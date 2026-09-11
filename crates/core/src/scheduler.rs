@@ -60,6 +60,41 @@ pub fn init_db() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 允许被定时启动的文件扩展名（可执行类型）。
+const EXECUTABLE_EXTENSIONS: [&str; 4] = ["exe", "bat", "cmd", "lnk"];
+
+/// 校验任务目标路径：必须是绝对路径、指向已存在的可执行类型文件。
+/// 定时任务是持久化的进程启动通道，入口（插件 API / 未来 UI）统一在此拦截。
+fn validate_task_target(target_path: &str) -> anyhow::Result<()> {
+    let t = target_path.trim();
+    if t.is_empty() {
+        anyhow::bail!("目标程序路径不能为空");
+    }
+    let p = std::path::Path::new(t);
+    if !p.is_absolute() {
+        anyhow::bail!("目标程序必须是绝对路径: {t}");
+    }
+    let ext_ok = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| EXECUTABLE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false);
+    if !ext_ok {
+        anyhow::bail!(
+            "目标程序仅支持 {} 文件",
+            EXECUTABLE_EXTENSIONS
+                .iter()
+                .map(|e| format!(".{e}"))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        );
+    }
+    if !p.is_file() {
+        anyhow::bail!("目标程序不存在: {t}");
+    }
+    Ok(())
+}
+
 /// 添加定时任务。
 pub fn add_task(
     name: &str,
@@ -69,6 +104,10 @@ pub fn add_task(
     schedule_time: &str,
     enabled: bool,
 ) -> i64 {
+    if let Err(e) = validate_task_target(target_path) {
+        tracing::warn!("添加定时任务被拒绝（{name}）: {e}");
+        return -1;
+    }
     let created = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     match open().and_then(|conn| {
         conn.execute(
@@ -105,6 +144,13 @@ pub fn update_task(
     schedule_time: Option<&str>,
     enabled: Option<bool>,
 ) -> bool {
+    // 修改目标路径时同样校验（不修改 target 字段则跳过，避免目标被删后无法编辑其他字段）
+    if let Some(t) = target_path {
+        if let Err(e) = validate_task_target(t) {
+            tracing::warn!("更新定时任务被拒绝（id={id}）: {e}");
+            return false;
+        }
+    }
     // 读取当前值
     let conn = match open() {
         Ok(c) => c,

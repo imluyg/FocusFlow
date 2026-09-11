@@ -47,6 +47,37 @@ const EDGE_COPY_MAX_BYTES: u64 = 100 * 1024 * 1024; // 100MB
 /// 被锁时 300ms 后自动转复制兜底（毫秒级），整体感知最快。
 const EDGE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// 复制兜底用的临时副本路径：放系统临时目录 + 随机文件名。
+/// 副本包含 Edge 完整浏览记录（URL/标题/时间），不落在程序目录，
+/// 且随机名 + 短生命周期把崩溃残留的风险窗口压到最低。
+fn temp_copy_path() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("focusflow_edge_{}_{nanos}.db", std::process::id()))
+}
+
+/// 删除副本及其 WAL/SHM 附属文件。
+fn remove_temp_copy(temp: &std::path::Path) {
+    let _ = std::fs::remove_file(temp);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{}", temp.display(), suffix));
+    }
+}
+
+/// 旧版本曾把副本放在程序目录 `data/_edge_history_temp.db`，
+/// 崩溃时会残留明文浏览记录，首次查询时清理历史残留。
+fn cleanup_legacy_temp_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let legacy = paths::data_dir().join("_edge_history_temp.db");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", legacy.display(), suffix));
+        }
+    });
+}
+
 /// 在 Edge History 上执行查询，返回 Option（None 表示读取失败/被锁）。
 /// 策略：
 /// 1) 只读直连（busy_timeout 1s）：Edge 未运行或锁间隙时最快。
@@ -73,6 +104,7 @@ fn query_edge_count(query: impl Fn(&Connection) -> Option<i64>) -> Option<i64> {
     }
 
     // 2) 复制兜底：先检查大小，超大库跳过复制避免卡顿
+    cleanup_legacy_temp_once();
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     if size > EDGE_COPY_MAX_BYTES {
         tracing::warn!(
@@ -81,7 +113,7 @@ fn query_edge_count(query: impl Fn(&Connection) -> Option<i64>) -> Option<i64> {
         );
         return None;
     }
-    let temp = paths::data_dir().join("_edge_history_temp.db");
+    let temp = temp_copy_path();
     for attempt in 0..3 {
         if std::fs::copy(&path, &temp).is_ok() {
             for suffix in ["-wal", "-shm"] {
@@ -93,20 +125,14 @@ fn query_edge_count(query: impl Fn(&Connection) -> Option<i64>) -> Option<i64> {
             if let Ok(conn) = Connection::open(&temp) {
                 if let Some(v) = query(&conn) {
                     drop(conn);
-                    let _ = std::fs::remove_file(&temp);
-                    for suffix in ["-wal", "-shm"] {
-                        let _ = std::fs::remove_file(format!("{}{}", temp.display(), suffix));
-                    }
+                    remove_temp_copy(&temp);
                     return Some(v);
                 }
             }
         }
+        remove_temp_copy(&temp);
         tracing::debug!("Edge 历史库复制查询失败（第{}次），重试", attempt + 1);
         std::thread::sleep(std::time::Duration::from_millis(150));
-    }
-    let _ = std::fs::remove_file(&temp);
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{}", temp.display(), suffix));
     }
     tracing::warn!("Edge 历史库无法读取（直连被锁且复制失败）");
     None

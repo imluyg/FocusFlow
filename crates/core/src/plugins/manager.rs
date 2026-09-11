@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::SystemTime;
 
-use mlua::{HookTriggers, Lua, VmState};
+use mlua::{HookTriggers, Lua, LuaOptions, StdLib, VmState};
 
 use crate::config::FocusFlowConfig;
 use crate::db;
@@ -89,6 +89,43 @@ impl PluginManager {
         }
     }
 
+    /// 创建沙箱化的 Lua 状态：
+    /// - 剔除 `io` 库（任意文件读写）；
+    /// - 移除 `os` 中可触达系统的高危函数（保留 date/time/clock 供插件使用）；
+    /// - 禁用 `package.loadlib`/`cpath`（防加载任意 DLL）。
+    ///
+    /// 配合 `apply_lua_limits` 的内存/指令数限制构成完整沙箱。
+    fn create_sandboxed_lua() -> mlua::Result<Lua> {
+        // 显式白名单，不用 ALL_SAFE：后者含 io 库，且未来 mlua 加入新库时不会默默放行。
+        let libs = StdLib::COROUTINE
+            | StdLib::TABLE
+            | StdLib::STRING
+            | StdLib::UTF8
+            | StdLib::MATH
+            | StdLib::PACKAGE
+            | StdLib::OS;
+        let lua = Lua::new_with(libs, LuaOptions::default())?;
+        let globals = lua.globals();
+        if let Ok(os) = globals.get::<mlua::Table>("os") {
+            for name in [
+                "execute",
+                "exit",
+                "getenv",
+                "remove",
+                "rename",
+                "setlocale",
+                "tmpname",
+            ] {
+                os.set(name, mlua::Value::Nil)?;
+            }
+        }
+        if let Ok(pkg) = globals.get::<mlua::Table>("package") {
+            pkg.set("loadlib", mlua::Value::Nil)?;
+            pkg.set("cpath", "")?;
+        }
+        Ok(lua)
+    }
+
     /// 为 Lua 状态施加资源限制（防 `while true do end` 冻结主线程）：
     /// - 内存上限：超限触发 `Error::MemoryError`；
     /// - 指令数 hook：每 N 条指令检查一次，超限直接中断执行。
@@ -149,7 +186,7 @@ impl PluginManager {
 
     /// 从 Lua 脚本读取元数据（不执行 init）。
     fn read_meta(&self, path: &Path) -> Result<PluginMeta, String> {
-        let lua = Lua::new();
+        let lua = Self::create_sandboxed_lua().map_err(|e| e.to_string())?;
         self.apply_lua_limits(&lua);
         // 只注册空的 focusflow 占位表，避免扫描阶段触发宿主单例副作用；
         // 真正的宿主 API 在 load_plugin 时才注册。
@@ -203,7 +240,7 @@ impl PluginManager {
         let meta = self.read_meta(path)?;
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
 
-        let lua = Lua::new();
+        let lua = Self::create_sandboxed_lua().map_err(|e| e.to_string())?;
         self.apply_lua_limits(&lua);
         host::register_host_api(&lua, self.config, Arc::clone(&self.db))
             .map_err(|e| format!("宿主 API 注册失败: {e}"))?;
@@ -725,5 +762,44 @@ fn parse_widget(w: &mlua::Table) -> mlua::Result<crate::plugins::Widget> {
             })
         }
         _ => Ok(Widget::Label(format!("[未知控件: {wtype}]"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 沙箱必须让 io 库不可用、os 高危函数与 package.loadlib 被移除，
+    /// 同时保留 os.date 等插件在用的安全函数。
+    #[test]
+    fn sandboxed_lua_blocks_dangerous_stdlib() {
+        let lua = PluginManager::create_sandboxed_lua().unwrap();
+        // io 库整体不可用
+        assert!(lua.globals().get::<mlua::Value>("io").unwrap().is_nil());
+        // os 高危函数已移除
+        for name in ["execute", "exit", "getenv", "remove", "rename", "tmpname"] {
+            let v: mlua::Value = lua.load(format!("return os.{name}")).eval().unwrap();
+            assert!(v.is_nil(), "os.{name} 应为 nil");
+        }
+        // package.loadlib 已禁用
+        let loadlib: mlua::Value = lua.load("return package.loadlib").eval().unwrap();
+        assert!(loadlib.is_nil());
+        // 插件在用的安全函数仍在
+        for expr in [
+            "return os.date",
+            "return os.time",
+            "return os.clock",
+            "return string.format",
+            "return math.floor",
+        ] {
+            lua.load(expr).exec().unwrap();
+        }
+        // 运行时兜底：io.open 即便被伪造调用也应报"未定义"
+        let err = lua
+            .load("return io.open('C:/x.txt','w')")
+            .exec()
+            .err()
+            .expect("io 不可用时必须报错");
+        assert!(err.to_string().contains("io"));
     }
 }

@@ -226,7 +226,7 @@ impl FocusFlowConfig {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        std::fs::write(&self.path, out)?;
+        atomic_write(&self.path, &out)?;
         Ok(())
     }
 
@@ -308,6 +308,45 @@ impl FocusFlowConfig {
     }
 }
 
+/// 原子写入：先写同目录临时文件并 fsync，再 rename 替换目标
+/// （Windows 上 rename 同样会替换已存在的目标）。
+/// 直接 `fs::write` 截断重写，掉电/崩溃会留下空文件或半截 INI；
+/// 原子替换保证任意时刻磁盘上的 config.ini 要么是旧的完整内容，要么是新的。
+fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    // 每次调用唯一后缀：并发 save 各用各的临时文件，避免一个 rename
+    // 把另一个的临时文件"偷走"后报"找不到文件"。
+    name.push(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = path.with_file_name(name);
+    let write = || -> anyhow::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(anyhow::Error::new(e).context("配置文件原子替换失败"))
+        }
+    }
+}
+
 /// 全局配置单例（与 Python 版全局 `config` 对应）。
 ///
 /// 首次访问时加载，仅一次。
@@ -329,7 +368,9 @@ fn saver_tx() -> &'static mpsc::Sender<()> {
                 // 收集 300ms 内的连续写请求，合并为一次落盘
                 while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
                 if let Some(cfg) = INSTANCE.get() {
-                    let _ = cfg.save();
+                    if let Err(e) = cfg.save() {
+                        tracing::error!("配置落盘失败: {e:#}");
+                    }
                 }
             })
             .ok();
