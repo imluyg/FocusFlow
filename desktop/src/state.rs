@@ -655,11 +655,15 @@ fn keep_floating_on_top(app: &App) {
             unsafe {
                 use windows::Win32::Foundation::HWND;
                 use windows::Win32::UI::WindowsAndMessaging::{
-                    GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
-                    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_APPWINDOW,
-                    WS_EX_TOOLWINDOW,
+                    GetWindowLongW, IsWindow, SetWindowLongW, SetWindowPos, GWL_EXSTYLE,
+                    HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+                    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
                 };
                 let hwnd = HWND(raw_hwnd as *mut _);
+                // 窗口已销毁：退出轮询，避免对失效 HWND 反复 SetWindowPos
+                if !IsWindow(Some(hwnd)).as_bool() {
+                    break;
+                }
                 // 工具窗口样式：tao 的 skip_taskbar 只做 DeleteTab，仍会带 WS_EX_APPWINDOW，
                 // 任务管理器会把它当"应用"；这里每轮重申：置 TOOLWINDOW、清 APPWINDOW，
                 // 进程即可归类为后台进程（对齐 Python 版方案）。
@@ -721,6 +725,14 @@ fn spawn_stats_worker(
             // 各周期最高单日缓存：period -> (次数, 日期)；重聚合播种，今日破纪录时快节奏即时更新
             let mut period_max: std::collections::HashMap<i64, (i64, String)> =
                 std::collections::HashMap::new();
+            // "总计"(period=0) 聚合缓存与全历史最高单日缓存：
+            // 两者都需要跨年度库全表扫描/全表 ORDER BY，active 的 2s 快节奏不触发重算，
+            // 仅在 强制刷新 / 跨天 / 今日新增写入量 ≥ ALLTIME_RECALC_THRESHOLD 时失效重建。
+            const ALLTIME_RECALC_THRESHOLD: i64 = 500;
+            let mut alltime_agg: Option<ChartAgg> = None;
+            let mut alltime_max: Option<(String, i64)> = None;
+            let mut alltime_cache_day: i64 = -1; // 上次缓存构建时的日期（CE 天序号）
+            let mut alltime_cache_today: i64 = -1; // 上次缓存构建时的今日计数
 
             loop {
                 let period_val = period.load(Ordering::Relaxed);
@@ -729,6 +741,15 @@ fn spawn_stats_worker(
                 let cur_today = db.writer().map(|w| w.today_count()).unwrap_or(0) as i64;
                 let active = cur_today != prev_today_count;
                 let heavy_elapsed_ms = last_heavy.elapsed().as_millis() as u64;
+                let day_ce = {
+                    use chrono::Datelike;
+                    chrono::Local::now().date_naive().num_days_from_ce()
+                } as i64;
+                let alltime_dirty = forced
+                    || alltime_max.is_none()
+                    || day_ce != alltime_cache_day
+                    || (alltime_cache_today >= 0
+                        && cur_today - alltime_cache_today >= ALLTIME_RECALC_THRESHOLD);
 
                 // 重聚合节奏随主窗口可见性自适应：
                 // - 主窗口打开：活跃（打字）时每 active_refresh_interval 秒刷新一次图表；
@@ -757,17 +778,43 @@ fn spawn_stats_worker(
                 let do_heavy = forced || period_changed || heavy_elapsed_ms >= heavy_interval_ms;
 
                 if do_heavy {
-                    // 先把写线程内存中的增量落库，图表查询才能看到最新按键
-                    // （否则排行/趋势/最高单日最多滞后一个 flush 周期）
-                    if let Some(w) = db.writer() {
-                        if w.has_pending() {
-                            w.flush(true);
+                    // 全历史最高单日（全表 ORDER BY，最贵的单项查询）：仅缓存失效时重查
+                    if alltime_dirty {
+                        // 先把写线程内存中的增量落库，图表查询才能看到最新按键
+                        if let Some(w) = db.writer() {
+                            if w.has_pending() {
+                                w.flush(true);
+                            }
                         }
+                        last_heavy = Instant::now();
+                        last_heavy_today = cur_today;
+                        let today_str = chrono::Local::now()
+                            .date_naive()
+                            .format("%Y-%m-%d")
+                            .to_string();
+                        alltime_max = Some(
+                            focusflow_core::db::get_alltime_max_day()
+                                .unwrap_or((today_str, 0)),
+                        );
+                        alltime_cache_day = day_ce;
+                        alltime_cache_today = cur_today;
                     }
-                    last_heavy = Instant::now();
-                    last_heavy_today = cur_today;
 
-                    let agg = compute_charts(period_val);
+                    // period=0 且缓存有效：直接复用上次聚合结果，不再全库扫描。
+                    // 今日破纪录等展示值由下方增量逻辑修正，轻量零查询。
+                    let agg = if period_val == 0
+                        && !period_changed
+                        && !alltime_dirty
+                        && alltime_agg.is_some()
+                    {
+                        alltime_agg.clone().unwrap()
+                    } else {
+                        let agg = compute_charts(period_val, alltime_max.clone());
+                        if period_val == 0 {
+                            alltime_agg = Some(agg.clone());
+                        }
+                        agg
+                    };
                     period_max.insert(period_val, (agg.max_day, agg.max_day_date.clone()));
                     {
                         let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -860,7 +907,9 @@ fn spawn_stats_worker(
 ///
 /// 纯函数（输入周期、输出聚合结果），从统计线程拆出便于单测；
 /// 数据一致性由读侧 busy_timeout 与写线程事务保证。
-fn compute_charts(period_val: i64) -> ChartAgg {
+/// `alltime_max` 为统计线程维护的全历史最高单日缓存（全表 ORDER BY 太贵，不在此重查；
+/// 传 None 时回退现查，供单测与无缓存路径使用）。
+fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartAgg {
     let (total, key_stats) = match period_val {
         -1 => focusflow_core::db::get_stats_by_date(chrono::Local::now().date_naive()),
         0 => focusflow_core::db::get_stats(None, None),
@@ -910,9 +959,14 @@ fn compute_charts(period_val: i64) -> ChartAgg {
         .format("%Y-%m-%d")
         .to_string();
     let (max_day, max_day_date) = if period_val == -1 || period_val == 0 {
-        // get_alltime_max_day 返回 (日期, 次数)
-        let (d, c) = focusflow_core::db::get_alltime_max_day().unwrap_or((today_str.clone(), 0));
-        (c, d)
+        match alltime_max {
+            Some((d, c)) => (c, d),
+            None => {
+                let (d, c) =
+                    focusflow_core::db::get_alltime_max_day().unwrap_or((today_str.clone(), 0));
+                (c, d)
+            }
+        }
     } else {
         let window: Vec<(String, i64)> = if total_days >= daily_days as usize {
             daily_all[total_days - daily_days as usize..].to_vec()
@@ -965,7 +1019,7 @@ mod compute_charts_tests {
         let dir = std::env::temp_dir().join(format!("ff_compute_charts_{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         focusflow_core::paths::set_app_dir(&dir);
-        let agg = compute_charts(0);
+        let agg = compute_charts(0, None);
         assert_eq!(agg.total, 0);
         assert_eq!(agg.rank.len(), 0);
         assert_eq!(agg.mouse_total, 0);

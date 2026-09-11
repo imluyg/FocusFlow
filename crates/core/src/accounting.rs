@@ -124,7 +124,9 @@ pub fn init_db() -> anyhow::Result<()> {
             name TEXT NOT NULL UNIQUE,
             type TEXT NOT NULL DEFAULT 'both',
             subs TEXT NOT NULL DEFAULT '[]'
-        );",
+        );
+        -- 排序/按日期筛选走索引（幂等，旧库启动时自动补建）
+        CREATE INDEX IF NOT EXISTS idx_expenses_purchase_date ON expenses(purchase_date);",
     )?;
 
     // 迁移：旧库 categories 表没有 subs 列 → 补列

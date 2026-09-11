@@ -101,25 +101,26 @@ fn key_display_name(key: &Key) -> &'static str {
     }
 }
 
-/// 处理热路径：按键名（优先零分配静态串，未知键才分配）。
-pub fn normalize_key(key: &Key) -> String {
+/// 处理热路径：按键名（静态键名零分配，未知键才分配 Owned）。
+pub fn normalize_key(key: &Key) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
     if let Some(n) = letter_name(key) {
-        return n.to_string();
+        return Cow::Borrowed(n);
     }
     if let Some(n) = digit_name(key) {
-        return n.to_string();
+        return Cow::Borrowed(n);
     }
     if let Some(n) = symbol_name(key) {
-        return n.to_string();
+        return Cow::Borrowed(n);
     }
     if let Some(n) = kp_name(key) {
-        return n.to_string();
+        return Cow::Borrowed(n);
     }
     let name = key_display_name(key);
     if name == "Unknown" {
-        format!("{:?}", key)
+        Cow::Owned(format!("{:?}", key))
     } else {
-        name.to_string()
+        Cow::Borrowed(name)
     }
 }
 
@@ -424,8 +425,13 @@ impl InputListener {
         db.record_key(key_name, ts);
         // 记录 CPM（当前速度统计）
         crate::stats::cpm(self.config).record();
-        // 通知回调（番茄钟 / 护眼提醒）
-        let callbacks = self.key_callbacks.lock().unwrap_or_else(|e| e.into_inner());
+        // 通知回调（番茄钟 / 护眼提醒）：先 clone 出回调列表再放锁执行，
+        // 避免持锁调用外部代码（回调可能耗时或重入）
+        let callbacks: Vec<_> = self
+            .key_callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         for cb in callbacks.iter() {
             cb(key_name);
         }
@@ -463,11 +469,15 @@ impl InputListener {
                 self.record_event(db, &name);
             }
             EventType::KeyRelease(key) => {
+                // 未知键从未进入 pressed 集合，直接跳过（同时避免 normalize_key 的格式化分配）
+                if matches!(key, Key::Unknown(_)) {
+                    return;
+                }
                 let name = normalize_key(key);
                 self.pressed
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .remove(&name);
+                    .remove(name.as_ref());
             }
             EventType::ButtonPress(button) => {
                 if !mouse_enabled {
