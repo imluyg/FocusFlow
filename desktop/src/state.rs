@@ -244,6 +244,10 @@ fn setup_windows(app: &App, state: &AppState) {
     // 悬浮窗：默认顶部靠右（对齐 Python 版），位置可持久化
     if let Some(win) = app.get_webview_window("floating") {
         make_floating_tool_window(&win);
+        // 悬浮窗本来就是透明窗口：Acrylic 生效时卡片背后是真实的系统级模糊；
+        // 失败则维持原有"半透明卡片"外观，无需前端配合
+        let dark = config.get("gui", "theme") == "dark";
+        apply_window_vibrancy(&win, dark);
         // WebView2 创建控制器时会把窗口强制放宽到至少 120px（内容实际只需 ~81px），
         // 因此在窗口构建完成后主动缩回目标宽度，并延时重复几次兜底异步放大。
         enforce_floating_size(&win, config);
@@ -401,6 +405,44 @@ pub fn set_webview_rendering(app: &tauri::AppHandle, label: &str, visible: bool)
 /// invoke 处理中），同步建窗会挂死（复现：启动后直接双击悬浮窗呼出主界面 →
 /// 点不开，再点托盘整个程序卡死）。后台线程 + run_on_main_thread 让创建
 /// 发生在 WebView2 消息派发栈退栈之后的事件循环迭代里。
+/// 主窗口是否已启用系统级窗口材质（前端据此切换半透明玻璃令牌）。
+pub static MAIN_GLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 应用系统级窗口材质（液态玻璃）：
+/// - Win11 优先 Mica（壁纸取色，功耗低）；
+/// - 回退 Acrylic（Win10/11，带主题底色的实时模糊）；
+/// - 都失败返回 false：窗口保持 CSS 不透明外观，与未开启一致。
+///
+/// 前端收到 `vibrancy-on` 事件（或启动时查询 get_vibrancy）后切换
+/// body.glass 半透明令牌，让材质透出。
+#[cfg(windows)]
+fn apply_window_vibrancy(win: &tauri::WebviewWindow, dark: bool) -> bool {
+    use window_vibrancy::{apply_acrylic, apply_mica};
+    if apply_mica(win, Some(dark)).is_ok() {
+        tracing::info!("窗口材质已启用: Mica ({})", win.label());
+        return true;
+    }
+    let tint = if dark {
+        (20, 22, 31, 96)
+    } else {
+        (245, 247, 250, 96)
+    };
+    if apply_acrylic(win, Some(tint)).is_ok() {
+        tracing::info!("窗口材质已启用: Acrylic ({})", win.label());
+        return true;
+    }
+    tracing::info!(
+        "窗口材质不可用（系统版本/透明效果设置限制）: {}",
+        win.label()
+    );
+    false
+}
+
+#[cfg(not(windows))]
+fn apply_window_vibrancy(_win: &tauri::WebviewWindow, _dark: bool) -> bool {
+    false
+}
+
 pub fn show_main_window(app: &tauri::AppHandle) {
     if app.get_webview_window("main").is_none() {
         if MAIN_CREATING.swap(true, Ordering::SeqCst) {
@@ -452,10 +494,21 @@ fn show_main_window_impl(app: &tauri::AppHandle) {
         .min_inner_size(820.0, 560.0)
         .resizable(true)
         .visible(false)
+        // 透明窗口：系统材质（Mica/Acrylic）生效时玻璃透出；
+        // 材质不可用时 CSS 保持不透明令牌，外观与不透明窗口一致
+        .transparent(true)
         .additional_browser_args(WEBVIEW_BROWSER_ARGS)
         .build();
         match &result {
-            Ok(_) => tracing::info!("show_main: 主窗口创建成功"),
+            Ok(win) => {
+                tracing::info!("show_main: 主窗口创建成功");
+                let dark = focusflow_core::config::instance().get("gui", "theme") == "dark";
+                if apply_window_vibrancy(win, dark) {
+                    MAIN_GLASS.store(true, Ordering::SeqCst);
+                    use tauri::Emitter;
+                    let _ = app.emit_to("main", "vibrancy-on", true);
+                }
+            }
             Err(e) => tracing::error!("show_main: 主窗口创建失败: {e}"),
         }
     }

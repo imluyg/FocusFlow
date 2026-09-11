@@ -115,6 +115,14 @@ document.querySelectorAll("#trend-days .tab").forEach((b) => {
   } catch (e) {
     console.error("读取主题失败", e);
   }
+  // 玻璃模式：系统材质（Mica/Acrylic）生效时后端通知/查询开启，
+  // 切换 body.glass 半透明令牌让模糊透出；材质不可用则保持不透明外观
+  try {
+    document.body.classList.toggle("glass", !!(await invoke("get_vibrancy")));
+  } catch (e) {}
+  try {
+    await listen("vibrancy-on", () => document.body.classList.add("glass"));
+  } catch (e) {}
   // 版本号从后端单一来源读取（Cargo 包版本），失败时用默认占位
   try {
     const v = await invoke("get_version");

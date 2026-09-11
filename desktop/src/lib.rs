@@ -56,6 +56,7 @@ pub fn run() {
             commands::get_charts,
             commands::get_settings,
             commands::get_version,
+            commands::get_vibrancy,
             commands::set_period,
             commands::get_config,
             commands::set_config,

@@ -51,6 +51,12 @@ pub fn get_version() -> String {
     focusflow_core::paths::APP_VERSION.to_string()
 }
 
+/// 主窗口是否已启用系统级窗口材质（前端据此切换 body.glass 半透明令牌）。
+#[tauri::command]
+pub fn get_vibrancy() -> bool {
+    crate::state::MAIN_GLASS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// 设置统计周期（-1=今日, N=天数, 0=总计）并触发即时重聚合。
 #[tauri::command]
 pub fn set_period(state: State<'_, Arc<AppState>>, period: i64) {

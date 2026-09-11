@@ -44,3 +44,19 @@ body.dark {
   --grid-line: #2E3548;
   --shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
 }
+
+/* ===== 玻璃模式（系统 Mica/Acrylic 材质生效时由后端开启） =====
+   卡片与页面背景改半透明，让系统级的真实模糊透出来。
+   材质不可用时不加 body.glass，令牌保持上方不透明值，外观与旧版一致。 */
+body.glass {
+  --page-top: rgba(232, 239, 252, 0.72);
+  --page-bottom: rgba(247, 250, 254, 0.80);
+  --card: rgba(255, 255, 255, 0.62);
+  --header-bg: rgba(241, 245, 251, 0.72);
+}
+body.glass.dark {
+  --page-top: rgba(23, 27, 39, 0.74);
+  --page-bottom: rgba(16, 19, 28, 0.80);
+  --card: rgba(30, 35, 49, 0.62);
+  --header-bg: rgba(35, 42, 60, 0.72);
+}
