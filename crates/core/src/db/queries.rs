@@ -216,13 +216,26 @@ fn query_stats_in_conn(
     };
     let sql = format!("SELECT key_name, {agg} FROM key_counts{where_clause}{group_clause} {order}");
     let map: HashMap<String, i64> = {
-        let mut stmt = conn.prepare(&sql).unwrap();
         let mapper = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?));
-        let rows = match param {
-            Some(p) => stmt.query_map([p], mapper).unwrap(),
-            None => stmt.query_map([], mapper).unwrap(),
+        let rows = match conn.prepare(&sql) {
+            Ok(mut stmt) => match param {
+                // SQL 出错时回退空结果并记日志，进程不因查询异常 panic 崩溃
+                Some(p) => stmt
+                    .query_map([p], mapper)
+                    .map(|rows| rows.flatten().collect::<Vec<_>>()),
+                None => stmt
+                    .query_map([], mapper)
+                    .map(|rows| rows.flatten().collect::<Vec<_>>()),
+            },
+            Err(e) => Err(e),
         };
-        rows.flatten().collect()
+        match rows {
+            Ok(list) => list.into_iter().collect(),
+            Err(e) => {
+                tracing::error!("key_counts 查询失败 ({sql}): {e}");
+                return None;
+            }
+        }
     };
     Some((total, map))
 }
@@ -341,26 +354,27 @@ pub fn get_daily_counts(days: i64, year: Option<i32>) -> Vec<(String, i64)> {
         if !path.exists() {
             continue;
         }
-        connection::with_ro_conn(&path, |conn| {
+        let year_result = connection::with_ro_conn(&path, |conn| -> rusqlite::Result<()> {
             if !table_exists(conn, "daily_counts") {
-                return;
+                return Ok(());
             }
-            let mut stmt = conn
-                .prepare(
-                    "SELECT date_key, count FROM daily_counts WHERE date_key >= ?1 AND date_key <= ?2",
-                )
-                .unwrap();
-            let rows = stmt
-                .query_map(rusqlite::params![start_dk, end_dk], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-                })
-                .unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT date_key, count FROM daily_counts WHERE date_key >= ?1 AND date_key <= ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![start_dk, end_dk], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
             for row in rows.flatten() {
                 if let Some(e) = daily_map.get_mut(&row.0) {
                     *e += row.1;
                 }
             }
+            Ok(())
         });
+        // 单个年度库查询失败只记日志跳过，不影响其余年份与进程存活
+        if let Some(Err(e)) = year_result {
+            tracing::error!("每日计数查询失败（{y} 年库）: {e}");
+        }
     }
 
     let mut result: Vec<(String, i64)> = Vec::with_capacity(daily_map.len());
@@ -382,19 +396,25 @@ pub fn get_hourly_stats(target_date: Option<chrono::NaiveDate>) -> Vec<i64> {
         if !table_exists(conn, "hourly_counts") {
             return None;
         }
-        let mut hourly = vec![0i64; 24];
-        let mut stmt = conn
-            .prepare("SELECT hour, count FROM hourly_counts WHERE date_key = ?1")
-            .unwrap();
-        let rows = stmt
-            .query_map([dk], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
-            .unwrap();
-        for row in rows.flatten() {
-            if (0..24).contains(&row.0) {
-                hourly[row.0 as usize] = row.1;
+        let query = (|| -> rusqlite::Result<Vec<i64>> {
+            let mut stmt =
+                conn.prepare("SELECT hour, count FROM hourly_counts WHERE date_key = ?1")?;
+            let rows = stmt.query_map([dk], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+            let mut hourly = vec![0i64; 24];
+            for row in rows.flatten() {
+                if (0..24).contains(&row.0) {
+                    hourly[row.0 as usize] = row.1;
+                }
+            }
+            Ok(hourly)
+        })();
+        match query {
+            Ok(hourly) => Some(hourly),
+            Err(e) => {
+                tracing::error!("小时分布查询失败: {e}");
+                None
             }
         }
-        Some(hourly)
     });
     result.flatten().unwrap_or_else(|| vec![0i64; 24])
 }

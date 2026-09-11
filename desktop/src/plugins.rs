@@ -11,6 +11,7 @@ use serde::Serialize;
 use tauri::{Emitter, State};
 
 use focusflow_core::db::Database;
+use focusflow_core::listener::InputListener;
 use focusflow_core::plugins::manager::PluginManager;
 use focusflow_core::plugins::Widget;
 
@@ -137,7 +138,70 @@ fn reload_plugin_by_key(key: &str, db: &Arc<Database>) {
             tracing::info!("未找到已加载插件 {key}，尝试补载新插件");
             pm.load_all();
         }
-    });
+    })
+}
+
+/// 键事件通道：listener 钩子线程投递键名，主线程分发给插件（番茄钟计数等）。
+static KEY_EVENT_TX: std::sync::OnceLock<std::sync::mpsc::Sender<String>> =
+    std::sync::OnceLock::new();
+
+/// 接通键事件回调链。
+/// mlua 的 Lua 非 Send，插件分发只能在主线程：钩子线程回调只往 channel 投递键名
+/// （零阻塞），独立分发线程批量取出后经 run_on_main_thread 回主线程，
+/// 对每个已加载插件调用 plugin_key_event。
+pub fn start_key_event_dispatch(
+    app: &tauri::AppHandle,
+    db: Arc<Database>,
+    listener: &Arc<InputListener>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let _ = KEY_EVENT_TX.set(tx);
+    listener.add_key_callback(Arc::new(|key| {
+        if let Some(tx) = KEY_EVENT_TX.get() {
+            let _ = tx.send(key.to_string());
+        }
+    }));
+
+    let app_owned = app.clone();
+    std::thread::Builder::new()
+        .name("plugin-key-dispatch".into())
+        .spawn(move || {
+            // 单次主线程投递最多合并的按键数：连打时减少跨线程消息数量
+            const MAX_BATCH: usize = 32;
+            while let Ok(first) = rx.recv() {
+                let mut keys = Vec::with_capacity(4);
+                keys.push(first);
+                while keys.len() < MAX_BATCH {
+                    match rx.try_recv() {
+                        Ok(k) => keys.push(k),
+                        Err(_) => break,
+                    }
+                }
+                let app = app_owned.clone();
+                let db = Arc::clone(&db);
+                let dispatch = move || {
+                    with_manager(&db, |pm| {
+                        let names: Vec<String> = pm
+                            .get_all_plugins()
+                            .iter()
+                            .filter(|p| p.loaded)
+                            .map(|p| p.name.clone())
+                            .collect();
+                        for name in names {
+                            for key in &keys {
+                                pm.plugin_key_event(&name, key);
+                            }
+                        }
+                    });
+                };
+                if let Err(e) = app.run_on_main_thread(dispatch) {
+                    tracing::debug!("键事件主线程分发失败（事件循环可能已退出）: {e}");
+                    break;
+                }
+            }
+        })
+        .expect("启动插件键事件分发线程失败");
+    tracing::info!("插件键事件分发已接通");
 }
 
 /// 下拉/单选选项 (value, label)。

@@ -117,6 +117,8 @@ impl AppState {
         crate::plugins::with_manager(&db, |_pm| {});
         // 插件热重载（Tauri 无 GUI 轮询循环，用独立扫描线程 + 主线程重载）
         crate::plugins::start_hot_reload(app.handle(), Arc::clone(&db));
+        // 键事件 → 插件分发（番茄钟按键计数依赖此链路）
+        crate::plugins::start_key_event_dispatch(app.handle(), Arc::clone(&db), &listener);
 
         let shared = Arc::new(Mutex::new(SharedStats::default()));
         // 默认周期 = 上次退出前选择的周期（前端切换时写入 gui.default_period）

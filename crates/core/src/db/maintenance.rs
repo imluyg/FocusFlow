@@ -56,32 +56,51 @@ pub fn archive_year_data(target_year: i32, source_year: i32) {
     // 1. 确保 target_year 库有表结构
     let target_path = paths::year_db_path(target_year);
     let source_path = paths::year_db_path(source_year);
-    if let Ok(conn) = connection::open_rw(&target_path) {
-        let _ = connection::ensure_schema(&conn, target_year);
+    if let Err(e) = connection::open_rw(&target_path)
+        .and_then(|conn| connection::ensure_schema(&conn, target_year))
+    {
+        tracing::error!("年度归档失败：目标库初始化失败: {e}");
+        return;
     }
 
-    // 2-4. ATTACH 迁移（三张聚合表）
+    // 2-4. ATTACH 迁移（三张聚合表）：任一步失败即回滚，杜绝"源库已删、目标库未写"
     let result = (|| -> anyhow::Result<()> {
+        let source_str = source_path.to_str().ok_or_else(|| {
+            anyhow::anyhow!("源库路径包含非 UTF-8 字符: {}", source_path.display())
+        })?;
         let conn = connection::open_rw(&target_path)?;
-        conn.execute(
-            "ATTACH DATABASE ?1 AS source",
-            rusqlite::params![source_path.to_str().unwrap()],
-        )?;
+        conn.execute("ATTACH DATABASE ?1 AS source", rusqlite::params![source_str])?;
         conn.execute("BEGIN;", [])?;
-        for table in ["daily_counts", "hourly_counts", "key_counts"] {
-            let _ = conn.execute(
-                &format!(
-                    "INSERT INTO {table} SELECT * FROM source.{table} \
-                     WHERE date_key >= ?1 AND date_key < ?2"
-                ),
-                rusqlite::params![y0, y1],
-            );
-            let _ = conn.execute(
-                &format!("DELETE FROM source.{table} WHERE date_key >= ?1 AND date_key < ?2"),
-                rusqlite::params![y0, y1],
-            );
+        let migrate: anyhow::Result<()> = (|| {
+            for table in ["daily_counts", "hourly_counts", "key_counts"] {
+                let inserted = conn.execute(
+                    &format!(
+                        "INSERT INTO {table} SELECT * FROM source.{table} \
+                         WHERE date_key >= ?1 AND date_key < ?2"
+                    ),
+                    rusqlite::params![y0, y1],
+                )?;
+                let deleted = conn.execute(
+                    &format!("DELETE FROM source.{table} WHERE date_key >= ?1 AND date_key < ?2"),
+                    rusqlite::params![y0, y1],
+                )?;
+                if inserted != deleted {
+                    anyhow::bail!(
+                        "{table} 迁移行数不一致（写入 {inserted} / 删除 {deleted}），已回滚"
+                    );
+                }
+            }
+            Ok(())
+        })();
+        match migrate {
+            Ok(()) => {
+                conn.execute("COMMIT;", [])?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK;", []);
+                return Err(e);
+            }
         }
-        conn.execute("COMMIT;", [])?;
         conn.execute("DETACH DATABASE source", [])?;
         Ok(())
     })();
