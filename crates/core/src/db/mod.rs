@@ -51,10 +51,9 @@ impl Database {
         invalidate_years_cache();
 
         // 启动写入线程
-        let batch_size = config.get_int("database", "batch_size", 50).max(1) as usize;
         let flush_interval =
             Duration::from_secs(config.get_int("database", "flush_interval", 10).max(1) as u64);
-        let writer = Some(DbWriter::start(batch_size, flush_interval));
+        let writer = Some(DbWriter::start(flush_interval));
 
         Ok(Arc::new(Self { writer }))
     }

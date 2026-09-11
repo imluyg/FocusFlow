@@ -1,11 +1,14 @@
 // 插件生态：插件列表、详情页、Widget 渲染、表格选中、弹窗、动作与字段回写。
 
 import { invoke } from "./tauri.js";
-import { $, escapeHtml } from "./utils.js";
+import { $, escapeHtml, toast } from "./utils.js";
 import { appState, openModals } from "./state.js";
 
 // ===== 插件最近使用记录（localStorage 持久化，用于列表排序）=====
 const LAST_USED_KEY = "ff_plugin_last_used";
+
+// 插件详情视图数据指纹（renderPluginDetail 增量刷新判断依据）
+let lastViewFingerprint = "";
 
 function loadLastUsed() {
   try {
@@ -64,11 +67,13 @@ export async function renderPlugins() {
 export function openPlugin(name) {
   markPluginUsed(name);
   appState.openPluginName = name;
+  lastViewFingerprint = ""; // 切换插件：指纹失效，强制重建
   renderPluginDetail();
 }
 
 export function closePlugin() {
   appState.openPluginName = null;
+  lastViewFingerprint = "";
   openModals.clear(); // 离开插件页：清空弹窗打开状态，避免重开时旧弹窗自动弹出
   appState.pluginSelIds = { __main: new Set() };
   renderPlugins();
@@ -83,12 +88,14 @@ export async function renderPluginDetail(force) {
     view = await invoke("get_plugin_view", { name });
   } catch (e) {
     if (seq !== appState.pluginDetailSeq) return;
+    lastViewFingerprint = "";
     box.innerHTML = `<button class="btn ghost" data-act="close-plugin">返回</button><div class="empty">加载失败: ${escapeHtml(e)}</div>`;
     return;
   }
   // 已有更新的请求在途：丢弃本次陈旧响应（防乱序覆盖）
   if (seq !== appState.pluginDetailSeq) return;
   if (!view) {
+    lastViewFingerprint = "";
     box.innerHTML = `<button class="btn ghost" data-act="close-plugin">返回</button><div class="empty">插件未提供视图</div>`;
     return;
   }
@@ -97,15 +104,16 @@ export async function renderPluginDetail(force) {
   for (const w of view.widgets) {
     html += renderWidget(w);
   }
-  // 内容未变化：不重建 DOM，保留正在输入的内容与焦点（每 2s 图表推送也会触发刷新）
-  // 注意：行选中高亮（tr.sel）是运行时添加的 class，会破坏 innerHTML 相等比较，
-  // 因此比较前先移除高亮，重建后再按保存的选中集合恢复。
+  // 数据指纹比对：view 数据未变化则不重建 DOM，保留正在输入的内容与焦点
+  //（每 2s 图表推送也会触发刷新）。指纹取后端 view 的序列化串，
+  // 不受行选中高亮等运行时 class 修改与浏览器 innerHTML 序列化差异影响。
   const prevSel = { ...appState.pluginSelIds };
-  box.querySelectorAll("tr.sel").forEach((tr) => tr.classList.remove("sel"));
-  if (box.innerHTML === html) {
+  const fingerprint = JSON.stringify(view);
+  if (fingerprint === lastViewFingerprint) {
     restoreSelClasses(box, prevSel);
     return;
   }
+  lastViewFingerprint = fingerprint;
   // 正在输入（焦点在框内输入控件）：跳过本次重建，失焦后下次刷新再更新。
   // force=true（按钮动作/联动刷新）时强制重建，否则下拉联动会失效。
   if (!force) {
@@ -169,8 +177,8 @@ export function renderWidget(w) {
           actionTd = `<td class="row-actions">${btns}</td>`;
         }
         // 可选中行：首列复选框 + 点击行切换选中（配合顶部 sel 按钮做修改/删除/距今）。
-        // 高亮只由 pluginSelectRow 运行时添加 class，不写进模板，
-        // 避免与 innerHTML 相等判断产生属性顺序差异导致误重建。
+        // 高亮只由 pluginSelectRow 运行时添加 class，不写进模板；
+        // 重建判断已改为数据指纹比对，不受运行时 class 影响。
         // 参数一律放 data-* 属性（escapeHtml 即安全），由事件委托分发，不拼接内联 JS。
         let rowAttrs = "";
         let cbTd = "";
@@ -342,11 +350,11 @@ function updateCheckAll(group) {
 export async function pluginBtnSel(name, id, group) {
   const set = selSet(group);
   if (set.size === 0) {
-    alert("请先在列表中点击选中一项");
+    toast("请先在列表中点击选中一项");
     return;
   }
   if (id === "edit_" && set.size > 1) {
-    alert("修改仅支持选中一条记录");
+    toast("修改仅支持选中一条记录");
     return;
   }
   await pluginBtn(name, id + [...set].join(","));
@@ -393,7 +401,7 @@ export async function pluginBtn(name, id) {
     await invoke("plugin_action", { name, id });
     await renderPluginDetail(true);
   } catch (e) {
-    alert("插件动作失败: " + e);
+    toast("插件动作失败: " + e);
   }
 }
 

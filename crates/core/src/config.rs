@@ -28,7 +28,6 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     s(
         "database",
         &[
-            ("batch_size", "50"),
             ("flush_interval", "10"),
             ("backup_on_exit", "true"),
             ("max_backups", "5"),

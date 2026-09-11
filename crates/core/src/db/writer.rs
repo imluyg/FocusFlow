@@ -70,8 +70,7 @@ pub struct DbWriter {
 
 impl DbWriter {
     /// 创建并启动写入线程。
-    pub fn start(batch_size: usize, flush_interval: Duration) -> Arc<Self> {
-        let _ = batch_size;
+    pub fn start(flush_interval: Duration) -> Arc<Self> {
         let (sig_tx, sig_rx) = mpsc::channel();
         // 今日计数初始值 = 聚合表中今日的记录数
         let today_base_count = {
@@ -364,5 +363,55 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
     }
     for ((dk, key), n) in pending.keys {
         *agg.keys.entry((dk, key)).or_insert(0) += n;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// 跨天边界：today_key 落后于当前日期时，record 应重置今日计数
+    /// （统计线程运行中跨 0 点，避免次日显示昨日累计值）。
+    #[test]
+    fn record_resets_today_count_on_day_change() {
+        let dir = std::env::temp_dir().join(format!("ff_writer_day_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let w = DbWriter::start(Duration::from_secs(3600));
+        // 模拟"昨天"：today_key 是昨天的日期键、计数停留在昨日值
+        w.state.today_key.store(current_day_key() - 1, Ordering::Relaxed);
+        w.state.today_count.store(999, Ordering::Relaxed);
+
+        w.record("A", queries::now_ts());
+
+        assert_eq!(w.state.today_key.load(Ordering::Relaxed), current_day_key());
+        assert_eq!(w.state.today_count.load(Ordering::Relaxed), 1);
+
+        w.flush(true);
+        w.stop();
+        crate::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// record 聚合到内存增量：daily/hourly/keys 正确累加。
+    #[test]
+    fn record_aggregates_deltas() {
+        let w = DbWriter::start(Duration::from_secs(3600));
+        let ts = queries::now_ts();
+        w.record("A", ts);
+        w.record("A", ts);
+        w.record("B", ts);
+        let agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+        let dk = queries::day_key_of_ts(ts);
+        assert_eq!(agg.daily.get(&dk), Some(&3));
+        assert_eq!(
+            agg.hourly.get(&(dk, queries::hour_of_ts(ts))),
+            Some(&3)
+        );
+        assert_eq!(agg.keys.get(&(dk, "A".to_string())), Some(&2));
+        drop(agg);
+        w.stop();
     }
 }

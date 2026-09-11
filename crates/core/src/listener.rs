@@ -561,6 +561,14 @@ impl InputListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::SystemTime;
+
+    fn test_config() -> &'static FocusFlowConfig {
+        let dir = std::env::temp_dir().join(format!("ff_listener_cfg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        Box::leak(Box::new(FocusFlowConfig::load(dir.join("config.ini")).unwrap()))
+    }
 
     #[test]
     fn unknown_key_name_format_is_stable() {
@@ -569,5 +577,110 @@ mod tests {
         // 此测试保证 Unknown(N) 格式契约不因实现调整而漂移
         assert_eq!(normalize_key(&Key::Unknown(173)), "Unknown(173)");
         assert_eq!(normalize_key(&Key::Unknown(0)), "Unknown(0)");
+    }
+
+    /// 长按去重：窗口内重复按下不计数，stale 超时后重新计数。
+    #[test]
+    fn is_new_press_filters_repeat_until_stale() {
+        let l = InputListener::new(test_config());
+        assert!(l.is_new_press("A"));
+        assert!(!l.is_new_press("A"), "窗口内第二次按下应视为长按重复");
+
+        // 手工把按下时刻拨到 stale 窗口之外（默认 15 秒，避免真实等待）
+        let stale_secs = l.cfg.stale_secs();
+        l.pressed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("A".to_string(), Instant::now() - Duration::from_secs_f64(stale_secs + 1.0));
+        assert!(l.is_new_press("A"), "stale 超时后应重新计数");
+    }
+
+    /// 安全阀：pressed 集合超过 256 时清理 stale 残留。
+    #[test]
+    fn is_new_press_cleans_up_stale_entries_when_large() {
+        let l = InputListener::new(test_config());
+        {
+            let mut pressed = l.pressed.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..250 {
+                pressed.insert(format!("Fresh{i}"), Instant::now());
+            }
+            let stale = Instant::now()
+                - Duration::from_secs_f64(l.cfg.stale_secs() + 1.0);
+            for i in 0..60 {
+                pressed.insert(format!("Aged{i}"), stale);
+            }
+        }
+        // 集合 310 > 256：触发 retain 清理，stale 键被移除后可重新计数
+        assert!(l.is_new_press("Aged0"));
+        let pressed = l.pressed.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!pressed.contains_key("Aged1"), "stale 残留应被清理");
+        assert!(pressed.contains_key("Fresh0"), "未超时按键应保留");
+    }
+
+    /// 滚轮合并：窗口内同方向只计 1 次；方向切换或窗口过期重新计数。
+    #[test]
+    fn is_new_scroll_burst_merges_same_direction_only() {
+        let l = InputListener::new(test_config());
+        assert!(l.is_new_scroll_burst("上"));
+        assert!(!l.is_new_scroll_burst("上"), "窗口内同方向应合并");
+        assert!(l.is_new_scroll_burst("下"), "方向切换应立即计数");
+        assert!(!l.is_new_scroll_burst("下"));
+
+        *l.scroll.lock().unwrap_or_else(|e| e.into_inner()) = (
+            Instant::now() - Duration::from_secs_f64(l.cfg.burst_window() + 1.0),
+            "上",
+        );
+        assert!(l.is_new_scroll_burst("上"), "窗口过期后应重新计数");
+    }
+
+    /// process_event 过滤分支：修饰键/功能键/未知键/鼠标关闭均不触发回调；
+    /// ignore_key_repeat 生效时长按重复也不计数。
+    #[test]
+    fn process_event_filters_keys_and_respects_mouse_toggle() {
+        let dir = std::env::temp_dir().join(format!("ff_listener_db_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+        let db = crate::db::Database::init_readonly();
+
+        let l = InputListener::new(test_config());
+        l.cfg.ignore_modifiers.store(true, Ordering::Relaxed);
+        l.cfg.ignore_functions.store(true, Ordering::Relaxed);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_cb = Arc::clone(&hits);
+        l.add_key_callback(Arc::new(move |_| {
+            hits_cb.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        let ev = |t: rdev::EventType| rdev::Event {
+            event_type: t,
+            name: None,
+            time: SystemTime::now(),
+        };
+        l.process_event(&db, &ev(rdev::EventType::KeyPress(Key::ShiftLeft)));
+        l.process_event(&db, &ev(rdev::EventType::KeyPress(Key::F5)));
+        l.process_event(&db, &ev(rdev::EventType::KeyPress(Key::Unknown(173))));
+        assert_eq!(hits.load(Ordering::Relaxed), 0, "修饰键/功能键/未知键不应触发回调");
+
+        l.process_event(&db, &ev(rdev::EventType::KeyPress(Key::KeyA)));
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        // ignore_key_repeat 默认开启：窗口内重复按下不计
+        l.process_event(&db, &ev(rdev::EventType::KeyPress(Key::KeyA)));
+        assert_eq!(hits.load(Ordering::Relaxed), 1, "长按重复不应计数");
+
+        // 鼠标统计关闭：滚轮不触发；重新开启后同方向窗口内合并
+        l.cfg.mouse_enabled.store(false, Ordering::Relaxed);
+        l.process_event(&db, &ev(rdev::EventType::Wheel { delta_x: 0, delta_y: 120 }));
+        assert_eq!(hits.load(Ordering::Relaxed), 1, "mouse_enabled=false 时滚轮不应计数");
+
+        l.cfg.mouse_enabled.store(true, Ordering::Relaxed);
+        l.process_event(&db, &ev(rdev::EventType::Wheel { delta_x: 0, delta_y: 120 }));
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+        l.process_event(&db, &ev(rdev::EventType::Wheel { delta_x: 0, delta_y: 120 }));
+        assert_eq!(hits.load(Ordering::Relaxed), 2, "窗口内同方向滚轮应合并");
+        l.process_event(&db, &ev(rdev::EventType::Wheel { delta_x: 0, delta_y: -120 }));
+        assert_eq!(hits.load(Ordering::Relaxed), 3, "方向切换应计数");
+
+        crate::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
