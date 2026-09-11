@@ -30,6 +30,7 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
         &[
             ("flush_interval", "10"),
             ("backup_on_exit", "true"),
+            ("online_backup_interval_hours", "24"),
             ("max_backups", "5"),
             ("auto_vacuum_days", "7"),
             ("yearly_archive", "true"),

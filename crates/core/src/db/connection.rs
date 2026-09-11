@@ -17,29 +17,42 @@ use rusqlite::Connection;
 // 只读连接不参与写锁，WAL 模式下可安全并发；文件被替换/移动后通过
 // [`clear_ro_cache`] 失效（归档/导入/压缩时调用）。
 thread_local! {
-    static RO_POOL: RefCell<HashMap<PathBuf, Connection>> = RefCell::new(HashMap::new());
+    static RO_POOL: RefCell<HashMap<PathBuf, (Connection, std::time::Instant)>> =
+        RefCell::new(HashMap::new());
 }
 
-// 连接缓存上限：超过则整体清空，防止多年份库长期运行后无界增长。
+// 连接缓存上限：超过则按 LRU 淘汰最久未用的条目，防止多年份库长期运行后无界增长。
 const RO_POOL_MAX: usize = 4;
 
 /// 使用缓存中的只读连接执行 `f`。连接不存在或打开失败时返回 `None`。
 pub fn with_ro_conn<T>(path: &Path, f: impl FnOnce(&Connection) -> T) -> Option<T> {
     RO_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
-        if pool.len() > RO_POOL_MAX {
-            pool.clear();
-        }
         if !pool.contains_key(path) {
+            // LRU 淘汰最久未用条目（此前整体 clear 会造成缓存抖动）
+            if pool.len() >= RO_POOL_MAX {
+                let oldest = pool
+                    .iter()
+                    .min_by_key(|(_, (_, last_used))| *last_used)
+                    .map(|(k, _)| k.clone());
+                if let Some(oldest) = oldest {
+                    pool.remove(&oldest);
+                }
+            }
             match open_ro(path) {
                 Ok(conn) => {
-                    pool.insert(path.to_path_buf(), conn);
+                    pool.insert(path.to_path_buf(), (conn, std::time::Instant::now()));
                 }
                 Err(_) => return None,
             }
         }
-        let conn = pool.get(path).unwrap();
-        Some(f(conn))
+        match pool.get_mut(path) {
+            Some((conn, last_used)) => {
+                *last_used = std::time::Instant::now();
+                Some(f(conn))
+            }
+            None => None,
+        }
     })
 }
 
@@ -106,6 +119,10 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
             key_name TEXT NOT NULL,
             count INTEGER NOT NULL,
             PRIMARY KEY (date_key, key_name)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS active_seconds (
+            date_key INTEGER PRIMARY KEY,
+            seconds INTEGER NOT NULL
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,

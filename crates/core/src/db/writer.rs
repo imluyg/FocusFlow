@@ -33,6 +33,9 @@ enum Signal {
     Stop,
 }
 
+/// 连续活跃判定：与上一事件间隔 ≤ 该秒数视为连续活跃（累计活跃时长）。
+const ACTIVE_GAP_SECS: i64 = 60;
+
 /// 内存中的聚合增量（未落库部分）。
 #[derive(Default)]
 struct AggDeltas {
@@ -42,11 +45,30 @@ struct AggDeltas {
     hourly: HashMap<(i64, i64), i64>,
     /// (date_key, key_name) -> count
     keys: HashMap<(i64, String), i64>,
+    /// (date_key) -> 当日累计活跃秒数
+    active: HashMap<i64, i64>,
+    /// 上一个事件的时间戳（连续活跃判定用；flush 取走增量时保留）
+    last_ts: i64,
 }
 
 impl AggDeltas {
     fn is_empty(&self) -> bool {
-        self.daily.is_empty() && self.hourly.is_empty() && self.keys.is_empty()
+        self.daily.is_empty()
+            && self.hourly.is_empty()
+            && self.keys.is_empty()
+            && self.active.is_empty()
+    }
+
+    /// 取走待落库增量。`last_ts` 保留在内存聚合中，
+    /// 否则每次 flush 都会打断连续活跃判定（每 10 秒白丢一段时长）。
+    fn take_for_flush(&mut self) -> AggDeltas {
+        AggDeltas {
+            daily: std::mem::take(&mut self.daily),
+            hourly: std::mem::take(&mut self.hourly),
+            keys: std::mem::take(&mut self.keys),
+            active: std::mem::take(&mut self.active),
+            last_ts: self.last_ts,
+        }
     }
 }
 
@@ -57,6 +79,8 @@ struct WriterState {
     sig_tx: mpsc::Sender<Signal>,
     /// 今日计数（内存缓存）
     today_count: AtomicU64,
+    /// 今日活跃秒数（内存缓存）
+    today_active: AtomicU64,
     /// 今日日期键（YYYYMMDD），用于跨天重置
     today_key: AtomicU64,
     /// 线程是否存活
@@ -88,10 +112,26 @@ impl DbWriter {
                 .unwrap_or(0)
                 .max(0) as u64
         };
+        let today_base_active = {
+            let path = paths::current_year_db_path();
+            connection::open_ro(&path)
+                .ok()
+                .and_then(|conn| {
+                    conn.query_row(
+                        "SELECT COALESCE(seconds, 0) FROM active_seconds WHERE date_key = ?1",
+                        [queries::day_key_of_date(chrono::Local::now().date_naive())],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or(0)
+                .max(0) as u64
+        };
         let state = Arc::new(WriterState {
             agg: Mutex::new(AggDeltas::default()),
             sig_tx,
             today_count: AtomicU64::new(today_base_count),
+            today_active: AtomicU64::new(today_base_active),
             today_key: AtomicU64::new(current_day_key()),
             alive: AtomicBool::new(true),
         });
@@ -116,11 +156,12 @@ impl DbWriter {
     /// 记录一次按键：累加到内存聚合（非阻塞，永不阻塞监听热路径）。
     pub fn record(&self, key_name: &str, timestamp: i64) {
         let state = &*self.state;
-        // 跨天检查：日期变化则重置今日计数（避免次日显示累计值）
+        // 跨天检查：日期变化则重置今日计数/活跃时长（避免次日显示累计值）
         let day = current_day_key();
         if state.today_key.load(Ordering::Relaxed) != day {
             state.today_key.store(day, Ordering::Relaxed);
             state.today_count.store(0, Ordering::Relaxed);
+            state.today_active.store(0, Ordering::Relaxed);
         }
         state.today_count.fetch_add(1, Ordering::Relaxed);
 
@@ -130,11 +171,32 @@ impl DbWriter {
         *agg.daily.entry(day_key).or_insert(0) += 1;
         *agg.hourly.entry((day_key, hour)).or_insert(0) += 1;
         *agg.keys.entry((day_key, key_name.to_string())).or_insert(0) += 1;
+        // 活跃时长：与上一事件间隔 ≤ ACTIVE_GAP_SECS 视为连续活跃
+        let contrib = if agg.last_ts > 0
+            && timestamp >= agg.last_ts
+            && timestamp - agg.last_ts <= ACTIVE_GAP_SECS
+        {
+            timestamp - agg.last_ts
+        } else {
+            0
+        };
+        agg.last_ts = timestamp;
+        if contrib > 0 {
+            *agg.active.entry(day_key).or_insert(0) += contrib;
+            state
+                .today_active
+                .fetch_add(contrib as u64, Ordering::Relaxed);
+        }
     }
 
     /// 今日计数（内存缓存值）。
     pub fn today_count(&self) -> u64 {
         self.state.today_count.load(Ordering::Relaxed)
+    }
+
+    /// 今日活跃秒数（内存缓存值）。
+    pub fn today_active_seconds(&self) -> u64 {
+        self.state.today_active.load(Ordering::Relaxed)
     }
 
     /// 是否有未落库的增量（重聚合前判断是否需要先 flush）。
@@ -268,7 +330,7 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
         if agg.is_empty() {
             return;
         }
-        std::mem::take(&mut *agg)
+        agg.take_for_flush()
     };
 
     let max_retries = 3;
@@ -306,6 +368,15 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
                     )?;
                     for ((dk, key), n) in &pending.keys {
                         stmt.execute(rusqlite::params![dk, key, n])?;
+                    }
+                }
+                {
+                    let mut stmt = c.prepare(
+                        "INSERT INTO active_seconds (date_key, seconds) VALUES (?1, ?2)
+                         ON CONFLICT(date_key) DO UPDATE SET seconds = seconds + excluded.seconds",
+                    )?;
+                    for (dk, n) in &pending.active {
+                        stmt.execute(rusqlite::params![dk, n])?;
                     }
                 }
                 Ok(())
@@ -364,6 +435,9 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
     for ((dk, key), n) in pending.keys {
         *agg.keys.entry((dk, key)).or_insert(0) += n;
     }
+    for (dk, n) in pending.active {
+        *agg.active.entry(dk).or_insert(0) += n;
+    }
 }
 
 #[cfg(test)]
@@ -412,6 +486,20 @@ mod tests {
         );
         assert_eq!(agg.keys.get(&(dk, "A".to_string())), Some(&2));
         drop(agg);
+        w.stop();
+    }
+
+    /// 活跃时长：与上一事件间隔 ≤ 60 秒累计连续活跃，超间隔或首事件不累计。
+    #[test]
+    fn record_tracks_active_seconds() {
+        let w = DbWriter::start(Duration::from_secs(3600));
+        let t0 = queries::now_ts();
+        w.record("A", t0);
+        w.record("A", t0 + 10); // 间隔 10s：活跃 +10
+        w.record("A", t0 + 100); // 间隔 90s > 60s：不累计
+        assert_eq!(w.state.today_active.load(Ordering::Relaxed), 10);
+        w.record("A", t0 + 102); // 间隔 2s：活跃 +2
+        assert_eq!(w.state.today_active.load(Ordering::Relaxed), 12);
         w.stop();
     }
 }

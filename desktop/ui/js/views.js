@@ -1,7 +1,7 @@
 // 统计视图（排行/分组/趋势/小时/星期）与设置页、数据操作。
 
 import { invoke } from "./tauri.js";
-import { $, fmt, escapeHtml, WD } from "./utils.js";
+import { $, fmt, fmtDuration, escapeHtml, WD } from "./utils.js";
 import { appState, rankFilter } from "./state.js";
 import { lineChart, barChart } from "./charts.js";
 
@@ -17,6 +17,7 @@ function applyMax(s) {
 // 轻量数据：今日/速度/周期（高频推送）
 export function applyLive(s) {
   $("st-today").textContent = fmt(s.today_count);
+  $("st-active").textContent = fmtDuration(s.active_seconds);
   $("st-cpm").textContent = fmt(s.cpm) + " 次/分";
 
   const periodLabel = s.period === -1 ? "今日" : s.period === 0 ? "总计" : s.period + "天";

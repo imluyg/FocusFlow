@@ -38,6 +38,8 @@ pub struct ChartAgg {
 pub struct SharedStats {
     pub today_count: i64,
     pub cpm: i64,
+    /// 今日活跃秒数（事件间隔 ≤ 60s 视为连续活跃）
+    pub active_seconds: i64,
     pub period: i64, // -1=今日, 0=总计, N=天数
     #[serde(flatten)]
     pub agg: ChartAgg,
@@ -48,6 +50,8 @@ pub struct SharedStats {
 pub struct LiveStats {
     pub today_count: i64,
     pub cpm: i64,
+    /// 今日活跃秒数（事件间隔 ≤ 60s 视为连续活跃）
+    pub active_seconds: i64,
     pub period: i64, // -1=今日, 0=总计, N=天数
     /// 当前周期最高单日（今日破纪录时随快节奏即时更新）
     pub max_day: i64,
@@ -720,6 +724,7 @@ fn spawn_stats_worker(
             let mut last_heavy = Instant::now() - Duration::from_secs(3600);
             let mut prev_today_count: i64 = -1;
             let mut prev_cpm: i64 = -1;
+            let mut prev_active: i64 = -1;
             // 上次重聚合时的今日计数：空闲且数据未变时跳过重聚合，避免无谓的整库查询
             let mut last_heavy_today: i64 = -1;
             // 各周期最高单日缓存：period -> (次数, 日期)；重聚合播种，今日破纪录时快节奏即时更新
@@ -739,6 +744,8 @@ fn spawn_stats_worker(
                 let forced = refresh_now.swap(false, Ordering::Relaxed);
                 let period_changed = period_val != prev_period;
                 let cur_today = db.writer().map(|w| w.today_count()).unwrap_or(0) as i64;
+                let cur_active =
+                    db.writer().map(|w| w.today_active_seconds()).unwrap_or(0) as i64;
                 let active = cur_today != prev_today_count;
                 let heavy_elapsed_ms = last_heavy.elapsed().as_millis() as u64;
                 let day_ce = {
@@ -860,17 +867,21 @@ fn spawn_stats_worker(
                     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
                     s.today_count = today_count;
                     s.cpm = cpm;
+                    s.active_seconds = cur_active;
                     s.period = period_val;
                     s.agg.max_day = max_day;
                     s.agg.max_day_date = max_day_date.clone();
                 }
 
-                let live_changed =
-                    today_count != prev_today_count || cpm != prev_cpm || period_val != prev_period;
+                let live_changed = today_count != prev_today_count
+                    || cpm != prev_cpm
+                    || cur_active != prev_active
+                    || period_val != prev_period;
                 if live_changed {
                     let live = LiveStats {
                         today_count,
                         cpm,
+                        active_seconds: cur_active,
                         period: period_val,
                         max_day,
                         max_day_date,
@@ -886,6 +897,7 @@ fn spawn_stats_worker(
                 }
                 prev_today_count = today_count;
                 prev_cpm = cpm;
+                prev_active = cur_active;
                 prev_period = period_val;
 
                 if today_count != prev_logged_today {

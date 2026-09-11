@@ -1,6 +1,6 @@
 // 悬浮窗逻辑：事件订阅统计、手动拖动、位置持久化、双击打开主界面
 import { invoke, listen } from "./js/tauri.js";
-import { fmt } from "./js/utils.js";
+import { fmt, fmtDuration } from "./js/utils.js";
 
 const appWindow = window.__TAURI__.window.getCurrentWindow();
 const PhysicalPosition = window.__TAURI__.window.PhysicalPosition;
@@ -73,12 +73,29 @@ async function persistPosition() {
 }
 
 // ===== 数据 =====
+// 显示口径（config gui.floating_metric）："times"=按键次数（默认），
+// "duration"=活跃时长，"both"=两者都显示
+let metric = "times";
+
 function apply(s) {
-  document.getElementById("today").textContent = fmt(s.today_count);
+  const durationEl = document.getElementById("duration");
+  if (metric === "duration") {
+    document.getElementById("today").textContent = fmtDuration(s.active_seconds);
+    durationEl.textContent = fmtDuration(s.active_seconds);
+  } else {
+    document.getElementById("today").textContent = fmt(s.today_count);
+    durationEl.textContent = fmtDuration(s.active_seconds);
+  }
+  const durRow = document.getElementById("row-duration");
+  if (durRow) durRow.style.display = metric === "both" ? "" : "none";
   document.getElementById("cpm").textContent = String(s.cpm || 0);
 }
 
 (async () => {
+  try {
+    const m = await invoke("get_config", { section: "gui", key: "floating_metric" });
+    if (m === "duration" || m === "both") metric = m;
+  } catch (e) {}
   try {
     const dark = (await invoke("get_config", { section: "gui", key: "theme" })) === "dark";
     document.body.classList.toggle("dark", dark);

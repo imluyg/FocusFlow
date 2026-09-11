@@ -13,6 +13,7 @@ pub fn get_live(state: State<'_, Arc<AppState>>) -> LiveStats {
     LiveStats {
         today_count: s.today_count,
         cpm: s.cpm,
+        active_seconds: s.active_seconds,
         period: s.period,
         max_day: s.agg.max_day,
         max_day_date: s.agg.max_day_date.clone(),

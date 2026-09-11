@@ -103,10 +103,21 @@ fn spawn_tray_updater(app: &App, paused_icon: tauri::image::Image<'static>) {
                 let s = state.shared.lock().unwrap_or_else(|e| e.into_inner());
                 let paused = state.listener.is_paused();
                 let paused_now = LAST_PAUSED.swap(paused, Ordering::SeqCst) != paused;
+                let active = s.active_seconds;
+                let active_str = if active > 0 {
+                    format!(
+                        " · 活跃 {}时{}分",
+                        active / 3600,
+                        (active % 3600) / 60
+                    )
+                } else {
+                    String::new()
+                };
                 let tooltip = format!(
-                    "FocusFlow - 今日 {} · 速度 {}/分{}",
+                    "FocusFlow - 今日 {} · 速度 {}/分{}{}",
                     s.today_count,
                     s.cpm,
+                    active_str,
                     if paused { " · 已暂停" } else { "" }
                 );
                 (

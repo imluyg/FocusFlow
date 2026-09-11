@@ -55,6 +55,15 @@ impl Database {
             Duration::from_secs(config.get_int("database", "flush_interval", 10).max(1) as u64);
         let writer = Some(DbWriter::start(flush_interval));
 
+        // 运行中定时在线备份：进程被强杀不再丢失自上次备份后的全部数据（0 = 关闭）
+        let backup_hours = config.get_int("database", "online_backup_interval_hours", 24);
+        if backup_hours > 0 {
+            maintenance::start_periodic_backup(
+                backup_hours as u64,
+                config.get_int("database", "max_backups", 5).max(1),
+            );
+        }
+
         Ok(Arc::new(Self { writer }))
     }
 

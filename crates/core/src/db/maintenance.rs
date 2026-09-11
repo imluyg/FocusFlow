@@ -354,6 +354,28 @@ fn backup_db_file(src: &Path, dst: &Path) -> bool {
     }
 }
 
+/// 启动运行中定时在线备份线程：每 `interval_hours` 小时静默备份一次全部年度库
+/// （0 = 关闭）。进程被强杀时不再丢失自上次退出备份后的全部数据。
+/// 备份走 SQLite 在线备份 API，不阻塞读写（与写线程的短事务天然错开）。
+pub fn start_periodic_backup(interval_hours: u64, max_backups: i64) {
+    if interval_hours == 0 {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("periodic-backup".into())
+        .spawn(move || {
+            let interval = std::time::Duration::from_secs(interval_hours * 3600);
+            tracing::info!("定时在线备份已启动：每 {interval_hours} 小时一次");
+            loop {
+                std::thread::sleep(interval);
+                if backup_database(max_backups).is_none() {
+                    tracing::debug!("定时备份：无可备份的年度库");
+                }
+            }
+        })
+        .expect("启动定时备份线程失败");
+}
+
 /// 备份所有年度数据库到 backup/ 目录，返回首个备份路径。
 pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
     std::fs::create_dir_all(paths::backup_dir()).ok();

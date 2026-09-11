@@ -32,3 +32,11 @@ export function toast(msg) {
   clearTimeout(toast._timer);
   toast._timer = setTimeout(() => el.classList.remove("show"), 3000);
 }
+
+// 时长格式化：秒 → "X小时Y分" / "Y分钟"
+export function fmtDuration(sec) {
+  sec = Math.max(0, Math.floor(Number(sec) || 0));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return h > 0 ? `${h}小时${m}分` : `${m}分钟`;
+}
