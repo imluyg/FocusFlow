@@ -47,9 +47,24 @@
     .val { color: var(--fg); font-size: 13px; font-variant-numeric: tabular-nums; }
     .slash { color: var(--fg); font-size: 9px; }
     .cpm { color: var(--accent); font-size: 13px; font-variant-numeric: tabular-nums; }
+    /* 暂停态：整体降透明度 + 右上角角标，让"正在暂停"一眼可见 */
+    body.paused .card { opacity: 0.55; }
+    .paused-badge {
+      display: none;
+      position: absolute;
+      top: 2px;
+      right: 4px;
+      font-size: 9px;
+      line-height: 1.2;
+      color: var(--warning);
+      font-weight: 600;
+    }
+    body.paused .paused-badge { display: block; }
+    body { position: relative; }
   </style>
 </head>
 <body>
+  <span class="paused-badge">已暂停</span>
   <div class="card">
     <div class="row"><span class="lbl">活跃</span><span class="val" id="today">0</span></div>
     <div class="row" id="row-duration" style="display:none;"><span class="lbl">时长</span><span class="val" id="duration">0分钟</span></div>

@@ -8,7 +8,11 @@ import { applyLive, applyCharts, renderRank, renderApps, renderGroup, renderTren
 
 export function switchView(view) {
   appState.currentView = view;
-  document.querySelectorAll("#view-tabs .tab").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+  document.querySelectorAll("#view-tabs .tab").forEach((b) => {
+    const active = b.dataset.view === view;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", String(active));
+  });
   const ids = ["rank", "apps", "group", "trend", "hourly", "weekday", "plugins", "settings"];
   ids.forEach((id) => {
     const el = $("view-" + id);
@@ -94,7 +98,11 @@ document.querySelectorAll("#view-tabs .tab").forEach((b) => {
 document.querySelectorAll("#trend-days .tab").forEach((b) => {
   b.addEventListener("click", () => {
     appState.trendDays = Number(b.dataset.days);
-    document.querySelectorAll("#trend-days .tab").forEach((x) => x.classList.toggle("active", x === b));
+    document.querySelectorAll("#trend-days .tab").forEach((x) => {
+      const active = x === b;
+      x.classList.toggle("active", active);
+      x.setAttribute("aria-selected", String(active));
+    });
     if (appState.chartsData) renderTrend(appState.chartsData);
   });
 });

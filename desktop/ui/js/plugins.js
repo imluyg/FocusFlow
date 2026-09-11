@@ -226,8 +226,8 @@ export function renderWidget(w) {
       const isOpen = !!(w.open || openModals.has(mid));
       return `<div class="plugin-modal">${w.text ? `<div style="margin:6px 0;"><button class="btn" data-act="modal-open" data-id="${midAttr}">${escapeHtml(w.text)}</button></div>` : ""}
         <div class="modal-overlay" id="${midAttr}" style="display:${isOpen ? "flex" : "none"};" data-act="modal-overlay-cancel" data-name="${escapeHtml(appState.openPluginName)}" data-cancel="${escapeHtml(w.cancel || "")}" data-modal="${midAttr}">
-          <div class="modal-dialog">
-            <div class="modal-head"><span>${escapeHtml(w.title || w.text || "新增")}</span><button class="modal-close" data-act="modal-cancel" data-name="${escapeHtml(appState.openPluginName)}" data-cancel="${escapeHtml(w.cancel || "")}" data-modal="${midAttr}">✕</button></div>
+          <div class="modal-dialog" role="dialog" aria-modal="true" aria-label="${escapeHtml(w.title || w.text || "对话框")}">
+            <div class="modal-head"><span>${escapeHtml(w.title || w.text || "新增")}</span><button class="modal-close" data-act="modal-cancel" data-name="${escapeHtml(appState.openPluginName)}" data-cancel="${escapeHtml(w.cancel || "")}" data-modal="${midAttr}" aria-label="关闭">✕</button></div>
             <div class="modal-body">${bodyHtml}</div>
             <div class="modal-foot">
               <button class="btn ghost" data-act="modal-cancel" data-name="${escapeHtml(appState.openPluginName)}" data-cancel="${escapeHtml(w.cancel || "")}" data-modal="${midAttr}">取消</button>
@@ -250,6 +250,16 @@ export function renderWidget(w) {
 }
 
 // 弹窗表单字段渲染（text / select / date）
+// Esc 关闭最上层的可见弹窗（与关闭按钮行为一致）
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const overlay = [...document.querySelectorAll(".modal-overlay")].find(
+    (o) => o.style.display !== "none"
+  );
+  if (!overlay) return;
+  const btn = overlay.querySelector(".modal-close");
+  if (btn) btn.click();
+});
 function pluginFieldHtml(f) {
   const label = `<span class="lbl">${escapeHtml(f.label || f.text || "")}</span>`;
   const act = f.refresh ? "plugin-field" : "plugin-field-stay";

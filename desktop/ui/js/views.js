@@ -1,6 +1,6 @@
 // 统计视图（排行/分组/趋势/小时/星期）与设置页、数据操作。
 
-import { invoke } from "./tauri.js";
+import { invoke, emit } from "./tauri.js";
 import { $, fmt, fmtDuration, escapeHtml, WD } from "./utils.js";
 import { appState, rankFilter } from "./state.js";
 import { lineChart, barChart } from "./charts.js";
@@ -25,7 +25,9 @@ export function applyLive(s) {
   $("st-avg-label").textContent = s.period === -1 ? "日均(今日)" : s.period === 0 ? "日均(近30天)" : "日均(" + s.period + "天)";
 
   document.querySelectorAll("#period-tabs .tab").forEach((b) => {
-    b.classList.toggle("active", Number(b.dataset.period) === s.period);
+    const active = Number(b.dataset.period) === s.period;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", String(active));
   });
 
   applyMax(s);
@@ -44,13 +46,24 @@ export function applyCharts(s) {
 
 // ===== 前台应用排行 =====
 // 复用按键排行的渲染模式：s.apps 为 [应用名, 累计秒数]（后端已降序截断）。
+// 数据指纹：活跃时每 2s 推送一次 stats-charts，内容未变就跳过整表重建，
+// 避免滚动位置/悬停状态丢失与视觉抖动。
+function skipIfUnchanged(box, fp) {
+  if (box.dataset.fp === fp) return true;
+  box.dataset.fp = fp;
+  return false;
+}
+
 export function renderApps(s) {
   const box = $("view-apps");
   const empty = '<div class="empty">暂无数据</div>';
   if (!s.apps || s.apps.length === 0) {
+    if (skipIfUnchanged(box, "empty")) return;
     box.innerHTML = empty;
     return;
   }
+  const fp = JSON.stringify(s.apps);
+  if (skipIfUnchanged(box, fp)) return;
   const total = s.apps.reduce((acc, [, sec]) => acc + sec, 0);
   const rows = s.apps
     .map(
@@ -70,17 +83,20 @@ function rankIsMouse(k) {
 
 export function renderRank(s) {
   const box = $("view-rank");
+  // 指纹含筛选状态：切筛选时仍会重建，纯数据推送则跳过
+  const fp = JSON.stringify([s.rank, s.mouse_total, s.keyboard_total, rankFilter.value]);
+  if (skipIfUnchanged(box, fp)) return;
   const summary = (hasData) => hasData
     ? `<div class="rank-summary">
         <span>鼠标总次数：<b>${fmt(s.mouse_total)}</b></span>
         <span>键盘总次数：<b>${fmt(s.keyboard_total)}</b></span>
       </div>`
     : "";
-  const filterTabs = (data) => `<div class="tabs" id="rank-filter" style="margin-bottom:10px;">
+  const filterTabs = (data) => `<div class="tabs" id="rank-filter" role="tablist" aria-label="排行筛选" style="margin-bottom:10px;">
       <span style="color:var(--muted);font-size:13px;">筛选</span>
-      <button class="tab ${rankFilter.value === "all" ? "active" : ""}" data-rf="all">全部</button>
-      <button class="tab ${rankFilter.value === "mouse" ? "active" : ""}" data-rf="mouse">鼠标</button>
-      <button class="tab ${rankFilter.value === "keyboard" ? "active" : ""}" data-rf="keyboard">键盘</button>
+      <button class="tab ${rankFilter.value === "all" ? "active" : ""}" data-rf="all" role="tab" aria-selected="${rankFilter.value === "all"}">全部</button>
+      <button class="tab ${rankFilter.value === "mouse" ? "active" : ""}" data-rf="mouse" role="tab" aria-selected="${rankFilter.value === "mouse"}">鼠标</button>
+      <button class="tab ${rankFilter.value === "keyboard" ? "active" : ""}" data-rf="keyboard" role="tab" aria-selected="${rankFilter.value === "keyboard"}">键盘</button>
     </div><div id="rank-result">${data}</div>`;
   const empty = '<div class="empty">暂无数据</div>';
   if (!s.rank || s.rank.length === 0) {
@@ -118,6 +134,8 @@ function bindRankFilter(s) {
 
 export function renderGroup(s) {
   const box = $("view-group");
+  const fp = JSON.stringify([s.group, s.total]);
+  if (skipIfUnchanged(box, fp)) return;
   if (!s.group || s.group.length === 0) {
     box.innerHTML = '<div class="empty">暂无数据</div>';
     return;
@@ -191,10 +209,17 @@ export async function renderSettings() {
   `;
 
   $("set-dark").addEventListener("change", async (e) => {
-    await invoke("set_config", { section: "gui", key: "theme", value: e.target.checked ? "dark" : "light" });
-    document.body.classList.toggle("dark", e.target.checked);
-    // 图表配色取自 CSS 变量：切换主题后立即用当前数据重绘，不等下次推送
-    if (appState.chartsData && appState.currentView === "trend") renderTrend(appState.chartsData);
+    const dark = e.target.checked;
+    await invoke("set_config", { section: "gui", key: "theme", value: dark ? "dark" : "light" });
+    document.body.classList.toggle("dark", dark);
+    // 图表配色取自 CSS 变量：切换主题后立即重绘当前统计视图。
+    // 不能只重绘 trend——空闲时后端可能长时间不推送 stats-charts，
+    // 停在小时/星期分布页会一直保持旧配色。
+    const chartViews = { rank: renderRank, apps: renderApps, group: renderGroup, trend: renderTrend, hourly: renderHourly, weekday: renderWeekday };
+    const rerender = chartViews[appState.currentView];
+    if (appState.chartsData && rerender) rerender(appState.chartsData);
+    // 悬浮窗只在启动时读一次主题，这里广播让它实时跟随
+    emit("theme-changed", dark).catch(() => {});
   });
   $("set-paused").addEventListener("change", async (e) => {
     // 同步到实际暂停状态

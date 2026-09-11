@@ -1,5 +1,7 @@
 /* ===== FocusFlow 主题令牌（唯一来源，主窗口与悬浮窗共享） ===== */
 :root {
+  /* 原生控件（下拉/滚动条/复选框）跟随主题配色 */
+  color-scheme: light;
   --bg: #F5F7FA;
   --page-top: #E8EFFC;
   --page-bottom: #F7FAFE;
@@ -7,6 +9,8 @@
   --card: #FFFFFF;
   --accent: #4D8CF7;
   --accent-hover: #3B7DE0;
+  /* 深色强调色：仅用于与白字搭配的实底（.tab.active），保证对比度 ≥ 4.5:1 */
+  --accent-strong: #2E6BDF;
   --accent-soft: #E8F0FE;
   --success: #10B981;
   --warning: #F59E0B;
@@ -21,6 +25,7 @@
 }
 
 body.dark {
+  color-scheme: dark;
   --bg: #14161F;
   --page-top: #171B27;
   --page-bottom: #10131C;
@@ -28,6 +33,7 @@ body.dark {
   --card: #1E2331;
   --accent: #5B9CF7;
   --accent-hover: #7AB1FA;
+  --accent-strong: #3B7DE0;
   --accent-soft: #22304A;
   --success: #34D399;
   --warning: #FBBF24;

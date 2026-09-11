@@ -19,14 +19,14 @@
 
     <!-- 统计卡片 -->
     <div class="card">
-      <div class="tabs" id="period-tabs">
+      <div class="tabs" id="period-tabs" role="tablist" aria-label="统计周期">
         <span style="color:var(--muted);font-size:13px;">统计周期</span>
-        <button class="tab active" data-period="-1">今日</button>
-        <button class="tab" data-period="7">7天</button>
-        <button class="tab" data-period="15">15天</button>
-        <button class="tab" data-period="30">30天</button>
-        <button class="tab" data-period="365">1年</button>
-        <button class="tab" data-period="0">总计</button>
+        <button class="tab active" data-period="-1" role="tab" aria-selected="true">今日</button>
+        <button class="tab" data-period="7" role="tab" aria-selected="false">7天</button>
+        <button class="tab" data-period="15" role="tab" aria-selected="false">15天</button>
+        <button class="tab" data-period="30" role="tab" aria-selected="false">30天</button>
+        <button class="tab" data-period="365" role="tab" aria-selected="false">1年</button>
+        <button class="tab" data-period="0" role="tab" aria-selected="false">总计</button>
       </div>
       <div class="stat-cards" style="margin-top:10px;">
         <div class="stat-card"><div class="label">今日活跃</div><div class="value" id="st-today">0</div><div class="label" id="st-active">时长 0秒</div></div>
@@ -39,15 +39,15 @@
 
     <!-- 视图切换 -->
     <div class="card view-tabs">
-      <div class="tabs" id="view-tabs">
-        <button class="tab active" data-view="rank">键鼠排行</button>
-        <button class="tab" data-view="apps">应用排行</button>
-        <button class="tab" data-view="group">分组统计</button>
-        <button class="tab" data-view="trend">趋势图</button>
-        <button class="tab" data-view="hourly">小时分布</button>
-        <button class="tab" data-view="weekday">星期分布</button>
-        <button class="tab" data-view="plugins">插件管理</button>
-        <button class="tab" data-view="settings">设置</button>
+      <div class="tabs" id="view-tabs" role="tablist" aria-label="视图">
+        <button class="tab active" data-view="rank" role="tab" aria-selected="true">键鼠排行</button>
+        <button class="tab" data-view="apps" role="tab" aria-selected="false">应用排行</button>
+        <button class="tab" data-view="group" role="tab" aria-selected="false">分组统计</button>
+        <button class="tab" data-view="trend" role="tab" aria-selected="false">趋势图</button>
+        <button class="tab" data-view="hourly" role="tab" aria-selected="false">小时分布</button>
+        <button class="tab" data-view="weekday" role="tab" aria-selected="false">星期分布</button>
+        <button class="tab" data-view="plugins" role="tab" aria-selected="false">插件管理</button>
+        <button class="tab" data-view="settings" role="tab" aria-selected="false">设置</button>
       </div>
     </div>
 

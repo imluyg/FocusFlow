@@ -6,8 +6,12 @@ const appWindow = window.__TAURI__.window.getCurrentWindow();
 const PhysicalPosition = window.__TAURI__.window.PhysicalPosition;
 
 // ===== 手动拖动 =====
+// 高频 mousemove 用 requestAnimationFrame 合并：每帧最多一次 setPosition IPC，
+// 快速拖动下明显减少跨进程调用（视觉上无差别）。
 let isDown = false;
 let drag = null;
+let rafPending = false;
+let pendingPos = null;
 
 document.addEventListener("mousedown", async (e) => {
   if (e.button !== 0) return;
@@ -20,20 +24,31 @@ document.addEventListener("mousedown", async (e) => {
   }
 });
 
+function flushPosition() {
+  rafPending = false;
+  if (!pendingPos) return;
+  const p = pendingPos;
+  pendingPos = null;
+  appWindow.setPosition(new PhysicalPosition(p.x, p.y)).catch(() => {});
+}
+
 document.addEventListener("mousemove", (e) => {
   if (!isDown) return;
   if (!drag) return;
   const dx = e.screenX - drag.startX;
   const dy = e.screenY - drag.startY;
   if (Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
-  appWindow
-    .setPosition(new PhysicalPosition(drag.winX + dx, drag.winY + dy))
-    .catch(() => {});
+  pendingPos = { x: drag.winX + dx, y: drag.winY + dy };
+  if (!rafPending) {
+    rafPending = true;
+    requestAnimationFrame(flushPosition);
+  }
 });
 
 document.addEventListener("mouseup", () => {
   if (isDown) {
     isDown = false;
+    flushPosition();
     persistPosition();
   }
 });
@@ -43,6 +58,7 @@ document.addEventListener("mouseup", () => {
 function resetDrag() {
   isDown = false;
   drag = null;
+  pendingPos = null;
 }
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) resetDrag();
@@ -102,6 +118,21 @@ function apply(s) {
   } catch (e) {}
   try {
     await listen("stats-live", (e) => apply(e.payload));
+  } catch (e) {}
+  // 主题跟随主窗口：设置页切暗色时广播 theme-changed，悬浮窗实时切换（原需重启）
+  try {
+    await listen("theme-changed", (e) => {
+      document.body.classList.toggle("dark", !!e.payload);
+    });
+  } catch (e) {}
+  // 暂停态反馈：降透明度 + "已暂停"角标（此前暂停时悬浮窗毫无变化）
+  try {
+    document.body.classList.toggle("paused", !!(await invoke("is_paused")));
+  } catch (e) {}
+  try {
+    await listen("pause-changed", (e) => {
+      document.body.classList.toggle("paused", !!e.payload);
+    });
   } catch (e) {}
   try {
     apply(await invoke("get_live"));

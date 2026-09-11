@@ -19,6 +19,22 @@ html, body {
   overflow-y: auto;
 }
 
+/* ===== 滚动条（默认的灰色滚动条与卡片风格冲突） ===== */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--grid-line);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+/* ===== 键盘焦点可见性（WebView2 默认焦点环太弱） ===== */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+
 /* ===== 卡片 ===== */
 .card {
   background: var(--card);
@@ -43,6 +59,10 @@ html, body {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
   gap: 8px;
+}
+/* 窄窗口降列数，避免每张卡片被压得过窄 */
+@media (max-width: 950px) {
+  .stat-cards { grid-template-columns: repeat(3, 1fr); }
 }
 .stat-card {
   background: var(--card);
@@ -78,7 +98,7 @@ html, body {
   cursor: pointer;
 }
 .tab:hover { background: var(--accent-soft); }
-.tab.active { background: var(--accent); color: #fff; font-weight: 600; }
+.tab.active { background: var(--accent-strong); color: #fff; font-weight: 600; }
 
 .view-tabs .tab { font-weight: 600; }
 
