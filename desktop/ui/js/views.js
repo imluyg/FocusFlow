@@ -42,6 +42,27 @@ export function applyCharts(s) {
   // 插件详情页与统计视图的重渲染分发在 main.js 的 stats-charts 监听器中
 }
 
+// ===== 前台应用排行 =====
+// 复用按键排行的渲染模式：s.apps 为 [应用名, 累计秒数]（后端已降序截断）。
+export function renderApps(s) {
+  const box = $("view-apps");
+  const empty = '<div class="empty">暂无数据</div>';
+  if (!s.apps || s.apps.length === 0) {
+    box.innerHTML = empty;
+    return;
+  }
+  const total = s.apps.reduce((acc, [, sec]) => acc + sec, 0);
+  const rows = s.apps
+    .map(
+      ([app, sec], i) =>
+        `<tr><td>${i + 1}</td><td class="key">${escapeHtml(app)}</td><td class="num">${fmtDuration(sec)}</td><td>${total ? ((sec / total) * 100).toFixed(2) : "0.00"}%</td></tr>`
+    )
+    .join("");
+  box.innerHTML = `<table class="grid"><thead><tr>
+    <th class="col-rank">排名</th><th class="col-key">应用</th><th class="col-count">使用时长</th><th class="col-percent">占比</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
 // ===== 键鼠排行 =====
 function rankIsMouse(k) {
   return k.startsWith("鼠标") || k.startsWith("滚轮");

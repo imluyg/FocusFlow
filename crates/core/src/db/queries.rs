@@ -419,6 +419,117 @@ pub fn get_hourly_stats(target_date: Option<chrono::NaiveDate>) -> Vec<i64> {
     result.flatten().unwrap_or_else(|| vec![0i64; 24])
 }
 
+/// 查询前台应用使用时长公共实现：app_usage 求总秒数 + 按应用聚合。
+/// `cond` 为日期条件片段，空串表示全表；表不存在（旧库）时返回 None。
+fn query_apps_in_conn(
+    conn: &rusqlite::Connection,
+    cond: &str,
+    param: Option<i64>,
+) -> Option<(i64, HashMap<String, i64>)> {
+    if !table_exists(conn, "app_usage") {
+        return None;
+    }
+    let where_clause = if cond.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {cond}")
+    };
+    let total: i64 = match param {
+        Some(p) => conn
+            .query_row(
+                &format!("SELECT COALESCE(SUM(seconds), 0) FROM app_usage{where_clause}"),
+                [p],
+                |r| r.get(0),
+            )
+            .unwrap_or(0),
+        None => conn
+            .query_row(
+                "SELECT COALESCE(SUM(seconds), 0) FROM app_usage",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0),
+    };
+    let sql = format!("SELECT app_name, seconds FROM app_usage{where_clause}");
+    let map: HashMap<String, i64> = {
+        let mapper = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?));
+        let rows = match conn.prepare(&sql) {
+            Ok(mut stmt) => match param {
+                Some(p) => stmt
+                    .query_map([p], mapper)
+                    .map(|rows| rows.flatten().collect::<Vec<_>>()),
+                None => stmt
+                    .query_map([], mapper)
+                    .map(|rows| rows.flatten().collect::<Vec<_>>()),
+            },
+            Err(e) => Err(e),
+        };
+        match rows {
+            Ok(list) => list.into_iter().collect(),
+            Err(e) => {
+                tracing::error!("app_usage 查询失败 ({sql}): {e}");
+                return None;
+            }
+        }
+    };
+    Some((total, map))
+}
+
+/// 查询前台应用使用时长：返回 (总秒数, {应用名: 秒数})，周期选择与按键统计一致。
+pub fn get_app_stats(days: Option<i64>, year: Option<i32>) -> (i64, HashMap<String, i64>) {
+    if let Some(y) = year {
+        return apps_single_year(y, days);
+    }
+    let years = query_years(days, None);
+    if years.len() == 1 {
+        return apps_single_year(years[0], days);
+    }
+    // 跨年逐库聚合后在 Rust 侧合并
+    let start_dk = cutoff_day_key(days);
+    let mut total_all: i64 = 0;
+    let mut map_all: HashMap<String, i64> = HashMap::new();
+    for year in years {
+        let path = paths::year_db_path(year);
+        let cond = if start_dk.is_some() {
+            "date_key >= ?1"
+        } else {
+            ""
+        };
+        let result =
+            connection::with_ro_conn(&path, |conn| query_apps_in_conn(conn, cond, start_dk));
+        if let Some((t, m)) = result.flatten() {
+            total_all += t;
+            for (k, v) in m {
+                *map_all.entry(k).or_insert(0) += v;
+            }
+        }
+    }
+    (total_all, map_all)
+}
+
+fn apps_single_year(year: i32, days: Option<i64>) -> (i64, HashMap<String, i64>) {
+    let path = paths::year_db_path(year);
+    let start_dk = cutoff_day_key(days);
+    let cond = if start_dk.is_some() {
+        "date_key >= ?1"
+    } else {
+        ""
+    };
+    let result =
+        connection::with_ro_conn(&path, |conn| query_apps_in_conn(conn, cond, start_dk));
+    result.flatten().unwrap_or((0, HashMap::new()))
+}
+
+/// 查询指定日期前台应用使用时长。
+pub fn get_app_stats_by_date(target_date: chrono::NaiveDate) -> (i64, HashMap<String, i64>) {
+    let dk = day_key_of_date(target_date);
+    let path = paths::year_db_path(target_date.year());
+    let result = connection::with_ro_conn(&path, |conn| {
+        query_apps_in_conn(conn, "date_key = ?1", Some(dk))
+    });
+    result.flatten().unwrap_or((0, HashMap::new()))
+}
+
 /// 查询最近 N 天按星期统计（0=周一 ... 6=周日）。
 pub fn get_weekday_stats(days: i64) -> HashMap<i64, i64> {
     let daily = get_daily_counts(days, None);

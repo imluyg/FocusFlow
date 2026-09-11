@@ -4,12 +4,12 @@ import { invoke, listen } from "./tauri.js";
 import { $ } from "./utils.js";
 import { appState } from "./state.js";
 import { renderPlugins, openPlugin, closePlugin, renderPluginDetail, pluginBtn, pluginBtnSel, pluginField, pluginFieldStay, pluginSelectRow, pluginSelectAll, modalOpen, modalCancel, modalSubmit, modalAction } from "./plugins.js";
-import { applyLive, applyCharts, renderRank, renderGroup, renderTrend, renderHourly, renderWeekday, renderSettings, doImport, doExport, doVacuum, doBackup } from "./views.js";
+import { applyLive, applyCharts, renderRank, renderApps, renderGroup, renderTrend, renderHourly, renderWeekday, renderSettings, doImport, doExport, doVacuum, doBackup } from "./views.js";
 
 export function switchView(view) {
   appState.currentView = view;
   document.querySelectorAll("#view-tabs .tab").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
-  const ids = ["rank", "group", "trend", "hourly", "weekday", "plugins", "settings"];
+  const ids = ["rank", "apps", "group", "trend", "hourly", "weekday", "plugins", "settings"];
   ids.forEach((id) => {
     const el = $("view-" + id);
     if (el) el.style.display = id === view ? "" : "none";
@@ -26,6 +26,7 @@ function renderCurrentView() {
   if (!appState.chartsData) return;
   switch (appState.currentView) {
     case "rank": return renderRank(appState.chartsData);
+    case "apps": return renderApps(appState.chartsData);
     case "group": return renderGroup(appState.chartsData);
     case "trend": return renderTrend(appState.chartsData);
     case "hourly": return renderHourly(appState.chartsData);

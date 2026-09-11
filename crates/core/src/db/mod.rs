@@ -13,8 +13,9 @@ use std::time::Duration;
 use chrono::Datelike;
 
 pub use queries::{
-    available_years, get_alltime_max_day, get_daily_counts, get_hourly_stats, get_stats,
-    get_stats_by_date, get_today_count, get_weekday_stats, invalidate_years_cache,
+    available_years, get_alltime_max_day, get_app_stats, get_app_stats_by_date, get_daily_counts,
+    get_hourly_stats, get_stats, get_stats_by_date, get_today_count, get_weekday_stats,
+    invalidate_years_cache,
 };
 pub use writer::DbWriter;
 
@@ -63,6 +64,9 @@ impl Database {
                 config.get_int("database", "max_backups", 5).max(1),
             );
         }
+
+        // 前台应用使用时长采集（Windows；[app_stats] enabled=false 或 exclude 可关停）
+        crate::app_stats::start_sampler(Arc::clone(writer.as_ref().unwrap()));
 
         Ok(Arc::new(Self { writer }))
     }

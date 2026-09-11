@@ -47,6 +47,8 @@ struct AggDeltas {
     keys: HashMap<(i64, String), i64>,
     /// (date_key) -> 当日累计活跃秒数
     active: HashMap<i64, i64>,
+    /// ((date_key, 应用名)) -> 当日累计使用秒数（前台应用统计）
+    apps: HashMap<(i64, String), i64>,
     /// 上一个事件的时间戳（连续活跃判定用；flush 取走增量时保留）
     last_ts: i64,
 }
@@ -57,6 +59,7 @@ impl AggDeltas {
             && self.hourly.is_empty()
             && self.keys.is_empty()
             && self.active.is_empty()
+            && self.apps.is_empty()
     }
 
     /// 取走待落库增量。`last_ts` 保留在内存聚合中，
@@ -67,6 +70,7 @@ impl AggDeltas {
             hourly: std::mem::take(&mut self.hourly),
             keys: std::mem::take(&mut self.keys),
             active: std::mem::take(&mut self.active),
+            apps: std::mem::take(&mut self.apps),
             last_ts: self.last_ts,
         }
     }
@@ -197,6 +201,14 @@ impl DbWriter {
     /// 今日活跃秒数（内存缓存值）。
     pub fn today_active_seconds(&self) -> u64 {
         self.state.today_active.load(Ordering::Relaxed)
+    }
+
+    /// 采集线程调用：累计前台应用使用秒数（进写线程内存聚合，随周期 flush 落库）。
+    pub(crate) fn add_app_seconds(&self, date_key: i64, app_name: &str, seconds: i64) {
+        let mut agg = self.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+        *agg.apps
+            .entry((date_key, app_name.to_string()))
+            .or_insert(0) += seconds;
     }
 
     /// 是否有未落库的增量（重聚合前判断是否需要先 flush）。
@@ -379,6 +391,15 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
                         stmt.execute(rusqlite::params![dk, n])?;
                     }
                 }
+                {
+                    let mut stmt = c.prepare(
+                        "INSERT INTO app_usage (date_key, app_name, seconds) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(date_key, app_name) DO UPDATE SET seconds = seconds + excluded.seconds",
+                    )?;
+                    for ((dk, app), n) in &pending.apps {
+                        stmt.execute(rusqlite::params![dk, app, n])?;
+                    }
+                }
                 Ok(())
             };
             match apply() {
@@ -437,6 +458,9 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
     }
     for (dk, n) in pending.active {
         *agg.active.entry(dk).or_insert(0) += n;
+    }
+    for ((dk, app), n) in pending.apps {
+        *agg.apps.entry((dk, app)).or_insert(0) += n;
     }
 }
 

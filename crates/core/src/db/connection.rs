@@ -124,6 +124,12 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
             date_key INTEGER PRIMARY KEY,
             seconds INTEGER NOT NULL
         ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS app_usage (
+            date_key INTEGER NOT NULL,
+            app_name TEXT NOT NULL,
+            seconds INTEGER NOT NULL,
+            PRIMARY KEY (date_key, app_name)
+        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL

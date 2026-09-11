@@ -1208,6 +1208,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows",
  "winreg 0.56.0",
 ]
 

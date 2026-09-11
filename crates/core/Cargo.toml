@@ -25,5 +25,14 @@ rdev = "0.5"
 # Lua 脚本（插件系统）
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 
+# 前台应用统计（仅用窗口 API + 进程快照，不对其他进程开句柄）
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
+
 [lints]
 workspace = true

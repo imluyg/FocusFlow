@@ -4,6 +4,7 @@
 //! 等纯逻辑模块也将放在此 crate 中（无 GUI 依赖，可被 CLI 与 GUI 复用）。
 
 pub mod accounting;
+pub mod app_stats;
 pub mod autostart;
 pub mod config;
 pub mod db;

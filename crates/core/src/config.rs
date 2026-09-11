@@ -38,6 +38,14 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     );
     s("stats", &[("cpm_window", "60")]);
     s(
+        "app_stats",
+        &[
+            // 前台应用统计：enabled=false 关停；exclude 命中的进程完全不记录
+            ("enabled", "true"),
+            ("exclude", ""),
+        ],
+    );
+    s(
         "listener",
         &[
             ("ignore_modifier_keys", "false"),
