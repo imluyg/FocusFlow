@@ -20,7 +20,8 @@ pub fn log_file_path() -> std::path::PathBuf {
     crate::paths::log_dir().join("focusflow.log")
 }
 
-/// 安装全局 panic hook：未捕获的 panic 记录为 critical 日志。
+/// 安装全局 panic hook：未捕获的 panic 记录为 critical 日志，
+/// 并在进程终止前把未落库增量写入恢复文件（下次启动回放，见 db::writer）。
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let payload = info
@@ -33,6 +34,7 @@ pub fn install_panic_hook() {
             .map(|l| format!("{}:{}", l.file(), l.line()))
             .unwrap_or_else(|| "?".to_string());
         tracing::error!(target: "panic", "未捕获的 panic: {payload} @ {location}");
+        crate::db::writer::panic_recovery_snapshot();
     }));
 }
 

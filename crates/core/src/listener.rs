@@ -567,7 +567,9 @@ mod tests {
     fn test_config() -> &'static FocusFlowConfig {
         let dir = std::env::temp_dir().join(format!("ff_listener_cfg_{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
-        Box::leak(Box::new(FocusFlowConfig::load(dir.join("config.ini")).unwrap()))
+        Box::leak(Box::new(
+            FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
+        ))
     }
 
     #[test]
@@ -588,10 +590,10 @@ mod tests {
 
         // 手工把按下时刻拨到 stale 窗口之外（默认 15 秒，避免真实等待）
         let stale_secs = l.cfg.stale_secs();
-        l.pressed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert("A".to_string(), Instant::now() - Duration::from_secs_f64(stale_secs + 1.0));
+        l.pressed.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            "A".to_string(),
+            Instant::now() - Duration::from_secs_f64(stale_secs + 1.0),
+        );
         assert!(l.is_new_press("A"), "stale 超时后应重新计数");
     }
 
@@ -604,8 +606,7 @@ mod tests {
             for i in 0..250 {
                 pressed.insert(format!("Fresh{i}"), Instant::now());
             }
-            let stale = Instant::now()
-                - Duration::from_secs_f64(l.cfg.stale_secs() + 1.0);
+            let stale = Instant::now() - Duration::from_secs_f64(l.cfg.stale_secs() + 1.0);
             for i in 0..60 {
                 pressed.insert(format!("Aged{i}"), stale);
             }
@@ -637,6 +638,7 @@ mod tests {
     /// ignore_key_repeat 生效时长按重复也不计数。
     #[test]
     fn process_event_filters_keys_and_respects_mouse_toggle() {
+        let _lock = crate::paths::test_app_dir_lock();
         let dir = std::env::temp_dir().join(format!("ff_listener_db_{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         crate::paths::set_app_dir(&dir);
@@ -659,7 +661,11 @@ mod tests {
         l.process_event(&db, &ev(rdev::EventType::KeyPress(Key::ShiftLeft)));
         l.process_event(&db, &ev(rdev::EventType::KeyPress(Key::F5)));
         l.process_event(&db, &ev(rdev::EventType::KeyPress(Key::Unknown(173))));
-        assert_eq!(hits.load(Ordering::Relaxed), 0, "修饰键/功能键/未知键不应触发回调");
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            0,
+            "修饰键/功能键/未知键不应触发回调"
+        );
 
         l.process_event(&db, &ev(rdev::EventType::KeyPress(Key::KeyA)));
         assert_eq!(hits.load(Ordering::Relaxed), 1);
@@ -669,15 +675,43 @@ mod tests {
 
         // 鼠标统计关闭：滚轮不触发；重新开启后同方向窗口内合并
         l.cfg.mouse_enabled.store(false, Ordering::Relaxed);
-        l.process_event(&db, &ev(rdev::EventType::Wheel { delta_x: 0, delta_y: 120 }));
-        assert_eq!(hits.load(Ordering::Relaxed), 1, "mouse_enabled=false 时滚轮不应计数");
+        l.process_event(
+            &db,
+            &ev(rdev::EventType::Wheel {
+                delta_x: 0,
+                delta_y: 120,
+            }),
+        );
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "mouse_enabled=false 时滚轮不应计数"
+        );
 
         l.cfg.mouse_enabled.store(true, Ordering::Relaxed);
-        l.process_event(&db, &ev(rdev::EventType::Wheel { delta_x: 0, delta_y: 120 }));
+        l.process_event(
+            &db,
+            &ev(rdev::EventType::Wheel {
+                delta_x: 0,
+                delta_y: 120,
+            }),
+        );
         assert_eq!(hits.load(Ordering::Relaxed), 2);
-        l.process_event(&db, &ev(rdev::EventType::Wheel { delta_x: 0, delta_y: 120 }));
+        l.process_event(
+            &db,
+            &ev(rdev::EventType::Wheel {
+                delta_x: 0,
+                delta_y: 120,
+            }),
+        );
         assert_eq!(hits.load(Ordering::Relaxed), 2, "窗口内同方向滚轮应合并");
-        l.process_event(&db, &ev(rdev::EventType::Wheel { delta_x: 0, delta_y: -120 }));
+        l.process_event(
+            &db,
+            &ev(rdev::EventType::Wheel {
+                delta_x: 0,
+                delta_y: -120,
+            }),
+        );
         assert_eq!(hits.load(Ordering::Relaxed), 3, "方向切换应计数");
 
         crate::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));

@@ -105,11 +105,7 @@ fn spawn_tray_updater(app: &App, paused_icon: tauri::image::Image<'static>) {
                 let paused_now = LAST_PAUSED.swap(paused, Ordering::SeqCst) != paused;
                 let active = s.active_seconds;
                 let active_str = if active > 0 {
-                    format!(
-                        " · 活跃 {}时{}分",
-                        active / 3600,
-                        (active % 3600) / 60
-                    )
+                    format!(" · 活跃 {}时{}分", active / 3600, (active % 3600) / 60)
                 } else {
                     String::new()
                 };

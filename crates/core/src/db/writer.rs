@@ -37,7 +37,8 @@ enum Signal {
 const ACTIVE_GAP_SECS: i64 = 60;
 
 /// 内存中的聚合增量（未落库部分）。
-#[derive(Default)]
+/// Clone 用于恢复文件快照；恢复文件的序列化格式见 `AggDeltasFile`。
+#[derive(Default, Clone)]
 struct AggDeltas {
     /// (date_key) -> count
     daily: HashMap<i64, i64>,
@@ -91,6 +92,8 @@ struct WriterState {
     today_key: AtomicU64,
     /// 线程是否存活
     alive: AtomicBool,
+    /// 成功落库次数（有实际写入才递增）：图表缓存用 "序号未变" 判定库内容没变，跳过重聚合
+    flush_seq: AtomicU64,
 }
 
 /// 写入器句柄（Send + Sync，可跨线程持有）。
@@ -133,13 +136,42 @@ impl DbWriter {
                 .unwrap_or(0)
                 .max(0) as u64
         };
+        // 启动回放：上次进程异常终止时写入的未落库增量（若存在）并入内存聚合，
+        // 随首次周期 flush 正常落库。读取后立即删除，保证只回放一次不重复计数。
+        let recovered = take_recovery();
+        if let Some(ref r) = recovered {
+            tracing::warn!(
+                "发现未落库增量恢复文件，已回放: daily={} hourly={} keys={} apps={}",
+                r.daily.len(),
+                r.hourly.len(),
+                r.keys.len(),
+                r.apps.len()
+            );
+        }
+        // 回放增量若属于今天，计入今日缓存基准，保证缓存 = 库 + 内存待落库
+        let today_dk = queries::day_key_of_date(chrono::Local::now().date_naive());
+        let recovered_today_count = recovered
+            .as_ref()
+            .and_then(|r| r.daily.get(&today_dk))
+            .copied()
+            .unwrap_or(0)
+            .max(0) as u64;
+        let recovered_today_active = recovered
+            .as_ref()
+            .and_then(|r| r.active.get(&today_dk))
+            .copied()
+            .unwrap_or(0)
+            .max(0) as u64;
+        let today_base_count = today_base_count + recovered_today_count;
+        let today_base_active = today_base_active + recovered_today_active;
         let state = Arc::new(WriterState {
-            agg: Mutex::new(AggDeltas::default()),
+            agg: Mutex::new(recovered.unwrap_or_default()),
             sig_tx,
             today_count: AtomicU64::new(today_base_count),
             today_active: AtomicU64::new(today_base_active),
             today_key: AtomicU64::new(current_day_key()),
             alive: AtomicBool::new(true),
+            flush_seq: AtomicU64::new(0),
         });
 
         let writer = Arc::new(Self {
@@ -262,24 +294,160 @@ impl DbWriter {
         if wait {
             let (tx, rx) = mpsc::channel();
             let _ = self.state.sig_tx.send(Signal::Flush { done: Some(tx) });
-            let _ = rx.recv_timeout(Duration::from_secs(3));
+            if rx.recv_timeout(Duration::from_secs(3)).is_err() {
+                tracing::warn!("flush 等待超时（3 秒），写线程可能繁忙，增量仍在内存中");
+            }
         } else {
             let _ = self.state.sig_tx.send(Signal::Flush { done: None });
         }
     }
 
     /// 停止写线程（退出前 flush 残留）。
+    /// 超时仍未停止（磁盘忙/库被锁）时，把未落库增量写到恢复文件兜底，
+    /// 下次启动回放——数据从内存移除，写线程即使随后恢复也不会再写一份（防重复计数）。
     pub fn stop(&self) {
         let _ = self.state.sig_tx.send(Signal::Stop);
         let deadline = Instant::now() + Duration::from_secs(3);
         while self.state.alive.load(Ordering::Relaxed) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
+        if self.state.alive.load(Ordering::Relaxed) {
+            snapshot_recovery(&self.state, true);
+        }
     }
 
     /// 线程是否存活。
     pub fn is_alive(&self) -> bool {
         self.state.alive.load(Ordering::Relaxed)
+    }
+
+    /// 成功落库序号（有实际写入才递增）。
+    pub fn flush_seq(&self) -> u64 {
+        self.state.flush_seq.load(Ordering::Relaxed)
+    }
+}
+
+/// 未落库增量恢复文件路径。
+fn recovery_path() -> std::path::PathBuf {
+    paths::data_dir().join("agg_recovery.json")
+}
+
+/// 恢复文件的序列化格式：JSON 对象键必须是字符串，故整数键的 map 一律转成
+/// 元组数组（AggDeltas 本身保持 HashMap 以保证热路径效率）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AggDeltasFile {
+    daily: Vec<(i64, i64)>,
+    hourly: Vec<((i64, i64), i64)>,
+    keys: Vec<(i64, Vec<(String, i64)>)>,
+    active: Vec<(i64, i64)>,
+    apps: Vec<((i64, String), i64)>,
+    last_ts: i64,
+}
+
+impl From<&AggDeltas> for AggDeltasFile {
+    fn from(a: &AggDeltas) -> Self {
+        Self {
+            daily: a.daily.iter().map(|(k, v)| (*k, *v)).collect(),
+            hourly: a.hourly.iter().map(|(k, v)| (*k, *v)).collect(),
+            keys: a
+                .keys
+                .iter()
+                .map(|(dk, m)| (*dk, m.iter().map(|(k, v)| (k.clone(), *v)).collect()))
+                .collect(),
+            active: a.active.iter().map(|(k, v)| (*k, *v)).collect(),
+            apps: a.apps.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            last_ts: a.last_ts,
+        }
+    }
+}
+
+impl From<AggDeltasFile> for AggDeltas {
+    fn from(f: AggDeltasFile) -> Self {
+        Self {
+            daily: f.daily.into_iter().collect(),
+            hourly: f.hourly.into_iter().collect(),
+            keys: f
+                .keys
+                .into_iter()
+                .map(|(dk, m)| (dk, m.into_iter().collect()))
+                .collect(),
+            active: f.active.into_iter().collect(),
+            apps: f.apps.into_iter().collect(),
+            last_ts: f.last_ts,
+        }
+    }
+}
+
+/// 把未落库增量快照写到恢复文件。
+/// `take=true` 时同时从内存聚合移除：用于 stop 超时 / panic（进程即将终止），
+/// 数据此后只存在于文件中，避免写线程随后恢复后再次落库造成重复计数。
+fn snapshot_recovery(state: &WriterState, take: bool) {
+    // try_lock：panic 可能发生在持有 agg 锁的线程，此时放弃快照（进程即将终止）
+    let Ok(mut agg) = state.agg.try_lock() else {
+        return;
+    };
+    if agg.is_empty() {
+        return;
+    }
+    let pending = if take {
+        agg.take_for_flush()
+    } else {
+        agg.clone()
+    };
+    drop(agg);
+    let json = match serde_json::to_string(&AggDeltasFile::from(&pending)) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!("恢复文件序列化失败: {e}");
+            return;
+        }
+    };
+    // 临时文件 + rename，避免写一半崩溃留下残缺 JSON
+    let path = recovery_path();
+    std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new("."))).ok();
+    let tmp = path.with_extension("json.tmp");
+    let result = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path));
+    match result {
+        Ok(()) => tracing::warn!(
+            "未落库增量已写入恢复文件 {}（下次启动回放）",
+            path.display()
+        ),
+        Err(e) => tracing::error!("恢复文件写入失败 {}: {e}", path.display()),
+    }
+}
+
+/// 读取并删除恢复文件（启动回放）。解析失败同样删除：残缺文件重试无意义。
+fn take_recovery() -> Option<AggDeltas> {
+    let path = recovery_path();
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    match serde_json::from_str::<AggDeltasFile>(&text) {
+        Ok(v) => Some(v.into()),
+        Err(e) => {
+            tracing::error!("恢复文件解析失败（已丢弃）: {e}");
+            None
+        }
+    }
+}
+
+// panic 兜底：panic hook（logger）在进程终止前调用 snapshot，
+// 把未落库增量从内存移出并落盘，配合启动回放把异常终止的丢失窗口收到接近零。
+static PANIC_WRITER: std::sync::Mutex<Option<std::sync::Arc<DbWriter>>> =
+    std::sync::Mutex::new(None);
+
+/// 注册全局 writer 引用（Database 创建后调用一次）。
+pub fn register_panic_recovery(writer: std::sync::Arc<DbWriter>) {
+    if let Ok(mut slot) = PANIC_WRITER.lock() {
+        *slot = Some(writer);
+    }
+}
+
+/// panic hook 调用：对未落库增量做兜底快照。幂等，未注册或无增量时为空操作。
+pub fn panic_recovery_snapshot() {
+    if let Ok(slot) = PANIC_WRITER.try_lock() {
+        if let Some(w) = slot.as_ref() {
+            snapshot_recovery(&w.state, true);
+        }
     }
 }
 
@@ -427,6 +595,7 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
 
         match result {
             Ok(()) => {
+                state.flush_seq.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     "聚合落库成功: daily={} hourly={} keys={}",
                     pending.daily.len(),
@@ -487,13 +656,16 @@ mod tests {
     /// （统计线程运行中跨 0 点，避免次日显示昨日累计值）。
     #[test]
     fn record_resets_today_count_on_day_change() {
+        let _lock = crate::paths::test_app_dir_lock();
         let dir = std::env::temp_dir().join(format!("ff_writer_day_{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         crate::paths::set_app_dir(&dir);
 
         let w = DbWriter::start(Duration::from_secs(3600));
         // 模拟"昨天"：today_key 是昨天的日期键、计数停留在昨日值
-        w.state.today_key.store(current_day_key() - 1, Ordering::Relaxed);
+        w.state
+            .today_key
+            .store(current_day_key() - 1, Ordering::Relaxed);
         w.state.today_count.store(999, Ordering::Relaxed);
 
         w.record("A", queries::now_ts());
@@ -510,6 +682,7 @@ mod tests {
     /// record 聚合到内存增量：daily/hourly/keys 正确累加。
     #[test]
     fn record_aggregates_deltas() {
+        let _lock = crate::paths::test_app_dir_lock();
         let w = DbWriter::start(Duration::from_secs(3600));
         let ts = queries::now_ts();
         w.record("A", ts);
@@ -518,10 +691,7 @@ mod tests {
         let agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
         let dk = queries::day_key_of_ts(ts);
         assert_eq!(agg.daily.get(&dk), Some(&3));
-        assert_eq!(
-            agg.hourly.get(&(dk, queries::hour_of_ts(ts))),
-            Some(&3)
-        );
+        assert_eq!(agg.hourly.get(&(dk, queries::hour_of_ts(ts))), Some(&3));
         assert_eq!(agg.keys.get(&dk).and_then(|m| m.get("A")), Some(&2));
         drop(agg);
         w.stop();
@@ -530,6 +700,13 @@ mod tests {
     /// 活跃时长：与上一事件间隔 ≤ 60 秒累计连续活跃，超间隔或首事件不累计。
     #[test]
     fn record_tracks_active_seconds() {
+        let _lock = crate::paths::test_app_dir_lock();
+        // today_active 初始基准来自全局库的 active_seconds 表，
+        // 必须用独立目录隔离，否则并行/残留数据会污染断言。
+        let dir = std::env::temp_dir().join(format!("ff_writer_active_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
         let w = DbWriter::start(Duration::from_secs(3600));
         let t0 = queries::now_ts();
         w.record("A", t0);
@@ -539,5 +716,59 @@ mod tests {
         w.record("A", t0 + 102); // 间隔 2s：活跃 +2
         assert_eq!(w.state.today_active.load(Ordering::Relaxed), 12);
         w.stop();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 恢复机制：快照落盘并从内存移除 → 正常 flush 不再落库 →
+    /// 重启回放后恰好落库一次且文件被删除（不重复计数）。
+    #[test]
+    fn recovery_snapshot_replayed_once() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_recovery_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let w = DbWriter::start(Duration::from_secs(3600));
+        let ts = queries::now_ts();
+        w.record("A", ts);
+        w.record("A", ts);
+        snapshot_recovery(&w.state, true);
+        assert!(recovery_path().exists(), "快照应写入恢复文件");
+        w.stop(); // 内存已空，stop 的最终 flush 不会再写库
+
+        // 并行测试共享全局 app_dir，库中可能有其他测试的数据，
+        // 因此全部用相对断言验证"回放数据恰好落库一次"。
+        // 库文件可能尚未创建（本测试早于任何 flush 运行）：缺失视为 0。
+        let dk = queries::day_key_of_ts(ts);
+        let db_count = || -> i64 {
+            connection::open_ro(&paths::current_year_db_path())
+                .ok()
+                .and_then(|conn| {
+                    conn.query_row(
+                        "SELECT COALESCE(SUM(count),0) FROM daily_counts WHERE date_key=?1",
+                        [dk],
+                        |r| r.get(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or(0)
+        };
+        let base = db_count();
+
+        let w2 = DbWriter::start(Duration::from_secs(3600));
+        assert!(w2.today_count() >= 2, "回放的今日计数应计入缓存基准");
+        assert_eq!(w2.flush_seq(), 0);
+        w2.flush(true);
+        // flush(true) 只等 3 秒，并行测试短暂占用 DB 写锁时可能提前返回；
+        // 数据由写线程异步落库，这里轮询等待（序号递增 = 落库成功）。
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while w2.flush_seq() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(w2.flush_seq(), 1, "成功落库后序号应递增");
+        assert_eq!(db_count(), base + 2, "回放数据应恰好落库一次");
+        assert!(!recovery_path().exists(), "恢复文件回放后应删除");
+        w2.stop();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

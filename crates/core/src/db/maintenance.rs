@@ -69,7 +69,10 @@ pub fn archive_year_data(target_year: i32, source_year: i32) {
             anyhow::anyhow!("源库路径包含非 UTF-8 字符: {}", source_path.display())
         })?;
         let conn = connection::open_rw(&target_path)?;
-        conn.execute("ATTACH DATABASE ?1 AS source", rusqlite::params![source_str])?;
+        conn.execute(
+            "ATTACH DATABASE ?1 AS source",
+            rusqlite::params![source_str],
+        )?;
         conn.execute("BEGIN;", [])?;
         let migrate: anyhow::Result<()> = (|| {
             for table in ["daily_counts", "hourly_counts", "key_counts"] {
@@ -612,8 +615,14 @@ pub fn delete_key_today(key_name: &str) -> i64 {
                 tracing::error!("delete_key_today 更新 hourly_counts 失败: {e}");
             }
         }
-        let _ = conn.execute("DELETE FROM hourly_counts WHERE count <= 0 AND date_key = ?1", [today_dk]);
-        let _ = conn.execute("DELETE FROM daily_counts WHERE count <= 0 AND date_key = ?1", [today_dk]);
+        let _ = conn.execute(
+            "DELETE FROM hourly_counts WHERE count <= 0 AND date_key = ?1",
+            [today_dk],
+        );
+        let _ = conn.execute(
+            "DELETE FROM daily_counts WHERE count <= 0 AND date_key = ?1",
+            [today_dk],
+        );
     }
 
     tracing::info!("已删除今日按键 [{key_name}] 的聚合记录（计数 {removed}）");
@@ -624,6 +633,7 @@ pub fn delete_key_today(key_name: &str) -> i64 {
 /// 1. daily_counts.count 与 Σkey_counts 不符的天，以 key_counts 为准重算；
 /// 2. Σhourly_counts 与 daily_counts 不符的天，按比例把小时分布缩放到当日总数
 ///    （hourly 无按 key 拆分，只能整体缩放；余数补到最大小时）。
+///
 /// 幂等：启动时每次执行都安全，写入线程尚未开始，库为落盘后的权威状态。
 pub fn heal_daily_consistency() {
     for year in queries::available_years() {
@@ -677,7 +687,10 @@ pub fn heal_daily_consistency() {
             scale_hourly_to_total(&conn, *dk, daily);
         }
         if !days.is_empty() {
-            tracing::info!("一致性自愈：{year} 年库重算 {} 天的 hourly_counts", days.len());
+            tracing::info!(
+                "一致性自愈：{year} 年库重算 {} 天的 hourly_counts",
+                days.len()
+            );
             queries::invalidate_years_cache();
         }
     }
@@ -689,8 +702,10 @@ fn scale_hourly_to_total(conn: &Connection, day_key: i64, target_total: i64) {
     let hours: Vec<(i64, i64)> = conn
         .prepare("SELECT hour, count FROM hourly_counts WHERE date_key=?1")
         .and_then(|mut s| {
-            s.query_map([day_key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
-                .map(|rows| rows.flatten().collect())
+            s.query_map([day_key], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map(|rows| rows.flatten().collect())
         })
         .unwrap_or_default();
     let cur_total: i64 = hours.iter().map(|(_, c)| c).sum();

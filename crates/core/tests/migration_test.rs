@@ -25,6 +25,9 @@ mod tests {
         let old_dir = std::env::temp_dir().join(format!("ff_old_{}", std::process::id()));
         // 当前目录（目标）
         let new_dir = std::env::temp_dir().join(format!("ff_new_{}", std::process::id()));
+        // pid 可能被操作系统复用：先清掉上次运行残留，避免旧库干扰去重与计数断言
+        std::fs::remove_dir_all(&old_dir).ok();
+        std::fs::remove_dir_all(&new_dir).ok();
         std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::create_dir_all(&new_dir).unwrap();
         paths::set_app_dir(&new_dir);

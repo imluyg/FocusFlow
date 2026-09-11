@@ -443,11 +443,9 @@ fn query_apps_in_conn(
             )
             .unwrap_or(0),
         None => conn
-            .query_row(
-                "SELECT COALESCE(SUM(seconds), 0) FROM app_usage",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COALESCE(SUM(seconds), 0) FROM app_usage", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(0),
     };
     let sql = format!("SELECT app_name, seconds FROM app_usage{where_clause}");
@@ -515,8 +513,7 @@ fn apps_single_year(year: i32, days: Option<i64>) -> (i64, HashMap<String, i64>)
     } else {
         ""
     };
-    let result =
-        connection::with_ro_conn(&path, |conn| query_apps_in_conn(conn, cond, start_dk));
+    let result = connection::with_ro_conn(&path, |conn| query_apps_in_conn(conn, cond, start_dk));
     result.flatten().unwrap_or((0, HashMap::new()))
 }
 

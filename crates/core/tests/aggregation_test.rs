@@ -22,6 +22,8 @@ mod tests {
     fn today_count_persists_across_restart() {
         let _g = guard();
         let dir = std::env::temp_dir().join(format!("ff_agg_{}", std::process::id()));
+        // pid 可能被操作系统复用：先清掉上次运行残留，避免旧库累积干扰断言
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         paths::set_app_dir(&dir);
         db::queries::invalidate_years_cache();
@@ -56,6 +58,8 @@ mod tests {
     fn daily_and_hourly_aggregate_correctly() {
         let _g = guard();
         let dir = std::env::temp_dir().join(format!("ff_agg2_{}", std::process::id()));
+        // pid 可能被操作系统复用：先清掉上次运行残留，避免旧库累积干扰断言
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         paths::set_app_dir(&dir);
         db::queries::invalidate_years_cache();

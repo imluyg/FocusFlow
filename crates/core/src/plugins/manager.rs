@@ -129,6 +129,7 @@ impl PluginManager {
     /// 为 Lua 状态施加资源限制（防 `while true do end` 冻结主线程）：
     /// - 内存上限：超限触发 `Error::MemoryError`；
     /// - 指令数 hook：每 N 条指令检查一次，超限直接中断执行。
+    ///
     /// 配置项：config.ini [plugins] memory_limit_mb（默认 16）/ instruction_limit（默认 1000 万）。
     /// Lua 状态创建后调用一次即可覆盖该状态后续所有执行路径。
     fn apply_lua_limits(&self, lua: &Lua) {

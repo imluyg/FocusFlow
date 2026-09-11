@@ -37,6 +37,15 @@ pub fn set_app_dir(dir: impl Into<PathBuf>) {
     *app_dir_override().lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.into());
 }
 
+/// 测试专用：切换全局 app_dir 的测试必须持有此锁跑完全程。
+/// 并行测试共享进程级全局路径，不加锁会互相改写（DB/恢复文件写错位置、
+/// 启动回放误删其他测试刚写入的恢复文件）。
+#[cfg(test)]
+pub fn test_app_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 程序目录。
 ///
 /// 优先级：`set_app_dir` 显式设置 > 环境变量 `FOCUSFLOW_APP_DIR` > exe 所在目录（release）> 当前工作目录。

@@ -55,6 +55,8 @@ impl Database {
         let flush_interval =
             Duration::from_secs(config.get_int("database", "flush_interval", 10).max(1) as u64);
         let writer = Some(DbWriter::start(flush_interval));
+        // panic hook 兜底：进程异常终止前把未落库增量写入恢复文件
+        writer::register_panic_recovery(Arc::clone(writer.as_ref().unwrap()));
 
         // 运行中定时在线备份：进程被强杀不再丢失自上次备份后的全部数据（0 = 关闭）
         let backup_hours = config.get_int("database", "online_backup_interval_hours", 24);

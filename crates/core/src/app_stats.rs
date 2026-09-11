@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::FocusFlowConfig;
-use crate::db::DbWriter;
 use crate::db::queries;
+use crate::db::DbWriter;
 
 /// 采集周期：每 2 秒给当前前台应用累计 2 秒。
 const SAMPLE_INTERVAL_SECS: u64 = 2;
@@ -27,10 +27,7 @@ fn load_config(config: &FocusFlowConfig) -> (bool, Vec<String>) {
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .collect();
-    (
-        config.get_bool("app_stats", "enabled", true),
-        exclude,
-    )
+    (config.get_bool("app_stats", "enabled", true), exclude)
 }
 
 /// 启动前台应用采集线程（非 Windows 平台为空实现）。
@@ -56,7 +53,7 @@ pub fn start_sampler(writer: Arc<DbWriter>) {
                     continue;
                 };
                 let lower = name.to_ascii_lowercase();
-                if exclude.iter().any(|x| *x == lower) {
+                if exclude.contains(&lower) {
                     continue;
                 }
                 let dk = queries::day_key_of_ts(queries::now_ts());
@@ -119,7 +116,7 @@ mod collect {
     fn take_process_snapshot() -> std::collections::HashMap<u32, String> {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
             TH32CS_SNAPPROCESS,
         };
         let mut map = std::collections::HashMap::new();

@@ -749,14 +749,17 @@ fn spawn_stats_worker(
             let mut alltime_max: Option<(String, i64)> = None;
             let mut alltime_cache_day: i64 = -1; // 上次缓存构建时的日期（CE 天序号）
             let mut alltime_cache_today: i64 = -1; // 上次缓存构建时的今日计数
+                                                   // period != 0 图表的落库序号指纹：DB 自上次聚合后没有新落库（序号未变）
+                                                   // 时，重聚合只会重复算出同样结果——增量都在写线程内存里，flush 前不进库。
+            let mut charts_seq: u64 = u64::MAX;
+            let mut charts_period: i64 = i64::MIN;
 
             loop {
                 let period_val = period.load(Ordering::Relaxed);
                 let forced = refresh_now.swap(false, Ordering::Relaxed);
                 let period_changed = period_val != prev_period;
                 let cur_today = db.writer().map(|w| w.today_count()).unwrap_or(0) as i64;
-                let cur_active =
-                    db.writer().map(|w| w.today_active_seconds()).unwrap_or(0) as i64;
+                let cur_active = db.writer().map(|w| w.today_active_seconds()).unwrap_or(0) as i64;
                 let active = cur_today != prev_today_count;
                 let heavy_elapsed_ms = last_heavy.elapsed().as_millis() as u64;
                 let day_ce = {
@@ -796,59 +799,73 @@ fn spawn_stats_worker(
                 let do_heavy = forced || period_changed || heavy_elapsed_ms >= heavy_interval_ms;
 
                 if do_heavy {
-                    // 全历史最高单日（全表 ORDER BY，最贵的单项查询）：仅缓存失效时重查
-                    if alltime_dirty {
-                        // 先把写线程内存中的增量落库，图表查询才能看到最新按键
-                        if let Some(w) = db.writer() {
-                            if w.has_pending() {
-                                w.flush(true);
-                            }
-                        }
-                        last_heavy = Instant::now();
-                        last_heavy_today = cur_today;
-                        let today_str = chrono::Local::now()
-                            .date_naive()
-                            .format("%Y-%m-%d")
-                            .to_string();
-                        alltime_max = Some(
-                            focusflow_core::db::get_alltime_max_day()
-                                .unwrap_or((today_str, 0)),
-                        );
-                        alltime_cache_day = day_ce;
-                        alltime_cache_today = cur_today;
-                    }
-
-                    // period=0 且缓存有效：直接复用上次聚合结果，不再全库扫描。
-                    // 今日破纪录等展示值由下方增量逻辑修正，轻量零查询。
-                    let agg = if period_val == 0
+                    let flush_seq = db.writer().map(|w| w.flush_seq()).unwrap_or(0);
+                    // period != 0 且库内容未变：跳过整轮重算与推送（活跃打字时每 2s
+                    // 到期的重聚合，在没有新落库时全部是重复计算，这里是主要开销）
+                    let charts_unchanged = !forced
                         && !period_changed
                         && !alltime_dirty
-                        && alltime_agg.is_some()
-                    {
-                        alltime_agg.clone().unwrap()
+                        && period_val != 0
+                        && period_val == charts_period
+                        && flush_seq == charts_seq;
+                    if charts_unchanged {
+                        last_heavy = Instant::now();
                     } else {
-                        let agg = compute_charts(period_val, alltime_max.clone());
-                        if period_val == 0 {
-                            alltime_agg = Some(agg.clone());
+                        // 全历史最高单日（全表 ORDER BY，最贵的单项查询）：仅缓存失效时重查
+                        if alltime_dirty {
+                            // 先把写线程内存中的增量落库，图表查询才能看到最新按键
+                            if let Some(w) = db.writer() {
+                                if w.has_pending() {
+                                    w.flush(true);
+                                }
+                            }
+                            last_heavy = Instant::now();
+                            last_heavy_today = cur_today;
+                            let today_str = chrono::Local::now()
+                                .date_naive()
+                                .format("%Y-%m-%d")
+                                .to_string();
+                            alltime_max = Some(
+                                focusflow_core::db::get_alltime_max_day().unwrap_or((today_str, 0)),
+                            );
+                            alltime_cache_day = day_ce;
+                            alltime_cache_today = cur_today;
                         }
-                        agg
-                    };
-                    period_max.insert(period_val, (agg.max_day, agg.max_day_date.clone()));
-                    {
-                        let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
-                        s.agg = agg.clone();
-                    }
-                    // 图表数据仅主窗口使用：主窗口隐藏时跳过推送，
-                    // 避免每轮重聚合都唤醒隐藏的渲染进程（打开窗口时 refresh_now 会强制重聚合）
-                    if main_visible {
-                        let _ = app.emit_to(
-                            "main",
-                            "stats-charts",
-                            ChartsStats {
-                                period: period_val,
-                                agg,
-                            },
-                        );
+
+                        // period=0 且缓存有效：直接复用上次聚合结果，不再全库扫描。
+                        // 今日破纪录等展示值由下方增量逻辑修正，轻量零查询。
+                        let agg = if period_val == 0
+                            && !period_changed
+                            && !alltime_dirty
+                            && alltime_agg.is_some()
+                        {
+                            alltime_agg.clone().unwrap()
+                        } else {
+                            let agg = compute_charts(period_val, alltime_max.clone());
+                            if period_val == 0 {
+                                alltime_agg = Some(agg.clone());
+                            }
+                            agg
+                        };
+                        charts_period = period_val;
+                        charts_seq = db.writer().map(|w| w.flush_seq()).unwrap_or(flush_seq);
+                        period_max.insert(period_val, (agg.max_day, agg.max_day_date.clone()));
+                        {
+                            let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+                            s.agg = agg.clone();
+                        }
+                        // 图表数据仅主窗口使用：主窗口隐藏时跳过推送，
+                        // 避免每轮重聚合都唤醒隐藏的渲染进程（打开窗口时 refresh_now 会强制重聚合）
+                        if main_visible {
+                            let _ = app.emit_to(
+                                "main",
+                                "stats-charts",
+                                ChartsStats {
+                                    period: period_val,
+                                    agg,
+                                },
+                            );
+                        }
                     }
                 }
 
