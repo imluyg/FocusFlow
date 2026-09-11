@@ -453,8 +453,8 @@ pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
             backed_up.push(dst);
         }
     }
-    // 附属库同样纳入备份与轮转（命名沿用 focusflow_{组}_{时间戳}.db，
-    // rotate_backups 按第二个下划线段分组，"accounting" 等名称天然成组）
+    // 附属库同样纳入备份与轮转（命名沿用 focusflow_{组名}_{时间戳}.db，
+    // rotate_backups 按第一段分组，"accounting" 等名称各自成组）
     for (name, src) in auxiliary_db_paths() {
         if !src.exists() {
             continue;
@@ -479,21 +479,24 @@ pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
     }
 }
 
-/// 保留最近 N 个备份（按年份分组）。
+/// 保留每组最近 N 个备份。
+/// 分组键取文件名第一段（`focusflow_2026_…` → "2026"，`focusflow_accounting_…`
+/// → "accounting"）。此前按第二段分组取到的是日期，每天自成一组导致轮转
+/// 永远删不到旧日期的备份，backup/ 目录无限增长。
 fn rotate_backups(max_keep: i64) {
     let mut groups: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
     if let Ok(entries) = std::fs::read_dir(paths::backup_dir()) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            // focusflow_2026_20260723_075125.db
+            // focusflow_2026_20260723_075125.db / focusflow_accounting_20260723_075125.db
             if let Some(stem) = name
                 .strip_prefix("focusflow_")
                 .and_then(|s| s.strip_suffix(".db"))
             {
                 let parts: Vec<&str> = stem.split('_').collect();
                 if parts.len() >= 3 {
-                    let year = parts[1].to_string();
-                    groups.entry(year).or_default().push(entry.path());
+                    let group = parts[0].to_string();
+                    groups.entry(group).or_default().push(entry.path());
                 }
             }
         }
@@ -737,4 +740,52 @@ fn scale_hourly_to_total(conn: &Connection, day_key: i64, target_total: i64) {
         "DELETE FROM hourly_counts WHERE count <= 0 AND date_key = ?1",
         [day_key],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 轮转分组按文件名第一段（年份/库名）：跨日期同组累加，
+    /// 超出保留数删除最旧的。回归：旧实现按第二段（日期）分组，
+    /// 每天自成一组导致轮转永远删不到旧备份，backup/ 无限增长。
+    #[test]
+    fn rotate_groups_by_first_segment() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_rotate_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+
+        let names = [
+            "focusflow_2026_20260911_100000.db",
+            "focusflow_2026_20260912_100000.db",
+            "focusflow_2026_20260912_110000.db",
+            "focusflow_accounting_20260911_100000.db",
+            "focusflow_accounting_20260912_100000.db",
+            "focusflow_accounting_20260912_110000.db",
+        ];
+        for name in names {
+            std::fs::write(paths::backup_dir().join(name), b"x").unwrap();
+        }
+
+        rotate_backups(2);
+
+        let remaining: Vec<String> = std::fs::read_dir(paths::backup_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(remaining.len(), 4, "两组各保留 2 个");
+        // 关键回归：旧日期的必须被删（修复前按日期分组永不删除）
+        assert!(
+            !remaining.contains(&"focusflow_2026_20260911_100000.db".to_string()),
+            "2026 组最旧备份应被删除"
+        );
+        assert!(
+            !remaining.contains(&"focusflow_accounting_20260911_100000.db".to_string()),
+            "accounting 组最旧备份应被删除"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

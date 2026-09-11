@@ -34,7 +34,9 @@ enum Signal {
 }
 
 /// 连续活跃判定：与上一事件间隔 ≤ 该秒数视为连续活跃（累计活跃时长）。
-const ACTIVE_GAP_SECS: i64 = 60;
+/// 连续活跃判定窗口（秒）：事件间隔 ≤ 该值视为同一段连续活跃。
+/// 前台应用时长累计（app_stats）复用同一口径。
+pub(crate) const ACTIVE_GAP_SECS: i64 = 60;
 
 /// 内存中的聚合增量（未落库部分）。
 /// Clone 用于恢复文件快照；恢复文件的序列化格式见 `AggDeltasFile`。
@@ -260,6 +262,16 @@ impl DbWriter {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty()
+    }
+
+    /// 最近一次键鼠事件的 Unix 时间戳（无事件为 0，flush 取走增量时保留）。
+    /// 前台应用时长累计据此判定"活跃窗口"：挂机（超窗口无事件）时不累计。
+    pub fn last_event_ts(&self) -> i64 {
+        self.state
+            .agg
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_ts
     }
 
     /// 重置今日计数缓存（外部清除数据后调用）。
@@ -715,6 +727,26 @@ mod tests {
         assert_eq!(w.state.today_active.load(Ordering::Relaxed), 10);
         w.record("A", t0 + 102); // 间隔 2s：活跃 +2
         assert_eq!(w.state.today_active.load(Ordering::Relaxed), 12);
+        w.stop();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// last_event_ts：record 后更新，flush 取走增量后保留（前台应用时长
+    /// 的活跃窗口判定依赖该值在两次事件之间保持有效）。
+    #[test]
+    fn last_event_ts_persists_across_flush() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_writer_lastts_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+        let w = DbWriter::start(Duration::from_secs(3600));
+        assert_eq!(w.last_event_ts(), 0, "无事件时应为 0（永远不处于活跃窗口）");
+        let ts = queries::now_ts();
+        w.record("A", ts);
+        assert_eq!(w.last_event_ts(), ts);
+        w.flush(true);
+        assert_eq!(w.last_event_ts(), ts, "flush 取走增量后 last_ts 应保留");
         w.stop();
         std::fs::remove_dir_all(&dir).ok();
     }

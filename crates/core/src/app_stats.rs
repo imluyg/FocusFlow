@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use crate::config::FocusFlowConfig;
 use crate::db::queries;
+use crate::db::writer;
 use crate::db::DbWriter;
 
 /// 采集周期：每 2 秒给当前前台应用累计 2 秒。
@@ -52,11 +53,17 @@ pub fn start_sampler(writer: Arc<DbWriter>) {
                 let Some(name) = collect::foreground_app_name() else {
                     continue;
                 };
+                // 只累计"活跃窗口"内的前台时长（60 秒内有键鼠事件，与今日活跃时长同口径）：
+                // 挂机时人不在电脑前，前台应用照常累计会把使用时长虚高一大截。
+                let now = queries::now_ts();
+                if now - writer.last_event_ts() > writer::ACTIVE_GAP_SECS {
+                    continue;
+                }
                 let lower = name.to_ascii_lowercase();
                 if exclude.contains(&lower) {
                     continue;
                 }
-                let dk = queries::day_key_of_ts(queries::now_ts());
+                let dk = queries::day_key_of_ts(now);
                 writer.add_app_seconds(dk, &name, SAMPLE_INTERVAL_SECS as i64);
             }
         })
