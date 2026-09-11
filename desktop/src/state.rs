@@ -656,48 +656,57 @@ fn keep_floating_on_top(app: &App) {
     let raw_hwnd = hwnd.0 as isize;
     std::thread::Builder::new()
         .name("floating-topmost".into())
-        .spawn(move || loop {
-            #[cfg(windows)]
-            unsafe {
-                use windows::Win32::Foundation::HWND;
-                use windows::Win32::UI::WindowsAndMessaging::{
-                    GetWindowLongW, IsWindow, SetWindowLongW, SetWindowPos, GWL_EXSTYLE,
-                    HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-                    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-                };
-                let hwnd = HWND(raw_hwnd as *mut _);
-                // 窗口已销毁：退出轮询，避免对失效 HWND 反复 SetWindowPos
-                if !IsWindow(Some(hwnd)).as_bool() {
-                    break;
+        .spawn(move || {
+            // 默认隐藏态轮询间隔（3s），可见时每轮覆写为 500ms
+            let mut sleep_ms: u64 = 3000;
+            loop {
+                #[cfg(windows)]
+                unsafe {
+                    use windows::Win32::Foundation::HWND;
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        GetWindowLongW, IsWindow, IsWindowVisible, SetWindowLongW, SetWindowPos,
+                        GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+                        SWP_NOSIZE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+                    };
+                    let hwnd = HWND(raw_hwnd as *mut _);
+                    // 窗口已销毁：退出轮询，避免对失效 HWND 反复 SetWindowPos
+                    if !IsWindow(Some(hwnd)).as_bool() {
+                        break;
+                    }
+                    // 隐藏时跳过置顶与样式维护（保持 3s 轮询）：
+                    // 悬浮窗关闭/禁用后不再每 500ms 白做系统调用（后台功耗）。
+                    if IsWindowVisible(hwnd).as_bool() {
+                        sleep_ms = 500;
+                        // 工具窗口样式：tao 的 skip_taskbar 只做 DeleteTab，仍会带 WS_EX_APPWINDOW，
+                        // 任务管理器会把它当"应用"；这里每轮重申：置 TOOLWINDOW、清 APPWINDOW，
+                        // 进程即可归类为后台进程（对齐 Python 版方案）。
+                        let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+                        let want = (style | WS_EX_TOOLWINDOW.0 as i32) & !WS_EX_APPWINDOW.0 as i32;
+                        if style != want {
+                            SetWindowLongW(hwnd, GWL_EXSTYLE, want);
+                            let _ = SetWindowPos(
+                                hwnd,
+                                Some(HWND_TOPMOST),
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                            );
+                        }
+                        let _ = SetWindowPos(
+                            hwnd,
+                            Some(HWND_TOPMOST),
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                    }
                 }
-                // 工具窗口样式：tao 的 skip_taskbar 只做 DeleteTab，仍会带 WS_EX_APPWINDOW，
-                // 任务管理器会把它当"应用"；这里每轮重申：置 TOOLWINDOW、清 APPWINDOW，
-                // 进程即可归类为后台进程（对齐 Python 版方案）。
-                let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-                let want = (style | WS_EX_TOOLWINDOW.0 as i32) & !WS_EX_APPWINDOW.0 as i32;
-                if style != want {
-                    SetWindowLongW(hwnd, GWL_EXSTYLE, want);
-                    let _ = SetWindowPos(
-                        hwnd,
-                        Some(HWND_TOPMOST),
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                    );
-                }
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOPMOST),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
+                std::thread::sleep(Duration::from_millis(sleep_ms));
             }
-            std::thread::sleep(Duration::from_millis(500));
         })
         .expect("启动悬浮窗置顶线程失败");
 }

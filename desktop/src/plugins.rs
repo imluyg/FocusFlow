@@ -142,7 +142,7 @@ fn reload_plugin_by_key(key: &str, db: &Arc<Database>) {
 }
 
 /// 键事件通道：listener 钩子线程投递键名，主线程分发给插件（番茄钟计数等）。
-static KEY_EVENT_TX: std::sync::OnceLock<std::sync::mpsc::Sender<String>> =
+static KEY_EVENT_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<String>> =
     std::sync::OnceLock::new();
 
 /// 接通键事件回调链。
@@ -154,11 +154,14 @@ pub fn start_key_event_dispatch(
     db: Arc<Database>,
     listener: &Arc<InputListener>,
 ) {
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    // 有界通道：主线程（Lua 分发）被卡住（插件失控/模态框）时丢弃新事件，
+    // 防止无界队列随时间无限积压。按键计数语义允许少量丢失，
+    // 权威计数由 DB 写线程的内存聚合负责，这里只服务插件联动。
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(4096);
     let _ = KEY_EVENT_TX.set(tx);
     listener.add_key_callback(Arc::new(|key| {
         if let Some(tx) = KEY_EVENT_TX.get() {
-            let _ = tx.send(key.to_string());
+            let _ = tx.try_send(key.to_string());
         }
     }));
 

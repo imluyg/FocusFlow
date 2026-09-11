@@ -21,13 +21,15 @@ pub fn get_live(state: State<'_, Arc<AppState>>) -> LiveStats {
 }
 
 /// 获取重量级图表数据（排行/趋势/分布）。
+/// async：同步命令在主线程执行，ChartAgg 的深拷贝+序列化恰好发生在
+/// 打开主窗口的瞬间，会造成可感知停顿；挪到异步运行时线程执行。
 #[tauri::command]
-pub fn get_charts(state: State<'_, Arc<AppState>>) -> ChartsStats {
+pub async fn get_charts(state: State<'_, Arc<AppState>>) -> Result<ChartsStats, String> {
     let s = state.shared.lock().unwrap_or_else(|e| e.into_inner());
-    ChartsStats {
+    Ok(ChartsStats {
         period: s.period,
         agg: s.agg.clone(),
-    }
+    })
 }
 
 /// 一次性返回设置页所需全部配置（替代多次 get_config 轮询）。

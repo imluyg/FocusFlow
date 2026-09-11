@@ -1204,7 +1204,6 @@ dependencies = [
  "rdev",
  "rusqlite",
  "serde",
- "thiserror 1.0.69",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

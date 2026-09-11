@@ -43,8 +43,10 @@ struct AggDeltas {
     daily: HashMap<i64, i64>,
     /// (date_key, hour) -> count
     hourly: HashMap<(i64, i64), i64>,
-    /// (date_key, key_name) -> count
-    keys: HashMap<(i64, String), i64>,
+    /// (date_key) -> (key_name -> count)。
+    /// 按天嵌套而非 (date_key, String) 元素键：record 热路径可用 &str
+    /// 查内层 map（String: Borrow<str>），避免每按键分配 String。
+    keys: HashMap<i64, HashMap<String, i64>>,
     /// (date_key) -> 当日累计活跃秒数
     active: HashMap<i64, i64>,
     /// ((date_key, 应用名)) -> 当日累计使用秒数（前台应用统计）
@@ -174,7 +176,14 @@ impl DbWriter {
         let mut agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
         *agg.daily.entry(day_key).or_insert(0) += 1;
         *agg.hourly.entry((day_key, hour)).or_insert(0) += 1;
-        *agg.keys.entry((day_key, key_name.to_string())).or_insert(0) += 1;
+        // 不用 entry()：那会为每次按键分配一个立刻丢弃的 String；
+        // 内层 map 用 &str 查（绝大多数命中）零分配，仅首次出现某键时才分配。
+        let day_map = agg.keys.entry(day_key).or_default();
+        if let Some(c) = day_map.get_mut(key_name) {
+            *c += 1;
+        } else {
+            day_map.insert(key_name.to_string(), 1);
+        }
         // 活跃时长：与上一事件间隔 ≤ ACTIVE_GAP_SECS 视为连续活跃
         let contrib = if agg.last_ts > 0
             && timestamp >= agg.last_ts
@@ -378,8 +387,10 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
                         "INSERT INTO key_counts (date_key, key_name, count) VALUES (?1, ?2, ?3)
                          ON CONFLICT(date_key, key_name) DO UPDATE SET count = count + excluded.count",
                     )?;
-                    for ((dk, key), n) in &pending.keys {
-                        stmt.execute(rusqlite::params![dk, key, n])?;
+                    for (dk, key_map) in &pending.keys {
+                        for (key, n) in key_map {
+                            stmt.execute(rusqlite::params![dk, key, n])?;
+                        }
                     }
                 }
                 {
@@ -453,8 +464,11 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
     for ((dk, h), n) in pending.hourly {
         *agg.hourly.entry((dk, h)).or_insert(0) += n;
     }
-    for ((dk, key), n) in pending.keys {
-        *agg.keys.entry((dk, key)).or_insert(0) += n;
+    for (dk, key_map) in pending.keys {
+        let day_map = agg.keys.entry(dk).or_default();
+        for (key, n) in key_map {
+            *day_map.entry(key).or_insert(0) += n;
+        }
     }
     for (dk, n) in pending.active {
         *agg.active.entry(dk).or_insert(0) += n;
@@ -508,7 +522,7 @@ mod tests {
             agg.hourly.get(&(dk, queries::hour_of_ts(ts))),
             Some(&3)
         );
-        assert_eq!(agg.keys.get(&(dk, "A".to_string())), Some(&2));
+        assert_eq!(agg.keys.get(&dk).and_then(|m| m.get("A")), Some(&2));
         drop(agg);
         w.stop();
     }
