@@ -1,0 +1,897 @@
+//! 记账模块。
+//!
+//! 镜像 Python 版 `accounting.py`：
+//! - 收入/支出记录 CRUD
+//! - 分类/子分类
+//! - 按日期/类型/分类筛选
+//! - 持久化到 `data/focusflow_accounting.db`
+
+use rusqlite::Connection;
+
+use crate::paths;
+
+/// 记账记录。
+#[derive(Debug, Clone)]
+pub struct Expense {
+    pub id: i64,
+    pub rtype: String,
+    pub item_name: String,
+    pub store: Option<String>,
+    pub purchase_date: String,
+    pub amount: f64,
+    pub category: Option<String>,
+    pub subcategory: Option<String>,
+    pub delivery_date: Option<String>,
+    pub record_time: String,
+    pub note: Option<String>,
+}
+
+/// 分类。
+#[derive(Debug, Clone)]
+pub struct Category {
+    pub id: i64,
+    pub name: String,
+    pub ctype: String,
+    pub subs: Vec<String>,
+}
+
+fn db_path() -> std::path::PathBuf {
+    paths::data_dir().join("focusflow_accounting.db")
+}
+
+fn open() -> rusqlite::Result<Connection> {
+    std::fs::create_dir_all(paths::data_dir()).ok();
+    let conn = Connection::open(db_path())?;
+    conn.pragma_update(None, "journal_mode", "WAL").ok();
+    conn.pragma_update(None, "synchronous", "NORMAL").ok();
+    conn.pragma_update(None, "foreign_keys", "ON").ok();
+    Ok(conn)
+}
+
+/// 预置分类（首次初始化用，对标 Python 版 DEFAULT_CATEGORIES）。
+/// 名称 -> (类型, 子分类列表)
+const DEFAULT_CATEGORIES: &[(&str, &str, &[&str])] = &[
+    (
+        "食品饮料",
+        "expense",
+        &[
+            "早餐", "午餐", "晚餐", "零食", "饮料", "水果", "外卖", "其他",
+        ],
+    ),
+    (
+        "日用百货",
+        "expense",
+        &["清洁用品", "纸品", "厨房用品", "卫浴用品", "其他"],
+    ),
+    (
+        "数码电子",
+        "expense",
+        &["电脑配件", "手机配件", "耳机", "充电器", "存储设备", "其他"],
+    ),
+    (
+        "服饰鞋包",
+        "expense",
+        &["上衣", "裤子", "鞋子", "包", "配饰", "其他"],
+    ),
+    (
+        "家居家电",
+        "expense",
+        &["家具", "小家电", "灯具", "装饰", "其他"],
+    ),
+    ("图书文具", "expense", &["书籍", "文具", "办公用品", "其他"]),
+    (
+        "交通出行",
+        "expense",
+        &["公交", "地铁", "打车", "加油", "停车", "其他"],
+    ),
+    (
+        "医疗健康",
+        "expense",
+        &["药品", "保健品", "医疗器械", "其他"],
+    ),
+    ("娱乐休闲", "expense", &["电影", "音乐", "运动", "其他"]),
+    (
+        "游戏",
+        "both",
+        &["梦幻西游", "充值", "道具", "账号", "装备", "其他"],
+    ),
+    ("工资收入", "income", &["月薪", "奖金", "兼职", "其他"]),
+    ("其他收入", "income", &["退款", "红包", "投资收益", "其他"]),
+    ("其他", "both", &["其他"]),
+];
+
+/// 初始化表结构（幂等），分类表为空时预置默认分类。
+/// 兼容旧版（Python 版）结构：旧库 categories 表无 subs 列、子分类在
+/// 独立的 subcategories 表中，此处自动迁移合并。
+pub fn init_db() -> anyhow::Result<()> {
+    let conn = open()?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL DEFAULT '支出',
+            item_name TEXT NOT NULL,
+            store TEXT,
+            purchase_date TEXT NOT NULL,
+            amount REAL NOT NULL,
+            category TEXT,
+            subcategory TEXT,
+            delivery_date TEXT,
+            record_time TEXT NOT NULL,
+            note TEXT
+        );
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            type TEXT NOT NULL DEFAULT 'both',
+            subs TEXT NOT NULL DEFAULT '[]'
+        );",
+    )?;
+
+    // 迁移：旧库 categories 表没有 subs 列 → 补列
+    let has_subs: bool = {
+        let mut stmt =
+            conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='categories'")?;
+        let sql: String = stmt.query_row([], |r| r.get(0)).unwrap_or_default();
+        sql.contains("subs")
+    };
+    if !has_subs {
+        conn.execute(
+            "ALTER TABLE categories ADD COLUMN subs TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+        // 旧版子分类在独立 subcategories 表（name, category_id）：合并进 subs 列
+        let has_sub_table: bool = {
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='subcategories'",
+            )?;
+            stmt.query_row([], |r| r.get::<_, i64>(0)).unwrap_or(0) > 0
+        };
+        if has_sub_table {
+            let merged: Vec<(String, String)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT c.name AS cat, s.name AS sub
+                     FROM subcategories s JOIN categories c ON s.category_id = c.id
+                     ORDER BY c.id, s.sort_order, s.id",
+                )?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                rows.flatten().collect()
+            };
+            let mut cat_subs: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for (cat, sub) in merged {
+                cat_subs.entry(cat).or_default().push(sub);
+            }
+            for (cat, subs) in cat_subs {
+                conn.execute(
+                    "UPDATE categories SET subs=?1 WHERE name=?2",
+                    rusqlite::params![subs.join(","), cat],
+                )?;
+            }
+            // 迁移完成后移除旧表（数据已并入）
+            conn.execute("DROP TABLE IF EXISTS subcategories", [])?;
+        }
+    }
+
+    // 分类表为空时预置默认分类
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM categories", [], |r| r.get(0))
+        .unwrap_or(0);
+    if count == 0 {
+        for (name, ctype, subs) in DEFAULT_CATEGORIES {
+            conn.execute(
+                "INSERT OR IGNORE INTO categories (name, type, subs) VALUES (?1, ?2, ?3)",
+                rusqlite::params![name, ctype, subs.join(",")],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn row_to_expense(r: &rusqlite::Row<'_>) -> rusqlite::Result<Expense> {
+    Ok(Expense {
+        id: r.get(0)?,
+        rtype: r.get(1)?,
+        item_name: r.get(2)?,
+        store: r.get(3)?,
+        purchase_date: r.get(4)?,
+        amount: r.get(5)?,
+        category: r.get(6)?,
+        subcategory: r.get(7)?,
+        delivery_date: r.get(8)?,
+        record_time: r.get(9)?,
+        note: r.get(10)?,
+    })
+}
+
+/// 添加记账记录，返回 id。
+#[allow(clippy::too_many_arguments)]
+pub fn add_expense(
+    rtype: &str,
+    item_name: &str,
+    store: Option<&str>,
+    purchase_date: &str,
+    amount: f64,
+    category: Option<&str>,
+    subcategory: Option<&str>,
+    note: Option<&str>,
+) -> i64 {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+    let record_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let r = conn.execute(
+        "INSERT INTO expenses
+         (type, item_name, store, purchase_date, amount, category, subcategory, record_time, note)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            rtype,
+            item_name,
+            store,
+            purchase_date,
+            amount,
+            category,
+            subcategory,
+            record_time,
+            note
+        ],
+    );
+    match r {
+        Ok(_) => conn.last_insert_rowid(),
+        Err(e) => {
+            tracing::error!("添加记账失败: {e}");
+            -1
+        }
+    }
+}
+
+/// 更新记账记录。
+pub fn update_expense(id: i64, e: &Expense) -> bool {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    conn.execute(
+        "UPDATE expenses SET type=?1, item_name=?2, store=?3, purchase_date=?4,
+         amount=?5, category=?6, subcategory=?7, note=?8 WHERE id=?9",
+        rusqlite::params![
+            e.rtype,
+            e.item_name,
+            e.store,
+            e.purchase_date,
+            e.amount,
+            e.category,
+            e.subcategory,
+            e.note,
+            id
+        ],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// 删除记账记录。
+pub fn delete_expense(id: i64) -> bool {
+    open()
+        .and_then(|conn| conn.execute("DELETE FROM expenses WHERE id=?1", [id]))
+        .map(|n| n > 0)
+        .unwrap_or(false)
+}
+
+/// 获取全部记账记录（按 id 降序）。
+pub fn get_all_expenses(limit: i64) -> Vec<Expense> {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut stmt = match conn.prepare("SELECT * FROM expenses ORDER BY id DESC LIMIT ?1") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let result = stmt.query_map([limit], row_to_expense);
+    match result {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 按日期筛选。
+pub fn get_expenses_by_date(date: &str) -> Vec<Expense> {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut stmt =
+        match conn.prepare("SELECT * FROM expenses WHERE purchase_date=?1 ORDER BY id DESC") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+    let result = stmt.query_map([date], row_to_expense);
+    match result {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 添加分类。
+pub fn add_category(name: &str, ctype: &str, subs: &[String]) -> i64 {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+    let subs_json = subs.join(",");
+    let r = conn.execute(
+        "INSERT OR IGNORE INTO categories (name, type, subs) VALUES (?1, ?2, ?3)",
+        rusqlite::params![name, ctype, subs_json],
+    );
+    match r {
+        Ok(_) => {
+            // 返回 id（存在则查询）
+            conn.query_row("SELECT id FROM categories WHERE name=?1", [name], |r| {
+                r.get(0)
+            })
+            .unwrap_or(-1)
+        }
+        Err(e) => {
+            tracing::error!("添加分类失败: {e}");
+            -1
+        }
+    }
+}
+
+/// 重命名分类（同步更新已记账记录的分类名），返回 (成功, 错误信息)。
+pub fn update_category(old_name: &str, new_name: &str, ctype: Option<&str>) -> (bool, String) {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(e) => return (false, format!("打开数据库失败: {e}")),
+    };
+    if old_name == new_name && ctype.is_none() {
+        return (false, "没有需要修改的内容".into());
+    }
+    if new_name.is_empty() {
+        return (false, "分类名不能为空".into());
+    }
+    // 重名检查
+    let dup: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM categories WHERE name=?1 AND name!=?2",
+            rusqlite::params![new_name, old_name],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if dup {
+        return (false, format!("分类 [{new_name}] 已存在"));
+    }
+    let r = match ctype {
+        Some(t) => conn.execute(
+            "UPDATE categories SET name=?1, type=?2 WHERE name=?3",
+            rusqlite::params![new_name, t, old_name],
+        ),
+        None => conn.execute(
+            "UPDATE categories SET name=?1 WHERE name=?2",
+            rusqlite::params![new_name, old_name],
+        ),
+    };
+    match r {
+        Ok(n) if n > 0 => {
+            // 同步历史记录
+            conn.execute(
+                "UPDATE expenses SET category=?1 WHERE category=?2",
+                rusqlite::params![new_name, old_name],
+            )
+            .ok();
+            (true, "更新成功".into())
+        }
+        Ok(_) => (false, format!("分类 [{old_name}] 不存在")),
+        Err(e) => (false, format!("更新失败: {e}")),
+    }
+}
+
+/// 删除分类（不影响已记账记录，其 category 字段保留原字符串），返回 (成功, 错误信息)。
+pub fn delete_category(name: &str) -> (bool, String) {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(e) => return (false, format!("打开数据库失败: {e}")),
+    };
+    match conn.execute("DELETE FROM categories WHERE name=?1", [name]) {
+        Ok(n) if n > 0 => (true, "删除成功".into()),
+        Ok(_) => (false, format!("分类 [{name}] 不存在")),
+        Err(e) => (false, format!("删除失败: {e}")),
+    }
+}
+
+/// 修改分类类型（expense/income/both）。
+pub fn update_category_type(name: &str, ctype: &str) -> bool {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    conn.execute(
+        "UPDATE categories SET type=?1 WHERE name=?2",
+        rusqlite::params![ctype, name],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// 为分类添加子分类，返回 (成功, 错误信息)。
+pub fn add_subcategory(category: &str, sub_name: &str) -> (bool, String) {
+    let sub_name = sub_name.trim();
+    if sub_name.is_empty() {
+        return (false, "子分类名不能为空".into());
+    }
+    let conn = match open() {
+        Ok(c) => c,
+        Err(e) => return (false, format!("打开数据库失败: {e}")),
+    };
+    let subs_raw: String = conn
+        .query_row(
+            "SELECT subs FROM categories WHERE name=?1",
+            [category],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    let mut subs: Vec<String> = subs_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if subs.iter().any(|s| s == sub_name) {
+        return (
+            false,
+            format!("子分类 [{sub_name}] 在 [{category}] 下已存在"),
+        );
+    }
+    subs.push(sub_name.to_string());
+    match conn.execute(
+        "UPDATE categories SET subs=?1 WHERE name=?2",
+        rusqlite::params![subs.join(","), category],
+    ) {
+        Ok(n) if n > 0 => (true, "添加成功".into()),
+        Ok(_) => (false, format!("分类 [{category}] 不存在")),
+        Err(e) => (false, format!("添加失败: {e}")),
+    }
+}
+
+/// 重命名子分类（同步更新已记账记录），返回 (成功, 错误信息)。
+pub fn update_subcategory(category: &str, old_sub: &str, new_sub: &str) -> (bool, String) {
+    let new_sub = new_sub.trim();
+    if new_sub.is_empty() {
+        return (false, "子分类名不能为空".into());
+    }
+    if old_sub == new_sub {
+        return (false, "没有需要修改的内容".into());
+    }
+    let conn = match open() {
+        Ok(c) => c,
+        Err(e) => return (false, format!("打开数据库失败: {e}")),
+    };
+    let subs_raw: String = conn
+        .query_row(
+            "SELECT subs FROM categories WHERE name=?1",
+            [category],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    let mut subs: Vec<String> = subs_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if subs.iter().any(|s| s == new_sub) {
+        return (
+            false,
+            format!("子分类 [{new_sub}] 在 [{category}] 下已存在"),
+        );
+    }
+    let idx = subs.iter().position(|s| s == old_sub);
+    match idx {
+        Some(i) => {
+            subs[i] = new_sub.to_string();
+            if conn
+                .execute(
+                    "UPDATE categories SET subs=?1 WHERE name=?2",
+                    rusqlite::params![subs.join(","), category],
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false)
+            {
+                // 同步历史记录
+                conn.execute(
+                    "UPDATE expenses SET subcategory=?1 WHERE category=?2 AND subcategory=?3",
+                    rusqlite::params![new_sub, category, old_sub],
+                )
+                .ok();
+                (true, "更新成功".into())
+            } else {
+                (false, format!("分类 [{category}] 不存在"))
+            }
+        }
+        None => (false, format!("子分类 [{old_sub}] 不存在")),
+    }
+}
+
+/// 删除子分类，返回 (成功, 错误信息)。
+pub fn delete_subcategory(category: &str, sub_name: &str) -> (bool, String) {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(e) => return (false, format!("打开数据库失败: {e}")),
+    };
+    let subs_raw: String = conn
+        .query_row(
+            "SELECT subs FROM categories WHERE name=?1",
+            [category],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    let subs: Vec<String> = subs_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != sub_name)
+        .collect();
+    if subs.len() == subs_raw.split(',').filter(|s| !s.trim().is_empty()).count() {
+        return (false, format!("子分类 [{sub_name}] 不存在"));
+    }
+    match conn.execute(
+        "UPDATE categories SET subs=?1 WHERE name=?2",
+        rusqlite::params![subs.join(","), category],
+    ) {
+        Ok(n) if n > 0 => (true, "删除成功".into()),
+        Ok(_) => (false, format!("分类 [{category}] 不存在")),
+        Err(e) => (false, format!("删除失败: {e}")),
+    }
+}
+
+/// 查询分类类型（expense/income/both），不存在返回 None。
+pub fn category_type(name: &str) -> Option<String> {
+    let conn = open().ok()?;
+    conn.query_row("SELECT type FROM categories WHERE name=?1", [name], |r| {
+        r.get(0)
+    })
+    .ok()
+}
+
+/// 获取所有分类。
+pub fn get_all_categories() -> Vec<Category> {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut stmt = match conn.prepare("SELECT id, name, type, subs FROM categories ORDER BY id") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let result = stmt.query_map([], |r| {
+        let subs_raw: String = r.get(3)?;
+        let subs: Vec<String> = if subs_raw.is_empty() {
+            Vec::new()
+        } else {
+            subs_raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        Ok(Category {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            ctype: r.get(2)?,
+            subs,
+        })
+    });
+    match result {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 按 id 获取记录。
+pub fn get_expense_by_id(id: i64) -> Option<Expense> {
+    let conn = open().ok()?;
+    conn.query_row("SELECT * FROM expenses WHERE id=?1", [id], row_to_expense)
+        .ok()
+}
+
+/// 分类下的子分类列表（分类表中声明的 + 记录中出现过的，去重合并）。
+pub fn get_subcategories(category: &str) -> Vec<String> {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    // 分类表中声明的子分类
+    if let Ok(mut stmt) = conn.prepare("SELECT subs FROM categories WHERE name=?1") {
+        if let Ok(mut rows) = stmt.query([category]) {
+            if let Ok(Some(row)) = rows.next() {
+                let subs_raw: String = row.get(0).unwrap_or_default();
+                for s in subs_raw
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    if !out.contains(&s) {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+    }
+    // 记录中出现过的子分类
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT DISTINCT subcategory FROM expenses WHERE category=?1 AND subcategory IS NOT NULL AND subcategory != '' ORDER BY subcategory",
+    ) {
+        if let Ok(mut rows) = stmt.query([category]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(s) = row.get::<_, String>(0) {
+                    if !out.contains(&s) {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 分页 + 筛选查询：返回 (records, total)。
+/// category/subcategory/keyword/date_from/date_to 为空时不过滤。
+#[allow(clippy::too_many_arguments)]
+pub fn get_expenses_page(
+    page: i64,
+    page_size: i64,
+    category: Option<&str>,
+    subcategory: Option<&str>,
+    keyword: Option<&str>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+) -> (Vec<Expense>, i64) {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return (Vec::new(), 0),
+    };
+    let mut conds: Vec<String> = Vec::new();
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(c) = category.filter(|c| !c.is_empty()) {
+        conds.push("category=?".to_string());
+        params.push(rusqlite::types::Value::Text(c.to_string()));
+    }
+    if let Some(s) = subcategory.filter(|s| !s.is_empty()) {
+        conds.push("subcategory=?".to_string());
+        params.push(rusqlite::types::Value::Text(s.to_string()));
+    }
+    if let Some(k) = keyword.filter(|k| !k.is_empty()) {
+        // 转义 LIKE 通配符，用户输入按字面匹配
+        let escaped = k
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        conds.push(
+            "(item_name LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\'
+             OR subcategory LIKE ? ESCAPE '\\' OR store LIKE ? ESCAPE '\\'
+             OR note LIKE ? ESCAPE '\\')"
+                .to_string(),
+        );
+        let like = format!("%{}%", escaped);
+        for _ in 0..5 {
+            params.push(rusqlite::types::Value::Text(like.clone()));
+        }
+    }
+    if let Some(f) = date_from.filter(|f| !f.is_empty()) {
+        conds.push("purchase_date>=?".to_string());
+        params.push(rusqlite::types::Value::Text(f.to_string()));
+    }
+    if let Some(t) = date_to.filter(|t| !t.is_empty()) {
+        conds.push("purchase_date<=?".to_string());
+        params.push(rusqlite::types::Value::Text(t.to_string()));
+    }
+    let where_sql = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    let page = page.clamp(1, 1_000_000);
+    let page_size = page_size.clamp(1, 200);
+    let offset = (page - 1) * page_size;
+
+    let total: i64 = {
+        let sql = format!("SELECT COUNT(*) FROM expenses{where_sql}");
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return (Vec::new(), 0),
+        };
+        let mut rows = match stmt.query(rusqlite::params_from_iter(params.iter())) {
+            Ok(r) => r,
+            Err(_) => return (Vec::new(), 0),
+        };
+        match rows.next() {
+            Ok(Some(row)) => row.get(0).unwrap_or(0),
+            _ => 0,
+        }
+    };
+
+    // 按日期倒序（最新在前），同日期按 id 倒序。
+    // 注意：占位符必须用位置 ?（不能用 ?1/?2 编号），否则带筛选时 LIMIT 会绑到筛选参数上
+    let sql = format!(
+        "SELECT * FROM expenses{where_sql} ORDER BY purchase_date DESC, id DESC LIMIT ? OFFSET ?"
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return (Vec::new(), total),
+    };
+    let mut all_params: Vec<rusqlite::types::Value> = params;
+    all_params.push(page_size.into());
+    all_params.push(offset.into());
+    let result = stmt.query_map(
+        rusqlite::params_from_iter(all_params.iter()),
+        row_to_expense,
+    );
+    let records = match result {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => Vec::new(),
+    };
+    (records, total)
+}
+
+/// 月度汇总（含分类明细）：返回 (总支出, 总收入, 条数, [(分类, 净额=收入-支出)]，按净额降序)。
+pub fn monthly_summary_detail(year_month: &str) -> (f64, f64, i64, Vec<(String, f64)>) {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return (0.0, 0.0, 0, Vec::new()),
+    };
+    let prefix = format!("{year_month}%");
+    let expense: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE type='支出' AND purchase_date LIKE ?1",
+            [&prefix],
+            |r| r.get(0),
+        )
+        .unwrap_or(0.0);
+    let income: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE type='收入' AND purchase_date LIKE ?1",
+            [&prefix],
+            |r| r.get(0),
+        )
+        .unwrap_or(0.0);
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM expenses WHERE purchase_date LIKE ?1",
+            [&prefix],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let mut cat_stats: Vec<(String, f64)> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT COALESCE(category, '(未分类)') AS cat,
+                COALESCE(SUM(CASE WHEN type='收入' THEN amount ELSE 0 END), 0) AS inc,
+                COALESCE(SUM(CASE WHEN type='支出' THEN amount ELSE 0 END), 0) AS exp
+         FROM expenses WHERE purchase_date LIKE ?1 GROUP BY category
+         ORDER BY inc - exp DESC",
+    ) {
+        if let Ok(mut rows) = stmt.query([&prefix]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(cat), Ok(inc), Ok(exp)) = (
+                    row.get::<_, String>(0),
+                    row.get::<_, f64>(1),
+                    row.get::<_, f64>(2),
+                ) {
+                    cat_stats.push((cat, inc - exp));
+                }
+            }
+        }
+    }
+    (expense, income, count, cat_stats)
+}
+
+/// 分类盈亏统计：返回 [(分类, 投入=支出合计, 赚取=收入合计, 条数)]。
+pub fn category_profit_loss() -> Vec<(String, f64, f64, i64)> {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT COALESCE(category, '(未分类)') AS cat,
+                COALESCE(SUM(CASE WHEN type='支出' THEN amount ELSE 0 END), 0) AS inv,
+                COALESCE(SUM(CASE WHEN type='收入' THEN amount ELSE 0 END), 0) AS earn,
+                COUNT(*) AS cnt
+         FROM expenses GROUP BY category ORDER BY inv - earn",
+    ) {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(cat), Ok(inv), Ok(earn), Ok(cnt)) = (
+                    row.get::<_, String>(0),
+                    row.get::<_, f64>(1),
+                    row.get::<_, f64>(2),
+                    row.get::<_, i64>(3),
+                ) {
+                    out.push((cat, inv, earn, cnt));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 指定分类下子分类盈亏：返回 [(子分类, 投入, 赚取, 条数)]。
+pub fn subcategory_profit_loss(category: &str) -> Vec<(String, f64, f64, i64)> {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT COALESCE(NULLIF(subcategory, ''), '(未分细类)') AS sub,
+                COALESCE(SUM(CASE WHEN type='支出' THEN amount ELSE 0 END), 0) AS inv,
+                COALESCE(SUM(CASE WHEN type='收入' THEN amount ELSE 0 END), 0) AS earn,
+                COUNT(*) AS cnt
+         FROM expenses WHERE category=?1 GROUP BY subcategory ORDER BY inv - earn",
+    ) {
+        if let Ok(mut rows) = stmt.query([category]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(sub), Ok(inv), Ok(earn), Ok(cnt)) = (
+                    row.get::<_, String>(0),
+                    row.get::<_, f64>(1),
+                    row.get::<_, f64>(2),
+                    row.get::<_, i64>(3),
+                ) {
+                    out.push((sub, inv, earn, cnt));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 距今多久：返回 [(id, 年, 天)]（天为去掉整年后的余数）。
+pub fn days_ago(ids: &[i64]) -> Vec<(i64, i64, i64)> {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let today = chrono::Local::now().date_naive();
+    let mut out = Vec::new();
+    let mut stmt = match conn.prepare("SELECT id, purchase_date FROM expenses WHERE id=?1") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    for id in ids {
+        if let Ok(mut rows) = stmt.query([id]) {
+            if let Ok(Some(row)) = rows.next() {
+                if let (Ok(rid), Ok(date_str)) = (row.get::<_, i64>(0), row.get::<_, String>(1)) {
+                    if let Ok(date) = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
+                        let days = (today - date).num_days().max(0);
+                        out.push((rid, days / 365, days % 365));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 月度汇总：返回 (总支出, 总收入)。
+pub fn monthly_summary(year_month: &str) -> (f64, f64) {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(_) => return (0.0, 0.0),
+    };
+    let prefix = format!("{year_month}%");
+    let expense: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE type='支出' AND purchase_date LIKE ?1",
+            [&prefix],
+            |r| r.get(0),
+        )
+        .unwrap_or(0.0);
+    let income: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE type='收入' AND purchase_date LIKE ?1",
+            [&prefix],
+            |r| r.get(0),
+        )
+        .unwrap_or(0.0);
+    (expense, income)
+}

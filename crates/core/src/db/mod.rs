@@ -1,0 +1,98 @@
+//! 数据库模块。
+//!
+//! 镜像 Python 版 `database.py`：年度归档 SQLite 存储 + 单写线程 + 查询 API。
+
+pub mod connection;
+pub mod maintenance;
+pub mod queries;
+pub mod writer;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::Datelike;
+
+pub use queries::{
+    available_years, get_alltime_max_day, get_daily_counts, get_hourly_stats, get_stats,
+    get_stats_by_date, get_today_count, get_weekday_stats, invalidate_years_cache,
+};
+pub use writer::DbWriter;
+
+use crate::config::FocusFlowConfig;
+
+/// 数据库门面：初始化 schema、归档检查、启动写入线程。
+pub struct Database {
+    /// 写入器（可空：CLI 只读模式不启动）
+    writer: Option<Arc<DbWriter>>,
+}
+
+impl Database {
+    /// 初始化：建表、旧数据聚合迁移、归档检查、启动写入线程。
+    pub fn init(config: &FocusFlowConfig) -> anyhow::Result<Arc<Self>> {
+        let year = chrono::Local::now().year();
+        let path = crate::paths::year_db_path(year);
+        let conn = crate::db::connection::open_rw(&path)?;
+        crate::db::connection::ensure_schema(&conn, year)?;
+        // 兼容清理：若存在旧版独立 mouse_stats 表，安全删除
+        let _ = conn.execute("DROP TABLE IF EXISTS mouse_stats", []);
+        drop(conn);
+        tracing::info!("数据库初始化完成: {} (年份={year})", path.display());
+
+        // 旧版逐条数据 → 聚合表（先迁移，归档检查才能基于聚合表）
+        maintenance::migrate_v2();
+
+        // 年度归档检查
+        let yearly_archive = config.get_bool("database", "yearly_archive", true);
+        maintenance::check_yearly_archive(yearly_archive);
+
+        invalidate_years_cache();
+
+        // 启动写入线程
+        let batch_size = config.get_int("database", "batch_size", 50).max(1) as usize;
+        let flush_interval =
+            Duration::from_secs(config.get_int("database", "flush_interval", 10).max(1) as u64);
+        let writer = Some(DbWriter::start(batch_size, flush_interval));
+
+        Ok(Arc::new(Self { writer }))
+    }
+
+    /// 只读初始化（CLI 统计用，不启动写入线程）。
+    pub fn init_readonly() -> Arc<Self> {
+        // 旧格式库也先聚合迁移（CLI 直接读用户数据目录）
+        maintenance::migrate_v2();
+        invalidate_years_cache();
+        Arc::new(Self { writer: None })
+    }
+
+    /// 获取写入器。
+    pub fn writer(&self) -> Option<&Arc<DbWriter>> {
+        self.writer.as_ref()
+    }
+
+    /// 记录一次按键。
+    pub fn record_key(&self, key_name: &str, timestamp: i64) {
+        if let Some(w) = &self.writer {
+            w.record(key_name, timestamp);
+        }
+    }
+
+    /// 立即 flush。
+    pub fn flush(&self, wait: bool) {
+        if let Some(w) = &self.writer {
+            w.flush(wait);
+        }
+    }
+
+    /// 优雅关闭：flush + 备份 + 停止写线程。
+    pub fn shutdown(&self, config: &FocusFlowConfig) {
+        if let Some(w) = &self.writer {
+            w.flush(true);
+            if config.get_bool("database", "backup_on_exit", true) {
+                let max_backups = config.get_int("database", "max_backups", 5).max(1);
+                maintenance::backup_database(max_backups);
+            }
+            w.stop();
+        }
+        tracing::info!("数据库已关闭");
+    }
+}

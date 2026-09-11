@@ -1,0 +1,29 @@
+[package]
+name = "focusflow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+chrono.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+# SQLite（bundled 编译，无需系统库）
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+
+# 开机自启（Windows 注册表/启动文件夹）
+winreg = "0.56"
+
+# 键鼠全局监听
+rdev = "0.5"
+
+# Lua 脚本（插件系统）
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+
+[lints]
+workspace = true

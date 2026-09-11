@@ -1,0 +1,40 @@
+/* ===== FocusFlow 主题令牌（唯一来源，主窗口与悬浮窗共享） ===== */
+:root {
+  --bg: #F5F7FA;
+  --page-top: #E8EFFC;
+  --page-bottom: #F7FAFE;
+  --fg: #1A1A2E;
+  --card: #FFFFFF;
+  --accent: #4D8CF7;
+  --accent-hover: #3B7DE0;
+  --accent-soft: #E8F0FE;
+  --success: #10B981;
+  --warning: #F59E0B;
+  --danger: #E5484D;
+  --muted: #4A4A6A;
+  --border: #E5ECF8;
+  --header-bg: #F1F5FB;
+  --grid-line: #E3EAF6;
+  --radius: 16px;
+  --shadow: 0 2px 10px rgba(24, 40, 80, 0.08);
+  --font: "Segoe UI", "Microsoft YaHei", "微软雅黑", sans-serif;
+}
+
+body.dark {
+  --bg: #14161F;
+  --page-top: #171B27;
+  --page-bottom: #10131C;
+  --fg: #E8EAEE;
+  --card: #1E2331;
+  --accent: #5B9CF7;
+  --accent-hover: #7AB1FA;
+  --accent-soft: #22304A;
+  --success: #34D399;
+  --warning: #FBBF24;
+  --danger: #F87171;
+  --muted: #8A92A6;
+  --border: #2A3042;
+  --header-bg: #232A3C;
+  --grid-line: #2E3548;
+  --shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+}

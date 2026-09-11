@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>FocusFlow 悬浮窗</title>
+  <!-- 主题变量单源：tokens.css；下面只保留悬浮窗特有的玻璃拟态样式 -->
+  <link rel="stylesheet" href="tokens.css" />
+  <style>
+    /* 悬浮窗玻璃边框需要半透明，覆盖 tokens 里的实色 --border */
+    :root {
+      --border: rgba(224,233,248,0.95);
+    }
+    body.dark {
+      --border: rgba(43,50,70,0.95);
+    }
+    html, body {
+      margin: 0; padding: 0;
+      background: transparent;
+      overflow: hidden;
+      -webkit-user-select: none; user-select: none;
+      font-family: var(--font);
+      cursor: grab;
+    }
+    body:active { cursor: grabbing; }
+    .card {
+      margin: 0;
+      padding: 4px 8px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid var(--border);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      box-sizing: border-box;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+    body.dark .card { background: rgba(30, 35, 49, 0.72); }
+    .row { display: flex; align-items: center; gap: 2px; line-height: 1.35; }
+    .lbl {
+      color: var(--muted);
+      font-size: 13px;
+      width: 26px;
+      flex: none;
+    }
+    .val { color: var(--fg); font-size: 13px; font-variant-numeric: tabular-nums; }
+    .slash { color: var(--fg); font-size: 9px; }
+    .cpm { color: var(--accent); font-size: 13px; font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="row"><span class="lbl">活跃</span><span class="val" id="today">0</span></div>
+    <div class="row"><span class="lbl">速度</span><span class="cpm" id="cpm">0</span><span class="slash">/</span><span class="val">分</span></div>
+  </div>
+  <script type="module" src="floating.js"></script>
+</body>
+</html>

@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/cli",
+    "desktop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# 统一 lint 基线：各 crate 通过 [lints] workspace = true 继承。
+# clippy::all 为默认集，显式声明作为 CI（clippy -D warnings）的约定基线。
+[workspace.lints.rust]
+rust_2018_idioms = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.dependencies]
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+
+# error handling
+anyhow = "1"
+thiserror = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

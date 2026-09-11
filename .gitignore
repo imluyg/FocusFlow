@@ -1,0 +1,33 @@
+/target
+**/*.rs.bk
+
+# 运行时生成物（数据/日志/备份/配置/插件）——任意层级
+**/data/
+**/logs/
+**/backup/
+/plugins/
+**/config.ini
+**/config.ini.corrupt-*
+**/window_state.ini
+**/dist/
+
+# Tauri 构建产物与打包目录（含用户数据，不入库）
+/dist-tauri/
+/desktop/gen/
+/desktop/target/
+
+# AI 助手 / 编辑器的工作目录与说明文件：属个人环境，不入库
+.zcode/
+.claude/
+.cursor/
+.workbuddy/
+.dsh/
+.opencode/
+.windsurf/
+.aider*
+CLAUDE.md
+AGENTS.md
+
+# ===== 设计文档 =====
+# 本地保留（设计小节、台账、验收清单、体检报告），一律不入库。
+docs/
