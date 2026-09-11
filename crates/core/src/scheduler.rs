@@ -29,7 +29,7 @@ pub struct ScheduledTask {
     pub created_at: String,
 }
 
-fn db_path() -> std::path::PathBuf {
+pub fn db_path() -> std::path::PathBuf {
     paths::data_dir().join("focusflow_scheduler.db")
 }
 
@@ -38,6 +38,7 @@ fn open() -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path())?;
     conn.pragma_update(None, "journal_mode", "WAL").ok();
     conn.pragma_update(None, "synchronous", "NORMAL").ok();
+    conn.busy_timeout(std::time::Duration::from_secs(15)).ok();
     Ok(conn)
 }
 

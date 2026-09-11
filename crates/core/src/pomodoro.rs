@@ -24,10 +24,20 @@ pub fn db_path() -> std::path::PathBuf {
     paths::data_dir().join("focusflow_pomodoro.db")
 }
 
+/// 打开本地库：WAL + busy_timeout，避免并发短锁导致读写直接失败。
+fn open_local() -> rusqlite::Result<Connection> {
+    std::fs::create_dir_all(paths::data_dir()).ok();
+    let conn = Connection::open(db_path())?;
+    conn.pragma_update(None, "journal_mode", "WAL").ok();
+    conn.pragma_update(None, "synchronous", "NORMAL").ok();
+    conn.busy_timeout(std::time::Duration::from_secs(15)).ok();
+    Ok(conn)
+}
+
 /// 初始化番茄钟数据库。
 pub fn init_db() -> anyhow::Result<()> {
     std::fs::create_dir_all(paths::data_dir()).ok();
-    let conn = Connection::open(db_path())?;
+    let conn = open_local()?;
     conn.pragma_update(None, "journal_mode", "WAL").ok();
     conn.pragma_update(None, "synchronous", "NORMAL").ok();
     conn.execute_batch(
@@ -62,7 +72,7 @@ pub struct Session {
 
 /// 保存一条会话记录。
 pub fn save_session(s: &Session) -> anyhow::Result<()> {
-    let conn = Connection::open(db_path())?;
+    let conn = open_local()?;
     conn.execute(
         "INSERT INTO pomodoro_sessions
          (type, start_time, end_time, planned_seconds, actual_seconds, key_count, created_at)
@@ -82,7 +92,7 @@ pub fn save_session(s: &Session) -> anyhow::Result<()> {
 
 /// 按日期查询会话。
 pub fn get_sessions_by_date(date_str: &str, limit: i64) -> Vec<Session> {
-    let conn = match Connection::open(db_path()) {
+    let conn = match open_local() {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
@@ -119,7 +129,7 @@ pub fn get_sessions_by_date(date_str: &str, limit: i64) -> Vec<Session> {
 
 /// 查询最近会话。
 pub fn get_recent_sessions(limit: i64) -> Vec<Session> {
-    let conn = match Connection::open(db_path()) {
+    let conn = match open_local() {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };

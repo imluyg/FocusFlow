@@ -167,13 +167,21 @@ pub fn query_edge_history_count(target_date: NaiveDate) -> Option<i64> {
     })
 }
 
-fn edge_db_path() -> PathBuf {
+pub fn edge_db_path() -> PathBuf {
     paths::data_dir().join("focusflow_edge_history.db")
+}
+
+/// 打开本地 Edge 计数库：busy_timeout 防并发短锁导致读写直接失败。
+fn open_local() -> rusqlite::Result<Connection> {
+    std::fs::create_dir_all(paths::data_dir()).ok();
+    let conn = Connection::open(edge_db_path())?;
+    conn.busy_timeout(std::time::Duration::from_secs(15)).ok();
+    Ok(conn)
 }
 
 /// 保存指定日期的计数到本地。
 pub fn save_edge_history_count(target_date: NaiveDate, count: i64) {
-    let conn = match Connection::open(edge_db_path()) {
+    let conn = match open_local() {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -200,7 +208,7 @@ pub fn get_edge_history_counts(days: i64) -> Vec<(String, i64)> {
     if !path.exists() {
         return Vec::new();
     }
-    let conn = match Connection::open(&path) {
+    let conn = match open_local() {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
@@ -245,7 +253,7 @@ fn backfill_edge_history(days: i64) -> impl FnOnce() + Send + 'static {
     move || {
         let today = Local::now().date_naive();
         let start = today - chrono::Days::new((days - 1).max(0) as u64);
-        let existing: std::collections::HashSet<String> = Connection::open(edge_db_path())
+        let existing: std::collections::HashSet<String> = open_local()
             .ok()
             .and_then(|conn| {
                 conn.prepare("SELECT date FROM edge_history WHERE date >= ?1")
@@ -279,7 +287,7 @@ fn backfill_edge_history(days: i64) -> impl FnOnce() + Send + 'static {
 
 /// 保存上次刷新的数值（meta 表），插件重启后恢复显示，避免出现误导性的 "—" / 0。
 fn save_edge_history_meta(key: &str, value: i64) {
-    let conn = match Connection::open(edge_db_path()) {
+    let conn = match open_local() {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -294,7 +302,7 @@ fn save_edge_history_meta(key: &str, value: i64) {
 
 /// 读取上次保存的今日计数（本地缓存，未刷新过返回 None）。
 pub fn get_edge_history_saved_today() -> Option<i64> {
-    let conn = Connection::open(edge_db_path()).ok()?;
+    let conn = open_local().ok()?;
     conn.query_row("SELECT value FROM meta WHERE key='today'", [], |r| {
         r.get::<_, String>(0)
     })
@@ -304,7 +312,7 @@ pub fn get_edge_history_saved_today() -> Option<i64> {
 
 /// 读取上次保存的总记录数（本地缓存，未刷新过返回 None）。
 pub fn get_edge_history_saved_total() -> Option<i64> {
-    let conn = Connection::open(edge_db_path()).ok()?;
+    let conn = open_local().ok()?;
     conn.query_row("SELECT value FROM meta WHERE key='total'", [], |r| {
         r.get::<_, String>(0)
     })

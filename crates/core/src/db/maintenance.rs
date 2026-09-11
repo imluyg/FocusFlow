@@ -246,7 +246,9 @@ fn combo_key_mapping(old: &str) -> Option<String> {
 }
 
 /// 清理 keep_days 天前的数据，返回删除的聚合行数。
+/// 不可逆操作：执行前先做一次全量备份。
 pub fn cleanup_old_data(keep_days: i64) -> i64 {
+    snapshot_before_destructive("cleanup_old_data");
     let cutoff_dk = queries::day_key_of_date(Local::now().date_naive()) - keep_days;
     let mut total = 0i64;
     for year in queries::available_years() {
@@ -334,10 +336,31 @@ pub fn maybe_auto_vacuum(auto_vacuum_days: i64) {
     tracing::info!("自动 VACUUM 完成");
 }
 
-/// 用 SQLite 在线备份 API 生成一致快照。
+/// 校验备份数据库可打开且通过 quick_check。
+/// 坏备份（撕裂的文件拷贝/中断的备份）不删除会占用轮转名额、顶掉好备份。
+fn verify_backup_file(dst: &Path) -> bool {
+    let result = Connection::open_with_flags(
+        dst,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .and_then(|conn| conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)));
+    match result {
+        Ok(status) if status == "ok" => true,
+        other => {
+            tracing::error!("备份完整性校验失败 {}: {other:?}", dst.display());
+            let _ = std::fs::remove_file(dst);
+            false
+        }
+    }
+}
+
+/// 用 SQLite 在线备份 API 生成一致快照（源库只读打开，避免备份触发 WAL 副作用）。
 fn backup_db_file(src: &Path, dst: &Path) -> bool {
     let result = (|| -> anyhow::Result<()> {
-        let src_conn = Connection::open(src)?;
+        let src_conn = Connection::open_with_flags(
+            src,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
         src_conn.backup(rusqlite::DatabaseName::Main, dst, None)?;
         Ok(())
     })();
@@ -376,7 +399,33 @@ pub fn start_periodic_backup(interval_hours: u64, max_backups: i64) {
         .expect("启动定时备份线程失败");
 }
 
-/// 备份所有年度数据库到 backup/ 目录，返回首个备份路径。
+/// 破坏性操作（清空/清理/删除按键）前的兜底快照。
+/// 备份失败不阻断操作本身（用户在 UI 主动发起），但错误日志会高亮，
+/// 并且该次备份不会污染轮转（坏文件已被校验逻辑删除）。
+fn snapshot_before_destructive(op: &str) {
+    let max_backups = crate::config::instance()
+        .get_int("database", "max_backups", 5)
+        .max(1);
+    if backup_database(max_backups).is_none() {
+        tracing::error!("{op}: 执行前快照失败，没有任何数据库被备份");
+    } else {
+        tracing::info!("{op}: 已完成执行前快照");
+    }
+}
+
+/// 附属数据库（记账/番茄钟/定时任务/Edge 历史）路径列表。
+/// 这些库以前从不备份，记账等数据损坏后无法恢复。
+fn auxiliary_db_paths() -> Vec<(&'static str, std::path::PathBuf)> {
+    vec![
+        ("accounting", crate::accounting::db_path()),
+        ("pomodoro", crate::pomodoro::db_path()),
+        ("scheduler", crate::scheduler::db_path()),
+        ("edge_history", crate::edge_history::edge_db_path()),
+    ]
+}
+
+/// 备份所有年度数据库与附属数据库到 backup/ 目录，返回首个备份路径。
+/// 每个备份都做 quick_check 校验，坏备份会被删除、不占用轮转名额。
 pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
     std::fs::create_dir_all(paths::backup_dir()).ok();
     let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
@@ -387,23 +436,37 @@ pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
             continue;
         }
         let dst = paths::backup_dir().join(format!("focusflow_{year}_{timestamp}.db"));
-        let mut ok = backup_db_file(&src, &dst);
+        let mut ok = backup_db_file(&src, &dst) && verify_backup_file(&dst);
         if !ok {
-            // 兜底：checkpoint 后直接复制主文件
+            // 兜底：checkpoint 后直接复制主文件（复制的是变化中的文件，可能撕裂，
+            // 必须校验，避免坏备份顶掉轮转中的好备份）
             if let Ok(conn) = connection::open_rw(&src) {
                 let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
                 drop(conn);
             }
-            ok = std::fs::copy(&src, &dst).is_ok();
+            ok = std::fs::copy(&src, &dst).is_ok() && verify_backup_file(&dst);
         }
-        if dst.exists() {
+        if ok {
             backed_up.push(dst);
+        }
+    }
+    // 附属库同样纳入备份与轮转（命名沿用 focusflow_{组}_{时间戳}.db，
+    // rotate_backups 按第二个下划线段分组，"accounting" 等名称天然成组）
+    for (name, src) in auxiliary_db_paths() {
+        if !src.exists() {
+            continue;
+        }
+        let dst = paths::backup_dir().join(format!("focusflow_{name}_{timestamp}.db"));
+        if backup_db_file(&src, &dst) && verify_backup_file(&dst) {
+            backed_up.push(dst);
+        } else {
+            tracing::error!("附属库备份失败: {name}");
         }
     }
     if !backed_up.is_empty() {
         rotate_backups(max_backups);
         tracing::info!(
-            "已备份 {} 个年度库到 {}",
+            "已备份 {} 个数据库到 {}",
             backed_up.len(),
             paths::backup_dir().display()
         );
@@ -442,7 +505,9 @@ fn rotate_backups(max_keep: i64) {
 }
 
 /// 清空所有年度库的聚合数据，返回删除行数。
+/// 不可逆操作：执行前先做一次全量备份（失败只记日志不阻断，但会在日志中高亮）。
 pub fn reset_all_data() -> i64 {
+    snapshot_before_destructive("reset_all_data");
     let mut total = 0i64;
     for year in queries::available_years() {
         let path = paths::year_db_path(year);
@@ -472,6 +537,7 @@ pub fn delete_key_today(key_name: &str) -> i64 {
     if key_name.is_empty() {
         return 0;
     }
+    snapshot_before_destructive("delete_key_today");
     let today_dk = queries::day_key_of_date(Local::now().date_naive());
     let path = paths::current_year_db_path();
     let conn = match connection::open_rw(&path) {

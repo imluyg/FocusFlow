@@ -35,7 +35,7 @@ pub struct Category {
     pub subs: Vec<String>,
 }
 
-fn db_path() -> std::path::PathBuf {
+pub fn db_path() -> std::path::PathBuf {
     paths::data_dir().join("focusflow_accounting.db")
 }
 
@@ -45,6 +45,7 @@ fn open() -> rusqlite::Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL").ok();
     conn.pragma_update(None, "synchronous", "NORMAL").ok();
     conn.pragma_update(None, "foreign_keys", "ON").ok();
+    conn.busy_timeout(std::time::Duration::from_secs(15)).ok();
     Ok(conn)
 }
 

@@ -795,11 +795,10 @@ mod tests {
             lua.load(expr).exec().unwrap();
         }
         // 运行时兜底：io.open 即便被伪造调用也应报"未定义"
-        let err = lua
-            .load("return io.open('C:/x.txt','w')")
-            .exec()
-            .err()
-            .expect("io 不可用时必须报错");
+        let err = lua.load("return io.open('C:/x.txt','w')").exec();
+        let Err(err) = err else {
+            panic!("io 不可用时必须报错");
+        };
         assert!(err.to_string().contains("io"));
     }
 }
