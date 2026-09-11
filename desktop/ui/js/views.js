@@ -17,7 +17,7 @@ function applyMax(s) {
 // 轻量数据：今日/速度/周期（高频推送）
 export function applyLive(s) {
   $("st-today").textContent = fmt(s.today_count);
-  $("st-active").textContent = fmtDuration(s.active_seconds);
+  $("st-active").textContent = "时长 " + fmtDuration(s.active_seconds);
   $("st-cpm").textContent = fmt(s.cpm) + " 次/分";
 
   const periodLabel = s.period === -1 ? "今日" : s.period === 0 ? "总计" : s.period + "天";
