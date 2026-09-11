@@ -440,7 +440,11 @@ pub fn reset_all_data() -> i64 {
     total
 }
 
-/// 删除今日指定按键的聚合记录（含内存中未落库增量由调用方先 flush），返回删除行数。
+/// 删除今日指定按键的聚合记录（含内存中未落库增量由调用方先 flush），返回删除的计数值。
+///
+/// key_counts 为每键每天一行；删除后同步修正 daily_counts 与 hourly_counts：
+/// hourly_counts 只有全天各小时总量、不含按 key 拆分，故按 removed/daily_before
+/// 比例整数分摊扣减（余数从最大小时补扣），保证 Σhourly == daily == Σkey_counts。
 pub fn delete_key_today(key_name: &str) -> i64 {
     let key_name = key_name.trim();
     if key_name.is_empty() {
@@ -452,23 +456,182 @@ pub fn delete_key_today(key_name: &str) -> i64 {
         Ok(c) => c,
         Err(_) => return 0,
     };
-    let n = conn
-        .execute(
-            "DELETE FROM key_counts WHERE key_name=?1 AND date_key=?2",
+
+    let removed: i64 = conn
+        .query_row(
+            "SELECT count FROM key_counts WHERE key_name=?1 AND date_key=?2",
             rusqlite::params![key_name, today_dk],
+            |r| r.get(0),
         )
         .unwrap_or(0);
-    if n > 0 {
-        // 同步扣减今日总数，保持一致
-        let _ = conn.execute(
-            "UPDATE daily_counts SET count = count - ?1 WHERE date_key = ?2",
-            rusqlite::params![n, today_dk],
-        );
-        let _ = conn.execute(
-            "DELETE FROM daily_counts WHERE count <= 0 AND date_key = ?1",
+    if removed <= 0 {
+        return 0;
+    }
+    let daily_before: i64 = conn
+        .query_row(
+            "SELECT count FROM daily_counts WHERE date_key=?1",
             [today_dk],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let daily_after = (daily_before - removed).max(0);
+
+    if let Err(e) = conn.execute(
+        "DELETE FROM key_counts WHERE key_name=?1 AND date_key=?2",
+        rusqlite::params![key_name, today_dk],
+    ) {
+        tracing::error!("delete_key_today 删除 key_counts 失败: {e}");
+        return 0;
+    }
+    if let Err(e) = conn.execute(
+        "UPDATE daily_counts SET count=?1 WHERE date_key=?2",
+        rusqlite::params![daily_after, today_dk],
+    ) {
+        tracing::error!("delete_key_today 更新 daily_counts 失败: {e}");
+    }
+
+    // 各小时按占比分摊扣减
+    if daily_before > 0 {
+        let hours: Vec<(i64, i64)> = conn
+            .prepare("SELECT hour, count FROM hourly_counts WHERE date_key=?1")
+            .and_then(|mut s| {
+                s.query_map([today_dk], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })
+                .map(|rows| rows.flatten().collect())
+            })
+            .unwrap_or_default();
+        let mut taken: i64 = 0;
+        let mut updates: Vec<(i64, i64)> = Vec::with_capacity(hours.len());
+        for (h, cnt) in &hours {
+            let take = cnt * removed / daily_before;
+            taken += take;
+            updates.push((*h, cnt - take));
+        }
+        // 整数分摊的余数从计数最大的小时补扣
+        let residual = removed - taken;
+        if residual > 0 {
+            let max_hour = hours.iter().max_by_key(|(_, c)| *c).map(|(h, _)| *h);
+            if let Some((_, c)) = updates.iter_mut().find(|(h, _)| Some(*h) == max_hour) {
+                *c -= residual;
+            }
+        }
+        for (h, new_count) in updates {
+            if let Err(e) = conn.execute(
+                "UPDATE hourly_counts SET count=?1 WHERE date_key=?2 AND hour=?3",
+                rusqlite::params![new_count, today_dk, h],
+            ) {
+                tracing::error!("delete_key_today 更新 hourly_counts 失败: {e}");
+            }
+        }
+        let _ = conn.execute("DELETE FROM hourly_counts WHERE count <= 0 AND date_key = ?1", [today_dk]);
+        let _ = conn.execute("DELETE FROM daily_counts WHERE count <= 0 AND date_key = ?1", [today_dk]);
+    }
+
+    tracing::info!("已删除今日按键 [{key_name}] 的聚合记录（计数 {removed}）");
+    removed
+}
+
+/// 启动时一次性聚合表一致性自愈：
+/// 1. daily_counts.count 与 Σkey_counts 不符的天，以 key_counts 为准重算；
+/// 2. Σhourly_counts 与 daily_counts 不符的天，按比例把小时分布缩放到当日总数
+///    （hourly 无按 key 拆分，只能整体缩放；余数补到最大小时）。
+/// 幂等：启动时每次执行都安全，写入线程尚未开始，库为落盘后的权威状态。
+pub fn heal_daily_consistency() {
+    for year in queries::available_years() {
+        let path = paths::year_db_path(year);
+        let conn = match connection::open_rw(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // 1. daily = Σ key_counts
+        let fixed_daily = conn
+            .execute(
+                "UPDATE daily_counts SET count = COALESCE(
+                     (SELECT SUM(count) FROM key_counts WHERE key_counts.date_key = daily_counts.date_key), 0)
+                 WHERE count != COALESCE(
+                     (SELECT SUM(count) FROM key_counts WHERE key_counts.date_key = daily_counts.date_key), 0)",
+                [],
+            )
+            .unwrap_or(0);
+        // 无 key_counts 行但 daily_counts 有值的残留天，直接清零
+        let _ = conn.execute(
+            "UPDATE daily_counts SET count = 0
+             WHERE count != 0 AND NOT EXISTS
+                 (SELECT 1 FROM key_counts WHERE key_counts.date_key = daily_counts.date_key)",
+            [],
+        );
+        if fixed_daily > 0 {
+            tracing::info!("一致性自愈：{year} 年库修正 {fixed_daily} 天的 daily_counts");
+        }
+
+        // 2. Σhourly → daily 对齐（仅处理有偏差的天）
+        let days: Vec<i64> = conn
+            .prepare(
+                "SELECT d.date_key FROM daily_counts d
+                 JOIN (SELECT date_key, SUM(count) s FROM hourly_counts GROUP BY date_key) h
+                   ON h.date_key = d.date_key
+                 WHERE h.s != d.count",
+            )
+            .and_then(|mut s| {
+                s.query_map([], |r| r.get::<_, i64>(0))
+                    .map(|rows| rows.flatten().collect())
+            })
+            .unwrap_or_default();
+        for dk in &days {
+            let daily: i64 = conn
+                .query_row(
+                    "SELECT count FROM daily_counts WHERE date_key=?1",
+                    [dk],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            scale_hourly_to_total(&conn, *dk, daily);
+        }
+        if !days.is_empty() {
+            tracing::info!("一致性自愈：{year} 年库重算 {} 天的 hourly_counts", days.len());
+            queries::invalidate_years_cache();
+        }
+    }
+}
+
+/// 把某天 hourly_counts 各小时按比例缩放，使 Σhourly == target_total。
+/// 整数分摊：每小时扣减 floor(cnt * excess / cur_total)，余数从最大小时补扣。
+fn scale_hourly_to_total(conn: &Connection, day_key: i64, target_total: i64) {
+    let hours: Vec<(i64, i64)> = conn
+        .prepare("SELECT hour, count FROM hourly_counts WHERE date_key=?1")
+        .and_then(|mut s| {
+            s.query_map([day_key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    let cur_total: i64 = hours.iter().map(|(_, c)| c).sum();
+    if cur_total <= 0 || cur_total == target_total {
+        return;
+    }
+    let excess = cur_total - target_total; // 可能为正（多记）也可能为负（少记）
+    let mut applied: i64 = 0;
+    let mut updates: Vec<(i64, i64)> = Vec::with_capacity(hours.len());
+    for (h, cnt) in &hours {
+        let take = cnt * excess / cur_total;
+        applied += take;
+        updates.push((*h, cnt - take));
+    }
+    let residual = excess - applied;
+    if residual != 0 {
+        let max_hour = hours.iter().max_by_key(|(_, c)| *c).map(|(h, _)| *h);
+        if let Some((_, c)) = updates.iter_mut().find(|(h, _)| Some(*h) == max_hour) {
+            *c -= residual;
+        }
+    }
+    for (h, new_count) in updates {
+        let _ = conn.execute(
+            "UPDATE hourly_counts SET count=?1 WHERE date_key=?2 AND hour=?3",
+            rusqlite::params![new_count, day_key, h],
         );
     }
-    tracing::info!("已删除今日按键 [{key_name}] 的聚合记录 {n} 行");
-    n as i64
+    let _ = conn.execute(
+        "DELETE FROM hourly_counts WHERE count <= 0 AND date_key = ?1",
+        [day_key],
+    );
 }

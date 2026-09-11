@@ -450,10 +450,23 @@ pub fn now_ts() -> i64 {
 }
 
 /// 本地日期转当日起始 Unix 秒（本地时区）。
+///
+/// DST 空档（如春令时 0:00-1:00 不存在）时 `.single()` 返回 None，
+/// 回退取最早可用映射，绝不让统计路径 panic。
 fn local_day_start_ts(date: chrono::NaiveDate) -> i64 {
-    let local_dt = chrono::Local
-        .from_local_datetime(&date.and_hms_opt(0, 0, 0).expect("time"))
-        .single()
-        .expect("本地时区转换失败");
-    local_dt.timestamp()
+    let naive = match date.and_hms_opt(0, 0, 0) {
+        Some(t) => t,
+        None => return 0,
+    };
+    match Local.from_local_datetime(&naive).single() {
+        Some(dt) => dt.timestamp(),
+        // DST 空档取最早映射；仍失败则按 UTC 零点近似并记日志
+        None => match Local.from_local_datetime(&naive).earliest() {
+            Some(dt) => dt.timestamp(),
+            None => {
+                tracing::warn!("本地时区转换失败，跳过该日起始时间: {date}");
+                naive.and_utc().timestamp()
+            }
+        },
+    }
 }

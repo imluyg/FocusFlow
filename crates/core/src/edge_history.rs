@@ -122,10 +122,12 @@ pub fn query_edge_total_count() -> Option<i64> {
 
 /// 查询指定日期的 Edge 历史记录数（失败/被锁返回 None）。
 pub fn query_edge_history_count(target_date: NaiveDate) -> Option<i64> {
-    let day_start = Local
-        .from_local_datetime(&target_date.and_hms_opt(0, 0, 0).unwrap())
-        .single()
-        .unwrap();
+    let naive = target_date.and_hms_opt(0, 0, 0)?;
+    // DST 空档（时钟跳变）该时刻无对应本地时间，回退取最早可用映射
+    let day_start = match Local.from_local_datetime(&naive).single() {
+        Some(dt) => dt,
+        None => Local.from_local_datetime(&naive).earliest()?,
+    };
     let day_end = day_start + chrono::Duration::days(1);
     let chrome_start = datetime_to_chrome(&day_start);
     let chrome_end = datetime_to_chrome(&day_end);

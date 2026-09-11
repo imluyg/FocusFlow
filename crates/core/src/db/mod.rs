@@ -41,6 +41,9 @@ impl Database {
         // 旧版逐条数据 → 聚合表（先迁移，归档检查才能基于聚合表）
         maintenance::migrate_v2();
 
+        // 聚合表一致性自愈（修正历史 delete_key_today 不同步扣减留下的偏差）
+        maintenance::heal_daily_consistency();
+
         // 年度归档检查
         let yearly_archive = config.get_bool("database", "yearly_archive", true);
         maintenance::check_yearly_archive(yearly_archive);

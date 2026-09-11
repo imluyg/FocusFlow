@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::SystemTime;
 
-use mlua::Lua;
+use mlua::{HookTriggers, Lua, VmState};
 
 use crate::config::FocusFlowConfig;
 use crate::db;
@@ -89,6 +89,42 @@ impl PluginManager {
         }
     }
 
+    /// 为 Lua 状态施加资源限制（防 `while true do end` 冻结主线程）：
+    /// - 内存上限：超限触发 `Error::MemoryError`；
+    /// - 指令数 hook：每 N 条指令检查一次，超限直接中断执行。
+    /// 配置项：config.ini [plugins] memory_limit_mb（默认 16）/ instruction_limit（默认 1000 万）。
+    /// Lua 状态创建后调用一次即可覆盖该状态后续所有执行路径。
+    fn apply_lua_limits(&self, lua: &Lua) {
+        let mem_mb = self.config.get_int("plugins", "memory_limit_mb", 16).max(1) as usize;
+        if let Err(e) = lua.set_memory_limit(mem_mb * 1024 * 1024) {
+            tracing::warn!("Lua 内存限制设置失败: {e}");
+        }
+        let instr = self
+            .config
+            .get_int("plugins", "instruction_limit", 10_000_000)
+            .clamp(1, u32::MAX as i64) as u32;
+        lua.set_hook(
+            HookTriggers::new().every_nth_instruction(instr),
+            |_lua, _dbg| -> mlua::Result<VmState> {
+                Err(mlua::Error::RuntimeError(
+                    "插件执行超出指令数上限（疑似死循环），已中断".into(),
+                ))
+            },
+        );
+    }
+
+    /// 将插件标记为错误并释放其 Lua 环境（保留条目供插件列表展示错误信息）。
+    /// 超限后 Lua 状态不可信，跳过 cleanup 直接丢弃。
+    fn mark_plugin_error(&mut self, name: &str, msg: String) {
+        if let Some(info) = self.plugins.get_mut(name) {
+            info.error = Some(msg.clone());
+            info.lua = None;
+            info.view = None;
+            info.loaded = false;
+        }
+        tracing::error!("插件已停用: {name}: {msg}");
+    }
+
     /// 插件目录。
     fn plugins_dir(&self) -> PathBuf {
         paths::plugins_dir()
@@ -114,6 +150,7 @@ impl PluginManager {
     /// 从 Lua 脚本读取元数据（不执行 init）。
     fn read_meta(&self, path: &Path) -> Result<PluginMeta, String> {
         let lua = Lua::new();
+        self.apply_lua_limits(&lua);
         // 只注册空的 focusflow 占位表，避免扫描阶段触发宿主单例副作用；
         // 真正的宿主 API 在 load_plugin 时才注册。
         {
@@ -167,6 +204,7 @@ impl PluginManager {
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
 
         let lua = Lua::new();
+        self.apply_lua_limits(&lua);
         host::register_host_api(&lua, self.config, Arc::clone(&self.db))
             .map_err(|e| format!("宿主 API 注册失败: {e}"))?;
         let script = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -342,7 +380,7 @@ impl PluginManager {
     /// 调用插件函数（GUI 线程）。
     /// 返回是否成功（函数存在且执行无错）。
     pub fn call_plugin_fn<R>(
-        &self,
+        &mut self,
         name: &str,
         fn_name: &str,
         args: mlua::MultiValue,
@@ -362,9 +400,16 @@ impl PluginManager {
             .globals()
             .get(fn_name)
             .map_err(|e| format!("获取 {fn_name} 失败: {e}"))?;
-        let ret: R = f
-            .call(args)
-            .map_err(|e| format!("调用 {fn_name} 失败: {e}"))?;
+        let ret: R = match f.call(args) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("调用 {fn_name} 失败: {e}");
+                if is_limit_error(&e) {
+                    self.mark_plugin_error(name, msg.clone());
+                }
+                return Err(msg);
+            }
+        };
         Ok(ret)
     }
 
@@ -384,7 +429,16 @@ impl PluginManager {
         if lua.globals().get::<mlua::Function>("get_view").is_err() {
             return Ok(());
         }
-        let view = Self::read_view(lua).map_err(|e| format!("get_view() 失败: {e}"))?;
+        let view = match Self::read_view(lua) {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format!("get_view() 失败: {e}");
+                if is_limit_error(&e) {
+                    self.mark_plugin_error(name, msg.clone());
+                }
+                return Err(msg);
+            }
+        };
         if let Some(p) = self.plugins.get_mut(name) {
             p.view = Some(view);
         }
@@ -403,9 +457,13 @@ impl PluginManager {
             .ok_or_else(|| format!("插件未加载: {name}"))?;
         // 先检查是否有 on_action
         if let Ok(on_action) = lua.globals().get::<mlua::Function>("on_action") {
-            let _: () = on_action
-                .call(action_id)
-                .map_err(|e| format!("on_action 失败: {e}"))?;
+            if let Err(e) = on_action.call::<()>(action_id) {
+                let msg = format!("on_action 失败: {e}");
+                if is_limit_error(&e) {
+                    self.mark_plugin_error(name, msg.clone());
+                }
+                return Err(msg);
+            }
             self.refresh_view(name)?;
             return Ok(());
         }
@@ -413,7 +471,7 @@ impl PluginManager {
     }
 
     /// 向插件投递按键事件（番茄钟联动等）。
-    pub fn plugin_key_event(&self, name: &str, key: &str) {
+    pub fn plugin_key_event(&mut self, name: &str, key: &str) {
         let info = match self.plugins.get(name) {
             Some(i) => i,
             None => return,
@@ -423,7 +481,11 @@ impl PluginManager {
             None => return,
         };
         if let Ok(record_key) = lua.globals().get::<mlua::Function>("record_key") {
-            let _: mlua::Result<()> = record_key.call(key);
+            if let Err(e) = record_key.call::<()>(key) {
+                if is_limit_error(&e) {
+                    self.mark_plugin_error(name, format!("record_key 失败: {e}"));
+                }
+            }
         }
     }
 
@@ -438,14 +500,24 @@ impl PluginManager {
             .as_ref()
             .ok_or_else(|| format!("插件未加载: {name}"))?;
         if let Ok(set_field) = lua.globals().get::<mlua::Function>("set_field") {
-            let _: () = set_field
-                .call((field, value))
-                .map_err(|e| format!("set_field 失败: {e}"))?;
+            if let Err(e) = set_field.call::<()>((field, value)) {
+                let msg = format!("set_field 失败: {e}");
+                if is_limit_error(&e) {
+                    self.mark_plugin_error(name, msg.clone());
+                }
+                return Err(msg);
+            }
             self.refresh_view(name)?;
             return Ok(());
         }
         Err("插件未定义 set_field".to_string())
     }
+}
+
+/// 判断 Lua 错误是否由资源限制触发（指令数超限 / 内存超限）。
+/// 此类错误说明插件已不可信，应停用插件而非继续复用其 Lua 环境。
+fn is_limit_error(e: &mlua::Error) -> bool {
+    matches!(e, mlua::Error::MemoryError(_)) || e.to_string().contains("指令数上限")
 }
 
 /// 热重载检测循环：扫描插件目录 mtime，变更时发送重载请求。
