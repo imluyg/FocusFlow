@@ -663,14 +663,51 @@ fn restore_main_after_load(app: &tauri::AppHandle) {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            // 超时仍未加载：补一次导航兜底，避免 stuck 在 about:blank 白屏
+            // 超时仍未加载：补导航兜底（再试两次，间隔等待）。若全部失败，
+            // 判定 WebView2 环境已损坏（典型场景：长时间休眠中浏览器进程死亡，
+            // 唤醒后控制器状态失效，此后所有 navigate 都无效），窗口只能显示
+            // 空白（about:blank + 透明窗口 → 用户看到纯材质底色）。此时自动
+            // 重启应用：干净退出走 flush/备份（恢复文件兜底未落库增量），
+            // 比留给用户一个永远空白的窗口好。
             if !loaded {
-                if let Some(win) = handle.get_webview_window("main") {
-                    let url = MAIN_URL.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    if let Some(u) = url.and_then(|u| u.parse::<tauri::Url>().ok()) {
-                        let _ = win.navigate(u);
+                for _ in 0..2 {
+                    if MAIN_VIS_EPOCH.load(Ordering::SeqCst) != epoch {
+                        return;
+                    }
+                    if let Some(win) = handle.get_webview_window("main") {
+                        let url = MAIN_URL.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        if let Some(u) = url.and_then(|u| u.parse::<tauri::Url>().ok()) {
+                            let _ = win.navigate(u);
+                        }
+                    }
+                    for _ in 0..60 {
+                        if MAIN_VIS_EPOCH.load(Ordering::SeqCst) != epoch {
+                            return;
+                        }
+                        loaded = handle
+                            .get_webview_window("main")
+                            .map(|w| {
+                                w.url()
+                                    .map(|u| u.as_str() != "about:blank")
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if loaded {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    if loaded {
+                        break;
                     }
                 }
+            }
+            if !loaded {
+                tracing::error!(
+                    "主窗口页面恢复失败（疑似休眠唤醒后 WebView2 环境损坏），3 秒后自动重启应用"
+                );
+                schedule_app_restart(&handle);
+                return;
             }
             // 显示前最终确认：代次未变、窗口仍隐藏（把 TOCTOU 窗口缩到最小）
             if MAIN_VIS_EPOCH.load(Ordering::SeqCst) != epoch {
@@ -693,6 +730,35 @@ fn restore_main_after_load(app: &tauri::AppHandle) {
             }
         })
         .expect("启动主窗口恢复线程失败");
+}
+
+/// 自动重启应用（WebView2 环境损坏等无法在线恢复的场景）：
+/// 后台线程延迟几秒后拉起新进程（当前 exe，数据目录解析与本次一致），
+/// 当前进程干净退出——退出路径完成 flush/备份，未落库增量由恢复文件兜底。
+fn schedule_app_restart(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    std::thread::Builder::new()
+        .name("app-restart".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            let exe = match std::env::current_exe() {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!("自动重启失败：无法定位当前 exe: {e}");
+                    return;
+                }
+            };
+            match std::process::Command::new(&exe).spawn() {
+                Ok(_) => {
+                    tracing::info!("应用自动重启：新进程已启动，当前进程退出");
+                    handle.exit(0);
+                }
+                Err(e) => {
+                    tracing::error!("自动重启失败（拉起新进程）: {e}，应用保持运行");
+                }
+            }
+        })
+        .expect("启动应用重启线程失败");
 }
 
 /// 悬浮窗周期重申置顶（对齐 Python 版方案）：
