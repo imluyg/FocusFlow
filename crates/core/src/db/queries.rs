@@ -448,7 +448,9 @@ fn query_apps_in_conn(
             })
             .unwrap_or(0),
     };
-    let sql = format!("SELECT app_name, seconds FROM app_usage{where_clause}");
+    // 必须按应用聚合后再进 HashMap：app_usage 主键是 (date_key, app_name)，
+    // 同一应用跨多天有多行，裸选行 collect 会同名覆盖（只剩最后一天），总时长被吃掉一大截。
+    let sql = format!("SELECT app_name, SUM(seconds) FROM app_usage{where_clause} GROUP BY app_name");
     let map: HashMap<String, i64> = {
         let mapper = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?));
         let rows = match conn.prepare(&sql) {
