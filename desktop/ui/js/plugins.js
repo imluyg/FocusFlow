@@ -48,20 +48,44 @@ export async function renderPlugins() {
         a.name.localeCompare(b.name, "zh-Hans-CN")
     );
     box.innerHTML = plugins
-      .map(
-        (p) =>
-          `<div class="plugin-row">
-            <div class="info"><div class="name">${escapeHtml(p.name)}</div><div class="desc">${escapeHtml(p.desc || "")}</div></div>
+      .map((p) => {
+        const file = escapeHtml(p.file || "");
+        // 停用态：整行灰化，且不提供"打开"（已卸载，打开必然失败）
+        const toggle = `<button class="btn ghost" data-act="toggle-plugin" data-file="${file}" data-target="${p.enabled ? 0 : 1}">${p.enabled ? "停用" : "启用"}</button>`;
+        const open = p.enabled
+          ? `<button class="btn ghost" data-act="open-plugin" data-name="${escapeHtml(p.name)}">打开</button>`
+          : "";
+        const err = p.enabled && p.error
+          ? `<div class="desc" style="color:var(--danger);">加载失败：${escapeHtml(p.error)}</div>`
+          : "";
+        return `<div class="plugin-row${p.enabled ? "" : " disabled"}">
+            <div class="info">
+              <div class="name">${escapeHtml(p.name)}${p.enabled ? "" : ' <span style="color:var(--muted);font-weight:400;">（已停用）</span>'}</div>
+              <div class="desc">${escapeHtml(p.desc || "")}</div>${err}
+            </div>
             <div style="display:flex;align-items:center;gap:10px;">
               <span style="font-size:13px;color:var(--muted);">v${escapeHtml(p.version || "")} · ${escapeHtml(p.author || "")}</span>
-              <button class="btn ghost" data-act="open-plugin" data-name="${escapeHtml(p.name)}">打开</button>
+              ${toggle}${open}
             </div>
-          </div>`
-      )
+          </div>`;
+      })
       .join("");
   } catch (e) {
     $("view-plugins").innerHTML = '<div class="empty">插件加载失败</div>';
   }
+}
+
+// 启用/停用插件：停用会卸载实例并调用 cleanup，之后不再加载、不接收键事件。
+// 开关作用在文件名上（插件改名不影响配置）。
+export async function togglePlugin(file, enabled) {
+  const want = enabled === true || enabled === "1";
+  try {
+    await invoke("set_plugin_enabled", { file, enabled: want });
+    toast(want ? "插件已启用" : "插件已停用");
+  } catch (e) {
+    toast("操作失败: " + e);
+  }
+  await renderPlugins();
 }
 
 export function openPlugin(name) {
@@ -259,6 +283,8 @@ document.addEventListener("keydown", (e) => {
   if (!overlay) return;
   const btn = overlay.querySelector(".modal-close");
   if (btn) btn.click();
+  // 标记已消费：main.js 的 Esc（隐藏主窗口）据此跳过，避免关弹窗时把窗口一起藏了
+  e.preventDefault();
 });
 function pluginFieldHtml(f) {
   const label = `<span class="lbl">${escapeHtml(f.label || f.text || "")}</span>`;

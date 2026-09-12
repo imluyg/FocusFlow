@@ -290,6 +290,8 @@ input[type="text"] {
 }
 .plugin-row .info .name { font-weight: 600; }
 .plugin-row .info .desc { color: var(--muted); font-size: 13px; }
+/* 已停用的插件：整行压暗，与可打开的插件区分开 */
+.plugin-row.disabled { opacity: 0.55; }
 
 #version { color: var(--muted); font-size: 12px; margin-top: 16px; }
 

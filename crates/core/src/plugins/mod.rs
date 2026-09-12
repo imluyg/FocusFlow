@@ -12,7 +12,7 @@
 pub mod host;
 pub mod manager;
 
-pub use manager::{PluginInfo, PluginManager};
+pub use manager::{DiscoveredPlugin, PluginInfo, PluginManager};
 
 pub use self::Widget as WidgetT;
 

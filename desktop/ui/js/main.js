@@ -3,7 +3,7 @@
 import { invoke, listen } from "./tauri.js";
 import { $ } from "./utils.js";
 import { appState } from "./state.js";
-import { renderPlugins, openPlugin, closePlugin, renderPluginDetail, pluginBtn, pluginBtnSel, pluginField, pluginFieldStay, pluginSelectRow, pluginSelectAll, modalOpen, modalCancel, modalSubmit, modalAction } from "./plugins.js";
+import { renderPlugins, openPlugin, closePlugin, renderPluginDetail, togglePlugin, pluginBtn, pluginBtnSel, pluginField, pluginFieldStay, pluginSelectRow, pluginSelectAll, modalOpen, modalCancel, modalSubmit, modalAction } from "./plugins.js";
 import { applyLive, applyCharts, renderRank, renderApps, renderGroup, renderTrend, renderHourly, renderWeekday, renderSettings, doImport, doExport, doVacuum, doBackup } from "./views.js";
 
 export function switchView(view) {
@@ -51,6 +51,7 @@ document.addEventListener("click", (e) => {
   switch (d.act) {
     case "open-plugin": openPlugin(d.name); break;
     case "close-plugin": closePlugin(); break;
+    case "toggle-plugin": togglePlugin(d.file, d.target); break;
     case "plugin-btn": pluginBtn(d.name, d.id); break;
     case "plugin-btn-sel": pluginBtnSel(d.name, d.id, d.group || ""); break;
     case "plugin-select-row": pluginSelectRow(el.closest("tr"), d.group || "", d.rid, d.onselect || ""); break;
@@ -95,6 +96,20 @@ document.querySelectorAll("#period-tabs .tab").forEach((b) => {
 document.querySelectorAll("#view-tabs .tab").forEach((b) => {
   b.addEventListener("click", () => switchView(b.dataset.view));
 });
+// Esc 隐藏主窗口到托盘（不退出程序，托盘图标仍可唤回）。
+// 注册在 plugins.js 的 Esc 监听之后：弹窗关闭时会 preventDefault，这里据此跳过。
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || e.defaultPrevented) return;
+  const el = e.target;
+  const tag = el && el.tagName ? el.tagName.toLowerCase() : "";
+  // 输入中按 Esc 视为取消输入（先失焦），不隐藏窗口，避免编辑设置时误触
+  if (tag === "input" || tag === "select" || tag === "textarea") {
+    if (el.blur) el.blur();
+    return;
+  }
+  invoke("hide_main").catch(() => {});
+});
+
 document.querySelectorAll("#trend-days .tab").forEach((b) => {
   b.addEventListener("click", () => {
     appState.trendDays = Number(b.dataset.days);

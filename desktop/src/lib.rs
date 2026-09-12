@@ -70,6 +70,7 @@ pub fn run() {
             commands::vacuum_db,
             commands::quit,
             commands::get_plugins,
+            commands::set_plugin_enabled,
             commands::plugins_watch,
             commands::dbg_log,
             commands::import_legacy,

@@ -45,6 +45,22 @@ struct PluginMeta {
     has_view: bool,
 }
 
+/// 目录中发现的插件（含已停用的），供插件管理页展示。
+pub struct DiscoveredPlugin {
+    /// 展示名（PLUGIN_NAME，读取失败时回退为文件名）
+    pub name: String,
+    pub desc: String,
+    pub version: String,
+    pub author: String,
+    /// 文件名（不含扩展名）：启用状态的持久化标识，插件改名不影响配置
+    pub file: String,
+    pub enabled: bool,
+    /// 当前是否已加载进内存
+    pub loaded: bool,
+    /// 加载错误信息（启用但加载失败时展示）
+    pub error: Option<String>,
+}
+
 /// 插件管理器（GUI 线程专用，不跨线程共享）。
 pub struct PluginManager {
     config: &'static FocusFlowConfig,
@@ -166,6 +182,129 @@ impl PluginManager {
     /// 插件目录。
     fn plugins_dir(&self) -> PathBuf {
         paths::plugins_dir()
+    }
+
+    /// 文件名（不含扩展名）：启用/停用配置的键。
+    /// 用文件名而非 PLUGIN_NAME——后者插件作者可随时改，改了配置就失配。
+    fn stem_of(path: &Path) -> String {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plugin")
+            .to_string()
+    }
+
+    /// 已停用的插件文件名列表（config.ini `[plugins] disabled`，逗号分隔）。
+    fn disabled_list(&self) -> Vec<String> {
+        self.config
+            .get_or("plugins", "disabled", "")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// 该插件文件是否被停用。
+    pub fn is_disabled(&self, stem: &str) -> bool {
+        self.disabled_list().iter().any(|s| s.as_str() == stem)
+    }
+
+    /// 启用/停用插件（按文件名）。返回操作后的启用状态。
+    ///
+    /// 停用会卸载已加载实例并调用其 cleanup；启用会立即加载。
+    /// 配置写入失败时原样返回 false，不改动内存状态。
+    pub fn set_enabled(&mut self, stem: &str, enabled: bool) -> bool {
+        let mut list = self.disabled_list();
+        if enabled {
+            list.retain(|s| s.as_str() != stem);
+        } else if !list.iter().any(|s| s.as_str() == stem) {
+            list.push(stem.to_string());
+        }
+        if let Err(e) = self.config.set("plugins", "disabled", &list.join(",")) {
+            tracing::error!("写入插件启用状态失败 ({stem}): {e}");
+            return false;
+        }
+        if enabled {
+            // 只有当前未加载时才加载，避免重复初始化
+            let already = self
+                .plugins
+                .values()
+                .any(|p| Self::stem_of(&p.file_path) == stem);
+            if !already {
+                if let Some(path) = self
+                    .discover()
+                    .into_iter()
+                    .find(|p| Self::stem_of(p) == stem)
+                {
+                    if let Err(e) = self.load_plugin(&path) {
+                        tracing::warn!("启用插件失败 ({stem}): {e}");
+                    }
+                }
+            }
+        } else {
+            // 先取出名字再卸载：避免在 if-let 条件里持有不可变借用、体内又要 &mut self
+            let name = self
+                .plugins
+                .values()
+                .find(|p| Self::stem_of(&p.file_path) == stem)
+                .map(|p| p.name.clone());
+            if let Some(n) = name {
+                self.unload_plugin(&n);
+            }
+        }
+        enabled
+    }
+
+    /// 列出目录中所有插件（含已停用的），停用的不执行其代码。
+    ///
+    /// 已加载的插件直接取内存中的信息，避免重复执行其顶层代码；
+    /// 未加载的（停用或加载失败）才读取元数据。
+    pub fn list_discovered(&self) -> Vec<DiscoveredPlugin> {
+        let disabled = self.disabled_list();
+        self.discover()
+            .into_iter()
+            .map(|path| {
+                let stem = Self::stem_of(&path);
+                let enabled = !disabled.iter().any(|s| s.as_str() == stem);
+                if let Some(info) = self
+                    .plugins
+                    .values()
+                    .find(|p| Self::stem_of(&p.file_path) == stem)
+                {
+                    return DiscoveredPlugin {
+                        name: info.name.clone(),
+                        desc: info.desc.clone(),
+                        version: info.version.clone(),
+                        author: info.author.clone(),
+                        file: stem,
+                        enabled,
+                        loaded: info.loaded,
+                        error: info.error.clone(),
+                    };
+                }
+                match self.read_meta(&path) {
+                    Ok(meta) => DiscoveredPlugin {
+                        name: meta.name,
+                        desc: meta.desc,
+                        version: meta.version,
+                        author: meta.author,
+                        file: stem,
+                        enabled,
+                        loaded: false,
+                        error: None,
+                    },
+                    Err(e) => DiscoveredPlugin {
+                        name: stem.clone(),
+                        desc: String::new(),
+                        version: String::new(),
+                        author: String::new(),
+                        file: stem,
+                        enabled,
+                        loaded: false,
+                        error: Some(e),
+                    },
+                }
+            })
+            .collect()
     }
 
     /// 扫描插件目录，返回 .lua 文件列表。
@@ -354,17 +493,24 @@ impl PluginManager {
         }
     }
 
-    /// 加载所有插件。
+    /// 加载所有未停用的插件（停用的跳过，其代码完全不执行）。
     pub fn load_all(&mut self) {
+        let disabled = self.disabled_list();
         for path in self.discover() {
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("plugin")
-                .to_string();
-            if !self.plugins.contains_key(&name) {
-                let _ = self.load_plugin(&path);
+            let stem = Self::stem_of(&path);
+            if disabled.iter().any(|s| s.as_str() == stem) {
+                continue;
             }
+            // 按文件名判重：插件展示名（PLUGIN_NAME）与文件名通常不同，
+            // 用名字判重会导致每次扫描都重复加载。
+            if self
+                .plugins
+                .values()
+                .any(|p| Self::stem_of(&p.file_path) == stem)
+            {
+                continue;
+            }
+            let _ = self.load_plugin(&path);
         }
     }
 

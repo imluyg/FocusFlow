@@ -175,6 +175,14 @@ pub struct PluginMeta {
     pub desc: String,
     pub version: String,
     pub author: String,
+    /// 文件名（不含扩展名）：启用开关的作用对象
+    pub file: String,
+    /// 是否启用（停用的插件不加载、不执行、不出现在已加载列表）
+    pub enabled: bool,
+    /// 当前是否已加载进内存
+    pub loaded: bool,
+    /// 加载错误（启用但失败时展示）
+    pub error: Option<String>,
 }
 
 /// 导入旧版 FocusFlow 数据（选择目录 → 后台导入）。
@@ -326,18 +334,39 @@ pub fn plugins_watch(watch: bool) {
     crate::plugins::set_watch(watch);
 }
 
-/// 列出插件（复用主线程共享的插件管理器）。
+/// 列出插件（含已停用的，供管理页显示开关）。
 #[tauri::command]
 pub fn get_plugins(state: State<'_, Arc<AppState>>) -> Vec<PluginMeta> {
     crate::plugins::with_manager(&state.db, |pm| {
-        pm.get_all_plugins()
-            .iter()
+        pm.list_discovered()
+            .into_iter()
             .map(|p| PluginMeta {
-                name: p.name.clone(),
-                desc: p.desc.clone(),
-                version: p.version.clone(),
-                author: p.author.clone(),
+                name: p.name,
+                desc: p.desc,
+                version: p.version,
+                author: p.author,
+                file: p.file,
+                enabled: p.enabled,
+                loaded: p.loaded,
+                error: p.error,
             })
             .collect()
     })
+}
+
+/// 启用/停用插件（按文件名）。
+///
+/// 停用：卸载已加载实例（调用 cleanup），之后不再加载、不再接收键事件；
+/// 启用：立即加载并持久化到 config.ini `[plugins] disabled`。
+#[tauri::command]
+pub fn set_plugin_enabled(
+    state: State<'_, Arc<AppState>>,
+    file: String,
+    enabled: bool,
+) -> Result<bool, String> {
+    let ok = crate::plugins::with_manager(&state.db, |pm| pm.set_enabled(&file, enabled));
+    if !ok {
+        return Err("写入插件启用状态失败".to_string());
+    }
+    Ok(enabled)
 }
