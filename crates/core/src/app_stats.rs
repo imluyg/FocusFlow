@@ -8,11 +8,10 @@
 //! 3. config.ini `[app_stats]` `exclude` 命中的进程完全不记录（隐私保险丝）。
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::FocusFlowConfig;
 use crate::db::queries;
-use crate::db::writer;
 use crate::db::DbWriter;
 
 /// 采集周期：每 2 秒给当前前台应用累计 2 秒。
@@ -48,15 +47,22 @@ pub fn start_sampler(writer: Arc<DbWriter>) {
             tracing::info!(
                 "前台应用采集已启动（每 {SAMPLE_INTERVAL_SECS} 秒采样，进程快照每 {SNAPSHOT_REFRESH_SECS} 秒刷新）"
             );
+            // 基准取自循环开始（sleep 之前），首个窗口长度自然 = 一个采样周期
+            let mut last_sample = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_secs(SAMPLE_INTERVAL_SECS));
+                // 用真实经过时间而非常量：sleep 有漂移，按实际窗口折算才不会系统性多计
+                let elapsed = last_sample.elapsed().as_secs() as i64;
+                last_sample = Instant::now();
                 let Some(name) = collect::foreground_app_name() else {
                     continue;
                 };
-                // 只累计"活跃窗口"内的前台时长（60 秒内有键鼠事件，与今日活跃时长同口径）：
-                // 挂机时人不在电脑前，前台应用照常累计会把使用时长虚高一大截。
+                // 只累计"活跃时长已覆盖"的秒数：活跃时长记到最后一个键鼠事件为止，
+                // 因此本采样窗口 [now-elapsed, now) 与 [.., last_event_ts] 取交集，
+                // 停手后的空档（挂机）不再白送时长，应用总时长恒 ≤ 今日活跃时长。
                 let now = queries::now_ts();
-                if now - writer.last_event_ts() > writer::ACTIVE_GAP_SECS {
+                let seconds = overlap_seconds(now, elapsed, writer.last_event_ts());
+                if seconds <= 0 {
                     continue;
                 }
                 let lower = name.to_ascii_lowercase();
@@ -64,10 +70,26 @@ pub fn start_sampler(writer: Arc<DbWriter>) {
                     continue;
                 }
                 let dk = queries::day_key_of_ts(now);
-                writer.add_app_seconds(dk, &name, SAMPLE_INTERVAL_SECS as i64);
+                writer.add_app_seconds(dk, &name, seconds);
             }
         })
         .expect("启动前台应用采集线程失败");
+}
+
+/// 本采样窗口 `[now - elapsed, now)` 与活跃时长已覆盖区间 `[.., last_event_ts]` 的交集秒数。
+///
+/// 活跃时长在最后一个键鼠事件处停止累计，所以超出 `last_event_ts` 的部分一律不计，
+/// 停手后的空档最多多算一个采样周期（≤ 采样粒度），不再白送 60 秒。
+fn overlap_seconds(now: i64, elapsed: i64, last_event_ts: i64) -> i64 {
+    if elapsed <= 0 || last_event_ts <= 0 {
+        return 0;
+    }
+    let start = now - elapsed;
+    // 窗口整体落在最后事件之后 → 已脱离活跃区间
+    if start >= last_event_ts {
+        return 0;
+    }
+    (now.min(last_event_ts) - start).clamp(0, elapsed)
 }
 
 /// 前台进程名采集（平台相关）。
@@ -159,5 +181,50 @@ mod collect {
     #[cfg(not(windows))]
     pub fn foreground_app_name() -> Option<String> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::overlap_seconds;
+
+    /// 采样窗口完全落在最后事件之前：整窗计入（活跃时长已覆盖）。
+    #[test]
+    fn overlap_full_window_when_still_active() {
+        // 窗口 [100, 102)，最后事件在 110（尚未到达，说明刚有键鼠活动）
+        assert_eq!(overlap_seconds(102, 2, 110), 2);
+    }
+
+    /// 最后事件落在窗口内：只计到事件时刻，尾巴不计。
+    #[test]
+    fn overlap_clips_to_last_event() {
+        // 窗口 [100, 102)，最后事件 101 → 交集 1 秒
+        assert_eq!(overlap_seconds(102, 2, 101), 1);
+    }
+
+    /// 窗口完全在最后事件之后（停手/挂机）：不计。
+    #[test]
+    fn overlap_zero_after_idle() {
+        assert_eq!(overlap_seconds(200, 2, 100), 0);
+        // 边界：窗口起点恰为最后事件时刻
+        assert_eq!(overlap_seconds(102, 2, 100), 0);
+    }
+
+    /// 无事件或非法窗口：不计。
+    #[test]
+    fn overlap_zero_without_events() {
+        assert_eq!(overlap_seconds(102, 2, 0), 0);
+        assert_eq!(overlap_seconds(102, 0, 200), 0);
+    }
+
+    /// 折算结果永不超过窗口长度（防止重复/溢出累计）。
+    #[test]
+    fn overlap_never_exceeds_window() {
+        for elapsed in 1..=5i64 {
+            for last in 0..=210i64 {
+                let s = overlap_seconds(200, elapsed, last);
+                assert!((0..=elapsed).contains(&s), "elapsed={elapsed} last={last} s={s}");
+            }
+        }
     }
 }
