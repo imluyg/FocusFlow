@@ -54,24 +54,42 @@ function skipIfUnchanged(box, fp) {
   return false;
 }
 
+// 周期文案：与应用排行/键鼠排行共用，让周期状态在内容区可见
+function periodText(p) {
+  if (p === -1) return "今日";
+  if (p === 0) return "全部历史";
+  return "近" + p + "天";
+}
+
 export function renderApps(s) {
   const box = $("view-apps");
-  const empty = '<div class="empty">暂无数据</div>';
+  const head = (extra) =>
+    `<div class="rank-summary"><span>统计周期：<b>${periodText(s.period)}</b></span>${extra}</div>`;
+  // 指纹含周期：切周期后即使数据内容恰巧相同也要重建（标签随周期变化）
+  const fp = JSON.stringify([s.period, s.app_total, s.apps]);
+  if (skipIfUnchanged(box, fp)) return;
   if (!s.apps || s.apps.length === 0) {
-    if (skipIfUnchanged(box, "empty")) return;
-    box.innerHTML = empty;
+    box.innerHTML = head("") + '<div class="empty">暂无数据</div>';
     return;
   }
-  const fp = JSON.stringify(s.apps);
-  if (skipIfUnchanged(box, fp)) return;
-  const total = s.apps.reduce((acc, [, sec]) => acc + sec, 0);
+  // 占比分母用后端返回的周期总时长（未截断）；旧版后端无该字段时回退为列表求和
+  const total = Number(s.app_total) || s.apps.reduce((acc, [, sec]) => acc + sec, 0);
+  const covered = s.apps.reduce((acc, [, sec]) => acc + sec, 0);
+  // Top N 未覆盖全部时长时给出覆盖度，避免把"占 Top100"误读成"占全部"
+  const cover = total && covered < total
+    ? `<span>Top${s.apps.length} 覆盖：<b>${((covered / total) * 100).toFixed(1)}%</b></span>`
+    : "";
+  const summary = head(
+    `<span>应用总时长：<b>${fmtDuration(total)}</b></span>` +
+      `<span>覆盖应用：<b>${fmt(s.apps.length)}</b> 个</span>${cover}`
+  );
   const rows = s.apps
     .map(
       ([app, sec], i) =>
         `<tr><td>${i + 1}</td><td class="key">${escapeHtml(app)}</td><td class="num">${fmtDuration(sec)}</td><td>${total ? ((sec / total) * 100).toFixed(2) : "0.00"}%</td></tr>`
     )
     .join("");
-  box.innerHTML = `<table class="grid"><thead><tr>
+  box.innerHTML = summary + `<table class="grid"><thead><tr>
     <th class="col-rank">排名</th><th class="col-key">应用</th><th class="col-count">使用时长</th><th class="col-percent">占比</th>
     </tr></thead><tbody>${rows}</tbody></table>`;
 }
@@ -83,15 +101,16 @@ function rankIsMouse(k) {
 
 export function renderRank(s) {
   const box = $("view-rank");
-  // 指纹含筛选状态：切筛选时仍会重建，纯数据推送则跳过
-  const fp = JSON.stringify([s.rank, s.mouse_total, s.keyboard_total, rankFilter.value]);
+  // 指纹含周期与筛选状态：切周期/切筛选时仍会重建，纯数据推送则跳过
+  const fp = JSON.stringify([s.period, s.rank, s.mouse_total, s.keyboard_total, rankFilter.value]);
   if (skipIfUnchanged(box, fp)) return;
-  const summary = (hasData) => hasData
-    ? `<div class="rank-summary">
-        <span>鼠标总次数：<b>${fmt(s.mouse_total)}</b></span>
-        <span>键盘总次数：<b>${fmt(s.keyboard_total)}</b></span>
-      </div>`
-    : "";
+  const summary = (hasData) =>
+    `<div class="rank-summary"><span>统计周期：<b>${periodText(s.period)}</b></span>${
+      hasData
+        ? `<span>鼠标总次数：<b>${fmt(s.mouse_total)}</b></span>
+        <span>键盘总次数：<b>${fmt(s.keyboard_total)}</b></span>`
+        : ""
+    }</div>`;
   const filterTabs = (data) => `<div class="tabs" id="rank-filter" role="tablist" aria-label="排行筛选" style="margin-bottom:10px;">
       <span style="color:var(--muted);font-size:13px;">筛选</span>
       <button class="tab ${rankFilter.value === "all" ? "active" : ""}" data-rf="all" role="tab" aria-selected="${rankFilter.value === "all"}">全部</button>

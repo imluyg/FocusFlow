@@ -24,6 +24,9 @@ pub struct ChartAgg {
     pub rank: Vec<(String, i64)>,
     /// 前台应用使用时长排行（秒数降序，随周期联动）
     pub apps: Vec<(String, i64)>,
+    /// 周期内前台应用时长总和（秒）：排行占比的分母。
+    /// 不能拿 apps 求和代替——apps 已截断到 RANK_LIMIT，长周期下会显著高估占比。
+    pub app_total: i64,
     pub group: Vec<(String, i64)>,
     /// 鼠标使用总次数（含点击与滚轮）
     pub mouse_total: i64,
@@ -1074,14 +1077,15 @@ fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartA
         0 => focusflow_core::db::get_stats(None, None),
         n => focusflow_core::db::get_stats(Some(n), None),
     };
-    // 前台应用使用时长排行（秒数），周期选择与按键统计联动
-    let mut apps: Vec<(String, i64)> = {
-        let (_, map) = match period_val {
+    // 前台应用使用时长排行（秒数），周期选择与按键统计联动。
+    // 保留查询返回的总秒数作为占比分母（未截断，与 apps 之和不是一回事）。
+    let (app_total, mut apps): (i64, Vec<(String, i64)>) = {
+        let (total, map) = match period_val {
             -1 => focusflow_core::db::get_app_stats_by_date(chrono::Local::now().date_naive()),
             0 => focusflow_core::db::get_app_stats(None, None),
             n => focusflow_core::db::get_app_stats(Some(n), None),
         };
-        map.into_iter().collect()
+        (total, map.into_iter().collect())
     };
     apps.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
     apps.truncate(RANK_LIMIT);
@@ -1170,6 +1174,7 @@ fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartA
         max_day_date,
         rank,
         apps,
+        app_total,
         group,
         mouse_total,
         keyboard_total,
