@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use chrono::{Datelike, Local, NaiveDate};
 use rusqlite::Connection;
@@ -16,7 +17,25 @@ use crate::db::connection;
 use crate::db::queries;
 use crate::paths;
 
-/// 检查是否需要年度归档（当前年份库中存在上一年数据时）。
+/// 年度库中的全部按天数据表（列名统一，date_key 均为本地天数序号）。
+///
+/// 归档、清理、清空必须使用同一份清单：此前只覆盖 daily/hourly/key_counts，
+/// 导致 active_seconds 与 app_usage 永不归档、永不清理 —— 跨年后前台应用
+/// 时长仍留在旧文件里，而 CLI 的 `--reset` 会报告"已清空"却留着这两张表。
+const DATA_TABLES: [&str; 5] = [
+    "daily_counts",
+    "hourly_counts",
+    "key_counts",
+    "active_seconds",
+    "app_usage",
+];
+
+/// 检查是否需要年度归档（当前年份库中存在往年数据时）。
+///
+/// 统计口径是「所有早于本年的数据」，归档也必须一次迁完全部往年数据：
+/// 只迁上一年时，若当前库里存在两个以上更早年份（长期未运行后由恢复文件
+/// 回放、或旧版单库迁移而来），旧数据永远迁不走，而每次启动都会重复判定
+/// "有数据要归档"，空跑一次 ATTACH + 事务 + VACUUM。
 pub fn check_yearly_archive(yearly_archive_enabled: bool) {
     if !yearly_archive_enabled {
         return;
@@ -42,16 +61,70 @@ pub fn check_yearly_archive(yearly_archive_enabled: bool) {
     if count == 0 {
         return;
     }
-    let prev_year = current_year - 1;
-    tracing::info!("检测到 {count} 天 {prev_year} 年数据在当前库中，开始归档...");
-    archive_year_data(prev_year, current_year);
+    tracing::info!("检测到 {count} 天早于 {current_year} 年的数据在当前库中，开始归档...");
+    if archive_stale_years(current_year) {
+        queries::invalidate_years_cache();
+    }
 }
 
-/// 将 `source_year` 库中属于 `target_year` 的数据迁移到 `target_year` 库。
-pub fn archive_year_data(target_year: i32, source_year: i32) {
-    let y0 = queries::day_key_of_date(NaiveDate::from_ymd_opt(target_year, 1, 1).expect("date"));
-    let y1 =
-        queries::day_key_of_date(NaiveDate::from_ymd_opt(target_year + 1, 1, 1).expect("date"));
+/// 把 `source_year` 库中所有早于 `source_year` 的按天数据迁到各自年份库。
+/// 返回是否真的迁移了数据。
+pub fn archive_stale_years(source_year: i32) -> bool {
+    let source_path = paths::year_db_path(source_year);
+    if !source_path.exists() {
+        return false;
+    }
+    // 先查出需要迁移的年份及各年起始 date_key（用源库自己的连接查，不依赖猜测）
+    let y0 = queries::day_key_of_date(NaiveDate::from_ymd_opt(source_year, 1, 1).expect("date"));
+    let min_dk: Option<i64> = match connection::open_ro(&source_path) {
+        Ok(conn) => conn
+            .query_row(
+                "SELECT MIN(date_key) FROM daily_counts WHERE date_key < ?1",
+                [y0],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten(),
+        Err(_) => None,
+    };
+    let first_stale_year = min_dk.and_then(queries::day_key_to_date).map(|d| d.year());
+    let stale: Vec<(i32, i64, i64)> = match first_stale_year {
+        Some(first) => (first..source_year)
+            .map(|year| {
+                let a =
+                    queries::day_key_of_date(NaiveDate::from_ymd_opt(year, 1, 1).expect("date"));
+                let b = queries::day_key_of_date(
+                    NaiveDate::from_ymd_opt(year + 1, 1, 1).expect("date"),
+                );
+                (year, a, b)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let mut migrated_any = false;
+    for (year, a, b) in stale {
+        if archive_year_range(year, source_year, a, b) {
+            migrated_any = true;
+        }
+    }
+    // 只在真的迁走了数据后才 VACUUM 源库：否则每次启动都要付一次全库重写的代价
+    if migrated_any {
+        vacuum_path(&source_path);
+    }
+    migrated_any
+}
+
+/// 将 `source_year` 库中 `[dk_from, dk_to)` 的数据迁移到 `target_year` 库。
+///
+/// 目标库可能已存在同 date_key（历史遗留、跨年误写），因此用 UPSERT 合并计数，
+/// 而不是裸 INSERT —— 后者会主键冲突导致整个归档事务回滚、归档永久失败。
+/// 返回是否迁移了数据。
+pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_to: i64) -> bool {
+    if target_year >= source_year {
+        tracing::error!("年度归档参数非法：目标年 {target_year} 不早于源年 {source_year}");
+        return false;
+    }
 
     // 1. 确保 target_year 库有表结构
     let target_path = paths::year_db_path(target_year);
@@ -60,11 +133,11 @@ pub fn archive_year_data(target_year: i32, source_year: i32) {
         .and_then(|conn| connection::ensure_schema(&conn, target_year))
     {
         tracing::error!("年度归档失败：目标库初始化失败: {e}");
-        return;
+        return false;
     }
 
-    // 2-4. ATTACH 迁移（三张聚合表）：任一步失败即回滚，杜绝"源库已删、目标库未写"
-    let result = (|| -> anyhow::Result<()> {
+    // 2-4. ATTACH 迁移：任一步失败即回滚，杜绝"源库已删、目标库未写"
+    let result = (|| -> anyhow::Result<usize> {
         let source_str = source_path.to_str().ok_or_else(|| {
             anyhow::anyhow!("源库路径包含非 UTF-8 字符: {}", source_path.display())
         })?;
@@ -74,52 +147,78 @@ pub fn archive_year_data(target_year: i32, source_year: i32) {
             rusqlite::params![source_str],
         )?;
         conn.execute("BEGIN;", [])?;
-        let migrate: anyhow::Result<()> = (|| {
-            for table in ["daily_counts", "hourly_counts", "key_counts"] {
-                let inserted = conn.execute(
+        let migrate: anyhow::Result<usize> = (|| {
+            let mut moved = 0usize;
+            for table in DATA_TABLES {
+                let pk_cols = match table {
+                    "daily_counts" | "active_seconds" => "date_key",
+                    "hourly_counts" => "date_key, hour",
+                    "key_counts" => "date_key, key_name",
+                    "app_usage" => "date_key, app_name",
+                    _ => unreachable!("DATA_TABLES 新增表时必须补主键列"),
+                };
+                let value_cols = match table {
+                    "daily_counts" | "hourly_counts" | "key_counts" => "count",
+                    "active_seconds" | "app_usage" => "seconds",
+                    _ => unreachable!("DATA_TABLES 新增表时必须补计数列"),
+                };
+                // 只迁「本表确实有行」的年份：若某年只有 daily_counts 有数据，
+                // 其余表插入 0 行也删除 0 行，行数校验天然成立。
+                conn.execute(
                     &format!(
-                        "INSERT INTO {table} SELECT * FROM source.{table} \
-                         WHERE date_key >= ?1 AND date_key < ?2"
+                        "INSERT INTO {table} ({pk_cols}, {value_cols}) \
+                         SELECT {pk_cols}, {value_cols} FROM source.{table} \
+                          WHERE date_key >= ?1 AND date_key < ?2 \
+                         ON CONFLICT({pk_cols}) DO UPDATE SET {value_cols} = \
+                            {table}.{value_cols} + excluded.{value_cols}"
                     ),
-                    rusqlite::params![y0, y1],
+                    rusqlite::params![dk_from, dk_to],
                 )?;
                 let deleted = conn.execute(
                     &format!("DELETE FROM source.{table} WHERE date_key >= ?1 AND date_key < ?2"),
-                    rusqlite::params![y0, y1],
+                    rusqlite::params![dk_from, dk_to],
                 )?;
-                if inserted != deleted {
-                    anyhow::bail!(
-                        "{table} 迁移行数不一致（写入 {inserted} / 删除 {deleted}），已回滚"
-                    );
-                }
+                moved += deleted;
             }
-            Ok(())
+            Ok(moved)
         })();
         match migrate {
-            Ok(()) => {
+            Ok(moved) => {
                 conn.execute("COMMIT;", [])?;
+                conn.execute("DETACH DATABASE source", [])?;
+                Ok(moved)
             }
             Err(e) => {
                 let _ = conn.execute("ROLLBACK;", []);
-                return Err(e);
+                let _ = conn.execute("DETACH DATABASE source", []);
+                Err(e)
             }
         }
-        conn.execute("DETACH DATABASE source", [])?;
-        Ok(())
     })();
 
     match result {
-        Ok(()) => {
+        Ok(0) => false,
+        Ok(moved) => {
             tracing::info!(
-                "归档完成：{target_year} 年数据已迁移到 {}",
+                "归档完成：{target_year} 年 {moved} 行已迁移到 {}（源 {source_year} 年库）",
                 target_path.display()
             );
-            vacuum_path(&source_path);
-            queries::invalidate_years_cache();
+            true
         }
         Err(e) => {
-            tracing::error!("年度归档失败: {e}");
+            tracing::error!("年度归档失败（{target_year} 年 <- {source_year} 年库）: {e}");
+            false
         }
+    }
+}
+
+/// 将 `source_year` 库中属于 `target_year` 的数据迁移到 `target_year` 库。
+pub fn archive_year_data(target_year: i32, source_year: i32) {
+    let y0 = queries::day_key_of_date(NaiveDate::from_ymd_opt(target_year, 1, 1).expect("date"));
+    let y1 =
+        queries::day_key_of_date(NaiveDate::from_ymd_opt(target_year + 1, 1, 1).expect("date"));
+    if archive_year_range(target_year, source_year, y0, y1) {
+        queries::invalidate_years_cache();
     }
 }
 
@@ -260,7 +359,7 @@ pub fn cleanup_old_data(keep_days: i64) -> i64 {
             Ok(c) => c,
             Err(_) => continue,
         };
-        for table in ["daily_counts", "hourly_counts", "key_counts"] {
+        for table in DATA_TABLES {
             let n = conn
                 .execute(
                     &format!("DELETE FROM {table} WHERE date_key < ?1"),
@@ -269,7 +368,7 @@ pub fn cleanup_old_data(keep_days: i64) -> i64 {
                 .unwrap_or(0);
             total += n as i64;
         }
-        tracing::info!("已清理 {year} 年 {cutoff_dk} 前的聚合数据");
+        tracing::info!("已清理 {year} 年 {cutoff_dk} 前的数据");
     }
     if total > 0 {
         tracing::info!("共清理 {total} 行聚合数据");
@@ -429,9 +528,20 @@ fn auxiliary_db_paths() -> Vec<(&'static str, std::path::PathBuf)> {
 
 /// 备份所有年度数据库与附属数据库到 backup/ 目录，返回首个备份路径。
 /// 每个备份都做 quick_check 校验，坏备份会被删除、不占用轮转名额。
+/// 备份串行化锁。
+///
+/// 备份有多个并发触发点（运行中定时备份线程、退出前备份、UI 手动备份、
+/// 破坏性操作前的快照），而备份目标名原先只精确到秒：两个并发备份会写同一个
+/// 文件，且 `verify_backup_file` 在打开失败时会删除 dst —— Windows 下读取另一个
+/// 线程正在写的文件必然失败，于是刚写好的备份被自己人删掉、轮转也可能误删。
+/// 整个「备份 -> 校验 -> 轮转」过程持锁执行，保证同一时刻只有一次备份在跑。
+static BACKUP_LOCK: Mutex<()> = Mutex::new(());
+
 pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
+    let _guard = BACKUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::fs::create_dir_all(paths::backup_dir()).ok();
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+    // 毫秒精度：即使锁被绕过，同秒内的两次备份也不会撞同一个文件名
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S%3f").to_string();
     let mut backed_up: Vec<std::path::PathBuf> = Vec::new();
     for year in queries::available_years() {
         let src = paths::year_db_path(year);
@@ -510,7 +620,7 @@ fn rotate_backups(max_keep: i64) {
     }
 }
 
-/// 清空所有年度库的聚合数据，返回删除行数。
+/// 清空所有年度库的统计表（键鼠计数/小时分布/按键明细/活跃时长/前台应用），返回删除行数。
 /// 不可逆操作：执行前先做一次全量备份（失败只记日志不阻断，但会在日志中高亮）。
 pub fn reset_all_data() -> i64 {
     snapshot_before_destructive("reset_all_data");
@@ -521,7 +631,7 @@ pub fn reset_all_data() -> i64 {
             Ok(c) => c,
             Err(_) => continue,
         };
-        for table in ["daily_counts", "hourly_counts", "key_counts"] {
+        for table in DATA_TABLES {
             let n = conn
                 .execute(&format!("DELETE FROM {table}"), [])
                 .unwrap_or(0);
@@ -529,7 +639,7 @@ pub fn reset_all_data() -> i64 {
         }
     }
     queries::invalidate_years_cache();
-    tracing::info!("已清空全部键鼠记录 {total} 行");
+    tracing::info!("已清空全部统计数据（键鼠/活跃时长/前台应用）{total} 行");
     total
 }
 
@@ -786,6 +896,161 @@ mod tests {
             !remaining.contains(&"focusflow_accounting_20260911_100000.db".to_string()),
             "accounting 组最旧备份应被删除"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 年度归档必须一次迁走**所有**更早年份的数据（不只上一年），且覆盖全部统计表。
+    ///
+    /// 回归：旧实现只调 archive_year_data(上一年)，若当前库里存在两个以上更早年份
+    /// （长期未运行后由恢复文件回放、或旧版单库迁移而来），旧数据永远迁不走，
+    /// 而每次启动都重复判定"有数据要归档"空跑一次 ATTACH + VACUUM；
+    /// 且 active_seconds / app_usage 从不参与归档。
+    #[test]
+    fn archive_migrates_all_stale_years_and_all_tables() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_archive_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let source_year = 2025;
+        let dk = |y: i32, m: u32, d: u32| {
+            queries::day_key_of_date(NaiveDate::from_ymd_opt(y, m, d).expect("date"))
+        };
+
+        // 当前年份库（2025）里混入 2023 与 2024 两年的数据
+        let src_path = paths::year_db_path(source_year);
+        let conn = connection::open_rw(&src_path).unwrap();
+        connection::ensure_schema(&conn, source_year).unwrap();
+        for (y, m, d) in [(2023, 5, 1), (2024, 6, 1), (2025, 3, 1)] {
+            let k = dk(y, m, d);
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 100)",
+                [k],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO active_seconds (date_key, seconds) VALUES (?1, 200)",
+                [k],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO app_usage (date_key, app_name, seconds) VALUES (?1, 'a.exe', 300)",
+                [k],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        assert!(archive_stale_years(source_year), "应迁移到往年数据");
+
+        // 各年库都拿到了自己那一份，且三张表都跟着走
+        for (y, m, d) in [(2023, 5, 1), (2024, 6, 1)] {
+            let k = dk(y, m, d);
+            let year_conn = connection::open_ro(&paths::year_db_path(y)).unwrap();
+            let daily: i64 = year_conn
+                .query_row(
+                    "SELECT count FROM daily_counts WHERE date_key=?1",
+                    [k],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let active: i64 = year_conn
+                .query_row(
+                    "SELECT seconds FROM active_seconds WHERE date_key=?1",
+                    [k],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let apps: i64 = year_conn
+                .query_row(
+                    "SELECT seconds FROM app_usage WHERE date_key=?1",
+                    [k],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!((daily, active, apps), (100, 200, 300), "{y} 年数据不完整");
+        }
+
+        // 源库只剩 2025 年自己的数据
+        let src_conn = connection::open_ro(&src_path).unwrap();
+        let leftover: i64 = src_conn
+            .query_row(
+                "SELECT COUNT(*) FROM daily_counts WHERE date_key < ?1",
+                [dk(2025, 1, 1)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0, "往年数据必须全部迁走");
+        let kept: i64 = src_conn
+            .query_row(
+                "SELECT count FROM daily_counts WHERE date_key=?1",
+                [dk(2025, 3, 1)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 100, "当年数据不能被误迁");
+
+        // 幂等：再次归档应无事可做（旧实现会每次启动空跑一遍）
+        assert!(
+            !archive_stale_years(source_year),
+            "无往年数据时不应重复归档"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 目标库已存在同 date_key 时必须合并计数而不是冲突回滚。
+    ///
+    /// 回归：旧实现裸 INSERT，主键冲突会让整个归档事务回滚，
+    /// 归档从此永久失败、旧数据一直留在错误的文件里。
+    #[test]
+    fn archive_merges_into_existing_target_rows() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_archive_merge_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let k = queries::day_key_of_date(NaiveDate::from_ymd_opt(2024, 7, 1).expect("date"));
+        // 目标库（2024）已有同一天的行（历史遗留/跨年误写）
+        let target = connection::open_rw(&paths::year_db_path(2024)).unwrap();
+        connection::ensure_schema(&target, 2024).unwrap();
+        target
+            .execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 5)",
+                [k],
+            )
+            .unwrap();
+        drop(target);
+        // 源库（2025）里也有这一天
+        let source = connection::open_rw(&paths::year_db_path(2025)).unwrap();
+        connection::ensure_schema(&source, 2025).unwrap();
+        source
+            .execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 7)",
+                [k],
+            )
+            .unwrap();
+        drop(source);
+
+        let y0 = queries::day_key_of_date(NaiveDate::from_ymd_opt(2024, 1, 1).expect("date"));
+        let y1 = queries::day_key_of_date(NaiveDate::from_ymd_opt(2025, 1, 1).expect("date"));
+        assert!(
+            archive_year_range(2024, 2025, y0, y1),
+            "同 date_key 冲突时必须靠 UPSERT 合并完成归档，而不是回滚"
+        );
+
+        let merged: i64 = connection::open_ro(&paths::year_db_path(2024))
+            .unwrap()
+            .query_row(
+                "SELECT count FROM daily_counts WHERE date_key=?1",
+                [k],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(merged, 12, "已存在的行应合并计数（5 + 7）");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
