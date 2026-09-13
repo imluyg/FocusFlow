@@ -137,8 +137,10 @@ export async function renderPluginDetail(force) {
     restoreSelClasses(box, prevSel);
     return;
   }
-  lastViewFingerprint = fingerprint;
   // 正在输入（焦点在框内输入控件）：跳过本次重建，失焦后下次刷新再更新。
+  // 注意：指纹必须在**真正重建之后**才写回。此前在这里就写入，导致被跳过的
+  // 这一次更新永久丢失（下次推送内容相同 → 指纹命中 → 一直走 skip 分支），
+  // 插件详情页会停留在旧数据上直到后端数据再次变化。
   // force=true（按钮动作/联动刷新）时强制重建，否则下拉联动会失效。
   if (!force) {
     const ae = document.activeElement;
@@ -147,6 +149,7 @@ export async function renderPluginDetail(force) {
     }
   }
   box.innerHTML = html;
+  lastViewFingerprint = fingerprint;
   restoreSelClasses(box, prevSel); // 重建后恢复选中状态（高亮 + 集合）
 }
 

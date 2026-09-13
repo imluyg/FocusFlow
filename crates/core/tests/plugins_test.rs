@@ -169,6 +169,100 @@ mod tests {
         assert!(manager.unload_plugin(&name));
     }
 
+    /// 回归：前端 sel 按钮的动作 id 是「按钮 id 直接拼接选中项」（无分隔符），
+    /// 例如 `m_edit_cat_sel` .. `食品饮料`。Lua 侧模式曾写成带尾部下划线的
+    /// `^m_edit_cat_sel_`，永远匹配不上 → 分类管理页 4 个按钮点了完全没反应。
+    #[test]
+    fn accounting_category_sel_buttons_are_wired() {
+        let _guard = guard();
+        let dir = std::env::current_dir().unwrap();
+        paths::set_app_dir(&dir);
+        db::queries::invalidate_years_cache();
+
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
+        ));
+        let database = db::Database::init_readonly();
+        let mut manager = PluginManager::new(config, database);
+
+        let files = manager.discover();
+        let file = files
+            .iter()
+            .find(|f| f.ends_with("accounting_plugin.lua"))
+            .expect("应发现 accounting_plugin.lua");
+        let name = manager.load_plugin(file).expect("加载记账本插件失败");
+
+        fn find_widget(widgets: &[Widget], pred: impl Fn(&Widget) -> bool + Copy) -> bool {
+            widgets.iter().any(|w| {
+                if pred(w) {
+                    return true;
+                }
+                if let Widget::Row { children } = w {
+                    return find_widget(children, pred);
+                }
+                false
+            })
+        }
+        fn current_widgets(manager: &PluginManager, name: &str) -> Vec<Widget> {
+            manager
+                .get_plugin(name)
+                .and_then(|p| p.view.as_ref())
+                .map(|v| v.widgets.clone())
+                .unwrap_or_default()
+        }
+        use focusflow_core::plugins::Widget;
+
+        // 进入分类管理页
+        manager
+            .plugin_action(&name, "open_manage")
+            .expect("打开分类管理应成功");
+        assert!(
+            !find_widget(&current_widgets(&manager, &name), |w| matches!(
+                w,
+                Widget::ModalForm { id, open, .. } if id == "m_edit_cat_modal" && *open
+            )),
+            "初始状态不应弹出修改分类弹窗"
+        );
+
+        // 前端实际发出的动作 id：按钮 id + 选中分类名（无分隔符）
+        manager
+            .plugin_action(&name, "m_edit_cat_sel食品饮料")
+            .expect("点击「修改分类」应成功");
+        assert!(
+            find_widget(&current_widgets(&manager, &name), |w| matches!(
+                w,
+                Widget::ModalForm { id, open, .. } if id == "m_edit_cat_modal" && *open
+            )),
+            "点击「修改分类」必须弹出编辑弹窗（回归：模式串曾带尾部下划线导致永不命中）"
+        );
+
+        // 取消后关闭
+        manager
+            .plugin_action(&name, "m_cancel_edit_cat")
+            .expect("取消编辑应成功");
+        assert!(
+            !find_widget(&current_widgets(&manager, &name), |w| matches!(
+                w,
+                Widget::ModalForm { id, open, .. } if id == "m_edit_cat_modal" && *open
+            )),
+            "取消后编辑弹窗应关闭"
+        );
+
+        // 修改子分类按钮同属一类契约（同一模式下划线问题）
+        manager
+            .plugin_action(&name, "m_edit_sub_sel餐饮")
+            .expect("点击「修改子分类」应成功");
+        assert!(
+            find_widget(&current_widgets(&manager, &name), |w| matches!(
+                w,
+                Widget::ModalForm { id, open, .. } if id == "m_edit_sub_modal" && *open
+            )),
+            "点击「修改子分类」必须弹出编辑弹窗"
+        );
+
+        assert!(manager.unload_plugin(&name));
+    }
+
     #[test]
     fn host_api_stats() {
         let _guard = guard();

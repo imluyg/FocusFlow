@@ -270,7 +270,10 @@ function on_action(id)
         local ok, msg = focusflow.accounting_category_add(m_name, m_type)
         result_text = (ok and ok > 0 and "分类 [" .. m_name .. "] 已添加") or ("添加分类失败：" .. tostring(msg or ""))
         if ok and ok > 0 then m_cat = m_name; m_name = "" end
-    elseif id:match("^m_edit_cat_sel_") then
+    -- 前端契约：sel 按钮的动作 id = 按钮 id 直接拼接选中项（无分隔符），
+    -- 例如 "m_edit_cat_sel" .. "食品饮料"。因此模式不能带尾部下划线，
+    -- 且 sub(N) 的起点就是按钮 id 长度的 +1。
+    elseif id:match("^m_edit_cat_sel") then
         -- 顶部"修改分类"（基于选中的分类行）
         local name = id:sub(15)
         if name == "" then return end
@@ -279,7 +282,7 @@ function on_action(id)
         local t = focusflow.accounting_category_type(name)
         if t ~= "" then m_type = t end
         m_edit_open = true
-    elseif id:match("^m_del_cat_sel_") then
+    elseif id:match("^m_del_cat_sel") then
         local name = id:sub(14)
         if name == "" then return end
         local ok, msg = focusflow.accounting_category_delete(name)
@@ -289,13 +292,13 @@ function on_action(id)
             local all = cats()
             if #all > 0 then m_cat = all[1] end
         end
-    elseif id:match("^m_edit_sub_sel_") then
+    elseif id:match("^m_edit_sub_sel") then
         local name = id:sub(15)
         if name == "" or m_cat == "" then return end
         m_sub_edit_old = name
         m_sub_name = name
         m_sub_edit_open = true
-    elseif id:match("^m_del_sub_sel_") then
+    elseif id:match("^m_del_sub_sel") then
         local name = id:sub(14)
         if name == "" or m_cat == "" then
             result_text = "请先在左侧分类列表点击选中一个分类"

@@ -420,26 +420,17 @@ pub fn register_host_api(
         })?;
     host.set("accounting_category_rename", acc_cat_rename)?;
 
-    // 修改分类类型：(ok, msg)
-    let acc_cat_type = lua.create_function(|_, (name, ctype): (String, String)| {
-        let ok = accounting::update_category_type(&name, &ctype);
-        Ok((
-            ok,
-            if ok {
-                "更新成功".to_string()
-            } else {
-                "更新失败".to_string()
-            },
-        ))
-    })?;
-    host.set("accounting_category_type", acc_cat_type)?;
-
     // 删除分类：(ok, msg)
     let acc_cat_del =
         lua.create_function(|_, name: String| Ok(accounting::delete_category(&name)))?;
     host.set("accounting_category_delete", acc_cat_del)?;
 
-    // 查询分类类型（expense/income/both），无则空串
+    // 查询分类类型（expense/income/both），无则空串。
+    //
+    // 注意：这里曾同时注册过一个「修改分类类型」的同名写接口，被本块覆盖成
+    // 不可达死代码 —— 而 Lua 插件按注释把它当读接口用（返回值是类型字符串，
+    // 解包成 `(ok, msg)` 会误判成功）。修改类型现由
+    // `accounting_category_rename(old, new, ctype)` 的第三个参数承担。
     let acc_cat_type = lua.create_function(|_, name: String| {
         Ok(accounting::category_type(&name).unwrap_or_default())
     })?;
