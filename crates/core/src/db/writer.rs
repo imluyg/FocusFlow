@@ -79,6 +79,48 @@ impl AggDeltas {
             last_ts: self.last_ts,
         }
     }
+
+    /// 按年份库切分增量。
+    ///
+    /// 年度库是 `focusflow_<年>.db`，而增量里的 date_key 来自事件发生时刻。
+    /// 跨年时（23:59 的事件在 00:00 后才 flush）如果统一写进「当前年份」的库，
+    /// 旧年份的数据会落进新年度文件：按日期查询会漏读，
+    /// 而年度归档会因目标库已存在同 date_key 主键冲突而整体回滚，导致归档永久失败。
+    fn split_by_year(&self, year_of: impl Fn(i64) -> i32) -> HashMap<i32, AggDeltas> {
+        let mut parts: HashMap<i32, AggDeltas> = HashMap::new();
+        for (dk, n) in &self.daily {
+            parts.entry(year_of(*dk)).or_default().daily.insert(*dk, *n);
+        }
+        for ((dk, h), n) in &self.hourly {
+            parts
+                .entry(year_of(*dk))
+                .or_default()
+                .hourly
+                .insert((*dk, *h), *n);
+        }
+        for (dk, key_map) in &self.keys {
+            parts
+                .entry(year_of(*dk))
+                .or_default()
+                .keys
+                .insert(*dk, key_map.clone());
+        }
+        for (dk, n) in &self.active {
+            parts
+                .entry(year_of(*dk))
+                .or_default()
+                .active
+                .insert(*dk, *n);
+        }
+        for ((dk, app), n) in &self.apps {
+            parts
+                .entry(year_of(*dk))
+                .or_default()
+                .apps
+                .insert((*dk, app.clone()), *n);
+        }
+        parts
+    }
 }
 
 struct WriterState {
@@ -507,24 +549,30 @@ fn writer_loop(state: Arc<WriterState>, sig_rx: mpsc::Receiver<Signal>, flush_in
     }
 }
 
-/// 确保连接指向当前年份库（跨年时重建）。
-fn ensure_connection(conn: &mut Option<Connection>, conn_year: &mut i32) {
-    let now_year = paths::current_year();
-    if *conn_year == now_year && conn.is_some() {
+/// 确保连接指向 `year` 年份库（换年时重建）。
+fn ensure_connection(conn: &mut Option<Connection>, conn_year: &mut i32, year: i32) {
+    if *conn_year == year && conn.is_some() {
         return;
     }
-    // 跨年或首次：重建连接
+    // 换年或首次：重建连接
     *conn = None;
-    let path = paths::year_db_path(now_year);
+    let path = paths::year_db_path(year);
     if let Ok(new_conn) = connection::open_rw(&path) {
-        if connection::ensure_schema(&new_conn, now_year).is_ok() {
+        if connection::ensure_schema(&new_conn, year).is_ok() {
             *conn = Some(new_conn);
-            *conn_year = now_year;
+            *conn_year = year;
         }
     }
 }
 
-/// 把内存增量落库（单事务 UPSERT，失败重试，最终失败回填内存避免丢数据）。
+/// date_key（本地天数序号）落在哪一年。
+fn year_of_day_key(dk: i64) -> i32 {
+    queries::day_key_to_date(dk)
+        .map(|d| d.year())
+        .unwrap_or_else(paths::current_year)
+}
+
+/// 把内存增量落库（按年份库分批、每批单事务 UPSERT，失败重试，最终失败回填内存避免丢数据）。
 fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &WriterState) {
     let pending = {
         let mut agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
@@ -534,11 +582,61 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
         agg.take_for_flush()
     };
 
+    // 增量按年份库切分后分别写入：跨年那一刻的按键必须落进它所属年份的库，
+    // 否则归档会主键冲突、按日期查询会漏读（见 AggDeltas::split_by_year）。
+    let mut parts = pending.split_by_year(year_of_day_key);
+    // 只回填写失败的那一份，其他年份已成功落库的不重写
+    let mut failed: Vec<AggDeltas> = Vec::new();
+    for (year, part) in parts.drain() {
+        match flush_partition(conn, conn_year, year, &part) {
+            Ok(()) => {
+                state.flush_seq.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::error!("聚合落库最终失败（{year} 年）: {e}");
+                failed.push(part);
+            }
+        }
+    }
+    if failed.is_empty() {
+        return;
+    }
+    // 回填内存，避免数据丢失（下次周期 flush 再试）
+    let mut agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
+    for part in failed {
+        for (dk, n) in part.daily {
+            *agg.daily.entry(dk).or_insert(0) += n;
+        }
+        for ((dk, h), n) in part.hourly {
+            *agg.hourly.entry((dk, h)).or_insert(0) += n;
+        }
+        for (dk, key_map) in part.keys {
+            let day_map = agg.keys.entry(dk).or_default();
+            for (key, n) in key_map {
+                *day_map.entry(key).or_insert(0) += n;
+            }
+        }
+        for (dk, n) in part.active {
+            *agg.active.entry(dk).or_insert(0) += n;
+        }
+        for ((dk, app), n) in part.apps {
+            *agg.apps.entry((dk, app)).or_insert(0) += n;
+        }
+    }
+}
+
+/// 单个年份库的落库：单事务 UPSERT + 最多 3 次重试。失败时返回错误（调用方回填）。
+fn flush_partition(
+    conn: &mut Option<Connection>,
+    conn_year: &mut i32,
+    year: i32,
+    pending: &AggDeltas,
+) -> anyhow::Result<()> {
     let max_retries = 3;
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 0..max_retries {
-        ensure_connection(conn, conn_year);
+        ensure_connection(conn, conn_year, year);
 
         let result = (|| -> anyhow::Result<()> {
             let c = conn.as_mut().ok_or_else(|| anyhow::anyhow!("无可用连接"))?;
@@ -607,14 +705,13 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
 
         match result {
             Ok(()) => {
-                state.flush_seq.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
-                    "聚合落库成功: daily={} hourly={} keys={}",
+                    "聚合落库成功（{year} 年）: daily={} hourly={} keys={}",
                     pending.daily.len(),
                     pending.hourly.len(),
                     pending.keys.len()
                 );
-                return;
+                return Ok(());
             }
             Err(e) => {
                 last_err = Some(e);
@@ -622,7 +719,7 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
                 *conn = None;
                 if attempt < max_retries - 1 {
                     tracing::warn!(
-                        "聚合落库失败 (第{}次), 重试: {}",
+                        "聚合落库失败（{year} 年，第{}次）, 重试: {}",
                         attempt + 1,
                         last_err.as_ref().unwrap()
                     );
@@ -632,37 +729,57 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
         }
     }
 
-    tracing::error!(
-        "聚合落库最终失败 (已重试{}次): {}",
-        max_retries,
-        last_err.as_ref().map(|e| e.to_string()).unwrap_or_default()
-    );
-    // 回填内存，避免数据丢失（下次周期 flush 再试）
-    let mut agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
-    for (dk, n) in pending.daily {
-        *agg.daily.entry(dk).or_insert(0) += n;
-    }
-    for ((dk, h), n) in pending.hourly {
-        *agg.hourly.entry((dk, h)).or_insert(0) += n;
-    }
-    for (dk, key_map) in pending.keys {
-        let day_map = agg.keys.entry(dk).or_default();
-        for (key, n) in key_map {
-            *day_map.entry(key).or_insert(0) += n;
-        }
-    }
-    for (dk, n) in pending.active {
-        *agg.active.entry(dk).or_insert(0) += n;
-    }
-    for ((dk, app), n) in pending.apps {
-        *agg.apps.entry((dk, app)).or_insert(0) += n;
-    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("未知错误")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    /// 跨年落库：增量必须写进 date_key 所属年份的库文件。
+    ///
+    /// 回归：此前统一写「当前年份」的库，跨年夜 23:59 的按键会落进新年度的文件。
+    /// 后果是按日期查询漏读、而年度归档因目标库已有同 date_key 主键冲突整体回滚。
+    #[test]
+    fn flush_writes_each_year_to_its_own_db() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_writer_crossyear_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let w = DbWriter::start(Duration::from_secs(3600));
+
+        let now = chrono::Local::now();
+        let last_year = now.year() - 1;
+        let last_year_date = chrono::NaiveDate::from_ymd_opt(last_year, 12, 31).unwrap();
+        let dk_last = queries::day_key_of_date(last_year_date);
+        let dk_today = queries::day_key_of_date(now.date_naive());
+
+        // 同一批增量里混入上一年的数据（跨年那一刻真实会出现的形态）
+        {
+            let mut agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+            agg.daily.insert(dk_last, 7);
+            agg.daily.insert(dk_today, 3);
+        }
+        w.flush(true);
+
+        assert_eq!(
+            crate::db::queries::get_stats_by_date(last_year_date).0,
+            7,
+            "上一年的增量必须落在上一年份库里"
+        );
+        assert_eq!(
+            crate::db::queries::get_stats_by_date(now.date_naive()).0,
+            3,
+            "今日增量必须落在当前年份库里"
+        );
+
+        w.stop();
+        crate::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// 跨天边界：today_key 落后于当前日期时，record 应重置今日计数
     /// （统计线程运行中跨 0 点，避免次日显示昨日累计值）。

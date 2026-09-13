@@ -8,6 +8,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
+    use chrono::Datelike;
+
     use focusflow_core::config::FocusFlowConfig;
     use focusflow_core::db;
     use focusflow_core::paths;
@@ -44,15 +46,23 @@ mod tests {
         }
     }
 
+    /// 写入用的基准时间：今天本地 00:00 起算的若干秒。
+    ///
+    /// 不用 `Utc::now().timestamp()`：跨年那一瞬间 `now - 100` 会落到上一年，
+    /// 而写线程现在按 date_key 的年份落库（这是正确行为，见 writer 的跨年测试），
+    /// 那样本测试就变成看运行时刻的偶然结果。
+    fn today_base_ts(offset_secs: i64) -> i64 {
+        focusflow_core::db::queries::today_start_ts() + offset_secs
+    }
+
     #[test]
     fn write_then_query_roundtrip() {
         let env = TestEnv::new("roundtrip");
         let config = env.config();
         let db = db::Database::init(&config).expect("初始化数据库失败");
 
-        let now = chrono::Utc::now().timestamp();
         for i in 0..100 {
-            db.record_key(&format!("键{}", i % 5), now - (100 - i));
+            db.record_key(&format!("键{}", i % 5), today_base_ts(i));
         }
         db.flush(true);
 
@@ -72,8 +82,7 @@ mod tests {
         let config = env.config();
         let db = db::Database::init(&config).expect("初始化数据库失败");
 
-        let now = chrono::Utc::now().timestamp();
-        db.record_key("A", now);
+        db.record_key("A", today_base_ts(10));
         db.flush(true);
         db.flush(true); // 二次 flush 应无副作用
 
@@ -91,9 +100,8 @@ mod tests {
         let writer = db.writer().expect("写入器未启动").clone();
 
         // 高压写入：验证不 panic、写线程持续工作、事件部分落库
-        let now = chrono::Utc::now().timestamp();
         for i in 0..8000 {
-            writer.record(&format!("X{}", i % 50), now - (8000 - i));
+            writer.record(&format!("X{}", i % 50), today_base_ts(i));
         }
         writer.flush(true);
 
@@ -111,12 +119,32 @@ mod tests {
         let config = env.config();
         let db = db::Database::init(&config).expect("初始化数据库失败");
 
-        // 今天 + 昨天各写几条
-        let today = focusflow_core::db::queries::today_start_ts();
-        let yesterday = today - 86_400;
+        // 今天 + 昨天各写几条。
+        // 用 Date 逐日回退再取正午，而不是 `today_start_ts() - 86400`：
+        // 那样在 1 月 1 日会把"昨天"落到上一年，而写线程现在按 date_key 的年份
+        // 落库（正确行为），断言就会随运行日期漂移。
+        let today_date = chrono::Local::now().date_naive();
+        let yesterday_date = today_date - chrono::Days::new(1);
+        // 极端情况（1 月 1 日）：昨天的日期落在上一年，换用同年的最后两天，
+        // 保证"两天数据都在同一年份库"这一测试前提成立。
+        let (d1, d2) = if yesterday_date.year() == today_date.year() {
+            (yesterday_date, today_date)
+        } else {
+            let dec31 = chrono::NaiveDate::from_ymd_opt(today_date.year() - 1, 12, 31).unwrap();
+            let dec30 = dec31 - chrono::Days::new(1);
+            (dec30, dec31)
+        };
+        let noon = |d: chrono::NaiveDate| {
+            d.and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_local_timezone(chrono::Local)
+                .single()
+                .unwrap()
+                .timestamp()
+        };
         for i in 0..10 {
-            db.record_key("A", today + i);
-            db.record_key("B", yesterday + i);
+            db.record_key("A", noon(d2) + i);
+            db.record_key("B", noon(d1) + i);
         }
         db.flush(true);
 
@@ -125,8 +153,8 @@ mod tests {
         assert_eq!(daily.len(), 7, "应返回 7 天");
         // 回归：daily 计数必须真实反映数据（曾因"天序号被当作秒"导致全为 0）
         // 返回的是"近 7 天"升序列表：[5天前, 4天前, ..., 昨天, 今天]
-        assert_eq!(daily[5].1, 10, "昨天应为 10 条, got {:?}", daily[5]);
-        assert_eq!(daily[6].1, 10, "今天应为 10 条, got {:?}", daily[6]);
+        assert_eq!(daily[5].1, 10, "前一天应为 10 条, got {:?}", daily[5]);
+        assert_eq!(daily[6].1, 10, "后一天应为 10 条, got {:?}", daily[6]);
 
         let hour = focusflow_core::db::queries::get_hourly_stats(None);
         assert_eq!(hour.len(), 24);
