@@ -1,7 +1,8 @@
 //! 日志模块。
 //!
 //! 镜像 Python 版 `logger.py`：
-//! - 文件日志写入 `logs/focusflow.log`，按大小轮转（5MB × 3 备份）
+//! - 文件日志写入 `logs/focusflow.log`，**按天轮转、最多保留 4 个文件**
+//!   （不是按大小轮转，避免单文件无限增长）
 //! - 控制台输出 ERROR 及以上（Windows 下通常无控制台，仅开发时可见）
 //! - 全局 panic hook 记录未捕获错误
 
