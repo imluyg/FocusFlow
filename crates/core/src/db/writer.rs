@@ -33,9 +33,11 @@ enum Signal {
     Stop,
 }
 
-/// 连续活跃判定：与上一事件间隔 ≤ 该秒数视为连续活跃（累计活跃时长）。
 /// 连续活跃判定窗口（秒）：事件间隔 ≤ 该值视为同一段连续活跃。
-/// 前台应用时长累计（app_stats）复用同一口径。
+///
+/// 活跃时长（active）与前台应用时长（apps）**共用这一个门限**：
+/// 两者都在 `record` 里按同一份事件间隔累加，因此天然可比，
+/// 不会出现「同一个下午，一张卡说 3 小时、另一张卡说 1 小时」的口径分裂。
 pub(crate) const ACTIVE_GAP_SECS: i64 = 60;
 
 /// 内存中的聚合增量（未落库部分）。
@@ -56,6 +58,10 @@ struct AggDeltas {
     apps: HashMap<(i64, String), i64>,
     /// 上一个事件的时间戳（连续活跃判定用；flush 取走增量时保留）
     last_ts: i64,
+    /// 当前前台应用名（归属用；flush 取走增量时保留）。
+    /// 采集线程写入，`record` 热路径读取 —— 事件发生时把「距上一事件的间隔」
+    /// 记到当时的前台应用头上。None = 无可归属应用（启动初期 / exclude 命中 / 采集失败）。
+    current_app: Option<String>,
 }
 
 impl AggDeltas {
@@ -67,8 +73,9 @@ impl AggDeltas {
             && self.apps.is_empty()
     }
 
-    /// 取走待落库增量。`last_ts` 保留在内存聚合中，
-    /// 否则每次 flush 都会打断连续活跃判定（每 10 秒白丢一段时长）。
+    /// 取走待落库增量。`last_ts` / `current_app` 保留在内存聚合中：
+    /// 前者否则每次 flush 都会打断连续活跃判定（每 10 秒白丢一段时长），
+    /// 后者是会话态（当前前台应用），不属于待落库数据。
     fn take_for_flush(&mut self) -> AggDeltas {
         AggDeltas {
             daily: std::mem::take(&mut self.daily),
@@ -77,6 +84,7 @@ impl AggDeltas {
             active: std::mem::take(&mut self.active),
             apps: std::mem::take(&mut self.apps),
             last_ts: self.last_ts,
+            current_app: None,
         }
     }
 
@@ -275,6 +283,15 @@ impl DbWriter {
             state
                 .today_active
                 .fetch_add(contrib as u64, Ordering::Relaxed);
+            // 同一段秒数同时归给「事件发生时所在的前台应用」：
+            // 与 active 同源、同门限（ACTIVE_GAP_SECS），所以应用总时长恒 ≤ 今日活跃时长，
+            // 差额只剩「当时没有已知前台应用」的时段（启动初期 / exclude 命中）。
+            // 归给「本次事件时」的应用是安全的：切窗动作（Alt+Tab、点任务栏）本身
+            // 也是一次键鼠事件，会把上一段静默期封口在前一个应用上，
+            // 不会出现「在 A 看了半小时却记到 B 头上」。
+            if let Some(app) = agg.current_app.clone() {
+                *agg.apps.entry((day_key, app)).or_insert(0) += contrib;
+            }
         }
     }
 
@@ -288,12 +305,20 @@ impl DbWriter {
         self.state.today_active.load(Ordering::Relaxed)
     }
 
-    /// 采集线程调用：累计前台应用使用秒数（进写线程内存聚合，随周期 flush 落库）。
-    pub(crate) fn add_app_seconds(&self, date_key: i64, app_name: &str, seconds: i64) {
+    /// 采集线程调用：更新「当前前台应用」（None = 无可归属应用）。
+    ///
+    /// 这里**不累计秒数** —— 秒数由 `record` 在键鼠事件发生时按事件间隔写入，
+    /// 与应用活跃时长共用同一个门限，因此两个指标天然可比。
+    pub(crate) fn set_current_app(&self, name: Option<&str>) {
         let mut agg = self.state.agg.lock().unwrap_or_else(|e| e.into_inner());
-        *agg.apps
-            .entry((date_key, app_name.to_string()))
-            .or_insert(0) += seconds;
+        match name {
+            // 名字没变就不重建 String：每秒采样一次，避免无谓分配
+            Some(n) if agg.current_app.as_deref() != Some(n) => {
+                agg.current_app = Some(n.to_string());
+            }
+            Some(_) => {}
+            None => agg.current_app = None,
+        }
     }
 
     /// 是否有未落库的增量（重聚合前判断是否需要先 flush）。
@@ -304,16 +329,6 @@ impl DbWriter {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty()
-    }
-
-    /// 最近一次键鼠事件的 Unix 时间戳（无事件为 0，flush 取走增量时保留）。
-    /// 前台应用时长累计据此判定"活跃窗口"：挂机（超窗口无事件）时不累计。
-    pub fn last_event_ts(&self) -> i64 {
-        self.state
-            .agg
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .last_ts
     }
 
     /// 重置今日计数缓存（外部清除数据后调用）。
@@ -428,6 +443,8 @@ impl From<AggDeltasFile> for AggDeltas {
             active: f.active.into_iter().collect(),
             apps: f.apps.into_iter().collect(),
             last_ts: f.last_ts,
+            // 会话态不透传恢复文件：回放后由采集线程重新填充
+            current_app: None,
         }
     }
 }
@@ -848,22 +865,77 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// last_event_ts：record 后更新，flush 取走增量后保留（前台应用时长
-    /// 的活跃窗口判定依赖该值在两次事件之间保持有效）。
+    /// 应用时长归属：间隔秒数在**事件发生时**归给当时的前台应用，
+    /// 与活跃时长共用门限（≥/≤ 一致），无归属时只记活跃、不记应用。
     #[test]
-    fn last_event_ts_persists_across_flush() {
+    fn record_credits_gap_to_current_app() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_writer_lastts_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ff_writer_credits_{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).ok();
         crate::paths::set_app_dir(&dir);
         let w = DbWriter::start(Duration::from_secs(3600));
-        assert_eq!(w.last_event_ts(), 0, "无事件时应为 0（永远不处于活跃窗口）");
-        let ts = queries::now_ts();
-        w.record("A", ts);
-        assert_eq!(w.last_event_ts(), ts);
+        let t0 = queries::now_ts();
+        let dk = queries::day_key_of_ts(t0);
+
+        w.record("A", t0); // 首事件：无间隔可归
+        w.set_current_app(Some("Obsidian.exe"));
+        w.record("A", t0 + 10); // 间隔 10s → Obsidian
+        w.set_current_app(Some("WorkBuddy.exe"));
+        w.record("A", t0 + 30); // 间隔 20s → WorkBuddy
+        w.record("A", t0 + 200); // 间隔 170s > 60s：既不活跃也不归属
+        w.set_current_app(None);
+        w.record("A", t0 + 205); // 间隔 5s：只有活跃，无应用归属
+
+        let agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(agg.active.get(&dk), Some(&35), "活跃 = 10 + 20 + 5");
+        assert_eq!(agg.apps.get(&(dk, "Obsidian.exe".to_string())), Some(&10));
+        assert_eq!(agg.apps.get(&(dk, "WorkBuddy.exe".to_string())), Some(&20));
+        assert_eq!(agg.apps.len(), 2, "无归属的 5 秒不应落到任何应用上");
+        drop(agg);
+        w.stop();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// current_app 是会话态：flush 取走增量后必须保留，
+    /// 否则每次落库（10 秒一次）后的第一个间隔都会丢掉归属。
+    #[test]
+    fn current_app_persists_across_flush() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_writer_curapp_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+        let w = DbWriter::start(Duration::from_secs(3600));
+        let t0 = queries::now_ts();
+        let dk = queries::day_key_of_ts(t0);
+
+        w.set_current_app(Some("Obsidian.exe"));
+        w.record("A", t0);
+        w.record("A", t0 + 5);
+        {
+            let agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(agg.apps.get(&(dk, "Obsidian.exe".to_string())), Some(&5));
+        }
         w.flush(true);
-        assert_eq!(w.last_event_ts(), ts, "flush 取走增量后 last_ts 应保留");
+        {
+            let agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(agg.apps.is_empty(), "flush 应取走应用增量");
+            assert_eq!(
+                agg.current_app.as_deref(),
+                Some("Obsidian.exe"),
+                "当前前台应用应跨 flush 保留"
+            );
+        }
+        w.record("A", t0 + 10);
+        {
+            let agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                agg.apps.get(&(dk, "Obsidian.exe".to_string())),
+                Some(&5),
+                "flush 后的事件仍应归属到同一应用"
+            );
+        }
         w.stop();
         std::fs::remove_dir_all(&dir).ok();
     }

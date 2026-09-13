@@ -105,11 +105,6 @@ pub(crate) fn day_key_of_ts(ts: i64) -> i64 {
     (ts + local_utc_offset_seconds()).div_euclid(86_400)
 }
 
-/// Unix 毫秒 → 本地时区天数序号（前台应用采集的采样时刻为毫秒）。
-pub(crate) fn day_key_of_ts_ms(ts_ms: i64) -> i64 {
-    (ts_ms.div_euclid(1000) + local_utc_offset_seconds()).div_euclid(86_400)
-}
-
 /// 本地日期 → 天数序号。
 pub(crate) fn day_key_of_date(date: chrono::NaiveDate) -> i64 {
     day_key_of_ts(local_day_start_ts(date))
@@ -601,11 +596,6 @@ pub fn today_start_ts() -> i64 {
 /// 当前 Unix 秒。
 pub fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
-}
-
-/// 当前 Unix 毫秒。
-pub fn now_ts_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
 }
 
 /// 本地日期转当日起始 Unix 秒（本地时区）。

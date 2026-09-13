@@ -1,23 +1,37 @@
-//! 前台应用使用时长统计（反作弊安全设计）。
+//! 前台应用识别（反作弊安全设计）。
 //!
 //! 三条硬约束（docs/optimization-plan.md 批次六）：
 //! 1. 绝不对其他进程调用 OpenProcess / ReadProcessMemory / WriteProcessMemory：
 //!    PID→进程名解析只用 `CreateToolhelp32Snapshot` 全量快照（任务管理器同款 API），
-//!    每 30 秒重建一次并缓存，采集时不打开任何游戏进程句柄；
+//!    定时重建并缓存，采集时不打开任何游戏进程句柄；
 //! 2. 只记进程名，不读窗口标题（反作弊会枚举窗口标题，我们不沾；也是隐私保护）；
 //! 3. config.ini `[app_stats]` `exclude` 命中的进程完全不记录（隐私保险丝）。
+//!
+//! 职责边界：本线程**只回答「此刻前台是哪个进程」**，把结果写进写线程的 `current_app`。
+//! 「用了多久」不在这里算 —— 时长由 `record` 在键鼠事件发生时按下一条
+//! （`apps.entry(...) += 距上一事件的间隔`），与应用活跃时长共用 ACTIVE_GAP_SECS 门限。
+//!
+//! 为什么不再用「采样窗口累计」：那样必须先判断窗口是否落在活跃区间内，
+//! 而活跃区间的上界是「最后一个键鼠事件」——于是只有覆盖到该事件的采样窗口才计秒，
+//! 间隔 2~60 秒的静默期（看屏幕、思考）会被整段丢掉，应用总时长只剩活跃时长的四成。
+//! 归属改到事件侧后，两者同源同门限：应用总时长恒 ≤ 今日活跃时长，
+//! 差额只剩「当时没有已知前台应用」的时段（启动初期 / exclude 命中 / 采集瞬时失败）。
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::config::FocusFlowConfig;
-use crate::db::queries;
 use crate::db::DbWriter;
 
-/// 采集周期：每 2 秒给当前前台应用累计 2 秒。
-const SAMPLE_INTERVAL_SECS: u64 = 2;
+/// 前台窗口采样周期（秒）。
+///
+/// 采样只做「取前台窗口 + PID 查快照」，成本极低，故取较密的 1 秒：
+/// 切换应用后最多 1 秒就被感知，缩短「切过去就打字」时的归属错位窗口。
+const SAMPLE_INTERVAL_SECS: u64 = 1;
 /// 进程名快照刷新周期（秒）。
 const SNAPSHOT_REFRESH_SECS: u64 = 30;
+/// 快照「未命中后立即重建」的最小间隔（秒），防止异常 PID 造成高频重建。
+const SNAPSHOT_FORCE_MIN_SECS: u64 = 1;
 
 /// 读取 [app_stats] 配置：enabled（默认 true）+ exclude（逗号分隔的进程名清单）。
 fn load_config(config: &FocusFlowConfig) -> (bool, Vec<String>) {
@@ -30,10 +44,12 @@ fn load_config(config: &FocusFlowConfig) -> (bool, Vec<String>) {
     (config.get_bool("app_stats", "enabled", true), exclude)
 }
 
-/// 启动前台应用采集线程（非 Windows 平台为空实现）。
-///
-/// 独立线程每 2 秒采样一次前台窗口，把秒数累计进写线程内存聚合，
-/// 随写线程周期 flush 落库到 app_usage 表。
+/// 该前台应用是否可归属：exclude 命中的进程完全不记录（隐私保险丝）。
+fn is_recordable(name: &str, exclude: &[String]) -> bool {
+    !exclude.contains(&name.to_ascii_lowercase())
+}
+
+/// 启动前台应用识别线程（非 Windows 平台恒返回 None，等同于不归属）。
 pub fn start_sampler(writer: Arc<DbWriter>) {
     let config = crate::config::instance();
     let (enabled, exclude) = load_config(config);
@@ -45,63 +61,27 @@ pub fn start_sampler(writer: Arc<DbWriter>) {
         .name("app-usage-sampler".into())
         .spawn(move || {
             tracing::info!(
-                "前台应用采集已启动（每 {SAMPLE_INTERVAL_SECS} 秒采样，进程快照每 {SNAPSHOT_REFRESH_SECS} 秒刷新）"
+                "前台应用识别已启动（每 {SAMPLE_INTERVAL_SECS} 秒采样，进程快照每 {SNAPSHOT_REFRESH_SECS} 秒刷新）"
             );
-            // 基准取自循环开始（sleep 之前），首个窗口长度自然 = 一个采样周期
-            let mut last_sample = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_secs(SAMPLE_INTERVAL_SECS));
-                // 用真实经过时间而非常量：sleep 有漂移，按实际窗口折算才不会系统性多计。
-                // 全程按毫秒计算再折算回秒：sleep(2s) 实际约 2.000x 秒，若用
-                // `as_secs()` 截断成 2 并把窗口当作 [now-1, now)（时间戳是整秒），
-                // 会反复丢半个采样窗口，前台应用时长被系统性少算约一半。
-                let elapsed_ms = last_sample.elapsed().as_millis().min(i64::MAX as u128) as i64;
-                last_sample = Instant::now();
-                let Some(name) = collect::foreground_app_name() else {
-                    continue;
-                };
-                // 只累计"活跃时长已覆盖"的秒数：活跃时长记到最后一个键鼠事件为止，
-                // 因此本采样窗口 (now-elapsed, now] 与 (.., last_event_ts] 取交集，
-                // 停手后的空档（挂机）不再白送时长，应用总时长恒 ≤ 今日活跃时长。
-                let now_ms = queries::now_ts_ms();
-                let seconds = overlap_seconds_ms(now_ms, elapsed_ms, writer.last_event_ts());
-                if seconds <= 0 {
-                    continue;
+                match collect::foreground_app_name() {
+                    Some(n) if is_recordable(&n, &exclude) => writer.set_current_app(Some(&n)),
+                    // exclude 命中：按其语义「完全不记录」，
+                    // 同时清空归属，避免这段时长被记到上一个应用头上
+                    Some(_) => writer.set_current_app(None),
+                    // 采集失败（锁屏、窗口切换瞬间、进程名暂未解析）：同样清空归属。
+                    // 宁可少记也不张冠李戴，差额会体现为「应用总时长 < 活跃时长」。
+                    None => writer.set_current_app(None),
                 }
-                let lower = name.to_ascii_lowercase();
-                if exclude.contains(&lower) {
-                    continue;
-                }
-                let dk = queries::day_key_of_ts_ms(now_ms);
-                writer.add_app_seconds(dk, &name, seconds);
             }
         })
-        .expect("启动前台应用采集线程失败");
-}
-
-/// 本采样窗口 `(now_ms - elapsed_ms, now_ms]` 与活跃时长已覆盖区间
-/// `(.., last_event_ts]` 的交集秒数（向上取整，避免小于 1 秒的窗口被丢成 0）。
-///
-/// 活跃时长在最后一个键鼠事件处停止累计，所以超出 `last_event_ts` 的部分一律不计，
-/// 停手后的空档最多多算一个采样周期（≤ 采样粒度），不再白送 60 秒。
-fn overlap_seconds_ms(now_ms: i64, elapsed_ms: i64, last_event_ts: i64) -> i64 {
-    if elapsed_ms <= 0 || last_event_ts <= 0 {
-        return 0;
-    }
-    let last_event_ms = last_event_ts.saturating_mul(1000);
-    let start_ms = now_ms - elapsed_ms;
-    // 窗口整体落在最后事件之后 → 已脱离活跃区间
-    if start_ms >= last_event_ms {
-        return 0;
-    }
-    // 交集毫秒数向上取整折算成秒；上限为一个采样窗口。
-    let overlap_ms = (now_ms.min(last_event_ms) - start_ms).clamp(0, elapsed_ms);
-    (overlap_ms + 999) / 1000
+        .expect("启动前台应用采样线程失败");
 }
 
 /// 前台进程名采集（平台相关）。
 mod collect {
-    use super::SNAPSHOT_REFRESH_SECS;
+    use super::{SNAPSHOT_FORCE_MIN_SECS, SNAPSHOT_REFRESH_SECS};
     use std::time::Duration;
 
     /// 前台窗口所属进程的 exe 文件名（不读窗口标题）。
@@ -125,7 +105,11 @@ mod collect {
         }
     }
 
-    /// PID→进程名，走线程本地的 30 秒快照缓存。
+    /// PID→进程名，走线程本地的快照缓存。
+    ///
+    /// 缓存未命中时立即重建一次快照再查：快照每 30 秒才刷新一次，而窗口进程
+    /// 常常是刚启动的（新开的窗口、UWP 的 ApplicationFrameHost 子进程），
+    /// 只靠定期刷新会让这些应用在前 30 秒里查不到名字、整段不归属。
     #[cfg(windows)]
     fn pid_to_name(pid: u32) -> Option<String> {
         use std::cell::RefCell;
@@ -145,6 +129,20 @@ mod collect {
                 cache.0 = Some(std::time::Instant::now());
                 cache.1 = take_process_snapshot();
             }
+            if let Some(name) = cache.1.get(&pid) {
+                return Some(name.clone());
+            }
+            // 未命中 → 立即重建再查一次；带最小间隔节流，
+            // 避免「PID 查不到」持续存在时每次都做一遍全进程遍历。
+            let can_force = cache
+                .0
+                .map(|t| t.elapsed() >= Duration::from_secs(SNAPSHOT_FORCE_MIN_SECS))
+                .unwrap_or(true);
+            if !can_force {
+                return None;
+            }
+            cache.0 = Some(std::time::Instant::now());
+            cache.1 = take_process_snapshot();
             cache.1.get(&pid).cloned()
         })
     }
@@ -196,63 +194,22 @@ mod collect {
 
 #[cfg(test)]
 mod tests {
-    use super::overlap_seconds_ms;
+    use super::is_recordable;
 
-    /// 采样窗口完全落在最后事件之前：整窗计入（活跃时长已覆盖）。
+    /// exclude 命中即不归属，且大小写不敏感。
     #[test]
-    fn overlap_full_window_when_still_active() {
-        // 窗口 (100s, 102s]，最后事件在秒 110（尚未到达，说明刚有键鼠活动）→ 整窗 2 秒
-        assert_eq!(overlap_seconds_ms(102_000, 2_000, 110), 2);
+    fn exclude_blocks_matching_process() {
+        let exclude = vec!["keepassxc.exe".to_string(), "taskmgr.exe".to_string()];
+        assert!(is_recordable("Obsidian.exe", &exclude));
+        assert!(!is_recordable("KeePassXC.exe", &exclude));
+        assert!(!is_recordable("KEEPASSXC.EXE", &exclude));
+        assert!(!is_recordable("taskmgr.exe", &exclude));
     }
 
-    /// 亚秒交集向上取整：不足 1 秒的活跃交集也要计入 1 秒，不能截断成 0。
+    /// 空 exclude（默认配置）时全部可归属。
     #[test]
-    fn overlap_counts_sub_second_tail() {
-        // 窗口 (99.400s, 100.400s]，最后事件 100s 落在窗口内 → 交集 400ms → 计 1 秒
-        assert_eq!(overlap_seconds_ms(100_400, 1_000, 100), 1);
-    }
-
-    /// 真实 sleep 漂移（2.000x 秒）不应丢掉半个窗口。
-    #[test]
-    fn overlap_handles_sleep_drift() {
-        // 窗口毫秒数 2003，最后事件在很远的将来（持续活跃）→ 仍应计 2 秒（向上取整 2003ms）
-        assert_eq!(overlap_seconds_ms(202_003, 2_003, 9_999_999_999), 3);
-    }
-
-    /// 最后事件落在窗口内：只计到事件时刻，尾巴不计。
-    #[test]
-    fn overlap_clips_to_last_event() {
-        // 窗口 (100s, 102s]，最后事件 101s（秒）→ 交集 1 秒
-        assert_eq!(overlap_seconds_ms(102_000, 2_000, 101), 1);
-    }
-
-    /// 窗口完全在最后事件之后（停手/挂机）：不计。
-    #[test]
-    fn overlap_zero_after_idle() {
-        assert_eq!(overlap_seconds_ms(200_000, 2_000, 100), 0);
-        // 边界：窗口起点恰为最后事件时刻
-        assert_eq!(overlap_seconds_ms(102_000, 2_000, 100), 0);
-    }
-
-    /// 无事件或非法窗口：不计。
-    #[test]
-    fn overlap_zero_without_events() {
-        assert_eq!(overlap_seconds_ms(102_000, 2_000, 0), 0);
-        assert_eq!(overlap_seconds_ms(102_000, 0, 200), 0);
-    }
-
-    /// 折算结果永不超过窗口长度（防止重复/溢出累计）。
-    #[test]
-    fn overlap_never_exceeds_window() {
-        for elapsed_ms in 1..=5_000i64 {
-            for last in 0..=210i64 {
-                let s = overlap_seconds_ms(200_000, elapsed_ms, last);
-                let max_expected = (elapsed_ms + 999) / 1000;
-                assert!(
-                    (0..=max_expected).contains(&s),
-                    "elapsed_ms={elapsed_ms} last={last} s={s}"
-                );
-            }
-        }
+    fn empty_exclude_allows_everything() {
+        let exclude: Vec<String> = Vec::new();
+        assert!(is_recordable("msedge.exe", &exclude));
     }
 }

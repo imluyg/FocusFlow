@@ -67,7 +67,8 @@ impl Database {
             );
         }
 
-        // 前台应用使用时长采集（Windows；[app_stats] enabled=false 或 exclude 可关停）
+        // 前台应用识别（写入 current_app，时长归属由写线程按键鼠事件完成；
+        // Windows；[app_stats] enabled=false 或 exclude 可关停）
         crate::app_stats::start_sampler(Arc::clone(writer.as_ref().unwrap()));
 
         Ok(Arc::new(Self { writer }))
