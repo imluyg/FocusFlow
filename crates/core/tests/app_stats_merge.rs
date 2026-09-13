@@ -47,7 +47,10 @@ fn app_stats_merges_across_days() {
     let (total, map) = db::get_app_stats(None, None);
     assert_eq!(total, 160, "总秒数应为全部行之和");
     assert_eq!(map.len(), 2);
-    assert_eq!(map["A"], 150, "同名应用跨天必须累加（回归：曾只剩最后一天）");
+    assert_eq!(
+        map["A"], 150,
+        "同名应用跨天必须累加（回归：曾只剩最后一天）"
+    );
     assert_eq!(map["B"], 10);
 
     // 按日期：只含该日行（B 只在昨天）

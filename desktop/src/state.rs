@@ -130,8 +130,15 @@ impl AppState {
         crate::plugins::start_key_event_dispatch(app.handle(), Arc::clone(&db), &listener);
 
         let shared = Arc::new(Mutex::new(SharedStats::default()));
-        // 默认周期 = 上次退出前选择的周期（前端切换时写入 gui.default_period）
+        // 默认周期 = 上次退出前选择的周期（前端切换时写入 gui.default_period）。
+        // 该值用户可手改，非法值必须在入口拦掉：它会进入日期运算并 panic（panic=abort）。
         let default_period = config.get_int("gui", "default_period", -1);
+        let default_period = if focusflow_core::db::queries::is_valid_period(default_period) {
+            default_period
+        } else {
+            tracing::warn!("gui.default_period 非法（{default_period}），回退为今日");
+            -1
+        };
         let period = Arc::new(AtomicI64::new(default_period));
         let refresh_now = Arc::new(AtomicBool::new(false));
 
@@ -849,12 +856,17 @@ fn spawn_stats_worker(
         .spawn(move || {
             tracing::info!("统计线程已启动");
             let mut prev_logged_today: i64 = -1;
-            // "统计更新"日志限频时间戳（打字时计数每秒变化，避免刷屏）
-            let mut last_stats_log = Instant::now() - Duration::from_secs(61);
+            // "统计更新"日志限频时间戳（打字时计数每秒变化，避免刷屏）。
+            // 初值用 Instant::now() 而非 now()-61s：开机初期（系统运行时间不足 61 秒）
+            // Instant 减法会下溢 panic，release 下 panic=abort 直接崩进程。
+            let mut last_stats_log = Instant::now();
             let tick_ms = 500u64;
 
             let mut prev_period: i64 = i64::MIN;
-            let mut last_heavy = Instant::now() - Duration::from_secs(3600);
+            // checked_sub：系统开机不足 1 小时时 Instant 减法会下溢 panic（panic=abort）。
+            let mut last_heavy = Instant::now()
+                .checked_sub(Duration::from_secs(3600))
+                .unwrap_or_else(Instant::now);
             let mut prev_today_count: i64 = -1;
             let mut prev_cpm: i64 = -1;
             let mut prev_active: i64 = -1;

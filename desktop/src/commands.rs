@@ -58,8 +58,15 @@ pub fn get_vibrancy() -> bool {
 }
 
 /// 设置统计周期（-1=今日, N=天数, 0=总计）并触发即时重聚合。
+///
+/// 非法值（如 -2、超大天数）必须拒绝：它会经 `gui.default_period` 持久化，
+/// 并在统计线程里进入日期运算导致 panic（release 下 panic=abort → 永久无法启动）。
 #[tauri::command]
 pub fn set_period(state: State<'_, Arc<AppState>>, period: i64) {
+    if !focusflow_core::db::queries::is_valid_period(period) {
+        tracing::warn!("拒绝非法统计周期: {period}");
+        return;
+    }
     state
         .period
         .store(period, std::sync::atomic::Ordering::Relaxed);

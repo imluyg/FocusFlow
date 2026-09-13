@@ -18,9 +18,39 @@ use crate::paths;
 /// 年度列表缓存 TTL（秒）
 const YEARS_CACHE_TTL: Duration = Duration::from_secs(30);
 
-/// 年度缓存：app_dir -> (时间, 年份列表)
-type YearsCache = std::sync::Mutex<HashMap<String, (Instant, Vec<i32>)>>;
+/// 年度缓存：app_dir -> (上次构建时间, 年份列表)
+///
+/// `None` 表示「已被显式失效」：失效不需要伪造一个过去的 `Instant`
+/// （`Instant::now() - Duration` 在系统开机时间短于该 Duration 时会 panic，
+/// 而应用有开机自启，release 下 `panic = "abort"` 会直接崩进程）。
+type YearsCache = std::sync::Mutex<HashMap<String, (Option<Instant>, Vec<i32>)>>;
 static YEARS_CACHE: std::sync::OnceLock<YearsCache> = std::sync::OnceLock::new();
+
+/// 查询天数上限（约 100 年）。
+///
+/// 所有进入日期运算的天数都必须先经过 [`clamp_query_days`]：周期值来自
+/// 配置（`gui.default_period`，用户可手改）、IPC（`set_period`）与 Lua 插件
+/// （`focusflow.stats`），不设上界时 `NaiveDate - Days` 越界会 panic。
+pub const MAX_QUERY_DAYS: i64 = 36_500;
+
+/// 把外部传入的天数收敛到可安全参与日期运算的区间 `1..=MAX_QUERY_DAYS`。
+pub fn clamp_query_days(days: i64) -> i64 {
+    days.clamp(1, MAX_QUERY_DAYS)
+}
+
+/// 统计周期取值是否合法：-1=今日 / 0=总计 / 1..=MAX_QUERY_DAYS 天。
+///
+/// 周期值来自前端 IPC 与 `gui.default_period`（用户可手改），必须在入口拦截：
+/// 此前任意负值（如 -2）会在 `NaiveDate - Days` 处 panic，release 下
+/// `panic = "abort"`，且默认周期每次启动都会重聚合 —— 应用会永久无法启动。
+pub fn is_valid_period(period: i64) -> bool {
+    period == -1 || (0..=MAX_QUERY_DAYS).contains(&period)
+}
+
+/// `date - days`，越界时返回 `None`（不使用会 panic 的 `Sub<Days>` 实现）。
+fn date_minus_days(date: chrono::NaiveDate, days: i64) -> Option<chrono::NaiveDate> {
+    date.checked_sub_days(Days::new(clamp_query_days(days) as u64))
+}
 
 fn years_cache() -> &'static YearsCache {
     YEARS_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
@@ -33,7 +63,7 @@ fn cache_key() -> String {
 /// 使年度列表缓存失效（归档/初始化后调用）。
 pub fn invalidate_years_cache() {
     let mut c = years_cache().lock().unwrap_or_else(|e| e.into_inner());
-    c.insert(cache_key(), (Instant::now() - YEARS_CACHE_TTL, vec![]));
+    c.insert(cache_key(), (None, vec![]));
     // 数据文件可能被替换/移动，同时失效只读连接缓存
     crate::db::connection::clear_ro_cache();
 }
@@ -44,8 +74,10 @@ pub fn available_years() -> Vec<i32> {
     {
         let c = years_cache().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = c.get(&key) {
-            if entry.0.elapsed() < YEARS_CACHE_TTL {
-                return entry.1.clone();
+            if let Some(built) = entry.0 {
+                if built.elapsed() < YEARS_CACHE_TTL {
+                    return entry.1.clone();
+                }
             }
         }
     }
@@ -59,7 +91,7 @@ pub fn available_years() -> Vec<i32> {
     }
     years.sort_unstable_by(|a, b| b.cmp(a));
     let mut c = years_cache().lock().unwrap_or_else(|e| e.into_inner());
-    c.insert(key, (Instant::now(), years.clone()));
+    c.insert(key, (Some(Instant::now()), years.clone()));
     years
 }
 
@@ -71,6 +103,11 @@ pub(crate) fn local_utc_offset_seconds() -> i64 {
 /// Unix 秒 → 本地时区天数序号（1970-01-01 起）。
 pub(crate) fn day_key_of_ts(ts: i64) -> i64 {
     (ts + local_utc_offset_seconds()).div_euclid(86_400)
+}
+
+/// Unix 毫秒 → 本地时区天数序号（前台应用采集的采样时刻为毫秒）。
+pub(crate) fn day_key_of_ts_ms(ts_ms: i64) -> i64 {
+    (ts_ms.div_euclid(1000) + local_utc_offset_seconds()).div_euclid(86_400)
 }
 
 /// 本地日期 → 天数序号。
@@ -139,7 +176,10 @@ fn query_years(days: Option<i64>, target_date: Option<chrono::NaiveDate>) -> Vec
         return available_years();
     }
     let now = Local::now();
-    let start = now.date_naive() - chrono::Days::new(days.unwrap() as u64);
+    // 天数先收敛再进日期运算：越界会 panic（release 下 panic=abort 直接崩进程）。
+    let sanitized = clamp_query_days(days.unwrap_or(1));
+    let start = date_minus_days(now.date_naive(), sanitized)
+        .unwrap_or_else(|| now.date_naive() - Days::new(MAX_QUERY_DAYS as u64));
     let years: Vec<i32> = (start.year()..=now.year()).collect();
     let available: std::collections::HashSet<i32> = available_years().into_iter().collect();
     let filtered: Vec<i32> = years
@@ -155,7 +195,7 @@ fn query_years(days: Option<i64>, target_date: Option<chrono::NaiveDate>) -> Vec
 
 /// 周期天数 → 起始 date_key（含当天，共 N 天）。None 表示不限。
 fn cutoff_day_key(days: Option<i64>) -> Option<i64> {
-    days.map(|d| day_key_of_date(Local::now().date_naive()) - d + 1)
+    days.map(|d| day_key_of_date(Local::now().date_naive()) - clamp_query_days(d) + 1)
 }
 
 /// 查询统计：返回 (总数, {键名: 次数})。
@@ -321,7 +361,10 @@ pub fn get_alltime_max_day() -> Option<(String, i64)> {
 /// 查询最近 N 天每日按键数：返回 [(YYYY-MM-DD, 次数)]。
 pub fn get_daily_counts(days: i64, year: Option<i32>) -> Vec<(String, i64)> {
     let now = Local::now();
-    let start = now.date_naive() - Days::new((days - 1).max(0) as u64);
+    // 含当天共 N 天：起点为 now-(N-1)；天数先收敛，越界会让日期运算 panic。
+    let days = clamp_query_days(days);
+    let start = date_minus_days(now.date_naive(), days - 1)
+        .unwrap_or_else(|| now.date_naive() - Days::new((MAX_QUERY_DAYS - 1) as u64));
     let start_dk = day_key_of_date(start);
     let end_dk = day_key_of_date(now.date_naive());
 
@@ -450,7 +493,8 @@ fn query_apps_in_conn(
     };
     // 必须按应用聚合后再进 HashMap：app_usage 主键是 (date_key, app_name)，
     // 同一应用跨多天有多行，裸选行 collect 会同名覆盖（只剩最后一天），总时长被吃掉一大截。
-    let sql = format!("SELECT app_name, SUM(seconds) FROM app_usage{where_clause} GROUP BY app_name");
+    let sql =
+        format!("SELECT app_name, SUM(seconds) FROM app_usage{where_clause} GROUP BY app_name");
     let map: HashMap<String, i64> = {
         let mapper = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?));
         let rows = match conn.prepare(&sql) {
@@ -559,6 +603,11 @@ pub fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// 当前 Unix 毫秒。
+pub fn now_ts_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
 /// 本地日期转当日起始 Unix 秒（本地时区）。
 ///
 /// DST 空档（如春令时 0:00-1:00 不存在）时 `.single()` 返回 None，
@@ -578,5 +627,69 @@ fn local_day_start_ts(date: chrono::NaiveDate) -> i64 {
                 naive.and_utc().timestamp()
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 周期合法性守卫：-1/0/N 合法，其他负值与超大天数非法。
+    #[test]
+    fn period_validation_accepts_only_known_ranges() {
+        assert!(is_valid_period(-1), "-1 = 今日");
+        assert!(is_valid_period(0), "0 = 总计");
+        assert!(is_valid_period(1));
+        assert!(is_valid_period(365));
+        assert!(is_valid_period(MAX_QUERY_DAYS));
+        assert!(!is_valid_period(-2), "回归：-2 曾让应用每次启动即崩溃");
+        assert!(!is_valid_period(-100));
+        assert!(!is_valid_period(MAX_QUERY_DAYS + 1));
+        assert!(!is_valid_period(i64::MIN));
+        assert!(!is_valid_period(i64::MAX));
+    }
+
+    /// 天数收敛：非法天数被夹到安全区间，不参与越界日期运算。
+    #[test]
+    fn clamp_query_days_bounds_everything() {
+        assert_eq!(clamp_query_days(-1), 1);
+        assert_eq!(clamp_query_days(0), 1);
+        assert_eq!(clamp_query_days(30), 30);
+        assert_eq!(clamp_query_days(i64::MAX), MAX_QUERY_DAYS);
+        assert_eq!(clamp_query_days(i64::MIN), 1);
+    }
+
+    /// 回归：非法周期值不得 panic（`panic = "abort"` 下会直接终止进程，
+    /// 且 `gui.default_period` 每次启动都会重聚合 —— 曾导致应用永久无法启动）。
+    #[test]
+    fn invalid_days_never_panic_on_date_math() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_period_guard_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        // 这些值此前都会让 `NaiveDate - Days::new(days as u64)` panic
+        for days in [-2i64, -100, i64::MIN, i64::MAX, MAX_QUERY_DAYS + 1] {
+            let _ = get_stats(Some(days), None);
+            let _ = get_app_stats(Some(days), None);
+            let _ = get_daily_counts(days, None);
+            let _ = get_weekday_stats(days);
+        }
+        // 合法值同样走通
+        let _ = get_stats(Some(7), None);
+        let _ = get_daily_counts(7, None);
+    }
+
+    /// 含当天共 N 天：N=1 只含今天，N=200 跨 200 个日期。
+    #[test]
+    fn daily_counts_span_includes_today() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_daily_span_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        assert_eq!(get_daily_counts(1, None).len(), 1);
+        assert_eq!(get_daily_counts(200, None).len(), 200);
+        assert_eq!(get_daily_counts(0, None).len(), 1, "非法天数收敛为 1 天");
     }
 }

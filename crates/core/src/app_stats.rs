@@ -51,17 +51,20 @@ pub fn start_sampler(writer: Arc<DbWriter>) {
             let mut last_sample = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_secs(SAMPLE_INTERVAL_SECS));
-                // 用真实经过时间而非常量：sleep 有漂移，按实际窗口折算才不会系统性多计
-                let elapsed = last_sample.elapsed().as_secs() as i64;
+                // 用真实经过时间而非常量：sleep 有漂移，按实际窗口折算才不会系统性多计。
+                // 全程按毫秒计算再折算回秒：sleep(2s) 实际约 2.000x 秒，若用
+                // `as_secs()` 截断成 2 并把窗口当作 [now-1, now)（时间戳是整秒），
+                // 会反复丢半个采样窗口，前台应用时长被系统性少算约一半。
+                let elapsed_ms = last_sample.elapsed().as_millis().min(i64::MAX as u128) as i64;
                 last_sample = Instant::now();
                 let Some(name) = collect::foreground_app_name() else {
                     continue;
                 };
                 // 只累计"活跃时长已覆盖"的秒数：活跃时长记到最后一个键鼠事件为止，
-                // 因此本采样窗口 [now-elapsed, now) 与 [.., last_event_ts] 取交集，
+                // 因此本采样窗口 (now-elapsed, now] 与 (.., last_event_ts] 取交集，
                 // 停手后的空档（挂机）不再白送时长，应用总时长恒 ≤ 今日活跃时长。
-                let now = queries::now_ts();
-                let seconds = overlap_seconds(now, elapsed, writer.last_event_ts());
+                let now_ms = queries::now_ts_ms();
+                let seconds = overlap_seconds_ms(now_ms, elapsed_ms, writer.last_event_ts());
                 if seconds <= 0 {
                     continue;
                 }
@@ -69,27 +72,31 @@ pub fn start_sampler(writer: Arc<DbWriter>) {
                 if exclude.contains(&lower) {
                     continue;
                 }
-                let dk = queries::day_key_of_ts(now);
+                let dk = queries::day_key_of_ts_ms(now_ms);
                 writer.add_app_seconds(dk, &name, seconds);
             }
         })
         .expect("启动前台应用采集线程失败");
 }
 
-/// 本采样窗口 `[now - elapsed, now)` 与活跃时长已覆盖区间 `[.., last_event_ts]` 的交集秒数。
+/// 本采样窗口 `(now_ms - elapsed_ms, now_ms]` 与活跃时长已覆盖区间
+/// `(.., last_event_ts]` 的交集秒数（向上取整，避免小于 1 秒的窗口被丢成 0）。
 ///
 /// 活跃时长在最后一个键鼠事件处停止累计，所以超出 `last_event_ts` 的部分一律不计，
 /// 停手后的空档最多多算一个采样周期（≤ 采样粒度），不再白送 60 秒。
-fn overlap_seconds(now: i64, elapsed: i64, last_event_ts: i64) -> i64 {
-    if elapsed <= 0 || last_event_ts <= 0 {
+fn overlap_seconds_ms(now_ms: i64, elapsed_ms: i64, last_event_ts: i64) -> i64 {
+    if elapsed_ms <= 0 || last_event_ts <= 0 {
         return 0;
     }
-    let start = now - elapsed;
+    let last_event_ms = last_event_ts.saturating_mul(1000);
+    let start_ms = now_ms - elapsed_ms;
     // 窗口整体落在最后事件之后 → 已脱离活跃区间
-    if start >= last_event_ts {
+    if start_ms >= last_event_ms {
         return 0;
     }
-    (now.min(last_event_ts) - start).clamp(0, elapsed)
+    // 交集毫秒数向上取整折算成秒；上限为一个采样窗口。
+    let overlap_ms = (now_ms.min(last_event_ms) - start_ms).clamp(0, elapsed_ms);
+    (overlap_ms + 999) / 1000
 }
 
 /// 前台进程名采集（平台相关）。
@@ -123,16 +130,19 @@ mod collect {
     fn pid_to_name(pid: u32) -> Option<String> {
         use std::cell::RefCell;
         thread_local! {
-            static SNAPSHOT: RefCell<(std::time::Instant, std::collections::HashMap<u32, String>)> =
-                RefCell::new((
-                    std::time::Instant::now() - Duration::from_secs(SNAPSHOT_REFRESH_SECS * 2),
-                    std::collections::HashMap::new(),
-                ));
+            // None = 尚未建立快照（不能用 Instant::now() - Duration 伪造过去时刻：
+            // 系统开机时间短于该 Duration 时 Instant 减法会下溢 panic）。
+            static SNAPSHOT: RefCell<(Option<std::time::Instant>, std::collections::HashMap<u32, String>)> =
+                RefCell::new((None, std::collections::HashMap::new()));
         }
         SNAPSHOT.with(|cache| {
             let mut cache = cache.borrow_mut();
-            if cache.0.elapsed() >= Duration::from_secs(SNAPSHOT_REFRESH_SECS) {
-                cache.0 = std::time::Instant::now();
+            let stale = cache
+                .0
+                .map(|t| t.elapsed() >= Duration::from_secs(SNAPSHOT_REFRESH_SECS))
+                .unwrap_or(true);
+            if stale {
+                cache.0 = Some(std::time::Instant::now());
                 cache.1 = take_process_snapshot();
             }
             cache.1.get(&pid).cloned()
@@ -186,44 +196,62 @@ mod collect {
 
 #[cfg(test)]
 mod tests {
-    use super::overlap_seconds;
+    use super::overlap_seconds_ms;
 
     /// 采样窗口完全落在最后事件之前：整窗计入（活跃时长已覆盖）。
     #[test]
     fn overlap_full_window_when_still_active() {
-        // 窗口 [100, 102)，最后事件在 110（尚未到达，说明刚有键鼠活动）
-        assert_eq!(overlap_seconds(102, 2, 110), 2);
+        // 窗口 (100s, 102s]，最后事件在秒 110（尚未到达，说明刚有键鼠活动）→ 整窗 2 秒
+        assert_eq!(overlap_seconds_ms(102_000, 2_000, 110), 2);
+    }
+
+    /// 亚秒交集向上取整：不足 1 秒的活跃交集也要计入 1 秒，不能截断成 0。
+    #[test]
+    fn overlap_counts_sub_second_tail() {
+        // 窗口 (99.400s, 100.400s]，最后事件 100s 落在窗口内 → 交集 400ms → 计 1 秒
+        assert_eq!(overlap_seconds_ms(100_400, 1_000, 100), 1);
+    }
+
+    /// 真实 sleep 漂移（2.000x 秒）不应丢掉半个窗口。
+    #[test]
+    fn overlap_handles_sleep_drift() {
+        // 窗口毫秒数 2003，最后事件在很远的将来（持续活跃）→ 仍应计 2 秒（向上取整 2003ms）
+        assert_eq!(overlap_seconds_ms(202_003, 2_003, 9_999_999_999), 3);
     }
 
     /// 最后事件落在窗口内：只计到事件时刻，尾巴不计。
     #[test]
     fn overlap_clips_to_last_event() {
-        // 窗口 [100, 102)，最后事件 101 → 交集 1 秒
-        assert_eq!(overlap_seconds(102, 2, 101), 1);
+        // 窗口 (100s, 102s]，最后事件 101s（秒）→ 交集 1 秒
+        assert_eq!(overlap_seconds_ms(102_000, 2_000, 101), 1);
     }
 
     /// 窗口完全在最后事件之后（停手/挂机）：不计。
     #[test]
     fn overlap_zero_after_idle() {
-        assert_eq!(overlap_seconds(200, 2, 100), 0);
+        assert_eq!(overlap_seconds_ms(200_000, 2_000, 100), 0);
         // 边界：窗口起点恰为最后事件时刻
-        assert_eq!(overlap_seconds(102, 2, 100), 0);
+        assert_eq!(overlap_seconds_ms(102_000, 2_000, 100), 0);
     }
 
     /// 无事件或非法窗口：不计。
     #[test]
     fn overlap_zero_without_events() {
-        assert_eq!(overlap_seconds(102, 2, 0), 0);
-        assert_eq!(overlap_seconds(102, 0, 200), 0);
+        assert_eq!(overlap_seconds_ms(102_000, 2_000, 0), 0);
+        assert_eq!(overlap_seconds_ms(102_000, 0, 200), 0);
     }
 
     /// 折算结果永不超过窗口长度（防止重复/溢出累计）。
     #[test]
     fn overlap_never_exceeds_window() {
-        for elapsed in 1..=5i64 {
+        for elapsed_ms in 1..=5_000i64 {
             for last in 0..=210i64 {
-                let s = overlap_seconds(200, elapsed, last);
-                assert!((0..=elapsed).contains(&s), "elapsed={elapsed} last={last} s={s}");
+                let s = overlap_seconds_ms(200_000, elapsed_ms, last);
+                let max_expected = (elapsed_ms + 999) / 1000;
+                assert!(
+                    (0..=max_expected).contains(&s),
+                    "elapsed_ms={elapsed_ms} last={last} s={s}"
+                );
             }
         }
     }
