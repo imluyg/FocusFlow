@@ -64,8 +64,87 @@ pub fn init_db() -> anyhow::Result<()> {
 /// 允许被定时启动的文件扩展名（可执行类型）。
 const EXECUTABLE_EXTENSIONS: [&str; 4] = ["exe", "bat", "cmd", "lnk"];
 
-/// 校验任务目标路径：必须是绝对路径、指向已存在的可执行类型文件。
-/// 定时任务是持久化的进程启动通道，入口（插件 API / 未来 UI）统一在此拦截。
+/// 明确禁止作为定时任务目标的可执行文件名（小写）。
+///
+/// 定时任务是「持久化的进程启动通道」，而插件 API 也暴露了它：任意 `.lua`
+/// 若能用 `cmd.exe /c ...`、`powershell.exe -EncodedCommand ...` 之类启动解释器，
+/// 就等于完整绕过插件沙箱（沙箱只剔除了 io/os 高危函数）。这里在入口与
+/// 执行前双重拦截。
+const BLOCKED_EXECUTABLES: [&str; 16] = [
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "mshta.exe",
+    "rundll32.exe",
+    "regsvr32.exe",
+    "installutil.exe",
+    "msbuild.exe",
+    "forfiles.exe",
+    "certutil.exe",
+    "bitsadmin.exe",
+    "conhost.exe",
+    "explorer.exe",
+    "wsl.exe",
+];
+
+/// 允许作为定时任务目标的可执行文件名（小写）。
+///
+/// 默认只放行常见「用户应用」：即便插件作者是恶意的，也无法借此启动解释器
+/// 或系统二进制。用户可在 `config.ini` 的 `[scheduler] allow_extra` 里追加
+/// 自己的白名单（逗号分隔的文件名），扩展时仍受 [`BLOCKED_EXECUTABLES`] 约束。
+const ALLOWED_EXECUTABLES: [&str; 24] = [
+    "notepad.exe",
+    "write.exe",
+    "wordpad.exe",
+    "mspaint.exe",
+    "calc.exe",
+    "charmap.exe",
+    "snippingtool.exe",
+    "magnify.exe",
+    "osk.exe",
+    "code.exe",
+    "devenv.exe",
+    "idea64.exe",
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "iexplore.exe",
+    "opera.exe",
+    "brave.exe",
+    "vlc.exe",
+    "wmplayer.exe",
+    "spotify.exe",
+    "winword.exe",
+    "excel.exe",
+    "powerpnt.exe",
+];
+
+/// 目标文件名（小写）。
+fn target_file_name(target_path: &str) -> String {
+    std::path::Path::new(target_path.trim())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+/// `config.ini` `[scheduler] allow_extra` 追加的白名单（逗号分隔文件名）。
+fn extra_allowed_executables() -> Vec<String> {
+    crate::config::instance()
+        .get_or("scheduler", "allow_extra", "")
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 校验任务目标路径：必须是绝对路径、指向已存在的可执行类型文件，
+/// 且文件名在白名单内、不在黑名单内。
+///
+/// 定时任务是持久化的进程启动通道，入口（插件 API / 未来 UI）统一在此拦截；
+/// [`execute_task`] 执行前还会再校验一次，防止库文件被外部改写后绕过入口。
 fn validate_task_target(target_path: &str) -> anyhow::Result<()> {
     let t = target_path.trim();
     if t.is_empty() {
@@ -88,6 +167,17 @@ fn validate_task_target(target_path: &str) -> anyhow::Result<()> {
                 .map(|e| format!(".{e}"))
                 .collect::<Vec<_>>()
                 .join(" / ")
+        );
+    }
+    let file_name = target_file_name(t);
+    if BLOCKED_EXECUTABLES.contains(&file_name.as_str()) {
+        anyhow::bail!("{file_name} 属于被禁止的解释器/系统程序，不能作为定时任务目标");
+    }
+    let extra = extra_allowed_executables();
+    if !ALLOWED_EXECUTABLES.contains(&file_name.as_str()) && !extra.contains(&file_name) {
+        anyhow::bail!(
+            "{file_name} 不在定时任务白名单内；如需放行请在 config.ini 的 \
+             [scheduler] allow_extra 中添加该文件名"
         );
     }
     if !p.is_file() {
@@ -347,6 +437,12 @@ fn execute_task(t: &ScheduledTask) {
     if t.target_path.is_empty() {
         return;
     }
+    // 纵深防御：入口已校验，这里再校验一次。库里可能有历史白名单外记录，
+    // 也可能被外部程序直接改写 —— 执行前的这道检查保证不会启动任意程序。
+    if let Err(e) = validate_task_target(&t.target_path) {
+        tracing::warn!("定时任务被拒绝执行（{}）: {e}", t.name);
+        return;
+    }
     let mut cmd = std::process::Command::new(&t.target_path);
     if !t.args.is_empty() {
         for arg in t.args.split_whitespace() {
@@ -474,5 +570,67 @@ pub fn validate_schedule(schedule_type: &str, schedule_time: &str) -> (bool, Str
             }
         }
         _ => (false, format!("未知调度类型: {schedule_type}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn isolate_app_dir(tag: &str) -> std::sync::MutexGuard<'static, ()> {
+        let lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_sched_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+        let _ = crate::config::instance();
+        lock
+    }
+
+    /// 回归：插件可通过 `scheduler_add` 启动任意程序，绕过 io/os 沙箱。
+    /// 解释器与系统二进制必须在白名单校验处被拒绝。
+    #[test]
+    fn blocked_interpreters_are_rejected() {
+        let _g = isolate_app_dir("blocked");
+        // 目标文件确实存在（否则会先被"不存在"分支拦下，测不到黑名单逻辑）
+        let cmd = r"C:\Windows\System32\cmd.exe";
+        if !std::path::Path::new(cmd).is_file() {
+            return; // 非 Windows 或无该系统路径：跳过
+        }
+        assert!(
+            validate_task_target(cmd).is_err(),
+            "cmd.exe 绝不能作为定时任务目标"
+        );
+        assert!(
+            validate_task_target(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+                .is_err(),
+            "powershell.exe 绝不能作为定时任务目标"
+        );
+
+        // 入口（add_task）必须同样拒绝，且不产生任何记录
+        let id = add_task("evil", cmd, "/c calc.exe", "once", "2000-01-01 00:00", true);
+        assert_eq!(id, -1, "被拒绝的任务不应返回有效 id");
+        assert!(get_all_tasks().is_empty(), "被拒绝的任务不应入库");
+    }
+
+    /// 白名单外的普通程序也会被拒绝（默认只放行常见用户应用）。
+    #[test]
+    fn non_whitelisted_binary_is_rejected() {
+        let _g = isolate_app_dir("notlisted");
+        let weird = r"C:\Windows\System32\where.exe";
+        if !std::path::Path::new(weird).is_file() {
+            return;
+        }
+        assert!(validate_task_target(weird).is_err());
+    }
+
+    /// 白名单内的目标 + 合法路径仍可通过（确保收敛没有把功能改死）。
+    #[test]
+    fn whitelisted_notepad_is_accepted() {
+        let _g = isolate_app_dir("notepad");
+        let notepad = r"C:\Windows\notepad.exe";
+        if !std::path::Path::new(notepad).is_file() {
+            return;
+        }
+        assert!(validate_task_target(notepad).is_ok());
     }
 }
