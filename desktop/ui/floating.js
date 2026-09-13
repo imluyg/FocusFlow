@@ -8,6 +8,10 @@ const PhysicalPosition = window.__TAURI__.window.PhysicalPosition;
 // ===== 手动拖动 =====
 // 高频 mousemove 用 requestAnimationFrame 合并：每帧最多一次 setPosition IPC，
 // 快速拖动下明显减少跨进程调用（视觉上无差别）。
+//
+// 单位约定（踩过的坑）：`outerPosition()` 返回**物理像素**，而 `e.screenX` 是
+// **CSS/逻辑像素**。两者必须经 `scaleFactor` 换算后再相加，否则在 125%/150%
+// 缩放下窗口位移只有鼠标位移的 1/scale（拖动明显落后于鼠标）。
 let isDown = false;
 let drag = null;
 let rafPending = false;
@@ -16,9 +20,18 @@ let pendingPos = null;
 document.addEventListener("mousedown", async (e) => {
   if (e.button !== 0) return;
   isDown = true;
+  drag = null; // 清掉上一次拖动，await 期间不再用陈旧基准
   try {
     const pos = await appWindow.outerPosition();
-    drag = { startX: e.screenX, startY: e.screenY, winX: pos.x, winY: pos.y };
+    const scale = (await appWindow.scaleFactor()) || 1;
+    if (!isDown) return; // await 期间已松开：丢弃本次基准
+    drag = {
+      startX: e.screenX,
+      startY: e.screenY,
+      winX: pos.x,
+      winY: pos.y,
+      scale,
+    };
   } catch (err) {
     drag = null;
   }
@@ -35,10 +48,15 @@ function flushPosition() {
 document.addEventListener("mousemove", (e) => {
   if (!isDown) return;
   if (!drag) return;
+  // 逻辑像素位移 → 物理像素位移
   const dx = e.screenX - drag.startX;
   const dy = e.screenY - drag.startY;
+  // 阈值按逻辑像素判断，避免高缩放下拖动一开始就跳动
   if (Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
-  pendingPos = { x: drag.winX + dx, y: drag.winY + dy };
+  pendingPos = {
+    x: Math.round(drag.winX + dx * drag.scale),
+    y: Math.round(drag.winY + dy * drag.scale),
+  };
   if (!rafPending) {
     rafPending = true;
     requestAnimationFrame(flushPosition);

@@ -87,6 +87,9 @@ export function lineChart(container, title, data) {
 
   const render = () => {
     container._chartRerender = render;
+    // 重建前先收起 tooltip：container.innerHTML = "" 会连同 svg 一起丢掉
+    // mouseleave 监听，悬停中遇重绘会留下永久残留的提示框（主窗口活跃时每 2 秒推送一次）。
+    hideTip(tip);
     const W = Math.max(320, Math.floor(container.clientWidth));
     const H = Math.max(220, Math.floor(container.clientHeight) || 260);
     container.innerHTML = "";
@@ -159,6 +162,9 @@ export function barChart(container, title, values, labels) {
 
   const render = () => {
     container._chartRerender = render;
+    // 重建前先收起 tooltip：container.innerHTML = "" 会连同 svg 一起丢掉
+    // mouseleave 监听，悬停中遇重绘会留下永久残留的提示框（主窗口活跃时每 2 秒推送一次）。
+    hideTip(tip);
     const W = Math.max(320, Math.floor(container.clientWidth));
     const H = Math.max(220, Math.floor(container.clientHeight) || 260);
     container.innerHTML = "";
