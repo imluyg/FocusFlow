@@ -43,7 +43,13 @@ pub fn with_ro_conn<T>(path: &Path, f: impl FnOnce(&Connection) -> T) -> Option<
                 Ok(conn) => {
                     pool.insert(path.to_path_buf(), (conn, std::time::Instant::now()));
                 }
-                Err(_) => return None,
+                Err(e) => {
+                    // 不静默：调用方普遍用 unwrap_or(0) 兜底，若不记日志，
+                    // "库损坏/被锁/不可读"会表现为"今日 0 次、排行榜为空"，
+                    // 用户与排查者都无法区分"没有数据"和"读不出来"。
+                    tracing::error!("只读连接打开失败 {}: {e}", path.display());
+                    return None;
+                }
             }
         }
         match pool.get_mut(path) {
