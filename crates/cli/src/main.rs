@@ -26,10 +26,32 @@ fn main() -> ExitCode {
     ExitCode::from(code as u8)
 }
 
+/// 命令用法（`--help` / `-h` / 无参数时输出）。
+const USAGE: &str = "\
+用法: focusflow-cli <命令> [参数]
+
+  --stats <天数|today|all>   统计最近 N 天 / 今日 / 总计
+  --stats-year <年份>        指定年度的统计
+  --list-years               列出有数据的年份
+  --export <csv|html>        导出报表到当前目录
+  --vacuum                   压缩数据库
+  --cleanup <天数>           清理 N 天前的数据
+  --reset                    清空所有统计记录（需输入 yes 确认）
+  -h, --help                 显示本帮助
+";
+
 fn run(args: &[String]) -> i32 {
     if args.is_empty() {
-        eprintln!("用法: focusflow-cli <命令> (见源码注释)");
+        eprint!("{USAGE}");
         return 1;
+    }
+
+    match args[0].as_str() {
+        "-h" | "--help" => {
+            print!("{USAGE}");
+            return 0;
+        }
+        _ => {}
     }
 
     // 读取配置（读当前目录 config.ini，不存在则生成默认）
@@ -369,6 +391,6 @@ fn reset(_db: &db::Database) -> i32 {
         return 0;
     }
     let total = db::maintenance::reset_all_data();
-    println!("所有记录已清空 ({} 条)", fmt_thousands(total));
+    println!("所有统计记录已清空 ({} 行)", fmt_thousands(total));
     0
 }
