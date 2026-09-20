@@ -712,10 +712,15 @@ fn query_devices_in_conn(
     } else {
         format!(" WHERE dc.{cond}")
     };
+    // 字典化：统计表只存 device_id，设备实例路径从 devices 取回。
+    // 对外（UI 改名、别名表）仍以 device_key 字符串为准；GROUP BY 用整数 id
+    // 顺带避免了按长文本分组的临时 B 树。
+    // COALESCE 兜底：登记行缺失（历史库）时也不能丢计数。
     let sql = format!(
-        "SELECT dc.device_key, d.name, d.kind, SUM(dc.count) AS cnt
-         FROM device_counts dc LEFT JOIN devices d ON d.device_key = dc.device_key
-         {where_clause} GROUP BY dc.device_key"
+        "SELECT COALESCE(d.device_key, 'device-id:' || dc.device_id) AS dkey,
+                d.name, d.kind, SUM(dc.count) AS cnt
+         FROM device_counts dc LEFT JOIN devices d ON d.id = dc.device_id
+         {where_clause} GROUP BY dc.device_id"
     );
     let mapper = |r: &rusqlite::Row<'_>| {
         Ok(DeviceRow {
@@ -909,13 +914,15 @@ fn device_key_rows(device_key: &str, period: i64) -> (Vec<(String, i64)>, bool) 
             }
             let (sql, param) = match start_key {
                 Some(sk) => (
-                    "SELECT key_name, SUM(count) FROM device_key_counts \
-                     WHERE device_key = ?1 AND date_key >= ?2 GROUP BY key_name",
+                    "SELECT k.key_name, SUM(k.count) FROM device_key_counts k \
+                       JOIN devices d ON d.id = k.device_id \
+                     WHERE d.device_key = ?1 AND k.date_key >= ?2 GROUP BY k.key_name",
                     Some(sk),
                 ),
                 None => (
-                    "SELECT key_name, SUM(count) FROM device_key_counts \
-                     WHERE device_key = ?1 GROUP BY key_name",
+                    "SELECT k.key_name, SUM(k.count) FROM device_key_counts k \
+                       JOIN devices d ON d.id = k.device_id \
+                     WHERE d.device_key = ?1 GROUP BY k.key_name",
                     None,
                 ),
             };
@@ -960,7 +967,11 @@ fn device_date_series(device_key: &str) -> Vec<(i64, i64)> {
                 return None;
             }
             let mut stmt = conn
-                .prepare("SELECT date_key, count FROM device_counts WHERE device_key = ?1")
+                .prepare(
+                    "SELECT c.date_key, c.count FROM device_counts c \
+                       JOIN devices d ON d.id = c.device_id \
+                     WHERE d.device_key = ?1",
+                )
                 .ok()?;
             let list: Vec<(i64, i64)> = stmt
                 .query_map([device_key], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -1320,9 +1331,18 @@ mod tests {
                 .unwrap();
             };
             let ins_cnt = |key: &str, n: i64| {
+                // 字典化后统计表只存 devices.id：设备路径必须先在 devices 里注册。
+                // 无登记行时补一行空名占位（与写入侧的兜底一致）。
                 conn.execute(
-                    "INSERT INTO device_counts VALUES (?1, ?2, ?3)",
-                    rusqlite::params![dk, key, n],
+                    "INSERT OR IGNORE INTO devices (device_key, name, kind) \
+                     VALUES (?1, '', 'unknown')",
+                    [key],
+                )
+                .unwrap();
+                let id = crate::db::connection::device_id_of(&conn, key).expect("设备 id");
+                conn.execute(
+                    "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![dk, id, n],
                 )
                 .unwrap();
             };
@@ -1339,7 +1359,7 @@ mod tests {
             );
             // devB：登记名为空 → 走 VID/PID 回退
             ins_dev("HID#VID_046D&PID_C52B#devB", "", "mouse");
-            // devC（键盘）：devices 表无登记行 → 回退 + kind=unknown
+            // devC（键盘）：只有统计行、登记名为空 → 回退 + kind=unknown
             ins_cnt("HID#VID_046D&PID_C52B#devA", 30);
             ins_cnt("HID#VID_046D&PID_C52B#devD", 10);
             ins_cnt("HID#VID_046D&PID_C52B#devB", 70);
@@ -1404,10 +1424,13 @@ mod tests {
                 rusqlite::params![b, "HID 键盘 · 046D/C52B", "keyboard"],
             )
             .unwrap();
+            let dev_id = |key: &str| -> i64 {
+                crate::db::connection::device_id_of(&conn, key).expect("设备 id")
+            };
             let ins = |key: &str, off: i64, n: i64| {
                 conn.execute(
-                    "INSERT INTO device_counts (date_key, device_key, count) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![dk(&today) - off, key, n],
+                    "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![dk(&today) - off, dev_id(key), n],
                 )
                 .unwrap();
             };
@@ -1422,16 +1445,16 @@ mod tests {
                 ("鼠标左键", 150, 1),
             ] {
                 conn.execute(
-                    "INSERT INTO device_key_counts (date_key, device_key, key_name, count) \
+                    "INSERT INTO device_key_counts (date_key, device_id, key_name, count) \
                      VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![dk(&today) - off, a, key, n],
+                    rusqlite::params![dk(&today) - off, dev_id(a), key, n],
                 )
                 .unwrap();
             }
             conn.execute(
-                "INSERT INTO device_key_counts (date_key, device_key, key_name, count) \
+                "INSERT INTO device_key_counts (date_key, device_id, key_name, count) \
                  VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![dk(&today), b, "空格", 10],
+                rusqlite::params![dk(&today), dev_id(b), "空格", 10],
             )
             .unwrap();
         }
@@ -1515,7 +1538,10 @@ mod tests {
             .unwrap();
             conn.execute(
                 "INSERT INTO device_counts VALUES (?1, ?2, 42)",
-                rusqlite::params![dk, key],
+                rusqlite::params![
+                    dk,
+                    crate::db::connection::device_id_of(&conn, key).expect("设备 id")
+                ],
             )
             .unwrap();
         }

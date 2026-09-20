@@ -159,20 +159,27 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
         return Ok(0);
     }
 
-    // 幂等：仅导入目标库中不存在的 (key_name, timestamp)
-    let mut stmt = src_conn.prepare("SELECT key_name, timestamp FROM key_log")?;
-    let rows: Vec<(String, i64)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+    // 暂存表按需创建：确认源库确实有明细才建，避免在目标库留下空表 + 唯一索引
+    // （运行期不写它，无条件建表会让每个年度库白占 2~4 页）
+    connection::ensure_staging_table(&dst_conn)?;
 
+    // 源库全部明细一次读出（旧库是逐条按键，量级几十万行，读完即关连接）
+    let rows: Vec<(String, i64)> = {
+        let mut stmt = src_conn.prepare("SELECT key_name, timestamp FROM key_log")?;
+        let list = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        list
+    };
+
+    // 幂等：唯一索引 (key_name, timestamp) 去重，重复行直接忽略。
+    // 旧写法是逐行 `INSERT ... WHERE NOT EXISTS(...)`：一次索引查找变两次，
+    // 且两个单列索引无法一次性定位。
     dst_conn.execute("BEGIN IMMEDIATE;", [])?;
     let mut imported: i64 = 0;
     {
-        let mut insert = dst_conn.prepare(
-            "INSERT INTO key_log (key_name, timestamp)
-             SELECT ?1, ?2
-             WHERE NOT EXISTS (SELECT 1 FROM key_log WHERE key_name=?1 AND timestamp=?2)",
-        )?;
+        let mut insert = dst_conn
+            .prepare("INSERT OR IGNORE INTO key_log (key_name, timestamp) VALUES (?1, ?2)")?;
         for (key, ts) in &rows {
             if insert.execute(rusqlite::params![key, ts])? > 0 {
                 imported += 1;

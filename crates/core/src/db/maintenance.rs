@@ -23,6 +23,10 @@ use crate::paths;
 /// 归档、清理、清空必须使用同一份清单：此前只覆盖 daily/hourly/key_counts，
 /// 导致 active_seconds 与 app_usage 永不归档、永不清理 —— 跨年后前台应用
 /// 时长仍留在旧文件里，而 CLI 的 `--reset` 会报告"已清空"却留着这两张表。
+///
+/// 注意 `devices`（设备字典）不在其中：它没有 date_key，不能按日期切分，
+/// 归档/清空时单独处理（见 [`sync_device_dict`] 与 [`reset_all_data`]）；
+/// 两张 device 明细表存的是 `devices.id`，跨库搬迁必须过 id 映射（见 [`move_device_rows`]）。
 const DATA_TABLES: [&str; 7] = [
     "daily_counts",
     "hourly_counts",
@@ -32,6 +36,11 @@ const DATA_TABLES: [&str; 7] = [
     "device_counts",
     "device_key_counts",
 ];
+
+/// 存 `devices.id` 而不是文本路径的设备表（归档时要走 id 映射）。
+fn is_device_id_table(table: &str) -> bool {
+    matches!(table, "device_counts" | "device_key_counts")
+}
 
 /// 检查是否需要年度归档（当前年份库中存在往年数据时）。
 ///
@@ -140,13 +149,21 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
         return false;
     }
 
-    // 1. 确保 target_year 库有表结构
+    // 1. 确保 target_year 与 source_year 库都是最新表结构
+    //    （源库也必须先迁移：附着上来的旧库仍是 device_key 文本形态时，
+    //     下面的 id 映射 SQL 会整段失败）
     let target_path = paths::year_db_path(target_year);
     let source_path = paths::year_db_path(source_year);
     if let Err(e) = connection::open_rw(&target_path)
         .and_then(|conn| connection::ensure_schema(&conn, target_year))
     {
         tracing::error!("年度归档失败：目标库初始化失败: {e}");
+        return false;
+    }
+    if let Err(e) = connection::open_rw(&source_path)
+        .and_then(|conn| connection::ensure_schema(&conn, source_year))
+    {
+        tracing::error!("年度归档失败：源库初始化失败: {e}");
         return false;
     }
 
@@ -163,20 +180,21 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
         conn.execute("BEGIN;", [])?;
         let migrate: anyhow::Result<usize> = (|| {
             let mut moved = 0usize;
+            // 设备字典先同步 + 建 id 映射（明细表跨库搬 id 必须换算）
+            sync_device_dict(&conn, dk_from, dk_to)?;
             for table in DATA_TABLES {
+                if is_device_id_table(table) {
+                    continue; // 单独走 id 映射搬迁
+                }
                 let pk_cols = match table {
                     "daily_counts" | "active_seconds" => "date_key",
                     "hourly_counts" => "date_key, hour",
                     "key_counts" => "date_key, key_name",
                     "app_usage" => "date_key, app_name",
-                    // 设备维度的明细表：date_key + 设备实例路径
-                    "device_counts" => "date_key, device_key",
-                    "device_key_counts" => "date_key, device_key, key_name",
                     _ => unreachable!("DATA_TABLES 新增表时必须补主键列"),
                 };
                 let value_cols = match table {
-                    "daily_counts" | "hourly_counts" | "key_counts" | "device_counts"
-                    | "device_key_counts" => "count",
+                    "daily_counts" | "hourly_counts" | "key_counts" => "count",
                     "active_seconds" | "app_usage" => "seconds",
                     _ => unreachable!("DATA_TABLES 新增表时必须补计数列"),
                 };
@@ -198,6 +216,7 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
                 )?;
                 moved += deleted;
             }
+            moved += move_device_rows(&conn, dk_from, dk_to)?;
             Ok(moved)
         })();
         match migrate {
@@ -228,6 +247,80 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
             false
         }
     }
+}
+
+/// 归档前把源库的设备字典同步进目标库，并建立「源 id → 目标 id」映射。
+///
+/// 两个库的自增 id 各不相干，明细行不能照搬 `device_id`。
+/// 源库里只有统计行、没有登记行的历史数据（归档发生在设备登记表落地之前）
+/// 先补一条占位登记，否则映射 JOIN 会静默丢掉这些行。
+/// 调用方需保证已 ATTACH 源库为 `source` 且处于同一事务中。
+fn sync_device_dict(conn: &Connection, dk_from: i64, dk_to: i64) -> anyhow::Result<()> {
+    // 1. 补齐源库的孤儿登记（占位名 device-id:<n>：路径已经丢了，救不回设备名，
+    //    但计数必须保住）
+    for table in ["device_counts", "device_key_counts"] {
+        conn.execute(
+            &format!(
+                "INSERT OR IGNORE INTO source.devices (device_key, name, kind)
+                 SELECT 'device-id:' || c.device_id, 'device-id:' || c.device_id, 'unknown'
+                   FROM source.{table} c
+                  WHERE c.date_key >= ?1 AND c.date_key < ?2
+                    AND NOT EXISTS (SELECT 1 FROM source.devices d WHERE d.id = c.device_id)"
+            ),
+            rusqlite::params![dk_from, dk_to],
+        )?;
+    }
+    // 2. 登记整表搬（元数据没有 date_key，不能按日期切；已存在的行保留目标库的名字）
+    conn.execute(
+        "INSERT OR IGNORE INTO devices (device_key, name, kind)
+         SELECT device_key, name, kind FROM source.devices",
+        [],
+    )?;
+    // 3. id 映射（临时表，事务结束即失效）
+    conn.execute("DROP TABLE IF EXISTS temp._dev_id_map", [])?;
+    conn.execute(
+        "CREATE TEMP TABLE _dev_id_map (src_id INTEGER PRIMARY KEY, dst_id INTEGER NOT NULL)",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO _dev_id_map (src_id, dst_id)
+         SELECT s.id, t.id FROM source.devices s
+           JOIN devices t ON t.device_key = s.device_key",
+        [],
+    )?;
+    Ok(())
+}
+
+/// 搬迁两张设备明细表（`device_id` 经 `_dev_id_map` 换算），返回搬迁行数。
+fn move_device_rows(conn: &Connection, dk_from: i64, dk_to: i64) -> anyhow::Result<usize> {
+    let mut moved = 0usize;
+    for (table, pk_cols) in [
+        ("device_counts", "date_key, device_id"),
+        ("device_key_counts", "date_key, device_id, key_name"),
+    ] {
+        let key_expr = if table == "device_counts" {
+            ""
+        } else {
+            ", c.key_name"
+        };
+        conn.execute(
+            &format!(
+                "INSERT INTO {table} ({pk_cols}, count) \
+                 SELECT c.date_key, m.dst_id{key_expr}, c.count FROM source.{table} c \
+                   JOIN _dev_id_map m ON m.src_id = c.device_id \
+                  WHERE c.date_key >= ?1 AND c.date_key < ?2 \
+                 ON CONFLICT({pk_cols}) DO UPDATE SET count = \
+                    {table}.count + excluded.count"
+            ),
+            rusqlite::params![dk_from, dk_to],
+        )?;
+        moved += conn.execute(
+            &format!("DELETE FROM source.{table} WHERE date_key >= ?1 AND date_key < ?2"),
+            rusqlite::params![dk_from, dk_to],
+        )?;
+    }
+    conn.execute("DROP TABLE IF EXISTS temp._dev_id_map", [])?;
+    Ok(moved)
 }
 
 /// 将 `source_year` 库中属于 `target_year` 的数据迁移到 `target_year` 库。
@@ -279,6 +372,9 @@ fn migrate_v2_file(path: &Path, year: i32) -> i64 {
             .query_row("SELECT COUNT(*) FROM key_log", [], |r| r.get(0))
             .unwrap_or(0);
         if row_count == 0 {
+            // 旧版 `ensure_schema` 无条件建的暂存表：空表直接丢弃，
+            // 回收表 + 两个单列索引共 3 页（实测占库体积 9%）
+            drop_staging_table(&conn);
             return Ok(0);
         }
 
@@ -331,6 +427,8 @@ fn migrate_v2_file(path: &Path, year: i32) -> i64 {
             [],
         )?;
         conn.execute("COMMIT;", [])?;
+        // 聚合完成后暂存表就没用了：连表一起丢掉（回收表 + 两个索引共 3 页）
+        drop_staging_table(&conn);
         Ok(row_count)
     })();
 
@@ -343,6 +441,17 @@ fn migrate_v2_file(path: &Path, year: i32) -> i64 {
         Err(e) => tracing::warn!("聚合迁移失败（{year} 年）: {e}"),
     }
     result.unwrap_or(0)
+}
+
+/// 丢弃运行期不再使用的 `key_log` 暂存表。
+///
+/// 它只在「导入旧版库」时按需创建（`connection::ensure_staging_table`）；
+/// 旧版本无条件建表会让每个年度库白占 3 页（表 + 两个单列索引）。
+/// 注意：旧表带的 AUTOINCREMENT 会留下 1 页 `sqlite_sequence` 空壳，**删不掉** ——
+/// SQLite 直接拒绝 `DROP TABLE sqlite_sequence`（实测 "table sqlite_sequence
+/// may not be dropped"），VACUUM 也不回收，所以这部分体积认了。
+fn drop_staging_table(conn: &Connection) {
+    let _ = conn.execute("DROP TABLE IF EXISTS key_log", []);
 }
 
 /// `Ctrl+X` -> 物理键名映射。
@@ -386,12 +495,26 @@ pub fn cleanup_old_data(keep_days: i64) -> i64 {
                 .unwrap_or(0);
             total += n as i64;
         }
+        // 设备字典按「还有没有引用」清理（它没有 date_key，不能按日期删）
+        prune_orphan_devices(&conn);
         tracing::info!("已清理 {year} 年 {cutoff_dk} 前的数据");
     }
     if total > 0 {
         tracing::info!("共清理 {total} 行聚合数据");
     }
     total
+}
+
+/// 清掉已经没有任何统计行引用的设备登记（`devices` 没有 date_key，不能按日期删）。
+///
+/// 别名存在 `device_aliases.json`，不受影响；设备再出现时会按同一路径重新登记。
+fn prune_orphan_devices(conn: &Connection) -> usize {
+    conn.execute(
+        "DELETE FROM devices WHERE id NOT IN (SELECT device_id FROM device_counts) \
+                                   AND id NOT IN (SELECT device_id FROM device_key_counts)",
+        [],
+    )
+    .unwrap_or(0)
 }
 
 /// VACUUM 指定数据库。
@@ -1035,6 +1158,9 @@ pub fn reset_all_data() -> i64 {
                 .unwrap_or(0);
             total += n as i64;
         }
+        // 设备字典也在「统计数据」范围内：统计行清空后留着旧登记名会让
+        // 「已清空全部统计数据」名不副实（别名在 json 里，不受影响）
+        total += conn.execute("DELETE FROM devices", []).unwrap_or(0) as i64;
     }
     queries::invalidate_years_cache();
     tracing::info!("已清空全部统计数据（键鼠/活跃时长/前台应用）{total} 行");
@@ -1370,6 +1496,122 @@ mod tests {
             snap_count, 77,
             "快照必须是归档前的状态（能查到尚未迁走的 77 次）"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 设备维度跨库归档：整数 id 必须过映射表换算，设备登记也要跟着搬。
+    ///
+    /// 两个年度库的自增 id 各不相干，若照搬 device_id，明细会挂到目标库里
+    /// 编号相同的另一台设备上（查询显示错名字）；而 devices 不搬则老年度
+    /// 只能显示 VID/PID 回退名。
+    #[test]
+    fn archive_remaps_device_ids_and_carries_registry() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_archive_dev_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let dev = "HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000";
+        let other = "HID#VID_1B1C&PID_1B2D#other";
+        let dk = |y: i32, m: u32, d: u32| {
+            queries::day_key_of_date(NaiveDate::from_ymd_opt(y, m, d).expect("date"))
+        };
+        let (stale, fresh) = (dk(2024, 6, 1), dk(2025, 3, 1));
+
+        // 目标年库先放一台「别的」设备，占掉 id=1，逼出源/目标 id 不一致
+        {
+            let conn = connection::open_rw(&paths::year_db_path(2024)).unwrap();
+            connection::ensure_schema(&conn, 2024).unwrap();
+            conn.execute(
+                "INSERT INTO devices (device_key, name, kind) VALUES (?1, 'HID 鼠标 · 1B1C/1B2D', 'mouse')",
+                [other],
+            )
+            .unwrap();
+        }
+        // 源库（2025）里混入 2024 年的设备数据
+        {
+            let conn = connection::open_rw(&paths::year_db_path(2025)).unwrap();
+            connection::ensure_schema(&conn, 2025).unwrap();
+            conn.execute(
+                "INSERT INTO devices (device_key, name, kind) VALUES (?1, 'HID 键盘 · 046D/C52B', 'keyboard')",
+                [dev],
+            )
+            .unwrap();
+            let sid = connection::device_id_of(&conn, dev).expect("源 id");
+            assert_eq!(sid, 1, "源库自己编号");
+            conn.execute(
+                "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, 9)",
+                rusqlite::params![stale, sid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO device_key_counts (date_key, device_id, key_name, count) VALUES (?1, ?2, '空格', 9)",
+                rusqlite::params![stale, sid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, 4)",
+                rusqlite::params![fresh, sid],
+            )
+            .unwrap();
+        }
+
+        assert!(
+            archive_year_range(2024, 2025, dk(2024, 1, 1), dk(2025, 1, 1)),
+            "应把 2024 年数据迁到 2024 年库"
+        );
+
+        // 目标库：登记搬到了、id 是本库的（=2，不是照搬源库的 1）、名字对得上
+        let dst = connection::open_ro(&paths::year_db_path(2024)).unwrap();
+        let did = connection::device_id_of(&dst, dev).expect("设备登记应随归档搬过去");
+        assert_ne!(did, 1, "id 必须经映射换算，不能照搬源库编号");
+        let n: i64 = dst
+            .query_row(
+                "SELECT count FROM device_counts WHERE date_key=?1 AND device_id=?2",
+                rusqlite::params![stale, did],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 9);
+        let (name, kname): (String, String) = dst
+            .query_row(
+                "SELECT d.name, k.key_name FROM device_key_counts k \
+                   JOIN devices d ON d.id = k.device_id WHERE k.date_key=?1",
+                [stale],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (name.as_str(), kname.as_str()),
+            ("HID 键盘 · 046D/C52B", "空格"),
+            "明细必须挂在对的设备上"
+        );
+        drop(dst);
+
+        // 源库只少了往年那一行
+        let src = connection::open_ro(&paths::year_db_path(2025)).unwrap();
+        let sid = connection::device_id_of(&src, dev).expect("源登记仍在");
+        let left: i64 = src
+            .query_row(
+                "SELECT SUM(count) FROM device_counts WHERE device_id=?1",
+                [sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 4, "2025 年自己的数据不得迁走");
+        drop(src);
+
+        // 端到端：按 2024 年查设备排行，名字与次数都要对
+        let (total, stats) = queries::get_device_stats(None, Some(2024));
+        assert_eq!(total, 9);
+        let hit = stats
+            .iter()
+            .find(|s| s.key == dev)
+            .expect("2024 年应能查到该设备");
+        assert_eq!(hit.name, "HID 键盘 · 046D/C52B");
+        assert_eq!(hit.count, 9);
 
         std::fs::remove_dir_all(&dir).ok();
     }

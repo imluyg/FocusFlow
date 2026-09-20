@@ -69,7 +69,8 @@ mod tests {
             .contains(&"focusflow_accounting.db".to_string()));
         assert!(summary.errors.is_empty(), "errors: {:?}", summary.errors);
 
-        // 验证目标库：聚合表有数据，暂存表已清空
+        // 验证目标库：聚合表有数据，暂存表已丢弃
+        // （key_log 只在导入时按需创建，聚合完成后连表一起丢掉，不再常年占 4 页）
         let new_db = paths::year_db_path(2025);
         assert!(new_db.exists());
         let conn = rusqlite::Connection::open(&new_db).unwrap();
@@ -82,9 +83,13 @@ mod tests {
             .unwrap();
         assert_eq!(cnt, 3);
         let staged: i64 = conn
-            .query_row("SELECT COUNT(*) FROM key_log", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='key_log'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(staged, 0, "导入后暂存表应已清空");
+        assert_eq!(staged, 0, "聚合完成后应丢弃暂存表 key_log");
 
         // 二次导入应幂等（去重，不再增加）
         let summary2 = migration::import_legacy_data(&old_dir);

@@ -2,7 +2,8 @@
 //!
 //! 按键事件不再逐条落库，而是在内存中按 (天, 小时) / (天, 按键) 聚合，
 //! 每 10 秒（或 flush 信号）把增量 UPSERT 到聚合表。相比逐事件写入：
-//! - 数据库体积约为原来的 1/170（一年约 1MB 而非 180MB）
+//! - 数据库体积约为原来的 1/170（主统计聚合表一年约 1MB 而非 180MB；
+//!   设备维度表另计：那里每行是「天 × 设备 × 键名」，路径已字典化成整数 id）
 //! - 写入频率固定，不受按键速度影响
 //! - flush 信号：立即落库 + 等待完成（退出/备份用）
 
@@ -67,6 +68,7 @@ struct AggDeltas {
     apps: HashMap<(i64, String), i64>,
     /// ((date_key, 设备实例路径)) -> 当日累计输入次数（设备维度统计）。
     /// 独立口径（键盘按下 + 鼠标按键按下 + 滚轮），不进 daily/hourly/keys。
+    /// 内存里按路径聚合（热路径只做字符串查表），落库时才换成 devices.id。
     devices: HashMap<(i64, String), i64>,
     /// ((date_key, 设备实例路径, 键名)) -> 当日累计次数（设备 × 键名明细）。
     /// 用于「设备详情」里的键名排行；同为独立口径，不参与主统计的 key_counts。
@@ -752,6 +754,22 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
     }
 }
 
+/// 取设备在本库的整数 id：登记行不存在时按路径补登一行（name 退化为路径、kind 记 unknown）。
+///
+/// 统计表字典化后只存 id，漏登记会让查询侧 JOIN 静默丢行、凭空少掉设备数据，
+/// 所以这里宁可补一条难看的占位登记，也不放弃计数。
+fn device_id_in_db(
+    upsert: &mut rusqlite::Statement<'_>,
+    dev: &str,
+    meta: Option<&DeviceMeta>,
+) -> rusqlite::Result<i64> {
+    let (name, kind) = match meta {
+        Some(m) => (m.name.as_str(), m.kind.as_str()),
+        None => (dev, "unknown"),
+    };
+    upsert.query_row(rusqlite::params![dev, name, kind], |r| r.get(0))
+}
+
 /// 单个年份库的落库：单事务 UPSERT + 最多 3 次重试。失败时返回错误（调用方回填）。
 fn flush_partition(
     conn: &mut Option<Connection>,
@@ -769,6 +787,41 @@ fn flush_partition(
             let c = conn.as_mut().ok_or_else(|| anyhow::anyhow!("无可用连接"))?;
             c.execute("BEGIN IMMEDIATE;", [])?;
             let apply = || -> anyhow::Result<()> {
+                // 设备字典：先落登记并取回本库的整数 id（统计表只存 id）。
+                // id 是库内自增、各年度库互不相干，所以每次落库都要按 device_key 取一次。
+                let mut dev_ids: HashMap<&str, i64> = HashMap::new();
+                {
+                    let mut upsert = c.prepare(
+                        "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(device_key) DO UPDATE SET name = excluded.name, kind = excluded.kind
+                         RETURNING id",
+                    )?;
+                    for dev in pending.device_meta.keys() {
+                        let meta = pending.device_meta.get(dev);
+                        let id = device_id_in_db(&mut upsert, dev, meta)?;
+                        dev_ids.insert(dev.as_str(), id);
+                    }
+                    // 统计行出现、登记缺失的设备（历史库/恢复文件）兜底补登，
+                    // 否则写入侧拿不到 id、查询侧 JOIN 也会丢行。
+                    for dev in pending
+                        .devices
+                        .keys()
+                        .map(|(_, d)| d)
+                        .chain(pending.device_keys.keys().map(|(_, d, _)| d))
+                    {
+                        if dev_ids.contains_key(dev.as_str()) {
+                            continue;
+                        }
+                        let id = device_id_in_db(&mut upsert, dev, pending.device_meta.get(dev))?;
+                        dev_ids.insert(dev.as_str(), id);
+                    }
+                }
+                let id_of = |dev: &String| -> anyhow::Result<i64> {
+                    dev_ids
+                        .get(dev.as_str())
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("设备 id 解析失败: {dev}"))
+                };
                 {
                     let mut stmt = c.prepare(
                         "INSERT INTO daily_counts (date_key, count) VALUES (?1, ?2)
@@ -818,30 +871,20 @@ fn flush_partition(
                 }
                 {
                     let mut stmt = c.prepare(
-                        "INSERT INTO device_counts (date_key, device_key, count) VALUES (?1, ?2, ?3)
-                         ON CONFLICT(date_key, device_key) DO UPDATE SET count = count + excluded.count",
+                        "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(date_key, device_id) DO UPDATE SET count = count + excluded.count",
                     )?;
                     for ((dk, dev), n) in &pending.devices {
-                        stmt.execute(rusqlite::params![dk, dev, n])?;
+                        stmt.execute(rusqlite::params![dk, id_of(dev)?, n])?;
                     }
                 }
-                // 设备登记表：幂等覆盖（名称/类型变更时更新，其余情况写入相同值）
                 {
                     let mut stmt = c.prepare(
-                        "INSERT INTO device_key_counts (date_key, device_key, key_name, count) VALUES (?1, ?2, ?3, ?4)
-                         ON CONFLICT(date_key, device_key, key_name) DO UPDATE SET count = count + excluded.count",
+                        "INSERT INTO device_key_counts (date_key, device_id, key_name, count) VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(date_key, device_id, key_name) DO UPDATE SET count = count + excluded.count",
                     )?;
                     for ((dk, dev, key), n) in &pending.device_keys {
-                        stmt.execute(rusqlite::params![dk, dev, key, n])?;
-                    }
-                }
-                {
-                    let mut stmt = c.prepare(
-                        "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)
-                         ON CONFLICT(device_key) DO UPDATE SET name = excluded.name, kind = excluded.kind",
-                    )?;
-                    for (dev, meta) in &pending.device_meta {
-                        stmt.execute(rusqlite::params![dev, meta.name, meta.kind])?;
+                        stmt.execute(rusqlite::params![dk, id_of(dev)?, key, n])?;
                     }
                 }
                 Ok(())
@@ -1110,8 +1153,9 @@ mod tests {
         let conn = crate::db::connection::open_ro(&paths::year_db_path(year)).unwrap();
         let read = |key: &str| -> i64 {
             conn.query_row(
-                "SELECT count FROM device_key_counts \
-                 WHERE date_key = ?1 AND device_key = ?2 AND key_name = ?3",
+                "SELECT k.count FROM device_key_counts k \
+                   JOIN devices d ON d.id = k.device_id \
+                 WHERE k.date_key = ?1 AND d.device_key = ?2 AND k.key_name = ?3",
                 rusqlite::params![dk, dev, key],
                 |r| r.get(0),
             )
@@ -1210,21 +1254,32 @@ mod tests {
         let conn = connection::open_ro(&paths::current_year_db_path()).unwrap();
         let count: i64 = conn
             .query_row(
-                "SELECT count FROM device_counts WHERE date_key = ?1 AND device_key = ?2",
+                "SELECT c.count FROM device_counts c JOIN devices d ON d.id = c.device_id \
+                 WHERE c.date_key = ?1 AND d.device_key = ?2",
                 rusqlite::params![dk, dev],
                 |r| r.get(0),
             )
             .unwrap();
         assert_eq!(count, 2);
-        let (name, kind): (String, String) = conn
+        let (id, name, kind): (i64, String, String) = conn
             .query_row(
-                "SELECT name, kind FROM devices WHERE device_key = ?1",
+                "SELECT id, name, kind FROM devices WHERE device_key = ?1",
                 [&dev],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         assert_eq!(name, "测试鼠标 · 1234/5678");
         assert_eq!(kind, "mouse");
+        // 字典化：统计表存 id，且只登记一行（两次事件不重复登记）
+        assert!(id > 0, "devices 必须有整数 id");
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM devices WHERE device_key = ?1",
+                [&dev],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
         w.stop();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1252,7 +1307,9 @@ mod tests {
                 .ok()
                 .and_then(|conn| {
                     conn.query_row(
-                        "SELECT COALESCE(SUM(count),0) FROM device_counts WHERE date_key=?1 AND device_key=?2",
+                        "SELECT COALESCE(SUM(c.count),0) FROM device_counts c \
+                           JOIN devices d ON d.id = c.device_id \
+                         WHERE c.date_key=?1 AND d.device_key=?2",
                         rusqlite::params![dk, dev],
                         |r| r.get(0),
                     )
