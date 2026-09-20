@@ -98,16 +98,24 @@ pub fn register_host_api(
     host.set("app_info", info_fn)?;
 
     // ---- 番茄钟 API ----
-    // 共享番茄钟实例（进程级单例）
+    // 共享番茄钟实例（进程级单例），**惰性初始化**：
+    // 只有插件真正调用番茄钟 API 时才建库。早前这里是「注册即 init_db」，
+    // 于是启用任意插件（哪怕与番茄钟无关）都会把 focusflow_pomodoro.db 建出来，
+    // 番茄钟插件的停用开关形同虚设。
     static POMODORO: std::sync::OnceLock<Arc<PomodoroTimer>> = std::sync::OnceLock::new();
-    let pomo = Arc::clone(POMODORO.get_or_init(|| {
-        let _ = pomodoro::init_db();
-        PomodoroTimer::new()
-    }));
+    fn pomodoro_timer() -> Arc<PomodoroTimer> {
+        Arc::clone(POMODORO.get_or_init(|| {
+            let _ = pomodoro::init_db();
+            PomodoroTimer::new()
+        }))
+    }
+    /// 只读历史/汇总：不必持有计时器实例，但要保证库已建好。
+    fn ensure_pomodoro_db() {
+        let _ = pomodoro_timer();
+    }
 
-    let pomo_state = Arc::clone(&pomo);
-    let pomo_state_fn = lua.create_function(move |lua, ()| {
-        let info = pomo_state.get_state_info();
+    let pomo_state_fn = lua.create_function(|lua, ()| {
+        let info = pomodoro_timer().get_state_info();
         let t = lua.create_table()?;
         for (k, v) in &info {
             t.set(k.as_str(), *v)?;
@@ -116,59 +124,54 @@ pub fn register_host_api(
     })?;
     host.set("pomodoro_state", pomo_state_fn)?;
 
-    let pomo_start_work = Arc::clone(&pomo);
     host.set(
         "pomodoro_start_work",
-        lua.create_function(move |_, ()| {
-            pomo_start_work.start_work();
+        lua.create_function(|_, ()| {
+            pomodoro_timer().start_work();
             Ok(())
         })?,
     )?;
 
-    let pomo_start_break = Arc::clone(&pomo);
     host.set(
         "pomodoro_start_break",
-        lua.create_function(move |_, ()| {
-            pomo_start_break.start_break();
+        lua.create_function(|_, ()| {
+            pomodoro_timer().start_break();
             Ok(())
         })?,
     )?;
 
-    let pomo_toggle = Arc::clone(&pomo);
     host.set(
         "pomodoro_toggle_pause",
-        lua.create_function(move |_, ()| Ok(pomo_toggle.toggle_pause()))?,
+        lua.create_function(|_, ()| Ok(pomodoro_timer().toggle_pause()))?,
     )?;
 
-    let pomo_stop = Arc::clone(&pomo);
     host.set(
         "pomodoro_stop",
-        lua.create_function(move |_, ()| {
-            pomo_stop.stop();
+        lua.create_function(|_, ()| {
+            pomodoro_timer().stop();
             Ok(())
         })?,
     )?;
 
-    let pomo_skip = Arc::clone(&pomo);
     host.set(
         "pomodoro_skip",
-        lua.create_function(move |_, ()| {
-            pomo_skip.skip();
+        lua.create_function(|_, ()| {
+            pomodoro_timer().skip();
             Ok(())
         })?,
     )?;
 
-    let pomo_durations = Arc::clone(&pomo);
     host.set(
         "pomodoro_set_durations",
-        lua.create_function(move |_, (work, brk): (i64, i64)| {
-            pomo_durations.set_durations(work, brk);
+        lua.create_function(|_, (work, brk): (i64, i64)| {
+            pomodoro_timer().set_durations(work, brk);
             Ok(())
         })?,
     )?;
 
     // 番茄钟历史
     let sessions_fn = lua.create_function(|lua, limit: i64| {
+        ensure_pomodoro_db();
         let sessions = pomodoro::get_recent_sessions(limit.clamp(1, 100));
         let t = lua.create_table()?;
         for (i, s) in sessions.iter().enumerate() {
@@ -186,27 +189,36 @@ pub fn register_host_api(
     host.set("pomodoro_sessions", sessions_fn)?;
 
     let summary_fn = lua.create_function(|_, ()| {
+        ensure_pomodoro_db();
         let (count, keys, secs) = pomodoro::today_summary();
         Ok((count, keys, secs))
     })?;
     host.set("pomodoro_summary", summary_fn)?;
 
     // 番茄钟按键联动（监听器回调调用）
-    let pomo_record = Arc::clone(&pomo);
     host.set(
         "pomodoro_record_key",
-        lua.create_function(move |_, key: String| {
-            pomo_record.record_key(&key);
+        lua.create_function(|_, key: String| {
+            pomodoro_timer().record_key(&key);
             Ok(())
         })?,
     )?;
 
     // ---- 定时任务 API ----
-    // 启动调度器（进程级单例）
+    // 调度器（进程级单例），**惰性初始化**：
+    // `Scheduler::start` 会 spawn 一个常驻线程并建库，早前在注册时就执行，
+    // 于是日程插件被禁用时线程照跑、focusflow_scheduler.db 照样生成。
+    // 现在改成首次调用任一日程 API 时才启动。
+    //
+    // 注意连「列出任务」也要先启动：程序重启后 UI 往往只是渲染任务列表，
+    // 若读任务不启动调度器，恢复上来的定时任务就永远不会被执行。
     static SCHEDULER: std::sync::OnceLock<Arc<scheduler::Scheduler>> = std::sync::OnceLock::new();
-    let _sched = SCHEDULER.get_or_init(scheduler::Scheduler::start);
+    fn ensure_scheduler() {
+        let _ = SCHEDULER.get_or_init(scheduler::Scheduler::start);
+    }
 
     let tasks_fn = lua.create_function(|lua, ()| {
+        ensure_scheduler();
         let tasks = scheduler::get_all_tasks();
         let t = lua.create_table()?;
         for (i, task) in tasks.iter().enumerate() {
@@ -239,6 +251,7 @@ pub fn register_host_api(
             String,
             bool,
         )| {
+            ensure_scheduler();
             Ok(scheduler::add_task(
                 &name, &target, &args, &stype, &stime, enabled,
             ))
@@ -257,6 +270,7 @@ pub fn register_host_api(
             String,
             bool,
         )| {
+            ensure_scheduler();
             let r = scheduler::update_task(
                 id,
                 Some(&name),
@@ -271,15 +285,20 @@ pub fn register_host_api(
     )?;
     host.set("scheduler_update", update_fn)?;
 
-    let delete_fn = lua.create_function(|_, id: i64| Ok(scheduler::delete_task(id)))?;
+    let delete_fn = lua.create_function(|_, id: i64| {
+        ensure_scheduler();
+        Ok(scheduler::delete_task(id))
+    })?;
     host.set("scheduler_delete", delete_fn)?;
 
     let toggle_fn = lua.create_function(|_, (id, enabled): (i64, bool)| {
+        ensure_scheduler();
         scheduler::toggle_task(id, enabled);
         Ok(())
     })?;
     host.set("scheduler_toggle", toggle_fn)?;
 
+    // 纯格式校验：不需要库、也不需要调度线程，保持惰性
     let validate_fn = lua.create_function(|_, (stype, stime): (String, String)| {
         let (ok, msg) = scheduler::validate_schedule(&stype, &stime);
         Ok((ok, msg))
@@ -287,7 +306,13 @@ pub fn register_host_api(
     host.set("scheduler_validate", validate_fn)?;
 
     // ---- 记账本 API ----
-    let _ = accounting::init_db();
+    // 与番茄钟/日程同理：记账库也改成惰性建库，禁用记账插件时不再碰它的文件。
+    static ACCOUNTING_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    fn ensure_accounting_db() {
+        ACCOUNTING_INIT.get_or_init(|| {
+            let _ = accounting::init_db();
+        });
+    }
 
     let acc_add = lua.create_function(
         |_,
@@ -301,6 +326,7 @@ pub fn register_host_api(
             String,
             String,
         )| {
+            ensure_accounting_db();
             Ok(accounting::add_expense(
                 &rtype,
                 &item,
@@ -343,6 +369,7 @@ pub fn register_host_api(
             String,
             String,
         )| {
+            ensure_accounting_db();
             let (records, total) = accounting::get_expenses_page(
                 page,
                 page_size,
@@ -393,6 +420,7 @@ pub fn register_host_api(
 
     // 分类列表（名字数组）
     let acc_cats = lua.create_function(|lua, ()| {
+        ensure_accounting_db();
         let cats = accounting::get_all_categories();
         let t = lua.create_table()?;
         for (i, c) in cats.iter().enumerate() {
@@ -404,6 +432,7 @@ pub fn register_host_api(
 
     // 分类管理：添加分类（返回 id，失败 -1）
     let acc_cat_add = lua.create_function(|_, (name, ctype): (String, String)| {
+        ensure_accounting_db();
         Ok(accounting::add_category(&name, &ctype, &[]))
     })?;
     host.set("accounting_category_add", acc_cat_add)?;
@@ -411,6 +440,7 @@ pub fn register_host_api(
     // 重命名分类（同步历史记录）：(ok, msg)；第三个参数修改类型，空串表示保持原类型
     let acc_cat_rename =
         lua.create_function(|_, (old_name, new_name, ctype): (String, String, String)| {
+            ensure_accounting_db();
             let ctype = if ctype.is_empty() {
                 None
             } else {
@@ -421,8 +451,10 @@ pub fn register_host_api(
     host.set("accounting_category_rename", acc_cat_rename)?;
 
     // 删除分类：(ok, msg)
-    let acc_cat_del =
-        lua.create_function(|_, name: String| Ok(accounting::delete_category(&name)))?;
+    let acc_cat_del = lua.create_function(|_, name: String| {
+        ensure_accounting_db();
+        Ok(accounting::delete_category(&name))
+    })?;
     host.set("accounting_category_delete", acc_cat_del)?;
 
     // 查询分类类型（expense/income/both），无则空串。
@@ -438,6 +470,7 @@ pub fn register_host_api(
 
     // 添加子分类：(ok, msg)
     let acc_sub_add = lua.create_function(|_, (cat, sub): (String, String)| {
+        ensure_accounting_db();
         Ok(accounting::add_subcategory(&cat, &sub))
     })?;
     host.set("accounting_subcategory_add", acc_sub_add)?;
@@ -445,18 +478,21 @@ pub fn register_host_api(
     // 重命名子分类：(ok, msg)
     let acc_sub_rename =
         lua.create_function(|_, (cat, old_sub, new_sub): (String, String, String)| {
+            ensure_accounting_db();
             Ok(accounting::update_subcategory(&cat, &old_sub, &new_sub))
         })?;
     host.set("accounting_subcategory_rename", acc_sub_rename)?;
 
     // 删除子分类：(ok, msg)
     let acc_sub_del = lua.create_function(|_, (cat, sub): (String, String)| {
+        ensure_accounting_db();
         Ok(accounting::delete_subcategory(&cat, &sub))
     })?;
     host.set("accounting_subcategory_delete", acc_sub_del)?;
 
     // 子分类列表
     let acc_subs = lua.create_function(|lua, cat: String| {
+        ensure_accounting_db();
         let subs = accounting::get_subcategories(&cat);
         let t = lua.create_table()?;
         for (i, s) in subs.iter().enumerate() {
@@ -468,6 +504,7 @@ pub fn register_host_api(
 
     // 按 id 查询
     let acc_get = lua.create_function(|lua, id: i64| {
+        ensure_accounting_db();
         let Some(e) = accounting::get_expense_by_id(id) else {
             return Ok(mlua::Value::Nil);
         };
@@ -499,6 +536,7 @@ pub fn register_host_api(
             String,
             String,
         )| {
+            ensure_accounting_db();
             let e = accounting::Expense {
                 id,
                 rtype,
@@ -519,6 +557,7 @@ pub fn register_host_api(
 
     // 月度汇总（含分类明细）：返回 (支出, 收入, 条数, [{category, net}])
     let acc_monthly = lua.create_function(|lua, ym: String| {
+        ensure_accounting_db();
         let (expense, income, count, cat_stats) = accounting::monthly_summary_detail(&ym);
         let t = lua.create_table()?;
         for (i, (cat, net)) in cat_stats.iter().enumerate() {
@@ -533,6 +572,7 @@ pub fn register_host_api(
 
     // 分类盈亏：返回 [{category, invested, earned, count}]
     let acc_cat_profit = lua.create_function(|lua, ()| {
+        ensure_accounting_db();
         let data = accounting::category_profit_loss();
         let t = lua.create_table()?;
         for (i, (cat, inv, earn, cnt)) in data.iter().enumerate() {
@@ -549,6 +589,7 @@ pub fn register_host_api(
 
     // 细分盈亏：返回 [{subcategory, invested, earned, count}]
     let acc_sub_profit = lua.create_function(|lua, cat: String| {
+        ensure_accounting_db();
         let data = accounting::subcategory_profit_loss(&cat);
         let t = lua.create_table()?;
         for (i, (sub, inv, earn, cnt)) in data.iter().enumerate() {
@@ -565,6 +606,7 @@ pub fn register_host_api(
 
     // 距今多久：入参 id 数组，返回 [{id, years, days}]
     let acc_days_ago = lua.create_function(|lua, ids: Vec<i64>| {
+        ensure_accounting_db();
         let data = accounting::days_ago(&ids);
         let t = lua.create_table()?;
         for (i, (id, years, days)) in data.iter().enumerate() {
@@ -579,6 +621,7 @@ pub fn register_host_api(
     host.set("accounting_days_ago", acc_days_ago)?;
 
     let acc_list = lua.create_function(|lua, limit: i64| {
+        ensure_accounting_db();
         // 上限放宽到 10000：记账本分页/查询需要全量记录（Lua 侧过滤 + 分页）
         let expenses = accounting::get_all_expenses(limit.clamp(1, 10000));
         let t = lua.create_table()?;
@@ -597,10 +640,14 @@ pub fn register_host_api(
     })?;
     host.set("accounting_list", acc_list)?;
 
-    let acc_delete = lua.create_function(|_, id: i64| Ok(accounting::delete_expense(id)))?;
+    let acc_delete = lua.create_function(|_, id: i64| {
+        ensure_accounting_db();
+        Ok(accounting::delete_expense(id))
+    })?;
     host.set("accounting_delete", acc_delete)?;
 
     let acc_summary = lua.create_function(|_, ym: String| {
+        ensure_accounting_db();
         let (expense, income) = accounting::monthly_summary(&ym);
         Ok((expense, income))
     })?;
@@ -649,4 +696,58 @@ pub fn register_host_api(
     // 注册为全局 `focusflow`
     lua.globals().set("focusflow", host.clone())?;
     Ok(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 注册宿主 API 必须**无副作用**：三个附属库都要等到首次调用才建。
+    ///
+    /// 早前 register_host_api 在注册时就跑 `init_db`（日程还会 spawn 常驻线程），
+    /// 于是只要启用任意一个插件，番茄钟/日程/记账的库就全被建出来 ——
+    /// 表现是：插件明明停用了，数据目录里却躺着它的空库。
+    #[test]
+    fn registering_host_api_creates_no_aux_databases() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_host_lazy_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let lua = Lua::new();
+        let database = db::Database::init_readonly();
+        register_host_api(&lua, crate::config::instance(), database).expect("注册宿主 API");
+
+        for (name, path) in [
+            ("pomodoro", crate::pomodoro::db_path()),
+            ("scheduler", crate::scheduler::db_path()),
+            ("accounting", crate::accounting::db_path()),
+        ] {
+            assert!(
+                !path.exists(),
+                "注册 API 不应创建 {name} 库: {}",
+                path.display()
+            );
+        }
+
+        // 调用番茄钟 API 之后，只应有番茄钟库被建出来
+        lua.load("return focusflow.pomodoro_state()")
+            .eval::<mlua::Table>()
+            .expect("调用番茄钟 API");
+        assert!(
+            crate::pomodoro::db_path().exists(),
+            "调用番茄钟 API 后应建库"
+        );
+        assert!(
+            !crate::scheduler::db_path().exists(),
+            "日程库必须等日程 API 被调用才建"
+        );
+        assert!(
+            !crate::accounting::db_path().exists(),
+            "记账库必须等记账 API 被调用才建"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
