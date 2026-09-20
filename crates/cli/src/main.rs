@@ -17,7 +17,7 @@ use chrono::Local;
 use focusflow_core::db;
 use focusflow_core::logger;
 
-use focusflow_core::format::fmt_thousands;
+use focusflow_core::format::{csv_field, fmt_thousands, html_escape};
 
 fn main() -> ExitCode {
     logger::init_logging();
@@ -198,6 +198,13 @@ fn import_legacy(src_dir: &str) -> i32 {
     }
     if !summary.copied_aux.is_empty() {
         println!("  附属数据: {}", summary.copied_aux.join(", "));
+    }
+    // 覆盖前的留档路径：选错导入目录时用户靠它找回原数据
+    if !summary.backed_up_aux.is_empty() {
+        println!("  原数据已留档（覆盖前）：");
+        for kept in &summary.backed_up_aux {
+            println!("    {kept}");
+        }
     }
     if !summary.skipped.is_empty() {
         println!("  跳过: {}", summary.skipped.join(", "));
@@ -473,7 +480,8 @@ fn export_csv(
         } else {
             "0.00".to_string()
         };
-        out.push_str(&format!("{rank},{key},{count},{percent}\n"));
+        // 键名可能来自导入的旧库（含逗号/引号/公式前缀），必须转义，否则 CSV 串列
+        out.push_str(&format!("{rank},{},{count},{percent}\n", csv_field(key)));
     }
     std::fs::File::create(path)
         .and_then(|mut f| {
@@ -506,8 +514,10 @@ fn export_html(
         } else {
             0.0
         };
+        // 键名未转义会污染报告 HTML（`<`/`&` 被当标记解析）
         rows.push_str(&format!(
-            r#"<tr><td class="rank">{rank}</td><td class="key">{key}</td><td class="count">{}</td><td class="percent"><div class="bar-container"><div class="bar" style="width:{bar_width:.1}%"></div><span>{percent}</span></div></td></tr>"#,
+            r#"<tr><td class="rank">{rank}</td><td class="key">{}</td><td class="count">{}</td><td class="percent"><div class="bar-container"><div class="bar" style="width:{bar_width:.1}%"></div><span>{percent}</span></div></td></tr>"#,
+            html_escape(key),
             fmt_thousands(*count)
         ));
     }
@@ -563,4 +573,49 @@ fn reset(_db: &db::Database) -> i32 {
     let total = db::maintenance::reset_all_data();
     println!("所有统计记录已清空 ({} 行)", fmt_thousands(total));
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{export_csv, export_html};
+    use std::collections::HashMap;
+
+    /// 回归：CLI 导出曾直接拼接键名 —— 带逗号的键名会让 CSV 串列、
+    /// 带 `<`/`&` 的键名会污染 HTML 报告。两者必须与 GUI 导出同样转义。
+    #[test]
+    fn cli_exports_escape_key_names() {
+        let mut stats: HashMap<String, i64> = HashMap::new();
+        stats.insert("a,b".to_string(), 5);
+        stats.insert("=cmd()".to_string(), 3);
+        stats.insert("<b>x&y</b>".to_string(), 2);
+
+        let dir = std::env::temp_dir().join(format!("ff_cli_export_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let csv = dir.join("out.csv");
+        let html = dir.join("out.html");
+        let _ = std::fs::remove_file(&csv);
+        let _ = std::fs::remove_file(&html);
+
+        assert!(export_csv(&csv, 10, &stats), "CSV 导出应成功");
+        assert!(export_html(&html, 10, &stats), "HTML 导出应成功");
+
+        let csv_text = std::fs::read_to_string(&csv).expect("读 CSV");
+        assert!(csv_text.contains("\"a,b\""), "逗号字段应加引号: {csv_text}");
+        assert!(
+            csv_text.contains("'=cmd()"),
+            "公式注入应加前导引号: {csv_text}"
+        );
+
+        let html_text = std::fs::read_to_string(&html).expect("读 HTML");
+        assert!(
+            html_text.contains("&lt;b&gt;x&amp;y&lt;/b&gt;"),
+            "HTML 键名应转义，不得出现原始尖括号: {html_text}"
+        );
+        assert!(
+            !html_text.contains("<b>x&y</b>"),
+            "转义后不应残留未转义形式"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

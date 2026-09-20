@@ -7,7 +7,9 @@
 //! 设计：
 //! - 年度键鼠库 `focusflow_YYYY.db`：先写入暂存表 key_log（按 timestamp 去重，幂等），
 //!   再通过聚合迁移落进 daily/hourly/key 三张聚合表并压缩文件
-//! - 附属库（accounting/pomodoro/scheduler/edge_history）：直接复制（表独立）
+//! - 附属库（accounting/pomodoro/scheduler/edge_history）：整体复制覆盖，
+//!   **覆盖前先把现有库改名留档**（见 [`backup_before_overwrite`]）——
+//!   导入目录由用户自己选，选错目录不能让当前数据凭空消失
 //! - 若目标库不存在则整体复制文件（最快路径）
 //! - 输出导入汇总
 
@@ -27,6 +29,8 @@ pub struct ImportSummary {
     pub records_by_year: Vec<(i32, i64)>,
     /// 复制的附属库
     pub copied_aux: Vec<String>,
+    /// 被导入覆盖、已改名留档的附属库（旧文件路径，供 UI 提示用户）
+    pub backed_up_aux: Vec<String>,
     /// 跳过的文件（无数据/已存在）
     pub skipped: Vec<String>,
     /// 错误
@@ -57,13 +61,26 @@ pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
         }
     }
 
-    // 2) 附属库直接复制
+    // 2) 附属库：整体复制（表独立，无法按行合并）
     for aux in AUX_DBS {
         let src = src_dir.join(aux);
         if !src.exists() {
             continue;
         }
         let dst = paths::data_dir().join(aux);
+        // 现有库先留档再覆盖：导入目录是用户手选的，选错目录（或新版本里
+        // 已记了几个月账）时当前数据不能就这么没了。
+        match backup_before_overwrite(&dst) {
+            Ok(Some(kept)) => summary.backed_up_aux.push(kept.display().to_string()),
+            Ok(None) => {}
+            Err(e) => {
+                // 留档失败就不覆盖：宁可这次不导入，也不能拿用户数据冒险
+                summary
+                    .errors
+                    .push(format!("{aux} 覆盖前留档失败，已跳过: {e}"));
+                continue;
+            }
+        }
         match std::fs::copy(&src, &dst) {
             Ok(_) => summary.copied_aux.push(aux.to_string()),
             Err(e) => summary.errors.push(format!("{aux} 复制失败: {e}")),
@@ -71,6 +88,38 @@ pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
     }
 
     summary
+}
+
+/// 覆盖前的留档：把现有文件改名成 `<原名>.import-backup-<时间戳>`。
+///
+/// 用 rename 而不是 copy —— 既省一次全量拷贝，也保证不会出现"复制到一半
+/// 失败、原文件和新文件都不完整"的中间态。返回被留下的路径（原先不存在时为 None）。
+fn backup_before_overwrite(dst: &Path) -> anyhow::Result<Option<std::path::PathBuf>> {
+    if !dst.exists() {
+        return Ok(None);
+    }
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S%3f").to_string();
+    let mut name = dst
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("路径没有文件名: {}", dst.display()))?
+        .to_os_string();
+    name.push(format!(".import-backup-{timestamp}"));
+    let kept = dst.with_file_name(name);
+    std::fs::rename(dst, &kept)?;
+    // 顺带把源库遗留的 sidecar 一起挪走：只留主库会让下次打开看到半套 WAL 状态
+    for suffix in ["-wal", "-shm"] {
+        let from = std::path::PathBuf::from(format!("{}{suffix}", dst.display()));
+        if from.exists() {
+            let to = std::path::PathBuf::from(format!("{}{suffix}", kept.display()));
+            let _ = std::fs::rename(&from, to);
+        }
+    }
+    tracing::info!(
+        "导入前已留档现有库: {} -> {}",
+        dst.display(),
+        kept.display()
+    );
+    Ok(Some(kept))
 }
 
 /// 列出数据目录下的年度库（focusflow_YYYY.db）。

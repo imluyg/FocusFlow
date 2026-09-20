@@ -240,6 +240,10 @@ pub async fn import_legacy(state: State<'_, Arc<AppState>>) -> Result<String, St
     if !summary.copied_aux.is_empty() {
         lines.push(format!("附属数据: {}", summary.copied_aux.join(", ")));
     }
+    // 被覆盖的现有附属库已留档：必须让用户知道去哪儿找回旧数据
+    for kept in &summary.backed_up_aux {
+        lines.push(format!("原数据已留档: {kept}"));
+    }
     for e in &summary.errors {
         lines.push(format!("错误: {e}"));
     }

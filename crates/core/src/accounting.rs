@@ -367,28 +367,48 @@ pub fn update_category(old_name: &str, new_name: &str, ctype: Option<&str>) -> (
     if dup {
         return (false, format!("分类 [{new_name}] 已存在"));
     }
-    let r = match ctype {
-        Some(t) => conn.execute(
-            "UPDATE categories SET name=?1, type=?2 WHERE name=?3",
-            rusqlite::params![new_name, t, old_name],
-        ),
-        None => conn.execute(
-            "UPDATE categories SET name=?1 WHERE name=?2",
-            rusqlite::params![new_name, old_name],
-        ),
-    };
-    match r {
-        Ok(n) if n > 0 => {
-            // 同步历史记录
+    // 两条 UPDATE 必须同事务：分类表改了名而 expenses 没跟上时，
+    // 按分类筛选会一条都查不出来，而界面已经提示"更新成功"。
+    // 显式 BEGIN IMMEDIATE：立刻拿写锁，失败就明确报错，绝不部分更新。
+    if let Err(e) = conn.execute("BEGIN IMMEDIATE;", []) {
+        return (false, format!("更新失败: {e}"));
+    }
+    let apply = (|| -> rusqlite::Result<usize> {
+        let n = match ctype {
+            Some(t) => conn.execute(
+                "UPDATE categories SET name=?1, type=?2 WHERE name=?3",
+                rusqlite::params![new_name, t, old_name],
+            )?,
+            None => conn.execute(
+                "UPDATE categories SET name=?1 WHERE name=?2",
+                rusqlite::params![new_name, old_name],
+            )?,
+        };
+        if n > 0 {
+            // 分类表已改名，历史记录必须同步，否则按分类筛选查不到任何记录
             conn.execute(
                 "UPDATE expenses SET category=?1 WHERE category=?2",
                 rusqlite::params![new_name, old_name],
-            )
-            .ok();
-            (true, "更新成功".into())
+            )?;
         }
-        Ok(_) => (false, format!("分类 [{old_name}] 不存在")),
-        Err(e) => (false, format!("更新失败: {e}")),
+        Ok(n)
+    })();
+    match apply {
+        Ok(0) => {
+            let _ = conn.execute("ROLLBACK;", []);
+            (false, format!("分类 [{old_name}] 不存在"))
+        }
+        Ok(_) => match conn.execute("COMMIT;", []) {
+            Ok(_) => (true, "更新成功".into()),
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK;", []);
+                (false, format!("更新失败: {e}"))
+            }
+        },
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK;", []);
+            (false, format!("更新失败: {e}"))
+        }
     }
 }
 
@@ -493,23 +513,40 @@ pub fn update_subcategory(category: &str, old_sub: &str, new_sub: &str) -> (bool
     match idx {
         Some(i) => {
             subs[i] = new_sub.to_string();
-            if conn
-                .execute(
+            // 与 update_category 同理：分类表的 subs 与 expenses.subcategory
+            // 必须一起改，否则按子分类筛选查不到记录却提示"更新成功"。
+            if let Err(e) = conn.execute("BEGIN IMMEDIATE;", []) {
+                return (false, format!("更新失败: {e}"));
+            }
+            let apply = (|| -> rusqlite::Result<usize> {
+                let n = conn.execute(
                     "UPDATE categories SET subs=?1 WHERE name=?2",
                     rusqlite::params![subs.join(","), category],
-                )
-                .map(|n| n > 0)
-                .unwrap_or(false)
-            {
-                // 同步历史记录
-                conn.execute(
-                    "UPDATE expenses SET subcategory=?1 WHERE category=?2 AND subcategory=?3",
-                    rusqlite::params![new_sub, category, old_sub],
-                )
-                .ok();
-                (true, "更新成功".into())
-            } else {
-                (false, format!("分类 [{category}] 不存在"))
+                )?;
+                if n > 0 {
+                    conn.execute(
+                        "UPDATE expenses SET subcategory=?1 WHERE category=?2 AND subcategory=?3",
+                        rusqlite::params![new_sub, category, old_sub],
+                    )?;
+                }
+                Ok(n)
+            })();
+            match apply {
+                Ok(0) => {
+                    let _ = conn.execute("ROLLBACK;", []);
+                    (false, format!("分类 [{category}] 不存在"))
+                }
+                Ok(_) => match conn.execute("COMMIT;", []) {
+                    Ok(_) => (true, "更新成功".into()),
+                    Err(e) => {
+                        let _ = conn.execute("ROLLBACK;", []);
+                        (false, format!("更新失败: {e}"))
+                    }
+                },
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK;", []);
+                    (false, format!("更新失败: {e}"))
+                }
             }
         }
         None => (false, format!("子分类 [{old_sub}] 不存在")),

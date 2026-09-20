@@ -114,4 +114,84 @@ mod tests {
         std::fs::remove_dir_all(&old_dir).ok();
         std::fs::remove_dir_all(&new_dir).ok();
     }
+
+    /// 回归：附属库是整文件覆盖，导入前必须把**现有**库留档。
+    ///
+    /// 导入目录由用户在对话框里自选，选错目录（或新版本里已经记了几个月账）
+    /// 时，当前数据不能就这么被旧库替换掉且无处找回。
+    #[test]
+    fn import_backs_up_existing_aux_db_before_overwrite() {
+        let _g = guard();
+        // 目录名必须与同文件其它用例区分开：两个用例都 set_app_dir + 清目录，
+        // 共用目录名会互相把对方的 seed 数据删掉（曾表现为"目标库突然不存在"）
+        let old_dir = std::env::temp_dir().join(format!("ff_auxbak_old_{}", std::process::id()));
+        let new_dir = std::env::temp_dir().join(format!("ff_auxbak_new_{}", std::process::id()));
+        std::fs::remove_dir_all(&old_dir).ok();
+        std::fs::remove_dir_all(&new_dir).ok();
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        paths::set_app_dir(&new_dir);
+        db::queries::invalidate_years_cache();
+
+        let seed = |path: &std::path::Path, item: &str| {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute(
+                "CREATE TABLE expenses (id INTEGER PRIMARY KEY, item_name TEXT)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO expenses (id, item_name) VALUES (1, ?1)",
+                [item],
+            )
+            .unwrap();
+        };
+        let item_of = |path: &std::path::Path| -> Option<String> {
+            let conn = rusqlite::Connection::open(path).ok()?;
+            conn.query_row("SELECT item_name FROM expenses WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .ok()
+        };
+
+        let aux = "focusflow_accounting.db";
+        seed(&old_dir.join(aux), "来自旧目录");
+        // 注意：程序目录是 app_dir，数据落在 app_dir/data（paths::data_dir）
+        let data_dir = new_dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let dst = data_dir.join(aux);
+        seed(&dst, "当前新数据");
+
+        let summary = migration::import_legacy_data(&old_dir);
+
+        assert!(
+            summary.copied_aux.contains(&aux.to_string()),
+            "附属库仍应被导入覆盖"
+        );
+        assert_eq!(
+            summary.backed_up_aux.len(),
+            1,
+            "覆盖前必须留档一份: {:?}",
+            summary.backed_up_aux
+        );
+        assert!(summary.errors.is_empty(), "errors: {:?}", summary.errors);
+
+        // 被覆盖的旧内容留在 <原名>.import-backup-<时间戳> 里
+        let kept = std::path::PathBuf::from(&summary.backed_up_aux[0]);
+        assert!(kept.exists(), "留档文件应存在: {}", kept.display());
+        assert_eq!(
+            item_of(&kept).as_deref(),
+            Some("当前新数据"),
+            "留档必须是**被覆盖掉的那份**当前数据"
+        );
+        // 目标库被导入内容替换
+        assert_eq!(
+            item_of(&dst).as_deref(),
+            Some("来自旧目录"),
+            "导入后目标库应为旧目录内容"
+        );
+
+        std::fs::remove_dir_all(&old_dir).ok();
+        std::fs::remove_dir_all(&new_dir).ok();
+    }
 }

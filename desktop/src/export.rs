@@ -6,29 +6,7 @@ use std::io::Write;
 use anyhow::Context;
 use chrono::Local;
 
-use focusflow_core::format::fmt_thousands;
-
-/// CSV 字段转义：含逗号/引号/换行时加引号并将内部引号双写；
-/// `=`/`+`/`@` 开头加前导单引号，防止 Excel 公式注入。
-fn csv_field(s: &str) -> String {
-    let escaped = if matches!(s.chars().next(), Some('=' | '+' | '@')) {
-        format!("'{s}")
-    } else {
-        s.to_string()
-    };
-    if escaped.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", escaped.replace('"', "\"\""))
-    } else {
-        escaped
-    }
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
+use focusflow_core::format::{csv_field, fmt_thousands, html_escape};
 
 /// 导出 CSV（带 BOM，Excel 打开中文不乱码）。
 pub fn export_csv(

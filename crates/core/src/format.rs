@@ -1,4 +1,7 @@
-//! 展示辅助：键鼠分类与数字格式化（desktop/desktop 导出/CLI 共用）。
+//! 展示辅助：键鼠分类、数字格式化与导出转义（desktop/desktop 导出/CLI 共用）。
+//!
+//! 导出转义必须只有一份实现：CLI 与 GUI 曾各自维护一套，CLI 那份漏了转义，
+//! 键名里带逗号会让 CSV 串列、带 `<`/`&` 会污染 HTML 报告。
 
 /// 键鼠名 → 分组名（分组统计页的 8 个固定分组）。
 pub fn classify_key(key_name: &str) -> &'static str {
@@ -90,6 +93,32 @@ pub fn fmt_thousands(n: i64) -> String {
     }
 }
 
+/// CSV 字段转义：含逗号/引号/换行时加引号并将内部引号双写；
+/// `=`/`+`/`@` 开头加前导单引号，防止 Excel 公式注入。
+///
+/// 键名来自旧版导入数据与恢复文件，不是可信内部常量，必须转义后再落盘。
+pub fn csv_field(s: &str) -> String {
+    let escaped = if matches!(s.chars().next(), Some('=' | '+' | '@')) {
+        format!("'{s}")
+    } else {
+        s.to_string()
+    };
+    if escaped.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", escaped.replace('"', "\"\""))
+    } else {
+        escaped
+    }
+}
+
+/// HTML 文本/属性转义（含单引号：属性值可能用单引号包裹）。
+pub fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +141,40 @@ mod tests {
         assert_eq!(classify_key("7"), "数字键");
         assert_eq!(classify_key("空格"), "编辑键");
         assert_eq!(classify_key("未知键"), "其他");
+    }
+
+    /// 回归：CLI 与 GUI 共用同一份转义（CLI 曾漏转义 → CSV 串列 / HTML 注入）。
+    #[test]
+    fn csv_field_escapes_and_blocks_formula_injection() {
+        assert_eq!(csv_field("A"), "A");
+        assert_eq!(csv_field("鼠标左键"), "鼠标左键");
+        // 逗号/引号/换行 → 加引号；内部引号双写
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("l1\nl2"), "\"l1\nl2\"");
+        // 公式注入前缀
+        assert_eq!(csv_field("=cmd()"), "'=cmd()");
+        assert_eq!(csv_field("+1"), "'+1");
+        assert_eq!(csv_field("@x"), "'@x");
+        // 注入 + 逗号同时命中：先加前导引号，再因逗号整体加引号
+        assert_eq!(csv_field("=a,b"), "\"'=a,b\"");
+    }
+
+    #[test]
+    fn html_escape_covers_text_and_attribute_contexts() {
+        assert_eq!(html_escape("A"), "A");
+        assert_eq!(
+            html_escape("<b>x&y</b>"),
+            "&lt;b&gt;x&amp;y&lt;/b&gt;",
+            "标签与 & 必须转义"
+        );
+        assert_eq!(
+            html_escape("\"onmouseover='x'"),
+            "&quot;onmouseover=&#39;x&#39;"
+        );
+        assert!(
+            !html_escape("'").contains('\''),
+            "单引号也要转义，否则属性值可被闭合"
+        );
     }
 }
