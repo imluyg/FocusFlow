@@ -263,8 +263,12 @@ impl DbWriter {
             .max(0) as u64;
         let today_base_count = today_base_count + recovered_today_count;
         let today_base_active = today_base_active + recovered_today_active;
+        // 设备登记预热：恢复文件不带 device_meta（会话态不透传），先从 devices 表把
+        // 名字补回来，避免回放后首次 flush 只能拿 device_key 占位补登。
+        let mut initial = recovered.unwrap_or_default();
+        preload_device_meta(&mut initial);
         let state = Arc::new(WriterState {
-            agg: Mutex::new(recovered.unwrap_or_default()),
+            agg: Mutex::new(initial),
             sig_tx,
             today_count: AtomicU64::new(today_base_count),
             today_active: AtomicU64::new(today_base_active),
@@ -754,6 +758,57 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
     }
 }
 
+/// 启动时把库里已登记的设备名/类型灌进内存会话态。
+///
+/// `device_meta` 原本只在设备产生首个输入事件时才建立，因此有两个空窗：
+///  1. 恢复文件回放 —— `AggDeltasFile` 压根没有这个字段，回放后必然为空；
+///  2. 程序刚启动到用户第一次动键鼠之间。
+///
+/// 空窗内若发生落库，补登只能拿 device_key 占位，界面会露出机器串。
+///
+/// 名字早就躺在 `devices` 表里，这里读回来当基线即可：
+/// 采集线程随后解析出的真名仍会经 `record_device` 覆盖它（注册表是权威来源，
+/// 设备换了型号或被改名时能自愈），所以预热只影响「还没等到事件」的那段时间。
+///
+/// 只读**当前年库**：写入侧面对的是正在输入的设备，它们的登记每次 flush 都会
+/// UPSERT 到对应年库，当年库覆盖全部活跃设备，读历史年库没有额外收益。
+fn preload_device_meta(agg: &mut AggDeltas) {
+    let path = paths::current_year_db_path();
+    if !connection::table_exists_readonly(&path, "devices") {
+        return;
+    }
+    let Ok(conn) = connection::open_ro(&path) else {
+        return;
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT device_key, name, kind FROM devices") else {
+        return;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    }) else {
+        return;
+    };
+    let mut loaded = 0usize;
+    for (key, name, kind) in rows.flatten() {
+        // 占位登记不算名字：空名、或之前被补登成了 device_key 本身（写入/迁移/
+        // 归档三条路径都会这么写）。把它们读回来等于把脏名字固化成「真名」。
+        if name.trim().is_empty() || name == key {
+            continue;
+        }
+        agg.device_meta
+            .entry(key)
+            .or_insert(DeviceMeta { name, kind });
+        loaded += 1;
+    }
+    if loaded > 0 {
+        tracing::debug!("设备登记预热：已从 devices 表载入 {loaded} 项");
+    }
+}
+
 /// 取设备在本库的整数 id：登记行不存在时补登一行（名称走回退命名、kind 记 unknown）。
 ///
 /// 统计表字典化后只存 id，漏登记会让查询侧 JOIN 静默丢行、凭空少掉设备数据，
@@ -763,10 +818,11 @@ fn device_id_in_db(
     dev: &str,
     meta: Option<&DeviceMeta>,
 ) -> rusqlite::Result<i64> {
-    // 没有登记信息时不能把裸设备路径写进 devices.name：查询侧只把「空名字」当作缺登记，
-    // 非空就原样展示（`merge_device_rows` 仅在 name 为空时才回退），于是会把
-    // `\\?\HID#VID_046D&PID_C52B&MI_00#8&...` 直接顶到设备排行上。
-    // 设备补齐后的下一次 flush 会 UPSERT 成真名，但那一跃期间的展示已经脏了。
+    // 没有登记信息时不能把裸设备路径写进 devices.name：查询侧只把「空名字」和
+    // 「name == device_key」当作缺登记（`merge_device_rows`），其余原样展示，
+    // 于是会把 `\\?\HID#VID_046D&PID_C52B&MI_00#8&...` 直接顶到设备排行上。
+    // 正常路径还有 `preload_device_meta`（启动时读登记表）+ 设备首个事件的双重保障，
+    // 走到这里的多半是恢复回放后仍未取到真名的时段。
     let fallback_name;
     let (name, kind) = match meta {
         Some(m) => (m.name.as_str(), m.kind.as_str()),
@@ -1292,6 +1348,78 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 启动预热：库里已登记的设备名/类型应在首个输入事件之前就可用。
+    ///
+    /// 这消掉了「恢复回放 → 首次 flush」必然缺 device_meta 的空窗
+    /// （`AggDeltasFile` 不带该字段），也让刚启动到用户第一次动键鼠之间的
+    /// 那段时间无需依赖占位补登。占位行（name == device_key / 空名）必须被跳过，
+    /// 否则等于把脏名字读回来固化成「真名」。
+    #[test]
+    fn start_preloads_device_meta_from_registry() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_writer_preload_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let year = chrono::Local::now().year();
+        {
+            let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            let ins = |key: &str, name: &str, kind: &str| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![key, name, kind],
+                )
+                .unwrap();
+            };
+            ins("HID#VID_24AE&PID_1464#a", "我的鼠标 · 24AE/1464", "mouse");
+            ins(
+                "HID#VID_07D7&PID_EFFF#b",
+                "我的键盘 · 07D7/EFFF",
+                "keyboard",
+            );
+            // 占位行：名字就是路径本身（历史补登的产物），不得被预热读回去
+            ins(
+                r"\\?\HID#VID_046D&PID_C52B&MI_00#8&2c5f&0&0000",
+                r"\\?\HID#VID_046D&PID_C52B&MI_00#8&2c5f&0&0000",
+                "unknown",
+            );
+            ins("HID#VID_1111&PID_2222#c", "", "mouse");
+        }
+
+        let w = DbWriter::start(Duration::from_secs(3600));
+        {
+            let agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                agg.device_meta
+                    .get("HID#VID_24AE&PID_1464#a")
+                    .map(|m| m.name.as_str()),
+                Some("我的鼠标 · 24AE/1464"),
+                "已登记设备应被预热"
+            );
+            assert_eq!(
+                agg.device_meta
+                    .get("HID#VID_07D7&PID_EFFF#b")
+                    .map(|m| m.kind.as_str()),
+                Some("keyboard"),
+                "设备类型也应一并预热"
+            );
+            assert!(
+                !agg.device_meta
+                    .contains_key(r"\\?\HID#VID_046D&PID_C52B&MI_00#8&2c5f&0&0000"),
+                "name == device_key 的占位行不得被当成真名读回"
+            );
+            assert!(
+                !agg.device_meta.contains_key("HID#VID_1111&PID_2222#c"),
+                "空名登记行不得被预热"
+            );
+            assert_eq!(agg.device_meta.len(), 2, "只有两条真实登记应进入会话态");
+        }
+        w.stop();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 缺设备登记时的兜底命名：不能把裸路径写进 devices.name（2026-09-21）。
     ///
     /// 恢复文件回放会把 device_meta 置空（会话态不透传），首次 flush 走 meta=None 分支；
@@ -1345,6 +1473,77 @@ mod tests {
         assert_eq!(rows, 1, "同一设备只登记一行");
 
         drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 端到端：崩溃恢复回放后的首次落库应当用**真名**补登，而不是占位名。
+    ///
+    /// 恢复文件故意不带 device_meta，回放后落库只能靠 `preload_device_meta`
+    /// 把库里的登记表读回来。缺这层时这里写进去的是 `[recovery]*` 前的回退名
+    /// （"HID 设备 · 24AE/1464"），虽然不再是机器串，但仍丢失了用户看到的设备名。
+    #[test]
+    fn recovery_replay_writes_real_device_name() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_writer_devname_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let ts = queries::now_ts();
+        let dev = "HID#VID_24AE&PID_1464#e2e".to_string();
+        let real_name = "端到端鼠标 · 24AE/1464";
+        let name_in_db = || -> Option<String> {
+            connection::open_ro(&paths::current_year_db_path())
+                .ok()
+                .and_then(|conn| {
+                    conn.query_row(
+                        "SELECT name FROM devices WHERE device_key=?1",
+                        [&dev],
+                        |r| r.get(0),
+                    )
+                    .ok()
+                })
+        };
+
+        // 1. 正常记一次并落库 —— 登记行进入 devices 表（预热的数据来源）
+        let w = DbWriter::start(Duration::from_secs(3600));
+        w.record_device(&dev, real_name, "mouse", ts);
+        w.flush(true);
+        assert_eq!(name_in_db().as_deref(), Some(real_name), "首次落库应是真名");
+
+        // 2. 又有两次输入，进程被强杀：这 2 次只存在于恢复文件里
+        w.record_device(&dev, real_name, "mouse", ts);
+        w.record_device(&dev, real_name, "mouse", ts);
+        snapshot_recovery(&w.state, true);
+        w.stop();
+
+        // 3. 重启回放 + 落库：登记名字必须是真名，不能被回退命名顶掉
+        let w2 = DbWriter::start(Duration::from_secs(3600));
+        w2.flush(true);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while w2.flush_seq() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            name_in_db().as_deref(),
+            Some(real_name),
+            "恢复回放后的补登应保留原设备名，预热失效时会退化成回退名"
+        );
+        let cnt: i64 = connection::open_ro(&paths::current_year_db_path())
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(SUM(c.count),0) FROM device_counts c \
+                       JOIN devices d ON d.id = c.device_id \
+                      WHERE d.device_key=?1",
+                    [&dev],
+                    |r| r.get(0),
+                )
+                .ok()
+            })
+            .unwrap_or(0);
+        assert_eq!(cnt, 3, "1 次直接落库 + 2 次回放，不得重复或丢计数");
+        w2.stop();
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -611,13 +611,24 @@ pub struct DeviceStat {
     pub count: i64,
 }
 
-/// 设备无登记名时的回退显示名：优先截取 VID/PID 段，取不到则截断原路径。
+/// 跨年归档给「有统计行、没登记行」的历史设备补的 device_key 前缀（见 `sync_device_dict`）。
+///
+/// 这类设备的真实实例路径当时没登记，已经不可考。常数放在这里是为了让
+/// 写入侧（生成占位）与展示侧（`fallback_device_name` 识别占位）共用同一份定义。
+pub(crate) const ARCHIVED_DEVICE_KEY_PREFIX: &str = "device-id:";
+
+/// 设备无登记名时的回退显示名：优先截取 VID/PID 段，其次处理归档占位，最后截断原路径。
 ///
 /// 写入侧也用（`writer::device_id_in_db`）：恢复文件回放后的首次落库拿不到设备名，
 /// 兜底登记用同一套命名，界面才不会因为「回放先于重新登记」而闪出原始路径。
 pub(crate) fn fallback_device_name(device_key: &str) -> String {
     if let Some((vid, pid)) = parse_vid_pid(device_key) {
         format!("HID 设备 · {vid}/{pid}")
+    } else if let Some(id) = device_key.strip_prefix(ARCHIVED_DEVICE_KEY_PREFIX) {
+        // 跨年归档给「有统计行、没登记行」的历史设备补的占位键（`sync_device_dict`）：
+        // 那批设备的真实路径当时没登记，已经不可考，只能说明它的来历，
+        // 不能把 `device-id:3` 这种纯机器串端给用户。
+        format!("未知设备 · 归档 #{id}")
     } else {
         let n = device_key.chars().count();
         if n > 40 {
@@ -1320,6 +1331,27 @@ mod tests {
         let long = "X".repeat(60);
         assert!(fallback_device_name(&long).starts_with(&"X".repeat(40)));
         assert!(fallback_device_name(&long).ends_with('…'));
+        assert_eq!(fallback_device_name("short#path"), "short#path");
+    }
+
+    /// 跨年归档的占位 device_key 必须显示成人话，不能把 `device-id:3` 端给用户。
+    ///
+    /// 这类行在 `merge_device_rows` 里会因为「name == device_key」走回退，
+    /// 但回退本身若认不出这个前缀就会原样返回 —— 这条断言锁住后半段。
+    #[test]
+    fn fallback_device_name_handles_archived_placeholder() {
+        assert_eq!(
+            fallback_device_name("device-id:3"),
+            "未知设备 · 归档 #3",
+            "归档占位要说明来历，不能显示机器串"
+        );
+        assert_eq!(
+            fallback_device_name("device-id:127"),
+            "未知设备 · 归档 #127"
+        );
+        // 前缀必须一致：改了常量而忘记改生成侧会让这条失效
+        assert_eq!(ARCHIVED_DEVICE_KEY_PREFIX, "device-id:");
+        // 不能误伤正常短 key
         assert_eq!(fallback_device_name("short#path"), "short#path");
     }
 

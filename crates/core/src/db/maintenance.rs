@@ -262,10 +262,11 @@ fn sync_device_dict(conn: &Connection, dk_from: i64, dk_to: i64) -> anyhow::Resu
         conn.execute(
             &format!(
                 "INSERT OR IGNORE INTO source.devices (device_key, name, kind)
-                 SELECT 'device-id:' || c.device_id, 'device-id:' || c.device_id, 'unknown'
+                 SELECT '{prefix}' || c.device_id, '{prefix}' || c.device_id, 'unknown'
                    FROM source.{table} c
                   WHERE c.date_key >= ?1 AND c.date_key < ?2
-                    AND NOT EXISTS (SELECT 1 FROM source.devices d WHERE d.id = c.device_id)"
+                    AND NOT EXISTS (SELECT 1 FROM source.devices d WHERE d.id = c.device_id)",
+                prefix = queries::ARCHIVED_DEVICE_KEY_PREFIX,
             ),
             rusqlite::params![dk_from, dk_to],
         )?;
