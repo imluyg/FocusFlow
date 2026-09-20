@@ -7,7 +7,7 @@
 //! - 写入频率固定，不受按键速度影响
 //! - flush 信号：立即落库 + 等待完成（退出/备份用）
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -226,7 +226,7 @@ impl DbWriter {
                 .ok()
                 .and_then(|conn| {
                     conn.query_row(
-                        "SELECT COALESCE(seconds, 0) FROM active_seconds WHERE date_key = ?1",
+                        "SELECT COALESCE(seconds, 0) FROM daily_counts WHERE date_key = ?1",
                         [queries::day_key_of_date(chrono::Local::now().date_naive())],
                         |r| r.get::<_, i64>(0),
                     )
@@ -887,12 +887,26 @@ fn flush_partition(
                         .ok_or_else(|| anyhow::anyhow!("设备 id 解析失败: {dev}"))
                 };
                 {
+                    // 活跃时长已并入 daily_counts.seconds：一次 UPSERT 同时累加两列。
+                    // 两个 map 的天集合未必一致（活跃统计上线晚于按键统计，
+                    // 早期日期只有按键数没有时长），缺失的一侧写 0，
+                    // `+ excluded.x` 的语义下不会影响另一侧。
                     let mut stmt = c.prepare(
-                        "INSERT INTO daily_counts (date_key, count) VALUES (?1, ?2)
-                         ON CONFLICT(date_key) DO UPDATE SET count = count + excluded.count",
+                        "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(date_key) DO UPDATE SET
+                            count = count + excluded.count,
+                            seconds = seconds + excluded.seconds",
                     )?;
-                    for (dk, n) in &pending.daily {
-                        stmt.execute(rusqlite::params![dk, n])?;
+                    let days: BTreeSet<i64> = pending
+                        .daily
+                        .keys()
+                        .chain(pending.active.keys())
+                        .copied()
+                        .collect();
+                    for dk in days {
+                        let cnt = pending.daily.get(&dk).copied().unwrap_or(0);
+                        let sec = pending.active.get(&dk).copied().unwrap_or(0);
+                        stmt.execute(rusqlite::params![dk, cnt, sec])?;
                     }
                 }
                 {
@@ -913,15 +927,6 @@ fn flush_partition(
                         for (key, n) in key_map {
                             stmt.execute(rusqlite::params![dk, key, n])?;
                         }
-                    }
-                }
-                {
-                    let mut stmt = c.prepare(
-                        "INSERT INTO active_seconds (date_key, seconds) VALUES (?1, ?2)
-                         ON CONFLICT(date_key) DO UPDATE SET seconds = seconds + excluded.seconds",
-                    )?;
-                    for (dk, n) in &pending.active {
-                        stmt.execute(rusqlite::params![dk, n])?;
                     }
                 }
                 {

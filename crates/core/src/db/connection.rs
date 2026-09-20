@@ -176,7 +176,8 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS daily_counts (
             date_key INTEGER PRIMARY KEY,
-            count INTEGER NOT NULL
+            count INTEGER NOT NULL,
+            seconds INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS hourly_counts (
             date_key INTEGER NOT NULL,
@@ -189,10 +190,6 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
             key_name TEXT NOT NULL,
             count INTEGER NOT NULL,
             PRIMARY KEY (date_key, key_name)
-        ) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS active_seconds (
-            date_key INTEGER PRIMARY KEY,
-            seconds INTEGER NOT NULL
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS app_usage (
             date_key INTEGER NOT NULL,
@@ -232,21 +229,85 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
     // 顺序有讲究：先把旧的 device_key 文本形态迁成整数 id（旧表没有 device_id 列，
     // 索引建在它上面会直接报 "no such column"），再统一补索引。
     migrate_device_tables(conn)?;
+    merge_active_seconds_into_daily(conn)?;
     // 复合主键前缀是 date_key，按设备单列过滤（设备详情）只能全表扫：
     // 这两条索引把「按设备取序列 / 取键名明细」变成索引区间扫描。
+    //
+    // daily_counts **不要**给 count 建索引：「历史最高一天」排的是
+    // (count DESC, date_key ASC) 两个键，单列 count 索引免不掉排序，
+    // EXPLAIN 实测是 SCAN 覆盖索引而非 SEARCH，有无索引差 0.025ms；
+    // 而它一年才 365 行，全表扫比维护索引更划算（2026-09-21 实测，原索引已移除）。
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_device_counts_dev
             ON device_counts(device_id, date_key);
          CREATE INDEX IF NOT EXISTS idx_device_key_counts_dev
-            ON device_key_counts(device_id, date_key);
-         CREATE INDEX IF NOT EXISTS idx_daily_counts_count
-            ON daily_counts(count DESC);",
+            ON device_key_counts(device_id, date_key);",
     )?;
+    // 兼容清理：旧库遗留的 count DESC 索引（上面已论证无用），存在就删。
+    conn.execute_batch("DROP INDEX IF EXISTS idx_daily_counts_count")?;
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('year', ?1)",
         [year.to_string()],
     )?;
     Ok(())
+}
+
+/// 把历史独立表 `active_seconds` 并入 `daily_counts.seconds`（幂等）。
+///
+/// 两张表都是「date_key 主键、一天一行」，且**所有查询都是 `WHERE date_key=?` 点查**，
+/// 拆开只是历史原因 —— 合并后少一棵 B-tree、少一条 UPSERT，
+/// 「今日按键次数 + 今日活跃时长」也能一次读出来。
+///
+/// 新建的库在 `ensure_schema` 里直接带上 seconds 列，只有**老库**才走到这里：
+/// 补列 → 把旧表的秒数 UPDATE 过来 → 删旧表。整段在单事务里完成，失败即回滚，
+/// 下次打开会重试；已完成时只做一次 `column_exists` 检测（一次 pragma 查询）。
+fn merge_active_seconds_into_daily(conn: &Connection) -> anyhow::Result<()> {
+    let already_merged = column_exists(conn, "daily_counts", "seconds");
+    if already_merged {
+        // 上次迁移中途失败时会剩下孤岛旧表，这里补删；正常路径是 no-op。
+        if table_exists(conn, "active_seconds") {
+            tracing::info!("清理残留的 active_seconds 表（已完成合并）");
+            conn.execute_batch("DROP TABLE active_seconds")?;
+        }
+        return Ok(());
+    }
+
+    tracing::info!("活跃时长迁移：active_seconds → daily_counts.seconds");
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> anyhow::Result<()> {
+        conn.execute_batch(
+            "ALTER TABLE daily_counts ADD COLUMN seconds INTEGER NOT NULL DEFAULT 0",
+        )?;
+        if table_exists(conn, "active_seconds") {
+            // 两步走，**不允许丢任何一天的时长**：
+            //   1) 先把「有活跃记录但 daily_counts 没有这一天」的行补进去（count=0）。
+            //      正常采集下不会出现（时长由键鼠事件产生，同一事件也记 daily），
+            //      但历史库的口径随版本变过，迁移逻辑宁可信其有。
+            //   2) 再 UPDATE 其余各行 —— 反过来「有按键没时长」的早期日期保持默认 0，
+            //      因为活跃统计本来就上线得更晚。
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO daily_counts (date_key, count, seconds)
+                   SELECT a.date_key, 0, a.seconds FROM active_seconds a;
+                 UPDATE daily_counts
+                    SET seconds = (SELECT a.seconds FROM active_seconds a
+                                    WHERE a.date_key = daily_counts.date_key)
+                  WHERE EXISTS (SELECT 1 FROM active_seconds a
+                                 WHERE a.date_key = daily_counts.date_key);
+                 DROP TABLE active_seconds;",
+            )?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
 }
 
 /// 把旧的「统计表直接存 device_key 文本」形态迁移成整数 id 形态（幂等）。
@@ -368,6 +429,7 @@ fn migrate_device_tables(conn: &Connection) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
 
     /// 旧形态（统计表直接存 device_key 文本）→ 整数 id 字典的自动迁移。
     ///
@@ -522,5 +584,80 @@ mod tests {
 
         drop(conn);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 老库的 active_seconds 必须被并入 daily_counts.seconds，数据一天都不能丢。
+    ///
+    /// 这条用例专门走到「迁移分支」——其余测试都是用新 ensure_schema 直接建库，
+    /// 压根不会执行 merge_active_seconds_into_daily，所以这里要手工搭老形态。
+    #[test]
+    fn ensure_schema_merges_legacy_active_seconds() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_conn_merge_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let year = chrono::Local::now().date_naive().year();
+        let path = crate::paths::year_db_path(year);
+        {
+            // 手工搭「2026-09-21 之前」的老形态：daily_counts 只有两列，时长另表存
+            let conn = open_rw(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE daily_counts (
+                    date_key INTEGER PRIMARY KEY,
+                    count INTEGER NOT NULL
+                 );
+                 CREATE TABLE active_seconds (
+                    date_key INTEGER PRIMARY KEY,
+                    seconds INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+            // A：既有按键也有时长（rusqlite 的 execute 只跑单条语句，多条要用 batch）
+            conn.execute_batch(
+                "INSERT INTO daily_counts VALUES (1000, 42);
+                 INSERT INTO active_seconds VALUES (1000, 3600);
+                 INSERT INTO daily_counts VALUES (1001, 7);
+                 INSERT INTO active_seconds VALUES (1002, 900);",
+            )
+            .unwrap();
+        }
+
+        let conn = open_rw(&path).unwrap();
+        ensure_schema(&conn, year).unwrap();
+
+        let ones = |dk: i64| -> (i64, i64) {
+            conn.query_row(
+                "SELECT count, seconds FROM daily_counts WHERE date_key=?1",
+                [dk],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(ones(1000), (42, 3600), "A 天：按键与时长都应保留");
+        assert_eq!(ones(1001), (7, 0), "B 天：没有时长应补 0，按键数不受影响");
+        assert_eq!(ones(1002), (0, 900), "C 天：只有时长的行不得丢失");
+        assert!(
+            !table_exists(&conn, "active_seconds"),
+            "旧表必须删掉，否则后续写入会写进没人读的表"
+        );
+        drop(conn);
+
+        // 幂等：再跑一次不能报错，也不能把 seconds 重新清零
+        let conn = open_rw(&path).unwrap();
+        ensure_schema(&conn, year).unwrap();
+        assert_eq!(ones_reopen(&conn, 1000), (42, 3600), "重复迁移必须幂等");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn ones_reopen(conn: &rusqlite::Connection, dk: i64) -> (i64, i64) {
+        conn.query_row(
+            "SELECT count, seconds FROM daily_counts WHERE date_key=?1",
+            [dk],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
     }
 }

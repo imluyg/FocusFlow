@@ -23,19 +23,33 @@ use crate::paths;
 /// 归档、清理、清空必须使用同一份清单：此前只覆盖 daily/hourly/key_counts，
 /// 导致 active_seconds 与 app_usage 永不归档、永不清理 —— 跨年后前台应用
 /// 时长仍留在旧文件里，而 CLI 的 `--reset` 会报告"已清空"却留着这两张表。
+/// （2026-09-21：`active_seconds` 已并入 `daily_counts.seconds`，不再单独成表。）
 ///
 /// 注意 `devices`（设备字典）不在其中：它没有 date_key，不能按日期切分，
 /// 归档/清空时单独处理（见 [`sync_device_dict`] 与 [`reset_all_data`]）；
 /// 两张 device 明细表存的是 `devices.id`，跨库搬迁必须过 id 映射（见 [`move_device_rows`]）。
-const DATA_TABLES: [&str; 7] = [
+const DATA_TABLES: [&str; 6] = [
     "daily_counts",
     "hourly_counts",
     "key_counts",
-    "active_seconds",
     "app_usage",
     "device_counts",
     "device_key_counts",
 ];
+
+/// 非主键的数值列：归档时**累加**到目标库的同名列。
+///
+/// `daily_counts` 有两列（2026-09-21 起合并了活跃时长），所以这里返回切片
+/// 而非单个列名 —— 归档 SQL 的 `DO UPDATE SET` 要逐列拼出 `a = a + excluded.a`。
+fn value_cols(table: &str) -> &'static [&'static str] {
+    match table {
+        "daily_counts" => &["count", "seconds"],
+        "hourly_counts" | "key_counts" => &["count"],
+        "app_usage" => &["seconds"],
+        "device_counts" | "device_key_counts" => &["count"],
+        _ => unreachable!("DATA_TABLES 新增表时必须补计数列"),
+    }
+}
 
 /// 存 `devices.id` 而不是文本路径的设备表（归档时要走 id 映射）。
 fn is_device_id_table(table: &str) -> bool {
@@ -187,26 +201,27 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
                     continue; // 单独走 id 映射搬迁
                 }
                 let pk_cols = match table {
-                    "daily_counts" | "active_seconds" => "date_key",
+                    "daily_counts" => "date_key",
                     "hourly_counts" => "date_key, hour",
                     "key_counts" => "date_key, key_name",
                     "app_usage" => "date_key, app_name",
                     _ => unreachable!("DATA_TABLES 新增表时必须补主键列"),
                 };
-                let value_cols = match table {
-                    "daily_counts" | "hourly_counts" | "key_counts" => "count",
-                    "active_seconds" | "app_usage" => "seconds",
-                    _ => unreachable!("DATA_TABLES 新增表时必须补计数列"),
-                };
+                let cols = value_cols(table);
+                let col_list = cols.join(", ");
+                let updates = cols
+                    .iter()
+                    .map(|c| format!("{c} = {table}.{c} + excluded.{c}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 // 只迁「本表确实有行」的年份：若某年只有 daily_counts 有数据，
                 // 其余表插入 0 行也删除 0 行，行数校验天然成立。
                 conn.execute(
                     &format!(
-                        "INSERT INTO {table} ({pk_cols}, {value_cols}) \
-                         SELECT {pk_cols}, {value_cols} FROM source.{table} \
+                        "INSERT INTO {table} ({pk_cols}, {col_list}) \
+                         SELECT {pk_cols}, {col_list} FROM source.{table} \
                           WHERE date_key >= ?1 AND date_key < ?2 \
-                         ON CONFLICT({pk_cols}) DO UPDATE SET {value_cols} = \
-                            {table}.{value_cols} + excluded.{value_cols}"
+                         ON CONFLICT({pk_cols}) DO UPDATE SET {updates}"
                     ),
                     rusqlite::params![dk_from, dk_to],
                 )?;
@@ -1788,13 +1803,9 @@ mod tests {
         connection::ensure_schema(&conn, source_year).unwrap();
         for (y, m, d) in [(2023, 5, 1), (2024, 6, 1), (2025, 3, 1)] {
             let k = dk(y, m, d);
+            // 活跃时长已并入 daily_counts（2026-09-21），同一行同时写两列
             conn.execute(
-                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 100)",
-                [k],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO active_seconds (date_key, seconds) VALUES (?1, 200)",
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 100, 200)",
                 [k],
             )
             .unwrap();
@@ -1821,7 +1832,7 @@ mod tests {
                 .unwrap();
             let active: i64 = year_conn
                 .query_row(
-                    "SELECT seconds FROM active_seconds WHERE date_key=?1",
+                    "SELECT seconds FROM daily_counts WHERE date_key=?1",
                     [k],
                     |r| r.get(0),
                 )
