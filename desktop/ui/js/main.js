@@ -4,7 +4,7 @@ import { invoke, listen } from "./tauri.js";
 import { $ } from "./utils.js";
 import { appState } from "./state.js";
 import { renderPlugins, openPlugin, closePlugin, renderPluginDetail, togglePlugin, pluginBtn, pluginBtnSel, pluginField, pluginFieldStay, pluginSelectRow, pluginSelectAll, modalOpen, modalCancel, modalSubmit, modalAction } from "./plugins.js";
-import { applyLive, applyCharts, renderRank, renderApps, renderGroup, renderTrend, renderHourly, renderWeekday, renderSettings, doImport, doExport, doVacuum, doBackup } from "./views.js";
+import { applyLive, applyCharts, renderRank, renderApps, renderDevices, deviceRename, deviceRenameSave, deviceRenameClear, deviceRenameCancel, renderGroup, renderTrend, renderHourly, renderWeekday, renderSettings, doImport, doExport, doVacuum, doBackup } from "./views.js";
 
 export function switchView(view) {
   appState.currentView = view;
@@ -13,7 +13,7 @@ export function switchView(view) {
     b.classList.toggle("active", active);
     b.setAttribute("aria-selected", String(active));
   });
-  const ids = ["rank", "apps", "group", "trend", "hourly", "weekday", "plugins", "settings"];
+  const ids = ["rank", "apps", "devices", "group", "trend", "hourly", "weekday", "plugins", "settings"];
   ids.forEach((id) => {
     const el = $("view-" + id);
     if (el) el.style.display = id === view ? "" : "none";
@@ -31,6 +31,7 @@ function renderCurrentView() {
   switch (appState.currentView) {
     case "rank": return renderRank(appState.chartsData);
     case "apps": return renderApps(appState.chartsData);
+    case "devices": return renderDevices(appState.chartsData);
     case "group": return renderGroup(appState.chartsData);
     case "trend": return renderTrend(appState.chartsData);
     case "hourly": return renderHourly(appState.chartsData);
@@ -60,6 +61,11 @@ document.addEventListener("click", (e) => {
     case "modal-cancel": modalCancel(d.name, d.cancel || "", d.modal); break;
     case "modal-submit": modalSubmit(d.name, d.id, d.modal); break;
     case "modal-action": modalAction(d.name, d.id, d.modal); break;
+    // 设备排行：改名 / 保存 / 还原 / 取消
+    case "device-rename": deviceRename(d.key); break;
+    case "device-rename-save": deviceRenameSave(d.key); break;
+    case "device-rename-clear": deviceRenameClear(d.key); break;
+    case "device-rename-cancel": deviceRenameCancel(); break;
     // 点击遮罩背景关闭：仅当点击目标就是遮罩层本身（与旧 if (event.target === this) 等价）
     case "modal-overlay-cancel":
       if (e.target === el) modalCancel(d.name, d.cancel || "", d.modal);

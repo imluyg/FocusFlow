@@ -327,30 +327,54 @@ pub fn get_stats_by_date(target_date: chrono::NaiveDate) -> (i64, HashMap<String
     result.flatten().unwrap_or((0, HashMap::new()))
 }
 
-/// 全历史最高单日（跨年度库）：返回 (YYYY-MM-DD, 次数)。无数据时返回 None。
-pub fn get_alltime_max_day() -> Option<(String, i64)> {
+/// 全历史汇总（跨年度库）：返回 (总次数, 最高单日)。
+///
+/// 「总计」卡片与「最高单日」卡片共用同一份失效条件（强制刷新 / 跨天 /
+/// 今日新增达阈值），因此两者在同一次跨库遍历里一起取出：`daily_counts`
+/// 每天一行，SUM 与 ORDER BY 都是小表扫描，多取一个总数不增加连接开销。
+pub fn get_alltime_summary() -> (i64, Option<(String, i64)>) {
+    let mut total: i64 = 0;
     let mut best: Option<(i64, i64)> = None; // (date_key, count)
     for year in available_years() {
         let path = paths::year_db_path(year);
-        if let Some((dk, c)) = connection::with_ro_conn(&path, |conn| {
+        let row = connection::with_ro_conn(&path, |conn| {
             if !table_exists(conn, "daily_counts") {
                 return None;
             }
-            conn.query_row(
-                "SELECT date_key, count FROM daily_counts ORDER BY count DESC, date_key ASC LIMIT 1",
-                [],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-            )
-            .ok()
+            let sum: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let top = conn
+                .query_row(
+                    "SELECT date_key, count FROM daily_counts ORDER BY count DESC, date_key ASC LIMIT 1",
+                    [],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .ok();
+            Some((sum, top))
         })
-        .flatten()
-        {
-            if best.is_none_or(|(_, bc)| c > bc) {
-                best = Some((dk, c));
+        .flatten();
+        if let Some((sum, top)) = row {
+            total += sum;
+            if let Some((dk, c)) = top {
+                if best.is_none_or(|(_, bc)| c > bc) {
+                    best = Some((dk, c));
+                }
             }
         }
     }
-    best.and_then(|(dk, c)| day_key_to_date(dk).map(|d| (d.format("%Y-%m-%d").to_string(), c)))
+    let max_day =
+        best.and_then(|(dk, c)| day_key_to_date(dk).map(|d| (d.format("%Y-%m-%d").to_string(), c)));
+    (total, max_day)
+}
+
+/// 全历史最高单日（跨年度库）：返回 (YYYY-MM-DD, 次数)。无数据时返回 None。
+pub fn get_alltime_max_day() -> Option<(String, i64)> {
+    get_alltime_summary().1
 }
 
 /// 查询最近 N 天每日按键数：返回 [(YYYY-MM-DD, 次数)]。
@@ -568,6 +592,252 @@ pub fn get_app_stats_by_date(target_date: chrono::NaiveDate) -> (i64, HashMap<St
     result.flatten().unwrap_or((0, HashMap::new()))
 }
 
+// ===== 设备维度统计（Raw Input 侧信道，独立口径）=====
+
+/// 设备统计行（查询结果：显示名已按设备去重）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DeviceStat {
+    /// 设备实例路径（Raw Input device_key）：改名/别名回写用，界面不直接展示
+    pub key: String,
+    /// 展示名：优先用户别名，其次自动解析名（如 "HID-compliant mouse · 046D/C52B"）
+    pub name: String,
+    /// 自动解析出的名字（未套别名）。有别名时界面用它做副标题，方便认设备
+    pub auto_name: String,
+    /// 是否已设用户别名（界面据此显示「还原」入口）
+    pub has_alias: bool,
+    /// 设备类型：mouse / keyboard / hybrid
+    pub kind: String,
+    /// 输入次数（键盘按下 + 鼠标按键按下 + 滚轮，独立口径）
+    pub count: i64,
+}
+
+/// 设备无登记名时的回退显示名：优先截取 VID/PID 段，取不到则截断原路径。
+fn fallback_device_name(device_key: &str) -> String {
+    if let Some((vid, pid)) = parse_vid_pid(device_key) {
+        format!("HID 设备 · {vid}/{pid}")
+    } else {
+        let n = device_key.chars().count();
+        if n > 40 {
+            let prefix: String = device_key.chars().take(40).collect();
+            format!("{prefix}…")
+        } else {
+            device_key.to_string()
+        }
+    }
+}
+
+/// 从设备实例路径解析 VID/PID，返回 (VID, PID) 十六进制串（大写）。
+///
+/// 支持两种真机形态（2026-09-20 实测）：
+/// - USB/2.4G 接收器：`HID#VID_24AE&PID_1464&MI_00#...` → ("24AE", "1464")
+/// - 蓝牙 HID：`HID#{GUID}_Dev_VID&0107d7_PID&efff_REV&0120_...` → ("07D7", "EFFF")
+///   （`VID&` 后 8 位里高 2 位是 vendor id source，真 VID 是后 4 位）
+///
+/// 格式不符返回 None（如 `HID#MSFT0001&Col01#...`、`ACPI#MSFT0001#...`，无 VID 段）。
+pub(crate) fn parse_vid_pid(path: &str) -> Option<(String, String)> {
+    let upper = path.to_ascii_uppercase();
+    if let Some(pair) = parse_usb_style(&upper) {
+        return Some(pair);
+    }
+    parse_bluetooth_style(&upper)
+}
+
+/// USB 形态：`VID_XXXX&PID_YYYY`。
+fn parse_usb_style(upper: &str) -> Option<(String, String)> {
+    let rest = upper.split("VID_").nth(1)?;
+    if rest.len() < 4 {
+        return None;
+    }
+    let vid = &rest[..4];
+    if !vid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let pid_rest = rest[4..].strip_prefix("&PID_")?;
+    if pid_rest.len() < 4 {
+        return None;
+    }
+    let pid = &pid_rest[..4];
+    if !pid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((vid.to_string(), pid.to_string()))
+}
+
+/// 蓝牙形态：`VID&<vendorSource><VID>` + PID 段。
+///
+/// Windows 里分隔符不统一——HID 子设备是 `..._Dev_VID&0107d7_PID&efff_...`，
+/// 枚举器路径是 `BTHENUM\VID&046d_PID_c52b`（`&` 与 `_` 混用），两种都要接受。
+fn parse_bluetooth_style(upper: &str) -> Option<(String, String)> {
+    let rest = upper.split("VID&").nth(1)?;
+    let vid_end = rest.find(['&', '_']).unwrap_or(rest.len());
+    let vid_field = &rest[..vid_end];
+    let after = &rest[vid_end..];
+    let pid_rest = ["&PID&", "_PID&", "&PID_", "_PID_"]
+        .iter()
+        .find_map(|p| after.strip_prefix(p))?;
+    let pid_field = pid_rest.split(['&', '_']).next()?;
+    // VID 字段长度可变：4 位（无 source 前缀）或 6 位（前 2 位为 vendor id source）
+    let vid = match vid_field.len() {
+        4 => vid_field,
+        n if n >= 6 => &vid_field[n - 4..],
+        _ => return None,
+    };
+    let pid = pid_field.get(..4)?;
+    if !vid.chars().all(|c| c.is_ascii_hexdigit()) || !pid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((vid.to_string(), pid.to_string()))
+}
+
+/// 单库设备查询的原始行：(device_key, 登记名, 类型, 次数)。
+struct DeviceRow {
+    device_key: String,
+    name: Option<String>,
+    kind: Option<String>,
+    count: i64,
+}
+
+/// 设备查询公共实现：device_counts 聚合 + LEFT JOIN devices 取登记名。
+/// `cond` 为 date_key 条件片段，空串表示全表；表不存在（旧库）时返回 None。
+fn query_devices_in_conn(
+    conn: &Connection,
+    cond: &str,
+    param: Option<i64>,
+) -> Option<Vec<DeviceRow>> {
+    if !table_exists(conn, "device_counts") {
+        return None;
+    }
+    let where_clause = if cond.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE dc.{cond}")
+    };
+    let sql = format!(
+        "SELECT dc.device_key, d.name, d.kind, SUM(dc.count) AS cnt
+         FROM device_counts dc LEFT JOIN devices d ON d.device_key = dc.device_key
+         {where_clause} GROUP BY dc.device_key"
+    );
+    let mapper = |r: &rusqlite::Row<'_>| {
+        Ok(DeviceRow {
+            device_key: r.get(0)?,
+            name: r.get::<_, Option<String>>(1)?,
+            kind: r.get::<_, Option<String>>(2)?,
+            count: r.get(3)?,
+        })
+    };
+    let rows = match conn.prepare(&sql) {
+        Ok(mut stmt) => match param {
+            Some(p) => stmt
+                .query_map([p], mapper)
+                .map(|rows| rows.flatten().collect::<Vec<_>>()),
+            None => stmt
+                .query_map([], mapper)
+                .map(|rows| rows.flatten().collect::<Vec<_>>()),
+        },
+        Err(e) => Err(e),
+    };
+    match rows {
+        Ok(list) => Some(list),
+        Err(e) => {
+            tracing::error!("device_counts 查询失败 ({sql}): {e}");
+            None
+        }
+    }
+}
+
+/// 原始行合并成展示行：别名优先、登记名缺失回退、显示名去重（同型号两只加序号）、按次数降序。
+fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
+    let aliases = crate::device_alias::table();
+    let total: i64 = rows.iter().map(|r| r.count).sum();
+    let mut stats: Vec<DeviceStat> = rows
+        .into_iter()
+        .map(|r| {
+            let auto_name = r
+                .name
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| fallback_device_name(&r.device_key));
+            // 别名优先（用户改过的名字），别名缺失或为空时用自动名。
+            // 去重只对自动名生效：两个不同设备可以起同一个别名，用户说了算。
+            let alias = aliases.resolve(&r.device_key).map(|s| s.to_string());
+            let has_alias = alias.is_some();
+            let aliased = alias.unwrap_or_else(|| auto_name.clone());
+            DeviceStat {
+                key: r.device_key,
+                name: aliased,
+                auto_name,
+                has_alias,
+                kind: r.kind.unwrap_or_else(|| "unknown".to_string()),
+                count: r.count,
+            }
+        })
+        .collect();
+    stats.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    // 显示名去重：两只同型号设备（VID/PID 相同、实例不同）加序号区分
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for s in &mut stats {
+        let n = seen.entry(s.name.clone()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            s.name = format!("{} ({})", s.name, *n);
+        }
+    }
+    (total, stats)
+}
+
+/// 查询设备维度统计：返回 (总输入次数, 设备行列表)，周期选择与按键统计一致。
+pub fn get_device_stats(days: Option<i64>, year: Option<i32>) -> (i64, Vec<DeviceStat>) {
+    let rows = if let Some(y) = year {
+        devices_single_year(y, days)
+    } else {
+        let years = query_years(days, None);
+        if years.len() == 1 {
+            devices_single_year(years[0], days)
+        } else {
+            let start_dk = cutoff_day_key(days);
+            let mut merged: Vec<DeviceRow> = Vec::new();
+            for year in years {
+                let path = paths::year_db_path(year);
+                let cond = if start_dk.is_some() {
+                    "date_key >= ?1"
+                } else {
+                    ""
+                };
+                let result = connection::with_ro_conn(&path, |conn| {
+                    query_devices_in_conn(conn, cond, start_dk)
+                });
+                if let Some(mut list) = result.flatten() {
+                    merged.append(&mut list);
+                }
+            }
+            merged
+        }
+    };
+    merge_device_rows(rows)
+}
+
+fn devices_single_year(year: i32, days: Option<i64>) -> Vec<DeviceRow> {
+    let path = paths::year_db_path(year);
+    let start_dk = cutoff_day_key(days);
+    let cond = if start_dk.is_some() {
+        "date_key >= ?1"
+    } else {
+        ""
+    };
+    let result =
+        connection::with_ro_conn(&path, |conn| query_devices_in_conn(conn, cond, start_dk));
+    result.flatten().unwrap_or_default()
+}
+
+/// 查询指定日期设备维度统计。
+pub fn get_device_stats_by_date(target_date: chrono::NaiveDate) -> (i64, Vec<DeviceStat>) {
+    let dk = day_key_of_date(target_date);
+    let path = paths::year_db_path(target_date.year());
+    let result = connection::with_ro_conn(&path, |conn| {
+        query_devices_in_conn(conn, "date_key = ?1", Some(dk))
+    });
+    merge_device_rows(result.flatten().unwrap_or_default())
+}
+
 /// 查询最近 N 天按星期统计（0=周一 ... 6=周日）。
 pub fn get_weekday_stats(days: i64) -> HashMap<i64, i64> {
     let daily = get_daily_counts(days, None);
@@ -681,5 +951,191 @@ mod tests {
         assert_eq!(get_daily_counts(1, None).len(), 1);
         assert_eq!(get_daily_counts(200, None).len(), 200);
         assert_eq!(get_daily_counts(0, None).len(), 1, "非法天数收敛为 1 天");
+    }
+
+    /// VID/PID 解析：USB 形态、蓝牙形态、大小写、残缺格式。
+    #[test]
+    fn parse_vid_pid_variants() {
+        assert_eq!(
+            parse_vid_pid(r"\\?\HID#VID_046D&PID_C52B&MI_00#8&2c5f&0&0000"),
+            Some(("046D".to_string(), "C52B".to_string()))
+        );
+        assert_eq!(
+            parse_vid_pid("hid#vid_1234&pid_5678#x"),
+            Some(("1234".to_string(), "5678".to_string()))
+        );
+        // 蓝牙 HID（真机实测形态）：VID& 后 6 位（含 2 位 vendor id source）
+        assert_eq!(
+            parse_vid_pid(
+                r"\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&0107d7_PID&efff_REV&0120_d46d51083b12&Col03#9&20337b89&0&0002#{378de44c-56ef-11d1-bc8c-00a0c91405dd}"
+            ),
+            Some(("07D7".to_string(), "EFFF".to_string()))
+        );
+        // 蓝牙形态无 source 前缀 / 枚举器分隔符混用（& 与 _）
+        assert_eq!(
+            parse_vid_pid(r"BTHENUM#VID&046d_PID_c52b#x"),
+            Some(("046D".to_string(), "C52B".to_string()))
+        );
+        assert_eq!(
+            parse_vid_pid(r"BTHENUM\Dev_VID&0000046D&PID_C52B"),
+            Some(("046D".to_string(), "C52B".to_string()))
+        );
+        assert_eq!(
+            parse_vid_pid("HID#VID_GGGG&PID_C52B"),
+            None,
+            "非十六进制 VID"
+        );
+        assert_eq!(parse_vid_pid("HID#VID_046D"), None, "缺 PID");
+        assert_eq!(
+            parse_vid_pid("HID#MSFT0001&Col01#5&36f79095&0&0000"),
+            None,
+            "无 VID 段"
+        );
+        assert_eq!(
+            parse_vid_pid("ACPI#MSFT0001#4&f25ce6e&0"),
+            None,
+            "ACPI 无 VID 段"
+        );
+    }
+
+    /// 回退显示名：无登记名时用 VID/PID 段，取不到时截断长路径。
+    #[test]
+    fn fallback_device_name_uses_vid_pid() {
+        assert_eq!(
+            fallback_device_name("HID#VID_046D&PID_C52B&MI_00#8&2c5f&0&0000"),
+            "HID 设备 · 046D/C52B"
+        );
+        let long = "X".repeat(60);
+        assert!(fallback_device_name(&long).starts_with(&"X".repeat(40)));
+        assert!(fallback_device_name(&long).ends_with('…'));
+        assert_eq!(fallback_device_name("short#path"), "short#path");
+    }
+
+    /// 设备查询：登记名 JOIN、无名回退、同名去重、按次数降序。
+    #[test]
+    fn device_stats_merge_join_and_dedupe() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_devq_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let dk = day_key_of_date(Local::now().date_naive());
+        {
+            let path = paths::year_db_path(Local::now().year());
+            let conn = crate::db::connection::open_rw(&path).unwrap();
+            crate::db::connection::ensure_schema(&conn, Local::now().year()).unwrap();
+            let ins_dev = |key: &str, name: &str, kind: &str| {
+                conn.execute(
+                    "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![key, name, kind],
+                )
+                .unwrap();
+            };
+            let ins_cnt = |key: &str, n: i64| {
+                conn.execute(
+                    "INSERT INTO device_counts VALUES (?1, ?2, ?3)",
+                    rusqlite::params![dk, key, n],
+                )
+                .unwrap();
+            };
+            // devA/devD：同型号两只（显示名相同 → 去重加序号）
+            ins_dev(
+                "HID#VID_046D&PID_C52B#devA",
+                "HID-compliant mouse · 046D/C52B",
+                "mouse",
+            );
+            ins_dev(
+                "HID#VID_046D&PID_C52B#devD",
+                "HID-compliant mouse · 046D/C52B",
+                "mouse",
+            );
+            // devB：登记名为空 → 走 VID/PID 回退
+            ins_dev("HID#VID_046D&PID_C52B#devB", "", "mouse");
+            // devC（键盘）：devices 表无登记行 → 回退 + kind=unknown
+            ins_cnt("HID#VID_046D&PID_C52B#devA", 30);
+            ins_cnt("HID#VID_046D&PID_C52B#devD", 10);
+            ins_cnt("HID#VID_046D&PID_C52B#devB", 70);
+            ins_cnt("HID#VID_1B1C&PID_1B2D#kb", 50);
+        }
+
+        let (total, stats) = get_device_stats_by_date(Local::now().date_naive());
+        assert_eq!(total, 160);
+        assert_eq!(stats.len(), 4, "设备按 device_key 独立成行");
+        // 降序：70 / 50 / 30 / 10
+        assert_eq!(
+            stats[0].name, "HID 设备 · 046D/C52B",
+            "空登记名回退 VID/PID"
+        );
+        assert_eq!(stats[0].name, stats[0].auto_name, "无别名时展示名 = 自动名");
+        assert_eq!(
+            stats[0].key, "HID#VID_046D&PID_C52B#devB",
+            "行内必须带 device_key（UI 改名回写要用）"
+        );
+        assert_eq!(stats[0].count, 70);
+        assert_eq!(stats[1].name, "HID 设备 · 1B1C/1B2D", "未登记设备同样回退");
+        assert_eq!(stats[1].kind, "unknown", "未登记设备的类型为 unknown");
+        assert_eq!(stats[1].count, 50);
+        assert_eq!(
+            stats[2].name, "HID-compliant mouse · 046D/C52B",
+            "先出现者保留原名"
+        );
+        assert_eq!(stats[2].count, 30);
+        assert_eq!(stats[2].kind, "mouse");
+        assert_eq!(
+            stats[3].name, "HID-compliant mouse · 046D/C52B (2)",
+            "同型号显示名去重"
+        );
+        assert_eq!(stats[3].count, 10);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 别名生效：改过名的设备展示别名，自动名仍保留在 auto_name 里做副标题。
+    #[test]
+    fn device_alias_overrides_display_name() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_devq_alias_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+        crate::device_alias::invalidate_cache();
+
+        let key = "HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000";
+        let dk = day_key_of_date(Local::now().date_naive());
+        {
+            let path = paths::year_db_path(Local::now().year());
+            let conn = crate::db::connection::open_rw(&path).unwrap();
+            crate::db::connection::ensure_schema(&conn, Local::now().year()).unwrap();
+            conn.execute(
+                "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)",
+                rusqlite::params![key, "HID 鼠标 · 046D/C52B", "mouse"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO device_counts VALUES (?1, ?2, 42)",
+                rusqlite::params![dk, key],
+            )
+            .unwrap();
+        }
+
+        // 无别名：展示自动名
+        let (_, stats) = get_device_stats_by_date(Local::now().date_naive());
+        assert_eq!(stats[0].name, "HID 鼠标 · 046D/C52B");
+        assert_eq!(stats[0].name, stats[0].auto_name);
+
+        // 改名后：展示别名，自动名保留
+        crate::device_alias::set(key, "罗技 G304").unwrap();
+        let (_, stats) = get_device_stats_by_date(Local::now().date_naive());
+        assert_eq!(stats[0].name, "罗技 G304", "展示名应被别名覆盖");
+        assert_eq!(stats[0].auto_name, "HID 鼠标 · 046D/C52B");
+        assert_eq!(stats[0].count, 42, "改名不影响计数");
+
+        // 清空别名：回到自动名
+        crate::device_alias::clear(key).unwrap();
+        let (_, stats) = get_device_stats_by_date(Local::now().date_naive());
+        assert_eq!(stats[0].name, "HID 鼠标 · 046D/C52B");
+
+        crate::device_alias::invalidate_cache();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

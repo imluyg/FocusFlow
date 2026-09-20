@@ -8,6 +8,8 @@ pub mod app_stats;
 pub mod autostart;
 pub mod config;
 pub mod db;
+pub mod device_alias;
+pub mod device_stats;
 pub mod edge_history;
 pub mod format;
 pub mod listener;

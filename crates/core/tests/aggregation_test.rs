@@ -105,4 +105,51 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn alltime_summary_totals_all_days_and_picks_max_day() {
+        let _g = guard();
+        let dir = std::env::temp_dir().join(format!("ff_alltime_{}", std::process::id()));
+        // pid 可能被操作系统复用：先清掉上次运行残留，避免旧库累积干扰断言
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        paths::set_app_dir(&dir);
+        db::queries::invalidate_years_cache();
+
+        let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
+        let database = db::Database::init(&config).unwrap();
+        let writer = database.writer().unwrap().clone();
+
+        // 昨天 3 次 + 今天 7 次：总计 10，最高单日为今天 7
+        let today_start = focusflow_core::db::queries::today_start_ts();
+        let yesterday = today_start - 86_400 + 3600;
+        for _ in 0..3 {
+            writer.record("A", yesterday);
+        }
+        for _ in 0..7 {
+            writer.record("A", today_start + 60);
+        }
+        writer.flush(true);
+        // 跨天增量可能新建上一年度的库文件，年度列表缓存必须失效后才能被扫到
+        db::queries::invalidate_years_cache();
+
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let (total, max_day) = db::get_alltime_summary();
+        assert_eq!(total, 10, "总计应为全部日期之和（回归：只统计今日）");
+        assert_eq!(
+            max_day,
+            Some((today.clone(), 7)),
+            "最高单日应取全历史最大值"
+        );
+
+        // 与既有口径一致：最高单日 = get_alltime_max_day，总计 = get_stats(None, None)
+        assert_eq!(db::get_alltime_max_day(), Some((today, 7)));
+        assert_eq!(db::get_stats(None, None).0, 10);
+
+        database.shutdown(&config);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

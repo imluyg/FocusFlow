@@ -14,15 +14,25 @@ function applyMax(s) {
   $("st-max-date").textContent = s.max_day_date ? "(" + s.max_day_date + ")" : "";
 }
 
+// 总计卡片：今日周期下"今日次数"已由"今日活跃"卡片显示，
+// 这里改显全历史总计，避免两张卡片是同一个数字；其余周期仍显示所选周期总数。
+// 取值来源：charts 推送带 total，live 推送带 period_total / alltime_total
+// （后端在同一把锁里快照 period + 两个总数，切周期时不会标签与数值错配）。
+function applyTotal(s) {
+  const alltime = s.period === -1 || s.period === 0;
+  $("st-total-label").textContent = alltime ? "总计" : "周期总数(" + s.period + "天)";
+  const value = s.period === -1 ? s.alltime_total : s.period_total != null ? s.period_total : s.total;
+  if (typeof value === "number") $("st-total").textContent = fmt(value);
+}
+
 // 轻量数据：今日/速度/周期（高频推送）
 export function applyLive(s) {
   $("st-today").textContent = fmt(s.today_count);
   $("st-active").textContent = "时长 " + fmtDuration(s.active_seconds);
   $("st-cpm").textContent = fmt(s.cpm) + " 次/分";
 
-  const periodLabel = s.period === -1 ? "今日" : s.period === 0 ? "总计" : s.period + "天";
-  $("st-total-label").textContent = "周期总数(" + periodLabel + ")";
   $("st-avg-label").textContent = s.period === -1 ? "日均(今日)" : s.period === 0 ? "日均(近30天)" : "日均(" + s.period + "天)";
+  applyTotal(s);
 
   document.querySelectorAll("#period-tabs .tab").forEach((b) => {
     const active = Number(b.dataset.period) === s.period;
@@ -36,7 +46,7 @@ export function applyLive(s) {
 // 重量数据：图表/排行（低频推送，变化才更新）
 export function applyCharts(s) {
   appState.chartsData = s;
-  $("st-total").textContent = fmt(s.total);
+  applyTotal(s);
   $("st-avg").textContent = fmt(s.avg);
   applyMax(s);
   // 设置页不依赖图表数据：不随推送重建，避免整页 innerHTML 重建清空正在输入的内容
@@ -92,6 +102,151 @@ export function renderApps(s) {
   box.innerHTML = summary + `<table class="grid"><thead><tr>
     <th class="col-rank">排名</th><th class="col-key">应用</th><th class="col-count">使用时长</th><th class="col-percent">占比</th>
     </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// ===== 设备排行 =====
+// 数据来自 Raw Input 侧信道（独立口径：键盘按下 + 鼠标左右中键按下 + 滚轮事件），
+// 与「键鼠排行」的过滤规则不同（不做长按去重/修饰键过滤、不含合成输入），
+// 数字不追求相等 —— 设备维度回答的是"哪个设备在用、占比多少"。
+// 设备名可改：自动解析出的名字（HID 鼠标 · 24AE/1464）不直观，用户可设别名，
+// 存 data/device_aliases.json（后端 alias 优先，自动名作为副标题保留）。
+const deviceFilter = { value: "all" };
+// 改名编辑态：正在改的设备 key + 草稿值（跨推送保留，避免每 2 秒重渲染吃掉输入）
+let deviceEditing = null;
+let deviceDraft = "";
+let deviceLastCharts = null;
+
+const kindLabel = (k) => ({ mouse: "鼠标", keyboard: "键盘", hybrid: "键鼠" }[k] || "未知");
+
+export function renderDevices(s) {
+  const box = $("view-devices");
+  deviceLastCharts = s;
+  // 指纹含周期、筛选与编辑态：切周期/切筛选/进改名时重建，纯数据推送则跳过
+  const fp = JSON.stringify([s.period, s.device_total, s.devices, deviceFilter.value, deviceEditing]);
+  if (skipIfUnchanged(box, fp)) return;
+  const summary = (extra) =>
+    `<div class="rank-summary"><span>统计周期：<b>${periodText(s.period)}</b></span>${extra}</div>`;
+  const list = Array.isArray(s.devices) ? s.devices : [];
+  if (list.length === 0) {
+    box.innerHTML =
+      summary("") +
+      '<div class="empty">暂无设备数据<br><span style="font-size:12px;color:var(--muted);">设备统计随程序运行开始积累，更换键鼠后各自独立计数</span></div>';
+    return;
+  }
+  // 占比分母用后端返回的周期总次数（未截断）；旧版后端无该字段时回退为列表求和
+  const total = Number(s.device_total) || list.reduce((acc, d) => acc + d.count, 0);
+  const covered = list.reduce((acc, d) => acc + d.count, 0);
+  const cover =
+    total && covered < total
+      ? `<span>Top${list.length} 覆盖：<b>${((covered / total) * 100).toFixed(1)}%</b></span>`
+      : "";
+  const head = summary(
+    `<span>输入总次数：<b>${fmt(total)}</b></span>` +
+      `<span>设备数：<b>${list.length}</b> 个</span>${cover}`
+  );
+  const filterTabs = (data) => `<div class="tabs" id="device-filter" role="tablist" aria-label="设备筛选" style="margin-bottom:10px;">
+      <span style="color:var(--muted);font-size:13px;">筛选</span>
+      <button class="tab ${deviceFilter.value === "all" ? "active" : ""}" data-df="all" role="tab" aria-selected="${deviceFilter.value === "all"}">全部</button>
+      <button class="tab ${deviceFilter.value === "mouse" ? "active" : ""}" data-df="mouse" role="tab" aria-selected="${deviceFilter.value === "mouse"}">鼠标</button>
+      <button class="tab ${deviceFilter.value === "keyboard" ? "active" : ""}" data-df="keyboard" role="tab" aria-selected="${deviceFilter.value === "keyboard"}">键盘</button>
+    </div><div id="device-result">${data}</div>`;
+  const src =
+    deviceFilter.value === "all"
+      ? list
+      : list.filter((d) => {
+          const k = d.kind || "unknown";
+          // hybrid（同一实例同时上报键鼠事件）在两类筛选里都显示
+          return deviceFilter.value === "mouse"
+            ? k === "mouse" || k === "hybrid"
+            : k === "keyboard" || k === "hybrid";
+        });
+  const rows = src
+    .map((d, i) => {
+      const editing = deviceEditing === d.key;
+      // 名称 + （有别名时）原名副标题：都用 title 挂全文，截断后悬停可看全部
+      const nameCell = editing
+        ? `<input type="text" id="device-alias-input" value="${escapeHtml(deviceDraft)}" placeholder="${escapeHtml(d.auto_name)}" maxlength="24">`
+        : `<div title="${escapeHtml(d.name)}">${escapeHtml(d.name)}</div>` +
+          (d.has_alias
+            ? `<div class="dev-auto" title="${escapeHtml(d.auto_name)}">原名 ${escapeHtml(d.auto_name)}</div>`
+            : "");
+      const actions = editing
+        ? `<button class="tab dev-act" data-act="device-rename-save" data-key="${escapeHtml(d.key)}">保存</button>` +
+          `<button class="tab dev-act" data-act="device-rename-cancel">取消</button>`
+        : `<button class="tab dev-act" data-act="device-rename" data-key="${escapeHtml(d.key)}">改名</button>` +
+          (d.has_alias
+            ? `<button class="tab dev-act" data-act="device-rename-clear" data-key="${escapeHtml(d.key)}">还原</button>`
+            : "");
+      return `<tr><td>${i + 1}</td><td class="key">${nameCell}</td><td class="col-kind">${kindLabel(d.kind)}</td><td class="num">${fmt(d.count)}</td><td>${total ? ((d.count / total) * 100).toFixed(2) : "0.00"}%</td><td class="col-act">${actions}</td></tr>`;
+    })
+    .join("");
+  const table = src.length
+    ? `<table class="grid grid-devices"><thead><tr>
+    <th class="col-rank">排名</th><th class="col-key">设备</th><th class="col-kind">类型</th><th class="col-count">次数</th><th class="col-percent">占比</th><th class="col-act">操作</th>
+    </tr></thead><tbody>${rows}</tbody></table>`
+    : '<div class="empty">该类型暂无设备</div>';
+  const note =
+    '<div style="margin-top:8px;font-size:12px;color:var(--muted);">口径说明：设备次数 = 键盘按下 + 鼠标左/右/中键按下 + 滚轮滚动，只统计真实硬件输入（脚本/宏产生的合成输入不计）；与「键鼠排行」的过滤规则不同，两者数字不必相等。<br>设备名可点「改名」自定义（存在 data/device_aliases.json，同型号设备换 USB 口后别名仍生效）。</div>';
+  box.innerHTML = head + filterTabs(table) + note;
+  bindDeviceFilter(s);
+  bindAliasInput();
+}
+
+function bindDeviceFilter(s) {
+  document.querySelectorAll("#device-filter .tab").forEach((b) => {
+    b.addEventListener("click", () => {
+      deviceFilter.value = b.dataset.df;
+      renderDevices(s);
+    });
+  });
+}
+
+// 编辑态草稿：每次输入同步到 deviceDraft，重渲染（数据推送）后输入不丢；回车即保存
+function bindAliasInput() {
+  const input = $("device-alias-input");
+  if (!input) return;
+  input.addEventListener("input", () => {
+    deviceDraft = input.value;
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") deviceRenameSave(deviceEditing);
+    if (e.key === "Escape") deviceRenameCancel();
+  });
+  input.focus();
+}
+
+/// 进入改名编辑态（草稿预填已有别名，便于修改）
+export function deviceRename(key) {
+  const list = (deviceLastCharts && deviceLastCharts.devices) || [];
+  const dev = list.find((d) => d.key === key);
+  deviceEditing = key;
+  deviceDraft = dev && dev.has_alias ? dev.name : "";
+  renderDevices(deviceLastCharts);
+}
+
+/// 保存别名（空值等同还原为自动名）
+export function deviceRenameSave(key) {
+  const input = $("device-alias-input");
+  const alias = input ? input.value : deviceDraft;
+  exitDeviceEditing();
+  invoke("set_device_alias", { key, alias }).catch((e) => console.warn("设备改名失败", e));
+}
+
+/// 清除别名，回到自动名
+export function deviceRenameClear(key) {
+  exitDeviceEditing();
+  invoke("set_device_alias", { key, alias: "" }).catch((e) => console.warn("设备还原失败", e));
+}
+
+/// 取消编辑
+export function deviceRenameCancel() {
+  exitDeviceEditing();
+}
+
+function exitDeviceEditing() {
+  deviceEditing = null;
+  deviceDraft = "";
+  renderDevices(deviceLastCharts);
 }
 
 // ===== 键鼠排行 =====
@@ -200,6 +355,17 @@ export async function renderSettings() {
   const hotkeyEnabled = s.hotkey_enabled;
   const hotkeyStr = s.hotkey_str;
   const floatingEnabled = s.floating_enabled;
+  // 备份开关：退出时备份 / 运行中定时备份（0 小时 = 关闭，与 config.ini 同语义）
+  const backupOnExit = s.backup_on_exit !== false;
+  const backupHours = Number(s.backup_online_hours ?? 24) || 0;
+  const backupOnline = backupHours > 0;
+  const hourOptions = [6, 12, 24, 48, 168];
+  if (backupOnline && !hourOptions.includes(backupHours)) hourOptions.push(backupHours);
+  hourOptions.sort((a, b) => a - b);
+  const hourLabel = (h) => (h === 168 ? "每 7 天" : `每 ${h} 小时`);
+  const hourSelect = hourOptions
+    .map((h) => `<option value="${h}" ${h === backupHours ? "selected" : ""}>${hourLabel(h)}</option>`)
+    .join("");
 
   box.innerHTML = `
     <div class="section-title">常规</div>
@@ -214,6 +380,18 @@ export async function renderSettings() {
     <div class="setting-row"><span class="lbl">显示悬浮窗</span><input type="checkbox" id="set-floating" ${floatingEnabled ? "checked" : ""}></div>
     <div class="setting-row"><button class="btn ghost" data-act="show-floating">立即显示</button>
       <button class="btn ghost" data-act="hide-floating">立即隐藏</button></div>
+
+    <div class="section-title">数据备份</div>
+    <div class="setting-row"><span class="lbl">退出时自动备份</span><input type="checkbox" id="set-backup-exit" ${backupOnExit ? "checked" : ""}></div>
+    <div class="setting-row">
+      <span class="lbl">运行中定时备份</span>
+      <input type="checkbox" id="set-backup-online" ${backupOnline ? "checked" : ""}>
+      <select id="set-backup-interval" ${backupOnline ? "" : "disabled"}>${hourSelect}</select>
+    </div>
+    <div style="color:var(--muted);font-size:12px;margin-top:4px;">
+      备份为单文件快照（不受插件开关影响，属核心功能），每类库各保留最近若干份（数量见 config.ini 的 max_backups）；
+      清空/清理数据、跨年归档前的自动快照始终保留，用于兜底恢复。
+    </div>
 
     <div class="section-title">数据操作</div>
     <div class="setting-row">
@@ -253,6 +431,35 @@ export async function renderSettings() {
   });
   $("set-floating").addEventListener("change", async (e) => {
     await invoke("set_config", { section: "floating", key: "enabled", value: e.target.checked ? "true" : "false" });
+  });
+  // 退出时备份：退出路径每次都重读配置，改完立即生效
+  $("set-backup-exit").addEventListener("change", async (e) => {
+    await invoke("set_config", {
+      section: "database",
+      key: "backup_on_exit",
+      value: e.target.checked ? "true" : "false",
+    });
+  });
+  // 定时备份：勾选写入所选小时数，取消写 0（= 关闭）。定时线程每分钟重读配置，
+  // 无需重启；关闭期间不累积计时，重新打开后从零开始计。
+  $("set-backup-online").addEventListener("change", async (e) => {
+    const on = e.target.checked;
+    const sel = $("set-backup-interval");
+    sel.disabled = !on;
+    const hours = on ? Number(sel.value) || 24 : 0;
+    await invoke("set_config", {
+      section: "database",
+      key: "online_backup_interval_hours",
+      value: String(hours),
+    });
+  });
+  $("set-backup-interval").addEventListener("change", async (e) => {
+    if (!$("set-backup-online").checked) return;
+    await invoke("set_config", {
+      section: "database",
+      key: "online_backup_interval_hours",
+      value: e.target.value,
+    });
   });
   renderMaintInfo();
 }
@@ -308,9 +515,16 @@ async function renderMaintInfo() {
   try {
     const info = await invoke("get_maintenance_info");
     const lines = [
-      "退出时自动备份（轮转保留最近若干份），上次压缩: " + (info.last_vacuum || "尚未压缩"),
+      "上次压缩: " + (info.last_vacuum || "尚未压缩"),
       "备份数量: " + info.backup_count + (info.latest_backup ? "，最新: " + info.latest_backup : ""),
     ];
-    $("set-maint").innerHTML = lines.map((l) => `<div>${escapeHtml(l)}</div>`).join("");
+    let html = lines.map((l) => `<div>${escapeHtml(l)}</div>`).join("");
+    // 异常体检提示：备份时发现数据体量异常（骤降/暴涨），当次已冻结轮转
+    if (Array.isArray(info.suspect_notes) && info.suspect_notes.length > 0) {
+      html += info.suspect_notes
+        .map((n) => `<div style="color:var(--danger)">备份异常：${escapeHtml(n)}</div>`)
+        .join("");
+    }
+    $("set-maint").innerHTML = html;
   } catch (e) {}
 }

@@ -17,6 +17,9 @@ use focusflow_core::listener::InputListener;
 #[derive(Clone, Default, Serialize)]
 pub struct ChartAgg {
     pub total: i64,
+    /// 全历史总次数（跨年度库）：今日周期下「总计」卡片用它，避免与「今日活跃」重复。
+    /// 由统计线程按 alltime 缓存 + 今日增量修正后写入，`total` 仍是所选周期的总数。
+    pub alltime_total: i64,
     pub avg: i64,
     pub max_day: i64,
     /// 最高单日对应的日期（YYYY-MM-DD）
@@ -27,6 +30,11 @@ pub struct ChartAgg {
     /// 周期内前台应用时长总和（秒）：排行占比的分母。
     /// 不能拿 apps 求和代替——apps 已截断到 RANK_LIMIT，长周期下会显著高估占比。
     pub app_total: i64,
+    /// 设备维度统计（Raw Input 侧信道，独立口径），随周期联动。
+    /// name 含 VID/PID，同型号设备已去重；kind: mouse/keyboard/hybrid。
+    pub devices: Vec<focusflow_core::db::DeviceStat>,
+    /// 周期内设备输入总次数（占比分母，未截断）
+    pub device_total: i64,
     pub group: Vec<(String, i64)>,
     /// 鼠标使用总次数（含点击与滚轮）
     pub mouse_total: i64,
@@ -62,6 +70,11 @@ pub struct LiveStats {
     pub max_day: i64,
     /// 最高单日对应的日期（YYYY-MM-DD）
     pub max_day_date: String,
+    /// 全历史总次数（今日周期下「总计」卡片显示它，随打字即时增长）
+    pub alltime_total: i64,
+    /// 所选周期的总次数。与 `period` 在同一把锁里快照，两者恒对应同一周期，
+    /// 前端切周期时不会出现「新周期标签 + 旧周期数值」的错配。
+    pub period_total: i64,
 }
 
 /// 重量级图表数据（周期切换 / 定时重聚合，事件 `stats-charts` 推送）。
@@ -87,8 +100,13 @@ const WEBVIEW_BROWSER_ARGS: &str =
 static MAIN_UNLOADED: AtomicBool = AtomicBool::new(false);
 /// 卸载前的页面 URL（重新显示时导航回去）
 static MAIN_URL: Mutex<Option<String>> = Mutex::new(None);
-/// 卸载任务是否已安排（显示时置 false 取消；任务唤醒后自行重置）
-static MAIN_UNLOAD_ARMED: AtomicBool = AtomicBool::new(false);
+/// 卸载任务代次：安排卸载时 +1 并把新值作为该任务的令牌，显示路径再 +1 作废在途任务。
+///
+/// 必须是"代次"而不是"是否已安排"的布尔标志：布尔标志会被随后的第二次隐藏重新置真，
+/// 让第一次隐藏留下的旧任务复活并二次卸载。此刻页面已是 about:blank，二次卸载会把
+/// 恢复 URL 写成 about:blank，主窗口便再也恢复不出来——表现就是"面板点不开，
+/// 空等 16 秒后自动重启"。日志里每次"主窗口页面恢复失败"之前都有这种连续两次卸载。
+static MAIN_UNLOAD_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// 卸载/恢复决策互斥：防止"卸载线程"与"显示路径"竞态
 static MAIN_UNLOAD_LOCK: Mutex<()> = Mutex::new(());
 /// 主窗口显示/隐藏代次：恢复线程捕获后若期间又发生 hide/show 则放弃恢复，避免误弹出
@@ -483,8 +501,8 @@ pub fn show_main_window(app: &tauri::AppHandle) {
 
 /// show_main_window 实现体（窗口已存在，或已确保在普通事件循环轮次执行）。
 fn show_main_window_impl(app: &tauri::AppHandle) {
-    // 取消待执行的"隐藏后卸载页面"任务（线程唤醒后会在锁内再次确认）
-    MAIN_UNLOAD_ARMED.store(false, Ordering::SeqCst);
+    // 作废待执行的"隐藏后卸载页面"任务（线程唤醒后会在锁内二次确认令牌）
+    MAIN_UNLOAD_EPOCH.fetch_add(1, Ordering::SeqCst);
     // 显示/隐藏代次 +1：让仍在等待恢复的旧线程放弃（见 restore_main_after_load）
     MAIN_VIS_EPOCH.fetch_add(1, Ordering::SeqCst);
 
@@ -492,7 +510,6 @@ fn show_main_window_impl(app: &tauri::AppHandle) {
         tracing::info!("show_main: 主窗口首次创建（懒创建）");
         // 全新窗口：清理可能残留的卸载状态（正常流程窗口常驻，此处仅为兜底）
         MAIN_UNLOADED.store(false, Ordering::SeqCst);
-        MAIN_UNLOAD_ARMED.store(false, Ordering::SeqCst);
         *MAIN_URL.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let result = tauri::WebviewWindowBuilder::new(
             app,
@@ -602,40 +619,46 @@ pub fn hide_main_window(app: &tauri::AppHandle) {
 
 /// 主窗口隐藏后延时卸载页面（navigate about:blank），释放页面内存。
 /// 防抖：默认隐藏 60 秒后仍隐藏才卸载（config [gui] unload_hidden_delay，
-/// 最小 5 秒）；显示路径会置 MAIN_UNLOAD_ARMED=false 取消任务。
+/// 最小 5 秒）；显示路径会推进 MAIN_UNLOAD_EPOCH 作废在途任务。
 /// 可通过 [gui] unload_hidden=false 关闭。
 fn arm_main_unload(app: &tauri::AppHandle) {
     let config = focusflow_core::config::instance();
     if !config.get_bool("gui", "unload_hidden", true) {
         return;
     }
-    // 已有任务在等待，不重复安排
-    if MAIN_UNLOAD_ARMED.swap(true, Ordering::SeqCst) {
-        return;
-    }
+    // 本次任务的令牌：任何后续操作（显示/再次隐藏）都会让它失效
+    let token = MAIN_UNLOAD_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let delay = config.get_int("gui", "unload_hidden_delay", 60).max(5) as u64;
     let handle = app.clone();
     std::thread::Builder::new()
         .name("main-unload".into())
         .spawn(move || {
             std::thread::sleep(Duration::from_secs(delay));
-            // 显示路径会置 ARM=false 取消任务
-            if !MAIN_UNLOAD_ARMED.load(Ordering::SeqCst) {
+            // 令牌已过期：期间发生过显示，或又安排了一次新的卸载（后者会自己负责卸载）
+            if MAIN_UNLOAD_EPOCH.load(Ordering::SeqCst) != token {
                 return;
             }
             let Some(win) = handle.get_webview_window("main") else {
-                // 窗口尚不存在（懒创建前）：复位标志，允许后续重新安排卸载
-                MAIN_UNLOAD_ARMED.store(false, Ordering::SeqCst);
                 return;
             };
             let _guard = MAIN_UNLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // 锁内最终确认：任务未被取消、窗口仍隐藏
-            if !MAIN_UNLOAD_ARMED.load(Ordering::SeqCst) || win.is_visible().unwrap_or(true) {
+            // 锁内二次确认：令牌未过期、窗口仍隐藏
+            if MAIN_UNLOAD_EPOCH.load(Ordering::SeqCst) != token || win.is_visible().unwrap_or(true)
+            {
+                return;
+            }
+            // 页面已经卸载过：绝不能再次记录恢复 URL。此刻 win.url() 是 about:blank，
+            // 覆盖进去会让主窗口永远恢复不出来（见 MAIN_UNLOAD_EPOCH 注释）。
+            if MAIN_UNLOADED.load(Ordering::SeqCst) {
                 return;
             }
             let Ok(url) = win.url() else {
                 return;
             };
+            // 兜底：窗口本来就停在空白页（没有可恢复的页面），不做无意义的"卸载"
+            if url.as_str() == "about:blank" {
+                return;
+            }
             // 记录原页面 URL（重新显示时导航回去），再卸载页面
             *MAIN_URL.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.to_string());
             MAIN_UNLOADED.store(true, Ordering::SeqCst);
@@ -686,8 +709,19 @@ fn restore_main_after_load(app: &tauri::AppHandle) {
                     }
                     if let Some(win) = handle.get_webview_window("main") {
                         let url = MAIN_URL.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                        if let Some(u) = url.and_then(|u| u.parse::<tauri::Url>().ok()) {
-                            let _ = win.navigate(u);
+                        // 记不到可恢复的页面 URL：重试导航无从下手，直接进入重启兜底
+                        match url.as_deref() {
+                            Some(u) if u != "about:blank" => {
+                                if let Ok(u) = u.parse::<tauri::Url>() {
+                                    let _ = win.navigate(u);
+                                }
+                            }
+                            other => {
+                                tracing::error!(
+                                    "主窗口恢复 URL 无效（{other:?}），跳过导航重试"
+                                );
+                                break;
+                            }
                         }
                     }
                     for _ in 0..60 {
@@ -713,8 +747,13 @@ fn restore_main_after_load(app: &tauri::AppHandle) {
                 }
             }
             if !loaded {
+                let url = MAIN_URL
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .unwrap_or_else(|| "<none>".into());
                 tracing::error!(
-                    "主窗口页面恢复失败（疑似休眠唤醒后 WebView2 环境损坏），3 秒后自动重启应用"
+                    "主窗口页面恢复失败（恢复目标 {url}，疑似 WebView2 环境损坏），3 秒后自动重启应用"
                 );
                 schedule_app_restart(&handle);
                 return;
@@ -742,10 +781,44 @@ fn restore_main_after_load(app: &tauri::AppHandle) {
         .expect("启动主窗口恢复线程失败");
 }
 
+/// 自动重启是否已安排（一个进程只允许安排一次：多个恢复线程同时超时会各拉起一个
+/// 新进程，几个新进程抢同一把单实例锁、互相把对方挤掉）。
+static RESTART_SCHEDULED: AtomicBool = AtomicBool::new(false);
+
+/// 自动重启链最大深度：A 起 B、B 又起 C…… 每层都要重新等 3 秒 + 冷启动，
+/// 若环境始终恢复不了就会无限重启（应用反复自尽）。到顶后放弃重启，
+/// 把窗口直接显示出来（空白也比"进程还在、面板永远打不开"好排查）。
+const MAX_RESTART_DEPTH: u32 = 2;
+
+/// 当前进程的重启链深度：由命令行 `--restart-depth <n>` 传入（见 desktop/src/lib.rs）。
+fn restart_depth_from_args() -> u32 {
+    let mut args = std::env::args();
+    while let Some(a) = args.next() {
+        if a == "--restart-depth" {
+            return args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        }
+    }
+    0
+}
+
 /// 自动重启应用（WebView2 环境损坏等无法在线恢复的场景）：
 /// 后台线程延迟几秒后拉起新进程（当前 exe，数据目录解析与本次一致），
 /// 当前进程干净退出——退出路径完成 flush/备份，未落库增量由恢复文件兜底。
+///
+/// 新进程带 `--wait-pid <本进程 PID>`：等本进程真正退出后再初始化，
+/// 否则会撞上单实例守卫（新进程被当成第二个实例直接退出，结果是两个进程都没了）
+/// 与 WebView2 用户数据目录；带 `--show-main`：用户本来就是在等面板打开，
+/// 重启后直接把面板显示出来。
 fn schedule_app_restart(app: &tauri::AppHandle) {
+    if RESTART_SCHEDULED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let depth = restart_depth_from_args();
+    if depth >= MAX_RESTART_DEPTH {
+        tracing::error!("自动重启已达上限（深度 {depth}），放弃重启：直接显示空白窗口");
+        reveal_main_window(app);
+        return;
+    }
     let handle = app.clone();
     std::thread::Builder::new()
         .name("app-restart".into())
@@ -755,20 +828,67 @@ fn schedule_app_restart(app: &tauri::AppHandle) {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::error!("自动重启失败：无法定位当前 exe: {e}");
+                    reveal_main_window(&handle);
                     return;
                 }
             };
-            match std::process::Command::new(&exe).spawn() {
+            match std::process::Command::new(&exe)
+                .arg("--wait-pid")
+                .arg(std::process::id().to_string())
+                .arg("--restart-depth")
+                .arg((depth + 1).to_string())
+                .arg("--show-main")
+                .spawn()
+            {
                 Ok(_) => {
-                    tracing::info!("应用自动重启：新进程已启动，当前进程退出");
+                    tracing::info!(
+                        "应用自动重启：新进程已启动（深度 {}），当前进程退出",
+                        depth + 1
+                    );
                     handle.exit(0);
                 }
                 Err(e) => {
                     tracing::error!("自动重启失败（拉起新进程）: {e}，应用保持运行");
+                    reveal_main_window(&handle);
                 }
             }
         })
         .expect("启动应用重启线程失败");
+}
+
+/// 兜底显示主窗口：恢复/重启都失败时至少让窗口可见，
+/// 用户可以据此确认程序还在（托盘菜单仍可退出/重开）。
+fn reveal_main_window(app: &tauri::AppHandle) {
+    set_webview_rendering(app, "main", true);
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.set_skip_taskbar(false);
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
+/// 等应用状态就绪后显示主窗口（推迟到下一轮事件循环执行，避免在 IPC/建窗栈内再建窗）。
+///
+/// 两个入口共用：用户重复启动 exe（单实例回调转发过来）、自动重启带 `--show-main` 启动。
+/// `delay`：启动后先等一会儿再显示（自动重启场景让 WebView2 环境先就绪）。
+pub fn show_main_window_when_ready(app: AppHandle, delay: Duration) {
+    std::thread::Builder::new()
+        .name("show-main-later".into())
+        .spawn(move || {
+            std::thread::sleep(delay);
+            // 启动早期 AppState 可能尚未 manage：最多再等 10 秒
+            for _ in 0..50 {
+                if app.try_state::<Arc<AppState>>().is_some() {
+                    let h = app.clone();
+                    let _ = app.run_on_main_thread(move || show_main_window(&h));
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            tracing::warn!("显示主窗口：应用状态长时间未就绪，放弃");
+        })
+        .expect("启动显示主窗口线程失败");
 }
 
 /// 悬浮窗周期重申置顶（对齐 Python 版方案）：
@@ -881,6 +1001,8 @@ fn spawn_stats_worker(
             const ALLTIME_RECALC_THRESHOLD: i64 = 500;
             let mut alltime_agg: Option<ChartAgg> = None;
             let mut alltime_max: Option<(String, i64)> = None;
+            // 缓存构建时的全历史总次数（-1 = 尚未构建）
+            let mut alltime_total_base: i64 = -1;
             let mut alltime_cache_day: i64 = -1; // 上次缓存构建时的日期（CE 天序号）
             let mut alltime_cache_today: i64 = -1; // 上次缓存构建时的今日计数
                                                    // period != 0 图表的落库序号指纹：DB 自上次聚合后没有新落库（序号未变）
@@ -959,9 +1081,10 @@ fn spawn_stats_worker(
                                 .date_naive()
                                 .format("%Y-%m-%d")
                                 .to_string();
-                            alltime_max = Some(
-                                focusflow_core::db::get_alltime_max_day().unwrap_or((today_str, 0)),
-                            );
+                            // 总计与最高单日同源同失效条件：一次跨库遍历同时取回
+                            let (total_all, max_all) = focusflow_core::db::get_alltime_summary();
+                            alltime_total_base = total_all;
+                            alltime_max = Some(max_all.unwrap_or((today_str, 0)));
                             alltime_cache_day = day_ce;
                             alltime_cache_today = cur_today;
                         }
@@ -1025,7 +1148,11 @@ fn spawn_stats_worker(
                     .cloned()
                     .unwrap_or((0, String::new()));
 
-                {
+                // 全历史总计由缓存基准 + 今日增量修正，与最高单日一样零 DB 查询
+                let alltime_total =
+                    alltime_total_now(alltime_total_base, alltime_cache_today, cur_today);
+
+                let (live_alltime_total, period_total) = {
                     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
                     s.today_count = today_count;
                     s.cpm = cpm;
@@ -1033,7 +1160,10 @@ fn spawn_stats_worker(
                     s.period = period_val;
                     s.agg.max_day = max_day;
                     s.agg.max_day_date = max_day_date.clone();
-                }
+                    s.agg.alltime_total = alltime_total;
+                    // period 与两个总数在同一把锁内快照：前端拿到的永远是自洽的一组
+                    (s.agg.alltime_total, s.agg.total)
+                };
 
                 let live_changed = today_count != prev_today_count
                     || cpm != prev_cpm
@@ -1047,6 +1177,8 @@ fn spawn_stats_worker(
                         period: period_val,
                         max_day,
                         max_day_date,
+                        alltime_total: live_alltime_total,
+                        period_total,
                     };
                     // 事件定向推送：只发给实际可见的窗口。
                     // 隐藏的窗口渲染进程已停（SetIsVisible=false），不再被 500ms 事件唤醒。
@@ -1077,6 +1209,19 @@ fn spawn_stats_worker(
         .expect("启动统计线程失败");
 }
 
+/// 全历史总计 = 缓存基准 + 今日自缓存构建以来的增量（零 DB 查询）。
+///
+/// 今日是唯一会实时增长的部分：跨天、导入、清库都会让 `alltime_dirty` 重建基准。
+/// 增量取 `max(0)`——数据被删除或跨天重置后今日计数可能小于缓存时的值，
+/// 此时宁可显示略旧的基准，也不能把总计减成负数。
+fn alltime_total_now(base: i64, cached_today: i64, cur_today: i64) -> i64 {
+    if base < 0 {
+        // 基准尚未构建（首轮重聚合前）：宁可显示 0，也不显示残缺的总计
+        return 0;
+    }
+    base + (cur_today - cached_today).max(0)
+}
+
 /// 重聚合：按周期查询数据库并计算全部图表数据。
 ///
 /// 纯函数（输入周期、输出聚合结果），从统计线程拆出便于单测；
@@ -1101,6 +1246,14 @@ fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartA
     };
     apps.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
     apps.truncate(RANK_LIMIT);
+    // 设备维度统计（Raw Input 侧信道，独立口径：键盘按下 + 鼠标按键 + 滚轮）。
+    // 查询侧已按次数降序、显示名去重，这里只截断。
+    let (device_total, mut devices) = match period_val {
+        -1 => focusflow_core::db::get_device_stats_by_date(chrono::Local::now().date_naive()),
+        0 => focusflow_core::db::get_device_stats(None, None),
+        n => focusflow_core::db::get_device_stats(Some(n), None),
+    };
+    devices.truncate(RANK_LIMIT);
     let mut rank: Vec<(String, i64)> = key_stats.iter().map(|(k, v)| (k.clone(), *v)).collect();
     rank.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
     rank.truncate(RANK_LIMIT);
@@ -1181,12 +1334,17 @@ fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartA
     let hourly = focusflow_core::db::queries::get_hourly_stats(None);
     ChartAgg {
         total,
+        // 全历史总计要跨年度库汇总，不在此重复查询：统计线程每轮用
+        // alltime 缓存 + 今日增量写入（见 alltime_total_now）
+        alltime_total: 0,
         avg,
         max_day,
         max_day_date,
         rank,
         apps,
         app_total,
+        devices,
+        device_total,
         group,
         mouse_total,
         keyboard_total,
@@ -1199,7 +1357,7 @@ fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartA
 
 #[cfg(test)]
 mod compute_charts_tests {
-    use super::compute_charts;
+    use super::{alltime_total_now, compute_charts};
 
     #[test]
     fn empty_db_returns_zeroed_agg() {
@@ -1209,10 +1367,21 @@ mod compute_charts_tests {
         focusflow_core::paths::set_app_dir(&dir);
         let agg = compute_charts(0, None);
         assert_eq!(agg.total, 0);
+        assert_eq!(agg.alltime_total, 0, "基准未构建时总计应为 0");
         assert_eq!(agg.rank.len(), 0);
         assert_eq!(agg.mouse_total, 0);
         assert_eq!(agg.keyboard_total, 0);
         focusflow_core::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 总计增量修正：基准未构建时为 0，之后按今日新增累加，
+    /// 今日计数回退（删数据/跨天重置）时不得减出负数。
+    #[test]
+    fn alltime_total_tracks_today_delta_without_going_negative() {
+        assert_eq!(alltime_total_now(-1, 0, 0), 0, "基准未构建：显示 0");
+        assert_eq!(alltime_total_now(1000, 100, 100), 1000, "无新增：等于基准");
+        assert_eq!(alltime_total_now(1000, 100, 130), 1030, "新增 30 次即计入");
+        assert_eq!(alltime_total_now(1000, 100, 0), 1000, "计数回退不减基准");
     }
 }

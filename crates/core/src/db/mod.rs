@@ -13,9 +13,10 @@ use std::time::Duration;
 use chrono::Datelike;
 
 pub use queries::{
-    available_years, get_alltime_max_day, get_app_stats, get_app_stats_by_date, get_daily_counts,
+    available_years, get_alltime_max_day, get_alltime_summary, get_app_stats,
+    get_app_stats_by_date, get_daily_counts, get_device_stats, get_device_stats_by_date,
     get_hourly_stats, get_stats, get_stats_by_date, get_today_count, get_weekday_stats,
-    invalidate_years_cache,
+    invalidate_years_cache, DeviceStat,
 };
 pub use writer::DbWriter;
 
@@ -51,6 +52,13 @@ impl Database {
 
         invalidate_years_cache();
 
+        // 启动自愈：清掉旧版备份在 backup/ 里遗留的 -wal/-shm 垃圾
+        // （备份已切回 rollback journal 模式、不再产生 sidecar；非空 WAL 会保留）
+        let swept = maintenance::sweep_stale_sidecars();
+        if swept > 0 {
+            tracing::info!("启动清理：backup/ 中 {swept} 个遗留残留文件已删除");
+        }
+
         // 启动写入线程
         let flush_interval =
             Duration::from_secs(config.get_int("database", "flush_interval", 10).max(1) as u64);
@@ -58,18 +66,18 @@ impl Database {
         // panic hook 兜底：进程异常终止前把未落库增量写入恢复文件
         writer::register_panic_recovery(Arc::clone(writer.as_ref().unwrap()));
 
-        // 运行中定时在线备份：进程被强杀不再丢失自上次备份后的全部数据（0 = 关闭）
-        let backup_hours = config.get_int("database", "online_backup_interval_hours", 24);
-        if backup_hours > 0 {
-            maintenance::start_periodic_backup(
-                backup_hours as u64,
-                config.get_int("database", "max_backups", 5).max(1),
-            );
-        }
+        // 运行中定时在线备份：进程被强杀不再丢失自上次备份后的全部数据。
+        // 线程常驻、每分钟重读配置（online_backup_interval_hours，0 = 关闭），
+        // 这样设置页里开关备份不必重启。
+        maintenance::start_periodic_backup();
 
         // 前台应用识别（写入 current_app，时长归属由写线程按键鼠事件完成；
         // Windows；[app_stats] enabled=false 或 exclude 可关停）
         crate::app_stats::start_sampler(Arc::clone(writer.as_ref().unwrap()));
+
+        // 设备维度统计（Raw Input 侧信道，独立口径按设备归属计数；
+        // Windows；[device_stats] enabled=false 可关停）
+        crate::device_stats::start_device_stats(Arc::clone(writer.as_ref().unwrap()));
 
         Ok(Arc::new(Self { writer }))
     }

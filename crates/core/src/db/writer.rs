@@ -40,6 +40,15 @@ enum Signal {
 /// 不会出现「同一个下午，一张卡说 3 小时、另一张卡说 1 小时」的口径分裂。
 pub(crate) const ACTIVE_GAP_SECS: i64 = 60;
 
+/// 设备登记信息（内存会话态：首个事件时登记，之后只读缓存）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DeviceMeta {
+    /// 显示名（如 "HID-compliant mouse · 046D/C52B"）
+    pub name: String,
+    /// 设备类型：mouse / keyboard / hybrid（同一实例产生两类事件时）
+    pub kind: String,
+}
+
 /// 内存中的聚合增量（未落库部分）。
 /// Clone 用于恢复文件快照；恢复文件的序列化格式见 `AggDeltasFile`。
 #[derive(Default, Clone)]
@@ -56,6 +65,12 @@ struct AggDeltas {
     active: HashMap<i64, i64>,
     /// ((date_key, 应用名)) -> 当日累计使用秒数（前台应用统计）
     apps: HashMap<(i64, String), i64>,
+    /// ((date_key, 设备实例路径)) -> 当日累计输入次数（设备维度统计）。
+    /// 独立口径（键盘按下 + 鼠标按键按下 + 滚轮），不进 daily/hourly/keys。
+    devices: HashMap<(i64, String), i64>,
+    /// 设备登记（device_key -> 名称/类型）。会话态，flush 不取走
+    /// （名称缓存由采集线程在设备首个事件时写入一次，此后只读）。
+    device_meta: HashMap<String, DeviceMeta>,
     /// 上一个事件的时间戳（连续活跃判定用；flush 取走增量时保留）
     last_ts: i64,
     /// 当前前台应用名（归属用；flush 取走增量时保留）。
@@ -71,11 +86,13 @@ impl AggDeltas {
             && self.keys.is_empty()
             && self.active.is_empty()
             && self.apps.is_empty()
+            && self.devices.is_empty()
     }
 
-    /// 取走待落库增量。`last_ts` / `current_app` 保留在内存聚合中：
+    /// 取走待落库增量。`last_ts` / `current_app` / `device_meta` 保留在内存聚合中：
     /// 前者否则每次 flush 都会打断连续活跃判定（每 10 秒白丢一段时长），
-    /// 后者是会话态（当前前台应用），不属于待落库数据。
+    /// 后两者是会话态（当前前台应用、设备名称缓存），不属于待落库数据。
+    /// `devices`（计数）会被取走落库。
     fn take_for_flush(&mut self) -> AggDeltas {
         AggDeltas {
             daily: std::mem::take(&mut self.daily),
@@ -83,6 +100,9 @@ impl AggDeltas {
             keys: std::mem::take(&mut self.keys),
             active: std::mem::take(&mut self.active),
             apps: std::mem::take(&mut self.apps),
+            devices: std::mem::take(&mut self.devices),
+            // 登记表快照随增量走（落库时写 devices 表），本体保留在内存
+            device_meta: self.device_meta.clone(),
             last_ts: self.last_ts,
             current_app: None,
         }
@@ -126,6 +146,19 @@ impl AggDeltas {
                 .or_default()
                 .apps
                 .insert((*dk, app.clone()), *n);
+        }
+        for ((dk, dev), n) in &self.devices {
+            parts
+                .entry(year_of(*dk))
+                .or_default()
+                .devices
+                .insert((*dk, dev.clone()), *n);
+        }
+        // 设备登记表随各分区带上（落库时写 devices 表）。
+        // 必须显式拷贝：partition 由 or_default() 新建，device_meta 默认为空，
+        // 漏掉这一步会出现「device_counts 写成功但 devices 表为空」的隐性数据缺失。
+        for part in parts.values_mut() {
+            part.device_meta = self.device_meta.clone();
         }
         parts
     }
@@ -321,6 +354,43 @@ impl DbWriter {
         }
     }
 
+    /// 设备维度统计：记录一次某设备的输入（独立口径，不进主统计）。
+    ///
+    /// 只累加 `devices` 聚合 —— **不碰 daily/hourly/keys/active**：
+    /// 主统计由 rdev 低级钩子负责，本方法来自 Raw Input 侧信道，
+    /// 两条链路的过滤规则不同（Raw Input 只收真实硬件输入、
+    /// 不做长按去重/修饰键过滤），数字不追求与键鼠统计相等。
+    ///
+    /// 设备登记（名称/类型）在首个事件时写入 `device_meta` 一次，
+    /// 之后同名调用零开销（名称未变不重建 String）。
+    pub fn record_device(&self, device_key: &str, name: &str, kind: &str, timestamp: i64) {
+        let mut agg = self.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+        match agg.device_meta.get_mut(device_key) {
+            Some(meta) => {
+                // 类型冲突（同一实例产生了鼠标+键盘两类事件）→ hybrid
+                if meta.kind != kind && meta.kind != "hybrid" {
+                    meta.kind = "hybrid".to_string();
+                }
+                if meta.name != name {
+                    meta.name = name.to_string();
+                }
+            }
+            None => {
+                agg.device_meta.insert(
+                    device_key.to_string(),
+                    DeviceMeta {
+                        name: name.to_string(),
+                        kind: kind.to_string(),
+                    },
+                );
+            }
+        }
+        let day_key = queries::day_key_of_ts(timestamp);
+        *agg.devices
+            .entry((day_key, device_key.to_string()))
+            .or_insert(0) += 1;
+    }
+
     /// 是否有未落库的增量（重聚合前判断是否需要先 flush）。
     pub fn has_pending(&self) -> bool {
         !self
@@ -410,6 +480,7 @@ struct AggDeltasFile {
     keys: Vec<(i64, Vec<(String, i64)>)>,
     active: Vec<(i64, i64)>,
     apps: Vec<((i64, String), i64)>,
+    devices: Vec<((i64, String), i64)>,
     last_ts: i64,
 }
 
@@ -425,6 +496,7 @@ impl From<&AggDeltas> for AggDeltasFile {
                 .collect(),
             active: a.active.iter().map(|(k, v)| (*k, *v)).collect(),
             apps: a.apps.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            devices: a.devices.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             last_ts: a.last_ts,
         }
     }
@@ -442,8 +514,11 @@ impl From<AggDeltasFile> for AggDeltas {
                 .collect(),
             active: f.active.into_iter().collect(),
             apps: f.apps.into_iter().collect(),
-            last_ts: f.last_ts,
+            devices: f.devices.into_iter().collect(),
             // 会话态不透传恢复文件：回放后由采集线程重新填充
+            // （设备名称在下一个输入事件时重新登记）
+            device_meta: HashMap::new(),
+            last_ts: f.last_ts,
             current_app: None,
         }
     }
@@ -639,6 +714,9 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
         for ((dk, app), n) in part.apps {
             *agg.apps.entry((dk, app)).or_insert(0) += n;
         }
+        for ((dk, dev), n) in part.devices {
+            *agg.devices.entry((dk, dev)).or_insert(0) += n;
+        }
     }
 }
 
@@ -704,6 +782,25 @@ fn flush_partition(
                     )?;
                     for ((dk, app), n) in &pending.apps {
                         stmt.execute(rusqlite::params![dk, app, n])?;
+                    }
+                }
+                {
+                    let mut stmt = c.prepare(
+                        "INSERT INTO device_counts (date_key, device_key, count) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(date_key, device_key) DO UPDATE SET count = count + excluded.count",
+                    )?;
+                    for ((dk, dev), n) in &pending.devices {
+                        stmt.execute(rusqlite::params![dk, dev, n])?;
+                    }
+                }
+                // 设备登记表：幂等覆盖（名称/类型变更时更新，其余情况写入相同值）
+                {
+                    let mut stmt = c.prepare(
+                        "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(device_key) DO UPDATE SET name = excluded.name, kind = excluded.kind",
+                    )?;
+                    for (dev, meta) in &pending.device_meta {
+                        stmt.execute(rusqlite::params![dev, meta.name, meta.kind])?;
                     }
                 }
                 Ok(())
@@ -937,6 +1034,155 @@ mod tests {
             );
         }
         w.stop();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 设备维度：record_device 只累加 devices 聚合，不污染主统计；
+    /// 类型冲突升级 hybrid；登记信息保留在会话态（flush 后仍在）。
+    #[test]
+    fn record_device_isolated_from_main_stats() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_writer_device_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+        let w = DbWriter::start(Duration::from_secs(3600));
+        let ts = queries::now_ts();
+        let dk = queries::day_key_of_ts(ts);
+
+        w.record("A", ts);
+        w.record_device(
+            "HID#VID_046D&PID_C52B",
+            "罗技 G304 · 046D/C52B",
+            "mouse",
+            ts,
+        );
+        w.record_device(
+            "HID#VID_046D&PID_C52B",
+            "罗技 G304 · 046D/C52B",
+            "mouse",
+            ts,
+        );
+        // 同一实例产生键盘事件 → hybrid
+        w.record_device(
+            "HID#VID_046D&PID_C52B",
+            "罗技 G304 · 046D/C52B",
+            "keyboard",
+            ts,
+        );
+
+        {
+            let agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+            let dev = "HID#VID_046D&PID_C52B".to_string();
+            assert_eq!(agg.devices.get(&(dk, dev.clone())), Some(&3));
+            assert_eq!(
+                agg.daily.get(&dk),
+                Some(&1),
+                "record_device 不得计入主统计 daily"
+            );
+            // 主统计只含显式 record 的那 1 次按键，设备事件不新增键名
+            assert_eq!(
+                agg.keys.get(&dk).and_then(|m| m.get("A")),
+                Some(&1),
+                "record_device 不得计入键名排行"
+            );
+            assert_eq!(agg.keys[&dk].len(), 1, "设备事件不得新增键名");
+            assert_eq!(
+                agg.device_meta.get(&dev).map(|m| m.kind.as_str()),
+                Some("hybrid")
+            );
+        }
+        w.flush(true);
+        // flush 后登记信息仍在内存（会话态），计数已取走
+        {
+            let agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(agg.devices.is_empty(), "flush 应取走设备计数");
+            assert!(!agg.device_meta.is_empty(), "设备登记应跨 flush 保留");
+        }
+        w.stop();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 设备维度落库：device_counts 累加 + devices 登记表写入。
+    #[test]
+    fn flush_writes_device_tables() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_writer_devflush_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+        let w = DbWriter::start(Duration::from_secs(3600));
+        let ts = queries::now_ts();
+        let dk = queries::day_key_of_ts(ts);
+        let dev = "HID#VID_1234&PID_5678".to_string();
+
+        w.record_device(&dev, "测试鼠标 · 1234/5678", "mouse", ts);
+        w.record_device(&dev, "测试鼠标 · 1234/5678", "mouse", ts);
+        w.flush(true);
+
+        let conn = connection::open_ro(&paths::current_year_db_path()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count FROM device_counts WHERE date_key = ?1 AND device_key = ?2",
+                rusqlite::params![dk, dev],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        let (name, kind): (String, String) = conn
+            .query_row(
+                "SELECT name, kind FROM devices WHERE device_key = ?1",
+                [&dev],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "测试鼠标 · 1234/5678");
+        assert_eq!(kind, "mouse");
+        w.stop();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 恢复机制：设备计数随快照落盘并回放，恰好落库一次。
+    #[test]
+    fn recovery_replays_device_counts_once() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_writer_devrec_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let w = DbWriter::start(Duration::from_secs(3600));
+        let ts = queries::now_ts();
+        let dk = queries::day_key_of_ts(ts);
+        let dev = "HID#VID_AAAA&PID_BBBB".to_string();
+        w.record_device(&dev, "恢复测试键盘 · AAAA/BBBB", "keyboard", ts);
+        w.record_device(&dev, "恢复测试键盘 · AAAA/BBBB", "keyboard", ts);
+        snapshot_recovery(&w.state, true);
+        w.stop();
+
+        let db_count = || -> i64 {
+            connection::open_ro(&paths::current_year_db_path())
+                .ok()
+                .and_then(|conn| {
+                    conn.query_row(
+                        "SELECT COALESCE(SUM(count),0) FROM device_counts WHERE date_key=?1 AND device_key=?2",
+                        rusqlite::params![dk, dev],
+                        |r| r.get(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or(0)
+        };
+        let base = db_count();
+
+        let w2 = DbWriter::start(Duration::from_secs(3600));
+        w2.flush(true);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while w2.flush_seq() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(db_count(), base + 2, "设备计数应恰好回放一次");
+        w2.stop();
         std::fs::remove_dir_all(&dir).ok();
     }
 

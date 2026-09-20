@@ -26,10 +26,14 @@ rdev = "0.5"
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 
 # 前台应用统计（仅用窗口 API + 进程快照，不对其他进程开句柄）
+# 设备维度统计用 Raw Input（Win32_UI_Input_KeyboardAndMouse）
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
     "Win32_System_Diagnostics_ToolHelp",
 ] }
 

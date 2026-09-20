@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use chrono::{Datelike, Local, NaiveDate};
 use rusqlite::Connection;
 
+use crate::config::FocusFlowConfig;
 use crate::db::connection;
 use crate::db::queries;
 use crate::paths;
@@ -103,6 +104,17 @@ pub fn archive_stale_years(source_year: i32) -> bool {
     };
 
     let mut migrated_any = false;
+    if !stale.is_empty() {
+        // 归档前的兜底快照（不受备份开关影响）。
+        //
+        // 归档是**跨库搬数据**：ATTACH 源库，在同一个事务里 INSERT 进目标年库、
+        // 再 DELETE 源库数据。而 SQLite 官方文档明确：WAL 模式下「多库事务只保证
+        // 每个库各自原子，整体不原子」。所以崩溃可能留下「目标库已加、源库未删」，
+        // 下次启动会再次归档同一段数据，而 UPSERT 是 `count = count + excluded.count`
+        // → 历史计数翻倍且无法自动识别。
+        // 只有在确实检测到往年数据时才快照（正常年份不进这里），代价可接受。
+        snapshot_before_destructive("yearly_archive");
+    }
     for (year, a, b) in stale {
         if archive_year_range(year, source_year, a, b) {
             migrated_any = true;
@@ -479,22 +491,113 @@ fn backup_db_file(src: &Path, dst: &Path) -> bool {
     }
 }
 
-/// 启动运行中定时在线备份线程：每 `interval_hours` 小时静默备份一次全部年度库
-/// （0 = 关闭）。进程被强杀时不再丢失自上次退出备份后的全部数据。
-/// 备份走 SQLite 在线备份 API，不阻塞读写（与写线程的短事务天然错开）。
-pub fn start_periodic_backup(interval_hours: u64, max_backups: i64) {
-    if interval_hours == 0 {
-        return;
+/// 备份文件的 sidecar 路径（WAL 模式会生成 `-wal` / `-shm`）。
+fn sidecar_paths(db: &Path) -> [std::path::PathBuf; 2] {
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    let mut shm = db.as_os_str().to_owned();
+    shm.push("-shm");
+    [std::path::PathBuf::from(wal), std::path::PathBuf::from(shm)]
+}
+
+/// 收尾备份文件，让它成为**单个自包含文件**。
+///
+/// 在线备份 API 会把源库的「WAL 模式」头一起复制过去，于是备份本身也是 WAL 库：
+/// - 每次备份/校验都会在旁边留下 `-wal`（0 字节）与 `-shm`（32KB），轮转又只认
+///   `.db`，这些 sidecar 永久堆积（实测 2 小时就攒了 66 个、1MB）
+/// - 只读打开（校验逻辑、只读介质、网盘同步目录）需要目录写权限才建得出 `-shm`，
+///   拿不到时会被误判为「坏备份」删掉
+///
+/// 所以备份完成后切回 rollback journal 并清掉 sidecar。
+fn finalize_backup(dst: &Path) {
+    let switched = Connection::open(dst)
+        .map(|conn| conn.pragma_update(None, "journal_mode", "DELETE").is_ok())
+        .unwrap_or(false);
+    let [wal, shm] = sidecar_paths(dst);
+    // 非空 WAL 里可能有还没并回主库的数据：只有确认切换成功、或 WAL 缺失/0 字节时才删
+    let wal_empty = std::fs::metadata(&wal)
+        .map(|m| m.len() == 0)
+        .unwrap_or(true);
+    if switched || wal_empty {
+        let _ = std::fs::remove_file(&wal);
+        let _ = std::fs::remove_file(&shm);
     }
+}
+
+/// 删除备份文件及其 sidecar（轮转、失败清理共用）。
+fn remove_backup(db: &Path) {
+    let _ = std::fs::remove_file(db);
+    for p in sidecar_paths(db) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// 清理备份目录里遗留的 sidecar（`-wal`/`-shm`）垃圾。
+///
+/// 旧版备份会把源库的 WAL 头复制进备份文件、并在旁边留下 sidecar，而轮转只认
+/// `.db` —— 被轮转掉的备份留下孤儿 sidecar，保留下来的备份也一直挂着两个垃圾文件。
+/// 这里的判据是安全的：**主库已不存在**（孤儿），或**对应 `-wal` 为空/缺失**
+/// （内容已全部并回主库）。非空 WAL 绝不删（里面可能有未合并的数据）。
+pub fn sweep_stale_sidecars() -> usize {
+    let dir = paths::backup_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("focusflow_") {
+            continue;
+        }
+        let Some(base) = name
+            .strip_suffix("-wal")
+            .or_else(|| name.strip_suffix("-shm"))
+        else {
+            continue;
+        };
+        let db_exists = dir.join(base).exists();
+        let wal_empty = std::fs::metadata(dir.join(format!("{base}-wal")))
+            .map(|m| m.len() == 0)
+            .unwrap_or(true);
+        if (!db_exists || wal_empty) && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 启动运行中定时在线备份线程。
+///
+/// 每 60 秒醒来重新读一次配置（`[database] online_backup_interval_hours`，0 = 关闭），
+/// 所以设置页里改开关/间隔**不必重启**：关闭期间不计时，重新打开后从零开始重新计时。
+/// 备份走 SQLite 在线备份 API，不阻塞读写（与写线程的短事务天然错开）。
+pub fn start_periodic_backup() {
     std::thread::Builder::new()
         .name("periodic-backup".into())
         .spawn(move || {
-            let interval = std::time::Duration::from_secs(interval_hours * 3600);
-            tracing::info!("定时在线备份已启动：每 {interval_hours} 小时一次");
+            tracing::info!(
+                "定时在线备份线程已启动（间隔读 [database] online_backup_interval_hours，0 = 关闭）"
+            );
+            let tick = std::time::Duration::from_secs(60);
+            let mut last = std::time::Instant::now();
             loop {
-                std::thread::sleep(interval);
-                if backup_database(max_backups).is_none() {
-                    tracing::debug!("定时备份：无可备份的年度库");
+                std::thread::sleep(tick);
+                let config = crate::config::instance();
+                // 上限一年，避免异常配置（如 i64::MAX）在秒换算时溢出
+                let hours = config
+                    .get_int("database", "online_backup_interval_hours", 24)
+                    .clamp(0, 24 * 365) as u64;
+                if hours == 0 {
+                    // 关闭期间不计时：重新打开后从零开始，不会立刻补一次备份
+                    last = std::time::Instant::now();
+                    continue;
+                }
+                if last.elapsed() >= std::time::Duration::from_secs(hours * 3600) {
+                    let max_backups = config.get_int("database", "max_backups", 5);
+                    if backup_database(max_backups).is_none() {
+                        tracing::debug!("定时备份：无可备份的年度库");
+                    }
+                    last = std::time::Instant::now();
                 }
             }
         })
@@ -515,15 +618,40 @@ fn snapshot_before_destructive(op: &str) {
     }
 }
 
-/// 附属数据库（记账/番茄钟/定时任务/Edge 历史）路径列表。
-/// 这些库以前从不备份，记账等数据损坏后无法恢复。
-fn auxiliary_db_paths() -> Vec<(&'static str, std::path::PathBuf)> {
+/// 附属数据库：`(库名, 对应插件的文件名 stem, 路径)`。
+///
+/// 第二个字段用于判断该插件是否已被停用 —— 停用的插件其库不再被写入，
+/// 没必要占用备份轮转名额（可用 `[database] backup_disabled_plugins = true` 强制全量）。
+fn auxiliary_db_paths() -> Vec<(&'static str, &'static str, std::path::PathBuf)> {
     vec![
-        ("accounting", crate::accounting::db_path()),
-        ("pomodoro", crate::pomodoro::db_path()),
-        ("scheduler", crate::scheduler::db_path()),
-        ("edge_history", crate::edge_history::edge_db_path()),
+        (
+            "accounting",
+            "accounting_plugin",
+            crate::accounting::db_path(),
+        ),
+        ("pomodoro", "pomodoro_plugin", crate::pomodoro::db_path()),
+        ("scheduler", "scheduler_plugin", crate::scheduler::db_path()),
+        (
+            "edge_history",
+            "edge_history_plugin",
+            crate::edge_history::edge_db_path(),
+        ),
     ]
+}
+
+/// 解析 `[plugins] disabled`（逗号分隔的插件文件名 stem，与 plugins::manager 同语义）。
+fn disabled_plugin_stems(config: &FocusFlowConfig) -> Vec<String> {
+    config
+        .get_or("plugins", "disabled", "")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 该附属库是否参与本次备份：插件停用时跳过（`force` = 强制全量）。
+fn should_backup_aux(plugin_stem: &str, disabled: &[String], force: bool) -> bool {
+    force || !disabled.iter().any(|s| s == plugin_stem)
 }
 
 /// 备份所有年度数据库与附属数据库到 backup/ 目录，返回首个备份路径。
@@ -540,8 +668,17 @@ static BACKUP_LOCK: Mutex<()> = Mutex::new(());
 pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
     let _guard = BACKUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::fs::create_dir_all(paths::backup_dir()).ok();
+    // 顺手清掉遗留的 sidecar 垃圾（旧版只删 .db，`-wal`/`-shm` 会永久堆积）
+    let swept = sweep_stale_sidecars();
+    if swept > 0 {
+        tracing::info!("已清理 {swept} 个遗留备份残留文件（-wal/-shm）");
+    }
     // 毫秒精度：即使锁被绕过，同秒内的两次备份也不会撞同一个文件名
     let timestamp = Local::now().format("%Y%m%d_%H%M%S%3f").to_string();
+    // 异常体检基线：本轮之前最新的一份年度库备份（用于对比体量）
+    let baseline_path = newest_backup_of_group(&chrono::Local::now().year().to_string());
+    let baseline_fp = baseline_path.as_deref().and_then(backup_fingerprint);
+    let mut suspicious_detail: Option<String> = None;
     let mut backed_up: Vec<std::path::PathBuf> = Vec::new();
     for year in queries::available_years() {
         let src = paths::year_db_path(year);
@@ -549,35 +686,92 @@ pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
             continue;
         }
         let dst = paths::backup_dir().join(format!("focusflow_{year}_{timestamp}.db"));
-        let mut ok = backup_db_file(&src, &dst) && verify_backup_file(&dst);
+        let mut ok = backup_db_file(&src, &dst);
+        if ok {
+            finalize_backup(&dst);
+            ok = verify_backup_file(&dst);
+        }
         if !ok {
+            // 失败的半成品会占轮转名额、顶掉好备份：先清干净再走兜底
+            remove_backup(&dst);
             // 兜底：checkpoint 后直接复制主文件（复制的是变化中的文件，可能撕裂，
             // 必须校验，避免坏备份顶掉轮转中的好备份）
             if let Ok(conn) = connection::open_rw(&src) {
                 let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
                 drop(conn);
             }
-            ok = std::fs::copy(&src, &dst).is_ok() && verify_backup_file(&dst);
+            if std::fs::copy(&src, &dst).is_ok() {
+                finalize_backup(&dst);
+                ok = verify_backup_file(&dst);
+            }
         }
         if ok {
+            // 异常体检：与上一份备份比总量/天数（只对当前年份库有意义）
+            if year == chrono::Local::now().year() {
+                if let (Some(prev), Some(cur)) = (baseline_fp, backup_fingerprint(&dst)) {
+                    if is_suspicious_change(prev, cur) {
+                        suspicious_detail = Some(format!(
+                            "对比对象: {}（总次数 {}，天数 {}）\n本次备份: {}（总次数 {}，天数 {}）",
+                            baseline_path
+                                .as_deref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default(),
+                            prev.total,
+                            prev.days,
+                            dst.display(),
+                            cur.total,
+                            cur.days
+                        ));
+                    }
+                }
+            }
             backed_up.push(dst);
+        } else {
+            remove_backup(&dst);
+            tracing::error!("年度库备份失败（已清理半成品）: {year}");
         }
     }
     // 附属库同样纳入备份与轮转（命名沿用 focusflow_{组名}_{时间戳}.db，
-    // rotate_backups 按第一段分组，"accounting" 等名称各自成组）
-    for (name, src) in auxiliary_db_paths() {
+    // rotate_backups 按第一段分组，"accounting" 等名称各自成组）。
+    // 已停用插件的数据默认跳过：其库不再被写入，备份它只会白占轮转名额。
+    let config = crate::config::instance();
+    let disabled = disabled_plugin_stems(config);
+    let force_aux = config.get_bool("database", "backup_disabled_plugins", false);
+    for (name, stem, src) in auxiliary_db_paths() {
         if !src.exists() {
             continue;
         }
+        if !should_backup_aux(stem, &disabled, force_aux) {
+            tracing::debug!("跳过已停用插件的数据备份: {name}（{stem}）");
+            continue;
+        }
         let dst = paths::backup_dir().join(format!("focusflow_{name}_{timestamp}.db"));
-        if backup_db_file(&src, &dst) && verify_backup_file(&dst) {
+        let ok = backup_db_file(&src, &dst) && {
+            finalize_backup(&dst);
+            verify_backup_file(&dst)
+        };
+        if ok {
             backed_up.push(dst);
         } else {
-            tracing::error!("附属库备份失败: {name}");
+            remove_backup(&dst);
+            tracing::error!("附属库备份失败（已清理半成品）: {name}");
         }
     }
     if !backed_up.is_empty() {
-        rotate_backups(max_backups);
+        let mut policy = RetentionPolicy::from_config(config);
+        // 调用方传入的 max_backups 覆盖「最近 N 份」（保持旧签名语义不变）
+        policy.recent = max_backups.max(1) as usize;
+        // 异常体检发现可疑 → 冻结本次轮转（不删任何旧备份）+ 留一份 SUSPECT 说明
+        if let Some(detail) = suspicious_detail {
+            tracing::error!(
+                "备份数据异常：已冻结轮转，本次不删除任何旧备份。\n{detail}\n\
+                 建议先排查统计异常，必要时用更早的备份恢复。"
+            );
+            write_suspect_note(&timestamp, &detail);
+            rotate_backups(policy, true);
+        } else {
+            rotate_backups(policy, false);
+        }
         tracing::info!(
             "已备份 {} 个数据库到 {}",
             backed_up.len(),
@@ -589,11 +783,192 @@ pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
     }
 }
 
-/// 保留每组最近 N 个备份。
+/// 备份体量指纹（只对含统计表的年度库有意义）。
+///
+/// 用于「异常体检」：与上一份备份对比总量与天数，骤降说明可能丢数据、
+/// 暴增说明可能重复计数（例如跨年归档重复执行导致的计数翻倍）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BackupFingerprint {
+    /// daily_counts 的总次数
+    total: i64,
+    /// daily_counts 的天数（行数）
+    days: i64,
+}
+
+/// 读取备份文件的体量指纹（打不开或表缺失返回 None）。
+fn backup_fingerprint(path: &Path) -> Option<BackupFingerprint> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let total: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let days: i64 = conn
+        .query_row("SELECT COUNT(*) FROM daily_counts", [], |r| r.get(0))
+        .ok()?;
+    Some(BackupFingerprint { total, days })
+}
+
+/// 新快照相对上一份是否「异常」。判定保守：样本太小（第一份备份、刚装好）时不判定。
+fn is_suspicious_change(prev: BackupFingerprint, cur: BackupFingerprint) -> bool {
+    /// 样本下限：总量低于此值时阈值没有统计意义
+    const MIN_SAMPLE: i64 = 1_000;
+    if prev.total < MIN_SAMPLE || cur.total < MIN_SAMPLE {
+        return false;
+    }
+    let dropped = cur.total * 2 < prev.total; // 掉了一半以上：疑似丢数据
+    let rose = cur.total > prev.total * 4; // 涨到 4 倍以上：疑似重复计数
+    let days_lost = cur.days + 1 < prev.days; // 天数明显减少（一天最多新增 1 天）
+    dropped || rose || days_lost
+}
+
+/// 把异常体检结果写成 `backup/SUSPECT-<时间戳>.txt`：日志之外留一份可追溯的记录，
+/// 设置页也会读它做提示（轮转只认 `.db`，不会碰它）。
+fn write_suspect_note(timestamp: &str, detail: &str) -> std::path::PathBuf {
+    let path = paths::backup_dir().join(format!("SUSPECT-{timestamp}.txt"));
+    let body = format!(
+        "检测到备份数据异常，已冻结轮转（本次未删除任何旧备份）\n\
+         时间: {timestamp}\n{detail}\n\
+         建议：先别继续备份，确认统计是否异常（可与更早的备份对比）。\n\
+         备份是单文件快照，可直接把更早的那份改名回 data/ 下的同名库来恢复。\n"
+    );
+    if let Err(e) = std::fs::write(&path, body) {
+        tracing::error!("异常说明文件写入失败 {}: {e}", path.display());
+    }
+    path
+}
+
+/// 某分组（年份 / 插件名）中最新的一份备份。
+fn newest_backup_of_group(group: &str) -> Option<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(paths::backup_dir())
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| {
+                    let n = n.to_string_lossy();
+                    n.starts_with(&format!("focusflow_{group}_")) && n.ends_with(".db")
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    files.pop()
+}
+
+/// 保留策略：最近 N 份 + 每天/每周/每月各一份。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RetentionPolicy {
+    /// 最近 N 份（近端全留）
+    recent: usize,
+    daily: usize,
+    weekly: usize,
+    monthly: usize,
+}
+
+impl RetentionPolicy {
+    fn from_config(config: &FocusFlowConfig) -> Self {
+        let get =
+            |key: &str, default: i64| config.get_int("database", key, default).max(0) as usize;
+        Self {
+            // 兼容旧键：max_backups 语义不变（最近 N 份）
+            recent: config.get_int("database", "max_backups", 5).max(1) as usize,
+            daily: get("backup_keep_daily", 7),
+            weekly: get("backup_keep_weekly", 4),
+            monthly: get("backup_keep_monthly", 6),
+        }
+    }
+}
+
+/// 从备份文件名解析日期（`focusflow_{组}_{YYYYMMDD}_{HHMMSS[mmm]}.db`），
+/// 解析失败回退文件修改时间。
+fn backup_file_date(path: &Path) -> Option<NaiveDate> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    if let Some(stem) = name.strip_suffix(".db") {
+        let parts: Vec<&str> = stem.split('_').collect();
+        if parts.len() >= 4 {
+            if let Ok(d) = NaiveDate::parse_from_str(parts[2], "%Y%m%d") {
+                return Some(d);
+            }
+        }
+    }
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let dt: chrono::DateTime<Local> = modified.into();
+    Some(dt.date_naive())
+}
+
+/// 按桶保留：每桶（天/周/月）只留最新的一份，最多 `max_buckets` 个桶（桶按新→旧取）。
+/// `files` 必须已按新→旧排序；已被近端保留的条目跳过（但计入桶去重）。
+fn retain_newest_per_bucket(
+    files: &[std::path::PathBuf],
+    keep: &mut [bool],
+    max_buckets: usize,
+    bucket_of: impl Fn(&Path) -> Option<String>,
+) {
+    if max_buckets == 0 {
+        return;
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let Some(bucket) = bucket_of(f.as_path()) else {
+            continue;
+        };
+        if seen.iter().any(|s| s == &bucket) {
+            continue;
+        }
+        if seen.len() >= max_buckets {
+            // 桶已按新→旧取满，更旧的桶整体丢弃
+            return;
+        }
+        // 该桶最新的一份：已被近端保留也算（不重复保留，但占用桶名额）
+        if !keep[i] {
+            keep[i] = true;
+        }
+        seen.push(bucket);
+    }
+}
+
+/// 选出要保留的备份（与 `files` 等长，true = 保留）。
+///
+/// 为什么不做「只留最新 N 份」：一旦异常数据进入统计，之后每次备份都会把它固化，
+/// 最新 N 份被依次顶掉 —— 几轮之后就没有任何干净的历史了（按份数轮转时，
+/// 开关几次程序就能把 5 个槽位全换一遍）。分层保留保证无论短期备份多密集，
+/// 都留着「约 1 天前 / 1 周前 / 1 个月前」的快照。
+fn select_retained(files: &[std::path::PathBuf], policy: RetentionPolicy) -> Vec<bool> {
+    let mut keep = vec![false; files.len()];
+    for k in keep.iter_mut().take(policy.recent.min(files.len())) {
+        *k = true;
+    }
+    // 每天一份
+    retain_newest_per_bucket(files, &mut keep, policy.daily, |p| {
+        backup_file_date(p).map(|d| d.format("%Y%m%d").to_string())
+    });
+    // 每周一份（ISO 周）
+    retain_newest_per_bucket(files, &mut keep, policy.weekly, |p| {
+        backup_file_date(p).map(|d| format!("{}-W{:02}", d.iso_week().year(), d.iso_week().week()))
+    });
+    // 每月一份
+    retain_newest_per_bucket(files, &mut keep, policy.monthly, |p| {
+        backup_file_date(p).map(|d| d.format("%Y%m").to_string())
+    });
+    keep
+}
+
+/// 按保留策略清理每组的旧备份（同时删掉其 `-wal`/`-shm`）。
+///
+/// `freeze = true` 时**本次不删任何文件**：异常体检发现数据可疑时用它兜底，
+/// 宁可多留旧备份，也不让坏数据把干净的历史顶掉。
 /// 分组键取文件名第一段（`focusflow_2026_…` → "2026"，`focusflow_accounting_…`
 /// → "accounting"）。此前按第二段分组取到的是日期，每天自成一组导致轮转
 /// 永远删不到旧日期的备份，backup/ 目录无限增长。
-fn rotate_backups(max_keep: i64) {
+fn rotate_backups(policy: RetentionPolicy, freeze: bool) {
     let mut groups: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
     if let Ok(entries) = std::fs::read_dir(paths::backup_dir()) {
         for entry in entries.flatten() {
@@ -611,11 +986,28 @@ fn rotate_backups(max_keep: i64) {
             }
         }
     }
-    for files in groups.values_mut() {
+    for (group, files) in groups.iter_mut() {
         files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
         files.reverse();
-        for old in files.iter().skip(max_keep.max(0) as usize) {
-            let _ = std::fs::remove_file(old);
+        if freeze {
+            tracing::warn!(
+                "数据异常，冻结轮转：{group} 组保留全部 {} 份备份（未删除）",
+                files.len()
+            );
+            continue;
+        }
+        let keep = select_retained(files, policy);
+        let removed = keep.iter().filter(|k| !**k).count();
+        for (i, f) in files.iter().enumerate() {
+            if !keep[i] {
+                remove_backup(f);
+            }
+        }
+        if removed > 0 {
+            tracing::debug!(
+                "轮转：{group} 组删除 {removed} 份旧备份，保留 {} 份",
+                files.len() - removed
+            );
         }
     }
 }
@@ -879,7 +1271,15 @@ mod tests {
             std::fs::write(paths::backup_dir().join(name), b"x").unwrap();
         }
 
-        rotate_backups(2);
+        rotate_backups(
+            RetentionPolicy {
+                recent: 2,
+                daily: 0,
+                weekly: 0,
+                monthly: 0,
+            },
+            false,
+        );
 
         let remaining: Vec<String> = std::fs::read_dir(paths::backup_dir())
             .unwrap()
@@ -896,6 +1296,75 @@ mod tests {
             !remaining.contains(&"focusflow_accounting_20260911_100000.db".to_string()),
             "accounting 组最旧备份应被删除"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 跨年归档前必须留下「归档前」快照。
+    ///
+    /// 回归：归档是跨库搬数据（ATTACH + INSERT 目标 + DELETE 源），WAL 下多库事务
+    /// 整体不原子，崩溃可能造成「目标已加、源未删」→ 下次启动重复归档 → 计数翻倍。
+    /// 此前快照只挂在 清理/清空/删除今日 上，跨年这一刻没有任何兜底。
+    #[test]
+    fn archiving_takes_snapshot_before_migrating() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_archive_snap_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let source_year = 2025;
+        let stale_year = 2024;
+        let stale_dk =
+            queries::day_key_of_date(NaiveDate::from_ymd_opt(stale_year, 6, 1).expect("date"));
+        {
+            let path = paths::year_db_path(source_year);
+            let conn = connection::open_rw(&path).unwrap();
+            connection::ensure_schema(&conn, source_year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 77)",
+                [stale_dk],
+            )
+            .unwrap();
+        }
+        queries::invalidate_years_cache();
+
+        assert!(archive_stale_years(source_year), "应迁移往年数据");
+
+        // 归档后：源库里往年数据已清空，目标（stale_year）库里有了
+        let before: i64 = connection::open_ro(&paths::year_db_path(source_year))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM daily_counts WHERE date_key = ?1",
+                [stale_dk],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0, "源库中的往年数据应已迁走");
+
+        // 快照必须存在，且内容是**归档前**的（源库里还能看到那条往年数据）
+        let snapshots: Vec<std::path::PathBuf> = std::fs::read_dir(paths::backup_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let n = p.file_name().unwrap().to_string_lossy().to_string();
+                n.starts_with(&format!("focusflow_{source_year}_")) && n.ends_with(".db")
+            })
+            .collect();
+        assert_eq!(snapshots.len(), 1, "归档前应留下一份当年库快照");
+        let snap_count: i64 = connection::open_ro(&snapshots[0])
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM daily_counts WHERE date_key = ?1",
+                [stale_dk],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            snap_count, 77,
+            "快照必须是归档前的状态（能查到尚未迁走的 77 次）"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1050,6 +1519,424 @@ mod tests {
             )
             .unwrap();
         assert_eq!(merged, 12, "已存在的行应合并计数（5 + 7）");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 备份必须是**单个自包含文件**：不留 `-wal`/`-shm`，且能被只读打开。
+    ///
+    /// 回归：在线备份 API 会把源库的 WAL 头一起复制过来，于是每次备份都在旁边留下
+    /// `-wal`(0B)/`-shm`(32KB)；轮转只认 `.db`，sidecar 永久堆积（实测 66 个/1MB）。
+    #[test]
+    fn backup_is_self_contained_and_leaves_no_junk() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_backup_self_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        // 源库走 WAL 模式（与运行时一致），确保覆盖「WAL 头被复制」这条路径
+        let year = chrono::Local::now().year();
+        let src = paths::year_db_path(year);
+        {
+            let conn = connection::open_rw(&src).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (1, 42)",
+                [],
+            )
+            .unwrap();
+        }
+        queries::invalidate_years_cache();
+
+        let dst = backup_database(5).expect("应产出备份");
+        let entries: Vec<String> = std::fs::read_dir(paths::backup_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            entries.iter().all(|n| n.ends_with(".db")),
+            "备份目录不应残留 -wal/-shm: {entries:?}"
+        );
+        assert!(dst.exists());
+
+        // 只读打开（模拟校验/只读介质）：必须是 rollback 模式且数据完整
+        let conn = Connection::open_with_flags(
+            &dst,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("备份应能被只读打开");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete", "备份应收尾为 rollback journal");
+        let check: String = conn
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        let count: i64 = conn
+            .query_row("SELECT count FROM daily_counts WHERE date_key=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 42, "备份内容应完整");
+        drop(conn);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 轮转删除旧备份时要连 sidecar 一起删；遗留的 sidecar 垃圾也要被清理
+    /// （包含保留下来的备份自己挂着的两个）。
+    #[test]
+    fn rotation_and_sweep_clean_sidecars() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_backup_junk_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("backup")).ok();
+        crate::paths::set_app_dir(&dir);
+
+        // 3 个年度备份（各带 sidecar）+ 2 个孤儿 sidecar（对应 .db 早已不在）
+        for name in [
+            "focusflow_2026_20260901_100000.db",
+            "focusflow_2026_20260902_100000.db",
+            "focusflow_2026_20260903_100000.db",
+        ] {
+            std::fs::write(paths::backup_dir().join(name), b"x").unwrap();
+            std::fs::write(paths::backup_dir().join(format!("{name}-wal")), b"").unwrap();
+            std::fs::write(paths::backup_dir().join(format!("{name}-shm")), b"junk").unwrap();
+        }
+        std::fs::write(
+            paths::backup_dir().join("focusflow_2026_20260904_100000.db-wal"),
+            b"",
+        )
+        .unwrap();
+        std::fs::write(
+            paths::backup_dir().join("focusflow_accounting_20260905_100000.db-shm"),
+            b"junk",
+        )
+        .unwrap();
+        std::fs::write(
+            paths::backup_dir().join("focusflow_accounting_20260905_100000.db-wal"),
+            b"junk",
+        )
+        .unwrap();
+        // 非空 WAL：里面可能有没并回主库的数据，必须保留
+        std::fs::write(
+            paths::backup_dir().join("focusflow_2026_20260906_100000.db"),
+            b"x",
+        )
+        .unwrap();
+        std::fs::write(
+            paths::backup_dir().join("focusflow_2026_20260906_100000.db-wal"),
+            b"data",
+        )
+        .unwrap();
+
+        let swept = sweep_stale_sidecars();
+        assert_eq!(
+            swept, 9,
+            "9 个可安全删除（空 WAL / 主库已不存在的孤儿；非空 WAL 保留）"
+        );
+        assert!(
+            paths::backup_dir()
+                .join("focusflow_2026_20260906_100000.db-wal")
+                .exists(),
+            "非空 WAL 绝不能删（可能含未合并数据）"
+        );
+
+        // 轮转只保留 1 个（每组，仅近端）：被删备份的 sidecar 必须一起消失
+        rotate_backups(
+            RetentionPolicy {
+                recent: 1,
+                daily: 0,
+                weekly: 0,
+                monthly: 0,
+            },
+            false,
+        );
+        let left: Vec<String> = std::fs::read_dir(paths::backup_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left.len(), 2, "1 个 .db + 1 个非空 WAL，实际: {left:?}");
+        assert!(
+            !left.iter().any(|n| n.ends_with("-shm")),
+            "空 WAL 的 sidecar 不该残留: {left:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 备份失败时不得留下半成品（半成品会占轮转名额、顶掉好备份）。    #[test]
+    /// 已停用插件的数据不参与备份（可用 backup_disabled_plugins 强制全量）。
+    ///
+    /// 回归：此前只看文件在不在，插件关掉后其库仍被反复备份、白占轮转名额 ——
+    /// 用户看到的现象是「插件都关了，备份里还有番茄钟/定时任务/Edge 历史」。
+    #[test]
+    fn disabled_plugin_data_skipped_in_backup() {
+        let disabled = vec![
+            "pomodoro_plugin".to_string(),
+            "scheduler_plugin".to_string(),
+            "edge_history_plugin".to_string(),
+        ];
+        assert!(
+            should_backup_aux("accounting_plugin", &disabled, false),
+            "启用中的插件照常备份"
+        );
+        assert!(!should_backup_aux("pomodoro_plugin", &disabled, false));
+        assert!(!should_backup_aux("edge_history_plugin", &disabled, false));
+        assert!(
+            should_backup_aux("pomodoro_plugin", &disabled, true),
+            "backup_disabled_plugins=true 时强制全量"
+        );
+        assert!(
+            should_backup_aux("scheduler_plugin", &[], false),
+            "无停用项时全部备份"
+        );
+
+        // 停用列表解析：逗号分隔 + 空白容错（与 plugins::manager 同语义）
+        let dir = std::env::temp_dir().join(format!("ff_disabled_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        let cfg_path = dir.join("config.ini");
+        std::fs::write(&cfg_path, "[plugins]\ndisabled = a_plugin, b_plugin ,\n").unwrap();
+        let cfg = FocusFlowConfig::load(&cfg_path).unwrap();
+        assert_eq!(
+            disabled_plugin_stems(&cfg),
+            vec!["a_plugin".to_string(), "b_plugin".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 附属库与插件文件的对应关系必须真实存在：插件改名后这条会立刻失败，
+    /// 避免「停用开关失效」这种静默退化。
+    #[test]
+    fn aux_db_plugin_stems_match_plugin_files() {
+        for (name, stem, _) in auxiliary_db_paths() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins")
+                .join(format!("{stem}.lua"));
+            assert!(
+                path.exists(),
+                "附属库 {name} 对应的插件文件不存在: {}（插件改名后需同步 auxiliary_db_paths）",
+                path.display()
+            );
+        }
+    }
+
+    /// 分层保留：无论短期备份多密集，都留着「每天 / 每周 / 每月」的快照 ——
+    /// 这样异常数据被连续备份时，仍有一份更早的干净副本可回滚。
+    ///
+    /// 回归场景：原来「只留最新 5 份」，一天内多开几次程序（退出即备份）就能
+    /// 把 5 个槽位全换成坏数据，干净历史彻底消失。
+    #[test]
+    fn retention_keeps_daily_weekly_monthly_tiers() {
+        // 造 2026-08-01 ~ 2026-09-20 每天 3 份的备份名（列表按新→旧，日内也是新→旧）
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let start = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let mut d = end;
+        loop {
+            for t in ["235959000", "120000000", "010000000"] {
+                files.push(std::path::PathBuf::from(format!(
+                    "focusflow_2026_{}_{t}.db",
+                    d.format("%Y%m%d")
+                )));
+            }
+            if d == start {
+                break;
+            }
+            d = d.pred_opt().unwrap();
+        }
+
+        let policy = RetentionPolicy {
+            recent: 5,
+            daily: 7,
+            weekly: 4,
+            monthly: 6,
+        };
+        let keep = select_retained(&files, policy);
+        let kept: Vec<&std::path::PathBuf> = files
+            .iter()
+            .zip(keep.iter())
+            .filter(|(_, k)| **k)
+            .map(|(f, _)| f)
+            .collect();
+
+        assert_eq!(keep.len(), files.len(), "结果与输入等长");
+        assert!(keep[..5].iter().all(|k| *k), "最近 5 份必须保留");
+        assert!(
+            kept.len() < files.len(),
+            "必须真的删掉一部分（否则不算轮转）"
+        );
+
+        // 每天一份：最近 7 天里，超出「最近 5 份」窗口的那些日子必须**恰好**保留一份
+        // （近端窗口内的日子会多留，属预期）
+        for offset in 2..=6 {
+            let day = end - chrono::Duration::days(offset);
+            let day_kept: Vec<&&std::path::PathBuf> = kept
+                .iter()
+                .filter(|f| {
+                    f.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains(&day.format("%Y%m%d").to_string())
+                })
+                .collect();
+            assert_eq!(day_kept.len(), 1, "{day} 应恰好保留一份（每天一份）");
+            assert!(
+                day_kept[0]
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("235959000"),
+                "{day} 保留的应是该天最新那份"
+            );
+        }
+
+        // 月级：8 月已被日/周档覆盖掉大部分，但月末那份（8-31 最新）必须留 ——
+        // 它超出「最近 7 天」与「最近 4 周」，只有月档能保住它
+        assert!(
+            kept.iter().any(|f| f
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("20260831_235959000")),
+            "月档必须保留 8 月最新一份（超出日/周窗口的干净副本）"
+        );
+    }
+
+    /// 异常体检：骤降/暴涨/天数减少判定为可疑；样本太小不误报。
+    #[test]
+    fn suspicious_change_flags_drops_and_spikes() {
+        let base = BackupFingerprint {
+            total: 100_000,
+            days: 120,
+        };
+        assert!(
+            !is_suspicious_change(
+                base,
+                BackupFingerprint {
+                    total: 102_000,
+                    days: 121
+                }
+            ),
+            "正常增长不应告警"
+        );
+        assert!(
+            is_suspicious_change(
+                base,
+                BackupFingerprint {
+                    total: 40_000,
+                    days: 120
+                }
+            ),
+            "总量掉一半以上：疑似丢数据"
+        );
+        assert!(
+            is_suspicious_change(
+                base,
+                BackupFingerprint {
+                    total: 500_000,
+                    days: 120
+                }
+            ),
+            "总量涨到 4 倍以上：疑似重复计数"
+        );
+        assert!(
+            is_suspicious_change(
+                base,
+                BackupFingerprint {
+                    total: 100_000,
+                    days: 100
+                }
+            ),
+            "天数明显减少（历史被清）"
+        );
+        assert!(
+            !is_suspicious_change(
+                BackupFingerprint {
+                    total: 500,
+                    days: 3
+                },
+                BackupFingerprint { total: 10, days: 1 },
+            ),
+            "样本太小不判定（新装用户）"
+        );
+    }
+
+    /// 冻结轮转：体检可疑时一份都不删（宁可多留，也不让坏数据顶掉干净历史）。
+    #[test]
+    fn freeze_skips_rotation_entirely() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_freeze_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("backup")).ok();
+        crate::paths::set_app_dir(&dir);
+
+        for i in 0..10 {
+            std::fs::write(
+                paths::backup_dir().join(format!("focusflow_2026_202609{:02}_120000000.db", i + 1)),
+                b"x",
+            )
+            .unwrap();
+        }
+        let policy = RetentionPolicy {
+            recent: 2,
+            daily: 0,
+            weekly: 0,
+            monthly: 0,
+        };
+
+        rotate_backups(policy, true);
+        assert_eq!(
+            std::fs::read_dir(paths::backup_dir()).unwrap().count(),
+            10,
+            "冻结时不得删除任何备份"
+        );
+
+        rotate_backups(policy, false);
+        assert_eq!(
+            std::fs::read_dir(paths::backup_dir()).unwrap().count(),
+            2,
+            "未冻结时按策略保留最近 2 份"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 备份失败时不得留下半成品（半成品会占轮转名额、顶掉好备份）。
+    #[test]
+    fn failed_backup_cleanup_removes_partial_file() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_backup_fail_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("backup")).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let dst = paths::backup_dir().join("focusflow_2026_20260920_000000.db");
+        std::fs::write(&dst, b"partial").unwrap();
+        std::fs::write(
+            dst.with_file_name("focusflow_2026_20260920_000000.db-shm"),
+            b"j",
+        )
+        .unwrap();
+        std::fs::write(
+            dst.with_file_name("focusflow_2026_20260920_000000.db-wal"),
+            b"",
+        )
+        .unwrap();
+
+        remove_backup(&dst);
+
+        let left: Vec<String> = std::fs::read_dir(paths::backup_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(left.is_empty(), "半成品与 sidecar 都应被清掉: {left:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

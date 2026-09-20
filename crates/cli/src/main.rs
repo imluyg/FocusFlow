@@ -32,6 +32,11 @@ const USAGE: &str = "\
 
   --stats <天数|today|all>   统计最近 N 天 / 今日 / 总计
   --stats-year <年份>        指定年度的统计
+  --devices <天数|today|all> 设备维度统计（各键鼠输入次数与占比）
+  --backup                   立即备份全部数据库到 backup/（含轮转与残留清理）
+  --device-keys [周期]       列出设备标识（device_key）与当前展示名，便于手改别名
+  --rename-device <匹配> <别名>
+                             给设备取别名（匹配 device_key 或展示名子串；别名留空则还原）
   --list-years               列出有数据的年份
   --export <csv|html>        导出报表到当前目录
   --vacuum                   压缩数据库
@@ -86,6 +91,28 @@ fn run(args: &[String]) -> i32 {
             let db = db::Database::init_readonly();
             print_list_years(&db)
         }
+        "--devices" => {
+            if args.len() < 2 {
+                eprintln!("用法: --devices <天数|today|all>");
+                return 1;
+            }
+            let db = db::Database::init_readonly();
+            print_devices(&db, &args[1])
+        }
+        "--device-keys" => {
+            let db = db::Database::init_readonly();
+            print_device_keys(&db)
+        }
+        "--rename-device" => {
+            if args.len() < 3 {
+                eprintln!("用法: --rename-device <匹配文本> <别名>");
+                eprintln!(
+                    "  匹配文本为 device_key 或展示名的子串；别名留空字符串 \"\" 表示还原为自动名"
+                );
+                return 1;
+            }
+            rename_device(&args[1], &args[2])
+        }
         "--export" => {
             if args.len() < 2 {
                 eprintln!("用法: --export <csv|html>");
@@ -101,6 +128,26 @@ fn run(args: &[String]) -> i32 {
         "--vacuum" => {
             db::maintenance::vacuum_all();
             0
+        }
+        "--backup" => {
+            let _ = db::Database::init_readonly();
+            let max_backups = focusflow_core::config::instance()
+                .get_int("database", "max_backups", 5)
+                .max(1);
+            match db::maintenance::backup_database(max_backups) {
+                Some(path) => {
+                    println!("备份完成: {}", path.display());
+                    println!(
+                        "  目录: {}（已停用插件的数据会跳过）",
+                        focusflow_core::paths::backup_dir().display()
+                    );
+                    0
+                }
+                None => {
+                    eprintln!("备份失败或无可备份的数据库");
+                    1
+                }
+            }
         }
         "--cleanup" => {
             if args.len() < 2 {
@@ -220,6 +267,129 @@ fn print_stats(_db: &db::Database, period: &str) -> i32 {
     }
     println!("{}\n", "=".repeat(50));
     0
+}
+
+/// 设备维度统计：各键鼠设备的输入次数与占比（独立口径，见 device_stats.rs）。
+fn print_devices(_db: &db::Database, period: &str) -> i32 {
+    let (total, devices, label) = match period.to_lowercase().as_str() {
+        "today" => {
+            let (t, s) = db::get_device_stats_by_date(Local::now().date_naive());
+            (t, s, "今日".to_string())
+        }
+        "all" => {
+            let (t, s) = db::get_device_stats(None, None);
+            (t, s, "总计".to_string())
+        }
+        _ => match period.parse::<i64>() {
+            Ok(days) => {
+                let (t, s) = db::get_device_stats(Some(days), None);
+                (t, s, format!("最近 {days} 天"))
+            }
+            Err(_) => {
+                eprintln!("无效的参数: {period}（应为数字、today 或 all）");
+                return 1;
+            }
+        },
+    };
+
+    println!("\n{}", "=".repeat(60));
+    println!("  FocusFlow 设备统计 - {label}");
+    println!("{}", "=".repeat(60));
+    println!(
+        "  输入总次数: {}（口径：键盘按下 + 鼠标按键 + 滚轮）",
+        fmt_thousands(total)
+    );
+    println!("{}", "-".repeat(60));
+    if devices.is_empty() {
+        println!("  暂无设备数据（功能上线后开始积累）");
+        println!("{}\n", "=".repeat(60));
+        return 0;
+    }
+    println!("  {:<6}{:<44}{:<8}{:<8}", "排名", "设备", "类型", "占比");
+    println!("  {}", "-".repeat(56));
+    for (rank, dev) in devices.iter().enumerate() {
+        let percent = if total > 0 {
+            format!("{:.1}%", (dev.count as f64 / total as f64) * 100.0)
+        } else {
+            "0%".to_string()
+        };
+        let kind = match dev.kind.as_str() {
+            "mouse" => "鼠标",
+            "keyboard" => "键盘",
+            "hybrid" => "键鼠",
+            _ => "未知",
+        };
+        println!("  {:<6}{:<44}{:<8}{:<8}", rank + 1, dev.name, kind, percent);
+    }
+    println!("{}\n", "=".repeat(60));
+    0
+}
+
+/// 列出设备标识与展示名：便于手改 device_aliases.json 或配合 --rename-device。
+fn print_device_keys(_db: &db::Database) -> i32 {
+    let (total, devices) = db::get_device_stats(None, None);
+    if devices.is_empty() {
+        println!("暂无设备数据（设备统计从功能上线后开始积累）");
+        return 0;
+    }
+    println!(
+        "\n共 {} 个设备，输入总次数 {}\n",
+        devices.len(),
+        fmt_thousands(total)
+    );
+    for d in &devices {
+        println!("  展示名: {}", d.name);
+        println!("  自动名: {}", d.auto_name);
+        println!("  device_key: {}\n", d.key);
+    }
+    0
+}
+
+/// 给设备取别名：匹配 device_key、展示名或自动名的子串（区分大小写不敏感）。
+/// 别名给空字符串表示还原为自动名。
+fn rename_device(pattern: &str, alias: &str) -> i32 {
+    let (_, devices) = db::get_device_stats(None, None);
+    let needle = pattern.to_lowercase();
+    let matched: Vec<&db::DeviceStat> = devices
+        .iter()
+        .filter(|d| {
+            d.key.to_lowercase().contains(&needle)
+                || d.name.to_lowercase().contains(&needle)
+                || d.auto_name.to_lowercase().contains(&needle)
+        })
+        .collect();
+
+    let target = match matched.len() {
+        0 => {
+            eprintln!("未找到匹配的设备: {pattern}");
+            eprintln!("  用 --device-keys 查看全部设备标识");
+            return 1;
+        }
+        1 => matched[0],
+        n => {
+            eprintln!("匹配到 {n} 个设备，请换更精确的匹配文本（或直接用 device_key）:");
+            for d in matched {
+                eprintln!("  {:<40} <- {}", d.name, d.key);
+            }
+            return 1;
+        }
+    };
+
+    let saved = focusflow_core::device_alias::clamp_alias(alias);
+    match focusflow_core::device_alias::set(&target.key, &saved) {
+        Ok(_) => {
+            if saved.is_empty() {
+                println!("已还原为自动名: {}", target.auto_name);
+            } else {
+                println!("已设别名: {} -> {}", target.auto_name, saved);
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("写入别名失败: {e}");
+            1
+        }
+    }
 }
 
 fn print_year_stats(_db: &db::Database, year: i32) -> i32 {

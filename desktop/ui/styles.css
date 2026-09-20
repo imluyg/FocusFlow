@@ -129,6 +129,44 @@ table.grid th.col-key { width: 40%; }
 table.grid th.col-count { width: 24%; }
 table.grid th.col-percent { width: 24%; }
 
+/* 设备排行：6 列。.grid 是 table-layout: fixed —— 没有显式宽度的列会被压到最小宽度
+   （表现为「类型」两个字换行、「操作」被挤出表格），所以这里必须给全每一列的宽度 */
+table.grid-devices th.col-rank { width: 8%; }
+table.grid-devices th.col-key { width: 40%; }
+table.grid-devices th.col-kind { width: 10%; }
+table.grid-devices th.col-count { width: 15%; }
+table.grid-devices th.col-percent { width: 13%; }
+table.grid-devices th.col-act { width: 14%; }
+/* 设备列左对齐（名字是主要识别信息），长名字截断而不是撑破表格 */
+table.grid-devices td.key { text-align: left; }
+table.grid-devices td.key > div {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+table.grid-devices td.key .dev-auto {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+}
+/* 类型与操作不换行 */
+table.grid-devices td.col-kind,
+table.grid-devices td.col-act { white-space: nowrap; }
+/* 行内小按钮：默认 .tab 的内边距太大，6 列表格里会把操作列撑出去 */
+table.grid-devices td .dev-act {
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: 6px;
+}
+table.grid-devices td .dev-act + .dev-act { margin-left: 4px; }
+table.grid-devices td .dev-act:hover { background: var(--accent-soft); }
+table.grid-devices td input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 13px;
+  padding: 3px 6px;
+}
+
 /* ===== 设置 ===== */
 .setting-row {
   display: flex;

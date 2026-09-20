@@ -136,6 +136,20 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
             seconds INTEGER NOT NULL,
             PRIMARY KEY (date_key, app_name)
         ) WITHOUT ROWID;
+        -- 设备维度统计：date_key + device_key 按天聚合
+        -- （device_key = Raw Input 设备实例路径，见 device_stats.rs）
+        CREATE TABLE IF NOT EXISTS device_counts (
+            date_key INTEGER NOT NULL,
+            device_key TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            PRIMARY KEY (date_key, device_key)
+        ) WITHOUT ROWID;
+        -- 设备登记表：首个事件时登记一次，之后只读缓存
+        CREATE TABLE IF NOT EXISTS devices (
+            device_key TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL
+        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL

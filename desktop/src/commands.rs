@@ -17,6 +17,8 @@ pub fn get_live(state: State<'_, Arc<AppState>>) -> LiveStats {
         period: s.period,
         max_day: s.agg.max_day,
         max_day_date: s.agg.max_day_date.clone(),
+        alltime_total: s.agg.alltime_total,
+        period_total: s.agg.total,
     }
 }
 
@@ -42,6 +44,10 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
         "hotkey_enabled": c.get("hotkey", "enabled") == "true",
         "hotkey_str": c.get("hotkey", "toggle_window"),
         "floating_enabled": c.get("floating", "enabled") == "true",
+        // 备份开关：退出时备份 / 运行中定时备份（0 小时 = 关闭）
+        "backup_on_exit": c.get_bool("database", "backup_on_exit", true),
+        "backup_online_hours": c.get_int("database", "online_backup_interval_hours", 24),
+        "max_backups": c.get_int("database", "max_backups", 5),
     })
 }
 
@@ -301,10 +307,37 @@ pub async fn get_maintenance_info() -> Result<serde_json::Value, String> {
             .last()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string());
 
+        // 备份异常体检留下的说明（backup/SUSPECT-*.txt），最近 2 条
+        let suspect_notes: Vec<String> = {
+            let mut notes: Vec<String> = Vec::new();
+            let mut files: Vec<std::path::PathBuf> =
+                std::fs::read_dir(focusflow_core::paths::backup_dir())
+                    .map(|it| {
+                        it.flatten()
+                            .map(|e| e.path())
+                            .filter(|p| {
+                                p.file_name()
+                                    .map(|n| n.to_string_lossy().starts_with("SUSPECT-"))
+                                    .unwrap_or(false)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            files.sort();
+            for p in files.iter().rev().take(2) {
+                if let Ok(text) = std::fs::read_to_string(p) {
+                    // 只取前两行（第一行结论 + 时间），够提示即可
+                    notes.push(text.lines().take(2).collect::<Vec<_>>().join("｜"));
+                }
+            }
+            notes
+        };
+
         serde_json::json!({
             "last_vacuum": last_vacuum,
             "backup_count": backups.len(),
             "latest_backup": latest,
+            "suspect_notes": suspect_notes,
         })
     })
     .await
@@ -333,6 +366,28 @@ pub fn dbg_log(msg: String) {
     tracing::info!("[floating-debug] {msg}");
     #[cfg(not(debug_assertions))]
     let _ = msg;
+}
+
+/// 设置设备别名（`alias` 为空则清除），返回最终保存的别名。
+///
+/// 别名存在 `data/device_aliases.json`（与统计库解耦，可手改），
+/// 写完后触发一次重聚合，界面立即显示新名字。
+#[tauri::command]
+pub fn set_device_alias(
+    state: State<'_, Arc<AppState>>,
+    key: String,
+    alias: String,
+) -> Result<String, String> {
+    if key.trim().is_empty() {
+        return Err("设备标识为空".to_string());
+    }
+    let saved = focusflow_core::device_alias::clamp_alias(&alias);
+    focusflow_core::device_alias::set(&key, &saved).map_err(|e| e.to_string())?;
+    state
+        .refresh_now
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!("设备别名已更新: {} -> {}", key, saved);
+    Ok(saved)
 }
 
 /// 插件管理页打开/关闭时切换热重载监听（打开才扫描，平时零后台开销）。

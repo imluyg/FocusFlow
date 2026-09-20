@@ -31,7 +31,7 @@
       <div class="stat-cards" style="margin-top:10px;">
         <div class="stat-card"><div class="label">今日活跃</div><div class="value" id="st-today">0</div><div class="label" id="st-active">时长 0秒</div></div>
         <div class="stat-card"><div class="label">当前速度</div><div class="value" id="st-cpm">0 次/分</div></div>
-        <div class="stat-card"><div class="label" id="st-total-label">周期总数</div><div class="value" id="st-total">0</div></div>
+        <div class="stat-card"><div class="label" id="st-total-label">总计</div><div class="value" id="st-total">0</div></div>
         <div class="stat-card"><div class="label" id="st-avg-label">日均</div><div class="value" id="st-avg">0</div></div>
         <div class="stat-card"><div class="label" id="st-max-label">最高单日</div><div class="value" id="st-max">0</div><div class="label" id="st-max-date"></div></div>
       </div>
@@ -42,6 +42,7 @@
       <div class="tabs" id="view-tabs" role="tablist" aria-label="视图">
         <button class="tab active" data-view="rank" role="tab" aria-selected="true">键鼠排行</button>
         <button class="tab" data-view="apps" role="tab" aria-selected="false">应用排行</button>
+        <button class="tab" data-view="devices" role="tab" aria-selected="false">设备排行</button>
         <button class="tab" data-view="group" role="tab" aria-selected="false">分组统计</button>
         <button class="tab" data-view="trend" role="tab" aria-selected="false">趋势图</button>
         <button class="tab" data-view="hourly" role="tab" aria-selected="false">小时分布</button>
@@ -55,6 +56,7 @@
     <div class="card" style="min-height:320px;">
       <div id="view-rank"></div>
       <div id="view-apps" style="display:none;"></div>
+      <div id="view-devices" style="display:none;"></div>
       <div id="view-group" style="display:none;"></div>
       <div id="view-trend" style="display:none;">
         <div class="tabs" id="trend-days">
