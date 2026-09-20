@@ -144,6 +144,14 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
             count INTEGER NOT NULL,
             PRIMARY KEY (date_key, device_key)
         ) WITHOUT ROWID;
+        -- 设备 × 键名明细：供「设备详情」的键名排行（独立口径，不与 key_counts 混用）
+        CREATE TABLE IF NOT EXISTS device_key_counts (
+            date_key INTEGER NOT NULL,
+            device_key TEXT NOT NULL,
+            key_name TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            PRIMARY KEY (date_key, device_key, key_name)
+        ) WITHOUT ROWID;
         -- 设备登记表：首个事件时登记一次，之后只读缓存
         CREATE TABLE IF NOT EXISTS devices (
             device_key TEXT PRIMARY KEY,

@@ -838,6 +838,293 @@ pub fn get_device_stats_by_date(target_date: chrono::NaiveDate) -> (i64, Vec<Dev
     merge_device_rows(result.flatten().unwrap_or_default())
 }
 
+/// 单台设备的详情（点击「设备排行」某一行时按需查询）。
+///
+/// 口径说明：设备维度只记录「次数」，**不含键名与时段明细**（采集侧未记录），
+/// 所以这里给的是各周期次数、排名、占比、活跃天数与近 30 天分布。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeviceDetail {
+    /// 设备实例路径（Raw Input device_key）
+    pub key: String,
+    /// 展示名（别名优先）
+    pub name: String,
+    /// 自动解析名
+    pub auto_name: String,
+    pub has_alias: bool,
+    /// mouse / keyboard / hybrid / unknown
+    pub kind: String,
+    /// 今日 / 近 7 天 / 近 30 天 / 全部 次数
+    pub today: i64,
+    pub week: i64,
+    pub month: i64,
+    pub all: i64,
+    /// 所选周期：-1 今日 / 0 全部 / n 近 n 天
+    pub period: i64,
+    pub period_count: i64,
+    /// 周期内全部设备次数（占比分母）
+    pub period_total: i64,
+    /// 周期内排名（1 起；周期内无数据为 0）
+    pub rank: i64,
+    /// 周期内设备总数
+    pub device_count: i64,
+    /// 同类型设备内的排名与数量
+    pub kind_rank: i64,
+    pub kind_count: i64,
+    /// 有输入的天数
+    pub active_days: i64,
+    /// 活跃日均次数（活跃天数为 0 时为 0）
+    pub avg_per_active_day: f64,
+    /// 首次 / 最近使用日期（YYYY-MM-DD）
+    pub first_date: String,
+    pub last_date: String,
+    /// 近 30 天每日次数（含无输入的 0，日期升序）
+    pub trend: Vec<(String, i64)>,
+    /// 周期内键名排行（次数降序）：`(键名, 次数)`。
+    /// 空表示该库还没有键名明细数据（功能上线前的历史，或采集侧未记录）。
+    pub keys: Vec<(String, i64)>,
+    /// 周期内键名明细的总次数（占比分母；与 period_count 可能略有出入：
+    /// 旧版本只记了次数没记键名的部分不会有明细）
+    pub key_total: i64,
+    /// 该设备是否有键名明细（区分「没有数据」与「明细为 0」）
+    pub has_key_detail: bool,
+}
+
+/// 单设备在周期内的键名排行（跨年度库合并，次数降序）。
+///
+/// 表不存在（旧库）时返回空 —— 键名明细从该功能上线后开始积累，历史无法回溯。
+fn device_key_rows(device_key: &str, period: i64) -> (Vec<(String, i64)>, bool) {
+    let today_key = day_key_of_date(Local::now().date_naive());
+    let start_key = match period {
+        -1 => Some(today_key),
+        0 => None,
+        n => Some(today_key - (n.max(1) - 1)),
+    };
+    let mut merged: HashMap<String, i64> = HashMap::new();
+    let mut present = false;
+    for year in query_years(None, None) {
+        let path = paths::year_db_path(year);
+        let rows = connection::with_ro_conn(&path, |conn| {
+            if !table_exists(conn, "device_key_counts") {
+                return None;
+            }
+            let (sql, param) = match start_key {
+                Some(sk) => (
+                    "SELECT key_name, SUM(count) FROM device_key_counts \
+                     WHERE device_key = ?1 AND date_key >= ?2 GROUP BY key_name",
+                    Some(sk),
+                ),
+                None => (
+                    "SELECT key_name, SUM(count) FROM device_key_counts \
+                     WHERE device_key = ?1 GROUP BY key_name",
+                    None,
+                ),
+            };
+            let mut stmt = conn.prepare(sql).ok()?;
+            let list: Vec<(String, i64)> = match param {
+                Some(p) => stmt
+                    .query_map(rusqlite::params![device_key, p], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .ok()?
+                    .flatten()
+                    .collect(),
+                None => stmt
+                    .query_map(rusqlite::params![device_key], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .ok()?
+                    .flatten()
+                    .collect(),
+            };
+            Some(list)
+        });
+        for (name, c) in rows.flatten().unwrap_or_default() {
+            present = true;
+            *merged.entry(name).or_insert(0) += c;
+        }
+    }
+    let mut list: Vec<(String, i64)> = merged.into_iter().collect();
+    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    (list, present)
+}
+
+/// 单设备按天次数序列（跨年度库合并，date_key 升序）。
+///
+/// 设备维度按年份分库存储，查询必须跨库合并 —— 与 `get_device_stats` 同理。
+fn device_date_series(device_key: &str) -> Vec<(i64, i64)> {
+    let mut merged: HashMap<i64, i64> = HashMap::new();
+    for year in query_years(None, None) {
+        let path = paths::year_db_path(year);
+        let rows = connection::with_ro_conn(&path, |conn| {
+            if !table_exists(conn, "device_counts") {
+                return None;
+            }
+            let mut stmt = conn
+                .prepare("SELECT date_key, count FROM device_counts WHERE device_key = ?1")
+                .ok()?;
+            let list: Vec<(i64, i64)> = stmt
+                .query_map([device_key], |r| Ok((r.get(0)?, r.get(1)?)))
+                .ok()?
+                .flatten()
+                .collect();
+            Some(list)
+        });
+        for (dk, c) in rows.flatten().unwrap_or_default() {
+            *merged.entry(dk).or_insert(0) += c;
+        }
+    }
+    let mut series: Vec<(i64, i64)> = merged.into_iter().collect();
+    series.sort_by_key(|(dk, _)| *dk);
+    series
+}
+
+/// 查询单台设备详情。`period` 与统计视图一致：-1 今日 / 0 全部 / n 近 n 天。
+pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
+    let today_date = Local::now().date_naive();
+    let today_key = day_key_of_date(today_date);
+    let series = device_date_series(device_key);
+
+    let in_period = |dk: i64| match period {
+        -1 => dk == today_key,
+        0 => true,
+        n => dk >= today_key - (n.max(1) - 1),
+    };
+    let sum_where = |f: &dyn Fn(i64) -> bool| -> i64 {
+        series
+            .iter()
+            .filter(|(dk, _)| f(*dk))
+            .map(|(_, c)| *c)
+            .sum()
+    };
+    let period_count = sum_where(&in_period);
+    let today = sum_where(&|dk| dk == today_key);
+    let week = sum_where(&|dk| dk >= today_key - 6);
+    let month = sum_where(&|dk| dk >= today_key - 29);
+    let all: i64 = series.iter().map(|(_, c)| *c).sum();
+    let active_days = series.len() as i64;
+
+    // 周期内的排名/占比/类型：复用「设备排行」同一套口径（含别名与同名去重）
+    let (period_total, stats) = if period == -1 {
+        get_device_stats_by_date(today_date)
+    } else {
+        get_device_stats((period > 0).then_some(period), None)
+    };
+    let idx = stats.iter().position(|s| s.key == device_key);
+
+    // 名称与类型：优先取排行里的行（已套别名、已去重），否则按登记表/VID-PID 回退
+    let (name, auto_name, has_alias, kind) = match idx {
+        Some(i) => (
+            stats[i].name.clone(),
+            stats[i].auto_name.clone(),
+            stats[i].has_alias,
+            stats[i].kind.clone(),
+        ),
+        None => {
+            let auto = fallback_device_name(device_key);
+            let alias = crate::device_alias::table()
+                .resolve(device_key)
+                .map(|s| s.to_string());
+            (
+                alias.clone().unwrap_or_else(|| auto.clone()),
+                auto,
+                alias.is_some(),
+                registered_kind(device_key).unwrap_or_else(|| "unknown".to_string()),
+            )
+        }
+    };
+    let kind_count = stats.iter().filter(|s| s.kind == kind).count() as i64;
+    let kind_rank = stats
+        .iter()
+        .filter(|s| s.kind == kind)
+        .position(|s| s.key == device_key)
+        .map(|i| i as i64 + 1)
+        .unwrap_or(0);
+
+    // 周期内键名排行（设备 × 键名明细；旧库无该表时为空）
+    let (key_rows, has_keys) = device_key_rows(device_key, period);
+    let key_total: i64 = key_rows.iter().map(|(_, c)| *c).sum();
+
+    // 近 30 天分布（缺数据补 0，便于前端直接画柱）
+    let date_str = |dk: i64| {
+        day_key_to_date(dk)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default()
+    };
+    let trend: Vec<(String, i64)> = (0..30)
+        .map(|back| today_key - back)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|dk| {
+            let c = series
+                .iter()
+                .find(|(k, _)| *k == dk)
+                .map(|(_, c)| *c)
+                .unwrap_or(0);
+            (date_str(dk), c)
+        })
+        .collect();
+
+    DeviceDetail {
+        key: device_key.to_string(),
+        name,
+        auto_name,
+        has_alias,
+        kind,
+        today,
+        week,
+        month,
+        all,
+        period,
+        period_count,
+        period_total,
+        rank: idx.map(|i| i as i64 + 1).unwrap_or(0),
+        device_count: stats.len() as i64,
+        kind_rank,
+        kind_count,
+        active_days,
+        avg_per_active_day: if active_days > 0 {
+            all as f64 / active_days as f64
+        } else {
+            0.0
+        },
+        first_date: series
+            .first()
+            .map(|(dk, _)| date_str(*dk))
+            .unwrap_or_default(),
+        last_date: series
+            .last()
+            .map(|(dk, _)| date_str(*dk))
+            .unwrap_or_default(),
+        trend,
+        keys: key_rows,
+        key_total,
+        has_key_detail: has_keys,
+    }
+}
+
+/// 读取设备登记表里的类型（用于周期内无数据、无法从排行取到类型的情况）。
+fn registered_kind(device_key: &str) -> Option<String> {
+    for year in query_years(None, None) {
+        let path = paths::year_db_path(year);
+        let kind = connection::with_ro_conn(&path, |conn| {
+            if !table_exists(conn, "devices") {
+                return None;
+            }
+            conn.query_row(
+                "SELECT kind FROM devices WHERE device_key = ?1",
+                [device_key],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        });
+        if let Some(Some(k)) = kind {
+            return Some(k);
+        }
+    }
+    None
+}
+
 /// 查询最近 N 天按星期统计（0=周一 ... 6=周日）。
 pub fn get_weekday_stats(days: i64) -> HashMap<i64, i64> {
     let daily = get_daily_counts(days, None);
@@ -1087,6 +1374,121 @@ mod tests {
             "同型号显示名去重"
         );
         assert_eq!(stats[3].count, 10);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 设备详情：各周期次数、活跃天数、首末日期、排名占比与近 30 天分布。
+    #[test]
+    fn device_detail_reports_periods_and_trend() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_devdetail_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let today = Local::now().date_naive();
+        let dk = |d: &chrono::NaiveDate| day_key_of_date(*d);
+        let a = "HID#VID_046D&PID_C52B&MI_00#a";
+        let b = "HID#VID_046D&PID_C52B&MI_00#b";
+        {
+            let path = paths::year_db_path(today.year());
+            let conn = crate::db::connection::open_rw(&path).unwrap();
+            crate::db::connection::ensure_schema(&conn, today.year()).unwrap();
+            conn.execute(
+                "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)",
+                rusqlite::params![a, "HID 鼠标 · 046D/C52B", "mouse"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)",
+                rusqlite::params![b, "HID 键盘 · 046D/C52B", "keyboard"],
+            )
+            .unwrap();
+            let ins = |key: &str, off: i64, n: i64| {
+                conn.execute(
+                    "INSERT INTO device_counts (date_key, device_key, count) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![dk(&today) - off, key, n],
+                )
+                .unwrap();
+            };
+            ins(a, 0, 100);
+            ins(a, 1, 50);
+            ins(a, 2, 25);
+            ins(b, 0, 10);
+            // 键名明细：A 设备今天 左下键多于滚轮；B 设备也有明细（用于验证按设备隔离）
+            for (key, n, off) in [
+                ("鼠标左键", 60, 0),
+                ("滚轮上滑", 40, 0),
+                ("鼠标左键", 150, 1),
+            ] {
+                conn.execute(
+                    "INSERT INTO device_key_counts (date_key, device_key, key_name, count) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![dk(&today) - off, a, key, n],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO device_key_counts (date_key, device_key, key_name, count) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![dk(&today), b, "空格", 10],
+            )
+            .unwrap();
+        }
+        crate::device_alias::invalidate_cache();
+
+        // 今日视角
+        let d = get_device_detail(a, -1);
+        assert_eq!(d.today, 100);
+        assert_eq!(d.period_count, 100, "今日周期只算今天");
+        assert_eq!(d.period_total, 110, "占比分母 = 今日全部设备");
+        assert_eq!(d.rank, 1, "今日该设备第一");
+        assert_eq!(d.device_count, 2);
+        assert_eq!(d.kind_rank, 1, "鼠标类型内第一");
+        assert_eq!(d.kind_count, 1);
+        assert_eq!(d.kind, "mouse");
+
+        // 全部历史视角
+        let d = get_device_detail(a, 0);
+        assert_eq!(d.all, 175);
+        assert_eq!(d.today, 100);
+        assert_eq!(d.week, 175, "三天数据都在 7 天窗口内");
+        assert_eq!(d.month, 175);
+        assert_eq!(d.period_count, 175);
+        assert_eq!(d.active_days, 3);
+        assert!((d.avg_per_active_day - 175.0 / 3.0).abs() < 0.01);
+        assert_eq!(
+            d.first_date,
+            (today - chrono::Duration::days(2)).to_string()
+        );
+        assert_eq!(d.last_date, today.to_string());
+        assert_eq!(d.trend.len(), 30, "近 30 天分布固定 30 格");
+        assert_eq!(d.trend.last().unwrap().1, 100, "最后一格是今天");
+        assert_eq!(
+            d.trend[0].0,
+            (today - chrono::Duration::days(29)).to_string()
+        );
+
+        // 近 2 天窗口：只含今天与昨天
+        let d = get_device_detail(a, 2);
+        assert_eq!(d.period_count, 150);
+        assert_eq!(d.period_total, 160);
+
+        // 键名明细：按设备隔离、按次数降序，且跟随所选周期
+        let today_detail = get_device_detail(a, -1);
+        assert!(today_detail.has_key_detail);
+        assert_eq!(today_detail.keys.len(), 2, "今日只有左键与滚轮");
+        assert_eq!(today_detail.keys[0], ("鼠标左键".to_string(), 60));
+        assert_eq!(today_detail.keys[1], ("滚轮上滑".to_string(), 40));
+        assert_eq!(today_detail.key_total, 100);
+        let all_detail = get_device_detail(a, 0);
+        assert_eq!(all_detail.key_total, 250, "含昨天的 150 次左键");
+        assert_eq!(all_detail.keys[0].1, 210, "左键累计 60 + 150");
+        let other = get_device_detail(b, -1);
+        assert_eq!(other.keys.len(), 1, "另一台设备的明细互不混入");
+        assert_eq!(other.keys[0], ("空格".to_string(), 10));
+
+        crate::device_alias::invalidate_cache();
         std::fs::remove_dir_all(&dir).ok();
     }
 

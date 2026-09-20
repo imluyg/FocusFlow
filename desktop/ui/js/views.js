@@ -177,7 +177,7 @@ export function renderDevices(s) {
           (d.has_alias
             ? `<button class="tab dev-act" data-act="device-rename-clear" data-key="${escapeHtml(d.key)}">还原</button>`
             : "");
-      return `<tr><td>${i + 1}</td><td class="key">${nameCell}</td><td class="col-kind">${kindLabel(d.kind)}</td><td class="num">${fmt(d.count)}</td><td>${total ? ((d.count / total) * 100).toFixed(2) : "0.00"}%</td><td class="col-act">${actions}</td></tr>`;
+      return `<tr data-act="device-detail" data-key="${escapeHtml(d.key)}"><td>${i + 1}</td><td class="key">${nameCell}</td><td class="col-kind">${kindLabel(d.kind)}</td><td class="num">${fmt(d.count)}</td><td>${total ? ((d.count / total) * 100).toFixed(2) : "0.00"}%</td><td class="col-act">${actions}</td></tr>`;
     })
     .join("");
   const table = src.length
@@ -217,6 +217,8 @@ function bindAliasInput() {
 
 /// 进入改名编辑态（草稿预填已有别名，便于修改）
 export function deviceRename(key) {
+  // 从弹窗点「改名」时先关弹窗：编辑框在表格行里，被弹窗盖住就看不见了
+  closeDeviceDetail();
   const list = (deviceLastCharts && deviceLastCharts.devices) || [];
   const dev = list.find((d) => d.key === key);
   deviceEditing = key;
@@ -247,6 +249,146 @@ function exitDeviceEditing() {
   deviceEditing = null;
   deviceDraft = "";
   renderDevices(deviceLastCharts);
+}
+
+// ===== 设备详情弹窗 =====
+// 点设备行打开：展示该设备各周期次数、周期内排名/占比、活跃情况与键名明细。
+// 数据按需向后端查询（get_device_detail），不参与高频统计推送。
+// 弹窗内可单独切换统计周期（与主界面周期互不影响）。
+const PERIODS = [
+  [-1, "今日"],
+  [7, "7天"],
+  [15, "15天"],
+  [30, "30天"],
+  [365, "1年"],
+  [0, "总计"],
+];
+let deviceDetailKey = null;
+let deviceDetailPeriod = 0;
+
+export async function openDeviceDetail(key) {
+  const overlay = $("device-modal");
+  const body = $("device-modal-body");
+  if (!overlay || !body) return;
+  // 改名编辑态下不弹详情（输入框点击会冒泡到行；这里再兜一层）
+  if (deviceEditing) return;
+  deviceDetailKey = key;
+  // 默认跟随主界面当前周期，之后可在弹窗内单独切换
+  deviceDetailPeriod = appState.chartsData ? Number(appState.chartsData.period) : 0;
+  overlay.style.display = "flex";
+  await loadDeviceDetail();
+}
+
+/// 弹窗内切换周期：只重查详情，不动主界面
+export async function deviceDetailSetPeriod(p) {
+  deviceDetailPeriod = Number(p);
+  await loadDeviceDetail();
+}
+
+async function loadDeviceDetail() {
+  const body = $("device-modal-body");
+  if (!body || !deviceDetailKey) return;
+  body.innerHTML = '<div class="empty">加载中…</div>';
+  let d;
+  try {
+    d = await invoke("get_device_detail", { key: deviceDetailKey, period: deviceDetailPeriod });
+  } catch (e) {
+    body.innerHTML = `<div class="empty">读取失败：${escapeHtml(String(e))}</div>`;
+    return;
+  }
+  body.innerHTML = deviceDetailHtml(d);
+}
+
+export function closeDeviceDetail() {
+  const overlay = $("device-modal");
+  if (overlay) overlay.style.display = "none";
+  deviceDetailKey = null;
+}
+
+function deviceDetailHtml(d) {
+  const kind = kindLabel(d.kind);
+  const total = Number(d.period_total) || 0;
+  const pct = total ? ((d.period_count / total) * 100).toFixed(2) + "%" : "—";
+  const rankText =
+    d.rank > 0
+      ? `第 <b>${d.rank}</b> / ${d.device_count}`
+      : "<b>本周期无输入</b>";
+  const kindText =
+    d.kind_rank > 0 ? `第 <b>${d.kind_rank}</b> / ${d.kind_count}` : "—";
+  const avg = Number(d.avg_per_active_day || 0);
+
+  const cell = (k, v) =>
+    `<div class="dev-detail-cell"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+
+  // 弹窗内周期切换：与主界面周期按钮同一套取值（-1 今日 / 0 总计 / n 天）
+  const periodTabs = `<div class="tabs" id="device-period-tabs" role="tablist" aria-label="明细周期">
+      <span style="color:var(--muted);font-size:13px;">明细周期</span>
+      ${PERIODS.map(
+        ([p, label]) =>
+          `<button class="tab ${p === d.period ? "active" : ""}" data-act="device-period" data-p="${p}" role="tab" aria-selected="${p === d.period}">${label}</button>`
+      ).join("")}
+    </div>`;
+
+  // 键名明细：与「键鼠排行」同样的表格（排名 / 键名 / 次数 / 占比）
+  const keys = Array.isArray(d.keys) ? d.keys : [];
+  const keyTotal = Number(d.key_total) || 0;
+  const TOP = 20;
+  const shown = keys.slice(0, TOP);
+  const rows = shown
+    .map(
+      ([name, c], i) =>
+        `<tr><td>${i + 1}</td><td class="key">${escapeHtml(name)}</td><td class="num">${fmt(c)}</td><td>${keyTotal ? ((c / keyTotal) * 100).toFixed(2) : "0.00"}%</td></tr>`
+    )
+    .join("");
+  const keySection = d.has_key_detail
+    ? `<div class="dev-detail-line" style="margin-top:12px;">键鼠明细（${periodText(d.period)}）</div>
+       <table class="grid"><thead><tr>
+         <th class="col-rank">排名</th><th class="col-key">键名</th><th class="col-count">次数</th><th class="col-percent">占比</th>
+       </tr></thead><tbody>${rows}</tbody></table>
+       <div class="dev-detail-line" style="font-size:12px;margin-top:6px;">
+         共 <b>${keys.length}</b> 个键位，按次数降序${keys.length > TOP ? `（显示前 ${TOP}）` : ""}。
+       </div>`
+    : `<div class="empty" style="margin-top:12px;">该设备暂无键名明细<br>
+         <span style="font-size:12px;color:var(--muted);">键名明细从该功能上线后开始积累，此前的历史数据无法回溯</span></div>`;
+
+  return `
+    <div class="dev-detail-head">
+      <span class="dev-detail-name">${escapeHtml(d.name)}</span>
+      <span class="dev-detail-sub">${kind}</span>
+      ${d.has_alias ? `<span class="dev-detail-sub">原名 ${escapeHtml(d.auto_name)}</span>` : ""}
+    </div>
+    <div class="dev-detail-sub" title="${escapeHtml(d.key)}">设备标识 ${escapeHtml(d.key)}</div>
+
+    ${periodTabs}
+
+    <div class="dev-detail-grid">
+      ${cell("今日", fmt(d.today))}
+      ${cell("近 7 天", fmt(d.week))}
+      ${cell("近 30 天", fmt(d.month))}
+      ${cell("总计", fmt(d.all))}
+    </div>
+
+    <div class="dev-detail-line">
+      ${periodText(d.period)}：<b>${fmt(d.period_count)}</b> 次 · 占比 <b>${pct}</b>
+      · 设备排名 ${rankText} · 同类（${kind}）${kindText}
+    </div>
+    <div class="dev-detail-line">
+      活跃 <b>${d.active_days}</b> 天 · 活跃日均 <b>${fmt(Math.round(avg))}</b> 次
+      ${d.first_date ? ` · 首次 <b>${escapeHtml(d.first_date)}</b>` : ""}
+      ${d.last_date ? ` · 最近 <b>${escapeHtml(d.last_date)}</b>` : ""}
+    </div>
+
+    ${keySection}
+
+    <div class="dev-detail-line" style="font-size:12px;margin-top:10px;">
+      设备维度为独立口径：键盘按下 + 鼠标左/右/中键按下 + 滚轮，只统计真实硬件输入，
+      与「键鼠排行」的过滤规则不同，两者数字不必相等。
+    </div>
+    <div class="setting-row" style="margin-top:10px;">
+      <button class="tab active" data-act="device-rename" data-key="${escapeHtml(d.key)}">改名</button>
+      ${d.has_alias ? `<button class="tab" data-act="device-rename-clear" data-key="${escapeHtml(d.key)}">还原</button>` : ""}
+      <button class="tab" data-act="device-detail-close">关闭</button>
+    </div>`;
 }
 
 // ===== 键鼠排行 =====

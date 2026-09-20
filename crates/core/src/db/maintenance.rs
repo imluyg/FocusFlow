@@ -23,12 +23,14 @@ use crate::paths;
 /// 归档、清理、清空必须使用同一份清单：此前只覆盖 daily/hourly/key_counts，
 /// 导致 active_seconds 与 app_usage 永不归档、永不清理 —— 跨年后前台应用
 /// 时长仍留在旧文件里，而 CLI 的 `--reset` 会报告"已清空"却留着这两张表。
-const DATA_TABLES: [&str; 5] = [
+const DATA_TABLES: [&str; 7] = [
     "daily_counts",
     "hourly_counts",
     "key_counts",
     "active_seconds",
     "app_usage",
+    "device_counts",
+    "device_key_counts",
 ];
 
 /// 检查是否需要年度归档（当前年份库中存在往年数据时）。
@@ -167,10 +169,14 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
                     "hourly_counts" => "date_key, hour",
                     "key_counts" => "date_key, key_name",
                     "app_usage" => "date_key, app_name",
+                    // 设备维度的明细表：date_key + 设备实例路径
+                    "device_counts" => "date_key, device_key",
+                    "device_key_counts" => "date_key, device_key, key_name",
                     _ => unreachable!("DATA_TABLES 新增表时必须补主键列"),
                 };
                 let value_cols = match table {
-                    "daily_counts" | "hourly_counts" | "key_counts" => "count",
+                    "daily_counts" | "hourly_counts" | "key_counts" | "device_counts"
+                    | "device_key_counts" => "count",
                     "active_seconds" | "app_usage" => "seconds",
                     _ => unreachable!("DATA_TABLES 新增表时必须补计数列"),
                 };

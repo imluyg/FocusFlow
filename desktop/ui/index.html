@@ -78,6 +78,17 @@
     <div id="version"></div>
   </div>
 
+  <!-- 设备详情弹窗（点「设备排行」某一行打开） -->
+  <div class="modal-overlay" id="device-modal" data-act="device-detail-overlay">
+    <div class="modal-dialog" style="width:min(520px,94vw);">
+      <div class="modal-head">
+        <span>设备详情</span>
+        <button class="tab" data-act="device-detail-close">关闭</button>
+      </div>
+      <div id="device-modal-body"></div>
+    </div>
+  </div>
+
   <script type="module" src="js/main.js"></script>
 </body>
 </html>

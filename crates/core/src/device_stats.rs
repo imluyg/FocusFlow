@@ -104,6 +104,109 @@ pub(crate) mod classify {
                 | RI_MOUSE_WHEEL)
             != 0
     }
+
+    /// 未识别键的归类名（键名明细里避免长尾一次性条目）。
+    pub const OTHER_KEY: &str = "其他按键";
+
+    const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const DIGITS: &str = "0123456789";
+    const NUMPAD: [&str; 10] = [
+        "数字键盘0",
+        "数字键盘1",
+        "数字键盘2",
+        "数字键盘3",
+        "数字键盘4",
+        "数字键盘5",
+        "数字键盘6",
+        "数字键盘7",
+        "数字键盘8",
+        "数字键盘9",
+    ];
+    const FKEYS: [&str; 24] = [
+        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14",
+        "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
+    ];
+
+    /// Windows 虚拟键码 → 显示名（`RAWKEYBOARD.VKey`）。
+    ///
+    /// 命名与主统计（`listener`）同风格：字母/数字/符号原样，功能键用中文
+    /// （空格/回车/左Shift…），小键盘加「数字键盘」前缀。未覆盖的返回 `None`。
+    pub fn vkey_name(vk: u16) -> Option<&'static str> {
+        Some(match vk {
+            0x08 => "退格",
+            0x09 => "Tab",
+            0x0D => "回车",
+            0x10 | 0xA0 => "左Shift",
+            0xA1 => "右Shift",
+            0x11 | 0xA2 => "左Ctrl",
+            0xA3 => "右Ctrl",
+            0x12 | 0xA4 => "左Alt",
+            0xA5 => "右Alt",
+            0x13 => "Pause",
+            0x14 => "大写锁定",
+            0x1B => "Esc",
+            0x20 => "空格",
+            0x21 => "PageUp",
+            0x22 => "PageDown",
+            0x23 => "End",
+            0x24 => "Home",
+            0x25 => "左方向键",
+            0x26 => "上方向键",
+            0x27 => "右方向键",
+            0x28 => "下方向键",
+            0x2C => "PrintScreen",
+            0x2D => "Insert",
+            0x2E => "Delete",
+            0x30..=0x39 => &DIGITS[(vk - 0x30) as usize..(vk - 0x30) as usize + 1],
+            0x41..=0x5A => &LETTERS[(vk - 0x41) as usize..(vk - 0x41) as usize + 1],
+            0x5B => "左Win",
+            0x5C => "右Win",
+            0x5D => "菜单键",
+            0x60..=0x69 => NUMPAD[(vk - 0x60) as usize],
+            0x6A => "数字键盘*",
+            0x6B => "数字键盘+",
+            0x6D => "数字键盘-",
+            0x6E => "数字键盘.",
+            0x6F => "数字键盘/",
+            0x70..=0x87 => FKEYS[(vk - 0x70) as usize],
+            0x90 => "数字锁定",
+            0x91 => "滚动锁定",
+            0xBA => ";",
+            0xBB => "=",
+            0xBC => ",",
+            0xBD => "-",
+            0xBE => ".",
+            0xBF => "/",
+            0xC0 => "`",
+            0xDB => "[",
+            0xDC => "\\",
+            0xDD => "]",
+            0xDE => "'",
+            _ => return None,
+        })
+    }
+
+    /// 鼠标动作名：按键优先于滚轮；滚轮方向由 `usButtonData` 的符号决定（正=向上）。
+    /// 命名与主统计一致（鼠标左键 / 滚轮上滑 …）。不计数的事件返回 `None`。
+    pub fn mouse_action_name(flags: u16, data: i16) -> Option<&'static str> {
+        if flags & RI_MOUSE_LEFT_BUTTON_DOWN != 0 {
+            return Some("鼠标左键");
+        }
+        if flags & RI_MOUSE_RIGHT_BUTTON_DOWN != 0 {
+            return Some("鼠标右键");
+        }
+        if flags & RI_MOUSE_MIDDLE_BUTTON_DOWN != 0 {
+            return Some("鼠标中键");
+        }
+        if flags & RI_MOUSE_WHEEL != 0 {
+            return Some(if data >= 0 {
+                "滚轮上滑"
+            } else {
+                "滚轮下滑"
+            });
+        }
+        None
+    }
 }
 
 /// 启动设备统计线程（[device_stats] enabled=false 可关停；非 Windows 无操作）。
@@ -288,15 +391,29 @@ mod win {
                 return;
             }
             // 事件分类（不计数事件走快速出口：读标志位后立即返回）
-            let (counts, kind) =
+            let (counts, kind, key_name) =
                 match windows::Win32::UI::Input::RID_DEVICE_INFO_TYPE(header.dwType) {
                     RIM_TYPEMOUSE => {
-                        let flags = unsafe { raw.data.mouse.Anonymous.Anonymous.usButtonFlags };
-                        (classify::mouse_counts(flags), "mouse")
+                        let mouse = unsafe { raw.data.mouse.Anonymous.Anonymous };
+                        (
+                            classify::mouse_counts(mouse.usButtonFlags),
+                            "mouse",
+                            // 滚轮方向看 usButtonData 的符号（正=向上），与主统计口径一致
+                            classify::mouse_action_name(
+                                mouse.usButtonFlags,
+                                mouse.usButtonData as i16,
+                            ),
+                        )
                     }
                     RIM_TYPEKEYBOARD => {
-                        let flags = unsafe { raw.data.keyboard.Flags } as u16;
-                        (classify::keyboard_counts(flags), "keyboard")
+                        let kb = unsafe { raw.data.keyboard };
+                        let flags = kb.Flags as u16;
+                        (
+                            classify::keyboard_counts(flags),
+                            "keyboard",
+                            // VKey 为 255（无有效键码）时不记明细，只累加次数
+                            classify::vkey_name(kb.VKey),
+                        )
                     }
                     _ => return,
                 };
@@ -321,6 +438,9 @@ mod win {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             self.writer.record_device(&entry.0, &entry.1, kind, ts);
+            // 键名明细：未识别的键归入「其他按键」，避免明细表被长尾撑爆
+            self.writer
+                .record_device_key(&entry.0, key_name.unwrap_or(classify::OTHER_KEY), ts);
         }
     }
 
@@ -493,6 +613,37 @@ mod tests {
         assert!(classify::mouse_counts(0x0004), "右键按下");
         assert!(classify::mouse_counts(0x0010), "中键按下");
         assert!(classify::mouse_counts(0x0400), "滚轮");
+    }
+
+    /// 键名映射：常见键覆盖 + 未识别返回 None（调用方归入「其他按键」）
+    #[test]
+    fn key_name_mapping_covers_common_keys() {
+        assert_eq!(classify::vkey_name(0x41), Some("A"));
+        assert_eq!(classify::vkey_name(0x5A), Some("Z"));
+        assert_eq!(classify::vkey_name(0x31), Some("1"));
+        assert_eq!(classify::vkey_name(0x20), Some("空格"));
+        assert_eq!(classify::vkey_name(0x0D), Some("回车"));
+        assert_eq!(classify::vkey_name(0x1B), Some("Esc"));
+        assert_eq!(classify::vkey_name(0xA0), Some("左Shift"));
+        assert_eq!(classify::vkey_name(0x25), Some("左方向键"));
+        assert_eq!(classify::vkey_name(0x70), Some("F1"));
+        assert_eq!(classify::vkey_name(0x87), Some("F24"));
+        assert_eq!(classify::vkey_name(0x61), Some("数字键盘1"));
+        assert_eq!(classify::vkey_name(0xDC), Some("\\"));
+        assert_eq!(classify::vkey_name(0xFF), None, "无有效键码");
+        assert_eq!(classify::vkey_name(0x07), None, "未覆盖的键");
+    }
+
+    /// 鼠标动作名：三键优先 + 滚轮方向（正=上滑）；抬起事件不记明细
+    #[test]
+    fn mouse_action_names() {
+        assert_eq!(classify::mouse_action_name(0x0001, 0), Some("鼠标左键"));
+        assert_eq!(classify::mouse_action_name(0x0004, 0), Some("鼠标右键"));
+        assert_eq!(classify::mouse_action_name(0x0010, 0), Some("鼠标中键"));
+        assert_eq!(classify::mouse_action_name(0x0400, 120), Some("滚轮上滑"));
+        assert_eq!(classify::mouse_action_name(0x0400, -120), Some("滚轮下滑"));
+        assert_eq!(classify::mouse_action_name(0x0002, 0), None, "按键抬起");
+        assert_eq!(classify::mouse_action_name(0x0008, 0), None, "移动不记明细");
         assert!(
             classify::mouse_counts(0x0004 | 0x0008),
             "右键按下+释放（一次事件同报两个标志）"

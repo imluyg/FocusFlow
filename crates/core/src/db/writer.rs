@@ -68,6 +68,9 @@ struct AggDeltas {
     /// ((date_key, 设备实例路径)) -> 当日累计输入次数（设备维度统计）。
     /// 独立口径（键盘按下 + 鼠标按键按下 + 滚轮），不进 daily/hourly/keys。
     devices: HashMap<(i64, String), i64>,
+    /// ((date_key, 设备实例路径, 键名)) -> 当日累计次数（设备 × 键名明细）。
+    /// 用于「设备详情」里的键名排行；同为独立口径，不参与主统计的 key_counts。
+    device_keys: HashMap<(i64, String, String), i64>,
     /// 设备登记（device_key -> 名称/类型）。会话态，flush 不取走
     /// （名称缓存由采集线程在设备首个事件时写入一次，此后只读）。
     device_meta: HashMap<String, DeviceMeta>,
@@ -87,6 +90,7 @@ impl AggDeltas {
             && self.active.is_empty()
             && self.apps.is_empty()
             && self.devices.is_empty()
+            && self.device_keys.is_empty()
     }
 
     /// 取走待落库增量。`last_ts` / `current_app` / `device_meta` 保留在内存聚合中：
@@ -101,6 +105,7 @@ impl AggDeltas {
             active: std::mem::take(&mut self.active),
             apps: std::mem::take(&mut self.apps),
             devices: std::mem::take(&mut self.devices),
+            device_keys: std::mem::take(&mut self.device_keys),
             // 登记表快照随增量走（落库时写 devices 表），本体保留在内存
             device_meta: self.device_meta.clone(),
             last_ts: self.last_ts,
@@ -153,6 +158,13 @@ impl AggDeltas {
                 .or_default()
                 .devices
                 .insert((*dk, dev.clone()), *n);
+        }
+        for ((dk, dev, key), n) in &self.device_keys {
+            parts
+                .entry(year_of(*dk))
+                .or_default()
+                .device_keys
+                .insert((*dk, dev.clone(), key.clone()), *n);
         }
         // 设备登记表随各分区带上（落库时写 devices 表）。
         // 必须显式拷贝：partition 由 or_default() 新建，device_meta 默认为空，
@@ -391,6 +403,18 @@ impl DbWriter {
             .or_insert(0) += 1;
     }
 
+    /// 设备 × 键名明细：记录某设备的某个按键/滚轮一次（供设备详情排行）。
+    ///
+    /// 与 [`Self::record_device`] 同源同口径，只是多带一个键名维度；
+    /// 调用方一次输入同时调用两者（次数 + 键名），键名明细不单独进 devices 计数。
+    pub fn record_device_key(&self, device_key: &str, key_name: &str, timestamp: i64) {
+        let mut agg = self.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+        let day_key = queries::day_key_of_ts(timestamp);
+        *agg.device_keys
+            .entry((day_key, device_key.to_string(), key_name.to_string()))
+            .or_insert(0) += 1;
+    }
+
     /// 是否有未落库的增量（重聚合前判断是否需要先 flush）。
     pub fn has_pending(&self) -> bool {
         !self
@@ -481,6 +505,9 @@ struct AggDeltasFile {
     active: Vec<(i64, i64)>,
     apps: Vec<((i64, String), i64)>,
     devices: Vec<((i64, String), i64)>,
+    /// 设备 × 键名明细。旧版恢复文件没有该字段 → 用 default 兼容
+    #[serde(default)]
+    device_keys: Vec<((i64, String, String), i64)>,
     last_ts: i64,
 }
 
@@ -497,6 +524,7 @@ impl From<&AggDeltas> for AggDeltasFile {
             active: a.active.iter().map(|(k, v)| (*k, *v)).collect(),
             apps: a.apps.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             devices: a.devices.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            device_keys: a.device_keys.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             last_ts: a.last_ts,
         }
     }
@@ -515,6 +543,7 @@ impl From<AggDeltasFile> for AggDeltas {
             active: f.active.into_iter().collect(),
             apps: f.apps.into_iter().collect(),
             devices: f.devices.into_iter().collect(),
+            device_keys: f.device_keys.into_iter().collect(),
             // 会话态不透传恢复文件：回放后由采集线程重新填充
             // （设备名称在下一个输入事件时重新登记）
             device_meta: HashMap::new(),
@@ -717,6 +746,9 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
         for ((dk, dev), n) in part.devices {
             *agg.devices.entry((dk, dev)).or_insert(0) += n;
         }
+        for ((dk, dev, key), n) in part.device_keys {
+            *agg.device_keys.entry((dk, dev, key)).or_insert(0) += n;
+        }
     }
 }
 
@@ -794,6 +826,15 @@ fn flush_partition(
                     }
                 }
                 // 设备登记表：幂等覆盖（名称/类型变更时更新，其余情况写入相同值）
+                {
+                    let mut stmt = c.prepare(
+                        "INSERT INTO device_key_counts (date_key, device_key, key_name, count) VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(date_key, device_key, key_name) DO UPDATE SET count = count + excluded.count",
+                    )?;
+                    for ((dk, dev, key), n) in &pending.device_keys {
+                        stmt.execute(rusqlite::params![dk, dev, key, n])?;
+                    }
+                }
                 {
                     let mut stmt = c.prepare(
                         "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)
@@ -1033,6 +1074,52 @@ mod tests {
                 "flush 后的事件仍应归属到同一应用"
             );
         }
+        w.stop();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 设备 × 键名明细：累加、落库，且不污染主统计键名表。
+    #[test]
+    fn record_device_key_persists_rows() {
+        use chrono::Datelike;
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_writer_devkey_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+        let w = DbWriter::start(Duration::from_secs(3600));
+        let ts = queries::now_ts();
+        let dk = queries::day_key_of_ts(ts);
+        let dev = "HID#VID_046D&PID_C52B";
+
+        w.record_device(dev, "我的新鼠标 · 046D/C52B", "mouse", ts);
+        w.record_device_key(dev, "鼠标左键", ts);
+        w.record_device_key(dev, "鼠标左键", ts);
+        w.record_device_key(dev, "滚轮上滑", ts);
+        {
+            let agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                agg.device_keys
+                    .get(&(dk, dev.to_string(), "鼠标左键".to_string())),
+                Some(&2)
+            );
+            assert!(agg.keys.is_empty(), "设备键名不得进主统计键名表");
+        }
+        w.flush(true);
+        let year = chrono::Local::now().date_naive().year();
+        let conn = crate::db::connection::open_ro(&paths::year_db_path(year)).unwrap();
+        let read = |key: &str| -> i64 {
+            conn.query_row(
+                "SELECT count FROM device_key_counts \
+                 WHERE date_key = ?1 AND device_key = ?2 AND key_name = ?3",
+                rusqlite::params![dk, dev, key],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(read("鼠标左键"), 2);
+        assert_eq!(read("滚轮上滑"), 1);
+        drop(conn);
         w.stop();
         std::fs::remove_dir_all(&dir).ok();
     }

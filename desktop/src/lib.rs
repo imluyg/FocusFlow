@@ -124,6 +124,7 @@ pub fn run() {
             commands::get_vibrancy,
             commands::set_period,
             commands::set_device_alias,
+            commands::get_device_detail,
             commands::get_config,
             commands::set_config,
             commands::toggle_pause,

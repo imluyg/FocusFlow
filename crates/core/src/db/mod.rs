@@ -14,9 +14,9 @@ use chrono::Datelike;
 
 pub use queries::{
     available_years, get_alltime_max_day, get_alltime_summary, get_app_stats,
-    get_app_stats_by_date, get_daily_counts, get_device_stats, get_device_stats_by_date,
-    get_hourly_stats, get_stats, get_stats_by_date, get_today_count, get_weekday_stats,
-    invalidate_years_cache, DeviceStat,
+    get_app_stats_by_date, get_daily_counts, get_device_detail, get_device_stats,
+    get_device_stats_by_date, get_hourly_stats, get_stats, get_stats_by_date, get_today_count,
+    get_weekday_stats, invalidate_years_cache, DeviceDetail, DeviceStat,
 };
 pub use writer::DbWriter;
 

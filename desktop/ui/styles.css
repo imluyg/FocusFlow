@@ -132,10 +132,11 @@ table.grid th.col-percent { width: 24%; }
 /* 设备排行：6 列。.grid 是 table-layout: fixed —— 没有显式宽度的列会被压到最小宽度
    （表现为「类型」两个字换行、「操作」被挤出表格），所以这里必须给全每一列的宽度 */
 table.grid-devices th.col-rank { width: 8%; }
-table.grid-devices th.col-key { width: 40%; }
+table.grid-devices th.col-key { width: 44%; }
 table.grid-devices th.col-kind { width: 10%; }
 table.grid-devices th.col-count { width: 15%; }
-table.grid-devices th.col-percent { width: 13%; }
+/* 占比列窄一档（13% → 9%），把空间让给设备名 */
+table.grid-devices th.col-percent { width: 9%; }
 table.grid-devices th.col-act { width: 14%; }
 /* 设备列左对齐（名字是主要识别信息），长名字截断而不是撑破表格 */
 table.grid-devices td.key { text-align: left; }
@@ -165,6 +166,53 @@ table.grid-devices td input[type="text"] {
   box-sizing: border-box;
   font-size: 13px;
   padding: 3px 6px;
+}
+/* 设备行可点开详情 */
+table.grid-devices tbody tr[data-act="device-detail"] { cursor: pointer; }
+
+/* ===== 设备详情弹窗 ===== */
+.dev-detail-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.dev-detail-name { font-size: 16px; font-weight: 700; }
+.dev-detail-sub { color: var(--muted); font-size: 12px; word-break: break-all; }
+.dev-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin: 12px 0;
+}
+.dev-detail-cell {
+  background: var(--header-bg);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.dev-detail-cell .k { color: var(--muted); font-size: 12px; }
+.dev-detail-cell .v { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.dev-detail-line { color: var(--muted); font-size: 13px; margin: 4px 0; }
+.dev-detail-line b { color: var(--fg, inherit); }
+.dev-trend {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 72px;
+  margin: 6px 0 2px;
+}
+.dev-trend .dev-bar {
+  flex: 1;
+  min-height: 2px;
+  background: var(--accent);
+  border-radius: 2px 2px 0 0;
+}
+.dev-trend .dev-bar.zero { background: var(--grid-line); }
+.dev-trend-axis {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 /* ===== 设置 ===== */
@@ -210,13 +258,14 @@ button.btn.mini { padding: 3px 10px; font-size: 12px; border-radius: 6px; }
   display: none;
   position: fixed;
   inset: 0;
-  background: rgba(10, 15, 30, 0.45);
+  background: rgba(10, 15, 30, 0.55);
   align-items: center;
   justify-content: center;
   z-index: 1000;
 }
 .modal-dialog {
-  background: var(--card);
+  /* 不透明：玻璃模式下 --card 是半透明，弹窗会与页面背景糊在一起 */
+  background: var(--modal-bg);
   border-radius: 14px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
   width: min(420px, 92vw);

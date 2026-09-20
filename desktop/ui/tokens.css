@@ -7,6 +7,9 @@
   --page-bottom: #F7FAFE;
   --fg: #1A1A2E;
   --card: #FFFFFF;
+  /* 弹窗背景：始终不透明 —— 玻璃模式下 --card 是半透明令牌，
+     弹窗用它会把页面文字透出来，读不清 */
+  --modal-bg: #FFFFFF;
   --accent: #4D8CF7;
   --accent-hover: #3B7DE0;
   /* 深色强调色：仅用于与白字搭配的实底（.tab.active），保证对比度 ≥ 4.5:1 */
@@ -31,6 +34,7 @@ body.dark {
   --page-bottom: #10131C;
   --fg: #E8EAEE;
   --card: #1E2331;
+  --modal-bg: #1E2331;
   --accent: #5B9CF7;
   --accent-hover: #7AB1FA;
   --accent-strong: #3B7DE0;
