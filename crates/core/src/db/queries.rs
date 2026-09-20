@@ -612,7 +612,10 @@ pub struct DeviceStat {
 }
 
 /// 设备无登记名时的回退显示名：优先截取 VID/PID 段，取不到则截断原路径。
-fn fallback_device_name(device_key: &str) -> String {
+///
+/// 写入侧也用（`writer::device_id_in_db`）：恢复文件回放后的首次落库拿不到设备名，
+/// 兜底登记用同一套命名，界面才不会因为「回放先于重新登记」而闪出原始路径。
+pub(crate) fn fallback_device_name(device_key: &str) -> String {
     if let Some((vid, pid)) = parse_vid_pid(device_key) {
         format!("HID 设备 · {vid}/{pid}")
     } else {
@@ -757,9 +760,20 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
     let mut stats: Vec<DeviceStat> = rows
         .into_iter()
         .map(|r| {
+            // 两种「没有可用名字」都要回退：
+            //   1. 登记名缺失/空白          —— 登记表压根没这一行；
+            //   2. 登记名 == device_key     —— 写入侧拿不到设备信息时的占位登记
+            //      （恢复文件回放会把 device_meta 置空、`migrate_device_tables` 与跨年归档
+            //      也都用 device_key 占位），存的是 `\\?\HID#VID_...` 或 `device-id:3` 这种
+            //      机器串。它非空却不能给人看，必须一并视为「没名字」。
+            // 放在查询侧而不是逐个堵写入点：写入/迁移/归档三条路径会随版本变化，
+            // 只有这里的兜底对所有历史库和新数据都成立。
             let auto_name = r
                 .name
-                .filter(|n| !n.trim().is_empty())
+                .as_ref()
+                .map(|n| n.trim())
+                .filter(|n| !n.is_empty() && *n != r.device_key.as_str())
+                .map(|n| n.to_string())
                 .unwrap_or_else(|| fallback_device_name(&r.device_key));
             // 别名优先（用户改过的名字），别名缺失或为空时用自动名。
             // 去重只对自动名生效：两个不同设备可以起同一个别名，用户说了算。
@@ -1394,6 +1408,60 @@ mod tests {
             "同型号显示名去重"
         );
         assert_eq!(stats[3].count, 10);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 登记名被写成裸设备路径时（历史脏登记）不计为真名，一律走回退。
+    ///
+    /// 有三个来源都把 device_key 当 name 写进 devices 表：
+    /// 恢复文件回放后缺 meta 的补登（2026-09-21 前的写法）、
+    /// `migrate_device_tables` 对旧库的迁移补登、跨年归档的占位登记。
+    /// 逐个堵写入点会随版本漏掉，所以兜底收在查询侧一处。
+    #[test]
+    fn device_stats_ignores_device_key_as_name() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_devdirty_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let dk = day_key_of_date(Local::now().date_naive());
+        let dirty = r"\\?\HID#VID_046D&PID_C52B&MI_00#8&2c5f&0&0000#{378de44c}";
+        let clean = "HID#VID_1B1C&PID_1B2D#clean";
+        {
+            let path = paths::year_db_path(Local::now().year());
+            let conn = crate::db::connection::open_rw(&path).unwrap();
+            crate::db::connection::ensure_schema(&conn, Local::now().year()).unwrap();
+            let ins = |key: &str, name: &str, kind: &str, n: i64| {
+                conn.execute(
+                    "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![key, name, kind],
+                )
+                .unwrap();
+                let id = crate::db::connection::device_id_of(&conn, key).expect("设备 id");
+                conn.execute(
+                    "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![dk, id, n],
+                )
+                .unwrap();
+            };
+            ins(dirty, dirty, "unknown", 40);
+            ins(clean, "我的键盘 · 1B1C/1B2D", "keyboard", 10);
+        }
+
+        let (_, stats) = get_device_stats_by_date(Local::now().date_naive());
+        let row = |key: &str| stats.iter().find(|s| s.key == key).expect("设备行");
+        assert_eq!(
+            row(dirty).name,
+            "HID 设备 · 046D/C52B",
+            "登记名等于 device_key 时必须当作「没名字」回退"
+        );
+        assert_ne!(row(dirty).name, dirty, "不能把设备实例路径显示出来");
+        assert_eq!(
+            row(clean).name,
+            "我的键盘 · 1B1C/1B2D",
+            "正常登记名不得被这条规则改掉"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

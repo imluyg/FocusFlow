@@ -754,18 +754,26 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
     }
 }
 
-/// 取设备在本库的整数 id：登记行不存在时按路径补登一行（name 退化为路径、kind 记 unknown）。
+/// 取设备在本库的整数 id：登记行不存在时补登一行（名称走回退命名、kind 记 unknown）。
 ///
 /// 统计表字典化后只存 id，漏登记会让查询侧 JOIN 静默丢行、凭空少掉设备数据，
-/// 所以这里宁可补一条难看的占位登记，也不放弃计数。
+/// 所以这里宁可补一条占位登记，也不放弃计数。
 fn device_id_in_db(
     upsert: &mut rusqlite::Statement<'_>,
     dev: &str,
     meta: Option<&DeviceMeta>,
 ) -> rusqlite::Result<i64> {
+    // 没有登记信息时不能把裸设备路径写进 devices.name：查询侧只把「空名字」当作缺登记，
+    // 非空就原样展示（`merge_device_rows` 仅在 name 为空时才回退），于是会把
+    // `\\?\HID#VID_046D&PID_C52B&MI_00#8&...` 直接顶到设备排行上。
+    // 设备补齐后的下一次 flush 会 UPSERT 成真名，但那一跃期间的展示已经脏了。
+    let fallback_name;
     let (name, kind) = match meta {
         Some(m) => (m.name.as_str(), m.kind.as_str()),
-        None => (dev, "unknown"),
+        None => {
+            fallback_name = queries::fallback_device_name(dev);
+            (fallback_name.as_str(), "unknown")
+        }
     };
     upsert.query_row(rusqlite::params![dev, name, kind], |r| r.get(0))
 }
@@ -1281,6 +1289,62 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1);
         w.stop();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 缺设备登记时的兜底命名：不能把裸路径写进 devices.name（2026-09-21）。
+    ///
+    /// 恢复文件回放会把 device_meta 置空（会话态不透传），首次 flush 走 meta=None 分支；
+    /// 而查询侧只在 name 为空时才回退，所以这里必须写出人话，
+    /// 否则设备排行会顶出一长串 `\\?\HID#VID_...`，直到该设备下一次真名 flush 为止。
+    #[test]
+    fn device_id_in_db_registers_readable_name_without_meta() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_writer_devfb_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let year = chrono::Local::now().year();
+        let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+        connection::ensure_schema(&conn, year).unwrap();
+        const DEV: &str = r"\\?\HID#VID_046D&PID_C52B&MI_00#8&2c5f&0&0000#{378de44c}";
+        const UPSERT: &str = "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(device_key) DO UPDATE SET name = excluded.name, kind = excluded.kind \
+             RETURNING id";
+
+        let mut upsert = conn.prepare(UPSERT).unwrap();
+        let id = device_id_in_db(&mut upsert, DEV, None).unwrap();
+        drop(upsert);
+        assert!(id > 0, "补登必须拿到整数 id");
+        let name: String = conn
+            .query_row("SELECT name FROM devices WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "HID 设备 · 046D/C52B", "缺登记时应写回退命名");
+        assert_ne!(name, DEV, "绝不能是裸设备实例路径");
+
+        // 设备补齐后（真名随首个真实事件到达）UPSERT 应覆盖成真名且不新开登记行
+        let real = DeviceMeta {
+            name: "我的新鼠标 · 046D/C52B".to_string(),
+            kind: "mouse".to_string(),
+        };
+        let mut upsert = conn.prepare(UPSERT).unwrap();
+        let id2 = device_id_in_db(&mut upsert, DEV, Some(&real)).unwrap();
+        drop(upsert);
+        assert_eq!(id2, id, "补名必须命中同一登记行");
+        let (name2, kind2): (String, String) = conn
+            .query_row("SELECT name, kind FROM devices WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(name2, "我的新鼠标 · 046D/C52B");
+        assert_eq!(kind2, "mouse");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "同一设备只登记一行");
+
+        drop(conn);
         std::fs::remove_dir_all(&dir).ok();
     }
 
