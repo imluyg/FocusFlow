@@ -1124,9 +1124,9 @@ mod tests {
         assert_eq!(stats[0].name, stats[0].auto_name);
 
         // 改名后：展示别名，自动名保留
-        crate::device_alias::set(key, "罗技 G304").unwrap();
+        crate::device_alias::set(key, "新鼠标").unwrap();
         let (_, stats) = get_device_stats_by_date(Local::now().date_naive());
-        assert_eq!(stats[0].name, "罗技 G304", "展示名应被别名覆盖");
+        assert_eq!(stats[0].name, "新鼠标", "展示名应被别名覆盖");
         assert_eq!(stats[0].auto_name, "HID 鼠标 · 046D/C52B");
         assert_eq!(stats[0].count, 42, "改名不影响计数");
 

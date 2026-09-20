@@ -1,6 +1,6 @@
 //! 设备别名：把自动解析出来的设备名（`HID 鼠标 · 24AE/1464`）换成用户看得懂的名字。
 //!
-//! 存储：`data/device_aliases.json`，形如 `{ "HID#VID_24AE&PID_1464&MI_00#7&...": "罗技 G304" }`。
+//! 存储：`data/device_aliases.json`，形如 `{ "HID#VID_24AE&PID_1464&MI_00#7&...": "新鼠标" }`。
 //! 纯文本、可直接手改；解析侧按文件 mtime 变化自动重载（无需重启）。
 //!
 //! 匹配分两层（`AliasTable::resolve`）：
@@ -216,11 +216,11 @@ mod tests {
         with_temp_dir("model", || {
             let old_key = "HID#VID_046D&PID_C52B&MI_00#7&OLDPORT&0&0000";
             let new_key = "HID#VID_046D&PID_C52B&MI_00#7&NEWPORT&0&0000";
-            set(old_key, "罗技 G304").unwrap();
-            assert_eq!(table().resolve(old_key), Some("罗技 G304"));
+            set(old_key, "新鼠标").unwrap();
+            assert_eq!(table().resolve(old_key), Some("新鼠标"));
             assert_eq!(
                 table().resolve(new_key),
-                Some("罗技 G304"),
+                Some("新鼠标"),
                 "同型号换端口后别名应回退命中"
             );
             // 精确别名不覆盖型号回退

@@ -437,11 +437,8 @@ mod tests {
         );
         // 非通用名（厂商名）原样保留
         assert_eq!(
-            display_name(
-                r"\\?\HID#VID_046D&PID_C52B#x",
-                Some("Logitech USB Receiver")
-            ),
-            "Logitech USB Receiver · 046D/C52B"
+            display_name(r"\\?\HID#VID_046D&PID_C52B#x", Some("USB 接收器")),
+            "USB 接收器 · 046D/C52B"
         );
         assert_eq!(
             display_name(
@@ -474,7 +471,7 @@ mod tests {
         assert_eq!(localize_generic_name("HID-compliant mouse"), "HID 鼠标");
         assert_eq!(localize_generic_name("HID Keyboard Device"), "HID 键盘");
         assert_eq!(localize_generic_name("Standard PS/2 Keyboard"), "PS/2 键盘");
-        assert_eq!(localize_generic_name("Rapoo Receiver"), "Rapoo Receiver");
+        assert_eq!(localize_generic_name("USB Receiver"), "USB Receiver");
     }
 
     /// 键盘分类：按下计、释放不计。

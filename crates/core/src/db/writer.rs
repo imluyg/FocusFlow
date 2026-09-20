@@ -1053,20 +1053,20 @@ mod tests {
         w.record("A", ts);
         w.record_device(
             "HID#VID_046D&PID_C52B",
-            "罗技 G304 · 046D/C52B",
+            "我的新鼠标 · 046D/C52B",
             "mouse",
             ts,
         );
         w.record_device(
             "HID#VID_046D&PID_C52B",
-            "罗技 G304 · 046D/C52B",
+            "我的新鼠标 · 046D/C52B",
             "mouse",
             ts,
         );
         // 同一实例产生键盘事件 → hybrid
         w.record_device(
             "HID#VID_046D&PID_C52B",
-            "罗技 G304 · 046D/C52B",
+            "我的新鼠标 · 046D/C52B",
             "keyboard",
             ts,
         );
