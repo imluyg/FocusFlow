@@ -163,11 +163,43 @@ pub fn run() {
         .run(|app_handle, event| {
             // 退出前优雅关闭数据库：flush + 备份 + 停止写线程
             if let tauri::RunEvent::Exit = event {
-                if let Some(state) = app_handle.try_state::<std::sync::Arc<state::AppState>>() {
-                    state.db.shutdown(state.config);
-                }
                 // 配置去抖写盘：退出前强制落盘，避免丢失最后的设置
                 let _ = focusflow_core::config::instance().save();
+
+                if let Some(state) = app_handle.try_state::<std::sync::Arc<state::AppState>>() {
+                    let db = std::sync::Arc::clone(&state.db);
+                    let config = state.config;
+                    // 在独立线程里做关闭，主线程限时等待。
+                    //
+                    // 不能直接丢给后台线程就返回：`RunEvent::Exit` 返回后进程即终止，
+                    // 未跑完的 flush/备份会被直接掐断 —— 那是真丢数据。
+                    // 也不能裸在主线程跑：内部是 flush(true)（≤3s）+ 全量备份 + stop()（≤3s），
+                    // 用户看到的就是"点了退出卡 6 秒"。折中成"后台线程 + 限时 join"：
+                    // 正常情况下主线程等它跑完（行为与之前一致、数据不丢），
+                    // 只有异常卡死时才放弃等待，避免窗口永远关不掉。
+                    let handle = std::thread::Builder::new()
+                        .name("db-shutdown".into())
+                        .spawn(move || db.shutdown(config));
+                    match handle {
+                        Ok(h) => {
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(20);
+                            while !h.is_finished() && std::time::Instant::now() < deadline {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                            }
+                            if h.is_finished() {
+                                let _ = h.join();
+                            } else {
+                                tracing::error!("数据库关闭超时（20 秒），放弃等待直接退出");
+                            }
+                        }
+                        Err(e) => {
+                            // 线程都起不来（极端资源耗尽）：退回同步关闭，宁可慢不可丢
+                            tracing::error!("关闭线程启动失败（{e}），改为主线程同步关闭");
+                            state.db.shutdown(state.config);
+                        }
+                    }
+                }
             }
         });
 }

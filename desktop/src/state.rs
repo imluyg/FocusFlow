@@ -1069,10 +1069,16 @@ fn spawn_stats_worker(
                     } else {
                         // 全历史最高单日（全表 ORDER BY，最贵的单项查询）：仅缓存失效时重查
                         if alltime_dirty {
-                            // 先把写线程内存中的增量落库，图表查询才能看到最新按键
+                            // 请求写线程落库（非阻塞：只发信号，不在这里等）。
+                            //
+                            // 这里曾用 flush(true)：写线程若正处重试退避（500ms/1s）或库被锁，
+                            // 统计线程会阻塞最长 3 秒，期间 stats-live 推不出去 ——
+                            // 悬浮窗数字肉眼可见地冻住。图表类的总数/最高单日只是展示值：
+                            // 最多一个 flush 周期（10 秒）后追上最新落库，
+                            // 期间 alltime_total_now 用今日增量自行修正，不需要阻塞等待。
                             if let Some(w) = db.writer() {
                                 if w.has_pending() {
-                                    w.flush(true);
+                                    w.flush(false);
                                 }
                             }
                             last_heavy = Instant::now();

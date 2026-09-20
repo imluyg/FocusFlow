@@ -396,13 +396,20 @@ pub fn set_device_alias(
 
 /// 设备详情（点击「设备排行」某一行时按需查询）。
 /// `period` 与统计视图一致：-1 今日 / 0 全部 / n 近 n 天。
+///
+/// async：核心实现要跨每个年度库跑 4 趟（设备日序列 + 设备键名明细 +
+/// 设备排行 + 类型回退），同步命令会在主线程跑完，年份一多点击就卡窗口。
 #[tauri::command]
-pub fn get_device_detail(key: String, period: i64) -> Result<serde_json::Value, String> {
+pub async fn get_device_detail(key: String, period: i64) -> Result<serde_json::Value, String> {
     if key.trim().is_empty() {
         return Err("设备标识为空".to_string());
     }
-    let detail = focusflow_core::db::get_device_detail(&key, period);
-    serde_json::to_value(detail).map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let detail = focusflow_core::db::get_device_detail(&key, period);
+        serde_json::to_value(detail).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 插件管理页打开/关闭时切换热重载监听（打开才扫描，平时零后台开销）。

@@ -356,18 +356,12 @@ pub fn migrate_v2() {
 /// 迁移单个年度库，返回迁移的明细条数（无旧数据时为 0）。
 fn migrate_v2_file(path: &Path, year: i32) -> i64 {
     let result = (|| -> anyhow::Result<i64> {
-        let conn = connection::open_rw(path)?;
-        connection::ensure_schema(&conn, year)?;
-        let has_key_log: bool = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='key_log'",
-                [],
-                |_| Ok(()),
-            )
-            .is_ok();
-        if !has_key_log {
+        // 廉价守卫放最前：绝大多数库没有旧版暂存表，连写连接都不该开。
+        if !connection::table_exists_readonly(path, "key_log") {
             return Ok(0);
         }
+        let conn = connection::open_rw(path)?;
+        connection::ensure_schema(&conn, year)?;
         let row_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM key_log", [], |r| r.get(0))
             .unwrap_or(0);
@@ -814,9 +808,25 @@ pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
         if !src.exists() {
             continue;
         }
+        // 源库指纹必须在**任何备份动作之前**取：备份过程本身可能触碰源库
+        // （兜底路径的 checkpoint 会改写主库文件），取晚了就会把"我改了源库"
+        // 记成"源库变了"，下次又来一遍。
+        let src_fp = source_fingerprint(&src);
+        // 历史年度库归档后不再变化，没必要每轮备份都重快照一遍（全量复制 +
+        // 切 journal_mode + quick_check 全读，而 backup_on_exit 默认开）。
+        // 当年库始终备份（每天都在写）；历史库与本组最新备份记录的源库指纹比对，
+        // 一致才跳过 —— 源库被外部改过 / 刚从归档补写 / 首次备份都会照常备份。
+        if year != chrono::Local::now().year() && !year_db_needs_backup(year, src_fp) {
+            tracing::debug!("跳过未变化的历史年度库备份: {year}");
+            continue;
+        }
         let dst = paths::backup_dir().join(format!("focusflow_{year}_{timestamp}.db"));
         let mut ok = backup_db_file(&src, &dst);
         if ok {
+            // 指纹要在 finalize 之前写：finalize 负责把备份收尾成"单个自包含
+            // 文件"（切回 rollback journal 并清掉 -wal/-shm）。用 open_rw 写
+            // meta 会重新产生 sidecar，等于把 finalize 的成果作废。
+            write_source_fingerprint(&dst, src_fp);
             finalize_backup(&dst);
             ok = verify_backup_file(&dst);
         }
@@ -830,6 +840,7 @@ pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
                 drop(conn);
             }
             if std::fs::copy(&src, &dst).is_ok() {
+                write_source_fingerprint(&dst, src_fp);
                 finalize_backup(&dst);
                 ok = verify_backup_file(&dst);
             }
@@ -973,8 +984,98 @@ fn write_suspect_note(timestamp: &str, detail: &str) -> std::path::PathBuf {
     path
 }
 
+/// 文件的修改时间（取不到返回 None）。
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+const SOURCE_SIZE_KEY: &str = "src_size";
+const SOURCE_MTIME_KEY: &str = "src_mtime";
+
+/// 源库指纹：大小 + 纳秒级 mtime。
+///
+/// 不能用「源库 mtime > 备份文件 mtime」判断是否需要备份 —— 备份过程本身会触碰
+/// 源库（在线备份读取、兜底路径的 checkpoint 都会更新主库时间戳），源库 mtime
+/// 永远晚于备份文件，判定恒为"需要备份"，优化直接失效。所以把"这份备份对应源库
+/// 的什么状态"记进备份自己的 `meta` 表，下一轮据此比对。
+fn source_fingerprint(path: &Path) -> Option<(i64, i128)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((meta.len() as i64, mtime.as_nanos() as i128))
+}
+
+/// 读取备份自己记录的源库指纹（旧备份没有这两个键 → None）。
+fn backup_source_fingerprint(backup: &Path) -> Option<(i64, i128)> {
+    let conn = Connection::open_with_flags(
+        backup,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let get = |key: &str| -> Option<String> {
+        conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+    };
+    let size: i64 = get(SOURCE_SIZE_KEY)?.parse().ok()?;
+    let mtime: i128 = get(SOURCE_MTIME_KEY)?.parse().ok()?;
+    Some((size, mtime))
+}
+
+/// 把源库指纹写进备份（必须在 [`finalize_backup`] **之前**调用）。
+///
+/// finalize 负责把备份收尾成"单个自包含文件"（切回 rollback journal 并清掉
+/// -wal/-shm）；用 open_rw 写 meta 会重新产生 sidecar，放它后面等于白收尾。
+/// 失败只记日志：备份本身已有效，只是下次会多备份一次，不能让整份备份作废。
+fn write_source_fingerprint(backup: &Path, fp: Option<(i64, i128)>) {
+    let Some((size, mtime)) = fp else {
+        return;
+    };
+    let result = (|| -> anyhow::Result<()> {
+        let conn = connection::open_rw(backup)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;",
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![SOURCE_SIZE_KEY, size.to_string()],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![SOURCE_MTIME_KEY, mtime.to_string()],
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        tracing::warn!("备份指纹写入失败 {}: {e}", backup.display());
+    }
+}
+
+/// 该年度库是否还需要备份：与**本组最新备份记录的源库指纹**比对。
+///
+/// 指纹一致 → 这份备份就是当前源库状态的快照，跳过；任何读取失败/指纹缺失
+/// （本组还没备份、或备份由更早版本产出）→ 保守备份。
+fn year_db_needs_backup(year: i32, current: Option<(i64, i128)>) -> bool {
+    let Some(current) = current else {
+        // 源库状态读不到（刚被删/权限异常）：保守备份
+        return true;
+    };
+    match newest_backup_of_group(&year.to_string())
+        .as_deref()
+        .and_then(backup_source_fingerprint)
+    {
+        Some(recorded) => recorded != current,
+        None => true,
+    }
+}
+
 /// 某分组（年份 / 插件名）中最新的一份备份。
 fn newest_backup_of_group(group: &str) -> Option<std::path::PathBuf> {
+    let prefix = format!("focusflow_{group}_");
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(paths::backup_dir())
         .ok()?
         .flatten()
@@ -983,12 +1084,13 @@ fn newest_backup_of_group(group: &str) -> Option<std::path::PathBuf> {
             p.file_name()
                 .map(|n| {
                     let n = n.to_string_lossy();
-                    n.starts_with(&format!("focusflow_{group}_")) && n.ends_with(".db")
+                    n.starts_with(&prefix) && n.ends_with(".db")
                 })
                 .unwrap_or(false)
         })
         .collect();
-    files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    // sort_by_cached_key：key 里有一次 stat 系统调用，用 sort_by_key 会按比较次数重复 stat
+    files.sort_by_cached_key(|p| file_mtime(p.as_path()));
     files.pop()
 }
 
@@ -1275,61 +1377,105 @@ pub fn delete_key_today(key_name: &str) -> i64 {
 pub fn heal_daily_consistency() {
     for year in queries::available_years() {
         let path = paths::year_db_path(year);
+        // 先用只读连接体检：健康的库（绝大多数）连写连接都不开，不产生 WAL 副作用、
+        // 不拿写锁。此前无条件 open_rw + 两条相关子查询 UPDATE，每次启动都在每个
+        // 年度库上跑一遍全表扫描，纯属白干。
+        let dirty = match connection::open_ro(&path) {
+            Ok(conn) => daily_inconsistency(&conn),
+            Err(_) => continue,
+        };
+        if !dirty.has_daily_mismatch && dirty.hourly_mismatch_days.is_empty() {
+            continue;
+        }
         let conn = match connection::open_rw(&path) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        // 1. daily = Σ key_counts
-        let fixed_daily = conn
-            .execute(
-                "UPDATE daily_counts SET count = COALESCE(
-                     (SELECT SUM(count) FROM key_counts WHERE key_counts.date_key = daily_counts.date_key), 0)
-                 WHERE count != COALESCE(
-                     (SELECT SUM(count) FROM key_counts WHERE key_counts.date_key = daily_counts.date_key), 0)",
-                [],
-            )
-            .unwrap_or(0);
-        // 无 key_counts 行但 daily_counts 有值的残留天，直接清零
-        let _ = conn.execute(
-            "UPDATE daily_counts SET count = 0
-             WHERE count != 0 AND NOT EXISTS
-                 (SELECT 1 FROM key_counts WHERE key_counts.date_key = daily_counts.date_key)",
-            [],
-        );
-        if fixed_daily > 0 {
-            tracing::info!("一致性自愈：{year} 年库修正 {fixed_daily} 天的 daily_counts");
-        }
-
-        // 2. Σhourly → daily 对齐（仅处理有偏差的天）
-        let days: Vec<i64> = conn
-            .prepare(
-                "SELECT d.date_key FROM daily_counts d
-                 JOIN (SELECT date_key, SUM(count) s FROM hourly_counts GROUP BY date_key) h
-                   ON h.date_key = d.date_key
-                 WHERE h.s != d.count",
-            )
-            .and_then(|mut s| {
-                s.query_map([], |r| r.get::<_, i64>(0))
-                    .map(|rows| rows.flatten().collect())
-            })
-            .unwrap_or_default();
-        for dk in &days {
-            let daily: i64 = conn
-                .query_row(
-                    "SELECT count FROM daily_counts WHERE date_key=?1",
-                    [dk],
-                    |r| r.get(0),
+        if dirty.has_daily_mismatch {
+            let fixed_daily = conn
+                .execute(
+                    "UPDATE daily_counts SET count = COALESCE(
+                         (SELECT SUM(count) FROM key_counts WHERE key_counts.date_key = daily_counts.date_key), 0)
+                     WHERE count != COALESCE(
+                         (SELECT SUM(count) FROM key_counts WHERE key_counts.date_key = daily_counts.date_key), 0)",
+                    [],
                 )
                 .unwrap_or(0);
-            scale_hourly_to_total(&conn, *dk, daily);
+            // 无 key_counts 行但 daily_counts 有值的残留天，直接清零
+            let cleared = conn
+                .execute(
+                    "UPDATE daily_counts SET count = 0
+                     WHERE count != 0 AND NOT EXISTS
+                         (SELECT 1 FROM key_counts WHERE key_counts.date_key = daily_counts.date_key)",
+                    [],
+                )
+                .unwrap_or(0);
+            if fixed_daily > 0 || cleared > 0 {
+                tracing::info!(
+                    "一致性自愈：{year} 年库修正 {fixed_daily} 天 daily_counts（另清零 {cleared} 天）"
+                );
+            }
         }
-        if !days.is_empty() {
+
+        // Σhourly → daily 对齐（只处理确有偏差的天）
+        if !dirty.hourly_mismatch_days.is_empty() {
+            for dk in &dirty.hourly_mismatch_days {
+                let daily: i64 = conn
+                    .query_row(
+                        "SELECT count FROM daily_counts WHERE date_key=?1",
+                        [dk],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                scale_hourly_to_total(&conn, *dk, daily);
+            }
             tracing::info!(
                 "一致性自愈：{year} 年库重算 {} 天的 hourly_counts",
-                days.len()
+                dirty.hourly_mismatch_days.len()
             );
             queries::invalidate_years_cache();
         }
+    }
+}
+
+/// 一致性体检结果（全部只在只读连接上得出）。
+#[derive(Default)]
+struct Inconsistency {
+    /// daily_counts 与 Σkey_counts 存在偏差（或有残留天）
+    has_daily_mismatch: bool,
+    /// Σhourly 与 daily 不一致的天
+    hourly_mismatch_days: Vec<i64>,
+}
+
+/// 只读体检：找出 daily/hourly 与明细表不一致的天。
+fn daily_inconsistency(conn: &Connection) -> Inconsistency {
+    // 1. 有没有哪天的 daily != Σkey_counts（含 daily 有值但明细全无的残留天）
+    let has_daily_mismatch = conn
+        .query_row(
+            "SELECT 1 FROM daily_counts d
+              WHERE d.count != COALESCE((SELECT SUM(count) FROM key_counts k
+                                          WHERE k.date_key = d.date_key), 0)
+              LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    // 2. 有没有哪天的 Σhourly != daily
+    let hourly_mismatch_days = conn
+        .prepare(
+            "SELECT d.date_key FROM daily_counts d
+              JOIN (SELECT date_key, SUM(count) s FROM hourly_counts GROUP BY date_key) h
+                ON h.date_key = d.date_key
+              WHERE h.s != d.count",
+        )
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, i64>(0))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    Inconsistency {
+        has_daily_mismatch,
+        hourly_mismatch_days,
     }
 }
 
@@ -1830,6 +1976,193 @@ mod tests {
             .unwrap();
         assert_eq!(count, 42, "备份内容应完整");
         drop(conn);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 未变化的历史年度库不再重复备份：内容相同的快照只是白占 backup/ 与磁盘 IO。
+    /// 但源库一旦真的变了（归档补写、恢复备份、手工替换）必须照常备份。
+    ///
+    /// 回归：判定不能用 mtime 比较（备份过程本身会更新源库时间戳，判定恒为真），
+    /// 必须比对备份自己记录的源库指纹 —— 否则这个"跳过"永远不会生效。
+    #[test]
+    fn unchanged_historical_year_is_not_rebacked_up() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_backup_skip_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let year = chrono::Local::now().year();
+        let old = year - 1;
+        for (y, marker) in [(year, 11i64), (old, 22i64)] {
+            let conn = connection::open_rw(&paths::year_db_path(y)).unwrap();
+            connection::ensure_schema(&conn, y).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (1, ?1)",
+                [marker],
+            )
+            .unwrap();
+        }
+        queries::invalidate_years_cache();
+
+        let backup_files = || -> Vec<String> {
+            std::fs::read_dir(paths::backup_dir())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.ends_with(".db"))
+                .collect()
+        };
+        let old_prefix = format!("focusflow_{old}_");
+
+        // 首轮：两个年度库都必须有备份（本组此前没有任何备份）
+        backup_database(5).expect("首轮应有备份");
+        assert!(
+            backup_files().iter().any(|n| n.starts_with(&old_prefix)),
+            "首轮应备份历史年度库: {:?}",
+            backup_files()
+        );
+
+        // 第二轮：内容未变 → 不应新增历史年度库的备份
+        let before: Vec<String> = backup_files()
+            .into_iter()
+            .filter(|n| n.starts_with(&old_prefix))
+            .collect();
+        backup_database(5).expect("第二轮应产出当年库备份");
+        let after: Vec<String> = backup_files()
+            .into_iter()
+            .filter(|n| n.starts_with(&old_prefix))
+            .collect();
+        assert_eq!(
+            after,
+            before,
+            "未变化的历史年度库不应被重复备份（新增 {:?}）",
+            after
+                .iter()
+                .filter(|n| !before.contains(n))
+                .collect::<Vec<_>>()
+        );
+
+        // 源库真的变了（模拟恢复备份/归档补写）→ 必须重新备份，否则新数据没被覆盖
+        {
+            let conn = connection::open_rw(&paths::year_db_path(old)).unwrap();
+            conn.execute("UPDATE daily_counts SET count = 33 WHERE date_key = 1", [])
+                .unwrap();
+        }
+        // 保证大小/时间戳确实变了（同毫秒内改写可能指纹相同）
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        backup_database(5).expect("第三轮应产出备份");
+        let changed: Vec<String> = backup_files()
+            .into_iter()
+            .filter(|n| n.starts_with(&old_prefix))
+            .collect();
+        assert!(
+            changed.len() > before.len(),
+            "源库变化后必须重新备份（前 {before:?}，后 {changed:?}）"
+        );
+        // 最新那份的内容必须是改后的值（证明备份到了新状态）
+        let newest = changed.iter().max().expect("应有历史年度库备份");
+        let conn = Connection::open(paths::backup_dir().join(newest)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count FROM daily_counts WHERE date_key=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 33, "新备份应包含改动后的数据");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 启动自愈：不一致的天必须被修好，且体检阶段只读。
+    #[test]
+    fn heal_detects_before_writing_and_repairs_mismatch() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_heal_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let year = chrono::Local::now().year();
+        let path = paths::year_db_path(year);
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            // 一致的一天
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (1, 10)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO key_counts (date_key, key_name, count) VALUES (1, 'A', 10)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO hourly_counts (date_key, hour, count) VALUES (1, 9, 10)",
+                [],
+            )
+            .unwrap();
+            // 不一致的一天：daily=99 但明细只有 4
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (2, 99)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO key_counts (date_key, key_name, count) VALUES (2, 'A', 4)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO hourly_counts (date_key, hour, count) VALUES (2, 9, 4)",
+                [],
+            )
+            .unwrap();
+        }
+        queries::invalidate_years_cache();
+
+        // 体检阶段：只读地发现第 2 天不一致
+        {
+            let ro = connection::open_ro(&path).unwrap();
+            let d = daily_inconsistency(&ro);
+            assert!(d.has_daily_mismatch, "应检出 daily 与明细不一致");
+            assert_eq!(d.hourly_mismatch_days, vec![2], "只有第 2 天 hourly 偏差");
+        }
+
+        heal_daily_consistency();
+
+        let conn = connection::open_ro(&path).unwrap();
+        let day1: i64 = conn
+            .query_row("SELECT count FROM daily_counts WHERE date_key=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let day2: i64 = conn
+            .query_row("SELECT count FROM daily_counts WHERE date_key=2", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(day1, 10, "一致的天不应被改动");
+        assert_eq!(day2, 4, "不一致的天应被重算为 Σkey_counts");
+        let sum2: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(count),0) FROM hourly_counts WHERE date_key=2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sum2, 4, "Σhourly 应被对齐到 daily");
+        drop(conn);
+
+        // 再跑一次：已经没有可修的东西
+        {
+            let ro = connection::open_ro(&path).unwrap();
+            let d = daily_inconsistency(&ro);
+            assert!(!d.has_daily_mismatch);
+            assert!(d.hourly_mismatch_days.is_empty());
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

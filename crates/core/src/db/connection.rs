@@ -119,6 +119,14 @@ fn table_exists(conn: &Connection, table: &str) -> bool {
     .is_ok()
 }
 
+/// 只读判断某个库里有没有某张表（库/表不存在都返回 false）。用完即关。
+pub fn table_exists_readonly(path: &Path, table: &str) -> bool {
+    match open_ro(path) {
+        Ok(conn) => table_exists(&conn, table),
+        Err(_) => false,
+    }
+}
+
 /// 表里是否有指定列（旧形态判定用）。
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     // 表名来自本模块内的字面量，无注入面；用 format 而非绑定参数是为了兼容
@@ -230,7 +238,9 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_device_counts_dev
             ON device_counts(device_id, date_key);
          CREATE INDEX IF NOT EXISTS idx_device_key_counts_dev
-            ON device_key_counts(device_id, date_key);",
+            ON device_key_counts(device_id, date_key);
+         CREATE INDEX IF NOT EXISTS idx_daily_counts_count
+            ON daily_counts(count DESC);",
     )?;
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('year', ?1)",
