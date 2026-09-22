@@ -716,12 +716,16 @@ pub fn register_host_api(
     host.set("accounting_summary", acc_summary)?;
 
     // ---- Edge 历史 API ----
-    // 返回 (是否成功, 今日数, 总数)；失败时 ok=false，插件据此提示而非显示 0
-    let edge_update = lua.create_function(|_, ()| {
-        let (ok, today, total) = edge_history::update_today_edge_history();
-        Ok((ok, today, total))
-    })?;
+    // 插件跑在主线程（Lua 状态机非 Send），而 Edge 库一次同步读取最坏要等
+    // 300ms busy 超时 + 三轮 ≤100MB 整文件复制，会把界面整个冻住。
+    // 因此 edge_update_today 只**启动**后台刷新并返回是否启动成功；
+    // 结果落在本地缓存库，渲染时用 edge_saved_today / edge_saved_total 取。
+    let edge_update = lua.create_function(|_, ()| Ok(edge_history::spawn_update_today()))?;
     host.set("edge_update_today", edge_update)?;
+
+    // 后台刷新状态："idle" | "running" | "ok" | "fail"
+    let edge_state = lua.create_function(|_, ()| Ok(edge_history::refresh_state()))?;
+    host.set("edge_refresh_state", edge_state)?;
 
     let edge_counts = lua.create_function(|lua, days: i64| {
         let data = edge_history::get_edge_history_counts(days.clamp(1, 90));

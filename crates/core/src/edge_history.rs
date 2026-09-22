@@ -78,13 +78,18 @@ fn cleanup_legacy_temp_once() {
     });
 }
 
-/// 在 Edge History 上执行查询，返回 Option（None 表示读取失败/被锁）。
+/// 在一份 Edge History 快照上执行一批查询，返回 Option（None 表示读取失败/被锁）。
+///
 /// 策略：
-/// 1) 只读直连（busy_timeout 1s）：Edge 未运行或锁间隙时最快。
+/// 1) 只读直连（busy_timeout 300ms）：Edge 未运行或锁间隙时最快。
 /// 2) 查询失败（被锁）→ 复制主文件兜底重试；复制是整文件快照，
 ///    可能撞上 Edge 写事务产生撕裂快照，用少量重试覆盖。
 ///    主文件在回滚日志模式下含全部已提交数据；WAL 模式下附带复制 -wal/-shm。
-fn query_edge_count(query: impl Fn(&Connection) -> Option<i64>) -> Option<i64> {
+///
+/// 之所以是「一批查询」而不是「每个查询各走一遍」：刷新一次要同时取今日数与
+/// 总数，若各自兜底，被锁时最坏要走两轮 300ms busy 等 + 两轮各 3 次 ≤100MB 复制。
+/// 共用快照后只剩一轮，且两个数取自同一时点，不会出现「总数比昨天小」。
+fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
     let path = edge_history_path();
     if !path.exists() {
         return None;
@@ -97,10 +102,9 @@ fn query_edge_count(query: impl Fn(&Connection) -> Option<i64>) -> Option<i64> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
         let _ = conn.busy_timeout(EDGE_BUSY_TIMEOUT);
-        if let Some(v) = query(&conn) {
+        if let Some(v) = f(&conn) {
             return Some(v);
         }
-        drop(conn);
     }
 
     // 2) 复制兜底：先检查大小，超大库跳过复制避免卡顿
@@ -123,7 +127,7 @@ fn query_edge_count(query: impl Fn(&Connection) -> Option<i64>) -> Option<i64> {
                 }
             }
             if let Ok(conn) = Connection::open(&temp) {
-                if let Some(v) = query(&conn) {
+                if let Some(v) = f(&conn) {
                     drop(conn);
                     remove_temp_copy(&temp);
                     return Some(v);
@@ -138,6 +142,11 @@ fn query_edge_count(query: impl Fn(&Connection) -> Option<i64>) -> Option<i64> {
     None
 }
 
+/// 在 Edge History 上执行单个查询（失败/被锁返回 None）。
+fn query_edge_count(query: impl Fn(&Connection) -> Option<i64>) -> Option<i64> {
+    with_edge_snapshot(query)
+}
+
 /// 查询 Edge 总历史记录数（失败/被锁返回 None）。
 pub fn query_edge_total_count() -> Option<i64> {
     query_edge_count(|conn| {
@@ -146,8 +155,8 @@ pub fn query_edge_total_count() -> Option<i64> {
     })
 }
 
-/// 查询指定日期的 Edge 历史记录数（失败/被锁返回 None）。
-pub fn query_edge_history_count(target_date: NaiveDate) -> Option<i64> {
+/// 某天 [00:00, 次日 00:00) 对应的 Chrome 微秒区间。
+fn chrome_day_range(target_date: NaiveDate) -> Option<(i64, i64)> {
     let naive = target_date.and_hms_opt(0, 0, 0)?;
     // DST 空档（时钟跳变）该时刻无对应本地时间，回退取最早可用映射
     let day_start = match Local.from_local_datetime(&naive).single() {
@@ -155,9 +164,13 @@ pub fn query_edge_history_count(target_date: NaiveDate) -> Option<i64> {
         None => Local.from_local_datetime(&naive).earliest()?,
     };
     let day_end = day_start + chrono::Duration::days(1);
-    let chrome_start = datetime_to_chrome(&day_start);
-    let chrome_end = datetime_to_chrome(&day_end);
-    query_edge_count(|conn| {
+    Some((datetime_to_chrome(&day_start), datetime_to_chrome(&day_end)))
+}
+
+/// 查询指定日期的 Edge 历史记录数（失败/被锁返回 None）。
+pub fn query_edge_history_count(target_date: NaiveDate) -> Option<i64> {
+    let (chrome_start, chrome_end) = chrome_day_range(target_date)?;
+    query_edge_count(move |conn| {
         conn.query_row(
             "SELECT COUNT(*) FROM urls WHERE last_visit_time >= ?1 AND last_visit_time < ?2",
             rusqlite::params![chrome_start, chrome_end],
@@ -226,13 +239,83 @@ pub fn get_edge_history_counts(days: i64) -> Vec<(String, i64)> {
     result.unwrap_or_default()
 }
 
+/// 刷新状态（`REFRESH_STATE` 的取值）。
+const ST_IDLE: u8 = 0;
+const ST_RUNNING: u8 = 1;
+const ST_OK: u8 = 2;
+const ST_FAIL: u8 = 3;
+static REFRESH_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(ST_IDLE);
+
+/// 一次后台刷新的状态：`idle` / `running` / `ok` / `fail`。
+pub fn refresh_state() -> &'static str {
+    match REFRESH_STATE.load(std::sync::atomic::Ordering::SeqCst) {
+        ST_RUNNING => "running",
+        ST_OK => "ok",
+        ST_FAIL => "fail",
+        _ => "idle",
+    }
+}
+
+/// 非阻塞启动一次「今日 + 总数」刷新，返回是否真的启动了任务。
+///
+/// 为什么必须异步：宿主 Lua 插件跑在**主线程**（Lua 状态机不是 `Send`，只能在
+/// 主线程操作，见 `desktop/src/plugins.rs`），而一次同步刷新最坏要等 300ms busy
+/// 超时、再走三轮 ≤100MB 的整文件复制 —— 用户点「刷新数据」会把整个界面冻住。
+///
+/// 已有一轮在跑时不再排队（重复点击不该放大复制开销），直接返回 `false`；
+/// 数值写进本地缓存库，插件下次渲染用 `get_edge_history_saved_*` 取。
+pub fn spawn_update_today() -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    let idle = REFRESH_STATE
+        .compare_exchange(ST_IDLE, ST_RUNNING, SeqCst, SeqCst)
+        .or_else(|_| REFRESH_STATE.compare_exchange(ST_OK, ST_RUNNING, SeqCst, SeqCst))
+        .or_else(|_| REFRESH_STATE.compare_exchange(ST_FAIL, ST_RUNNING, SeqCst, SeqCst));
+    if idle.is_err() {
+        return false;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("edge-refresh".into())
+        .spawn(|| match update_today_edge_history().0 {
+            true => REFRESH_STATE.store(ST_OK, SeqCst),
+            false => REFRESH_STATE.store(ST_FAIL, SeqCst),
+        });
+    match spawned {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::error!("启动 Edge 历史刷新线程失败: {e}");
+            REFRESH_STATE.store(ST_IDLE, SeqCst);
+            false
+        }
+    }
+}
+
 /// 更新今天并返回 (是否成功, 今日数, 总数)。
 /// 任一步失败（Edge 库被锁/不可读）返回 (false, 0, 0)，调用方据此提示用户，
 /// 避免把失败静默当成"0 条记录"。成功后后台补齐近 30 天缺失的历史计数。
+///
+/// 调用方应当用 [`spawn_update_today`] 而不是直接调本函数（本函数会阻塞调用线程）。
 pub fn update_today_edge_history() -> (bool, i64, i64) {
     let today = Local::now().date_naive();
-    match (query_edge_history_count(today), query_edge_total_count()) {
-        (Some(today_count), Some(total)) => {
+    let Some((chrome_start, chrome_end)) = chrome_day_range(today) else {
+        return (false, 0, 0);
+    };
+    // 今日数与总数取自同一份快照：被锁时只兜底复制一次副本，
+    // 也不会出现「总数比今日小」这种跨时点的错帧。
+    let pair = with_edge_snapshot(move |conn| {
+        let day = conn
+            .query_row(
+                "SELECT COUNT(*) FROM urls WHERE last_visit_time >= ?1 AND last_visit_time < ?2",
+                rusqlite::params![chrome_start, chrome_end],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()?;
+        let total = conn
+            .query_row("SELECT COUNT(*) FROM urls", [], |r| r.get::<_, i64>(0))
+            .ok()?;
+        Some((day, total))
+    });
+    match pair {
+        Some((today_count, total)) => {
             save_edge_history_count(today, today_count);
             save_edge_history_meta("today", today_count);
             save_edge_history_meta("total", total);

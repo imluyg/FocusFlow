@@ -232,7 +232,7 @@ fn validate_task_args(args: &str) -> anyhow::Result<()> {
                 anyhow::bail!("任务参数只能是本地绝对路径或简单名称（发现 {tok}）");
             }
         }
-        let drive_path = tok.as_bytes().len() > 3
+        let drive_path = tok.len() > 3
             && tok.as_bytes()[0].is_ascii_alphabetic()
             && tok.as_bytes()[1] == b':'
             && tok.as_bytes()[2] == b'\\';

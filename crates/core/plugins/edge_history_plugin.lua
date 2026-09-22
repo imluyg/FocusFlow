@@ -7,14 +7,9 @@ PLUGIN_DESC = "查看 Edge 浏览器历史记录数量及 30 天趋势"
 PLUGIN_VERSION = "1.0.0"
 PLUGIN_AUTHOR = "FocusFlow"
 
-local cached_today = -1
-local cached_total = -1
-local refresh_error = nil
+local hint = nil
 
 function init()
-    -- 恢复上次刷新的数值（存于本地缓存库），重启后不再显示 "—"
-    cached_today = focusflow.edge_saved_today() or -1
-    cached_total = focusflow.edge_saved_total() or -1
     focusflow.log("Edge历史记录插件已初始化")
 end
 
@@ -24,28 +19,25 @@ end
 
 function on_action(id)
     if id == "refresh" then
-        refresh_error = nil
-        local ok, today, total = focusflow.edge_update_today()
-        if ok then
-            cached_today = today
-            cached_total = total
-            focusflow.log("已更新 Edge 历史：今日 " .. tostring(today) .. "，总计 " .. tostring(total))
+        -- 只启动后台刷新：Edge 库读取可能要几百毫秒到数秒（被锁时还要复制整份
+        -- 快照），而插件跑在主线程上，同步等会把整个界面冻住。
+        if focusflow.edge_update_today() then
+            hint = "已启动后台读取，完成后重新打开本面板即可看到最新数值"
         else
-            refresh_error = "读取失败：Edge 历史库被占用或不可读（Edge 后台进程可能仍在运行），请稍后重试"
-            focusflow.log(refresh_error)
+            hint = "上一次读取还没结束，稍后再试"
         end
+        focusflow.log(hint)
     end
 end
 
 function get_view()
-    -- 延迟查询：首次打开不自动查 Edge 库（可能很大/被锁定），
-    -- 用户点击"刷新数据"才执行，避免加载卡顿
-    local today_display = "—"
-    local total_display = "—"
-    if cached_today >= 0 then
-        today_display = tostring(cached_today)
-        total_display = tostring(cached_total)
-    end
+    -- 数值只取本地缓存库（上次后台刷新保存的结果）：渲染路径不碰 Edge 库，
+    -- 所以打开面板永远不卡。从未刷新过时显示 "—"。
+    local today = focusflow.edge_saved_today()
+    local total = focusflow.edge_saved_total()
+    local today_display = today and tostring(today) or "—"
+    local total_display = total and tostring(total) or "—"
+    local state = focusflow.edge_refresh_state()
 
     -- 30 天趋势（本地缓存库，快）；日期从新到旧排列（近 → 远）
     local counts = focusflow.edge_counts(30)
@@ -64,14 +56,19 @@ function get_view()
         { type = "keyvalue", key = "近30天峰值", value = tostring(max_count) },
         { type = "button", id = "refresh", text = "刷新数据" },
     }
-    if refresh_error then
-        widgets[#widgets + 1] = { type = "label", text = "⚠ " .. refresh_error }
+    if state == "running" then
+        widgets[#widgets + 1] = { type = "label", text = "⏳ 正在后台读取 Edge 历史（Edge 运行时会先复制一份快照）…" }
+    elseif state == "fail" then
+        widgets[#widgets + 1] = { type = "label", text = "⚠ 读取失败：Edge 历史库被占用或不可读（Edge 后台进程可能仍在运行），请稍后重试" }
+    end
+    if hint then
+        widgets[#widgets + 1] = { type = "label", text = hint }
     end
     widgets[#widgets + 1] = { type = "separator" }
     widgets[#widgets + 1] = { type = "heading", text = "近 30 天趋势" }
     widgets[#widgets + 1] = { type = "table", headers = { "日期", "记录数" }, rows = rows }
     widgets[#widgets + 1] = { type = "separator" }
-    widgets[#widgets + 1] = { type = "label", text = "点击「刷新数据」从 Edge 浏览器读取最新记录（可能较慢）" }
+    widgets[#widgets + 1] = { type = "label", text = "点击「刷新数据」在后台从 Edge 浏览器读取最新记录，不阻塞界面" }
 
     return {
         title = "Edge 历史记录",
