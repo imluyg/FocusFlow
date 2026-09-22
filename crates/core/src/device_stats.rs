@@ -259,9 +259,14 @@ mod win {
     /// WndProc 与消息循环同线程，状态走线程本地。
     struct Sink {
         writer: Arc<DbWriter>,
-        /// hDevice 指针值 -> (device_key, 显示名)：设备首个事件登记一次，此后只读。
+        /// (hDevice 指针值, 事件类型) -> (device_key, 显示名)：设备首个事件登记一次，此后只读。
         /// 拔插后系统会分配新句柄，新句柄重新登记一次（路径相同 → device_key 不变，计数连续）。
-        devices: HashMap<isize, (String, String)>,
+        ///
+        /// key 必须带上事件类型：句柄数值会被回收复用 —— Windows 关闭移除设备的句柄后，
+        /// 同一数值可能发给另一台设备。只按数值缓存时，鼠标句柄的旧值被键盘复用就会把
+        /// 键盘事件整段记到那只鼠标名下。按 (数值, 类型) 缓存零成本挡掉这类跨类型串号；
+        /// 同类型复用仍挡不住（识别它要先解析路径，而那正是这层缓存省掉的开销）。
+        devices: HashMap<(isize, &'static str), (String, String)>,
     }
 
     thread_local! {
@@ -421,13 +426,13 @@ mod win {
                 return;
             }
             // 设备登记：首个事件查一次（路径 + 注册表名），此后全部缓存命中
-            let handle_key = header.hDevice.0 as isize;
-            let entry = match self.devices.get(&handle_key) {
+            let cache_key = (header.hDevice.0 as isize, kind);
+            let entry = match self.devices.get(&cache_key) {
                 Some(e) => e.clone(),
                 None => match register_device(header.hDevice) {
                     Some(e) => {
                         tracing::info!("设备统计：登记新设备 {}", e.0);
-                        self.devices.insert(handle_key, e.clone());
+                        self.devices.insert(cache_key, e.clone());
                         e
                     }
                     None => return, // 无法解析路径：宁可不计也不张冠李戴
