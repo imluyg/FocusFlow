@@ -505,6 +505,8 @@ function renderWeekdayChart(s) {
 // 每日目标与连续打卡条。get_goal_status 要扫近 370 天的按日序列，
 // 不能跟着 2 秒一次的图表推送跑，这里自带 60 秒节流。
 let goalFetchedAt = 0;
+// 设置页当前生效的每日目标：非法输入时用它回写控件，避免显示值与后端值不一致
+let lastGoalKeys = 20000;
 // 上次从后端取到的目标信息（含 streak/best/近 7 天），以及 live 推送里的今日数。
 // get_goal_status 要扫近 370 天按日序列，不能跟着 2 秒一次的图表推送跑 —— 但
 // 「今日 x / 目标 y」这一项如果只靠 60 秒节流，就会和顶部每 500ms 更新的
@@ -615,6 +617,7 @@ export async function renderSettings() {
   const hotkeyError = s.hotkey_error || "";
   const floatingEnabled = s.floating_enabled;
   const goalKeys = Number(s.goal_daily_keys ?? 20000) || 20000;
+  lastGoalKeys = goalKeys;
   // 备份开关：退出时备份 / 运行中定时备份（0 小时 = 关闭，与 config.ini 同语义）
   const backupOnExit = s.backup_on_exit !== false;
   const backupHours = Number(s.backup_online_hours ?? 24) || 0;
@@ -716,8 +719,21 @@ export async function renderSettings() {
   });
   // 每日目标：夹到 [1, 5000000]。写回输入框，避免显示与实际生效值不一致
   $("set-goal").addEventListener("change", async (e) => {
-    const n = Math.floor(Number(e.target.value));
-    const v = Math.max(1, Math.min(5000000, Number.isFinite(n) ? n : 20000));
+    // 空串/非正整数一律保持原值，不写库：Number("") 是 0 而不是 NaN，
+    // 早先的夹取会把「清空输入框顺手一离开」变成「每日目标 = 1」，等于关掉打卡。
+    const raw = e.target.value.trim();
+    const n = Math.floor(Number(raw));
+    if (raw === "" || !Number.isFinite(n) || n < 1) {
+      e.target.value = String(lastGoalKeys);
+      const box = $("set-msg");
+      if (box) {
+        box.style.color = "var(--danger)";
+        box.textContent = "每日目标必须是正整数，已保持原来的 " + fmt(lastGoalKeys) + " 次";
+      }
+      return;
+    }
+    const v = Math.min(5000000, n);
+    lastGoalKeys = v;
     e.target.value = String(v);
     await invoke("set_config", { section: "goal", key: "daily_keys", value: String(v) });
     refreshGoalStrip(true);
