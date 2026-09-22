@@ -79,30 +79,57 @@ pub fn start_hot_reload(app: &tauri::AppHandle, db: Arc<Database>) {
                     continue;
                 }
                 let mut seen: HashMap<String, Option<SystemTime>> = HashMap::new();
+                let mut listed = true;
                 if let Ok(entries) = std::fs::read_dir(&dir) {
                     for entry in entries.flatten() {
                         let p = entry.path();
-                        if p.extension().map(|e| e == "lua").unwrap_or(false) {
-                            if let Some(name) = p
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .map(|s| s.to_string())
-                            {
-                                let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
-                                seen.insert(name, mtime);
-                            }
+                        if !p.extension().map(|e| e == "lua").unwrap_or(false) {
+                            continue;
                         }
+                        let Some(name) = p.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+                        else {
+                            continue;
+                        };
+                        let Ok(meta) = std::fs::metadata(&p) else {
+                            continue;
+                        };
+                        // 编辑器常有「先截断再写入」：0 字节的 .lua 会被解析成空块而且
+                        // 不报错，插件就此变成没有任何函数的空壳。本轮当作「还没写完」，
+                        // 沿用上一轮的指纹（否则删除检测会把它误判成文件消失），
+                        // 等下一次轮询到非空内容再触发重载。
+                        if meta.len() == 0 {
+                            if let Some(prev) = last.get(&name) {
+                                seen.insert(name, *prev);
+                            }
+                            continue;
+                        }
+                        seen.insert(name, meta.modified().ok());
                     }
+                } else {
+                    listed = false;
                 }
-                if primed {
+                // 目录整体没读到（被占用、或构建脚本正在替换整个目录）时不能拿空的
+                // seen 参与比较：否则每个插件都会被判定成「文件已删除」而全部卸载。
+                // 同理也不能覆盖基线 —— 那样下一轮成功读取会把所有文件当成新变更，
+                // 触发一整轮无谓的重载。保持上一轮基线，等下一轮再说。
+                if listed && primed {
                     for (name, mtime) in &seen {
                         if last.get(name) != Some(mtime) {
                             let _ = tx.send(name.clone());
                         }
                     }
+                    // 删除也要发事件：只遍历 seen 会漏掉消失的文件，插件就得重启
+                    // 才停得下来 —— 而删掉文件表达的意思恰恰是「别再跑它了」。
+                    for name in last.keys() {
+                        if !seen.contains_key(name) {
+                            let _ = tx.send(name.clone());
+                        }
+                    }
                 }
-                primed = true;
-                last = seen;
+                if listed {
+                    primed = true;
+                    last = seen;
+                }
                 std::thread::sleep(Duration::from_secs(2));
             }
         })
@@ -128,10 +155,21 @@ pub fn start_hot_reload(app: &tauri::AppHandle, db: Arc<Database>) {
     tracing::info!("插件热重载已就绪（监听随插件管理页开关）");
 }
 
-/// 按插件名或文件名重载插件（主线程调用）。
-/// 未找到时补扫一次目录：兜底加载运行期间新放入的插件文件。
+/// 按插件文件名（stem）重载插件（主线程调用）。
+/// 文件已消失 → 卸载：删除插件文件表达的就是「别再跑它了」，只 reload 不 remove
+/// 的话它会一直跑到下次重启（其 cleanup 也就一直不执行）。
+/// 未找到已加载实例 → 补扫一次目录：兜底加载运行期间新放入的插件文件。
 fn reload_plugin_by_key(key: &str, db: &Arc<Database>) {
     with_manager(db, |pm| {
+        if !focusflow_core::paths::plugins_dir()
+            .join(format!("{key}.lua"))
+            .exists()
+        {
+            if pm.unload_by_stem(key) {
+                tracing::info!("插件文件已删除，已卸载: {key}");
+            }
+            return;
+        }
         if pm.reload_plugin(key) {
             tracing::info!("插件已热重载: {key}");
         } else {

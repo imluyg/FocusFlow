@@ -477,6 +477,20 @@ impl PluginManager {
         }
     }
 
+    /// 按文件名（stem）卸载插件，供热重载处理「插件文件被删除」用。
+    /// 插件表以展示名（PLUGIN_NAME）为键，所以要先反查。返回是否真卸载了一个。
+    pub fn unload_by_stem(&mut self, stem: &str) -> bool {
+        let name = self
+            .plugins
+            .values()
+            .find(|p| Self::stem_of(&p.file_path) == stem)
+            .map(|p| p.name.clone());
+        match name {
+            Some(n) => self.unload_plugin(&n),
+            None => false,
+        }
+    }
+
     /// 重新加载插件（按文件名或插件名匹配）。
     pub fn reload_plugin(&mut self, key: &str) -> bool {
         // 先按插件名匹配，再按文件名匹配
