@@ -28,7 +28,7 @@ use crate::paths;
 /// 注意 `devices`（设备字典）不在其中：它没有 date_key，不能按日期切分，
 /// 归档/清空时单独处理（见 [`sync_device_dict`] 与 [`reset_all_data`]）；
 /// 两张 device 明细表存的是 `devices.id`，跨库搬迁必须过 id 映射（见 [`move_device_rows`]）。
-const DATA_TABLES: [&str; 6] = [
+pub(crate) const DATA_TABLES: [&str; 6] = [
     "daily_counts",
     "hourly_counts",
     "key_counts",
@@ -599,6 +599,9 @@ pub fn cleanup_old_data(keep_days: i64) -> i64 {
         tracing::info!("已清理 {year} 年 {cutoff_dk} 前的数据");
     }
     if total > 0 {
+        // 删空的年份文件还在磁盘上：让年份列表立刻重算（现在会把空壳过滤掉），
+        // 而不是等 30 秒 TTL —— 否则清理之后仍然要替那些空壳各扫一遍。
+        queries::invalidate_years_cache();
         tracing::info!("共清理 {total} 行聚合数据");
     }
     total
@@ -2707,8 +2710,16 @@ mod tests {
         queries::invalidate_years_cache();
         let years = queries::available_years();
         assert!(
-            years.contains(&stale_year) && years.contains(&source_year),
-            "应有 {stale_year} 与 {source_year}: {years:?}"
+            years.contains(&stale_year),
+            "迁入数据的那一年必须在年份列表里: {years:?}"
+        );
+        // 源库这一整年本来只有那一条被搬走的设备行，归档后它一行聚合数据都不剩
+        // （上面 left == 0 已经证明）。available_years() 现在会滤掉这种空壳，
+        // 所以「文件还在、没被误删」这件事直接按文件断言 —— 它本来也不该由
+        // 年份列表来代证。
+        assert!(
+            paths::year_db_path(source_year).exists(),
+            "{source_year} 年的库文件不该被归档顺手删掉"
         );
         for gap in (stale_year + 1)..source_year {
             assert!(

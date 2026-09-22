@@ -69,6 +69,10 @@ pub fn invalidate_years_cache() {
 }
 
 /// 获取所有有数据的年份列表（降序，带 30 秒缓存，按 app_dir 隔离）。
+///
+/// 「有数据」是按聚合表里是否还有行判定的，不是按文件是否存在：删空的年度库、
+/// 归档/清理留下的空壳都会在这里被滤掉，否则调用方（统计聚合、备份、VACUUM）
+/// 每年都要为它们白跑一轮。打不开的文件保守地当作有数据。
 pub fn available_years() -> Vec<i32> {
     let key = cache_key();
     {
@@ -89,10 +93,35 @@ pub fn available_years() -> Vec<i32> {
             }
         }
     }
+    // 只保留真的有聚合行的年份。空壳年度库会永久出现在这个列表里，于是每轮刷新
+    // 都要为它各开一次连接、把 6-8 趟聚合查询各跑一遍，备份与 VACUUM 也各挨一次
+    // —— 而它一行数据都没有。`cleanup_old_data` 正是这种空壳的来源（按日期删空
+    // 整库，但文件留着）。这里不删任何文件：判「有没有数据」就够了，删库是
+    // 归档/重置那条路径的职责（它们也遵循「宁可不做，也不留没有数据来源的空库」）。
+    years.retain(|y| year_has_aggregates(&paths::year_db_path(*y)));
     years.sort_unstable_by(|a, b| b.cmp(a));
     let mut c = years_cache().lock().unwrap_or_else(|e| e.into_inner());
     c.insert(key, (Some(Instant::now()), years.clone()));
     years
+}
+
+/// 这个年度库里还有没有聚合数据行（空壳判定用）。
+///
+/// 读不了就按「有数据」处理：宁可多扫一趟，也不能因为一次 I/O 失败或库损坏，
+/// 就把整整一年的数据从统计里抹掉——那会表现成"某一年的记录凭空消失"。
+///
+/// 用 `open_ro` 而不是池化的 `with_ro_conn`：本函数由 `available_years()` 调用，
+/// 而它可能处在别的查询链路中间；连接池是 `RefCell`，在池内闭包里再取池会
+/// panic（already mutably borrowed），release 的 panic=abort 等于进程消失。
+fn year_has_aggregates(path: &std::path::Path) -> bool {
+    let Ok(conn) = connection::open_ro(path) else {
+        return true;
+    };
+    crate::db::maintenance::DATA_TABLES.iter().any(|table| {
+        conn.prepare(&format!("SELECT 1 FROM {table} LIMIT 1"))
+            .and_then(|mut s| s.exists([]))
+            .unwrap_or(false)
+    })
 }
 
 /// 本地时区相对 UTC 的偏移秒数（如 UTC+8 = 28800 秒）。
@@ -1216,6 +1245,49 @@ fn local_day_start_ts(date: chrono::NaiveDate) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 空壳年度库不该再算进 `available_years()`。
+    ///
+    /// 年份列表按文件名取，于是「按日期把一整年删空」（`cleanup_old_data`）或历史
+    /// 遗留的空文件，会让此后每一轮刷新都为它开一次连接、把全部聚合查询各跑一遍，
+    /// 备份与 VACUUM 也各挨一次 —— 收益是 0，因为它一行数据都没有。
+    #[test]
+    fn available_years_skips_empty_shell_dbs() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_years_shell_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        crate::paths::set_app_dir(&dir);
+        invalidate_years_cache();
+
+        // 2031：只有表结构的空壳；2032：有一行聚合数据
+        for y in [2031, 2032] {
+            let conn = connection::open_rw(&paths::year_db_path(y)).unwrap();
+            connection::ensure_schema(&conn, y).unwrap();
+            if y == 2032 {
+                conn.execute(
+                    "INSERT INTO daily_counts (date_key, count, seconds) VALUES (1, 1, 1)",
+                    [],
+                )
+                .unwrap();
+            }
+        }
+        invalidate_years_cache();
+        let years = available_years();
+        assert!(years.contains(&2032), "有数据的年份必须在: {years:?}");
+        assert!(!years.contains(&2031), "空壳年份不该再被扫: {years:?}");
+
+        // 读不了的库方向相反，必须**保留**：宁可多扫一趟，也不能因为一次 I/O
+        // 失败或文件损坏，把一整年静默地从统计里抹掉。
+        std::fs::write(paths::year_db_path(2033), b"not a database at all").unwrap();
+        invalidate_years_cache();
+        assert!(
+            available_years().contains(&2033),
+            "损坏的年度库应按「有数据」保守处理"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        invalidate_years_cache();
+    }
 
     /// 周期合法性守卫：-1/0/N 合法，其他负值与超大天数非法。
     #[test]

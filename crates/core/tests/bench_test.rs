@@ -254,6 +254,107 @@ mod tests {
         }
         println!("聚合序列耗时随年度库个数变化：\n{report}");
     }
+    /// 空壳年度库值多少钱：3 个有数据的库 + 4 个被删空的壳。
+    ///
+    /// `available_years()` 按文件名取年份时，那 4 个壳每轮都要各开一次连接、
+    /// 把整套聚合查询再跑一遍（一行数据也没有）。改成按「有没有聚合行」过滤后，
+    /// 它们不该再进入扫描。只打印，不做时序断言（CI 抖动）；对照数字来自
+    /// 临时注释掉 retain 过滤后的同机重跑。
+    #[test]
+    fn empty_year_shells_cost_scan_passes() {
+        let _g = guard();
+        use chrono::Datelike;
+        use std::time::Instant;
+
+        let dir = std::env::temp_dir().join(format!("ff_bench_shells_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        paths::set_app_dir(&dir);
+        db::queries::invalidate_years_cache();
+        let now_year = chrono::Local::now().date_naive().year();
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        // 3 个真实年库 + 4 个只有表结构的壳（排在真实库之前，模拟往年遗留）
+        for off in 0..7i32 {
+            let y = now_year - off;
+            let conn = rusqlite::Connection::open(paths::year_db_path(y)).unwrap();
+            db::connection::ensure_schema(&conn, y).unwrap();
+            if off >= 4 {
+                continue; // 空壳：只有表结构
+            }
+            let base = chrono::NaiveDate::from_ymd_opt(y, 1, 1)
+                .unwrap()
+                .signed_duration_since(epoch)
+                .num_days();
+            conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            for d in 0..365 {
+                let dk = base + d;
+                conn.execute(
+                    "INSERT OR REPLACE INTO daily_counts (date_key, count, seconds) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![dk, 5000 + d, 3600_i64],
+                )
+                .unwrap();
+                for h in 0..24 {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO hourly_counts (date_key, hour, count) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![dk, h, 200],
+                    )
+                    .unwrap();
+                }
+                for k in 0..30 {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO key_counts (date_key, key_name, count) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![dk, format!("K{k}"), 100],
+                    )
+                    .unwrap();
+                }
+                conn.execute(
+                    "INSERT OR REPLACE INTO app_usage (date_key, app_name, seconds) VALUES (?1, 'app.exe', 600)",
+                    [dk],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT OR REPLACE INTO device_counts (date_key, device_id, count) VALUES (?1, 1, 900)",
+                    [dk],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO devices (id, device_key, name, kind) VALUES (1, 'k1', 'dev', 'keyboard')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+        db::queries::invalidate_years_cache();
+        let scanned = db::queries::available_years();
+        let t = Instant::now();
+        for _ in 0..10 {
+            let _ = db::get_stats(Some(30), None);
+            let _ = db::get_daily_counts(30, None);
+            let _ = db::queries::get_hourly_stats(None);
+            let _ = db::get_app_stats(Some(30), None);
+            let _ = db::get_device_stats(Some(30), None);
+            let _ = db::get_alltime_summary();
+        }
+        let per = t.elapsed().as_secs_f64() * 1000.0 / 10.0;
+        // 7 个文件里只有 off 0..=3 这 4 个年库有数据，另外 3 个是空壳
+        println!(
+            "7 个年度库文件（{} 个空壳）：available_years 返回 {} 个年份 {}，每轮聚合 {per:.2}ms",
+            7 - 4,
+            scanned.len(),
+            if scanned.len() == 4 {
+                "（壳已滤掉）"
+            } else {
+                "（壳没滤掉！）"
+            }
+        );
+        assert_eq!(
+            scanned.len(),
+            4,
+            "空壳不该进入年份列表 —— 这条断言让基准测试本身也能守住过滤行为"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 // force rebuild
