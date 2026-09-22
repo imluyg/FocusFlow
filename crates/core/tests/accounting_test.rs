@@ -297,3 +297,41 @@ fn profit_and_days_ago() {
         d_year.2
     );
 }
+
+/// 回归：金额汇总按「分」精确相加，不再累积浮点误差。
+///
+/// `amount` 是 REAL，逐条相加走的是二进制浮点：实测十笔 0.1 加起来是
+/// 0.9999999999999999，0.1 + 0.2 是 0.30000000000000004 —— 界面上就表现为
+/// 「明细逐条加起来比合计多一分/少一分」，而用户会以为是算错了账。
+/// 修法是聚合时先化成整数分相加、最后除回 100（30/100 与 0.3 是同一个 double）。
+#[test]
+fn monthly_totals_sum_in_cents_not_floats() {
+    let _g = guard();
+    let dir = setup();
+
+    for _ in 0..10 {
+        add("2026-03-05", "支出", "一毛", 0.1, "吃饭", "");
+    }
+    let (expense, _) = accounting::monthly_summary("2026-03");
+    assert_eq!(expense, 1.0, "十笔 0.1 必须正好 1.00");
+
+    add("2026-04-01", "支出", "a", 0.1, "吃饭", "");
+    add("2026-04-02", "支出", "b", 0.2, "吃饭", "");
+    let (apr_expense, _) = accounting::monthly_summary("2026-04");
+    assert_eq!(
+        apr_expense, 0.3,
+        "0.1 + 0.2 按分相加应得 0.30 而非 0.3000…004"
+    );
+
+    // 分类净额：收 0.3 对支 0.1+0.2，必须恰好抵消成 0.00
+    add("2026-04-03", "收入", "c", 0.3, "吃饭", "");
+    let (_, _, _, cats) = accounting::monthly_summary_detail("2026-04");
+    let net = cats
+        .iter()
+        .find(|(c, _)| c == "吃饭")
+        .map(|(_, n)| *n)
+        .unwrap_or(f64::NAN);
+    assert_eq!(net, 0.0, "净额须在分维度相减，不能剩浮点残差：{cats:?}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

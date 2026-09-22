@@ -775,6 +775,25 @@ pub fn get_expenses_page(
 }
 
 /// 月度汇总（含分类明细）：返回 (总支出, 总收入, 条数, [(分类, 净额=收入-支出)]，按净额降序)。
+/// 金额按「分」求和的 SQL 片段（整数相加，精确）。
+///
+/// `amount` 是 REAL：逐条相加会累积二进制浮点误差（`0.1 + 0.2 =
+/// 0.30000000000000004`），于是分类/月份汇总偶尔比明细逐条加起来多一分、
+/// 少一分。整数加法没有这个问题，而 `ROUND(x * 100)` 对按两位小数录入的金额
+/// 稳定收敛（REAL 里的 12.34 是 12.3400000000000002，×100 后 ROUND 回 1234）。
+///
+/// 刻意不改 schema、不改 Lua 侧的 f64 口径，只在聚合这一步归一：单条金额读出来
+/// 仍是原样的 REAL，只有「合计」变成先化分、整数相加、最后除回 100。
+fn sum_cents(inner: &str) -> String {
+    format!("COALESCE(SUM(CAST(ROUND(({inner}) * 100) AS INTEGER)), 0)")
+}
+
+/// 上者的金额（元）形式：分维度求和后做一次除法，避免两端各自除完再相减又引入漂移
+fn sum_amount_sql(inner: &str) -> String {
+    format!("({}) / 100.0", sum_cents(inner))
+}
+
+/// 月度汇总明细：返回 (总支出, 总收入, 条数, [(分类, 净收入)])。
 pub fn monthly_summary_detail(year_month: &str) -> (f64, f64, i64, Vec<(String, f64)>) {
     let conn = match open() {
         Ok(c) => c,
@@ -783,14 +802,20 @@ pub fn monthly_summary_detail(year_month: &str) -> (f64, f64, i64, Vec<(String, 
     let prefix = format!("{year_month}%");
     let expense: f64 = conn
         .query_row(
-            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE type='支出' AND purchase_date LIKE ?1",
+            &format!(
+                "SELECT {} FROM expenses WHERE type='支出' AND purchase_date LIKE ?1",
+                sum_amount_sql("amount")
+            ),
             [&prefix],
             |r| r.get(0),
         )
         .unwrap_or(0.0);
     let income: f64 = conn
         .query_row(
-            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE type='收入' AND purchase_date LIKE ?1",
+            &format!(
+                "SELECT {} FROM expenses WHERE type='收入' AND purchase_date LIKE ?1",
+                sum_amount_sql("amount")
+            ),
             [&prefix],
             |r| r.get(0),
         )
@@ -803,21 +828,20 @@ pub fn monthly_summary_detail(year_month: &str) -> (f64, f64, i64, Vec<(String, 
         )
         .unwrap_or(0);
     let mut cat_stats: Vec<(String, f64)> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(
+    // 净额在 SQL 里按分相减、只在最后除一次：分两次查出 inc/exp 再在 Rust 里
+    // 相减，等于把浮点漂移又请回来一次
+    if let Ok(mut stmt) = conn.prepare(&format!(
         "SELECT COALESCE(category, '(未分类)') AS cat,
-                COALESCE(SUM(CASE WHEN type='收入' THEN amount ELSE 0 END), 0) AS inc,
-                COALESCE(SUM(CASE WHEN type='支出' THEN amount ELSE 0 END), 0) AS exp
+                ({inc} - {exp}) / 100.0 AS net
          FROM expenses WHERE purchase_date LIKE ?1 GROUP BY category
-         ORDER BY inc - exp DESC",
-    ) {
+         ORDER BY net DESC",
+        inc = sum_cents("CASE WHEN type='收入' THEN amount ELSE 0 END"),
+        exp = sum_cents("CASE WHEN type='支出' THEN amount ELSE 0 END"),
+    )) {
         if let Ok(mut rows) = stmt.query([&prefix]) {
             while let Ok(Some(row)) = rows.next() {
-                if let (Ok(cat), Ok(inc), Ok(exp)) = (
-                    row.get::<_, String>(0),
-                    row.get::<_, f64>(1),
-                    row.get::<_, f64>(2),
-                ) {
-                    cat_stats.push((cat, inc - exp));
+                if let (Ok(cat), Ok(net)) = (row.get::<_, String>(0), row.get::<_, f64>(1)) {
+                    cat_stats.push((cat, net));
                 }
             }
         }
@@ -832,13 +856,15 @@ pub fn category_profit_loss() -> Vec<(String, f64, f64, i64)> {
         Err(_) => return Vec::new(),
     };
     let mut out = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(
+    if let Ok(mut stmt) = conn.prepare(&format!(
         "SELECT COALESCE(category, '(未分类)') AS cat,
-                COALESCE(SUM(CASE WHEN type='支出' THEN amount ELSE 0 END), 0) AS inv,
-                COALESCE(SUM(CASE WHEN type='收入' THEN amount ELSE 0 END), 0) AS earn,
+                {inv} AS inv,
+                {earn} AS earn,
                 COUNT(*) AS cnt
          FROM expenses GROUP BY category ORDER BY inv - earn",
-    ) {
+        inv = sum_amount_sql("CASE WHEN type='支出' THEN amount ELSE 0 END"),
+        earn = sum_amount_sql("CASE WHEN type='收入' THEN amount ELSE 0 END"),
+    )) {
         if let Ok(mut rows) = stmt.query([]) {
             while let Ok(Some(row)) = rows.next() {
                 if let (Ok(cat), Ok(inv), Ok(earn), Ok(cnt)) = (
@@ -862,13 +888,15 @@ pub fn subcategory_profit_loss(category: &str) -> Vec<(String, f64, f64, i64)> {
         Err(_) => return Vec::new(),
     };
     let mut out = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(
+    if let Ok(mut stmt) = conn.prepare(&format!(
         "SELECT COALESCE(NULLIF(subcategory, ''), '(未分细类)') AS sub,
-                COALESCE(SUM(CASE WHEN type='支出' THEN amount ELSE 0 END), 0) AS inv,
-                COALESCE(SUM(CASE WHEN type='收入' THEN amount ELSE 0 END), 0) AS earn,
+                {inv} AS inv,
+                {earn} AS earn,
                 COUNT(*) AS cnt
          FROM expenses WHERE category=?1 GROUP BY subcategory ORDER BY inv - earn",
-    ) {
+        inv = sum_amount_sql("CASE WHEN type='支出' THEN amount ELSE 0 END"),
+        earn = sum_amount_sql("CASE WHEN type='收入' THEN amount ELSE 0 END"),
+    )) {
         if let Ok(mut rows) = stmt.query([category]) {
             while let Ok(Some(row)) = rows.next() {
                 if let (Ok(sub), Ok(inv), Ok(earn), Ok(cnt)) = (
@@ -921,14 +949,20 @@ pub fn monthly_summary(year_month: &str) -> (f64, f64) {
     let prefix = format!("{year_month}%");
     let expense: f64 = conn
         .query_row(
-            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE type='支出' AND purchase_date LIKE ?1",
+            &format!(
+                "SELECT {} FROM expenses WHERE type='支出' AND purchase_date LIKE ?1",
+                sum_amount_sql("amount")
+            ),
             [&prefix],
             |r| r.get(0),
         )
         .unwrap_or(0.0);
     let income: f64 = conn
         .query_row(
-            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE type='收入' AND purchase_date LIKE ?1",
+            &format!(
+                "SELECT {} FROM expenses WHERE type='收入' AND purchase_date LIKE ?1",
+                sum_amount_sql("amount")
+            ),
             [&prefix],
             |r| r.get(0),
         )
