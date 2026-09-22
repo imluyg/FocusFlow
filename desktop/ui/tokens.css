@@ -2,7 +2,6 @@
 :root {
   /* 原生控件（下拉/滚动条/复选框）跟随主题配色 */
   color-scheme: light;
-  --bg: #F5F7FA;
   --page-top: #E8EFFC;
   --page-bottom: #F7FAFE;
   --fg: #1A1A2E;
@@ -24,20 +23,26 @@
   --grid-line: #E3EAF6;
   --radius: 16px;
   --shadow: 0 2px 10px rgba(24, 40, 80, 0.08);
+  /* 弹窗投影：深色底上浅阴影分不开层，需要明显更重 */
+  --modal-shadow: rgba(0, 0, 0, 0.25);
   --font: "Segoe UI", "Microsoft YaHei", "微软雅黑", sans-serif;
 }
 
 body.dark {
   color-scheme: dark;
-  --bg: #14161F;
   --page-top: #171B27;
   --page-bottom: #10131C;
   --fg: #E8EAEE;
   --card: #1E2331;
   --modal-bg: #1E2331;
   --accent: #5B9CF7;
-  --accent-hover: #7AB1FA;
-  --accent-strong: #3B7DE0;
+  /* 这两个令牌在深色下只出现在「实底 + 白字」场景（.tab.active 用 strong、
+     button.btn:hover 用 hover，二者都配 color:#fff）。原值 #7AB1FA 与白字只有
+     ~1.9:1、#3B7DE0 只有 ~4.0:1，都低于 :root 注释承诺的 4.5:1 —— 深色模式下
+     悬停按钮几乎读不出字。统一压到 #2E6BDF（白字 4.9:1）；深色下的 hover 因此
+     是「变深」而非「变亮」，仍与常态 #5B9CF7 分得开。 */
+  --accent-hover: #2E6BDF;
+  --accent-strong: #2E6BDF;
   --accent-soft: #22304A;
   --success: #34D399;
   --warning: #FBBF24;
@@ -47,6 +52,7 @@ body.dark {
   --header-bg: #232A3C;
   --grid-line: #2E3548;
   --shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  --modal-shadow: rgba(0, 0, 0, 0.6);
 }
 
 /* ===== 玻璃模式（系统 Mica/Acrylic 材质生效时由后端开启） =====

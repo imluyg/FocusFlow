@@ -194,26 +194,6 @@ table.grid-devices tbody tr[data-act="device-detail"] { cursor: pointer; }
 .dev-detail-cell .v { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .dev-detail-line { color: var(--muted); font-size: 13px; margin: 4px 0; }
 .dev-detail-line b { color: var(--fg, inherit); }
-.dev-trend {
-  display: flex;
-  align-items: flex-end;
-  gap: 2px;
-  height: 72px;
-  margin: 6px 0 2px;
-}
-.dev-trend .dev-bar {
-  flex: 1;
-  min-height: 2px;
-  background: var(--accent);
-  border-radius: 2px 2px 0 0;
-}
-.dev-trend .dev-bar.zero { background: var(--grid-line); }
-.dev-trend-axis {
-  display: flex;
-  justify-content: space-between;
-  color: var(--muted);
-  font-size: 11px;
-}
 
 /* ===== 设置 ===== */
 .setting-row {
@@ -267,7 +247,7 @@ button.btn.mini { padding: 3px 10px; font-size: 12px; border-radius: 6px; }
   /* 不透明：玻璃模式下 --card 是半透明，弹窗会与页面背景糊在一起 */
   background: var(--modal-bg);
   border-radius: 14px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 12px 40px var(--modal-shadow);
   width: min(420px, 92vw);
   max-height: 86vh;
   overflow: auto;
