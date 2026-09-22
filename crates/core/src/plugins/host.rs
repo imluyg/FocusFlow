@@ -9,7 +9,7 @@
 //! - `focusflow.available_years()` -> 年份列表
 //! - `focusflow.config_get("section.key")` -> 配置值
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use mlua::{Lua, Table};
 
@@ -19,6 +19,58 @@ use crate::db;
 use crate::edge_history;
 use crate::pomodoro::{self, PomodoroTimer};
 use crate::scheduler;
+
+// ---- 番茄钟 / 调度器的进程级单例 ----
+//
+// 用 `Mutex<Option<Arc<_>>>` 而不是 `OnceLock`：停用插件时要能拆掉后台线程，
+// 而 OnceLock 占用后永远换不进去，用户重新启用插件时线程不会再起来。
+static POMODORO: Mutex<Option<Arc<PomodoroTimer>>> = Mutex::new(None);
+static SCHEDULER: Mutex<Option<Arc<scheduler::Scheduler>>> = Mutex::new(None);
+static POMODORO_DB: OnceLock<()> = OnceLock::new();
+
+fn pomodoro_timer() -> Arc<PomodoroTimer> {
+    let mut slot = POMODORO.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(t) = slot.as_ref() {
+        return Arc::clone(t);
+    }
+    ensure_pomodoro_db();
+    let t = PomodoroTimer::new();
+    *slot = Some(Arc::clone(&t));
+    t
+}
+
+/// 只保证库建好，不启动计时线程：读历史/汇总的接口用。
+fn ensure_pomodoro_db() {
+    POMODORO_DB.get_or_init(|| {
+        let _ = pomodoro::init_db();
+    });
+}
+
+/// 回收番茄钟：落盘进行中的阶段并结束计时线程（重新启用插件会再起）。
+///
+/// 由番茄钟插件在自己的 `cleanup()` 里调用 —— 谁用资源谁负责释放，
+/// 核心层不必知道哪个插件在用。
+pub fn shutdown_pomodoro() {
+    let timer = POMODORO.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(t) = timer {
+        t.shutdown();
+    }
+}
+
+fn ensure_scheduler() {
+    let mut slot = SCHEDULER.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        *slot = Some(scheduler::Scheduler::start());
+    }
+}
+
+/// 回收调度线程：停用日程插件后定时任务不再触发（重新启用会再起）。
+pub fn stop_scheduler() {
+    let s = SCHEDULER.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(s) = s {
+        s.stop();
+    }
+}
 
 /// 注册宿主 API 到 Lua 全局表 `focusflow`，返回该表。
 pub fn register_host_api(
@@ -98,21 +150,10 @@ pub fn register_host_api(
     host.set("app_info", info_fn)?;
 
     // ---- 番茄钟 API ----
-    // 共享番茄钟实例（进程级单例），**惰性初始化**：
-    // 只有插件真正调用番茄钟 API 时才建库。早前这里是「注册即 init_db」，
-    // 于是启用任意插件（哪怕与番茄钟无关）都会把 focusflow_pomodoro.db 建出来，
-    // 番茄钟插件的停用开关形同虚设。
-    static POMODORO: std::sync::OnceLock<Arc<PomodoroTimer>> = std::sync::OnceLock::new();
-    fn pomodoro_timer() -> Arc<PomodoroTimer> {
-        Arc::clone(POMODORO.get_or_init(|| {
-            let _ = pomodoro::init_db();
-            PomodoroTimer::new()
-        }))
-    }
-    /// 只读历史/汇总：不必持有计时器实例，但要保证库已建好。
-    fn ensure_pomodoro_db() {
-        let _ = pomodoro_timer();
-    }
+    // 共享番茄钟实例（进程级单例，见模块顶部），**惰性初始化**：
+    // 只有插件真正调用番茄钟 API 时才建库、才起计时线程。早前这里是
+    // 「注册即 init_db + spawn」，于是启用任意插件（哪怕与番茄钟无关）
+    // 都会把 focusflow_pomodoro.db 建出来，番茄钟插件的停用开关形同虚设。
 
     let pomo_state_fn = lua.create_function(|lua, ()| {
         let info = pomodoro_timer().get_state_info();
@@ -149,6 +190,16 @@ pub fn register_host_api(
         "pomodoro_stop",
         lua.create_function(|_, ()| {
             pomodoro_timer().stop();
+            Ok(())
+        })?,
+    )?;
+
+    // 与 pomodoro_stop 的区别：stop 只结束当前番茄会话、线程继续跑；
+    // 这个是插件停用/卸载时在 cleanup 里回收计时线程用。
+    host.set(
+        "pomodoro_shutdown",
+        lua.create_function(|_, ()| {
+            shutdown_pomodoro();
             Ok(())
         })?,
     )?;
@@ -205,17 +256,13 @@ pub fn register_host_api(
     )?;
 
     // ---- 定时任务 API ----
-    // 调度器（进程级单例），**惰性初始化**：
+    // 调度器（进程级单例，见模块顶部），**惰性初始化**：
     // `Scheduler::start` 会 spawn 一个常驻线程并建库，早前在注册时就执行，
     // 于是日程插件被禁用时线程照跑、focusflow_scheduler.db 照样生成。
-    // 现在改成首次调用任一日程 API 时才启动。
+    // 现在改成首次调用任一日程 API 时才启动，停用插件时经 scheduler_shutdown 回收。
     //
     // 注意连「列出任务」也要先启动：程序重启后 UI 往往只是渲染任务列表，
     // 若读任务不启动调度器，恢复上来的定时任务就永远不会被执行。
-    static SCHEDULER: std::sync::OnceLock<Arc<scheduler::Scheduler>> = std::sync::OnceLock::new();
-    fn ensure_scheduler() {
-        let _ = SCHEDULER.get_or_init(scheduler::Scheduler::start);
-    }
 
     let tasks_fn = lua.create_function(|lua, ()| {
         ensure_scheduler();
@@ -304,6 +351,17 @@ pub fn register_host_api(
         Ok((ok, msg))
     })?;
     host.set("scheduler_validate", validate_fn)?;
+
+    // 插件停用/卸载时在 cleanup 里回收调度线程，否则定时任务会在插件
+    // 显示为「已停用」的状态下继续触发。重新启用插件时首次调用任一日程
+    // API 会经 ensure_scheduler 再把线程起回来。
+    host.set(
+        "scheduler_shutdown",
+        lua.create_function(|_, ()| {
+            stop_scheduler();
+            Ok(())
+        })?,
+    )?;
 
     // ---- 记账本 API ----
     // 与番茄钟/日程同理：记账库也改成惰性建库，禁用记账插件时不再碰它的文件。
@@ -463,7 +521,11 @@ pub fn register_host_api(
     // 不可达死代码 —— 而 Lua 插件按注释把它当读接口用（返回值是类型字符串，
     // 解包成 `(ok, msg)` 会误判成功）。修改类型现由
     // `accounting_category_rename(old, new, ctype)` 的第三个参数承担。
+    //
+    // ensure 不可省：category_type 内部走 accounting::open()，而它是
+    // Connection::open —— 库文件不存在时会顺手建出一个没有任何表的空库。
     let acc_cat_type = lua.create_function(|_, name: String| {
+        ensure_accounting_db();
         Ok(accounting::category_type(&name).unwrap_or_default())
     })?;
     host.set("accounting_category_type", acc_cat_type)?;

@@ -29,6 +29,8 @@ end
 
 function cleanup()
     focusflow.pomodoro_stop()
+    -- stop 只结束当前番茄会话，计时线程还在跑；shutdown 才回收线程
+    focusflow.pomodoro_shutdown()
     focusflow.log("番茄工作法插件已清理")
 end
 

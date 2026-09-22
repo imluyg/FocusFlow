@@ -14,6 +14,8 @@ function init()
 end
 
 function cleanup()
+    -- 回收宿主的调度线程：不叫这句，插件停用后定时任务仍会照常触发
+    focusflow.scheduler_shutdown()
     focusflow.log("定时任务插件已清理")
 end
 

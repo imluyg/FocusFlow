@@ -471,10 +471,21 @@ fn execute_task(t: &ScheduledTask) {
     }
 }
 
+/// 调度线程的检查间隔。
+const CHECK_INTERVAL_MS: u64 = 30_000;
+
 /// 后台检查循环。
+///
+/// 30 秒的间隔按 500ms 小片睡：`stop()` 置位后最多 500ms 就能退出，
+/// 不必等满一整轮间隔（停用插件时若等它睡满，会把调用方挂住半分钟）。
 fn check_loop(stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_secs(30));
+        for _ in 0..(CHECK_INTERVAL_MS / 500) {
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
         let now = Local::now();
         let tasks = get_all_tasks();
         for t in &tasks {
@@ -508,12 +519,18 @@ impl Scheduler {
         s
     }
 
+    /// 请求停止：置位后由调度线程自行在下一个 500ms 分片退出。
+    ///
+    /// 刻意不 `join()`：调用方是主线程（插件 cleanup），而线程此刻可能正在
+    /// 拉起目标程序，等它会卡住界面。取走句柄即 detach。
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = h.join();
-        }
-        tracing::info!("定时任务调度线程已停止");
+        let _ = self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        tracing::info!("定时任务调度线程已请求停止");
     }
 }
 
