@@ -390,10 +390,19 @@ fn migrate_v2_file(path: &Path, year: i32) -> i64 {
 
         let off = queries::local_utc_offset_seconds();
         conn.execute("BEGIN IMMEDIATE;", [])?;
+        // 三条聚合都必须累加而不是直接插入：目标年库很可能早有当天的聚合行
+        // （新版一直在跑，之后又导入同年的旧版明细），plain INSERT 会撞主键
+        // 让整段迁移回滚 —— 旧明细既聚不上也清不掉，且每次启动重复失败，
+        // 导入结果看起来「成功」但界面上什么都看不见。
+        // 敢累加是因为同一事务末尾会 DELETE FROM key_log：明细与聚合同生同灭，
+        // 不存在重放一遍就翻倍的路径。
+        // daily_counts.seconds 不进冲突分支：旧版明细没有活跃时长，
+        // 用 0 覆盖会抹掉该天已有的时长统计。
         conn.execute(
             "INSERT INTO daily_counts (date_key, count)
              SELECT CAST((timestamp + ?1) / 86400 AS INTEGER), COUNT(*)
-             FROM key_log GROUP BY 1",
+             FROM key_log GROUP BY 1
+             ON CONFLICT(date_key) DO UPDATE SET count = count + excluded.count",
             [off],
         )?;
         conn.execute(
@@ -401,17 +410,22 @@ fn migrate_v2_file(path: &Path, year: i32) -> i64 {
              SELECT CAST((timestamp + ?1) / 86400 AS INTEGER),
                     CAST(((timestamp + ?1) / 3600) % 24 AS INTEGER),
                     COUNT(*)
-             FROM key_log GROUP BY 1, 2",
+             FROM key_log GROUP BY 1, 2
+             ON CONFLICT(date_key, hour) DO UPDATE SET count = count + excluded.count",
             [off],
         )?;
         conn.execute(
             "INSERT INTO key_counts (date_key, key_name, count)
              SELECT CAST((timestamp + ?1) / 86400 AS INTEGER), key_name, COUNT(*)
-             FROM key_log GROUP BY 1, 2",
+             FROM key_log GROUP BY 1, 2
+             ON CONFLICT(date_key, key_name) DO UPDATE SET count = count + excluded.count",
             [off],
         )?;
 
-        // 旧版 Ctrl+X 组合键名修正
+        // 旧版 Ctrl+X 组合键名修正。改名是「并入」而非「替换」：同一天往往
+        // 已经存在修正后的键名，直接 UPDATE 会撞 key_counts 的
+        // (date_key, key_name) 主键；而 UPDATE 是整条语句作废（不是逐行跳过），
+        // 结果是一个键都没改、新旧两名长期分裂，且原先的 let _ = 把它吞了。
         {
             let mut stmt = conn
                 .prepare("SELECT DISTINCT key_name FROM key_counts WHERE key_name GLOB 'Ctrl+*'")?;
@@ -419,14 +433,33 @@ fn migrate_v2_file(path: &Path, year: i32) -> i64 {
                 .query_map([], |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
             for old in names {
-                if let Some(new) = combo_key_mapping(&old) {
-                    if new != old {
-                        let _ = conn.execute(
-                            "UPDATE key_counts SET key_name = ?1 WHERE key_name = ?2",
-                            rusqlite::params![new, old],
-                        );
-                    }
+                let Some(new) = combo_key_mapping(&old) else {
+                    continue;
+                };
+                if new == old {
+                    continue;
                 }
+                let rows: Vec<(i64, i64)> = {
+                    let mut q = conn
+                        .prepare("SELECT date_key, count FROM key_counts WHERE key_name = ?1")?;
+                    let list = q
+                        .query_map(rusqlite::params![old], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<Result<_, _>>()?;
+                    list
+                };
+                for (date_key, count) in rows {
+                    conn.execute(
+                        "INSERT INTO key_counts (date_key, key_name, count)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(date_key, key_name)
+                         DO UPDATE SET count = count + excluded.count",
+                        rusqlite::params![date_key, new, count],
+                    )?;
+                }
+                conn.execute(
+                    "DELETE FROM key_counts WHERE key_name = ?1",
+                    rusqlite::params![old],
+                )?;
             }
         }
 
@@ -484,11 +517,21 @@ fn combo_key_mapping(old: &str) -> Option<String> {
     None
 }
 
-/// 清理 keep_days 天前的数据，返回删除的聚合行数。
+/// 清理「保留 keep_days 天（含今天）」之外的数据，返回删除的聚合行数。
+///
+/// 口径与 `get_daily_counts` 对齐：保留 N 天 = 含今天在内的 N 个自然日。
 /// 不可逆操作：执行前先做一次全量备份。
+///
+/// `keep_days < 1` 一律拒绝而不是钳制成 1：0 或负数会让 cutoff 落到今天甚至
+/// 未来，一条 DELETE 就把全部历史（含今天）清空；而钳制同样会把误输入的 -1
+/// 变成「只留今天」，两者都是不可逆的灾难，只能拒绝对方才有机会发现打错了字。
 pub fn cleanup_old_data(keep_days: i64) -> i64 {
+    if keep_days < 1 {
+        tracing::error!("清理天数必须 >= 1（收到 {keep_days}），已拒绝");
+        return 0;
+    }
     snapshot_before_destructive("cleanup_old_data");
-    let cutoff_dk = queries::day_key_of_date(Local::now().date_naive()) - keep_days;
+    let cutoff_dk = queries::day_key_of_date(Local::now().date_naive()) - (keep_days - 1);
     let mut total = 0i64;
     for year in queries::available_years() {
         let path = paths::year_db_path(year);

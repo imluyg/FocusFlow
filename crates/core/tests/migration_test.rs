@@ -194,4 +194,117 @@ mod tests {
         std::fs::remove_dir_all(&old_dir).ok();
         std::fs::remove_dir_all(&new_dir).ok();
     }
+
+    /// 回归：目标年库**已有当天聚合行**时，导入必须累加而不是插入。
+    ///
+    /// 三条 `INSERT ... SELECT ... GROUP BY` 原本没有 ON CONFLICT，而新版一直
+    /// 在跑的年库早已有当天的 daily_counts 行 —— 一撞主键整段迁移回滚：旧明细
+    /// 聚不上、暂存表也清不掉，且 `Database::init` 每次启动都重跑一遍重复失败。
+    /// 更糟的是导入返回值取自暂存表的插入条数（那一步是成功的），于是界面显示
+    /// 「导入 N 条」而统计数据毫无变化。
+    #[test]
+    fn import_into_year_db_with_existing_rows_accumulates() {
+        let _g = guard();
+        let old_dir = std::env::temp_dir().join(format!("ff_merge_old_{}", std::process::id()));
+        let new_dir = std::env::temp_dir().join(format!("ff_merge_new_{}", std::process::id()));
+        std::fs::remove_dir_all(&old_dir).ok();
+        std::fs::remove_dir_all(&new_dir).ok();
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(new_dir.join("data")).unwrap();
+        paths::set_app_dir(&new_dir);
+        db::queries::invalidate_years_cache();
+
+        // 三条明细共用一个时间戳：同日同小时，不受时区与小时边界影响
+        let ts: i64 = 1_700_000_000;
+        let off = chrono::Local::now().offset().local_minus_utc() as i64;
+        let dk = (ts + off) / 86_400;
+        let hour = ((ts + off) / 3_600) % 24;
+
+        // 旧版库：含一个需修正的 Ctrl+A（应并入已存在的 A）
+        {
+            let conn = rusqlite::Connection::open(old_dir.join("focusflow_2025.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE key_log (id INTEGER PRIMARY KEY AUTOINCREMENT, key_name TEXT NOT NULL, timestamp INTEGER NOT NULL);
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO key_log (key_name, timestamp) VALUES ('A', ?1), ('B', ?1), ('Ctrl+A', ?1)",
+                [ts],
+            )
+            .unwrap();
+        }
+
+        // 目标年库：新版已在跑，当天已有聚合行（daily 还带着已算好的 seconds）
+        {
+            let dst = paths::year_db_path(2025);
+            let conn = rusqlite::Connection::open(&dst).unwrap();
+            db::connection::ensure_schema(&conn, 2025).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 5, 42)",
+                [dk],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO hourly_counts (date_key, hour, count) VALUES (?1, ?2, 5)",
+                rusqlite::params![dk, hour],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO key_counts (date_key, key_name, count) VALUES (?1, 'A', 5)",
+                [dk],
+            )
+            .unwrap();
+        }
+
+        let summary = migration::import_legacy_data(&old_dir);
+        assert!(summary.errors.is_empty(), "errors: {:?}", summary.errors);
+
+        let conn = rusqlite::Connection::open(paths::year_db_path(2025)).unwrap();
+        let sum_of = |sql: &str| -> i64 {
+            conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap()
+        };
+        assert_eq!(sum_of("SELECT SUM(count) FROM daily_counts"), 8, "原有 5 + 导入 3");
+        assert_eq!(sum_of("SELECT SUM(count) FROM hourly_counts"), 8, "小时维度同样累加");
+        assert_eq!(sum_of("SELECT SUM(count) FROM key_counts"), 8, "键名维度同样累加");
+        assert_eq!(
+            sum_of("SELECT count FROM key_counts WHERE key_name = 'A'"),
+            7,
+            "Ctrl+A 的 1 次应并入已存在的 A（5 + 1 + 1）"
+        );
+        assert_eq!(
+            sum_of("SELECT COUNT(*) FROM key_counts WHERE key_name = 'Ctrl+A'"),
+            0,
+            "并入后不应再留 Ctrl+A 行"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT seconds FROM daily_counts WHERE date_key = ?1",
+                [dk],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            42,
+            "旧版明细没有活跃时长，冲突分支绝不能把它清零"
+        );
+        assert_eq!(
+            sum_of("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='key_log'"),
+            0,
+            "聚合成功后应丢弃暂存表"
+        );
+
+        // 再跑一次迁移不得翻倍（明细与聚合同事务，不存在重放路径）
+        db::maintenance::migrate_v2();
+        let conn = rusqlite::Connection::open(paths::year_db_path(2025)).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT SUM(count) FROM daily_counts", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            8,
+            "重复迁移应保持幂等"
+        );
+
+        std::fs::remove_dir_all(&old_dir).ok();
+        std::fs::remove_dir_all(&new_dir).ok();
+    }
 }

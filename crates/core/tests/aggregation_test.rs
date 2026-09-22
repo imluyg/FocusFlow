@@ -152,4 +152,64 @@ mod tests {
         database.shutdown(&config);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// 清理接口的两道闸：非正天数必须整笔拒绝，以及「保留 N 天」按含今天
+    /// 的自然日计。
+    ///
+    /// 原先 `cutoff = today - keep_days` 不做任何校验：填 0 或负数会让 cutoff
+    /// 落到今天甚至未来，一条 `DELETE ... WHERE date_key < cutoff` 连今天一起
+    /// 清空，而这是不可逆操作、只靠删前快照兜底。同时它比口径多留一天
+    /// （keep 10 实际留 11 天），与 `get_daily_counts` 的「含今天共 N 天」不一致。
+    #[test]
+    fn cleanup_refuses_non_positive_and_keeps_including_today() {
+        let _g = guard();
+        let dir = std::env::temp_dir().join(format!("ff_cleanup_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        paths::set_app_dir(&dir);
+        db::queries::invalidate_years_cache();
+
+        let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
+        let database = db::Database::init(&config).unwrap();
+        let writer = database.writer().unwrap().clone();
+        // 今天与 10 天前各一天（同一年度库内，日期由写入路径自己算）
+        let today_noon = focusflow_core::db::queries::today_start_ts() + 43_200;
+        for _ in 0..3 {
+            writer.record("A", today_noon);
+        }
+        for _ in 0..4 {
+            writer.record("A", today_noon - 10 * 86_400);
+        }
+        writer.flush(true);
+        database.shutdown(&config);
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let days_with_data = || -> usize {
+            db::get_daily_counts(11, None)
+                .into_iter()
+                .filter(|(_, c)| *c > 0)
+                .count()
+        };
+        assert_eq!(days_with_data(), 2, "前置：今天与 10 天前各一天");
+
+        assert_eq!(db::maintenance::cleanup_old_data(0), 0, "0 天必须被拒绝");
+        assert_eq!(db::maintenance::cleanup_old_data(-5), 0, "负数必须被拒绝");
+        assert_eq!(days_with_data(), 2, "拒绝时不得删掉任何数据");
+
+        db::maintenance::cleanup_old_data(11);
+        assert_eq!(days_with_data(), 2, "保留 11 天（含今天）刚好覆盖 10 天前");
+
+        assert!(db::maintenance::cleanup_old_data(10) > 0, "保留 10 天应清掉 10 天前那天");
+        assert_eq!(days_with_data(), 1, "含今天共 10 天不含第 11 天");
+        assert_eq!(
+            db::get_daily_counts(11, None)
+                .into_iter()
+                .find(|(d, _)| *d == today)
+                .map(|(_, c)| c),
+            Some(3),
+            "剩下的必须是今天那 3 次"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

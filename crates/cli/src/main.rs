@@ -40,7 +40,7 @@ const USAGE: &str = "\
   --list-years               列出有数据的年份
   --export <csv|html>        导出报表到当前目录
   --vacuum                   压缩数据库
-  --cleanup <天数>           清理 N 天前的数据
+  --cleanup <天数>           保留 N 天（含今天），删除更早的数据
   --reset                    清空所有统计记录（需输入 yes 确认）
   -h, --help                 显示本帮助
 ";
@@ -155,10 +155,16 @@ fn run(args: &[String]) -> i32 {
                 return 1;
             }
             match args[1].parse::<i64>() {
-                Ok(days) => {
+                Ok(days) if days >= 1 => {
                     let deleted = db::maintenance::cleanup_old_data(days);
                     println!("已删除 {days} 天前的记录 {deleted} 条");
                     0
+                }
+                // 必须挡在这里：core 对非法值只返回 0，直接打「已删除 0 条」
+                // 看起来像成功，用户不会发现自己把天数打成了 0 或负数
+                Ok(days) => {
+                    eprintln!("保留天数必须 >= 1（收到 {days}），已取消：0 或负数会连今天一起删掉");
+                    1
                 }
                 Err(_) => {
                     eprintln!("天数必须为整数");
