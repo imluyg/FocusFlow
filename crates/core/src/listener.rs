@@ -313,8 +313,8 @@ pub struct InputListener {
     cfg: ListenerCfg,
     /// 按下状态的按键集合：{按键名: 按下时刻}
     pressed: Mutex<HashMap<String, Instant>>,
-    /// 滚轮合并状态
-    scroll: Mutex<(Instant, &'static str)>,
+    /// 滚轮合并状态：最近一次滚轮时刻（`None` = 尚无/已被重置，必然算新一轮）
+    scroll: Mutex<(Option<Instant>, &'static str)>,
     /// 暂停状态
     paused: Mutex<bool>,
     /// 事件回调（番茄钟 / 护眼提醒）
@@ -329,7 +329,11 @@ impl InputListener {
             config,
             cfg: ListenerCfg::default(),
             pressed: Mutex::new(HashMap::new()),
-            scroll: Mutex::new((Instant::now() - Duration::from_secs(10), "上")),
+            // None 表示「还没有滚过」，等价于上一次的合并窗口早已过期。
+            // 不能写成 `Instant::now() - Duration::from_secs(10)`：开机不足 10 秒时
+            // Instant 减法下溢 panic，而 release 的 panic=abort 会让开机自启变成启动即崩
+            // （app_stats.rs / queries.rs 里对同一个坑留过告诫）。
+            scroll: Mutex::new((None, "上")),
             paused: Mutex::new(false),
             key_callbacks: Mutex::new(Vec::new()),
             alive: Arc::new(Mutex::new(false)),
@@ -368,7 +372,7 @@ impl InputListener {
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
             let mut s = self.scroll.lock().unwrap_or_else(|e| e.into_inner());
-            *s = (Instant::now() - Duration::from_secs(10), "上");
+            *s = (None, "上");
         }
         tracing::info!("监听已 {}", if paused { "暂停" } else { "恢复" });
     }
@@ -406,9 +410,14 @@ impl InputListener {
         let window = self.cfg.burst_window();
         let now = Instant::now();
         let mut scroll = self.scroll.lock().unwrap_or_else(|e| e.into_inner());
-        let is_new =
-            now.duration_since(scroll.0) > Duration::from_secs_f64(window) || scroll.1 != direction;
-        *scroll = (now, direction);
+        let is_new = match scroll.0 {
+            // 尚无记录（首次，或暂停后刚重置）：一定是新一轮
+            None => true,
+            Some(t) => {
+                now.duration_since(t) > Duration::from_secs_f64(window) || scroll.1 != direction
+            }
+        };
+        *scroll = (Some(now), direction);
         is_new
     }
 
@@ -588,12 +597,16 @@ mod tests {
         assert!(l.is_new_press("A"));
         assert!(!l.is_new_press("A"), "窗口内第二次按下应视为长按重复");
 
-        // 手工把按下时刻拨到 stale 窗口之外（默认 15 秒，避免真实等待）
+        // 手工把按下时刻拨到 stale 窗口之外（默认 15 秒，避免真实等待）。
+        // checked_sub：裸减法低于时钟原点会 panic。
         let stale_secs = l.cfg.stale_secs();
-        l.pressed.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            "A".to_string(),
-            Instant::now() - Duration::from_secs_f64(stale_secs + 1.0),
-        );
+        let aged = Instant::now()
+            .checked_sub(Duration::from_secs_f64(stale_secs + 1.0))
+            .unwrap_or_else(Instant::now);
+        l.pressed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("A".to_string(), aged);
         assert!(l.is_new_press("A"), "stale 超时后应重新计数");
     }
 
@@ -606,7 +619,9 @@ mod tests {
             for i in 0..250 {
                 pressed.insert(format!("Fresh{i}"), Instant::now());
             }
-            let stale = Instant::now() - Duration::from_secs_f64(l.cfg.stale_secs() + 1.0);
+            let stale = Instant::now()
+                .checked_sub(Duration::from_secs_f64(l.cfg.stale_secs() + 1.0))
+                .unwrap_or_else(Instant::now);
             for i in 0..60 {
                 pressed.insert(format!("Aged{i}"), stale);
             }
@@ -627,10 +642,12 @@ mod tests {
         assert!(l.is_new_scroll_burst("下"), "方向切换应立即计数");
         assert!(!l.is_new_scroll_burst("下"));
 
-        *l.scroll.lock().unwrap_or_else(|e| e.into_inner()) = (
-            Instant::now() - Duration::from_secs_f64(l.cfg.burst_window() + 1.0),
-            "上",
-        );
+        // 造一个确实已超出合并窗口的时刻。用 checked_sub 而不是裸减法：
+        // Instant 减法低于时钟原点（开机时刻）会 panic，正是生产路径这轮修掉的坑。
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs_f64(l.cfg.burst_window() + 1.0))
+            .unwrap_or_else(Instant::now);
+        *l.scroll.lock().unwrap_or_else(|e| e.into_inner()) = (Some(expired), "上");
         assert!(l.is_new_scroll_burst("上"), "窗口过期后应重新计数");
     }
 
