@@ -261,12 +261,23 @@ mod tests {
         assert!(summary.errors.is_empty(), "errors: {:?}", summary.errors);
 
         let conn = rusqlite::Connection::open(paths::year_db_path(2025)).unwrap();
-        let sum_of = |sql: &str| -> i64 {
-            conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap()
-        };
-        assert_eq!(sum_of("SELECT SUM(count) FROM daily_counts"), 8, "原有 5 + 导入 3");
-        assert_eq!(sum_of("SELECT SUM(count) FROM hourly_counts"), 8, "小时维度同样累加");
-        assert_eq!(sum_of("SELECT SUM(count) FROM key_counts"), 8, "键名维度同样累加");
+        let sum_of =
+            |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap() };
+        assert_eq!(
+            sum_of("SELECT SUM(count) FROM daily_counts"),
+            8,
+            "原有 5 + 导入 3"
+        );
+        assert_eq!(
+            sum_of("SELECT SUM(count) FROM hourly_counts"),
+            8,
+            "小时维度同样累加"
+        );
+        assert_eq!(
+            sum_of("SELECT SUM(count) FROM key_counts"),
+            8,
+            "键名维度同样累加"
+        );
         assert_eq!(
             sum_of("SELECT count FROM key_counts WHERE key_name = 'A'"),
             7,

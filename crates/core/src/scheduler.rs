@@ -525,11 +525,7 @@ impl Scheduler {
     /// 拉起目标程序，等它会卡住界面。取走句柄即 detach。
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = self
-            .handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let _ = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
         tracing::info!("定时任务调度线程已请求停止");
     }
 }

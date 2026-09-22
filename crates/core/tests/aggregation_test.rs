@@ -199,7 +199,10 @@ mod tests {
         db::maintenance::cleanup_old_data(11);
         assert_eq!(days_with_data(), 2, "保留 11 天（含今天）刚好覆盖 10 天前");
 
-        assert!(db::maintenance::cleanup_old_data(10) > 0, "保留 10 天应清掉 10 天前那天");
+        assert!(
+            db::maintenance::cleanup_old_data(10) > 0,
+            "保留 10 天应清掉 10 天前那天"
+        );
         assert_eq!(days_with_data(), 1, "含今天共 10 天不含第 11 天");
         assert_eq!(
             db::get_daily_counts(11, None)
