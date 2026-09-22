@@ -108,13 +108,21 @@ impl PluginManager {
     /// 创建沙箱化的 Lua 状态：
     /// - 剔除 `io` 库（任意文件读写）；
     /// - 移除 `os` 中可触达系统的高危函数（保留 date/time/clock 供插件使用）；
-    /// - 禁用 `package.loadlib`/`cpath`（防加载任意 DLL）。
+    /// - 禁用 `package.loadlib`/`cpath`（防加载任意 DLL）；
+    /// - 摘掉 base 库的 `dofile`/`loadfile`（base 由 mlua 无条件打开，白名单挡不住）；
+    /// - 不放行 `coroutine` 库（见下方 hook 说明）。
     ///
     /// 配合 `apply_lua_limits` 的内存/指令数限制构成完整沙箱。
     fn create_sandboxed_lua() -> mlua::Result<Lua> {
         // 显式白名单，不用 ALL_SAFE：后者含 io 库，且未来 mlua 加入新库时不会默默放行。
-        let libs = StdLib::COROUTINE
-            | StdLib::TABLE
+        //
+        // 这里刻意没有 coroutine：Lua 的 debug hook 是 per-thread 的，
+        // `set_hook` 只作用在主状态上，`coroutine.create` 出的线程不继承。
+        // 于是 `coroutine.resume(coroutine.create(function() while true do end end))`
+        // 能完整绕开指令数上限，而内存配额也拦不住不分配内存的死循环 ——
+        // 所有 Lua 都跑在 Tauri 主线程上，这等价于永久冻死整个界面。
+        // 与其去给新线程补 hook，不如关掉这个唯一的搬移入口（随附插件无一使用）。
+        let libs = StdLib::TABLE
             | StdLib::STRING
             | StdLib::UTF8
             | StdLib::MATH
@@ -122,6 +130,12 @@ impl PluginManager {
             | StdLib::OS;
         let lua = Lua::new_with(libs, LuaOptions::default())?;
         let globals = lua.globals();
+        // base 库由 mlua 无条件打开（白名单里没有 BASE 也挡不住），所以按名字
+        // 逐个摘掉能碰到磁盘的入口：随附插件没有一个用得到，留着只是多一条
+        // "加载并执行任意路径下的 .lua" 的通道（跨插件代码混用、探测文件是否存在）。
+        for name in ["dofile", "loadfile"] {
+            globals.set(name, mlua::Value::Nil)?;
+        }
         if let Ok(os) = globals.get::<mlua::Table>("os") {
             for name in [
                 "execute",
@@ -916,6 +930,46 @@ fn parse_widget(w: &mlua::Table) -> mlua::Result<crate::plugins::Widget> {
 mod tests {
     use super::*;
 
+    /// 死循环必须被指令数上限打断，且沙箱里不能留着"换个线程躲开 hook"的出口。
+    ///
+    /// 实测（去掉本修复前）：同样规模的主线程循环被 hook 中断，而包进
+    /// `coroutine.create` 就一路跑完不报错 —— Lua 的 hook 是 per-thread 的。
+    /// 用有界循环而不是 `while true`：绕过成立时测试会自己跑完，不会挂住 CI。
+    #[test]
+    fn instruction_limit_cannot_be_escaped_by_coroutines() {
+        let lua = PluginManager::create_sandboxed_lua().unwrap();
+        lua.set_hook(
+            HookTriggers::new().every_nth_instruction(1_000),
+            |_lua, _dbg| -> mlua::Result<VmState> {
+                Err(mlua::Error::RuntimeError("超出指令数上限".into()))
+            },
+        );
+
+        let err = lua
+            .load("local n = 0 for i = 1, 200000 do n = n + i end")
+            .exec()
+            .expect_err("主线程死循环必须被 hook 中断");
+        assert!(err.to_string().contains("指令数上限"), "{err}");
+
+        assert!(
+            lua.globals()
+                .get::<mlua::Value>("coroutine")
+                .unwrap()
+                .is_nil(),
+            "协程是唯一能把指令计数搬走的入口，必须整体不可用"
+        );
+        let escaped = lua
+            .load(
+                "coroutine.resume(coroutine.create(function() \
+                 local n = 0 for i = 1, 200000 do n = n + i end end))",
+            )
+            .exec();
+        assert!(
+            escaped.is_err(),
+            "协程入口被移除后这段要立刻报错，而不是安静跑完"
+        );
+    }
+
     /// 沙箱必须让 io 库不可用、os 高危函数与 package.loadlib 被移除，
     /// 同时保留 os.date 等插件在用的安全函数。
     #[test]
@@ -931,6 +985,12 @@ mod tests {
         // package.loadlib 已禁用
         let loadlib: mlua::Value = lua.load("return package.loadlib").eval().unwrap();
         assert!(loadlib.is_nil());
+        // base 库 mlua 会无条件打开（白名单里没有 BASE 也挡不住），能落盘的两个
+        // 入口只能按名字摘掉；协程库则整体不在白名单内（hook 是 per-thread 的）
+        for name in ["dofile", "loadfile", "coroutine"] {
+            let v: mlua::Value = lua.globals().get(name).unwrap();
+            assert!(v.is_nil(), "{name} 应为 nil");
+        }
         // 插件在用的安全函数仍在
         for expr in [
             "return os.date",
