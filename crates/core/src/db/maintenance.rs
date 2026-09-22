@@ -37,6 +37,39 @@ const DATA_TABLES: [&str; 6] = [
     "device_key_counts",
 ];
 
+/// `[dk_from, dk_to)` 区间内该连接上是否还有任何数据行（跨全部 DATA_TABLES）。
+fn range_has_rows(conn: &rusqlite::Connection, dk_from: i64, dk_to: i64) -> bool {
+    DATA_TABLES.iter().any(|table| {
+        conn.query_row(
+            &format!("SELECT 1 FROM {table} WHERE date_key >= ?1 AND date_key < ?2 LIMIT 1"),
+            rusqlite::params![dk_from, dk_to],
+            |_| Ok::<i64, rusqlite::Error>(1),
+        )
+        .unwrap_or(0)
+            != 0
+    })
+}
+
+/// 早于 `before_dk` 的数据里最早的那一天（跨全部 DATA_TABLES 取最小），无则 None。
+///
+/// 不能只探 `daily_counts`：`record_device` 从不写它。只看 daily_counts 时，
+/// 「只有设备明细被误放进当前库」的往年数据永远判定成无需归档，而按日期的
+/// 查询只会去对应年份的库里找 —— 那批数据就再也看不见。
+fn min_stale_date_key(conn: &rusqlite::Connection, before_dk: i64) -> Option<i64> {
+    DATA_TABLES
+        .iter()
+        .filter_map(|table| {
+            conn.query_row(
+                &format!("SELECT MIN(date_key) FROM {table} WHERE date_key < ?1"),
+                [before_dk],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+        })
+        .min()
+}
+
 /// 非主键的数值列：归档时**累加**到目标库的同名列。
 ///
 /// `daily_counts` 有两列（2026-09-21 起合并了活跃时长），所以这里返回切片
@@ -75,19 +108,15 @@ pub fn check_yearly_archive(yearly_archive_enabled: bool) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM daily_counts WHERE date_key < ?1",
-            [year_start_dk],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    let earliest = min_stale_date_key(&conn, year_start_dk);
     drop(conn);
 
-    if count == 0 {
+    let Some(earliest) = earliest else {
         return;
-    }
-    tracing::info!("检测到 {count} 天早于 {current_year} 年的数据在当前库中，开始归档...");
+    };
+    tracing::info!(
+        "检测到早于 {current_year} 年的数据在当前库中（最早 date_key {earliest}），开始归档..."
+    );
     if archive_stale_years(current_year) {
         queries::invalidate_years_cache();
     }
@@ -103,14 +132,7 @@ pub fn archive_stale_years(source_year: i32) -> bool {
     // 先查出需要迁移的年份及各年起始 date_key（用源库自己的连接查，不依赖猜测）
     let y0 = queries::day_key_of_date(NaiveDate::from_ymd_opt(source_year, 1, 1).expect("date"));
     let min_dk: Option<i64> = match connection::open_ro(&source_path) {
-        Ok(conn) => conn
-            .query_row(
-                "SELECT MIN(date_key) FROM daily_counts WHERE date_key < ?1",
-                [y0],
-                |r| r.get(0),
-            )
-            .ok()
-            .flatten(),
+        Ok(conn) => min_stale_date_key(&conn, y0),
         Err(_) => None,
     };
     let first_stale_year = min_dk.and_then(queries::day_key_to_date).map(|d| d.year());
@@ -163,11 +185,29 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
         return false;
     }
 
+    // 源库在这一年里没有数据就直接收工，且**必须在建目标库之前**判：
+    // open_rw 会凭空造出一个空年度库，而归档区间是 first..source_year 的连续
+    // 年份，于是 2026 年归档一份 2020 的数据会连带建出 focusflow_2021..2025.db
+    // 四个空壳 —— 此后永久出现在 available_years() 里、白占备份轮转名额，
+    // 每个还要各挨一次 VACUUM。
+    let source_path = paths::year_db_path(source_year);
+    match connection::open_ro(&source_path) {
+        Ok(conn) => {
+            if !range_has_rows(&conn, dk_from, dk_to) {
+                return false;
+            }
+        }
+        // 判不了就不建：宁可这一轮不归档，也不要留下没有数据来源的空库
+        Err(e) => {
+            tracing::error!("年度归档中止：源库无法读取（{e}），未改动目标库");
+            return false;
+        }
+    }
+
     // 1. 确保 target_year 与 source_year 库都是最新表结构
     //    （源库也必须先迁移：附着上来的旧库仍是 device_key 文本形态时，
     //     下面的 id 映射 SQL 会整段失败）
     let target_path = paths::year_db_path(target_year);
-    let source_path = paths::year_db_path(source_year);
     if let Err(e) = connection::open_rw(&target_path)
         .and_then(|conn| connection::ensure_schema(&conn, target_year))
     {
@@ -273,11 +313,17 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
 fn sync_device_dict(conn: &Connection, dk_from: i64, dk_to: i64) -> anyhow::Result<()> {
     // 1. 补齐源库的孤儿登记（占位名 device-id:<n>：路径已经丢了，救不回设备名，
     //    但计数必须保住）
+    //
+    // id 必须显式写 `c.device_id`，不能交给 SQLite 自增：映射表是按
+    // `src_id = c.device_id` JOIN 出来的，而自增只会给到 max(id)+1。
+    // 孤儿 id 一旦不是 max+1（多数情况），占位行就对不上明细里的 id，
+    // 于是 INSERT 一行都搬不到、紧接着的 DELETE 却无条件把源库那些行删了
+    // —— 静默丢数据。
     for table in ["device_counts", "device_key_counts"] {
         conn.execute(
             &format!(
-                "INSERT OR IGNORE INTO source.devices (device_key, name, kind)
-                 SELECT '{prefix}' || c.device_id, '{prefix}' || c.device_id, 'unknown'
+                "INSERT OR IGNORE INTO source.devices (id, device_key, name, kind)
+                 SELECT c.device_id, '{prefix}' || c.device_id, '{prefix}' || c.device_id, 'unknown'
                    FROM source.{table} c
                   WHERE c.date_key >= ?1 AND c.date_key < ?2
                     AND NOT EXISTS (SELECT 1 FROM source.devices d WHERE d.id = c.device_id)",
@@ -2583,6 +2629,93 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert!(left.is_empty(), "半成品与 sidecar 都应被清掉: {left:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 往年数据只在设备明细里时也必须被归档；归档不得顺手造出空年度库。
+    ///
+    /// 两处回归：
+    /// 1. 陈旧判定原先只查 daily_counts，而 `record_device` 从不写它 —— 于是
+    ///    「只有设备行留在上一年库中」的数据永远判成无需归档，而按日期的查询
+    ///    只去 2022 库里找，那批计数就永久不可见。
+    /// 2. 归档范围是 `first_stale_year..source_year` 的连续年份，而
+    ///    `archive_year_range` 一进来就 `open_rw` 目标库 —— 2025 库里只有 2022
+    ///    的数据时，会连带建出 focusflow_2023.db / _2024.db 两个空壳，此后
+    ///    永久出现在 available_years() 里、白占备份轮转名额，每个还各挨一次
+    ///    VACUUM。
+    #[test]
+    fn stale_device_only_rows_archive_without_creating_empty_year_dbs() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_archive_gap_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        crate::paths::set_app_dir(&dir);
+
+        let source_year = 2025;
+        let stale_year = 2022;
+        // 取 6 月：避开 1 月 1 日，免得日期换算的时区边界干扰本用例
+        let stale_dk =
+            queries::day_key_of_date(NaiveDate::from_ymd_opt(stale_year, 6, 1).expect("date"));
+        {
+            let conn = connection::open_rw(&paths::year_db_path(source_year)).unwrap();
+            connection::ensure_schema(&conn, source_year).unwrap();
+            // 只插设备明细，daily_counts 一行都没有；devices 字典故意留空，
+            // 归档侧应自动补占位登记而不是静默丢掉这行
+            conn.execute(
+                "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, 7, 99)",
+                [stale_dk],
+            )
+            .unwrap();
+        }
+        queries::invalidate_years_cache();
+
+        assert!(
+            archive_stale_years(source_year),
+            "往年数据只存在于 device_counts 时也必须触发归档"
+        );
+
+        for gap in (stale_year + 1)..source_year {
+            assert!(
+                !paths::year_db_path(gap).exists(),
+                "{gap} 年没有任何数据，不该被建出空库"
+            );
+        }
+        assert!(
+            paths::year_db_path(stale_year).exists(),
+            "{stale_year} 年有数据，应建库并迁入"
+        );
+
+        let moved: i64 = connection::open_ro(&paths::year_db_path(stale_year))
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM device_counts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved, 99, "设备计数应搬到目标年库");
+        let left: i64 = connection::open_ro(&paths::year_db_path(source_year))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM device_counts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "源库里的往年设备行应已清空");
+
+        // 生产路径由 check_yearly_archive 在迁移成功后负责失效；这里直接调
+        // archive_stale_years，就得自己补这一步（否则读到的是归档前快照流程
+        // 顺手填进 TTL 缓存的旧年份列表）
+        queries::invalidate_years_cache();
+        let years = queries::available_years();
+        assert!(
+            years.contains(&stale_year) && years.contains(&source_year),
+            "应有 {stale_year} 与 {source_year}: {years:?}"
+        );
+        for gap in (stale_year + 1)..source_year {
+            assert!(
+                !years.contains(&gap),
+                "available_years 不该混进空年份 {gap}: {years:?}"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
