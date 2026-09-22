@@ -185,6 +185,40 @@ fn extra_allowed_executables() -> Vec<String> {
 /// 参数总长度上限：超出即拒绝，避免把整份追踪数据塞进一个参数。
 const MAX_ARGS_LEN: usize = 260;
 
+/// 按 shell 风格切分参数：空白分词，但双引号内的空白算作同一个参数。
+///
+/// 只用 `split_whitespace` 会把 `C:\My Notes\日报.txt` 拆成两个参数（第二个
+/// 还带着引号），而引号又被参数白名单禁止 —— 等于「带空格的路径根本表达不出来，
+/// 硬写就被静默拆错」。切分后再逐个校验去引号的值，安全性质不变。
+fn split_args(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut started = false;
+    for c in raw.chars() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                started = true;
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(cur);
+    }
+    out
+}
+
 /// 校验任务参数。
 ///
 /// 定时任务是插件唯一的「带网络出口」通道：Lua 沙箱拿掉 io/os 后没有 socket，
@@ -201,6 +235,9 @@ const MAX_ARGS_LEN: usize = 260;
 /// - 非 ASCII 只允许出现在「盘符绝对路径」里（`C:\笔记\日报.txt`）。这样中文路径可用，
 ///   又不必担心全角 `：／` 之类同形字绕过 scheme 判断——那条 token 不再是纯 ASCII，
 ///   也没有盘符前缀，直接被同一规则拦掉。
+///
+/// 双引号只作**分组**用途（`"C:\My Notes\日报.txt"` 算一个参数）：引号在逐条校验前
+/// 就被 split_args 剥掉，里面的值仍要过同一套规则，所以它不构成绕行口子。
 fn validate_task_args(args: &str) -> anyhow::Result<()> {
     let t = args.trim();
     if t.is_empty() {
@@ -212,7 +249,7 @@ fn validate_task_args(args: &str) -> anyhow::Result<()> {
     if t.chars().any(|c| c.is_control()) {
         anyhow::bail!("任务参数不能包含控制字符");
     }
-    for tok in t.split_whitespace() {
+    for tok in split_args(t) {
         if tok.starts_with('-') || tok.starts_with('/') {
             anyhow::bail!("任务参数不支持命令行开关（发现 {tok}）");
         }
@@ -220,7 +257,7 @@ fn validate_task_args(args: &str) -> anyhow::Result<()> {
             anyhow::bail!("任务参数不支持 UNC 路径（会触发对外主机的 NTLM 认证）");
         }
         if tok.contains([
-            '/', '&', '|', ';', '<', '>', '^', '%', '"', '\'', '?', '#', '@', '*',
+            '/', '&', '|', ';', '<', '>', '^', '%', '\'', '?', '#', '@', '*',
         ]) {
             anyhow::bail!("任务参数包含被禁止的字符或 URL 形态（{tok}）");
         }
@@ -596,7 +633,9 @@ fn execute_task(t: &ScheduledTask) {
     }
     let mut cmd = std::process::Command::new(&t.target_path);
     if !t.args.is_empty() {
-        for arg in t.args.split_whitespace() {
+        // 与校验用的是同一个切分器：校验的是「带空格的一个路径」，启动时也必须
+        // 把它当成一个 argv 传下去（Rust 会自己加引号）。
+        for arg in split_args(&t.args) {
             cmd.arg(arg);
         }
     }
@@ -902,5 +941,40 @@ mod tests {
         );
         assert_eq!(id, -1, "坏参数不应入库");
         assert!(get_all_tasks().is_empty());
+    }
+
+    /// 引号只做分组：`"C:\My Notes\日报.txt"` 是一个参数，不是两个。
+    /// 只用 split_whitespace 会把它劈成 `C:\My` + `Notes\日报.txt`，后者不是盘符
+    /// 路径 → 被拒；而引号本身又被字符黑名单禁止 → 带空格的路径根本没法用。
+    #[test]
+    fn quoted_arg_with_spaces_is_one_token() {
+        assert_eq!(
+            split_args(r#""C:\My Notes\日报.txt" other"#),
+            vec![r"C:\My Notes\日报.txt".to_string(), "other".to_string()]
+        );
+        assert_eq!(split_args(""), Vec::<String>::new());
+        assert_eq!(split_args("   "), Vec::<String>::new());
+        // 引号不闭合也不丢参数（宁可少放行，也不能把后半段漏掉）
+        assert_eq!(
+            split_args(r#""C:\a b.txt"#),
+            vec![r"C:\a b.txt".to_string()]
+        );
+        assert!(validate_task_args(r#""C:\My Notes\日报.txt""#).is_ok());
+    }
+
+    /// 分组能力不能变成绕行口子：引号内的开关、URL、UNC 一样被拒。
+    #[test]
+    fn quoting_does_not_bypass_arg_rules() {
+        for bad in [
+            r#""--app=https://evil.example/?d=1""#,
+            r#""https://evil.example""#,
+            r#""\\evil.example\share\x""#,
+            r#""C:\a.txt" "--user-data-dir=C:\ev""#,
+        ] {
+            assert!(
+                validate_task_args(bad).is_err(),
+                "加引号不该绕过参数校验: {bad}"
+            );
+        }
     }
 }
