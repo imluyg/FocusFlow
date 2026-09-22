@@ -2,9 +2,9 @@
 
 import { invoke, listen } from "./tauri.js";
 import { $ } from "./utils.js";
-import { appState } from "./state.js";
+import { appState, analyticsTab } from "./state.js";
 import { renderPlugins, openPlugin, closePlugin, renderPluginDetail, togglePlugin, pluginBtn, pluginBtnSel, pluginField, pluginFieldStay, pluginSelectRow, pluginSelectAll, modalOpen, modalCancel, modalSubmit, modalAction } from "./plugins.js";
-import { applyLive, applyCharts, renderRank, renderApps, renderDevices, deviceRename, deviceRenameSave, deviceRenameClear, deviceRenameCancel, openDeviceDetail, closeDeviceDetail, deviceDetailSetPeriod, renderGroup, renderTrend, renderHourly, renderWeekday, renderSettings, doImport, doExport, doVacuum, doBackup } from "./views.js";
+import { applyLive, applyCharts, renderRank, renderApps, renderDevices, deviceRename, deviceRenameSave, deviceRenameClear, deviceRenameCancel, openDeviceDetail, closeDeviceDetail, deviceDetailSetPeriod, renderAnalytics, renderTrendChart, renderSettings, doImport, doExport, doVacuum, doBackup } from "./views.js";
 
 export function switchView(view) {
   appState.currentView = view;
@@ -13,7 +13,7 @@ export function switchView(view) {
     b.classList.toggle("active", active);
     b.setAttribute("aria-selected", String(active));
   });
-  const ids = ["rank", "apps", "devices", "group", "trend", "hourly", "weekday", "plugins", "settings"];
+  const ids = ["rank", "apps", "devices", "analytics", "plugins", "settings"];
   ids.forEach((id) => {
     const el = $("view-" + id);
     if (el) el.style.display = id === view ? "" : "none";
@@ -32,10 +32,7 @@ function renderCurrentView() {
     case "rank": return renderRank(appState.chartsData);
     case "apps": return renderApps(appState.chartsData);
     case "devices": return renderDevices(appState.chartsData);
-    case "group": return renderGroup(appState.chartsData);
-    case "trend": return renderTrend(appState.chartsData);
-    case "hourly": return renderHourly(appState.chartsData);
-    case "weekday": return renderWeekday(appState.chartsData);
+    case "analytics": return renderAnalytics(appState.chartsData);
   }
 }
 
@@ -141,7 +138,15 @@ document.querySelectorAll("#trend-days .tab").forEach((b) => {
       x.classList.toggle("active", active);
       x.setAttribute("aria-selected", String(active));
     });
-    if (appState.chartsData) renderTrend(appState.chartsData);
+    if (appState.chartsData) renderTrendChart(appState.chartsData);
+  });
+});
+
+// 活跃分析页内视图切换：改状态后重渲染（renderAnalytics 内部同步页签高亮与分块可见性）
+document.querySelectorAll("#analytics-tabs .tab").forEach((b) => {
+  b.addEventListener("click", () => {
+    analyticsTab.value = b.dataset.at;
+    if (appState.chartsData) renderAnalytics(appState.chartsData);
   });
 });
 

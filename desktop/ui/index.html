@@ -43,10 +43,7 @@
         <button class="tab active" data-view="rank" role="tab" aria-selected="true">键鼠排行</button>
         <button class="tab" data-view="apps" role="tab" aria-selected="false">应用排行</button>
         <button class="tab" data-view="devices" role="tab" aria-selected="false">设备排行</button>
-        <button class="tab" data-view="group" role="tab" aria-selected="false">分组统计</button>
-        <button class="tab" data-view="trend" role="tab" aria-selected="false">趋势图</button>
-        <button class="tab" data-view="hourly" role="tab" aria-selected="false">小时分布</button>
-        <button class="tab" data-view="weekday" role="tab" aria-selected="false">星期分布</button>
+        <button class="tab" data-view="analytics" role="tab" aria-selected="false">活跃分析</button>
         <button class="tab" data-view="plugins" role="tab" aria-selected="false">插件管理</button>
         <button class="tab" data-view="settings" role="tab" aria-selected="false">设置</button>
       </div>
@@ -57,19 +54,27 @@
       <div id="view-rank"></div>
       <div id="view-apps" style="display:none;"></div>
       <div id="view-devices" style="display:none;"></div>
-      <div id="view-group" style="display:none;"></div>
-      <div id="view-trend" style="display:none;">
-        <div class="tabs" id="trend-days">
-          <button class="tab active" data-days="7">近7天</button>
-          <button class="tab" data-days="30">近30天</button>
+      <!-- 活跃分析：页内三视图切换，数据窗口各自固定（见各图标题） -->
+      <div id="view-analytics" style="display:none;">
+        <div class="tabs" id="analytics-tabs" role="tablist" aria-label="分析视图" style="margin-bottom:10px;">
+          <button class="tab active" data-at="trend" role="tab" aria-selected="true">趋势图</button>
+          <button class="tab" data-at="hourly" role="tab" aria-selected="false">小时分布</button>
+          <button class="tab" data-at="weekday" role="tab" aria-selected="false">星期分布</button>
         </div>
-        <div id="trend-chart" style="height:300px;margin-top:8px;"></div>
-      </div>
-      <div id="view-hourly" style="display:none;">
-        <div id="hourly-chart" style="height:300px;margin-top:8px;"></div>
-      </div>
-      <div id="view-weekday" style="display:none;">
-        <div id="weekday-chart" style="height:300px;margin-top:8px;"></div>
+        <div id="ana-trend">
+          <div class="tabs" id="trend-days" role="tablist" aria-label="趋势窗口">
+            <span style="color:var(--muted);font-size:13px;">窗口</span>
+            <button class="tab active" data-days="7" role="tab" aria-selected="true">近7天</button>
+            <button class="tab" data-days="30" role="tab" aria-selected="false">近30天</button>
+          </div>
+          <div id="trend-chart" style="height:300px;margin-top:8px;"></div>
+        </div>
+        <div id="ana-hourly" style="display:none;">
+          <div id="hourly-chart" style="height:300px;"></div>
+        </div>
+        <div id="ana-weekday" style="display:none;">
+          <div id="weekday-chart" style="height:300px;"></div>
+        </div>
       </div>
       <div id="view-plugins" style="display:none;"></div>
       <div id="view-settings" style="display:none;"></div>

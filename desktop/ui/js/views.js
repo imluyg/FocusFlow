@@ -1,8 +1,8 @@
-// 统计视图（排行/分组/趋势/小时/星期）与设置页、数据操作。
+// 统计视图（键鼠排行[排行/分组]、应用排行、设备排行、活跃分析）与设置页、数据操作。
 
 import { invoke, emit } from "./tauri.js";
 import { $, fmt, fmtDuration, escapeHtml, WD } from "./utils.js";
-import { appState, rankFilter } from "./state.js";
+import { appState, rankFilter, rankTab, analyticsTab } from "./state.js";
 import { lineChart, barChart } from "./charts.js";
 
 // ===== 统计快照 =====
@@ -186,7 +186,7 @@ export function renderDevices(s) {
     </tr></thead><tbody>${rows}</tbody></table>`
     : '<div class="empty">该类型暂无设备</div>';
   const note =
-    '<div style="margin-top:8px;font-size:12px;color:var(--muted);">口径说明：设备次数 = 键盘按下 + 鼠标左/右/中键按下 + 滚轮滚动，只统计真实硬件输入（脚本/宏产生的合成输入不计）；与「键鼠排行」的过滤规则不同，两者数字不必相等。<br>设备名可点「改名」自定义（存在 data/device_aliases.json，同型号设备换 USB 口后别名仍生效）。</div>';
+    '<div style="margin-top:8px;font-size:12px;color:var(--muted);">口径说明：设备排行与键鼠排行口径不同，这里按物理动作计次——滚轮每格、按键每次（含长按重复）都算，且只认真实硬件（脚本/宏的模拟输入不计）；键鼠排行则做了滚动合并与长按去重。因此两者数字一般不会相同，设备侧略高属正常。<br>设备名可点「改名」自定义，同型号设备换 USB 口后仍生效。</div>';
   box.innerHTML = head + filterTabs(table) + note;
   bindDeviceFilter(s);
   bindAliasInput();
@@ -381,8 +381,8 @@ function deviceDetailHtml(d) {
     ${keySection}
 
     <div class="dev-detail-line" style="font-size:12px;margin-top:10px;">
-      设备维度为独立口径：键盘按下 + 鼠标左/右/中键按下 + 滚轮，只统计真实硬件输入，
-      与「键鼠排行」的过滤规则不同，两者数字不必相等。
+      设备维度为独立口径，按物理动作计次：滚轮每格、按键每次（含长按重复）都算，只统计真实硬件输入
+      （脚本/宏的模拟输入不计）；键鼠排行做了滚动合并与长按去重，两者数字一般不会相同，设备侧略高属正常。
     </div>
     <div class="setting-row" style="margin-top:10px;">
       <button class="tab active" data-act="device-rename" data-key="${escapeHtml(d.key)}">改名</button>
@@ -398,8 +398,8 @@ function rankIsMouse(k) {
 
 export function renderRank(s) {
   const box = $("view-rank");
-  // 指纹含周期与筛选状态：切周期/切筛选时仍会重建，纯数据推送则跳过
-  const fp = JSON.stringify([s.period, s.rank, s.mouse_total, s.keyboard_total, rankFilter.value]);
+  // 指纹含周期、页内视图（排行/分组）与筛选状态：切换时仍会重建，纯数据推送则跳过
+  const fp = JSON.stringify([s.period, s.rank, s.group, s.mouse_total, s.keyboard_total, s.total, rankFilter.value, rankTab.value]);
   if (skipIfUnchanged(box, fp)) return;
   const summary = (hasData) =>
     `<div class="rank-summary"><span>统计周期：<b>${periodText(s.period)}</b></span>${
@@ -408,6 +408,12 @@ export function renderRank(s) {
         <span>键盘总次数：<b>${fmt(s.keyboard_total)}</b></span>`
         : ""
     }</div>`;
+  // 页内视图切换：分组统计与排行同源同周期（同吃 keys 数据），收进同一页
+  const viewTabs = `<div class="tabs" id="rank-tabs" role="tablist" aria-label="视图" style="margin-bottom:10px;">
+      <span style="color:var(--muted);font-size:13px;">视图</span>
+      <button class="tab ${rankTab.value === "rank" ? "active" : ""}" data-rt="rank" role="tab" aria-selected="${rankTab.value === "rank"}">排行</button>
+      <button class="tab ${rankTab.value === "group" ? "active" : ""}" data-rt="group" role="tab" aria-selected="${rankTab.value === "group"}">分组</button>
+    </div>`;
   const filterTabs = (data) => `<div class="tabs" id="rank-filter" role="tablist" aria-label="排行筛选" style="margin-bottom:10px;">
       <span style="color:var(--muted);font-size:13px;">筛选</span>
       <button class="tab ${rankFilter.value === "all" ? "active" : ""}" data-rf="all" role="tab" aria-selected="${rankFilter.value === "all"}">全部</button>
@@ -415,28 +421,51 @@ export function renderRank(s) {
       <button class="tab ${rankFilter.value === "keyboard" ? "active" : ""}" data-rf="keyboard" role="tab" aria-selected="${rankFilter.value === "keyboard"}">键盘</button>
     </div><div id="rank-result">${data}</div>`;
   const empty = '<div class="empty">暂无数据</div>';
-  if (!s.rank || s.rank.length === 0) {
-    box.innerHTML = summary(false) + filterTabs(empty);
-    bindRankFilter(s);
-    return;
-  }
-  const total = s.total || 0;
-  const src = rankFilter.value === "all"
-    ? s.rank
-    : s.rank.filter(([k]) => (rankFilter.value === "mouse") === rankIsMouse(k));
-  const rows = src
-    .map(
-      ([k, c], i) =>
-        `<tr><td>${i + 1}</td><td class="key">${escapeHtml(k)}</td><td class="num">${fmt(c)}</td><td>${total ? ((c / total) * 100).toFixed(2) : "0.00"}%</td></tr>`
-    )
-    .join("");
-  const table = src.length
-    ? `<table class="grid"><thead><tr>
+  let body;
+  if (rankTab.value === "group") {
+    const rows = (s.group || [])
+      .map(
+        ([k, c]) =>
+          `<tr><td class="key">${escapeHtml(k)}</td><td class="num">${fmt(c)}</td><td>${s.total ? ((c / s.total) * 100).toFixed(2) : "0.00"}%</td></tr>`
+      )
+      .join("");
+    body = viewTabs + (rows
+      ? `<table class="grid"><thead><tr><th>分组</th><th>次数</th><th>占比</th></tr></thead><tbody>${rows}</tbody></table>`
+      : empty);
+  } else if (!s.rank || s.rank.length === 0) {
+    body = viewTabs + filterTabs(empty);
+  } else {
+    const src = rankFilter.value === "all"
+      ? s.rank
+      : s.rank.filter(([k]) => (rankFilter.value === "mouse") === rankIsMouse(k));
+    const rows = src
+      .map(
+        ([k, c], i) =>
+          `<tr><td>${i + 1}</td><td class="key">${escapeHtml(k)}</td><td class="num">${fmt(c)}</td><td>${s.total ? ((c / s.total) * 100).toFixed(2) : "0.00"}%</td></tr>`
+      )
+      .join("");
+    const table = src.length
+      ? `<table class="grid"><thead><tr>
     <th class="col-rank">排名</th><th class="col-key">键鼠</th><th class="col-count">次数</th><th class="col-percent">占比</th>
     </tr></thead><tbody>${rows}</tbody></table>`
-    : empty;
-  box.innerHTML = summary(true) + filterTabs(table);
+      : empty;
+    body = viewTabs + filterTabs(table);
+  }
+  const hasData = rankTab.value === "group"
+    ? !!(s.group && s.group.length)
+    : !!(s.rank && s.rank.length);
+  box.innerHTML = summary(hasData) + body;
+  bindRankTabs(s);
   bindRankFilter(s);
+}
+
+function bindRankTabs(s) {
+  document.querySelectorAll("#rank-tabs .tab").forEach((b) => {
+    b.addEventListener("click", () => {
+      rankTab.value = b.dataset.rt;
+      renderRank(s);
+    });
+  });
 }
 
 function bindRankFilter(s) {
@@ -448,44 +477,41 @@ function bindRankFilter(s) {
   });
 }
 
-export function renderGroup(s) {
-  const box = $("view-group");
-  const fp = JSON.stringify([s.group, s.total]);
-  if (skipIfUnchanged(box, fp)) return;
-  if (!s.group || s.group.length === 0) {
-    box.innerHTML = '<div class="empty">暂无数据</div>';
-    return;
-  }
-  const total = s.total || 0;
-  const rows = s.group
-    .map(
-      ([k, c]) =>
-        `<tr><td class="key">${escapeHtml(k)}</td><td class="num">${fmt(c)}</td><td>${total ? ((c / total) * 100).toFixed(2) : "0.00"}%</td></tr>`
-    )
-    .join("");
-  box.innerHTML = `<table class="grid"><thead><tr>
-    <th>分组</th><th>次数</th><th>占比</th>
-    </tr></thead><tbody>${rows}</tbody></table>`;
-}
+// ===== 活跃分析 =====
+// 趋势 / 小时 / 星期三张图同属「活跃时长」的时间切面，但数据窗口各自固定
+// （趋势 7/30 可切、小时固定今日、星期固定近30天），收进一页做页内切换；
+// 每张图标题自带窗口说明，不再与顶部的统计周期选择器混淆。
 
-// ===== 趋势图 =====
-export function renderTrend(s) {
+// 趋势图单独导出：切「近7天/近30天」时只重绘这一张
+export function renderTrendChart(s) {
   const data = (appState.trendDays === 30 ? s.trend30 : s.trend) || [];
   const mapped = data.map(([date, value]) => ({ date, value }));
-  lineChart($("trend-chart"), "每日活跃趋势", mapped);
+  lineChart($("trend-chart"), `每日活跃趋势（近${appState.trendDays}天）`, mapped);
 }
 
-// ===== 小时 / 星期 =====
-export function renderHourly(s) {
+function renderHourlyChart(s) {
   const hourly = s.hourly || [];
-  const labels = hourly.map((_, h) => h + "时");
-  barChart($("hourly-chart"), "今日每小时活跃", hourly, labels);
+  barChart($("hourly-chart"), "今日每小时活跃", hourly, hourly.map((_, h) => h + "时"));
 }
 
-export function renderWeekday(s) {
+function renderWeekdayChart(s) {
   const weekday = s.weekday || [];
-  const values = weekday.map(([, v]) => v);
-  barChart($("weekday-chart"), "近30天星期活跃", values, WD);
+  barChart($("weekday-chart"), "近30天星期活跃", weekday.map(([, v]) => v), WD);
+}
+
+// 只渲染当前页内视图；分块可见性在这里同步（切页/推送重绘都走这里，状态保持一致）
+export function renderAnalytics(s) {
+  document.querySelectorAll("#analytics-tabs .tab").forEach((b) => {
+    const active = b.dataset.at === analyticsTab.value;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", String(active));
+  });
+  $("ana-trend").style.display = analyticsTab.value === "trend" ? "" : "none";
+  $("ana-hourly").style.display = analyticsTab.value === "hourly" ? "" : "none";
+  $("ana-weekday").style.display = analyticsTab.value === "weekday" ? "" : "none";
+  if (analyticsTab.value === "trend") return renderTrendChart(s);
+  if (analyticsTab.value === "hourly") return renderHourlyChart(s);
+  renderWeekdayChart(s);
 }
 
 // ===== 设置 =====
@@ -554,7 +580,7 @@ export async function renderSettings() {
     // 图表配色取自 CSS 变量：切换主题后立即重绘当前统计视图。
     // 不能只重绘 trend——空闲时后端可能长时间不推送 stats-charts，
     // 停在小时/星期分布页会一直保持旧配色。
-    const chartViews = { rank: renderRank, apps: renderApps, group: renderGroup, trend: renderTrend, hourly: renderHourly, weekday: renderWeekday };
+    const chartViews = { rank: renderRank, apps: renderApps, devices: renderDevices, analytics: renderAnalytics };
     const rerender = chartViews[appState.currentView];
     if (appState.chartsData && rerender) rerender(appState.chartsData);
     // 悬浮窗只在启动时读一次主题，这里广播让它实时跟随
