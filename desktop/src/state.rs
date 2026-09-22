@@ -1334,6 +1334,8 @@ fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartA
     } else {
         daily_all.clone()
     };
+    // 星期分布天然稠密：上面的 needed 恒 >=30 天，而 get_daily_counts
+    // 会把整个窗口零填充，故 7 个星期几必定都有值（可能为 0）。
     let wd = focusflow_core::db::queries::aggregate_weekday(&tail30);
     let mut weekday: Vec<(i64, i64)> = wd.into_iter().collect();
     weekday.sort_by_key(|(d, _)| *d);
@@ -1377,6 +1379,13 @@ mod compute_charts_tests {
         assert_eq!(agg.rank.len(), 0);
         assert_eq!(agg.mouse_total, 0);
         assert_eq!(agg.keyboard_total, 0);
+        // 星期分布必须稠密且按 0..=6 有序：前端按下标对位「周一…周日」标签，
+        // 窗口一旦短于 7 天（见 compute_charts 里 needed 的下限）标签就会错位。
+        assert_eq!(
+            agg.weekday,
+            (0..7).map(|d| (d, 0)).collect::<Vec<(i64, i64)>>(),
+            "星期分布应为 0..=6 七个槽位且按下标有序"
+        );
         focusflow_core::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));
         std::fs::remove_dir_all(&dir).ok();
     }
