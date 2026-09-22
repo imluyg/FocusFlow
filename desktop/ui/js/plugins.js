@@ -280,12 +280,17 @@ export function renderWidget(w) {
 // Esc 关闭最上层的可见弹窗（与关闭按钮行为一致）
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  const overlay = [...document.querySelectorAll(".modal-overlay")].find(
-    (o) => o.style.display !== "none"
-  );
-  if (!overlay) return;
-  const btn = overlay.querySelector(".modal-close");
-  if (btn) btn.click();
+  // 必须用 getComputedStyle：设备详情弹窗靠 CSS 隐藏、没有内联 style，
+  // 判 o.style.display !== "none" 会把它误判为可见（空串 ≠ "none"）。
+  // 取末位是因为各弹窗 z-index 相同，DOM 靠后的才盖在上面。
+  const overlay = [...document.querySelectorAll(".modal-overlay")]
+    .filter((o) => getComputedStyle(o).display !== "none")
+    .at(-1);
+  const btn = overlay?.querySelector(".modal-close");
+  // 本弹窗没有 .modal-close 就不认领：不 preventDefault，
+  // 把 Esc 让给 main.js（它负责关设备弹窗、否则收起主窗口到托盘）。
+  if (!btn) return;
+  btn.click();
   // 标记已消费：main.js 的 Esc（隐藏主窗口）据此跳过，避免关弹窗时把窗口一起藏了
   e.preventDefault();
 });
