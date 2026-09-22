@@ -108,6 +108,18 @@ mod tests {
             );
             // refresh 是各插件共用的动作 id：走一遍 on_action → 宿主 API 调用链
             let _ = manager.plugin_action(&name, "refresh");
+            // 动作之后必须还能重新出图：on_action 改坏了模块级状态（例如把某个
+            // 变量置成面板引用不到的形态）时，用户看到的就是插件页空白。
+            // 刻意不触发 "add" —— 那会真的插入一条定时任务并被调度线程执行。
+            manager
+                .refresh_view(&name)
+                .unwrap_or_else(|e| panic!("{name} 动作之后重新出图失败: {e}"));
+            let after = manager.get_plugin(&name).expect("插件应仍在").view.clone();
+            let widgets = after.expect("重新出图后应有视图");
+            assert!(
+                !widgets.widgets.is_empty(),
+                "{name}（{fpath}）动作后的视图不应为空面板"
+            );
             assert!(
                 manager.unload_plugin(&name),
                 "{name}（{fpath}）应能卸载（cleanup 里报错会残留后台线程）"

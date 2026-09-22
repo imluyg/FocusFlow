@@ -319,6 +319,17 @@ fn validate_task_target(target_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 供 UI / 插件预检：目标程序与参数会不会被接受，返回可读原因。
+///
+/// 入口校验失败原本只进 `tracing` 日志（`add_task` 只回一个 -1），于是插件点
+/// 「添加」后什么都不发生、也没有解释。白名单收紧（canonicalize + 来源目录 +
+/// 参数形态）之后，这种静默失败更容易撞到 —— 这里给一个能拿到文案的口子。
+pub fn check_target(target_path: &str, args: &str) -> Result<(), String> {
+    validate_task_target(target_path)
+        .and_then(|_| validate_task_args(args))
+        .map_err(|e| e.to_string())
+}
+
 /// 添加定时任务。
 pub fn add_task(
     name: &str,

@@ -306,6 +306,16 @@ pub fn register_host_api(
     )?;
     host.set("scheduler_add", add_fn)?;
 
+    // 预检目标 + 参数：返回 (是否可用, 被拒原因)。
+    // 让界面能把「为什么点添加没反应」说清楚，而不是只写进日志。
+    let check_fn = lua.create_function(|_, (target, args): (String, String)| {
+        Ok(match scheduler::check_target(&target, &args) {
+            Ok(()) => (true, String::new()),
+            Err(e) => (false, e),
+        })
+    })?;
+    host.set("scheduler_check_target", check_fn)?;
+
     let update_fn = lua.create_function(
         |_,
          (id, name, target, args, stype, stime, enabled): (
