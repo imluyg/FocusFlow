@@ -41,6 +41,9 @@ export function applyLive(s) {
   });
 
   applyMax(s);
+  // 打卡条的「今日」跟着 live 推送走（目标本身 60 秒才取一次）
+  liveToday = s.today_count;
+  paintGoalStrip();
 }
 
 // 重量数据：图表/排行（低频推送，变化才更新）
@@ -502,6 +505,34 @@ function renderWeekdayChart(s) {
 // 每日目标与连续打卡条。get_goal_status 要扫近 370 天的按日序列，
 // 不能跟着 2 秒一次的图表推送跑，这里自带 60 秒节流。
 let goalFetchedAt = 0;
+// 上次从后端取到的目标信息（含 streak/best/近 7 天），以及 live 推送里的今日数。
+// get_goal_status 要扫近 370 天按日序列，不能跟着 2 秒一次的图表推送跑 —— 但
+// 「今日 x / 目标 y」这一项如果只靠 60 秒节流，就会和顶部每 500ms 更新的
+// 「今日活跃」卡片长时间不一致（卡片 25,300、打卡条还写着 24,900）。
+// 折中：进度与今日数用 live 推送就地补丁，streak/最长天数按 60 秒节流刷新。
+let goalInfo = null;
+let liveToday = null;
+
+function goalToday() {
+  return liveToday == null ? goalInfo.today : liveToday;
+}
+
+function paintGoalStrip() {
+  const box = $("goal-strip");
+  if (!box || !goalInfo) return;
+  const today = Math.max(0, goalToday());
+  const pctv = Math.max(0, Math.min(100, Math.round((today / goalInfo.goal) * 100)));
+  const met = today >= goalInfo.goal;
+  const txt = box.querySelector("#goal-today");
+  const bar = box.querySelector("#goal-bar");
+  const dot = box.querySelector("#goal-dot-today");
+  if (!txt || !bar) return;
+  txt.textContent = `今日 ${fmt(today)} / ${fmt(goalInfo.goal)}`;
+  bar.style.width = pctv + "%";
+  bar.style.background = met ? "var(--success)" : "var(--accent)";
+  if (dot) dot.style.background = met ? "var(--success)" : "var(--grid-line)";
+}
+
 async function refreshGoalStrip(force) {
   const box = $("goal-strip");
   if (!box) return;
@@ -514,19 +545,22 @@ async function refreshGoalStrip(force) {
   } catch (e) {
     return;
   }
-  const pctv = Math.max(0, Math.min(100, Math.round((g.today / g.goal) * 100)));
+  goalInfo = g;
+  const today = Math.max(0, goalToday());
+  const pctv = Math.max(0, Math.min(100, Math.round((today / g.goal) * 100)));
+  const met = today >= g.goal;
   const dots = (g.days || [])
     .map(
-      (d) =>
-        `<span title="${escapeHtml(d.date)}：${fmt(d.count)}" style="width:14px;height:14px;` +
+      (d, i, arr) =>
+        `<span ${i === arr.length - 1 ? 'id="goal-dot-today" ' : ""}title="${escapeHtml(d.date)}：${fmt(d.count)}" style="width:14px;height:14px;` +
         `border-radius:3px;flex:none;background:${d.met ? "var(--success)" : "var(--grid-line)"};"></span>`
     )
     .join("");
   box.innerHTML = `
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
-      <span style="font-weight:600;white-space:nowrap;">今日 ${fmt(g.today)} / ${fmt(g.goal)}</span>
+      <span id="goal-today" style="font-weight:600;white-space:nowrap;">今日 ${fmt(today)} / ${fmt(g.goal)}</span>
       <div style="flex:1;min-width:120px;height:8px;border-radius:4px;background:var(--grid-line);overflow:hidden;">
-        <div style="height:100%;width:${pctv}%;background:${g.todayMet ? "var(--success)" : "var(--accent)"};"></div>
+        <div id="goal-bar" style="height:100%;width:${pctv}%;background:${met ? "var(--success)" : "var(--accent)"};"></div>
       </div>
       <span style="color:var(--muted);font-size:13px;white-space:nowrap;">
         连续打卡 ${g.streak} 天 · 最长 ${g.best} 天
