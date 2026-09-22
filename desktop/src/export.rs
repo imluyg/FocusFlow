@@ -140,66 +140,68 @@ pub fn report_dir() -> std::path::PathBuf {
 }
 
 /// 生成并写出「上一个完整周」（周一~周日）的周报，返回文件路径。
-///
-/// 数据来源全是既有的按日查询：键名排行、应用时长、小时分布各自逐日取回再累加
-/// （7 天 = 7 次查询）。一周只跑一次、且跑在后台线程里，所以不值得为它新增一条
-/// 日期区间查询路径；按日序列（含上一周，用于环比）只需一次 get_daily_counts。
 pub fn write_weekly_report() -> anyhow::Result<std::path::PathBuf> {
-    use chrono::{Datelike, Local as ChLocal, NaiveDate};
+    let (from, to) = focusflow_core::stats::last_finished_week(chrono::Local::now().date_naive());
+    write_weekly_report_for(from, to)
+}
+
+/// 写出指定「周一~周日」区间的周报。
+///
+/// 环比、连续打卡都改用同一批**按日**查询取数，而不是拿「相对今天的 21 天」去套：
+/// 那样只有"上一个整周"这一种取值碰巧落在窗口内，任何历史周（跨年、手动补生成）
+/// 都会静默读到 0 —— 报告照样生成，只是数字全空，最难发现。按日查询自己按日期
+/// 选年度库，所以跨年周（一月的第一个周报正好压在年界上）会把两个库都算进来。
+pub fn write_weekly_report_for(
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) -> anyhow::Result<std::path::PathBuf> {
+    use chrono::Datelike;
     use focusflow_core::db::queries as q;
 
-    let today = ChLocal::now().date_naive();
-    let (from, to) = focusflow_core::stats::last_finished_week(today);
     let goal = focusflow_core::config::instance().get_int("goal", "daily_keys", 20000);
-
-    // 近 21 天：够覆盖本周 + 上一周（环比用），一次查完
-    let daily = q::get_daily_counts(21, None);
-    let day_count = |d: NaiveDate| -> i64 {
-        let key = d.format("%Y-%m-%d").to_string();
-        daily
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, c)| *c)
-            .unwrap_or(0)
-    };
 
     let mut keys: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut apps: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut hourly = [0i64; 24];
-    let mut rows: Vec<(NaiveDate, i64)> = Vec::new();
+    let mut rows: Vec<(chrono::NaiveDate, i64)> = Vec::new();
+    // 上一周 + 本周共 14 天（升序）：环比与连续打卡都从这份算
+    let mut daily: Vec<(String, i64)> = Vec::new();
     let mut keyboard = 0i64;
     let mut mouse = 0i64;
+    let mut prev_total = 0i64;
 
-    let mut day = from;
+    let mut day = from - chrono::Duration::days(7);
     while day <= to {
         let (total, day_keys) = q::get_stats_by_date(day);
-        for (k, c) in &day_keys {
-            *keys.entry(k.clone()).or_insert(0) += *c;
-            if matches!(focusflow_core::format::classify_key(k), "滚轮" | "鼠标点击") {
-                mouse += *c;
-            } else {
-                keyboard += *c;
+        daily.push((day.format("%Y-%m-%d").to_string(), total));
+        if day >= from {
+            rows.push((day, total));
+            for (k, c) in &day_keys {
+                *keys.entry(k.clone()).or_insert(0) += *c;
+                if matches!(focusflow_core::format::classify_key(k), "滚轮" | "鼠标点击") {
+                    mouse += *c;
+                } else {
+                    keyboard += *c;
+                }
             }
-        }
-        rows.push((day, total));
-        let (_, day_apps) = q::get_app_stats_by_date(day);
-        for (a, s) in day_apps {
-            *apps.entry(a).or_insert(0) += s;
-        }
-        for (i, v) in q::get_hourly_stats(Some(day))
-            .into_iter()
-            .take(24)
-            .enumerate()
-        {
-            hourly[i] += v;
+            let (_, day_apps) = q::get_app_stats_by_date(day);
+            for (a, s) in day_apps {
+                *apps.entry(a).or_insert(0) += s;
+            }
+            for (i, v) in q::get_hourly_stats(Some(day))
+                .into_iter()
+                .take(24)
+                .enumerate()
+            {
+                hourly[i] += v;
+            }
+        } else {
+            prev_total += total;
         }
         day += chrono::Duration::days(1);
     }
 
     let total: i64 = rows.iter().map(|(_, c)| c).sum();
-    let prev_total: i64 = (0..7)
-        .map(|i| day_count(from - chrono::Duration::days(i + 1)))
-        .sum();
     let best = rows.iter().max_by_key(|(_, c)| *c).copied();
     let worst = rows.iter().min_by_key(|(_, c)| *c).copied();
     let met_days = rows.iter().filter(|(_, c)| *c >= goal).count();
@@ -217,7 +219,7 @@ pub fn write_weekly_report() -> anyhow::Result<std::path::PathBuf> {
     ));
     out.push_str(&format!(
         "- 生成时间：{}\n",
-        ChLocal::now().format("%Y-%m-%d %H:%M:%S")
+        Local::now().format("%Y-%m-%d %H:%M:%S")
     ));
     let delta = if prev_total > 0 {
         format!(
@@ -251,7 +253,7 @@ pub fn write_weekly_report() -> anyhow::Result<std::path::PathBuf> {
         ));
     }
     out.push_str(&format!(
-        "- 每日目标 {}：达标 {}/7 天；截至本周日连续 {} 天（近 21 天最长 {} 天）\n\n",
+        "- 每日目标 {}：达标 {}/7 天；截至本周日连续 {} 天（近两周最长 {} 天）\n\n",
         fmt_thousands(goal),
         met_days,
         goal_state.streak,
@@ -427,6 +429,73 @@ mod tests {
         assert_eq!(again, path);
         std::fs::remove_dir_all(&dir).ok();
         // 别让下一个用例继续沿着我这份已删掉的目录查年份/连接
+        queries::invalidate_years_cache();
+        Ok(())
+    }
+
+    /// 跨年周：一月的第一个周报正好压在年度库边界上，两个库都必须算进来。
+    ///
+    /// 少查一个库的表现是"报告照样生成、数字偏小"，属于最难被发现的一类错误
+    /// （不 panic、不报错、文件也在），所以把总量直接钉死。
+    #[test]
+    fn weekly_report_spans_year_boundary() -> anyhow::Result<()> {
+        use chrono::NaiveDate;
+        use focusflow_core::db::connection::{ensure_schema, open_rw};
+        use focusflow_core::db::queries;
+        use focusflow_core::paths;
+
+        let _serial = crate::app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_weekly_xyear_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        paths::set_app_dir(&dir);
+        queries::invalidate_years_cache();
+
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let seed = |year: i32, dates: &[NaiveDate], per_day: i64| -> anyhow::Result<()> {
+            let conn = open_rw(&paths::year_db_path(year))?;
+            ensure_schema(&conn, year)?;
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            for d in dates {
+                let k = d.signed_duration_since(epoch).num_days();
+                conn.execute_batch(&format!(
+                    "INSERT INTO daily_counts (date_key, count, seconds) VALUES ({k}, {per_day}, 600);
+                     INSERT OR REPLACE INTO key_counts (date_key, key_name, count) VALUES ({k}, 'A', {per_day});"
+                ))?;
+            }
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        };
+        // 2025-12-29 是周一，2026-01-04 是周日：整周横跨两个年度库
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        seed(
+            2025,
+            &[d(2025, 12, 29), d(2025, 12, 30), d(2025, 12, 31)],
+            10000,
+        )?;
+        seed(
+            2026,
+            &[d(2026, 1, 1), d(2026, 1, 2), d(2026, 1, 3), d(2026, 1, 4)],
+            20000,
+        )?;
+        queries::invalidate_years_cache();
+
+        let path = write_weekly_report_for(d(2025, 12, 29), d(2026, 1, 4))?;
+        let md = std::fs::read_to_string(&path)?;
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            "周报-2025-12-29-2026-01-04.md"
+        );
+        // 3×10000 + 4×20000：只查一个年度库会得到 30,000 或 80,000
+        assert!(
+            md.contains("110,000"),
+            "跨年周必须把两个年度库都算进来：\n{md}"
+        );
+        assert!(md.contains("2025-12-29") && md.contains("2026-01-04"));
+        // 每日表的星期标签按真实星期几走（12-29 周一、01-04 周日）
+        assert!(md.contains("| 2025-12-29 | 周一 |"), "标签错位：\n{md}");
+        assert!(md.contains("| 2026-01-04 | 周日 |"), "标签错位：\n{md}");
+        std::fs::remove_dir_all(&dir).ok();
         queries::invalidate_years_cache();
         Ok(())
     }
