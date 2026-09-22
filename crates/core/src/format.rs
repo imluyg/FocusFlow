@@ -94,11 +94,15 @@ pub fn fmt_thousands(n: i64) -> String {
 }
 
 /// CSV 字段转义：含逗号/引号/换行时加引号并将内部引号双写；
-/// `=`/`+`/`@` 开头加前导单引号，防止 Excel 公式注入。
+/// `=`/`+`/`-`/`@`/Tab/CR 开头加前导单引号，防止 Excel 公式注入。
 ///
 /// 键名来自旧版导入数据与恢复文件，不是可信内部常量，必须转义后再落盘。
+///
+/// `-` 与 `\t` 也在 OWASP 列出的公式前缀里。对本项目 `-` 尤其不是理论风险：
+/// 减号键本身就叫 `-`，`-=~` 这类组合键名会以 `-` 开头，Excel 会按公式求值
+/// （如 `-2+3` → 计算结果，`=cmd()|certutil` 之类可执行外部命令）。
 pub fn csv_field(s: &str) -> String {
-    let escaped = if matches!(s.chars().next(), Some('=' | '+' | '@')) {
+    let escaped = if matches!(s.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r')) {
         format!("'{s}")
     } else {
         s.to_string()
@@ -156,6 +160,12 @@ mod tests {
         assert_eq!(csv_field("=cmd()"), "'=cmd()");
         assert_eq!(csv_field("+1"), "'+1");
         assert_eq!(csv_field("@x"), "'@x");
+        // `-` 与 Tab 也在 OWASP 的公式前缀里，且对本项目不是理论风险：
+        // 减号键的键名就是 "-"，组合键名会是 "-=~-_+" 这类形态。
+        assert_eq!(csv_field("-"), "'-");
+        assert_eq!(csv_field("-=~-_+"), "'-=~-_+");
+        assert_eq!(csv_field("-2+3"), "'-2+3");
+        assert_eq!(csv_field("\tA"), "'\tA");
         // 注入 + 逗号同时命中：先加前导引号，再因逗号整体加引号
         assert_eq!(csv_field("=a,b"), "\"'=a,b\"");
     }

