@@ -440,8 +440,8 @@ fn migrate_v2_file(path: &Path, year: i32) -> i64 {
                     continue;
                 }
                 let rows: Vec<(i64, i64)> = {
-                    let mut q = conn
-                        .prepare("SELECT date_key, count FROM key_counts WHERE key_name = ?1")?;
+                    let mut q =
+                        conn.prepare("SELECT date_key, count FROM key_counts WHERE key_name = ?1")?;
                     let list = q
                         .query_map(rusqlite::params![old], |r| Ok((r.get(0)?, r.get(1)?)))?
                         .collect::<Result<_, _>>()?;
@@ -894,12 +894,22 @@ pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
             remove_backup(&dst);
             // 兜底：checkpoint 后直接复制主文件（复制的是变化中的文件，可能撕裂，
             // 必须校验，避免坏备份顶掉轮转中的好备份）
+            let mut checkpointed = false;
             if let Ok(conn) = connection::open_rw(&src) {
-                let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+                checkpointed = conn
+                    .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+                    .is_ok();
                 drop(conn);
             }
             if std::fs::copy(&src, &dst).is_ok() {
-                write_source_fingerprint(&dst, src_fp);
+                // 只有 checkpoint 成功时 -wal 才算全部并回主文件，整文件复制才是
+                // 完整快照。BUSY 时复制到的是旧的主文件，此时不能盖源库指纹：
+                // 那等于宣称"这份备份已等于源库"，而主文件的 size/mtime 要等下次
+                // checkpoint 才变化，期间的增量会被 year_db_needs_backup 一路跳过。
+                // 不盖指纹正好落回它自己的约定 —— 指纹缺失就保守重备份。
+                if checkpointed {
+                    write_source_fingerprint(&dst, src_fp);
+                }
                 finalize_backup(&dst);
                 ok = verify_backup_file(&dst);
             }
