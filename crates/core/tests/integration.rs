@@ -28,7 +28,10 @@ mod tests {
 
     impl TestEnv {
         fn new(name: &str) -> Self {
-            let guard = test_lock().lock().unwrap();
+            // 不用 unwrap()：前一个用例失败时会把锁弄毒，unwrap 让后续用例全部
+            // 以一样的 PoisonError 崩掉，真正的失败就被盖住了（本仓库其他测试
+            // 也统一用 into_inner 口径）。
+            let guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir().join(format!("ff_rs_{name}_{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             paths::set_app_dir(&dir);
@@ -38,6 +41,27 @@ mod tests {
         fn config(&self) -> FocusFlowConfig {
             FocusFlowConfig::load(self.dir.join("config.ini")).unwrap()
         }
+    }
+
+    /// 关闭数据库，并**等到写线程真的退出**才返回。
+    ///
+    /// `DbWriter::stop()` 只等 3 秒，超时就放弃（并把内存里的增量写进恢复文件）。
+    /// 被放弃的那个线程仍在继续排空，而它落库用的年度库路径是在 flush 那一刻从
+    /// 全局 `app_dir` 现取的 —— 此时下一个用例已经 `set_app_dir` 到自己的目录，
+    /// 于是上一轮的残留事件会写进**别人的库**（实测：`batch_flush_idempotent`
+    /// 的 1 变成 2，且只在负载较高的 `cargo test --workspace` 全量跑时偶发）。
+    /// 用例在释放串行锁之前必须等到线程退出，残留事件才会落在自己的目录里。
+    fn shutdown_and_wait(db: &db::Database, config: &FocusFlowConfig) {
+        let writer = db.writer().cloned();
+        db.shutdown(config);
+        let Some(w) = writer else { return };
+        for _ in 0..200 {
+            if !w.is_alive() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("写线程 10 秒后仍未退出：它随后会在别的用例目录里落库");
     }
 
     impl Drop for TestEnv {
@@ -73,7 +97,7 @@ mod tests {
             assert_eq!(count, 20, "每种键各 20 次");
         }
 
-        db.shutdown(&config);
+        shutdown_and_wait(&db, &config);
     }
 
     #[test]
@@ -89,7 +113,7 @@ mod tests {
         let (total, _) = db::get_stats(None, None);
         assert_eq!(total, 1);
 
-        db.shutdown(&config);
+        shutdown_and_wait(&db, &config);
     }
 
     #[test]
@@ -110,7 +134,7 @@ mod tests {
         assert!(total >= 1000, "应写入大量数据, got {total}");
         assert_eq!(stats.len(), 50, "50 种键都出现");
 
-        db.shutdown(&config);
+        shutdown_and_wait(&db, &config);
     }
 
     #[test]
@@ -168,6 +192,6 @@ mod tests {
             wd
         );
 
-        db.shutdown(&config);
+        shutdown_and_wait(&db, &config);
     }
 }
