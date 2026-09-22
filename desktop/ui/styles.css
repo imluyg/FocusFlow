@@ -339,6 +339,12 @@ input[type="text"] {
 }
 .chart-tip-sub { color: var(--muted); font-size: 11px; }
 
+/* ===== 键盘热力图 ===== */
+/* 配色全在 SVG 属性里（渲染器从 tokens 读实际值），这里只管块级排布与悬停描边 */
+.keyheat-svg { display: block; }
+.keyheat-label { pointer-events: none; }
+.keyheat-key:hover .keyheat-base { stroke: var(--accent); stroke-width: 1.5; }
+
 .rank-summary {
   display: flex;
   gap: 24px;

@@ -3,7 +3,7 @@
 import { invoke, emit } from "./tauri.js";
 import { $, fmt, fmtDuration, escapeHtml, WD } from "./utils.js";
 import { appState, rankFilter, rankTab, analyticsTab } from "./state.js";
-import { lineChart, barChart } from "./charts.js";
+import { lineChart, barChart, renderKeyHeat } from "./charts.js";
 
 // ===== 统计快照 =====
 // 最高单日卡片：今日周期显示"历史最高"作对比目标，其余周期显示窗口内最高单日。
@@ -499,6 +499,59 @@ function renderWeekdayChart(s) {
   barChart($("weekday-chart"), "近30天星期活跃", weekday.map(([, v]) => v), WD);
 }
 
+// 每日目标与连续打卡条。get_goal_status 要扫近 370 天的按日序列，
+// 不能跟着 2 秒一次的图表推送跑，这里自带 60 秒节流。
+let goalFetchedAt = 0;
+async function refreshGoalStrip(force) {
+  const box = $("goal-strip");
+  if (!box) return;
+  const now = Date.now();
+  if (!force && now - goalFetchedAt < 60000) return;
+  goalFetchedAt = now;
+  let g;
+  try {
+    g = await invoke("get_goal_status");
+  } catch (e) {
+    return;
+  }
+  const pctv = Math.max(0, Math.min(100, Math.round((g.today / g.goal) * 100)));
+  const dots = (g.days || [])
+    .map(
+      (d) =>
+        `<span title="${escapeHtml(d.date)}：${fmt(d.count)}" style="width:14px;height:14px;` +
+        `border-radius:3px;flex:none;background:${d.met ? "var(--success)" : "var(--grid-line)"};"></span>`
+    )
+    .join("");
+  box.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+      <span style="font-weight:600;white-space:nowrap;">今日 ${fmt(g.today)} / ${fmt(g.goal)}</span>
+      <div style="flex:1;min-width:120px;height:8px;border-radius:4px;background:var(--grid-line);overflow:hidden;">
+        <div style="height:100%;width:${pctv}%;background:${g.todayMet ? "var(--success)" : "var(--accent)"};"></div>
+      </div>
+      <span style="color:var(--muted);font-size:13px;white-space:nowrap;">
+        连续打卡 ${g.streak} 天 · 最长 ${g.best} 天
+      </span>
+      <span style="display:flex;gap:3px;">${dots}</span>
+    </div>`;
+}
+
+export async function doWeeklyReport() {
+  const msg = $("set-msg");
+  if (msg) {
+    msg.style.color = "var(--muted)";
+    msg.textContent = "正在生成上周周报…";
+  }
+  try {
+    const p = await invoke("get_weekly_report");
+    if (msg) msg.textContent = "周报已生成：" + p;
+  } catch (e) {
+    if (msg) {
+      msg.style.color = "var(--danger)";
+      msg.textContent = "周报生成失败：" + e;
+    }
+  }
+}
+
 // 只渲染当前页内视图；分块可见性在这里同步（切页/推送重绘都走这里，状态保持一致）
 export function renderAnalytics(s) {
   document.querySelectorAll("#analytics-tabs .tab").forEach((b) => {
@@ -509,8 +562,11 @@ export function renderAnalytics(s) {
   $("ana-trend").style.display = analyticsTab.value === "trend" ? "" : "none";
   $("ana-hourly").style.display = analyticsTab.value === "hourly" ? "" : "none";
   $("ana-weekday").style.display = analyticsTab.value === "weekday" ? "" : "none";
+  $("ana-heat").style.display = analyticsTab.value === "heat" ? "" : "none";
+  refreshGoalStrip();
   if (analyticsTab.value === "trend") return renderTrendChart(s);
   if (analyticsTab.value === "hourly") return renderHourlyChart(s);
+  if (analyticsTab.value === "heat") return renderKeyHeat($("key-heat"), s.rank || []);
   renderWeekdayChart(s);
 }
 
@@ -524,6 +580,7 @@ export async function renderSettings() {
   const hotkeyStr = s.hotkey_str;
   const hotkeyError = s.hotkey_error || "";
   const floatingEnabled = s.floating_enabled;
+  const goalKeys = Number(s.goal_daily_keys ?? 20000) || 20000;
   // 备份开关：退出时备份 / 运行中定时备份（0 小时 = 关闭，与 config.ini 同语义）
   const backupOnExit = s.backup_on_exit !== false;
   const backupHours = Number(s.backup_online_hours ?? 24) || 0;
@@ -569,6 +626,17 @@ export async function renderSettings() {
       清空/清理数据、跨年归档前的自动快照始终保留，用于兜底恢复。
     </div>
 
+    <div class="section-title">每日目标与周报</div>
+    <div class="setting-row"><span class="lbl">每日目标次数</span><input type="text" id="set-goal" size="10" value="${goalKeys}"></div>
+    <div style="color:var(--muted);font-size:12px;">
+      达标即算打卡：按整日总活跃次数判定，连续天数显示在「活跃分析」页顶部（今天没达标不清零昨天的纪录）。
+    </div>
+    <div class="setting-row"><button class="btn ghost" data-act="do-weekly-report">立即生成上周周报</button></div>
+    <div style="color:var(--muted);font-size:12px;">
+      应用会在启动后与每周一自动把上一个完整周（周一~周日）汇总成 Markdown 周报，写到 data/reports/ 下；
+      同一周重复生成只会重写同一份文件。
+    </div>
+
     <div class="section-title">数据操作</div>
     <div class="setting-row">
       <button class="btn ghost" data-act="do-import">导入旧数据</button>
@@ -611,6 +679,14 @@ export async function renderSettings() {
   });
   $("set-floating").addEventListener("change", async (e) => {
     await invoke("set_config", { section: "floating", key: "enabled", value: e.target.checked ? "true" : "false" });
+  });
+  // 每日目标：夹到 [1, 5000000]。写回输入框，避免显示与实际生效值不一致
+  $("set-goal").addEventListener("change", async (e) => {
+    const n = Math.floor(Number(e.target.value));
+    const v = Math.max(1, Math.min(5000000, Number.isFinite(n) ? n : 20000));
+    e.target.value = String(v);
+    await invoke("set_config", { section: "goal", key: "daily_keys", value: String(v) });
+    refreshGoalStrip(true);
   });
   // 退出时备份：退出路径每次都重读配置，改完立即生效
   $("set-backup-exit").addEventListener("change", async (e) => {

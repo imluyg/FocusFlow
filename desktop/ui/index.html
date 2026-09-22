@@ -56,10 +56,12 @@
       <div id="view-devices" style="display:none;"></div>
       <!-- 活跃分析：页内三视图切换，数据窗口各自固定（见各图标题） -->
       <div id="view-analytics" style="display:none;">
+        <div id="goal-strip"></div>
         <div class="tabs" id="analytics-tabs" role="tablist" aria-label="分析视图" style="margin-bottom:10px;">
           <button class="tab active" data-at="trend" role="tab" aria-selected="true">趋势图</button>
           <button class="tab" data-at="hourly" role="tab" aria-selected="false">小时分布</button>
           <button class="tab" data-at="weekday" role="tab" aria-selected="false">星期分布</button>
+          <button class="tab" data-at="heat" role="tab" aria-selected="false">键盘热力</button>
         </div>
         <div id="ana-trend">
           <div class="tabs" id="trend-days" role="tablist" aria-label="趋势窗口">
@@ -74,6 +76,12 @@
         </div>
         <div id="ana-weekday" style="display:none;">
           <div id="weekday-chart" style="height:300px;"></div>
+        </div>
+        <div id="ana-heat" style="display:none;">
+          <div style="color:var(--muted);font-size:13px;margin-bottom:6px;">
+            按键热度随顶部统计周期联动；未排在前列的键与不认识的键名显示在下方「其它按键」。
+          </div>
+          <div id="key-heat" style="height:360px;"></div>
         </div>
       </div>
       <div id="view-plugins" style="display:none;"></div>
