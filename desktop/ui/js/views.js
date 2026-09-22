@@ -522,6 +522,7 @@ export async function renderSettings() {
   const paused = s.paused;
   const hotkeyEnabled = s.hotkey_enabled;
   const hotkeyStr = s.hotkey_str;
+  const hotkeyError = s.hotkey_error || "";
   const floatingEnabled = s.floating_enabled;
   // 备份开关：退出时备份 / 运行中定时备份（0 小时 = 关闭，与 config.ini 同语义）
   const backupOnExit = s.backup_on_exit !== false;
@@ -543,6 +544,13 @@ export async function renderSettings() {
     <div class="section-title">全局热键</div>
     <div class="setting-row"><span class="lbl">启用热键</span><input type="checkbox" id="set-hotkey-enabled" ${hotkeyEnabled ? "checked" : ""}></div>
     <div class="setting-row"><span class="lbl">热键组合</span><input type="text" id="set-hotkey-str" value="${escapeHtml(hotkeyStr)}"></div>
+    ${
+      hotkeyEnabled && hotkeyError
+        ? `<div style="font-size:12px;color:var(--danger);margin:4px 0;">热键注册失败：${escapeHtml(
+            hotkeyError
+          )}（换一个组合键，或让开占用者）</div>`
+        : ""
+    }
 
     <div class="section-title">悬浮窗</div>
     <div class="setting-row"><span class="lbl">显示悬浮窗</span><input type="checkbox" id="set-floating" ${floatingEnabled ? "checked" : ""}></div>
@@ -593,9 +601,13 @@ export async function renderSettings() {
   });
   $("set-hotkey-enabled").addEventListener("change", async (e) => {
     await invoke("set_config", { section: "hotkey", key: "enabled", value: e.target.checked ? "true" : "false" });
+    // 重读一遍设置：配置写入成功但注册失败时 set_config 仍返回 Ok（不能拿它
+    // 报错，否则前端以为开关没写上），注册结果只能由 hotkey_error 反映
+    await renderSettings();
   });
   $("set-hotkey-str").addEventListener("change", async (e) => {
     await invoke("set_config", { section: "hotkey", key: "toggle_window", value: e.target.value });
+    await renderSettings();
   });
   $("set-floating").addEventListener("change", async (e) => {
     await invoke("set_config", { section: "floating", key: "enabled", value: e.target.checked ? "true" : "false" });

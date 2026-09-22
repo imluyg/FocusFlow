@@ -43,6 +43,9 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
         "paused": state.listener.is_paused(),
         "hotkey_enabled": c.get("hotkey", "enabled") == "true",
         "hotkey_str": c.get("hotkey", "toggle_window"),
+        // 已启用但注册失败时的原因（空串 = 正常）：组合键常被其它程序占用，
+        // 只有日志的话用户看到的是「开关打开着、按了没反应」
+        "hotkey_error": crate::hotkey::last_error().unwrap_or_default(),
         "floating_enabled": c.get("floating", "enabled") == "true",
         // 备份开关：退出时备份 / 运行中定时备份（0 小时 = 关闭）
         "backup_on_exit": c.get_bool("database", "backup_on_exit", true),
