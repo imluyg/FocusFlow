@@ -352,10 +352,11 @@ fn state_code(s: &str) -> i64 {
     }
 }
 
-/// 保存当前阶段记录（须持有锁）。
-fn save_current(s: &mut TimerState) {
+/// 由当前状态构造待落盘的阶段记录：纯内存、不做 I/O。
+/// `None` 表示该状态无需保存（空闲或尚未计时）。
+fn build_session(s: &TimerState) -> Option<Session> {
     if s.state == STATE_IDLE || s.planned <= 0 {
-        return;
+        return None;
     }
     let now = Local::now();
     let end_time = now.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -369,20 +370,31 @@ fn save_current(s: &mut TimerState) {
     } else {
         s.start_time.clone()
     };
-    let session = Session {
+    Some(Session {
         id: 0,
         rtype: s.state.clone(),
-        start_time: start_time.clone(),
-        end_time: end_time.clone(),
+        start_time,
+        end_time,
         planned_seconds: s.planned,
         actual_seconds: actual,
         key_count: s.key_count,
         created_at: now.format("%Y-%m-%d %H:%M:%S").to_string(),
+    })
+}
+
+/// 保存当前阶段记录（须持有锁）。
+///
+/// 调用方都在主线程（stop/shutdown 由宿主 API 触发），本来就要等这一次
+/// I/O，不会额外冻住别人；计时线程的阶段完成走的是另一条出锁再写的路径。
+fn save_current(s: &mut TimerState) {
+    let Some(session) = build_session(s) else {
+        return;
     };
+    let counted = session.actual_seconds >= 1;
     if let Err(e) = save_session(&session) {
         tracing::error!("保存番茄钟记录失败: {e}");
     }
-    if s.state == STATE_WORK && actual >= 1 {
+    if s.state == STATE_WORK && counted {
         s.work_finished += 1;
     }
 }
@@ -391,18 +403,27 @@ fn save_current(s: &mut TimerState) {
 fn tick_loop(state: Arc<Mutex<TimerState>>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(1000));
-        let mut s = match state.lock() {
-            Ok(g) => g,
-            Err(_) => continue,
-        };
-        if s.state == STATE_IDLE || s.paused {
-            continue;
-        }
-        s.remaining -= 1;
-        s.elapsed += 1;
-        if s.remaining <= 0 {
+        // 锁内只做纯内存的计时与状态推进；阶段完成时要写的记录攒到出锁后落盘。
+        // 原先是持锁 INSERT：SQLite 的 busy_timeout 是 15 秒，一旦库被占住，
+        // 主线程每次按键的 record_key（抢同一把锁）都会跟着卡住整个界面。
+        let session = {
+            let mut s = match state.lock() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            if s.state == STATE_IDLE || s.paused {
+                continue;
+            }
+            s.remaining -= 1;
+            s.elapsed += 1;
+            if s.remaining > 0 {
+                continue;
+            }
             // 阶段完成
-            save_current(&mut s);
+            let session = build_session(&s);
+            if s.state == STATE_WORK && session.as_ref().is_some_and(|x| x.actual_seconds >= 1) {
+                s.work_finished += 1;
+            }
             if s.state == STATE_WORK && s.auto_break {
                 s.state = STATE_BREAK.to_string();
                 s.planned = s.break_minutes * 60;
@@ -416,6 +437,12 @@ fn tick_loop(state: Arc<Mutex<TimerState>>, stop: Arc<AtomicBool>) {
                 s.remaining = 0;
                 s.elapsed = 0;
                 s.key_count = 0;
+            }
+            session
+        };
+        if let Some(session) = session {
+            if let Err(e) = save_session(&session) {
+                tracing::error!("保存番茄钟记录失败: {e}");
             }
         }
     }
