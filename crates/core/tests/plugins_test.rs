@@ -67,6 +67,54 @@ mod tests {
         assert!(manager.get_plugin(&name).is_none());
     }
 
+    /// 全量体检：`crates/core/plugins/` 下每个内置插件都必须能解析、init、
+    /// 渲染出视图，并跑一次 `refresh` 动作走到宿主 API。
+    ///
+    /// 上面的用例只显式加载了 stats_overview.lua，其余内置插件的 Lua 从来没被
+    /// 任何测试执行过 —— 而宿主与 Lua 互不编译，宿主 API 改了形状（例如
+    /// `edge_update_today` 从返回 (ok, today, total) 改成只返回「是否已启动后台
+    /// 刷新」+ 新增 `edge_refresh_state`）时，编译和 clippy 全绿，只有用户在 GUI
+    /// 里点开那个插件才会发现它加载失败。这个测试把这类断裂变成 CI 可见。
+    #[test]
+    fn all_bundled_plugins_load_render_and_act() {
+        let _guard = guard();
+        let dir = std::env::current_dir().unwrap();
+        paths::set_app_dir(&dir);
+        db::queries::invalidate_years_cache();
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
+        ));
+        let database = db::Database::init_readonly();
+        let mut manager = PluginManager::new(config, database);
+
+        let files = manager.discover();
+        assert!(
+            files.len() >= 4,
+            "内置插件目录应有至少 4 个插件，实际 {files:?}"
+        );
+        for f in &files {
+            let fpath = f.display().to_string();
+            let name = manager
+                .load_plugin(f)
+                .unwrap_or_else(|e| panic!("加载内置插件 {fpath} 失败: {e}"));
+            let info = manager.get_plugin(&name).expect("插件应已注册");
+            assert!(
+                info.view.is_some(),
+                "{name}（{fpath}）应渲染出视图 —— init/get_view 里报错会让插件页空白"
+            );
+            assert!(
+                !info.view.as_ref().unwrap().title.is_empty(),
+                "{name} 的视图标题不应为空"
+            );
+            // refresh 是各插件共用的动作 id：走一遍 on_action → 宿主 API 调用链
+            let _ = manager.plugin_action(&name, "refresh");
+            assert!(
+                manager.unload_plugin(&name),
+                "{name}（{fpath}）应能卸载（cleanup 里报错会残留后台线程）"
+            );
+        }
+    }
+
     #[test]
     fn accounting_view_widgets() {
         // 新控件类型（select / modal_form / 分页按钮 disabled）解析回归测试
