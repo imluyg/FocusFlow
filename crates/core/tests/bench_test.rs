@@ -163,6 +163,97 @@ mod tests {
         database.shutdown(&config);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// 度量「每轮 UI 刷新的聚合序列」随年度库个数的变化。
+    ///
+    /// 统计线程每轮会跑 6-8 次「遍历全部年度库」的查询（stats/app/device/daily/
+    /// hourly/alltime），而只读连接池上限是 4 且按 LRU 淘汰 —— 年库一旦超过 4 个，
+    /// 每趟都会重开被挤掉的连接。这个基准用来判断值不值得为此合并扫描趟数，
+    /// 而不是凭猜重构五个查询函数。只打印，不做紧断言（避免 CI 抖动）。
+    #[test]
+    fn aggregation_cost_vs_year_db_count() {
+        let _g = guard();
+        use chrono::Datelike;
+        use std::time::Instant;
+
+        fn seed(years: &[i32]) {
+            let dir = std::env::temp_dir().join(format!("ff_bench_years_{}", std::process::id()));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(dir.join("data")).unwrap();
+            paths::set_app_dir(&dir);
+            db::queries::invalidate_years_cache();
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            for &y in years {
+                let conn = rusqlite::Connection::open(paths::year_db_path(y)).unwrap();
+                db::connection::ensure_schema(&conn, y).unwrap();
+                // 造数整体一个事务：autocommit 下每年 2 万条 = 2 万次 WAL fsync，
+                // 基准本身会跑到分钟级，量不到查询时间
+                conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+                let base = chrono::NaiveDate::from_ymd_opt(y, 1, 1)
+                    .unwrap()
+                    .signed_duration_since(epoch)
+                    .num_days();
+                for d in 0..365 {
+                    let dk = base + d;
+                    conn.execute(
+                        "INSERT OR REPLACE INTO daily_counts (date_key, count, seconds) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![dk, 5000 + d, 3600_i64],
+                    )
+                    .unwrap();
+                    for h in 0..24 {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO hourly_counts (date_key, hour, count) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![dk, h, 200],
+                        )
+                        .unwrap();
+                    }
+                    for k in 0..30 {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO key_counts (date_key, key_name, count) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![dk, format!("K{k}"), 100],
+                        )
+                        .unwrap();
+                    }
+                    conn.execute(
+                        "INSERT OR REPLACE INTO app_usage (date_key, app_name, seconds) VALUES (?1, 'app.exe', 600)",
+                        [dk],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT OR REPLACE INTO device_counts (date_key, device_id, count) VALUES (?1, 1, 900)",
+                        [dk],
+                    )
+                    .unwrap();
+                }
+                conn.execute(
+                    "INSERT OR REPLACE INTO devices (id, device_key, name, kind) VALUES (1, 'k1', 'dev', 'keyboard')",
+                    [],
+                )
+                .unwrap();
+                conn.execute_batch("COMMIT;").unwrap();
+            }
+            db::queries::invalidate_years_cache();
+        }
+
+        let mut report = String::new();
+        for n in [1usize, 4, 7] {
+            let now_year = chrono::Local::now().date_naive().year();
+            let years: Vec<i32> = ((now_year - n as i32 + 1)..=now_year).collect();
+            seed(&years);
+            let t = Instant::now();
+            for _ in 0..10 {
+                let _ = db::get_stats(Some(30), None);
+                let _ = db::get_daily_counts(30, None);
+                let _ = db::queries::get_hourly_stats(None);
+                let _ = db::get_app_stats(Some(30), None);
+                let _ = db::get_device_stats(Some(30), None);
+                let _ = db::get_alltime_summary();
+            }
+            let per = t.elapsed().as_secs_f64() * 1000.0 / 10.0;
+            report.push_str(&format!("  {n} 个年度库：每轮聚合 {per:.2}ms\n"));
+        }
+        println!("聚合序列耗时随年度库个数变化：\n{report}");
+    }
 }
 
 // force rebuild

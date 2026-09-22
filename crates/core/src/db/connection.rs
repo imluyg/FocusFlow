@@ -27,7 +27,13 @@ thread_local! {
 }
 
 // 连接缓存上限：超过则按 LRU 淘汰最久未用的条目，防止多年份库长期运行后无界增长。
-const RO_POOL_MAX: usize = 4;
+//
+// 上限必须容得下「一个用户的全部年度库」，否则每遍历一轮都要重开被挤掉的连接。
+// 实测（bench_test::aggregation_cost_vs_year_db_count，每轮 = 6 个聚合查询）：
+// 7 个年度库时上限 4 → 16.9ms，上限 12 → 10.0ms（−40%）；1/4 库场景不变。
+// 代价是每条缓存连接约 1MB 页缓存（open_ro 里 cache_size=-1024）+ 一个文件句柄，
+// 且只在真正查过这么多年库的线程上增长。
+const RO_POOL_MAX: usize = 12;
 
 /// 使用缓存中的只读连接执行 `f`。连接不存在或打开失败时返回 `None`。
 pub fn with_ro_conn<T>(path: &Path, f: impl FnOnce(&Connection) -> T) -> Option<T> {
