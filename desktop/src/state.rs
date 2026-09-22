@@ -1073,7 +1073,9 @@ fn spawn_stats_worker(
                     std::thread::Builder::new()
                         .name("weekly-report".into())
                         .spawn(|| match crate::export::write_weekly_report() {
-                            Ok(p) => tracing::info!("自动周报已生成: {}", p.display()),
+                            Ok(Some(p)) => tracing::info!("自动周报已生成: {}", p.display()),
+                            // 新装/长期没用：那一周没有记录，本来就没有可报告的
+                            Ok(None) => tracing::debug!("上一个整周没有记录，跳过自动周报"),
                             Err(e) => tracing::warn!("自动周报生成失败: {e}"),
                         })
                         .ok();

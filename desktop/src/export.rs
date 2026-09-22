@@ -140,7 +140,7 @@ pub fn report_dir() -> std::path::PathBuf {
 }
 
 /// 生成并写出「上一个完整周」（周一~周日）的周报，返回文件路径。
-pub fn write_weekly_report() -> anyhow::Result<std::path::PathBuf> {
+pub fn write_weekly_report() -> anyhow::Result<Option<std::path::PathBuf>> {
     let (from, to) = focusflow_core::stats::last_finished_week(chrono::Local::now().date_naive());
     write_weekly_report_for(from, to)
 }
@@ -154,7 +154,7 @@ pub fn write_weekly_report() -> anyhow::Result<std::path::PathBuf> {
 pub fn write_weekly_report_for(
     from: chrono::NaiveDate,
     to: chrono::NaiveDate,
-) -> anyhow::Result<std::path::PathBuf> {
+) -> anyhow::Result<Option<std::path::PathBuf>> {
     use chrono::Datelike;
     use focusflow_core::db::queries as q;
 
@@ -209,6 +209,13 @@ pub fn write_weekly_report_for(
         focusflow_core::stats::goal_status(goal, &daily, &to.format("%Y-%m-%d").to_string());
     let app_total: i64 = apps.values().sum();
     let hour_max = *hourly.iter().max().unwrap_or(&0);
+
+    // 整周（连同一周对比用的上一周）一条记录都没有 → 不生成文件。
+    // 这个函数在每次启动时都会被自动触发一次：新装的机器上写一份全 0 的周报
+    // 只是往 data/reports/ 里堆噪音，还让人以为程序在空转。
+    if total == 0 && prev_total == 0 {
+        return Ok(None);
+    }
 
     let week_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
     let mut out = String::new();
@@ -320,7 +327,7 @@ pub fn write_weekly_report_for(
         to.format("%Y-%m-%d")
     ));
     std::fs::write(&path, out).with_context(|| format!("写入失败: {}", path.display()))?;
-    Ok(path)
+    Ok(Some(path))
 }
 
 #[cfg(test)]
@@ -334,6 +341,28 @@ mod tests {
         m.insert("B".to_string(), 10);
         m.insert("鼠标左键".to_string(), 30);
         m
+    }
+
+    /// 空周不产出文件：自动触发点在统计线程的第一轮循环里，也就是**每次启动**
+    /// 都会走一次。新装的机器那一周没有任何记录，写一份全 0 的周报只是噪音。
+    #[test]
+    fn weekly_report_skips_week_without_data() -> anyhow::Result<()> {
+        use chrono::NaiveDate;
+        use focusflow_core::paths;
+
+        let _serial = crate::app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_weekly_empty_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        paths::set_app_dir(&dir);
+        focusflow_core::db::queries::invalidate_years_cache();
+
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        let r = write_weekly_report_for(d(2020, 3, 2), d(2020, 3, 8))?;
+        assert!(r.is_none(), "没有任何记录时不该生成文件");
+        assert!(!report_dir().exists(), "连 reports/ 目录都不该被创建出来");
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[test]
@@ -396,7 +425,7 @@ mod tests {
         drop(conn);
         queries::invalidate_years_cache();
 
-        let path = write_weekly_report()?;
+        let path = write_weekly_report()?.expect("有数据时应生成文件");
         let md = std::fs::read_to_string(&path)?;
 
         assert!(path.starts_with(paths::data_dir().join("reports")));
@@ -425,7 +454,7 @@ mod tests {
         assert!(md.contains("鼠标左键"));
         assert!(md.contains("code.exe"));
         // 重跑一次：同一周必须落在同一个文件（幂等，不产生第二份）
-        let again = write_weekly_report()?;
+        let again = write_weekly_report()?.expect("重跑应仍指向同一文件");
         assert_eq!(again, path);
         std::fs::remove_dir_all(&dir).ok();
         // 别让下一个用例继续沿着我这份已删掉的目录查年份/连接
@@ -480,7 +509,9 @@ mod tests {
         )?;
         queries::invalidate_years_cache();
 
-        let path = write_weekly_report_for(d(2025, 12, 29), d(2026, 1, 4))?;
+        let path = write_weekly_report_for(d(2025, 12, 29), d(2026, 1, 4))
+            .expect("跨年周不应报错")
+            .expect("跨年周应生成");
         let md = std::fs::read_to_string(&path)?;
         assert_eq!(
             path.file_name().unwrap().to_string_lossy(),

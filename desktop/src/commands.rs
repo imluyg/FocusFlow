@@ -88,9 +88,9 @@ pub async fn get_goal_status(state: State<'_, Arc<AppState>>) -> Result<serde_js
 /// 平时由统计线程在启动/跨周时自动触发（见 state::spawn_stats_worker）；
 /// 这个入口给设置页的「立即生成」按钮用。
 #[tauri::command]
-pub async fn get_weekly_report() -> Result<String, String> {
+pub async fn get_weekly_report() -> Result<Option<String>, String> {
     crate::export::write_weekly_report()
-        .map(|p| p.display().to_string())
+        .map(|p| p.map(|p| p.display().to_string()))
         .map_err(|e| e.to_string())
 }
 

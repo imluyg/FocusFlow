@@ -543,7 +543,7 @@ export async function doWeeklyReport() {
   }
   try {
     const p = await invoke("get_weekly_report");
-    if (msg) msg.textContent = "周报已生成：" + p;
+    if (msg) msg.textContent = p ? "周报已生成：" + p : "上一个整周没有任何记录，未生成文件";
   } catch (e) {
     if (msg) {
       msg.style.color = "var(--danger)";
