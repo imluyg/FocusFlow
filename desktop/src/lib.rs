@@ -200,6 +200,9 @@ pub fn run() {
                         }
                     }
                 }
+                // 放在所有关闭动作之后：上面这些过程本身也要留日志，而非阻塞
+                // 日志 worker 的缓冲区不显式释放，进程一退最后几条就没了
+                focusflow_core::logger::shutdown();
             }
         });
 }

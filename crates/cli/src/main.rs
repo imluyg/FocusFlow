@@ -23,6 +23,9 @@ fn main() -> ExitCode {
     logger::init_logging();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = run(&args);
+    // 返回前把非阻塞日志缓冲里的内容写完：main 一返回进程就终止，static 里的
+    // WorkerGuard 不会自动析构，最后那几条日志（往往正是出错时最想要的）会丢
+    logger::shutdown();
     ExitCode::from(code as u8)
 }
 
