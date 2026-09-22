@@ -79,7 +79,9 @@
         </div>
         <div id="ana-heat" style="display:none;">
           <div style="color:var(--muted);font-size:13px;margin-bottom:6px;">
-            按键热度随顶部统计周期联动；未排在前列的键与不认识的键名显示在下方「其它按键」。
+            按键热度随顶部统计周期联动，取**排行前 100 名**的键（与排行榜同一份数据）：
+            没进前 100 的键、移位产生的符号名（`!` `@`）与旧版导入的遗留键名，
+            都列在下方「其它按键」。板上显示为「冷」只说明它不在这前 100 里，不等于没按过。
           </div>
           <div id="key-heat" style="height:360px;"></div>
         </div>

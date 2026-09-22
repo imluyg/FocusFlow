@@ -102,6 +102,11 @@ const BLOCKED_EXECUTABLES: [&str; 16] = [
 /// 默认只放行常见「用户应用」：即便插件作者是恶意的，也无法借此启动解释器
 /// 或系统二进制。用户可在 `config.ini` 的 `[scheduler] allow_extra` 里追加
 /// 自己的白名单（逗号分隔的文件名），扩展时仍受 [`BLOCKED_EXECUTABLES`] 约束。
+///
+/// 这套控制挡住的是「文件名伪装」（改名、`..\`、8.3 短名、符号链接、非受信
+/// 目录），挡不住**内容伪装**：能在 `C:\Windows\System32` 里创建一个硬链接并
+/// 命名为 `calc.exe` 的前提是已经有管理员写权限，那时也不必绕这个白名单。
+/// 也就是说这里的信任边界是「系统目录里的文件由 Windows 保护」，不是文件哈希。
 const ALLOWED_EXECUTABLES: [&str; 24] = [
     "notepad.exe",
     "write.exe",
@@ -920,6 +925,95 @@ mod tests {
             "C:\\Windows\\System32\\config.ini",
         ] {
             assert!(validate_task_args(ok).is_ok(), "合法参数应放行: {ok}");
+        }
+    }
+
+    /// 对抗性输入清单：白名单收紧后能想到的绕过与误杀形态。
+    ///
+    /// 期望值分两类写死：**必须拒**的（各种绕过尝试）与**必须放行**的
+    /// （只是写法不同、实际就是受信程序的那些，拒了就是误伤用户）。
+    #[test]
+    fn adversarial_target_shapes() {
+        let _g = isolate_app_dir("adversarial");
+        let sys32 = std::path::Path::new(r"C:\Windows\System32");
+        if !sys32.is_dir() {
+            return; // 非 Windows
+        }
+        let deny = [
+            // 各种指向 cmd.exe 的写法
+            r"C:\Windows\System32\cmd.exe",
+            r"C:\Windows\..\Windows\System32\cmd.exe",
+            r"\\?\C:\Windows\System32\cmd.exe",
+            r"C:\Windows\Temp\..\System32\cmd.exe",
+            // 改名伪装：白名单名字出现在非受信目录
+            r"C:\Users\Public\calc.exe",
+            r"C:\Windows\Temp\notepad.exe",
+            // 链接目标不可控 / 经不起 canonicalize
+            r"C:\Users\Public\anything.lnk",
+            r"C:\Users\Public\daily.bat",
+            r"C:\Users\Public\daily.cmd",
+            r"C:\Users\Public\notes.txt",
+            // 目录、UNC、不存在的文件
+            r"C:\Windows\System32",
+            r"\\localhost\C$\Windows\System32\notepad.exe",
+            r"C:\Windows\System32\definitely_not_here_9x.exe",
+            // 相对路径
+            r"notepad.exe",
+        ];
+        for t in deny {
+            let e = validate_task_target(t);
+            assert!(e.is_err(), "该被拒绝却放行了: {t}");
+        }
+        // 同一批真实程序，只是写法不同：拒了就是误伤
+        let allow = [
+            r"C:\Windows\System32\notepad.exe",
+            r"C:/Windows/System32/notepad.exe",
+            r"C:\Windows\System32\NOTEPAD.EXE",
+            r"C:\Windows\..\Windows\System32\notepad.exe",
+            r"C:\Windows\SysWOW64\..\System32\notepad.exe",
+        ];
+        for t in allow {
+            if let Err(e) = validate_task_target(t) {
+                // 只允许因为「这个文件在这台机器上确实不在」而失败
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("不可用") || msg.contains("不在定时任务白名单"),
+                    "合法写法被规则拒绝: {t} -> {msg}"
+                );
+            }
+        }
+    }
+
+    /// 参数侧的对抗形态：全角同形字、多参数、控制字符、长度上限。
+    #[test]
+    fn adversarial_arg_shapes() {
+        let _g = isolate_app_dir("adversarial_args");
+        let deny = [
+            "https：／／evil.example", // 全角冒号斜杠
+            "http://evil.example\\@ok.com",
+            "C:\\a.txt\nD:\\b.txt",            // 换行造出第二个参数
+            "C:\\a.txt\r\n--app=https://evil", // 回车换行同上
+            "\u{0}C:\\a.txt",                  // NUL
+            "\u{7}C:\\a.txt",                  // DEL
+            "--",
+            "-",
+            "C:\\a.txt\tD:\\b.txt", // Tab 分词
+            "https:/evil.example",
+            "file:C:\\Windows\\System32\\cmd.exe",
+        ];
+        for a in deny {
+            assert!(validate_task_args(a).is_err(), "该被拒绝却放行了: {a:?}");
+        }
+        // 超长（查询字符串正是外带的常见形态）
+        let long = format!("C:\\a.txt?d={}", "k".repeat(300));
+        assert!(validate_task_args(&long).is_err(), "超长参数应被拒");
+        for a in [
+            "",
+            "C:\\a.txt",
+            "\"C:\\My Notes\\日报.txt\"",
+            "C:\\a.txt C:\\b.txt",
+        ] {
+            assert!(validate_task_args(a).is_ok(), "合法参数被拒: {a:?}");
         }
     }
 
