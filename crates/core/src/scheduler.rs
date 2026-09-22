@@ -785,13 +785,18 @@ pub fn validate_schedule(schedule_type: &str, schedule_time: &str) -> (bool, Str
 mod tests {
     use super::*;
 
-    fn isolate_app_dir(tag: &str) -> std::sync::MutexGuard<'static, ()> {
+    /// 串行锁 + 隔离目录；返回值活着期间两者都在，离开作用域删目录。
+    ///
+    /// 原来只回锁不回目录，`ff_sched_*` 每个用例每跑一次就在 %TEMP% 留一份
+    /// （调度器有 8 个用例 → 每轮 +8）。目录删除前先清只读连接池，
+    /// 否则 Windows 下句柄未放，remove_dir_all 静默失败。
+    fn isolate_app_dir(
+        tag: &str,
+    ) -> (std::sync::MutexGuard<'static, ()>, crate::paths::TestAppDir) {
         let lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_sched_{tag}_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let dir = crate::paths::test_app_dir(&format!("sched_{tag}"));
         let _ = crate::config::instance();
-        lock
+        (lock, dir)
     }
 
     /// 回归：插件可通过 `scheduler_add` 启动任意程序，绕过 io/os 沙箱。

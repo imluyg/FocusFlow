@@ -1209,6 +1209,7 @@ version = "0.2.2"
 dependencies = [
  "anyhow",
  "chrono",
+ "focusflow-core",
  "mlua",
  "rdev",
  "rusqlite",

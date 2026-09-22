@@ -76,7 +76,11 @@ impl TestAppDir {
 #[cfg(any(test, feature = "test-utils"))]
 impl Drop for TestAppDir {
     fn drop(&mut self) {
-        // 删不掉就算了：%TEMP% 由系统回收，不能因为清理失败让测试报错
+        // 先放掉本线程池子里的只读连接，再删目录。
+        // Windows 上目录里还有打开的句柄时 remove_dir_all 会失败，而这些测试正是
+        // 靠 with_ro_conn 的线程本地缓存反复读年度库的 —— 不先清缓存，删除就静默
+        // 返回 Err，于是每个用例每跑一次留一个目录（实测所有前缀一律 +1/run）。
+        crate::db::connection::clear_ro_cache();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

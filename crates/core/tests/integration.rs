@@ -66,6 +66,9 @@ mod tests {
 
     impl Drop for TestEnv {
         fn drop(&mut self) {
+            // 先放掉本线程的只读连接：Windows 下目录里还有打开的句柄时
+            // remove_dir_all 会静默失败，于是每跑一次留一个目录。
+            focusflow_core::db::connection::clear_ro_cache();
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }

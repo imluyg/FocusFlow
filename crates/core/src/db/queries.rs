@@ -1254,10 +1254,7 @@ mod tests {
     #[test]
     fn available_years_skips_empty_shell_dbs() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_years_shell_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(dir.join("data")).unwrap();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("years_shell");
         invalidate_years_cache();
 
         // 2031：只有表结构的空壳；2032：有一行聚合数据
@@ -1285,8 +1282,6 @@ mod tests {
             available_years().contains(&2033),
             "损坏的年度库应按「有数据」保守处理"
         );
-        std::fs::remove_dir_all(&dir).ok();
-        invalidate_years_cache();
     }
 
     /// 周期合法性守卫：-1/0/N 合法，其他负值与超大天数非法。
