@@ -113,6 +113,107 @@ pub fn cpm(config: &'static FocusFlowConfig) -> Arc<CpmCalculator> {
     }))
 }
 
+/// 每日目标与连续打卡的结果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalStatus {
+    pub goal: i64,
+    /// 今日次数（尚未落库的增量不在内，统计线程会补）
+    pub today: i64,
+    /// 今日是否已达标
+    pub today_met: bool,
+    /// 连续达标天数。今天还没达标时，从昨天往回数——否则每天零点一到
+    /// 连续记录就会清零，用户会看到「连了 20 天突然变 0」。
+    pub streak: i64,
+    /// 回看窗口内的最长连续纪录
+    pub best: i64,
+    /// 最近 7 天（旧→新）：(日期, 次数, 是否达标)
+    pub days: Vec<(String, i64, bool)>,
+}
+
+/// 由「按日计数」序列算出每日目标达成与连续打卡。
+///
+/// `rows` 来自 `db::get_daily_counts`（升序、只含库里有的日期）；缺口日期按 0 处理。
+/// 纯函数，便于覆盖跨年、缺口、今天未达标这些真实会踩到的边界。
+pub fn goal_status(goal: i64, rows: &[(String, i64)], today: &str) -> GoalStatus {
+    use chrono::{Local, NaiveDate};
+    let map: std::collections::HashMap<&str, i64> =
+        rows.iter().map(|(d, c)| (d.as_str(), *c)).collect();
+    let goal = goal.max(1);
+    let count_of = |d: NaiveDate| -> i64 {
+        map.get(d.format("%Y-%m-%d").to_string().as_str())
+            .copied()
+            .unwrap_or(0)
+    };
+    let today_d =
+        NaiveDate::parse_from_str(today, "%Y-%m-%d").unwrap_or_else(|_| Local::now().date_naive());
+
+    let today_count = count_of(today_d);
+    let today_met = today_count >= goal;
+
+    // 连续天数：今天达标则 +1，再从昨天往回数。今天还没达标不清零——
+    // 否则每天零点一到，昨天的纪录就凭空消失，用户会看到「连了 20 天突然变 0」。
+    let mut streak = if today_met { 1 } else { 0 };
+    let mut day = today_d - chrono::Duration::days(1);
+    while count_of(day) >= goal {
+        streak += 1;
+        day -= chrono::Duration::days(1);
+    }
+
+    // 最长纪录：扫描回看窗口
+    let mut best = 0i64;
+    let mut run = 0i64;
+    for d in rows {
+        if d.1 >= goal {
+            run += 1;
+            best = best.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    best = best.max(streak);
+
+    let days = (0..7i64)
+        .rev()
+        .map(|i| {
+            let d = today_d - chrono::Duration::days(i);
+            let key = d.format("%Y-%m-%d").to_string();
+            let c = count_of(d);
+            (key, c, c >= goal)
+        })
+        .collect();
+
+    GoalStatus {
+        goal,
+        today: today_count,
+        today_met,
+        streak,
+        best,
+        days,
+    }
+}
+
+/// 「刚结束的那一周」= 上一个完整的周一~周日。
+///
+/// 周报只能在整周结束后生成，所以锚点是本周一：不管今天周二还是周日，
+/// 算出来的都是同一个区间，进程重启也不会多生成一份别的周。
+pub fn last_finished_week(today: chrono::NaiveDate) -> (chrono::NaiveDate, chrono::NaiveDate) {
+    use chrono::{Datelike, Duration, Weekday};
+    let since_monday = match today.weekday() {
+        Weekday::Mon => 0,
+        Weekday::Tue => 1,
+        Weekday::Wed => 2,
+        Weekday::Thu => 3,
+        Weekday::Fri => 4,
+        Weekday::Sat => 5,
+        Weekday::Sun => 6,
+    };
+    let this_monday = today - Duration::days(since_monday);
+    (
+        this_monday - Duration::days(7),
+        this_monday - Duration::days(1),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +245,92 @@ mod tests {
         assert_eq!(calc.get_cpm(), 5, "窗口远超开机时长：没有一条记录算过期");
         calc.reset();
         assert_eq!(calc.get_cpm(), 0);
+    }
+
+    fn rows(v: &[(&str, i64)]) -> Vec<(String, i64)> {
+        v.iter().map(|(d, c)| (d.to_string(), *c)).collect()
+    }
+
+    /// 今天还没达标时，已有的连续纪录不得被清零。
+    #[test]
+    fn streak_survives_unfinished_today() {
+        let s = goal_status(
+            20000,
+            &rows(&[
+                ("2026-09-19", 30000),
+                ("2026-09-20", 25000),
+                ("2026-09-21", 500),
+            ]),
+            "2026-09-21",
+        );
+        assert!(!s.today_met);
+        assert_eq!(s.streak, 2, "零点不该把昨天的纪录抹掉");
+        assert_eq!(s.best, 2);
+    }
+
+    /// 达标日必须连续：中间断一天就重新计数，但最长纪录仍记住断点之前。
+    #[test]
+    fn streak_breaks_on_gap_and_best_keeps_longest_run() {
+        let s = goal_status(
+            20000,
+            &rows(&[
+                ("2026-09-15", 40000),
+                ("2026-09-16", 40000),
+                ("2026-09-17", 40000),
+                ("2026-09-18", 1),
+                ("2026-09-19", 1),
+                ("2026-09-20", 40000),
+                ("2026-09-21", 40000),
+            ]),
+            "2026-09-21",
+        );
+        assert!(s.today_met);
+        assert_eq!(s.streak, 2, "断了两天之后不该接上更早的三连");
+        assert_eq!(s.best, 3);
+        assert_eq!(s.days.len(), 7);
+        assert_eq!(s.days[6], ("2026-09-21".to_string(), 40000, true));
+        assert_eq!(s.days[4].0, "2026-09-19");
+        assert!(!s.days[4].2);
+    }
+
+    /// 空库 / 没有当日记录：全 0，不 panic、不除零；非法目标值按 1 处理。
+    #[test]
+    fn goal_status_handles_empty_history() {
+        let s = goal_status(20000, &[], "2026-09-21");
+        assert_eq!((s.today, s.streak, s.best, s.today_met), (0, 0, 0, false));
+        assert_eq!(s.days.len(), 7);
+        assert!(s.days.iter().all(|(_, c, met)| *c == 0 && !*met));
+        assert_eq!(
+            goal_status(0, &rows(&[("2026-09-21", 1)]), "2026-09-21").streak,
+            1,
+            "目标 0 会让任何非零天数都永不达标，按 1 兜住"
+        );
+    }
+
+    /// 周报锚点：永远是「上一个完整周」，且同一周内天天算出同一个区间。
+    #[test]
+    fn last_finished_week_is_the_previous_full_week() {
+        use chrono::NaiveDate as D;
+        let d = |y, m, day| D::from_ymd_opt(y, m, day).unwrap();
+        // 2026-09-22 是周二 → 上周一 09-14 ~ 上周日 09-20
+        assert_eq!(
+            last_finished_week(d(2026, 9, 22)),
+            (d(2026, 9, 14), d(2026, 9, 20))
+        );
+        // 周一当天：本周一 09-21，上一个整周仍是 09-14~09-20（与周二同区间 → 一周只生成一次）
+        assert_eq!(
+            last_finished_week(d(2026, 9, 21)),
+            (d(2026, 9, 14), d(2026, 9, 20))
+        );
+        // 周日当天不能把自己这一周算进去
+        assert_eq!(
+            last_finished_week(d(2026, 9, 20)),
+            (d(2026, 9, 7), d(2026, 9, 13))
+        );
+        // 跨年
+        assert_eq!(
+            last_finished_week(d(2026, 1, 1)),
+            (d(2025, 12, 22), d(2025, 12, 28))
+        );
     }
 }

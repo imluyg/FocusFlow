@@ -1009,6 +1009,8 @@ fn spawn_stats_worker(
                                                    // 时，重聚合只会重复算出同样结果——增量都在写线程内存里，flush 前不进库。
             let mut charts_seq: u64 = u64::MAX;
             let mut charts_period: i64 = i64::MIN;
+            // 上次生成自动周报的锚点（上一个整周周一的 CE 天序号）
+            let mut last_report_week: i64 = 0;
 
             loop {
                 let period_val = period.load(Ordering::Relaxed);
@@ -1053,6 +1055,29 @@ fn spawn_stats_worker(
                     u64::MAX
                 };
                 let do_heavy = forced || period_changed || heavy_elapsed_ms >= heavy_interval_ms;
+
+                // 自动周报：进程启动后的第一轮、以及跨进新一周后的第一轮，为
+                // 「刚结束的那个整周」生成一次 Markdown 报告。锚点取本周一，
+                // 所以同一周内 marker 恒定 —— 每周最多一次，重启也只是重写同一份
+                // 文件。生成要跑 7 天的聚合查询，放进独立线程，不占用本线程的
+                // 500ms 快节奏。
+                let week_marker = {
+                    use chrono::Datelike;
+                    let (f, _) = focusflow_core::stats::last_finished_week(
+                        chrono::Local::now().date_naive(),
+                    );
+                    f.num_days_from_ce() as i64
+                };
+                if week_marker != last_report_week {
+                    last_report_week = week_marker;
+                    std::thread::Builder::new()
+                        .name("weekly-report".into())
+                        .spawn(|| match crate::export::write_weekly_report() {
+                            Ok(p) => tracing::info!("自动周报已生成: {}", p.display()),
+                            Err(e) => tracing::warn!("自动周报生成失败: {e}"),
+                        })
+                        .ok();
+                }
 
                 if do_heavy {
                     let flush_seq = db.writer().map(|w| w.flush_seq()).unwrap_or(0);

@@ -119,6 +119,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_live,
             commands::get_charts,
+            commands::get_goal_status,
+            commands::get_weekly_report,
             commands::get_settings,
             commands::get_version,
             commands::get_vibrancy,

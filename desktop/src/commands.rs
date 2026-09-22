@@ -51,7 +51,47 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
         "backup_on_exit": c.get_bool("database", "backup_on_exit", true),
         "backup_online_hours": c.get_int("database", "online_backup_interval_hours", 24),
         "max_backups": c.get_int("database", "max_backups", 5),
+        // 每日目标次数（连续打卡的判定线）
+        "goal_daily_keys": c.get_int("goal", "daily_keys", 20000),
     })
+}
+
+/// 每日目标与连续打卡。
+///
+/// async：判定要读近 370 天的按日序列（可能跨两个年度库），同步命令会把这次
+/// 扫描压在主线程上 —— 与 `get_charts` 同一个理由挪到运行时线程。
+#[tauri::command]
+pub async fn get_goal_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let goal = state.config.get_int("goal", "daily_keys", 20000).max(1);
+    let rows = focusflow_core::db::queries::get_daily_counts(370, None);
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let s = focusflow_core::stats::goal_status(goal, &rows, &today);
+    Ok(serde_json::json!({
+        "goal": s.goal,
+        "today": s.today,
+        "todayMet": s.today_met,
+        "streak": s.streak,
+        "best": s.best,
+        "days": s
+            .days
+            .iter()
+            .map(|(d, c, m)| serde_json::json!({ "date": d, "count": c, "met": m }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// 立即生成「上一个完整周」的周报，返回文件路径。
+///
+/// 平时由统计线程在启动/跨周时自动触发（见 state::spawn_stats_worker）；
+/// 这个入口给设置页的「立即生成」按钮用。
+#[tauri::command]
+pub async fn get_weekly_report() -> Result<String, String> {
+    crate::export::write_weekly_report()
+        .map(|p| p.display().to_string())
+        .map_err(|e| e.to_string())
 }
 
 /// 返回应用版本号（单一来源：Cargo 包版本）。
