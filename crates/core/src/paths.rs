@@ -40,10 +40,61 @@ pub fn set_app_dir(dir: impl Into<PathBuf>) {
 /// 测试专用：切换全局 app_dir 的测试必须持有此锁跑完全程。
 /// 并行测试共享进程级全局路径，不加锁会互相改写（DB/恢复文件写错位置、
 /// 启动回放误删其他测试刚写入的恢复文件）。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
 pub fn test_app_dir_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// 测试专用的临时程序目录：**Drop 时删除目录**。
+///
+/// 为什么要有它：各测试原来自己 `temp_dir().join(format!("ff_x_{}_{}", pid, 纳秒))`
+/// 并在函数末尾手写一行 `remove_dir_all` —— 名字每轮都新，收尾又只在断言全过时
+/// 才执行，于是一次失败（或干脆忘了写）就在 %TEMP% 里永久留下一份 SQLite 库。
+/// 实测本机 %TEMP% 已堆到 2666 个目录 / 1.4GB，其中 `ff_acc_test_*` 一个前缀 333 个。
+///
+/// 两点刻意保留：
+/// - 名字继续带 pid+纳秒：同一进程内多个用例必须各用一套目录，否则互相看数据；
+/// - **不加串行锁**：`app_dir` 的串行由各用例自己的 `test_app_dir_lock()` 负责，
+///   这里再拿一次就是重入 std::Mutex（不可重入）→ 直接死锁。
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub struct TestAppDir {
+    dir: PathBuf,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl TestAppDir {
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Drop for TestAppDir {
+    fn drop(&mut self) {
+        // 删不掉就算了：%TEMP% 由系统回收，不能因为清理失败让测试报错
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// 建一个隔离的临时程序目录并切过去；返回值守着期间目录可用，离开作用域自动删除
+/// （含 panic / 断言失败路径）。
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn test_app_dir(tag: &str) -> TestAppDir {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("ff_{tag}_{}_{nanos}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("data")).expect("创建临时程序目录失败");
+    set_app_dir(&dir);
+    TestAppDir { dir }
 }
 
 /// 程序目录。

@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# 只在开发期存在：把「测试用的临时程序目录」助手暴露给 tests/ 下的集成测试。
+# 集成测试链接的是不带 cfg(test) 的库，拿不到 #[cfg(test)] 项；用特征开关 shared
+# 一份实现，免得每个测试文件各自复制一份、各自漏掉清理。正常构建（含发布）不开启，
+# 不会把这些代码打进产物。
+[features]
+test-utils = []
+
+[dev-dependencies]
+focusflow-core = { path = ".", features = ["test-utils"] }
+
 [dependencies]
 tracing.workspace = true
 tracing-subscriber.workspace = true

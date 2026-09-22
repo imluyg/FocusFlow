@@ -11,17 +11,13 @@ fn guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-fn setup() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "ff_acc_test_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(dir.join("data")).unwrap();
-    paths::set_app_dir(&dir);
+/// 一个隔离的记账库；返回值 Drop 时删目录（断言 panic 也会删）。
+///
+/// 原来这里手拼 pid+纳秒的目录名、又在函数末尾才 `remove_dir_all`：目录名每轮都新，
+/// 收尾只在全绿时执行 —— 于是一次失败就在 %TEMP% 永久留一份 SQLite 库（本机曾堆到
+/// 333 个 `ff_acc_test_*`）。清理改由 RAII 负责。
+fn setup() -> paths::TestAppDir {
+    let dir = paths::test_app_dir("acc_test");
     accounting::init_db().unwrap();
     dir
 }
@@ -113,18 +109,8 @@ fn page_filter_and_escaping() {
 fn legacy_db_migration() {
     // 旧版（Python 版）结构：categories 无 subs 列 + 独立 subcategories 表
     let _g = guard();
-    let dir = std::env::temp_dir().join(format!(
-        "ff_acc_mig_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(dir.join("data")).unwrap();
-    paths::set_app_dir(&dir);
-
-    let db = dir.join("data").join("focusflow_accounting.db");
+    let dir = paths::test_app_dir("acc_mig");
+    let db = dir.path().join("data").join("focusflow_accounting.db");
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
@@ -307,7 +293,7 @@ fn profit_and_days_ago() {
 #[test]
 fn monthly_totals_sum_in_cents_not_floats() {
     let _g = guard();
-    let dir = setup();
+    let _dir = setup();
 
     for _ in 0..10 {
         add("2026-03-05", "支出", "一毛", 0.1, "吃饭", "");
@@ -332,6 +318,4 @@ fn monthly_totals_sum_in_cents_not_floats() {
         .map(|(_, n)| *n)
         .unwrap_or(f64::NAN);
     assert_eq!(net, 0.0, "净额须在分维度相减，不能剩浮点残差：{cats:?}");
-
-    std::fs::remove_dir_all(&dir).ok();
 }
