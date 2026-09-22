@@ -68,6 +68,15 @@ function hideTip(tip) {
   tip.style.display = "none";
 }
 
+// 同一份数据 + 同一尺寸 + 同一主题就不重画：整棵 SVG 重建会丢掉悬停状态
+// （参考线、放大点、tooltip 全没了），而主窗口活跃时每 ~2 秒就有一次推送。
+// 主题进指纹是必须的 —— 设置页切主题后是「用同样的数据再调一次渲染」，
+// 只看数据的守卫会把这次重绘一起跳过。ResizeObserver 触发的重绘靠尺寸变化
+// 自然通过校验。
+function chartKey(W, H, title, payloadSig) {
+  return `${W}x${H}|${title}|${document.body.className}|${payloadSig}`;
+}
+
 // 坐标轴 + 网格 + 标题骨架（折线/柱状共用）。W/H 为实测像素，1:1 绘制。
 function chartSkeleton(W, H, padL, padR, padT, padB, title, max, colors) {
   const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H });
@@ -87,11 +96,16 @@ export function lineChart(container, title, data) {
 
   const render = () => {
     container._chartRerender = render;
+    const W = Math.max(320, Math.floor(container.clientWidth));
+    const H = Math.max(220, Math.floor(container.clientHeight) || 260);
+    const key = chartKey(W, H, title, data.map((d) => d.date + ":" + d.value).join(","));
+    // 还要确认图形确实挂在容器里：指纹断言的是「上一次画的结果还在」，
+    // 而容器可能被别处的 innerHTML 赋值整体清掉，那时跳过就会留下空白
+    if (container._chartKey === key && container.querySelector("svg")) return;
+    container._chartKey = key;
     // 重建前先收起 tooltip：container.innerHTML = "" 会连同 svg 一起丢掉
     // mouseleave 监听，悬停中遇重绘会留下永久残留的提示框（主窗口活跃时每 2 秒推送一次）。
     hideTip(tip);
-    const W = Math.max(320, Math.floor(container.clientWidth));
-    const H = Math.max(220, Math.floor(container.clientHeight) || 260);
     container.innerHTML = "";
     container.appendChild(tip);
     const padL = 50, padR = 16, padT = 30, padB = 30;
@@ -162,11 +176,17 @@ export function barChart(container, title, values, labels) {
 
   const render = () => {
     container._chartRerender = render;
+    const W = Math.max(320, Math.floor(container.clientWidth));
+    const H = Math.max(220, Math.floor(container.clientHeight) || 260);
+    const sig = values.join(",") + "|" + (labels ? labels.join("\u0001") : "");
+    const key = chartKey(W, H, title, sig);
+    // 还要确认图形确实挂在容器里：指纹断言的是「上一次画的结果还在」，
+    // 而容器可能被别处的 innerHTML 赋值整体清掉，那时跳过就会留下空白
+    if (container._chartKey === key && container.querySelector("svg")) return;
+    container._chartKey = key;
     // 重建前先收起 tooltip：container.innerHTML = "" 会连同 svg 一起丢掉
     // mouseleave 监听，悬停中遇重绘会留下永久残留的提示框（主窗口活跃时每 2 秒推送一次）。
     hideTip(tip);
-    const W = Math.max(320, Math.floor(container.clientWidth));
-    const H = Math.max(220, Math.floor(container.clientHeight) || 260);
     container.innerHTML = "";
     container.appendChild(tip);
     const padL = 50, padR = 16, padT = 30, padB = 30;
