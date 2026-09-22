@@ -1394,6 +1394,9 @@ mod compute_charts_tests {
 
     #[test]
     fn empty_db_returns_zeroed_agg() {
+        // app_dir 是进程级全局：与周报用例（会往自己目录里种年度库）并行跑时，
+        // 不持锁就会读到对方的数据（表现为「空库应为 0」拿到 42 万）。
+        let _serial = crate::app_dir_lock();
         // 用隔离的临时程序目录，避免读到开发库
         let dir = std::env::temp_dir().join(format!("ff_compute_charts_{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();

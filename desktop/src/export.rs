@@ -347,6 +347,90 @@ mod tests {
         assert_eq!(fmt_duration(9), "9秒");
     }
 
+    /// 端到端：造一个有数据的年度库，跑一次真实周报生成。
+    ///
+    /// 为什么值得测：这份报告由统计线程在**启动后第一轮**自动触发，而 release
+    /// profile 是 `panic = "abort"` —— 生成路径里任何一次 panic 都不是"报告没了"，
+    /// 是整个进程在开机时消失。格式化（除零、下标、空表）与 Markdown 转义都必须
+    /// 在真数据上跑一遍，而不是只看它编译得过。
+    #[test]
+    fn weekly_report_renders_seeded_week() -> anyhow::Result<()> {
+        use chrono::{Datelike, NaiveDate};
+        use focusflow_core::db::connection::open_rw;
+        use focusflow_core::db::queries;
+        use focusflow_core::paths;
+
+        let _serial = crate::app_dir_lock();
+        let dir = std::env::temp_dir().join(format!("ff_weekly_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        paths::set_app_dir(&dir);
+        queries::invalidate_years_cache();
+
+        let today = Local::now().date_naive();
+        let (from, to) = focusflow_core::stats::last_finished_week(today);
+        let year = to.year();
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let dk = |d: NaiveDate| d.signed_duration_since(epoch).num_days();
+
+        let conn = open_rw(&paths::year_db_path(year))?;
+        focusflow_core::db::connection::ensure_schema(&conn, year)?;
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let mut day = from - chrono::Duration::days(7);
+        while day <= to {
+            let k = dk(day);
+            // 最后一天的键名带竖线：它必须被 md_cell 转义，否则表格列会被切断
+            let key = if day == to { "a|b" } else { "鼠标左键" };
+            conn.execute_batch(&format!(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES ({k}, 30000, 3600);
+                 INSERT OR REPLACE INTO key_counts (date_key, key_name, count) VALUES ({k}, '{key}', 20000);
+                 INSERT OR REPLACE INTO key_counts (date_key, key_name, count) VALUES ({k}, 'A', 10000);
+                 INSERT OR REPLACE INTO app_usage (date_key, app_name, seconds) VALUES ({k}, 'code.exe', 5400);
+                 INSERT OR REPLACE INTO hourly_counts (date_key, hour, count) VALUES ({k}, 14, 9000);"
+            ))?;
+            day += chrono::Duration::days(1);
+        }
+        conn.execute_batch("COMMIT;")?;
+        drop(conn);
+        queries::invalidate_years_cache();
+
+        let path = write_weekly_report()?;
+        let md = std::fs::read_to_string(&path)?;
+
+        assert!(path.starts_with(paths::data_dir().join("reports")));
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            format!(
+                "周报-{}-{}.md",
+                from.format("%Y-%m-%d"),
+                to.format("%Y-%m-%d")
+            ),
+            "文件名必须带上它覆盖的那个整周"
+        );
+        assert!(md.contains(&format!(
+            "{} ~ {}",
+            from.format("%Y-%m-%d"),
+            to.format("%Y-%m-%d")
+        )));
+        // 7 天 × 30000
+        assert!(md.contains("210,000"), "本周总数应为 21 万：\n{md}");
+        // 上一周同量 → 环比 0.0%
+        assert!(md.contains("环比 +0.0%"), "同量对比应为 +0.0%：\n{md}");
+        assert!(md.contains("每日") && md.contains("时段分布"));
+        assert!(md.contains("| 14:00 |"), "14 时应有 7×9000 的聚合");
+        // 键名转义：竖线必须成 \|，否则它会自成一个新的列分隔
+        assert!(md.contains(r#"a\|b"#), "键名里的竖线必须转义：\n{md}");
+        assert!(md.contains("鼠标左键"));
+        assert!(md.contains("code.exe"));
+        // 重跑一次：同一周必须落在同一个文件（幂等，不产生第二份）
+        let again = write_weekly_report()?;
+        assert_eq!(again, path);
+        std::fs::remove_dir_all(&dir).ok();
+        // 别让下一个用例继续沿着我这份已删掉的目录查年份/连接
+        queries::invalidate_years_cache();
+        Ok(())
+    }
+
     #[test]
     fn export_csv_has_bom_header_and_rows() -> anyhow::Result<()> {
         let dir = std::env::temp_dir().join("ff_export_test");
