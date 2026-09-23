@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use rdev::{listen, Button, Event, EventType, Key};
 
@@ -426,10 +426,13 @@ impl InputListener {
         if self.is_paused() {
             return;
         }
-        let ts = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let ts = match now_ts_secs() {
+            Some(ts) => ts,
+            None => {
+                warn_bad_clock_once();
+                return;
+            }
+        };
         tracing::debug!("record_event: {key_name} ts={ts}");
         db.record_key(key_name, ts);
         // 记录 CPM（当前速度统计）
@@ -567,8 +570,58 @@ impl InputListener {
     }
 }
 
+/// `SystemTime` → Unix 秒；时钟落在历元之前时返回 `None`。
+///
+/// 两处采集点原来都写 `duration_since(UNIX_EPOCH).unwrap_or(0)`：CMOS 电池没了、
+/// 或系统时间被设到 1970 之前时，补出来的 0 会被分桶成"1970-01-01"，于是按键永久
+/// 落进 `focusflow_1970.db` —— 而「总计」不按年截断，这些计数会一直留在总数里，
+/// 那个空壳还要每年被备份/VACUUM/聚合各挨一遍。
+/// 一条没有时间的事件本来就没法归属到任何一天，宁可不记。
+pub(crate) fn unix_ts_secs(at: std::time::SystemTime) -> Option<i64> {
+    match at.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => Some(d.as_secs() as i64),
+        Err(_) => None,
+    }
+}
+
+/// 此刻的 Unix 秒；时钟异常时 `None`（见 [`unix_ts_secs`]）。
+pub(crate) fn now_ts_secs() -> Option<i64> {
+    unix_ts_secs(std::time::SystemTime::now())
+}
+
+/// 时钟异常只说一次：这是每个按键都会走的路径，逐条 warn 会把日志刷爆。
+fn warn_bad_clock_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::error!(
+            "系统时间落在 1970 之前，本次运行的键鼠事件不再记录（否则会把计数写进一个\
+             永不合并的 1970 年库）；把系统时间修正后重启 FocusFlow 即可恢复"
+        );
+    });
+}
+
 #[cfg(test)]
 mod tests {
+    /// 时钟换算的三条腿：正常值、历元整点、历元之前。
+    ///
+    /// 第三条是重点：老写法 `unwrap_or(0)` 会把"时间拿不到"变成一个**看起来合法**的
+    /// 1970-01-01，按键因此永久落进 `focusflow_1970.db` 并留在「总计」里。
+    #[test]
+    fn pre_epoch_clock_is_not_turned_into_year_1970() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(
+            unix_ts_secs(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            Some(1_700_000_000)
+        );
+        assert_eq!(unix_ts_secs(UNIX_EPOCH), Some(0));
+        assert_eq!(
+            unix_ts_secs(UNIX_EPOCH - Duration::from_secs(1)),
+            None,
+            "历元之前的时钟必须报不出来"
+        );
+        // 生产路径：这台机器时钟正常，必须拿得到（拿不到就等于全程不记录）
+        assert!(super::now_ts_secs().is_some());
+    }
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::SystemTime;

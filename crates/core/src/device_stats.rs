@@ -236,7 +236,6 @@ mod win {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use windows::core::w;
     use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
@@ -438,10 +437,12 @@ mod win {
                     None => return, // 无法解析路径：宁可不计也不张冠李戴
                 },
             };
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+            let ts = match crate::listener::now_ts_secs() {
+                Some(ts) => ts,
+                // 时钟在历元之前：补 0 会把这条设备计数写进 focusflow_1970.db
+                // 并永久留在「总计」里，见 `listener::unix_ts_secs` 的注释
+                None => return,
+            };
             self.writer.record_device(&entry.0, &entry.1, kind, ts);
             // 键名明细：未识别的键归入「其他按键」，避免明细表被长尾撑爆
             self.writer
