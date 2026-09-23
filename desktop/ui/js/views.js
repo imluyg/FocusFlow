@@ -121,6 +121,15 @@ let deviceLastCharts = null;
 
 const kindLabel = (k) => ({ mouse: "鼠标", keyboard: "键盘", hybrid: "键鼠" }[k] || "未知");
 
+/// 设备是否属于当前筛选。hybrid（同一实例同时上报键鼠事件）在两类筛选里都显示。
+function deviceMatchesFilter(d) {
+  if (deviceFilter.value === "all") return true;
+  const k = d.kind || "unknown";
+  return deviceFilter.value === "mouse"
+    ? k === "mouse" || k === "hybrid"
+    : k === "keyboard" || k === "hybrid";
+}
+
 export function renderDevices(s) {
   const box = $("view-devices");
   deviceLastCharts = s;
@@ -130,6 +139,19 @@ export function renderDevices(s) {
   // 列表数字停在推开前的样子无所谓，退出编辑态后的下一次推送会照常用指纹重画。
   const ae = document.activeElement;
   if (deviceEditing && ae && ae.id === "device-alias-input") return;
+  // 改名对象被筛掉、或换了周期之后它压根不在列表里时，输入框会随该行一起消失，
+  // 但 deviceEditing 还留着 —— 而 openDeviceDetail 开头那句 `if (deviceEditing) return`
+  // 会让**所有**设备行点了都没反应，且界面上再没有任何东西能清掉这个状态。
+  // 必须在算指纹之前清掉，否则这次推送会画出一份"编辑态已经不存在了"的旧指纹。
+  if (deviceEditing) {
+    const stillThere = (Array.isArray(s.devices) ? s.devices : []).some(
+      (d) => d.key === deviceEditing && deviceMatchesFilter(d)
+    );
+    if (!stillThere) {
+      deviceEditing = null;
+      deviceDraft = "";
+    }
+  }
   // 指纹含周期、筛选与编辑态：切周期/切筛选/进改名时重建，纯数据推送则跳过
   const fp = JSON.stringify([s.period, s.device_total, s.devices, deviceFilter.value, deviceEditing]);
   if (skipIfUnchanged(box, fp)) return;
@@ -162,13 +184,7 @@ export function renderDevices(s) {
   const src =
     deviceFilter.value === "all"
       ? list
-      : list.filter((d) => {
-          const k = d.kind || "unknown";
-          // hybrid（同一实例同时上报键鼠事件）在两类筛选里都显示
-          return deviceFilter.value === "mouse"
-            ? k === "mouse" || k === "hybrid"
-            : k === "keyboard" || k === "hybrid";
-        });
+      : list.filter((d) => deviceMatchesFilter(d));
   const rows = src
     .map((d, i) => {
       const editing = deviceEditing === d.key;
@@ -221,7 +237,10 @@ function bindAliasInput() {
     if (e.key === "Enter") deviceRenameSave(deviceEditing);
     if (e.key === "Escape") deviceRenameCancel();
   });
-  input.focus();
+  // 刻意不在这里 focus：本函数每 2 秒的推送都会跑到（只要该行还在列表里），
+  // 于是用户点到别处去（切筛选、看说明、点某一行）之后焦点会被硬抢回来，
+  // 值也是刚重建出来的新节点 → 光标跳回开头、输入法正在合成的字被吞。
+  // 进入编辑态时的那一次聚焦由 deviceRename() 负责。
 }
 
 /// 进入改名编辑态（草稿预填已有别名，便于修改）
@@ -233,6 +252,18 @@ export function deviceRename(key) {
   deviceEditing = key;
   deviceDraft = dev && dev.has_alias ? dev.name : "";
   renderDevices(deviceLastCharts);
+  // 进入编辑态的这一次才聚焦（bindAliasInput 里不再 focus，见那里的注释）。
+  // 光标放到末尾：预填的是已有别名，从头开始会让他先按一遍 End。
+  const input = $("device-alias-input");
+  if (input) {
+    input.focus();
+    const n = input.value.length;
+    try {
+      input.setSelectionRange(n, n);
+    } catch (_) {
+      /* 某些控件类型不支持选区，忽略 */
+    }
+  }
 }
 
 /// 保存别名（空值等同还原为自动名）
@@ -240,13 +271,23 @@ export function deviceRenameSave(key) {
   const input = $("device-alias-input");
   const alias = input ? input.value : deviceDraft;
   exitDeviceEditing();
-  invoke("set_device_alias", { key, alias }).catch((e) => console.warn("设备改名失败", e));
+  invoke("set_device_alias", { key, alias })
+    .catch((e) => console.warn("设备改名失败", e))
+    .finally(refreshDeviceDetailIfOpen);
 }
 
 /// 清除别名，回到自动名
 export function deviceRenameClear(key) {
   exitDeviceEditing();
-  invoke("set_device_alias", { key, alias: "" }).catch((e) => console.warn("设备还原失败", e));
+  invoke("set_device_alias", { key, alias: "" })
+    .catch((e) => console.warn("设备还原失败", e))
+    .finally(refreshDeviceDetailIfOpen);
+}
+
+/// 详情弹窗里也有「改名/还原」，而列表那侧保存完之后没人回头刷新弹窗 ——
+/// 弹窗于是继续显示「原名 X」和一个已经无效的「还原」按钮。
+function refreshDeviceDetailIfOpen() {
+  if (deviceDetailKey) loadDeviceDetail();
 }
 
 /// 取消编辑

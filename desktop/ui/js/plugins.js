@@ -148,9 +148,40 @@ export async function renderPluginDetail(force) {
       return;
     }
   }
+  // force 重建会把整个子树换掉，正在输入的那个框也跟着变成新节点 → 焦点掉到
+  // <body>。记账的关键词框就是这里栽的：`change` 事件在按 Enter 时才触发，
+  // 于是"输入关键词 → Enter"= 写回插件状态 + 强制重建，文本还在但焦点没了，
+  // 后面的按键全打在空气里。按 data-field 认出同一个控件，重建后把焦点和
+  // 光标位置放回去。
+  const ae2 = document.activeElement;
+  const keepFocus =
+    force && ae2 && box.contains(ae2) && ae2.dataset && ae2.dataset.field
+      ? {
+          field: ae2.dataset.field,
+          start: typeof ae2.selectionStart === "number" ? ae2.selectionStart : null,
+        }
+      : null;
   box.innerHTML = html;
   lastViewFingerprint = fingerprint;
   restoreSelClasses(box, prevSel); // 重建后恢复选中状态（高亮 + 集合）
+  if (keepFocus) {
+    const next = box.querySelector(`[data-field="${cssEscape(keepFocus.field)}"]`);
+    if (next) {
+      next.focus();
+      if (keepFocus.start !== null && typeof next.setSelectionRange === "function") {
+        try {
+          next.setSelectionRange(keepFocus.start, keepFocus.start);
+        } catch (_) {
+          /* select 之类没有选区，忽略 */
+        }
+      }
+    }
+  }
+}
+
+/// 选择器里的字符串转义（CSS.escape 在旧 WebView2 上可能没有）
+function cssEscape(s) {
+  return window.CSS && CSS.escape ? CSS.escape(String(s)) : String(s).replace(/["\\]/g, "\\$&");
 }
 
 // 重建后恢复表格选中行：按保存的分组集合重新加高亮 class 并同步选中集合
