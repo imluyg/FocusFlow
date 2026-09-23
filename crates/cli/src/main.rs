@@ -153,16 +153,22 @@ fn run(args: &[String]) -> i32 {
                 .get_int("database", "max_backups", 5)
                 .max(1);
             match db::maintenance::backup_database(max_backups) {
-                Some(path) => {
-                    println!("备份完成: {}", path.display());
+                db::maintenance::BackupOutcome::Done { first, count } => {
+                    println!("备份完成: {}（共 {count} 份）", first.display());
                     println!(
                         "  目录: {}（已停用插件的数据会跳过）",
                         focusflow_core::paths::backup_dir().display()
                     );
                     0
                 }
-                None => {
-                    eprintln!("备份失败或无可备份的数据库");
+                // 没东西可备份不是失败：挂计划任务时退 1 会让用户以为天天在坏，
+                // 而真失败的那一次也混在同一句话里看不出来
+                db::maintenance::BackupOutcome::NothingToDo => {
+                    println!("没有需要备份的数据库（新建/刚重置过，或历史库都与上次一致）");
+                    0
+                }
+                db::maintenance::BackupOutcome::Failed { reason } => {
+                    eprintln!("备份失败: {reason}");
                     1
                 }
             }

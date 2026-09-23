@@ -423,14 +423,20 @@ pub async fn get_maintenance_info() -> Result<serde_json::Value, String> {
 pub async fn do_backup(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let max_backups = state.config.get_int("database", "max_backups", 5).max(1);
     let db = Arc::clone(&state.db);
-    tauri::async_runtime::spawn_blocking(move || {
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
         db.flush(true);
-        focusflow_core::db::maintenance::backup_database(max_backups)
+        use focusflow_core::db::maintenance::BackupOutcome;
+        match focusflow_core::db::maintenance::backup_database(max_backups) {
+            BackupOutcome::Done { first, count } => {
+                Ok(format!("{}（共 {count} 份）", first.display()))
+            }
+            BackupOutcome::NothingToDo => Err("没有需要备份的数据库".to_string()),
+            BackupOutcome::Failed { reason } => Err(reason),
+        }
     })
     .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "备份失败".to_string())
-    .map(|p| p.display().to_string())
+    .map_err(|e| e.to_string())??;
+    Ok(outcome)
 }
 
 /// 调试：前端写入日志（定位悬浮窗拖动问题）。发布版为 no-op。

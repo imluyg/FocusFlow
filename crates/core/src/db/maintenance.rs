@@ -958,8 +958,14 @@ pub fn start_periodic_backup() {
                 }
                 if last.elapsed() >= std::time::Duration::from_secs(hours * 3600) {
                     let max_backups = config.get_int("database", "max_backups", 5);
-                    if backup_database(max_backups).is_none() {
-                        tracing::debug!("定时备份：无可备份的年度库");
+                    match backup_database(max_backups) {
+                        BackupOutcome::Failed { reason } => {
+                            tracing::error!("定时备份失败: {reason}")
+                        }
+                        BackupOutcome::NothingToDo => {
+                            tracing::debug!("定时备份：无可备份的年度库")
+                        }
+                        BackupOutcome::Done { .. } => {}
                     }
                     last = std::time::Instant::now();
                 }
@@ -975,10 +981,18 @@ fn snapshot_before_destructive(op: &str) {
     let max_backups = crate::config::instance()
         .get_int("database", "max_backups", 5)
         .max(1);
-    if backup_database(max_backups).is_none() {
-        tracing::error!("{op}: 执行前快照失败，没有任何数据库被备份");
-    } else {
-        tracing::info!("{op}: 已完成执行前快照");
+    match backup_database(max_backups) {
+        BackupOutcome::Done { count, .. } => {
+            tracing::info!("{op}: 已完成执行前快照（{count} 份）");
+        }
+        // 没东西可备份不是失败：刚装好/刚重置过的目录里本来就没有库。
+        // 以前这一条走 `is_none()` → 打一条 error 说"快照失败"，是假警报。
+        BackupOutcome::NothingToDo => {
+            tracing::info!("{op}: 目录里没有需要快照的数据库，本次不备份");
+        }
+        BackupOutcome::Failed { reason } => {
+            tracing::error!("{op}: 执行前快照失败，没有任何数据库被备份 —— {reason}");
+        }
     }
 }
 
@@ -1029,7 +1043,34 @@ fn should_backup_aux(plugin_stem: &str, disabled: &[String], force: bool) -> boo
 /// 整个「备份 -> 校验 -> 轮转」过程持锁执行，保证同一时刻只有一次备份在跑。
 static BACKUP_LOCK: Mutex<()> = Mutex::new(());
 
-pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
+/// 一轮备份的结果。**三态必须分开**：
+/// - `--backup` 挂在计划任务上，"无事可做"也退 1 会让人以为天天在失败；
+/// - `snapshot_before_destructive` 以前拿 `None` 当"快照失败"，于是在刚重置过的
+///   空目录上打出一条假警报（什么数据都没有，本来就没东西可备份）。
+#[derive(Debug)]
+pub enum BackupOutcome {
+    /// 至少写出一份通过校验的备份
+    Done {
+        first: std::path::PathBuf,
+        count: usize,
+    },
+    /// 没有该备份的东西：一套年度库都没有、附属库都不在，或历史库都与上次指纹一致
+    NothingToDo,
+    /// 该备份的都失败了（或年度库根本没能列出来）
+    Failed { reason: String },
+}
+
+impl BackupOutcome {
+    /// 只关心"第一份备份路径"的调用方（含测试）用的取法。
+    pub fn first_path(self) -> Option<std::path::PathBuf> {
+        match self {
+            BackupOutcome::Done { first, .. } => Some(first),
+            _ => None,
+        }
+    }
+}
+
+pub fn backup_database(max_backups: i64) -> BackupOutcome {
     let _guard = BACKUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::fs::create_dir_all(paths::backup_dir()).ok();
     // 顺手清掉遗留的 sidecar 垃圾（旧版只删 .db，`-wal`/`-shm` 会永久堆积）
@@ -1044,7 +1085,18 @@ pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
     let baseline_fp = baseline_path.as_deref().and_then(backup_fingerprint);
     let mut suspicious_detail: Option<String> = None;
     let mut backed_up: Vec<std::path::PathBuf> = Vec::new();
-    for year in queries::available_years() {
+    let mut failed: Vec<String> = Vec::new();
+    let years = match queries::try_available_years() {
+        Ok(y) => y,
+        Err(e) => {
+            // 列不出年度库时以前会当成"没有要备份的"，静默什么都不做
+            tracing::error!("备份：枚举年度库失败: {e}");
+            return BackupOutcome::Failed {
+                reason: format!("没能列出数据目录里的年度库: {e}"),
+            };
+        }
+    };
+    for year in years {
         let src = paths::year_db_path(year);
         if !src.exists() {
             continue;
@@ -1119,6 +1171,7 @@ pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
             backed_up.push(dst);
         } else {
             remove_backup(&dst);
+            failed.push(format!("{year} 年库"));
             tracing::error!("年度库备份失败（已清理半成品）: {year}");
         }
     }
@@ -1145,6 +1198,7 @@ pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
             backed_up.push(dst);
         } else {
             remove_backup(&dst);
+            failed.push(name.to_string());
             tracing::error!("附属库备份失败（已清理半成品）: {name}");
         }
     }
@@ -1163,14 +1217,22 @@ pub fn backup_database(max_backups: i64) -> Option<std::path::PathBuf> {
         } else {
             rotate_backups(policy, false);
         }
+        let count = backed_up.len();
         tracing::info!(
             "已备份 {} 个数据库到 {}",
-            backed_up.len(),
+            count,
             paths::backup_dir().display()
         );
-        backed_up.first().cloned()
+        BackupOutcome::Done {
+            first: backed_up.remove(0),
+            count,
+        }
+    } else if !failed.is_empty() {
+        BackupOutcome::Failed {
+            reason: format!("这些库没能产出通过校验的备份: {failed:?}"),
+        }
     } else {
-        None
+        BackupOutcome::NothingToDo
     }
 }
 
@@ -2258,7 +2320,7 @@ mod tests {
         }
         queries::invalidate_years_cache();
 
-        let dst = backup_database(5).expect("应产出备份");
+        let dst = backup_database(5).first_path().expect("应产出备份");
         let entries: Vec<String> = std::fs::read_dir(paths::backup_dir())
             .unwrap()
             .flatten()
@@ -2327,7 +2389,7 @@ mod tests {
         let old_prefix = format!("focusflow_{old}_");
 
         // 首轮：两个年度库都必须有备份（本组此前没有任何备份）
-        backup_database(5).expect("首轮应有备份");
+        backup_database(5).first_path().expect("首轮应有备份");
         assert!(
             backup_files().iter().any(|n| n.starts_with(&old_prefix)),
             "首轮应备份历史年度库: {:?}",
@@ -2339,7 +2401,9 @@ mod tests {
             .into_iter()
             .filter(|n| n.starts_with(&old_prefix))
             .collect();
-        backup_database(5).expect("第二轮应产出当年库备份");
+        backup_database(5)
+            .first_path()
+            .expect("第二轮应产出当年库备份");
         let after: Vec<String> = backup_files()
             .into_iter()
             .filter(|n| n.starts_with(&old_prefix))
@@ -2362,7 +2426,7 @@ mod tests {
         }
         // 保证大小/时间戳确实变了（同毫秒内改写可能指纹相同）
         std::thread::sleep(std::time::Duration::from_millis(20));
-        backup_database(5).expect("第三轮应产出备份");
+        backup_database(5).first_path().expect("第三轮应产出备份");
         let changed: Vec<String> = backup_files()
             .into_iter()
             .filter(|n| n.starts_with(&old_prefix))
