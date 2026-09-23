@@ -62,7 +62,17 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
 /// 扫描压在主线程上 —— 与 `get_charts` 同一个理由挪到运行时线程。
 #[tauri::command]
 pub async fn get_goal_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    let goal = state.config.get_int("goal", "daily_keys", 20000).max(1);
+    let app = Arc::clone(&state);
+    // async 命令体跑在 tokio 运行时线程上，而这条要在里面做跨年度库的同步扫描
+    // （近 370 天按日序列）—— 挪到 spawn_blocking，别占着运行时线程（同 vacuum_db /
+    // import_legacy 的套路）。
+    tauri::async_runtime::spawn_blocking(move || goal_status_json(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn goal_status_json(app: &AppState) -> Result<serde_json::Value, String> {
+    let goal = app.config.get_int("goal", "daily_keys", 20000).max(1);
     let rows = focusflow_core::db::queries::get_daily_counts(
         focusflow_core::stats::GOAL_LOOKBACK_DAYS,
         None,
@@ -92,9 +102,15 @@ pub async fn get_goal_status(state: State<'_, Arc<AppState>>) -> Result<serde_js
 /// 这个入口给设置页的「立即生成」按钮用。
 #[tauri::command]
 pub async fn get_weekly_report() -> Result<Option<String>, String> {
-    crate::export::write_weekly_report()
-        .map(|p| p.map(|p| p.display().to_string()))
-        .map_err(|e| e.to_string())
+    // 生成周报要扫上一周 + 再往前 14 天的按日序列（跨两个年度库），并在里面读文件、
+    // 压缩图片、写库：和 `get_goal_status` 同一个理由，别占着 tokio 运行时线程。
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::export::write_weekly_report()
+            .map(|p| p.map(|p| p.display().to_string()))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 返回应用版本号（单一来源：Cargo 包版本）。

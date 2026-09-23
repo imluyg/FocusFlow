@@ -21,8 +21,25 @@ thread_local! {
     static PM: RefCell<Option<PluginManager>> = const { RefCell::new(None) };
 }
 
+/// 记下主线程 id（`setup` 里调用一次），供 `with_manager` 自查。
+pub fn note_main_thread() {
+    let _ = MAIN_THREAD.set(std::thread::current().id());
+}
+
+static MAIN_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
 /// 获取（必要时初始化）主线程插件管理器并执行操作。
 pub fn with_manager<T>(db: &Arc<Database>, f: impl FnOnce(&mut PluginManager) -> T) -> T {
+    if let Some(id) = MAIN_THREAD.get() {
+        // `PM` 是 thread_local：从别的线程调进来不会报错，而是**再造一个完整的
+        // PluginManager**（第二次 load_all、第二批 Lua 状态， yet 共用同一批进程级
+        // 单例：调度线程、番茄钟、事件投递）。今天所有调用方都在主线程（Tauri 同步命令
+        // 与 run_on_main_thread），所以这条只是护栏 —— 一旦以后有人图省事把某个插件命令
+        // 改成 async，这里会先喊出来，而不是让人去查"为什么插件收了两遍键事件"。
+        if std::thread::current().id() != *id {
+            tracing::error!("with_manager 被非主线程调用，将另建一份 PluginManager");
+        }
+    }
     PM.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {

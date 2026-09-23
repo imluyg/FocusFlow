@@ -445,6 +445,12 @@ pub fn add_subcategory(category: &str, sub_name: &str) -> (bool, String) {
     if sub_name.is_empty() {
         return (false, "子分类名不能为空".into());
     }
+    if sub_name.contains(',') {
+        return (
+            false,
+            "子分类名里不能带逗号：逗号是 subs 列的内部分隔符，\"a,b\" 会被存成两个子分类".into(),
+        );
+    }
     let conn = match open() {
         Ok(c) => c,
         Err(e) => return (false, format!("打开数据库失败: {e}")),
@@ -495,6 +501,12 @@ pub fn update_subcategory(category: &str, old_sub: &str, new_sub: &str) -> (bool
         )
         .unwrap_or_default();
     let mut subs: Vec<String> = parse_subs(&subs_raw);
+    if new_sub.contains(',') {
+        return (
+            false,
+            "子分类名里不能带逗号：逗号是 subs 列的内部分隔符".into(),
+        );
+    }
     if subs.iter().any(|s| s == new_sub) {
         return (
             false,
@@ -1008,6 +1020,16 @@ mod tests {
         let (ok, msg) = add_subcategory("迁移来的", "零食");
         assert!(ok, "{msg}");
         assert_eq!(get_subcategories("迁移来的"), vec!["零食".to_string()]);
+        // 逗号是 subs 列的内部分隔符：带逗号的名字会被存成**两个**子分类，
+        // 之后按其中一个名字去删会把另一个也带走。只能堵在入口。
+        let (ok, msg) = add_subcategory("迁移来的", "零食,饮料");
+        assert!(!ok, "带逗号的名字必须被拒");
+        assert!(msg.contains("逗号"), "{msg}");
+        assert_eq!(
+            get_subcategories("迁移来的"),
+            vec!["零食".to_string()],
+            "被拒的名字不该落库"
+        );
 
         // 反向腿：真实子分类必须照旧读得到，否则上面几条只是"什么都没读到"
         {

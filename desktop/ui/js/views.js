@@ -318,10 +318,14 @@ function deviceDetailHtml(d) {
   const kind = kindLabel(d.kind);
   const total = Number(d.period_total) || 0;
   const pct = total ? ((d.period_count / total) * 100).toFixed(2) + "%" : "—";
+  // rank 为 0 有两种完全不同的原因：这周期真没输入，或它排在被截断的 top-100 之外
+  // （后端榜单只带前 100 名回来）。有 period_count 却说"无输入"是把话讲反了。
   const rankText =
     d.rank > 0
       ? `第 <b>${d.rank}</b> / ${d.device_count}`
-      : "<b>本周期无输入</b>";
+      : Number(d.period_count) > 0
+        ? "未进前 100（榜单只回传前 100 名）"
+        : "<b>本周期无输入</b>";
   const kindText =
     d.kind_rank > 0 ? `第 <b>${d.kind_rank}</b> / ${d.kind_count}` : "—";
   const avg = Number(d.avg_per_active_day || 0);

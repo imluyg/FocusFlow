@@ -159,7 +159,7 @@ export function lineChart(container, title, data) {
       dot.setAttribute("cx", p.x);
       dot.setAttribute("cy", p.y);
       dot.setAttribute("visibility", "visible");
-      showTip(tip, container, e.clientX, e.clientY, `<b>${fmtThousands(data[i].value)}</b> 次<div class="chart-tip-sub">${data[i].date}</div>`);
+      showTip(tip, container, e.clientX, e.clientY, `<b>${fmtThousands(data[i].value)}</b> 次<div class="chart-tip-sub">${escapeHtml(String(data[i].date))}</div>`);
     });
     svg.addEventListener("mouseleave", () => {
       guide.setAttribute("visibility", "hidden");

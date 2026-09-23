@@ -119,6 +119,8 @@ pub fn run() {
             state::show_main_window_when_ready(app.clone(), Duration::ZERO);
         }))
         .setup(move |app| {
+            // setup 跑在主线程：记下它，插件管理器据此发现自己被从别的线程调用了
+            crate::plugins::note_main_thread();
             // 初始化数据库、监听器、统计线程（复用 focusflow-core）
             state::AppState::init(app)?;
             // 自动重启（--show-main）：用户点了面板才触发的重启，
