@@ -110,7 +110,9 @@ mod tests {
         assert_eq!(timer.get_state_info()["key_count"], 2);
         assert!(!timer.toggle_pause());
 
-        // 停止并保存
+        // 停之前先等满一个 tick（1 秒）：零秒的会话现在不再入库，
+        // 而这个用例要验的是"停止会保存记录"，必须真有一段时长才行。
+        std::thread::sleep(std::time::Duration::from_millis(1200));
         timer.stop();
         assert_eq!(timer.get_state(), pomodoro::STATE_IDLE);
 
@@ -118,6 +120,12 @@ mod tests {
         let sessions = pomodoro::get_recent_sessions(10);
         assert!(!sessions.is_empty(), "停止时应保存一条记录");
         assert_eq!(sessions[0].rtype, "work");
+        assert!(
+            sessions[0].actual_seconds >= 1,
+            "记录里应带上真实跑过的秒数：{}",
+            sessions[0].actual_seconds
+        );
+        assert_eq!(sessions[0].key_count, 2, "按键数应随会话一起入库");
 
         timer.shutdown();
         std::fs::remove_dir_all(&dir).ok();
