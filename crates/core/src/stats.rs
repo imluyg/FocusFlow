@@ -113,6 +113,10 @@ pub fn cpm(config: &'static FocusFlowConfig) -> Arc<CpmCalculator> {
     }))
 }
 
+/// 打卡判定的回看窗口（天）。调用方取按日序列时必须用同一个值，否则
+/// `best` 会在数据边界上被截断，而两处各自写死数字迟早对不上。
+pub const GOAL_LOOKBACK_DAYS: i64 = 370;
+
 /// 每日目标与连续打卡的结果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct GoalStatus {
@@ -159,18 +163,22 @@ pub fn goal_status(goal: i64, rows: &[(String, i64)], today: &str) -> GoalStatus
         day -= chrono::Duration::days(1);
     }
 
-    // 最长纪录：扫描回看窗口
+    // 最长纪录：与 streak 一样在**日期轴**上数，不能直接遍历 rows。零活动的那天
+    // 压根没有 daily_counts 行，按行遍历等于把缺失的间隔当成连续 ——
+    // 9/1 和 9/3 各达标一次会被数成「连续 2 天」，而 streak 用日期轴算出来的是 1，
+    // 两个口径互相打架（设置页显示的"最长"因此可能比真实值大）。
     let mut best = 0i64;
     let mut run = 0i64;
-    for d in rows {
-        if d.1 >= goal {
+    let mut d = today_d - chrono::Duration::days(GOAL_LOOKBACK_DAYS - 1);
+    while d <= today_d {
+        if count_of(d) >= goal {
             run += 1;
             best = best.max(run);
         } else {
             run = 0;
         }
+        d += chrono::Duration::days(1);
     }
-    best = best.max(streak);
 
     let days = (0..7i64)
         .rev()
@@ -305,6 +313,27 @@ mod tests {
             1,
             "目标 0 会让任何非零天数都永不达标，按 1 兜住"
         );
+    }
+
+    /// 缺口日期必须按 0 算：零活动的那天没有 daily_counts 行，如果按"行"数连续，
+    /// 9/1 与 9/3 两次达标会被报成「最长 2 天」—— 而 streak 走的是日期轴，
+    /// 两个口径会自相矛盾。
+    #[test]
+    fn goal_best_counts_calendar_days_not_rows() {
+        let goal = 20000;
+        let s = goal_status(
+            goal,
+            &rows(&[
+                ("2026-08-30", 25000),
+                // 8/31 整天没有活动 → 库里没有这一行
+                ("2026-09-01", 25000),
+                ("2026-09-02", 25000),
+                ("2026-09-03", 25000),
+            ]),
+            "2026-09-03",
+        );
+        assert_eq!(s.streak, 3, "9/1..9/3 是真连续");
+        assert_eq!(s.best, 3, "缺口把 8/30 与 9/1 隔开，最长只能是 3");
     }
 
     /// 周报锚点：永远是「上一个完整周」，且同一周内天天算出同一个区间。

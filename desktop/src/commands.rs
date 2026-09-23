@@ -63,7 +63,10 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
 #[tauri::command]
 pub async fn get_goal_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     let goal = state.config.get_int("goal", "daily_keys", 20000).max(1);
-    let rows = focusflow_core::db::queries::get_daily_counts(370, None);
+    let rows = focusflow_core::db::queries::get_daily_counts(
+        focusflow_core::stats::GOAL_LOOKBACK_DAYS,
+        None,
+    );
     let today = chrono::Local::now()
         .date_naive()
         .format("%Y-%m-%d")
