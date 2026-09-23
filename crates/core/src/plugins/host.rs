@@ -750,14 +750,16 @@ pub fn register_host_api(
     })?;
     host.set("edge_counts", edge_counts)?;
 
-    let edge_today = lua.create_function(|_, ()| {
-        let today = chrono::Local::now().date_naive();
-        Ok(edge_history::query_edge_history_count(today).unwrap_or(0))
-    })?;
+    // 今日数 / 总数也取自本地缓存库：这两个名字是早先的直接读 Edge 版本，第三方
+    // 脚本在用，所以保留签名（永远返回整数、没刷新过就是 0），但绝不碰 Edge 文件。
+    // 否则插件一调它们，就把 ea7b2d3 刚修掉的主线程卡顿（300ms busy + 三轮
+    // ≤100MB 复制）原样请回来。
+    let edge_today =
+        lua.create_function(|_, ()| Ok(edge_history::get_edge_history_saved_today().unwrap_or(0)))?;
     host.set("edge_today_count", edge_today)?;
 
     let edge_total =
-        lua.create_function(|_, ()| Ok(edge_history::query_edge_total_count().unwrap_or(0)))?;
+        lua.create_function(|_, ()| Ok(edge_history::get_edge_history_saved_total().unwrap_or(0)))?;
     host.set("edge_total_count", edge_total)?;
 
     // 本地缓存（上次刷新保存的值），插件重启后恢复显示

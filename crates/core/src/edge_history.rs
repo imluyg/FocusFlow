@@ -142,16 +142,20 @@ fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
     None
 }
 
-/// 在 Edge History 上执行单个查询（失败/被锁返回 None）。
-fn query_edge_count(query: impl Fn(&Connection) -> Option<i64>) -> Option<i64> {
-    with_edge_snapshot(query)
-}
-
-/// 查询 Edge 总历史记录数（失败/被锁返回 None）。
-pub fn query_edge_total_count() -> Option<i64> {
-    query_edge_count(|conn| {
-        conn.query_row("SELECT COUNT(*) FROM urls", [], |r| r.get::<_, i64>(0))
-            .ok()
+/// 查询指定日期的 Edge 历史记录数（失败/被锁返回 None）。
+///
+/// **会阻塞调用线程**（最坏 300ms busy 等待 + 3 轮 ≤100MB 整文件复制），所以只
+/// 允许后台线程调用；跑在主线程上的宿主 Lua API 一律改读本地缓存库
+/// （见 `saved_count_on`），否则点一下就冻住界面。
+fn query_edge_history_count(target_date: NaiveDate) -> Option<i64> {
+    let (chrome_start, chrome_end) = chrome_day_range(target_date)?;
+    with_edge_snapshot(move |conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM urls WHERE last_visit_time >= ?1 AND last_visit_time < ?2",
+            rusqlite::params![chrome_start, chrome_end],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
     })
 }
 
@@ -165,19 +169,6 @@ fn chrome_day_range(target_date: NaiveDate) -> Option<(i64, i64)> {
     };
     let day_end = day_start + chrono::Duration::days(1);
     Some((datetime_to_chrome(&day_start), datetime_to_chrome(&day_end)))
-}
-
-/// 查询指定日期的 Edge 历史记录数（失败/被锁返回 None）。
-pub fn query_edge_history_count(target_date: NaiveDate) -> Option<i64> {
-    let (chrome_start, chrome_end) = chrome_day_range(target_date)?;
-    query_edge_count(move |conn| {
-        conn.query_row(
-            "SELECT COUNT(*) FROM urls WHERE last_visit_time >= ?1 AND last_visit_time < ?2",
-            rusqlite::params![chrome_start, chrome_end],
-            |r| r.get::<_, i64>(0),
-        )
-        .ok()
-    })
 }
 
 pub fn edge_db_path() -> PathBuf {
@@ -239,21 +230,49 @@ pub fn get_edge_history_counts(days: i64) -> Vec<(String, i64)> {
     result.unwrap_or_default()
 }
 
-/// 刷新状态（`REFRESH_STATE` 的取值）。
+/// 刷新状态（`RefreshSlot::state` 的取值）。
 const ST_IDLE: u8 = 0;
 const ST_RUNNING: u8 = 1;
 const ST_OK: u8 = 2;
 const ST_FAIL: u8 = 3;
-static REFRESH_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(ST_IDLE);
 
-/// 一次后台刷新的状态：`idle` / `running` / `ok` / `fail`。
-pub fn refresh_state() -> &'static str {
-    match REFRESH_STATE.load(std::sync::atomic::Ordering::SeqCst) {
-        ST_RUNNING => "running",
-        ST_OK => "ok",
-        ST_FAIL => "fail",
-        _ => "idle",
-    }
+/// RUNNING 超过这个时长就认定为卡死。
+///
+/// 阈值刻意放宽到 120 秒：一轮正常刷新最坏也只是 300ms busy 等待 + 3 轮 ≤100MB
+/// 整文件复制，慢盘上十几秒也走得完，这里留了一个数量级的余量。取短了会招来
+/// 更糟的后果 —— 接管会与仍在正常跑的轮次并发，两个线程各复制一份 100MB。
+const RUNNING_STALE_MS: i64 = 120_000;
+
+/// 刷新槽位：状态 + 本轮世代号 + 进入 RUNNING 的时刻。
+///
+/// 世代号是给「被接管的那一轮」准备的：卡死的线程哪天真的从 `fs::copy` 里回来，
+/// 也不该由它把新一轮的状态改写成 ok/fail。
+#[derive(Default)]
+struct RefreshSlot {
+    state: u8,
+    gen: u64,
+    started_at_ms: i64,
+}
+
+static REFRESH_SLOT: std::sync::Mutex<RefreshSlot> = std::sync::Mutex::new(RefreshSlot {
+    state: ST_IDLE,
+    gen: 0,
+    started_at_ms: 0,
+});
+
+fn lock_slot() -> std::sync::MutexGuard<'static, RefreshSlot> {
+    REFRESH_SLOT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+/// 一轮刷新是否已经拖过了头。
+fn is_wedged(slot: &RefreshSlot, now: i64) -> bool {
+    slot.state == ST_RUNNING
+        && slot.started_at_ms > 0
+        && now.saturating_sub(slot.started_at_ms) >= RUNNING_STALE_MS
 }
 
 /// 非阻塞启动一次「今日 + 总数」刷新，返回是否真的启动了任务。
@@ -265,27 +284,90 @@ pub fn refresh_state() -> &'static str {
 /// 已有一轮在跑时不再排队（重复点击不该放大复制开销），直接返回 `false`；
 /// 数值写进本地缓存库，插件下次渲染用 `get_edge_history_saved_*` 取。
 pub fn spawn_update_today() -> bool {
-    use std::sync::atomic::Ordering::SeqCst;
-    let idle = REFRESH_STATE
-        .compare_exchange(ST_IDLE, ST_RUNNING, SeqCst, SeqCst)
-        .or_else(|_| REFRESH_STATE.compare_exchange(ST_OK, ST_RUNNING, SeqCst, SeqCst))
-        .or_else(|_| REFRESH_STATE.compare_exchange(ST_FAIL, ST_RUNNING, SeqCst, SeqCst));
-    if idle.is_err() {
+    let Some(gen) = claim_round(now_ms()) else {
         return false;
-    }
+    };
     let spawned = std::thread::Builder::new()
         .name("edge-refresh".into())
-        .spawn(|| match update_today_edge_history().0 {
-            true => REFRESH_STATE.store(ST_OK, SeqCst),
-            false => REFRESH_STATE.store(ST_FAIL, SeqCst),
+        .spawn(move || {
+            let ok = update_today_edge_history().0;
+            finish_round(gen, ok);
         });
     match spawned {
         Ok(_) => true,
         Err(e) => {
             tracing::error!("启动 Edge 历史刷新线程失败: {e}");
-            REFRESH_STATE.store(ST_IDLE, SeqCst);
+            release_round(gen);
             false
         }
+    }
+}
+
+/// 尝试占用「本轮刷新」这个槽位：成功返回本轮世代号，`None` 表示应当拒绝。
+///
+/// 拒绝的唯一理由是上一轮还在正常跑；它一旦超过 [`RUNNING_STALE_MS`] 仍没收尾就
+/// 按卡死处理并接管 —— 不然线程回不来时，用户点到重启为止都不会再有任何反应。
+/// 世代号用来让被接管掉的那一轮之后再返回也改不动新一轮的状态。
+fn claim_round(now: i64) -> Option<u64> {
+    let mut slot = lock_slot();
+    let wedged = is_wedged(&slot, now);
+    if slot.state == ST_RUNNING && !wedged {
+        return None;
+    }
+    if wedged {
+        tracing::warn!(
+            "Edge 刷新线程超过 {} 秒未收尾，按卡死接管并启动新一轮",
+            RUNNING_STALE_MS / 1000
+        );
+    }
+    slot.state = ST_RUNNING;
+    slot.started_at_ms = now;
+    slot.gen += 1;
+    Some(slot.gen)
+}
+
+/// 收尾：只有「本轮仍是当前这一轮」时才允许写回结果。
+fn finish_round(gen: u64, ok: bool) {
+    let mut slot = lock_slot();
+    if slot.gen != gen {
+        return;
+    }
+    slot.state = if ok { ST_OK } else { ST_FAIL };
+    slot.started_at_ms = 0;
+}
+
+/// 线程根本没起来时的回滚：本轮没人在跑，别把状态留在 RUNNING 卡住用户。
+fn release_round(gen: u64) {
+    let mut slot = lock_slot();
+    if slot.gen != gen {
+        return;
+    }
+    slot.state = ST_IDLE;
+    slot.started_at_ms = 0;
+}
+
+/// 一次后台刷新的状态：`idle` / `running` / `ok` / `fail`。
+///
+/// 读的时候顺手自愈：光靠 `spawn_update_today` 里的接管救不了刷新按钮 ——
+/// 线程卡死后插件会一直显示「正在后台读取」，用户连再点一次的入口都没有。
+pub fn refresh_state() -> &'static str {
+    let now = now_ms();
+    let mut slot = lock_slot();
+    if is_wedged(&slot, now) {
+        tracing::error!(
+            "Edge 刷新线程已卡死（超过 {} 秒未收尾），状态已复位，可重新点刷新",
+            RUNNING_STALE_MS / 1000
+        );
+        slot.state = ST_FAIL;
+        slot.started_at_ms = 0;
+        // 推进世代号，让那个再也不会收尾的线程之后没有改写的余地
+        slot.gen += 1;
+    }
+    match slot.state {
+        ST_RUNNING => "running",
+        ST_OK => "ok",
+        ST_FAIL => "fail",
+        _ => "idle",
     }
 }
 
@@ -317,7 +399,6 @@ pub fn update_today_edge_history() -> (bool, i64, i64) {
     match pair {
         Some((today_count, total)) => {
             save_edge_history_count(today, today_count);
-            save_edge_history_meta("today", today_count);
             save_edge_history_meta("total", total);
             // 后台补齐近 30 天缺失日期（不阻塞刷新返回）
             std::thread::Builder::new()
@@ -383,14 +464,27 @@ fn save_edge_history_meta(key: &str, value: i64) {
     );
 }
 
-/// 读取上次保存的今日计数（本地缓存，未刷新过返回 None）。
-pub fn get_edge_history_saved_today() -> Option<i64> {
+/// 读取本地缓存库中某一天已保存的计数（没刷新过那一天返回 None）。
+fn saved_count_on(target_date: NaiveDate) -> Option<i64> {
+    if !edge_db_path().exists() {
+        return None;
+    }
     let conn = open_local().ok()?;
-    conn.query_row("SELECT value FROM meta WHERE key='today'", [], |r| {
-        r.get::<_, String>(0)
-    })
+    conn.query_row(
+        "SELECT count FROM edge_history WHERE date = ?1",
+        [target_date.format("%Y-%m-%d").to_string()],
+        |r| r.get::<_, i64>(0),
+    )
     .ok()
-    .and_then(|v| v.parse().ok())
+}
+
+/// 读取今天的 Edge 记录数（本地缓存，今天没刷新过返回 None）。
+///
+/// 按日期查 `edge_history` 表，而不是读 meta 里那个"上次刷新时当作今天"的值：
+/// meta 不会自己跨零点更新，应用通宵开着的话，第二天早上就会把昨天的数当成
+/// "今日记录数"显示给用户。
+pub fn get_edge_history_saved_today() -> Option<i64> {
+    saved_count_on(Local::now().date_naive())
 }
 
 /// 读取上次保存的总记录数（本地缓存，未刷新过返回 None）。
@@ -406,4 +500,105 @@ pub fn get_edge_history_saved_total() -> Option<i64> {
 /// 本地趋势（近 N 天），供插件展示。
 pub fn trend_counts(days: i64) -> Vec<(String, i64)> {
     get_edge_history_counts(days)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 把槽位置成「有一轮在跑，且已经跑了 `ms_elapsed` 毫秒」，返回那一轮的世代号。
+    /// 每次改槽位都推进世代号，这样上一轮遗留的后台线程（`plugins_test` 真的会
+    /// 点一次 refresh）也就没法反过来改写测试中的状态。
+    fn fake_running_round(ms_elapsed: i64) -> u64 {
+        let mut slot = lock_slot();
+        slot.state = ST_RUNNING;
+        slot.started_at_ms = now_ms() - ms_elapsed;
+        slot.gen += 1;
+        slot.gen
+    }
+
+    fn reset_slot() {
+        let mut slot = lock_slot();
+        slot.state = ST_IDLE;
+        slot.started_at_ms = 0;
+        slot.gen += 1;
+    }
+
+    /// 线程卡死（例如回不来地卡在 `fs::copy`）后，刷新按钮不该死到重启为止。
+    #[test]
+    fn wedged_refresh_self_heals_so_the_button_stays_usable() {
+        let _lock = crate::paths::test_app_dir_lock();
+        fake_running_round(RUNNING_STALE_MS + 60_000);
+        assert_eq!(
+            refresh_state(),
+            "fail",
+            "越过阈值的 running 必须自愈，否则面板永远显示「正在后台读取」"
+        );
+        assert!(
+            claim_round(now_ms()).is_some(),
+            "自愈之后下一次点击要真能启动新一轮"
+        );
+        reset_slot();
+    }
+
+    /// 阈值内是"正常在跑"，不能拒绝第二次点击之外的接管，也不能放行第二轮并发。
+    #[test]
+    fn live_round_is_not_stolen_but_a_wedged_one_is() {
+        let _lock = crate::paths::test_app_dir_lock();
+        fake_running_round(1_000);
+        assert_eq!(refresh_state(), "running", "才跑 1 秒不该被判成卡死");
+        assert!(
+            claim_round(now_ms()).is_none(),
+            "上一轮还在正常跑时再起一轮 = 两个线程各复制 100MB"
+        );
+
+        fake_running_round(RUNNING_STALE_MS + 1);
+        assert!(
+            claim_round(now_ms()).is_some(),
+            "超过阈值就该接管，而不是到重启前都点不动"
+        );
+        reset_slot();
+    }
+
+    /// 被接管的那一轮之后就算真的回来，也不许改写新一轮的状态。
+    #[test]
+    fn superseded_round_cannot_write_back_its_result() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let zombie = fake_running_round(RUNNING_STALE_MS + 1);
+        let live = claim_round(now_ms()).expect("接管应成功");
+        assert_ne!(zombie, live);
+        finish_round(zombie, true);
+        assert_eq!(
+            refresh_state(),
+            "running",
+            "僵尸线程回来不该把新一轮标成已完成"
+        );
+        finish_round(live, true);
+        assert_eq!(refresh_state(), "ok");
+        reset_slot();
+    }
+
+    /// 「今日记录数」按日期查表。
+    ///
+    /// 老实现读 meta 里那个"上次刷新时算作今天"的值：应用通宵开着时它不会跨零点
+    /// 更新，第二天早上就会把昨天的数当成今天显示。
+    #[test]
+    fn saved_today_is_date_keyed() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("edge_saved");
+        let today = Local::now().date_naive();
+        let yesterday = today - chrono::Days::new(1);
+
+        assert_eq!(get_edge_history_saved_today(), None, "从未刷新过不该有值");
+        save_edge_history_count(yesterday, 111);
+        assert_eq!(
+            get_edge_history_saved_today(),
+            None,
+            "昨天的计数不该被当成今天"
+        );
+        save_edge_history_count(today, 42);
+        assert_eq!(get_edge_history_saved_today(), Some(42));
+        save_edge_history_meta("total", 900);
+        assert_eq!(get_edge_history_saved_total(), Some(900));
+    }
 }
