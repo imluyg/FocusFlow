@@ -57,10 +57,11 @@ function _build_widgets()
     local code = state["state"] or 0
     local remaining = state["remaining"] or 0
     local key_count = state["key_count"] or 0
-    local work_finished = state["work_finished"] or 0
     local paused = (state["paused"] or 0) == 1
     local work_min = state["work_minutes"] or 25
     local brk_min = state["break_minutes"] or 5
+    -- 今日完成取库里的当日汇总，不取计时器里的 work_finished：后者是进程内的
+    -- 累加值，重启后归零、跨零点又继续往上加，标成「今日」两头都会说谎。
     local summary_count, summary_keys = focusflow.pomodoro_summary()
 
     local st = _state_text(code)
@@ -71,7 +72,7 @@ function _build_widgets()
         { type = "keyvalue", key = "状态", value = st },
         { type = "keyvalue", key = "倒计时", value = _fmt(remaining) },
         { type = "keyvalue", key = "本阶段键鼠", value = tostring(key_count) },
-        { type = "keyvalue", key = "今日完成", value = tostring(work_finished) .. " 个" },
+        { type = "keyvalue", key = "今日完成", value = tostring(summary_count) .. " 个" },
         { type = "keyvalue", key = "今日键鼠", value = tostring(summary_keys) },
         { type = "separator" },
         { type = "button", id = "start_work", text = "开始工作" },
