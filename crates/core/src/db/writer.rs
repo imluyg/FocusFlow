@@ -494,6 +494,27 @@ impl DbWriter {
         self.state.alive.load(Ordering::Relaxed)
     }
 
+    /// `stop()` 之后继续等到线程真的退出（最多 10 秒）。
+    ///
+    /// `stop()` 只等 3 秒，超时就先写恢复文件再返回 —— 那时线程可能还在做
+    /// 最后一次 flush，而它会照着自己记下的 `app_dir` 去 `open_rw`。生产里
+    /// 目录不会被删，无所谓；测试里紧跟着就是 `TestAppDir` 的 Drop 删目录，
+    /// 于是那个目录连带 `data/focusflow_YYYY.db` 被重新建出来
+    /// （实测每个全量跑多 1~2 个 `%TEMP%` 目录）。
+    ///
+    /// 等的是 `alive`，而它只在末次 flush **之后**才置 false，所以等到就等于
+    /// "再没有人会往这个目录写"。
+    pub fn stop_and_wait(&self) {
+        self.stop();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.state.alive.load(Ordering::Relaxed) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if self.state.alive.load(Ordering::Relaxed) {
+            tracing::warn!("DB 写入线程 10 秒内没退出，后续落盘可能写到别的目录");
+        }
+    }
+
     /// 成功落库序号（有实际写入才递增）。
     pub fn flush_seq(&self) -> u64 {
         self.state.flush_seq.load(Ordering::Relaxed)
@@ -1044,7 +1065,7 @@ mod tests {
             "今日增量必须落在当前年份库里"
         );
 
-        w.stop();
+        w.stop_and_wait();
         crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
     }
 
@@ -1068,7 +1089,7 @@ mod tests {
         assert_eq!(w.state.today_count.load(Ordering::Relaxed), 1);
 
         w.flush(true);
-        w.stop();
+        w.stop_and_wait();
         crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
     }
 
@@ -1076,6 +1097,11 @@ mod tests {
     #[test]
     fn record_aggregates_deltas() {
         let _lock = crate::paths::test_app_dir_lock();
+        // 必须有自己的 app_dir：这条用例只断内存聚合，但 stop 的最后一次 flush
+        // 会把这 3 条事件照 `current_year_db_path()` 落库 —— 少了这一行，它落的
+        // 就是**上一个用例已经删掉**的那个目录，于是那个目录连着 focusflow_YYYY.db
+        // 被重新建出来（实测每个全量跑多一个 %TEMP% 残留）。
+        let _tmp = crate::paths::test_app_dir("writer_agg");
         let w = DbWriter::start(Duration::from_secs(3600));
         let ts = queries::now_ts();
         w.record("A", ts);
@@ -1087,7 +1113,7 @@ mod tests {
         assert_eq!(agg.hourly.get(&(dk, queries::hour_of_ts(ts))), Some(&3));
         assert_eq!(agg.keys.get(&dk).and_then(|m| m.get("A")), Some(&2));
         drop(agg);
-        w.stop();
+        w.stop_and_wait();
     }
 
     /// 活跃时长：与上一事件间隔 ≤ 60 秒累计连续活跃，超间隔或首事件不累计。
@@ -1105,7 +1131,7 @@ mod tests {
         assert_eq!(w.state.today_active.load(Ordering::Relaxed), 10);
         w.record("A", t0 + 102); // 间隔 2s：活跃 +2
         assert_eq!(w.state.today_active.load(Ordering::Relaxed), 12);
-        w.stop();
+        w.stop_and_wait();
     }
 
     /// 导入/外部写库之后，两个今日缓存都得跟着库走。
@@ -1140,7 +1166,7 @@ mod tests {
         w.recompute_today_totals();
         assert_eq!(w.today_count(), 502, "按键数跟着库走");
         assert_eq!(w.today_active_seconds(), 4010, "活跃时长也得跟着库走");
-        w.stop();
+        w.stop_and_wait();
     }
 
     /// 应用时长归属：间隔秒数在**事件发生时**归给当时的前台应用，
@@ -1168,7 +1194,7 @@ mod tests {
         assert_eq!(agg.apps.get(&(dk, "WorkBuddy.exe".to_string())), Some(&20));
         assert_eq!(agg.apps.len(), 2, "无归属的 5 秒不应落到任何应用上");
         drop(agg);
-        w.stop();
+        w.stop_and_wait();
     }
 
     /// current_app 是会话态：flush 取走增量后必须保留，
@@ -1207,7 +1233,7 @@ mod tests {
                 "flush 后的事件仍应归属到同一应用"
             );
         }
-        w.stop();
+        w.stop_and_wait();
     }
 
     /// 设备 × 键名明细：累加、落库，且不污染主统计键名表。
@@ -1250,7 +1276,7 @@ mod tests {
         assert_eq!(read("鼠标左键"), 2);
         assert_eq!(read("滚轮上滑"), 1);
         drop(conn);
-        w.stop();
+        w.stop_and_wait();
     }
 
     /// 设备维度：record_device 只累加 devices 聚合，不污染主统计；
@@ -1312,7 +1338,7 @@ mod tests {
             assert!(agg.devices.is_empty(), "flush 应取走设备计数");
             assert!(!agg.device_meta.is_empty(), "设备登记应跨 flush 保留");
         }
-        w.stop();
+        w.stop_and_wait();
     }
 
     /// 设备维度落库：device_counts 累加 + devices 登记表写入。
@@ -1358,7 +1384,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1);
-        w.stop();
+        w.stop_and_wait();
     }
 
     /// 启动预热：库里已登记的设备名/类型应在首个输入事件之前就可用。
@@ -1426,7 +1452,7 @@ mod tests {
             );
             assert_eq!(agg.device_meta.len(), 2, "只有两条真实登记应进入会话态");
         }
-        w.stop();
+        w.stop_and_wait();
     }
 
     /// 缺设备登记时的兜底命名：不能把裸路径写进 devices.name（2026-09-21）。
@@ -1517,7 +1543,7 @@ mod tests {
         w.record_device(&dev, real_name, "mouse", ts);
         w.record_device(&dev, real_name, "mouse", ts);
         snapshot_recovery(&w.state, true);
-        w.stop();
+        w.stop_and_wait();
 
         // 3. 重启回放 + 落库：登记名字必须是真名，不能被回退命名顶掉
         let w2 = DbWriter::start(Duration::from_secs(3600));
@@ -1545,7 +1571,7 @@ mod tests {
             })
             .unwrap_or(0);
         assert_eq!(cnt, 3, "1 次直接落库 + 2 次回放，不得重复或丢计数");
-        w2.stop();
+        w2.stop_and_wait();
     }
 
     /// 恢复机制：设备计数随快照落盘并回放，恰好落库一次。
@@ -1561,7 +1587,7 @@ mod tests {
         w.record_device(&dev, "恢复测试键盘 · AAAA/BBBB", "keyboard", ts);
         w.record_device(&dev, "恢复测试键盘 · AAAA/BBBB", "keyboard", ts);
         snapshot_recovery(&w.state, true);
-        w.stop();
+        w.stop_and_wait();
 
         let db_count = || -> i64 {
             connection::open_ro(&paths::current_year_db_path())
@@ -1587,7 +1613,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert_eq!(db_count(), base + 2, "设备计数应恰好回放一次");
-        w2.stop();
+        w2.stop_and_wait();
     }
 
     /// 恢复机制：快照落盘并从内存移除 → 正常 flush 不再落库 →
@@ -1603,7 +1629,7 @@ mod tests {
         w.record("A", ts);
         snapshot_recovery(&w.state, true);
         assert!(recovery_path().exists(), "快照应写入恢复文件");
-        w.stop(); // 内存已空，stop 的最终 flush 不会再写库
+        w.stop_and_wait(); // 内存已空，stop 的最终 flush 不会再写库
 
         // 并行测试共享全局 app_dir，库中可能有其他测试的数据，
         // 因此全部用相对断言验证"回放数据恰好落库一次"。
@@ -1637,6 +1663,6 @@ mod tests {
         assert_eq!(w2.flush_seq(), 1, "成功落库后序号应递增");
         assert_eq!(db_count(), base + 2, "回放数据应恰好落库一次");
         assert!(!recovery_path().exists(), "恢复文件回放后应删除");
-        w2.stop();
+        w2.stop_and_wait();
     }
 }
