@@ -72,6 +72,11 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             ("unload_hidden_delay", "60"),
             // 悬浮窗显示口径：times / duration / both（desktop/ui/floating.js 读）
             ("floating_metric", "times"),
+            // 启动时选中的统计周期（-1 = 今日）：前端每次切换都写回它，
+            // 用来"记住上次退出前看的周期"（desktop/src/state.rs 读，非法值在入口拦掉）。
+            // 和 floating_metric 同一类：代码一直在读、默认值里却没有，
+            // 等于只有会手改 config.ini 的人知道有这么个开关。
+            ("default_period", "-1"),
         ],
     );
     s(
@@ -516,6 +521,7 @@ mod tests {
         // 真开关，藏在 config.ini 里不可发现就是文档缺失（floating_metric 之前
         // 就是这种状态，UI 里那个口径切换只有会改文件的人才用得到）。
         assert_eq!(cfg.get("gui", "floating_metric"), "times");
+        assert_eq!(cfg.get_int("gui", "default_period", 99), -1);
         assert!(cfg.get_bool("gui", "unload_hidden", false));
         assert_eq!(cfg.get_int("gui", "unload_hidden_delay", 0), 60);
         assert!(cfg.get_bool("device_stats", "enabled", false));
