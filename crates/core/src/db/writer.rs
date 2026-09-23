@@ -431,31 +431,35 @@ impl DbWriter {
             .is_empty()
     }
 
-    /// 重置今日计数缓存（外部清除数据后调用）。
-    pub fn reset_today_count(&self) {
-        self.state.today_count.store(0, Ordering::Relaxed);
-    }
-
-    /// 重新统计今日计数（导入/外部写入数据后调用，避免缓存与库不一致）。
-    /// 先落库再读聚合表，保证计数准确。
-    pub fn recompute_today_count(&self) {
+    /// 重新统计「今日按键数 + 今日活跃时长」缓存（导入或外部写库之后调用）。
+    ///
+    /// 两个都得刷：落库是 `seconds = seconds + excluded.seconds` 的增量式，所以
+    /// 导入进来的时长不会丢，但内存里那个基准还是旧的 —— 界面上的「今日活跃时长」
+    /// 会一直少着一截，直到下次重启才补回来。以前这里只刷了次数。
+    /// 先 flush 再读聚合表，两个数取的是同一份已落库的状态。
+    pub fn recompute_today_totals(&self) {
         self.flush(true);
         self.state
             .today_key
             .store(current_day_key(), Ordering::Relaxed);
-        let count = connection::open_ro(&paths::current_year_db_path())
+        let (count, seconds) = connection::open_ro(&paths::current_year_db_path())
             .ok()
             .and_then(|conn| {
                 conn.query_row(
-                    "SELECT COALESCE(SUM(count), 0) FROM daily_counts WHERE date_key = ?1",
+                    "SELECT COALESCE(SUM(count), 0), COALESCE(SUM(seconds), 0) \
+                     FROM daily_counts WHERE date_key = ?1",
                     [queries::day_key_of_date(chrono::Local::now().date_naive())],
-                    |r| r.get::<_, i64>(0),
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
                 )
                 .ok()
             })
-            .unwrap_or(0)
-            .max(0) as u64;
-        self.state.today_count.store(count, Ordering::Relaxed);
+            .unwrap_or((0, 0));
+        self.state
+            .today_count
+            .store(count.max(0) as u64, Ordering::Relaxed);
+        self.state
+            .today_active
+            .store(seconds.max(0) as u64, Ordering::Relaxed);
     }
 
     /// 立即 flush：发信号让写线程落库。`wait=true` 时阻塞等待完成。
@@ -1101,6 +1105,41 @@ mod tests {
         assert_eq!(w.state.today_active.load(Ordering::Relaxed), 10);
         w.record("A", t0 + 102); // 间隔 2s：活跃 +2
         assert_eq!(w.state.today_active.load(Ordering::Relaxed), 12);
+        w.stop();
+    }
+
+    /// 导入/外部写库之后，两个今日缓存都得跟着库走。
+    ///
+    /// 以前只刷按键数：落库是 `seconds = seconds + excluded.seconds` 的增量式，
+    /// 所以导入进来的活跃时长不会丢，但内存里的基准还是旧的 —— 界面上
+    /// 「今日活跃时长」会一直少着一截，直到下次重启才补回来。
+    #[test]
+    fn recompute_today_totals_refreshes_both_count_and_active_seconds() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_recompute");
+        let w = DbWriter::start(Duration::from_secs(3600));
+        let t0 = queries::now_ts();
+        w.record("A", t0);
+        w.record("A", t0 + 10); // 今日活跃 10 秒
+        w.flush(true);
+
+        let dk = queries::day_key_of_ts(t0);
+        // 模拟"导入把今天的数抬高了"：直接改库
+        {
+            let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+            conn.execute(
+                "UPDATE daily_counts SET count = count + 500, seconds = seconds + 4000 \
+                 WHERE date_key = ?1",
+                [dk],
+            )
+            .unwrap();
+        }
+        assert_eq!(w.today_count(), 2, "还没刷：内存仍是旧值（这条前提得成立）");
+        assert_eq!(w.today_active_seconds(), 10);
+
+        w.recompute_today_totals();
+        assert_eq!(w.today_count(), 502, "按键数跟着库走");
+        assert_eq!(w.today_active_seconds(), 4010, "活跃时长也得跟着库走");
         w.stop();
     }
 

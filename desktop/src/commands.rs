@@ -294,7 +294,7 @@ pub async fn import_legacy(state: State<'_, Arc<AppState>>) -> Result<String, St
     // 导入直接写库，重建缓存与今日计数保持一致
     focusflow_core::db::queries::invalidate_years_cache();
     if let Some(w) = db.writer() {
-        w.recompute_today_count();
+        w.recompute_today_totals();
     }
     state
         .refresh_now

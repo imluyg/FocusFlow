@@ -934,6 +934,28 @@ pub fn subcategory_profit_loss(category: &str) -> Vec<(String, f64, f64, i64)> {
     out
 }
 
+/// 两个日期之间的「整年 + 余下天数」，按日历周年数。
+///
+/// 不能拿 `总天数 / 365` 当整年：闰年混进来之后余数会漂移，差一天满三年的
+/// 记录会被算成"已经 3 年"（2021-03-16 → 2024-03-15 恰好是 1095 天，
+/// 除下来是 (3, 0)）。界面上这就是一句读起来怪、又没人会去核对的话。
+pub fn years_and_days(from: chrono::NaiveDate, today: chrono::NaiveDate) -> (i64, i64) {
+    if from >= today {
+        return (0, 0);
+    }
+    let mut years: u32 = 0;
+    while from
+        .checked_add_months(chrono::Months::new((years + 1) * 12))
+        .is_some_and(|d| d <= today)
+    {
+        years += 1;
+    }
+    let anniversary = from
+        .checked_add_months(chrono::Months::new(years * 12))
+        .unwrap_or(from);
+    (years as i64, (today - anniversary).num_days().max(0))
+}
+
 /// 距今多久：返回 [(id, 年, 天)]（天为去掉整年后的余数）。
 pub fn days_ago(ids: &[i64]) -> Vec<(i64, i64, i64)> {
     let conn = match open() {
@@ -951,8 +973,8 @@ pub fn days_ago(ids: &[i64]) -> Vec<(i64, i64, i64)> {
             if let Ok(Some(row)) = rows.next() {
                 if let (Ok(rid), Ok(date_str)) = (row.get::<_, i64>(0), row.get::<_, String>(1)) {
                     if let Ok(date) = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
-                        let days = (today - date).num_days().max(0);
-                        out.push((rid, days / 365, days % 365));
+                        let (years, rest) = years_and_days(date, today);
+                        out.push((rid, years, rest));
                     }
                 }
             }
@@ -994,6 +1016,35 @@ pub fn monthly_summary(year_month: &str) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「几年几天」按日历周年，不按 365 天一块切。
+    ///
+    /// 老实现是 `days/365, days%365`：2021-03-16 → 2024-03-15 正好 1095 天，
+    /// 除完报「3 年」，而那天还差一天才满三年。跨闰年时误差必然出现，
+    /// 因为一年从来不是 365 天。
+    #[test]
+    fn years_and_days_counts_calendar_anniversaries_not_365_day_blocks() {
+        let d = |y, m, day| chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        assert_eq!(
+            years_and_days(d(2021, 3, 16), d(2024, 3, 15)),
+            (2, 365),
+            "差一天满三年：不能报成 3 年"
+        );
+        assert_eq!(
+            years_and_days(d(2021, 3, 16), d(2024, 3, 16)),
+            (3, 0),
+            "整三年那天才是 3 年"
+        );
+        assert_eq!(years_and_days(d(2020, 1, 1), d(2020, 1, 31)), (0, 30));
+        assert_eq!(years_and_days(d(2026, 1, 1), d(2026, 1, 1)), (0, 0));
+        assert_eq!(
+            years_and_days(d(2026, 5, 1), d(2026, 1, 1)),
+            (0, 0),
+            "未来日期（手填错了购买日期）不该给出负数"
+        );
+        // 2 月 29 日出生的记录：周年被夹到 2/28，不该因此少算一整年
+        assert_eq!(years_and_days(d(2024, 2, 29), d(2025, 2, 28)), (1, 0));
+    }
 
     /// 从旧版库迁移过来的分类，`subs` 列里躺的是建表默认值 `'[]'` 而不是空串
     /// （`ALTER TABLE categories ADD COLUMN subs TEXT NOT NULL DEFAULT '[]'`：只有

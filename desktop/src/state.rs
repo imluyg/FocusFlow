@@ -288,7 +288,23 @@ fn setup_windows(app: &App, state: &AppState) {
                 let _ = win.set_position(tauri::LogicalPosition::new(w - 120.0, 60.0));
             }
         } else {
-            let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+            // 存过的坐标得夹回当前这块屏幕：换过显示器或拔掉副屏之后那对数字
+            // 常常落在工作区之外，而下面 `win.show()` 照样执行 —— 表现就是
+            // "设置里勾了悬浮窗却看不见"，界面上没有任何入口能把它召回来
+            // （只能去 config.ini 改 pos_x/pos_y）。
+            let (mut cx, mut cy) = (x, y);
+            if let Ok(Some(mon)) = win.current_monitor() {
+                let scale = win.scale_factor().unwrap_or(1.0);
+                let wa = mon.work_area();
+                let left = wa.position.x as f64 / scale;
+                let top = wa.position.y as f64 / scale;
+                // 留 120×40 可见余量：卡片实际宽度约 90px，留一点边
+                let right = left + wa.size.width as f64 / scale - 120.0;
+                let bottom = top + wa.size.height as f64 / scale - 40.0;
+                cx = cx.clamp(left, right.max(left));
+                cy = cy.clamp(top, bottom.max(top));
+            }
+            let _ = win.set_position(tauri::LogicalPosition::new(cx, cy));
         }
 
         // 启动时按配置显示悬浮窗
