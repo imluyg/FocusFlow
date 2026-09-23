@@ -599,10 +599,7 @@ mod tests {
     #[test]
     fn ensure_schema_merges_legacy_active_seconds() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_conn_merge_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("conn_merge");
 
         let year = chrono::Local::now().date_naive().year();
         let path = crate::paths::year_db_path(year);
@@ -655,7 +652,6 @@ mod tests {
         ensure_schema(&conn, year).unwrap();
         assert_eq!(ones_reopen(&conn, 1000), (42, 3600), "重复迁移必须幂等");
         drop(conn);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn ones_reopen(conn: &rusqlite::Connection, dk: i64) -> (i64, i64) {

@@ -1399,10 +1399,8 @@ mod compute_charts_tests {
         // app_dir 是进程级全局：与周报用例（会往自己目录里种年度库）并行跑时，
         // 不持锁就会读到对方的数据（表现为「空库应为 0」拿到 42 万）。
         let _serial = crate::app_dir_lock();
-        // 用隔离的临时程序目录，避免读到开发库
-        let dir = std::env::temp_dir().join(format!("ff_compute_charts_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        focusflow_core::paths::set_app_dir(&dir);
+        // 用隔离的临时程序目录，避免读到开发库（目录由返回值的 Drop 回收）
+        let _app = focusflow_core::paths::test_app_dir("compute_charts");
         let agg = compute_charts(0, None);
         assert_eq!(agg.total, 0);
         assert_eq!(agg.alltime_total, 0, "基准未构建时总计应为 0");
@@ -1417,7 +1415,6 @@ mod compute_charts_tests {
             "星期分布应为 0..=6 七个槽位且按下标有序"
         );
         focusflow_core::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 总计增量修正：基准未构建时为 0，之后按今日新增累加，

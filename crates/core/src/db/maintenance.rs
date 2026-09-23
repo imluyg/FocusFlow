@@ -1693,9 +1693,7 @@ mod tests {
     #[test]
     fn rotate_groups_by_first_segment() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_rotate_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("rotate");
         std::fs::create_dir_all(paths::backup_dir()).unwrap();
 
         let names = [
@@ -1735,7 +1733,6 @@ mod tests {
             !remaining.contains(&"focusflow_accounting_20260911_100000.db".to_string()),
             "accounting 组最旧备份应被删除"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 跨年归档前必须留下「归档前」快照。
@@ -1746,10 +1743,7 @@ mod tests {
     #[test]
     fn archiving_takes_snapshot_before_migrating() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_archive_snap_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("archive_snap");
 
         let source_year = 2025;
         let stale_year = 2024;
@@ -1803,8 +1797,6 @@ mod tests {
             snap_count, 77,
             "快照必须是归档前的状态（能查到尚未迁走的 77 次）"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 设备维度跨库归档：整数 id 必须过映射表换算，设备登记也要跟着搬。
@@ -1815,10 +1807,7 @@ mod tests {
     #[test]
     fn archive_remaps_device_ids_and_carries_registry() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_archive_dev_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("archive_dev");
 
         let dev = "HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000";
         let other = "HID#VID_1B1C&PID_1B2D#other";
@@ -1919,8 +1908,6 @@ mod tests {
             .expect("2024 年应能查到该设备");
         assert_eq!(hit.name, "HID 键盘 · 046D/C52B");
         assert_eq!(hit.count, 9);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 年度归档必须一次迁走**所有**更早年份的数据（不只上一年），且覆盖全部统计表。
@@ -1932,10 +1919,7 @@ mod tests {
     #[test]
     fn archive_migrates_all_stale_years_and_all_tables() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_archive_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("archive");
 
         let source_year = 2025;
         let dk = |y: i32, m: u32, d: u32| {
@@ -2016,8 +2000,6 @@ mod tests {
             !archive_stale_years(source_year),
             "无往年数据时不应重复归档"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 目标库已存在同 date_key 时必须合并计数而不是冲突回滚。
@@ -2027,10 +2009,7 @@ mod tests {
     #[test]
     fn archive_merges_into_existing_target_rows() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_archive_merge_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("archive_merge");
 
         let k = queries::day_key_of_date(NaiveDate::from_ymd_opt(2024, 7, 1).expect("date"));
         // 目标库（2024）已有同一天的行（历史遗留/跨年误写）
@@ -2070,8 +2049,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(merged, 12, "已存在的行应合并计数（5 + 7）");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 备份必须是**单个自包含文件**：不留 `-wal`/`-shm`，且能被只读打开。
@@ -2081,10 +2058,7 @@ mod tests {
     #[test]
     fn backup_is_self_contained_and_leaves_no_junk() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_backup_self_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("backup_self");
 
         // 源库走 WAL 模式（与运行时一致），确保覆盖「WAL 头被复制」这条路径
         let year = chrono::Local::now().year();
@@ -2133,8 +2107,6 @@ mod tests {
             .unwrap();
         assert_eq!(count, 42, "备份内容应完整");
         drop(conn);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 未变化的历史年度库不再重复备份：内容相同的快照只是白占 backup/ 与磁盘 IO。
@@ -2145,10 +2117,7 @@ mod tests {
     #[test]
     fn unchanged_historical_year_is_not_rebacked_up() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_backup_skip_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("backup_skip");
 
         let year = chrono::Local::now().year();
         let old = year - 1;
@@ -2227,18 +2196,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 33, "新备份应包含改动后的数据");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 启动自愈：不一致的天必须被修好，且体检阶段只读。
     #[test]
     fn heal_detects_before_writing_and_repairs_mismatch() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_heal_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("heal");
 
         let year = chrono::Local::now().year();
         let path = paths::year_db_path(year);
@@ -2320,8 +2284,6 @@ mod tests {
             assert!(!d.has_daily_mismatch);
             assert!(d.hourly_mismatch_days.is_empty());
         }
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 轮转删除旧备份时要连 sidecar 一起删；遗留的 sidecar 垃圾也要被清理
@@ -2329,10 +2291,7 @@ mod tests {
     #[test]
     fn rotation_and_sweep_clean_sidecars() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_backup_junk_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(dir.join("backup")).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("backup_junk");
 
         // 3 个年度备份（各带 sidecar）+ 2 个孤儿 sidecar（对应 .db 早已不在）
         for name in [
@@ -2403,8 +2362,6 @@ mod tests {
             !left.iter().any(|n| n.ends_with("-shm")),
             "空 WAL 的 sidecar 不该残留: {left:?}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 备份失败时不得留下半成品（半成品会占轮转名额、顶掉好备份）。    #[test]
@@ -2435,17 +2392,18 @@ mod tests {
         );
 
         // 停用列表解析：逗号分隔 + 空白容错（与 plugins::manager 同语义）
-        let dir = std::env::temp_dir().join(format!("ff_disabled_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        let cfg_path = dir.join("config.ini");
+        // test_app_dir 会切全局 app_dir，所以这里也得持串行锁；目录由它的 Drop 回收
+        // （原来这个用例不碰 app_dir，收尾那行手写 remove_dir_all 在只读连接未放时
+        // 会静默失败，每轮留一个目录）
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("disabled");
+        let cfg_path = _tmp.path().join("config.ini");
         std::fs::write(&cfg_path, "[plugins]\ndisabled = a_plugin, b_plugin ,\n").unwrap();
         let cfg = FocusFlowConfig::load(&cfg_path).unwrap();
         assert_eq!(
             disabled_plugin_stems(&cfg),
             vec!["a_plugin".to_string(), "b_plugin".to_string()]
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 附属库与插件文件的对应关系必须真实存在：插件改名后这条会立刻失败，
@@ -2609,10 +2567,7 @@ mod tests {
     #[test]
     fn freeze_skips_rotation_entirely() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_freeze_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(dir.join("backup")).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("freeze");
 
         for i in 0..10 {
             std::fs::write(
@@ -2641,18 +2596,13 @@ mod tests {
             2,
             "未冻结时按策略保留最近 2 份"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 备份失败时不得留下半成品（半成品会占轮转名额、顶掉好备份）。
     #[test]
     fn failed_backup_cleanup_removes_partial_file() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_backup_fail_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(dir.join("backup")).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("backup_fail");
 
         let dst = paths::backup_dir().join("focusflow_2026_20260920_000000.db");
         std::fs::write(&dst, b"partial").unwrap();
@@ -2675,8 +2625,6 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert!(left.is_empty(), "半成品与 sidecar 都应被清掉: {left:?}");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 往年数据只在设备明细里时也必须被归档；归档不得顺手造出空年度库。
@@ -2693,10 +2641,7 @@ mod tests {
     #[test]
     fn stale_device_only_rows_archive_without_creating_empty_year_dbs() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_archive_gap_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("archive_gap");
 
         let source_year = 2025;
         let stale_year = 2022;
@@ -2770,8 +2715,6 @@ mod tests {
                 "available_years 不该混进空年份 {gap}: {years:?}"
             );
         }
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// backup/ 里有几份备份库（只数 .db，SUSPECT 说明等旁证文件不算）。

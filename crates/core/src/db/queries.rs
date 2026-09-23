@@ -1314,9 +1314,7 @@ mod tests {
     #[test]
     fn invalid_days_never_panic_on_date_math() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_period_guard_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("period_guard");
 
         // 这些值此前都会让 `NaiveDate - Days::new(days as u64)` panic
         for days in [-2i64, -100, i64::MIN, i64::MAX, MAX_QUERY_DAYS + 1] {
@@ -1334,9 +1332,7 @@ mod tests {
     #[test]
     fn daily_counts_span_includes_today() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_daily_span_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("daily_span");
 
         assert_eq!(get_daily_counts(1, None).len(), 1);
         assert_eq!(get_daily_counts(200, None).len(), 200);
@@ -1426,10 +1422,7 @@ mod tests {
     #[test]
     fn device_stats_merge_join_and_dedupe() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_devq_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("devq");
 
         let dk = day_key_of_date(Local::now().date_naive());
         {
@@ -1507,7 +1500,6 @@ mod tests {
             "同型号显示名去重"
         );
         assert_eq!(stats[3].count, 10);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 登记名被写成裸设备路径时（历史脏登记）不计为真名，一律走回退。
@@ -1519,10 +1511,7 @@ mod tests {
     #[test]
     fn device_stats_ignores_device_key_as_name() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_devdirty_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("devdirty");
 
         let dk = day_key_of_date(Local::now().date_naive());
         let dirty = r"\\?\HID#VID_046D&PID_C52B&MI_00#8&2c5f&0&0000#{378de44c}";
@@ -1561,17 +1550,13 @@ mod tests {
             "我的键盘 · 1B1C/1B2D",
             "正常登记名不得被这条规则改掉"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 设备详情：各周期次数、活跃天数、首末日期、排名占比与近 30 天分布。
     #[test]
     fn device_detail_reports_periods_and_trend() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_devdetail_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("devdetail");
 
         let today = Local::now().date_naive();
         let dk = |d: &chrono::NaiveDate| day_key_of_date(*d);
@@ -1679,17 +1664,13 @@ mod tests {
         assert_eq!(other.keys[0], ("空格".to_string(), 10));
 
         crate::device_alias::invalidate_cache();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 别名生效：改过名的设备展示别名，自动名仍保留在 auto_name 里做副标题。
     #[test]
     fn device_alias_overrides_display_name() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_devq_alias_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("devq_alias");
         crate::device_alias::invalidate_cache();
 
         let key = "HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000";
@@ -1731,6 +1712,5 @@ mod tests {
         assert_eq!(stats[0].name, "HID 鼠标 · 046D/C52B");
 
         crate::device_alias::invalidate_cache();
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -21,16 +21,11 @@ mod tests {
     #[test]
     fn import_legacy_year_db_dedup() {
         let _g = guard();
-        // 旧目录
-        let old_dir = std::env::temp_dir().join(format!("ff_old_{}", std::process::id()));
-        // 当前目录（目标）
-        let new_dir = std::env::temp_dir().join(format!("ff_new_{}", std::process::id()));
-        // pid 可能被操作系统复用：先清掉上次运行残留，避免旧库干扰去重与计数断言
-        std::fs::remove_dir_all(&old_dir).ok();
-        std::fs::remove_dir_all(&new_dir).ok();
-        std::fs::create_dir_all(&old_dir).unwrap();
-        std::fs::create_dir_all(&new_dir).unwrap();
-        paths::set_app_dir(&new_dir);
+        // 旧目录（导入源）+ 当前目录（目标）。test_app_dir 会把全局 app_dir 切到自己
+        // 身上，所以后建的那个才是目标目录，顺序不能反。
+        let _old = paths::test_app_dir("old");
+        let old_dir = _old.path().to_path_buf();
+        let _new = paths::test_app_dir("new");
         db::queries::invalidate_years_cache();
 
         // 构造旧库（Python 版 schema）
@@ -110,9 +105,6 @@ mod tests {
         // 用 CLI 查询验证
         let (total, _) = db::get_stats(None, Some(2025));
         assert_eq!(total, 3);
-
-        std::fs::remove_dir_all(&old_dir).ok();
-        std::fs::remove_dir_all(&new_dir).ok();
     }
 
     /// 回归：附属库是整文件覆盖，导入前必须把**现有**库留档。
@@ -122,15 +114,12 @@ mod tests {
     #[test]
     fn import_backs_up_existing_aux_db_before_overwrite() {
         let _g = guard();
-        // 目录名必须与同文件其它用例区分开：两个用例都 set_app_dir + 清目录，
+        // 标签必须与同文件其它用例区分开：两个用例都各自切 app_dir，
         // 共用目录名会互相把对方的 seed 数据删掉（曾表现为"目标库突然不存在"）
-        let old_dir = std::env::temp_dir().join(format!("ff_auxbak_old_{}", std::process::id()));
-        let new_dir = std::env::temp_dir().join(format!("ff_auxbak_new_{}", std::process::id()));
-        std::fs::remove_dir_all(&old_dir).ok();
-        std::fs::remove_dir_all(&new_dir).ok();
-        std::fs::create_dir_all(&old_dir).unwrap();
-        std::fs::create_dir_all(&new_dir).unwrap();
-        paths::set_app_dir(&new_dir);
+        let _old = paths::test_app_dir("auxbak_old");
+        let old_dir = _old.path().to_path_buf();
+        let _new = paths::test_app_dir("auxbak_new");
+        let new_dir = _new.path().to_path_buf();
         db::queries::invalidate_years_cache();
 
         let seed = |path: &std::path::Path, item: &str| {
@@ -190,9 +179,6 @@ mod tests {
             Some("来自旧目录"),
             "导入后目标库应为旧目录内容"
         );
-
-        std::fs::remove_dir_all(&old_dir).ok();
-        std::fs::remove_dir_all(&new_dir).ok();
     }
 
     /// 回归：目标年库**已有当天聚合行**时，导入必须累加而不是插入。
@@ -205,13 +191,9 @@ mod tests {
     #[test]
     fn import_into_year_db_with_existing_rows_accumulates() {
         let _g = guard();
-        let old_dir = std::env::temp_dir().join(format!("ff_merge_old_{}", std::process::id()));
-        let new_dir = std::env::temp_dir().join(format!("ff_merge_new_{}", std::process::id()));
-        std::fs::remove_dir_all(&old_dir).ok();
-        std::fs::remove_dir_all(&new_dir).ok();
-        std::fs::create_dir_all(&old_dir).unwrap();
-        std::fs::create_dir_all(new_dir.join("data")).unwrap();
-        paths::set_app_dir(&new_dir);
+        let _old = paths::test_app_dir("merge_old");
+        let old_dir = _old.path().to_path_buf();
+        let _new = paths::test_app_dir("merge_new");
         db::queries::invalidate_years_cache();
 
         // 三条明细共用一个时间戳：同日同小时，不受时区与小时边界影响
@@ -314,8 +296,5 @@ mod tests {
             8,
             "重复迁移应保持幂等"
         );
-
-        std::fs::remove_dir_all(&old_dir).ok();
-        std::fs::remove_dir_all(&new_dir).ok();
     }
 }

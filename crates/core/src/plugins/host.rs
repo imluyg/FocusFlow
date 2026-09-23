@@ -788,10 +788,7 @@ mod tests {
     #[test]
     fn registering_host_api_creates_no_aux_databases() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_host_lazy_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("host_lazy");
 
         let lua = Lua::new();
         let database = db::Database::init_readonly();
@@ -825,7 +822,5 @@ mod tests {
             !crate::accounting::db_path().exists(),
             "记账库必须等记账 API 被调用才建"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

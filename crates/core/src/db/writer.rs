@@ -1011,10 +1011,7 @@ mod tests {
     #[test]
     fn flush_writes_each_year_to_its_own_db() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_writer_crossyear_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("writer_crossyear");
 
         let w = DbWriter::start(Duration::from_secs(3600));
 
@@ -1045,7 +1042,6 @@ mod tests {
 
         w.stop();
         crate::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 跨天边界：today_key 落后于当前日期时，record 应重置今日计数
@@ -1053,9 +1049,7 @@ mod tests {
     #[test]
     fn record_resets_today_count_on_day_change() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_writer_day_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("writer_day");
 
         let w = DbWriter::start(Duration::from_secs(3600));
         // 模拟"昨天"：today_key 是昨天的日期键、计数停留在昨日值
@@ -1072,7 +1066,6 @@ mod tests {
         w.flush(true);
         w.stop();
         crate::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// record 聚合到内存增量：daily/hourly/keys 正确累加。
@@ -1099,10 +1092,7 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         // today_active 初始基准来自全局库的 active_seconds 表，
         // 必须用独立目录隔离，否则并行/残留数据会污染断言。
-        let dir = std::env::temp_dir().join(format!("ff_writer_active_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("writer_active");
         let w = DbWriter::start(Duration::from_secs(3600));
         let t0 = queries::now_ts();
         w.record("A", t0);
@@ -1112,7 +1102,6 @@ mod tests {
         w.record("A", t0 + 102); // 间隔 2s：活跃 +2
         assert_eq!(w.state.today_active.load(Ordering::Relaxed), 12);
         w.stop();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 应用时长归属：间隔秒数在**事件发生时**归给当时的前台应用，
@@ -1120,10 +1109,7 @@ mod tests {
     #[test]
     fn record_credits_gap_to_current_app() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_writer_credits_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("writer_credits");
         let w = DbWriter::start(Duration::from_secs(3600));
         let t0 = queries::now_ts();
         let dk = queries::day_key_of_ts(t0);
@@ -1144,7 +1130,6 @@ mod tests {
         assert_eq!(agg.apps.len(), 2, "无归属的 5 秒不应落到任何应用上");
         drop(agg);
         w.stop();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// current_app 是会话态：flush 取走增量后必须保留，
@@ -1152,10 +1137,7 @@ mod tests {
     #[test]
     fn current_app_persists_across_flush() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_writer_curapp_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("writer_curapp");
         let w = DbWriter::start(Duration::from_secs(3600));
         let t0 = queries::now_ts();
         let dk = queries::day_key_of_ts(t0);
@@ -1187,7 +1169,6 @@ mod tests {
             );
         }
         w.stop();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 设备 × 键名明细：累加、落库，且不污染主统计键名表。
@@ -1195,10 +1176,7 @@ mod tests {
     fn record_device_key_persists_rows() {
         use chrono::Datelike;
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_writer_devkey_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("writer_devkey");
         let w = DbWriter::start(Duration::from_secs(3600));
         let ts = queries::now_ts();
         let dk = queries::day_key_of_ts(ts);
@@ -1234,7 +1212,6 @@ mod tests {
         assert_eq!(read("滚轮上滑"), 1);
         drop(conn);
         w.stop();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 设备维度：record_device 只累加 devices 聚合，不污染主统计；
@@ -1242,10 +1219,7 @@ mod tests {
     #[test]
     fn record_device_isolated_from_main_stats() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_writer_device_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("writer_device");
         let w = DbWriter::start(Duration::from_secs(3600));
         let ts = queries::now_ts();
         let dk = queries::day_key_of_ts(ts);
@@ -1300,17 +1274,13 @@ mod tests {
             assert!(!agg.device_meta.is_empty(), "设备登记应跨 flush 保留");
         }
         w.stop();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 设备维度落库：device_counts 累加 + devices 登记表写入。
     #[test]
     fn flush_writes_device_tables() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_writer_devflush_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("writer_devflush");
         let w = DbWriter::start(Duration::from_secs(3600));
         let ts = queries::now_ts();
         let dk = queries::day_key_of_ts(ts);
@@ -1350,7 +1320,6 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1);
         w.stop();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 启动预热：库里已登记的设备名/类型应在首个输入事件之前就可用。
@@ -1362,10 +1331,7 @@ mod tests {
     #[test]
     fn start_preloads_device_meta_from_registry() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_writer_preload_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("writer_preload");
 
         let year = chrono::Local::now().year();
         {
@@ -1422,7 +1388,6 @@ mod tests {
             assert_eq!(agg.device_meta.len(), 2, "只有两条真实登记应进入会话态");
         }
         w.stop();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 缺设备登记时的兜底命名：不能把裸路径写进 devices.name（2026-09-21）。
@@ -1433,10 +1398,7 @@ mod tests {
     #[test]
     fn device_id_in_db_registers_readable_name_without_meta() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_writer_devfb_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("writer_devfb");
 
         let year = chrono::Local::now().year();
         let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
@@ -1478,7 +1440,6 @@ mod tests {
         assert_eq!(rows, 1, "同一设备只登记一行");
 
         drop(conn);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 端到端：崩溃恢复回放后的首次落库应当用**真名**补登，而不是占位名。
@@ -1489,10 +1450,7 @@ mod tests {
     #[test]
     fn recovery_replay_writes_real_device_name() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_writer_devname_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("writer_devname");
 
         let ts = queries::now_ts();
         let dev = "HID#VID_24AE&PID_1464#e2e".to_string();
@@ -1549,17 +1507,13 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(cnt, 3, "1 次直接落库 + 2 次回放，不得重复或丢计数");
         w2.stop();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 恢复机制：设备计数随快照落盘并回放，恰好落库一次。
     #[test]
     fn recovery_replays_device_counts_once() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_writer_devrec_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("writer_devrec");
 
         let w = DbWriter::start(Duration::from_secs(3600));
         let ts = queries::now_ts();
@@ -1595,7 +1549,6 @@ mod tests {
         }
         assert_eq!(db_count(), base + 2, "设备计数应恰好回放一次");
         w2.stop();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 恢复机制：快照落盘并从内存移除 → 正常 flush 不再落库 →
@@ -1603,9 +1556,7 @@ mod tests {
     #[test]
     fn recovery_snapshot_replayed_once() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_recovery_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("recovery");
 
         let w = DbWriter::start(Duration::from_secs(3600));
         let ts = queries::now_ts();
@@ -1648,6 +1599,5 @@ mod tests {
         assert_eq!(db_count(), base + 2, "回放数据应恰好落库一次");
         assert!(!recovery_path().exists(), "恢复文件回放后应删除");
         w2.stop();
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

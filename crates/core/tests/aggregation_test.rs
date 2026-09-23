@@ -21,11 +21,8 @@ mod tests {
     #[test]
     fn today_count_persists_across_restart() {
         let _g = guard();
-        let dir = std::env::temp_dir().join(format!("ff_agg_{}", std::process::id()));
-        // pid 可能被操作系统复用：先清掉上次运行残留，避免旧库累积干扰断言
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("agg");
+        let dir = _app.path().to_path_buf();
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
@@ -50,18 +47,13 @@ mod tests {
             "重启后今日计数应从 daily_counts 恢复（回归：COUNT(*) 误用为行数）"
         );
         database2.shutdown(&config);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn daily_and_hourly_aggregate_correctly() {
         let _g = guard();
-        let dir = std::env::temp_dir().join(format!("ff_agg2_{}", std::process::id()));
-        // pid 可能被操作系统复用：先清掉上次运行残留，避免旧库累积干扰断言
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("agg2");
+        let dir = _app.path().to_path_buf();
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
@@ -102,18 +94,13 @@ mod tests {
         let (t2, _) = db::get_stats_by_date(chrono::Local::now().date_naive());
         assert_eq!(t2, 18);
         database2.shutdown(&config);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn alltime_summary_totals_all_days_and_picks_max_day() {
         let _g = guard();
-        let dir = std::env::temp_dir().join(format!("ff_alltime_{}", std::process::id()));
-        // pid 可能被操作系统复用：先清掉上次运行残留，避免旧库累积干扰断言
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("alltime");
+        let dir = _app.path().to_path_buf();
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
@@ -150,7 +137,6 @@ mod tests {
         assert_eq!(db::get_stats(None, None).0, 10);
 
         database.shutdown(&config);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 清理接口的两道闸：非正天数必须整笔拒绝，以及「保留 N 天」按含今天
@@ -163,10 +149,8 @@ mod tests {
     #[test]
     fn cleanup_refuses_non_positive_and_keeps_including_today() {
         let _g = guard();
-        let dir = std::env::temp_dir().join(format!("ff_cleanup_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("cleanup");
+        let dir = _app.path().to_path_buf();
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
@@ -212,7 +196,5 @@ mod tests {
             Some(3),
             "剩下的必须是今天那 3 次"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

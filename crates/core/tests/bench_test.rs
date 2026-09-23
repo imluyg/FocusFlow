@@ -25,9 +25,8 @@ mod tests {
     #[test]
     fn write_throughput_benchmark() {
         let _g = guard();
-        let dir = std::env::temp_dir().join(format!("ff_bench_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("bench");
+        let dir = _app.path().to_path_buf();
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
@@ -63,15 +62,13 @@ mod tests {
         );
 
         database.shutdown(&config);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn burst_aggregation_no_loss() {
         let _g = guard();
-        let dir = std::env::temp_dir().join(format!("ff_bench2_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("bench2");
+        let dir = _app.path().to_path_buf();
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
@@ -98,15 +95,13 @@ mod tests {
         assert_eq!(total, 100_000, "聚合不应丢失事件");
 
         database.shutdown(&config);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn large_db_query_performance() {
         let _g = guard();
-        let dir = std::env::temp_dir().join(format!("ff_bench3_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("bench3");
+        let dir = _app.path().to_path_buf();
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
@@ -161,7 +156,6 @@ mod tests {
         assert!(hourly_t.as_secs_f64() < 1.0, "get_hourly_stats 过慢");
 
         database.shutdown(&config);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 度量「每轮 UI 刷新的聚合序列」随年度库个数的变化。
@@ -176,11 +170,12 @@ mod tests {
         use chrono::Datelike;
         use std::time::Instant;
 
-        fn seed(years: &[i32]) {
-            let dir = std::env::temp_dir().join(format!("ff_bench_years_{}", std::process::id()));
-            std::fs::remove_dir_all(&dir).ok();
-            std::fs::create_dir_all(dir.join("data")).unwrap();
-            paths::set_app_dir(&dir);
+        /// 造 n 个年度库；返回的守卫 Drop 时删掉这次的临时目录。
+        ///
+        /// 原来这里手写 `remove_dir_all + create_dir_all` 复用同一个目录名，收尾
+        /// 那行根本没有 —— 每跑一次留一份。现在每轮 seed 各用一套新目录，用完回收。
+        fn seed(years: &[i32]) -> paths::TestAppDir {
+            let app = paths::test_app_dir("bench_years");
             db::queries::invalidate_years_cache();
             let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
             for &y in years {
@@ -233,13 +228,14 @@ mod tests {
                 conn.execute_batch("COMMIT;").unwrap();
             }
             db::queries::invalidate_years_cache();
+            app
         }
 
         let mut report = String::new();
         for n in [1usize, 4, 7] {
             let now_year = chrono::Local::now().date_naive().year();
             let years: Vec<i32> = ((now_year - n as i32 + 1)..=now_year).collect();
-            seed(&years);
+            let _app = seed(&years);
             let t = Instant::now();
             for _ in 0..10 {
                 let _ = db::get_stats(Some(30), None);
@@ -266,10 +262,7 @@ mod tests {
         use chrono::Datelike;
         use std::time::Instant;
 
-        let dir = std::env::temp_dir().join(format!("ff_bench_shells_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(dir.join("data")).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("bench_shells");
         db::queries::invalidate_years_cache();
         let now_year = chrono::Local::now().date_naive().year();
         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
@@ -353,7 +346,6 @@ mod tests {
             4,
             "空壳不该进入年份列表 —— 这条断言让基准测试本身也能守住过滤行为"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

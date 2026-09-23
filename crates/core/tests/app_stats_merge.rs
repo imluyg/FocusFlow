@@ -17,10 +17,7 @@ fn day_key_of(date: chrono::NaiveDate) -> i64 {
 
 #[test]
 fn app_stats_merges_across_days() {
-    let dir = std::env::temp_dir().join(format!("ff_app_merge_{}", std::process::id()));
-    std::fs::remove_dir_all(&dir).ok();
-    std::fs::create_dir_all(&dir).ok();
-    paths::set_app_dir(&dir);
+    let _app = paths::test_app_dir("app_merge");
 
     let today = Local::now().date_naive();
     let yesterday = today - chrono::Days::new(1);
@@ -62,6 +59,4 @@ fn app_stats_merges_across_days() {
     let (t7, m7) = db::get_app_stats(Some(7), None);
     assert_eq!(t7, 160);
     assert_eq!(m7["A"], 150);
-
-    std::fs::remove_dir_all(&dir).ok();
 }

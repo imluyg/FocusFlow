@@ -32,5 +32,11 @@ tracing.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 
+[dev-dependencies]
+# 单元测试里的「隔离临时程序目录」助手（paths::test_app_dir / TestAppDir）挂在 core 的
+# test-utils 特征上，只对 dev 构建打开：发布构建里那些代码不存在（与 core 自己的
+# dev-dependency 同一套路）。
+focusflow-core = { path = "../crates/core", features = ["test-utils"] }
+
 [lints]
 workspace = true

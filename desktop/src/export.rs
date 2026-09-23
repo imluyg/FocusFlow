@@ -351,17 +351,13 @@ mod tests {
         use focusflow_core::paths;
 
         let _serial = crate::app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_weekly_empty_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(dir.join("data")).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("weekly_empty");
         focusflow_core::db::queries::invalidate_years_cache();
 
         let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
         let r = write_weekly_report_for(d(2020, 3, 2), d(2020, 3, 8))?;
         assert!(r.is_none(), "没有任何记录时不该生成文件");
         assert!(!report_dir().exists(), "连 reports/ 目录都不该被创建出来");
-        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
@@ -392,10 +388,7 @@ mod tests {
         use focusflow_core::paths;
 
         let _serial = crate::app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_weekly_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(dir.join("data")).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("weekly");
         queries::invalidate_years_cache();
 
         let today = Local::now().date_naive();
@@ -456,8 +449,7 @@ mod tests {
         // 重跑一次：同一周必须落在同一个文件（幂等，不产生第二份）
         let again = write_weekly_report()?.expect("重跑应仍指向同一文件");
         assert_eq!(again, path);
-        std::fs::remove_dir_all(&dir).ok();
-        // 别让下一个用例继续沿着我这份已删掉的目录查年份/连接
+        // 目录由 _app 的 Drop 删除：别让下一个用例继续沿着这份年度库列表查下去
         queries::invalidate_years_cache();
         Ok(())
     }
@@ -474,10 +466,7 @@ mod tests {
         use focusflow_core::paths;
 
         let _serial = crate::app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_weekly_xyear_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(dir.join("data")).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("weekly_xyear");
         queries::invalidate_years_cache();
 
         let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
@@ -526,7 +515,7 @@ mod tests {
         // 每日表的星期标签按真实星期几走（12-29 周一、01-04 周日）
         assert!(md.contains("| 2025-12-29 | 周一 |"), "标签错位：\n{md}");
         assert!(md.contains("| 2026-01-04 | 周日 |"), "标签错位：\n{md}");
-        std::fs::remove_dir_all(&dir).ok();
+        // 目录随 _app 的 Drop 回收，年份缓存留给下一个用例重新扫
         queries::invalidate_years_cache();
         Ok(())
     }

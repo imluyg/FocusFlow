@@ -123,9 +123,7 @@ mod tests {
     #[test]
     fn shutdown_flushes_and_is_repeatable() {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_logflush_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _tmp = crate::paths::test_app_dir("logflush");
         super::init_logging();
         // init_logging 自称幂等：tracing 的 init() 二次调用会 panic，这里验一道
         super::init_logging();
@@ -151,7 +149,5 @@ mod tests {
             "shutdown 之后尾部日志应已落盘到 {}",
             logs.display()
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

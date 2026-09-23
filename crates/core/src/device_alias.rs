@@ -177,16 +177,16 @@ pub fn invalidate_cache() {
 mod tests {
     use super::*;
 
+    /// 串行锁 + 隔离目录，`f` 的返回值照旧透出。
+    ///
+    /// 目录改由 `TestAppDir` 的 Drop 回收：原来收尾那行手写 `remove_dir_all(..).ok()`
+    /// 在只读连接池还握着句柄时会静默失败，每跑一次就在 %TEMP% 留一份库。
     fn with_temp_dir<T>(name: &str, f: impl FnOnce() -> T) -> T {
         let _lock = crate::paths::test_app_dir_lock();
-        let dir = std::env::temp_dir().join(format!("ff_alias_{}_{}", name, std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).ok();
-        crate::paths::set_app_dir(&dir);
+        let _dir = crate::paths::test_app_dir(&format!("alias_{name}"));
         invalidate_cache();
         let out = f();
         invalidate_cache();
-        std::fs::remove_dir_all(&dir).ok();
         out
     }
 
