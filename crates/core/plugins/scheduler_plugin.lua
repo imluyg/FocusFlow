@@ -45,26 +45,18 @@ function on_action(id)
     end
 end
 
--- 目标程序与参数由宿主白名单校验（canonicalize 后必须位于系统安装目录，
--- 且在 [scheduler] 白名单内）。被拒时必须把原因显示出来：否则点「添加」
--- 像是没反应，用户只会反复点。
+-- 目标程序、参数与调度都由宿主校验，被拒时 scheduler_add 直接给出原因。
+-- 不再先调 scheduler_check_target / scheduler_validate 预检一遍：那两道预检和
+-- 入库之间文件可能被改（TOCTOU），而 add 的返回值本来就是同一条判定链。
 function add_sample_task()
     local target = "C:\\Windows\\notepad.exe"
-    local ok_sched, sched_msg = focusflow.scheduler_validate("daily", "09:00")
-    if not ok_sched then
-        return "调度配置无效：" .. sched_msg
-    end
-    local ok_target, target_msg = focusflow.scheduler_check_target(target, "")
-    if not ok_target then
-        focusflow.log("示例任务被拒绝：" .. target_msg)
-        return "示例任务被拒绝：" .. target_msg
-    end
-    local new_id = focusflow.scheduler_add("新任务", target, "", "daily", "09:00", true)
+    local new_id, why = focusflow.scheduler_add("新任务", target, "", "daily", "09:00", true)
     if new_id > 0 then
         focusflow.log("已添加任务 #" .. tostring(new_id))
         return "已添加任务 #" .. tostring(new_id) .. "（每日 09:00 启动记事本）"
     end
-    return "添加失败：目标被拒绝或调度库写入失败（详见日志）"
+    focusflow.log("示例任务被拒绝：" .. why)
+    return "示例任务被拒绝：" .. why
 end
 
 function _status(enabled)

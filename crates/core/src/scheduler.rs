@@ -567,16 +567,36 @@ fn approved_launch_target(target: &str, args: &str) -> anyhow::Result<std::path:
 
 /// 供 UI / 插件预检：目标程序与参数会不会被接受，返回可读原因。
 ///
-/// 入口校验失败原本只进 `tracing` 日志（`add_task` 只回一个 -1），于是插件点
-/// 「添加」后什么都不发生、也没有解释。白名单收紧（canonicalize + 来源目录 +
-/// 参数形态）之后，这种静默失败更容易撞到 —— 这里给一个能拿到文案的口子。
+/// 这是**预检**（不落库），给界面在用户点下之前把话说明白用。真正的判定以
+/// [`add_task`] 的返回原因为准 —— 它才一次做完「目标 + 参数 + 调度」，而且不存在
+/// 预检与入库之间文件被改掉的窗口。
 pub fn check_target(target_path: &str, args: &str) -> Result<(), String> {
     validate_task_target(target_path)
         .and_then(|_| validate_task_args(args))
         .map_err(|e| e.to_string())
 }
 
-/// 添加定时任务。
+/// 入库前的完整校验：目标、参数、调度。
+///
+/// 调度这一项早前**完全没有入口校验**（只有 UI 侧的 `validate_schedule`，而定时任务
+/// 唯一的入口是插件 API），于是 `"abc:xyz"` 这类值能入库；`should_run` 又把它按
+/// 00:00 解释，任务一建出来就在当轮 30 秒轮询里立刻启动了目标程序。
+fn validate_task_entry(
+    target_path: &str,
+    args: &str,
+    schedule_type: &str,
+    schedule_time: &str,
+) -> anyhow::Result<()> {
+    validate_task_target(target_path)?;
+    validate_task_args(args)?;
+    let (ok, msg) = validate_schedule(schedule_type, schedule_time);
+    if !ok {
+        anyhow::bail!("调度配置无效（{msg}）");
+    }
+    Ok(())
+}
+
+/// 添加定时任务，返回新记录 id；失败时给出可直接显示的原因。
 pub fn add_task(
     name: &str,
     target_path: &str,
@@ -584,38 +604,32 @@ pub fn add_task(
     schedule_type: &str,
     schedule_time: &str,
     enabled: bool,
-) -> i64 {
-    if let Err(e) = validate_task_target(target_path).and_then(|_| validate_task_args(args)) {
+) -> anyhow::Result<i64> {
+    if let Err(e) = validate_task_entry(target_path, args, schedule_type, schedule_time) {
         tracing::warn!("添加定时任务被拒绝（{name}）: {e}");
-        return -1;
+        return Err(e);
     }
     let created = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    match open().and_then(|conn| {
-        conn.execute(
-            "INSERT INTO scheduled_tasks
-             (name, target_path, args, schedule_type, schedule_time, enabled, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                name,
-                target_path,
-                args,
-                schedule_type,
-                schedule_time,
-                if enabled { 1 } else { 0 },
-                created
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }) {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::error!("添加定时任务失败: {e}");
-            -1
-        }
-    }
+    let conn = open().map_err(|e| anyhow::anyhow!("打开调度库失败: {e}"))?;
+    conn.execute(
+        "INSERT INTO scheduled_tasks
+         (name, target_path, args, schedule_type, schedule_time, enabled, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            name,
+            target_path,
+            args,
+            schedule_type,
+            schedule_time,
+            if enabled { 1 } else { 0 },
+            created
+        ],
+    )
+    .map_err(|e| anyhow::anyhow!("写入定时任务失败: {e}"))?;
+    Ok(conn.last_insert_rowid())
 }
 
-/// 更新任务（None 字段保持原值）。
+/// 更新任务（None 字段保持原值）；失败时给出可直接显示的原因。
 pub fn update_task(
     id: i64,
     name: Option<&str>,
@@ -624,25 +638,22 @@ pub fn update_task(
     schedule_type: Option<&str>,
     schedule_time: Option<&str>,
     enabled: Option<bool>,
-) -> bool {
+) -> anyhow::Result<()> {
     // 修改目标路径时同样校验（不修改 target 字段则跳过，避免目标被删后无法编辑其他字段）
     if let Some(t) = target_path {
         if let Err(e) = validate_task_target(t) {
             tracing::warn!("更新定时任务被拒绝（id={id}）: {e}");
-            return false;
+            return Err(e);
         }
     }
     if let Some(a) = args {
         if let Err(e) = validate_task_args(a) {
             tracing::warn!("更新定时任务被拒绝（id={id}）: {e}");
-            return false;
+            return Err(e);
         }
     }
     // 读取当前值
-    let conn = match open() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+    let conn = open()?;
     let Ok(existing) = conn.query_row(
         "SELECT name, target_path, args, schedule_type, schedule_time, enabled FROM scheduled_tasks WHERE id=?1",
         [id],
@@ -657,7 +668,7 @@ pub fn update_task(
             ))
         },
     ) else {
-        return false;
+        anyhow::bail!("定时任务不存在（id={id}）");
     };
     let new_name = name.unwrap_or(&existing.0).to_string();
     let new_target = target_path.unwrap_or(&existing.1).to_string();
@@ -665,6 +676,16 @@ pub fn update_task(
     let new_type = schedule_type.unwrap_or(&existing.3).to_string();
     let new_time = schedule_time.unwrap_or(&existing.4).to_string();
     let new_enabled = enabled.unwrap_or(existing.5 != 0);
+
+    // 调度必须按**合并后的整对**校验：只改 type（daily→once）而 time 还是 "09:00"
+    // 时，两个字段各自看着都没问题，落库后却是一条永远不该执行的记录。
+    let (ok, msg) = validate_schedule(&new_type, &new_time);
+    if !ok {
+        let e = anyhow::anyhow!("调度配置无效（{msg}）");
+        tracing::warn!("更新定时任务被拒绝（id={id}）: {e}");
+        return Err(e);
+    }
+
     let last_run: Option<String> = if schedule_time.is_some() {
         None // 修改时间时重置 last_run
     } else {
@@ -677,14 +698,14 @@ pub fn update_task(
         .flatten()
     };
 
-    let r = conn.execute(
+    conn.execute(
         "UPDATE scheduled_tasks SET name=?1, target_path=?2, args=?3, schedule_type=?4, schedule_time=?5, enabled=?6, last_run=?7 WHERE id=?8",
         rusqlite::params![
             new_name, new_target, new_args, new_type, new_time,
             if new_enabled { 1 } else { 0 }, last_run, id
         ],
-    );
-    r.map(|n| n > 0).unwrap_or(false)
+    )?;
+    Ok(())
 }
 
 /// 删除任务。
@@ -757,6 +778,21 @@ fn parse_interval(s: &str) -> Option<(i64, i64, i64)> {
     Some((start, end, interval))
 }
 
+/// 解析 'HH:MM' 为「当日第几分钟」；格式或范围不符一律 None。
+///
+/// 刻意不写成 `parse().unwrap_or(0)`：那种写法下 `"abc:xyz"` 等于 00:00，而
+/// daily 的判定是 `now_min >= target_min`，于是"非法时间"实际含义是"任何时刻都该跑"，
+/// 任务一入库就立刻启动目标程序。`"25:00"` 反过来永远跑不了。两种都比拒绝更糟。
+fn parse_hhmm(s: &str) -> Option<i64> {
+    let (h, m) = s.split_once(':')?;
+    let h: i64 = h.trim().parse().ok()?;
+    let m: i64 = m.trim().parse().ok()?;
+    if !(0..=23).contains(&h) || !(0..=59).contains(&m) {
+        return None;
+    }
+    Some(h * 60 + m)
+}
+
 /// 判断任务是否应执行（镜像 `_should_run`）。
 fn should_run(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> bool {
     if !t.enabled {
@@ -768,11 +804,10 @@ fn should_run(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> bool {
     match t.schedule_type.as_str() {
         "daily" => {
             // 格式 HH:MM
-            let (h, m) = match t.schedule_time.split_once(':') {
-                Some((h, m)) => (h.parse::<u32>().unwrap_or(0), m.parse::<u32>().unwrap_or(0)),
+            let target_min = match parse_hhmm(&t.schedule_time) {
+                Some(v) => v,
                 None => return false,
             };
-            let target_min = h as i64 * 60 + m as i64;
             if now_min < target_min {
                 return false;
             }
@@ -964,9 +999,9 @@ pub fn validate_schedule(schedule_type: &str, schedule_time: &str) -> (bool, Str
             if parts.len() != 2 {
                 return (false, "每日定时格式应为 HH:MM".into());
             }
-            match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                (Ok(h), Ok(m)) if h <= 23 && m <= 59 => (true, String::new()),
-                _ => (false, "时间超出范围".into()),
+            match parse_hhmm(t) {
+                Some(_) => (true, String::new()),
+                None => (false, "时间超出范围".into()),
             }
         }
         "once" => {
@@ -990,6 +1025,7 @@ pub fn validate_schedule(schedule_type: &str, schedule_time: &str) -> (bool, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     /// 串行锁 + 隔离目录；返回值活着期间两者都在，离开作用域删目录。
     ///
@@ -1002,6 +1038,9 @@ mod tests {
         let lock = crate::paths::test_app_dir_lock();
         let dir = crate::paths::test_app_dir(&format!("sched_{tag}"));
         let _ = crate::config::instance();
+        // 生产路径上 `Scheduler::start()` 一定会先建表，隔离目录里没有这一步时
+        // 任何"成功入库"的写法都会撞上 no such table。
+        let _ = init_db();
         (lock, dir)
     }
 
@@ -1026,8 +1065,12 @@ mod tests {
         );
 
         // 入口（add_task）必须同样拒绝，且不产生任何记录
-        let id = add_task("evil", cmd, "/c calc.exe", "once", "2000-01-01 00:00", true);
-        assert_eq!(id, -1, "被拒绝的任务不应返回有效 id");
+        let e = add_task("evil", cmd, "/c calc.exe", "once", "2000-01-01 00:00", true)
+            .expect_err("被拒绝的任务不应返回有效 id");
+        assert!(
+            e.to_string().contains("禁止") || e.to_string().contains("白名单"),
+            "原因要说清楚为什么被拒，实得: {e}"
+        );
         assert!(get_all_tasks().is_empty(), "被拒绝的任务不应入库");
     }
 
@@ -1243,16 +1286,133 @@ mod tests {
         if !std::path::Path::new(notepad).is_file() {
             return;
         }
-        let id = add_task(
+        let e = add_task(
             "exfil",
             notepad,
             "--app=https://evil.example/?d=1",
             "daily",
             "09:00",
             true,
-        );
-        assert_eq!(id, -1, "坏参数不应入库");
+        )
+        .expect_err("坏参数不应入库");
+        assert!(e.to_string().contains("开关"), "原因应可显示，实得: {e}");
         assert!(get_all_tasks().is_empty());
+    }
+
+    /// 回归：入口从来不校验调度配置（只有 UI 侧的 `validate_schedule`，而定时任务
+    /// 唯一的入口是插件 API），于是 `"abc:xyz"` 能入库；`should_run` 又按
+    /// `unwrap_or(0)` 把它当 00:00 —— daily 的判定是 `now_min >= target_min`，
+    /// 结果"建了个坏时间的任务"等于"立刻启动目标程序"。
+    #[test]
+    fn invalid_schedules_are_rejected_at_entry() {
+        let _g = isolate_app_dir("sched_entry");
+        let notepad = r"C:\Windows\notepad.exe";
+        if !std::path::Path::new(notepad).is_file() {
+            return;
+        }
+        for (stype, stime) in [
+            ("daily", "abc:xyz"),
+            ("daily", "25:00"),
+            ("daily", "09:70"),
+            ("daily", "9"),
+            ("once", "bad"),
+            ("interval", "23:00-07:00|30"),
+            ("interval", "07:00-23:00|0"),
+            ("weekly", "09:00"),
+        ] {
+            let e = add_task("t", notepad, "", stype, stime, true)
+                .expect_err("非法调度不该入库: {stype} {stime}");
+            assert!(
+                e.to_string().contains("调度配置无效"),
+                "应说明是调度问题，实得: {e}"
+            );
+        }
+        assert!(get_all_tasks().is_empty(), "被拒的调度不该留下记录");
+        assert!(add_task("t", notepad, "", "daily", "09:00", true).is_ok());
+    }
+
+    /// 构造一条 daily 任务骨架，便于按字段覆盖出各种调度配置。
+    fn daily_task(time: &str) -> ScheduledTask {
+        ScheduledTask {
+            id: 1,
+            name: "t".into(),
+            target_path: r"C:\Windows\notepad.exe".into(),
+            args: String::new(),
+            schedule_type: "daily".into(),
+            schedule_time: time.into(),
+            enabled: true,
+            last_run: None,
+            created_at: String::new(),
+        }
+    }
+
+    /// 已在库里的非法 daily 时间绝不能被当成 00:00（那就是"什么时候都该跑"）。
+    #[test]
+    fn unparseable_daily_time_never_fires() {
+        let noon = Local.with_ymd_and_hms(2026, 3, 5, 12, 0, 0).unwrap();
+        for bad in ["abc:xyz", "25:00", "09", "09:70", "", "0:0:0", "  "] {
+            let t = daily_task(bad);
+            assert!(
+                !should_run(&t, &noon),
+                "非法时间 {bad:?} 不能被解释成 00:00 然后在 12:00 触发"
+            );
+        }
+        // 合法值照旧：09:00 的任务在 12:00 且今天没跑过 → 该跑
+        assert!(should_run(&daily_task("09:00"), &noon));
+        assert!(should_run(&daily_task("9:05"), &noon));
+        assert!(!should_run(&daily_task("12:30"), &noon));
+        // 今天已跑过就不再跑
+        let done = ScheduledTask {
+            last_run: Some("2026-03-05 09:00:12".into()),
+            ..daily_task("09:00")
+        };
+        assert!(!should_run(&done, &noon));
+        // 昨天跑过的，今天到点还要跑
+        let stale = ScheduledTask {
+            last_run: Some("2026-03-04 09:00:12".into()),
+            ..daily_task("09:00")
+        };
+        assert!(should_run(&stale, &noon));
+        // last_run 写成非法格式时按"没跑过"处理，但不能因此放行非法调度
+        let junk = ScheduledTask {
+            last_run: Some("不是时间".into()),
+            ..daily_task("abc:xyz")
+        };
+        assert!(!should_run(&junk, &noon));
+    }
+
+    /// 只改调度类型时，必须按**合并后的整对**判定：daily `09:00` 改成 once 而
+    /// time 不动，两个字段各自都"没被改坏"，落库后却是一条永不执行的记录。
+    #[test]
+    fn update_validates_the_merged_schedule_pair() {
+        let _g = isolate_app_dir("sched_update_pair");
+        let notepad = r"C:\Windows\notepad.exe";
+        if !std::path::Path::new(notepad).is_file() {
+            return;
+        }
+        let id = add_task("t", notepad, "", "daily", "09:00", true).unwrap();
+        let e = update_task(id, None, None, None, Some("once"), None, None)
+            .expect_err("daily 的时间配不上 once，必须拒绝");
+        assert!(e.to_string().contains("调度配置无效"), "实得: {e}");
+        let t = &get_all_tasks()[0];
+        assert_eq!(t.schedule_type, "daily", "被拒的更新不该落库");
+
+        // 同时给出两个字段则合法
+        assert!(update_task(
+            id,
+            None,
+            None,
+            None,
+            Some("once"),
+            Some("2026-12-01 10:00"),
+            None
+        )
+        .is_ok());
+        assert_eq!(get_all_tasks()[0].schedule_type, "once");
+        // 不存在的 id 也要说清楚，而不是静默 false
+        let e = update_task(9999, Some("x"), None, None, None, None, None)
+            .expect_err("不存在的任务不该更新成功");
+        assert!(e.to_string().contains("不存在"), "实得: {e}");
     }
 
     /// 引号只做分组：`"C:\My Notes\日报.txt"` 是一个参数，不是两个。

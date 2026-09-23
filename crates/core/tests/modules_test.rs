@@ -46,21 +46,16 @@ mod tests {
             "daily",
             "09:00",
             true,
-        );
+        )
+        .unwrap();
         assert!(id > 0);
         let tasks = scheduler::get_all_tasks();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].name, "测试");
 
-        assert!(scheduler::update_task(
-            id,
-            Some("改名"),
-            None,
-            None,
-            None,
-            None,
-            Some(false)
-        ));
+        assert!(
+            scheduler::update_task(id, Some("改名"), None, None, None, None, Some(false)).is_ok()
+        );
         let tasks = scheduler::get_all_tasks();
         assert_eq!(tasks[0].name, "改名");
         assert!(!tasks[0].enabled);

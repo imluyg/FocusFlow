@@ -288,6 +288,8 @@ pub fn register_host_api(
     })?;
     host.set("scheduler_tasks", tasks_fn)?;
 
+    // 添加：返回 (id, 失败原因)。只回 -1 的话，第三方插件拿到的就是"没成功也没解释"，
+    // 而目标被白名单拒 / 调度格式无效 / 库写不进去是三件完全不同的事。
     let add_fn = lua.create_function(
         |_,
          (name, target, args, stype, stime, enabled): (
@@ -299,9 +301,10 @@ pub fn register_host_api(
             bool,
         )| {
             ensure_scheduler();
-            Ok(scheduler::add_task(
-                &name, &target, &args, &stype, &stime, enabled,
-            ))
+            match scheduler::add_task(&name, &target, &args, &stype, &stime, enabled) {
+                Ok(id) => Ok((id, String::new())),
+                Err(e) => Ok((-1i64, e.to_string())),
+            }
         },
     )?;
     host.set("scheduler_add", add_fn)?;
@@ -337,7 +340,10 @@ pub fn register_host_api(
                 Some(&stime),
                 Some(enabled),
             );
-            Ok(r)
+            match r {
+                Ok(()) => Ok((true, String::new())),
+                Err(e) => Ok((false, e.to_string())),
+            }
         },
     )?;
     host.set("scheduler_update", update_fn)?;
