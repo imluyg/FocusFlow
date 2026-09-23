@@ -297,4 +297,160 @@ mod tests {
             "重复迁移应保持幂等"
         );
     }
+
+    /// 回归：合并分支（目标年库已存在）必须把源库的**按天活跃时长**一起搬过来。
+    ///
+    /// 原来这条路只搬 `key_log` 明细，而明细里没有时长信息 —— 旧库的时长按天存在
+    /// 独立表 `active_seconds`（旧版）或 `daily_counts.seconds`（并入后），一步都没读。
+    /// 表现：换电脑把旧库并进同年库后按键数上去了，「活跃时长」却全是 0，
+    /// 而旧文件还在，谁也不会想到是没搬。
+    #[test]
+    fn import_into_existing_year_db_carries_over_active_seconds() {
+        let _g = guard();
+        let _old = paths::test_app_dir("secs_old");
+        let old_dir = _old.path().to_path_buf();
+        let _new = paths::test_app_dir("secs_new");
+        db::queries::invalidate_years_cache();
+
+        // 三条明细同一时刻 → 同一天同一小时，不受时区与日界影响
+        let ts: i64 = 1_700_000_000;
+        let off = chrono::Local::now().offset().local_minus_utc() as i64;
+        let dk = (ts + off) / 86_400;
+
+        // 旧版库形态：明细 + 独立 active_seconds（daily_counts 里还没有 seconds 列）
+        {
+            let conn = rusqlite::Connection::open(old_dir.join("focusflow_2025.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE key_log (id INTEGER PRIMARY KEY AUTOINCREMENT, key_name TEXT NOT NULL, timestamp INTEGER NOT NULL);
+                 CREATE TABLE active_seconds (date_key INTEGER PRIMARY KEY, seconds INTEGER NOT NULL);
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO key_log (key_name, timestamp) VALUES ('A', ?1), ('B', ?1), ('C', ?1)",
+                [ts],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO active_seconds VALUES (?1, 500), (?2, 900)",
+                rusqlite::params![dk, dk + 1],
+            )
+            .unwrap();
+        }
+
+        // 目标年库已存在：dk 有一天（时长比旧库小，该被抬高）、
+        // dk+2 是新版本自己采集的一天（旧库没有，绝不能被 0 覆盖）
+        {
+            let dst = paths::year_db_path(2025);
+            let conn = rusqlite::Connection::open(&dst).unwrap();
+            db::connection::ensure_schema(&conn, 2025).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 5, 42), (?2, 7, 8080)",
+                rusqlite::params![dk, dk + 2],
+            )
+            .unwrap();
+        }
+
+        let summary = migration::import_legacy_data(&old_dir);
+        assert!(summary.errors.is_empty(), "errors: {:?}", summary.errors);
+
+        let conn = rusqlite::Connection::open(paths::year_db_path(2025)).unwrap();
+        let seconds_of = |key: i64| -> i64 {
+            conn.query_row(
+                "SELECT seconds FROM daily_counts WHERE date_key = ?1",
+                [key],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            seconds_of(dk),
+            500,
+            "同一天取两侧较大值，不是相加也不是覆盖"
+        );
+        assert_eq!(seconds_of(dk + 1), 900, "旧库独有的那一天必须补进来");
+        assert_eq!(seconds_of(dk + 2), 8080, "旧库没有的天不得被清零");
+        assert_eq!(
+            conn.query_row(
+                "SELECT count FROM daily_counts WHERE date_key = ?1",
+                [dk],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            8,
+            "明细照旧累加（原有 5 + 导入 3）"
+        );
+
+        // 二次导入必须幂等：时长不得翻倍
+        let summary2 = migration::import_legacy_data(&old_dir);
+        assert!(summary2.errors.is_empty(), "errors: {:?}", summary2.errors);
+        let conn = rusqlite::Connection::open(paths::year_db_path(2025)).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT SUM(seconds) FROM daily_counts", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            500 + 900 + 8080,
+            "重复导入不得再增加活跃时长"
+        );
+    }
+
+    /// 回归：源库**只剩聚合表**（没有 key_log）时，活跃时长仍要搬过来。
+    ///
+    /// 暂存明细聚完就丢，所以这种旧库很常见。原来那段 `has_src_table` 提前 return
+    /// 在它之前，等于把这类源库整段跳过 —— 时长必须先并，再谈明细。
+    #[test]
+    fn import_from_aggregate_only_legacy_db_still_carries_seconds() {
+        let _g = guard();
+        let _old = paths::test_app_dir("agg_old");
+        let old_dir = _old.path().to_path_buf();
+        let _new = paths::test_app_dir("agg_new");
+        db::queries::invalidate_years_cache();
+
+        let dk: i64 = 20_500;
+        {
+            let conn = rusqlite::Connection::open(old_dir.join("focusflow_2025.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE daily_counts (date_key INTEGER PRIMARY KEY, count INTEGER NOT NULL, seconds INTEGER NOT NULL);
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts VALUES (?1, 99, 500), (?2, 30, 900)",
+                rusqlite::params![dk, dk + 1],
+            )
+            .unwrap();
+        }
+        {
+            let dst = paths::year_db_path(2025);
+            let conn = rusqlite::Connection::open(&dst).unwrap();
+            db::connection::ensure_schema(&conn, 2025).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 5, 42)",
+                [dk],
+            )
+            .unwrap();
+        }
+
+        let summary = migration::import_legacy_data(&old_dir);
+        assert!(summary.errors.is_empty(), "errors: {:?}", summary.errors);
+
+        let conn = rusqlite::Connection::open(paths::year_db_path(2025)).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT SUM(seconds) FROM daily_counts", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            500 + 900,
+            "无明细的旧库也要把时长并进来了"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count FROM daily_counts WHERE date_key = ?1",
+                [dk],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            5,
+            "聚合计数不做累加（无法幂等去重），原有按键数必须保持原样"
+        );
+    }
 }

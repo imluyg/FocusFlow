@@ -6,7 +6,9 @@
 //!
 //! 设计：
 //! - 年度键鼠库 `focusflow_YYYY.db`：先写入暂存表 key_log（按 timestamp 去重，幂等），
-//!   再通过聚合迁移落进 daily/hourly/key 三张聚合表并压缩文件
+//!   再通过聚合迁移落进 daily/hourly/key 三张聚合表并压缩文件；
+//!   按天的**活跃时长**单独并（明细里没有时长信息，旧库存在 `active_seconds` 表
+//!   或 `daily_counts.seconds` 里，同一天取两侧较大值 —— 幂等且不覆盖新值）
 //! - 附属库（accounting/pomodoro/scheduler/edge_history）：整体复制覆盖，
 //!   **覆盖前先把现有库改名留档**（见 [`backup_before_overwrite`]）——
 //!   导入目录由用户自己选，选错目录不能让当前数据凭空消失
@@ -217,6 +219,10 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
     let dst_conn = connection::open_rw(&dst_path)?;
     connection::ensure_schema(&dst_conn, year)?;
 
+    // 活跃时长必须在检查 key_log 之前先并：这一步与明细无关，而源库有可能
+    // 早就只剩聚合表（暂存明细聚合完就被丢弃），那种库走不到下面那段。
+    merge_active_seconds_from_src(&src_conn, &dst_conn)?;
+
     // 确认源库有 key_log 表
     let has_src_table: bool = src_conn
         .query_row(
@@ -228,6 +234,7 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
     if !has_src_table {
         return Ok(0);
     }
+    merge_active_seconds_from_src(&src_conn, &dst_conn)?;
 
     // 暂存表按需创建：确认源库确实有明细才建，避免在目标库留下空表 + 唯一索引
     // （运行期不写它，无条件建表会让每个年度库白占 2~4 页）
@@ -264,6 +271,64 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
     record_import_marker(&dst_path, &src_path)?;
 
     Ok(imported)
+}
+
+/// 读一份「date_key → 活跃秒数」（`sql` 只接受本模块内的字面量）。
+fn read_day_seconds(conn: &Connection, sql: &str) -> anyhow::Result<Vec<(i64, i64)>> {
+    let mut stmt = conn.prepare(sql)?;
+    let list = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(list)
+}
+
+/// 把源库的「每天活跃秒数」并进目标库，返回目标库净增的秒数。
+///
+/// 合并分支（目标年库已存在）原先只搬 `key_log` 明细，而**明细里没有时长信息**：
+/// 活跃时长按天存在独立表 `active_seconds`（旧版）或 `daily_counts.seconds`
+/// （2026-09-21 并入后），那条路上没有任何一步读它们。于是"换电脑/换目录"把
+/// 旧库并进已有同年库时，按键数上去了、活跃时长却整段留在旧文件里。
+///
+/// 取 `MAX()` 而不是相加：重复导入不能把一天算成两天；而目标库某天是新版本
+/// 自己采集的，它的时长就是真值，不能被旧库那天的 0 覆盖（旧版早期没记时长）。
+fn merge_active_seconds_from_src(src: &Connection, dst: &Connection) -> anyhow::Result<i64> {
+    let rows: Vec<(i64, i64)> = if connection::table_exists(src, "active_seconds") {
+        read_day_seconds(src, "SELECT date_key, seconds FROM active_seconds")?
+    } else if connection::column_exists(src, "daily_counts", "seconds") {
+        read_day_seconds(src, "SELECT date_key, seconds FROM daily_counts")?
+    } else {
+        // 最早的旧版根本没记活跃时长 —— 没东西可搬，不是丢数据
+        return Ok(0);
+    };
+    if rows.iter().all(|(_, s)| *s <= 0) {
+        return Ok(0);
+    }
+
+    let before: i64 = dst.query_row(
+        "SELECT COALESCE(SUM(seconds), 0) FROM daily_counts",
+        [],
+        |r| r.get(0),
+    )?;
+    for (date_key, seconds) in rows.iter().filter(|(_, s)| *s > 0) {
+        // 补进来的那天可能一个按键记录都没有（时长口径与按键口径分别上线过）：
+        // count 给 0，与 `merge_active_seconds_into_daily` 的既有口径一致。
+        dst.execute(
+            "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 0, ?2)
+             ON CONFLICT(date_key)
+             DO UPDATE SET seconds = MAX(daily_counts.seconds, excluded.seconds)",
+            rusqlite::params![date_key, seconds],
+        )?;
+    }
+    let after: i64 = dst.query_row(
+        "SELECT COALESCE(SUM(seconds), 0) FROM daily_counts",
+        [],
+        |r| r.get(0),
+    )?;
+    let gained = after - before;
+    if gained > 0 {
+        tracing::info!("从旧库并入活跃时长 {gained} 秒");
+    }
+    Ok(gained)
 }
 
 /// 记录源文件指纹（大小 + 修改时间）到目标库 meta，用于重复导入检测。

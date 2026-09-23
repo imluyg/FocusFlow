@@ -142,7 +142,7 @@ fn apply_rw_pragmas(conn: &Connection) -> anyhow::Result<()> {
 }
 
 /// 表是否存在。
-fn table_exists(conn: &Connection, table: &str) -> bool {
+pub(crate) fn table_exists(conn: &Connection, table: &str) -> bool {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
         [table],
@@ -160,7 +160,7 @@ pub fn table_exists_readonly(path: &Path, table: &str) -> bool {
 }
 
 /// 表里是否有指定列（旧形态判定用）。
-fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+pub(crate) fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     // 表名来自本模块内的字面量，无注入面；用 format 而非绑定参数是为了兼容
     // pragma_table_info 的参数绑定差异。
     conn.prepare(&format!(
