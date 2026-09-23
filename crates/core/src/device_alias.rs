@@ -100,30 +100,77 @@ pub fn table() -> AliasTable {
             }
         }
     }
-    let map = read_map(&path);
+    let map = match try_read_map(&path) {
+        AliasRead::Good(m) => m,
+        // 读不出可信内容时只这一次返回空表，**不写缓存**：否则一次同步盘占用会让
+        // "这个用户没有任何别名"这个假象一直挂到文件 mtime 变化为止。
+        _ => return AliasTable::from_map(&BTreeMap::new()),
+    };
     let table = AliasTable::from_map(&map);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *cache = Some((mtime, table.clone(), path));
     table
 }
 
-/// 读取文件成有序 map（解析失败返回空，坏文件不影响主流程）。
-fn read_map(path: &std::path::Path) -> BTreeMap<String, String> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return BTreeMap::new();
-    };
-    match serde_json::from_str::<BTreeMap<String, String>>(&text) {
-        Ok(map) => map,
+/// 读别名文件的结果 —— 分三类，因为只有"读不出、但内容可能完好"这一类该拒绝写回。
+///
+/// `set()` 的做法是"读全表 → 改一行 → 整体写回"，所以旧实现把几种失败全并成
+/// "空表"就有问题：一次改名会**静默抹掉其余全部别名**，函数还照旧返回 Ok。
+/// 触发路径都不罕见：
+/// - `Unreadable`：OneDrive/杀软正占着文件（共享冲突）、权限问题 —— 内容很可能是好的，
+///   覆盖就是真丢数据，必须停手；
+/// - `Broken`：非法 UTF-8（记事本"另存为 ANSI"）或 JSON 截断 —— 这份内容我们自己已经
+///   用不了，另存一份 `.json.bad` 之后可以从空表重新开始（既有测试断言的
+///   "坏文件后仍可正常写入"就是这一类，语义保留）；
+/// - `Good`：正常，或文件本来不存在。
+enum AliasRead {
+    Good(BTreeMap<String, String>),
+    Broken,
+    Unreadable,
+}
+
+fn try_read_map(path: &std::path::Path) -> AliasRead {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return AliasRead::Good(BTreeMap::new());
+        }
         Err(e) => {
-            tracing::error!("设备别名文件解析失败（已忽略）: {e}");
-            BTreeMap::new()
+            tracing::error!("读取设备别名文件失败（内容可能完好），本次不据此覆盖: {e}");
+            return AliasRead::Unreadable;
+        }
+    };
+    match serde_json::from_slice::<BTreeMap<String, String>>(&bytes) {
+        Ok(map) => AliasRead::Good(map),
+        Err(e) => {
+            tracing::error!("设备别名文件解析失败，原文另存为 .json.bad 后重新开始: {e}");
+            // 留一份原文，名字还有机会救回来；只留第一次，别把目录刷成一堆备份
+            let bad = path.with_extension("json.bad");
+            if !bad.exists() {
+                let _ = std::fs::write(&bad, &bytes);
+            }
+            AliasRead::Broken
         }
     }
 }
 
+/// 读不出可信内容时给调用方（界面）的原因文案。
+fn alias_unreadable(path: &std::path::Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "设备别名文件此刻读不出来（常被同步盘或杀软短暂占用），已取消本次改动：\
+         继续写会把其余别名一起抹掉。稍等几秒再试一次即可；文件位置 {}",
+        path.display()
+    )
+}
+
 /// 写入别名：`alias` 为空白时等同删除。返回写入后的数量。
 pub fn set(device_key: &str, alias: &str) -> anyhow::Result<usize> {
-    let mut map = read_map(&alias_path());
+    let path = alias_path();
+    let mut map = match try_read_map(&path) {
+        AliasRead::Good(m) => m,
+        AliasRead::Broken => BTreeMap::new(),
+        AliasRead::Unreadable => return Err(alias_unreadable(&path)),
+    };
     let trimmed = alias.trim();
     if trimmed.is_empty() {
         map.remove(device_key);
@@ -136,7 +183,12 @@ pub fn set(device_key: &str, alias: &str) -> anyhow::Result<usize> {
 
 /// 删除某设备别名，返回是否确有删除。
 pub fn clear(device_key: &str) -> anyhow::Result<bool> {
-    let mut map = read_map(&alias_path());
+    let path = alias_path();
+    let mut map = match try_read_map(&path) {
+        AliasRead::Good(m) => m,
+        AliasRead::Broken => BTreeMap::new(),
+        AliasRead::Unreadable => return Err(alias_unreadable(&path)),
+    };
     let removed = map.remove(device_key).is_some();
     if removed {
         write_map(&map)?;
@@ -276,5 +328,64 @@ mod tests {
             );
             assert_eq!(table().resolve("HID#MSFT0001&Col01#另一个实例"), None);
         });
+    }
+}
+
+#[cfg(test)]
+mod unreadable_file_tests {
+    use super::*;
+
+    /// 「文件被占用」与「文件内容坏了」是两件事：前者绝不能覆盖，后者要能自救。
+    ///
+    /// 旧实现把两者都当成"空表"，于是一次改名会连带**静默抹掉其余全部别名**并返回 Ok。
+    #[test]
+    fn unreadable_file_is_not_overwritten_but_broken_file_self_heals() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("alias_unreadable");
+        set("k1", "办公键盘").expect("正常写入应当成功");
+        set("k2", "游戏鼠标").expect("正常写入应当成功");
+        let path = alias_path();
+        let good = std::fs::read(&path).expect("别名文件应存在");
+        assert!(String::from_utf8_lossy(&good).contains("办公键盘"));
+
+        // ① 被别的程序独占打开（同步盘/杀软那一类，内容本身是好的）：必须停手
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let hold = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0) // 拒绝一切共享：后续 open 直接报共享冲突
+                .open(&path)
+                .expect("占位句柄应能打开");
+            let err = set("k3", "新名字").expect_err("读不出来时必须拒绝整体写回");
+            assert!(err.to_string().contains("读不出来"), "{err}");
+            assert!(
+                !path.with_extension("json.bad").exists(),
+                "内容没问题，不该被当成坏文件另存"
+            );
+            drop(hold);
+            // 内容比对要放在释放占位句柄之后：share_mode(0) 之下连测试自己也读不到它
+            assert_eq!(
+                std::fs::read(&path).expect("文件应还在"),
+                good,
+                "被拒绝的写回绝不能碰原文件"
+            );
+            // 反向腿：占用结束后同一次改名要能成功，且原有别名一条不少
+            let n = set("k3", "新名字").expect("释放占用后应当能写");
+            assert_eq!(n, 3, "原有的两条别名必须还在: {n}");
+            assert_eq!(table().resolve("k1"), Some("办公键盘"));
+            assert_eq!(table().resolve("k3"), Some("新名字"));
+        }
+
+        // ② 内容真的坏了（非法 UTF-8 / 不是合法 JSON）：另存原文，从空表重新开始
+        std::fs::write(&path, b"{ not json \xff\xfe ").expect("写坏文件失败");
+        invalidate_cache();
+        assert!(table().is_empty(), "坏文件不该让读路径 panic");
+        set("k4", "重新开始").expect("坏文件应当可以自救（既有测试的语义保留）");
+        assert!(
+            path.with_extension("json.bad").is_file(),
+            "原文要留一份，名字还有机会救回来"
+        );
+        assert_eq!(table().resolve("k4"), Some("重新开始"));
     }
 }

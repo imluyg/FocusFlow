@@ -24,7 +24,22 @@ use rusqlite::Connection;
 thread_local! {
     static RO_POOL: RefCell<HashMap<PathBuf, (Connection, std::time::Instant)>> =
         RefCell::new(HashMap::new());
+    /// 本线程上次清池时对应的全局代次；与 `RO_GEN` 不一致就说明别的线程做过失效
+    static RO_GEN_SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+/// 只读连接池的**全局**代次。
+///
+/// 池子是 thread_local 的，而失效动作（归档/导入/压缩/按日期删数据）发生在别的线程上
+/// —— init 主线程、或 async 命令的 tokio worker。原先的 `clear_ro_cache()` 只清得掉
+/// 调用者自己那一份，于是存活几个月的统计线程会继续拿着指向"已被换掉的同名文件"的句柄
+/// 读旧内容；更绕的是 `available_years()` 走的是非池化的 `open_ro`，年份照样被列出来，
+/// 表现就是"列出了这一年、查它却是 0"。改成惰性比对代次：每个线程下一次用到时自愈。
+static RO_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 测试用：池子里真正**新打开**过多少次连接（用来判断"有没有复用陈旧句柄"）。
+#[cfg(test)]
+static RO_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // 连接缓存上限：超过则按 LRU 淘汰最久未用的条目，防止多年份库长期运行后无界增长。
 //
@@ -38,7 +53,13 @@ const RO_POOL_MAX: usize = 12;
 /// 使用缓存中的只读连接执行 `f`。连接不存在或打开失败时返回 `None`。
 pub fn with_ro_conn<T>(path: &Path, f: impl FnOnce(&Connection) -> T) -> Option<T> {
     RO_POOL.with(|pool| {
+        let gen = RO_GEN.load(std::sync::atomic::Ordering::Acquire);
         let mut pool = pool.borrow_mut();
+        if RO_GEN_SEEN.get() != gen {
+            // 别的线程调用过 clear_ro_cache()：本线程的陈旧句柄全部作废
+            pool.clear();
+            RO_GEN_SEEN.set(gen);
+        }
         if !pool.contains_key(path) {
             // LRU 淘汰最久未用条目（此前整体 clear 会造成缓存抖动）
             if pool.len() >= RO_POOL_MAX {
@@ -52,6 +73,8 @@ pub fn with_ro_conn<T>(path: &Path, f: impl FnOnce(&Connection) -> T) -> Option<
             }
             match open_ro(path) {
                 Ok(conn) => {
+                    #[cfg(test)]
+                    RO_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     pool.insert(path.to_path_buf(), (conn, std::time::Instant::now()));
                 }
                 Err(e) => {
@@ -75,7 +98,10 @@ pub fn with_ro_conn<T>(path: &Path, f: impl FnOnce(&Connection) -> T) -> Option<
 
 /// 清空只读连接缓存（归档/导入/压缩/删除数据后调用，避免持有失效句柄）。
 pub fn clear_ro_cache() {
+    // 先推进全局代次（别的线程下次取连接时自愈），再清掉本线程这一份
+    RO_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     RO_POOL.with(|pool| pool.borrow_mut().clear());
+    RO_GEN_SEEN.with(|g| g.set(RO_GEN.load(std::sync::atomic::Ordering::Acquire)));
 }
 
 /// 打开一个可写连接并应用标准 PRAGMA。
@@ -661,5 +687,76 @@ mod tests {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod ro_pool_thread_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    fn make_db_at(path: &std::path::Path, value: i64) {
+        let conn = Connection::open(path).expect("建库失败");
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS t (v INTEGER);")
+            .expect("建表失败");
+        conn.execute("INSERT INTO t (v) VALUES (?1)", [value])
+            .expect("插入失败");
+        drop(conn);
+    }
+
+    fn read_t(conn: &Connection) -> i64 {
+        conn.query_row("SELECT v FROM t ORDER BY v LIMIT 1", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap_or(-999)
+    }
+
+    /// 别的线程调用 `clear_ro_cache()` 之后，本线程的连接池必须真的作废。
+    ///
+    /// 池子是 thread_local，而失效动作（归档/导入/压缩/按日期删数据）跑在 init 主线程
+    /// 或 async 命令的 tokio worker 上：旧实现只清得掉调用者自己那一份，于是存活几个月
+    /// 的统计线程会一直复用指向"已被换掉的同名文件"的旧句柄。
+    /// 断的是"重开了连接"而不是"读到了新内容"—— 后者要在 Windows 上换掉一个正被
+    /// 打开着的文件（改名/删除都受共享句柄阻挡），换成计次既确定又不依赖文件系统脾气。
+    #[test]
+    fn clear_ro_cache_invalidates_other_threads_too() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("ro_gen");
+        let path = dir.path().join("gen_year.db");
+        make_db_at(&path, 5);
+
+        let (started_tx, started_rx) = channel::<(u64, i64)>();
+        let (go_tx, go_rx) = channel::<()>();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let before = RO_OPENS.load(Ordering::Relaxed);
+            let first = with_ro_conn(&worker_path, read_t).expect("首次读取失败");
+            let after_first = RO_OPENS.load(Ordering::Relaxed);
+            let _ = started_tx.send((after_first - before, first));
+            let released = go_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+            let again_before = RO_OPENS.load(Ordering::Relaxed);
+            let second = with_ro_conn(&worker_path, read_t).unwrap_or(-1);
+            let after_second = RO_OPENS.load(Ordering::Relaxed);
+            (released, second, after_second - again_before)
+        });
+
+        let (opens_first, first) = started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("工作线程没能完成首次读取");
+        assert_eq!(opens_first, 1, "前置条件：首次使用应当新开一条连接");
+        assert_eq!(first, 5, "前置条件：读到的是建库时写入的值");
+
+        clear_ro_cache(); // 从**另一个线程**失效
+        let _ = go_tx.send(());
+
+        let (released, second, opens_second) = worker.join().expect("工作线程 panic");
+        assert!(released, "工作线程等待失效信号超时");
+        assert_eq!(second, 5, "内容没变，值应当一致");
+        assert_eq!(
+            opens_second, 1,
+            "另一个线程 clear_ro_cache() 之后，本线程必须重开连接（旧实现这里复用陈旧句柄 → 0）"
+        );
     }
 }
