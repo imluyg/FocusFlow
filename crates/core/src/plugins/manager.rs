@@ -222,11 +222,16 @@ impl PluginManager {
         self.disabled_list().iter().any(|s| s.as_str() == stem)
     }
 
-    /// 启用/停用插件（按文件名）。返回操作后的启用状态。
+    /// 启用/停用插件（按文件名）。
     ///
     /// 停用会卸载已加载实例并调用其 cleanup；启用会立即加载。
-    /// 配置写入失败时原样返回 false，不改动内存状态。
-    pub fn set_enabled(&mut self, stem: &str, enabled: bool) -> bool {
+    ///
+    /// 刻意不返回"是否成功"。`config.set` 只把改动排进 300ms 去抖的持久化队列、
+    /// 永远返回 Ok，所以 `Err` 分支只能是死代码；而它原先返回的是"操作后的启用
+    /// 状态"，于是**停用成功**时给出 false，调用方一句 `if !ok` 就把成功报成了
+    /// 「写入插件启用状态失败」—— 插件页每点一次「停用」都弹一条失败，可插件确实
+    /// 已经卸载。返回值无法同时表达这两件事，那就只留一个。
+    pub fn set_enabled(&mut self, stem: &str, enabled: bool) {
         let mut list = self.disabled_list();
         if enabled {
             list.retain(|s| s.as_str() != stem);
@@ -235,7 +240,6 @@ impl PluginManager {
         }
         if let Err(e) = self.config.set("plugins", "disabled", &list.join(",")) {
             tracing::error!("写入插件启用状态失败 ({stem}): {e}");
-            return false;
         }
         if enabled {
             // 只有当前未加载时才加载，避免重复初始化
@@ -265,7 +269,6 @@ impl PluginManager {
                 self.unload_plugin(&n);
             }
         }
-        enabled
     }
 
     /// 列出目录中所有插件（含已停用的），停用的不执行其代码。

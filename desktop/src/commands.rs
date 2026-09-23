@@ -494,9 +494,6 @@ pub fn set_plugin_enabled(
     file: String,
     enabled: bool,
 ) -> Result<bool, String> {
-    let ok = crate::plugins::with_manager(&state.db, |pm| pm.set_enabled(&file, enabled));
-    if !ok {
-        return Err("写入插件启用状态失败".to_string());
-    }
+    crate::plugins::with_manager(&state.db, |pm| pm.set_enabled(&file, enabled));
     Ok(enabled)
 }
