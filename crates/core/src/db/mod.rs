@@ -109,15 +109,20 @@ impl Database {
         }
     }
 
-    /// 优雅关闭：flush + 备份 + 停止写线程。
+    /// 优雅关闭：flush + 停止写线程 + 备份。
+    ///
+    /// 备份必须排在 `stop()` 之后：`stop()` 里处理线程还要做最后一次 flush_pending，
+    /// 而 `flush(true)` 最多只等 3 秒、超时也只 warn（跨年那天新建年度库 + ensure_schema
+    /// 真会超）。原先备份夹在两次 flush 中间，一旦第一次超时，那份备份就永久少了最后
+    /// 几毫秒才落盘的增量 —— 而它正是次日恢复时要用的那一份。
     pub fn shutdown(&self, config: &FocusFlowConfig) {
         if let Some(w) = &self.writer {
             w.flush(true);
+            w.stop();
             if config.get_bool("database", "backup_on_exit", true) {
                 let max_backups = config.get_int("database", "max_backups", 5).max(1);
                 maintenance::backup_database(max_backups);
             }
-            w.stop();
         }
         tracing::info!("数据库已关闭");
     }

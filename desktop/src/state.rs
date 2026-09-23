@@ -343,6 +343,35 @@ fn setup_windows(app: &App, state: &AppState) {
 }
 
 /// 设置各窗口 WebView2 内存档位：
+/// 在某个窗口的 WebView2 上执行一段闭包，并**等它真的执行完**，返回它给出的结果。
+///
+/// 为什么要等：`with_webview` 在主线程上是同步执行，在别的线程上只是把消息投递给
+/// 主循环（tauri-runtime-wry 的 `send_user_message`：只有 `current_thread().id() ==
+/// main_thread_id` 才 inline 跑，否则走 `proxy.send_event` 立刻返回 Ok）。
+/// 原先两处都写成"投递完马上读一个共享 bool"，于是从后台线程调用时**永远**读到 false：
+/// `webview-bg-state` 那条同步循环每轮都判失败，白跑满 60 轮（每轮还要再投两次 COM
+/// 调用），并且每次启动都在日志里留下一条「控制器长时间未就绪」的假警报 —— 真出故障时
+/// 这条日志已经没人信了。副作用本身是落地的，所以除了噪音和 60 秒空转没人受害，
+/// 但这条假警报会把后来查内存问题的人带到错的方向上。
+///
+/// 主线程调用时闭包已经跑完，`recv` 立即返回；投递不出去/主循环卡住时最多等 2 秒，
+/// 报 false 让调用方按原样重试。
+fn with_webview_sync(
+    win: &tauri::WebviewWindow,
+    f: impl FnOnce(tauri::webview::PlatformWebview) -> bool + Send + 'static,
+) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    if win
+        .with_webview(move |webview| {
+            let _ = tx.send(f(webview));
+        })
+        .is_err()
+    {
+        return false;
+    }
+    matches!(rx.recv_timeout(Duration::from_secs(2)), Ok(true))
+}
+
 /// 应用活跃（主窗口可见）→ Normal；仅托盘/悬浮窗（非活跃）→ Low。
 /// WebView2 官方 MemoryUsageTargetLevel API，非活跃时设 Low 可显著降低内存占用。
 /// 主窗口虽隐藏但其页面仍在运行，同样要降档才能把内存压下来。
@@ -351,10 +380,7 @@ pub fn set_floating_memory_level(app: &tauri::AppHandle, low: bool) -> bool {
     let mut all_ok = true;
     for label in ["main", "floating"] {
         if let Some(win) = app.get_webview_window(label) {
-            // with_webview 闭包无返回值，用共享标志记录是否真正设置成功
-            let done = Arc::new(AtomicBool::new(false));
-            let done_cb = Arc::clone(&done);
-            let result = win.with_webview(move |webview| {
+            let ok = with_webview_sync(&win, move |webview| {
                 #[cfg(windows)]
                 unsafe {
                     use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -370,25 +396,22 @@ pub fn set_floating_memory_level(app: &tauri::AppHandle, low: bool) -> bool {
                             } else {
                                 COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
                             };
-                            done_cb.store(
-                                v19.SetMemoryUsageTargetLevel(level).is_ok(),
-                                Ordering::SeqCst,
-                            );
-                        } else {
-                            tracing::warn!(
-                                "WebView2 运行时过旧，不支持内存档位 API（需 1.0.2390+）"
-                            );
+                            return v19.SetMemoryUsageTargetLevel(level).is_ok();
                         }
+                        tracing::warn!("WebView2 运行时过旧，不支持内存档位 API（需 1.0.2390+）");
+                        // 运行时太旧是**永久性**的不可用，重试到 60 秒之外也不会变好
+                        return true;
                     }
-                    // CoreWebView2 未就绪：静默，等待调用方重试
+                    // CoreWebView2 未就绪：报 false，让调用方重试
+                    false
                 }
                 #[cfg(not(windows))]
                 {
                     let _ = low;
-                    done_cb.store(true, Ordering::SeqCst);
+                    true
                 }
             });
-            all_ok = all_ok && result.is_ok() && done.load(Ordering::SeqCst);
+            all_ok = all_ok && ok;
         }
     }
     all_ok
@@ -403,22 +426,18 @@ pub fn set_webview_rendering(app: &tauri::AppHandle, label: &str, visible: bool)
     let Some(win) = app.get_webview_window(label) else {
         return false;
     };
-    // with_webview 闭包无返回值，用共享标志记录是否真正设置成功（同 set_floating_memory_level）
-    let done = Arc::new(AtomicBool::new(false));
-    let done_cb = Arc::clone(&done);
-    let result = win.with_webview(move |webview| {
+    with_webview_sync(&win, move |webview| {
         #[cfg(windows)]
         unsafe {
             let controller = webview.controller();
-            done_cb.store(controller.SetIsVisible(visible).is_ok(), Ordering::SeqCst);
+            controller.SetIsVisible(visible).is_ok()
         }
         #[cfg(not(windows))]
         {
             let _ = visible;
-            done_cb.store(true, Ordering::SeqCst);
+            true
         }
-    });
-    result.is_ok() && done.load(Ordering::SeqCst)
+    })
 }
 
 /// 显示主窗口（不存在则懒创建）。

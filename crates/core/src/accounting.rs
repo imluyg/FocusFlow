@@ -456,11 +456,7 @@ pub fn add_subcategory(category: &str, sub_name: &str) -> (bool, String) {
             |r| r.get(0),
         )
         .unwrap_or_default();
-    let mut subs: Vec<String> = subs_raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut subs: Vec<String> = parse_subs(&subs_raw);
     if subs.iter().any(|s| s == sub_name) {
         return (
             false,
@@ -498,11 +494,7 @@ pub fn update_subcategory(category: &str, old_sub: &str, new_sub: &str) -> (bool
             |r| r.get(0),
         )
         .unwrap_or_default();
-    let mut subs: Vec<String> = subs_raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut subs: Vec<String> = parse_subs(&subs_raw);
     if subs.iter().any(|s| s == new_sub) {
         return (
             false,
@@ -566,12 +558,13 @@ pub fn delete_subcategory(category: &str, sub_name: &str) -> (bool, String) {
             |r| r.get(0),
         )
         .unwrap_or_default();
-    let subs: Vec<String> = subs_raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s != sub_name)
+    let all = parse_subs(&subs_raw);
+    let subs: Vec<String> = all
+        .iter()
+        .filter(|s| s.as_str() != sub_name)
+        .cloned()
         .collect();
-    if subs.len() == subs_raw.split(',').filter(|s| !s.trim().is_empty()).count() {
+    if subs.len() == all.len() {
         return (false, format!("子分类 [{sub_name}] 不存在"));
     }
     match conn.execute(
@@ -605,15 +598,7 @@ pub fn get_all_categories() -> Vec<Category> {
     };
     let result = stmt.query_map([], |r| {
         let subs_raw: String = r.get(3)?;
-        let subs: Vec<String> = if subs_raw.is_empty() {
-            Vec::new()
-        } else {
-            subs_raw
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        };
+        let subs: Vec<String> = parse_subs(&subs_raw);
         Ok(Category {
             id: r.get(0)?,
             name: r.get(1)?,
@@ -625,6 +610,21 @@ pub fn get_all_categories() -> Vec<Category> {
         Ok(rows) => rows.flatten().collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// `categories.subs` 的解析口径（逗号分隔），全模块共用。
+///
+/// 刻意把字面量 `[]` 也当作"没有子分类"：建表语句给这列的默认值是 `'[]'`，
+/// `ALTER TABLE ... ADD COLUMN subs TEXT NOT NULL DEFAULT '[]'` 补列时同样如此，
+/// 于是**从旧版库迁移过来、原本一条子分类都没有**的分类，列里躺着的就是 `[]`。
+/// 只按 `split(',')` 过滤空串的话，界面上会凭空多出一个名叫 `[]` 的子分类（还能被
+/// 选中写进记录），而给它"添加子分类"会把 `[],新名字` 真的写回库里。
+fn parse_subs(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "[]")
+        .map(str::to_string)
+        .collect()
 }
 
 /// 按 id 获取记录。
@@ -646,11 +646,7 @@ pub fn get_subcategories(category: &str) -> Vec<String> {
         if let Ok(mut rows) = stmt.query([category]) {
             if let Ok(Some(row)) = rows.next() {
                 let subs_raw: String = row.get(0).unwrap_or_default();
-                for s in subs_raw
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                {
+                for s in parse_subs(&subs_raw) {
                     if !out.contains(&s) {
                         out.push(s);
                     }
@@ -968,4 +964,63 @@ pub fn monthly_summary(year_month: &str) -> (f64, f64) {
         )
         .unwrap_or(0.0);
     (expense, income)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 从旧版库迁移过来的分类，`subs` 列里躺的是建表默认值 `'[]'` 而不是空串
+    /// （`ALTER TABLE categories ADD COLUMN subs TEXT NOT NULL DEFAULT '[]'`：只有
+    /// 旧 `subcategories` 表里有行的那批会被 UPDATE 覆盖，一条子分类都没有的那批
+    /// 就留着字面量 `[]`）。各读取点原先只 `split(',')` 去空串，于是界面上凭空多出
+    /// 一个名叫 `[]` 的子分类，还能被选中写进记录。
+    #[test]
+    fn migrated_empty_subs_is_not_a_subcategory() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_subs");
+        init_db().expect("建库失败");
+        {
+            let conn = open().expect("打开库失败");
+            conn.execute(
+                "INSERT INTO categories (name,type,subs) VALUES ('迁移来的','both','[]')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO categories (name,type,subs) VALUES ('新建的','both','')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let migrated = get_all_categories()
+            .into_iter()
+            .find(|c| c.name == "迁移来的")
+            .expect("应读到该分类");
+        assert!(
+            migrated.subs.is_empty(),
+            "默认值 [] 不该变成一个可选中的子分类: {:?}",
+            migrated.subs
+        );
+        assert_eq!(get_subcategories("迁移来的"), Vec::<String>::new());
+        // 给它加子分类时，也不能把 [] 一并写回库里
+        let (ok, msg) = add_subcategory("迁移来的", "零食");
+        assert!(ok, "{msg}");
+        assert_eq!(get_subcategories("迁移来的"), vec!["零食".to_string()]);
+
+        // 反向腿：真实子分类必须照旧读得到，否则上面几条只是"什么都没读到"
+        {
+            let conn = open().expect("打开库失败");
+            conn.execute(
+                "UPDATE categories SET subs='饮料,零食' WHERE name='新建的'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            get_subcategories("新建的"),
+            vec!["饮料".to_string(), "零食".to_string()]
+        );
+    }
 }

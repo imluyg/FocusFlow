@@ -263,37 +263,53 @@ impl PomodoroTimer {
     }
 
     pub fn start_work(&self) {
-        {
+        let (pending, started) = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if s.state == STATE_WORK {
-                return;
+                (None, false)
+            } else {
+                let p = take_current(&mut s);
+                s.state = STATE_WORK.to_string();
+                s.paused = false;
+                s.planned = s.work_minutes * 60;
+                s.remaining = s.planned;
+                s.elapsed = 0;
+                s.key_count = 0;
+                s.start_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                (p, true)
             }
-            save_current(&mut s);
-            s.state = STATE_WORK.to_string();
-            s.paused = false;
-            s.planned = s.work_minutes * 60;
-            s.remaining = s.planned;
-            s.elapsed = 0;
-            s.key_count = 0;
-            s.start_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        };
+        if !started {
+            return;
+        }
+        if let Some(session) = pending {
+            persist_session(&session);
         }
         tracing::info!("番茄钟开始工作");
     }
 
     pub fn start_break(&self) {
-        {
+        let (pending, started) = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if s.state == STATE_BREAK {
-                return;
+                (None, false)
+            } else {
+                let p = take_current(&mut s);
+                s.state = STATE_BREAK.to_string();
+                s.paused = false;
+                s.planned = s.break_minutes * 60;
+                s.remaining = s.planned;
+                s.elapsed = 0;
+                s.key_count = 0;
+                s.start_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                (p, true)
             }
-            save_current(&mut s);
-            s.state = STATE_BREAK.to_string();
-            s.paused = false;
-            s.planned = s.break_minutes * 60;
-            s.remaining = s.planned;
-            s.elapsed = 0;
-            s.key_count = 0;
-            s.start_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        };
+        if !started {
+            return;
+        }
+        if let Some(session) = pending {
+            persist_session(&session);
         }
         tracing::info!("番茄钟开始休息");
     }
@@ -331,14 +347,18 @@ impl PomodoroTimer {
     }
 
     pub fn stop(&self) {
-        {
+        let pending = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            save_current(&mut s);
+            let p = take_current(&mut s);
             s.state = STATE_IDLE.to_string();
             s.paused = false;
             s.remaining = 0;
             s.elapsed = 0;
             s.key_count = 0;
+            p
+        };
+        if let Some(session) = pending {
+            persist_session(&session);
         }
         tracing::info!("番茄钟已停止");
     }
@@ -352,12 +372,16 @@ impl PomodoroTimer {
     }
 
     pub fn shutdown(&self) {
-        {
+        let pending = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            save_current(&mut s);
+            let p = take_current(&mut s);
             s.state = STATE_IDLE.to_string();
-        }
+            p
+        };
         self.stop.store(true, Ordering::SeqCst);
+        if let Some(session) = pending {
+            persist_session(&session);
+        }
     }
 }
 
@@ -401,25 +425,31 @@ fn build_session(s: &TimerState) -> Option<Session> {
     })
 }
 
-/// 保存当前阶段记录（须持有锁）。
+/// 在锁内取出待落盘的那一段并复位计数；**I/O 留给调用方在出锁之后做**。
+/// `None` = 无需落库（空闲、还没计时、或计划时长无效）。
 ///
-/// 调用方都在主线程（stop/shutdown 由宿主 API 触发），本来就要等这一次
-/// I/O，不会额外冻住别人；计时线程的阶段完成走的是另一条出锁再写的路径。
-fn save_current(s: &mut TimerState) {
-    let Some(session) = build_session(s) else {
-        return;
-    };
+/// 为什么不在这里写库：`save_session` 走 `open_local()`，那是 `busy_timeout=15s` 的
+/// SQLite 写操作。而 `record_key()` 每个按键都要抢同一把 `state` 锁（rdev 钩子线程
+/// 同步调用），锁里等库 = 整个界面跟着卡住，Windows 还会在 LowLevelHooksTimeout 之后
+/// 干脆不再回调钩子 —— 表现是"统计悄悄不涨了"。计时线程的阶段完成早就是这么改的
+/// （见 `tick_loop`），这四条路径当时漏下了。
+fn take_current(s: &mut TimerState) -> Option<Session> {
+    let session = build_session(s)?;
     // 零秒会话不入库也不计数：`today_summary` 是按 work 行数算番茄数的，
     // 留下一行 actual_seconds=0 的记录同样会被数成一个番茄。
     if session.actual_seconds <= 0 {
-        return;
+        return None;
     }
-    let counted = session.actual_seconds >= 1;
-    if let Err(e) = save_session(&session) {
-        tracing::error!("保存番茄钟记录失败: {e}");
-    }
-    if s.state == STATE_WORK && counted {
+    if s.state == STATE_WORK {
         s.work_finished += 1;
+    }
+    Some(session)
+}
+
+/// 出锁后落盘 `take_current` 交出来的那一段。
+fn persist_session(session: &Session) {
+    if let Err(e) = save_session(session) {
+        tracing::error!("保存番茄钟记录失败: {e}");
     }
 }
 
@@ -479,7 +509,7 @@ mod tests {
     /// 开始还不满一秒就停：不该留下一条"完成了一个番茄"的记录。
     ///
     /// `build_session` 原先把 0 秒垫成 `(planned - remaining).max(1)`，于是
-    /// actual_seconds=1 → `save_current` 里 `>= 1` 的判定通过 → `work_finished` +1，
+    /// actual_seconds=1 → 落库计数那一步的 `>= 1` 判定通过 → `work_finished` +1，
     /// `today_summary` 也把它算成一个番茄：手一抖点了开始又点停止，今天就多一个番茄。
     #[test]
     fn stopping_before_the_first_tick_records_nothing() {
@@ -524,5 +554,59 @@ mod tests {
 
         let got = get_sessions_by_date(&today, 100);
         assert_eq!(got.len(), 1, "23:59:59 开始的会话被查询边界吃掉了");
+    }
+}
+
+#[cfg(test)]
+mod busy_lock_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// 库被占住时，`stop()` 等 SQLite 没错，但不该把 `state` 锁一起拖着等。
+    ///
+    /// `record_key()` 每个按键都要抢这把锁（rdev 钩子线程同步调用），而原先
+    /// start_work / start_break / stop / shutdown 四条路径在锁里做 I/O，
+    /// `open_local()` 的 busy_timeout 是 15 秒：库一被占住（WAL checkpoint、备份、
+    /// 杀软握着 -wal），整个界面跟着卡住，Windows 过了 LowLevelHooksTimeout 还会
+    /// 干脆不再回调钩子 —— 表现是"统计悄悄不涨了"。`tick_loop` 早就改成出锁再写了，
+    /// 这四条是漏下的那几条。
+    #[test]
+    fn stop_does_not_hold_the_state_lock_while_the_db_is_busy() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("pomo_busy_lock");
+        init_db().expect("建库失败");
+        let timer = PomodoroTimer::new();
+        timer.start_work();
+        // 计时要真的走过一秒，stop() 才有东西要落库（零秒段刻意不写）
+        std::thread::sleep(Duration::from_millis(1200));
+
+        // 另一个连接占住写锁：WAL 下一个 IMMEDIATE 事务就足以挡住 INSERT
+        let hold = open_local().expect("占位连接失败");
+        hold.execute_batch("BEGIN IMMEDIATE").expect("占锁失败");
+
+        let t = Arc::clone(&timer);
+        let stopper = std::thread::spawn(move || t.stop());
+        std::thread::sleep(Duration::from_millis(80));
+        let mut lock_free = false;
+        for _ in 0..25 {
+            if timer.state.try_lock().is_ok() {
+                lock_free = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        // 放掉写锁，让 stop() 里那次写落完
+        let _ = hold.execute_batch("ROLLBACK");
+        drop(hold);
+        let waited = Instant::now();
+        stopper.join().expect("stop 线程 panicked");
+        timer.shutdown();
+        assert!(
+            lock_free,
+            "库被占住期间 state 锁必须已经放开（等到 {:?} 才脱身）",
+            waited.elapsed()
+        );
+        // 反向腿：这一段确实落了库，否则上面的"不卡"只是因为什么都没写
+        assert_eq!(get_recent_sessions(10).len(), 1);
     }
 }
