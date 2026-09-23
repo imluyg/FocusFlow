@@ -15,12 +15,31 @@ use crate::paths;
 
 /// Edge History 数据库路径。
 pub fn edge_history_path() -> PathBuf {
+    // 单测把"Edge 的库"指向自己造的夹具：真机上的 History 既不确定（他随时在浏览），
+    // 也不该被测试读走一份副本。
+    #[cfg(test)]
+    if let Some(p) = EDGE_PATH_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return p;
+    }
     if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
         PathBuf::from(local_app).join(r"Microsoft\Edge\User Data\Default\History")
     } else {
         PathBuf::from(r"C:\Users\Default\AppData\Local\Microsoft\Edge\User Data\Default\History")
     }
 }
+
+/// 测试夹具路径（进程级，靠 `test_app_dir_lock` 串行化）。
+#[cfg(test)]
+static EDGE_PATH_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// 本进程进过 `with_edge_snapshot` 几次 —— 补档那条路要求"一批查询只走一轮"，
+/// 光看代码结构断言不住，只能数。
+#[cfg(test)]
+static SNAPSHOT_ROUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Chrome 时间戳（1601-01-01 起微秒）转 datetime。
 #[allow(dead_code)]
@@ -55,7 +74,10 @@ fn temp_copy_path() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("focusflow_edge_{}_{nanos}.db", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "{TEMP_COPY_PREFIX}{}_{nanos}.db",
+        std::process::id()
+    ))
 }
 
 /// 删除副本及其 WAL/SHM 附属文件。
@@ -66,14 +88,63 @@ fn remove_temp_copy(temp: &std::path::Path) {
     }
 }
 
+/// 副本名里稳定的前缀，供启动时清扫识别。
+const TEMP_COPY_PREFIX: &str = "focusflow_edge_";
+
+/// 清扫 `%TEMP%` 里残留副本的年龄门槛。
+///
+/// 一份副本只在 `with_edge_snapshot` 兜底期间存在（毫秒到秒级），留够一个数量级
+/// 的余量就不会碰到另一个实例正在用的文件；门槛再短就成了"两个实例互删"。
+const STALE_TEMP_COPY_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// 删除目录里老于 `max_age` 的 Edge 副本（含 `-wal`/`-shm`），返回删掉的个数。
+///
+/// 为什么需要这一条：副本里是**明文浏览记录**，正常路径每次都 `remove_temp_copy`，
+/// 但 release 是 `panic = "abort"`、被任务管理器直接杀也来不及删 —— 那份完整的
+/// History 就永久躺在 `%TEMP%`，谁都能读。`dir` 参数是为测试留的：单测扫自己的
+/// 临时目录，不去碰系统 `%TEMP%`。
+fn sweep_stale_temp_copies_in(dir: &std::path::Path, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(TEMP_COPY_PREFIX) || !name.contains(".db") {
+            continue;
+        }
+        // mtime 读不出来就留着：宁可少删，也不要把一个状态不明的文件删掉
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        // 时钟回拨/未来 mtime → 当作 0 龄，不删
+        let age = now
+            .duration_since(mtime)
+            .unwrap_or(std::time::Duration::ZERO);
+        if age > max_age && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// 旧版本曾把副本放在程序目录 `data/_edge_history_temp.db`，
-/// 崩溃时会残留明文浏览记录，首次查询时清理历史残留。
-fn cleanup_legacy_temp_once() {
+/// 崩溃时会残留明文浏览记录；顺手扫 `%TEMP%` 里本模块留下的副本。
+/// 一个进程只跑一次，所以放在每次快照读取的入口，而不是等到真要复制时才清。
+fn cleanup_stale_copies_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let legacy = paths::data_dir().join("_edge_history_temp.db");
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", legacy.display(), suffix));
+        }
+        let removed = sweep_stale_temp_copies_in(&std::env::temp_dir(), STALE_TEMP_COPY_AGE);
+        if removed > 0 {
+            // 说清"为什么会有"，否则用户只看到一句"我删了你临时目录里的东西"
+            tracing::warn!(
+                "清理了 {removed} 份上一次异常退出残留的 Edge 历史副本（位于系统临时目录，含明文浏览记录）"
+            );
         }
     });
 }
@@ -90,6 +161,9 @@ fn cleanup_legacy_temp_once() {
 /// 总数，若各自兜底，被锁时最坏要走两轮 300ms busy 等 + 两轮各 3 次 ≤100MB 复制。
 /// 共用快照后只剩一轮，且两个数取自同一时点，不会出现「总数比昨天小」。
 fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
+    #[cfg(test)]
+    SNAPSHOT_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cleanup_stale_copies_once();
     let path = edge_history_path();
     if !path.exists() {
         return None;
@@ -108,7 +182,6 @@ fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
     }
 
     // 2) 复制兜底：先检查大小，超大库跳过复制避免卡顿
-    cleanup_legacy_temp_once();
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     if size > EDGE_COPY_MAX_BYTES {
         tracing::warn!(
@@ -142,33 +215,60 @@ fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
     None
 }
 
-/// 查询指定日期的 Edge 历史记录数（失败/被锁返回 None）。
+/// 在**一份**快照上逐日取计数（`days` 通常是一批缺失的历史日期）。
 ///
-/// **会阻塞调用线程**（最坏 300ms busy 等待 + 3 轮 ≤100MB 整文件复制），所以只
-/// 允许后台线程调用；跑在主线程上的宿主 Lua API 一律改读本地缓存库
-/// （见 `saved_count_on`），否则点一下就冻住界面。
-fn query_edge_history_count(target_date: NaiveDate) -> Option<i64> {
-    let (chrome_start, chrome_end) = chrome_day_range(target_date)?;
-    with_edge_snapshot(move |conn| {
-        conn.query_row(
+/// 返回 `None` 表示这条快照根本不可用（被锁 / 没有 `urls` 表），调用方
+/// （`with_edge_snapshot`）据此走复制兜底；已经开始有结果后中途失败则返回
+/// 已取到的那部分 —— 半批也比全弃强，剩下的日期下一轮还会被挑出来。
+///
+/// 替代了原来的 `query_edge_history_count(day)`：那个形状让每个缺失日各走一遍
+/// 快照（各一次 300ms busy 等待 + 最多 3 份 ≤100MB 整文件复制）。
+fn counts_on_snapshot(conn: &Connection, days: &[NaiveDate]) -> Option<Vec<(NaiveDate, i64)>> {
+    let mut out = Vec::with_capacity(days.len());
+    for day in days {
+        let Some((chrome_start, chrome_end)) = chrome_day_range(*day) else {
+            continue;
+        };
+        match conn.query_row(
             "SELECT COUNT(*) FROM urls WHERE last_visit_time >= ?1 AND last_visit_time < ?2",
             rusqlite::params![chrome_start, chrome_end],
             |r| r.get::<_, i64>(0),
-        )
-        .ok()
-    })
+        ) {
+            Ok(count) => out.push((*day, count)),
+            Err(e) => {
+                if out.is_empty() {
+                    tracing::debug!("Edge 历史批量补档查询失败，转复制兜底: {e}");
+                    return None;
+                }
+                tracing::debug!(
+                    "Edge 历史批量补档中途失败，先收下已取到的 {} 天: {e}",
+                    out.len()
+                );
+                break;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// 某天 [00:00, 次日 00:00) 对应的 Chrome 微秒区间。
+///
+/// 右端点取**次日的本地零点**，不是"本日零点 + 24 小时"：有夏令时的日子真实长度是
+/// 23 或 25 小时，固定加 24 小时会让相邻两天的区间互相重叠（同一条记录计进两天）或
+/// 留出空洞（某天最后一小时谁都不算）。
 fn chrome_day_range(target_date: NaiveDate) -> Option<(i64, i64)> {
-    let naive = target_date.and_hms_opt(0, 0, 0)?;
-    // DST 空档（时钟跳变）该时刻无对应本地时间，回退取最早可用映射
-    let day_start = match Local.from_local_datetime(&naive).single() {
-        Some(dt) => dt,
-        None => Local.from_local_datetime(&naive).earliest()?,
-    };
-    let day_end = day_start + chrono::Duration::days(1);
+    let day_start = local_midnight(target_date)?;
+    let day_end = local_midnight(target_date.succ_opt()?)?;
     Some((datetime_to_chrome(&day_start), datetime_to_chrome(&day_end)))
+}
+
+/// 某日本地零点。DST 跳变的空档里该时刻不存在，回退取该日最早可用映射。
+fn local_midnight(day: NaiveDate) -> Option<chrono::DateTime<Local>> {
+    let naive = day.and_hms_opt(0, 0, 0)?;
+    match Local.from_local_datetime(&naive).single() {
+        Some(dt) => Some(dt),
+        None => Local.from_local_datetime(&naive).earliest(),
+    }
 }
 
 pub fn edge_db_path() -> PathBuf {
@@ -371,9 +471,12 @@ pub fn refresh_state() -> &'static str {
     }
 }
 
+/// 补档往回看多少天（与趋势表的口径一致）。
+const BACKFILL_DAYS: i64 = 30;
+
 /// 更新今天并返回 (是否成功, 今日数, 总数)。
 /// 任一步失败（Edge 库被锁/不可读）返回 (false, 0, 0)，调用方据此提示用户，
-/// 避免把失败静默当成"0 条记录"。成功后后台补齐近 30 天缺失的历史计数。
+/// 避免把失败静默当成"0 条记录"。同一次快照顺手补齐近 30 天缺失的历史计数。
 ///
 /// 调用方应当用 [`spawn_update_today`] 而不是直接调本函数（本函数会阻塞调用线程）。
 pub fn update_today_edge_history() -> (bool, i64, i64) {
@@ -381,9 +484,11 @@ pub fn update_today_edge_history() -> (bool, i64, i64) {
     let Some((chrome_start, chrome_end)) = chrome_day_range(today) else {
         return (false, 0, 0);
     };
-    // 今日数与总数取自同一份快照：被锁时只兜底复制一次副本，
-    // 也不会出现「总数比今日小」这种跨时点的错帧。
-    let pair = with_edge_snapshot(move |conn| {
+    // 要补哪些天必须在开快照**之前**定好：这样今日数、总数和整批补档共用同一轮
+    // 快照，被锁时也只兜底复制一份副本，且所有数字取自同一时点。
+    let missing = missing_days_before(today, BACKFILL_DAYS);
+    let pending = missing.len();
+    let batch = with_edge_snapshot(move |conn| {
         let day = conn
             .query_row(
                 "SELECT COUNT(*) FROM urls WHERE last_visit_time >= ?1 AND last_visit_time < ?2",
@@ -394,59 +499,61 @@ pub fn update_today_edge_history() -> (bool, i64, i64) {
         let total = conn
             .query_row("SELECT COUNT(*) FROM urls", [], |r| r.get::<_, i64>(0))
             .ok()?;
-        Some((day, total))
+        // 补档一条查不动时不该把已经到手的今日数/总数一起丢掉：退化成"这轮不补"
+        let filled = counts_on_snapshot(conn, &missing).unwrap_or_default();
+        Some((day, total, filled))
     });
-    match pair {
-        Some((today_count, total)) => {
+    match batch {
+        Some((today_count, total, filled)) => {
             save_edge_history_count(today, today_count);
             save_edge_history_meta("total", total);
-            // 后台补齐近 30 天缺失日期（不阻塞刷新返回）
-            std::thread::Builder::new()
-                .name("edge-backfill".into())
-                .spawn(backfill_edge_history(30))
-                .ok();
+            if !filled.is_empty() {
+                for (day, count) in &filled {
+                    save_edge_history_count(*day, *count);
+                }
+                tracing::info!(
+                    "Edge 历史已补齐 {} 天缺失记录（{} 天待补，与今日数同一份快照）",
+                    filled.len(),
+                    pending
+                );
+            }
             (true, today_count, total)
         }
         _ => (false, 0, 0),
     }
 }
 
-/// 补齐近 N 天缺失的 Edge 历史计数（趋势表）。
-/// 只查询本地库中还没有记录的天，避免每次全量重查。
-fn backfill_edge_history(days: i64) -> impl FnOnce() + Send + 'static {
-    move || {
-        let today = Local::now().date_naive();
-        let start = today - chrono::Days::new((days - 1).max(0) as u64);
-        let existing: std::collections::HashSet<String> = open_local()
-            .ok()
-            .and_then(|conn| {
-                conn.prepare("SELECT date FROM edge_history WHERE date >= ?1")
-                    .ok()
-                    .and_then(|mut stmt| {
-                        stmt.query_map([start.format("%Y-%m-%d").to_string()], |r| {
-                            r.get::<_, String>(0)
-                        })
-                        .ok()
-                        .map(|it| it.flatten().collect())
-                    })
-            })
-            .unwrap_or_default();
-        let mut filled = 0;
-        let mut day = start;
-        while day <= today {
-            let key = day.format("%Y-%m-%d").to_string();
-            if !existing.contains(&key) {
-                if let Some(c) = query_edge_history_count(day) {
-                    save_edge_history_count(day, c);
-                    filled += 1;
-                }
-            }
-            day = day + chrono::Days::new(1);
+/// 近 `days` 天里本地缓存库还没有记录的日子（不含 `today`，那条由刷新主路写）。
+fn missing_days_before(today: NaiveDate, days: i64) -> Vec<NaiveDate> {
+    let start = today - chrono::Days::new((days - 1).max(0) as u64);
+    let existing = saved_dates_since(start);
+    let mut out = Vec::new();
+    let mut day = start;
+    while day < today {
+        if !existing.contains(&day.format("%Y-%m-%d").to_string()) {
+            out.push(day);
         }
-        if filled > 0 {
-            tracing::info!("Edge 历史已补齐 {} 天缺失记录", filled);
-        }
+        day = day + chrono::Days::new(1);
     }
+    out
+}
+
+/// 本地缓存库里 `start` 之后（含）已有记录的日子集合。
+fn saved_dates_since(start: NaiveDate) -> std::collections::HashSet<String> {
+    open_local()
+        .ok()
+        .and_then(|conn| {
+            conn.prepare("SELECT date FROM edge_history WHERE date >= ?1")
+                .ok()
+                .and_then(|mut stmt| {
+                    stmt.query_map([start.format("%Y-%m-%d").to_string()], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .ok()
+                    .map(|it| it.flatten().collect())
+                })
+        })
+        .unwrap_or_default()
 }
 
 /// 保存上次刷新的数值（meta 表），插件重启后恢复显示，避免出现误导性的 "—" / 0。
@@ -505,6 +612,189 @@ pub fn trend_counts(days: i64) -> Vec<(String, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 把"Edge 的库"指向夹具文件，析构时还原（panic 时也不会留给下一个用例）。
+    struct EdgeFixture;
+    impl Drop for EdgeFixture {
+        fn drop(&mut self) {
+            *EDGE_PATH_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// 造一份 Edge 形状的 History 库（列名对齐 Chrome 的 `urls` 表）。
+    fn write_edge_fixture(tag: &str, last_visit_times: &[i64]) -> EdgeFixture {
+        let path = paths::data_dir().join(format!("{tag}_edge_history.db"));
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        let conn = Connection::open(&path).expect("夹具库应能创建");
+        conn.execute_batch(
+            "CREATE TABLE urls (
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL,
+                title TEXT,
+                visit_count INTEGER,
+                last_visit_time INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for t in last_visit_times {
+            conn.execute(
+                "INSERT INTO urls (url, title, visit_count, last_visit_time) VALUES (?1,'t',1,?2)",
+                rusqlite::params![format!("https://example.com/{t}"), t],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        *EDGE_PATH_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+        EdgeFixture
+    }
+
+    /// 某天 `[00:00, 次日 00:00)` 起点的 Chrome 微秒值。
+    fn chrome_start_of(day: NaiveDate) -> i64 {
+        chrome_day_range(day).unwrap().0
+    }
+
+    /// Chrome 纪元换算的独立校验：不借用模块自己的 `chrome_day_range`，直接对
+    /// 一个手算的常量。夹具是拿同一个函数造的，只有这条能证明纪元没歪。
+    ///
+    /// 1601-01-01→1970-01-01 是 134774 天 = 11_644_473_600 秒；
+    /// 2020-01-01T00:00:00Z 的 Unix 秒 1_577_836_800 → 微秒 13_222_310_400_000_000。
+    #[test]
+    fn chrome_epoch_matches_a_hand_computed_instant() {
+        let dt = Utc
+            .timestamp_opt(1_577_836_800, 0)
+            .single()
+            .expect("合法 Unix 秒")
+            .with_timezone(&Local);
+        assert_eq!(datetime_to_chrome(&dt), 13_222_310_400_000_000);
+    }
+
+    /// 一天的窗口上界是**次日零点**而非"本日 + 24 小时"：零点整那条属于下一天。
+    #[test]
+    fn snapshot_counts_use_half_open_local_days() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _app = crate::paths::test_app_dir("edge_half_open");
+        let today = Local::now().date_naive();
+        let y = today - chrono::Days::new(1);
+        let hour = 3_600 * 1_000_000;
+        let rows = [
+            chrome_start_of(y),            // y 的零点：属于 y
+            chrome_start_of(y) + hour,     // y 的上午：属于 y
+            chrome_start_of(today),        // 今天的零点：不该算进 y
+            chrome_start_of(today) + hour, // 今天
+        ];
+        let _fx = write_edge_fixture("halfopen", &rows);
+        let conn = Connection::open(edge_history_path()).unwrap();
+        let got = counts_on_snapshot(&conn, &[y, today]).unwrap();
+        assert_eq!(got, vec![(y, 2), (today, 2)], "零点整那条必须落到下一天");
+    }
+
+    /// 相邻两天的区间必须严丝合缝地拼起来：既不重叠也不留空洞。
+    ///
+    /// 注：这条不变量在 UTC+8（本机）拿新旧实现都验不出差别 —— 旧实现是
+    /// "本日零点 + 24 小时"，只有真实日长不等于 24 小时的那天（有夏令时的地区）
+    /// 才会错开。写成断言是为了让它在有 DST 的机器上真的把关，而不是装成已复现。
+    #[test]
+    fn day_windows_tile_exactly() {
+        let today = Local::now().date_naive();
+        for offset in 0..400 {
+            let d = today - chrono::Days::new(offset);
+            let Some(next) = d.succ_opt() else { continue };
+            let (_, end) = chrome_day_range(d).unwrap();
+            let (next_start, _) = chrome_day_range(next).unwrap();
+            assert_eq!(end, next_start, "{d} 的右端点应等于次日的左端点");
+            let (start, _) = chrome_day_range(d).unwrap();
+            assert!(start < end, "{d} 的窗口不该为空或反向");
+        }
+    }
+
+    /// **一轮刷新只走一份快照**：今日数、总数、以及 29 天补档全部在同一次
+    /// `with_edge_snapshot` 里查完，且在函数返回时就已写进本地库。
+    ///
+    /// 旧实现是 `spawn` 一个游离线程、对每个缺失日各调一次 `query_edge_history_count`，
+    /// 也就是最坏 30 轮"300ms busy 等待 + 3 份 ≤100MB 整文件复制"，还不受
+    /// `REFRESH_SLOT` 跟踪。把这条注回旧形状，本用例的 `== 1` 立刻变 `== 2`。
+    #[test]
+    fn one_refresh_backfills_every_missing_day_in_a_single_snapshot() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _app = crate::paths::test_app_dir("edge_backfill");
+        let today = Local::now().date_naive();
+        let y = today - chrono::Days::new(1);
+        let two = today - chrono::Days::new(2);
+        // 本地库只有 `two` 这一天 → 补档还剩 29 天（今天由主路写）
+        save_edge_history_count(two, 7);
+        let rows = [
+            chrome_start_of(today),
+            chrome_start_of(today) + 500_000,
+            chrome_start_of(y) + 3_000_000,
+            chrome_start_of(two) + 3_000_000,
+        ];
+        let _fx = write_edge_fixture("backfill", &rows);
+
+        SNAPSHOT_ROUNDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let (ok, today_count, total) = update_today_edge_history();
+        let rounds = SNAPSHOT_ROUNDS.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert!(ok, "夹具可读，刷新不该失败");
+        assert_eq!((today_count, total), (2, 4));
+        assert_eq!(rounds, 1, "今日数+总数+29 天补档必须共用一轮快照");
+        // 同步补齐：函数返回时就该已经落库，不是"回头某个时刻出现"
+        assert_eq!(saved_count_on(y), Some(1), "缺失日应在本次调用内补齐");
+        assert_eq!(saved_count_on(today), Some(2));
+        assert_eq!(saved_count_on(two), Some(7), "已有的一天不该被重查覆盖");
+        // 再刷新一次：没有缺失日了就完全不必再动补档查询
+        assert!(update_today_edge_history().0);
+        assert_eq!(
+            SNAPSHOT_ROUNDS.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "补齐过后第二次刷新仍是一轮快照"
+        );
+    }
+
+    /// 崩溃/被杀留在 `%TEMP%` 的副本是**明文浏览记录**，必须能被扫掉；
+    /// 但正在使用的副本只有几秒大，绝不能被误删。
+    #[test]
+    fn stale_temp_copies_are_swept_but_recent_ones_survive() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("edge_sweep");
+        // 扫自己的临时子目录：不碰系统 %TEMP%，也不会留东西
+        let dir = app.path().join("sweep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |name: &str, age: std::time::Duration| {
+            let p = dir.join(name);
+            std::fs::write(&p, b"plaintext browsing history").unwrap();
+            let old = std::time::SystemTime::now() - age;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&p)
+                .expect("为了改 mtime 需要写权限")
+                .set_modified(old)
+                .expect("set_modified 应可用（Rust 1.75+）");
+            p
+        };
+        let stale_db = mk(
+            "focusflow_edge_11111_222222.db",
+            std::time::Duration::from_secs(7200),
+        );
+        let stale_wal = mk(
+            "focusflow_edge_11111_222222.db-wal",
+            std::time::Duration::from_secs(7200),
+        );
+        let fresh = mk(
+            "focusflow_edge_99999_000000.db",
+            std::time::Duration::from_secs(5),
+        );
+        // 同名不同前缀的文件不该被牵连
+        let other = mk("focusflow_other_1.db", std::time::Duration::from_secs(7200));
+
+        let removed = sweep_stale_temp_copies_in(&dir, STALE_TEMP_COPY_AGE);
+        assert_eq!(removed, 2, "只该删掉那两份超龄的 Edge 副本");
+        assert!(
+            !stale_db.exists() && !stale_wal.exists(),
+            "超龄副本要真删掉"
+        );
+        assert!(fresh.exists(), "几秒大的副本可能正被另一个实例用着");
+        assert!(other.exists(), "前缀不匹配的文件不该被动");
+    }
 
     /// 把槽位置成「有一轮在跑，且已经跑了 `ms_elapsed` 毫秒」，返回那一轮的世代号。
     /// 每次改槽位都推进世代号，这样上一轮遗留的后台线程（`plugins_test` 真的会
