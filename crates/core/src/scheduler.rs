@@ -553,6 +553,18 @@ fn validate_exe_target(p: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 执行前的唯一决定：解析目标 → 校验解析结果 → 校验参数，返回真正要启动的路径。
+///
+/// 刻意只解析一次。早先的写法是 `validate_task_target(原始路径)`（内部解析一遍 `.lnk`）
+/// 之后再 `launch_target_of(原始路径)`（又解析一遍）：两次之间链接文件被改写时，校验
+/// 通过的就已经不是真正要启动的那个程序 —— 双次解析等于没校验。
+fn approved_launch_target(target: &str, args: &str) -> anyhow::Result<std::path::PathBuf> {
+    let exe = launch_target_of(target)?;
+    validate_exe_target(&exe)?;
+    validate_task_args(args)?;
+    Ok(exe)
+}
+
 /// 供 UI / 插件预检：目标程序与参数会不会被接受，返回可读原因。
 ///
 /// 入口校验失败原本只进 `tracing` 日志（`add_task` 只回一个 -1），于是插件点
@@ -821,19 +833,12 @@ fn execute_task(t: &ScheduledTask) {
     if t.target_path.is_empty() {
         return;
     }
-    // 纵深防御：入口已校验，这里再校验一次。库里可能有历史白名单外记录
-    // （旧版曾放行 .bat/.cmd/.lnk），也可能被外部程序直接改写 —— 执行前的这道
-    // 检查保证既不会启动任意程序，也不会把 URL/开关类参数交给浏览器。
-    if let Err(e) = validate_task_target(&t.target_path).and_then(|_| validate_task_args(&t.args)) {
-        tracing::warn!("定时任务被拒绝执行（{}）: {e}", t.name);
-        return;
-    }
-    // 与校验同一个口径：`.lnk` 启动的是它指向的本体，而不是 `.lnk` 本身
-    // （`CreateProcess` 不认 shell item，直接拿快捷方式去启动必然失败）。
-    let exe = match launch_target_of(&t.target_path) {
+    // 先解析、再校验**解析出来的那个路径**，最后启动同一个路径 —— 见
+    // [`approved_launch_target`]。
+    let exe = match approved_launch_target(&t.target_path, &t.args) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("定时任务解析启动目标失败（{}）: {e}", t.name);
+            tracing::warn!("定时任务被拒绝执行（{}）: {e}", t.name);
             return;
         }
     };
@@ -1421,6 +1426,33 @@ mod tests {
         v.extend_from_slice(&idlist);
         v.extend_from_slice(&base[LNK_HEADER_SIZE..]);
         assert_eq!(parse_lnk_target(&v).as_deref(), Some(target));
+    }
+
+    /// 执行入口校验的必须是**解析出来的那个路径**：链接文件本身存在、也解析得动，
+    /// 但目标程序不存在时要报"目标程序不可用"，而不是因为"链接没问题"就放行。
+    #[test]
+    fn approved_target_validates_the_resolved_path() {
+        let (_l, dir) = isolate_app_dir("lnk_approved");
+        let p = write_lnk(
+            dir.path(),
+            "gone.lnk",
+            &make_lnk(r"C:\no-such-dir\calc.exe"),
+        );
+        let e = approved_launch_target(&p.to_string_lossy(), "")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("不可用"),
+            "被校验的必须是解析出来的目标，实得: {e}"
+        );
+
+        // 非快捷方式走的是同一套规则（不是"只有 .lnk 才校验"）
+        let note = dir.path().join("note.txt");
+        std::fs::write(&note, b"hi").unwrap();
+        let e = approved_launch_target(&note.to_string_lossy(), "")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("仅支持"), "普通文件也要过扩展名规则，实得: {e}");
     }
 
     /// UTF-16 形态的路径也要认（各家生成器两种都有）。
