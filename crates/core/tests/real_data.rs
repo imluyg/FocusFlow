@@ -390,4 +390,116 @@ mod tests {
             None => println!("真实数据导入回归：本机无数据，跳过"),
         }
     }
+
+    /// 设备详情与各周期窗口在真实数据上必须自洽。
+    ///
+    /// 详情页一次给出 今日/近7/近30/全部 + 排名 + 键名明细，这些数字来自好几条
+    /// 独立查询；它们之间的矛盾（窗口大的反而小、有次数却排名 0、明细比总次数还多）
+    /// 在 fixture 上要手写出来很费劲，真库里天然就有。
+    #[test]
+    fn real_data_device_detail_and_windows_are_self_consistent() {
+        let outcome = on_real_data_copy("realdata_detail", || {
+            let (total, devices) = queries::get_device_stats(None, None);
+            if devices.is_empty() {
+                return 0usize;
+            }
+            let rank_sum: i64 = devices.iter().map(|d| d.count).sum();
+            assert_eq!(rank_sum, total, "设备排行的次数加起来不等于总次数");
+
+            let mut checked = 0usize;
+            for dev in &devices {
+                for period in [-1i64, 7, 30, 0] {
+                    let d = queries::get_device_detail(&dev.key, period);
+                    let tag = format!("{} period={period}", dev.key);
+                    assert_eq!(d.key, dev.key, "{tag}: 详情答非所问");
+                    assert!(
+                        d.today <= d.week && d.week <= d.month && d.month <= d.all,
+                        "{tag}: 窗口包含关系被破 today={} week={} month={} all={}",
+                        d.today,
+                        d.week,
+                        d.month,
+                        d.all
+                    );
+                    assert!(d.period_count <= d.all, "{tag}: 周期内比全部还多");
+                    assert_eq!(
+                        d.period_count == 0,
+                        d.rank == 0,
+                        "{tag}: 周期内次数 {} 与排名 {} 口径不一致",
+                        d.period_count,
+                        d.rank
+                    );
+                    if d.rank > 0 {
+                        assert!(
+                            d.rank <= d.device_count,
+                            "{tag}: 排名 {} 超过周期内设备数 {}",
+                            d.rank,
+                            d.device_count
+                        );
+                    }
+                    if d.kind_rank > 0 {
+                        assert!(
+                            d.kind_rank <= d.kind_count,
+                            "{tag}: 同类排名 {} 超过同类设备数 {}",
+                            d.kind_rank,
+                            d.kind_count
+                        );
+                    }
+                    let key_sum: i64 = d.keys.iter().map(|(_, c)| *c).sum();
+                    assert_eq!(key_sum, d.key_total, "{tag}: 键名明细与明细总次数不等");
+                    assert!(
+                        d.key_total <= d.period_count,
+                        "{tag}: 键名明细({}) 比该周期的输入次数({}) 还多",
+                        d.key_total,
+                        d.period_count
+                    );
+                    assert!(
+                        d.keys.iter().all(|(_, c)| *c > 0),
+                        "{tag}: 键名排行里出现非正次数"
+                    );
+                    let mut prev = i64::MAX;
+                    for (_, c) in &d.keys {
+                        assert!(*c <= prev, "{tag}: 键名排行不是降序（前端直接取前 20）");
+                        prev = *c;
+                    }
+                    assert_eq!(
+                        d.active_days == 0,
+                        d.all == 0,
+                        "{tag}: 活跃天数 {} 与总次数 {} 矛盾",
+                        d.active_days,
+                        d.all
+                    );
+                    if d.active_days > 0 {
+                        let want = d.all as f64 / d.active_days as f64;
+                        assert!(
+                            (d.avg_per_active_day - want).abs() < 0.51,
+                            "{tag}: 活跃日均 {} 与 all/active_days={want} 不符",
+                            d.avg_per_active_day
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+
+            // 周期窗口：总数、按日序列、星期分布三者必须说同一件事
+            for days in [7i64, 30, 90] {
+                let (win_total, _) = queries::get_stats(Some(days), None);
+                let daily: i64 = queries::get_daily_counts(days, None)
+                    .iter()
+                    .map(|(_, c)| *c)
+                    .sum();
+                assert_eq!(
+                    daily, win_total,
+                    "近 {days} 天：get_daily_counts 之和与 get_stats 总数不等"
+                );
+                let weekday: i64 = queries::get_weekday_stats(days).values().sum();
+                assert_eq!(weekday, daily, "近 {days} 天：星期分布之和与按日序列不等");
+            }
+            checked
+        });
+        match outcome {
+            Some(0) => println!("真实数据设备详情：这份数据里没有设备维度，跳过"),
+            Some(n) => println!("真实数据设备详情：{n} 组 (设备 × 周期) 全部自洽"),
+            None => println!("真实数据设备详情：本机无数据，跳过"),
+        }
+    }
 }
