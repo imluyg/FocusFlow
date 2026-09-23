@@ -59,10 +59,22 @@ fn pomodoro_timer() -> Arc<PomodoroTimer> {
 }
 
 /// 只保证库建好，不启动计时线程：读历史/汇总的接口用。
+///
+/// **只在成功时才落闩**。原来是 `get_or_init(|| { let _ = init_db(); })`：
+/// `open_local()` 已经把文件建出来了，所以只要有一次 `CREATE TABLE` 失败
+/// （24 小时在线备份线程正持着库、杀软占着 `-wal`、第二个实例正在退出），
+/// 闩就落下了、schema 永不重试 —— 之后整个进程里每次 `save_session` 都是
+/// "no such table"，而他不重启的话表现是"这好几周的番茄钟一条都没存下"。
 fn ensure_pomodoro_db() {
-    POMODORO_DB.get_or_init(|| {
-        let _ = pomodoro::init_db();
-    });
+    if POMODORO_DB.get().is_some() {
+        return;
+    }
+    match pomodoro::init_db() {
+        Ok(()) => {
+            let _ = POMODORO_DB.set(());
+        }
+        Err(e) => tracing::error!("番茄钟库初始化失败，下次调用会重试: {e}"),
+    }
 }
 
 /// 回收番茄钟：落盘进行中的阶段并结束计时线程（重新启用插件会再起）。
@@ -120,18 +132,31 @@ pub fn register_host_api(
     let host = lua.create_table()?;
     let owner = owner.to_string();
 
-    // 统计查询：period = -1 今日, 0 总计, N 天数。返回 (total, keys表)
+    // 统计查询：period = -1 今日, 0 总计, N 天数。
+    // 返回 (total, **按次数降序**的 `{name=,count=}` 数组, 键鼠种类数)。
+    //
+    // 为什么由 Rust 排序、且返回数组而不是"名字->次数"的表：`get_stats` 里是
+    // `HashMap`，SQL 那句 `ORDER BY cnt DESC` 在返回之前就被抹平了，而插件用
+    // `pairs()` 遍历取前十 —— 于是「键鼠排行（Top 10）」其实是**任意十个键**
+    // （他机器上不同键名有一百多个，空格这种高频键可能整周都不上榜）。
+    // 第三个返回值是真实种类数：以前插件把"榜单行数"当种类数，永远显示 10。
     let stats_fn = lua.create_function(move |lua, period: i64| {
         let (total, key_stats) = match period {
             -1 => db::get_stats_by_date(chrono::Local::now().date_naive()),
             0 => db::get_stats(None, None),
             n => db::get_stats(Some(n), None),
         };
-        let keys = lua.create_table()?;
-        for (k, v) in &key_stats {
-            keys.set(k.as_str(), *v)?;
+        let distinct = key_stats.len();
+        let mut ordered: Vec<(&String, &i64)> = key_stats.iter().collect();
+        ordered.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let rows = lua.create_table()?;
+        for (idx, (name, count)) in ordered.iter().enumerate() {
+            let row = lua.create_table()?;
+            row.set("name", name.as_str())?;
+            row.set("count", **count)?;
+            rows.set(idx + 1, row)?;
         }
-        Ok((total, keys))
+        Ok((total, rows, distinct))
     })?;
     host.set("stats", stats_fn)?;
 

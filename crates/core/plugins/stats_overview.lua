@@ -15,14 +15,14 @@ function cleanup()
 end
 
 function get_view()
-    local total, keys = focusflow.stats(-1)  -- 今日统计
+    local total, keys, distinct = focusflow.stats(-1)  -- 今日统计
     local today = focusflow.today_count()
 
-    -- 构建排行行
+    -- 构建排行行（宿主已按次数降序，这里只截前十）
     local rows = {}
     local i = 1
-    for k, v in pairs(keys) do
-        rows[i] = {k, tostring(v)}
+    for _, row in ipairs(keys or {}) do
+        rows[i] = { row.name, tostring(row.count) }
         i = i + 1
         if i > 10 then break end
     end
@@ -32,7 +32,7 @@ function get_view()
         widgets = {
             { type = "heading", text = "今日活跃" },
             { type = "keyvalue", key = "总次数", value = tostring(today) },
-            { type = "keyvalue", key = "键鼠种类", value = tostring(#rows) },
+            { type = "keyvalue", key = "键鼠种类", value = tostring(distinct or #rows) },
             { type = "separator" },
             { type = "heading", text = "键鼠排行（Top 10）" },
             {

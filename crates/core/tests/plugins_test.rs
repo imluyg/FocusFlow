@@ -346,12 +346,36 @@ mod tests {
             .expect("today_count 调用失败");
         assert!(today >= 0);
 
-        // stats(0) 应返回 total + keys
-        let result: mlua::MultiValue = lua
-            .load("return focusflow.stats(0)")
+        // stats(0) 返回 (total, **按次数降序**的 {name,count} 数组, 键鼠种类数)。
+        //
+        // 老契约是"名字->次数"的表 + 两个返回值：`get_stats` 内部是 HashMap，
+        // SQL 的 ORDER BY cnt DESC 被抹平，插件再 `pairs()` 取前十 —— 于是
+        // 「键鼠排行（Top 10）」是任意十个，而"种类"显示的是榜单长度（永远 10）。
+        let (total, rows, distinct): (i64, mlua::Table, i64) = lua
+            .load("local t, k, n = focusflow.stats(0) return t, k, n")
             .eval()
             .expect("stats 调用失败");
-        assert_eq!(result.len(), 2);
+        assert!(total >= 0);
+        let mut prev: Option<i64> = None;
+        let mut n = 0i64;
+        for row in rows.sequence_values::<mlua::Table>() {
+            let row = row.expect("榜单每一项都该是表");
+            let name: String = row.get("name").expect("每项要有 name");
+            let count: i64 = row.get("count").expect("每项要有 count");
+            assert!(!name.is_empty(), "键名不该为空");
+            if let Some(p) = prev {
+                assert!(
+                    count <= p,
+                    "榜单必须按次数从多到少: {name} {count} 排在 {p} 之后"
+                );
+            }
+            prev = Some(count);
+            n += 1;
+        }
+        assert_eq!(
+            n, distinct,
+            "数组长度就是真实种类数；旧实现把榜单长度当种类数（永远 10）"
+        );
 
         // app_info 应返回版本
         let info: String = lua.load("return focusflow.app_info()").eval().unwrap();
