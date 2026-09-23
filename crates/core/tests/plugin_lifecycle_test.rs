@@ -183,12 +183,28 @@ fn only_real_plugin_files_can_be_persisted() {
     assert!(pm.is_disabled("real_one"), "真实文件名应当被记下并生效");
     assert_eq!(config.get_or("plugins", "disabled", ""), "real_one");
 
-    // 注入腿：这一条在旧代码里会把换行原样写进 disabled
-    pm.set_enabled("evil\n[injected]\nx = 1", false)
-        .expect("未知文件名是被忽略的，不算失败");
-    let after = config.get_or("plugins", "disabled", "").to_string();
-    assert_eq!(after, "real_one", "未知文件名不该进配置: {after:?}");
-    assert!(!after.contains("injected"));
+    // 注入腿：不合法的入参一律**报错**，不再"忽略后回 Ok"。
+    // 以前这里是 `return Ok(())`，而命令层把 Ok 当成功、前端弹「插件已启用」——
+    // 对着一个插件目录里根本没有的名字报成功，配置一个字没改。
+    for bad in [
+        "evil\n[injected]\nx = 1",
+        "real_one,another",
+        "not_a_plugin",
+    ] {
+        let r = pm.set_enabled(bad, false);
+        assert!(
+            r.is_err(),
+            "非法/未知插件名必须报错，不该静默成功: {bad:?} -> {r:?}"
+        );
+        assert_eq!(
+            config.get_or("plugins", "disabled", ""),
+            "real_one",
+            "{bad:?} 不该改动停用列表"
+        );
+    }
+    // 启用方向的同一道闸：不能靠传假名字把列表洗空
+    assert!(pm.set_enabled("ghost", true).is_err());
+    assert_eq!(config.get_or("plugins", "disabled", ""), "real_one");
 }
 
 /// 启用一个"加载就会失败"的插件：必须返回 Err 并带上插件自己报的原因。

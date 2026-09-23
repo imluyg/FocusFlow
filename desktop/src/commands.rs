@@ -366,16 +366,24 @@ pub async fn get_maintenance_info() -> Result<serde_json::Value, String> {
         )
         .flatten();
 
-        // 备份目录信息
-        let mut backups: Vec<std::path::PathBuf> =
-            std::fs::read_dir(focusflow_core::paths::backup_dir())
-                .map(|it| {
-                    it.flatten()
-                        .map(|e| e.path())
-                        .filter(|p| p.extension().is_some_and(|e| e == "db"))
-                        .collect()
-                })
-                .unwrap_or_default();
+        // 备份目录信息。读不出来必须与"目录里真的没有备份"分开说：便携包放在
+        // 休眠的移动盘上、OneDrive 占位、`backup` 是个普通文件，read_dir 都会失败，
+        // 而原先照样显示"备份数量 0"，看起来就像一次都没备份过
+        // （同一族已在 vacuum_all / reset / backup_database 修过）。
+        let backup_dir = focusflow_core::paths::backup_dir();
+        let (mut backups, backup_error) = match std::fs::read_dir(&backup_dir) {
+            Ok(it) => (
+                it.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|e| e == "db"))
+                    .collect::<Vec<_>>(),
+                String::new(),
+            ),
+            Err(e) => (
+                Vec::new(),
+                format!("备份目录读不出来（{}）: {e}", backup_dir.display()),
+            ),
+        };
         backups.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
         let latest = backups
             .last()
@@ -411,6 +419,7 @@ pub async fn get_maintenance_info() -> Result<serde_json::Value, String> {
             "last_vacuum": last_vacuum,
             "backup_count": backups.len(),
             "latest_backup": latest,
+            "backup_error": backup_error,
             "suspect_notes": suspect_notes,
         })
     })

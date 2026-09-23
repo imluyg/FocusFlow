@@ -874,11 +874,16 @@ export async function doBackup() {
 async function renderMaintInfo() {
   try {
     const info = await invoke("get_maintenance_info");
-    const lines = [
-      "上次压缩: " + (info.last_vacuum || "尚未压缩"),
-      "备份数量: " + info.backup_count + (info.latest_backup ? "，最新: " + info.latest_backup : ""),
-    ];
-    let html = lines.map((l) => `<div>${escapeHtml(l)}</div>`).join("");
+    // 备份目录读不出来时不能报"备份数量 0" —— 那和"确实一次没备份过"长得一模一样
+    const backupError = info.backup_error ? String(info.backup_error) : "";
+    const backupLine = backupError
+      ? "备份数量: 未知 —— " + backupError
+      : "备份数量: " +
+        info.backup_count +
+        (info.latest_backup ? "，最新: " + info.latest_backup : "");
+    let html =
+      `<div>${escapeHtml("上次压缩: " + (info.last_vacuum || "尚未压缩"))}</div>` +
+      `<div${backupError ? ` style="color:var(--danger)"` : ""}>${escapeHtml(backupLine)}</div>`;
     // 异常体检提示：备份时发现数据体量异常（骤降/暴涨），当次已冻结轮转
     if (Array.isArray(info.suspect_notes) && info.suspect_notes.length > 0) {
       html += info.suspect_notes

@@ -246,9 +246,17 @@ impl PluginManager {
         // `stem` 会原样拼进 config.ini 的 `[plugins] disabled`（逗号分隔，写盘不做转义），
         // 而它是 IPC 传上来的字符串：名字里带一个 `,` 就能顺手停用别的插件，带换行的
         // 能往配置里注入任意 INI 行。只接受插件目录里真实存在的文件名。
+        if stem.contains(',') || stem.contains('\n') || stem.contains('\r') {
+            // 光"存在于磁盘"挡不住带逗号的文件名 —— 它自己就能把列表撑成两项，
+            // 于是下一次启动会把别的插件一起"点亮"。这种文件直接不认。
+            tracing::error!("插件名不能含逗号/换行（会破坏 [plugins] disabled 列表）: {stem}");
+            return Err(format!("插件名不合法（含逗号或换行）: {stem}"));
+        }
         if !self.discover().iter().any(|p| Self::stem_of(p) == stem) {
+            // 以前这里是 `return Ok(())`：命令层把 Ok 当成功，前端弹「插件已启用」，
+            // 而配置一个字没改 —— 对着一个不存在的插件报成功。
             tracing::warn!("忽略未知的插件文件名（插件目录里没有它）: {stem}");
-            return Ok(());
+            return Err(format!("插件文件不存在: {stem}"));
         }
         let mut list = self.disabled_list();
         if enabled {
