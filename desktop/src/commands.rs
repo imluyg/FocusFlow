@@ -495,6 +495,8 @@ pub fn set_plugin_enabled(
     file: String,
     enabled: bool,
 ) -> Result<bool, String> {
-    crate::plugins::with_manager(&state.db, |pm| pm.set_enabled(&file, enabled));
+    // 只有"启用但加载失败"才会 Err（配置写入本身是去抖队列，永远 Ok）。
+    // 原先这里丢掉结果、回一句 Ok(enabled)，于是插件带着 Lua 语法错误也能弹「插件已启用」。
+    crate::plugins::with_manager(&state.db, |pm| pm.set_enabled(&file, enabled))?;
     Ok(enabled)
 }

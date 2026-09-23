@@ -1166,7 +1166,7 @@ fn spawn_stats_worker(
 
                         // period=0 且缓存有效：直接复用上次聚合结果，不再全库扫描。
                         // 今日破纪录等展示值由下方增量逻辑修正，轻量零查询。
-                        let agg = if period_val == 0
+                        let mut agg = if period_val == 0
                             && !period_changed
                             && !alltime_dirty
                             && alltime_agg.is_some()
@@ -1181,6 +1181,13 @@ fn spawn_stats_worker(
                         };
                         charts_period = period_val;
                         charts_seq = db.writer().map(|w| w.flush_seq()).unwrap_or(flush_seq);
+                        // 图表推送也必须带上"缓存基准 + 今日增量"的那个总计：`compute_charts`
+                        // 里的 alltime_total 是硬编码 0（重聚合不付一次全历史扫描），而前端
+                        // applyTotal 在「今日」周期取的就是这个字段 —— 于是每来一次图表推送，
+                        // 「总计」卡片就被写成 0，只有下一次 live 推送才改回来（停止输入后就
+                        // 停在 0 上）。下面那段补丁只改了共享快照，晚于这里的 emit。
+                        agg.alltime_total =
+                            alltime_total_now(alltime_total_base, alltime_cache_today, cur_today);
                         period_max.insert(period_val, (agg.max_day, agg.max_day_date.clone()));
                         {
                             let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());

@@ -237,18 +237,18 @@ impl PluginManager {
     ///
     /// 停用会卸载已加载实例并调用其 cleanup；启用会立即加载。
     ///
-    /// 刻意不返回"是否成功"。`config.set` 只把改动排进 300ms 去抖的持久化队列、
-    /// 永远返回 Ok，所以 `Err` 分支只能是死代码；而它原先返回的是"操作后的启用
-    /// 状态"，于是**停用成功**时给出 false，调用方一句 `if !ok` 就把成功报成了
-    /// 「写入插件启用状态失败」—— 插件页每点一次「停用」都弹一条失败，可插件确实
-    /// 已经卸载。返回值无法同时表达这两件事，那就只留一个。
-    pub fn set_enabled(&mut self, stem: &str, enabled: bool) {
+    /// 返回值只表示**这次操作本身有没有做成**。`config.set` 只把改动排进 300ms 去抖的
+    /// 持久化队列、永远返回 Ok，所以"写配置失败"那个分支是死代码 —— 它原先返回的是
+    /// "操作后的启用状态"，于是**停用成功**时给出 false，调用方一句 `if !ok` 把成功
+    /// 报成了「写入插件启用状态失败」（0a85386）。现在只有"启用但加载失败"才给 Err，
+    /// 附带插件自己报的原因：那是真失败，而前端一直把 Ok 当成功弹「插件已启用」。
+    pub fn set_enabled(&mut self, stem: &str, enabled: bool) -> Result<(), String> {
         // `stem` 会原样拼进 config.ini 的 `[plugins] disabled`（逗号分隔，写盘不做转义），
         // 而它是 IPC 传上来的字符串：名字里带一个 `,` 就能顺手停用别的插件，带换行的
         // 能往配置里注入任意 INI 行。只接受插件目录里真实存在的文件名。
         if !self.discover().iter().any(|p| Self::stem_of(p) == stem) {
             tracing::warn!("忽略未知的插件文件名（插件目录里没有它）: {stem}");
-            return;
+            return Ok(());
         }
         let mut list = self.disabled_list();
         if enabled {
@@ -273,6 +273,7 @@ impl PluginManager {
                 {
                     if let Err(e) = self.try_load(&path) {
                         tracing::warn!("启用插件失败 ({stem}): {e}");
+                        return Err(format!("插件已记录为启用，但加载失败：{e}"));
                     }
                 }
             }
@@ -287,6 +288,7 @@ impl PluginManager {
                 self.unload_plugin(&n);
             }
         }
+        Ok(())
     }
 
     /// 列出目录中所有插件（含已停用的），停用的不执行其代码。

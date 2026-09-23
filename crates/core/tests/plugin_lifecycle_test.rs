@@ -179,15 +179,45 @@ fn only_real_plugin_files_can_be_persisted() {
     let (mut pm, config) = manager_in(tmp.path());
     pm.load_all();
 
-    pm.set_enabled("real_one", false);
+    pm.set_enabled("real_one", false).expect("停用不该报错");
     assert!(pm.is_disabled("real_one"), "真实文件名应当被记下并生效");
     assert_eq!(config.get_or("plugins", "disabled", ""), "real_one");
 
     // 注入腿：这一条在旧代码里会把换行原样写进 disabled
-    pm.set_enabled("evil\n[injected]\nx = 1", false);
+    pm.set_enabled("evil\n[injected]\nx = 1", false)
+        .expect("未知文件名是被忽略的，不算失败");
     let after = config.get_or("plugins", "disabled", "").to_string();
     assert_eq!(after, "real_one", "未知文件名不该进配置: {after:?}");
     assert!(!after.contains("injected"));
+}
+
+/// 启用一个"加载就会失败"的插件：必须返回 Err 并带上插件自己报的原因。
+///
+/// 前端那句 toast 一直把 Ok 当成成功（plugins.js 弹「插件已启用」）。以前
+/// set_enabled 拿不到加载结果，所以带语法错误的插件会"启用成功"，只有下面那行
+/// 小字写着加载失败 —— 与刚修掉的「停用误报失败」是同一个开关的两个方向。
+#[test]
+fn enabling_a_broken_plugin_reports_the_reason() {
+    let _g = guard();
+    let tmp = paths::test_app_dir("enable_broken");
+    write_plugin(
+        tmp.path(),
+        "broken_enable",
+        "PLUGIN_NAME = \"启用即失败\"\nerror(\"这行不该通过\")\n",
+    );
+    let (mut pm, _) = manager_in(tmp.path());
+
+    let err = pm
+        .set_enabled("broken_enable", true)
+        .expect_err("加载失败必须报给调用方");
+    assert!(err.contains("加载失败"), "{err}");
+    assert!(err.contains("这行不该通过"), "原因要原样带出来: {err}");
+    assert!(
+        pm.list_discovered()
+            .iter()
+            .any(|p| p.file == "broken_enable" && !p.loaded),
+        "该插件不该被当成已加载"
+    );
 }
 
 /// 两个文件声明同一个 PLUGIN_NAME 时，原先是后来者静默顶掉前者：被顶掉的那个
@@ -234,7 +264,8 @@ fn listing_plugins_never_runs_their_code() {
     );
     let (mut pm, config) = manager_in(tmp.path());
     // 停用它：连加载都不该发生
-    pm.set_enabled("top_level_boom", false);
+    pm.set_enabled("top_level_boom", false)
+        .expect("停用不该报错");
     assert!(config
         .get_or("plugins", "disabled", "")
         .contains("top_level_boom"));
