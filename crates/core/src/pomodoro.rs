@@ -473,10 +473,28 @@ fn persist_session(session: &Session) {
     }
 }
 
+/// 一次 tick 之间过了多少**墙钟秒**。
+///
+/// 计时原来是每轮 `remaining -= 1`：一台笔记本合上盖睡 30 分钟，循环根本不跑，
+/// 醒来后还要从"还剩 20 分钟"继续倒数 20 分钟 —— 休息晚半小时才开始；
+/// 而落库那行的 `end_time` 用的是 `Local::now()`，于是同一条记录自相矛盾
+/// （"时长 1500 秒"却跨了 45 分钟墙钟），今日活跃时长也少算同一截。
+/// 改成按墙钟推进：睡眠期间真实过去的时间一次补齐。
+/// 时钟被往回拨时取 0（不能把已经走过的进度吐回去）。
+fn tick_delta_seconds(prev: &chrono::DateTime<Local>, now: &chrono::DateTime<Local>) -> i64 {
+    now.signed_duration_since(*prev).num_seconds().max(0)
+}
+
 /// 后台计时循环（每秒 tick）。
 fn tick_loop(state: Arc<Mutex<TimerState>>, stop: Arc<AtomicBool>) {
+    let mut last_tick = Local::now();
     while !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(1000));
+        let now_wall = Local::now();
+        // 每轮都推进锚点：空闲/暂停的这些轮也必须重置，否则 resume 之后
+        // 第一次 tick 会把"暂停期间过去的时间"整个算进这一段
+        let delta = tick_delta_seconds(&last_tick, &now_wall);
+        last_tick = now_wall;
         // 锁内只做纯内存的计时与状态推进；阶段完成时要写的记录攒到出锁后落盘。
         // 原先是持锁 INSERT：SQLite 的 busy_timeout 是 15 秒，一旦库被占住，
         // 主线程每次按键的 record_key（抢同一把锁）都会跟着卡住整个界面。
@@ -488,8 +506,8 @@ fn tick_loop(state: Arc<Mutex<TimerState>>, stop: Arc<AtomicBool>) {
             if s.state == STATE_IDLE || s.paused {
                 continue;
             }
-            s.remaining -= 1;
-            s.elapsed += 1;
+            s.remaining -= delta;
+            s.elapsed += delta;
             if s.remaining > 0 {
                 continue;
             }
@@ -664,5 +682,25 @@ mod busy_lock_tests {
         let cfg3 = crate::config::FocusFlowConfig::load(&path).unwrap();
         t.apply_config(&cfg3);
         assert_eq!(t.get_state_info()["work_minutes"], 25);
+    }
+
+    /// 计时必须按**墙钟**推进，不是"每轮 tick 减一秒"。
+    ///
+    /// 老实现合上盖睡 30 分钟回来，还要从"剩 20 分钟"再倒数 20 分钟，
+    /// 而落库的 end_time 用的是真实时刻 —— 同一行记录自相矛盾。
+    #[test]
+    fn tick_advances_by_wall_clock_not_by_iterations() {
+        use chrono::TimeZone;
+        let a = Local
+            .with_ymd_and_hms(2026, 9, 23, 10, 0, 0)
+            .single()
+            .expect("合法本地时刻");
+        let b = Local
+            .with_ymd_and_hms(2026, 9, 23, 10, 30, 0)
+            .single()
+            .expect("合法本地时刻");
+        assert_eq!(tick_delta_seconds(&a, &b), 1800, "睡 30 分钟要一次补齐");
+        assert_eq!(tick_delta_seconds(&b, &a), 0, "时钟往回拨不能把进度吐回去");
+        assert_eq!(tick_delta_seconds(&a, &a), 0);
     }
 }
