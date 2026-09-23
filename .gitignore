@@ -11,6 +11,11 @@
 **/window_state.ini
 **/dist/
 
+# `focusflow-cli --export` 写到**当前目录**，在仓库根跑一次就会产出一份完整按键
+# 统计（键名 + 次数）。文件名固定、不含随机后缀，一旦 `git add -A` 就被静默收录。
+**/focusflow_export.csv
+**/focusflow_export.html
+
 # Tauri 构建产物与打包目录（含用户数据，不入库）
 /dist-tauri/
 /desktop/gen/
