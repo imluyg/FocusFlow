@@ -41,15 +41,27 @@ fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// 后台静默运行 PowerShell 创建快捷方式。
+/// 在启动文件夹创建自启快捷方式。
 fn create_shortcut() -> anyhow::Result<PathBuf> {
+    let lnk = shortcut_path();
+    create_shortcut_at(&lnk)?;
+    Ok(lnk)
+}
+
+/// 在指定路径生成快捷方式（真的起 PowerShell）。
+///
+/// 单独收一个路径参数，是为了能在临时目录里跑完整往返：启动文件夹是用户机器的
+/// 常驻状态，不该被测试写脏；而这段命令此前**从来没被执行过**，`ps_quote` 的转义
+/// 也就没有任何东西在验。
+fn create_shortcut_at(lnk: &std::path::Path) -> anyhow::Result<()> {
     let exe = exe_path();
     let workdir = exe
         .parent()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    let lnk = shortcut_path();
-    std::fs::create_dir_all(lnk.parent().unwrap()).ok();
+    if let Some(parent) = lnk.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
     let ps_cmd = format!(
         "$ws = New-Object -ComObject WScript.Shell; \
          $s = $ws.CreateShortcut({}); \
@@ -81,11 +93,22 @@ fn create_shortcut() -> anyhow::Result<PathBuf> {
     }
     let output = cmd.output()?;
     if output.status.success() {
-        Ok(lnk)
+        Ok(())
     } else {
+        // PowerShell 把不同类别的错误分别写到两个流上（解析错误走 stderr，COM /
+        // .NET 异常常只留在 stdout），只报 stderr 时会是"失败但没有任何原因"。
+        let mut detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if detail.is_empty() {
+            detail = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        }
         anyhow::bail!(
-            "PowerShell 创建快捷方式失败: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "PowerShell 创建快捷方式失败（退出码 {:?}）: {}",
+            output.status.code(),
+            if detail.is_empty() {
+                "无输出"
+            } else {
+                &detail
+            }
         )
     }
 }
@@ -106,18 +129,18 @@ fn shortcut_target_at(lnk: &std::path::Path) -> Option<String> {
     crate::scheduler::parse_lnk_target(&data)
 }
 
+/// 路径比较用的归一化：能 canonicalize 就 canonicalize（还原 `..\`、8.3 短名、
+/// 符号链接），再按 Windows 习惯忽略大小写。
+fn norm_path(p: &str) -> String {
+    std::fs::canonicalize(p)
+        .unwrap_or_else(|_| PathBuf::from(p))
+        .to_string_lossy()
+        .to_lowercase()
+}
+
 fn shortcut_points_to_exe() -> bool {
-    let target = shortcut_target();
-    match target {
-        Some(t) => {
-            let norm = |p: &str| {
-                std::fs::canonicalize(p)
-                    .unwrap_or_else(|_| PathBuf::from(p))
-                    .to_string_lossy()
-                    .to_lowercase()
-            };
-            norm(&t) == norm(&exe_path().to_string_lossy())
-        }
+    match shortcut_target() {
+        Some(t) => norm_path(&t) == norm_path(&exe_path().to_string_lossy()),
         None => false,
     }
 }
@@ -271,5 +294,25 @@ mod tests {
         std::fs::write(&p, []).unwrap();
         assert_eq!(shortcut_target_at(&p), None);
         assert_eq!(shortcut_target_at(&dir.path().join("missing.lnk")), None);
+    }
+
+    /// 端到端跑一遍**真的** PowerShell 建链接流程（此前从没执行过：测试只碰启动
+    /// 文件夹外的东西，而 `4b2e923` 修的正是这条命令行里的引号转义）。
+    ///
+    /// 目录名带撇号，所以这一步同时验到 `ps_quote`：少翻一倍引号就是 PowerShell 报错、
+    /// 或者建出一个指向别处的链接。读回再用自家解析器，等于把"写"和"读"两头对上。
+    #[test]
+    fn powershell_created_shortcut_roundtrips() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("autostart_roundtrip");
+        let lnk = dir.path().join("D'Angelo").join(SHORTCUT_NAME);
+        create_shortcut_at(&lnk).expect("临时目录里应能建出自启快捷方式");
+        assert!(lnk.is_file(), "PowerShell 报了成功却没落盘");
+        let target = shortcut_target_at(&lnk).expect("刚建出的链接必须能被自家解析器读回");
+        assert_eq!(
+            norm_path(&target),
+            norm_path(&exe_path().to_string_lossy()),
+            "链接指向的本体应当就是当前 exe"
+        );
     }
 }
