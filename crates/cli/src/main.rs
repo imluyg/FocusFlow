@@ -299,7 +299,33 @@ fn parse_period(arg: &str) -> Result<Period, String> {
     })
 }
 
+/// 年度库列不出来、或其中某一年打不开时**必须说话**。
+///
+/// `available_years()` 与 `get_stats(None, None)` 都把"读不出来"折成空列表 / 偏小的
+/// 总数，于是这些诊断命令会打印一个自信而错误的数字、还退回退出码 0。
+/// 破坏性命令（`--reset` / `--vacuum` / `--cleanup`）上一批已经改成会报原因的版本，
+/// 这里补的是留下来的那半边 —— 一个分不清"没有数据"与"读不到数据"的诊断工具，
+/// 是这仓库目前产出最高的一类 bug。
+fn check_years_readable() -> Result<Vec<i32>, String> {
+    let years = db::queries::try_available_years().map_err(|e| format!("年度库列不出来: {e}"))?;
+    let bad: Vec<i32> = years
+        .iter()
+        .copied()
+        .filter(|y| db::connection::open_ro(&focusflow_core::paths::year_db_path(*y)).is_err())
+        .collect();
+    if !bad.is_empty() {
+        return Err(format!(
+            "这些年度库打不开，它们的计数不会出现在结果里: {bad:?}"
+        ));
+    }
+    Ok(years)
+}
+
 fn print_stats(_db: &db::Database, period: &str) -> i32 {
+    if let Err(e) = check_years_readable() {
+        eprintln!("{e}");
+        return 1;
+    }
     let (total, stats, label) = match parse_period(period) {
         Err(e) => {
             eprintln!("{e}");
@@ -493,7 +519,13 @@ fn print_year_stats(_db: &db::Database, year: i32) -> i32 {
 }
 
 fn print_list_years(_db: &db::Database) -> i32 {
-    let years = db::available_years();
+    let years = match check_years_readable() {
+        Ok(y) => y,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     if years.is_empty() {
         println!("暂无数据");
         return 0;
@@ -511,6 +543,10 @@ fn export(_db: &db::Database, fmt: &str) -> i32 {
         "focusflow_export.{}",
         if fmt == "csv" { "csv" } else { "html" }
     ));
+    if let Err(e) = check_years_readable() {
+        eprintln!("导出的会是一份偏小的数据：{e}");
+        return 1;
+    }
     let (total, stats) = db::get_stats(None, None);
     let ok = match fmt {
         "csv" => export_csv(&filepath, total, &stats),
