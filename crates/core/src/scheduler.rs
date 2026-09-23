@@ -686,8 +686,13 @@ pub fn update_task(
         return Err(e);
     }
 
-    let last_run: Option<String> = if schedule_time.is_some() {
-        None // 修改时间时重置 last_run
+    // 只有**调度时刻真的变了**才重置 last_run。原来判的是"调用方传了 schedule_time"，
+    // 而插件侧的 scheduler_update 永远把整条记录原样传回来（host.rs 的绑定是七个参数
+    // 一起给），于是改个名字、补一条白名单都会把 last_run 清空 —— 一条 09:00 的任务
+    // 在 14:00 被编辑过一次，30 秒内就把那个程序又启动了一遍。
+    let schedule_changed = new_type != existing.3 || new_time != existing.4;
+    let last_run: Option<String> = if schedule_changed {
+        None // 改了调度时刻：按新时刻重新计一次
     } else {
         conn.query_row(
             "SELECT last_run FROM scheduled_tasks WHERE id=?1",
@@ -864,9 +869,12 @@ fn should_run(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> bool {
 }
 
 /// 执行任务（启动目标程序，DETACHED_PROCESS）。
-fn execute_task(t: &ScheduledTask) {
+///
+/// 返回 `Some(尝试时刻)` = 真的启动起来了；`None` = 没启动（目标为空、被白名单拒绝、
+/// `CreateProcess` 失败）。调用方（调度循环）用这个区分要不要退避，见 [`check_loop`]。
+fn execute_task(t: &ScheduledTask) -> Option<String> {
     if t.target_path.is_empty() {
-        return;
+        return None;
     }
     // 先解析、再校验**解析出来的那个路径**，最后启动同一个路径 —— 见
     // [`approved_launch_target`]。
@@ -874,7 +882,7 @@ fn execute_task(t: &ScheduledTask) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("定时任务被拒绝执行（{}）: {e}", t.name);
-            return;
+            return None;
         }
     };
     let mut cmd = std::process::Command::new(&exe);
@@ -894,15 +902,24 @@ fn execute_task(t: &ScheduledTask) {
         Ok(_) => {
             tracing::info!("定时任务已执行: {} -> {}", t.name, exe.display());
             let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let _ = open().and_then(|conn| {
+            // 写库失败也必须把"这次已经启动过"带回去。原来这里 `let _ =` 吞掉错误：
+            // 库里 last_run 还是空 → 30 秒后 `should_run` 又说该跑 → 程序一遍遍地开，
+            // 表现是"我设的定时任务弹了一窗口"。（库 BUSY 超过 15 秒、表不可用时就会这样。）
+            if let Err(e) = open().and_then(|conn| {
                 conn.execute(
                     "UPDATE scheduled_tasks SET last_run=?1 WHERE id=?2",
-                    rusqlite::params![now_str, t.id],
+                    rusqlite::params![now_str.clone(), t.id],
                 )
-            });
+            }) {
+                tracing::error!(
+                    "定时任务已启动，但 last_run 没写进库（本进程内先记着，不会再启一次）: {e}"
+                );
+            }
+            Some(now_str)
         }
         Err(e) => {
             tracing::error!("定时任务执行失败: {} -> {}: {e}", t.name, exe.display());
+            None
         }
     }
 }
@@ -910,11 +927,36 @@ fn execute_task(t: &ScheduledTask) {
 /// 调度线程的检查间隔。
 const CHECK_INTERVAL_MS: u64 = 30_000;
 
+/// 连续启动失败到这个次数就退到下一个调度时段。
+///
+/// 留三次而不是立刻放弃：目标在休眠的 USB 盘上、被杀软扫第一个瞬间这类**瞬时**失败
+/// 下一轮（30 秒后）多半就好了。但从此不再试是必须的 —— 目标被卸载/被白名单拒绝的
+/// 任务原来每 30 秒重试一次、每次一条 error，一天两万八千条，而且真的哪天忽然能启动
+/// 就会在一个谁也没预期的时刻弹出来。
+/// 刻意**不**写 `last_run`：那字段的语义是"执行过了"，插件页会把它显示成"上次执行"，
+/// 拿一次失败的尝试去填等于对用户撒谎。
+const LAUNCH_FAILURE_BACKOFF_AFTER: u32 = 3;
+
+/// 库里那次与本轮兜底记忆里取更新的一个（时间串是 `%Y-%m-%d %H:%M:%S`，定长，
+/// 字典序即时间序）。
+fn effective_last_run(db: Option<&str>, memo: Option<&str>) -> Option<String> {
+    match (db, memo) {
+        (Some(a), Some(b)) => Some(if a >= b { a.to_string() } else { b.to_string() }),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// 后台检查循环。
 ///
 /// 30 秒的间隔按 500ms 小片睡：`stop()` 置位后最多 500ms 就能退出，
 /// 不必等满一整轮间隔（停用插件时若等它睡满，会把调用方挂住半分钟）。
 fn check_loop(stop: Arc<AtomicBool>) {
+    // 两张只在本进程有效的兜底表（重启即清零，库里那份才是准）：
+    // last_run 写库失败时记下的启动时刻、以及连续启动失败的次数。
+    let mut fired_memo: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    let mut launch_failures: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
     while !stop.load(Ordering::SeqCst) {
         for _ in 0..(CHECK_INTERVAL_MS / 500) {
             if stop.load(Ordering::SeqCst) {
@@ -924,9 +966,41 @@ fn check_loop(stop: Arc<AtomicBool>) {
         }
         let now = Local::now();
         let tasks = get_all_tasks();
-        for t in &tasks {
-            if should_run(t, &now) {
-                execute_task(t);
+        for task in &tasks {
+            if launch_failures.get(&task.id).copied().unwrap_or(0) >= LAUNCH_FAILURE_BACKOFF_AFTER {
+                continue;
+            }
+            // 条数就几条，克隆一份把兜底时刻套上去，比到处传参数好读
+            let memo = fired_memo.get(&task.id).cloned();
+            let mut t = task.clone();
+            t.last_run = effective_last_run(task.last_run.as_deref(), memo.as_deref());
+            if should_run(&t, &now) {
+                record_launch(&t, &mut fired_memo, &mut launch_failures);
+            }
+        }
+    }
+}
+
+/// 启动一次并把结果记进两张兜底表。
+fn record_launch(
+    t: &ScheduledTask,
+    fired_memo: &mut std::collections::HashMap<i64, String>,
+    launch_failures: &mut std::collections::HashMap<i64, u32>,
+) {
+    match execute_task(t) {
+        Some(at) => {
+            fired_memo.insert(t.id, at);
+            launch_failures.remove(&t.id);
+        }
+        None => {
+            let n = launch_failures.entry(t.id).or_insert(0);
+            *n += 1;
+            if *n == LAUNCH_FAILURE_BACKOFF_AFTER {
+                tracing::warn!(
+                    "定时任务「{}」连续 {n} 次没能启动，本轮调度期内不再重试（到下一个时段再试一次）；\
+                     目标已卸载或不在白名单里的话，请直接删掉或改正这条任务",
+                    t.name
+                );
             }
         }
     }
@@ -1279,6 +1353,88 @@ mod tests {
     }
 
     /// 入口与执行前两道校验都要挡下坏参数（库被外部改写的情形）。
+    /// 回归：编辑一条任务不该让它当天再被执行一次。
+    ///
+    /// 判"要不要重置 last_run"原来看的是"调用方传没传 schedule_time"，而插件侧的
+    /// `scheduler_update` 永远把七个字段整条传回来（host.rs）—— 于是改个名字、补一条
+    /// 参数，都会把今天的执行记录清空，30 秒后那个程序又弹一次。
+    #[test]
+    fn editing_a_task_keeps_todays_last_run() {
+        let _g = isolate_app_dir("edit_keeps_last_run");
+        let notepad = r"C:\Windows\notepad.exe";
+        if !std::path::Path::new(notepad).is_file() {
+            return; // 与既有测试同口径：没有 notepad 的机器跳过建任务
+        }
+        let id = add_task("每日记事本", notepad, "", "daily", "00:01", true).unwrap();
+        let today = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "UPDATE scheduled_tasks SET last_run=?1 WHERE id=?2",
+                rusqlite::params![today.clone(), id],
+            )
+            .unwrap();
+        }
+
+        // 只改名字，时刻一字未动
+        update_task(
+            id,
+            Some("改名后的记事本"),
+            Some(notepad),
+            Some(""),
+            Some("daily"),
+            Some("00:01"),
+            Some(true),
+        )
+        .unwrap();
+        let t = get_all_tasks().into_iter().find(|x| x.id == id).unwrap();
+        assert_eq!(
+            t.last_run.as_deref(),
+            Some(today.as_str()),
+            "只改名字不该把今天的执行记录清掉"
+        );
+        assert!(
+            !should_run(&t, &Local::now()),
+            "今天已经跑过的任务，改完名字不该立刻又该跑"
+        );
+
+        // 反向腿：真的改了时刻，必须清掉，否则新的时刻今天再也不触发
+        update_task(
+            id,
+            Some("改名后的记事本"),
+            Some(notepad),
+            Some(""),
+            Some("daily"),
+            Some("00:02"),
+            Some(true),
+        )
+        .unwrap();
+        let t2 = get_all_tasks().into_iter().find(|x| x.id == id).unwrap();
+        assert_eq!(t2.last_run, None, "改了调度时刻就该重新计一次");
+        assert!(should_run(&t2, &Local::now()), "改到新时刻后要能重新触发");
+    }
+
+    /// 写库失败时，本轮兜底记忆必须顶得上；重启后则以库里那次为准。
+    #[test]
+    fn launch_memo_only_adds_what_the_db_lost() {
+        assert_eq!(
+            effective_last_run(None, Some("2026-09-23 10:00:00")).as_deref(),
+            Some("2026-09-23 10:00:00"),
+            "库里没写进去（BUSY/表不可用）时要靠内存那次"
+        );
+        assert_eq!(
+            effective_last_run(Some("2026-09-23 09:00:00"), Some("2026-09-23 10:00:00")).as_deref(),
+            Some("2026-09-23 10:00:00"),
+            "内存里那次更新"
+        );
+        assert_eq!(
+            effective_last_run(Some("2026-09-23 11:00:00"), Some("2026-09-23 10:00:00")).as_deref(),
+            Some("2026-09-23 11:00:00"),
+            "库里更全时不能被旧记忆盖掉"
+        );
+        assert_eq!(effective_last_run(None, None), None);
+    }
+
     #[test]
     fn add_task_rejects_bad_args_without_storing() {
         let _g = isolate_app_dir("args_entry");
