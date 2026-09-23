@@ -618,6 +618,99 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// WAL 年度库缺 `-shm`（崩溃残留的那一类）时，只读路径必须还能读出内容。
+    ///
+    /// 不修的表现是"那一年静默读成空"：`open_ro` 打不开 → `with_ro_conn` 返回
+    /// `None` → 调用方普遍 `unwrap_or(0)`，界面上就是整年排行榜空掉。
+    #[test]
+    fn ro_conn_reads_a_wal_db_that_lost_its_shm_sidecar() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("conn_wal_shm");
+
+        // ① 正常建一个 WAL 库并写三行
+        let src = crate::paths::year_db_path(2031);
+        {
+            let conn = open_rw(&src).unwrap();
+            assert_eq!(
+                conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .to_ascii_uppercase(),
+                "WAL",
+                "夹具必须是 WAL 库，否则这条用例什么都验不到"
+            );
+            conn.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+            for i in 0..3 {
+                conn.execute("INSERT INTO t VALUES (?1)", [i]).unwrap();
+            }
+        }
+        // ② 只取主库文件。正常关闭会把 -wal/-shm 合并回主库并删掉 sidecar，
+        //    而库头的 journal 形态仍是 WAL —— 这正是"崩溃后只剩主文件"的形状。
+        let orphan = src.parent().unwrap().join("orphan_2031.db");
+        std::fs::copy(&src, &orphan).unwrap();
+        assert!(!orphan.with_extension("db-shm").exists());
+
+        // ③ 只读路径要读出 3 行，而不是 None（上层会把它当成 0）
+        let got = with_ro_conn(&orphan, |c| {
+            c.query_row("SELECT COUNT(*) FROM t", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        });
+        assert_eq!(got, Some(3), "只读打开无 -shm 的 WAL 库不该静默读成空");
+        // 兜底句柄仍须只读：读路径不能顺手写数据
+        let can_write = with_ro_conn(&orphan, |c| c.execute("INSERT INTO t VALUES (9)", []));
+        assert_eq!(
+            can_write.map(|r| r.is_ok()),
+            Some(false),
+            "兜底之后仍然不许写"
+        );
+    }
+
+    /// 更硬的一种形态：主库 + **还在的 -wal**，但 -shm 没了。
+    ///
+    /// 这才是"崩溃/整目录搬运后只剩 sidecar"的形状：未 checkpoint 的已提交帧还在
+    /// -wal 里，只读连接要先把 WAL 恢复出来才能读，而恢复需要写 -shm。
+    /// 这条用例先回答"SQLite 到底会不会失败"，再决定要不要在 `open_ro` 里兜底 ——
+    /// 上一节那种"只有主库文件"的形态实测根本不失败（见另一个用例）。
+    #[test]
+    fn ro_conn_reads_a_wal_db_with_orphaned_wal_sidecar() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("conn_wal_orphan");
+
+        let src = crate::paths::year_db_path(2032);
+        let orphan = src.parent().unwrap().join("orphan_2032.db");
+        let conn = open_rw(&src).unwrap();
+        conn.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        for i in 0..3 {
+            conn.execute("INSERT INTO t VALUES (?1)", [i]).unwrap();
+        }
+        // 连接还开着的时候拷走主库 + -wal：关掉连接会把 -wal 合并回主库并删掉，
+        // 那样就变回"只有主库文件"的温和形态，验不到想验的这一种。
+        assert!(
+            Path::new(&format!("{}-wal", src.display())).exists(),
+            "夹具前提：WAL 里得有未合并的帧"
+        );
+        std::fs::copy(&src, &orphan).unwrap();
+        std::fs::copy(
+            format!("{}-wal", src.display()),
+            format!("{}-wal", orphan.display()),
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            !Path::new(&format!("{}-shm", orphan.display())).exists(),
+            "夹具前提：-shm 必须不存在"
+        );
+
+        let got = with_ro_conn(&orphan, |c| {
+            c.query_row("SELECT COUNT(*) FROM t", [], |r| r.get::<_, i64>(0))
+                .unwrap_or(-1)
+        });
+        assert_eq!(
+            got,
+            Some(3),
+            "带着孤儿 -wal 的库不该被只读路径读成空（None 在上层就是 0）"
+        );
+    }
+
     /// 老库的 active_seconds 必须被并入 daily_counts.seconds，数据一天都不能丢。
     ///
     /// 这条用例专门走到「迁移分支」——其余测试都是用新 ensure_schema 直接建库，
