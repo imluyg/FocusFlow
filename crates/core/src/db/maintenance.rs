@@ -566,7 +566,7 @@ fn combo_key_mapping(old: &str) -> Option<String> {
 /// 清理「保留 keep_days 天（含今天）」之外的数据，返回删除的聚合行数。
 ///
 /// 口径与 `get_daily_counts` 对齐：保留 N 天 = 含今天在内的 N 个自然日。
-/// 不可逆操作：执行前先做一次全量备份。
+/// 不可逆操作：只在**确实有行要删**时才做一次全量备份（没删成东西就不该占备份名额）。
 ///
 /// `keep_days < 1` 一律拒绝而不是钳制成 1：0 或负数会让 cutoff 落到今天甚至
 /// 未来，一条 DELETE 就把全部历史（含今天）清空；而钳制同样会把误输入的 -1
@@ -576,27 +576,54 @@ pub fn cleanup_old_data(keep_days: i64) -> i64 {
         tracing::error!("清理天数必须 >= 1（收到 {keep_days}），已拒绝");
         return 0;
     }
-    snapshot_before_destructive("cleanup_old_data");
     let cutoff_dk = queries::day_key_of_date(Local::now().date_naive()) - (keep_days - 1);
     let mut total = 0i64;
+    // 快照只在「确实有过期行要删」的那一年、且在本轮任何 DELETE 之前做一次：
+    // backup_database 本来就覆盖全部年度库与附属库，所以这一次快照足以兜住
+    // 之后所有年份的删除。反过来，先抢在循环外无条件备份会让「其实没什么可删」
+    // 的清理白写一套快照，挤掉 max_backups 的近期名额。
+    let mut snapshotted = false;
     for year in queries::available_years() {
         let path = paths::year_db_path(year);
         let conn = match connection::open_rw(&path) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        for table in DATA_TABLES {
-            let n = conn
-                .execute(
-                    &format!("DELETE FROM {table} WHERE date_key < ?1"),
-                    [cutoff_dk],
-                )
-                .unwrap_or(0);
-            total += n as i64;
+        // 探测必须发生在 BEGIN IMMEDIATE 之后：事务外先查后删之间，写入线程仍可
+        // 把过期增量落进库，那一行就会被「无快照删除」掉。拿到写锁后再探测，
+        // 探测结果与随后的 DELETE 之间就不可能有别人插队。
+        if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+            continue;
         }
-        // 设备字典按「还有没有引用」清理（它没有 date_key，不能按日期删）
+        let mut year_deleted = 0i64;
+        if min_stale_date_key(&conn, cutoff_dk).is_some() {
+            if !snapshotted {
+                snapshot_before_destructive("cleanup_old_data");
+                snapshotted = true;
+            }
+            for table in DATA_TABLES {
+                let n = conn
+                    .execute(
+                        &format!("DELETE FROM {table} WHERE date_key < ?1"),
+                        [cutoff_dk],
+                    )
+                    .unwrap_or(0);
+                year_deleted += n as i64;
+            }
+        }
+        // 设备字典按「还有没有引用」清理（它没有 date_key，不能按日期删）。
+        // 与日期删除解耦：它删的是已经不被任何统计行引用的登记，且设备再出现时
+        // 会按同一路径自动重新登记，因此不需要为它单独付一次全量快照。
         prune_orphan_devices(&conn);
-        tracing::info!("已清理 {year} 年 {cutoff_dk} 前的数据");
+        // 提交失败 = 这一年的删除被回滚，不能把它算进「已清理」的回报里
+        if conn.execute_batch("COMMIT").is_ok() {
+            if year_deleted > 0 {
+                tracing::info!("已清理 {year} 年 {cutoff_dk} 前的数据");
+                total += year_deleted;
+            }
+        } else {
+            tracing::error!("{year} 年数据清理提交失败，本年度改动已回滚");
+        }
     }
     if total > 0 {
         // 删空的年份文件还在磁盘上：让年份列表立刻重算（现在会把空壳过滤掉），
@@ -1397,13 +1424,20 @@ pub fn delete_key_today(key_name: &str) -> i64 {
     if key_name.is_empty() {
         return 0;
     }
-    snapshot_before_destructive("delete_key_today");
     let today_dk = queries::day_key_of_date(Local::now().date_naive());
     let path = paths::current_year_db_path();
     let conn = match connection::open_rw(&path) {
         Ok(c) => c,
         Err(_) => return 0,
     };
+    // 整个「探测有没有得删 → 快照 → 删 + 联动修正」放进一个写事务：
+    // 探测若放在事务外，写入线程随时可能把该按键今天的增量落进来，删掉它的同时
+    // 却没有任何快照兜着（探测时看到 0 行已经省掉了备份）。拿到写锁再探测，
+    // 探测结果就和随后的删除一致了。顺带让 key_counts / daily_counts /
+    // hourly_counts 的三方修正变成原子的 —— 中途失败不会留下 Σhourly ≠ daily。
+    if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+        return 0;
+    }
 
     let removed: i64 = conn
         .query_row(
@@ -1413,8 +1447,11 @@ pub fn delete_key_today(key_name: &str) -> i64 {
         )
         .unwrap_or(0);
     if removed <= 0 {
+        conn.execute_batch("ROLLBACK").ok();
         return 0;
     }
+    // 到这一步才真的会删东西，快照也只在这种时候才值回它的轮转名额
+    snapshot_before_destructive("delete_key_today");
     let daily_before: i64 = conn
         .query_row(
             "SELECT count FROM daily_counts WHERE date_key=?1",
@@ -1429,6 +1466,7 @@ pub fn delete_key_today(key_name: &str) -> i64 {
         rusqlite::params![key_name, today_dk],
     ) {
         tracing::error!("delete_key_today 删除 key_counts 失败: {e}");
+        conn.execute_batch("ROLLBACK").ok();
         return 0;
     }
     if let Err(e) = conn.execute(
@@ -1482,6 +1520,11 @@ pub fn delete_key_today(key_name: &str) -> i64 {
         );
     }
 
+    // 提交失败就等于什么都没删（连接析构会回滚），不能照报成功值
+    if let Err(e) = conn.execute_batch("COMMIT") {
+        tracing::error!("delete_key_today 提交失败，本次删除已回滚: {e}");
+        return 0;
+    }
     tracing::info!("已删除今日按键 [{key_name}] 的聚合记录（计数 {removed}）");
     removed
 }
@@ -2729,5 +2772,136 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// backup/ 里有几份备份库（只数 .db，SUSPECT 说明等旁证文件不算）。
+    fn backup_db_count() -> usize {
+        std::fs::read_dir(paths::backup_dir())
+            .map(|it| {
+                it.flatten()
+                    .filter(|e| {
+                        e.path()
+                            .file_name()
+                            .map(|n| n.to_string_lossy().ends_with(".db"))
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// 空清理不该吃备份名额。
+    ///
+    /// 老实现把 `snapshot_before_destructive` 无条件放在循环之前，于是"保留 90 天
+    /// 但历史只有 30 天"这种最常见的清理每跑一次就写一整套快照并触发轮转 ——
+    /// 实测两次空跑留下 4 个文件 / 300KB，把 `max_backups` 的近端档挤掉。
+    ///
+    /// 后半段是对照组：真有可删的东西时快照必须照旧存在。少了这半段，"跳过快照"
+    /// 就可能悄悄变成"不可逆操作永远没有兜底"。
+    #[test]
+    fn empty_cleanup_skips_snapshot_but_real_cleanup_keeps_it() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("cleanup_snap");
+
+        let year = Local::now().year();
+        let now_date = Local::now().date_naive();
+        let today_dk = queries::day_key_of_date(now_date);
+        let old_dk = queries::day_key_of_date(now_date - chrono::Days::new(400));
+        {
+            let conn = connection::open_rw(&paths::year_db_path(year)).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 7)",
+                [today_dk],
+            )
+            .unwrap();
+        }
+        queries::invalidate_years_cache();
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+
+        assert_eq!(cleanup_old_data(30), 0, "今天那行还在保留窗口内");
+        assert_eq!(
+            backup_db_count(),
+            0,
+            "删 0 行却写了快照，白占 max_backups 的近端名额"
+        );
+
+        // 对照组：改成"只留今天"，400 天前那行就是可删的
+        {
+            let conn = connection::open_rw(&paths::year_db_path(year)).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 3)",
+                [old_dk],
+            )
+            .unwrap();
+        }
+        assert_eq!(cleanup_old_data(1), 1, "应删掉那一行过期数据");
+        assert!(backup_db_count() >= 1, "真删了数据就必须留下执行前快照");
+        let left: i64 = connection::open_rw(&paths::year_db_path(year))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM daily_counts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "过期行应已删除，只剩今天那行");
+    }
+
+    /// 「今天没有这个按键」时删除不该付快照；真删了则要快照，且
+    /// key_counts / daily_counts / hourly_counts 三方必须一起归零。
+    #[test]
+    fn delete_key_today_skips_snapshot_when_nothing_to_delete() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("delkey_snap");
+
+        let year = Local::now().year();
+        let today_dk = queries::day_key_of_date(Local::now().date_naive());
+        {
+            let conn = connection::open_rw(&paths::year_db_path(year)).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            conn.execute(
+                "INSERT INTO key_counts (date_key, key_name, count) VALUES (?1, 'A', 6)",
+                [today_dk],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 6)",
+                [today_dk],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO hourly_counts (date_key, hour, count) VALUES (?1, 9, 6)",
+                [today_dk],
+            )
+            .unwrap();
+        }
+        queries::invalidate_years_cache();
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+
+        assert_eq!(delete_key_today("Ghost"), 0);
+        assert_eq!(backup_db_count(), 0, "什么都没删掉却写了一整套快照");
+
+        assert_eq!(delete_key_today("A"), 6);
+        assert!(backup_db_count() >= 1, "真的删除后必须留下执行前快照");
+        let conn = connection::open_rw(&paths::year_db_path(year)).unwrap();
+        let daily: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let hourly: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM hourly_counts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let keys: i64 = conn
+            .query_row("SELECT COUNT(*) FROM key_counts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            (keys, daily, hourly),
+            (0, 0, 0),
+            "三方应一起归零（Σhourly == daily == key_counts）"
+        );
     }
 }
