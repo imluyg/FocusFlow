@@ -49,6 +49,18 @@ fn open() -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// 空白值按"没有分类"处理：落库存 NULL。
+///
+/// 插件侧的下拉框用 `""` 表示"（无）/（请选择）"，直接原样写库的话：
+/// - 分类盈亏/月度分类明细里出现一个**名字为空**的行（`(未分类)` 只兜住了 NULL），
+///   插件把它拼成 `"  : 12.00"` 这样一行看不出是谁的数；
+/// - 与旧版 Python 导入的 NULL 分成两组，同一个"没分类"被拆成两行、各自的数都不对。
+/// 顺带 trim：`"餐饮"` 与 `" 餐饮"` 在 GROUP BY 里也是两个分类。
+fn blank_to_none(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(trimmed.to_string())
+}
+
 /// 预置分类（首次初始化用，对标 Python 版 DEFAULT_CATEGORIES）。
 /// 名称 -> (类型, 子分类列表)
 const DEFAULT_CATEGORIES: &[(&str, &str, &[&str])] = &[
@@ -234,8 +246,8 @@ pub fn add_expense(
             store,
             purchase_date,
             amount,
-            category,
-            subcategory,
+            blank_to_none(category),
+            blank_to_none(subcategory),
             record_time,
             note
         ],
@@ -264,8 +276,8 @@ pub fn update_expense(id: i64, e: &Expense) -> bool {
             e.store,
             e.purchase_date,
             e.amount,
-            e.category,
-            e.subcategory,
+            blank_to_none(e.category.as_deref()),
+            blank_to_none(e.subcategory.as_deref()),
             e.note,
             id
         ],
@@ -839,9 +851,9 @@ pub fn monthly_summary_detail(year_month: &str) -> (f64, f64, i64, Vec<(String, 
     // 净额在 SQL 里按分相减、只在最后除一次：分两次查出 inc/exp 再在 Rust 里
     // 相减，等于把浮点漂移又请回来一次
     if let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT COALESCE(category, '(未分类)') AS cat,
+        "SELECT COALESCE(NULLIF(category, ''), '(未分类)') AS cat,
                 ({inc} - {exp}) / 100.0 AS net
-         FROM expenses WHERE purchase_date LIKE ?1 GROUP BY category
+         FROM expenses WHERE purchase_date LIKE ?1 GROUP BY cat
          ORDER BY net DESC",
         inc = sum_cents("CASE WHEN type='收入' THEN amount ELSE 0 END"),
         exp = sum_cents("CASE WHEN type='支出' THEN amount ELSE 0 END"),
@@ -865,11 +877,11 @@ pub fn category_profit_loss() -> Vec<(String, f64, f64, i64)> {
     };
     let mut out = Vec::new();
     if let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT COALESCE(category, '(未分类)') AS cat,
+        "SELECT COALESCE(NULLIF(category, ''), '(未分类)') AS cat,
                 {inv} AS inv,
                 {earn} AS earn,
                 COUNT(*) AS cnt
-         FROM expenses GROUP BY category ORDER BY inv - earn",
+         FROM expenses GROUP BY cat ORDER BY inv - earn",
         inv = sum_amount_sql("CASE WHEN type='支出' THEN amount ELSE 0 END"),
         earn = sum_amount_sql("CASE WHEN type='收入' THEN amount ELSE 0 END"),
     )) {
@@ -901,7 +913,7 @@ pub fn subcategory_profit_loss(category: &str) -> Vec<(String, f64, f64, i64)> {
                 {inv} AS inv,
                 {earn} AS earn,
                 COUNT(*) AS cnt
-         FROM expenses WHERE category=?1 GROUP BY subcategory ORDER BY inv - earn",
+         FROM expenses WHERE category=?1 GROUP BY sub ORDER BY inv - earn",
         inv = sum_amount_sql("CASE WHEN type='支出' THEN amount ELSE 0 END"),
         earn = sum_amount_sql("CASE WHEN type='收入' THEN amount ELSE 0 END"),
     )) {
@@ -1043,6 +1055,148 @@ mod tests {
         assert_eq!(
             get_subcategories("新建的"),
             vec!["饮料".to_string(), "零食".to_string()]
+        );
+    }
+
+    /// 「没有分类」在库里可以有两种写法，聚合必须把它们当成同一件事。
+    ///
+    /// 插件的下拉框用空串表示"（无）/（请选择）"，旧版 Python 导入的记录用的是 NULL。
+    /// 旧实现按 `category` 原样 GROUP BY、只在 NULL 上兜 `(未分类)`，于是分类盈亏
+    /// 里出现一个**名字为空**的行（插件把它拼成 `"  : 12.00"`），而同一件"没分类"
+    /// 被拆成两行、两边的数都不对。
+    #[test]
+    fn empty_and_null_category_are_the_same_bucket() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_blank_cat");
+        init_db().expect("建库失败");
+        let ym = chrono::Local::now().format("%Y-%m").to_string();
+        let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        // ① 写入侧：空串/纯空白的分类与子分类不该落成一个空名字
+        let a = add_expense(
+            "支出",
+            "无分类甲",
+            None,
+            &day,
+            10.0,
+            Some(""),
+            Some("  "),
+            None,
+        );
+        let b = add_expense(
+            "支出",
+            "无分类乙",
+            None,
+            &day,
+            5.0,
+            Some("  "),
+            Some(""),
+            None,
+        );
+        assert!(a > 0 && b > 0, "写入应成功: {a} {b}");
+        let rec = get_expense_by_id(a).expect("记录应能读回");
+        assert_eq!(rec.category, None, "空白分类该落成 NULL");
+        assert_eq!(rec.subcategory, None, "空白子分类该落成 NULL");
+        // 反向腿：非空白的照原样留下（首尾空格被 trim，否则 GROUP BY 里又是两个分类）
+        let c = add_expense(
+            "支出",
+            "有分类",
+            None,
+            &day,
+            2.0,
+            Some(" 餐饮 "),
+            Some(" 零食 "),
+            None,
+        );
+        assert_eq!(
+            get_expense_by_id(c).unwrap().category.as_deref(),
+            Some("餐饮"),
+            "有效分类不该被动"
+        );
+
+        // ② 库里再补两条旧形态 —— 写入侧管不到历史数据：NULL 一类、真空串一类
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO expenses (type,item_name,purchase_date,amount,category,subcategory,record_time)
+                 VALUES ('收入','旧版导入',?1,25.0,NULL,NULL,?2)",
+                rusqlite::params![day, day],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO expenses (type,item_name,purchase_date,amount,category,subcategory,record_time)
+                 VALUES ('支出','修复前写入',?1,7.0,'','',?2)",
+                rusqlite::params![day, day],
+            )
+            .unwrap();
+        }
+
+        // ③ 读取侧：NULL 与空串并成一行 (未分类)，且不许出现空名字的行
+        let profit = category_profit_loss();
+        let names: Vec<&str> = profit.iter().map(|(n, ..)| n.as_str()).collect();
+        assert!(
+            !names.iter().any(|n| n.is_empty()),
+            "不该出现名字为空的分类行: {names:?}"
+        );
+        let blank: Vec<&(String, f64, f64, i64)> =
+            profit.iter().filter(|(n, ..)| n == "(未分类)").collect();
+        assert_eq!(blank.len(), 1, "NULL 与空串必须并成一行: {names:?}");
+        let row = blank[0];
+        assert_eq!(
+            (row.1, row.2, row.3),
+            (22.0, 25.0, 4),
+            "(未分类) 的四笔应并成一行（10+5+7 支出、25 收入）: {row:?}"
+        );
+        assert!(names.contains(&"餐饮"), "非空白分类照常成行: {names:?}");
+
+        // ④ 月度分类明细同一口径
+        let (_, _, _, detail) = monthly_summary_detail(&ym);
+        assert_eq!(
+            detail.iter().filter(|(n, _)| n == "(未分类)").count(),
+            1,
+            "月度明细不该把同一件事拆成两行: {detail:?}"
+        );
+        assert!(
+            detail.iter().all(|(n, _)| !n.is_empty()),
+            "月度明细里不该有空名字: {detail:?}"
+        );
+
+        // ⑤ 子分类：同一分类下 '' 与 NULL 不能各占一行 "(未分细类)"
+        add_expense(
+            "支出",
+            "细类空",
+            None,
+            &day,
+            1.0,
+            Some("餐饮"),
+            Some(""),
+            None,
+        );
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO expenses (type,item_name,purchase_date,amount,category,subcategory,record_time)
+                 VALUES ('支出','细类NULL',?1,2.0,'餐饮',NULL,?2)",
+                rusqlite::params![day, day],
+            )
+            .unwrap();
+        }
+        let sub = subcategory_profit_loss("餐饮");
+        let sub_names: Vec<&str> = sub.iter().map(|(n, ..)| n.as_str()).collect();
+        assert_eq!(
+            sub_names.iter().filter(|n| **n == "(未分细类)").count(),
+            1,
+            "不该出现两行 (未分细类): {sub_names:?}"
+        );
+        let merged = sub.iter().find(|(n, ..)| n == "(未分细类)").unwrap();
+        assert_eq!(
+            (merged.1, merged.3),
+            (3.0, 2),
+            "两笔空白子分类该并成一行: {merged:?}"
+        );
+        assert!(
+            sub_names.contains(&"零食"),
+            "有名字的子分类照常成行: {sub_names:?}"
         );
     }
 }
