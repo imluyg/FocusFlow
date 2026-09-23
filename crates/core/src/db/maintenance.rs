@@ -458,7 +458,34 @@ fn migrate_v2_file(path: &Path, year: i32) -> i64 {
             return Ok(0);
         }
 
-        let off = queries::local_utc_offset_seconds();
+        // 日期/小时分桶交给 SQLite 按**那条时间戳当时**的本地时刻换算，
+        // 不再用 `local_utc_offset_seconds()`（那是"此刻"的偏移）去套全部历史：
+        // 有夏令时的地区里，被导入那一年的上半年会按夏天的偏移分桶、下半年按冬天的，
+        // 于是大约一半的日数据在日界上偏一格。
+        // 顺带修掉第二件事：`CAST(x / 86400 AS INTEGER)` 对**负数向零截断**，
+        // 1970 年之前的时间戳会被塞进错的一天 —— 而且截出来的 0 是
+        // "看起来合法"的 1970-01-01，事后根本查不出来。
+        const LOCAL_DAY_KEY: &str = "CAST(julianday(date(timestamp,'unixepoch','localtime')) \
+                                     - 2440587.5 AS INTEGER)";
+        // 换算不出本地日期的明细（脏到超出 SQLite 的 0000..9999 年，或这个构建没带
+        // date/`localtime` 支持）先数一遍再决定要不要动手。
+        // 实测：即使没有这道守卫，紧随其后的 hourly_counts 也会因为
+        // `(date_key, hour)` 主键不收 NULL 而整段回滚，所以"明细被当成聚合过而删掉"
+        // 这条路其实走不通。守卫换来的是**一条说得清原因的错误**（"N 条里只有 M 条
+        // 能换算出本地日期"）而不是一句 `NOT NULL constraint failed: hourly_counts.hour`，
+        // 并且不依赖后面那三条语句的形状 —— 而 daily_counts 那一侧 NULL 是真的会被
+        // SQLite 当"没给 rowid"补号的，只是靠回滚兜住。
+        let bucketed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM key_log WHERE date(timestamp,'unixepoch','localtime') IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        if bucketed != row_count {
+            return Err(anyhow::anyhow!(
+                "{year} 年 {row_count} 条旧明细里只有 {bucketed} 条能换算出本地日期，\
+                 聚合与清理全部中止（明细保持原样，未删除任何数据）"
+            ));
+        }
         conn.execute("BEGIN IMMEDIATE;", [])?;
         // 三条聚合都必须累加而不是直接插入：目标年库很可能早有当天的聚合行
         // （新版一直在跑，之后又导入同年的旧版明细），plain INSERT 会撞主键
@@ -469,29 +496,36 @@ fn migrate_v2_file(path: &Path, year: i32) -> i64 {
         // daily_counts.seconds 不进冲突分支：旧版明细没有活跃时长，
         // 用 0 覆盖会抹掉该天已有的时长统计。
         conn.execute(
-            "INSERT INTO daily_counts (date_key, count)
-             SELECT CAST((timestamp + ?1) / 86400 AS INTEGER), COUNT(*)
-             FROM key_log GROUP BY 1
-             ON CONFLICT(date_key) DO UPDATE SET count = count + excluded.count",
-            [off],
+            &format!(
+                "INSERT INTO daily_counts (date_key, count)
+                 SELECT dk, COUNT(*) FROM (SELECT {LOCAL_DAY_KEY} AS dk FROM key_log)
+                 GROUP BY dk
+                 ON CONFLICT(date_key) DO UPDATE SET count = count + excluded.count"
+            ),
+            [],
         )?;
         conn.execute(
-            "INSERT INTO hourly_counts (date_key, hour, count)
-             SELECT CAST((timestamp + ?1) / 86400 AS INTEGER),
-                    CAST(((timestamp + ?1) / 3600) % 24 AS INTEGER),
-                    COUNT(*)
-             FROM key_log GROUP BY 1, 2
-             ON CONFLICT(date_key, hour) DO UPDATE SET count = count + excluded.count",
-            [off],
+            &format!(
+                "INSERT INTO hourly_counts (date_key, hour, count)
+                 SELECT dk, hh, COUNT(*) FROM (
+                   SELECT {LOCAL_DAY_KEY} AS dk,
+                          CAST(strftime('%H', datetime(timestamp,'unixepoch','localtime')) AS INTEGER) AS hh
+                   FROM key_log)
+                 GROUP BY 1, 2
+                 ON CONFLICT(date_key, hour) DO UPDATE SET count = count + excluded.count"
+            ),
+            [],
         )?;
         conn.execute(
-            "INSERT INTO key_counts (date_key, key_name, count)
-             SELECT CAST((timestamp + ?1) / 86400 AS INTEGER), key_name, COUNT(*)
-             FROM key_log GROUP BY 1, 2
-             ON CONFLICT(date_key, key_name) DO UPDATE SET count = count + excluded.count",
-            [off],
+            &format!(
+                "INSERT INTO key_counts (date_key, key_name, count)
+                 SELECT dk, key_name, COUNT(*) FROM (
+                   SELECT {LOCAL_DAY_KEY} AS dk, key_name FROM key_log)
+                 GROUP BY 1, 2
+                 ON CONFLICT(date_key, key_name) DO UPDATE SET count = count + excluded.count"
+            ),
+            [],
         )?;
-
         // 旧版 Ctrl+X 组合键名修正。改名是「并入」而非「替换」：同一天往往
         // 已经存在修正后的键名，直接 UPDATE 会撞 key_counts 的
         // (date_key, key_name) 主键；而 UPDATE 是整条语句作废（不是逐行跳过），
@@ -3219,6 +3253,126 @@ mod tests {
         assert!(suspect_notes().is_empty());
         // 没有说明时是 no-op，不得报错
         clear_suspect_notes();
+    }
+
+    /// 旧明细的日/时分桶要按**那条时间戳当时**的本地时刻算，负数还要向下取整。
+    ///
+    /// 原来三条聚合都写成 `CAST((timestamp + 此刻偏移) / 86400 AS INTEGER)`，两个毛病：
+    /// ① 拿"此刻"的 UTC 偏移去套全部历史 —— 有夏令时的地区里，被导入那一年的
+    ///   上半年按夏天偏移分桶、下半年按冬天，约一半日数据在日界上偏一格
+    ///   （本机 UTC+8 无 DST，这半个改动的效果在这里验不出来，只能靠推导）；
+    /// ② `CAST` 对负数是**向零截断** —— 1970 年之前的时间戳被塞进错的一天，
+    ///   而且截出来的 0 是"看起来合法"的 1970-01-01，事后完全查不出来。
+    ///   下面测的就是 ②，它在任何时区都有区分度。
+    #[test]
+    fn migrate_v2_buckets_pre_epoch_timestamps_by_their_own_local_day() {
+        use chrono::{Local, TimeZone, Timelike};
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("migrate_bucket");
+        let year = 1970i32;
+        let path = paths::year_db_path(year);
+        // 本地零点**前一秒**（UTC+8 下 = 1969-12-31 23:59:59）：它属于前一天。
+        let edge = -28_801i64;
+        let at = Local.timestamp_opt(edge, 0).single().expect("合法时间戳");
+        let expect_dk = at
+            .date_naive()
+            .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("date"))
+            .num_days();
+        let expect_hour = at.hour() as i64;
+        assert_eq!(
+            expect_dk, -1,
+            "前提：这条时间戳在本地确实落在 1970-01-01 之前"
+        );
+
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            connection::ensure_staging_table(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO key_log (key_name, timestamp) VALUES ('A', ?1), ('B', ?1)",
+                [edge],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(migrate_v2_file(&path, year), 2, "两条明细都该被聚合");
+
+        let conn = connection::open_rw(&path).unwrap();
+        let pick = |sql: &str| -> Vec<(i64, i64)> {
+            let mut stmt = match conn.prepare(sql) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let mapped =
+                match stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))) {
+                    Ok(m) => m,
+                    Err(_) => return Vec::new(),
+                };
+            mapped.filter_map(|r| r.ok()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pick("SELECT date_key, count FROM daily_counts"),
+            vec![(expect_dk, 2)],
+            "1970 年之前的时间戳被塞进了错误的一天（向零截断）"
+        );
+        assert_eq!(
+            pick("SELECT hour, count FROM hourly_counts"),
+            vec![(expect_hour, 2)],
+            "小时桶同样得按那条时间戳的本地时刻"
+        );
+        let keys: i64 = conn
+            .query_row("SELECT COUNT(DISTINCT key_name) FROM key_counts", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        assert_eq!(keys, 2, "键名维度不能漏");
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM key_log", [], |r| r.get(0))
+            .unwrap_or(0);
+        assert_eq!(left, 0, "聚合成功后暂存明细要清空（表本身可以丢弃）");
+    }
+
+    /// 换算不出本地日期的脏时间戳要让整段聚合**中止且不动任何数据**。
+    ///
+    /// 这条锁住的是"失败时长什么样"：没有守卫时它也会被 hourly_counts 的
+    /// `(date_key, hour)` 主键挡下来（NULL 进不了主键），但那时日志里是一句
+    /// `NOT NULL constraint failed`，看不出是脏数据；有了守卫就是
+    /// "N 条里只有 M 条能换算出本地日期"。两种情况下明细都必须原样留着。
+    #[test]
+    fn migrate_v2_aborts_without_deleting_when_a_timestamp_has_no_local_date() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("migrate_guard");
+        let year = 2026i32;
+        let path = paths::year_db_path(year);
+        let good = 1_700_000_000i64;
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            connection::ensure_staging_table(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO key_log (key_name, timestamp) VALUES ('A', ?1), ('B', ?2)",
+                rusqlite::params![good, i64::MAX],
+            )
+            .unwrap();
+        }
+
+        let n = migrate_v2_file(&path, year);
+        let conn = connection::open_rw(&path).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM key_log", [], |r| r.get(0))
+            .unwrap_or(-1);
+        assert_eq!(n, 0, "有一条明细换算不出日期，整段聚合就不算成功");
+        assert_eq!(
+            left, 2,
+            "明细一条都不能少（中止之后原样留着，下次再试）：实际剩 {left} 条"
+        );
+        let days: i64 = conn
+            .query_row("SELECT COUNT(*) FROM daily_counts", [], |r| r.get(0))
+            .unwrap_or(-1);
+        assert_eq!(
+            days, 0,
+            "中止时不该留下半套聚合（更不该有 NULL date_key 补出来的行）"
+        );
     }
 
     /// backup/ 里有几份备份库（只数 .db，SUSPECT 说明等旁证文件不算）。
