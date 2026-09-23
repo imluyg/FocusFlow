@@ -227,7 +227,8 @@ pub fn start_device_stats(writer: Arc<DbWriter>) {
                 tracing::info!("非 Windows 平台不支持设备统计");
             }
         })
-        .expect("启动设备统计线程失败");
+        .map_err(|e| tracing::error!("启动设备统计线程失败: {e}"))
+        .ok();
 }
 
 /// Windows 实现：消息窗口 + Raw Input 注册 + 消息循环。

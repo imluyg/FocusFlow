@@ -222,7 +222,8 @@ impl PomodoroTimer {
         std::thread::Builder::new()
             .name("pomodoro".into())
             .spawn(move || tick_loop(state, stop))
-            .expect("启动番茄钟线程失败");
+            .map_err(|e| tracing::error!("启动番茄钟线程失败: {e}"))
+            .ok();
         timer
     }
 

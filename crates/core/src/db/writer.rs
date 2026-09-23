@@ -285,7 +285,8 @@ impl DbWriter {
         thread::Builder::new()
             .name("db-writer".into())
             .spawn(move || writer_loop(state2, sig_rx, flush_interval))
-            .expect("启动 DB 写入线程失败");
+            .map_err(|e| tracing::error!("启动 DB 写入线程失败: {e}"))
+            .ok();
 
         tracing::info!(
             "DB 写入线程已启动 (聚合写入, interval={:?})",

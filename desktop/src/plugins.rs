@@ -150,7 +150,8 @@ pub fn start_hot_reload(app: &tauri::AppHandle, db: Arc<Database>) {
                 std::thread::sleep(Duration::from_secs(2));
             }
         })
-        .expect("启动插件热重载扫描线程失败");
+        .map_err(|e| tracing::error!("启动插件热重载扫描线程失败（该功能不可用）: {e}"))
+        .ok();
 
     // 投递线程：收到变更 → 主线程执行重载，并通知前端刷新插件列表
     let app_owned = app.clone();
@@ -168,7 +169,8 @@ pub fn start_hot_reload(app: &tauri::AppHandle, db: Arc<Database>) {
                 });
             }
         })
-        .expect("启动插件热重载应用线程失败");
+        .map_err(|e| tracing::error!("启动插件热重载应用线程失败（该功能不可用）: {e}"))
+        .ok();
     tracing::info!("插件热重载已就绪（监听随插件管理页开关）");
 }
 
@@ -258,7 +260,8 @@ pub fn start_key_event_dispatch(
                 }
             }
         })
-        .expect("启动插件键事件分发线程失败");
+        .map_err(|e| tracing::error!("启动插件键事件分发线程失败（该功能不可用）: {e}"))
+        .ok();
     tracing::info!("插件键事件分发已接通");
 }
 

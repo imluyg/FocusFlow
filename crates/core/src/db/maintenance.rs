@@ -1006,7 +1006,8 @@ pub fn start_periodic_backup() {
                 }
             }
         })
-        .expect("启动定时备份线程失败");
+        .map_err(|e| tracing::error!("启动定时备份线程失败: {e}"))
+        .ok();
 }
 
 /// 破坏性操作（清空/清理/删除按键）前的兜底快照。

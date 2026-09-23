@@ -1043,8 +1043,10 @@ impl Scheduler {
         let handle = std::thread::Builder::new()
             .name("scheduler".into())
             .spawn(move || check_loop(stop))
-            .expect("启动调度线程失败");
-        *s.handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+            .map_err(|e| tracing::error!("启动调度线程失败: {e}"))
+            .ok();
+        // spawn 失败时 .ok() 已经是 None：调度线程没起来，句柄留 None
+        *s.handle.lock().unwrap_or_else(|e| e.into_inner()) = handle;
         tracing::info!("定时任务调度线程已启动");
         s
     }

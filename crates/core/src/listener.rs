@@ -552,7 +552,8 @@ impl InputListener {
                 }
                 thread::sleep(Duration::from_secs(5));
             })
-            .expect("启动输入监听线程失败");
+            .map_err(|e| tracing::error!("启动输入监听线程失败: {e}"))
+            .ok();
         tracing::info!(
             "键鼠监听已启动 (ignore_modifiers={}, ignore_functions={}, mouse_enabled={})",
             self.config

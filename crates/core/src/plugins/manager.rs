@@ -661,8 +661,10 @@ impl PluginManager {
         let handle = std::thread::Builder::new()
             .name("plugin-hot-reload".into())
             .spawn(move || hot_reload_loop(dir, tx, stop))
-            .expect("启动热重载线程失败");
-        self.hot_reload_thread = Some(handle);
+            .map_err(|e| tracing::error!("启动热重载线程失败: {e}"))
+            .ok();
+        // spawn 失败时 .ok() 已经是 None，字段本身就该留 None
+        self.hot_reload_thread = handle;
         tracing::info!("插件热重载已启用");
     }
 

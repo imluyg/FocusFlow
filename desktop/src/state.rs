@@ -255,7 +255,8 @@ fn enforce_floating_size(win: &tauri::WebviewWindow, config: &FocusFlowConfig) {
                 }
             }
         })
-        .expect("启动悬浮窗尺寸修正线程失败");
+        .map_err(|e| tracing::error!("启动悬浮窗尺寸修正线程失败（该功能不可用）: {e}"))
+        .ok();
 }
 
 /// 设置窗口初始可见性与悬浮窗位置。
@@ -355,7 +356,8 @@ fn setup_windows(app: &App, state: &AppState) {
             }
             tracing::warn!("WebView2 后台状态同步失败：控制器长时间未就绪");
         })
-        .expect("启动 WebView2 后台状态同步线程失败");
+        .map_err(|e| tracing::error!("启动 WebView2 后台状态同步线程失败（该功能不可用）: {e}"))
+        .ok();
 }
 
 /// 显示/隐藏悬浮窗，并把 WebView2 的渲染状态一起跟上。
@@ -554,7 +556,8 @@ pub fn show_main_window(app: &tauri::AppHandle) {
                     MAIN_CREATING.store(false, Ordering::SeqCst);
                 }
             })
-            .expect("启动主窗口创建线程失败");
+            .map_err(|e| tracing::error!("启动主窗口创建线程失败（该功能不可用）: {e}"))
+            .ok();
         return;
     }
     show_main_window_impl(app);
@@ -735,7 +738,8 @@ fn arm_main_unload(app: &tauri::AppHandle) {
             let _ = win.navigate(tauri::Url::parse("about:blank").unwrap());
             tracing::info!("主窗口页面已卸载到 about:blank（释放页面内存）");
         })
-        .expect("启动主窗口页面卸载线程失败");
+        .map_err(|e| tracing::error!("启动主窗口页面卸载线程失败（该功能不可用）: {e}"))
+        .ok();
 }
 
 /// 页面卸载后重新打开主窗口：轮询等待页面加载完成（最多 2 秒），
@@ -848,7 +852,7 @@ fn restore_main_after_load(app: &tauri::AppHandle) {
                 let _ = win.hide();
             }
         })
-        .expect("启动主窗口恢复线程失败");
+        .map_err(|e| tracing::error!("启动主窗口恢复线程失败（该功能不可用）: {e}")).ok();
 }
 
 /// 自动重启是否已安排（一个进程只允许安排一次：多个恢复线程同时超时会各拉起一个
@@ -923,7 +927,8 @@ fn schedule_app_restart(app: &tauri::AppHandle) {
                 }
             }
         })
-        .expect("启动应用重启线程失败");
+        .map_err(|e| tracing::error!("启动应用重启线程失败（该功能不可用）: {e}"))
+        .ok();
 }
 
 /// 兜底显示主窗口：恢复/重启都失败时至少让窗口可见，
@@ -958,7 +963,8 @@ pub fn show_main_window_when_ready(app: AppHandle, delay: Duration) {
             }
             tracing::warn!("显示主窗口：应用状态长时间未就绪，放弃");
         })
-        .expect("启动显示主窗口线程失败");
+        .map_err(|e| tracing::error!("启动显示主窗口线程失败（该功能不可用）: {e}"))
+        .ok();
 }
 
 /// 悬浮窗周期重申置顶（对齐 Python 版方案）：
@@ -1027,7 +1033,8 @@ fn keep_floating_on_top(app: &App) {
                 std::thread::sleep(Duration::from_millis(sleep_ms));
             }
         })
-        .expect("启动悬浮窗置顶线程失败");
+        .map_err(|e| tracing::error!("启动悬浮窗置顶线程失败（该功能不可用）: {e}"))
+        .ok();
 }
 
 /// 后台统计线程：
@@ -1349,7 +1356,8 @@ fn spawn_stats_worker(
                 std::thread::sleep(Duration::from_millis(tick_ms));
             }
         })
-        .expect("启动统计线程失败");
+        .map_err(|e| tracing::error!("启动统计线程失败（该功能不可用）: {e}"))
+        .ok();
 }
 
 /// 全历史总计 = 缓存基准 + 今日自缓存构建以来的增量（零 DB 查询）。

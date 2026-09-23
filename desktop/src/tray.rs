@@ -139,7 +139,8 @@ fn spawn_tray_updater(app: &App, paused_icon: tauri::image::Image<'static>) {
             }
             UPDATING.store(false, Ordering::SeqCst);
         })
-        .expect("启动托盘更新线程失败");
+        .map_err(|e| tracing::error!("启动托盘更新线程失败（该功能不可用）: {e}"))
+        .ok();
 }
 
 fn handle_menu(app: &AppHandle, id: &str) {
