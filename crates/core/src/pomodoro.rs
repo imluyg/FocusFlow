@@ -270,10 +270,17 @@ impl PomodoroTimer {
         s.auto_break = config.get_bool("pomodoro", "auto_break", s.auto_break);
     }
 
+    /// 供宿主 API `pomodoro_set_durations` 调用：与 [`apply_config`] 必须是同一套约束。
+    ///
+    /// 夹取范围与配置那条路一致（1..=180）。以前这里只有 `.max(1)`，
+    /// 于是"config.ini 多写一位数不该变成 1666 小时的倒计时"那条理由
+    /// 只对配置文件成立，从程序这条路照样能进去：release 不开 overflow-checks，
+    /// `work_minutes * 60` 会绕成负的或荒唐的 `planned`，倒计时显示成
+    /// "26358279…"或者一秒"完成"且什么都不落库，而 stop 之后每次 start_work 都重演。
     pub fn set_durations(&self, work_minutes: i64, break_minutes: i64) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        s.work_minutes = work_minutes.max(1);
-        s.break_minutes = break_minutes.max(1);
+        s.work_minutes = work_minutes.clamp(1, 180);
+        s.break_minutes = break_minutes.clamp(1, 180);
     }
 
     pub fn set_auto_break(&self, enabled: bool) {
@@ -683,6 +690,32 @@ mod busy_lock_tests {
         let cfg3 = crate::config::FocusFlowConfig::load(&path).unwrap();
         t.apply_config(&cfg3);
         assert_eq!(t.get_state_info()["work_minutes"], 25);
+    }
+
+    /// `pomodoro_set_durations`（宿主 API，程序这条路）必须和配置那条路一样夹住。
+    ///
+    /// 以前只有 `.max(1)`：一个天文数字进来后 `work_minutes * 60` 在 release
+    /// （不开 overflow-checks）里绕成负的/荒唐的 `planned`，倒计时就成了
+    /// "26358279…"或一秒"完成"，而且 stop 后每次 start_work 都重演。
+    #[test]
+    fn set_durations_clamps_like_apply_config() {
+        let _lock = crate::paths::test_app_dir_lock();
+        // start_work 会碰番茄钟自己的库，必须隔离到临时目录
+        let _dir = crate::paths::test_app_dir("pomodoro_clamp");
+        let t = PomodoroTimer::new();
+        t.set_durations(i64::from(i32::MAX) * 1_000, 5);
+        let s = t.get_state_info();
+        assert_eq!(s["work_minutes"], 180, "程序入口也要夹 1..=180");
+        t.start_work();
+        let s = t.get_state_info();
+        assert_eq!(s["planned"], 180 * 60, "planned 不能绕成负数或荒唐值");
+        assert!(s["remaining"] > 0, "倒计时不该一上来就是 0 或负数");
+
+        // 反向腿：0 与负数也不能把计时器变成"立刻完成"
+        t.set_durations(0, -30);
+        let s = t.get_state_info();
+        assert_eq!(s["work_minutes"], 1);
+        assert_eq!(s["break_minutes"], 1);
     }
 
     /// 计时必须按**墙钟**推进，不是"每轮 tick 减一秒"。
