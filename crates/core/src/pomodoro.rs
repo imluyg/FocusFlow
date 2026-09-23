@@ -249,6 +249,26 @@ impl PomodoroTimer {
             .clone()
     }
 
+    /// 用 `[pomodoro]` 三键覆盖时长与自动休息。
+    ///
+    /// 这三个键以前是**摆设**：`config.rs` 把它们写进每个人的 config.ini（镜像 Python 版），
+    /// 而计时器只用 `TimerState::default()` 的 25/5/true，`set_durations` 与
+    /// `set_auto_break` 全仓零调用方（宿主注册了 `pomodoro_set_durations`，
+    /// 但没有任何内置 `.lua` 调它）。表现：他把 `work_minutes` 改成 45，
+    /// 倒计时照旧 25:00，自动休息也关不掉。
+    ///
+    /// 只在计时器创建时读一次：改完配置要停用/再启用番茄钟插件（或重启）才生效。
+    pub fn apply_config(&self, config: &crate::config::FocusFlowConfig) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.work_minutes = config
+            .get_int("pomodoro", "work_minutes", s.work_minutes)
+            .clamp(1, 180);
+        s.break_minutes = config
+            .get_int("pomodoro", "break_minutes", s.break_minutes)
+            .clamp(1, 180);
+        s.auto_break = config.get_bool("pomodoro", "auto_break", s.auto_break);
+    }
+
     pub fn set_durations(&self, work_minutes: i64, break_minutes: i64) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.work_minutes = work_minutes.max(1);
@@ -608,5 +628,41 @@ mod busy_lock_tests {
         );
         // 反向腿：这一段确实落了库，否则上面的"不卡"只是因为什么都没写
         assert_eq!(get_recent_sessions(10).len(), 1);
+    }
+
+    /// `[pomodoro]` 三键必须真的落到计时器上。
+    ///
+    /// 以前是摆设：`config.rs` 把 `work_minutes/break_minutes/auto_break` 写进每个人的
+    /// config.ini，计时器却只用 `TimerState::default()`，而 `set_durations` /
+    /// `set_auto_break` 全仓零调用方 —— 改成 45 分钟仍然倒数 25:00。
+    #[test]
+    fn config_durations_reach_the_timer() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("pomodoro_cfg");
+        let path = dir.path().join("config.ini");
+        std::fs::write(
+            &path,
+            "[pomodoro]\nwork_minutes = 45\nbreak_minutes = 10\nauto_break = false\n",
+        )
+        .unwrap();
+        let cfg = crate::config::FocusFlowConfig::load(&path).unwrap();
+        let t = PomodoroTimer::new();
+        t.apply_config(&cfg);
+        let s = t.get_state_info();
+        assert_eq!(s["work_minutes"], 45, "手改的工作时长必须生效");
+        assert_eq!(s["break_minutes"], 10);
+        assert_eq!(s["auto_break"], 0, "自动休息必须能关掉");
+
+        // 越界要夹住：config.ini 是手改的，多写一位数不该变成 1666 小时的倒计时
+        std::fs::write(&path, "[pomodoro]\nwork_minutes = 99999\n").unwrap();
+        let cfg2 = crate::config::FocusFlowConfig::load(&path).unwrap();
+        t.apply_config(&cfg2);
+        assert_eq!(t.get_state_info()["work_minutes"], 180, "越界必须被夹住");
+
+        // 反向腿：键没了要回到默认，而不是停在上一次的值
+        std::fs::write(&path, "[pomodoro]\n").unwrap();
+        let cfg3 = crate::config::FocusFlowConfig::load(&path).unwrap();
+        t.apply_config(&cfg3);
+        assert_eq!(t.get_state_info()["work_minutes"], 25);
     }
 }

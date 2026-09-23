@@ -54,6 +54,8 @@ fn pomodoro_timer() -> Arc<PomodoroTimer> {
     }
     ensure_pomodoro_db();
     let t = PomodoroTimer::new();
+    // config.ini 里的 [pomodoro] 三键必须真的起作用（见 apply_config 的注释）
+    t.apply_config(crate::config::instance());
     *slot = Some(Arc::clone(&t));
     t
 }
