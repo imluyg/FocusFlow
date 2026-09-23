@@ -201,6 +201,14 @@ impl FocusFlowConfig {
     /// 仅在锁内做快照，序列化与写盘在锁外完成：
     /// 落盘期间的磁盘 IO 不会阻塞热路径（键鼠监听/统计线程）的配置读取。
     pub fn save(&self) -> anyhow::Result<()> {
+        // 把「快照 → 序列化 → rename」整体串行化。
+        //
+        // 落盘刻意不能放在 `values` 锁里做（否则磁盘 IO 会阻塞键鼠监听/统计线程读配置），
+        // 但一旦出了锁，两个并发 save 的 **rename 先后** 就和 **快照新旧** 再无关系：
+        // 拿着旧快照的线程只要 IO 慢一点，就会把另一个线程刚写好的新配置整个盖回去，
+        // 设置静默丢失。调用方确实有两个 —— 去抖的 config-saver 线程，和退出前
+        // `RunEvent::Exit` 里主线程那次强制 save（改完设置立刻关窗口时正好撞上）。
+        let _write_guard = SAVE_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot: HashMap<String, HashMap<String, String>> = self
             .values
             .lock()
@@ -351,6 +359,10 @@ fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
 ///
 /// 首次访问时加载，仅一次。
 pub static INSTANCE: OnceLock<FocusFlowConfig> = OnceLock::new();
+
+/// 配置落盘的全局串行锁：保证后完成的写一定基于不早于它的快照。
+/// 进程内只有一个配置实例（`INSTANCE`），所以全局锁等价于"每个文件一把"。
+static SAVE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// 配置保存信号通道：`set` 写入内存后向后台线程发信号，去抖后落盘。
 static SAVE_TX: OnceLock<mpsc::Sender<()>> = OnceLock::new();
