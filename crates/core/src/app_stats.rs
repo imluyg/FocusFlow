@@ -35,13 +35,18 @@ const SNAPSHOT_FORCE_MIN_SECS: u64 = 1;
 
 /// 读取 [app_stats] 配置：enabled（默认 true）+ exclude（逗号分隔的进程名清单）。
 fn load_config(config: &FocusFlowConfig) -> (bool, Vec<String>) {
-    let exclude = config
-        .get_or("app_stats", "exclude", "")
-        .split(',')
+    (
+        config.get_bool("app_stats", "enabled", true),
+        parse_exclude(&config.get_or("app_stats", "exclude", "")),
+    )
+}
+
+/// `exclude` 原始串 → 小写进程名清单（去空白、去空项）。
+fn parse_exclude(raw: &str) -> Vec<String> {
+    raw.split(',')
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
-        .collect();
-    (config.get_bool("app_stats", "enabled", true), exclude)
+        .collect()
 }
 
 /// 该前台应用是否可归属：exclude 命中的进程完全不记录（隐私保险丝）。
@@ -51,11 +56,9 @@ fn is_recordable(name: &str, exclude: &[String]) -> bool {
 
 /// 启动前台应用识别线程（非 Windows 平台恒返回 None，等同于不归属）。
 pub fn start_sampler(writer: Arc<DbWriter>) {
-    let config = crate::config::instance();
-    let (enabled, exclude) = load_config(config);
+    let (enabled, exclude) = load_config(crate::config::instance());
     if !enabled {
-        tracing::info!("前台应用统计未启用（[app_stats] enabled=false）");
-        return;
+        tracing::info!("前台应用统计未启用（[app_stats] enabled=false），线程仍会起来等它被打开");
     }
     std::thread::Builder::new()
         .name("app-usage-sampler".into())
@@ -63,8 +66,39 @@ pub fn start_sampler(writer: Arc<DbWriter>) {
             tracing::info!(
                 "前台应用识别已启动（每 {SAMPLE_INTERVAL_SECS} 秒采样，进程快照每 {SNAPSHOT_REFRESH_SECS} 秒刷新）"
             );
+            let mut exclude = exclude;
+            let mut cached_raw = String::new();
+            let mut was_enabled = enabled;
+            if !was_enabled {
+                writer.set_current_app(None);
+            }
             loop {
                 std::thread::sleep(Duration::from_secs(SAMPLE_INTERVAL_SECS));
+                let config = crate::config::instance();
+                // 每一轮都重读 `[app_stats]`。以前这两项只在 spawn 之前读一次，于是：
+                // ① 事后把 `keepassxc.exe` 加进 exclude 完全不生效 —— 那款软件会继续
+                //    被记录，而 exclude 的语义是"完全不记录"；一条隐私保险丝静默失效，
+                //    日志里连"要重启"都不会提示；② 事后 enabled=false 也停不下来。
+                // 配置是内存快照 + 去抖落盘，每秒读一次的成本可忽略；原始串没变就
+                // 不必重复 split/分配。
+                let raw = config.get_or("app_stats", "exclude", "");
+                if raw != cached_raw {
+                    exclude = parse_exclude(&raw);
+                    cached_raw = raw;
+                }
+                let enabled_now = config.get_bool("app_stats", "enabled", true);
+                if enabled_now != was_enabled {
+                    tracing::info!(
+                        "前台应用统计已切换为 {}",
+                        if enabled_now { "启用" } else { "停用" }
+                    );
+                    was_enabled = enabled_now;
+                }
+                if !enabled_now {
+                    // 停用的当下就清掉归属，否则这段时长会记到上一个应用头上
+                    writer.set_current_app(None);
+                    continue;
+                }
                 match collect::foreground_app_name() {
                     Some(n) if is_recordable(&n, &exclude) => writer.set_current_app(Some(&n)),
                     // exclude 命中：按其语义「完全不记录」，
@@ -194,7 +228,7 @@ mod collect {
 
 #[cfg(test)]
 mod tests {
-    use super::is_recordable;
+    use super::{is_recordable, parse_exclude};
 
     /// exclude 命中即不归属，且大小写不敏感。
     #[test]
@@ -204,6 +238,23 @@ mod tests {
         assert!(!is_recordable("KeePassXC.exe", &exclude));
         assert!(!is_recordable("KEEPASSXC.EXE", &exclude));
         assert!(!is_recordable("taskmgr.exe", &exclude));
+    }
+
+    /// exclude 清单的解析口径：逗号分隔、去空白、统一小写、忽略空项。
+    ///
+    /// 采样循环现在每一轮都会重读这个串（隐私保险丝必须当场生效），所以解析这步
+    /// 得自己站得住。
+    #[test]
+    fn parse_exclude_normalizes_entries() {
+        let ex = parse_exclude("KeePassXC.exe, taskmgr.exe");
+        assert_eq!(
+            ex,
+            vec!["keepassxc.exe".to_string(), "taskmgr.exe".to_string()]
+        );
+        assert!(parse_exclude("").is_empty());
+        assert!(parse_exclude(" , , ").is_empty());
+        let ex = parse_exclude("  KEEPASSXC.EXE  ");
+        assert!(!is_recordable("keepassxc.exe", &ex));
     }
 
     /// 空 exclude（默认配置）时全部可归属。
