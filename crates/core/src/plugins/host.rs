@@ -204,6 +204,7 @@ pub fn register_host_api(
         })?,
     )?;
 
+    // 语义与 pomodoro_stop 不同：skip 是"这段作废"，当前阶段不落库、不计入今日番茄数。
     host.set(
         "pomodoro_skip",
         lua.create_function(|_, ()| {

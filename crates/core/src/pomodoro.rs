@@ -307,8 +307,22 @@ impl PomodoroTimer {
         s.paused
     }
 
+    /// 跳过当前阶段：**这段作废**，与 [`stop`] 唯一的差别就是不落库。
+    ///
+    /// 工作到一半按下来，已过的时间和本阶段键鼠数都不写进会话表，因此既不占
+    /// 今日番茄数也不进键鼠统计。刻意保留这个语义（而不是让「跳过」记成一个
+    /// 完成）：没做完的一段被数成"做完了 1 个"，比丢掉一段更难事后分辨。
+    /// 会打一条日志，免得在日志里也是无声消失。
     pub fn skip(&self) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.state != STATE_IDLE && s.elapsed > 0 {
+            tracing::info!(
+                "跳过 {} 阶段：已计时 {} 秒、键鼠 {} 次，按作废处理（未落库）",
+                s.state,
+                s.elapsed,
+                s.key_count
+            );
+        }
         s.state = STATE_IDLE.to_string();
         s.paused = false;
         s.remaining = 0;
