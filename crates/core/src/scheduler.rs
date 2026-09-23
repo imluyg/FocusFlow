@@ -67,9 +67,11 @@ pub fn init_db() -> anyhow::Result<()> {
 /// - `.bat` / `.cmd`：`CreateProcess` 不直接执行批处理，而是交给 `cmd.exe` 解释，
 ///   且参数会被 cmd 二次解析（Rust 安全公告 RUSTSEC-2024-0037）。等于把黑名单里
 ///   刻意封掉的 `cmd.exe` 用扩展名请回来，而脚本内容不受任何白名单约束。
-/// - `.lnk`：shell item 只有 `ShellExecute` 会解析，`CreateProcess` 直接失败，
-///   所以「能启动」从未成立；改用 `ShellExecute` 又会放行链接指向的任意程序
-///   （可以是 `cmd.exe`），整个白名单作废。要支持必须先解析出真实目标再校验。
+/// - `.lnk`：不是"暂未支持"，而是**不能直接启动** —— shell item 只有
+///   `ShellExecute` 会解析，而 `ShellExecute` 会连链接自带的参数一起放行任意
+///   程序（可以是 `cmd.exe`），整个白名单作废。现在走 [`launch_target_of`]：
+///   先把链接指向的本体解析出来，按 `.exe` 那一套完整校验之后启动本体，
+///   参数只用任务自己存的那份。
 const EXECUTABLE_EXTENSIONS: [&str; 1] = ["exe"];
 
 /// 明确禁止作为定时任务目标的可执行文件名（小写）。
@@ -301,9 +303,199 @@ fn validate_task_target(target_path: &str) -> anyhow::Result<()> {
     if t.is_empty() {
         anyhow::bail!("目标程序路径不能为空");
     }
-    let p = std::path::Path::new(t);
+    validate_exe_target(&launch_target_of(t)?)
+}
+
+/// 快捷方式扩展名（大小写不敏感）。
+const LINK_EXTENSIONS: [&str; 1] = ["lnk"];
+
+/// 读取 `.lnk` 的体积上限：真实快捷方式只有几 KB，超大文件一律拒绝，
+/// 免得有人塞一个巨型文件让调度线程去 read 进内存。
+const LNK_MAX_BYTES: u64 = 64 * 1024;
+
+fn is_link_file(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| LINK_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// 把「任务里存的目标路径」换算成真正要 `CreateProcess` 的程序路径。
+///
+/// `.exe` 原样返回；`.lnk` 解析出链接指向的本体（只跟一级，不做链式跳转）。
+/// 校验与执行共用这一个口径 —— 否则入口按解析后的目标放行、执行时却拿原始
+/// `.lnk` 去启动（`CreateProcess` 不认 shell item），两边说的不是同一个东西。
+fn launch_target_of(target: &str) -> anyhow::Result<std::path::PathBuf> {
+    let p = std::path::Path::new(target);
+    if !is_link_file(p) {
+        return Ok(p.to_path_buf());
+    }
+    let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX);
+    if size > LNK_MAX_BYTES {
+        anyhow::bail!("快捷方式体积异常（{size} 字节），已拒绝读取: {target}");
+    }
+    let bytes = std::fs::read(p).map_err(|e| anyhow::anyhow!("快捷方式不可读: {target}（{e}）"))?;
+    let resolved = parse_lnk_target(&bytes).ok_or_else(|| {
+        anyhow::anyhow!(
+            "无法从快捷方式中解析出本地目标程序（网络位置、控制面板项等一律不支持）: {target}"
+        )
+    })?;
+    let rp = std::path::PathBuf::from(&resolved);
+    if is_link_file(&rp) {
+        anyhow::bail!("快捷方式指向另一个快捷方式，只支持一级链接: {target} -> {resolved}");
+    }
+    tracing::debug!("快捷方式 {target} 解析为目标 {resolved}");
+    Ok(rp)
+}
+
+/// MS-SHLLINK 固定头长度（HeaderSize 必须是这个值）。
+const LNK_HEADER_SIZE: usize = 76;
+
+/// 从 Windows 快捷方式（MS-SHLLINK）里解析出目标程序路径。
+///
+/// 只取链接指向的**本体路径**，刻意忽略链接自带的 WorkingDir / Arguments /
+/// IconLocation：否则一个 `.lnk` 就能往白名单程序的命令行里塞任意参数，而那正是
+/// 这套白名单要挡住的事。也不解析 `LinkTargetIDList` 里的 PIDL（相对 CSIDL 的
+/// 还原面太大、伪装空间也多），因此只认 `LinkInfo.LocalBasePath`。
+///
+/// 全程用带边界的取值：release 配置是 `panic = "abort"`，一次越界就是整个应用消失。
+fn parse_lnk_target(bytes: &[u8]) -> Option<String> {
+    // Shell Link 的 CLSID {00021401-0000-0000-C000-000000000046}，按小端原样存于头里。
+    // 前三字节必须是 01 14 02 —— 早期 fixture 里写成 01 14 00 时，自造的用例全过、
+    // 真实快捷方式全挂（校验和被测试与实现同时写错时，测试就一点用也没有）。
+    const CLSID: [u8; 16] = [
+        0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    let head = bytes.get(..LNK_HEADER_SIZE)?;
+    if u32::from_le_bytes(head[0..4].try_into().ok()?) != LNK_HEADER_SIZE as u32 {
+        return None;
+    }
+    if head[4..20] != CLSID {
+        return None;
+    }
+    let flags = u32::from_le_bytes(head[20..24].try_into().ok()?);
+    // MS-SHLLINK 2.1.1 的 LinkFlags。位序必须照抄：`0x02` 才是"带 LinkInfo"。
+    // 本机开始菜单里 25 个真实快捷方式的 flags 都是 0x40DF，早先按 0x20/0x40
+    // 判断时它们被整批判成不可解析（那两位其实是参数段与图标段）。
+    const HAS_IDLIST: u32 = 0x0000_0001;
+    const HAS_LINK_INFO: u32 = 0x0000_0002;
+    const NO_LINK_INFO: u32 = 0x0000_0100;
+    let mut off = LNK_HEADER_SIZE;
+    if flags & HAS_IDLIST != 0 {
+        let idlist_len = u16::from_le_bytes(bytes.get(off..off + 2)?.try_into().ok()?) as usize;
+        off = off.checked_add(2)?.checked_add(idlist_len)?;
+    }
+    // 没有 LinkInfo 就只有 PIDL，而我们不解析 PIDL（相对 CSIDL 的还原面太大、
+    // 能伪装的地方也多）
+    if flags & HAS_LINK_INFO == 0 || flags & NO_LINK_INFO != 0 {
+        return None;
+    }
+    const VOLUME_ID_AND_LOCAL_BASE_PATH: u32 = 0x0000_0001;
+    let li = off;
+    let li_size = u32::from_le_bytes(bytes.get(li..li + 4)?.try_into().ok()?) as usize;
+    let li_flags = u32::from_le_bytes(bytes.get(li + 8..li + 12)?.try_into().ok()?);
+    if li_flags & VOLUME_ID_AND_LOCAL_BASE_PATH == 0 {
+        return None;
+    }
+    local_base_path_in_link_info(bytes, li, li_size)
+}
+
+/// LinkInfo 头部里"偏移字段"所在的字节区间（前 12 字节是 size / headerSize / flags）。
+const LINK_INFO_FIELD_RANGE: std::ops::Range<usize> = 12..28;
+
+/// 在 LinkInfo 里定位 LocalBasePath。
+///
+/// **刻意不假定字段顺序**：把头部每个 u32 都当成候选偏移，只接受指向
+/// 「盘符 + 分隔符」形态字符串的那个。理由很实际 —— 本机开始菜单的真实快捷方式按
+/// "第 4 个字段就是 LocalBasePathOffset" 来读，读到的全是 VolumeID 块（size + 类型
+/// 3 + FILETIME + 卷标），真正的路径在下一个字段指向的位置；各家生成器的排布并不
+/// 完全一致，而猜错的后果是拿一段二进制去启动。判定条件够硬（必须以 `X:\` 或
+/// UTF-16 形态的 `X:\` 开头），指错的空间几乎没有。
+fn local_base_path_in_link_info(bytes: &[u8], li: usize, li_size: usize) -> Option<String> {
+    let end = li.checked_add(li_size)?.min(bytes.len());
+    let limit = li.checked_add(LINK_INFO_FIELD_RANGE.end)?.min(end);
+    let mut o = li.checked_add(LINK_INFO_FIELD_RANGE.start)?;
+    while o + 4 <= limit {
+        let candidate = u32::from_le_bytes(bytes[o..o + 4].try_into().ok()?) as usize;
+        if candidate > 0 {
+            if let Some(p) = read_path_at(bytes, li.checked_add(candidate)?) {
+                return Some(p);
+            }
+        }
+        o += 4;
+    }
+    None
+}
+
+/// 从 `at` 处读一条路径字符串，ANSI 与 UTF-16LE 两种形态都认。
+///
+/// 形态不符（不是「盘符 + 分隔符」开头、含控制字符、超长、找不到结束符）一律 None：
+/// 宁可让调用方给出"解析不出目标"的明确拒绝，也不猜一个路径出来开进程。
+fn read_path_at(bytes: &[u8], at: usize) -> Option<String> {
+    let head3 = bytes.get(at..at + 3)?;
+    if head3[0].is_ascii_alphabetic() && head3[1] == b':' && matches!(head3[2], b'\\' | b'/') {
+        let mut out: Vec<u8> = Vec::new();
+        let mut terminated = false;
+        let mut i = at;
+        while let Some(&b) = bytes.get(i) {
+            if b == 0 {
+                terminated = true;
+                break;
+            }
+            if !b.is_ascii_graphic() && b != b' ' {
+                return None;
+            }
+            out.push(b);
+            if out.len() > 4096 {
+                return None;
+            }
+            i += 1;
+        }
+        // 没有结束符就是被截断过：这时候拿到的是半个路径，绝不能拿去启动
+        if !terminated || out.is_empty() {
+            return None;
+        }
+        return String::from_utf8(out).ok();
+    }
+    let head6 = bytes.get(at..at + 6)?;
+    if head6[0].is_ascii_alphabetic()
+        && head6[1] == 0
+        && head6[2] == b':'
+        && head6[3] == 0
+        && matches!(head6[4], b'\\' | b'/')
+        && head6[5] == 0
+    {
+        let mut vals: Vec<u16> = Vec::new();
+        let mut i = at;
+        loop {
+            let u = u16::from_le_bytes(bytes.get(i..i + 2)?.try_into().ok()?);
+            if u == 0 {
+                break;
+            }
+            if u < 0x20 {
+                return None;
+            }
+            vals.push(u);
+            if vals.len() > 4096 {
+                return None;
+            }
+            i += 2;
+        }
+        let s = String::from_utf16(&vals).ok()?;
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// 对一个**已经确定要启动的程序路径**做全部白名单校验（绝对路径、可 canonicalize、
+/// `.exe`、文件名黑白名单、内置白名单还要求来源目录可信）。
+fn validate_exe_target(p: &std::path::Path) -> anyhow::Result<()> {
+    let shown = p.display();
     if !p.is_absolute() {
-        anyhow::bail!("目标程序必须是绝对路径: {t}");
+        anyhow::bail!("目标程序必须是绝对路径: {shown}");
     }
     let ext_ok = p
         .extension()
@@ -312,7 +504,7 @@ fn validate_task_target(target_path: &str) -> anyhow::Result<()> {
         .unwrap_or(false);
     if !ext_ok {
         anyhow::bail!(
-            "目标程序仅支持 {} 文件",
+            "目标程序仅支持 {}（快捷方式会先解析成它指向的 .exe）",
             EXECUTABLE_EXTENSIONS
                 .iter()
                 .map(|e| format!(".{e}"))
@@ -324,7 +516,7 @@ fn validate_task_target(target_path: &str) -> anyhow::Result<()> {
     // 路径，后续的文件名与来源目录判断才有意义（否则 `notepad.exe` 可以是任何文件）。
     let canon = match p.canonicalize() {
         Ok(c) => c,
-        Err(e) => anyhow::bail!("目标程序不可用: {t}（{e}）"),
+        Err(e) => anyhow::bail!("目标程序不可用: {shown}（{e}）"),
     };
     let file_name = canon
         .file_name()
@@ -636,7 +828,16 @@ fn execute_task(t: &ScheduledTask) {
         tracing::warn!("定时任务被拒绝执行（{}）: {e}", t.name);
         return;
     }
-    let mut cmd = std::process::Command::new(&t.target_path);
+    // 与校验同一个口径：`.lnk` 启动的是它指向的本体，而不是 `.lnk` 本身
+    // （`CreateProcess` 不认 shell item，直接拿快捷方式去启动必然失败）。
+    let exe = match launch_target_of(&t.target_path) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("定时任务解析启动目标失败（{}）: {e}", t.name);
+            return;
+        }
+    };
+    let mut cmd = std::process::Command::new(&exe);
     if !t.args.is_empty() {
         // 与校验用的是同一个切分器：校验的是「带空格的一个路径」，启动时也必须
         // 把它当成一个 argv 传下去（Rust 会自己加引号）。
@@ -651,7 +852,7 @@ fn execute_task(t: &ScheduledTask) {
     }
     match cmd.spawn() {
         Ok(_) => {
-            tracing::info!("定时任务已执行: {} -> {}", t.name, t.target_path);
+            tracing::info!("定时任务已执行: {} -> {}", t.name, exe.display());
             let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
             let _ = open().and_then(|conn| {
                 conn.execute(
@@ -661,7 +862,7 @@ fn execute_task(t: &ScheduledTask) {
             });
         }
         Err(e) => {
-            tracing::error!("定时任务执行失败: {} -> {}: {e}", t.name, t.target_path);
+            tracing::error!("定时任务执行失败: {} -> {}: {e}", t.name, exe.display());
         }
     }
 }
@@ -883,15 +1084,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 回归：`.bat`/`.cmd` 经被禁的 `cmd.exe` 解释、`.lnk` 根本起不来（且链接目标
-    /// 可以是任意程序），三者都必须在入口被拒绝。
+    /// 回归：`.bat`/`.cmd` 经被禁的 `cmd.exe` 解释、`.txt` 根本不是程序，三者都
+    /// 必须在入口被拒绝。`.lnk` 现在会被解析，但一个内容不是合法 shell link 的
+    /// `.lnk`（这里就是一字节 `x`）同样起不来 —— 拒绝理由从"扩展名"变成了
+    /// "解析不出目标"，安全结论不变。
     #[test]
     fn script_and_shell_link_targets_are_rejected() {
-        let _g = isolate_app_dir("script");
-        let dir = std::env::temp_dir().join(format!("ff_sched_script_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        for name in ["daily.bat", "daily.cmd", "notepad.lnk", "notepad.txt"] {
-            let p = dir.join(name);
+        let (_g, dir) = isolate_app_dir("script");
+        for name in ["daily.bat", "daily.cmd", "notepad.txt"] {
+            let p = dir.path().join(name);
             std::fs::write(&p, b"x").unwrap();
             let e = validate_task_target(&p.to_string_lossy())
                 .expect_err("{name} 不能作为定时任务目标");
@@ -900,7 +1101,14 @@ mod tests {
                 "{name} 应被扩展名拦下，实际: {e}"
             );
         }
-        std::fs::remove_dir_all(&dir).ok();
+        let p = dir.path().join("notepad.lnk");
+        std::fs::write(&p, b"x").unwrap();
+        let e = validate_task_target(&p.to_string_lossy())
+            .expect_err("内容不是合法 shell link 的 .lnk 不能起任何程序");
+        assert!(
+            e.to_string().contains("快捷方式"),
+            "假 .lnk 应被解析环节拦下，实际: {e}"
+        );
     }
 
     /// 回归：插件可用 `scheduler_add` 给白名单浏览器传任意参数，而 Lua 沙箱没有
@@ -1075,5 +1283,322 @@ mod tests {
                 "加引号不该绕过参数校验: {bad}"
             );
         }
+    }
+
+    // ---- .lnk 快捷方式解析 ----
+
+    fn u16z(s: &str) -> Vec<u8> {
+        let mut v: Vec<u8> = s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v
+    }
+
+    fn ansi_z(s: &str) -> Vec<u8> {
+        let mut v = s.as_bytes().to_vec();
+        v.push(0);
+        v
+    }
+
+    /// 造一个 .lnk，结构照本机真实快捷方式：LinkInfo 头 7 个 u32，头后先是
+    /// VolumeID（含 "system" 卷标），再是 ANSI 编码的 LocalBasePath。
+    ///
+    /// `slot` 决定 LocalBasePathOffset 落在头部哪个 u32（4 = 文档里的位置，
+    /// 5 = 真实文件里的位置），用来证明解析不依赖字段顺序。
+    fn make_lnk_at(target: &str, slot: usize) -> Vec<u8> {
+        make_lnk_enc(target, slot, false)
+    }
+
+    /// `wide` = 路径按 UTF-16LE 存（各家生成器 ANSI / UTF-16 两种都有）。
+    fn make_lnk_enc(target: &str, slot: usize, wide: bool) -> Vec<u8> {
+        const LI_HEADER: usize = 28;
+        let mut volid: Vec<u8> = Vec::new();
+        volid.extend_from_slice(&23u32.to_le_bytes()); // VolumeIDSize
+        volid.extend_from_slice(&3u32.to_le_bytes()); // DRIVE_FIXED
+        volid.extend_from_slice(&0x0000_1010_9fbf_84d7u64.to_le_bytes()); // 卷创建时间
+        volid.extend_from_slice(b"system\0"); // 卷名，正好凑满 23 字节
+        assert_eq!(volid.len(), 23);
+        let path = if wide { u16z(target) } else { ansi_z(target) };
+        let li_size = LI_HEADER + volid.len() + path.len();
+        let vol_off = LI_HEADER as u32;
+        let base_off = (LI_HEADER + volid.len()) as u32;
+        let offsets: [u32; 4] = if slot == 4 {
+            [base_off, vol_off, 0, 0]
+        } else {
+            [vol_off, base_off, 0, 0]
+        };
+
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(&(LNK_HEADER_SIZE as u32).to_le_bytes());
+        v.extend_from_slice(&[
+            0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x46,
+        ]);
+        // 与真实快捷方式同一组标志位，除了 HasLinkTargetIDList —— 这个 fixture 不
+        // 带 IDList（LinkInfo 因此正好从第 76 字节起，测试里的字节偏移才写得清楚）。
+        // 带 IDList 的情形由 idlist_prefixed_link_is_skipped 单独覆盖。
+        v.extend_from_slice(&0x40DEu32.to_le_bytes());
+        v.resize(LNK_HEADER_SIZE, 0);
+        v.extend_from_slice(&(li_size as u32).to_le_bytes());
+        v.extend_from_slice(&(LI_HEADER as u32).to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes()); // VolumeIDAndLocalBasePath
+        for o in offsets {
+            v.extend_from_slice(&o.to_le_bytes());
+        }
+        v.extend_from_slice(&volid);
+        v.extend_from_slice(&path);
+        v
+    }
+
+    fn make_lnk(target: &str) -> Vec<u8> {
+        make_lnk_at(target, 5)
+    }
+
+    fn write_lnk(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    /// 核心安全点：链接目标必须过**同一套**白名单，而不是因为"用户挑的是快捷方式"
+    /// 就绕过去。指向 cmd.exe 的 .lnk 依旧要被拒，否则整个黑名单等于没有。
+    #[test]
+    fn lnk_target_goes_through_the_same_whitelist() {
+        let (_l, dir) = isolate_app_dir("lnk_cmd");
+        let cmd = r"C:\Windows\System32\cmd.exe";
+        if !std::path::Path::new(cmd).is_file() {
+            return;
+        }
+        let p = write_lnk(dir.path(), "shell.lnk", &make_lnk(cmd));
+        let e = validate_task_target(&p.to_string_lossy())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("禁止") || e.contains("白名单"),
+            "指向 cmd.exe 的快捷方式必须被拒，实得: {e}"
+        );
+    }
+
+    #[test]
+    fn lnk_resolves_to_the_link_body() {
+        let (_l, dir) = isolate_app_dir("lnk_resolve");
+        let p = write_lnk(
+            dir.path(),
+            "np.lnk",
+            &make_lnk(r"C:\Windows\System32\notepad.exe"),
+        );
+        let got = launch_target_of(&p.to_string_lossy()).unwrap();
+        assert_eq!(
+            got,
+            std::path::Path::new(r"C:\Windows\System32\notepad.exe")
+        );
+    }
+
+    /// 字段顺序不可信：同一条路径放在头部第 4 或第 5 个 u32 指向的位置都得读出来。
+    /// （本机真实快捷方式在后一种，文档写的是前一种。）
+    #[test]
+    fn path_is_found_whichever_header_slot_points_at_it() {
+        let target = r"C:\Windows\System32\notepad.exe";
+        assert_eq!(
+            parse_lnk_target(&make_lnk_at(target, 4)).as_deref(),
+            Some(target)
+        );
+        assert_eq!(
+            parse_lnk_target(&make_lnk_at(target, 5)).as_deref(),
+            Some(target)
+        );
+    }
+
+    /// 带 LinkTargetIDList 的快捷方式也要能读出来：必须先按 IDListSize 跳过它。
+    #[test]
+    fn idlist_prefixed_link_is_skipped() {
+        let target = r"C:\Windows\System32\notepad.exe";
+        let base = make_lnk(target);
+        // 一个占位 PIDL + 列表结束标记；真实文件里这一段可以有几百字节
+        let idlist: Vec<u8> = vec![0x14, 0x00, b'.', 0x00, 0x00, 0x00];
+        let mut v = base[..LNK_HEADER_SIZE].to_vec();
+        v[20] |= 0x01; // HasLinkTargetIDList
+        v.extend_from_slice(&(idlist.len() as u16).to_le_bytes());
+        v.extend_from_slice(&idlist);
+        v.extend_from_slice(&base[LNK_HEADER_SIZE..]);
+        assert_eq!(parse_lnk_target(&v).as_deref(), Some(target));
+    }
+
+    /// UTF-16 形态的路径也要认（各家生成器两种都有）。
+    #[test]
+    fn utf16_encoded_path_is_read_too() {
+        let target = r"C:\Windows\System32\notepad.exe";
+        assert_eq!(
+            parse_lnk_target(&make_lnk_enc(target, 5, true)).as_deref(),
+            Some(target)
+        );
+        assert_eq!(
+            parse_lnk_target(&make_lnk_enc(target, 4, true)).as_deref(),
+            Some(target)
+        );
+    }
+
+    /// 链接自带的 Arguments / WorkingDir 一律不参与：否则一个 .lnk 就能往白名单
+    /// 程序的命令行里塞任意参数，正是这套白名单要挡的事。
+    #[test]
+    fn arguments_carried_by_the_link_are_ignored() {
+        let target = r"C:\Windows\System32\notepad.exe";
+        let mut bytes = make_lnk(target);
+        // 把 HasArguments 置上，并在 LinkInfo 之后补一段真实形态的参数区
+        bytes[20] |= 0x20;
+        let args = u16z("/c calc.exe");
+        bytes.extend_from_slice(&(args.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&args);
+        assert_eq!(parse_lnk_target(&bytes).as_deref(), Some(target));
+        assert_eq!(parse_lnk_target(&make_lnk(target)).as_deref(), Some(target));
+    }
+
+    /// 畸形/被截断的快捷方式必须只得到 None（走可读拒绝原因），绝不能 panic ——
+    /// release 是 `panic = "abort"`，一次越界就是整个应用消失。
+    #[test]
+    fn malformed_lnk_is_rejected_without_panicking() {
+        let good = make_lnk(r"C:\Windows\System32\notepad.exe");
+        let mut cases: Vec<(&str, Vec<u8>)> = vec![
+            ("空文件", vec![]),
+            ("完全不是 shell link", b"not a shell link".to_vec()),
+        ];
+        for n in 0..good.len() {
+            cases.push(("截断", good[..n].to_vec()));
+        }
+        let mut m = good.clone();
+        m[0] = 0x4D;
+        cases.push(("HeaderSize 不对", m));
+        let mut m = good.clone();
+        m[5] ^= 0xFF;
+        cases.push(("CLSID 不对", m));
+        let mut m = good.clone();
+        m[20] &= !0x02;
+        cases.push(("声明不带 LinkInfo", m));
+        let mut m = good.clone();
+        m[21] |= 0x01;
+        cases.push(("NoLinkInfo", m));
+        let mut m = good.clone();
+        m[20] |= 0x01;
+        cases.push(("声称有 IDList 但长度指向文件外", m));
+        let mut m = good.clone();
+        m[84] = 0;
+        cases.push(("LinkInfo 里没有 VolumeIDAndLocalBasePath", m));
+        let mut m = good.clone();
+        m[88..104].fill(0);
+        cases.push(("头部偏移字段全为零", m));
+        let mut m = good.clone();
+        m[88..104].fill(0xFF);
+        cases.push(("头部偏移字段全是垃圾", m));
+        for (label, c) in cases.iter() {
+            assert!(
+                parse_lnk_target(c).is_none(),
+                "{label}（{} 字节）本应被拒绝，实得 {:?}",
+                c.len(),
+                parse_lnk_target(c)
+            );
+        }
+    }
+
+    /// 对着**真实文件**校验解析器：扫开始菜单里的快捷方式，要求多数能解析、
+    /// 解析出的路径多数真实存在。
+    ///
+    /// 这条不是冗余 —— 自造 fixture 与实现共享同一个错误（CLSID 第三个字节写成
+    /// 0x00、LinkFlags 位序错一位）时，那一堆合成用例照样全绿，而真实快捷方式
+    /// 一个都读不出来。只有拿系统里现成的文件跑一遍才暴露得出来。
+    #[test]
+    fn real_start_menu_shortcuts_resolve() {
+        let mut stack: Vec<std::path::PathBuf> = ["APPDATA", "ProgramData"]
+            .iter()
+            .filter_map(|k| {
+                std::env::var_os(k).map(|v| {
+                    std::path::PathBuf::from(v).join(r"Microsoft\Windows\Start Menu\Programs")
+                })
+            })
+            .filter(|p| p.exists())
+            .collect();
+        let mut seen = 0usize;
+        let mut parsed = 0usize;
+        let mut exists = 0usize;
+        while let Some(dir) = stack.pop() {
+            if seen >= 40 {
+                break;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                let is_lnk = p
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("lnk"))
+                    .unwrap_or(false);
+                if !is_lnk {
+                    continue;
+                }
+                seen += 1;
+                if let Some(t) = std::fs::read(&p).ok().and_then(|b| parse_lnk_target(&b)) {
+                    parsed += 1;
+                    assert!(
+                        std::path::Path::new(&t).is_absolute(),
+                        "解析结果必须是绝对路径，实得 {t}"
+                    );
+                    if std::path::Path::new(&t).is_file() {
+                        exists += 1;
+                    }
+                }
+            }
+        }
+        if seen == 0 {
+            return; // 这台机器上没有开始菜单（非 Windows / 干净环境）
+        }
+        // 少数快捷方式指向 Store 应用或 KnownFolder（本机是 2 个 WSL 项），它们的
+        // 目标只存在于 PIDL 里 —— 那是我们刻意不解析的部分，所以只要求多数能解析。
+        assert!(
+            parsed * 2 >= seen,
+            "真实快捷方式应大多能解析：{seen} 个里只解析出 {parsed} 个"
+        );
+        assert!(
+            exists * 2 >= parsed,
+            "解析出的路径应大多真实存在：{parsed} 个里只有 {exists} 个存在"
+        );
+    }
+
+    #[test]
+    fn chained_lnk_is_not_followed() {
+        let (_l, dir) = isolate_app_dir("lnk_chain");
+        let inner = write_lnk(
+            dir.path(),
+            "inner.lnk",
+            &make_lnk(r"C:\Windows\System32\notepad.exe"),
+        );
+        let outer = write_lnk(dir.path(), "outer.lnk", &make_lnk(&inner.to_string_lossy()));
+        let e = launch_target_of(&outer.to_string_lossy())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("一级"), "不该跟着链式跳转，实得: {e}");
+    }
+
+    #[test]
+    fn missing_lnk_and_non_exe_target_report_readable_reasons() {
+        let (_l, dir) = isolate_app_dir("lnk_reasons");
+        let e = validate_task_target(r"C:\no-such-dir\nope.lnk")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("快捷方式"), "打不开的链接要说清楚: {e}");
+
+        let note = dir.path().join("note.txt");
+        std::fs::write(&note, b"hi").unwrap();
+        let p = write_lnk(dir.path(), "note.lnk", &make_lnk(&note.to_string_lossy()));
+        let e = validate_task_target(&p.to_string_lossy())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("仅支持") && e.contains(".exe"),
+            "链接指向非 .exe 时要说明只支持 .exe，实得: {e}"
+        );
     }
 }
