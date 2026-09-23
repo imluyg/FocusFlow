@@ -825,8 +825,33 @@ fn query_devices_in_conn(
 /// 原始行合并成展示行：别名优先、登记名缺失回退、显示名去重（同型号两只加序号）、按次数降序。
 fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
     let aliases = crate::device_alias::table();
-    let total: i64 = rows.iter().map(|r| r.count).sum();
-    let mut stats: Vec<DeviceStat> = rows
+    // 同一台设备在两个年度库里各查出一行时必须先并起来：`devices.id` 各库自增、
+    // 互不相干，只有 `device_key` 认得出是同一台。跨年查询（1 月看「最近 30 天」、
+    // 或任何 period=0/跨年窗口）走的是逐年 append，不并的话设备页每个设备两行、
+    // 各占一半次数，第二行还要被下面的同名去重冠上 "(2)"。
+    let mut first_at: HashMap<String, usize> = HashMap::new();
+    let mut merged: Vec<DeviceRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        match first_at.get(&row.device_key).copied() {
+            Some(i) => {
+                let keep = &mut merged[i];
+                keep.count += row.count;
+                // 名字/类型取"哪一年登记过就用哪一年的"：归档与迁移会留空名占位行
+                if keep.name.as_deref().unwrap_or("").trim().is_empty() {
+                    keep.name = row.name;
+                }
+                if keep.kind.as_deref().unwrap_or("").is_empty() {
+                    keep.kind = row.kind;
+                }
+            }
+            None => {
+                first_at.insert(row.device_key.clone(), merged.len());
+                merged.push(row);
+            }
+        }
+    }
+    let total: i64 = merged.iter().map(|r| r.count).sum();
+    let mut stats: Vec<DeviceStat> = merged
         .into_iter()
         .map(|r| {
             // 两种「没有可用名字」都要回退：
@@ -1587,6 +1612,76 @@ mod tests {
             "同型号显示名去重"
         );
         assert_eq!(stats[3].count, 10);
+    }
+
+    /// 跨年查询里同一台设备必须是一行（1 月看「最近 30 天」就会走到这条路）。
+    ///
+    /// `devices.id` 各年度库自增、互不相干，两个库里的同一台设备只有 device_key
+    /// 认得出来。逐年 append 而不按 key 并起来时，设备页每个设备显示两行、
+    /// 各占一半次数，第二行还被同名去重加上 "(2)"，看着就像多了一只鼠标。
+    #[test]
+    fn device_stats_collapse_the_same_device_across_year_dbs() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("devq_year");
+
+        let this_year = Local::now().year();
+        let prev_year = this_year - 1;
+        let key = "HID#VID_046D&PID_C52B#same";
+        // 两个库各登记一台设备，让同一台设备在两侧的自增 id 真的错开
+        for (year, n, other) in [
+            (prev_year, 40, "HID#VID_1B1C&PID_1B2D#old"),
+            (this_year, 60, ""),
+        ] {
+            let conn = crate::db::connection::open_rw(&paths::year_db_path(year)).unwrap();
+            crate::db::connection::ensure_schema(&conn, year).unwrap();
+            let dk = day_key_of_date(chrono::NaiveDate::from_ymd_opt(year, 6, 1).expect("date"));
+            let ins_cnt = |k: &str, c: i64| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO devices (device_key, name, kind) VALUES (?1, ?2, 'mouse')",
+                    rusqlite::params![k, format!("HID-compliant mouse · {k}")],
+                )
+                .unwrap();
+                let id = crate::db::connection::device_id_of(&conn, k).expect("设备 id");
+                conn.execute(
+                    "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![dk, id, c],
+                )
+                .unwrap();
+            };
+            if !other.is_empty() {
+                ins_cnt(other, 5);
+            }
+            ins_cnt(key, n);
+            // available_years() 会滤掉没有任何聚合行的空壳库，补一行当"这年真在用"
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, ?2, 10)",
+                rusqlite::params![dk, n],
+            )
+            .unwrap();
+        }
+        invalidate_years_cache();
+
+        let (total, stats) = get_device_stats(None, None);
+        let shown: Vec<_> = stats.iter().map(|s| (&s.key, &s.name, s.count)).collect();
+        assert_eq!(total, 105, "跨年总次数 = 两个库相加");
+        assert_eq!(
+            stats.len(),
+            2,
+            "一只跨年共用设备 + 一只旧库设备 = 两行，实际：{shown:?}"
+        );
+        let same = stats
+            .iter()
+            .find(|s| s.key == key)
+            .expect("同一台设备必须只有一行");
+        assert_eq!(same.count, 100, "两个年度库的次数必须并起来");
+        assert!(
+            !same.name.ends_with("(2)"),
+            "跨年重复行不该被同名去重顶成两只：{}",
+            same.name
+        );
+        // 按单年查询不受影响
+        assert_eq!(get_device_stats(None, Some(this_year)).0, 60);
+        assert_eq!(get_device_stats(None, Some(prev_year)).0, 45);
     }
 
     /// 登记名被写成裸设备路径时（历史脏登记）不计为真名，一律走回退。
