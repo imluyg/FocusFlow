@@ -37,6 +37,8 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
         ],
     );
     s("stats", &[("cpm_window", "60")]);
+    // 设备维度采集的总开关（device_stats.rs 读它；关掉只停采集，历史不动）
+    s("device_stats", &[("enabled", "true")]);
     s(
         "app_stats",
         &[
@@ -59,31 +61,35 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     s(
         "gui",
         &[
-            ("refresh_interval", "2"),
+            // 图表刷新节奏：打字时每 active_refresh_interval 秒、空闲时每
+            // full_refresh_interval 秒（两个都有读点，见 desktop/src/state.rs）
+            ("active_refresh_interval", "2"),
             ("full_refresh_interval", "10"),
-            ("show_first_run_tip", "true"),
             ("theme", "light"),
-            ("show_trend_chart", "true"),
-            ("show_key_groups", "true"),
             ("start_to_tray", "true"),
-            ("font", "hei"),
+            // 主窗口隐藏够久就卸载渲染进程（省几百 MB；false = 一直留着）
+            ("unload_hidden", "true"),
+            ("unload_hidden_delay", "60"),
+            // 悬浮窗显示口径：times / duration / both（desktop/ui/floating.js 读）
+            ("floating_metric", "times"),
         ],
     );
     s(
         "hotkey",
         &[("enabled", "false"), ("toggle_window", "ctrl+shift+f")],
     );
-    s("floating", &[("enabled", "true"), ("opacity", "0.85")]);
-    s("tray", &[("tooltip_interval", "5")]);
+    s("floating", &[("enabled", "true")]);
     s(
         "pomodoro",
         &[
-            ("enabled", "true"),
             ("work_minutes", "25"),
             ("break_minutes", "5"),
             ("auto_break", "true"),
         ],
     );
+    // 久坐提醒：六个键全部有读点（core::stats::RestMonitor，判定在统计线程里跑，
+    // 改完不必重启）。番茄钟的"休息"是工作周期的一部分，这里是**没开番茄钟时**
+    // 也会催你一下的那一条。
     s(
         "rest",
         &[
@@ -103,6 +109,24 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
 const DEPRECATED_CONFIG: &[(&str, &[&str])] = &[
     // 已移除：今日计数用写入线程内存缓存，此键不再读取
     ("stats", &["today_count_cache_ttl"]),
+    // 以下这些是「每次启动都写进 config.ini、但全仓一个读点都没有」的假开关：
+    // 用户改了没反应，比压根没有这个键更糟（同一类问题上一场已经处理过
+    // [pomodoro] 的时长三键）。老文件里的这些键在 load 时清掉。
+    (
+        "gui",
+        &[
+            "refresh_interval",
+            "show_first_run_tip",
+            "show_trend_chart",
+            "show_key_groups",
+            "font",
+        ],
+    ),
+    ("floating", &["opacity"]),
+    ("tray", &["tooltip_interval"]),
+    // 番茄钟真正的开关是 `[plugins] disabled`（整节插件停用），这个键从来没被读过
+    ("pomodoro", &["enabled"]),
+    ("database", &["batch_size"]),
 ];
 
 /// 解析 INI：兼容 Python configparser 的 `#`/`;` 注释与 `key = value` 语法。
@@ -265,14 +289,19 @@ impl FocusFlowConfig {
         let mut out = String::new();
         // 固定 section 顺序，与 Python 版一致，便于阅读与 diff。
         let order = [
-            "database", "stats", "listener", "gui", "hotkey", "floating", "tray", "pomodoro",
-            "rest",
+            "database", "stats", "listener", "gui", "hotkey", "floating", "pomodoro", "rest",
         ];
         let mut sections: Vec<&String> = snapshot.keys().collect();
         sections.sort_by_key(|s| order.iter().position(|o| o == s).unwrap_or(usize::MAX));
         for section in sections {
-            out.push_str(&format!("[{section}]\n"));
             let mut keys: Vec<&String> = snapshot[section].keys().collect();
+            if keys.is_empty() {
+                // 一个键都没有就整节不写：清掉废弃键之后可能把一整节掏空
+                // （`[tray]` 以前只剩 tooltip_interval 一个死键），留个空节头
+                // 只是让人以为那里还有什么可配。
+                continue;
+            }
+            out.push_str(&format!("[{section}]\n"));
             keys.sort();
             for key in keys {
                 out.push_str(&format!("{} = {}\n", key, snapshot[section][key]));
@@ -473,17 +502,23 @@ mod tests {
         let dir = std::env::temp_dir().join("ff_rs_cfg_test");
         std::fs::create_dir_all(&dir).ok();
         let path = dir.join("config.ini");
-        std::fs::write(&path, "[gui]\ntheme = dark\nrefresh_interval = 5\n").unwrap();
+        std::fs::write(&path, "[gui]\ntheme = dark\nactive_refresh_interval = 5\n").unwrap();
 
         let cfg = FocusFlowConfig::load(&path).unwrap();
         // 覆盖值
         assert_eq!(cfg.get("gui", "theme"), "dark");
-        assert_eq!(cfg.get_int("gui", "refresh_interval", 0), 5);
+        assert_eq!(cfg.get_int("gui", "active_refresh_interval", 0), 5);
         // 默认值补齐
         assert!(cfg.get_bool("listener", "ignore_key_repeat", false));
         assert_eq!(cfg.get("hotkey", "toggle_window"), "ctrl+shift+f");
         assert_eq!(cfg.get_int("rest", "key_threshold", 0), 10000);
-        assert_eq!(cfg.get_float("floating", "opacity", 0.0), 0.85);
+        // 「代码在读、但默认值里没有」的键必须也能在这里看到：它们在界面上是
+        // 真开关，藏在 config.ini 里不可发现就是文档缺失（floating_metric 之前
+        // 就是这种状态，UI 里那个口径切换只有会改文件的人才用得到）。
+        assert_eq!(cfg.get("gui", "floating_metric"), "times");
+        assert!(cfg.get_bool("gui", "unload_hidden", false));
+        assert_eq!(cfg.get_int("gui", "unload_hidden_delay", 0), 60);
+        assert!(cfg.get_bool("device_stats", "enabled", false));
 
         let _ = Arc::new(());
         std::fs::remove_dir_all(&dir).ok();
@@ -505,8 +540,17 @@ pos_x = 1488
 pos_y = 165
 width = 90
 height = 46
+opacity = 0.5
              [gui]
 theme = light
+refresh_interval = 3
+show_key_groups = false
+font = hei
+             [tray]
+tooltip_interval = 5
+             [pomodoro]
+enabled = false
+work_minutes = 45
 ",
         )
         .unwrap();
@@ -521,6 +565,53 @@ theme = light
 
         // 已废弃键应从内存移除
         assert!(cfg.get("stats", "today_count_cache_ttl").is_empty());
+        // 「写进文件却全仓没人读」的假开关同族：读不到，也不许被回填
+        for (section, key) in [
+            ("floating", "opacity"),
+            ("gui", "refresh_interval"),
+            ("gui", "show_key_groups"),
+            ("gui", "font"),
+            ("tray", "tooltip_interval"),
+            ("pomodoro", "enabled"),
+        ] {
+            assert!(
+                cfg.get(section, key).is_empty(),
+                "{section}.{key} 已无读点，必须被清掉"
+            );
+        }
+        // 同前缀的活键不能被顺手带走：full_refresh_interval 有读点，
+        // work_minutes 是番茄钟真正生效的时长
+        assert_eq!(cfg.get_int("gui", "full_refresh_interval", 0), 10);
+        assert_eq!(cfg.get_int("pomodoro", "work_minutes", 0), 45);
+        assert_eq!(cfg.get_int("gui", "active_refresh_interval", 0), 2);
+
+        // 而且不能只清内存：load() 结尾无条件 save()，文件里也不该再留着它们
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let dead: Vec<&str> = on_disk
+            .lines()
+            .map(str::trim)
+            .filter(|l| {
+                [
+                    "opacity",
+                    "refresh_interval",
+                    "tooltip_interval",
+                    "show_key_groups",
+                    "font",
+                    "today_count_cache_ttl",
+                ]
+                .iter()
+                .any(|k| l.starts_with(k))
+            })
+            .collect();
+        assert!(dead.is_empty(), "回写的文件里还留着死键: {dead:?}");
+        assert!(
+            on_disk.contains("work_minutes = 45"),
+            "活键必须照旧留在文件里: {on_disk}"
+        );
+        assert!(
+            !on_disk.contains("[tray]"),
+            "清空之后的 [tray] 节不该被回写"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
