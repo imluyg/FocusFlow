@@ -139,6 +139,28 @@ pub fn report_dir() -> std::path::PathBuf {
     focusflow_core::paths::data_dir().join("reports")
 }
 
+/// 周报里「环比」那一段的文案。
+///
+/// 上一周基数很小的时候，百分比在数学上没错、在信息量上是噪音：刚开始记录的第二个
+/// 星期，上一周可能只有十几次点击，本机第一份周报就印着 `环比 +35678.6%`。
+/// 超过 ±1000% 就改报绝对差值 —— 读者要的是"多了多少"，不是一个位数都数不清的百分号。
+fn week_delta(total: i64, prev_total: i64) -> String {
+    if prev_total <= 0 {
+        return String::new();
+    }
+    let diff = total - prev_total;
+    let pct = diff as f64 / prev_total as f64 * 100.0;
+    if pct.abs() >= 1000.0 {
+        format!(
+            "，环比 {}{} 次（上一周基数太小，百分比没有意义）",
+            if diff >= 0 { "+" } else { "-" },
+            fmt_thousands(diff.abs())
+        )
+    } else {
+        format!("，环比 {:+.1}%", pct)
+    }
+}
+
 /// 生成并写出「上一个完整周」（周一~周日）的周报，返回文件路径。
 pub fn write_weekly_report() -> anyhow::Result<Option<std::path::PathBuf>> {
     let (from, to) = focusflow_core::stats::last_finished_week(chrono::Local::now().date_naive());
@@ -228,14 +250,7 @@ pub fn write_weekly_report_for(
         "- 生成时间：{}\n",
         Local::now().format("%Y-%m-%d %H:%M:%S")
     ));
-    let delta = if prev_total > 0 {
-        format!(
-            "，环比 {:+.1}%",
-            (total - prev_total) as f64 / prev_total as f64 * 100.0
-        )
-    } else {
-        String::new()
-    };
+    let delta = week_delta(total, prev_total);
     out.push_str(&format!(
         "- 总活跃次数：**{}**（上一周 {}{}）\n",
         fmt_thousands(total),
@@ -452,6 +467,22 @@ mod tests {
         // 目录由 _app 的 Drop 删除：别让下一个用例继续沿着这份年度库列表查下去
         queries::invalidate_years_cache();
         Ok(())
+    }
+
+    /// 上一周基数极小时，环比必须改报绝对差值，而不是印一个几万次方的百分号。
+    #[test]
+    fn week_delta_avoids_meaningless_percentages() {
+        // 刚开始记录的第二个星期：上一周只有 14 次（本机第一份周报的真实形态）
+        let s = week_delta(5009, 14);
+        assert!(s.contains("4,995 次"), "小基数应报绝对差值：{s}");
+        assert!(!s.contains('%'), "不该再出现无意义的百分比：{s}");
+        // 正常量级照旧走百分比
+        assert_eq!(week_delta(210000, 210000), "，环比 +0.0%");
+        assert_eq!(week_delta(100, 200), "，环比 -50.0%");
+        // 下降最多到 -100%，不会被误判成"基数太小"
+        assert_eq!(week_delta(0, 30000), "，环比 -100.0%");
+        // 上一周为 0：整段不写（既不是除零 panic，也不是 inf%）
+        assert_eq!(week_delta(500, 0), "");
     }
 
     /// 跨年周：一月的第一个周报正好压在年度库边界上，两个库都必须算进来。
