@@ -5,9 +5,10 @@
 //!
 //! 匹配分两层（`AliasTable::resolve`）：
 //! 1. **精确匹配** device_key（Raw Input 设备实例路径）
-//! 2. 未命中时按 **VID/PID 型号** 回退 —— 同型号设备换 USB 口、接收器重插后实例路径会变，
-//!    但型号不变，别名仍然生效。
-//!    同型号出现多个**不同**别名时视为歧义，该型号不再参与回退（避免张冠李戴）。
+//! 2. 未命中时按 **型号 + 接口** 回退 —— 同型号设备换 USB 口、接收器重插后实例路径会变，
+//!    但型号与接口不变，别名仍然生效。复合设备（一个接收器的键盘面 `&MI_00` 与
+//!    鼠标面 `&MI_01`）按接口分开，不共用同一个回退键。
+//!    同一回退键下出现多个**不同**别名时视为歧义，该键不再参与回退（避免张冠李戴）。
 //!
 //! 注意：别名只影响展示，不改动统计口径，也不回写 `devices` 登记表。
 
@@ -39,8 +40,7 @@ impl AliasTable {
                 continue;
             }
             exact.insert(key.clone(), alias.clone());
-            if let Some((vid, pid)) = parse_vid_pid(key) {
-                let model_key = format!("{vid}/{pid}");
+            if let Some(model_key) = model_key(key) {
                 match model.get(&model_key) {
                     None => {
                         model.insert(model_key, Some(alias.clone()));
@@ -66,14 +66,48 @@ impl AliasTable {
         if let Some(alias) = self.exact.get(device_key) {
             return Some(alias.as_str());
         }
-        let (vid, pid) = parse_vid_pid(device_key)?;
-        self.model.get(&format!("{vid}/{pid}"))?.as_deref()
+        let model_key = model_key(device_key)?;
+        self.model.get(&model_key)?.as_deref()
     }
 
     /// 已有别名（供 UI / CLI 展示与编辑回填）。
     pub fn exact_alias(&self, device_key: &str) -> Option<&str> {
         self.exact.get(device_key).map(|s| s.as_str())
     }
+}
+
+/// 型号级回退的键：VID/PID，外加接口/集合段（如果路径里有）。
+///
+/// 只用 VID/PID 会把复合设备并成一个：一个无线二合一接收器在 Windows 里是
+/// `VID_xxxx&PID_yyyy&MI_00`（键盘）和 `&MI_01`（鼠标）两个设备实例，型号键相同。
+/// 给键盘起名"办公键盘"之后，鼠标换个 USB 口（实例路径变了、精确匹配落空）就会
+/// 顶着同一个名字。分开之后代价是：同一逻辑接口从"带 MI 段"变成"不带 MI 段"
+/// 这种跨形态漂移时，回退不再命中，界面退回自动名 —— 少个别名比张冠李戴好。
+fn model_key(device_key: &str) -> Option<String> {
+    let (vid, pid) = parse_vid_pid(device_key)?;
+    Some(match interface_tag(device_key) {
+        Some(tag) => format!("{vid}/{pid}#{tag}"),
+        None => format!("{vid}/{pid}"),
+    })
+}
+
+/// 设备实例路径里的接口段：USB 复合设备是 `&MI_00`，蓝牙 HID 集合是 `&Col03`。
+fn interface_tag(device_key: &str) -> Option<String> {
+    let upper = device_key.to_ascii_uppercase();
+    for marker in ["&MI_", "&COL"] {
+        let Some(idx) = upper.find(marker) else {
+            continue;
+        };
+        let tail = &upper[idx + marker.len()..];
+        let value: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        if !value.is_empty() {
+            return Some(format!("{}{value}", &marker[1..]));
+        }
+    }
+    None
 }
 
 /// 别名文件路径。
@@ -278,6 +312,50 @@ mod tests {
             // 精确别名不覆盖型号回退
             set(new_key, "第二只 G304").unwrap();
             assert_eq!(table().resolve(new_key), Some("第二只 G304"));
+        });
+    }
+
+    /// 二合一接收器：同一型号的键盘面与鼠标面不共用一个型号回退键。
+    ///
+    /// 旧实现的回退键只有 `VID/PID`，所以给键盘面起名"办公键盘"之后，鼠标面换
+    /// 一个 USB 口（精确匹配落空 → 走到回退）就顶着同一个名字显示。
+    #[test]
+    fn composite_device_interfaces_do_not_share_the_model_key() {
+        with_temp_dir("composite", || {
+            let kb = "HID#VID_24AE&PID_1464&MI_00#7&1111&0&0000";
+            let mouse = "HID#VID_24AE&PID_1464&MI_01#7&2222&0&0001";
+            set(kb, "办公键盘").unwrap();
+            assert_eq!(table().resolve(kb), Some("办公键盘"));
+            let mouse_replugged = "HID#VID_24AE&PID_1464&MI_01#7&9999&0&0001";
+            assert_eq!(
+                table().resolve(mouse_replugged),
+                None,
+                "另一个接口的设备不该被型号回退带进键盘的名字"
+            );
+            // 同接口换端口照常回退命中（这才是型号回退存在的理由）
+            assert_eq!(
+                table().resolve("HID#VID_24AE&PID_1464&MI_00#7&8888&0&0000"),
+                Some("办公键盘"),
+                "同一接口换端口仍应回退命中"
+            );
+            // 鼠标面自己起了名字之后，两面各自独立
+            set(mouse, "游戏鼠标").unwrap();
+            assert_eq!(table().resolve(mouse_replugged), Some("游戏鼠标"));
+            assert_eq!(table().resolve(kb), Some("办公键盘"));
+        });
+    }
+
+    /// 蓝牙 HID 用 `&Colxx` 分集合，与 USB 的 `&MI_xx` 同等对待。
+    #[test]
+    fn bluetooth_collection_tags_split_the_model_key() {
+        with_temp_dir("btcol", || {
+            let c1 = r"HID#{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&0107d7_PID&efff_REV&0120_d46d51083b12&Col01#9&aaaa&0&0001";
+            assert_eq!(interface_tag(c1).as_deref(), Some("COL01"));
+            assert_eq!(interface_tag("HID#VID_1234&PID_5678#x"), None);
+            set(c1, "键盘集合").unwrap();
+            let c2 = c1.replace("&Col01", "&Col02");
+            assert_eq!(table().resolve(c1), Some("键盘集合"));
+            assert_eq!(table().resolve(&c2), None, "另一个集合不该命中");
         });
     }
 
