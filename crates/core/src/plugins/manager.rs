@@ -70,6 +70,9 @@ pub struct PluginManager {
     stop_event: Arc<AtomicBool>,
     /// 热重载检测线程句柄
     hot_reload_thread: Option<std::thread::JoinHandle<()>>,
+    /// 加载失败过的插件（按文件名记下最后一次错误）：
+    /// 失败的文件不在 `plugins` 里，不另记一笔的话插件页就只能显示"没加载、也没原因"。
+    load_errors: HashMap<String, String>,
     /// 重载请求接收端（GUI 线程 poll）
     reload_rx: mpsc::Receiver<String>,
     /// 重载请求发送端（检测线程用）
@@ -98,6 +101,7 @@ impl PluginManager {
             config,
             db,
             plugins: HashMap::new(),
+            load_errors: HashMap::new(),
             stop_event: Arc::new(AtomicBool::new(false)),
             hot_reload_thread: None,
             reload_rx: rx,
@@ -267,7 +271,7 @@ impl PluginManager {
                     .into_iter()
                     .find(|p| Self::stem_of(p) == stem)
                 {
-                    if let Err(e) = self.load_plugin(&path) {
+                    if let Err(e) = self.try_load(&path) {
                         tracing::warn!("启用插件失败 ({stem}): {e}");
                     }
                 }
@@ -312,16 +316,17 @@ impl PluginManager {
                         error: info.error.clone(),
                     };
                 }
-                match self.read_meta(&path) {
-                    Ok(meta) => DiscoveredPlugin {
-                        name: meta.name,
-                        desc: meta.desc,
-                        version: meta.version,
-                        author: meta.author,
-                        file: stem,
+                match Self::scan_meta(&path) {
+                    Ok((name, desc, version, author)) => DiscoveredPlugin {
+                        name,
+                        desc,
+                        version,
+                        author,
+                        file: stem.clone(),
                         enabled,
                         loaded: false,
-                        error: None,
+                        // 没加载、但加载失败过：原因得显示出来，不能只剩"未加载"
+                        error: self.load_errors.get(&stem).cloned(),
                     },
                     Err(e) => DiscoveredPlugin {
                         name: stem.clone(),
@@ -353,6 +358,28 @@ impl PluginManager {
             .unwrap_or_default();
         files.sort();
         files
+    }
+
+    /// 只做文本扫描读元数据，**不执行插件代码**：`(name, desc, version, author)`。
+    ///
+    /// `list_discovered` 原先回退到 `read_meta`，而 `read_meta` 是 `exec()` 整段脚本再取
+    /// 全局变量 —— 于是「已停用」的插件每开一次插件管理页、每来一次 `plugins-reloaded`
+    /// 都要在主线程上把顶层代码跑一遍（只有指令数上限兜着），与 `mod.rs` 里
+    /// 「停用的不执行其代码」这句承诺正好相反，也白跑了加载失败那批的顶层代码。
+    /// 这 4 个字段本来就是给人看的字符串字面量，扫一行足够；真正要执行顶层代码的
+    /// 加载路径照旧用 `read_meta`。
+    fn scan_meta(path: &Path) -> Result<(String, String, String, String), String> {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let field = |key: &str| -> Option<String> {
+            text.lines()
+                .find_map(|line| literal_after_assign(line, key))
+        };
+        Ok((
+            field("PLUGIN_NAME").unwrap_or_else(|| Self::stem_of(path)),
+            field("PLUGIN_DESC").unwrap_or_default(),
+            field("PLUGIN_VERSION").unwrap_or_else(|| "1.0".to_string()),
+            field("PLUGIN_AUTHOR").unwrap_or_default(),
+        ))
     }
 
     /// 从 Lua 脚本读取元数据（不执行 init）。
@@ -480,6 +507,22 @@ impl PluginManager {
         Ok(name)
     }
 
+    /// `load_plugin` 的记账版：成功就清掉这个文件之前的失败原因，失败就留档，
+    /// 好让插件页显示"为什么没加载"而不是只有一行未加载。
+    fn try_load(&mut self, path: &Path) -> Result<String, String> {
+        let stem = Self::stem_of(path);
+        match self.load_plugin(path) {
+            Ok(name) => {
+                self.load_errors.remove(&stem);
+                Ok(name)
+            }
+            Err(e) => {
+                self.load_errors.insert(stem, e.clone());
+                Err(e)
+            }
+        }
+    }
+
     /// 从插件 Lua 环境读取 get_view() 返回值（声明式 UI 表）。
     fn read_view(lua: &Lua) -> mlua::Result<PluginView> {
         let get_view: mlua::Function = lua.globals().get("get_view")?;
@@ -503,6 +546,9 @@ impl PluginManager {
     /// 卸载插件。
     pub fn unload_plugin(&mut self, name: &str) -> bool {
         if let Some(mut info) = self.plugins.remove(name) {
+            // 卸载 = 用户不要它了（停用/删除/重启前的一次回收），旧的加载失败原因
+            // 不该继续挂在插件页上。
+            self.load_errors.remove(&Self::stem_of(&info.file_path));
             if let Some(lua) = &mut info.lua {
                 if let Ok(cleanup) = lua.globals().get::<mlua::Function>("cleanup") {
                     let _: mlua::Result<()> = cleanup.call(());
@@ -564,7 +610,7 @@ impl PluginManager {
                 if let Some(n) = &pname {
                     self.plugins.remove(n);
                 }
-                self.load_plugin(&p).is_ok()
+                self.try_load(&p).is_ok()
             }
             None => false,
         }
@@ -587,7 +633,7 @@ impl PluginManager {
             {
                 continue;
             }
-            let _ = self.load_plugin(&path);
+            let _ = self.try_load(&path);
         }
     }
 
@@ -833,6 +879,25 @@ fn hot_reload_loop(dir: PathBuf, tx: mpsc::Sender<String>, stop: Arc<AtomicBool>
         }
         std::thread::sleep(std::time::Duration::from_millis(2000));
     }
+}
+
+/// 从一行 Lua 源码里取 `KEY = "值"` 的字面量值（取不到返回 `None`）。
+///
+/// 刻意不做转义、不支持 `[[长字符串]]`、也不接受 `KEY = 变量` 这类计算值：
+/// 元数据这几个字段就是给人看的名字/简介/版本，扫不到时调用方回退成文件名，
+/// 换来的是"列表刷新绝不执行插件代码"。
+fn literal_after_assign(line: &str, key: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let body = trimmed.strip_prefix("local ").unwrap_or(trimmed);
+    let after_key = body.strip_prefix(key)?.trim_start();
+    let value = after_key.strip_prefix('=')?.trim_start();
+    let quote = *value.as_bytes().first()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let inner = &value[1..];
+    let end = inner.find(quote as char)?;
+    Some(inner[..end].to_string())
 }
 
 /// 解析 Lua 表的 options 数组为 (value, label) 列表。

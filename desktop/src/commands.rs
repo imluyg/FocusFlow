@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::state::{AppState, ChartsStats, LiveStats};
 
@@ -154,6 +154,12 @@ pub fn set_config(
     if section == "hotkey" && (key == "enabled" || key == "toggle_window") {
         crate::hotkey::reload_hotkey(&app);
     }
+    // 悬浮窗开关：这个键原先只落盘不生效（全仓唯一的读者是启动时的 setup_windows），
+    // 所以设置页勾完要到下次重启才看得见变化 —— 而"立即隐藏"按钮是马上生效的，
+    // 两个入口给两种反馈，勾一次没反应的那条会被当成坏了。这里跟着即时显示/隐藏。
+    if section == "floating" && key == "enabled" {
+        crate::state::set_floating_visible(&app, value == "true");
+    }
     Ok(())
 }
 
@@ -183,23 +189,18 @@ pub fn hide_main(app: AppHandle) {
     crate::state::hide_main_window(&app);
 }
 
-/// 显示悬浮窗。
+/// 显示悬浮窗（并把这个意图写回 `[floating] enabled`，否则下次启动又按旧配置来）。
 #[tauri::command]
-pub fn show_floating(app: AppHandle) {
-    if let Some(win) = app.get_webview_window("floating") {
-        crate::state::set_webview_rendering(&app, "floating", true);
-        let _ = win.show();
-        let _ = win.set_focus();
-    }
+pub fn show_floating(state: State<'_, Arc<AppState>>, app: AppHandle) {
+    let _ = state.config.set("floating", "enabled", "true");
+    crate::state::set_floating_visible(&app, true);
 }
 
-/// 隐藏悬浮窗。
+/// 隐藏悬浮窗（同 `show_floating`：可见性变了就落盘，让设置页那个勾和现实一致）。
 #[tauri::command]
-pub fn hide_floating(app: AppHandle) {
-    if let Some(win) = app.get_webview_window("floating") {
-        let _ = win.hide();
-        crate::state::set_webview_rendering(&app, "floating", false);
-    }
+pub fn hide_floating(state: State<'_, Arc<AppState>>, app: AppHandle) {
+    let _ = state.config.set("floating", "enabled", "false");
+    crate::state::set_floating_visible(&app, false);
 }
 
 /// 立即 flush 数据库（写线程排空队列）。

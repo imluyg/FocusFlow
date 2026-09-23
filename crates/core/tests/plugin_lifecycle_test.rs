@@ -215,3 +215,70 @@ fn duplicate_plugin_name_is_rejected_instead_of_evicting() {
     // 同一个文件重新加载不算撞名
     assert!(pm.reload_plugin("dup_a"), "重载自身不该被当成撞名");
 }
+
+/// 插件管理页列表不该执行插件代码。
+///
+/// `list_discovered` 原先对"没在内存里的"插件回退到 `read_meta`，而那是 `exec()`
+/// 整段脚本：已停用的插件、加载失败的插件，每开一次插件页、每来一次
+/// `plugins-reloaded` 都要在主线程上把顶层代码再跑一遍 —— 与 `mod.rs` 里
+/// 「停用的不执行其代码」的承诺正好相反。
+#[test]
+fn listing_plugins_never_runs_their_code() {
+    let _g = guard();
+    let tmp = paths::test_app_dir("list_no_exec");
+    // 顶层直接 error：这段一旦被执行，read_meta 就把这条错误当成插件的"状态"显示出来
+    write_plugin(
+        tmp.path(),
+        "top_level_boom",
+        "PLUGIN_NAME = \"顶层会炸\"\nerror(\"不该被执行\")\n",
+    );
+    let (mut pm, config) = manager_in(tmp.path());
+    // 停用它：连加载都不该发生
+    pm.set_enabled("top_level_boom", false);
+    assert!(config
+        .get_or("plugins", "disabled", "")
+        .contains("top_level_boom"));
+
+    let listed = pm.list_discovered();
+    let entry = listed
+        .iter()
+        .find(|p| p.file == "top_level_boom")
+        .expect("停用的插件也该出现在列表里");
+    assert_eq!(entry.name, "顶层会炸", "元数据要靠扫描拿到");
+    assert!(!entry.enabled);
+    assert!(
+        entry.error.is_none(),
+        "只是列个表，不该有插件报错（报错说明顶层代码被执行了）: {:?}",
+        entry.error
+    );
+}
+
+/// 加载失败的原因必须能在列表里看到：改用扫描取元数据之后，`read_meta` 那条
+/// 顺带报错的路子没了，不另记一笔的话插件页就只剩"未加载"三个字。
+#[test]
+fn load_failure_is_visible_in_the_list() {
+    let _g = guard();
+    let tmp = paths::test_app_dir("load_error_visible");
+    write_plugin(
+        tmp.path(),
+        "broken",
+        "PLUGIN_NAME = \"坏掉的\"\nerror(\"顶层就是炸\")\n",
+    );
+    let (mut pm, _) = manager_in(tmp.path());
+    pm.load_all();
+
+    let entry = pm
+        .list_discovered()
+        .into_iter()
+        .find(|p| p.file == "broken")
+        .expect("应列出该文件");
+    assert_eq!(entry.name, "坏掉的", "展示名照样扫得出来");
+    assert!(!entry.loaded);
+    let err = entry
+        .error
+        .expect("加载失败的原因必须显示出来，不能只有一行未加载");
+    assert!(
+        err.contains("顶层就是炸") || err.contains("执行失败"),
+        "{err}"
+    );
+}

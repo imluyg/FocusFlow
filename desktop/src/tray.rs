@@ -171,15 +171,18 @@ fn toggle_pause(app: &AppHandle) {
     }
 }
 
-fn toggle_floating(app: &AppHandle) {
-    if let Some(win) = app.get_webview_window("floating") {
-        if win.is_visible().unwrap_or(false) {
-            let _ = win.hide();
-            crate::state::set_webview_rendering(app, "floating", false);
-        } else {
-            crate::state::set_webview_rendering(app, "floating", true);
-            let _ = win.show();
-            let _ = win.set_focus();
-        }
-    }
+fn toggle_floating(app: &tauri::AppHandle) {
+    // 走与设置页同一个动作，并把结果写回 [floating] enabled：
+    // 托盘点了不算数、下次启动又按老配置冒出来，是同一个开关两处口径不一致。
+    let now_visible = app
+        .get_webview_window("floating")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    let want = !now_visible;
+    let _ = focusflow_core::config::instance().set(
+        "floating",
+        "enabled",
+        if want { "true" } else { "false" },
+    );
+    crate::state::set_floating_visible(app, want);
 }

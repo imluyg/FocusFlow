@@ -342,6 +342,29 @@ fn setup_windows(app: &App, state: &AppState) {
         .expect("启动 WebView2 后台状态同步线程失败");
 }
 
+/// 显示/隐藏悬浮窗，并把 WebView2 的渲染状态一起跟上。
+///
+/// 三条入口（设置页的开关、设置页的「显示/隐藏」按钮、托盘菜单）原先各写一份，
+/// 而且都不落盘：`[floating] enabled` 全仓只有 `setup_windows` 一个读者，且只在启动时
+/// 跑一次 —— 于是勾了开关要到重启才看得见，而用托盘或按钮改了可见性后，下次启动又按
+/// 老配置显示出来，两头的意图互相覆盖。这里只负责"照开关做动作"，落盘由调用方做。
+///
+/// 窗口不存在（构建失败）时以前是静默什么都不发生，这里至少留一条日志。
+pub fn set_floating_visible(app: &tauri::AppHandle, visible: bool) {
+    let Some(win) = app.get_webview_window("floating") else {
+        tracing::warn!("悬浮窗不存在，忽略可见性切换 (visible={visible})");
+        return;
+    };
+    if visible {
+        set_webview_rendering(app, "floating", true);
+        let _ = win.show();
+        let _ = win.set_focus();
+    } else {
+        let _ = win.hide();
+        set_webview_rendering(app, "floating", false);
+    }
+}
+
 /// 设置各窗口 WebView2 内存档位：
 /// 在某个窗口的 WebView2 上执行一段闭包，并**等它真的执行完**，返回它给出的结果。
 ///
