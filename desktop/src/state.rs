@@ -363,6 +363,9 @@ pub fn set_floating_visible(app: &tauri::AppHandle, visible: bool) {
         let _ = win.hide();
         set_webview_rendering(app, "floating", false);
     }
+    // 通知前端同步设置页那个勾选：入口有三个（设置页勾选、页内两个按钮、托盘菜单），
+    // 不广播的话从托盘切完之后，设置页的勾就和屏幕上有没有悬浮窗对不上。
+    let _ = app.emit("floating-changed", visible);
 }
 
 /// 设置各窗口 WebView2 内存档位：

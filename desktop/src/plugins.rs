@@ -527,10 +527,13 @@ fn view_dto(pm: &PluginManager, name: &str) -> Option<PluginViewDto> {
 #[tauri::command]
 pub fn get_plugin_view(state: State<'_, Arc<AppState>>, name: String) -> Option<PluginViewDto> {
     with_manager(&state.db, |pm| {
-        // 刷新失败（如 Lua 视图报错）时返回 None，不静默吐旧缓存造成"点了没反应"假象
         if let Err(e) = pm.refresh_view(&name) {
-            tracing::warn!("插件视图刷新失败 ({name}): {e}");
-            return None;
+            // 渲染报错时退回上一次成功的视图。原先这里直接给 None，前端就把整页
+            // 换成「插件未提供视图」—— 那是一句假话（插件明明有视图，只是这一次
+            // get_view() 抛了错），还会顺手丢掉用户正在操作的分页/选中行。
+            // 宁可让数字停在推开前的样子，下一次刷新成功就自己跟上；真·没有视图
+            // （插件未加载/没有 get_view）时才由下面的 None 给出那句话。
+            tracing::warn!("插件视图刷新失败 ({name})，沿用上一次视图: {e}");
         }
         view_dto(pm, &name)
     })

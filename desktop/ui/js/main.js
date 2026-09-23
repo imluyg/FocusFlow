@@ -199,9 +199,28 @@ document.querySelectorAll("#analytics-tabs .tab").forEach((b) => {
       const cb = $("set-paused");
       if (cb) cb.checked = !!e.payload;
     });
+    // 悬浮窗可见性在托盘菜单 / 「立即显示·隐藏」按钮 / 设置页勾选任一入口改变时，
+    // 同步那一页的勾选。少了这一步，从托盘切了悬浮窗之后设置页的勾还是旧的
+    // （现在配置会被这些入口一并写回，所以勾与现实不一致是看得见的矛盾）。
+    await listen("floating-changed", (e) => {
+      const cb = $("set-floating");
+      if (cb) cb.checked = !!e.payload;
+    });
   } catch (e) {
     console.error("事件订阅失败", e);
   }
+  // 插件详情页自己驱动刷新：番茄钟的倒计时原先只跟着 stats-charts 走，
+  // 而主窗口可见且空闲时后端把重量推送间隔设成了 u64::MAX —— 人一走开倒计时就冻住，
+  // 只有再动键鼠才跳一格。renderPluginDetail 内部有代次守卫与内容比对，
+  // 内容没变不会重建 DOM，1 秒一次的代价只是"打开某个插件面板时多一次 IPC"。
+  setInterval(() => {
+    if (appState.currentView === "plugins" && appState.openPluginName) {
+      try {
+        const r = renderPluginDetail();
+        if (r && typeof r.catch === "function") r.catch(() => {});
+      } catch (e) {}
+    }
+  }, 1000);
   try {
     applyLive(await invoke("get_live"));
     applyCharts(await invoke("get_charts"));

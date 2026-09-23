@@ -124,6 +124,12 @@ const kindLabel = (k) => ({ mouse: "鼠标", keyboard: "键盘", hybrid: "键鼠
 export function renderDevices(s) {
   const box = $("view-devices");
   deviceLastCharts = s;
+  // 正在改名时不重建：指纹里含每台设备的计数，而**每按一个键计数就变** ——
+  // 重建会把输入框换成新节点，bindAliasInput() 又把焦点抢过去，于是光标跳回开头、
+  // 中文输入法正在合成的那几个字被吞掉（草稿文本本身不丢，丢的是手上的编辑）。
+  // 列表数字停在推开前的样子无所谓，退出编辑态后的下一次推送会照常用指纹重画。
+  const ae = document.activeElement;
+  if (deviceEditing && ae && ae.id === "device-alias-input") return;
   // 指纹含周期、筛选与编辑态：切周期/切筛选/进改名时重建，纯数据推送则跳过
   const fp = JSON.stringify([s.period, s.device_total, s.devices, deviceFilter.value, deviceEditing]);
   if (skipIfUnchanged(box, fp)) return;
