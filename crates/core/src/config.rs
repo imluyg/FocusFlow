@@ -34,9 +34,18 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             ("max_backups", "5"),
             ("auto_vacuum_days", "7"),
             ("yearly_archive", "true"),
+            // 已停用插件的数据默认不备份（它们的库不再被写入，备了只占轮转名额）；
+            // 想连它们一起备就设 true。代码注释里提了这个开关，但默认值里没有，
+            // 不读源码的人不知道能设（同 default_period 那一类）。
+            ("backup_disabled_plugins", "false"),
         ],
     );
     s("stats", &[("cpm_window", "60")]);
+    // 插件沙箱的两个上限（manager.rs 读；超限的插件会被标记为不可用）
+    s(
+        "plugins",
+        &[("memory_limit_mb", "16"), ("instruction_limit", "10000000")],
+    );
     // 设备维度采集的总开关（device_stats.rs 读它；关掉只停采集，历史不动）
     s("device_stats", &[("enabled", "true")]);
     s(
@@ -522,6 +531,10 @@ mod tests {
         // 就是这种状态，UI 里那个口径切换只有会改文件的人才用得到）。
         assert_eq!(cfg.get("gui", "floating_metric"), "times");
         assert_eq!(cfg.get_int("gui", "default_period", 99), -1);
+        // 插件沙箱上限与"停用插件要不要一起备份"也都要在文件里看得见
+        assert_eq!(cfg.get_int("plugins", "memory_limit_mb", 0), 16);
+        assert_eq!(cfg.get_int("plugins", "instruction_limit", 0), 10_000_000);
+        assert!(!cfg.get_bool("database", "backup_disabled_plugins", true));
         assert!(cfg.get_bool("gui", "unload_hidden", false));
         assert_eq!(cfg.get_int("gui", "unload_hidden_delay", 0), 60);
         assert!(cfg.get_bool("device_stats", "enabled", false));
