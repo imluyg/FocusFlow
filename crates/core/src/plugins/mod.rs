@@ -42,6 +42,11 @@ pub struct FormField {
     pub value: String,
     /// select 的选项 (value, label)
     pub options: Vec<(String, String)>,
+    /// 这一项改动后要重建视图（分类 → 子分类那种联动）。
+    /// 与 `Widget::Select` 上的同名字段是同一个契约 —— 前端 `pluginFieldHtml`
+    /// 只看这个布尔值决定发 `plugin-field` 还是 `plugin-field-stay`，
+    /// 少了它弹窗里的下拉就是"改了没反应"，而插件那边一切正常。
+    pub refresh: bool,
 }
 
 /// 声明式控件。

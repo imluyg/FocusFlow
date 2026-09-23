@@ -437,4 +437,122 @@ mod tests {
 
         manager.disable_hot_reload();
     }
+
+    /// 内置插件的"行内操作按钮"必须真的声明出来 —— 只在 `on_action` 里写分支不够。
+    ///
+    /// 定时任务插件原先把 `"toggle_3"` / `"del_3"` 当普通文本塞进单元格：表格没有
+    /// `ids` + `actions` 时前端只渲染文本，于是那两列既点不动、又把内部动作 id
+    /// 印在界面上，而 `on_action` 里那两段 `^toggle_` / `^del_` 分支永远到不了 ——
+    /// 表现就是"定时任务在界面上既停不掉也删不掉"（只能改库或走 CLI）。
+    #[test]
+    fn scheduler_plugin_declares_row_actions_instead_of_action_text() {
+        use focusflow_core::plugins::Widget;
+        let _guard = guard();
+        let dir = std::env::current_dir().unwrap();
+        paths::set_app_dir(&dir);
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
+        ));
+        let database = db::Database::init_readonly();
+        let mut manager = PluginManager::new(config, database);
+        let file = manager
+            .discover()
+            .into_iter()
+            .find(|f| f.ends_with("scheduler_plugin.lua"))
+            .expect("应发现 scheduler_plugin.lua");
+        let name = manager.load_plugin(&file).expect("加载插件失败");
+        let view = manager
+            .get_plugin(&name)
+            .expect("插件应存在")
+            .view
+            .clone()
+            .expect("应有视图");
+
+        let found = view.widgets.iter().find_map(|w| match w {
+            Widget::Table {
+                headers,
+                rows,
+                ids,
+                actions,
+                ..
+            } => Some((headers.clone(), rows.clone(), ids.clone(), actions.clone())),
+            _ => None,
+        });
+        let (headers, rows, ids, actions) = found.expect("任务列表应是表格控件");
+        assert!(
+            !actions.is_empty(),
+            "表格必须声明行内按钮，否则界面上就是两列死文本"
+        );
+        let prefixes: Vec<&str> = actions.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            prefixes,
+            vec!["toggle_", "del_"],
+            "按钮前缀必须与 on_action 里的 ^toggle_ / ^del_ 分支对得上"
+        );
+        assert_eq!(ids.len(), rows.len(), "ids 必须与 rows 一一对应");
+        // 最后一列由按钮渲染，所以表头要比数据列多一个
+        if let Some(first) = rows.first() {
+            assert_eq!(
+                headers.len(),
+                first.len() + 1,
+                "有 actions 时表头应比数据列多一列（按钮那一列）"
+            );
+        }
+        for r in &rows {
+            for c in r {
+                assert!(
+                    !c.starts_with("toggle_") && !c.starts_with("del_"),
+                    "单元格里不该再印动作 id：{c}"
+                );
+            }
+        }
+    }
+
+    /// 弹窗表单里的 `refresh` 必须一路活到前端 —— 分类 → 子分类联动靠它。
+    ///
+    /// 行内下拉控件（`Widget::Select`）一直带着这个标志，所以记账页顶部的
+    /// "分类"筛选是好的；而弹窗表单的 `FormField` 从头到尾没有这个字段，
+    /// Lua 里 `d_category` 写的 `refresh = true` 在 Rust 侧被丢掉，
+    /// 前端就永远走 `plugin-field-stay`（只写状态、不重建）——
+    /// 换分类后子分类下拉还是旧分类的选项，能存进去一个不属于该分类的子分类。
+    #[test]
+    fn accounting_modal_form_keeps_refresh_flag() {
+        use focusflow_core::plugins::Widget;
+        let _guard = guard();
+        let dir = std::env::current_dir().unwrap();
+        paths::set_app_dir(&dir);
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
+        ));
+        let database = db::Database::init_readonly();
+        let mut manager = PluginManager::new(config, database);
+        let file = manager
+            .discover()
+            .into_iter()
+            .find(|f| f.ends_with("accounting_plugin.lua"))
+            .expect("应发现 accounting_plugin.lua");
+        let name = manager.load_plugin(&file).expect("加载插件失败");
+        let view = manager
+            .get_plugin(&name)
+            .expect("插件应存在")
+            .view
+            .clone()
+            .expect("应有视图");
+
+        let mut saw_category_field = false;
+        for w in &view.widgets {
+            if let Widget::ModalForm { fields, .. } = w {
+                for f in fields {
+                    if f.field == "d_category" {
+                        saw_category_field = true;
+                        assert!(
+                            f.refresh,
+                            "分类下拉必须带 refresh：否则改了分类，子分类还是旧选项"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(saw_category_field, "记账弹窗里应有 d_category 这一项");
+    }
 }

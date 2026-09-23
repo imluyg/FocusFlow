@@ -281,6 +281,9 @@ pub struct FormFieldDto {
     pub label: String,
     pub value: String,
     pub options: Option<Vec<OptionDto>>,
+    /// 改动后重建视图（分类 → 子分类联动）。缺这一项时插件那边设了
+    /// `refresh = true` 也会被 DTO 层吃掉，弹窗里的下拉就成了"改了没反应"。
+    pub refresh: bool,
 }
 
 /// 表格行内操作按钮描述。
@@ -488,6 +491,7 @@ fn widget_dto(w: &focusflow_core::plugins::Widget) -> WidgetDto {
                         field: f.field.clone(),
                         label: f.label.clone(),
                         value: f.value.clone(),
+                        refresh: f.refresh,
                         options: Some(
                             f.options
                                 .iter()

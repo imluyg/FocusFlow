@@ -69,15 +69,19 @@ end
 function get_view()
     local tasks = focusflow.scheduler_tasks()
     local rows = {}
+    local ids = {}
     for _, t in ipairs(tasks) do
         rows[#rows + 1] = {
             tostring(t["id"]),
             t["name"],
             t["desc"],
             _status(t["enabled"]),
-            "toggle_" .. tostring(t["id"]),
-            "del_" .. tostring(t["id"]),
         }
+        -- 行必须带 ids + actions 才会渲染成按钮。以前是把 "toggle_3"/"del_3"
+        -- 当普通文本塞进单元格，于是这两列既点不动、又把内部动作 id 直接印在界面上，
+        -- 而 on_action 里那两段 ^toggle_ / ^del_ 分支压根到不了 ——
+        -- 定时任务在界面上既停不掉也删不掉（只能改库或用 CLI）。
+        ids[#ids + 1] = tostring(t["id"])
     end
 
     local widgets = {
@@ -87,8 +91,13 @@ function get_view()
         { type = "separator" },
         {
             type = "table",
-            headers = { "ID", "名称", "调度", "状态", "启用/禁用", "删除" },
+            headers = { "ID", "名称", "调度", "状态", "操作" },
             rows = rows,
+            ids = ids,
+            actions = {
+                { prefix = "toggle_", text = "启用/禁用" },
+                { prefix = "del_", text = "删除" },
+            },
         },
     }
     -- 上一次操作的结果：被白名单拒绝、删除成功与否都要在面板上说出来，

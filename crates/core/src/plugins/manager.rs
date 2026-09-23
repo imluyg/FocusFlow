@@ -536,8 +536,14 @@ impl PluginManager {
             }
             if let Ok(widgets) = t.get::<mlua::Table>("widgets") {
                 for (_, w) in widgets.pairs::<mlua::Value, mlua::Table>().flatten() {
-                    if let Ok(widget) = parse_widget(&w) {
-                        view.widgets.push(widget);
+                    match parse_widget(&w) {
+                        Ok(widget) => view.widgets.push(widget),
+                        // 认不出来的控件以前是**静默丢掉**的：`type` 打错一个字母、
+                        // headers 里混进一个数字，界面上就是少一块，而插件行不报红、
+                        // 日志里一个字都没有 —— 这一类"看不见"正是上面那些契约问题
+                        // 能藏很久的原因。仍然跳过（不能让一个坏控件毁掉整页），
+                        // 但要留下为什么。
+                        Err(e) => tracing::warn!("跳过无法解析的控件: {e}"),
                     }
                 }
             }
@@ -967,6 +973,7 @@ fn parse_widget(w: &mlua::Table) -> mlua::Result<crate::plugins::Widget> {
                         label: f.get("label").unwrap_or_default(),
                         value: f.get("value").unwrap_or_default(),
                         options: parse_options(&f)?,
+                        refresh: f.get("refresh").unwrap_or(false),
                     });
                 }
             }
