@@ -68,24 +68,41 @@ pub fn init_logging() {
     // 日志目录
     std::fs::create_dir_all(crate::paths::log_dir()).ok();
 
-    // 文件 appender：按天滚动，保留最近 4 个文件（避免单文件无限增长）
-    let file_appender = tracing_appender::rolling::Builder::new()
+    // 文件 appender：按天滚动，保留最近 4 个文件（避免单文件无限增长）。
+    //
+    // 建不出来时不能 panic：目录取自 `paths::log_dir()` → `app_dir`，而 `app_dir` 可以被
+    // `FOCUSFLOW_APP_DIR` 指到任何地方（不可写的目录、已被删掉的路径、或一个同名普通文件
+    // 都会走到这条 Err 分支）。更要紧的是 `init_logging()` 在命令行参数解析**之前**就被调用，
+    // 而 release 是 `panic = "abort"` —— 进程连一行用法提示都印不出来，用户看到的是
+    // "双击没反应、也没有任何报错"。现在退化成只走控制台层，程序照常能用。
+    let file_layer = match tracing_appender::rolling::Builder::new()
         .max_log_files(4)
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .build(crate::paths::log_dir())
-        .expect("创建日志 appender 失败");
-    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
-    // 收好 guard：它一被 drop，worker 线程就停转、后续日志静默丢弃
-    *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+    {
+        Ok(file_appender) => {
+            let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+            // 收好 guard：它一被 drop，worker 线程就停转、后续日志静默丢弃
+            *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+            Some(
+                fmt::layer()
+                    .with_writer(file_writer)
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_thread_names(true)
+                    .with_thread_ids(true),
+            )
+        }
+        Err(e) => {
+            eprintln!(
+                "日志文件建不出来（目录 {}）：本次只输出到控制台、不落盘文件。原因: {e}",
+                crate::paths::log_dir().display()
+            );
+            None
+        }
+    };
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
-    let file_layer = fmt::layer()
-        .with_writer(file_writer)
-        .with_ansi(false)
-        .with_target(true)
-        .with_thread_names(true)
-        .with_thread_ids(true);
     // 控制台直接同步写 stdout，不再套一层 non_blocking：
     // 那样要多管一个 guard，而它原先在同一条语句里就被丢弃了，
     // worker 随即停转 —— 控制台层实际上是死的。ERROR 量小，同步写无碍。
