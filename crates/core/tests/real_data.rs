@@ -502,4 +502,72 @@ mod tests {
             None => println!("真实数据设备详情：本机无数据，跳过"),
         }
     }
+
+    /// 启动自愈在他的真实库上必须是**纯空转**。
+    ///
+    /// `heal_daily_consistency()` 每次启动都跑：它认定哪天不一致就以 key_counts
+    /// 为准重算 daily、按占比缩放 hourly —— 一旦误判就会**改写真实历史**。
+    /// 前面几条用例已经证明这份数据三个口径自洽，所以这里断言"跑完一字未动"：
+    /// 哪天检测器开始喊狼，会在这里露出来，而不是在他的历史里。
+    #[test]
+    fn real_data_startup_self_heal_is_a_noop() {
+        let outcome = on_real_data_copy("realdata_heal", || {
+            let year = queries::available_years()
+                .first()
+                .copied()
+                .expect("副本里至少有一个年度库");
+            let path = paths::year_db_path(year);
+            let fingerprint = |conn: &rusqlite::Connection| -> Vec<(String, i64)> {
+                [
+                    "SELECT COALESCE(SUM(count),0) FROM daily_counts",
+                    "SELECT COALESCE(SUM(seconds),0) FROM daily_counts",
+                    "SELECT COUNT(*) FROM daily_counts",
+                    "SELECT COALESCE(SUM(count),0) FROM key_counts",
+                    "SELECT COUNT(*) FROM key_counts",
+                    "SELECT COALESCE(SUM(count),0) FROM hourly_counts",
+                    "SELECT COUNT(*) FROM hourly_counts",
+                    "SELECT COALESCE(SUM(count),0) FROM device_counts",
+                    "SELECT COALESCE(SUM(seconds),0) FROM app_usage",
+                ]
+                .iter()
+                .map(|sql| {
+                    (
+                        (*sql).to_string(),
+                        conn.query_row(sql, [], |r| r.get::<_, i64>(0))
+                            .unwrap_or(-1),
+                    )
+                })
+                .collect()
+            };
+
+            let before = {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                fingerprint(&conn)
+            };
+            // 别让"空库所以什么都没得改"混成一个假通过
+            assert!(
+                before
+                    .iter()
+                    .any(|(sql, v)| sql.contains("daily_counts") && *v > 0),
+                "副本里连一行聚合都没有，这条用例就成了空转：{before:?}"
+            );
+            // 跑生产路径本身，而不是在测试里复制一份检测逻辑
+            queries::invalidate_years_cache();
+            focusflow_core::db::maintenance::heal_daily_consistency();
+            let after = {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                fingerprint(&conn)
+            };
+
+            assert_eq!(
+                before, after,
+                "启动自愈改写了真实历史数据 —— 检测器在健康的库上误判了"
+            );
+            year
+        });
+        match outcome {
+            Some(year) => println!("真实数据自愈空转：{year} 年库一字未动"),
+            None => println!("真实数据自愈空转：本机无数据，跳过"),
+        }
+    }
 }
