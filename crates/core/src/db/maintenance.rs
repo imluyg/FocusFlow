@@ -38,16 +38,23 @@ pub(crate) const DATA_TABLES: [&str; 6] = [
 ];
 
 /// `[dk_from, dk_to)` 区间内该连接上是否还有任何数据行（跨全部 DATA_TABLES）。
-fn range_has_rows(conn: &rusqlite::Connection, dk_from: i64, dk_to: i64) -> bool {
-    DATA_TABLES.iter().any(|table| {
-        conn.query_row(
+///
+/// **读不出来必须与"没有行"分开**：原先把查询 Err 折成 false，于是当前年库损坏
+/// （或表压根没建出来）时归档判定为"这一轮没数据要搬"，静默跳过且一条日志都不留。
+fn range_has_rows(conn: &rusqlite::Connection, dk_from: i64, dk_to: i64) -> anyhow::Result<bool> {
+    for table in DATA_TABLES.iter() {
+        match conn.query_row(
             &format!("SELECT 1 FROM {table} WHERE date_key >= ?1 AND date_key < ?2 LIMIT 1"),
             rusqlite::params![dk_from, dk_to],
             |_| Ok::<i64, rusqlite::Error>(1),
-        )
-        .unwrap_or(0)
-            != 0
-    })
+        ) {
+            Ok(_) => return Ok(true),
+            // 空表是正常答案，不是错误
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(false)
 }
 
 /// 早于 `before_dk` 的数据里最早的那一天（跨全部 DATA_TABLES 取最小），无则 None。
@@ -55,19 +62,21 @@ fn range_has_rows(conn: &rusqlite::Connection, dk_from: i64, dk_to: i64) -> bool
 /// 不能只探 `daily_counts`：`record_device` 从不写它。只看 daily_counts 时，
 /// 「只有设备明细被误放进当前库」的往年数据永远判定成无需归档，而按日期的
 /// 查询只会去对应年份的库里找 —— 那批数据就再也看不见。
-fn min_stale_date_key(conn: &rusqlite::Connection, before_dk: i64) -> Option<i64> {
-    DATA_TABLES
-        .iter()
-        .filter_map(|table| {
-            conn.query_row(
-                &format!("SELECT MIN(date_key) FROM {table} WHERE date_key < ?1"),
-                [before_dk],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-            .ok()
-            .flatten()
-        })
-        .min()
+///
+/// 同样把读错误如实报出去（见 [`range_has_rows`]）。
+fn min_stale_date_key(conn: &rusqlite::Connection, before_dk: i64) -> anyhow::Result<Option<i64>> {
+    let mut earliest: Option<i64> = None;
+    for table in DATA_TABLES.iter() {
+        let min: Option<i64> = conn.query_row(
+            &format!("SELECT MIN(date_key) FROM {table} WHERE date_key < ?1"),
+            [before_dk],
+            |r| r.get::<_, Option<i64>>(0),
+        )?;
+        if let Some(v) = min {
+            earliest = Some(earliest.map_or(v, |e| e.min(v)));
+        }
+    }
+    Ok(earliest)
 }
 
 /// 非主键的数值列：归档时**累加**到目标库的同名列。
@@ -104,12 +113,19 @@ pub fn check_yearly_archive(yearly_archive_enabled: bool) {
         queries::day_key_of_date(NaiveDate::from_ymd_opt(current_year, 1, 1).expect("date"));
 
     let path = paths::current_year_db_path();
-    let conn = match connection::open_ro(&path) {
-        Ok(c) => c,
-        Err(_) => return,
+    // 打不开与探不出来都不能静默 return：那意味着"往年数据就躺在当前库里，
+    // 而按日期的查询只去对应年份的库里找"，界面上那些天永远看不见，日志里
+    // 一个字都没有。
+    let earliest = match connection::open_ro(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|conn| min_stale_date_key(&conn, year_start_dk).map_err(|e| e.to_string()))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("{current_year} 年库探测失败，本轮年度归档跳过（未做任何改动）: {e}");
+            return;
+        }
     };
-    let earliest = min_stale_date_key(&conn, year_start_dk);
-    drop(conn);
 
     let Some(earliest) = earliest else {
         return;
@@ -131,9 +147,15 @@ pub fn archive_stale_years(source_year: i32) -> bool {
     }
     // 先查出需要迁移的年份及各年起始 date_key（用源库自己的连接查，不依赖猜测）
     let y0 = queries::day_key_of_date(NaiveDate::from_ymd_opt(source_year, 1, 1).expect("date"));
-    let min_dk: Option<i64> = match connection::open_ro(&source_path) {
-        Ok(conn) => min_stale_date_key(&conn, y0),
-        Err(_) => None,
+    let min_dk: Option<i64> = match connection::open_ro(&source_path)
+        .map_err(|e| e.to_string())
+        .and_then(|conn| min_stale_date_key(&conn, y0).map_err(|e| e.to_string()))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("{source_year} 年库探测失败，本轮归档跳过（未做任何改动）: {e}");
+            return false;
+        }
     };
     let first_stale_year = min_dk.and_then(queries::day_key_to_date).map(|d| d.year());
     let stale: Vec<(i32, i64, i64)> = match first_stale_year {
@@ -191,17 +213,19 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
     // 四个空壳 —— 此后永久出现在 available_years() 里、白占备份轮转名额，
     // 每个还要各挨一次 VACUUM。
     let source_path = paths::year_db_path(source_year);
-    match connection::open_ro(&source_path) {
-        Ok(conn) => {
-            if !range_has_rows(&conn, dk_from, dk_to) {
-                return false;
-            }
-        }
+    let has_rows = match connection::open_ro(&source_path)
+        .map_err(|e| e.to_string())
+        .and_then(|conn| range_has_rows(&conn, dk_from, dk_to).map_err(|e| e.to_string()))
+    {
+        Ok(v) => v,
         // 判不了就不建：宁可这一轮不归档，也不要留下没有数据来源的空库
         Err(e) => {
             tracing::error!("年度归档中止：源库无法读取（{e}），未改动目标库");
             return false;
         }
+    };
+    if !has_rows {
+        return false;
     }
 
     // 1. 确保 target_year 与 source_year 库都是最新表结构
@@ -665,7 +689,18 @@ pub fn cleanup_old_data(keep_days: i64) -> CleanupReport {
         }
         let mut year_deleted = 0i64;
         let mut year_failed = false;
-        if min_stale_date_key(&conn, cutoff_dk).is_some() {
+        let stale = match min_stale_date_key(&conn, cutoff_dk) {
+            Ok(v) => v,
+            Err(e) => {
+                // 探不出来时两个选择都错：当成"有过期行"去删是盲删，当成"没有"
+                // 是静默漏删。这里退到"本年度什么也没做"并计进 failed_years。
+                tracing::error!("{year} 年库探测失败，本年度未清理: {e}");
+                let _ = conn.execute_batch("ROLLBACK");
+                report.failed_years.push(year);
+                continue;
+            }
+        };
+        if stale.is_some() {
             if !snapshotted {
                 snapshot_before_destructive("cleanup_old_data");
                 snapshotted = true;
@@ -1215,6 +1250,8 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
             write_suspect_note(&timestamp, &detail);
             rotate_backups(policy, true);
         } else {
+            // 本轮全部通过校验 —— 上一轮那条异常说明到此为止（见 clear_suspect_notes）
+            clear_suspect_notes();
             rotate_backups(policy, false);
         }
         let count = backed_up.len();
@@ -1276,13 +1313,20 @@ fn is_suspicious_change(prev: BackupFingerprint, cur: BackupFingerprint) -> bool
         return false;
     }
     let dropped = cur.total * 2 < prev.total; // 掉了一半以上：疑似丢数据
-    let rose = cur.total > prev.total * 4; // 涨到 4 倍以上：疑似重复计数
     let days_lost = cur.days + 1 < prev.days; // 天数明显减少（一天最多新增 1 天）
-    dropped || rose || days_lost
+                                              // 暴涨要按**日均**比，不能按总量比：导旧库、恢复一份更大的备份、换机迁库
+                                              // 都会让总量一夜翻几倍，而那同时也带进更多天 —— 那是预期行为不是故障。
+                                              // （实测：他导入生产库后那份备份就是 181,056/22 天 → 1,162,562/55 天，
+                                              //  按总量判会报"疑似重复计数"，而按日均只涨了 2.6 倍。）
+                                              // 真正的重复计数（跨年归档重放把 `count = count + excluded.count` 跑两遍）
+                                              // 天数一动不动、只有总量翻倍，日均才会异常抬高。
+                                              // 天数 ≥1 由上面的样本下限兜住（一天都没有时总量必为 0）。
+    let per_day_rose = cur.total * prev.days > prev.total * cur.days * 4;
+    dropped || per_day_rose || days_lost
 }
 
 /// 把异常体检结果写成 `backup/SUSPECT-<时间戳>.txt`：日志之外留一份可追溯的记录，
-/// 设置页也会读它做提示（轮转只认 `.db`，不会碰它）。
+/// 设置页也会读它做提示。生命周期见 [`clear_suspect_notes`] 与 [`rotate_suspect_notes`]。
 fn write_suspect_note(timestamp: &str, detail: &str) -> std::path::PathBuf {
     let path = paths::backup_dir().join(format!("SUSPECT-{timestamp}.txt"));
     let body = format!(
@@ -1512,7 +1556,70 @@ fn select_retained(files: &[std::path::PathBuf], policy: RetentionPolicy) -> Vec
 /// 分组键取文件名第一段（`focusflow_2026_…` → "2026"，`focusflow_accounting_…`
 /// → "accounting"）。此前按第二段分组取到的是日期，每天自成一组导致轮转
 /// 永远删不到旧日期的备份，backup/ 目录无限增长。
+/// backup/ 下现存的异常说明文件，按文件名升序（文件名里的时间戳是
+/// `%Y%m%d_%H%M%S%3f`，字典序即时间序）。
+fn suspect_notes() -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(paths::backup_dir()) else {
+        return Vec::new();
+    };
+    let mut notes: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| {
+                    let n = n.to_string_lossy();
+                    n.starts_with("SUSPECT-") && n.ends_with(".txt")
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    notes.sort();
+    notes
+}
+
+/// 某次备份全部通过校验后，把历史的异常说明清掉。
+///
+/// 那些文件是设置页红字的来源（界面取最近两份读）。异常只出现过一次、之后每次
+/// 备份都干净，红字还挂着就是对着用户说谎，而界面上没有任何东西能把它清掉 ——
+/// 只能人肉去 backup/ 删。日志里那条 error 不动，要追溯历史去 logs/。
+fn clear_suspect_notes() {
+    let notes = suspect_notes();
+    if notes.is_empty() {
+        return;
+    }
+    for path in &notes {
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::warn!("旧异常说明删除失败 {}: {e}", path.display());
+        }
+    }
+    tracing::info!(
+        "本轮备份全部通过校验，已清理 {} 份旧的异常说明（{}）",
+        notes.len(),
+        paths::backup_dir().display()
+    );
+}
+
+/// 异常说明文件（`backup/SUSPECT-*.txt`）在**一直不干净**时也只留最近 5 份。
+///
+/// 轮转原先只认 `.db`，说明文件每检出一次异常就多一份且永不删除 —— 用不了多久
+/// backup/ 里就躺着几十份内容重复的说明，真要看的那份反倒被埋在里面。
+/// 冻结轮转时也照样清：冻的是**可恢复的备份库**，说明文件不是。
+fn rotate_suspect_notes() {
+    const KEEP: usize = 5;
+    let notes = suspect_notes();
+    if notes.len() <= KEEP {
+        return;
+    }
+    for old in notes.iter().take(notes.len() - KEEP) {
+        if let Err(e) = std::fs::remove_file(old) {
+            tracing::warn!("旧异常说明删除失败 {}: {e}", old.display());
+        }
+    }
+}
+
 fn rotate_backups(policy: RetentionPolicy, freeze: bool) {
+    rotate_suspect_notes();
     let mut groups: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
     if let Ok(entries) = std::fs::read_dir(paths::backup_dir()) {
         for entry in entries.flatten() {
@@ -2787,7 +2894,33 @@ mod tests {
                     days: 120
                 }
             ),
-            "总量涨到 4 倍以上：疑似重复计数"
+            "天数没变、日均涨到 4 倍以上：疑似重复计数"
+        );
+        // 他真实发生过的一次：把生产库导进来之后那份备份 181,056/22 天 →
+        // 1,162,562/55 天。按总量比是 6.4 倍（当时报了假警报、冻结轮转、
+        // 设置页从此挂着红字），按日均只涨 2.6 倍 —— 这是预期增长。
+        assert!(
+            !is_suspicious_change(
+                BackupFingerprint {
+                    total: 181_056,
+                    days: 22
+                },
+                BackupFingerprint {
+                    total: 1_162_562,
+                    days: 55
+                },
+            ),
+            "导入旧库/恢复更大的备份：总量翻数倍但天数同步增长，不该告警"
+        );
+        assert!(
+            !is_suspicious_change(
+                base,
+                BackupFingerprint {
+                    total: 400_000,
+                    days: 400
+                }
+            ),
+            "换机迁库：总量与天数同倍增长，日均没变，不该告警"
         );
         assert!(
             is_suspicious_change(
@@ -2963,6 +3096,128 @@ mod tests {
                 "available_years 不该混进空年份 {gap}: {years:?}"
             );
         }
+    }
+
+    /// 两个探测必须分得清「读不出来」与「没有行」。
+    ///
+    /// 原先查询 Err 被折成 false/None，于是当前年库损坏（表压根没建出来）时
+    /// 年度归档与过期清理都判定为"没有数据要处理"，静默跳过且一条日志都不留。
+    #[test]
+    fn probes_report_read_errors_instead_of_no_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(
+            range_has_rows(&conn, 1, 2).is_err(),
+            "表不存在必须报 Err，不能当成 false"
+        );
+        assert!(min_stale_date_key(&conn, 10).is_err(), "同样不能折成 None");
+
+        // 表齐了但没有行 —— 那才是正常的"没有"
+        connection::ensure_schema(&conn, 2026).unwrap();
+        assert!(
+            !range_has_rows(&conn, 1, 2).unwrap(),
+            "空表是正常答案，不该报错"
+        );
+        assert_eq!(min_stale_date_key(&conn, 10).unwrap(), None);
+
+        conn.execute(
+            "INSERT INTO daily_counts (date_key, count, seconds) VALUES (5, 1, 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(min_stale_date_key(&conn, 10).unwrap(), Some(5));
+        assert!(range_has_rows(&conn, 5, 6).unwrap());
+        assert!(!range_has_rows(&conn, 6, 7).unwrap(), "区间外不该算有数据");
+
+        // 只有设备明细里的往年行也算"有数据"（不能只探 daily_counts）
+        conn.execute(
+            "INSERT INTO devices (device_key, name, kind) VALUES ('k', '', 'mouse')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO device_counts VALUES (3, 1, 7)", [])
+            .unwrap();
+        assert_eq!(
+            min_stale_date_key(&conn, 10).unwrap(),
+            Some(3),
+            "设备明细里的往年天也要探到"
+        );
+    }
+
+    /// 异常说明文件（SUSPECT-*.txt）不能只增不减，且轮转不得碰别的文件。
+    #[test]
+    fn suspect_notes_are_capped_and_no_other_file_is_touched() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("suspect_rot");
+        let dir = paths::backup_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        // 文件名里的时间戳是 %Y%m%d_%H%M%S%3f，字典序即时间序
+        for i in 0..7 {
+            std::fs::write(dir.join(format!("SUSPECT-20260901_00000000{i}.txt")), b"x").unwrap();
+        }
+        let keep_db = dir.join("focusflow_2026_20260901_000000001.db");
+        let keep_txt = dir.join("readme.txt");
+        std::fs::write(&keep_db, b"keep").unwrap();
+        std::fs::write(&keep_txt, b"keep").unwrap();
+
+        rotate_suspect_notes();
+
+        let left: Vec<String> = {
+            let mut v: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with("SUSPECT-"))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(left.len(), 5, "说明文件应只留最近 5 份: {left:?}");
+        assert!(
+            left.contains(&"SUSPECT-20260901_000000006.txt".to_string()),
+            "最近那份必须在: {left:?}"
+        );
+        assert!(
+            !left.contains(&"SUSPECT-20260901_000000000.txt".to_string()),
+            "最旧那份应已删除: {left:?}"
+        );
+        assert!(keep_db.is_file(), "备份库不归它管");
+        assert!(keep_txt.is_file(), "别的 txt 也不能碰");
+
+        // 已经不超过上限时是 no-op（不得把留下的那些再删一轮）
+        rotate_suspect_notes();
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("SUSPECT-"))
+                .count(),
+            5
+        );
+    }
+
+    /// 一次干净的备份必须把旧的异常说明带走。
+    ///
+    /// 那些文件是设置页红字的唯一来源，而红字以前只会越挂越久：异常只出现过一次、
+    /// 之后连续几天备份都干净，界面上仍然写着"检测到备份数据异常"，
+    /// 用户除了手动去 backup/ 删文件没有任何办法让它消失。
+    #[test]
+    fn a_clean_backup_clears_previous_suspect_notes() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("suspect_clear");
+        let dir = paths::backup_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("SUSPECT-20260901_000000000.txt");
+        let keep_db = dir.join("focusflow_2026_20260901_000000000.db");
+        std::fs::write(&note, b"x").unwrap();
+        std::fs::write(&keep_db, b"keep").unwrap();
+
+        assert!(!suspect_notes().is_empty());
+        clear_suspect_notes();
+        assert!(!note.exists(), "干净的一轮之后旧异常说明不该再挂着");
+        assert!(keep_db.is_file(), "备份库一份都不能少");
+        assert!(suspect_notes().is_empty());
+        // 没有说明时是 no-op，不得报错
+        clear_suspect_notes();
     }
 
     /// backup/ 里有几份备份库（只数 .db，SUSPECT 说明等旁证文件不算）。
