@@ -60,7 +60,7 @@ pub fn start_sampler(writer: Arc<DbWriter>) {
     if !enabled {
         tracing::info!("前台应用统计未启用（[app_stats] enabled=false），线程仍会起来等它被打开");
     }
-    std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("app-usage-sampler".into())
         .spawn(move || {
             tracing::info!(
@@ -110,7 +110,14 @@ pub fn start_sampler(writer: Arc<DbWriter>) {
                 }
             }
         })
-        .expect("启动前台应用采样线程失败");
+    {
+        // 线程创建失败（机器长时间运行、句柄压力）只该少掉「应用归属」这一项，
+        // 不该让整个程序在启动路上死掉 —— release 是 panic = "abort"，
+        // 一条 expect 就是"双击没反应"。
+        tracing::error!(
+            "前台应用采样线程启动失败（{e}）：本次运行不再统计应用归属，键鼠统计不受影响"
+        );
+    }
 }
 
 /// 前台进程名采集（平台相关）。

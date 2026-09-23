@@ -109,7 +109,11 @@ pub fn export_html(
 
 /// Markdown 表格单元格：键名里可能带 `|` 或换行，会直接破坏表格结构。
 fn md_cell(s: &str) -> String {
-    s.replace('|', "\\|").replace(['\n', '\r'], " ")
+    // 反斜杠要先转义：单元格里以 `\` 结尾会把紧跟的 `|` 吃掉，整行列错位。
+    // 顺序不能反 —— 先转 `|` 再转 `\` 会把刚加的那个 `\` 又转一遍。
+    s.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\n', '\r'], " ")
 }
 
 /// 百分比（分母为 0 时给 0.0%，不做除零）。
@@ -382,6 +386,10 @@ mod tests {
         assert_eq!(md_cell("a|b"), "a\\|b");
         assert_eq!(md_cell("a\nb"), "a b");
         assert_eq!(md_cell("鼠标左键"), "鼠标左键");
+        // 反斜杠也要转义：以 `\` 结尾的单元格会把紧跟的 `|` 当转义吃掉，整行列错位。
+        // 顺序不能反 —— 先转 `|` 再转 `\` 会把刚加的那个反斜杠又转一遍。
+        assert_eq!(md_cell("x\\"), "x\\\\");
+        assert_eq!(md_cell("a\\|b"), "a\\\\\\|b");
         assert_eq!(pct(1, 4), "25.0%");
         assert_eq!(pct(1, 0), "0.0%", "分母为 0 不能除零");
         assert_eq!(fmt_duration(3780), "1小时3分");
