@@ -714,11 +714,15 @@ pub fn update_task(
 }
 
 /// 删除任务。
-pub fn delete_task(id: i64) -> bool {
-    open()
-        .and_then(|conn| conn.execute("DELETE FROM scheduled_tasks WHERE id=?1", [id]))
+///
+/// `Ok(false)` 只在"库里确实没有这一条"时返回；库打不开 / 查询出错走 `Err`。
+/// 这两件原先都返回 `false`，于是插件页对着一条**存在**的任务报"任务 #N 不存在"
+/// （GUI 开着、库被它的写事务占满时就会这样），用户以为任务已经没了。
+pub fn delete_task(id: i64) -> anyhow::Result<bool> {
+    let conn = open().map_err(|e| anyhow::anyhow!("打开定时任务库失败: {e}"))?;
+    conn.execute("DELETE FROM scheduled_tasks WHERE id=?1", [id])
         .map(|n| n > 0)
-        .unwrap_or(false)
+        .map_err(|e| anyhow::anyhow!("删除任务 #{id} 失败: {e}"))
 }
 
 /// 启用/禁用任务。
@@ -732,14 +736,23 @@ pub fn toggle_task(id: i64, enabled: bool) {
 }
 
 /// 获取所有任务。
+///
+/// 读不出来时**必须留日志**：返回空列表与"他一条任务都没建过"在界面上长得一样，
+/// 而插件页会直接显示成空列表。
 pub fn get_all_tasks() -> Vec<ScheduledTask> {
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::error!("定时任务读不出来（打开库失败），本次按空列表处理: {e}");
+            return Vec::new();
+        }
     };
     let mut stmt = match conn.prepare("SELECT * FROM scheduled_tasks ORDER BY id") {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::error!("定时任务读不出来（查询准备失败），本次按空列表处理: {e}");
+            return Vec::new();
+        }
     };
     let result = stmt.query_map([], |r| {
         Ok(ScheduledTask {
@@ -756,7 +769,10 @@ pub fn get_all_tasks() -> Vec<ScheduledTask> {
     });
     match result {
         Ok(rows) => rows.flatten().collect(),
-        Err(_) => Vec::new(),
+        Err(e) => {
+            tracing::error!("定时任务读不出来（查询失败），本次按空列表处理: {e}");
+            Vec::new()
+        }
     }
 }
 
@@ -1014,7 +1030,11 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn start() -> Arc<Self> {
-        let _ = init_db();
+        if let Err(e) = init_db() {
+            // 建表失败以前被 `let _ =` 吞掉：之后每次添加任务都报 "no such table"，
+            // 而日志里一个字都没有，只能靠猜。线程照旧起来（读失败会记日志）。
+            tracing::error!("定时任务表初始化失败，添加/删除任务会持续报错: {e}");
+        }
         let s = Arc::new(Self {
             stop: Arc::new(AtomicBool::new(false)),
             handle: Mutex::new(None),
@@ -1433,6 +1453,38 @@ mod tests {
             "库里更全时不能被旧记忆盖掉"
         );
         assert_eq!(effective_last_run(None, None), None);
+    }
+
+    /// 「库里没有这一条」与「库读不出来」必须是两种回报。
+    ///
+    /// 两者都返回 `false` 时，插件页对着一条**还在**的任务说"任务 #N 不存在"，
+    /// 用户以为删掉了，其实下次到点它照样启动。
+    #[test]
+    fn delete_task_separates_missing_row_from_unreadable_db() {
+        let _g = isolate_app_dir("delete_shapes");
+        let notepad = r"C:\Windows\notepad.exe";
+        if !std::path::Path::new(notepad).is_file() {
+            return;
+        }
+        let id = add_task("留着", notepad, "", "daily", "09:00", true).unwrap();
+        assert!(matches!(delete_task(id), Ok(true)), "存在的任务应报删到了");
+        assert!(
+            matches!(delete_task(id + 4242), Ok(false)),
+            "没有这一条才该是 Ok(false)"
+        );
+
+        // app_dir 指向一个普通文件 → 附属库根本开不了：这必须是 Err，不能是 false
+        let scratch = crate::paths::test_app_dir("delete_unreadable");
+        let file = scratch.path().join("not_a_dir");
+        std::fs::write(&file, b"x").unwrap();
+        crate::paths::set_app_dir(&file);
+        let e = delete_task(id).expect_err("读不出库不能被说成「没有这条」");
+        assert!(e.to_string().contains("打开定时任务库失败"), "{e}");
+        assert!(
+            get_all_tasks().is_empty(),
+            "读不出来时列表为空是既有口径（会留 error 日志）"
+        );
+        crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
     }
 
     #[test]

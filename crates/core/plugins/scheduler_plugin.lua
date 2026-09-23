@@ -37,10 +37,12 @@ function on_action(id)
         end
     elseif id:match("^del_") then
         local tid = tonumber(id:sub(5))
-        if focusflow.scheduler_delete(tid) then
+        -- 宿主给的是 (是否删到, 原因)：库读不出来时不能说成"任务不存在"
+        local ok, why = focusflow.scheduler_delete(tid)
+        if ok then
             msg = "已删除任务 #" .. tostring(tid)
         else
-            msg = "删除失败：任务 #" .. tostring(tid) .. " 不存在"
+            msg = "删除失败：" .. ((why and #why > 0) and why or ("任务 #" .. tostring(tid) .. " 不存在"))
         end
     end
 end

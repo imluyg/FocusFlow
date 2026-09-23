@@ -393,9 +393,16 @@ pub fn register_host_api(
     host.set("scheduler_update", update_fn)?;
 
     let delete_owner = owner.clone();
+    // 与 scheduler_update 同形状：返回 (是否删到, 没删到的原因)。
+    // 以前只有一个 bool，"库里读不出来"也会被插件说成"任务不存在"。
     let delete_fn = lua.create_function(move |_, id: i64| {
         claim_scheduler(&delete_owner);
-        Ok(scheduler::delete_task(id))
+        let reason = match scheduler::delete_task(id) {
+            Ok(true) => String::new(),
+            Ok(false) => format!("任务 #{id} 不存在（可能已经被删掉了）"),
+            Err(e) => e.to_string(),
+        };
+        Ok((reason.is_empty(), reason))
     })?;
     host.set("scheduler_delete", delete_fn)?;
 

@@ -745,9 +745,10 @@ pub fn vacuum_path(path: &Path) -> bool {
     }
 }
 
-/// 压缩所有年度数据库，返回**没能压缩**的年份（空 = 全部成功）。
+/// 压缩所有年度数据库，返回 [`MaintenanceReport`]（`failed_years` = 没压成的年份，
+/// `dir_error` = 连年度库都没列出来，一套都没碰）。
 ///
-/// 返回值是给 CLI 用的：`focusflow-cli --vacuum` 此前无论发生什么都退 0，
+/// 返回值是给 CLI 与 GUI 用的：`focusflow-cli --vacuum` 此前无论发生什么都退 0，
 /// 挂到计划任务上就是"每天准时什么都不做"，而日志在另一个地方。
 pub fn vacuum_all() -> MaintenanceReport {
     let mut report = MaintenanceReport::default();
@@ -785,13 +786,24 @@ pub fn maybe_auto_vacuum(auto_vacuum_days: i64) {
         if let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(&last) {
             let last_local = last_dt.with_timezone(&Local);
             let diff = Local::now().signed_duration_since(last_local);
-            if diff.num_days() < auto_vacuum_days {
+            // 负数 = `last_vacuum` 在未来（改过系统时间、NTP 往回校正）。旧写法
+            // `diff.num_days() < auto_vacuum_days` 在这种情况下永远成立，
+            // 于是自动压缩**到此为止**、再也没有下一次 —— 而且不留一行日志。
+            if diff.num_days() >= 0 && diff.num_days() < auto_vacuum_days {
                 return;
             }
         }
     }
 
-    let _ = vacuum_all();
+    let report = vacuum_all();
+    if report.incomplete() {
+        // 没做成就不盖 `last_vacuum`：盖了等于把这次失败又按住 auto_vacuum_days 天
+        tracing::warn!(
+            "自动 VACUUM 未完成，本次不记录时间戳：{}",
+            report.why_incomplete()
+        );
+        return;
+    }
     let now_str = chrono::DateTime::to_rfc3339(&chrono::Utc::now());
     if let Ok(conn) = connection::open_rw(&path) {
         let _ = conn.execute(

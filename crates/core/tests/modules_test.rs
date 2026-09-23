@@ -63,7 +63,7 @@ mod tests {
         scheduler::toggle_task(id, true);
         assert!(scheduler::get_all_tasks()[0].enabled);
 
-        assert!(scheduler::delete_task(id));
+        assert!(scheduler::delete_task(id).unwrap());
         assert!(scheduler::get_all_tasks().is_empty());
 
         // 调度描述
