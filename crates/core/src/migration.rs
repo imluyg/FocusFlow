@@ -68,6 +68,16 @@ pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
             continue;
         }
         let dst = paths::data_dir().join(aux);
+        // 自己导自己必须先看住：用户在目录选择器里挑到自己当前的 data/ 上是很常见的
+        // 误操作。下面那步留档用的是 rename —— 它会把"源文件"一起搬走，紧接着的
+        // copy 就找不到源了，结果是附属库从正名上消失、应用下次打开建一个空库，
+        // 表现就是"我的账记/日程数据没了"（文件其实还在，只是躺在 .import-backup-* 里）。
+        if same_file(&src, &dst) {
+            summary
+                .skipped
+                .push(format!("{aux}（源与目标是同一个文件，无需导入）"));
+            continue;
+        }
         // 现有库先留档再覆盖：导入目录是用户手选的，选错目录（或新版本里
         // 已记了几个月账）时当前数据不能就这么没了。
         match backup_before_overwrite(&dst) {
@@ -88,6 +98,17 @@ pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
     }
 
     summary
+}
+
+/// 两个路径是否指向同一个已存在的文件（用于看住"自己导自己"）。
+///
+/// 认不出来时返回 false：宁可照常走导入流程，也不要在读不了元数据的时候
+/// 悄悄跳过一份真正该导入的数据。
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
 }
 
 /// 覆盖前的留档：把现有文件改名成 `<原名>.import-backup-<时间戳>`。
@@ -294,5 +315,77 @@ fn read_import_marker(
             Ok(Some((size, mtime)))
         }
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 把**当前**数据目录当成导入源（目录选择器里挑到自己 data/ 上很常见）：
+    /// 附属库必须原地不动。
+    ///
+    /// 修之前留档那步 rename 会把"源文件"一起搬走，紧接着的 copy 找不到源而失败 ——
+    /// 附属库从正名上消失，应用下次打开时建一个空库，表现就是"我的账记数据没了"。
+    #[test]
+    fn importing_the_current_data_dir_keeps_aux_dbs_in_place() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("selfimport");
+        let data = crate::paths::data_dir();
+        let aux = data.join("focusflow_accounting.db");
+        std::fs::write(&aux, b"not a real db, but it must survive").unwrap();
+
+        let summary = import_legacy_data(&data);
+
+        assert!(
+            aux.is_file(),
+            "自导入把附属库从正名上弄丢了：{:?}",
+            summary.errors
+        );
+        assert!(
+            !summary.errors.iter().any(|e| e.contains("复制失败")),
+            "不该出现源文件已被搬走导致的复制失败：{:?}",
+            summary.errors
+        );
+        assert!(
+            summary.skipped.iter().any(|s| s.contains("同一个文件")),
+            "应说明为什么跳过：{:?}",
+            summary.skipped
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&data)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".import-backup-"))
+            .collect();
+        assert!(leftovers.is_empty(), "不该留下留档文件：{leftovers:?}");
+    }
+
+    /// 真正的跨目录导入仍须照旧覆盖并留档（上一条的守卫不能顺手把正常路径也挡掉）。
+    #[test]
+    fn importing_from_another_dir_still_overwrites_and_keeps_backup() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("crossimport");
+        let data = crate::paths::data_dir();
+        let aux = data.join("focusflow_accounting.db");
+        std::fs::write(&aux, b"current").unwrap();
+
+        let src_dir = _dir.path().join("old");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("focusflow_accounting.db"), b"legacy").unwrap();
+
+        let summary = import_legacy_data(&src_dir);
+
+        assert!(
+            summary.copied_aux.iter().any(|a| a.contains("accounting")),
+            "跨目录导入应照常复制：{:?}",
+            summary
+        );
+        assert_eq!(std::fs::read_to_string(&aux).unwrap(), "legacy");
+        let kept: Vec<_> = std::fs::read_dir(&data)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".import-backup-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "被覆盖的现有库必须留档一份");
     }
 }
