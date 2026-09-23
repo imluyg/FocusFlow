@@ -232,27 +232,60 @@ fn import_legacy(src_dir: &str) -> i32 {
     }
 }
 
+/// `--stats` / `--devices` 的周期。
+enum Period {
+    Today,
+    All,
+    Days(i64),
+}
+
+/// 解析周期参数，语义与 UI 的 `set_period` 完全一致：`-1` = 今日、`0` = 总计、
+/// `1..=MAX_QUERY_DAYS` = 最近 N 天，`today` / `all` 是字面量别名。
+///
+/// 之前这里只 `parse::<i64>()` 成功就用，于是 `-5`、`99999999999` 都能通过，而查询层
+/// 会把天数静默钳进 `1..=MAX_QUERY_DAYS` —— 标题写着"最近 -5 天"、拿到的却是 1 天的
+/// 数据。诊断工具给出一套对不上的口径，比直接报错更糟。
+fn parse_period(arg: &str) -> Result<Period, String> {
+    let lower = arg.to_lowercase();
+    let n = match lower.as_str() {
+        "today" => return Ok(Period::Today),
+        "all" => return Ok(Period::All),
+        other => other
+            .parse::<i64>()
+            .map_err(|_| format!("无效的参数: {arg}（应为数字、today 或 all）"))?,
+    };
+    if !db::queries::is_valid_period(n) {
+        return Err(format!(
+            "无效的天数: {n}（-1 = 今日，0 = 总计，1..={} = 最近 N 天）",
+            db::queries::MAX_QUERY_DAYS
+        ));
+    }
+    Ok(match n {
+        -1 => Period::Today,
+        0 => Period::All,
+        d => Period::Days(d),
+    })
+}
+
 fn print_stats(_db: &db::Database, period: &str) -> i32 {
-    let (total, stats, label) = match period.to_lowercase().as_str() {
-        "today" => {
+    let (total, stats, label) = match parse_period(period) {
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+        Ok(Period::Today) => {
             let d = Local::now().date_naive();
             let (t, s) = db::get_stats_by_date(d);
             (t, s, "今日".to_string())
         }
-        "all" => {
+        Ok(Period::All) => {
             let (t, s) = db::get_stats(None, None);
             (t, s, "总计".to_string())
         }
-        _ => match period.parse::<i64>() {
-            Ok(days) => {
-                let (t, s) = db::get_stats(Some(days), None);
-                (t, s, format!("最近 {days} 天"))
-            }
-            Err(_) => {
-                eprintln!("无效的参数: {period}（应为数字、today 或 all）");
-                return 1;
-            }
-        },
+        Ok(Period::Days(days)) => {
+            let (t, s) = db::get_stats(Some(days), None);
+            (t, s, format!("最近 {days} 天"))
+        }
     };
 
     println!("\n{}", "=".repeat(50));
@@ -287,25 +320,23 @@ fn print_stats(_db: &db::Database, period: &str) -> i32 {
 
 /// 设备维度统计：各键鼠设备的输入次数与占比（独立口径，见 device_stats.rs）。
 fn print_devices(_db: &db::Database, period: &str) -> i32 {
-    let (total, devices, label) = match period.to_lowercase().as_str() {
-        "today" => {
+    let (total, devices, label) = match parse_period(period) {
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+        Ok(Period::Today) => {
             let (t, s) = db::get_device_stats_by_date(Local::now().date_naive());
             (t, s, "今日".to_string())
         }
-        "all" => {
+        Ok(Period::All) => {
             let (t, s) = db::get_device_stats(None, None);
             (t, s, "总计".to_string())
         }
-        _ => match period.parse::<i64>() {
-            Ok(days) => {
-                let (t, s) = db::get_device_stats(Some(days), None);
-                (t, s, format!("最近 {days} 天"))
-            }
-            Err(_) => {
-                eprintln!("无效的参数: {period}（应为数字、today 或 all）");
-                return 1;
-            }
-        },
+        Ok(Period::Days(days)) => {
+            let (t, s) = db::get_device_stats(Some(days), None);
+            (t, s, format!("最近 {days} 天"))
+        }
     };
 
     println!("\n{}", "=".repeat(60));
@@ -587,6 +618,23 @@ fn reset(_db: &db::Database) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{export_csv, export_html};
+    use super::{parse_period, Period};
+
+    /// 周期参数必须与 UI 的 `set_period` 同一口径，越界值要报错而不是被静默钳制。
+    #[test]
+    fn period_argument_matches_the_ui_semantics() {
+        assert!(matches!(parse_period("today"), Ok(Period::Today)));
+        assert!(matches!(parse_period("ALL"), Ok(Period::All)));
+        assert!(matches!(parse_period("7"), Ok(Period::Days(7))));
+        // -1 / 0 在 UI 里就是今日 / 总计，之前会被印成"最近 -1 天""最近 0 天"
+        assert!(matches!(parse_period("-1"), Ok(Period::Today)));
+        assert!(matches!(parse_period("0"), Ok(Period::All)));
+        // 越界与非法：以前 -5 会被钳成 1 天、99999999999 被钳成上限，
+        // 表格照出、标题却印着原始数字
+        for bad in ["-5", "99999999999", "abc", "", " "].iter() {
+            assert!(parse_period(bad).is_err(), "{bad} 应当被拒绝");
+        }
+    }
     use std::collections::HashMap;
 
     /// 回归：CLI 导出曾直接拼接键名 —— 带逗号的键名会让 CSV 串列、
