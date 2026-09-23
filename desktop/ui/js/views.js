@@ -395,13 +395,16 @@ function deviceDetailHtml(d) {
     )
     .join("");
   const keySection = d.has_key_detail
-    ? `<div class="dev-detail-line" style="margin-top:12px;">键鼠明细（${periodText(d.period)}）</div>
+    ? keys.length
+      ? `<div class="dev-detail-line" style="margin-top:12px;">键鼠明细（${periodText(d.period)}）</div>
        <table class="grid"><thead><tr>
          <th class="col-rank">排名</th><th class="col-key">键名</th><th class="col-count">次数</th><th class="col-percent">占比</th>
        </tr></thead><tbody>${rows}</tbody></table>
        <div class="dev-detail-line" style="font-size:12px;margin-top:6px;">
          共 <b>${keys.length}</b> 个键位，按次数降序${keys.length > TOP ? `（显示前 ${TOP}）` : ""}。
        </div>`
+      : `<div class="empty" style="margin-top:12px;">本周期该设备没有键名明细<br>
+         <span style="font-size:12px;color:var(--muted);">它其它时间是记过的，把周期换长一点就能看到</span></div>`
     : `<div class="empty" style="margin-top:12px;">该设备暂无键名明细<br>
          <span style="font-size:12px;color:var(--muted);">键名明细从该功能上线后开始积累，此前的历史数据无法回溯</span></div>`;
 

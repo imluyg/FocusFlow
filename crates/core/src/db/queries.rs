@@ -998,14 +998,45 @@ pub struct DeviceDetail {
     /// 周期内键名明细的总次数（占比分母；与 period_count 可能略有出入：
     /// 旧版本只记了次数没记键名的部分不会有明细）
     pub key_total: i64,
-    /// 该设备是否有键名明细（区分「没有数据」与「明细为 0」）
+    /// 该设备**任何时候**有没有键名明细（区分「从没记过」与「本周期没有」）。
+    /// 周期内有没有数据看 `keys` 是否为空，不要拿这个字段代替。
     pub has_key_detail: bool,
+}
+
+/// 该设备在任何年份库里有没有一条键名明细。
+///
+/// 与「本周期内有没有」是两件事，混起来会对着设备说谎：点「今日」看一台
+/// 上周还在用、今天没按过的鼠标，界面说的是"键名明细从该功能上线后开始积累，
+/// 此前的历史数据无法回溯"，而那台鼠标库里其实有几十条明细。
+fn device_has_key_detail(device_key: &str) -> bool {
+    for year in query_years(None, None) {
+        let path = paths::year_db_path(year);
+        let found = connection::with_ro_conn(&path, |conn| {
+            if !table_exists(conn, "device_key_counts") {
+                return None;
+            }
+            let mut stmt = conn
+                .prepare(
+                    "SELECT 1 FROM device_key_counts k \
+                     JOIN devices d ON d.id = k.device_id \
+                     WHERE d.device_key = ?1 LIMIT 1",
+                )
+                .ok()?;
+            Some(stmt.exists([device_key]).unwrap_or(false))
+        })
+        .flatten()
+        .unwrap_or(false);
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 /// 单设备在周期内的键名排行（跨年度库合并，次数降序）。
 ///
 /// 表不存在（旧库）时返回空 —— 键名明细从该功能上线后开始积累，历史无法回溯。
-fn device_key_rows(device_key: &str, period: i64) -> (Vec<(String, i64)>, bool) {
+fn device_key_rows(device_key: &str, period: i64) -> Vec<(String, i64)> {
     let today_key = day_key_of_date(Local::now().date_naive());
     let start_key = match period {
         -1 => Some(today_key),
@@ -1013,7 +1044,6 @@ fn device_key_rows(device_key: &str, period: i64) -> (Vec<(String, i64)>, bool) 
         n => Some(today_key - (n.max(1) - 1)),
     };
     let mut merged: HashMap<String, i64> = HashMap::new();
-    let mut present = false;
     for year in query_years(None, None) {
         let path = paths::year_db_path(year);
         let rows = connection::with_ro_conn(&path, |conn| {
@@ -1054,13 +1084,12 @@ fn device_key_rows(device_key: &str, period: i64) -> (Vec<(String, i64)>, bool) 
             Some(list)
         });
         for (name, c) in rows.flatten().unwrap_or_default() {
-            present = true;
             *merged.entry(name).or_insert(0) += c;
         }
     }
     let mut list: Vec<(String, i64)> = merged.into_iter().collect();
     list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    (list, present)
+    list
 }
 
 /// 单设备按天次数序列（跨年度库合并，date_key 升序）。
@@ -1160,7 +1189,7 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
         .unwrap_or(0);
 
     // 周期内键名排行（设备 × 键名明细；旧库无该表时为空）
-    let (key_rows, has_keys) = device_key_rows(device_key, period);
+    let key_rows = device_key_rows(device_key, period);
     let key_total: i64 = key_rows.iter().map(|(_, c)| *c).sum();
 
     // 近 30 天分布（缺数据补 0，便于前端直接画柱）
@@ -1218,7 +1247,7 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
         trend,
         keys: key_rows,
         key_total,
-        has_key_detail: has_keys,
+        has_key_detail: device_has_key_detail(device_key),
     }
 }
 
@@ -1682,6 +1711,78 @@ mod tests {
         // 按单年查询不受影响
         assert_eq!(get_device_stats(None, Some(this_year)).0, 60);
         assert_eq!(get_device_stats(None, Some(prev_year)).0, 45);
+    }
+
+    /// `has_key_detail` 问的是"这台设备记过键名明细吗"，不是"本周期里有吗"。
+    ///
+    /// 两者混起来时，点「今日」看一台只在上周按过的鼠标，界面会说
+    /// "键名明细从该功能上线后开始积累，此前的历史数据无法回溯" —— 而库里
+    /// 其实有它的明细（他机器上就有这种设备：明细全落在 09-22 那一天）。
+    #[test]
+    fn device_key_detail_flag_is_not_period_scoped() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("devflag");
+
+        let today = Local::now().date_naive();
+        let dk = day_key_of_date(today);
+        let old = "HID#VID_046D&PID_C52B&MI_00#old";
+        let never = "HID#VID_046D&PID_C52B&MI_00#never";
+        {
+            let path = paths::year_db_path(today.year());
+            let conn = crate::db::connection::open_rw(&path).unwrap();
+            crate::db::connection::ensure_schema(&conn, today.year()).unwrap();
+            for (key, kind) in [(old, "mouse"), (never, "mouse")] {
+                conn.execute(
+                    "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![key, format!("HID 鼠标 · {kind}"), kind],
+                )
+                .unwrap();
+            }
+            let dev_id = |key: &str| -> i64 {
+                crate::db::connection::device_id_of(&conn, key).expect("设备 id")
+            };
+            // 两台设备今天都有按键次数（否则压根进不了详情入口）
+            for key in [old, never] {
+                conn.execute(
+                    "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![dk, dev_id(key), 7],
+                )
+                .unwrap();
+            }
+            // 但只有 `old` 记过键名明细，而且记在 5 天前
+            conn.execute(
+                "INSERT INTO device_key_counts (date_key, device_id, key_name, count) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![dk - 5, dev_id(old), "空格", 30],
+            )
+            .unwrap();
+        }
+        crate::device_alias::invalidate_cache();
+
+        let today_view = get_device_detail(old, -1);
+        assert!(
+            today_view.keys.is_empty(),
+            "今日确实没有明细（这条前提要成立，下面的断言才有意义）"
+        );
+        assert!(
+            today_view.has_key_detail,
+            "「本周期没有明细」不等于「这台设备没记过明细」"
+        );
+        let all_view = get_device_detail(old, 0);
+        assert!(all_view.has_key_detail);
+        assert_eq!(
+            all_view
+                .keys
+                .iter()
+                .find(|(k, _)| k == "空格")
+                .map(|(_, c)| *c),
+            Some(30),
+            "换成长周期就该看到那条明细"
+        );
+        assert!(
+            !get_device_detail(never, -1).has_key_detail,
+            "从没记过明细的设备仍然要报 false，否则新文案就没意义了"
+        );
     }
 
     /// 登记名被写成裸设备路径时（历史脏登记）不计为真名，一律走回退。
