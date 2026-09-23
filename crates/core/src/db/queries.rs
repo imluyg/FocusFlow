@@ -129,20 +129,38 @@ pub(crate) fn local_utc_offset_seconds() -> i64 {
     Local::now().offset().local_minus_utc() as i64
 }
 
+/// 历元日期（1970-01-01）。取不到只可能是 chrono 自己出错，所以宁可退回 MIN
+/// 也不在这儿 panic：release 是 `panic = "abort"`。
+fn unix_epoch_date() -> chrono::NaiveDate {
+    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or(chrono::NaiveDate::MIN)
+}
+
 /// Unix 秒 → 本地时区天数序号（1970-01-01 起）。
+///
+/// 只在**写入侧**用（`writer.rs` 给刚发生的按键算桶），那里 `now` 的偏移就是
+/// 那个时刻的偏移，结果与"该瞬时的本地日期序号"一致。
 pub(crate) fn day_key_of_ts(ts: i64) -> i64 {
     (ts + local_utc_offset_seconds()).div_euclid(86_400)
 }
 
-/// 本地日期 → 天数序号。
+/// 本地日期 → 天数序号：序号的定义就是"该日期距 1970-01-01 多少天"。
+///
+/// 原先写成 `day_key_of_ts(local_day_start_ts(date))`，绕一圈把该日零点的 Unix 秒
+/// 再**加上此刻的**偏移：查一个偏移与今天不同的日期（有夏令时的时区里，冬天查夏天
+/// 的日子）就少一天 —— 而查询条件是日期，少一天等于取回隔壁那天的数据，还不报错。
+/// UTC+8 这种固定偏移看不出任何问题，所以这条一直没被撞到。
+/// 与写入侧的等价性：同一天的 `ts + 当天偏移` 整除 86400 恰得该日期的历元天数。
 pub(crate) fn day_key_of_date(date: chrono::NaiveDate) -> i64 {
-    day_key_of_ts(local_day_start_ts(date))
+    date.signed_duration_since(unix_epoch_date()).num_days()
 }
 
-/// 天数序号 → 本地日期。
+/// 天数序号 → 本地日期：纯日历换算（见 `day_key_of_date` 里序号的定义）。
+///
+/// 原先是 `from_timestamp(day_key * 86_400).with_timezone(&Local)`，等于把时区偏移
+/// **第二次**加上去：正偏移（含 UTC+8）恰好还在同一天所以看不出来，负偏移（美洲）
+/// 会把每一行日数据标到前一天。
 pub(crate) fn day_key_to_date(day_key: i64) -> Option<chrono::NaiveDate> {
-    chrono::DateTime::from_timestamp(day_key * 86_400, 0)
-        .map(|dt| dt.with_timezone(&Local).date_naive())
+    unix_epoch_date().checked_add_days(chrono::Days::new(u64::try_from(day_key).ok()?))
 }
 
 /// Unix 秒 → 当日小时（0-23，本地时区）。
@@ -1245,6 +1263,64 @@ fn local_day_start_ts(date: chrono::NaiveDate) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 日期 ↔ 天数序号必须原样往返。
+    ///
+    /// 说明清楚它的适用边界：在 UTC+8 这台机器上，改前改后都过 —— 老实现的错要
+    /// 在**负偏移时区**（`day_key_to_date` 把偏移加了第二次 → 每行日数据标到前一天）
+    /// 或**有夏令时的时区**（`day_key_of_date` 加的是"此刻"的偏移 → 冬天查夏天少一天）
+    /// 才露出来。留着它是为了让任何一次时区相关的改动都不能悄悄把这条不变量弄坏，
+    /// 也是 CI（跑在别的时区）上的真守卫。
+    #[test]
+    fn day_key_roundtrips_over_eight_hundred_days() {
+        let base = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("date");
+        for i in 0..800u64 {
+            let d = base + chrono::Days::new(i);
+            let k = day_key_of_date(d);
+            assert_eq!(day_key_to_date(k), Some(d), "{d} -> {k} -> 反算不一致");
+        }
+        // 序号就是"距 1970-01-01 的天数"，与本机时区无关
+        assert_eq!(
+            day_key_of_date(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("date")),
+            0
+        );
+        assert_eq!(
+            day_key_of_date(chrono::NaiveDate::from_ymd_opt(1970, 1, 2).expect("date")),
+            1
+        );
+        assert_eq!(
+            day_key_of_date(base + chrono::Days::new(365)) - day_key_of_date(base),
+            365
+        );
+    }
+
+    /// 查询用的日期序号，必须等于写入侧给"该日中午那个瞬时"算出的序号。
+    ///
+    /// 取中午是刻意避开夏令时切换的那一小时（那里任何按瞬时分桶的写法都有歧义）。
+    #[test]
+    fn day_key_of_date_matches_the_instant_based_key_at_local_noon() {
+        use chrono::{Local, TimeZone};
+        for (y, m, d) in [
+            (2024, 1, 5),
+            (2024, 3, 31),
+            (2024, 7, 1),
+            (2024, 10, 27),
+            (2025, 12, 31),
+        ] {
+            let date = chrono::NaiveDate::from_ymd_opt(y, m, d).expect("date");
+            let naive = date.and_hms_opt(12, 0, 0).expect("noon");
+            let ts = Local
+                .from_local_datetime(&naive)
+                .latest()
+                .expect("可解析")
+                .timestamp();
+            assert_eq!(
+                day_key_of_date(date),
+                day_key_of_ts(ts),
+                "{date} 的查询序号与写入侧分桶不一致"
+            );
+        }
+    }
 
     /// 空壳年度库不该再算进 `available_years()`。
     ///

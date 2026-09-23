@@ -177,8 +177,12 @@ pub fn run() {
         .run(|app_handle, event| {
             // 退出前优雅关闭数据库：flush + 备份 + 停止写线程
             if let tauri::RunEvent::Exit = event {
-                // 配置去抖写盘：退出前强制落盘，避免丢失最后的设置
-                let _ = focusflow_core::config::instance().save();
+                // 配置去抖写盘：退出前强制落盘，避免丢失最后的设置。
+                // 这里原先是 `let _ =`，是全仓唯一不记日志的配置写失败 —— 杀软或另一份
+                // 实例握着 config.ini 时，最后这次改动没了，日志里一个字都没有。
+                if let Err(e) = focusflow_core::config::instance().save() {
+                    tracing::warn!("退出前落盘配置失败，最后一次改动可能丢失: {e}");
+                }
 
                 if let Some(state) = app_handle.try_state::<std::sync::Arc<state::AppState>>() {
                     let db = std::sync::Arc::clone(&state.db);
