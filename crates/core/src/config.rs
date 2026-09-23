@@ -105,6 +105,75 @@ const DEPRECATED_CONFIG: &[(&str, &[&str])] = &[
     ("stats", &["today_count_cache_ttl"]),
 ];
 
+/// 解析 INI：兼容 Python configparser 的 `#`/`;` 注释与 `key = value` 语法。
+///
+/// 开头的 BOM 必须先剥掉：PowerShell 5.1 的 `>`/`Out-File`、记事本另存为 UTF-8 都会
+/// 写一个 U+FEFF，而它**不算空白**（`char::is_whitespace` 为 false），`trim()` 去不掉。
+/// 留着的话首行是 `\u{FEFF}[database]`，不是合法的 section 头 → 第一个 section 的
+/// 键全被丢掉；而 `load()` 结尾无条件 `save()`，于是用户自己的 `[database]` 配置
+/// 直接被默认值覆盖回写进文件 —— 静默丢配置，不只是这次读错。
+fn parse_ini(text: &str) -> HashMap<String, HashMap<String, String>> {
+    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut current_section: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            current_section = Some(line[1..line.len() - 1].trim().to_string());
+            continue;
+        }
+        let Some(section) = current_section.clone() else {
+            continue;
+        };
+        if let Some(eq) = line.find('=') {
+            let key = line[..eq].trim().to_string();
+            let val = line[eq + 1..].trim().to_string();
+            // 去掉可能带有的引号
+            let val = val
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(&val)
+                .to_string();
+            out.entry(section).or_default().insert(key, val);
+        }
+    }
+    out
+}
+
+/// 把文件里"内存从没有过"的键回填进待写快照（内存里已有的键一律以内存为准）。
+///
+/// `save()` 写的是内存快照，而本项目到处是"你去 config.ini 里加一行"的提示语
+/// （例如 `[scheduler] allow_extra`，见 scheduler.rs 的拒绝原因文案）。不回填的话，
+/// 用户照提示加完那一行，下一次任何一次设置变更 —— 甚至只是拖动悬浮窗写
+/// `[floating] pos_x` —— 就把他手加的键整个抹掉。
+/// 废弃键不参与回填：`load()` 刻意把它们清掉，回填等于复活它们。
+fn merge_unknown_keys(
+    snapshot: &mut HashMap<String, HashMap<String, String>>,
+    path: &std::path::Path,
+) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return; // 文件不存在/正被占用：本次照旧只写内存快照
+    };
+    for (section, keys) in parse_ini(&text) {
+        for (key, val) in keys {
+            if DEPRECATED_CONFIG
+                .iter()
+                .any(|(s, ks)| *s == section && ks.contains(&key.as_str()))
+            {
+                continue;
+            }
+            snapshot
+                .entry(section.clone())
+                .or_default()
+                .entry(key)
+                .or_insert(val);
+        }
+    }
+}
+
 /// 线程安全的配置管理器。
 ///
 /// 通过 `FocusFlowConfig::instance()` 获得进程级单例（镜像 Python 的全局 `config`）。
@@ -124,31 +193,8 @@ impl FocusFlowConfig {
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
-                    // 解析 INI：兼容 Python configparser 的 `#`/`;` 注释与 `key = value` 语法。
-                    let mut current_section: Option<String> = None;
-                    for line in text.lines() {
-                        let line = line.trim();
-                        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-                            continue;
-                        }
-                        if line.starts_with('[') && line.ends_with(']') {
-                            current_section = Some(line[1..line.len() - 1].trim().to_string());
-                            continue;
-                        }
-                        let Some(section) = current_section.clone() else {
-                            continue;
-                        };
-                        if let Some(eq) = line.find('=') {
-                            let key = line[..eq].trim().to_string();
-                            let val = line[eq + 1..].trim().to_string();
-                            // 去掉可能带有的引号
-                            let val = val
-                                .strip_prefix('"')
-                                .and_then(|v| v.strip_suffix('"'))
-                                .unwrap_or(&val)
-                                .to_string();
-                            values.entry(section.clone()).or_default().insert(key, val);
-                        }
+                    for (section, keys) in parse_ini(&text) {
+                        values.entry(section).or_default().extend(keys);
                     }
                 }
                 Err(e) => {
@@ -214,6 +260,8 @@ impl FocusFlowConfig {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let mut snapshot = snapshot;
+        merge_unknown_keys(&mut snapshot, &self.path);
         let mut out = String::new();
         // 固定 section 顺序，与 Python 版一致，便于阅读与 diff。
         let order = [
@@ -475,5 +523,79 @@ theme = light
         assert!(cfg.get("stats", "today_count_cache_ttl").is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// BOM 不许吃掉第一个 section —— 吃掉之后还会被回写坐实成"配置没了"。
+    ///
+    /// PowerShell 5.1 的 `>` / `Out-File`、记事本的"另存为 UTF-8"都会写 BOM，
+    /// 而 `[database]` 正好是本项目 config.ini 的第一个 section。
+    #[test]
+    fn utf8_bom_does_not_eat_the_first_section() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("cfg_bom");
+        let path = dir.path().join("config.ini");
+        std::fs::write(
+            &path,
+            "\u{feff}[database]\nmax_backups = 99\n[gui]\ntheme = dark\n",
+        )
+        .unwrap();
+
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.get_int("database", "max_backups", 0),
+            99,
+            "BOM 之后第一个 section 的键必须读得到"
+        );
+        assert_eq!(cfg.get("gui", "theme"), "dark");
+        // load() 结尾会 save() 一次：读不到就会被默认值覆盖回写进文件，
+        // 所以这里查的是**文件**而不是内存 —— 用户下次打开看到的正是它。
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("max_backups = 99"),
+            "用户配置不该被默认值盖掉:\n{after}"
+        );
+        assert!(
+            !after.starts_with('\u{feff}'),
+            "回写不必再把 BOM 带回去:\n{after}"
+        );
+    }
+
+    /// 用户照提示语手加的行，必须活得过程序自己的每一次保存。
+    ///
+    /// `save()` 写的是内存快照，而代码里到处是"去 config.ini 加一行"的提示
+    /// （`[scheduler] allow_extra` 就是 scheduler 拒绝启动某程序时给的话）。
+    #[test]
+    fn hand_added_keys_survive_program_saves() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("cfg_handedit");
+        let path = dir.path().join("config.ini");
+        std::fs::write(&path, "[stats]\ntoday_count_cache_ttl = 10\n").unwrap();
+
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+        // 关键在"启动之后"：程序已经在跑了，用户这才照提示语往文件里加一行
+        // （另开一个 CLI 进程写文件是同一形状）。load 时见过的键本来就在内存里，
+        // 验不到回填这条路。
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("[scheduler]\nallow_extra = mytool.exe\n");
+        std::fs::write(&path, &text).unwrap();
+
+        // 触发一次整文件重写。刻意不调 `set()`：它把信号发给**全局**去抖保存线程，
+        // 那个线程在 300ms 后才写 `instance()` 的路径 —— 而 instance 的 app_dir
+        // 可能是别的用例已经删掉的临时目录，写它等于把目录建回来（实测每个全量
+        // 跑完 %TEMP% 多一个 ff_archive_*/config.ini）。
+        cfg.save().unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("allow_extra = mytool.exe"),
+            "手加的白名单不该被保存抹掉:\n{after}"
+        );
+        assert!(
+            after.contains("theme = light"),
+            "内存里已有的默认键照旧要写进去（证明文件真被重写过）:\n{after}"
+        );
+        assert!(
+            !after.contains("today_count_cache_ttl"),
+            "废弃键不该靠回填复活:\n{after}"
+        );
     }
 }

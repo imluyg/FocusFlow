@@ -55,6 +55,7 @@ fn open() -> rusqlite::Result<Connection> {
 /// - 分类盈亏/月度分类明细里出现一个**名字为空**的行（`(未分类)` 只兜住了 NULL），
 ///   插件把它拼成 `"  : 12.00"` 这样一行看不出是谁的数；
 /// - 与旧版 Python 导入的 NULL 分成两组，同一个"没分类"被拆成两行、各自的数都不对。
+///
 /// 顺带 trim：`"餐饮"` 与 `" 餐饮"` 在 GROUP BY 里也是两个分类。
 fn blank_to_none(raw: Option<&str>) -> Option<String> {
     let trimmed = raw.map(str::trim).filter(|s| !s.is_empty())?;

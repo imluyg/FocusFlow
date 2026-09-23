@@ -686,18 +686,27 @@ fn arm_main_unload(app: &tauri::AppHandle) {
             let Some(win) = handle.get_webview_window("main") else {
                 return;
             };
-            let _guard = MAIN_UNLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // 锁内二次确认：令牌未过期、窗口仍隐藏
-            if MAIN_UNLOAD_EPOCH.load(Ordering::SeqCst) != token || win.is_visible().unwrap_or(true)
-            {
+            // 两个 getter 必须在拿锁**之前**读。`is_visible()`/`url()` 在
+            // tauri-runtime-wry 里是"把请求投进主循环、然后无超时等回话"；而主线程的
+            // show_main 正等着同一把 MAIN_UNLOAD_LOCK —— 锁里等主循环 = 两边互等死锁，
+            // 表现是主窗口再也打不开，统计线程随后也卡在自己的 is_visible() 上。
+            // 拿锁后只用原子量复核：显示路径会推进 MAIN_UNLOAD_EPOCH，让本轮作废。
+            let visible = win.is_visible().unwrap_or(true);
+            let page_url = win.url().ok();
+            if visible {
                 return;
             }
-            // 页面已经卸载过：绝不能再次记录恢复 URL。此刻 win.url() 是 about:blank，
+            let _guard = MAIN_UNLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // 锁内二次确认：令牌未过期（期间发生过显示/重新安排卸载）
+            if MAIN_UNLOAD_EPOCH.load(Ordering::SeqCst) != token {
+                return;
+            }
+            // 页面已经卸载过：绝不能再次记录恢复 URL。此刻页面就是 about:blank，
             // 覆盖进去会让主窗口永远恢复不出来（见 MAIN_UNLOAD_EPOCH 注释）。
             if MAIN_UNLOADED.load(Ordering::SeqCst) {
                 return;
             }
-            let Ok(url) = win.url() else {
+            let Some(url) = page_url else {
                 return;
             };
             // 兜底：窗口本来就停在空白页（没有可恢复的页面），不做无意义的"卸载"
@@ -1073,7 +1082,13 @@ fn spawn_stats_worker(
                     || alltime_max.is_none()
                     || day_ce != alltime_cache_day
                     || (alltime_cache_today >= 0
-                        && cur_today - alltime_cache_today >= ALLTIME_RECALC_THRESHOLD);
+                        // 写线程的今日计数只在**新的一天第一次按键**时才归零，所以跨过
+                        // 零点后的第一轮重建会把"昨天的计数"当成今天的基准 stamp 进去
+                        // —— 之后 cur_today 一直小于它，`cur_today - 基准` 恒为 0，
+                        // 「总计」卡片整整一天都不再动。计数往回走本身就说明换了天，
+                        // 用它再触发一次重建，把基准重新钉在新的一天上。
+                        && (cur_today - alltime_cache_today >= ALLTIME_RECALC_THRESHOLD
+                            || cur_today < alltime_cache_today));
 
                 // 重聚合节奏随主窗口可见性自适应：
                 // - 主窗口打开：活跃（打字）时每 active_refresh_interval 秒刷新一次图表；
@@ -1139,6 +1154,14 @@ fn spawn_stats_worker(
                     if charts_unchanged {
                         last_heavy = Instant::now();
                     } else {
+                        // 只要真的走了重算这一支，就得记下"这次重算的时刻与当时的今日计数"。
+                        // 原先只在 `alltime_dirty` 里记：而 `charts_unchanged` 带着
+                        // `period_val != 0` 的条件，于是**总计周期（period=0，也是
+                        // [gui] default_period 的默认值）永远走不到那条"空闲且数据未变就
+                        // u64::MAX"的分支** —— 节奏一旦到期就每 500ms 重算+推送一次，
+                        // 人走了也不停（`last_heavy_today` 同样从不更新，永远"数据有变化"）。
+                        last_heavy = Instant::now();
+                        last_heavy_today = cur_today;
                         // 全历史最高单日（全表 ORDER BY，最贵的单项查询）：仅缓存失效时重查
                         if alltime_dirty {
                             // 请求写线程落库（非阻塞：只发信号，不在这里等）。
@@ -1153,8 +1176,6 @@ fn spawn_stats_worker(
                                     w.flush(false);
                                 }
                             }
-                            last_heavy = Instant::now();
-                            last_heavy_today = cur_today;
                             let today_str = chrono::Local::now()
                                 .date_naive()
                                 .format("%Y-%m-%d")
