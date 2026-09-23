@@ -22,6 +22,7 @@
 /desktop/target/
 
 # AI 助手 / 编辑器的工作目录与说明文件：属个人环境，不入库
+.scratch/
 .zcode/
 .claude/
 .cursor/
