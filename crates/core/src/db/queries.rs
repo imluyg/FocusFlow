@@ -74,23 +74,34 @@ pub fn invalidate_years_cache() {
 /// 归档/清理留下的空壳都会在这里被滤掉，否则调用方（统计聚合、备份、VACUUM）
 /// 每年都要为它们白跑一轮。打不开的文件保守地当作有数据。
 pub fn available_years() -> Vec<i32> {
+    try_available_years().unwrap_or_default()
+}
+
+/// 同 [`available_years`]（同一份缓存与口径），但把"数据目录读不出来"与
+/// "真的一个年份都没有"分开返回。
+///
+/// 破坏性命令必须走这一条：`available_years()` 在 `read_dir` 失败时给的是空列表，
+/// 于是 `--reset` 一行没删却照样打印"所有统计记录已清空 (0 行)"并退 0 ——
+/// 用户以为追踪数据已经抹掉了，其实还在盘上。
+pub fn try_available_years() -> anyhow::Result<Vec<i32>> {
     let key = cache_key();
     {
         let c = years_cache().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = c.get(&key) {
             if let Some(built) = entry.0 {
                 if built.elapsed() < YEARS_CACHE_TTL {
-                    return entry.1.clone();
+                    return Ok(entry.1.clone());
                 }
             }
         }
     }
     let mut years: Vec<i32> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(paths::data_dir()) {
-        for entry in entries.flatten() {
-            if let Some(year) = paths::is_year_db_file(&entry.path()) {
-                years.push(year);
-            }
+    let dir = paths::data_dir();
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| anyhow::anyhow!("读取数据目录 {} 失败: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        if let Some(year) = paths::is_year_db_file(&entry.path()) {
+            years.push(year);
         }
     }
     // 只保留真的有聚合行的年份。空壳年度库会永久出现在这个列表里，于是每轮刷新
@@ -102,7 +113,7 @@ pub fn available_years() -> Vec<i32> {
     years.sort_unstable_by(|a, b| b.cmp(a));
     let mut c = years_cache().lock().unwrap_or_else(|e| e.into_inner());
     c.insert(key, (Some(Instant::now()), years.clone()));
-    years
+    Ok(years)
 }
 
 /// 这个年度库里还有没有聚合数据行（空壳判定用）。

@@ -583,12 +583,46 @@ pub struct MaintenanceReport {
     pub deleted: i64,
     /// 没能处理完的年份：空 = 全程顺利
     pub failed_years: Vec<i32>,
+    /// 连"有哪些年份"都没问出来（数据目录读不出来）。
+    ///
+    /// 这一条与 `failed_years` 分开是有必要的：前者意味着**一套库都没碰过**，
+    /// 后者意味着碰过且失败了若干个具体年份。混在一起的话，`--reset` 在目录
+    /// 读不出来时会打印"所有统计记录已清空 (0 行)"并退 0 —— 用户以为数据抹了。
+    pub dir_error: Option<String>,
 }
 
 impl MaintenanceReport {
-    /// 是否有年份被跳过（CLI 据此决定退出码）。
+    /// 是否有年份被跳过、或干脆没枚举到年份（CLI 据此决定退出码）。
     pub fn incomplete(&self) -> bool {
-        !self.failed_years.is_empty()
+        !self.failed_years.is_empty() || self.dir_error.is_some()
+    }
+
+    /// 一句能直接给人看的话：哪儿没成、为什么。
+    pub fn why_incomplete(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(e) = &self.dir_error {
+            parts.push(format!("没能列出数据目录里的年度库（{e}）—— 一套库都没碰"));
+        }
+        if !self.failed_years.is_empty() {
+            parts.push(format!("这些年份没做成: {:?}", self.failed_years));
+        }
+        parts.join("；")
+    }
+}
+
+/// 破坏性命令开头的年度枚举：读不到目录就必须带着原因退回去。
+///
+/// 三个改写型命令（清理 / 压缩 / 重置）原先都直接 `for year in available_years()`，
+/// 而那个函数把"read_dir 失败"折叠成空列表 —— 于是"什么都没做"和"确实没东西可做"
+/// 在回报里长得一模一样。
+fn years_or_record(report: &mut MaintenanceReport) -> Option<Vec<i32>> {
+    match queries::try_available_years() {
+        Ok(years) => Some(years),
+        Err(e) => {
+            tracing::error!("枚举年度库失败，本次什么都没做: {e}");
+            report.dir_error = Some(e.to_string());
+            None
+        }
     }
 }
 
@@ -608,7 +642,10 @@ pub fn cleanup_old_data(keep_days: i64) -> CleanupReport {
     // 之后所有年份的删除。反过来，先抢在循环外无条件备份会让「其实没什么可删」
     // 的清理白写一套快照，挤掉 max_backups 的近期名额。
     let mut snapshotted = false;
-    for year in queries::available_years() {
+    let Some(years) = years_or_record(&mut report) else {
+        return report;
+    };
+    for year in years {
         let path = paths::year_db_path(year);
         let conn = match connection::open_rw(&path) {
             Ok(c) => c,
@@ -712,14 +749,17 @@ pub fn vacuum_path(path: &Path) -> bool {
 ///
 /// 返回值是给 CLI 用的：`focusflow-cli --vacuum` 此前无论发生什么都退 0，
 /// 挂到计划任务上就是"每天准时什么都不做"，而日志在另一个地方。
-pub fn vacuum_all() -> Vec<i32> {
-    let mut failed = Vec::new();
-    for year in queries::available_years() {
+pub fn vacuum_all() -> MaintenanceReport {
+    let mut report = MaintenanceReport::default();
+    let Some(years) = years_or_record(&mut report) else {
+        return report;
+    };
+    for year in years {
         if !vacuum_path(&paths::year_db_path(year)) {
-            failed.push(year);
+            report.failed_years.push(year);
         }
     }
-    failed
+    report
 }
 
 /// 按配置自动 VACUUM（检查 meta 表中的 last_vacuum）。
@@ -1451,7 +1491,10 @@ fn rotate_backups(policy: RetentionPolicy, freeze: bool) {
 pub fn reset_all_data() -> MaintenanceReport {
     snapshot_before_destructive("reset_all_data");
     let mut report = MaintenanceReport::default();
-    for year in queries::available_years() {
+    let Some(years) = years_or_record(&mut report) else {
+        return report;
+    };
+    for year in years {
         let path = paths::year_db_path(year);
         let conn = match connection::open_rw(&path) {
             Ok(c) => c,
@@ -1779,6 +1822,42 @@ fn scale_hourly_to_total(conn: &Connection, day_key: i64, target_total: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 数据目录读不出来时，破坏性命令必须带着原因退回去，不能报"已清空 0 行"。
+    #[test]
+    fn destructive_commands_notice_an_unreadable_data_dir() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let scratch = crate::paths::test_app_dir("enum_fail");
+        // app_dir 指向一个**普通文件**：`<文件>/data` 既建不出来也读不了
+        let file = scratch.path().join("not_a_dir");
+        std::fs::write(&file, b"x").unwrap();
+        crate::paths::set_app_dir(&file);
+
+        let r = reset_all_data();
+        assert!(
+            r.dir_error.is_some(),
+            "读不到目录不能被当成\"一个年份都没有\": {r:?}"
+        );
+        assert!(r.incomplete(), "这种情况必须让 CLI 退非 0");
+        assert_eq!(r.deleted, 0);
+        assert!(
+            r.why_incomplete().contains("一套库都没碰"),
+            "给人看的那句必须说清什么都没做: {}",
+            r.why_incomplete()
+        );
+        assert!(cleanup_old_data(30).dir_error.is_some());
+        assert!(vacuum_all().incomplete(), "压缩同理：没枚举到库就不算完成");
+
+        // 反向腿：目录读得了、只是确实没有年度库 —— 那是真的无事可做，必须报成功，
+        // 否则新装机每次 --reset 都会被误报成失败
+        crate::paths::set_app_dir(scratch.path());
+        let ok = reset_all_data();
+        assert!(
+            ok.dir_error.is_none() && !ok.incomplete(),
+            "空目录不该被算成失败: {ok:?}"
+        );
+        crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
+    }
 
     /// 轮转分组按文件名第一段（年份/库名）：跨日期同组累加，
     /// 超出保留数删除最旧的。回归：旧实现按第二段（日期）分组，

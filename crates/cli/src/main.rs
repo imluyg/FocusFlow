@@ -136,15 +136,15 @@ fn run(args: &[String]) -> i32 {
                 "压缩全部年度库（数据目录 {}）",
                 focusflow_core::paths::data_dir().display()
             );
-            let failed = db::maintenance::vacuum_all();
-            if failed.is_empty() {
-                println!("压缩完成");
-                0
-            } else {
+            let report = db::maintenance::vacuum_all();
+            if report.incomplete() {
                 // 旧行为是 `vacuum_all(); 0`：每个库的成败都被丢掉，永远退 0，
                 // 挂在计划任务上就是"每天准时什么都不做"。
-                eprintln!("以下年份未能压缩（原因见日志）: {failed:?}");
+                eprintln!("压缩未完成：{}（原因见日志）", report.why_incomplete());
                 1
+            } else {
+                println!("压缩完成");
+                0
             }
         }
         "--backup" => {
@@ -188,11 +188,12 @@ fn run(args: &[String]) -> i32 {
                         fmt_thousands(report.deleted)
                     );
                     if report.incomplete() {
-                        // 「已删除 0 条」以前既可能是真没得删、也可能是每个库都没打开，
-                        // 两者回报一模一样，于是 GUI 开着跑清理会假装成功
+                        // 「已删除 0 条」以前既可能是真没得删、也可能是每个库都没打开、
+                        // 还可能是一个库都没枚举到，三者回报一模一样，于是 GUI 开着跑清理
+                        // 会假装成功
                         eprintln!(
-                            "以下年份未能清理（已回滚，未删的行还在；原因见日志）: {:?}",
-                            report.failed_years
+                            "清理未完成：{}（已回滚的年份未删的行还在；原因见日志）",
+                            report.why_incomplete()
                         );
                         return 1;
                     }
@@ -669,9 +670,9 @@ fn reset(_db: &db::Database) -> i32 {
     let report = db::maintenance::reset_all_data();
     if report.incomplete() {
         eprintln!(
-            "只清掉了一部分：未能完成的年份 {:#?}（这些年份已回滚，行还在）。\
+            "只清掉了一部分：{}（这些年份已回滚，行还在）。\
              先关掉正在运行的 FocusFlow 再重试。",
-            report.failed_years
+            report.why_incomplete()
         );
         return 1;
     }

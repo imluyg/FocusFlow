@@ -231,10 +231,17 @@ pub async fn vacuum_db(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let db = Arc::clone(&state.db);
     tauri::async_runtime::spawn_blocking(move || {
         db.flush(true);
-        let _ = focusflow_core::db::maintenance::vacuum_all();
+        let report = focusflow_core::db::maintenance::vacuum_all();
+        // 以前这里 `let _ =`：哪个库没压缩成、甚至一个库都没枚举到，界面都照旧显示
+        // 「压缩完成」。前端 doVacuum 的 catch 会把这句原样打在设置页的消息位上。
+        if report.incomplete() {
+            Err(report.why_incomplete())
+        } else {
+            Ok(())
+        }
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())??;
     Ok(())
 }
 
