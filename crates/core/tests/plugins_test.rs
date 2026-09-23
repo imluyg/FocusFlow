@@ -336,7 +336,8 @@ mod tests {
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
         ));
         let database = db::Database::init_readonly();
-        focusflow_core::plugins::host::register_host_api(&lua, config, database).unwrap();
+        focusflow_core::plugins::host::register_host_api(&lua, config, database, "host_api_test")
+            .unwrap();
 
         // today_count 应返回数字
         let today: i64 = lua

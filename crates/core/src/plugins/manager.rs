@@ -163,7 +163,14 @@ impl PluginManager {
     /// 配置项：config.ini [plugins] memory_limit_mb（默认 16）/ instruction_limit（默认 1000 万）。
     /// Lua 状态创建后调用一次即可覆盖该状态后续所有执行路径。
     fn apply_lua_limits(&self, lua: &Lua) {
-        let mem_mb = self.config.get_int("plugins", "memory_limit_mb", 16).max(1) as usize;
+        // 上限要夹：`memory_limit_mb` 来自可以手改的 config.ini，一个天文数字会在
+        // `* 1024 * 1024` 处 wrap 成 0（release 不做溢出检查），于是 set_memory_limit(0)
+        // ——每个插件立刻 MemoryError，而日志里只有一句 warn，看起来像"插件自己坏了"。
+        // 4096MB 之外没有合理用途，超出就是笔误，按笔误处理。
+        let mem_mb = self
+            .config
+            .get_int("plugins", "memory_limit_mb", 16)
+            .clamp(1, 4096) as usize;
         if let Err(e) = lua.set_memory_limit(mem_mb * 1024 * 1024) {
             tracing::warn!("Lua 内存限制设置失败: {e}");
         }
@@ -232,6 +239,13 @@ impl PluginManager {
     /// 「写入插件启用状态失败」—— 插件页每点一次「停用」都弹一条失败，可插件确实
     /// 已经卸载。返回值无法同时表达这两件事，那就只留一个。
     pub fn set_enabled(&mut self, stem: &str, enabled: bool) {
+        // `stem` 会原样拼进 config.ini 的 `[plugins] disabled`（逗号分隔，写盘不做转义），
+        // 而它是 IPC 传上来的字符串：名字里带一个 `,` 就能顺手停用别的插件，带换行的
+        // 能往配置里注入任意 INI 行。只接受插件目录里真实存在的文件名。
+        if !self.discover().iter().any(|p| Self::stem_of(p) == stem) {
+            tracing::warn!("忽略未知的插件文件名（插件目录里没有它）: {stem}");
+            return;
+        }
         let mut list = self.disabled_list();
         if enabled {
             list.retain(|s| s.as_str() != stem);
@@ -395,12 +409,35 @@ impl PluginManager {
     /// 加载单个插件文件。
     pub fn load_plugin(&mut self, path: &Path) -> Result<String, String> {
         let meta = self.read_meta(path)?;
+        // 展示名（PLUGIN_NAME）是插件表的键。两个文件声明同一个名字时，原先是
+        // 后来者静默覆盖前者：被顶掉的那个既不再接收键事件，也再没有 unload
+        // 入口（cleanup 永不执行），而它的 .lua 还在盘上。拿复制模板改插件的人
+        // 十有八九是忘了改 PLUGIN_NAME，所以这里明确报错、保留已加载的那个。
+        let stem = Self::stem_of(path);
+        if let Some(clash) = self
+            .plugins
+            .get(&meta.name)
+            .filter(|p| Self::stem_of(&p.file_path) != stem)
+        {
+            return Err(format!(
+                "PLUGIN_NAME「{}」与已加载插件（文件 {}）重名，请改一个再启用",
+                meta.name,
+                Self::stem_of(&clash.file_path)
+            ));
+        }
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
 
         let lua = Self::create_sandboxed_lua().map_err(|e| e.to_string())?;
         self.apply_lua_limits(&lua);
-        host::register_host_api(&lua, self.config, Arc::clone(&self.db))
-            .map_err(|e| format!("宿主 API 注册失败: {e}"))?;
+        // 宿主按文件名记账调度线程的使用者，所以这里传 stem 而不是展示名：
+        // 两个插件的 PLUGIN_NAME 相同是常见的手误，展示名当键会串味。
+        host::register_host_api(
+            &lua,
+            self.config,
+            Arc::clone(&self.db),
+            &Self::stem_of(path),
+        )
+        .map_err(|e| format!("宿主 API 注册失败: {e}"))?;
         let script = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         lua.load(&script)
             .set_name(&meta.name)
@@ -509,14 +546,23 @@ impl PluginManager {
             });
         match path {
             Some(p) => {
-                // 找到插件名用于卸载
+                // 找到插件名用于摘除
                 let pname = self
                     .plugins
                     .values()
                     .find(|x| x.file_path == p)
                     .map(|x| x.name.clone());
+                // 重载刻意**不**跑 cleanup()：这条路径是「存了个文件」触发的
+                // （mtime 变化、构建脚本换目录、编辑器先截断再写入），而番茄插件的
+                // cleanup 会 `pomodoro_stop()` —— 那段 `save_current()` 只要实际计时
+                // ≥1 秒就给 `work_finished += 1`。于是按一次 Ctrl+S 就把用户跑到一半的
+                // 番茄钟判成「完成一个」，还是静默的。调度线程同理，拆了要靠重新渲染
+                // 定时任务面板才起得回来。
+                // 摘掉条目即可：旧 Lua 状态随它一起释放，新的那份经宿主 API 复用
+                // 同一批进程级单例（沙箱里没有 io/coroutine，插件本身持不住别的资源）。
+                // 真正的「停用/删文件」仍然走 unload_plugin → cleanup。
                 if let Some(n) = &pname {
-                    self.unload_plugin(n);
+                    self.plugins.remove(n);
                 }
                 self.load_plugin(&p).is_ok()
             }
@@ -661,6 +707,11 @@ impl PluginManager {
     }
 
     /// 调用插件按钮动作（动作后刷新视图缓存）。
+    ///
+    /// 返回值只表示**动作**成不成功：`on_action` 已经跑完（任务删了、记录写了）之后
+    /// 才失败的 `get_view()`，不能报成"动作失败"—— 那正是 `set_enabled` 修过的同一类
+    /// 谎报（插件页每点一次「停用」弹一条失败，可插件确实已经卸载）。刷新失败留一条
+    /// warn，视图沿用上一份，下一次 `get_plugin_view` 会再试并把错误摊开。
     pub fn plugin_action(&mut self, name: &str, action_id: &str) -> Result<(), String> {
         let info = self
             .plugins
@@ -679,7 +730,9 @@ impl PluginManager {
                 }
                 return Err(msg);
             }
-            self.refresh_view(name)?;
+            if let Err(e) = self.refresh_view(name) {
+                tracing::warn!("插件 {name} 动作已执行，但视图刷新失败: {e}");
+            }
             return Ok(());
         }
         Err("插件未定义 on_action".to_string())
@@ -722,7 +775,9 @@ impl PluginManager {
                 }
                 return Err(msg);
             }
-            self.refresh_view(name)?;
+            if let Err(e) = self.refresh_view(name) {
+                tracing::warn!("插件 {name} 输入已写入，但视图刷新失败: {e}");
+            }
             return Ok(());
         }
         Err("插件未定义 set_field".to_string())

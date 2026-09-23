@@ -9,7 +9,8 @@
 //! - `focusflow.available_years()` -> 年份列表
 //! - `focusflow.config_get("section.key")` -> 配置值
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use mlua::{Lua, Table};
 
@@ -25,8 +26,26 @@ use crate::scheduler;
 // 用 `Mutex<Option<Arc<_>>>` 而不是 `OnceLock`：停用插件时要能拆掉后台线程，
 // 而 OnceLock 占用后永远换不进去，用户重新启用插件时线程不会再起来。
 static POMODORO: Mutex<Option<Arc<PomodoroTimer>>> = Mutex::new(None);
-static SCHEDULER: Mutex<Option<Arc<scheduler::Scheduler>>> = Mutex::new(None);
 static POMODORO_DB: OnceLock<()> = OnceLock::new();
+
+/// 调度线程额外记一份「哪些插件在用它」。
+///
+/// 单例只有一个线程，用户却可能装了多个各自调 `scheduler_*` 的插件。若
+/// `scheduler_shutdown` 无条件拆线程，那么**停用任何一个**在 cleanup 里照
+/// `host.rs` 文档写了 `scheduler_shutdown()` 的插件，就会把别的插件（含内置
+/// 「定时任务」）正在依赖的调度线程一起停掉，而且是无声的：任务列表还在，
+/// 到点却再也不启动程序，只有重新打开定时任务面板才会把线程唤回来。
+/// 所以改成按持有者计数，最后一个用户走了才真的停。
+struct SchedulerSlot {
+    runner: Option<Arc<scheduler::Scheduler>>,
+    users: HashSet<String>,
+}
+static SCHEDULER: LazyLock<Mutex<SchedulerSlot>> = LazyLock::new(|| {
+    Mutex::new(SchedulerSlot {
+        runner: None,
+        users: HashSet::new(),
+    })
+});
 
 fn pomodoro_timer() -> Arc<PomodoroTimer> {
     let mut slot = POMODORO.lock().unwrap_or_else(|e| e.into_inner());
@@ -50,6 +69,10 @@ fn ensure_pomodoro_db() {
 ///
 /// 由番茄钟插件在自己的 `cleanup()` 里调用 —— 谁用资源谁负责释放，
 /// 核心层不必知道哪个插件在用。
+///
+/// 刻意**不**按持有者计数（与调度线程不同）：一个 PomodoroTimer 就是一个
+/// 「当前番茄会话」的状态，两个插件同时计时本就无意义，所以它是单持有者资源，
+/// 拆掉就是拆掉。多个插件共用、且拆错会无声改变行为的是调度线程，见下面 `SchedulerSlot`。
 pub fn shutdown_pomodoro() {
     let timer = POMODORO.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(t) = timer {
@@ -57,28 +80,45 @@ pub fn shutdown_pomodoro() {
     }
 }
 
-fn ensure_scheduler() {
+/// 取用调度线程，并把 `owner`（插件文件名，见 `PluginManager::stem_of`）记为用户之一。
+fn claim_scheduler(owner: &str) {
     let mut slot = SCHEDULER.lock().unwrap_or_else(|e| e.into_inner());
-    if slot.is_none() {
-        *slot = Some(scheduler::Scheduler::start());
+    if slot.runner.is_none() {
+        slot.runner = Some(scheduler::Scheduler::start());
+    }
+    slot.users.insert(owner.to_string());
+}
+
+/// 归还调度线程：只有最后一个用户走了才真的停线程。
+pub fn release_scheduler(owner: &str) {
+    let mut slot = SCHEDULER.lock().unwrap_or_else(|e| e.into_inner());
+    slot.users.remove(owner);
+    if slot.users.is_empty() {
+        if let Some(s) = slot.runner.take() {
+            s.stop();
+        }
     }
 }
 
-/// 回收调度线程：停用日程插件后定时任务不再触发（重新启用会再起）。
-pub fn stop_scheduler() {
-    let s = SCHEDULER.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some(s) = s {
-        s.stop();
-    }
+/// 测试/诊断用：调度线程当前状态（`None` = 线程已回收，`Some(n)` = 在跑且有 n 个用户）。
+#[cfg(any(test, feature = "test-utils"))]
+pub fn scheduler_state_for_test() -> Option<usize> {
+    let slot = SCHEDULER.lock().unwrap_or_else(|e| e.into_inner());
+    slot.runner.as_ref().map(|_| slot.users.len())
 }
 
 /// 注册宿主 API 到 Lua 全局表 `focusflow`，返回该表。
+///
+/// `owner` 是调用方的插件文件名（stem）：调度线程按持有者计数，
+/// 所以每个会用到它的闭包都要知道自己代表哪个插件。
 pub fn register_host_api(
     lua: &Lua,
     config: &'static FocusFlowConfig,
     database: Arc<db::Database>,
+    owner: &str,
 ) -> mlua::Result<Table> {
     let host = lua.create_table()?;
+    let owner = owner.to_string();
 
     // 统计查询：period = -1 今日, 0 总计, N 天数。返回 (total, keys表)
     let stats_fn = lua.create_function(move |lua, period: i64| {
@@ -265,8 +305,9 @@ pub fn register_host_api(
     // 注意连「列出任务」也要先启动：程序重启后 UI 往往只是渲染任务列表，
     // 若读任务不启动调度器，恢复上来的定时任务就永远不会被执行。
 
-    let tasks_fn = lua.create_function(|lua, ()| {
-        ensure_scheduler();
+    let tasks_owner = owner.clone();
+    let tasks_fn = lua.create_function(move |lua, ()| {
+        claim_scheduler(&tasks_owner);
         let tasks = scheduler::get_all_tasks();
         let t = lua.create_table()?;
         for (i, task) in tasks.iter().enumerate() {
@@ -291,9 +332,10 @@ pub fn register_host_api(
 
     // 添加：返回 (id, 失败原因)。只回 -1 的话，第三方插件拿到的就是"没成功也没解释"，
     // 而目标被白名单拒 / 调度格式无效 / 库写不进去是三件完全不同的事。
+    let add_owner = owner.clone();
     let add_fn = lua.create_function(
-        |_,
-         (name, target, args, stype, stime, enabled): (
+        move |_,
+              (name, target, args, stype, stime, enabled): (
             String,
             String,
             String,
@@ -301,7 +343,7 @@ pub fn register_host_api(
             String,
             bool,
         )| {
-            ensure_scheduler();
+            claim_scheduler(&add_owner);
             match scheduler::add_task(&name, &target, &args, &stype, &stime, enabled) {
                 Ok(id) => Ok((id, String::new())),
                 Err(e) => Ok((-1i64, e.to_string())),
@@ -320,9 +362,10 @@ pub fn register_host_api(
     })?;
     host.set("scheduler_check_target", check_fn)?;
 
+    let update_owner = owner.clone();
     let update_fn = lua.create_function(
-        |_,
-         (id, name, target, args, stype, stime, enabled): (
+        move |_,
+              (id, name, target, args, stype, stime, enabled): (
             i64,
             String,
             String,
@@ -331,7 +374,7 @@ pub fn register_host_api(
             String,
             bool,
         )| {
-            ensure_scheduler();
+            claim_scheduler(&update_owner);
             let r = scheduler::update_task(
                 id,
                 Some(&name),
@@ -349,14 +392,16 @@ pub fn register_host_api(
     )?;
     host.set("scheduler_update", update_fn)?;
 
-    let delete_fn = lua.create_function(|_, id: i64| {
-        ensure_scheduler();
+    let delete_owner = owner.clone();
+    let delete_fn = lua.create_function(move |_, id: i64| {
+        claim_scheduler(&delete_owner);
         Ok(scheduler::delete_task(id))
     })?;
     host.set("scheduler_delete", delete_fn)?;
 
-    let toggle_fn = lua.create_function(|_, (id, enabled): (i64, bool)| {
-        ensure_scheduler();
+    let toggle_owner = owner.clone();
+    let toggle_fn = lua.create_function(move |_, (id, enabled): (i64, bool)| {
+        claim_scheduler(&toggle_owner);
         scheduler::toggle_task(id, enabled);
         Ok(())
     })?;
@@ -371,11 +416,13 @@ pub fn register_host_api(
 
     // 插件停用/卸载时在 cleanup 里回收调度线程，否则定时任务会在插件
     // 显示为「已停用」的状态下继续触发。重新启用插件时首次调用任一日程
-    // API 会经 ensure_scheduler 再把线程起回来。
+    // API 会经 claim_scheduler 再把线程起回来。
+    // 只回收**本插件**那一份：还有别的插件在用就不停（见 `SchedulerSlot`）。
+    let shutdown_owner = owner;
     host.set(
         "scheduler_shutdown",
-        lua.create_function(|_, ()| {
-            stop_scheduler();
+        lua.create_function(move |_, ()| {
+            release_scheduler(&shutdown_owner);
             Ok(())
         })?,
     )?;
@@ -799,7 +846,8 @@ mod tests {
 
         let lua = Lua::new();
         let database = db::Database::init_readonly();
-        register_host_api(&lua, crate::config::instance(), database).expect("注册宿主 API");
+        register_host_api(&lua, crate::config::instance(), database, "lazy_test")
+            .expect("注册宿主 API");
 
         for (name, path) in [
             ("pomodoro", crate::pomodoro::db_path()),
