@@ -739,7 +739,7 @@ mod tests {
         );
         assert_eq!(hits.load(Ordering::Relaxed), 3, "方向切换应计数");
 
-        crate::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));
+        crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

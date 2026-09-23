@@ -1041,7 +1041,7 @@ mod tests {
         );
 
         w.stop();
-        crate::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));
+        crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
     }
 
     /// 跨天边界：today_key 落后于当前日期时，record 应重置今日计数
@@ -1065,7 +1065,7 @@ mod tests {
 
         w.flush(true);
         w.stop();
-        crate::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));
+        crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
     }
 
     /// record 聚合到内存增量：daily/hourly/keys 正确累加。

@@ -101,6 +101,21 @@ pub fn test_app_dir(tag: &str) -> TestAppDir {
     TestAppDir { dir }
 }
 
+/// 用例收尾时把全局 `app_dir` 指到这里：**哨兵，不是数据目录**。
+///
+/// `set_app_dir` 是进程级全局，而 `stop()` 放弃等待之后仍可能有线程惰性去解析它；
+/// 把它指向一个与任何用例都无关的路径，孤儿写入就不会落进下一个用例刚建好的目录。
+///
+/// 原先直接用 `%TEMP%/ff_restore_nonexistent`：名字虽固定，但 `accounting`/`pomodoro`/
+/// `scheduler` 打开附属库时会 `create_dir_all(data_dir())`，于是这个"本不存在"的哨兵
+/// 每轮真被建出来（实测 +1/轮），还成了一个谁也不删、又持续吸收孤儿写入的常驻目录。
+/// 放 `target/` 下就对了：跨运行复用同一个、一次 `cargo clean` 带走，`%TEMP%` 不再增长。
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn test_scratch_app_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ff_restore_sentinel")
+}
+
 /// 程序目录。
 ///
 /// 优先级：`set_app_dir` 显式设置 > 环境变量 `FOCUSFLOW_APP_DIR` > exe 所在目录（release）> 当前工作目录。

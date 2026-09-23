@@ -1414,7 +1414,7 @@ mod compute_charts_tests {
             (0..7).map(|d| (d, 0)).collect::<Vec<(i64, i64)>>(),
             "星期分布应为 0..=6 七个槽位且按下标有序"
         );
-        focusflow_core::paths::set_app_dir(std::env::temp_dir().join("ff_restore_nonexistent"));
+        focusflow_core::paths::set_app_dir(focusflow_core::paths::test_scratch_app_dir());
     }
 
     /// 总计增量修正：基准未构建时为 0，之后按今日新增累加，
