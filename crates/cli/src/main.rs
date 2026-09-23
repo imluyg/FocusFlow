@@ -129,8 +129,23 @@ fn run(args: &[String]) -> i32 {
             reset(&db)
         }
         "--vacuum" => {
-            db::maintenance::vacuum_all();
-            0
+            // 破坏性/改写型命令一律先把**目标目录**说出来：`FOCUSFLOW_APP_DIR` 是
+            // app_dir 的第一优先级，测试里临时设过之后再忘，就会把真实数据目录当成
+            // 草稿目录处理掉（旧代码从头到尾不提它在动哪套库）。
+            println!(
+                "压缩全部年度库（数据目录 {}）",
+                focusflow_core::paths::data_dir().display()
+            );
+            let failed = db::maintenance::vacuum_all();
+            if failed.is_empty() {
+                println!("压缩完成");
+                0
+            } else {
+                // 旧行为是 `vacuum_all(); 0`：每个库的成败都被丢掉，永远退 0，
+                // 挂在计划任务上就是"每天准时什么都不做"。
+                eprintln!("以下年份未能压缩（原因见日志）: {failed:?}");
+                1
+            }
         }
         "--backup" => {
             let _ = db::Database::init_readonly();
@@ -157,21 +172,31 @@ fn run(args: &[String]) -> i32 {
                 eprintln!("用法: --cleanup <保留天数>");
                 return 1;
             }
-            match args[1].parse::<i64>() {
-                Ok(days) if days >= 1 => {
-                    let deleted = db::maintenance::cleanup_old_data(days);
-                    println!("已删除 {days} 天前的记录 {deleted} 条");
-                    0
+            match parse_keep_days(&args[1]) {
+                Err(msg) => {
+                    eprintln!("{msg}，已取消");
+                    1
                 }
-                // 必须挡在这里：core 对非法值只返回 0，直接打「已删除 0 条」
-                // 看起来像成功，用户不会发现自己把天数打成了 0 或负数
                 Ok(days) => {
-                    eprintln!("保留天数必须 >= 1（收到 {days}），已取消：0 或负数会连今天一起删掉");
-                    1
-                }
-                Err(_) => {
-                    eprintln!("天数必须为整数");
-                    1
+                    println!(
+                        "清理 {days} 天前的记录（数据目录 {}）",
+                        focusflow_core::paths::data_dir().display()
+                    );
+                    let report = db::maintenance::cleanup_old_data(days);
+                    println!(
+                        "已删除 {days} 天前的记录 {} 条",
+                        fmt_thousands(report.deleted)
+                    );
+                    if report.incomplete() {
+                        // 「已删除 0 条」以前既可能是真没得删、也可能是每个库都没打开，
+                        // 两者回报一模一样，于是 GUI 开着跑清理会假装成功
+                        eprintln!(
+                            "以下年份未能清理（已回滚，未删的行还在；原因见日志）: {:?}",
+                            report.failed_years
+                        );
+                        return 1;
+                    }
+                    0
                 }
             }
         }
@@ -598,8 +623,39 @@ fn export_html(
     std::fs::write(path, html).is_ok()
 }
 
+/// `--cleanup <保留天数>` 的取值口径：必须落在 1..=3660。
+///
+/// 与 `parse_period` 同一个理由：core 对非法天数只会返回 0，直接打「已删除 0 条」
+/// 看起来就像成功，用户不会发现自己把天数打成了 0 或负数（那会连今天一起删）。
+/// 上限是给打错字兜底的：旧代码接受任意 `>= 1`，于是 `--cleanup 3000` 与
+/// `--cleanup 999999` 都合法，而它们的真实含义是"把历史全删了"；十年以上的保留期
+/// 没有合理用途，超出就当笔误处理。
+fn parse_keep_days(raw: &str) -> Result<i64, String> {
+    let days = raw
+        .parse::<i64>()
+        .map_err(|_| format!("保留天数必须是整数（收到 {raw:?}）"))?;
+    if days < 1 {
+        return Err(format!(
+            "保留天数必须 >= 1（收到 {days}）：0 或负数会连今天一起删掉"
+        ));
+    }
+    if days > 3660 {
+        return Err(format!(
+            "保留天数 {days} 超出可理解的范围（上限 3660 天）：这个值等价于清空全部历史，\
+             真要清空请用 --reset"
+        ));
+    }
+    Ok(days)
+}
+
 fn reset(_db: &db::Database) -> i32 {
-    println!("警告：将清空所有记录！输入 yes 确认: ");
+    // 确认提示必须说清楚要清的是哪一套库、哪些年份：这是唯一一个有确认的破坏性命令，
+    // 而它原先只写"清空所有记录"—— 用户无从发现 `FOCUSFLOW_APP_DIR` 还指着真实数据目录。
+    println!(
+        "警告：将清空数据目录 {} 下这些年份的全部统计记录：{:?}\n输入 yes 确认: ",
+        focusflow_core::paths::data_dir().display(),
+        db::queries::available_years()
+    );
     use std::io::BufRead;
     let mut line = String::new();
     let stdin = std::io::stdin();
@@ -610,15 +666,51 @@ fn reset(_db: &db::Database) -> i32 {
         println!("已取消");
         return 0;
     }
-    let total = db::maintenance::reset_all_data();
-    println!("所有统计记录已清空 ({} 行)", fmt_thousands(total));
+    let report = db::maintenance::reset_all_data();
+    if report.incomplete() {
+        eprintln!(
+            "只清掉了一部分：未能完成的年份 {:#?}（这些年份已回滚，行还在）。\
+             先关掉正在运行的 FocusFlow 再重试。",
+            report.failed_years
+        );
+        return 1;
+    }
+    println!("所有统计记录已清空 ({} 行)", fmt_thousands(report.deleted));
     0
 }
 
 #[cfg(test)]
 mod tests {
     use super::{export_csv, export_html};
-    use super::{parse_period, Period};
+    use super::{parse_keep_days, parse_period, Period};
+
+    /// `--cleanup` 的天数口径：0 / 负数 / 非整数 / 大得离谱都要在入口挡住。
+    ///
+    /// 旧代码只挡 `< 1`，于是 `--cleanup 3000` 与 `--cleanup 999999` 一路放行，
+    /// 而它们实际等价于"把历史全删了"。core 那边对非法值只返回 0，直接打
+    /// 「已删除 0 条」看起来就是成功。
+    #[test]
+    fn keep_days_argument_is_bounded() {
+        assert_eq!(parse_keep_days("30"), Ok(30));
+        assert_eq!(parse_keep_days("1"), Ok(1));
+        assert_eq!(parse_keep_days("3660"), Ok(3660), "上限本身是合法保留期");
+        for bad in [
+            "0",
+            "-5",
+            "abc",
+            "",
+            " ",
+            "30.5",
+            "3661",
+            "999999",
+            "99999999999",
+        ] {
+            assert!(parse_keep_days(bad).is_err(), "{bad} 应当被拒绝");
+        }
+        // 文案要能分清是哪一种：会连今天一起删，与"笔误"是两件事
+        assert!(parse_keep_days("0").unwrap_err().contains(">= 1"));
+        assert!(parse_keep_days("999999").unwrap_err().contains("--reset"));
+    }
 
     /// 周期参数必须与 UI 的 `set_period` 同一口径，越界值要报错而不是被静默钳制。
     #[test]

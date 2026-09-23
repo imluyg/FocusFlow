@@ -215,7 +215,7 @@ pub async fn vacuum_db(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let db = Arc::clone(&state.db);
     tauri::async_runtime::spawn_blocking(move || {
         db.flush(true);
-        focusflow_core::db::maintenance::vacuum_all();
+        let _ = focusflow_core::db::maintenance::vacuum_all();
     })
     .await
     .map_err(|e| e.to_string())?;

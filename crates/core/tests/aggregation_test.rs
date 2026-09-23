@@ -176,15 +176,23 @@ mod tests {
         };
         assert_eq!(days_with_data(), 2, "前置：今天与 10 天前各一天");
 
-        assert_eq!(db::maintenance::cleanup_old_data(0), 0, "0 天必须被拒绝");
-        assert_eq!(db::maintenance::cleanup_old_data(-5), 0, "负数必须被拒绝");
+        assert_eq!(
+            db::maintenance::cleanup_old_data(0).deleted,
+            0,
+            "0 天必须被拒绝"
+        );
+        assert_eq!(
+            db::maintenance::cleanup_old_data(-5).deleted,
+            0,
+            "负数必须被拒绝"
+        );
         assert_eq!(days_with_data(), 2, "拒绝时不得删掉任何数据");
 
-        db::maintenance::cleanup_old_data(11);
+        let _ = db::maintenance::cleanup_old_data(11);
         assert_eq!(days_with_data(), 2, "保留 11 天（含今天）刚好覆盖 10 天前");
 
         assert!(
-            db::maintenance::cleanup_old_data(10) > 0,
+            db::maintenance::cleanup_old_data(10).deleted > 0,
             "保留 10 天应清掉 10 天前那天"
         );
         assert_eq!(days_with_data(), 1, "含今天共 10 天不含第 11 天");

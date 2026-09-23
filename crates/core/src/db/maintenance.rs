@@ -571,13 +571,38 @@ fn combo_key_mapping(old: &str) -> Option<String> {
 /// `keep_days < 1` 一律拒绝而不是钳制成 1：0 或负数会让 cutoff 落到今天甚至
 /// 未来，一条 DELETE 就把全部历史（含今天）清空；而钳制同样会把误输入的 -1
 /// 变成「只留今天」，两者都是不可逆的灾难，只能拒绝对方才有机会发现打错了字。
-pub fn cleanup_old_data(keep_days: i64) -> i64 {
+/// 一次按日期/清空型维护的结果。
+///
+/// 为什么要带 `failed_years`：以前这些路径上的失败是**从不说话**的 ——
+/// `open_rw` 或 `BEGIN IMMEDIATE` 拿不到就 `continue`，于是 GUI 开着（写锁被占）时
+/// 跑 `--cleanup 30` 会打印「已删除 0 条」并退出码 0，看起来像"确实没什么可删"，
+/// 而实际上一条都没删成。计划任务尤其需要能区分这两种 0。
+#[derive(Debug, Default, Clone)]
+pub struct MaintenanceReport {
+    /// 真正删掉的行数（提交成功的年份才计入）
+    pub deleted: i64,
+    /// 没能处理完的年份：空 = 全程顺利
+    pub failed_years: Vec<i32>,
+}
+
+impl MaintenanceReport {
+    /// 是否有年份被跳过（CLI 据此决定退出码）。
+    pub fn incomplete(&self) -> bool {
+        !self.failed_years.is_empty()
+    }
+}
+
+/// 清理结果别名（保留旧名字，读代码时更直观）。
+pub type CleanupReport = MaintenanceReport;
+
+/// 按日期清理过期聚合数据；见 [`MaintenanceReport`] 关于失败如何被上报的说明。
+pub fn cleanup_old_data(keep_days: i64) -> CleanupReport {
+    let mut report = CleanupReport::default();
     if keep_days < 1 {
         tracing::error!("清理天数必须 >= 1（收到 {keep_days}），已拒绝");
-        return 0;
+        return report;
     }
     let cutoff_dk = queries::day_key_of_date(Local::now().date_naive()) - (keep_days - 1);
-    let mut total = 0i64;
     // 快照只在「确实有过期行要删」的那一年、且在本轮任何 DELETE 之前做一次：
     // backup_database 本来就覆盖全部年度库与附属库，所以这一次快照足以兜住
     // 之后所有年份的删除。反过来，先抢在循环外无条件备份会让「其实没什么可删」
@@ -587,51 +612,67 @@ pub fn cleanup_old_data(keep_days: i64) -> i64 {
         let path = paths::year_db_path(year);
         let conn = match connection::open_rw(&path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::error!("{year} 年库打不开，本年度未清理: {e}");
+                report.failed_years.push(year);
+                continue;
+            }
         };
         // 探测必须发生在 BEGIN IMMEDIATE 之后：事务外先查后删之间，写入线程仍可
         // 把过期增量落进库，那一行就会被「无快照删除」掉。拿到写锁后再探测，
         // 探测结果与随后的 DELETE 之间就不可能有别人插队。
-        if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+        if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+            tracing::error!("{year} 年库拿不到写锁，本年度未清理: {e}");
+            report.failed_years.push(year);
             continue;
         }
         let mut year_deleted = 0i64;
+        let mut year_failed = false;
         if min_stale_date_key(&conn, cutoff_dk).is_some() {
             if !snapshotted {
                 snapshot_before_destructive("cleanup_old_data");
                 snapshotted = true;
             }
             for table in DATA_TABLES {
-                let n = conn
-                    .execute(
-                        &format!("DELETE FROM {table} WHERE date_key < ?1"),
-                        [cutoff_dk],
-                    )
-                    .unwrap_or(0);
-                year_deleted += n as i64;
+                match conn.execute(
+                    &format!("DELETE FROM {table} WHERE date_key < ?1"),
+                    [cutoff_dk],
+                ) {
+                    Ok(n) => year_deleted += n as i64,
+                    Err(e) => {
+                        // 原先是 `.unwrap_or(0)`：某张表删失败（盘满、库被占）就当它
+                        // 本来没有过期行，最后报一个偏小的"已清理 N 条"，谁也看不出漏了。
+                        tracing::error!("{year} 年 {table} 删除失败: {e}");
+                        year_failed = true;
+                        break;
+                    }
+                }
             }
         }
         // 设备字典按「还有没有引用」清理（它没有 date_key，不能按日期删）。
         // 与日期删除解耦：它删的是已经不被任何统计行引用的登记，且设备再出现时
         // 会按同一路径自动重新登记，因此不需要为它单独付一次全量快照。
-        prune_orphan_devices(&conn);
+        if !year_failed {
+            prune_orphan_devices(&conn);
+        }
         // 提交失败 = 这一年的删除被回滚，不能把它算进「已清理」的回报里
-        if conn.execute_batch("COMMIT").is_ok() {
-            if year_deleted > 0 {
-                tracing::info!("已清理 {year} 年 {cutoff_dk} 前的数据");
-                total += year_deleted;
-            }
-        } else {
-            tracing::error!("{year} 年数据清理提交失败，本年度改动已回滚");
+        let committed = !year_failed && conn.execute_batch("COMMIT").is_ok();
+        if !committed {
+            let _ = conn.execute_batch("ROLLBACK");
+            tracing::error!("{year} 年数据清理未完成，本年度改动已回滚");
+            report.failed_years.push(year);
+        } else if year_deleted > 0 {
+            tracing::info!("已清理 {year} 年 {cutoff_dk} 前的数据");
+            report.deleted += year_deleted;
         }
     }
-    if total > 0 {
+    if report.deleted > 0 {
         // 删空的年份文件还在磁盘上：让年份列表立刻重算（现在会把空壳过滤掉），
         // 而不是等 30 秒 TTL —— 否则清理之后仍然要替那些空壳各扫一遍。
         queries::invalidate_years_cache();
-        tracing::info!("共清理 {total} 行聚合数据");
+        tracing::info!("共清理 {} 行聚合数据", report.deleted);
     }
-    total
+    report
 }
 
 /// 清掉已经没有任何统计行引用的设备登记（`devices` 没有 date_key，不能按日期删）。
@@ -646,8 +687,8 @@ fn prune_orphan_devices(conn: &Connection) -> usize {
     .unwrap_or(0)
 }
 
-/// VACUUM 指定数据库。
-pub fn vacuum_path(path: &Path) {
+/// VACUUM 指定数据库，返回是否成功（失败已记日志）。
+pub fn vacuum_path(path: &Path) -> bool {
     let result = (|| -> anyhow::Result<()> {
         let conn = connection::open_rw(path)?;
         conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
@@ -656,16 +697,29 @@ pub fn vacuum_path(path: &Path) {
         Ok(())
     })();
     match result {
-        Ok(()) => tracing::info!("已压缩 {}", path.display()),
-        Err(e) => tracing::error!("VACUUM {} 失败: {e}", path.display()),
+        Ok(()) => {
+            tracing::info!("已压缩 {}", path.display());
+            true
+        }
+        Err(e) => {
+            tracing::error!("VACUUM {} 失败: {e}", path.display());
+            false
+        }
     }
 }
 
-/// 压缩所有年度数据库。
-pub fn vacuum_all() {
+/// 压缩所有年度数据库，返回**没能压缩**的年份（空 = 全部成功）。
+///
+/// 返回值是给 CLI 用的：`focusflow-cli --vacuum` 此前无论发生什么都退 0，
+/// 挂到计划任务上就是"每天准时什么都不做"，而日志在另一个地方。
+pub fn vacuum_all() -> Vec<i32> {
+    let mut failed = Vec::new();
     for year in queries::available_years() {
-        vacuum_path(&paths::year_db_path(year));
+        if !vacuum_path(&paths::year_db_path(year)) {
+            failed.push(year);
+        }
     }
+    failed
 }
 
 /// 按配置自动 VACUUM（检查 meta 表中的 last_vacuum）。
@@ -697,7 +751,7 @@ pub fn maybe_auto_vacuum(auto_vacuum_days: i64) {
         }
     }
 
-    vacuum_all();
+    let _ = vacuum_all();
     let now_str = chrono::DateTime::to_rfc3339(&chrono::Utc::now());
     if let Ok(conn) = connection::open_rw(&path) {
         let _ = conn.execute(
@@ -1388,30 +1442,69 @@ fn rotate_backups(policy: RetentionPolicy, freeze: bool) {
     }
 }
 
-/// 清空所有年度库的统计表（键鼠计数/小时分布/按键明细/活跃时长/前台应用），返回删除行数。
+/// 清空所有年度库的统计表（键鼠计数/小时分布/按键明细/活跃时长/前台应用）。
 /// 不可逆操作：执行前先做一次全量备份（失败只记日志不阻断，但会在日志中高亮）。
-pub fn reset_all_data() -> i64 {
+///
+/// 每一年单独一个事务：原先是裸着一串 `DELETE ... .unwrap_or(0)`，中途一次
+/// SQLITE_BUSY 就会留下一半删掉、一半没删的库，而调用方拿到的行数照报"已清空"
+/// （`cleanup_old_data` 早就包了 BEGIN IMMEDIATE/COMMIT，这里是漏下的那一个）。
+pub fn reset_all_data() -> MaintenanceReport {
     snapshot_before_destructive("reset_all_data");
-    let mut total = 0i64;
+    let mut report = MaintenanceReport::default();
     for year in queries::available_years() {
         let path = paths::year_db_path(year);
         let conn = match connection::open_rw(&path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::error!("{year} 年库打不开，本年度未清空: {e}");
+                report.failed_years.push(year);
+                continue;
+            }
         };
+        if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+            tracing::error!("{year} 年库拿不到写锁，本年度未清空: {e}");
+            report.failed_years.push(year);
+            continue;
+        }
+        let mut year_deleted = 0i64;
+        let mut failed = false;
         for table in DATA_TABLES {
-            let n = conn
-                .execute(&format!("DELETE FROM {table}"), [])
-                .unwrap_or(0);
-            total += n as i64;
+            match conn.execute(&format!("DELETE FROM {table}"), []) {
+                Ok(n) => year_deleted += n as i64,
+                Err(e) => {
+                    tracing::error!("{year} 年 {table} 清空失败: {e}");
+                    failed = true;
+                    break;
+                }
+            }
         }
         // 设备字典也在「统计数据」范围内：统计行清空后留着旧登记名会让
         // 「已清空全部统计数据」名不副实（别名在 json 里，不受影响）
-        total += conn.execute("DELETE FROM devices", []).unwrap_or(0) as i64;
+        if !failed {
+            match conn.execute("DELETE FROM devices", []) {
+                Ok(n) => year_deleted += n as i64,
+                Err(e) => {
+                    tracing::error!("{year} 年设备登记清空失败: {e}");
+                    failed = true;
+                }
+            }
+        }
+        if failed || conn.execute_batch("COMMIT").is_err() {
+            let _ = conn.execute_batch("ROLLBACK");
+            tracing::error!("{year} 年清空未完成，本年度改动已回滚");
+            report.failed_years.push(year);
+        } else {
+            report.deleted += year_deleted;
+        }
     }
     queries::invalidate_years_cache();
-    tracing::info!("已清空全部统计数据（键鼠/活跃时长/前台应用）{total} 行");
-    total
+    if report.failed_years.is_empty() {
+        tracing::info!(
+            "已清空全部统计数据（键鼠/活跃时长/前台应用）{} 行",
+            report.deleted
+        );
+    }
+    report
 }
 
 /// 删除今日指定按键的聚合记录（含内存中未落库增量由调用方先 flush），返回删除的计数值。
@@ -2762,7 +2855,7 @@ mod tests {
         queries::invalidate_years_cache();
         std::fs::create_dir_all(paths::backup_dir()).unwrap();
 
-        assert_eq!(cleanup_old_data(30), 0, "今天那行还在保留窗口内");
+        assert_eq!(cleanup_old_data(30).deleted, 0, "今天那行还在保留窗口内");
         assert_eq!(
             backup_db_count(),
             0,
@@ -2778,13 +2871,88 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(cleanup_old_data(1), 1, "应删掉那一行过期数据");
+        assert_eq!(cleanup_old_data(1).deleted, 1, "应删掉那一行过期数据");
         assert!(backup_db_count() >= 1, "真删了数据就必须留下执行前快照");
         let left: i64 = connection::open_rw(&paths::year_db_path(year))
             .unwrap()
             .query_row("SELECT COUNT(*) FROM daily_counts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 1, "过期行应已删除，只剩今天那行");
+    }
+
+    /// 退出时把记下的一批文件恢复可写。
+    ///
+    /// 必须恢复：临时目录是 `TestAppDir::drop` 删的，留一个只读文件在里头
+    /// `remove_dir_all` 就会失败 —— 那是本仓测过好几轮的 `%TEMP%` 泄漏路径。
+    struct RestoreWritable(Vec<std::path::PathBuf>);
+    impl Drop for RestoreWritable {
+        // clippy 不让 set_readonly(false)：在 Unix 上它会把权限一律设成 0o666 而不是
+        // 还原原值。这里只在 Windows 的测试里成对使用（先 true 后 false），且目录本身就是
+        // 用完即删的临时程序目录，不存在"误放开别人文件"的口子。
+        #[allow(clippy::permissions_set_readonly_false)]
+        fn drop(&mut self) {
+            for p in &self.0 {
+                if let Ok(mut perm) = std::fs::metadata(p).map(|m| m.permissions()) {
+                    perm.set_readonly(false);
+                    let _ = std::fs::set_permissions(p, perm);
+                }
+            }
+        }
+    }
+
+    /// 库动不了的时候必须报"哪一年没做成"，而不是报"没有可删的"。
+    ///
+    /// 旧实现里这两者是同一个回报：`open_rw` / `BEGIN IMMEDIATE` 拿不到就 `continue`，
+    /// 一行日志都不留，最后打印「已删除 0 条」并退出码 0 —— 挂到计划任务上就是
+    /// "每天准时什么都不做"。GUI 开着（写线程握着库）是这条路径最常见的现实触发。
+    /// 这里用只读文件模拟，是为了避免吃满 15 秒 busy_timeout 把门禁拖慢。
+    #[test]
+    fn cleanup_names_the_years_it_could_not_touch() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("cleanup_locked");
+        let year = Local::now().year();
+        let db = paths::year_db_path(year);
+        {
+            let conn = connection::open_rw(&db).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 3)",
+                [queries::day_key_of_date(
+                    Local::now().date_naive() - chrono::Days::new(40),
+                )],
+            )
+            .unwrap();
+        }
+        queries::invalidate_years_cache();
+
+        // 主库和它旁边的 -wal / -shm 一起只读：少了一个，写路径可能仍然走得通
+        let mut targets = vec![db.clone()];
+        for suffix in ["-wal", "-shm"] {
+            let extra = std::path::PathBuf::from(format!("{}{}", db.display(), suffix));
+            if extra.is_file() {
+                targets.push(extra);
+            }
+        }
+        for p in &targets {
+            if let Ok(mut perm) = std::fs::metadata(p).map(|m| m.permissions()) {
+                perm.set_readonly(true);
+                let _ = std::fs::set_permissions(p, perm);
+            }
+        }
+        let _restore = RestoreWritable(targets.clone());
+
+        let report = cleanup_old_data(30);
+        assert_eq!(report.deleted, 0, "动不了的库不该声称删了行");
+        assert!(
+            report.incomplete() && report.failed_years.contains(&year),
+            "被挡住的年份必须被点名（这就是与\"确实没得删\"的区别）: {report:?}"
+        );
+
+        // 对照组：恢复可写后同一次清理要真的做成，不能永远报失败
+        drop(_restore);
+        let again = cleanup_old_data(30);
+        assert!(!again.incomplete(), "解锁后不该还报失败: {again:?}");
+        assert_eq!(again.deleted, 1, "解锁后应删掉那行过期数据");
     }
 
     /// 「今天没有这个按键」时删除不该付快照；真删了则要快照，且
