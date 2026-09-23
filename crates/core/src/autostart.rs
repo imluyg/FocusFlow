@@ -48,6 +48,28 @@ fn create_shortcut() -> anyhow::Result<PathBuf> {
     Ok(lnk)
 }
 
+/// 从 PowerShell 的两个输出流里取一条能看的失败原因。
+///
+/// 分两类流是必要的：解析错误只走 stderr，而 COM / .NET 异常常只留在 stdout，
+/// 只看 stderr 会得到"失败但没有任何原因"。两边都只剩空白时按"没有信息"处理
+/// （返回空串），调用方据此决定值不值得重试。
+///
+/// BOM 要单独剥：Windows PowerShell 在控制台输出编码是 UTF-8 时会先写一个
+/// `\u{feff}`，而它**不属于** Unicode 的 White_Space，`trim()` 拿它没办法 ——
+/// 于是"一条消息都没有"会被当成"有信息"，该重试的那一次就不重试了。
+fn ps_failure_detail(stdout: &[u8], stderr: &[u8]) -> String {
+    for stream in [stderr, stdout] {
+        let text = String::from_utf8_lossy(stream)
+            .trim_start_matches('\u{feff}')
+            .trim()
+            .to_string();
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    String::new()
+}
+
 /// 在指定路径生成快捷方式（真的起 PowerShell）。
 ///
 /// 单独收一个路径参数，是为了能在临时目录里跑完整往返：启动文件夹是用户机器的
@@ -91,21 +113,33 @@ fn create_shortcut_at(lnk: &std::path::Path) -> anyhow::Result<()> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000);
     }
-    let output = cmd.output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        // PowerShell 把不同类别的错误分别写到两个流上（解析错误走 stderr，COM /
-        // .NET 异常常只留在 stdout），只报 stderr 时会是"失败但没有任何原因"。
-        let mut detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if detail.is_empty() {
-            detail = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // 最多两次：退出码非 0 且两个流都空着 = PowerShell 连报错都没来得及产生，
+    // 这种"没有信息的失败"实测会在机器负载高时偶发（全量并跑测试时见过两次，
+    // 报的是退出码 -1；单跑 6/6 不复现，原因没能钉死）。它跟"被明确拒绝"是两件事 ——
+    // 后者一定带文字，重试只是白等，所以只对前者补一次。
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        let output = cmd.output()?;
+        if output.status.success() {
+            if attempt > 1 {
+                tracing::info!("自启快捷方式在第 {attempt} 次尝试时建成");
+            }
+            return Ok(());
+        }
+        let code = output.status.code();
+        let detail = ps_failure_detail(&output.stdout, &output.stderr);
+        if detail.is_empty() && attempt == 1 {
+            tracing::warn!(
+                "PowerShell 建自启快捷方式失败且没有任何输出（退出码 {code:?}），再试一次"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            continue;
         }
         anyhow::bail!(
-            "PowerShell 创建快捷方式失败（退出码 {:?}）: {}",
-            output.status.code(),
+            "PowerShell 创建快捷方式失败（退出码 {code:?}，第 {attempt} 次尝试）: {}",
             if detail.is_empty() {
-                "无输出"
+                "无任何输出：多半是 PowerShell 自己没起来（机器负载高时实测出现过），稍后再试一次即可"
             } else {
                 &detail
             }
@@ -208,6 +242,28 @@ pub fn disable_autostart() -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 失败原因的取法：两个流都要看，都空才算"没有信息"（那才是要重试的那一类）。
+    #[test]
+    fn ps_failure_detail_prefers_stderr_then_falls_back_to_stdout() {
+        // 解析错误只走 stderr
+        assert_eq!(
+            ps_failure_detail(b"", b"syntax error"),
+            "syntax error",
+            "stderr 有内容时用它"
+        );
+        // COM / .NET 异常常只留在 stdout
+        assert_eq!(
+            ps_failure_detail(b"  Cannot set property ", b"   \n"),
+            "Cannot set property",
+            "stderr 全空时得回退到 stdout，并去掉首尾空白"
+        );
+        // 两边都只剩空白（含 BOM）：按"没有任何信息"处理
+        assert_eq!(
+            ps_failure_detail("\u{feff} \r\n".as_bytes(), b"\t ").len(),
+            0
+        );
+    }
 
     /// 撇号必须翻倍，否则它会提前闭合 PowerShell 的字符串字面量。
     #[test]
