@@ -359,7 +359,7 @@ const LNK_HEADER_SIZE: usize = 76;
 /// 还原面太大、伪装空间也多），因此只认 `LinkInfo.LocalBasePath`。
 ///
 /// 全程用带边界的取值：release 配置是 `panic = "abort"`，一次越界就是整个应用消失。
-fn parse_lnk_target(bytes: &[u8]) -> Option<String> {
+pub(crate) fn parse_lnk_target(bytes: &[u8]) -> Option<String> {
     // Shell Link 的 CLSID {00021401-0000-0000-C000-000000000046}，按小端原样存于头里。
     // 前三字节必须是 01 14 02 —— 早期 fixture 里写成 01 14 00 时，自造的用例全过、
     // 真实快捷方式全挂（校验和被测试与实现同时写错时，测试就一点用也没有）。
