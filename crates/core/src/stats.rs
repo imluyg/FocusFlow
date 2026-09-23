@@ -113,6 +113,124 @@ pub fn cpm(config: &'static FocusFlowConfig) -> Arc<CpmCalculator> {
     }))
 }
 
+/// 久坐提醒的判定状态（`[rest]` 那一节配置的实现）。
+///
+/// 输入只要一样东西：**今天的键鼠事件累计数**（写入线程的内存缓存，单调递增、
+/// 跨零点归零）。按采样时刻留一小段历史，就能回答"最近 `window_minutes` 分钟里
+/// 发生了多少次事件"，不必给采集侧再接一条回调链。
+///
+/// 三道闸都是为了别让人烦：
+/// - 采样必须铺满整个窗口才开始判定 —— 刚开机/刚睡醒那半小时本来就还没坐够；
+/// - 发过一次就清空采样，下一次要再攒满一整段窗口；
+/// - `cooldown_minutes` 是两次提醒之间的最小间隔。
+///
+/// 参数每次判定从配置现读，所以改 `config.ini` 立刻生效（与 `[pomodoro]` 那种
+/// 启动时读一次的不一样：这个线程本来每 tick 都在跑）。
+#[derive(Debug, Default)]
+pub struct RestMonitor {
+    /// (采样时刻, 当时的今日累计事件数)
+    samples: VecDeque<(Instant, i64)>,
+    last_check: Option<Instant>,
+    last_sent: Option<Instant>,
+}
+
+/// 一条久坐提醒（推给前端的载荷）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RestNotice {
+    /// 判定窗口（分钟），来自 `[rest] window_minutes`
+    pub window_minutes: i64,
+    /// 窗口内的事件数
+    pub events_in_window: i64,
+    /// 建议休息时长（秒），来自 `[rest] rest_seconds`
+    pub rest_seconds: i64,
+}
+
+/// `[rest]` 的参数（越界值一律夹住，别让一句手写的 0 把提醒变成每 tick 一次）。
+struct RestParams {
+    enabled: bool,
+    window: Duration,
+    key_threshold: i64,
+    cooldown: Duration,
+    check_interval: Duration,
+    rest_seconds: i64,
+}
+
+impl RestParams {
+    fn load(cfg: &FocusFlowConfig) -> Self {
+        let secs = |min: i64| Duration::from_secs(min.max(1) as u64 * 60);
+        Self {
+            enabled: cfg.get_bool("rest", "enabled", true),
+            window: secs(cfg.get_int("rest", "window_minutes", 30)),
+            key_threshold: cfg.get_int("rest", "key_threshold", 10_000).max(1),
+            cooldown: secs(cfg.get_int("rest", "cooldown_minutes", 10)),
+            check_interval: Duration::from_secs(
+                cfg.get_int("rest", "check_interval", 10).clamp(1, 600) as u64,
+            ),
+            rest_seconds: cfg.get_int("rest", "rest_seconds", 20).clamp(1, 3600),
+        }
+    }
+}
+
+impl RestMonitor {
+    /// 统计线程每 tick 调一次；到点且判定为久坐时返回一条提醒（自带节流）。
+    pub fn observe(
+        &mut self,
+        now: Instant,
+        today_total: i64,
+        cfg: &FocusFlowConfig,
+    ) -> Option<RestNotice> {
+        let p = RestParams::load(cfg);
+        if !p.enabled {
+            // 关掉期间不攒样本：重新打开时不该拿"关着的那半小时"当久坐证据
+            self.samples.clear();
+            self.last_check = None;
+            return None;
+        }
+        // `checked_duration_since` 而非减法：`Instant` 相减下溢会 panic，而 release
+        // 是 panic=abort（改小 check_interval 后旧时刻还可能"在未来"）。拿不到差值
+        // 就当"早就到点了"；从没发生过（None）同样是"早过了"。
+        let since = |at: Option<Instant>| -> Duration {
+            match at {
+                Some(t) => now.checked_duration_since(t).unwrap_or(Duration::ZERO),
+                None => Duration::MAX,
+            }
+        };
+        if since(self.last_check) < p.check_interval {
+            return None;
+        }
+        self.last_check = Some(now);
+
+        // 今日计数变小 = 跨了零点（或库被清理/恢复），旧样本与新数字没有可比性
+        if self.samples.back().is_some_and(|(_, c)| *c > today_total) {
+            self.samples.clear();
+        }
+        self.samples.push_back((now, today_total));
+        while let Some(&(at, _)) = self.samples.front() {
+            if since(Some(at)) > p.window {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        let &(first_at, first_count) = self.samples.front()?;
+        // 窗口没铺满，"这一整段一直在用"就还不成立
+        if since(Some(first_at)) < p.window {
+            return None;
+        }
+        let events = today_total.saturating_sub(first_count);
+        if events < p.key_threshold || since(self.last_sent) < p.cooldown {
+            return None;
+        }
+        self.last_sent = Some(now);
+        self.samples.clear();
+        Some(RestNotice {
+            window_minutes: p.window.as_secs() as i64 / 60,
+            events_in_window: events,
+            rest_seconds: p.rest_seconds,
+        })
+    }
+}
+
 /// 打卡判定的回看窗口（天）。调用方取按日序列时必须用同一个值，否则
 /// `best` 会在数据边界上被截断，而两处各自写死数字迟早对不上。
 pub const GOAL_LOOKBACK_DAYS: i64 = 370;
@@ -360,6 +478,108 @@ mod tests {
         assert_eq!(
             last_finished_week(d(2026, 1, 1)),
             (d(2025, 12, 22), d(2025, 12, 28))
+        );
+    }
+
+    /// 写一份配置到 `target/` 下（固定文件名，跨运行复用、`cargo clean` 带走，
+    /// 不进 `%TEMP%`），并读回来。绕开 `instance()`/`set()`：那会叫醒进程级的
+    /// 去抖保存线程，把文件写进别的用例已经删掉的目录里。
+    /// `tag` 必须每个用例各不相同 ——  cargo 并行跑用例，共用一个文件就是互相盖。
+    fn cfg_from(tag: &str, body: &str) -> FocusFlowConfig {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/ff_rest_cfg_{tag}.ini"));
+        std::fs::write(&path, body).unwrap();
+        FocusFlowConfig::load(&path).unwrap()
+    }
+
+    /// 30 分钟窗口 / 100 次阈值 / 10 分钟冷却 / 每 60 秒最多判一次
+    const REST_30: &str = "[rest]\nenabled = true\nwindow_minutes = 30\nkey_threshold = 100\n\
+                           cooldown_minutes = 10\nrest_seconds = 20\ncheck_interval = 60\n";
+
+    /// 久坐提醒必须"铺满整个窗口 + 事件数过阈值"两个条件同时成立才发。
+    #[test]
+    fn rest_monitor_needs_a_full_window_of_sustained_work() {
+        let cfg = cfg_from("full_window", REST_30);
+        let mut m = RestMonitor::default();
+        let t0 = Instant::now();
+        let at = |mins: u64| t0 + Duration::from_secs(mins * 60);
+        for i in 0..6u64 {
+            assert!(
+                m.observe(at(i * 5), (i * 100) as i64, &cfg).is_none(),
+                "第 {i} 次：30 分钟的窗口还没铺满，不该提醒（刚开机就催人休息是最烦的那种）"
+            );
+        }
+        let n = m
+            .observe(at(30), 600, &cfg)
+            .expect("窗口铺满且事件数过阈值，该提醒了");
+        assert_eq!(
+            (n.window_minutes, n.events_in_window, n.rest_seconds),
+            (30, 600, 20),
+            "载荷里的三个数都要来自配置"
+        );
+    }
+
+    /// 冷却期到点前不得重复提醒；提醒之后窗口要重新攒满。
+    #[test]
+    fn rest_monitor_respects_cooldown() {
+        let cfg = cfg_from(
+            "cooldown",
+            "[rest]\nenabled = true\nwindow_minutes = 1\nkey_threshold = 10\n\
+             cooldown_minutes = 10\nrest_seconds = 20\ncheck_interval = 10\n",
+        );
+        let mut m = RestMonitor::default();
+        let t0 = Instant::now();
+        let fired: Vec<u64> = (1..=12u64)
+            .filter(|&k| {
+                m.observe(t0 + Duration::from_secs(k * 60), (k * 50) as i64, &cfg)
+                    .is_some()
+            })
+            .collect();
+        assert_eq!(
+            fired,
+            vec![2, 12],
+            "第 2 分钟才可能第一次发（先要铺满一个 1 分钟的窗口）；之后每分钟阈值都够，\
+             但 10 分钟冷却压着，直到第 12 分钟才再发一次"
+        );
+    }
+
+    /// `[rest] enabled = false` 是真开关；今日计数跨零点归零不能当成"刚才很活跃"。
+    #[test]
+    fn rest_monitor_honours_the_switch_and_a_midnight_reset() {
+        let off = cfg_from(
+            "switch_off",
+            "[rest]\nenabled = false\nwindow_minutes = 1\nkey_threshold = 10\n\
+             cooldown_minutes = 1\nrest_seconds = 20\ncheck_interval = 10\n",
+        );
+        let mut m = RestMonitor::default();
+        let t0 = Instant::now();
+        assert!(m.observe(t0, 0, &off).is_none());
+        assert!(
+            m.observe(t0 + Duration::from_secs(600), 999_999, &off)
+                .is_none(),
+            "enabled=false 时事件数再高也不该提醒（否则又是一个改了就生效不了的假开关）"
+        );
+
+        // 同一个 monitor 换配置：参数每次判定现读，改文件不必重启
+        let cfg = cfg_from("midnight", REST_30);
+        let mut m = RestMonitor::default();
+        for i in 0..6u64 {
+            m.observe(t0 + Duration::from_secs(i * 300), (i * 100) as i64, &cfg);
+        }
+        assert!(
+            m.observe(t0 + Duration::from_secs(1800), 10, &cfg)
+                .is_none(),
+            "计数归零的那一 tick 不能拿昨天的累计当证据"
+        );
+        assert!(
+            m.observe(t0 + Duration::from_secs(2100), 60, &cfg)
+                .is_none(),
+            "归零后窗口要重新铺满"
+        );
+        assert!(
+            m.observe(t0 + Duration::from_secs(3600), 700, &cfg)
+                .is_some(),
+            "重新攒满 30 分钟之后应当能提醒"
         );
     }
 }

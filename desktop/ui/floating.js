@@ -137,6 +137,29 @@ function apply(s) {
   try {
     await listen("stats-live", (e) => apply(e.payload));
   } catch (e) {}
+  // 久坐提醒（[rest]，判定在 core 的 RestMonitor）：悬浮窗没有主界面那条 toast，
+  // 自己画一条会自动消失的横条 —— 悬浮窗本来就是"不看主窗口也想看数"的入口。
+  try {
+    await listen("rest-reminder", (e) => {
+      const n = e.payload || {};
+      let el = document.getElementById("rest-notice");
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "rest-notice";
+        el.setAttribute("role", "status");
+        el.style.cssText =
+          "position:fixed;left:0;right:0;top:0;padding:3px 6px;font-size:11px;" +
+          "text-align:center;background:rgba(220,120,30,.92);color:#fff;border-radius:6px;";
+        document.body.appendChild(el);
+      }
+      el.textContent = `久坐提醒：已连用 ${Number(n.window_minutes) || 0} 分钟，起来活动 ${Number(n.rest_seconds) || 0} 秒`;
+      el.style.display = "";
+      clearTimeout(el._hide);
+      el._hide = setTimeout(() => {
+        el.style.display = "none";
+      }, 20000);
+    });
+  } catch (e) {}
   // 主题跟随主窗口：设置页切暗色时广播 theme-changed，悬浮窗实时切换（原需重启）
   try {
     await listen("theme-changed", (e) => {

@@ -1,7 +1,7 @@
 // FocusFlow 主界面入口：视图切换、事件推送分发、统一事件委托、启动初始化。
 
 import { invoke, listen } from "./tauri.js";
-import { $ } from "./utils.js";
+import { $, toast } from "./utils.js";
 import { appState, analyticsTab } from "./state.js";
 import { renderPlugins, openPlugin, closePlugin, renderPluginDetail, togglePlugin, pluginBtn, pluginBtnSel, pluginField, pluginFieldStay, pluginSelectRow, pluginSelectAll, modalOpen, modalCancel, modalSubmit, modalAction } from "./plugins.js";
 import { applyLive, applyCharts, renderRank, renderApps, renderDevices, deviceRename, deviceRenameSave, deviceRenameClear, deviceRenameCancel, openDeviceDetail, closeDeviceDetail, deviceDetailSetPeriod, renderAnalytics, renderTrendChart, renderSettings, doImport, doExport, doVacuum, doBackup, doWeeklyReport } from "./views.js";
@@ -205,6 +205,14 @@ document.querySelectorAll("#analytics-tabs .tab").forEach((b) => {
     await listen("floating-changed", (e) => {
       const cb = $("set-floating");
       if (cb) cb.checked = !!e.payload;
+    });
+    // 久坐提醒（[rest]，判定在 core 的 RestMonitor）：顶部浮层几秒后自动消失
+    await listen("rest-reminder", (e) => {
+      const n = e.payload || {};
+      const w = Number(n.window_minutes) || 0;
+      const c = Number(n.events_in_window) || 0;
+      const s = Number(n.rest_seconds) || 0;
+      toast(`久坐提醒：最近 ${w} 分钟键鼠 ${c} 次，起来活动 ${s} 秒`);
     });
   } catch (e) {
     console.error("事件订阅失败", e);

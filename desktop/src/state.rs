@@ -1049,6 +1049,9 @@ fn spawn_stats_worker(
             // 各周期最高单日缓存：period -> (次数, 日期)；重聚合播种，今日破纪录时快节奏即时更新
             let mut period_max: std::collections::HashMap<i64, (i64, String)> =
                 std::collections::HashMap::new();
+            // 久坐提醒（`[rest]`）：判定与自节流都在 RestMonitor 里，
+            // 这里每 tick 只喂一个"今日累计事件数"。
+            let mut rest_monitor = focusflow_core::stats::RestMonitor::default();
             // "总计"(period=0) 聚合缓存与全历史最高单日缓存：
             // 两者都需要跨年度库全表扫描/全表 ORDER BY，active 的 2s 快节奏不触发重算，
             // 仅在 强制刷新 / 跨天 / 今日新增写入量 ≥ ALLTIME_RECALC_THRESHOLD 时失效重建。
@@ -1299,6 +1302,24 @@ fn spawn_stats_worker(
                 prev_cpm = cpm;
                 prev_active = cur_active;
                 prev_period = period_val;
+
+                // 久坐提醒：不受"有没有变化"影响，每个 tick 都喂一次判定
+                // （RestMonitor 自己按 [rest] check_interval 节流）。
+                if let Some(notice) = rest_monitor.observe(Instant::now(), cur_today, config) {
+                    tracing::info!(
+                        "久坐提醒: 近 {} 分钟 {} 次键鼠事件，建议休息 {} 秒",
+                        notice.window_minutes,
+                        notice.events_in_window,
+                        notice.rest_seconds
+                    );
+                    // 与 stats-live 同一套定向推送：隐藏的窗口渲染进程是停着的
+                    if main_visible {
+                        let _ = app.emit_to("main", "rest-reminder", &notice);
+                    }
+                    if floating_visible {
+                        let _ = app.emit_to("floating", "rest-reminder", notice);
+                    }
+                }
 
                 if today_count != prev_logged_today {
                     // 限频：打字时今日计数每秒都在变，每 60 秒最多记一条，避免日志刷屏
