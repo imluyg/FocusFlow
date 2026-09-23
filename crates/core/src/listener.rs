@@ -573,8 +573,16 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::SystemTime;
 
+    /// 测试用的 `&'static` 配置。
+    ///
+    /// `InputListener` 按 `&'static FocusFlowConfig` 持有配置（生产里它就是全局单例），
+    /// 所以这份只能泄漏到进程结束 —— RAII 的 `TestAppDir` 用不上。也正因如此，草稿
+    /// 不能放 `%TEMP%`：那里的名字带 pid，每跑一次测试就永久多留一个目录（本机攒到
+    /// 179 个）。放到 `target/` 下的**固定路径**才是对的：跨运行复用同一个目录，
+    /// 一次 `cargo clean` 全部带走，`%TEMP%` 不再增长。
     fn test_config() -> &'static FocusFlowConfig {
-        let dir = std::env::temp_dir().join(format!("ff_listener_cfg_{}", std::process::id()));
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ff_listener_cfg");
         std::fs::create_dir_all(&dir).ok();
         Box::leak(Box::new(
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
