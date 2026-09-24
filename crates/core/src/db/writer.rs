@@ -193,6 +193,9 @@ struct WriterState {
     alive: AtomicBool,
     /// 成功落库次数（有实际写入才递增）：图表缓存用 "序号未变" 判定库内容没变，跳过重聚合
     flush_seq: AtomicU64,
+    /// 启动回放后留下的兜底副本路径，等**首批增量真的落库**才删（见 `take_recovery`）。
+    /// `None` = 这次启动没有回放任何东西。
+    recovery_leftover: Mutex<Option<std::path::PathBuf>>,
 }
 
 /// 写入器句柄（Send + Sync，可跨线程持有）。
@@ -236,8 +239,9 @@ impl DbWriter {
                 .max(0) as u64
         };
         // 启动回放：上次进程异常终止时写入的未落库增量（若存在）并入内存聚合，
-        // 随首次周期 flush 正常落库。读取后立即删除，保证只回放一次不重复计数。
-        let recovered = take_recovery();
+        // 随首次周期 flush 正常落库。读到就改名留一份副本，等首批增量真落库再删
+        // （见 `take_recovery`）—— 原来是读到即删，等于把兜底证据只留到首次 flush。
+        let (recovered, recovered_copy) = take_recovery();
         if let Some(ref r) = recovered {
             tracing::warn!(
                 "发现未落库增量恢复文件，已回放: daily={} hourly={} keys={} apps={}",
@@ -275,6 +279,7 @@ impl DbWriter {
             today_key: AtomicU64::new(current_day_key()),
             alive: AtomicBool::new(true),
             flush_seq: AtomicU64::new(0),
+            recovery_leftover: Mutex::new(recovered_copy),
         });
 
         let writer = Arc::new(Self {
@@ -438,42 +443,84 @@ impl DbWriter {
     /// 导入进来的时长不会丢，但内存里那个基准还是旧的 —— 界面上的「今日活跃时长」
     /// 会一直少着一截，直到下次重启才补回来。以前这里只刷了次数。
     /// 先 flush 再读聚合表，两个数取的是同一份已落库的状态。
+    ///
+    /// flush 只等 3 秒，超时是常态而非例外（写线程正在重试退避、库被别的连接占着），
+    /// 而那批增量随后才落库 —— 所以锚定值不能只取库值：`库里的今日聚合 + 内存里
+    /// 尚未落库的今日增量` 才是今日真值。原来超时后照用库值，等于把那批增量从
+    /// 「今日」里抹掉，而 `today_count` 之后只会往上加，一整天都补不回来
+    /// （「总计」卡片和悬浮窗跟着偏小）。
     pub fn recompute_today_totals(&self) {
-        self.flush(true);
+        let flushed = self.flush_confirmed(true);
         self.state
             .today_key
             .store(current_day_key(), Ordering::Relaxed);
+        let today_dk = queries::day_key_of_date(chrono::Local::now().date_naive());
+        // 持着 agg 锁去读库：写线程的 flush_pending 也要这把锁（它的 SQLite IO 在
+        // 锁外做），所以"库里的值"和"内存里的待落库增量"取的是同一瞬间的状态，
+        // 不会出现同一批既算进库值又算进增量。
+        let agg = self.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+        let pending_count = agg.daily.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
+        let pending_active = agg.active.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
         let (count, seconds) = connection::open_ro(&paths::current_year_db_path())
             .ok()
             .and_then(|conn| {
                 conn.query_row(
                     "SELECT COALESCE(SUM(count), 0), COALESCE(SUM(seconds), 0) \
                      FROM daily_counts WHERE date_key = ?1",
-                    [queries::day_key_of_date(chrono::Local::now().date_naive())],
+                    [today_dk],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
                 )
                 .ok()
             })
             .unwrap_or((0, 0));
-        self.state
-            .today_count
-            .store(count.max(0) as u64, Ordering::Relaxed);
-        self.state
-            .today_active
-            .store(seconds.max(0) as u64, Ordering::Relaxed);
+        // 锁到这一步才放：上面那句读库必须和"读内存增量"取同一瞬间的状态
+        let base_count = self.state.today_count.load(Ordering::Relaxed);
+        let base_active = self.state.today_active.load(Ordering::Relaxed);
+        drop(agg);
+        if !flushed {
+            tracing::warn!("recompute_today_totals: flush 未确认完成，今日基准只追平不回退");
+        }
+        // flush 确认完成 → 库值 + 内存增量就是今日真值，照它重锚（含"库变小"的场景，
+        // 例如 --reset 之后）。超时 → 那批增量可能已被写线程从 agg 里取走、正卡在重试
+        // （既不在库里也不在 agg 里），而内存基准**是含它的** → 只能取 max，
+        // 让今日只会追平、不会倒退。
+        let landed_count = count.max(0) as u64 + pending_count;
+        let landed_active = seconds.max(0) as u64 + pending_active;
+        let (new_count, new_active) = if flushed {
+            (landed_count, landed_active)
+        } else {
+            (landed_count.max(base_count), landed_active.max(base_active))
+        };
+        self.state.today_count.store(new_count, Ordering::Relaxed);
+        self.state.today_active.store(new_active, Ordering::Relaxed);
     }
 
     /// 立即 flush：发信号让写线程落库。`wait=true` 时阻塞等待完成。
     pub fn flush(&self, wait: bool) {
-        if wait {
-            let (tx, rx) = mpsc::channel();
-            let _ = self.state.sig_tx.send(Signal::Flush { done: Some(tx) });
-            if rx.recv_timeout(Duration::from_secs(3)).is_err() {
-                tracing::warn!("flush 等待超时（3 秒），写线程可能繁忙，增量仍在内存中");
-            }
-        } else {
+        let _ = self.flush_confirmed(wait);
+    }
+
+    /// 同 [`Self::flush`]，但把"这批增量是否已确认落库"告诉调用方。
+    /// `wait=false` 恒返回 false：没等过就不能声称落完了。
+    fn flush_confirmed(&self, wait: bool) -> bool {
+        if !wait {
             let _ = self.state.sig_tx.send(Signal::Flush { done: None });
+            return false;
         }
+        let (tx, rx) = mpsc::channel();
+        if self
+            .state
+            .sig_tx
+            .send(Signal::Flush { done: Some(tx) })
+            .is_err()
+        {
+            return false;
+        }
+        if rx.recv_timeout(Duration::from_secs(3)).is_ok() {
+            return true;
+        }
+        tracing::warn!("flush 等待超时（3 秒），写线程可能繁忙，增量仍在内存中");
+        false
     }
 
     /// 停止写线程（退出前 flush 残留）。
@@ -525,6 +572,11 @@ impl DbWriter {
 /// 未落库增量恢复文件路径。
 fn recovery_path() -> std::path::PathBuf {
     paths::data_dir().join("agg_recovery.json")
+}
+
+/// 回放之后给恢复文件留的副本名：等首批增量真的落库才删。
+fn recovery_kept_path() -> std::path::PathBuf {
+    paths::data_dir().join("agg_recovery.replayed.json")
 }
 
 /// 恢复文件的序列化格式：JSON 对象键必须是字符串，故整数键的 map 一律转成
@@ -588,6 +640,12 @@ impl From<AggDeltasFile> for AggDeltas {
 /// 把未落库增量快照写到恢复文件。
 /// `take=true` 时同时从内存聚合移除：用于 stop 超时 / panic（进程即将终止），
 /// 数据此后只存在于文件中，避免写线程随后恢复后再次落库造成重复计数。
+///
+/// 全程持有 agg 锁，且**先写盘成功、后从内存取走**：原先是"先取走再写盘"，
+/// 写失败只留一行 `tracing::error!` 就 return —— 那批增量既不在库里、也不在
+/// 文件里，等于在最需要兜底的时刻（线程已经不收增量了）把数据凭空抹掉。
+/// 持锁跨写盘还顺带堵掉了取走与落库之间的竞态：写线程的 `flush_pending`
+/// 同样要拿这把锁（它的 SQLite IO 在锁外做），所以在它看来这批增量从未消失过。
 fn snapshot_recovery(state: &WriterState, take: bool) {
     // try_lock：panic 可能发生在持有 agg 锁的线程，此时放弃快照（进程即将终止）
     let Ok(mut agg) = state.agg.try_lock() else {
@@ -596,13 +654,7 @@ fn snapshot_recovery(state: &WriterState, take: bool) {
     if agg.is_empty() {
         return;
     }
-    let pending = if take {
-        agg.take_for_flush()
-    } else {
-        agg.clone()
-    };
-    drop(agg);
-    let json = match serde_json::to_string(&AggDeltasFile::from(&pending)) {
+    let json = match serde_json::to_string(&AggDeltasFile::from(&*agg)) {
         Ok(j) => j,
         Err(e) => {
             tracing::error!("恢复文件序列化失败: {e}");
@@ -615,25 +667,64 @@ fn snapshot_recovery(state: &WriterState, take: bool) {
     let tmp = path.with_extension("json.tmp");
     let result = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path));
     match result {
-        Ok(()) => tracing::warn!(
-            "未落库增量已写入恢复文件 {}（下次启动回放）",
-            path.display()
-        ),
+        Ok(()) => {
+            tracing::warn!(
+                "未落库增量已写入恢复文件 {}（下次启动回放）",
+                path.display()
+            );
+            if take {
+                agg.take_for_flush();
+            }
+        }
+        // 写失败就**不**取走：增量仍在内存里，至少不比修前更糟
         Err(e) => tracing::error!("恢复文件写入失败 {}: {e}", path.display()),
     }
 }
 
-/// 读取并删除恢复文件（启动回放）。解析失败同样删除：残缺文件重试无意义。
-fn take_recovery() -> Option<AggDeltas> {
+/// 读取恢复文件（启动回放）。
+///
+/// 返回 `(回放进内存的增量, 要留到首批落库之后再删的副本路径)`。
+/// 原来读到就 `remove_file`，而回放的数据要等**首次周期 flush**（默认 10 秒）才进库
+/// —— 这 10 秒里再崩一次/断电，那批增量就二次丢失，而且盘上连痕迹都没有。
+/// 现在改成改名留一份：改名成功就等于"不会被第二次回放"（下次启动只看
+/// `agg_recovery.json`），删除则推迟到写线程确认首批增量真的落库之后。
+/// 解析失败同样改名（不再重读重败），但不必等落库 —— 没有数据要保护。
+fn take_recovery() -> (Option<AggDeltas>, Option<std::path::PathBuf>) {
     let path = recovery_path();
-    let text = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    match serde_json::from_str::<AggDeltasFile>(&text) {
-        Ok(v) => Some(v.into()),
-        Err(e) => {
-            tracing::error!("恢复文件解析失败（已丢弃）: {e}");
-            None
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return (None, None);
+    };
+    let kept = recovery_kept_path();
+    // Windows 上目标已存在时 rename 会失败（上次崩留下的副本还没到删除时机）→ 先清掉它。
+    // 这里覆盖是安全的：那份副本的内容已经在这次的 agg_recovery.json 里被重新算过了
+    // —— 上一轮回放进内存的增量如果没落库，进程就不会活着写新的恢复文件；落了库就已在库里。
+    if std::fs::rename(&path, &kept).is_err() {
+        let _ = std::fs::remove_file(&kept);
+        if std::fs::rename(&path, &kept).is_err() {
+            // 改名失败（副本被别的进程占着）就退回旧行为：删掉，
+            // 不能让同一份文件每次启动都重放一遍——那是确定的重复计数。
+            let _ = std::fs::remove_file(&path);
         }
+    }
+    match serde_json::from_str::<AggDeltasFile>(&text) {
+        Ok(v) => (Some(v.into()), Some(kept)),
+        Err(e) => {
+            tracing::error!("恢复文件解析失败（已丢弃，残片在 {}）: {e}", kept.display());
+            (None, None)
+        }
+    }
+}
+
+/// 首批增量已落库 → 可以扔掉回放副本了。幂等：没有副本时为空操作。
+fn drop_recovery_leftover(state: &WriterState) {
+    let Ok(mut slot) = state.recovery_leftover.lock() else {
+        return;
+    };
+    let Some(path) = slot.take() else { return };
+    match std::fs::remove_file(&path) {
+        Ok(()) => tracing::debug!("回放副本已删除 {}", path.display()),
+        // 删不掉不影响正确性：下次启动只读 agg_recovery.json，不会重放这个副本
+        Err(e) => tracing::warn!("回放副本删除失败 {}: {e}", path.display()),
     }
 }
 
@@ -740,9 +831,11 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
     let mut parts = pending.split_by_year(year_of_day_key);
     // 只回填写失败的那一份，其他年份已成功落库的不重写
     let mut failed: Vec<AggDeltas> = Vec::new();
+    let mut wrote_any = false;
     for (year, part) in parts.drain() {
         match flush_partition(conn, conn_year, year, &part) {
             Ok(()) => {
+                wrote_any = true;
                 state.flush_seq.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
@@ -750,6 +843,10 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
                 failed.push(part);
             }
         }
+    }
+    if wrote_any {
+        // 首批真的进库了 —— 启动回放留的副本到这里才完成它的使命（见 take_recovery）
+        drop_recovery_leftover(state);
     }
     if failed.is_empty() {
         return;
@@ -1167,6 +1264,115 @@ mod tests {
         w.recompute_today_totals();
         assert_eq!(w.today_count(), 502, "按键数跟着库走");
         assert_eq!(w.today_active_seconds(), 4010, "活跃时长也得跟着库走");
+        w.stop_and_wait();
+    }
+
+    /// 库被独占、flush 超时（3 秒）时重锚今日基准，绝不能把尚未落库的增量抹掉。
+    ///
+    /// 修前：只等 3 秒就照抄库值 → 今日按键数从那一刻起整天偏小，
+    /// 「总计」卡片和悬浮窗跟着偏（`today_count` 之后只会往上加，补不回来）。
+    #[test]
+    fn recompute_today_totals_does_not_lose_deltas_that_have_not_landed() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_recompute_locked");
+        let w = DbWriter::start(Duration::from_secs(3600));
+        let t0 = queries::now_ts();
+        for i in 0..5 {
+            w.record("A", t0 + i);
+        }
+        assert_eq!(w.today_count(), 5, "前提：内存基准含这 5 次");
+
+        // 另开一个连接把库独占住 → 写线程落不了库，flush(true) 必然超时
+        let path = paths::current_year_db_path();
+        {
+            let blocker = connection::open_rw(&path).unwrap();
+            blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+            w.recompute_today_totals();
+            assert!(
+                w.today_count() >= 5,
+                "未落库的 5 次必须还在今日里，实际 {}",
+                w.today_count()
+            );
+            blocker.execute_batch("COMMIT;").ok();
+        }
+        w.stop_and_wait();
+        assert!(w.today_count() >= 5, "落库之后今日计数更不能倒退");
+    }
+
+    /// 恢复文件写盘失败时，增量必须仍留在内存里。
+    /// 修前是"先从内存取走、再写盘"，写失败只留一行 error 日志就 return
+    /// → 那批数据既不在库里也不在文件里，凭空消失（而且正是在写线程已经
+    /// 不收增量的时刻，没有任何补救途径）。
+    #[test]
+    fn snapshot_recovery_keeps_deltas_in_memory_when_the_write_fails() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("recovery_writefail");
+        let w = DbWriter::start(Duration::from_secs(3600));
+        w.record("A", queries::now_ts());
+        // 让写盘必失败：临时文件路径上放一个同名目录
+        let tmp = recovery_path().with_extension("json.tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        snapshot_recovery(&w.state, true);
+
+        let still_there = w
+            .state
+            .agg
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .daily
+            .values()
+            .sum::<i64>();
+        assert_eq!(
+            still_there, 1,
+            "写盘失败时不能把增量从内存取走（修前：已被 take 走，数据凭空消失）"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+        w.stop_and_wait();
+    }
+
+    /// 启动回放留下的副本，要等首批增量真的落库才删。
+    ///
+    /// 修前是"读到即删"，而回放进内存的数据要等首次周期 flush（默认 10 秒）才进库
+    /// → 这 10 秒内再崩一次就是二次丢失，且盘上连痕迹都没有。
+    #[test]
+    fn recovery_copy_survives_until_the_replayed_deltas_land() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("recovery_keep");
+        // 造一份恢复文件：先起一个 writer，收到增量后按 stop 超时那条路做快照
+        {
+            let w = DbWriter::start(Duration::from_secs(3600));
+            w.record("A", queries::now_ts());
+            w.record("A", queries::now_ts() + 1);
+            snapshot_recovery(&w.state, true);
+            assert!(recovery_path().exists(), "快照应写出恢复文件");
+            w.stop_and_wait();
+        }
+
+        // 第二次"启动"：回放。原文件必须被改名带走（不能留在原地等着被重放第二次），
+        // 副本先留着 —— 此时数据还没进库。
+        let w = DbWriter::start(Duration::from_millis(200));
+        assert!(
+            !recovery_path().exists(),
+            "回放后原恢复文件不能再留在盘上（否则下次重放两次）"
+        );
+        assert!(
+            recovery_kept_path().exists(),
+            "回放要把恢复文件改名留成副本，读到就删等于只留 10 秒证据"
+        );
+        assert!(w.today_count() >= 2, "回放的增量要计入今日基准");
+
+        // 等首批增量落库（interval=200ms）→ 副本此时才该消失
+        for _ in 0..50 {
+            if !recovery_kept_path().exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !recovery_kept_path().exists(),
+            "首批增量落库后回放副本必须被删掉，别永久留在 data/ 里"
+        );
         w.stop_and_wait();
     }
 
