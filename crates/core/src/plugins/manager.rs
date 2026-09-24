@@ -418,18 +418,33 @@ impl PluginManager {
     /// 「停用的不执行其代码」这句承诺正好相反，也白跑了加载失败那批的顶层代码。
     /// 这 4 个字段本来就是给人看的字符串字面量，扫一行足够；真正要执行顶层代码的
     /// 加载路径照旧用 `read_meta`。
+    ///
+    /// **判据必须与 `read_meta` 的实际口径一致**（扫出来的名字 = 加载后的名字），
+    /// 否则插件管理页会拿一个假名字当键用：那页的「打开」按钮传的就是列表里的
+    /// `p.name`（见 `desktop/ui/js/plugins.js` 的 `open-plugin`），名字对不上
+    /// 就是点一次报一次「插件未提供视图」。所以要挡掉两类假命中：
+    /// `--[[ ]]` 块注释里被注释掉的旧值、函数体里缩进的同名局部赋值。
+    /// 规则写在 [`top_level_string_assign`] 与 [`strip_lua_non_code`] 里：
+    /// 先把注释和长字符串整段抹成空格，再只认**从第 0 列起**正好是
+    /// `KEY = "字面量"` 的行（`local KEY = …` 也不算 —— 那根本不会成为全局变量）。
     fn scan_meta(path: &Path) -> Result<(String, String, String, String), String> {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        Ok(Self::scan_meta_source(&text, path))
+    }
+
+    /// `scan_meta` 的全部判定（读文件之外的那部分，单独拿出来才测得动）。
+    fn scan_meta_source(text: &str, path: &Path) -> (String, String, String, String) {
+        let code = strip_lua_non_code(text);
         let field = |key: &str| -> Option<String> {
-            text.lines()
-                .find_map(|line| literal_after_assign(line, key))
+            code.lines()
+                .find_map(|line| top_level_string_assign(line, key))
         };
-        Ok((
+        (
             field("PLUGIN_NAME").unwrap_or_else(|| Self::stem_of(path)),
             field("PLUGIN_DESC").unwrap_or_default(),
             field("PLUGIN_VERSION").unwrap_or_else(|| "1.0".to_string()),
             field("PLUGIN_AUTHOR").unwrap_or_default(),
-        ))
+        )
     }
 
     /// 从 Lua 脚本读取元数据（不执行 init）。
@@ -490,11 +505,17 @@ impl PluginManager {
         // 后来者静默覆盖前者：被顶掉的那个既不再接收键事件，也再没有 unload
         // 入口（cleanup 永不执行），而它的 .lua 还在盘上。拿复制模板改插件的人
         // 十有八九是忘了改 PLUGIN_NAME，所以这里明确报错、保留已加载的那个。
+        //
+        // **判据是源文件，不是展示名**：热重载现在"先加载新版本、成功才退休旧条目"
+        // （见 `reload_plugin`），而加载那一下旧条目还在表里挂着 —— 按展示名判重的话，
+        // 每个插件的自我重载都会被自己判成撞名，于是"坏不了的插件反而永远重载不动"
+        // （上一场就是卡在这一步停手的）。同一个源文件的重复加载不算撞名：
+        // 下面 insert 会顶掉它自己那一条，改了名的旧名字另外摘掉。
         let stem = Self::stem_of(path);
         if let Some(clash) = self
             .plugins
-            .get(&meta.name)
-            .filter(|p| Self::stem_of(&p.file_path) != stem)
+            .values()
+            .find(|p| p.name == meta.name && !is_same_source(&p.file_path, path))
         {
             return Err(format!(
                 "PLUGIN_NAME「{}」与已加载插件（文件 {}）重名，请改一个再启用",
@@ -508,13 +529,8 @@ impl PluginManager {
         self.apply_lua_limits(&lua);
         // 宿主按文件名记账调度线程的使用者，所以这里传 stem 而不是展示名：
         // 两个插件的 PLUGIN_NAME 相同是常见的手误，展示名当键会串味。
-        host::register_host_api(
-            &lua,
-            self.config,
-            Arc::clone(&self.db),
-            &Self::stem_of(path),
-        )
-        .map_err(|e| format!("宿主 API 注册失败: {e}"))?;
+        host::register_host_api(&lua, self.config, Arc::clone(&self.db), &stem)
+            .map_err(|e| format!("宿主 API 注册失败: {e}"))?;
         let script = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         lua.load(&script)
             .set_name(&meta.name)
@@ -545,6 +561,23 @@ impl PluginManager {
             view,
         };
 
+        // 新实例装好了，才让同源的旧版本退休。同名的那条由 insert 顶掉；
+        // 但这一版把 PLUGIN_NAME 改了名的话顶不掉，会留下"同一个文件、两份实例"的
+        // 僵尸 —— 旧那条既不再收键事件、又没有 unload 入口（cleanup 永不执行），
+        // 记在 stem 上的调度线程使用者也就再没人回收。这里刻意**不**跑 cleanup、
+        // 也不动 owner 记账：重载语义见 `reload_plugin`。
+        let renamed = self
+            .plugins
+            .iter()
+            .find(|(name, p)| {
+                name.as_str() != info.name.as_str() && is_same_source(&p.file_path, path)
+            })
+            .map(|(name, _)| name.clone());
+        if let Some(old) = renamed {
+            tracing::info!("插件改名，旧条目退休: {old} -> {}", info.name);
+            self.plugins.remove(&old);
+        }
+
         self.plugins.insert(info.name.clone(), info);
         tracing::info!("插件加载成功: {}", self.plugins.len());
         // 返回刚加载的插件名
@@ -567,6 +600,21 @@ impl PluginManager {
                 Ok(name)
             }
             Err(e) => {
+                // 失败的那次尝试可能已经在调度线程上把这个文件名登记成使用者了 ——
+                // `init()` 跑到一半才报错最常见（`focusflow.scheduler_tasks()` 是第一个
+                // 会 claim 的宿主 API，插件往往先列任务再在下一行炸）。表里已经没有这个
+                // 源文件的条目时，那份登记就成了无主孤儿：唯一的释放入口是插件 Lua 里的
+                // `scheduler_shutdown()`，而那个状态已经跟着失败的回滚一起没了 →
+                // 本进程的调度线程再也回收不掉（见 `reload_plugin` 的说明）。
+                // **有活着的旧实例时一律不销**：那份账属于旧实例，重载失败要"什么都没
+                // 发生"，销它等于把定时任务的线程从还在用它的插件脚下拆走。
+                if !self
+                    .plugins
+                    .values()
+                    .any(|p| is_same_source(&p.file_path, path))
+                {
+                    host::release_scheduler(&stem);
+                }
                 self.load_errors.insert(stem, e.clone());
                 Err(e)
             }
@@ -636,6 +684,18 @@ impl PluginManager {
     }
 
     /// 重新加载插件（按文件名或插件名匹配）。
+    ///
+    /// **先加载新版本，成功之后才让旧条目退休**（退休那一步在 `load_plugin` 里，
+    /// 因为改名时新旧展示名不同、光靠 insert 顶不掉）。旧实现是先 `plugins.remove(n)`
+    /// 再 `try_load`，那是"把两步中可能失败的那步放在后面"：编辑器/网盘留下一个
+    /// 半截的、语法错误的文件时（这类工具最爱这么写），旧实例已经离开表、而它的
+    /// `cleanup()` 按设计没跑，新加载又失败 → 插件从 map 里消失、正打开的详情页
+    /// 变成「插件未提供视图」，而它记在 `claim_scheduler` 上的 owner 成了无主孤儿
+    /// （`host.rs` 里那份 owner 表只有 Lua 侧 `scheduler_shutdown()` 一个释放入口，
+    /// 而那个 Lua 状态已经跟着旧条目没了）→ 本进程再也回收不掉，
+    /// 除了重启没有别的办法把定时任务线程还回来。
+    /// 现在失败路径**一个字都不动**旧实例：重载失败 = 什么都没发生（插件页多一条
+    /// 加载失败原因，见 `try_load`），下一次存盘成功再换上来。
     pub fn reload_plugin(&mut self, key: &str) -> bool {
         // 先按插件名匹配，再按文件名匹配
         let path = self
@@ -650,24 +710,16 @@ impl PluginManager {
             });
         match path {
             Some(p) => {
-                // 找到插件名用于摘除
-                let pname = self
-                    .plugins
-                    .values()
-                    .find(|x| x.file_path == p)
-                    .map(|x| x.name.clone());
                 // 重载刻意**不**跑 cleanup()：这条路径是「存了个文件」触发的
                 // （mtime 变化、构建脚本换目录、编辑器先截断再写入），而番茄插件的
                 // cleanup 会 `pomodoro_stop()` —— 那段 `save_current()` 只要实际计时
                 // ≥1 秒就给 `work_finished += 1`。于是按一次 Ctrl+S 就把用户跑到一半的
                 // 番茄钟判成「完成一个」，还是静默的。调度线程同理，拆了要靠重新渲染
                 // 定时任务面板才起得回来。
-                // 摘掉条目即可：旧 Lua 状态随它一起释放，新的那份经宿主 API 复用
-                // 同一批进程级单例（沙箱里没有 io/coroutine，插件本身持不住别的资源）。
+                // 所以这里只把条目换掉：旧 Lua 状态随旧条目一起释放，新的那份经宿主
+                // API 复用同一批进程级单例（沙箱里没有 io/coroutine，插件本身持不住
+                // 别的资源），owner 记账按 stem 走、两份实例同一个 stem 也就一次登记。
                 // 真正的「停用/删文件」仍然走 unload_plugin → cleanup。
-                if let Some(n) = &pname {
-                    self.plugins.remove(n);
-                }
                 self.try_load(&p).is_ok()
             }
             None => false,
@@ -733,10 +785,24 @@ impl PluginManager {
         tracing::info!("插件热重载已禁用");
     }
 
-    /// GUI 线程轮询：处理热重载请求。返回本次重载的插件名列表。
+    /// GUI 线程轮询：处理热重载请求。返回本次实际换上来的插件名列表
+    /// （文件已被删除的那些，卸载成功后也算 —— 调用方要刷新列表的就是这批）。
+    ///
+    /// 删除这条在 core 这边原先是**检测到也没人处理**的：`reload_plugin` 按名字找不
+    /// 到实例就返回 false，于是"删掉 .lua"要等下次重启才生效，而删除表达的恰恰是
+    /// 「别再跑它了」（它的 cleanup 也就一直不执行）。桌面侧早就按这个口径做了，
+    /// 见 `desktop/src/plugins.rs` 的 `reload_plugin_by_key`。
     pub fn poll_reload_requests(&mut self) -> Vec<String> {
         let mut reloaded = Vec::new();
+        let dir = self.plugins_dir();
         while let Ok(name) = self.reload_rx.try_recv() {
+            if !dir.join(format!("{name}.lua")).exists() {
+                if self.unload_by_stem(&name) {
+                    tracing::info!("插件文件已删除，已卸载: {name}");
+                    reloaded.push(name);
+                }
+                continue;
+            }
             if self.reload_plugin(&name) {
                 reloaded.push(name);
             }
@@ -898,6 +964,23 @@ impl PluginManager {
     }
 }
 
+/// 判断两个路径指向的是不是**同一个源文件**。
+///
+/// 撞名闸改成按源文件判重（见 `load_plugin`）之后，这一步的准头直接决定"重载"和
+/// "撞名"分不分得开：判成同一个文件 → 放行（那是自我重载，旧条目随后退休）；
+/// 判成两个文件 → 拒。所以先按原样比，再 `canonicalize` 比一次（同一个文件可能以
+/// 相对/绝对、大小写不同的写法传进来），都拿不到就保守地当成**两个**文件 ——
+/// 宁可多拒一次撞名，也不能把"两个插件抢一个名字"放过去。
+fn is_same_source(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// 判断 Lua 错误是否由资源限制触发（指令数超限 / 内存超限）。
 /// 此类错误说明插件已不可信，应停用插件而非继续复用其 Lua 环境。
 fn is_limit_error(e: &mlua::Error) -> bool {
@@ -906,66 +989,268 @@ fn is_limit_error(e: &mlua::Error) -> bool {
 
 /// 热重载检测循环：扫描插件目录 mtime，变更时发送重载请求。
 /// 不执行 Lua（Lua 非 Send，只能在 GUI 线程）。
+///
+/// 三条保护是照桌面侧那份（`desktop/src/plugins.rs::start_hot_reload`）补的 ——
+/// 那三条都是那边先踩过、写过注释才定下来的：
+/// 1. 目录整体没读出来时**既不比对、也不清基线**（见 [`scan_plugin_mtimes`]）；
+/// 2. **文件消失**也要发请求（见 [`reload_requests`]），否则删掉的插件要重启才停；
+/// 3. 0 字节的 `.lua` 本轮不算变更（编辑器"先截断再写入"的一瞬间，见
+///    [`scan_plugin_mtimes`]）—— 空的 .lua 会被 Lua 当成空块、一句错都不报，
+///    插件就此变成没有函数的空壳。
 fn hot_reload_loop(dir: PathBuf, tx: mpsc::Sender<String>, stop: Arc<AtomicBool>) {
     let mut last_mtime: HashMap<String, Option<SystemTime>> = HashMap::new();
-    let mut first_scan = true;
+    // 基线是否已经配平过（首轮只建基线不发事件，否则每次启动都把全部插件当"新文件"
+    // 重载一遍）
+    let mut primed = false;
     while !stop.load(Ordering::SeqCst) {
-        // 扫描目录
-        let mut seen: HashMap<String, Option<SystemTime>> = HashMap::new();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().map(|e| e == "lua").unwrap_or(false) {
-                    let name = p
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !name.is_empty() {
-                        let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
-                        seen.insert(name, mtime);
-                    }
-                }
-            }
-        }
-        if first_scan {
-            last_mtime = seen;
-            first_scan = false;
-        } else {
-            // 检测变更（mtime 变化或新文件）
-            for (name, mtime) in &seen {
-                let changed = match last_mtime.get(name) {
-                    Some(prev) => *prev != *mtime,
-                    None => true, // 新文件
-                };
-                if changed {
-                    tracing::info!("热重载检测到变更: {name}");
-                    let _ = tx.send(name.clone());
-                }
-            }
-            last_mtime = seen;
+        for name in hot_reload_round(&dir, &mut last_mtime, &mut primed) {
+            tracing::info!("热重载检测到变更: {name}");
+            let _ = tx.send(name);
         }
         std::thread::sleep(std::time::Duration::from_millis(2000));
     }
 }
 
-/// 从一行 Lua 源码里取 `KEY = "值"` 的字面量值（取不到返回 `None`）。
+/// 一轮扫描的全部判定（线程里除了 sleep 就只剩这一句，判定本身全在这里 —— 这样
+/// 上面那三条保护才测得动，不用去起真线程、也不用等 2 秒一周期的 tick）。
+/// 返回这一轮该发出去的重载请求；`last` / `primed` 是跨轮状态。
+fn hot_reload_round(
+    dir: &Path,
+    last: &mut HashMap<String, Option<SystemTime>>,
+    primed: &mut bool,
+) -> Vec<String> {
+    // `None` = 这一轮目录没读出来：基线与 `primed` 一个字都不动，下一轮再说。
+    let Some(seen) = scan_plugin_mtimes(dir, last) else {
+        return Vec::new();
+    };
+    let requests = reload_requests(last, &seen, *primed);
+    *last = seen;
+    *primed = true;
+    requests
+}
+
+/// 扫一次插件目录，得到「文件名 → mtime」快照；**返回 `None` 表示目录没读出来**
+/// （`plugins` 被建成同名文件、整份放在断线的网盘上、构建脚本正在替换目录……）。
+/// 这条区分必须传出去：把"没读到"当"目录空了"参与比对，每个插件都会被判成
+/// 「文件已删除」而全部卸载；把基线清空，则下一轮成功读取会把所有文件当成新变更，
+/// 白重载一整轮。
 ///
-/// 刻意不做转义、不支持 `[[长字符串]]`、也不接受 `KEY = 变量` 这类计算值：
+/// `last` 只用来给 0 字节的文件沿用上一轮指纹（本轮既不算新增也不算消失）。
+fn scan_plugin_mtimes(
+    dir: &Path,
+    last: &HashMap<String, Option<SystemTime>>,
+) -> Option<HashMap<String, Option<SystemTime>>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::error!(
+                "热重载扫描读不到插件目录（{}），本轮不判定任何变更 —— 这不是「没有插件」: {e}",
+                dir.display()
+            );
+            return None;
+        }
+    };
+    let mut seen: HashMap<String, Option<SystemTime>> = HashMap::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.extension().map(|e| e == "lua").unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = p.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&p) else {
+            continue;
+        };
+        if meta.len() == 0 {
+            // 0 字节 = 还没写完的那一瞬间：沿用上一轮指纹（没有就不记），
+            // 否则删除检测会把它误判成"文件消失"，而插件页会拿到一个空壳。
+            if let Some(prev) = last.get(name) {
+                seen.insert(name.to_string(), *prev);
+            }
+            continue;
+        }
+        seen.insert(name.to_string(), meta.modified().ok());
+    }
+    Some(seen)
+}
+
+/// 两轮快照之间该发哪些重载请求：mtime 变了、出现了新文件、**文件消失了**。
+/// 只遍历 `seen` 会漏掉最后一种 —— 而删掉文件表达的意思恰恰是「别再跑它了」。
+/// `primed == false`（首轮）什么都不发。返回排序后的稳定顺序，便于日志与测试对账。
+fn reload_requests(
+    last: &HashMap<String, Option<SystemTime>>,
+    seen: &HashMap<String, Option<SystemTime>>,
+    primed: bool,
+) -> Vec<String> {
+    if !primed {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = seen
+        .iter()
+        .filter(|(name, mtime)| last.get(*name) != Some(mtime))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in last.keys() {
+        if !seen.contains_key(name) {
+            out.push(name.clone());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 把 Lua 源码里**不是代码**的部分抹掉：`--` 行注释、`--[[ ]]` / `[==[ ]==]` 块注释、
+/// `[[ ]]` 长字符串。目标是让"这一行的第一个代码记号"这件事可以用**列号**回答：
+/// - 整段正好从行首开始 → 直接删掉（调用处连它后面的空白一起吞掉），于是
+///   `--[[ 说明 ]] PLUGIN_NAME = "值"` 这种"注释打头、后面跟着真声明"的一行仍算顶层；
+/// - 否则等长换成空格（保住后面那些字节的列号）；
+/// - 换行一律原样保留：行号不能错位，而块注释/长字符串**内部**那些顶在第 0 列的
+///   假赋值整段都在被抹掉的区间里，这正是这一轮要挡掉的东西。
+///
+/// 为什么不写成"正经的 Lua 词法分析器"：这里只需要回答"这一行是不是顶层的
+/// `KEY = "字面量"`"，而扫错名字的代价已经写在 `PluginManager::scan_meta` 上了。
+/// 引号内的 `--` 不当注释（`PLUGIN_DESC = "a -- b"` 整值被抹掉就是假阴性）；
+/// 单行字符串到行尾还没闭合时后半段原样保留（半截文件本来就语法错，别再把手上
+/// 唯一一处真名字也吃掉）。所有切片走 `.get()`：读的是外部文件，release 是 abort。
+fn strip_lua_non_code(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    // 刚删掉一段行首的注释/长字符串：连它后面到下一个代码记号之间的空白一起吞
+    let mut swallow = false;
+    while i < b.len() {
+        match b[i] {
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                // `--[[ … ]]` 抹到配平的 `]==]`（没有结尾就是文件被写坏，抹到文件尾）；
+                // `-- …` 抹到行尾（换行本身留着）。
+                let end = match long_bracket_open(b, i + 2) {
+                    Some((level, after)) => {
+                        long_bracket_close_from(b, after, level).unwrap_or(b.len())
+                    }
+                    None => newline_from(b, i).unwrap_or(b.len()),
+                };
+                swallow = blank_non_code(&mut out, &b[i..end]);
+                i = end;
+            }
+            b'[' if long_bracket_open(b, i).is_some() => {
+                // 长字符串里的 `PLUGIN_NAME = "…"` 是数据，不是声明
+                let (level, after) = long_bracket_open(b, i).expect("上面刚判定过是长括号");
+                let end = long_bracket_close_from(b, after, level).unwrap_or(b.len());
+                swallow = blank_non_code(&mut out, &b[i..end]);
+                i = end;
+            }
+            q @ (b'"' | b'\'') => {
+                // 字符串照原样保留（值正是我们要取的东西），整段"吃掉"不再往里看
+                swallow = false;
+                out.push(q);
+                let mut j = i + 1;
+                while let Some(&x) = b.get(j) {
+                    if x == b'\\' {
+                        out.push(x);
+                        if let Some(&y) = b.get(j + 1) {
+                            out.push(y);
+                        }
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                    out.push(x);
+                    if x == b'\n' || x == q {
+                        break; // 闭合，或这一行根本没闭合
+                    }
+                }
+                i = j;
+            }
+            b' ' | b'\t' if swallow => {
+                i += 1;
+            }
+            c => {
+                swallow = false;
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    // 正常一定解得开（只写 ASCII 空白 + 原文的合法片段）；解不开也不 panic，退化成 lossy。
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// 把一段"不是代码"的字节追加进 `out`（见 [`strip_lua_non_code`] 的两种形状）。
+/// 返回 `true` = 这一段是从行首整段删掉的，后面的空白该一起吞掉。
+fn blank_non_code(out: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    if out.last().is_none_or(|&c| c == b'\n') {
+        out.extend(chunk.iter().copied().filter(|&c| c == b'\n'));
+        true
+    } else {
+        out.extend(chunk.iter().map(|&c| if c == b'\n' { b'\n' } else { b' ' }));
+        false
+    }
+}
+
+/// `i` 处是否是长括号起始 `[[` / `[=[` / `[==[`…：返回 (等号个数, 起始标记之后的下标)。
+fn long_bracket_open(b: &[u8], i: usize) -> Option<(usize, usize)> {
+    if b.get(i) != Some(&b'[') {
+        return None;
+    }
+    let mut j = i + 1;
+    let mut level = 0usize;
+    while b.get(j) == Some(&b'=') {
+        level += 1;
+        j += 1;
+    }
+    if b.get(j) == Some(&b'[') {
+        Some((level, j + 1))
+    } else {
+        None
+    }
+}
+
+/// 从 `i` 起找配平的长括号结束标记 `]` + `=`×level + `]`，返回其之后的下标。
+fn long_bracket_close_from(b: &[u8], mut i: usize, level: usize) -> Option<usize> {
+    loop {
+        i = b.get(i..)?.iter().position(|&c| c == b']')? + i;
+        let mut j = i + 1;
+        let mut n = 0usize;
+        while b.get(j) == Some(&b'=') {
+            n += 1;
+            j += 1;
+        }
+        if n == level && b.get(j) == Some(&b']') {
+            return Some(j + 1);
+        }
+        i += 1;
+    }
+}
+
+/// `i` 起第一个换行的下标（`None` = 到文件尾）。
+fn newline_from(b: &[u8], i: usize) -> Option<usize> {
+    Some(b.get(i..)?.iter().position(|&c| c == b'\n')? + i)
+}
+
+/// 从一行**已抹掉注释**的 Lua 代码里取顶层元数据赋值 `KEY = "值"`（取不到 `None`）。
+///
+/// 刻意不做转义、不接受 `[[长字符串]]` 当值、也不接受 `KEY = 变量` 这类计算值：
 /// 元数据这几个字段就是给人看的名字/简介/版本，扫不到时调用方回退成文件名，
 /// 换来的是"列表刷新绝不执行插件代码"。
-fn literal_after_assign(line: &str, key: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let body = trimmed.strip_prefix("local ").unwrap_or(trimmed);
-    let after_key = body.strip_prefix(key)?.trim_start();
+///
+/// 两条判据都是为了"别把假名字当真的"（旧实现都不挡）：
+/// - **不 trim 行首空白**：带缩进说明它写在某个块里，函数体里的
+///   `PLUGIN_NAME = "…"` 只是个局部变量，加载后 `read_meta` 从 globals 里取不到它；
+/// - **不接受 `local KEY = …`**：`local` 的同样不会成为全局变量。
+fn top_level_string_assign(line: &str, key: &str) -> Option<String> {
+    let after_key = line.strip_prefix(key)?.trim_start();
     let value = after_key.strip_prefix('=')?.trim_start();
     let quote = *value.as_bytes().first()?;
     if quote != b'"' && quote != b'\'' {
         return None;
     }
-    let inner = &value[1..];
+    let inner = value.get(1..)?;
     let end = inner.find(quote as char)?;
-    Some(inner[..end].to_string())
+    Some(inner.get(..end)?.to_string())
 }
 
 /// 解析 Lua 表的 options 数组为 (value, label) 列表。
@@ -1146,6 +1431,353 @@ fn parse_widget(w: &mlua::Table, depth: u32) -> mlua::Result<crate::plugins::Wid
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 往 `plugins/` 里放一个插件文件（路径按 `discover()` 的口径来）。
+    fn write_lua(dir: &Path, file: &str, body: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(format!("{file}.lua"));
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// 一个用到调度线程、并按 `host.rs` 的说明在 cleanup 里归还的插件。
+    fn scheduler_user(name: &str) -> String {
+        format!(
+            r###"
+PLUGIN_NAME = "{name}"
+function init() focusflow.scheduler_tasks() end
+function cleanup() focusflow.scheduler_shutdown() end
+function get_view() return {{ title = "{name}", widgets = {{ {{type="label", text="ok"}} }} }} end
+"###
+        )
+    }
+
+    /// 一个有视图、别的什么都不干的插件。
+    fn view_only(name: &str) -> String {
+        format!(
+            "PLUGIN_NAME = \"{name}\"\nfunction get_view() return {{ title = \"{name}\", \
+             widgets = {{ {{type=\"label\", text=\"v\"}} }} }} end\n"
+        )
+    }
+
+    /// 每个用例一套**自己的** config：`config::instance()` 是另一个进程级全局，
+    /// 一旦被哪个用例初始化，后面任何一次 `config.set` 都会把盘写到它那个已经删掉的
+    /// 临时目录里（`%TEMP%` 就是这么堆起来的）。这里只 `load`，且用例一律不碰 `set`。
+    fn manager_in(tmp: &Path) -> PluginManager {
+        db::queries::invalidate_years_cache();
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(tmp.join("config.ini")).expect("临时配置应能载入"),
+        ));
+        PluginManager::new(config, db::Database::init_readonly())
+    }
+
+    // ---------- 第八节 A7：热重载失败不许把还能用的插件弄丢 ----------
+
+    /// 把一个还能用的插件文件写成半截语法错误（编辑器自动保存、网盘同步到一半都会这样）：
+    /// 重载必须"什么都没发生"，而不是旧实例已被摘除、新版本又装不回来。
+    ///
+    /// 旧实现是 `plugins.remove(n)` 之后才 `try_load`，于是那一刻：插件从列表里消失、
+    /// 正打开的详情页变成「插件未提供视图」，而它记在 `claim_scheduler` 上的 owner
+    /// 成了无主孤儿 —— 唯一的释放入口是插件 Lua 里的 `scheduler_shutdown()`，
+    /// 而那份 Lua 状态已经跟着条目一起没了 → 本进程的调度线程再也还不回来。
+    #[test]
+    fn a_failed_reload_leaves_the_old_plugin_exactly_where_it_was() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("reload_keeps_old");
+        let plugins = tmp.path().join("plugins");
+        let p = write_lua(&plugins, "keep_old", &scheduler_user("重载别丢我"));
+        let mut pm = manager_in(tmp.path());
+        pm.load_plugin(&p).expect("好版本该能加载");
+        assert_eq!(
+            host::scheduler_state_for_test(),
+            Some(1),
+            "init() 用过调度线程就该把这个文件名登记成使用者"
+        );
+
+        // 半截的语法错误
+        write_lua(
+            &plugins,
+            "keep_old",
+            "PLUGIN_NAME = \"重载别丢我\"\nfunction init() 这行不是 Lua ((( \n",
+        );
+        assert!(
+            !pm.reload_plugin("keep_old"),
+            "坏版本不能让重载报成功（否则调用方以为换上了新的）"
+        );
+
+        // 旧实例还在表里，而且照常能渲染（详情页不该变成「插件未提供视图」）
+        let info = pm
+            .get_plugin("重载别丢我")
+            .expect("旧实例必须还挂着：摘掉它的那一步只能在新版本装好之后发生");
+        assert!(info.loaded, "旧实例不该被顺手标成未加载");
+        assert_eq!(info.file_path, p);
+        pm.refresh_view("重载别丢我")
+            .expect("旧实例的 get_view 该照常能跑");
+        assert!(pm.get_plugin("重载别丢我").unwrap().view.is_some());
+        // owner 记账一个字都不许动 —— 这份账现在是旧实例的，不是孤儿的
+        assert_eq!(
+            host::scheduler_state_for_test(),
+            Some(1),
+            "加载失败时把旧实例的 owner 销掉，等于把定时任务的线程拆了"
+        );
+
+        // 反向腿：旧实例活着 ⇒ 停用就能回收。旧实现走到这里条目已经没了，
+        // `unload_plugin` 返回 false、owner 永远留在表上（= 上面那句"再也回收不掉"）。
+        assert!(pm.unload_plugin("重载别丢我"), "卸载应当成功");
+        assert_eq!(
+            host::scheduler_state_for_test(),
+            None,
+            "最后一个用户走了就该回收"
+        );
+    }
+
+    /// 撞名闸按**源文件**判重之后，两个方向都要钉住：
+    /// - 改了名的重载要真能换上来，并且把旧名字那条一起带走（不然同一个文件两份实例，
+    ///   旧那份再没有 unload 入口、cleanup 永不执行）；
+    /// - 撞上**别的文件**占用的名字仍然要拒，而且被拒的那次不许动旧实例。
+    #[test]
+    fn a_renamed_reload_retires_the_old_entry_and_still_respects_the_gate() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("reload_rename");
+        let plugins = tmp.path().join("plugins");
+        let p = write_lua(&plugins, "ren", &view_only("旧名"));
+        let mut pm = manager_in(tmp.path());
+        pm.load_plugin(&p).expect("加载失败");
+
+        write_lua(&plugins, "ren", &view_only("新名"));
+        assert!(pm.reload_plugin("ren"), "改名重载应当成功");
+        assert!(pm.get_plugin("新名").is_some(), "新名字该进表");
+        assert!(
+            pm.get_plugin("旧名").is_none(),
+            "insert 顶不掉改了名的旧条目，必须显式退休，否则留一份僵尸"
+        );
+        assert_eq!(
+            pm.get_all_plugins().len(),
+            1,
+            "同一个文件不该同时有两份实例"
+        );
+
+        let other = write_lua(&plugins, "neighbour", &view_only("邻居"));
+        pm.load_plugin(&other).expect("加载邻居失败");
+        write_lua(&plugins, "ren", &view_only("邻居"));
+        assert!(!pm.reload_plugin("ren"), "抢了别人的名字要被拒");
+        assert!(
+            pm.get_plugin("新名").is_some(),
+            "被拒的那次重载不许把旧实例一起带走"
+        );
+        assert_eq!(pm.get_all_plugins().len(), 2);
+    }
+
+    /// `init()` 跑一半才失败（首次启用/启动补载这条路上没有"旧实例"可留）：
+    /// 那次尝试在调度线程上登记的 owner 也要跟着回滚，不然同样留下一个本进程
+    /// 再也回收不掉的孤儿 —— 而 `release_scheduler` 只有 Lua 侧一个调用点。
+    #[test]
+    fn a_failed_first_load_does_not_leave_an_orphan_scheduler_owner() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("failed_load_owner");
+        let plugins = tmp.path().join("plugins");
+        write_lua(
+            &plugins,
+            "orphan",
+            "PLUGIN_NAME = \"跑一半就坏\"\nfunction init() focusflow.scheduler_tasks() \
+             error(\"下一行才坏\") end\n",
+        );
+        let mut pm = manager_in(tmp.path());
+        pm.load_all();
+        assert!(
+            pm.get_plugin("跑一半就坏").is_none(),
+            "加载失败的插件不该在表里"
+        );
+        assert_eq!(
+            host::scheduler_state_for_test(),
+            None,
+            "这次尝试登记下的 owner 必须销掉：表里没有它的插件，就再没人能归还"
+        );
+    }
+
+    // ---------- 第八节 A8：元数据扫描只认真正的顶层赋值 ----------
+
+    /// `--[[ ]]` 里被注释掉的旧值、函数体里缩进的同名赋值、`local PLUGIN_NAME`、
+    /// 顶层长字符串里的那一行，都不许赢过真声明。
+    ///
+    /// 扫错的代价写在 `scan_meta` 上：插件管理页的「打开」按钮传的就是这里扫出来的
+    /// 名字（`desktop/ui/js/plugins.js` 的 `open-plugin`），名字对不上就是点一次
+    /// 报一次「插件未提供视图」；旧实现"取第一条匹配行"，只要注释那行带缩进就先命中。
+    #[test]
+    fn scan_meta_only_takes_top_level_assignments() {
+        let path = Path::new("whatever.lua");
+        let name_of = |src: &str| PluginManager::scan_meta_source(src, path).0;
+
+        // 块注释里的假名正好顶在第 0 列 —— 旧实现就是它赢
+        assert_eq!(
+            name_of("--[[\nPLUGIN_NAME = \"注释掉的旧名\"\n--]]\nPLUGIN_NAME = \"真名\"\n",),
+            "真名",
+            "块注释里的行不能算声明"
+        );
+        // 同行块的 `--[[ … ]]`、以及 `--[==[ … ]==]` 这种带等号的形状
+        assert_eq!(
+            name_of("--[[ PLUGIN_NAME = \"同行的假名\" ]] PLUGIN_NAME = \"真名2\"\n"),
+            "真名2"
+        );
+        assert_eq!(
+            name_of("--[==[\nPLUGIN_NAME = \"等号块里的\"\n]==]\nPLUGIN_NAME = \"真名3\"\n"),
+            "真名3"
+        );
+        // 函数体里缩进的同名赋值（那是个局部变量，加载后 globals 里根本没有它）
+        assert_eq!(
+            name_of(
+                "function init()\n  PLUGIN_NAME = \"函数体里的\"\nend\nPLUGIN_NAME = \"顶层的\"\n",
+            ),
+            "顶层的",
+            "带缩进的说明它写在某个块里"
+        );
+        // `local` 的同样不会成为全局变量
+        assert_eq!(
+            name_of("local PLUGIN_NAME = \"局部的\"\nPLUGIN_NAME = \"全局的\"\n"),
+            "全局的"
+        );
+        // 顶层长字符串里的那一行是数据
+        assert_eq!(
+            name_of("local hint = [[\nPLUGIN_NAME = \"串里的\"\n]]\nPLUGIN_NAME = \"真名4\"\n"),
+            "真名4"
+        );
+        // 行注释（旧实现靠"行首不是 --"侥幸挡住，现在由同一套规则挡住）
+        assert_eq!(
+            name_of("-- PLUGIN_NAME = \"行注释里的\"\nPLUGIN_NAME = \"真名5\"\n"),
+            "真名5"
+        );
+    }
+
+    /// 正常形状照旧扫得出来（含"简介里带 `--`"这种不能被注释规则吃掉的形状），
+    /// 什么都没有时回退成文件名 —— 这两条不是新行为，是防上面那套规则改过头的网。
+    #[test]
+    fn scan_meta_still_reads_normal_fields() {
+        let path = Path::new("whatever.lua");
+        let (name, desc, version, author) = PluginManager::scan_meta_source(
+            "PLUGIN_NAME = '单引号也行'\nPLUGIN_DESC = \"含 -- 破折号的简介\"\n\
+             PLUGIN_VERSION = \"1.2.3\"\nPLUGIN_AUTHOR = \"某人\"\n",
+            path,
+        );
+        assert_eq!(name, "单引号也行");
+        assert_eq!(desc, "含 -- 破折号的简介", "引号里的 -- 不是注释");
+        assert_eq!(version, "1.2.3");
+        assert_eq!(author, "某人");
+
+        let (name, desc, version, author) =
+            PluginManager::scan_meta_source("function init() end\n", path);
+        assert_eq!(name, "whatever", "扫不到就回退成文件名");
+        assert_eq!(desc, "");
+        assert_eq!(version, "1.0");
+        assert_eq!(author, "");
+    }
+
+    // ---------- 第八节 A11：core 自己那份热重载扫描的三条保护 ----------
+
+    /// 新文件要报、删文件也要报（旧实现只遍历本轮看到的，消失的那个永远没人提），
+    /// 而 0 字节的 `.lua` 本轮不能算"有新版本"—— 空的 .lua 会被 Lua 当成空块、
+    /// 一句错都不报，插件就此变成没有函数的空壳。
+    #[test]
+    fn hot_reload_round_reports_new_and_deleted_files_but_not_empty_ones() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("hr_new_del");
+        let dir = tmp.path().join("plugins");
+        write_lua(&dir, "a", "PLUGIN_NAME = \"甲\"\n");
+        let mut last = HashMap::new();
+        let mut primed = false;
+
+        assert!(
+            hot_reload_round(&dir, &mut last, &mut primed).is_empty(),
+            "首轮只建基线，否则每次启动都把全部插件重载一遍"
+        );
+        assert!(primed);
+
+        // 半截文件（编辑器"先截断再写入"的那一瞬间 / 网盘还没同步上来）
+        write_lua(&dir, "b", "");
+        assert!(
+            hot_reload_round(&dir, &mut last, &mut primed).is_empty(),
+            "0 字节的 b 不该被当成新版本，也不该被记进基线"
+        );
+        assert!(!last.contains_key("b"), "空壳不该有指纹");
+
+        // 内容写上了 → 这才算一个新文件
+        write_lua(&dir, "b", "PLUGIN_NAME = \"乙\"\n");
+        assert_eq!(hot_reload_round(&dir, &mut last, &mut primed), ["b"]);
+
+        // 已知插件被截成 0 字节：本轮不发请求，指纹沿用上一轮
+        let known = last["a"];
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        write_lua(&dir, "a", "");
+        assert!(
+            hot_reload_round(&dir, &mut last, &mut primed).is_empty(),
+            "0 字节 = 还没写完，不能判成变更（旧实现在这里发请求，把空壳装上去）"
+        );
+        assert_eq!(last["a"], known, "删除检测不能把截断误判成文件消失");
+
+        // 真删掉：必须报（旧实现漏这一整条）
+        std::fs::remove_file(dir.join("a.lua")).unwrap();
+        assert_eq!(hot_reload_round(&dir, &mut last, &mut primed), ["a"]);
+        assert!(!last.contains_key("a"), "基线要跟着收缩");
+    }
+
+    /// 目录整体没读出来（`plugins` 被建成同名文件、整份放在断线的网盘上、构建脚本
+    /// 正在替换目录）时既不判定任何变更，**也不许把基线清空** —— 清空的话下一轮
+    /// 成功读取会把所有文件都当成新变更，白重载一整轮。
+    #[test]
+    fn hot_reload_round_keeps_the_baseline_when_the_dir_cannot_be_listed() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("hr_unreadable");
+        let dir = tmp.path().join("plugins");
+        write_lua(&dir, "a", "PLUGIN_NAME = \"甲\"\n");
+        write_lua(&dir, "b", "PLUGIN_NAME = \"乙\"\n");
+        let not_a_dir = write_lua(tmp.path(), "not_a_dir", "这是个文件，不是目录\n");
+        let mut last = HashMap::new();
+        let mut primed = false;
+        assert!(hot_reload_round(&dir, &mut last, &mut primed).is_empty());
+        let baseline = last.clone();
+
+        assert!(
+            scan_plugin_mtimes(&not_a_dir, &last).is_none(),
+            "读不出来要当成「不知道」，不是「目录空了」"
+        );
+        assert!(
+            hot_reload_round(&not_a_dir, &mut last, &mut primed).is_empty(),
+            "读不出来的那一轮不该判成\"所有插件都被删了\""
+        );
+        assert_eq!(last, baseline, "基线一个字都不许动");
+        assert!(
+            hot_reload_round(&dir, &mut last, &mut primed).is_empty(),
+            "下一轮成功读取不能把每个文件都当成新变更（旧实现在这里全员重载）"
+        );
+    }
+
+    /// `poll_reload_requests` 这条路上，"文件已经不在盘上"要真的把插件卸掉。
+    /// 扫描线程那边现在会发删除事件了，而 core 这头的处理原先是空的：
+    /// `reload_plugin` 按名字找不到实例就返回 false → 删掉的插件要重启才停得下来，
+    /// 而删除表达的意思恰恰是「别再跑它了」（桌面侧 `reload_plugin_by_key` 早就做了）。
+    #[test]
+    fn poll_unloads_a_plugin_whose_file_was_deleted() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("hr_poll_delete");
+        let plugins = tmp.path().join("plugins");
+        let p = write_lua(&plugins, "gone", &scheduler_user("会被删掉的"));
+        let mut pm = manager_in(tmp.path());
+        pm.load_plugin(&p).expect("加载失败");
+        assert_eq!(host::scheduler_state_for_test(), Some(1));
+
+        std::fs::remove_file(&p).unwrap();
+        // 不经线程：直接往检测线程那条 channel 里塞一条请求
+        pm.reload_tx.send("gone".to_string()).unwrap();
+        assert_eq!(pm.poll_reload_requests(), ["gone"], "删除该被当成一次卸载");
+        assert!(
+            pm.get_plugin("会被删掉的").is_none(),
+            "文件没了却还在跑 = cleanup 永不执行"
+        );
+        assert_eq!(
+            host::scheduler_state_for_test(),
+            None,
+            "卸载走了 cleanup，owner 才还得回来"
+        );
+    }
 
     /// 死循环必须被指令数上限打断，且沙箱里不能留着"换个线程躲开 hook"的出口。
     ///
