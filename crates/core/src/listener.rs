@@ -7,8 +7,12 @@
 //! - 滚轮连续滚动合并（0.8s 窗口内同方向只计 1 次）
 //! - Ctrl+字母控制字符还原为物理键（v1.2.1 行为）
 //! - 暂停/恢复，事件回调（番茄钟 / 护眼提醒用）
+//!
+//! 暂停位是 `PauseFlag`（`Arc<AtomicBool>`）：本模块的 rdev 主链路与设备侧信道
+//! （`device_stats`，Raw Input）共用同一份，两侧都在落库前过同一道闸。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +21,30 @@ use rdev::{listen, Button, Event, EventType, Key};
 
 use crate::config::FocusFlowConfig;
 use crate::db::Database;
+
+/// 暂停位：整条采集链路的**一份**真相，`Arc` 共享给所有采集侧。
+///
+/// 为什么必须是共享的 `Arc<AtomicBool>` 而不是各处各存一个布尔（或各持一份拷贝）：
+/// 暂停是"别再采集了"的全局指令，而设备侧信道（`device_stats`，Raw Input）的线程
+/// 结构上只持有 `Arc<DbWriter>`、拿不到 `InputListener`。各存一份的结果就是本轮修的
+/// 那个 bug：托盘/设置点暂停后继续敲键盘，「今日计数」冻住了而「设备排行」还在涨，
+/// 看起来正是"暂停失效"。所以标志位在组合根（`desktop/src/state.rs`）建一次，
+/// 同时喂给 `InputListener::new` 与 `Database::init`（后者转交设备线程）。
+pub type PauseFlag = Arc<AtomicBool>;
+
+/// 新建暂停位（初值 = 未暂停）。由组合根创建后分发给各采集侧。
+pub fn new_pause_flag() -> PauseFlag {
+    Arc::new(AtomicBool::new(false))
+}
+
+/// 暂停闸的唯一读点：主链路与设备侧信道都必须经由它判定，两边才不会走岔。
+///
+/// Relaxed 足够：这个标志只守卫"记不记"这一个布尔决定，不发布任何需要
+/// happens-before 的数据。（暂停瞬间已越过闸门的并发事件最多多记一次，
+/// 与原 `Mutex<bool>` 实现的窗口期同形。）
+pub(crate) fn is_paused_now(flag: &PauseFlag) -> bool {
+    flag.load(Ordering::Relaxed)
+}
 
 /// 修饰键集合（用于过滤）
 fn is_modifier(key: &Key) -> bool {
@@ -340,8 +368,8 @@ pub struct InputListener {
     pressed: Mutex<HashMap<String, Instant>>,
     /// 滚轮合并状态：最近一次滚轮时刻（`None` = 尚无/已被重置，必然算新一轮）
     scroll: Mutex<(Option<Instant>, &'static str)>,
-    /// 暂停状态
-    paused: Mutex<bool>,
+    /// 暂停状态（与设备侧信道共享同一份，见 [`PauseFlag`]）
+    paused: PauseFlag,
     /// 事件回调（番茄钟 / 护眼提醒）
     key_callbacks: Mutex<Vec<KeyCallback>>,
     /// 监听线程是否存活
@@ -349,7 +377,9 @@ pub struct InputListener {
 }
 
 impl InputListener {
-    pub fn new(config: &'static FocusFlowConfig) -> Arc<Self> {
+    /// 建监听器。`paused` 是共享暂停位：调用方（组合根）必须把**同一个** flag
+    /// 也交给 `Database::init`，否则设备侧信道看不到暂停状态。
+    pub fn new(config: &'static FocusFlowConfig, paused: PauseFlag) -> Arc<Self> {
         let listener = Self {
             config,
             cfg: ListenerCfg::default(),
@@ -359,7 +389,7 @@ impl InputListener {
             // Instant 减法下溢 panic，而 release 的 panic=abort 会让开机自启变成启动即崩
             // （app_stats.rs / queries.rs 里对同一个坑留过告诫）。
             scroll: Mutex::new((None, "上")),
-            paused: Mutex::new(false),
+            paused,
             key_callbacks: Mutex::new(Vec::new()),
             alive: Arc::new(Mutex::new(false)),
         };
@@ -381,16 +411,15 @@ impl InputListener {
     }
 
     pub fn is_paused(&self) -> bool {
-        *self.paused.lock().unwrap_or_else(|e| e.into_inner())
+        is_paused_now(&self.paused)
     }
 
     pub fn set_paused(&self, paused: bool) {
-        let mut p = self.paused.lock().unwrap_or_else(|e| e.into_inner());
-        if *p == paused {
+        // swap 而不是 load + store：一次原子操作就完成"确实变了才做副作用"的判断，
+        // 托盘与设置页同时切换时不会各触发一次清按下的副作用（等价于原来整段持锁）。
+        if self.paused.swap(paused, Ordering::SeqCst) == paused {
             return;
         }
-        *p = paused;
-        drop(p);
         if paused {
             self.pressed
                 .lock()
@@ -448,6 +477,8 @@ impl InputListener {
 
     /// 处理单个键鼠事件：记录到数据库 + 触发回调。
     fn record_event(&self, db: &Database, key_name: &str) {
+        // 暂停闸（与 device_stats 的设备侧信道读的是同一份 PauseFlag）：
+        // 两侧都在"要落库的那一刻"判定，所以暂停后今日计数与设备排行一起停住。
         if self.is_paused() {
             return;
         }
@@ -716,7 +747,7 @@ mod tests {
     /// 长按去重：窗口内重复按下不计数，stale 超时后重新计数。
     #[test]
     fn is_new_press_filters_repeat_until_stale() {
-        let l = InputListener::new(test_config());
+        let l = InputListener::new(test_config(), new_pause_flag());
         assert!(l.is_new_press("A"));
         assert!(!l.is_new_press("A"), "窗口内第二次按下应视为长按重复");
 
@@ -736,7 +767,7 @@ mod tests {
     /// 安全阀：pressed 集合超过 256 时清理 stale 残留。
     #[test]
     fn is_new_press_cleans_up_stale_entries_when_large() {
-        let l = InputListener::new(test_config());
+        let l = InputListener::new(test_config(), new_pause_flag());
         {
             let mut pressed = l.pressed.lock().unwrap_or_else(|e| e.into_inner());
             for i in 0..250 {
@@ -759,7 +790,7 @@ mod tests {
     /// 滚轮合并：窗口内同方向只计 1 次；方向切换或窗口过期重新计数。
     #[test]
     fn is_new_scroll_burst_merges_same_direction_only() {
-        let l = InputListener::new(test_config());
+        let l = InputListener::new(test_config(), new_pause_flag());
         assert!(l.is_new_scroll_burst("上"));
         assert!(!l.is_new_scroll_burst("上"), "窗口内同方向应合并");
         assert!(l.is_new_scroll_burst("下"), "方向切换应立即计数");
@@ -784,7 +815,7 @@ mod tests {
         crate::paths::set_app_dir(&dir);
         let db = crate::db::Database::init_readonly();
 
-        let l = InputListener::new(test_config());
+        let l = InputListener::new(test_config(), new_pause_flag());
         l.cfg.ignore_modifiers.store(true, Ordering::Relaxed);
         l.cfg.ignore_functions.store(true, Ordering::Relaxed);
         let hits = Arc::new(AtomicUsize::new(0));
@@ -856,5 +887,74 @@ mod tests {
 
         crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 暂停位必须是**共享**的那一份：`set_paused`/`toggle_pause` 翻动的就是设备侧信道
+    /// 读的同一个 `Arc<AtomicBool>`，两侧同停同起。
+    ///
+    /// 反着的形态就是那条回归：`InputListener` 自持 `Mutex<bool>` 时，设备线程只拿得到
+    /// `Arc<DbWriter>`，结构上看不到暂停 → 托盘暂停后继续敲键盘，「今日计数」冻住而
+    /// 「设备排行」还在涨，看着像"暂停失效"。这里两侧都验（主链路走回调，
+    /// 设备侧走落库点 `record_device_event` —— rdev/Raw Input 回调在本机注入不了）。
+    #[test]
+    fn pause_flag_is_shared_by_listener_and_device_channel() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("listener_pause_shared");
+        let db = crate::db::Database::init_readonly();
+        let writer = crate::db::DbWriter::start(Duration::from_secs(3600));
+
+        let paused = new_pause_flag();
+        let l = InputListener::new(test_config(), Arc::clone(&paused));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_cb = Arc::clone(&hits);
+        l.add_key_callback(Arc::new(move |_| {
+            hits_cb.fetch_add(1, Ordering::Relaxed);
+        }));
+        let ev = |t: rdev::EventType| rdev::Event {
+            event_type: t,
+            name: None,
+            time: SystemTime::now(),
+        };
+        let device_side = |w: &crate::db::DbWriter| {
+            crate::device_stats::record_device_event(
+                w,
+                &paused,
+                r"HID#VID_046D&PID_C52B#7&1",
+                "HID 鼠标 · 046D/C52B",
+                "mouse",
+                Some("鼠标左键"),
+                now_ts_secs().unwrap_or(0),
+            )
+        };
+
+        // 未暂停：两侧都记
+        l.process_event(&db, &ev(EventType::KeyPress(Key::KeyA)));
+        assert_eq!(hits.load(Ordering::Relaxed), 1, "未暂停时主链路应记录");
+        assert!(device_side(&writer), "未暂停时设备侧应记录");
+        assert!(writer.has_pending(), "未暂停时设备计数应落到写入器");
+
+        // 暂停（走对外唯一入口）：共享位被翻起来，两侧一起停
+        assert!(l.toggle_pause());
+        assert!(
+            paused.load(Ordering::Relaxed),
+            "toggle_pause 改的必须是那份共享 Arc，而不是监听器自己的拷贝"
+        );
+        l.process_event(&db, &ev(EventType::KeyPress(Key::KeyB)));
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "暂停后主链路不得记录（换个键名，绕开长按去重）"
+        );
+        assert!(!device_side(&writer), "暂停后设备侧不得记录");
+
+        // 继续：同一份标志翻回去，两侧一起恢复
+        l.set_paused(false);
+        assert!(!l.is_paused() && !paused.load(Ordering::Relaxed));
+        l.process_event(&db, &ev(EventType::KeyPress(Key::KeyC)));
+        assert_eq!(hits.load(Ordering::Relaxed), 2, "恢复后主链路应重新记录");
+        assert!(device_side(&writer), "恢复后设备侧应重新记录");
+
+        // 线程退出要在临时目录被删之前（见 stop_and_wait 的注释）
+        writer.stop_and_wait();
     }
 }

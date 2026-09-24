@@ -30,7 +30,14 @@ pub struct Database {
 
 impl Database {
     /// 初始化：建表、旧数据聚合迁移、归档检查、启动写入线程。
-    pub fn init(config: &FocusFlowConfig) -> anyhow::Result<Arc<Self>> {
+    ///
+    /// `paused` 是采集层的共享暂停位（`listener::PauseFlag`），由组合根创建、
+    /// 与 `InputListener` 同一份：本函数会把它转交给设备侧信道线程，
+    /// 这样「暂停」能同时闸住 rdev 主链路与设备计数（不能各自拿一份拷贝）。
+    pub fn init(
+        config: &FocusFlowConfig,
+        paused: crate::listener::PauseFlag,
+    ) -> anyhow::Result<Arc<Self>> {
         let year = chrono::Local::now().year();
         let path = crate::paths::year_db_path(year);
         let conn = crate::db::connection::open_rw(&path)?;
@@ -77,7 +84,8 @@ impl Database {
 
         // 设备维度统计（Raw Input 侧信道，独立口径按设备归属计数；
         // Windows；[device_stats] enabled=false 可关停）
-        crate::device_stats::start_device_stats(Arc::clone(writer.as_ref().unwrap()));
+        // 共享暂停位一并交给它：设备计数必须和主链路一起停，否则暂停后「设备排行」还在涨
+        crate::device_stats::start_device_stats(Arc::clone(writer.as_ref().unwrap()), paused);
 
         Ok(Arc::new(Self { writer }))
     }

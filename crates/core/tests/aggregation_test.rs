@@ -29,7 +29,8 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
 
         // 第一轮：写入 25 条后落库
-        let database = db::Database::init(&config).unwrap();
+        let database =
+            db::Database::init(&config, focusflow_core::listener::new_pause_flag()).unwrap();
         let writer = database.writer().unwrap().clone();
         for i in 0..25u64 {
             writer.record(&format!("K{}", i % 5), now - (25 - i) as i64);
@@ -39,7 +40,8 @@ mod tests {
         database.shutdown(&config);
 
         // 第二轮：模拟重启，今日计数应从聚合表恢复
-        let database2 = db::Database::init(&config).unwrap();
+        let database2 =
+            db::Database::init(&config, focusflow_core::listener::new_pause_flag()).unwrap();
         let writer2 = database2.writer().unwrap().clone();
         assert_eq!(
             writer2.today_count(),
@@ -57,7 +59,8 @@ mod tests {
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
-        let database = db::Database::init(&config).unwrap();
+        let database =
+            db::Database::init(&config, focusflow_core::listener::new_pause_flag()).unwrap();
         let writer = database.writer().unwrap().clone();
 
         let today_start = focusflow_core::db::queries::today_start_ts();
@@ -90,7 +93,8 @@ mod tests {
 
         // 重启后今日总数依旧正确
         database.shutdown(&config);
-        let database2 = db::Database::init(&config).unwrap();
+        let database2 =
+            db::Database::init(&config, focusflow_core::listener::new_pause_flag()).unwrap();
         let (t2, _) = db::get_stats_by_date(chrono::Local::now().date_naive());
         assert_eq!(t2, 18);
         database2.shutdown(&config);
@@ -104,7 +108,8 @@ mod tests {
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
-        let database = db::Database::init(&config).unwrap();
+        let database =
+            db::Database::init(&config, focusflow_core::listener::new_pause_flag()).unwrap();
         let writer = database.writer().unwrap().clone();
 
         // 昨天 3 次 + 今天 7 次：总计 10，最高单日为今天 7
@@ -154,7 +159,8 @@ mod tests {
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
-        let database = db::Database::init(&config).unwrap();
+        let database =
+            db::Database::init(&config, focusflow_core::listener::new_pause_flag()).unwrap();
         let writer = database.writer().unwrap().clone();
         // 今天与 10 天前各一天（同一年度库内，日期由写入路径自己算）
         let today_noon = focusflow_core::db::queries::today_start_ts() + 43_200;

@@ -146,14 +146,18 @@ impl AppState {
     /// 初始化：数据库、监听器、统计线程、托盘、热键、窗口可见性。
     pub fn init(app: &mut App) -> anyhow::Result<()> {
         let config = focusflow_core::config::instance();
-        let db = focusflow_core::db::Database::init(config)?;
+        // 暂停位在这里建一次：它是整个采集层的**同一份**真相，同时交给
+        // Database::init（转交设备侧信道线程）与 InputListener（rdev 主链路）。
+        // 组合根是唯一同时握有两者的地方，所以只能由它持有原始 Arc。
+        let paused = focusflow_core::listener::new_pause_flag();
+        let db = focusflow_core::db::Database::init(config, Arc::clone(&paused))?;
         // 每日维护：按配置自动 VACUUM（auto_vacuum_days 天一次）
         focusflow_core::db::maintenance::maybe_auto_vacuum(config.get_int(
             "database",
             "auto_vacuum_days",
             7,
         ));
-        let listener = InputListener::new(config);
+        let listener = InputListener::new(config, Arc::clone(&paused));
         listener.start(Arc::clone(&db));
 
         // 启动即加载插件（番茄钟/定时任务等随插件 init 运行，对齐 Python 版）

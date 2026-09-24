@@ -8,6 +8,10 @@
 //! 由此，设备计数是**独立口径**（键盘按下 + 鼠标按键按下 + 滚轮事件，
 //! 不做长按去重/修饰键过滤），数字不追求与键鼠统计相等。
 //!
+//! 暂停（托盘/设置的「暂停记录」）对两条链路的口径必须一致：本模块**不持有**暂停位，
+//! 而是与 `InputListener` 共享同一份 `listener::PauseFlag`（见 `record_device_event`）。
+//! 各存一份会出"今日计数冻住、设备排行还在涨"的假象，正是这条闸最初缺失的形态。
+//!
 //! 性能约定（重要，不要退化成轮询）：
 //! - 完全事件驱动：无输入时线程在 GetMessageW 阻塞，零消耗
 //! - 设备登记（取设备路径 + 查注册表 FriendlyName）只在**每个设备的首个事件**
@@ -17,6 +21,7 @@
 use std::sync::Arc;
 
 use crate::db::DbWriter;
+use crate::listener::{is_paused_now, PauseFlag};
 
 /// 去掉设备路径的 `\\?\` 前缀，得到用作主键的实例路径。
 pub(crate) fn strip_device_prefix(path: &str) -> &str {
@@ -210,7 +215,10 @@ pub(crate) mod classify {
 }
 
 /// 启动设备统计线程（[device_stats] enabled=false 可关停；非 Windows 无操作）。
-pub fn start_device_stats(writer: Arc<DbWriter>) {
+///
+/// `paused` 必须与 `InputListener` 持有的是同一份（见 `listener::PauseFlag`）：
+/// 设备侧信道只有 `Arc<DbWriter>`，拿不到监听器，暂停状态只能靠这份共享标志传进来。
+pub fn start_device_stats(writer: Arc<DbWriter>, paused: PauseFlag) {
     let config = crate::config::instance();
     if !config.get_bool("device_stats", "enabled", true) {
         tracing::info!("设备统计未启用（[device_stats] enabled=false）");
@@ -220,15 +228,42 @@ pub fn start_device_stats(writer: Arc<DbWriter>) {
         .name("device-stats".into())
         .spawn(move || {
             #[cfg(windows)]
-            win::run(writer);
+            win::run(writer, paused);
             #[cfg(not(windows))]
             {
-                let _ = writer;
+                let _ = (writer, paused);
                 tracing::info!("非 Windows 平台不支持设备统计");
             }
         })
         .map_err(|e| tracing::error!("启动设备统计线程失败: {e}"))
         .ok();
+}
+
+/// 记一次设备输入（次数 + 键名明细），返回是否真的记了。
+///
+/// 暂停闸就在这里、且只在这里判一次：读的是与 rdev 主链路 `record_event` **同一份**
+/// `PauseFlag`，所以「今日计数冻住、设备排行还在涨」这个形态从结构上不可能再出现。
+/// 位置也与主链路对齐（分类/登记都做完、即将写库时），暂停只是不落库。
+///
+/// 写成自由函数而不是埋在 `Sink::on_input` 里：Raw Input 回调在本机没法注入
+/// （没人按键），把决定抽出来才能直接用例钉住这条闸。
+#[cfg_attr(not(windows), allow(dead_code))] // 非 Windows 下调用方（mod win）不存在
+pub(crate) fn record_device_event(
+    writer: &DbWriter,
+    paused: &PauseFlag,
+    device_key: &str,
+    name: &str,
+    kind: &'static str,
+    key_name: Option<&str>,
+    ts: i64,
+) -> bool {
+    if is_paused_now(paused) {
+        return false;
+    }
+    writer.record_device(device_key, name, kind, ts);
+    // 键名明细：未识别的键归入「其他按键」，避免明细表被长尾撑爆
+    writer.record_device_key(device_key, key_name.unwrap_or(classify::OTHER_KEY), ts);
+    true
 }
 
 /// Windows 实现：消息窗口 + Raw Input 注册 + 消息循环。
@@ -253,12 +288,14 @@ mod win {
     };
 
     use super::classify;
-    use super::{display_name, strip_device_prefix};
+    use super::{display_name, record_device_event, strip_device_prefix, PauseFlag};
     use crate::db::DbWriter;
 
     /// WndProc 与消息循环同线程，状态走线程本地。
     struct Sink {
         writer: Arc<DbWriter>,
+        /// 与 rdev 主链路共享的暂停位（同一份 `Arc`，见 `listener::PauseFlag`）
+        paused: PauseFlag,
         /// (hDevice 指针值, 事件类型) -> (device_key, 显示名)：设备首个事件登记一次，此后只读。
         /// 拔插后系统会分配新句柄，新句柄重新登记一次（路径相同 → device_key 不变，计数连续）。
         ///
@@ -274,7 +311,7 @@ mod win {
     }
 
     /// 消息循环主入口（在专用线程上运行）。
-    pub fn run(writer: Arc<DbWriter>) {
+    pub fn run(writer: Arc<DbWriter>, paused: PauseFlag) {
         unsafe {
             let Ok(hinstance) = GetModuleHandleW(None) else {
                 tracing::error!("设备统计：GetModuleHandleW 失败");
@@ -338,6 +375,7 @@ mod win {
             SINK.with(|s| {
                 *s.borrow_mut() = Some(Sink {
                     writer,
+                    paused,
                     devices: HashMap::new(),
                 })
             });
@@ -444,10 +482,16 @@ mod win {
                 // 并永久留在「总计」里，见 `listener::unix_ts_secs` 的注释
                 None => return,
             };
-            self.writer.record_device(&entry.0, &entry.1, kind, ts);
-            // 键名明细：未识别的键归入「其他按键」，避免明细表被长尾撑爆
-            self.writer
-                .record_device_key(&entry.0, key_name.unwrap_or(classify::OTHER_KEY), ts);
+            // 落库（含暂停闸）统一走 record_device_event，与主链路同一份真相
+            record_device_event(
+                &self.writer,
+                &self.paused,
+                &entry.0,
+                &entry.1,
+                kind,
+                key_name,
+                ts,
+            );
         }
     }
 
@@ -659,6 +703,57 @@ mod tests {
         assert!(!classify::mouse_counts(0x0002), "左键释放不计");
         assert!(!classify::mouse_counts(0x0008), "右键释放不计");
         assert!(!classify::mouse_counts(0x0020), "中键释放不计");
+    }
+
+    /// 暂停必须同样闸住设备侧信道（回归「设备侧只持 `Arc<DbWriter>`、结构上拿不到暂停位」）：
+    /// 共享位置位时一次都不记、清掉后照常记。判的是真实 `DbWriter` 的待落库增量，
+    /// 所以「今日计数冻住、设备排行还在涨」这个形态被钉在这里。
+    ///
+    /// 判定用 `record_device_event` 这个落库点：Raw Input 回调在本机注入不了（没人按键），
+    /// 而 `Sink::on_input` 落库前唯一经过的就是这个函数。
+    #[test]
+    fn device_records_are_gated_by_the_shared_pause_flag() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("dev_pause_gate");
+        let paused = crate::listener::new_pause_flag();
+        let ts = crate::listener::now_ts_secs().expect("本机时钟应正常");
+        let key = r"HID#VID_046D&PID_C52B#7&1f126e19&0&0000";
+        let name = "HID 鼠标 · 046D/C52B";
+        // 一次设备输入的等价调用；writer 的 flush 间隔给到一小时，
+        // 用例期间不会有后台落库把增量取走（has_pending 才是"这一条记没记"的判据）
+        let write = |w: &DbWriter| {
+            record_device_event(w, &paused, key, name, "mouse", Some("鼠标左键"), ts)
+        };
+
+        // 未暂停：次数 + 键名明细两条增量都进了写入器（尚未落库 → has_pending 为真）
+        let running = DbWriter::start(Duration::from_secs(3600));
+        assert!(write(&running), "未暂停时应记录");
+        assert!(
+            running.has_pending(),
+            "未暂停时设备计数必须落到写入器，否则设备排行永远是空的"
+        );
+
+        // 暂停：一条都不记。另用一个 writer —— 复用上面那个的话 has_pending 恒为真，
+        // 就测不出"这一条到底记没记"。
+        let stopped = DbWriter::start(Duration::from_secs(3600));
+        paused.store(true, Ordering::Relaxed);
+        assert!(!write(&stopped), "暂停时应拒绝记录");
+        assert!(
+            !stopped.has_pending(),
+            "暂停后设备侧信道不得再产生增量（这正是原 bug：托盘暂停后「设备排行」继续涨）"
+        );
+
+        // 解除暂停：同一份共享位翻回来，设备侧信道立刻跟着恢复
+        paused.store(false, Ordering::Relaxed);
+        assert!(write(&stopped), "恢复后应重新记录");
+        assert!(stopped.has_pending(), "恢复后设备计数应重新落进写入器");
+
+        // 收尾：线程必须在临时目录被删之前退出（见 DbWriter::stop_and_wait 的注释）
+        running.stop_and_wait();
+        stopped.stop_and_wait();
     }
 
     /// 手动冒烟：枚举本机 Raw Input 设备并打印解析出的展示名，

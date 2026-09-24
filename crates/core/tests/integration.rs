@@ -86,7 +86,8 @@ mod tests {
     fn write_then_query_roundtrip() {
         let env = TestEnv::new("roundtrip");
         let config = env.config();
-        let db = db::Database::init(&config).expect("初始化数据库失败");
+        let db = db::Database::init(&config, focusflow_core::listener::new_pause_flag())
+            .expect("初始化数据库失败");
 
         for i in 0..100 {
             db.record_key(&format!("键{}", i % 5), today_base_ts(i));
@@ -107,7 +108,8 @@ mod tests {
     fn batch_flush_idempotent() {
         let env = TestEnv::new("flush");
         let config = env.config();
-        let db = db::Database::init(&config).expect("初始化数据库失败");
+        let db = db::Database::init(&config, focusflow_core::listener::new_pause_flag())
+            .expect("初始化数据库失败");
 
         db.record_key("A", today_base_ts(10));
         db.flush(true);
@@ -123,7 +125,8 @@ mod tests {
     fn writer_high_volume() {
         let env = TestEnv::new("highvol");
         let config = env.config();
-        let db = db::Database::init(&config).expect("初始化数据库失败");
+        let db = db::Database::init(&config, focusflow_core::listener::new_pause_flag())
+            .expect("初始化数据库失败");
         let writer = db.writer().expect("写入器未启动").clone();
 
         // 高压写入：验证不 panic、写线程持续工作、事件部分落库
@@ -144,7 +147,8 @@ mod tests {
     fn daily_and_date_stats() {
         let env = TestEnv::new("daily");
         let config = env.config();
-        let db = db::Database::init(&config).expect("初始化数据库失败");
+        let db = db::Database::init(&config, focusflow_core::listener::new_pause_flag())
+            .expect("初始化数据库失败");
 
         // 今天 + 昨天各写几条。
         // 用 Date 逐日回退再取正午，而不是 `today_start_ts() - 86400`：

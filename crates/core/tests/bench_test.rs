@@ -30,7 +30,8 @@ mod tests {
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
-        let database = db::Database::init(&config).unwrap();
+        let database =
+            db::Database::init(&config, focusflow_core::listener::new_pause_flag()).unwrap();
         let writer = database.writer().unwrap().clone();
 
         // 持续高频注入 5 万条（模拟游戏/高速输入，约 5 万/秒），
@@ -72,7 +73,8 @@ mod tests {
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
-        let database = db::Database::init(&config).unwrap();
+        let database =
+            db::Database::init(&config, focusflow_core::listener::new_pause_flag()).unwrap();
         let writer = database.writer().unwrap().clone();
 
         // 微秒级突发注入 10 万条：内存聚合不丢数据、不 OOM、不 panic
@@ -105,7 +107,8 @@ mod tests {
         db::queries::invalidate_years_cache();
 
         let config = FocusFlowConfig::load(dir.join("config.ini")).unwrap();
-        let database = db::Database::init(&config).unwrap();
+        let database =
+            db::Database::init(&config, focusflow_core::listener::new_pause_flag()).unwrap();
         let writer = database.writer().unwrap().clone();
 
         // 预置 20 万条数据
