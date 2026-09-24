@@ -434,10 +434,16 @@ pub fn register_host_api(
     host.set("scheduler_delete", delete_fn)?;
 
     let toggle_owner = owner.clone();
+    // 与 scheduler_delete 同形状：返回 (是否改成, 没改成的原因)。
+    // 以前这个闭包恒回 Ok(())，"库里没这条"和"库被占住写不进去"都被插件说成"已启用"。
     let toggle_fn = lua.create_function(move |_, (id, enabled): (i64, bool)| {
         claim_scheduler(&toggle_owner);
-        scheduler::toggle_task(id, enabled);
-        Ok(())
+        let reason = match scheduler::toggle_task(id, enabled) {
+            Ok(true) => String::new(),
+            Ok(false) => format!("任务 #{id} 不存在（可能已经被删掉了）"),
+            Err(e) => e.to_string(),
+        };
+        Ok((reason.is_empty(), reason))
     })?;
     host.set("scheduler_toggle", toggle_fn)?;
 
@@ -462,12 +468,25 @@ pub fn register_host_api(
     )?;
 
     // ---- 记账本 API ----
-    // 与番茄钟/日程同理：记账库也改成惰性建库，禁用记账插件时不再碰它的文件。
-    static ACCOUNTING_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    // 与番茄钟同理：记账库也改成惰性建库，禁用记账插件时不再碰它的文件。
+    //
+    // 而且**只在 init_db 成功时才落闩**（同 `ensure_pomodoro_db`）：原来这里是
+    // `get_or_init(|| { let _ = accounting::init_db(); })`，闭包永远返回 ()，
+    // 所以哪怕一次 `CREATE TABLE` 失败（24 小时在线备份线程正持着库、杀软占着
+    // `-wal`、第二个实例正在退出），闩也照样落下、schema 永不重试 —— 之后整个
+    // 进程里每次 `accounting_add` 都是 "no such table"，界面却照样回一个 id，
+    // 他不重启的话表现是"这几周的账一条都没存下"。
+    static ACCOUNTING_DB: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     fn ensure_accounting_db() {
-        ACCOUNTING_INIT.get_or_init(|| {
-            let _ = accounting::init_db();
-        });
+        if ACCOUNTING_DB.get().is_some() {
+            return;
+        }
+        match accounting::init_db() {
+            Ok(()) => {
+                let _ = ACCOUNTING_DB.set(());
+            }
+            Err(e) => tracing::error!("记账库初始化失败，下次调用会重试: {e}"),
+        }
     }
 
     let acc_add = lua.create_function(

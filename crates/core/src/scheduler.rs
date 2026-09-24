@@ -726,13 +726,20 @@ pub fn delete_task(id: i64) -> anyhow::Result<bool> {
 }
 
 /// 启用/禁用任务。
-pub fn toggle_task(id: i64, enabled: bool) {
-    let _ = open().and_then(|conn| {
-        conn.execute(
-            "UPDATE scheduled_tasks SET enabled=?1 WHERE id=?2",
-            rusqlite::params![if enabled { 1 } else { 0 }, id],
-        )
-    });
+///
+/// 契约与 [`delete_task`] 一致：`Ok(false)` 只在"库里确实没有这一条"时返回，
+/// 库打不开 / UPDATE 失败走 `Err`。以前这里是 `let _ = ...` 且**什么都不返回**，
+/// 于是宿主只能回 `Ok`：库被 GUI 的写事务占满时，插件页对着一条**存在**的任务
+/// 报"已启用"而配置一个字没改（同一族的 `scheduler_delete`、插件「停用」都修过了，
+/// 这是剩下的那条腿）。
+pub fn toggle_task(id: i64, enabled: bool) -> anyhow::Result<bool> {
+    let conn = open().map_err(|e| anyhow::anyhow!("打开定时任务库失败: {e}"))?;
+    conn.execute(
+        "UPDATE scheduled_tasks SET enabled=?1 WHERE id=?2",
+        rusqlite::params![if enabled { 1 } else { 0 }, id],
+    )
+    .map(|n| n > 0)
+    .map_err(|e| anyhow::anyhow!("更新任务 #{id} 的启用状态失败: {e}"))
 }
 
 /// 获取所有任务。
@@ -1168,6 +1175,57 @@ mod tests {
             "原因要说清楚为什么被拒，实得: {e}"
         );
         assert!(get_all_tasks().is_empty(), "被拒绝的任务不应入库");
+    }
+
+    /// 启用/禁用必须分得清"改成没改成"。以前 `toggle_task` 是 `let _ = ...` 且什么都不
+    /// 返回，宿主那一层只能恒回成功 —— 于是库被写事务占满时，插件页对着一条**存在**的
+    /// 任务报"已启用"而配置一个字没改（`scheduler_delete`、插件「停用」都修过这一族，
+    /// 这是剩下的那条腿）。三条腿要分开：真改成 / 没这一条 / 库开不出来。
+    #[test]
+    fn toggle_separates_changed_missing_and_unwritable() {
+        let _g = isolate_app_dir("toggle_contract");
+        // ① 库里没有这一条 → Ok(false)，既不是 Err 也不是"成功"
+        assert!(
+            !toggle_task(999_999, true).unwrap(),
+            "不存在的 id 不该被报成改成功"
+        );
+
+        // 直接插一行，不走 add_task：它要求目标存在且在白名单内，而这里既不关心目标
+        // 校验，也不想给任何游离的调度线程留下真去启动进程的机会。
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_tasks (id, name, target_path, args, schedule_type, \
+                 schedule_time, enabled, last_run, created_at) \
+                 VALUES (424242, 't', ?1, '', 'daily', '23:59', 0, NULL, '2026-01-01T00:00:00')",
+                [r"C:\focusflow-test-dir\不存在的目标.exe"],
+            )
+            .unwrap();
+        }
+        // ② 真存在 → Ok(true)，且状态确实写进了库
+        assert!(toggle_task(424242, true).unwrap(), "改成了就该回 true");
+        assert!(
+            get_all_tasks().iter().any(|t| t.id == 424242 && t.enabled),
+            "报 true 就得真的落库"
+        );
+        assert!(toggle_task(424242, false).unwrap());
+        assert!(
+            get_all_tasks().iter().any(|t| t.id == 424242 && !t.enabled),
+            "反向也要能改回去"
+        );
+
+        // ③ 库根本开不出来 → Err，且原因说清是"打不开库"（不能说成"没这条任务"）
+        let path = db_path();
+        let _ = std::fs::remove_file(&path);
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+        std::fs::create_dir_all(&path).expect("把库路径换成一个目录，open 就该失败");
+        let e = toggle_task(424242, true).expect_err("库打不开必须是 Err");
+        assert!(
+            e.to_string().contains("打开定时任务库失败"),
+            "应说明是打不开库，而不是任务不存在，实际: {e}"
+        );
     }
 
     /// 白名单外的普通程序也会被拒绝（默认只放行常见用户应用）。

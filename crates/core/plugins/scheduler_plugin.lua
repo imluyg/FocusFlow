@@ -28,11 +28,22 @@ function on_action(id)
     elseif id:match("^toggle_") then
         local tid = tonumber(id:sub(8))
         local tasks = focusflow.scheduler_tasks()
+        local target = nil
         for _, t in ipairs(tasks) do
             if t["id"] == tid then
-                focusflow.scheduler_toggle(tid, not t["enabled"])
-                msg = "任务 #" .. tostring(tid) .. " 已" .. (_status(not t["enabled"]))
+                target = t
                 break
+            end
+        end
+        if not target then
+            msg = "切换失败：任务 #" .. tostring(tid) .. " 不在列表里（先点刷新）"
+        else
+            -- 宿主给的是 (是否改成, 原因)：库被写事务占住时不能说成"已启用"
+            local ok, why = focusflow.scheduler_toggle(tid, not target["enabled"])
+            if ok then
+                msg = "任务 #" .. tostring(tid) .. " 已" .. (_status(not target["enabled"]))
+            else
+                msg = "切换失败：" .. ((why and #why > 0) and why or ("任务 #" .. tostring(tid) .. " 没改成"))
             end
         end
     elseif id:match("^del_") then

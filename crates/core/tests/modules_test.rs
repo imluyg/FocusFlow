@@ -60,7 +60,10 @@ mod tests {
         assert_eq!(tasks[0].name, "改名");
         assert!(!tasks[0].enabled);
 
-        scheduler::toggle_task(id, true);
+        assert!(
+            scheduler::toggle_task(id, true).unwrap(),
+            "存在的任务改成启用该回 true"
+        );
         assert!(scheduler::get_all_tasks()[0].enabled);
 
         assert!(scheduler::delete_task(id).unwrap());
