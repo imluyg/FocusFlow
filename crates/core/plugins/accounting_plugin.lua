@@ -25,6 +25,11 @@ local PAGE_SIZE = 10
 
 -- 统计结果与细分盈亏选择
 local result_text = ""
+-- 上一次动作的可见结果（成功与**被拒**都要有话）。
+-- 只 `focusflow.log` 等于没说：弹窗是先关后发动作的（`ui/js/plugins.js` 的
+-- `modalSubmit`），于是校验失败/写库失败的表现是"弹窗关了、列表里没这条"，
+-- 一个字都没有 —— 与定时任务那边已修的"被拒时必须说清原因"同一族。
+local list_msg = ""
 local picker_open = false
 local profit_cat = ""
 
@@ -102,24 +107,44 @@ function on_action(id)
     elseif id == "add_record" then
         local amount = tonumber(draft.amount) or 0
         if draft.item == "" or amount <= 0 then
+            list_msg = "没保存：请填写名称，金额要大于 0（小数写 12.50 这种，别写 1,234）"
             focusflow.log("请填写名称和有效金额")
             return
         end
-        if draft.date == "" then draft.date = _today() end
+        local backdated = false
+        if draft.date == "" then
+            draft.date = _today()
+        else
+            backdated = draft.date ~= _today()
+        end
         local new_id = focusflow.accounting_add(
             draft.type, draft.item, draft.store, draft.date, amount,
             draft.category, draft.subcategory, draft.note
         )
         if new_id > 0 then
+            list_msg = "已保存 #" .. tostring(new_id) .. "：" .. draft.date .. " " .. draft.item
             focusflow.log("已添加记录 #" .. tostring(new_id))
+            local saved_date = draft.date
             draft.item = ""; draft.store = ""; draft.amount = ""
             draft.category = ""; draft.subcategory = ""; draft.date = ""; draft.note = ""
-            page = 1 -- 新记录在首页（id 降序）
+            -- 列表是 `ORDER BY purchase_date DESC, id DESC`（accounting.rs 的
+            -- get_expenses_page），**不是 id 降序**：补记一笔上个月的账时它压根不在
+            -- 首页，而旧代码无条件跳第 1 页 —— 用户看到"保存过了却没这条"，
+            -- 于是再点一次保存，造出重复记录。只有当天的记录才保证落在首页。
+            if not backdated then
+                page = 1
+            else
+                list_msg = list_msg .. "（记在 " .. saved_date .. "，按日期排在后面页，用日期筛选能找到）"
+            end
+        else
+            list_msg = "没保存：记账库写入失败（库正被占用或打不开），没有生成记录"
         end
     elseif id == "save_edit" then
         if editing_id == nil then return end
         local amount = tonumber(draft.amount) or 0
         if draft.item == "" or amount <= 0 then
+            -- 刻意不清 editing_id：弹窗带着原草稿重新开出来，改完就能再保存
+            list_msg = "没保存：请填写名称，金额要大于 0（小数写 12.50 这种，别写 1,234）"
             focusflow.log("请填写名称和有效金额")
             return
         end
@@ -129,11 +154,14 @@ function on_action(id)
             draft.category, draft.subcategory, draft.note
         )
         if ok then
+            list_msg = "已更新记录 #" .. tostring(editing_id)
             focusflow.log("已更新记录 #" .. tostring(editing_id))
             editing_id = nil
             -- 清空草稿，避免下次"添加记录"弹窗预填旧数据
             draft.item = ""; draft.store = ""; draft.amount = ""
             draft.category = ""; draft.subcategory = ""; draft.date = ""; draft.note = ""
+        else
+            list_msg = "没更新 #" .. tostring(editing_id) .. "：写入失败（库被占用或记录已被删除）"
         end
     elseif id:match("^edit_") then
         local rid = tonumber(id:sub(6))
@@ -491,6 +519,9 @@ function get_view()
 
     -- 记录列表（点击行选中，配合顶部 修改/删除/距今多久 按钮）
     add({ type = "heading", text = "收支记录（点击行选中，按日期倒序）" })
+    if list_msg ~= "" then
+        add({ type = "label", text = list_msg })
+    end
     add({
         type = "table",
         headers = { "日期", "类型", "名称", "渠道", "金额", "分类", "子分类", "备注" },

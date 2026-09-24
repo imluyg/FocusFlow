@@ -555,4 +555,68 @@ mod tests {
         }
         assert!(saw_category_field, "记账弹窗里应有 d_category 这一项");
     }
+
+    /// 记账的「保存」被拒时，原因必须出现在视图里。
+    ///
+    /// 旧实现只 `focusflow.log("请填写名称和有效金额")` 然后 `return`，而前端
+    /// `modalSubmit` 是**先关弹窗再发动作**（`ui/js/plugins.js`）—— 于是用户看到的是
+    /// "弹窗关了、列表里没这条记录"，一个字都没有。与定时任务那边已修的
+    /// "被拒时要说清原因"同一族，这是记账本里漏的半边。
+    #[test]
+    fn accounting_rejected_save_shows_a_visible_reason() {
+        fn labels(manager: &PluginManager, name: &str) -> Vec<String> {
+            fn walk(widgets: &[focusflow_core::plugins::Widget], out: &mut Vec<String>) {
+                use focusflow_core::plugins::Widget;
+                for w in widgets {
+                    match w {
+                        Widget::Label(t) => out.push(t.clone()),
+                        Widget::Row { children } => walk(children, out),
+                        _ => {}
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            if let Some(p) = manager.get_plugin(name) {
+                if let Some(view) = &p.view {
+                    walk(&view.widgets, &mut out);
+                }
+            }
+            out
+        }
+
+        let _guard = guard();
+        let dir = std::env::current_dir().unwrap();
+        paths::set_app_dir(&dir);
+        db::queries::invalidate_years_cache();
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
+        ));
+        let mut manager = PluginManager::new(config, db::Database::init_readonly());
+        let file = manager
+            .discover()
+            .into_iter()
+            .find(|f| f.ends_with("accounting_plugin.lua"))
+            .expect("应发现 accounting_plugin.lua");
+        let name = manager.load_plugin(&file).expect("加载记账本插件失败");
+
+        assert!(
+            !labels(&manager, &name).iter().any(|t| t.contains("没保存")),
+            "刚加载不该有失败提示"
+        );
+
+        // 名称与金额都是空的草稿：必须被拒（**不写库**），并且把原因写在视图里
+        manager
+            .plugin_action(&name, "add_record")
+            .expect("动作本身不该失败");
+        let seen = labels(&manager, &name);
+        assert!(
+            seen.iter().any(|t| t.contains("没保存")),
+            "被拒的原因必须出现在插件页上，实际标签: {seen:?}"
+        );
+
+        // 修改路径同理：没有编辑对象时静默 return 是对的，但校验失败必须有话
+        manager
+            .plugin_action(&name, "save_edit")
+            .expect("无编辑对象时的 save_edit 不该报错");
+    }
 }
