@@ -1177,16 +1177,25 @@ fn device_date_series(device_key: &str) -> Vec<(i64, i64)> {
 }
 
 /// 查询单台设备详情。`period` 与统计视图一致：-1 今日 / 0 全部 / n 近 n 天。
+///
+/// 周期起点单独成一个函数：`period` 是外部输入（前端、CLI 都传），而
+/// `today_key - (n - 1)` 在 `n = i64::MAX` 时下溢 —— debug 直接 panic、
+/// release（`panic = "abort"`）连进程一起没，夹不住就别让它参与运算。
+fn period_start_key(today_key: i64, period: i64) -> i64 {
+    match period {
+        -1 => today_key,
+        0 => i64::MIN,
+        n => today_key - (n.clamp(1, MAX_QUERY_DAYS) - 1),
+    }
+}
+
 pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
     let today_date = Local::now().date_naive();
     let today_key = day_key_of_date(today_date);
     let series = device_date_series(device_key);
 
-    let in_period = |dk: i64| match period {
-        -1 => dk == today_key,
-        0 => true,
-        n => dk >= today_key - (n.max(1) - 1),
-    };
+    let from_key = period_start_key(today_key, period);
+    let in_period = |dk: i64| dk >= from_key;
     let sum_where = |f: &dyn Fn(i64) -> bool| -> i64 {
         series
             .iter()
@@ -1377,6 +1386,27 @@ fn local_day_start_ts(date: chrono::NaiveDate) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// 设备详情的周期起点：`period` 是外部输入，极端值不许把 `today_key - (n-1)` 算崩。
+    /// 修前是就地 `today_key - (n.max(1) - 1)`，`n = i64::MAX` 时下溢
+    /// （debug 直接 panic，release abort）→ 这里必须只落进 `1..=MAX_QUERY_DAYS`。
+    #[test]
+    fn device_detail_period_cannot_underflow() {
+        assert_eq!(period_start_key(20_720, -1), 20_720, "-1 = 今日");
+        assert_eq!(
+            period_start_key(20_720, 0),
+            i64::MIN,
+            "0 = 总计，下界不能筛掉任何一天"
+        );
+        assert_eq!(period_start_key(20_720, 7), 20_714);
+        assert_eq!(period_start_key(20_720, 1), 20_720);
+        assert_eq!(
+            period_start_key(20_720, i64::MAX),
+            period_start_key(20_720, MAX_QUERY_DAYS),
+            "i64::MAX 要夹到 MAX_QUERY_DAYS，而不是回绕"
+        );
+        assert_eq!(period_start_key(20_720, i64::MIN), 20_720);
+        assert_eq!(period_start_key(20_720, -100), 20_720, "非法负值退回今日");
+    }
     use super::*;
 
     /// 日期 ↔ 天数序号必须原样往返。
