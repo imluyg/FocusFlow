@@ -1282,11 +1282,15 @@ fn spawn_stats_worker(
                             alltime_total_now(alltime_total_base, alltime_cache_today, cur_today);
                         // 同一个口径补到 `total` 上：否则「总计」页的那张卡片停在
                         // 上次重算的库值上（见 `total_for_display`）。
+                        // `pending_today` 这里**恒传 0**：算出来的值要写回共享快照，
+                        // 而下面每次 live 推送是拿快照当基数再加一次 pending ——
+                        // 这里也加就成了双重计数。
                         agg.total = total_for_display(
                             period_val,
                             agg.total,
                             agg.alltime_total,
                             alltime_total_base >= 0,
+                            0,
                         );
                         period_max.insert(period_val, (agg.max_day, agg.max_day_date.clone()));
                         {
@@ -1334,6 +1338,9 @@ fn spawn_stats_worker(
                 let alltime_total =
                     alltime_total_now(alltime_total_base, alltime_cache_today, cur_today);
 
+                // 今日尚未落库的那部分增量 —— 「近 N 天」的窗口和只到上次 flush 为止，
+                // 不在这里补上，那张卡片就只能每 10 秒跳一次（「总计」「今日」同理走这条快路径）。
+                let pending_today = db.writer().map(|w| w.today_pending_count()).unwrap_or(0);
                 let (live_alltime_total, period_total) = {
                     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
                     s.today_count = today_count;
@@ -1343,8 +1350,16 @@ fn spawn_stats_worker(
                     s.agg.max_day = max_day;
                     s.agg.max_day_date = max_day_date.clone();
                     s.agg.alltime_total = alltime_total;
-                    // period 与两个总数在同一把锁内快照：前端拿到的永远是自洽的一组
-                    (s.agg.alltime_total, s.agg.total)
+                    // period 与两个总数在同一把锁内快照：前端拿到的永远是自洽的一组。
+                    // 修正只在这里做（快照里存的仍是原始库值，见 `total_for_display` 的 pending 说明）。
+                    let corrected = total_for_display(
+                        period_val,
+                        s.agg.total,
+                        alltime_total,
+                        alltime_total_base >= 0,
+                        pending_today,
+                    );
+                    (s.agg.alltime_total, corrected)
                 };
 
                 let live_changed = today_count != prev_today_count
@@ -1436,12 +1451,23 @@ fn alltime_total_now(base: i64, cached_today: i64, cur_today: i64) -> i64 {
 /// Σ`daily_counts.count`），所以 period=0 时直接用那个被"基准 + 今日增量"修正过的值。
 /// 基准还没建立时**不能**覆盖：那时 `alltime_total_now` 回 0，会把一个本来正确的
 /// 库值清零（首轮重聚合之前恰好就是这个状态）。
-fn total_for_display(period_val: i64, agg_total: i64, alltime_total: i64, base_ready: bool) -> i64 {
-    if period_val == 0 && base_ready {
-        alltime_total
-    } else {
-        agg_total
+fn total_for_display(
+    period_val: i64,
+    agg_total: i64,
+    alltime_total: i64,
+    base_ready: bool,
+    pending_today: i64,
+) -> i64 {
+    if period_val == 0 {
+        // 总计 = 全历史，与「今日」页用的是同一个每 tick 修正的量
+        return if base_ready { alltime_total } else { agg_total };
     }
+    if period_val > 0 {
+        // 近 N 天的窗口和里，今日那部分只到上次落库为止；补上内存里还没落库的
+        // 那份才是完整的今日。库里长出同一批时内存里那项已被清空，不会重复计。
+        return agg_total + pending_today;
+    }
+    agg_total
 }
 
 /// 重聚合：按周期查询数据库并计算全部图表数据。
@@ -1593,13 +1619,27 @@ mod compute_charts_tests {
     /// 选了其它周期总计就不变了」。
     #[test]
     fn total_tab_card_uses_the_live_total_not_the_last_recompute() {
-        // period=0 且基准已建立 → 用"基准 + 今日增量"的修正值
-        assert_eq!(total_for_display(0, 1_000_000, 1_000_300, true), 1_000_300);
+        // period=0 且基准已建立 → 用"基准 + 今日增量"的修正值（每 tick 现算的那个）
+        assert_eq!(
+            total_for_display(0, 1_000_000, 1_000_300, true, 0),
+            1_000_300
+        );
         // 基准还没建立（首轮重聚合前 alltime_total_now 回 0）→ 保住库值，别清零
-        assert_eq!(total_for_display(0, 1_000_000, 0, false), 1_000_000);
-        // 「今日」页前端根本不读这个字段；近 N 天该继续用周期自己的总数
-        assert_eq!(total_for_display(-1, 500, 1_000_300, true), 500);
-        assert_eq!(total_for_display(30, 4242, 1_000_300, true), 4242);
+        assert_eq!(total_for_display(0, 1_000_000, 0, false, 77), 1_000_000);
+        // 「总计」页即便有 pending 也不加第二遍：alltime_total 里的今日增量已含未落库部分
+        assert_eq!(
+            total_for_display(0, 1_000_000, 1_000_300, true, 300),
+            1_000_300
+        );
+        // 「今日」页前端根本不读这个字段
+        assert_eq!(total_for_display(-1, 500, 1_000_300, true, 300), 500);
+        // 近 N 天：库里的窗口和只到上次落库为止，得把今日未落库那份补上
+        assert_eq!(total_for_display(30, 4242, 1_000_300, true, 17), 4259);
+        assert_eq!(
+            total_for_display(7, 900, 1_000_300, true, 0),
+            900,
+            "没有 pending 时原样"
+        );
     }
 
     #[test]

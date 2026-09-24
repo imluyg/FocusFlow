@@ -437,6 +437,24 @@ impl DbWriter {
             .is_empty()
     }
 
+    /// 今日**尚未落库**的按键增量（内存聚合里今日那一份）。
+    ///
+    /// 统计线程用它把「近 n 天」那张卡片补成逐键动的：库里那份窗口和只到上次
+    /// flush（默认 10 秒）为止，不加这个量，卡片就只能每 10 秒跳一次。
+    /// 落库之后今日那项会被清空、库里同时长出同一批 → 加上它不会重复计数。
+    pub fn today_pending_count(&self) -> i64 {
+        let dk = queries::day_key_of_date(chrono::Local::now().date_naive());
+        self.state
+            .agg
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .daily
+            .get(&dk)
+            .copied()
+            .unwrap_or(0)
+            .max(0)
+    }
+
     /// 重新统计「今日按键数 + 今日活跃时长」缓存（导入或外部写库之后调用）。
     ///
     /// 两个都得刷：落库是 `seconds = seconds + excluded.seconds` 的增量式，所以
@@ -1372,6 +1390,32 @@ mod tests {
         assert!(
             !recovery_kept_path().exists(),
             "首批增量落库后回放副本必须被删掉，别永久留在 data/ 里"
+        );
+        w.stop_and_wait();
+    }
+
+    /// 今日尚未落库的按键增量：统计线程拿它补「近 N 天」那张卡片。
+    ///
+    /// 两条都得钉住，否则补法会双重计数：**未落库时它就是那批增量**，
+    /// 而落库之后必须归零（同一批已经进了库里的窗口和）。
+    #[test]
+    fn today_pending_count_covers_only_unflushed_deltas() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_pending");
+        let w = DbWriter::start(Duration::from_secs(3600));
+        assert_eq!(w.today_pending_count(), 0, "开局没有未落库增量");
+
+        let t0 = queries::now_ts();
+        for i in 0..6 {
+            w.record("A", t0 + i);
+        }
+        assert_eq!(w.today_pending_count(), 6, "这 6 次还没落库");
+
+        w.flush(true);
+        assert_eq!(
+            w.today_pending_count(),
+            0,
+            "落库之后必须归零 —— 否则统计线程把同一批加两遍"
         );
         w.stop_and_wait();
     }
