@@ -41,12 +41,17 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
     serde_json::json!({
         "theme": c.get("gui", "theme"),
         "paused": state.listener.is_paused(),
-        "hotkey_enabled": c.get("hotkey", "enabled") == "true",
+        // 布尔项一律走 `get_bool`，不能拿字符串比 "==true"：`get_bool` 认
+        // `true/1/yes/on`，而这里以前只认字面量 "true" —— 手改 config.ini 写成
+        // `enabled = 1` 时功能是**开的**（hotkey.rs / state.rs 都用 get_bool 读），
+        // 设置页的勾却是灭的，两个入口对同一件事两把尺子。默认值与权威读者对齐：
+        // [hotkey] enabled 的默认是 false，[floating] enabled 的默认是 true。
+        "hotkey_enabled": c.get_bool("hotkey", "enabled", false),
         "hotkey_str": c.get("hotkey", "toggle_window"),
         // 已启用但注册失败时的原因（空串 = 正常）：组合键常被其它程序占用，
         // 只有日志的话用户看到的是「开关打开着、按了没反应」
         "hotkey_error": crate::hotkey::last_error().unwrap_or_default(),
-        "floating_enabled": c.get("floating", "enabled") == "true",
+        "floating_enabled": c.get_bool("floating", "enabled", true),
         // 备份开关：退出时备份 / 运行中定时备份（0 小时 = 关闭）
         "backup_on_exit": c.get_bool("database", "backup_on_exit", true),
         "backup_online_hours": c.get_int("database", "online_backup_interval_hours", 24),
