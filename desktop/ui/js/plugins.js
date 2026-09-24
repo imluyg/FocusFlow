@@ -154,18 +154,33 @@ export async function renderPluginDetail(force) {
   // 后面的按键全打在空气里。按 data-field 认出同一个控件，重建后把焦点和
   // 光标位置放回去。
   const ae2 = document.activeElement;
-  const keepFocus =
+  const keepField =
     force && ae2 && box.contains(ae2) && ae2.dataset && ae2.dataset.field
-      ? {
-          field: ae2.dataset.field,
-          start: typeof ae2.selectionStart === "number" ? ae2.selectionStart : null,
-        }
+      ? ae2.dataset.field
       : null;
+  const keepFocus = keepField
+    ? {
+        field: keepField,
+        // 同一个 `data-field` 在视图里**可能有好几份**：记账的 `form_fields` 被
+        // add_modal 与 edit_modal 共用（accounting_plugin.lua:434/446），于是
+        // `d_category` 有两组控件。以前只按名字取第一个 → 用户在「修改记录」弹窗里
+        // 换分类时，焦点被放回那个**隐藏的「新增」弹窗**的框上（等于没恢复，
+        // 后续按键还是打在空气里）。所以记下"焦点元素在同名字段里排第几"，
+        // 重建后放回同一个序号。
+        index: [
+          ...box.querySelectorAll(`[data-field="${cssEscape(keepField)}"]`),
+        ].indexOf(ae2),
+        start: typeof ae2.selectionStart === "number" ? ae2.selectionStart : null,
+      }
+    : null;
   box.innerHTML = html;
   lastViewFingerprint = fingerprint;
   restoreSelClasses(box, prevSel); // 重建后恢复选中状态（高亮 + 集合）
   if (keepFocus) {
-    const next = box.querySelector(`[data-field="${cssEscape(keepFocus.field)}"]`);
+    const same = [
+      ...box.querySelectorAll(`[data-field="${cssEscape(keepFocus.field)}"]`),
+    ];
+    const next = same[keepFocus.index] || same[0];
     if (next) {
       next.focus();
       if (keepFocus.start !== null && typeof next.setSelectionRange === "function") {

@@ -19,7 +19,14 @@ function fmtThousands(n) {
 
 // 读取当前主题的图表配色（每次渲染读取一次，主题切换后的下一次推送即生效）
 function chartColors() {
-  const css = getComputedStyle(document.documentElement);
+  // 取色必须从 **body** 拿，不是 `document.documentElement`：深色令牌挂在
+  // `body.dark` 上（tokens.css:31），而自定义属性**只向下继承** —— `<html>` 是 body
+  // 的父节点，于是永远读不到深色的那一套，暗色模式下四张图全用浅色配色
+  // （轴标题与柱顶数值用近黑的 #1A1A2E 压在 #1E2331 的深色卡片上，基本看不见；
+  //  网格线用近白的 #E3EAF6 在暗底上刺眼）。
+  // 切主题后图确实重绘了（`chartKey` 指纹里带着 `document.body.className`），
+  // 只是每次重绘都还是取到同一套浅色值 —— 所以这个 bug 光看"有没有重绘"查不出来。
+  const css = getComputedStyle(document.body);
   const v = (name) => css.getPropertyValue(name).trim();
   return { accent: v("--accent"), muted: v("--muted"), grid: v("--grid-line"), fg: v("--fg"), card: v("--card") };
 }
