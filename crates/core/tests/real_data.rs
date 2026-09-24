@@ -189,6 +189,30 @@ mod tests {
                         .is_empty(),
                     "{year} 年 app_usage 单天总秒数超过一天"
                 );
+                // 6b) 同一天里「前台应用总时长 ≤ 活跃时长」。
+                //
+                // 这是结构性结论：`record()` 拿同一个 `contrib` 同时喂 `active` 和
+                // `apps`（同门限 `ACTIVE_GAP_SECS`），所以归属到应用的秒数只会是活跃
+                // 秒的子集，差额只剩"当时没有已知前台应用"的时段。
+                //
+                // 为什么只从 2026-09-13 起断言：`app_usage` 是 09-12 凌晨才有的表
+                // （`0a317b3`），09-12/09-13 两天先后换过两次口径 —— 最初按"采样窗口
+                // 累计"，会把挂机时间也算进去（`3fd42d2` 改活跃窗口内累计，`403653d`
+                // 才统一到事件侧）。所以 09-12 那天 app > daily 是**历史口径留下的
+                // 痕迹**，不是现在的代码能造出来的：拿他的真实库核过，55 天里违反的
+                // 只有 09-12 这一天（超出 8,694 秒），其余 12 天差值都在 13 秒以内。
+                // 上一场把这条记成"来源查不清、疑似外部换库"，其实是口径迁移。
+                let unified = day_key_of(NaiveDate::from_ymd_opt(2026, 9, 13).expect("date"));
+                assert!(
+                    stale_days(&format!(
+                        "SELECT d.date_key FROM daily_counts d
+                         JOIN (SELECT date_key, SUM(seconds) s FROM app_usage GROUP BY date_key) a
+                           ON a.date_key = d.date_key
+                         WHERE d.date_key >= {unified} AND d.seconds < a.s"
+                    ))
+                    .is_empty(),
+                    "{year} 年存在前台应用时长超过当天活跃时长的天（口径统一之后不该出现）"
+                );
                 assert!(
                     stale_days(
                         "SELECT date_key FROM key_counts WHERE key_name IS NULL OR TRIM(key_name) = ''"
