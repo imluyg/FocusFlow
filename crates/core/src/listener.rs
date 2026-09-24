@@ -258,6 +258,25 @@ struct ListenerCfg {
     scroll_burst_window: std::sync::atomic::AtomicU64,
 }
 
+/// `[listener]` 里"秒"这一类浮点配置的收敛。
+///
+/// 两个值最终都喂给 `Duration::from_secs_f64`，而那个函数对**非有限值**与超大值是
+/// panic —— `get_float` 走 `parse::<f64>()`，`inf` / `nan` / `1e300` 都解析得过来。
+/// 换算点在**每次按键**的热路径上（`is_new_press` 的长按判定、滚轮突发窗口），
+/// release 是 `panic = "abort"` 且没有控制台：症状就是"正打字呢程序没了"，
+/// 开机自启时变成"启动即崩"。
+///
+/// 夹在配置入口而不是各个 getter：新增一个读点也不会漏，且 getter 里的
+/// `+ 1.0`（测试用）不会再把它推回溢出区。上限一天 —— 这两个都是"间隔"语义，
+/// 长过一天等于永不触发，与写错同义；非有限值退回调用方给的默认值。
+fn cfg_seconds(v: f64, fallback: f64, floor: f64) -> f64 {
+    if v.is_finite() {
+        v.clamp(floor, 86_400.0)
+    } else {
+        fallback
+    }
+}
+
 impl ListenerCfg {
     fn reload(&self, config: &FocusFlowConfig) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -276,15 +295,21 @@ impl ListenerCfg {
             Relaxed,
         );
         self.key_repeat_stale.store(
-            config
-                .get_float("listener", "key_repeat_stale_seconds", 15.0)
-                .to_bits(),
+            cfg_seconds(
+                config.get_float("listener", "key_repeat_stale_seconds", 15.0),
+                15.0,
+                0.1,
+            )
+            .to_bits(),
             Relaxed,
         );
         self.scroll_burst_window.store(
-            config
-                .get_float("listener", "scroll_burst_window", 0.8)
-                .to_bits(),
+            cfg_seconds(
+                config.get_float("listener", "scroll_burst_window", 0.8),
+                0.8,
+                0.01,
+            )
+            .to_bits(),
             Relaxed,
         );
     }
@@ -641,6 +666,42 @@ mod tests {
         Box::leak(Box::new(
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
         ))
+    }
+
+    /// `[listener] key_repeat_stale_seconds = inf` 这一句手写配置，改之前会让
+    /// **下一次按键**在 `Duration::from_secs_f64` 上 panic（`get_float` 用的
+    /// `parse::<f64>()` 认 `inf`/`nan`/`1e300`，而 `.max(0.1)` 只挡下限），
+    /// release 是 panic=abort 且无控制台 —— 症状是"正打字呢程序没了"。
+    /// 现在配置入口就该挡掉，并且挡完还得是一个能换算的有限值。
+    #[test]
+    fn absurd_second_values_never_reach_the_duration() {
+        for raw in ["inf", "-inf", "nan", "1e300", "-5", "0"] {
+            // 每个取值一个文件：cargo 并行跑用例，共用一份会互相盖
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../target/ff_listener_clamp_{raw}.ini"));
+            std::fs::write(
+                &path,
+                format!(
+                    "[listener]\nkey_repeat_stale_seconds = {raw}\nscroll_burst_window = {raw}\n"
+                ),
+            )
+            .unwrap();
+            let cfg = FocusFlowConfig::load(&path).unwrap();
+            let c = ListenerCfg::default();
+            c.reload(&cfg);
+            let (stale, burst) = (c.stale_secs(), c.burst_window());
+            assert!(
+                (0.1..=86_400.0).contains(&stale),
+                "`{raw}` 的 stale 该被夹进 0.1..=86400，实际 {stale}"
+            );
+            assert!(
+                (0.01..=86_400.0).contains(&burst),
+                "`{raw}` 的 burst 窗口该被夹进 0.01..=86400，实际 {burst}"
+            );
+            // 生产路径上真正会炸的那一步，连同测试里用的 `+ 1.0` 一起走一遍
+            let _ = Duration::from_secs_f64(stale + 1.0);
+            let _ = Duration::from_secs_f64(burst);
+        }
     }
 
     #[test]
