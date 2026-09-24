@@ -94,6 +94,12 @@ impl Drop for PluginManager {
     }
 }
 
+/// `[plugins] instruction_limit` 没写或写成 0 时用的默认预算（条 Lua 指令 / 每次调用）。
+const DEFAULT_INSTRUCTION_LIMIT: i64 = 10_000_000;
+
+/// 控件表允许的最大嵌套层数（见 `parse_widget`）。
+const MAX_WIDGET_DEPTH: u32 = 32;
+
 impl PluginManager {
     pub fn new(config: &'static FocusFlowConfig, db: Arc<db::Database>) -> Self {
         let (tx, rx) = mpsc::channel();
@@ -178,10 +184,34 @@ impl PluginManager {
         if let Err(e) = lua.set_memory_limit(mem_mb * 1024 * 1024) {
             tracing::warn!("Lua 内存限制设置失败: {e}");
         }
-        let instr = self
-            .config
-            .get_int("plugins", "instruction_limit", 10_000_000)
-            .clamp(1, u32::MAX as i64) as u32;
+        Self::arm_instruction_budget(lua, self.config);
+    }
+
+    /// 装（或**重新**装）一次指令钩子：把这一轮的预算重置为 N 条指令。
+    ///
+    /// 为什么要"每次进入插件代码之前重装"：Lua 的 count 计数器挂在 `lua_State` 上，
+    /// 只有 `lua_sethook` 会把它复位，而回调是**无条件 Err** —— 所以"创建状态时装一次"
+    /// 的真实语义是「这个状态**累计**跑满 N 条指令，就把当时那次调用掐死」，
+    /// 而不是注释所写的「每次调用有 N 条预算」。
+    ///
+    /// 后果是可复现的：插件详情页每 2 秒渲染一次 `get_view()`，插件页挂着不动，
+    /// 攒到 N 的那一刻一个完全正常的插件会被 `mark_plugin_error` 判成
+    /// "疑似死循环"而停用 —— 界面停在旧数据、插件页一行红字，不重启（或停用再启用）
+    /// 不自愈。本仓有用例把这条钉住：
+    /// `crates/core/tests/plugin_lifecycle_test.rs::instruction_budget_is_per_call_not_per_state`
+    /// （默认 1000 万条 + 记账那种规模的 get_view，几个小时到几天内必中一次）。
+    ///
+    /// 重装之后死循环仍然在**同一个调用**里被掐断（预算没变、只是不再跨调用累计）。
+    /// `instruction_limit = 0`（有人当"不限制"写）以前被 `.clamp(1)` 变成 1 →
+    /// 每条指令都超限、所有插件在第一条就中断，这里一并退回默认值。
+    fn arm_instruction_budget(lua: &Lua, cfg: &FocusFlowConfig) {
+        let instr = match cfg
+            .get_int("plugins", "instruction_limit", DEFAULT_INSTRUCTION_LIMIT)
+            .clamp(0, u32::MAX as i64)
+        {
+            0 => DEFAULT_INSTRUCTION_LIMIT as u32,
+            n => n as u32,
+        };
         lua.set_hook(
             HookTriggers::new().every_nth_instruction(instr),
             |_lua, _dbg| -> mlua::Result<VmState> {
@@ -357,15 +387,25 @@ impl PluginManager {
     pub fn discover(&self) -> Vec<PathBuf> {
         let dir = self.plugins_dir();
         std::fs::create_dir_all(&dir).ok();
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().map(|e| e == "lua").unwrap_or(false))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|e| e == "lua").unwrap_or(false))
+                .collect(),
+            // 读不出来 **不等于** 没有插件。以前是 `.unwrap_or_default()`：
+            // `plugins` 被建成同名文件、整份放在断线的网盘上、或替换目录的那一刻，
+            // 插件页显示「暂无插件」而 5 个插件都还在盘上，日志里一个字都没有；
+            // 此时点启用还会得到一句假原因「插件文件不存在」。
+            // 桌面侧那份扫描早就区分了这两件事（见 desktop/src/plugins.rs 的读失败处理）。
+            Err(e) => {
+                tracing::error!(
+                    "插件目录读不出来（{}），本次看不到任何插件 —— 这不是「没有插件」: {e}",
+                    dir.display()
+                );
+                Vec::new()
+            }
+        };
         files.sort();
         files
     }
@@ -544,7 +584,7 @@ impl PluginManager {
             }
             if let Ok(widgets) = t.get::<mlua::Table>("widgets") {
                 for (_, w) in widgets.pairs::<mlua::Value, mlua::Table>().flatten() {
-                    match parse_widget(&w) {
+                    match parse_widget(&w, 0) {
                         Ok(widget) => view.widgets.push(widget),
                         // 认不出来的控件以前是**静默丢掉**的：`type` 打错一个字母、
                         // headers 里混进一个数字，界面上就是少一块，而插件行不报红、
@@ -561,12 +601,14 @@ impl PluginManager {
 
     /// 卸载插件。
     pub fn unload_plugin(&mut self, name: &str) -> bool {
+        let cfg = self.config;
         if let Some(mut info) = self.plugins.remove(name) {
             // 卸载 = 用户不要它了（停用/删除/重启前的一次回收），旧的加载失败原因
             // 不该继续挂在插件页上。
             self.load_errors.remove(&Self::stem_of(&info.file_path));
             if let Some(lua) = &mut info.lua {
                 if let Ok(cleanup) = lua.globals().get::<mlua::Function>("cleanup") {
+                    Self::arm_instruction_budget(lua, cfg);
                     let _: mlua::Result<()> = cleanup.call(());
                 }
             }
@@ -742,6 +784,7 @@ impl PluginManager {
     /// 动作/输入回写会改变插件状态，前端拿到的视图必须是新鲜的，
     /// 否则会出现"点了没反应"（如分页不切换）。
     pub fn refresh_view(&mut self, name: &str) -> Result<(), String> {
+        let cfg = self.config;
         let info = self
             .plugins
             .get(name)
@@ -754,6 +797,7 @@ impl PluginManager {
         if lua.globals().get::<mlua::Function>("get_view").is_err() {
             return Ok(());
         }
+        Self::arm_instruction_budget(lua, cfg);
         let view = match Self::read_view(lua) {
             Ok(v) => v,
             Err(e) => {
@@ -777,6 +821,7 @@ impl PluginManager {
     /// 谎报（插件页每点一次「停用」弹一条失败，可插件确实已经卸载）。刷新失败留一条
     /// warn，视图沿用上一份，下一次 `get_plugin_view` 会再试并把错误摊开。
     pub fn plugin_action(&mut self, name: &str, action_id: &str) -> Result<(), String> {
+        let cfg = self.config;
         let info = self
             .plugins
             .get(name)
@@ -787,6 +832,7 @@ impl PluginManager {
             .ok_or_else(|| format!("插件未加载: {name}"))?;
         // 先检查是否有 on_action
         if let Ok(on_action) = lua.globals().get::<mlua::Function>("on_action") {
+            Self::arm_instruction_budget(lua, cfg);
             if let Err(e) = on_action.call::<()>(action_id) {
                 let msg = format!("on_action 失败: {e}");
                 if is_limit_error(&e) {
@@ -804,6 +850,7 @@ impl PluginManager {
 
     /// 向插件投递按键事件（番茄钟联动等）。
     pub fn plugin_key_event(&mut self, name: &str, key: &str) {
+        let cfg = self.config;
         let info = match self.plugins.get(name) {
             Some(i) => i,
             None => return,
@@ -813,6 +860,7 @@ impl PluginManager {
             None => return,
         };
         if let Ok(record_key) = lua.globals().get::<mlua::Function>("record_key") {
+            Self::arm_instruction_budget(lua, cfg);
             if let Err(e) = record_key.call::<()>(key) {
                 if is_limit_error(&e) {
                     self.mark_plugin_error(name, format!("record_key 失败: {e}"));
@@ -823,6 +871,7 @@ impl PluginManager {
 
     /// 调用插件 set_field(field, value)（输入框回传，随后刷新视图缓存）。
     pub fn plugin_set_field(&mut self, name: &str, field: &str, value: &str) -> Result<(), String> {
+        let cfg = self.config;
         let info = self
             .plugins
             .get(name)
@@ -832,6 +881,7 @@ impl PluginManager {
             .as_ref()
             .ok_or_else(|| format!("插件未加载: {name}"))?;
         if let Ok(set_field) = lua.globals().get::<mlua::Function>("set_field") {
+            Self::arm_instruction_budget(lua, cfg);
             if let Err(e) = set_field.call::<()>((field, value)) {
                 let msg = format!("set_field 失败: {e}");
                 if is_limit_error(&e) {
@@ -933,7 +983,18 @@ fn parse_options(t: &mlua::Table) -> mlua::Result<Vec<(String, String)>> {
 }
 
 /// 解析 Lua 表为声明式控件。
-fn parse_widget(w: &mlua::Table) -> mlua::Result<crate::plugins::Widget> {
+fn parse_widget(w: &mlua::Table, depth: u32) -> mlua::Result<crate::plugins::Widget> {
+    // 深度闸：`modal_form.widgets` 与 `row.children` 是递归下降解析的，而插件表是
+    // **外部数据**。没有上限时一句 `local w={type="row",children={}}; w.children[1]=w`
+    // 就成了自引用 → 递归无界 → 打穿线程栈。栈溢出是 SIGSEGV：不走 panic hook
+    // （那场给 hook 加 flush 也救不了这条），release 又是 abort + 无控制台，
+    // 用户看到的是"双击没反应/开着开着就没了"，连一行死因都没有。
+    // 无环但要撞上限也只需要几千层，插件作者手滑（把上一行的 row 塞进新 row）即可命中。
+    if depth > MAX_WIDGET_DEPTH {
+        return Err(mlua::Error::RuntimeError(format!(
+            "控件嵌套超过 {MAX_WIDGET_DEPTH} 层，已停止解析该控件（疑似自引用的控件表）"
+        )));
+    }
     let wtype: String = w.get("type")?;
     use crate::plugins::{FormField, Widget};
     match wtype.as_str() {
@@ -999,7 +1060,7 @@ fn parse_widget(w: &mlua::Table) -> mlua::Result<crate::plugins::Widget> {
             let mut widgets = Vec::new();
             if let Ok(ws_val) = w.get::<mlua::Table>("widgets") {
                 for (_, c) in ws_val.pairs::<mlua::Value, mlua::Table>().flatten() {
-                    if let Ok(widget) = parse_widget(&c) {
+                    if let Ok(widget) = parse_widget(&c, depth + 1) {
                         widgets.push(widget);
                     }
                 }
@@ -1021,7 +1082,7 @@ fn parse_widget(w: &mlua::Table) -> mlua::Result<crate::plugins::Widget> {
             let mut children = Vec::new();
             if let Ok(children_val) = w.get::<mlua::Table>("children") {
                 for (_, c) in children_val.pairs::<mlua::Value, mlua::Table>().flatten() {
-                    if let Ok(widget) = parse_widget(&c) {
+                    if let Ok(widget) = parse_widget(&c, depth + 1) {
                         children.push(widget);
                     }
                 }

@@ -329,3 +329,86 @@ fn load_failure_is_visible_in_the_list() {
         "{err}"
     );
 }
+
+/// `[plugins] instruction_limit` 必须是**每次调用**的预算，不是这个 Lua 状态
+/// 一辈子的累计账。
+///
+/// 钩子是 `every_nth_instruction(N)` + 回调**无条件** Err，而 Lua 的 count 计数器
+/// 挂在 `lua_State` 上、只有 `lua_sethook` 会把它重置 —— 所以"创建状态时装一次"
+/// 的语义是：这个状态**累计**跑满 N 条指令，就把当时那次调用掐死。
+/// 插件详情页每 2 秒渲染一次 `get_view()`，挂机开着迟早踩中，然后
+/// `mark_plugin_error` 把一个完全正常的插件判成"疑似死循环"停用 ——
+/// 界面停在旧数据、插件页一行红字，不重启/不停用再启用就不自愈。
+#[test]
+fn instruction_budget_is_per_call_not_per_state() {
+    let _g = guard();
+    let tmp = paths::test_app_dir("instr_budget");
+    std::fs::write(
+        tmp.path().join("config.ini"),
+        "[plugins]\nenabled = true\ninstruction_limit = 20000\n",
+    )
+    .unwrap();
+    let p = write_plugin(
+        tmp.path(),
+        "busy_but_fine",
+        r###"
+PLUGIN_NAME = "忙碌但正常"
+function get_view()
+  local s = 0
+  for i = 1, 200 do s = s + i end
+  return { title = "t", widgets = { {type="label", text=tostring(s)} } }
+end
+"###,
+    );
+    let (mut pm, _) = manager_in(tmp.path());
+    pm.load_plugin(&p).expect("加载这个插件本该成功");
+
+    let mut first_fail: Option<(u32, String)> = None;
+    for k in 1..=60u32 {
+        if let Err(e) = pm.refresh_view("忙碌但正常") {
+            first_fail = Some((k, e));
+            break;
+        }
+    }
+    if let Some((k, e)) = first_fail {
+        panic!(
+            "第 {k} 次渲染就被判定超限: {e}\n\
+             每次 get_view() 的工作量都很小（200 次加法 + 一张表），\
+             超限只该发生在**单次调用**跑满预算时；累计计数会把长会话里的正常插件误杀。"
+        );
+    }
+}
+
+/// 自引用的控件表必须被深度闸拦下，而不是把线程栈打穿。
+///
+/// `row.children` / `modal_form.widgets` 是递归下降解析的，而那张表来自插件文件
+/// = 外部数据。修之前没有任何深度上限：`w.children[1] = w` 就是无界递归 → 栈溢出
+/// 是 SIGSEGV —— 不走 panic hook（那场刚给 hook 加的 flush 也救不了它），
+/// release 又是 abort + 无控制台，症状是"开着开着程序没了"且零线索。
+#[test]
+fn a_self_referencing_widget_table_is_truncated_not_fatal() {
+    let _g = guard();
+    let tmp = paths::test_app_dir("widget_cycle");
+    let p = write_plugin(
+        tmp.path(),
+        "selfref",
+        r###"
+PLUGIN_NAME = "自引用控件"
+function get_view()
+  local w = { type = "row", children = {} }
+  w.children[1] = w
+  return { title = "t", widgets = { w } }
+end
+"###,
+    );
+    let (mut pm, _) = manager_in(tmp.path());
+    pm.load_plugin(&p).expect("加载本身不该失败");
+    assert!(
+        pm.refresh_view("自引用控件").is_ok(),
+        "渲染必须能返回，而不是把栈打穿"
+    );
+    assert!(
+        pm.get_plugin("自引用控件").is_some(),
+        "一个控件解析不了不该把整个插件判成错误"
+    );
+}
