@@ -88,6 +88,22 @@ pub struct ChartsStats {
 /// 键鼠排行显示上限。
 const RANK_LIMIT: usize = 100;
 
+/// 榜单排序：次数降序，**同分时按名字升序**。
+///
+/// 以前只排次数（`sort_by_key(Reverse)`），而 `get_stats`/`get_app_stats` 返回的是
+/// `HashMap` —— `into_iter().collect()` 出来的输入序每进程都不一样（SipHash 随机种子），
+/// 稳定排序只是把这份随机原样留在结果里。于是同分键次的先后每次重启都换，
+/// 而紧跟其后的是 `truncate(RANK_LIMIT)`：**谁进榜**也变成随机的。
+/// 他真实库里 113 个键名，第 99~102 名并列 2 次，正好被 100 这条线切进那组 ——
+/// 每次重启有两个键上榜、两个出局，界面末尾那一截每次都在跳（每 2 秒推送一次，
+/// 按 index 上色的话还会闪）。
+///
+/// 宿主侧给插件的同一份榜单早就补了这个破平（`plugins/host.rs` 里
+/// `.then_with(|| a.0.cmp(b.0))` 并写了理由），这里是漏掉的那一处。
+fn sort_rank_desc(items: &mut [(String, i64)]) {
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+}
+
 // ===== 主窗口懒创建 / 隐藏后卸载页面 状态（见 show_main_window / arm_main_unload）=====
 
 /// 与悬浮窗一致的 WebView2 浏览器启动参数。
@@ -1395,7 +1411,7 @@ fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartA
         };
         (total, map.into_iter().collect())
     };
-    apps.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+    sort_rank_desc(&mut apps);
     apps.truncate(RANK_LIMIT);
     // 设备维度统计（Raw Input 侧信道，独立口径：键盘按下 + 鼠标按键 + 滚轮）。
     // 查询侧已按次数降序、显示名去重，这里只截断。
@@ -1406,7 +1422,7 @@ fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartA
     };
     devices.truncate(RANK_LIMIT);
     let mut rank: Vec<(String, i64)> = key_stats.iter().map(|(k, v)| (k.clone(), *v)).collect();
-    rank.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+    sort_rank_desc(&mut rank);
     rank.truncate(RANK_LIMIT);
     let mut groups: std::collections::HashMap<&'static str, i64> = std::collections::HashMap::new();
     for (k, v) in &key_stats {
@@ -1510,7 +1526,45 @@ fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartA
 
 #[cfg(test)]
 mod compute_charts_tests {
-    use super::{alltime_total_now, compute_charts};
+    use super::{alltime_total_now, compute_charts, sort_rank_desc};
+
+    /// 同分必须有确定的先后：否则"谁进前 100 名"随进程重启而变。
+    #[test]
+    fn rank_ties_break_by_name_so_the_truncation_is_stable() {
+        // 三个并列 2 次的键，正好卡在 RANK_LIMIT=100 的切割线上
+        let mut items: Vec<(String, i64)> = (0..99)
+            .map(|i| (format!("k{i:03}"), (100 - i) as i64))
+            .collect();
+        for name in ["zz", "aa", "mm"] {
+            items.push((name.to_string(), 2));
+        }
+        // 打乱输入序（模拟 HashMap 的随机迭代序），结果必须每次一样
+        let mut a = items.clone();
+        let mut b = items.clone();
+        b.reverse();
+        sort_rank_desc(&mut a);
+        sort_rank_desc(&mut b);
+        a.truncate(100);
+        b.truncate(100);
+        assert_eq!(a, b, "输入序不同不该改变截断后的榜单");
+        // 99 条的计数从 100 递减到 2，所以第 97 位是 (k097, 3)，
+        // 并列 2 次的那一组 [aa, k098, mm, zz] 只有前两条活到截断之后。
+        assert_eq!(a.len(), 100);
+        assert_eq!(
+            a[97..],
+            [
+                ("k097".to_string(), 3),
+                ("aa".to_string(), 2),
+                ("k098".to_string(), 2),
+            ],
+            "并列的次数该按名字升序取舍，而不是随 HashMap 迭代序"
+        );
+        assert!(
+            !a.iter().any(|(n, _)| n == "mm" || n == "zz"),
+            "被切掉的该是名字排在后面的那两只"
+        );
+        assert_eq!(a[0], ("k000".to_string(), 100), "次数降序是第一位的");
+    }
 
     #[test]
     fn empty_db_returns_zeroed_agg() {
