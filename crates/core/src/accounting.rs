@@ -1083,10 +1083,22 @@ mod tests {
     #[test]
     fn normalize_date_filter_pads_and_rejects_junk() {
         let norm = |s: &str| super::normalize_date_filter(s);
-        assert_eq!(norm("2026-9-1").as_deref(), Some("2026-09-01"), "不补零的要收成库里的形态");
+        assert_eq!(
+            norm("2026-9-1").as_deref(),
+            Some("2026-09-01"),
+            "不补零的要收成库里的形态"
+        );
         assert_eq!(norm("2026/9/1").as_deref(), Some("2026-09-01"));
-        assert_eq!(norm("20260901").as_deref(), Some("2026-09-01"), "紧凑八位也认");
-        assert_eq!(norm("  2026-09-05  ").as_deref(), Some("2026-09-05"), "首尾空白不算错");
+        assert_eq!(
+            norm("20260901").as_deref(),
+            Some("2026-09-01"),
+            "紧凑八位也认"
+        );
+        assert_eq!(
+            norm("  2026-09-05  ").as_deref(),
+            Some("2026-09-05"),
+            "首尾空白不算错"
+        );
         assert_eq!(norm(""), None, "空 = 不参与筛选");
         assert_eq!(norm("2026-13-1"), None, "没有 13 月，不能静默当成没筛");
         assert_eq!(norm("2026-2-30"), None, "数字都对但日子不存在");
