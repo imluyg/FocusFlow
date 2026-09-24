@@ -37,7 +37,21 @@ pub struct CpmCalculator {
 impl CpmCalculator {
     pub fn new(window: f64) -> Self {
         Self {
-            window: window.max(1.0),
+            // 上下都要夹。`Duration::from_secs_f64` 对**非有限值**与超大值是 panic
+            // （`inf`、`1e300`），而这个窗口每个按键都要换算一次（见 `record`），
+            // release 是 `panic = "abort"` 且没有控制台 —— 症状是"正打着字程序没了"。
+            // 这些值都能从 `[stats] cpm_window` 一句手写出来。
+            //
+            // 先判 `is_finite` 再 `clamp`，而不是直接 `clamp`（clippy 会建议后者）：
+            // `clamp` 自己在参数为 NaN 时 panic，而且**输入是 NaN 时返回 NaN** ——
+            // 正好漏掉两种要挡的情况，还把 panic 留到每次按键的换算上。
+            // 非有限值退回配置的默认 60 秒，语义就是"这一句没写对，当没写"。
+            // 上限一小时：CPM 量的是"最近这一小段有多快"，更长的窗口量不出东西。
+            window: if window.is_finite() {
+                window.clamp(1.0, 3600.0)
+            } else {
+                60.0
+            },
             state: Mutex::new(CpmState {
                 timestamps: VecDeque::with_capacity(4096),
                 cached_count: 0,
@@ -157,7 +171,11 @@ struct RestParams {
 
 impl RestParams {
     fn load(cfg: &FocusFlowConfig) -> Self {
-        let secs = |min: i64| Duration::from_secs(min.max(1) as u64 * 60);
+        // 乘 60 **之前**先夹住：`window_minutes = 99999999999999999` 这种一句手写的值
+        // 会先让 i64 乘法溢出（debug 下直接 panic，release 回绕成一个说不清的窗口长度），
+        // 而不是"只是太长"。上限一天 —— 与 `check_interval`/`rest_seconds` 同一族做法
+        // （`maintenance.rs` 里在线备份的上限是一年）。
+        let secs = |min: i64| Duration::from_secs(min.clamp(1, 24 * 60) as u64 * 60);
         Self {
             enabled: cfg.get_bool("rest", "enabled", true),
             window: secs(cfg.get_int("rest", "window_minutes", 30)),
@@ -205,12 +223,20 @@ impl RestMonitor {
             self.samples.clear();
         }
         self.samples.push_back((now, today_total));
-        while let Some(&(at, _)) = self.samples.front() {
-            if since(Some(at)) > p.window {
-                self.samples.pop_front();
-            } else {
-                break;
-            }
+        // 裁剪时要**留下最后一条已经超过窗口的样本**当左端点。
+        //
+        // 原来这里把所有 `age > window` 的样本都弹掉，紧接着又要求 `age >= window`
+        // 才开始判定 —— 于是只有"最老那条样本的年龄恰好等于 window 那一纳秒"才可能
+        // 通过。调用方是统计线程每 500ms 一次的 `Instant::now()`，年龄只会从
+        // `window - 0.5s` 跳到 `window + 0.5s`：跳过去的那一刻它被弹掉，剩下的又不够
+        // 长 → **"窗口铺满"这件事在真实时序下永远不成立，久坐提醒一次也不会响**。
+        // 三条单测之所以是绿的，因为它们用 `t0 + n*60s` 这种合成整时刻，正好撞在相等上。
+        //
+        // 留下的这条会让判定跨度最多多出一个 tick（`check_interval`，上限 60 秒），
+        // 对一个"要不要起身"的阈值判断无关紧要；反过来（用窗口内最新那条当起点）
+        // 就会少算一整段，那才是原来错的方向。
+        while self.samples.len() >= 2 && since(Some(self.samples[1].0)) > p.window {
+            self.samples.pop_front();
         }
         let &(first_at, first_count) = self.samples.front()?;
         // 窗口没铺满，"这一整段一直在用"就还不成立
@@ -373,6 +399,37 @@ mod tests {
         assert_eq!(calc.get_cpm(), 0);
     }
 
+    /// `[stats] cpm_window` 是记事本里能写 `inf` / `1e300` / `nan` 的地方，而
+    /// `Duration::from_secs_f64` 对前两者是 panic —— 这个窗口每个按键都要换算一次
+    /// （见 `record`），release 的 `panic = "abort"` 把它表现成"正打字呢程序没了"。
+    /// 上面那条 1e12 是安全值（有限、且小于 Duration 上限），挡不住这一族。
+    #[test]
+    fn cpm_window_absurd_values_are_clamped_not_fatal() {
+        for (bad, want) in [
+            (f64::INFINITY, 60.0),
+            (f64::NEG_INFINITY, 60.0),
+            (f64::NAN, 60.0),
+            (1e300, 3600.0),
+            (90_000.0, 3600.0),
+            (-5.0, 1.0),
+            (0.0, 1.0),
+            (60.0, 60.0),
+        ] {
+            let calc = CpmCalculator::new(bad);
+            assert_eq!(
+                calc.window, want,
+                "{bad} 的窗口该落成 {want}：非有限值退回默认 60，有限值夹进 1..=3600"
+            );
+            calc.record();
+            assert_eq!(
+                calc.get_cpm(),
+                1,
+                "{bad} 被夹住之后 record/get_cpm 都不该炸"
+            );
+            calc.reset();
+        }
+    }
+
     fn rows(v: &[(&str, i64)]) -> Vec<(String, i64)> {
         v.iter().map(|(d, c)| (d.to_string(), *c)).collect()
     }
@@ -517,6 +574,80 @@ mod tests {
             (30, 600, 20),
             "载荷里的三个数都要来自配置"
         );
+    }
+
+    /// **真实 tick 不是整分钟**：判定不能要求"最老那条样本的年龄恰好等于窗口"。
+    ///
+    /// 上面这些用例都用 `t0 + n*60s` 这种合成整时刻，正好撞在相等上，所以旧实现
+    /// （把所有 `age > window` 的样本弹掉，紧接着又要求 `age >= window` 才判定）
+    /// 在它们底下是绿的。实际调用方是统计线程每 500ms 一次的 `Instant::now()`，
+    /// 年龄只会从 `window - 0.5s` 跳到 `window + 0.5s`：跳过去那一刻它被弹掉，
+    /// 留下的又不够长 → "窗口铺满"永不成立，**久坐提醒一次也不会响**。
+    ///
+    /// 这条用 350ms 的碎步（60 秒不是 350ms 的整数倍）钉住它真的会发。
+    #[test]
+    fn rest_monitor_fires_on_unaligned_ticks() {
+        let cfg = cfg_from(
+            "unaligned",
+            "[rest]\nenabled = true\nwindow_minutes = 1\nkey_threshold = 20\n\
+             cooldown_minutes = 1\nrest_seconds = 20\ncheck_interval = 1\n",
+        );
+        let mut m = RestMonitor::default();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(350);
+        let mut fired = None;
+        for k in 1..400u32 {
+            if let Some(n) = m.observe(t0 + step * k, (k * 3) as i64, &cfg) {
+                fired = Some((k, n));
+                break;
+            }
+        }
+        let (k, n) = fired
+            .expect("碎步 tick 下也要能提醒一次 —— 否则这条功能等于没有（旧实现在这里一次都不发）");
+        assert!(
+            u64::from(k) * 350 >= 60_000,
+            "第一个 1 分钟窗口还没铺满就发了（第 {k} 个 tick）"
+        );
+        assert!(
+            n.events_in_window >= 20,
+            "过阈值才该发，实际 {}",
+            n.events_in_window
+        );
+        assert_eq!(n.window_minutes, 1);
+    }
+
+    /// `[rest]` 的分钟数乘 60 之前必须先夹住：一句手写的天文数字不该把
+    /// 进程弄 panic（debug）或回绕成一个说不清的窗口（release 无 overflow-checks）。
+    #[test]
+    fn rest_params_bound_absurd_minute_values() {
+        let cfg = cfg_from(
+            "absurd",
+            "[rest]\nenabled = true\nwindow_minutes = 9223372036854775807\n\
+             cooldown_minutes = 9223372036854775807\nrest_seconds = 999999\n\
+             key_threshold = 9223372036854775807\ncheck_interval = 999999\n",
+        );
+        let p = RestParams::load(&cfg);
+        assert_eq!(p.window, Duration::from_secs(24 * 60 * 60), "窗口上限一天");
+        assert_eq!(
+            p.cooldown,
+            Duration::from_secs(24 * 60 * 60),
+            "冷却同样上限一天"
+        );
+        assert_eq!(
+            p.check_interval,
+            Duration::from_secs(600),
+            "检查间隔上限 10 分钟"
+        );
+        assert_eq!(p.rest_seconds, 3600, "建议休息时长上限一小时");
+        assert_eq!(
+            p.key_threshold,
+            i64::MAX,
+            "阈值只做比较，不换算单位，原样收下"
+        );
+        // 夹住之后仍然是一个"发得出来"的判定，而不是永不触发
+        let mut m = RestMonitor::default();
+        let t0 = Instant::now();
+        assert!(m.observe(t0, 5, &cfg).is_none(), "刚起步不该发");
     }
 
     /// 冷却期到点前不得重复提醒；提醒之后窗口要重新攒满。
