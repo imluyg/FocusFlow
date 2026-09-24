@@ -998,9 +998,18 @@ fn keep_floating_on_top(app: &App) {
     std::thread::Builder::new()
         .name("floating-topmost".into())
         .spawn(move || {
-            // 默认隐藏态轮询间隔（3s），可见时每轮覆写为 500ms
-            let mut sleep_ms: u64 = 3000;
+            // 间隔每轮现算（可见 500ms、隐藏 3s），所以这里**不**给初值：
+            // 给了就是死值 —— 第一轮任何读取之前它都会先被赋值一次
+            // （`clippy::unused_assignments` 会把它打成 -D warnings 失败）。
+            // 非 Windows 分支问不到可见性，固定 3s；那条路径上本函数早在
+            // `win.hwnd()` 就 return 了，这里只是为了让这个文件在非 Windows
+            // 下也过得去。
+            let mut sleep_ms: u64;
             loop {
+                #[cfg(not(windows))]
+                {
+                    sleep_ms = 3000;
+                }
                 #[cfg(windows)]
                 unsafe {
                     use windows::Win32::Foundation::HWND;
@@ -1016,8 +1025,14 @@ fn keep_floating_on_top(app: &App) {
                     }
                     // 隐藏时跳过置顶与样式维护（保持 3s 轮询）：
                     // 悬浮窗关闭/禁用后不再每 500ms 白做系统调用（后台功耗）。
-                    if IsWindowVisible(hwnd).as_bool() {
-                        sleep_ms = 500;
+                    //
+                    // 间隔每轮都按当前可见性重算。原来只有这一行 `sleep_ms = 500` 而没有
+                    // 回落分支（全函数 `3000` 只出现在初始化那一行）—— 于是**只要悬浮窗
+                    // 打开过一次**，这个线程就永远以 2 次/秒跑下去，关掉了也不停，
+                    // 与本文件上面那句注释（"隐藏时保持 3s 轮询"）正好相反。
+                    let visible = IsWindowVisible(hwnd).as_bool();
+                    sleep_ms = if visible { 500 } else { 3000 };
+                    if visible {
                         // 工具窗口样式：tao 的 skip_taskbar 只做 DeleteTab，仍会带 WS_EX_APPWINDOW，
                         // 任务管理器会把它当"应用"；这里每轮重申：置 TOOLWINDOW、清 APPWINDOW，
                         // 进程即可归类为后台进程（对齐 Python 版方案）。
@@ -1246,7 +1261,14 @@ fn spawn_stats_worker(
                             agg
                         };
                         charts_period = period_val;
-                        charts_seq = db.writer().map(|w| w.flush_seq()).unwrap_or(flush_seq);
+                        // 记的是"这一份聚合数据对应到哪一次落库"，所以必须用**取数之前**
+                        // 读到的那个 `flush_seq`。原来在这里重新读一次写线程的计数器：
+                        // `compute_charts` 本身要跑几十毫秒到几百毫秒，期间写线程完全可能
+                        // 又完成一次 flush —— 于是那一批增量被记成"已经反映过了"，
+                        // 而同一轮又把 `last_heavy_today = cur_today` 写成"数据没变化"，
+                        // 结果是这批数据在趋势图/排行里**缺席**，直到用户再动一次键鼠
+                        // 才有机会补上（停手时就一直停在这个偏小的值上）。
+                        charts_seq = flush_seq;
                         // 图表推送也必须带上"缓存基准 + 今日增量"的那个总计：`compute_charts`
                         // 里的 alltime_total 是硬编码 0（重聚合不付一次全历史扫描），而前端
                         // applyTotal 在「今日」周期取的就是这个字段 —— 于是每来一次图表推送，
