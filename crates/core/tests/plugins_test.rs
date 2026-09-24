@@ -6,6 +6,7 @@ mod tests {
     use focusflow_core::db;
     use focusflow_core::paths;
     use focusflow_core::plugins::manager::PluginManager;
+    use focusflow_core::plugins::Widget;
 
     /// 串行锁（app_dir 全局状态），容忍 poison（测试失败后不阻塞其他）
     fn test_lock() -> &'static std::sync::Mutex<()> {
@@ -486,8 +487,8 @@ mod tests {
         let prefixes: Vec<&str> = actions.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             prefixes,
-            vec!["toggle_", "del_"],
-            "按钮前缀必须与 on_action 里的 ^toggle_ / ^del_ 分支对得上"
+            vec!["toggle_", "edit_", "del_"],
+            "按钮前缀必须与 on_action 里的 ^toggle_ / ^edit_ / ^del_ 分支对得上"
         );
         assert_eq!(ids.len(), rows.len(), "ids 必须与 rows 一一对应");
         // 最后一列由按钮渲染，所以表头要比数据列多一个
@@ -618,5 +619,770 @@ mod tests {
         manager
             .plugin_action(&name, "save_edit")
             .expect("无编辑对象时的 save_edit 不该报错");
+    }
+
+    // =====================================================================
+    // 下面这组用例都跑在**独立临时目录**里：它们要真的写记账/番茄钟/定时任务的
+    // 附属库，不能落在仓库目录（`plugins_test.rs` 上面那批只做加载+渲染，才敢用
+    // `set_app_dir(当前目录)`）。
+    // =====================================================================
+
+    /// 把一个内置插件复制进隔离的临时程序目录并加载。
+    fn bundled_in(tag: &str, file: &str) -> (paths::TestAppDir, PluginManager, String) {
+        let tmp = paths::test_app_dir(tag);
+        let src = std::env::current_dir()
+            .expect("用例应从 crates/core 目录运行")
+            .join("plugins")
+            .join(file);
+        let dst = tmp.path().join("plugins").join(file);
+        std::fs::create_dir_all(dst.parent().unwrap()).expect("建临时 plugins 目录");
+        std::fs::copy(&src, &dst).unwrap_or_else(|e| panic!("复制内置插件 {src:?} 失败: {e}"));
+        db::queries::invalidate_years_cache();
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(tmp.path().join("config.ini")).expect("临时配置应能载入"),
+        ));
+        let mut manager = PluginManager::new(config, db::Database::init_readonly());
+        let name = manager
+            .load_plugin(&dst)
+            .unwrap_or_else(|e| panic!("加载内置插件 {file} 失败: {e}"));
+        (tmp, manager, name)
+    }
+
+    /// 递归展开控件（`Row` 容器与弹窗内嵌的那一层也要看到）。
+    fn flatten(widgets: &[Widget]) -> Vec<Widget> {
+        let mut out = Vec::new();
+        for w in widgets {
+            out.push(w.clone());
+            match w {
+                Widget::Row { children } => out.extend(flatten(children)),
+                Widget::ModalForm { widgets: inner, .. } => out.extend(flatten(inner)),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn view_of(manager: &PluginManager, name: &str) -> Vec<Widget> {
+        flatten(
+            &manager
+                .get_plugin(name)
+                .and_then(|p| p.view.as_ref())
+                .expect("插件应有视图")
+                .widgets,
+        )
+    }
+
+    fn title_of(manager: &PluginManager, name: &str) -> String {
+        manager
+            .get_plugin(name)
+            .and_then(|p| p.view.as_ref())
+            .map(|v| v.title.clone())
+            .unwrap_or_default()
+    }
+
+    fn labels_of(manager: &PluginManager, name: &str) -> Vec<String> {
+        view_of(manager, name)
+            .into_iter()
+            .filter_map(|w| match w {
+                Widget::Label(t) | Widget::TextArea(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 渲染时就处于打开态的弹窗（`open = true`）—— A0.4 说的那"自己弹出来"。
+    fn open_modal_ids(manager: &PluginManager, name: &str) -> Vec<String> {
+        view_of(manager, name)
+            .into_iter()
+            .filter_map(|w| match w {
+                Widget::ModalForm { id, open: true, .. } => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn select_value(manager: &PluginManager, name: &str, field: &str) -> Option<String> {
+        view_of(manager, name).into_iter().find_map(|w| match w {
+            Widget::Select {
+                field: f, value, ..
+            } if f == field => Some(value),
+            _ => None,
+        })
+    }
+
+    fn textinput_value(manager: &PluginManager, name: &str, field: &str) -> Option<String> {
+        view_of(manager, name).into_iter().find_map(|w| match w {
+            Widget::TextInput {
+                field: f, value, ..
+            } if f == field => Some(value),
+            _ => None,
+        })
+    }
+
+    fn pager_of(manager: &PluginManager, name: &str) -> (i64, i64, i64) {
+        view_of(manager, name)
+            .into_iter()
+            .find_map(|w| match w {
+                Widget::Pager {
+                    page, pages, total, ..
+                } => Some((page, pages, total)),
+                _ => None,
+            })
+            .expect("视图里应有分页条")
+    }
+
+    fn first_table_rows(manager: &PluginManager, name: &str) -> Vec<Vec<String>> {
+        view_of(manager, name)
+            .into_iter()
+            .find_map(|w| match w {
+                Widget::Table { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .expect("视图里应有表格")
+    }
+
+    fn keyvalue_of(manager: &PluginManager, name: &str, key: &str) -> Option<String> {
+        view_of(manager, name).into_iter().find_map(|w| match w {
+            Widget::KeyValue(k, v) if k == key => Some(v),
+            _ => None,
+        })
+    }
+
+    fn button_ids(manager: &PluginManager, name: &str) -> Vec<String> {
+        view_of(manager, name)
+            .into_iter()
+            .filter_map(|w| match w {
+                Widget::Button { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn modal_field(modal: &Widget, field: &str) -> Option<String> {
+        match modal {
+            Widget::ModalForm { fields, .. } => fields
+                .iter()
+                .find(|f| f.field == field)
+                .map(|f| f.value.clone()),
+            _ => None,
+        }
+    }
+
+    fn modal_open(modal: &Widget) -> bool {
+        matches!(modal, Widget::ModalForm { open: true, .. })
+    }
+
+    /// A0.4：面板关掉之后，Lua 里的一次性状态必须清零。
+    ///
+    /// `closePlugin` 原先只清 JS 侧的 `openModals`，插件的 Lua 状态活着 —— 重开记账
+    /// 面板时 `edit_modal`/`profit_modal`/结果弹窗自己弹出来、人还落在分类管理子页；
+    /// Edge 的 `hint`、定时任务的 `msg` 挂到下一次同类动作才走。
+    /// 前端在关闭路径上发一个约定的 `__panel_closed` 动作（宿主没有"面板关闭"入口），
+    /// 这条用例钉的就是插件收到它之后的行为。
+    #[test]
+    fn panel_transient_state_is_reset_when_the_panel_closes() {
+        let _guard = guard();
+
+        // ---- 记账：弹窗 + 分类管理子页 ----
+        let (tmp, mut manager, name) = bundled_in("reset_acct", "accounting_plugin.lua");
+        manager
+            .plugin_action(&name, "open_manage")
+            .expect("打开分类管理");
+        manager
+            .plugin_action(&name, "open_profit_picker")
+            .expect("打开细分盈亏选择");
+        manager
+            .plugin_action(&name, "monthly_detail")
+            .expect("月度汇总");
+        let opened = open_modal_ids(&manager, &name);
+        assert!(
+            opened.contains(&"result_modal".to_string())
+                && opened.contains(&"profit_modal".to_string()),
+            "动作之后这些弹窗本就该是打开的（先证明状态确实立起来了）: {opened:?}"
+        );
+        assert_eq!(title_of(&manager, &name), "记账本 - 分类管理");
+
+        manager
+            .plugin_action(&name, "__panel_closed")
+            .expect("关闭动作不该失败");
+        assert!(
+            open_modal_ids(&manager, &name).is_empty(),
+            "面板关闭后不该再有任何弹窗是打开的： {:?}",
+            open_modal_ids(&manager, &name)
+        );
+        assert_eq!(
+            title_of(&manager, &name),
+            "记账本",
+            "关闭后重开必须落在记账主页，而不是分类管理子页"
+        );
+        assert!(manager.unload_plugin(&name));
+        drop(tmp);
+
+        // ---- Edge：hint 不该挂到下一次刷新为止 ----
+        let (tmp, mut manager, name) = bundled_in("reset_edge", "edge_history_plugin.lua");
+        manager
+            .plugin_action(&name, "refresh")
+            .expect("刷新动作不该失败");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("后台")),
+            "点了刷新数据必须有一句回话"
+        );
+        manager
+            .plugin_action(&name, "__panel_closed")
+            .expect("关闭动作不该失败");
+        // 只要求 **Lua 侧那句 hint** 消失。"⏳ 正在后台读取…" 那一行是写线程真实在途时的
+        // 状态标签（`95eb1f1` 的 claim_round 语义），关闭面板不该、也无力把它抹掉 ——
+        // A0.4 修的是"提示挂到下次同类动作为止"，不是伪造进度。
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .all(|t| !t.contains("已启动后台读取") && !t.contains("稍后再试")),
+            "关闭面板后那句自家的提示必须消失，实际: {:?}",
+            labels_of(&manager, &name)
+        );
+        assert!(manager.unload_plugin(&name));
+        drop(tmp);
+
+        // ---- 定时任务：结果语同样不该残留 ----
+        let (tmp, mut manager, name) = bundled_in("reset_sched", "scheduler_plugin.lua");
+        manager
+            .plugin_action(&name, "toggle_999999")
+            .expect("点了不存在的任务也不该报错");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("切换失败")),
+            "失败原因要先出现在面板上（才有'残留'可言）"
+        );
+        manager
+            .plugin_action(&name, "__panel_closed")
+            .expect("关闭动作不该失败");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .all(|t| !t.contains("切换失败")),
+            "关闭面板后结果语必须清零，实际: {:?}",
+            labels_of(&manager, &name)
+        );
+        assert!(manager.unload_plugin(&name), "卸载要回收调度线程");
+        drop(tmp);
+    }
+
+    /// A0.1 的补测（`ca9111c` 的行为断言）：改名/删除分类后，悬空的筛选条件必须被
+    /// 校正回来，而且**列表要重新有数据**。
+    ///
+    /// 那条提交只被"加载 + 渲染 + refresh"盖住 —— 语法错与 get_view 抛错能挡住，
+    /// "校正"本身没被断言过。这里把 `reset_stale_filters()` 注掉，红的就是
+    /// `pager.total`（筛选还停在老分类名上 → SQL 一条都匹配不到 → 共 0 条）。
+    #[test]
+    fn renamed_or_deleted_category_corrects_the_stale_filter() {
+        use focusflow_core::accounting;
+
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("stale_filter", "accounting_plugin.lua");
+        accounting::init_db().expect("记账库应能建起来");
+        assert!(accounting::add_category("测试分类", "both", &[]) > 0);
+        let put = |date: &str, item: &str, cat: &str| {
+            accounting::add_expense("支出", item, None, date, 3.0, Some(cat), None, None)
+        };
+        for (i, d) in ["2026-08-01", "2026-08-02", "2026-08-03"]
+            .iter()
+            .enumerate()
+        {
+            assert!(put(d, &format!("测试记录{}", i + 1), "测试分类") > 0);
+        }
+        for (i, d) in ["2026-08-04", "2026-08-05"].iter().enumerate() {
+            assert!(put(d, &format!("饮料{}", i + 1), "食品饮料") > 0);
+        }
+
+        // 先把筛选立到"测试分类"上：只有 3 条
+        manager
+            .plugin_set_field(&name, "f_cat", "测试分类")
+            .expect("设置分类筛选");
+        assert_eq!(
+            select_value(&manager, &name, "f_cat").as_deref(),
+            Some("测试分类")
+        );
+        assert_eq!(
+            pager_of(&manager, &name).2,
+            3,
+            "筛选立住时只看到该分类的 3 条"
+        );
+
+        // 通过面板改名 → 悬空
+        manager
+            .plugin_action(&name, "open_manage")
+            .expect("进分类管理");
+        manager
+            .plugin_action(&name, "m_edit_cat_sel测试分类")
+            .expect("选中要改名的分类");
+        manager
+            .plugin_set_field(&name, "m_name", "测试分类改名")
+            .expect("填新名字");
+        manager
+            .plugin_action(&name, "m_save_edit_cat")
+            .expect("保存改名");
+        assert!(accounting::get_all_categories()
+            .iter()
+            .any(|c| c.name == "测试分类改名"));
+        assert_eq!(
+            select_value(&manager, &name, "f_cat").as_deref(),
+            Some("全部"),
+            "改完之后筛选里存的还是老名字 → 下拉显示'全部'而列表是空的，两边各说一套"
+        );
+        assert_eq!(
+            pager_of(&manager, &name).2,
+            5,
+            "校正回来的这一帧必须看得到全部 5 条，不能是共 0 条"
+        );
+
+        // 删除分类同理（记录不会被删，所以总数仍是 5）
+        manager
+            .plugin_set_field(&name, "f_cat", "食品饮料")
+            .expect("换一个分类筛");
+        assert_eq!(pager_of(&manager, &name).2, 2);
+        manager
+            .plugin_action(&name, "m_del_cat_sel食品饮料")
+            .expect("删除分类");
+        assert_eq!(
+            select_value(&manager, &name, "f_cat").as_deref(),
+            Some("全部"),
+            "被删掉的分类名不该留在筛选里"
+        );
+        assert_eq!(pager_of(&manager, &name).2, 5, "同理：共 0 条就是那条假象");
+        assert!(manager.unload_plugin(&name));
+        drop(tmp);
+    }
+
+    /// A0.7 之一：日期筛选是自由文本，`2026-9-1` 这种不补零的写法过去会**静默漏**。
+    ///
+    /// `purchase_date >= ?` 是字符串比较，`"2026-9-1" > "2026-09-05"`（字节序里
+    /// `'9' > '0'`），于是"从 9 月 1 日"恰好把整个九月上旬筛掉而一句错都不报；
+    /// 同一个面板里弹窗的日期控件却是补零的。现在两侧都规范成 `YYYY-MM-DD`，
+    /// 认不出来的写法必须点名说"这一条没生效"，而不是继续装成筛过了。
+    #[test]
+    fn date_range_filter_is_normalised_and_bad_input_is_called_out() {
+        use focusflow_core::accounting;
+
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("date_filter", "accounting_plugin.lua");
+        accounting::init_db().expect("记账库应能建起来");
+        for d in ["2026-08-20", "2026-09-05", "2026-09-15", "2026-10-01"] {
+            assert!(
+                accounting::add_expense(
+                    "支出",
+                    &format!("记录{d}"),
+                    None,
+                    d,
+                    1.0,
+                    None,
+                    None,
+                    None
+                ) > 0
+            );
+        }
+
+        // 不补零的起止：过去 total=0，现在应筛出九月那 2 条
+        manager
+            .plugin_set_field(&name, "f_from", "2026-9-1")
+            .expect("填起始日期");
+        manager
+            .plugin_set_field(&name, "f_to", "2026-9-30")
+            .expect("填结束日期");
+        assert_eq!(
+            pager_of(&manager, &name).2,
+            2,
+            "2026-9-1 得能筛到 2026-09-05（字符串比较下少一个零就整个漏掉）"
+        );
+        assert_eq!(
+            textinput_value(&manager, &name, "f_from").as_deref(),
+            Some("2026-09-01"),
+            "输入框该回填成与日期控件同一套口径（补零）"
+        );
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .all(|t| !t.contains("没生效")),
+            "认得出来的写法不该报错: {:?}",
+            labels_of(&manager, &name)
+        );
+
+        // 认不出来：这条筛选不生效（宁可给全量），并且必须说清是哪一条
+        manager
+            .plugin_set_field(&name, "f_from", "上个月")
+            .expect("填一个不是日期的值");
+        let seen = labels_of(&manager, &name);
+        assert!(
+            seen.iter()
+                .any(|t| t.contains("从") && t.contains("没生效")),
+            "非法日期必须点名说'哪一条没生效'，实际: {seen:?}"
+        );
+        assert_eq!(
+            pager_of(&manager, &name).2,
+            3,
+            "非法的起、合法的止：合法那条照旧生效，非法这条不筛"
+        );
+
+        // 清空 = 不筛（哨兵值不会被 norm 成 nil 之后误报）
+        manager
+            .plugin_set_field(&name, "f_from", "")
+            .expect("清空起始日期");
+        manager
+            .plugin_set_field(&name, "f_to", "")
+            .expect("清空结束日期");
+        assert_eq!(pager_of(&manager, &name).2, 4, "两端都空 = 全量");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .all(|t| !t.contains("没生效")),
+            "留空不该报错"
+        );
+        assert!(manager.unload_plugin(&name));
+        drop(tmp);
+    }
+
+    /// A0.7 之二：`get_view` 原先"先用未夹的 page 查询、再 clamp_page"，
+    /// 于是外部改库/双开把记录删少之后会有一帧"表格空 + 第 3 / 3 页"。
+    #[test]
+    fn out_of_range_page_is_queried_again_after_clamping() {
+        use focusflow_core::accounting;
+
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("page_clamp", "accounting_plugin.lua");
+        accounting::init_db().expect("记账库应能建起来");
+        for i in 0..25 {
+            assert!(
+                accounting::add_expense(
+                    "支出",
+                    &format!("记录{i:02}"),
+                    None,
+                    "2026-07-01",
+                    1.0,
+                    None,
+                    None,
+                    None
+                ) > 0
+            );
+        }
+        // 翻到第 3 页（10 条/页 → 3 页）
+        for _ in 0..2 {
+            manager.plugin_action(&name, "page_next").expect("下一页");
+        }
+        assert_eq!(pager_of(&manager, &name), (3, 3, 25));
+        assert_eq!(first_table_rows(&manager, &name).len(), 5);
+
+        // 外部把库删到只剩 4 条（面板的 page 还是 3 → 必须重查而不是给空表）
+        let (all, _) = accounting::get_expenses_page(1, 200, None, None, None, None, None);
+        for e in all.iter().skip(4) {
+            assert!(accounting::delete_expense(e.id));
+        }
+        manager.refresh_view(&name).expect("重新出图");
+        let (page, pages, total) = pager_of(&manager, &name);
+        assert_eq!((page, pages, total), (1, 1, 4), "夹回到唯一那一页");
+        assert_eq!(
+            first_table_rows(&manager, &name).len(),
+            4,
+            "同一帧就得给出这 4 条：夹过之后没重查的话，页码写着 1/1 而表格是空的"
+        );
+        assert!(manager.unload_plugin(&name));
+        drop(tmp);
+    }
+
+    /// A0.3：番茄钟面板要有「跳过」，而且它和「停止」的落库结果必须不同。
+    ///
+    /// 宿主早就有作废语义的 `pomodoro_skip`（`pomodoro.rs` 的注释专门讲了这条区别，
+    /// 且这是他**明确选定**的丢弃语义），但全仓 `.lua` 零调用 —— 面板只有「停止」，
+    /// 而 `take_current` 只要 `actual > 0` 就落库并 `work_finished += 1`，
+    /// 于是"工作到一半不想记了"只能按停止，今日汇总跟着谎报"完成 1 个"。
+    #[test]
+    fn pomodoro_skip_voids_the_session_while_stop_records_it() {
+        use focusflow_core::pomodoro;
+
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("pomo_skip", "pomodoro_plugin.lua");
+        // 宿主的 `ensure_pomodoro_db` 是进程级闩（本二进制里别的用例已经把它落下了），
+        // 这里显式在**本用例的临时目录**里建好 schema，落库才不会被静默丢掉。
+        pomodoro::init_db().expect("番茄钟库应能建起来");
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        assert!(
+            button_ids(&manager, &name).iter().any(|b| b == "skip"),
+            "面板必须有「跳过」按钮： {:?}",
+            button_ids(&manager, &name)
+        );
+
+        // 跳过：不落库、不计入今日完成
+        manager
+            .plugin_action(&name, "start_work")
+            .expect("开始工作");
+        tick();
+        manager.plugin_action(&name, "skip").expect("跳过");
+        assert!(
+            pomodoro::get_recent_sessions(10).is_empty(),
+            "跳过过的这一段不该留下一行"
+        );
+        assert_eq!(pomodoro::today_summary().0, 0, "跳过不该被数成'完成 1 个'");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("跳过") && t.contains("不落库")),
+            "跳过之后要说清这段作废了"
+        );
+
+        // 停止：落库、计入今日完成（这条语义刻意保持不动）
+        manager
+            .plugin_action(&name, "start_work")
+            .expect("再开一个");
+        tick();
+        manager.plugin_action(&name, "stop").expect("停止");
+        let rows = pomodoro::get_recent_sessions(10);
+        assert_eq!(
+            rows.len(),
+            1,
+            "停止必须照旧把已计到的这一段落库（跳过那条不能顺手把它也关掉）"
+        );
+        assert_eq!(pomodoro::today_summary().0, 1);
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("已停止") && t.contains("今日完成")),
+            "停止之后要说清这一段算完成"
+        );
+
+        // 暂停/继续以前零反馈（`toggle_pause` 的返回值被丢弃、hint 是死代码）
+        manager.plugin_action(&name, "start_work").expect("开始");
+        manager.plugin_action(&name, "toggle_pause").expect("暂停");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("已暂停")),
+            "暂停必须有回话"
+        );
+        manager.plugin_action(&name, "toggle_pause").expect("继续");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("已继续")),
+            "继续必须有回话"
+        );
+        manager
+            .plugin_action(&name, "skip")
+            .expect("收尾：作废这一段");
+        manager
+            .plugin_action(&name, "toggle_pause")
+            .expect("空闲时点暂停");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("没有在计时的番茄钟")),
+            "空闲时点暂停要说'先开始工作'，而不是分不清的已暂停/已继续"
+        );
+        assert_eq!(
+            pomodoro::get_recent_sessions(10).len(),
+            1,
+            "以上没有任何一段被记成完成"
+        );
+        assert!(manager.unload_plugin(&name));
+        drop(tmp);
+    }
+
+    /// A0.5 之一：番茄钟面板看得到、也改得动时长（以前 `work_min`/`brk_min`
+    /// 取出即弃，宿主的 `pomodoro_set_durations` 零调用方）。
+    #[test]
+    fn pomodoro_panel_shows_and_changes_the_durations() {
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("pomo_dur", "pomodoro_plugin.lua");
+
+        assert_eq!(
+            keyvalue_of(&manager, &name, "工作时长").as_deref(),
+            Some("25 分钟"),
+            "默认时长要看得见（值取自宿主状态，不是面板自己写死的）"
+        );
+        assert_eq!(
+            keyvalue_of(&manager, &name, "休息时长").as_deref(),
+            Some("5 分钟")
+        );
+
+        manager
+            .plugin_set_field(&name, "d_work", "40")
+            .expect("填工作时长");
+        manager
+            .plugin_set_field(&name, "d_brk", "10")
+            .expect("填休息时长");
+        manager
+            .plugin_action(&name, "apply_durations")
+            .expect("应用时长");
+        assert_eq!(
+            keyvalue_of(&manager, &name, "工作时长").as_deref(),
+            Some("40 分钟"),
+            "点了应用就该真的写进计时器"
+        );
+        assert_eq!(
+            keyvalue_of(&manager, &name, "休息时长").as_deref(),
+            Some("10 分钟")
+        );
+
+        // 越界与非数字都要被拒并说清（宿主的 clamp 只兜住边界，界面得给原因）
+        manager
+            .plugin_set_field(&name, "d_work", "abc")
+            .expect("填一个不是数字的时长");
+        manager
+            .plugin_action(&name, "apply_durations")
+            .expect("应用非法时长不该让动作本身失败");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("时长没改")),
+            "非法时长必须有话，实际: {:?}",
+            labels_of(&manager, &name)
+        );
+        assert_eq!(
+            keyvalue_of(&manager, &name, "工作时长").as_deref(),
+            Some("40 分钟"),
+            "被拒的输入不许改动计时器"
+        );
+
+        // 还原成默认，别把这个进程级单例留给后面的用例
+        manager
+            .plugin_set_field(&name, "d_work", "25")
+            .expect("还原");
+        manager.plugin_set_field(&name, "d_brk", "5").expect("还原");
+        manager
+            .plugin_action(&name, "apply_durations")
+            .expect("还原时长");
+        assert!(manager.unload_plugin(&name));
+        drop(tmp);
+    }
+
+    /// A0.5 之二：定时任务面板要真能**编辑**任务。
+    ///
+    /// `scheduler_plugin.lua` 的 `edit_id` 从未被使用、宿主的 `scheduler_update` 零
+    /// 调用方 → GUI 里根本不存在"编辑任务"，只能删了重建（而新建被目标白名单卡着）。
+    #[test]
+    fn scheduler_panel_can_edit_a_task() {
+        use focusflow_core::scheduler;
+
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("sched_edit", "scheduler_plugin.lua");
+        scheduler::init_db().expect("定时任务库应能建起来");
+        // enabled=false：这条测试绝不能起记事本（连「添加示例任务」那个动作都不点）
+        let id = scheduler::add_task(
+            "改名前",
+            "C:\\Windows\\notepad.exe",
+            "",
+            "daily",
+            "09:00",
+            false,
+        )
+        .expect("夹具任务应能入库");
+        manager.refresh_view(&name).expect("重新出图");
+
+        let actions: Vec<String> = view_of(&manager, &name)
+            .into_iter()
+            .find_map(|w| match w {
+                Widget::Table { actions, .. } => {
+                    Some(actions.into_iter().map(|(prefix, _)| prefix).collect())
+                }
+                _ => None,
+            })
+            .expect("任务表格应有行内按钮");
+        assert!(
+            actions.iter().any(|a| a == "edit_"),
+            "行内必须有「编辑」： {:?}",
+            actions
+        );
+
+        manager
+            .plugin_action(&name, &format!("edit_{id}"))
+            .expect("点编辑");
+        let modal = view_of(&manager, &name)
+            .into_iter()
+            .find(|w| matches!(w, Widget::ModalForm { id, .. } if id == "edit_modal"))
+            .expect("视图里应有编辑弹窗");
+        assert!(modal_open(&modal), "点编辑必须把弹窗开起来");
+        assert_eq!(
+            modal_field(&modal, "ed_name").as_deref(),
+            Some("改名前"),
+            "弹窗要预填任务现值，不然等于让用户重打一遍"
+        );
+        assert_eq!(
+            modal_field(&modal, "ed_target").as_deref(),
+            Some("C:\\Windows\\notepad.exe")
+        );
+        assert_eq!(modal_field(&modal, "ed_enabled").as_deref(), Some("0"));
+
+        manager
+            .plugin_set_field(&name, "ed_name", "改名后")
+            .expect("改名字");
+        manager.plugin_action(&name, "save_edit").expect("保存编辑");
+        let tasks = scheduler::get_all_tasks();
+        let edited = tasks.iter().find(|t| t.id == id).expect("任务该还在");
+        assert_eq!(edited.name, "改名后", "scheduler_update 必须真的被走到");
+        assert!(!edited.enabled, "编辑不该顺手把任务启用（会起记事本）");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("已更新任务")),
+            "保存成功要有回话"
+        );
+        assert!(
+            open_modal_ids(&manager, &name)
+                .iter()
+                .all(|m| m != "edit_modal"),
+            "保存之后编辑弹窗要关闭"
+        );
+
+        // 被拒时把宿主的原话说出来，并且留着弹窗让人改
+        manager
+            .plugin_action(&name, &format!("edit_{id}"))
+            .expect("再开一次编辑");
+        manager
+            .plugin_set_field(&name, "ed_time", " nonsense : : ")
+            .expect("填一个非法调度");
+        manager
+            .plugin_action(&name, "save_edit")
+            .expect("非法调度的保存不该让动作失败");
+        let seen = labels_of(&manager, &name);
+        assert!(
+            seen.iter()
+                .any(|t| t.contains("更新失败") && t.contains("调度")),
+            "被宿主拒绝时要把原因搬上面板，实际: {seen:?}"
+        );
+        assert!(
+            open_modal_ids(&manager, &name).contains(&"edit_modal".to_string()),
+            "被拒时弹窗要留着（草稿还在里面）"
+        );
+        assert_eq!(
+            scheduler::get_all_tasks()
+                .iter()
+                .find(|t| t.id == id)
+                .expect("还在")
+                .name,
+            "改名后",
+            "被拒的那次保存一个字都不该写进去"
+        );
+
+        manager
+            .plugin_action(&name, "cancel_edit")
+            .expect("取消编辑");
+        assert!(
+            open_modal_ids(&manager, &name)
+                .iter()
+                .all(|m| m != "edit_modal"),
+            "取消之后弹窗要关"
+        );
+        manager
+            .plugin_action(&name, "edit_999999")
+            .expect("点一个不存在 id 的编辑");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("编辑失败")),
+            "列表里没有这一条时也要说清"
+        );
+        assert!(manager.unload_plugin(&name), "卸载要回收调度线程");
+        drop(tmp);
     }
 }

@@ -710,6 +710,44 @@ pub fn get_subcategories(category: &str) -> Vec<String> {
     out
 }
 
+/// 把"人手写出来的日期"规范成 `YYYY-MM-DD`：`2026-9-1`、`2026/09/01`、`2026.9.1`、
+/// `20260901` 都收到同一个值；根本不是日期就返回 `None`。
+///
+/// 为什么要有它：`expenses.purchase_date` 存的是补零形态，而日期筛选是**字符串比较**
+/// （`purchase_date >= ?`）。少一个零就漏：`"2026-9-1" > "2026-09-05"` 在字节序里成立
+/// （`'9' > '0'`），于是"从 2026-9-1 起"恰好把整个九月上旬筛掉，而且一句错都不报。
+/// 同一个弹窗里的日期控件给的却是补零形态（`kind="date"`）—— 同一个列两套口径。
+pub fn normalize_date_filter(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = s.split(['-', '/', '.']).collect();
+    let (ys, ms, ds) = match parts.len() {
+        3 => (parts[0], parts[1], parts[2]),
+        // 紧凑写法 20260901：八位数字
+        1 if parts[0].len() == 8 && parts[0].bytes().all(|b| b.is_ascii_digit()) => {
+            let p = parts[0];
+            (p.get(..4)?, p.get(4..6)?, p.get(6..8)?)
+        }
+        _ => return None,
+    };
+    let num = |seg: &str| -> Option<i64> {
+        let t = seg.trim();
+        if t.is_empty() || t.len() > 8 || !t.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        t.parse::<i64>().ok()
+    };
+    let (y, m, d) = (num(ys)?, num(ms)?, num(ds)?);
+    if !(1970..=9999).contains(&y) {
+        return None;
+    }
+    // from_ymd_opt 顺带管掉 2 月 30 日、13 月这类"数字都对但日子不存在"的输入
+    chrono::NaiveDate::from_ymd_opt(y as i32, m as u32, d as u32)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+}
+
 /// 分页 + 筛选查询：返回 (records, total)。
 /// category/subcategory/keyword/date_from/date_to 为空时不过滤。
 #[allow(clippy::too_many_arguments)]
@@ -753,11 +791,20 @@ pub fn get_expenses_page(
             params.push(rusqlite::types::Value::Text(like.clone()));
         }
     }
-    if let Some(f) = date_from.filter(|f| !f.is_empty()) {
+    // 日期两端先规范成库里那套补零形态，再进字符串比较（见 `normalize_date_filter`）。
+    // 规范不出来的（"上个月"）按"这一条筛选不生效"处理：与其悄悄少筛一半，
+    // 不如把全部列出来 —— 面板那一头会在筛选栏下面把"哪一条没认出来"说清楚。
+    let from_norm = date_from
+        .filter(|f| !f.is_empty())
+        .and_then(normalize_date_filter);
+    if let Some(f) = from_norm.as_deref() {
         conds.push("purchase_date>=?".to_string());
         params.push(rusqlite::types::Value::Text(f.to_string()));
     }
-    if let Some(t) = date_to.filter(|t| !t.is_empty()) {
+    let to_norm = date_to
+        .filter(|t| !t.is_empty())
+        .and_then(normalize_date_filter);
+    if let Some(t) = to_norm.as_deref() {
         conds.push("purchase_date<=?".to_string());
         params.push(rusqlite::types::Value::Text(t.to_string()));
     }

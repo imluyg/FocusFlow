@@ -52,8 +52,64 @@ function cleanup()
     focusflow.log("记账本插件已清理")
 end
 
+-- 「面板已关闭」由前端在关闭路径上发来（`ui/js/plugins.js` 的 closePlugin）。
+-- 面板关掉并不清空 Lua 状态：以前重开记账面板时 edit_modal / profit_modal /
+-- 统计结果弹窗会自己弹出来，人也直接落在分类管理子页上。
+-- 刻意**保留**筛选条件与页码（那是用户选的"看哪一批"，不是一次性状态，
+-- 要清有「重置」按钮）。
+local PANEL_CLOSED = "__panel_closed"
+
+local function reset_transient_state()
+    editing_id = nil
+    draft.type = "支出"; draft.item = ""; draft.store = ""; draft.amount = ""
+    draft.category = ""; draft.subcategory = ""; draft.date = ""; draft.note = ""
+    result_text = ""
+    list_msg = ""
+    picker_open = false
+    profit_cat = ""
+    manage_open = false
+    m_cat = ""
+    m_name = ""
+    m_sub_name = ""
+    m_edit_old = ""
+    m_edit_open = false
+    m_sub_edit_old = ""
+    m_sub_edit_open = false
+end
+
 function _today()
     return os.date("%Y-%m-%d")
+end
+
+-- 某一天是否存在（闰年 2 月 29 日这种"数字都对、日子不存在"的写法要挡掉）
+local function days_in_month(y, m)
+    local lens = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+    if m == 2 and y % 4 == 0 and (y % 100 ~= 0 or y % 400 == 0) then return 29 end
+    return lens[m]
+end
+
+-- 日期筛选的规范化：`2026-9-1` / `2026/09/01` / `2026.9.1` / `20260901` 一律收成
+-- 补零的 `YYYY-MM-DD`，认不出来返回 nil。
+--
+-- 为什么两边（面板与宿主 `accounting.normalize_date_filter`）都要做：`purchase_date`
+-- 存的是补零形态，而日期筛选是**字符串比较** —— 少一个零就静默漏：
+-- `"2026-9-1" > "2026-09-05"`（字节序里 `'9' > '0'`），"从 2026-9-1 起"恰好把
+-- 整个九月上旬筛掉，一个错都不报。同一个弹窗里的日期控件却是补零的，
+-- 同一列两套口径。面板这一侧还要负责把话说明白（宿主只会"不筛"，没有反馈通道）。
+function norm_date(s)
+    if type(s) ~= "string" then return nil end
+    local t = s:match("^%s*(.-)%s*$")
+    if t == "" then return nil end
+    local y, m, d = t:match("^(%d+)%D+(%d+)%D+(%d+)$")
+    if not y and t:match("^%d%d%d%d%d%d%d%d$") then
+        y, m, d = t:sub(1, 4), t:sub(5, 6), t:sub(7, 8)
+    end
+    if not y then return nil end
+    y, m, d = tonumber(y), tonumber(m), tonumber(d)
+    if y < 1970 or y > 9999 or m < 1 or m > 12 or d < 1 or d > days_in_month(y, m) then
+        return nil
+    end
+    return string.format("%04d-%02d-%02d", y, m, d)
 end
 
 local function cats()
@@ -65,13 +121,14 @@ local function subs(cat)
     return focusflow.accounting_subcategories(cat)
 end
 
--- 查询当前页，返回 (records, total)
+-- 查询当前页，返回 (records, total)。日期在这里再规范一次：认不出来的写法
+-- 不当筛选条件用（面板上另有一行说明是哪一条没认出来）。
 local function query_page()
     return focusflow.accounting_query(
         page, PAGE_SIZE,
         f_cat == "全部" and "" or f_cat,
         f_sub == "全部" and "" or f_sub,
-        f_kw, f_from, f_to
+        f_kw, norm_date(f_from) or "", norm_date(f_to) or ""
     )
 end
 
@@ -132,7 +189,9 @@ local function reset_stale_filters()
 end
 
 function on_action(id)
-    if id == "page_prev" then
+    if id == PANEL_CLOSED then
+        reset_transient_state()
+    elseif id == "page_prev" then
         if page > 1 then page = page - 1 end
     elseif id == "page_next" then
         local _, total = query_page()
@@ -428,8 +487,13 @@ function set_field(field, value)
     elseif field == "f_cat" then f_cat = value; f_sub = "全部"; page = 1
     elseif field == "f_sub" then f_sub = value; page = 1
     elseif field == "f_kw" then f_kw = value; page = 1
-    elseif field == "f_from" then f_from = value; page = 1
-    elseif field == "f_to" then f_to = value; page = 1
+    elseif field == "f_from" or field == "f_to" then
+        -- 认得出来就收成补零形态（与弹窗的 `kind="date"` 同一套口径）；
+        -- 认不出来留着原样给用户改，视图上另有一行说明它没生效。
+        local n = norm_date(value)
+        if field == "f_from" then f_from = n or value
+        else f_to = n or value end
+        page = 1
     elseif field == "profit_cat" then profit_cat = value
     elseif field == "m_cat" then m_cat = value
     elseif field == "m_name" then m_name = value
@@ -456,8 +520,17 @@ local function sub_opts_with(extra_label, extra_value, cat)
 end
 
 function get_view()
+    -- 先按当前页查、再判断这一页还在不在：以前是"用**没夹过**的 page 查一次、
+    -- 然后才 clamp_page"，所以外部改库/双开把记录删少之后，会有一帧
+    -- "表格空着 + 第 3 / 3 页"，要等下一次 2 秒推送才自愈。
+    -- 夹过之后重查一次（只在真的越界时发生，正常翻页一次查询就够）。
+    local asked = page
     local records, total = query_page()
     local pages = clamp_page(total)
+    if page ~= asked then
+        records, total = query_page()
+        pages = clamp_page(total)
+    end
 
     local rows = {}
     local ids = {}
@@ -565,6 +638,14 @@ function get_view()
             { type = "button", id = "reset_query", text = "重置" },
         },
     })
+    -- 日期是自由文本框：认不出来的写法必须点名说"这一条没生效"，
+    -- 否则用户以为筛过了，看到的其实是全量（宿主那一头只会静默不筛）。
+    for _, pair in ipairs({ { "从", f_from }, { "到", f_to } }) do
+        if pair[2] ~= "" and not norm_date(pair[2]) then
+            add({ type = "label", text = "日期筛选「" .. pair[1] .. "」没生效："
+                .. "「" .. pair[2] .. "」不是能认的日期，写成 2026-09-01（年-月-日，个位数不用补零）或留空" })
+        end
+    end
 
     add({ type = "separator" })
 

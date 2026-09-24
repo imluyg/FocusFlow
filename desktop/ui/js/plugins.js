@@ -88,6 +88,16 @@ export async function togglePlugin(file, enabled) {
   await renderPlugins();
 }
 
+// 面板关闭时发给插件的约定动作 id：让插件把**一次性状态**（弹窗是否打开、上一次
+// 动作的提示语、草稿）清零。
+//
+// 为什么要有这一句：`closePlugin` 原先只清 JS 侧的 `openModals`，而插件的 Lua 状态
+// 在面板关掉之后仍然活着 —— 重开记账面板时 edit_modal / profit_modal / 统计结果弹窗
+// 会自己弹出来、人也直接落在分类管理子页上；Edge 的提示、定时任务的结果语也一直挂到
+// 下一次同类动作。宿主没有"面板关闭"这个入口（能用的只有 init/cleanup/get_view/
+// on_action/set_field），所以借 on_action 一个不会与任何按钮 id 撞车的保留字。
+export const PANEL_CLOSED_ACTION = "__panel_closed";
+
 export function openPlugin(name) {
   markPluginUsed(name);
   appState.openPluginName = name;
@@ -96,11 +106,17 @@ export function openPlugin(name) {
 }
 
 export function closePlugin() {
+  const name = appState.openPluginName;
   appState.openPluginName = null;
   lastViewFingerprint = "";
   openModals.clear(); // 离开插件页：清空弹窗打开状态，避免重开时旧弹窗自动弹出
   appState.pluginSelIds = { __main: new Set() };
   renderPlugins();
+  // Lua 侧同样要清（见 PANEL_CLOSED_ACTION）。发不出去就算了：没有 on_action 的插件
+  // 本来也没有可残留的状态，报一条 toast 只会打扰。
+  if (name) {
+    invoke("plugin_action", { name, id: PANEL_CLOSED_ACTION }).catch(() => {});
+  }
 }
 
 export async function renderPluginDetail(force) {

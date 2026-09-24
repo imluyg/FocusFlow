@@ -306,7 +306,17 @@ pub fn save_edge_history_count(target_date: NaiveDate, count: i64) {
     );
 }
 
-/// 获取近 N 天 Edge 历史计数。
+/// 获取近 N 天 Edge 历史计数，**按天补零**：返回的要么正好是 `days` 项、按日期升序，
+/// 要么是空表（一次都没刷新过）。
+///
+/// 以前只回数据库里存在的那几行：面板标题写着「近 30 天」，表格里却常只躺两三行，
+/// 而且没人说得清"这天没记录"和"这天没刷过"差在哪。补零之后"没有行"这个信号只剩
+/// 一种含义（从没刷新过），插件据此把峰值也显示成 "—"，与今日/总数同一口径。
+///
+/// 从没刷新过时**刻意不补零**：`open_local()` 会把文件创建出来，所以不能靠"文件在不在"
+/// 判，只能看窗口内到底有没有行 —— 补成一整列 0 就等于把"没刷过"伪装成"每天都是 0"。
+/// 天数上限 366 只是防御性的：真正决定 `with_capacity` 的数值不能来自外部（release 是
+/// `panic = "abort"`，`i64::MAX` 那种值会直接在分配处崩掉整个程序）。
 pub fn get_edge_history_counts(days: i64) -> Vec<(String, i64)> {
     let path = edge_db_path();
     if !path.exists() {
@@ -316,18 +326,41 @@ pub fn get_edge_history_counts(days: i64) -> Vec<(String, i64)> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let start = (Local::now().date_naive() - chrono::Days::new((days - 1).max(0) as u64))
-        .format("%Y-%m-%d")
-        .to_string();
+    let days = days.clamp(1, 366);
+    let today = Local::now().date_naive();
+    let Some(start) = today.checked_sub_days(chrono::Days::new((days - 1) as u64)) else {
+        return Vec::new();
+    };
+    let start_str = start.format("%Y-%m-%d").to_string();
     let result = conn
         .prepare("SELECT date, count FROM edge_history WHERE date >= ?1 ORDER BY date")
         .and_then(|mut stmt| {
-            stmt.query_map([&start], |r| {
+            stmt.query_map([&start_str], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
             })
-            .map(|it| it.flatten().collect())
+            .map(|it| it.flatten().collect::<Vec<(String, i64)>>())
         });
-    result.unwrap_or_default()
+    let saved: Vec<(String, i64)> = match result {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    if saved.is_empty() {
+        return Vec::new();
+    }
+
+    let mut by_date: std::collections::HashMap<String, i64> = saved.into_iter().collect();
+    let mut out = Vec::with_capacity(days as usize);
+    let mut day = start;
+    while day <= today {
+        let key = day.format("%Y-%m-%d").to_string();
+        let count = by_date.remove(&key).unwrap_or(0);
+        out.push((key, count));
+        match day.succ_opt() {
+            Some(next) => day = next,
+            None => break,
+        }
+    }
+    out
 }
 
 /// 刷新状态（`RefreshSlot::state` 的取值）。
@@ -1054,5 +1087,58 @@ mod tests {
         assert_eq!(get_edge_history_saved_today(), Some(42));
         save_edge_history_meta("total", 900);
         assert_eq!(get_edge_history_saved_total(), Some(900));
+    }
+
+    /// 「近 30 天」必须真的给满 30 天：库里没有的日子补 0。
+    ///
+    /// 旧实现把 SQLite 里恰好存在的那几行原样交给面板 —— 标题写「近 30 天」、表格里
+    /// 只躺两三行，而且"这天没记录"和"这天没刷过"在界面上长得一模一样。
+    /// 另一头也不能编造：一次都没刷新过时必须是**空表**，否则插件会把"没刷过"
+    /// 显示成一整列 0（那正是这一场要连带修掉的"峰值恒 0"）。
+    #[test]
+    fn trend_zero_fills_missing_days_but_never_invents_history() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("edge_zero_fill");
+        let today = Local::now().date_naive();
+
+        assert!(
+            get_edge_history_counts(30).is_empty(),
+            "一次都没刷新过时不该编出一张 30 天的表"
+        );
+
+        save_edge_history_count(today, 7);
+        save_edge_history_count(today - chrono::Days::new(3), 4);
+        // 窗口之外的老日子：存在库里，但不该挤进这张 30 天的表
+        save_edge_history_count(today - chrono::Days::new(400), 999);
+
+        let counts = get_edge_history_counts(30);
+        assert_eq!(counts.len(), 30, "标题写近 30 天就得给满 30 行");
+        assert!(
+            !counts.iter().any(|(_, c)| *c == 999),
+            "400 天前那行不该被算进近 30 天"
+        );
+        let fmt = |d: NaiveDate| d.format("%Y-%m-%d").to_string();
+        assert_eq!(counts[0].0, fmt(today - chrono::Days::new(29)));
+        assert_eq!(counts[29], (fmt(today), 7), "今天那行用存进去的值");
+        assert_eq!(
+            counts[26],
+            (fmt(today - chrono::Days::new(3)), 4),
+            "3 天前那行用存进去的值"
+        );
+        assert_eq!(
+            counts.iter().filter(|(_, c)| *c == 0).count(),
+            28,
+            "缺的日子一律补 0"
+        );
+        for w in counts.windows(2) {
+            let prev = NaiveDate::parse_from_str(&w[0].0, "%Y-%m-%d").expect("日期格式");
+            let next = NaiveDate::parse_from_str(&w[1].0, "%Y-%m-%d").expect("日期格式");
+            assert_eq!(
+                next,
+                prev.succ_opt().unwrap(),
+                "必须逐日连续且升序：{:?}",
+                w.iter().map(|e| e.0.as_str()).collect::<Vec<_>>()
+            );
+        }
     }
 }
