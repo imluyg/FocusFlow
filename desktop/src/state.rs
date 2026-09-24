@@ -309,22 +309,27 @@ fn setup_windows(app: &App, state: &AppState) {
                 let _ = win.set_position(tauri::LogicalPosition::new(w - 120.0, 60.0));
             }
         } else {
-            // 存过的坐标得夹回当前这块屏幕：换过显示器或拔掉副屏之后那对数字
-            // 常常落在工作区之外，而下面 `win.show()` 照样执行 —— 表现就是
-            // "设置里勾了悬浮窗却看不见"，界面上没有任何入口能把它召回来
-            // （只能去 config.ini 改 pos_x/pos_y）。
-            let (mut cx, mut cy) = (x, y);
-            if let Ok(Some(mon)) = win.current_monitor() {
-                let scale = win.scale_factor().unwrap_or(1.0);
-                let wa = mon.work_area();
-                let left = wa.position.x as f64 / scale;
-                let top = wa.position.y as f64 / scale;
-                // 留 120×40 可见余量：卡片实际宽度约 90px，留一点边
-                let right = left + wa.size.width as f64 / scale - 120.0;
-                let bottom = top + wa.size.height as f64 / scale - 40.0;
-                cx = cx.clamp(left, right.max(left));
-                cy = cy.clamp(top, bottom.max(top));
-            }
+            // 存过的坐标只在"基本看不见"时才夹回来（判据与为什么不用工作区，
+            // 都写在 `clamp_floating_into_screen` 上）。
+            let (cx, cy) = match win.current_monitor() {
+                Ok(Some(mon)) => {
+                    let scale = win.scale_factor().unwrap_or(1.0);
+                    clamp_floating_into_screen(
+                        x,
+                        y,
+                        FloatingBounds {
+                            left: mon.position().x as f64 / scale,
+                            top: mon.position().y as f64 / scale,
+                            screen_w: mon.size().width as f64 / scale,
+                            screen_h: mon.size().height as f64 / scale,
+                            win_w: config.get_float("floating", "width", 90.0),
+                            win_h: config.get_float("floating", "height", 46.0),
+                        },
+                    )
+                }
+                // 拿不到显示器信息就不动它：瞎夹一次可能把一个好位置弄坏
+                _ => (x, y),
+            };
             let _ = win.set_position(tauri::LogicalPosition::new(cx, cy));
         }
 
@@ -1447,6 +1452,41 @@ fn alltime_total_now(base: i64, cached_today: i64, cur_today: i64) -> i64 {
 /// 跨天 / 强制刷新）才发生 —— 于是同一个「总计」，切到「今日」逐键跳动、
 /// 切到「总计」一整天不动。
 ///
+/// 悬浮窗"至少还得露出这么多像素"才算看得见；低于这个才认为它跑丢了。
+const FLOATING_MIN_VISIBLE: f64 = 20.0;
+
+/// 一块屏幕的位置与尺寸 + 悬浮卡片尺寸（合成一个参数，避开 `too_many_arguments`）。
+struct FloatingBounds {
+    left: f64,
+    top: f64,
+    screen_w: f64,
+    screen_h: f64,
+    win_w: f64,
+    win_h: f64,
+}
+
+/// 把存过的悬浮窗坐标夹回屏幕，但**只在卡片基本看不见时才动它**。
+///
+/// 要防的是那一件事：换显示器/拔副屏之后坐标落在屏幕之外，而下面 `win.show()` 照样执行
+/// —— 表现是"设置里勾了悬浮窗却看不见"，界面上没有任何入口能召回（只能去改 config.ini）。
+///
+/// 判据不能用**工作区**：悬浮窗是 top-most 工具窗，压在任务栏上照样看得见。
+/// 拿工作区夹会把人故意放在屏幕底边的位置每次启动往上拽一截，而且是拽到一个确定值
+/// （他实测：1920x1080、工作区底边 1032、卡片高 46、存的 `pos_y = 1031` → 被夹到 992，
+/// 于是"我放好了，重开又跑到固定位置"）。所以用整块屏幕的边界，并允许卡片只要
+/// 露出 `FLOATING_MIN_VISIBLE` 就原样保留 —— 越界时也只朝看不见的方向挪最小的一步。
+fn clamp_floating_into_screen(x: f64, y: f64, b: FloatingBounds) -> (f64, f64) {
+    let min_x = b.left - b.win_w + FLOATING_MIN_VISIBLE;
+    let max_x = b.left + b.screen_w - FLOATING_MIN_VISIBLE;
+    let min_y = b.top - b.win_h + FLOATING_MIN_VISIBLE;
+    let max_y = b.top + b.screen_h - FLOATING_MIN_VISIBLE;
+    // max 可能小于 min（屏幕比卡片还小，比如 640x480 的副屏配大悬浮窗）→ 夹成单点而不是 panic
+    (
+        x.clamp(min_x, max_x.max(min_x)),
+        y.clamp(min_y, max_y.max(min_y)),
+    )
+}
+
 /// `compute_charts(0).total` 与 `alltime_total_base` 是同一个量（都是全跨年库的
 /// Σ`daily_counts.count`），所以 period=0 时直接用那个被"基准 + 今日增量"修正过的值。
 /// 基准还没建立时**不能**覆盖：那时 `alltime_total_now` 回 0，会把一个本来正确的
@@ -1607,9 +1647,75 @@ fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartA
 
 #[cfg(test)]
 mod compute_charts_tests {
-    use super::{alltime_total_now, compute_charts, sort_rank_desc, total_for_display};
+    use super::{
+        alltime_total_now, clamp_floating_into_screen, compute_charts, sort_rank_desc,
+        total_for_display, FloatingBounds, FLOATING_MIN_VISIBLE,
+    };
 
-    /// 同分必须有确定的先后：否则"谁进前 100 名"随进程重启而变。
+    /// 他这台机器的形状：1920x1080 单屏（任务栏 48px，故工作区底边 1032）、卡片 90x46。
+    fn primary() -> FloatingBounds {
+        FloatingBounds {
+            left: 0.0,
+            top: 0.0,
+            screen_w: 1920.0,
+            screen_h: 1080.0,
+            win_w: 90.0,
+            win_h: 46.0,
+        }
+    }
+
+    /// 他实测的那个症状：卡片故意放在屏幕底边（压在任务栏上，看得见），
+    /// 旧判据拿**工作区**夹它 → 每次启动都被拽到一个确定值，看起来像"位置被固定了"。
+    #[test]
+    fn floating_position_is_left_alone_when_the_card_is_still_visible() {
+        // 1920x1080 的屏（工作区底边 1032）、卡片 90x46、存的 pos = (82, 1031)
+        let (x, y) = clamp_floating_into_screen(82.0, 1031.0, primary());
+        assert_eq!(
+            (x, y),
+            (82.0, 1031.0),
+            "底边那格卡片还露出 49px，看得见 → 一个字都不该改（旧判据在这里夹到 992）"
+        );
+
+        // 临界：正好露出 20px 不动，再往外 1px 才算看不见
+        let ok = clamp_floating_into_screen(82.0, 1060.0, primary());
+        assert_eq!(ok.1, 1060.0, "恰好露 20px 是允许的");
+        let over = clamp_floating_into_screen(82.0, 1061.0, primary());
+        assert_eq!(over.1, 1060.0, "多 1px 就往回挪最小的一步");
+    }
+
+    /// 原来那一刀要防的故障仍然得防住：拔了副屏之后坐标落在屏幕外，
+    /// 勾着悬浮窗却看不见，界面上没有任何入口能召回。
+    #[test]
+    fn offscreen_floating_position_gets_pulled_back_to_visible() {
+        // 原来放在右边那块副屏上（x=2100），副屏拔掉后只剩 1920 宽
+        let (x, _) = clamp_floating_into_screen(2100.0, 300.0, primary());
+        assert_eq!(x, 1920.0 - FLOATING_MIN_VISIBLE, "至少得露出 20px");
+        // 左边界外与上边界外
+        let (lx, _) = clamp_floating_into_screen(-500.0, 300.0, primary());
+        assert_eq!(lx, -90.0 + FLOATING_MIN_VISIBLE);
+        let (_, ty) = clamp_floating_into_screen(82.0, -500.0, primary());
+        assert_eq!(ty, -46.0 + FLOATING_MIN_VISIBLE);
+        // 副屏在左边（负偏移屏幕）时，落在该屏内的位置不能被判成越界
+        let left_monitor = FloatingBounds {
+            left: -1920.0,
+            ..primary()
+        };
+        let (nx, ny) = clamp_floating_into_screen(-1900.0, 100.0, left_monitor);
+        assert_eq!(
+            (nx, ny),
+            (-1900.0, 100.0),
+            "负偏移屏幕上放在副屏的窗口不该被拽走"
+        );
+        // 屏幕比卡片还小的退化形状：不 panic，夹成一个确定值
+        let tiny = FloatingBounds {
+            screen_w: 60.0,
+            screen_h: 50.0,
+            ..primary()
+        };
+        let (sx, sy) = clamp_floating_into_screen(500.0, 500.0, tiny);
+        assert!(sx.is_finite() && sy.is_finite());
+    }
+
     /// 「总计」页的卡片必须和「今日」页一样实时更新。
     ///
     /// 回归：前端 `applyTotal` 只在 `period == -1` 时用带今日增量的 `alltime_total`，
@@ -1642,6 +1748,7 @@ mod compute_charts_tests {
         );
     }
 
+    /// 同分必须有确定的先后：否则"谁进前 100 名"随进程重启而变。
     #[test]
     fn rank_ties_break_by_name_so_the_truncation_is_stable() {
         // 三个并列 2 次的键，正好卡在 RANK_LIMIT=100 的切割线上
