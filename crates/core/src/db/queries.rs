@@ -917,13 +917,31 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
         })
         .collect();
     stats.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
-    // 显示名去重：两只同型号设备（VID/PID 相同、实例不同）加序号区分
+    // 显示名去重：两只同型号设备（VID/PID 相同、实例不同）加序号区分。
+    //
+    // **只对自动名计数**，别名不改写、但要占位 —— 这才是上面那句注释
+    // （"去重只对自动名生效：两个不同设备可以起同一个别名，用户说了算"）的本意。
+    // 原先键的是 `s.name`，而有别名时 `s.name` 就是别名，于是两条都反着来：
+    // ① 两只设备起同一个别名，第二只被强行改成「别名 (2)」—— 恰恰违背"用户说了算"；
+    // ② 别人的别名反过来改掉第三台的展示名：用户给 A 起名「罗技M590」，而 B 的**自动名**
+    //    本来也叫「罗技M590」，按次数排序谁在前谁占走干净名字 —— 排在后面的那个
+    //    往往是 A，也就是**用户亲手起的名字被加了序号**，而它本来是唯一确定的。
+    // 别名先占位、自动名从占位之后开始编号：用户的名字永不改写，自动名之间、
+    // 自动名与别名之间都不再撞车。
     let mut seen: HashMap<String, usize> = HashMap::new();
-    for s in &mut stats {
-        let n = seen.entry(s.name.clone()).or_insert(0);
+    for st in &stats {
+        if st.has_alias {
+            *seen.entry(st.name.clone()).or_insert(0) += 1;
+        }
+    }
+    for st in &mut stats {
+        if st.has_alias {
+            continue;
+        }
+        let n = seen.entry(st.auto_name.clone()).or_insert(0);
         *n += 1;
         if *n > 1 {
-            s.name = format!("{} ({})", s.name, *n);
+            st.name = format!("{} ({})", st.name, *n);
         }
     }
     (total, stats)
@@ -2064,6 +2082,74 @@ mod tests {
         assert_eq!(other.keys.len(), 1, "另一台设备的明细互不混入");
         assert_eq!(other.keys[0], ("空格".to_string(), 10));
 
+        crate::device_alias::invalidate_cache();
+    }
+
+    /// 用户起的别名永不被加序号，即使是两只设备起了同一个名字。
+    #[test]
+    fn identical_aliases_are_both_kept_verbatim() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("devq_two_aliases");
+        crate::device_alias::invalidate_cache();
+        // 两只设备的 VID/PID 必须**不同**：同一型号会走 model_key 回退，
+        // 那会让两条键都解析到同一个别名，测的就不是去重而是回退了。
+        let k1 = "HID#VID_1111&PID_2222#1";
+        let k2 = "HID#VID_3333&PID_4444#2";
+        crate::device_alias::set(k1, "双鼠").unwrap();
+        crate::device_alias::set(k2, "双鼠").unwrap();
+        crate::device_alias::invalidate_cache();
+        let row = |key: &str, count: i64| DeviceRow {
+            device_key: key.to_string(),
+            name: Some("HID 鼠标 · 046D/C52B".to_string()),
+            kind: Some("mouse".to_string()),
+            count,
+        };
+        let (_, stats) = merge_device_rows(vec![row(k1, 300), row(k2, 200)]);
+        assert_eq!(stats[0].name, "双鼠");
+        assert_eq!(
+            stats[1].name, "双鼠",
+            "两只都叫「双鼠」是用户自己的决定，去重只对自动名生效",
+        );
+        crate::device_alias::clear(k1).unwrap();
+        crate::device_alias::clear(k2).unwrap();
+        crate::device_alias::invalidate_cache();
+    }
+
+    /// 别名与另一台的**自动名**撞车时：该加序号的是那台没起过名的设备。
+    ///
+    /// 旧实现按键是展示名，谁次数高谁占走干净名字 —— 而次数高的往往是用户
+    /// 起了别名那台排在前面时才相反：这里 B 次数最高、A（别名）次数最低，
+    /// 旧实现会把**用户起的别名**改写成「罗技M590 (2)」。
+    #[test]
+    fn an_alias_reserves_its_name_against_other_auto_names() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("devq_alias_reserve");
+        crate::device_alias::invalidate_cache();
+        // 同上：三只键各用不同 VID/PID，只有 aliased 那只起了别名
+        let auto_hi = "HID#VID_AAAA&PID_BBBB#a";
+        let aliased = "HID#VID_046D&PID_C52B#b";
+        let auto_lo = "HID#VID_CCCC&PID_DDDD#c";
+        crate::device_alias::set(aliased, "罗技M590").unwrap();
+        crate::device_alias::invalidate_cache();
+        let row = |key: &str, name: &str, count: i64| DeviceRow {
+            device_key: key.to_string(),
+            name: Some(name.to_string()),
+            kind: Some("mouse".to_string()),
+            count,
+        };
+        let (_, stats) = merge_device_rows(vec![
+            row(auto_hi, "罗技M590", 300),
+            row(aliased, "别的登记名", 100),
+            row(auto_lo, "罗技M590", 50),
+        ]);
+        assert_eq!(stats[0].name, "罗技M590 (2)", "没起过名的自动名让路");
+        assert_eq!(stats[1].name, "罗技M590", "用户起的别名一字不改");
+        assert_eq!(stats[2].name, "罗技M590 (3)");
+        assert_eq!(
+            stats[1].auto_name, "别的登记名",
+            "auto_name 仍是登记名，供副标题用"
+        );
+        crate::device_alias::clear(aliased).unwrap();
         crate::device_alias::invalidate_cache();
     }
 
