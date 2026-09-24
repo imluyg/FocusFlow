@@ -341,38 +341,41 @@ const ST_FAIL: u8 = 3;
 /// 阈值刻意放宽到 120 秒：一轮正常刷新最坏也只是 300ms busy 等待 + 3 轮 ≤100MB
 /// 整文件复制，慢盘上十几秒也走得完，这里留了一个数量级的余量。取短了会招来
 /// 更糟的后果 —— 接管会与仍在正常跑的轮次并发，两个线程各复制一份 100MB。
-const RUNNING_STALE_MS: i64 = 120_000;
+const RUNNING_STALE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// 刷新槽位：状态 + 本轮世代号 + 进入 RUNNING 的时刻。
 ///
 /// 世代号是给「被接管的那一轮」准备的：卡死的线程哪天真的从 `fs::copy` 里回来，
 /// 也不该由它把新一轮的状态改写成 ok/fail。
+///
+/// 计时用 `Instant` 而不是墙上时钟：本机对过表（NTP 校正、手动改系统时间、
+/// 从休眠回来同步）会让一个**正在正常跑**的轮次被算成"跑了 2 分钟"，于是再起一轮
+/// —— 那正是 120 秒阈值想防的"两个线程各复制一份 100MB"。反过来时钟后跳会让
+/// `now - started` 变成负数（饱和成 0），按钮卡在「正在后台读取」几个小时点不动。
+/// `Instant` 走的是单调计时器，不受时钟调整影响；本仓别处（`maintenance.rs`）也是这个口径。
 #[derive(Default)]
 struct RefreshSlot {
     state: u8,
     gen: u64,
-    started_at_ms: i64,
+    started_at: Option<std::time::Instant>,
 }
 
 static REFRESH_SLOT: std::sync::Mutex<RefreshSlot> = std::sync::Mutex::new(RefreshSlot {
     state: ST_IDLE,
     gen: 0,
-    started_at_ms: 0,
+    started_at: None,
 });
 
 fn lock_slot() -> std::sync::MutexGuard<'static, RefreshSlot> {
     REFRESH_SLOT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn now_ms() -> i64 {
-    Utc::now().timestamp_millis()
-}
-
 /// 一轮刷新是否已经拖过了头。
-fn is_wedged(slot: &RefreshSlot, now: i64) -> bool {
+fn is_wedged(slot: &RefreshSlot, now: std::time::Instant) -> bool {
     slot.state == ST_RUNNING
-        && slot.started_at_ms > 0
-        && now.saturating_sub(slot.started_at_ms) >= RUNNING_STALE_MS
+        && slot
+            .started_at
+            .is_some_and(|s| now.saturating_duration_since(s) >= RUNNING_STALE)
 }
 
 /// 非阻塞启动一次「今日 + 总数」刷新，返回是否真的启动了任务。
@@ -384,7 +387,7 @@ fn is_wedged(slot: &RefreshSlot, now: i64) -> bool {
 /// 已有一轮在跑时不再排队（重复点击不该放大复制开销），直接返回 `false`；
 /// 数值写进本地缓存库，插件下次渲染用 `get_edge_history_saved_*` 取。
 pub fn spawn_update_today() -> bool {
-    let Some(gen) = claim_round(now_ms()) else {
+    let Some(gen) = claim_round(std::time::Instant::now()) else {
         return false;
     };
     let spawned = std::thread::Builder::new()
@@ -405,10 +408,10 @@ pub fn spawn_update_today() -> bool {
 
 /// 尝试占用「本轮刷新」这个槽位：成功返回本轮世代号，`None` 表示应当拒绝。
 ///
-/// 拒绝的唯一理由是上一轮还在正常跑；它一旦超过 [`RUNNING_STALE_MS`] 仍没收尾就
+/// 拒绝的唯一理由是上一轮还在正常跑；它一旦超过 [`RUNNING_STALE`] 仍没收尾就
 /// 按卡死处理并接管 —— 不然线程回不来时，用户点到重启为止都不会再有任何反应。
 /// 世代号用来让被接管掉的那一轮之后再返回也改不动新一轮的状态。
-fn claim_round(now: i64) -> Option<u64> {
+fn claim_round(now: std::time::Instant) -> Option<u64> {
     let mut slot = lock_slot();
     let wedged = is_wedged(&slot, now);
     if slot.state == ST_RUNNING && !wedged {
@@ -417,11 +420,11 @@ fn claim_round(now: i64) -> Option<u64> {
     if wedged {
         tracing::warn!(
             "Edge 刷新线程超过 {} 秒未收尾，按卡死接管并启动新一轮",
-            RUNNING_STALE_MS / 1000
+            RUNNING_STALE.as_secs()
         );
     }
     slot.state = ST_RUNNING;
-    slot.started_at_ms = now;
+    slot.started_at = Some(now);
     slot.gen += 1;
     Some(slot.gen)
 }
@@ -433,7 +436,7 @@ fn finish_round(gen: u64, ok: bool) {
         return;
     }
     slot.state = if ok { ST_OK } else { ST_FAIL };
-    slot.started_at_ms = 0;
+    slot.started_at = None;
 }
 
 /// 线程根本没起来时的回滚：本轮没人在跑，别把状态留在 RUNNING 卡住用户。
@@ -443,7 +446,7 @@ fn release_round(gen: u64) {
         return;
     }
     slot.state = ST_IDLE;
-    slot.started_at_ms = 0;
+    slot.started_at = None;
 }
 
 /// 一次后台刷新的状态：`idle` / `running` / `ok` / `fail`。
@@ -451,15 +454,19 @@ fn release_round(gen: u64) {
 /// 读的时候顺手自愈：光靠 `spawn_update_today` 里的接管救不了刷新按钮 ——
 /// 线程卡死后插件会一直显示「正在后台读取」，用户连再点一次的入口都没有。
 pub fn refresh_state() -> &'static str {
-    let now = now_ms();
+    refresh_state_at(std::time::Instant::now())
+}
+
+/// [`refresh_state`] 的可注入时刻版：卡死判定要能测，就得能把"现在"当参数传进来。
+fn refresh_state_at(now: std::time::Instant) -> &'static str {
     let mut slot = lock_slot();
     if is_wedged(&slot, now) {
         tracing::error!(
             "Edge 刷新线程已卡死（超过 {} 秒未收尾），状态已复位，可重新点刷新",
-            RUNNING_STALE_MS / 1000
+            RUNNING_STALE.as_secs()
         );
         slot.state = ST_FAIL;
-        slot.started_at_ms = 0;
+        slot.started_at = None;
         // 推进世代号，让那个再也不会收尾的线程之后没有改写的余地
         slot.gen += 1;
     }
@@ -476,7 +483,7 @@ const BACKFILL_DAYS: i64 = 30;
 
 /// 更新今天并返回 (是否成功, 今日数, 总数)。
 /// 任一步失败（Edge 库被锁/不可读）返回 (false, 0, 0)，调用方据此提示用户，
-/// 避免把失败静默当成"0 条记录"。同一次快照顺手补齐近 30 天缺失的历史计数。
+/// 避免把失败静默当成"0 条记录"。同一次快照顺手把近 30 天里不可信的历史计数重查一遍。
 ///
 /// 调用方应当用 [`spawn_update_today`] 而不是直接调本函数（本函数会阻塞调用线程）。
 pub fn update_today_edge_history() -> (bool, i64, i64) {
@@ -486,8 +493,8 @@ pub fn update_today_edge_history() -> (bool, i64, i64) {
     };
     // 要补哪些天必须在开快照**之前**定好：这样今日数、总数和整批补档共用同一轮
     // 快照，被锁时也只兜底复制一份副本，且所有数字取自同一时点。
-    let missing = missing_days_before(today, BACKFILL_DAYS);
-    let pending = missing.len();
+    let stale = stale_days_before(today, BACKFILL_DAYS);
+    let pending = stale.len();
     let batch = with_edge_snapshot(move |conn| {
         let day = conn
             .query_row(
@@ -500,7 +507,7 @@ pub fn update_today_edge_history() -> (bool, i64, i64) {
             .query_row("SELECT COUNT(*) FROM urls", [], |r| r.get::<_, i64>(0))
             .ok()?;
         // 补档一条查不动时不该把已经到手的今日数/总数一起丢掉：退化成"这轮不补"
-        let filled = counts_on_snapshot(conn, &missing).unwrap_or_default();
+        let filled = counts_on_snapshot(conn, &stale).unwrap_or_default();
         Some((day, total, filled))
     });
     match batch {
@@ -512,7 +519,7 @@ pub fn update_today_edge_history() -> (bool, i64, i64) {
                     save_edge_history_count(*day, *count);
                 }
                 tracing::info!(
-                    "Edge 历史已补齐 {} 天缺失记录（{} 天待补，与今日数同一份快照）",
+                    "Edge 历史已重查 {}/{} 天（缺行的日子 + 当天就写下、还没盖完整的日子）",
                     filled.len(),
                     pending
                 );
@@ -523,14 +530,31 @@ pub fn update_today_edge_history() -> (bool, i64, i64) {
     }
 }
 
-/// 近 `days` 天里本地缓存库还没有记录的日子（不含 `today`，那条由刷新主路写）。
-fn missing_days_before(today: NaiveDate, days: i64) -> Vec<NaiveDate> {
+/// 近 `days` 天里本地缓存**还不可信**的日子（不含 `today`，那条由刷新主路写）。
+///
+/// 不可信有两种，旧实现只认第一种：
+/// ① 缓存里压根没有这一行；
+/// ② 有行，但那一行是在**该日结束之前**写的 —— 于是它只覆盖到当天最后一次刷新为止，
+///    当天剩下的几个小时永久丢失（早上刷一次，那一天就少算一整天里余下的部分）。
+///
+/// 为什么第②种能靠重查救回来：Edge 的 `urls.last_visit_time` 是"这条 URL 最后一次
+/// 访问的时刻"，第二天再按同一天的区间查，仍停在那一天的 URL 都还在区间内，整天就
+/// 捞齐了。代价是那之后又访问过的 URL 会从这一天挪走 —— 但"挪走"只在 URL 被再次
+/// 访问时发生，比"整个下午加晚上都没有"小一个量级。
+///
+/// 判据刻意做成"只在还没盖完时重查"：重查过一次之后 `updated_at` 就落在该日之后了，
+/// 每个历史日因此**恰好**被重查一次（下一次刷新时），不会天天回头改写更老的日子。
+fn stale_days_before(today: NaiveDate, days: i64) -> Vec<NaiveDate> {
     let start = today - chrono::Days::new((days - 1).max(0) as u64);
-    let existing = saved_dates_since(start);
+    let saved = saved_rows_since(start);
     let mut out = Vec::new();
     let mut day = start;
     while day < today {
-        if !existing.contains(&day.format("%Y-%m-%d").to_string()) {
+        let complete = match saved.get(&day.format("%Y-%m-%d").to_string()) {
+            None => false,
+            Some(&updated_at) => day_end(updated_at, day),
+        };
+        if !complete {
             out.push(day);
         }
         day = day + chrono::Days::new(1);
@@ -538,16 +562,28 @@ fn missing_days_before(today: NaiveDate, days: i64) -> Vec<NaiveDate> {
     out
 }
 
-/// 本地缓存库里 `start` 之后（含）已有记录的日子集合。
-fn saved_dates_since(start: NaiveDate) -> std::collections::HashSet<String> {
+/// 那一天结束之前是否已经不再改写了（`updated_at` 不早于该日本地零点之后的界）。
+/// 界算不出来（日期越界）就当已完整，宁可少重查也不要每天都重查。
+fn day_end(updated_at: i64, day: NaiveDate) -> bool {
+    let Some(next) = day.succ_opt() else {
+        return true;
+    };
+    match local_midnight(next) {
+        Some(end) => updated_at >= end.timestamp(),
+        None => true,
+    }
+}
+
+/// 本地缓存库里 `start` 之后（含）已有记录的日子 → 该行的写入时刻。
+fn saved_rows_since(start: NaiveDate) -> std::collections::HashMap<String, i64> {
     open_local()
         .ok()
         .and_then(|conn| {
-            conn.prepare("SELECT date FROM edge_history WHERE date >= ?1")
+            conn.prepare("SELECT date, updated_at FROM edge_history WHERE date >= ?1")
                 .ok()
                 .and_then(|mut stmt| {
                     stmt.query_map([start.format("%Y-%m-%d").to_string()], |r| {
-                        r.get::<_, String>(0)
+                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
                     })
                     .ok()
                     .map(|it| it.flatten().collect())
@@ -740,7 +776,11 @@ mod tests {
         // 同步补齐：函数返回时就该已经落库，不是"回头某个时刻出现"
         assert_eq!(saved_count_on(y), Some(1), "缺失日应在本次调用内补齐");
         assert_eq!(saved_count_on(today), Some(2));
-        assert_eq!(saved_count_on(two), Some(7), "已有的一天不该被重查覆盖");
+        assert_eq!(
+            saved_count_on(two),
+            Some(7),
+            "这一行是刚刚写下的（`updated_at` 已在该日之后）→ 已盖完，不该重查"
+        );
         // 再刷新一次：没有缺失日了就完全不必再动补档查询
         assert!(update_today_edge_history().0);
         assert_eq!(
@@ -748,6 +788,70 @@ mod tests {
             2,
             "补齐过后第二次刷新仍是一轮快照"
         );
+    }
+
+    /// 直接按指定 `updated_at` 写一行本地缓存。
+    /// `save_edge_history_count` 只会写"此刻"，而这几条用例要模拟的正是
+    /// "这一行是当天还没过完时写下的"，只能绕过它自己插。
+    fn seed_saved_row(day: NaiveDate, count: i64, updated_at: i64) {
+        let conn = open_local().expect("本地缓存库应能打开");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS edge_history (
+                date TEXT PRIMARY KEY,
+                count INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO edge_history (date, count, updated_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![day.format("%Y-%m-%d").to_string(), count, updated_at],
+        )
+        .unwrap();
+    }
+
+    /// 昨天那一行是"昨天还没过完"时留下的 → 它只盖到当天最后一次刷新，
+    /// 剩下的几个小时永久丢失。旧判据只问"有没有行"，于是那一天**永远**不再重查：
+    /// 早上刷一次，那一天的趋势值就永远停在半天。
+    ///
+    /// 两个方向都要钉住：
+    /// ① 还没盖完的日子要重查（`y`：2 → 3，深夜那条被捞回来）；
+    /// ② 已经盖完的日子不许重查（`d2`：存着 42、真实只有 1，重查会把它打回 1）。
+    /// 注回旧判据（行存在即完整）会红在 ①。
+    #[test]
+    fn a_day_saved_before_it_ended_is_requeried_once() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _app = crate::paths::test_app_dir("edge_stale_day");
+        let today = Local::now().date_naive();
+        let y = today - chrono::Days::new(1);
+        let d2 = today - chrono::Days::new(2);
+        let hour = 3_600 * 1_000_000; // Chrome 时间戳是微秒
+        let _fx = write_edge_fixture(
+            "staleday",
+            &[
+                chrome_start_of(y) + 8 * hour, // 上午两条：旧行已经算进去了
+                chrome_start_of(y) + 9 * hour,
+                chrome_start_of(y) + 23 * hour, // 深夜这条：旧行没算到
+                chrome_start_of(d2) + 12 * hour,
+                chrome_start_of(today) + hour,
+            ],
+        );
+        let y_end = local_midnight(y.succ_opt().unwrap()).unwrap().timestamp();
+        // 昨天：当天 23:00 写的 → 该日还没盖完
+        seed_saved_row(y, 2, y_end - 3_600);
+        // 前天：昨天凌晨写的 → 已经盖完（真实值只有 1，重查就会把 42 打回去）
+        seed_saved_row(d2, 42, y_end + 3_600);
+
+        let (ok, today_count, total) = update_today_edge_history();
+        assert!(ok, "夹具可读，刷新不该失败");
+        assert_eq!((today_count, total), (1, 5));
+        assert_eq!(saved_count_on(y), Some(3), "深夜那条必须被捞回来");
+        assert_eq!(saved_count_on(d2), Some(42), "已盖完的日子不该被重查改写");
+
+        // 重查过一次就算盖完了：下一轮不该再回头动它
+        assert!(update_today_edge_history().0);
+        assert_eq!(saved_count_on(y), Some(3), "每个历史日只该被重查一次");
+        assert_eq!(saved_count_on(d2), Some(42));
     }
 
     /// 崩溃/被杀留在 `%TEMP%` 的副本是**明文浏览记录**，必须能被扫掉；
@@ -796,13 +900,16 @@ mod tests {
         assert!(other.exists(), "前缀不匹配的文件不该被动");
     }
 
-    /// 把槽位置成「有一轮在跑，且已经跑了 `ms_elapsed` 毫秒」，返回那一轮的世代号。
+    /// 把槽位置成「有一轮在 `start` 这一时刻进入 RUNNING」，返回那一轮的世代号。
     /// 每次改槽位都推进世代号，这样上一轮遗留的后台线程（`plugins_test` 真的会
     /// 点一次 refresh）也就没法反过来改写测试中的状态。
-    fn fake_running_round(ms_elapsed: i64) -> u64 {
+    ///
+    /// 时刻一律"从此刻往前起算、再往后加"，不做 `Instant::now() - 3 分钟`：
+    /// `Instant` 是单调时钟（Windows 上是开机以来的计数），刚开机的机器上往回减会下溢。
+    fn fake_running_round(start: std::time::Instant) -> u64 {
         let mut slot = lock_slot();
         slot.state = ST_RUNNING;
-        slot.started_at_ms = now_ms() - ms_elapsed;
+        slot.started_at = Some(start);
         slot.gen += 1;
         slot.gen
     }
@@ -810,22 +917,72 @@ mod tests {
     fn reset_slot() {
         let mut slot = lock_slot();
         slot.state = ST_IDLE;
-        slot.started_at_ms = 0;
+        slot.started_at = None;
         slot.gen += 1;
+    }
+
+    /// 卡死判定的时长只能由**两个单调时刻相减**得出，墙上时钟不参与。
+    ///
+    /// 旧实现取 `Utc::now().timestamp_millis()`：对表/休眠回来同步时钟时，前跳会把一
+    /// 个**正在正常跑**的轮次算成"已经跑了 2 分钟"而去接管 → 两个线程各复制一份
+    /// 100MB；后跳则让 `now - started` 饱和成 0，按钮卡在「正在后台读取」几小时。
+    /// 这条把四个边界钉死：差 1 毫秒不算、恰好到阈值算、`now` 早于本轮起点（回拨在
+    /// 旧表示里造出的形状）不算也不下溢、没有起点不算。
+    /// 想退回墙上时钟 —— `is_wedged` 收的是 `Instant`，改回去就编译不过去。
+    #[test]
+    fn wedge_verdict_is_pure_monotonic_elapsed() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let base = std::time::Instant::now();
+        let slot = RefreshSlot {
+            state: ST_RUNNING,
+            gen: 7,
+            started_at: Some(base),
+        };
+        assert!(
+            !is_wedged(
+                &slot,
+                base + RUNNING_STALE - std::time::Duration::from_millis(1)
+            ),
+            "差 1 毫秒到阈值仍算正常在跑"
+        );
+        assert!(is_wedged(&slot, base + RUNNING_STALE), "恰好到阈值才算卡死");
+        assert!(!is_wedged(&slot, base), "刚起头就查，不该算卡死");
+        let rolled_back = RefreshSlot {
+            state: ST_RUNNING,
+            gen: 7,
+            // 本轮起点"在未来"：正是时钟后跳时旧实现看到的形状
+            started_at: Some(base + std::time::Duration::from_secs(3600)),
+        };
+        assert!(
+            !is_wedged(&rolled_back, base),
+            "拿到的 now 比本轮起点还早时该饱和成 0，既不下溢也不误判成卡死"
+        );
+        assert!(
+            !is_wedged(
+                &RefreshSlot {
+                    state: ST_RUNNING,
+                    gen: 7,
+                    started_at: None,
+                },
+                base + RUNNING_STALE * 2
+            ),
+            "没有起点就没有'拖过头'的依据"
+        );
     }
 
     /// 线程卡死（例如回不来地卡在 `fs::copy`）后，刷新按钮不该死到重启为止。
     #[test]
     fn wedged_refresh_self_heals_so_the_button_stays_usable() {
         let _lock = crate::paths::test_app_dir_lock();
-        fake_running_round(RUNNING_STALE_MS + 60_000);
+        let base = std::time::Instant::now();
+        fake_running_round(base);
         assert_eq!(
-            refresh_state(),
+            refresh_state_at(base + RUNNING_STALE + std::time::Duration::from_secs(60)),
             "fail",
             "越过阈值的 running 必须自愈，否则面板永远显示「正在后台读取」"
         );
         assert!(
-            claim_round(now_ms()).is_some(),
+            claim_round(base + RUNNING_STALE + std::time::Duration::from_secs(61)).is_some(),
             "自愈之后下一次点击要真能启动新一轮"
         );
         reset_slot();
@@ -835,16 +992,21 @@ mod tests {
     #[test]
     fn live_round_is_not_stolen_but_a_wedged_one_is() {
         let _lock = crate::paths::test_app_dir_lock();
-        fake_running_round(1_000);
-        assert_eq!(refresh_state(), "running", "才跑 1 秒不该被判成卡死");
+        let base = std::time::Instant::now();
+        fake_running_round(base);
+        assert_eq!(
+            refresh_state_at(base + std::time::Duration::from_secs(1)),
+            "running",
+            "才跑 1 秒不该被判成卡死"
+        );
         assert!(
-            claim_round(now_ms()).is_none(),
+            claim_round(base + std::time::Duration::from_secs(2)).is_none(),
             "上一轮还在正常跑时再起一轮 = 两个线程各复制 100MB"
         );
 
-        fake_running_round(RUNNING_STALE_MS + 1);
+        fake_running_round(base);
         assert!(
-            claim_round(now_ms()).is_some(),
+            claim_round(base + RUNNING_STALE + std::time::Duration::from_millis(1)).is_some(),
             "超过阈值就该接管，而不是到重启前都点不动"
         );
         reset_slot();
@@ -854,17 +1016,19 @@ mod tests {
     #[test]
     fn superseded_round_cannot_write_back_its_result() {
         let _lock = crate::paths::test_app_dir_lock();
-        let zombie = fake_running_round(RUNNING_STALE_MS + 1);
-        let live = claim_round(now_ms()).expect("接管应成功");
+        let base = std::time::Instant::now();
+        let zombie = fake_running_round(base);
+        let live = claim_round(base + RUNNING_STALE + std::time::Duration::from_millis(1))
+            .expect("接管应成功");
         assert_ne!(zombie, live);
         finish_round(zombie, true);
         assert_eq!(
-            refresh_state(),
+            refresh_state_at(base + RUNNING_STALE + std::time::Duration::from_secs(1)),
             "running",
             "僵尸线程回来不该把新一轮标成已完成"
         );
         finish_round(live, true);
-        assert_eq!(refresh_state(), "ok");
+        assert_eq!(refresh_state_at(base + RUNNING_STALE * 2), "ok");
         reset_slot();
     }
 
