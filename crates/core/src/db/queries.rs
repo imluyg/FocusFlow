@@ -128,11 +128,41 @@ fn year_has_aggregates(path: &std::path::Path) -> bool {
     let Ok(conn) = connection::open_ro(path) else {
         return true;
     };
-    crate::db::maintenance::DATA_TABLES.iter().any(|table| {
-        conn.prepare(&format!("SELECT 1 FROM {table} LIMIT 1"))
-            .and_then(|mut s| s.exists([]))
-            .unwrap_or(false)
-    })
+    for table in crate::db::maintenance::DATA_TABLES.iter() {
+        // 先问 `sqlite_master` 这张表在不在：缺表是一个**正常答案**（辅助库、旧格式
+        // 文件、刚建出来的空壳），不该算成"有数据"。
+        let present = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [*table],
+            |r| r.get::<_, i64>(0),
+        );
+        let has_rows = match present {
+            Ok(0) => Ok(false),
+            Ok(_) => conn
+                .prepare(&format!("SELECT 1 FROM {table} LIMIT 1"))
+                .and_then(|mut s| s.exists([])),
+            Err(e) => Err(e),
+        };
+        match has_rows {
+            Ok(true) => return true,
+            Ok(false) => {}
+            // 查都查不出来（库头合法但页损坏 / "disk image is malformed" / 半截文件）
+            // **不是**"没有行"。原来只有 `open_ro` 失败走上面那条保守分支，逐表探测的
+            // Err 被 `unwrap_or(false)` 折成"没行" —— 于是这种文件里的一整年会从
+            // `available_years()` 凭空消失：总计、排行、趋势、启动自愈、备份、VACUUM
+            // 都不再经过它，`--list-years` 也不列它，而一条日志都没有。
+            // 这与本函数自己的文档、以及 `maintenance.rs` 里"读不出来 ≠ 没有行"那条
+            // 规矩正好相反，所以按"有数据"办并留一条错误。
+            Err(e) => {
+                tracing::error!(
+                    "年度库 {} 的 {table} 读不出来，本年度按「有数据」处理: {e}",
+                    path.display()
+                );
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 本地时区相对 UTC 的偏移秒数（如 UTC+8 = 28800 秒）。
@@ -715,20 +745,21 @@ pub(crate) fn parse_vid_pid(path: &str) -> Option<(String, String)> {
 }
 
 /// USB 形态：`VID_XXXX&PID_YYYY`。
+///
+/// 切片一律用 `.get(..)?` 而不是 `&s[..4]`：`len()` 数的是**字节**，而设备实例路径
+/// 不保证是 ASCII —— 驱动会把产品名写进路径（`HID#VID_罗技&PID_1464` 这类真实形状），
+/// 按字节切落在多字节字符中间就直接 panic。函数名里带 `parse` 却能让进程消失，是因为
+/// 它在读侧：`fallback_device_name` 每次设备查询都调它，`device_alias::model_key`
+/// 对 `device_aliases.json`（文档写明"可直接手改"）的每个键也调它，而 release 是
+/// `panic = "abort"` 且没有控制台。蓝牙分支用的本来就是安全写法，这里补齐。
 fn parse_usb_style(upper: &str) -> Option<(String, String)> {
     let rest = upper.split("VID_").nth(1)?;
-    if rest.len() < 4 {
-        return None;
-    }
-    let vid = &rest[..4];
+    let vid = rest.get(..4)?;
     if !vid.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    let pid_rest = rest[4..].strip_prefix("&PID_")?;
-    if pid_rest.len() < 4 {
-        return None;
-    }
-    let pid = &pid_rest[..4];
+    let pid_rest = rest.get(4..)?.strip_prefix("&PID_")?;
+    let pid = pid_rest.get(..4)?;
     if !pid.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
@@ -749,9 +780,10 @@ fn parse_bluetooth_style(upper: &str) -> Option<(String, String)> {
         .find_map(|p| after.strip_prefix(p))?;
     let pid_field = pid_rest.split(['&', '_']).next()?;
     // VID 字段长度可变：4 位（无 source 前缀）或 6 位（前 2 位为 vendor id source）
+    // 同样用 `get(..)`：`len()` 是字节数，路径里混进非 ASCII 时 `n - 4` 不是字符边界。
     let vid = match vid_field.len() {
         4 => vid_field,
-        n if n >= 6 => &vid_field[n - 4..],
+        n if n >= 6 => vid_field.get(n - 4..)?,
         _ => return None,
     };
     let pid = pid_field.get(..4)?;
@@ -1423,6 +1455,92 @@ mod tests {
             available_years().contains(&2033),
             "损坏的年度库应按「有数据」保守处理"
         );
+    }
+
+    /// 另一半：**库头合法、页却是坏的**。这种文件 `open_ro` 是成功的，失败发生在查询时。
+    ///
+    /// 上面 2033 那条走的是"整个文件都是垃圾 → 打不开"的分支，盖不住这一半：
+    /// 逐表探测的 Err 以前被 `unwrap_or(false)` 折成"这一张表没行"，六张全折完之后
+    /// 该年就被 `available_years()` 剔除 —— 于是总计/排行/趋势/启动自愈/备份/VACUUM
+    /// 都不再经过那一年，`--list-years` 也不列它，而且一条日志都没有。
+    /// 截断与位翻转是真实损坏形状（掉电、同步盘半截文件、坏道），不是假想的。
+    #[test]
+    fn available_years_keeps_dbs_whose_pages_are_corrupt() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("years_corrupt");
+        invalidate_years_cache();
+
+        let path = paths::year_db_path(2034);
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            connection::ensure_schema(&conn, 2034).unwrap();
+            // 数据必须铺到第 2 页之后，否则"只坏第 1 页之外"什么也测不到
+            for k in 1..4001i64 {
+                conn.execute(
+                    "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 1, 1)",
+                    [k],
+                )
+                .unwrap();
+            }
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+        // 第 1 页（文件头 + `sqlite_master` 的根页）留着，后面的页全部打成垃圾
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.len() > 4096 * 4,
+            "夹具太小，坏不到东西：{} 字节",
+            bytes.len()
+        );
+        for b in bytes.iter_mut().skip(4096) {
+            *b = 0xA5;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        // 先证明夹具真的落在"打得开、读不出"这一族，否则这条断言什么也没钉住
+        let conn = connection::open_ro(&path).expect("库头合法，连接本身该打得开");
+        assert!(
+            conn.query_row("SELECT COUNT(*) FROM daily_counts", [], |r| r
+                .get::<_, i64>(0))
+                .is_err(),
+            "夹具必须真的读不出行，否则测不到损坏分支"
+        );
+
+        invalidate_years_cache();
+        assert!(
+            available_years().contains(&2034),
+            "读不出来的年份必须保留（宁可多扫一趟），实际: {:?}",
+            available_years()
+        );
+    }
+
+    /// 设备实例路径里混进非 ASCII 时不能把进程弄没。
+    ///
+    /// `parse_vid_pid` 原来按**字节**切（`len() < 4` 之后 `&rest[..4]`），而 Windows 的
+    /// HID 路径里驱动是可以带产品名的（`HID#VID_罗技&PID_1464` 这类形状），一个汉字
+    /// 占 3 字节 → 索引 4 不是字符边界 → slice panic。它在读侧：`fallback_device_name`
+    /// 每次设备查询都走，`device_alias::model_key` 对可手改的 `device_aliases.json`
+    /// 每个键也走，而 release 是 `panic = "abort"` 且无控制台 —— 症状是设备页一刷新
+    /// 整个程序消失。修法是 `.get(..)?`（蓝牙分支本来就是这么写的）。
+    #[test]
+    fn non_ascii_device_keys_are_rejected_not_fatal() {
+        assert_eq!(parse_vid_pid("HID#VID_罗技&PID_1464"), None);
+        assert_eq!(parse_vid_pid("HID#VID_日本語のデバイス&PID_0001"), None);
+        // 蓝牙那条路的变长字段同样按字节切过：`n - 4` 落在汉字中间
+        assert_eq!(parse_vid_pid(r"BTHENUM#VID&012罗技_PID&c52b"), None);
+        // 正常形状必须照旧解析出来，别把修 panic 做成修功能
+        assert_eq!(
+            parse_vid_pid(r"HID#VID_24AE&PID_1464&MI_00#7&1a2b&0&0000"),
+            Some(("24AE".to_string(), "1464".to_string()))
+        );
+        assert_eq!(
+            parse_vid_pid("BTHENUM\\VID&046d_PID_c52b"),
+            Some(("046D".to_string(), "C52B".to_string()))
+        );
+        // 太短的路径走 None，不是 panic
+        assert_eq!(parse_vid_pid("HID#VID_1"), None);
     }
 
     /// 周期合法性守卫：-1/0/N 合法，其他负值与超大天数非法。
