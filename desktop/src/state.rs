@@ -1276,6 +1276,14 @@ fn spawn_stats_worker(
                         // 停在 0 上）。下面那段补丁只改了共享快照，晚于这里的 emit。
                         agg.alltime_total =
                             alltime_total_now(alltime_total_base, alltime_cache_today, cur_today);
+                        // 同一个口径补到 `total` 上：否则「总计」页的那张卡片停在
+                        // 上次重算的库值上（见 `total_for_display`）。
+                        agg.total = total_for_display(
+                            period_val,
+                            agg.total,
+                            agg.alltime_total,
+                            alltime_total_base >= 0,
+                        );
                         period_max.insert(period_val, (agg.max_day, agg.max_day_date.clone()));
                         {
                             let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -1409,6 +1417,27 @@ fn alltime_total_now(base: i64, cached_today: i64, cur_today: i64) -> i64 {
         return 0;
     }
     base + (cur_today - cached_today).max(0)
+}
+
+/// 「总计」那张卡片该显示哪个数（前端只读 `period_total`，除了「今日」页读
+/// `alltime_total`）。抽成纯函数是为了把这条规则钉住 —— 它出错过一次：
+///
+/// `applyTotal` 在 `period == -1`（今日）取 `alltime_total`，其余周期取
+/// `period_total`（= `agg.total`）。而**标签写着「总计」的那一页正是 `period == 0`**：
+/// 它显示的是上次重算时从库里读出来的数，重算要等 `alltime_dirty`（每 500 次按键 /
+/// 跨天 / 强制刷新）才发生 —— 于是同一个「总计」，切到「今日」逐键跳动、
+/// 切到「总计」一整天不动。
+///
+/// `compute_charts(0).total` 与 `alltime_total_base` 是同一个量（都是全跨年库的
+/// Σ`daily_counts.count`），所以 period=0 时直接用那个被"基准 + 今日增量"修正过的值。
+/// 基准还没建立时**不能**覆盖：那时 `alltime_total_now` 回 0，会把一个本来正确的
+/// 库值清零（首轮重聚合之前恰好就是这个状态）。
+fn total_for_display(period_val: i64, agg_total: i64, alltime_total: i64, base_ready: bool) -> i64 {
+    if period_val == 0 && base_ready {
+        alltime_total
+    } else {
+        agg_total
+    }
 }
 
 /// 重聚合：按周期查询数据库并计算全部图表数据。
@@ -1548,9 +1577,27 @@ fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartA
 
 #[cfg(test)]
 mod compute_charts_tests {
-    use super::{alltime_total_now, compute_charts, sort_rank_desc};
+    use super::{alltime_total_now, compute_charts, sort_rank_desc, total_for_display};
 
     /// 同分必须有确定的先后：否则"谁进前 100 名"随进程重启而变。
+    /// 「总计」页的卡片必须和「今日」页一样实时更新。
+    ///
+    /// 回归：前端 `applyTotal` 只在 `period == -1` 时用带今日增量的 `alltime_total`，
+    /// 其余周期用 `period_total` = `agg.total`（上次重算的库值，而 period=0 的重算
+    /// 要等每 500 次按键才发生）—— 于是**标签写着「总计」的那一页**数字不动，
+    /// 切到「今日」却逐键跳。作者原话：「选今日时今日活跃和总计都快速变动，
+    /// 选了其它周期总计就不变了」。
+    #[test]
+    fn total_tab_card_uses_the_live_total_not_the_last_recompute() {
+        // period=0 且基准已建立 → 用"基准 + 今日增量"的修正值
+        assert_eq!(total_for_display(0, 1_000_000, 1_000_300, true), 1_000_300);
+        // 基准还没建立（首轮重聚合前 alltime_total_now 回 0）→ 保住库值，别清零
+        assert_eq!(total_for_display(0, 1_000_000, 0, false), 1_000_000);
+        // 「今日」页前端根本不读这个字段；近 N 天该继续用周期自己的总数
+        assert_eq!(total_for_display(-1, 500, 1_000_300, true), 500);
+        assert_eq!(total_for_display(30, 4242, 1_000_300, true), 4242);
+    }
+
     #[test]
     fn rank_ties_break_by_name_so_the_truncation_is_stable() {
         // 三个并列 2 次的键，正好卡在 RANK_LIMIT=100 的切割线上
