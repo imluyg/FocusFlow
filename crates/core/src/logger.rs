@@ -52,7 +52,33 @@ pub fn install_panic_hook() {
             .unwrap_or_else(|| "?".to_string());
         tracing::error!(target: "panic", "未捕获的 panic: {payload} @ {location}");
         crate::db::writer::panic_recovery_snapshot();
+        // 上面那条 error 走的是 non_blocking 通道，而 release 是 `panic = "abort"`：
+        // 紧随其后进程就没了，那条"唯一的死因"多半还留在缓冲区里 —— 于是"双击没反应"
+        // 连一行日志都不剩（`shutdown` 的注释记过这件事：落盘靠显式 drop，存全局不管）。
+        // 所以这里在 abort 之前显式 flush 一次。
+        //
+        // 只在真正会 abort 的构建里做：debug/测试是 unwind，一个用例 panic 之后
+        // 进程还要继续跑完其余用例，而 guard 一 drop 之后整个进程的日志就静默死了
+        // （`shutdown_flushes_and_is_repeatable` 那类读日志文件的用例会因此偶发红）。
+        #[cfg(not(test))]
+        flush_before_abort();
     }));
+}
+
+/// panic 路径上的日志 flush。
+///
+/// 与上面的调用点同样只在会 abort 的构建里存在（测试构建里没人调它）。
+///
+/// **不能直接复用 [`shutdown`]**：那个函数拿的是阻塞锁，而 panic 完全可能发生在
+/// 正持有 `LOG_GUARD` 的线程里（日志自己出错、或 appender 写盘时炸），在 hook 里
+/// 一阻塞就把"崩溃至少留下一行"换成"进程挂死在那里"。拿不到锁就放弃 ——
+/// 少一行日志比整个程序卡死好。
+#[cfg(not(test))]
+fn flush_before_abort() {
+    if let Ok(mut guard) = LOG_GUARD.try_lock() {
+        let taken = guard.take();
+        drop(taken); // `WorkerGuard` 的 Drop 会把队列里的尾部写完
+    }
 }
 
 /// 初始化日志系统（文件轮转 + 控制台）。
