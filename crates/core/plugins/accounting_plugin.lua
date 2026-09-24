@@ -92,6 +92,45 @@ local function fmt_net(v)
     return string.format("%.2f", v)
 end
 
+-- 分类/子分类被改名或删除之后，筛选条件里存的还是老名字。
+--
+-- 后果有两句、而且互相加重：
+-- ① SQL 按老名字筛 → 列表"共 0 条"，用户以为**记录被删了**；
+-- ② `<select>` 拿到一个不在 options 里的 value 时，浏览器会退回显示第一项
+--    （也就是"全部"，见 `ui/js/plugins.js` 渲染 select 的地方）—— 于是下拉说"全部"、
+--    列表却是空的，两边各说一套，比单纯显示 0 条更难看懂。
+-- 弹窗草稿里的分类同样会悬空：留着它，下一次"保存"就会把记录写进一个**已经不存在的分类**。
+local function reset_stale_filters()
+    local valid = {}
+    local sub_of = {}
+    for _, c in ipairs(cats()) do
+        valid[c] = true
+        local set = {}
+        for _, x in ipairs(subs(c)) do
+            set[x] = true
+        end
+        sub_of[c] = set
+    end
+    if f_cat ~= "全部" and not valid[f_cat] then
+        f_cat = "全部"
+        f_sub = "全部"
+        page = 1
+    elseif f_sub ~= "全部" and not (sub_of[f_cat] and sub_of[f_cat][f_sub]) then
+        f_sub = "全部"
+        page = 1
+    end
+    if profit_cat ~= "" and not valid[profit_cat] then
+        profit_cat = ""
+    end
+    if draft.category ~= "" and not valid[draft.category] then
+        draft.category = ""
+        draft.subcategory = ""
+    end
+    if m_cat ~= "" and not valid[m_cat] then
+        m_cat = ""
+    end
+end
+
 function on_action(id)
     if id == "page_prev" then
         if page > 1 then page = page - 1 end
@@ -328,6 +367,7 @@ function on_action(id)
             local all = cats()
             if #all > 0 then m_cat = all[1] end
         end
+        reset_stale_filters()
     elseif id:match("^m_edit_sub_sel") then
         local name = id:sub(15)
         if name == "" or m_cat == "" then return end
@@ -342,6 +382,7 @@ function on_action(id)
             local ok, msg = focusflow.accounting_subcategory_delete(m_cat, name)
             result_text = (ok and "子分类 [" .. name .. "] 已删除") or ("删除失败：" .. tostring(msg))
             if ok then m_sub_name = "" end
+            reset_stale_filters()
         end
     elseif id == "m_save_edit_cat" then
         if m_edit_old == nil or m_edit_old == "" then return end
@@ -349,6 +390,7 @@ function on_action(id)
         result_text = (ok and "分类已更新为 [" .. m_name .. "]") or ("更新失败：" .. tostring(msg))
         m_edit_open = false; m_edit_old = ""
         if ok then m_cat = m_name; m_name = "" end
+        reset_stale_filters()
     elseif id == "m_cancel_edit_cat" then
         m_edit_open = false; m_edit_old = ""
     elseif id == "m_add_sub" then
@@ -365,6 +407,7 @@ function on_action(id)
         result_text = (ok and "子分类已更新为 [" .. m_sub_name .. "]") or ("更新失败：" .. tostring(msg))
         m_sub_edit_open = false; m_sub_edit_old = ""
         if ok then m_sub_name = "" end
+        reset_stale_filters()
     elseif id == "m_cancel_edit_sub" then
         m_sub_edit_open = false; m_sub_edit_old = ""
     elseif id == "clear_result" then
