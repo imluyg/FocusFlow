@@ -22,6 +22,62 @@ fn setup() -> paths::TestAppDir {
     dir
 }
 
+/// 分类名：空与纯空格必须被拒，合法名字必须去掉首尾空格。
+///
+/// 回归：`categories` 只有 NOT NULL + UNIQUE，以前 `add_category("")` 会真建出一行，
+/// 而它的 id 就是 `""` —— 记账面板把 `""` 当"未选中"的哨兵（删除/修改按钮开头都是
+/// `if name == "" then return`），于是**这个分类删不掉、改不了、挂不上子分类**。
+/// 带空格的版本更隐蔽：记录侧存分类时走 `blank_to_none`（会 trim），
+/// 于是" 餐饮"这个分类永远筛不到任何记录，列表看着像空的。
+#[test]
+fn category_names_are_trimmed_and_blank_ones_rejected() {
+    let _g = guard();
+    let _d = setup();
+    let names = || -> Vec<String> {
+        accounting::get_all_categories()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect()
+    };
+
+    assert_eq!(
+        accounting::add_category("", "both", &[]),
+        -1,
+        "空名不该建出来"
+    );
+    assert_eq!(
+        accounting::add_category("   ", "both", &[]),
+        -1,
+        "只有空格也不算名字"
+    );
+    assert!(
+        !names().iter().any(|n| n.trim().is_empty()),
+        "被拒之后不该留下任何空分类: {:?}",
+        names()
+    );
+
+    assert!(accounting::add_category(" 餐饮 ", "both", &[]) > 0);
+    assert!(
+        names().iter().any(|n| n == "餐饮"),
+        "存进去的该是去掉首尾空格的名字: {:?}",
+        names()
+    );
+
+    // 改名同理：改成纯空格必须被拒，并给出原因
+    let (ok, msg) = accounting::update_category("餐饮", "   ", None);
+    assert!(!ok, "改成纯空格竟然成功了");
+    assert!(msg.contains("不能为空"), "原因要说清，实际: {msg}");
+    // 改成带空格的合法名字 → 落地成 trimmed 值（否则匹配不上记录）
+    let renamed = accounting::update_category("餐饮", " 饮料 ", None).0;
+    assert!(renamed, "改成带空格的合法名字该成功");
+    assert!(names().iter().any(|n| n == "饮料"), "{:?}", names());
+    assert!(
+        !names().iter().any(|n| n != n.trim()),
+        "不该留下带空格的分类名: {:?}",
+        names()
+    );
+}
+
 fn add(date: &str, rtype: &str, item: &str, amount: f64, cat: &str, sub: &str) -> i64 {
     accounting::add_expense(
         rtype,

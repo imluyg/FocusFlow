@@ -332,6 +332,17 @@ pub fn get_expenses_by_date(date: &str) -> Vec<Expense> {
 
 /// 添加分类。
 pub fn add_category(name: &str, ctype: &str, subs: &[String]) -> i64 {
+    // trim + 拒空。空名以前真能建出来（`categories` 只有 NOT NULL + UNIQUE），
+    // 而它的行 id 就是 `""` —— 记账面板里 `""` 同时是"未选中"的哨兵
+    // （`m_del_cat_sel` / `m_edit_cat_sel` 开头都是 `if name == "" then return`），
+    // 于是**这个分类建得出来却永远删不掉、改不了、挂不上子分类**。
+    // 带首尾空格的名字同样危险：记录侧写分类时走 `blank_to_none`（本文件里会 trim），
+    // 存成"餐饮"而分类表里是" 餐饮"，按它筛选恒为 0 条。
+    let name = name.trim();
+    if name.is_empty() {
+        tracing::warn!("分类名为空，已拒绝创建（空名会成为一个在界面上删不掉的分类）");
+        return -1;
+    }
     let conn = match open() {
         Ok(c) => c,
         Err(_) => return -1,
@@ -365,6 +376,9 @@ pub fn update_category(old_name: &str, new_name: &str, ctype: Option<&str>) -> (
     if old_name == new_name && ctype.is_none() {
         return (false, "没有需要修改的内容".into());
     }
+    // 先 trim 再判空：`"   ".is_empty()` 是 false，所以一个纯空格的分类名以前能改成功，
+    // 而它此后再也匹配不上任何记录（见 `add_category` 里那段）。
+    let new_name = new_name.trim();
     if new_name.is_empty() {
         return (false, "分类名不能为空".into());
     }

@@ -295,6 +295,14 @@ function on_action(id)
     elseif id == "close_manage" then
         manage_open = false
     elseif id == "m_add_cat" then
+        -- 宿主那边现在也会拒（add_category 已 trim + 拒空），但 `accounting_category_add`
+        -- 只回一个 id、没有原因串，所以下面那句 `msg` 恒为 nil —— 界面只会显示
+        -- "添加分类失败：" 四个字。空名/纯空格在这里就拦下，才能说清是哪一种。
+        m_name = (m_name or ""):match("^%s*(.-)%s*$")
+        if m_name == "" then
+            result_text = "分类名不能是空的（也别只打空格）"
+            return
+        end
         local ok, msg = focusflow.accounting_category_add(m_name, m_type)
         result_text = (ok and ok > 0 and "分类 [" .. m_name .. "] 已添加") or ("添加分类失败：" .. tostring(msg or ""))
         if ok and ok > 0 then m_cat = m_name; m_name = "" end
