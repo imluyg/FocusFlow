@@ -1004,8 +1004,12 @@ pub fn sweep_stale_sidecars() -> usize {
 /// 每 60 秒醒来重新读一次配置（`[database] online_backup_interval_hours`，0 = 关闭），
 /// 所以设置页里改开关/间隔**不必重启**：关闭期间不计时，重新打开后从零开始重新计时。
 /// 备份走 SQLite 在线备份 API，不阻塞读写（与写线程的短事务天然错开）。
-pub fn start_periodic_backup() {
-    std::thread::Builder::new()
+///
+/// spawn 失败不让启动失败（少的是自动备份，主功能不瘫），但结论要返回给
+/// 启动自检 —— 原来吞进 `.ok()` 里，备份悄悄没了都没人知道。
+pub fn start_periodic_backup() -> crate::startup::CheckResult {
+    let step = "定时备份线程";
+    match std::thread::Builder::new()
         .name("periodic-backup".into())
         .spawn(move || {
             tracing::info!(
@@ -1039,9 +1043,16 @@ pub fn start_periodic_backup() {
                     last = std::time::Instant::now();
                 }
             }
-        })
-        .map_err(|e| tracing::error!("启动定时备份线程失败: {e}"))
-        .ok();
+        }) {
+        Ok(_handle) => crate::startup::CheckResult::ok(
+            step,
+            "已启动（间隔读 [database] online_backup_interval_hours）",
+        ),
+        Err(e) => {
+            tracing::error!("启动定时备份线程失败: {e}");
+            crate::startup::CheckResult::fail(step, format!("{e}"))
+        }
+    }
 }
 
 /// 破坏性操作（清空/清理/删除按键）前的兜底快照。

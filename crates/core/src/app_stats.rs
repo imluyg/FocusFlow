@@ -61,12 +61,18 @@ fn is_recordable(name: &str, exclude: &[String]) -> bool {
 }
 
 /// 启动前台应用识别线程（非 Windows 平台恒返回 None，等同于不归属）。
-pub fn start_sampler(writer: Arc<DbWriter>) {
+///
+/// 返回自检结论（B15）：线程创建失败（机器长时间运行、句柄压力）只该少掉
+/// 「应用归属」这一项，不该让整个程序在启动路上死掉 —— release 是
+/// panic = "abort"，一条 expect 就是"双击没反应"。但**必须留痕**：
+/// 原来结论吞在自己函数里，只有翻日志才知道应用统计悄悄没了。
+pub fn start_sampler(writer: Arc<DbWriter>) -> crate::startup::CheckResult {
+    let step = "前台应用采样线程";
     let (enabled, exclude) = load_config(crate::config::instance());
     if !enabled {
         tracing::info!("前台应用统计未启用（[app_stats] enabled=false），线程仍会起来等它被打开");
     }
-    if let Err(e) = std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("app-usage-sampler".into())
         .spawn(move || {
             tracing::info!(
@@ -117,12 +123,23 @@ pub fn start_sampler(writer: Arc<DbWriter>) {
             }
         })
     {
-        // 线程创建失败（机器长时间运行、句柄压力）只该少掉「应用归属」这一项，
-        // 不该让整个程序在启动路上死掉 —— release 是 panic = "abort"，
-        // 一条 expect 就是"双击没反应"。
-        tracing::error!(
-            "前台应用采样线程启动失败（{e}）：本次运行不再统计应用归属，键鼠统计不受影响"
-        );
+        Ok(_handle) => crate::startup::CheckResult::ok(
+            step,
+            if enabled {
+                "已启动"
+            } else {
+                "未启用（[app_stats] enabled=false），线程在等它被打开"
+            },
+        ),
+        Err(e) => {
+            // 线程创建失败（机器长时间运行、句柄压力）只该少掉「应用归属」这一项，
+            // 不该让整个程序在启动路上死掉 —— release 是 panic = "abort"，
+            // 一条 expect 就是"双击没反应"。
+            tracing::error!(
+                "前台应用采样线程启动失败（{e}）：本次运行不再统计应用归属，键鼠统计不受影响"
+            );
+            crate::startup::CheckResult::fail(step, format!("{e}"))
+        }
     }
 }
 

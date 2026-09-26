@@ -163,6 +163,7 @@ pub fn run() {
             plugins::plugin_set_field,
             commands::get_maintenance_info,
             commands::do_backup,
+            commands::get_startup_report,
         ])
         .on_window_event(|window, event| {
             // 主窗口关闭 → 隐藏到托盘（500ms 后仍隐藏才销毁，见 state::hide_main_window），

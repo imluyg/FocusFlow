@@ -236,4 +236,16 @@ document.querySelectorAll("#analytics-tabs .tab").forEach((b) => {
   } catch (e) {
     console.error("初始加载失败", e);
   }
+  // 启动自检汇总（后端 B15）：全绿静默；有失败项逐条 toast 说清楚，
+  // 别让人对着"数字不动/设备页空了"猜原因。toast 是单元素替换式的，
+  // 多条要错开 3.5 秒排队，否则只剩最后一条。
+  try {
+    const report = await invoke("get_startup_report");
+    const failed = (report || []).filter((c) => !c.ok);
+    failed.forEach((c, i) => {
+      setTimeout(() => toast(`启动自检：${c.step} —— ${c.detail}`), i * 3500);
+    });
+  } catch (e) {
+    console.error("启动自检拉取失败", e);
+  }
 })();

@@ -432,6 +432,16 @@ pub async fn get_maintenance_info() -> Result<serde_json::Value, String> {
     .map_err(|e| e.to_string())
 }
 
+/// 启动自检汇总（B15）：init 路径上各子系统「起没起来」的结论。
+/// 全绿静默 —— 前端只在有失败项时 toast；托盘 tooltip 也会带 ⚠ 计数。
+/// 静态数据（init 完成后不再变），直接同步返回。
+#[tauri::command]
+pub fn get_startup_report(
+    state: State<'_, Arc<AppState>>,
+) -> Vec<focusflow_core::startup::CheckResult> {
+    state.startup_report.clone()
+}
+
 /// 立即备份数据库，返回备份文件路径（重 IO；后台线程执行）。
 #[tauri::command]
 pub async fn do_backup(state: State<'_, Arc<AppState>>) -> Result<String, String> {

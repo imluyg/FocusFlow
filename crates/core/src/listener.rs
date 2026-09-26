@@ -587,15 +587,21 @@ impl InputListener {
     }
 
     /// 启动监听（在后台线程运行）。
-    pub fn start(self: &Arc<Self>, db: Arc<Database>) {
+    ///
+    /// spawn 失败往上传（`Err` → `AppState::init` → 启动失败）：这是键鼠统计的
+    /// 主链路，没了这个线程整个程序就是"看着在跑、什么都不记"。原来失败被
+    /// `.map_err(日志).ok()` 吞掉，还带着两处连带的小错：`alive` 在 spawn
+    /// **之前**就置 true（失败后运行状态看着像在跑）、失败也照打
+    /// 「键鼠监听已启动」。一起修掉。
+    pub fn start(self: &Arc<Self>, db: Arc<Database>) -> anyhow::Result<()> {
         let mut alive = self.alive.lock().unwrap_or_else(|e| e.into_inner());
         if *alive {
-            return;
+            return Ok(());
         }
-        *alive = true;
-        drop(alive);
-
         let this = Arc::clone(self);
+        // 持锁跨 spawn：spawn 只是建线程不阻塞，锁到置位为止，
+        // 防两个并发 start 都过了检查、双起线程。
+        // 新线程首件事也是锁 alive —— 它会短暂等在这里，等我们置位后放行。
         thread::Builder::new()
             .name("input-listener".into())
             .spawn(move || loop {
@@ -616,8 +622,12 @@ impl InputListener {
                 }
                 thread::sleep(Duration::from_secs(5));
             })
-            .map_err(|e| tracing::error!("启动输入监听线程失败: {e}"))
-            .ok();
+            .map_err(|e| {
+                tracing::error!("启动输入监听线程失败: {e}");
+                anyhow::anyhow!("启动输入监听线程失败: {e}")
+            })?;
+        *alive = true;
+        drop(alive);
         tracing::info!(
             "键鼠监听已启动 (ignore_modifiers={}, ignore_functions={}, mouse_enabled={})",
             self.config
@@ -626,6 +636,7 @@ impl InputListener {
                 .get_bool("listener", "ignore_function_keys", false),
             self.config.get_bool("listener", "mouse_enabled", true),
         );
+        Ok(())
     }
 
     /// 停止监听。
@@ -945,7 +956,8 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         let _dir = crate::paths::test_app_dir("listener_pause_shared");
         let db = crate::db::Database::init_readonly();
-        let writer = crate::db::DbWriter::start(Duration::from_secs(3600));
+        let writer = crate::db::DbWriter::start(Duration::from_secs(3600))
+            .expect("测试里 DB 写线程必须能启动");
 
         let paused = new_pause_flag();
         let l = InputListener::new(test_config(), Arc::clone(&paused));

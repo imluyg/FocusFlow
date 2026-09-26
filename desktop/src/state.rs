@@ -140,6 +140,10 @@ pub struct AppState {
     pub refresh_now: Arc<AtomicBool>,
     /// 主窗口是否启动即进托盘
     pub start_to_tray: bool,
+    /// 启动自检汇总（B15）：init 路径上各子系统「起没起来」。
+    /// 全绿静默；有失败项时前端 toast（`get_startup_report`）、
+    /// 托盘 tooltip 带 ⚠ 计数、报告全文在 `get_startup_report`。
+    pub startup_report: Vec<focusflow_core::startup::CheckResult>,
 }
 
 impl AppState {
@@ -158,14 +162,58 @@ impl AppState {
             7,
         ));
         let listener = InputListener::new(config, Arc::clone(&paused));
-        listener.start(Arc::clone(&db));
+        // 启动自检（B15）：DB 侧三项（备份/采样/设备统计）已收在 Database 里，
+        // 键鼠监听是致命项（失败直接 ? 让启动失败），成功也记一行备查。
+        let mut startup_report = db.take_startup_checks();
+        listener.start(Arc::clone(&db))?;
+        startup_report.push(focusflow_core::startup::CheckResult::ok(
+            "键鼠监听线程",
+            "已启动（断线 5 秒自动重启）",
+        ));
 
-        // 启动即加载插件（番茄钟/定时任务等随插件 init 运行，对齐 Python 版）
-        crate::plugins::with_manager(&db, |_pm| {});
+        // 启动即加载插件（番茄钟/定时任务等随插件 init 运行，对齐 Python 版）。
+        // 加载失败的插件从 manager 拿清单 —— 插件页能看到只是一半，
+        // 启动报告要让它跟其他子系统一样显性化。
+        crate::plugins::with_manager(&db, |pm| {
+            let failures = pm.load_failures();
+            if failures.is_empty() {
+                startup_report.push(focusflow_core::startup::CheckResult::ok(
+                    "插件加载",
+                    "已加载的全部成功",
+                ));
+            } else {
+                for (name, err) in failures {
+                    startup_report.push(focusflow_core::startup::CheckResult::fail(
+                        "插件加载",
+                        format!("{name}: {err}"),
+                    ));
+                }
+            }
+        });
         // 插件热重载（Tauri 无 GUI 轮询循环，用独立扫描线程 + 主线程重载）
-        crate::plugins::start_hot_reload(app.handle(), Arc::clone(&db));
+        if crate::plugins::start_hot_reload(app.handle(), Arc::clone(&db)) {
+            startup_report.push(focusflow_core::startup::CheckResult::ok(
+                "插件热重载线程",
+                "已启动（监听随插件管理页开关）",
+            ));
+        } else {
+            startup_report.push(focusflow_core::startup::CheckResult::fail(
+                "插件热重载线程",
+                "扫描/应用线程启动失败，该功能本次运行不可用（重启可恢复）",
+            ));
+        }
         // 键事件 → 插件分发（番茄钟按键计数依赖此链路）
-        crate::plugins::start_key_event_dispatch(app.handle(), Arc::clone(&db), &listener);
+        if crate::plugins::start_key_event_dispatch(app.handle(), Arc::clone(&db), &listener) {
+            startup_report.push(focusflow_core::startup::CheckResult::ok(
+                "插件键事件分发线程",
+                "已启动",
+            ));
+        } else {
+            startup_report.push(focusflow_core::startup::CheckResult::fail(
+                "插件键事件分发线程",
+                "分发线程启动失败，插件收不到按键（重启可恢复）",
+            ));
+        }
 
         let shared = Arc::new(Mutex::new(SharedStats::default()));
         // 默认周期 = 上次退出前选择的周期（前端切换时写入 gui.default_period）。
@@ -180,14 +228,19 @@ impl AppState {
         let period = Arc::new(AtomicI64::new(default_period));
         let refresh_now = Arc::new(AtomicBool::new(false));
 
-        spawn_stats_worker(
+        if !spawn_stats_worker(
             app.handle().clone(),
             Arc::clone(&db),
             config,
             Arc::clone(&shared),
             Arc::clone(&period),
             Arc::clone(&refresh_now),
-        );
+        ) {
+            startup_report.push(focusflow_core::startup::CheckResult::fail(
+                "统计线程",
+                "启动失败，界面数字不会更新（重启可恢复）",
+            ));
+        }
 
         let start_to_tray = config.get_bool("gui", "start_to_tray", true);
 
@@ -199,6 +252,7 @@ impl AppState {
             period,
             refresh_now,
             start_to_tray,
+            startup_report,
         });
 
         // 悬浮窗默认位置（持久化）
@@ -1080,6 +1134,8 @@ fn keep_floating_on_top(app: &App) {
 /// 后台统计线程：
 /// 快节奏 500ms 更新今日/CPM 并推送 `stats-live`；
 /// 重聚合在周期切换/超时/强制时执行并推送 `stats-charts`。
+///
+/// 返回线程是否起来了（启动自检 B15 用；失败已记 error 日志）。
 fn spawn_stats_worker(
     app: AppHandle,
     db: Arc<Database>,
@@ -1087,7 +1143,7 @@ fn spawn_stats_worker(
     shared: Arc<Mutex<SharedStats>>,
     period: Arc<AtomicI64>,
     refresh_now: Arc<AtomicBool>,
-) {
+) -> bool {
     std::thread::Builder::new()
         .name("stats-worker".into())
         .spawn(move || {
@@ -1427,7 +1483,7 @@ fn spawn_stats_worker(
             }
         })
         .map_err(|e| tracing::error!("启动统计线程失败（该功能不可用）: {e}"))
-        .ok();
+        .is_ok()
 }
 
 /// 全历史总计 = 缓存基准 + 今日自缓存构建以来的增量（零 DB 查询）。

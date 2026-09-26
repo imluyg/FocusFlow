@@ -19,6 +19,7 @@ pub mod paths;
 pub mod plugins;
 pub mod pomodoro;
 pub mod scheduler;
+pub mod startup;
 pub mod stats;
 
 pub use config::FocusFlowConfig;

@@ -752,6 +752,26 @@ impl PluginManager {
         self.plugins.values().collect()
     }
 
+    /// 启动自检用（B15）：加载失败的插件清单（展示名/文件名 + 最后一次错误）。
+    ///
+    /// 「启用但加载失败」有两个去向：进了 `plugins` 但被标成未加载（`try_load`
+    /// 失败的），以及连 parse 都没过、只留在 `load_errors` 的 —— 两处都要收，
+    /// 否则自检报告只能看见一半。已加载与已停用的不在此列。
+    pub fn load_failures(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for p in self.plugins.values() {
+            if !p.loaded {
+                if let Some(e) = &p.error {
+                    out.push((p.name.clone(), e.clone()));
+                }
+            }
+        }
+        for (file, e) in &self.load_errors {
+            out.push((file.clone(), e.clone()));
+        }
+        out
+    }
+
     /// 获取单个插件。
     pub fn get_plugin(&self, name: &str) -> Option<&PluginInfo> {
         self.plugins.get(name)

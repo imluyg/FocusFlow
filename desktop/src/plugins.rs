@@ -67,7 +67,9 @@ pub fn set_watch(watch: bool) {
 /// Tauri 没有这个循环，这里用独立实现：扫描线程只在插件管理页打开时
 /// 监视 plugins/ 的 mtime 变更，变更通过 channel 交给投递线程，
 /// 再用 run_on_main_thread 回到主线程重载（Lua 非 Send，只能主线程操作）。
-pub fn start_hot_reload(app: &tauri::AppHandle, db: Arc<Database>) {
+///
+/// 返回两条线程是否都起来了（启动自检 B15 用；失败各自已记 error 日志）。
+pub fn start_hot_reload(app: &tauri::AppHandle, db: Arc<Database>) -> bool {
     let (ctl_tx, ctl_rx) = std::sync::mpsc::channel::<bool>();
     let _ = WATCH_TX.set(ctl_tx);
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -75,7 +77,7 @@ pub fn start_hot_reload(app: &tauri::AppHandle, db: Arc<Database>) {
     // 扫描线程：仅监听状态下每 2 秒比对 mtime，变更时发送插件文件名。
     // 首轮只建立 mtime 基线不触发事件：否则每次打开插件管理页都会把全部文件
     // 当作"变更"连发 plugins-reloaded，列表反复重建会吞掉用户正在进行的点击。
-    std::thread::Builder::new()
+    let scan_ok = std::thread::Builder::new()
         .name("plugin-hot-reload-scan".into())
         .spawn(move || {
             let dir = focusflow_core::paths::plugins_dir();
@@ -151,11 +153,11 @@ pub fn start_hot_reload(app: &tauri::AppHandle, db: Arc<Database>) {
             }
         })
         .map_err(|e| tracing::error!("启动插件热重载扫描线程失败（该功能不可用）: {e}"))
-        .ok();
+        .is_ok();
 
     // 投递线程：收到变更 → 主线程执行重载，并通知前端刷新插件列表
     let app_owned = app.clone();
-    std::thread::Builder::new()
+    let apply_ok = std::thread::Builder::new()
         .name("plugin-hot-reload-apply".into())
         .spawn(move || {
             while let Ok(name) = rx.recv() {
@@ -170,8 +172,12 @@ pub fn start_hot_reload(app: &tauri::AppHandle, db: Arc<Database>) {
             }
         })
         .map_err(|e| tracing::error!("启动插件热重载应用线程失败（该功能不可用）: {e}"))
-        .ok();
-    tracing::info!("插件热重载已就绪（监听随插件管理页开关）");
+        .is_ok();
+    // spawn 失败时上面各自已 error，别再谎报「已就绪」
+    if scan_ok && apply_ok {
+        tracing::info!("插件热重载已就绪（监听随插件管理页开关）");
+    }
+    scan_ok && apply_ok
 }
 
 /// 按插件文件名（stem）重载插件（主线程调用）。
@@ -206,11 +212,13 @@ static KEY_EVENT_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<String>> =
 /// mlua 的 Lua 非 Send，插件分发只能在主线程：钩子线程回调只往 channel 投递键名
 /// （零阻塞），独立分发线程批量取出后经 run_on_main_thread 回主线程，
 /// 对每个已加载插件调用 plugin_key_event。
+///
+/// 返回分发线程是否起来了（启动自检 B15 用；失败已记 error 日志）。
 pub fn start_key_event_dispatch(
     app: &tauri::AppHandle,
     db: Arc<Database>,
     listener: &Arc<InputListener>,
-) {
+) -> bool {
     // 有界通道：主线程（Lua 分发）被卡住（插件失控/模态框）时丢弃新事件，
     // 防止无界队列随时间无限积压。按键计数语义允许少量丢失，
     // 权威计数由 DB 写线程的内存聚合负责，这里只服务插件联动。
@@ -223,7 +231,7 @@ pub fn start_key_event_dispatch(
     }));
 
     let app_owned = app.clone();
-    std::thread::Builder::new()
+    let dispatch_ok = std::thread::Builder::new()
         .name("plugin-key-dispatch".into())
         .spawn(move || {
             // 单次主线程投递最多合并的按键数：连打时减少跨线程消息数量
@@ -261,8 +269,12 @@ pub fn start_key_event_dispatch(
             }
         })
         .map_err(|e| tracing::error!("启动插件键事件分发线程失败（该功能不可用）: {e}"))
-        .ok();
-    tracing::info!("插件键事件分发已接通");
+        .is_ok();
+    // spawn 失败时上面已 error，别再谎报「已接通」
+    if dispatch_ok {
+        tracing::info!("插件键事件分发已接通");
+    }
+    dispatch_ok
 }
 
 /// 下拉/单选选项 (value, label)。

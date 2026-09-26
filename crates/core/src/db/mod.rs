@@ -26,6 +26,10 @@ use crate::config::FocusFlowConfig;
 pub struct Database {
     /// 写入器（可空：CLI 只读模式不启动）
     writer: Option<Arc<DbWriter>>,
+    /// 启动自检（B15）：init 路径上各子系统「起没起来」的结论。致命的失败
+    /// 直接 `?` 让启动失败；不致命的（备份/采样/设备侧信道）收在这里，
+    /// 由组合根汇总成启动报告（日志 / get_startup_report / 托盘 ⚠）。全绿静默。
+    startup_checks: std::sync::Mutex<Vec<crate::startup::CheckResult>>,
 }
 
 impl Database {
@@ -66,28 +70,33 @@ impl Database {
             tracing::info!("启动清理：backup/ 中 {swept} 个遗留残留文件已删除");
         }
 
-        // 启动写入线程
+        // 启动写入线程：起不来 = 一条都存不了，直接让启动失败（见 DbWriter::start）
         let flush_interval =
             Duration::from_secs(config.get_int("database", "flush_interval", 10).max(1) as u64);
-        let writer = Some(DbWriter::start(flush_interval));
+        let writer = Some(DbWriter::start(flush_interval)?);
         // panic hook 兜底：进程异常终止前把未落库增量写入恢复文件
         writer::register_panic_recovery(Arc::clone(writer.as_ref().unwrap()));
 
-        // 运行中定时在线备份：进程被强杀不再丢失自上次备份后的全部数据。
-        // 线程常驻、每分钟重读配置（online_backup_interval_hours，0 = 关闭），
-        // 这样设置页里开关备份不必重启。
-        maintenance::start_periodic_backup();
+        // 下面三个子系统起不来都不值得让整个程序死掉，但必须**留痕**：
+        // 结论收进启动自检，由组合根汇总显性化（托盘/toast/日志）。
+        let startup_checks = vec![
+            // 运行中定时在线备份：进程被强杀不再丢失自上次备份后的全部数据。
+            // 线程常驻、每分钟重读配置（online_backup_interval_hours，0 = 关闭），
+            // 这样设置页里开关备份不必重启。
+            maintenance::start_periodic_backup(),
+            // 前台应用识别（写入 current_app，时长归属由写线程按键鼠事件完成；
+            // Windows；[app_stats] enabled=false 或 exclude 可关停）
+            crate::app_stats::start_sampler(Arc::clone(writer.as_ref().unwrap())),
+            // 设备维度统计（Raw Input 侧信道，独立口径按设备归属计数；
+            // Windows；[device_stats] enabled=false 可关停）
+            // 共享暂停位一并交给它：设备计数必须和主链路一起停，否则暂停后「设备排行」还在涨
+            crate::device_stats::start_device_stats(Arc::clone(writer.as_ref().unwrap()), paused),
+        ];
 
-        // 前台应用识别（写入 current_app，时长归属由写线程按键鼠事件完成；
-        // Windows；[app_stats] enabled=false 或 exclude 可关停）
-        crate::app_stats::start_sampler(Arc::clone(writer.as_ref().unwrap()));
-
-        // 设备维度统计（Raw Input 侧信道，独立口径按设备归属计数；
-        // Windows；[device_stats] enabled=false 可关停）
-        // 共享暂停位一并交给它：设备计数必须和主链路一起停，否则暂停后「设备排行」还在涨
-        crate::device_stats::start_device_stats(Arc::clone(writer.as_ref().unwrap()), paused);
-
-        Ok(Arc::new(Self { writer }))
+        Ok(Arc::new(Self {
+            writer,
+            startup_checks: std::sync::Mutex::new(startup_checks),
+        }))
     }
 
     /// 只读初始化（CLI 统计用，不启动写入线程）。
@@ -95,7 +104,20 @@ impl Database {
         // 旧格式库也先聚合迁移（CLI 直接读用户数据目录）
         maintenance::migrate_v2();
         invalidate_years_cache();
-        Arc::new(Self { writer: None })
+        Arc::new(Self {
+            writer: None,
+            startup_checks: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// 取走启动自检结果（组合根组装启动报告用；取后清空，只汇总一次）。
+    pub fn take_startup_checks(&self) -> Vec<crate::startup::CheckResult> {
+        std::mem::take(
+            &mut *self
+                .startup_checks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
     }
 
     /// 获取写入器。
@@ -133,5 +155,50 @@ impl Database {
             }
         }
         tracing::info!("数据库已关闭");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B15：init 路径上各子系统的「起没起来」必须收进 startup_checks，
+    /// 不能再吞回各自函数里（原来 `.map_err(日志).ok()` 之后外面什么都看不见，
+    /// 备份/设备统计悄悄消失只有翻日志才知道）。取走即清空：报告只汇总一次。
+    #[test]
+    fn database_init_collects_startup_checks() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("db_init_checks");
+        // 危险子系统全部关掉（设备统计会起 Raw Input 循环、在线备份会写盘），
+        // flush_interval 给到一年：用例结束后不得有任何后台线程再碰这个临时目录
+        // （§八·2 那类泄漏）。
+        let cfg = crate::config::FocusFlowConfig::load(dir.path().join("config.ini")).unwrap();
+        cfg.set("device_stats", "enabled", "false").unwrap();
+        cfg.set("database", "online_backup_interval_hours", "0")
+            .unwrap();
+        cfg.set("database", "backup_on_exit", "false").unwrap();
+        cfg.set("database", "flush_interval", "31536000").unwrap();
+
+        let paused = crate::listener::new_pause_flag();
+        let db = Database::init(&cfg, paused).expect("init 应成功");
+        let checks = db.take_startup_checks();
+        let steps: Vec<&str> = checks.iter().map(|c| c.step.as_str()).collect();
+        for step in ["定时备份线程", "前台应用采样线程", "设备统计线程"] {
+            assert!(
+                steps.contains(&step),
+                "自检结论里必须有「{step}」: {steps:?}"
+            );
+        }
+        assert!(
+            checks.iter().all(|c| c.ok),
+            "这些线程在测试环境里应该都起来了（设备统计是显式未启用，也算 ok）: {checks:?}"
+        );
+        // 取走即清空
+        assert!(
+            db.take_startup_checks().is_empty(),
+            "报告只汇总一次，第二次取应为空"
+        );
+        // 停掉写线程：否则它按 flush_interval 醒来，可能把已删掉的临时目录建回来
+        db.shutdown(&cfg);
     }
 }

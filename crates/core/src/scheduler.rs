@@ -1054,7 +1054,10 @@ impl Scheduler {
             .ok();
         // spawn 失败时 .ok() 已经是 None：调度线程没起来，句柄留 None
         *s.handle.lock().unwrap_or_else(|e| e.into_inner()) = handle;
-        tracing::info!("定时任务调度线程已启动");
+        // spawn 失败时上面已 error，别再谎报「已启动」
+        if s.handle.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            tracing::info!("定时任务调度线程已启动");
+        }
         s
     }
 

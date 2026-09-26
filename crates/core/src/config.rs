@@ -556,7 +556,11 @@ impl FocusFlowConfig {
                 .insert(key.to_string(), value.to_string());
         }
         // 去抖持久化：合并 300ms 窗口内的多次写入，避免高频调用（如悬浮窗位置）频繁整文件重写。
-        let _ = saver_tx().send(());
+        // 保存线程死了（spawn 失败/通道断）send 会一直报错：热路径只喊一次，
+        // 别让悬浮窗每动一下就刷一条。
+        if saver_tx().send(()).is_err() {
+            warn_saver_dead_once();
+        }
         Ok(())
     }
 }
@@ -630,9 +634,25 @@ fn saver_tx() -> &'static mpsc::Sender<()> {
                     }
                 }
             })
+            // 全仓曾经唯一一处裸 `.ok()`：spawn 失败连日志都没有，此后所有
+            // 设置改动静默不落盘。失败记下；set() 侧还有发送失败的第二道闸。
+            .map_err(|e| {
+                tracing::error!(
+                    "配置保存线程启动失败（{e}）：本次运行的设置改动将不再落盘，重启程序可恢复"
+                )
+            })
             .ok();
         tx
     })
+}
+
+/// 配置保存线程死了只喊一次：`set` 每次都会 send，逐条 warn 会把日志刷爆
+/// （同 `warn_bad_clock_once` 的热路径先例）。
+fn warn_saver_dead_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::error!("配置保存线程不可用：本次运行的设置改动不会落盘（重启程序可恢复）");
+    });
 }
 
 /// 获取全局配置实例；未初始化时用默认路径加载并初始化。

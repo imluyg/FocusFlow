@@ -218,13 +218,17 @@ pub(crate) mod classify {
 ///
 /// `paused` 必须与 `InputListener` 持有的是同一份（见 `listener::PauseFlag`）：
 /// 设备侧信道只有 `Arc<DbWriter>`，拿不到监听器，暂停状态只能靠这份共享标志传进来。
-pub fn start_device_stats(writer: Arc<DbWriter>, paused: PauseFlag) {
+///
+/// 返回自检结论（B15）：spawn 失败不让启动失败（设备排行悄悄消失比程序起不来轻），
+/// 但不再吞进 `.ok()` —— 结论交启动报告显性化。
+pub fn start_device_stats(writer: Arc<DbWriter>, paused: PauseFlag) -> crate::startup::CheckResult {
+    let step = "设备统计线程";
     let config = crate::config::instance();
     if !config.get_bool("device_stats", "enabled", true) {
         tracing::info!("设备统计未启用（[device_stats] enabled=false）");
-        return;
+        return crate::startup::CheckResult::ok(step, "未启用（[device_stats] enabled=false）");
     }
-    std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("device-stats".into())
         .spawn(move || {
             #[cfg(windows)]
@@ -234,9 +238,13 @@ pub fn start_device_stats(writer: Arc<DbWriter>, paused: PauseFlag) {
                 let _ = (writer, paused);
                 tracing::info!("非 Windows 平台不支持设备统计");
             }
-        })
-        .map_err(|e| tracing::error!("启动设备统计线程失败: {e}"))
-        .ok();
+        }) {
+        Ok(_handle) => crate::startup::CheckResult::ok(step, "已启动（Raw Input 侧信道）"),
+        Err(e) => {
+            tracing::error!("启动设备统计线程失败: {e}");
+            crate::startup::CheckResult::fail(step, format!("{e}"))
+        }
+    }
 }
 
 /// 记一次设备输入（次数 + 键名明细），返回是否真的记了。
@@ -729,7 +737,8 @@ mod tests {
         };
 
         // 未暂停：次数 + 键名明细两条增量都进了写入器（尚未落库 → has_pending 为真）
-        let running = DbWriter::start(Duration::from_secs(3600));
+        let running =
+            DbWriter::start(Duration::from_secs(3600)).expect("测试里 DB 写线程必须能启动");
         assert!(write(&running), "未暂停时应记录");
         assert!(
             running.has_pending(),
@@ -738,7 +747,8 @@ mod tests {
 
         // 暂停：一条都不记。另用一个 writer —— 复用上面那个的话 has_pending 恒为真，
         // 就测不出"这一条到底记没记"。
-        let stopped = DbWriter::start(Duration::from_secs(3600));
+        let stopped =
+            DbWriter::start(Duration::from_secs(3600)).expect("测试里 DB 写线程必须能启动");
         paused.store(true, Ordering::Relaxed);
         assert!(!write(&stopped), "暂停时应拒绝记录");
         assert!(

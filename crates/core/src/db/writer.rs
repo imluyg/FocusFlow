@@ -205,7 +205,12 @@ pub struct DbWriter {
 
 impl DbWriter {
     /// 创建并启动写入线程。
-    pub fn start(flush_interval: Duration) -> Arc<Self> {
+    ///
+    /// spawn 失败必须往上传（`Err` → `Database::init` → 启动失败）：这个线程是
+    /// 数据持久化的**唯一出口**，它没起来时 `record()` 只在内存累加，一条都进不了
+    /// 库、退出即丢 —— 与其让程序"看起来在跑其实什么都不存"，不如起不来就说清楚
+    /// （原来 `.map_err(日志).ok()` 吞掉后连启动日志都照常打"已启动"）。
+    pub fn start(flush_interval: Duration) -> anyhow::Result<Arc<Self>> {
         let (sig_tx, sig_rx) = mpsc::channel();
         // 今日计数初始值 = 聚合表中今日的记录数
         let today_base_count = {
@@ -290,14 +295,13 @@ impl DbWriter {
         thread::Builder::new()
             .name("db-writer".into())
             .spawn(move || writer_loop(state2, sig_rx, flush_interval))
-            .map_err(|e| tracing::error!("启动 DB 写入线程失败: {e}"))
-            .ok();
+            .map_err(|e| anyhow::anyhow!("启动 DB 写入线程失败: {e}"))?;
 
         tracing::info!(
             "DB 写入线程已启动 (聚合写入, interval={:?})",
             flush_interval
         );
-        writer
+        Ok(writer)
     }
 
     /// 记录一次按键：累加到内存聚合（非阻塞，永不阻塞监听热路径）。
@@ -1145,6 +1149,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
+    /// `start` 现在返回 `Result`（写线程起不来 = 启动失败）：用例只关心行为，
+    /// 统一 expect，失败本身就是测试环境坏了。
+    fn start_writer(interval: Duration) -> Arc<DbWriter> {
+        DbWriter::start(interval).expect("测试里 DB 写线程必须能启动")
+    }
+
     /// 跨年落库：增量必须写进 date_key 所属年份的库文件。
     ///
     /// 回归：此前统一写「当前年份」的库，跨年夜 23:59 的按键会落进新年度的文件。
@@ -1154,7 +1164,7 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("writer_crossyear");
 
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
 
         let now = chrono::Local::now();
         let last_year = now.year() - 1;
@@ -1192,7 +1202,7 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("writer_day");
 
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         // 模拟"昨天"：today_key 是昨天的日期键、计数停留在昨日值
         w.state
             .today_key
@@ -1218,7 +1228,7 @@ mod tests {
         // 就是**上一个用例已经删掉**的那个目录，于是那个目录连着 focusflow_YYYY.db
         // 被重新建出来（实测每个全量跑多一个 %TEMP% 残留）。
         let _tmp = crate::paths::test_app_dir("writer_agg");
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         let ts = queries::now_ts();
         w.record("A", ts);
         w.record("A", ts);
@@ -1239,7 +1249,7 @@ mod tests {
         // today_active 初始基准来自全局库的 active_seconds 表，
         // 必须用独立目录隔离，否则并行/残留数据会污染断言。
         let _tmp = crate::paths::test_app_dir("writer_active");
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         let t0 = queries::now_ts();
         w.record("A", t0);
         w.record("A", t0 + 10); // 间隔 10s：活跃 +10
@@ -1259,7 +1269,7 @@ mod tests {
     fn recompute_today_totals_refreshes_both_count_and_active_seconds() {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("writer_recompute");
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         let t0 = queries::now_ts();
         w.record("A", t0);
         w.record("A", t0 + 10); // 今日活跃 10 秒
@@ -1293,7 +1303,7 @@ mod tests {
     fn recompute_today_totals_does_not_lose_deltas_that_have_not_landed() {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("writer_recompute_locked");
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         let t0 = queries::now_ts();
         for i in 0..5 {
             w.record("A", t0 + i);
@@ -1325,7 +1335,7 @@ mod tests {
     fn snapshot_recovery_keeps_deltas_in_memory_when_the_write_fails() {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("recovery_writefail");
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         w.record("A", queries::now_ts());
         // 让写盘必失败：临时文件路径上放一个同名目录
         let tmp = recovery_path().with_extension("json.tmp");
@@ -1359,7 +1369,7 @@ mod tests {
         let _tmp = crate::paths::test_app_dir("recovery_keep");
         // 造一份恢复文件：先起一个 writer，收到增量后按 stop 超时那条路做快照
         {
-            let w = DbWriter::start(Duration::from_secs(3600));
+            let w = start_writer(Duration::from_secs(3600));
             w.record("A", queries::now_ts());
             w.record("A", queries::now_ts() + 1);
             snapshot_recovery(&w.state, true);
@@ -1369,7 +1379,7 @@ mod tests {
 
         // 第二次"启动"：回放。原文件必须被改名带走（不能留在原地等着被重放第二次），
         // 副本先留着 —— 此时数据还没进库。
-        let w = DbWriter::start(Duration::from_millis(200));
+        let w = start_writer(Duration::from_millis(200));
         assert!(
             !recovery_path().exists(),
             "回放后原恢复文件不能再留在盘上（否则下次重放两次）"
@@ -1402,7 +1412,7 @@ mod tests {
     fn today_pending_count_covers_only_unflushed_deltas() {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("writer_pending");
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         assert_eq!(w.today_pending_count(), 0, "开局没有未落库增量");
 
         let t0 = queries::now_ts();
@@ -1426,7 +1436,7 @@ mod tests {
     fn record_credits_gap_to_current_app() {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("writer_credits");
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         let t0 = queries::now_ts();
         let dk = queries::day_key_of_ts(t0);
 
@@ -1454,7 +1464,7 @@ mod tests {
     fn current_app_persists_across_flush() {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("writer_curapp");
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         let t0 = queries::now_ts();
         let dk = queries::day_key_of_ts(t0);
 
@@ -1493,7 +1503,7 @@ mod tests {
         use chrono::Datelike;
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("writer_devkey");
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         let ts = queries::now_ts();
         let dk = queries::day_key_of_ts(ts);
         let dev = "HID#VID_046D&PID_C52B";
@@ -1536,7 +1546,7 @@ mod tests {
     fn record_device_isolated_from_main_stats() {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("writer_device");
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         let ts = queries::now_ts();
         let dk = queries::day_key_of_ts(ts);
 
@@ -1597,7 +1607,7 @@ mod tests {
     fn flush_writes_device_tables() {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("writer_devflush");
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         let ts = queries::now_ts();
         let dk = queries::day_key_of_ts(ts);
         let dev = "HID#VID_1234&PID_5678".to_string();
@@ -1675,7 +1685,7 @@ mod tests {
             ins("HID#VID_1111&PID_2222#c", "", "mouse");
         }
 
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         {
             let agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(
@@ -1785,7 +1795,7 @@ mod tests {
         };
 
         // 1. 正常记一次并落库 —— 登记行进入 devices 表（预热的数据来源）
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         w.record_device(&dev, real_name, "mouse", ts);
         w.flush(true);
         assert_eq!(name_in_db().as_deref(), Some(real_name), "首次落库应是真名");
@@ -1797,7 +1807,7 @@ mod tests {
         w.stop_and_wait();
 
         // 3. 重启回放 + 落库：登记名字必须是真名，不能被回退命名顶掉
-        let w2 = DbWriter::start(Duration::from_secs(3600));
+        let w2 = start_writer(Duration::from_secs(3600));
         w2.flush(true);
         let deadline = Instant::now() + Duration::from_secs(15);
         while w2.flush_seq() == 0 && Instant::now() < deadline {
@@ -1831,7 +1841,7 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("writer_devrec");
 
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         let ts = queries::now_ts();
         let dk = queries::day_key_of_ts(ts);
         let dev = "HID#VID_AAAA&PID_BBBB".to_string();
@@ -1857,7 +1867,7 @@ mod tests {
         };
         let base = db_count();
 
-        let w2 = DbWriter::start(Duration::from_secs(3600));
+        let w2 = start_writer(Duration::from_secs(3600));
         w2.flush(true);
         let deadline = Instant::now() + Duration::from_secs(15);
         while w2.flush_seq() == 0 && Instant::now() < deadline {
@@ -1874,7 +1884,7 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("recovery");
 
-        let w = DbWriter::start(Duration::from_secs(3600));
+        let w = start_writer(Duration::from_secs(3600));
         let ts = queries::now_ts();
         w.record("A", ts);
         w.record("A", ts);
@@ -1901,7 +1911,7 @@ mod tests {
         };
         let base = db_count();
 
-        let w2 = DbWriter::start(Duration::from_secs(3600));
+        let w2 = start_writer(Duration::from_secs(3600));
         assert!(w2.today_count() >= 2, "回放的今日计数应计入缓存基准");
         assert_eq!(w2.flush_seq(), 0);
         w2.flush(true);

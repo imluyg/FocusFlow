@@ -109,12 +109,23 @@ fn spawn_tray_updater(app: &App, paused_icon: tauri::image::Image<'static>) {
                 } else {
                     String::new()
                 };
+                // 启动自检有失败项时在 tooltip 里带上计数（B15）：
+                // start_to_tray 时主窗口可能根本没开，前端 toast 看不见，
+                // 托盘是常驻的唯一出口。更新线程本来就每 5 秒重写 tooltip，
+                // 挂在这里就不会跟别处抢写。
+                let fails = state.startup_report.iter().filter(|c| !c.ok).count();
+                let check_str = if fails > 0 {
+                    format!(" · ⚠ 自检 {fails} 项异常")
+                } else {
+                    String::new()
+                };
                 let tooltip = format!(
-                    "FocusFlow - 今日 {} · 速度 {}/分{}{}",
+                    "FocusFlow - 今日 {} · 速度 {}/分{}{}{}",
                     s.today_count,
                     s.cpm,
                     active_str,
-                    if paused { " · 已暂停" } else { "" }
+                    if paused { " · 已暂停" } else { "" },
+                    check_str,
                 );
                 (
                     tooltip,
