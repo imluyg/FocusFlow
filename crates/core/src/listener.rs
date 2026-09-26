@@ -572,15 +572,29 @@ impl InputListener {
                     return;
                 }
                 if *delta_y == 0 {
+                    // 亚格滚动（高分辨率/平滑滚轮，rdev 整除后只剩 0）：幅度信息
+                    // 在 rdev 的 `delta / WHEEL_DELTA` 里已被销毁，事件只剩"动过"
+                    // 而不知道动了多少 —— 记 1 会把一次平滑滚动刷成几百次，只能丢。
+                    // 真要按格计亚格滚动，得绕开 rdev 直接读 Raw Input（设备侧
+                    // 信道那套），那是另一个口径的工程。
                     return;
                 }
                 let direction = scroll_direction(*delta_y);
-                // 连续滚动合并
+                // 连续滚动合并（窗口限速锚在上一次计数，见 is_new_scroll_burst_at）
                 if !self.is_new_scroll_burst(direction) {
                     return;
                 }
+                // rdev 交付的 delta_y 已经是**格数**（原始 delta 被它整除过）。
+                // 一条消息携带 N 格 = 物理上滚了 N 格（Windows/驱动的输入合并），
+                // 按 N 计而不是 1；合并窗口照旧只判这一次 —— 窗口内被合并掉的
+                // 事件属于同一段甩动，与「每满一个窗口最多计一批」的口径一致。
+                // 上限只为挡异常驱动刷爆计数（消息里物理上限约 ±273 格）。
+                const MAX_WHEEL_NOTCHES_PER_EVENT: i64 = 16;
+                let notches = (*delta_y).abs().clamp(1, MAX_WHEEL_NOTCHES_PER_EVENT);
                 let name = format!("滚轮{}滑", direction);
-                self.record_event(db, &name);
+                for _ in 0..notches {
+                    self.record_event(db, &name);
+                }
             }
             EventType::MouseMove { .. } => {}
         }
@@ -915,11 +929,12 @@ mod tests {
         );
 
         l.cfg.mouse_enabled.store(true, Ordering::Relaxed);
+        // delta_y 的语义是 rdev 整除后的**格数**（不是原始 delta）：1 = 一格
         l.process_event(
             &db,
             &ev(rdev::EventType::Wheel {
                 delta_x: 0,
-                delta_y: 120,
+                delta_y: 1,
             }),
         );
         assert_eq!(hits.load(Ordering::Relaxed), 2);
@@ -927,7 +942,7 @@ mod tests {
             &db,
             &ev(rdev::EventType::Wheel {
                 delta_x: 0,
-                delta_y: 120,
+                delta_y: 1,
             }),
         );
         assert_eq!(hits.load(Ordering::Relaxed), 2, "窗口内同方向滚轮应合并");
@@ -935,13 +950,57 @@ mod tests {
             &db,
             &ev(rdev::EventType::Wheel {
                 delta_x: 0,
-                delta_y: -120,
+                delta_y: -1,
             }),
         );
         assert_eq!(hits.load(Ordering::Relaxed), 3, "方向切换应计数");
 
         crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 多格合并上报（§九·2）：Windows/驱动会把快速滚动**合并进一条消息**
+    /// （delta_y = 物理格数，rdev 交付的已是整除后的格数）。物理 3 格要计 3 次，
+    /// 不能只计 1；窗口限速（§九）与亚格丢弃的口径不能被这刀破坏。
+    #[test]
+    fn wheel_event_carrying_multiple_notches_counts_each() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("listener_wheel_multi");
+        let db = crate::db::Database::init_readonly();
+        let l = InputListener::new(test_config(), new_pause_flag());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_cb = Arc::clone(&hits);
+        l.add_key_callback(Arc::new(move |_| {
+            hits_cb.fetch_add(1, Ordering::Relaxed);
+        }));
+        let ev = |dy: i64| rdev::Event {
+            event_type: rdev::EventType::Wheel {
+                delta_x: 0,
+                delta_y: dy,
+            },
+            name: None,
+            time: SystemTime::now(),
+        };
+
+        // 一条消息 3 格：物理 3 格计 3 次
+        l.process_event(&db, &ev(3));
+        assert_eq!(hits.load(Ordering::Relaxed), 3, "多格消息应按格数计数");
+
+        // 同方向 0.25s 窗口内的下一个事件照旧被合并（限速没被这刀削弱）
+        l.process_event(&db, &ev(2));
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            3,
+            "窗口内同方向事件应照旧合并"
+        );
+
+        // 反方向立刻计数（2 格计 2 次）
+        l.process_event(&db, &ev(-2));
+        assert_eq!(hits.load(Ordering::Relaxed), 5, "方向切换照旧按格计数");
+
+        // 亚格事件（rdev 整除后为 0）：信息已销毁，丢弃且不改变窗口锚
+        l.process_event(&db, &ev(0));
+        assert_eq!(hits.load(Ordering::Relaxed), 5, "亚格事件不应计数");
     }
 
     /// 暂停位必须是**共享**的那一份：`set_paused`/`toggle_pause` 翻动的就是设备侧信道
