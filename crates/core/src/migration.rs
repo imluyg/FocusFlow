@@ -9,6 +9,9 @@
 //!   再通过聚合迁移落进 daily/hourly/key 三张聚合表并压缩文件；
 //!   按天的**活跃时长**单独并（明细里没有时长信息，旧库存在 `active_seconds` 表
 //!   或 `daily_counts.seconds` 里，同一天取两侧较大值 —— 幂等且不覆盖新值）
+//! - 重复导入靠源文件指纹（大小+mtime）跳过；指纹变了但 key_log **内容**没变
+//!   （复制/云盘摸过 mtime 的同一份文件）靠内容指纹（行数+最大时间戳）跳过 ——
+//!   聚合是累加式，把同一批明细再聚一遍就是整体翻倍
 //! - 附属库（accounting/pomodoro/scheduler/edge_history）：整体复制覆盖，
 //!   **覆盖前先把现有库改名留档**（见 [`backup_before_overwrite`]）——
 //!   导入目录由用户自己选，选错目录不能让当前数据凭空消失
@@ -194,8 +197,8 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
     // 目标库已存在：源文件未变化（大小+修改时间一致）→ 已导入过，跳过
     if let Ok(meta) = std::fs::metadata(&src_path) {
         let marker = read_import_marker(&dst_path).unwrap_or(None);
-        let same_size = marker.map(|(s, _)| s) == Some(meta.len());
-        let same_mtime = match (marker.and_then(|(_, m)| m), meta.modified().ok()) {
+        let same_size = marker.as_ref().map(|m| m.size) == Some(meta.len());
+        let same_mtime = match (marker.as_ref().and_then(|m| m.mtime), meta.modified().ok()) {
             (Some(a), Some(b)) => {
                 let a_s = a
                     .duration_since(std::time::UNIX_EPOCH)
@@ -223,18 +226,32 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
     // 早就只剩聚合表（暂存明细聚合完就被丢弃），那种库走不到下面那段。
     merge_active_seconds_from_src(&src_conn, &dst_conn)?;
 
-    // 确认源库有 key_log 表
-    let has_src_table: bool = src_conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='key_log'",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok();
-    if !has_src_table {
+    // 源库 key_log 的内容指纹：没有这张表就是"只剩聚合表"，没有明细可导。
+    let Some(kl_now) = key_log_fingerprint(&src_conn)? else {
         return Ok(0);
+    };
+
+    // 大小/mtime 变了、key_log 内容却逐行没变 —— 同一份旧库被资源管理器复制、
+    // 云盘同步或备份还原摸过 mtime 都是这个形状 —— 一行新增明细都没有。
+    // 暂存表在上轮聚合后已清空，对它没有任何记忆：照旧往下走，整套旧明细会
+    // 被**再聚合一遍**，而 migrate_v2 是累加式（`count = count + excluded`），
+    // 那一年就整体翻倍，界面上没有任何提示。
+    if let Some((c0, t0)) = read_import_marker(&dst_path)
+        .unwrap_or(None)
+        .and_then(|m| m.key_log)
+    {
+        if (c0, t0) == kl_now {
+            tracing::info!("{year} 年源库明细内容未变（仅文件时间戳变了），跳过重复导入");
+            return Ok(0);
+        }
     }
-    merge_active_seconds_from_src(&src_conn, &dst_conn)?;
+    // 已知局限（判定不修，留档）：源库**真的追加过**新明细时，这里仍会整份重聚合，
+    // 与上次导入的重叠段翻倍。要修就得按 `timestamp > 上次最大值` 过滤或保留暂存表
+    // 当去重记忆 —— 前者会把"另一份更早的旧目录里独有的历史"挡在外面（多源回填
+    // 是导入对话框明说的用法），后者要放弃"聚合后连表丢掉"的压缩设计。两个代价
+    // 都比它想救的场景（旧版在两次导入之间还在写数据）大，交给指纹守卫 + 本条留档。
+    // 注意 `imported` 计数与 `records_by_year` 报的是**本次暂存命中数**，重聚合
+    // 不区分新旧 —— 界面上"导入 N 条"偏大是这条局限的可见症状。
 
     // 暂存表按需创建：确认源库确实有明细才建，避免在目标库留下空表 + 唯一索引
     // （运行期不写它，无条件建表会让每个年度库白占 2~4 页）
@@ -331,7 +348,30 @@ fn merge_active_seconds_from_src(src: &Connection, dst: &Connection) -> anyhow::
     Ok(gained)
 }
 
-/// 记录源文件指纹（大小 + 修改时间）到目标库 meta，用于重复导入检测。
+/// 源库 key_log 的内容指纹：(行数, 最大时间戳)。没有这张表返回 None。
+///
+/// 行数 + 最大时间戳足以分辨"这份旧库的明细变没变"：key_log 是按键发生时
+/// 逐条追加的，内容没变时两者恒定，摸一摸 mtime 不会动它们。反推不成立
+/// （两份不同内容可能撞上同一对数）不碍事 —— 误判的代价只是少跳过一次
+/// 幂等的导入，而**不是**漏导或翻倍。
+fn key_log_fingerprint(conn: &Connection) -> anyhow::Result<Option<(i64, i64)>> {
+    let has = conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='key_log'",
+        [],
+        |_| Ok(()),
+    );
+    if has.is_err() {
+        return Ok(None);
+    }
+    let row = conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(timestamp), 0) FROM key_log",
+        [],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    )?;
+    Ok(Some(row))
+}
+
+/// 记录源文件指纹（大小 + 修改时间 + key_log 内容）到目标库 meta，用于重复导入检测。
 fn record_import_marker(dst_path: &Path, src_path: &Path) -> anyhow::Result<()> {
     let meta = std::fs::metadata(src_path)?;
     let conn = connection::open_rw(dst_path)?;
@@ -348,13 +388,35 @@ fn record_import_marker(dst_path: &Path, src_path: &Path) -> anyhow::Result<()> 
             .map(|d| d.as_secs().to_string())
             .unwrap_or_default()],
     )?;
+    // key_log 内容指纹：内容没变、只有 mtime 变的再导入要靠它跳过（见
+    // import_year_db 的内容比对）。源库没有 key_log 时不写 —— 读取侧两个键
+    // 缺任一个都按"没有指纹"处理，与旧版本留下的标记兼容。
+    if let Some(kl) = Connection::open(src_path)
+        .ok()
+        .and_then(|c| key_log_fingerprint(&c).ok().flatten())
+    {
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('imported_src_kl_count', ?1)",
+            [kl.0.to_string()],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('imported_src_kl_maxts', ?1)",
+            [kl.1.to_string()],
+        )?;
+    }
     Ok(())
 }
 
-/// 读取导入指纹：(大小, 修改时间)。
-fn read_import_marker(
-    dst_path: &Path,
-) -> anyhow::Result<Option<(u64, Option<std::time::SystemTime>)>> {
+/// 导入标记：源文件指纹 + 上次导入时源库 key_log 的内容指纹。
+struct ImportMarker {
+    size: u64,
+    mtime: Option<std::time::SystemTime>,
+    /// (行数, 最大时间戳)；旧版本留下的标记没有这两个键 → None。
+    key_log: Option<(i64, i64)>,
+}
+
+/// 读取导入标记。
+fn read_import_marker(dst_path: &Path) -> anyhow::Result<Option<ImportMarker>> {
     let conn = connection::open_ro(dst_path)?;
     let size: Option<String> = conn
         .query_row(
@@ -370,17 +432,32 @@ fn read_import_marker(
             |r| r.get(0),
         )
         .ok();
-    match (size, mtime) {
-        (Some(sz), Some(mt)) => {
-            let size = sz.parse::<u64>().unwrap_or(0);
-            let mtime = mt
-                .parse::<u64>()
-                .ok()
-                .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
-            Ok(Some((size, mtime)))
-        }
-        _ => Ok(None),
-    }
+    let kl_count: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'imported_src_kl_count'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let kl_maxts: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'imported_src_kl_maxts'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let Some(sz) = size else {
+        return Ok(None);
+    };
+    Ok(Some(ImportMarker {
+        size: sz.parse::<u64>().unwrap_or(0),
+        mtime: mtime
+            .and_then(|mt| mt.parse::<u64>().ok())
+            .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+        key_log: kl_count.zip(kl_maxts),
+    }))
 }
 
 #[cfg(test)]
@@ -452,5 +529,85 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".import-backup-"))
             .collect();
         assert_eq!(kept.len(), 1, "被覆盖的现有库必须留档一份");
+    }
+
+    /// 同一份旧库、内容一行没变、只是 mtime 变了（资源管理器复制一份、云盘
+    /// 同步、备份还原都是这个形状）→ 再导入一次**不得**把那一年翻倍。
+    ///
+    /// 大小+mtime 的指纹守卫挡不住这个形状（mtime 变了就照常往下走），而暂存表
+    /// 在上轮聚合后已经连表丢掉、对导过什么毫无记忆，聚合又是累加式 —— 没有
+    /// 内容指纹这一刀，整套旧明细会被再聚一遍，统计翻倍且无任何提示。
+    /// 注掉内容比对（注回旧行为）这条必红。
+    #[test]
+    fn reimporting_unchanged_key_log_after_mtime_touch_does_not_double_count() {
+        use std::time::Duration;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("reimport");
+        let year = 2024i32;
+
+        // 源库：旧版形状（只有 key_log 明细），100 条落进同一天
+        let src_dir = _dir.path().join("old");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join(format!("focusflow_{year}.db"));
+        {
+            let c = Connection::open(&src).unwrap();
+            c.execute_batch(
+                "CREATE TABLE key_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    key_name TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+            for i in 0..100 {
+                c.execute(
+                    "INSERT INTO key_log (key_name, timestamp) VALUES (?1, ?2)",
+                    rusqlite::params![format!("k{}", i % 10), 1_700_000_000i64 + i],
+                )
+                .unwrap();
+            }
+        }
+        // 目标库：已存在的空年度库 → 走合并路径（而不是整文件复制）
+        let dst = paths::year_db_path(year);
+        {
+            let c = connection::open_rw(&dst).unwrap();
+            connection::ensure_schema(&c, year).unwrap();
+        }
+        let daily_total = || -> i64 {
+            connection::open_ro(&dst)
+                .unwrap()
+                .query_row(
+                    "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        let first = import_legacy_data(&src_dir);
+        assert_eq!(
+            first.records_by_year,
+            vec![(year, 100)],
+            "首次应导入全部 100 条明细"
+        );
+        assert_eq!(daily_total(), 100);
+
+        // 摸 mtime（往回拨一小时，避开"刚创建"的边界）：大小不变、时间戳变
+        let older = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+
+        let again = import_legacy_data(&src_dir);
+        assert_eq!(
+            again.records_by_year,
+            vec![(year, 0)],
+            "内容没变就没有任何新明细：{:?}",
+            again
+        );
+        assert_eq!(daily_total(), 100, "重导同内容不得把那一年翻倍");
     }
 }
