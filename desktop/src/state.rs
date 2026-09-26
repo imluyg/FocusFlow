@@ -1265,6 +1265,9 @@ fn spawn_stats_worker(
 
                 if do_heavy {
                     let flush_seq = db.writer().map(|w| w.flush_seq()).unwrap_or(0);
+                    // 今日未落库的增量：日均/周期总数两处展示值都要补上它
+                    // （读取与 flush_seq 同刻，聚合基于的库状态才自洽）。
+                    let pending_today = db.writer().map(|w| w.today_pending_count()).unwrap_or(0);
                     // period != 0 且库内容未变：跳过整轮重算与推送（活跃打字时每 2s
                     // 到期的重聚合，在没有新落库时全部是重复计算，这里是主要开销）
                     let charts_unchanged = !forced
@@ -1319,7 +1322,8 @@ fn spawn_stats_worker(
                         {
                             alltime_agg.clone().unwrap()
                         } else {
-                            let agg = compute_charts(period_val, alltime_max.clone());
+                            let agg =
+                                compute_charts(period_val, alltime_max.clone(), pending_today);
                             if period_val == 0 {
                                 alltime_agg = Some(agg.clone());
                             }
@@ -1572,7 +1576,11 @@ fn total_for_display(
 /// 数据一致性由读侧 busy_timeout 与写线程事务保证。
 /// `alltime_max` 为统计线程维护的全历史最高单日缓存（全表 ORDER BY 太贵，不在此重查；
 /// 传 None 时回退现查，供单测与无缓存路径使用）。
-fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartAgg {
+fn compute_charts(
+    period_val: i64,
+    alltime_max: Option<(String, i64)>,
+    pending_today: i64,
+) -> ChartAgg {
     let (total, key_stats) = match period_val {
         -1 => focusflow_core::db::get_stats_by_date(chrono::Local::now().date_naive()),
         0 => focusflow_core::db::get_stats(None, None),
@@ -1631,9 +1639,14 @@ fn compute_charts(period_val: i64, alltime_max: Option<(String, i64)>) -> ChartA
         Vec::new()
     };
     let avg = if counts.is_empty() {
-        0
+        // 窗口里还没有任何落库行（刚装好/今天还没落过）：今天若有未落库增量，
+        // 它就是窗口里唯一"有数据的一天"，日均即其本身（没数据 ≠ 0 的口径）。
+        pending_today.max(0)
     } else {
-        counts.iter().sum::<i64>() / counts.len() as i64
+        // 「日均不跟 pending 走」（§七 记档的不完美）：窗口一定以今天收尾，
+        // 把今天未落库的增量补进分子，分母不动 —— 与「总计」「近 N 天」卡片
+        // 的 total_for_display 同一口径。
+        (counts.iter().sum::<i64>() + pending_today) / counts.len() as i64
     };
     // 最高单日：今日/总计 = 全历史纪录（含日期）；N天 = 窗口内最大（含日期）。
     // 窗口值从 daily_all 取（已含落库后的今日），历史纪录跨库取。
@@ -1849,7 +1862,7 @@ mod compute_charts_tests {
         let _serial = crate::app_dir_lock();
         // 用隔离的临时程序目录，避免读到开发库（目录由返回值的 Drop 回收）
         let _app = focusflow_core::paths::test_app_dir("compute_charts");
-        let agg = compute_charts(0, None);
+        let agg = compute_charts(0, None, 0);
         assert_eq!(agg.total, 0);
         assert_eq!(agg.alltime_total, 0, "基准未构建时总计应为 0");
         assert_eq!(agg.rank.len(), 0);
@@ -1862,6 +1875,43 @@ mod compute_charts_tests {
             (0..7).map(|d| (d, 0)).collect::<Vec<(i64, i64)>>(),
             "星期分布应为 0..=6 七个槽位且按下标有序"
         );
+        focusflow_core::paths::set_app_dir(focusflow_core::paths::test_scratch_app_dir());
+    }
+
+    /// 「日均」必须把今天未落库的增量补进分子（§七 记档的"日均不跟 pending 走"）：
+    /// 窗口以今天收尾，与「总计」「近 N 天」卡片走 total_for_display 的口径一致。
+    #[test]
+    fn daily_avg_includes_today_pending() {
+        use chrono::Datelike;
+        let _serial = crate::app_dir_lock();
+        let _app = focusflow_core::paths::test_app_dir("avg_pending");
+        let today = chrono::Local::now().date_naive();
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let dk_today = (today - epoch).num_days();
+        let dk_yesterday = dk_today - 1;
+        {
+            let path = focusflow_core::paths::year_db_path(today.year());
+            let conn = focusflow_core::db::connection::open_rw(&path).unwrap();
+            focusflow_core::db::connection::ensure_schema(&conn, today.year()).unwrap();
+            for (dk, n) in [(dk_today, 100), (dk_yesterday, 50)] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO daily_counts (date_key, count, seconds) VALUES ({dk}, {n}, 0)"
+                    ),
+                    [],
+                )
+                .unwrap();
+            }
+        }
+        focusflow_core::db::invalidate_years_cache();
+
+        // 今日周期：窗口 = [今天落库 100]，补上未落库 37 → 日均 137
+        let agg = compute_charts(-1, None, 37);
+        assert_eq!(agg.avg, 137, "今日日均 = 落库 + 未落库");
+        // 30 天窗口：分母 30（零填充稠密），分子 = 落库 150 + 未落库 37
+        let agg = compute_charts(0, None, 37);
+        assert_eq!(agg.avg, (150 + 37) / 30, "30 天日均的分子含未落库增量");
+
         focusflow_core::paths::set_app_dir(focusflow_core::paths::test_scratch_app_dir());
     }
 
