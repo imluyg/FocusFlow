@@ -16,6 +16,10 @@
 **/focusflow_export.csv
 **/focusflow_export.html
 
+# .scratch/package.sh 每次打包都在**仓库根**重写的构建日志（挪进 .scratch 也没用，
+# 它下次打包还会写回来，见交接文档 §八·3）
+/pkg.txt
+
 # Tauri 构建产物与打包目录（含用户数据，不入库）
 /dist-tauri/
 /desktop/gen/
