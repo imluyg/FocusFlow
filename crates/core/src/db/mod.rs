@@ -178,13 +178,19 @@ mod tests {
         let dir = crate::paths::test_app_dir("db_init_checks");
         // 危险子系统全部关掉（设备统计会起 Raw Input 循环、在线备份会写盘），
         // flush_interval 给到一年：用例结束后不得有任何后台线程再碰这个临时目录
-        // （§八·2 那类泄漏）。
+        // （§八·2 那类泄漏）。值直接预置进文件，**不走 set()**：set 会把信号发给
+        // 全局去抖保存线程，那个线程存的是全局 INSTANCE —— 而它可能已被某个
+        // 不死线程（采样/备份）在**别的用例的目录**里惰性初始化过，300ms 后一次
+        // 落盘就把那个已删的目录原样建回来（实测每轮 +1 个只剩 config.ini 的
+        // ff_archive_*，就是这么来的）。
+        std::fs::write(
+            dir.path().join("config.ini"),
+            "[device_stats]\nenabled = false\n\
+             [database]\nonline_backup_interval_hours = 0\n\
+             backup_on_exit = false\nflush_interval = 31536000\n",
+        )
+        .unwrap();
         let cfg = crate::config::FocusFlowConfig::load(dir.path().join("config.ini")).unwrap();
-        cfg.set("device_stats", "enabled", "false").unwrap();
-        cfg.set("database", "online_backup_interval_hours", "0")
-            .unwrap();
-        cfg.set("database", "backup_on_exit", "false").unwrap();
-        cfg.set("database", "flush_interval", "31536000").unwrap();
 
         let paused = crate::listener::new_pause_flag();
         let db = Database::init(&cfg, paused).expect("init 应成功");

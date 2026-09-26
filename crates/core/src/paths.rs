@@ -76,12 +76,26 @@ impl TestAppDir {
 #[cfg(any(test, feature = "test-utils"))]
 impl Drop for TestAppDir {
     fn drop(&mut self) {
-        // 先放掉本线程池子里的只读连接，再删目录。
-        // Windows 上目录里还有打开的句柄时 remove_dir_all 会失败，而这些测试正是
-        // 靠 with_ro_conn 的线程本地缓存反复读年度库的 —— 不先清缓存，删除就静默
-        // 返回 Err，于是每个用例每跑一次留一个目录（实测所有前缀一律 +1/run）。
+        // 先把全局 app_dir 撤到哨兵，再放只读连接、删目录。
+        // ① 用例留下的后台线程（写线程的收尾竞态、Database::init 带起的
+        //    采样/备份这类不死线程、将来任何惰性解析 app_dir 的代码）在此刻
+        //    之后解析到的是 target/ 的哨兵，而不是把刚删掉的目录原样建回来 ——
+        //    实测泄漏目录里只有一份 config.ini 或一份年度库，正是这个形状。
+        // ② Windows 上句柄没放完时 remove_dir_all 会静默失败：这些测试正是
+        //    靠 with_ro_conn 的线程本地缓存反复读年度库的 —— 不先清缓存，
+        //    删除就返回 Err，每个用例每跑一次留一个目录（历史上所有前缀一律
+        //    +1/run，所以哨兵之后还要 clear_ro_cache）。
+        set_app_dir(test_scratch_app_dir());
         crate::db::connection::clear_ro_cache();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // 句柄释放有竞态（写线程先清 alive 标志、连接在其后析构）：remove
+        // 撞上未释放的句柄会失败，重试几轮等它放干净；目录已经不在了就当成功。
+        for _ in 0..20 {
+            match std::fs::remove_dir_all(&self.dir) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
     }
 }
 
