@@ -8,6 +8,7 @@
 /plugins/
 **/config.ini
 **/config.ini.corrupt-*
+**/config.ini.bak
 **/window_state.ini
 **/dist/
 
