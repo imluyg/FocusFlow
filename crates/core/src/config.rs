@@ -7,7 +7,7 @@
 //!
 //! 注意：Python 版配置大量使用中文值与按键名，config crate 需按 UTF-8 处理。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Duration;
@@ -181,34 +181,202 @@ fn parse_ini(text: &str) -> HashMap<String, HashMap<String, String>> {
     out
 }
 
-/// 把文件里"内存从没有过"的键回填进待写快照（内存里已有的键一律以内存为准）。
+/// 逐行重写：**只替换自己认识的键行**，其余一律逐字保留。
 ///
-/// `save()` 写的是内存快照，而本项目到处是"你去 config.ini 里加一行"的提示语
-/// （例如 `[scheduler] allow_extra`，见 scheduler.rs 的拒绝原因文案）。不回填的话，
-/// 用户照提示加完那一行，下一次任何一次设置变更 —— 甚至只是拖动悬浮窗写
-/// `[floating] pos_x` —— 就把他手加的键整个抹掉。
-/// 废弃键不参与回填：`load()` 刻意把它们清掉，回填等于复活它们。
-fn merge_unknown_keys(
-    snapshot: &mut HashMap<String, HashMap<String, String>>,
-    path: &std::path::Path,
-) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return; // 文件不存在/正被占用：本次照旧只写内存快照
-    };
-    for (section, keys) in parse_ini(&text) {
-        for (key, val) in keys {
-            if DEPRECATED_CONFIG
-                .iter()
-                .any(|(s, ks)| *s == section && ks.contains(&key.as_str()))
-            {
-                continue;
+/// 旧实现是「从内存快照整份重建」：用户手写的注释行、空行、节内顺序全部被抹掉，
+/// 节头之前游离的键也会被丢。本项目到处是"你去 config.ini 里加一行"的提示语
+/// （`[scheduler] allow_extra` 就是 scheduler 拒绝启动某程序时给的话），用户照着
+/// 加的任何一行、写的任何一条注释，都不该被下一次保存抹掉。
+///
+/// 规则：
+/// - 注释行 / 空行 / 解析不了的杂行 / 文件里有而内存里没有的键（含游离在节头前的）→ 原样保留；
+/// - 内存里认识的键 → 原位替换成 `key = value`（值以内存为准，规则与旧 `merge_unknown_keys` 一致）；
+/// - 废弃键（[`DEPRECATED_CONFIG`]）→ 整行丢掉：`load()` 刻意清理它们，回写等于复活；
+/// - 快照里有、文件里没有的键 → 追加到所在**节尾**；整节都没有 → 追加到文件末尾
+///   （有固定序的按固定序，其余按名字排 —— 旧重建用 HashMap 迭代序，每次保存都可能变）；
+/// - 键全被清掉的节连节头一起丢（留个空节头只会让人以为那里还有什么可配）；
+///   还留着注释/未知键的节保留节头 —— 不替用户做主删他写的东西。
+fn serialize_preserving_structure(
+    snapshot: &HashMap<String, HashMap<String, String>>,
+    original: &str,
+) -> String {
+    // 开头 BOM 先剥掉（PowerShell `>`、记事本另存为都会写，见 parse_ini 的注释）：
+    // 保留它等于每次回写都把 `\u{FEFF}` 带回文件开头。
+    let original = original.strip_prefix('\u{feff}').unwrap_or(original);
+    let mut out = String::new();
+    // 已在文件里输出过的键：节尾追加"新增键"时靠它排除
+    let mut seen_keys: HashSet<(String, String)> = HashSet::new();
+    let mut seen_sections: HashSet<String> = HashSet::new();
+    // 当前节的输出缓冲。节头去留要等整个节扫完才知道（键可能全被废弃清掉），
+    // 所以先攒着，节结束（下一个节头/EOF）时统一结算。
+    let mut cur: Option<(String, Vec<String>)> = None;
+
+    for line in original.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if let Some((section, lines)) = cur.take() {
+                flush_section(
+                    &mut out,
+                    &mut seen_keys,
+                    &mut seen_sections,
+                    snapshot,
+                    section,
+                    lines,
+                );
             }
-            snapshot
-                .entry(section.clone())
-                .or_default()
-                .entry(key)
-                .or_insert(val);
+            cur = Some((
+                trimmed[1..trimmed.len() - 1].trim().to_string(),
+                vec![line.to_string()],
+            ));
+            continue;
         }
+        let Some((section, lines)) = cur.as_mut() else {
+            // 节头之前的行：旧实现整行丢掉。逐字保留是本次要修的一部分。
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            lines.push(line.to_string());
+            continue;
+        }
+        let Some(eq) = trimmed.find('=') else {
+            lines.push(line.to_string());
+            continue;
+        };
+        let key = trimmed[..eq].trim();
+        if DEPRECATED_CONFIG
+            .iter()
+            .any(|(s, ks)| *s == section.as_str() && ks.contains(&key))
+        {
+            continue;
+        }
+        match snapshot.get(section.as_str()).and_then(|m| m.get(key)) {
+            Some(v) => {
+                lines.push(format!("{key} = {v}"));
+                seen_keys.insert((section.clone(), key.to_string()));
+            }
+            // 文件里有、内存里没有（load 之后才手加进文件的键走这里）：原样保留
+            None => lines.push(line.to_string()),
+        }
+    }
+    if let Some((section, lines)) = cur.take() {
+        flush_section(
+            &mut out,
+            &mut seen_keys,
+            &mut seen_sections,
+            snapshot,
+            section,
+            lines,
+        );
+    }
+
+    // 快照里还有整节没出现过的：追加到文件末尾
+    let order = [
+        "database", "stats", "listener", "gui", "hotkey", "floating", "pomodoro", "rest",
+    ];
+    let mut remaining: Vec<&String> = snapshot
+        .keys()
+        .filter(|s| !seen_sections.contains(*s))
+        .collect();
+    remaining.sort_by(|a, b| {
+        let pa = order.iter().position(|o| o == *a).unwrap_or(usize::MAX);
+        let pb = order.iter().position(|o| o == *b).unwrap_or(usize::MAX);
+        pa.cmp(&pb).then_with(|| a.cmp(b))
+    });
+    for section in remaining {
+        let keys = &snapshot[section.as_str()];
+        if keys.is_empty() {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str(&format!("[{section}]\n"));
+        let mut sorted: Vec<&String> = keys.keys().collect();
+        sorted.sort();
+        for key in sorted {
+            out.push_str(&format!("{key} = {}\n", keys[key.as_str()]));
+        }
+    }
+    out
+}
+
+/// 结算一个节：追加快照里这个节还没输出过的键，然后决定节头去留、写进 out。
+fn flush_section(
+    out: &mut String,
+    seen_keys: &mut HashSet<(String, String)>,
+    seen_sections: &mut HashSet<String>,
+    snapshot: &HashMap<String, HashMap<String, String>>,
+    section: String,
+    mut lines: Vec<String>,
+) {
+    seen_sections.insert(section.clone());
+    if let Some(keys) = snapshot.get(&section) {
+        let mut new_keys: Vec<&String> = keys
+            .keys()
+            .filter(|k| !seen_keys.contains(&(section.clone(), (*k).clone())))
+            .collect();
+        new_keys.sort();
+        for key in new_keys {
+            lines.push(format!("{key} = {}", keys[key.as_str()]));
+        }
+    }
+    // 节头之外还有内容（键/注释，空行不算）才保留整节
+    let has_content = lines[1..].iter().any(|l| !l.trim().is_empty());
+    if !has_content {
+        return;
+    }
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+}
+
+/// 整份从内存重建（旧 save 的行为）。只在原文件读不到时兜底：
+/// 那种情况下逐行重写同样没有输入可用，注释/未知键本来就已无处可保。
+fn serialize_rebuilt(snapshot: &HashMap<String, HashMap<String, String>>) -> String {
+    let mut out = String::new();
+    // 固定 section 顺序，与 Python 版一致，便于阅读与 diff。
+    let order = [
+        "database", "stats", "listener", "gui", "hotkey", "floating", "pomodoro", "rest",
+    ];
+    let mut sections: Vec<&String> = snapshot.keys().collect();
+    sections.sort_by_key(|s| order.iter().position(|o| o == s).unwrap_or(usize::MAX));
+    for section in sections {
+        let mut keys: Vec<&String> = snapshot[section].keys().collect();
+        if keys.is_empty() {
+            // 一个键都没有就整节不写：清掉废弃键之后可能把一整节掏空
+            // （`[tray]` 以前只剩 tooltip_interval 一个死键），留个空节头
+            // 只是让人以为那里还有什么可配。
+            continue;
+        }
+        out.push_str(&format!("[{section}]\n"));
+        keys.sort();
+        for key in keys {
+            out.push_str(&format!("{} = {}\n", key, snapshot[section][key]));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// 首次「逐行重写」前把原文件留一份 `.bak`（只留第一份，之后不覆盖）。
+///
+/// 这是对唯一一份用户配置的结构性改动：`atomic_write` 只保证"不写半截"，
+/// 不保证"写出来的内容一定对"。留一份改动前的原貌，最坏情况照它手工恢复。
+fn backup_original_once(path: &Path, original: &str) {
+    let mut name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(".bak");
+    let bak = path.with_file_name(name);
+    if bak.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&bak, original) {
+        tracing::warn!("配置备份（{}）写入失败: {e}", bak.display());
     }
 }
 
@@ -298,30 +466,16 @@ impl FocusFlowConfig {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut snapshot = snapshot;
-        merge_unknown_keys(&mut snapshot, &self.path);
-        let mut out = String::new();
-        // 固定 section 顺序，与 Python 版一致，便于阅读与 diff。
-        let order = [
-            "database", "stats", "listener", "gui", "hotkey", "floating", "pomodoro", "rest",
-        ];
-        let mut sections: Vec<&String> = snapshot.keys().collect();
-        sections.sort_by_key(|s| order.iter().position(|o| o == s).unwrap_or(usize::MAX));
-        for section in sections {
-            let mut keys: Vec<&String> = snapshot[section].keys().collect();
-            if keys.is_empty() {
-                // 一个键都没有就整节不写：清掉废弃键之后可能把一整节掏空
-                // （`[tray]` 以前只剩 tooltip_interval 一个死键），留个空节头
-                // 只是让人以为那里还有什么可配。
-                continue;
+        // 原文件读得到 → 逐行重写（保注释/空行/节序/未知键，见函数注释）；
+        // 读不到（被占用/刚被删）→ 退回整份重建：那种情况下逐行重写同样没有
+        // 输入可用，"文件里有而内存没有"的键本来就已无处可保，与旧行为一致。
+        let out = match std::fs::read_to_string(&self.path) {
+            Ok(original) => {
+                backup_original_once(&self.path, &original);
+                serialize_preserving_structure(&snapshot, &original)
             }
-            out.push_str(&format!("[{section}]\n"));
-            keys.sort();
-            for key in keys {
-                out.push_str(&format!("{} = {}\n", key, snapshot[section][key]));
-            }
-            out.push('\n');
-        }
+            Err(_) => serialize_rebuilt(&snapshot),
+        };
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -706,6 +860,67 @@ work_minutes = 45
         assert!(
             !after.contains("today_count_cache_ttl"),
             "废弃键不该靠回填复活:\n{after}"
+        );
+    }
+
+    /// save() 必须逐行重写：注释、空行、节序、未知键逐字保留，认识的键只换值、
+    /// 原位不动。旧实现（从快照整份重建）会把这条用例里的注释与节序全部抹掉 ——
+    /// 他文件里暂时还没有注释行（所以一直没咬到人），但"你去 config.ini 加一行"
+    /// 的提示语到处都是，注释与手写行迟早出现。
+    #[test]
+    fn save_preserves_comments_blank_lines_and_unknown_keys() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("cfg_comments");
+        let path = dir.path().join("config.ini");
+        std::fs::write(
+            &path,
+            concat!(
+                "# 顶部的用户注释\n",
+                "[listener]\n",
+                "; 分号注释：滚轮节奏自己调过\n",
+                "scroll_burst_window = 0.8\n",
+                "mouse_enabled = true\n",
+                "\n",
+                "[custom]\n",
+                "my_note = hello\n",
+            ),
+        )
+        .unwrap();
+
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+        // 改一个内存值再保存。刻意不走 set()：它把信号发给全局去抖保存线程，
+        // 那个线程写的是 instance() 的路径，不是这里的临时目录。
+        cfg.values
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut("listener")
+            .unwrap()
+            .insert("scroll_burst_window".to_string(), "0.25".to_string());
+        cfg.save().unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# 顶部的用户注释") && after.contains("; 分号注释：滚轮节奏自己调过"),
+            "注释必须逐字活着:\n{after}"
+        );
+        assert!(
+            after.contains("scroll_burst_window = 0.25") && !after.contains("= 0.8"),
+            "认识的键要换成内存的新值:\n{after}"
+        );
+        assert!(
+            after.contains("my_note = hello"),
+            "内存不认识的键（整个 [custom] 节）必须原样保留:\n{after}"
+        );
+        let listener = after.find("[listener]").expect("listener 节头还在");
+        let custom = after.find("[custom]").expect("custom 节头还在");
+        assert!(listener < custom, "文件里原有的节序不许被重排:\n{after}");
+        assert!(
+            after.contains("mouse_enabled = true"),
+            "同节没动过的键不许被新键挤掉:\n{after}"
+        );
+        assert!(
+            after.contains("ignore_function_keys"),
+            "快照里有、文件里没有的键要追加到节尾（证明确实重写过）:\n{after}"
         );
     }
 }
