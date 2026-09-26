@@ -110,6 +110,88 @@ fn interface_tag(device_key: &str) -> Option<String> {
     None
 }
 
+/// 设备**归组键**（B14-2）：实例路径 `#` 分段后的硬件身份段。
+///
+/// 完整实例路径是 `枚举器#硬件ID#实例号` 三段（如
+/// `HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000`），原来整串当 device_key：
+/// 第三段的连接拓扑实例号换 USB 口就变 —— 同一台设备被拆成多行，计数从零开始、
+/// 别名不跟。真正的硬件身份是中间那段 `VID_xxx&PID_yyy&MI_00`（型号 + 接口；
+/// 接口段区分复合设备的键鼠两面，理由同 [`model_key`]）。
+///
+/// **硬取舍**（写在这里，别处别再猜）：Raw Input 拿不到 USB 序列号，同型号且
+/// 同接口的多台设备（两只一样的鼠标、同一接收器下的多设备）在这个颗粒度
+/// 下必然并成一台 —— 这是「最细稳定粒度」，不是「唯一粒度」。反过来，
+/// 「只认完整路径」的旧键则是最细的**不稳定**粒度，换一次口就丢一段历史。
+///
+/// 非 `A#B#C` 三段形态的键原样返回：形状认不准时不并（宁可保持原状，
+/// 也不把两台不同的设备错并到一起）。已迁移过的键（本身就是身份段，无 `#`）
+/// 原样返回 → 本函数幂等，重复迁移是空操作。
+pub fn hardware_identity_key(device_key: &str) -> String {
+    let parts: Vec<&str> = device_key.split('#').collect();
+    if parts.len() >= 3 && !parts[1].trim().is_empty() {
+        parts[1].to_string()
+    } else {
+        device_key.to_string()
+    }
+}
+
+/// 一次性迁移：把别名文件里挂在**完整实例路径**上的精确别名改挂到身份键上
+/// （B14-2 的配套 —— device_key 换了，别名跟着走）。
+///
+/// 两个旧路径迁成同一个身份键（同一台设备换过口，或本来就是并组取舍内的
+/// 同型号设备）而别名不同时，保留 BTreeMap 序在前的那个（确定性），
+/// 被挤掉的记一条 warn —— 型号级回退（`model_key`）对两种键都还能命中，
+/// 丢的只是「分口精确别名」这一层。
+///
+/// 幂等：身份键经 [`hardware_identity_key`] 原样返回，重复跑是空操作。
+/// 读不出文件（占用/损坏）时不动：等下次启动再试，别在内容可疑时覆盖。
+pub fn migrate_exact_keys_to_identity() {
+    let path = alias_path();
+    let map = match try_read_map(&path) {
+        AliasRead::Good(m) => m,
+        // Broken：原文已另存 .json.bad，从空表开始与 set() 的语义一致 ——
+        // 没有别名可迁，直接返回。
+        AliasRead::Broken => return,
+        AliasRead::Unreadable => {
+            tracing::warn!("设备别名迁移跳过：别名文件此刻读不出来，下次启动重试");
+            return;
+        }
+    };
+    let mut migrated: BTreeMap<String, String> = BTreeMap::new();
+    let mut changed = false;
+    for (key, alias) in &map {
+        let identity = hardware_identity_key(key);
+        if identity == *key {
+            migrated.insert(key.clone(), alias.clone());
+            continue;
+        }
+        changed = true;
+        match migrated.get(&identity) {
+            // 身份键已存在且来自别的旧路径：键序在前的赢（BTreeMap 迭代有序）
+            Some(existing) if existing != alias => {
+                tracing::warn!(
+                    "别名迁移：{key} 与已有条目并到同一身份键 {identity}，保留「{existing}」、丢弃「{alias}」"
+                );
+            }
+            Some(_) => {
+                // 同名别名：并入即可，不用记
+                let _ = &identity;
+            }
+            None => {
+                migrated.insert(identity, alias.clone());
+            }
+        }
+    }
+    if !changed {
+        return;
+    }
+    if let Err(e) = write_map(&migrated) {
+        tracing::error!("设备别名迁移写回失败（原文件未动）: {e}");
+    } else {
+        tracing::info!("设备别名迁移：精确键已从完整实例路径改挂到硬件身份键");
+    }
+}
+
 /// 别名文件路径。
 fn alias_path() -> PathBuf {
     paths::data_dir().join("device_aliases.json")
@@ -405,6 +487,77 @@ mod tests {
                 Some("触控板")
             );
             assert_eq!(table().resolve("HID#MSFT0001&Col01#另一个实例"), None);
+        });
+    }
+
+    /// B14-2：身份键的三段提取 + 幂等性。
+    #[test]
+    fn hardware_identity_key_extracts_the_middle_segment() {
+        // 标准三段：取中间
+        assert_eq!(
+            hardware_identity_key("HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000"),
+            "VID_046D&PID_C52B&MI_00"
+        );
+        // 换 USB 口只动第三段：身份不变 —— 这就是归组键要的稳定性
+        assert_eq!(
+            hardware_identity_key("HID#VID_046D&PID_C52B&MI_00#8&2c5f77d4&0&0001"),
+            "VID_046D&PID_C52B&MI_00"
+        );
+        // 接口段在键里：复合设备的键盘面与鼠标面不并组
+        assert_eq!(
+            hardware_identity_key("HID#VID_24AE&PID_1464&MI_01#7&2222&0&0001"),
+            "VID_24AE&PID_1464&MI_01"
+        );
+        // 已是身份键：原样返回（幂等，迁移重跑是空操作）
+        assert_eq!(
+            hardware_identity_key("VID_046D&PID_C52B&MI_00"),
+            "VID_046D&PID_C52B&MI_00"
+        );
+        // 形状认不准（只有两段 / 无 #）：不改 —— 宁可保持原状也不错并
+        assert_eq!(hardware_identity_key("HID#ORPHAN"), "HID#ORPHAN");
+        assert_eq!(hardware_identity_key("RDP_MOU"), "RDP_MOU");
+    }
+
+    /// B14-2：别名文件的精确键跟着 device_key 换轨。
+    #[test]
+    fn alias_exact_keys_migrate_to_identity() {
+        with_temp_dir("migrate_keys", || {
+            let old_a = "HID#VID_046D&PID_C52B&MI_00#7&OLD&0&0000";
+            let old_b = "HID#VID_046D&PID_C52B&MI_00#8&NEW&0&0001";
+            let kb = "VID_1B1C&PID_1B2D"; // 已是身份形态：必须原样保留
+            set(old_a, "办公鼠标").unwrap();
+            set(old_b, "家里那把").unwrap();
+            set(kb, "办公键盘").unwrap();
+            invalidate_cache();
+
+            migrate_exact_keys_to_identity();
+
+            // 两个旧路径同身份：保留一个（键序在前的），另一个被挤掉要留日志
+            let text = std::fs::read_to_string(alias_path()).unwrap();
+            assert!(
+                text.contains("VID_046D&PID_C52B&MI_00"),
+                "别名应改挂到身份键: {text}"
+            );
+            assert!(
+                !text.contains("#OLD") && !text.contains("#NEW"),
+                "完整路径键不该再留在别名文件里: {text}"
+            );
+            assert!(
+                text.contains("VID_1B1C&PID_1B2D"),
+                "已是身份键的原样保留: {text}"
+            );
+            // 新键上解析得到别名（换口后仍然命中，不再只靠型号回退）
+            assert_eq!(
+                table().resolve("VID_046D&PID_C52B&MI_00"),
+                Some("办公鼠标"),
+                "键序在前的赢（BTreeMap 序：#8 开头的键排在 #7 之后）"
+            );
+            assert_eq!(table().resolve(kb), Some("办公键盘"));
+
+            // 幂等：再跑一遍不再变化
+            migrate_exact_keys_to_identity();
+            let text2 = std::fs::read_to_string(alias_path()).unwrap();
+            assert_eq!(text, text2, "第二次迁移应是空操作");
         });
     }
 }

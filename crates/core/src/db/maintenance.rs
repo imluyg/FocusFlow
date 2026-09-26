@@ -999,6 +999,43 @@ pub fn sweep_stale_sidecars() -> usize {
     removed
 }
 
+/// 把**每个年度库**的设备归组键迁到硬件身份段（B14-2）。
+///
+/// `ensure_schema` 只在库被打开写入时跑：当前年度库启动必开，历史年度库通常
+/// 只被只读查询 —— 不主动跑一遍，跨年视图里同一台设备就是「2025 完整路径键 +
+/// 2026 身份键」两行。逐库 open_rw + ensure_schema（幂等，已迁过的库只剩一次
+/// EXISTS 的成本）。单个库失败（被占用等）记日志跳过：查询侧的跨年合并按身份
+/// 段认（`merge_device_rows`），显示不受影响，下次启动再试。
+pub fn migrate_all_year_device_keys() {
+    let dir = crate::paths::data_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(year) = name
+            .strip_prefix("focusflow_")
+            .and_then(|s| s.strip_suffix(".db"))
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let conn = match crate::db::connection::open_rw(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("设备归组键迁移跳过 {name}（打不开，可能被占用）: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = crate::db::connection::ensure_schema(&conn, year) {
+            tracing::error!("设备归组键迁移失败 {name}: {e}");
+        }
+    }
+}
+
 /// 启动运行中定时在线备份线程。
 ///
 /// 每 60 秒醒来重新读一次配置（`[database] online_backup_interval_hours`，0 = 关闭），
@@ -2208,8 +2245,9 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("archive_dev");
 
-        let dev = "HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000";
-        let other = "HID#VID_1B1C&PID_1B2D#other";
+        // B14-2 后库里的键是身份形态；本测试的靶子是跨库 id 重映射，与键形态无关
+        let dev = "VID_046D&PID_C52B&MI_00";
+        let other = "VID_1B1C&PID_1B2D";
         let dk = |y: i32, m: u32, d: u32| {
             queries::day_key_of_date(NaiveDate::from_ymd_opt(y, m, d).expect("date"))
         };

@@ -262,6 +262,9 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
     // 索引建在它上面会直接报 "no such column"），再统一补索引。
     migrate_device_tables(conn)?;
     merge_active_seconds_into_daily(conn)?;
+    // 再把「完整实例路径」归组键迁成「硬件身份段」（B14-2）：必须在索引批次之前，
+    // 它会整表重建两张统计表（索引随 DROP 消失，下面的 CREATE IF NOT EXISTS 会补回）。
+    migrate_device_identity_keys(conn)?;
     // 复合主键前缀是 date_key，按设备单列过滤（设备详情）只能全表扫：
     // 这两条索引把「按设备取序列 / 取键名明细」变成索引区间扫描。
     //
@@ -281,6 +284,198 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('year', ?1)",
         [year.to_string()],
     )?;
+    Ok(())
+}
+
+/// 设备归组键重做（B14-2）：完整实例路径 → 硬件身份段（见
+/// `device_alias::hardware_identity_key`），同身份的历史计数合并求和。
+///
+/// 幂等：触发条件是 devices 里还有含 `#` 的键（完整路径形态）；迁过的库键已
+/// 无 `#`，一次 EXISTS 就跳过。身份键经身份函数原样返回，重复执行是空操作。
+/// 整段单事务，失败整体回滚 —— 骨架照 `migrate_device_tables` 的先例。
+///
+/// 硬取舍（见身份函数注释）：同型号 + 同接口的多台设备在此颗粒度必然并成一台，
+/// 历史计数随之合并 —— 这是迁移的一部分，不是 bug。
+fn migrate_device_identity_keys(conn: &Connection) -> anyhow::Result<()> {
+    let needs: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM devices WHERE device_key LIKE '%#%')",
+        [],
+        |r| r.get(0),
+    )?;
+    if needs == 0 {
+        return Ok(());
+    }
+    tracing::info!("设备归组键迁移：完整实例路径 → 硬件身份段（同身份合并计数）");
+    conn.execute("BEGIN IMMEDIATE;", [])?;
+    let migrate = (|| -> anyhow::Result<()> {
+        // 旧登记行按 id 升序读：同一身份多行时，先登记的（换口前的老路径）
+        // 名字/类型优先 —— 它更接近用户第一次见到这台设备时的样子
+        let mut stmt =
+            conn.prepare("SELECT id, device_key, name, kind FROM devices ORDER BY id")?;
+        let mut old_rows: Vec<(i64, String, String, String)> = Vec::new();
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            old_rows.push(row?);
+        }
+        drop(stmt);
+
+        // 旧 id → 新 id；同一身份的旧行全部指到同一新行
+        let mut new_id_of: HashMap<i64, i64> = HashMap::new();
+        // (身份键, 名字, 类型)，按新 id 序
+        let mut merged_meta: Vec<(String, String, String)> = Vec::new();
+        let mut identity_new_id: HashMap<String, i64> = HashMap::new();
+        for (id, key, name, kind) in &old_rows {
+            let identity = crate::device_alias::hardware_identity_key(key);
+            let new_id = match identity_new_id.get(&identity) {
+                Some(nid) => *nid,
+                None => {
+                    let nid = merged_meta.len() as i64 + 1;
+                    identity_new_id.insert(identity.clone(), nid);
+                    merged_meta.push((identity, name.clone(), kind.clone()));
+                    nid
+                }
+            };
+            new_id_of.insert(*id, new_id);
+        }
+        // 孤儿 device_id（统计行有、登记行没有——迁移/归档历史遗留）：
+        // 补占位登记行，键沿用查询侧 `device-id:N` 的既有约定（无 #，重复迁移稳定），
+        // 不补的话下面的映射会静默丢行
+        let mut orphan_ids: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+        for table in ["device_counts", "device_key_counts"] {
+            let mut st = conn.prepare(&format!("SELECT DISTINCT device_id FROM {table}"))?;
+            let rows = st.query_map([], |r| r.get::<_, i64>(0))?;
+            for r in rows {
+                let id = r?;
+                if !new_id_of.contains_key(&id) {
+                    orphan_ids.insert(id);
+                }
+            }
+        }
+        for oid in &orphan_ids {
+            let key = format!("{}{oid}", crate::db::queries::ARCHIVED_DEVICE_KEY_PREFIX);
+            let nid = merged_meta.len() as i64 + 1;
+            identity_new_id.insert(key.clone(), nid);
+            merged_meta.push((key.clone(), key, "unknown".to_string()));
+            new_id_of.insert(*oid, nid);
+        }
+
+        // devices 按新键重建（新 id 连续下发）
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS devices_new;
+             CREATE TABLE devices_new (
+                id INTEGER PRIMARY KEY,
+                device_key TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL
+             );",
+        )?;
+        {
+            let mut ins = conn.prepare(
+                "INSERT INTO devices_new (id, device_key, name, kind) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (i, (identity, name, kind)) in merged_meta.iter().enumerate() {
+                ins.execute(rusqlite::params![i as i64 + 1, identity, name, kind])?;
+            }
+        }
+        rebuild_device_counts_by_identity(conn, "device_counts", &new_id_of, false)?;
+        rebuild_device_counts_by_identity(conn, "device_key_counts", &new_id_of, true)?;
+        // 旧登记表整体换掉
+        if table_exists(conn, "devices") {
+            conn.execute("DROP TABLE devices", [])?;
+        }
+        conn.execute("ALTER TABLE devices_new RENAME TO devices", [])?;
+        Ok(())
+    })();
+
+    match migrate {
+        Ok(()) => {
+            conn.execute("COMMIT;", [])?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK;", []);
+            Err(e)
+        }
+    }
+}
+
+/// 按新归组 id 重建一张设备统计表：旧行读进内存、映射 + 求和、写进新表、换名。
+/// （表都很小：device_counts 一年 365×设备数 行，明细表多一个键名维度。）
+fn rebuild_device_counts_by_identity(
+    conn: &Connection,
+    table: &str,
+    new_id_of: &HashMap<i64, i64>,
+    with_key_name: bool,
+) -> anyhow::Result<()> {
+    let sql = if with_key_name {
+        format!("SELECT date_key, device_id, key_name, count FROM {table}")
+    } else {
+        format!("SELECT date_key, device_id, NULL, count FROM {table}")
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+    let mut agg: std::collections::BTreeMap<(i64, i64, Option<String>), i64> = Default::default();
+    for row in rows {
+        let (date_key, old_id, key_name, count) = row?;
+        let new_id = *new_id_of
+            .get(&old_id)
+            .ok_or_else(|| anyhow::anyhow!("{table} 引用了登记表里没有的 device_id {old_id}"))?;
+        *agg.entry((date_key, new_id, key_name)).or_insert(0) += count;
+    }
+    drop(stmt);
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {table}_new;
+         CREATE TABLE {table}_new (
+            {schema}
+            , PRIMARY KEY ({pk})
+         ) WITHOUT ROWID;",
+        schema = if with_key_name {
+            "date_key INTEGER NOT NULL, device_id INTEGER NOT NULL, key_name TEXT NOT NULL, count INTEGER NOT NULL"
+        } else {
+            "date_key INTEGER NOT NULL, device_id INTEGER NOT NULL, count INTEGER NOT NULL"
+        },
+        pk = if with_key_name {
+            "date_key, device_id, key_name"
+        } else {
+            "date_key, device_id"
+        },
+    ))?;
+    let ins_sql = if with_key_name {
+        format!("INSERT INTO {table}_new (date_key, device_id, key_name, count) VALUES (?1, ?2, ?3, ?4)")
+    } else {
+        format!("INSERT INTO {table}_new (date_key, device_id, count) VALUES (?1, ?2, ?3)")
+    };
+    {
+        let mut ins = conn.prepare(&ins_sql)?;
+        for ((date_key, new_id, key_name), count) in &agg {
+            if with_key_name {
+                ins.execute(rusqlite::params![
+                    date_key,
+                    new_id,
+                    key_name.as_deref().unwrap_or(""),
+                    count
+                ])?;
+            } else {
+                ins.execute(rusqlite::params![date_key, new_id, count])?;
+            }
+        }
+    }
+    conn.execute(&format!("DROP TABLE {table}"), [])?;
+    conn.execute(&format!("ALTER TABLE {table}_new RENAME TO {table}"), [])?;
     Ok(())
 }
 
@@ -514,7 +709,9 @@ mod tests {
             !table_exists(&conn, "key_log"),
             "运行期不再无条件创建暂存表"
         );
-        let id = device_id_of(&conn, kb).expect("登记行应保留");
+        // B14-2：3 段形态的完整路径键在 ensure_schema 里被一并迁成硬件身份段
+        let identity = "VID_046D&PID_C52B&MI_00";
+        let id = device_id_of(&conn, identity).expect("登记行应保留");
         let cnt: i64 = conn
             .query_row(
                 "SELECT count FROM device_counts WHERE date_key=20716 AND device_id=?1",
@@ -532,11 +729,14 @@ mod tests {
             .unwrap();
         assert_eq!((key.as_str(), n), ("空格", 7));
         let name: String = conn
-            .query_row("SELECT name FROM devices WHERE device_key=?1", [kb], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT name FROM devices WHERE device_key=?1",
+                [identity],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(name, "HID 键盘 · 046D/C52B", "登记名不能丢");
+        // 形状认不准的键（这里只有两段）不并也不改：HID#ORPHAN 原样保留
         let orphans: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM devices WHERE device_key = 'HID#ORPHAN'",
@@ -560,6 +760,101 @@ mod tests {
             .query_row("SELECT SUM(count) FROM device_counts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(total2, 15);
+
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// B14-2：完整实例路径键 → 硬件身份段，同一硬件（只差拓扑实例号）的历史计数
+    /// 必须并成一台。这是「换 USB 口就新起一行、计数从零开始」的根治，
+    /// 代价（同型号 + 同接口必然并组）见 `device_alias::hardware_identity_key`。
+    #[test]
+    fn migrates_full_path_keys_to_identity_and_merges_same_hardware() {
+        let dir = std::env::temp_dir().join("ff_rs_db_migrate_identity");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("focusflow_2026.db");
+        std::fs::remove_file(&path).ok();
+
+        let conn = open_rw(&path).unwrap();
+        ensure_schema(&conn, 2026).unwrap();
+        // 同一只鼠标在两个 USB 口登记过（只差第三段拓扑实例号），另有一台键盘
+        let mouse_a = "HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000";
+        let mouse_b = "HID#VID_046D&PID_C52B&MI_00#8&2c5f77d4&0&0001";
+        let kb = "VID_1B1C&PID_1B2D"; // 已是身份形态：迁移必须原样保留
+        let ins_dev = |key: &str, name: &str, kind: &str| {
+            conn.execute(
+                "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)",
+                rusqlite::params![key, name, kind],
+            )
+            .unwrap();
+        };
+        let ins_cnt = |key: &str, dk: i64, n: i64| {
+            let id = device_id_of(&conn, key).unwrap();
+            conn.execute(
+                "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, ?3)",
+                rusqlite::params![dk, id, n],
+            )
+            .unwrap();
+        };
+        ins_dev(mouse_a, "HID-compliant mouse · 046D/C52B", "mouse");
+        ins_dev(mouse_b, "HID-compliant mouse · 046D/C52B", "mouse");
+        ins_dev(kb, "我的键盘 · 1B1C/1B2D", "keyboard");
+        ins_cnt(mouse_a, 20710, 30);
+        ins_cnt(mouse_b, 20711, 12);
+        ins_cnt(kb, 20711, 50);
+
+        ensure_schema(&conn, 2026).unwrap();
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "同一硬件的两条路径必须并成一行");
+        let identity = "VID_046D&PID_C52B&MI_00";
+        let mouse_id = device_id_of(&conn, identity).expect("身份键应在登记表里");
+        let (name, kind): (String, String) = conn
+            .query_row(
+                "SELECT name, kind FROM devices WHERE device_key=?1",
+                [identity],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            name, "HID-compliant mouse · 046D/C52B",
+            "先登记的（id 小的）名字保留"
+        );
+        assert_eq!(kind, "mouse");
+        let mouse_total: i64 = conn
+            .query_row(
+                "SELECT SUM(count) FROM device_counts WHERE device_id=?1",
+                [mouse_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mouse_total, 42, "两个口的计数必须求和，不能丢");
+        // 已是身份形态的设备不受影响
+        let kb_total: i64 = conn
+            .query_row(
+                "SELECT SUM(count) FROM device_counts WHERE device_id=?1",
+                [device_id_of(&conn, kb).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kb_total, 50);
+        let grand: i64 = conn
+            .query_row("SELECT SUM(count) FROM device_counts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(grand, 92, "总数守恒");
+
+        // 幂等：再跑一遍不得再并、不得再变
+        ensure_schema(&conn, 2026).unwrap();
+        let rows2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows2, 2);
+        let grand2: i64 = conn
+            .query_row("SELECT SUM(count) FROM device_counts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(grand2, 92);
 
         drop(conn);
         std::fs::remove_dir_all(&dir).ok();

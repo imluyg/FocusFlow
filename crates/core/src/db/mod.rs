@@ -70,6 +70,13 @@ impl Database {
             tracing::info!("启动清理：backup/ 中 {swept} 个遗留残留文件已删除");
         }
 
+        // 设备归组键迁移（B14-2）：当前年度库上面的 ensure_schema 已迁，
+        // 这里补上历史年度库 —— 否则跨年视图里同一台设备一库一key、两行显示。
+        // 幂等；个别库占用时跳过（查询侧按身份段归组兜底），下次启动再试。
+        maintenance::migrate_all_year_device_keys();
+        // 别名文件的精确键跟着换轨（B14-2 配套）：换口后别名仍然命中
+        crate::device_alias::migrate_exact_keys_to_identity();
+
         // 启动写入线程：起不来 = 一条都存不了，直接让启动失败（见 DbWriter::start）
         let flush_interval =
             Duration::from_secs(config.get_int("database", "flush_interval", 10).max(1) as u64);

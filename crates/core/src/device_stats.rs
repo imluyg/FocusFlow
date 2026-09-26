@@ -506,7 +506,10 @@ mod win {
     /// 登记设备：实例路径（主键）+ 显示名。失败返回 None。
     fn register_device(handle: HANDLE) -> Option<(String, String)> {
         let path = device_path(handle)?;
-        let device_key = strip_device_prefix(&path).to_string();
+        // 归组键 = 硬件身份段（B14-2）：原来是完整实例路径，换 USB 口就变 ——
+        // 同一台设备新起一行、计数从零开始、别名不跟。现在取 `#` 分段后的
+        // 型号+接口段，换口不换键；完整路径仍用于注册表名与 VID/PID 显示名。
+        let device_key = crate::device_alias::hardware_identity_key(strip_device_prefix(&path));
         let friendly = registry_device_name(&path);
         let name = display_name(&path, friendly.as_deref());
         Some((device_key, name))

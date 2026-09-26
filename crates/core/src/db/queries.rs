@@ -861,10 +861,14 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
     // 互不相干，只有 `device_key` 认得出是同一台。跨年查询（1 月看「最近 30 天」、
     // 或任何 period=0/跨年窗口）走的是逐年 append，不并的话设备页每个设备两行、
     // 各占一半次数，第二行还要被下面的同名去重冠上 "(2)"。
+    // 认同改按**硬件身份段**（B14-2）：迁移按库做，个别历史库可能因占用没迁成、
+    // 行里还是完整实例路径 —— 按原始 key 认会把同一台设备拆成两行；身份段对
+    // 两种形态给同一个值，已迁移的键原样返回。
     let mut first_at: HashMap<String, usize> = HashMap::new();
     let mut merged: Vec<DeviceRow> = Vec::with_capacity(rows.len());
     for row in rows {
-        match first_at.get(&row.device_key).copied() {
+        let identity = crate::device_alias::hardware_identity_key(&row.device_key);
+        match first_at.get(&identity).copied() {
             Some(i) => {
                 let keep = &mut merged[i];
                 keep.count += row.count;
@@ -877,7 +881,7 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
                 }
             }
             None => {
-                first_at.insert(row.device_key.clone(), merged.len());
+                first_at.insert(identity, merged.len());
                 merged.push(row);
             }
         }
@@ -1759,37 +1763,41 @@ mod tests {
                 )
                 .unwrap();
             };
-            // devA/devD：同型号两只（显示名相同 → 去重加序号）
+            // devA/devD：展示名相同的两只（登记名相同 → 去重加序号）。
+            // B14-2 后同库键都是身份形态；「两只同型号」在真机上会并成一台
+            //（见 hardware_identity_key 的硬取舍），所以这里用不同 VID 制造
+            // 同名异机，去重路径的覆盖不变。
             ins_dev(
-                "HID#VID_046D&PID_C52B#devA",
+                "VID_046D&PID_C52B",
                 "HID-compliant mouse · 046D/C52B",
                 "mouse",
             );
             ins_dev(
-                "HID#VID_046D&PID_C52B#devD",
+                "VID_046D&PID_C52C",
                 "HID-compliant mouse · 046D/C52B",
                 "mouse",
             );
             // devB：登记名为空 → 走 VID/PID 回退
-            ins_dev("HID#VID_046D&PID_C52B#devB", "", "mouse");
+            ins_dev("VID_046D&PID_C52D", "", "mouse");
             // devC（键盘）：只有统计行、登记名为空 → 回退 + kind=unknown
-            ins_cnt("HID#VID_046D&PID_C52B#devA", 30);
-            ins_cnt("HID#VID_046D&PID_C52B#devD", 10);
-            ins_cnt("HID#VID_046D&PID_C52B#devB", 70);
-            ins_cnt("HID#VID_1B1C&PID_1B2D#kb", 50);
+            ins_cnt("VID_046D&PID_C52D", 70);
+            ins_cnt("VID_1B1C&PID_1B2D", 50);
+            // devA 也要有统计行：先登记后补一行计数
+            ins_cnt("VID_046D&PID_C52B", 30);
+            ins_cnt("VID_046D&PID_C52C", 10);
         }
 
         let (total, stats) = get_device_stats_by_date(Local::now().date_naive());
         assert_eq!(total, 160);
-        assert_eq!(stats.len(), 4, "设备按 device_key 独立成行");
+        assert_eq!(stats.len(), 4, "设备按身份键独立成行");
         // 降序：70 / 50 / 30 / 10
         assert_eq!(
-            stats[0].name, "HID 设备 · 046D/C52B",
+            stats[0].name, "HID 设备 · 046D/C52D",
             "空登记名回退 VID/PID"
         );
         assert_eq!(stats[0].name, stats[0].auto_name, "无别名时展示名 = 自动名");
         assert_eq!(
-            stats[0].key, "HID#VID_046D&PID_C52B#devB",
+            stats[0].key, "VID_046D&PID_C52D",
             "行内必须带 device_key（UI 改名回写要用）"
         );
         assert_eq!(stats[0].count, 70);
@@ -1804,7 +1812,7 @@ mod tests {
         assert_eq!(stats[2].kind, "mouse");
         assert_eq!(
             stats[3].name, "HID-compliant mouse · 046D/C52B (2)",
-            "同型号显示名去重"
+            "同显示名去重"
         );
         assert_eq!(stats[3].count, 10);
     }
@@ -1814,6 +1822,8 @@ mod tests {
     /// `devices.id` 各年度库自增、互不相干，两个库里的同一台设备只有 device_key
     /// 认得出来。逐年 append 而不按 key 并起来时，设备页每个设备显示两行、
     /// 各占一半次数，第二行还被同名去重加上 "(2)"，看着就像多了一只鼠标。
+    /// B14-2 后同库按身份键存：旧库若因占用没迁成，行里还是完整路径 ——
+    /// 归组按身份段认（`merge_device_rows`），两种形态照样并成一行。
     #[test]
     fn device_stats_collapse_the_same_device_across_year_dbs() {
         let _lock = crate::paths::test_app_dir_lock();
@@ -1821,11 +1831,13 @@ mod tests {
 
         let this_year = Local::now().year();
         let prev_year = this_year - 1;
-        let key = "HID#VID_046D&PID_C52B#same";
+        // 旧库是升级前的完整路径键、新库是身份键：同一台设备的两种形态
+        let prev_key = "HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000";
+        let this_key = "VID_046D&PID_C52B&MI_00";
         // 两个库各登记一台设备，让同一台设备在两侧的自增 id 真的错开
-        for (year, n, other) in [
-            (prev_year, 40, "HID#VID_1B1C&PID_1B2D#old"),
-            (this_year, 60, ""),
+        for (year, n, other, key) in [
+            (prev_year, 40, "HID#VID_1B1C&PID_1B2D#old", prev_key),
+            (this_year, 60, "", this_key),
         ] {
             let conn = crate::db::connection::open_rw(&paths::year_db_path(year)).unwrap();
             crate::db::connection::ensure_schema(&conn, year).unwrap();
@@ -1866,8 +1878,8 @@ mod tests {
         );
         let same = stats
             .iter()
-            .find(|s| s.key == key)
-            .expect("同一台设备必须只有一行");
+            .find(|s| s.key == prev_key || s.key == this_key)
+            .expect("同一台设备必须只有一行（旧路径键与新身份键都行）");
         assert_eq!(same.count, 100, "两个年度库的次数必须并起来");
         assert!(
             !same.name.ends_with("(2)"),
@@ -1963,8 +1975,9 @@ mod tests {
         let _tmp = crate::paths::test_app_dir("devdirty");
 
         let dk = day_key_of_date(Local::now().date_naive());
-        let dirty = r"\\?\HID#VID_046D&PID_C52B&MI_00#8&2c5f&0&0000#{378de44c}";
-        let clean = "HID#VID_1B1C&PID_1B2D#clean";
+        // B14-2 后库里的键是身份形态；「name == key」这条脏登记规则与键形态无关
+        let dirty = "VID_046D&PID_C52B&MI_00";
+        let clean = "VID_1B1C&PID_1B2D";
         {
             let path = paths::year_db_path(Local::now().year());
             let conn = crate::db::connection::open_rw(&path).unwrap();
@@ -2009,8 +2022,10 @@ mod tests {
 
         let today = Local::now().date_naive();
         let dk = |d: &chrono::NaiveDate| day_key_of_date(*d);
-        let a = "HID#VID_046D&PID_C52B&MI_00#a";
-        let b = "HID#VID_046D&PID_C52B&MI_00#b";
+        // B14-2 后库里的键是身份形态；鼠标/键盘两面靠接口段（&MI_00/&MI_01）区分，
+        // 同 VID/PID 不同接口不会并组（这正是接口段进键的原因）。
+        let a = "VID_046D&PID_C52B&MI_00";
+        let b = "VID_046D&PID_C52B&MI_01";
         {
             let path = paths::year_db_path(today.year());
             let conn = crate::db::connection::open_rw(&path).unwrap();
@@ -2190,7 +2205,8 @@ mod tests {
         let _tmp = crate::paths::test_app_dir("devq_alias");
         crate::device_alias::invalidate_cache();
 
-        let key = "HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000";
+        // B14-2 后库里的键是身份形态；别名按精确键解析（parse_vid_pid 对它照样有效）
+        let key = "VID_046D&PID_C52B&MI_00";
         let dk = day_key_of_date(Local::now().date_naive());
         {
             let path = paths::year_db_path(Local::now().year());

@@ -275,6 +275,10 @@ impl DbWriter {
         // 设备登记预热：恢复文件不带 device_meta（会话态不透传），先从 devices 表把
         // 名字补回来，避免回放后首次 flush 只能拿 device_key 占位补登。
         let mut initial = recovered.unwrap_or_default();
+        // B14-2：升级前崩溃留下的恢复批次里可能还挂着旧版完整实例路径键 ——
+        // 先归一到硬件身份段（同一硬件的新旧计数在内存里就合并），后面的
+        // preload_device_meta 与首次落库才同轨；正常运行这里没有旧键，零成本。
+        initial = normalize_device_keys(&initial);
         preload_device_meta(&mut initial);
         let state = Arc::new(WriterState {
             agg: Mutex::new(initial),
@@ -954,8 +958,51 @@ fn preload_device_meta(agg: &mut AggDeltas) {
     }
 }
 
-/// 取设备在本库的整数 id：登记行不存在时补登一行（名称走回退命名、kind 记 unknown）。
+/// 把批次里的设备键统一归一到硬件身份段（B14-2）。
 ///
+/// 只在启动回放时调用：升级前崩溃留下的恢复批次里可能还挂着旧版完整实例
+/// 路径键，不归一的话 meta/补登按 A 键查、统计行按 B 键落，设备名会退化成
+/// 回退命名、同一硬件的新旧计数也会分家。身份键原样返回 —— 没有旧键时
+/// 每个映射只多做一次字符串判断。
+fn normalize_device_keys(pending: &AggDeltas) -> AggDeltas {
+    let stale = |k: &str| crate::device_alias::hardware_identity_key(k) != k;
+    let needs = pending.device_meta.keys().any(|k| stale(k))
+        || pending.devices.keys().any(|(_, d)| stale(d))
+        || pending.device_keys.keys().any(|(_, d, _)| stale(d));
+    if !needs {
+        return pending.clone();
+    }
+    tracing::info!("恢复批次含旧版完整路径设备键，归一到硬件身份段");
+    let ident = |k: &String| crate::device_alias::hardware_identity_key(k);
+    let mut out = AggDeltas {
+        daily: pending.daily.clone(),
+        hourly: pending.hourly.clone(),
+        keys: pending.keys.clone(),
+        active: pending.active.clone(),
+        apps: pending.apps.clone(),
+        devices: HashMap::new(),
+        device_keys: HashMap::new(),
+        device_meta: pending
+            .device_meta
+            .iter()
+            .map(|(k, v)| (ident(k), v.clone()))
+            .collect(),
+        // 会话态原样带过去（归一只动设备键）
+        last_ts: pending.last_ts,
+        current_app: pending.current_app.clone(),
+    };
+    for ((dk, dev), n) in &pending.devices {
+        *out.devices.entry((*dk, ident(dev))).or_insert(0) += *n;
+    }
+    for ((dk, dev, key), n) in &pending.device_keys {
+        *out.device_keys
+            .entry((*dk, ident(dev), key.clone()))
+            .or_insert(0) += *n;
+    }
+    out
+}
+
+/// 取设备在本库的整数 id：登记行不存在时补登一行（名称走回退命名、kind 记 unknown）。
 /// 统计表字典化后只存 id，漏登记会让查询侧 JOIN 静默丢行、凭空少掉设备数据，
 /// 所以这里宁可补一条占位登记，也不放弃计数。
 fn device_id_in_db(
@@ -976,6 +1023,10 @@ fn device_id_in_db(
             (fallback_name.as_str(), "unknown")
         }
     };
+    // B14-2：升级前崩溃留下的恢复文件里可能还是旧版完整实例路径 ——
+    // 先归一到身份段再登记，别让一次回放凭空多出一行旧路径键
+    // （身份键经身份函数原样返回，正常路径无副作用）。
+    let dev = crate::device_alias::hardware_identity_key(dev);
     upsert.query_row(rusqlite::params![dev, name, kind], |r| r.get(0))
 }
 
@@ -1781,13 +1832,16 @@ mod tests {
         let ts = queries::now_ts();
         let dev = "HID#VID_24AE&PID_1464#e2e".to_string();
         let real_name = "端到端鼠标 · 24AE/1464";
+        // B14-2：落库前 device_id_in_db 会把键归一到硬件身份段 ——
+        // 登记行按身份键存，查询也得按身份键问
+        let dev_in_db = crate::device_alias::hardware_identity_key(&dev);
         let name_in_db = || -> Option<String> {
             connection::open_ro(&paths::current_year_db_path())
                 .ok()
                 .and_then(|conn| {
                     conn.query_row(
                         "SELECT name FROM devices WHERE device_key=?1",
-                        [&dev],
+                        [&dev_in_db],
                         |r| r.get(0),
                     )
                     .ok()
@@ -1825,7 +1879,7 @@ mod tests {
                     "SELECT COALESCE(SUM(c.count),0) FROM device_counts c \
                        JOIN devices d ON d.id = c.device_id \
                       WHERE d.device_key=?1",
-                    [&dev],
+                    [&dev_in_db],
                     |r| r.get(0),
                 )
                 .ok()
