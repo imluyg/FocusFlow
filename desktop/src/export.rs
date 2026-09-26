@@ -231,8 +231,10 @@ pub fn write_weekly_report_for(
     let best = rows.iter().max_by_key(|(_, c)| *c).copied();
     let worst = rows.iter().min_by_key(|(_, c)| *c).copied();
     let met_days = rows.iter().filter(|(_, c)| *c >= goal).count();
+    // 未落库增量恒传 0：周报是「已落库快照」文档（§七·4 判定），锚点又是
+    // 已结束的整周日 —— "今天还没落库的部分"与这份报告的窗口无关。
     let goal_state =
-        focusflow_core::stats::goal_status(goal, &daily, &to.format("%Y-%m-%d").to_string());
+        focusflow_core::stats::goal_status(goal, &daily, &to.format("%Y-%m-%d").to_string(), 0);
     let app_total: i64 = apps.values().sum();
     let hour_max = *hourly.iter().max().unwrap_or(&0);
 

@@ -78,15 +78,25 @@ pub async fn get_goal_status(state: State<'_, Arc<AppState>>) -> Result<serde_js
 
 fn goal_status_json(app: &AppState) -> Result<serde_json::Value, String> {
     let goal = app.config.get_int("goal", "daily_keys", 20000).max(1);
+    // 先取按日序列、后读未落库增量：两步之间若恰好有一次 flush 落库，增量已进库、
+    // 此刻读到的 pending 就是 0 —— 最坏少算一个瞬时切片，绝不会把同一段计两遍
+    // （反过来先读 pending 再查库，中间落库就是双重计数）。
+    // 与主卡片（compute_charts / total_for_display）同一族口径：顶部「今日」是
+    // 实时值，这里的达标/连续/最长若只认库值，用户刚跨线的一分钟里两处数字打架。
     let rows = focusflow_core::db::queries::get_daily_counts(
         focusflow_core::stats::GOAL_LOOKBACK_DAYS,
         None,
     );
+    let pending = app
+        .db
+        .writer()
+        .map(|w| w.today_pending_count())
+        .unwrap_or(0);
     let today = chrono::Local::now()
         .date_naive()
         .format("%Y-%m-%d")
         .to_string();
-    let s = focusflow_core::stats::goal_status(goal, &rows, &today);
+    let s = focusflow_core::stats::goal_status(goal, &rows, &today, pending);
     Ok(serde_json::json!({
         "goal": s.goal,
         "today": s.today,
