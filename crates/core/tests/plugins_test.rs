@@ -126,6 +126,8 @@ mod tests {
                 "{name}（{fpath}）应能卸载（cleanup 里报错会残留后台线程）"
             );
         }
+        // 上面那圈里 Edge 插件被点过 `refresh`，见 `wait_edge_refresh_settled`。
+        wait_edge_refresh_settled();
     }
 
     #[test]
@@ -648,6 +650,27 @@ mod tests {
         (tmp, manager, name)
     }
 
+    /// 等 Edge 那一轮后台刷新真的收尾，再让用例继续往下走。
+    ///
+    /// `edge-refresh` 线程是 detach 的，而它落盘用的 `data_dir()` 取的是**当下**的
+    /// 全局 `app_dir`：不等它，它会写进下一条用例刚建好的临时目录（实测在
+    /// `ff_reset_sched_*` 里长出 `focusflow_edge_history.db`），于是那个目录在
+    /// `TestAppDir::drop` 时删不掉（句柄还在），或被删掉之后又重建 ——
+    /// 每跑一轮就往 `%TEMP%` 留一个目录。
+    fn wait_edge_refresh_settled() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while focusflow_core::edge_history::refresh_state() == "running"
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_ne!(
+            focusflow_core::edge_history::refresh_state(),
+            "running",
+            "后台刷新线程没在 15 秒内收尾，它之后会把数据写进下一个用例的临时目录"
+        );
+    }
+
     /// 递归展开控件（`Row` 容器与弹窗内嵌的那一层也要看到）。
     fn flatten(widgets: &[Widget]) -> Vec<Widget> {
         let mut out = Vec::new();
@@ -842,6 +865,7 @@ mod tests {
             "关闭面板后那句自家的提示必须消失，实际: {:?}",
             labels_of(&manager, &name)
         );
+        wait_edge_refresh_settled();
         assert!(manager.unload_plugin(&name));
         drop(tmp);
 
