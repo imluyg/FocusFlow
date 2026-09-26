@@ -64,7 +64,7 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             ("ignore_key_repeat", "true"),
             ("key_repeat_stale_seconds", "15"),
             ("mouse_enabled", "true"),
-            ("scroll_burst_window", "0.8"),
+            ("scroll_burst_window", "0.25"),
         ],
     );
     s(

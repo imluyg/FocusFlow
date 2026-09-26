@@ -4,7 +4,7 @@
 //! - rdev 全局键盘/鼠标监听（键盘 + 鼠标点击/滚轮统一计数）
 //! - 修饰键/功能键过滤
 //! - 长按自动重复过滤（`_pressed` 集合 + stale 时长）
-//! - 滚轮连续滚动合并（0.8s 窗口内同方向只计 1 次）
+//! - 滚轮连续滚动合并（从上次计数起 `scroll_burst_window` 秒内同方向只计 1 次，默认 0.25s）
 //! - Ctrl+字母控制字符还原为物理键（v1.2.1 行为）
 //! - 暂停/恢复，事件回调（番茄钟 / 护眼提醒用）
 //!
@@ -333,8 +333,8 @@ impl ListenerCfg {
         );
         self.scroll_burst_window.store(
             cfg_seconds(
-                config.get_float("listener", "scroll_burst_window", 0.8),
-                0.8,
+                config.get_float("listener", "scroll_burst_window", 0.25),
+                0.25,
                 0.01,
             )
             .to_bits(),
@@ -459,20 +459,28 @@ impl InputListener {
         }
     }
 
-    /// 滚轮连续滚动合并：窗口内同方向只计 1 次。
-    fn is_new_scroll_burst(&self, direction: &'static str) -> bool {
-        let window = self.cfg.burst_window();
-        let now = Instant::now();
+    /// 滚轮连续滚动合并：从**上一次计数**起整个窗口内，同方向只计 1 次。
+    ///
+    /// 时间戳只在真的计数时刷新（`_at` 版是为了能把"每次间隔都短于窗口、总时长却远超
+    /// 窗口"这个形状写成确定性用例）。原来是无条件 `*scroll = (Some(now), direction)`，
+    /// 于是窗口变成跟随式的：截止点跟着每一格滚轮往后跑，连续滚动一整段只计 1 次，
+    /// 必须**停手超过一个窗口**才可能有第二次 —— 与"窗口内只计 1 次"的措辞并不是一回事。
+    fn is_new_scroll_burst_at(&self, direction: &'static str, now: Instant) -> bool {
+        let window = Duration::from_secs_f64(self.cfg.burst_window());
         let mut scroll = self.scroll.lock().unwrap_or_else(|e| e.into_inner());
         let is_new = match scroll.0 {
             // 尚无记录（首次，或暂停后刚重置）：一定是新一轮
             None => true,
-            Some(t) => {
-                now.duration_since(t) > Duration::from_secs_f64(window) || scroll.1 != direction
-            }
+            Some(t) => now.duration_since(t) > window || scroll.1 != direction,
         };
-        *scroll = (Some(now), direction);
+        if is_new {
+            *scroll = (Some(now), direction);
+        }
         is_new
+    }
+
+    fn is_new_scroll_burst(&self, direction: &'static str) -> bool {
+        self.is_new_scroll_burst_at(direction, Instant::now())
     }
 
     /// 处理单个键鼠事件：记录到数据库 + 触发回调。
@@ -803,6 +811,42 @@ mod tests {
             .unwrap_or_else(Instant::now);
         *l.scroll.lock().unwrap_or_else(|e| e.into_inner()) = (Some(expired), "上");
         assert!(l.is_new_scroll_burst("上"), "窗口过期后应重新计数");
+    }
+
+    /// 真实手感那一刀：**每格间隔都短于窗口、但一直在滚**，总时长远超窗口时该计多次。
+    ///
+    /// 上面那条用例证明不了它 —— 它只测"背靠背"和"手工造一个过期时刻"。原实现把
+    /// 时间戳无条件推到"现在"，于是截止点跟着每一格往后跑，10 格滚了 2.7 个窗口
+    /// 仍然只计 1 次（要停手满一个窗口才可能有第二次）。锚在**上一次计数**之后：
+    /// 同一轮里前 4 格合并，满了窗口才再计一次。
+    #[test]
+    fn scroll_burst_merges_from_the_last_count_not_the_last_event() {
+        let l = InputListener::new(test_config(), new_pause_flag());
+        let window = Duration::from_secs_f64(l.cfg.burst_window());
+        let t0 = Instant::now();
+
+        // 每 0.3 个窗口滚一格，共 10 格（跨 2.7 个窗口），全程没有停手
+        let mut counted = 0;
+        for i in 0..10u32 {
+            if l.is_new_scroll_burst_at("上", t0 + window.mul_f32(0.3 * i as f32)) {
+                counted += 1;
+            }
+        }
+        assert_eq!(
+            counted, 3,
+            "锚在上次计数：0、>窗口、再>窗口 各计一次，其余合并"
+        );
+
+        // 反向对照：同一轮里密密麻麻的短间隔滚动（总时长不出一个窗口）仍然只计 1 次，
+        // 合并本身没被削弱 —— 一次甩动不该变成好几次。
+        let l2 = InputListener::new(test_config(), new_pause_flag());
+        let mut rapid = 0;
+        for i in 0..8u32 {
+            if l2.is_new_scroll_burst_at("上", t0 + window.mul_f32(0.1 * i as f32)) {
+                rapid += 1;
+            }
+        }
+        assert_eq!(rapid, 1, "0.7 个窗口内的 8 格还是一次动作");
     }
 
     /// process_event 过滤分支：修饰键/功能键/未知键/鼠标关闭均不触发回调；
