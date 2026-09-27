@@ -220,6 +220,13 @@ fn row_to_expense(r: &rusqlite::Row<'_>) -> rusqlite::Result<Expense> {
     })
 }
 
+/// 记账允许的类型值。
+///
+/// 合计 SQL 用的是**字面量**比较（`type='支出'` / `type='收入'`，见
+/// `monthly_summary_detail`），所以一个拼错的值不会报错，只会在所有月度合计里
+/// 静默算 0 —— 记录在列表里看得见、钱却怎么也对不上。挡在写入口比在读侧猜意图便宜。
+const EXPENSE_TYPES: [&str; 2] = ["支出", "收入"];
+
 /// 添加记账记录，返回 id。
 #[allow(clippy::too_many_arguments)]
 pub fn add_expense(
@@ -236,6 +243,18 @@ pub fn add_expense(
         Ok(c) => c,
         Err(_) => return -1,
     };
+    let rtype = rtype.trim();
+    if !EXPENSE_TYPES.contains(&rtype) {
+        tracing::warn!("记账类型「{rtype}」不在允许值里（支出/收入），这条没写进去");
+        return -1;
+    }
+    let date = match normalize_write_date(purchase_date) {
+        Some(d) => d,
+        None => {
+            tracing::warn!("记账日期「{purchase_date}」不是可识别的日期，这条没写进去");
+            return -1;
+        }
+    };
     let record_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let r = conn.execute(
         "INSERT INTO expenses
@@ -245,7 +264,7 @@ pub fn add_expense(
             rtype,
             item_name,
             store,
-            purchase_date,
+            date,
             amount,
             blank_to_none(category),
             blank_to_none(subcategory),
@@ -262,20 +281,49 @@ pub fn add_expense(
     }
 }
 
+/// 写入侧的日期归一：把 `"2026-9-1"` 补成 `"2026-09-01"`，空串原样留给调用方。
+///
+/// 读侧全是**字符串**比较（`LIKE '2026-09%'`、`purchase_date >= ?`、`ORDER BY`），
+/// 少一个零的记录会在列表里永远可见、却不在任何月度合计里。尺子与
+/// [`normalize_date_filter`] 同一把（那是筛选侧已经认下来的几种写法）。
+fn normalize_write_date(raw: &str) -> Option<String> {
+    if raw.trim().is_empty() {
+        return Some(String::new());
+    }
+    normalize_date_filter(raw)
+}
+
 /// 更新记账记录。
 pub fn update_expense(id: i64, e: &Expense) -> bool {
     let conn = match open() {
         Ok(c) => c,
         Err(_) => return false,
     };
+    let rtype = e.rtype.trim();
+    if !EXPENSE_TYPES.contains(&rtype) {
+        tracing::warn!("记账类型「{rtype}」不在允许值里（支出/收入），#{id} 没改");
+        return false;
+    }
+    // 老库里一条日期没补零的记录，用户改个名字顺手就被修成补零形态（而不是被拒）；
+    // 真正认不出来的日期才报错。
+    let date = match normalize_write_date(&e.purchase_date) {
+        Some(d) => d,
+        None => {
+            tracing::warn!(
+                "记账日期「{}」不是可识别的日期，#{id} 没改",
+                e.purchase_date
+            );
+            return false;
+        }
+    };
     conn.execute(
         "UPDATE expenses SET type=?1, item_name=?2, store=?3, purchase_date=?4,
          amount=?5, category=?6, subcategory=?7, note=?8 WHERE id=?9",
         rusqlite::params![
-            e.rtype,
+            rtype,
             e.item_name,
             e.store,
-            e.purchase_date,
+            date,
             e.amount,
             blank_to_none(e.category.as_deref()),
             blank_to_none(e.subcategory.as_deref()),
@@ -347,6 +395,16 @@ pub fn add_category(name: &str, ctype: &str, subs: &[String]) -> i64 {
         Ok(c) => c,
         Err(_) => return -1,
     };
+    // 重名不再"假装添加成功"。`INSERT OR IGNORE` 撞 UNIQUE 时整条被忽略，紧接着回读
+    // id 却拿到**已存在那一条**的 id（> 0），于是面板报"分类 [x] 已添加"，而这次传的
+    // ctype / subs 一个字都没落库 —— 用户以为把类型改掉了。与 update_category 的
+    // "已存在"同口径。
+    if category_type(name).is_some() {
+        tracing::warn!(
+            "分类 [{name}] 已经存在：这次传的类型「{ctype}」与子分类都没有落库（要改请用「修改分类」）"
+        );
+        return -1;
+    }
     let subs_json = subs.join(",");
     let r = conn.execute(
         "INSERT OR IGNORE INTO categories (name, type, subs) VALUES (?1, ?2, ?3)",
@@ -606,13 +664,42 @@ pub fn delete_subcategory(category: &str, sub_name: &str) -> (bool, String) {
     if subs.len() == all.len() {
         return (false, format!("子分类 [{sub_name}] 不存在"));
     }
-    match conn.execute(
-        "UPDATE categories SET subs=?1 WHERE name=?2",
-        rusqlite::params![subs.join(","), category],
-    ) {
-        Ok(n) if n > 0 => (true, "删除成功".into()),
-        Ok(_) => (false, format!("分类 [{category}] 不存在")),
-        Err(e) => (false, format!("删除失败: {e}")),
+    // 两条 UPDATE 必须同事务，且必须**一起**做：`get_subcategories` 会把"记录里出现过
+    // 的子分类"并回列表（见它那段注释），所以只改 categories.subs 的话，删掉的子分类
+    // 立刻又出现在下拉里 —— 插件页刚说完"子分类 […] 已删除"，细分盈亏里它也还在。
+    // 与 update_subcategory / update_category 同一口径。
+    if let Err(e) = conn.execute("BEGIN IMMEDIATE;", []) {
+        return (false, format!("删除失败: {e}"));
+    }
+    let apply = (|| -> rusqlite::Result<usize> {
+        let n = conn.execute(
+            "UPDATE categories SET subs=?1 WHERE name=?2",
+            rusqlite::params![subs.join(","), category],
+        )?;
+        if n > 0 {
+            conn.execute(
+                "UPDATE expenses SET subcategory=NULL WHERE category=?1 AND subcategory=?2",
+                rusqlite::params![category, sub_name],
+            )?;
+        }
+        Ok(n)
+    })();
+    match apply {
+        Ok(0) => {
+            let _ = conn.execute("ROLLBACK;", []);
+            (false, format!("分类 [{category}] 不存在"))
+        }
+        Ok(_) => match conn.execute("COMMIT;", []) {
+            Ok(_) => (true, "删除成功".into()),
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK;", []);
+                (false, format!("删除失败: {e}"))
+            }
+        },
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK;", []);
+            (false, format!("删除失败: {e}"))
+        }
     }
 }
 
@@ -875,13 +962,55 @@ fn sum_amount_sql(inner: &str) -> String {
     format!("({}) / 100.0", sum_cents(inner))
 }
 
+/// 把用户或脚本给的月份写法归一成 `YYYY-MM`；认不出来返回 `None`。
+///
+/// 为什么要有它：月度汇总是拿 `purchase_date LIKE '<ym>%'` 做**字符串前缀**匹配，
+/// 前缀本身直接决定统计范围，而 `ym` 是原样开放给第三方脚本的 `String`
+/// （`plugins/host.rs` 的 `accounting_monthly*`）。不守这个口有三类静默错法：
+/// - `"2026-1"`（人手写一月）：前缀命中 2026-10/11/12 三个月，而**真正的一月一条不算**；
+/// - `""`：前缀成 `%` ⇒ 全时段总额被当成一个月报出去（Lua 表头还照原样印那个空 ym）；
+/// - 含 `%` / `_`：LIKE 的通配符，等于让调用方自己拼窗口。
+///   归一之后进 `LIKE` 的串只剩数字与 `-`，通配符没有入口。
+pub fn normalize_month(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let parts: Vec<&str> = s.split(['-', '/', '.']).collect();
+    let (ys, ms) = match parts[..] {
+        [y, m] => (y, m),
+        // 紧凑写法 202601
+        [one] if one.len() == 6 && one.bytes().all(|b| b.is_ascii_digit()) => {
+            (one.get(..4)?, one.get(4..)?)
+        }
+        _ => return None,
+    };
+    let num = |seg: &str| -> Option<i64> {
+        if seg.is_empty() || seg.len() > 4 || !seg.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        seg.parse().ok()
+    };
+    let (y, m) = (num(ys)?, num(ms)?);
+    if !(1970..=9999).contains(&y) || !(1..=12).contains(&m) {
+        return None;
+    }
+    Some(format!("{y:04}-{m:02}"))
+}
+
 /// 月度汇总明细：返回 (总支出, 总收入, 条数, [(分类, 净收入)])。
 pub fn monthly_summary_detail(year_month: &str) -> (f64, f64, i64, Vec<(String, f64)>) {
     let conn = match open() {
         Ok(c) => c,
         Err(_) => return (0.0, 0.0, 0, Vec::new()),
     };
-    let prefix = format!("{year_month}%");
+    let ym = match normalize_month(year_month) {
+        Some(v) => v,
+        None => {
+            tracing::error!(
+                "月度汇总的月份参数认不出来（{year_month:?}），本次按 0 条返回；需要的是 YYYY-MM"
+            );
+            return (0.0, 0.0, 0, Vec::new());
+        }
+    };
+    let prefix = format!("{ym}%");
     let expense: f64 = conn
         .query_row(
             &format!(
@@ -1050,7 +1179,16 @@ pub fn monthly_summary(year_month: &str) -> (f64, f64) {
         Ok(c) => c,
         Err(_) => return (0.0, 0.0),
     };
-    let prefix = format!("{year_month}%");
+    let ym = match normalize_month(year_month) {
+        Some(v) => v,
+        None => {
+            tracing::error!(
+                "月度汇总的月份参数认不出来（{year_month:?}），本次按 0 返回；需要的是 YYYY-MM"
+            );
+            return (0.0, 0.0);
+        }
+    };
+    let prefix = format!("{ym}%");
     let expense: f64 = conn
         .query_row(
             &format!(
@@ -1339,5 +1477,206 @@ mod tests {
             sub_names.contains(&"零食"),
             "有名字的子分类照常成行: {sub_names:?}"
         );
+    }
+
+    /// 回归（第 23 轮）：`delete_subcategory` 曾经只改 `categories.subs`，不像
+    /// `update_subcategory` / `update_category` 那样同步清 `expenses.subcategory`。
+    /// 而 `get_subcategories` 刻意会把"记录里出现过的子分类"并回列表 ⇒ 删了立刻又长回来，
+    /// 面板刚说完"子分类 […] 已删除"，细分盈亏里它也还在。
+    #[test]
+    fn deleted_subcategory_goes_away_from_records_too() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_del_sub");
+        init_db().expect("建库失败");
+        // 分类名刻意避开 `init_db` 预置的那批（"游戏" 就是预置分类，且自带六个子分类）
+        assert!(add_category("虚拟道具", "both", &["点卡".to_string()]) > 0);
+        let hit = add_expense(
+            "支出",
+            "月卡",
+            None,
+            "2026-09-05",
+            68.0,
+            Some("虚拟道具"),
+            Some("点卡"),
+            None,
+        );
+        assert!(hit > 0, "记账没写进去，后面的断言都没有意义");
+        let (ok, msg) = delete_subcategory("虚拟道具", "点卡");
+        assert!(ok, "删除子分类该成功，实得: {msg}");
+        // ① 列表面：删掉的不能因为"记录里出现过"又长回来
+        let subs = get_subcategories("虚拟道具");
+        assert!(subs.is_empty(), "删掉的子分类不能还在列表里: {subs:?}");
+        // ② 记录面：那条记录的 subcategory 必须一起清掉
+        let sub: Option<String> = {
+            let conn = open().unwrap();
+            conn.query_row("SELECT subcategory FROM expenses WHERE id=?1", [hit], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert!(
+            sub.clone().unwrap_or_default().is_empty(),
+            "记录里的子分类要一起清掉，实得 {sub:?}"
+        );
+        // ③ 反向腿：UPDATE 必须带 category 条件，别的分类不能被牵连
+        assert!(add_category("食品", "both", &["零食".to_string(), "饮料".to_string()]) > 0);
+        let other = add_expense(
+            "支出",
+            "薯片",
+            None,
+            "2026-09-06",
+            8.0,
+            Some("食品"),
+            Some("零食"),
+            None,
+        );
+        assert!(delete_subcategory("食品", "饮料").0);
+        assert_eq!(
+            get_subcategories("食品"),
+            vec!["零食".to_string()],
+            "同分类下别的子分类要留着"
+        );
+        let kept: Option<String> = {
+            let conn = open().unwrap();
+            conn.query_row(
+                "SELECT subcategory FROM expenses WHERE id=?1",
+                [other],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(kept.as_deref(), Some("零食"), "没删的子分类不能被顺手清空");
+    }
+
+    /// 月份写法必须归一（`normalize_month`），否则月度汇总是**前缀**匹配出的另一个窗口。
+    #[test]
+    fn normalize_month_pads_and_rejects() {
+        let m = |s: &str| super::normalize_month(s);
+        assert_eq!(m("2026-1").as_deref(), Some("2026-01"), "人手写的一月");
+        assert_eq!(m("2026-09").as_deref(), Some("2026-09"), "已经补零的不变");
+        assert_eq!(m("2026/9").as_deref(), Some("2026-09"));
+        assert_eq!(m("202609").as_deref(), Some("2026-09"), "紧凑六位也认");
+        assert_eq!(m(" 2026-12 ").as_deref(), Some("2026-12"), "首尾空白不算错");
+        assert_eq!(m(""), None, "空串会变成前缀 % = 全时段，必须拒");
+        assert_eq!(m("2026-%"), None, "LIKE 通配符不能进前缀");
+        assert_eq!(m("2026-13"), None, "没有 13 月");
+        assert_eq!(m("2026-09-27"), None, "这不是一个月");
+        assert_eq!(m("昨天"), None, "认不出来必须报出来");
+    }
+
+    /// 回归（第 23 轮）：`year_month` 以前原样拼成 `LIKE 'x%'`。
+    /// `"2026-1"` ⇒ 命中 2026-10/11/12 三个月、真正的一月一条不算；
+    /// `""` ⇒ 前缀 `%` ⇒ 全时段总额被当成一个月报出去（Lua 表头还照原样印那个空 ym）。
+    #[test]
+    fn monthly_summary_only_counts_the_month_it_was_asked_about() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_ym");
+        init_db().expect("建库失败");
+        for (d, amt) in [
+            ("2026-01-15", 10.0),
+            ("2026-10-05", 20.0),
+            ("2026-11-05", 40.0),
+        ] {
+            assert!(
+                add_expense("支出", "x", None, d, amt, None, None, None) > 0,
+                "{d} 没写进去"
+            );
+        }
+        assert_eq!(monthly_summary("2026-10").0, 20.0, "对照腿：整月照旧");
+        assert_eq!(monthly_summary("2026-11").0, 40.0);
+        assert_eq!(
+            monthly_summary("2026-1").0,
+            10.0,
+            "「2026-1」必须归一成 2026-01：既不能吞下十月/十一月，也不能丢掉一月"
+        );
+        assert_eq!(
+            monthly_summary("").0,
+            0.0,
+            "空月份不能把全时段总额当成一个月"
+        );
+        assert_eq!(monthly_summary("2026-%").0, 0.0, "通配符不能当月份");
+        assert_eq!(
+            monthly_summary_detail("2026-1").2,
+            1,
+            "明细面的条数必须与总额同一把尺子"
+        );
+    }
+
+    /// 回归（第 23 轮）：写入侧以前既不规范化 `purchase_date`，也不校验 `type`。
+    /// 一条 `"2026-9-1"` 在列表里永远可见、却不在**任何**月度合计里（读侧全是字符串
+    /// 前缀/区间比较）；`type="expense"` 在支出与收入两侧的字面量比较下都算 0，
+    /// 对用户的表现就是"记录在、钱对不上"，一句错都不报。
+    #[test]
+    fn write_side_pads_dates_and_rejects_unknown_type() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_write");
+        init_db().expect("建库失败");
+        let id = add_expense("支出", "早餐", None, "2026-9-1", 12.0, None, None, None);
+        assert!(id > 0, "合法日期（只是没补零）不能被拒");
+        let stored: String = {
+            let conn = open().unwrap();
+            conn.query_row(
+                "SELECT purchase_date FROM expenses WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stored, "2026-09-01", "写入侧要把日期补成库里的形态");
+        assert_eq!(
+            monthly_summary("2026-09").0,
+            12.0,
+            "补零之后这笔必须在九月合计里"
+        );
+
+        // 类型白名单：非 支出/收入 一律拒写，且不能留下半条记录
+        assert_eq!(
+            add_expense("expense", "笔误", None, "2026-09-02", 5.0, None, None, None),
+            -1,
+            "type 只能是 支出/收入"
+        );
+        assert_eq!(
+            add_expense("", "空类型", None, "2026-09-02", 5.0, None, None, None),
+            -1
+        );
+        // 认不出来的日期拒，而不是存进去变成合计里的幽灵
+        assert_eq!(
+            add_expense("支出", "坏日期", None, "昨天", 5.0, None, None, None),
+            -1
+        );
+        let rows: i64 = {
+            let conn = open().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM expenses", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows, 1, "被拒的三条一条都不能留在库里，实得 {rows}");
+        // 反向腿：空日期仍然允许（面板自己会填今天），不能被这道闸顺手打死
+        assert!(add_expense("收入", "没日期", None, "", 5.0, None, None, None) > 0);
+        assert!(add_expense("支出", "斜杠日期", None, "2026/9/3", 3.0, None, None, None) > 0);
+        assert_eq!(monthly_summary("2026-09").0, 15.0, "斜杠写法也要落进九月");
+    }
+
+    /// 回归（第 23 轮）：`add_category` 撞重名时 `INSERT OR IGNORE` 整条忽略，紧接着
+    /// 回读 id 却拿到**已存在那一条**的 id（> 0）⇒ 面板报"分类 [x] 已添加"，而这次传的
+    /// `ctype` / `subs` 一个字都没落库。与 `update_category` 的"已存在"同口径。
+    #[test]
+    fn add_category_does_not_claim_a_duplicate_was_added() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_dup_cat");
+        init_db().expect("建库失败");
+        assert!(add_category("食品", "expense", &[]) > 0);
+        assert_eq!(
+            add_category("食品", "income", &["早餐".to_string()]),
+            -1,
+            "重名不能回一个已存在记录的 id"
+        );
+        // 原来的那条不能被这次"添加"改掉
+        assert_eq!(category_type("食品").as_deref(), Some("expense"));
+        assert!(
+            get_subcategories("食品").is_empty(),
+            "重名那次传的 subs 不该落库"
+        );
+        // 反向腿：换个名字照常建
+        assert!(add_category("交通", "expense", &[]) > 0);
     }
 }

@@ -605,10 +605,23 @@ pub fn register_host_api(
     })?;
     host.set("accounting_categories", acc_cats)?;
 
-    // 分类管理：添加分类（返回 id，失败 -1）
+    // 分类管理：添加分类（返回 (id, 失败原因)；成功时 id > 0、原因为空串）
     let acc_cat_add = lua.create_function(|_, (name, ctype): (String, String)| {
         ensure_accounting_db();
-        Ok(accounting::add_category(&name, &ctype, &[]))
+        let id = accounting::add_category(&name, &ctype, &[]);
+        // 面板读的是 `local ok, msg = focusflow.accounting_category_add(...)`，而这里
+        // 原来只回一个 id ⇒ msg 恒为 nil，界面只能说"添加分类失败："四个字。
+        let trimmed = name.trim();
+        let msg = if id >= 0 {
+            String::new()
+        } else if trimmed.is_empty() {
+            "分类名不能是空的（也别只打空格）".to_string()
+        } else if accounting::category_type(trimmed).is_some() {
+            format!("分类 [{trimmed}] 已经存在，要改类型请用「修改分类」")
+        } else {
+            "记账库没打开或写入失败（详见日志）".to_string()
+        };
+        Ok((id, msg))
     })?;
     host.set("accounting_category_add", acc_cat_add)?;
 
