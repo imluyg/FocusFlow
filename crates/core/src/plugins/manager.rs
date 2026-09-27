@@ -559,7 +559,29 @@ impl PluginManager {
         }
 
         let view = if meta.has_view {
-            Self::read_view(&lua).ok()
+            match Self::read_view(&lua) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    // 原来这里是 `.ok()`：源码里声明了 get_view、但首次调用就抛错的插件，
+                    // 结局是 `loaded = true` + 没有视图 + 一个字都不留 —— 插件页看着健康，
+                    // 卡片却永远不出现。同一个失败晚些时候在 `refresh_view` 会返回 `Err`
+                    // 摊给用户（超限那一类还会 `mark_plugin_error`），两边不一致。
+                    // 仍然只留日志、不改 `loaded`：init() 已经跑过，标成"未加载"会让
+                    // 用户以为插件根本没起来（并可能去点"启用"再跑一遍 init）。
+                    if is_limit_error(&e) {
+                        tracing::error!(
+                            "插件 {stem} 的 get_view() 超出指令预算（{e}）：本次取不到视图，\
+                             界面上不会出卡片，界面刷新时会再报一次并停用该插件"
+                        );
+                    } else {
+                        tracing::error!(
+                            "插件 {stem} 声明了 get_view() 但首次取视图就失败（{e}）：\
+                             本次没有视图，界面上不会出卡片"
+                        );
+                    }
+                    None
+                }
+            }
         } else {
             None
         };
