@@ -84,8 +84,21 @@ impl CpmCalculator {
         state.cached_at = None;
     }
 
-    /// 获取当前 CPM（窗口内事件数）。
+    /// 当前**每分钟**次数（CPM 的本义）。
+    ///
+    /// 窗口里的原始计数必须折算到"每分钟"再交出去：三个显示面都把这一个数标成
+    /// 「次/分」（`desktop/ui/js/views.js:32` 的 `次/分`、`desktop/src/tray.rs` 的
+    /// `速度 {}/分`、`desktop/ui/floating.html:71` 的「速度 … / 分」），
+    /// 而窗口长度是 `[stats] cpm_window` 一句手写的配置。原来直接返回窗口计数，
+    /// 于是 `cpm_window = 30` 让所有速度读数**偏低一半**、`= 120` 让它们**偏高一倍**，
+    /// 只有默认 60 秒时碰巧对 —— 而设置页没有这一项的入口，改它的人正是会去改配置的人。
+    /// 折算放在这里而不是放在显示层：一个口径一处实现。
     pub fn get_cpm(&self) -> i64 {
+        (self.window_count() as f64 * (60.0 / self.window)).round() as i64
+    }
+
+    /// 窗口内的原始事件数（不是速率）。用例与内部判定要的是这个。
+    pub fn window_count(&self) -> i64 {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(at) = state.cached_at {
@@ -389,9 +402,33 @@ mod tests {
         for _ in 0..10 {
             calc.record();
         }
+        // 窗口正好 60 秒时"每分钟"与"窗口计数"数值相等 —— 这条碰巧看不出区别，
+        // 区别由 cpm_is_per_minute_not_per_window 钉住。
+        assert_eq!(calc.window_count(), 10);
         assert_eq!(calc.get_cpm(), 10);
         calc.reset();
         assert_eq!(calc.get_cpm(), 0);
+    }
+
+    /// 窗口不是 60 秒时，交出去的速度必须折算到"每分钟"。
+    ///
+    /// 三个显示面都写着「次/分」，而 `cpm_window` 是设置页没有入口、只能在 config.ini
+    /// 手改的一项：改它的人原本会同时把速度读数按倍数改错（30 秒 → 偏低一半，
+    /// 120 秒 → 偏高一倍），只有默认 60 是对的。
+    #[test]
+    fn cpm_is_per_minute_not_per_window() {
+        for (window, want) in [(30.0, 20i64), (120.0, 5), (10.0, 60), (60.0, 10)] {
+            let calc = CpmCalculator::new(window);
+            for _ in 0..10 {
+                calc.record();
+            }
+            assert_eq!(calc.window_count(), 10, "窗口 {window} 秒里存了 10 条");
+            assert_eq!(
+                calc.get_cpm(),
+                want,
+                "窗口 {window} 秒 / 10 次应当报出每分钟 {want}"
+            );
+        }
     }
 
     /// 回归：窗口长度超过机器开机时长时不得 panic。
@@ -407,7 +444,11 @@ mod tests {
         for _ in 0..5 {
             calc.record();
         }
-        assert_eq!(calc.get_cpm(), 5, "窗口远超开机时长：没有一条记录算过期");
+        assert_eq!(
+            calc.window_count(),
+            5,
+            "窗口远超开机时长：没有一条记录算过期"
+        );
         calc.reset();
         assert_eq!(calc.get_cpm(), 0);
     }
@@ -435,7 +476,7 @@ mod tests {
             );
             calc.record();
             assert_eq!(
-                calc.get_cpm(),
+                calc.window_count(),
                 1,
                 "{bad} 被夹住之后 record/get_cpm 都不该炸"
             );

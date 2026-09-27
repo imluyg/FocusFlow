@@ -49,11 +49,16 @@ fn load_config(config: &FocusFlowConfig) -> (bool, Vec<String>) {
 
 /// `exclude` 原始串 → 小写进程名清单（去空白、去空项）+ 被补全的项。
 ///
-/// 比对对象是 `CreateToolhelp32Snapshot` 交回来的进程文件名，**恒带 `.exe`**；
-/// 而 exclude 是 config.ini 里手写的隐私保险丝（设置页没有入口）。旧口径只精确匹配
-/// 小写全名，于是少写后缀的项**静默不生效**：密码管理器全程被记录、一行提示都没有。
-/// 现在缺后缀就补 `.exe`，并把补过的项交回调用方 warn 一条 —— 保险丝要么生效，
+/// exclude 是 config.ini 里手写的隐私保险丝（设置页没有入口），比对对象是
+/// `CreateToolhelp32Snapshot` 交回来的进程文件名。旧口径只精确匹配小写全名，
+/// 于是少写后缀的项**静默不生效**：密码管理器全程被记录、一行提示都没有。
+/// 现在缺扩展名就补 `.exe`，并把补过的项交回调用方 warn 一条 —— 保险丝要么生效，
 /// 要么明确说出它被补全过，不许静默。
+///
+/// 补后缀只对**一个扩展名都没有**的项生效，这条限制不是洁癖：这台机器真实库里就有三个
+/// 不带 `.exe` 的前台进程名（`asktao.mod`、`UninstallTool_x64.dat`、`_unins.tmp`，
+/// 2026-09-27 实测 `dist/FocusFlow/123/data/focusflow_2026.db`）。凡是已经带扩展名的
+/// 一律原样比对 —— 给 `asktao.mod` 再添个 `.exe` 就等于把保险丝换成永远拉不断的那根。
 fn parse_exclude(raw: &str) -> (Vec<String>, Vec<String>) {
     let mut names = Vec::new();
     let mut widened = Vec::new();
@@ -62,7 +67,7 @@ fn parse_exclude(raw: &str) -> (Vec<String>, Vec<String>) {
             continue;
         }
         let lower = item.to_ascii_lowercase();
-        if lower.ends_with(".exe") {
+        if lower.contains('.') {
             names.push(lower);
         } else {
             names.push(format!("{lower}.exe"));
@@ -163,7 +168,7 @@ pub fn start_sampler(writer: Arc<DbWriter>) -> crate::startup::CheckResult {
                     // 只在原始串真的变过时 warn：每轮都 warn 就是一秒一条刷屏
                     if !widened.is_empty() {
                         tracing::warn!(
-                            "[app_stats] exclude 里这些项没写 .exe，已按进程名补全后生效：{}",
+                            "[app_stats] exclude 里这些项没写扩展名，已按进程名补 .exe 后生效：{}",
                             widened.join(", ")
                         );
                     }
@@ -407,6 +412,29 @@ mod tests {
     fn empty_exclude_allows_everything() {
         let exclude: Vec<String> = Vec::new();
         assert!(is_recordable("msedge.exe", &exclude));
+    }
+
+    /// **已经带扩展名的项必须原样比对**（2026-09-27 用他的运行时库实测出来的回归）：
+    /// 真实库里就有三个不带 `.exe` 的前台进程名 —— `asktao.mod`、`UninstallTool_x64.dat`、
+    /// `_unins.tmp`。上一轮那条"缺后缀就补 `.exe`"的规则若按后缀名判断，会把
+    /// `asktao.mod` 改成 `asktao.mod.exe`：一个不存在的进程名，于是那根保险丝
+    /// 变成永远拉不断的那根，而且比改之前更难发现（配置里看着是写了的）。
+    #[test]
+    fn exclude_entry_with_other_extension_is_matched_verbatim() {
+        let (ex, widened) = parse_exclude("asktao.mod, UninstallTool_x64.dat");
+        assert_eq!(
+            ex,
+            vec![
+                "asktao.mod".to_string(),
+                "uninstalltool_x64.dat".to_string()
+            ]
+        );
+        assert!(widened.is_empty(), "已经带扩展名的项不该被补成 .exe");
+        assert!(!is_recordable("asktao.mod", &ex), "原样名字必须真的拦得住");
+        assert!(
+            is_recordable("asktao.mod.exe", &ex),
+            "补后缀会造出一个不存在的进程名，等于换了个命中面"
+        );
     }
 
     /// 快照取空 = WinAPI 失败，绝不能把整张 PID→名字表换空：一次瞬时失败会让
