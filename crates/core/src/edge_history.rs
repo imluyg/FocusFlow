@@ -315,35 +315,39 @@ pub fn save_edge_history_count(target_date: NaiveDate, count: i64) -> Result<(),
 /// 判，只能看窗口内到底有没有行 —— 补成一整列 0 就等于把"没刷过"伪装成"每天都是 0"。
 /// 天数上限 366 只是防御性的：真正决定 `with_capacity` 的数值不能来自外部（release 是
 /// `panic = "abort"`，`i64::MAX` 那种值会直接在分配处崩掉整个程序）。
-pub fn get_edge_history_counts(days: i64) -> Vec<(String, i64)> {
+///
+/// `Err` 只表示**读不出可信内容**（本地缓存库打不开、查询失败），与"读到了、库里就是
+/// 没有行"是两件事：旧写法把两种都回成空表，于是"刷新成功、数据为空"与"本地缓存根本
+/// 读不动"在界面上长得一模一样（与上一场修掉的落盘假成功同族）。
+pub fn get_edge_history_counts(days: i64) -> Result<Vec<(String, i64)>, String> {
     let path = edge_db_path();
     if !path.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let conn = match open_local() {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+    let conn = open_local().map_err(|e| format!("打开本地缓存库失败: {e}"))?;
+    // 「表还没建过」与「表在但这一窗没有行」都是真的没刷过，不是读不动 ——
+    // 首次刷新之前 `open_local()` 刚创建出来的就是这份空库。
+    if !history_table_exists(&conn)? {
+        return Ok(Vec::new());
+    }
     let days = days.clamp(1, 366);
     let today = Local::now().date_naive();
     let Some(start) = today.checked_sub_days(chrono::Days::new((days - 1) as u64)) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let start_str = start.format("%Y-%m-%d").to_string();
-    let result = conn
+    let mut stmt = conn
         .prepare("SELECT date, count FROM edge_history WHERE date >= ?1 ORDER BY date")
-        .and_then(|mut stmt| {
-            stmt.query_map([&start_str], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })
-            .map(|it| it.flatten().collect::<Vec<(String, i64)>>())
-        });
-    let saved: Vec<(String, i64)> = match result {
-        Ok(rows) => rows,
-        Err(_) => return Vec::new(),
-    };
+        .map_err(|e| format!("准备趋势查询失败: {e}"))?;
+    let saved: Vec<(String, i64)> = stmt
+        .query_map([&start_str], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })
+        .map_err(|e| format!("查询趋势失败: {e}"))?
+        .flatten()
+        .collect();
     if saved.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut by_date: std::collections::HashMap<String, i64> = saved.into_iter().collect();
@@ -358,7 +362,7 @@ pub fn get_edge_history_counts(days: i64) -> Vec<(String, i64)> {
             None => break,
         }
     }
-    out
+    Ok(out)
 }
 
 /// 刷新状态（`RefreshSlot::state` 的取值）。
@@ -603,7 +607,17 @@ pub fn update_today_edge_history() -> (bool, i64, i64) {
 /// 每个历史日因此**恰好**被重查一次（下一次刷新时），不会天天回头改写更老的日子。
 fn stale_days_before(today: NaiveDate, days: i64) -> Vec<NaiveDate> {
     let start = today - chrono::Days::new((days - 1).max(0) as u64);
-    let saved = saved_rows_since(start);
+    let saved = match saved_rows_since(start) {
+        Ok(rows) => rows,
+        Err(e) => {
+            // 读不出判据 ≠ 判据说"这些天都没有行"。旧写法 `unwrap_or_default()` 把两件事
+            // 并成一件，于是整窗 29 天全被判成陈旧：每轮刷新都为这 29 天重查 Edge、并在
+            // 库里被别的连接占住时走 ≤100MB×3 的整文件复制兜底 —— 白烧一整轮 IO，
+            // 而且永远不收敛（因为下一次照样读不动）。跳过本轮补档，下一轮再挑。
+            tracing::warn!("Edge 补档判据读不出来，本轮跳过补档（下一轮重试）: {e}");
+            return Vec::new();
+        }
+    };
     let mut out = Vec::new();
     let mut day = start;
     while day < today {
@@ -631,22 +645,44 @@ fn day_end(updated_at: i64, day: NaiveDate) -> bool {
     }
 }
 
+/// `edge_history` 表在不在。`Err` = 这份库根本读不动（不是数据库、被别的连接占着、
+/// 模式损坏），`Ok(false)` 才是"从没建过表"。
+///
+/// 拆出来是因为两条读路都把"表还没建"当成判据：首刷之前 `open_local()` 刚创建的
+/// 空库就是这种状态，直接查 `edge_history` 会报 `no such table`，那不该混进"读不动"。
+fn history_table_exists(conn: &Connection) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='edge_history' LIMIT 1")
+        .map_err(|e| format!("检查 edge_history 表失败: {e}"))?;
+    let found = stmt
+        .query_map([], |r| r.get::<_, i64>(0))
+        .map_err(|e| format!("读取表清单失败: {e}"))?
+        .flatten()
+        .next()
+        .is_some();
+    Ok(found)
+}
+
 /// 本地缓存库里 `start` 之后（含）已有记录的日子 → 该行的写入时刻。
-fn saved_rows_since(start: NaiveDate) -> std::collections::HashMap<String, i64> {
-    open_local()
-        .ok()
-        .and_then(|conn| {
-            conn.prepare("SELECT date, updated_at FROM edge_history WHERE date >= ?1")
-                .ok()
-                .and_then(|mut stmt| {
-                    stmt.query_map([start.format("%Y-%m-%d").to_string()], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-                    })
-                    .ok()
-                    .map(|it| it.flatten().collect())
-                })
+///
+/// `Err` = 这份判据**读不出来**；调用方不许把它当成"读到了、库里没有行"（见
+/// [`stale_days_before`]）。
+fn saved_rows_since(start: NaiveDate) -> Result<std::collections::HashMap<String, i64>, String> {
+    let conn = open_local().map_err(|e| format!("打开本地缓存库失败: {e}"))?;
+    if !history_table_exists(&conn)? {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut stmt = conn
+        .prepare("SELECT date, updated_at FROM edge_history WHERE date >= ?1")
+        .map_err(|e| format!("准备补档判据查询失败: {e}"))?;
+    let rows = stmt
+        .query_map([start.format("%Y-%m-%d").to_string()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         })
-        .unwrap_or_default()
+        .map_err(|e| format!("查询补档判据失败: {e}"))?
+        .flatten()
+        .collect();
+    Ok(rows)
 }
 
 /// 保存上次刷新的数值（meta 表），插件重启后恢复显示，避免出现误导性的 "—" / 0。
@@ -699,7 +735,7 @@ pub fn get_edge_history_saved_total() -> Option<i64> {
 }
 
 /// 本地趋势（近 N 天），供插件展示。
-pub fn trend_counts(days: i64) -> Vec<(String, i64)> {
+pub fn trend_counts(days: i64) -> Result<Vec<(String, i64)>, String> {
     get_edge_history_counts(days)
 }
 
@@ -1165,7 +1201,7 @@ mod tests {
         let today = Local::now().date_naive();
 
         assert!(
-            get_edge_history_counts(30).is_empty(),
+            get_edge_history_counts(30).unwrap().is_empty(),
             "一次都没刷新过时不该编出一张 30 天的表"
         );
 
@@ -1174,7 +1210,7 @@ mod tests {
         // 窗口之外的老日子：存在库里，但不该挤进这张 30 天的表
         save_edge_history_count(today - chrono::Days::new(400), 999).unwrap();
 
-        let counts = get_edge_history_counts(30);
+        let counts = get_edge_history_counts(30).unwrap();
         assert_eq!(counts.len(), 30, "标题写近 30 天就得给满 30 行");
         assert!(
             !counts.iter().any(|(_, c)| *c == 999),
@@ -1203,5 +1239,54 @@ mod tests {
                 w.iter().map(|e| e.0.as_str()).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// A④ 之一（§十五 第 17 条）：本地缓存读不动与"一次都没刷过"必须是两种结果。
+    ///
+    /// 旧写法两处 `return Vec::new()`（打开失败、查询失败）与"库里没有行"都回同一张
+    /// 空表，于是面板上的 "—" 有两种含义，与上一场修掉的"落盘失败仍报刷新成功"同族。
+    #[test]
+    fn unreadable_cache_is_not_reported_as_never_refreshed() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("edge_trend_readfail");
+
+        // 读得到、库里就是没有行 —— 这才是"从没刷过"
+        assert_eq!(
+            get_edge_history_counts(30),
+            Ok(Vec::new()),
+            "一次都没刷新过应当是 Ok(空表)"
+        );
+
+        // 读不动：把本地缓存库的路径占成目录，open 必失败
+        std::fs::create_dir_all(edge_db_path()).expect("占位目录应能建出来");
+        let problem = get_edge_history_counts(30).expect_err("读不出内容不该被说成「没刷过」");
+        assert!(
+            problem.contains("打开本地缓存库失败"),
+            "错误要说清是哪一步读不动: {problem}"
+        );
+    }
+
+    /// A④ 之二（§十五 第 18 条）：补档判据读不动时跳过本轮，而不是把整窗判成陈旧。
+    #[test]
+    fn unreadable_backfill_probe_skips_the_round_instead_of_refilling_every_day() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("edge_stale_probe");
+        let today = Local::now().date_naive();
+
+        // 对照腿（改动前后都必须绿）：读得到但没有行时，29 个历史日全该补档
+        assert_eq!(
+            stale_days_before(today, 30).len(),
+            29,
+            "从没刷过时，窗口里每个历史日都该被挑出来补档"
+        );
+
+        // 读不动：把本地缓存库的路径占成目录，open 必失败。先删掉对照腿里
+        // `open_local()` 已经创建出来的那个空库文件，否则同名占位建不出来。
+        std::fs::remove_file(edge_db_path()).ok();
+        std::fs::create_dir_all(edge_db_path()).expect("占位目录应能建出来");
+        assert!(
+            stale_days_before(today, 30).is_empty(),
+            "判据读不出来时本轮不该补档 —— 那要留给下一轮"
+        );
     }
 }

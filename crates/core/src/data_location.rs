@@ -363,6 +363,27 @@ pub fn run_pending_migration() -> Option<MigrationReport> {
 /// 进程只能初始化一次、路径启动即钉死，单测里换不了目录；不依赖配置的部分拆出来才按得住。
 /// 成功后由调用方清标记。
 pub fn migrate_data_tree(from: &Path, to: &Path) -> Result<MigrationReport, String> {
+    // 源侧根目录必须读得出来。旧写法让"旧根里既没有 data/ 也没有 backup/"一路
+    // continue 过去：copy_data_tree 零错误、verify_copy 零核对项、remove_source_trees
+    // 零可删 → 返回 Ok(copied: 0) → 调用方清掉 data_migrate_from 标记。可"旧数据根
+    // 此刻读不出来"（U 盘/网络盘还没挂上、`data_home` 回退成了程序目录、config.ini
+    // 里那行是相对路径而 CWD 变了）与"旧根确实没有历史"在旧实现里长得一模一样，
+    // 前者被清掉标记就等于从"这次没搬成"升级成"永远不再搬"：全部历史留在旧目录，
+    // 新目录从今天起开始攒第二份，两边越差越远。
+    if !from.is_dir() {
+        return Err(format!(
+            "旧数据目录读不出来（{}）：不存在、不是目录，或那个盘还没挂上；标记保留，下次启动重试",
+            from.display()
+        ));
+    }
+    // 读得出来、但两棵子树都没有：这确实是"没有可搬的历史"，让它成功（否则刚装完
+    // 就改目录的用户会被这个标记钉在旧目录上，永远搬不完），只留一条 warn 备查。
+    if !from.join("data").is_dir() && !from.join("backup").is_dir() {
+        tracing::warn!(
+            "旧数据目录 {} 里没有 data/ 也没有 backup/，本次按「没有可搬的历史」完成",
+            from.display()
+        );
+    }
     let summary = copy_data_tree(from, to);
     if summary.has_errors() {
         return Err(join_errors(&summary));
@@ -779,6 +800,38 @@ mod tests {
             from.path().join("data/focusflow_2026.db").exists(),
             "没核对通过时源必须原样留着"
         );
+    }
+
+    #[test]
+    fn migrate_data_tree_refuses_a_source_root_that_cannot_be_read() {
+        let _lock = paths::test_app_dir_lock();
+        let from = paths::test_app_dir("mr_from");
+        let to = paths::test_app_dir("mr_to");
+        paths::set_app_dir(from.path());
+
+        // 旧根读不出来（U 盘/网络盘没挂上、data_home 回退、相对路径撞上别的 CWD 都是
+        // 这一类）：旧实现里 copy_data_tree 零错误、verify_copy 零核对项、删源零可删，
+        // 于是返回 Ok(copied: 0) → 调用方把 data_migrate_from 标记清掉 ⇒
+        // "这次没搬成"升级成"永远不再搬"，历史留在旧目录、新目录开始攒第二份。
+        let not_mounted = from.path().join("not-mounted");
+        let e = migrate_data_tree(&not_mounted, to.path()).expect_err("源根读不出来时必须失败");
+        assert!(
+            e.contains("读不出来"),
+            "文案要说清是「没搬成」而不是「搬完了」: {e}"
+        );
+        // 目标侧必须是干净的：`test_app_dir` 自己会建出空的 `data/`，所以判"有没有
+        // 落下半截东西"要看条目数，不能判目录在不在。
+        let landed = std::fs::read_dir(to.path().join("data"))
+            .map(|it| it.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(landed, 0, "失败不该在新目录里留下半截东西");
+
+        // 反向腿：旧根读得出来、里面确实没有历史（刚装完就改数据目录）必须成功，
+        // 否则这个用户会被标记钉在旧目录上永远搬不完
+        let fresh = from.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let rep = migrate_data_tree(&fresh, to.path()).expect("空的旧根不该卡住迁移");
+        assert_eq!(rep.summary.copied, 0);
     }
 
     #[test]

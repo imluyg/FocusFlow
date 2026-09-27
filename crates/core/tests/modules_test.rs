@@ -203,7 +203,7 @@ mod tests {
         edge_history::save_edge_history_count(prev, 50).unwrap();
 
         // 读取趋势
-        let counts = edge_history::get_edge_history_counts(30);
+        let counts = edge_history::get_edge_history_counts(30).expect("本地缓存应能读");
         assert!(!counts.is_empty(), "应有趋势数据");
         // 应包含今天和昨天
         let today_str = today.format("%Y-%m-%d").to_string();

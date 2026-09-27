@@ -845,7 +845,15 @@ pub fn register_host_api(
     host.set("edge_refresh_state", edge_state)?;
 
     let edge_counts = lua.create_function(|lua, days: i64| {
-        let data = edge_history::get_edge_history_counts(days.clamp(1, 90));
+        // 读不出本地缓存与"从没刷过"对 Lua 仍是同一张空表（第三方脚本的签名不动），
+        // 但两者在日志里必须分得开：前者是缓存库读不动，后者是这个功能还没用过。
+        let data = match edge_history::get_edge_history_counts(days.clamp(1, 90)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!("Edge 趋势读不出来（面板会画成「从没刷过」）: {e}");
+                Vec::new()
+            }
+        };
         let t = lua.create_table()?;
         for (i, (date, count)) in data.iter().enumerate() {
             let row = lua.create_table()?;

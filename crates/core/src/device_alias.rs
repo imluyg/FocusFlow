@@ -36,17 +36,21 @@ impl AliasTable {
         let mut exact = HashMap::new();
         let mut model: HashMap<String, Option<String>> = HashMap::new();
         for (key, alias) in map {
-            if alias.trim().is_empty() {
+            // 长度闸必须在读侧：文件按模块头注释「可直接手改」，只在 `set()` 里钳
+            // 挡不住手写进来的超长值 —— 那样 MAX_ALIAS_CHARS 那条"撑破表格"的防线
+            // 从下一次读起就失效。`clamp_alias` 顺带去首尾空白，与 `set()` 存的形态一致。
+            let alias = clamp_alias(alias);
+            if alias.is_empty() {
                 continue;
             }
             exact.insert(key.clone(), alias.clone());
             if let Some(model_key) = model_key(key) {
                 match model.get(&model_key) {
                     None => {
-                        model.insert(model_key, Some(alias.clone()));
+                        model.insert(model_key, Some(alias));
                     }
                     // 同型号已有不同别名 → 标记歧义
-                    Some(Some(existing)) if existing != alias => {
+                    Some(Some(existing)) if *existing != alias => {
                         model.insert(model_key, None);
                     }
                     Some(_) => {}
@@ -160,25 +164,44 @@ pub fn migrate_exact_keys_to_identity() {
     let mut migrated: BTreeMap<String, String> = BTreeMap::new();
     let mut changed = false;
     for (key, alias) in &map {
+        // 迁移是「原样读 → 原样写回」，不过长度闸就等于把超长别名再落一次盘
+        let alias = clamp_alias(alias);
+        if alias.is_empty() {
+            continue;
+        }
         let identity = hardware_identity_key(key);
         if identity == *key {
-            migrated.insert(key.clone(), alias.clone());
+            // 已是身份键的那条，同样可能撞上前面「完整路径迁过来」的那条：
+            // 必须走下面同一套判定。无条件 insert 是**后来者覆盖** —— 完整路径以
+            // 枚举器名开头（`HID#`、`USB#`），身份键以中间那段 `VID_` 开头，
+            // BTreeMap 序里前者必在前，于是用户的别名会被无声换掉，而函数头
+            // 承诺的是「序在前的赢 + 被挤掉的记 warn」。
+            match migrated.get(&identity) {
+                Some(existing) if *existing != alias => {
+                    tracing::warn!(
+                        "别名迁移：{key} 与已迁移条目并到同一身份键 {identity}，保留「{existing}」、丢弃「{alias}」"
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    migrated.insert(identity, alias);
+                }
+            }
             continue;
         }
         changed = true;
         match migrated.get(&identity) {
             // 身份键已存在且来自别的旧路径：键序在前的赢（BTreeMap 迭代有序）
-            Some(existing) if existing != alias => {
+            Some(existing) if *existing != alias => {
                 tracing::warn!(
                     "别名迁移：{key} 与已有条目并到同一身份键 {identity}，保留「{existing}」、丢弃「{alias}」"
                 );
             }
             Some(_) => {
                 // 同名别名：并入即可，不用记
-                let _ = &identity;
             }
             None => {
-                migrated.insert(identity, alias.clone());
+                migrated.insert(identity, alias);
             }
         }
     }
@@ -558,6 +581,136 @@ mod tests {
             migrate_exact_keys_to_identity();
             let text2 = std::fs::read_to_string(alias_path()).unwrap();
             assert_eq!(text, text2, "第二次迁移应是空操作");
+        });
+    }
+
+    /// 只抓**当前线程**的 tracing 消息（`with_default` 是线程本地的作用域）：
+    /// 并行的其它用例既不会被这里收走，也不会串进来。
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+        struct MsgVisitor<'a>(&'a mut String);
+
+        impl tracing::field::Visit for MsgVisitor<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    *self.0 = format!("{value:?}");
+                }
+            }
+        }
+
+        impl<S: Subscriber> Layer<S> for Sink {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut msg = String::new();
+                event.record(&mut MsgVisitor(&mut msg));
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(msg);
+            }
+        }
+
+        let sink = Sink::default();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(sink.clone()));
+        let out = tracing::dispatcher::with_default(&dispatch, f);
+        let msgs = sink.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (out, msgs)
+    }
+
+    /// A①（§十五 第 15 条）：迁移撞上**已有身份键**时，序在前的赢，被挤掉的必须留 warn。
+    ///
+    /// 完整路径 `HID#…` 在 BTreeMap 里必排在身份键 `VID_…` 之前，所以"已是身份键"
+    /// 那一支的无条件 insert 是后来者覆盖：用户的别名被无声换掉、一条日志都没有。
+    #[test]
+    fn migration_keeps_the_first_alias_and_warns_about_the_dropped_one() {
+        with_temp_dir("migrate_collide", || {
+            let full = "HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000";
+            let ident = "VID_046D&PID_C52B&MI_00";
+            set(full, "办公鼠标").unwrap();
+            set(ident, "家里那把").unwrap();
+            invalidate_cache();
+
+            let ((), logs) = capture_logs(migrate_exact_keys_to_identity);
+
+            let text = std::fs::read_to_string(alias_path()).unwrap();
+            let after: BTreeMap<String, String> = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                after.len(),
+                1,
+                "两条应并成一条身份键条目（而不是留下两个键）: {text}"
+            );
+            assert_eq!(
+                after.get(ident).map(|s| s.as_str()),
+                Some("办公鼠标"),
+                "承诺的是「序在前的赢」，不是后来者覆盖: {text}"
+            );
+            assert!(
+                logs.iter().any(|l| l.contains("丢弃")),
+                "被挤掉的那条必须留 warn，否则用户不知道名字什么时候换的: {logs:?}"
+            );
+        });
+    }
+
+    /// A②（§十五 第 16 条）：长度闸不能只在 `set()` 里 —— 手改的文件读进来也要钳。
+    #[test]
+    fn hand_edited_overlong_alias_is_clamped_when_read() {
+        with_temp_dir("clamp_read", || {
+            let key = "HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000";
+            let long = "鼠".repeat(MAX_ALIAS_CHARS + 36);
+            let map = BTreeMap::from([(key.to_string(), long.clone())]);
+            std::fs::create_dir_all(alias_path().parent().unwrap()).unwrap();
+            std::fs::write(alias_path(), serde_json::to_string(&map).unwrap()).unwrap();
+            invalidate_cache();
+
+            // 夹具必须是真超长的，否则这条用例什么都没测
+            let text = std::fs::read_to_string(alias_path()).unwrap();
+            assert!(text.contains(&long), "文件里应留着超长原文: {text}");
+
+            let cached = table();
+            let got = cached.resolve(key).expect("手改的别名应能读到");
+            assert_eq!(
+                got.chars().count(),
+                MAX_ALIAS_CHARS,
+                "读侧必须过长度闸（撑破表格的防线不能只在写侧）: {got}"
+            );
+            // 型号回退用的是同一份索引，也必须是被钳过的值
+            let replugged = "HID#VID_046D&PID_C52B&MI_00#9&2c5f77d4&0&0001";
+            assert_eq!(
+                table().resolve(replugged).map(|s| s.chars().count()),
+                Some(MAX_ALIAS_CHARS),
+                "回退命中时不该拿出未钳的别名"
+            );
+        });
+    }
+
+    /// A② 的另一半：迁移「读原样 → 写回」时不得把超长别名再落一次盘。
+    #[test]
+    fn migration_writes_aliases_through_the_length_gate() {
+        with_temp_dir("clamp_migrate", || {
+            let full = "HID#VID_1B1C&PID_1B2D#7&1111&0&0000";
+            let long = "键".repeat(MAX_ALIAS_CHARS + 20);
+            let map = BTreeMap::from([(full.to_string(), long.clone())]);
+            std::fs::create_dir_all(alias_path().parent().unwrap()).unwrap();
+            std::fs::write(alias_path(), serde_json::to_string(&map).unwrap()).unwrap();
+            invalidate_cache();
+
+            migrate_exact_keys_to_identity();
+
+            let text = std::fs::read_to_string(alias_path()).unwrap();
+            let after: BTreeMap<String, String> = serde_json::from_str(&text).unwrap();
+            let kept = after
+                .get("VID_1B1C&PID_1B2D")
+                .expect("完整路径应改挂到身份键");
+            assert_eq!(
+                kept.chars().count(),
+                MAX_ALIAS_CHARS,
+                "迁移写回要过长度闸: {kept}"
+            );
+            assert!(
+                !text.contains(&long),
+                "超长原文不该被迁移原样再落一次盘: {text}"
+            );
         });
     }
 }
