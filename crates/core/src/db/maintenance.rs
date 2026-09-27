@@ -1351,6 +1351,12 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
             tracing::error!("附属库备份失败（已清理半成品）: {name}");
         }
     }
+    // 设备别名表跟着这一轮一起快照与轮转：它既不在年度库也不在附属库里，
+    // 而失败不并入 `failed` —— 库已经备份好了，把"别名文件此刻读不出来"报成
+    // 整轮备份失败会让设置页与破坏性快照一起发出假警报（该函数内部只记 error）。
+    let alias_frozen = suspicious_detail.is_some();
+    backup_alias_snapshot(&timestamp);
+    rotate_alias_backups(max_backups.max(1) as usize, alias_frozen);
     if !backed_up.is_empty() {
         let mut policy = RetentionPolicy::from_config(config);
         // 调用方传入的 max_backups 覆盖「最近 N 份」（保持旧签名语义不变）
@@ -1384,6 +1390,92 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
         }
     } else {
         BackupOutcome::NothingToDo
+    }
+}
+
+/// 别名快照集合（`backup/focusflow_aliases_*.json`），**旧 → 新** 排序。
+///
+/// 主键用 mtime，文件名做平手时的次键：文件名里的时间戳是定宽的
+/// （`%Y%m%d_%H%M%S%3f`），字典序即时间序 —— 没有次键时同一毫秒内的两份
+/// 谁先谁后不确定，轮转就可能删掉新的那份。
+fn alias_backups() -> Vec<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(paths::backup_dir())
+        .map(|it| {
+            it.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| {
+                            let n = n.to_string_lossy();
+                            n.starts_with("focusflow_aliases_") && n.ends_with(".json")
+                        })
+                        .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // sort_by_cached_key：key 里带 stat 系统调用，sort_by_key 会按比较次数重复 stat
+    files.sort_by_cached_key(|p| {
+        (
+            file_mtime(p.as_path()),
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        )
+    });
+    files
+}
+
+/// 给 `data/device_aliases.json` 留一份快照，**只在内容真的变了的时候**。
+///
+/// 它和库一样属于"丢了找不回来"的用户数据（库里只存自动名，型号回退键也在这个文件
+/// 里），而整套备份原先只复制 `.db` —— 于是它是唯一一个用户手工录入、却没有任何
+/// 自动副本的文件（`config.ini` 至少还有 `backup_original_once` 留的 `.bak`）。
+/// 反过来按轮次无脑复制也不对：改名是低频动作，备份却每次退出都跑，
+/// 那样 backup/ 里会堆一串逐字节相同的 json。
+///
+/// 三种"这次不留"要分开：从没改过名（文件不存在）是常态，静默；内容与最新那份相同
+/// 是预期，静默；**文件被占用/权限读不出来**必须记 error —— 那正是需要人知道的一种，
+/// 但它不改变本轮备份的结论（见 [`backup_database`] 里的调用点注释）。
+fn backup_alias_snapshot(timestamp: &str) {
+    let src = crate::device_alias::file_path();
+    let bytes = match std::fs::read(&src) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::error!(
+                "设备别名快照跳过：别名文件此刻读不出来（{}）: {e}",
+                src.display()
+            );
+            return;
+        }
+    };
+    if let Some(newest) = alias_backups().pop() {
+        if std::fs::read(&newest).is_ok_and(|old| old == bytes) {
+            return;
+        }
+    }
+    let dst = paths::backup_dir().join(format!("focusflow_aliases_{timestamp}.json"));
+    if let Err(e) = std::fs::write(&dst, &bytes) {
+        tracing::error!("设备别名快照写入失败 {}: {e}", dst.display());
+    }
+}
+
+/// 别名快照的轮转：只留最近 `keep` 份。
+///
+/// 不走 `.db` 那套 daily/weekly/monthly 分层 —— 那套是为了限制"每轮都产出一份、
+/// 体积按天涨"的库快照；别名快照按内容去重，留最近 N 份就是"最近 N 次改名前的
+/// 样子"，正是找回旧名字要的东西。异常体检冻结轮转时一份都不删，与库同口径。
+fn rotate_alias_backups(keep: usize, freeze: bool) {
+    if freeze {
+        return;
+    }
+    let files = alias_backups();
+    if files.len() <= keep {
+        return;
+    }
+    for old in files.iter().take(files.len() - keep) {
+        remove_backup(old);
     }
 }
 
@@ -2309,6 +2401,88 @@ mod tests {
             !remaining.contains(&"focusflow_accounting_20260911_100000.db".to_string()),
             "accounting 组最旧备份应被删除"
         );
+    }
+
+    /// 别名快照：**只在内容真的变了时**留一份，并按 keep 轮转、冻结时一份不删。
+    ///
+    /// 钉住两件事 —— 备份每次退出都跑而改名是低频动作，按轮次无脑复制会让 backup/
+    /// 里堆一串逐字节相同的 json；反过来"变了却没留"就等于没有任何自动副本。
+    #[test]
+    fn alias_snapshot_only_when_content_changed() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("alias_snap");
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+        crate::device_alias::invalidate_cache();
+
+        crate::device_alias::set("HID#VID_24AE&PID_1464&MI_00", "新鼠标").unwrap();
+        backup_alias_snapshot("20260928_100000000");
+        backup_alias_snapshot("20260928_100001000");
+        assert_eq!(
+            alias_backups().len(),
+            1,
+            "内容没变不该再留一份（改名是低频动作，备份每次退出都跑）"
+        );
+
+        crate::device_alias::set("HID#VID_24AE&PID_1464&MI_01", "旧键盘").unwrap();
+        backup_alias_snapshot("20260928_100002000");
+        assert_eq!(alias_backups().len(), 2, "改过名就该多一份");
+
+        // 冻结轮转（异常体检）时不得删任何东西，与 .db 同口径
+        rotate_alias_backups(1, true);
+        assert_eq!(alias_backups().len(), 2, "冻结时一份都不许删");
+
+        rotate_alias_backups(1, false);
+        let left = alias_backups();
+        assert_eq!(left.len(), 1);
+        assert!(
+            left[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("100002000"),
+            "留下的一定是最新那份: {:?}",
+            left[0]
+        );
+        crate::device_alias::invalidate_cache();
+    }
+
+    /// 从没改过名（别名文件不存在）：这一步整个跳过，不留文件也不许把备份判成失败。
+    #[test]
+    fn missing_alias_file_leaves_no_snapshot() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("alias_absent");
+        crate::device_alias::invalidate_cache();
+        assert!(!crate::device_alias::file_path().exists());
+
+        let out = backup_database(5);
+        assert!(matches!(out, BackupOutcome::NothingToDo), "{out:?}");
+        assert_eq!(alias_backups().len(), 0, "没有别名文件就不该凭空造一份");
+    }
+
+    /// 有别名、一套库都没有：快照照留，而备份结论仍是「无事可做」。
+    ///
+    /// 两头都要钉住 —— 别名不能因为"这轮没备份库"就被跳过（那正是它唯一没有副本的
+    /// 场景），也不能反过来挤占库的名额、把 NothingToDo 撑成 Done（设置页的
+    /// 「备份数量」只数 `.db`，两码事）。
+    #[test]
+    fn alias_snapshot_lands_even_with_no_databases() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("alias_no_db");
+        crate::device_alias::invalidate_cache();
+        crate::device_alias::set("HID#VID_1234&PID_5678", "手柄").unwrap();
+
+        let out = backup_database(5);
+        assert!(
+            matches!(out, BackupOutcome::NothingToDo),
+            "别名不该改变库的备份结论: {out:?}"
+        );
+        let snaps = alias_backups();
+        assert_eq!(snaps.len(), 1);
+        let body = std::fs::read_to_string(&snaps[0]).unwrap();
+        assert!(body.contains("手柄"), "快照内容就是别名表本身: {body}");
+        // 库的分组查找不能把 json 认成备份
+        assert!(newest_backup_of_group("aliases").is_none());
+        crate::device_alias::invalidate_cache();
     }
 
     /// 跨年归档前必须留下「归档前」快照。

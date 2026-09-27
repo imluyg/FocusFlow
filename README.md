@@ -110,8 +110,10 @@ desktop\build_nsis.bat
   合成的输入不产生 Raw Input，天然不计）；且不做长按去重与修饰键过滤。
 - **设备名看不懂 / 想改名**：设备排行每行点「改名」输入自己的名字（如「新鼠标」），
   按回车保存；有别名时原名会作为副标题保留，点「还原」可恢复自动名。
-  别名存在 `data/device_aliases.json`（纯文本，可直接手改），先在
-  `--rename-device` 前用 `focusflow-cli --device-keys` 查设备标识也行：
+  别名存在 `data/device_aliases.json`（纯文本，可直接手改）。它按**用户数据**对待：
+  随数据目录一起迁移、`--reset` 与按日期清理都不碰它，每次备份另存一份到
+  `backup/focusflow_aliases_*.json`（只在真的改过名时留新的，最多 `max_backups` 份）。
+  先在 `--rename-device` 前用 `focusflow-cli --device-keys` 查设备标识也行：
   `focusflow-cli --rename-device "24AE/1464" "新鼠标"`。
   同名型号换 USB 口后实例路径会变，别名按 VID/PID 型号回退仍然生效（同型号出现
   多个不同别名时该回退自动停用，避免张冠李戴）。

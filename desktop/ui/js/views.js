@@ -946,7 +946,7 @@ const SETTINGS_CATS = [
               $("set-backup-online").addEventListener("change", onBackupOnlineChange);
               $("set-backup-interval").addEventListener("change", onBackupIntervalChange);
             },
-            desc: "备份为单文件快照（不受插件开关影响，属核心功能），每类库各保留最近若干份（数量见 config.ini 的 max_backups）；清空/清理数据、跨年归档前的自动快照始终保留，用于兜底恢复。",
+            desc: "备份为单文件快照（不受插件开关影响，属核心功能），每类库与设备别名表各保留最近若干份（数量见 config.ini 的 max_backups，别名只在真的改过名时留新的一份）；清空/清理数据、跨年归档前的自动快照始终保留，用于兜底恢复。",
           },
           {
             t: "btns", name: "立即备份",

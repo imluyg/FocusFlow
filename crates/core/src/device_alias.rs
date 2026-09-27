@@ -3,6 +3,11 @@
 //! 存储：`data/device_aliases.json`，形如 `{ "HID#VID_24AE&PID_1464&MI_00#7&...": "新鼠标" }`。
 //! 纯文本、可直接手改；解析侧按文件 mtime 变化自动重载（无需重启）。
 //!
+//! 归属是**用户数据**而不是配置：它住在 `data/` 下、随数据目录整体迁移，`--reset` 与
+//! 按日期清理都不碰它；每次备份还会顺带快照一份到 `backup/focusflow_aliases_*.json`
+//! （内容没变不重复留，见 `db::maintenance::backup_alias_snapshot`）。理由是重建代价
+//! 不对称 —— `config.ini` 丢了能靠默认值跑回来，别名丢了找不回来（库里只有自动名）。
+//!
 //! 匹配分两层（`AliasTable::resolve`）：
 //! 1. **精确匹配** device_key（Raw Input 设备实例路径）
 //! 2. 未命中时按 **型号 + 接口** 回退 —— 同型号设备换 USB 口、接收器重插后实例路径会变，
@@ -218,6 +223,11 @@ pub fn migrate_exact_keys_to_identity() {
 /// 别名文件路径。
 fn alias_path() -> PathBuf {
     paths::data_dir().join("device_aliases.json")
+}
+
+/// 别名文件路径（对外只读）。备份模块要拿它做快照 —— 别处不要自己拼这个文件名。
+pub fn file_path() -> PathBuf {
+    alias_path()
 }
 
 /// 缓存：`(文件 mtime, 别名表)`；mtime 未变则复用。
