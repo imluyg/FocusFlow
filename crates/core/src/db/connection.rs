@@ -41,6 +41,14 @@ static RO_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 #[cfg(test)]
 static RO_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// 测试用：**本线程**跑过几次设备归组键的整表重建。
+// 用 thread_local 而不是原子计数：并行跑的用例互不污染对方的数。
+// （写成 `///` 会被 `unused_doc_comment` 拒：宏调用不接文档注释）
+#[cfg(test)]
+thread_local! {
+    static IDENTITY_MIGRATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 // 连接缓存上限：超过则按 LRU 淘汰最久未用的条目，防止多年份库长期运行后无界增长。
 //
 // 上限必须容得下「一个用户的全部年度库」，否则每遍历一轮都要重开被挤掉的连接。
@@ -290,21 +298,38 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
 /// 设备归组键重做（B14-2）：完整实例路径 → 硬件身份段（见
 /// `device_alias::hardware_identity_key`），同身份的历史计数合并求和。
 ///
-/// 幂等：触发条件是 devices 里还有含 `#` 的键（完整路径形态）；迁过的库键已
-/// 无 `#`，一次 EXISTS 就跳过。身份键经身份函数原样返回，重复执行是空操作。
+/// 幂等：守卫问的是"有没有键会在这次迁移里被改变"（不是"库里有没有 `#`" ——
+/// 两段形态与中间段为空的键本来就改不动，拿它当触发条件会让守卫永远为真）。
+/// 身份键经身份函数原样返回，重复执行是空操作。
 /// 整段单事务，失败整体回滚 —— 骨架照 `migrate_device_tables` 的先例。
 ///
 /// 硬取舍（见身份函数注释）：同型号 + 同接口的多台设备在此颗粒度必然并成一台，
 /// 历史计数随之合并 —— 这是迁移的一部分，不是 bug。
 fn migrate_device_identity_keys(conn: &Connection) -> anyhow::Result<()> {
-    let needs: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM devices WHERE device_key LIKE '%#%')",
-        [],
-        |r| r.get(0),
-    )?;
-    if needs == 0 {
+    // 守卫该问的是"这次迁移会不会改变任何键"，而不是"库里有没有 `#`"。
+    // 原来写成 `device_key LIKE '%#%'`，而 `hardware_identity_key` 只在
+    // `parts.len() >= 3 && 中间段非空` 时才剥 `#` ⇒ 两段形态（`HID#ORPHAN`）
+    // 与中间段为空的键（`HID##MI_00`）**迁完仍然原样** ⇒ 守卫永远为真：
+    // 每次 `ensure_schema`（启动/导入/归档都算）都把 devices 与两张统计表整表读进
+    // 内存再 `DROP/CREATE/INSERT/RENAME` 一遍，写锁贯穿全程，那条 info 每次刷。
+    // 不丢数据（身份函数幂等），是"每次启动白干一遍"的白账。
+    let mut needs = false;
+    {
+        let mut stmt = conn.prepare("SELECT device_key FROM devices")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let key = row?;
+            if crate::device_alias::hardware_identity_key(&key) != key {
+                needs = true;
+                break;
+            }
+        }
+    }
+    if !needs {
         return Ok(());
     }
+    #[cfg(test)]
+    IDENTITY_MIGRATIONS.with(|c| c.set(c.get() + 1));
     tracing::info!("设备归组键迁移：完整实例路径 → 硬件身份段（同身份合并计数）");
     conn.execute("BEGIN IMMEDIATE;", [])?;
     let migrate = (|| -> anyhow::Result<()> {
@@ -1066,6 +1091,70 @@ mod tests {
         ensure_schema(&conn, year).unwrap();
         assert_eq!(ones_reopen(&conn, 1000), (42, 3600), "重复迁移必须幂等");
         drop(conn);
+    }
+
+    /// 回归（第八扫 A2）：`migrate_device_identity_keys` 的守卫原来问的是
+    /// "库里有没有 `#`"（`device_key LIKE '%#%'`），而 `hardware_identity_key` 只在
+    /// `parts.len() >= 3 && 中间段非空` 时才剥 `#` ⇒ 两段形态（`HID#ORPHAN`）与
+    /// 中间段为空的键（`HID##MI_00`）**迁完还是原样**，守卫于是永远为真：
+    /// 每次 `ensure_schema`（启动/导入/归档都算）都把 devices 与两张统计表整表读进
+    /// 内存再 `DROP/CREATE/INSERT/RENAME` 一遍，写锁贯穿、info 每次刷。
+    /// 不丢数据，但那是"每次启动白干一遍"的白账，而且上面那条"幂等"用例分不出来
+    /// （它只查数据守恒，重建十遍也守恒）—— 所以这条直接数**重建跑了几次**。
+    #[test]
+    fn identity_migration_guard_asks_whether_anything_changes() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("conn_ident_guard");
+        let year = 2031i32;
+        let path = crate::paths::year_db_path(year);
+        let conn = open_rw(&path).unwrap();
+        ensure_schema(&conn, year).unwrap();
+        conn.execute("DELETE FROM devices", []).unwrap();
+        for (id, key, name) in [
+            (1i64, "HID#ORPHAN", "孤儿"),
+            (2, "HID##MI_00", "空段"),
+            (3, "VID_046D&PID_C52B", "已归一"),
+        ] {
+            conn.execute(
+                "INSERT INTO devices (id, device_key, name, kind) VALUES (?1, ?2, ?3, 'mouse')",
+                rusqlite::params![id, key, name],
+            )
+            .unwrap();
+        }
+        let base = IDENTITY_MIGRATIONS.with(|c| c.get());
+        migrate_device_identity_keys(&conn).unwrap();
+        assert_eq!(
+            IDENTITY_MIGRATIONS.with(|c| c.get()),
+            base,
+            "三个键都改不动 ⇒ 守卫不该放行整表重建"
+        );
+
+        // 反向腿：真有一条完整实例路径 ⇒ 必须放行，而且迁过之后再跑就该收手
+        conn.execute(
+            "INSERT INTO devices (id, device_key, name, kind) VALUES (4, 'HID#VID_1234&PID_5678#MI_00', '路径', 'kbd')",
+            [],
+        )
+        .unwrap();
+        migrate_device_identity_keys(&conn).unwrap();
+        assert_eq!(
+            IDENTITY_MIGRATIONS.with(|c| c.get()),
+            base + 1,
+            "有键会被改变时守卫必须放行"
+        );
+        migrate_device_identity_keys(&conn).unwrap();
+        assert_eq!(
+            IDENTITY_MIGRATIONS.with(|c| c.get()),
+            base + 1,
+            "迁完之后第二次不该再重建一遍"
+        );
+        // 改不动的那几行不能被顺手丢掉
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            rows >= 3,
+            "迁不动的键要原样留着（宁可保持原状也不错并）: {rows}"
+        );
     }
 
     fn ones_reopen(conn: &rusqlite::Connection, dk: i64) -> (i64, i64) {
