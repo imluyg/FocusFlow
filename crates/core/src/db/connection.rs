@@ -6,7 +6,7 @@
 //! - 设备维度：`devices` 是整数 id 字典表，`device_counts` / `device_key_counts`
 //!   只存 `device_id` —— 设备实例路径有 84~151 字符，逐行存它会让设备明细表
 //!   年涨 4~7MB（是其余全部统计表的 4~7 倍），字典化后降到 ~0.5MB/年。
-//!   旧库的 `device_key` TEXT 形态由 [`migrate_device_tables`] 自动转换。
+//!   旧库的 `device_key` TEXT 形态由 `migrate_device_tables` 自动转换。
 //! - `key_log` 是**导入旧版库时的暂存表**，运行期不写：不再由 `ensure_schema`
 //!   无条件创建（每年库白占 4 页），只在导入路径用 [`ensure_staging_table`] 建。
 //! - `meta` 表记录元信息

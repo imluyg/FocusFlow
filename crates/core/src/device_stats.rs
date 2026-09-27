@@ -214,7 +214,7 @@ pub(crate) mod classify {
     }
 }
 
-/// 启动设备统计线程（[device_stats] enabled=false 可关停；非 Windows 无操作）。
+/// 启动设备统计线程（`[device_stats] enabled=false` 可关停；非 Windows 无操作）。
 ///
 /// `paused` 必须与 `InputListener` 持有的是同一份（见 `listener::PauseFlag`）：
 /// 设备侧信道只有 `Arc<DbWriter>`，拿不到监听器，暂停状态只能靠这份共享标志传进来。

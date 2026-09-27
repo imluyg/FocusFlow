@@ -127,7 +127,7 @@ pub enum Widget {
     },
     /// 横向行容器（子控件按行排列）
     Row { children: Vec<Widget> },
-    /// 分页条：[上一页] 第 x/y 页 · 共 N 条 [下一页]
+    /// 分页条：「上一页」 第 x/y 页 · 共 N 条 「下一页」
     Pager {
         page: i64,
         pages: i64,

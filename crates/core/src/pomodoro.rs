@@ -270,7 +270,7 @@ impl PomodoroTimer {
         s.auto_break = config.get_bool("pomodoro", "auto_break", s.auto_break);
     }
 
-    /// 供宿主 API `pomodoro_set_durations` 调用：与 [`apply_config`] 必须是同一套约束。
+    /// 供宿主 API `pomodoro_set_durations` 调用：与 [`PomodoroTimer::apply_config`] 必须是同一套约束。
     ///
     /// 夹取范围与配置那条路一致（1..=180）。以前这里只有 `.max(1)`，
     /// 于是"config.ini 多写一位数不该变成 1666 小时的倒计时"那条理由
@@ -351,7 +351,7 @@ impl PomodoroTimer {
         s.paused
     }
 
-    /// 跳过当前阶段：**这段作废**，与 [`stop`] 唯一的差别就是不落库。
+    /// 跳过当前阶段：**这段作废**，与 [`PomodoroTimer::stop`] 唯一的差别就是不落库。
     ///
     /// 工作到一半按下来，已过的时间和本阶段键鼠数都不写进会话表，因此既不占
     /// 今日番茄数也不进键鼠统计。刻意保留这个语义（而不是让「跳过」记成一个
