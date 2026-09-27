@@ -95,6 +95,38 @@ impl AggDeltas {
             && self.device_keys.is_empty()
     }
 
+    /// 把另一份增量并进这一份（恢复快照算 `agg ∪ 在途批次` 用）。
+    ///
+    /// 只并在七项计数，`device_meta` / `current_app` 不参与：它们是会话态，
+    /// 恢复文件的格式里根本没有这两栏（见 `AggDeltasFile`）。
+    fn merge_in(&mut self, other: &AggDeltas) {
+        for (dk, n) in &other.daily {
+            *self.daily.entry(*dk).or_insert(0) += n;
+        }
+        for (k, n) in &other.hourly {
+            *self.hourly.entry(*k).or_insert(0) += n;
+        }
+        for (dk, map) in &other.keys {
+            let day = self.keys.entry(*dk).or_default();
+            for (key, n) in map {
+                *day.entry(key.clone()).or_insert(0) += n;
+            }
+        }
+        for (dk, n) in &other.active {
+            *self.active.entry(*dk).or_insert(0) += n;
+        }
+        for (k, n) in &other.apps {
+            *self.apps.entry(k.clone()).or_insert(0) += n;
+        }
+        for (k, n) in &other.devices {
+            *self.devices.entry(k.clone()).or_insert(0) += n;
+        }
+        for (k, n) in &other.device_keys {
+            *self.device_keys.entry(k.clone()).or_insert(0) += n;
+        }
+        self.last_ts = self.last_ts.max(other.last_ts);
+    }
+
     /// 取走待落库增量。`last_ts` / `current_app` / `device_meta` 保留在内存聚合中：
     /// 前者否则每次 flush 都会打断连续活跃判定（每 10 秒白丢一段时长），
     /// 后两者是会话态（当前前台应用、设备名称缓存），不属于待落库数据。
@@ -196,6 +228,17 @@ struct WriterState {
     /// 启动回放后留下的兜底副本路径，等**首批增量真的落库**才删（见 `take_recovery`）。
     /// `None` = 这次启动没有回放任何东西。
     recovery_leftover: Mutex<Option<std::path::PathBuf>>,
+    /// 已经被 `flush_pending` 从 `agg` 取走、SQLite 落库结果还没出来的那一批。
+    ///
+    /// 存在的理由只有一个：恢复快照必须看得见它。`flush_pending` 在 agg 锁内取走
+    /// 批次、在锁外做 IO，而 `stop()` 只等 3 秒、panic hook 更是随时插进来 ——
+    /// 只按 `agg` 写文件的话，**正好在写的那一批**既不在库里、也不在文件里，
+    /// 而它要等到进程早就退出之后才轮到回填，等于退出即丢。
+    /// 锁序一律 agg → in_flight（两边都按这个顺序拿，别处不得反过来）。
+    in_flight: Mutex<AggDeltas>,
+    /// `stop()` 超时或 panic 真的写出过恢复文件：在途批次出结果后要由写线程把
+    /// 文件收敛成"此刻真正未落库的集合"（见 [`settle_after_stop_snapshot`]）。
+    stop_snapshot_taken: AtomicBool,
 }
 
 /// 写入器句柄（Send + Sync，可跨线程持有）。
@@ -282,6 +325,8 @@ impl DbWriter {
         preload_device_meta(&mut initial);
         let state = Arc::new(WriterState {
             agg: Mutex::new(initial),
+            in_flight: Mutex::new(AggDeltas::default()),
+            stop_snapshot_taken: AtomicBool::new(false),
             sig_tx,
             today_count: AtomicU64::new(today_base_count),
             today_active: AtomicU64::new(today_base_active),
@@ -677,10 +722,15 @@ fn snapshot_recovery(state: &WriterState, take: bool) {
     let Ok(mut agg) = state.agg.try_lock() else {
         return;
     };
-    if agg.is_empty() {
+    // 快照范围是 agg ∪ 在途批次：只按 agg 写文件的话，正在落库的那一批
+    // （`flush_pending` 已在 agg 锁内取走、SQLite IO 还在锁外跑）会同时不在库里、
+    // 不在内存里、也不在兜底文件里 —— 而这恰恰是 stop 超时/panic 最常见的形态。
+    let mut merged = agg.clone();
+    merged.merge_in(&state.in_flight.lock().unwrap_or_else(|e| e.into_inner()));
+    if merged.is_empty() {
         return;
     }
-    let json = match serde_json::to_string(&AggDeltasFile::from(&*agg)) {
+    let json = match serde_json::to_string(&AggDeltasFile::from(&merged)) {
         Ok(j) => j,
         Err(e) => {
             tracing::error!("恢复文件序列化失败: {e}");
@@ -701,10 +751,43 @@ fn snapshot_recovery(state: &WriterState, take: bool) {
             if take {
                 agg.take_for_flush();
             }
+            // 让写线程知道"文件里此刻有一批结果未定的在途数据"，出结论后必须收敛
+            //（见 [`settle_after_stop_snapshot`]），否则成功落库的那批会被重放第二次。
+            state.stop_snapshot_taken.store(true, Ordering::Relaxed);
         }
         // 写失败就**不**取走：增量仍在内存里，至少不比修前更糟
         Err(e) => tracing::error!("恢复文件写入失败 {}: {e}", path.display()),
     }
+}
+
+/// 在途批次出结论之后，把 [`snapshot_recovery`] 留下的恢复文件收敛成"此刻真正未落库的集合"。
+///
+/// 快照写的是 `agg ∪ 在途`，而那一批随后可能**成功落库** —— 文件继续留在盘上，
+/// 下次启动就会把同一批数据再回放一遍（落库是 `count = count + excluded` 的累加式，
+/// 没有去重键）。所以只能由"拿到结果的那个人"来收尾：
+/// - 落成了 → 内存里也没有未落库的增量了 → 删文件；
+/// - 最终失败并已回填 → 那批仍在 agg 里 → 按当前内容重做快照（take 语义同 stop）。
+///
+/// 没做过快照时（正常周期 flush）第一步就返回，不碰盘。
+fn settle_after_stop_snapshot(state: &WriterState) {
+    if !state.stop_snapshot_taken.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
+    if agg.is_empty() {
+        drop(agg);
+        let path = recovery_path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!("在途批次已确认落库，删除恢复文件 {}", path.display()),
+            // 快照根本没写出来（写失败时不取走，数据仍在内存），删不到东西是正常结果
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::error!("删除恢复文件失败 {}: {e}", path.display()),
+        }
+        return;
+    }
+    drop(agg);
+    tracing::warn!("在途批次最终没落库，按当前未落库增量重写恢复文件");
+    snapshot_recovery(state, true);
 }
 
 /// 读取恢复文件（启动回放）。
@@ -849,7 +932,11 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
         if agg.is_empty() {
             return;
         }
-        agg.take_for_flush()
+        let taken = agg.take_for_flush();
+        // 同一把锁内登记"这批已离开内存、结果还没出来"，恢复快照才看得见它。
+        // clone 的代价是每 10 秒一次、量级是一天的增量，换的是退出时不丢数据。
+        *state.in_flight.lock().unwrap_or_else(|e| e.into_inner()) = taken.clone();
+        taken
     };
 
     // 增量按年份库切分后分别写入：跨年那一刻的按键必须落进它所属年份的库，
@@ -875,6 +962,9 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
         drop_recovery_leftover(state);
     }
     if failed.is_empty() {
+        // 全部落库：在途记录作废，并把 stop 超时可能留下的恢复文件收敛掉
+        *state.in_flight.lock().unwrap_or_else(|e| e.into_inner()) = AggDeltas::default();
+        settle_after_stop_snapshot(state);
         return;
     }
     // 回填内存，避免数据丢失（下次周期 flush 再试）
@@ -905,6 +995,10 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
             *agg.device_keys.entry((dk, dev, key)).or_insert(0) += n;
         }
     }
+    drop(agg);
+    // 这批有了最终结论（失败的那部分已回填进 agg）：在途记录作废并收敛恢复文件
+    *state.in_flight.lock().unwrap_or_else(|e| e.into_inner()) = AggDeltas::default();
+    settle_after_stop_snapshot(state);
 }
 
 /// 启动时把库里已登记的设备名/类型灌进内存会话态。
@@ -1408,6 +1502,72 @@ mod tests {
         );
         std::fs::remove_dir_all(&tmp).ok();
         w.stop_and_wait();
+    }
+
+    /// `stop()` 超时那一刻**正在落库**的那一批也必须进恢复文件，出结论之后又要收敛。
+    ///
+    /// 症状（退出即丢）：`flush_pending` 在 agg 锁内取走批次、在锁外做 SQLite IO。
+    /// 年度库被别的连接独占时（退出时的备份、另一个进程、同步盘）这一批会在途很久，
+    /// 而 `stop()` 只等 3 秒就做兜底快照，快照原来只看 agg —— 那一批既不在库里、
+    /// 又不在文件里，而"回填内存"那一步要等进程早就退出之后才轮得到。
+    /// 反向的坑也要按住：那一批后来真的落库了，文件继续留在盘上就是下次启动重放第二遍
+    /// （落库是 `count = count + excluded` 的累加式，没有去重键）。
+    #[test]
+    fn stop_snapshot_covers_the_batch_still_being_written_and_settles_afterwards() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("recovery_inflight");
+        let w = start_writer(Duration::from_secs(3600));
+        let t0 = queries::now_ts();
+        for i in 0..3 {
+            w.record("A", t0 + i);
+        }
+        assert_eq!(w.today_count(), 3, "前提：三次都还在内存增量里");
+
+        // 独占年度库：写线程取走批次之后必然停在 BEGIN IMMEDIATE 上（重试要到 15 秒）
+        let path = paths::current_year_db_path();
+        let blocker = connection::open_rw(&path).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        w.flush(false);
+        // 等到批次真的离开 agg（取走与登记在途是同一把锁内做的，看到空就说明已登记）
+        for _ in 0..100 {
+            let empty = w
+                .state
+                .agg
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+            if empty {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        w.stop();
+        assert!(w.is_alive(), "前提：写线程还卡在落库里，stop 只能超时");
+        let text = std::fs::read_to_string(recovery_path())
+            .expect("在途批次必须在恢复文件里（修前：只快照 agg，这批两头落空）");
+        let file: AggDeltasFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            file.daily.iter().map(|(_, n)| n).sum::<i64>(),
+            3,
+            "文件里该是那三次未落库的按键"
+        );
+
+        // 放开独占 → 那一批真的落库 → 文件不能再留着它，否则同一批会被重放第二遍
+        blocker.execute_batch("COMMIT;").unwrap();
+        drop(blocker);
+        w.stop_and_wait();
+        assert!(
+            !recovery_path().exists(),
+            "已确认落库的批次不该继续留在恢复文件里"
+        );
+        let conn = connection::open_rw(&path).unwrap();
+        let landed: i64 = conn
+            .query_row("SELECT COALESCE(SUM(count),0) FROM daily_counts", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(landed, 3, "三次按键最终要落在库里");
     }
 
     /// 启动回放留下的副本，要等首批增量真的落库才删。
