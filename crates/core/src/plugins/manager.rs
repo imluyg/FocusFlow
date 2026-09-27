@@ -735,17 +735,28 @@ impl PluginManager {
     /// 现在失败路径**一个字都不动**旧实例：重载失败 = 什么都没发生（插件页多一条
     /// 加载失败原因，见 `try_load`），下一次存盘成功再换上来。
     pub fn reload_plugin(&mut self, key: &str) -> bool {
-        // 先按插件名匹配，再按文件名匹配
-        let path = self
+        // 先按文件名（stem）、再按展示名。生产里唯一的调用方是热重载
+        // （`desktop/src/plugins.rs::reload_plugin_by_key`，它发的是"改了的那个文件名"），
+        // 而表是以展示名为键的 ⇒ 旧顺序先查展示名会在重名时把**另一个**插件顶上来：
+        // 文件 `beta.lua` 变更 → key="beta"，若 `alpha.lua` 的 PLUGIN_NAME 正好叫「beta」，
+        // 命中的是 alpha：没改过的被重载、改过的继续跑旧代码，而日志写着"插件已热重载: beta"，
+        // 用户看到的就是"存盘没生效"。两种键都存在且指向不同文件时留一条 warn。
+        let by_stem = self
             .plugins
-            .get(key)
-            .map(|p| p.file_path.clone())
-            .or_else(|| {
-                self.plugins
-                    .values()
-                    .find(|p| p.file_path.file_stem().and_then(|s| s.to_str()) == Some(key))
-                    .map(|p| p.file_path.clone())
-            });
+            .values()
+            .find(|p| Self::stem_of(&p.file_path) == key)
+            .map(|p| p.file_path.clone());
+        let by_display = self.plugins.get(key).map(|p| p.file_path.clone());
+        if let (Some(s), Some(n)) = (&by_stem, &by_display) {
+            if s != n {
+                tracing::warn!(
+                    "重载键 {key} 同时是文件 {} 的名字与另一个插件（文件 {}）的展示名：按文件那个重载",
+                    s.display(),
+                    n.display()
+                );
+            }
+        }
+        let path = by_stem.or(by_display);
         match path {
             Some(p) => {
                 // 重载刻意**不**跑 cleanup()：这条路径是「存了个文件」触发的
@@ -1527,6 +1538,54 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
             FocusFlowConfig::load(tmp.join("config.ini")).expect("临时配置应能载入"),
         ));
         PluginManager::new(config, db::Database::init_readonly())
+    }
+
+    /// 展示名固定、只换 `get_view` 标题的插件：条目在表里的键不变，
+    /// 断言就不必去管 `load_plugin` 的改名退休逻辑。
+    fn view_with_name(display: &str, title: &str) -> String {
+        format!(
+            "PLUGIN_NAME = \"{display}\"\nfunction get_view() return {{ title = \"{title}\", \
+             widgets = {{ {{type=\"label\", text=\"v\"}} }} }} end\n"
+        )
+    }
+
+    /// 热重载的键是**文件名**，所以先按文件匹配、再按展示名。
+    ///
+    /// 回归：`plugins` 以展示名为键，旧顺序先 `get(key)`。文件 `beta.lua` 变了 ⇒
+    /// key="beta"，而 `alpha.lua` 的 `PLUGIN_NAME` 正好叫「beta」⇒ 命中的是 alpha：
+    /// **没改的那个被重载、改过的那个继续跑旧代码**，日志还写着"插件已热重载: beta"
+    /// —— 用户看到的就是"存盘没生效"。
+    #[test]
+    fn a_reload_key_prefers_the_changed_file_over_a_same_named_display_name() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("reload_key_prefers_stem");
+        let plugins = tmp.path().join("plugins");
+        let alpha = write_lua(&plugins, "alpha", &view_with_name("beta", "alpha-旧"));
+        let beta = write_lua(&plugins, "beta", &view_with_name("真正的乙", "beta-旧"));
+        let mut pm = manager_in(tmp.path());
+        pm.load_plugin(&alpha).expect("alpha 该能加载");
+        pm.load_plugin(&beta).expect("beta 该能加载");
+
+        // 只有文件 beta.lua 变了（展示名不变，只换标题）
+        write_lua(&plugins, "beta", &view_with_name("真正的乙", "beta-新"));
+        assert!(
+            pm.reload_plugin("beta"),
+            "键 beta 既是 beta.lua 的文件名、又是 alpha.lua 的展示名，总得命中一个"
+        );
+
+        let reloaded = pm.get_plugin("真正的乙").expect("beta.lua 的条目还在");
+        assert_eq!(
+            reloaded.view.as_ref().map(|v| v.title.as_str()),
+            Some("beta-新"),
+            "改了的那个文件必须换上新代码（旧顺序在这里仍然跑 beta-旧）"
+        );
+        let untouched = pm.get_plugin("beta").expect("alpha.lua 的条目还在");
+        assert_eq!(
+            untouched.view.as_ref().map(|v| v.title.as_str()),
+            Some("alpha-旧"),
+            "没改过的 alpha 不该因为展示名撞上就被顶替"
+        );
+        assert_eq!(untouched.file_path, alpha, "键 beta 指向的仍是 alpha.lua");
     }
 
     // ---------- 第八节 A7：热重载失败不许把还能用的插件弄丢 ----------
