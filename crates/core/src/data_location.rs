@@ -303,6 +303,22 @@ pub(crate) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// 两个路径是不是同一个目录？`PathBuf` 的相等是按字节比的，Windows 上同一个目录
+/// 至少有下列写法：`C:\data`、`C:\data\`、`C:/data`、`c:\DATA`。
+///
+/// 字节不等时才 `canonicalize`（它解析大小写与 `..` 段，并给两边同一个 `\\?\` 前缀）。
+/// 任一 `canonicalize` 失败就回 `false`：读不出来的那条由调用方自己的失败路径去报错，
+/// 这里不顺手把"读不出来"判成"同一个目录"（那会让一次 U 盘没挂上被说成"不用搬"）。
+fn same_directory(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// 搬运结果（供日志与启动报告措辞用）。
 #[derive(Debug)]
 pub struct MigrationReport {
@@ -408,6 +424,22 @@ pub fn migrate_data_tree(from: &Path, to: &Path) -> Result<MigrationReport, Stri
             "旧数据目录 {} 里没有 data/ 也没有 backup/，本次按「没有可搬的历史」完成",
             from.display()
         );
+    }
+    // 同一个目录的两种写法必须在这里再拦一次。`run_pending_migration` 那道
+    // `from == to` 是 `PathBuf` 的字节比较，而 Windows 上 `C:\data`、`C:\data\`、
+    // `c:/DATA` 指的是同一个目录：闸过了以后下面的 `copy_data_tree` 是自己抄自己、
+    // `verify_copy` 天然全对，最后 `remove_source_trees(from)` 删掉的正是**活目录**。
+    if same_directory(from, to) {
+        tracing::warn!(
+            "新旧数据目录其实是同一个（{}），没有可搬的东西；源侧一个文件都不动",
+            from.display()
+        );
+        return Ok(MigrationReport {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+            summary: CopySummary::default(),
+            leftover_in_source: 0,
+        });
     }
     let summary = copy_data_tree(from, to);
     if summary.has_errors() {
@@ -775,6 +807,30 @@ mod tests {
         );
         // copy_data_tree 本身只复制；删源是 migrate_data_tree 的事，两层的职责不同
         assert!(app.path().join("data/focusflow_2026.db").exists());
+    }
+
+    /// 回归（账 31）：`run_pending_migration` 那道 `from == to` 是 `PathBuf` 的字节比较，
+    /// 而 Windows 上 `C:\data` 与 `C:\data\` 是同一个目录的两种写法 ⇒ 过了闸以后
+    /// `migrate_data_tree` 一路走到 `remove_source_trees(from)`，删掉的正是**活目录**。
+    #[test]
+    fn same_directory_in_two_spellings_deletes_nothing() {
+        let _lock = paths::test_app_dir_lock();
+        let dir = paths::test_app_dir("mv_same");
+        write_file(&dir.path().join("data/focusflow_2026.db"), "history");
+        write_file(&dir.path().join("backup/keep.db"), "bk");
+        let spelled = format!(
+            "{}{}",
+            dir.path().to_string_lossy(),
+            std::path::MAIN_SEPARATOR
+        );
+        let rep = migrate_data_tree(dir.path(), std::path::Path::new(&spelled))
+            .expect("同一个目录应按「没有可搬的东西」成功");
+        assert_eq!(rep.summary.copied, 0, "自己搬自己不该复制任何文件");
+        assert!(
+            dir.path().join("data/focusflow_2026.db").is_file(),
+            "源侧就是目标侧，主库一个字都不能少"
+        );
+        assert!(dir.path().join("backup/keep.db").is_file(), "backup 侧同理");
     }
 
     #[test]
