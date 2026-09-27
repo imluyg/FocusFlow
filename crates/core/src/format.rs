@@ -75,6 +75,13 @@ pub const KEY_GROUPS: [&str; 8] = [
     "其他",
 ];
 
+/// `KEY_GROUPS` 里属于"鼠标"的那两个分组名。
+///
+/// 桌面端的"鼠标 vs 键盘"拆分（`state.rs` 的卡片与图表）和周报导出的行筛选都靠它，
+/// 原来三处各写一遍 `"鼠标点击"`/`"滚轮"` 字面量 ⇒ `classify_key` 一改产出名，
+/// 鼠标那一路就静默拿到 0（键盘＝总数），数字看着完全正常、没有任何用例报错。
+pub const MOUSE_GROUPS: [&str; 2] = ["鼠标点击", "滚轮"];
+
 /// 千分位格式化（如 1234567 → "1,234,567"，支持负数）。
 pub fn fmt_thousands(n: i64) -> String {
     let s = n.abs().to_string();
@@ -186,5 +193,39 @@ mod tests {
             !html_escape("'").contains('\''),
             "单引号也要转义，否则属性值可被闭合"
         );
+    }
+
+    /// 分组名只许有一处真相：`classify_key` 的产出、`KEY_GROUPS` 的清单、
+    /// `MOUSE_GROUPS` 的子集必须互相对得上。
+    ///
+    /// 回归：桌面端"鼠标 vs 键盘"（`state.rs` 的卡片/图表）与周报导出的行筛选
+    /// （`export.rs`）原来各写一遍 `"鼠标点击"`/`"滚轮"` 字面量 ⇒ `classify_key` 一改
+    /// 产出名，鼠标那一路就静默拿到 0（键盘＝总数，看着完全正常，没有用例会红）。
+    #[test]
+    fn group_names_stay_one_source_for_the_mouse_keyboard_split() {
+        for g in MOUSE_GROUPS {
+            assert!(
+                KEY_GROUPS.contains(&g),
+                "鼠标分组 {g:?} 不在 KEY_GROUPS 里 ⇒ 桌面端按 KEY_GROUPS 渲染时它会消失"
+            );
+        }
+        for raw in [
+            "a",
+            "7",
+            "F12",
+            "左Shift",
+            "↑",
+            "鼠标左键",
+            "滚轮下",
+            "奇怪名字",
+        ] {
+            let g = classify_key(raw);
+            assert!(KEY_GROUPS.contains(&g), "{raw:?} → {g:?} 落不进 KEY_GROUPS");
+            assert_eq!(
+                MOUSE_GROUPS.contains(&g),
+                raw.starts_with("鼠标") || raw.starts_with("滚轮"),
+                "{raw:?} 的鼠标/键盘归属与桌面算法不一致 ⇒ 鼠标拿 0 就等于键盘＝总数"
+            );
+        }
     }
 }

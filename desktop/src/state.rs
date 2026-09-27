@@ -1702,8 +1702,10 @@ fn compute_charts(
         .iter()
         .filter_map(|g| groups.get(*g).map(|c| (g.to_string(), *c)))
         .collect();
-    let mouse_total =
-        groups.get("鼠标点击").copied().unwrap_or(0) + groups.get("滚轮").copied().unwrap_or(0);
+    let mouse_total: i64 = focusflow_core::format::MOUSE_GROUPS
+        .iter()
+        .map(|g| groups.get(*g).copied().unwrap_or(0))
+        .sum();
     let keyboard_total = total - mouse_total;
     let daily_days = match period_val {
         -1 => 1,

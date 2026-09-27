@@ -213,7 +213,9 @@ pub fn write_weekly_report_for(
             rows.push((day, total));
             for (k, c) in &day_keys {
                 *keys.entry(k.clone()).or_insert(0) += *c;
-                if matches!(focusflow_core::format::classify_key(k), "滚轮" | "鼠标点击") {
+                if focusflow_core::format::MOUSE_GROUPS
+                    .contains(&focusflow_core::format::classify_key(k))
+                {
                     mouse += *c;
                 } else {
                     keyboard += *c;
