@@ -2182,6 +2182,51 @@ fn scale_hourly_to_total(conn: &Connection, day_key: i64, target_total: i64) {
 mod tests {
     use super::*;
 
+    /// 一条**平台前提**（本轮现量，三个产品路径都踩在它上面：
+    /// `data_location.rs` 的"留档先 `rename` 主库"、备份轮转的删除、改数据目录的搬运）：
+    /// 另一个连接握着这个年度库的**只读句柄**时 ——
+    /// - 复制、就地覆盖写：都还能做
+    /// - `rename`、`remove_file`：** sharing violation（os error 32）**
+    ///
+    /// 所以"闲置在线程本地只读连接池里的那个句柄"足以让留档/搬运失败，而
+    /// `clear_ro_cache()` 是按代次让**下次查询的线程**自愈的 —— 不再查询的线程永远
+    /// 不丢句柄。断言写在这里，是为了让"把 rename 换成复制/覆盖"这类修法有一个
+    /// 可核对的落点，而不是凭印象（这台机器上 `config.rs` 那条夹具也是同一族现象）。
+    #[test]
+    fn a_readonly_handle_blocks_rename_and_delete_but_not_copy_or_overwrite() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let tmp = crate::paths::test_app_dir("ro_handle_blocks_rename");
+        let db = tmp.path().join("focusflow_2031.db");
+        {
+            let w = rusqlite::Connection::open(&db).unwrap();
+            w.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x);")
+                .unwrap();
+            w.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        }
+        let hold =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let n: i64 = hold
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "夹具该读得动");
+
+        std::fs::copy(&db, tmp.path().join("copy.db")).expect("只读句柄不该挡住复制");
+        std::fs::write(&db, b"x").expect("只读句柄不该挡住就地覆盖");
+
+        let renamed = std::fs::rename(&db, tmp.path().join("kept.db"));
+        assert!(
+            renamed.is_err(),
+            "前提：只读句柄握着时 rename 必须失败 —— 留档那一步要是改成复制/覆盖，\
+             就是为了让这一步不发生（实际错误：{renamed:?}）"
+        );
+        let removed = std::fs::remove_file(&db);
+        assert!(removed.is_err(), "前提：同一只读句柄也挡住删除");
+        drop(hold);
+        // 句柄放开之后两样都做得了（证明上面失败的原因是句柄，不是权限或路径）
+        std::fs::rename(&db, tmp.path().join("kept.db")).expect("放开后 rename 该成功");
+    }
+
     /// 数据目录读不出来时，破坏性命令必须带着原因退回去，不能报"已清空 0 行"。
     #[test]
     fn destructive_commands_notice_an_unreadable_data_dir() {
