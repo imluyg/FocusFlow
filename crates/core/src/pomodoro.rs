@@ -493,6 +493,19 @@ fn tick_delta_seconds(prev: &chrono::DateTime<Local>, now: &chrono::DateTime<Loc
     now.signed_duration_since(*prev).num_seconds().max(0)
 }
 
+/// 按墙钟推进本段计时，返回 `(新的 remaining, 新的 elapsed)`。
+///
+/// 负方向由 `tick_delta_seconds` 夹过（回拨不把进度吐回去），这里夹**正方向**：
+/// 墙钟也会凭空向前跳（NTP 校正、手工改时间、休眠后 RTC 与系统时钟对齐）。
+/// 不夹回本段的剩余值，一次 +1 小时的跳变就把 25 分钟的番茄记成 4800 秒 ——
+/// `build_session` 无条件取 `elapsed`，于是 `work_finished` 加一、今日专注时长
+/// 跟着虚高，而这一行已经落库，事后没法修正。合盖睡过整段的补齐语义保持不变：
+/// 最多推进到本段结束，多出来的那截丢掉。
+fn advance_stage_seconds(remaining: i64, elapsed: i64, delta: i64) -> (i64, i64) {
+    let step = delta.clamp(0, remaining.max(0));
+    (remaining - step, elapsed + step)
+}
+
 /// 后台计时循环（每秒 tick）。
 fn tick_loop(state: Arc<Mutex<TimerState>>, stop: Arc<AtomicBool>) {
     let mut last_tick = Local::now();
@@ -514,8 +527,9 @@ fn tick_loop(state: Arc<Mutex<TimerState>>, stop: Arc<AtomicBool>) {
             if s.state == STATE_IDLE || s.paused {
                 continue;
             }
-            s.remaining -= delta;
-            s.elapsed += delta;
+            let (remaining, elapsed) = advance_stage_seconds(s.remaining, s.elapsed, delta);
+            s.remaining = remaining;
+            s.elapsed = elapsed;
             if s.remaining > 0 {
                 continue;
             }
@@ -736,5 +750,26 @@ mod busy_lock_tests {
         assert_eq!(tick_delta_seconds(&a, &b), 1800, "睡 30 分钟要一次补齐");
         assert_eq!(tick_delta_seconds(&b, &a), 0, "时钟往回拨不能把进度吐回去");
         assert_eq!(tick_delta_seconds(&a, &a), 0);
+    }
+
+    /// 墙钟**向前**凭空跳，不能给本段造出没走过的时间。
+    ///
+    /// 上面那条钉住了回拨方向，正方向只考虑了"合盖睡过去"这一种，可同一个 delta 也
+    /// 来自 NTP 校正、手工改时间、休眠后 RTC 对齐。不夹回本段剩余值，`build_session`
+    /// 会无条件把 `elapsed` 写进落库行（4800 秒的"25 分钟番茄"），`work_finished`
+    /// 跟着 +1，今日专注时长一起虚高，而且那行已经落库、事后无法修正。
+    #[test]
+    fn forward_clock_jump_cannot_inflate_a_stage_beyond_its_remaining() {
+        // 正常一秒 tick：本段内怎么推进都不夹
+        assert_eq!(advance_stage_seconds(900, 600, 1), (899, 601));
+        // 合盖 30 分钟睡过整段：补齐到本段结束为止（1500 秒的番茄就是 1500）
+        assert_eq!(advance_stage_seconds(900, 600, 1800), (0, 1500));
+        assert_eq!(advance_stage_seconds(900, 600, 900), (0, 1500), "恰好走完");
+        // 已经走完的段一步都不能再推进（remaining=0 时 elapsed 不再动）
+        assert_eq!(advance_stage_seconds(0, 1500, 1800), (0, 1500));
+        // 兜住符号：负 delta 不该把进度吐回去、也不该让 elapsed 倒退
+        assert_eq!(advance_stage_seconds(900, 600, -5), (900, 600));
+        // 计划外的畸形 remaining（历史状态里可能是负数）不能推进度
+        assert_eq!(advance_stage_seconds(-30, 1500, 5), (-30, 1500));
     }
 }

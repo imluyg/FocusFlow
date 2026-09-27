@@ -903,19 +903,30 @@ fn writer_loop(state: Arc<WriterState>, sig_rx: mpsc::Receiver<Signal>, flush_in
 }
 
 /// 确保连接指向 `year` 年份库（换年时重建）。
-fn ensure_connection(conn: &mut Option<Connection>, conn_year: &mut i32, year: i32) {
+///
+/// 两个失败点都必须把**原因**带出去：打不开库 = 用户的按键一直留在内存里，
+/// 而原先的 `if let Ok(..)` / `.is_ok()` 把 `open_rw` 与 `ensure_schema` 的错误整个丢掉，
+/// 日志里只剩一句"无可用连接"—— 是路径不存在、目录只读、被同步盘换成占位文件，
+/// 还是库结构建不起来，运维侧完全看不出来（与 B14-1 已修的"吞掉线程失败"同族）。
+/// 这里不打日志：一次落库要重试 3 次，最终错误由调用方写一条。
+fn ensure_connection(
+    conn: &mut Option<Connection>,
+    conn_year: &mut i32,
+    year: i32,
+) -> Result<(), String> {
     if *conn_year == year && conn.is_some() {
-        return;
+        return Ok(());
     }
     // 换年或首次：重建连接
     *conn = None;
     let path = paths::year_db_path(year);
-    if let Ok(new_conn) = connection::open_rw(&path) {
-        if connection::ensure_schema(&new_conn, year).is_ok() {
-            *conn = Some(new_conn);
-            *conn_year = year;
-        }
-    }
+    let new_conn = connection::open_rw(&path)
+        .map_err(|e| format!("打开 {year} 年库 {} 失败: {e:#}", path.display()))?;
+    connection::ensure_schema(&new_conn, year)
+        .map_err(|e| format!("初始化 {year} 年库结构失败: {e:#}"))?;
+    *conn = Some(new_conn);
+    *conn_year = year;
+    Ok(())
 }
 
 /// date_key（本地天数序号）落在哪一年。
@@ -1135,10 +1146,15 @@ fn flush_partition(
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 0..max_retries {
-        ensure_connection(conn, conn_year, year);
+        let conn_fail = ensure_connection(conn, conn_year, year).err();
 
         let result = (|| -> anyhow::Result<()> {
-            let c = conn.as_mut().ok_or_else(|| anyhow::anyhow!("无可用连接"))?;
+            // 拿不到连接时把原因一起报出去：`flush_pending` 只记这一条最终错误，
+            // "无可用连接"后面不接东西就等于把 open/建表 的失败又吞回黑箱。
+            let c = conn.as_mut().ok_or_else(|| match &conn_fail {
+                Some(why) => anyhow::anyhow!("无可用连接: {why}"),
+                None => anyhow::anyhow!("无可用连接"),
+            })?;
             c.execute("BEGIN IMMEDIATE;", [])?;
             let apply = || -> anyhow::Result<()> {
                 // 设备字典：先落登记并取回本库的整数 id（统计表只存 id）。
@@ -1293,6 +1309,54 @@ fn flush_partition(
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    /// 年份库打不开时，错误里必须留下**原因**而不是光一句"无可用连接"。
+    ///
+    /// 回归：`ensure_connection` 原先用 `if let Ok(..)` / `.is_ok()` 把 `open_rw` 与
+    /// `ensure_schema` 的错误整个丢掉，`flush_partition` 只能报"无可用连接"，
+    /// `flush_pending` 打进日志的就是那五个字 —— 目录里放的是占位文件、路径不存在、
+    /// 还是库结构建不起来，全都看不出来（B14-1 吞线程失败同族）。
+    #[test]
+    fn flush_failure_carries_the_reason_the_year_db_could_not_be_opened() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_conn_cause");
+
+        let year = chrono::Local::now().year();
+        let mut pending = AggDeltas::default();
+        *pending
+            .daily
+            .entry(queries::day_key_of_date(chrono::Local::now().date_naive()))
+            .or_insert(0) += 7;
+        let path = paths::year_db_path(year);
+
+        // ① 库路径上是个目录（同步盘/手工放错的典型形状）→ open_rw 失败
+        std::fs::create_dir_all(&path).unwrap();
+        let mut conn: Option<Connection> = None;
+        let mut conn_year = 0;
+        let err = flush_partition(&mut conn, &mut conn_year, year, &pending)
+            .unwrap_err()
+            .to_string();
+        assert!(conn.is_none(), "打不开库时不能留下半拉连接");
+        assert!(err.contains("无可用连接"), "保留可定位的那一句: {err}");
+        assert!(
+            err.contains("失败:") && err.contains(&path.display().to_string()),
+            "必须带上打开失败的原因与是哪个库: {err}"
+        );
+
+        // ② 同一个位置换成"不是 SQLite 的文件"（占位文件/被截断的库）
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"this is not a sqlite database").unwrap();
+        let mut conn: Option<Connection> = None;
+        let mut conn_year = 0;
+        let err = flush_partition(&mut conn, &mut conn_year, year, &pending)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("失败:"),
+            "占位文件也要给出原因，不能只报状态: {err}"
+        );
+        assert_ne!(err, "无可用连接", "不能再退化成那五个字");
+    }
 
     /// `start` 现在返回 `Result`（写线程起不来 = 启动失败）：用例只关心行为，
     /// 统一 expect，失败本身就是测试环境坏了。

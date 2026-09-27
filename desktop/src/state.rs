@@ -20,6 +20,10 @@ pub struct ChartAgg {
     /// 全历史总次数（跨年度库）：今日周期下「总计」卡片用它，避免与「今日活跃」重复。
     /// 由统计线程按 alltime 缓存 + 今日增量修正后写入，`total` 仍是所选周期的总数。
     pub alltime_total: i64,
+    /// 所选周期的**展示值**：`total`（纯库值）补上今日尚未落库的增量。
+    /// 前端与 `get_live`/`get_charts` 只读这个字段；`total` 留着当统计线程下一轮
+    /// 修正的基准，所以两者必须是两个字段（写进同一个字段会双重计数）。
+    pub period_total: i64,
     pub avg: i64,
     pub max_day: i64,
     /// 最高单日对应的日期（YYYY-MM-DD）
@@ -1361,17 +1365,15 @@ fn spawn_stats_worker(
                         // 停在 0 上）。下面那段补丁只改了共享快照，晚于这里的 emit。
                         agg.alltime_total =
                             alltime_total_now(alltime_total_base, alltime_cache_today, cur_today);
-                        // 同一个口径补到 `total` 上：否则「总计」页的那张卡片停在
-                        // 上次重算的库值上（见 `total_for_display`）。
-                        // `pending_today` 这里**恒传 0**：算出来的值要写回共享快照，
-                        // 而下面每次 live 推送是拿快照当基数再加一次 pending ——
-                        // 这里也加就成了双重计数。
-                        agg.total = total_for_display(
+                        // 同一个口径补到展示值上：否则图表推送里「周期总数」停在纯库值，
+                        // 而同一条推送里的「日均」已经补过今日未落库的增量（两把尺子），
+                        // 且这一推送晚于 live 推送时卡片会偏低（见 `apply_display_total`）。
+                        apply_display_total(
                             period_val,
-                            agg.total,
                             agg.alltime_total,
                             alltime_total_base >= 0,
-                            0,
+                            pending_today,
+                            &mut agg,
                         );
                         period_max.insert(period_val, (agg.max_day, agg.max_day_date.clone()));
                         {
@@ -1430,17 +1432,18 @@ fn spawn_stats_worker(
                     s.period = period_val;
                     s.agg.max_day = max_day;
                     s.agg.max_day_date = max_day_date.clone();
-                    s.agg.alltime_total = alltime_total;
+                    s.period = period_val;
                     // period 与两个总数在同一把锁内快照：前端拿到的永远是自洽的一组。
-                    // 修正只在这里做（快照里存的仍是原始库值，见 `total_for_display` 的 pending 说明）。
-                    let corrected = total_for_display(
+                    // 修正只在这里做（快照的 `agg.total` 仍是原始库基准，见
+                    // `apply_display_total`）。
+                    apply_display_total(
                         period_val,
-                        s.agg.total,
                         alltime_total,
                         alltime_total_base >= 0,
                         pending_today,
+                        &mut s.agg,
                     );
-                    (s.agg.alltime_total, corrected)
+                    (s.agg.alltime_total, s.agg.period_total)
                 };
 
                 let live_changed = today_count != prev_today_count
@@ -1586,6 +1589,30 @@ fn total_for_display(
     agg_total
 }
 
+/// 一轮重算/每 tick 快照都要产出的两个展示值写在一起，只这一个入口：
+/// `alltime_total`（缓存基准 + 今日增量）与 `period_total`（所选周期的展示值）。
+///
+/// `agg.total` **保持纯库值**：它就是共享快照里那份基准，live 推送每轮在它上面
+/// 加一次今日未落库的增量。把展示值也写回 `total`，下一轮就成 `raw + 2×pending`
+/// 的双重计数 —— 所以两个数必须是两个字段（原先图表推送为了避免双重计数只能
+/// 恒传 pending=0，代价是那张卡片比 live 推送和同一条推送里的「日均」少一截）。
+fn apply_display_total(
+    period_val: i64,
+    alltime_total: i64,
+    base_ready: bool,
+    pending_today: i64,
+    agg: &mut ChartAgg,
+) {
+    agg.alltime_total = alltime_total;
+    agg.period_total = total_for_display(
+        period_val,
+        agg.total,
+        alltime_total,
+        base_ready,
+        pending_today,
+    );
+}
+
 /// 重聚合：按周期查询数据库并计算全部图表数据。
 ///
 /// 纯函数（输入周期、输出聚合结果），从统计线程拆出便于单测；
@@ -1709,6 +1736,9 @@ fn compute_charts(
     let hourly = focusflow_core::db::queries::get_hourly_stats(None);
     ChartAgg {
         total,
+        // 展示值要等统计线程拿到 alltime 缓存与本轮 pending 才能定（apply_display_total）；
+        // 这里先放纯库值，任何直接消费 ChartAgg 的路径都拿不到没算过的数。
+        period_total: total,
         // 全历史总计要跨年度库汇总，不在此重复查询：统计线程每轮用
         // alltime 缓存 + 今日增量写入（见 alltime_total_now）
         alltime_total: 0,
@@ -1733,8 +1763,8 @@ fn compute_charts(
 #[cfg(test)]
 mod compute_charts_tests {
     use super::{
-        alltime_total_now, clamp_floating_into_screen, compute_charts, sort_rank_desc,
-        total_for_display, FloatingBounds, FLOATING_MIN_VISIBLE,
+        alltime_total_now, apply_display_total, clamp_floating_into_screen, compute_charts,
+        sort_rank_desc, total_for_display, ChartAgg, FloatingBounds, FLOATING_MIN_VISIBLE,
     };
 
     /// 他这台机器的形状：1920x1080 单屏（任务栏 48px，故工作区底边 1032）、卡片 90x46。
@@ -1831,6 +1861,50 @@ mod compute_charts_tests {
             900,
             "没有 pending 时原样"
         );
+    }
+
+    /// 图表推送、live 推送与 `get_live`/`get_charts` 命令得给同一个口径：
+    /// 近 N 天的展示值 = 纯库窗口和 + 今日未落库增量，而基准 `total` 不被改写
+    /// （统计线程每轮都在它上面加一次 pending）。
+    ///
+    /// 回归：图表推送那段为了不把 pending 计两遍只能恒传 0（`agg.total` 一个字段两用），
+    /// 于是每来一次图表推送，「周期总数」卡片就掉回纯库值 —— 停手时最后一推正是它，
+    /// 数字偏低一整条 pending，而同一条推送里的「日均」却是补过 pending 的。
+    #[test]
+    fn charts_push_carries_the_same_pending_corrected_total_as_the_live_push() {
+        let mut agg = ChartAgg {
+            total: 900,
+            ..Default::default()
+        };
+        apply_display_total(7, 1_000_300, true, 37, &mut agg);
+        assert_eq!(agg.period_total, 937, "展示值要补上今日未落库的那 37");
+        assert_eq!(agg.total, 900, "基准必须仍是纯库值");
+        assert_eq!(agg.alltime_total, 1_000_300);
+
+        // 下一轮拿快照里的基准再算一次：不能变成 974（双重计数的判据）
+        let mut next = agg.clone();
+        apply_display_total(7, 1_000_300, true, 37, &mut next);
+        assert_eq!(
+            (next.total, next.period_total),
+            (900, 937),
+            "每轮幂等，展示值不随轮数累积"
+        );
+
+        // 与「日均」一致的那一侧：pending=0 时展示值就是库值
+        let mut quiet = ChartAgg {
+            total: 900,
+            ..Default::default()
+        };
+        apply_display_total(7, 1_000_300, true, 0, &mut quiet);
+        assert_eq!(quiet.period_total, 900);
+
+        // 总计周期走「基准 + 今日增量」那个量，今日增量里已含未落库部分，不加第二遍
+        let mut all = ChartAgg {
+            total: 1_000_000,
+            ..Default::default()
+        };
+        apply_display_total(0, 1_000_300, true, 300, &mut all);
+        assert_eq!((all.total, all.period_total), (1_000_000, 1_000_300));
     }
 
     /// 同分必须有确定的先后：否则"谁进前 100 名"随进程重启而变。

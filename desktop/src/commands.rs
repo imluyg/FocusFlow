@@ -18,7 +18,7 @@ pub fn get_live(state: State<'_, Arc<AppState>>) -> LiveStats {
         max_day: s.agg.max_day,
         max_day_date: s.agg.max_day_date.clone(),
         alltime_total: s.agg.alltime_total,
-        period_total: s.agg.total,
+        period_total: s.agg.period_total,
     }
 }
 
