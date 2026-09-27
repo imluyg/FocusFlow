@@ -58,6 +58,15 @@ pub fn init_db() -> anyhow::Result<()> {
             created_at TEXT NOT NULL
         );",
     )?;
+    // 把遗留的 NULL `args` 补成空串。schema 里这列可空（Python 版就这么存），而读侧
+    // 要把它当非 Option 的 String 用；库里留着 NULL 的话，那条任务会在所有"要读 args"
+    // 的面上凭空消失（见 get_all_tasks 的逐行解码）。补一次比在每个读点各自兜底强。
+    let n = conn
+        .execute("UPDATE scheduled_tasks SET args='' WHERE args IS NULL", [])
+        .map_err(|e| anyhow::anyhow!("补齐 args 为 NULL 的定时任务失败: {e}"))?;
+    if n > 0 {
+        tracing::warn!("定时任务库里有 {n} 条 args 为 NULL 的记录（旧版本遗留），已补成空串");
+    }
     Ok(())
 }
 
@@ -652,23 +661,35 @@ pub fn update_task(
             return Err(e);
         }
     }
-    // 读取当前值
+    // 读取当前值。last_run 必须在**同一次** SELECT 里读回来：分成两次时第二次的
+    // `.ok().flatten()` 把"读失败"和"这一条没有 last_run"并成一件 —— 库 BUSY 超过
+    // 15 秒那一瞬，更新照样返回 Ok，而写回的 NULL 抹掉的正是防同日重跑的锚
+    // （那条 09:00 的任务当天会被再启动一遍）。
     let conn = open()?;
-    let Ok(existing) = conn.query_row(
-        "SELECT name, target_path, args, schedule_type, schedule_time, enabled FROM scheduled_tasks WHERE id=?1",
+    let existing = match conn.query_row(
+        "SELECT name, target_path, args, schedule_type, schedule_time, enabled, last_run FROM scheduled_tasks WHERE id=?1",
         [id],
         |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, i64>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         },
-    ) else {
-        anyhow::bail!("定时任务不存在（id={id}）");
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            anyhow::bail!("定时任务不存在（id={id}）");
+        }
+        Err(e) => {
+            let e = anyhow::anyhow!("读取定时任务失败（id={id}）: {e}");
+            tracing::warn!("更新定时任务失败: {e}");
+            return Err(e);
+        }
     };
     let new_name = name.unwrap_or(&existing.0).to_string();
     let new_target = target_path.unwrap_or(&existing.1).to_string();
@@ -694,13 +715,7 @@ pub fn update_task(
     let last_run: Option<String> = if schedule_changed {
         None // 改了调度时刻：按新时刻重新计一次
     } else {
-        conn.query_row(
-            "SELECT last_run FROM scheduled_tasks WHERE id=?1",
-            [id],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten()
+        existing.6 // 就是上面那次 SELECT 读回来的值，读失败已经在那里 return 了
     };
 
     conn.execute(
@@ -762,11 +777,15 @@ pub fn get_all_tasks() -> Vec<ScheduledTask> {
         }
     };
     let result = stmt.query_map([], |r| {
+        // args 在 schema 里可空（Python 版遗留库、backup/ 还原、手改都会留下 NULL），
+        // 读成 Option 再兜底。原来读成非 Option 的 String，NULL 行会解码失败，
+        // 又被下面的 flatten() 静默丢掉 —— 那条任务连一条日志都没有就再也不触发。
+        let id: i64 = r.get(0)?;
         Ok(ScheduledTask {
-            id: r.get(0)?,
+            id,
             name: r.get(1)?,
             target_path: r.get(2)?,
-            args: r.get(3)?,
+            args: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
             schedule_type: r.get(4)?,
             schedule_time: r.get(5)?,
             enabled: r.get::<_, i64>(6)? != 0,
@@ -774,13 +793,30 @@ pub fn get_all_tasks() -> Vec<ScheduledTask> {
             created_at: r.get(8)?,
         })
     });
+    let mut out: Vec<ScheduledTask> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
     match result {
-        Ok(rows) => rows.flatten().collect(),
+        Ok(rows) => {
+            for row in rows {
+                match row {
+                    Ok(t) => out.push(t),
+                    Err(e) => dropped.push(e.to_string()),
+                }
+            }
+        }
         Err(e) => {
             tracing::error!("定时任务读不出来（查询失败），本次按空列表处理: {e}");
-            Vec::new()
+            return Vec::new();
         }
     }
+    // 逐行报错而不是整体吞掉：rusqlite 的错误串带列号与列名（如
+    // `InvalidColumnType(3, "args", Null)`），够定位是哪一条、哪一列。
+    for d in &dropped {
+        tracing::error!(
+            "定时任务有一行解不出来，已跳过（这条不会参与调度，请在插件页删掉重建）: {d}"
+        );
+    }
+    out
 }
 
 /// 解析 interval 格式 'HH:MM-HH:MM|N'，返回 (start_min, end_min, interval)。
@@ -891,13 +927,28 @@ fn should_run(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> bool {
     }
 }
 
+/// 一次启动尝试的结果。
+///
+/// 刻意分三态。原来 `execute_task` 返回 `Option<String>`，把"目标为空 / 被白名单拒绝"
+/// （重试多少次都不会变好）与 `CreateProcess` 失败（休眠的 USB 盘、杀软首扫这类
+/// **瞬时**问题）并成一件 —— 调用方拿不到这个区分，就只能对所有失败用同一套退避，
+/// 于是"该再试的不再试、不该再试的每 30 秒试一次"两头都错。
+enum LaunchOutcome {
+    /// 真的启动起来了，带回填 `last_run` 的时刻
+    Fired(String),
+    /// 永久拒绝：目标为空或不在白名单里
+    Refused(String),
+    /// 瞬时失败：进程创建本身没成功
+    Transient(String),
+}
+
 /// 执行任务（启动目标程序，DETACHED_PROCESS）。
 ///
-/// 返回 `Some(尝试时刻)` = 真的启动起来了；`None` = 没启动（目标为空、被白名单拒绝、
-/// `CreateProcess` 失败）。调用方（调度循环）用这个区分要不要退避，见 [`check_loop`]。
-fn execute_task(t: &ScheduledTask) -> Option<String> {
+/// 只有 [`LaunchOutcome::Fired`] 意味着"这次真的启动了"；两个失败臂都无时刻。
+/// 调用方（调度循环）按三态决定退避策略，见 [`check_loop`]。
+fn execute_task(t: &ScheduledTask) -> LaunchOutcome {
     if t.target_path.is_empty() {
-        return None;
+        return LaunchOutcome::Refused("目标路径为空".into());
     }
     // 先解析、再校验**解析出来的那个路径**，最后启动同一个路径 —— 见
     // [`approved_launch_target`]。
@@ -905,7 +956,7 @@ fn execute_task(t: &ScheduledTask) -> Option<String> {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("定时任务被拒绝执行（{}）: {e}", t.name);
-            return None;
+            return LaunchOutcome::Refused(e.to_string());
         }
     };
     let mut cmd = std::process::Command::new(&exe);
@@ -938,11 +989,11 @@ fn execute_task(t: &ScheduledTask) -> Option<String> {
                     "定时任务已启动，但 last_run 没写进库（本进程内先记着，不会再启一次）: {e}"
                 );
             }
-            Some(now_str)
+            LaunchOutcome::Fired(now_str)
         }
         Err(e) => {
             tracing::error!("定时任务执行失败: {} -> {}: {e}", t.name, exe.display());
-            None
+            LaunchOutcome::Transient(e.to_string())
         }
     }
 }
@@ -950,15 +1001,63 @@ fn execute_task(t: &ScheduledTask) -> Option<String> {
 /// 调度线程的检查间隔。
 const CHECK_INTERVAL_MS: u64 = 30_000;
 
-/// 连续启动失败到这个次数就退到下一个调度时段。
+/// 同一个调度窗口内连续启动失败到这个次数就退到**下一个窗口**再试。
 ///
 /// 留三次而不是立刻放弃：目标在休眠的 USB 盘上、被杀软扫第一个瞬间这类**瞬时**失败
-/// 下一轮（30 秒后）多半就好了。但从此不再试是必须的 —— 目标被卸载/被白名单拒绝的
-/// 任务原来每 30 秒重试一次、每次一条 error，一天两万八千条，而且真的哪天忽然能启动
-/// 就会在一个谁也没预期的时刻弹出来。
+/// 下一轮（30 秒后）多半就好了。烧满三次就在本窗口内停手：这类任务原来每 30 秒重试
+/// 一次、每次一条 error，一天两万八千条，而且真的哪天忽然能启动就会在一个谁也没
+/// 预期的时刻弹出来。
 /// 刻意**不**写 `last_run`：那字段的语义是"执行过了"，插件页会把它显示成"上次执行"，
 /// 拿一次失败的尝试去填等于对用户撒谎。
 const LAUNCH_FAILURE_BACKOFF_AFTER: u32 = 3;
+
+/// 一条任务的退避状态（只在进程内，重启即清零）。
+#[derive(Debug)]
+struct Backoff {
+    /// 本窗口内已经烧掉的次数
+    count: u32,
+    /// 这份计数属于哪个调度窗口（见 [`backoff_window`]）
+    window: String,
+    /// 计数建立时这条任务的配置指纹（见 [`task_stamp`]）
+    stamp: String,
+    /// 被**永久**拒绝（目标为空/白名单外）：跨窗口也不重试，直到配置改动
+    given_up: bool,
+}
+
+/// 配置指纹：目标、参数、调度类型、调度时刻里任何一样变了，老的失败计数与老的
+/// "永久拒绝"判定就都不算数（用户在插件页改正了目标，就该重新试一次）。
+/// `\u{1}` 作分隔符：路径与参数里不可能出现该字符，拼接不会与另一条配置撞车。
+fn task_stamp(t: &ScheduledTask) -> String {
+    format!(
+        "{}\u{1}{}\u{1}{}\u{1}{}",
+        t.target_path, t.args, t.schedule_type, t.schedule_time
+    )
+}
+
+/// 这条任务此刻所处的调度窗口 —— 退避按窗口复位，粒度与 [`should_run`] 的判定对齐：
+/// - `interval`：`"YYYY-MM-DD#第n步"`，一个 interval 步就是一个时段
+/// - `daily` / `once` / 其余：日历日（"下一个时段" = 明天）
+fn backoff_window(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> String {
+    let day = now.format("%Y-%m-%d").to_string();
+    if t.schedule_type == "interval" {
+        if let Some((start_min, _end_min, interval)) = parse_interval(&t.schedule_time) {
+            let now_min = now.hour() as i64 * 60 + now.minute() as i64;
+            let slot = (now_min - start_min).max(0) / interval.max(1);
+            return format!("{day}#{slot}");
+        }
+    }
+    day
+}
+
+/// 这一轮该不该跳过这条任务。窗口换了、配置改了都算重新武装。
+fn in_backoff(seen: Option<&Backoff>, window: &str, stamp: &str) -> bool {
+    match seen {
+        None => false,
+        Some(b) if b.stamp != stamp => false,
+        Some(b) if b.given_up => true,
+        Some(b) => b.count >= LAUNCH_FAILURE_BACKOFF_AFTER && b.window == window,
+    }
+}
 
 /// 库里那次与本轮兜底记忆里取更新的一个（时间串是 `%Y-%m-%d %H:%M:%S`，定长，
 /// 字典序即时间序）。
@@ -979,7 +1078,7 @@ fn check_loop(stop: Arc<AtomicBool>) {
     // 两张只在本进程有效的兜底表（重启即清零，库里那份才是准）：
     // last_run 写库失败时记下的启动时刻、以及连续启动失败的次数。
     let mut fired_memo: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
-    let mut launch_failures: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+    let mut backoffs: std::collections::HashMap<i64, Backoff> = std::collections::HashMap::new();
     while !stop.load(Ordering::SeqCst) {
         for _ in 0..(CHECK_INTERVAL_MS / 500) {
             if stop.load(Ordering::SeqCst) {
@@ -990,7 +1089,9 @@ fn check_loop(stop: Arc<AtomicBool>) {
         let now = Local::now();
         let tasks = get_all_tasks();
         for task in &tasks {
-            if launch_failures.get(&task.id).copied().unwrap_or(0) >= LAUNCH_FAILURE_BACKOFF_AFTER {
+            let window = backoff_window(task, &now);
+            let stamp = task_stamp(task);
+            if in_backoff(backoffs.get(&task.id), &window, &stamp) {
                 continue;
             }
             // 条数就几条，克隆一份把兜底时刻套上去，比到处传参数好读
@@ -998,7 +1099,7 @@ fn check_loop(stop: Arc<AtomicBool>) {
             let mut t = task.clone();
             t.last_run = effective_last_run(task.last_run.as_deref(), memo.as_deref());
             if should_run(&t, &now) {
-                record_launch(&t, &mut fired_memo, &mut launch_failures);
+                record_launch(&t, &mut fired_memo, &mut backoffs, &window, &stamp);
             }
         }
     }
@@ -1008,25 +1109,73 @@ fn check_loop(stop: Arc<AtomicBool>) {
 fn record_launch(
     t: &ScheduledTask,
     fired_memo: &mut std::collections::HashMap<i64, String>,
-    launch_failures: &mut std::collections::HashMap<i64, u32>,
+    backoffs: &mut std::collections::HashMap<i64, Backoff>,
+    window: &str,
+    stamp: &str,
 ) {
-    match execute_task(t) {
-        Some(at) => {
-            fired_memo.insert(t.id, at);
-            launch_failures.remove(&t.id);
+    let outcome = execute_task(t);
+    let fired_at = apply_attempt(backoffs, t.id, window, stamp, &outcome);
+    if let Some(at) = fired_at {
+        fired_memo.insert(t.id, at);
+    }
+}
+
+/// 把一次尝试的结果记进退避表，返回"真的启动了"的时刻（没有启动则 `None`）。
+///
+/// 纯函数（不起进程、不碰库），三个臂都能单测。
+fn apply_attempt(
+    backoffs: &mut std::collections::HashMap<i64, Backoff>,
+    id: i64,
+    window: &str,
+    stamp: &str,
+    outcome: &LaunchOutcome,
+) -> Option<String> {
+    match outcome {
+        LaunchOutcome::Fired(at) => {
+            backoffs.remove(&id);
+            return Some(at.clone());
         }
-        None => {
-            let n = launch_failures.entry(t.id).or_insert(0);
-            *n += 1;
-            if *n == LAUNCH_FAILURE_BACKOFF_AFTER {
+        LaunchOutcome::Refused(why) => {
+            // 永久拒绝：跨窗口也不再试。计数直接给到阈值，省掉"还剩几次"这套歧义。
+            tracing::warn!(
+                "定时任务 #{id} 不再重试（{why}）；在插件页改正这条任务的目标后会重新试一次"
+            );
+            backoffs.insert(
+                id,
+                Backoff {
+                    count: LAUNCH_FAILURE_BACKOFF_AFTER,
+                    window: window.to_string(),
+                    stamp: stamp.to_string(),
+                    given_up: true,
+                },
+            );
+        }
+        LaunchOutcome::Transient(why) => {
+            let b = backoffs.entry(id).or_insert(Backoff {
+                count: 0,
+                window: window.to_string(),
+                stamp: stamp.to_string(),
+                given_up: false,
+            });
+            // 窗口或配置换过 ⇒ 这份计数属于上一个时段，重新武装
+            if b.window != window || b.stamp != stamp {
+                b.count = 0;
+                b.window = window.to_string();
+                b.stamp = stamp.to_string();
+                b.given_up = false;
+            }
+            b.count += 1;
+            tracing::debug!("定时任务 #{id} 本时段第 {} 次启动没成功: {why}", b.count);
+            if b.count == LAUNCH_FAILURE_BACKOFF_AFTER {
                 tracing::warn!(
-                    "定时任务「{}」连续 {n} 次没能启动，本轮调度期内不再重试（到下一个时段再试一次）；\
+                    "定时任务 #{id} 连续 {} 次没能启动，本时段内不再重试，下一个时段再试一次；\
                      目标已卸载或不在白名单里的话，请直接删掉或改正这条任务",
-                    t.name
+                    b.count
                 );
             }
         }
     }
+    None
 }
 
 /// 后台调度线程句柄。
@@ -2062,6 +2211,229 @@ mod tests {
         assert!(
             e.contains("仅支持") && e.contains(".exe"),
             "链接指向非 .exe 时要说明只支持 .exe，实得: {e}"
+        );
+    }
+
+    /// 造一条内存里的任务，只给退避/窗口判定用（不落库、不起进程）。
+    fn sched_task(id: i64, ty: &str, time: &str) -> ScheduledTask {
+        ScheduledTask {
+            id,
+            name: format!("t{id}"),
+            target_path: r"C:\focusflow-test-dir\不存在的目标.exe".into(),
+            args: String::new(),
+            schedule_type: ty.into(),
+            schedule_time: time.into(),
+            enabled: true,
+            last_run: None,
+            created_at: "2026-01-01T00:00:00".into(),
+        }
+    }
+
+    fn at(y: i32, mo: u32, d: u32, hh: u32, mm: u32) -> chrono::DateTime<Local> {
+        Local
+            .with_ymd_and_hms(y, mo, d, hh, mm, 0)
+            .single()
+            .expect("构造本地时刻")
+    }
+
+    /// 回归（账 34 同族）：`args` 列可空，读侧却按非 `Option` 的 String 解码，
+    /// 解码失败的行再被 `rows.flatten()` 静默丢掉。后果不是"插件页少一条"：
+    /// `check_loop` 走的也是 `get_all_tasks` ⇒ 那条任务**连一条日志都没有就永远不再
+    /// 触发**，而 `delete_task`/`toggle_task` 不读 args 照旧找得到它、`update_task`
+    /// 又报"不存在"⇒ 三个面对同一条任务的存在性各执一词。
+    /// NULL 的来源合法且常见：Python 版遗留库、`backup/` 还原、手改。
+    #[test]
+    fn null_args_does_not_make_a_task_invisible() {
+        let _g = isolate_app_dir("null_args");
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_tasks (id, name, target_path, args, schedule_type, \
+                 schedule_time, enabled, last_run, created_at) \
+                 VALUES (7101, 'legacy', ?1, NULL, 'daily', '23:59', 1, NULL, \
+                 '2026-01-01T00:00:00')",
+                [r"C:\focusflow-test-dir\不存在的目标.exe"],
+            )
+            .unwrap();
+        }
+        // ① 列表面：这一条必须在，args 兜成空串
+        let all = get_all_tasks();
+        assert_eq!(all.len(), 1, "NULL args 的行不能凭空消失，实得 {all:?}");
+        assert_eq!(all[0].args, "", "NULL 要兜成空串而不是丢掉整条");
+        // ② 编辑面：以前这里报"定时任务不存在（id=7101）"，是同一次解码失败的另一副面孔
+        update_task(7101, Some("改名"), None, None, None, None, None)
+            .expect("存在的任务不能因为 args 为 NULL 就改不动");
+        assert!(
+            get_all_tasks()
+                .iter()
+                .any(|t| t.id == 7101 && t.name == "改名"),
+            "改完要读得回来"
+        );
+        // ③ 修复面：脏值不在库里长期留着，init_db 补一次
+        {
+            let conn = open().unwrap();
+            conn.execute("UPDATE scheduled_tasks SET args=NULL WHERE id=7101", [])
+                .unwrap();
+        }
+        init_db().expect("init_db 必须幂等");
+        let raw: String = {
+            let conn = open().unwrap();
+            conn.query_row("SELECT args FROM scheduled_tasks WHERE id=7101", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(raw, "", "init_db 要把遗留的 NULL args 补成空串");
+    }
+
+    /// 回归：`launch_failures >= 3` 以后**从来没有**按窗口复位（唯一的清零是启动成功），
+    /// 而注释写"退到下一个调度时段"、给用户的 warn 写"到下一个时段再试一次"
+    /// ⇒ 文案与实现相反。一条 09:00 的任务在睡着的 USB 盘上烧掉 3 次，就在本次进程
+    /// 运行期内再也不跑，直到重启（而重启那一刻它又会在不该跑的时刻补一次）。
+    #[test]
+    fn transient_backoff_rearms_at_the_next_window() {
+        let t = sched_task(1, "daily", "09:00");
+        let stamp = task_stamp(&t);
+        let day1 = backoff_window(&t, &at(2026, 9, 27, 9, 5));
+        let day2 = backoff_window(&t, &at(2026, 9, 28, 9, 5));
+        assert_ne!(day1, day2, "daily 的窗口必须按日历日切");
+
+        let mut m: std::collections::HashMap<i64, Backoff> = std::collections::HashMap::new();
+        let fail = || LaunchOutcome::Transient("os error 2: 系统找不到指定的文件".into());
+        for _ in 0..LAUNCH_FAILURE_BACKOFF_AFTER {
+            apply_attempt(&mut m, 1, &day1, &stamp, &fail());
+        }
+        assert!(
+            in_backoff(m.get(&1), &day1, &stamp),
+            "本时段烧满 {LAUNCH_FAILURE_BACKOFF_AFTER} 次就该停手"
+        );
+        assert!(
+            !in_backoff(m.get(&1), &day2, &stamp),
+            "warn 说「到下一个时段再试一次」⇒ 第二天必须重新武装"
+        );
+        // 新窗口里再烧满 3 次 ⇒ 又停（不会变成"每 30 秒试一次、一天两万八千条"）
+        for _ in 0..LAUNCH_FAILURE_BACKOFF_AFTER {
+            apply_attempt(&mut m, 1, &day2, &stamp, &fail());
+        }
+        assert!(
+            in_backoff(m.get(&1), &day2, &stamp),
+            "新窗口也是同样的三次上限"
+        );
+        // 成功一次就把整条退避抹掉
+        apply_attempt(
+            &mut m,
+            1,
+            &day2,
+            &stamp,
+            &LaunchOutcome::Fired("2026-09-28 09:00:00".into()),
+        );
+        assert!(m.is_empty(), "启动成功要清零计数，实得 {m:?}");
+        // 用户改了调度（换时间）⇒ 老计数不算数
+        apply_attempt(&mut m, 1, &day2, &stamp, &fail());
+        apply_attempt(&mut m, 1, &day2, &stamp, &fail());
+        apply_attempt(&mut m, 1, &day2, &stamp, &fail());
+        let edited = sched_task(1, "daily", "07:30");
+        assert!(
+            !in_backoff(m.get(&1), &day2, &task_stamp(&edited)),
+            "改过配置就是另一条任务，必须重新试"
+        );
+    }
+
+    /// 三态的另一半：目标为空/白名单外是**永久**拒绝，跨窗口也不该再去启动
+    /// （否则"真的哪天忽然能启动就会在一个谁也没预期的时刻弹出来"），
+    /// 但用户在插件页改正目标之后必须重新武装。
+    #[test]
+    fn permanent_refusal_survives_window_rollover_but_not_a_config_fix() {
+        let t = sched_task(2, "daily", "09:00");
+        let stamp = task_stamp(&t);
+        let day1 = backoff_window(&t, &at(2026, 9, 27, 9, 5));
+        let day2 = backoff_window(&t, &at(2026, 9, 28, 9, 5));
+        let mut m: std::collections::HashMap<i64, Backoff> = std::collections::HashMap::new();
+        apply_attempt(
+            &mut m,
+            2,
+            &day1,
+            &stamp,
+            &LaunchOutcome::Refused("目标不在白名单".into()),
+        );
+        assert!(in_backoff(m.get(&2), &day1, &stamp));
+        assert!(
+            in_backoff(m.get(&2), &day2, &stamp),
+            "永久拒绝不该因为过了半夜又多启动一次"
+        );
+        let fixed = ScheduledTask {
+            target_path: r"C:\Windows\notepad.exe".into(),
+            ..t.clone()
+        };
+        assert!(
+            !in_backoff(m.get(&2), &day2, &task_stamp(&fixed)),
+            "改正目标之后必须再试一次"
+        );
+    }
+
+    /// interval 的窗口粒度 = 一个 interval 步（不是"整个当天"），
+    /// 否则一次卡住的窗口任务会把当天剩下的所有步全哑掉，与文案的"下一个时段"不符。
+    #[test]
+    fn interval_backoff_window_steps_with_the_schedule() {
+        let iv = sched_task(3, "interval", "09:00-18:00|30");
+        let early = backoff_window(&iv, &at(2026, 9, 27, 9, 5));
+        let same_step = backoff_window(&iv, &at(2026, 9, 27, 9, 29));
+        let next_step = backoff_window(&iv, &at(2026, 9, 27, 9, 35));
+        assert_eq!(early, same_step, "同一个 30 分钟步内算同一个窗口");
+        assert_ne!(early, next_step, "跨过一步就是新的时段，该重新试");
+        // 解析不出来的 schedule_time 退化成日历日窗口（不能 panic）
+        let broken = sched_task(4, "interval", "not-a-schedule");
+        assert_eq!(
+            backoff_window(&broken, &at(2026, 9, 27, 23, 0)),
+            "2026-09-27",
+            "坏配置要退化成日历日窗口"
+        );
+    }
+
+    /// 回归（第 23 轮靶子 △）：`update_task` 曾把当前值读成两次 SELECT，第二次的
+    /// `.ok().flatten()` 把"读失败"当成"这一条没有 last_run" ⇒ 更新返回 `Ok`、
+    /// 顺手把防同日重跑的锚写成 NULL。合并成一次读之后，错误必须冒到调用方，
+    /// 而且不能与"库里没这一条"混成一句话。
+    #[test]
+    fn update_task_separates_missing_row_from_unreadable_table() {
+        let _g = isolate_app_dir("update_contract");
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_tasks (id, name, target_path, args, schedule_type, \
+                 schedule_time, enabled, last_run, created_at) \
+                 VALUES (7102, '锚', ?1, '', 'daily', '09:00', 1, '2026-09-27 09:00:05', \
+                 '2026-01-01T00:00:00')",
+                [r"C:\focusflow-test-dir\不存在的目标.exe"],
+            )
+            .unwrap();
+        }
+        // 只改名字：调度没动 ⇒ last_run（今天已经跑过的锚）必须原样留着
+        update_task(7102, Some("改名"), None, None, None, None, None).expect("改名要成功");
+        let after = get_all_tasks().into_iter().find(|t| t.id == 7102).unwrap();
+        assert_eq!(
+            after.last_run.as_deref(),
+            Some("2026-09-27 09:00:05"),
+            "改个名字不能把防同日重跑的锚抹掉"
+        );
+
+        // 库里没有这一条 ⇒ 说"不存在"
+        let e = update_task(999_999, Some("x"), None, None, None, None, None)
+            .expect_err("不存在的 id 不能返回 Ok");
+        assert!(
+            e.to_string().contains("不存在"),
+            "没这一条要说「不存在」，实得: {e}"
+        );
+        // 表根本读不出来 ⇒ 不能说成"没这一条"（那是另一件事：库坏了）
+        {
+            let conn = open().unwrap();
+            conn.execute_batch("DROP TABLE scheduled_tasks").unwrap();
+        }
+        let e = update_task(7102, Some("x"), None, None, None, None, None)
+            .expect_err("读失败不能当成读成功");
+        assert!(
+            e.to_string().contains("读取定时任务失败"),
+            "表读不出来要说清是读失败，实得: {e}"
         );
     }
 }
