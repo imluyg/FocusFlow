@@ -204,6 +204,112 @@ table.grid-devices tbody tr[data-act="device-detail"] { cursor: pointer; }
 }
 .setting-row .lbl { min-width: 120px; color: var(--muted); }
 
+/* ===== 设置页（侧栏版） =====
+   前缀 ff- 自成一套，不复用 .setting-row：那个 class 还被插件面板（.widget-row）
+   与插件弹窗（.plugin-modal）共用，改它会把插件视图一起带下水。
+   版式 = 左栏分类 + 右面板「一行一项」：名称与说明占左列，控件贴右边缘。 */
+.ff-shell { display: flex; gap: 18px; align-items: flex-start; }
+
+.ff-nav { width: 178px; flex: none; position: sticky; top: 8px; }
+.ff-search {
+  width: 100%;
+  font-family: var(--font); font-size: 13px;
+  background: var(--card); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 10px; margin-bottom: 10px;
+}
+.ff-cap { font-size: 11px; color: var(--muted); letter-spacing: .06em; padding: 10px 8px 4px; }
+.ff-nav button {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  border: none; background: transparent; color: var(--fg);
+  font-family: var(--font); font-size: 13px; text-align: left;
+  padding: 6px 9px; border-radius: 8px; cursor: pointer;
+}
+.ff-nav button:hover { background: var(--accent-soft); }
+.ff-nav button.on { background: var(--accent-soft); font-weight: 600; }
+.ff-nav .i { width: 16px; flex: none; text-align: center; opacity: .7; }
+
+.ff-body { flex: 1; min-width: 0; }
+.ff-h2 { font-size: 15px; font-weight: 700; margin: 4px 0 8px; }
+.ff-card {
+  background: var(--header-bg);
+  border: 1px solid var(--divider);
+  border-radius: 12px;
+  padding: 2px 16px 4px;
+  margin: 0 0 18px;
+}
+.ff-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 26px; row-gap: 3px;
+  align-items: center;
+  padding: 13px 0;
+  border-top: 1px solid var(--divider);
+}
+.ff-item:first-child { border-top: none; }
+.ff-item > .ff-name { grid-column: 1; grid-row: 1; font-weight: 600; }
+.ff-item > .ff-ctl {
+  grid-column: 2; grid-row: 1; justify-self: end;
+  display: flex; align-items: center; gap: 8px;
+}
+.ff-item > .ff-desc {
+  grid-column: 1; font-size: 12px; line-height: 1.6;
+  color: var(--muted); max-width: 66ch;
+}
+.ff-item > .ff-desc.row2 { grid-row: 2; }
+/* 占满整行的附加块：路径、错误条，以及跟着它们的长说明 */
+.ff-item > .ff-desc.span, .ff-item > .ff-wide { grid-column: 1 / -1; }
+.ff-path {
+  font-family: Consolas, "Courier New", monospace;
+  background: var(--card); border: 1px solid var(--divider);
+  border-radius: 8px; padding: 7px 10px;
+  word-break: break-all; line-height: 1.5;
+}
+.ff-alert {
+  color: var(--danger); background: var(--card);
+  border: 1px solid var(--danger); border-left-width: 3px;
+  border-radius: 6px; padding: 7px 10px;
+}
+/* 状态位与维护信息：留在外壳里而不随分类切换重建，否则点「立即备份」的
+   回话一回来，刚写上的提示已经被换到新节点之外了 */
+.ff-foot {
+  border-top: 1px solid var(--divider);
+  padding-top: 10px; font-size: 12px; line-height: 1.7; color: var(--muted);
+}
+
+/* 开关：仍是同一个 input[type=checkbox]，只换外观，change 语义不变 */
+input[type="checkbox"].sw {
+  appearance: none; -webkit-appearance: none;
+  width: 38px; height: 22px; border-radius: 11px;
+  background: var(--switch-off);
+  position: relative; cursor: pointer; flex: none;
+  transition: background .15s ease;
+}
+input[type="checkbox"].sw::after {
+  content: ""; position: absolute; left: 3px; top: 3px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, .28);
+  transition: transform .15s ease;
+}
+input[type="checkbox"].sw:checked { background: var(--accent); }
+input[type="checkbox"].sw:checked::after { transform: translateX(16px); }
+input[type="checkbox"].sw:disabled { opacity: .45; cursor: not-allowed; }
+
+.ff-item .ff-in { width: 168px; }
+.ff-item .ff-num { width: 110px; text-align: right; font-variant-numeric: tabular-nums; }
+.ff-item input[type="text"], .ff-item select { font-size: 13px; }
+.ff-item select { padding: 5px 8px; }
+.ff-item .btn { font-size: 13px; padding: 6px 13px; }
+
+/* 最小窗口宽 820：178px 左栏加内容列挤不下，收成顶部一行分类 */
+@media (max-width: 900px) {
+  .ff-shell { display: block; }
+  .ff-nav { width: auto; position: static; display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+  .ff-search { flex: 1 1 100%; margin-bottom: 4px; }
+  .ff-cap { display: none; }
+  .ff-nav button { width: auto; }
+}
+
 /* ===== 插件控件（下拉/日期/弹窗表单） ===== */
 select, input[type="date"] {
   background: var(--card);

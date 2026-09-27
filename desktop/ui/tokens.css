@@ -21,6 +21,10 @@
   --border: #E5ECF8;
   --header-bg: #F1F5FB;
   --grid-line: #E3EAF6;
+  /* 设置页分组卡片：卡片底是 --header-bg，而 --border 压在上面几乎看不见，
+     所以描边与分隔线单开一档；开关的关闭底色同理不能复用边框色 */
+  --divider: #DCE4F2;
+  --switch-off: #CDD6E6;
   --radius: 16px;
   --shadow: 0 2px 10px rgba(24, 40, 80, 0.08);
   /* 弹窗投影：深色底上浅阴影分不开层，需要明显更重 */
@@ -51,6 +55,8 @@ body.dark {
   --border: #2A3042;
   --header-bg: #232A3C;
   --grid-line: #2E3548;
+  --divider: #333C53;
+  --switch-off: #3A4358;
   --shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
   --modal-shadow: rgba(0, 0, 0, 0.6);
 }

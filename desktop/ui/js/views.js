@@ -678,184 +678,475 @@ export function renderAnalytics(s) {
 }
 
 // ===== 设置 =====
-export async function renderSettings() {
-  const box = $("view-settings");
-  const s = await invoke("get_settings");
-  const dark = s.theme === "dark";
-  const paused = s.paused;
-  const hotkeyEnabled = s.hotkey_enabled;
-  const hotkeyStr = s.hotkey_str;
-  const hotkeyError = s.hotkey_error || "";
-  const floatingEnabled = s.floating_enabled;
-  const goalKeys = Number(s.goal_daily_keys ?? 20000) || 20000;
-  lastGoalKeys = goalKeys;
-  // 备份开关：退出时备份 / 运行中定时备份（0 小时 = 关闭，与 config.ini 同语义）
-  const backupOnExit = s.backup_on_exit !== false;
-  const backupHours = Number(s.backup_online_hours ?? 24) || 0;
-  const backupOnline = backupHours > 0;
-  const hourOptions = [6, 12, 24, 48, 168];
-  if (backupOnline && !hourOptions.includes(backupHours)) hourOptions.push(backupHours);
-  hourOptions.sort((a, b) => a - b);
-  const hourLabel = (h) => (h === 168 ? "每 7 天" : `每 ${h} 小时`);
-  const hourSelect = hourOptions
-    .map((h) => `<option value="${h}" ${h === backupHours ? "selected" : ""}>${hourLabel(h)}</option>`)
+// 侧栏版：左栏分类 + 右面板「一行一项」（名称与说明占左列，控件贴右边缘）。
+// 加一项设置只改 SETTINGS_CATS：分类导航、搜索过滤、控件外观与写回都从这张表派生。
+//
+// 行字段：
+//   name 项标题 / desc 说明小字（可以是函数，读快照拼文案）/ descWide 说明占满整行
+//   t    "switch" | "text" | "btns" | "raw"（raw 自己给控件字符串，用于开关+下拉这类组合）
+//   v    取值（读 get_settings 快照）/ on change 处理器 / wide 占满整行的附加块
+//   id   控件 id：set-paused、set-floating 这两个名字不能改，main.js 的
+//        pause-changed / floating-changed 订阅按 id 找节点同步勾选
+//
+// 这张表留在 views.js 而不另开 settings.js：暗色切换要顺手重绘 renderRank /
+// renderApps / renderDevices / renderAnalytics，还要动 lastGoalKeys 与
+// refreshGoalStrip，全在本文件里；拆出去会形成 views ↔ settings 的循环 import。
+
+const settingsUI = { cat: "general", q: "", data: null };
+
+const BACKUP_HOURS = [6, 12, 24, 48, 168];
+const backupHourLabel = (h) => (h === 168 ? "每 7 天" : `每 ${h} 小时`);
+// 现实值不在预设里（手改过 config.ini）时补进选项，否则下拉会把它显示成第一项
+function backupHourSelect(cur) {
+  const opts = BACKUP_HOURS.includes(cur) ? BACKUP_HOURS.slice() : BACKUP_HOURS.concat(cur);
+  opts.sort((a, b) => a - b);
+  return opts
+    .map((h) => `<option value="${h}"${h === cur ? " selected" : ""}>${backupHourLabel(h)}</option>`)
     .join("");
-  // 数据目录：后端报的是**当前真正生效**的那个（配的目录建不出来时会回落程序目录）。
-  const dataHome = s.data_home || "";
-  const dataHomeShared = s.data_home_shared_with_app !== false;
+}
 
+async function onDarkChange(e) {
+  const dark = e.target.checked;
+  await invoke("set_config", { section: "gui", key: "theme", value: dark ? "dark" : "light" });
+  document.body.classList.toggle("dark", dark);
+  // 图表配色取自 CSS 变量：切换主题后立即重绘当前统计视图。
+  // 不能只重绘 trend——空闲时后端可能长时间不推送 stats-charts，
+  // 停在小时/星期分布页会一直保持旧配色。
+  const chartViews = { rank: renderRank, apps: renderApps, devices: renderDevices, analytics: renderAnalytics };
+  const rerender = chartViews[appState.currentView];
+  if (appState.chartsData && rerender) rerender(appState.chartsData);
+  // 悬浮窗只在启动时读一次主题，这里广播让它实时跟随
+  emit("theme-changed", dark).catch(() => {});
+}
+
+async function onPauseChange(e) {
+  // 同步到实际暂停状态
+  const target = e.target.checked;
+  if ((await invoke("is_paused")) !== target) await invoke("toggle_pause");
+}
+
+async function onHotkeyEnabledChange(e) {
+  await invoke("set_config", { section: "hotkey", key: "enabled", value: e.target.checked ? "true" : "false" });
+  // 重读一遍设置：配置写入成功但注册失败时 set_config 仍返回 Ok（不能拿它
+  // 报错，否则前端以为开关没写上），注册结果只能由 hotkey_error 反映
+  await renderSettings();
+}
+
+async function onHotkeyStrChange(e) {
+  await invoke("set_config", { section: "hotkey", key: "toggle_window", value: e.target.value });
+  await renderSettings();
+}
+
+async function onFloatingChange(e) {
+  await invoke("set_config", { section: "floating", key: "enabled", value: e.target.checked ? "true" : "false" });
+}
+
+// 每日目标：夹到 [1, 5000000]。写回输入框，避免显示与实际生效值不一致
+async function onGoalChange(e) {
+  // 空串/非正整数一律保持原值，不写库：Number("") 是 0 而不是 NaN，
+  // 早先的夹取会把「清空输入框顺手一离开」变成「每日目标 = 1」，等于关掉打卡。
+  const raw = e.target.value.trim();
+  const n = Math.floor(Number(raw));
+  if (raw === "" || !Number.isFinite(n) || n < 1) {
+    e.target.value = String(lastGoalKeys);
+    const box = $("set-msg");
+    if (box) {
+      box.style.color = "var(--danger)";
+      box.textContent = "每日目标必须是正整数，已保持原来的 " + fmt(lastGoalKeys) + " 次";
+    }
+    return;
+  }
+  const v = Math.min(5000000, n);
+  lastGoalKeys = v;
+  e.target.value = String(v);
+  await invoke("set_config", { section: "goal", key: "daily_keys", value: String(v) });
+  refreshGoalStrip(true);
+}
+
+// 退出时备份：退出路径每次都重读配置，改完立即生效
+async function onBackupExitChange(e) {
+  await invoke("set_config", {
+    section: "database",
+    key: "backup_on_exit",
+    value: e.target.checked ? "true" : "false",
+  });
+}
+
+// 定时备份：勾选写入所选小时数，取消写 0（= 关闭）。定时线程每分钟重读配置，
+// 无需重启；关闭期间不累积计时，重新打开后从零开始计。
+async function onBackupOnlineChange(e) {
+  const on = e.target.checked;
+  const sel = $("set-backup-interval");
+  sel.disabled = !on;
+  const hours = on ? Number(sel.value) || 24 : 0;
+  await invoke("set_config", {
+    section: "database",
+    key: "online_backup_interval_hours",
+    value: String(hours),
+  });
+}
+
+async function onBackupIntervalChange(e) {
+  if (!$("set-backup-online").checked) return;
+  await invoke("set_config", {
+    section: "database",
+    key: "online_backup_interval_hours",
+    value: e.target.value,
+  });
+}
+
+const SETTINGS_CATS = [
+  {
+    id: "general",
+    cap: "应用",
+    label: "常规",
+    icon: "◐",
+    cards: [
+      {
+        title: "外观与记录",
+        rows: [
+          {
+            id: "set-dark", t: "switch", name: "暗色模式",
+            desc: "本页、图表与悬浮窗立即跟随，不必重启。",
+            v: (s) => s.theme === "dark", on: onDarkChange,
+          },
+          {
+            id: "set-paused", t: "switch", name: "暂停记录",
+            desc: "暂停期间不再统计键鼠。托盘与悬浮窗也能切，状态会同步到这里。",
+            v: (s) => !!s.paused, on: onPauseChange,
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "hotkey",
+    cap: "应用",
+    label: "热键",
+    icon: "⌨",
+    cards: [
+      {
+        title: "呼出主窗口",
+        rows: [
+          {
+            id: "set-hotkey-enabled", t: "switch", name: "启用热键",
+            desc: "按下组合键显示或隐藏主窗口。",
+            v: (s) => !!s.hotkey_enabled, on: onHotkeyEnabledChange,
+          },
+          {
+            id: "set-hotkey-str", t: "text", name: "热键组合",
+            v: (s) => s.hotkey_str || "", on: onHotkeyStrChange,
+            wide: (s) =>
+              s.hotkey_enabled && s.hotkey_error
+                ? `<div class="ff-wide ff-alert">热键注册失败：${escapeHtml(s.hotkey_error)}（换一个组合键，或让开占用者）</div>`
+                : "",
+            desc: "形如 Ctrl+Alt+F。改动后立即重新注册：成功不提示，失败会红字写在上面。",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "floating",
+    cap: "应用",
+    label: "悬浮窗",
+    icon: "▣",
+    cards: [
+      {
+        title: "桌面小窗",
+        rows: [
+          {
+            id: "set-floating", t: "switch", name: "显示悬浮窗",
+            desc: "关掉后本次运行不再显示。",
+            v: (s) => !!s.floating_enabled, on: onFloatingChange,
+          },
+          {
+            t: "btns", name: "临时显示 / 隐藏",
+            desc: "只影响当前这一次，不改上面那个开关。",
+            btns: [
+              { act: "show-floating", label: "立即显示" },
+              { act: "hide-floating", label: "立即隐藏" },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "goal",
+    cap: "应用",
+    label: "目标与周报",
+    icon: "◎",
+    cards: [
+      {
+        title: "每日目标",
+        rows: [
+          {
+            // 值不加千分位：onGoalChange 用 Number() 解析，"20,000" 会变 NaN 被当成非法输入
+            id: "set-goal", t: "text", cls: "ff-num", name: "每日目标次数",
+            v: (s) => String(Number(s.goal_daily_keys ?? 20000) || 20000), on: onGoalChange,
+            desc: "达标即算打卡：按整日总活跃次数判定，连续天数显示在「活跃分析」页顶部（今天没达标不清零昨天的纪录）。",
+          },
+        ],
+      },
+      {
+        title: "周报",
+        rows: [
+          {
+            t: "btns", name: "上周周报",
+            btns: [{ act: "do-weekly-report", label: "立即生成" }],
+            desc: "应用会在启动后与每周一自动把上一个完整周（周一~周日）汇总成 Markdown 周报，写到 data/reports/ 下；同一周重复生成只会重写同一份文件。",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "data",
+    cap: "数据",
+    label: "目录与备份",
+    icon: "🗀",
+    cards: [
+      {
+        title: "数据目录",
+        rows: [
+          {
+            t: "btns", name: "当前位置",
+            btns: [{ act: "do-change-data-dir", label: "更改数据文件夹…" }],
+            // 后端报的是**当前真正生效**的那个目录（配的目录建不出来时会回落程序目录）
+            wide: (s) => `<div class="ff-wide ff-path" id="set-data-home">${escapeHtml(s.data_home || "")}</div>`,
+            desc: (s) =>
+              (s.data_home_shared_with_app !== false
+                ? "数据目前与程序放在一起，拷走整个文件夹即迁移。"
+                : "数据已从程序目录挪出。") +
+              " 更改会把 data 与 backup <b>整体搬</b>到你选的文件夹：程序先重启，重启时复制并逐文件核对，确认无误才删旧目录；核对没过就保留原样、下次启动重试。日志、插件与 config.ini 仍留在程序目录。搬运期间请勿输入。",
+            descWide: true,
+          },
+        ],
+      },
+      {
+        title: "备份",
+        rows: [
+          {
+            id: "set-backup-exit", t: "switch", name: "退出时自动备份",
+            desc: "每次正常退出前给各类库各存一份快照。",
+            v: (s) => s.backup_on_exit !== false, on: onBackupExitChange,
+          },
+          {
+            // 0 小时 = 关闭，与 config.ini 同语义
+            t: "raw", name: "运行中定时备份",
+            ctl: (s) => {
+              const h = Number(s.backup_online_hours ?? 24) || 0;
+              return (
+                `<input type="checkbox" class="sw" id="set-backup-online"${h > 0 ? " checked" : ""}>` +
+                `<select id="set-backup-interval"${h > 0 ? "" : " disabled"}>${backupHourSelect(h)}</select>`
+              );
+            },
+            bind: () => {
+              $("set-backup-online").addEventListener("change", onBackupOnlineChange);
+              $("set-backup-interval").addEventListener("change", onBackupIntervalChange);
+            },
+            desc: "备份为单文件快照（不受插件开关影响，属核心功能），每类库各保留最近若干份（数量见 config.ini 的 max_backups）；清空/清理数据、跨年归档前的自动快照始终保留，用于兜底恢复。",
+          },
+          {
+            t: "btns", name: "立即备份",
+            btns: [{ act: "do-backup", label: "现在备份一次", primary: true }],
+            desc: "马上对当前各类库各存一份快照。",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "ops",
+    cap: "数据",
+    label: "导入与导出",
+    icon: "↧",
+    cards: [
+      {
+        title: "导出与整理",
+        rows: [
+          {
+            t: "btns", name: "导出",
+            btns: [
+              { act: "do-export", label: "导出 CSV", fmt: "csv" },
+              { act: "do-export", label: "导出 HTML", fmt: "html" },
+            ],
+            desc: "导出全部历史数据，与顶部统计周期无关。",
+          },
+          {
+            t: "btns", name: "导入旧数据",
+            btns: [{ act: "do-import", label: "选择目录导入" }],
+            desc: "把旧版 FocusFlow 目录里的历史数据并进来。",
+          },
+          {
+            t: "btns", name: "压缩数据库",
+            btns: [{ act: "do-vacuum", label: "压缩数据库" }],
+            desc: "重建库文件、回收空间；数据量大时耗时较久。",
+          },
+        ],
+      },
+    ],
+  },
+];
+
+function descTextOf(r, s) {
+  const d = typeof r.desc === "function" ? r.desc(s) : r.desc || "";
+  return d || "";
+}
+
+function ffRowMatches(r, q) {
+  if (!q) return true;
+  const s = settingsUI.data || {};
+  return (r.name + " " + descTextOf(r, s)).toLowerCase().includes(q);
+}
+
+function ffCatMatches(c, q) {
+  return (c.label + " " + c.cap).toLowerCase().includes(q);
+}
+
+function ffRowHtml(r, s) {
+  let ctl = "";
+  if (r.t === "switch") {
+    ctl = `<input type="checkbox" class="sw" id="${r.id}"${r.v(s) ? " checked" : ""}>`;
+  } else if (r.t === "text") {
+    ctl = `<input type="text" class="${r.cls || "ff-in"}" id="${r.id}" value="${escapeHtml(r.v(s))}">`;
+  } else if (r.t === "btns") {
+    ctl = r.btns
+      .map(
+        (b) =>
+          `<button class="btn${b.primary ? "" : " ghost"}" data-act="${b.act}"` +
+          `${b.fmt ? ` data-fmt="${b.fmt}"` : ""}>${escapeHtml(b.label)}</button>`
+      )
+      .join("");
+  } else if (r.t === "raw") {
+    ctl = r.ctl(s);
+  }
+  const desc = descTextOf(r, s);
+  const wide = r.wide ? r.wide(s) : "";
+  return (
+    `<div class="ff-item"><span class="ff-name">${escapeHtml(r.name)}</span>` +
+    `<span class="ff-ctl">${ctl}</span>${wide}` +
+    (desc ? `<span class="ff-desc ${r.descWide ? "span" : "row2"}">${desc}</span>` : "") +
+    `</div>`
+  );
+}
+
+function ffCardHtml(card, s, q) {
+  const rows = card.rows.filter((r) => ffRowMatches(r, q));
+  if (!rows.length) return "";
+  return `<div class="ff-h2">${escapeHtml(card.title)}</div><div class="ff-card">${rows.map((r) => ffRowHtml(r, s)).join("")}</div>`;
+}
+
+// 有查询词时把命中的分类摊平成一张长列表；没有就只显示当前分类
+function ffVisibleCats(q) {
+  if (!q) return SETTINGS_CATS.filter((c) => c.id === settingsUI.cat);
+  return SETTINGS_CATS.filter(
+    (c) => ffCatMatches(c, q) || c.cards.some((cd) => cd.rows.some((r) => ffRowMatches(r, q)))
+  );
+}
+
+function ffBindRows(cats) {
+  cats.forEach((c) =>
+    c.cards.forEach((cd) =>
+      cd.rows.forEach((r) => {
+        if (r.bind) {
+          r.bind();
+        } else if (r.on && r.id) {
+          const el = $(r.id);
+          if (el) el.addEventListener("change", r.on);
+        }
+      })
+    )
+  );
+}
+
+function paintSettingsBody() {
+  const s = settingsUI.data;
+  const body = $("ff-body");
+  if (!s || !body) return;
+  const q = settingsUI.q.trim().toLowerCase();
+  const cats = ffVisibleCats(q);
+  const html = cats.map((c) => c.cards.map((cd) => ffCardHtml(cd, s, q)).join("")).join("");
+  body.innerHTML = html || '<div class="empty">没有匹配的设置</div>';
+  ffBindRows(cats);
+}
+
+// 只改可见性与高亮，不重建左栏：重建会把搜索框里的焦点与输入一起丢掉
+function paintNavFilter() {
+  const q = settingsUI.q.trim().toLowerCase();
+  document.querySelectorAll(".ff-nav button[data-cat]").forEach((b) => {
+    const c = SETTINGS_CATS.find((x) => x.id === b.dataset.cat);
+    const hit =
+      !q || ffCatMatches(c, q) || c.cards.some((cd) => cd.rows.some((r) => ffRowMatches(r, q)));
+    b.style.display = hit ? "" : "none";
+    b.classList.toggle("on", !q && c.id === settingsUI.cat);
+  });
+  document.querySelectorAll(".ff-nav .ff-cap").forEach((el) => {
+    el.style.display = q ? "none" : "";
+  });
+}
+
+function ffNavHtml() {
+  let out = "";
+  let cap = null;
+  for (const c of SETTINGS_CATS) {
+    if (c.cap !== cap) {
+      cap = c.cap;
+      out += `<div class="ff-cap">${escapeHtml(cap)}</div>`;
+    }
+    out += `<button data-cat="${c.id}"${c.id === settingsUI.cat ? ' class="on"' : ""}><span class="i">${c.icon}</span>${escapeHtml(c.label)}</button>`;
+  }
+  return out;
+}
+
+function paintSettingsShell() {
+  const box = $("view-settings");
+  // 重建会连带清空 #set-msg：先记下再放回。压缩/导入/改数据目录这些动作要等几十秒
+  // 才回话，中途一次重渲染（比如顺手改了热键）不能把它抹掉。
+  const prev = $("set-msg");
+  const keep = prev ? { text: prev.textContent, color: prev.style.color } : null;
   box.innerHTML = `
-    <div class="section-title">常规</div>
-    <div class="setting-row"><span class="lbl">暗色模式</span><input type="checkbox" id="set-dark" ${dark ? "checked" : ""}></div>
-    <div class="setting-row"><span class="lbl">暂停记录</span><input type="checkbox" id="set-paused" ${paused ? "checked" : ""}></div>
-
-    <div class="section-title">全局热键</div>
-    <div class="setting-row"><span class="lbl">启用热键</span><input type="checkbox" id="set-hotkey-enabled" ${hotkeyEnabled ? "checked" : ""}></div>
-    <div class="setting-row"><span class="lbl">热键组合</span><input type="text" id="set-hotkey-str" value="${escapeHtml(hotkeyStr)}"></div>
-    ${
-      hotkeyEnabled && hotkeyError
-        ? `<div style="font-size:12px;color:var(--danger);margin:4px 0;">热键注册失败：${escapeHtml(
-            hotkeyError
-          )}（换一个组合键，或让开占用者）</div>`
-        : ""
-    }
-
-    <div class="section-title">悬浮窗</div>
-    <div class="setting-row"><span class="lbl">显示悬浮窗</span><input type="checkbox" id="set-floating" ${floatingEnabled ? "checked" : ""}></div>
-    <div class="setting-row"><button class="btn ghost" data-act="show-floating">立即显示</button>
-      <button class="btn ghost" data-act="hide-floating">立即隐藏</button></div>
-
-    <div class="section-title">数据目录</div>
-    <div class="setting-row">
-      <span class="lbl">当前位置</span>
-      <span id="set-data-home" style="font-size:12px;word-break:break-all;">${escapeHtml(dataHome)}</span>
+    <div class="ff-shell">
+      <nav class="ff-nav">
+        <input type="text" class="ff-search" id="ff-search" placeholder="搜索设置…" value="${escapeHtml(settingsUI.q)}">
+        ${ffNavHtml()}
+      </nav>
+      <div class="ff-body" id="ff-body"></div>
     </div>
-    <div class="setting-row"><button class="btn ghost" data-act="do-change-data-dir">更改数据文件夹…</button></div>
-    <div style="color:var(--muted);font-size:12px;">
-      ${dataHomeShared
-        ? "数据目前与程序放在一起，拷走整个文件夹即迁移。"
-        : "数据已从程序目录挪出。"}
-      更改会把 data 与 backup <b>整体搬</b>到你选的文件夹：程序先重启，重启时复制并逐文件核对，
-      确认无误才删旧目录；核对没过就保留原样、下次启动重试。
-      日志、插件与 config.ini 仍留在程序目录。搬运期间请勿输入。
-    </div>
+    <div class="ff-foot">
+      <div id="set-maint"></div>
+      <div id="set-msg"></div>
+    </div>`;
+  if (keep) {
+    const el = $("set-msg");
+    el.textContent = keep.text;
+    if (keep.color) el.style.color = keep.color;
+  }
+  $("ff-search").addEventListener("input", (e) => {
+    settingsUI.q = e.target.value;
+    paintSettingsBody();
+    paintNavFilter();
+  });
+  box.querySelectorAll(".ff-nav button[data-cat]").forEach((b) =>
+    b.addEventListener("click", () => {
+      settingsUI.cat = b.dataset.cat;
+      settingsUI.q = "";
+      $("ff-search").value = "";
+      paintSettingsBody();
+      paintNavFilter();
+    })
+  );
+  paintSettingsBody();
+  paintNavFilter();
+}
 
-    <div class="section-title">数据备份</div>
-    <div class="setting-row"><span class="lbl">退出时自动备份</span><input type="checkbox" id="set-backup-exit" ${backupOnExit ? "checked" : ""}></div>
-    <div class="setting-row">
-      <span class="lbl">运行中定时备份</span>
-      <input type="checkbox" id="set-backup-online" ${backupOnline ? "checked" : ""}>
-      <select id="set-backup-interval" ${backupOnline ? "" : "disabled"}>${hourSelect}</select>
-    </div>
-    <div style="color:var(--muted);font-size:12px;margin-top:4px;">
-      备份为单文件快照（不受插件开关影响，属核心功能），每类库各保留最近若干份（数量见 config.ini 的 max_backups）；
-      清空/清理数据、跨年归档前的自动快照始终保留，用于兜底恢复。
-    </div>
-
-    <div class="section-title">每日目标与周报</div>
-    <div class="setting-row"><span class="lbl">每日目标次数</span><input type="text" id="set-goal" size="10" value="${goalKeys}"></div>
-    <div style="color:var(--muted);font-size:12px;">
-      达标即算打卡：按整日总活跃次数判定，连续天数显示在「活跃分析」页顶部（今天没达标不清零昨天的纪录）。
-    </div>
-    <div class="setting-row"><button class="btn ghost" data-act="do-weekly-report">立即生成上周周报</button></div>
-    <div style="color:var(--muted);font-size:12px;">
-      应用会在启动后与每周一自动把上一个完整周（周一~周日）汇总成 Markdown 周报，写到 data/reports/ 下；
-      同一周重复生成只会重写同一份文件。
-    </div>
-
-    <div class="section-title">数据操作</div>
-    <div class="setting-row">
-      <button class="btn ghost" data-act="do-import">导入旧数据</button>
-      <button class="btn ghost" data-act="do-export" data-fmt="csv">导出 CSV</button>
-      <button class="btn ghost" data-act="do-export" data-fmt="html">导出 HTML</button>
-      <button class="btn" data-act="do-vacuum">压缩数据库</button>
-      <button class="btn ghost" data-act="do-backup">立即备份</button>
-    </div>
-    <div id="set-msg" style="color:var(--success);margin-top:8px;"></div>
-    <div id="set-maint" style="color:var(--muted);font-size:13px;margin-top:8px;"></div>
-  `;
-
-  $("set-dark").addEventListener("change", async (e) => {
-    const dark = e.target.checked;
-    await invoke("set_config", { section: "gui", key: "theme", value: dark ? "dark" : "light" });
-    document.body.classList.toggle("dark", dark);
-    // 图表配色取自 CSS 变量：切换主题后立即重绘当前统计视图。
-    // 不能只重绘 trend——空闲时后端可能长时间不推送 stats-charts，
-    // 停在小时/星期分布页会一直保持旧配色。
-    const chartViews = { rank: renderRank, apps: renderApps, devices: renderDevices, analytics: renderAnalytics };
-    const rerender = chartViews[appState.currentView];
-    if (appState.chartsData && rerender) rerender(appState.chartsData);
-    // 悬浮窗只在启动时读一次主题，这里广播让它实时跟随
-    emit("theme-changed", dark).catch(() => {});
-  });
-  $("set-paused").addEventListener("change", async (e) => {
-    // 同步到实际暂停状态
-    const target = e.target.checked;
-    if ((await invoke("is_paused")) !== target) await invoke("toggle_pause");
-  });
-  $("set-hotkey-enabled").addEventListener("change", async (e) => {
-    await invoke("set_config", { section: "hotkey", key: "enabled", value: e.target.checked ? "true" : "false" });
-    // 重读一遍设置：配置写入成功但注册失败时 set_config 仍返回 Ok（不能拿它
-    // 报错，否则前端以为开关没写上），注册结果只能由 hotkey_error 反映
-    await renderSettings();
-  });
-  $("set-hotkey-str").addEventListener("change", async (e) => {
-    await invoke("set_config", { section: "hotkey", key: "toggle_window", value: e.target.value });
-    await renderSettings();
-  });
-  $("set-floating").addEventListener("change", async (e) => {
-    await invoke("set_config", { section: "floating", key: "enabled", value: e.target.checked ? "true" : "false" });
-  });
-  // 每日目标：夹到 [1, 5000000]。写回输入框，避免显示与实际生效值不一致
-  $("set-goal").addEventListener("change", async (e) => {
-    // 空串/非正整数一律保持原值，不写库：Number("") 是 0 而不是 NaN，
-    // 早先的夹取会把「清空输入框顺手一离开」变成「每日目标 = 1」，等于关掉打卡。
-    const raw = e.target.value.trim();
-    const n = Math.floor(Number(raw));
-    if (raw === "" || !Number.isFinite(n) || n < 1) {
-      e.target.value = String(lastGoalKeys);
-      const box = $("set-msg");
-      if (box) {
-        box.style.color = "var(--danger)";
-        box.textContent = "每日目标必须是正整数，已保持原来的 " + fmt(lastGoalKeys) + " 次";
-      }
-      return;
-    }
-    const v = Math.min(5000000, n);
-    lastGoalKeys = v;
-    e.target.value = String(v);
-    await invoke("set_config", { section: "goal", key: "daily_keys", value: String(v) });
-    refreshGoalStrip(true);
-  });
-  // 退出时备份：退出路径每次都重读配置，改完立即生效
-  $("set-backup-exit").addEventListener("change", async (e) => {
-    await invoke("set_config", {
-      section: "database",
-      key: "backup_on_exit",
-      value: e.target.checked ? "true" : "false",
-    });
-  });
-  // 定时备份：勾选写入所选小时数，取消写 0（= 关闭）。定时线程每分钟重读配置，
-  // 无需重启；关闭期间不累积计时，重新打开后从零开始计。
-  $("set-backup-online").addEventListener("change", async (e) => {
-    const on = e.target.checked;
-    const sel = $("set-backup-interval");
-    sel.disabled = !on;
-    const hours = on ? Number(sel.value) || 24 : 0;
-    await invoke("set_config", {
-      section: "database",
-      key: "online_backup_interval_hours",
-      value: String(hours),
-    });
-  });
-  $("set-backup-interval").addEventListener("change", async (e) => {
-    if (!$("set-backup-online").checked) return;
-    await invoke("set_config", {
-      section: "database",
-      key: "online_backup_interval_hours",
-      value: e.target.value,
-    });
-  });
+export async function renderSettings() {
+  const s = await invoke("get_settings");
+  settingsUI.data = s;
+  lastGoalKeys = Number(s.goal_daily_keys ?? 20000) || 20000;
+  if (!SETTINGS_CATS.some((c) => c.id === settingsUI.cat)) settingsUI.cat = SETTINGS_CATS[0].id;
+  paintSettingsShell();
   renderMaintInfo();
 }
 
