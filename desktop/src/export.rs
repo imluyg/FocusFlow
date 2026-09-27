@@ -171,6 +171,16 @@ pub fn write_weekly_report() -> anyhow::Result<Option<std::path::PathBuf>> {
     write_weekly_report_for(from, to)
 }
 
+/// 周报用的目标次数：必须与设置页、`stats::goal_status` 同一把尺子。
+///
+/// 单独成函数是为了能被喂一份临时配置去测（`config::instance()` 是进程内单例，
+/// 用例改不动它）。周报里"达标 X 天"和逐日的 ✅ 是自己数出来的，而"连续 N 天"走
+/// `goal_status` —— 两处必须过同一个 `effective_goal`，否则 `daily_keys = 0` 时
+/// 一份文档里两把尺子（见 `stats::effective_goal`）。
+fn weekly_goal(cfg: &focusflow_core::config::FocusFlowConfig) -> i64 {
+    focusflow_core::stats::effective_goal(cfg.get_int("goal", "daily_keys", 20000))
+}
+
 /// 写出指定「周一~周日」区间的周报。
 ///
 /// 环比、连续打卡都改用同一批**按日**查询取数，而不是拿「相对今天的 21 天」去套：
@@ -184,7 +194,7 @@ pub fn write_weekly_report_for(
     use chrono::Datelike;
     use focusflow_core::db::queries as q;
 
-    let goal = focusflow_core::config::instance().get_int("goal", "daily_keys", 20000);
+    let goal = weekly_goal(focusflow_core::config::instance());
 
     let mut keys: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut apps: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
@@ -293,7 +303,7 @@ pub fn write_weekly_report_for(
         ));
     }
     out.push_str(&format!(
-        "- 每日目标 {}：达标 {}/7 天；截至本周日连续 {} 天（最长纪录 {} 天）\n\n",
+        "- 每日目标 {}：达标 {}/7 天；截至本周日连续 {} 天（近一年最长 {} 天）\n\n",
         fmt_thousands(goal),
         met_days,
         goal_state.streak,
@@ -561,8 +571,8 @@ mod tests {
             lookback - 3
         );
         assert!(
-            md.contains(&format!("最长纪录 {lookback} 天）")),
-            "最长纪录同样被窗口左端截短：\n{md}"
+            md.contains(&format!("近一年最长 {lookback} 天）")),
+            "近一年最长同样被窗口左端截短：\n{md}"
         );
         // 总量照旧只算那 7 天（7 × 30000），别让补长的窗口漏进别的口径里
         assert!(md.contains("210,000"), "本周总量应仍是 21 万：\n{md}");
@@ -726,5 +736,40 @@ mod tests {
             "HTML 键名应转义"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 写一份临时 config.ini 并加载。`config::instance()` 是进程内单例，用例改不动它，
+    /// 所以把"读配置"这一步单独成函数（[`weekly_goal`]）才好喂配置进去测。
+    /// 放 `target/` 下按 tag 固定命名：`%TEMP%` 里的随机名每跑一次漏一个目录。
+    fn cfg(tag: &str, body: &str) -> focusflow_core::config::FocusFlowConfig {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target")
+            .join(format!("ff_export_{tag}.ini"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{body}\n")).unwrap();
+        focusflow_core::config::FocusFlowConfig::load(&path).unwrap()
+    }
+
+    /// 回归（账 37）：`[goal] daily_keys = 0` 时，周报的"达标 X 天"与逐日的 ✅ 是按
+    /// **原始配置值**数的（0 ⇒ 每一天都满分），而同一份文件里的"连续 N 天"走
+    /// `stats::goal_status`，那边有 `goal.max(1)`；设置页那边又自己写了一遍 `.max(1)`。
+    /// 三处三把尺子，现在都过 `stats::effective_goal`。
+    #[test]
+    fn weekly_goal_shares_the_settings_page_caliper() {
+        assert_eq!(
+            weekly_goal(&cfg("goal_zero", "[goal]\ndaily_keys = 0")),
+            1,
+            "目标 0 次不能被当成「每天都达标」"
+        );
+        assert_eq!(
+            weekly_goal(&cfg("goal_absent", "[gui]\ntheme = dark")),
+            20000,
+            "没配就用默认值"
+        );
+        assert_eq!(
+            weekly_goal(&cfg("goal_ok", "[goal]\ndaily_keys = 500")),
+            500,
+            "正常配置值一字不动"
+        );
     }
 }

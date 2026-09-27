@@ -274,6 +274,18 @@ impl RestMonitor {
 /// `best` 会在数据边界上被截断，而两处各自写死数字迟早对不上。
 pub const GOAL_LOOKBACK_DAYS: i64 = 370;
 
+/// 打卡判定的**实际**目标次数：0 次不是"没有目标"，而是"每天都达标"——
+/// 那样"连续 N 天"就退化成"库里有几天"，所以按 1 兜住。
+///
+/// 所有喂给 [`goal_status`] 的调用方、以及任何自己数"达标天数"的面（周报）都必须
+/// 过这个函数。原来只有 `goal_status` 内部 `goal.max(1)`，设置页那边自己又写了个
+/// `.max(1)`，而周报拿的是**原始配置值**去数达标天数 ⇒ 同一个人把 `daily_keys` 设成
+/// 0 时，一份周报里"达标 X 天"按 0 算（每周都满分）、"连续 N 天"按 1 算 ——
+/// 三处三把尺子，正是上面那条常量注释禁止的形状。
+pub fn effective_goal(goal: i64) -> i64 {
+    goal.max(1)
+}
+
 /// 每日目标与连续打卡的结果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct GoalStatus {
@@ -312,7 +324,7 @@ pub fn goal_status(
     if today_pending > 0 {
         *map.entry(today).or_insert(0) += today_pending;
     }
-    let goal = goal.max(1);
+    let goal = effective_goal(goal);
     let count_of = |d: NaiveDate| -> i64 {
         map.get(d.format("%Y-%m-%d").to_string().as_str())
             .copied()
@@ -808,5 +820,13 @@ mod tests {
                 .is_some(),
             "重新攒满 30 分钟之后应当能提醒"
         );
+    }
+
+    /// 目标 0 次不是"没目标"，而是"每天都达标"⇒ 必须按 1 兜（三个面共用这一把尺子）。
+    #[test]
+    fn effective_goal_floors_zero_but_keeps_the_configured_value() {
+        assert_eq!(effective_goal(0), 1, "0 会让每一天都算达标");
+        assert_eq!(effective_goal(-5), 1, "负数同理，不能被当成「没目标」");
+        assert_eq!(effective_goal(20000), 20000, "正常值一字不动");
     }
 }

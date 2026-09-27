@@ -629,7 +629,7 @@ async function refreshGoalStrip(force) {
         <div id="goal-bar" style="height:100%;width:${pctv}%;background:${met ? "var(--success)" : "var(--accent)"};"></div>
       </div>
       <span style="color:var(--muted);font-size:13px;white-space:nowrap;">
-        连续打卡 ${g.streak} 天 · 最长 ${g.best} 天
+        连续打卡 ${g.streak} 天 · 近一年最长 ${g.best} 天
       </span>
       <span style="display:flex;gap:3px;">${dots}</span>
     </div>`;

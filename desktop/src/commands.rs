@@ -85,7 +85,10 @@ pub async fn get_goal_status(state: State<'_, Arc<AppState>>) -> Result<serde_js
 }
 
 fn goal_status_json(app: &AppState) -> Result<serde_json::Value, String> {
-    let goal = app.config.get_int("goal", "daily_keys", 20000).max(1);
+    // 尺子在 `stats::effective_goal` 里（周报那半边过的是同一个函数）：
+    // 各自写 `.max(1)` / 不写，就是"同一页两把尺子"的成因。
+    let goal =
+        focusflow_core::stats::effective_goal(app.config.get_int("goal", "daily_keys", 20000));
     // 先取按日序列、后读未落库增量：两步之间若恰好有一次 flush 落库，增量已进库、
     // 此刻读到的 pending 就是 0 —— 最坏少算一个瞬时切片，绝不会把同一段计两遍
     // （反过来先读 pending 再查库，中间落库就是双重计数）。
