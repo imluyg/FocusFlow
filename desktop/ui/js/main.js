@@ -4,7 +4,7 @@ import { invoke, listen } from "./tauri.js";
 import { $, toast } from "./utils.js";
 import { appState, analyticsTab } from "./state.js";
 import { renderPlugins, openPlugin, closePlugin, renderPluginDetail, togglePlugin, pluginBtn, pluginBtnSel, pluginField, pluginFieldStay, pluginSelectRow, pluginSelectAll, modalOpen, modalCancel, modalSubmit, modalAction } from "./plugins.js";
-import { applyLive, applyCharts, renderRank, renderApps, renderDevices, deviceRename, deviceRenameSave, deviceRenameClear, deviceRenameCancel, openDeviceDetail, closeDeviceDetail, deviceDetailSetPeriod, renderAnalytics, renderTrendChart, renderSettings, doImport, doExport, doVacuum, doBackup, doWeeklyReport } from "./views.js";
+import { applyLive, applyCharts, renderRank, renderApps, renderDevices, deviceRename, deviceRenameSave, deviceRenameClear, deviceRenameCancel, openDeviceDetail, closeDeviceDetail, deviceDetailSetPeriod, renderAnalytics, renderTrendChart, renderSettings, doImport, doExport, doVacuum, doBackup, doWeeklyReport, doChangeDataDir } from "./views.js";
 
 export function switchView(view) {
   appState.currentView = view;
@@ -79,6 +79,7 @@ document.addEventListener("click", (e) => {
       if (e.target === el) modalCancel(d.name, d.cancel || "", d.modal);
       break;
     case "do-import": doImport(); break;
+    case "do-change-data-dir": doChangeDataDir(); break;
     case "do-export": doExport(d.fmt); break;
     case "do-vacuum": doVacuum(); break;
     case "do-backup": doBackup(); break;

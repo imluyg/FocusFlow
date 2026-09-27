@@ -21,6 +21,10 @@ use focusflow_core::format::{csv_field, fmt_thousands, html_escape};
 
 fn main() -> ExitCode {
     logger::init_logging();
+    // 有待搬运的数据目录就先把家搬了。CLI 与 GUI 读同一套库：只写配置不搬的话，
+    // 命令行会对着一个空的新目录统计出 0（就是"列出了这一年、查它却是 0"那一族），
+    // 所以这个入口也得自愈，不能只靠 GUI 启动时搬。
+    focusflow_core::data_location::run_pending_migration();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = run(&args);
     // 返回前把非阻塞日志缓冲里的内容写完：main 一返回进程就终止，static 里的

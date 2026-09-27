@@ -52,7 +52,11 @@ desktop\build_nsis.bat
 ```
 
 运行：直接双击 `dist\FocusFlow\FocusFlow.exe`，或安装 NSIS 安装包。
-数据（键鼠记录、插件库）存放在程序目录 `data/`，备份在 `backup/`。
+程序目录（exe 所在目录）放程序本体：`config.ini`、`window_state.ini`、`plugins/`、`logs/`；
+数据放 `data/`（键鼠记录与各附属库）和 `backup/`，默认也在程序目录里 ——
+拷走整个文件夹即迁移。要把数据放到别处：设置页「数据目录 → 更改数据文件夹…」，
+它把 `data/` 与 `backup/` **复制**过去（原目录完整留着当备份）并自动重启生效，
+等价于手改 `config.ini` 的 `[paths] data_home`（留空 = 跟程序目录走）。日志、插件与配置始终跟着程序走。
 程序目录的定位优先级：`FOCUSFLOW_APP_DIR` 环境变量 > exe 所在目录（release 版）> 当前工作目录；
 快捷方式的"起始位置"不影响数据落点。配置损坏时原文件会被备份为 `config.ini.corrupt-<时间戳>` 后重建。
 

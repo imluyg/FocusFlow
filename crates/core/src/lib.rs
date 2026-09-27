@@ -7,6 +7,7 @@ pub mod accounting;
 pub mod app_stats;
 pub mod autostart;
 pub mod config;
+pub mod data_location;
 pub mod db;
 pub mod device_alias;
 pub mod device_stats;

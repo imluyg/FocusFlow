@@ -41,6 +41,20 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
         ],
     );
     s("stats", &[("cpm_window", "60")]);
+    // 数据目录（`data/` 与 `backup/` 挂在哪里）。留空 = 跟程序目录走，即"拷走整个
+    // 文件夹即迁移"的默认形态；填一个绝对路径就把数据挪到那儿，改完由程序自己
+    // 拷贝已有数据并重启生效（读者：paths::data_home）。日志/插件/配置仍留在程序目录。
+    s(
+        "paths",
+        &[
+            ("data_home", ""),
+            // 待搬运的**旧**数据根：非空 = 下次启动要先把它下面的 data/ 与 backup/
+            // 搬进 data_home（读者：data_location::run_pending_migration）。
+            // 「更改数据文件夹」只写这两个键然后重启；搬成功就清零，失败就留着，
+            // 下次启动重试 —— 源在搬成功并逐文件核对之前一个字都不动。
+            ("data_migrate_from", ""),
+        ],
+    );
     // 插件沙箱的两个上限（manager.rs 读；超限的插件会被标记为不可用）
     s(
         "plugins",
@@ -145,12 +159,16 @@ const DEPRECATED_CONFIG: &[(&str, &[&str])] = &[
 
 /// 解析 INI：兼容 Python configparser 的 `#`/`;` 注释与 `key = value` 语法。
 ///
+/// 对 crate 内开放：`paths::data_home` 要在配置单例就绪之前从 config.ini 里抠出
+/// `[paths] data_home` 一个键，用这份现成的解析器（含 BOM、引号、注释的处理）而不是
+/// 再手搓一个——两者对同一个文件给出不同结论，比只有一个解析器更糟。
+///
 /// 开头的 BOM 必须先剥掉：PowerShell 5.1 的 `>`/`Out-File`、记事本另存为 UTF-8 都会
 /// 写一个 U+FEFF，而它**不算空白**（`char::is_whitespace` 为 false），`trim()` 去不掉。
 /// 留着的话首行是 `\u{FEFF}[database]`，不是合法的 section 头 → 第一个 section 的
 /// 键全被丢掉；而 `load()` 结尾无条件 `save()`，于是用户自己的 `[database]` 配置
 /// 直接被默认值覆盖回写进文件 —— 静默丢配置，不只是这次读错。
-fn parse_ini(text: &str) -> HashMap<String, HashMap<String, String>> {
+pub(crate) fn parse_ini(text: &str) -> HashMap<String, HashMap<String, String>> {
     let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut current_section: Option<String> = None;
@@ -273,7 +291,7 @@ fn serialize_preserving_structure(
 
     // 快照里还有整节没出现过的：追加到文件末尾
     let order = [
-        "database", "stats", "listener", "gui", "hotkey", "floating", "pomodoro", "rest",
+        "database", "stats", "paths", "listener", "gui", "hotkey", "floating", "pomodoro", "rest",
     ];
     let mut remaining: Vec<&String> = snapshot
         .keys()
@@ -339,7 +357,7 @@ fn serialize_rebuilt(snapshot: &HashMap<String, HashMap<String, String>>) -> Str
     let mut out = String::new();
     // 固定 section 顺序，与 Python 版一致，便于阅读与 diff。
     let order = [
-        "database", "stats", "listener", "gui", "hotkey", "floating", "pomodoro", "rest",
+        "database", "stats", "paths", "listener", "gui", "hotkey", "floating", "pomodoro", "rest",
     ];
     let mut sections: Vec<&String> = snapshot.keys().collect();
     sections.sort_by_key(|s| order.iter().position(|o| o == s).unwrap_or(usize::MAX));

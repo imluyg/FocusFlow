@@ -165,6 +165,11 @@ impl AppState {
         // 启动自检（B15）：DB 侧三项（备份/采样/设备统计）已收在 Database 里，
         // 键鼠监听是致命项（失败直接 ? 让启动失败），成功也记一行备查。
         let mut startup_report = db.take_startup_checks();
+        // 数据目录搬运的结论（只有失败才有话，成功只进日志）：跟着启动报告一起 toast，
+        // 免得"没搬成、还在旧目录记着"这件事只有翻日志的人才知道。
+        if let Some(notice) = focusflow_core::data_location::take_startup_notice() {
+            startup_report.push(notice);
+        }
         listener.start(Arc::clone(&db))?;
         startup_report.push(focusflow_core::startup::CheckResult::ok(
             "键鼠监听线程",
@@ -908,7 +913,7 @@ fn restore_main_after_load(app: &tauri::AppHandle) {
                 tracing::error!(
                     "主窗口页面恢复失败（恢复目标 {url}，疑似 WebView2 环境损坏），3 秒后自动重启应用"
                 );
-                schedule_app_restart(&handle);
+                schedule_app_restart(&handle, false);
                 return;
             }
             // 显示前最终确认：代次未变、窗口仍隐藏（把 TOCTOU 窗口缩到最小）
@@ -962,16 +967,25 @@ fn restart_depth_from_args() -> u32 {
 /// 否则会撞上单实例守卫（新进程被当成第二个实例直接退出，结果是两个进程都没了）
 /// 与 WebView2 用户数据目录；带 `--show-main`：用户本来就是在等面板打开，
 /// 重启后直接把面板显示出来。
-fn schedule_app_restart(app: &tauri::AppHandle) {
+///
+/// `user_initiated = false`（既有的恢复路径）：受 [`MAX_RESTART_DEPTH`] 约束，
+/// 环境始终恢复不了时不至于无限自尽。
+/// `user_initiated = true`（用户主动换数据目录）：不该被深度上限拒绝——那会让
+/// 配置已写、进程却不重启，新目录要等到下次自然启动才生效，而中间这段按键全落在
+/// 旧目录里；它同时把重启链深度归零，因为这一跳是"新起点"而不是又一轮恢复重试，
+/// 不该把新进程里的恢复重启额度提前吃掉。两条路径共用 `RESTART_SCHEDULED`：
+/// 一个进程只准拉起一个新进程，这个不变量与触发原因无关。
+pub(crate) fn schedule_app_restart(app: &tauri::AppHandle, user_initiated: bool) {
     if RESTART_SCHEDULED.swap(true, Ordering::SeqCst) {
         return;
     }
     let depth = restart_depth_from_args();
-    if depth >= MAX_RESTART_DEPTH {
+    if !user_initiated && depth >= MAX_RESTART_DEPTH {
         tracing::error!("自动重启已达上限（深度 {depth}），放弃重启：直接显示空白窗口");
         reveal_main_window(app);
         return;
     }
+    let next_depth = if user_initiated { 0 } else { depth + 1 };
     let handle = app.clone();
     std::thread::Builder::new()
         .name("app-restart".into())
@@ -989,15 +1003,12 @@ fn schedule_app_restart(app: &tauri::AppHandle) {
                 .arg("--wait-pid")
                 .arg(std::process::id().to_string())
                 .arg("--restart-depth")
-                .arg((depth + 1).to_string())
+                .arg(next_depth.to_string())
                 .arg("--show-main")
                 .spawn()
             {
                 Ok(_) => {
-                    tracing::info!(
-                        "应用自动重启：新进程已启动（深度 {}），当前进程退出",
-                        depth + 1
-                    );
+                    tracing::info!("应用自动重启：新进程已启动（深度 {next_depth}），当前进程退出");
                     handle.exit(0);
                 }
                 Err(e) => {

@@ -1,7 +1,7 @@
 // 统计视图（键鼠排行[排行/分组]、应用排行、设备排行、活跃分析）与设置页、数据操作。
 
 import { invoke, emit } from "./tauri.js";
-import { $, fmt, fmtDuration, escapeHtml, WD } from "./utils.js";
+import { $, fmt, fmtDuration, escapeHtml, WD, toast } from "./utils.js";
 import { appState, rankFilter, rankTab, analyticsTab } from "./state.js";
 import { lineChart, barChart, renderKeyHeat } from "./charts.js";
 
@@ -683,6 +683,9 @@ export async function renderSettings() {
   const hourSelect = hourOptions
     .map((h) => `<option value="${h}" ${h === backupHours ? "selected" : ""}>${hourLabel(h)}</option>`)
     .join("");
+  // 数据目录：后端报的是**当前真正生效**的那个（配的目录建不出来时会回落程序目录）。
+  const dataHome = s.data_home || "";
+  const dataHomeShared = s.data_home_shared_with_app !== false;
 
   box.innerHTML = `
     <div class="section-title">常规</div>
@@ -704,6 +707,21 @@ export async function renderSettings() {
     <div class="setting-row"><span class="lbl">显示悬浮窗</span><input type="checkbox" id="set-floating" ${floatingEnabled ? "checked" : ""}></div>
     <div class="setting-row"><button class="btn ghost" data-act="show-floating">立即显示</button>
       <button class="btn ghost" data-act="hide-floating">立即隐藏</button></div>
+
+    <div class="section-title">数据目录</div>
+    <div class="setting-row">
+      <span class="lbl">当前位置</span>
+      <span id="set-data-home" style="font-size:12px;word-break:break-all;">${escapeHtml(dataHome)}</span>
+    </div>
+    <div class="setting-row"><button class="btn ghost" data-act="do-change-data-dir">更改数据文件夹…</button></div>
+    <div style="color:var(--muted);font-size:12px;">
+      ${dataHomeShared
+        ? "数据目前与程序放在一起，拷走整个文件夹即迁移。"
+        : "数据已从程序目录挪出。"}
+      更改会把 data 与 backup <b>整体搬</b>到你选的文件夹：程序先重启，重启时复制并逐文件核对，
+      确认无误才删旧目录；核对没过就保留原样、下次启动重试。
+      日志、插件与 config.ini 仍留在程序目录。搬运期间请勿输入。
+    </div>
 
     <div class="section-title">数据备份</div>
     <div class="setting-row"><span class="lbl">退出时自动备份</span><input type="checkbox" id="set-backup-exit" ${backupOnExit ? "checked" : ""}></div>
@@ -845,6 +863,50 @@ export async function doImport() {
   } catch (e) {
     $("set-msg").textContent = "导入失败: " + e;
     $("set-msg").style.color = "var(--danger)";
+  }
+}
+
+export async function doChangeDataDir() {
+  const msg = $("set-msg");
+  // 不弹原生 confirm：本项目的确认要么走页面内的消息位，要么走 openModals 那套，
+  // 而这里的"确认"本来就是目录选择器本身——选完目录等于表态，且这一步只复制不删除，
+  // 随时可回退。真正需要用户知道的是"要重启"，所以写在按钮旁边的说明里。
+  msg.textContent = "请在弹出的窗口里选择新的数据文件夹；选定后程序会重启，并在重启时把 data 与 backup 整体搬过去…";
+  msg.style.color = "var(--muted)";
+  let text;
+  try {
+    text = await invoke("change_data_dir");
+  } catch (e) {
+    // 失败的话必须留在页面上。原先这里跟着调了 renderSettings()，而那会整段重建设置页
+    // 的 innerHTML —— 刚写进 #set-msg 的错误被它一起抹掉，用户看到的就是"点了没反应、
+    // 数据还在原地"，而那句话其实好好地躺在日志里。现在只刷路径那一行，消息位不动。
+    msg.textContent = "更改失败: " + e;
+    msg.style.color = "var(--danger)";
+    toast("更改数据目录失败：" + e);
+    refreshDataHome();
+    return;
+  }
+  if (!text || text === "已取消") {
+    msg.textContent = "已取消，数据目录没有改动";
+    msg.style.color = "var(--muted)";
+    refreshDataHome();
+    return;
+  }
+  msg.textContent = text;
+  msg.style.color = "var(--success)";
+  // 重启在即，页面马上就没用了：把同一句话再 toast 一遍，免得用户正看着别处
+  toast(text);
+  // 已安排重启：不再刷设置页，避免在退出路径上多发一轮 IPC。
+}
+
+// 只刷"数据目录当前位置"那一行，不重建整页（重建会连带清空 #set-msg）。
+async function refreshDataHome() {
+  try {
+    const s = await invoke("get_settings");
+    const el = $("set-data-home");
+    if (el) el.textContent = s.data_home || "";
+  } catch (_) {
+    // 拿不到就留着上一次的显示：这条路径本身就是收尾用的，不值得为它再抛一次
   }
 }
 

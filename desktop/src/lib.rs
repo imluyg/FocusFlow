@@ -108,6 +108,10 @@ pub fn run() {
     if let Some(pid) = wait_pid_arg() {
         wait_previous_process_exit(pid);
     }
+    // 数据目录待搬运？「更改数据文件夹」那个按钮只写配置然后重启，真正的搬运在这里。
+    // 位置是刻意的：必须在上面等到旧进程**真退出之后**、又在任何东西开库之前 ——
+    // 搬的才是旧进程写完整、备份完整的最终结果，而不是搬一半它还在往里补写。
+    focusflow_core::data_location::run_pending_migration();
     let show_main_on_start = std::env::args().any(|arg| arg == ARG_SHOW_MAIN);
 
     tauri::Builder::default()
@@ -157,6 +161,7 @@ pub fn run() {
             commands::plugins_watch,
             commands::dbg_log,
             commands::import_legacy,
+            commands::change_data_dir,
             commands::export_report,
             plugins::get_plugin_view,
             plugins::plugin_action,

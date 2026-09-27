@@ -8,6 +8,11 @@
 //! - `plugins/` 插件目录
 //!
 //! 运行时数据与 exe 同级存放，保证"拷贝整个文件夹即可迁移数据"的既有产品形态。
+//!
+//! 程序目录（`app_dir`）与数据目录（`data_home`）是两件事，见各自函数注释：
+//! 前者放程序本体（exe、config.ini、window_state.ini、plugins/、logs/），后者放
+//! 用户数据（`data/`、`backup/`）。不设 `[paths] data_home` 时两者同一个目录，
+//! 上面那句"拷走整个文件夹即迁移"依然成立。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -28,13 +33,25 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 优先级：`set_app_dir` 显式设置 > 环境变量 `FOCUSFLOW_APP_DIR` > 当前工作目录。
 static APP_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
+/// 进程级数据目录解析结果缓存（详见 [`data_home`]：一次运行只认一个数据目录）。
+static DATA_HOME: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
 fn app_dir_override() -> &'static Mutex<Option<PathBuf>> {
     APP_DIR_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+fn data_home_cache() -> &'static Mutex<Option<PathBuf>> {
+    DATA_HOME.get_or_init(|| Mutex::new(None))
 }
 
 /// 显式设置程序目录（测试隔离用；也可在打包版指向 exe 目录）。
 pub fn set_app_dir(dir: impl Into<PathBuf>) {
     *app_dir_override().lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.into());
+    // 数据目录是从「当前 app_dir 下的 config.ini」抠出来的一个键，换了 app_dir 就等于
+    // 换了一份配置，缓存必须一起作废：否则 `test_app_dir` 切目录之后，`data_dir()` 仍然
+    // 指着上一个用例已经删掉的临时目录 —— 孤儿写入落进下一个用例刚建好的目录，正是本文件
+    // 到处设哨兵、`TestAppDir::drop` 反复清理要防的那个形状。
+    *data_home_cache().lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 测试专用：切换全局 app_dir 的测试必须持有此锁跑完全程。
@@ -159,14 +176,91 @@ pub fn app_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// 数据根目录：`data/` 与 `backup/` 挂在哪里，可由 `config.ini` 的
+/// `[paths] data_home` 指到程序目录之外（不设 = 程序目录，与历史行为一致）。
+///
+/// 刻意**不读 `config::instance()`**，而是把 config.ini 当纯文本抠这一个键：
+/// - 路径解析早于配置单例就绪（`config::load()` 自己结尾就要落盘，建库/备份都要用它），
+///   拿单例取键会在其 `OnceLock` 的初始化闭包里再次进入它；
+/// - 单例的 `path` 启动即钉死，本来就支撑不了"运行中换目录"的语义。
+///
+/// 也刻意**只在进程内解析一次**：换数据目录的流程是"拷贝 → 写配置 → 重启"，从写配置
+/// 到进程真的退出之间，写线程与备份/采样这些常驻线程还在按老目录落库。若每次即时解析，
+/// 那几秒里会有一半线程写旧目录、一半写新目录 —— 数据静默分裂比不切换更糟。
+pub fn data_home() -> PathBuf {
+    if let Some(dir) = data_home_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return dir;
+    }
+    let dir = resolve_data_home();
+    *data_home_cache().lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
+    dir
+}
+
+/// 把本进程的数据根**钉死**到指定目录（当前只有"迁移失败退回旧目录"这一条路用它）。
+///
+/// 与 [`set_app_dir`] 的区别：那个换的是程序目录（配置、日志、插件的所在），这个只换
+/// 数据落在哪。刻意保留"一次运行只认一个数据目录"的不变量：这里直接写进缓存，
+/// 而不是让后续解析再去看配置文件，否则常驻线程会在运行中改口、新旧目录一起被写。
+pub fn force_data_home(dir: impl Into<PathBuf>) {
+    *data_home_cache().lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.into());
+}
+
+/// 解析一次 [`data_home`]：读程序目录下的 config.ini，取 `[paths] data_home`。
+fn resolve_data_home() -> PathBuf {
+    let app = app_dir();
+    let configured = std::fs::read_to_string(app.join("config.ini"))
+        .ok()
+        .and_then(|text| {
+            crate::config::parse_ini(&text)
+                .get("paths")
+                .and_then(|s| s.get("data_home"))
+                .cloned()
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let Some(configured) = configured else {
+        return app;
+    };
+    // 相对路径按程序目录展开：便携包里写 `data_home = D:\FocusData` 是绝对路径，
+    // 而写 `..\Data` 这种相对形式的人也该有个明确的基准，不能取决于起始位置
+    // （app_dir 的注释里就是为了防这个才在 release 下取 exe 目录的）。
+    let p = Path::new(&configured);
+    let candidate = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        app.join(p)
+    };
+    match std::fs::create_dir_all(&candidate) {
+        Ok(()) => candidate,
+        Err(e) => {
+            // 配置指向的目录用不了（移动盘没插、OneDrive 占位、权限不足、同名普通文件）
+            // 时不硬失败，回落程序目录继续跑：按键统计必须有个能写的地方，而"双击没反应、
+            // 也没有任何报错"是 logger.rs 里已经避过一次的坑。回落的事实记进日志。
+            tracing::error!(
+                "配置的数据目录不可用（{}）: {e}；本次回落到程序目录 {}",
+                candidate.display(),
+                app.display()
+            );
+            app
+        }
+    }
+}
+
 /// `data/` 数据目录，不存在则创建。
 pub fn data_dir() -> PathBuf {
-    let dir = app_dir().join("data");
+    let dir = data_home().join("data");
     std::fs::create_dir_all(&dir).ok();
     dir
 }
 
 /// `logs/` 日志目录，不存在则创建。
+///
+/// 跟着**程序目录**走而不是数据目录：`init_logging()` 在任何命令行参数解析之前就要跑
+/// （见 desktop/src/lib.rs），让它依赖配置文件等于把日志系统架在配置能否读上来的赌注上。
 pub fn log_dir() -> PathBuf {
     let dir = app_dir().join("logs");
     std::fs::create_dir_all(&dir).ok();
@@ -175,7 +269,7 @@ pub fn log_dir() -> PathBuf {
 
 /// `backup/` 备份目录，不存在则创建。
 pub fn backup_dir() -> PathBuf {
-    let dir = app_dir().join("backup");
+    let dir = data_home().join("backup");
     std::fs::create_dir_all(&dir).ok();
     dir
 }

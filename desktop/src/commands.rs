@@ -38,6 +38,8 @@ pub async fn get_charts(state: State<'_, Arc<AppState>>) -> Result<ChartsStats, 
 #[tauri::command]
 pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
     let c = state.config;
+    let data_home = focusflow_core::paths::data_home();
+    let app_dir = focusflow_core::paths::app_dir();
     serde_json::json!({
         "theme": c.get("gui", "theme"),
         "paused": state.listener.is_paused(),
@@ -58,6 +60,12 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
         "max_backups": c.get_int("database", "max_backups", 5),
         // 每日目标次数（连续打卡的判定线）
         "goal_daily_keys": c.get_int("goal", "daily_keys", 20000),
+        // 数据目录：报**当前真正生效**的那个，而不是 config.ini 里写的那个 ——
+        // 配的目录建不出来时 paths 会回落程序目录并记 error（见 resolve_data_home），
+        // 照配置文件显示就会写着"数据在 D:\x"而其实一直写在程序目录里。
+        "data_home": data_home.display().to_string(),
+        // 数据与程序是否还在同一个目录（= 从没挪出去过）；前端据此给一句可选提示
+        "data_home_shared_with_app": data_home == app_dir,
     })
 }
 
@@ -334,6 +342,75 @@ pub async fn import_legacy(state: State<'_, Arc<AppState>>) -> Result<String, St
     }
     tracing::info!("导入完成: 来源={} 结果={}", dir.display(), lines.join("；"));
     Ok(lines.join("；"))
+}
+
+/// 更改数据目录：选文件夹 → 写 `[paths] data_home` 与 `data_migrate_from` → 自动重启；
+/// 真正的搬运由**新进程**在开库之前做（见 `data_location::run_pending_migration`）。
+/// 日志、插件、config.ini 留在程序目录不动（分工见 `paths::data_home`）。
+///
+/// 为什么不当场就把目录搬走：本进程从解析出数据目录那一刻起就一直按它写 —— 写线程、
+/// 备份/采样/统计线程都是常驻的。当场搬完之后到进程真退出之间还会往旧目录落一截增量，
+/// 新目录里没有那一份，表现就是"搬完还差一截"，而且旧目录从此变成一个"看着还在被用、
+/// 其实早就停了"的陷阱。让旧进程把自己那套写完整、备份完整再死，新进程搬走的就是完整结果。
+///
+/// 为什么这里要先 `validate_new_data_home` 判一次：不合法的目录（同一个目录、选进了
+/// 正在被搬的子树、里面已有无关文件、根本建不出来）原本要等到重启后搬运时才暴露，
+/// 那时界面早没了，用户只会觉得"点了没反应"。当场判，话就能显示在设置页上。
+#[tauri::command]
+pub async fn change_data_dir(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let picked = tauri::async_runtime::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("选择新的数据文件夹（data 与 backup 会整体搬进这里）")
+            .pick_folder()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some(dir) = picked else {
+        return Ok("已取消".to_string());
+    };
+
+    let config = state.config;
+    let handle = app.clone();
+    let dir_for_thread = dir.clone();
+    let from =
+        tauri::async_runtime::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
+            let from = focusflow_core::data_location::current_data_home();
+            // 顺序是故意的：先写标记、再写新目录。万一中间落盘失败，留下的状态是
+            // "标记指向旧目录 + data_home 仍是旧目录"，新进程一看两者相同，只会清掉标记
+            // 并记一条 warn，不会搬运、也不会把数据指到一个空目录上。
+            focusflow_core::data_location::validate_new_data_home(&dir_for_thread)
+                .map_err(|e| format!("{e}；数据目录没有改动，也不会重启"))?;
+            config
+                .set("paths", "data_migrate_from", &from.to_string_lossy())
+                .map_err(|e| format!("写入迁移标记失败: {e}；数据目录没有改动，也不会重启"))?;
+            config
+                .set("paths", "data_home", &dir_for_thread.to_string_lossy())
+                .map_err(|e| format!("写入新数据目录失败: {e}；请重新再点一次更改"))?;
+            // 同步落盘，不等去抖的 config-saver：新进程要不要搬运、搬到哪儿，全看这两行
+            // 在旧进程退出前真的写进了 config.ini。
+            config
+                .save()
+                .map_err(|e| format!("配置落盘失败: {e}；数据目录没有改动，也不会重启"))?;
+            crate::state::schedule_app_restart(&handle, true);
+            Ok(from)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+    let msg = format!(
+        "已安排把数据从 {} 搬到 {}：程序即将重启，重启时先复制并逐文件核对，确认无误才删旧目录；搬运期间请不要输入",
+        from.display(),
+        dir.display()
+    );
+    tracing::info!(
+        "更改数据目录: {} → {}（搬运在新进程启动时进行）",
+        from.display(),
+        dir.display()
+    );
+    Ok(msg)
 }
 
 /// 导出统计报告（CSV / HTML）。
