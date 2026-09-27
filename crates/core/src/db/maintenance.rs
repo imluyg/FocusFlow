@@ -448,13 +448,21 @@ fn migrate_v2_file(path: &Path, year: i32) -> i64 {
         }
         let conn = connection::open_rw(path)?;
         connection::ensure_schema(&conn, year)?;
+        // 「读不出来」与「空表」不是一件事实，而下面那条 if 紧接着就要 DROP TABLE：
+        // 损坏/半截的导入库里 `COUNT(*)` 报错 ⇒ 当成 0 ⇒ 把用户仅存的一份旧明细连表
+        // 删掉；下次启动 `table_exists_readonly` 已经是 false ⇒ 连重试的机会都没了。
+        // 这就是"吞掉的失败 + 顺手做一个不可逆动作 = 从这次没读动升级成永远没了"。
         let row_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM key_log", [], |r| r.get(0))
-            .unwrap_or(0);
+            .map_err(|e| {
+                anyhow::anyhow!("{year} 年库的 key_log 行数读不出来，本轮既不迁移也不删表: {e}")
+            })?;
         if row_count == 0 {
             // 旧版 `ensure_schema` 无条件建的暂存表：空表直接丢弃，
             // 回收表 + 两个单列索引共 3 页（实测占库体积 9%）
-            drop_staging_table(&conn);
+            if let Err(e) = drop_staging_table(&conn) {
+                tracing::error!("空暂存表没删掉（不影响数据，只是白占 3 页）: {e}");
+            }
             return Ok(0);
         }
 
@@ -574,8 +582,12 @@ fn migrate_v2_file(path: &Path, year: i32) -> i64 {
             [],
         )?;
         conn.execute("COMMIT;", [])?;
-        // 聚合完成后暂存表就没用了：连表一起丢掉（回收表 + 两个索引共 3 页）
-        drop_staging_table(&conn);
+        // 聚合完成后暂存表就没用了：连表一起丢掉（回收表 + 两个索引共 3 页）。
+        // 这一步失败**不**能推翻"已经聚合好了"这个事实（数据已进三张聚合表），
+        // 所以只记一条 error，不改成本函数的返回值。
+        if let Err(e) = drop_staging_table(&conn) {
+            tracing::error!("{year} 年库迁移已完成，但暂存表没删掉（白占 3 页）: {e}");
+        }
         Ok(row_count)
     })();
 
@@ -597,8 +609,11 @@ fn migrate_v2_file(path: &Path, year: i32) -> i64 {
 /// 注意：旧表带的 AUTOINCREMENT 会留下 1 页 `sqlite_sequence` 空壳，**删不掉** ——
 /// SQLite 直接拒绝 `DROP TABLE sqlite_sequence`（实测 "table sqlite_sequence
 /// may not be dropped"），VACUUM 也不回收，所以这部分体积认了。
-fn drop_staging_table(conn: &Connection) {
-    let _ = conn.execute("DROP TABLE IF EXISTS key_log", []);
+fn drop_staging_table(conn: &Connection) -> rusqlite::Result<()> {
+    // 原来是一句 `let _ = conn.execute(...)`：这是全函数唯一**不可逆**的那一步，
+    // 静默失败等于"删了"与"没删"只有 SQLite 自己知道。
+    conn.execute("DROP TABLE IF EXISTS key_log", [])?;
+    Ok(())
 }
 
 /// `Ctrl+X` -> 物理键名映射。
@@ -3627,6 +3642,86 @@ mod tests {
             (keys, daily, hourly),
             (0, 0, 0),
             "三方应一起归零（Σhourly == daily == key_counts）"
+        );
+    }
+
+    /// 钉住一条不变量：`key_log` 的行数**读不出来**时，本轮既不迁移也不删表、返回 0。
+    ///
+    /// 修的是"两种状态并成一件"（`.unwrap_or(0)` 把"未知"折成"空表"，而紧接着那条
+    /// 分支就是 `DROP TABLE`）。**但这条用例不是区分性的**：注入取证 INJ-38 把
+    /// `.map_err(..)?` 换回 `.unwrap_or(0)` 之后它仍然绿 —— 因为让 `COUNT(*)` 失败的那
+    /// 批坏页同样让 `DROP TABLE` 失败，表其实没被删掉。所以：
+    /// - 子代理报的"一次坏页就把仅存的旧明细连表删掉"在这台机器上**不成立**，严重性已降级；
+    /// - 这条用例真正钉住的是另一头：以后有人把这支改成"读不出来也照删"或"当成迁移成功"，
+    ///   它会红。长路径损坏下"读不出与删不掉同源"这件事记在 §二十。
+    ///
+    /// 夹具配方与 `queries.rs::available_years_keeps_dbs_whose_pages_are_corrupt`
+    /// 同族，但**只坏文件后半段**：`key_log` 是最后建的表，它的页在文件尾部，
+    /// 这样六张聚合表的页还活着 ⇒ 能证明"库打得开、聚合表读得出、只有 key_log 读不出"，
+    /// 而不是整个文件都是垃圾（那种情况会在 `ensure_schema` 之前就 Err，
+    /// 用例照不出这一支，属于假绿）。
+    #[test]
+    fn unreadable_key_log_is_not_treated_as_empty_and_dropped() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("migrate_corrupt");
+        let year = 2027i32;
+        let path = paths::year_db_path(year);
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            // 聚合表先占住前面的页
+            for k in 1..2001i64 {
+                conn.execute(
+                    "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 1, 1)",
+                    [k],
+                )
+                .unwrap();
+            }
+            connection::ensure_staging_table(&conn).unwrap();
+            for k in 1..8001i64 {
+                conn.execute(
+                    "INSERT INTO key_log (key_name, timestamp) VALUES (?1, ?2)",
+                    rusqlite::params![format!("K{k}"), 1_700_000_000 + k],
+                )
+                .unwrap();
+            }
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > 4096 * 40, "夹具太小，key_log 没铺到文件尾部");
+        let cut = bytes.len() / 2;
+        for b in bytes.iter_mut().skip(cut) {
+            *b = 0xA5;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        // ―― 先证明夹具真的落在"打得开、聚合表读得出、只有 key_log 读不出"这一族 ――
+        assert!(
+            connection::table_exists_readonly(&path, "key_log"),
+            "前提：sqlite_master 在第 1 页，表登记必须还在"
+        );
+        let conn = connection::open_rw(&path).expect("库头合法，连接该打得开");
+        connection::ensure_schema(&conn, year).expect("前提：ensure_schema 必须走得通");
+        let daily_ok: i64 = conn
+            .query_row("SELECT COUNT(*) FROM daily_counts", [], |r| r.get(0))
+            .expect("前提：聚合表那半边要读得出来");
+        assert!(daily_ok > 0, "前提：daily_counts 有行，实得 {daily_ok}");
+        assert!(
+            conn.query_row("SELECT COUNT(*) FROM key_log", [], |r| r.get::<_, i64>(0))
+                .is_err(),
+            "夹具没坏到 key_log：这条用例什么也没钉住"
+        );
+        drop(conn);
+
+        // ―― 断言：读不出来时不许把表删掉 ――
+        let n = migrate_v2_file(&path, year);
+        assert_eq!(n, 0, "读不出来的那一支不能报成「迁了几条」");
+        assert!(
+            connection::table_exists_readonly(&path, "key_log"),
+            "COUNT 读不出来被当成空表 ⇒ key_log 被 DROP 掉了，那份旧明细从此不会再被迁移"
         );
     }
 }

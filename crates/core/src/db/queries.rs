@@ -48,8 +48,13 @@ pub fn is_valid_period(period: i64) -> bool {
 }
 
 /// `date - days`，越界时返回 `None`（不使用会 panic 的 `Sub<Days>` 实现）。
+///
+/// 入参的口径是"**往回减几天**"，`0` 是合法值（就是那一天本身）。刻意不复用
+/// [`clamp_query_days`]：那是"窗口含几天"的口径、下界是 1，拿它钳增量会把
+/// "减 0 天"抬成"减 1 天" ⇒ `get_daily_counts(1)`（起点 = 今天 - 0）返回的是**昨天**，
+/// 而它自己的文档写着"含当天共 N 天"。
 fn date_minus_days(date: chrono::NaiveDate, days: i64) -> Option<chrono::NaiveDate> {
-    date.checked_sub_days(Days::new(clamp_query_days(days) as u64))
+    date.checked_sub_days(Days::new(days.clamp(0, MAX_QUERY_DAYS) as u64))
 }
 
 fn years_cache() -> &'static YearsCache {
@@ -2245,5 +2250,56 @@ mod tests {
         assert_eq!(stats[0].name, "HID 鼠标 · 046D/C52B");
 
         crate::device_alias::invalidate_cache();
+    }
+
+    /// 回归：`get_daily_counts(1)` 返回的是**昨天**。
+    ///
+    /// `date_minus_days` 拿 [`clamp_query_days`]（"窗口含几天"的口径、下界 1）去钳
+    /// "往回减几天"这个增量，于是 `days - 1 == 0` 被抬成 1 ⇒ 起点=昨天、map 里只有
+    /// 昨天那一格，今天的那一行在 `daily_map.get_mut` 那一步被直接丢掉。而函数自己的
+    /// 文档写着"含当天共 N 天"，`maintenance.rs` 那边的口径也是"早于本年"。
+    /// 可达入口：`plugins/host.rs` 的 `focusflow.stats.daily_counts(days.max(1))`
+    /// —— 传 1（或 0/负数）就拿不到今天。
+    ///
+    /// 与已有的 `daily_counts_span_includes_today` 的区别：那条只断言**长度**
+    /// （1 格 / 200 格），不判日期 ⇒ 非区分性用例，所以这个错位它照不出来。
+    #[test]
+    fn one_day_window_ends_today_not_yesterday() {
+        use chrono::Datelike;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("daily_one");
+        invalidate_years_cache();
+
+        let today = Local::now().date_naive();
+        let y = today.year();
+        let today_s = today.format("%Y-%m-%d").to_string();
+        {
+            let conn = connection::open_rw(&paths::year_db_path(y)).unwrap();
+            connection::ensure_schema(&conn, y).unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_counts (date_key, count, seconds) VALUES (?1, 777, 10)",
+                [day_key_of_date(today)],
+            )
+            .unwrap();
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        invalidate_years_cache();
+
+        let one = get_daily_counts(1, None);
+        assert_eq!(one.len(), 1, "窗口 1 天就该只有一格，实得 {one:?}");
+        assert_eq!(
+            one[0].0, today_s,
+            "那一格必须是**今天**（旧写法给的是昨天）"
+        );
+        assert_eq!(one[0].1, 777, "今天那行的数必须带出来，实得 {:?}", one[0]);
+
+        // 对照腿：2 天窗口本来就是 [昨天, 今天] —— 证明不是我把 end_dk 读反了
+        let two = get_daily_counts(2, None);
+        assert_eq!(two.len(), 2, "实得 {two:?}");
+        assert_eq!(
+            two.last().map(|p| p.0.as_str()),
+            Some(today_s.as_str()),
+            "两天窗口的最后一格也必须是今天"
+        );
     }
 }
