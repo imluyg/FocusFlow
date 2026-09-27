@@ -315,6 +315,8 @@ const PERIODS = [
 ];
 let deviceDetailKey = null;
 let deviceDetailPeriod = 0;
+// 弹窗内"最后一次请求"的序号，用来让先发的慢请求不再落画（见 `loadDeviceDetail`）。
+let deviceDetailSeq = 0;
 
 export async function openDeviceDetail(key) {
   const overlay = $("device-modal");
@@ -338,14 +340,22 @@ export async function deviceDetailSetPeriod(p) {
 async function loadDeviceDetail() {
   const body = $("device-modal-body");
   if (!body || !deviceDetailKey) return;
+  // 只让"最后一次请求"的回应落画（同 plugins.js 的 pluginDetailSeq）。get_device_detail
+  // 是跨年四趟扫描、跑在后台线程上，几百毫秒到几秒都可能：点了「1年」再点「今日」，
+  // 慢的那次后到就把快的那次盖掉 —— 弹窗里是上一个周期、甚至上一台设备的数字，
+  // 而高亮的按钮是用户最后点的那个。closeDeviceDetail 之后重开同理。
+  const seq = ++deviceDetailSeq;
+  const key = deviceDetailKey;
   body.innerHTML = '<div class="empty">加载中…</div>';
   let d;
   try {
-    d = await invoke("get_device_detail", { key: deviceDetailKey, period: deviceDetailPeriod });
+    d = await invoke("get_device_detail", { key, period: deviceDetailPeriod });
   } catch (e) {
+    if (seq !== deviceDetailSeq) return;
     body.innerHTML = `<div class="empty">读取失败：${escapeHtml(String(e))}</div>`;
     return;
   }
+  if (seq !== deviceDetailSeq || key !== deviceDetailKey) return;
   body.innerHTML = deviceDetailHtml(d);
 }
 
@@ -625,20 +635,27 @@ async function refreshGoalStrip(force) {
     </div>`;
 }
 
+// 结果必须写进**当下还挂在 DOM 上**的 #set-msg。
+///
+/// 这些动作都在后台跑几十秒（周报要跨年扫库；改数据目录要等一个非模态的原生选择器，
+/// 期间标签页照样能点），而 await 之前拿到的那个节点可能早就被 renderSettings 换成
+/// 新的一份了 —— 写进脱离 DOM 的旧节点等于什么都没写，用户看到的就是"点了没反应、
+/// 提示永远停在'正在生成…'"。doVacuum/doImport 一直是 await 之后再查一次节点，
+/// 这里跟它们对齐。
+function setMsg(text, color) {
+  const el = $("set-msg");
+  if (!el) return;
+  if (color) el.style.color = color;
+  el.textContent = text;
+}
+
 export async function doWeeklyReport() {
-  const msg = $("set-msg");
-  if (msg) {
-    msg.style.color = "var(--muted)";
-    msg.textContent = "正在生成上周周报…";
-  }
+  setMsg("正在生成上周周报…", "var(--muted)");
   try {
     const p = await invoke("get_weekly_report");
-    if (msg) msg.textContent = p ? "周报已生成：" + p : "上一个整周没有任何记录，未生成文件";
+    setMsg(p ? "周报已生成：" + p : "上一个整周没有任何记录，未生成文件", "var(--success)");
   } catch (e) {
-    if (msg) {
-      msg.style.color = "var(--danger)";
-      msg.textContent = "周报生成失败：" + e;
-    }
+    setMsg("周报生成失败：" + e, "var(--danger)");
   }
 }
 
@@ -867,12 +884,13 @@ export async function doImport() {
 }
 
 export async function doChangeDataDir() {
-  const msg = $("set-msg");
   // 不弹原生 confirm：本项目的确认要么走页面内的消息位，要么走 openModals 那套，
-  // 而这里的"确认"本来就是目录选择器本身——选完目录等于表态，且这一步只复制不删除，
+  // 而这里的"确认"本来就是目录选择器本身 —— 选完目录等于表态，且这一步只复制不删除，
   // 随时可回退。真正需要用户知道的是"要重启"，所以写在按钮旁边的说明里。
-  msg.textContent = "请在弹出的窗口里选择新的数据文件夹；选定后程序会重启，并在重启时把 data 与 backup 整体搬过去…";
-  msg.style.color = "var(--muted)";
+  setMsg(
+    "请在弹出的窗口里选择新的数据文件夹；选定后程序会重启，并在重启时把 data 与 backup 整体搬过去…",
+    "var(--muted)",
+  );
   let text;
   try {
     text = await invoke("change_data_dir");
@@ -880,20 +898,17 @@ export async function doChangeDataDir() {
     // 失败的话必须留在页面上。原先这里跟着调了 renderSettings()，而那会整段重建设置页
     // 的 innerHTML —— 刚写进 #set-msg 的错误被它一起抹掉，用户看到的就是"点了没反应、
     // 数据还在原地"，而那句话其实好好地躺在日志里。现在只刷路径那一行，消息位不动。
-    msg.textContent = "更改失败: " + e;
-    msg.style.color = "var(--danger)";
+    setMsg("更改失败: " + e, "var(--danger)");
     toast("更改数据目录失败：" + e);
     refreshDataHome();
     return;
   }
   if (!text || text === "已取消") {
-    msg.textContent = "已取消，数据目录没有改动";
-    msg.style.color = "var(--muted)";
+    setMsg("已取消，数据目录没有改动", "var(--muted)");
     refreshDataHome();
     return;
   }
-  msg.textContent = text;
-  msg.style.color = "var(--success)";
+  setMsg(text, "var(--success)");
   // 重启在即，页面马上就没用了：把同一句话再 toast 一遍，免得用户正看着别处
   toast(text);
   // 已安排重启：不再刷设置页，避免在退出路径上多发一轮 IPC。

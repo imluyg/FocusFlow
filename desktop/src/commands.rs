@@ -375,8 +375,8 @@ pub async fn change_data_dir(
     let config = state.config;
     let handle = app.clone();
     let dir_for_thread = dir.clone();
-    let from =
-        tauri::async_runtime::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
+    let (from, scheduled) = tauri::async_runtime::spawn_blocking(
+        move || -> Result<(std::path::PathBuf, bool), String> {
             let from = focusflow_core::data_location::current_data_home();
             // 顺序是故意的：先写标记、再写新目录。万一中间落盘失败，留下的状态是
             // "标记指向旧目录 + data_home 仍是旧目录"，新进程一看两者相同，只会清掉标记
@@ -394,11 +394,28 @@ pub async fn change_data_dir(
             config
                 .save()
                 .map_err(|e| format!("配置落盘失败: {e}；数据目录没有改动，也不会重启"))?;
-            crate::state::schedule_app_restart(&handle, true);
-            Ok(from)
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+            let scheduled = crate::state::schedule_app_restart(&handle, true);
+            Ok((from, scheduled))
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())??;
+
+    if !scheduled {
+        // 配置写好、进程没重启 —— 这时候说"程序即将重启"就是句谎话，用户会干等着。
+        // 实话是：下次真的打开程序时会自动把这一趟补完（run_pending_migration 认配置里
+        // 的标记），而在此之前按键照旧记在旧目录里，一段都不会丢。
+        tracing::error!(
+            "更改数据目录：配置已写入（{} → {}），但重启没能安排，需要用户重新启动一次",
+            from.display(),
+            dir.display()
+        );
+        return Err(format!(
+            "配置已写入（{} → {}），但这次没能安排成重启：请退出程序后重新打开，届时会自动完成搬运",
+            from.display(),
+            dir.display()
+        ));
+    }
 
     let msg = format!(
         "已安排把数据从 {} 搬到 {}：程序即将重启，重启时先复制并逐文件核对，确认无误才删旧目录；搬运期间请不要输入",

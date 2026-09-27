@@ -975,15 +975,20 @@ fn restart_depth_from_args() -> u32 {
 /// 旧目录里；它同时把重启链深度归零，因为这一跳是"新起点"而不是又一轮恢复重试，
 /// 不该把新进程里的恢复重启额度提前吃掉。两条路径共用 `RESTART_SCHEDULED`：
 /// 一个进程只准拉起一个新进程，这个不变量与触发原因无关。
-pub(crate) fn schedule_app_restart(app: &tauri::AppHandle, user_initiated: bool) {
+///
+/// 返回值只说明"这一跳有没有安排上"（占住重启序号、重启线程起得来）。线程里
+/// 3 秒后真的拉不起新进程是调用方拿不到的 —— 那种情况下程序继续按旧目录记录，
+/// 而配置里的迁移标记留着，下次自然启动照样会把数据搬过去。
+pub(crate) fn schedule_app_restart(app: &tauri::AppHandle, user_initiated: bool) -> bool {
     if RESTART_SCHEDULED.swap(true, Ordering::SeqCst) {
-        return;
+        tracing::warn!("本进程已经安排过一次重启，这次不再重复安排");
+        return false;
     }
     let depth = restart_depth_from_args();
     if !user_initiated && depth >= MAX_RESTART_DEPTH {
         tracing::error!("自动重启已达上限（深度 {depth}），放弃重启：直接显示空白窗口");
         reveal_main_window(app);
-        return;
+        return false;
     }
     let next_depth = if user_initiated { 0 } else { depth + 1 };
     let handle = app.clone();
@@ -1018,7 +1023,7 @@ pub(crate) fn schedule_app_restart(app: &tauri::AppHandle, user_initiated: bool)
             }
         })
         .map_err(|e| tracing::error!("启动应用重启线程失败（该功能不可用）: {e}"))
-        .ok();
+        .is_ok()
 }
 
 /// 兜底显示主窗口：恢复/重启都失败时至少让窗口可见，
