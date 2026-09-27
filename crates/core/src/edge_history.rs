@@ -283,27 +283,25 @@ fn open_local() -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// 保存指定日期的计数到本地。
-pub fn save_edge_history_count(target_date: NaiveDate, count: i64) {
-    let conn = match open_local() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let _ = conn.execute_batch(
+/// 保存指定日期的计数到本地。失败原因交回调用方 —— 本轮刷新要据此改口，
+/// 不许把"写不进去"吞成"刷新成功"（见 [`update_today_edge_history`]）。
+pub fn save_edge_history_count(target_date: NaiveDate, count: i64) -> Result<(), String> {
+    let day = target_date.format("%Y-%m-%d").to_string();
+    let conn = open_local().map_err(|e| format!("打开本地缓存库失败: {e}"))?;
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS edge_history (
             date TEXT PRIMARY KEY,
             count INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );",
-    );
-    let _ = conn.execute(
+    )
+    .map_err(|e| format!("{day} 建表失败: {e}"))?;
+    conn.execute(
         "INSERT OR REPLACE INTO edge_history (date, count, updated_at) VALUES (?1, ?2, ?3)",
-        rusqlite::params![
-            target_date.format("%Y-%m-%d").to_string(),
-            count,
-            Utc::now().timestamp()
-        ],
-    );
+        rusqlite::params![day, count, Utc::now().timestamp()],
+    )
+    .map_err(|e| format!("{day} 写入失败: {e}"))?;
+    Ok(())
 }
 
 /// 获取近 N 天 Edge 历史计数，**按天补零**：返回的要么正好是 `days` 项、按日期升序，
@@ -515,7 +513,8 @@ fn refresh_state_at(now: std::time::Instant) -> &'static str {
 const BACKFILL_DAYS: i64 = 30;
 
 /// 更新今天并返回 (是否成功, 今日数, 总数)。
-/// 任一步失败（Edge 库被锁/不可读）返回 (false, 0, 0)，调用方据此提示用户，
+/// 读侧任一步失败（Edge 库被锁/不可读）返回 `(false, 0, 0)`；读到数但**没写进本地
+/// 缓存**也返回 `false`（数值仍交回，只是别当成"已落库"）。调用方据此提示用户，
 /// 避免把失败静默当成"0 条记录"。同一次快照顺手把近 30 天里不可信的历史计数重查一遍。
 ///
 /// 调用方应当用 [`spawn_update_today`] 而不是直接调本函数（本函数会阻塞调用线程）。
@@ -545,19 +544,44 @@ pub fn update_today_edge_history() -> (bool, i64, i64) {
     });
     match batch {
         Some((today_count, total, filled)) => {
-            save_edge_history_count(today, today_count);
-            save_edge_history_meta("total", total);
+            let persisted = save_edge_history_count(today, today_count)
+                .and_then(|_| save_edge_history_meta("total", total));
+            let mut backfill_failed = 0usize;
             if !filled.is_empty() {
                 for (day, count) in &filled {
-                    save_edge_history_count(*day, *count);
+                    if let Err(e) = save_edge_history_count(*day, *count) {
+                        backfill_failed += 1;
+                        tracing::debug!("Edge 补档 {day} 未落库: {e}");
+                    }
                 }
-                tracing::info!(
-                    "Edge 历史已重查 {}/{} 天（缺行的日子 + 当天就写下、还没盖完整的日子）",
-                    filled.len(),
-                    pending
-                );
+                if backfill_failed == 0 {
+                    tracing::info!(
+                        "Edge 历史已重查 {}/{} 天（缺行的日子 + 当天就写下、还没盖完整的日子）",
+                        filled.len(),
+                        pending
+                    );
+                } else {
+                    // 补档失败不翻本轮状态：那些是**历史行**，下一轮 `stale_days_before`
+                    // 仍会把它们挑出来重查（写的是 `INSERT OR REPLACE`，无双计风险）。
+                    tracing::warn!(
+                        "Edge 补档有 {}/{} 天没写进本地缓存，下一轮重试",
+                        backfill_failed,
+                        filled.len()
+                    );
+                }
             }
-            (true, today_count, total)
+            match persisted {
+                Ok(()) => (true, today_count, total),
+                Err(e) => {
+                    // 面板读的是本地库（`get_edge_history_saved_*`）：今日数没落库时
+                    // 它显示 "—"，而状态位还报 ok —— "刷新成功、数据为空"于是与
+                    // "真的没数据"无法区分。数值仍交回调用方（本轮确实读到了）。
+                    tracing::error!(
+                        "Edge 计数没写进本地缓存（今日 {today_count}／总数 {total} 只在内存里）: {e}"
+                    );
+                    (false, today_count, total)
+                }
+            }
         }
         _ => (false, 0, 0),
     }
@@ -626,18 +650,19 @@ fn saved_rows_since(start: NaiveDate) -> std::collections::HashMap<String, i64> 
 }
 
 /// 保存上次刷新的数值（meta 表），插件重启后恢复显示，避免出现误导性的 "—" / 0。
-fn save_edge_history_meta(key: &str, value: i64) {
-    let conn = match open_local() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let _ = conn.execute_batch(
+/// 失败原因同样交回调用方。
+fn save_edge_history_meta(key: &str, value: i64) -> Result<(), String> {
+    let conn = open_local().map_err(|e| format!("打开本地缓存库失败: {e}"))?;
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-    );
-    let _ = conn.execute(
+    )
+    .map_err(|e| format!("{key} 建表失败: {e}"))?;
+    conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
         rusqlite::params![key, value.to_string()],
-    );
+    )
+    .map_err(|e| format!("{key} 写入失败: {e}"))?;
+    Ok(())
 }
 
 /// 读取本地缓存库中某一天已保存的计数（没刷新过那一天返回 None）。
@@ -790,7 +815,7 @@ mod tests {
         let y = today - chrono::Days::new(1);
         let two = today - chrono::Days::new(2);
         // 本地库只有 `two` 这一天 → 补档还剩 29 天（今天由主路写）
-        save_edge_history_count(two, 7);
+        save_edge_history_count(two, 7).unwrap();
         let rows = [
             chrome_start_of(today),
             chrome_start_of(today) + 500_000,
@@ -821,6 +846,44 @@ mod tests {
             2,
             "补齐过后第二次刷新仍是一轮快照"
         );
+    }
+
+    /// 读到了数、一条也没落库时，本轮刷新不许报成功。
+    ///
+    /// 旧形状：ok 位只由**读侧**那一趟查询决定，`save_edge_history_count` /
+    /// `save_edge_history_meta` 里的失败全被吞（`Err(_) => return`、`let _ =`）。
+    /// 于是本地缓存库打不开时（被第二个实例锁住、同步盘占用、`data_dir` 不可写）
+    /// `refresh_state()` 仍是 `ok`，插件却按 `get_edge_history_saved_*` 读到 None、
+    /// 把「今日记录数 / 总记录数」画成 "—" —— "刷新成功、数据为空"与"真的没数据"
+    /// 在界面上长成同一个样子（B15 同族）。
+    /// 注回旧写法（ok 位不看落盘结果）时，前两条断言里红在 `assert!(!ok)`。
+    #[test]
+    fn a_refresh_that_cannot_persist_does_not_report_ok() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _app = crate::paths::test_app_dir("edge_unwritable");
+        // 用目录占住本地缓存库的位置：`Connection::open` 必失败，一条也写不进去
+        std::fs::create_dir_all(edge_db_path()).unwrap();
+        let today = Local::now().date_naive();
+        let _fx = write_edge_fixture("unwritable", &[chrome_start_of(today)]);
+
+        let (ok, today_count, total) = update_today_edge_history();
+        assert_eq!(
+            (today_count, total),
+            (1, 1),
+            "Edge 库可读，数值该照原样交回调用方（别降级成 0）"
+        );
+        assert!(!ok, "一条也没落库，本轮不该算成功");
+        assert_eq!(
+            get_edge_history_saved_today(),
+            None,
+            "落库失败后不该有缓存值可供面板显示"
+        );
+
+        // 界面读的是状态位：那一轮该落到 fail，而不是 ok
+        reset_slot();
+        let gen = claim_round(std::time::Instant::now()).expect("空槽位该能占用");
+        finish_round(gen, ok);
+        assert_eq!(refresh_state(), "fail", "没落库的那一轮不该把界面留在 ok");
     }
 
     /// 直接按指定 `updated_at` 写一行本地缓存。
@@ -1077,15 +1140,15 @@ mod tests {
         let yesterday = today - chrono::Days::new(1);
 
         assert_eq!(get_edge_history_saved_today(), None, "从未刷新过不该有值");
-        save_edge_history_count(yesterday, 111);
+        save_edge_history_count(yesterday, 111).unwrap();
         assert_eq!(
             get_edge_history_saved_today(),
             None,
             "昨天的计数不该被当成今天"
         );
-        save_edge_history_count(today, 42);
+        save_edge_history_count(today, 42).unwrap();
         assert_eq!(get_edge_history_saved_today(), Some(42));
-        save_edge_history_meta("total", 900);
+        save_edge_history_meta("total", 900).unwrap();
         assert_eq!(get_edge_history_saved_total(), Some(900));
     }
 
@@ -1106,10 +1169,10 @@ mod tests {
             "一次都没刷新过时不该编出一张 30 天的表"
         );
 
-        save_edge_history_count(today, 7);
-        save_edge_history_count(today - chrono::Days::new(3), 4);
+        save_edge_history_count(today, 7).unwrap();
+        save_edge_history_count(today - chrono::Days::new(3), 4).unwrap();
         // 窗口之外的老日子：存在库里，但不该挤进这张 30 天的表
-        save_edge_history_count(today - chrono::Days::new(400), 999);
+        save_edge_history_count(today - chrono::Days::new(400), 999).unwrap();
 
         let counts = get_edge_history_counts(30);
         assert_eq!(counts.len(), 30, "标题写近 30 天就得给满 30 行");

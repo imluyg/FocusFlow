@@ -201,10 +201,16 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
                 }
             }
         }
-        // 用 Rusqlite 打开确认可用 + 建聚合表 + 迁移旧格式数据
+        // 用 Rusqlite 打开确认可用 + 建聚合表
         let conn = connection::open_rw(&dst_path)?;
         connection::ensure_schema(&conn, year)?;
         drop(conn);
+        // **标记写在聚合之前**，与下面合并分支同一条理由（那里的注释是完整版）：
+        // `migrate_v2` 是累加式且没有去重键，"这份导过了"只记在 `meta` 的
+        // `imported_src_*` 里。旧顺序在两步之间失败时留下「已聚合、未标记」，
+        // 用户点重试 ⇒ 读不到标记 ⇒ 那一年再累加一遍。整库复制这一支以前正好漏在
+        // 外面（"整库都搬过来了，标记写不上去有什么关系"），而它一样要跑 `migrate_v2`。
+        record_import_marker(&dst_path, &src_path)?;
         crate::db::maintenance::migrate_v2();
         // 统计导入条数（聚合表总量）
         let conn = connection::open_ro(&dst_path)?;
@@ -213,7 +219,6 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
             [],
             |r| r.get(0),
         )?;
-        record_import_marker(&dst_path, &src_path)?;
         return Ok(count);
     }
 
@@ -306,9 +311,18 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
     dst_conn.execute("COMMIT;", [])?;
     drop(dst_conn);
 
+    // **先写标记，再聚合**（原来反过来）。理由不是排版：聚合是**累加式且没有去重键**
+    // （`count = count + excluded.count`，见 `migrate_v2`），而"这次导过了"这件事只有
+    // `meta` 里那几个键记得。所以两步之间任何一次失败（磁盘满、库被另一个连接占住、
+    // 进程被杀）在旧顺序下留下的是「已聚合、未标记」——用户看到"导入失败"去重试，
+    // 重试读不到标记 ⇒ 指纹比对失效 ⇒ **同一份明细再聚合第二遍，那一年整体翻倍**，
+    // 而界面没有任何提示。
+    // 反过来「已标记、未聚合」是可自愈的：明细还在目标库的 `key_log` 里，
+    // 而 `Database::init` 每次启动都会跑一遍 `migrate_v2`（见 db/mod.rs），
+    // 下一次启动就把它聚合掉。两种半截状态里只有一个会毁数据，所以把另一个留下。
+    record_import_marker(&dst_path, &src_path)?;
     // 聚合落库并压缩（幂等：key_log 迁移后清空）
     crate::db::maintenance::migrate_v2();
-    record_import_marker(&dst_path, &src_path)?;
 
     Ok(imported)
 }
@@ -575,6 +589,154 @@ mod tests {
             !data.join(&name).exists(),
             "半份主库必须回滚：留着它，下次导入会改走合并分支，\
              而它读的正是缺了那段尾巴的副本"
+        );
+    }
+
+    /// **重试不得把那一年累加第二遍**：聚合是 `count = count + excluded` 且没有去重键，
+    /// 而"这份已经导过了"只记在目标库 `meta` 的 `imported_src_*` 里。
+    /// 旧顺序（先聚合、后写标记）在两步之间失败时留下的是「已聚合、未标记」——
+    /// 用户看到"导入失败"点重试，重试读不到标记 ⇒ 同一份明细再聚合一遍 ⇒ 那一年翻倍。
+    #[test]
+    fn retry_after_a_failed_marker_does_not_double_count_the_year() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("mig_retry_double");
+        let data = crate::paths::data_dir();
+        std::fs::create_dir_all(&data).unwrap();
+        let name = "focusflow_2026.db".to_string();
+
+        // 源库：完整结构 + 5 条明细
+        let src_dir = _dir.path().join("old");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        {
+            let conn = Connection::open(src_dir.join(&name)).unwrap();
+            connection::ensure_schema(&conn, 2026).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS key_log (key_name TEXT NOT NULL, timestamp INTEGER NOT NULL);
+                 INSERT INTO key_log (key_name, timestamp) VALUES
+                     ('A', 1770000000), ('B', 1770000001), ('A', 1770000002),
+                     ('C', 1770000003), ('A', 1770000004);",
+            )
+            .unwrap();
+        }
+
+        // 目标库先存在（走合并分支），并让**只有标记那几个键**写不下去：
+        // 失败点精确落在 record_import_marker 上（现场形状 = 磁盘满 / 库被别的连接占住）
+        {
+            let conn = connection::open_rw(&data.join(&name)).unwrap();
+            connection::ensure_schema(&conn, 2026).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER block_marker BEFORE INSERT ON meta
+                     WHEN NEW.key LIKE 'imported_src_%'
+                 BEGIN SELECT RAISE(ABORT, 'blocked by test'); END;",
+            )
+            .unwrap();
+        }
+        let total_of = || -> i64 {
+            let conn = connection::open_ro(&data.join(&name)).unwrap();
+            let v = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0);
+            drop(conn);
+            v
+        };
+
+        let first = import_legacy_data(&src_dir);
+        assert!(
+            first.errors.iter().any(|e| e.contains("导入失败")),
+            "标记写不下去必须报错，不能当成功：{:?}",
+            first.errors
+        );
+        let after_first = total_of();
+        assert_eq!(after_first, 0, "失败的那一次不该已经把聚合数落进库");
+
+        let second = import_legacy_data(&src_dir);
+        assert!(
+            second.errors.iter().any(|e| e.contains("导入失败")),
+            "重试同样报错：{:?}",
+            second.errors
+        );
+        assert_eq!(
+            total_of(),
+            after_first,
+            "重试把那一年又累加了一遍（{after_first} → {}）",
+            total_of()
+        );
+    }
+
+    /// 复制分支的同一对顺序也得钉住：它正好在"整库都搬过来了，标记写不写得上去有什么
+    /// 关系"这个直觉盲区里，而它一样要跑 `migrate_v2` 的累加式聚合。
+    ///
+    /// 触发形状 = 源库自带一个只挡 `imported_src_*` 的触发器（现场对应 meta 所在页写不
+    /// 进去：磁盘满、库被另一个连接占住）：复制成功、`ensure_schema` 成功、聚合成功，
+    /// 唯独标记写不下去。旧顺序此时已把那一年累加进 `daily_counts`，报错后用户重试 ⇒
+    /// 再累加一遍。注回旧顺序（标记写回聚合之后）红在"失败的那一次不该已经落了聚合数"。
+    #[test]
+    fn copy_branch_marker_failure_does_not_double_count_either() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("mig_copy_double");
+        let data = crate::paths::data_dir();
+        std::fs::create_dir_all(&data).unwrap();
+        let name = "focusflow_2027.db".to_string();
+
+        // 源库：完整结构 + 5 条明细 + 触发器（整库复制会把它一起带过去）
+        let src_dir = _dir.path().join("old");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        {
+            let conn = Connection::open(src_dir.join(&name)).unwrap();
+            connection::ensure_schema(&conn, 2027).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS key_log (key_name TEXT NOT NULL, timestamp INTEGER NOT NULL);
+                 INSERT INTO key_log (key_name, timestamp) VALUES
+                     ('A', 1770000000), ('B', 1770000001), ('A', 1770000002),
+                     ('C', 1770000003), ('A', 1770000004);
+                 CREATE TRIGGER block_marker BEFORE INSERT ON meta
+                     WHEN NEW.key LIKE 'imported_src_%'
+                 BEGIN SELECT RAISE(ABORT, 'blocked by test'); END;",
+            )
+            .unwrap();
+        }
+        assert!(
+            !data.join(&name).exists(),
+            "目标库不存在才会走整体复制这一支"
+        );
+
+        let total_of = || -> i64 {
+            let conn = connection::open_ro(&data.join(&name)).unwrap();
+            let v = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0);
+            drop(conn);
+            v
+        };
+
+        let first = import_legacy_data(&src_dir);
+        assert!(
+            first.errors.iter().any(|e| e.contains("导入失败")),
+            "标记写不下去必须报错，不能当成功：{:?}",
+            first.errors
+        );
+        let after_first = total_of();
+        assert_eq!(after_first, 0, "复制分支失败的那一次不该已经落了聚合数");
+
+        let second = import_legacy_data(&src_dir);
+        assert!(
+            second.errors.iter().any(|e| e.contains("导入失败")),
+            "重试同样报错：{:?}",
+            second.errors
+        );
+        assert_eq!(
+            total_of(),
+            after_first,
+            "重试把那一年又累加了一遍（{after_first} → {}）",
+            total_of()
         );
     }
 

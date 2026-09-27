@@ -199,8 +199,8 @@ mod tests {
         // 保存计数到本地趋势库
         let today = chrono::Local::now().date_naive();
         let prev = today - chrono::Days::new(1);
-        edge_history::save_edge_history_count(today, 100);
-        edge_history::save_edge_history_count(prev, 50);
+        edge_history::save_edge_history_count(today, 100).unwrap();
+        edge_history::save_edge_history_count(prev, 50).unwrap();
 
         // 读取趋势
         let counts = edge_history::get_edge_history_counts(30);
