@@ -1100,7 +1100,12 @@ fn device_key_rows(device_key: &str, period: i64) -> Vec<(String, i64)> {
     let start_key = match period {
         -1 => Some(today_key),
         0 => None,
-        n => Some(today_key - (n.max(1) - 1)),
+        // 周期起点统一走 `period_start_key`：同一个公式只留一份实现，
+        // 而且它夹到 `MAX_QUERY_DAYS`（就地写 `n.max(1) - 1` 那份不夹）。
+        // 说清差别在哪：`today_key - (i64::MAX - 1)` **不会**下溢（结果约 −9.22e18，
+        // 仍在 i64 范围内，注回旧写法实测没 panic），但它等于"没有任何下界"
+        // ⇒ 极端周期从"近 100 年"变成"全表"，与 `period_start_key` 那一路不同口径。
+        n => Some(period_start_key(today_key, n)),
     };
     let mut merged: HashMap<String, i64> = HashMap::new();
     for year in query_years(None, None) {
@@ -2300,6 +2305,101 @@ mod tests {
             two.last().map(|p| p.0.as_str()),
             Some(today_s.as_str()),
             "两天窗口的最后一格也必须是今天"
+        );
+    }
+
+    /// 回归（`period_start_key` 那一族的另一半）：`device_key_rows` 自己写了一遍
+    /// 周期起点公式 `today_key - (n.max(1) - 1)`，而 `period_start_key` 那份夹到
+    /// `MAX_QUERY_DAYS` —— 同一个公式两份实现。
+    ///
+    /// 差别的形状要说清（我第一版按 `period_start_key` 注释里那句"会下溢"写成了
+    /// **崩溃级**，注回旧写法实测**不 panic** —— `n = i64::MAX` 时结果约 −9.22e18，
+    /// 仍在 i64 范围内，那个说法在这条 i64 键运算上不成立，收回）。真正的问题是
+    /// 那一档等于"没有下界"：不夹的写法会把 1900 年的行也算进"近 N 天"。
+    ///
+    /// `period` 是外部输入：`desktop/src/commands.rs::get_device_detail` 这一条
+    /// 不过 `is_valid_period`（对比同一个文件里的统计视图那条）。
+    ///
+    /// 已有的 `device_detail_period_cannot_underflow` 只测纯函数那一份，
+    /// 照不到第二处实现 —— 这条直接点 `device_key_rows` 本体。
+    ///
+    /// （第一版只从入口喂极端值 + 断言"空库返回空"，注入取证 INJ-39 注回旧写法后
+    /// 仍然绿 —— 那等于什么都没测。第二版改成"种一条 1900 年的设备行"：
+    /// 它在窗口之外、在全表之内，两种写法的答案不一样。）
+    #[test]
+    fn device_key_rows_extreme_period_is_clamped_not_unbounded() {
+        use chrono::Datelike;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("dev_keys_clamp");
+        invalidate_years_cache();
+        let key = "HID#VID_1234&PID_5678#0";
+        let old_year = 1900i32;
+        let old_dk =
+            day_key_of_date(chrono::NaiveDate::from_ymd_opt(old_year, 6, 1).expect("date"));
+        let today_key = day_key_of_date(Local::now().date_naive());
+        {
+            let conn = connection::open_rw(&paths::year_db_path(old_year)).unwrap();
+            connection::ensure_schema(&conn, old_year).unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO devices (id, device_key, name, kind) VALUES (7, ?1, '老键鼠', 'mouse')",
+                [key],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO device_key_counts (date_key, device_id, key_name, count) VALUES (?1, 7, 'A', 5)",
+                [old_dk],
+            )
+            .unwrap();
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        invalidate_years_cache();
+        // 前提：这条行必须真的落在窗口之外，否则整条用例在测"查不到东西"
+        assert!(
+            today_key - old_dk > MAX_QUERY_DAYS,
+            "夹具不对：1900 年那条行距今天只有 {} 天，窗口 {MAX_QUERY_DAYS} 天测不出来",
+            today_key - old_dk
+        );
+        // 全表那一档必须看得见它
+        let all = device_key_rows(key, 0);
+        assert_eq!(
+            all,
+            vec![("A".to_string(), 5)],
+            "period=0 是全表，实得 {all:?}"
+        );
+        // 极端周期：夹住 ⇒ 1900 年那行不计进来（注回旧写法会算进来 ⇒ 这条红）
+        let huge = device_key_rows(key, i64::MAX);
+        assert!(
+            huge.is_empty(),
+            "i64::MAX 要夹到 {MAX_QUERY_DAYS} 天，不能等于「没有下界」，实得 {huge:?}"
+        );
+        // 反向腿：窗口内的行照常计入，且那一档与 MAX_QUERY_DAYS 完全一致
+        let cur = Local::now().year();
+        {
+            let conn = connection::open_rw(&paths::year_db_path(cur)).unwrap();
+            connection::ensure_schema(&conn, cur).unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO devices (id, device_key, name, kind) VALUES (7, ?1, '键鼠', 'mouse')",
+                [key],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO device_key_counts (date_key, device_id, key_name, count) VALUES (?1, 7, 'B', 3)",
+                [today_key],
+            )
+            .unwrap();
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        invalidate_years_cache();
+        let got = device_key_rows(key, i64::MAX);
+        assert_eq!(
+            got,
+            vec![("B".to_string(), 3)],
+            "窗口内的行要照常计入、窗口外的不计（实得 {got:?}）"
+        );
+        assert_eq!(
+            device_key_rows(key, MAX_QUERY_DAYS),
+            got,
+            "i64::MAX 与 MAX_QUERY_DAYS 必须是同一档，不能一份回绕一份夹住"
         );
     }
 }
