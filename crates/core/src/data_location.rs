@@ -275,7 +275,31 @@ fn keep_aside(dst: &Path) -> anyhow::Result<Option<PathBuf>> {
     name.push(format!(".pre-switch-{timestamp}"));
     let kept = dst.with_file_name(name);
     std::fs::rename(dst, &kept)?;
+    // WAL 附属文件必须跟着主库走（同 `migration::backup_before_overwrite`）：只搬主库，
+    // 目标目录里那份**别人的** `-wal` 就留在原位配上了新主库，SQLite 打开时照那份 wal
+    // 恢复 —— 而这次搬运随后还要删源，唯一一份可能就是那个错配的组合。
+    // 附属文件本就不存在是常态（多数库早就 checkpoint 了），所以只在存在时搬；
+    // 搬不动就当失败：宁可这次不覆盖，也不能留下主库与 wal 成套但来源不同的两份。
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = with_suffix(dst, suffix);
+        if sidecar.exists() {
+            std::fs::rename(&sidecar, with_suffix(&kept, suffix))?;
+        }
+    }
     Ok(Some(kept))
+}
+
+/// 在文件名的**末尾**接一段后缀（`focusflow_2026.db` → `focusflow_2026.db-wal`）。
+///
+/// 走 `OsString` 而不是 `format!("{}", path.display())`：后者对非 UTF-8 文件名是 lossy
+/// 转换，拼出来的路径根本不存在 —— 本仓库的复制链在别处也刻意保 `OsString` 原名。
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
 /// 搬运结果（供日志与启动报告措辞用）。
@@ -832,6 +856,60 @@ mod tests {
         std::fs::create_dir_all(&fresh).unwrap();
         let rep = migrate_data_tree(&fresh, to.path()).expect("空的旧根不该卡住迁移");
         assert_eq!(rep.summary.copied, 0);
+    }
+
+    #[test]
+    fn keeping_aside_a_conflicting_target_takes_its_wal_sidecars_too() {
+        let _lock = paths::test_app_dir_lock();
+        let src = paths::test_app_dir("ksw_src");
+        let dst = paths::test_app_dir("ksw_dst");
+        paths::set_app_dir(src.path());
+        write_file(
+            &src.path().join("data/focusflow_2026.db"),
+            "fresh-from-source",
+        );
+        // 目标目录里那份是**别人**的一套库，还带着自己没 checkpoint 完的 WAL
+        write_file(
+            &dst.path().join("data/focusflow_2026.db"),
+            "older-other-data",
+        );
+        write_file(
+            &dst.path().join("data/focusflow_2026.db-wal"),
+            "someone-elses-wal",
+        );
+        write_file(
+            &dst.path().join("data/focusflow_2026.db-shm"),
+            "someone-elses-shm",
+        );
+
+        let s = copy_data_tree(src.path(), dst.path());
+        assert!(s.errors.is_empty(), "{:?}", s.errors);
+
+        let dir = dst.path().join("data");
+        let archived = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".pre-switch-"))
+            .count();
+        assert_eq!(
+            archived,
+            3,
+            "主库与它的 -wal/-shm 必须成套留档，不该只搬主库: {:?}",
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        );
+        // 原位一份都不该剩：新主库 + 别人的旧 wal = SQLite 照错配的 wal 恢复
+        assert!(
+            !dir.join("focusflow_2026.db-wal").exists(),
+            "孤儿 -wal 不该留在原位"
+        );
+        assert!(
+            !dir.join("focusflow_2026.db-shm").exists(),
+            "孤儿 -shm 不该留在原位"
+        );
     }
 
     #[test]

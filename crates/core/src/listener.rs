@@ -420,14 +420,19 @@ impl InputListener {
         if self.paused.swap(paused, Ordering::SeqCst) == paused {
             return;
         }
-        if paused {
-            self.pressed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-            let mut s = self.scroll.lock().unwrap_or_else(|e| e.into_inner());
-            *s = (None, "上");
-        }
+        // 两个沿都要清锚点，不能只在「进入暂停」那一侧清。
+        //
+        // 去重锚点是在 `is_new_press` / `is_new_scroll_burst` 里被消费的，而那两处都调在
+        // `record_event` 的暂停闸**之前** —— 于是暂停期间滚的那一下、按的那一键照样把锚点
+        // 吃掉了，只是没落库。不清的话恢复后的第一件事被当成"重复/还在窗口内"丢掉：
+        // 每个方向、每个键每次暂停-恢复少计恰好 1 次（键盘多数还能被 KeyRelease 自愈，
+        // 丢的就是"释放没收到"那一次；滚轮没有自愈）。
+        self.pressed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let mut s = self.scroll.lock().unwrap_or_else(|e| e.into_inner());
+        *s = (None, "上");
         tracing::info!("监听已 {}", if paused { "暂停" } else { "恢复" });
     }
 
@@ -1071,5 +1076,57 @@ mod tests {
 
         // 线程退出要在临时目录被删之前（见 stop_and_wait 的注释）
         writer.stop_and_wait();
+    }
+
+    /// 暂停期间被消费掉的去重锚点，不许吃掉恢复后的第一次计数。
+    ///
+    /// 形状：`is_new_scroll_burst` / `is_new_press` 都调在 `record_event` 的暂停闸**之前**，
+    /// 所以暂停时滚的那一下、按的那一键已经把锚点吃掉了，只是没落库。旧写法只在
+    /// "进入暂停"那一沿清锚点 ⇒ 恢复后的同方向滚轮还在 burst 窗口里、那个键还在
+    /// "已按下"集合里 ⇒ 各少计 1 次（每个方向、每个键，每暂停一次少一次）。
+    #[test]
+    fn events_consumed_while_paused_do_not_swallow_the_first_count_after_resume() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("listener_pause_anchor");
+        let db = crate::db::Database::init_readonly();
+        let paused = new_pause_flag();
+        let l = InputListener::new(test_config(), Arc::clone(&paused));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_cb = Arc::clone(&hits);
+        l.add_key_callback(Arc::new(move |_| {
+            hits_cb.fetch_add(1, Ordering::Relaxed);
+        }));
+        let ev = |t: rdev::EventType| rdev::Event {
+            event_type: t,
+            name: None,
+            time: SystemTime::now(),
+        };
+
+        l.set_paused(true);
+        l.process_event(
+            &db,
+            &ev(EventType::Wheel {
+                delta_x: 0,
+                delta_y: 1,
+            }),
+        );
+        l.process_event(&db, &ev(EventType::KeyPress(Key::KeyA)));
+        assert_eq!(hits.load(Ordering::Relaxed), 0, "暂停期间一条都不该计");
+
+        // 恢复之后：同方向再滚一格、再按一次同一个键 —— 两条都该计
+        l.set_paused(false);
+        l.process_event(
+            &db,
+            &ev(EventType::Wheel {
+                delta_x: 0,
+                delta_y: 1,
+            }),
+        );
+        l.process_event(&db, &ev(EventType::KeyPress(Key::KeyA)));
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            2,
+            "暂停期间被消费掉的锚点必须在恢复那一沿也清掉，否则这里停在 0 或 1"
+        );
     }
 }
