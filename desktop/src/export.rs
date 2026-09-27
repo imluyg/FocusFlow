@@ -236,7 +236,15 @@ pub fn write_weekly_report_for(
     // 于是同一个人连打 40 天：设置页显示 40，周报显示 14，而周报的文案还写着
     // 「截至本周日连续」，读起来像整段纪录。两处的数字必须能对上。
     // 锚点仍是本周日（`to`）不是今天，pending 恒传 0：周报是「已落库快照」文档（§七·4）。
-    let goal_rows = q::get_daily_counts(focusflow_core::stats::GOAL_LOOKBACK_DAYS, None);
+    // 序列的**尾界**是今天（`db/queries.rs:469-477`：`end_dk = 今天`、起点 `今天-(n-1)`），
+    // 而判定的锚在 `to`（`stats.rs:342` 从 `to` 往回数 `GOAL_LOOKBACK_DAYS-1` 天）。
+    // 只要 370 天就等于把序列左端少要了 `今天 - to`（1..7）天：连打 363 天以上的人，
+    // 周报的连续/最长会比设置页少这么多天 —— 正是 `GOAL_LOOKBACK_DAYS` 注释禁止的
+    // 「两处两把尺子」。上面那条修的是同族的另一头（周报喂 14 天序列），那次播的纪录
+    // 只有 41 天，正好跨不过窗口左端，所以这个缺口没被现有用例照出来。
+    let anchor_gap = (Local::now().date_naive() - to).num_days().max(0);
+    let goal_rows =
+        q::get_daily_counts(focusflow_core::stats::GOAL_LOOKBACK_DAYS + anchor_gap, None);
     let goal_state =
         focusflow_core::stats::goal_status(goal, &goal_rows, &to.format("%Y-%m-%d").to_string(), 0);
     let app_total: i64 = apps.values().sum();
@@ -493,6 +501,71 @@ mod tests {
         let again = write_weekly_report()?.expect("重跑应仍指向同一文件");
         assert_eq!(again, path);
         // 目录由 _app 的 Drop 删除：别让下一个用例继续沿着这份年度库列表查下去
+        queries::invalidate_years_cache();
+        Ok(())
+    }
+
+    /// 连续纪录跨过 `GOAL_LOOKBACK_DAYS` 时，周报与设置页必须是同一把尺子。
+    ///
+    /// `get_daily_counts` 的窗口尾界是**今天**，而 `goal_status` 从 `to`（周末那天）往回数
+    /// `GOAL_LOOKBACK_DAYS - 1` 天 —— 只要 370 天就等于把序列左端少要 `今天 - to` 天，
+    /// 连打 363 天以上的人周报会少报这么多天。上一场修的是同族的另一头（周报喂 14 天
+    /// 序列），那条用例播 41 天，纪录跨不过窗口左端 ⇒ 照不出这个缺口。
+    ///
+    /// **刻意不走 `last_finished_week`**：今天正好是周日时那一周的"周末"就是今天，
+    /// 缺口 0 天，旧写法照样过 —— 用例得日历无关，所以直接把界钉在 `今天 - 3`。
+    /// 时间只会往前走，实际缺口只会 ≥ 3，不会把这条翻成假绿。
+    #[test]
+    fn weekly_report_lookback_is_not_short_by_the_days_since_the_week_end() -> anyhow::Result<()> {
+        use chrono::{Datelike, NaiveDate};
+        use focusflow_core::db::connection::{ensure_schema, open_rw};
+        use focusflow_core::db::queries;
+        use focusflow_core::paths;
+
+        let _serial = crate::app_dir_lock();
+        let _app = paths::test_app_dir("weekly_lookback");
+        queries::invalidate_years_cache();
+
+        let today = Local::now().date_naive();
+        let to = today - chrono::Duration::days(3);
+        let from = to - chrono::Duration::days(6);
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let dk = |d: NaiveDate| d.signed_duration_since(epoch).num_days();
+        let lookback = focusflow_core::stats::GOAL_LOOKBACK_DAYS;
+
+        // 逐年一条批量语句：逐日开连接会把这条用例拖到秒级以上
+        let mut by_year: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
+        let mut day = to - chrono::Duration::days(lookback - 1);
+        while day <= to {
+            let k = dk(day);
+            by_year.entry(day.year()).or_default().push_str(&format!(
+                "INSERT OR REPLACE INTO daily_counts (date_key, count, seconds) \
+                 VALUES ({k}, 30000, 3600); \
+                 INSERT OR REPLACE INTO key_counts (date_key, key_name, count) \
+                 VALUES ({k}, '鼠标左键', 30000);"
+            ));
+            day += chrono::Duration::days(1);
+        }
+        for (year, sql) in &by_year {
+            let conn = open_rw(&paths::year_db_path(*year))?;
+            ensure_schema(&conn, *year)?;
+            conn.execute_batch(sql)?;
+        }
+        queries::invalidate_years_cache();
+
+        let path = write_weekly_report_for(from, to)?.expect("有数据时应生成文件");
+        let md = std::fs::read_to_string(&path)?;
+        assert!(
+            md.contains(&format!("连续 {lookback} 天")),
+            "周报的连续天数被少要了 `今天 - to` 天（旧写法报 {}）：\n{md}",
+            lookback - 3
+        );
+        assert!(
+            md.contains(&format!("最长纪录 {lookback} 天）")),
+            "最长纪录同样被窗口左端截短：\n{md}"
+        );
+        // 总量照旧只算那 7 天（7 × 30000），别让补长的窗口漏进别的口径里
+        assert!(md.contains("210,000"), "本周总量应仍是 21 万：\n{md}");
         queries::invalidate_years_cache();
         Ok(())
     }
