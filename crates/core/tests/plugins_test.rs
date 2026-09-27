@@ -650,6 +650,76 @@ mod tests {
         (tmp, manager, name)
     }
 
+    /// 回归：宿主 `accounting_category_add` 必须回 `(id, 原因串)` 两个值。
+    ///
+    /// 面板本来就读两个（`local ok, msg = focusflow.accounting_category_add(...)`），
+    /// 而宿主原来只回一个 id ⇒ `msg` 恒为 nil，于是：
+    ///
+    /// - 重名添加：`INSERT OR IGNORE` + 回读 id 拿到**已存在那一条**的 id（> 0）
+    ///   ⇒ 面板印「分类 [x] 已添加」，而这次传的类型/子分类一个字都没落库；
+    /// - 其他失败：面板只能说"添加分类失败：" 四个字。
+    ///
+    /// 这一族在 Rust 侧（`accounting::add_category`）已有用例，但宿主这两条腿
+    /// 只有真过一遍 Lua 才测得到 —— 就是这条。
+    #[test]
+    fn host_accounting_category_add_returns_a_reason() {
+        let _guard = guard();
+        let tmp = paths::test_app_dir("host_cat_reason");
+        db::queries::invalidate_years_cache();
+        // 宿主那侧的 `ensure_accounting_db()` 是"本进程只跑一次"的形状：单跑这条时
+        // 它会在本用例的临时目录里建表，而全量并行跑时**前一条用例已经把它用掉了**，
+        // 于是本用例的目录里没有 `categories` ⇒ "no such table: categories"。
+        // 记账建库本来就是用例的前置（同文件 `renamed_or_deleted_category...` 也这么写）。
+        focusflow_core::accounting::init_db().expect("记账库应能建起来");
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(tmp.path().join("config.ini")).expect("临时配置应能载入"),
+        ));
+        let lua = mlua::Lua::new();
+        focusflow_core::plugins::host::register_host_api(
+            &lua,
+            config,
+            db::Database::init_readonly(),
+            "host_cat_reason",
+        )
+        .expect("宿主 API 应能注册");
+
+        let call = |name: &str, ctype: &str| -> (i64, String) {
+            lua.load(format!(
+                "local ok, msg = focusflow.accounting_category_add('{name}', '{ctype}') \
+                 return ok, msg or '<nil>'"
+            ))
+            .eval()
+            .expect("accounting_category_add 该回两个值")
+        };
+
+        // 第一次正常添加：id > 0，原因串为空
+        let (id, msg) = call("宠物", "expense");
+        assert!(id > 0, "首次添加该回真实 id，实得 {id} / {msg}");
+        assert_eq!(msg, "", "成功时原因串该是空的");
+
+        // 重名：必须报"已存在"，不能回一个已存在记录的 id 让面板印「已添加」
+        let (dup_id, dup_msg) = call("宠物", "income");
+        assert_eq!(dup_id, -1, "重名不能回已存在那一条的 id，实得 {dup_id}");
+        assert!(
+            dup_msg.contains("已经存在"),
+            "要说清是重名（传的 ctype 没落库），实得: {dup_msg}"
+        );
+        // 那次"添加"不能把已有分类的类型改掉
+        assert_eq!(
+            focusflow_core::accounting::category_type("宠物").as_deref(),
+            Some("expense"),
+            "重名那次传的 income 不该落库"
+        );
+
+        // 空名：也要有话可说（原来 msg 恒为 nil ⇒ 界面只剩四个字）
+        let (empty_id, empty_msg) = call("   ", "both");
+        assert_eq!(empty_id, -1, "空分类名不该被建出来");
+        assert!(
+            !empty_msg.is_empty() && empty_msg != "<nil>",
+            "失败必须带原因，实得: {empty_msg:?}"
+        );
+    }
+
     /// 等 Edge 那一轮后台刷新真的收尾，再让用例继续往下走。
     ///
     /// `edge-refresh` 线程是 detach 的，而它落盘用的 `data_dir()` 取的是**当下**的
