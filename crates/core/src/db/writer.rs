@@ -239,6 +239,14 @@ struct WriterState {
     /// `stop()` 超时或 panic 真的写出过恢复文件：在途批次出结果后要由写线程把
     /// 文件收敛成"此刻真正未落库的集合"（见 [`settle_after_stop_snapshot`]）。
     stop_snapshot_taken: AtomicBool,
+    /// `snapshot_recovery(take=true)` 从 `agg` 里取走、但**从没进过落库管道**的那一批。
+    ///
+    /// 与 `in_flight` 的区别就在"有没有人打算去落它"：在途那批由写线程负责到底，
+    /// 而这一批此刻**只存在于恢复文件里**（内存里已经没有、落库管道里也没有）。
+    /// settle 必须先把它并回 `agg` 再判空 —— 否则"agg 空了"会被当成"全部落库了"，
+    /// 连它一起把文件删掉，那批键鼠既不在库里也不在文件里，且没有任何重试途径。
+    /// 锁序与 `in_flight` 同侧：一律 agg → snapshot_taken，别处不得反过来。
+    snapshot_taken: Mutex<AggDeltas>,
 }
 
 /// 写入器句柄（Send + Sync，可跨线程持有）。
@@ -326,6 +334,7 @@ impl DbWriter {
         let state = Arc::new(WriterState {
             agg: Mutex::new(initial),
             in_flight: Mutex::new(AggDeltas::default()),
+            snapshot_taken: Mutex::new(AggDeltas::default()),
             stop_snapshot_taken: AtomicBool::new(false),
             sig_tx,
             today_count: AtomicU64::new(today_base_count),
@@ -749,7 +758,15 @@ fn snapshot_recovery(state: &WriterState, take: bool) {
                 path.display()
             );
             if take {
-                agg.take_for_flush();
+                let taken = agg.take_for_flush();
+                // 留一份：这批既不在库里也没在落库管道里，此刻唯一的副本是那个文件。
+                // settle 时要么并回内存（由随后的 flush 或重做的快照接手），要么…
+                // 没有要么 —— 不并回来就是"退出即丢"。
+                state
+                    .snapshot_taken
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .merge_in(&taken);
             }
             // 让写线程知道"文件里此刻有一批结果未定的在途数据"，出结论后必须收敛
             //（见 [`settle_after_stop_snapshot`]），否则成功落库的那批会被重放第二次。
@@ -772,6 +789,21 @@ fn snapshot_recovery(state: &WriterState, take: bool) {
 fn settle_after_stop_snapshot(state: &WriterState) {
     if !state.stop_snapshot_taken.swap(false, Ordering::Relaxed) {
         return;
+    }
+    // 先把"只存在于文件里、从没进过落库管道"的那一批并回内存（锁序 agg → snapshot_taken，
+    // 与 snapshot_recovery 那一侧同序）。不并的话下面看到的"agg 已空"并不代表"全部落库了"，
+    // 删文件就会把还没落库的这批一起抹掉 —— 退出即永久丢，且日志会写成"已确认落库"。
+    {
+        let mut agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = std::mem::take(
+            &mut *state
+                .snapshot_taken
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        if !taken.is_empty() {
+            agg.merge_in(&taken);
+        }
     }
     let agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
     if agg.is_empty() {
@@ -1665,6 +1697,84 @@ mod tests {
             })
             .unwrap();
         assert_eq!(landed, 3, "三次按键最终要落在库里");
+    }
+
+    /// `stop()` 超时快照**取走**的那一批只存在于文件里：在途批次落成之后，不许因为
+    /// "agg 空了"就把它连同文件一起删掉。
+    ///
+    /// 两条批次走的是两条命：`in_flight` 有写线程负责到底，而快照 `take=true` 从 agg
+    /// 里取走的那批（A）从没进过落库管道 —— 内存里没了、库里没有、只有那个文件。
+    /// 旧写法的 settle 只看 `agg.is_empty()` 就删文件，判据把"内存空"当成"都落库了"，
+    /// 于是 A 两头落空、且日志写的是"已确认落库，删除恢复文件"。
+    #[test]
+    fn nothing_is_lost_when_the_stop_snapshot_took_deltas_that_never_entered_the_pipeline() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("recovery_took_batch");
+        let w = start_writer(Duration::from_secs(3600));
+        let t0 = queries::now_ts();
+        // B：正在落库的一批（被年度库的独占挡在 BEGIN IMMEDIATE 上）
+        for i in 0..3 {
+            w.record("A", t0 + i);
+        }
+        let path = paths::current_year_db_path();
+        let blocker = connection::open_rw(&path).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        w.flush(false);
+        for _ in 0..100 {
+            let empty = w
+                .state
+                .agg
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+            if empty {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // A：快照那一刻还留在 agg 里的一批 —— 它不会被任何人去落库
+        for i in 0..2 {
+            w.record("B", t0 + 10 + i);
+        }
+
+        w.stop();
+        assert!(w.is_alive(), "前提：写线程还卡在落库里，stop 只能超时");
+        let text = std::fs::read_to_string(recovery_path()).expect("两批都必须在恢复文件里");
+        let file: AggDeltasFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            file.daily.iter().map(|(_, n)| n).sum::<i64>(),
+            5,
+            "快照要覆盖 在途 + 还在 agg 的，一共五次按键"
+        );
+
+        // 放开独占：B 真的落库，settle 随后收尾
+        blocker.execute_batch("COMMIT;").unwrap();
+        drop(blocker);
+        w.stop_and_wait();
+
+        // 唯一的判据：一条都不许"既不在库里、也不在恢复文件里"
+        let in_file = match std::fs::read_to_string(recovery_path()) {
+            Ok(t) => serde_json::from_str::<AggDeltasFile>(&t)
+                .unwrap()
+                .daily
+                .iter()
+                .map(|(_, n)| *n)
+                .sum::<i64>(),
+            Err(_) => 0,
+        };
+        let conn = connection::open_rw(&path).unwrap();
+        let landed: i64 = conn
+            .query_row("SELECT COALESCE(SUM(count),0) FROM daily_counts", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            landed + in_file,
+            5,
+            "库里 {landed} 条 + 恢复文件 {in_file} 条必须等于 5：\
+             修前 B 落成后 settle 见 agg 已空就删文件，被快照取走的 A 两头落空"
+        );
     }
 
     /// 启动回放留下的副本，要等首批增量真的落库才删。

@@ -131,15 +131,22 @@ fn backup_before_overwrite(dst: &Path) -> anyhow::Result<Option<std::path::PathB
         .to_os_string();
     name.push(format!(".import-backup-{timestamp}"));
     let kept = dst.with_file_name(name);
-    std::fs::rename(dst, &kept)?;
-    // 顺带把源库遗留的 sidecar 一起挪走：只留主库会让下次打开看到半套 WAL 状态
+    // 附属文件**先**搬、主库**后**搬，搬不动就整次失败。
+    // ① 顺序：旧写法先把主库 rename 走，再 `let _ =` 吞掉 sidecar 的失败 —— 那一刻目录里
+    //    躺着的是"主库已改名带走、别人那份 -wal 还在原位"的半套状态，而调用方只看到
+    //    一条错误文案，不知道目录被动过了。
+    // ② 不吞：`-wal` 里正是还没 checkpoint 进主库的那段新数据（§十四 在真库上量到
+    //    `-wal` 比主库还大），留在原位等于让下次打开按错配的 WAL 去恢复。
+    // ③ 路径用 OsString 追加，不用 `format!("{}", path.display())`：后者对非 UTF-8
+    //    文件名是 lossy 转换，拼出来的路径根本不存在 ⇒ 配合 `let _ =` 连失败都不会报。
     for suffix in ["-wal", "-shm"] {
-        let from = std::path::PathBuf::from(format!("{}{suffix}", dst.display()));
+        let from = crate::data_location::with_suffix(dst, suffix);
         if from.exists() {
-            let to = std::path::PathBuf::from(format!("{}{suffix}", kept.display()));
-            let _ = std::fs::rename(&from, to);
+            std::fs::rename(&from, crate::data_location::with_suffix(&kept, suffix))
+                .map_err(|e| anyhow::anyhow!("{} 没能一起留档: {e}", from.display()))?;
         }
     }
+    std::fs::rename(dst, &kept)?;
     tracing::info!(
         "导入前已留档现有库: {} -> {}",
         dst.display(),
@@ -767,6 +774,52 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".import-backup-"))
             .collect();
         assert_eq!(kept.len(), 1, "被覆盖的现有库必须留档一份");
+    }
+
+    /// 附属文件搬不动时，整次留档必须在**动主库之前**失败。
+    ///
+    /// 旧写法是「先 rename 主库 → `let _ =` 吞掉 `-wal` 的失败」，于是目录里留下
+    /// "主库已改名带走、别人那份 `-wal` 还在原位"这半套状态；而 `-wal` 里正是还没
+    /// checkpoint 进主库的那段新数据（§十四 在真库上量到 `-wal` 比主库还大），
+    /// 下次打开就是按错配的 WAL 去恢复。
+    #[cfg(windows)]
+    #[test]
+    fn a_sidecar_that_cannot_be_archived_aborts_before_the_main_file_moves() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("mig_sidecar_hold");
+        let data = crate::paths::data_dir();
+        let main = data.join("focusflow_accounting.db");
+        std::fs::write(&main, b"current").unwrap();
+        let wal = crate::data_location::with_suffix(&main, "-wal");
+        std::fs::write(&wal, b"someone-else-tail").unwrap();
+
+        // 独占占住 -wal（同步盘/杀软那一类，不需要真杀软）：rename 它必失败
+        let hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&wal)
+            .expect("占位句柄应能打开");
+        let e = backup_before_overwrite(&main).expect_err("-wal 搬不动时整次留档必须失败");
+        assert!(
+            e.to_string().contains("-wal"),
+            "错误要说清是哪个附属文件搬不动: {e}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&main).unwrap(),
+            "current",
+            "失败的那一次绝不能已经把主库改名带走"
+        );
+        assert!(wal.exists(), "搬不动的 -wal 必须还在原位");
+        assert!(
+            !data
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(".import-backup-")),
+            "半套归档也不该留下"
+        );
+        drop(hold);
     }
 
     /// 同一份旧库、内容一行没变、只是 mtime 变了（资源管理器复制一份、云盘

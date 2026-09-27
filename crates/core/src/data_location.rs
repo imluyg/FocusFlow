@@ -293,7 +293,8 @@ fn keep_aside(dst: &Path) -> anyhow::Result<Option<PathBuf>> {
 ///
 /// 走 `OsString` 而不是 `format!("{}", path.display())`：后者对非 UTF-8 文件名是 lossy
 /// 转换，拼出来的路径根本不存在 —— 本仓库的复制链在别处也刻意保 `OsString` 原名。
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+/// `migration::backup_before_overwrite` 共用这一份（那条链原先正是用 lossy 拼接的）。
+pub(crate) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path
         .file_name()
         .map(|s| s.to_os_string())
