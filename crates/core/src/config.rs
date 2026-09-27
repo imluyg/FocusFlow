@@ -165,6 +165,30 @@ const DEPRECATED_CONFIG: &[(&str, &[&str])] = &[
 ///
 /// 开头的 BOM 必须先剥掉：PowerShell 5.1 的 `>`/`Out-File`、记事本另存为 UTF-8 都会
 /// 写一个 U+FEFF，而它**不算空白**（`char::is_whitespace` 为 false），`trim()` 去不掉。
+/// 一行是不是节头；是的话返回节名。
+///
+/// 判据原来两处都写成 `starts_with('[') && ends_with(']')`，于是 `[gui] # 备注`
+/// **不算节头**：解析时 `current_section` 还停在上一节，紧随其后的 `theme = dark`
+/// 被记成 `database.theme`；回写时同一判据把那一行原样留在 `[database]` 的缓冲里，
+/// 而 `[gui]` 整节没在文件里出现过 ⇒ 走"追加到文件末尾"，写下默认的 `theme = light`。
+/// 净效果：用户的行被复制进错误的节、并被默认值盖掉（下次 parse 后者赢）。
+/// Python 的 `configparser` 用 `re.match`，尾注是被接受的 —— 与本文件"同格式、
+/// 兼容用户既有配置"的承诺相反。`]` 之后只允许空白或注释起始符（`#` / `;`），
+/// 别的字符（例如 `[gui]x`）仍然不算节头。
+fn section_header(line: &str) -> Option<&str> {
+    let s = line.trim();
+    if !s.starts_with('[') {
+        return None;
+    }
+    let close = s.find(']')?;
+    let tail = s[close + 1..].trim();
+    if tail.is_empty() || tail.starts_with('#') || tail.starts_with(';') {
+        Some(s[1..close].trim())
+    } else {
+        None
+    }
+}
+
 /// 留着的话首行是 `\u{FEFF}[database]`，不是合法的 section 头 → 第一个 section 的
 /// 键全被丢掉；而 `load()` 结尾无条件 `save()`，于是用户自己的 `[database]` 配置
 /// 直接被默认值覆盖回写进文件 —— 静默丢配置，不只是这次读错。
@@ -177,8 +201,8 @@ pub(crate) fn parse_ini(text: &str) -> HashMap<String, HashMap<String, String>> 
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        if line.starts_with('[') && line.ends_with(']') {
-            current_section = Some(line[1..line.len() - 1].trim().to_string());
+        if let Some(section) = section_header(line) {
+            current_section = Some(section.to_string());
             continue;
         }
         let Some(section) = current_section.clone() else {
@@ -231,7 +255,7 @@ fn serialize_preserving_structure(
 
     for line in original.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        if let Some(section) = section_header(trimmed) {
             if let Some((section, lines)) = cur.take() {
                 flush_section(
                     &mut out,
@@ -242,10 +266,7 @@ fn serialize_preserving_structure(
                     lines,
                 );
             }
-            cur = Some((
-                trimmed[1..trimmed.len() - 1].trim().to_string(),
-                vec![line.to_string()],
-            ));
+            cur = Some((section.to_string(), vec![line.to_string()]));
             continue;
         }
         let Some((section, lines)) = cur.as_mut() else {
@@ -462,7 +483,20 @@ impl FocusFlowConfig {
             values: Mutex::new(values),
             path,
         };
-        cfg.save()?;
+        // 结尾这次回写只是把"补齐的默认键"落到盘上，它失败**不能**推翻已经读出来、
+        // 已经 reconcile 好的那一份。原来的 `cfg.save()?` 会让整个 `load()` 报错，
+        // 而 `instance()` 的兜底臂是 `in_memory(path)` = `default_config()` ⇒
+        // 本次运行全程跑默认值，接着下一笔成功的 save（退出前强制落盘、改数据目录、
+        // 任意 `set()` 唤醒的去抖保存）就拿这份默认快照逐行重写**真实**的 config.ini：
+        // `data_home` 被写空（下次启动数据根回到程序目录，真历史静默失联）、
+        // `[app_stats] exclude` 那道隐私保险丝失效、`[plugins] disabled` 复原。
+        // 读成功而写失败在 Windows 上是常态：另一个实例握着文件、记事本开着它、
+        // 杀软首扫 —— 所以这条链随时走得通，不是假想形状。
+        if let Err(rewrite) = cfg.save() {
+            tracing::warn!(
+                "配置已读出来，但补齐默认键的回写没成功（本次运行仍按读出来的值，不会拿默认值盖掉文件）: {rewrite:#}"
+            );
+        }
         Ok(cfg)
     }
 
@@ -959,6 +993,142 @@ work_minutes = 45
         assert!(
             after.contains("ignore_function_keys"),
             "快照里有、文件里没有的键要追加到节尾（证明确实重写过）:\n{after}"
+        );
+    }
+
+    /// 回归：`load()` 结尾那次"补齐默认键"的回写失败，原来会把**已经读好的**配置
+    /// 整个推翻（`cfg.save()?` ⇒ `load` 报 `Err`），而 `instance()` 的兜底臂是
+    /// `in_memory(path)` = `default_config()` ⇒ 本次运行跑默认值，下一笔成功的
+    /// `save()`（退出前强制落盘、改数据目录、任意 `set` 的去抖保存）就拿默认快照
+    /// 逐行重写真实的 `config.ini`：`data_home` 写空、`[app_stats] exclude`
+    /// 那道隐私保险丝失效、`[plugins] disabled` 复原。
+    ///
+    /// 夹具用**只读属性**让落盘失败（正是"另一个实例开着 / 记事本开着 / 杀软首扫"
+    /// 那一类写不进去的形态），并先断言这一步真的写不进去 —— 否则整条用例只是空跑。
+    /// （先试的是"握着另一个读句柄"，实测走不通：Rust 的 `File::open` 连
+    /// `FILE_SHARE_DELETE` 一起给，rename 照样成功。是前提断言把它否掉的。）
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_rewrite_at_load_time_does_not_degrade_to_defaults() {
+        // 只读位用 `attrib` 设：`PermissionsExt::set_readonly` 在本工具链还没稳定
+        // （E0658，issue #152956），而 `std::fs::set_permissions` 没有别的法子置它。
+        // 仓库里已有起外部进程的测试先例（autostart 那组跑 powershell 造 .lnk）。
+        let attrib_ro = |p: &std::path::Path, on: bool| {
+            let flag = if on { "+R" } else { "-R" };
+            let out = std::process::Command::new("cmd")
+                .args(["/C", "attrib", flag, &p.to_string_lossy()])
+                .output();
+            out.map(|o| o.status.success()).unwrap_or(false)
+        };
+        // panic 路径也要把只读位撤掉，否则 TestAppDir::drop 删不动这个目录
+        // （%TEMP% 泄漏这条账记过好几轮）
+        struct RoGuard<'a>(
+            &'a std::path::Path,
+            &'a dyn Fn(&std::path::Path, bool) -> bool,
+        );
+        impl Drop for RoGuard<'_> {
+            fn drop(&mut self) {
+                let _ = (self.1)(self.0, false);
+            }
+        }
+
+        let _lock = crate::paths::test_app_dir_lock();
+        let tmp = crate::paths::test_app_dir("cfg_write_fails");
+        let path = tmp.path().join("config.ini");
+        std::fs::write(
+            &path,
+            "[gui]\ntheme = dark\n\n[paths]\ndata_home = X:\\我的数据\\123\n\n\
+             [app_stats]\nenabled = true\nexclude = secret.exe\n",
+        )
+        .unwrap();
+        // 只读位是这台机器上唯一稳定的"写得动读得动、就是 rename 不进去"的形态；
+        // 设不上就直接跳过（不是失败：CI 上没有 cmd/attrib 时不该骗人）
+        if !attrib_ro(&path, true) {
+            eprintln!("attrib +R 没生效，跳过（夹具做不出来）");
+            return;
+        }
+        let _ro = RoGuard(&path, &attrib_ro);
+
+        // 前提：只读文件上，落盘确实会失败
+        let probe = FocusFlowConfig::in_memory(path.clone());
+        assert!(
+            probe.save().is_err(),
+            "夹具没让写失败：这条用例照不出「读成功、写失败」那一支"
+        );
+
+        // 读成功 ⇒ 写失败不能让 load 报错，也不能把用户那份换成默认值
+        let cfg = FocusFlowConfig::load(&path).expect("补齐键的回写失败不该让加载失败");
+        assert_eq!(cfg.get("gui", "theme"), "dark", "读出来的值必须留着");
+        assert_eq!(cfg.get("paths", "data_home"), "X:\\我的数据\\123");
+        assert_eq!(cfg.get("app_stats", "exclude"), "secret.exe");
+
+        // 只读位撤掉之后正常落盘：用户那三样一个字都不能少
+        assert!(attrib_ro(&path, false), "撤掉只读位该成功");
+        let _ro_off = RoGuard(&path, &attrib_ro);
+        cfg.save().expect("解锁后应该写得动");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("theme = dark"),
+            "默认值不许盖掉用户配置:\n{after}"
+        );
+        assert!(
+            after.contains(r"data_home = X:\我的数据\123"),
+            "data_home 被写空就等于把数据根搬回程序目录:\n{after}"
+        );
+        assert!(
+            after.contains("exclude = secret.exe"),
+            "隐私 exclude 不许被抹掉:\n{after}"
+        );
+    }
+
+    /// 回归（第八扫 A3）：节头带尾注（`[gui] # 界面`）时，两处判据原来都要求
+    /// `ends_with(']')` ⇒ 那一行不算节头：紧随其后的 `theme = dark` 被记进**上一节**
+    /// （`database.theme`），回写又把那一行原样留在上一节的缓冲里，再在文件末尾
+    /// 另起一节写默认值 `theme = light` —— 用户的键被复制进错误的节并被盖掉，
+    /// 下次 parse 后写的赢。Python 的 `configparser` 用 `re.match`，尾注是接受的，
+    /// 而本文件的承诺是"同格式、兼容用户既有配置"。
+    #[test]
+    fn section_header_with_trailing_comment_stays_its_own_section() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let tmp = crate::paths::test_app_dir("cfg_section_tail_note");
+        let path = tmp.path().join("config.ini");
+        std::fs::write(
+            &path,
+            "[database]\nmax_backups = 99\n[gui] # 界面\ntheme = dark\nunload_hidden = true\n",
+        )
+        .unwrap();
+
+        let cfg = FocusFlowConfig::load(&path).expect("带尾注的节头该能读");
+        assert_eq!(
+            cfg.get("gui", "theme"),
+            "dark",
+            "theme 不该被记到 database 那一节去"
+        );
+        assert_eq!(
+            cfg.get("database", "max_backups").parse::<i64>().unwrap(),
+            99,
+            "上一节自己的键要照旧"
+        );
+
+        // 落盘之后：那一行逐字保留、gui 节里还是 dark，且全文件不许出现第二份 theme
+        cfg.save().expect("保存该成功");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("[gui] # 界面"),
+            "尾注节头该行该逐字留着:\n{text}"
+        );
+        let gui_block = text
+            .split("\n[")
+            .find(|b| b.starts_with("gui]"))
+            .unwrap_or_default();
+        assert!(
+            gui_block.contains("theme = dark"),
+            "gui 节里必须还是 dark:\n{text}"
+        );
+        assert_eq!(
+            text.matches("theme = ").count(),
+            1,
+            "不许再冒出一份默认值的 theme:\n{text}"
         );
     }
 }
