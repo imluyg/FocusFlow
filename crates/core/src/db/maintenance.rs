@@ -255,7 +255,12 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
             "ATTACH DATABASE ?1 AS source",
             rusqlite::params![source_str],
         )?;
-        conn.execute("BEGIN;", [])?;
+        // 这里必须用 `BEGIN IMMEDIATE`：ATTACH 已经拿到库，随后的写要把事务升级成
+        // 写事务，而 deferred 事务的升级锁在第二个连接同时写时会中途 BUSY
+        // —— 那时已经删了一半行，只能整体回滚（本文件 `:716` 那条规矩就是为此立的：
+        // 探测/写要排在 `BEGIN IMMEDIATE` 之后）。启动路径上写线程还没起，
+        // 所以这条目前只是"锁型不对"，不是已经在丢数据。
+        conn.execute("BEGIN IMMEDIATE;", [])?;
         let migrate: anyhow::Result<usize> = (|| {
             let mut moved = 0usize;
             // 设备字典先同步 + 建 id 映射（明细表跨库搬 id 必须换算）
@@ -1843,7 +1848,15 @@ pub fn delete_key_today(key_name: &str) -> i64 {
     let path = paths::current_year_db_path();
     let conn = match connection::open_rw(&path) {
         Ok(c) => c,
-        Err(_) => return 0,
+        // 本函数其余每一步都有 error 日志（删 key_counts / 改 daily / 改 hourly /
+        // 提交失败都说了），唯独这一句把"库根本动不了"折成"今天没这个键"。
+        // 返回值形状要等一个能表达失败的口径（账 36 同族），先至少让它出声。
+        Err(e) => {
+            tracing::error!(
+                "删除按键「{key_name}」今日记录时库打不开，本次什么都没删（返回值 0 不代表没这个键）: {e}"
+            );
+            return 0;
+        }
     };
     // 整个「探测有没有得删 → 快照 → 删 + 联动修正」放进一个写事务：
     // 探测若放在事务外，写入线程随时可能把该按键今天的增量落进来，删掉它的同时
@@ -1958,34 +1971,63 @@ pub fn heal_daily_consistency() {
         // 年度库上跑一遍全表扫描，纯属白干。
         let dirty = match connection::open_ro(&path) {
             Ok(conn) => daily_inconsistency(&conn),
-            Err(_) => continue,
+            Err(e) => {
+                tracing::error!("{year} 年库连只读连接都开不出来，一致性自愈本轮跳过它: {e}");
+                continue;
+            }
         };
+        // 体检没做成 ≠ 健康。旧写法两条探测都是 `.is_ok()` / `.unwrap_or_default()`，
+        // 坏库每轮都报"健康"，自愈从此不再经过它，而且一句错都不报。
+        if !dirty.probe_errors.is_empty() {
+            tracing::error!(
+                "{year} 年库一致性体检没做成（不能当成健康），本轮跳过: {}",
+                dirty.probe_errors.join("；")
+            );
+            continue;
+        }
         if !dirty.has_daily_mismatch && dirty.hourly_mismatch_days.is_empty() {
             continue;
         }
+        // 已经探到"确有偏差"却拿不到写连接：这一年的自愈没跑成，必须说出来
+        //（旧写法是 `Err(_) => continue`，与"这个库本来就健康"同一个结局）
         let conn = match connection::open_rw(&path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::error!("{year} 年库检出偏差但写连接开不出来，本轮没修成: {e}");
+                continue;
+            }
         };
         if dirty.has_daily_mismatch {
-            let fixed_daily = conn
+            // 两条 UPDATE 失败以前是 `.unwrap_or(0)` ⇒ 与"本来就没有偏差"同一个数，
+            // 连下面那条 info 都不会印出来，看起来像"这个库不需要修"。
+            let fixed_daily = match conn
                 .execute(
                     "UPDATE daily_counts SET count = COALESCE(
                          (SELECT SUM(count) FROM key_counts WHERE key_counts.date_key = daily_counts.date_key), 0)
                      WHERE count != COALESCE(
                          (SELECT SUM(count) FROM key_counts WHERE key_counts.date_key = daily_counts.date_key), 0)",
                     [],
-                )
-                .unwrap_or(0);
+                ) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!("一致性自愈：{year} 年库 daily_counts 对齐失败，本轮没修成: {e}");
+                    0
+                }
+            };
             // 无 key_counts 行但 daily_counts 有值的残留天，直接清零
-            let cleared = conn
+            let cleared = match conn
                 .execute(
                     "UPDATE daily_counts SET count = 0
                      WHERE count != 0 AND NOT EXISTS
                          (SELECT 1 FROM key_counts WHERE key_counts.date_key = daily_counts.date_key)",
                     [],
-                )
-                .unwrap_or(0);
+                ) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!("一致性自愈：{year} 年库残留天清零失败，本轮没修成: {e}");
+                    0
+                }
+            };
             if fixed_daily > 0 || cleared > 0 {
                 tracing::info!(
                     "一致性自愈：{year} 年库修正 {fixed_daily} 天 daily_counts（另清零 {cleared} 天）"
@@ -1996,13 +2038,20 @@ pub fn heal_daily_consistency() {
         // Σhourly → daily 对齐（只处理确有偏差的天）
         if !dirty.hourly_mismatch_days.is_empty() {
             for dk in &dirty.hourly_mismatch_days {
-                let daily: i64 = conn
-                    .query_row(
-                        "SELECT count FROM daily_counts WHERE date_key=?1",
-                        [dk],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
+                let daily: i64 = match conn.query_row(
+                    "SELECT count FROM daily_counts WHERE date_key=?1",
+                    [dk],
+                    |r| r.get(0),
+                ) {
+                    Ok(v) => v,
+                    // 读不到 daily 就当 0 缩放 ⇒ 会把那一天的 hourly 全压成 0。
+                    Err(e) => {
+                        tracing::error!(
+                            "一致性自愈：{year} 年库 date_key {dk} 的 daily 读不出来，跳过这一天（不缩放）: {e}"
+                        );
+                        continue;
+                    }
+                };
                 scale_hourly_to_total(&conn, *dk, daily);
             }
             tracing::info!(
@@ -2021,37 +2070,57 @@ struct Inconsistency {
     has_daily_mismatch: bool,
     /// Σhourly 与 daily 不一致的天
     hourly_mismatch_days: Vec<i64>,
+    /// 体检**没做成**的原因（表读不出、页坏了、语句报错）
+    ///
+    /// 这一项原来不存在：两条探测都写成 `query_row(..).is_ok()` 与
+    /// `.unwrap_or_default()`，于是"查询失败"与"没有偏差"是同一个答案 ——
+    /// 坏库每轮体检都报"健康"，自愈从此不再经过它，而且一句错都不报。
+    probe_errors: Vec<String>,
 }
 
 /// 只读体检：找出 daily/hourly 与明细表不一致的天。
 fn daily_inconsistency(conn: &Connection) -> Inconsistency {
+    let mut probe_errors: Vec<String> = Vec::new();
     // 1. 有没有哪天的 daily != Σkey_counts（含 daily 有值但明细全无的残留天）
-    let has_daily_mismatch = conn
-        .query_row(
-            "SELECT 1 FROM daily_counts d
-              WHERE d.count != COALESCE((SELECT SUM(count) FROM key_counts k
-                                          WHERE k.date_key = d.date_key), 0)
-              LIMIT 1",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok();
+    //    只有 `QueryReturnedNoRows` 才是"没有偏差"；其余 Err 是"没探测成"。
+    let has_daily_mismatch = match conn.query_row(
+        "SELECT 1 FROM daily_counts d
+          WHERE d.count != COALESCE((SELECT SUM(count) FROM key_counts k
+                                      WHERE k.date_key = d.date_key), 0)
+          LIMIT 1",
+        [],
+        |_| Ok(()),
+    ) {
+        Ok(()) => true,
+        Err(rusqlite::Error::QueryReturnedNoRows) => false,
+        Err(e) => {
+            probe_errors.push(format!("daily vs Σkey_counts 探测失败: {e}"));
+            false
+        }
+    };
     // 2. 有没有哪天的 Σhourly != daily
-    let hourly_mismatch_days = conn
-        .prepare(
-            "SELECT d.date_key FROM daily_counts d
-              JOIN (SELECT date_key, SUM(count) s FROM hourly_counts GROUP BY date_key) h
-                ON h.date_key = d.date_key
-              WHERE h.s != d.count",
-        )
-        .and_then(|mut s| {
-            s.query_map([], |r| r.get::<_, i64>(0))
-                .map(|rows| rows.flatten().collect())
-        })
-        .unwrap_or_default();
+    let hourly_mismatch_days = match conn.prepare(
+        "SELECT d.date_key FROM daily_counts d
+          JOIN (SELECT date_key, SUM(count) s FROM hourly_counts GROUP BY date_key) h
+            ON h.date_key = d.date_key
+          WHERE h.s != d.count",
+    ) {
+        Ok(mut s) => match s.query_map([], |r| r.get::<_, i64>(0)) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(e) => {
+                probe_errors.push(format!("Σhourly vs daily 逐行读失败: {e}"));
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            probe_errors.push(format!("Σhourly vs daily 探测失败: {e}"));
+            Vec::new()
+        }
+    };
     Inconsistency {
         has_daily_mismatch,
         hourly_mismatch_days,
+        probe_errors,
     }
 }
 
@@ -3722,6 +3791,72 @@ mod tests {
         assert!(
             connection::table_exists_readonly(&path, "key_log"),
             "COUNT 读不出来被当成空表 ⇒ key_log 被 DROP 掉了，那份旧明细从此不会再被迁移"
+        );
+    }
+
+    /// 回归：一致性体检的两条探测以前写成 `.is_ok()` 与 `.unwrap_or_default()`，
+    /// 于是"读不出来"与"确实没有偏差"是同一个答案 ⇒ 坏库每轮体检都报"健康"，
+    /// 自愈从此不再经过它，而且一句错都不报。
+    ///
+    /// 现在 `Inconsistency` 多一条 `probe_errors`：探测没做成必须单独说出来
+    /// （`heal_daily_consistency` 据此跳过该年并打 `error`，而不是当成健康）。
+    /// 这条用例点的是纯探测函数本身 —— 日志面没有无头断言可用，能把"三种结局分开"
+    /// 的只有这个返回值。
+    #[test]
+    fn inconsistency_probe_separates_read_failure_from_healthy() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("heal_probe");
+        let year = 2027i32;
+        let path = paths::year_db_path(year);
+        let conn = connection::open_rw(&path).unwrap();
+        connection::ensure_schema(&conn, year).unwrap();
+        conn.execute(
+            "INSERT INTO daily_counts (date_key, count, seconds) VALUES (5, 4, 40)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO key_counts (date_key, key_name, count) VALUES (5, 'A', 4)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO hourly_counts (date_key, hour, count) VALUES (5, 9, 4)",
+            [],
+        )
+        .unwrap();
+
+        // 反向腿先走：三张表齐、数据一致 ⇒ 是"健康"，且没有探测错误
+        let ok = daily_inconsistency(&conn);
+        assert!(!ok.has_daily_mismatch, "数据本就一致，不该报偏差");
+        assert!(ok.hourly_mismatch_days.is_empty());
+        assert!(
+            ok.probe_errors.is_empty(),
+            "健康库不该有探测错误: {:?}",
+            ok.probe_errors
+        );
+
+        // 第二条探测的表没了 ⇒ 不能当成"没有偏差的一天"
+        conn.execute("DROP TABLE hourly_counts", []).unwrap();
+        let bad = daily_inconsistency(&conn);
+        assert!(
+            !bad.probe_errors.is_empty(),
+            "hourly_counts 读不出来必须记一条探测错误"
+        );
+        assert!(
+            bad.hourly_mismatch_days.is_empty(),
+            "探不出来时不该给出天数: {:?}",
+            bad.hourly_mismatch_days
+        );
+
+        // 第一条探测的表也没了 ⇒ 两条各记一条（不是一条盖过另一条）
+        conn.execute("DROP TABLE daily_counts", []).unwrap();
+        let worse = daily_inconsistency(&conn);
+        assert_eq!(
+            worse.probe_errors.len(),
+            2,
+            "两条探测都读不出来时要有两条话: {:?}",
+            worse.probe_errors
         );
     }
 }
