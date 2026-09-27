@@ -190,8 +190,8 @@ pub fn write_weekly_report_for(
     let mut apps: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut hourly = [0i64; 24];
     let mut rows: Vec<(chrono::NaiveDate, i64)> = Vec::new();
-    // 上一周 + 本周共 14 天（升序）：环比与连续打卡都从这份算
-    let mut daily: Vec<(String, i64)> = Vec::new();
+    // 上一周 + 本周共 14 天：上一周只用来做环比；连续/最长另按
+    // `GOAL_LOOKBACK_DAYS` 取序列（见下面 `goal_state`，与设置页同一把尺子）。
     let mut keyboard = 0i64;
     let mut mouse = 0i64;
     let mut prev_total = 0i64;
@@ -199,7 +199,6 @@ pub fn write_weekly_report_for(
     let mut day = from - chrono::Duration::days(7);
     while day <= to {
         let (total, day_keys) = q::get_stats_by_date(day);
-        daily.push((day.format("%Y-%m-%d").to_string(), total));
         if day >= from {
             rows.push((day, total));
             for (k, c) in &day_keys {
@@ -231,10 +230,15 @@ pub fn write_weekly_report_for(
     let best = rows.iter().max_by_key(|(_, c)| *c).copied();
     let worst = rows.iter().min_by_key(|(_, c)| *c).copied();
     let met_days = rows.iter().filter(|(_, c)| *c >= goal).count();
-    // 未落库增量恒传 0：周报是「已落库快照」文档（§七·4 判定），锚点又是
-    // 已结束的整周日 —— "今天还没落库的部分"与这份报告的窗口无关。
+    // 连续/最长必须与设置页同一把尺子。`stats::GOAL_LOOKBACK_DAYS` 的注释写着
+    // 「调用方取按日序列时必须用同一个值，否则 best 会在数据边界上被截断，
+    // 而两处各自写死数字迟早对不上」—— 周报原来喂的是上面那份 **14 天**序列，
+    // 于是同一个人连打 40 天：设置页显示 40，周报显示 14，而周报的文案还写着
+    // 「截至本周日连续」，读起来像整段纪录。两处的数字必须能对上。
+    // 锚点仍是本周日（`to`）不是今天，pending 恒传 0：周报是「已落库快照」文档（§七·4）。
+    let goal_rows = q::get_daily_counts(focusflow_core::stats::GOAL_LOOKBACK_DAYS, None);
     let goal_state =
-        focusflow_core::stats::goal_status(goal, &daily, &to.format("%Y-%m-%d").to_string(), 0);
+        focusflow_core::stats::goal_status(goal, &goal_rows, &to.format("%Y-%m-%d").to_string(), 0);
     let app_total: i64 = apps.values().sum();
     let hour_max = *hourly.iter().max().unwrap_or(&0);
 
@@ -281,7 +285,7 @@ pub fn write_weekly_report_for(
         ));
     }
     out.push_str(&format!(
-        "- 每日目标 {}：达标 {}/7 天；截至本周日连续 {} 天（近两周最长 {} 天）\n\n",
+        "- 每日目标 {}：达标 {}/7 天；截至本周日连续 {} 天（最长纪录 {} 天）\n\n",
         fmt_thousands(goal),
         met_days,
         goal_state.streak,
@@ -418,29 +422,37 @@ mod tests {
 
         let today = Local::now().date_naive();
         let (from, to) = focusflow_core::stats::last_finished_week(today);
-        let year = to.year();
         let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         let dk = |d: NaiveDate| d.signed_duration_since(epoch).num_days();
 
-        let conn = open_rw(&paths::year_db_path(year))?;
-        focusflow_core::db::connection::ensure_schema(&conn, year)?;
-        conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let mut day = from - chrono::Duration::days(7);
-        while day <= to {
+        // 连打纪录必须跨过两周才测得出"周报用的尺子"：多播 27 天，让真实连续是 41 天，
+        // 而 14 天序列最多只能算出 14。
+        // 按天所属年份各写各的库（一天一个连接，测试里不必把 Connection 类型写出来）：
+        // 一月里跑这次用例时，多播的那几周属于上一个年份库，全塞进 `to` 那一年的库
+        // 就写错了地方，连续天数也就测不出效果。
+        const EXTRA_DAYS: i64 = 27;
+        let seed_day = |day: NaiveDate| -> anyhow::Result<()> {
+            let y = day.year();
+            let c = open_rw(&paths::year_db_path(y))?;
+            focusflow_core::db::connection::ensure_schema(&c, y)?;
             let k = dk(day);
             // 最后一天的键名带竖线：它必须被 md_cell 转义，否则表格列会被切断
             let key = if day == to { "a|b" } else { "鼠标左键" };
-            conn.execute_batch(&format!(
+            c.execute_batch(&format!(
                 "INSERT INTO daily_counts (date_key, count, seconds) VALUES ({k}, 30000, 3600);
                  INSERT OR REPLACE INTO key_counts (date_key, key_name, count) VALUES ({k}, '{key}', 20000);
                  INSERT OR REPLACE INTO key_counts (date_key, key_name, count) VALUES ({k}, 'A', 10000);
                  INSERT OR REPLACE INTO app_usage (date_key, app_name, seconds) VALUES ({k}, 'code.exe', 5400);
                  INSERT OR REPLACE INTO hourly_counts (date_key, hour, count) VALUES ({k}, 14, 9000);"
             ))?;
+            Ok(())
+        };
+        let mut day = from - chrono::Duration::days(7 + EXTRA_DAYS);
+        while day <= to {
+            seed_day(day)?;
             day += chrono::Duration::days(1);
         }
-        conn.execute_batch("COMMIT;")?;
-        drop(conn);
+        let seeded = EXTRA_DAYS + 14;
         queries::invalidate_years_cache();
 
         let path = write_weekly_report()?.expect("有数据时应生成文件");
@@ -469,6 +481,12 @@ mod tests {
         assert!(md.contains("| 14:00 |"), "14 时应有 7×9000 的聚合");
         // 键名转义：竖线必须成 \|，否则它会自成一个新的列分隔
         assert!(md.contains(r#"a\|b"#), "键名里的竖线必须转义：\n{md}");
+        // 连续天数必须与设置页同一把尺子：播了 `seeded` 个连续达标日，周报就得报出
+        // 这个数；喂 14 天序列的旧写法最多只能算出 14，这条会红。
+        assert!(
+            md.contains(&format!("连续 {seeded} 天")),
+            "周报的连续天数被 14 天序列截断了（应报 {seeded}）：\n{md}"
+        );
         assert!(md.contains("鼠标左键"));
         assert!(md.contains("code.exe"));
         // 重跑一次：同一周必须落在同一个文件（幂等，不产生第二份）

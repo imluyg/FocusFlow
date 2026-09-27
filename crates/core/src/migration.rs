@@ -175,7 +175,30 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
         for suffix in ["-wal", "-shm"] {
             let s = format!("{}{}", src_path.display(), suffix);
             if Path::new(&s).exists() {
-                let _ = std::fs::copy(&s, format!("{}{}", dst_path.display(), suffix));
+                let d = format!("{}{}", dst_path.display(), suffix);
+                if let Err(e) = std::fs::copy(&s, &d) {
+                    if suffix == "-shm" {
+                        // 共享内存索引，SQLite 会照着 WAL 自己重建：拿不到就算了
+                        tracing::debug!("跳过 {year} 年库的 -shm 副本: {e}");
+                        continue;
+                    }
+                    // `-wal` 不一样：那里面是**还没 checkpoint 进主库的记录**。吞掉它
+                    // （原来是 `let _ =`）会继续往下走、把整年总量报成"已导入"，
+                    // 并写下 `imported_src_*` 标记 —— 之后重导会被大小+mtime 与内容
+                    // 指纹比对直接跳过（见下面的 same_size / key_log 指纹），
+                    // 那一年最新的一段就永久拿不回来了。
+                    // 所以：回滚刚复制的主库、报错、**不写标记**。回滚是为了让重试仍走
+                    // 这条整体复制分支；留着半份库会让下次导入改走合并分支，
+                    // 而它读的是已复制过来的主库（正缺那段尾巴）。
+                    let _ = std::fs::remove_file(&dst_path);
+                    for extra in ["-wal", "-shm"] {
+                        let _ = std::fs::remove_file(format!("{}{}", dst_path.display(), extra));
+                    }
+                    return Err(anyhow::anyhow!(
+                        "复制 {year} 年库的 WAL 失败（{s} → {d}）: {e} —— \
+                         那里面可能还有未落盘记录，本次导入未完成，请重试"
+                    ));
+                }
             }
         }
         // 用 Rusqlite 打开确认可用 + 建聚合表 + 迁移旧格式数据
@@ -500,6 +523,59 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".import-backup-"))
             .collect();
         assert!(leftovers.is_empty(), "不该留下留档文件：{leftovers:?}");
+    }
+
+    /// 年度库整体复制时 `-wal` 复制失败**不许被吞掉**。
+    ///
+    /// 旧写法是 `let _ = std::fs::copy(..)`：主库复制成功、边文件失败（杀软/索引器占住、
+    /// 磁盘满、同步盘把它换成占位文件），而 `-wal` 里正是**还没 checkpoint 进主库**的那段
+    /// 新记录。吞掉之后流程照走 —— 报"导入 N 条"、并写下 `imported_src_*` 标记，
+    /// 而重导会被大小+mtime / 内容指纹比对跳过，那一年最新的一段就永久拿不回来了。
+    #[test]
+    fn failed_wal_copy_is_not_reported_as_imported() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("mig_wal_fail");
+        let data = crate::paths::data_dir();
+        let name = "focusflow_2031.db".to_string();
+
+        // 源：一个真年度库 + 一个带尾巴的 -wal
+        let src_dir = _dir.path().join("old");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join(&name);
+        {
+            let conn = Connection::open(&src).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE daily_counts (
+                    date_key INTEGER PRIMARY KEY,
+                    count INTEGER NOT NULL,
+                    seconds INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO daily_counts (date_key, count, seconds) VALUES (20000, 7, 7);",
+            )
+            .unwrap();
+        }
+        std::fs::write(format!("{}-wal", src.display()), b"un-checkpointed tail").unwrap();
+
+        // 目标位置的 -wal 先占成一个目录：往它上面 copy 必失败（不需要真杀软）
+        std::fs::create_dir_all(format!("{}-wal", data.join(&name).display())).unwrap();
+
+        let summary = import_legacy_data(&src_dir);
+
+        assert!(
+            summary.errors.iter().any(|e| e.contains("WAL")),
+            "WAL 复制失败必须报给用户，而不是被吞掉：{:?}",
+            summary.errors
+        );
+        assert!(
+            summary.year_dbs.is_empty() && summary.records_by_year.is_empty(),
+            "没导成就不该报「导入 N 条」：{:?}",
+            summary.records_by_year
+        );
+        assert!(
+            !data.join(&name).exists(),
+            "半份主库必须回滚：留着它，下次导入会改走合并分支，\
+             而它读的正是缺了那段尾巴的副本"
+        );
     }
 
     /// 真正的跨目录导入仍须照旧覆盖并留档（上一条的守卫不能顺手把正常路径也挡掉）。
