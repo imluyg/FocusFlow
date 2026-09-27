@@ -106,14 +106,52 @@ impl Drop for TestAppDir {
         crate::db::connection::clear_ro_cache();
         // 句柄释放有竞态（写线程先清 alive 标志、连接在其后析构）：remove
         // 撞上未释放的句柄会失败，重试几轮等它放干净；目录已经不在了就当成功。
-        for _ in 0..20 {
-            match std::fs::remove_dir_all(&self.dir) {
+        // 前 10 轮用普通路径，之后换成 `\\?\` 前缀再试 10 轮 —— 普通路径删不动
+        // 超过 MAX_PATH 的树（%TEMP% 里那棵常驻的 `ff_gd_src_*` 就是：某版
+        // `copy_data_tree` 还没闸自嵌套时建出来的 200 多层 `data/sub/data/sub/…`，
+        // 5215 个条目，`rm -rf` 与 `remove_dir_all` 都吃不下，从此谁都删不掉它）。
+        let mut last_err: Option<std::io::Error> = None;
+        for attempt in 0..20 {
+            let r = if attempt < 10 {
+                std::fs::remove_dir_all(&self.dir)
+            } else {
+                remove_dir_all_long(&self.dir)
+            };
+            match r {
                 Ok(()) => return,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
             }
         }
+        // 静默放弃过一次就被记成"账 33：那 1 项常驻"，查了两轮都没查出是谁留的。
+        // 删不掉要说出来，哪怕说的只是"我自己也删不动"。
+        if let Some(e) = last_err {
+            tracing::warn!("测试临时目录没删掉，留在 {}: {e}", self.dir.display());
+        }
     }
+}
+
+/// 与 `remove_dir_all` 同义，但先给路径挂上 `\\?\` 前缀 —— Windows 上绕开
+/// MAX_PATH（260）唯一的办法。前缀路径要求绝对、反斜杠、不做规范化，
+/// 所以这里先 `absolute` 再把 `/` 换掉。
+#[cfg(windows)]
+fn remove_dir_all_long(dir: &Path) -> std::io::Result<()> {
+    let abs = std::path::absolute(dir)?;
+    let s = abs.display().to_string().replace('/', "\\");
+    let prefixed = if s.starts_with("\\\\?\\") {
+        s
+    } else {
+        format!("\\\\?\\{s}")
+    };
+    std::fs::remove_dir_all(Path::new(&prefixed))
+}
+
+#[cfg(not(windows))]
+fn remove_dir_all_long(dir: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir_all(dir)
 }
 
 /// 建一个隔离的临时程序目录并切过去；返回值守着期间目录可用，离开作用域自动删除
