@@ -225,11 +225,27 @@ impl PluginManager {
     /// 将插件标记为错误并释放其 Lua 环境（保留条目供插件列表展示错误信息）。
     /// 超限后 Lua 状态不可信，跳过 cleanup 直接丢弃。
     fn mark_plugin_error(&mut self, name: &str, msg: String) {
+        // owner = 插件文件名（见 `host::claim_scheduler`），要在置空 lua 之前取出来。
+        // 必须在这里归还调度线程：Lua 侧唯一的归还入口是 `scheduler_shutdown()`，
+        // 而它跟着 `info.lua = None` 一起消失了；`unload_plugin` 也救不回来
+        //（它只在还有 lua 实例时才跑 cleanup）。不还不掉的后果不是"占点内存"：
+        // 插件页显示这个面板已停用，`Scheduler` 线程却为整个进程续命，
+        // 它登记的定时任务照旧到点 `CreateProcess` 启动程序 ——
+        // `scheduler_plugin.lua` 的注释早就把这条语义写死了：
+        // 「不叫这句，插件停用后定时任务仍会照常触发」。
+        let owner = self
+            .plugins
+            .get(name)
+            .map(|info| Self::stem_of(&info.file_path))
+            .unwrap_or_default();
         if let Some(info) = self.plugins.get_mut(name) {
             info.error = Some(msg.clone());
             info.lua = None;
             info.view = None;
             info.loaded = false;
+        }
+        if !owner.is_empty() {
+            host::release_scheduler(&owner);
         }
         tracing::error!("插件已停用: {name}: {msg}");
     }
@@ -1612,6 +1628,73 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
             host::scheduler_state_for_test(),
             None,
             "这次尝试登记下的 owner 必须销掉：表里没有它的插件，就再没人能归还"
+        );
+    }
+
+    /// 回归（第九扫 A1）：**超限停用**把调度线程的 owner 变成永久孤儿。
+    ///
+    /// `mark_plugin_error` 原来只置 `info.lua = None` 就完事 —— 而 Lua 侧唯一的归还
+    /// 入口（`scheduler_shutdown()`）跟着那个状态一起消失，`unload_plugin` 也只在还有
+    /// lua 实例时才跑 cleanup。后果不是占点内存：插件页显示这个面板"已停用"，
+    /// `Scheduler` 线程却为整个进程续命，它登记的定时任务照旧到点启动程序
+    /// （`scheduler_plugin.lua` 的注释自己就写着"不叫这句，插件停用后定时任务仍会照常触发"）。
+    ///
+    /// 夹具：`init` 里先 claim（`scheduler_tasks`），`get_view` 里跑一条有界大循环，
+    /// 临时 `config.ini` 把 `instruction_limit` 压到 3000 ⇒ 渲染必然超限。
+    #[test]
+    fn an_over_limit_disable_does_not_orphan_the_scheduler_owner() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("limit_owner");
+        std::fs::write(
+            tmp.path().join("config.ini"),
+            "[plugins]\ninstruction_limit = 3000\n",
+        )
+        .unwrap();
+        write_lua(
+            &tmp.path().join("plugins"),
+            "hog",
+            r###"
+PLUGIN_NAME = "超限甲"
+function init() focusflow.scheduler_tasks() end
+function cleanup() focusflow.scheduler_shutdown() end
+function get_view()
+  local n = 0
+  for i = 1, 200000 do n = n + i end
+  return { title = "超限甲", widgets = { {type="label", text=tostring(n)} } }
+end
+"###,
+        );
+        let mut pm = manager_in(tmp.path());
+        pm.load_all();
+        // 调度线程槽是**进程全局**的，同二进制里并行跑的用例也可能各占一个 owner
+        // ⇒ 前提只看"至少登记了一个"，归还之后才断精确的 None（那才是要钉的东西）。
+        assert!(
+            host::scheduler_state_for_test()
+                .map(|n| n >= 1)
+                .unwrap_or(false),
+            "前提：init 里那句 scheduler_tasks 该把 owner 登记上"
+        );
+
+        let r = pm.refresh_view("超限甲");
+        assert!(r.is_err(), "超限那次渲染该报错，实得 {r:?}");
+        assert!(
+            pm.get_plugin("超限甲")
+                .map(|p| !p.loaded && p.error.is_some())
+                .unwrap_or(false),
+            "插件必须被停用（表里留着错误信息）"
+        );
+        assert_eq!(
+            host::scheduler_state_for_test(),
+            None,
+            "停用必须同时归还 owner：Lua 状态一没，就再没有别的归还入口了"
+        );
+
+        // 反向腿：正常停用（没超限的那条路）仍然要能回收
+        pm.unload_plugin("超限甲");
+        assert_eq!(
+            host::scheduler_state_for_test(),
+            None,
+            "对一个已停用条目再卸载不该 panic，也不该把 owner 留下"
         );
     }
 
