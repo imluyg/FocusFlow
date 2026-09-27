@@ -644,7 +644,13 @@ pub fn show_main_window(app: &tauri::AppHandle) {
                     MAIN_CREATING.store(false, Ordering::SeqCst);
                 }
             })
-            .map_err(|e| tracing::error!("启动主窗口创建线程失败（该功能不可用）: {e}"))
+            .map_err(|e| {
+                // 线程压根就没起来 ⇒ 线程体里那两处复位永远轮不到执行。不在这里补上，
+                // MAIN_CREATING 永久为真，之后每次点面板都在最上面直接 return，
+                // 主窗口再也打不开——而这次失败本身只留下一行日志。
+                MAIN_CREATING.store(false, Ordering::SeqCst);
+                tracing::error!("启动主窗口创建线程失败（该功能不可用）: {e}")
+            })
             .ok();
         return;
     }
@@ -963,6 +969,37 @@ fn restart_depth_from_args() -> u32 {
     0
 }
 
+/// [`restart_decision`] 的结论。
+#[derive(Debug)]
+enum RestartDecision {
+    /// 该安排这一跳，`next_depth` 是新进程要带的重启链深度（名额已占住）
+    Proceed { next_depth: u32 },
+    /// 名额被**真在途**的那次占着，这次不重复安排
+    AlreadyScheduled,
+    /// 自动重启链到顶：放弃，并且**不占**名额
+    DepthExhausted { depth: u32 },
+}
+
+/// 这一跳到底要不要安排 —— 判据顺序本身就是修复：**先过深度闸，再占名额**。
+///
+/// 反过来写（先 `swap` 占名额、后判深度）时，一次"深度到顶、压根没打算拉起新进程"
+/// 的自动重试会把本进程唯一的重启名额吃掉；之后用户主动换目录那一跳就被同一个
+/// 名额以"本进程已经安排过一次重启"为由拒绝：配置已写、进程不重启，新目录要等
+/// 下次自然启动才生效，而给出的理由指向的是一次从未真正尝试过的安排。
+///
+/// `scheduled` 由参数注入（而不是直接引用静态量），是为了让"到顶那次没占名额"
+/// 这件事在无头、无 AppHandle 的条件下可断言。
+fn restart_decision(scheduled: &AtomicBool, user_initiated: bool, depth: u32) -> RestartDecision {
+    if !user_initiated && depth >= MAX_RESTART_DEPTH {
+        return RestartDecision::DepthExhausted { depth };
+    }
+    let next_depth = if user_initiated { 0 } else { depth + 1 };
+    if scheduled.swap(true, Ordering::SeqCst) {
+        return RestartDecision::AlreadyScheduled;
+    }
+    RestartDecision::Proceed { next_depth }
+}
+
 /// 自动重启应用（WebView2 环境损坏等无法在线恢复的场景）：
 /// 后台线程延迟几秒后拉起新进程（当前 exe，数据目录解析与本次一致），
 /// 当前进程干净退出——退出路径完成 flush/备份，未落库增量由恢复文件兜底。
@@ -978,23 +1015,27 @@ fn restart_depth_from_args() -> u32 {
 /// 配置已写、进程却不重启，新目录要等到下次自然启动才生效，而中间这段按键全落在
 /// 旧目录里；它同时把重启链深度归零，因为这一跳是"新起点"而不是又一轮恢复重试，
 /// 不该把新进程里的恢复重启额度提前吃掉。两条路径共用 `RESTART_SCHEDULED`：
-/// 一个进程只准拉起一个新进程，这个不变量与触发原因无关。
+/// 一个进程只准拉起一个新进程，这个不变量与触发原因无关；但**被深度闸拒绝的那一次
+/// 不占名额**——它压根不会拉起任何进程，占名额等于把这一跳的额度白送给一次
+/// 不存在的尝试（判据顺序见 [`restart_decision`]）。
 ///
 /// 返回值只说明"这一跳有没有安排上"（占住重启序号、重启线程起得来）。线程里
 /// 3 秒后真的拉不起新进程是调用方拿不到的 —— 那种情况下程序继续按旧目录记录，
 /// 而配置里的迁移标记留着，下次自然启动照样会把数据搬过去。
 pub(crate) fn schedule_app_restart(app: &tauri::AppHandle, user_initiated: bool) -> bool {
-    if RESTART_SCHEDULED.swap(true, Ordering::SeqCst) {
-        tracing::warn!("本进程已经安排过一次重启，这次不再重复安排");
-        return false;
-    }
     let depth = restart_depth_from_args();
-    if !user_initiated && depth >= MAX_RESTART_DEPTH {
-        tracing::error!("自动重启已达上限（深度 {depth}），放弃重启：直接显示空白窗口");
-        reveal_main_window(app);
-        return false;
-    }
-    let next_depth = if user_initiated { 0 } else { depth + 1 };
+    let next_depth = match restart_decision(&RESTART_SCHEDULED, user_initiated, depth) {
+        RestartDecision::AlreadyScheduled => {
+            tracing::warn!("本进程已经安排过一次重启，这次不再重复安排");
+            return false;
+        }
+        RestartDecision::DepthExhausted { depth } => {
+            tracing::error!("自动重启已达上限（深度 {depth}），放弃重启：直接显示空白窗口");
+            reveal_main_window(app);
+            return false;
+        }
+        RestartDecision::Proceed { next_depth } => next_depth,
+    };
     let handle = app.clone();
     std::thread::Builder::new()
         .name("app-restart".into())
@@ -2013,5 +2054,82 @@ mod compute_charts_tests {
         assert_eq!(alltime_total_now(1000, 100, 100), 1000, "无新增：等于基准");
         assert_eq!(alltime_total_now(1000, 100, 130), 1030, "新增 30 次即计入");
         assert_eq!(alltime_total_now(1000, 100, 0), 1000, "计数回退不减基准");
+    }
+}
+
+#[cfg(test)]
+mod restart_gate_tests {
+    use super::{restart_decision, RestartDecision, MAX_RESTART_DEPTH};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// 到深度上限的那一次**不占名额**。
+    ///
+    /// 回归：原来先 `RESTART_SCHEDULED.swap(true)` 再判深度，于是"深度到顶、压根
+    /// 不会拉起新进程"的自动重试把本进程唯一的重启名额白吃了；之后用户主动换
+    /// 数据目录那一跳被同一个名额以"本进程已经安排过一次重启"顶回去 —— 配置已写、
+    /// 进程不重启，新目录要等下次自然启动才生效，而拒绝理由指向的是一次从未发生的安排。
+    #[test]
+    fn a_depth_refused_attempt_leaves_the_one_restart_slot_unused() {
+        let slot = AtomicBool::new(false);
+        let refused = restart_decision(&slot, false, MAX_RESTART_DEPTH);
+        assert!(
+            matches!(refused, RestartDecision::DepthExhausted { depth }
+                     if depth == MAX_RESTART_DEPTH),
+            "深度到顶该判成 DepthExhausted，实际 {refused:?}"
+        );
+        assert!(
+            !slot.load(Ordering::SeqCst),
+            "这一次不会拉起任何进程，不许占住本进程唯一的重启名额"
+        );
+        // 名额还在 ⇒ 用户主动那一跳照样安排得上，并把深度归零（新起点）
+        let user = restart_decision(&slot, true, MAX_RESTART_DEPTH);
+        assert!(
+            matches!(user, RestartDecision::Proceed { next_depth: 0 }),
+            "用户主动换目录不该被深度上限拒绝，实际 {user:?}"
+        );
+    }
+
+    /// 自动重启链：放行的一跳占住名额并把深度 +1 带进新进程，同进程第二次不再安排
+    /// （多个恢复线程各拉一个进程会互相撞单实例锁，结果两个进程都没了）。
+    #[test]
+    fn an_auto_attempt_burns_the_slot_and_increments_depth() {
+        let slot = AtomicBool::new(false);
+        let first = restart_decision(&slot, false, 0);
+        assert!(
+            matches!(first, RestartDecision::Proceed { next_depth: 1 }),
+            "深度 0 的自动重试应放行并带 next_depth=1，实际 {first:?}"
+        );
+        assert!(slot.load(Ordering::SeqCst), "真在途的这一次必须占住名额");
+        let second = restart_decision(&slot, false, 0);
+        assert!(
+            matches!(second, RestartDecision::AlreadyScheduled),
+            "名额已占，同一进程不再安排第二次，实际 {second:?}"
+        );
+        let third = restart_decision(&slot, true, 0);
+        assert!(
+            matches!(third, RestartDecision::AlreadyScheduled),
+            "「一个进程只准拉起一个新进程」与触发原因无关，实际 {third:?}"
+        );
+    }
+
+    /// 深度闸的边界：正好差一跳（`MAX-1`）时放行，且那一跳会把新进程带到上限；
+    /// 上限那一跳本身被拒绝。
+    #[test]
+    fn depth_gate_trips_on_the_last_hop_only() {
+        let slot = AtomicBool::new(false);
+        let last = restart_decision(&slot, false, MAX_RESTART_DEPTH - 1);
+        assert!(
+            matches!(last, RestartDecision::Proceed { next_depth }
+                     if next_depth == MAX_RESTART_DEPTH),
+            "还差一跳时该放行，实际 {last:?}"
+        );
+        let slot2 = AtomicBool::new(false);
+        assert!(
+            matches!(
+                restart_decision(&slot2, false, MAX_RESTART_DEPTH),
+                RestartDecision::DepthExhausted { .. }
+            ),
+            "到了上限就该停下"
+        );
     }
 }
