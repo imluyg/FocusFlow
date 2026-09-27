@@ -725,6 +725,12 @@ pub fn cleanup_old_data(keep_days: i64) -> CleanupReport {
     };
     for year in years {
         let path = paths::year_db_path(year);
+        // 探测之前先补齐表结构：`min_stale_date_key` 要遍历 DATA_TABLES 全部六张表，
+        // 而 2026-09-21 之前的年度库只有四张（`device_counts` / `device_key_counts`
+        // 还没出生）。那条查询的 `?` 会把"没有这两张表"报成探测失败 ⇒ 这一年被记进
+        // failed_years，CLI 退非 0，而**没有任何路径会去补建它们**（GUI 只在写入时才
+        // ensure_schema）⇒ 一次清理命令变成永久失败。清理本来就是要写这个库的维护
+        // 命令，顺手把结构补齐是它该做的事。
         let conn = match connection::open_rw(&path) {
             Ok(c) => c,
             Err(e) => {
@@ -733,6 +739,11 @@ pub fn cleanup_old_data(keep_days: i64) -> CleanupReport {
                 continue;
             }
         };
+        if let Err(e) = connection::ensure_schema(&conn, year) {
+            tracing::error!("{year} 年库补表结构失败，本年度未清理: {e}");
+            report.failed_years.push(year);
+            continue;
+        }
         // 探测必须发生在 BEGIN IMMEDIATE 之后：事务外先查后删之间，写入线程仍可
         // 把过期增量落进库，那一行就会被「无快照删除」掉。拿到写锁后再探测，
         // 探测结果与随后的 DELETE 之间就不可能有别人插队。
@@ -3857,6 +3868,59 @@ mod tests {
             2,
             "两条探测都读不出来时要有两条话: {:?}",
             worse.probe_errors
+        );
+    }
+
+    /// 回归（B 道第七扫 B5）：清理命令遇上"只有四张表"的老年度库会**永久失败**。
+    /// `min_stale_date_key` 要遍历 `DATA_TABLES` 全部六张，而那条查询的 `?` 把
+    /// "表不存在"报成探测失败 ⇒ 该年进 `failed_years`、CLI 退非 0，而没有任何路径
+    /// 会补建这两张表（GUI 只在真要写入时才 `ensure_schema`）。清理本来就是要把这个
+    /// 库改写的维护命令 ⇒ 探测之前先把表结构补齐，失败仍然照 `failed_years` 走。
+    ///
+    /// 探测本身不静默：那一臂原来就会 `tracing::error!` 并计入 `failed_years`
+    /// （注释还写着"当成有过期行去删是盲删、当成没有是静默漏删"），所以这条**不是**
+    /// 吞失败那一族，是"永久失败没人修"。
+    #[test]
+    fn cleanup_self_upgrades_a_year_db_missing_the_device_tables() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("cleanup_oldfmt");
+        crate::db::queries::invalidate_years_cache();
+        let year = Local::now().year() - 2;
+        let path = paths::year_db_path(year);
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (1, 5, 5)",
+                [],
+            )
+            .unwrap();
+            // 退回 2026-09-21 之前的形态：设备两张表还没出生
+            conn.execute("DROP TABLE device_key_counts", []).unwrap();
+            conn.execute("DROP TABLE device_counts", []).unwrap();
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        // 前提：这张库确实探测不动（缺表 ⇒ 旧实现把它记成 failed_years）
+        assert!(
+            !connection::table_exists_readonly(&path, "device_counts"),
+            "夹具不对：device_counts 还在，测不到缺表那一支"
+        );
+        crate::db::queries::invalidate_years_cache();
+
+        let report = cleanup_old_data(1);
+        assert!(
+            !report.failed_years.contains(&year),
+            "{year} 年库不该因为缺表就永远清理失败: {:?}",
+            report.failed_years
+        );
+        assert!(
+            report.deleted >= 1,
+            "date_key=1 早于保留窗口，要真删掉一条才算走通，实得 {}",
+            report.deleted
+        );
+        assert!(
+            connection::table_exists_readonly(&path, "device_counts"),
+            "清理该把缺的两张表补上，否则下一次还是同一个坑"
         );
     }
 }
