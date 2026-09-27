@@ -14,12 +14,28 @@ const RUN_REG_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_APPROVED_PATH: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 
+/// 启动文件夹。
 fn startup_dir() -> PathBuf {
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Startup")
-    } else {
-        PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()))
-            .join(r"Microsoft\Windows\Start Menu\Programs\Startup")
+    startup_dir_from(
+        std::env::var("APPDATA").ok(),
+        std::env::var("USERPROFILE").ok(),
+    )
+}
+
+/// 纯函数版的启动文件夹（`APPDATA` / `USERPROFILE` 由调用方给，便于用例钉回退分支）。
+///
+/// 回退分支不能直接拼 `%USERPROFILE%\Microsoft\...`：真正的启动文件夹在
+/// `%USERPROFILE%\AppData\Roaming\Microsoft\...` 下面，少了 `AppData\Roaming` 这一段时
+/// 快捷方式照样建得成、`is_autostart_enabled` 也照样在同一个错目录里读得到它 ——
+/// 于是层面报"已启用开机自启"，而 Explorer 从来不去那个目录，开机什么都不发生，
+/// 且没有任何一处说谎话（这比失败更难查）。
+fn startup_dir_from(appdata: Option<String>, userprofile: Option<String>) -> PathBuf {
+    const REL: &str = r"Microsoft\Windows\Start Menu\Programs\Startup";
+    match appdata {
+        Some(appdata) => PathBuf::from(appdata).join(REL),
+        None => PathBuf::from(userprofile.unwrap_or_else(|| ".".to_string()))
+            .join(r"AppData\Roaming")
+            .join(REL),
     }
 }
 
@@ -350,6 +366,30 @@ mod tests {
         std::fs::write(&p, []).unwrap();
         assert_eq!(shortcut_target_at(&p), None);
         assert_eq!(shortcut_target_at(&dir.path().join("missing.lnk")), None);
+    }
+
+    /// B 道：`APPDATA` 没设时的回退分支必须还带 `AppData\Roaming`。
+    ///
+    /// 少了这一段时快捷方式建在 Explorer 永远不去的目录里，而 `is_autostart_enabled`
+    /// 读的是同一个错目录 —— 于是"已启用开机自启"是真的（文件确实在），开机自启是假的，
+    /// 且没有任何一处说出矛盾在哪。两条分支必须指向同一个目录（`APPDATA` 的默认值正是
+    /// `%USERPROFILE%\AppData\Roaming`）。
+    #[test]
+    fn startup_dir_fallback_points_at_the_real_startup_folder() {
+        let via_appdata = startup_dir_from(Some(r"C:\Users\t\AppData\Roaming".to_string()), None);
+        let via_profile = startup_dir_from(None, Some(r"C:\Users\t".to_string()));
+        assert_eq!(
+            via_profile,
+            PathBuf::from(
+                r"C:\Users\t\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+            )
+        );
+        assert_eq!(
+            via_appdata, via_profile,
+            "两个环境变量必须指到同一个启动文件夹"
+        );
+        // 两个都没有时不能 panic（拿到 "." 也比崩好）
+        assert!(startup_dir_from(None, None).is_relative());
     }
 
     /// 端到端跑一遍**真的** PowerShell 建链接流程（此前从没执行过：测试只碰启动

@@ -311,7 +311,7 @@ impl PomodoroTimer {
             return;
         }
         if let Some(session) = pending {
-            persist_session(&session);
+            persist_session(&self.state, &session);
         }
         tracing::info!("番茄钟开始工作");
     }
@@ -337,7 +337,7 @@ impl PomodoroTimer {
             return;
         }
         if let Some(session) = pending {
-            persist_session(&session);
+            persist_session(&self.state, &session);
         }
         tracing::info!("番茄钟开始休息");
     }
@@ -386,7 +386,7 @@ impl PomodoroTimer {
             p
         };
         if let Some(session) = pending {
-            persist_session(&session);
+            persist_session(&self.state, &session);
         }
         tracing::info!("番茄钟已停止");
     }
@@ -408,7 +408,7 @@ impl PomodoroTimer {
         };
         self.stop.store(true, Ordering::SeqCst);
         if let Some(session) = pending {
-            persist_session(&session);
+            persist_session(&self.state, &session);
         }
     }
 }
@@ -468,16 +468,24 @@ fn take_current(s: &mut TimerState) -> Option<Session> {
     if session.actual_seconds <= 0 {
         return None;
     }
-    if s.state == STATE_WORK {
-        s.work_finished += 1;
-    }
     Some(session)
 }
 
-/// 出锁后落盘 `take_current` 交出来的那一段。
-fn persist_session(session: &Session) {
+/// 出锁后落盘 `take_current` 交出来的那一段，**真的落进库才计一个番茄**。
+///
+/// 原来 `take_current` 在锁内就先 `work_finished += 1`，写库失败只留一句
+/// `tracing::error!`：内存里的计数与库里的行数从此永久分叉 —— 卡片上"今日完成 4 个"
+/// 而库里只有 3 行，重启后按库行数读数就无声缩水。改成两边同轨：库里有这一行才算数。
+fn persist_session(state: &Mutex<TimerState>, session: &Session) {
     if let Err(e) = save_session(session) {
-        tracing::error!("保存番茄钟记录失败: {e}");
+        tracing::error!("保存番茄钟记录失败: {e}（本次不计入已完成番茄数）");
+        return;
+    }
+    if session.rtype == STATE_WORK && session.actual_seconds >= 1 {
+        state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .work_finished += 1;
     }
 }
 
@@ -506,6 +514,52 @@ fn advance_stage_seconds(remaining: i64, elapsed: i64, delta: i64) -> (i64, i64)
     (remaining - step, elapsed + step)
 }
 
+/// 推进一轮计时：锁内只做纯内存的计时与状态推进，返回**出锁后**要落盘的那一段。
+///
+/// `delta` 与 `now_wall` 由调用方传进来而不是在这里读时钟：想钉"墙钟跳变""锁中毒后
+/// 还在不在走"这类场景，靠线程里真 sleep 是钉不出来的。
+///
+/// 一轮最多跨过**一个**阶段：`delta` 超出本段剩余值的部分整段丢弃（见
+/// [`advance_stage_seconds`]）。合盖睡两小时醒来只补一次切换，中间那几段既不计完成
+/// 也不落记录 —— 这是刻意保留的：继续往下跨就会把睡着的时间逐段结算成番茄与专注时长。
+fn tick_once(
+    state: &Mutex<TimerState>,
+    delta: i64,
+    now_wall: chrono::DateTime<Local>,
+) -> Option<Session> {
+    // 取锁一律 `unwrap_or_else(into_inner)`。这里原先是全文件唯一的例外
+    // （`match state.lock() { Err(_) => continue }`）：std 的中毒是**永久**的，
+    // 一旦有人在持锁时 panic，计时线程就从此每轮 continue —— 倒计时卡住、永不落库、
+    // 零日志，而其余取锁处照常工作，界面上只剩"番茄钟不动了"这一个现象。
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    if s.state == STATE_IDLE || s.paused {
+        return None;
+    }
+    let (remaining, elapsed) = advance_stage_seconds(s.remaining, s.elapsed, delta);
+    s.remaining = remaining;
+    s.elapsed = elapsed;
+    if s.remaining > 0 {
+        return None;
+    }
+    // 阶段完成。番茄计数不在这里加：落库成功才加（见 `persist_session`）。
+    let session = build_session(&s);
+    if s.state == STATE_WORK && s.auto_break {
+        s.state = STATE_BREAK.to_string();
+        s.planned = s.break_minutes * 60;
+        s.remaining = s.planned;
+        s.elapsed = 0;
+        s.key_count = 0;
+        s.start_time = now_wall.format("%Y-%m-%d %H:%M:%S").to_string();
+    } else {
+        s.state = STATE_IDLE.to_string();
+        s.paused = false;
+        s.remaining = 0;
+        s.elapsed = 0;
+        s.key_count = 0;
+    }
+    session
+}
+
 /// 后台计时循环（每秒 tick）。
 fn tick_loop(state: Arc<Mutex<TimerState>>, stop: Arc<AtomicBool>) {
     let mut last_tick = Local::now();
@@ -516,48 +570,10 @@ fn tick_loop(state: Arc<Mutex<TimerState>>, stop: Arc<AtomicBool>) {
         // 第一次 tick 会把"暂停期间过去的时间"整个算进这一段
         let delta = tick_delta_seconds(&last_tick, &now_wall);
         last_tick = now_wall;
-        // 锁内只做纯内存的计时与状态推进；阶段完成时要写的记录攒到出锁后落盘。
-        // 原先是持锁 INSERT：SQLite 的 busy_timeout 是 15 秒，一旦库被占住，
-        // 主线程每次按键的 record_key（抢同一把锁）都会跟着卡住整个界面。
-        let session = {
-            let mut s = match state.lock() {
-                Ok(g) => g,
-                Err(_) => continue,
-            };
-            if s.state == STATE_IDLE || s.paused {
-                continue;
-            }
-            let (remaining, elapsed) = advance_stage_seconds(s.remaining, s.elapsed, delta);
-            s.remaining = remaining;
-            s.elapsed = elapsed;
-            if s.remaining > 0 {
-                continue;
-            }
-            // 阶段完成
-            let session = build_session(&s);
-            if s.state == STATE_WORK && session.as_ref().is_some_and(|x| x.actual_seconds >= 1) {
-                s.work_finished += 1;
-            }
-            if s.state == STATE_WORK && s.auto_break {
-                s.state = STATE_BREAK.to_string();
-                s.planned = s.break_minutes * 60;
-                s.remaining = s.planned;
-                s.elapsed = 0;
-                s.key_count = 0;
-                s.start_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            } else {
-                s.state = STATE_IDLE.to_string();
-                s.paused = false;
-                s.remaining = 0;
-                s.elapsed = 0;
-                s.key_count = 0;
-            }
-            session
-        };
-        if let Some(session) = session {
-            if let Err(e) = save_session(&session) {
-                tracing::error!("保存番茄钟记录失败: {e}");
-            }
+        // 落盘排在出锁之后：原先是持锁 INSERT，而 SQLite 的 busy_timeout 是 15 秒，
+        // 一旦库被占住，主线程每次按键的 record_key（抢同一把锁）都会跟着卡住整个界面。
+        if let Some(session) = tick_once(&state, delta, now_wall) {
+            persist_session(&state, &session);
         }
     }
 }
@@ -589,6 +605,96 @@ mod tests {
         );
         assert!(get_recent_sessions(10).is_empty(), "不该落进历史记录");
         assert_eq!(t.get_state_info()["work_finished"], 0, "不该算完成一个番茄");
+    }
+
+    /// 锁中毒之后计时必须继续按秒推进。
+    ///
+    /// `tick_once` 原先是全文件唯一写成 `match state.lock() { Err(_) => continue }` 的
+    /// 取锁处，而 std 的中毒是**永久**的：一次持锁 panic 之后计时线程从此每轮空转 ——
+    /// 倒计时卡住、永不落库、零日志，其余取锁处照常工作，界面上只剩"番茄钟不动了"。
+    #[test]
+    fn tick_advances_after_the_state_lock_is_poisoned() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("pomo_poison");
+        init_db().ok();
+
+        let state = Mutex::new(TimerState {
+            state: STATE_WORK.to_string(),
+            planned: 30 * 60,
+            remaining: 30 * 60,
+            ..Default::default()
+        });
+        // 夹具：持锁时 panic，把 Mutex 打成中毒（之后每次 lock() 都返回 Err）
+        let panicked = std::panic::catch_unwind(|| {
+            let _g = state.lock().unwrap();
+            panic!("用例制造的中锁 panic");
+        });
+        assert!(
+            panicked.is_err() && state.is_poisoned(),
+            "夹具没造出中毒状态，后面的断言就没有意义"
+        );
+
+        for _ in 1..=3 {
+            tick_once(&state, 1, Local::now());
+        }
+        let remaining = state.lock().unwrap_or_else(|e| e.into_inner()).remaining;
+        assert_eq!(
+            remaining,
+            30 * 60 - 3,
+            "锁中毒后倒计时仍要按秒推进（旧写法会永久停在 1800）"
+        );
+    }
+
+    /// 落库失败的那一段不算「今日完成」。
+    ///
+    /// 原来 `take_current` 在锁内先 `work_finished += 1`，再由调用方写库，写库失败只留
+    /// 一句 `tracing::error!`：内存计数与库里的行数从此永久分叉 —— 卡片上 4 个、库里
+    /// 3 行，重启后按库行数读数就无声缩水。现在两边同轨：库里有这一行才算一个。
+    #[test]
+    fn save_failure_does_not_credit_a_pomodoro() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("pomo_savefail");
+        init_db().ok();
+        // 把会话表打掉：open_local 仍建得起库，INSERT 必失败 —— 这就是"写库失败"的形状
+        {
+            let conn = open_local().unwrap();
+            conn.execute("DROP TABLE pomodoro_sessions", []).unwrap();
+        }
+
+        let t = PomodoroTimer::new();
+        t.start_work();
+        // 真的推进 5 秒：零秒会话在 take_current 里就被拦掉，绕不开要验的这条路径
+        tick_once(&t.state, 5, Local::now());
+        t.stop();
+        t.shutdown();
+
+        assert_eq!(
+            t.get_state_info()["work_finished"],
+            0,
+            "没落进库的一段不该算完成一个番茄"
+        );
+    }
+
+    /// 反面对照：保证上一条不是"根本没走到落库"造成的假红 —— 表在、落库成功时，
+    /// 同一条路径必须正好计出一个番茄、库里正好一行。
+    #[test]
+    fn saved_session_credits_one_pomodoro() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("pomo_saveok");
+        init_db().ok();
+
+        let t = PomodoroTimer::new();
+        t.start_work();
+        tick_once(&t.state, 5, Local::now());
+        t.stop();
+        t.shutdown();
+
+        assert_eq!(
+            t.get_state_info()["work_finished"],
+            1,
+            "落库成功要计一个番茄"
+        );
+        assert_eq!(get_recent_sessions(10).len(), 1, "库里要留下那一行");
     }
 
     /// 一天最后一秒里开始的会话必须查得到。

@@ -919,14 +919,27 @@ fn ensure_connection(
     }
     // 换年或首次：重建连接
     *conn = None;
-    let path = paths::year_db_path(year);
-    let new_conn = connection::open_rw(&path)
-        .map_err(|e| format!("打开 {year} 年库 {} 失败: {e:#}", path.display()))?;
-    connection::ensure_schema(&new_conn, year)
-        .map_err(|e| format!("初始化 {year} 年库结构失败: {e:#}"))?;
+    let new_conn = open_year_db(year)?;
+    ensure_year_schema(&new_conn, year)?;
     *conn = Some(new_conn);
     *conn_year = year;
     Ok(())
+}
+
+/// 打开某年的年度库（只开库，不建表）。
+///
+/// 拆成两步、各自带**属于自己那一步**的措辞：开库失败（路径是目录、文件不是 SQLite、
+/// 目录只读）与建表失败（能打开却写不进去）在日志里必须是两种说法，否则排查时
+/// 分不清是路径问题还是库被占住。
+fn open_year_db(year: i32) -> Result<Connection, String> {
+    let path = paths::year_db_path(year);
+    connection::open_rw(&path)
+        .map_err(|e| format!("打开 {year} 年库 {} 失败: {e:#}", path.display()))
+}
+
+/// 在已经打开的年度库上补齐表结构。
+fn ensure_year_schema(conn: &Connection, year: i32) -> Result<(), String> {
+    connection::ensure_schema(conn, year).map_err(|e| format!("初始化 {year} 年库结构失败: {e:#}"))
 }
 
 /// date_key（本地天数序号）落在哪一年。
@@ -1111,6 +1124,7 @@ fn normalize_device_keys(pending: &AggDeltas) -> AggDeltas {
 /// 统计表字典化后只存 id，漏登记会让查询侧 JOIN 静默丢行、凭空少掉设备数据，
 /// 所以这里宁可补一条占位登记，也不放弃计数。
 fn device_id_in_db(
+    conn: &Connection,
     upsert: &mut rusqlite::Statement<'_>,
     dev: &str,
     meta: Option<&DeviceMeta>,
@@ -1120,18 +1134,36 @@ fn device_id_in_db(
     // 于是会把 `\\?\HID#VID_046D&PID_C52B&MI_00#8&...` 直接顶到设备排行上。
     // 正常路径还有 `preload_device_meta`（启动时读登记表）+ 设备首个事件的双重保障，
     // 走到这里的多半是恢复回放后仍未取到真名的时段。
+    // B14-2：落库前先把键归一到身份段 —— 升级前崩溃留下的恢复文件里可能还是旧版
+    // 完整实例路径（身份键经身份函数原样返回，正常路径无副作用）。
+    let dev = crate::device_alias::hardware_identity_key(dev);
+    if meta.is_none() {
+        // 这一轮拿不到登记信息，而库里**已经有**这一行：只取 id，不动 name/kind。
+        // UPSERT 是 `name = excluded.name` 的无条件覆盖，照写就会把上一轮存下的真名
+        // 换成回退名、kind 换成 unknown —— 而 `preload_device_meta` 打不开当年库时
+        // 是整条链路静默早退（表不存在 / open_ro 失败 / prepare 失败都直接 return），
+        // 一次瞬时占用就能让全部设备的名字当场退化，日志一个字没有。
+        // 占位登记只在行还不存在时才补（统计表只存 id，漏登记会让查询侧 JOIN 丢行）。
+        use rusqlite::OptionalExtension;
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM devices WHERE device_key = ?1",
+                [&dev],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+    }
     let fallback_name;
     let (name, kind) = match meta {
         Some(m) => (m.name.as_str(), m.kind.as_str()),
         None => {
-            fallback_name = queries::fallback_device_name(dev);
+            fallback_name = queries::fallback_device_name(&dev);
             (fallback_name.as_str(), "unknown")
         }
     };
-    // B14-2：升级前崩溃留下的恢复文件里可能还是旧版完整实例路径 ——
-    // 先归一到身份段再登记，别让一次回放凭空多出一行旧路径键
-    // （身份键经身份函数原样返回，正常路径无副作用）。
-    let dev = crate::device_alias::hardware_identity_key(dev);
     upsert.query_row(rusqlite::params![dev, name, kind], |r| r.get(0))
 }
 
@@ -1168,7 +1200,7 @@ fn flush_partition(
                     )?;
                     for dev in pending.device_meta.keys() {
                         let meta = pending.device_meta.get(dev);
-                        let id = device_id_in_db(&mut upsert, dev, meta)?;
+                        let id = device_id_in_db(&*c, &mut upsert, dev, meta)?;
                         dev_ids.insert(dev.as_str(), id);
                     }
                     // 统计行出现、登记缺失的设备（历史库/恢复文件）兜底补登，
@@ -1182,7 +1214,8 @@ fn flush_partition(
                         if dev_ids.contains_key(dev.as_str()) {
                             continue;
                         }
-                        let id = device_id_in_db(&mut upsert, dev, pending.device_meta.get(dev))?;
+                        let id =
+                            device_id_in_db(&*c, &mut upsert, dev, pending.device_meta.get(dev))?;
                         dev_ids.insert(dev.as_str(), id);
                     }
                 }
@@ -2010,7 +2043,7 @@ mod tests {
              RETURNING id";
 
         let mut upsert = conn.prepare(UPSERT).unwrap();
-        let id = device_id_in_db(&mut upsert, DEV, None).unwrap();
+        let id = device_id_in_db(&conn, &mut upsert, DEV, None).unwrap();
         drop(upsert);
         assert!(id > 0, "补登必须拿到整数 id");
         let name: String = conn
@@ -2025,7 +2058,7 @@ mod tests {
             kind: "mouse".to_string(),
         };
         let mut upsert = conn.prepare(UPSERT).unwrap();
-        let id2 = device_id_in_db(&mut upsert, DEV, Some(&real)).unwrap();
+        let id2 = device_id_in_db(&conn, &mut upsert, DEV, Some(&real)).unwrap();
         drop(upsert);
         assert_eq!(id2, id, "补名必须命中同一登记行");
         let (name2, kind2): (String, String) = conn
@@ -2040,6 +2073,102 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1, "同一设备只登记一行");
 
+        drop(conn);
+    }
+
+    /// A 道⑥：批次里只有计数、没有登记信息时，**不许把库里已有的真名降级**成回退名 + unknown。
+    ///
+    /// 上一场悬着的可达路径在这里钉死了：`devices` 的 UPSERT 是 `name = excluded.name`
+    /// 的无条件覆盖，而 `preload_device_meta` 的三条早退（表不存在 / `open_ro` 失败 /
+    /// prepare 失败）全是静默 return —— 当年库被退出备份或同步盘占住的那一次启动，
+    /// 会话态里就没有任何登记信息，而这批计数照样要落库。旧写法把每一台设备的名字
+    /// 换成回退名、kind 换成 unknown，界面上设备排行当场退化，日志一个字没有。
+    #[test]
+    fn meta_less_round_keeps_an_existing_registration() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_devdegrade");
+        const UPSERT: &str = "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(device_key) DO UPDATE SET name = excluded.name, kind = excluded.kind \
+             RETURNING id";
+
+        let year = chrono::Local::now().year();
+        let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+        connection::ensure_schema(&conn, year).unwrap();
+        let real = DeviceMeta {
+            name: "罗技键盘 · 062A/4100".to_string(),
+            kind: "keyboard".to_string(),
+        };
+
+        // 上一轮：真名落进了库
+        let mut upsert = conn.prepare(UPSERT).unwrap();
+        let id = device_id_in_db(
+            &conn,
+            &mut upsert,
+            "HID#VID_062A&PID_4100#keep",
+            Some(&real),
+        )
+        .unwrap();
+        drop(upsert);
+
+        // 这一轮：只有计数、没有登记信息（preload 静默早退的形状）
+        let mut upsert = conn.prepare(UPSERT).unwrap();
+        let id2 = device_id_in_db(&conn, &mut upsert, "HID#VID_062A&PID_4100#keep", None).unwrap();
+        drop(upsert);
+        assert_eq!(id2, id, "同一设备仍要命中同一登记行");
+        let (name, kind): (String, String) = conn
+            .query_row("SELECT name, kind FROM devices WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(name, "罗技键盘 · 062A/4100", "缺登记的一轮不得改写已有真名");
+        assert_eq!(kind, "keyboard", "kind 同理，不能被换成 unknown");
+
+        // 反面对照：库里还没有这一行时，占位登记必须补上（漏登记会让查询侧 JOIN 丢行）
+        let mut upsert = conn.prepare(UPSERT).unwrap();
+        let fresh = device_id_in_db(&conn, &mut upsert, "HID#VID_9999&PID_8888#new", None).unwrap();
+        drop(upsert);
+        assert!(fresh > 0, "缺登记且库里没有行时仍要补登");
+        let (fname, fkind): (String, String) = conn
+            .query_row(
+                "SELECT name, kind FROM devices WHERE id = ?1",
+                [fresh],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fname, "HID 设备 · 9999/8888", "补登要写人话，不是裸路径");
+        assert_eq!(fkind, "unknown");
+        drop(conn);
+    }
+
+    /// A 道⑦：开库与建表两步的失败要各说各话，且都必须带上是哪一年的库。
+    ///
+    /// 上一场只钉住了 `open_rw` 那一半（`ensure_schema` 没有稳定夹具）。现在拆成
+    /// [`open_year_db`] / [`ensure_year_schema`]，两半分别注入验证。
+    /// 建表那一半的夹具是「库能打开、写被拒」（`PRAGMA query_only`），
+    /// 这正是同步盘换成占位文件、只读挂载点这类现场形状。
+    #[test]
+    fn year_db_open_and_schema_failures_say_which_half() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_yearhalf");
+
+        // 半 1：年库路径是个目录 → 开库这一步就该失败，措辞是"打开 … 失败"
+        let blocked = 1971;
+        std::fs::create_dir_all(paths::year_db_path(blocked)).unwrap();
+        let why = open_year_db(blocked).unwrap_err();
+        assert!(why.starts_with("打开 1971 年库 "), "措辞走样: {why}");
+        assert!(why.contains("失败"), "必须带原因: {why}");
+
+        // 半 2：库能打开、建表被拒 → 措辞必须是"初始化 … 结构失败"，
+        // 不能含糊成"打不开"，否则排查时把 schema 问题当路径问题找。
+        let year = chrono::Local::now().year();
+        let conn = open_year_db(year).unwrap();
+        conn.execute_batch("PRAGMA query_only = ON;").unwrap();
+        let why = ensure_year_schema(&conn, year).unwrap_err();
+        assert!(
+            why.starts_with(&format!("初始化 {year} 年库结构失败")),
+            "建表失败被说成了别的: {why}"
+        );
+        assert!(why.len() > 20, "原因得真的带上 SQLite 原文: {why}");
         drop(conn);
     }
 
