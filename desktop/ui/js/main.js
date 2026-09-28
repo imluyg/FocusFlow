@@ -4,7 +4,7 @@ import { invoke, listen } from "./tauri.js";
 import { $, toast } from "./utils.js";
 import { appState, analyticsTab } from "./state.js";
 import { renderPlugins, openPlugin, closePlugin, renderPluginDetail, togglePlugin, pluginBtn, pluginBtnSel, pluginField, pluginFieldStay, pluginSelectRow, pluginSelectAll, modalOpen, modalCancel, modalSubmit, modalAction } from "./plugins.js";
-import { applyLive, applyCharts, renderRank, renderApps, renderDevices, deviceRename, deviceRenameSave, deviceRenameClear, deviceRenameCancel, openDeviceDetail, closeDeviceDetail, deviceDetailSetPeriod, renderAnalytics, renderTrendChart, renderSettings, doImport, doExport, doVacuum, doBackup, doWeeklyReport, doChangeDataDir } from "./views.js";
+import { applyLive, applyCharts, renderRank, renderApps, renderDevices, deviceRename, deviceRenameSave, deviceRenameClear, deviceRenameCancel, openDeviceDetail, closeDeviceDetail, deviceDetailSetPeriod, renderAnalytics, renderTrendChart, renderSettings, doImport, doExport, doVacuum, doBackup, doWeeklyReport, doChangeDataDir, doSnip } from "./views.js";
 
 export function switchView(view) {
   appState.currentView = view;
@@ -84,6 +84,7 @@ document.addEventListener("click", (e) => {
     case "do-vacuum": doVacuum(); break;
     case "do-backup": doBackup(); break;
     case "do-weekly-report": doWeeklyReport(); break;
+    case "do-snip": doSnip(); break;
     case "show-floating": invoke("show_floating").catch(() => {}); break;
     case "hide-floating": invoke("hide_floating").catch(() => {}); break;
   }
@@ -206,6 +207,11 @@ document.querySelectorAll("#analytics-tabs .tab").forEach((b) => {
     await listen("floating-changed", (e) => {
       const cb = $("set-floating");
       if (cb) cb.checked = !!e.payload;
+    });
+    // 截图的结果只在 Rust 侧才知道（存盘与剪贴板是两个独立成败），由 snip.rs 广播一句话。
+    // 用 toast 而不是 setMsg：按热键截图时用户多半不在设置页。
+    await listen("snip-done", (e) => {
+      toast(String(e.payload || ""));
     });
     // 久坐提醒（[rest]，判定在 core 的 RestMonitor）：顶部浮层几秒后自动消失
     await listen("rest-reminder", (e) => {

@@ -305,6 +305,19 @@ pub fn log_dir() -> PathBuf {
     dir
 }
 
+/// `data/screenshots/` 截图目录，不存在则创建。
+///
+/// 位置不是随便挑的：搬家逻辑（`data_location.rs`）在四处硬编码只走 `data` 与 `backup`
+/// 两棵子树 —— 复制 `:98`、逐字节核对 `:502`、删源 `:572`，而 `:67` 会把目标目录根下
+/// 任何其它条目当成"陌生人"拒绝切换。所以截图放在 `data_home()/data/` **里面**，
+/// 用户改数据文件夹时才会被现有递归 walk 一起带走；放在 `data_home` 根下则要么被落下、
+/// 要么直接把"更改数据文件夹"这个功能挡住。
+pub fn screenshots_dir() -> PathBuf {
+    let dir = data_home().join("data").join("screenshots");
+    std::fs::create_dir_all(&dir).ok();
+    dir
+}
+
 /// `backup/` 备份目录，不存在则创建。
 pub fn backup_dir() -> PathBuf {
     let dir = data_home().join("backup");
@@ -352,5 +365,30 @@ pub fn is_year_db_file(path: &Path) -> Option<i32> {
         stem.parse().ok()
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 截图目录必须落在 `data_home()/data/screenshots`。
+    ///
+    /// 这不是审美问题：搬家逻辑（`data_location.rs`）有四处硬编码只走 `data` 与 `backup`
+    /// 两棵子树（复制 `:98`、逐字节核对 `:502`、删源 `:572`），而目标目录根下出现任何
+    /// 别的条目都会被 `validate_new_data_home:67` 当成"陌生人"拒绝切换。
+    /// 放到 `data_home` 根下的后果是二选一：截图被落在旧目录，或"更改数据文件夹"不能用了。
+    #[test]
+    fn screenshots_dir_is_inside_data_so_migration_carries_it() {
+        let _lock = test_app_dir_lock();
+        let app = test_app_dir("shot_dir");
+        set_app_dir(app.path());
+        let dir = screenshots_dir();
+        assert_eq!(dir, app.path().join("data").join("screenshots"));
+        assert!(
+            dir.starts_with(data_home().join("data")),
+            "screenshots 不在 data/ 下面：{dir:?}"
+        );
+        assert!(dir.is_dir(), "取用时该已经把目录建好");
     }
 }

@@ -719,6 +719,10 @@ mod tests {
 
         write_file(&src.path().join("data/focusflow_2026.db"), "year-db-bytes");
         write_file(&src.path().join("data/reports/week.md"), "report");
+        // 截图目录：它和 reports 一样是"用户产物"，必须跟着 data/ 一起走。
+        // 这条断言盯的是搬家只认 `data`/`backup` 两棵子树这个口径 —— 一旦有人把
+        // `screenshots_dir()` 挪到 data_home 根下，这里会从 4 变回 3 并且读不到文件。
+        write_file(&src.path().join("data/screenshots/snip_a.png"), "png-bytes");
         write_file(&src.path().join("backup/focusflow_2026.db"), "backup-bytes");
         // 留在程序目录的两样：日志与插件，不该被这次复制带过去
         write_file(&src.path().join("logs/2026-09-27"), "log");
@@ -726,11 +730,16 @@ mod tests {
 
         let s = copy_data_tree(src.path(), dst.path());
         assert!(s.errors.is_empty(), "{:?}", s.errors);
-        assert_eq!(s.copied, 3);
+        assert_eq!(s.copied, 4);
         assert!(s.bytes > 0);
         assert_eq!(
             std::fs::read_to_string(dst.path().join("data/reports/week.md")).unwrap(),
             "report"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("data/screenshots/snip_a.png")).unwrap(),
+            "png-bytes",
+            "截图没被带走：说明 screenshots 不在 data/ 下面，或者搬家漏了新目录"
         );
         assert_eq!(
             std::fs::read_to_string(dst.path().join("backup/focusflow_2026.db")).unwrap(),

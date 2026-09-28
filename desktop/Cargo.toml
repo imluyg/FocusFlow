@@ -11,12 +11,16 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
+# 截图底图走 base64 data URL 送到覆盖层（见 snip.rs）。版本已在依赖图里（tauri 自己就用），
+# 加直接依赖不引入新的 crate 集合。
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
 ] }
 # 系统级窗口材质（Win11 Mica / Win10 Acrylic，液态玻璃）

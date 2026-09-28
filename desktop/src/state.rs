@@ -113,7 +113,10 @@ fn sort_rank_desc(items: &mut [(String, i64)]) {
 /// 与悬浮窗一致的 WebView2 浏览器启动参数。
 /// 注意：WebView2 环境由"首个创建的窗口"建立，之后创建的窗口参数会被忽略，
 /// 因此懒创建的主窗口必须与悬浮窗保持同一份参数。
-const WEBVIEW_BROWSER_ARGS: &str =
+///
+/// `pub(crate)`：截图覆盖层（`snip.rs`）同样是懒创建的窗口，必须共用这一份 ——
+/// 参数各处写一遍，就会出现"有的窗口在后台联网、有的没有"这种查不出来的差别。
+pub(crate) const WEBVIEW_BROWSER_ARGS: &str =
     "--disable-background-networking --disable-component-update --no-first-run --disable-domain-reliability --disable-features=MediaRouter";
 
 /// 主窗口页面是否已被卸载到 about:blank（隐藏超时后卸载，释放页面内存）

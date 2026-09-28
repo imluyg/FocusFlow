@@ -1,27 +1,51 @@
-//! 全局热键：显示/隐藏主窗口。
+//! 全局热键：一张表管所有绑定。
 //!
-//! 支持运行时重新注册：设置页修改 `[hotkey] enabled/toggle_window` 后，
-//! 通过 `reload_hotkey` 卸载旧的并重新注册，无需重启程序。
+//! 支持运行时重新注册：设置页修改 `[hotkey]` 任一条目后，通过 `reload_hotkey`
+//! 卸载旧的并按最新配置重新注册，无需重启程序。
+//!
+//! 为什么**必须**做成表，而不是"要加功能就在别处再 `on_shortcut` 一条"：
+//! `reload_hotkey` 的卸载动作是 `unregister_all()` —— 它摘掉的是这个进程注册的
+//! **全部**快捷键。挂在别处的热键会在用户改一次设置页热键后被悄悄卸掉，
+//! 症状是"昨天还好好的，今天按截图没反应了"。所以全局热键只能从 `BINDINGS` 出生。
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use tauri::{App, AppHandle, Manager};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
-/// 最近一次热键注册失败的原因（`None` = 注册成功或已关闭热键）。
+/// 每条绑定的注册失败原因，按 config 键名分格存。
 ///
-/// 必须存住而不能只发事件：启动时的注册早于前端首次读设置，事件那时没有
-/// 监听者；而组合键被其它程序占用是最常见的静默失败 —— 设置页显示着
-/// 「已启用」，按下去却毫无反应，用户没有任何线索。
-static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+/// 两个理由决定了它的形状：
+/// 1. **必须存住而不能只发事件**：启动时的注册早于前端首次读设置，事件那时没有监听者；
+///    而组合键被其它程序占用是最常见的静默失败 —— 设置页显示着「已启用」，
+///    按下去却毫无反应，用户没有任何线索。
+/// 2. **必须按 key 分格**：两条热键可以一条成功、一条被占用。共用一格的话两行都会
+///    显示同一个原因；而关掉开关留下的过期报错，会让人以为另一条好的也坏了。
+static LAST_ERRORS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn set_last_error(msg: Option<String>) {
-    *LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = msg;
+fn set_last_error(key: &str, msg: Option<String>) {
+    let mut map = LAST_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+    match msg {
+        Some(m) => {
+            map.insert(key.to_string(), m);
+        }
+        // 不注册的两条路（总开关关着 / 输入框被清空）都算"没有报错"：
+        // 关掉开关后不能留着上一次的占用报错，否则设置页会显示一条已过期的提示。
+        None => {
+            map.remove(key);
+        }
+    }
 }
 
-/// 供设置页展示的最近一次注册失败原因。
-pub fn last_error() -> Option<String> {
-    LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+/// 供设置页展示的最近一次注册失败原因（按 config 键名取，`None` = 正常）。
+pub fn last_error(key: &str) -> Option<String> {
+    LAST_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .cloned()
 }
 
 /// 显示/隐藏主窗口的回调处理。
@@ -37,71 +61,145 @@ fn toggle_main_window(app: &AppHandle) {
     }
 }
 
-/// 该注册成哪个热键；`None` = 本次不注册（未启用，或用户把输入框清空了）。
+/// 区域截图的回调。按了没反应必须留下一条能查到的原因，最常见的一条是"上一张还挂着"。
+fn trigger_snip(app: &AppHandle) {
+    if let Err(e) = crate::snip::trigger(app) {
+        tracing::warn!("截图热键未能开始：{e}");
+    }
+}
+
+/// 一条全局热键绑定。
+struct Binding {
+    /// `[hotkey]` 段里的键名：设置页读写的键名、失败原因的索引、默认组合的出处。
+    key: &'static str,
+    /// 给人看的用途，出现在日志与撞车提示里。
+    what: &'static str,
+    handler: fn(&AppHandle),
+}
+
+/// 全部全局热键。**加功能要往这张表里加，不要在别处调 `on_shortcut`**（理由见文件头）。
+const BINDINGS: &[Binding] = &[
+    Binding {
+        key: "toggle_window",
+        what: "显示/隐藏主窗口",
+        handler: toggle_main_window,
+    },
+    Binding {
+        key: "snip",
+        what: "区域截图",
+        handler: trigger_snip,
+    },
+];
+
+/// 该注册成哪个热键；`None` = 本次不注册（未启用，或用户把这一条的输入框清空了）。
 ///
-/// 刻意用 `get` 而不是 `get_or(..., "ctrl+shift+f")`：`get_or` 把**空串当"没配"**
+/// 刻意用 `get` 而不是 `get_or(..., 默认组合)`：`get_or` 把**空串当"没配"**
 /// （见 `config.rs::get_or`），于是在设置页里清空热键框 —— 那是"我不想让程序占用
 /// 任何全局快捷键"的正常表达 —— 会被读成默认组合：框是空的、开关还勾着、
-/// `is_empty()` 那条分支永远到不了，而 Ctrl+Shift+F 已经被悄悄全局占用。
+/// `is_empty()` 那条分支永远到不了，而组合键已经被悄悄全局占用。
 ///
 /// 默认组合本来就写在 `default_config()` 里、首次落盘一定带上，所以"键不存在"与
-/// "用户主动清空"这两件事用 `get` 才分得开，这里也不必再兜一次默认值。
-fn pending_hotkey(config: &focusflow_core::config::FocusFlowConfig) -> Option<String> {
+/// "用户主动清空"这两件事用 `get` 才分得开，这里不必再兜一次默认值。
+fn pending_spec(config: &focusflow_core::config::FocusFlowConfig, key: &str) -> Option<String> {
     if !config.get_bool("hotkey", "enabled", false) {
-        tracing::info!("全局热键未启用，跳过注册");
         return None;
     }
-    let spec = config.get("hotkey", "toggle_window").trim().to_lowercase();
+    let spec = config.get("hotkey", key).trim().to_lowercase();
     if spec.is_empty() {
-        tracing::warn!("热键组合已被清空，本次不注册任何全局热键（要恢复请把组合键填回去）");
         return None;
     }
     Some(spec)
 }
 
-/// 按当前配置注册全局热键（不先卸载；调用方负责先 unregister_all）。
-/// 配置未启用或被清空时直接返回，不注册。
-fn register_current_hotkey(app: &AppHandle) {
-    let config = focusflow_core::config::instance();
-    let Some(s) = pending_hotkey(config) else {
-        // 不注册的两条路都算"没有报错"：关掉开关后不能留着上一次的失败提示，
-        // 否则设置页会显示一条已过期的占用报错。
-        set_last_error(None);
-        return;
-    };
-
-    let result = app
-        .global_shortcut()
-        .on_shortcut(s.as_str(), |app, _shortcut, _event| {
-            toggle_main_window(app);
-        });
-    match result {
-        Ok(()) => {
-            set_last_error(None);
-            tracing::info!("全局热键已注册: {s}");
+/// 找出"被两条以上绑定共用"的组合键 → 共用它的键名。
+///
+/// 不查的后果是难查：同一组合键注册两次，第二次必然失败，而报错写的是
+/// "可能被其它程序占用" —— 真正的原因是用户自己把两条热键填重了，
+/// 占用者就是本程序半秒前刚注册的那一条。
+fn collisions(
+    config: &focusflow_core::config::FocusFlowConfig,
+) -> HashMap<String, Vec<&'static str>> {
+    let mut by_spec: HashMap<String, Vec<&'static str>> = HashMap::new();
+    for b in BINDINGS {
+        if let Some(spec) = pending_spec(config, b.key) {
+            by_spec.entry(spec).or_default().push(b.key);
         }
-        Err(e) => {
-            let msg = format!("{s} 注册失败，可能被其它程序占用：{e}");
-            tracing::warn!("全局热键注册失败 ({s}): {e}");
-            set_last_error(Some(msg));
+    }
+    by_spec.retain(|_, keys| keys.len() > 1);
+    by_spec
+}
+
+/// 按当前配置注册表里的每一条（不先卸载；调用方负责先 `unregister_all`）。
+fn register_all(app: &AppHandle) {
+    let config = focusflow_core::config::instance();
+    let clash = collisions(config);
+    // 日志在**这一层**记，不在 `pending_spec` 里记：那个函数同时被 `collisions` 和
+    // 注册循环调用，在里面记一句就会同一件事打两行（真机日志里就这么吵过一次，
+    // 看着像配置被读了两遍，白耗人一轮）。
+    let master_on = config.get_bool("hotkey", "enabled", false);
+    if !master_on {
+        tracing::info!("全局热键未启用，本次不注册任何热键");
+    }
+    for b in BINDINGS {
+        let Some(spec) = pending_spec(config, b.key) else {
+            // 不注册的两条路都要清掉这一格自己的旧报错，别让它留在设置页上。
+            set_last_error(b.key, None);
+            if master_on {
+                tracing::warn!(
+                    "热键 {}（{}）的组合键是空的，本次不注册它（要恢复请在设置页把组合键填回去）",
+                    b.key,
+                    b.what
+                );
+            }
+            continue;
+        };
+        if let Some(shares) = clash.get(&spec) {
+            set_last_error(
+                b.key,
+                Some(format!(
+                    "{spec} 同时被 {} 用着，两条都没注册（改一条的组合键）",
+                    shares.join(" / ")
+                )),
+            );
+            tracing::warn!("热键 {} = {spec} 与其它条目撞车，跳过注册", b.key);
+            continue;
+        }
+        let handler = b.handler;
+        let result =
+            app.global_shortcut()
+                .on_shortcut(spec.as_str(), move |app, _shortcut, _event| {
+                    (handler)(app);
+                });
+        match result {
+            Ok(()) => {
+                set_last_error(b.key, None);
+                tracing::info!("全局热键已注册: {spec}（{}）", b.what);
+            }
+            Err(e) => {
+                let msg = format!("{spec} 注册失败，可能被其它程序占用：{e}");
+                tracing::warn!("全局热键注册失败 ({} {spec}): {e}", b.what);
+                set_last_error(b.key, Some(msg));
+            }
         }
     }
 }
 
 /// 启动时注册全局热键。
 pub fn setup_hotkey(app: &App) {
-    register_current_hotkey(app.handle());
+    register_all(app.handle());
 }
 
-/// 运行时重新加载热键：先卸载全部（本程序只注册一个全局热键），
-/// 再按最新配置重新注册。设置页改动热键后调用。
+/// 运行时重新加载热键：先卸载全部，再按最新配置重新注册表里的每一条。设置页改动热键后调用。
+///
+/// 这里敢用 `unregister_all()` 的前提是文件头那条纪律：本程序的全局热键**只**从
+/// `BINDINGS` 出生。以后若有人在别处 `on_shortcut`，这条就会把它一起摘掉。
 pub fn reload_hotkey(app: &AppHandle) {
     // 先卸载旧的，避免重复注册同一快捷键
     match app.global_shortcut().unregister_all() {
         Ok(()) => tracing::debug!("已卸载全部全局热键"),
         Err(e) => tracing::warn!("卸载全局热键失败: {e}"),
     }
-    register_current_hotkey(app);
+    register_all(app);
 }
 
 #[cfg(test)]
@@ -122,67 +220,176 @@ mod tests {
         focusflow_core::config::FocusFlowConfig::load(&path).unwrap()
     }
 
-    /// 清空热键输入框 = 不占用任何全局快捷键。
-    ///
-    /// 旧写法 `get_or(..., "ctrl+shift+f")` 把空串当"没配"，所以框清空后
-    /// 实际注册的是默认组合：界面显示空白、开关还勾着，Ctrl+Shift+F 却被程序占住。
+    /// `default_config()` 里 `[hotkey]` 的某个键。测试要的默认值一律从这里取，
+    /// 不在断言里再抄一遍字面量 —— 抄了就有了"改了默认值而用例还在守旧值"的余地。
+    fn default_spec(key: &str) -> String {
+        focusflow_core::config::default_config()
+            .get("hotkey")
+            .and_then(|s| s.get(key))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 每条绑定都得有默认组合：缺键时 `get` 返回空串，那条热键就**永远注册不上**，
+    /// 而日志里只有"已被清空"一行，看起来像用户自己清的。
     #[test]
-    fn cleared_or_absent_spec_means_no_hotkey() {
-        assert_eq!(
-            pending_hotkey(&cfg(
-                "cleared",
-                "[hotkey]\nenabled = true\ntoggle_window = "
-            )),
-            None,
-            "被清空的输入框不该被读成默认组合"
-        );
-        assert_eq!(
-            pending_hotkey(&cfg(
-                "blank",
-                "[hotkey]\nenabled = true\ntoggle_window =    "
-            )),
-            None,
-            "只有空格也算清空"
-        );
-        // 与"清空"相对：文件里**压根没有**这一行时要退回默认值。`load()` 是从
-        // `default_config()` 起步再被文件覆盖的，所以缺行不等于空串 —— 老配置文件
-        // 升级上来仍然有热键可用。以前 `get_or` 把这两件事压成同一件。
-        assert_eq!(
-            pending_hotkey(&cfg("absent", "[hotkey]\nenabled = true")).as_deref(),
-            Some("ctrl+shift+f"),
-            "缺行 ≠ 清空：仍该用 default_config 里那句默认组合"
-        );
+    fn every_binding_has_a_default_spec() {
+        for b in BINDINGS {
+            assert!(
+                !default_spec(b.key).is_empty(),
+                "BINDINGS 里的 {} 在 default_config 的 [hotkey] 段没有默认组合",
+                b.key
+            );
+        }
+    }
+
+    /// 出厂默认值之间不许互相撞车，否则第一帧就有一两条热键静默失效。
+    #[test]
+    fn default_specs_do_not_collide() {
+        let mut seen: Vec<String> = Vec::new();
+        for b in BINDINGS {
+            let spec = default_spec(b.key);
+            assert!(
+                !seen.contains(&spec),
+                "两条绑定默认都是 {spec}，会被撞车检查一起挡掉"
+            );
+            seen.push(spec);
+        }
+    }
+
+    /// 三态（清空 / 只有空格 / 压根没这一行）+ 总开关关闭，对**每一条**绑定都成立。
+    ///
+    /// 清空热键输入框 = 不占用任何全局快捷键。旧写法 `get_or(..., "ctrl+shift+f")`
+    /// 把空串当"没配"，所以框清空后实际注册的是默认组合：界面显示空白、开关还勾着，
+    /// 组合键却被程序占住。
+    #[test]
+    fn cleared_absent_and_off_states_hold_for_every_binding() {
+        for b in BINDINGS {
+            let ini = format!("[hotkey]\nenabled = true\n{} = ", b.key);
+            assert_eq!(
+                pending_spec(&cfg(&format!("cleared-{}", b.key), &ini), b.key),
+                None,
+                "被清空的输入框不该被读成默认组合（{}）",
+                b.key
+            );
+
+            let ini = format!("[hotkey]\nenabled = true\n{} =    ", b.key);
+            assert_eq!(
+                pending_spec(&cfg(&format!("blank-{}", b.key), &ini), b.key),
+                None,
+                "只有空格也算清空（{}）",
+                b.key
+            );
+
+            // 与"清空"相对：文件里**压根没有**这一行时要退回默认值。`load()` 是从
+            // `default_config()` 起步再被文件覆盖的，所以缺行不等于空串 —— 老配置文件
+            // 升级上来仍然有热键可用。以前 `get_or` 把这两件事压成同一件。
+            let expect = default_spec(b.key);
+            assert_eq!(
+                pending_spec(
+                    &cfg(&format!("absent-{}", b.key), "[hotkey]\nenabled = true"),
+                    b.key
+                )
+                .as_deref(),
+                Some(expect.as_str()),
+                "缺行 ≠ 清空：仍该用 default_config 里那句默认组合（{}）",
+                b.key
+            );
+
+            let ini = format!("[hotkey]\nenabled = false\n{} = ctrl+alt+m", b.key);
+            assert_eq!(
+                pending_spec(&cfg(&format!("off-{}", b.key), &ini), b.key),
+                None,
+                "总开关关掉时不该碰任何组合键（{}）",
+                b.key
+            );
+        }
     }
 
     /// 正常路径仍然生效，并且大小写/空白都被归一。
     #[test]
     fn configured_spec_is_used_verbatim_after_normalize() {
+        let c = cfg(
+            "normal",
+            "[hotkey]\nenabled = true\ntoggle_window = Ctrl+Alt+M",
+        );
         assert_eq!(
-            pending_hotkey(&cfg(
-                "normal",
-                "[hotkey]\nenabled = true\ntoggle_window = Ctrl+Alt+M"
-            ))
-            .as_deref(),
+            pending_spec(&c, "toggle_window").as_deref(),
             Some("ctrl+alt+m"),
             "注册前要小写化并去掉首尾空白"
         );
-        assert_eq!(
-            pending_hotkey(&cfg(
-                "off",
-                "[hotkey]\nenabled = false\ntoggle_window = ctrl+alt+m"
-            )),
-            None,
-            "开关关掉时不该碰组合键"
-        );
         // `enabled = 1` 也是"启用"：这一族在 get_bool 里是认的
+        let c = cfg("one", "[hotkey]\nenabled = 1\ntoggle_window = ctrl+alt+j");
         assert_eq!(
-            pending_hotkey(&cfg(
-                "one",
-                "[hotkey]\nenabled = 1\ntoggle_window = ctrl+alt+j"
-            ))
-            .as_deref(),
+            pending_spec(&c, "toggle_window").as_deref(),
             Some("ctrl+alt+j"),
             "1/yes/on 与 true 同义（get_bool 的口径）"
         );
+    }
+
+    /// 两条热键填同一个组合键时，两条都要被认出来（而不是"后注册的那条报占用"）。
+    #[test]
+    fn same_spec_on_two_keys_is_reported_as_a_clash() {
+        let c = cfg(
+            "clash",
+            "[hotkey]\nenabled = true\ntoggle_window = Ctrl+Shift+X\nsnip = ctrl+shift+x",
+        );
+        let got = collisions(&c);
+        let keys = got.get("ctrl+shift+x").expect("大小写不同也该认出撞车");
+        assert_eq!(keys.len(), 2, "两条都该进撞车名单，实际 {keys:?}");
+    }
+
+    /// 只有一条用某个组合键时不算撞车 —— 否则"改成一个冷门组合"会被无故挡下。
+    #[test]
+    fn a_unique_spec_is_not_a_clash() {
+        let c = cfg(
+            "unique",
+            "[hotkey]\nenabled = true\ntoggle_window = ctrl+shift+f\nsnip = shift+f1",
+        );
+        assert!(collisions(&c).is_empty(), "{:?}", collisions(&c));
+    }
+
+    /// 撞车名单里不该出现"某一条被清空"的组合：清空 = 不注册 = 不占位。
+    #[test]
+    fn a_cleared_key_does_not_join_a_clash() {
+        let c = cfg(
+            "clash-cleared",
+            "[hotkey]\nenabled = true\ntoggle_window = shift+f1\nsnip = ",
+        );
+        assert!(
+            collisions(&c).is_empty(),
+            "snip 已被清空，不该因为它把 toggle_window 也判成撞车"
+        );
+    }
+
+    /// 失败原因必须按 key 分格，且"这一条不注册"会清掉**它自己**的旧报错。
+    #[test]
+    fn errors_are_keyed_per_binding() {
+        set_last_error("snip", Some("被占用".to_string()));
+        assert_eq!(last_error("snip").as_deref(), Some("被占用"));
+        assert_eq!(
+            last_error("toggle_window"),
+            None,
+            "截图那条的报错不该串到主窗口那条上"
+        );
+        set_last_error("snip", None);
+        assert_eq!(last_error("snip"), None, "不注册之后不能留下过期报错");
+    }
+
+    /// 两条同时报错时各自可读 —— 设置页两行显示同一个原因就等于没说。
+    ///
+    /// 结束时把两格都清掉：这几条用例共用同一张进程级表，不清会把状态漏给下一条。
+    #[test]
+    fn two_errors_coexist_without_overwriting() {
+        set_last_error("snip", Some("A 占用了".to_string()));
+        set_last_error("toggle_window", Some("B 占用了".to_string()));
+        assert_eq!(last_error("snip").as_deref(), Some("A 占用了"));
+        assert_eq!(
+            last_error("toggle_window").as_deref(),
+            Some("B 占用了"),
+            "后写的一条把先写的那条盖掉了"
+        );
+        set_last_error("snip", None);
+        set_last_error("toggle_window", None);
     }
 }

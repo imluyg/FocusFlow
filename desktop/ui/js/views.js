@@ -737,6 +737,21 @@ async function onHotkeyStrChange(e) {
   await renderSettings();
 }
 
+// 截图热键：与上面同属 [hotkey] 段、共用 enabled 总开关，但各存各的组合与失败原因
+async function onSnipHotkeyStrChange(e) {
+  await invoke("set_config", { section: "hotkey", key: "snip", value: e.target.value });
+  await renderSettings();
+}
+
+export async function doSnip() {
+  setMsg("正在冻结屏幕…", "var(--muted)");
+  try {
+    setMsg(await invoke("do_snip"), "var(--success)");
+  } catch (e) {
+    setMsg("截图未能开始：" + e, "var(--danger)");
+  }
+}
+
 async function onFloatingChange(e) {
   await invoke("set_config", { section: "floating", key: "enabled", value: e.target.checked ? "true" : "false" });
 }
@@ -841,6 +856,29 @@ const SETTINGS_CATS = [
                 ? `<div class="ff-wide ff-alert">热键注册失败：${escapeHtml(s.hotkey_error)}（换一个组合键，或让开占用者）</div>`
                 : "",
             desc: "形如 Ctrl+Alt+F。改动后立即重新注册：成功不提示，失败会红字写在上面。",
+          },
+        ],
+      },
+      {
+        title: "区域截图",
+        rows: [
+          {
+            id: "set-snip-hotkey-str", t: "text", name: "截图热键",
+            v: (s) => s.snip_hotkey_str || "", on: onSnipHotkeyStrChange,
+            wide: (s) =>
+              s.hotkey_enabled && s.snip_hotkey_error
+                ? `<div class="ff-wide ff-alert">截图热键注册失败：${escapeHtml(s.snip_hotkey_error)}（换一个组合键，或让开占用者）</div>`
+                : "",
+            desc: "形如 Shift+F1。共用上面那个「启用热键」开关：关掉开关后两条热键都不占用。"
+              + "这是全局抢占——启用后别的程序（如 Excel/Word 的 Shift+F1）就拿不到这个组合了。",
+          },
+          {
+            t: "btns", name: "立即截图",
+            btns: [{ act: "do-snip", label: "框选一块" }],
+            desc: (s) =>
+              "屏幕会先被冻结，拖框选区后存成 PNG 并复制到剪贴板；单击或按 Esc 取消，什么都不留下。"
+              + `文件写在 ${escapeHtml(s.screenshots_dir || "data/screenshots/")}，程序不会自动删，也不上传任何东西。`,
+            descWide: true,
           },
         ],
       },

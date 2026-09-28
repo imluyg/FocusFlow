@@ -52,7 +52,12 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
         "hotkey_str": c.get("hotkey", "toggle_window"),
         // 已启用但注册失败时的原因（空串 = 正常）：组合键常被其它程序占用，
         // 只有日志的话用户看到的是「开关打开着、按了没反应」
-        "hotkey_error": crate::hotkey::last_error().unwrap_or_default(),
+        "hotkey_error": crate::hotkey::last_error("toggle_window").unwrap_or_default(),
+        // 截图热键：与上面同一条 `enabled` 总开关管着，但失败原因各记各的格
+        "snip_hotkey_str": c.get("hotkey", "snip"),
+        "snip_hotkey_error": crate::hotkey::last_error("snip").unwrap_or_default(),
+        // 截图落盘位置：报**当前真正生效**的那个（与 data_home 同一口径，见下面那行）
+        "screenshots_dir": focusflow_core::paths::screenshots_dir().display().to_string(),
         "floating_enabled": c.get_bool("floating", "enabled", true),
         // 备份开关：退出时备份 / 运行中定时备份（0 小时 = 关闭）
         "backup_on_exit": c.get_bool("database", "backup_on_exit", true),

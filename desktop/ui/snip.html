@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>FocusFlow 截图</title>
+  <style>
+    /* 覆盖层是"盖住一块屏"的窗口：整屏就是这张页面，不做任何滚动与选中。
+       窗口不带透明（原因见 snip.rs 的 ensure_overlay），所以在底图画出来之前
+       用实心近黑兜住 —— 这恰好也是"屏幕已冻结"该有的观感。 */
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0b0b0d;
+      -webkit-user-select: none;
+      user-select: none;
+      cursor: crosshair;
+      font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    /* 冻结的整屏底图：铺满视口，物理像素与 CSS 像素的比例由 devicePixelRatio 给出 */
+    #shot {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      -webkit-user-drag: none;
+      user-drag: none;
+      pointer-events: none;
+    }
+    /* 选区外的压暗：用一层巨大的 box-shadow 实现，比再画四个遮罩块少四次布局 */
+    #sel {
+      position: fixed;
+      display: none;
+      border: 1px solid #ff8a00;
+      box-sizing: border-box;
+      box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.45);
+      pointer-events: none;
+    }
+    /* 未开始拖框时整屏压暗，让"已经冻结了"这件事一眼可见 */
+    body:not(.dragging) #sel { display: none; }
+    #veil {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.45);
+      pointer-events: none;
+    }
+    body.has-sel #veil { display: none; }
+    #size {
+      position: fixed;
+      display: none;
+      padding: 2px 6px;
+      font-size: 12px;
+      line-height: 1.4;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.72);
+      border-radius: 4px;
+      font-variant-numeric: tabular-nums;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+    #hint {
+      position: fixed;
+      left: 50%;
+      bottom: 28px;
+      transform: translateX(-50%);
+      padding: 6px 12px;
+      font-size: 13px;
+      color: #fff;
+      background: rgba(20, 20, 20, 0.82);
+      border-radius: 6px;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+    /* 出错时换成红底：截图是全屏手势，提示必须盖在同一层里才看得见 */
+    #hint.error { background: rgba(150, 32, 32, 0.92); }
+  </style>
+</head>
+<body>
+  <img id="shot" alt="" />
+  <div id="veil"></div>
+  <div id="sel"></div>
+  <div id="size"></div>
+  <div id="hint">拖框选区 · Esc 取消</div>
+  <script type="module" src="snip.js"></script>
+</body>
+</html>

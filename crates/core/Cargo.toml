@@ -35,16 +35,25 @@ rdev = "0.5"
 # Lua 脚本（插件系统）
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 
+# 截图的 PNG 编码。只用编码器，不引 image 那种全家桶。
+# 版本已在依赖图里（经 tray-icon/muda 传递），加直接依赖不引入新的 crate 集合。
+png = "0.18"
+
 # 前台应用统计（仅用窗口 API + 进程快照，不对其他进程开句柄）
 # 设备维度统计用 Raw Input（Win32_UI_Input_KeyboardAndMouse）
+# 截图（capture 模块）用 Gdi 取屏、DataExchange/Memory 写 CF_DIB 剪贴板、
+# HiDpi 核对进程 DPI 感知（坐标模型成立的前提）
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
 ] }
 
 [lints]

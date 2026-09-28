@@ -104,7 +104,15 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     );
     s(
         "hotkey",
-        &[("enabled", "false"), ("toggle_window", "ctrl+shift+f")],
+        &[
+            ("enabled", "false"),
+            ("toggle_window", "ctrl+shift+f"),
+            // 区域截图（desktop/src/snip.rs）。默认值刻意避开三类撞车：
+            // Win+Shift+S 被系统截图工具占着、裸 PrintScreen 被系统的"使用 Print
+            // Screen 按钮"无障碍钩子抢、Ctrl+Alt+A 是微信的默认截图键。
+            // `enabled` 是总开关，两条绑定共用：关掉开关时不占用任何全局快捷键。
+            ("snip", "shift+f1"),
+        ],
     );
     s("floating", &[("enabled", "true")]);
     s(

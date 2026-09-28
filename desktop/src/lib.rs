@@ -7,6 +7,7 @@ pub mod commands;
 pub mod export;
 pub mod hotkey;
 pub mod plugins;
+pub mod snip;
 pub mod state;
 pub mod tray;
 
@@ -169,6 +170,10 @@ pub fn run() {
             commands::get_maintenance_info,
             commands::do_backup,
             commands::get_startup_report,
+            snip::do_snip,
+            snip::snip_take,
+            snip::snip_commit,
+            snip::snip_cancel,
         ])
         .on_window_event(|window, event| {
             // 主窗口关闭 → 隐藏到托盘（500ms 后仍隐藏才销毁，见 state::hide_main_window），
@@ -177,6 +182,13 @@ pub fn run() {
                 if window.label() == "main" {
                     api.prevent_close();
                     state::hide_main_window(window.app_handle());
+                }
+                // 截图覆盖层被 Alt+F4 收走：按"取消"收尾（清会话、恢复悬浮窗），并且
+                // **必须拦住真正的关闭** —— 这个窗口是懒创建的，页面已经加载过一次；
+                // 让它真销毁就得到"下次截图再建一个控制器"那条不可靠的路（见 snip.rs 顶部）。
+                if window.label() == snip::SNIP_LABEL {
+                    api.prevent_close();
+                    snip::on_snip_close_requested(window.app_handle());
                 }
             }
         })
