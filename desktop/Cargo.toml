@@ -8,7 +8,19 @@ license.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+# default-features = false 的唯一目的：摘掉 tauri 默认开的 `common-controls-v6`。
+# 那条 feature 会把 muda 的消息框实现（`comctl32!TaskDialogIndirect`，只有 Common-Controls
+# v6 才导出）变成**每个产物的静态导入**，而本仓从没调用过消息框。带着它意味着：任何拿不到
+# 应用清单的产物（`tauri-build` 只把清单挂给 [[bin]]）在完整链接后加载即死
+# STATUS_ENTRYPOINT_NOT_FOUND —— 桌面 lib 单元测试就是这么起不来的。
+# 其余四项就是 tauri default 里除 common-controls-v6 之外的全部（x11/dbus 是 Linux 后端，
+# 本包只出 Windows，故不列）。
+tauri = { version = "2", default-features = false, features = [
+    "tray-icon",
+    "wry",
+    "compression",
+    "dynamic-acl",
+] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
 # 截图底图走 base64 data URL 送到覆盖层（见 snip.rs）。版本已在依赖图里（tauri 自己就用），
