@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use tauri::{App, AppHandle, Manager};
-use tauri_plugin_global_shortcut::GlobalShortcutExt;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 /// 每条绑定的注册失败原因，按 config 键名分格存。
 ///
@@ -129,6 +129,24 @@ fn collisions(
     by_spec
 }
 
+/// 一条热键事件该不该跑 handler —— **只有 `Pressed`**。
+///
+/// 这不是防御性代码，是 Windows 上实测出来的事件形状：`global-hotkey 0.8` 收到 `WM_HOTKEY`
+/// 之后会**另起一个线程每 50ms 轮询 `GetAsyncKeyState`**，等键松开时再补发一条 `Released`
+/// （见其 `platform_impl/windows/mod.rs` 的 `global_hotkey_proc`）。插件两种都转给回调、
+/// 自己不过滤，它自己的 README 里就明写要判 `state == ShortcutState::Pressed`。
+///
+/// 不判的后果按绑定各不一样，而且都不响亮：
+/// - 截图：第二遍撞上 `IN_FLIGHT` 被拒 ⇒ 真机日志里 45 条"已有一张截图在进行中"，
+///   而"13 次开始对 13 次拒绝"那个 1:1 就是它 —— 人手不会每次都双击得这么准。
+/// - 显示/隐藏主窗口：按下 = 显示，松手 = 立刻隐藏 ⇒ **净效果就是"热键按了没反应"**。
+///   这条今天没暴露，只是因为他的 `toggle_window` 是空的（那是"别占用这个键"的正常表达）。
+/// - 更险的一格：如果第一遍在松手前就完事（截图很快），第二遍会**再起一张新截图**，
+///   症状是覆盖层闪两下 —— 正是 `IN_FLIGHT` 那条评论当初描述过的现象。
+fn should_run_on(state: ShortcutState) -> bool {
+    matches!(state, ShortcutState::Pressed)
+}
+
 /// 按当前配置注册表里的每一条（不先卸载；调用方负责先 `unregister_all`）。
 fn register_all(app: &AppHandle) {
     let config = focusflow_core::config::instance();
@@ -167,8 +185,10 @@ fn register_all(app: &AppHandle) {
         let handler = b.handler;
         let result =
             app.global_shortcut()
-                .on_shortcut(spec.as_str(), move |app, _shortcut, _event| {
-                    (handler)(app);
+                .on_shortcut(spec.as_str(), move |app, _shortcut, event| {
+                    if should_run_on(event.state) {
+                        (handler)(app);
+                    }
                 });
         match result {
             Ok(()) => {
@@ -228,6 +248,23 @@ mod tests {
             .and_then(|s| s.get(key))
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// 一次物理按下会来**两条**事件（`Pressed`，加上松手时那个 50ms 轮询补发的 `Released`），
+    /// handler 只能跑一遍。
+    ///
+    /// 为什么单独钉它：不判状态的旧写法在截图那条上只是刷日志（被 `IN_FLIGHT` 挡下），
+    /// 在"显示/隐藏主窗口"那条上却是**自己把自己关掉** —— 按下显示、松手隐藏，
+    /// 用户看到的就是"热键没反应"，而代码一行错都没有。这种"第二遍才致命"的形状
+    /// 没有用例就看不见。区分性：把 `should_run_on` 改成无条件 `true` 这条当场红。
+    #[test]
+    fn only_pressed_events_run_the_handler() {
+        use tauri_plugin_global_shortcut::ShortcutState;
+        assert!(should_run_on(ShortcutState::Pressed), "按下必须跑 handler");
+        assert!(
+            !should_run_on(ShortcutState::Released),
+            "松手那条不该再跑一遍 —— 跑两遍等于热键自己把自己关掉"
+        );
     }
 
     /// 每条绑定都得有默认组合：缺键时 `get` 返回空串，那条热键就**永远注册不上**，
