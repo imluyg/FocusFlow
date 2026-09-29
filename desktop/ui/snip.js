@@ -25,6 +25,9 @@
 //    Rust 解码 → 合成），所以 Rust 侧不为它们加任何概念：文字用 `fillText`，字号是
 //    物理像素；马赛克从冻结的底图取子块「缩小再放大」，缩小那趟要平滑（要的就是平均
 //    掉的糊），放大那趟关平滑（不然糊成一片灰、等于白打码）。
+// 8. 打敏感受信息有两支笔，差别在"留不留痕迹"：**马赛克**每格是 ~10×10 源像素的平均色，
+//    读不出字但还留着"这里有一行、分成几组"的粗略明暗；**色块**把那块涂成一个颜色，
+//    信息量为零，而且能盖住先前画的字（后画的在上面）。色块用当前颜色档，不写死黑。
 import { invoke, listen } from "./js/tauri.js";
 
 const img = document.getElementById("shot");
@@ -131,6 +134,19 @@ function drawOp(op) {
   }
   if (op.t === "text") {
     drawText(op);
+    return;
+  }
+  if (op.t === "fill") {
+    // 实心色块：涂死一块，**跟着当前颜色档走**（红/黄/黑/白），不写死黑色。
+    // 它与马赛克的分工是"要不要留下痕迹"：色块之后这块只剩一个颜色（零信息，
+    // 也盖得住前面写过的字），马赛克还会漏出粗略明暗与"这里有一行字"的结构。
+    actx.fillStyle = op.color;
+    actx.fillRect(
+      Math.round(Math.min(op.a.x, op.b.x)),
+      Math.round(Math.min(op.a.y, op.b.y)),
+      Math.round(Math.abs(op.b.x - op.a.x)),
+      Math.round(Math.abs(op.b.y - op.a.y))
+    );
     return;
   }
   actx.strokeStyle = op.color;

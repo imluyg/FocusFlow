@@ -1045,6 +1045,48 @@ mod tests {
         );
     }
 
+    /// 「原图不留」与「打码之后拿不回原像素」这两条口径的**结构护栏**：
+    /// 整条提交路只允许一处写盘，且写盘、剪贴板都必须排在标注层合成之后。
+    ///
+    /// 为什么按文本形状钉而不是跑一遍：真机那条路要真窗口和真显示器，无头环境进不去；
+    /// 而这里要防的恰恰是"有人在别处再加一次 `fs::write`（比如顺手存个原图好排查）"——
+    /// 那种改动的症状是**盘上多了一张没打码的截图**，谁都不会报错。
+    /// 与 `annotation_is_composited_exactly_once_between_crop_and_encode` 同样只读
+    /// `#[cfg(test)]` 之前那一段（本用例自己的字面量也含这些 needle）。
+    #[test]
+    fn nothing_but_the_composited_image_reaches_disk_or_clipboard() {
+        let src = include_str!("snip.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let body = prod.find("fn commit_blocking").expect("提交函数找不到了");
+        let at = |needle: &str, from: usize| prod[from..].find(needle).map(|i| i + from);
+
+        let writes: Vec<usize> = prod
+            .match_indices("std::fs::write(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            writes.len(),
+            1,
+            "整条截图路只允许一处写盘（现在 {} 处）",
+            writes.len()
+        );
+
+        // 第二个 `apply_annot_layer(` 是调用点（第一个是函数定义）
+        let call = prod
+            .match_indices("apply_annot_layer(")
+            .nth(1)
+            .expect("标注层合成的调用点不见了")
+            .0;
+        let clip = at("write_image_to_clipboard(", body).expect("剪贴板那一步不见了");
+        let encode = at("let png = capture::encode_png(", body).expect("编码那一步不见了");
+        assert!(
+            call < writes[0] && call < encode && call < clip,
+            "写盘（{}）、编码（{encode}）、剪贴板（{clip}）都必须排在合成（{call}）之后，\
+             否则盘上或剪贴板里就会有一份没打码的图",
+            writes[0]
+        );
+    }
+
     /// 页面回报的字段是可选的：老页面（和现成夹具）不带 `layer_png_base64` 也必须解得开，
     /// 否则加一个字段就把"松手即提交"那条老手势判成反序列化失败。
     #[test]
