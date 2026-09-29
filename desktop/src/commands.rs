@@ -56,6 +56,9 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
         // 截图热键：与上面同一条 `enabled` 总开关管着，但失败原因各记各的格
         "snip_hotkey_str": c.get("hotkey", "snip"),
         "snip_hotkey_error": crate::hotkey::last_error("snip").unwrap_or_default(),
+        // 标注版截图热键：同一个总开关、同样各记各的失败原因
+        "snip_annotate_hotkey_str": c.get("hotkey", "snip_annotate"),
+        "snip_annotate_hotkey_error": crate::hotkey::last_error("snip_annotate").unwrap_or_default(),
         // 截图落盘位置：报**当前真正生效**的那个（与 data_home 同一口径，见下面那行）
         "screenshots_dir": focusflow_core::paths::screenshots_dir().display().to_string(),
         "floating_enabled": c.get_bool("floating", "enabled", true),

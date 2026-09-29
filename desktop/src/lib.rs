@@ -172,6 +172,7 @@ pub fn run() {
             commands::do_backup,
             commands::get_startup_report,
             snip::do_snip,
+            snip::do_snip_annotate,
             snip::snip_take,
             snip::snip_commit,
             snip::snip_cancel,

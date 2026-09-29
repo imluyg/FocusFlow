@@ -743,12 +743,27 @@ async function onSnipHotkeyStrChange(e) {
   await renderSettings();
 }
 
+// 标注版截图热键：同一段、同一开关，各存各的
+async function onSnipAnnotateHotkeyStrChange(e) {
+  await invoke("set_config", { section: "hotkey", key: "snip_annotate", value: e.target.value });
+  await renderSettings();
+}
+
 export async function doSnip() {
   setMsg("正在冻结屏幕…", "var(--muted)");
   try {
     setMsg(await invoke("do_snip"), "var(--success)");
   } catch (e) {
     setMsg("截图未能开始：" + e, "var(--danger)");
+  }
+}
+
+export async function doSnipAnnotate() {
+  setMsg("正在冻结屏幕…", "var(--muted)");
+  try {
+    setMsg(await invoke("do_snip_annotate"), "var(--success)");
+  } catch (e) {
+    setMsg("标注截图未能开始：" + e, "var(--danger)");
   }
 }
 
@@ -873,8 +888,19 @@ const SETTINGS_CATS = [
               + "这是全局抢占——启用后别的程序（如 Excel/Word 的 Shift+F1）就拿不到这个组合了。",
           },
           {
+            id: "set-snip-annotate-hotkey-str", t: "text", name: "标注截图热键",
+            v: (s) => s.snip_annotate_hotkey_str || "", on: onSnipAnnotateHotkeyStrChange,
+            wide: (s) =>
+              s.hotkey_enabled && s.snip_annotate_hotkey_error
+                ? `<div class="ff-wide ff-alert">标注截图热键注册失败：${escapeHtml(s.snip_annotate_hotkey_error)}（换一个组合键，或让开占用者）</div>`
+                : "",
+            desc: "形如 Shift+F2。按它截图时松手不立刻提交，而是进标注态：画完之后 Enter 或点「完成」才存盘，"
+              + "Backspace 撤销上一笔，Esc 放弃（什么都不留下）。上面那条「截图热键」的手势不受影响，"
+              + "两条填成同一个组合时两条都不会注册。",
+          },
+          {
             t: "btns", name: "立即截图",
-            btns: [{ act: "do-snip", label: "框选一块" }],
+            btns: [{ act: "do-snip", label: "框选一块" }, { act: "do-snip-annotate", label: "框选并标注" }],
             desc: (s) =>
               "屏幕会先被冻结，拖框选区后存成 PNG 并复制到剪贴板；单击或按 Esc 取消，什么都不留下。"
               + `文件写在 ${escapeHtml(s.screenshots_dir || "data/screenshots/")}，程序不会自动删，也不上传任何东西。`,

@@ -14,6 +14,13 @@
 //    "没有候选时才取消" —— 取消还有 Esc 与右键两条路，都不受影响。
 //    清单是冻结那一刻定下来的，所以覆盖层自己不会在里面（它那时还没显示，
 //    而且 Rust 侧按进程号排掉了自己进程的窗口）。
+// 5. **标注模式（`snip_annotate` 那条热键）只改"松手之后去哪"**：`annotate` 为真时，
+//    吸附选中与拖框松手都只确定选区、进标注态，只有 Enter 或点「完成」才提交；
+//    `annotate` 为假时上面第 2、4 条一个字节都不变。两种手势共用同一份底图会话，
+//    所以区分点只有 payload 里那一个布尔 —— 别在这里再猜"用户是不是想标注"。
+// 6. 标注层的位图尺寸就是 Rust 裁出来的那块**物理像素**，画笔坐标与选区用同一条
+//    `round(v*dpr)` 规则换算（见 `cssRectToPhysical` 上面那段说明）。Rust 那边尺寸不
+//    严格相等就拒收、绝不缩放，所以这里的镜像算错一格，提交就会响而不是悄悄裁偏。
 import { invoke, listen } from "./js/tauri.js";
 
 const img = document.getElementById("shot");
@@ -36,6 +43,185 @@ let pulling = false;
 let started = false;
 let anchor = null;
 let box = null;
+
+// ---------- 标注态（annotate 模式才有意义） ----------
+
+const annotCanvas = document.getElementById("annot");
+const toolsEl = document.getElementById("tools");
+const actx = annotCanvas.getContext("2d");
+
+/** 这一张是不是 `snip_annotate` 进来的（跟会话走，由 payload 给）。 */
+let annotate = false;
+/** 已经选好区、正在画。为真时拖框与吸附那两条手势全部让路。 */
+let annotating = false;
+/** 已完成的笔。撤销 = pop 一支然后整层重绘（不做真 undo 栈）。 */
+let ops = [];
+/** 正在拖的那一支（还没进 ops）。 */
+let live = null;
+/** 选区的物理矩形：标注层画布的原点，也是"页面所见 = 落盘像素"的那个原点。 */
+let selPhys = null;
+let tool = "rect";
+let penColor = "#ff2d2d";
+let penWidth = 3;
+
+/** CSS 选区 → 屏内相对物理矩形。与 Rust 的 `capture::css_rect_to_physical` 同一条规则：
+ *  先归一化反向拖框、一律 round、再钳到屏内（先角点后宽高，反过来会各吃掉一像素）。
+ *  这份镜像是唯一一处不得不在 JS 里重算的地方，所以导出给夹具：那组分数/越界矩形会
+ *  同时喂给两边逐条对拍（Rust 侧收货条件是严格相等，不一致就是提交被拒而不是悄悄裁偏）。 */
+export function cssRectToPhysical(r, dpr, monitor) {
+  const left = r.w < 0 ? r.x + r.w : r.x;
+  const top = r.h < 0 ? r.y + r.h : r.y;
+  const w = Math.abs(r.w);
+  const h = Math.abs(r.h);
+  if (!(w >= 1) || !(h >= 1)) return null;
+  const px = (v) => Math.round(v * dpr);
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+  const x = clamp(px(left), 0, monitor.width - 1);
+  const y = clamp(px(top), 0, monitor.height - 1);
+  return {
+    x,
+    y,
+    w: clamp(px(w), 1, monitor.width - x),
+    h: clamp(px(h), 1, monitor.height - y),
+  };
+}
+
+/** 客户端 CSS 坐标 → 画布里的物理格（画布原点就是选区的物理原点）。 */
+function toCanvasPx(p) {
+  return { x: Math.round(p.x * dpr) - selPhys.x, y: Math.round(p.y * dpr) - selPhys.y };
+}
+
+function newOp(p) {
+  const q = toCanvasPx(p);
+  return tool === "pen"
+    ? { t: "pen", color: penColor, w: penWidth, pts: [q] }
+    : { t: tool, color: penColor, w: penWidth, a: q, b: q };
+}
+
+function updateOp(op, p) {
+  const q = toCanvasPx(p);
+  if (op.t === "pen") op.pts.push(q);
+  else op.b = q;
+}
+
+function drawOp(op) {
+  actx.strokeStyle = op.color;
+  actx.fillStyle = op.color;
+  actx.lineWidth = op.w;
+  actx.lineCap = "round";
+  actx.lineJoin = "round";
+  if (op.t === "rect") {
+    const x = Math.min(op.a.x, op.b.x);
+    const y = Math.min(op.a.y, op.b.y);
+    actx.strokeRect(x, y, Math.abs(op.b.x - op.a.x), Math.abs(op.b.y - op.a.y));
+    return;
+  }
+  if (op.t === "arrow") {
+    actx.beginPath();
+    actx.moveTo(op.a.x, op.a.y);
+    actx.lineTo(op.b.x, op.b.y);
+    actx.stroke();
+    const ang = Math.atan2(op.b.y - op.a.y, op.b.x - op.a.x);
+    const head = Math.max(10, op.w * 4);
+    actx.beginPath();
+    actx.moveTo(op.b.x, op.b.y);
+    actx.lineTo(op.b.x - head * Math.cos(ang - Math.PI / 7), op.b.y - head * Math.sin(ang - Math.PI / 7));
+    actx.lineTo(op.b.x - head * Math.cos(ang + Math.PI / 7), op.b.y - head * Math.sin(ang + Math.PI / 7));
+    actx.closePath();
+    actx.fill();
+    return;
+  }
+  actx.beginPath();
+  actx.moveTo(op.pts[0].x, op.pts[0].y);
+  for (const p of op.pts) actx.lineTo(p.x, p.y);
+  actx.stroke();
+}
+
+/** 整层重绘：笔只有 ops 这一个真相，撤销与改线宽都走同一条路。 */
+function redraw() {
+  actx.clearRect(0, 0, annotCanvas.width, annotCanvas.height);
+  for (const op of ops) drawOp(op);
+  if (live) drawOp(live);
+}
+
+function undoOp() {
+  ops.pop();
+  live = null;
+  redraw();
+}
+
+/** 工具条摆在选区下沿；放不下就翻到上沿（选区贴屏幕底部是常态）。 */
+function placeTools() {
+  const r = annotCanvas.getBoundingClientRect();
+  toolsEl.style.left = Math.max(4, r.left) + "px";
+  const below = r.bottom + 6;
+  const h = toolsEl.offsetHeight;
+  const top = below + h > window.innerHeight ? Math.max(4, r.top - h - 6) : below;
+  toolsEl.style.top = top + "px";
+}
+
+function enterAnnotate() {
+  selPhys = cssRectToPhysical(box, dpr, monitor);
+  if (!selPhys) {
+    giveUp("选区不足 1 像素，什么都没框住");
+    return;
+  }
+  annotCanvas.width = selPhys.w;
+  annotCanvas.height = selPhys.h;
+  annotCanvas.style.left = selPhys.x / dpr + "px";
+  annotCanvas.style.top = selPhys.y / dpr + "px";
+  annotCanvas.style.width = selPhys.w / dpr + "px";
+  annotCanvas.style.height = selPhys.h / dpr + "px";
+  ops = [];
+  live = null;
+  annotating = true;
+  document.body.classList.add("annotating");
+  redraw();
+  placeTools();
+  syncTools();
+  setHint("画一笔 · Enter 或点「完成」提交 · Backspace 撤销 · Esc 放弃");
+}
+
+/** 退出并清空标注态。复用覆盖层时必须走这里：上一张的笔漏给下一张就是画错图。 */
+function exitAnnotate() {
+  annotating = false;
+  live = null;
+  ops = [];
+  selPhys = null;
+  document.body.classList.remove("annotating");
+  actx.clearRect(0, 0, annotCanvas.width, annotCanvas.height);
+  annotCanvas.width = 0;
+  annotCanvas.height = 0;
+}
+
+/** 标注层 PNG 的 base64；一笔都没画就交 null（走原路，与加这个字段之前逐字节一致）。 */
+function layerBase64() {
+  if (!annotating || ops.length === 0) return null;
+  const url = annotCanvas.toDataURL("image/png");
+  return url.slice(url.indexOf(",") + 1);
+}
+
+function syncTools() {
+  const on = (el, want) => el.classList.toggle("on", want);
+  for (const b of toolsEl.querySelectorAll("button[data-tool]")) on(b, b.dataset.tool === tool);
+  for (const b of toolsEl.querySelectorAll("button[data-color]")) on(b, b.dataset.color === penColor);
+  for (const b of toolsEl.querySelectorAll("button[data-w]")) on(b, Number(b.dataset.w) === penWidth);
+}
+
+// 点工具条不能同时在画布上落一笔：工具条在选区外面时不会，贴边时就可能重叠。
+toolsEl.addEventListener("mousedown", (e) => e.stopPropagation());
+toolsEl.addEventListener("mouseup", (e) => e.stopPropagation());
+toolsEl.addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.tool) tool = b.dataset.tool;
+  else if (b.dataset.color) penColor = b.dataset.color;
+  else if (b.dataset.w) penWidth = Number(b.dataset.w);
+  else if (b.id === "t-undo") undoOp();
+  else if (b.id === "t-ok") doCommit();
+  else if (b.id === "t-cancel") giveUp("标注态点了取消");
+  syncTools();
+});
 
 function setHint(text, isError) {
   hint.textContent = text;
@@ -122,6 +308,8 @@ function doCommit() {
       h: box.h,
       dpr,
       epoch,
+      // 标注层（null = 没画东西）。Rust 侧解码后严格核对尺寸，不等就报错而不是缩放。
+      layer_png_base64: layerBase64(),
       ...viewportReport(),
     },
   }).catch((err) => {
@@ -135,6 +323,11 @@ document.addEventListener("mousedown", (e) => {
   if (submitted || !started) return;
   if (e.button === 2) return; // 右键交给 contextmenu 处理成"取消"
   if (e.button !== 0) return;
+  if (annotating) {
+    live = newOp(point(e));
+    redraw();
+    return;
+  }
   anchor = point(e);
   document.body.classList.add("dragging");
   showSnap(null);
@@ -142,6 +335,12 @@ document.addEventListener("mousedown", (e) => {
 
 document.addEventListener("mousemove", (e) => {
   if (submitted || !started) return;
+  if (annotating) {
+    if (!live) return;
+    updateOp(live, point(e));
+    redraw();
+    return;
+  }
   if (anchor) {
     showBox(anchor, point(e));
     return;
@@ -150,6 +349,14 @@ document.addEventListener("mousemove", (e) => {
 });
 
 document.addEventListener("mouseup", (e) => {
+  if (annotating) {
+    if (!live) return;
+    // 抬手时位置没动也算一笔（点一个箭头/一个十字是正常用法）
+    ops.push(live);
+    live = null;
+    redraw();
+    return;
+  }
   if (!anchor || submitted) return;
   const a = anchor;
   const end = point(e);
@@ -164,11 +371,14 @@ document.addEventListener("mouseup", (e) => {
       return;
     }
     applyBox(r.x, r.y, r.w, r.h);
-    doCommit();
+    // 标注模式下到这里就停：吸附选中只是"确定选区"，提交要等 Enter 或点「完成」
+    if (annotate) enterAnnotate();
+    else doCommit();
     return;
   }
   showBox(a, end);
-  doCommit();
+  if (annotate) enterAnnotate();
+  else doCommit();
 });
 
 document.addEventListener("contextmenu", (e) => {
@@ -179,7 +389,17 @@ document.addEventListener("contextmenu", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     e.preventDefault();
-    giveUp("");
+    giveUp(annotating ? "标注态按 Esc 放弃" : "");
+    return;
+  }
+  if (!annotating) return;
+  if (e.key === "Enter") {
+    e.preventDefault();
+    doCommit();
+  } else if (e.key === "Backspace") {
+    // 撤销上一笔。不 preventDefault 的话某些 WebView 配置会把它当成"后退"
+    e.preventDefault();
+    undoOp();
   }
 });
 
@@ -208,6 +428,8 @@ async function pull() {
     submitted = false;
     anchor = null;
     box = null;
+    // 上一张的标注必须整体清掉：复用覆盖层时留着的笔会画到下一张图上
+    exitAnnotate();
     sel.style.display = "none";
     sizeEl.style.display = "none";
     showSnap(null);
@@ -223,6 +445,7 @@ async function pull() {
     }
     epoch = payload.epoch;
     monitor = payload.monitor;
+    annotate = payload.annotate === true;
     // Rust 给的是物理像素 + 这块屏的绝对坐标；换成页面一直在用的"CSS 像素、相对视口"。
     // 副屏的负原点与 dpr≠1 都在这一步一起消化，后面的命中判定才是纯 CSS 坐标。
     wins = payload.windows.map((w) => ({
@@ -237,7 +460,11 @@ async function pull() {
     }
     img.src = "data:image/png;base64," + payload.png_base64;
     started = true;
-    setHint("拖框自由选区 · 单击选中整个窗口 · Esc / 右键取消");
+    setHint(
+      annotate
+        ? "标注模式：拖框或单击选中窗口，然后画标注 · Enter 提交 · Esc 放弃"
+        : "拖框自由选区 · 单击选中整个窗口 · Esc / 右键取消"
+    );
   } finally {
     pulling = false;
   }

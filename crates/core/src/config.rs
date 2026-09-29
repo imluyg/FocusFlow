@@ -112,6 +112,10 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             // Screen 按钮"无障碍钩子抢、Ctrl+Alt+A 是微信的默认截图键。
             // `enabled` 是总开关，两条绑定共用：关掉开关时不占用任何全局快捷键。
             ("snip", "shift+f1"),
+            // 标注版截图：框完松手不立刻提交，而是进标注态（Enter 才提交、Esc 放弃）。
+            // 默认键沿用上面那三类避让；不复用 shift+f1 而另起一键，是为了让"松手即提交"
+            // 那条老手势一个字节都不必改（叠修饰做分岔既容易撞车又不可发现）。
+            ("snip_annotate", "shift+f2"),
         ],
     );
     s("floating", &[("enabled", "true")]);

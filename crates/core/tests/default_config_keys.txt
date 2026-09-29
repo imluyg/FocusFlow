@@ -22,6 +22,7 @@ gui/unload_hidden
 gui/unload_hidden_delay
 hotkey/enabled
 hotkey/snip
+hotkey/snip_annotate
 hotkey/toggle_window
 listener/ignore_function_keys
 listener/ignore_key_repeat

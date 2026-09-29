@@ -61,6 +61,9 @@ struct Session {
     /// 从"按下热键"那一刻起算，用来把首帧耗时打进日志（4K/高缩放的④项要靠它出真数，
     /// 现在手上只有 1080p 的两次读数）。
     started: std::time::Instant,
+    /// 这次是不是标注模式（从 `snip_annotate` 那条热键进来的）。跟着会话走而不是再开一个
+    /// 全局开关：复用覆盖层时上一张的模式不能漏给下一张（页面靠它决定松手是提交还是进标注态）。
+    annotate: bool,
 }
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
@@ -84,6 +87,13 @@ pub struct SnipSelection {
     /// 上一版拿这类尺寸差当硬失败用，1.3% 的取整噪声就把功能判死。
     pub viewport_w: Option<f64>,
     pub viewport_h: Option<f64>,
+    /// 标注层（选区尺寸的 RGBA PNG，base64；页面 `canvas.toDataURL` 交回来的那一份）。
+    /// `None` / 空 = 这次没画东西，落盘与剪贴板就走原路。
+    ///
+    /// `#[serde(default)]` 是给它配对的：老页面（和夹具里那些不带这个字段的调用）必须仍然
+    /// 解得开，否则加一个字段就把"松手即提交"那条老手势判成反序列化失败。
+    #[serde(default)]
+    pub layer_png_base64: Option<String>,
 }
 
 /// 覆盖层启动时要的底图。
@@ -99,6 +109,8 @@ pub struct SnipPayload {
     /// 覆盖层那回 label 不在任何 capability 里、第一个 `invoke` 就失败，所以这里
     /// 刻意不加 IPC 面，页面也拿不到"半新半旧"的两份数据。
     pub windows: Vec<MonitorRect>,
+    /// 标注模式：页面据此决定"吸附选中 / 拖框松手"是提交还是进标注态（口径①：两种手势各走各的）。
+    pub annotate: bool,
 }
 
 /// 提交结果。两个下游动作**分开**上报，不合并成一个"成功/失败"：
@@ -152,6 +164,7 @@ fn claim_session(
     png_base64: String,
     windows: Vec<MonitorRect>,
     started: std::time::Instant,
+    annotate: bool,
 ) -> u64 {
     let epoch = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     if let Ok(mut slot) = SESSION.lock() {
@@ -161,6 +174,7 @@ fn claim_session(
             png_base64: Some(png_base64),
             windows,
             started,
+            annotate,
         });
     }
     epoch
@@ -207,7 +221,7 @@ fn restore_floating(app: &AppHandle) {
 }
 
 /// 抓屏 + 编码 + 入槽 + 开覆盖层。在专用线程上跑（`trigger` 派下来的）。
-fn run_capture(app: &AppHandle) -> Result<(), String> {
+fn run_capture(app: &AppHandle, annotate: bool) -> Result<(), String> {
     // DPI 感知只记录、**不否决**。理由：感知等级影响的是"抓到的画面是不是原生分辨率"
     // （非 Per-Monitor V2 时系统给的是缩放后的那份，糊一点），而坐标换算仍然成立 ——
     // 缓冲区与覆盖层窗口在同一个进程的虚拟化视图里，两边始终 1:1。
@@ -246,7 +260,7 @@ fn run_capture(app: &AppHandle) -> Result<(), String> {
         shot.rect.height,
         png.len()
     );
-    let epoch = claim_session(shot, b64, windows, t0);
+    let epoch = claim_session(shot, b64, windows, t0, annotate);
 
     // 覆盖层的几何与显示都在主线程做：窗口方法从工作线程调用会阻塞在主循环上等待，
     // 而"设尺寸 → 设位置 → 显示 → 抢前台"必须是原子的一个轮次。
@@ -463,9 +477,13 @@ fn finish_session(app: &AppHandle) {
 
 /// 开始一次截图。由全局热键（主线程）与设置页按钮调用。
 ///
+/// `annotate` = 这次是不是标注模式（`snip_annotate` 那条热键 / 设置页那个按钮）。它只影响
+/// 页面拿到 payload 之后怎么走：`false` 沿用"松手即提交"，`true` 松手进标注态等 Enter。
+/// 抓屏、覆盖层、会话、收尾两条路完全共用。
+///
 /// 抓屏、PNG 编码这些重活一律不在主线程做 —— 热键回调就跑在主线程上，
 /// 在那儿 BitBlt 一次会把整个事件循环卡住两三百毫秒。
-pub fn trigger(app: &AppHandle) -> Result<(), String> {
+pub fn trigger(app: &AppHandle, annotate: bool) -> Result<(), String> {
     // swap 的返回值是"进去之前是不是已经有人了"。已经有人时**不要**把它改回 false：
     // 那个 true 属于上一次会话，被这次失败的触发清掉的话，下一次就能并发抓第二张屏。
     if IN_FLIGHT.swap(true, Ordering::SeqCst) {
@@ -494,7 +512,7 @@ pub fn trigger(app: &AppHandle) -> Result<(), String> {
         .spawn(move || {
             // 等 DWM 把悬浮窗真的撤掉（上面的 hide 只是发了消息）。
             std::thread::sleep(HIDE_SETTLE);
-            if let Err(e) = run_capture(&handle) {
+            if let Err(e) = run_capture(&handle, annotate) {
                 tracing::error!("截图失败：{e}");
                 abort_session(&handle, &e);
             }
@@ -513,7 +531,7 @@ pub fn trigger(app: &AppHandle) -> Result<(), String> {
 pub async fn snip_take(app: AppHandle) -> Result<SnipPayload, String> {
     // epoch 与图必须在**同一次加锁**里取：分两次锁的话，中间若换了会话，就会把新会话的图
     // 配着旧 epoch 交出去 —— 页面之后回报的 epoch 永远对不上，症状是"框完点提交没反应"。
-    let (epoch, png, rect, windows, started) = {
+    let (epoch, png, rect, windows, started, annotate) = {
         let mut slot = SESSION.lock().map_err(|_| "截图会话锁不可用")?;
         let s = slot
             .as_mut()
@@ -524,6 +542,7 @@ pub async fn snip_take(app: AppHandle) -> Result<SnipPayload, String> {
             s.shot.rect,
             s.windows.clone(),
             s.started,
+            s.annotate,
         )
     };
     let png = png.ok_or_else(|| "本次截图的底图已被取走过，请重新触发一次截图".to_string())?;
@@ -531,7 +550,8 @@ pub async fn snip_take(app: AppHandle) -> Result<SnipPayload, String> {
     // 带上"距触发多少毫秒"是为了让首帧延迟这件事有真数可看（抓屏 + PNG 编码 + base64 +
     // 派发 + 页面拉取全在这段里），而不是靠人肉对两条日志的时间戳。
     tracing::info!(
-        "截图覆盖层已取走底图（epoch {epoch}，base64 {} 字节，屏 {}x{}，距触发 {} ms）",
+        "截图覆盖层已取走底图（epoch {epoch}，{}模式，base64 {} 字节，屏 {}x{}，距触发 {} ms）",
+        if annotate { "标注" } else { "直出" },
         png.len(),
         rect.width,
         rect.height,
@@ -549,6 +569,7 @@ pub async fn snip_take(app: AppHandle) -> Result<SnipPayload, String> {
         monitor: rect,
         dpr,
         windows,
+        annotate,
     })
 }
 
@@ -559,6 +580,37 @@ pub async fn snip_commit(app: AppHandle, sel: SnipSelection) -> Result<SnipOutco
     tauri::async_runtime::spawn_blocking(move || commit_blocking(&handle, sel))
         .await
         .map_err(|e| format!("截图任务被中断：{e}"))?
+}
+
+/// 把页面回传的标注层合成到裁剪好的 BGRA 上；返回值是"这次到底叠了没有"（只为日志）。
+///
+/// 三条规矩收在这一个函数里，别在调用点各写一遍：
+/// - **没带图层就一个字节都不碰**（老热键那条路、以及标注模式下什么都没画）——
+///   加了字段之后老页面的提交必须仍然逐字节等于加字段之前；
+/// - 解码出的尺寸要**严格等于**选区物理尺寸，不等就 `Err`。缩放或补边会把"页面所见 =
+///   落盘像素"变成一次重采样，而裁偏的图看着完全正常；
+/// - 只动 RGB，底图那第四字节不碰（GDI 交回恒 0，编码 PNG 那一刻才钉 255）——
+///   在这里写 alpha 会顺手改掉 CF_DIB 那份的字节。
+fn apply_annot_layer(
+    dst_bgra: &mut [u8],
+    layer_b64: Option<&str>,
+    width: u32,
+    height: u32,
+) -> Result<bool, String> {
+    let Some(b64) = layer_b64.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(false);
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("标注层 base64 解不开：{e}"))?;
+    let (layer, lw, lh) = capture::decode_png_rgba(&bytes)?;
+    if (lw, lh) != (width, height) {
+        return Err(format!(
+            "标注层尺寸与选区不符：图层 {lw}x{lh}，选区 {width}x{height}（这里不缩放也不补边，请重新框一次）"
+        ));
+    }
+    capture::composite_over(dst_bgra, &layer, width, height)?;
+    Ok(true)
 }
 
 fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, String> {
@@ -574,7 +626,7 @@ fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, S
     // 2) 在锁内**直接裁**：既不 clone 整屏（4K 是 33 MB），也不把底图取走 ——
     //    这一步之后任何失败都保留会话与覆盖层，让用户重新框一次就能再提交，
     //    而不是"失败一次就得重新触发截图"。
-    let (cropped, phys) = {
+    let (mut cropped, phys) = {
         let slot = SESSION.lock().map_err(|_| "截图会话锁不可用")?;
         let s = slot
             .as_ref()
@@ -613,7 +665,22 @@ fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, S
         (cropped, phys)
     };
 
-    // 3) 只把裁出来的小块转 RGBA 编码（CF_DIB 那份仍用原始 BGRA）。
+    // 3) 标注层合成：**全链路只有这一个合成点，且必须在裁剪之后、编码之前**。
+    //    下面两支（第 4 步编码用的 clone、第 6 步交给 CF_DIB 的原块）读的是同一块
+    //    `cropped.bgra`：把合成挪到第 4 步之后，就会得到「落盘那张没标注、剪贴板那份有标注」，
+    //    而两个产物都看着完全正常 —— 这是本模块最难发现的一类不一致。
+    let annotated = apply_annot_layer(
+        &mut cropped.bgra,
+        sel.layer_png_base64.as_deref(),
+        phys.width,
+        phys.height,
+    )?;
+    if annotated {
+        // 成功也要出声：只记失败的话，日志里"叠了标注"和"这压根没带图层"长得一样。
+        tracing::info!("截图已叠加标注层（{}x{}）", phys.width, phys.height);
+    }
+
+    // 4) 只把裁出来的小块转 RGBA 编码（CF_DIB 那份仍用原始 BGRA）。
     let png = capture::encode_png(
         &{
             let mut b = cropped.bgra.clone();
@@ -624,7 +691,7 @@ fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, S
         phys.height,
     )?;
 
-    // 4) 写盘。失败不阻断剪贴板（反过来也一样），两个结果分开交出去。
+    // 5) 写盘。失败不阻断剪贴板（反过来也一样），两个结果分开交出去。
     let dir = focusflow_core::paths::screenshots_dir();
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
     let stem = capture::name_stem(&ts, phys.width, phys.height);
@@ -647,7 +714,7 @@ fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, S
         }
     };
 
-    // 5) 剪贴板：CF_DIB 要的正是裁剪出来那份 BGRA（不用再解码 PNG），PNG 就是刚编好的那一份。
+    // 6) 剪贴板：CF_DIB 要的正是裁剪出来那份 BGRA（不用再解码 PNG），PNG 就是刚编好的那一份。
     //    两个格式都交 —— CF_DIB 给传统 GDI 目标，PNG 给浏览器/网页编辑器（它们不看 CF_DIB）。
     //    线程亲和：整段在同一个 spawn_blocking 线程里跑完（见 core 侧注释）。
     let (clipboard, clipboard_reason) = match capture::win::write_image_to_clipboard(
@@ -705,8 +772,15 @@ pub fn snip_cancel(app: AppHandle, reason: Option<String>) {
 /// 设置页"立即截图"：不依赖热键也能走完整条路（也是手动验证的入口）。
 #[tauri::command]
 pub async fn do_snip(app: AppHandle) -> Result<String, String> {
-    trigger(&app)?;
+    trigger(&app, false)?;
     Ok("已进入截图：拖框选区后自动存盘并复制，按 Esc 取消".to_string())
+}
+
+/// 设置页"框选并标注"：与上面同一条路，只是松手后进标注态（Enter 才提交、Esc 放弃）。
+#[tauri::command]
+pub async fn do_snip_annotate(app: AppHandle) -> Result<String, String> {
+    trigger(&app, true)?;
+    Ok("已进入标注截图：框选后用工具条画，Enter 提交、Backspace 撤销上一笔、Esc 放弃".to_string())
 }
 
 /// 覆盖层被 Alt+F4 / 关闭按钮收走时的收尾。`lib.rs` 的 `on_window_event` 调用。
@@ -825,5 +899,164 @@ mod tests {
     fn stale_reason_names_both_epochs() {
         let r = stale_reason(7);
         assert!(r.contains("epoch=7"), "要带上被拒的 epoch：{r}");
+    }
+
+    // ---------- 标注层合成（M1） ----------
+
+    /// 现场编一层标注 PNG 再 base64 —— 与 core 侧的夹具纪律一致：不依赖外部图片文件。
+    fn b64_layer(rgba: &[u8], w: u32, h: u32) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(capture::encode_png(rgba, w, h).unwrap())
+    }
+
+    fn base_bgra(n: usize) -> Vec<u8> {
+        let mut v = Vec::new();
+        for _ in 0..n {
+            v.extend_from_slice(&[10, 20, 30, 0]);
+        }
+        v
+    }
+
+    /// 老热键那条路（没带图层）必须逐字节等于加这个字段之前 —— 包括只有空格的那一支：
+    /// 页面在"进了标注态但一笔没画"时回传空串，那是正常提交而不是失败。
+    #[test]
+    fn missing_layer_leaves_the_crop_byte_identical() {
+        for none in [None, Some(""), Some("   ")] {
+            let mut dst = base_bgra(8);
+            let before = dst.clone();
+            assert!(
+                !apply_annot_layer(&mut dst, none, 4, 2).unwrap(),
+                "没图层时不该报成功叠加"
+            );
+            assert_eq!(dst, before, "没图层却动了像素：{none:?}");
+        }
+    }
+
+    #[test]
+    fn layer_lands_one_to_one_and_nothing_else_moves() {
+        // 4x2 底图，在 (x=2,y=1) 那一格画一个不透明纯红
+        let w = 4usize;
+        let (px, py) = (2usize, 1usize);
+        let hit = (py * w + px) * 4;
+        let mut layer = vec![0u8; 4 * 4 * 2];
+        layer[hit..hit + 4].copy_from_slice(&[255, 0, 0, 255]);
+        let b64 = b64_layer(&layer, 4, 2);
+
+        let mut dst = base_bgra(8);
+        let before = dst.clone();
+        assert!(
+            apply_annot_layer(&mut dst, Some(&b64), 4, 2).unwrap(),
+            "带图层要报「叠了」"
+        );
+        assert_eq!(
+            &dst[hit..hit + 4],
+            &[0u8, 0, 255, 0],
+            "纯红要落成 BGR(0,0,255) 且第四字节不动"
+        );
+        for (idx, (g, o)) in dst
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(before.as_chunks::<4>().0.iter())
+            .enumerate()
+        {
+            if idx == py * w + px {
+                continue;
+            }
+            assert_eq!(g, o, "第 {idx} 格被标注层碰到了");
+        }
+    }
+
+    /// 尺寸不符是 `Err` 而不是缩放/补边，且报错那一次一个字节都不落到画布上。
+    #[test]
+    fn layer_size_mismatch_is_refused_without_touching_pixels() {
+        let mut layer = vec![0u8; 4 * 2 * 4];
+        for px in layer.as_chunks_mut::<4>().0 {
+            px[3] = 255;
+        }
+        // 2x4 的层交给 4x2 的选区：面积一样但形状不一样，只有严格校验能拦住
+        let b64 = b64_layer(&layer, 2, 4);
+        let mut dst = base_bgra(8);
+        let before = dst.clone();
+        let e = apply_annot_layer(&mut dst, Some(&b64), 4, 2).unwrap_err();
+        assert!(
+            e.contains("2x4") && e.contains("4x2"),
+            "消息要带两组的尺寸：{e}"
+        );
+        assert_eq!(dst, before, "尺寸不符那次不该动到底图像素");
+    }
+
+    #[test]
+    fn garbage_layer_is_an_error_not_a_panic() {
+        let mut dst = base_bgra(8);
+        // 不是 base64
+        assert!(apply_annot_layer(&mut dst, Some("!! 不是 base64 !!"), 4, 2).is_err());
+        // 是 base64 但里面不是 PNG
+        let not_png = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(b"nonsense bytes")
+        };
+        assert!(apply_annot_layer(&mut dst, Some(&not_png), 4, 2).is_err());
+        assert_eq!(dst, base_bgra(8), "两条失败路径都不该留半成品");
+    }
+
+    /// 合成点唯一、且卡在裁剪与编码之间 —— ⚠ 那条"落盘没标注、剪贴板有标注"的护栏。
+    ///
+    /// 只能这样钉：`commit_blocking` 要真窗口才能跑，无头环境进不去，而顺序这件事
+    /// 恰好是纯结构性的（本仓已有同形状的用例：capabilities 里有没有那个 label、
+    /// 覆盖层有没有被写进 tauri.conf.json）。把合成挪到编码之后，这里立刻红。
+    ///
+    /// 判据只读**生产代码那一段**（`#[cfg(test)]` 之前）：一来 `run_capture` 里也有一处
+    /// `let png = capture::encode_png(`（底图那份），不切开就会拿它当锚点；二来本用例自己
+    /// 的字面量也含这些 needle，连着测试一起数就会自己匹配自己。
+    #[test]
+    fn annotation_is_composited_exactly_once_between_crop_and_encode() {
+        let src = include_str!("snip.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let body = &prod[prod.find("fn commit_blocking").expect("提交函数找不到了")..];
+
+        let crop = body
+            .find(".crop(phys.x as u32")
+            .expect("裁剪那一步不见了（用例判据要跟着改）");
+        let encode = body
+            .find("let png = capture::encode_png(")
+            .expect("编码那一步找不到了（用例判据要跟着改）");
+        assert!(crop < encode, "用例自己的前提：提交函数里裁剪在编码之前");
+
+        let inside: usize = body
+            .match_indices("apply_annot_layer(")
+            .filter(|(i, _)| *i > crop && *i < encode)
+            .count();
+        assert_eq!(
+            inside, 1,
+            "裁剪与编码之间必须恰好一个合成点（现在 {inside} 个）"
+        );
+        // 提交函数里只有一处调用它；整段生产代码里则是"定义 + 调用"两处
+        assert_eq!(
+            prod.match_indices("apply_annot_layer(").count(),
+            2,
+            "标注层合成被人加多了一处 —— 两个产物就会不同源"
+        );
+        // 别人绕过这个函数直接去调 core 的合成，也会让"唯一合成点"这条失效
+        assert_eq!(
+            prod.match_indices("composite_over(").count(),
+            1,
+            "composite_over 只允许在 apply_annot_layer 里被调一次"
+        );
+    }
+
+    /// 页面回报的字段是可选的：老页面（和现成夹具）不带 `layer_png_base64` 也必须解得开，
+    /// 否则加一个字段就把"松手即提交"那条老手势判成反序列化失败。
+    #[test]
+    fn selection_without_layer_field_still_deserializes() {
+        let old = r#"{"x":1.0,"y":2.0,"w":3.0,"h":4.0,"dpr":1.5,"epoch":9}"#;
+        let s: SnipSelection = serde_json::from_str(old).expect("老页面的提交体");
+        assert_eq!(s.epoch, 9);
+        assert!(s.layer_png_base64.is_none());
+
+        let with =
+            r#"{"x":1.0,"y":2.0,"w":3.0,"h":4.0,"dpr":1.5,"epoch":9,"layer_png_base64":"AAA"}"#;
+        let s: SnipSelection = serde_json::from_str(with).expect("带标注层的提交体");
+        assert_eq!(s.layer_png_base64.as_deref(), Some("AAA"));
     }
 }

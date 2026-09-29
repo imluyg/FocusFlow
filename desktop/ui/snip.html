@@ -88,6 +88,41 @@
     }
     /* 出错时换成红底：截图是全屏手势，提示必须盖在同一层里才看得见 */
     #hint.error { background: rgba(150, 32, 32, 0.92); }
+    /* 标注层：位图尺寸就是**物理像素**（与 Rust 裁出来的那块 1:1），CSS 尺寸除回 dpr。
+       两件事不能反：位图若按 CSS 尺寸建，提交时要么重采样要么尺寸对不上（Rust 那边是
+       严格相等才合，不等就报错）。pointer-events 关掉 —— 手势一律由 document 上的
+       监听接，画布只做像素。 */
+    #annot {
+      position: fixed;
+      display: none;
+      pointer-events: none;
+    }
+    body.annotating #annot { display: block; }
+    /* 工具条：必须能点（标注态会把整屏冻住盖住，鼠标党不能只靠 Enter/Esc） */
+    #tools {
+      position: fixed;
+      display: none;
+      gap: 4px;
+      padding: 5px;
+      background: rgba(20, 20, 20, 0.92);
+      border-radius: 6px;
+      z-index: 6;
+    }
+    body.annotating #tools { display: flex; }
+    #tools button {
+      padding: 3px 9px;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #eee;
+      background: #232329;
+      border: 1px solid #4a4a52;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    #tools button.on { border-color: #ff8a00; background: #3a2a12; }
+    #tools .sep { width: 1px; background: #4a4a52; margin: 0 3px; }
+    /* 标注态下把选区边框换成"正在编辑"的样子，并让光标在选区内保持十字 */
+    body.annotating #sel { border-color: #4ea1ff; cursor: crosshair; }
   </style>
 </head>
 <body>
@@ -95,6 +130,22 @@
   <div id="veil"></div>
   <div id="snap"></div>
   <div id="sel"></div>
+  <canvas id="annot"></canvas>
+  <div id="tools">
+    <button id="t-rect" data-tool="rect">矩形框</button>
+    <button id="t-arrow" data-tool="arrow">箭头</button>
+    <button id="t-pen" data-tool="pen">画笔</button>
+    <span class="sep"></span>
+    <button id="c-red" data-color="#ff2d2d">红</button>
+    <button id="c-yellow" data-color="#ffd400">黄</button>
+    <span class="sep"></span>
+    <button id="w-thin" data-w="3">细</button>
+    <button id="w-fat" data-w="7">粗</button>
+    <span class="sep"></span>
+    <button id="t-undo">撤销</button>
+    <button id="t-ok">完成</button>
+    <button id="t-cancel">取消</button>
+  </div>
   <div id="size"></div>
   <div id="hint">拖框自由选区 · 单击选中整个窗口 · Esc / 右键取消</div>
   <script type="module" src="snip.js"></script>

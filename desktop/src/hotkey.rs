@@ -63,8 +63,15 @@ fn toggle_main_window(app: &AppHandle) {
 
 /// 区域截图的回调。按了没反应必须留下一条能查到的原因，最常见的一条是"上一张还挂着"。
 fn trigger_snip(app: &AppHandle) {
-    if let Err(e) = crate::snip::trigger(app) {
+    if let Err(e) = crate::snip::trigger(app, false) {
         tracing::warn!("截图热键未能开始：{e}");
+    }
+}
+
+/// 带标注的区域截图：同一套抓屏与覆盖层，只是松手后进标注态而不是立刻结案。
+fn trigger_snip_annotate(app: &AppHandle) {
+    if let Err(e) = crate::snip::trigger(app, true) {
+        tracing::warn!("标注截图热键未能开始：{e}");
     }
 }
 
@@ -88,6 +95,11 @@ const BINDINGS: &[Binding] = &[
         key: "snip",
         what: "区域截图",
         handler: trigger_snip,
+    },
+    Binding {
+        key: "snip_annotate",
+        what: "区域截图（带标注）",
+        handler: trigger_snip_annotate,
     },
 ];
 
