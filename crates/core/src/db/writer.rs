@@ -735,6 +735,11 @@ impl From<AggDeltasFile> for AggDeltas {
 fn snapshot_recovery(state: &WriterState, take: bool) {
     // try_lock：panic 可能发生在持有 agg 锁的线程，此时放弃快照（进程即将终止）
     let Ok(mut agg) = state.agg.try_lock() else {
+        // 这是**唯一的**兜底机制，静默失效等于让人以为有文件在兜着。这里没什么可救的
+        // （锁在谁手里都写不了盘），但至少要留下一行能在日志里查到的话。
+        tracing::error!(
+            "兜底快照拿不到 agg 锁，本次没有写出恢复文件：未落库增量只存在于内存，进程一退就没有了"
+        );
         return;
     };
     // 快照范围是 agg ∪ 在途批次：只按 agg 写文件的话，正在落库的那一批
@@ -1040,11 +1045,14 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
             }
         }
     }
-    if wrote_any {
-        // 首批真的进库了 —— 启动回放留的副本到这里才完成它的使命（见 take_recovery）
-        drop_recovery_leftover(state);
-    }
     if failed.is_empty() {
+        // 这一批**全部**落成，启动回放留的副本到这里才完成使命（见 take_recovery）。
+        // 原先判的是 `wrote_any`（有任何一半落成就扔）：元旦当晚一份增量常跨两个年份库，
+        // 新年库写成、旧年库失败并回填内存，副本却在那一行被删掉 —— 旧年那半只剩内存里
+        // 那一份，进程一退（或当场崩）就两头落空、盘上连痕迹都没有。
+        if wrote_any {
+            drop_recovery_leftover(state);
+        }
         // 全部落库：在途记录作废，并把 stop 超时可能留下的恢复文件收敛掉
         *state.in_flight.lock().unwrap_or_else(|e| e.into_inner()) = AggDeltas::default();
         settle_after_stop_snapshot(state);
@@ -1941,6 +1949,86 @@ mod tests {
         assert!(
             !recovery_kept_path().exists(),
             "首批增量落库后回放副本必须被删掉，别永久留在 data/ 里"
+        );
+        w.stop_and_wait();
+    }
+
+    /// 回放副本要等**这一批全部落成**才扔，不能"有一年半载落成了就当没事了"。
+    ///
+    /// 元旦当晚一份增量常跨两个年份库：新年库写成、旧年库因归档/被占写失败并回填内存，
+    /// 而原先 `drop_recovery_leftover` 挂在 `wrote_any` 那一支 —— 副本就在这一行被删掉了。
+    /// 那批旧年数据此刻只剩内存里那一份，进程一退（或当场崩）就两头落空、盘上无痕迹。
+    #[test]
+    fn the_replay_copy_waits_for_every_year_in_the_batch_to_land() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_leftover_partial");
+        let now = chrono::Local::now();
+        let last_year = now.year() - 1;
+        let dk_last = queries::day_key_of_date(
+            chrono::NaiveDate::from_ymd_opt(last_year, 12, 31).expect("12-31 一定存在"),
+        );
+        let dk_today = queries::day_key_of_date(now.date_naive());
+
+        // ―― 第一次"启动"：攒一批跨年增量，按 stop 那条路写成恢复文件 ――
+        {
+            let w = start_writer(Duration::from_secs(3600));
+            {
+                let mut agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+                agg.daily.insert(dk_last, 4);
+                agg.daily.insert(dk_today, 3);
+            }
+            snapshot_recovery(&w.state, true);
+            assert!(recovery_path().exists(), "前提：恢复文件要跨两次启动留着");
+            w.stop_and_wait();
+        }
+
+        // ―― 第二次"启动"：上一年的库位置做成目录 ⇒ 那一半年份永远写不进去 ――
+        let blocked = paths::year_db_path(last_year);
+        std::fs::create_dir_all(&blocked).expect("把上一年的库做成同名目录");
+        let w = start_writer(Duration::from_secs(3600));
+        assert!(
+            recovery_kept_path().exists(),
+            "前提：回放要留下副本，否则这条用例没有观察量"
+        );
+        w.flush(true);
+
+        // 前提三件：今年的那半真落库了、上一年的那半真没落、副本因此还得留着
+        assert!(
+            w.flush_seq() > 0,
+            "前提：今年那半要真的落成，否则测的是「全失败」那一支"
+        );
+        assert!(
+            w.state
+                .agg
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .daily
+                .contains_key(&dk_last),
+            "前提：上一年那半要确实留在内存里（没落库），副本才有存在的理由"
+        );
+        assert!(
+            recovery_kept_path().exists(),
+            "旧年那半还没落库就把回放副本删了 —— 它此刻只剩内存里那一份，进程一退就两头落空"
+        );
+
+        // ―― 放开障碍：同一批要能补落，且**只落一次**（副本不是永久垃圾） ――
+        std::fs::remove_dir(&blocked).expect("撤掉目录障碍");
+        w.flush(true);
+        assert!(
+            !recovery_kept_path().exists(),
+            "全部落成后副本该删掉，别永久留在 data/ 里"
+        );
+        let conn = connection::open_rw(&blocked).expect("上一年库该被补建出来");
+        let landed_last: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(count),0) FROM daily_counts WHERE date_key=?1",
+                [dk_last],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            landed_last, 4,
+            "旧年那半要补落且只落一次，实得 {landed_last}"
         );
         w.stop_and_wait();
     }
