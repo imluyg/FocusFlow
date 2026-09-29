@@ -362,9 +362,19 @@ mod tests {
         );
     }
 
+    /// `LAST_ERRORS` 是**进程级**的一张表，而 cargo 默认并行跑用例 ⇒ 碰它的用例必须串行。
+    /// 不串行时不是"偶发红"而是"互相看得见对方写的格"：2026-09-29 门禁实测 10 次红 1 次，
+    /// `errors_are_keyed_per_binding` 读到 `toggle_window = Some("B 占用了")` ——
+    /// 那串只有隔壁 `two_errors_coexist_without_overwriting` 会写。
+    fn last_errors_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 失败原因必须按 key 分格，且"这一条不注册"会清掉**它自己**的旧报错。
     #[test]
     fn errors_are_keyed_per_binding() {
+        let _lock = last_errors_lock();
         set_last_error("snip", Some("被占用".to_string()));
         assert_eq!(last_error("snip").as_deref(), Some("被占用"));
         assert_eq!(
@@ -381,6 +391,7 @@ mod tests {
     /// 结束时把两格都清掉：这几条用例共用同一张进程级表，不清会把状态漏给下一条。
     #[test]
     fn two_errors_coexist_without_overwriting() {
+        let _lock = last_errors_lock();
         set_last_error("snip", Some("A 占用了".to_string()));
         set_last_error("toggle_window", Some("B 占用了".to_string()));
         assert_eq!(last_error("snip").as_deref(), Some("A 占用了"));
