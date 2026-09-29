@@ -223,11 +223,29 @@ fn run_capture(app: &AppHandle) -> Result<(), String> {
              但选区换算不受影响，继续）"
         );
     }
+    // 分阶段计时：只为回答一个具体问题 —— "要不要把底图改成分块拉"。
+    // 只报一个总数的话，永远看不出是抓屏慢、编码慢，还是 base64 那 33% 的膨胀在吃时间。
+    let mut stage = std::time::Instant::now();
     let shot = capture::win::capture_at_cursor()?;
+    let d_grab = stage.elapsed().as_millis();
+    stage = std::time::Instant::now();
     // 吸附候选在**冻结这一刻**取：这时覆盖层还没显示，z 序就是用户此刻看到的顺序。
     let windows = capture::win::snap_targets(&shot.rect);
+    let d_windows = stage.elapsed().as_millis();
+    stage = std::time::Instant::now();
     let png = capture::encode_png(&shot.rgba(), shot.rect.width, shot.rect.height)?;
+    let d_png = stage.elapsed().as_millis();
+    stage = std::time::Instant::now();
     let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+    let d_b64 = stage.elapsed().as_millis();
+    tracing::info!(
+        "截图底图就绪：抓屏 {d_grab}ms / 枚举窗口 {d_windows}ms（候选 {} 个）/ PNG 编码 {d_png}ms / \
+         base64 {d_b64}ms，屏 {}x{}，png {} 字节",
+        windows.len(),
+        shot.rect.width,
+        shot.rect.height,
+        png.len()
+    );
     let epoch = claim_session(shot, b64, windows, t0);
 
     // 覆盖层的几何与显示都在主线程做：窗口方法从工作线程调用会阻塞在主循环上等待，
