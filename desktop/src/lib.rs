@@ -245,3 +245,270 @@ pub fn run() {
             }
         });
 }
+
+/// 接线审计：前端叫的命令、程序建的窗口，与 Rust 侧注册表 / capabilities 必须对得上。
+///
+/// 为什么要写成用例而不是靠 review：这两件事坏掉时的症状都是**"页面做了个动作，什么都没发生"**，
+/// 而且现场不留痕迹 —— `snip` 那次就是覆盖层窗口的 label 没进 `capabilities/default.json`，
+/// 结果页面第一个 `invoke` 就被拒，而编译、用例、门禁全绿，只能靠人去点。命令名写错一个字母同理：
+/// `invoke("get_plugin_views")` 照样能编译、能跑，只是永远 reject。
+///
+/// 两条断言各管一个方向，都是**扫源码**而不是维护第二份清单（清单一旦要人手同步，
+/// 就回到"改一漏一"那个老账上）。
+#[cfg(test)]
+mod wiring_audit {
+    use std::path::{Path, PathBuf};
+
+    /// 程序会创建的**全部**窗口 label。新增窗口必须登记到这里 —— 没登记时第二条断言会红，
+    /// 红消息里会写出是在哪个文件建出来的。
+    const APP_WINDOW_LABELS: [&str; 3] = ["main", "floating", "snip"];
+
+    fn read(rel: &str) -> String {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("读 {} 失败：{e}", p.display()))
+    }
+
+    /// 递归收集 `ui/` 下的 .js（前端源码都在那儿，`snip.js` 在 `ui/` 根而不是 `ui/js/`）。
+    fn js_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        walk(dir, "js", out);
+    }
+
+    /// 递归收集 `src/` 下的 .rs（建窗点可能出现在任何模块）。
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        walk(dir, "rs", out);
+    }
+
+    fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
+        for entry in
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("读 {} 失败：{e}", dir.display()))
+        {
+            let path = entry.expect("读目录项失败").path();
+            if path.is_dir() {
+                walk(&path, ext, out);
+            } else if path.extension().is_some_and(|e| e == ext) {
+                out.push(path);
+            }
+        }
+    }
+
+    /// 取 `name[...]` 之后与配平的 `]` 之间那一段（`[` `]` 计数，能穿过嵌套）。
+    fn bracket_block(text: &str, opener: &str) -> Option<String> {
+        let start = text.find(opener)? + opener.len();
+        let bytes: Vec<char> = text[start..].chars().collect();
+        let mut depth = 1usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(text[start..start + chars_upto(&bytes, i)].to_string());
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// `chars` 前 i 个字符在原串里占多少 byte —— 用 ASCII 之外的中文注释把索引对回去。
+    fn chars_upto(bytes: &[char], i: usize) -> usize {
+        bytes[..i].iter().map(|c| c.len_utf8()).sum()
+    }
+
+    fn registered_commands() -> Vec<String> {
+        let src = read("src/lib.rs");
+        let block =
+            bracket_block(&src, "generate_handler![").expect("lib.rs 里找不到 generate_handler!");
+        let mut names: Vec<String> = block
+            .split(',')
+            .map(|s| {
+                s.lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<String>()
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.rsplit("::").next().unwrap_or_default().to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn invoked_commands() -> (Vec<String>, Vec<String>) {
+        let mut files = Vec::new();
+        js_files(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui"),
+            &mut files,
+        );
+        assert!(
+            !files.is_empty(),
+            "一个 .js 都没找到 —— 扫描路径错了，这条断言就没有观察量"
+        );
+        let mut names = Vec::new();
+        let mut unresolved = Vec::new();
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            let rel = f.file_name().unwrap().to_string_lossy().to_string();
+            for chunk in text.split("invoke(").skip(1) {
+                let head = chunk.split([',', ')', '\n']).next().unwrap_or("").trim();
+                let quoted = head
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .or_else(|| head.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')));
+                match quoted {
+                    Some(n) if !n.is_empty() => names.push(n.to_string()),
+                    // 动态命令名（`invoke(cmd)`）以前没有过，出现了就要人来看一眼：
+                    // 静默跳过会让这条审计悄悄失去覆盖面。
+                    _ => unresolved.push(format!("{rel}: invoke({head}…)")),
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        (names, unresolved)
+    }
+
+    fn capability_windows() -> Vec<String> {
+        let json = read("capabilities/default.json");
+        let Some(at) = json.find("\"windows\"") else {
+            panic!("capabilities/default.json 里没有 windows 字段");
+        };
+        let block = json[at..]
+            .split_once('[')
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(inner, _)| inner.to_string())
+            .expect("windows 字段不是数组");
+        block
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// 前端叫到的每个命令，都必须在 `invoke_handler` 的注册表里。
+    #[test]
+    fn every_invoked_command_is_registered() {
+        let (called, dynamic) = invoked_commands();
+        assert!(
+            dynamic.is_empty(),
+            "出现了动态命令名，这条审计不再覆盖它们，请改写法或显式登记：\n{}",
+            dynamic.join("\n")
+        );
+        let registered = registered_commands();
+        let missing: Vec<&String> = called.iter().filter(|c| !registered.contains(c)).collect();
+        assert!(
+            missing.is_empty(),
+            "前端 invoke 了没注册的命令（会被拒，症状是\"点了没反应\"）：{:?}\n注册表有 {} 条",
+            missing,
+            registered.len()
+        );
+        // 反向不判：注册了但前端没叫的（`quit` / `flush_db` / `dbg_log`）是留给插件面板与
+        // 兜底路径用的，当成死代码报会一直红 —— 那是另一件事，不该混进这条断言里。
+    }
+
+    /// 程序建的每个窗口 label 都必须在 capabilities 里，否则那个窗口拿不到 `core:default`，
+    /// 它发出的第一个 `invoke` 就会被拒（`snip` 那次真机就是这样）。
+    #[test]
+    fn every_window_label_has_a_capability() {
+        let caps = capability_windows();
+        for label in APP_WINDOW_LABELS {
+            assert!(
+                caps.iter().any(|w| w == label),
+                "窗口 {label} 不在 capabilities/default.json 的 windows 里 —— 它的 invoke 会全被拒"
+            );
+        }
+
+        // 建窗侧：扫 builder 的第二参数（字面量或 `&str` 常量），不许出现没登记的 label。
+        // 扫整个 src/ 而不是写死几个文件名 —— 写死清单等于"改一漏一"，新模块建窗就漏掉了。
+        let mut builders = Vec::new();
+        rust_files(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut builders,
+        );
+        let mut found: Vec<(String, String)> = Vec::new();
+        for f in builders {
+            let src = std::fs::read_to_string(&f).unwrap();
+            let body = strip_line_comments(&src);
+            let rel = f.file_name().unwrap().to_string_lossy().to_string();
+            for chunk in body.split(&format!("{BUILDER_MARK}(")).skip(1) {
+                // 第二个逗号段就是 label：`new(app, "main", WebviewUrl::…)` 或 `new(app, SNIP_LABEL, …)`
+                let second = chunk
+                    .split(',')
+                    .nth(1)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let label = match second.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                    Some(q) => q.to_string(),
+                    // 常量（如 SNIP_LABEL）：回到同一个文件里查它等于哪个串
+                    None => lookup_const(&src, &second).unwrap_or_else(|| {
+                        panic!("{rel} 里用 `{second}` 建窗，但解不出这个常量的值，请改审计或登记")
+                    }),
+                };
+                found.push((label, rel.clone()));
+            }
+        }
+        assert!(
+            !found.is_empty(),
+            "一个建窗点都没扫到 —— 扫描写法过期了，别让它假装通过"
+        );
+        for (label, where_) in &found {
+            assert!(
+                APP_WINDOW_LABELS.contains(&label.as_str()),
+                "{where_} 建了窗口 \"{label}\"，但没登记进 APP_WINDOW_LABELS（新窗口要同步 capabilities）"
+            );
+        }
+
+        // 配置侧：tauri.conf.json 预声明的窗口同样要在 capabilities 里。
+        let conf = read("tauri.conf.json");
+        for chunk in conf.split("\"label\"").skip(1) {
+            let Some(rest) = chunk.split(':').nth(1) else {
+                continue;
+            };
+            let label = rest
+                .trim_start()
+                .strip_prefix('"')
+                .and_then(|s| s.split('"').next())
+                .unwrap_or_default()
+                .to_string();
+            if label.is_empty() {
+                continue;
+            }
+            assert!(
+                caps.contains(&label),
+                "tauri.conf.json 里的窗口 \"{label}\" 不在 capabilities 的 windows 里"
+            );
+        }
+    }
+
+    /// 建窗调用的前缀。扫的是这个串再拼上 `(`（所以整串在源码文本里不成形），写成运行时拼接
+    /// 是因为第一版被**自己注释里抄的那段示例**喂了一个假建窗点。
+    const BUILDER_MARK: &str = "WebviewWindowBuilder::new";
+
+    /// 丢掉行注释（只用于扫描，不影响编译）。粗到"整行 `//` 之后全切"，代价可能改坏
+    /// 某行里的 URL 字符串 —— 那不影响本审计，因为它只找 builder 标记和紧跟其后的引号。
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 在同一个文件里找 `const NAME: &str = "value"`。
+    fn lookup_const(src: &str, name: &str) -> Option<String> {
+        let at = src.find(&format!("const {name}"))?;
+        let value = src[at..]
+            .split('"')
+            .nth(1)
+            .filter(|s| !s.is_empty())?
+            .to_string();
+        Some(value)
+    }
+}
