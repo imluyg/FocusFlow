@@ -1255,6 +1255,40 @@ mod tests {
             assert_eq!(h.biCompression, BI_RGB.0);
         }
 
+        /// 平台前提（不是功能测试）：`GlobalUnlock` 在**锁计数归零**时返回 0，而它不写
+        /// LastError —— 于是 windows 把 BOOL 包成 `Result`（判据 `!=0`）之后，"成功解锁"
+        /// 变成 `Err(操作成功完成 0x0)`。
+        ///
+        /// 这条钉的是 `prep_global` 为什么**必须忽略** `GlobalUnlock` 的返回值：当年把它当错误
+        /// 提前返回，造成每次截图清空用户剪贴板却什么都不复制，错着走了三个版本。
+        /// 它只 lock/unlock 自己分配的一块全局内存、**不碰剪贴板**，所以能进门禁。
+        /// 哪天封装改了约定（真的返回 Ok），这条会红，要重看的是 `prep_global` 的写法。
+        #[test]
+        fn global_unlock_reports_the_lock_count_not_an_error() {
+            use windows::Win32::Foundation::{GetLastError, GlobalFree, SetLastError, WIN32_ERROR};
+            use windows::Win32::System::Memory::{
+                GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+            };
+            unsafe {
+                SetLastError(WIN32_ERROR(0));
+                let hg = GlobalAlloc(GMEM_MOVEABLE, 64).expect("GlobalAlloc 该成功");
+                assert!(!GlobalLock(hg).is_null(), "刚分配的全局内存锁不住？");
+                SetLastError(WIN32_ERROR(0));
+                let unlocked = GlobalUnlock(hg);
+                let last = GetLastError();
+                assert!(
+                    unlocked.is_err(),
+                    "windows 现在把返回 0 当成功了？那 prep_global 里「忽略返回值」的写法要重评"
+                );
+                assert_eq!(
+                    last,
+                    WIN32_ERROR(0),
+                    "锁计数归零不是错误，不该留下错误码 —— 日志里那句「失败：操作成功完成」就是这么来的"
+                );
+                let _ = GlobalFree(Some(hg));
+            }
+        }
+
         /// 吸附候选的过滤与裁剪，逐条钉住 —— 每条过滤都对应一种真实噪声，
         /// 合并成一个 `if` 就看不出哪条还活着，所以分开断言。
         #[test]
