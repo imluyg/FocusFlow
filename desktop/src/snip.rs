@@ -55,6 +55,9 @@ struct Session {
     /// 取走即空，之后任何一次 `snip_take` 都算陈旧会话，同时这也是看门狗判断
     /// "页面到底拉过图没有"的唯一观察量。
     png_base64: Option<String>,
+    /// 这块屏上当时可吸附的窗口矩形（z-order 顶→底），随底图一起交给覆盖层。
+    /// 抓一次就固定下来：截图期间桌面本来就被冻结了，页面反复拉取也不该看到不同的清单。
+    windows: Vec<MonitorRect>,
     /// 从"按下热键"那一刻起算，用来把首帧耗时打进日志（4K/高缩放的④项要靠它出真数，
     /// 现在手上只有 1080p 的两次读数）。
     started: std::time::Instant,
@@ -92,6 +95,10 @@ pub struct SnipPayload {
     pub monitor: MonitorRect,
     /// Rust 侧认定的缩放倍数，页面拿来和自己的 `devicePixelRatio` 对账。
     pub dpr: f64,
+    /// 可吸附窗口（物理像素，z-order 顶→底）。**跟着这份 payload 走而不是另开命令**：
+    /// 覆盖层那回 label 不在任何 capability 里、第一个 `invoke` 就失败，所以这里
+    /// 刻意不加 IPC 面，页面也拿不到"半新半旧"的两份数据。
+    pub windows: Vec<MonitorRect>,
 }
 
 /// 提交结果。两个下游动作**分开**上报，不合并成一个"成功/失败"：
@@ -140,13 +147,19 @@ fn outcome_line(saved: bool, save_reason: &str, clipboard: bool, clip_reason: &s
 }
 
 /// 占用会话槽位；已经有会话在进行中时返回 false（调用方直接放弃这次触发）。
-fn claim_session(shot: Shot, png_base64: String, started: std::time::Instant) -> u64 {
+fn claim_session(
+    shot: Shot,
+    png_base64: String,
+    windows: Vec<MonitorRect>,
+    started: std::time::Instant,
+) -> u64 {
     let epoch = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     if let Ok(mut slot) = SESSION.lock() {
         *slot = Some(Session {
             epoch,
             shot,
             png_base64: Some(png_base64),
+            windows,
             started,
         });
     }
@@ -211,9 +224,11 @@ fn run_capture(app: &AppHandle) -> Result<(), String> {
         );
     }
     let shot = capture::win::capture_at_cursor()?;
+    // 吸附候选在**冻结这一刻**取：这时覆盖层还没显示，z 序就是用户此刻看到的顺序。
+    let windows = capture::win::snap_targets(&shot.rect);
     let png = capture::encode_png(&shot.rgba(), shot.rect.width, shot.rect.height)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-    let epoch = claim_session(shot, b64, t0);
+    let epoch = claim_session(shot, b64, windows, t0);
 
     // 覆盖层的几何与显示都在主线程做：窗口方法从工作线程调用会阻塞在主循环上等待，
     // 而"设尺寸 → 设位置 → 显示 → 抢前台"必须是原子的一个轮次。
@@ -480,12 +495,18 @@ pub fn trigger(app: &AppHandle) -> Result<(), String> {
 pub async fn snip_take(app: AppHandle) -> Result<SnipPayload, String> {
     // epoch 与图必须在**同一次加锁**里取：分两次锁的话，中间若换了会话，就会把新会话的图
     // 配着旧 epoch 交出去 —— 页面之后回报的 epoch 永远对不上，症状是"框完点提交没反应"。
-    let (epoch, png, rect, started) = {
+    let (epoch, png, rect, windows, started) = {
         let mut slot = SESSION.lock().map_err(|_| "截图会话锁不可用")?;
         let s = slot
             .as_mut()
             .ok_or_else(|| "没有进行中的截图".to_string())?;
-        (s.epoch, s.png_base64.take(), s.shot.rect, s.started)
+        (
+            s.epoch,
+            s.png_base64.take(),
+            s.shot.rect,
+            s.windows.clone(),
+            s.started,
+        )
     };
     let png = png.ok_or_else(|| "本次截图的底图已被取走过，请重新触发一次截图".to_string())?;
     // 这一行与 `on_page_load` 的"完成"配对看：加载完成却没有这行 = 页面脚本没跑起来。
@@ -509,6 +530,7 @@ pub async fn snip_take(app: AppHandle) -> Result<SnipPayload, String> {
         png_base64: png,
         monitor: rect,
         dpr,
+        windows,
     })
 }
 

@@ -276,9 +276,12 @@ pub mod win {
     use std::sync::OnceLock;
     use std::time::Duration;
 
-    use windows::core::w;
+    use windows::core::{w, BOOL};
     use windows::Win32::Foundation::{
         GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    };
+    use windows::Win32::Graphics::Dwm::{
+        DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
     };
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
@@ -298,8 +301,9 @@ pub mod win {
         DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, GetCursorPos, IsWindow, RegisterClassW, HWND_MESSAGE,
-        WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, EnumWindows, GetCursorPos, GetWindowLongPtrW,
+        GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+        RegisterClassW, GWL_EXSTYLE, HWND_MESSAGE, WNDCLASSW, WS_EX_TOOLWINDOW,
     };
 
     use super::{MonitorRect, Shot};
@@ -767,6 +771,120 @@ pub mod win {
         }
         Ok(())
     }
+
+    /// 一个窗口能被枚举到的全部事实。纯数据 ⇒ 过滤规则能脱离真实桌面窗口被断言：
+    /// `snap_candidate` 有用例钉着，`snap_targets` 只负责把这些事实取回来。
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct WinFacts {
+        pub visible: bool,
+        pub iconic: bool,
+        pub cloaked: bool,
+        pub tool_window: bool,
+        pub own_process: bool,
+        /// 物理边界 (left, top, right, bottom)；取不到就是 `None`。
+        pub bounds: Option<(i32, i32, i32, i32)>,
+    }
+
+    /// 这个窗口能不能当"点一下选中整窗"的候选；能的话给出**裁进这块屏**的矩形。
+    ///
+    /// 每条过滤都对应一种真实噪声：
+    /// - 不可见 / 最小化：框上去是一张空图。
+    /// - DWM cloaked：UWP、Edge 那些"`IsWindowVisible` 说 TRUE、其实根本没在画"的窗口。
+    /// - `WS_EX_TOOLWINDOW`：菜单、tooltip、自动补全弹层 —— 它们恰恰挂在最上层，
+    ///   不排掉的话鼠标一停就吸到一条 8 像素高的悬浮条上。
+    /// - 本进程的窗口：截图覆盖层自己铺满整屏，选中它等于"点一下＝整屏"，功能当场作废。
+    ///   代价是程序自己的主窗口/悬浮窗也只能拖框 —— 绕不开，tauri 的窗口类名是 WebView2
+    ///   那套通用名，认不出"哪个 hwnd 是我"。
+    ///
+    /// 裁剪不是可选项：窗口经常露出一屏外（贴边、跨屏），而 `Shot::crop` 对越界选区是**报错**，
+    /// 不裁就成了"点一下整窗，结果截图失败"。小于 8x8 的一律不要 —— 选中只产出废图。
+    pub fn snap_candidate(f: &WinFacts, monitor: &MonitorRect) -> Option<MonitorRect> {
+        if !f.visible || f.iconic || f.cloaked || f.tool_window || f.own_process {
+            return None;
+        }
+        let (l, t, r, b) = f.bounds?;
+        let left = l.max(monitor.x);
+        let top = t.max(monitor.y);
+        let right = r.min(monitor.x + monitor.width as i32);
+        let bottom = b.min(monitor.y + monitor.height as i32);
+        let w = (right - left).max(0) as u32;
+        let h = (bottom - top).max(0) as u32;
+        if w < 8 || h < 8 {
+            return None;
+        }
+        MonitorRect::new(left, top, w, h).ok()
+    }
+
+    /// 按 **z-order 从最上往下**列出这块屏上可吸附的窗口矩形（第一个包住光标的就是用户看到的）。
+    ///
+    /// `EnumWindows` 的枚举顺序就是桌面 z 序（顶层在前）。这件事对以后做贴图有实际作用：
+    /// 贴图窗口是 topmost，它盖在目标之上时**应该吸到贴图**，按 z 序取第一个就自然成立，
+    /// 不用为它写任何特例。
+    ///
+    /// 边界优先取 `DWMWA_EXTENDED_FRAME_BOUNDS`：Win10/11 的 `GetWindowRect` 含一圈不可见的
+    /// 调整边框（每边约 7~8 像素），拿它当"这个窗口长什么样"会明显偏大一圈。
+    pub fn snap_targets(monitor: &MonitorRect) -> Vec<MonitorRect> {
+        struct Ctx {
+            monitor: MonitorRect,
+            own_pid: u32,
+            out: Vec<MonitorRect>,
+        }
+
+        unsafe extern "system" fn each(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let ctx = &mut *(lparam.0 as *mut Ctx);
+            let mut r = RECT::default();
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            let mut cloaked: u32 = 0;
+            let bounds = if DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut r as *mut RECT as *mut core::ffi::c_void,
+                core::mem::size_of::<RECT>() as u32,
+            )
+            .is_ok()
+            {
+                Some((r.left, r.top, r.right, r.bottom))
+            } else if GetWindowRect(hwnd, &mut r).is_ok() {
+                // DWM 拿不到（没合成、老驱动）就退回 GDI 那份：偏一点总比没有强。
+                Some((r.left, r.top, r.right, r.bottom))
+            } else {
+                None
+            };
+            let facts = WinFacts {
+                visible: IsWindowVisible(hwnd).as_bool(),
+                iconic: IsIconic(hwnd).as_bool(),
+                cloaked: DwmGetWindowAttribute(
+                    hwnd,
+                    DWMWA_CLOAKED,
+                    &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+                    core::mem::size_of::<u32>() as u32,
+                )
+                .is_ok()
+                    && cloaked != 0,
+                tool_window: (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW.0 as isize)
+                    != 0,
+                own_process: pid != 0 && pid == ctx.own_pid,
+                bounds,
+            };
+            if let Some(rect) = snap_candidate(&facts, &ctx.monitor) {
+                ctx.out.push(rect);
+            }
+            true.into()
+        }
+
+        let mut ctx = Ctx {
+            monitor: *monitor,
+            own_pid: std::process::id(),
+            out: Vec::new(),
+        };
+        // 枚举失败不是错误而只是"这次没有候选"：底图已经抓好了，点选退化成拖框就行。
+        if let Err(e) = unsafe { EnumWindows(Some(each), LPARAM(&mut ctx as *mut Ctx as isize)) } {
+            tracing::warn!("枚举窗口失败，本次截图没有吸附候选：{e}");
+            return Vec::new();
+        }
+        ctx.out
+    }
 }
 
 #[cfg(test)]
@@ -1135,6 +1253,88 @@ mod tests {
             assert_eq!(h.biBitCount, 32);
             assert_eq!(h.biPlanes, 1);
             assert_eq!(h.biCompression, BI_RGB.0);
+        }
+
+        /// 吸附候选的过滤与裁剪，逐条钉住 —— 每条过滤都对应一种真实噪声，
+        /// 合并成一个 `if` 就看不出哪条还活着，所以分开断言。
+        #[test]
+        fn snap_candidate_filters_noise_and_clamps_to_the_monitor() {
+            let mon = crate::capture::MonitorRect::new(0, 0, 1920, 1080).unwrap();
+            let base = win::WinFacts {
+                visible: true,
+                bounds: Some((100, 100, 600, 500)),
+                ..Default::default()
+            };
+            let reject = |f: win::WinFacts| {
+                assert!(
+                    win::snap_candidate(&f, &mon).is_none(),
+                    "这类窗口不该进候选：{f:?}"
+                );
+            };
+
+            let got = win::snap_candidate(&base, &mon).expect("正常窗口该是候选");
+            assert_eq!((got.x, got.y, got.width, got.height), (100, 100, 500, 400));
+
+            reject(win::WinFacts {
+                visible: false,
+                ..base
+            });
+            reject(win::WinFacts {
+                iconic: true,
+                ..base
+            });
+            // UWP/Edge 那些"IsWindowVisible 说 TRUE 其实没在画"的
+            reject(win::WinFacts {
+                cloaked: true,
+                ..base
+            });
+            // 菜单、tooltip、自动补全弹层：它们恰恰挂在最上层
+            reject(win::WinFacts {
+                tool_window: true,
+                ..base
+            });
+            // 自己进程不排掉的话，铺满整屏的覆盖层永远是第一个候选 ⇒ 点一下＝整屏
+            reject(win::WinFacts {
+                own_process: true,
+                ..base
+            });
+            reject(win::WinFacts {
+                bounds: None,
+                ..base
+            });
+            // 5x400 的边条：选中只会产出一张废图
+            reject(win::WinFacts {
+                bounds: Some((100, 100, 104, 504)),
+                ..base
+            });
+            // 完全在这块屏之外
+            reject(win::WinFacts {
+                bounds: Some((-4000, -4000, -3000, -3000)),
+                ..base
+            });
+
+            // 露出一屏外要**裁进来**：`Shot::crop` 对越界选区是报错，不裁就成了"点一下反而失败"
+            let got = win::snap_candidate(
+                &win::WinFacts {
+                    bounds: Some((-100, -100, 3000, 3000)),
+                    ..base
+                },
+                &mon,
+            )
+            .expect("跨边窗口裁进来后仍是候选");
+            assert_eq!((got.x, got.y, got.width, got.height), (0, 0, 1920, 1080));
+
+            // 副屏（负原点）上算的也是它自己那块矩形，不被原点的符号带偏
+            let sec = crate::capture::MonitorRect::new(-1920, 0, 1920, 1080).unwrap();
+            let got = win::snap_candidate(
+                &win::WinFacts {
+                    bounds: Some((-1500, 20, -1000, 520)),
+                    ..base
+                },
+                &sec,
+            )
+            .expect("副屏上的窗口该能吸附");
+            assert_eq!((got.x, got.y, got.width, got.height), (-1500, 20, 500, 500));
         }
 
         #[test]

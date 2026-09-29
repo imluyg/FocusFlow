@@ -42,7 +42,8 @@ png = "0.18"
 # 前台应用统计（仅用窗口 API + 进程快照，不对其他进程开句柄）
 # 设备维度统计用 Raw Input（Win32_UI_Input_KeyboardAndMouse）
 # 截图（capture 模块）用 Gdi 取屏、DataExchange/Memory 写 CF_DIB 剪贴板、
-# HiDpi 核对进程 DPI 感知（坐标模型成立的前提）
+# HiDpi 核对进程 DPI 感知（坐标模型成立的前提）、
+# Dwm 读窗口的真实可见边界（`DWMWA_EXTENDED_FRAME_BOUNDS`）与 cloak 状态（吸附选窗用）
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
@@ -50,6 +51,7 @@ windows = { version = "0.61", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_DataExchange",

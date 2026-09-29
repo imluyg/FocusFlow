@@ -41,6 +41,16 @@
     }
     /* 未开始拖框时整屏压暗，让"已经冻结了"这件事一眼可见 */
     body:not(.dragging) #sel { display: none; }
+    /* 鼠标停在某个窗口上时的吸附轮廓：亮着 = 这一下点下去选中整个窗口；
+       不亮 = 这一下点下去是取消。颜色与选区橙错开，免得看成已经框好的选区。 */
+    #snap {
+      position: fixed;
+      display: none;
+      border: 2px solid #4ea1ff;
+      box-sizing: border-box;
+      background: rgba(78, 161, 255, 0.08);
+      pointer-events: none;
+    }
     #veil {
       position: fixed;
       inset: 0;
@@ -48,6 +58,8 @@
       pointer-events: none;
     }
     body.has-sel #veil { display: none; }
+    /* 有高亮候选时也揭开压暗：不然"要点的是哪一块"看不清楚 */
+    body.has-snap #veil { display: none; }
     #size {
       position: fixed;
       display: none;
@@ -81,9 +93,10 @@
 <body>
   <img id="shot" alt="" />
   <div id="veil"></div>
+  <div id="snap"></div>
   <div id="sel"></div>
   <div id="size"></div>
-  <div id="hint">拖框选区 · Esc 取消</div>
+  <div id="hint">拖框自由选区 · 单击选中整个窗口 · Esc / 右键取消</div>
   <script type="module" src="snip.js"></script>
 </body>
 </html>

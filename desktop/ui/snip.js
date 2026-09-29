@@ -9,16 +9,28 @@
 //    而这个手势的定义就是"一次框选一张"。
 // 3. 缩放倍数在这里先和 Rust 认定的值对账，对不上就不提交 —— 裁偏的图看着完全正常，
 //    是最难被发现的一种坏。
+// 4. **单击 = 选中光标下那个窗口**（Rust 给的 z-order 里第一个包住光标的），
+//    拖框 = 自由矩形，松手即完成这点不变。原来"单击 = 取消"仍然成立，只是变成
+//    "没有候选时才取消" —— 取消还有 Esc 与右键两条路，都不受影响。
+//    清单是冻结那一刻定下来的，所以覆盖层自己不会在里面（它那时还没显示，
+//    而且 Rust 侧按进程号排掉了自己进程的窗口）。
 import { invoke, listen } from "./js/tauri.js";
 
 const img = document.getElementById("shot");
 const sel = document.getElementById("sel");
+const snapEl = document.getElementById("snap");
 const sizeEl = document.getElementById("size");
 const hint = document.getElementById("hint");
+
+// 按下到抬起的位移小于它就当作"单击"（沿用原来那个"没框住任何东西"的判据，
+// 只是现在单击不再是取消，而是选中光标下那个窗口 —— 没有候选时才仍是取消）。
+const CLICK_SLACK = 2;
 
 const dpr = window.devicePixelRatio || 1;
 let epoch = 0;
 let monitor = null;
+/** 可吸附窗口，已换算成 CSS 像素、相对视口；顺序是 z-order 顶→底（Rust 侧 EnumWindows 给的）。 */
+let wins = [];
 let submitted = false;
 let pulling = false;
 let started = false;
@@ -46,11 +58,8 @@ window.addEventListener("unhandledrejection", (e) =>
   giveUp("页面异步失败：" + String((e.reason && e.reason.message) || e.reason))
 );
 
-function showBox(a, b) {
-  const x = Math.min(a.x, b.x);
-  const y = Math.min(a.y, b.y);
-  const w = Math.abs(b.x - a.x);
-  const h = Math.abs(b.y - a.y);
+/** 画选区并同步尺寸标签。参数是 CSS 像素、相对视口。 */
+function applyBox(x, y, w, h) {
   box = { x, y, w, h };
   sel.style.left = x + "px";
   sel.style.top = y + "px";
@@ -65,35 +74,43 @@ function showBox(a, b) {
   sizeEl.style.top = Math.max(0, y - 22) + "px";
 }
 
+function showBox(a, b) {
+  applyBox(
+    Math.min(a.x, b.x),
+    Math.min(a.y, b.y),
+    Math.abs(b.x - a.x),
+    Math.abs(b.y - a.y)
+  );
+}
+
 function point(e) {
   return { x: e.clientX, y: e.clientY };
 }
 
-document.addEventListener("mousedown", (e) => {
-  if (submitted || !started) return;
-  if (e.button === 2) return; // 右键交给 contextmenu 处理成"取消"
-  if (e.button !== 0) return;
-  anchor = point(e);
-  document.body.classList.add("dragging");
-});
+/** 光标下最上面那个可吸附窗口。`wins` 已经是 z-order 顶→底，所以 find 就是"看到的那个"。 */
+function snapAt(p) {
+  return (
+    wins.find((w) => p.x >= w.x && p.x < w.x + w.w && p.y >= w.y && p.y < w.y + w.h) || null
+  );
+}
 
-document.addEventListener("mousemove", (e) => {
-  if (!anchor || submitted) return;
-  showBox(anchor, point(e));
-});
-
-document.addEventListener("mouseup", (e) => {
-  if (!anchor || submitted) return;
-  const end = point(e);
-  const a = anchor;
-  anchor = null;
-  document.body.classList.remove("dragging");
-  if (Math.abs(end.x - a.x) < 2 || Math.abs(end.y - a.y) < 2) {
-    // 按下就松开：没有框住任何东西。按"取消"处理，而不是产出一张 1×1 的图。
-    giveUp("");
+/** 高亮吸附候选。轮廓亮着 = 这一下点下去会选中整个窗口；不亮 = 这一下是取消。 */
+function showSnap(r) {
+  // 揭开压暗也挂在这个开关上：不揭开的话"要点的是哪一块"看不清
+  document.body.classList.toggle("has-snap", !!r);
+  if (!r) {
+    snapEl.style.display = "none";
     return;
   }
-  showBox(a, end);
+  snapEl.style.left = r.x + "px";
+  snapEl.style.top = r.y + "px";
+  snapEl.style.width = r.w + "px";
+  snapEl.style.height = r.h + "px";
+  snapEl.style.display = "block";
+}
+
+/** 提交唯一入口：`submitted` 这道闸只在这里落下（一次手势一张图）。 */
+function doCommit() {
   if (!box) return;
   submitted = true;
   sel.style.cursor = "progress";
@@ -112,6 +129,46 @@ document.addEventListener("mouseup", (e) => {
     submitted = false;
     setHint("截图失败：" + err + "（重新框选或按 Esc）", true);
   });
+}
+
+document.addEventListener("mousedown", (e) => {
+  if (submitted || !started) return;
+  if (e.button === 2) return; // 右键交给 contextmenu 处理成"取消"
+  if (e.button !== 0) return;
+  anchor = point(e);
+  document.body.classList.add("dragging");
+  showSnap(null);
+});
+
+document.addEventListener("mousemove", (e) => {
+  if (submitted || !started) return;
+  if (anchor) {
+    showBox(anchor, point(e));
+    return;
+  }
+  showSnap(snapAt(point(e)));
+});
+
+document.addEventListener("mouseup", (e) => {
+  if (!anchor || submitted) return;
+  const a = anchor;
+  const end = point(e);
+  anchor = null;
+  document.body.classList.remove("dragging");
+  if (Math.abs(end.x - a.x) < CLICK_SLACK || Math.abs(end.y - a.y) < CLICK_SLACK) {
+    // 单击：光标下有候选就选中整个窗口，没有才仍是"取消"（原来的行为）
+    const r = snapAt(end);
+    showSnap(null);
+    if (!r) {
+      giveUp("");
+      return;
+    }
+    applyBox(r.x, r.y, r.w, r.h);
+    doCommit();
+    return;
+  }
+  showBox(a, end);
+  doCommit();
 });
 
 document.addEventListener("contextmenu", (e) => {
@@ -153,7 +210,8 @@ async function pull() {
     box = null;
     sel.style.display = "none";
     sizeEl.style.display = "none";
-    document.body.classList.remove("has-sel", "dragging");
+    showSnap(null);
+    document.body.classList.remove("has-sel", "dragging", "has-snap");
     img.style.visibility = "hidden";
 
     let payload;
@@ -165,13 +223,21 @@ async function pull() {
     }
     epoch = payload.epoch;
     monitor = payload.monitor;
+    // Rust 给的是物理像素 + 这块屏的绝对坐标；换成页面一直在用的"CSS 像素、相对视口"。
+    // 副屏的负原点与 dpr≠1 都在这一步一起消化，后面的命中判定才是纯 CSS 坐标。
+    wins = payload.windows.map((w) => ({
+      x: (w.x - monitor.x) / dpr,
+      y: (w.y - monitor.y) / dpr,
+      w: w.width / dpr,
+      h: w.height / dpr,
+    }));
     if (Math.abs(dpr - payload.dpr) > 0.01) {
       giveUp(`缩放倍数对不上（页面 ${dpr}，程序 ${payload.dpr}），已取消`);
       return;
     }
     img.src = "data:image/png;base64," + payload.png_base64;
     started = true;
-    setHint("拖框选区 · 单击或 Esc 取消");
+    setHint("拖框自由选区 · 单击选中整个窗口 · Esc / 右键取消");
   } finally {
     pulling = false;
   }
