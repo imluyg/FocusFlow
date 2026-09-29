@@ -1287,8 +1287,13 @@ async function renderMaintInfo() {
       : "备份数量: " +
         info.backup_count +
         (info.latest_backup ? "，最新: " + info.latest_backup : "");
+    // 压缩时间同理：查不到不能报成"尚未压缩"（当年库被同步盘换成占位文件就是这个形态）
+    const vacuumError = info.last_vacuum_error ? String(info.last_vacuum_error) : "";
+    const vacuumLine = vacuumError
+      ? "上次压缩: 查不到 —— " + vacuumError
+      : "上次压缩: " + (info.last_vacuum || "尚未压缩");
     let html =
-      `<div>${escapeHtml("上次压缩: " + (info.last_vacuum || "尚未压缩"))}</div>` +
+      `<div${vacuumError ? ` style="color:var(--danger)"` : ""}>${escapeHtml(vacuumLine)}</div>` +
       `<div${backupError ? ` style="color:var(--danger)"` : ""}>${escapeHtml(backupLine)}</div>`;
     // 异常体检提示：备份时发现数据体量异常（骤降/暴涨），当次已冻结轮转
     if (Array.isArray(info.suspect_notes) && info.suspect_notes.length > 0) {

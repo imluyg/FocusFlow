@@ -357,11 +357,28 @@ pub async fn import_legacy(state: State<'_, Arc<AppState>>) -> Result<String, St
     for kept in &summary.backed_up_aux {
         lines.push(format!("原数据已留档: {kept}"));
     }
-    for e in &summary.errors {
-        lines.push(format!("错误: {e}"));
+    let text = lines.join("；");
+    // 部分失败必须走 Err：前端 `doImport` 的成功分支把整句渲染成**绿色**"完成"，
+    // 于是"2025 年度键鼠: 1200 条；错误: 2024 年度库导入失败"看着就是一次成功导入 ——
+    // 用户不会再重试那一年，那年的历史从此缺一块。`import_legacy_data` 从不返回 Err
+    // （每个年度库失败只往 summary.errors 里 push），所以结论只能在这里判。
+    let outcome = import_outcome(text, &summary.errors);
+    match &outcome {
+        Ok(t) => tracing::info!("导入完成: 来源={} 结果={}", dir.display(), t),
+        Err(t) => tracing::error!("导入部分失败: 来源={} {}", dir.display(), t),
     }
-    tracing::info!("导入完成: 来源={} 结果={}", dir.display(), lines.join("；"));
-    Ok(lines.join("；"))
+    outcome
+}
+
+/// 把导入的统计文本与失败清单合成命令返回值：**有失败项就是 Err**。
+///
+/// 抽成纯函数只有一个原因：`import_legacy` 要先弹目录选择框，测试起不来那条路，
+/// 而"部分失败不能报成成功"这一判据正好是这条命令里唯一会骗人的地方。
+fn import_outcome(text: String, errors: &[String]) -> Result<String, String> {
+    if errors.is_empty() {
+        return Ok(text);
+    }
+    Err(format!("{text}｜失败项：{}", errors.join("；")))
 }
 
 /// 更改数据目录：选文件夹 → 写 `[paths] data_home` 与 `data_migrate_from` → 自动重启；
@@ -483,17 +500,16 @@ pub async fn export_report(fmt: String) -> Result<String, String> {
 #[tauri::command]
 pub async fn get_maintenance_info() -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        // 上次 VACUUM 时间（meta 表）
-        let last_vacuum = focusflow_core::db::connection::with_ro_conn(
-            &focusflow_core::paths::current_year_db_path(),
-            |conn| {
-                conn.query_row("SELECT value FROM meta WHERE key='last_vacuum'", [], |r| {
-                    r.get::<_, String>(0)
-                })
-                .ok()
-            },
-        )
-        .flatten();
+        // 上次 VACUUM 时间（meta 表）。"查不到"与"从没压过"要分开说：原先两者都折成
+        // `null`，界面一律显示"尚未压缩"，于是"当年库被同步盘换成占位文件了"被报成
+        // "一次都没压缩"——与下面备份目录那一族同一个毛病（那边已修）。
+        let (last_vacuum, last_vacuum_error) =
+            match focusflow_core::db::maintenance::last_vacuum_stamp(
+                &focusflow_core::paths::current_year_db_path(),
+            ) {
+                Ok(stamp) => (stamp, String::new()),
+                Err(e) => (None, e),
+            };
 
         // 备份目录信息。读不出来必须与"目录里真的没有备份"分开说：便携包放在
         // 休眠的移动盘上、OneDrive 占位、`backup` 是个普通文件，read_dir 都会失败，
@@ -546,6 +562,7 @@ pub async fn get_maintenance_info() -> Result<serde_json::Value, String> {
 
         serde_json::json!({
             "last_vacuum": last_vacuum,
+            "last_vacuum_error": last_vacuum_error,
             "backup_count": backups.len(),
             "latest_backup": latest,
             "backup_error": backup_error,
@@ -680,7 +697,7 @@ pub fn set_plugin_enabled(
 
 #[cfg(test)]
 mod tests {
-    use super::must_reload_hotkey;
+    use super::{import_outcome, must_reload_hotkey};
 
     /// `[hotkey]` 里每一条组合键都必须触发重注册。判据的键名集合取自 `hotkey::BINDINGS`，
     /// 所以这张表以后加第三条绑定，这条用例自动跟着长 —— 把判据退回成写死的键名列表会立刻红
@@ -705,5 +722,22 @@ mod tests {
         // 反向两格：本段里不是热键的键、以及别的段的同名键，都不该惊动全局热键。
         assert!(!must_reload_hotkey("hotkey", "some_other_key"));
         assert!(!must_reload_hotkey("floating", "enabled"));
+    }
+
+    /// 导入只要有失败项就不能报成成功：前端把 `Ok` 的整句话渲染成绿色"完成"，
+    /// 而 `import_legacy_data` 自己从不返回 Err。
+    #[test]
+    fn import_with_errors_is_not_reported_as_success() {
+        let ok =
+            import_outcome("2025 年度键鼠: 1200 条".to_string(), &[]).expect("没有失败项时该是 Ok");
+        assert_eq!(ok, "2025 年度键鼠: 1200 条");
+        let err = import_outcome(
+            "2025 年度键鼠: 1200 条".to_string(),
+            &["2024 年度库导入失败: 库被占用".to_string()],
+        )
+        .expect_err("有失败项必须是 Err，否则那一句走的是绿字");
+        // 已经成功的那半也要留在消息里：用户得知道哪些年进来了、哪些没进来
+        assert!(err.contains("1200 条"), "已导入的部分不能丢: {err}");
+        assert!(err.contains("2024"), "失败项要能定位到是哪一年: {err}");
     }
 }

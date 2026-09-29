@@ -831,6 +831,18 @@ pub fn vacuum_path(path: &Path) -> bool {
         conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
         conn.execute("VACUUM;", [])?;
         conn.execute("PRAGMA optimize;", [])?;
+        // 顺手盖上"这套库上次压缩于何时"。原先只有 `maybe_auto_vacuum` 写这一格，
+        // 于是设置页点"立即压缩"拿到绿色"压缩完成"，刷新维护区却仍写"尚未压缩" ——
+        // 一句成功提示配一格过期事实。写点放在这里，自动与手动两条路共用。
+        //
+        // 时间戳没盖上**不算压缩失败**（库是真 VACUUM 过了）：所以只 warn，不 `?`。
+        // 缺 meta 表的旧库也不该因此被报成"没压成"，进而被 `failed_years` 按住下一轮自动压缩。
+        if let Err(e) = conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_vacuum', ?1)",
+            [chrono::DateTime::to_rfc3339(&chrono::Utc::now())],
+        ) {
+            tracing::warn!("last_vacuum 时间戳没写进 {}: {e}", path.display());
+        }
         Ok(())
     })();
     match result {
@@ -842,6 +854,24 @@ pub fn vacuum_path(path: &Path) -> bool {
             tracing::error!("VACUUM {} 失败: {e}", path.display());
             false
         }
+    }
+}
+
+/// 读「这套库上次压缩于何时」，并把**查不到**与**从没压缩过**分开返回：
+/// `Ok(Some)` = 有时间；`Ok(None)` = 库打不开以外的原因里没有这一行（真的没压过）；
+/// `Err` = 库打不开 / meta 表查不出来。
+///
+/// 分开的理由与维护页的备份目录同族：原先调用点用 `.ok()` 一路折成 `null`，
+/// "当年库换成占位文件了"和"一次都没压缩"在界面上是同一句话。
+pub fn last_vacuum_stamp(path: &Path) -> Result<Option<String>, String> {
+    let conn = connection::open_ro(path)
+        .map_err(|e| format!("当年库打不开（{}）: {e}", path.display()))?;
+    match conn.query_row("SELECT value FROM meta WHERE key='last_vacuum'", [], |r| {
+        r.get::<_, String>(0)
+    }) {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("meta 表查不出来（{}）: {e}", path.display())),
     }
 }
 
@@ -897,20 +927,16 @@ pub fn maybe_auto_vacuum(auto_vacuum_days: i64) {
 
     let report = vacuum_all();
     if report.incomplete() {
-        // 没做成就不盖 `last_vacuum`：盖了等于把这次失败又按住 auto_vacuum_days 天
+        // 没做成的年份不盖 `last_vacuum`（`vacuum_path` 只在 VACUUM 成功后写）：
+        // 盖了等于把这次失败又按住 auto_vacuum_days 天，而且维护页会显示一个没发生过的时间。
         tracing::warn!(
-            "自动 VACUUM 未完成，本次不记录时间戳：{}",
+            "自动 VACUUM 未完成，没做成的年份不记录时间戳：{}",
             report.why_incomplete()
         );
         return;
     }
-    let now_str = chrono::DateTime::to_rfc3339(&chrono::Utc::now());
-    if let Ok(conn) = connection::open_rw(&path) {
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_vacuum', ?1)",
-            [now_str],
-        );
-    }
+    // 时间戳由 `vacuum_path` 逐库盖好，这里不再单独写一次：原先自动与手动两条路
+    // 只有一条会盖，而设置页的"上次压缩"读的就是这一格。
     tracing::info!("自动 VACUUM 完成");
 }
 
@@ -4140,6 +4166,39 @@ mod tests {
         assert!(
             connection::table_exists_readonly(&path, "device_counts"),
             "清理该把缺的两张表补上，否则下一次还是同一个坑"
+        );
+    }
+
+    /// 手动压缩也要盖上「上次压缩时间」：设置页那句"上次压缩"读的就是 `meta.last_vacuum`，
+    /// 而原先**只有** `maybe_auto_vacuum` 会写它 —— 于是点"立即压缩"拿到绿色"压缩完成"，
+    /// 刷新维护区仍写"尚未压缩"（一句成功提示配一格过期事实）。
+    #[test]
+    fn vacuum_stamps_the_timestamp_the_settings_page_reads_and_absent_is_not_unreadable() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("vacuum_stamp");
+        let year = Local::now().year();
+        let path = paths::year_db_path(year);
+        let conn = Connection::open(&path).expect("建库");
+        connection::ensure_schema(&conn, year).expect("建 meta 表");
+        drop(conn);
+        // 夹具要成立：开局真的没有这一格（否则"压完有了"什么都钉不住）
+        assert_eq!(
+            last_vacuum_stamp(&path),
+            Ok(None),
+            "前提：新库里没有压缩时间"
+        );
+
+        assert!(vacuum_path(&path), "VACUUM 该成功");
+        let stamped = last_vacuum_stamp(&path)
+            .unwrap()
+            .expect("压完必须留下时间戳");
+        chrono::DateTime::parse_from_rfc3339(&stamped).expect("时间戳要能被自动压缩那套算法解析");
+
+        // "查不到"不能折成"从没压过"：界面那句"尚未压缩"承担不起这两种意思
+        let absent = paths::year_db_path(year + 1);
+        assert!(
+            last_vacuum_stamp(&absent).is_err(),
+            "库根本不存在时必须报错，而不是 Ok(None)"
         );
     }
 }
