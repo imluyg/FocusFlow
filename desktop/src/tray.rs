@@ -1,4 +1,4 @@
-//! 系统托盘：显示主界面 / 暂停记录（可勾选）/ 显示悬浮窗 / 退出程序。
+//! 系统托盘：显示主界面 / 暂停记录（可勾选）/ 显示悬浮窗 / 打开截图文件夹 / 退出程序。
 //! 对齐 Python 版：tooltip 每 5 秒刷新今日活跃与速度，暂停时切换图标并勾选菜单。
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +15,7 @@ use crate::state::AppState;
 const MENU_SHOW: &str = "show";
 const MENU_PAUSE: &str = "pause";
 const MENU_FLOATING: &str = "floating";
+const MENU_SNIP: &str = "snip_folder";
 const MENU_QUIT: &str = "quit";
 
 /// 托盘控制器（供后台更新线程使用）。
@@ -31,6 +32,7 @@ pub fn setup_tray(app: &mut App) -> anyhow::Result<()> {
     let pause_item =
         CheckMenuItem::with_id(app, MENU_PAUSE, "暂停记录", true, false, None::<&str>)?;
     let floating_item = MenuItem::with_id(app, MENU_FLOATING, "显示悬浮窗", true, None::<&str>)?;
+    let snip_item = MenuItem::with_id(app, MENU_SNIP, "打开截图文件夹", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, MENU_QUIT, "退出程序", true, None::<&str>)?;
 
     let menu = Menu::with_items(
@@ -40,6 +42,7 @@ pub fn setup_tray(app: &mut App) -> anyhow::Result<()> {
             &pause_item,
             &tauri::menu::PredefinedMenuItem::separator(app)?,
             &floating_item,
+            &snip_item,
             &tauri::menu::PredefinedMenuItem::separator(app)?,
             &quit_item,
         ],
@@ -159,6 +162,12 @@ fn handle_menu(app: &AppHandle, id: &str) {
         MENU_SHOW => show_main(app),
         MENU_PAUSE => toggle_pause(app),
         MENU_FLOATING => toggle_floating(app),
+        // 点下去"没反应"是本功能唯一的故障形态，所以成败都要落日志（吞掉就等于
+        // 让用户以为截图目录不存在）。
+        MENU_SNIP => match crate::reveal::reveal_last_screenshot() {
+            Ok(line) => tracing::info!("托盘打开截图文件夹：{line}"),
+            Err(e) => tracing::error!("托盘打开截图文件夹失败：{e}"),
+        },
         MENU_QUIT => {
             app.exit(0);
         }

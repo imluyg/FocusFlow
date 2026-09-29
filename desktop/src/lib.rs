@@ -7,6 +7,7 @@ pub mod commands;
 pub mod export;
 pub mod hotkey;
 pub mod plugins;
+pub mod reveal;
 pub mod snip;
 pub mod state;
 pub mod tray;
