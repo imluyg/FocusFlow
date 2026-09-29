@@ -55,6 +55,9 @@ struct Session {
     /// 取走即空，之后任何一次 `snip_take` 都算陈旧会话，同时这也是看门狗判断
     /// "页面到底拉过图没有"的唯一观察量。
     png_base64: Option<String>,
+    /// 从"按下热键"那一刻起算，用来把首帧耗时打进日志（4K/高缩放的④项要靠它出真数，
+    /// 现在手上只有 1080p 的两次读数）。
+    started: std::time::Instant,
 }
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
@@ -137,13 +140,14 @@ fn outcome_line(saved: bool, save_reason: &str, clipboard: bool, clip_reason: &s
 }
 
 /// 占用会话槽位；已经有会话在进行中时返回 false（调用方直接放弃这次触发）。
-fn claim_session(shot: Shot, png_base64: String) -> u64 {
+fn claim_session(shot: Shot, png_base64: String, started: std::time::Instant) -> u64 {
     let epoch = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     if let Ok(mut slot) = SESSION.lock() {
         *slot = Some(Session {
             epoch,
             shot,
             png_base64: Some(png_base64),
+            started,
         });
     }
     epoch
@@ -196,6 +200,7 @@ fn run_capture(app: &AppHandle) -> Result<(), String> {
     // 缓冲区与覆盖层窗口在同一个进程的虚拟化视图里，两边始终 1:1。
     // 上一版把这件事当硬失败处理，结果是把整条功能全挡死（真机日志里六次截图六次被拒），
     // 而代价只是"可能糊一点"。
+    let t0 = std::time::Instant::now();
     let awareness = capture::win::dpi_awareness_text();
     if capture::win::is_per_monitor_v2() {
         tracing::info!("截图开始，DPI 感知 = {awareness}");
@@ -208,7 +213,7 @@ fn run_capture(app: &AppHandle) -> Result<(), String> {
     let shot = capture::win::capture_at_cursor()?;
     let png = capture::encode_png(&shot.rgba(), shot.rect.width, shot.rect.height)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-    let epoch = claim_session(shot, b64);
+    let epoch = claim_session(shot, b64, t0);
 
     // 覆盖层的几何与显示都在主线程做：窗口方法从工作线程调用会阻塞在主循环上等待，
     // 而"设尺寸 → 设位置 → 显示 → 抢前台"必须是原子的一个轮次。
@@ -298,6 +303,17 @@ fn ensure_overlay(app: &AppHandle) -> Result<(WebviewWindow, bool), String> {
     Ok((win, true))
 }
 
+/// 覆盖层的客户区到底算不算"铺满了这块屏"——判据是**覆盖**，不是逐像素相等。
+///
+/// 旧判据写的是 `==`。他真机日志里 27 次截图有 1 次量到：`set_size(1920x1080)` 成功返回之后
+/// `inner_size()` 读回来是 1920x**1087**——多出的 7 个像素落在屏幕外，对用户毫无影响，
+/// 却被这条判据当成"没铺满"，于是整次截图被 `abort_session` 掉、热键白按一次。
+/// 反过来，真正要拦的那种（`SetWindowPos` 少给 `SWP_NOSIZE` 把窗口缩成 0×0、或者短了一截）
+/// 在这里照样拦得住：小的那一侧才是要命的一侧。
+fn covers_screen(got_w: u32, got_h: u32, screen_w: u32, screen_h: u32) -> bool {
+    got_w >= screen_w && got_h >= screen_h
+}
+
 /// 把覆盖层摆到目标屏并抢前台。只在主线程执行。
 fn show_overlay(app: &AppHandle, epoch: u64) -> Result<(), String> {
     let rect = SESSION
@@ -318,14 +334,14 @@ fn show_overlay(app: &AppHandle, epoch: u64) -> Result<(), String> {
         .map_err(|e| format!("覆盖层取焦点失败：{e}"))?;
     raise_topmost(&win);
 
-    // 摆完核对一遍：客户区必须正好是那块屏、窗口必须真的可见。
+    // 摆完核对一遍：客户区必须**盖住**那块屏、窗口必须真的可见。
     // 这条专治"窗口存在、页面正常加载、底图也取走了，但用户面前什么都没有"——
     // 那种失败在日志里和成功长得一模一样，只有量过才发现。真机上就是这么栽的：
     // `SetWindowPos` 少给 `SWP_NOSIZE` 把窗口缩成了 0×0。
     let got = win
         .inner_size()
         .map_err(|e| format!("读不到覆盖层客户区尺寸：{e}"))?;
-    if got.width != rect.width || got.height != rect.height {
+    if !covers_screen(got.width, got.height, rect.width, rect.height) {
         return Err(format!(
             "覆盖层没铺满这块屏：客户区 {}x{}，屏幕 {}x{}",
             got.width, got.height, rect.width, rect.height
@@ -464,18 +480,23 @@ pub fn trigger(app: &AppHandle) -> Result<(), String> {
 pub async fn snip_take(app: AppHandle) -> Result<SnipPayload, String> {
     // epoch 与图必须在**同一次加锁**里取：分两次锁的话，中间若换了会话，就会把新会话的图
     // 配着旧 epoch 交出去 —— 页面之后回报的 epoch 永远对不上，症状是"框完点提交没反应"。
-    let (epoch, png, rect) = {
+    let (epoch, png, rect, started) = {
         let mut slot = SESSION.lock().map_err(|_| "截图会话锁不可用")?;
         let s = slot
             .as_mut()
             .ok_or_else(|| "没有进行中的截图".to_string())?;
-        (s.epoch, s.png_base64.take(), s.shot.rect)
+        (s.epoch, s.png_base64.take(), s.shot.rect, s.started)
     };
     let png = png.ok_or_else(|| "本次截图的底图已被取走过，请重新触发一次截图".to_string())?;
     // 这一行与 `on_page_load` 的"完成"配对看：加载完成却没有这行 = 页面脚本没跑起来。
+    // 带上"距触发多少毫秒"是为了让首帧延迟这件事有真数可看（抓屏 + PNG 编码 + base64 +
+    // 派发 + 页面拉取全在这段里），而不是靠人肉对两条日志的时间戳。
     tracing::info!(
-        "截图覆盖层已取走底图（epoch {epoch}，base64 {} 字节）",
-        png.len()
+        "截图覆盖层已取走底图（epoch {epoch}，base64 {} 字节，屏 {}x{}，距触发 {} ms）",
+        png.len(),
+        rect.width,
+        rect.height,
+        started.elapsed().as_millis()
     );
     let win = app
         .get_webview_window(SNIP_LABEL)
@@ -659,6 +680,39 @@ pub fn on_snip_close_requested(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 覆盖层自检的判据：**多出来可以，少了不行**。
+    ///
+    /// 这条钉的是那次真机误判：`set_size(1920x1080)` 之后 `inner_size()` 报 1920x1087，
+    /// 旧的 `==` 判据把一整次截图判死（27 次里 1 次）。而它必须仍然拦得住真正出事的那两种
+    /// ——0×0（`SWP_NOSIZE` 漏给的那次）和短一截。
+    #[test]
+    fn overlay_geometry_accepts_overcoverage_but_not_undercoverage() {
+        // 正好铺满
+        assert!(covers_screen(1920, 1080, 1920, 1080));
+        // 真机量到的那一例：多 7 个像素落在屏幕外
+        assert!(
+            covers_screen(1920, 1087, 1920, 1080),
+            "超出屏幕的富余不该把功能判死"
+        );
+        // 副屏负坐标时屏宽也可能是别的值
+        assert!(covers_screen(2560, 1440, 2560, 1440));
+
+        // 下面这些才是真故障
+        assert!(
+            !covers_screen(0, 0, 1920, 1080),
+            "0x0 必须拦（SWP_NOSIZE 那一栽）"
+        );
+        assert!(
+            !covers_screen(1919, 1080, 1920, 1080),
+            "横向少 1 像素也要拦"
+        );
+        assert!(
+            !covers_screen(1920, 1079, 1920, 1080),
+            "纵向少 1 像素也要拦"
+        );
+        assert!(!covers_screen(960, 540, 1920, 1080), "只铺了四分之一必须拦");
+    }
 
     #[test]
     fn dpr_must_agree_within_a_rounding_slack() {
