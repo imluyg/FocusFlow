@@ -268,6 +268,136 @@ pub fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Strin
     Ok(out)
 }
 
+/// 标注层解码的内存上限（字节）。`png` 的默认值是 64 MiB，而一层覆盖 8K 屏的 RGBA
+/// 就要 132 MB —— 标注层最大不过一块屏，所以放到 256 MiB；再大就不是标注层而是攻击面了。
+const MAX_LAYER_BYTES: usize = 256 * 1024 * 1024;
+
+/// 诊断消息里带的头字节个数：够认出签名对不对，又不会把整张图喷进日志。
+const HEAD_DUMP: usize = 8;
+
+/// PNG 字节 → RGBA8 像素，返回 `(像素, 宽, 高)`。
+///
+/// 存在的唯一理由：标注层是页面 `canvas.toDataURL('image/png')` 交回来的那一层透明像素，
+/// Rust 要把它 1:1 合成到裁剪后的 BGRA 上。**只接 8 位 RGBA，其他色型直接报错、不做转换**：
+/// 灰度/调色板/16 位都要先解释一遍才能落进缓冲，而"页面所见 = 落盘像素"正是这条链路唯一
+/// 要保证的事 —— 宁可不画也不猜。页面自己产的那张 PNG 必然是 RGBA8，所以正常路径不受影响。
+///
+/// 不引新依赖：解码走 `encode_png` 用的那个 `png` crate（它自带解码，不是 image 全家桶）。
+pub fn decode_png_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_limits(png::Limits {
+        bytes: MAX_LAYER_BYTES,
+    });
+    let mut reader = decoder.read_info().map_err(|e| {
+        format!(
+            "PNG 头读不出来（前 {} 字节 {}）：{e}",
+            HEAD_DUMP,
+            head_hex(bytes)
+        )
+    })?;
+    let info = reader.info();
+    let (w, h) = (info.width, info.height);
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return Err(format!(
+            "标注层只支持 8 位 RGBA PNG，这份是 {:?} / {} 位",
+            info.color_type, info.bit_depth as u8
+        ));
+    }
+    if w == 0 || h == 0 || w > MonitorRect::MAX_SIDE || h > MonitorRect::MAX_SIDE {
+        return Err(format!(
+            "PNG 尺寸不可用（{w}x{h}，单轴上限 {}）",
+            MonitorRect::MAX_SIDE
+        ));
+    }
+    let want = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| format!("PNG 像素数溢出（{w}x{h}）"))?;
+    let mut buf = vec![0u8; want];
+    let out = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("PNG 数据解码失败（{w}x{h}）：{e}"))?;
+    if out.buffer_size() != want {
+        // 解码器算出来的行数和我们要的不是一回事：宁可整层不画，也不返回半张图。
+        return Err(format!(
+            "PNG 解码缓冲不符：解码器给了 {} 字节，按 {w}x{h} RGBA 应是 {want}",
+            out.buffer_size()
+        ));
+    }
+    Ok((buf, w, h))
+}
+
+/// 取前 `HEAD_DUMP` 个字节的十六进制。
+fn head_hex(bytes: &[u8]) -> String {
+    let n = bytes.len().min(HEAD_DUMP);
+    let mut s = String::with_capacity(n * 3);
+    for b in &bytes[..n] {
+        s.push_str(&format!("{b:02x} "));
+    }
+    if bytes.len() > n {
+        s.push('…');
+    }
+    s.trim_end().to_string()
+}
+
+/// 把一层 RGBA 标注**就地**合成到 BGRA 缓冲上。
+///
+/// `dst` 是裁剪出来的那块像素（[`Shot::crop`] 给的 BGRA，剪贴板 CF_DIB 用的就是它本体），
+/// `layer` 是页面回传的标注层（RGBA），两者都必须严格等于 `width × height × 4` 字节 ——
+/// 尺寸不符是 `Err`，绝不缩放：缩放会把"页面所见 = 落盘像素"变成一次重采样。
+///
+/// 三件事是刻意的，动之前先读：
+/// 1. **R/B 显式换序**：layer 是 RGBA、dst 是 BGRA，红与蓝落在 0 和 2 两个下标上正好相反。
+///    写反了的图只是"颜色差一点"，谁也都说不出哪里不对，所以用例
+///    `composite_over_puts_rgba_red_onto_bgra_blue` 专门断颜色（只断 alpha 三档照不出来）。
+/// 2. **dst 的 alpha 字节一个都不碰**：GDI 交回的第四字节恒为 0，[`bgra_to_rgba`] 在编码 PNG
+///    那一刻才钉成 255。在这里写 alpha 会顺手改掉 CF_DIB 那份的字节。
+/// 3. **alpha=0 整像素跳过**：这就是"未被标注覆盖的像素逐字节相等"那条红线的实现方式，
+///    也比算一遍混合再取回原值更省 —— 且不给四舍五入留机会。
+pub fn composite_over(dst: &mut [u8], layer: &[u8], width: u32, height: u32) -> Result<(), String> {
+    let want = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| format!("图像尺寸溢出（{width}x{height}）"))?;
+    if dst.len() != want {
+        return Err(format!(
+            "底图像素长度不符：{} 字节，应为 {want}（{width}x{height}）",
+            dst.len()
+        ));
+    }
+    if layer.len() != want {
+        return Err(format!(
+            "标注层像素长度不符：{} 字节，应为 {want}（{width}x{height}）",
+            layer.len()
+        ));
+    }
+    for (d, s) in dst
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(layer.as_chunks::<4>().0)
+    {
+        let a = u32::from(s[3]);
+        if a == 0 {
+            continue;
+        }
+        if a == 255 {
+            d[0] = s[2];
+            d[1] = s[1];
+            d[2] = s[0];
+            continue;
+        }
+        // 非预乘混合：src·a + dst·(1-a)，四舍五入用 +127（= 255/2 取整）而不是 +128。
+        let inv = 255 - a;
+        let mix =
+            |s: u8, d: u8| -> u8 { ((u32::from(s) * a + u32::from(d) * inv + 127) / 255) as u8 };
+        d[0] = mix(s[2], d[0]);
+        d[1] = mix(s[1], d[1]);
+        d[2] = mix(s[0], d[2]);
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 pub mod win {
     //! 真正摸 Win32 的部分：问出鼠标所在那块屏的矩形，把它抓进内存，以及给剪贴板备料。
@@ -1161,6 +1291,338 @@ mod tests {
     fn encode_png_rejects_mismatched_buffer() {
         assert!(encode_png(&[0u8; 10], 3, 2).is_err());
         assert!(encode_png(&[0u8; 24], 1, 1).is_err());
+    }
+
+    // ---------- 标注层：解码 / 合成（M0 的地基） ----------
+
+    /// 现场编一张任意色型/位深的 PNG 喂解码器 —— 本仓不存外部图片文件（夹具的既有纪律）。
+    fn png_of(color: png::ColorType, depth: png::BitDepth, data: &[u8], w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, w, h);
+            enc.set_color(color);
+            enc.set_depth(depth);
+            let mut writer = enc.write_header().expect("写头");
+            writer.write_image_data(data).expect("写数据");
+        }
+        out
+    }
+
+    /// 伪随机底图：值域压到 0..=199，alpha 一律 0（GDI 交回的就是 0）。
+    /// 上限不到 200 是有意的 —— 后面几条用例把「纯红」当作标注的记号，底图里不能撞到。
+    fn noise_bgra(w: u32, h: u32) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w as usize) * (h as usize) * 4);
+        let mut s = 0x2545_F491_u32;
+        for _ in 0..(w as usize * h as usize) {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let n = (s >> 16) as u8;
+            v.extend_from_slice(&[n % 200, n / 2 % 200, n.wrapping_add(37) % 200, 0]);
+        }
+        v
+    }
+
+    #[test]
+    fn decode_png_rgba_roundtrips_this_repos_encoder() {
+        let mut rgba = Vec::new();
+        for i in 0..6u8 {
+            rgba.extend_from_slice(&[10 + i, 200 - i, 40 + i, if i % 2 == 0 { 255 } else { 0 }]);
+        }
+        let bytes = encode_png(&rgba, 3, 2).unwrap();
+        let (got, w, h) = decode_png_rgba(&bytes).unwrap();
+        assert_eq!((w, h), (3, 2), "尺寸要照着 IHDR 报");
+        assert_eq!(got, rgba, "编解码必须逐字节闭合");
+        assert_eq!(
+            got[7], 0,
+            "透明格解码回来还是透明（当成不透明会把整张截图盖掉）"
+        );
+    }
+
+    /// 垃圾输入要 `Err` 而不是 panic：release 是 panic=abort，崩一次就是整个程序没了。
+    #[test]
+    fn decode_png_rgba_rejects_garbage_instead_of_panicking() {
+        let cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"nonsense".to_vec(),
+            b"\x89PNG\r\n\x1a\n".to_vec(),
+            vec![0u8; 4096],
+        ];
+        for bytes in cases {
+            assert!(
+                decode_png_rgba(&bytes).is_err(),
+                "垃圾字节要报错，不能 panic 也不能返回半成品"
+            );
+        }
+        // 截断的真 PNG：头能读、数据读不完 —— 同样只能 Err（半张标注层比不画更糟）
+        let mut rgba = vec![0u8; 4 * 20 * 20];
+        for px in rgba.as_chunks_mut::<4>().0 {
+            px[3] = 255;
+        }
+        let full = encode_png(&rgba, 20, 20).unwrap();
+        let truncated = full[..full.len() / 2].to_vec();
+        assert!(
+            decode_png_rgba(&truncated).is_err(),
+            "截断的 PNG 不能返回半成品"
+        );
+    }
+
+    #[test]
+    fn decode_png_rgba_rejects_other_color_types_and_depths() {
+        let gray = png_of(
+            png::ColorType::Grayscale,
+            png::BitDepth::Eight,
+            &[7, 8, 9, 10, 11, 12],
+            3,
+            2,
+        );
+        let e = decode_png_rgba(&gray).unwrap_err();
+        assert!(e.contains("Grayscale"), "报错要把实际色型写进消息：{e}");
+
+        let rgb = png_of(
+            png::ColorType::Rgb,
+            png::BitDepth::Eight,
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9],
+            3,
+            1,
+        );
+        let e = decode_png_rgba(&rgb).unwrap_err();
+        assert!(e.contains("只支持"), "非 RGBA 要直接拒：{e}");
+
+        let deep = png_of(
+            png::ColorType::Rgba,
+            png::BitDepth::Sixteen,
+            &[0u8; 3 * 2 * 8],
+            3,
+            2,
+        );
+        let e = decode_png_rgba(&deep).unwrap_err();
+        assert!(
+            e.contains("16"),
+            "16 位要出声（悄悄降到 8 位就是一次重采样）：{e}"
+        );
+    }
+
+    #[test]
+    fn composite_over_blends_alpha_zero_half_and_full() {
+        // 底色 BGRA (10, 20, 30) + alpha 0（GDI 的那第四字节）
+        let mut dst = Vec::new();
+        for _ in 0..3 {
+            dst.extend_from_slice(&[10, 20, 30, 0]);
+        }
+        let mut layer = Vec::new();
+        layer.extend_from_slice(&[255, 0, 0, 0]); // 全透明红
+        layer.extend_from_slice(&[255, 0, 0, 128]); // 半透明红
+        layer.extend_from_slice(&[255, 0, 0, 255]); // 不透明红
+        composite_over(&mut dst, &layer, 3, 1).unwrap();
+
+        assert_eq!(&dst[0..4], &[10, 20, 30, 0], "alpha=0 那一格必须逐字节不动");
+        // 非预乘：src·a + dst·(255-a)，再 +127 除 255 取整。三格分别手算过：
+        //   B = (0·128 + 10·127 + 127)/255 = 5
+        //   G = (0·128 + 20·127 + 127)/255 = 10
+        //   R = (255·128 + 30·127 + 127)/255 = 143
+        assert_eq!(&dst[4..8], &[5, 10, 143, 0], "半透明要走非预乘混合");
+        assert_eq!(&dst[8..12], &[0, 0, 255, 0], "alpha=255 就是整格覆盖");
+        assert_eq!(
+            dst[3], 0,
+            "底图的 alpha 字节谁都不许改（CF_DIB 那份要看它）"
+        );
+    }
+
+    /// 通道序是第一号坑：解码层是 RGBA、底图是 BGRA，写反了的图只是「颜色差一点」，
+    /// 谁也说不出哪里不对。只断 alpha 三档照不出红蓝互换，所以这里一路断到落盘那张 PNG。
+    #[test]
+    fn composite_over_puts_rgba_red_onto_bgra_blue() {
+        let mut dst = vec![9u8, 9, 9, 0];
+        composite_over(&mut dst, &[255, 0, 0, 255], 1, 1).unwrap();
+        assert_eq!(
+            &dst[..3],
+            &[0, 0, 255],
+            "页面画的纯红要落成 BGR (0,0,255)；落成 (255,0,0) 就是通道写反了"
+        );
+        assert_eq!(dst[3], 0);
+
+        // 闭环：合成后的 BGRA 走产品那条路（bgra_to_rgba → encode → decode）颜色不该变
+        let mut rgba = dst.clone();
+        bgra_to_rgba(&mut rgba);
+        assert_eq!(rgba, vec![255, 0, 0, 255], "绕一圈回到 RGBA 还是那抹红");
+        let (back, w, h) = decode_png_rgba(&encode_png(&rgba, 1, 1).unwrap()).unwrap();
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(back, rgba, "落盘的像素就是合成出来的那一份");
+    }
+
+    #[test]
+    fn composite_over_rejects_size_mismatch() {
+        let mut dst = vec![0u8; 4 * 4 * 2];
+        let before = dst.clone();
+        assert!(composite_over(&mut dst, &[0u8; 4 * 4 * 2 - 4], 4, 2).is_err());
+        assert!(composite_over(&mut dst, &[0u8; 4 * 4 * 3], 4, 2).is_err());
+        assert!(composite_over(&mut dst, &[0u8; 4 * 4 * 2], 4, 3).is_err());
+        assert_eq!(dst, before, "报错的那一次一个字节都不该落到 1:1 的画布上");
+        let mut one = [0u8; 4];
+        assert!(composite_over(&mut one, &[0u8; 4], 1, 1).is_ok());
+    }
+
+    /// M0 红线第一半：未被标注覆盖的像素必须逐字节相等。
+    #[test]
+    fn composite_over_leaves_every_uncovered_pixel_byte_identical() {
+        let (w, h) = (40u32, 30u32);
+        let base = noise_bgra(w, h);
+
+        // 先测最纯的形式：整层全透明 ⇒ 底图一个字节都不动
+        let transparent = vec![0u8; (w as usize) * (h as usize) * 4];
+        let mut dst = base.clone();
+        composite_over(&mut dst, &transparent, w, h).unwrap();
+        assert_eq!(dst, base, "空标注层不许碰到底图任何一个字节");
+
+        // 再测只画一小块：块外逐字节相等，块内逐字节等于覆盖值，且改动像素数刚好等于块面积
+        let (x0, y0, bw, bh) = (12usize, 7usize, 5usize, 4usize);
+        let mut layer = transparent.clone();
+        for y in y0..(y0 + bh) {
+            for x in x0..(x0 + bw) {
+                let i = (y * w as usize + x) * 4;
+                layer[i..i + 4].copy_from_slice(&[200, 30, 90, 255]);
+            }
+        }
+        let mut dst = base.clone();
+        composite_over(&mut dst, &layer, w, h).unwrap();
+
+        let mut changed = 0usize;
+        for (idx, (got, old)) in dst
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(base.as_chunks::<4>().0.iter())
+            .enumerate()
+        {
+            let (x, y) = (idx % w as usize, idx / w as usize);
+            let inside = x >= x0 && x < x0 + bw && y >= y0 && y < y0 + bh;
+            if inside {
+                assert_eq!(
+                    got,
+                    &[90, 30, 200, 0],
+                    "块内是不透明覆盖（BGR 换序、alpha 不动）"
+                );
+                changed += 1;
+            } else {
+                assert_eq!(got, old, "块外第 {x},{y} 格被标注层碰到了");
+            }
+        }
+        assert_eq!(changed, bw * bh, "改动到的像素必须刚好是那一块的面积");
+    }
+
+    /// M0 红线第二半：标注位置在最终 PNG 里与页面所见误差 ≤1px。
+    /// 走的是真链路：带分数的 CSS 选区 → `css_rect_to_physical` → `crop` → 合成 → 编码 → 解码。
+    /// 画笔矩形的位置也同一个函数算（探针对照选区做差），不在用例里再写一套四舍五入。
+    #[test]
+    fn annotation_lands_where_the_page_drew_it() {
+        let dpr = 1.5;
+        let monitors = [mon(400, 300), MonitorRect::new(-1920, 0, 400, 300).unwrap()];
+        for m in monitors {
+            let sel = CssRect {
+                x: 41.33,
+                y: 23.67,
+                w: 100.33,
+                h: 60.67,
+            };
+            let sel_phys = css_rect_to_physical(&sel, dpr, &m).unwrap();
+            let shot = Shot::new(m, noise_bgra(m.width, m.height)).unwrap();
+            let cropped = shot
+                .crop(
+                    sel_phys.x as u32,
+                    sel_phys.y as u32,
+                    sel_phys.width,
+                    sel_phys.height,
+                )
+                .unwrap();
+
+            // 页面在选区内画的笔（CSS 相对选区原点）：换算成画布内的物理像素
+            let pen = CssRect {
+                x: sel.x + 10.5,
+                y: sel.y + 7.25,
+                w: 20.0,
+                h: 12.0,
+            };
+            let pen_phys = css_rect_to_physical(&pen, dpr, &m).unwrap();
+            let (bx, by) = (
+                (pen_phys.x - sel_phys.x) as i64,
+                (pen_phys.y - sel_phys.y) as i64,
+            );
+            let (bw, bh) = (pen_phys.width as i64, pen_phys.height as i64);
+            assert!(bx >= 0 && by >= 0, "画笔必须落在选区画布内：{bx},{by}");
+
+            let (cw, ch) = (sel_phys.width as usize, sel_phys.height as usize);
+            let mut layer = vec![0u8; cw * ch * 4];
+            for y in by..(by + bh) {
+                for x in bx..(bx + bw) {
+                    let i = (y as usize * cw + x as usize) * 4;
+                    // 页面画的是纯红 RGBA
+                    layer[i..i + 4].copy_from_slice(&[255, 0, 0, 255]);
+                }
+            }
+
+            let mut dst = cropped.bgra.clone();
+            composite_over(&mut dst, &layer, sel_phys.width, sel_phys.height).unwrap();
+            // 落盘那一步（snip.rs 里就是这么编的）
+            let mut encoded = dst.clone();
+            bgra_to_rgba(&mut encoded);
+            let png = encode_png(&encoded, sel_phys.width, sel_phys.height).unwrap();
+            let (final_px, fw, fh) = decode_png_rgba(&png).unwrap();
+            assert_eq!(
+                (fw, fh),
+                (sel_phys.width, sel_phys.height),
+                "最终 PNG 的尺寸就是选区的物理尺寸"
+            );
+
+            // 量一遍标注块在最终 PNG 里的实际位置
+            let mut min_x = usize::MAX;
+            let mut min_y = usize::MAX;
+            let mut max_x = 0usize;
+            let mut max_y = 0usize;
+            let mut hits = 0usize;
+            for (idx, px) in final_px.as_chunks::<4>().0.iter().enumerate() {
+                if px != &[255, 0, 0, 255] {
+                    continue;
+                }
+                let (x, y) = (idx % cw, idx / cw);
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                hits += 1;
+            }
+            assert!(hits > 0, "最终 PNG 里一个标注像素都没有 —— 合成没生效");
+            let report = format!(
+                "屏 {}x{} 选区 {bw}x{bh} 标注块实测 ({min_x},{min_y})..({max_x},{max_y}) 期望 ({bx},{by})..({},{}), 命中 {hits}",
+                m.width,
+                m.height,
+                bx + bw - 1,
+                by + bh - 1
+            );
+            assert_eq!(hits, (bw * bh) as usize, "标注块像素数不符：{report}");
+            assert_eq!(min_x as i64, bx, "左边界偏了：{report}");
+            assert_eq!(min_y as i64, by, "上边界偏了：{report}");
+            assert_eq!(max_x as i64, bx + bw - 1, "右边界偏了：{report}");
+            assert_eq!(max_y as i64, by + bh - 1, "下边界偏了：{report}");
+
+            // 红线第一半在这条链路末端再钉一次：块外逐字节等于未标注时那张
+            let mut untouched = cropped.bgra.clone();
+            bgra_to_rgba(&mut untouched);
+            for (idx, (got, old)) in final_px
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(untouched.as_chunks::<4>().0.iter())
+                .enumerate()
+            {
+                let (x, y) = (idx % cw, idx / cw);
+                let inside = (x as i64) >= bx
+                    && (x as i64) < bx + bw
+                    && (y as i64) >= by
+                    && (y as i64) < by + bh;
+                if !inside {
+                    assert_eq!(got, old, "标注块之外的一格被改了：屏 {:?} 处 {x},{y}", m.x);
+                }
+            }
+        }
     }
 
     #[cfg(windows)]
