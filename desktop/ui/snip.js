@@ -86,6 +86,52 @@ let penWidth = 3;
 /** 字号（物理像素），三档：小/中/大。 */
 let textSize = 30;
 
+/** 标注态闲置多久自动放弃。人框完开始画、然后被叫走 —— 桌面会被一张不透明的冻结图
+ *  一直盖着，而 Enter/Esc 是键盘路径，鼠标党未必知道该按什么（工具条上有能点的按钮，
+ *  但人不在这儿时没人点）。Rust 那边另有一道更长的**绝对**上限兜"页面卡住"这种
+ *  计时器也不跑的情况，见 `desktop/src/snip.rs` 的 `ANNOTATE_LIVE_LIMIT`；
+ *  有一条用例盯着"这两个数必须页面短、Rust 长"。 */
+export const ANNOTATE_IDLE_MS = 180_000;
+let lastActivity = 0;
+let idleTimer = null;
+
+/** 到点了没有。纯函数：夹具拿合成时间戳直接断言，不必真等三分钟。 */
+export function annotIdleExpired(now, last, limit) {
+  return now - last >= limit;
+}
+
+/** 最后一次操作的时间戳（导出只为给夹具一个观察量：动一下到底有没有续上）。 */
+export function annotLastActivity() {
+  return lastActivity;
+}
+
+function markActivity() {
+  lastActivity = Date.now();
+}
+
+function stopIdleWatch() {
+  if (idleTimer) {
+    clearInterval(idleTimer);
+    idleTimer = null;
+  }
+}
+
+function startIdleWatch() {
+  stopIdleWatch();
+  markActivity();
+  idleTimer = setInterval(() => {
+    if (submitted) {
+      stopIdleWatch();
+      return;
+    }
+    if (annotIdleExpired(Date.now(), lastActivity, ANNOTATE_IDLE_MS)) {
+      // 话要说成"超时放弃"，不能让人以为是自己哪一步做错了或者截图坏了
+      giveUp("标注态闲置满 " + Math.round(ANNOTATE_IDLE_MS / 60000) + " 分钟，自动放弃（不是失败）");
+      stopIdleWatch();
+    }
+  }, 1000);
+}
+
 /** CSS 选区 → 屏内相对物理矩形。与 Rust 的 `capture::css_rect_to_physical` 同一条规则：
  *  先归一化反向拖框、一律 round、再钳到屏内（先角点后宽高，反过来会各吃掉一像素）。
  *  这份镜像是唯一一处不得不在 JS 里重算的地方，所以导出给夹具：那组分数/越界矩形会
@@ -267,6 +313,8 @@ function finishTyping(keep) {
 // 会把"正在打的字"当成手势吃掉，所以在这里截住，不让它冒到 document。
 txtEl.addEventListener("keydown", (e) => {
   e.stopPropagation();
+  // 打字也是活动：不续时的话，一段长字打到一半就被"闲置超时"砍掉
+  markActivity();
   if (e.key === "Enter") {
     e.preventDefault();
     finishTyping(true);
@@ -307,11 +355,13 @@ function enterAnnotate() {
   redraw();
   placeTools();
   syncTools();
+  startIdleWatch();
   setHint("画一笔 · Enter 或点「完成」提交 · Backspace 撤销 · Esc 放弃");
 }
 
 /** 退出并清空标注态。复用覆盖层时必须走这里：上一张的笔漏给下一张就是画错图。 */
 function exitAnnotate() {
+  stopIdleWatch();
   finishTyping(false);
   annotating = false;
   live = null;
@@ -455,6 +505,7 @@ document.addEventListener("mousedown", (e) => {
   if (e.button === 2) return; // 右键交给 contextmenu 处理成"取消"
   if (e.button !== 0) return;
   if (annotating) {
+    markActivity();
     if (tool === "text") {
       startTyping(point(e));
       return;
@@ -476,6 +527,8 @@ document.addEventListener("mousedown", (e) => {
 document.addEventListener("mousemove", (e) => {
   if (submitted || !started) return;
   if (annotating) {
+    // 空移动也算"人在"：只有按住拖才续时的话，人坐在这儿挪挪鼠标照样会被 3 分钟砍掉
+    markActivity();
     if (!live) return;
     updateOp(live, point(e));
     redraw();
@@ -491,6 +544,7 @@ document.addEventListener("mousemove", (e) => {
 document.addEventListener("mouseup", (e) => {
   if (annotating) {
     if (!live) return;
+    markActivity();
     // 抬手时位置没动也算一笔（点一个箭头/一个十字是正常用法）
     ops.push(live);
     live = null;
@@ -536,6 +590,7 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (!annotating) return;
+  markActivity();
   if (e.key === "Enter") {
     e.preventDefault();
     doCommit();

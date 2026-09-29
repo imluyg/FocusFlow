@@ -46,6 +46,28 @@ const HIDE_SETTLE: std::time::Duration = std::time::Duration::from_millis(90);
 /// 控制器就绪到页面跑起来这段在这条计时之内，卡太紧会把"第一次截图"稳定误判成失败。
 const TAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// 标注态的**绝对**存活上限。页面自己那份 3 分钟闲置计时器管"人走了"，管不了"页面卡住"
+/// —— 卡住时计时器也不跑了，而这是一张不透明的全屏 topmost 冻结图，盖在用户桌面上
+/// 没有上限是不能接受的（老手势松手即提交，最多盖几百毫秒）。
+const ANNOTATE_LIVE_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// 再按一次热键时，该不该把在飞的那张标注放弃（口径①：这条热键本来就该幂等）。
+///
+/// 只有"在飞的这张是标注模式、按下的也是标注热键"才放弃。直出那张正在等松手，
+/// 拿另一条热键去砍它会让用户莫名其妙丢一张截图。
+fn should_abandon_on_repress(in_flight_annotate: Option<bool>, requested_annotate: bool) -> bool {
+    in_flight_annotate == Some(true) && requested_annotate
+}
+
+/// 标注态的绝对上限到点了该不该收（纯函数，给用例钉判据）。
+///
+/// `same_epoch` 是关键那道：计时器是**上一张**起的，晚一步醒来时槽里可能已经是下一张
+/// （用户 10 分钟内又截了一张），那时砍它就是误杀。直出模式也不归这条管（它有 8 秒
+/// 那条取图看门狗）。
+fn annotate_ceiling_fires(same_epoch: bool, annotate: bool) -> bool {
+    same_epoch && annotate
+}
+
 /// 一次冻结的会话。
 struct Session {
     epoch: u64,
@@ -186,6 +208,14 @@ fn current_epoch() -> u64 {
         .ok()
         .and_then(|g| g.as_ref().map(|s| s.epoch))
         .unwrap_or(0)
+}
+
+/// 在飞那张会话是不是标注模式；没有会话（抓屏线程还没入槽）时是 `None`。
+fn session_annotate() -> Option<bool> {
+    SESSION
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.annotate))
 }
 
 /// 清空会话（所有出口都走这里，包括失败路径）。
@@ -487,7 +517,21 @@ pub fn trigger(app: &AppHandle, annotate: bool) -> Result<(), String> {
     // swap 的返回值是"进去之前是不是已经有人了"。已经有人时**不要**把它改回 false：
     // 那个 true 属于上一次会话，被这次失败的触发清掉的话，下一次就能并发抓第二张屏。
     if IN_FLIGHT.swap(true, Ordering::SeqCst) {
-        return Err("已有一张截图在进行中，先完成它（Esc 取消或框选一块）".to_string());
+        // 已经有人了：那个 true 属于上一次会话，别把它改回 false（下面真放弃时由
+        // finish_session 统一清）。再按一次标注热键 = 放弃当前这张标注（幂等，口径①）。
+        if should_abandon_on_repress(session_annotate(), annotate) {
+            tracing::info!(
+                "标注截图：再按一次 snip_annotate，放弃当前这一张（不落盘、不动剪贴板）"
+            );
+            finish_session(app);
+            return Ok(());
+        }
+        return Err(if annotate {
+            "已有一张截图在进行中，先完成它（Enter 提交 / Esc 放弃；再按一次本热键也会放弃当前这张）"
+                .to_string()
+        } else {
+            "已有一张截图在进行中，先完成它（Esc 取消或框选一块）".to_string()
+        });
     }
 
     // 悬浮窗的可见性必须在主线程读、也必须先藏起来再抓屏，顺序反了就把悬浮窗截进图里。
@@ -523,6 +567,41 @@ pub fn trigger(app: &AppHandle, annotate: bool) -> Result<(), String> {
             format!("启动截图线程失败：{e}")
         })?;
     Ok(())
+}
+
+/// 起一条标注态的绝对上限计时。只在页面**真把底图取走了**、且这张是标注模式时起 ——
+/// 直出那张几百毫秒就交了，不该为它多留一个活十分钟的线程。
+///
+/// 页面自己那份闲置计时器（3 分钟无操作）管"人走了"，管不了"页面卡住"：卡住时计时器
+/// 也不跑了。这条是最后一道，专门保证那张不透明全屏覆盖层不会无限期盖住桌面。
+fn spawn_annotate_ceiling(app: &AppHandle, epoch: u64) {
+    let handle = app.clone();
+    if let Err(e) = std::thread::Builder::new()
+        .name("snip-annotate-ceiling".into())
+        .spawn(move || {
+            std::thread::sleep(ANNOTATE_LIVE_LIMIT);
+            let stuck = SESSION
+                .lock()
+                .ok()
+                .and_then(|g| {
+                    g.as_ref()
+                        .map(|s| annotate_ceiling_fires(s.epoch == epoch, s.annotate))
+                })
+                .unwrap_or(false);
+            if stuck {
+                tracing::warn!(
+                    "标注态存活超过 {ANNOTATE_LIVE_LIMIT:?}（页面既没交也没取消），自动放弃并恢复桌面"
+                );
+                abort_session(
+                    &handle,
+                    "标注时间过长，已自动放弃（不是失败），什么都没保存",
+                );
+            }
+        })
+    {
+        // 起不了这条计时不是失败：还有页面那份闲置计时器在管，只是少了一道兜底。
+        tracing::warn!("启动标注上限计时失败：{e}（只剩页面那份闲置计时器在管）");
+    }
 }
 
 /// 覆盖层页面启动时来取底图。**图被取走**（见 `Session::png_base64`），
@@ -563,6 +642,9 @@ pub async fn snip_take(app: AppHandle) -> Result<SnipPayload, String> {
     let dpr = win
         .scale_factor()
         .map_err(|e| format!("取缩放倍数失败：{e}"))?;
+    if annotate {
+        spawn_annotate_ceiling(&app, epoch);
+    }
     Ok(SnipPayload {
         epoch,
         png_base64: png,
@@ -582,7 +664,8 @@ pub async fn snip_commit(app: AppHandle, sel: SnipSelection) -> Result<SnipOutco
         .map_err(|e| format!("截图任务被中断：{e}"))?
 }
 
-/// 把页面回传的标注层合成到裁剪好的 BGRA 上；返回值是"这次到底叠了没有"（只为日志）。
+/// 把页面回传的标注层合成到裁剪好的 BGRA 上；返回 `Some(层 PNG 字节数)`，
+/// 没带图层返回 `None`（给日志用，也用来区分"这张没画"与"画了但画错了"）。
 ///
 /// 三条规矩收在这一个函数里，别在调用点各写一遍：
 /// - **没带图层就一个字节都不碰**（老热键那条路、以及标注模式下什么都没画）——
@@ -596,9 +679,9 @@ fn apply_annot_layer(
     layer_b64: Option<&str>,
     width: u32,
     height: u32,
-) -> Result<bool, String> {
+) -> Result<Option<usize>, String> {
     let Some(b64) = layer_b64.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(false);
+        return Ok(None);
     };
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
@@ -610,7 +693,7 @@ fn apply_annot_layer(
         ));
     }
     capture::composite_over(dst_bgra, &layer, width, height)?;
-    Ok(true)
+    Ok(Some(bytes.len()))
 }
 
 fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, String> {
@@ -669,15 +752,23 @@ fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, S
     //    下面两支（第 4 步编码用的 clone、第 6 步交给 CF_DIB 的原块）读的是同一块
     //    `cropped.bgra`：把合成挪到第 4 步之后，就会得到「落盘那张没标注、剪贴板那份有标注」，
     //    而两个产物都看着完全正常 —— 这是本模块最难发现的一类不一致。
-    let annotated = apply_annot_layer(
+    let t_layer = std::time::Instant::now();
+    let layered = apply_annot_layer(
         &mut cropped.bgra,
         sel.layer_png_base64.as_deref(),
         phys.width,
         phys.height,
     )?;
-    if annotated {
-        // 成功也要出声：只记失败的话，日志里"叠了标注"和"这压根没带图层"长得一样。
-        tracing::info!("截图已叠加标注层（{}x{}）", phys.width, phys.height);
+    if let Some(bytes) = layered {
+        // 成功也要出声，而且带上"回传这一层多大、吃了多久"：日志里要能直接看出
+        // 标注这条路占了多少毫秒，不然它永远是一笔糊涂账（底图那三分段计时同理）。
+        tracing::info!(
+            "截图已叠加标注层（{}x{}，层 PNG {} 字节，解码+合成 {} ms）",
+            phys.width,
+            phys.height,
+            bytes,
+            t_layer.elapsed().as_millis()
+        );
     }
 
     // 4) 只把裁出来的小块转 RGBA 编码（CF_DIB 那份仍用原始 BGRA）。
@@ -925,7 +1016,7 @@ mod tests {
             let mut dst = base_bgra(8);
             let before = dst.clone();
             assert!(
-                !apply_annot_layer(&mut dst, none, 4, 2).unwrap(),
+                apply_annot_layer(&mut dst, none, 4, 2).unwrap().is_none(),
                 "没图层时不该报成功叠加"
             );
             assert_eq!(dst, before, "没图层却动了像素：{none:?}");
@@ -945,7 +1036,9 @@ mod tests {
         let mut dst = base_bgra(8);
         let before = dst.clone();
         assert!(
-            apply_annot_layer(&mut dst, Some(&b64), 4, 2).unwrap(),
+            apply_annot_layer(&mut dst, Some(&b64), 4, 2)
+                .unwrap()
+                .is_some(),
             "带图层要报「叠了」"
         );
         assert_eq!(
@@ -1084,6 +1177,78 @@ mod tests {
             "写盘（{}）、编码（{encode}）、剪贴板（{clip}）都必须排在合成（{call}）之后，\
              否则盘上或剪贴板里就会有一份没打码的图",
             writes[0]
+        );
+    }
+
+    /// 再按一次热键的判据：只有"在飞的是标注、按下的也是标注热键"才放弃当前那张。
+    #[test]
+    fn repress_only_abandons_an_annotate_session() {
+        assert!(
+            should_abandon_on_repress(Some(true), true),
+            "再按标注热键要放弃当前标注（幂等那条）"
+        );
+        assert!(
+            !should_abandon_on_repress(Some(false), true),
+            "直出那张正在等松手，不该被标注热键砍掉"
+        );
+        assert!(
+            !should_abandon_on_repress(Some(true), false),
+            "反过来也一样：画了一半的标注不该被直出热键砍掉"
+        );
+        assert!(
+            !should_abandon_on_repress(None, true),
+            "抓屏线程还没入槽时没有可放弃的东西（保持原来的报错）"
+        );
+    }
+
+    /// 绝对上限只砍"还是这一张、且是标注模式"那一种组合。
+    #[test]
+    fn annotate_ceiling_only_fires_for_its_own_session() {
+        assert!(
+            annotate_ceiling_fires(true, true),
+            "还是那张标注 → 到点就该收"
+        );
+        assert!(
+            !annotate_ceiling_fires(false, true),
+            "槽里已经是下一张了，砍它就是误杀（计时器是上一张起的）"
+        );
+        assert!(
+            !annotate_ceiling_fires(true, false),
+            "直出那张归 8 秒那条取图看门狗管"
+        );
+    }
+
+    /// 两道时限必须"页面闲置 < Rust 绝对上限"，而且页面那份**得还在**。
+    ///
+    /// 后半截是跨语言钉：按活动的计时器只有页面自己知道（Rust 看不到鼠标），所以它一旦
+    /// 被人删掉，Rust 这边只剩一道"卡住才用得上"的兜底 —— 用户画 10 分钟就会被误砍。
+    /// 症状不响亮（只是"我回来时桌面被清了一下"），所以宁可拿文本匹配钉住。
+    #[test]
+    fn annotate_idle_timer_lives_in_the_page_and_is_shorter_than_the_ceiling() {
+        assert!(
+            ANNOTATE_LIVE_LIMIT >= std::time::Duration::from_secs(300),
+            "绝对上限要比页面那份闲置宽：{ANNOTATE_LIVE_LIMIT:?}"
+        );
+        let js = include_str!("../ui/snip.js");
+        assert!(
+            js.contains("ANNOTATE_IDLE_MS"),
+            "页面那份按活动的闲置计时器不见了 —— 只剩 Rust 的绝对上限会误砍正常作画"
+        );
+        let idle = js
+            .split("ANNOTATE_IDLE_MS = ")
+            .nth(1)
+            .and_then(|s| {
+                s.split_whitespace()
+                    .next()
+                    .map(|v| v.trim_end_matches(';').to_string())
+            })
+            .expect("ANNOTATE_IDLE_MS 要有字面量");
+        let ms: u64 = idle.replace('_', "").parse().expect("闲置上限得是个毫秒数");
+        assert!(ms >= 60_000, "闲置短于一分钟会把人正在想的工夫砍掉：{ms}");
+        assert!(
+            ms < ANNOTATE_LIVE_LIMIT.as_millis() as u64,
+            "页面闲置（{ms}ms）必须短于 Rust 的绝对上限（{:?}），否则那道兜底永远轮不到",
+            ANNOTATE_LIVE_LIMIT
         );
     }
 
