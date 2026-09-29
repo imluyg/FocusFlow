@@ -287,7 +287,7 @@ pub mod win {
         HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
     };
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
@@ -625,8 +625,8 @@ pub mod win {
         Ok(hwnd)
     }
 
-    /// 校验输入并拼出 CF_DIB 负载。**不碰剪贴板**，所以尺寸不符时在清空用户剪贴板之前就失败。
-    pub fn dib_payload(bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    /// 校验 BGRA 与它声称的尺寸是否自洽。**不碰剪贴板**，所以尺寸不符时在动用户剪贴板之前就失败。
+    fn check_bgra_size(bgra: &[u8], width: u32, height: u32) -> Result<usize, String> {
         if width == 0 || height == 0 {
             return Err(format!("剪贴板图像尺寸为 0（{width}x{height}）"));
         }
@@ -640,23 +640,61 @@ pub mod win {
                 bgra.len()
             ));
         }
-        Ok(dib_bytes(&dib_header(width, height), bgra))
+        Ok(bytes)
     }
 
-    /// 把 BGRA 图作为 CF_DIB 放进剪贴板。
+    /// 拼**剪贴板专用**的 CF_DIB 负载：正高度（bottom-up）+ BGRA 行序倒过来。
     ///
-    /// 线程亲和：`Open → Empty → Set → Close` 必须整段在同一个线程里跑完，所以这里不拆成
-    /// 三个公开函数；调用方把整个调用放进一个 `spawn_blocking` 闭包就是对的。
-    pub fn write_dib_to_clipboard(bgra: &[u8], width: u32, height: u32) -> Result<(), String> {
+    /// 为什么不复用 `dib_header` 的负高度：那一版是给 `GetDIBits` 用的（负高度在它那里表示
+    /// 自上而下），而剪贴板的读者按 Windows 自己 PrtScn 交出的约定来。实测一份 top-down 的
+    /// CF_DIB 让 .NET 的 `Clipboard.GetImage()` 抛 `NullReferenceException`（也就是走 WinForms /
+    /// WPF 那一路的粘帖目标全拿不到图），症状就是"截图存了盘、粘出去什么都没有"。
+    /// 纯函数，所以"方向"能脱离真实剪贴板被断言 —— 注意断言必须用**能区分上下**的图形，
+    /// 1x1 的夹具里倒不倒序都看不出差别。
+    pub fn dib_payload_bottom_up(bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+        check_bgra_size(bgra, width, height)?;
+        let mut header = dib_header(width, height);
+        header.biHeight = height as i32; // 正 = bottom-up
+        let row = (width as usize) * 4;
+        let mut flipped = Vec::with_capacity(bgra.len());
+        for r in (0..height as usize).rev() {
+            flipped.extend_from_slice(&bgra[r * row..(r + 1) * row]);
+        }
+        Ok(dib_bytes(&header, &flipped))
+    }
+
+    /// 注册 `PNG` 剪贴板格式：浏览器与网页编辑器读 `image/png`，它们**不看** CF_DIB。
+    /// 返回 `None` 表示系统没这个格式 ⇒ 只交 CF_DIB，不影响主路径。
+    fn png_format() -> Option<u32> {
+        let id = unsafe { RegisterClipboardFormatW(w!("PNG")) };
+        if id == 0 {
+            tracing::warn!("注册剪贴板格式 PNG 失败，本次只交 CF_DIB");
+            None
+        } else {
+            Some(id)
+        }
+    }
+
+    /// 把截图放进剪贴板：CF_DIB（bottom-up）+ `PNG`（`png` 非空时）。
+    ///
+    /// 线程亲和：`Open → Empty → Set… → Close` 必须整段在同一个线程里跑完，所以这里不拆成三个
+    /// 公开函数；调用方把整个调用放进一个 `spawn_blocking` 闭包就是对的。
+    pub fn write_image_to_clipboard(
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+        png: &[u8],
+    ) -> Result<(), String> {
         // 先备料再开窗：校验失败时必须原样留下用户剪贴板里的东西。
-        let payload = dib_payload(bgra, width, height)?;
+        let payload = dib_payload_bottom_up(bgra, width, height)?;
+        let png_fmt = if png.is_empty() { None } else { png_format() };
 
         let owner = clip_owner_hwnd()?;
         let mut last = String::from("未尝试");
         for attempt in 1..=5u32 {
             match unsafe { OpenClipboard(Some(owner)) } {
                 Ok(()) => {
-                    let result = unsafe { write_while_open(&payload) };
+                    let result = unsafe { write_formats(&payload, png_fmt.zip(Some(png))) };
                     // 无论成败都要关：不关的话其它程序从此读不到剪贴板，症状比本次失败严重得多。
                     if let Err(e) = unsafe { CloseClipboard() } {
                         tracing::warn!("关闭剪贴板失败（本次结果仍按 {result:?} 上报）：{e}");
@@ -673,27 +711,59 @@ pub mod win {
         Err(format!("剪贴板被其它程序占用，重试 5 次后放弃：{last}"))
     }
 
-    /// 已持有剪贴板时的写入段。调用方负责 `CloseClipboard`。
-    unsafe fn write_while_open(payload: &[u8]) -> Result<(), String> {
-        EmptyClipboard().map_err(|e| format!("清空剪贴板失败：{e}"))?;
-        let hg: HGLOBAL = match GlobalAlloc(GMEM_MOVEABLE, payload.len()) {
+    /// 把字节搬进一块 `GMEM_MOVEABLE` 全局内存。调用方负责之后的 `SetClipboardData` 或释放。
+    unsafe fn prep_global(bytes: &[u8]) -> Result<HGLOBAL, String> {
+        let hg: HGLOBAL = match GlobalAlloc(GMEM_MOVEABLE, bytes.len()) {
             Ok(h) => h,
-            Err(e) => return Err(format!("分配剪贴板内存失败（{} 字节）：{e}", payload.len())),
+            Err(e) => return Err(format!("分配剪贴板内存失败（{} 字节）：{e}", bytes.len())),
         };
         let dst = GlobalLock(hg);
         if dst.is_null() {
             let _ = GlobalFree(Some(hg));
-            return Err(format!("GlobalLock 返回空指针（{} 字节）", payload.len()));
+            return Err(format!("GlobalLock 返回空指针（{} 字节）", bytes.len()));
         }
-        std::ptr::copy_nonoverlapping(payload.as_ptr(), dst as *mut u8, payload.len());
-        if let Err(e) = GlobalUnlock(hg) {
-            let _ = GlobalFree(Some(hg));
-            return Err(format!("GlobalUnlock 失败：{e}"));
-        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+        // GlobalUnlock 的返回值在这里**必须丢掉**：锁计数归零时它就返回 0，而 0 正是"已经解锁"
+        // 这个我们想要的结果。windows 把 BOOL 包成 Result，于是"成功解锁"被翻译成 Err，而它又不写
+        //LastError ⇒ 报出来是那句自相矛盾的"失败：操作成功完成。(0x00000000)"。
+        // 当成错误提前返回会让 SetClipboardData 永远不被调用：截图照样存盘，但粘不出任何东西
+        // （这条成功路径原本没有任何用例覆盖，所以它在生产里错了三个版本）。
+        let _ = GlobalUnlock(hg);
+        Ok(hg)
+    }
+
+    /// 已持有剪贴板时的写入段。调用方负责 `CloseClipboard`。
+    unsafe fn write_formats(dib: &[u8], png: Option<(u32, &[u8])>) -> Result<(), String> {
+        // 顺序刻意是「先把内存备料完成，最后才 EmptyClipboard」：备料任何一步失败都不该动用户
+        // 已有的剪贴板内容。旧写法先 Empty 再备料，失败就留下一个**空剪贴板** —— 症状比"没复制上"
+        // 更糟，是把他原本要粘的东西擦掉了。
+        let h_dib = prep_global(dib)?;
+        let h_png = match png {
+            Some((fmt, bytes)) => match prep_global(bytes) {
+                Ok(h) => Some((fmt, h)),
+                Err(e) => {
+                    let _ = GlobalFree(Some(h_dib));
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
+
+        EmptyClipboard().map_err(|e| format!("清空剪贴板失败：{e}"))?;
         // 从这一行起所有权交给系统：之后再 GlobalFree 就是双释放，这是这一族 bug 的固定结局。
-        if let Err(e) = SetClipboardData(CF_DIB, Some(HANDLE(hg.0))) {
-            let _ = GlobalFree(Some(hg));
+        if let Err(e) = SetClipboardData(CF_DIB, Some(HANDLE(h_dib.0))) {
+            if let Some((_, hp)) = h_png {
+                let _ = GlobalFree(Some(hp));
+            }
+            let _ = GlobalFree(Some(h_dib));
             return Err(format!("写入剪贴板失败：{e}"));
+        }
+        // PNG 是加分项：它失败不该让整次截图算失败（CF_DIB 已经进了剪贴板）。
+        if let Some((fmt, hp)) = h_png {
+            if let Err(e) = SetClipboardData(fmt, Some(HANDLE(hp.0))) {
+                tracing::warn!("CF_DIB 已进剪贴板，但 PNG 没放进去：{e}");
+                let _ = GlobalFree(Some(hp));
+            }
         }
         Ok(())
     }
@@ -1080,10 +1150,22 @@ mod tests {
             assert_eq!(&bytes[40..], &bgra[..]);
         }
 
+        /// 剪贴板那份 DIB 的方向：**正高度**，且行序倒过来（我们的 BGRA 是自上而下的）。
+        /// 夹具必须能区分上下 —— 1x1 里倒不倒序都得到同一份字节，那是条假绿。
         #[test]
-        fn dib_payload_is_header_plus_pixels_for_the_given_size() {
-            let bytes = win::dib_payload(&[0u8; 4 * 2 * 2], 2, 2).unwrap();
+        fn dib_payload_bottom_up_flips_the_rows() {
+            // 2x2：顶行 8 个字节全是 1，底行全是 2
+            let bgra: Vec<u8> = vec![1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2];
+            let bytes = win::dib_payload_bottom_up(&bgra, 2, 2).unwrap();
             assert_eq!(bytes.len(), 40 + 16);
+            assert_eq!(&bytes[..4], &40u32.to_le_bytes()[..], "biSize 恒为 40");
+            assert_eq!(
+                &bytes[8..12],
+                &2i32.to_le_bytes()[..],
+                "剪贴板的 biHeight 必须是正数：负高度那份实测让 .NET 的 Clipboard.GetImage 抛异常"
+            );
+            assert_eq!(&bytes[40..48], &[2u8; 8][..], "紧跟头的该是**底行**");
+            assert_eq!(&bytes[48..56], &[1u8; 8][..], "第二块该是顶行");
         }
 
         #[test]
@@ -1093,7 +1175,7 @@ mod tests {
                 (&[][..], 0u32, 0u32),
                 (&[0u8; 8][..], 2u32, 2u32),
             ] {
-                let err = win::dib_payload(buf, w, h).unwrap_err();
+                let err = win::dib_payload_bottom_up(buf, w, h).unwrap_err();
                 assert!(
                     err.contains("剪贴板"),
                     "错误要指得出是哪一层拒的，实际：{err}"
@@ -1101,9 +1183,9 @@ mod tests {
             }
         }
 
-        /// 只读地问一句"剪贴板里现在有没有 CF_DIB"。读不出来给 Err，**不折成"没有"** ——
-        /// 这条 helper 存在的意义就是给下面那条用例一个真的观察量。
-        fn clip_has_dib() -> Result<bool, String> {
+        /// 只读地问一句"剪贴板里现在有没有这个格式"。读不出来给 Err，**不折成"没有"** ——
+        /// 这条 helper 存在的意义就是给下面的用例一个真的观察量。
+        fn clip_has_fmt(fmt: u32) -> Result<bool, String> {
             use windows::Win32::System::DataExchange::{
                 CloseClipboard, IsClipboardFormatAvailable, OpenClipboard,
             };
@@ -1111,7 +1193,7 @@ mod tests {
             for attempt in 1..=10u32 {
                 match unsafe { OpenClipboard(None) } {
                     Ok(()) => {
-                        let has = unsafe { IsClipboardFormatAvailable(win::CF_DIB) }.is_ok();
+                        let has = unsafe { IsClipboardFormatAvailable(fmt) }.is_ok();
                         if let Err(e) = unsafe { CloseClipboard() } {
                             return Err(format!("读完了却关不上剪贴板：{e}"));
                         }
@@ -1124,6 +1206,11 @@ mod tests {
                 }
             }
             Err(format!("重试 10 次仍读不到剪贴板：{last}"))
+        }
+
+        /// 上面那条的 CF_DIB 专用写法（三处用例都在问它）。
+        fn clip_has_dib() -> Result<bool, String> {
+            clip_has_fmt(win::CF_DIB)
         }
 
         /// 坏输入一定在碰剪贴板之前被挡掉：用户原有的剪贴板内容不能因为一次错误调用而消失。
@@ -1139,12 +1226,45 @@ mod tests {
                 (&[][..], 0u32, 0u32),
                 (&[0u8; 8][..], 2u32, 2u32),
             ] {
-                assert!(win::write_dib_to_clipboard(buf, w, h).is_err());
+                assert!(win::write_image_to_clipboard(buf, w, h, &[]).is_err());
             }
             assert_eq!(
                 clip_has_dib().expect("调用后又读不到剪贴板了"),
                 before,
                 "校验失败却动了用户的剪贴板"
+            );
+        }
+
+        /// 成功路径真的落到剪贴板上：写一张 1x1 的 CF_DIB，再问"现在有没有 CF_DIB"。
+        ///
+        /// `#[ignore]` 的原因是本机的硬约束 —— 它会**覆盖用户的剪贴板内容**，只能他点头才跑。
+        /// 但它盯的正是那条此前零覆盖的成功路径：旧写法在 `GlobalUnlock` 处把"锁计数归零"
+        /// 当成失败返回（实测原始返回 0、last error 也是 0，windows 把它翻成
+        /// `Err("操作成功完成 (0x0)")`），截图照样存盘却永远粘不出东西，在生产里错着走了三个版本。
+        /// 想跑：`cargo test -p focusflow-core --lib -- --ignored capture::tests::good_input`
+        #[test]
+        #[ignore = "会覆盖用户剪贴板内容：只在用户明确同意时用 --ignored 跑"]
+        fn good_input_actually_lands_on_the_clipboard() {
+            use windows::core::w;
+            use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+            let bgra = [12u8, 40, 66, 255]; // 1x1 不透明
+                                            // 这一层不校验 PNG 内容（编码在 encode_png 那层已经保证），所以给一段假字节即可
+            let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+            if let Err(e) = win::write_image_to_clipboard(&bgra, 1, 1, &png) {
+                panic!("1x1 的图应该写得进剪贴板，却报：{e}");
+            }
+            assert!(
+                clip_has_dib().expect("写完读不到剪贴板，这条用例就没有观察量了"),
+                "写入返回成功，剪贴板里却没有 CF_DIB"
+            );
+            let png_fmt = unsafe { RegisterClipboardFormatW(w!("PNG")) };
+            assert_ne!(
+                png_fmt, 0,
+                "这台机器上连 PNG 注册格式都拿不到，那条腿没有观察量"
+            );
+            assert!(
+                clip_has_fmt(png_fmt).expect("读不到剪贴板"),
+                "CF_DIB 进去了但 PNG 没进去：浏览器/网页编辑器只认 PNG，症状照样是\"粘不出图\""
             );
         }
 

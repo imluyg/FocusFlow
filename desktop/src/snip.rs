@@ -576,23 +576,40 @@ fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, S
         .unwrap_or_default();
     let file = dir.join(capture::unique_name(&stem, "png", &listing));
     let (saved, save_reason) = match std::fs::write(&file, &png) {
-        Ok(()) => (true, String::new()),
+        Ok(()) => {
+            tracing::info!("截图已存盘：{}（{} 字节）", file.display(), png.len());
+            (true, String::new())
+        }
         Err(e) => {
             tracing::error!("截图写盘失败（{}）：{e}", file.display());
             (false, e.to_string())
         }
     };
 
-    // 5) 剪贴板：CF_DIB 要的正是裁剪出来那份 BGRA，不用再解码 PNG。
+    // 5) 剪贴板：CF_DIB 要的正是裁剪出来那份 BGRA（不用再解码 PNG），PNG 就是刚编好的那一份。
+    //    两个格式都交 —— CF_DIB 给传统 GDI 目标，PNG 给浏览器/网页编辑器（它们不看 CF_DIB）。
     //    线程亲和：整段在同一个 spawn_blocking 线程里跑完（见 core 侧注释）。
-    let (clipboard, clipboard_reason) =
-        match capture::win::write_dib_to_clipboard(&cropped.bgra, phys.width, phys.height) {
-            Ok(()) => (true, String::new()),
-            Err(e) => {
-                tracing::warn!("截图进剪贴板失败：{e}");
-                (false, e)
-            }
-        };
+    let (clipboard, clipboard_reason) = match capture::win::write_image_to_clipboard(
+        &cropped.bgra,
+        phys.width,
+        phys.height,
+        &png,
+    ) {
+        Ok(()) => {
+            // 成功也要出声：只记失败的话，日志里"提交并写进了剪贴板"与"根本没走到这一步"
+            // 长得一模一样（今天我就是因此误判了一次他的操作）。
+            tracing::info!(
+                "截图已进剪贴板（CF_DIB bottom-up + PNG，{}x{}）",
+                phys.width,
+                phys.height
+            );
+            (true, String::new())
+        }
+        Err(e) => {
+            tracing::warn!("截图进剪贴板失败：{e}");
+            (false, e)
+        }
+    };
 
     let line = outcome_line(saved, &save_reason, clipboard, &clipboard_reason);
     finish_session(app);
