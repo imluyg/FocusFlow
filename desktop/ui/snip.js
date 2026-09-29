@@ -28,6 +28,10 @@
 // 8. 打敏感受信息有两支笔，差别在"留不留痕迹"：**马赛克**每格是 ~10×10 源像素的平均色，
 //    读不出字但还留着"这里有一行、分成几组"的粗略明暗；**色块**把那块涂成一个颜色，
 //    信息量为零，而且能盖住先前画的字（后画的在上面）。色块用当前颜色档，不写死黑。
+// 9. **贴图（M4）是提交的一个出口，不是第三种手势**：点「贴图」或按 `P` 走的仍然是
+//    `snip_commit`，只是多带一个 `pin: true`。存盘、进剪贴板、落盘的文件名规则一行没改，
+//    所以贴图**不多落一个文件**（口径 A，2026-09-30 定）。`submitted` 那道闸也不为它让路：
+//    一次手势一张图，贴图只是那张图的第二个去处。
 import { invoke, listen } from "./js/tauri.js";
 
 const img = document.getElementById("shot");
@@ -356,7 +360,7 @@ function enterAnnotate() {
   placeTools();
   syncTools();
   startIdleWatch();
-  setHint("画一笔 · Enter 或点「完成」提交 · Backspace 撤销 · Esc 放弃");
+  setHint("画一笔 · Enter 提交 · P 或点「贴图」钉在桌面上 · Backspace 撤销 · Esc 放弃");
 }
 
 /** 退出并清空标注态。复用覆盖层时必须走这里：上一张的笔漏给下一张就是画错图。 */
@@ -399,6 +403,7 @@ toolsEl.addEventListener("click", (e) => {
   else if (b.dataset.w) penWidth = Number(b.dataset.w);
   else if (b.dataset.size) textSize = Number(b.dataset.size);
   else if (b.id === "t-undo") undoOp();
+  else if (b.id === "t-pin") doCommit(true);
   else if (b.id === "t-ok") doCommit();
   else if (b.id === "t-cancel") giveUp("标注态点了取消");
   syncTools();
@@ -476,9 +481,16 @@ function showSnap(r) {
   snapEl.style.display = "block";
 }
 
-/** 提交唯一入口：`submitted` 这道闸只在这里落下（一次手势一张图）。 */
-function doCommit() {
-  if (!box) return;
+/** 提交唯一入口：`submitted` 这道闸只在这里落下（一次手势一张图）。
+ *  `pin` 为真只是"这一次提交之后再多开一个贴图窗口"，产出的还是**同一张**图，
+ *  所以这道闸不为贴图让路 —— 点两下贴图按钮不该得到两张截图加两张贴图。
+ *
+ *  ⚠ 闸门口径（文件头第 2 条）是"置上之后**所有**输入忽略"，而这里以前只挡鼠标那条路：
+ *  工具条的「完成 / 贴图」与 Enter / P 都直接调进来，连点两下就发两次 `snip_commit`。
+ *  第二次会被 Rust 以"没有进行中的截图"打回，于是**一次成功的截图之后紧跟一条红色失败提示** ——
+ *  盘上不会多一张，但用户看到的是坏了。贴图按钮进来之后这条更容易撞到。 */
+function doCommit(pin) {
+  if (!box || submitted) return;
   submitted = true;
   sel.style.cursor = "progress";
   invoke("snip_commit", {
@@ -491,6 +503,8 @@ function doCommit() {
       epoch,
       // 标注层（null = 没画东西）。Rust 侧解码后严格核对尺寸，不等就报错而不是缩放。
       layer_png_base64: layerBase64(),
+      // 贴图开关（口径 A：贴图算这次截图的一个出口，存盘与剪贴板照旧）
+      pin: !!pin,
       ...viewportReport(),
     },
   }).catch((err) => {
@@ -594,6 +608,11 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
     e.preventDefault();
     doCommit();
+  } else if (e.key === "p" || e.key === "P") {
+    // 贴图。打字那条路不会走到这儿：输入框自己的 keydown 把所有键都 stopPropagation 了
+    // （见上面 `txtEl` 那段），正在敲的字不会被当成手势吃掉。
+    e.preventDefault();
+    doCommit(true);
   } else if (e.key === "Backspace") {
     // 撤销上一笔。不 preventDefault 的话某些 WebView 配置会把它当成"后退"
     e.preventDefault();

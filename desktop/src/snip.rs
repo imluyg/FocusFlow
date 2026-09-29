@@ -27,6 +27,8 @@ use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Webview
 
 use focusflow_core::capture::{self, MonitorRect, Shot};
 
+use crate::pin;
+
 /// 覆盖层窗口的 label，必须与 `capabilities/default.json` 里的字符串一致。
 ///
 /// 两处各写一遍是这个模块最容易静默坏掉的地方：capabilities 里缺这个 label 时窗口拿不到
@@ -116,6 +118,15 @@ pub struct SnipSelection {
     /// 解得开，否则加一个字段就把"松手即提交"那条老手势判成反序列化失败。
     #[serde(default)]
     pub layer_png_base64: Option<String>,
+    /// 这次提交之后**再贴一张**（工具条上的「贴图」按钮 / `P`）。
+    ///
+    /// 口径 A（2026-09-30 定）：贴图算一次截图的一个出口，不是它的替代品 —— 存盘与剪贴板
+    /// 那两步照旧走完，然后把刚编好的那一份 png 交给贴图窗口。所以这里只是一个布尔开关，
+    /// 而不是"第三种提交"。
+    ///
+    /// `#[serde(default)]` 与上面那条同理：不带这个字段的提交必须仍然解得开。
+    #[serde(default)]
+    pub pin: bool,
 }
 
 /// 覆盖层启动时要的底图。
@@ -177,6 +188,19 @@ fn outcome_line(saved: bool, save_reason: &str, clipboard: bool, clip_reason: &s
         (true, false) => format!("已存盘，但未复制到剪贴板（{clip_reason}）"),
         (false, true) => format!("已复制到剪贴板，但未存盘（{save_reason}）"),
         (false, false) => format!("截图未完成：存盘（{save_reason}）；剪贴板（{clip_reason}）"),
+    }
+}
+
+/// 贴图的成败追加在同一句话尾部，而不是另开一个出口。
+///
+/// `None` = 这次没点贴图，那句话**一个字都不加**（老手势的提示必须与贴图功能出现之前
+/// 逐字节一致）。贴图失败要说清"截图本身不受影响"：图已经落盘、也进过剪贴板了，
+/// 这时候让人以为整件事没成，比少一张贴图严重。
+fn pin_note(line: String, pinned: Option<Result<u32, String>>) -> String {
+    match pinned {
+        None => line,
+        Some(Ok(_)) => format!("{line}，已贴图"),
+        Some(Err(e)) => format!("{line}，贴图失败（截图本身不受影响）：{e}"),
     }
 }
 
@@ -709,7 +733,7 @@ fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, S
     // 2) 在锁内**直接裁**：既不 clone 整屏（4K 是 33 MB），也不把底图取走 ——
     //    这一步之后任何失败都保留会话与覆盖层，让用户重新框一次就能再提交，
     //    而不是"失败一次就得重新触发截图"。
-    let (mut cropped, phys) = {
+    let (mut cropped, phys, monitor) = {
         let slot = SESSION.lock().map_err(|_| "截图会话锁不可用")?;
         let s = slot
             .as_ref()
@@ -745,7 +769,8 @@ fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, S
         let cropped = s
             .shot
             .crop(phys.x as u32, phys.y as u32, phys.width, phys.height)?;
-        (cropped, phys)
+        // 那块屏本身也要带出去：`phys.x/y` 是**屏内偏移**，贴图的绝对落点还得加原点。
+        (cropped, phys, s.shot.rect)
     };
 
     // 3) 标注层合成：**全链路只有这一个合成点，且必须在裁剪之后、编码之前**。
@@ -832,6 +857,20 @@ fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, S
 
     let line = outcome_line(saved, &save_reason, clipboard, &clipboard_reason);
     finish_session(app);
+
+    // 7) 贴图（口径 A：贴图算这次截图的一个出口）。三步都在这一行之后：
+    //    - **在标注层合成与编码之后** —— 交给贴图的就是落盘那份 png，不重新编码，
+    //      于是「贴出来的」与「盘上的」「剪贴板里的」必然同源（与 M1 那条唯一合成点同一个理由）；
+    //    - **在 `finish_session` 之后** —— 覆盖层是一张盖住整屏的 topmost 冻结图，
+    //      它还没收掉就建贴图窗口，用户看到的会是贴图在那张图底下先闪一下；
+    //    - 本模块**一次盘都不写**（`pin.rs` 有一条按文本形状钉的用例）：贴图不多落一个文件。
+    let pinned = if sel.pin {
+        Some(pin::open(app, &png, &phys, &monitor))
+    } else {
+        None
+    };
+    let line = pin_note(line, pinned);
+
     if let Err(e) = app.emit("snip-done", line.clone()) {
         tracing::warn!("截图结果发不回前端：{e}");
     }
@@ -871,7 +910,10 @@ pub async fn do_snip(app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 pub async fn do_snip_annotate(app: AppHandle) -> Result<String, String> {
     trigger(&app, true)?;
-    Ok("已进入标注截图：框选后用工具条画，Enter 提交、Backspace 撤销上一笔、Esc 放弃".to_string())
+    Ok(
+        "已进入标注截图：框选后用工具条画，Enter 提交、P 或「贴图」钉在桌面上、Backspace 撤销上一笔、Esc 放弃"
+            .to_string(),
+    )
 }
 
 /// 覆盖层被 Alt+F4 / 关闭按钮收走时的收尾。`lib.rs` 的 `on_window_event` 调用。
@@ -1260,10 +1302,63 @@ mod tests {
         let s: SnipSelection = serde_json::from_str(old).expect("老页面的提交体");
         assert_eq!(s.epoch, 9);
         assert!(s.layer_png_base64.is_none());
+        assert!(!s.pin, "不带贴图字段的提交必须仍是「不贴图」");
 
         let with =
             r#"{"x":1.0,"y":2.0,"w":3.0,"h":4.0,"dpr":1.5,"epoch":9,"layer_png_base64":"AAA"}"#;
         let s: SnipSelection = serde_json::from_str(with).expect("带标注层的提交体");
         assert_eq!(s.layer_png_base64.as_deref(), Some("AAA"));
+        assert!(!s.pin, "加了标注层不等于要贴图，两者是独立的两件事");
+
+        let pin = r#"{"x":1.0,"y":2.0,"w":3.0,"h":4.0,"dpr":1.5,"epoch":9,"pin":true}"#;
+        assert!(
+            serde_json::from_str::<SnipSelection>(pin)
+                .expect("带贴图开关的提交体")
+                .pin
+        );
+    }
+
+    /// 贴图那句追加的话：没点贴图时必须**一个字都不加**。
+    /// 失败那一支要说清「截图本身不受影响」—— 图已经落盘也进过剪贴板了，
+    /// 让人以为整件事没成，比少一张贴图严重。
+    #[test]
+    fn pin_note_only_moves_when_pinning_was_asked() {
+        let base = "已存盘并复制到剪贴板".to_string();
+        assert_eq!(pin_note(base.clone(), None), base, "没贴图就不该改那句话");
+        let ok = pin_note(base.clone(), Some(Ok(3)));
+        assert!(ok.starts_with(&base) && ok.contains("已贴图"), "{ok}");
+        let err = pin_note(base.clone(), Some(Err("主线程没回音".to_string())));
+        assert!(
+            err.contains("不受影响") && err.contains("主线程没回音"),
+            "失败要带上原因，也要说清截图没受影响：{err}"
+        );
+    }
+
+    /// 贴图的入口只有工具条那一个按钮与 `P` 这一个键，两条都必须走**同一个** `doCommit(pin)`。
+    ///
+    /// 为什么按文本形状钉：`submitted` 那道闸（一次手势一张图）坏掉的形状是"多点两下贴图
+    /// 就落了三张盘、开了三扇窗"，而夹具里那一遍只测得动手势，测不到"有没有人另开一条提交路"。
+    #[test]
+    fn pin_entry_shares_the_single_commit_gate() {
+        let js = include_str!("../ui/snip.js");
+        assert_eq!(
+            js.match_indices("doCommit(true)").count(),
+            2,
+            "贴图入口该只有按钮与 P 键两处，多一处就是有人另开了一条提交路"
+        );
+        assert!(
+            js.contains("pin: !!pin,"),
+            "提交体里的 pin 必须由 doCommit 的参数决定，而不是页面某处写死"
+        );
+        // 「完成」那一条必须仍然是不贴图的提交（两条手势各走各的这条口径不能歪）
+        assert!(
+            js.contains("t-ok") && js.contains("doCommit();"),
+            "Enter 与「完成」那条得继续走不带贴图的提交"
+        );
+        // 直出模式（老热键）没有工具条，也就没有贴图入口：这条是给下一个改手势的人看的
+        assert!(
+            js.contains("if (annotate) enterAnnotate();"),
+            "松手进不进标注态的判据不见了 —— 贴图入口就会渗到直出那条路上"
+        );
     }
 }

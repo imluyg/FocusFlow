@@ -6,6 +6,7 @@
 pub mod commands;
 pub mod export;
 pub mod hotkey;
+pub mod pin;
 pub mod plugins;
 pub mod reveal;
 pub mod snip;
@@ -176,6 +177,10 @@ pub fn run() {
             snip::snip_take,
             snip::snip_commit,
             snip::snip_cancel,
+            pin::pin_take,
+            pin::pin_resize,
+            pin::pin_close,
+            pin::pin_close_all,
         ])
         .on_window_event(|window, event| {
             // 主窗口关闭 → 隐藏到托盘（500ms 后仍隐藏才销毁，见 state::hide_main_window），
@@ -192,6 +197,13 @@ pub fn run() {
                     api.prevent_close();
                     snip::on_snip_close_requested(window.app_handle());
                 }
+            }
+            // 贴图窗口销毁之后才收回它那份底图（`CloseRequested` 时窗口还在，那时收就早了）。
+            // 与覆盖层相反：贴图**不**拦关闭 —— 每张贴图都是新 label、走的是覆盖层已经验证过
+            // 的那条建窗路，销毁之后可以重建；拦下来反而得到「✕ 点不动」那种关不掉的东西。
+            // 非贴图的窗口在这里直接早退（`on_destroyed` 自己筛 label），不必在这儿再写一遍判据。
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                pin::on_destroyed(window.app_handle(), window.label());
             }
         })
         .build(tauri::generate_context!())
@@ -242,6 +254,7 @@ pub fn run() {
                 }
                 // 放在所有关闭动作之后：上面这些过程本身也要留日志，而非阻塞
                 // 日志 worker 的缓冲区不显式释放，进程一退最后几条就没了
+                pin::log_on_quit(app_handle);
                 focusflow_core::logger::shutdown();
             }
         });
@@ -262,7 +275,12 @@ mod wiring_audit {
 
     /// 程序会创建的**全部**窗口 label。新增窗口必须登记到这里 —— 没登记时第二条断言会红，
     /// 红消息里会写出是在哪个文件建出来的。
-    const APP_WINDOW_LABELS: [&str; 3] = ["main", "floating", "snip"];
+    ///
+    /// 多实例窗口（贴图）登记的是它的**通配形状**，与 `capabilities/default.json` 里那条
+    /// 字符串一模一样：`pin-*` 覆盖 `pin-1`、`pin-2`…（tauri 侧确实是按 glob 匹配的，
+    /// `tauri-utils` 的 `acl/resolved.rs` 把每条编成 `glob::Pattern`，`ipc/authority.rs`
+    /// 拿 `.matches(label)` 判）。
+    const APP_WINDOW_LABELS: [&str; 4] = ["main", "floating", "snip", "pin-*"];
 
     fn read(rel: &str) -> String {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
@@ -446,9 +464,13 @@ mod wiring_audit {
                 let label = match second.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
                     Some(q) => q.to_string(),
                     // 常量（如 SNIP_LABEL）：回到同一个文件里查它等于哪个串
-                    None => lookup_const(&src, &second).unwrap_or_else(|| {
-                        panic!("{rel} 里用 `{second}` 建窗，但解不出这个常量的值，请改审计或登记")
-                    }),
+                    None => lookup_const(&src, &second)
+                        .or_else(|| dynamic_label(&src, &second))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{rel} 里用 `{second}` 建窗，但解不出这个常量的值，请改审计或登记"
+                            )
+                        }),
                 };
                 found.push((label, rel.clone()));
             }
@@ -511,5 +533,28 @@ mod wiring_audit {
             .filter(|s| !s.is_empty())?
             .to_string();
         Some(value)
+    }
+
+    /// 动态 label：`format!("{PIN_LABEL_PREFIX}{seq}")` —— 多实例窗口（贴图）就是这么命名的。
+    ///
+    /// 只认这一种形状，且解出来的是**登记用的通配**（`pin-*`），与 capabilities 里那条字符串
+    /// 同一个串。三条限制各有理由：
+    /// - `{名字}` 之前必须没有别的文本：通配只能表达「以某串开头」，`format!("x{C}1")`
+    ///   那种拼接匹不出来的东西不该被当成已登记；
+    /// - 那个常量必须以 `-` 结尾：前缀不带分隔符（`pin`）会让 `pin-*` 谁也匹不到，
+    ///   症状正好是当年 snip 那个「窗口有了、调什么都被拒」；
+    /// - 解不出就 `None`，由调用点 panic —— 静默跳过等于这条审计悄悄失去覆盖面。
+    fn dynamic_label(src: &str, expr: &str) -> Option<String> {
+        let inner = expr.strip_prefix("format!(\"")?.strip_suffix("\")")?;
+        let (head, rest) = inner.split_once('{')?;
+        if !head.is_empty() {
+            return None;
+        }
+        let name = rest.split('}').next()?;
+        let prefix = lookup_const(src, name)?;
+        if !prefix.ends_with('-') {
+            return None;
+        }
+        Some(format!("{prefix}*"))
     }
 }

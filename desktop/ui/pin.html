@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>FocusFlow 贴图</title>
+  <style>
+    /* 贴图窗口是**不透明**的：Windows 上每个透明窗口都会建一个 softbuffer 表面并立刻
+       unwrap 一次 resize，而本包 release 是 panic=abort —— 一失败就是整个进程闪退
+       （原因写在 snip.rs 的 ensure_overlay 与 pin.rs 的模块头）。所以这里不要加
+       rgba 背景、不要加圆角与阴影：那都不会真的透出东西，只会把窗口改成透明。 */
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0b0b0d;
+      -webkit-user-select: none;
+      user-select: none;
+      cursor: move;
+      font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    /* 图按**自己的物理尺寸 / devicePixelRatio** 画（见 pin.js 第 2 条口径），
+       不铺满视口：WebView2 会把窗口强制放宽到至少 120px，铺满就会把图横向拉糊。
+       多出来的那一条是底色边 —— 难看，但图仍然逐像素等于落盘那张。 */
+    #img {
+      position: fixed;
+      left: 0;
+      top: 0;
+      display: block;
+      image-rendering: pixelated;
+      -webkit-user-drag: none;
+      user-drag: none;
+    }
+    /* 只在鼠标进来时出现的关闭键：贴图平时就该只有图，不常驻一条工具条 */
+    #x {
+      position: fixed;
+      right: 4px;
+      top: 4px;
+      display: none;
+      width: 22px;
+      height: 22px;
+      line-height: 20px;
+      text-align: center;
+      border: 1px solid #666;
+      border-radius: 3px;
+      background: #17171a;
+      color: #eee;
+      font-size: 15px;
+      cursor: pointer;
+      z-index: 3;
+    }
+    body:hover #x { display: block; }
+    #x:hover { background: #b3261e; border-color: #b3261e; }
+    /* 缩放百分比：只在刚滚完轮的那一会儿出现，然后自己淡掉 */
+    #badge {
+      position: fixed;
+      left: 6px;
+      bottom: 6px;
+      display: none;
+      padding: 2px 6px;
+      border-radius: 3px;
+      background: rgba(0, 0, 0, 0.7);
+      color: #ffd400;
+      font-size: 12px;
+      line-height: 1.4;
+      z-index: 3;
+      pointer-events: none;
+    }
+    /* 取不到图时窗口只剩这行话：别让人对着一个灰框猜 */
+    #dead {
+      position: fixed;
+      inset: 0;
+      display: none;
+      padding: 10px;
+      box-sizing: border-box;
+      color: #ffb4b4;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    body.dead #dead { display: block; }
+    body.dead { cursor: default; }
+  </style>
+</head>
+<body>
+  <img id="img" alt="" />
+  <div id="x" title="关掉这张贴图（Esc）">✕</div>
+  <div id="badge"></div>
+  <div id="dead"></div>
+  <script type="module" src="pin.js"></script>
+</body>
+</html>

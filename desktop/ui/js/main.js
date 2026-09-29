@@ -4,7 +4,7 @@ import { invoke, listen } from "./tauri.js";
 import { $, toast } from "./utils.js";
 import { appState, analyticsTab } from "./state.js";
 import { renderPlugins, openPlugin, closePlugin, renderPluginDetail, togglePlugin, pluginBtn, pluginBtnSel, pluginField, pluginFieldStay, pluginSelectRow, pluginSelectAll, modalOpen, modalCancel, modalSubmit, modalAction } from "./plugins.js";
-import { applyLive, applyCharts, renderRank, renderApps, renderDevices, deviceRename, deviceRenameSave, deviceRenameClear, deviceRenameCancel, openDeviceDetail, closeDeviceDetail, deviceDetailSetPeriod, renderAnalytics, renderTrendChart, renderSettings, doImport, doExport, doVacuum, doBackup, doWeeklyReport, doChangeDataDir, doSnip, doSnipAnnotate } from "./views.js";
+import { applyLive, applyCharts, renderRank, renderApps, renderDevices, deviceRename, deviceRenameSave, deviceRenameClear, deviceRenameCancel, openDeviceDetail, closeDeviceDetail, deviceDetailSetPeriod, renderAnalytics, renderTrendChart, renderSettings, doImport, doExport, doVacuum, doBackup, doWeeklyReport, doChangeDataDir, doSnip, doSnipAnnotate, closeAllPins } from "./views.js";
 
 export function switchView(view) {
   appState.currentView = view;
@@ -86,6 +86,7 @@ document.addEventListener("click", (e) => {
     case "do-weekly-report": doWeeklyReport(); break;
     case "do-snip": doSnip(); break;
     case "do-snip-annotate": doSnipAnnotate(); break;
+    case "pin-close-all": closeAllPins(); break;
     case "show-floating": invoke("show_floating").catch(() => {}); break;
     case "hide-floating": invoke("hide_floating").catch(() => {}); break;
   }

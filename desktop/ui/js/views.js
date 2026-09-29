@@ -767,6 +767,18 @@ export async function doSnipAnnotate() {
   }
 }
 
+// 贴图窗口的兜底出口：那是一张盖在桌面上、平时抢不走焦点的小窗口，
+// 单张有 Esc 与右上角 ✕ 两条路，但页面脚本挂了那两条都在页面里。
+// Alt+F4 不依赖页面（Rust 那边不拦贴图的关闭），这个按钮也不依赖。
+export async function closeAllPins() {
+  try {
+    const n = await invoke("pin_close_all");
+    setMsg(n > 0 ? `已请求关掉 ${n} 张贴图` : "桌面上没有贴着的图", "var(--success)");
+  } catch (e) {
+    setMsg("关掉贴图失败：" + e, "var(--danger)");
+  }
+}
+
 async function onFloatingChange(e) {
   await invoke("set_config", { section: "floating", key: "enabled", value: e.target.checked ? "true" : "false" });
 }
@@ -905,6 +917,16 @@ const SETTINGS_CATS = [
             desc: (s) =>
               "屏幕会先被冻结，拖框选区后存成 PNG 并复制到剪贴板；单击或按 Esc 取消，什么都不留下。"
               + `文件写在 ${escapeHtml(s.screenshots_dir || "data/screenshots/")}，程序不会自动删，也不上传任何东西。`,
+            descWide: true,
+          },
+          {
+            t: "btns", name: "桌面上的贴图",
+            btns: [{ act: "pin-close-all", label: "关掉所有贴图" }],
+            desc:
+              "标注截图的工具条上有「贴图」（快捷键 P）：那张图照样存盘、照样进剪贴板，"
+              + "再多开一个总在最前的小窗口钉在屏幕上 —— 贴图算截图的一个出口，不会多落一个文件。"
+              + "贴图不能编辑，所以里面没有「没存下来的东西」，关掉或退出程序都不丢什么。"
+              + "单张用 Esc 或鼠标移到右上角的 ✕ 关；这一条是给页面卡住时兜底的。",
             descWide: true,
           },
         ],
