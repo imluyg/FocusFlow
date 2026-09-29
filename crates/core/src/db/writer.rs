@@ -604,17 +604,23 @@ impl DbWriter {
     }
 
     /// 停止写线程（退出前 flush 残留）。
-    /// 超时仍未停止（磁盘忙/库被锁）时，把未落库增量写到恢复文件兜底，
-    /// 下次启动回放——数据从内存移除，写线程即使随后恢复也不会再写一份（防重复计数）。
+    ///
+    /// **两支都要兜底**，理由不同：
+    ///  - 线程 3 秒内没停（磁盘忙/库被锁）：那批正在 SQLite IO 里，进程先走就得靠恢复文件；
+    ///  - 线程干净退出了，但末次落库失败、批次被 `flush_pending` 回填进 `agg`：这一支原先
+    ///    **什么都不写**，于是"年度库整天写不进去 + 用户正常点退出"= 全天增量随进程消失、
+    ///    盘上零痕迹，而退出日志照打"数据库已关闭"。
+    ///
+    /// 数据从内存取走（`take=true`），下次启动回放后写线程即使随后恢复也不会再写一份（防重复计数）。
+    /// 无条件调用是安全的：`snapshot_recovery` 自己判空（`agg ∪ 在途` 为空就直接返回），
+    /// 正常退出不该凭空留下恢复文件。
     pub fn stop(&self) {
         let _ = self.state.sig_tx.send(Signal::Stop);
         let deadline = Instant::now() + Duration::from_secs(3);
         while self.state.alive.load(Ordering::Relaxed) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
-        if self.state.alive.load(Ordering::Relaxed) {
-            snapshot_recovery(&self.state, true);
-        }
+        snapshot_recovery(&self.state, true);
     }
 
     /// 线程是否存活。
@@ -830,6 +836,9 @@ fn settle_after_stop_snapshot(state: &WriterState) {
 /// 现在改成改名留一份：改名成功就等于"不会被第二次回放"（下次启动只看
 /// `agg_recovery.json`），删除则推迟到写线程确认首批增量真的落库之后。
 /// 解析失败同样改名（不再重读重败），但不必等落库 —— 没有数据要保护。
+///
+/// 三个结局要分开：改名走 ⇒ 第二个字段是副本路径；改不动但删掉了原文件 ⇒ 第二个字段是
+/// `None`（根本没有副本可"等资源落库后再删"）；两样都失败 ⇒ **不回放**、文件留在原地。
 fn take_recovery() -> (Option<AggDeltas>, Option<std::path::PathBuf>) {
     let path = recovery_path();
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -839,18 +848,36 @@ fn take_recovery() -> (Option<AggDeltas>, Option<std::path::PathBuf>) {
     // Windows 上目标已存在时 rename 会失败（上次崩留下的副本还没到删除时机）→ 先清掉它。
     // 这里覆盖是安全的：那份副本的内容已经在这次的 agg_recovery.json 里被重新算过了
     // —— 上一轮回放进内存的增量如果没落库，进程就不会活着写新的恢复文件；落了库就已在库里。
-    if std::fs::rename(&path, &kept).is_err() {
+    let mut kept_exists = std::fs::rename(&path, &kept).is_ok();
+    if !kept_exists {
         let _ = std::fs::remove_file(&kept);
-        if std::fs::rename(&path, &kept).is_err() {
-            // 改名失败（副本被别的进程占着）就退回旧行为：删掉，
-            // 不能让同一份文件每次启动都重放一遍——那是确定的重复计数。
-            let _ = std::fs::remove_file(&path);
+        kept_exists = std::fs::rename(&path, &kept).is_ok();
+    }
+    if !kept_exists {
+        // 改名两度失败就退回旧行为：删掉原文件 —— 不能让同一份文件每次启动都重放一遍。
+        // 但**连删也删不动**时必须停手：落库是 `count = count + excluded` 的纯累加、没有幂等键，
+        // 原文件留在原地还照回放 = 每次开机把同一批再加一遍，多出来的量永久留在统计里，
+        // 而这条分支原先一行日志都没有。口径：宁可少这一次历史，也不要无上限的虚高 ——
+        // 文件留在原地才有人查得动。
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::error!(
+                "恢复文件既改不了名也删不掉（{}）: {e} —— 这批不回放，否则每次启动都把它再加一遍。\
+                 请关掉握着这个文件的程序（杀软实时扫描、同步盘）之后再处理它。",
+                path.display()
+            );
+            return (None, None);
         }
     }
     match serde_json::from_str::<AggDeltasFile>(&text) {
-        Ok(v) => (Some(v.into()), Some(kept)),
+        Ok(v) => (Some(v.into()), kept_exists.then_some(kept)),
         Err(e) => {
-            tracing::error!("恢复文件解析失败（已丢弃，残片在 {}）: {e}", kept.display());
+            // 残片在哪要照着真的结局说：删掉原文件那一支没有残片可留。
+            let where_ = if kept_exists {
+                format!("残片在 {}", kept.display())
+            } else {
+                "原文件已清除".to_string()
+            };
+            tracing::error!("恢复文件解析失败（已丢弃，{where_}）: {e}");
             (None, None)
         }
     }
@@ -1697,6 +1724,102 @@ mod tests {
             })
             .unwrap();
         assert_eq!(landed, 3, "三次按键最终要落在库里");
+    }
+
+    /// 年度库**整天**写不进去（同步盘换成占位、路径被手工做成目录、盘满）+ 用户正常点退出
+    /// = 原先盘上零痕迹。
+    ///
+    /// `stop()` 只在"3 秒内线程还没停"那一支才写兜底文件，而 `flush_pending` 失败是把批次
+    /// **回填进 `agg`**（那句"回填内存，避免数据丢失"）、线程照样干净退出（`alive=false`）。
+    /// 于是这一天累积在内存里的量随进程消失，而退出日志照打"数据库已关闭"。
+    #[test]
+    fn a_clean_stop_still_writes_the_recovery_file_when_the_year_db_is_unwritable() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_clean_stop");
+        // 周期 flush 拉到 1 小时：这条要盯的正是"最后一次 flush 失败 + 线程干净退出"那一支
+        let w = start_writer(Duration::from_secs(3600));
+        let db_path = paths::year_db_path(chrono::Local::now().year());
+        if std::fs::metadata(&db_path).is_ok() {
+            // 启动路径可能已经把库建出来了：换成同名目录才算「永久写不进去」
+            std::fs::remove_file(&db_path).expect("删掉刚建好的年度库");
+        }
+        std::fs::create_dir_all(&db_path).expect("把年度库的位置做成目录");
+
+        let t0 = queries::now_ts();
+        for i in 0..11 {
+            w.record("A", t0 + i);
+        }
+        assert_eq!(w.today_pending_count(), 11, "夹具的 11 条要先在内存里");
+
+        w.stop_and_wait();
+        assert!(
+            !w.is_alive(),
+            "线程没在 3 秒内干净退出 —— 那这条测的是超时支，不是本条要照的干净支"
+        );
+        // 夹具本身也要成立：这批真的一个字节都没进库（flush_seq 只在成功落库时递增）
+        assert_eq!(w.flush_seq(), 0, "夹具没生效：居然落库了，这条就照不出兜底");
+
+        let text = std::fs::read_to_string(recovery_path()).unwrap_or_else(|e| {
+            panic!("库写不进去而线程又干净退出时，盘上没有兜底文件（{e}）—— 那 11 条随进程消失")
+        });
+        let saved: AggDeltasFile = serde_json::from_str(&text).expect("恢复文件要能解析");
+        let total: i64 = saved.daily.iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            total, 11,
+            "兜底文件里必须是那批未落库的增量：{:?}",
+            saved.daily
+        );
+    }
+
+    /// 恢复文件**既改不了名也删不掉**时不许回放（同步盘/杀软握着句柄的真实形态）。
+    ///
+    /// 落库是 `count = count + excluded` 的纯累加、没有幂等键，所以"原文件留在原地还照回放"
+    /// = 每次启动把同一批再加一遍，多出来的量永久留在统计里；而原先这条分支一行日志都没有。
+    /// 口径：宁可少一次历史，也不要无上限的虚高 —— 文件留在原地等人处理。
+    #[cfg(windows)]
+    #[test]
+    fn a_recovery_file_that_cannot_be_cleared_is_not_replayed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_recovery_locked");
+
+        let path = recovery_path();
+        std::fs::create_dir_all(path.parent().unwrap()).expect("建 data 目录");
+        let dk = queries::day_key_of_date(chrono::Local::now().date_naive());
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"daily":[[{dk},5]],"hourly":[],"keys":[],"active":[],"apps":[],"devices":[],"device_keys":[],"last_ts":0}}"#
+            ),
+        )
+        .expect("写恢复文件");
+
+        // 只放行"读"这一种共享：改名与删除要的 DELETE 访问会撞共享冲突 —— 杀软实时扫描、
+        // 同步盘握句柄就是这个形状。（`File::open` 挡不住：std 默认连 DELETE 一起共享。）
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .expect("占位句柄应能打开");
+        assert!(
+            std::fs::remove_file(&path).is_err(),
+            "夹具没成立：这个句柄挡不住删除，测不到清不掉那一支"
+        );
+        assert!(
+            std::fs::read_to_string(&path).is_ok(),
+            "夹具过头：连读都读不到，走的是第一条早退而不是「清不掉」那一支"
+        );
+
+        let (deltas, leftover) = take_recovery();
+        assert!(
+            deltas.is_none(),
+            "原文件还在原地就回放 = 下次启动再把同一批加一遍"
+        );
+        assert!(
+            leftover.is_none(),
+            "没有真的留下 kept 副本，就不能登记一个以后要删的路径"
+        );
+        assert!(path.exists(), "清不掉就留在原地，给人留一个能查的现场");
     }
 
     /// `stop()` 超时快照**取走**的那一批只存在于文件里：在途批次落成之后，不许因为
