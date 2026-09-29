@@ -1,0 +1,45 @@
+# 金标准：新装程序第一次写 config.ini 时，真实会落盘有哪些「节/键」。
+# 由 config.rs 的用例 default_config_keys_match_golden 与 serialize_rebuilt 的对拍维护；
+# 发布用的 zip 模板（.scratch/make_zip.sh）拿这份文件做断言。只钉键、不钉值。
+app_stats/enabled
+app_stats/exclude
+database/auto_vacuum_days
+database/backup_disabled_plugins
+database/backup_on_exit
+database/flush_interval
+database/max_backups
+database/online_backup_interval_hours
+database/yearly_archive
+device_stats/enabled
+floating/enabled
+gui/active_refresh_interval
+gui/default_period
+gui/floating_metric
+gui/full_refresh_interval
+gui/start_to_tray
+gui/theme
+gui/unload_hidden
+gui/unload_hidden_delay
+hotkey/enabled
+hotkey/snip
+hotkey/toggle_window
+listener/ignore_function_keys
+listener/ignore_key_repeat
+listener/ignore_modifier_keys
+listener/key_repeat_stale_seconds
+listener/mouse_enabled
+listener/scroll_burst_window
+paths/data_home
+paths/data_migrate_from
+plugins/instruction_limit
+plugins/memory_limit_mb
+pomodoro/auto_break
+pomodoro/break_minutes
+pomodoro/work_minutes
+rest/check_interval
+rest/cooldown_minutes
+rest/enabled
+rest/key_threshold
+rest/rest_seconds
+rest/window_minutes
+stats/cpm_window

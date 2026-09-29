@@ -1139,4 +1139,80 @@ work_minutes = 45
             "不许再冒出一份默认值的 theme:\n{text}"
         );
     }
+
+    /// 金标准：`crates/core/tests/default_config_keys.txt` 记着「新装程序第一次落盘会写
+    /// 哪些节/键」。这条用例保证那份文件跟着**程序的序列化器**走，改默认值时它会红。
+    ///
+    /// 为什么要这份金标准：发布用的 zip 模板（`.scratch/make_zip.sh` 的 `CFG_SRC`）每版都可能
+    /// 是"上一版跑出来的那一份"，本版新增的默认键不在里面 —— v0.4.3 就缺 `[hotkey] snip`，
+    /// 新装用户拿到的 config.ini 少一行，而用例、编译、门禁全都不会红（模板是 `.scratch/`
+    /// 里的发布工件，不在仓库里）。`make_zip.sh` 拿这份文件对拍，本用例保证文件没跟丢代码。
+    ///
+    /// 只钉键集合、不钉值：默认值常年调（`scroll_burst_window` 就从 0.8 调到 0.25），
+    /// 钉住值会让每次调参都得重新生成一份文件。
+    ///
+    /// 更新方式：把失败消息里印出的「应有清单」原样写回那份文件（注释头保留）。
+    #[test]
+    fn default_config_keys_match_golden() {
+        let defaults = default_config();
+        let rendered = serialize_rebuilt(&defaults);
+
+        // 从渲染文本里抠出 节/键。serialize_rebuilt 不写注释，所以这里不必处理 # 行。
+        let mut rendered_keys: Vec<String> = Vec::new();
+        let mut section = String::new();
+        for line in rendered.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if let Some(rest) = t.strip_prefix('[') {
+                section = rest
+                    .split(']')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+            } else if let Some(eq) = t.find('=') {
+                let key = t[..eq].trim();
+                if !key.is_empty() {
+                    rendered_keys.push(format!("{section}/{key}"));
+                }
+            }
+        }
+        rendered_keys.sort();
+
+        // 第一条腿：default_config() 里每一个键都必须真的出现在渲染里。
+        // 光跟金标准比看不出来 —— serialize_rebuilt 会把**整节为空**的节跳过（金标准跟着
+        // 一起少），而"这一节配了默认值却没落盘"正是新装用户少一行的形态。
+        let mut declared: Vec<String> = Vec::new();
+        for (section, keys) in &defaults {
+            for key in keys.keys() {
+                declared.push(format!("{section}/{key}"));
+            }
+        }
+        declared.sort();
+        assert_eq!(
+            declared, rendered_keys,
+            "default_config() 有键没被写进渲染（多半是那一节一个键都没有，被整节跳过了）"
+        );
+
+        // 第二条腿：渲染结果与仓库里那份金标准一致 ⇒ 金标准没跟丢代码。
+        let golden: Vec<String> = include_str!("../tests/default_config_keys.txt")
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        let mut golden_sorted = golden.clone();
+        golden_sorted.sort();
+        if golden_sorted != rendered_keys {
+            let want = rendered_keys.join("\n");
+            let got = golden_sorted.join("\n");
+            panic!(
+                "金标准与程序的渲染不一致，请更新 crates/core/tests/default_config_keys.txt\n\
+                 应有清单（{} 条）:\n{want}\n文件里现有（{} 条）:\n{got}",
+                rendered_keys.len(),
+                golden_sorted.len()
+            );
+        }
+    }
 }
