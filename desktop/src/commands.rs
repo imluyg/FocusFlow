@@ -197,8 +197,9 @@ pub fn set_config(
     if section == "listener" {
         state.listener.refresh_config();
     }
-    // 热键配置（enabled / toggle_window）变更后运行时重新注册，无需重启。
-    if section == "hotkey" && (key == "enabled" || key == "toggle_window") {
+    // 热键配置变更后运行时重新注册，无需重启。判据在 `must_reload_hotkey` 里，
+    // 且键名集合是从 `hotkey::BINDINGS` 推的 —— 见那里关于截图热键的说明。
+    if must_reload_hotkey(&section, &key) {
         crate::hotkey::reload_hotkey(&app);
     }
     // 悬浮窗开关：这个键原先只落盘不生效（全仓唯一的读者是启动时的 setup_windows），
@@ -208,6 +209,17 @@ pub fn set_config(
         crate::state::set_floating_visible(&app, value == "true");
     }
     Ok(())
+}
+
+/// 设置页刚写完 `[hotkey]` 的某个键，要不要重注册全局热键。
+///
+/// 纯函数只为一个原因：让用例能把"`[hotkey]` 里每一条组合键都要触发重注册"钉住。
+/// 这条判据原先写死成 `key == "enabled" || key == "toggle_window"`，v0.4.3 加截图热键时
+/// 没人回来补 `snip` —— 症状是"改了组合键：旧键还占着、新键按了没反应、设置页毫无报错"
+/// （不重注册就没人去写 `LAST_ERRORS` 那一格），而且编译、用例、门禁全绿，只能靠人手按。
+/// 现在键名集合从 `hotkey::BINDINGS` 推，加一条绑定两处自动一起长。
+fn must_reload_hotkey(section: &str, key: &str) -> bool {
+    section == "hotkey" && (key == "enabled" || crate::hotkey::is_binding_key(key))
 }
 
 /// 切换暂停记录，返回新的暂停状态，并广播给前端（与托盘切换保持一致）。
@@ -664,4 +676,34 @@ pub fn set_plugin_enabled(
     // 原先这里丢掉结果、回一句 Ok(enabled)，于是插件带着 Lua 语法错误也能弹「插件已启用」。
     crate::plugins::with_manager(&state.db, |pm| pm.set_enabled(&file, enabled))?;
     Ok(enabled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::must_reload_hotkey;
+
+    /// `[hotkey]` 里每一条组合键都必须触发重注册。判据的键名集合取自 `hotkey::BINDINGS`，
+    /// 所以这张表以后加第三条绑定，这条用例自动跟着长 —— 把判据退回成写死的键名列表会立刻红
+    /// （截图热键当年就是这么漏的）。
+    #[test]
+    fn every_hotkey_binding_key_retriggers_registration() {
+        let keys = crate::hotkey::binding_keys();
+        assert!(
+            keys.len() >= 2,
+            "绑定表读出来是空的，这条用例就没有观察量：{keys:?}"
+        );
+        for key in keys {
+            assert!(
+                must_reload_hotkey("hotkey", key),
+                "设置页改了 {key} 却不重注册：新组合按了没反应、旧组合还占着、页面毫无报错"
+            );
+        }
+        assert!(
+            must_reload_hotkey("hotkey", "enabled"),
+            "总开关必须能重注册"
+        );
+        // 反向两格：本段里不是热键的键、以及别的段的同名键，都不该惊动全局热键。
+        assert!(!must_reload_hotkey("hotkey", "some_other_key"));
+        assert!(!must_reload_hotkey("floating", "enabled"));
+    }
 }

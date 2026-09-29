@@ -91,6 +91,16 @@ const BINDINGS: &[Binding] = &[
     },
 ];
 
+/// 表里的键名，**从 `BINDINGS` 推**（给用例做"逐条覆盖"的循环用；不再抄第二份清单）。
+pub fn binding_keys() -> Vec<&'static str> {
+    BINDINGS.iter().map(|b| b.key).collect()
+}
+
+/// 这个 `[hotkey]` 键是不是一条热键组合。设置页改完要不要重注册，判据只有这一处。
+pub fn is_binding_key(key: &str) -> bool {
+    BINDINGS.iter().any(|b| b.key == key)
+}
+
 /// 该注册成哪个热键；`None` = 本次不注册（未启用，或用户把这一条的输入框清空了）。
 ///
 /// 刻意用 `get` 而不是 `get_or(..., 默认组合)`：`get_or` 把**空串当"没配"**
