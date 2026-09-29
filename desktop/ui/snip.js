@@ -21,6 +21,10 @@
 // 6. 标注层的位图尺寸就是 Rust 裁出来的那块**物理像素**，画笔坐标与选区用同一条
 //    `round(v*dpr)` 规则换算（见 `cssRectToPhysical` 上面那段说明）。Rust 那边尺寸不
 //    严格相等就拒收、绝不缩放，所以这里的镜像算错一格，提交就会响而不是悄悄裁偏。
+// 7. 文字与马赛克**共用同一条回传管道**（都画在那一层 canvas 上、都走 toDataURL →
+//    Rust 解码 → 合成），所以 Rust 侧不为它们加任何概念：文字用 `fillText`，字号是
+//    物理像素；马赛克从冻结的底图取子块「缩小再放大」，缩小那趟要平滑（要的就是平均
+//    掉的糊），放大那趟关平滑（不然糊成一片灰、等于白打码）。
 import { invoke, listen } from "./js/tauri.js";
 
 const img = document.getElementById("shot");
@@ -48,12 +52,25 @@ let box = null;
 
 const annotCanvas = document.getElementById("annot");
 const toolsEl = document.getElementById("tools");
+const txtEl = document.getElementById("txt");
 const actx = annotCanvas.getContext("2d");
+/** 马赛克的两步缩放要一块临时画布，借一条而不是每笔新建一块。 */
+const scratch = document.createElement("canvas");
+const sctx = scratch.getContext("2d");
+/** 与 `snip.html` 里 body 那串同一个字体：文字笔不许再引第二种字体。 */
+const FONT_STACK = 'system-ui, "Segoe UI", "Microsoft YaHei", sans-serif';
+/** 马赛克一格多大（物理像素）。固定值：同一块区域每次打码结果一样，撤销重绘才不会漂。 */
+const MOSAIC_CELL = 10;
 
 /** 这一张是不是 `snip_annotate` 进来的（跟会话走，由 payload 给）。 */
 let annotate = false;
 /** 已经选好区、正在画。为真时拖框与吸附那两条手势全部让路。 */
 let annotating = false;
+/** 正在用输入框打一段字：这时的 Enter/Esc 归输入框，不能被"提交/放弃"那套抢走。 */
+let typing = false;
+let pendingAt = null;
+/** 底图解码完了没有 —— 马赛克要从那张真像素上取子块，没解码完画出来是空的。 */
+let imgDecoded = false;
 /** 已完成的笔。撤销 = pop 一支然后整层重绘（不做真 undo 栈）。 */
 let ops = [];
 /** 正在拖的那一支（还没进 ops）。 */
@@ -63,6 +80,8 @@ let selPhys = null;
 let tool = "rect";
 let penColor = "#ff2d2d";
 let penWidth = 3;
+/** 字号（物理像素），三档：小/中/大。 */
+let textSize = 30;
 
 /** CSS 选区 → 屏内相对物理矩形。与 Rust 的 `capture::css_rect_to_physical` 同一条规则：
  *  先归一化反向拖框、一律 round、再钳到屏内（先角点后宽高，反过来会各吃掉一像素）。
@@ -105,6 +124,15 @@ function updateOp(op, p) {
 }
 
 function drawOp(op) {
+  // 这两支不描边，先分流出去：它们要的是"从底图取像素"和"排字"，与描线的状态无关
+  if (op.t === "mosaic") {
+    drawMosaic(op);
+    return;
+  }
+  if (op.t === "text") {
+    drawText(op);
+    return;
+  }
   actx.strokeStyle = op.color;
   actx.fillStyle = op.color;
   actx.lineWidth = op.w;
@@ -137,6 +165,45 @@ function drawOp(op) {
   actx.stroke();
 }
 
+/** 把选区内的某一格区域按物理像素映射回底图的 intrinsic 像素。
+ *  正常路径上比值恒等于 1（底图就是那块屏的原生像素），带上它是因为哪天底图被别处
+ *  缩放过，也要让马赛克盖在该盖的位置上，而不是悄悄错开一格。 */
+function baseOf(p) {
+  const k = img.naturalWidth && monitor.width ? img.naturalWidth / monitor.width : 1;
+  return { x: (selPhys.x + p.x) * k, y: (selPhys.y + p.y) * k, k };
+}
+
+function drawMosaic(op) {
+  const x = Math.round(Math.min(op.a.x, op.b.x));
+  const y = Math.round(Math.min(op.a.y, op.b.y));
+  const w = Math.round(Math.abs(op.b.x - op.a.x));
+  const h = Math.round(Math.abs(op.b.y - op.a.y));
+  if (w < 2 || h < 2) return;
+  const src = baseOf({ x, y });
+  const sw = Math.max(1, Math.ceil(w / MOSAIC_CELL));
+  const sh = Math.max(1, Math.ceil(h / MOSAIC_CELL));
+  scratch.width = sw;
+  scratch.height = sh;
+  // 缩小这一趟**要**平滑：把一格平均成一个颜色才叫糊
+  sctx.imageSmoothingEnabled = true;
+  sctx.clearRect(0, 0, sw, sh);
+  sctx.drawImage(img, src.x, src.y, w * src.k, h * src.k, 0, 0, sw, sh);
+  actx.save();
+  // 放大这一趟**关**平滑：开着就会糊成一片均匀的灰，等于白打码
+  actx.imageSmoothingEnabled = false;
+  actx.drawImage(scratch, 0, 0, sw, sh, x, y, w, h);
+  actx.restore();
+}
+
+function drawText(op) {
+  actx.save();
+  actx.fillStyle = op.color;
+  actx.textBaseline = "top";
+  actx.font = `${op.size}px ${FONT_STACK}`;
+  actx.fillText(op.text, op.at.x, op.at.y);
+  actx.restore();
+}
+
 /** 整层重绘：笔只有 ops 这一个真相，撤销与改线宽都走同一条路。 */
 function redraw() {
   actx.clearRect(0, 0, annotCanvas.width, annotCanvas.height);
@@ -149,6 +216,51 @@ function undoOp() {
   live = null;
   redraw();
 }
+
+/** 文字笔的起点：把输入框摆在那一格上，它自己就是预览。
+ *  字号按 dpr 除掉换成 CSS 像素，屏幕上看着多大、落到物理像素上就多大。 */
+function startTyping(p) {
+  if (typing) finishTyping(true);
+  pendingAt = toCanvasPx(p);
+  typing = true;
+  document.body.classList.add("typing");
+  txtEl.value = "";
+  txtEl.style.color = penColor;
+  txtEl.style.fontFamily = FONT_STACK;
+  txtEl.style.fontSize = textSize / dpr + "px";
+  txtEl.style.left = (selPhys.x + pendingAt.x) / dpr + "px";
+  txtEl.style.top = (selPhys.y + pendingAt.y) / dpr + "px";
+  txtEl.focus();
+}
+
+/** 收一段字。keep=false 是"打字中按 Esc"——只丢这段字，不取消整张截图。 */
+function finishTyping(keep) {
+  if (!typing) return;
+  typing = false;
+  document.body.classList.remove("typing");
+  const s = txtEl.value.trim();
+  txtEl.value = "";
+  if (keep && s && pendingAt) {
+    ops.push({ t: "text", text: s, at: pendingAt, color: penColor, size: textSize });
+    redraw();
+  }
+  pendingAt = null;
+}
+
+// 打字期间这三个键归输入框：全局那套 Enter=提交 / Esc=放弃 / Backspace=撤销
+// 会把"正在打的字"当成手势吃掉，所以在这里截住，不让它冒到 document。
+txtEl.addEventListener("keydown", (e) => {
+  e.stopPropagation();
+  if (e.key === "Enter") {
+    e.preventDefault();
+    finishTyping(true);
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    finishTyping(false);
+  }
+});
+txtEl.addEventListener("blur", () => finishTyping(true));
+txtEl.addEventListener("mousedown", (e) => e.stopPropagation());
 
 /** 工具条摆在选区下沿；放不下就翻到上沿（选区贴屏幕底部是常态）。 */
 function placeTools() {
@@ -184,6 +296,7 @@ function enterAnnotate() {
 
 /** 退出并清空标注态。复用覆盖层时必须走这里：上一张的笔漏给下一张就是画错图。 */
 function exitAnnotate() {
+  finishTyping(false);
   annotating = false;
   live = null;
   ops = [];
@@ -206,6 +319,7 @@ function syncTools() {
   for (const b of toolsEl.querySelectorAll("button[data-tool]")) on(b, b.dataset.tool === tool);
   for (const b of toolsEl.querySelectorAll("button[data-color]")) on(b, b.dataset.color === penColor);
   for (const b of toolsEl.querySelectorAll("button[data-w]")) on(b, Number(b.dataset.w) === penWidth);
+  for (const b of toolsEl.querySelectorAll("button[data-size]")) on(b, Number(b.dataset.size) === textSize);
 }
 
 // 点工具条不能同时在画布上落一笔：工具条在选区外面时不会，贴边时就可能重叠。
@@ -217,6 +331,7 @@ toolsEl.addEventListener("click", (e) => {
   if (b.dataset.tool) tool = b.dataset.tool;
   else if (b.dataset.color) penColor = b.dataset.color;
   else if (b.dataset.w) penWidth = Number(b.dataset.w);
+  else if (b.dataset.size) textSize = Number(b.dataset.size);
   else if (b.id === "t-undo") undoOp();
   else if (b.id === "t-ok") doCommit();
   else if (b.id === "t-cancel") giveUp("标注态点了取消");
@@ -324,6 +439,15 @@ document.addEventListener("mousedown", (e) => {
   if (e.button === 2) return; // 右键交给 contextmenu 处理成"取消"
   if (e.button !== 0) return;
   if (annotating) {
+    if (tool === "text") {
+      startTyping(point(e));
+      return;
+    }
+    if (tool === "mosaic" && !imgDecoded) {
+      // 底图没解码就取不到像素，画出来会是一块透明的"假打码"——出声比画错好
+      setHint("底图还没解码完，稍等一下再打码", true);
+      return;
+    }
     live = newOp(point(e));
     redraw();
     return;
@@ -383,6 +507,9 @@ document.addEventListener("mouseup", (e) => {
 
 document.addEventListener("contextmenu", (e) => {
   e.preventDefault();
+  // 标注态下右键**不**取消：画了半天的笔不该被一次误触清掉，
+  // 放弃这条路有 Esc 和工具条上的「取消」两条明路（直出模式下原语义不变）。
+  if (annotating) return;
   giveUp("");
 });
 
@@ -435,6 +562,8 @@ async function pull() {
     showSnap(null);
     document.body.classList.remove("has-sel", "dragging", "has-snap");
     img.style.visibility = "hidden";
+    // 新的底图还没解码：马赛克这条笔要先等它（见 drawMosaic）
+    imgDecoded = false;
 
     let payload;
     try {
@@ -473,6 +602,7 @@ async function pull() {
 (async () => {
   img.addEventListener("error", () => giveUp("底图解码失败，已取消"));
   img.addEventListener("load", () => {
+    imgDecoded = true;
     img.style.visibility = "visible";
   });
   try {

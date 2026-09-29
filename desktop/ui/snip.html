@@ -123,6 +123,23 @@
     #tools .sep { width: 1px; background: #4a4a52; margin: 0 3px; }
     /* 标注态下把选区边框换成"正在编辑"的样子，并让光标在选区内保持十字 */
     body.annotating #sel { border-color: #4ea1ff; cursor: crosshair; }
+    /* 文字笔的输入框：它就是"这一笔会画成什么样"的实时预览（不另画一层近似预览，
+       那会变成两套字体渲染互相不一致）。字号按 dpr 放大，才与落到像素上的那一格同大小。 */
+    #txt {
+      position: fixed;
+      display: none;
+      margin: 0;
+      padding: 0 2px;
+      color: #ff2d2d;
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px dashed #ff8a00;
+      border-radius: 2px;
+      font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+      line-height: 1.1;
+      z-index: 7;
+      outline: none;
+    }
+    body.typing #txt { display: block; }
   </style>
 </head>
 <body>
@@ -131,16 +148,23 @@
   <div id="snap"></div>
   <div id="sel"></div>
   <canvas id="annot"></canvas>
+  <input id="txt" type="text" autocomplete="off" spellcheck="false" />
   <div id="tools">
     <button id="t-rect" data-tool="rect">矩形框</button>
     <button id="t-arrow" data-tool="arrow">箭头</button>
     <button id="t-pen" data-tool="pen">画笔</button>
+    <button id="t-text" data-tool="text">文字</button>
+    <button id="t-mosaic" data-tool="mosaic">马赛克</button>
     <span class="sep"></span>
     <button id="c-red" data-color="#ff2d2d">红</button>
     <button id="c-yellow" data-color="#ffd400">黄</button>
     <span class="sep"></span>
     <button id="w-thin" data-w="3">细</button>
     <button id="w-fat" data-w="7">粗</button>
+    <span class="sep"></span>
+    <button id="s-small" data-size="18">小</button>
+    <button id="s-mid" data-size="30">中</button>
+    <button id="s-big" data-size="48">大</button>
     <span class="sep"></span>
     <button id="t-undo">撤销</button>
     <button id="t-ok">完成</button>
