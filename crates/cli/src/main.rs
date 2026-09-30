@@ -764,13 +764,54 @@ fn parse_keep_days(raw: &str) -> Result<i64, String> {
     Ok(days)
 }
 
+/// `--reset` 在向人要确认**之前**必须先看清要清哪些库（三种结局；纯函数好钉住）。
+#[derive(Debug)]
+enum ResetPlan {
+    /// 列不出来，或列出来的年度库里有打不开的：不能让人对着一份看不见的清单按 yes。
+    ///
+    /// 这里刻意是"整套操作都不做"而不是"清能清的那几个"：确认这一步的意义就在于
+    /// 用户知道自己批准的是什么，一份缺了年份的清单已经不是他批准的那件事了。
+    Blocked(String),
+    /// 一套可清的年度库都没有 ⇒ 没有破坏性可做，连"输入 yes"都不该讨
+    /// （`reset_all_data` 清的就是这批库：逐年 DELETE 聚合表与 `devices`）。
+    NothingToClear,
+    /// 确认提示里逐条列出的年份，与 `reset_all_data` 将要处理的清单同一来源。
+    Confirm(Vec<i32>),
+}
+
+fn reset_plan(readable: Result<Vec<i32>, String>) -> ResetPlan {
+    match readable {
+        Err(e) => ResetPlan::Blocked(e),
+        Ok(years) if years.is_empty() => ResetPlan::NothingToClear,
+        Ok(years) => ResetPlan::Confirm(years),
+    }
+}
+
 fn reset(_db: &db::Database) -> i32 {
     // 确认提示必须说清楚要清的是哪一套库、哪些年份：这是唯一一个有确认的破坏性命令，
     // 而它原先只写"清空所有记录"—— 用户无从发现 `FOCUSFLOW_APP_DIR` 还指着真实数据目录。
+    //
+    // 清单走 `check_years_readable`，与 `reset_all_data` 里 `years_or_record` 同一把尺子。
+    // 原先这里用 `available_years()`：它把"目录读不出来"和"每个年度库都打不开"都折成
+    // `[]` ⇒ 提示里印一个空的 `[]` 还照旧讨一次 yes，用户在看不见要清什么的情况下
+    // 确认了破坏性操作，而真正的失败要到下一步才听得见（那时执行前快照都已经做过了）。
+    let years = match reset_plan(check_years_readable()) {
+        ResetPlan::Blocked(e) => {
+            eprintln!("无法确认要清空哪些库，已取消（没有改动任何数据）: {e}");
+            return 1;
+        }
+        ResetPlan::NothingToClear => {
+            println!(
+                "没有需要清空的年度库（数据目录 {} 里没有带聚合数据的 focusflow_年份.db）",
+                focusflow_core::paths::data_dir().display()
+            );
+            return 0;
+        }
+        ResetPlan::Confirm(years) => years,
+    };
     println!(
-        "警告：将清空数据目录 {} 下这些年份的全部统计记录：{:?}\n输入 yes 确认: ",
-        focusflow_core::paths::data_dir().display(),
-        db::queries::available_years()
+        "警告：将清空数据目录 {} 下这些年份的全部统计记录：{years:?}\n输入 yes 确认: ",
+        focusflow_core::paths::data_dir().display()
     );
     use std::io::BufRead;
     let mut line = String::new();
@@ -848,6 +889,7 @@ fn cleanup_outcome(days: i64, report: &db::maintenance::MaintenanceReport) -> (S
 mod tests {
     use super::{cleanup_outcome, export_csv, export_html, year_lookup, YearLookup};
     use super::{parse_keep_days, parse_period, parse_stats_year, Period};
+    use super::{reset_plan, ResetPlan};
     use focusflow_core::db::maintenance::MaintenanceReport;
 
     /// `--cleanup` 的天数口径：0 / 负数 / 非整数 / 大得离谱都要在入口挡住。
@@ -1122,6 +1164,30 @@ mod tests {
         match year_lookup(2025, Err(bad.to_string())) {
             YearLookup::Unreadable(e) => assert_eq!(e, bad),
             other => panic!("读不动要报 Unreadable（它不是\"没有数据\"），实得 {other:?}"),
+        }
+    }
+    /// `--reset` 不能对着一份看不见的清单讨一次 yes。
+    ///
+    /// 旧写法用 `available_years()`（它把「读不出来」折成 `[]`），于是提示里印 `[]`、
+    /// 用户照样确认，失败要到 `reset_all_data` 那边才说出口 —— 那时执行前快照都做过了。
+    /// 三种结局必须是三句话：能清（逐条列年份）、没得清（直接收工、不讨确认）、
+    /// 看不清（拒绝并说明原因，且一个字节都不动）。
+    #[test]
+    fn reset_never_asks_confirmation_on_a_list_it_cannot_read() {
+        match reset_plan(Ok(vec![2026, 2025])) {
+            ResetPlan::Confirm(years) => {
+                assert_eq!(years, vec![2026, 2025], "确认提示要拿到将要清的年份清单");
+            }
+            other => panic!("读得动就该 Confirm，实得 {other:?}"),
+        }
+        assert!(
+            matches!(reset_plan(Ok(Vec::new())), ResetPlan::NothingToClear),
+            "一套库都没有时不该讨一次 yes，更不该做执行前快照"
+        );
+        let bad = "这些年度库打不开，它们的计数不会出现在结果里: [2025]";
+        match reset_plan(Err(bad.to_string())) {
+            ResetPlan::Blocked(e) => assert_eq!(e, bad, "拒绝的原因要原样递给用户"),
+            other => panic!("读不出清单必须 Blocked，不能退化成空白确认: {other:?}"),
         }
     }
 }
