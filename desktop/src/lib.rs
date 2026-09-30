@@ -409,6 +409,157 @@ mod wiring_audit {
             .collect()
     }
 
+    /// 递归收集 `ui/` 下的 .html（页面骨架与 .js 是同级的，`js/` 子目录里没有 html）。
+    fn html_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        walk(dir, "html", out);
+    }
+
+    /// 抓 `needle(...)` 里那个**字符串字面量**参数。不是字面量的（`getElementById(v)`）跳过，
+    /// 但调用方要拿到它们的名字 —— 覆盖面静默缩掉比红一条更难查，所以照
+    /// `invoked_commands` 那样把解不出的原样交出去。
+    fn literal_args(text: &str, call: &str) -> (Vec<String>, Vec<String>) {
+        let mut got = Vec::new();
+        let mut dynamic = Vec::new();
+        for chunk in text.split(&format!("{call}(")).skip(1) {
+            let head = chunk
+                .split([',', ')', '\n'])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            match head
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| head.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            {
+                Some(v) if !v.is_empty() => got.push(v.to_string()),
+                _ => dynamic.push(format!("{call}({head}…)")),
+            }
+        }
+        (got, dynamic)
+    }
+
+    /// 抓 `id="…"` / `id='…'` 这种**属性式**的声明。与上面 `literal_args` 是两种形状：
+    /// 那一个认的是 `f("x")` 的调用参数，`id` 后面跟的是 `=` 不是 `(`，不能共用。
+    ///
+    /// 前一个字符必须是分隔符，否则 `data-id="shot"` 与 `valid_id = "shot"` 会冒充成
+    /// `id="shot"` 把真缺口盖掉。`.` 要放行：`el.id = "toast"` 那种"用到时现造"的写法
+    /// （`utils.js` 的 toast、`floating.js` 的休息提示）就是合法声明，拦掉它会报两条假缺口。
+    fn declared_ids(text: &str) -> Vec<String> {
+        let b: Vec<char> = text.chars().collect();
+        let mut out = Vec::new();
+        for i in 0..b.len() {
+            if i + 2 > b.len() || b[i] != 'i' || b[i + 1] != 'd' {
+                continue;
+            }
+            let prev_ok = i == 0
+                || matches!(
+                    b[i - 1],
+                    ' ' | '\t' | '\n' | '\r' | '<' | '"' | '\'' | '`' | '.'
+                );
+            if !prev_ok {
+                continue;
+            }
+            let mut j = i + 2;
+            while j < b.len() && matches!(b[j], ' ' | '\t') {
+                j += 1;
+            }
+            if j >= b.len() || (b[j] != '=' && b[j] != ':') {
+                continue;
+            }
+            j += 1;
+            while j < b.len() && matches!(b[j], ' ' | '\t') {
+                j += 1;
+            }
+            if j >= b.len() || (b[j] != '"' && b[j] != '\'' && b[j] != '`') {
+                continue;
+            }
+            let quote = b[j];
+            if let Some(end) = b[j + 1..].iter().position(|c| *c == quote) {
+                out.push(b[j + 1..j + 1 + end].iter().collect());
+            }
+        }
+        out
+    }
+
+    /// 前端每个字面量 `getElementById("x")` 都必须有人在某处写下 `id="x"`。
+    ///
+    /// 这是 `every_window_label_has_a_capability` 的第三种同一族缺口：ids 与 label 一样是
+    /// **跨语言/跨文件的字符串约定**，错了不会编译失败、不会让任何一条现有用例变红，症状只是
+    /// "那个页面什么都不会发生"。本仓已经在 `snip` 的 capabilities 上栽过一次（真机才发现），
+    /// 而浏览器夹具（`.scratch/*-harness.html`）不进 CI ⇒ 只能在这儿钉。
+    ///
+    /// `id` 也从 .js 里收集：设置页不少元素是 JS 现拼的模板（`views.js`），只扫 html 会误报。
+    #[test]
+    fn every_literal_getelementbyid_has_a_matching_id() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui");
+        let mut js = Vec::new();
+        js_files(&root, &mut js);
+        let mut html = Vec::new();
+        html_files(&root, &mut html);
+        assert!(
+            !js.is_empty() && !html.is_empty(),
+            "一个 .js 或 .html 都没找到（扫描路径 {:?}）—— 这条审计就没有观察量",
+            root
+        );
+
+        // 声明侧：所有 html + js 里出现过的 id="…"
+        let mut declared: Vec<String> = Vec::new();
+        for f in js.iter().chain(html.iter()) {
+            let text = std::fs::read_to_string(f).unwrap();
+            let rel = f.file_name().unwrap().to_string_lossy().to_string();
+            for id in declared_ids(&text) {
+                if id.is_empty() {
+                    panic!("{rel} 里有个空 id 声明，扫描器要跟着改");
+                }
+                declared.push(id);
+            }
+        }
+        declared.sort();
+        declared.dedup();
+        assert!(
+            declared.len() > 20,
+            "只量到 {} 个 id 声明 —— 扫描器多半没生效，这条就成了假绿",
+            declared.len()
+        );
+
+        let mut missing = Vec::new();
+        let mut dynamic = Vec::new();
+        let mut wanted = 0usize;
+        for f in &js {
+            let text = std::fs::read_to_string(f).unwrap();
+            let rel = f.file_name().unwrap().to_string_lossy().to_string();
+            let (want, dyn_want) = literal_args(&text, "getElementById");
+            wanted += want.len();
+            for id in want {
+                if !declared.contains(&id) {
+                    missing.push(format!("{rel}: getElementById(\"{id}\")"));
+                }
+            }
+            for d in dyn_want {
+                dynamic.push(format!("{rel}: {d}"));
+            }
+        }
+        // 两头都要有量：任一为空都说明这条在空转
+        assert!(
+            wanted >= 10,
+            "只量到 {wanted} 个字面量 getElementById —— 抓取形状变了，这条是假绿"
+        );
+        assert!(
+            missing.is_empty(),
+            "页面脚本要的 id 没有任何地方声明 —— `getElementById` 返回 null，\
+             下一行就是 TypeError，整个页面的启动脚本一起死（症状：那扇窗口是块纯色）：\n{}",
+            missing.join("\n")
+        );
+        // 动态 id 不是错误，但要说出来：那正是"审计悄悄失去覆盖面"的形状
+        if !dynamic.is_empty() {
+            eprintln!(
+                "注意：这些 getElementById 的参数不是字面量，本条审计不覆盖它们：\n{}",
+                dynamic.join("\n")
+            );
+        }
+    }
+
     /// 前端叫到的每个命令，都必须在 `invoke_handler` 的注册表里。
     #[test]
     fn every_invoked_command_is_registered() {
