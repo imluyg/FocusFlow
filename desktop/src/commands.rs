@@ -360,6 +360,12 @@ pub async fn import_legacy(state: State<'_, Arc<AppState>>) -> Result<String, St
     for kept in &summary.backed_up_aux {
         lines.push(format!("原数据已留档: {kept}"));
     }
+    // 跳过清单里每一项都是"这一年/这一份没并进来东西"，不显示就等于没说：
+    // `records_by_year` 只会把它们排成「2025 年度键鼠: 0 条」，与"那一年本来没数据"
+    // 完全同形（CLI 那侧早就在打印 `summary.skipped`，桌面侧漏了这半边）。
+    for note in &summary.skipped {
+        lines.push(format!("跳过: {note}"));
+    }
     let text = lines.join("；");
     // 部分失败必须走 Err：前端 `doImport` 的成功分支把整句渲染成**绿色**"完成"，
     // 于是"2025 年度键鼠: 1200 条；错误: 2024 年度库导入失败"看着就是一次成功导入 ——

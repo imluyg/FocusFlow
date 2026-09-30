@@ -57,7 +57,7 @@ pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
     // 1) 年度键鼠库
     let src_year_dbs = list_year_dbs(src_dir);
     for year in src_year_dbs {
-        match import_year_db(src_dir, year) {
+        match import_year_db(src_dir, year, &mut summary) {
             Ok(imported) => {
                 summary.year_dbs.push(year);
                 summary.records_by_year.push((year, imported));
@@ -171,7 +171,10 @@ fn list_year_dbs(dir: &Path) -> Vec<i32> {
 
 /// 导入单个年度库：先写暂存表（按 timestamp 去重），再聚合落库。
 /// 返回导入的记录数。
-fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
+/// 导入某一份年度库，返回本次落进暂存表的明细行数（`Ok(0)` 也可能是"只剩聚合表、
+/// 按键数没并"或"内容未变跳过"——后者要自己往 `summary.skipped` 里写一条，
+/// 调用方只按数字说话会把"被丢下"报成"这一年没数据"）。
+fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> anyhow::Result<i64> {
     let src_path = src_dir.join(format!("focusflow_{year}.db"));
     let dst_path = paths::year_db_path(year);
 
@@ -211,13 +214,17 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
         // 用 Rusqlite 打开确认可用 + 建聚合表
         let conn = connection::open_rw(&dst_path)?;
         connection::ensure_schema(&conn, year)?;
+        // 指纹从这份**刚复制过来的**库里读：它与源文件逐字节相同、连接已经开着，
+        // 不需要再开第三次源文件（`ensure_schema` 不建 key_log，所以这里读到的
+        // 有无明细与源库一致）。
+        let kl = key_log_fingerprint(&conn)?;
         drop(conn);
         // **标记写在聚合之前**，与下面合并分支同一条理由（那里的注释是完整版）：
         // `migrate_v2` 是累加式且没有去重键，"这份导过了"只记在 `meta` 的
         // `imported_src_*` 里。旧顺序在两步之间失败时留下「已聚合、未标记」，
         // 用户点重试 ⇒ 读不到标记 ⇒ 那一年再累加一遍。整库复制这一支以前正好漏在
         // 外面（"整库都搬过来了，标记写不上去有什么关系"），而它一样要跑 `migrate_v2`。
-        record_import_marker(&dst_path, &src_path)?;
+        record_import_marker(&dst_path, &src_path, kl)?;
         crate::db::maintenance::migrate_v2();
         // 统计导入条数（聚合表总量）
         let conn = connection::open_ro(&dst_path)?;
@@ -263,6 +270,18 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
 
     // 源库 key_log 的内容指纹：没有这张表就是"只剩聚合表"，没有明细可导。
     let Some(kl_now) = key_log_fingerprint(&src_conn)? else {
+        // **这条分支是本仓年度库的常态**：明细聚完就丢表，所以"上一个版本记的那一年"
+        // 天生就是只剩聚合表。此时按键数/按日/按小时/按键明细整段不并（口径早已定成
+        // "不累加"，见 migration_test 里那条"聚合计数不做累加（无法幂等去重）"），
+        // 只有上面那段活跃时长并进来了。旧写法回一个裸的 `Ok(0)`，调用方照样把这一年
+        // 记进 `year_dbs` ⇒ 报告上是一行「2025 年度键鼠: 0 条」，与"这一年本来没数据"
+        // 完全同形，而那一份按键数其实被丢下了（同族：`backup_database` 的 Done 曾经
+        // 不带 failed）。口径不改，改的是**不许谎报**。
+        let note = format!(
+            "{year} 年源库只剩聚合表：活跃时长已并，按键数与按键明细未并（目标库已有同一年，累加会翻倍）"
+        );
+        tracing::warn!("{note}");
+        summary.skipped.push(note);
         return Ok(0);
     };
 
@@ -327,7 +346,7 @@ fn import_year_db(src_dir: &Path, year: i32) -> anyhow::Result<i64> {
     // 反过来「已标记、未聚合」是可自愈的：明细还在目标库的 `key_log` 里，
     // 而 `Database::init` 每次启动都会跑一遍 `migrate_v2`（见 db/mod.rs），
     // 下一次启动就把它聚合掉。两种半截状态里只有一个会毁数据，所以把另一个留下。
-    record_import_marker(&dst_path, &src_path)?;
+    record_import_marker(&dst_path, &src_path, Some(kl_now))?;
     // 聚合落库并压缩（幂等：key_log 迁移后清空）
     crate::db::maintenance::migrate_v2();
 
@@ -416,7 +435,19 @@ fn key_log_fingerprint(conn: &Connection) -> anyhow::Result<Option<(i64, i64)>> 
 }
 
 /// 记录源文件指纹（大小 + 修改时间 + key_log 内容）到目标库 meta，用于重复导入检测。
-fn record_import_marker(dst_path: &Path, src_path: &Path) -> anyhow::Result<()> {
+///
+/// `kl` 由调用方给：合并分支手上已经有 `kl_now`，整库复制那一支的目标库就是源文件的
+/// 逐字节副本、连接也已经开着 —— 两处都不该再去开第三次。旧写法在这里
+/// `Connection::open(src_path).ok().and_then(...)` 另起一次读，失败与"源库没有明细表"
+/// 折成同一种结局（两个键都不写），而读取侧"缺任一个键都按没有指纹处理" ⇒
+/// 一次占用/同步盘抖动就把 `reimporting_unchanged_key_log_after_mtime_touch_
+/// does_not_double_count` 那道守卫整个卸掉，那一年会被再聚一遍而界面无提示。
+/// 现在读不动会真报错，不会静默降级成"没有指纹"。
+fn record_import_marker(
+    dst_path: &Path,
+    src_path: &Path,
+    kl: Option<(i64, i64)>,
+) -> anyhow::Result<()> {
     let meta = std::fs::metadata(src_path)?;
     let conn = connection::open_rw(dst_path)?;
     conn.execute(
@@ -435,10 +466,7 @@ fn record_import_marker(dst_path: &Path, src_path: &Path) -> anyhow::Result<()> 
     // key_log 内容指纹：内容没变、只有 mtime 变的再导入要靠它跳过（见
     // import_year_db 的内容比对）。源库没有 key_log 时不写 —— 读取侧两个键
     // 缺任一个都按"没有指纹"处理，与旧版本留下的标记兼容。
-    if let Some(kl) = Connection::open(src_path)
-        .ok()
-        .and_then(|c| key_log_fingerprint(&c).ok().flatten())
-    {
+    if let Some(kl) = kl {
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('imported_src_kl_count', ?1)",
             [kl.0.to_string()],

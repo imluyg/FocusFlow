@@ -434,6 +434,24 @@ mod tests {
         let summary = migration::import_legacy_data(&old_dir);
         assert!(summary.errors.is_empty(), "errors: {:?}", summary.errors);
 
+        // 时长并进来了、按键数没有 —— 报告必须说清这件事。旧写法只回一个裸的 `Ok(0)`，
+        // 调用方照样把这年记进 `year_dbs`，界面上就成了「2025 年度键鼠: 0 条」，
+        // 与"这一年本来没数据"完全同形；而源库里那 99+30 次按键就是被丢下的那一份。
+        // （"只剩聚合表的旧库"是本仓年度库的常态：明细聚完就丢表。）
+        assert_eq!(
+            summary.records_by_year,
+            vec![(2025, 0)],
+            "症状先钉住：报的就是这个 0"
+        );
+        assert!(
+            summary
+                .skipped
+                .iter()
+                .any(|s| s.contains("2025") && s.contains("只剩聚合表")),
+            "被丢下的那一年必须出现在跳过清单里: {:?}",
+            summary.skipped
+        );
+
         let conn = rusqlite::Connection::open(paths::year_db_path(2025)).unwrap();
         assert_eq!(
             conn.query_row("SELECT SUM(seconds) FROM daily_counts", [], |r| r
