@@ -438,6 +438,12 @@ pub struct FocusFlowConfig {
     /// section -> (key -> value)
     values: Mutex<HashMap<String, HashMap<String, String>>>,
     path: PathBuf,
+    /// 本次运行里被 `set()` 改过、还没成功落盘的键。
+    /// 它唯一的作用是区分"盘上与内存不一样的值是谁改的"：
+    /// 在这个集合里 ⇒ 本进程改的（内存赢，否则设置静默丢失）；
+    /// 不在 ⇒ 文件在运行期被外部改过（记事本/`notepad config.ini`/同步盘），
+    /// 那种改动必须被采纳，绝不能被下一次 save 悄悄盖掉。
+    pending_writes: Mutex<HashSet<(String, String)>>,
 }
 
 impl FocusFlowConfig {
@@ -494,6 +500,7 @@ impl FocusFlowConfig {
         let cfg = Self {
             values: Mutex::new(values),
             path,
+            pending_writes: Mutex::new(HashSet::new()),
         };
         // 结尾这次回写只是把"补齐的默认键"落到盘上，它失败**不能**推翻已经读出来、
         // 已经 reconcile 好的那一份。原来的 `cfg.save()?` 会让整个 `load()` 报错，
@@ -504,6 +511,12 @@ impl FocusFlowConfig {
         // `[app_stats] exclude` 那道隐私保险丝失效、`[plugins] disabled` 复原。
         // 读成功而写失败在 Windows 上是常态：另一个实例握着文件、记事本开着它、
         // 杀软首扫 —— 所以这条链随时走得通，不是假想形状。
+        //
+        // 那半截"拿默认快照盖真实文件"的后果现在由 `adopt_external_edits` 兜住：
+        // `in_memory` 的 `pending_writes` 是空的 ⇒ 它第一次 save 会把文件里读得到的键
+        // 全部采纳，于是写回去的就是用户那一份。但**别把它当许可**：采纳只覆盖文件里
+        // 已有的键，默认值新增的键照样写进去，而本进程仍然一路跑默认值（`instance()`
+        // 已经缓存了这份兜底）—— 所以要 warn，不要静默。
         if let Err(rewrite) = cfg.save() {
             tracing::warn!(
                 "配置已读出来，但补齐默认键的回写没成功（本次运行仍按读出来的值，不会拿默认值盖掉文件）: {rewrite:#}"
@@ -525,7 +538,7 @@ impl FocusFlowConfig {
         // 设置静默丢失。调用方确实有两个 —— 去抖的 config-saver 线程，和退出前
         // `RunEvent::Exit` 里主线程那次强制 save（改完设置立刻关窗口时正好撞上）。
         let _write_guard = SAVE_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let snapshot: HashMap<String, HashMap<String, String>> = self
+        let mut snapshot: HashMap<String, HashMap<String, String>> = self
             .values
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -536,6 +549,13 @@ impl FocusFlowConfig {
         let out = match std::fs::read_to_string(&self.path) {
             Ok(original) => {
                 backup_original_once(&self.path, &original);
+                let adopted = self.adopt_external_edits(&mut snapshot, &original);
+                if !adopted.is_empty() {
+                    tracing::info!(
+                        "config.ini 在本次运行期间被外部改过，已采纳这些项（现在起按新值读；只在启动时读一次的项仍要重启）: {}",
+                        adopted.join(", ")
+                    );
+                }
                 serialize_preserving_structure(&snapshot, &original)
             }
             Err(_) => serialize_rebuilt(&snapshot),
@@ -544,14 +564,90 @@ impl FocusFlowConfig {
             std::fs::create_dir_all(parent).ok();
         }
         atomic_write(&self.path, &out)?;
+        // 落盘成功 ⇒ 本进程改过的键此刻已经在文件上了，内存与文件重新对齐；
+        // 之后再出现差异就都是外部改动。写失败时**不清**：那份待写的值还得靠它保住。
+        self.pending_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         Ok(())
     }
 
+    /// 把文件里「不是本进程改的、却与内存不同」的值采纳进内存与快照，返回项名清单。
+    ///
+    /// 这一步防的是**静默销毁用户手写的那一行**：`[app_stats] exclude`（隐私保险丝）、
+    /// `[rest] *`、`[stats] cpm_window`、`[device_stats] enabled` 这些键都没有界面入口，
+    /// 手改 config.ini 是唯一的写法，而程序常驻后台 ⇒ 用户永远是在"程序运行中"改的。
+    /// 旧写法里 `serialize_preserving_structure` 对"文件与内存都有这个键"一律写内存值
+    /// （那是启动时读进来的快照），于是退出前那次强制 save 把他刚改的那一行盖回旧值，
+    /// 一行日志都没有 —— `app_stats.rs` 与 `stats.rs` 注释里"改文件立刻生效"那句
+    /// 因此从来没成立过。
+    ///
+    /// 只认"本进程没写过"的键：UI 改键走 `set()`，它进 `pending_writes` 直到成功落盘，
+    /// 那期间文件上的旧值必须让位给内存里的新值（否则就是上一场修掉的"设置静默丢失"）。
+    /// 废弃键不采纳（`load()` 刻意清掉它们，采纳等于复活），未知键照旧原样保留。
+    fn adopt_external_edits(
+        &self,
+        snapshot: &mut HashMap<String, HashMap<String, String>>,
+        original: &str,
+    ) -> Vec<String> {
+        let disk = parse_ini(original);
+        let pending = self
+            .pending_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut adopted: Vec<String> = Vec::new();
+        let mut changes: Vec<(String, String, String)> = Vec::new();
+        for (section, keys) in &disk {
+            for (key, value) in keys {
+                if DEPRECATED_CONFIG
+                    .iter()
+                    .any(|(s, ks)| *s == section.as_str() && ks.contains(&key.as_str()))
+                {
+                    continue;
+                }
+                if pending.contains(&(section.clone(), key.clone())) {
+                    continue;
+                }
+                let same = snapshot
+                    .get(section)
+                    .and_then(|m| m.get(key))
+                    .is_some_and(|v| v == value);
+                if same {
+                    continue;
+                }
+                snapshot
+                    .entry(section.clone())
+                    .or_default()
+                    .insert(key.clone(), value.clone());
+                changes.push((section.clone(), key.clone(), value.clone()));
+                adopted.push(format!("{section}.{key}"));
+            }
+        }
+        // 内存也要跟上：热路径读的是 `values`，只改快照会让"每次判定现读"的那批键
+        // 这一轮还是旧值，而写进文件的却是新值 —— 两份真相。
+        if !changes.is_empty() {
+            let mut values = self.values.lock().unwrap_or_else(|e| e.into_inner());
+            for (section, key, value) in changes {
+                values.entry(section).or_default().insert(key, value);
+            }
+        }
+        // 顺序要稳定：`disk` 是 HashMap，不排序的话同一批改动每次列出的次序都不同
+        adopted.sort();
+        adopted
+    }
+
     /// 仅内存的配置实例（加载/落盘失败时的兜底，保证应用可用，只损失持久化）。
+    ///
+    /// `pending_writes` 空 = 本进程什么都没改 ⇒ `save()` 会把盘上读得到的键全部采纳，
+    /// 于是这次兜底不会拿 `default_config()` 去盖真实文件（`load()` 尾部那段注释防的
+    /// 正是这个形状：`data_home` 被写空、`[app_stats] exclude` 保险丝失效）。
     fn in_memory(path: PathBuf) -> Self {
         Self {
             values: Mutex::new(default_config()),
             path,
+            pending_writes: Mutex::new(HashSet::new()),
         }
     }
 
@@ -612,13 +708,7 @@ impl FocusFlowConfig {
 
     /// 设置字符串值并持久化。
     pub fn set(&self, section: &str, key: &str, value: &str) -> anyhow::Result<()> {
-        {
-            let mut values = self.values.lock().unwrap_or_else(|e| e.into_inner());
-            values
-                .entry(section.to_string())
-                .or_default()
-                .insert(key.to_string(), value.to_string());
-        }
+        self.set_local(section, key, value);
         // 去抖持久化：合并 300ms 窗口内的多次写入，避免高频调用（如悬浮窗位置）频繁整文件重写。
         // 保存线程死了（spawn 失败/通道断）send 会一直报错：热路径只喊一次，
         // 别让悬浮窗每动一下就刷一条。
@@ -626,6 +716,25 @@ impl FocusFlowConfig {
             warn_saver_dead_once();
         }
         Ok(())
+    }
+
+    /// `set()` 的前半步：只改内存 + 记上"这一处是本进程改的"，不叫醒全局去抖保存线程。
+    ///
+    /// 单测走这条：那条线程写的是 `instance()` 的路径，而测试用的是自己的临时目录 ——
+    /// 叫醒它等于让另一个对象往本次测试的 `config.ini` 里写它那份快照（切全局
+    /// app_dir 的测试还会把它引到别人的目录去）。生产侧只有 `set()` 调它。
+    fn set_local(&self, section: &str, key: &str, value: &str) {
+        {
+            let mut values = self.values.lock().unwrap_or_else(|e| e.into_inner());
+            values
+                .entry(section.to_string())
+                .or_default()
+                .insert(key.to_string(), value.to_string());
+        }
+        self.pending_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((section.to_string(), key.to_string()));
     }
 }
 
@@ -779,6 +888,106 @@ mod tests {
 
         let _ = Arc::new(());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 程序运行期间用户手改 config.ini 的那一行，绝不能被下一次落盘盖掉。
+    ///
+    /// `[app_stats] exclude`（隐私保险丝）、`[rest] *`、`[stats] cpm_window`、
+    /// `[device_stats] enabled` 都没有界面入口，手改文件是唯一写法，而程序是常驻后台的
+    /// ⇒ 他永远是在"运行中"改的。旧写法对"文件与内存都有这个键"一律写内存值（启动时
+    /// 那份快照），退出前的强制 save 就把那一行还原了，一行日志都没有 ——
+    /// `app_stats.rs`/`stats.rs` 注释里"改文件立刻生效"因此从来没成立过。
+    #[test]
+    fn an_external_edit_survives_the_next_save() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_ext_edit");
+        let path = app.path().join("config.ini");
+        std::fs::write(&path, "[app_stats]\nexclude = psafe.exe\n").unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+        assert_eq!(cfg.get("app_stats", "exclude"), "psafe.exe");
+
+        // 程序还在跑，用户用记事本又加了一个密码管理器
+        std::fs::write(&path, "[app_stats]\nexclude = psafe.exe, keepass.exe\n").unwrap();
+        cfg.save().unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("exclude = psafe.exe, keepass.exe"),
+            "运行期手改的那一行被启动时的值盖掉了: {text}"
+        );
+        // 内存也必须跟上：热路径读的是 `values`，只改文件的话"每次判定现读"的那批键
+        // 这一轮还是旧值（而 `load_config` 那边的注释承诺的是立刻生效）。
+        assert_eq!(
+            cfg.get("app_stats", "exclude"),
+            "psafe.exe, keepass.exe",
+            "采纳只落到文件、没落到内存 ⇒ 两份真相"
+        );
+    }
+
+    /// 反面对照（这一半才是这条修改真正的风险）：UI 刚改、还没落盘的键必须继续赢。
+    ///
+    /// 上一场修过"两个并发 save 让设置静默丢失"，如果这里让文件上的旧值赢，
+    /// 那个形状就回来了 —— 所以判据是"差异是谁改的"，不是"谁在文件上"。
+    #[test]
+    fn a_pending_ui_write_beats_a_stale_disk_value() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_ext_race");
+        let path = app.path().join("config.ini");
+        std::fs::write(&path, "[gui]\ntheme = dark\n").unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+
+        // 用户在设置页把主题改成 light（去抖还没落盘），同一时刻文件又被外部改成别的值
+        cfg.set_local("gui", "theme", "light");
+        std::fs::write(&path, "[gui]\ntheme = solarized\n").unwrap();
+        cfg.save().unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("theme = light"),
+            "本进程刚做的设置被文件里的旧值顶掉了: {text}"
+        );
+        assert_eq!(cfg.get("gui", "theme"), "light");
+    }
+
+    /// 落盘成功之后"待写"集合要清空：否则那个键一辈子不再接受外部改动
+    /// （UI 改过一次主题之后，用户就再也改不动这一行了）。
+    #[test]
+    fn the_pending_set_clears_after_a_successful_save() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_ext_after_save");
+        let path = app.path().join("config.ini");
+        std::fs::write(&path, "[gui]\ntheme = dark\n").unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+
+        cfg.set_local("gui", "theme", "light");
+        cfg.save().unwrap();
+        assert_eq!(cfg.get("gui", "theme"), "light");
+
+        // 这次改动已经在文件上了 ⇒ 之后的差异只能来自外部
+        std::fs::write(&path, "[gui]\ntheme = solarized\n").unwrap();
+        cfg.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("theme = solarized"),
+            "已落盘的键此后再被外部改动应当采纳，而不是永久停在 UI 那次值: {text}"
+        );
+        assert_eq!(cfg.get("gui", "theme"), "solarized");
+    }
+
+    /// 废弃键不采纳：`load()` 刻意把它们清掉，采纳等于让它们复活。
+    #[test]
+    fn a_deprecated_key_on_disk_is_not_adopted() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_ext_deprecated");
+        let path = app.path().join("config.ini");
+        std::fs::write(&path, "[stats]\ntoday_count_cache_ttl = 999\n").unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+        cfg.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("today_count_cache_ttl"),
+            "废弃键被采纳回内存又写回文件了: {text}"
+        );
     }
 
     #[test]
@@ -972,14 +1181,12 @@ work_minutes = 45
         .unwrap();
 
         let cfg = FocusFlowConfig::load(&path).unwrap();
-        // 改一个内存值再保存。刻意不走 set()：它把信号发给全局去抖保存线程，
+        // 改一个值再保存。走 `set_local`（= `set()` 的前半步）：直接写 `values` 的话
+        // 这次改动没进 `pending_writes`，`save()` 会把它当成"文件被外部改了"而把内存
+        // 采纳回旧值 —— 那正是 `an_external_edit_survives_the_next_save` 要的行为。
+        // 刻意不走完整 `set()`：它把信号发给全局去抖保存线程，
         // 那个线程写的是 instance() 的路径，不是这里的临时目录。
-        cfg.values
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut("listener")
-            .unwrap()
-            .insert("scroll_burst_window".to_string(), "0.25".to_string());
+        cfg.set_local("listener", "scroll_burst_window", "0.25");
         cfg.save().unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();

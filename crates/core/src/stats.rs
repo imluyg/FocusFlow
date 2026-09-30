@@ -151,8 +151,10 @@ pub fn cpm(config: &'static FocusFlowConfig) -> Arc<CpmCalculator> {
 /// - 发过一次就清空采样，下一次要再攒满一整段窗口；
 /// - `cooldown_minutes` 是两次提醒之间的最小间隔。
 ///
-/// 参数每次判定从配置现读，所以改 `config.ini` 立刻生效（与 `[pomodoro]` 那种
-/// 启动时读一次的不一样：这个线程本来每 tick 都在跑）。
+/// 参数每次判定从配置**内存快照**现读，所以本进程内的改动不需要重启就生效。
+/// 反过来，手改 `config.ini` 不会立刻生效：读的是快照，文件要等下一次 `save()`
+/// 被 [`crate::config`] 的"外部改动采纳"那步吸收（或重启后第一次读）。
+/// 与 `[pomodoro]` 那种启动时读一次的不一样：这个线程本来每 tick 都在跑。
 #[derive(Debug, Default)]
 pub struct RestMonitor {
     /// (采样时刻, 当时的今日累计事件数)
