@@ -632,6 +632,21 @@ fn spawn_annotate_ceiling(app: &AppHandle, epoch: u64) {
 /// 于是"看门狗有没有看到页面拉过图"这件事有了一个真的观察量。
 #[tauri::command]
 pub async fn snip_take(app: AppHandle) -> Result<SnipPayload, String> {
+    // 覆盖层与缩放倍数**必须在动会话之前读到**。反过来的话底图已经从槽里取走了，而这里
+    // 任何一个 `?` 走人都会留下一个没人收的半成品会话：8 秒看门狗认的观察量是
+    // 「图还在不在」（见 `run_capture`），图没了它就不响；绝对上限那条也没来得及起；
+    // 于是 `IN_FLIGHT` 永久停在 true —— 症状是**这一次截图之后，两条热键一直到进程重启
+    // 都只回一句「已有一张截图在进行中」**，而屏幕上还盖着那张不透明全屏覆盖层。
+    //
+    // 两步分开、不在锁内调窗口方法也是刻意的：`scale_factor()` 从工作线程调会阻塞在
+    // 主循环上等待，握着 `SESSION` 等就是一次锁跨线程的调用。
+    let win = app
+        .get_webview_window(SNIP_LABEL)
+        .ok_or_else(|| format!("覆盖层窗口 {SNIP_LABEL} 不存在"))?;
+    let dpr = win
+        .scale_factor()
+        .map_err(|e| format!("取缩放倍数失败：{e}"))?;
+
     // epoch 与图必须在**同一次加锁**里取：分两次锁的话，中间若换了会话，就会把新会话的图
     // 配着旧 epoch 交出去 —— 页面之后回报的 epoch 永远对不上，症状是"框完点提交没反应"。
     let (epoch, png, rect, windows, started, annotate) = {
@@ -660,12 +675,7 @@ pub async fn snip_take(app: AppHandle) -> Result<SnipPayload, String> {
         rect.height,
         started.elapsed().as_millis()
     );
-    let win = app
-        .get_webview_window(SNIP_LABEL)
-        .ok_or_else(|| format!("覆盖层窗口 {SNIP_LABEL} 不存在"))?;
-    let dpr = win
-        .scale_factor()
-        .map_err(|e| format!("取缩放倍数失败：{e}"))?;
+    // 从这一行起没有会 `?` 走人的步骤了 —— 底图已经取走，中途退出就是一个没人收的会话。
     if annotate {
         spawn_annotate_ceiling(&app, epoch);
     }
@@ -1359,6 +1369,97 @@ mod tests {
         assert!(
             js.contains("if (annotate) enterAnnotate();"),
             "松手进不进标注态的判据不见了 —— 贴图入口就会渗到直出那条路上"
+        );
+    }
+
+    /// `snip_take` 必须**先读覆盖层与缩放倍数，再消费底图**。
+    ///
+    /// 顺序反了会留下一个没人收的半成品会话：8 秒看门狗唯一的观察量是「图还在不在」，
+    /// 图被取走它就不响；绝对上限那条也来不及起；`IN_FLIGHT` 从此永久是 true ——
+    /// 一次截图之后两条热键到进程重启都只回「已有一张截图在进行中」。
+    /// 命令本体要真窗口才跑得动，所以按文本顺序钉（与本文件
+    /// `annotation_is_composited_exactly_once_between_crop_and_encode` 同族）。
+    #[test]
+    fn snip_take_validates_the_window_before_consuming_the_image() {
+        let src = include_str!("snip.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let head = prod
+            .find("pub async fn snip_take")
+            .expect("取图命令找不到了");
+        let body = &prod[head..head
+            + prod[head..]
+                .find("\n#[tauri::command]")
+                .expect("后面没有别的命令")];
+
+        let take = body
+            .find("s.png_base64.take()")
+            .expect("底图消费点不见了（判据要跟着改）");
+        let window = body
+            .find("get_webview_window(SNIP_LABEL)")
+            .expect("读覆盖层那一步不见了");
+        let scale = body.find("scale_factor()").expect("读缩放倍数那一步不见了");
+        assert!(
+            window < take && scale < take,
+            "读窗口（{window}）与缩放倍数（{scale}）必须都排在消费底图（{take}）之前，\
+             否则它们之中任一 ? 走人时图已经没了，看门狗再也看不见这次会话"
+        );
+        // 夹具自己的前提：切片真盖住了函数体，而不是切成空串让上面的断言空转
+        assert!(
+            body.contains("spawn_annotate_ceiling"),
+            "切片没盖住整个函数体，上面三条是假绿"
+        );
+    }
+
+    /// 工具条的落点必须走 `placeToolbar` 那个纯函数，且**横向也夹在视口里**。
+    ///
+    /// 这条钉的是补进来的那半个判据：竖向翻转一直有，横向只有 `Math.max(4, 选区.left)`，
+    /// 于是点中右半屏的窗口就把「撤销 / 贴图 / 完成 / 取消」整段推出屏幕 —— 而工具条正是
+    /// 为「鼠标党不能只靠 Enter/Esc」才存在的。真浏览器探针量到修复前右边到 1734 而视口
+    /// 只有 1256，修复后 1252。
+    #[test]
+    fn toolbar_placement_is_a_pure_function_that_clamps_both_axes() {
+        let js = include_str!("../ui/snip.js");
+        let at = js
+            .find("export function placeToolbar(")
+            .expect("工具条落点该是个导出的纯函数，夹具要能直接断言它");
+        let body = &js[at..at + js[at..].find("\n}\n").expect("placeToolbar 的结尾")];
+
+        assert!(
+            body.contains("left: fit(sel.left, tool.w, vp.w)"),
+            "横向落点必须按视口宽夹住，否则右半屏的选区会把工具条推出屏幕：{body}"
+        );
+        assert!(
+            body.contains("top: fit(prefer, tool.h, vp.h)"),
+            "竖向那条翻转判据不能跟着一起丢：{body}"
+        );
+        // 条比视口还宽时不能算出负坐标（那比出右边更难够到）
+        assert!(
+            body.contains("max < EDGE ? EDGE"),
+            "放不下时要贴左边缘，而不是给出负的 left：{body}"
+        );
+
+        // placeTools 只做「量 → 交给纯函数 → 写回」，不许再自己拼坐标
+        let head = js[at..]
+            .find("function placeTools()")
+            .map(|i| i + at)
+            .expect("摆工具条那一步不见了");
+        let place = &js[head..head + js[head..].find("\n}\n").expect("placeTools 的结尾")];
+        assert!(
+            place.contains("placeToolbar("),
+            "摆位置绕过了纯函数 —— 夹取判据就会与上面断言的那份分叉"
+        );
+        assert!(
+            !place.contains("Math.max(4, r.left)"),
+            "又直接拿选区左沿当工具条的 left 了，那正是出屏的那一条：{place}"
+        );
+        // 先摆到 0 再量宽度：left 一大条就折行，量到的是半条的宽度，夹了等于没夹
+        let measure = place.find("offsetWidth").expect("要量工具条宽度");
+        let reset = place
+            .find("style.left = \"0px\"")
+            .expect("量之前要先把它摆到 0");
+        assert!(
+            reset < measure,
+            "量宽度的次序不对：先量再摆会量到折行之后的半条宽度"
         );
     }
 }

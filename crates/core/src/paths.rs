@@ -137,7 +137,10 @@ impl Drop for TestAppDir {
 /// 与 `remove_dir_all` 同义，但先给路径挂上 `\\?\` 前缀 —— Windows 上绕开
 /// MAX_PATH（260）唯一的办法。前缀路径要求绝对、反斜杠、不做规范化，
 /// 所以这里先 `absolute` 再把 `/` 换掉。
-#[cfg(windows)]
+///
+/// cfg 必须盖住 `any(test, feature = "test-utils")`：唯一的调用方 `TestAppDir::drop`
+/// 就带这个 cfg，只写 `windows` 会让普通 lib 构建报 `dead_code`。
+#[cfg(all(windows, any(test, feature = "test-utils")))]
 fn remove_dir_all_long(dir: &Path) -> std::io::Result<()> {
     let abs = std::path::absolute(dir)?;
     let s = abs.display().to_string().replace('/', "\\");
@@ -149,7 +152,7 @@ fn remove_dir_all_long(dir: &Path) -> std::io::Result<()> {
     std::fs::remove_dir_all(Path::new(&prefixed))
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), any(test, feature = "test-utils")))]
 fn remove_dir_all_long(dir: &Path) -> std::io::Result<()> {
     std::fs::remove_dir_all(dir)
 }

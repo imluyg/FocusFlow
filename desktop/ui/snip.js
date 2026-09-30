@@ -44,6 +44,10 @@ const hint = document.getElementById("hint");
 // 只是现在单击不再是取消，而是选中光标下那个窗口 —— 没有候选时才仍是取消）。
 const CLICK_SLACK = 2;
 
+/** 工具条离视口边缘留多少，以及它离选区留多少（都是 CSS 像素）。 */
+const EDGE = 4;
+const GAP = 6;
+
 // 缩放倍数是**每次会话重读**的（见 pull() 里那句 `dpr = …`），这里只是给首次加载前
 // 可能读到它的地方一个初值：覆盖层窗口常驻复用，`let` 而不是 `const`。
 let dpr = window.devicePixelRatio || 1;
@@ -332,14 +336,42 @@ txtEl.addEventListener("keydown", (e) => {
 txtEl.addEventListener("blur", () => finishTyping(true));
 txtEl.addEventListener("mousedown", (e) => e.stopPropagation());
 
-/** 工具条摆在选区下沿；放不下就翻到上沿（选区贴屏幕底部是常态）。 */
+/** 工具条落点：贴着选区下沿，放不下翻到上沿，左右同理。纯函数（尺寸由调用方量好传进来）。
+ *
+ *  竖向那条一直有，**横向那条是补的**：条本身近 900 CSS 像素宽，而 `placeTools` 以前直接
+ *  `left = max(4, 选区.left)`。在 1920 屏上点中右半屏任意一个窗口（吸附选中的常态）就把
+ *  「撤销 / 贴图 / 完成 / 取消」整段推出屏幕 —— 而工具条正是为"鼠标党不能只靠 Enter/Esc"
+ *  才存在的（见上面 `#tools` 的注释），出口全在屏幕外等于没有出口。
+ *
+ *  `EDGE` 那一支的次序有讲究：条比视口还宽时（窄屏、或以后再加笔）不能算出负 `left`
+ *  把条推到左边屏幕外去，那样比出右边更难够到 —— 放不下就贴左边缘。 */
+export function placeToolbar(sel, tool, vp) {
+  const fit = (start, size, span) => {
+    const max = span - size - EDGE;
+    return max < EDGE ? EDGE : Math.min(Math.max(start, EDGE), max);
+  };
+  // 下沿放得下就用下沿，否则翻到上沿（选区贴屏幕底部是常态）
+  const below = sel.bottom + GAP;
+  const prefer = below + tool.h > vp.h ? sel.top - tool.h - GAP : below;
+  return {
+    left: fit(sel.left, tool.w, vp.w),
+    top: fit(prefer, tool.h, vp.h),
+  };
+}
+
+/** 工具条摆在选区下沿；放不下就翻到上沿（选区贴屏幕底部是常态），横向同理不能出屏。 */
 function placeTools() {
   const r = annotCanvas.getBoundingClientRect();
-  toolsEl.style.left = Math.max(4, r.left) + "px";
-  const below = r.bottom + 6;
-  const h = toolsEl.offsetHeight;
-  const top = below + h > window.innerHeight ? Math.max(4, r.top - h - 6) : below;
-  toolsEl.style.top = top + "px";
+  // 先把条挪到 0 再量：`position: fixed` 元素的可用宽度是「视口右边 − left」，
+  // left 一大它就当场折成两行，那时量到的是一行的宽，拿去夹右边界等于没夹。
+  toolsEl.style.left = "0px";
+  const p = placeToolbar(
+    { left: r.left, top: r.top, bottom: r.bottom },
+    { w: toolsEl.offsetWidth, h: toolsEl.offsetHeight },
+    { w: window.innerWidth, h: window.innerHeight }
+  );
+  toolsEl.style.left = p.left + "px";
+  toolsEl.style.top = p.top + "px";
 }
 
 function enterAnnotate() {
