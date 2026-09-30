@@ -343,6 +343,77 @@ pub fn take_startup_notice() -> Option<crate::startup::CheckResult> {
         .take()
 }
 
+/// 配置里那两行 + 本进程实际生效的数据根 → 这次启动该做什么。**纯判断，不做任何副作用**。
+///
+/// 抽出来是因为 `run_pending_migration` 读的是 `config::instance()`，而那个单例一个进程
+/// 只能初始化一次、路径启动即钉死（见 `migrate_data_tree` 的注释），单测里换不了目录；
+/// 判断本身却是最容易判错、也最需要反例的一环。
+#[derive(Debug)]
+enum MigrationPlan {
+    /// 标记与生效的数据根确实是同一个目录，而配置里的 `data_home` 也就是这个目录 ——
+    /// 那是"先写标记、再写新目录"中途落盘失败留下的半写状态（`desktop` 侧
+    /// `change_data_dir` 的注释里写明了这个顺序是故意的）：没有可搬的东西，清掉标记即可。
+    ClearMarker,
+    /// 配置里的新数据目录**没有生效**（`paths::resolve_data_home` 在目标建不出来时会
+    /// 回落到程序目录：USB/网络盘开机还没就绪、同名普通文件、权限不足都是这一类）。
+    /// 此刻指向的不是用户选的那个地方，而这次搬运是不可逆的（删源 + 清标记）⇒ 什么都不做，
+    /// 标记留着下次重试。
+    RetryLater {
+        configured: PathBuf,
+        problem: String,
+    },
+    /// 正常搬运。
+    Migrate { from: PathBuf, to: PathBuf },
+}
+
+/// 把配置里的 `data_home` 原文按 `paths::resolve_data_home` 的同一条规则展开
+/// （绝对路径原样、相对路径以程序目录为基准），好让两边比的是同一种东西。
+fn expand_data_home(configured: &str, app_dir: &Path) -> PathBuf {
+    let p = Path::new(configured);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        app_dir.join(p)
+    }
+}
+
+fn plan_migration(
+    from_raw: &str,
+    configured_raw: &str,
+    app_dir: &Path,
+    resolved: &Path,
+) -> MigrationPlan {
+    let from = PathBuf::from(from_raw);
+    // 这道闸必须在 `from == resolved` 之前：目标没生效时 `resolved` 就是程序目录，
+    // 而旧目录在很多情形里也正是程序目录 —— 两者撞成同一个，下面的半写分支就会
+    // 抢在"目标没到"这一支前面命中，把标记清掉。清掉等于把"这次没搬成"变成
+    // "永远不再搬"（与 `migrate_data_tree` 为"旧根读不出来"补的那道闸是同一族，
+    // 那处防的是源侧，这里防的是目标侧）。
+    let configured_raw = configured_raw.trim();
+    if !configured_raw.is_empty() {
+        let configured = expand_data_home(configured_raw, app_dir);
+        if !same_directory(&configured, resolved) {
+            return MigrationPlan::RetryLater {
+                problem: format!(
+                    "配置里的新数据目录（{}）这次没能生效，本进程实际指向 {}；\
+                     多半是那个盘还没就绪或建不出来。搬运是不可逆的（核对通过就删源），\
+                     不能做在没到达的目标上 —— 标记保留，下次启动重试",
+                    configured.display(),
+                    resolved.display()
+                ),
+                configured,
+            };
+        }
+    }
+    if from == resolved {
+        return MigrationPlan::ClearMarker;
+    }
+    MigrationPlan::Migrate {
+        from,
+        to: resolved.to_path_buf(),
+    }
+}
+
 /// 启动早期调用：配置里留着 `[paths] data_migrate_from` 就把旧数据根的 `data/`+`backup/`
 /// 搬进新数据根，逐文件核对无误后删掉源侧，再清掉标记。没有标记时零成本返回。
 ///
@@ -361,39 +432,48 @@ pub fn run_pending_migration() -> Option<MigrationReport> {
     if from_raw.is_empty() {
         return None;
     }
+    let configured_raw = cfg.get("paths", "data_home").trim().to_string();
+    let resolved = paths::data_home();
     let from = PathBuf::from(&from_raw);
-    let to = paths::data_home();
-
-    if from == to {
-        tracing::warn!(
-            "data_migrate_from 与 data_home 是同一个目录（{}），没有可搬的东西，清掉标记",
-            from.display()
-        );
-        clear_marker(cfg);
-        return None;
-    }
-
-    match migrate_data_tree(&from, &to) {
-        Ok(report) => {
-            clear_marker(cfg);
-            tracing::info!(
-                "数据目录迁移完成：{} → {}（{} 个文件 / {} 字节，旧目录{}）",
-                report.from.display(),
-                report.to.display(),
-                report.summary.copied,
-                report.summary.bytes,
-                if report.leftover_in_source > 0 {
-                    format!("还剩下 {} 项删不掉，可手工清理", report.leftover_in_source)
-                } else {
-                    "已清空".to_string()
-                }
-            );
-            Some(report)
-        }
-        Err(problem) => {
-            give_up(&from, &to, problem);
+    match plan_migration(&from_raw, &configured_raw, &paths::app_dir(), &resolved) {
+        MigrationPlan::RetryLater {
+            configured,
+            problem,
+        } => {
+            // 与"搬不成"同一套处置：钉回旧目录继续记录、标记留着、启动报告出声。
+            give_up(&from, &configured, problem);
             None
         }
+        MigrationPlan::ClearMarker => {
+            tracing::warn!(
+                "data_migrate_from 与 data_home 是同一个目录（{}），没有可搬的东西，清掉标记",
+                from.display()
+            );
+            clear_marker(cfg);
+            None
+        }
+        MigrationPlan::Migrate { from, to } => match migrate_data_tree(&from, &to) {
+            Ok(report) => {
+                clear_marker(cfg);
+                tracing::info!(
+                    "数据目录迁移完成：{} → {}（{} 个文件 / {} 字节，旧目录{}）",
+                    report.from.display(),
+                    report.to.display(),
+                    report.summary.copied,
+                    report.summary.bytes,
+                    if report.leftover_in_source > 0 {
+                        format!("还剩下 {} 项删不掉，可手工清理", report.leftover_in_source)
+                    } else {
+                        "已清空".to_string()
+                    }
+                );
+                Some(report)
+            }
+            Err(problem) => {
+                give_up(&from, &to, problem);
+                None
+            }
+        },
     }
 }
 
@@ -1104,5 +1184,134 @@ mod tests {
         // 逐字节相同才放行
         write_file(&to.path().join("data/focusflow_2026.db"), "1234");
         assert!(verify_copy(from.path(), to.path()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod migration_plan_tests {
+    use super::*;
+
+    /// 把配置里的 `[paths] data_home` 原文展开成"应当生效的那个目录"。
+    fn configured_of(app: &Path, raw: &str) -> PathBuf {
+        expand_data_home(raw, app)
+    }
+
+    /// 目标目录这次没生效（回落到程序目录）时，绝不能清掉迁移标记。
+    ///
+    /// 旧实现只看 `data_migrate_from == 实际生效的 data_home`：而 `resolve_data_home`
+    /// 在建不出目标时（USB/网络盘开机还没就绪是最常见的一种，而"改数据目录"的人多半
+    /// 正是为了把数据放到那种盘上）回落到程序目录，旧目录在此刻**也**就是程序目录，
+    /// 于是这一对撞成相同 → 清标记 → "这次没搬成"变成"永远不再搬"：全部历史留在旧目录，
+    /// 盘挂上之后新目录从今天起开始攒第二份，两边越差越远。
+    #[test]
+    fn a_target_that_never_took_effect_keeps_the_marker() {
+        let _lock = paths::test_app_dir_lock();
+        let app = paths::test_app_dir("plan_fallback");
+        // 夹具：目标建不出来（路径中间是个普通文件）⇒ 本进程回落到程序目录
+        let blocker = app.path().join("not_a_dir");
+        std::fs::write(&blocker, "x").unwrap();
+        let wanted = configured_of(app.path(), &blocker.join("FocusData").to_string_lossy());
+        let resolved = app.path().to_path_buf();
+
+        // 前提：这正是旧代码会误判成"半写状态"的那一对 —— 旧目录与生效目录是同一个
+        let from = resolved.clone();
+        assert_eq!(
+            from, resolved,
+            "夹具的前提就是旧代码那一对相等，否则这条照不出回归"
+        );
+        let plan = plan_migration(
+            &from.to_string_lossy(),
+            &wanted.to_string_lossy(),
+            app.path(),
+            &resolved,
+        );
+        match &plan {
+            MigrationPlan::RetryLater {
+                configured,
+                problem,
+            } => {
+                assert_eq!(
+                    configured, &wanted,
+                    "话要说清是**哪个**目标没到，不是回落后那个"
+                );
+                assert!(
+                    problem.contains("没能生效"),
+                    "文案该说清为什么不动手: {problem}"
+                );
+                assert!(
+                    problem.contains("标记保留"),
+                    "要说清下次启动会重试: {problem}"
+                );
+            }
+            _ => panic!("目标没生效时必须留着标记重试，不该清标记、也不该删源: {plan:?}"),
+        }
+    }
+
+    /// 反向腿：三种"目标确实生效"的写法都不许被误判成没生效。
+    ///
+    /// 这一半才是这条修改真正的风险 —— 误判会让用户每次启动都搬不成、还永远看不到原因。
+    #[test]
+    fn a_target_that_did_take_effect_is_never_called_a_fallback() {
+        let _lock = paths::test_app_dir_lock();
+        let app = paths::test_app_dir("plan_ok");
+        let target = paths::test_app_dir("plan_ok_target");
+        let from = app.path().to_path_buf();
+
+        // ① 绝对路径、盘也真的建出来了：正常搬运
+        let raw = target.path().to_string_lossy().to_string();
+        let plan = plan_migration(
+            &from.to_string_lossy(),
+            &raw,
+            app.path(),
+            &configured_of(app.path(), &raw),
+        );
+        assert!(
+            matches!(plan, MigrationPlan::Migrate { .. }),
+            "目标生效时该搬运: {plan:?}"
+        );
+
+        // ② 同一个目录多写一个尾随分隔符（用户在配置里手打路径的常态）
+        let spelled = format!("{raw}{}", std::path::MAIN_SEPARATOR);
+        let plan = plan_migration(
+            &from.to_string_lossy(),
+            &spelled,
+            app.path(),
+            &configured_of(app.path(), &raw),
+        );
+        assert!(
+            !matches!(plan, MigrationPlan::RetryLater { .. }),
+            "同一个目录的另一种写法不该被判成没生效: {plan:?}"
+        );
+
+        // ③ 相对写法：按程序目录展开后与生效目录一致
+        let rel_home = app.path().join("MyData");
+        std::fs::create_dir_all(&rel_home).unwrap();
+        let plan = plan_migration(&from.to_string_lossy(), "MyData", app.path(), &rel_home);
+        assert!(
+            !matches!(plan, MigrationPlan::RetryLater { .. }),
+            "相对形式的 data_home 不该被判成没生效: {plan:?}"
+        );
+    }
+
+    /// 半写状态（写了 `data_migrate_from`、`data_home` 还是旧目录）必须仍走"清掉标记"，
+    /// 这是 `change_data_dir` 刻意先写标记再写新目录时所依赖的那一支。
+    #[test]
+    fn the_half_written_state_still_clears_the_marker() {
+        let _lock = paths::test_app_dir_lock();
+        let app = paths::test_app_dir("plan_half");
+        let plan = plan_migration(
+            &app.path().to_string_lossy(),
+            &app.path().to_string_lossy(),
+            app.path(),
+            app.path(),
+        );
+        assert!(
+            matches!(plan, MigrationPlan::ClearMarker),
+            "data_home 与标记都指旧目录 = 半写状态，该清标记: {plan:?}"
+        );
+
+        // 配置里根本没写 data_home（便携包的默认布局）时也照旧走原来的两条分支
+        let plan2 = plan_migration(&app.path().to_string_lossy(), "", app.path(), app.path());
+        assert!(matches!(plan2, MigrationPlan::ClearMarker), "{plan2:?}");
     }
 }
