@@ -45,6 +45,10 @@ const MAX_PIN_WINDOWS: usize = 12;
 /// 槽里最多留几份底图。底图是整块选区的 PNG base64（全屏那一档一张就有几 MB），
 /// 窗口一多就要有个天花板。超出时丢**最老**的那份：已经画出来的窗口不受影响，
 /// 只有那张老窗口真去重新加载页面时才会取不到图 —— 那种情况会有一行 warn。
+///
+/// 「不受影响」要有东西兜着：这份天花板比 `MAX_PIN_WINDOWS` 低，所以**尺寸**不能跟着
+/// 像素一起被挤掉，否则最老那几扇还活着的窗口连滚轮缩放都会报「底图不在了」。
+/// 尺寸记在下面的 `DIMS` 里，与像素分开。
 const MAX_PIN_IMAGES: usize = 8;
 
 /// `open()` 等主线程把窗口建回来的上限。正常是几十毫秒；给到 5 秒是因为它一旦超时，
@@ -76,6 +80,15 @@ pub struct PinPayload {
 static PIN_SEQ: AtomicU32 = AtomicU32::new(0);
 /// 用 `Vec` 而不是 `BTreeMap`：要的就是「插入顺序 = 新旧顺序」，满了直接从头上丢。
 static PENDING: Mutex<Vec<(u32, PinSlot)>> = Mutex::new(Vec::new());
+
+/// 尺寸账：`seq` → 那张图的物理宽高。两个数，没有 base64。
+///
+/// 为什么不与 `PENDING` 同一份：像素那份有 `MAX_PIN_IMAGES` 的天花板，而窗口有
+/// `MAX_PIN_WINDOWS` 个 —— 一起丢就会让「还活着的第 9 扇窗口」的滚轮缩放报错，
+/// 而缩放根本不需要那几个字节（`pin_resize` 只要宽高）。
+/// 天花板取 `MAX_PIN_WINDOWS`：`open()` 在已经有 `MAX_PIN_WINDOWS` 扇活着时就拒了，
+/// 所以正常路径上这里丢不到还在用的那扇。
+static DIMS: Mutex<Vec<(u32, (u32, u32))>> = Mutex::new(Vec::new());
 
 /// `seq` → 窗口 label（日志与回收用）。建窗那一点不叫它，见 `build_pin` 里的说明。
 fn pin_label(seq: u32) -> String {
@@ -190,6 +203,25 @@ fn slot_drop(slots: &mut Vec<(u32, PinSlot)>, id: u32) -> bool {
     let before = slots.len();
     slots.retain(|(k, _)| *k != id);
     slots.len() != before
+}
+
+/// 记下一张贴图的物理宽高（同 id 重写，不会积累两份）。
+fn dim_put(dims: &mut Vec<(u32, (u32, u32))>, id: u32, width: u32, height: u32) {
+    dims.retain(|(k, _)| *k != id);
+    dims.push((id, (width, height)));
+    if dims.len() > MAX_PIN_WINDOWS {
+        dims.remove(0);
+    }
+}
+
+fn dim_get(dims: &[(u32, (u32, u32))], id: u32) -> Option<(u32, u32)> {
+    dims.iter().find(|(k, _)| *k == id).map(|(_, v)| *v)
+}
+
+fn dim_drop(dims: &mut Vec<(u32, (u32, u32))>, id: u32) -> bool {
+    let before = dims.len();
+    dims.retain(|(k, _)| *k != id);
+    dims.len() != before
 }
 
 /// 当前活着的贴图窗口（`webview_windows()` 是唯一真相，不另建一份登记表）。
@@ -316,9 +348,14 @@ pub fn open(
         let mut slots = PENDING.lock().map_err(|_| "贴图槽锁不可用")?;
         slot_put(&mut slots, seq, slot, MAX_PIN_IMAGES)
     };
+    {
+        let mut dims = DIMS.lock().map_err(|_| "贴图尺寸账锁不可用")?;
+        dim_put(&mut dims, seq, width, height);
+    }
     if let Some(old) = evicted {
         tracing::warn!(
-            "贴图槽满了 {MAX_PIN_IMAGES} 份，收回最老的 {} 的底图（那张窗口若重新加载会取不到图）",
+            "贴图槽满了 {MAX_PIN_IMAGES} 份，收回最老的 {} 的底图（那张窗口若重新加载会取不到图，\
+             但已经画出来的那张照样能拖、能缩放）",
             pin_label(old)
         );
     }
@@ -337,6 +374,9 @@ pub fn open(
     }) {
         let mut slots = PENDING.lock().map_err(|_| "贴图槽锁不可用")?;
         slot_drop(&mut slots, seq);
+        if let Ok(mut dims) = DIMS.lock() {
+            dim_drop(&mut dims, seq);
+        }
         return Err(format!("无法把建贴图派发到主线程：{e}"));
     }
     let built = rx
@@ -346,6 +386,9 @@ pub fn open(
     if let Err(e) = built {
         let mut slots = PENDING.lock().map_err(|_| "贴图槽锁不可用")?;
         slot_drop(&mut slots, seq);
+        if let Ok(mut dims) = DIMS.lock() {
+            dim_drop(&mut dims, seq);
+        }
         return Err(e);
     }
 
@@ -405,17 +448,18 @@ pub async fn pin_take(win: WebviewWindow) -> Result<PinPayload, String> {
 /// 为什么不放页面自己去 `setSize`：那要给 `capabilities/default.json` 加
 /// `core:window:allow-set-size`，而那份能力是 `main`/`floating`/`snip` 共用的 ——
 /// 为贴图的缩放给所有窗口开一项写权限不划算。档位表也只在这边留一份。
+///
+/// 尺寸从 `DIMS` 读而不是从 `PENDING` 读：这里要的只是那两个数。读像素槽的话，
+/// 「底图超过 `MAX_PIN_IMAGES` 份被收回」会连带把**还活着**的那扇窗口的滚轮判成失败，
+/// 而模块头对那次收回的承诺是「已经画出来的窗口不受影响」。
 #[tauri::command]
 pub fn pin_resize(win: WebviewWindow, scale: f64, dir: i32) -> Result<(f64, u32, u32), String> {
     let id =
         pin_id_of_label(win.label()).ok_or_else(|| format!("不是贴图窗口：{}", win.label()))?;
     let (width, height) = {
-        let slots = PENDING.lock().map_err(|_| "贴图槽锁不可用")?;
-        let (_, slot) = slots
-            .iter()
-            .find(|(k, _)| *k == id)
-            .ok_or_else(|| format!("贴图 {id} 的底图不在了"))?;
-        (slot.width, slot.height)
+        let dims = DIMS.lock().map_err(|_| "贴图尺寸账锁不可用")?;
+        dim_get(&dims, id)
+            .ok_or_else(|| format!("贴图 {id} 的尺寸账不在了（窗口已关，或建窗那一步没成）"))?
     };
     let applied = zoom_step(scale, dir);
     let (w, h) = pin_size(width, height, applied)?;
@@ -471,6 +515,9 @@ pub fn on_destroyed(app: &AppHandle, label: &str) {
     };
     if let Ok(mut slots) = PENDING.lock() {
         slot_drop(&mut slots, id);
+    }
+    if let Ok(mut dims) = DIMS.lock() {
+        dim_drop(&mut dims, id);
     }
     tracing::info!(
         "贴图已关闭：{label}（还活着 {} 张，图已经在盘上，没有未保存的东西）",
@@ -622,6 +669,88 @@ mod tests {
         assert_eq!(slot_take(&slots, 4).unwrap().png_base64, "4");
         assert!(slot_take(&slots, 1).is_none());
         assert_eq!(slots.len(), 3, "一次只挤掉一份");
+    }
+
+    /// 挤掉最老那份**像素**时，尺寸账必须留着：模块头对那次回收的承诺是「已经画出来的
+    /// 窗口不受影响」，而滚轮缩放读的要是像素槽，那么贴图开到第 9 张起，最老那几扇还
+    /// 活着的窗口一滚滚轮就只会得到一句「底图不在了」——图明明还在桌上。
+    #[test]
+    fn evicted_pixels_leave_the_size_ledger_behind() {
+        let mut slots = Vec::new();
+        let mut dims = Vec::new();
+        let s = |n: u32| PinSlot {
+            png_base64: "AAA".to_string(),
+            width: n,
+            height: n / 2,
+        };
+        for i in 1..=4u32 {
+            slot_put(&mut slots, i, s(i * 200), 3);
+            dim_put(&mut dims, i, i * 200, i * 100);
+        }
+        assert!(
+            slot_take(&slots, 1).is_none(),
+            "夹具前提：第 1 份像素已经被挤掉了"
+        );
+        let (w, h) = dim_get(&dims, 1).expect("尺寸账不该跟着像素一起没了");
+        assert_eq!((w, h), (200, 100));
+        // 缩放要算的就是「档位 × 图像尺寸」，那几 MB 的 base64 全程没参与
+        let applied = zoom_step(1.0, 1);
+        assert_eq!(pin_size(w, h, applied).unwrap(), (300, 150));
+
+        // 账本自己的天花板按窗口数计，且从最老一条起丢 —— `open()` 在已经有
+        // `MAX_PIN_WINDOWS` 扇活着时就拒了，所以正常路径丢不到还在用的那扇。
+        for i in 5..=(MAX_PIN_WINDOWS as u32 + 4) {
+            dim_put(&mut dims, i, 10, 10);
+        }
+        assert_eq!(dims.len(), MAX_PIN_WINDOWS);
+        assert!(dim_get(&dims, 1).is_none(), "账本满了也从最老的那条起丢");
+        assert!(dim_get(&dims, MAX_PIN_WINDOWS as u32 + 4).is_some());
+        assert!(dim_drop(&mut dims, 5), "窗口销毁要把这条一起带走");
+        assert!(!dim_drop(&mut dims, 5), "重复收尾不该报错");
+    }
+
+    /// `pin_resize` 只许读尺寸账。回到读 `PENDING` 的话上面那条夹具就管不住它了 ——
+    /// 「底图被收回」与「这扇窗口的滚轮坏了」之间只差一行，而命令本体要真窗口才跑得动，
+    /// 所以按文本形状钉（与 `pin_windows_are_opaque_and_never_touch_the_disk` 同族）。
+    #[test]
+    fn pin_resize_reads_the_size_ledger_not_the_pixels() {
+        let all = code_only(include_str!("pin.rs"));
+        let prod = &all[..all.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let body = &prod[prod.find("fn pin_resize").expect("缩放函数找不到了")
+            ..prod.find("fn pin_close").expect("下一条命令的起点找不到了")];
+        assert!(body.contains("dim_get("), "缩放没在读尺寸账：{body}");
+        assert!(
+            !body.contains("PENDING"),
+            "缩放又去读像素槽了：底图被收回时滚轮会跟着一起坏"
+        );
+        assert!(
+            !body.contains("png_base64"),
+            "缩放不需要那几个字节的 base64"
+        );
+    }
+
+    /// 「同步」是最顺手也最容易做错的改法：`open()` 里挤掉一份像素时，顺手把那条尺寸
+    /// 也 `dim_drop` 掉，两份账就重新变成一个了 —— 于是第 9 张贴图一滚滚轮就报错。
+    /// 这条盯的是回收那一段，而不是 `pin_resize` 那一段（上一条管不到这里）。
+    #[test]
+    fn evicting_a_slot_does_not_evict_its_size_entry() {
+        let all = code_only(include_str!("pin.rs"));
+        let prod = &all[..all.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("if let Some(old) = evicted {")
+            .expect("回收底图那一段找不到了（判据要跟着改）");
+        let evict = &prod[at..prod[at..]
+            .find("let (tx, rx)")
+            .expect("派发建窗那一段的起点")
+            + at];
+        assert!(
+            evict.contains("tracing::warn"),
+            "切片是空的或对错了位置，这条就成了假绿：{evict}"
+        );
+        assert!(
+            !evict.contains("dim_drop"),
+            "挤像素的那一段动到尺寸账了：还活着的窗口会连缩放一起失去依据"
+        );
     }
 
     /// 去掉行注释（`//` 与 `///` 都在内）：本模块的模块头写的就是「不许出现 `fs::write`」「不要

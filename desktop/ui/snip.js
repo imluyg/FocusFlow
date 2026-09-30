@@ -44,7 +44,9 @@ const hint = document.getElementById("hint");
 // 只是现在单击不再是取消，而是选中光标下那个窗口 —— 没有候选时才仍是取消）。
 const CLICK_SLACK = 2;
 
-const dpr = window.devicePixelRatio || 1;
+// 缩放倍数是**每次会话重读**的（见 pull() 里那句 `dpr = …`），这里只是给首次加载前
+// 可能读到它的地方一个初值：覆盖层窗口常驻复用，`let` 而不是 `const`。
+let dpr = window.devicePixelRatio || 1;
 let epoch = 0;
 let monitor = null;
 /** 可吸附窗口，已换算成 CSS 像素、相对视口；顺序是 z-order 顶→底（Rust 侧 EnumWindows 给的）。 */
@@ -570,7 +572,10 @@ document.addEventListener("mouseup", (e) => {
   const end = point(e);
   anchor = null;
   document.body.classList.remove("dragging");
-  if (Math.abs(end.x - a.x) < CLICK_SLACK || Math.abs(end.y - a.y) < CLICK_SLACK) {
+  // 位移判据要**两轴都**没超出 slack 才算单击：只比一根轴的话，
+  // "沿水平方向拖一条工具栏"（dy≈0、dx 上百）会被判成单击，
+  // 于是用户框的是自己画的那条，拿到的却是光标下整个窗口 —— 而且不报错。
+  if (Math.abs(end.x - a.x) < CLICK_SLACK && Math.abs(end.y - a.y) < CLICK_SLACK) {
     // 单击：光标下有候选就选中整个窗口，没有才仍是"取消"（原来的行为）
     const r = snapAt(end);
     showSnap(null);
@@ -665,6 +670,11 @@ async function pull() {
     epoch = payload.epoch;
     monitor = payload.monitor;
     annotate = payload.annotate === true;
+    // **每一场会话重读一次**：覆盖层是常驻复用的，Rust 每次把它摆到光标所在那块屏。
+    // 混合 DPI 的双屏（或人在两次截图之间改了显示缩放）之后 devicePixelRatio 就变了，
+    // 而模块级只求值一次的写法会让下面那条对账永远对不上 —— 症状是"换了那块屏，
+    // 热键按下去屏幕暗一下就取消"，且主屏上一切正常，最难归因。
+    dpr = window.devicePixelRatio || 1;
     // Rust 给的是物理像素 + 这块屏的绝对坐标；换成页面一直在用的"CSS 像素、相对视口"。
     // 副屏的负原点与 dpr≠1 都在这一步一起消化，后面的命中判定才是纯 CSS 坐标。
     wins = payload.windows.map((w) => ({

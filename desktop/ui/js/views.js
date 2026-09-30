@@ -915,7 +915,8 @@ const SETTINGS_CATS = [
             t: "btns", name: "立即截图",
             btns: [{ act: "do-snip", label: "框选一块" }, { act: "do-snip-annotate", label: "框选并标注" }],
             desc: (s) =>
-              "屏幕会先被冻结，拖框选区后存成 PNG 并复制到剪贴板；单击或按 Esc 取消，什么都不留下。"
+              "屏幕会先被冻结，拖框选区后松手就存成 PNG 并复制到剪贴板；"
+              + "单击不是取消，而是选中光标下那个窗口（那里没有窗口时才是取消）；Esc 与右键都能放弃。"
               + `文件写在 ${escapeHtml(s.screenshots_dir || "data/screenshots/")}，程序不会自动删，也不上传任何东西。`,
             descWide: true,
           },

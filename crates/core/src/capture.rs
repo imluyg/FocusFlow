@@ -232,7 +232,10 @@ pub fn unique_name(base: &str, ext: &str, listing: &[String]) -> String {
         }
         match n {
             None => n = Some(2),
-            Some(v) if v == u32::MAX => return format!("{base}_{}.  {ext}", u32::MAX),
+            // 这一支要到 `u32::MAX` 才走得到（同名的先例文件得凑满 42 亿个），用例造不出来，
+            // 所以只能就地写对：名字必须仍是 `.<ext>` 结尾 —— 写成空格就成一个没有扩展名的
+            // 文件，截图功能唯一的出口那次会落出一张谁都不认得的图。
+            Some(v) if v == u32::MAX => return format!("{base}_{}.{ext}", u32::MAX),
             Some(v) => n = Some(v + 1),
         }
     }
