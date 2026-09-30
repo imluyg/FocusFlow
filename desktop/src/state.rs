@@ -104,27 +104,12 @@ const RANK_LIMIT: usize = 100;
 ///
 /// 宿主侧给插件的同一份榜单早就补了这个破平（`plugins/host.rs` 里
 /// `.then_with(|| a.0.cmp(b.0))` 并写了理由），这里是漏掉的那一处。
-/// 排名比较器：**次数降序，同次数按名字升序**。榜单的四处（屏幕上的键鼠榜与应用榜、
-/// 插件宿主那份、以及 `export.rs` 的 CSV / HTML / 周报 Top 10）共用这一份。
-///
-/// 上面那段历史为什么成立，对导出那三张表**一模一样成立**：它们同样从 `HashMap` 出发、
-/// 同样只 `sort_by(次数)`，而周报里那句 `top.iter().take(10)` 与屏幕上的
-/// `truncate(RANK_LIMIT)` 是同一个形状 —— 同分键跨在第 10 名这条线上时，
-/// **谁进榜**每进程随机。周报每次启动都会自动重生成一份，于是同一个人的同一周，
-/// 两次导出的 Top 10 成员可能不同，而且与屏幕上看到的排名不一致（屏幕上已经修了）。
-pub(crate) fn cmp_rank_desc(
-    name_a: &str,
-    count_a: &i64,
-    name_b: &str,
-    count_b: &i64,
-) -> std::cmp::Ordering {
-    count_b
-        .cmp(count_a)
-        .then_with(|| name_a.as_bytes().cmp(name_b.as_bytes()))
-}
-
+/// 比较器本身在 `focusflow_core::format::cmp_rank_desc` —— 桌面导出的三张表与 **CLI**
+/// 那四个排名用的是同一把尺子，而 CLI 够不着本 crate，所以唯一的一份放在 core。
+/// 那里还记着"少了同分破平会怎样"的完整理由（`HashMap` 每进程随机 + 排序之后就是
+/// `truncate`/`take` ⇒ 谁进榜是随机的）。
 fn sort_rank_desc(items: &mut [(String, i64)]) {
-    items.sort_by(|a, b| cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
+    items.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
 }
 
 // ===== 主窗口懒创建 / 隐藏后卸载页面 状态（见 show_main_window / arm_main_unload）=====

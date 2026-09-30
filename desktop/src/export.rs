@@ -6,7 +6,7 @@ use std::io::Write;
 use anyhow::Context;
 use chrono::Local;
 
-use focusflow_core::format::{csv_field, fmt_thousands, html_escape};
+use focusflow_core::format::{cmp_rank_desc, csv_field, fmt_thousands, html_escape};
 
 /// 导出 CSV（带 BOM，Excel 打开中文不乱码）。
 pub fn export_csv(
@@ -15,7 +15,7 @@ pub fn export_csv(
     stats: &HashMap<String, i64>,
 ) -> anyhow::Result<()> {
     let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
-    sorted.sort_by(|a, b| crate::state::cmp_rank_desc(a.0, a.1, b.0, b.1));
+    sorted.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
     let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut out = String::new();
     out.push_str("# FocusFlow 键鼠活跃统计导出\n");
@@ -47,7 +47,7 @@ pub fn export_html(
     stats: &HashMap<String, i64>,
 ) -> anyhow::Result<()> {
     let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
-    sorted.sort_by(|a, b| crate::state::cmp_rank_desc(a.0, a.1, b.0, b.1));
+    sorted.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
     let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut rows = String::new();
     let mut rank = 0;
@@ -325,7 +325,7 @@ pub fn write_weekly_report_for(
 
     out.push_str("\n## 键鼠 Top 10\n\n| 键鼠 | 次数 | 占比 |\n|---|---:|---:|\n");
     let mut top: Vec<(&String, &i64)> = keys.iter().collect();
-    top.sort_by(|a, b| crate::state::cmp_rank_desc(a.0, a.1, b.0, b.1));
+    top.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
     for (k, c) in top.iter().take(10) {
         out.push_str(&format!(
             "| {} | {} | {} |\n",
@@ -338,7 +338,7 @@ pub fn write_weekly_report_for(
     if !apps.is_empty() {
         out.push_str("\n## 前台应用时长 Top 5\n\n| 应用 | 时长 | 占比 |\n|---|---:|---:|\n");
         let mut at: Vec<(&String, &i64)> = apps.iter().collect();
-        at.sort_by(|a, b| crate::state::cmp_rank_desc(a.0, a.1, b.0, b.1));
+        at.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
         for (a, s) in at.iter().take(5) {
             out.push_str(&format!(
                 "| {} | {} | {} |\n",
@@ -797,7 +797,7 @@ mod tests {
         }
 
         let rank10 = |src: &mut [(&str, i64)]| -> Vec<String> {
-            src.sort_by(|a, b| crate::state::cmp_rank_desc(a.0, &a.1, b.0, &b.1));
+            src.sort_by(|a, b| cmp_rank_desc(a.0, &a.1, b.0, &b.1));
             src.iter().take(10).map(|(k, _)| k.to_string()).collect()
         };
 

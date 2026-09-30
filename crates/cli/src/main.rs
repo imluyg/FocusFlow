@@ -17,7 +17,7 @@ use chrono::Local;
 use focusflow_core::db;
 use focusflow_core::logger;
 
-use focusflow_core::format::{csv_field, fmt_thousands, html_escape};
+use focusflow_core::format::{cmp_rank_desc, csv_field, fmt_thousands, html_escape};
 
 fn main() -> ExitCode {
     logger::init_logging();
@@ -359,7 +359,7 @@ fn print_stats(_db: &db::Database, period: &str) -> i32 {
     println!("  {}", "-".repeat(40));
     let mut rank = 0;
     let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(a.1));
+    sorted.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
     for (key, count) in sorted {
         rank += 1;
         let percent = if total > 0 {
@@ -510,7 +510,7 @@ fn print_year_stats(_db: &db::Database, year: i32) -> i32 {
     println!("{}", "-".repeat(50));
     let mut rank = 0;
     let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(a.1));
+    sorted.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
     for (key, count) in sorted {
         rank += 1;
         println!("  {rank:<6}{key:<12}{}", fmt_thousands(*count));
@@ -576,7 +576,7 @@ fn export_csv(
 ) -> bool {
     use std::io::Write;
     let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(a.1));
+    sorted.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
     let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut out = String::new();
     out.push_str("# FocusFlow 键鼠活跃统计导出\n");
@@ -610,7 +610,7 @@ fn export_html(
     stats: &std::collections::HashMap<String, i64>,
 ) -> bool {
     let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(a.1));
+    sorted.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
     let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut rows = String::new();
     let mut rank = 0;
@@ -813,5 +813,36 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CLI 的每一个排名都必须走那**一个**比较器（`focusflow_core::format::cmp_rank_desc`）。
+    ///
+    /// 为什么单独给 CLI 钉一条，而不是靠桌面侧那条同名的用例：同一把尺子在三个地方各写
+    /// 一遍，已经因此栽过两回 —— 第一次是导出转义（CLI 那份漏了转义，见 `format.rs` 模块头），
+    /// 第二次是同分破平（屏幕上先修了，桌面导出与 CLI 这八处全漏）。漏法不报错也不崩溃：
+    /// 榜的输入是 `HashMap`，每进程随机序，而排序后面紧跟着 `truncate` / `take` /
+    /// `if rank >= N { break }` ⇒ **谁进榜**每次跑 CLI 都可能不一样。
+    /// 桌面那条用例管不到这个 crate，所以覆盖面要在这儿自己盯住。
+    #[test]
+    fn every_cli_rank_goes_through_the_one_comparator() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
+        let sorts: Vec<usize> = prod.match_indices(".sort_by(").map(|(i, _)| i).collect();
+        assert_eq!(
+            sorts.len(),
+            4,
+            "CLI 的排名应当正好四处（两个统计面板 + CSV / HTML 导出），现在数到 {} 处 ——\
+             加了新的榜就要一并进这条断言",
+            sorts.len()
+        );
+        for (n, at) in sorts.iter().enumerate() {
+            let line = &prod[*at..prod[*at..].find('\n').unwrap_or(prod.len() - *at) + *at];
+            assert!(
+                line.contains("cmp_rank_desc"),
+                "第 {} 处排名没走共用比较器：{line}\n\
+                 只排次数 = 同分键谁进榜随 HashMap 种子变",
+                n + 1
+            );
+        }
     }
 }

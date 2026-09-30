@@ -82,6 +82,32 @@ pub const KEY_GROUPS: [&str; 8] = [
 /// 鼠标那一路就静默拿到 0（键盘＝总数），数字看着完全正常、没有任何用例报错。
 pub const MOUSE_GROUPS: [&str; 2] = ["鼠标点击", "滚轮"];
 
+/// 排名比较器：**次数降序，同次数按名字升序**。全仓唯一一份。
+///
+/// 为什么必须在 core 而不是桌面侧：用它的有四个地方 —— 屏幕上的键鼠榜与应用榜
+/// （`desktop/src/state.rs`）、桌面导出的 CSV / HTML / 周报 Top 10 / 应用 Top 5
+/// （`desktop/src/export.rs`）、以及 **CLI 自己的四个排名与两份导出器**
+/// （`crates/cli/src/main.rs`）。放在 desktop 里 CLI 就够不着，而"同一把尺子抄两个
+/// crate 各写一遍"正是本函数要防的事 —— 上面模块头记的就是同一族的上一次事故
+/// （CLI 与 GUI 各维护一套导出转义，CLI 那套漏了转义）。
+///
+/// 少了"同分按名字"这一半会怎样：这些榜的输入全部来自 `HashMap`，`iter().collect()`
+/// 出来的序每进程都不一样（SipHash 随机种子），而 `sort_by` 是稳定排序 —— 它只是把
+/// 那份随机原样留在结果里。紧跟在排序后面的是 `truncate` / `take(n)` /
+/// `if rank >= N { break }`，于是随机性不止"同分的先后换了"，而是**谁进榜**都换。
+/// 屏幕上那次（他真实库 113 个键、第 99~102 名并列 2 次正好被 100 那条线切开）已经
+/// 因此修过一遍，导出与 CLI 是漏掉的另一半。
+pub fn cmp_rank_desc(
+    name_a: &str,
+    count_a: &i64,
+    name_b: &str,
+    count_b: &i64,
+) -> std::cmp::Ordering {
+    count_b
+        .cmp(count_a)
+        .then_with(|| name_a.as_bytes().cmp(name_b.as_bytes()))
+}
+
 /// 千分位格式化（如 1234567 → "1,234,567"，支持负数）。
 pub fn fmt_thousands(n: i64) -> String {
     let s = n.abs().to_string();
@@ -133,6 +159,49 @@ pub fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 排名比较器：次数降序 + **同分按名字升序**，而且结果不许依赖输入顺序。
+    ///
+    /// 这条要钉的是这样一类事故：榜的输入是 `HashMap`，排序只比次数，而排序后面就跟着
+    /// 截断 —— 屏幕上（`state.rs`，他真实库第 99~102 名并列被 100 那条线切开）、
+    /// 桌面导出四处、CLI 四处，同一个形状一共栽过三回。所以断言写成
+    /// "把输入倒过来喂，取出的榜必须逐位相同"，而不是"看起来有序"。
+    #[test]
+    fn rank_comparator_is_total_and_independent_of_input_order() {
+        const TIED: [&str; 12] = [
+            "k00", "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10", "k11",
+        ];
+        let build = |reverse: bool| -> Vec<(String, i64)> {
+            let mut v: Vec<(String, i64)> = vec![("zzz-big".to_string(), 90)];
+            for n in TIED {
+                v.push((n.to_string(), 10));
+            }
+            if reverse {
+                v.reverse();
+            }
+            v
+        };
+        let rank8 = |v: &mut Vec<(String, i64)>| -> Vec<String> {
+            v.sort_by(|a, b| cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
+            v.iter().take(8).map(|(k, _)| k.clone()).collect()
+        };
+
+        let mut fwd = build(false);
+        let mut rev = build(true);
+        let (a, b) = (rank8(&mut fwd), rank8(&mut rev));
+        assert_eq!(a, b, "同一份数据换个输入序就换榜 ⇒ 截断出来的是随机的");
+        assert_eq!(a[0], "zzz-big", "次数降序这一半不能丢");
+        assert_eq!(
+            &a[1..],
+            &["k00", "k01", "k02", "k03", "k04", "k05", "k06"],
+            "并列那组里进榜的必须是名字最小的 7 个"
+        );
+        // 反向断言：把 `.then_with` 那半截掉，这条就会红（同分先后的随序留进结果里）
+        assert!(
+            !a.iter().any(|k| k == "k11"),
+            "名字最大的那个并列项不该挤进榜：{a:?}"
+        );
+    }
 
     #[test]
     fn thousands_formatter() {
