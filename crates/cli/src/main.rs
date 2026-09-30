@@ -795,22 +795,24 @@ fn reset(_db: &db::Database) -> i32 {
     0
 }
 
-/// `--stats-year <年份>` 的取值口径：1970..=9999。
+/// `--stats-year <年份>` 的取值口径：1000..=9999（四位数）。
 ///
 /// 旧代码只 `parse::<i32>()`，于是 `--stats-year 0`、`-5`、`99999` 都能进去跑一圈，
 /// 而给出来的却是与"那一年真的没数据"一模一样的那句「总活跃次数: 0」+ 退 0。
-/// 1970 之下更糟：那一年的 `day_key` 是**负数**，而按日期归档与按日查询都不认负
-/// `day_key`（见 core 的 `day_key_to_date`）；年份本身还是文件名的一部分
-/// （`focusflow_2026.db`），四位数之外连库都拼不出来。
+/// 下界取 1000 而不是 1970：年份就是年度库文件名的一部分（`focusflow_2026.db`），
+/// `paths::is_year_db_file` 只认四位十进制，再小的数字连库都拼不出来；而 1970 **之前**
+/// 的记录现在有自己的年份库（core 的 `day_key_to_date` 已能解负 `day_key`，归档那侧
+/// 会把它们搬进 `focusflow_1969.db` 这类真实年份），所以 `--stats-year 1969` 是个合法
+/// 问题，不该被当成笔误拒掉。
 fn parse_stats_year(raw: &str) -> Result<i32, String> {
     let year = raw
         .trim()
         .parse::<i32>()
-        .map_err(|_| format!("无效的年份: {raw}（需要 1970..=9999 的四位数字）"))?;
-    if !(1970..=9999).contains(&year) {
+        .map_err(|_| format!("无效的年份: {raw}（需要 1000..=9999 的四位数字）"))?;
+    if !(1000..=9999).contains(&year) {
         return Err(format!(
-            "年份 {year} 不在可查范围（1970..=9999）内：早于 1970 的日期在这套库里是负的 day_key，\
-             归档与按日查询都不认"
+            "年份 {year} 不在可查范围（1000..=9999）内：年度库的文件名是 focusflow_YYYY.db，\
+             四位数之外的年份没有对应的库"
         ));
     }
     Ok(year)
@@ -972,19 +974,26 @@ mod tests {
             Ok(2026),
             "首尾空格是命令行常见写法"
         );
-        assert_eq!(parse_stats_year("1970"), Ok(1970), "边界本身合法");
+        assert_eq!(parse_stats_year("1000"), Ok(1000), "边界本身合法");
         assert_eq!(parse_stats_year("9999"), Ok(9999), "边界本身合法");
-        for bad in ["0", "-5", "1969", "10000", "999999", "abc", "", " ", "20.5"] {
+        // 1970 之前是**合法问题**：那一年的记录有自己的年份库（core 那边已经能解负
+        // day_key 并按真实年份归档），把它当笔误拒掉会把数据锁死在查不到的地方。
+        assert_eq!(
+            parse_stats_year("1969"),
+            Ok(1969),
+            "历元之前的年份照样要能问"
+        );
+        for bad in ["0", "-5", "999", "10000", "999999", "abc", "", " ", "20.5"] {
             assert!(parse_stats_year(bad).is_err(), "{bad} 应当被拒绝");
         }
         // 文案要能分清"不是数字"与"数字超出可查范围"
         assert!(parse_stats_year("abc").unwrap_err().contains("无效的年份"));
         assert!(
-            parse_stats_year("1969")
+            parse_stats_year("999")
                 .unwrap_err()
                 .contains("不在可查范围"),
             "实得: {}",
-            parse_stats_year("1969").unwrap_err()
+            parse_stats_year("999").unwrap_err()
         );
     }
 
