@@ -493,6 +493,13 @@ mod tests {
             "按钮前缀必须与 on_action 里的 ^toggle_ / ^edit_ / ^del_ 分支对得上"
         );
         assert_eq!(ids.len(), rows.len(), "ids 必须与 rows 一一对应");
+        // 「上次执行」必须是看得见的一列：面板那句"改了时刻会连同「上次执行」一起重置"
+        // 与宿主那句"连续三次没能启动，本时段内不再重试"都假设用户看得见它，而这一列
+        // 以前从来没被渲染过 —— 任务到底跑没跑、是不是被退避按住，只能靠翻日志知道。
+        assert!(
+            headers.iter().any(|h| h.contains("上次执行")),
+            "任务列表要有「上次执行」这一列，实得表头: {headers:?}"
+        );
         // 最后一列由按钮渲染，所以表头要比数据列多一个
         if let Some(first) = rows.first() {
             assert_eq!(

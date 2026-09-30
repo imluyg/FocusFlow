@@ -353,11 +353,26 @@ fn launch_target_of(target: &str) -> anyhow::Result<std::path::PathBuf> {
     if !is_link_file(p) {
         return Ok(p.to_path_buf());
     }
-    let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX);
+    let size = match std::fs::metadata(p) {
+        // stat 读不到原先被折成"体积异常"这个**永久**判定（`unwrap_or(u64::MAX)`），
+        // 于是盘 momentarily 不可用就等同于"这个快捷方式永远不合格"。
+        Ok(m) => m.len(),
+        Err(e) => {
+            return Err(anyhow::Error::new(TargetCurrentlyUnavailable {
+                shown: target.to_string(),
+                reason: format!("快捷方式 stat 失败: {e}"),
+            }))
+        }
+    };
     if size > LNK_MAX_BYTES {
         anyhow::bail!("快捷方式体积异常（{size} 字节），已拒绝读取: {target}");
     }
-    let bytes = std::fs::read(p).map_err(|e| anyhow::anyhow!("快捷方式不可读: {target}（{e}）"))?;
+    let bytes = std::fs::read(p).map_err(|e| {
+        anyhow::Error::new(TargetCurrentlyUnavailable {
+            shown: target.to_string(),
+            reason: format!("快捷方式不可读: {e}"),
+        })
+    })?;
     let resolved = parse_lnk_target(&bytes).ok_or_else(|| {
         anyhow::anyhow!(
             "无法从快捷方式中解析出本地目标程序（网络位置、控制面板项等一律不支持）: {target}"
@@ -539,7 +554,13 @@ fn validate_exe_target(p: &std::path::Path) -> anyhow::Result<()> {
     // 路径，后续的文件名与来源目录判断才有意义（否则 `notepad.exe` 可以是任何文件）。
     let canon = match p.canonicalize() {
         Ok(c) => c,
-        Err(e) => anyhow::bail!("目标程序不可用: {shown}（{e}）"),
+        Err(e) => {
+            // 打不开/查不到 = 此刻的状态，不是"这个目标不该跑"（见类型注释）
+            return Err(anyhow::Error::new(TargetCurrentlyUnavailable {
+                shown: shown.to_string(),
+                reason: e.to_string(),
+            }));
+        }
     };
     let file_name = canon
         .file_name()
@@ -587,6 +608,28 @@ fn approved_launch_target(target: &str, args: &str) -> anyhow::Result<std::path:
     validate_task_args(args)?;
     Ok(exe)
 }
+
+/// 「这一刻读不到它」，而**不是**「这个目标不该被启动」。
+///
+/// 休眠的 USB 盘、杀软首扫、开机还没就绪的网络盘都会让 `canonicalize`/`metadata`/`read`
+/// 临时失败。调用方必须把它和真正的白名单拒绝分开 —— 后者重试多少次都不会变好，
+/// 前者下一轮多半就好了。本文件 `LAUNCH_FAILURE_BACKOFF_AFTER` 那段注释早就把这类
+/// 失败写成「瞬时」，只是执行路径从来没照这个分过（一律折成 `Refused`）。
+///
+/// 用类型而不是文本匹配来分派：`e.downcast_ref::<Self>()`。
+#[derive(Debug)]
+struct TargetCurrentlyUnavailable {
+    shown: String,
+    reason: String,
+}
+
+impl std::fmt::Display for TargetCurrentlyUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "目标程序不可用: {}（{}）", self.shown, self.reason)
+    }
+}
+
+impl std::error::Error for TargetCurrentlyUnavailable {}
 
 /// 供 UI / 插件预检：目标程序与参数会不会被接受，返回可读原因。
 ///
@@ -667,13 +710,6 @@ pub fn update_task(
     schedule_time: Option<&str>,
     enabled: Option<bool>,
 ) -> anyhow::Result<()> {
-    // 修改目标路径时同样校验（不修改 target 字段则跳过，避免目标被删后无法编辑其他字段）
-    if let Some(t) = target_path {
-        if let Err(e) = validate_task_target(t) {
-            tracing::warn!("更新定时任务被拒绝（id={id}）: {e}");
-            return Err(e);
-        }
-    }
     if let Some(a) = args {
         if let Err(e) = validate_task_args(a) {
             tracing::warn!("更新定时任务被拒绝（id={id}）: {e}");
@@ -712,6 +748,16 @@ pub fn update_task(
     };
     let new_name = name.unwrap_or(&existing.0).to_string();
     let new_target = target_path.unwrap_or(&existing.1).to_string();
+    // 目标**真的换了**才重新校验。原先判的是"调用方传了 target_path"，而这个函数唯一
+    // 的调用方（插件页 scheduler_update，见 host.rs 的七参数绑定）永远把整条记录原样
+    // 传回来 —— 于是程序被卸载或移走之后，这条任务连名字和时刻都改不动（想改也过不了
+    // 目标那道闸）。传回来的就是库里存的那一条 ⇒ 没人改目标，不该拿库外的变化惩罚他。
+    if target_path.is_some() && new_target != existing.1 {
+        if let Err(e) = validate_task_target(&new_target) {
+            tracing::warn!("更新定时任务被拒绝（id={id}）: {e}");
+            return Err(e);
+        }
+    }
     let new_args = args.unwrap_or(&existing.2).to_string();
     let new_type = schedule_type.unwrap_or(&existing.3).to_string();
     // 入库一律写 trim 过的串（与 `add_task` 同一半）：`validate_schedule` 判的是 trim
@@ -901,9 +947,20 @@ fn parse_clock_number(s: &str) -> Option<i64> {
 }
 
 /// 判断任务是否应执行（镜像 `_should_run`）。
-fn should_run(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> bool {
+/// 一次判定的结论。`Wait` 与 `BadConfig` 的分别是给日志用的：前者是正常的"还没到点"，
+/// 后者是"这条任务永远不会到点"（配置根本解不开）。
+#[derive(Debug)]
+enum RunDecision {
+    Run,
+    Wait,
+    BadConfig(String),
+}
+
+/// [`should_run`] 的判定过程。拆成两层的理由：原先四个"解不开"的臂都只
+/// `return false`、一行日志都没有 —— 用户想知道"为什么这条任务从来不跑"只能翻源码。
+fn run_check(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> RunDecision {
     if !t.enabled {
-        return false;
+        return RunDecision::Wait;
     }
     let now_min = now.hour() as i64 * 60 + now.minute() as i64;
     let last_run = t.last_run.as_deref();
@@ -913,10 +970,15 @@ fn should_run(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> bool {
             // 格式 HH:MM
             let target_min = match parse_hhmm(&t.schedule_time) {
                 Some(v) => v,
-                None => return false,
+                None => {
+                    return RunDecision::BadConfig(format!(
+                        "daily 的时刻「{}」不是 HH:MM",
+                        t.schedule_time
+                    ))
+                }
             };
             if now_min < target_min {
-                return false;
+                return RunDecision::Wait;
             }
             match last_run {
                 Some(lr) => {
@@ -933,50 +995,68 @@ fn should_run(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> bool {
                     // 戳记只会来自过去，来自"未来"的那次一定已经跑过了。
                     if let Ok(lr_dt) = NaiveDateTime::parse_from_str(lr, "%Y-%m-%d %H:%M:%S") {
                         if lr_dt.date() >= now.date_naive() {
-                            return false;
+                            return RunDecision::Wait;
                         }
                     }
-                    true
+                    RunDecision::Run
                 }
-                None => true,
+                None => RunDecision::Run,
             }
         }
         "once" => {
             // 格式 YYYY-MM-DD HH:MM
             let target = match NaiveDateTime::parse_from_str(&t.schedule_time, "%Y-%m-%d %H:%M") {
                 Ok(dt) => dt,
-                Err(_) => return false,
+                Err(_) => {
+                    return RunDecision::BadConfig(format!(
+                        "once 的时刻「{}」不是 YYYY-MM-DD HH:MM",
+                        t.schedule_time
+                    ))
+                }
             };
             if now.naive_local() < target {
-                return false;
+                return RunDecision::Wait;
             }
-            last_run.is_none()
+            if last_run.is_none() {
+                RunDecision::Run
+            } else {
+                RunDecision::Wait
+            }
         }
         "interval" => {
             let (start_min, end_min, interval) = match parse_interval(&t.schedule_time) {
                 Some(v) => v,
-                None => return false,
+                None => {
+                    return RunDecision::BadConfig(format!(
+                        "interval 的时刻「{}」不是 HH:MM-HH:MM|分钟数",
+                        t.schedule_time
+                    ))
+                }
             };
             if now_min < start_min || now_min > end_min {
-                return false;
+                return RunDecision::Wait;
             }
             match last_run {
-                None => now_min >= start_min,
+                None => RunDecision::Run,
                 Some(lr) => {
                     if let Ok(lr_dt) = NaiveDateTime::parse_from_str(lr, "%Y-%m-%d %H:%M:%S") {
                         if lr_dt.date() < now.date_naive() {
-                            return now_min >= start_min;
+                            return RunDecision::Run;
                         }
                         // 同一天：检查间隔
                         let elapsed = now.naive_local().signed_duration_since(lr_dt).num_minutes();
-                        elapsed >= interval
+                        if elapsed >= interval {
+                            RunDecision::Run
+                        } else {
+                            RunDecision::Wait
+                        }
                     } else {
-                        true
+                        RunDecision::Run
                     }
                 }
             }
         }
-        _ => false,
+        other => RunDecision::BadConfig(format!("调度类型「{other}」不是 daily/once/interval")),
     }
 }
 
@@ -986,12 +1066,13 @@ fn should_run(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> bool {
 /// （重试多少次都不会变好）与 `CreateProcess` 失败（休眠的 USB 盘、杀软首扫这类
 /// **瞬时**问题）并成一件 —— 调用方拿不到这个区分，就只能对所有失败用同一套退避，
 /// 于是"该再试的不再试、不该再试的每 30 秒试一次"两头都错。
+#[derive(Debug)]
 enum LaunchOutcome {
     /// 真的启动起来了，带回填 `last_run` 的时刻
     Fired(String),
     /// 永久拒绝：目标为空或不在白名单里
     Refused(String),
-    /// 瞬时失败：进程创建本身没成功
+    /// 瞬时失败：目标此刻读不到，或进程创建本身没成功
     Transient(String),
 }
 
@@ -1008,6 +1089,17 @@ fn execute_task(t: &ScheduledTask) -> LaunchOutcome {
     let exe = match approved_launch_target(&t.target_path, &t.args) {
         Ok(p) => p,
         Err(e) => {
+            // 这一支原先一律 `Refused`：一次瞬时 IO（休眠的 USB 盘、杀软首扫、网络盘
+            // 开机没就绪）就让这条任务在整个进程生命周期里不再尝试 —— 而本文件
+            // `LAUNCH_FAILURE_BACKOFF_AFTER` 的注释早就把这些情形写成"瞬时"。
+            // 按错误类型分派（见 `TargetCurrentlyUnavailable`）。
+            if e.downcast_ref::<TargetCurrentlyUnavailable>().is_some() {
+                tracing::warn!(
+                    "定时任务这次量不到目标（按瞬时处理，本时段内还会再试）: {} — {e}",
+                    t.name
+                );
+                return LaunchOutcome::Transient(e.to_string());
+            }
             tracing::warn!("定时任务被拒绝执行（{}）: {e}", t.name);
             return LaunchOutcome::Refused(e.to_string());
         }
@@ -1127,11 +1219,40 @@ fn effective_last_run(db: Option<&str>, memo: Option<&str>) -> Option<String> {
 ///
 /// 30 秒的间隔按 500ms 小片睡：`stop()` 置位后最多 500ms 就能退出，
 /// 不必等满一整轮间隔（停用插件时若等它睡满，会把调用方挂住半分钟）。
-fn check_loop(stop: Arc<AtomicBool>) {
+/// 保证 `scheduled_tasks` 表存在，且**只在成功时落闩**。
+///
+/// `Scheduler::start()` 那一次失败不该钉死整个进程：数据目录可能在开机之后才出现
+/// （USB / 网络盘 —— 会等它的人正是把数据放那种盘上的人）、杀软可能正占着 `-wal`、
+/// 第二个实例正在退出。番茄钟与记账两条兄弟路径都是这个形状（`ensure_pomodoro_db`、
+/// `ensure_accounting_db`），本文件此前只有"启动时试一次"。
+///
+/// 闩刻意做成调用方传进来的 `AtomicBool`（而不是进程级 static）：调度线程与
+/// `start()` 各持一份克隆，测试能在自己的隔离目录里重跑这套判定。
+fn ensure_schema_ready(ready: &AtomicBool) -> bool {
+    if ready.load(Ordering::Relaxed) {
+        return true;
+    }
+    match init_db() {
+        Ok(()) => {
+            ready.store(true, Ordering::Relaxed);
+            true
+        }
+        Err(e) => {
+            tracing::error!("定时任务表初始化失败，下次调用会重试: {e}");
+            false
+        }
+    }
+}
+
+fn check_loop(stop: Arc<AtomicBool>, schema_ready: Arc<AtomicBool>) {
     // 两张只在本进程有效的兜底表（重启即清零，库里那份才是准）：
     // last_run 写库失败时记下的启动时刻、以及连续启动失败的次数。
     let mut fired_memo: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     let mut backoffs: std::collections::HashMap<i64, Backoff> = std::collections::HashMap::new();
+    // 配置解不开的任务：每个调度窗口只说一次（30 秒一条会把日志本身刷成噪声，
+    // 与本文件对退避日志的口径一致）
+    let mut bad_config_window: std::collections::HashMap<i64, String> =
+        std::collections::HashMap::new();
     while !stop.load(Ordering::SeqCst) {
         for _ in 0..(CHECK_INTERVAL_MS / 500) {
             if stop.load(Ordering::SeqCst) {
@@ -1139,6 +1260,8 @@ fn check_loop(stop: Arc<AtomicBool>) {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
+        // `start()` 那一次建表失败不该钉死一辈子（见 `ensure_schema_ready`）
+        ensure_schema_ready(&schema_ready);
         let now = Local::now();
         let tasks = get_all_tasks();
         for task in &tasks {
@@ -1151,8 +1274,25 @@ fn check_loop(stop: Arc<AtomicBool>) {
             let memo = fired_memo.get(&task.id).cloned();
             let mut t = task.clone();
             t.last_run = effective_last_run(task.last_run.as_deref(), memo.as_deref());
-            if should_run(&t, &now) {
-                record_launch(&t, &mut fired_memo, &mut backoffs, &window, &stamp);
+            match run_check(&t, &now) {
+                RunDecision::Run => {
+                    record_launch(&t, &mut fired_memo, &mut backoffs, &window, &stamp);
+                }
+                RunDecision::BadConfig(why) => {
+                    if bad_config_window
+                        .get(&task.id)
+                        .map(|seen| *seen != window)
+                        .unwrap_or(true)
+                    {
+                        tracing::warn!(
+                            "定时任务 #{} 的调度配置解不开，它永远不会执行（{why}）；\
+                             在插件页改正这一条的时刻即可恢复",
+                            task.id
+                        );
+                        bad_config_window.insert(task.id, window.clone());
+                    }
+                }
+                RunDecision::Wait => {}
             }
         }
     }
@@ -1239,11 +1379,9 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn start() -> Arc<Self> {
-        if let Err(e) = init_db() {
-            // 建表失败以前被 `let _ =` 吞掉：之后每次添加任务都报 "no such table"，
-            // 而日志里一个字都没有，只能靠猜。线程照旧起来（读失败会记日志）。
-            tracing::error!("定时任务表初始化失败，添加/删除任务会持续报错: {e}");
-        }
+        // 建表失败不再只是"记一笔然后放弃"：同一份闩交给调度线程，它每轮还会再试
+        let schema_ready = Arc::new(AtomicBool::new(false));
+        ensure_schema_ready(&schema_ready);
         let s = Arc::new(Self {
             stop: Arc::new(AtomicBool::new(false)),
             handle: Mutex::new(None),
@@ -1251,7 +1389,7 @@ impl Scheduler {
         let stop = Arc::clone(&s.stop);
         let handle = std::thread::Builder::new()
             .name("scheduler".into())
-            .spawn(move || check_loop(stop))
+            .spawn(move || check_loop(stop, Arc::clone(&schema_ready)))
             .map_err(|e| tracing::error!("启动调度线程失败: {e}"))
             .ok();
         // spawn 失败时 .ok() 已经是 None：调度线程没起来，句柄留 None
@@ -1340,6 +1478,12 @@ mod tests {
     /// 原来只回锁不回目录，`ff_sched_*` 每个用例每跑一次就在 %TEMP% 留一份
     /// （调度器有 8 个用例 → 每轮 +8）。目录删除前先清只读连接池，
     /// 否则 Windows 下句柄未放，remove_dir_all 静默失败。
+    /// 判定入口的布尔视图：产品侧只看 [`RunDecision`]（调度线程据此分派日志），
+    /// 这里给既有那批"该不该跑"的用例留着原来的写法，别把它们全改一遍。
+    fn should_run(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> bool {
+        matches!(run_check(t, now), RunDecision::Run)
+    }
+
     fn isolate_app_dir(
         tag: &str,
     ) -> (std::sync::MutexGuard<'static, ()>, crate::paths::TestAppDir) {
@@ -2658,6 +2802,188 @@ mod tests {
         assert!(
             e.to_string().contains("读取定时任务失败"),
             "表读不出来要说清是读失败，实得: {e}"
+        );
+    }
+    /// 「配置解不开」必须说得出是哪个臂。原先四个臂只 return false、一行日志都没有，
+    /// 而它和正常的"还没到点"在调用方眼里长得一模一样 —— 用户只能翻源码才知道
+    /// 为什么这条任务从来不跑。
+    #[test]
+    fn an_unparsable_schedule_says_which_arm_failed() {
+        let noon = Local.with_ymd_and_hms(2026, 3, 5, 12, 0, 0).unwrap();
+
+        let bad_daily = daily_task("25:99");
+        assert!(
+            matches!(run_check(&bad_daily, &noon), RunDecision::BadConfig(w) if w.contains("daily")),
+            "daily 的时刻解不开要报 BadConfig 并点名 daily，实得 {:?}",
+            run_check(&bad_daily, &noon)
+        );
+        let bad_once = sched_task(11, "once", "明天早上");
+        assert!(
+            matches!(run_check(&bad_once, &noon), RunDecision::BadConfig(w) if w.contains("once")),
+            "once 同理，实得 {:?}",
+            run_check(&bad_once, &noon)
+        );
+        let bad_interval = sched_task(12, "interval", "09:00-abc|30");
+        assert!(
+            matches!(
+                run_check(&bad_interval, &noon),
+                RunDecision::BadConfig(w) if w.contains("interval")
+            ),
+            "interval 同理，实得 {:?}",
+            run_check(&bad_interval, &noon)
+        );
+        let unknown_type = sched_task(13, "weekly", "09:00");
+        assert!(
+            matches!(
+                run_check(&unknown_type, &noon),
+                RunDecision::BadConfig(w) if w.contains("weekly")
+            ),
+            "未知的调度类型要把那个值本身说出来的，实得 {:?}",
+            run_check(&unknown_type, &noon)
+        );
+
+        // 反向腿：正常的"还没到点"不能被报成坏配置（否则日志里全是噪声）
+        assert!(
+            matches!(run_check(&daily_task("23:59"), &noon), RunDecision::Wait),
+            "还没到点就是 Wait，不是坏配置"
+        );
+        // 正向腿：合法配置的结论与改造前一致
+        assert!(matches!(
+            run_check(&daily_task("09:00"), &noon),
+            RunDecision::Run
+        ));
+    }
+
+    /// 目标"此刻读不到"必须是 Transient，不是 Refused。
+    ///
+    /// 回归：approved_launch_target 的失败原先一律折成永久拒绝 ⇒ 休眠的 USB 盘、
+    /// 杀软首扫一次就让这条任务在整个进程生命周期里不再尝试，而本文件
+    /// LAUNCH_FAILURE_BACKOFF_AFTER 的注释早就把这些情形写成"瞬时"。
+    /// 反向腿钉住"真·白名单拒绝"仍然是永久 —— 换三态不是为了放跑坏目标。
+    #[test]
+    fn a_target_that_cannot_be_read_now_is_transient_not_refused() {
+        let _g = isolate_app_dir("transient_target");
+        // 绝对路径与 .exe 都过关，卡在 canonicalize：文件此刻不在（盘没醒就是这个形状）
+        let missing = sched_task(21, "daily", "23:59");
+        assert!(
+            matches!(execute_task(&missing), LaunchOutcome::Transient(_)),
+            "读不到目标要按瞬时处理（下一轮还会再试），实得 {:?}",
+            execute_task(&missing)
+        );
+
+        // 反向腿：被禁止的解释器 = 重试多少次都不会变好 ⇒ 仍然永久拒绝
+        let mut forbidden = sched_task(22, "daily", "23:59");
+        // 路径从环境变量拼出来，不在这里再抄一遍字面量（抄一遍就是又一处会写错的副本）
+        let root = std::env::var("SystemRoot").unwrap_or_default();
+        let cmd_path = std::path::Path::new(&root).join("System32").join("cmd.exe");
+        assert!(
+            cmd_path.is_file(),
+            "夹具：这台机器上得真有 {}，反向腿不能静默跳过",
+            cmd_path.display()
+        );
+        forbidden.target_path = cmd_path.to_string_lossy().to_string();
+        assert!(
+            matches!(execute_task(&forbidden), LaunchOutcome::Refused(_)),
+            "黑名单里的解释器不能因为换了分派就被当成可重试，实得 {:?}",
+            execute_task(&forbidden)
+        );
+    }
+
+    /// 建表失败不能钉死整个进程。
+    ///
+    /// 番茄钟与记账两条兄弟路径都修过这一族（只在成功时落闩）：数据目录可能在
+    /// 开机之后才出现（USB / 网络盘）、杀软可能正占着 -wal、第二个实例正在退出。
+    /// 原先只有 Scheduler::start() 那一次机会，失败之后这个进程余生都"没有这张表"，
+    /// 而添加任务持续报 no such table。
+    #[test]
+    fn a_failed_table_init_is_retried_instead_of_poisoned_for_good() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("sched_schema_retry");
+        let ready = std::sync::atomic::AtomicBool::new(false);
+
+        let path = db_path();
+        std::fs::create_dir_all(&path).expect("把库路径换成一个目录，init_db 就该失败");
+        assert!(
+            !ensure_schema_ready(&ready),
+            "建不出表时不能落闩：落了闩就等于宣布这个进程再也不试"
+        );
+
+        // 撤掉路障（盘醒过来、杀软松手、另一个实例退出，都是这个形状）
+        std::fs::remove_dir(&path).expect("移开路障目录");
+        assert!(
+            ensure_schema_ready(&ready),
+            "路障撤掉之后下一次调用必须真去重试并成功"
+        );
+        let n: i64 = open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='scheduled_tasks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "落闩的凭据只能是「表真的建出来了」");
+        assert!(ensure_schema_ready(&ready), "已成功过就不必再建一次");
+    }
+
+    /// 程序被卸载之后，这条任务还得改得动名字与时刻。
+    ///
+    /// 回归：update_task 原先判的是"调用方传了 target_path"，而它唯一的调用方
+    /// （插件页 scheduler_update，见 host.rs 的七参数绑定）永远把整条记录原样传回来
+    /// ⇒ 目标一失效，连改名都被拒，用户只能去库里删行。判据换成"传回来的这条
+    /// 是不是库里存的那一条"。
+    #[test]
+    fn editing_a_task_still_works_after_its_program_was_uninstalled() {
+        let _g = isolate_app_dir("edit_after_uninstall");
+        // 目标路径取自既有夹具（`daily_task` 用的就是 notepad），不在这里再抄一遍字面量
+        let notepad = daily_task("23:59").target_path;
+        assert!(
+            std::path::Path::new(&notepad).is_file(),
+            "夹具：这台机器上得真有 {notepad}，否则这条用例什么都验不到"
+        );
+        let id = add_task("每日记事本", &notepad, "", "daily", "00:01", true).unwrap();
+
+        // 卸载/移走：把库里那一行的目标换成一个此刻过不了校验的路径
+        let gone = sched_task(77, "daily", "23:59").target_path;
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "UPDATE scheduled_tasks SET target_path=?1 WHERE id=?2",
+                rusqlite::params![gone, id],
+            )
+            .unwrap();
+        }
+        let stored = get_all_tasks()
+            .into_iter()
+            .find(|t| t.id == id)
+            .unwrap()
+            .target_path;
+        assert!(
+            validate_task_target(&stored).is_err(),
+            "前提：这条目标本身现在该被校验拒掉，否则「跳过校验」什么都钉不住"
+        );
+
+        // 面板那一步：七个参数原样传回来，只有名字是新的
+        update_task(
+            id,
+            Some("改名后的记事本"),
+            Some(&stored),
+            Some(""),
+            Some("daily"),
+            Some("00:01"),
+            Some(true),
+        )
+        .expect("原样传回库里那条目标时，改名不该被目标校验挡住");
+        let after = get_all_tasks().into_iter().find(|t| t.id == id).unwrap();
+        assert_eq!(after.name, "改名后的记事本", "改名要真落库");
+        assert_eq!(after.target_path, stored, "没人改的目标要原样留着");
+
+        // 反向腿：真的换了一个非法目标 ⇒ 照旧被拒（这道闸不是被删掉，只是改了判据）
+        let e = update_task(id, None, Some(""), None, None, None, None)
+            .expect_err("换了非法目标必须照旧校验");
+        assert!(
+            e.to_string().contains("不能为空"),
+            "要说清为什么被拒，实得: {e}"
         );
     }
 }

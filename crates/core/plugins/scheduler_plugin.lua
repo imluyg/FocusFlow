@@ -153,6 +153,18 @@ function _status(enabled)
     return "禁用"
 end
 
+-- 「上次执行」这一列：宿主的 scheduler_tasks 每行都带着 last_run（没跑过就是空串）。
+-- 两处文案都假设用户看得见它 —— 「改了时刻会连同「上次执行」一起重置」，以及宿主侧
+-- 那句"连续三次没能启动，本时段内不再重试" —— 而这一列以前从来没渲染过，
+-- 于是任务到底跑没跑、是不是被退避按住了，只能靠翻日志知道。
+function _last_run(t)
+    local s = t["last_run"]
+    if s == nil or s == "" then
+        return "从未"
+    end
+    return s
+end
+
 function get_view()
     local tasks = focusflow.scheduler_tasks()
     local rows = {}
@@ -162,6 +174,7 @@ function get_view()
             tostring(t["id"]),
             t["name"],
             t["desc"],
+            _last_run(t),
             _status(t["enabled"]),
         }
         -- 行必须带 ids + actions 才会渲染成按钮。以前是把 "toggle_3"/"del_3"
@@ -178,7 +191,7 @@ function get_view()
         { type = "separator" },
         {
             type = "table",
-            headers = { "ID", "名称", "调度", "状态", "操作" },
+            headers = { "ID", "名称", "调度", "上次执行", "状态", "操作" },
             rows = rows,
             ids = ids,
             actions = {
