@@ -888,13 +888,27 @@ pub mod win {
             None => None,
         };
 
-        EmptyClipboard().map_err(|e| format!("清空剪贴板失败：{e}"))?;
-        // 从这一行起所有权交给系统：之后再 GlobalFree 就是双释放，这是这一族 bug 的固定结局。
+        // 清空失败 ⇒ 用户的剪贴板还原样在、这两块内存仍是我们自己的：必须释放。
+        // （`SetClipboardData` 只有**成功**才接手所有权 —— 这一族 bug 的固定结局是双释放。）
+        if let Err(e) = EmptyClipboard() {
+            if let Some((_, hp)) = h_png {
+                let _ = GlobalFree(Some(hp));
+            }
+            let _ = GlobalFree(Some(h_dib));
+            return Err(format!("清空剪贴板失败：{e}"));
+        }
+        // 从这一行起用户原来的内容**已经没了**。所以后面失败的症状不是"没复制上"，
+        // 而是"原内容被擦掉、新内容也没进去" —— 这个残口按第 63 轮的口径**接受**：
+        // 回灌要在每次复制都留一份全局内存副本，代价大于它救的那几个场景。
+        // 但必须出声，否则用户只知道"粘出来是空的"。
         if let Err(e) = SetClipboardData(CF_DIB, Some(HANDLE(h_dib.0))) {
             if let Some((_, hp)) = h_png {
                 let _ = GlobalFree(Some(hp));
             }
             let _ = GlobalFree(Some(h_dib));
+            tracing::error!(
+                "剪贴板已清空却什么都没写进去（用户原来的内容没了，这次截图也没复制上）：{e}"
+            );
             return Err(format!("写入剪贴板失败：{e}"));
         }
         // PNG 是加分项：它失败不该让整次截图算失败（CF_DIB 已经进了剪贴板）。
