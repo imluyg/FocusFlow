@@ -83,14 +83,14 @@ fn run(args: &[String]) -> i32 {
                 eprintln!("用法: --stats-year <年份>");
                 return 1;
             }
-            match args[1].parse::<i32>() {
+            match parse_stats_year(&args[1]) {
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    1
+                }
                 Ok(year) => {
                     let db = db::Database::init_readonly();
                     print_year_stats(&db, year)
-                }
-                Err(_) => {
-                    eprintln!("无效的年份: {}", args[1]);
-                    1
                 }
             }
         }
@@ -208,21 +208,14 @@ fn run(args: &[String]) -> i32 {
                         focusflow_core::paths::data_dir().display()
                     );
                     let report = db::maintenance::cleanup_old_data(days);
-                    println!(
-                        "已删除 {days} 天前的记录 {} 条",
-                        fmt_thousands(report.deleted)
-                    );
-                    if report.incomplete() {
-                        // 「已删除 0 条」以前既可能是真没得删、也可能是每个库都没打开、
-                        // 还可能是一个库都没枚举到，三者回报一模一样，于是 GUI 开着跑清理
-                        // 会假装成功
-                        eprintln!(
-                            "清理未完成：{}（已回滚的年份未删的行还在；原因见日志）",
-                            report.why_incomplete()
-                        );
-                        return 1;
+                    let (line, code) = cleanup_outcome(days, &report);
+                    // 成功那句话只属于成功：走 stdout；未完成走 stderr（这条是给计划任务用的）
+                    if code == 0 {
+                        println!("{line}");
+                    } else {
+                        eprintln!("{line}");
                     }
-                    0
+                    code
                 }
             }
         }
@@ -397,6 +390,10 @@ fn print_stats(_db: &db::Database, period: &str) -> i32 {
 
 /// 设备维度统计：各键鼠设备的输入次数与占比（独立口径，见 device_stats.rs）。
 fn print_devices(_db: &db::Database, period: &str) -> i32 {
+    if let Err(e) = check_years_readable() {
+        eprintln!("{e}");
+        return 1;
+    }
     let (total, devices, label) = match parse_period(period) {
         Err(e) => {
             eprintln!("{e}");
@@ -451,6 +448,10 @@ fn print_devices(_db: &db::Database, period: &str) -> i32 {
 
 /// 列出设备标识与展示名：便于手改 device_aliases.json 或配合 --rename-device。
 fn print_device_keys(_db: &db::Database) -> i32 {
+    if let Err(e) = check_years_readable() {
+        eprintln!("{e}");
+        return 1;
+    }
     let (total, devices) = db::get_device_stats(None, None);
     if devices.is_empty() {
         println!("暂无设备数据（设备统计从功能上线后开始积累）");
@@ -472,6 +473,12 @@ fn print_device_keys(_db: &db::Database) -> i32 {
 /// 给设备取别名：匹配 device_key、展示名或自动名的子串（区分大小写不敏感）。
 /// 别名给空字符串表示还原为自动名。
 fn rename_device(pattern: &str, alias: &str) -> i32 {
+    // 这条是"读一遍统计再写别名"：读不全时给出的匹配结果本身就是残缺的，
+    // 而用户会以为设备名改错了（不是没读到）。所以同样要先过这道闸。
+    if let Err(e) = check_years_readable() {
+        eprintln!("{e}");
+        return 1;
+    }
     let (_, devices) = db::get_device_stats(None, None);
     let needle = pattern.to_lowercase();
     let matched: Vec<&db::DeviceStat> = devices
@@ -516,7 +523,42 @@ fn rename_device(pattern: &str, alias: &str) -> i32 {
     }
 }
 
+/// `--stats-year` 先要回答"这一年能不能查"。
+///
+/// 三种"读不到"以前印成同一句「总活跃次数: 0」并退 0：清单列不出来、那一年的库
+/// 打不开、那一年真的没有库。前两种是**故障**（挂在计划任务上退 0 就是"每天准时
+/// 什么都不做却报告成功"），只有第三种才配得上一个 0。
+#[derive(Debug)]
+enum YearLookup {
+    /// 能查（不代表有数据 —— 那一年本身可能就是空的）
+    Queryable,
+    /// 这一年没有可查的年度库；带着现有年份清单
+    NoLibrary(Vec<i32>),
+    /// 读不出可靠清单
+    Unreadable(String),
+}
+
+/// 纯函数版判定，好让三种结局能被单测钉住（`check_years_readable` 要碰真库）。
+fn year_lookup(year: i32, readable: Result<Vec<i32>, String>) -> YearLookup {
+    match readable {
+        Err(e) => YearLookup::Unreadable(e),
+        Ok(known) if known.contains(&year) => YearLookup::Queryable,
+        Ok(known) => YearLookup::NoLibrary(known),
+    }
+}
+
 fn print_year_stats(_db: &db::Database, year: i32) -> i32 {
+    match year_lookup(year, check_years_readable()) {
+        YearLookup::Unreadable(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+        YearLookup::NoLibrary(known) => {
+            println!("  {year} 年没有可查的年度库（现有年份: {known:?}）");
+            return 0;
+        }
+        YearLookup::Queryable => {}
+    }
     let (total, stats) = db::get_stats(None, Some(year));
     println!("\n{}", "=".repeat(50));
     println!("  FocusFlow 活跃统计 - {year} 年度");
@@ -567,7 +609,13 @@ fn export(_db: &db::Database, fmt: &str) -> i32 {
         return 1;
     }
     let (total, stats) = db::get_stats(None, None);
-    let ok = match fmt {
+    // 导出文件名是相对路径 ⇒ 成败都要把**绝对位置**说出来：写到当前目录这件事，
+    // 对挂着计划任务的人来说从来不是显然的（当前目录可能是 System32）。
+    let target = match std::env::current_dir() {
+        Ok(dir) => dir.join(&filepath),
+        Err(_) => filepath.clone(),
+    };
+    let outcome = match fmt {
         "csv" => export_csv(&filepath, total, &stats),
         "html" => export_html(&filepath, total, &stats),
         other => {
@@ -575,12 +623,18 @@ fn export(_db: &db::Database, fmt: &str) -> i32 {
             return 1;
         }
     };
-    if ok {
-        println!("已导出到: {}", filepath.display());
-        0
-    } else {
-        println!("导出失败");
-        1
+    match outcome {
+        Ok(()) => {
+            println!("已导出到: {}", target.display());
+            0
+        }
+        // 失败的话要说在 stderr，并带上 OS 给的原因和写不出去的那个位置：
+        // 旧写法 `.is_ok()` 把错误丢了，`println!("导出失败")` 连目录都不给，
+        // 而"当前目录没权限"与"盘满了"用户完全无从区分。
+        Err(e) => {
+            eprintln!("导出失败（目标 {}）: {e}", target.display());
+            1
+        }
     }
 }
 
@@ -588,7 +642,7 @@ fn export_csv(
     path: &std::path::Path,
     total: i64,
     stats: &std::collections::HashMap<String, i64>,
-) -> bool {
+) -> Result<(), String> {
     use std::io::Write;
     let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
     sorted.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
@@ -610,20 +664,20 @@ fn export_csv(
         // 键名可能来自导入的旧库（含逗号/引号/公式前缀），必须转义，否则 CSV 串列
         out.push_str(&format!("{rank},{},{count},{percent}\n", csv_field(key)));
     }
-    std::fs::File::create(path)
-        .and_then(|mut f| {
-            // 带 BOM，Excel 打开中文不乱码
-            f.write_all(b"\xef\xbb\xbf")?;
-            f.write_all(out.as_bytes())
-        })
-        .is_ok()
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(path)?;
+        // 带 BOM，Excel 打开中文不乱码
+        f.write_all(b"\xef\xbb\xbf")?;
+        f.write_all(out.as_bytes())
+    })();
+    written.map_err(|e| format!("写 {} 失败: {e}", path.display()))
 }
 
 fn export_html(
     path: &std::path::Path,
     total: i64,
     stats: &std::collections::HashMap<String, i64>,
-) -> bool {
+) -> Result<(), String> {
     let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
     sorted.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
     let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -682,7 +736,7 @@ fn export_html(
 </html>"#,
         fmt_thousands(total)
     );
-    std::fs::write(path, html).is_ok()
+    std::fs::write(path, html).map_err(|e| format!("写 {} 失败: {e}", path.display()))
 }
 
 /// `--cleanup <保留天数>` 的取值口径：必须落在 1..=3660。
@@ -741,10 +795,58 @@ fn reset(_db: &db::Database) -> i32 {
     0
 }
 
+/// `--stats-year <年份>` 的取值口径：1970..=9999。
+///
+/// 旧代码只 `parse::<i32>()`，于是 `--stats-year 0`、`-5`、`99999` 都能进去跑一圈，
+/// 而给出来的却是与"那一年真的没数据"一模一样的那句「总活跃次数: 0」+ 退 0。
+/// 1970 之下更糟：那一年的 `day_key` 是**负数**，而按日期归档与按日查询都不认负
+/// `day_key`（见 core 的 `day_key_to_date`）；年份本身还是文件名的一部分
+/// （`focusflow_2026.db`），四位数之外连库都拼不出来。
+fn parse_stats_year(raw: &str) -> Result<i32, String> {
+    let year = raw
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| format!("无效的年份: {raw}（需要 1970..=9999 的四位数字）"))?;
+    if !(1970..=9999).contains(&year) {
+        return Err(format!(
+            "年份 {year} 不在可查范围（1970..=9999）内：早于 1970 的日期在这套库里是负的 day_key，\
+             归档与按日查询都不认"
+        ));
+    }
+    Ok(year)
+}
+
+/// `--cleanup` 的结论：**先**判有没有失败，再决定说哪句话。
+///
+/// 旧写法把「已删除 N 条」排在 `incomplete()` 之前，于是一轮"每个库都没打开"的清理
+/// 也会先往 stdout 打出「已删除 30 天前的记录 0 条」—— 看着就是成功，而这条命令是
+/// 挂在计划任务上的（第 57 轮 `c4aee24` 已经定过口径：结论必须带上失败项）。
+/// 返回（要打的那句, 退出码）。
+fn cleanup_outcome(days: i64, report: &db::maintenance::MaintenanceReport) -> (String, i32) {
+    if report.incomplete() {
+        (
+            format!(
+                "清理未完成：{}（已回滚的年份未删的行还在；原因见日志）",
+                report.why_incomplete()
+            ),
+            1,
+        )
+    } else {
+        (
+            format!(
+                "已删除 {days} 天前的记录 {} 条",
+                fmt_thousands(report.deleted)
+            ),
+            0,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{export_csv, export_html};
-    use super::{parse_keep_days, parse_period, Period};
+    use super::{cleanup_outcome, export_csv, export_html, year_lookup, YearLookup};
+    use super::{parse_keep_days, parse_period, parse_stats_year, Period};
+    use focusflow_core::db::maintenance::MaintenanceReport;
 
     /// `--cleanup` 的天数口径：0 / 负数 / 非整数 / 大得离谱都要在入口挡住。
     ///
@@ -807,8 +909,8 @@ mod tests {
         let _ = std::fs::remove_file(&csv);
         let _ = std::fs::remove_file(&html);
 
-        assert!(export_csv(&csv, 10, &stats), "CSV 导出应成功");
-        assert!(export_html(&html, 10, &stats), "HTML 导出应成功");
+        export_csv(&csv, 10, &stats).expect("CSV 导出应成功");
+        export_html(&html, 10, &stats).expect("HTML 导出应成功");
 
         let csv_text = std::fs::read_to_string(&csv).expect("读 CSV");
         assert!(csv_text.contains("\"a,b\""), "逗号字段应加引号: {csv_text}");
@@ -858,6 +960,159 @@ mod tests {
                  只排次数 = 同分键谁进榜随 HashMap 种子变",
                 n + 1
             );
+        }
+    }
+    /// 年份取值要夹住。旧代码只要 `parse::<i32>()` 成功就用，于是 `--stats-year 0`、
+    /// `-5`、`99999` 一路跑完，给出的却是与"那一年真的没数据"同一句话。
+    #[test]
+    fn stats_year_argument_is_bounded() {
+        assert_eq!(parse_stats_year("2025"), Ok(2025));
+        assert_eq!(
+            parse_stats_year(" 2026 "),
+            Ok(2026),
+            "首尾空格是命令行常见写法"
+        );
+        assert_eq!(parse_stats_year("1970"), Ok(1970), "边界本身合法");
+        assert_eq!(parse_stats_year("9999"), Ok(9999), "边界本身合法");
+        for bad in ["0", "-5", "1969", "10000", "999999", "abc", "", " ", "20.5"] {
+            assert!(parse_stats_year(bad).is_err(), "{bad} 应当被拒绝");
+        }
+        // 文案要能分清"不是数字"与"数字超出可查范围"
+        assert!(parse_stats_year("abc").unwrap_err().contains("无效的年份"));
+        assert!(
+            parse_stats_year("1969")
+                .unwrap_err()
+                .contains("不在可查范围"),
+            "实得: {}",
+            parse_stats_year("1969").unwrap_err()
+        );
+    }
+
+    /// 导出失败必须说出**哪个文件**与 OS 给的原因。
+    ///
+    /// 旧写法是 `.is_ok()`：错误当场丢掉，调用方只能印一句"导出失败"，还在 stdout，
+    /// 也不说写到哪儿去了 —— 而"当前目录没权限"与"盘满了"是完全不同的两件事，
+    /// 计划任务里前者天天坏、后者某天突然坏，用户看到的都是同样四个字。
+    #[test]
+    fn a_failed_export_names_the_file_and_the_os_error() {
+        let mut stats: HashMap<String, i64> = HashMap::new();
+        stats.insert("键盘".to_string(), 7);
+        let dir = std::env::temp_dir().join(format!("ff_cli_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("造临时目录");
+        // 夹具：把一个目录摆在要写的位置上，File::create 与 fs::write 都会失败
+        let blocked = dir.join("out.csv");
+        std::fs::create_dir_all(&blocked).expect("把 csv 目标做成一个目录");
+        let e = export_csv(&blocked, 7, &stats).expect_err("目标是个目录时必须失败");
+        assert!(
+            e.contains(&blocked.display().to_string()),
+            "要说清楚写不出去的是哪个文件，实得: {e}",
+        );
+        assert!(e.len() > 20, "还得带上 OS 给的原因，实得: {e}");
+        let blocked_html = dir.join("out.html");
+        std::fs::create_dir_all(&blocked_html).expect("把 html 目标做成一个目录");
+        let e2 = export_html(&blocked_html, 7, &stats).expect_err("同上");
+        assert!(e2.contains("out.html"), "实得: {e2}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 「已删除 N 条」只能在**没有失败项**的时候说。
+    ///
+    /// 旧写法把成功句排在 `report.incomplete()` 之前 ⇒ 一轮"每个库都没打开"的清理
+    /// 也会先往 stdout 打出「已删除 30 天前的记录 0 条」，挂在计划任务上就是成功。
+    #[test]
+    fn cleanup_says_success_only_when_nothing_failed() {
+        let ok = MaintenanceReport {
+            deleted: 12,
+            failed_years: vec![],
+            dir_error: None,
+        };
+        let (line, code) = cleanup_outcome(30, &ok);
+        assert_eq!(code, 0);
+        assert!(
+            line.contains("已删除") && line.contains("12"),
+            "实得: {line}"
+        );
+
+        // 部分失败：这一句绝不能出现
+        let partial = MaintenanceReport {
+            deleted: 0,
+            failed_years: vec![2025],
+            dir_error: None,
+        };
+        let (line, code) = cleanup_outcome(30, &partial);
+        assert_eq!(code, 1);
+        assert!(
+            !line.contains("已删除"),
+            "没做成的那一轮不能报删除数，实得: {line}"
+        );
+        assert!(
+            line.contains("未完成") && line.contains("2025"),
+            "实得: {line}"
+        );
+
+        // 连目录都列不出来：一套库都没碰
+        let nodir = MaintenanceReport {
+            deleted: 0,
+            failed_years: vec![],
+            dir_error: Some("读取数据目录失败".to_string()),
+        };
+        let (line, code) = cleanup_outcome(30, &nodir);
+        assert_eq!(code, 1, "目录读不出来不是「没东西可删」");
+        assert!(!line.contains("已删除"), "实得: {line}");
+    }
+
+    /// 七条读命令都必须先过 `check_years_readable`。
+    ///
+    /// 这道闸原先只罩着其中三条，剩下四条把"读不到"折成 0 / 空表照样印出来并退 0。
+    /// 与本文件那条排名守卫同一个理由：**这个 crate 的覆盖面要在这儿自己盯住**，
+    /// 桌面侧的用例管不到它，而"加了一条读命令却忘了出声"是这条线上反复出现的漏法。
+    #[test]
+    fn every_cli_read_command_checks_the_years_are_readable() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
+        let readers = [
+            "print_stats",
+            "print_year_stats",
+            "print_list_years",
+            "print_devices",
+            "print_device_keys",
+            "rename_device",
+            "export",
+        ];
+        for name in readers {
+            let at = prod
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("读命令的函数不见了: {name}"));
+            let rest = &prod[at..];
+            let end = rest[1..].find("\nfn ").map(|n| n + 1).unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains("check_years_readable"),
+                "{name} 没有先问年度库读不读得动 —— 它会对着读不到的库印一个自信的数字并退 0",
+            );
+        }
+    }
+    /// `--stats-year` 的三种"读不到"必须是三句不同的话。
+    ///
+    /// 旧写法把它们全印成同一句「总活跃次数: 0」并退 0 —— 一个分不清"没有数据"与
+    /// "读不到数据"的诊断命令，正是这仓库产出最高的一类 bug。
+    #[test]
+    fn a_year_that_cannot_be_read_is_not_reported_as_an_empty_year() {
+        assert!(matches!(
+            year_lookup(2026, Ok(vec![2026, 2025])),
+            YearLookup::Queryable
+        ));
+        match year_lookup(2024, Ok(vec![2026, 2025])) {
+            YearLookup::NoLibrary(known) => {
+                assert_eq!(known, vec![2026, 2025], "要把可选的年份一起说出来");
+            }
+            other => panic!("没有库要报 NoLibrary，实得 {other:?}"),
+        }
+        let bad = "这些年度库打不开，它们的计数不会出现在结果里: [2025]";
+        match year_lookup(2025, Err(bad.to_string())) {
+            YearLookup::Unreadable(e) => assert_eq!(e, bad),
+            other => panic!("读不动要报 Unreadable（它不是\"没有数据\"），实得 {other:?}"),
         }
     }
 }
