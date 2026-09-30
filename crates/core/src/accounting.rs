@@ -201,7 +201,47 @@ pub fn init_db() -> anyhow::Result<()> {
             )?;
         }
     }
+    // 把历史行里没补零的 purchase_date 补齐成这一列的尺子（见函数注释）
+    heal_purchase_date_format(&conn)?;
     Ok(())
+}
+
+/// 一次性把库里**格式不对**的 `purchase_date` 写成这一列声明的尺子（补零形态）。
+///
+/// 为什么要在 `init_db` 里做：这一列的所有读侧都是**字符串**比较（`LIKE 'YYYY-MM%'`、
+/// `>=`/`<=`、`ORDER BY`），少一个零的那一行在月度合计与日期区间里永久隐身，却照常
+/// 进分类盈亏（那条 SQL 不看日期）—— 同一个数两本账。写入侧从 2026-09-27 起才规范化，
+/// 所以旧库、以及"整份导入 Python 时代的账本"里那种行是真实存在过的。
+///
+/// 认不出来的值（含空串）**原样留着**：这是补齐格式，不是替用户猜一个日期。
+fn heal_purchase_date_format(conn: &Connection) -> anyhow::Result<usize> {
+    let fixed: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, purchase_date FROM expenses")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, raw) = row?;
+            if let Some(norm) = normalize_date_filter(&raw) {
+                if norm != raw {
+                    out.push((id, norm));
+                }
+            }
+        }
+        out
+    };
+    for (id, norm) in &fixed {
+        conn.execute(
+            "UPDATE expenses SET purchase_date=?1 WHERE id=?2",
+            rusqlite::params![norm, id],
+        )?;
+    }
+    if !fixed.is_empty() {
+        tracing::warn!(
+            "补齐了 {} 行 purchase_date 的格式（它们此前在月度合计与日期区间里查不到）",
+            fixed.len()
+        );
+    }
+    Ok(fixed.len())
 }
 
 fn row_to_expense(r: &rusqlite::Row<'_>) -> rusqlite::Result<Expense> {
@@ -227,6 +267,16 @@ fn row_to_expense(r: &rusqlite::Row<'_>) -> rusqlite::Result<Expense> {
 /// 静默算 0 —— 记录在列表里看得见、钱却怎么也对不上。挡在写入口比在读侧猜意图便宜。
 const EXPENSE_TYPES: [&str; 2] = ["支出", "收入"];
 
+/// 分类的「适用方向」合法值 —— **不是** [`EXPENSE_TYPES`] 那一组。
+///
+/// 两串中文是**流水**的收支（写进 `expenses.type`，被合计 SQL 按字面量比较）；
+/// 这三个英文串是**分类**的取值，来源是面板的三个选项
+/// （`accounting_plugin.lua` 的 expense/income/both）与预置分类 `DEFAULT_CATEGORIES`。
+/// 原先这一列收任意字符串：打错的值既不会报错，也不会生效 —— 它只在插件的标签
+/// 兜底里被显示成「双向」（`t == "income" and 收入 or (t == "expense" and 支出 or 双向")`），
+/// 于是用户以为改了类型，实际那行永远是"双向"。
+const CATEGORY_TYPES: [&str; 3] = ["expense", "income", "both"];
+
 /// 添加记账记录，返回 id。
 #[allow(clippy::too_many_arguments)]
 pub fn add_expense(
@@ -248,10 +298,17 @@ pub fn add_expense(
         tracing::warn!("记账类型「{rtype}」不在允许值里（支出/收入），这条没写进去");
         return -1;
     }
-    let date = match normalize_write_date(purchase_date) {
+    // 日期尺子与读侧同一把（见 `normalize_date_filter`）。**空串也拒**：原先空值
+    // 原样落库（`purchase_date TEXT NOT NULL` 容得下 `""`），因为**面板**自己会在
+    // 提交前填今天 —— 那是面板的私有知识，不是宿主的契约。宿主收下空值就等于允许
+    // 任何调用方写出一行"对月度合计与日期区间隐身、却照常进分类盈亏"的账。
+    // 要"今天"就自己算好传进来。
+    let date = match normalize_date_filter(purchase_date) {
         Some(d) => d,
         None => {
-            tracing::warn!("记账日期「{purchase_date}」不是可识别的日期，这条没写进去");
+            tracing::warn!(
+                "记账日期「{purchase_date}」不是可识别的日期（空值也算不可识别），这条没写进去"
+            );
             return -1;
         }
     };
@@ -281,18 +338,6 @@ pub fn add_expense(
     }
 }
 
-/// 写入侧的日期归一：把 `"2026-9-1"` 补成 `"2026-09-01"`，空串原样留给调用方。
-///
-/// 读侧全是**字符串**比较（`LIKE '2026-09%'`、`purchase_date >= ?`、`ORDER BY`），
-/// 少一个零的记录会在列表里永远可见、却不在任何月度合计里。尺子与
-/// [`normalize_date_filter`] 同一把（那是筛选侧已经认下来的几种写法）。
-fn normalize_write_date(raw: &str) -> Option<String> {
-    if raw.trim().is_empty() {
-        return Some(String::new());
-    }
-    normalize_date_filter(raw)
-}
-
 /// 更新记账记录。
 pub fn update_expense(id: i64, e: &Expense) -> bool {
     let conn = match open() {
@@ -305,8 +350,8 @@ pub fn update_expense(id: i64, e: &Expense) -> bool {
         return false;
     }
     // 老库里一条日期没补零的记录，用户改个名字顺手就被修成补零形态（而不是被拒）；
-    // 真正认不出来的日期才报错。
-    let date = match normalize_write_date(&e.purchase_date) {
+    // 认不出来或空值才报错（空值被拒的理由见 `add_expense`）。
+    let date = match normalize_date_filter(&e.purchase_date) {
         Some(d) => d,
         None => {
             tracing::warn!(
@@ -378,6 +423,12 @@ pub fn get_expenses_by_date(date: &str) -> Vec<Expense> {
     }
 }
 
+/// 分类类型的写入侧闸：trim 后必须落在 [`CATEGORY_TYPES`] 里，否则 None。
+fn normalize_category_type(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    CATEGORY_TYPES.contains(&t).then(|| t.to_string())
+}
+
 /// 添加分类。
 pub fn add_category(name: &str, ctype: &str, subs: &[String]) -> i64 {
     // trim + 拒空。空名以前真能建出来（`categories` 只有 NOT NULL + UNIQUE），
@@ -391,6 +442,17 @@ pub fn add_category(name: &str, ctype: &str, subs: &[String]) -> i64 {
         tracing::warn!("分类名为空，已拒绝创建（空名会成为一个在界面上删不掉的分类）");
         return -1;
     }
+    // 类型也走白名单（见 `CATEGORY_TYPES`）：原先任意字符串都能落库，而它唯一的
+    // 症状是"这个分类在界面上永远显示双向"—— 插件的标签兜底臂把不认识的值都念成双向。
+    let ctype = match normalize_category_type(ctype) {
+        Some(t) => t,
+        None => {
+            tracing::warn!(
+                "分类类型「{ctype}」不在允许值里（expense/income/both），分类 [{name}] 没建"
+            );
+            return -1;
+        }
+    };
     let conn = match open() {
         Ok(c) => c,
         Err(_) => return -1,
@@ -452,6 +514,22 @@ pub fn update_category(old_name: &str, new_name: &str, ctype: Option<&str>) -> (
     if dup {
         return (false, format!("分类 [{new_name}] 已存在"));
     }
+    // 类型传了就校验（同 `add_category`）：原先打错的值会照样落库，而它的症状只是
+    // 界面上那个分类永远显示「双向」。
+    let ctype = match ctype {
+        Some(t) => match normalize_category_type(t) {
+            Some(norm) => Some(norm),
+            None => {
+                return (
+                    false,
+                    format!(
+                        "分类类型「{t}」不在允许值里（expense/income/both），[{old_name}] 没改"
+                    ),
+                )
+            }
+        },
+        None => None,
+    };
     // 两条 UPDATE 必须同事务：分类表改了名而 expenses 没跟上时，
     // 按分类筛选会一条都查不出来，而界面已经提示"更新成功"。
     // 显式 BEGIN IMMEDIATE：立刻拿写锁，失败就明确报错，绝不部分更新。
@@ -512,13 +590,19 @@ pub fn delete_category(name: &str) -> (bool, String) {
 
 /// 修改分类类型（expense/income/both）。
 pub fn update_category_type(name: &str, ctype: &str) -> bool {
+    let Some(norm) = normalize_category_type(ctype) else {
+        tracing::warn!(
+            "分类类型「{ctype}」不在允许值里（expense/income/both），分类 [{name}] 没改"
+        );
+        return false;
+    };
     let conn = match open() {
         Ok(c) => c,
         Err(_) => return false,
     };
     conn.execute(
         "UPDATE categories SET type=?1 WHERE name=?2",
-        rusqlite::params![ctype, name],
+        rusqlite::params![norm, name],
     )
     .map(|n| n > 0)
     .unwrap_or(false)
@@ -1162,7 +1246,13 @@ pub fn days_ago(ids: &[i64]) -> Vec<(i64, i64, i64)> {
         if let Ok(mut rows) = stmt.query([id]) {
             if let Ok(Some(row)) = rows.next() {
                 if let (Ok(rid), Ok(date_str)) = (row.get::<_, i64>(0), row.get::<_, String>(1)) {
-                    if let Ok(date) = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
+                    // 尺子用本列声明的那把（`normalize_date_filter`）。原先这里用严格
+                    // `%Y-%m-%d`：实测它**能**解 `2026-9-1`（chrono 的数字位宽是弹性的），
+                    // 却只认破折号分隔 —— `2026/9/1`、`2026.9.1`、`20260901` 这些本列
+                    // 承认的写法在它眼里等于"没有日期"，那一行就在"距今多久"里隐身。
+                    let parsed = normalize_date_filter(&date_str)
+                        .and_then(|norm| chrono::NaiveDate::parse_from_str(&norm, "%Y-%m-%d").ok());
+                    if let Some(date) = parsed {
                         let (years, rest) = years_and_days(date, today);
                         out.push((rid, years, rest));
                     }
@@ -1650,10 +1740,175 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(rows, 1, "被拒的三条一条都不能留在库里，实得 {rows}");
-        // 反向腿：空日期仍然允许（面板自己会填今天），不能被这道闸顺手打死
-        assert!(add_expense("收入", "没日期", None, "", 5.0, None, None, None) > 0);
+        // 反向腿（第 63 轮改口）：空日期现在也**拒**。原先放行是因为面板提交前
+        // 自己会填今天 —— 那是面板的私有知识；宿主收下空值就等于允许任何调用方
+        // 写出一行"对月度合计与日期区间隐身、却照常进分类盈亏"的账。
+        assert_eq!(
+            add_expense("收入", "没日期", None, "", 5.0, None, None, None),
+            -1,
+            "空日期不是一个合法日期"
+        );
         assert!(add_expense("支出", "斜杠日期", None, "2026/9/3", 3.0, None, None, None) > 0);
         assert_eq!(monthly_summary("2026-09").0, 15.0, "斜杠写法也要落进九月");
+    }
+
+    /// 分类的 `ctype` 原先收任意字符串：既不报错也不生效，唯一的症状是面板上那个
+    /// 分类永远显示「双向」（插件的标签兜底臂把不认识的值念成双向）。
+    /// 合法域是 `expense/income/both` —— **不是** [`EXPENSE_TYPES`] 那两串中文，
+    /// 那是流水的收支；拿它当分类白名单会把面板的三个选项与预置分类一起拒掉。
+    #[test]
+    fn category_type_is_whitelisted_at_every_write_door() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_ctype");
+        init_db().expect("建库失败");
+
+        // 先钉合法域本身：预置分类必须全部过闸，否则这道闸会把默认值自己拒掉
+        for (name, ctype, _) in DEFAULT_CATEGORIES {
+            assert!(
+                CATEGORY_TYPES.contains(ctype),
+                "预置分类 [{name}] 的类型「{ctype}」不在白名单里"
+            );
+        }
+
+        assert!(add_category("食品", "expense", &[]) > 0);
+        assert_eq!(
+            add_category("交通", "支出", &[]),
+            -1,
+            "流水那两串中文不是分类类型"
+        );
+        assert_eq!(
+            add_category("交通", "typo", &[]),
+            -1,
+            "打错的值不能默默落库"
+        );
+        assert!(
+            get_all_categories().iter().all(|c| c.name != "交通"),
+            "被拒的分类一条都不能留在库里"
+        );
+        assert!(add_category("交通", "both", &[]) > 0, "换个合法值照常建");
+
+        // 三个写入口都要挡，且被拒的那次不能改到原值
+        assert!(!update_category_type("食品", "支出"));
+        assert_eq!(
+            category_type("食品").as_deref(),
+            Some("expense"),
+            "被拒的那次不该已经把库改了"
+        );
+        assert!(update_category_type("食品", "income"));
+        assert_eq!(category_type("食品").as_deref(), Some("income"));
+        let (ok, msg) = update_category("交通", "交通", Some("双向"));
+        assert!(!ok, "中文名不是合法分类类型: {msg}");
+        assert_eq!(
+            category_type("交通").as_deref(),
+            Some("both"),
+            "被拒的那次不该已经把库改了"
+        );
+        // 正向腿：带空格但合法的取值照常收（与分类名同口径的 trim）
+        let (ok, msg) = update_category("交通", "交通", Some(" expense "));
+        assert!(ok, "trim 之后合法就该收: {msg}");
+        assert_eq!(category_type("交通").as_deref(), Some("expense"));
+    }
+
+    /// 同一列只该有一把日期尺子。
+    ///
+    /// 回归两半：
+    /// 1. `days_ago` 原先用 `%Y-%m-%d` 解析 `purchase_date`，而这一列声明的尺子是
+    ///    [`normalize_date_filter`]。实测前者**能**解没补零的 `2026-9-1`（chrono 数字
+    ///    位宽弹性），却只认破折号分隔 ⇒ `2026/9/1`、`20260901` 这类行在"距今多久"里隐身。
+    /// 2. 更要紧的是这一列**所有**读侧都是字符串比较（`LIKE 'YYYY-MM%'`、`>=`/`<=`、
+    ///    `ORDER BY`）⇒ 没补零的行在月度合计与日期区间里隐身，却照常进分类盈亏
+    ///    （那条 SQL 不看日期）—— 同一个数两本账。修法：读侧换成同一把尺子，
+    ///    并由 `init_db` 把历史行补齐成补零形态。
+    #[test]
+    fn one_date_ruler_for_the_column_days_ago_and_the_backfill() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_ruler");
+        init_db().expect("建库失败");
+
+        // 绕过写入侧的规范化，造出旧库里那种两种形态（写入侧从 2026-09-27 起才规范化）
+        let (unpadded, slashed) = {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO expenses (type, item_name, purchase_date, amount, record_time)
+                 VALUES ('支出', '没补零', '2026-9-1', 12.0, '2026-09-01 08:00:00')",
+                [],
+            )
+            .expect("造一条没补零的历史行");
+            let a = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO expenses (type, item_name, purchase_date, amount, record_time)
+                 VALUES ('收入', '斜杠写法', '2026/9/2', 8.0, '2026-09-02 08:00:00')",
+                [],
+            )
+            .expect("造一条斜杠写法的历史行");
+            (a, conn.last_insert_rowid())
+        };
+        let stored = |id: i64| -> String {
+            let conn = open().unwrap();
+            conn.query_row(
+                "SELECT purchase_date FROM expenses WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            stored(unpadded),
+            "2026-9-1",
+            "前提：这一行真是没补零的旧形态"
+        );
+        assert_eq!(stored(slashed), "2026/9/2", "前提：这一行真是斜杠写法");
+
+        // 第一腿（读侧）：补齐之前这两行就该在「距今多久」里看得见
+        let seen: Vec<i64> = days_ago(&[unpadded, slashed])
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(
+            seen,
+            vec![unpadded, slashed],
+            "没补零与斜杠写法都不该在「距今多久」里隐身"
+        );
+
+        // 第二腿（症状）：这两行此刻对月度合计完全隐身（分类盈亏却照常算它们）
+        assert_eq!(
+            monthly_summary("2026-09").0,
+            0.0,
+            "前提：补齐之前这两笔不在九月合计里 —— 这就是「两本账」少掉的那一本"
+        );
+
+        // 第三腿（补齐）：再走一次 init_db 就该写成这一列的尺子
+        init_db().expect("init_db 要幂等");
+        assert_eq!(stored(unpadded), "2026-09-01");
+        assert_eq!(stored(slashed), "2026-09-02");
+        assert_eq!(
+            monthly_summary("2026-09").0,
+            12.0,
+            "补齐之后没补零那笔要落进九月合计（斜杠那笔是收入，不进支出侧）"
+        );
+        assert_eq!(monthly_summary("2026-09").1, 8.0, "收入侧同理");
+
+        // 认不出来的值原样留着：补齐格式不是清洗数据，不替用户猜一个日期
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO expenses (type, item_name, purchase_date, amount, record_time)
+                 VALUES ('支出', '垃圾行', '昨天', 9.0, '2026-09-01 08:00:00')",
+                [],
+            )
+            .expect("造一条认不出的行");
+        }
+        init_db().expect("第三次 init_db 仍要幂等");
+        let junk: String = {
+            let conn = open().unwrap();
+            conn.query_row(
+                "SELECT purchase_date FROM expenses WHERE item_name='垃圾行'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(junk, "昨天", "认不出的值不能被改掉");
     }
 
     /// 回归（第 23 轮）：`add_category` 撞重名时 `INSERT OR IGNORE` 整条忽略，紧接着
