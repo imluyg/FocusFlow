@@ -2206,7 +2206,20 @@ pub fn delete_key_today(key_name: &str) -> i64 {
 ///
 /// 幂等：启动时每次执行都安全，写入线程尚未开始，库为落盘后的权威状态。
 pub fn heal_daily_consistency() {
-    for year in queries::available_years() {
+    // 清单读不出来 ≠ "没有库需要修"。原先这一行用的是 `available_years()`（它把
+    // `read_dir` 的失败折成 `[]`），于是数据目录出问题的那一轮自愈**静默停摆**、
+    // 一行日志都没有 —— 而同一个函数里每一把库级失败都会 error!（"体检没做成不能
+    // 当成健康"），口径自相矛盾：坏在枚举上时反而最安静。
+    let years = match queries::try_available_years() {
+        Ok(years) => years,
+        Err(e) => {
+            tracing::error!(
+                "年度库列不出来，本轮一致性自愈什么都没做（不是都健康，是没读到）: {e}"
+            );
+            return;
+        }
+    };
+    for year in years {
         let path = paths::year_db_path(year);
         // 先用只读连接体检：健康的库（绝大多数）连写连接都不开，不产生 WAL 副作用、
         // 不拿写锁。此前无条件 open_rw + 两条相关子查询 UPDATE，每次启动都在每个
@@ -4557,6 +4570,34 @@ mod tests {
             logs.iter()
                 .any(|l| l.contains(&wild_dk.to_string()) && l.contains("超出可换算的日期范围")),
             "这一轮的失败必须出声（同文件探测失败那支就会 error!）: {logs:?}",
+        );
+    }
+    /// 年度库清单读不出来时，一致性自愈要**说出来**，不能静默当成「都健康」。
+    ///
+    /// 旧写法用的是 `available_years()`（它把 `read_dir` 的失败折成 `[]`），于是数据目录
+    /// 出问题的那一轮什么都不修、一行日志都没有；而同一个函数里每一把库级失败都会
+    /// error!（「体检没做成不能当成健康」）—— 坏在枚举那一步时反而最安静。
+    #[test]
+    fn heal_daily_consistency_says_so_when_the_year_list_cannot_be_read() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("heal_list_fail");
+        // 夹具：把数据目录的位置占成一个普通文件 ⇒ `read_dir` 必失败
+        //（与 `--reset` 那笔端到端跑过的同款形状）
+        let data = paths::data_dir();
+        // 先把它清掉：隔离目录里这个路径可能已经是个空目录（上一句才建的），
+        // 而往一个已存在的目录上写会得到 PermissionDenied，不是夹具想要的形状。
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::write(&data, "这不是目录").expect("占住数据目录的位置");
+        queries::invalidate_years_cache();
+        assert!(
+            queries::try_available_years().is_err(),
+            "前提：年度库清单要真的读不出来",
+        );
+
+        let ((), logs) = crate::logger::capture_logs(heal_daily_consistency);
+        assert!(
+            logs.iter().any(|l| l.contains("年度库列不出来")),
+            "读不出清单要出声，不能静默停摆（这一轮本来会修的偏差就没人管了）: {logs:?}",
         );
     }
 }
