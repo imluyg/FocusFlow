@@ -793,7 +793,8 @@ fn snapshot_recovery(state: &WriterState, take: bool) {
 /// 快照写的是 `agg ∪ 在途`，而那一批随后可能**成功落库** —— 文件继续留在盘上，
 /// 下次启动就会把同一批数据再回放一遍（落库是 `count = count + excluded` 的累加式，
 /// 没有去重键）。所以只能由"拿到结果的那个人"来收尾：
-/// - 落成了 → 内存里也没有未落库的增量了 → 删文件；
+/// - 落成了 → 内存里也没有未落库的增量了 → 把文件**中和成空增量再删**
+///   （只删不行：删不掉是常态，见 [`neutralize_recovery_file`]）；
 /// - 最终失败并已回填 → 那批仍在 agg 里 → 按当前内容重做快照（take 语义同 stop）。
 ///
 /// 没做过快照时（正常周期 flush）第一步就返回，不碰盘。
@@ -819,18 +820,55 @@ fn settle_after_stop_snapshot(state: &WriterState) {
     let agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
     if agg.is_empty() {
         drop(agg);
-        let path = recovery_path();
-        match std::fs::remove_file(&path) {
-            Ok(()) => tracing::info!("在途批次已确认落库，删除恢复文件 {}", path.display()),
-            // 快照根本没写出来（写失败时不取走，数据仍在内存），删不到东西是正常结果
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::error!("删除恢复文件失败 {}: {e}", path.display()),
-        }
+        neutralize_recovery_file();
         return;
     }
     drop(agg);
     tracing::warn!("在途批次最终没落库，按当前未落库增量重写恢复文件");
     snapshot_recovery(state, true);
+}
+
+/// 这批已经确认落库 ⇒ 让恢复文件再也回放不出东西，然后顺手删掉它。
+///
+/// **顺序刻成"先把内容中和成空增量，再删"，而不是只 `remove_file`。**
+/// 这台机器上"删不掉"是常态而不是意外：`maintenance.rs` 有一条按实测钉住的用例
+/// `a_readonly_handle_blocks_rename_and_delete_but_not_copy_or_overwrite`（`c0b7a44`）
+/// —— 别的进程握着句柄时 `rename` 与 `remove_file` 返回 os error 32，而**就地覆盖写
+/// 仍然成功**。原先那一支只删、失败就打一行 error 就返回，于是"这一次没删掉"直接
+/// 升级成"每次开机把同一批再加一遍"：落库是 `count = count + excluded` 的纯累加、
+/// 没有幂等键，多出来的量永久留在统计里，而且除了那行日志之外再没有任何痕迹。
+/// 上层 [`take_recovery`] 改不动这个结局 —— 它在"文件里的数据可能还没落库"那一侧
+/// 必须保住副本，能判断"已经落库了"的只有这里。
+fn neutralize_recovery_file() {
+    let path = recovery_path();
+    if !path.is_file() {
+        // 快照根本没写出来（写失败时不取走，数据一直在内存里）：没有要中和的东西
+        return;
+    }
+    let json = match serde_json::to_string(&AggDeltasFile::from(&AggDeltas::default())) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!("恢复文件的空内容序列化失败: {e} —— 下次启动可能把这批再加一遍");
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&path, json) {
+        tracing::error!(
+            "恢复文件中和失败 {}: {e} —— 这批已经落过库了，下次启动会把同一批再加一遍。\
+             请关掉握着这个文件的程序（杀软实时扫描、同步盘）之后删掉它。",
+            path.display()
+        );
+        return;
+    }
+    // 删不掉已经不影响正确性了，只是目录里多一个空壳
+    match std::fs::remove_file(&path) {
+        Ok(()) => tracing::info!("在途批次已确认落库，删除恢复文件 {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            "恢复文件已中和成空增量但删不掉 {}: {e}（不影响统计，回放它等于什么都不加）",
+            path.display()
+        ),
+    }
 }
 
 /// 读取恢复文件（启动回放）。
@@ -1828,6 +1866,95 @@ mod tests {
             "没有真的留下 kept 副本，就不能登记一个以后要删的路径"
         );
         assert!(path.exists(), "清不掉就留在原地，给人留一个能查的现场");
+    }
+
+    /// 一批**已经落库**的增量，碰上"删不掉的恢复文件"：内容必须被中和掉。
+    ///
+    /// 上面那条管的是 boot 侧（数据可能还没落库 ⇒ 宁可留在原地也不回放）。这条管镜像
+    /// 的另一半：数据**已经**在库里了，文件继续留着就等于下次启动把同一批再加一遍
+    /// —— 落库是纯累加、没有幂等键，多出来的量永久留在统计里。旧写法只 `remove_file`
+    /// 并在失败时打一行 error，也就是把"这次没删掉"升级成"以后每次都虚高"。
+    ///
+    /// 夹具的句柄要与上面那条分开：这里放行 读+写、只挡住 DELETE（同步盘/编辑器握着
+    /// 句柄就是这个形状），覆盖写还能活 —— 那正是"中和"这个修法能成立的前提。
+    /// `share_mode(1)` 那种连写都挡的句柄归上面那条管。
+    #[cfg(windows)]
+    #[test]
+    fn settling_a_landed_batch_neutralizes_a_recovery_file_that_cannot_be_deleted() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_settle_locked");
+
+        let path = recovery_path();
+        std::fs::create_dir_all(path.parent().unwrap()).expect("建 data 目录");
+        let dk = queries::day_key_of_date(chrono::Local::now().date_naive());
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"daily":[[{dk},5]],"hourly":[[{dk},3]],"keys":[[{dk},[["A",5]]]],"active":[],"apps":[],"devices":[],"device_keys":[],"last_ts":0}}"#
+            ),
+        )
+        .expect("写恢复文件");
+
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3) // FILE_SHARE_READ | FILE_SHARE_WRITE，不给 FILE_SHARE_DELETE
+            .open(&path)
+            .expect("占位句柄应能打开");
+        assert!(
+            std::fs::remove_file(&path).is_err(),
+            "夹具没成立：这个句柄挡不住删除，测不到「清不掉」那一支"
+        );
+        assert!(
+            std::fs::write(&path, "probe").is_ok()
+                && std::fs::read_to_string(&path)
+                    .map(|t| t == "probe")
+                    .unwrap_or(false),
+            "夹具过头：连覆盖写都挡住，那这条测的不是本函数能救的那个场景"
+        );
+        // 探针刚把内容写坏了，重新播一次
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"daily":[[{dk},5]],"hourly":[[{dk},3]],"keys":[[{dk},[["A",5]]]],"active":[],"apps":[],"devices":[],"device_keys":[],"last_ts":0}}"#
+            ),
+        )
+        .expect("重播恢复文件");
+
+        neutralize_recovery_file();
+
+        assert!(
+            path.exists(),
+            "删不掉是这条的前提；它要是被删掉了，本条只是碰巧绿的"
+        );
+        let text = std::fs::read_to_string(&path).expect("中和之后文件仍要可读（它没被删掉）");
+        let left: AggDeltasFile =
+            serde_json::from_str(&text).expect("留下的必须是个解析得开的空增量文件");
+        assert!(
+            left.daily.is_empty()
+                && left.hourly.is_empty()
+                && left.keys.is_empty()
+                && left.active.is_empty()
+                && left.apps.is_empty()
+                && left.devices.is_empty()
+                && left.device_keys.is_empty(),
+            "文件里还剩 daily={:?} —— 下次启动就把这批再加一遍",
+            left.daily
+        );
+    }
+
+    /// 没有兜底文件时不许**造**一个出来（快照写失败那一支：数据一直在内存里）。
+    #[test]
+    fn neutralizing_leaves_no_file_when_there_was_none_to_begin_with() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_settle_none");
+        let path = recovery_path();
+        assert!(!path.exists(), "夹具前提：这里本来不该有恢复文件");
+        neutralize_recovery_file();
+        assert!(
+            !path.exists(),
+            "没有文件时把「中和」做成了新建一个空文件 —— 那会让下次启动白读一趟"
+        );
     }
 
     /// `stop()` 超时快照**取走**的那一批只存在于文件里：在途批次落成之后，不许因为
