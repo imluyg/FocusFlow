@@ -1157,8 +1157,19 @@ fn snapshot_before_destructive(op: &str) {
         .get_int("database", "max_backups", 5)
         .max(1);
     match backup_database(max_backups) {
-        BackupOutcome::Done { count, .. } => {
-            tracing::info!("{op}: 已完成执行前快照（{count} 份）");
+        BackupOutcome::Done { count, failed, .. } => {
+            if failed.is_empty() {
+                tracing::info!("{op}: 已完成执行前快照（{count} 份）");
+            } else {
+                // 这一支原先打的是上面那句"已完成执行前快照"：一轮里 5 个年度库只备份
+                // 出 1 份（还是附属库）也算 Done，于是马上要 DELETE/清空的统计库
+                // 一份覆盖都没有，而日志说的正好相反。不阻断操作（口径不变：用户在 UI
+                // 主动发起），但这句必须比"成功"响。
+                tracing::error!(
+                    "{op}: 执行前快照只兜住了 {count} 份，这些库没备份出去: {failed:?} —— \
+                     接下来的破坏性操作在那些库上没有退路",
+                );
+            }
         }
         // 没东西可备份不是失败：刚装好/刚重置过的目录里本来就没有库。
         // 以前这一条走 `is_none()` → 打一条 error 说"快照失败"，是假警报。
@@ -1224,10 +1235,24 @@ static BACKUP_LOCK: Mutex<()> = Mutex::new(());
 ///   空目录上打出一条假警报（什么数据都没有，本来就没东西可备份）。
 #[derive(Debug)]
 pub enum BackupOutcome {
-    /// 至少写出一份通过校验的备份
+    /// 至少写出一份通过校验的备份 —— **但"至少一份"不等于"全都备份到了"**。
+    ///
+    /// `failed` 是这一轮里没能产出通过校验的备份的那些库（原先这个信息只进了
+    /// `tracing::error!`，返回值里没带出来）。少了它，"5 个年度库里 1 个备份成功、
+    /// 4 个失败"与"5 个全部成功"在调用方眼里是同一个结局，于是：
+    /// - 破坏性操作前的兜底快照会打出「已完成执行前快照（1 份）」，而那 1 份是附属库，
+    ///   **马上要被删掉的统计库一份覆盖都没有**，日志说的正好相反；
+    /// - `--backup` 与设置页的「立即备份」报"备份完成"并退 0；
+    /// - `clear_suspect_notes()` 会在那一轮把上一轮记下的异常说明删掉
+    ///   （原先那行注释写的就是"本轮全部通过校验"）。
+    ///
+    /// 轮转参数（`freeze`）这次刻意没动 —— 把"部分失败"也改成冻结是一条保留策略
+    /// （会让 backup/ 在长期备份失败时一直涨），该由维护者定。
     Done {
         first: std::path::PathBuf,
         count: usize,
+        /// 这一轮**没**产出通过校验的备份的库（年度库/附属库名）。空 = 全都备份到了。
+        failed: Vec<String>,
     },
     /// 没有该备份的东西：一套年度库都没有、附属库都不在，或历史库都与上次指纹一致
     NothingToDo,
@@ -1236,6 +1261,21 @@ pub enum BackupOutcome {
 }
 
 impl BackupOutcome {
+    /// 这一轮是不是"该备份的都备份到了"（也就是：破坏性操作有没有兜住）。
+    ///
+    /// 收成函数是为了让上面那条判据有一个能断言的落点 —— 真正的"部分失败"要在测试里
+    /// 造出一轮"列得出来、却备份不动"的库（`try_available_years` 会把读不出聚合行的
+    /// 库整个排除掉，所以它压根不进 `failed`），那套夹具不是一行的事；
+    /// 而"结局被读成什么"这一步全部走这个函数，把它钉住就够挡住那个误读。
+    pub fn is_complete(&self) -> bool {
+        match self {
+            BackupOutcome::Done { failed, .. } => failed.is_empty(),
+            // `NothingToDo` 也算"兜住了"：目录里本来就没有库，破坏性操作没有要保护的东西
+            BackupOutcome::NothingToDo => true,
+            BackupOutcome::Failed { .. } => false,
+        }
+    }
+
     /// 只关心"第一份备份路径"的调用方（含测试）用的取法。
     pub fn first_path(self) -> Option<std::path::PathBuf> {
         match self {
@@ -1395,20 +1435,41 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
             );
             write_suspect_note(&timestamp, &detail);
             rotate_backups(policy, true);
-        } else {
+        } else if failed.is_empty() {
             // 本轮全部通过校验 —— 上一轮那条异常说明到此为止（见 clear_suspect_notes）
             clear_suspect_notes();
             rotate_backups(policy, false);
+        } else {
+            // 本轮有库没备份出去 ⇒ **不**清上一轮的异常说明：它记录的很可能就是同一只
+            // 握着句柄的手（杀软实时扫描 / 同步盘），在这一轮把它删掉等于销毁线索，
+            // 而删掉它的那行注释原先写的是"本轮全部通过校验"。
+            // 轮转仍走非冻结那一路，与修前完全一致 —— 改成冻结是一条保留策略，
+            // 见 `BackupOutcome::Done` 上那段。
+            tracing::warn!(
+                "本轮有 {} 个库没产出通过校验的备份，上一轮的异常说明先留着",
+                failed.len()
+            );
+            rotate_backups(policy, false);
         }
         let count = backed_up.len();
-        tracing::info!(
-            "已备份 {} 个数据库到 {}",
-            count,
-            paths::backup_dir().display()
-        );
+        if failed.is_empty() {
+            tracing::info!(
+                "已备份 {} 个数据库到 {}",
+                count,
+                paths::backup_dir().display()
+            );
+        } else {
+            tracing::error!(
+                "本轮只备份出 {} 个数据库到 {}，这些没成: {failed:?} ——\
+                 这一轮说「备份完成」是假的，破坏性操作别把它当兜底",
+                count,
+                paths::backup_dir().display()
+            );
+        }
         BackupOutcome::Done {
             first: backed_up.remove(0),
             count,
+            failed,
         }
     } else if !failed.is_empty() {
         BackupOutcome::Failed {
@@ -3401,6 +3462,47 @@ mod tests {
             2,
             "未冻结时按策略保留最近 2 份"
         );
+    }
+
+    /// `Done` 不等于"全都备份到了" —— 这条钉住那个区分（破坏性操作与 `--backup`
+    /// 的退出码都读它）。
+    ///
+    /// 真正的"部分失败"要在测试里造出一轮"列得出来、却备份不动"的库：
+    /// `try_available_years()` 会把读不出聚合行的库整个排除，所以它压根不进 `failed`，
+    /// 得搭一套"能打开、能数出行、复制过去却过不了校验"的夹具 —— 不是一行的事。
+    /// 而"这个结局被读成什么"全部经过 `is_complete()`，把它钉住就挡住了那个误读本身：
+    /// 下面两组 `count` 都大于 0（这正是原先唯一看得见的数），只有 `failed` 分得开。
+    #[test]
+    fn a_backup_round_that_missed_some_dbs_is_not_complete() {
+        let first = std::path::PathBuf::from("focusflow_2026_x.db");
+        let all_landed = BackupOutcome::Done {
+            first: first.clone(),
+            count: 5,
+            failed: Vec::new(),
+        };
+        let partial = BackupOutcome::Done {
+            first,
+            count: 1,
+            failed: vec!["2026 年库".to_string(), "device_stats".to_string()],
+        };
+        assert!(all_landed.is_complete(), "全部备份到了就该判成兜住了");
+        assert!(
+            !partial.is_complete(),
+            "只出 1 份、另有 2 个库失败的一轮不能判成兜住了 —— 它原先与上面那一组\
+             在调用方眼里是同一个结局（都只看 count > 0）"
+        );
+        assert!(
+            partial.first_path().is_some(),
+            "部分失败仍然有第一份路径可给：这条不是把 Done 判成 Failed"
+        );
+        assert!(
+            BackupOutcome::NothingToDo.is_complete(),
+            "本来就没有库要备份 ⇒ 破坏性操作没有要保护的东西"
+        );
+        assert!(!BackupOutcome::Failed {
+            reason: "一个都没成".to_string()
+        }
+        .is_complete());
     }
 
     /// 备份失败时不得留下半成品（半成品会占轮转名额、顶掉好备份）。

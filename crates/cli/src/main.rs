@@ -157,13 +157,28 @@ fn run(args: &[String]) -> i32 {
                 .get_int("database", "max_backups", 5)
                 .max(1);
             match db::maintenance::backup_database(max_backups) {
-                db::maintenance::BackupOutcome::Done { first, count } => {
+                db::maintenance::BackupOutcome::Done {
+                    first,
+                    count,
+                    failed,
+                } => {
                     println!("备份完成: {}（共 {count} 份）", first.display());
                     println!(
                         "  目录: {}（已停用插件的数据会跳过）",
                         focusflow_core::paths::backup_dir().display()
                     );
-                    0
+                    if failed.is_empty() {
+                        0
+                    } else {
+                        // 部分成功必须退非 0：这条是给计划任务用的，而"5 个库里只备份出
+                        // 1 个"在退出码上一直读成成功 —— `Done` 原先不带 `failed`，
+                        // 调用方根本没有信息可以区分。
+                        eprintln!(
+                            "备份不完整: 这些库没能产出通过校验的备份: {failed:?}\
+                             （已经备份到的 {count} 份仍然有效）"
+                        );
+                        1
+                    }
                 }
                 // 没东西可备份不是失败：挂计划任务时退 1 会让用户以为天天在坏，
                 // 而真失败的那一次也混在同一句话里看不出来

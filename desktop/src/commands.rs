@@ -595,8 +595,19 @@ pub async fn do_backup(state: State<'_, Arc<AppState>>) -> Result<String, String
         db.flush(true);
         use focusflow_core::db::maintenance::BackupOutcome;
         match focusflow_core::db::maintenance::backup_database(max_backups) {
-            BackupOutcome::Done { first, count } => {
-                Ok(format!("{}（共 {count} 份）", first.display()))
+            BackupOutcome::Done {
+                first,
+                count,
+                failed,
+            } => {
+                let line = format!("{}（共 {count} 份）", first.display());
+                if failed.is_empty() {
+                    Ok(line)
+                } else {
+                    // 部分成功不能报成一句"备份完成"：设置页那个按钮按下去就是想知道
+                    // 有没有兜住，而少掉的那些恰恰是统计库
+                    Ok(format!("{line}；但这些没备份出去：{failed:?}"))
+                }
             }
             BackupOutcome::NothingToDo => Err("没有需要备份的数据库".to_string()),
             BackupOutcome::Failed { reason } => Err(reason),
