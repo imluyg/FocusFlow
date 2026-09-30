@@ -15,7 +15,7 @@ pub fn export_csv(
     stats: &HashMap<String, i64>,
 ) -> anyhow::Result<()> {
     let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(a.1));
+    sorted.sort_by(|a, b| crate::state::cmp_rank_desc(a.0, a.1, b.0, b.1));
     let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut out = String::new();
     out.push_str("# FocusFlow 键鼠活跃统计导出\n");
@@ -47,7 +47,7 @@ pub fn export_html(
     stats: &HashMap<String, i64>,
 ) -> anyhow::Result<()> {
     let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(a.1));
+    sorted.sort_by(|a, b| crate::state::cmp_rank_desc(a.0, a.1, b.0, b.1));
     let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut rows = String::new();
     let mut rank = 0;
@@ -325,7 +325,7 @@ pub fn write_weekly_report_for(
 
     out.push_str("\n## 键鼠 Top 10\n\n| 键鼠 | 次数 | 占比 |\n|---|---:|---:|\n");
     let mut top: Vec<(&String, &i64)> = keys.iter().collect();
-    top.sort_by(|a, b| b.1.cmp(a.1));
+    top.sort_by(|a, b| crate::state::cmp_rank_desc(a.0, a.1, b.0, b.1));
     for (k, c) in top.iter().take(10) {
         out.push_str(&format!(
             "| {} | {} | {} |\n",
@@ -338,7 +338,7 @@ pub fn write_weekly_report_for(
     if !apps.is_empty() {
         out.push_str("\n## 前台应用时长 Top 5\n\n| 应用 | 时长 | 占比 |\n|---|---:|---:|\n");
         let mut at: Vec<(&String, &i64)> = apps.iter().collect();
-        at.sort_by(|a, b| b.1.cmp(a.1));
+        at.sort_by(|a, b| crate::state::cmp_rank_desc(a.0, a.1, b.0, b.1));
         for (a, s) in at.iter().take(5) {
             out.push_str(&format!(
                 "| {} | {} | {} |\n",
@@ -773,5 +773,82 @@ mod tests {
             500,
             "正常配置值一字不动"
         );
+    }
+
+    /// 导出侧的排名必须**与输入顺序无关** —— 这是 `HashMap` 那个随机种子的正面判据。
+    ///
+    /// 四条榜单（CSV / HTML / 周报键鼠 Top 10 / 周报应用 Top 5）原先都只写
+    /// `sort_by(|a, b| b.1.cmp(a.1))`，而屏幕上同一条榜早就补了同分破平
+    /// （`state.rs::sort_rank_desc`，注释里记着他真实库 113 个键、第 99~102 名并列
+    /// 被 100 那条线切开的现场）。导出这四处在同一个形状上漏掉：紧跟在排序后面的是
+    /// `take(10)` / `take(5)`，所以随机性不止于"顺序换了"，而是**谁进榜**每进程都换；
+    /// 周报每次启动自动重生成一份 ⇒ 同一周两次导出的 Top 10 可以不同，
+    /// 而且与用户在屏幕上看到的那份不一致。
+    #[test]
+    fn export_rank_membership_does_not_depend_on_input_order() {
+        // 一组并列 10 次、恰好跨过 take(10) 这条线的键：只有按名字定序才谈得上稳定
+        const TIED_NAMES: [&str; 14] = [
+            "k00", "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10", "k11",
+            "k12", "k13",
+        ];
+        let mut items: Vec<(&str, i64)> = vec![("zzz-big", 90)];
+        for name in TIED_NAMES {
+            items.push((name, 10));
+        }
+
+        let rank10 = |src: &mut [(&str, i64)]| -> Vec<String> {
+            src.sort_by(|a, b| crate::state::cmp_rank_desc(a.0, &a.1, b.0, &b.1));
+            src.iter().take(10).map(|(k, _)| k.to_string()).collect()
+        };
+
+        // 两份"HashMap 会给出的"不同输入序：结果必须逐位相同
+        let mut a = items.clone();
+        let first = rank10(&mut a);
+        items.reverse();
+        let mut b = items.clone();
+        let second = rank10(&mut b);
+        assert_eq!(
+            first, second,
+            "同一份数据换个输入序就换榜 ⇒ take(10) 是随机的"
+        );
+
+        assert_eq!(first[0], "zzz-big", "次数降序这一半不能丢");
+        assert_eq!(
+            &first[1..],
+            &["k00", "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08"],
+            "并列那组里上榜的必须是名字最小的 9 个，且这个集合与输入序无关"
+        );
+        assert!(
+            !first.iter().any(|k| k == "k13"),
+            "名字最大的那个并列项不该挤进榜：{first:?}"
+        );
+    }
+
+    /// 四条导出榜单必须都走那**一个**比较器 —— 屏幕上修过的那条规则不许只在屏幕上有。
+    ///
+    /// 与本文件 `weekly_goal_shares_the_settings_page_caliper` 同一族的教训：一把尺子
+    /// 写在几处，就会有一处被漏掉，而这里的漏法是"每次导出可能给不同的 Top 10"，
+    /// 不报错、不崩溃，只有人对过两份文件时才会发现。
+    #[test]
+    fn every_export_rank_goes_through_the_one_comparator() {
+        let src = include_str!("export.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let sorts: Vec<usize> = prod.match_indices(".sort_by(").map(|(i, _)| i).collect();
+        assert_eq!(
+            sorts.len(),
+            4,
+            "导出的排名榜单应当正好四处（CSV / HTML / 周报 Top 10 / 周报应用 Top 5），\
+             现在数到 {} 处 —— 加了新榜单就要一并进这条断言",
+            sorts.len()
+        );
+        for (n, at) in sorts.iter().enumerate() {
+            let line = &prod[*at..prod[*at..].find('\n').unwrap_or(prod.len() - *at) + *at];
+            assert!(
+                line.contains("cmp_rank_desc"),
+                "第 {} 处排序没走共用比较器：{line}\n\
+                 只排次数 = 同分键谁进榜随 HashMap 种子变",
+                n + 1
+            );
+        }
     }
 }

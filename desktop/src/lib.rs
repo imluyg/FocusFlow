@@ -414,19 +414,65 @@ mod wiring_audit {
         walk(dir, "html", out);
     }
 
-    /// 抓 `needle(...)` 里那个**字符串字面量**参数。不是字面量的（`getElementById(v)`）跳过，
-    /// 但调用方要拿到它们的名字 —— 覆盖面静默缩掉比红一条更难查，所以照
+    /// 抓 `call(...)` 第 `idx` 个参数里的那个**字符串字面量**。不是字面量的（`getElementById(v)`）
+    /// 跳过，但调用方要拿到它们的名字 —— 覆盖面静默缩掉比红一条更难查，所以照
     /// `invoked_commands` 那样把解不出的原样交出去。
-    fn literal_args(text: &str, call: &str) -> (Vec<String>, Vec<String>) {
+    ///
+    /// `idx` 不为 0 是 `emit_to(窗口, "事件名", …)` 那种第一位另有其物的形状。
+    ///
+    /// 参数边界靠**配平括号**数出来，不是"到第一个 `,` 或换行为止"：`state.rs` 那处
+    /// `emit_to(` 的实参横跨三行，按行截断会把 `stats-charts` 整条漏掉（第一版就是这么写的，
+    /// 于是它报出一句假缺口）；而 `listen("x", (e) => { … })` 的箭头体里有逗号与括号，
+    /// 不按深度切就会把第二个实参算进第一个。
+    fn literal_call_arg(text: &str, call: &str, idx: usize) -> (Vec<String>, Vec<String>) {
+        let pat = format!("{call}(");
         let mut got = Vec::new();
         let mut dynamic = Vec::new();
-        for chunk in text.split(&format!("{call}(")).skip(1) {
-            let head = chunk
-                .split([',', ')', '\n'])
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(&pat) {
+            let open = from + rel + pat.len();
+            from = open;
+            let b: Vec<char> = text[open..].chars().collect();
+            // 走到与这个 `(` 配平的 `)`
+            let mut depth = 1usize;
+            let mut end = b.len();
+            for (i, c) in b.iter().enumerate() {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
+                    }
+                    ']' | '}' if depth > 1 => depth -= 1,
+                    _ => {}
+                }
+            }
+            // 只在顶层（depth==1）切逗号
+            let mut args: Vec<String> = Vec::new();
+            let mut depth = 1usize;
+            let mut start = 0usize;
+            for (i, c) in b[..end].iter().enumerate() {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 1 => {
+                        args.push(b[start..i].iter().collect());
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            args.push(b[start..end].iter().collect());
+            let head = match args.get(idx) {
+                Some(a) => a.trim().to_string(),
+                None => {
+                    dynamic.push(format!("{call}(…只给了 {} 个参数)", args.len()));
+                    continue;
+                }
+            };
             match head
                 .strip_prefix('"')
                 .and_then(|s| s.strip_suffix('"'))
@@ -529,7 +575,7 @@ mod wiring_audit {
         for f in &js {
             let text = std::fs::read_to_string(f).unwrap();
             let rel = f.file_name().unwrap().to_string_lossy().to_string();
-            let (want, dyn_want) = literal_args(&text, "getElementById");
+            let (want, dyn_want) = literal_call_arg(&text, "getElementById", 0);
             wanted += want.len();
             for id in want {
                 if !declared.contains(&id) {
@@ -556,6 +602,106 @@ mod wiring_audit {
             eprintln!(
                 "注意：这些 getElementById 的参数不是字面量，本条审计不覆盖它们：\n{}",
                 dynamic.join("\n")
+            );
+        }
+    }
+
+    /// 去掉行注释（`//` 与 `///` 都算）：本模块的注释里就写着 `.emit("名字", …)` 与
+    /// `getElementById(v)` 这种示例，连注释一起扫会**自己匹配自己** —— 与本仓
+    /// `pin.rs::code_only` 同一个处理。代价是 `https://…` 字符串所在行的后半截会被截掉，
+    /// 那对"从调用里抠字符串字面量"没有影响（要抠的调用在前头）。
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Rust 广播的每个事件名，前端必须有人听；前端听的每个事件名，必须有人广播。
+    ///
+    /// 同一族缺口的第四条：命令名（`every_invoked_command_is_registered`）、窗口 label
+    /// （`every_window_label_has_a_capability`）、页面元素 id，加上这条的事件名 ——
+    /// 全是**跨语言写一遍字符串**的约定。事件名这一条最阴：写错了 `emit` 本身**成功**
+    /// （tauri 不校验有没有监听者），所以连 `截图结果发不回前端` 那句 warn 都不会打，
+    /// 症状只是"图截好了、盘上也有了，但那句提示永远不出现"。
+    ///
+    /// 两个方向都判：只查"没人听"会漏掉前端在等一个从没广播过的事件（那才是真断链），
+    /// 只查"没人 broadcast"会漏掉改名后留下的孤儿广播。
+    #[test]
+    fn event_names_match_between_rust_and_the_pages() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut rs = Vec::new();
+        rust_files(&manifest.join("src"), &mut rs);
+        let mut js = Vec::new();
+        js_files(&manifest.join("ui"), &mut js);
+        assert!(!rs.is_empty() && !js.is_empty(), "扫描路径下什么都没有");
+
+        let collect = |files: &Vec<PathBuf>, calls: &[(&str, usize)]| {
+            let mut names: Vec<String> = Vec::new();
+            let mut dynamic = Vec::new();
+            for f in files {
+                let text = code_only(&std::fs::read_to_string(f).unwrap());
+                let rel = f.file_name().unwrap().to_string_lossy().to_string();
+                for (call, idx) in calls {
+                    let (got, dyn_got) = literal_call_arg(&text, call, *idx);
+                    for n in got {
+                        names.push(n);
+                    }
+                    for d in dyn_got {
+                        dynamic.push(format!("{rel}: {d}"));
+                    }
+                }
+            }
+            names.sort();
+            names.dedup();
+            (names, dynamic)
+        };
+
+        // Rust 侧 `.emit("名字", …)` 与 `.emit_to(窗口, "名字", …)`；JS 侧 `emit("名字", …)`
+        let (mut emitted, mut dyn_e) =
+            collect(&rs, &[("emit", 0), ("emit_to", 1), ("emit_filtered", 1)]);
+        let (js_emitted, mut dyn_je) = collect(&js, &[("emit", 0)]);
+        emitted.extend(js_emitted);
+        emitted.sort();
+        emitted.dedup();
+        dyn_e.append(&mut dyn_je);
+
+        // 监听侧只在前端（本仓 Rust 不用 `app.listen`，出现了会掉进 dynamic 里被说出来）
+        let (listened, dyn_l) = collect(&js, &[("listen", 0), ("listen_to", 1)]);
+
+        // 两条腿都得有量，否则"没有缺口"只是因为"什么都没扫到"
+        assert!(
+            emitted.len() >= 5,
+            "只量到 {} 个广播事件名 —— 扫描形状变了，这条是假绿",
+            emitted.len()
+        );
+        assert!(
+            listened.len() >= 5,
+            "只量到 {} 个监听事件名 —— 扫描形状变了，这条是假绿",
+            listened.len()
+        );
+
+        let no_listener: Vec<&String> = emitted.iter().filter(|n| !listened.contains(n)).collect();
+        let no_emitter: Vec<&String> = listened.iter().filter(|n| !emitted.contains(n)).collect();
+        assert!(
+            no_listener.is_empty(),
+            "广播了但前端没人听（多半是前端那侧改了名或删了监听）：{:?}\n广播侧共 {} 个",
+            no_listener,
+            emitted.len()
+        );
+        assert!(
+            no_emitter.is_empty(),
+            "前端在等一个从来没人广播的事件 —— 那个界面永远不会被更新：{:?}\n监听侧共 {} 个",
+            no_emitter,
+            listened.len()
+        );
+        if !dyn_e.is_empty() || !dyn_l.is_empty() {
+            eprintln!(
+                "注意：这些事件名不是字面量，本条审计不覆盖它们：\n{}",
+                [dyn_e, dyn_l].concat().join("\n")
             );
         }
     }
