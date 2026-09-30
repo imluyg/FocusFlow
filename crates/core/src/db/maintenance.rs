@@ -157,7 +157,25 @@ pub fn archive_stale_years(source_year: i32) -> bool {
             return false;
         }
     };
-    let first_stale_year = min_dk.and_then(queries::day_key_to_date).map(|d| d.year());
+    let first_stale_year = match min_dk {
+        Some(dk) => match queries::day_key_to_date(dk) {
+            Some(d) => Some(d.year()),
+            None => {
+                // `min_stale_date_key` 已经查出"确实有早于本年的行"，而 `day_key_to_date`
+                // 只对**负** dk 返回 None（`migrate_v2_file` 的 LOCAL_DAY_KEY 就故意产负值）。
+                // 原先这里是 `and_then` → None → `stale` 为空 → 直接 return false：那些天
+                // 永远归档不掉、按日期查询也永远看不见，而每次启动都重跑再失败，
+                // 日志里一个字都没有（隔壁 `:155` 探测失败那支却会 error!）。
+                //
+                // "这些天该归到哪一年"是归档口径，要单独定；这一步先把**失败**说出来。
+                tracing::error!(
+                    "{source_year} 年库里有早于本年的 date_key = {dk}，它解不出日期（早于历元），本轮归档跳过：那些行既没迁走也没被查询看见，下次启动还会重跑再失败"
+                );
+                None
+            }
+        },
+        None => None,
+    };
     let stale: Vec<(i32, i64, i64)> = match first_stale_year {
         Some(first) => (first..source_year)
             .map(|year| {
@@ -893,39 +911,62 @@ pub fn vacuum_all() -> MaintenanceReport {
     report
 }
 
-/// 按配置自动 VACUUM（检查 meta 表中的 last_vacuum）。
+/// 这套库到该压缩的时候了吗 —— **每库各算各的**。
+///
+/// 三种"拿不准"（没有这一格 / 戳解不开 / 库打不开）都按**到期**处理：
+/// 判成"没到期"就是静默什么都不做，而判成到期会走到 `vacuum_path`，那里
+/// 失败会响亮地 `error!` 并记进 `failed_years`。
+fn vacuum_due(path: &Path, auto_vacuum_days: i64) -> bool {
+    let stamp = match last_vacuum_stamp(path) {
+        Ok(Some(stamp)) => stamp,
+        Ok(None) => return true,
+        Err(e) => {
+            tracing::warn!(
+                "读 {} 的压缩时间戳失败，本轮按到期处理: {e}",
+                path.display()
+            );
+            return true;
+        }
+    };
+    let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(&stamp) else {
+        return true;
+    };
+    let diff = Local::now().signed_duration_since(last_dt.with_timezone(&Local));
+    // 负数 = 戳在未来（改过系统时间、NTP 往回校正）：旧写法
+    // `diff.num_days() < auto_vacuum_days` 在这种情况下永远成立，
+    // 于是自动压缩**到此为止**、再也没有下一次 —— 而且不留一行日志。
+    diff.num_days() < 0 || diff.num_days() >= auto_vacuum_days
+}
+
+/// 按配置自动 VACUUM：逐个年度库问**它自己**的 `last_vacuum`，只压到期那些。
+///
+/// 闸门原先只看当年库那一格，而当年库没有聚合行时会被 `try_available_years`
+/// 整个排除（`--reset` 之后、或 1 月 1 日还没输入之前）—— 排除就压不到、
+/// 压不到就盖不上戳、盖不上戳下一次判定又是"到期"，于是每次启动把全部历史库
+/// 重 VACUUM 一遍，还会打一句「自动 VACUUM 完成」。改成每库各算各的之后，
+/// 那个空壳当年库不在名单里也不影响历史库的节奏。
 pub fn maybe_auto_vacuum(auto_vacuum_days: i64) {
     if auto_vacuum_days <= 0 {
         return;
     }
-    let path = paths::current_year_db_path();
-    let conn = match connection::open_ro(&path) {
-        Ok(c) => c,
-        Err(_) => return,
+    let mut report = MaintenanceReport::default();
+    let Some(years) = years_or_record(&mut report) else {
+        tracing::warn!("自动 VACUUM 未做任何改动：连年度库都没列出来");
+        return;
     };
-    let last: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'last_vacuum'",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-    drop(conn);
-
-    if let Some(last) = last {
-        if let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(&last) {
-            let last_local = last_dt.with_timezone(&Local);
-            let diff = Local::now().signed_duration_since(last_local);
-            // 负数 = `last_vacuum` 在未来（改过系统时间、NTP 往回校正）。旧写法
-            // `diff.num_days() < auto_vacuum_days` 在这种情况下永远成立，
-            // 于是自动压缩**到此为止**、再也没有下一次 —— 而且不留一行日志。
-            if diff.num_days() >= 0 && diff.num_days() < auto_vacuum_days {
-                return;
-            }
+    let due: Vec<i32> = years
+        .into_iter()
+        .filter(|year| vacuum_due(&paths::year_db_path(*year), auto_vacuum_days))
+        .collect();
+    if due.is_empty() {
+        // 一套都不到期：正常节奏，不出声（与改造前"没到期就 return"一致）。
+        return;
+    }
+    for year in due {
+        if !vacuum_path(&paths::year_db_path(year)) {
+            report.failed_years.push(year);
         }
     }
-
-    let report = vacuum_all();
     if report.incomplete() {
         // 没做成的年份不盖 `last_vacuum`（`vacuum_path` 只在 VACUUM 成功后写）：
         // 盖了等于把这次失败又按住 auto_vacuum_days 天，而且维护页会显示一个没发生过的时间。
@@ -4301,6 +4342,128 @@ mod tests {
         assert!(
             last_vacuum_stamp(&absent).is_err(),
             "库根本不存在时必须报错，而不是 Ok(None)"
+        );
+    }
+
+    /// 自动压缩的闸门必须**每库各算各的**。
+    ///
+    /// 回归：原先只读**当年库**那一格 `last_vacuum`，而当年库没有聚合行时会被
+    /// `try_available_years` 整个排除（`--reset` 之后、1 月 1 日还没输入之前）⇒
+    /// 排除 = 压不到 = 盖不上戳 = 下次判定又是"到期"，于是每次启动把全部历史库
+    /// 重 VACUUM 一遍，还会打一句「自动 VACUUM 完成」。
+    #[test]
+    fn auto_vacuum_asks_each_database_on_its_own_schedule() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("vacuum_per_db");
+        let cur = Local::now().year();
+        let prev = cur - 1;
+
+        // 当年库：表建齐、聚合行一行都没有 ⇒ 正是被排除的那一种
+        {
+            let conn = connection::open_rw(&paths::year_db_path(cur)).expect("建当年库");
+            connection::ensure_schema(&conn, cur).expect("建表");
+        }
+        // 上一年的库：有数据，且 1 天前刚压过（窗口 7 天 → 这轮不该再碰它）
+        let prev_dk = queries::day_key_of_date(NaiveDate::from_ymd_opt(prev, 6, 1).expect("date"));
+        let planted = {
+            let conn = connection::open_rw(&paths::year_db_path(prev)).expect("建往年库");
+            connection::ensure_schema(&conn, prev).expect("建表");
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 5)",
+                [prev_dk],
+            )
+            .expect("插一行聚合");
+            let stamp = (Local::now() - chrono::Duration::days(1)).to_rfc3339();
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_vacuum', ?1)",
+                [&stamp],
+            )
+            .expect("盖一个新鲜的压缩戳");
+            stamp
+        };
+        queries::invalidate_years_cache();
+
+        // 夹具前提：当年库真的不在名单里（否则这条回归根本构造不出来）
+        assert_eq!(
+            queries::try_available_years().unwrap(),
+            vec![prev],
+            "前提：没有聚合行的当年库要被排除、历史库要在名单里"
+        );
+
+        maybe_auto_vacuum(7);
+
+        assert_eq!(
+            last_vacuum_stamp(&paths::year_db_path(prev))
+                .unwrap()
+                .as_deref(),
+            Some(planted.as_str()),
+            "它自己的戳还是新的，这一轮不该把它重压一遍"
+        );
+
+        // 另一条腿：到期就得真压 —— "每库各算各的"不能退化成"永远不压"
+        let stale = (Local::now() - chrono::Duration::days(30)).to_rfc3339();
+        {
+            let conn = connection::open_rw(&paths::year_db_path(prev)).expect("改戳");
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_vacuum', ?1)",
+                [&stale],
+            )
+            .expect("盖一个过期的压缩戳");
+        }
+        maybe_auto_vacuum(7);
+        let after = last_vacuum_stamp(&paths::year_db_path(prev))
+            .unwrap()
+            .expect("30 天前的戳已过期，该真压一次并盖上新戳");
+        assert_ne!(after, stale, "过了窗口的库必须真被压到，而不是跳过");
+        chrono::DateTime::parse_from_rfc3339(&after).expect("新戳要能被下一轮判定解析");
+    }
+
+    /// 负 `date_key` 让跨年归档**整轮静默 no-op** 这条要有声音。
+    ///
+    /// `day_key_to_date` 对负值返回 None，原先 `and_then` 把它折成"没有往年数据"⇒
+    /// `stale` 为空、直接 `return false`：刚打过"开始归档…"就一声不响，那些天永远
+    /// 归档不掉、按日期查询也永远看不见，而每次启动都重跑再失败。
+    /// 归属规则（这些天到底算哪一年）还没定，这一步只保证**失败说出来**。
+    #[test]
+    fn archiving_an_unparsable_date_key_says_so_instead_of_noopping_silently() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("archive_neg_dk");
+
+        let source_year = 2025;
+        let neg_dk: i64 = -1;
+        {
+            let path = paths::year_db_path(source_year);
+            let conn = connection::open_rw(&path).expect("建源库");
+            connection::ensure_schema(&conn, source_year).expect("建表");
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 9)",
+                [neg_dk],
+            )
+            .expect("插一行负 date_key");
+        }
+        queries::invalidate_years_cache();
+
+        // 夹具前提：它真被"有往年数据"探测到了，且确实解不出日期
+        let conn = connection::open_ro(&paths::year_db_path(source_year)).expect("开源库");
+        let y0 =
+            queries::day_key_of_date(NaiveDate::from_ymd_opt(source_year, 1, 1).expect("date"));
+        assert_eq!(
+            min_stale_date_key(&conn, y0).unwrap(),
+            Some(neg_dk),
+            "前提：这条负 date_key 要真的算成早于本年"
+        );
+        assert!(
+            queries::day_key_to_date(neg_dk).is_none(),
+            "前提：负 date_key 解不出日期"
+        );
+        drop(conn);
+
+        let (migrated, logs) = crate::logger::capture_logs(|| archive_stale_years(source_year));
+        assert!(!migrated, "解不出归属时不能假装迁完了");
+        assert!(
+            logs.iter()
+                .any(|l| l.contains(&neg_dk.to_string()) && l.contains("解不出日期")),
+            "这一轮失败必须出声（同文件探测失败那支就会 error!）: {logs:?}"
         );
     }
 }

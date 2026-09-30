@@ -594,40 +594,6 @@ mod tests {
         });
     }
 
-    /// 只抓**当前线程**的 tracing 消息（`with_default` 是线程本地的作用域）：
-    /// 并行的其它用例既不会被这里收走，也不会串进来。
-    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-        use tracing::Subscriber;
-        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-
-        #[derive(Clone, Default)]
-        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-        struct MsgVisitor<'a>(&'a mut String);
-
-        impl tracing::field::Visit for MsgVisitor<'_> {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    *self.0 = format!("{value:?}");
-                }
-            }
-        }
-
-        impl<S: Subscriber> Layer<S> for Sink {
-            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-                let mut msg = String::new();
-                event.record(&mut MsgVisitor(&mut msg));
-                self.0.lock().unwrap_or_else(|e| e.into_inner()).push(msg);
-            }
-        }
-
-        let sink = Sink::default();
-        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(sink.clone()));
-        let out = tracing::dispatcher::with_default(&dispatch, f);
-        let msgs = sink.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        (out, msgs)
-    }
-
     /// A①（§十五 第 15 条）：迁移撞上**已有身份键**时，序在前的赢，被挤掉的必须留 warn。
     ///
     /// 完整路径 `HID#…` 在 BTreeMap 里必排在身份键 `VID_…` 之前，所以"已是身份键"
@@ -641,7 +607,7 @@ mod tests {
             set(ident, "家里那把").unwrap();
             invalidate_cache();
 
-            let ((), logs) = capture_logs(migrate_exact_keys_to_identity);
+            let ((), logs) = crate::logger::capture_logs(migrate_exact_keys_to_identity);
 
             let text = std::fs::read_to_string(alias_path()).unwrap();
             let after: BTreeMap<String, String> = serde_json::from_str(&text).unwrap();

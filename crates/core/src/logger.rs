@@ -155,6 +155,44 @@ pub fn is_initialized() -> bool {
     INITIALIZED.load(Ordering::SeqCst)
 }
 
+/// 抓**当前线程**产生的 tracing 消息（`with_default` 是线程本地的作用域）：
+/// 并行的其它用例既不会被这里收走，也不会串进来。
+///
+/// 供"某条分支必须出声"这类断言用 —— 那种缺陷唯一的症状就是一行日志，
+/// 没有这个夹具就只能眼验（先例：`device_alias::migration_keeps_the_first_alias_and_warns_about_the_dropped_one`）。
+#[cfg(test)]
+pub(crate) fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    use tracing::Subscriber;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct MsgVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MsgVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for Sink {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut msg = String::new();
+            event.record(&mut MsgVisitor(&mut msg));
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).push(msg);
+        }
+    }
+
+    let sink = Sink::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(sink.clone()));
+    let out = tracing::dispatcher::with_default(&dispatch, f);
+    let msgs = sink.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (out, msgs)
+}
+
 #[cfg(test)]
 mod tests {
     /// `shutdown` 的契约：释放 guard、把尾部日志写完、可重复调用。
