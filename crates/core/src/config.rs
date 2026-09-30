@@ -543,6 +543,16 @@ impl FocusFlowConfig {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        // 待写集合的快照**单独取**（不与上面嵌锁）：两次 clone 之间落进来的 `set()`
+        // 值既不在写盘快照里、也不在这份清单里 ⇒ 下面收尾时它会被**留下**，
+        // 由它自己那笔去抖保存再写一次。反过来若在这里把整个集合清空，
+        // 那一次设置就同时从文件和清单上消失了 —— 正是上一场用 `SAVE_WRITE_LOCK`
+        // 防住的"设置静默丢失"换个入口回来。
+        let pending_written = self
+            .pending_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         // 原文件读得到 → 逐行重写（保注释/空行/节序/未知键，见函数注释）；
         // 读不到（被占用/刚被删）→ 退回整份重建：那种情况下逐行重写同样没有
         // 输入可用，"文件里有而内存没有"的键本来就已无处可保，与旧行为一致。
@@ -563,13 +573,18 @@ impl FocusFlowConfig {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        // 落盘成功 ⇒ 把**这次写出去的**那些"本进程改过的键"从待写集合里摘掉，此后这些
+        // 键再出现差异就都算外部改动（`the_pending_set_clears_after_a_successful_save`
+        // 钉的就是这一半）。刻意不整表清空：写盘之后、摘除之前落进来的新 `set()` 必须
+        // 留在集合里，否则它既不在刚落盘的快照里、又丢了"本进程改过"的身份 ——
+        // 下一次 save 会把它当成外部改动采纳回旧值，那就是上一场防住的"设置静默丢失"。
+        // 写失败时 `?` 先返回，摘除整步不执行，待写的值继续保住。
         atomic_write(&self.path, &out)?;
-        // 落盘成功 ⇒ 本进程改过的键此刻已经在文件上了，内存与文件重新对齐；
-        // 之后再出现差异就都是外部改动。写失败时**不清**：那份待写的值还得靠它保住。
-        self.pending_writes
+        let mut pending = self
+            .pending_writes
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .unwrap_or_else(|e| e.into_inner());
+        pending.retain(|k| !pending_written.contains(k));
         Ok(())
     }
 
@@ -1298,6 +1313,68 @@ work_minutes = 45
             after.contains("exclude = secret.exe"),
             "隐私 exclude 不许被抹掉:\n{after}"
         );
+    }
+
+    /// 写失败的那一次不能顺手把"本进程改过"的身份也丢掉。
+    ///
+    /// ⚠ 这条**不是**"回退旧写法就红"的区分性用例：旧写法（成功后整表 `clear()`）在
+    /// `atomic_write` 失败时靠 `?` 提前返回，同样不会摘除，所以这一支两版都绿。
+    /// 它钉的是那条不变量本身 —— 将来谁把摘除挪到写盘**之前**、或改成失败也清，
+    /// 这条就会红。上面代码注释里那半条真正的差异（`set()` 正好夹在"取快照"与
+    /// "摘除"之间）需要 interleaving，headless 造不出来 ⇒ 登记为逻辑核过、无守卫视角。
+    #[test]
+    fn a_failed_save_keeps_the_pending_marks() {
+        // 只读位是这台机器上唯一稳定的"读得动、就是 rename 不进去"的形态；
+        // 设不上就直接跳过（CI 上没有 cmd/attrib 时不该骗人）
+        let attrib_ro = |p: &std::path::Path, on: bool| {
+            let flag = if on { "+R" } else { "-R" };
+            std::process::Command::new("cmd")
+                .args(["/C", "attrib", flag, &p.to_string_lossy()])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        // panic 路径也要把只读位撤掉，否则 TestAppDir::drop 删不动这个目录（%TEMP% 泄漏）
+        struct RoGuard<'a>(
+            &'a std::path::Path,
+            &'a dyn Fn(&std::path::Path, bool) -> bool,
+        );
+        impl Drop for RoGuard<'_> {
+            fn drop(&mut self) {
+                let _ = (self.1)(self.0, false);
+            }
+        }
+
+        let _lock = crate::paths::test_app_dir_lock();
+        let tmp = crate::paths::test_app_dir("cfg_failed_save_pending");
+        let path = tmp.path().join("config.ini");
+        std::fs::write(&path, "[gui]\ntheme = dark\n").unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+        assert_eq!(cfg.get("gui", "theme"), "dark");
+
+        if !attrib_ro(&path, true) {
+            eprintln!("attrib +R 没生效，跳过（夹具做不出来）");
+            return;
+        }
+        let _ro = RoGuard(&path, &attrib_ro);
+
+        // ① UI 改了主题，而这一次落盘被只读位挡住
+        cfg.set_local("gui", "theme", "light");
+        assert!(
+            cfg.save().is_err(),
+            "夹具没让写失败：这条用例照不出「写失败还要保住待写身份」那一支"
+        );
+
+        // ② 解锁之后文件被外部改成另一个值：那次没落盘的 UI 写入必须还赢一次
+        assert!(attrib_ro(&path, false), "撤掉只读位该成功");
+        std::fs::write(&path, "[gui]\ntheme = solarized\n").unwrap();
+        cfg.save().expect("解锁后应该写得动");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("theme = light"),
+            "写失败把\"本进程改过\"的身份一起摘掉了 ⇒ UI 那次设置两头落空:\n{after}"
+        );
+        assert_eq!(cfg.get("gui", "theme"), "light");
     }
 
     /// 回归（第八扫 A3）：节头带尾注（`[gui] # 界面`）时，两处判据原来都要求
