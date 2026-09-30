@@ -221,6 +221,18 @@ struct WriterState {
     today_active: AtomicU64,
     /// 今日日期键（YYYYMMDD），用于跨天重置
     today_key: AtomicU64,
+    /// 时钟**往回**跨过本地午夜 ⇒ 上面那两个"今日"缓存被清零过、需要按库里真值重锚一次。
+    ///
+    /// 为什么是一个标志而不是一次直接重锚：置位的地方是 `record()`，它在键鼠热路径上
+    /// （那条的注释写着"非阻塞，永不阻塞监听热路径"），而重锚要读库。写线程每个 tick
+    /// （≤100 ms）看一眼这个标志，就把"少报到下次重启"缩成"少报一个 tick"。
+    ///
+    /// 为什么这种跳变要单独处理：往前跨天是真的新的一天，库里那一天的行还不存在，
+    /// 清零就是对的；往回跨天（向西越过时区界、CMOS 掉电后 NTP 把表拨回去，
+    /// 且正好落在午夜附近）落到的是一个**已经有数据**的日子 —— 清零就把那一天此前
+    /// 的按键与活跃秒数从"今日"里抹掉了，而 `today_count` 之后只往上加，
+    /// 一整天都补不回来。事件本身按时间戳入库是对的，坏的只有这三个缓存。
+    today_reanchor: AtomicBool,
     /// 线程是否存活
     alive: AtomicBool,
     /// 成功落库次数（有实际写入才递增）：图表缓存用 "序号未变" 判定库内容没变，跳过重聚合
@@ -340,6 +352,7 @@ impl DbWriter {
             today_count: AtomicU64::new(today_base_count),
             today_active: AtomicU64::new(today_base_active),
             today_key: AtomicU64::new(current_day_key()),
+            today_reanchor: AtomicBool::new(false),
             alive: AtomicBool::new(true),
             flush_seq: AtomicU64::new(0),
             recovery_leftover: Mutex::new(recovered_copy),
@@ -367,10 +380,20 @@ impl DbWriter {
         let state = &*self.state;
         // 跨天检查：日期变化则重置今日计数/活跃时长（避免次日显示累计值）
         let day = current_day_key();
-        if state.today_key.load(Ordering::Relaxed) != day {
+        let stored = state.today_key.load(Ordering::Relaxed);
+        if stored != day {
             state.today_key.store(day, Ordering::Relaxed);
             state.today_count.store(0, Ordering::Relaxed);
             state.today_active.store(0, Ordering::Relaxed);
+            // 往前跨天是真的新的一天，库里还没有那一天的行，清零就是对的。
+            // **往后退**的那一次落到的是一个已经有数据的日子（向西越过时区界、
+            // CMOS 掉电后 NTP 把表拨回来，且正好在午夜附近）：清零会把那一天此前的
+            // 按键与活跃秒数从"今日"里抹掉，而这两个缓存之后只往上加，一整天补不回来。
+            // 这里不能就地重锚 —— 那是把一次 SQLite 读压进键鼠热路径（本函数开头的
+            // "非阻塞，永不阻塞监听热路径"），所以留个标志交给写线程，见字段注释。
+            if day < stored {
+                state.today_reanchor.store(true, Ordering::Relaxed);
+            }
         }
         state.today_count.fetch_add(1, Ordering::Relaxed);
 
@@ -541,18 +564,7 @@ impl DbWriter {
         let agg = self.state.agg.lock().unwrap_or_else(|e| e.into_inner());
         let pending_count = agg.daily.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
         let pending_active = agg.active.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
-        let (count, seconds) = connection::open_ro(&paths::current_year_db_path())
-            .ok()
-            .and_then(|conn| {
-                conn.query_row(
-                    "SELECT COALESCE(SUM(count), 0), COALESCE(SUM(seconds), 0) \
-                     FROM daily_counts WHERE date_key = ?1",
-                    [today_dk],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-                )
-                .ok()
-            })
-            .unwrap_or((0, 0));
+        let (count, seconds) = today_landed_totals(today_dk);
         // 锁到这一步才放：上面那句读库必须和"读内存增量"取同一瞬间的状态
         let base_count = self.state.today_count.load(Ordering::Relaxed);
         let base_active = self.state.today_active.load(Ordering::Relaxed);
@@ -871,6 +883,53 @@ fn neutralize_recovery_file() {
     }
 }
 
+/// 今日那两个数**已经在库里的**部分：`(活跃次数, 活跃秒数)`。库读不到就是 (0, 0)。
+///
+/// 这条 SQL 只许有一份：`recompute_today_totals`（外部调，先 flush 再读）与
+/// [`reanchor_today`]（写线程自己调，不等 flush）算的是同一个量，两处各写一遍就是
+/// 本仓那个"一把尺子抄多处、改一漏一"的老形状。
+fn today_landed_totals(today_dk: i64) -> (i64, i64) {
+    connection::open_ro(&paths::current_year_db_path())
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(SUM(count), 0), COALESCE(SUM(seconds), 0) \
+                 FROM daily_counts WHERE date_key = ?1",
+                [today_dk],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok()
+        })
+        .unwrap_or((0, 0))
+}
+
+/// 写线程自己用的"今日"重锚：把三个缓存按 **库里的今日聚合 + 内存里未落库的今日增量**
+/// 重算一遍。唯一的触发原因是时钟往回跨过午夜，见 `WriterState::today_reanchor`。
+///
+/// 与 `DbWriter::recompute_today_totals` 的差别只有一处，但那一处是要命的：
+/// **它不发 `Signal::Flush`、也不等回音。** 那个函数开头要 `flush_confirmed(true)`，
+/// 而那是"把消息投给写线程、然后阻塞等它回话"的形状（见其实现）—— 由写线程自己调就是
+/// 等一个永远不会被处理的请求，白卡满 3 秒还把 flush 判成超时。走到本函数这条路上时
+/// 那一步也没有意义：调用点正是写线程本身，且它每 tick 都在同步地跑 `flush_pending`，
+/// 没有别人的 flush 在飞，所以"库值 + 内存增量"本来就是一致的瞬间。
+fn reanchor_today(state: &WriterState) {
+    let today_dk = queries::day_key_of_date(chrono::Local::now().date_naive());
+    // 与 recompute_today_totals 同一条规矩：持着 agg 锁读库，让"库里的值"与
+    // "内存里的待落库增量"取的是同一瞬间，同一批不会既算进库值又算进增量。
+    let agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
+    let pending_count = agg.daily.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
+    let pending_active = agg.active.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
+    let (count, seconds) = today_landed_totals(today_dk);
+    drop(agg);
+    state
+        .today_count
+        .store(count.max(0) as u64 + pending_count, Ordering::Relaxed);
+    state
+        .today_active
+        .store(seconds.max(0) as u64 + pending_active, Ordering::Relaxed);
+    state.today_key.store(current_day_key(), Ordering::Relaxed);
+}
+
 /// 读取恢复文件（启动回放）。
 ///
 /// 返回 `(回放进内存的增量, 要留到首批落库之后再删的副本路径)`。
@@ -1000,6 +1059,18 @@ fn writer_loop(state: Arc<WriterState>, sig_rx: mpsc::Receiver<Signal>, flush_in
         if last_flush.elapsed() >= flush_interval {
             flush_pending(&mut conn, &mut conn_year, &state);
             last_flush = Instant::now();
+        }
+
+        // 时钟往回跨过午夜那一次，`record()` 只敢置位（它在键鼠热路径上，读库会把
+        // SQLite IO 压进每一次按键），重锚在这里做。摆在周期落库之后：这样读到的库值
+        // 已经含刚落下去的那一批，未落库的部分由 `reanchor_today` 从 agg 里补。
+        // 每个 tick（≤100 ms）看一眼，把"少报到下次重启"缩成"少报一个 tick"。
+        if state.today_reanchor.swap(false, Ordering::Relaxed) {
+            tracing::warn!(
+                "检测到本地日期往回跳（改时钟、NTP 回拨或向西跨时区）：按库里的真值重锚今日\
+                 计数 —— 不重锚的话今天此前记下的量会被清零后一整天补不回来"
+            );
+            reanchor_today(&state);
         }
     }
 }
@@ -1564,6 +1635,54 @@ mod tests {
         w.flush(true);
         w.stop_and_wait();
         crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
+    }
+
+    /// 时钟**往回**跨过午夜 ⇒ 今日计数不能停在"清零"上，写线程要按库里的真值重锚。
+    ///
+    /// 上面那条测的是往前跨天（真的新的一天，库里还没有那一天的行，清零就是对的）。
+    /// 这条测的是反方向：向西越过时区界、或 CMOS 掉电之后 NTP 把表拨回来，且正好落在
+    /// 午夜附近 —— 落到的那个日子**已经有数据**，而 `today_count` / `today_active`
+    /// 之后只往上加，清零一次就把今天此前记下的量抹掉、一整天补不回来（「今日」卡片与
+    /// 悬浮窗跟着偏小，而库里的行是对的，所以只有显示面在撒谎）。
+    ///
+    /// 断言写成"轮询等结果"而不是读那个标志：置位是即时的，但消费它的是写线程的
+    /// 每个 tick（≤100 ms），两边赛跑时读标志会看到它已经被抹平。
+    #[test]
+    fn a_backward_clock_jump_reanchors_today_instead_of_losing_it() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_backwards_day");
+        let w = start_writer(Duration::from_secs(3600));
+        let t0 = queries::now_ts();
+        for i in 0..7 {
+            w.record("A", t0 + i);
+        }
+        w.flush(true);
+        assert_eq!(w.today_pending_count(), 0, "夹具前提：这 7 条要已经落库");
+        assert_eq!(
+            w.state.today_count.load(Ordering::Relaxed),
+            7,
+            "夹具前提：重锚之前今日基准是 7"
+        );
+
+        // 把缓存里的日期键摆到**明天**，再按一次键：真实日期比缓存旧 ⇒ 这一族走的是回拨支
+        w.state
+            .today_key
+            .store(current_day_key() + 1, Ordering::Relaxed);
+        w.record("A", queries::now_ts());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got = w.state.today_count.load(Ordering::Relaxed);
+        while got != 8 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            got = w.state.today_count.load(Ordering::Relaxed);
+        }
+        w.stop_and_wait();
+        crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
+
+        assert_eq!(
+            got, 8,
+            "回拨那一次把基准清零之后没人重锚：今天此前那 7 次永久从「今日」里丢了（停在 {got}）"
+        );
     }
 
     /// record 聚合到内存增量：daily/hourly/keys 正确累加。
