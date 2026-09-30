@@ -159,17 +159,28 @@ pub fn archive_stale_years(source_year: i32) -> bool {
     };
     let first_stale_year = match min_dk {
         Some(dk) => match queries::day_key_to_date(dk) {
-            Some(d) => Some(d.year()),
+            Some(d) => {
+                // 负序号 = 1970 年之前的时间戳（旧版 Python 库导入，或系统时钟被调到
+                // 1970 之前）。现在按真实年份归库 —— 说一句，免得用户看见
+                // `focusflow_1969.db` 这种文件名时不知道它是哪来的。
+                if dk < 0 {
+                    tracing::warn!(
+                        "{source_year} 年库里有早于 1970-01-01 的记录（最早 date_key = {dk}，即 {}），\
+                         它们会被归到各自真实的年份库",
+                        d.format("%Y-%m-%d")
+                    );
+                }
+                Some(d.year())
+            }
             None => {
-                // `min_stale_date_key` 已经查出"确实有早于本年的行"，而 `day_key_to_date`
-                // 只对**负** dk 返回 None（`migrate_v2_file` 的 LOCAL_DAY_KEY 就故意产负值）。
-                // 原先这里是 `and_then` → None → `stale` 为空 → 直接 return false：那些天
-                // 永远归档不掉、按日期查询也永远看不见，而每次启动都重跑再失败，
-                // 日志里一个字都没有（隔壁 `:155` 探测失败那支却会 error!）。
+                // `day_key_to_date` 现在两头都解得开（见它的注释），走到这里只剩一种可能：
+                // 序号超出 `NaiveDate` 能表示的范围（约公元前/公元后 26 万年）。
+                // 原先这里是 `and_then` → None → `stale` 为空 → 静默 return false，刚打过
+                // "开始归档…"就一个字不说（隔壁 `:155` 探测失败那支却会 error!）。
                 //
-                // "这些天该归到哪一年"是归档口径，要单独定；这一步先把**失败**说出来。
+                // 这一轮仍是不归档：宁可留着这批行，也不替它们猜一个年份。
                 tracing::error!(
-                    "{source_year} 年库里有早于本年的 date_key = {dk}，它解不出日期（早于历元），本轮归档跳过：那些行既没迁走也没被查询看见，下次启动还会重跑再失败"
+                    "{source_year} 年库里有早于本年的 date_key = {dk}，它超出可换算的日期范围，本轮归档跳过：那些行按日期视图看不见、却照常进总计，下次启动还会重跑再失败"
                 );
                 None
             }
@@ -4418,52 +4429,134 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339(&after).expect("新戳要能被下一轮判定解析");
     }
 
-    /// 负 `date_key` 让跨年归档**整轮静默 no-op** 这条要有声音。
+    /// 某个年度库里那一天在 `daily_counts` 的合计（0 = 那一行不在这套库里）。
+    fn sum_of_day(path: std::path::PathBuf, dk: i64) -> i64 {
+        let conn = connection::open_ro(&path).expect("读年度库");
+        conn.query_row(
+            "SELECT COALESCE(SUM(count), 0) FROM daily_counts WHERE date_key = ?1",
+            [dk],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// 1970 年之前的记录要按**真实年份**归库，而不是一句「解不出日期」就跳过整轮。
     ///
-    /// `day_key_to_date` 对负值返回 None，原先 `and_then` 把它折成"没有往年数据"⇒
-    /// `stale` 为空、直接 `return false`：刚打过"开始归档…"就一声不响，那些天永远
-    /// 归档不掉、按日期查询也永远看不见，而每次启动都重跑再失败。
-    /// 归属规则（这些天到底算哪一年）还没定，这一步只保证**失败说出来**。
+    /// `day_key_of_ts` 用的是 `div_euclid`，1970 年前的瞬时本来就算得出负序号
+    /// （旧版 Python 库导入、或系统时钟被调到 1970 前）。旧实现 `day_key_to_date` 里
+    /// 的 `u64::try_from(...).ok()?` 把它们全折成 None ⇒ 归档算不出目标年份、整轮 no-op，
+    /// 而那些行却照常进总计 —— 「总数」与「每日序列之和」从此永远差这一截。
     #[test]
-    fn archiving_an_unparsable_date_key_says_so_instead_of_noopping_silently() {
+    fn pre_epoch_records_archive_into_their_real_year_databases() {
         let _lock = crate::paths::test_app_dir_lock();
-        let _tmp = crate::paths::test_app_dir("archive_neg_dk");
+        let _tmp = crate::paths::test_app_dir("archive_pre_epoch");
 
         let source_year = 2025;
-        let neg_dk: i64 = -1;
+        let d1969 = NaiveDate::from_ymd_opt(1969, 6, 15).expect("date");
+        let d2024 = NaiveDate::from_ymd_opt(2024, 3, 1).expect("date");
+        let dk1969 = queries::day_key_of_date(d1969);
+        let dk2024 = queries::day_key_of_date(d2024);
+        assert!(dk1969 < 0, "前提：1969-06-15 的序号要是负数，实得 {dk1969}");
         {
             let path = paths::year_db_path(source_year);
             let conn = connection::open_rw(&path).expect("建源库");
             connection::ensure_schema(&conn, source_year).expect("建表");
             conn.execute(
                 "INSERT INTO daily_counts (date_key, count) VALUES (?1, 9)",
-                [neg_dk],
+                [dk1969],
             )
-            .expect("插一行负 date_key");
+            .expect("插一行 1969 年的聚合");
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 11)",
+                [dk2024],
+            )
+            .expect("插一行 2024 年的聚合");
         }
         queries::invalidate_years_cache();
 
-        // 夹具前提：它真被"有往年数据"探测到了，且确实解不出日期
+        let (migrated, logs) = crate::logger::capture_logs(|| archive_stale_years(source_year));
+        assert!(migrated, "1969 与 2024 两笔都该迁走");
+        assert_eq!(
+            sum_of_day(paths::year_db_path(1969), dk1969),
+            9,
+            "1969 年库要真拿到那一笔",
+        );
+        assert_eq!(
+            sum_of_day(paths::year_db_path(2024), dk2024),
+            11,
+            "2024 年库同理",
+        );
+        assert_eq!(
+            sum_of_day(paths::year_db_path(source_year), dk1969),
+            0,
+            "源库里不能再留着 1969 那一行",
+        );
+        assert_eq!(sum_of_day(paths::year_db_path(source_year), dk2024), 0);
+        assert!(
+            logs.iter().any(|l| l.contains("1969-06-15")),
+            "搬之前要把这批来源说出来，否则用户不知道 `focusflow_1969.db` 是哪来的: {logs:?}",
+        );
+        // 中间那些没有数据的年份不能留下空壳库：`archive_year_range` 是先判有行、
+        // 后建目标库的，这条腿钉的就是那个顺序。
+        let mut shells: Vec<String> = std::fs::read_dir(paths::data_dir())
+            .expect("读数据目录")
+            .flatten()
+            .filter_map(|e| paths::is_year_db_file(&e.path()))
+            .map(|y| y.to_string())
+            .collect();
+        shells.sort();
+        let want = vec!["1969".to_string(), "2024".to_string(), "2025".to_string()];
+        assert_eq!(shells, want, "归档只能在真有数据的那几年建库");
+    }
+
+    /// 序号**超出可换算范围**时仍然要出声并跳过这一轮。负数如今解得开了，这一支只剩
+    /// 「真的猜不出年份」那种脏值：宁可留着不迁，也不替它编一个年份 —— 归档是破坏性的，
+    /// 搬错一年就等于把数据写进另一本账。
+    #[test]
+    fn a_date_key_beyond_the_calendar_range_is_skipped_and_said_out_loud() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("archive_unbounded_dk");
+
+        let source_year = 2025;
+        let wild_dk: i64 = -100_000_000;
+        assert_eq!(
+            queries::day_key_to_date(wild_dk),
+            None,
+            "前提：这个序号确实超出 `NaiveDate` 能表示的范围",
+        );
+        {
+            let path = paths::year_db_path(source_year);
+            let conn = connection::open_rw(&path).expect("建源库");
+            connection::ensure_schema(&conn, source_year).expect("建表");
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 7)",
+                [wild_dk],
+            )
+            .expect("插一行超出范围的 date_key");
+        }
+        queries::invalidate_years_cache();
+
         let conn = connection::open_ro(&paths::year_db_path(source_year)).expect("开源库");
         let y0 =
             queries::day_key_of_date(NaiveDate::from_ymd_opt(source_year, 1, 1).expect("date"));
         assert_eq!(
             min_stale_date_key(&conn, y0).unwrap(),
-            Some(neg_dk),
-            "前提：这条负 date_key 要真的算成早于本年"
-        );
-        assert!(
-            queries::day_key_to_date(neg_dk).is_none(),
-            "前提：负 date_key 解不出日期"
+            Some(wild_dk),
+            "前提：它要真的算成早于本年",
         );
         drop(conn);
 
         let (migrated, logs) = crate::logger::capture_logs(|| archive_stale_years(source_year));
-        assert!(!migrated, "解不出归属时不能假装迁完了");
+        assert!(!migrated, "解不出年份时不能假装迁完了");
+        assert_eq!(
+            sum_of_day(paths::year_db_path(source_year), wild_dk),
+            7,
+            "被跳过的那一行必须原样留着",
+        );
         assert!(
             logs.iter()
-                .any(|l| l.contains(&neg_dk.to_string()) && l.contains("解不出日期")),
-            "这一轮失败必须出声（同文件探测失败那支就会 error!）: {logs:?}"
+                .any(|l| l.contains(&wild_dk.to_string()) && l.contains("超出可换算的日期范围")),
+            "这一轮的失败必须出声（同文件探测失败那支就会 error!）: {logs:?}",
         );
     }
 }

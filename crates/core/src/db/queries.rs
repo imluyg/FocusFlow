@@ -205,13 +205,32 @@ pub(crate) fn day_key_of_date(date: chrono::NaiveDate) -> i64 {
 /// 原先是 `from_timestamp(day_key * 86_400).with_timezone(&Local)`，等于把时区偏移
 /// **第二次**加上去：正偏移（含 UTC+8）恰好还在同一天所以看不出来，负偏移（美洲）
 /// 会把每一行日数据标到前一天。
+///
+/// **负序号必须能解**：`day_key_of_ts` 用的是 `div_euclid`，1970 年之前的时间戳
+/// 本来就算得出负序号，而旧实现 `u64::try_from(day_key).ok()?` 把它们一律折成 `None`，
+/// 后果是三处对不上（`maintenance.rs` 的归档算不出目标年份、每日序列丢掉那一行、
+/// "最高单日"整格变成没有），而总计那一侧照算。现在两头都走 `checked_*_days`，
+/// 只有真的超出 `NaiveDate` 可表示范围（约公元前 26 万年）才回 `None`。
 pub(crate) fn day_key_to_date(day_key: i64) -> Option<chrono::NaiveDate> {
-    unix_epoch_date().checked_add_days(chrono::Days::new(u64::try_from(day_key).ok()?))
+    let epoch = unix_epoch_date();
+    // `unsigned_abs` 而不是 `-day_key`：后者在 `i64::MIN` 上会溢出，而 release 配置是
+    // `panic = "abort"` —— 一次坏数据就让整个应用消失。
+    let days = chrono::Days::new(day_key.unsigned_abs());
+    if day_key >= 0 {
+        epoch.checked_add_days(days)
+    } else {
+        epoch.checked_sub_days(days)
+    }
 }
 
 /// Unix 秒 → 当日小时（0-23，本地时区）。
+///
+/// 与 `day_key_of_ts` 同一个理由：`div_euclid(3600)` 对 1970 年前的瞬时给出**负**商，
+/// 而 Rust 的 `%` 跟着被除数的符号走 ⇒ 旧实现会算出 -1..-23 这种"小时"，
+/// 它进得了 `(date_key, hour)` 主键、却落在任何 0..=23 的读侧窗口之外（又是总数算它、
+/// 小时图看不见那一族）。`rem_euclid` 两头都收进 0..=23。
 pub(crate) fn hour_of_ts(ts: i64) -> i64 {
-    ((ts + local_utc_offset_seconds()).div_euclid(3600)) % 24
+    ((ts + local_utc_offset_seconds()).div_euclid(3600)).rem_euclid(24)
 }
 
 /// 查询今日按键数（聚合表）。
@@ -1451,6 +1470,50 @@ mod tests {
             day_key_of_date(base + chrono::Days::new(365)) - day_key_of_date(base),
             365
         );
+        // 往 1970 之前同样要往返。旧实现里 `day_key_to_date` 只对非负序号工作
+        // （`u64::try_from(...).ok()?`），负序号一律 `None` ⇒ 归档算不出目标年份、
+        // 按日视图丢掉那一行，而总计照算（两本账）。
+        let eve = chrono::NaiveDate::from_ymd_opt(1969, 12, 31).expect("date");
+        for i in 0..4000u64 {
+            let d = eve.checked_sub_days(chrono::Days::new(i)).expect("date");
+            let k = day_key_of_date(d);
+            assert!(k < 0, "{d} 的序号应当是负数，实得 {k}");
+            assert_eq!(day_key_to_date(k), Some(d), "{d} -> {k} -> 反算不一致");
+        }
+    }
+
+    /// 换算的两端都得是不溢出的纯函数 —— release 配置是 `panic = "abort"`，
+    /// 一个在 `i64::MIN` 上写错的 `-x` 就是整个应用消失。
+    #[test]
+    fn day_key_to_date_handles_the_extremes_without_panicking() {
+        assert_eq!(
+            day_key_to_date(-1),
+            chrono::NaiveDate::from_ymd_opt(1969, 12, 31),
+            "历元前一天要解得开"
+        );
+        assert_eq!(
+            day_key_to_date(-100_000_000),
+            None,
+            "约公元前 27 万年，超出范围"
+        );
+        assert_eq!(day_key_to_date(i64::MIN), None, "不能因为取反而溢出");
+        assert_eq!(day_key_to_date(i64::MAX), None);
+    }
+
+    /// `hour_of_ts` 在 1970 之前也必须落在 0..=23。
+    ///
+    /// `div_euclid(3600)` 对负瞬时给出负商，而 Rust 的 `%` 跟着被除数的符号走 ⇒
+    /// 旧写法算出 -1..-23 这种「小时」：它进得了 `(date_key, hour)` 主键、却永远
+    /// 落在任何 0..=23 的读侧窗口之外（又是总数算它、小时图看不见那一族）。
+    #[test]
+    fn hour_of_ts_stays_in_range_before_the_epoch() {
+        let day_start = |dk: i64| dk * 86_400 - local_utc_offset_seconds();
+        for dk in [-4000i64, -2, -1, 0, 1, 20727] {
+            for h in 0..24i64 {
+                let got = hour_of_ts(day_start(dk) + h * 3600);
+                assert_eq!(got, h, "date_key={dk} 的第 {h} 小时，实得 {got}");
+            }
+        }
     }
 
     /// 查询用的日期序号，必须等于写入侧给"该日中午那个瞬时"算出的序号。
