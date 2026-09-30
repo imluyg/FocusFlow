@@ -67,6 +67,20 @@ pub fn init_db() -> anyhow::Result<()> {
     if n > 0 {
         tracing::warn!("定时任务库里有 {n} 条 args 为 NULL 的记录（旧版本遗留），已补成空串");
     }
+    // 同一手的第二件：把 `schedule_time` 的首尾空格清掉。写侧现在存的就是 trim 过的
+    // 值，但库里可能躺着旧写法留下的 `"2026-12-01 10:00 "` —— 而 `should_run` 拿原串
+    // 去 parse，那种行会永远解析失败、永远不执行、也一行日志都不留。
+    // 旧版 Python 的调度库是整份复制进来的（`migration.rs` 的 AUX_DBS），那批行
+    // 靠写侧修不到，只能在这里规范化一次。
+    let n = conn
+        .execute(
+            "UPDATE scheduled_tasks SET schedule_time = TRIM(schedule_time) WHERE schedule_time != TRIM(schedule_time)",
+            [],
+        )
+        .map_err(|e| anyhow::anyhow!("规范化 schedule_time 的定时任务失败: {e}"))?;
+    if n > 0 {
+        tracing::warn!("定时任务库里有 {n} 条 schedule_time 带首尾空格（旧版本遗留），已规范化");
+    }
     Ok(())
 }
 
@@ -619,6 +633,11 @@ pub fn add_task(
         return Err(e);
     }
     let created = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    // 入库的必须是**校验过的那个串**：`validate_schedule` 判的是 trim 之后的值，
+    // 而这里原先直接把原样字符串写下去。`"2026-12-01 10:00 "`（面板里从记事本粘出来
+    // 很容易带上尾随空格）于是变成"校验通过、入库、然后 `should_run` 永远解析失败
+    // 返回 false"——一条看着已排好、实际永不执行、也一行日志都没有的任务。
+    let schedule_time = schedule_time.trim();
     let conn = open().map_err(|e| anyhow::anyhow!("打开调度库失败: {e}"))?;
     conn.execute(
         "INSERT INTO scheduled_tasks
@@ -695,7 +714,10 @@ pub fn update_task(
     let new_target = target_path.unwrap_or(&existing.1).to_string();
     let new_args = args.unwrap_or(&existing.2).to_string();
     let new_type = schedule_type.unwrap_or(&existing.3).to_string();
-    let new_time = schedule_time.unwrap_or(&existing.4).to_string();
+    // 入库一律写 trim 过的串（与 `add_task` 同一半）：`validate_schedule` 判的是 trim
+    // 之后的值，写原样字符串就会留下 `"2026-12-01 10:00 "` 这种"校验通过、执行期永远
+    // 解析失败、还一行日志都没有"的记录。
+    let new_time = schedule_time.unwrap_or(&existing.4).trim().to_string();
     let new_enabled = enabled.unwrap_or(existing.5 != 0);
 
     // 调度必须按**合并后的整对**校验：只改 type（daily→once）而 time 还是 "09:00"
@@ -711,7 +733,9 @@ pub fn update_task(
     // 而插件侧的 scheduler_update 永远把整条记录原样传回来（host.rs 的绑定是七个参数
     // 一起给），于是改个名字、补一条白名单都会把 last_run 清空 —— 一条 09:00 的任务
     // 在 14:00 被编辑过一次，30 秒内就把那个程序又启动了一遍。
-    let schedule_changed = new_type != existing.3 || new_time != existing.4;
+    // 比较也要按 trim 后的做：一条历史脏行 `"09:00 "` 被规范化成 `"09:00"` 不算
+    // "改了调度时刻"，否则这次编辑会顺手清空 last_run、当天多启动一次。
+    let schedule_changed = new_type != existing.3 || new_time != existing.4.trim();
     let last_run: Option<String> = if schedule_changed {
         None // 改了调度时刻：按新时刻重新计一次
     } else {
@@ -823,19 +847,13 @@ pub fn get_all_tasks() -> Vec<ScheduledTask> {
 fn parse_interval(s: &str) -> Option<(i64, i64, i64)> {
     let (time_part, n_part) = s.split_once('|')?;
     let (start_str, end_str) = time_part.split_once('-')?;
-    let parse_hhmm = |t: &str| -> Option<i64> {
-        let (h, m) = t.split_once(':')?;
-        let h: i64 = h.parse().ok()?;
-        let m: i64 = m.parse().ok()?;
-        if (0..=23).contains(&h) && (0..=59).contains(&m) {
-            Some(h * 60 + m)
-        } else {
-            None
-        }
-    };
+    // 两个时刻走的是与 daily 同一个解析器。原来这里另写了一份闭包，而且那份
+    // **不 trim**（外层 `parse_hhmm` trim 了）：于是 `validate_schedule` 先 trim 后判
+    // 通过、入库的却是带空格的 `" 07:00-23:00|30"`，这里解析成 None ⇒
+    // `should_run` 永远 false —— 一条看着合法、实际永不执行、也一行日志都没有的任务。
     let start = parse_hhmm(start_str)?;
     let end = parse_hhmm(end_str)?;
-    let interval: i64 = n_part.trim().parse().ok()?;
+    let interval = digits_only(n_part.trim())?;
     if interval <= 0 || end < start {
         return None;
     }
@@ -849,12 +867,37 @@ fn parse_interval(s: &str) -> Option<(i64, i64, i64)> {
 /// 任务一入库就立刻启动目标程序。`"25:00"` 反过来永远跑不了。两种都比拒绝更糟。
 fn parse_hhmm(s: &str) -> Option<i64> {
     let (h, m) = s.split_once(':')?;
-    let h: i64 = h.trim().parse().ok()?;
-    let m: i64 = m.trim().parse().ok()?;
+    let (h, m) = (parse_clock_number(h.trim())?, parse_clock_number(m.trim())?);
     if !(0..=23).contains(&h) || !(0..=59).contains(&m) {
         return None;
     }
     Some(h * 60 + m)
+}
+
+/// 只认纯十进制（`+9`、`-0`、空白、任何非数字字符都是 None），溢出也 None。
+///
+/// 加这一层是因为 `"-0".parse::<i64>()` 是 `Ok(0)`、`"+9"` 是 `Ok(9)`：于是
+/// `"-0:00"` 一路通过校验、存进库、被判成 00:00 —— 而 daily 的判据是
+/// `now_min >= target_min`，"非法时间"就又变成"任何时刻都该跑"，任务落库后
+/// 30 秒内启动目标程序（`parse_hhmm` 头那段防的是同一件事，只是从符号这个门进来）。
+/// 面板那个时刻输入框是把 `el.value` 原样交下来的（`desktop/ui/js/main.js`），
+/// 手抖多带一个 `-` 就进得来。
+fn digits_only(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// 时钟位（时 / 分）用的数字：纯十进制且最多两位。
+///
+/// 分钟**间隔**不这走这条：`07:00-23:00|120`、`|1440` 都是正当写法，
+/// 那里只要求"纯十进制 + > 0"（见 `parse_interval`）。
+fn parse_clock_number(s: &str) -> Option<i64> {
+    if s.len() > 2 {
+        return None;
+    }
+    digits_only(s)
 }
 
 /// 判断任务是否应执行（镜像 `_should_run`）。
@@ -877,9 +920,19 @@ fn should_run(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> bool {
             }
             match last_run {
                 Some(lr) => {
-                    // 今天已执行过则不重复
+                    // 今天（或"比今天还晚"的那一次）已执行过则不重复。
+                    //
+                    // 判据原来是 `== now.date_naive()`，那把时钟**往回**跨过午夜这件事
+                    // 变成放行器：任务在 10-02 09:00 跑过，随后时钟被调回 10-01 23:30
+                    // （NTP 校正、手工对表、向东跨时区），`10-02 != 10-01` ⇒ 判定为
+                    // "今天还没跑"，于是所有 daily 任务在回拨后的那一刻一起启动一遍；
+                    // 而这一遍又把 `last_run` 盖成 10-01 23:30，等时钟真的走到 10-02
+                    // 又会再启动一次 —— 一次回拨换来两次弹出。
+                    // 与同文件 `interval` 那一支（用 `<` 放行、往回跳时算出负数于是闭嘴）
+                    // 以及 `effective_last_run` 取两个戳里**较晚**的那个是同一个口径：
+                    // 戳记只会来自过去，来自"未来"的那次一定已经跑过了。
                     if let Ok(lr_dt) = NaiveDateTime::parse_from_str(lr, "%Y-%m-%d %H:%M:%S") {
-                        if lr_dt.date() == now.date_naive() {
+                        if lr_dt.date() >= now.date_naive() {
                             return false;
                         }
                     }
@@ -1735,9 +1788,13 @@ mod tests {
             ("daily", "25:00"),
             ("daily", "09:70"),
             ("daily", "9"),
+            // 符号那一门：`"-0".parse::<i64>()` 是 Ok(0)，不收就等于"任何时刻都该跑"
+            ("daily", "-0:00"),
+            ("daily", "+9:00"),
             ("once", "bad"),
             ("interval", "23:00-07:00|30"),
             ("interval", "07:00-23:00|0"),
+            ("interval", "07:00-23:00|+30"),
             ("weekly", "09:00"),
         ] {
             let e = add_task("t", notepad, "", stype, stime, true)
@@ -1799,6 +1856,173 @@ mod tests {
             ..daily_task("abc:xyz")
         };
         assert!(!should_run(&junk, &noon));
+    }
+
+    /// 时钟**往回**跨过午夜，不能把"今天已经跑过"变成放行器。
+    ///
+    /// 判据原来是 `lr.date() == now.date()`：任务在 10-02 09:00 跑过之后把表调回
+    /// 10-01 23:30（NTP 校正、手工对表、向东跨时区），两个日期不再相等 ⇒ 所有到点的
+    /// daily 任务当场又启动一遍；而这一遍把 `last_run` 盖成 10-01 23:30，等时钟真的
+    /// 走到 10-02 还会再启动第二次 —— 一次回拨换来两次弹出。与同文件
+    /// `effective_last_run`「取两个戳里较晚的那个」、`interval` 那一支「往回跳时算出
+    /// 负数于是闭嘴」是同一个口径：戳记只会来自过去，来自"未来"的那次一定已经跑过了。
+    #[test]
+    fn a_backward_clock_jump_does_not_refire_todays_task() {
+        let back = Local.with_ymd_and_hms(2026, 10, 1, 23, 30, 0).unwrap();
+        let ran_after_the_jump = ScheduledTask {
+            last_run: Some("2026-10-02 09:00:12".into()),
+            ..daily_task("09:00")
+        };
+        assert!(
+            !should_run(&ran_after_the_jump, &back),
+            "戳记比今天还晚 = 那一刻已经跑过了，回拨不该把它变成放行"
+        );
+
+        // 反向腿：别把正常节奏一起夹死
+        let yesterday = ScheduledTask {
+            last_run: Some("2026-09-30 09:00:12".into()),
+            ..daily_task("09:00")
+        };
+        assert!(
+            should_run(&yesterday, &back),
+            "昨天那次不该挡住 10-01 23:30 这一轮"
+        );
+        let same_day = Local.with_ymd_and_hms(2026, 10, 1, 9, 0, 30).unwrap();
+        let just_ran = ScheduledTask {
+            last_run: Some("2026-10-01 09:00:12".into()),
+            ..daily_task("09:00")
+        };
+        assert!(!should_run(&just_ran, &same_day), "同一分钟内跑过就不再跑");
+        let before_target = Local.with_ymd_and_hms(2026, 10, 1, 8, 0, 0).unwrap();
+        assert!(
+            !should_run(&yesterday, &before_target),
+            "09:00 的任务不该在 08:00 跑"
+        );
+    }
+
+    /// 带符号的时钟字段必须拒掉，而**间隔的分钟数**不能被同一层"最多两位"误伤。
+    ///
+    /// `"-0".parse::<i64>()` 是 `Ok(0)`、`"+9"` 是 `Ok(9)`，于是 `"-0:00"` 一路通过
+    /// 校验、存进库、被判成 00:00 —— daily 的判据是 `now_min >= target_min`，
+    /// "非法时间"就又等于"任何时刻都该跑"（`unparseable_daily_time_never_fires` 防的
+    /// 是同一件事，只是从符号这个门进来）。面板那个输入框是把 `el.value` 原样交下来的
+    /// （`desktop/ui/js/main.js`），手抖多带一个 `-` 就进得来。
+    ///
+    /// 第二条腿是给我自己新加的判据兜底的：`07:00-23:00|120`（每 2 小时）与 `|1440`
+    /// 都是正当写法，收紧时钟位时把它们一起夹掉就是修一个洞开一个洞。
+    #[test]
+    fn signed_clock_fields_are_rejected_without_breaking_long_intervals() {
+        for bad in ["-0:00", "+9:00", "-1:30", "09:0 0", "9999:00"] {
+            assert!(parse_hhmm(bad).is_none(), "{bad:?} 不该被当成合法时刻");
+        }
+        for good in ["09:00", "9:05", "0:00", "23:59", " 09:00 "] {
+            // 首尾空格是合法写法：`validate_schedule` 判的是 trim 后的值，写侧现在也存
+            // trim 后的串，这一层再 trim 一次只是把同一把尺子用到最后一处。
+            assert!(parse_hhmm(good).is_some(), "{good:?} 是合法写法");
+        }
+        assert_eq!(
+            parse_interval("07:00-23:00|120"),
+            Some((420, 1380, 120)),
+            "间隔可以是三位数"
+        );
+        assert_eq!(
+            parse_interval("07:00-23:00|1440"),
+            Some((420, 1380, 1440)),
+            "间隔甚至可以是四位"
+        );
+        assert!(
+            parse_interval("07:00-23:00|+30").is_none(),
+            "带符号的间隔要拒（同一个 `+` 门）"
+        );
+        assert!(parse_interval("07:00-23:00|-30").is_none());
+        // 外层带空格的串现在也能解析：以前 `parse_interval` 里另写了一份**不 trim** 的
+        // 解析器，于是"校验通过、入库、执行期永远 None"（见下面那条 trim 用例）
+        assert_eq!(
+            parse_interval(" 07:00-23:00|30 "),
+            Some((420, 1380, 30)),
+            "首尾空格不该让一条合法任务永远不执行"
+        );
+    }
+
+    /// 入库的必须是**校验过的那个串**：校验判 trim 之后的值，写侧原先写的是原样字符串。
+    ///
+    /// `"2026-12-01 10:00 "`（从记事本粘时刻很容易带上尾空格）于是变成"校验通过、
+    /// 落库、然后 `should_run` 永远解析失败返回 false"——一条看着已排好、实际永不执行、
+    /// 也一行日志都没有的任务。
+    #[test]
+    fn stored_schedule_time_is_the_validated_string() {
+        let _g = isolate_app_dir("sched_trim");
+        let notepad = r"C:\Windows\notepad.exe";
+        if !std::path::Path::new(notepad).is_file() {
+            return;
+        }
+        add_task("粘来的", notepad, "", "once", " 2026-12-01 10:00 ", true).unwrap();
+        let t = &get_all_tasks()[0];
+        assert_eq!(
+            t.schedule_time, "2026-12-01 10:00",
+            "入库的必须是校验过的那个串"
+        );
+        let later = Local.with_ymd_and_hms(2026, 12, 1, 10, 30, 0).unwrap();
+        assert!(should_run(t, &later), "规范化之后这一条才真的到点会跑");
+    }
+
+    /// 库里躺着带空格的旧行时：编辑只规范化空格，不算"改了调度时刻"。
+    ///
+    /// `schedule_changed` 原来拿新串与**原始**库值比，于是 `" 09:00 "` → `"09:00"`
+    /// 这一纯规范化会被判成改了时刻 ⇒ 清空 `last_run` ⇒ 当天那个程序又被启动一遍。
+    /// `init_db` 那一次性 `TRIM` 规范化也在这里钉住（旧版 Python 的调度库是整份
+    /// 复制进来的，`migration.rs` 的 AUX_DBS，那种行靠写侧修不到）。
+    #[test]
+    fn normalizing_spaces_alone_does_not_reset_the_anchor() {
+        let _g = isolate_app_dir("sched_trim_legacy");
+        let legacy = r"C:\focusflow-test-dir\不存在的目标.exe";
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_tasks (id, name, target_path, args, schedule_type, \
+                 schedule_time, enabled, last_run, created_at) \
+                 VALUES (7201, 'legacy', ?1, '', 'daily', ' 09:00 ', 1, \
+                 '2026-10-01 09:00:00', '2026-01-01 00:00:00')",
+                [legacy],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_tasks (id, name, target_path, args, schedule_type, \
+                 schedule_time, enabled, last_run, created_at) \
+                 VALUES (7202, 'legacy2', ?1, '', 'daily', ' 08:00 ', 1, NULL, \
+                 '2026-01-01 00:00:00')",
+                [legacy],
+            )
+            .unwrap();
+        }
+
+        // 只改名字、并把手上的 `"09:00"` 传回去：空格被规范化，但锚必须留着
+        // （参数顺序是 id, name, target_path, args, schedule_type, schedule_time, enabled）
+        update_task(7201, Some("改名"), None, None, None, Some("09:00"), None).unwrap();
+        let t = get_all_tasks().into_iter().find(|x| x.id == 7201).unwrap();
+        assert_eq!(t.schedule_time, "09:00", "编辑应当顺手把空格规范化");
+        assert_eq!(
+            t.last_run.as_deref(),
+            Some("2026-10-01 09:00:00"),
+            "只是规范化空格不该重置防同日重跑的锚（那会当天多启动一次）"
+        );
+
+        // 另一条没人碰它：`init_db` 把库里的历史脏行一次性洗干净
+        init_db().expect("init_db 必须幂等");
+        init_db().expect("重复调用也得幂等");
+        let raw: String = {
+            let conn = open().unwrap();
+            conn.query_row(
+                "SELECT schedule_time FROM scheduled_tasks WHERE id=7202",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            raw, "08:00",
+            "init_db 的一次性规范化要覆盖没被编辑过的旧行: {raw:?}"
+        );
     }
 
     /// 只改调度类型时，必须按**合并后的整对**判定：daily `09:00` 改成 once 而
