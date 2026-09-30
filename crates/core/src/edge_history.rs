@@ -305,7 +305,10 @@ pub fn save_edge_history_count(target_date: NaiveDate, count: i64) -> Result<(),
 }
 
 /// 获取近 N 天 Edge 历史计数，**按天补零**：返回的要么正好是 `days` 项、按日期升序，
-/// 要么是空表（一次都没刷新过）。
+/// 要么是空表（这个窗口内一次都没刷新过）。
+///
+/// 窗口是 `[今天-days+1, 今天]`，两头都夹：晚于今天的行既不进表，也不算"刷过"
+/// （见查询处那条注释 —— 它能从时钟超前的机器上随 `data/` 一起复制进来）。
 ///
 /// 以前只回数据库里存在的那几行：面板标题写着「近 30 天」，表格里却常只躺两三行，
 /// 而且没人说得清"这天没记录"和"这天没刷过"差在哪。补零之后"没有行"这个信号只剩
@@ -336,11 +339,19 @@ pub fn get_edge_history_counts(days: i64) -> Result<Vec<(String, i64)>, String> 
         return Ok(Vec::new());
     };
     let start_str = start.format("%Y-%m-%d").to_string();
+    let today_str = today.format("%Y-%m-%d").to_string();
+    // 上界必须有：库里可能存在**晚于今天**的行（在时钟超前的机器上刷新一轮后，把
+    // `data/` 按搬家那条路口径复制过来；或本机对过表 —— 先往前调、刷了一轮、又调回来，
+    // 与 `writer.rs` 为时钟回拨重锚今日计数防的是同一件事）。只夹下界时那行会挤进
+    // `saved`，于是下面"窗口内没有行 = 从没刷过"这个哨兵被顶开，一列 0 的假历史就
+    // 发出去了，而插件的峰值会显示 0 而不是 "—"。
     let mut stmt = conn
-        .prepare("SELECT date, count FROM edge_history WHERE date >= ?1 ORDER BY date")
+        .prepare(
+            "SELECT date, count FROM edge_history WHERE date >= ?1 AND date <= ?2 ORDER BY date",
+        )
         .map_err(|e| format!("准备趋势查询失败: {e}"))?;
     let saved: Vec<(String, i64)> = stmt
-        .query_map([&start_str], |r| {
+        .query_map(rusqlite::params![start_str, today_str], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         })
         .map_err(|e| format!("查询趋势失败: {e}"))?
@@ -1205,6 +1216,18 @@ mod tests {
             "一次都没刷新过时不该编出一张 30 天的表"
         );
 
+        // 窗口之外的另一头：晚于今天的行。写法用的是产品自己的入口 —— 真实成因就是
+        // "刷新发生在那一刻的『今天』"（本机时钟先往前调过、随后调回来；或把 `data/`
+        // 从时钟超前的机器上复制过来），测试改不了系统时钟，只能把那种行按同一条路径插进去。
+        // 只夹下界时它会把"窗口内没行 = 从没刷过"这个哨兵顶开，面板就从 "—"
+        // 变成一整列 0、峰值显示 0。
+        save_edge_history_count(today + chrono::Days::new(5), 33).unwrap();
+        assert_eq!(
+            get_edge_history_counts(30),
+            Ok(Vec::new()),
+            "库里只有晚于今天的那一行时，仍然必须判成「这个窗口没刷过」"
+        );
+
         save_edge_history_count(today, 7).unwrap();
         save_edge_history_count(today - chrono::Days::new(3), 4).unwrap();
         // 窗口之外的老日子：存在库里，但不该挤进这张 30 天的表
@@ -1215,6 +1238,10 @@ mod tests {
         assert!(
             !counts.iter().any(|(_, c)| *c == 999),
             "400 天前那行不该被算进近 30 天"
+        );
+        assert!(
+            !counts.iter().any(|(_, c)| *c == 33),
+            "晚于今天那行不该挤进这张表，也不该改变任何一天的值"
         );
         let fmt = |d: NaiveDate| d.format("%Y-%m-%d").to_string();
         assert_eq!(counts[0].0, fmt(today - chrono::Days::new(29)));
