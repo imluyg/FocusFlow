@@ -727,7 +727,28 @@ pub struct DeviceStat {
 ///
 /// 这类设备的真实实例路径当时没登记，已经不可考。常数放在这里是为了让
 /// 写入侧（生成占位）与展示侧（`fallback_device_name` 识别占位）共用同一份定义。
+///
+/// 完整形态是 `device-id:<年份>:<库内 id>`。**年份是必须的**：`devices.id` 每个
+/// 年度库各自自增、互不相干，裸 id 当身份键的话，2025 库的 3 号设备与 2026 库的
+/// 3 号设备（两台无关的设备）会在跨年视图里被并成一台 —— 次数相加、别名互串；
+/// 跨年归档的 `INSERT OR IGNORE` + 按 device_key 建 id 映射还会把源库的计数
+/// 映到目标库那台不相干的设备上（张冠李戴）。
+/// 年份取"这条占位键诞生在哪个库"，随行搬到目标库后不再改写，所以同一台设备
+/// 不管停在哪个库里，键都只有一个。
 pub(crate) const ARCHIVED_DEVICE_KEY_PREFIX: &str = "device-id:";
+
+/// 占位键的生成处：写入侧（补登记、迁移）用它，SQL 兜底用
+/// [`archived_device_key_sql_prefix`]，两者由用例逐字对一次。
+pub(crate) fn archived_device_key(year: i32, device_id: i64) -> String {
+    format!("{ARCHIVED_DEVICE_KEY_PREFIX}{year}:{device_id}")
+}
+
+/// SQL 内联用的占位键前缀片段：`'device-id:2025:' || dc.device_id`。
+///
+/// `year` 来自我们自己数出来的年度库清单（i32），拼进 SQL 没有注入面。
+pub(crate) fn archived_device_key_sql_prefix(year: i32) -> String {
+    format!("'{}{year}:'", ARCHIVED_DEVICE_KEY_PREFIX)
+}
 
 /// 设备无登记名时的回退显示名：优先截取 VID/PID 段，其次处理归档占位，最后截断原路径。
 ///
@@ -740,7 +761,12 @@ pub(crate) fn fallback_device_name(device_key: &str) -> String {
         // 跨年归档给「有统计行、没登记行」的历史设备补的占位键（`sync_device_dict`）：
         // 那批设备的真实路径当时没登记，已经不可考，只能说明它的来历，
         // 不能把 `device-id:3` 这种纯机器串端给用户。
-        format!("未知设备 · 归档 #{id}")
+        match id.split_once(':') {
+            // 现形 `<年份>:<库内 id>`：年份就是它的来历，裸 id 不是
+            Some((year, n)) => format!("未知设备 · {year} 年归档 #{n}"),
+            // 旧形：库还没跑过 `ensure_schema` 时文件里仍是裸 id
+            None => format!("未知设备 · 归档 #{id}"),
+        }
     } else {
         let n = device_key.chars().count();
         if n > 40 {
@@ -827,10 +853,15 @@ struct DeviceRow {
 
 /// 设备查询公共实现：device_counts 聚合 + LEFT JOIN devices 取登记名。
 /// `cond` 为 date_key 条件片段，空串表示全表；表不存在（旧库）时返回 None。
+///
+/// `year` 是**这个库文件的年份**，只用来给「统计行有、登记行没有」那批兜底键起名
+/// （见 [`archived_device_key_sql_prefix`]）：`devices.id` 各库各自自增，
+/// 不带年份的话两个库里的同号设备会被当成同一台。
 fn query_devices_in_conn(
     conn: &Connection,
     cond: &str,
     param: Option<i64>,
+    year: i32,
 ) -> Option<Vec<DeviceRow>> {
     if !table_exists(conn, "device_counts") {
         return None;
@@ -845,10 +876,11 @@ fn query_devices_in_conn(
     // 顺带避免了按长文本分组的临时 B 树。
     // COALESCE 兜底：登记行缺失（历史库）时也不能丢计数。
     let sql = format!(
-        "SELECT COALESCE(d.device_key, 'device-id:' || dc.device_id) AS dkey,
+        "SELECT COALESCE(d.device_key, {} || dc.device_id) AS dkey,
                 d.name, d.kind, SUM(dc.count) AS cnt
          FROM device_counts dc LEFT JOIN devices d ON d.id = dc.device_id
-         {where_clause} GROUP BY dc.device_id"
+         {where_clause} GROUP BY dc.device_id",
+        archived_device_key_sql_prefix(year)
     );
     let mapper = |r: &rusqlite::Row<'_>| {
         Ok(DeviceRow {
@@ -1010,7 +1042,7 @@ pub fn get_device_stats(days: Option<i64>, year: Option<i32>) -> (i64, Vec<Devic
                     ""
                 };
                 let result = connection::with_ro_conn(&path, |conn| {
-                    query_devices_in_conn(conn, cond, start_dk)
+                    query_devices_in_conn(conn, cond, start_dk, year)
                 });
                 if let Some(mut list) = result.flatten() {
                     merged.append(&mut list);
@@ -1030,8 +1062,9 @@ fn devices_single_year(year: i32, days: Option<i64>) -> Vec<DeviceRow> {
     } else {
         ""
     };
-    let result =
-        connection::with_ro_conn(&path, |conn| query_devices_in_conn(conn, cond, start_dk));
+    let result = connection::with_ro_conn(&path, |conn| {
+        query_devices_in_conn(conn, cond, start_dk, year)
+    });
     result.flatten().unwrap_or_default()
 }
 
@@ -1040,7 +1073,7 @@ pub fn get_device_stats_by_date(target_date: chrono::NaiveDate) -> (i64, Vec<Dev
     let dk = day_key_of_date(target_date);
     let path = paths::year_db_path(target_date.year());
     let result = connection::with_ro_conn(&path, |conn| {
-        query_devices_in_conn(conn, "date_key = ?1", Some(dk))
+        query_devices_in_conn(conn, "date_key = ?1", Some(dk), target_date.year())
     });
     merge_device_rows(result.flatten().unwrap_or_default())
 }
@@ -1109,21 +1142,48 @@ pub struct DeviceDetail {
 ///
 /// 在 Rust 里归一而不是注册 SQL 函数：登记表一个库就几行，读全表的成本可以忽略，
 /// 而口径与展示侧用的是同一份实现；rusqlite 的自定义函数还要另开 `functions` feature。
-fn device_ids_of_identity(conn: &Connection, device_key: &str) -> Vec<i64> {
+///
+/// `db_year` 是本库文件的年份，用来接住**占位键**那台设备：它压根没有登记行
+/// （排行靠 `query_devices_in_conn` 的 COALESCE 兜底才出现在界面上），光扫 `devices`
+/// 永远扫不到 —— 不接住的话界面就是"排行有次数、点开详情全是 0"。键里就写着它的
+/// 库内 id，直接解出来；只认与本库年份相符的那一个，别的库的同编号设备不算它
+/// （那正是 C6 要避免的形态）。
+fn device_ids_of_identity(conn: &Connection, device_key: &str, db_year: i32) -> Vec<i64> {
     // 传进来的可以是任意形态（`get_device_detail` 已经归一，直接调这些 helper 的
     // 用例与日后别的调用方未必）：归一是幂等的，这里再归一次不改变答案，
     // 却省掉了"helper 只收身份键"这种看不见的约定。
     let identity = crate::device_alias::hardware_identity_key(device_key);
-    let Ok(mut stmt) = conn.prepare("SELECT id, device_key FROM devices") else {
-        return Vec::new();
+    let mut ids: Vec<i64> = match conn.prepare("SELECT id, device_key FROM devices") {
+        Ok(mut stmt) => {
+            match stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
+                Ok(rows) => rows
+                    .flatten()
+                    .filter(|(_, key)| crate::device_alias::hardware_identity_key(key) == identity)
+                    .map(|(id, _)| id)
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+        Err(_) => Vec::new(),
     };
-    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) else {
-        return Vec::new();
-    };
-    rows.flatten()
-        .filter(|(_, key)| crate::device_alias::hardware_identity_key(key) == identity)
-        .map(|(id, _)| id)
-        .collect()
+    if let Some(rest) = identity.strip_prefix(ARCHIVED_DEVICE_KEY_PREFIX) {
+        // 现形 `<年份>:<库内 id>`；旧形是裸 id（那个库连占位登记都没写过），
+        // 说的就是"本库的 n 号"
+        let (y, n) = match rest.split_once(':') {
+            Some((y, n)) => (y.parse::<i32>().ok(), n.parse::<i64>().ok()),
+            None => (None, rest.parse::<i64>().ok()),
+        };
+        let from_this_db = match y {
+            Some(y) => y == db_year,
+            None => true,
+        };
+        if let (true, Some(n)) = (from_this_db, n) {
+            if !ids.contains(&n) {
+                ids.push(n);
+            }
+        }
+    }
+    ids
 }
 
 /// `IN (?,?,…)` 的占位符串：只有 `?n`，值一律走绑定参数。
@@ -1151,7 +1211,7 @@ fn device_has_key_detail(identity: &str) -> bool {
             if !table_exists(conn, "device_key_counts") {
                 return None;
             }
-            let ids = device_ids_of_identity(conn, identity);
+            let ids = device_ids_of_identity(conn, identity, year);
             if ids.is_empty() {
                 return Some(false);
             }
@@ -1195,7 +1255,7 @@ fn device_key_rows(identity: &str, period: i64) -> Vec<(String, i64)> {
             if !table_exists(conn, "device_key_counts") {
                 return None;
             }
-            let ids = device_ids_of_identity(conn, identity);
+            let ids = device_ids_of_identity(conn, identity, year);
             if ids.is_empty() {
                 return Some(Vec::new());
             }
@@ -1255,7 +1315,7 @@ fn device_date_series(identity: &str) -> Vec<(i64, i64)> {
             if !table_exists(conn, "device_counts") {
                 return None;
             }
-            let ids = device_ids_of_identity(conn, identity);
+            let ids = device_ids_of_identity(conn, identity, year);
             if ids.is_empty() {
                 return Some(Vec::new());
             }
@@ -1435,7 +1495,7 @@ fn registered_kind(identity: &str) -> Option<String> {
             if !table_exists(conn, "devices") {
                 return None;
             }
-            let ids = device_ids_of_identity(conn, identity);
+            let ids = device_ids_of_identity(conn, identity, year);
             let first = *ids.first()?;
             conn.query_row("SELECT kind FROM devices WHERE id = ?1", [first], |r| {
                 r.get::<_, String>(0)
@@ -1871,17 +1931,39 @@ mod tests {
     /// 但回退本身若认不出这个前缀就会原样返回 —— 这条断言锁住后半段。
     #[test]
     fn fallback_device_name_handles_archived_placeholder() {
+        // 现形：带来源年份
         assert_eq!(
-            fallback_device_name("device-id:3"),
-            "未知设备 · 归档 #3",
+            fallback_device_name("device-id:2025:3"),
+            "未知设备 · 2025 年归档 #3",
             "归档占位要说明来历，不能显示机器串"
         );
+        // 旧形：库还没跑过 ensure_schema 时文件里仍是裸 id，也得能显示
+        assert_eq!(fallback_device_name("device-id:3"), "未知设备 · 归档 #3");
         assert_eq!(
             fallback_device_name("device-id:127"),
             "未知设备 · 归档 #127"
         );
         // 前缀必须一致：改了常量而忘记改生成侧会让这条失效
         assert_eq!(ARCHIVED_DEVICE_KEY_PREFIX, "device-id:");
+        // 生成侧有两份实现（Rust 与 SQL 内联），飘开了同一台设备就会分成两行
+        assert_eq!(
+            archived_device_key(2025, 3),
+            "device-id:2025:3",
+            "Rust 侧的拼法"
+        );
+        assert_eq!(
+            archived_device_key_sql_prefix(2025),
+            "'device-id:2025:'",
+            "SQL 侧的内联前缀"
+        );
+        // SQL 拼出来的串必须能被 Rust 侧同一个解析认出来（展示与归组同一份真相）
+        let from_sql = format!(
+            "{}{}",
+            archived_device_key_sql_prefix(2026).trim_matches('\''),
+            7
+        );
+        assert_eq!(from_sql, archived_device_key(2026, 7));
+        assert!(fallback_device_name(&from_sql).contains("2026 年归档 #7"));
         // 不能误伤正常短 key
         assert_eq!(fallback_device_name("short#path"), "short#path");
     }
@@ -2101,6 +2183,158 @@ mod tests {
         assert_eq!(from_legacy.key, this_key, "详情回写的键必须是身份段");
         crate::device_alias::clear(this_key).unwrap();
         crate::device_alias::invalidate_cache();
+    }
+
+    /// 两个年度库里**恰好同号**的孤儿设备必须是两台设备（C6）。
+    ///
+    /// 「有统计行、没登记行」的历史数据在查询侧用 `device-id:<...>` 占位键兜底，
+    /// 而 `devices.id` 是每个年度库各自自增的 —— 占位键不带来源年份时，2025 库的
+    /// 3 号设备和 2026 库的 3 号设备（两台毫无关系的设备）会被 `merge_device_rows`
+    /// 按同一身份并成一行：次数相加、给其中一台起的别名显示在另一台头上。
+    #[test]
+    fn archived_placeholder_keys_from_different_year_dbs_stay_separate() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("devq_orphan");
+
+        let this_year = Local::now().year();
+        let prev_year = this_year - 1;
+        // 两个库各插一条"只有统计行、没有登记行"的孤儿，并且故意用同一个 id=3
+        for (year, n) in [(prev_year, 40i64), (this_year, 60)] {
+            let conn = crate::db::connection::open_rw(&paths::year_db_path(year)).unwrap();
+            crate::db::connection::ensure_schema(&conn, year).unwrap();
+            let dk = day_key_of_date(chrono::NaiveDate::from_ymd_opt(year, 6, 1).expect("date"));
+            // 直接写 device_counts：绕开 devices 字典，制造孤儿行
+            conn.execute(
+                "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, 3, ?2)",
+                rusqlite::params![dk, n],
+            )
+            .unwrap();
+            // 让这个库真的算"有数据"（否则 available_years 把它当空壳滤掉）
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, ?2, 10)",
+                rusqlite::params![dk, n],
+            )
+            .unwrap();
+            drop(conn);
+        }
+        invalidate_years_cache();
+
+        // 总计视图（period=0）：两台设备两行
+        let (total, stats) = get_device_stats(None, None);
+        assert_eq!(total, 100, "两库次数都该算进来");
+        assert_eq!(
+            stats.len(),
+            2,
+            "跨库同号的孤儿必须是两台设备，不是一行: {:?}",
+            stats.iter().map(|s| (&s.key, s.count)).collect::<Vec<_>>()
+        );
+        assert!(
+            stats.iter().all(|s| s.count != 100),
+            "任何一行都不许是两库相加的数"
+        );
+        // 键必须带来源年份，且各自指向自己的库
+        let mut keys: Vec<&str> = stats.iter().map(|s| s.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                archived_device_key(prev_year, 3).as_str(),
+                archived_device_key(this_year, 3).as_str()
+            ],
+            "占位键必须是 device-id:<来源年份>:<库内 id>"
+        );
+        // 显示名要说清来历，不能把机器串端给用户
+        for s in &stats {
+            assert!(
+                s.name.contains("年归档 #3"),
+                "占位设备的名得能看懂: {:?}",
+                s.name
+            );
+            assert!(
+                !s.name.contains("device-id"),
+                "机器串不许上界面: {}",
+                s.name
+            );
+        }
+
+        // 别名互串是这台设备最疼的形态：给今年那只起名，去年的另一只不能跟着变
+        crate::device_alias::invalidate_cache();
+        let mine = archived_device_key(this_year, 3);
+        let theirs = archived_device_key(prev_year, 3);
+        crate::device_alias::set(&mine, "今年这只").unwrap();
+        let (_, after) = get_device_stats(None, None);
+        let row = |k: &str| {
+            after
+                .iter()
+                .find(|s| s.key == k)
+                .unwrap_or_else(|| panic!("找不到 {k}"))
+        };
+        assert_eq!(row(&mine).name, "今年这只");
+        assert_eq!(
+            row(&theirs).name,
+            row(&theirs).auto_name,
+            "另一台同号设备的名字被别名串走了"
+        );
+        // 详情也必须只统计自己那个库
+        assert_eq!(get_device_detail(&mine, 0).all, 60);
+        assert_eq!(get_device_detail(&theirs, 0).all, 40);
+        crate::device_alias::clear(&mine).unwrap();
+        crate::device_alias::invalidate_cache();
+    }
+
+    /// 库里已有的裸占位键（旧版本写下的）要在 `ensure_schema` 里补上来源年份，
+    /// 并且**重复执行是空操作**（不能每次都改写一遍）。
+    #[test]
+    fn legacy_bare_placeholder_keys_get_retagged_once() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("devq_retag");
+        let year = Local::now().year();
+        let path = paths::year_db_path(year);
+        {
+            let conn = crate::db::connection::open_rw(&path).unwrap();
+            crate::db::connection::ensure_schema(&conn, year).unwrap();
+            // 旧形态：设备表里躺着 `device-id:3`（没有来源年份）
+            conn.execute(
+                "INSERT INTO devices (id, device_key, name, kind) VALUES (3, 'device-id:3', 'device-id:3', 'unknown')",
+                [],
+            )
+            .unwrap();
+            let dk = day_key_of_date(chrono::NaiveDate::from_ymd_opt(year, 6, 1).expect("date"));
+            conn.execute(
+                "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, 3, 9)",
+                rusqlite::params![dk,],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 9, 10)",
+                rusqlite::params![dk],
+            )
+            .unwrap();
+        }
+        // 再走一次 ensure_schema（= 下次启动、或归档/导入打开这个库）
+        let conn = crate::db::connection::open_rw(&path).unwrap();
+        crate::db::connection::ensure_schema(&conn, year).unwrap();
+        let key: String = conn
+            .query_row("SELECT device_key FROM devices WHERE id = 3", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(key, archived_device_key(year, 3), "裸 id 要补上来源年份");
+        // 计数必须还挂在这行上（改的是键的写法，不是归属）
+        let n: i64 = conn
+            .query_row("SELECT SUM(count) FROM device_counts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 9);
+        drop(conn);
+        // 幂等：第三次跑不得再改一次（第三次会把年份写成两层）
+        let conn = crate::db::connection::open_rw(&path).unwrap();
+        crate::db::connection::ensure_schema(&conn, year).unwrap();
+        let key2: String = conn
+            .query_row("SELECT device_key FROM devices WHERE id = 3", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(key2, key, "重跑 ensure_schema 不该再改写占位键");
     }
 
     /// `has_key_detail` 问的是"这台设备记过键名明细吗"，不是"本周期里有吗"。

@@ -293,7 +293,7 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
         let migrate: anyhow::Result<usize> = (|| {
             let mut moved = 0usize;
             // 设备字典先同步 + 建 id 映射（明细表跨库搬 id 必须换算）
-            sync_device_dict(&conn, dk_from, dk_to)?;
+            sync_device_dict(&conn, dk_from, dk_to, source_year)?;
             for table in DATA_TABLES {
                 if is_device_id_table(table) {
                     continue; // 单独走 id 映射搬迁
@@ -367,9 +367,17 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
 /// 两个库的自增 id 各不相干，明细行不能照搬 `device_id`。
 /// 源库里只有统计行、没有登记行的历史数据（归档发生在设备登记表落地之前）
 /// 先补一条占位登记，否则映射 JOIN 会静默丢掉这些行。
+/// `src_year` 是**源库文件的年份**，只用于给那些占位键起名
+/// （见 `queries::ARCHIVED_DEVICE_KEY_PREFIX` 的注释：裸 id 会让两个库里的同号
+/// 设备在目标库里长成同一条登记）。
 /// 调用方需保证已 ATTACH 源库为 `source` 且处于同一事务中。
-fn sync_device_dict(conn: &Connection, dk_from: i64, dk_to: i64) -> anyhow::Result<()> {
-    // 1. 补齐源库的孤儿登记（占位名 device-id:<n>：路径已经丢了，救不回设备名，
+fn sync_device_dict(
+    conn: &Connection,
+    dk_from: i64,
+    dk_to: i64,
+    src_year: i32,
+) -> anyhow::Result<()> {
+    // 1. 补齐源库的孤儿登记（占位名 device-id:<年>:<n>：路径已经丢了，救不回设备名，
     //    但计数必须保住）
     //
     // id 必须显式写 `c.device_id`，不能交给 SQLite 自增：映射表是按
@@ -381,11 +389,12 @@ fn sync_device_dict(conn: &Connection, dk_from: i64, dk_to: i64) -> anyhow::Resu
         conn.execute(
             &format!(
                 "INSERT OR IGNORE INTO source.devices (id, device_key, name, kind)
-                 SELECT c.device_id, '{prefix}' || c.device_id, '{prefix}' || c.device_id, 'unknown'
+                 SELECT c.device_id, {prefix} || c.device_id, {prefix} || c.device_id, 'unknown'
                    FROM source.{table} c
                   WHERE c.date_key >= ?1 AND c.date_key < ?2
                     AND NOT EXISTS (SELECT 1 FROM source.devices d WHERE d.id = c.device_id)",
-                prefix = queries::ARCHIVED_DEVICE_KEY_PREFIX,
+                // 与查询侧兜底、与 `retag_archived_placeholders` 同一份拼法
+                prefix = queries::archived_device_key_sql_prefix(src_year),
             ),
             rusqlite::params![dk_from, dk_to],
         )?;

@@ -272,7 +272,7 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
     merge_active_seconds_into_daily(conn)?;
     // 再把「完整实例路径」归组键迁成「硬件身份段」（B14-2）：必须在索引批次之前，
     // 它会整表重建两张统计表（索引随 DROP 消失，下面的 CREATE IF NOT EXISTS 会补回）。
-    migrate_device_identity_keys(conn)?;
+    migrate_device_identity_keys(conn, year)?;
     // 复合主键前缀是 date_key，按设备单列过滤（设备详情）只能全表扫：
     // 这两条索引把「按设备取序列 / 取键名明细」变成索引区间扫描。
     //
@@ -295,6 +295,42 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 把本库里历史形态的占位键 `device-id:<库内 id>` 改成带来源年份的
+/// `device-id:<本年>:<库内 id>`。
+///
+/// 为什么必须带年份（C6）：`devices.id` 是**每个年度库各自自增**的，裸 id 当身份键
+/// 的话，2025 库的 3 号设备与 2026 库的 3 号设备（两台毫无关系的设备）在跨年视图
+/// 里会被并成一台 —— 次数相加、别名互串；按 device_key JOIN 的归档 id 映射还会把
+/// 源库的计数映到目标库那台不相干的设备上。
+///
+/// 只改"前缀之后不再有冒号"的那一行 —— 也就是旧形态的裸 id。
+/// 判据不能写成 `instr(device_key, ':') = 10`：那个冒号**永远**是前缀自己的，
+/// 于是 `device-id:2026:3` 第二次跑还会再被叠一层年份（写成 `2026:2026:3`）。
+/// 一个库里每个裸 id 最多一行（`device_key UNIQUE`），改完不会撞唯一键。
+/// 已经在这之前被并起来的历史计数救不回来（那些行当初就是照同一串键搬的），
+/// 这里只保证今后不再发生。
+fn retag_archived_placeholders(conn: &Connection, year: i32) -> anyhow::Result<()> {
+    use crate::db::queries::ARCHIVED_DEVICE_KEY_PREFIX as P;
+    let changed = conn.execute(
+        "UPDATE devices
+            SET device_key = ?1 || substr(device_key, ?2)
+          WHERE device_key LIKE ?3
+            AND instr(substr(device_key, ?2), ':') = 0",
+        rusqlite::params![
+            format!("{P}{year}:"),
+            // 跳过前缀那 10 个字符，只留库内 id（也用作"前缀之后"的起点）
+            P.chars().count() as i64 + 1,
+            format!("{P}%"),
+        ],
+    )?;
+    if changed > 0 {
+        tracing::info!(
+            "设备占位键补来源年份：{changed} 条 `device-id:<id>` → `device-id:{year}:<id>`"
+        );
+    }
+    Ok(())
+}
+
 /// 设备归组键重做（B14-2）：完整实例路径 → 硬件身份段（见
 /// `device_alias::hardware_identity_key`），同身份的历史计数合并求和。
 ///
@@ -305,7 +341,11 @@ pub fn ensure_schema(conn: &Connection, year: i32) -> anyhow::Result<()> {
 ///
 /// 硬取舍（见身份函数注释）：同型号 + 同接口的多台设备在此颗粒度必然并成一台，
 /// 历史计数随之合并 —— 这是迁移的一部分，不是 bug。
-fn migrate_device_identity_keys(conn: &Connection) -> anyhow::Result<()> {
+fn migrate_device_identity_keys(conn: &Connection, year: i32) -> anyhow::Result<()> {
+    // 先把历史形态的占位键 `device-id:<库内 id>` 补上来源年份（C6）。
+    // 放在守卫之前、且独立一次 UPDATE：它改的是"键的写法"，不是"键的归组颗粒度"，
+    // 拿它去触发下面那次整表重建是白干（重建的守卫只关心身份段）。
+    retag_archived_placeholders(conn, year)?;
     // 守卫该问的是"这次迁移会不会改变任何键"，而不是"库里有没有 `#`"。
     // 原来写成 `device_key LIKE '%#%'`，而 `hardware_identity_key` 只在
     // `parts.len() >= 3 && 中间段非空` 时才剥 `#` ⇒ 两段形态（`HID#ORPHAN`）
@@ -384,7 +424,7 @@ fn migrate_device_identity_keys(conn: &Connection) -> anyhow::Result<()> {
             }
         }
         for oid in &orphan_ids {
-            let key = format!("{}{oid}", crate::db::queries::ARCHIVED_DEVICE_KEY_PREFIX);
+            let key = crate::db::queries::archived_device_key(year, *oid);
             let nid = merged_meta.len() as i64 + 1;
             identity_new_id.insert(key.clone(), nid);
             merged_meta.push((key.clone(), key, "unknown".to_string()));
@@ -1122,7 +1162,7 @@ mod tests {
             .unwrap();
         }
         let base = IDENTITY_MIGRATIONS.with(|c| c.get());
-        migrate_device_identity_keys(&conn).unwrap();
+        migrate_device_identity_keys(&conn, year).unwrap();
         assert_eq!(
             IDENTITY_MIGRATIONS.with(|c| c.get()),
             base,
@@ -1135,13 +1175,13 @@ mod tests {
             [],
         )
         .unwrap();
-        migrate_device_identity_keys(&conn).unwrap();
+        migrate_device_identity_keys(&conn, year).unwrap();
         assert_eq!(
             IDENTITY_MIGRATIONS.with(|c| c.get()),
             base + 1,
             "有键会被改变时守卫必须放行"
         );
-        migrate_device_identity_keys(&conn).unwrap();
+        migrate_device_identity_keys(&conn, year).unwrap();
         assert_eq!(
             IDENTITY_MIGRATIONS.with(|c| c.get()),
             base + 1,
