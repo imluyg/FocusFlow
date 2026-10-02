@@ -890,6 +890,12 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
     // 两种形态给同一个值，已迁移的键原样返回。
     let mut first_at: HashMap<String, usize> = HashMap::new();
     let mut merged: Vec<DeviceRow> = Vec::with_capacity(rows.len());
+    // 与 merged 同序：每台展示行交出去的**规范键**（身份段）。
+    // 行键必须是这个，不能是"这个组里第一条库行的原始 device_key"—— 那个形态
+    // 取决于哪一年先被读到（`query_years` 在 period=0 走降序、跨年窗口走升序），
+    // 于是同一台设备在不同统计周期交出去两种键：别名只认其中一种（换个周期名字
+    // 就没了），而改名又按当前周期那种落盘（名字写在哪条键上跟着界面变）。
+    let mut identities: Vec<String> = Vec::with_capacity(rows.len());
     for row in rows {
         let identity = crate::device_alias::hardware_identity_key(&row.device_key);
         match first_at.get(&identity).copied() {
@@ -905,7 +911,8 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
                 }
             }
             None => {
-                first_at.insert(identity, merged.len());
+                first_at.insert(identity.clone(), merged.len());
+                identities.push(identity);
                 merged.push(row);
             }
         }
@@ -913,7 +920,8 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
     let total: i64 = merged.iter().map(|r| r.count).sum();
     let mut stats: Vec<DeviceStat> = merged
         .into_iter()
-        .map(|r| {
+        .zip(identities)
+        .map(|(r, identity)| {
             // 两种「没有可用名字」都要回退：
             //   1. 登记名缺失/空白          —— 登记表压根没这一行；
             //   2. 登记名 == device_key     —— 写入侧拿不到设备信息时的占位登记
@@ -926,16 +934,24 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
                 .name
                 .as_ref()
                 .map(|n| n.trim())
-                .filter(|n| !n.is_empty() && *n != r.device_key.as_str())
+                .filter(|n| {
+                    !n.is_empty()
+                        // 占位登记用的名字有两种写法：本行的原始键，和归一之后的
+                        // 身份键（`migrate_device_identity_keys` 用后者补占位行）。
+                        // 只比原始键的话，历史库里那条"名字=完整实例路径"的占位行
+                        // 会因为键已归一而被当成真名端给用户。
+                        && *n != r.device_key.as_str()
+                        && *n != identity.as_str()
+                })
                 .map(|n| n.to_string())
-                .unwrap_or_else(|| fallback_device_name(&r.device_key));
+                .unwrap_or_else(|| fallback_device_name(&identity));
             // 别名优先（用户改过的名字），别名缺失或为空时用自动名。
             // 去重只对自动名生效：两个不同设备可以起同一个别名，用户说了算。
-            let alias = aliases.resolve(&r.device_key).map(|s| s.to_string());
+            let alias = aliases.resolve(&identity).map(|s| s.to_string());
             let has_alias = alias.is_some();
             let aliased = alias.unwrap_or_else(|| auto_name.clone());
             DeviceStat {
-                key: r.device_key,
+                key: identity,
                 name: aliased,
                 auto_name,
                 has_alias,
@@ -1081,26 +1097,72 @@ pub struct DeviceDetail {
     pub has_key_detail: bool,
 }
 
+/// 这台设备在**本库**里的所有 `devices.id`（按硬件身份段认，见
+/// [`crate::device_alias::hardware_identity_key`]）。
+///
+/// 为什么不写 `WHERE d.device_key = ?1`：`devices.device_key` 的形态不止一种 ——
+/// 归组键迁移（`connection::migrate_device_identity_keys`）按库做，历史库被占用时
+/// 只跳过（`maintenance::migrate_all_year_device_keys`），于是同一台设备在旧库里
+/// 还是完整实例路径、在新库里是身份段。展示侧早就按身份段把它们并成一行
+/// （`merge_device_rows`），而单设备查询按文本等值比 —— 两边口径一岔，就是
+/// 「排行那一行 1000 次、点进详情只有 600 次」和「别名切个周期就不显示」。
+///
+/// 在 Rust 里归一而不是注册 SQL 函数：登记表一个库就几行，读全表的成本可以忽略，
+/// 而口径与展示侧用的是同一份实现；rusqlite 的自定义函数还要另开 `functions` feature。
+fn device_ids_of_identity(conn: &Connection, device_key: &str) -> Vec<i64> {
+    // 传进来的可以是任意形态（`get_device_detail` 已经归一，直接调这些 helper 的
+    // 用例与日后别的调用方未必）：归一是幂等的，这里再归一次不改变答案，
+    // 却省掉了"helper 只收身份键"这种看不见的约定。
+    let identity = crate::device_alias::hardware_identity_key(device_key);
+    let Ok(mut stmt) = conn.prepare("SELECT id, device_key FROM devices") else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .filter(|(_, key)| crate::device_alias::hardware_identity_key(key) == identity)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// `IN (?,?,…)` 的占位符串：只有 `?n`，值一律走绑定参数。
+fn in_placeholders(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 把 id 列表铺成绑定参数（`&[&dyn ToSql]`）。
+fn id_params(ids: &[i64]) -> Vec<&dyn rusqlite::ToSql> {
+    ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect()
+}
+
 /// 该设备在任何年份库里有没有一条键名明细。
 ///
 /// 与「本周期内有没有」是两件事，混起来会对着设备说谎：点「今日」看一台
 /// 上周还在用、今天没按过的鼠标，界面说的是"键名明细从该功能上线后开始积累，
 /// 此前的历史数据无法回溯"，而那台鼠标库里其实有几十条明细。
-fn device_has_key_detail(device_key: &str) -> bool {
+fn device_has_key_detail(identity: &str) -> bool {
     for year in query_years(None, None) {
         let path = paths::year_db_path(year);
         let found = connection::with_ro_conn(&path, |conn| {
             if !table_exists(conn, "device_key_counts") {
                 return None;
             }
-            let mut stmt = conn
-                .prepare(
-                    "SELECT 1 FROM device_key_counts k \
-                     JOIN devices d ON d.id = k.device_id \
-                     WHERE d.device_key = ?1 LIMIT 1",
-                )
-                .ok()?;
-            Some(stmt.exists([device_key]).unwrap_or(false))
+            let ids = device_ids_of_identity(conn, identity);
+            if ids.is_empty() {
+                return Some(false);
+            }
+            let sql = format!(
+                "SELECT 1 FROM device_key_counts k \
+                 WHERE k.device_id IN ({}) LIMIT 1",
+                in_placeholders(ids.len())
+            );
+            let pv = id_params(&ids);
+            let mut stmt = conn.prepare(&sql).ok()?;
+            Some(stmt.exists(pv.as_slice()).unwrap_or(false))
         })
         .flatten()
         .unwrap_or(false);
@@ -1114,7 +1176,7 @@ fn device_has_key_detail(device_key: &str) -> bool {
 /// 单设备在周期内的键名排行（跨年度库合并，次数降序）。
 ///
 /// 表不存在（旧库）时返回空 —— 键名明细从该功能上线后开始积累，历史无法回溯。
-fn device_key_rows(device_key: &str, period: i64) -> Vec<(String, i64)> {
+fn device_key_rows(identity: &str, period: i64) -> Vec<(String, i64)> {
     let today_key = day_key_of_date(Local::now().date_naive());
     let start_key = match period {
         -1 => Some(today_key),
@@ -1133,37 +1195,44 @@ fn device_key_rows(device_key: &str, period: i64) -> Vec<(String, i64)> {
             if !table_exists(conn, "device_key_counts") {
                 return None;
             }
-            let (sql, param) = match start_key {
+            let ids = device_ids_of_identity(conn, identity);
+            if ids.is_empty() {
+                return Some(Vec::new());
+            }
+            let ph = in_placeholders(ids.len());
+            // GROUP BY key_name 在这台设备的**所有 id** 上做：同一台设备在同库里
+            // 可能占两行（两种键形态的历史登记），明细必须加到一起。
+            let (sql, tail) = match start_key {
                 Some(sk) => (
-                    "SELECT k.key_name, SUM(k.count) FROM device_key_counts k \
-                       JOIN devices d ON d.id = k.device_id \
-                     WHERE d.device_key = ?1 AND k.date_key >= ?2 GROUP BY k.key_name",
+                    format!(
+                        "SELECT k.key_name, SUM(k.count) FROM device_key_counts k \
+                         WHERE k.device_id IN ({ph}) AND k.date_key >= ?{} \
+                         GROUP BY k.key_name",
+                        ids.len() + 1
+                    ),
                     Some(sk),
                 ),
                 None => (
-                    "SELECT k.key_name, SUM(k.count) FROM device_key_counts k \
-                       JOIN devices d ON d.id = k.device_id \
-                     WHERE d.device_key = ?1 GROUP BY k.key_name",
+                    format!(
+                        "SELECT k.key_name, SUM(k.count) FROM device_key_counts k \
+                         WHERE k.device_id IN ({ph}) GROUP BY k.key_name"
+                    ),
                     None,
                 ),
             };
-            let mut stmt = conn.prepare(sql).ok()?;
-            let list: Vec<(String, i64)> = match param {
-                Some(p) => stmt
-                    .query_map(rusqlite::params![device_key, p], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })
-                    .ok()?
-                    .flatten()
-                    .collect(),
-                None => stmt
-                    .query_map(rusqlite::params![device_key], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })
-                    .ok()?
-                    .flatten()
-                    .collect(),
-            };
+            let mut pv = id_params(&ids);
+            if let Some(ref sk) = tail {
+                pv.push(sk as &dyn rusqlite::ToSql);
+            }
+            let list: Vec<(String, i64)> = conn
+                .prepare(&sql)
+                .ok()
+                .and_then(|mut stmt| {
+                    stmt.query_map(pv.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))
+                        .ok()
+                        .map(|rows| rows.flatten().collect())
+                })
+                .unwrap_or_default();
             Some(list)
         });
         for (name, c) in rows.flatten().unwrap_or_default() {
@@ -1178,7 +1247,7 @@ fn device_key_rows(device_key: &str, period: i64) -> Vec<(String, i64)> {
 /// 单设备按天次数序列（跨年度库合并，date_key 升序）。
 ///
 /// 设备维度按年份分库存储，查询必须跨库合并 —— 与 `get_device_stats` 同理。
-fn device_date_series(device_key: &str) -> Vec<(i64, i64)> {
+fn device_date_series(identity: &str) -> Vec<(i64, i64)> {
     let mut merged: HashMap<i64, i64> = HashMap::new();
     for year in query_years(None, None) {
         let path = paths::year_db_path(year);
@@ -1186,18 +1255,25 @@ fn device_date_series(device_key: &str) -> Vec<(i64, i64)> {
             if !table_exists(conn, "device_counts") {
                 return None;
             }
-            let mut stmt = conn
-                .prepare(
-                    "SELECT c.date_key, c.count FROM device_counts c \
-                       JOIN devices d ON d.id = c.device_id \
-                     WHERE d.device_key = ?1",
-                )
-                .ok()?;
-            let list: Vec<(i64, i64)> = stmt
-                .query_map([device_key], |r| Ok((r.get(0)?, r.get(1)?)))
-                .ok()?
-                .flatten()
-                .collect();
+            let ids = device_ids_of_identity(conn, identity);
+            if ids.is_empty() {
+                return Some(Vec::new());
+            }
+            let sql = format!(
+                "SELECT c.date_key, c.count FROM device_counts c \
+                 WHERE c.device_id IN ({})",
+                in_placeholders(ids.len())
+            );
+            let pv = id_params(&ids);
+            let list: Vec<(i64, i64)> = conn
+                .prepare(&sql)
+                .ok()
+                .and_then(|mut stmt| {
+                    stmt.query_map(pv.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))
+                        .ok()
+                        .map(|rows| rows.flatten().collect())
+                })
+                .unwrap_or_default();
             Some(list)
         });
         for (dk, c) in rows.flatten().unwrap_or_default() {
@@ -1223,9 +1299,14 @@ fn period_start_key(today_key: i64, period: i64) -> i64 {
 }
 
 pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
+    // 交进来的键先归一成身份段。排行行的 key 已经是身份形态，但这是个外部入口
+    // （界面快照、CLI、手改的别名文件都可能递来历史形态的完整实例路径），
+    // 不归一的话单设备查询与下面那句 `s.key == device_key` 都认不出同一台设备 ——
+    // 表现就是「点进去数字比排行那一行小」和「弹窗里没名字」。
+    let device_key = crate::device_alias::hardware_identity_key(device_key);
     let today_date = Local::now().date_naive();
     let today_key = day_key_of_date(today_date);
-    let series = device_date_series(device_key);
+    let series = device_date_series(&device_key);
 
     let from_key = period_start_key(today_key, period);
     let in_period = |dk: i64| dk >= from_key;
@@ -1260,15 +1341,15 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
             stats[i].kind.clone(),
         ),
         None => {
-            let auto = fallback_device_name(device_key);
+            let auto = fallback_device_name(&device_key);
             let alias = crate::device_alias::table()
-                .resolve(device_key)
+                .resolve(&device_key)
                 .map(|s| s.to_string());
             (
                 alias.clone().unwrap_or_else(|| auto.clone()),
                 auto,
                 alias.is_some(),
-                registered_kind(device_key).unwrap_or_else(|| "unknown".to_string()),
+                registered_kind(&device_key).unwrap_or_else(|| "unknown".to_string()),
             )
         }
     };
@@ -1281,7 +1362,7 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
         .unwrap_or(0);
 
     // 周期内键名排行（设备 × 键名明细；旧库无该表时为空）
-    let key_rows = device_key_rows(device_key, period);
+    let key_rows = device_key_rows(&device_key, period);
     let key_total: i64 = key_rows.iter().map(|(_, c)| *c).sum();
 
     // 近 30 天分布（缺数据补 0，便于前端直接画柱）
@@ -1306,7 +1387,7 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
         .collect();
 
     DeviceDetail {
-        key: device_key.to_string(),
+        key: device_key.clone(),
         name,
         auto_name,
         has_alias,
@@ -1339,23 +1420,26 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
         trend,
         keys: key_rows,
         key_total,
-        has_key_detail: device_has_key_detail(device_key),
+        has_key_detail: device_has_key_detail(&device_key),
     }
 }
 
 /// 读取设备登记表里的类型（用于周期内无数据、无法从排行取到类型的情况）。
-fn registered_kind(device_key: &str) -> Option<String> {
+///
+/// 按身份段找（[`device_ids_of_identity`]）：同一台设备在一个库里可能占着两种
+/// 键形态的历史登记，随便取一条的类型即可。
+fn registered_kind(identity: &str) -> Option<String> {
     for year in query_years(None, None) {
         let path = paths::year_db_path(year);
         let kind = connection::with_ro_conn(&path, |conn| {
             if !table_exists(conn, "devices") {
                 return None;
             }
-            conn.query_row(
-                "SELECT kind FROM devices WHERE device_key = ?1",
-                [device_key],
-                |r| r.get::<_, String>(0),
-            )
+            let ids = device_ids_of_identity(conn, identity);
+            let first = *ids.first()?;
+            conn.query_row("SELECT kind FROM devices WHERE id = ?1", [first], |r| {
+                r.get::<_, String>(0)
+            })
             .ok()
         });
         if let Some(Some(k)) = kind {
@@ -1962,6 +2046,61 @@ mod tests {
         // 按单年查询不受影响
         assert_eq!(get_device_stats(None, Some(this_year)).0, 60);
         assert_eq!(get_device_stats(None, Some(prev_year)).0, 45);
+
+        // ===== 行键必须是身份段，不能是"这个组里第一条库行的原始键" =====
+        // 读库顺序在两条路上是**反的**：period=0 走 `available_years()`（降序，
+        // 今年的身份键先进来），跨年窗口走 `start.year()..=now.year()`（升序，
+        // 去年的完整路径先进来）。行键跟着第一条走的话，同一台设备在两个统计
+        // 周期里交出两种键 —— 别名只认一种，改名又按当前那种落盘。
+        assert_eq!(same.key, this_key, "总计视图的行键");
+        let window = get_device_stats(Some(600), None)
+            .1
+            .into_iter()
+            .find(|s| s.key == this_key || s.key == prev_key)
+            .expect("跨年窗口里这台设备必须还是那一行");
+        assert_eq!(
+            window.key, this_key,
+            "跨年窗口的行键也得是身份段（升序读库时它是后到的那一条）"
+        );
+        assert_eq!(window.count, 100, "窗口里并起来的次数与总计同口径");
+
+        // 一次改名，两个视图都要认（这就是"改完名切个周期名字没了"的那条腿）
+        crate::device_alias::invalidate_cache();
+        crate::device_alias::set(&window.key, "跨年也认的名字").unwrap();
+        let (t_total, t_stats) = get_device_stats(None, None);
+        assert_eq!(t_total, 105);
+        assert_eq!(
+            t_stats
+                .iter()
+                .find(|s| s.key == this_key)
+                .expect("总计视图找得到这台设备")
+                .name,
+            "跨年也认的名字"
+        );
+        assert_eq!(
+            get_device_stats(Some(600), None)
+                .1
+                .iter()
+                .find(|s| s.key == this_key)
+                .expect("跨年视图找得到这台设备")
+                .name,
+            "跨年也认的名字",
+            "别名不能只认写入时那一种键形态"
+        );
+
+        // 详情必须给整台设备的数：单设备查询原先按 `d.device_key = ?1` 文本等值比，
+        // 于是「排行那一行 100 次、点进详情只有 60 次」（另一半库在历史形态的键上）。
+        let detail = get_device_detail(this_key, 0);
+        assert_eq!(detail.all, 100, "详情的总计要等于排行那一行");
+        assert_eq!(detail.period_count, 100);
+        assert_eq!(detail.active_days, 2, "两个库各一天 = 活跃两天");
+        assert_eq!(detail.name, "跨年也认的名字");
+        // 拿历史形态的键进来（旧界面快照、CLI、手改的别名文件）也得是同一台设备
+        let from_legacy = get_device_detail(prev_key, 0);
+        assert_eq!(from_legacy.all, 100, "用旧形态键点详情也得拿到全部次数");
+        assert_eq!(from_legacy.key, this_key, "详情回写的键必须是身份段");
+        crate::device_alias::clear(this_key).unwrap();
+        crate::device_alias::invalidate_cache();
     }
 
     /// `has_key_detail` 问的是"这台设备记过键名明细吗"，不是"本周期里有吗"。
@@ -1977,7 +2116,10 @@ mod tests {
         let today = Local::now().date_naive();
         let dk = day_key_of_date(today);
         let old = "HID#VID_046D&PID_C52B&MI_00#old";
-        let never = "HID#VID_046D&PID_C52B&MI_00#never";
+        // 必须换**型号**才算另一台设备：B14-2 之后换实例号（原来这里是 `#never`）
+        // 是同一台设备的另一种键形态，明细当然归它 —— 拿那种写法造"从没记过明细"
+        // 的设备，造出来的只是同一台设备的第二个别名键。
+        let never = "HID#VID_1111&PID_2222#never";
         {
             let path = paths::year_db_path(today.year());
             let conn = crate::db::connection::open_rw(&path).unwrap();

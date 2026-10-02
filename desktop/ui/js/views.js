@@ -272,7 +272,12 @@ export function deviceRenameSave(key) {
   const alias = input ? input.value : deviceDraft;
   exitDeviceEditing();
   invoke("set_device_alias", { key, alias })
-    .catch((e) => console.warn("设备改名失败", e))
+    .then((saved) => {
+      applyAliasLocally(key, saved);
+      // 后端按 MAX_ALIAS_CHARS 静默截断：不说的话只像"我打的那几个字没了"
+      if (saved && saved !== alias.trim()) toast(`名字太长，已截为「${saved}」`);
+    })
+    .catch((e) => toast("设备改名失败：" + e))
     .finally(refreshDeviceDetailIfOpen);
 }
 
@@ -280,8 +285,33 @@ export function deviceRenameSave(key) {
 export function deviceRenameClear(key) {
   exitDeviceEditing();
   invoke("set_device_alias", { key, alias: "" })
-    .catch((e) => console.warn("设备还原失败", e))
+    .then((saved) => applyAliasLocally(key, saved))
+    .catch((e) => toast("设备还原失败：" + e))
     .finally(refreshDeviceDetailIfOpen);
+}
+
+/// 用后端返回的最终别名就地改掉本地快照并重画。
+///
+/// 原本新名字要等 stats-worker 下一拍（500ms）的推送才落到界面，而
+/// `deviceRename()` 的预填读的就是这份快照（`dev.name`）：那一秒里再点一次
+/// 「改名」，预填到的是旧名（原本没别名的甚至是空串），回车就把刚设的名字
+/// 写回去、或直接走进删除分支删掉 —— 看起来正是「改完名没生效」。
+/// 失败这一支同样必须有出口：发布版没挂 devtools（desktop/Cargo.toml 的 tauri
+/// features 里没有它），`console.warn` 是条没人看得见的路，而后端专门写了
+/// 「别名文件此刻读不出来，已取消本次改动」这句话。
+function applyAliasLocally(key, saved) {
+  const list = deviceLastCharts && deviceLastCharts.devices;
+  if (!Array.isArray(list)) return;
+  const alias = String(saved || "").trim();
+  let hit = false;
+  for (const d of list) {
+    if (d.key !== key) continue;
+    hit = true;
+    d.has_alias = alias !== "";
+    // 别名不参与同名去重（后端同理：有别名的行永不加 "(2)"）
+    d.name = alias === "" ? d.auto_name : alias;
+  }
+  if (hit) renderDevices(deviceLastCharts);
 }
 
 /// 详情弹窗里也有「改名/还原」，而列表那侧保存完之后没人回头刷新弹窗 ——

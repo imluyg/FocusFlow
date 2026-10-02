@@ -38,7 +38,7 @@ pub struct AliasTable {
 
 impl AliasTable {
     fn from_map(map: &BTreeMap<String, String>) -> Self {
-        let mut exact = HashMap::new();
+        let mut exact: HashMap<String, String> = HashMap::new();
         let mut model: HashMap<String, Option<String>> = HashMap::new();
         for (key, alias) in map {
             // 长度闸必须在读侧：文件按模块头注释「可直接手改」，只在 `set()` 里钳
@@ -48,8 +48,34 @@ impl AliasTable {
             if alias.is_empty() {
                 continue;
             }
-            exact.insert(key.clone(), alias.clone());
-            if let Some(model_key) = model_key(key) {
+            // 索引一律按**硬件身份键**建：文件里的键可能是历史形态的完整实例路径
+            // （`migrate_exact_keys_to_identity` 之前写下的，或历史库没迁成时界面写下的），
+            // 而界面交回来的查询键是新形态。不在这里归一，同一台设备的别名就只认
+            // 其中一种形态 —— 换个统计周期名字消失、点「还原」还删不掉另一种形态。
+            let identity = hardware_identity_key(key);
+            let won = match exact.entry(identity.clone()) {
+                // 同一身份的多个键形态：序在前的赢（与 `migrate_exact_keys_to_identity`
+                // 同一套取舍；BTreeMap 迭代有序，完整路径以枚举器名开头必在前）
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    if existing.get() != &alias {
+                        tracing::warn!(
+                            "别名文件里 {key} 与另一条同身份键的别名不同，保留「{}」、忽略「{alias}」",
+                            existing.get()
+                        );
+                    }
+                    false
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(alias.clone());
+                    true
+                }
+            };
+            // 型号回退只收"赢下来的那条"：被忽略的另一形态本就不参与展示，
+            // 拿它去判歧义会把一个好端端的回退白白打掉。
+            if !won {
+                continue;
+            }
+            if let Some(model_key) = model_key(&identity) {
                 match model.get(&model_key) {
                     None => {
                         model.insert(model_key, Some(alias));
@@ -70,18 +96,24 @@ impl AliasTable {
         self.exact.is_empty()
     }
 
-    /// 解析某设备的展示名：精确 key → 型号回退，都没有则 None（调用方用自动名）。
+    /// 解析某设备的展示名：精确（身份键）→ 型号回退，都没有则 None（调用方用自动名）。
+    ///
+    /// 传进来的可以是任意键形态（完整实例路径或身份段）：先归一成身份键再查，
+    /// 所以读侧不再关心库里存的是哪一种。
     pub fn resolve(&self, device_key: &str) -> Option<&str> {
-        if let Some(alias) = self.exact.get(device_key) {
+        let identity = hardware_identity_key(device_key);
+        if let Some(alias) = self.exact.get(&identity) {
             return Some(alias.as_str());
         }
-        let model_key = model_key(device_key)?;
+        let model_key = model_key(&identity)?;
         self.model.get(&model_key)?.as_deref()
     }
 
     /// 已有别名（供 UI / CLI 展示与编辑回填）。
     pub fn exact_alias(&self, device_key: &str) -> Option<&str> {
-        self.exact.get(device_key).map(|s| s.as_str())
+        self.exact
+            .get(&hardware_identity_key(device_key))
+            .map(|s| s.as_str())
     }
 }
 
@@ -155,6 +187,9 @@ pub fn hardware_identity_key(device_key: &str) -> String {
 /// 幂等：身份键经 [`hardware_identity_key`] 原样返回，重复跑是空操作。
 /// 读不出文件（占用/损坏）时不动：等下次启动再试，别在内容可疑时覆盖。
 pub fn migrate_exact_keys_to_identity() {
+    // 迁移本身也是「读全表 → 整表写回」，与 set()/clear() 共用同一把串行锁，
+    // 否则启动迁移与界面上的一次改名交错，就是一次整表覆盖。
+    let _serial = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = alias_path();
     let map = match try_read_map(&path) {
         AliasRead::Good(m) => m,
@@ -312,19 +347,58 @@ fn alias_unreadable(path: &std::path::Path) -> anyhow::Error {
     )
 }
 
+/// 读-改-写的串行锁（同进程内）。
+///
+/// `set()`/`clear()` 的形态是「读全表 → 动一行 → 整表写回」，所以两次并发改名
+/// 各自读到同一份旧快照时，后写的那一份会把先写的整表**整个盖掉** —— 先改的那个
+/// 名字静默消失，两个函数还都照旧返回 Ok。界面上连按两次回车、两条 IPC 并发进来
+/// 就是这一种；改名是低频动作，串行化的代价可以忽略。
+///
+/// 锁只兜得住本进程。与 `focusflow-cli --rename-device` 同时写仍是
+/// last-writer-wins：没上锁文件，因为进程被强杀留下的锁会把改名**永久**卡死，
+/// 那比现在这个偶发覆盖更糟。读侧不受影响（`table()` 每次按 mtime 现读，
+/// 手改文件的内容不会被下一次改名抹掉）。
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 抹掉别名表里挂在**同一台设备其他键形态**上的条目，返回抹掉的条数。
+///
+/// `set()`/`clear()` 一律按身份键落盘，而文件里可能还留着历史形态的完整实例路径
+/// （`migrate_exact_keys_to_identity` 跑之前写的，或某个历史库没迁成时界面写下的）。
+/// 不清它们的话有两个后果：改一次名留下两条同身份条目（谁生效取决于这次查的是哪种
+/// 形态），以及点「还原」只删得掉当前那一条 —— 另一条继续顶着旧名显示，名字赖着不走。
+/// 同一身份按 [`hardware_identity_key`] 的定义就是同一台设备，所以并掉不是张冠李戴。
+fn prune_other_forms(map: &mut BTreeMap<String, String>, identity: &str) -> usize {
+    let stale: Vec<String> = map
+        .keys()
+        .filter(|k| k.as_str() != identity && hardware_identity_key(k) == identity)
+        .cloned()
+        .collect();
+    for key in &stale {
+        tracing::warn!("别名按身份键收拢：{key} 与 {identity} 是同一台设备，旧形态条目已移除");
+        map.remove(key);
+    }
+    stale.len()
+}
+
 /// 写入别名：`alias` 为空白时等同删除。返回写入后的数量。
+///
+/// 键一律先归一成硬件身份段（见 `prune_other_forms`），所以库里存的是完整实例路径
+/// 还是身份段、界面交回来的是哪一种，都不影响最终显示与「还原」。
 pub fn set(device_key: &str, alias: &str) -> anyhow::Result<usize> {
+    let _serial = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = alias_path();
     let mut map = match try_read_map(&path) {
         AliasRead::Good(m) => m,
         AliasRead::Broken => BTreeMap::new(),
         AliasRead::Unreadable => return Err(alias_unreadable(&path)),
     };
+    let identity = hardware_identity_key(device_key);
+    prune_other_forms(&mut map, &identity);
     let trimmed = alias.trim();
     if trimmed.is_empty() {
-        map.remove(device_key);
+        map.remove(&identity);
     } else {
-        map.insert(device_key.to_string(), clamp_alias(trimmed));
+        map.insert(identity, clamp_alias(trimmed));
     }
     write_map(&map)?;
     Ok(map.len())
@@ -332,13 +406,16 @@ pub fn set(device_key: &str, alias: &str) -> anyhow::Result<usize> {
 
 /// 删除某设备别名，返回是否确有删除。
 pub fn clear(device_key: &str) -> anyhow::Result<bool> {
+    let _serial = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = alias_path();
     let mut map = match try_read_map(&path) {
         AliasRead::Good(m) => m,
         AliasRead::Broken => BTreeMap::new(),
         AliasRead::Unreadable => return Err(alias_unreadable(&path)),
     };
-    let removed = map.remove(device_key).is_some();
+    let identity = hardware_identity_key(device_key);
+    let dropped_other_forms = prune_other_forms(&mut map, &identity);
+    let removed = map.remove(&identity).is_some() || dropped_other_forms > 0;
     if removed {
         write_map(&map)?;
     }
@@ -354,16 +431,25 @@ pub fn clamp_alias(alias: &str) -> String {
     trimmed.chars().take(MAX_ALIAS_CHARS).collect()
 }
 
-/// 原子写回（临时文件 + rename），并立即失效缓存。
+/// 原子写回（同目录临时文件 + fsync + rename），并立即失效缓存。
+///
+/// 写的是 `device_aliases.json` —— 用户手工录入、库里没有第二份的名字。
+/// 原来这里自己写了半套：临时文件名固定（两个并发写会互相把对方的临时文件
+/// rename 走，然后一方报"找不到文件"）、且**没有 fsync**（掉电/崩溃留下的
+/// 半截 JSON 下一次读会被判成 Broken，从空表重新开始 = 全部别名没了）。
+/// 现在与 `config.ini` 共用 [`crate::config::atomic_write`]，同一套纪律一份实现。
 fn write_map(map: &BTreeMap<String, String>) -> anyhow::Result<()> {
     let path = alias_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(map)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)?;
+    if let Err(e) = crate::config::atomic_write(&path, &json) {
+        // 换一层自己的说法再上抛：共享实现里那句是「配置文件原子替换失败」，
+        // 而这条错误文案会一路走到界面上的改名失败提示里，指着 config.ini 说事
+        // 会把人引到另一个文件去。
+        return Err(e.context("设备别名文件原子替换失败"));
+    }
     // mtime 精度可能不足（同秒内多次改），直接清缓存保证下次读到新值
     *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok(())
@@ -411,7 +497,7 @@ mod tests {
         });
     }
 
-    /// 型号回退：实例路径变了（换 USB 口），同 VID/PID 的别名仍生效。
+    /// 型号回退：实例路径变了（换 USB 口），同型号的别名仍生效。
     #[test]
     fn model_fallback_matches_replugged_port() {
         with_temp_dir("model", || {
@@ -422,11 +508,25 @@ mod tests {
             assert_eq!(
                 table().resolve(new_key),
                 Some("新鼠标"),
-                "同型号换端口后别名应回退命中"
+                "同型号换端口后别名应命中"
             );
-            // 精确别名不覆盖型号回退
+            // 换口后的路径与旧路径是**同一台设备**（同一身份段），所以在 new_key 上
+            // 再起名就是改这台设备的名字，不是"另开一条精确别名压过回退"。
+            // B14-2 之前这两条是两个键、可以并存两个名字；现在文件里只该留一条。
             set(new_key, "第二只 G304").unwrap();
             assert_eq!(table().resolve(new_key), Some("第二只 G304"));
+            assert_eq!(
+                table().resolve(old_key),
+                Some("第二只 G304"),
+                "同一台设备只有一个名字"
+            );
+            let text = std::fs::read_to_string(alias_path()).unwrap();
+            let after: BTreeMap<String, String> = serde_json::from_str(&text).unwrap();
+            assert_eq!(after.len(), 1, "两种键形态该收拢成一条: {text}");
+            assert!(
+                after.contains_key("VID_046D&PID_C52B&MI_00"),
+                "留下的那条必须是身份键: {text}"
+            );
         });
     }
 
@@ -475,15 +575,43 @@ mod tests {
     }
 
     /// 同型号多个不同别名 → 视为歧义，不参与型号回退（避免张冠李戴）。
+    ///
+    /// 三个键必须是**三台不同设备**才谈得上歧义：B14-2 之后 `#A/#B/#C` 那种
+    /// 「同身份换个实例号」已经被有意并成一台（见 `hardware_identity_key` 的硬取舍），
+    /// 拿它们造歧义造不出来 —— 三次 `set` 落在同一个身份键上，最后一次说话。
+    /// 这里用两个真会分身的身份形态：一个带 `&MI_00`、一个在同型号上再挂个 `&Col01`，
+    /// 两者的型号回退键都是 `046D/C52B#MI_00`（`interface_tag` 先认 `&MI_`）。
     #[test]
     fn ambiguous_model_aliases_do_not_fallback() {
         with_temp_dir("ambiguous", || {
-            set("HID#VID_046D&PID_C52B#A", "旧鼠标").unwrap();
-            set("HID#VID_046D&PID_C52B#B", "新鼠标").unwrap();
-            let unknown = "HID#VID_046D&PID_C52B#C";
+            let a = "VID_046D&PID_C52B&MI_00";
+            let b = "VID_046D&PID_C52B&MI_00&Col01";
+            assert_ne!(a, b, "夹具得是两个不同身份，否则并成一台就没有歧义可判");
+            assert_eq!(
+                model_key(a).as_deref(),
+                model_key(b).as_deref(),
+                "夹具的两个身份必须共用一个型号回退键"
+            );
+            set(a, "旧鼠标").unwrap();
+            set(b, "新鼠标").unwrap();
+            // 第三台：型号回退键一样，但没有任何一条精确别名 —— 这才轮到回退说话。
+            // （注意别用 `HID#VID_046D&PID_C52B&MI_00#…` 那种完整路径当"陌生设备"：
+            // 它归一之后就是 a 自己，命中的是精确别名，不是回退。）
+            let unknown = "VID_046D&PID_C52B&MI_00&Col03";
+            assert_eq!(
+                model_key(unknown).as_deref(),
+                model_key(a).as_deref(),
+                "夹具的陌生设备必须与 a 共用型号回退键"
+            );
             assert_eq!(table().resolve(unknown), None, "歧义型号不应回退");
             // 但精确匹配照常
-            assert_eq!(table().resolve("HID#VID_046D&PID_C52B#A"), Some("旧鼠标"));
+            assert_eq!(table().resolve(a), Some("旧鼠标"));
+            assert_eq!(table().resolve(b), Some("新鼠标"));
+            // 换口的 a 走精确（身份段一致），不受歧义影响
+            assert_eq!(
+                table().resolve("HID#VID_046D&PID_C52B&MI_00#7&9999&0&0000"),
+                Some("旧鼠标")
+            );
         });
     }
 
@@ -510,16 +638,74 @@ mod tests {
         });
     }
 
-    /// 无 VID/PID 的设备（触控板）只支持精确匹配。
+    /// 无 VID/PID 的设备（触控板、PS/2、ACPI 键盘）：只按身份段认，没有型号回退。
+    ///
+    /// 口径与 B14-2 一致 —— 换个实例号（`#5&36f79095&0&0000` 那一段）还是同一台设备，
+    /// 别名跟着走；而"同一段设备 ID 的另一个接口"（`&Col02`）是另一台，不落。
+    /// 老用例在这里断言的是"换个实例路径就不认"，那是完整实例路径当主键时代的口径，
+    /// 归组键换轨之后已经反过来了。
     #[test]
-    fn no_vid_pid_devices_only_exact_match() {
+    fn no_vid_pid_devices_match_by_identity_only() {
         with_temp_dir("novid", || {
             set("HID#MSFT0001&Col01#5&36f79095&0&0000", "触控板").unwrap();
             assert_eq!(
                 table().resolve("HID#MSFT0001&Col01#5&36f79095&0&0000"),
                 Some("触控板")
             );
-            assert_eq!(table().resolve("HID#MSFT0001&Col01#另一个实例"), None);
+            assert_eq!(
+                table().resolve("HID#MSFT0001&Col01#7&9999&0&0001"),
+                Some("触控板"),
+                "同一台设备换个实例号，别名必须跟着走"
+            );
+            assert_eq!(
+                table().resolve("HID#MSFT0001&Col02#5&36f79095&0&0001"),
+                None,
+                "另一个接口是另一台设备"
+            );
+            // 没有 VID/PID 就没有型号回退键可用
+            assert_eq!(model_key("MSFT0001&Col01"), None);
+        });
+    }
+
+    /// 别名与键形态无关：写、认、还原都只看身份键。
+    ///
+    /// 这一条盯的是"设备名称改名之后失效"那组形态 —— 库里存完整实例路径
+    /// （历史库没迁成）而界面交回来的是身份键，或别名文件是照 README 手改的：
+    /// ① 别名只认写入时那一种形态 → 换个统计周期名字消失；
+    /// ② 「还原」只删当前行键 → 另一形态那条赖在文件里，名字删不掉。
+    #[test]
+    fn rename_lookup_and_restore_ignore_the_key_form() {
+        with_temp_dir("forms", || {
+            let legacy = "HID#VID_046D&PID_C52B&MI_00#7&OLDPORT&0&0000";
+            let ident = "VID_046D&PID_C52B&MI_00";
+
+            // 手改文件（README 说"纯文本，可直接手改"）写的是历史形态
+            let map = BTreeMap::from([(legacy.to_string(), "手写的名字".to_string())]);
+            std::fs::create_dir_all(alias_path().parent().unwrap()).unwrap();
+            std::fs::write(alias_path(), serde_json::to_string(&map).unwrap()).unwrap();
+            invalidate_cache();
+            assert_eq!(
+                table().resolve(ident),
+                Some("手写的名字"),
+                "历史形态写的别名，按身份键也该认"
+            );
+            // 「还原」按当前行键（身份形态）来，历史形态那条必须跟着走
+            assert!(
+                clear(ident).unwrap(),
+                "换一种键形态就删不掉，名字会赖在文件里"
+            );
+            assert!(table().is_empty(), "还原之后不该留任何形态的条目");
+
+            // 改名落在历史形态的键上，查询用身份键
+            set(legacy, "办公鼠标").unwrap();
+            assert_eq!(table().resolve(ident), Some("办公鼠标"));
+            // 再在身份键上改一次：文件里只该有一条，不能两种形态各留一个名字
+            set(ident, "家里那把").unwrap();
+            let text = std::fs::read_to_string(alias_path()).unwrap();
+            let after: BTreeMap<String, String> = serde_json::from_str(&text).unwrap();
+            assert_eq!(after.len(), 1, "同一台设备在文件里只该有一条: {text}");
+            assert_eq!(after.get(ident).map(|s| s.as_str()), Some("家里那把"));
+            assert!(!text.contains(legacy), "旧形态不该再留在文件里: {text}");
         });
     }
 
@@ -551,6 +737,20 @@ mod tests {
         assert_eq!(hardware_identity_key("RDP_MOU"), "RDP_MOU");
     }
 
+    /// 照**旧版本的写法**把别名原样落盘（不经 `set()` 的键归一）。
+    ///
+    /// `set()` 现在总是把键收拢到身份段，所以"两种键形态并存"的文件只可能来自
+    /// 旧版本或用户手改 —— 那正是下面两条迁移用例要处理的对象，用 `set()` 造不出来。
+    fn write_raw_alias_file(entries: &[(&str, &str)]) {
+        let map: BTreeMap<String, String> = entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        std::fs::create_dir_all(alias_path().parent().unwrap()).unwrap();
+        std::fs::write(alias_path(), serde_json::to_string(&map).unwrap()).unwrap();
+        invalidate_cache();
+    }
+
     /// B14-2：别名文件的精确键跟着 device_key 换轨。
     #[test]
     fn alias_exact_keys_migrate_to_identity() {
@@ -558,10 +758,7 @@ mod tests {
             let old_a = "HID#VID_046D&PID_C52B&MI_00#7&OLD&0&0000";
             let old_b = "HID#VID_046D&PID_C52B&MI_00#8&NEW&0&0001";
             let kb = "VID_1B1C&PID_1B2D"; // 已是身份形态：必须原样保留
-            set(old_a, "办公鼠标").unwrap();
-            set(old_b, "家里那把").unwrap();
-            set(kb, "办公键盘").unwrap();
-            invalidate_cache();
+            write_raw_alias_file(&[(old_a, "办公鼠标"), (old_b, "家里那把"), (kb, "办公键盘")]);
 
             migrate_exact_keys_to_identity();
 
@@ -603,9 +800,9 @@ mod tests {
         with_temp_dir("migrate_collide", || {
             let full = "HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000";
             let ident = "VID_046D&PID_C52B&MI_00";
-            set(full, "办公鼠标").unwrap();
-            set(ident, "家里那把").unwrap();
-            invalidate_cache();
+            // 直接写文件：`set()` 已经把两种形态收拢成一条，用它造不出"旧版遗留的
+            // 两条并存"这份输入。
+            write_raw_alias_file(&[(full, "办公鼠标"), (ident, "家里那把")]);
 
             let ((), logs) = crate::logger::capture_logs(migrate_exact_keys_to_identity);
 
@@ -688,6 +885,129 @@ mod tests {
                 "超长原文不该被迁移原样再落一次盘: {text}"
             );
         });
+    }
+
+    /// 并发改名不得互相吃掉。
+    ///
+    /// `set()` 的形态是「读全表 → 动一行 → 整表写回」：没有串行锁时这一批线程
+    /// 各自读到同一份旧快照，最后落盘的那一份只剩自己那一条，其余 N-1 个名字
+    /// **静默消失**而每次调用都返回 Ok。用 Barrier 把起点钉在同一刻，
+    /// 这条用例才是"盯着交错"而不是"碰巧没交错"。
+    #[test]
+    fn concurrent_renames_do_not_eat_each_other() {
+        with_temp_dir("concurrent_set", || {
+            const N: usize = 24;
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(N));
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    let gate = std::sync::Arc::clone(&gate);
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        set(&format!("VID_000{i}&PID_{i:04}"), &format!("设备{i}"))
+                    })
+                })
+                .collect();
+            let errs: Vec<String> = handles
+                .into_iter()
+                .flat_map(|h| h.join())
+                .filter_map(|r| r.err().map(|e| e.to_string()))
+                .collect();
+            assert!(errs.is_empty(), "并发改名每一条都该成功: {errs:?}");
+
+            let text = std::fs::read_to_string(alias_path()).unwrap();
+            let after: BTreeMap<String, String> = serde_json::from_str(&text).unwrap();
+            assert_eq!(after.len(), N, "{N} 个名字都得留在文件里: {text}");
+            for i in 0..N {
+                assert_eq!(
+                    after
+                        .get(&format!("VID_000{i}&PID_{i:04}"))
+                        .map(|s| s.as_str()),
+                    Some(format!("设备{i}")).as_deref(),
+                    "第 {i} 条被并发改名吃掉了: {text}"
+                );
+            }
+            // 临时文件不得残留：固定名的 .tmp 会被另一个写者的 rename 抢走，
+            // 剩下那一方直接报"找不到文件"，改名就失败
+            let leftovers: Vec<String> = temp_names_with(".tmp");
+            assert!(leftovers.is_empty(), "写完之后不留临时文件: {leftovers:?}");
+        });
+    }
+
+    /// 写回失败那一次：必须报错、原文件一字不动、临时文件不留。
+    ///
+    /// 失败面用只读位造 —— 这是本机唯一稳定的「读得动、就是 rename 不进去」的形态
+    /// （同一手法见 `config.rs` 的 `a_failed_save_keeps_the_pending_marks`）。
+    /// 原来这条路径是 `std::fs::rename(&tmp, &path)?` 直接上抛：错误是报了，
+    /// 但同目录留一个 `device_aliases.json.tmp` 没人清；改名再多次也只是往那里堆。
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_alias_rewrite_reports_and_leaves_no_temp_file() {
+        // 只读位用 `attrib` 设：`PermissionsExt::set_readonly` 在本工具链还没稳定
+        // （E0658，issue #152956）
+        let attrib_ro = |p: &std::path::Path, on: bool| {
+            let flag = if on { "+R" } else { "-R" };
+            std::process::Command::new("cmd")
+                .args(["/C", "attrib", flag, &p.to_string_lossy()])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        // panic 路径也要撤掉只读位，否则 TestAppDir::drop 删不动目录（%TEMP% 泄漏）
+        struct RoGuard<'a>(
+            &'a std::path::Path,
+            &'a dyn Fn(&std::path::Path, bool) -> bool,
+        );
+        impl Drop for RoGuard<'_> {
+            fn drop(&mut self) {
+                let _ = (self.1)(self.0, false);
+            }
+        }
+
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("alias_write_fails");
+        invalidate_cache();
+        set("VID_0001&PID_0001", "第一只").unwrap();
+        set("VID_0002&PID_0002", "第二只").unwrap();
+        let path = alias_path();
+        let good = std::fs::read(&path).unwrap();
+        if !attrib_ro(&path, true) {
+            eprintln!("attrib +R 没生效，跳过（夹具做不出来）");
+            return;
+        }
+        let _ro = RoGuard(&path, &attrib_ro);
+
+        let err = set("VID_0003&PID_0003", "第三只")
+            .expect_err("目标写不进去时必须报错，不能静默当成写好了");
+        assert!(
+            err.to_string().contains("设备别名文件"),
+            "错误要说清楚是哪个文件（界面上就把这句给用户）: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("原文件必须还在"),
+            good,
+            "失败的写回绝不能碰原文件"
+        );
+        let leftovers: Vec<String> = temp_names_with(".tmp");
+        assert!(
+            leftovers.is_empty(),
+            "写回失败要把临时文件清掉: {leftovers:?}"
+        );
+        // 撤掉只读位后同一次改名要能落成，且原有两条一条不少
+        assert!(attrib_ro(&path, false), "撤掉只读位该成功");
+        drop(_ro);
+        let n = set("VID_0003&PID_0003", "第三只").expect("解锁后应当写得动");
+        assert_eq!(n, 3, "原有的两条别名必须还在: {n}");
+        assert_eq!(table().resolve("VID_0002&PID_0002"), Some("第二只"));
+    }
+
+    /// 数据目录里名字含指定片段的文件（临时文件残留的观察量）。
+    fn temp_names_with(part: &str) -> Vec<String> {
+        std::fs::read_dir(alias_path().parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(part))
+            .collect()
     }
 }
 

@@ -757,7 +757,11 @@ impl FocusFlowConfig {
 /// （Windows 上 rename 同样会替换已存在的目标）。
 /// 直接 `fs::write` 截断重写，掉电/崩溃会留下空文件或半截 INI；
 /// 原子替换保证任意时刻磁盘上的 config.ini 要么是旧的完整内容，要么是新的。
-fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
+///
+/// 对 crate 内开放：`device_aliases.json` 是同一类"用户手工录入、丢了找不回来"的
+/// 小文件，两条写路径共用这一份实现，别再各写一套半成品（那边原来用的
+/// 固定名 `.json.tmp` + 无 fsync，正是本函数注释里要避免的形态）。
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
