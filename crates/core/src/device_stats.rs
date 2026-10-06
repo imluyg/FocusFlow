@@ -421,14 +421,18 @@ mod win {
 
     impl Sink {
         fn on_input(&mut self, lparam: LPARAM) {
-            let raw: RAWINPUT = unsafe { std::mem::zeroed() };
+            // `mut` 不是可有可无的：`GetRawInputData` 是**输出**参数，它要往这块内存里写。
+            // 原来写成 `let raw` + `&raw as *const _ as *mut c_void`，等于把共享引用转成
+            // 可变指针再写进去 —— 那是 UB（编译器有权假设共享引用背后不变），
+            // 下面 `&raw.header` / `raw.data.*` 读的又是刚被写过的字节。
+            let mut raw: RAWINPUT = unsafe { std::mem::zeroed() };
             let hr = HRAWINPUT(lparam.0 as *mut core::ffi::c_void);
             let mut size = std::mem::size_of::<RAWINPUT>() as u32;
             let copied = unsafe {
                 GetRawInputData(
                     hr,
                     RID_INPUT,
-                    Some(&raw as *const RAWINPUT as *mut core::ffi::c_void),
+                    Some(&mut raw as *mut RAWINPUT as *mut core::ffi::c_void),
                     &mut size,
                     std::mem::size_of::<RAWINPUTHEADER>() as u32,
                 )
