@@ -107,7 +107,19 @@ pub fn init_logging() {
         .build(crate::paths::log_dir())
     {
         Ok(file_appender) => {
-            let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+            // 队列槽是**创建时一次性分配**的：crossbeam 的 `bounded(N)` 会预分配整块
+            // `Box<[Slot<Msg>]>`，每槽约 40 字节（Slot 未做 cache padding，最大变体是
+            // 24 字节的 `Vec<u8>`）。默认 128_000 行 ⇒ **常驻约 5 MB**，与"有没有写满"
+            // 无关 —— 相对整个 Rust 进程 12 MB 的私有提交，这一项就占了约四成。
+            //
+            // 16384 行（约 0.65 MB）在本程序的 `info` 级日志下等于永远填不满。
+            // 唯一代价：`RUST_LOG=debug`（listener 每事件一行）时才可能触到上限，
+            // 而 lossy 模式丢的是**最新**那条 —— 包括 panic hook 想留下的那一行。
+            // 这是本条改动已知且有限的代价，用远大于最小可用值的余量把它压到最小。
+            let (file_writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+                .buffered_lines_limit(16_384)
+                .lossy(true)
+                .finish(file_appender);
             // 收好 guard：它一被 drop，worker 线程就停转、后续日志静默丢弃
             *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
             Some(

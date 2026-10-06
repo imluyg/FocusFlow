@@ -795,11 +795,24 @@ pub mod win {
         let mut header = dib_header(width, height);
         header.biHeight = height as i32; // 正 = bottom-up
         let row = (width as usize) * 4;
-        let mut flipped = Vec::with_capacity(bgra.len());
+        let head = unsafe {
+            std::slice::from_raw_parts(
+                &header as *const BITMAPINFOHEADER as *const u8,
+                std::mem::size_of::<BITMAPINFOHEADER>(),
+            )
+        };
+        // **一次分配**：先写头，再倒着按行写像素。
+        //
+        // 原来是"倒序抄进 `flipped`，再 `dib_bytes(&header, &flipped)` 抄进 `out`"，
+        // 于是两块全尺寸缓冲同时在（4K 下 33 MB × 2）。而这条路正是全程序瞬时峰值
+        // 最高的地方（调用方那份 BGRA + 这里两块 + 下面 `prep_global` 的 HGLOBAL），
+        // 省掉的这一块不改变任何字节 —— 方向由 `dib_payload_bottom_up_flips_the_rows` 钉着。
+        let mut out = Vec::with_capacity(head.len() + bgra.len());
+        out.extend_from_slice(head);
         for r in (0..height as usize).rev() {
-            flipped.extend_from_slice(&bgra[r * row..(r + 1) * row]);
+            out.extend_from_slice(&bgra[r * row..(r + 1) * row]);
         }
-        Ok(dib_bytes(&header, &flipped))
+        Ok(out)
     }
 
     /// 注册 `PNG` 剪贴板格式：浏览器与网页编辑器读 `image/png`，它们**不看** CF_DIB。

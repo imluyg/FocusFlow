@@ -84,6 +84,9 @@ let typing = false;
 let pendingAt = null;
 /** 底图解码完了没有 —— 马赛克要从那张真像素上取子块，没解码完画出来是空的。 */
 let imgDecoded = false;
+/** 正在清底图（见 clearBottomImage）。`removeAttribute("src")` 若在某些实现里引发
+ *  error 事件，那道 error 不能被当成"这次截图解码失败"而把会话取消掉。 */
+let clearingBottom = false;
 /** 已完成的笔。撤销 = pop 一支然后整层重绘（不做真 undo 栈）。 */
 let ops = [];
 /** 正在拖的那一支（还没进 ops）。 */
@@ -448,6 +451,24 @@ function setHint(text, isError) {
   hint.classList.toggle("error", !!isError);
 }
 
+/** 放掉上一张整屏底图。
+ *
+ * 覆盖层窗口是**常驻复用**的（建一次就一直在，见 `on_snip_close_requested` 的 prevent_close），
+ * 而 `img.src` 里那份整屏 PNG 会被浏览器解码成一张全分辨率位图**外加**一份解码后的 data URL
+ * —— 4K 下一张就是这个量级，而且在两次截图之间一直挂着。原先 `pull()` 只把图**藏**起来
+ * （visibility="hidden"），从没清过 `src`，于是这张图要到进程结束才走。
+ *
+ * 只 `removeAttribute("src")`、不写 `src = ""`：后者会被解析成文档 URL 并触发 error，
+ * 而 error 那条路会 `giveUp()` 把**新**会话取消掉。`clearingBottom` 是第二道保险。
+ * 清掉之后 `naturalWidth` 归 0，但 `baseOf()` 只在会话内被调用，那时 src 已经重新赋好。
+ */
+function clearBottomImage() {
+  clearingBottom = true;
+  img.removeAttribute("src");
+  imgDecoded = false;
+  clearingBottom = false;
+}
+
 /** 放弃这次截图：不落文件、不动剪贴板，Rust 侧负责关窗并恢复悬浮窗。
  *  reason 会进日志——页面上的失败若在 Rust 侧不可见，这里就只剩一条 8 秒超时可查。 */
 function giveUp(reason) {
@@ -455,6 +476,8 @@ function giveUp(reason) {
   submitted = true;
   if (reason) setHint(reason, true);
   invoke("snip_cancel", { reason: reason || "" }).catch(() => {});
+  // 这次会话到此为止，底图留着没有意义（`submitted` 已立，error 事件也不会再误判）
+  clearBottomImage();
 }
 
 // 脚本抛异常一律报给 Rust 再取消。不加这一条，模块里任何一处抛错都是"黑屏盖 8 秒然后自己关掉"，
@@ -676,6 +699,10 @@ async function pull() {
   if (pulling) return;
   pulling = true;
   try {
+    // 上一张的底图先放掉（见 clearBottomImage）。放在 `submitted = false` **之前**：
+    // 万一 removeAttribute 引发 error，那时 giveUp 的 `submitted` 闸还立着，
+    // 不会把这一次新会话当成"解码失败"取消掉。
+    clearBottomImage();
     // 先放开上一张留下的闸门，再谈别的：`submitted` 是"这次手势只提交一张"的闸，
     // 而复用窗口时新会话开始前它还留着 true —— 挡在守卫里的话页面就再也不取图了
     // （夹具测出来的正是这条：第二次截图只剩 8 秒看门狗超时）。
@@ -732,7 +759,11 @@ async function pull() {
 }
 
 (async () => {
-  img.addEventListener("error", () => giveUp("底图解码失败，已取消"));
+  img.addEventListener("error", () => {
+    // 清底图时引发的 error 不是"这次截图解码失败"（见 clearBottomImage）
+    if (clearingBottom) return;
+    giveUp("底图解码失败，已取消");
+  });
   img.addEventListener("load", () => {
     imgDecoded = true;
     img.style.visibility = "visible";
@@ -740,6 +771,12 @@ async function pull() {
   try {
     await listen("snip-ready", () => {
       pull();
+    });
+    // 提交成功后 Rust 会广播 `snip-done`（主窗口用它弹提示）。覆盖层必须在这里把底图放掉：
+    // 提交成功后页面收不到任何别的通知，不在这里清，那张全屏底图就挂到进程结束。
+    // `submitted` 顺手当判据 —— 已经开了新会话时 pull() 会把它归 false，那时不许动新图。
+    await listen("snip-done", () => {
+      if (submitted) clearBottomImage();
     });
   } catch (err) {
     setHint("监听截图通知失败：" + err, true);
