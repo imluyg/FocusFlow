@@ -214,6 +214,58 @@ pub(crate) mod classify {
     }
 }
 
+/// 设备统计线程回给启动路径的那一句实话。
+///
+/// 为什么要有它：`start_device_stats` 原先是 `spawn` 一成功就报
+/// `CheckResult::ok("已启动（Raw Input 侧信道）")`，而线程本体 `win::run` 里有四条
+/// API 早退（`GetModuleHandleW` / `RegisterClassW` / `CreateWindowExW` /
+/// `RegisterRawInputDevices`）—— 那四条**全部**只 `tracing::error!` 然后 `return`。
+/// 于是启动自检与线程的真实状态脱节：报告写着"已启动"，界面上设备排行整块空、
+/// 一条设备计数都不涨，唯一的线索在 `logs/` 里。本仓对这一族"结论与现场脱节"
+/// 已经修过好几处（定时备份线程、写线程、`--backup` 的结论），这是剩下的一角。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ThreadReport {
+    Ready,
+    Failed(String),
+}
+
+/// 启动那头等握手时看到的三种结局。"没等到"与"等到了坏消息"分开，
+/// 是因为两句要说的话不一样，而把前者写成"已启动"就是这条缺陷的原始形状。
+#[derive(Debug, PartialEq)]
+pub(crate) enum StartupSignal {
+    Confirmed,
+    Refused(String),
+    Unanswered,
+}
+
+/// 握手 → 启动自检那一条。**纯函数**：`startup.rs` 模块头告诫过别把结论放进进程级
+/// 静态（测试里几十个用例各 init 一次 `Database`，静态会互相污染），所以这里只吃信号。
+fn startup_check(step: &str, signal: StartupSignal) -> crate::startup::CheckResult {
+    match signal {
+        StartupSignal::Confirmed => {
+            crate::startup::CheckResult::ok(step, "已启动（Raw Input 侧信道）")
+        }
+        StartupSignal::Refused(why) => {
+            crate::startup::CheckResult::fail(step, format!("线程起来了但没注册成功：{why}"))
+        }
+        StartupSignal::Unanswered => {
+            crate::startup::CheckResult::fail(step, "没等到设备统计线程的回报（超时或线程已退出）")
+        }
+    }
+}
+
+/// 等一次握手：超时与发送端被丢弃都算 `Unanswered`。
+fn wait_for_report(
+    rx: &std::sync::mpsc::Receiver<ThreadReport>,
+    wait: std::time::Duration,
+) -> StartupSignal {
+    match rx.recv_timeout(wait) {
+        Ok(ThreadReport::Ready) => StartupSignal::Confirmed,
+        Ok(ThreadReport::Failed(why)) => StartupSignal::Refused(why),
+        Err(_) => StartupSignal::Unanswered,
+    }
+}
+
 /// 启动设备统计线程（`[device_stats] enabled=false` 可关停；非 Windows 无操作）。
 ///
 /// `paused` 必须与 `InputListener` 持有的是同一份（见 `listener::PauseFlag`）：
@@ -228,18 +280,28 @@ pub fn start_device_stats(writer: Arc<DbWriter>, paused: PauseFlag) -> crate::st
         tracing::info!("设备统计未启用（[device_stats] enabled=false）");
         return crate::startup::CheckResult::ok(step, "未启用（[device_stats] enabled=false）");
     }
+    let (tx, rx) = std::sync::mpsc::channel::<ThreadReport>();
     match std::thread::Builder::new()
         .name("device-stats".into())
         .spawn(move || {
             #[cfg(windows)]
-            win::run(writer, paused);
+            win::run(writer, paused, tx);
             #[cfg(not(windows))]
             {
-                let _ = (writer, paused);
+                let _ = (writer, paused, tx);
                 tracing::info!("非 Windows 平台不支持设备统计");
             }
         }) {
-        Ok(_handle) => crate::startup::CheckResult::ok(step, "已启动（Raw Input 侧信道）"),
+        Ok(_handle) => {
+            // 等一句实话，不等一个"看起来起来了"。正常是几毫秒（线程一注册完 Raw Input
+            // 就回 Ready），给到 300ms 是为了不在句柄压力/杀软首扫那种时刻误报。
+            let signal = wait_for_report(&rx, std::time::Duration::from_millis(300));
+            let result = startup_check(step, signal);
+            if !result.ok {
+                tracing::error!("设备统计未确认启动: {}", result.detail);
+            }
+            result
+        }
         Err(e) => {
             tracing::error!("启动设备统计线程失败: {e}");
             crate::startup::CheckResult::fail(step, format!("{e}"))
@@ -318,11 +380,25 @@ mod win {
         static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
     }
 
+    /// 一条早退：既留下日志，也把原因递回启动路径那头的回音通道。
+    fn refuse(report: &std::sync::mpsc::Sender<super::ThreadReport>, why: &str) {
+        tracing::error!("设备统计：{why}");
+        let _ = report.send(super::ThreadReport::Failed(why.to_string()));
+    }
+
     /// 消息循环主入口（在专用线程上运行）。
-    pub fn run(writer: Arc<DbWriter>, paused: PauseFlag) {
+    ///
+    /// `report` 是把"到底起没起来"送回启动路径的那根线：下面四条 API 早退原先只留
+    /// 一行日志，而 `start_device_stats` 已经在报"已启动"了 —— 现在这头由它等这份回音。
+    /// `send` 失败只可能是启动那头不再等（超时或丢弃），不影响线程照常走下去。
+    pub fn run(
+        writer: Arc<DbWriter>,
+        paused: PauseFlag,
+        report: std::sync::mpsc::Sender<super::ThreadReport>,
+    ) {
         unsafe {
             let Ok(hinstance) = GetModuleHandleW(None) else {
-                tracing::error!("设备统计：GetModuleHandleW 失败");
+                refuse(&report, "GetModuleHandleW 失败");
                 return;
             };
             let class_name = w!("FocusFlowDeviceStats");
@@ -333,7 +409,7 @@ mod win {
                 ..Default::default()
             };
             if RegisterClassW(&wc) == 0 {
-                tracing::error!("设备统计：窗口类注册失败");
+                refuse(&report, "窗口类注册失败");
                 return;
             }
             // 消息专用窗口（HWND_MESSAGE 父窗口）：不可见、不进枚举、只收消息
@@ -353,7 +429,7 @@ mod win {
             ) {
                 Ok(hwnd) => hwnd,
                 Err(e) => {
-                    tracing::error!("设备统计：创建消息窗口失败: {e}");
+                    refuse(&report, &format!("创建消息窗口失败: {e}"));
                     return;
                 }
             };
@@ -376,9 +452,12 @@ mod win {
             if let Err(e) =
                 RegisterRawInputDevices(&rid, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
             {
-                tracing::error!("设备统计：Raw Input 注册失败: {e}");
+                refuse(&report, &format!("Raw Input 注册失败: {e}"));
                 return;
             }
+            // 到这一步才算真的"起来了"：上面四条早退 any 一条，启动报告拿到的都是
+            // 坏消息而不是"已启动"这句空话。
+            let _ = report.send(super::ThreadReport::Ready);
 
             SINK.with(|s| {
                 *s.borrow_mut() = Some(Sink {
@@ -580,6 +659,95 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 启动结论必须照线程的真话说：三条判决各说各的，谁都不许替谁撒谎。
+    ///
+    /// 旧写法是 `spawn` 一成功就 `CheckResult::ok("已启动")`，而线程内部四条 API
+    /// 早退只写日志 ⇒ 自检报告与"设备排行整块空、一条计数不涨"这个现场脱节。
+    /// `Unanswered` 那一档特意也判 fail：没等到回音**不是**证明起来了的证据。
+    #[test]
+    fn the_startup_report_follows_the_thread_handshake() {
+        let up = startup_check("设备统计线程", StartupSignal::Confirmed);
+        assert!(up.ok && up.detail.contains("已启动"), "{up:?}");
+
+        let refused = startup_check(
+            "设备统计线程",
+            StartupSignal::Refused("Raw Input 注册失败: 拒绝访问".to_string()),
+        );
+        assert!(!refused.ok, "线程自己报了失败，结论不能是 ok：{refused:?}");
+        assert!(
+            refused.detail.contains("Raw Input 注册失败"),
+            "原因要原样递到启动报告，否则读报告的人只剩一句\"没起来\": {refused:?}"
+        );
+
+        let quiet = startup_check("设备统计线程", StartupSignal::Unanswered);
+        assert!(!quiet.ok, "没等到回音不能写成已启动: {quiet:?}");
+        assert!(
+            quiet.detail.contains("没等到"),
+            "这一档要说清是\"没等到\"，与\"确认失败\"是两件事: {quiet:?}"
+        );
+    }
+
+    /// 回音通道的三种结局各归哪一档 —— 钉的是"等"那一步，不是判决表。
+    #[test]
+    fn the_handshake_maps_channel_outcomes_to_signals() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(ThreadReport::Ready).unwrap();
+        assert_eq!(
+            wait_for_report(&rx, std::time::Duration::from_millis(500)),
+            StartupSignal::Confirmed
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(ThreadReport::Failed("窗口类注册失败".to_string()))
+            .unwrap();
+        assert_eq!(
+            wait_for_report(&rx, std::time::Duration::from_millis(500)),
+            StartupSignal::Refused("窗口类注册失败".to_string())
+        );
+
+        // 线程退场却什么都没说（发送端被丢弃）与真超时，都归"没等到"
+        let (tx, rx) = std::sync::mpsc::channel::<ThreadReport>();
+        drop(tx);
+        assert_eq!(
+            wait_for_report(&rx, std::time::Duration::from_millis(500)),
+            StartupSignal::Unanswered
+        );
+        let (_keep, rx) = std::sync::mpsc::channel::<ThreadReport>();
+        assert_eq!(
+            wait_for_report(&rx, std::time::Duration::from_millis(30)),
+            StartupSignal::Unanswered
+        );
+    }
+
+    /// 线程本体的每条早退都必须回音 —— 钉的是接线，不是判决表。
+    ///
+    /// 为什么要在源码上数：`win::run` 里那段要真建消息窗口、真注册 Raw Input，还会
+    /// 一路 `GetMessageW` 卡住不放，用例起不了它；而"纯函数绿、调用方没接上"正是
+    /// 这类缺陷的盲点（`--device-keys` 那一次就是这么漏的）。四条 `return` 对四条
+    /// `refuse` 数不齐就红 —— 以后再加一条早退而忘了回音，红点会指在这里。
+    #[test]
+    fn every_early_exit_in_the_thread_body_reports_back() {
+        let src = include_str!("device_stats.rs");
+        let at = src.find("pub fn run(").expect("win::run 不见了");
+        let rest = &src[at..];
+        let body = &rest[..rest.find("SINK.with").expect("线程本体的锚点不见了")];
+        let exits = body.match_indices("return;").count();
+        let echoes = body.match_indices("refuse(&report").count();
+        assert!(
+            exits >= 4,
+            "线程本体该有四条早退，现在数到 {exits} 条 —— 说明这一段被改过了，重新对一遍"
+        );
+        assert_eq!(
+            exits, echoes,
+            "{exits} 条 return 只配了 {echoes} 条回音 ⇒ 少掉的那条会让启动报告说谎"
+        );
+        assert_eq!(
+            body.match_indices("ThreadReport::Ready").count(),
+            1,
+            "Ready 只许在 Raw Input 注册成功之后发一次"
+        );
+    }
 
     /// 路径前缀剥离：`\\?\` 前缀去掉，无前缀原样返回。
     #[test]
