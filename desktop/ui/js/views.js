@@ -634,13 +634,19 @@ async function refreshGoalStrip(force) {
   if (!box) return;
   const now = Date.now();
   if (!force && now - goalFetchedAt < 60000) return;
-  goalFetchedAt = now;
   let g;
   try {
     g = await invoke("get_goal_status");
   } catch (e) {
+    // 打卡条整块空白，而且此后 60 秒连一次重试都没有 —— 这是原先那句裸 `return`
+    // 的两宗罪：`goalFetchedAt` 在 try **之前**就盖了章，失败也当成"刚取过"。
+    // 宿主这条命令是 `Result<_, String>`（spawn_blocking 里跨 370 天扫描，炸了真会
+    // reject 到这里），所以"读不出来"是一种真实结局，不是理论分支：必须写在页面上，
+    // 并且不盖章 —— 下一次进「活跃分析」要能重新去问。
+    box.innerHTML = `<div style="color:var(--danger);">连续打卡读不出来：${escapeHtml(String(e))}</div>`;
     return;
   }
+  goalFetchedAt = now;
   goalInfo = g;
   const today = Math.max(0, goalToday());
   const pctv = Math.max(0, Math.min(100, Math.round((today / g.goal) * 100)));
@@ -725,13 +731,25 @@ export function renderAnalytics(s) {
 const settingsUI = { cat: "general", q: "", data: null };
 
 const BACKUP_HOURS = [6, 12, 24, 48, 168];
+// 关闭状态（0）下下拉显示的那一档：与 `commands.rs` 的
+// `get_int("database", "online_backup_interval_hours", 24)` 同一个默认值。
+const BACKUP_HOURS_DEFAULT = 24;
 const backupHourLabel = (h) => (h === 168 ? "每 7 天" : `每 ${h} 小时`);
-// 现实值不在预设里（手改过 config.ini）时补进选项，否则下拉会把它显示成第一项
+// 现实值不在预设里（手改过 config.ini）时补进选项，否则下拉会把它显示成第一项。
+//
+// 但 0 **不是一档间隔**，它是复选框的语义（core 里 `if hours == 0 { continue }`＝关闭）。
+// 旧写法把 0 也 concat 进选项，于是关着的时候下拉明晃晃写着「每 0 小时」；
+// 更糟的是重新勾选走 `Number(sel.value) || 24` 写的是 24，屏幕上却还停在 0 那一格
+// —— 界面与落库两个数。现在下拉里永远只有正数间隔，关闭时显示的就是
+// "勾上之后会采用的那一档"，所见即所写。
 function backupHourSelect(cur) {
-  const opts = BACKUP_HOURS.includes(cur) ? BACKUP_HOURS.slice() : BACKUP_HOURS.concat(cur);
+  const shown = cur > 0 ? cur : BACKUP_HOURS_DEFAULT;
+  const opts = BACKUP_HOURS.includes(shown)
+    ? BACKUP_HOURS.slice()
+    : BACKUP_HOURS.concat(shown);
   opts.sort((a, b) => a - b);
   return opts
-    .map((h) => `<option value="${h}"${h === cur ? " selected" : ""}>${backupHourLabel(h)}</option>`)
+    .map((h) => `<option value="${h}"${h === shown ? " selected" : ""}>${backupHourLabel(h)}</option>`)
     .join("");
 }
 
@@ -850,7 +868,10 @@ async function onBackupOnlineChange(e) {
   const on = e.target.checked;
   const sel = $("set-backup-interval");
   sel.disabled = !on;
-  const hours = on ? Number(sel.value) || 24 : 0;
+  // 这里以前是 `Number(sel.value) || 24`：下拉里那格 0（＝关闭）会被 `|| 24` 悄悄
+  // 换成 24 写进库，而屏幕上还显示着「每 0 小时」—— 两个数。现在 `backupHourSelect`
+  // 只给正数档位，屏幕上那一格就是将要写入的值，不需要兜底，也不该再兜底。
+  const hours = on ? Number(sel.value) : 0;
   await invoke("set_config", {
     section: "database",
     key: "online_backup_interval_hours",
@@ -1382,5 +1403,12 @@ async function renderMaintInfo() {
         .join("");
     }
     $("set-maint").innerHTML = html;
-  } catch (e) {}
+  } catch (e) {
+    // 原先这里是 `catch (e) {}`：这一段里"备份目录读不出来"与"查不到压缩时间"都
+    // 专门拆成了红字，偏偏**整段**信息读不出来时一个字都不留 —— 用户分不清
+    // "没这个信息"和"读不出来"。宿主这条命令是 Result（spawn_blocking 会 reject），
+    // 而 #set-maint 只有在设置页挂起来时才存在，所以先判节点在不在。
+    const el = $("set-maint");
+    if (el) el.textContent = "维护信息读不出来：" + String(e);
+  }
 }
