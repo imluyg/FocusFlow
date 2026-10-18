@@ -778,6 +778,24 @@ pub(crate) fn fallback_device_name(device_key: &str) -> String {
     }
 }
 
+/// 展示侧把库里存着的英文通用名换成中文词条（`device_stats::localize_generic_name` 那张表）。
+///
+/// 那张表过去**只在写侧用**（`display_name` 登记时套一次），于是它有个可预见的失效形态：
+/// 词条是后来新增或改写的，旧年度库里的行永远停在写入那一刻的英文串 —— 同一台设备在
+/// `2025.focusflow.db` 里是 `HID-compliant mouse · 24AE/1464`、在 `2026` 里是
+/// `HID 鼠标 · 24AE/1464`，界面上取哪一条取决于哪个库先被读到（见 [`merge_device_rows`]）。
+/// 在读侧过一次词条表就能对所有历史库成立，而且不用迁移任何行。
+///
+/// 按 ` · ` 分段逐段过表（写侧正是"名字 · VID/PID"这个形状），所以它对已经中文化的名字
+/// 是幂等的：表里没有的串一律原样返回。
+pub(crate) fn localize_display_name(stored: &str) -> String {
+    stored
+        .split(" · ")
+        .map(crate::device_stats::localize_generic_name)
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 /// 从设备实例路径解析 VID/PID，返回 (VID, PID) 十六进制串（大写）。
 ///
 /// 支持两种真机形态（2026-09-20 实测）：
@@ -843,12 +861,16 @@ fn parse_bluetooth_style(upper: &str) -> Option<(String, String)> {
     Some((vid.to_string(), pid.to_string()))
 }
 
-/// 单库设备查询的原始行：(device_key, 登记名, 类型, 次数)。
+/// 单库设备查询的原始行：(device_key, 登记名, 类型, 次数, 这个库的年份)。
+#[derive(Clone)]
 struct DeviceRow {
     device_key: String,
     name: Option<String>,
     kind: Option<String>,
     count: i64,
+    /// 这一行来自哪一年的库。同一台设备在两个年度库里各有一行时，展示名按
+    /// **最新登记年**那条走（见 [`merge_device_rows`]），不能让读序决定界面。
+    year: i32,
 }
 
 /// 设备查询公共实现：device_counts 聚合 + LEFT JOIN devices 取登记名。
@@ -888,6 +910,7 @@ fn query_devices_in_conn(
             name: r.get::<_, Option<String>>(1)?,
             kind: r.get::<_, Option<String>>(2)?,
             count: r.get(3)?,
+            year,
         })
     };
     let rows = match conn.prepare(&sql) {
@@ -934,12 +957,24 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
             Some(i) => {
                 let keep = &mut merged[i];
                 keep.count += row.count;
-                // 名字/类型取"哪一年登记过就用哪一年的"：归档与迁移会留空名占位行
-                if keep.name.as_deref().unwrap_or("").trim().is_empty() {
-                    keep.name = row.name;
+                let newer = row.year >= keep.year;
+                if newer {
+                    keep.year = row.year;
                 }
-                if keep.kind.as_deref().unwrap_or("").is_empty() {
-                    keep.kind = row.kind;
+                // 名字/类型："空的那条永远让位"（归档与迁移会留空名占位行），两边都有值时
+                // 按**最新登记年**那条走。后半个判据是新加的：读序随统计周期变
+                // （`query_years` 在 period=0 降序、跨年窗口升序），旧实现是"第一条非空即定"，
+                // 于是同一台设备换个周期就换个名字 —— 而详情弹窗复用排行的那条行，
+                // 两处就会给出不同的名字与副标题。
+                let incoming = row.name.as_deref().unwrap_or("").trim();
+                let have = keep.name.as_deref().unwrap_or("").trim();
+                if !incoming.is_empty() && (have.is_empty() || newer) {
+                    keep.name = row.name.clone();
+                }
+                let incoming_kind = row.kind.as_deref().unwrap_or("").trim();
+                let have_kind = keep.kind.as_deref().unwrap_or("").trim();
+                if !incoming_kind.is_empty() && (have_kind.is_empty() || newer) {
+                    keep.kind = row.kind.clone();
                 }
             }
             None => {
@@ -975,7 +1010,9 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
                         && *n != r.device_key.as_str()
                         && *n != identity.as_str()
                 })
-                .map(|n| n.to_string())
+                // 库里存的英文名在读侧过一次词条表（见 `localize_display_name`）：
+                // 词条是后来加的，旧年度库的行停在登记那一刻的写法上。
+                .map(localize_display_name)
                 .unwrap_or_else(|| fallback_device_name(&identity));
             // 别名优先（用户改过的名字），别名缺失或为空时用自动名。
             // 去重只对自动名生效：两个不同设备可以起同一个别名，用户说了算。
@@ -2044,14 +2081,14 @@ mod tests {
         assert_eq!(stats[1].kind, "unknown", "未登记设备的类型为 unknown");
         assert_eq!(stats[1].count, 50);
         assert_eq!(
-            stats[2].name, "HID-compliant mouse · 046D/C52B",
-            "先出现者保留原名"
+            stats[2].name, "HID 鼠标 · 046D/C52B",
+            "库里存的英文名在读侧换成词条（写入侧没动，历史库不迁移）"
         );
         assert_eq!(stats[2].count, 30);
         assert_eq!(stats[2].kind, "mouse");
         assert_eq!(
-            stats[3].name, "HID-compliant mouse · 046D/C52B (2)",
-            "同显示名去重"
+            stats[3].name, "HID 鼠标 · 046D/C52B (2)",
+            "同显示名去重：换算是幂等的，两只才仍然算同名"
         );
         assert_eq!(stats[3].count, 10);
     }
@@ -2597,6 +2634,7 @@ mod tests {
             name: Some("HID 鼠标 · 046D/C52B".to_string()),
             kind: Some("mouse".to_string()),
             count,
+            year: 2026,
         };
         let (_, stats) = merge_device_rows(vec![row(k1, 300), row(k2, 200)]);
         assert_eq!(stats[0].name, "双鼠");
@@ -2630,6 +2668,7 @@ mod tests {
             name: Some(name.to_string()),
             kind: Some("mouse".to_string()),
             count,
+            year: 2026,
         };
         let (_, stats) = merge_device_rows(vec![
             row(auto_hi, "罗技M590", 300),
@@ -2645,6 +2684,97 @@ mod tests {
         );
         crate::device_alias::clear(aliased).unwrap();
         crate::device_alias::invalidate_cache();
+    }
+
+    /// 词条表对显示名必须**幂等**，且不认识的一律原样交出去。
+    ///
+    /// 幂等这条不是讲究：读侧过表之后，两只同型号设备的名字要仍然相等，
+    /// 同名去重才会给第二只加 "(2)"；表若对已中文化的串再动一次手，
+    /// 两只就变成两个名字，去重静默失效（症状是设备页并列两只一模一样的鼠标）。
+    #[test]
+    fn localizing_a_display_name_is_idempotent_and_conservative() {
+        assert_eq!(
+            localize_display_name("HID-compliant mouse · 046D/C52B"),
+            "HID 鼠标 · 046D/C52B",
+            "写侧存过英文的旧行要换得过来"
+        );
+        assert_eq!(
+            localize_display_name("HID 鼠标 · 046D/C52B"),
+            "HID 鼠标 · 046D/C52B",
+            "已经中文化的名字二次过表不许再变"
+        );
+        assert_eq!(
+            localize_display_name("HID Keyboard Device"),
+            "HID 键盘",
+            "没有 ` · ` 分隔符的整串也要过表"
+        );
+        assert_eq!(
+            localize_display_name("罗技 G502 HERO · 046D/C07D"),
+            "罗技 G502 HERO · 046D/C07D",
+            "词条表里没有的真名一个字都不许动"
+        );
+        assert_eq!(localize_display_name(""), "");
+    }
+
+    /// 同一台设备跨年两行时，展示名与类型都不许跟着"哪个库先读到"变。
+    ///
+    /// 上面那条 `device_stats_collapse_the_same_device_across_year_dbs` 钉住了**次数与行键**
+    /// 在读序翻转时不变，却没钉名字：旧实现是"第一条非空即定"，于是两只库行名字不同时就
+    /// 会「总计视图叫 A、最近 30 天叫 B」（详情弹窗复用排行那一行，两处跟着一起变）。
+    /// 这里把两种读序都跑一遍，只许有一个答案。
+    #[test]
+    fn a_device_keeps_its_name_whichever_year_is_read_first() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("devq_name_order");
+        crate::device_alias::invalidate_cache();
+
+        // 旧库那行是升级前的完整实例路径、新库是身份键：同一台设备的两种形态
+        let prev_key = "HID#VID_046D&PID_C52B&MI_00#7&1f126e19&0&0000";
+        let this_key = "VID_046D&PID_C52B&MI_00";
+        let row = |key: &str, name: &str, kind: &str, count: i64, year: i32| DeviceRow {
+            device_key: key.to_string(),
+            name: Some(name.to_string()),
+            kind: Some(kind.to_string()),
+            count,
+            year,
+        };
+        let old = row(
+            prev_key,
+            "HID-compliant mouse · 046D/C52B",
+            "mouse",
+            30,
+            2025,
+        );
+        let new = row(this_key, "罗技 M590 · 046D/C52B", "mouse", 70, 2026);
+
+        for (first, second, label) in [
+            (old.clone(), new.clone(), "旧库先读到（跨年窗口那条路）"),
+            (
+                new.clone(),
+                old.clone(),
+                "新库先读到（period=0 降序那条路）",
+            ),
+        ] {
+            let (total, stats) = merge_device_rows(vec![first, second]);
+            assert_eq!(total, 100, "{label}：次数必须照并");
+            assert_eq!(stats.len(), 1, "{label}：两种键形态要并成一台");
+            assert_eq!(
+                stats[0].auto_name, "罗技 M590 · 046D/C52B",
+                "{label}：名字取最新登记年那条，读序不参与决定"
+            );
+            assert_eq!(
+                stats[0].key, "VID_046D&PID_C52B&MI_00",
+                "{label}：行键是身份段"
+            );
+        }
+
+        // 空名占位行仍然永远让位：新库那条没登记名时，只能用旧库那条（不能回退成占位串）
+        let empty_new = row(this_key, "  ", "mouse", 70, 2026);
+        let (_, stats) = merge_device_rows(vec![empty_new, old]);
+        assert_eq!(
+            stats[0].auto_name, "HID 鼠标 · 046D/C52B",
+            "空白登记名让位于有值的那条，同时读侧词条照样生效"
+        );
     }
 
     /// 别名生效：改过名的设备展示别名，自动名仍保留在 auto_name 里做副标题。
