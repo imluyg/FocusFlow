@@ -121,6 +121,29 @@ pub fn try_available_years() -> anyhow::Result<Vec<i32>> {
     Ok(years)
 }
 
+/// 列出口径与读法口径都问一遍：数据目录读得动吗、每个列出来的年度库真打得开吗。
+///
+/// 这把尺子原先只有 CLI 有（`crates/cli/src/main.rs`），而 `available_years()` 把
+/// `read_dir` 失败折成空列表、`stats_multi_year` 把打不开的那一年**静默跳过**，
+/// 所以"读不到"在两个读侧函数里都不会留下任何痕迹。桌面端的导出是第三个读点，
+/// 它原先直接 `get_stats(None, None)` 就写文件 —— 移动盘没插、或某年的库被同步盘
+/// 换成占位文件时，用户拿到一份"总活跃次数 0"或明显偏小的报告，界面还报绿色成功
+/// （`desktop/src/export.rs` 的模块头当时写着"逻辑与 CLI 版一致"，那正是没对上的地方）。
+///
+/// 返回值里的 `Vec<i32>` 就是 `try_available_years()` 那份列表，调用方可以省一次枚举。
+pub fn check_years_readable() -> anyhow::Result<Vec<i32>> {
+    let years = try_available_years().map_err(|e| anyhow::anyhow!("年度库列不出来: {e}"))?;
+    let bad: Vec<i32> = years
+        .iter()
+        .copied()
+        .filter(|y| connection::open_ro(&paths::year_db_path(*y)).is_err())
+        .collect();
+    if !bad.is_empty() {
+        anyhow::bail!("这些年度库打不开，它们的计数不会出现在结果里: {bad:?}");
+    }
+    Ok(years)
+}
+
 /// 这个年度库里还有没有聚合数据行（空壳判定用）。
 ///
 /// 读不了就按「有数据」处理：宁可多扫一趟，也不能因为一次 I/O 失败或库损坏，
@@ -2969,6 +2992,56 @@ mod tests {
             device_key_rows(key, MAX_QUERY_DAYS),
             got,
             "i64::MAX 与 MAX_QUERY_DAYS 必须是同一档，不能一份回绕一份夹住"
+        );
+    }
+
+    /// 某一年打不开时必须**报出是哪一年**，而不是让调用方拿着少一年的总数当结论。
+    ///
+    /// 夹具形态就是真机会遇到的那一种：文件名是年度库，内容却不是 SQLite 库（同步盘
+    /// 换成占位文件、半截下载、被别的进程独占）。`available_years()` 保守地把它列出来
+    /// （"读不了就按有数据处理"，见 `year_has_aggregates`），而 `stats_multi_year`
+    /// 会静默跳过那一年 —— 两边都不出声，导出的报告就少一年而界面报成功。
+    #[test]
+    fn an_unopenable_year_is_named_instead_of_silently_dropped() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("readable_years");
+        invalidate_years_cache();
+        crate::db::connection::clear_ro_cache();
+
+        let good = 2031;
+        let broken = 2032;
+        {
+            let conn = crate::db::connection::open_rw(&paths::year_db_path(good)).unwrap();
+            crate::db::connection::ensure_schema(&conn, good).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 5, 60)",
+                rusqlite::params![day_key_of_date(
+                    chrono::NaiveDate::from_ymd_opt(good, 6, 1).expect("夹具日期")
+                )],
+            )
+            .unwrap();
+        }
+        std::fs::write(paths::year_db_path(broken), b"not a sqlite file at all").unwrap();
+
+        // 前提：坏的那一年确实被列出来了（它没有被"当作没有数据"悄悄抹掉）
+        assert_eq!(
+            available_years(),
+            vec![broken, good],
+            "列表是降序的，且打不开那一年也在里面"
+        );
+        let e = check_years_readable().unwrap_err().to_string();
+        assert!(
+            e.contains(&broken.to_string()) && e.contains("打不开"),
+            "要报出是哪一年，不能只说\"读不出来\"：{e}"
+        );
+
+        // 修好之后同一句话就不再响 —— 这条判据不是恒真
+        std::fs::remove_file(paths::year_db_path(broken)).unwrap();
+        invalidate_years_cache();
+        crate::db::connection::clear_ro_cache();
+        assert_eq!(
+            check_years_readable().expect("都能打开时不该报错"),
+            vec![good]
         );
     }
 }

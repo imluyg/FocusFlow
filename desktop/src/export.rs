@@ -1,4 +1,8 @@
-//! 导出报告（CSV / HTML），逻辑与 CLI 版一致。
+//! 导出报告（CSV / HTML）。
+//!
+//! 与 CLI 共用的是**转义与排名比较**那两把尺子（都在 `focusflow_core::format`），
+//! 不是"两份实现互为镜像"——列结构、周期标签与 CLI 那份本来就不一样。
+//! 读侧的可读性闸两边都要问，判据在 `db::queries::check_years_readable`。
 
 use std::collections::HashMap;
 use std::io::Write;

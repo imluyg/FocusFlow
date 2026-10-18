@@ -310,19 +310,12 @@ fn parse_period(arg: &str) -> Result<Period, String> {
 /// 破坏性命令（`--reset` / `--vacuum` / `--cleanup`）上一批已经改成会报原因的版本，
 /// 这里补的是留下来的那半边 —— 一个分不清"没有数据"与"读不到数据"的诊断工具，
 /// 是这仓库目前产出最高的一类 bug。
+///
+/// 判据本体在 `focusflow_core::db::queries::check_years_readable`：桌面端的导出也要
+/// 问同一句话，一把尺子抄两处就会分叉（这个分叉真发生过，见 `desktop/src/export.rs`
+/// 的模块头那句"逻辑与 CLI 版一致"）。这里只把错误换成 CLI 用的 String。
 fn check_years_readable() -> Result<Vec<i32>, String> {
-    let years = db::queries::try_available_years().map_err(|e| format!("年度库列不出来: {e}"))?;
-    let bad: Vec<i32> = years
-        .iter()
-        .copied()
-        .filter(|y| db::connection::open_ro(&focusflow_core::paths::year_db_path(*y)).is_err())
-        .collect();
-    if !bad.is_empty() {
-        return Err(format!(
-            "这些年度库打不开，它们的计数不会出现在结果里: {bad:?}"
-        ));
-    }
-    Ok(years)
+    db::queries::check_years_readable().map_err(|e| e.to_string())
 }
 
 fn print_stats(_db: &db::Database, period: &str) -> i32 {

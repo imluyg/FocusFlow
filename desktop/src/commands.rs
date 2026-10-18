@@ -485,6 +485,13 @@ pub async fn change_data_dir(
 #[tauri::command]
 pub async fn export_report(fmt: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // 先问可读性，再挑文件名：`available_years()` 把 `read_dir` 失败折成空列表、
+        // `stats_multi_year` 把打不开的那一年静默跳过，所以移动盘没插、或某年的库被
+        // 同步盘换成占位文件时，原先这条路会写出一份"总活跃次数 0"或明显偏小的报告，
+        // 而界面报绿色成功。CLI 那半边早就有这句话了（判据在 core，两边共用一把尺子）。
+        if let Err(e) = focusflow_core::db::queries::check_years_readable() {
+            return Err(format!("导出被拒绝：{e}"));
+        }
         let ext = if fmt == "csv" { "csv" } else { "html" };
         let file = rfd::FileDialog::new()
             .set_title("导出统计报告")
@@ -829,5 +836,42 @@ mod tests {
         // 已经成功的那半也要留在消息里：用户得知道哪些年进来了、哪些没进来
         assert!(err.contains("1200 条"), "已导入的部分不能丢: {err}");
         assert!(err.contains("2024"), "失败项要能定位到是哪一年: {err}");
+    }
+
+    /// 导出必须先问年度库可读，再去做聚合。
+    ///
+    /// 命令本体会弹真文件对话框、也要真库才跑得动，无头环境进不去，所以按文本形状钉
+    /// （与 `crates/cli/src/main.rs` 里"七条读命令都要过这把尺子"同一族做法）。
+    /// 钉的是**次序**：闸排在 `get_stats` 之后就等于已经拿少一年的总数写完了报告。
+    #[test]
+    fn export_asks_readability_before_it_aggregates() {
+        let src = include_str!("commands.rs");
+        let head = src
+            .find("pub async fn export_report")
+            .expect("导出命令找不到了（判据要跟着改）");
+        let body = &src[head..head
+            + src[head..]
+                .find("\n#[tauri::command]")
+                .expect("导出命令之后没有别的命令，切片前提变了")];
+
+        let gate = body
+            .find("check_years_readable()")
+            .expect("导出没问可读性 —— 读不到的那一年会被静默跳过");
+        let agg = body
+            .find("get_stats(None, None)")
+            .expect("导出不再聚合？判据要跟着改");
+        assert!(
+            gate < agg,
+            "可读性闸必须排在聚合之前（闸在 {gate}、聚合在 {agg}）"
+        );
+        assert!(
+            body.contains("导出被拒绝"),
+            "拒绝时要给前端一句能显示的话，不能只 return Err(空)"
+        );
+        // 夹具自己的前提：切片真盖住了整个命令体，不是切在中间让上面两条空转
+        assert!(
+            body.contains("export_csv") && body.contains("export_html"),
+            "切片没盖住导出的两个格式分支，上面三条是假绿"
+        );
     }
 }
