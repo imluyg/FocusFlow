@@ -322,7 +322,7 @@ fn run_capture(app: &AppHandle, annotate: bool) -> Result<(), String> {
     if let Err(e) = app.run_on_main_thread(move || {
         if let Err(e) = show_overlay(&handle, epoch) {
             tracing::error!("显示截图覆盖层失败：{e}");
-            abort_session(&handle, &e);
+            abort_session(&handle, epoch, &e);
         }
     }) {
         return Err(format!("无法把覆盖层派发到主线程：{e}"));
@@ -349,7 +349,11 @@ fn run_capture(app: &AppHandle, annotate: bool) -> Result<(), String> {
                 .unwrap_or(false);
             if still_waiting_for_image {
                 tracing::error!("截图覆盖层 {TAKE_DEADLINE:?} 内没有被页面取图，按失败收尾");
-                abort_session(&handle, "截图覆盖层没能显示内容（页面未取图），已自动关闭");
+                abort_session(
+                    &handle,
+                    epoch,
+                    "截图覆盖层没能显示内容（页面未取图），已自动关闭",
+                );
             }
         })
         .map_err(|e| format!("启动截图看门狗失败：{e}"))?;
@@ -501,8 +505,27 @@ fn raise_topmost(win: &WebviewWindow) {
 #[cfg(not(windows))]
 fn raise_topmost(_win: &WebviewWindow) {}
 
+/// 这次收尾有没有归属。**纯函数**：会话槽是进程级的，用例里造不出两个并发会话，
+/// 但"陈旧的那一次不许踩死活的那一张"这条判决可以单独钉住。
+///
+/// `claim == 0` = 调用方说不出自己属于哪一张（`trigger` 里"再按一次放弃当前这张"、
+/// 页面那条 `snip_cancel`、以及 `run_capture` 在 claim 之前就失败的那条路），
+/// 它们要收的就是当前这张 ⇒ 放行。说得出 epoch 的（抓屏线程里的 `show_overlay` 失败、
+/// 两条看门狗）就必须相等才动手。不等还要收尾的后果不是日志难看，是**用户那张图没了**：
+/// 陈旧的抓屏线程会 `clear_session` + 藏掉正被新会话使用的覆盖层。
+fn may_finish(claim: u64, current: u64) -> bool {
+    claim == 0 || claim == current
+}
+
 /// 失败收尾：关窗、清会话、恢复悬浮窗、给前端一句话。
-fn abort_session(app: &AppHandle, reason: &str) {
+///
+/// `claim` 见 `may_finish`。
+fn abort_session(app: &AppHandle, claim: u64, reason: &str) {
+    let current = current_epoch();
+    if !may_finish(claim, current) {
+        tracing::info!("跳过一次陈旧会话的收尾（epoch {claim}，当前 {current}）");
+        return;
+    }
     clear_session();
     IN_FLIGHT.store(false, Ordering::SeqCst);
     if let Some(win) = app.get_webview_window(SNIP_LABEL) {
@@ -516,8 +539,13 @@ fn abort_session(app: &AppHandle, reason: &str) {
     }
 }
 
-/// 结束一次会话的正常出口（提交与取消共用）。
-fn finish_session(app: &AppHandle) {
+/// 结束一次会话的正常出口（提交与取消共用）。`claim` 见 `may_finish`。
+fn finish_session(app: &AppHandle, claim: u64) {
+    let current = current_epoch();
+    if !may_finish(claim, current) {
+        tracing::info!("跳过一次陈旧会话的收尾（epoch {claim}，当前 {current}）");
+        return;
+    }
     clear_session();
     IN_FLIGHT.store(false, Ordering::SeqCst);
     if let Some(win) = app.get_webview_window(SNIP_LABEL) {
@@ -547,7 +575,7 @@ pub fn trigger(app: &AppHandle, annotate: bool) -> Result<(), String> {
             tracing::info!(
                 "标注截图：再按一次 snip_annotate，放弃当前这一张（不落盘、不动剪贴板）"
             );
-            finish_session(app);
+            finish_session(app, 0);
             return Ok(());
         }
         return Err(if annotate {
@@ -579,10 +607,19 @@ pub fn trigger(app: &AppHandle, annotate: bool) -> Result<(), String> {
         .name("snip-capture".into())
         .spawn(move || {
             // 等 DWM 把悬浮窗真的撤掉（上面的 hide 只是发了消息）。
-            std::thread::sleep(HIDE_SETTLE);
+            // **只有真的藏过东西才等**：以前这里是无条件睡 90ms，于是关着悬浮窗
+            // （或不显示悬浮窗）的用户每次截图都白等一格，而这 90ms 正落在
+            // "按下热键 → 看见底图"的首帧路径上，也让 `run_capture` 里那条
+            // 分阶段计时量不到真数（它 t0 之前就睡了）。
+            if FLOATING_WAS_VISIBLE.load(Ordering::SeqCst) {
+                std::thread::sleep(HIDE_SETTLE);
+            }
             if let Err(e) = run_capture(&handle, annotate) {
                 tracing::error!("截图失败：{e}");
-                abort_session(&handle, &e);
+                // 说不出 epoch：`run_capture` 可能在 claim 之前就失败（那时槽里是上一张，
+                // 或者什么都没有），也可能在 claim 之后失败（它内部的两个出口已经各自
+                // 带 epoch 收尾了）。这里按"收当前这张"处理，与旧行为一致。
+                abort_session(&handle, 0, &e);
             }
         })
         .map_err(|e| {
@@ -618,6 +655,7 @@ fn spawn_annotate_ceiling(app: &AppHandle, epoch: u64) {
                 );
                 abort_session(
                     &handle,
+                    epoch,
                     "标注时间过长，已自动放弃（不是失败），什么都没保存",
                 );
             }
@@ -866,7 +904,8 @@ fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, S
     };
 
     let line = outcome_line(saved, &save_reason, clipboard, &clipboard_reason);
-    finish_session(app);
+    // 上面已经验过 `sel.epoch` 就是当前这张 ⇒ 这次收尾有归属，踩不到别的会话
+    finish_session(app, sel.epoch);
 
     // 7) 贴图（口径 A：贴图算这次截图的一个出口）。三步都在这一行之后：
     //    - **在标注层合成与编码之后** —— 交给贴图的就是落盘那份 png，不重新编码，
@@ -905,8 +944,10 @@ pub fn snip_cancel(app: AppHandle, reason: Option<String>) {
         Some(r) if !r.is_empty() => tracing::warn!("截图被页面取消：{r}"),
         _ => tracing::debug!("截图已取消（用户主动）"),
     }
-    // 收尾是幂等的（无会话时也照样把窗口藏好、悬浮窗复位），所以不在这里分叉
-    finish_session(&app);
+    // 收尾是幂等的（无会话时也照样把窗口藏好、悬浮窗复位），所以不在这里分叉。
+    // epoch 传 0：这条命令是页面发的"取消我眼前这张"，而页面说不出 epoch 也不能假设
+    // 槽里还是它那张（可能已经被新一轮触发换掉）—— 按"收当前这张"处理，见 `may_finish`。
+    finish_session(&app, 0);
 }
 
 /// 设置页"立即截图"：不依赖热键也能走完整条路（也是手动验证的入口）。
@@ -930,8 +971,10 @@ pub async fn do_snip_annotate(app: AppHandle) -> Result<String, String> {
 ///
 /// 必须 `prevent_close`：这个窗口是声明式常驻的，真被销毁后就没有可靠的办法在进程内
 /// 重建 WebView2 控制器（见 `state.rs` 里那条挂死复现），下次截图就永远开不了。
+///
+/// epoch 传 0：关窗请求是"我眼前这张不要了"，和页面那条 `snip_cancel` 同一条口径。
 pub fn on_snip_close_requested(app: &AppHandle) {
-    finish_session(app);
+    finish_session(app, 0);
 }
 
 #[cfg(test)]
@@ -1460,6 +1503,156 @@ mod tests {
         assert!(
             reset < measure,
             "量宽度的次序不对：先量再摆会量到折行之后的半条宽度"
+        );
+    }
+
+    // ---------- 会话归属（陈旧的那一次不许踩死活的那一张） ----------
+
+    /// 归属判据本身：说不出 epoch（0）放行，说得出就必须与槽里那张相等。
+    #[test]
+    fn a_stale_exit_must_not_touch_a_live_session() {
+        assert!(may_finish(3, 3), "自己的那一张要能收（这是正常路径）");
+        assert!(
+            !may_finish(1, 3),
+            "epoch 1 的抓屏线程不能收掉 epoch 3 那张：用户眼前那张图会直接没掉"
+        );
+        assert!(
+            may_finish(0, 3),
+            "说不出 epoch 的调用方按「收当前这张」处理"
+        );
+        assert!(may_finish(0, 0), "槽里没会话时取消仍然要藏窗口、复位悬浮窗");
+        assert!(
+            !may_finish(3, 0),
+            "会话已经结束（槽里是 0）时那条陈旧计时器也不许再踩一遍"
+        );
+    }
+
+    /// 生产代码那一段（`#[cfg(test)]` 之前）原样取回。
+    ///
+    /// 只读这一段有两个理由：`run_capture` 里也有一处 `capture::encode_png(`，不切开就会
+    /// 拿它当锚点；而本文件用例自己的字面量也含这些 needle，连着测试一起数会自己匹配自己。
+    fn prod_text() -> String {
+        let src = include_str!("snip.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        prod.to_string()
+    }
+
+    /// 同上，但把空白全剥掉后的形状，用于按调用点钉结构。
+    ///
+    /// 为什么剥空白：这些调用点会被 rustfmt 折行（`abort_session(` 标注上限那条就跨了
+    /// 四行），拿原始文本比就会因为一次无关的格式化而红。标识符本身永远不会被折开，
+    /// 所以剥完仍然逐字对得上。
+    fn prod_flat() -> String {
+        prod_text().chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// 两条收尾都必须先问归属、再动会话槽。
+    ///
+    /// 顺序反了（守卫写在 `clear_session()` 之后）症状完全一样、用例却永远绿：陈旧线程
+    /// 已经把活的那一张清掉了，才想起来自己不拥有它。
+    ///
+    /// 只在**函数体这一段**里比先后：`fn clear_session()` 的定义里也含这个串，窗口
+    /// 放宽了就会拿定义当调用点，比出来的次序不作数。
+    #[test]
+    fn both_exits_ask_ownership_before_they_clear_the_slot() {
+        let prod = prod_text();
+        for name in ["abort_session", "finish_session"] {
+            let head = prod
+                .find(&format!("fn {name}(app"))
+                .unwrap_or_else(|| panic!("{name} 的函数体找不到了（判据要跟着改）"));
+            let next_fn = prod[head..]
+                .find("\nfn ")
+                .map(|i| i + head)
+                .unwrap_or(prod.len());
+            let body = &prod[head..next_fn];
+            let guard = body
+                .find("may_finish(")
+                .unwrap_or_else(|| panic!("{name} 里不再问归属了 —— 陈旧收尾会踩掉活的那张"));
+            let clear = body
+                .find("clear_session()")
+                .expect("这个函数里不再清会话槽，判据要跟着改");
+            assert!(
+                guard < clear,
+                "{name}：必须先 may_finish 再 clear_session（现在守卫在第 {guard} 字、清槽在第 {clear} 字）"
+            );
+            // 守卫得真能拦人：拦下时要 return，不能只是记一行日志继续往下走
+            let between = &body[guard..clear];
+            assert!(
+                between.contains("return;"),
+                "{name}：may_finish 判 false 之后要早退，否则归属问了就等于没问：{between}"
+            );
+        }
+    }
+
+    /// 说不出 epoch 的出口只允许一条（`trigger` 里那个「run_capture 整体失败」的兜底），
+    /// 抓屏线程与两条时限各自都带着自己的 epoch 收尾。
+    ///
+    /// 这条盯的是最省事的回潮：有人嫌参数麻烦，把某处 `epoch` 改成 `0`「先让它别报错」。
+    /// 改掉的正是那三种会迟到的线程 —— 覆盖层显示失败、取图看门狗、标注绝对上限。
+    #[test]
+    fn only_the_exit_that_cannot_name_an_epoch_claims_zero() {
+        let flat = prod_flat();
+        assert_eq!(
+            flat.match_indices("abort_session(&handle,0,").count(),
+            1,
+            "传 0 的失败出口只该有 trigger 那一条兜底"
+        );
+        assert_eq!(
+            flat.match_indices("abort_session(&handle,epoch,").count(),
+            3,
+            "覆盖层显示失败 + 取图看门狗 + 标注绝对上限都要带自己的 epoch 收尾"
+        );
+        assert_eq!(
+            flat.match_indices("finish_session(app,sel.epoch)").count(),
+            1,
+            "提交那条路必须按选区自带的 epoch 收尾（旧页面传 0 会被拒绝，见 stale_reason）"
+        );
+        // 那唯一一条 0 必须还在 trigger 里（它跑在 claim 之前，说不出 epoch 才有依据）
+        let zero = flat
+            .find("abort_session(&handle,0,")
+            .expect("兜底出口不见了");
+        let head = flat.find("pubfntrigger(app").expect("trigger 找不到了");
+        let tail = flat[head..]
+            .find("fnspawn_annotate_ceiling")
+            .map(|i| i + head)
+            .expect("trigger 后面没有标注上限那条，切片前提变了");
+        assert!(
+            zero > head && zero < tail,
+            "传 0 的那条兜底挪出 trigger 了（在第 {zero} 字，trigger 区间 {head}..{tail}）—— \
+             别处说不出 epoch 就应该带上调用方的 epoch，而不是靠这条放行"
+        );
+    }
+
+    /// 藏悬浮窗后的 90ms 只等「真的藏过东西」那一次。
+    ///
+    /// 无条件睡挂在每一次截图的首帧路径上（按下热键 → 看见底图），而这张图根本不含悬浮窗
+    /// 时那 90ms 纯属白等。这条钉的是回潮：把 `if` 摘掉就又变成每次都睡。
+    #[test]
+    fn the_hide_settle_sleep_is_gated_on_actually_hiding_the_widget() {
+        let flat = prod_flat();
+        assert_eq!(
+            flat.match_indices("std::thread::sleep(HIDE_SETTLE)")
+                .count(),
+            1,
+            "等 DWM 撤窗只该有一处"
+        );
+        let sleep = flat
+            .find("std::thread::sleep(HIDE_SETTLE)")
+            .expect("等待那一步不见了");
+        let gate = flat
+            .find("ifFLOATING_WAS_VISIBLE.load(")
+            .expect("藏过悬浮窗才睡的门禁不见了 —— 摘掉它就回到每次白等 90ms");
+        assert!(
+            sleep > gate && sleep - gate < 120,
+            "睡必须紧跟在门禁的分支里（门禁在第 {gate} 字、睡在第 {sleep} 字），\
+             隔开太远说明它被挪去了别处"
+        );
+        // 反向的那半也要成立：藏过东西时确实要睡。它靠的是 store→load 都读同一个原子，
+        // 所以 trigger 里那次 store 不许被换成局部变量
+        assert_eq!(
+            flat.match_indices("FLOATING_WAS_VISIBLE.store(").count(),
+            2,
+            "trigger 里两个分支各写一次可见性，收尾再读一次 —— 少一处就是有一支没登记"
         );
     }
 }
