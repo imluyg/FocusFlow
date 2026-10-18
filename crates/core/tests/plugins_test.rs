@@ -385,16 +385,49 @@ mod tests {
         assert!(info.contains("FocusFlow"));
     }
 
+    /// 临时根目录：panic 也要回收。
+    ///
+    /// `/tmp/ff_*` 是门禁基线盯的那一项，泄漏一个就报不出 `TEMP_FLAT`；
+    /// 而 `app_dir` 是进程级的，用例炸在半路不把仓库目录还回去，后面的用例
+    /// 就接手一个已经删掉的目录（同文件里那些用例都自己 `set_app_dir`，
+    /// 但顺序与并行不由我们挑）。
+    struct TempRoot(std::path::PathBuf);
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+            if let Ok(dir) = std::env::current_dir() {
+                paths::set_app_dir(&dir);
+            }
+            db::queries::invalidate_years_cache();
+        }
+    }
+
     #[test]
     fn hot_reload_request() {
         focusflow_core::logger::init_logging();
         let _guard = guard();
-        let dir = std::env::current_dir().unwrap();
-        paths::set_app_dir(&dir);
+        // 这一条以前把 `app_dir` 指到仓库目录（`current_dir`），然后**直接改仓库里那份
+        // `plugins/stats_overview.lua`** 来动 mtime，用例末尾再写回去。两处坏：
+        // ① 进程被杀、或 `fs::write` / 中途任何一句 panic，那句"写回去"就轮不到 ——
+        //    签入的插件源文件于是带着 `-- hot reload test` 留在工作树里（实测脏过一次，
+        //    是并行杀进程那一轮留下的），而那是会随包发给用户的字节；
+        // ② 它和其它并行用例抢同一块地盘（同一份源文件既被读又被写）。
+        // 现在整份搬进临时目录，改的是自己的副本，仓库字节全程不动。
+        let root = std::env::temp_dir().join(format!("ff_hotreload_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("plugins")).unwrap();
+        let shipped = std::env::current_dir()
+            .unwrap()
+            .join("plugins/stats_overview.lua");
+        let copy = root.join("plugins/stats_overview.lua");
+        std::fs::copy(&shipped, &copy).unwrap();
+        let _root = TempRoot(root.clone());
+
+        paths::set_app_dir(&root);
         db::queries::invalidate_years_cache();
 
         let config: &'static FocusFlowConfig = Box::leak(Box::new(
-            FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
+            FocusFlowConfig::load(root.join("config.ini")).unwrap(),
         ));
         let database = db::Database::init_readonly();
         let mut manager = PluginManager::new(config, database);
@@ -413,8 +446,12 @@ mod tests {
         // 等待检测线程完成首次基线扫描（2s 周期）
         std::thread::sleep(std::time::Duration::from_millis(2500));
 
-        // 修改文件触发重载请求（追加注释改变 mtime）
+        // 修改文件触发重载请求（追加注释改变 mtime）—— 改的是本次自己复制出来的那份
         let path = manager.get_plugin("统计速览").unwrap().file_path.clone();
+        assert_eq!(
+            path, copy,
+            "被改的必须是临时副本，不能是仓库里那份签入的文件"
+        );
         let content = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, format!("{content}\n-- hot reload test\n")).unwrap();
 
@@ -430,6 +467,13 @@ mod tests {
 
         // 恢复内容（避免污染）
         std::fs::write(&path, content).unwrap();
+        // 仓库里那份一个字节都不许动 —— 这条断言是这次改动真正的守卫：
+        // 上面若又去写 `current_dir()/plugins/...`，这里会立刻读出差异并红。
+        assert_eq!(
+            std::fs::read_to_string(&shipped).unwrap(),
+            std::fs::read_to_string(&copy).unwrap(),
+            "仓库里签入的插件源文件被用例改了字节"
+        );
 
         assert!(
             reloaded.contains(&"stats_overview".to_string())
