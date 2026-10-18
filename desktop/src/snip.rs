@@ -325,7 +325,14 @@ fn run_capture(app: &AppHandle, annotate: bool) -> Result<(), String> {
             abort_session(&handle, epoch, &e);
         }
     }) {
-        return Err(format!("无法把覆盖层派发到主线程：{e}"));
+        // 会话在 `claim_session` 那一步就已经入槽了，所以这一条（以及下面看门狗起不来
+        // 那一条）**必须带着自己的 epoch 收尾**：从这儿 `return Err` 会落到 trigger 那条
+        // "说不出 epoch"的兜底（claim 0），而 claim 0 按"收当前这张"放行 —— 正好踩掉
+        // `may_finish` 要护的东西（页面取消或 Alt+F4 之后可能已经有下一张在飞了）。
+        let reason = format!("无法把覆盖层派发到主线程：{e}");
+        tracing::error!("截图失败：{reason}");
+        abort_session(app, epoch, &reason);
+        return Ok(());
     }
 
     // 看门狗：覆盖层显示后页面迟迟没来取图（页面没加载、图解码失败），
@@ -335,7 +342,7 @@ fn run_capture(app: &AppHandle, annotate: bool) -> Result<(), String> {
     // 三秒内就框完的正常截图误判成失败：会话早就清空了，5 秒后再弹一句
     // "覆盖层没能显示内容"。
     let handle = app.clone();
-    std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("snip-watchdog".into())
         .spawn(move || {
             std::thread::sleep(TAKE_DEADLINE);
@@ -356,7 +363,15 @@ fn run_capture(app: &AppHandle, annotate: bool) -> Result<(), String> {
                 );
             }
         })
-        .map_err(|e| format!("启动截图看门狗失败：{e}"))?;
+        .map_err(|e| format!("启动截图看门狗失败：{e}"))
+    {
+        let reason = format!("启动截图看门狗失败：{e}");
+        tracing::error!("截图失败：{reason}");
+        // 同上一条：会话已入槽、覆盖层也已经亮了，收尾要带自己的 epoch。
+        // 塞给 claim 0 的兜底就会去清别人的会话槽、藏别人的覆盖层。
+        abort_session(app, epoch, &reason);
+        // 老写法在这里 return Err(reason)，等于把收尾外包给 claim 0 的兜底
+    }
     Ok(())
 }
 
@@ -509,10 +524,11 @@ fn raise_topmost(_win: &WebviewWindow) {}
 /// 但"陈旧的那一次不许踩死活的那一张"这条判决可以单独钉住。
 ///
 /// `claim == 0` = 调用方说不出自己属于哪一张（`trigger` 里"再按一次放弃当前这张"、
-/// 页面那条 `snip_cancel`、以及 `run_capture` 在 claim 之前就失败的那条路），
-/// 它们要收的就是当前这张 ⇒ 放行。说得出 epoch 的（抓屏线程里的 `show_overlay` 失败、
-/// 两条看门狗）就必须相等才动手。不等还要收尾的后果不是日志难看，是**用户那张图没了**：
-/// 陈旧的抓屏线程会 `clear_session` + 藏掉正被新会话使用的覆盖层。
+/// 页面那条 `snip_cancel`、以及 `run_capture` 在 claim 之前就失败的那两条：抓屏本身
+/// 失败、PNG 编码失败），它们要收的就是当前这张 ⇒ 放行。
+/// 说得出 epoch 的（`run_capture` 入槽之后的四个出口：派发主线程失败、覆盖层显示失败、
+/// 取图看门狗到点、标注绝对上限到点）就必须相等才动手。不等还要收尾的后果不是日志难看，
+/// 是**用户那张图没了**：陈旧的抓屏线程会 `clear_session` + 藏掉正被新会话使用的覆盖层。
 fn may_finish(claim: u64, current: u64) -> bool {
     claim == 0 || claim == current
 }
@@ -616,9 +632,10 @@ pub fn trigger(app: &AppHandle, annotate: bool) -> Result<(), String> {
             }
             if let Err(e) = run_capture(&handle, annotate) {
                 tracing::error!("截图失败：{e}");
-                // 说不出 epoch：`run_capture` 可能在 claim 之前就失败（那时槽里是上一张，
-                // 或者什么都没有），也可能在 claim 之后失败（它内部的两个出口已经各自
-                // 带 epoch 收尾了）。这里按"收当前这张"处理，与旧行为一致。
+                // 说不出 epoch：`run_capture` 现在只可能在 claim **之前**失败（抓屏、编码
+                // 那两条），那时槽里是上一张或者什么都没有；入槽之后的四个出口都各自带着
+                // epoch 收尾了。这里按"收当前这张"处理，与旧行为一致。
+                // 反过来说，入槽之后要是还能走到 abort_session(&handle,0,&e)，归属判据就被绕开了。
                 abort_session(&handle, 0, &e);
             }
         })
@@ -1537,13 +1554,28 @@ mod tests {
         prod.to_string()
     }
 
-    /// 同上，但把空白全剥掉后的形状，用于按调用点钉结构。
+    /// 把一段代码剪成"只剩标识符"的形状：先去掉行注释，再剥掉所有空白。
     ///
     /// 为什么剥空白：这些调用点会被 rustfmt 折行（`abort_session(` 标注上限那条就跨了
     /// 四行），拿原始文本比就会因为一次无关的格式化而红。标识符本身永远不会被折开，
     /// 所以剥完仍然逐字对得上。
+    ///
+    /// 为什么要先剪注释：本文件的注释里就写着 `return Err` 这种字样，留着它就能让
+    /// "这段代码里没有早退"那条判据被一句解释性的话判红 —— 那是假红，而且红得让人只想
+    /// 把判据删掉。
+    fn flat_code(s: &str) -> String {
+        s.lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// 生产代码把空白全剥掉后的形状，用于按调用点钉结构。
     fn prod_flat() -> String {
-        prod_text().chars().filter(|c| !c.is_whitespace()).collect()
+        flat_code(&prod_text())
     }
 
     /// 两条收尾都必须先问归属、再动会话槽。
@@ -1620,6 +1652,51 @@ mod tests {
             zero > head && zero < tail,
             "传 0 的那条兜底挪出 trigger 了（在第 {zero} 字，trigger 区间 {head}..{tail}）—— \
              别处说不出 epoch 就应该带上调用方的 epoch，而不是靠这条放行"
+        );
+    }
+
+    /// 入槽之后的出口不许把收尾外包给 trigger 那条 claim 0 的兜底。
+    ///
+    /// 这条盯的是最顺手的一种改法：`run_capture` 里已经有 `epoch` 了，却在新加的失败分支上
+    /// `?` 或 `return Err` 一下交给调用方 —— 归属判据当场被绕过，而编译、用例、真机都不会响
+    /// （症状只在"页面取消之后立刻又按一次热键"这种迟到收尾里才露出来）。
+    #[test]
+    fn run_capture_does_not_outsource_an_exit_after_claiming() {
+        let prod = prod_text();
+        let head = prod
+            .find("fn run_capture(app")
+            .expect("抓屏函数找不到了（判据要跟着改）");
+        let end = prod[head..]
+            .find("\n}\n")
+            .map(|i| i + head)
+            .expect("抓屏函数的结尾不见了");
+        let body = &prod[head..end];
+        let claim = body
+            .find("let epoch = claim_session(")
+            .expect("入槽那一步不见了");
+        let flat = flat_code(&body[claim..]);
+
+        // 夹具自己的前提：这段切片真盖住了入槽之后的部分，不是切成空串让下面的断言空转
+        assert!(
+            flat.contains("snip-watchdog"),
+            "切片没盖住入槽之后的代码，那三条断言是假绿"
+        );
+        assert_eq!(
+            flat.match_indices("abort_session(&handle,epoch,&e)")
+                .count(),
+            1,
+            "覆盖层显示失败那条要自己带 epoch 收尾"
+        );
+        assert_eq!(
+            flat.match_indices("abort_session(app,epoch,&reason)")
+                .count(),
+            2,
+            "入槽之后的两条 Err 出口（派发主线程失败、看门狗起不来）没有各自带 epoch 收尾"
+        );
+        assert!(
+            !flat.contains("returnErr(") && !flat.contains(")?;"),
+            "入槽之后还留着会把错误交给 claim 0 兜底的出口（return Err 或 ? 早退）—— \
+             那一刻 epoch 就在作用域里，收尾必须带着它"
         );
     }
 
