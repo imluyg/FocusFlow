@@ -142,11 +142,17 @@ pub fn init_logging() {
     };
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    // 控制台直接同步写 stdout，不再套一层 non_blocking：
+    // 控制台只同步写 **stderr**，不再套一层 non_blocking：
     // 那样要多管一个 guard，而它原先在同一条语句里就被丢弃了，
     // worker 随即停转 —— 控制台层实际上是死的。ERROR 量小，同步写无碍。
+    //
+    // 为什么必须是 stderr：CLI 把自己的结论严格分流（成功那句走 stdout，未完成/失败走
+    // stderr，因为这条命令挂在计划任务上，运维收的就是 stdout）。这一层只放 ERROR 级
+    // 消息 —— 它落在 stdout 上，等于把「执行前快照只兜住一份」这类失败掺进那份
+    // 看着像成功的产物里，正是本仓为 `--backup` / `--cleanup` 反复修过的那一族。
+    // 桌面端是 windows 子系统、根本没有控制台，改动对它无感。
     let console_layer = fmt::layer()
-        .with_writer(std::io::stdout)
+        .with_writer(std::io::stderr)
         .with_ansi(true)
         .with_target(false)
         .with_filter(tracing_subscriber::filter::LevelFilter::ERROR);
@@ -208,6 +214,34 @@ pub(crate) fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    /// 控制台那一层只许写 stderr。
+    ///
+    /// 为什么钉在这一处：CLI 的 stdout 是**给计划任务收的那份结论**，所以它自己严格
+    /// 分流（成功那句走 stdout、未完成与失败走 stderr）。这一层放的是 ERROR 级消息，
+    /// 落在 stdout 上就等于把「执行前快照只兜住一份」「某年库没压缩成」这类失败掺进
+    /// 那份看着像成功的产物里 —— `--backup` / `--cleanup` / `--vacuum` 为同一族修过三轮，
+    /// 漏的这一半在日志层。桌面端是 windows 子系统、没有控制台，所以改动对它无感。
+    ///
+    /// 这条只能钉形状：全局 subscriber 装好就撤不下来，同一进程里没法再拿第二个
+    /// subscriber 去观察"ERROR 到底写到哪个流"。
+    #[test]
+    fn the_console_layer_writes_to_stderr() {
+        let src = include_str!("logger.rs");
+        let at = src
+            .find("let console_layer")
+            .expect("控制台层不见了（删掉它之前请先想想到底的 ERROR 往哪儿走）");
+        let rest = &src[at..];
+        let body = &rest[..rest.find(';').map(|n| n + 1).unwrap_or(rest.len())];
+        assert!(
+            body.contains("with_writer(std::io::stderr)"),
+            "控制台层不再写 stderr，失败消息会混进 CLI 给计划任务的那份 stdout：{body}"
+        );
+        assert!(
+            !body.contains("stdout"),
+            "同一层里不能同时引用 stdout：{body}"
+        );
+    }
+
     /// `shutdown` 的契约：释放 guard、把尾部日志写完、可重复调用。
     ///
     /// 注：这条只能算契约/冒烟测试 —— non_blocking 的 worker 平时也会很快把行

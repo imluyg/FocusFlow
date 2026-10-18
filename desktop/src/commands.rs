@@ -599,29 +599,53 @@ pub async fn do_backup(state: State<'_, Arc<AppState>>) -> Result<String, String
     let db = Arc::clone(&state.db);
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         db.flush(true);
-        use focusflow_core::db::maintenance::BackupOutcome;
-        match focusflow_core::db::maintenance::backup_database(max_backups) {
-            BackupOutcome::Done {
-                first,
-                count,
-                failed,
-            } => {
-                let line = format!("{}（共 {count} 份）", first.display());
-                if failed.is_empty() {
-                    Ok(line)
-                } else {
-                    // 部分成功不能报成一句"备份完成"：设置页那个按钮按下去就是想知道
-                    // 有没有兜住，而少掉的那些恰恰是统计库
-                    Ok(format!("{line}；但这些没备份出去：{failed:?}"))
-                }
-            }
-            BackupOutcome::NothingToDo => Err("没有需要备份的数据库".to_string()),
-            BackupOutcome::Failed { reason } => Err(reason),
-        }
+        backup_message(&focusflow_core::db::maintenance::backup_database(
+            max_backups,
+        ))
     })
     .await
     .map_err(|e| e.to_string())??;
     Ok(outcome)
+}
+
+/// 「立即备份」这句结论的**唯一**判据：只有全都兜住才许是 Ok。
+///
+/// 部分失败原先也返回 `Ok`，把失败清单拼在成功串后面 —— 而前端 `doBackup()`
+/// 拿到 Ok 就无条件渲染成绿字「备份完成: 」+ 那句尾巴（`views.js`），于是用户看到的
+/// 是一句成功，而尾巴上写的恰恰是"统计库这次没备份出去"。同一个形状在导入那侧
+/// 早就改成 `import_outcome`（errors 非空 ⇒ Err），这是漏下的另一半。
+///
+/// 判据不重写一遍：走 core 的 `BackupOutcome::is_complete()`。那个函数在 core 里
+/// 有用例钉着、却没有任何生产调用方，"完成与否"到两个界面上各写了一遍
+/// `failed.is_empty()` —— 本仓最常见的那把抄了两处的尺子。
+fn backup_message(
+    outcome: &focusflow_core::db::maintenance::BackupOutcome,
+) -> Result<String, String> {
+    use focusflow_core::db::maintenance::BackupOutcome as B;
+    match outcome {
+        B::Done {
+            first,
+            count,
+            failed,
+        } => {
+            let line = format!("{}（共 {count} 份）", first.display());
+            if outcome.is_complete() {
+                Ok(line)
+            } else {
+                // 前端把 Err 的整句话渲染成红字并冠以「备份失败: 」。这句话要自己
+                // 就能说清"拿到过几份、缺的是哪一个库"，而不是只喊一次失败。
+                Err(format!(
+                    "只兜住 {count} 份（最新 {}），但这些库没备份出去: {failed:?}",
+                    first.display()
+                ))
+            }
+        }
+        // 没东西可备份不算成功也不算损坏：按钮要的是"这次有没有落盘"这句话
+        B::NothingToDo => {
+            Err("没有需要备份的数据库（新建或刚重置过，或历史库都与上次一致）".to_string())
+        }
+        B::Failed { reason } => Err(reason.clone()),
+    }
 }
 
 /// 调试：前端写入日志（定位悬浮窗拖动问题）。发布版为 no-op。
@@ -717,7 +741,49 @@ pub fn set_plugin_enabled(
 
 #[cfg(test)]
 mod tests {
-    use super::{import_outcome, must_reload_hotkey};
+    use super::{backup_message, import_outcome, must_reload_hotkey};
+    use focusflow_core::db::maintenance::BackupOutcome;
+
+    /// 备份部分失败时设置页不能拿到绿色那句「备份完成」。
+    ///
+    /// 与下面那条导入的同族用例同一个形状：前端只看 `Ok`/`Err` 两个分支，
+    /// 把失败清单拼进 `Ok` 的字符串里，它照样会印成成功。判据走 core 的
+    /// `is_complete()`，这里同时钉"没兜住的库必须出现在这句话里"——
+    /// 用户要能在红字上看出**是哪个库**没备份出去。
+    #[test]
+    fn a_partial_backup_is_not_returned_as_success() {
+        let all = BackupOutcome::Done {
+            first: std::path::PathBuf::from("backup/focusflow_2026_1.db"),
+            count: 3,
+            failed: vec![],
+        };
+        let ok = backup_message(&all).expect("全都兜住时才是 Ok");
+        assert!(
+            ok.contains("共 3 份") && ok.contains("focusflow_2026_1.db"),
+            "成功串要带份数与位置：{ok}"
+        );
+
+        let partial = BackupOutcome::Done {
+            first: std::path::PathBuf::from("backup/focusflow_2026_1.db"),
+            count: 1,
+            failed: vec!["focusflow_2025.db".to_string()],
+        };
+        let err = backup_message(&partial).expect_err("五库里只成一个绝不能是 Ok");
+        assert!(
+            err.contains("focusflow_2025.db") && err.contains("只兜住 1 份"),
+            "红字里必须同时说清没兜住的是谁、已经拿到几份：{err}"
+        );
+
+        // 三态各归各位：无事可做与真失败都不是成功
+        assert!(backup_message(&BackupOutcome::NothingToDo).is_err());
+        assert_eq!(
+            backup_message(&BackupOutcome::Failed {
+                reason: "备份目录建不出来".to_string()
+            })
+            .unwrap_err(),
+            "备份目录建不出来"
+        );
+    }
 
     /// `[hotkey]` 里每一条组合键都必须触发重注册。判据的键名集合取自 `hotkey::BINDINGS`，
     /// 所以这张表以后加第三条绑定，这条用例自动跟着长 —— 把判据退回成写死的键名列表会立刻红

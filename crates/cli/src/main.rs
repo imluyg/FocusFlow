@@ -162,39 +162,22 @@ fn run(args: &[String]) -> i32 {
             let max_backups = focusflow_core::config::instance()
                 .get_int("database", "max_backups", 5)
                 .max(1);
-            match db::maintenance::backup_database(max_backups) {
-                db::maintenance::BackupOutcome::Done {
-                    first,
-                    count,
-                    failed,
-                } => {
-                    // 结论只有一句，而且先判失败再选措辞（与 `--cleanup` 的
-                    // `cleanup_outcome` 同一条口径）：旧写法无条件先往 stdout 打
-                    // 「备份完成」，随后才在 stderr 补一句「不完整」—— 计划任务收的是
-                    // stdout，那份日志说的正好是反的。
-                    println!(
-                        "  目录: {}（已停用插件的数据会跳过）",
-                        focusflow_core::paths::backup_dir().display()
-                    );
-                    let (line, code) = backup_outcome(&first, count, &failed);
-                    if code == 0 {
-                        println!("{line}");
-                    } else {
-                        eprintln!("{line}");
-                    }
-                    code
-                }
-                // 没东西可备份不是失败：挂计划任务时退 1 会让用户以为天天在坏，
-                // 而真失败的那一次也混在同一句话里看不出来
-                db::maintenance::BackupOutcome::NothingToDo => {
-                    println!("没有需要备份的数据库（新建/刚重置过，或历史库都与上次一致）");
-                    0
-                }
-                db::maintenance::BackupOutcome::Failed { reason } => {
-                    eprintln!("备份失败: {reason}");
-                    1
-                }
+            let outcome = db::maintenance::backup_database(max_backups);
+            if matches!(outcome, db::maintenance::BackupOutcome::Done { .. }) {
+                println!(
+                    "  目录: {}（已停用插件的数据会跳过）",
+                    focusflow_core::paths::backup_dir().display()
+                );
             }
+            // 三种结局（全都兜住 / 只兜住一部分 / 无事可做 / 真失败）由同一个函数挑话：
+            // 成功那句只属于成功，走 stdout，其余走 stderr（这条命令是挂在计划任务上的）。
+            let (line, code) = backup_outcome(&outcome);
+            if code == 0 {
+                println!("{line}");
+            } else {
+                eprintln!("{line}");
+            }
+            code
         }
         "--cleanup" => {
             if args.len() < 2 {
@@ -383,13 +366,28 @@ fn print_stats(_db: &db::Database, period: &str) -> i32 {
             "  {rank:<6}{key:<12}{:<12}{percent:<10}",
             fmt_thousands(*count)
         );
-        if rank >= 20 {
-            println!("  ... 共 {} 种键鼠", stats.len());
+        if rank >= RANK_LIMIT {
             break;
         }
     }
+    if let Some(note) = rank_tail_note(rank, stats.len()) {
+        println!("{note}");
+    }
     println!("{}\n", "=".repeat(50));
     0
+}
+
+/// 两个统计面板并列时截到第几名。
+const RANK_LIMIT: usize = 20;
+
+/// 榜单被截断时补的那半句话 —— `--stats` 与 `--stats-year` 共用一把尺子。
+///
+/// 以前只有 `--stats` 会说「… 共 N 种键鼠」，而 `--stats-year` 到第 20 名直接 break、
+/// 什么都不说：上面印的总计是全量、榜上只有 20 行，两处口径不一致却看不出来。
+/// 同一族已经栽过好几次（导出转义、同分破平、鼠标/键盘分组名）——**显示规则抄两遍，
+/// 改一漏一**是本仓产出最高的缺陷形状，所以这里收成一处，两个面板各自只调用一次。
+fn rank_tail_note(shown: usize, kinds: usize) -> Option<String> {
+    (kinds > shown).then(|| format!("  ... 只列前 {shown}，共 {kinds} 种键鼠"))
 }
 
 /// 一个周期参数落到查询层的那两个数（days / date）与要印在标题上的那句说法。
@@ -596,9 +594,12 @@ fn print_year_stats(_db: &db::Database, year: i32) -> i32 {
     for (key, count) in sorted {
         rank += 1;
         println!("  {rank:<6}{key:<12}{}", fmt_thousands(*count));
-        if rank >= 20 {
+        if rank >= RANK_LIMIT {
             break;
         }
+    }
+    if let Some(note) = rank_tail_note(rank, stats.len()) {
+        println!("{note}");
     }
     println!("{}\n", "=".repeat(50));
     0
@@ -624,11 +625,29 @@ fn print_list_years(_db: &db::Database) -> i32 {
     0
 }
 
+/// `--export <格式>` 的目标文件名：**唯一**一处把参数翻成文件名，认不出来就在入口拒掉。
+///
+/// 旧写法先按 `if fmt == "csv" { "csv" } else { "html" }` 拼出 `focusflow_export.html`，
+/// 再往下才在 match 里拒绝未知格式 ⇒ `--export pdf` 这一路先把"要写哪个文件"算了出来，
+/// 而且可读性闸门排在格式校验**之前**：一个拼错的格式名会先讨到一句不相干的
+/// 「导出的会是一份偏小的数据」。参数对不对得先看参数自己。
+fn export_target(fmt: &str) -> Result<std::path::PathBuf, String> {
+    let ext = match fmt {
+        "csv" => "csv",
+        "html" => "html",
+        other => return Err(format!("不支持的格式: {other}（可选 csv 或 html）")),
+    };
+    Ok(std::path::PathBuf::from(format!("focusflow_export.{ext}")))
+}
+
 fn export(_db: &db::Database, fmt: &str) -> i32 {
-    let filepath = std::path::PathBuf::from(format!(
-        "focusflow_export.{}",
-        if fmt == "csv" { "csv" } else { "html" }
-    ));
+    let filepath = match export_target(fmt) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     if let Err(e) = check_years_readable() {
         eprintln!("导出的会是一份偏小的数据：{e}");
         return 1;
@@ -640,13 +659,11 @@ fn export(_db: &db::Database, fmt: &str) -> i32 {
         Ok(dir) => dir.join(&filepath),
         Err(_) => filepath.clone(),
     };
-    let outcome = match fmt {
-        "csv" => export_csv(&filepath, total, &stats),
-        "html" => export_html(&filepath, total, &stats),
-        other => {
-            eprintln!("不支持的格式: {other}（可选 csv 或 html）");
-            return 1;
-        }
+    // 写哪一格式由那个已经通过校验的文件名决定，不再第二次判 `fmt`
+    let outcome = if filepath.extension().is_some_and(|e| e == "csv") {
+        export_csv(&filepath, total, &stats)
+    } else {
+        export_html(&filepath, total, &stats)
     };
     match outcome {
         Ok(()) => {
@@ -919,31 +936,122 @@ fn cleanup_outcome(days: i64, report: &db::maintenance::MaintenanceReport) -> (S
 /// 与 `cleanup_outcome` 同一族、同一条口径（`c4aee24` 定下的）：`Done` 里的 `count` 是
 /// "成功份数"，5 个库里只成 1 个也算 `Done`。旧写法先把「备份完成」打到 stdout，
 /// 再往 stderr 补一句不完整 ⇒ 挂在计划任务上的那份日志读起来是成功。
-/// 现在不完整那一句同时带上已经拿到的份数与最新一份的路径，信息一条不少。
-fn backup_outcome(first: &std::path::Path, count: usize, failed: &[String]) -> (String, i32) {
-    if failed.is_empty() {
-        (format!("备份完成: {}（共 {count} 份）", first.display()), 0)
-    } else {
-        (
-            format!(
-                "备份不完整: 这些库没能产出通过校验的备份: {failed:?}\
-                 （已经备份到的 {count} 份仍然有效，最新一份 {}）",
-                first.display()
-            ),
-            1,
-        )
+///
+/// "到底兜住了没有"不在这里重写：判据用 core 的 `BackupOutcome::is_complete()`，
+/// 设置页那句结论（`desktop/src/commands.rs` 的 `backup_message`）用的是同一个函数。
+/// 这个判据先前在两个界面各抄了一遍 `failed.is_empty()`，桌面那一份抄成了 `Ok`
+/// ⇒ 部分失败在设置页上照样是一片绿字。三句话（完成 / 不完整 / 无事可做）都在这里挑。
+fn backup_outcome(outcome: &db::maintenance::BackupOutcome) -> (String, i32) {
+    use db::maintenance::BackupOutcome as B;
+    match outcome {
+        B::Done {
+            first,
+            count,
+            failed,
+        } => {
+            let line = format!("{}（共 {count} 份）", first.display());
+            if outcome.is_complete() {
+                (format!("备份完成: {line}"), 0)
+            } else {
+                (
+                    format!(
+                        "备份不完整: 这些库没能产出通过校验的备份: {failed:?}（{line}仍然有效）"
+                    ),
+                    1,
+                )
+            }
+        }
+        // 没东西可备份不是失败：挂计划任务时退 1 会让用户以为天天在坏，
+        // 而真失败的那一次也混在同一句话里看不出来
+        B::NothingToDo => (
+            "没有需要备份的数据库（新建/刚重置过，或历史库都与上次一致）".to_string(),
+            0,
+        ),
+        B::Failed { reason } => (format!("备份失败: {reason}"), 1),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_outcome, cleanup_outcome, export_csv, export_html, period_window, year_lookup,
+        backup_outcome, cleanup_outcome, export_csv, export_html, export_target, parse_keep_days,
+        parse_period, parse_stats_year, period_window, rank_tail_note, year_lookup, Period,
         YearLookup,
     };
-    use super::{parse_keep_days, parse_period, parse_stats_year, Period};
     use super::{reset_plan, ResetPlan};
     use focusflow_core::db::maintenance::MaintenanceReport;
+
+    /// `--export` 的格式参数必须先看它自己，而不是先算出一个文件名。
+    ///
+    /// 旧写法 `if fmt == "csv" { "csv" } else { "html" }` 把任何未知格式都拼成
+    /// `focusflow_export.html`，之后才在 match 里拒绝 —— 于是一个拼错的格式名先拿到了
+    /// 一个不相干的目标文件，又（因为可读性闸门排在它前面）先讨到一句
+    /// 「导出的会是一份偏小的数据」。反向腿钉的就是这一点：认不出来时**不许**报出文件名。
+    #[test]
+    fn an_unsupported_export_format_never_names_a_target_file() {
+        assert_eq!(
+            export_target("csv").unwrap(),
+            std::path::PathBuf::from("focusflow_export.csv")
+        );
+        assert_eq!(
+            export_target("html").unwrap(),
+            std::path::PathBuf::from("focusflow_export.html")
+        );
+        for bad in ["pdf", "CSV", "", "csv ", "htm"].iter() {
+            let e = export_target(bad).expect_err("不是受支持的格式，应当被拒");
+            assert!(
+                !e.contains("focusflow_export"),
+                "被拒的格式不该看到一个目标文件名：{e}"
+            );
+            assert!(e.contains("格式"), "要说明拒的是哪一类参数：{e}");
+        }
+    }
+
+    /// 榜单截断那句「共 N 种键鼠」必须两个面板共用，而且没截断时不许说话。
+    ///
+    /// `--stats` 一直有这句、`--stats-year` 到第 20 名直接 break 一个字不吱 ——
+    /// 上面印的总计是全量、榜上只有 20 行，两处口径不一致却看不出来。
+    /// 「显示规则抄两遍，改一漏一」是本仓产出最高的一类缺陷（导出转义、同分破平、
+    /// 鼠标/键盘分组名都栽过），所以这里把话收成一处，两个面板各调用一次。
+    #[test]
+    fn the_rank_truncation_note_only_appears_when_rows_were_dropped() {
+        let note = rank_tail_note(20, 113).expect("113 种只列了 20，必须声明");
+        assert!(
+            note.contains("只列前 20") && note.contains("共 113"),
+            "既要说出看见了几行、也要说出全量：{note}"
+        );
+        assert_eq!(
+            rank_tail_note(20, 20),
+            None,
+            "刚好 20 种＝一行没丢，不该有省略号"
+        );
+        assert_eq!(rank_tail_note(5, 5), None);
+        assert_eq!(rank_tail_note(0, 0), None, "空榜不声明");
+        assert!(
+            rank_tail_note(20, 21).is_some(),
+            "多一种也是截断 —— 全量总计与榜上的行数对不上时必须说出来"
+        );
+
+        // 接线腿：两个面板都必须真的说这句话。纯函数自己绿不等于有人调它 ——
+        // 这条缺陷原本的形状就是"一处说、一处不说"。
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
+        for name in ["print_stats", "print_year_stats"].iter() {
+            let at = prod
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("面板函数不见了：{name}"));
+            let rest = &prod[at..];
+            let body = &rest[..rest[1..].find("\nfn ").map(|n| n + 1).unwrap_or(rest.len())];
+            assert!(
+                body.contains("rank_tail_note(rank, stats.len())"),
+                "{name} 调用截断声明时没把**实际行数与全量**传进去 —— 那句话就永远说不出口"
+            );
+            assert!(
+                body.contains("RANK_LIMIT"),
+                "{name} 还自己写死着截断行数，两处上限会分叉"
+            );
+        }
+    }
 
     /// `--cleanup` 的天数口径：0 / 负数 / 非整数 / 大得离谱都要在入口挡住。
     ///
@@ -1398,24 +1506,43 @@ mod tests {
     /// `--cleanup` 定过这条口径，`--backup` 是同族的另一半）。
     #[test]
     fn backup_says_incomplete_instead_of_done_when_a_library_failed() {
-        let p = std::path::Path::new("backup/focusflow_2026_20261019.db");
-        let (line, code) = backup_outcome(p, 1, &["focusflow_2025.db".to_string()]);
+        use focusflow_core::db::maintenance::BackupOutcome as B;
+        let done = |failed: Vec<String>, count: usize| B::Done {
+            first: std::path::PathBuf::from("backup/focusflow_2026_20261019.db"),
+            count,
+            failed,
+        };
+
+        let (line, code) = backup_outcome(&done(vec!["focusflow_2025.db".to_string()], 1));
         assert_eq!(code, 1, "有库没备份成就不能退 0");
         assert!(
             !line.contains("备份完成"),
             "部分失败那一轮绝不能出现「备份完成」四个字：{line}"
         );
         assert!(
-            line.contains("focusflow_2025.db") && line.contains("1 份"),
+            line.contains("focusflow_2025.db") && line.contains("共 1 份"),
             "要点名失败的库、也说清已经拿到几份：{line}"
         );
 
-        let (ok_line, ok_code) = backup_outcome(p, 3, &[]);
+        let (ok_line, ok_code) = backup_outcome(&done(vec![], 3));
         assert_eq!(ok_code, 0);
         assert!(
             ok_line.contains("备份完成") && ok_line.contains("共 3 份"),
             "全都成功时才说完成，并把份数带上：{ok_line}"
         );
+
+        // 三态分开这条口径不能塌：无事可做退 0 且不说"完成"，真失败退 1 并带上原因
+        let (nothing, nothing_code) = backup_outcome(&B::NothingToDo);
+        assert_eq!(nothing_code, 0, "没有该备份的东西不是失败");
+        assert!(
+            !nothing.contains("完成"),
+            "一份都没写出去，不能说完成：{nothing}"
+        );
+        let (bad, bad_code) = backup_outcome(&B::Failed {
+            reason: "备份目录建不出来".to_string(),
+        });
+        assert_eq!(bad_code, 1);
+        assert!(bad.contains("备份目录建不出来"), "原因要原递给人：{bad}");
     }
 
     /// 两条设备命令共用同一把周期尺子：`--devices` 认的参数与 `--device-keys` 认的必须一样。
