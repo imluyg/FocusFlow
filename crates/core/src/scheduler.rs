@@ -67,19 +67,56 @@ pub fn init_db() -> anyhow::Result<()> {
     if n > 0 {
         tracing::warn!("定时任务库里有 {n} 条 args 为 NULL 的记录（旧版本遗留），已补成空串");
     }
-    // 同一手的第二件：把 `schedule_time` 的首尾空格清掉。写侧现在存的就是 trim 过的
-    // 值，但库里可能躺着旧写法留下的 `"2026-12-01 10:00 "` —— 而 `should_run` 拿原串
-    // 去 parse，那种行会永远解析失败、永远不执行、也一行日志都不留。
+    // 同一手的第二件：把三个文本列的首尾空白清掉。写侧现在存的就是 trim 过的值，
+    // 但库里可能躺着旧写法留下的 `"2026-12-01 10:00 "` 或 `" C:\\Windows\\notepad.exe"`。
+    // 前者 `should_run` 拿原串去 parse ⇒ 永远解析失败、永远不执行、一行日志都不留；
+    // 后者更狠：`execute_task` 会拿库里那条原始串再过一次"必须绝对路径"的校验，
+    // 判成**永久**拒绝（不是"此刻读不到"那一类），这条任务从此再也不试第二次。
     // 旧版 Python 的调度库是整份复制进来的（`migration.rs` 的 AUX_DBS），那批行
     // 靠写侧修不到，只能在这里规范化一次。
-    let n = conn
-        .execute(
-            "UPDATE scheduled_tasks SET schedule_time = TRIM(schedule_time) WHERE schedule_time != TRIM(schedule_time)",
-            [],
+    //
+    // 用 Rust 的 `str::trim` 而不是 SQL 的 `TRIM()`：SQL 那个只去空格，而写侧那把尺子
+    // 去掉的是所有首尾空白 —— 拿 SQL 版就会留下"带 tab 的历史行修不到"的半个口径。
+    let rows: Vec<(i64, String, String, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, target_path, args, schedule_time FROM scheduled_tasks")
+            .map_err(|e| anyhow::anyhow!("读取待规范化的定时任务失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| anyhow::anyhow!("读取待规范化的定时任务失败: {e}"))?
+            .flatten()
+            .collect();
+        rows
+    };
+    let mut healed = 0usize;
+    for (id, target, args, time) in rows {
+        let (t2, a2, s2) = (
+            target.trim().to_string(),
+            args.trim().to_string(),
+            time.trim().to_string(),
+        );
+        if t2 == target && a2 == args && s2 == time {
+            continue;
+        }
+        // 只动这三列：`last_run` 是防同日重跑的锚，规范化空白不算"改了调度时刻"
+        conn.execute(
+            "UPDATE scheduled_tasks SET target_path=?1, args=?2, schedule_time=?3 WHERE id=?4",
+            rusqlite::params![t2, a2, s2, id],
         )
-        .map_err(|e| anyhow::anyhow!("规范化 schedule_time 的定时任务失败: {e}"))?;
-    if n > 0 {
-        tracing::warn!("定时任务库里有 {n} 条 schedule_time 带首尾空格（旧版本遗留），已规范化");
+        .map_err(|e| anyhow::anyhow!("规范化定时任务的空白失败: {e}"))?;
+        healed += 1;
+    }
+    if healed > 0 {
+        tracing::warn!(
+            "定时任务库里有 {healed} 条目标/参数/时刻带首尾空白（旧版本遗留），已规范化"
+        );
     }
     Ok(())
 }
@@ -676,10 +713,15 @@ pub fn add_task(
         return Err(e);
     }
     let created = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    // 入库的必须是**校验过的那个串**：`validate_schedule` 判的是 trim 之后的值，
-    // 而这里原先直接把原样字符串写下去。`"2026-12-01 10:00 "`（面板里从记事本粘出来
-    // 很容易带上尾随空格）于是变成"校验通过、入库、然后 `should_run` 永远解析失败
-    // 返回 false"——一条看着已排好、实际永不执行、也一行日志都没有的任务。
+    // 入库的必须是**校验过的那个串**：校验判的是 trim 之后的值，而这里原先直接把原样
+    // 字符串写下去。`"2026-12-01 10:00 "`（面板里从记事本粘出来很容易带上尾随空格）
+    // 于是变成"校验通过、入库、然后 `should_run` 永远解析失败返回 false"——一条看着
+    // 已排好、实际永不执行、也一行日志都没有的任务。
+    // 目标路径与参数是同一族的另一半，而且后果更狠：`execute_task` 会拿库里那条原始串
+    // 再过一次 `validate_exe_target`，`" C:\\Windows\\notepad.exe"` 连"绝对路径"这一关
+    // 都过不了 ⇒ 永久 `Refused`（不是"此刻读不到"那一类），这条任务从此再也不试第二次。
+    let target_path = target_path.trim();
+    let args = args.trim();
     let schedule_time = schedule_time.trim();
     let conn = open().map_err(|e| anyhow::anyhow!("打开调度库失败: {e}"))?;
     conn.execute(
@@ -747,18 +789,20 @@ pub fn update_task(
         }
     };
     let new_name = name.unwrap_or(&existing.0).to_string();
-    let new_target = target_path.unwrap_or(&existing.1).to_string();
+    let new_target = target_path.unwrap_or(&existing.1).trim().to_string();
     // 目标**真的换了**才重新校验。原先判的是"调用方传了 target_path"，而这个函数唯一
     // 的调用方（插件页 scheduler_update，见 host.rs 的七参数绑定）永远把整条记录原样
     // 传回来 —— 于是程序被卸载或移走之后，这条任务连名字和时刻都改不动（想改也过不了
     // 目标那道闸）。传回来的就是库里存的那一条 ⇒ 没人改目标，不该拿库外的变化惩罚他。
-    if target_path.is_some() && new_target != existing.1 {
+    // 比较要拿**两边都 trim 过**的做：库里那条若是历史脏行（带空格），这次编辑只是把
+    // 空格规范化掉，不该顺手重新校验 —— 规范化不等于"换了个程序"。
+    if target_path.is_some() && new_target != existing.1.trim() {
         if let Err(e) = validate_task_target(&new_target) {
             tracing::warn!("更新定时任务被拒绝（id={id}）: {e}");
             return Err(e);
         }
     }
-    let new_args = args.unwrap_or(&existing.2).to_string();
+    let new_args = args.unwrap_or(&existing.2).trim().to_string();
     let new_type = schedule_type.unwrap_or(&existing.3).to_string();
     // 入库一律写 trim 过的串（与 `add_task` 同一半）：`validate_schedule` 判的是 trim
     // 之后的值，写原样字符串就会留下 `"2026-12-01 10:00 "` 这种"校验通过、执行期永远
@@ -2108,6 +2152,124 @@ mod tests {
         );
         let later = Local.with_ymd_and_hms(2026, 12, 1, 10, 30, 0).unwrap();
         assert!(should_run(t, &later), "规范化之后这一条才真的到点会跑");
+    }
+
+    /// 目标路径与参数也必须是"校验过的那个串"—— 后果比时刻那一半严重得多。
+    ///
+    /// `" C:\\Windows\\notepad.exe"` 过得了入口（`validate_task_target` 先 trim），入库
+    /// 却是带空格的原始串，而 `execute_task` 拿库里那条再过一次绝对路径校验：带前导
+    /// 空格的路径 `is_absolute()` 为假 ⇒ 判成**永久**拒绝（不是"此刻读不到"那一类，
+    /// 见 `TargetCurrentlyUnavailable` 的分工），这条任务显示"已排好"却永远不会再试。
+    #[test]
+    fn stored_target_path_keeps_the_task_launchable() {
+        let _g = isolate_app_dir("sched_trim_target");
+        let notepad = r"C:\Windows\notepad.exe";
+        // 参数也有自己的口径（非开关的参数必须是带反斜杠的绝对路径），夹具照这个形状给
+        const ARG: &str = r"C:\Users\Public\report.txt";
+        // 夹具前提由 `add_task(...).unwrap()` 自己守住：notepad 要是不在白名单里，
+        // 那句 unwrap 就红了，不需要再拿"文件在不在"当借口静默跳过整个用例。
+        add_task(
+            "粘来的路径",
+            &format!(" {notepad} "),
+            &format!(" {ARG} "),
+            "daily",
+            " 09:00 ",
+            true,
+        )
+        .expect("带首尾空格的目标应当过入口校验（校验判的是 trim 之后的值）");
+        let t = &get_all_tasks()[0];
+        assert_eq!(t.target_path, notepad, "入库的必须是校验过的那个串");
+        assert_eq!(t.args, ARG, "参数是同一把尺子的另一半");
+        assert_eq!(t.schedule_time, "09:00");
+        // 真正的判据不是字符串好看，而是执行期那一次校验过得去
+        approved_launch_target(&t.target_path, &t.args).expect("规范化之后这条任务必须真的启得动");
+    }
+
+    /// 历史脏行由 `init_db` 一次治好，而且按写侧那同一把尺子（tab 也是首尾空白）。
+    ///
+    /// 这条钉的是"用 SQL 的 `TRIM()` 就够了"那个念头：SQL 那个只去空格，写侧 `.trim()`
+    /// 去的是所有首尾空白 —— 拿 SQL 版就会留下"带 tab 的历史行永远治不好"的半个口径，
+    /// 而那种行照样在执行期被永久拒绝。
+    #[test]
+    fn init_db_heals_legacy_whitespace_in_all_three_columns() {
+        let _g = isolate_app_dir("sched_trim_legacy3");
+        let notepad = r"C:\Windows\notepad.exe";
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_tasks (id, name, target_path, args, schedule_type, \
+                 schedule_time, enabled, last_run, created_at) \
+                 VALUES (7301, 'legacy', ?1, ?2, 'daily', ?3, 1, '2026-10-01 09:00:00', \
+                 '2026-01-01 00:00:00')",
+                rusqlite::params![
+                    format!(" {notepad} "),
+                    "\tC:\\Users\\Public\\report.txt\t",
+                    "\t09:00 "
+                ],
+            )
+            .unwrap();
+        }
+        init_db().expect("init_db 必须幂等");
+        init_db().expect("重复调用也得幂等");
+        let t = get_all_tasks()
+            .into_iter()
+            .find(|x| x.id == 7301)
+            .expect("那条历史任务还在");
+        assert_eq!(t.target_path, notepad, "目标路径的两头空白必须被清掉");
+        assert_eq!(
+            t.args, r"C:\Users\Public\report.txt",
+            "tab 也算首尾空白，不许漏（SQL 的 TRIM() 就漏这一手）"
+        );
+        assert_eq!(t.schedule_time, "09:00");
+        assert_eq!(
+            t.last_run.as_deref(),
+            Some("2026-10-01 09:00:00"),
+            "规范化空白不算改了调度时刻，防同日重跑的锚要留着"
+        );
+        approved_launch_target(&t.target_path, &t.args).expect("治好之后这条启得动");
+    }
+
+    /// 只是把手上的脏空格规范化掉，不算"换了目标"，不许顺手重新校验。
+    ///
+    /// 目标程序被卸载或移走之后，插件页把整条记录原样传回来改个名字 —— 库里那条若是
+    /// 带空格的脏行，而比较拿**原始**串做，规范化就被判成"换了目标"，于是这次编辑撞上
+    /// 绝对路径/存在性校验被拒（用户什么都没改）。比较必须两边都 trim。
+    #[test]
+    fn a_whitespace_only_target_edit_does_not_revalidate() {
+        let _g = isolate_app_dir("sched_trim_edit");
+        let gone = r"C:\focusflow-test-dir\不存在的目标.exe";
+        let dirty = format!(" {gone}");
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_tasks (id, name, target_path, args, schedule_type, \
+                 schedule_time, enabled, last_run, created_at) \
+                 VALUES (7311, 'ghost', ?1, '', 'daily', '09:00', 1, NULL, \
+                 '2026-01-01 00:00:00')",
+                [&dirty],
+            )
+            .unwrap();
+        }
+        // 注意这里**不**先跑 init_db：要测的就是库里那条还脏着的时候，用户原样传回来
+        update_task(
+            7311,
+            Some("改个名字"),
+            Some(&dirty),
+            None,
+            None,
+            Some("09:00"),
+            None,
+        )
+        .expect("目标没真的换，不该拿库外的变化把这次编辑拒掉");
+        let t = get_all_tasks()
+            .into_iter()
+            .find(|x| x.id == 7311)
+            .expect("那条任务还在");
+        assert_eq!(t.name, "改个名字");
+        assert_eq!(
+            t.target_path, gone,
+            "顺手把空格规范化掉是对的，但它不构成重新校验的理由"
+        );
     }
 
     /// 库里躺着带空格的旧行时：编辑只规范化空格，不算"改了调度时刻"。
