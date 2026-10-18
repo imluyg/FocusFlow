@@ -309,6 +309,25 @@ pub fn start_device_stats(writer: Arc<DbWriter>, paused: PauseFlag) -> crate::st
     }
 }
 
+/// 解析不出实例路径的设备句柄，隔多久再试一次。
+const REG_RETRY_GAP_SECS: u64 = 60;
+
+/// 这一句判决只吃"距离上次失败多少秒"，所以能被用例钉住（拿 `Instant` 进来就不确定）。
+///
+/// 为什么要有节流：`Sink::on_input` 跑在 Raw Input 的消息循环线程上，而
+/// `register_device` 一次要两趟 `GetRawInputDeviceInfoW` 加一趟开注册表键。
+/// 以前解析失败时**什么都不记**，于是那个句柄的每一个键鼠事件都重跑一遍这套查询 ——
+/// 与本模块头"只在每个设备的首个事件执行一次"的承诺正好相反；而且这台设备就此
+/// 不出现在排行里、日志里一个字都没有。现在按句柄记账：首次出声并记时间，
+/// `REG_RETRY_GAP_SECS` 之内不再重试（注册表/即插即用可能只是忙一下，到点再给一次机会）。
+#[cfg_attr(not(windows), allow(dead_code))] // 非 Windows 下调用方（mod win）不存在
+fn reg_retry_allowed(seconds_since_last_failure: Option<u64>) -> bool {
+    match seconds_since_last_failure {
+        None => true,
+        Some(s) => s >= REG_RETRY_GAP_SECS,
+    }
+}
+
 /// 记一次设备输入（次数 + 键名明细），返回是否真的记了。
 ///
 /// 暂停闸就在这里、且只在这里判一次：读的是与 rdev 主链路 `record_event` **同一份**
@@ -374,6 +393,9 @@ mod win {
         /// 键盘事件整段记到那只鼠标名下。按 (数值, 类型) 缓存零成本挡掉这类跨类型串号；
         /// 同类型复用仍挡不住（识别它要先解析路径，而那正是这层缓存省掉的开销）。
         devices: HashMap<(isize, &'static str), (String, String)>,
+        /// 路径解析不出来的句柄 -> 上次尝试的时刻。只为节流存在（见 `reg_retry_allowed`）：
+        /// 不记就变成"每个事件重跑一遍注册表查询"，记成永久失败又不给恢复的机会。
+        failed_probe: HashMap<(isize, &'static str), std::time::Instant>,
     }
 
     thread_local! {
@@ -464,6 +486,7 @@ mod win {
                     writer,
                     paused,
                     devices: HashMap::new(),
+                    failed_probe: HashMap::new(),
                 })
             });
             tracing::info!("设备统计已启动（Raw Input，鼠标+键盘）");
@@ -564,7 +587,29 @@ mod win {
                         self.devices.insert(cache_key, e.clone());
                         e
                     }
-                    None => return, // 无法解析路径：宁可不计也不张冠李戴
+                    None => {
+                        // 无法解析路径：宁可不计也不张冠李戴。但不能每来一个事件就把
+                        // 两趟 Win32 查询加一次开注册表键再跑一遍 —— 这里跑在
+                        // Raw Input 的消息循环线程上，而模块头承诺的是"首个事件查一次"。
+                        // 现在按句柄节流，并且**出声一次**：这台设备不会出现在排行里，
+                        // 一声不响就没人知道它为什么不见。
+                        let now = std::time::Instant::now();
+                        let since = self
+                            .failed_probe
+                            .get(&cache_key)
+                            .map(|t| t.elapsed().as_secs());
+                        if super::reg_retry_allowed(since) {
+                            self.failed_probe.insert(cache_key, now);
+                            tracing::warn!(
+                                "设备统计：设备句柄 {:#x}（{}）的实例路径解析不出来，本次不计；\
+                                 每 {} 秒再试一次（拔插进行中或注册表正被占用时就是这个形态）",
+                                cache_key.0,
+                                cache_key.1,
+                                super::REG_RETRY_GAP_SECS
+                            );
+                        }
+                        return;
+                    }
                 },
             };
             let ts = match crate::listener::now_ts_secs() {
@@ -746,6 +791,49 @@ mod tests {
             body.match_indices("ThreadReport::Ready").count(),
             1,
             "Ready 只许在 Raw Input 注册成功之后发一次"
+        );
+    }
+
+    /// 解析不出实例路径的设备句柄：首个事件要试、六十秒内不许每个事件都试、到点再给一次机会。
+    ///
+    /// 旧写法是 `None => return`，什么都不记 ⇒ 那个句柄的每个键鼠事件都在 Raw Input 的
+    /// 消息循环线程上重跑两趟 `GetRawInputDeviceInfoW` + 一次开注册表键，与本模块头
+    /// "只在每个设备的首个事件执行一次"的承诺正好相反；而那台设备永远不会出现在排行里，
+    /// 日志里一个字都没有。
+    #[test]
+    fn an_unresolvable_device_is_retried_on_a_budget_not_every_event() {
+        assert!(
+            reg_retry_allowed(None),
+            "首个事件必须试一次，否则新设备永远进不了排行"
+        );
+        assert!(
+            !reg_retry_allowed(Some(0)),
+            "同一秒内的后续事件不能再跑一遍注册表查询"
+        );
+        assert!(!reg_retry_allowed(Some(59)));
+        assert!(
+            reg_retry_allowed(Some(60)),
+            "到点要再给一次机会：注册表/即插即用可能只是忙一下"
+        );
+    }
+
+    /// 接线守卫：那条早退必须真的走节流并出声（纯函数绿不代表调用方读了它）。
+    #[test]
+    fn the_unresolvable_branch_actually_uses_the_budget() {
+        let src = include_str!("device_stats.rs");
+        let start = src.find("fn on_input(").expect("Sink::on_input 不见了");
+        let end = src[start..]
+            .find("fn register_device(")
+            .map(|n| n + start)
+            .expect("register_device 不见了");
+        let body = &src[start..end];
+        assert!(
+            body.contains("reg_retry_allowed(since)"),
+            "解析失败那支又回到每个事件重跑一遍注册表查询"
+        );
+        assert!(
+            body.contains("tracing::warn!"),
+            "这台设备不会出现在排行里，至少要说一句它为什么不见"
         );
     }
 
