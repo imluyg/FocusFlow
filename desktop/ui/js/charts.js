@@ -379,29 +379,44 @@ function khChip(c, colors, maxCount, total, tip, container) {
   return g;
 }
 
-export function renderKeyHeat(container, rank) {
+export function renderKeyHeat(container, rank, givenTotal) {
   const tip = prepareContainer(container);
 
   const render = () => {
     container._chartRerender = render;
     const counts = khCounts(rank);
-    let total = 0, maxCount = 0;
+    let listSum = 0, maxCount = 0;
     for (const v of counts.values()) {
-      total += v;
+      listSum += v;
       if (v > maxCount) maxCount = v;
     }
+    // 占比的分母与「键鼠排行」同一把尺子：后端给的**未截断**周期总量。
+    // 以前是拿传进来的这份列表自己求和，而 `rank` 在 Rust 侧被截到前 100 名
+    // （`state.rs` 的 `RANK_LIMIT`）⇒ 键超过 100 个时每一格都按"前 100 名之和"算比例：
+    // 同一个键在排行页 3.2%、在热力页 4.1%，两个数都不等于"占全部"，而界面上
+    // 没有任何一处说明分母换了。`renderApps` 早就按这条口径走（分母用 `app_total`、
+    // 另给一行 TopN 覆盖度），这里是漏掉的那一半。
+    const total = Number(givenTotal) > 0 ? Number(givenTotal) : listSum;
+    const coverText =
+      total > 0 && listSum < total
+        ? `榜上 ${counts.size} 项覆盖全部输入的 ${((listSum / total) * 100).toFixed(1)}%`
+        : "";
     const W = Math.max(320, Math.floor(container.clientWidth));
     const AH = Math.max(0, Math.floor(container.clientHeight));
     const leftover = Array.from(counts).filter(([name]) => !KH_PLACED.has(name));
     const strip = khChipLayout(leftover.slice(0, 20), W);
-    const hintH = total > 0 ? 0 : 26;
+    const hintH = total > 0 ? (coverText ? 16 : 0) : 26;
     // 键宽同时受容器宽高约束：容器高度是写死的内联样式，板子超出去就会压到下方内容
     const byWidth = (W - 10) / KH_W;
     const byHeight = AH > 80 ? (AH - strip.h - hintH - 8) / KH_H : Infinity;
     const u = khClamp(Math.min(byWidth, byHeight), 11, 40);
     const boardH = KH_H * u;
     const H = Math.ceil(boardH + strip.h + hintH + 4);
-    const sig = Array.isArray(rank) ? rank.map((it) => it[0] + "\u0002" + it[1]).join("\u0001") : "";
+    // 指纹里必须带上分母：换了周期总量（例如从"近 7 天"切到"总计"）而榜单前 100 名
+    // 恰好一项没变时，只比 rank 会判定"不用重画"，于是格子里还是上一个分母算出来的比例
+    const sig =
+      (Array.isArray(rank) ? rank.map((it) => it[0] + "\u0002" + it[1]).join("\u0001") : "") +
+      "\u0003" + String(total);
     const key = chartKey(W, H, "keyheat", sig);
     if (container._chartKey === key && container.querySelector("svg")) return;
     container._chartKey = key;
@@ -429,6 +444,10 @@ export function renderKeyHeat(container, rank) {
     }
     if (total === 0) {
       svg.appendChild(el("text", { x: W / 2, y: boardH + 20, "text-anchor": "middle", "font-size": 13, fill: colors.muted }, "当前周期没有键盘数据"));
+    }
+    // 分母换过就要说明换了：这一行与「应用榜/设备榜」的 TopN 覆盖度同一族
+    if (coverText) {
+      svg.appendChild(el("text", { x: 2, y: H - 4, "font-size": 11, fill: colors.muted }, coverText));
     }
 
     container.appendChild(svg);

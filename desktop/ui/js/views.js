@@ -715,7 +715,9 @@ export function renderAnalytics(s) {
   refreshGoalStrip();
   if (analyticsTab.value === "trend") return renderTrendChart(s);
   if (analyticsTab.value === "hourly") return renderHourlyChart(s);
-  if (analyticsTab.value === "heat") return renderKeyHeat($("key-heat"), s.rank || []);
+  // 分母把后端的周期总量一起交出去：`s.rank` 是被截过的 Top100，让它自己求和当分母
+  // 就成了"占前 100 名"而不是"占全部"（见 charts.js 里那段说明）
+  if (analyticsTab.value === "heat") return renderKeyHeat($("key-heat"), s.rank || [], s.total);
   renderWeekdayChart(s);
 }
 
