@@ -352,8 +352,14 @@ export async function openDeviceDetail(key) {
   const overlay = $("device-modal");
   const body = $("device-modal-body");
   if (!overlay || !body) return;
-  // 改名编辑态下不弹详情（输入框点击会冒泡到行；这里再兜一层）
-  if (deviceEditing) return;
+  // 改名编辑态下不弹详情（输入框点击会冒泡到行；这里再兜一层）。
+  // 但被拒不等于可以一声不响：原先这里直接 return，用户点别的设备看到的是"整个列表
+  // 按不动"，唯一的线索是那一行里还挂着的输入框。与本仓"被拒也要有话"同一条口径
+  // （记账弹窗、定时任务、设备改名写回都是这么收口的）。
+  if (deviceEditing) {
+    toast("这台设备正在改名：先按「保存」或「取消」，再点别的设备");
+    return;
+  }
   deviceDetailKey = key;
   // 默认跟随主界面当前周期，之后可在弹窗内单独切换
   deviceDetailPeriod = appState.chartsData ? Number(appState.chartsData.period) : 0;
