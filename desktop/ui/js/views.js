@@ -1324,14 +1324,30 @@ export async function doVacuum() {
 }
 
 export async function doImport() {
+  let msg;
   try {
-    const msg = await invoke("import_legacy");
-    $("set-msg").textContent = msg || "导入完成";
-    $("set-msg").style.color = "var(--success)";
+    msg = await invoke("import_legacy");
+  } catch (e) {
+    $("set-msg").textContent = "导入失败: " + e;
+    $("set-msg").style.color = "var(--danger)";
+    return;
+  }
+  // 到这一步导入已经落库了。刷新界面是**另一件事**：以前这两句写在同一个 try 里，
+  // 于是 `get_live` / `get_charts` 一旦 reject，绿色的"导入完成"会被红字
+  // 「导入失败: …」顶掉 —— 数据明明进库了，界面却说没成，而用户接着就会再导一次，
+  // 这正是重复计数的入口（同族先例：`import_outcome` 让"有失败项"不再是绿色成功；
+  // 反方向同样不能说谎）。
+  $("set-msg").textContent = msg || "导入完成";
+  $("set-msg").style.color = "var(--success)";
+  try {
     applyLive(await invoke("get_live"));
     applyCharts(await invoke("get_charts"));
   } catch (e) {
-    $("set-msg").textContent = "导入失败: " + e;
+    $("set-msg").textContent =
+      (msg || "导入完成") +
+      "；界面刷新没读到最新数据：" +
+      e +
+      "（数据已经进库，不必重做导入）";
     $("set-msg").style.color = "var(--danger)";
   }
 }
