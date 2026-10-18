@@ -218,7 +218,11 @@ fn register_all(app: &AppHandle) {
                 tracing::info!("全局热键已注册: {spec}（{}）", b.what);
             }
             Err(e) => {
-                let msg = format!("{spec} 注册失败，可能被其它程序占用：{e}");
+                // 别把猜测当结论：这一支同时容纳两种原因（被别人占用 / 这个组合键本身
+                // 不合法，例如 `ctrl+` 这种缺主键的写法），真原因在 `{e}` 里。
+                // 只写"可能被其它程序占用"会让用户去关没在占用的程序，换几个键还是失败。
+                let msg =
+                    format!("{spec} 注册失败：{e}（可能被其它程序占用，也可能这个组合键不合法）");
                 tracing::warn!("全局热键注册失败 ({} {spec}): {e}", b.what);
                 set_last_error(b.key, Some(msg));
             }

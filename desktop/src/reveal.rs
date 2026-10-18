@@ -55,12 +55,13 @@ pub fn latest_png(dir: &Path) -> Option<PathBuf> {
 ///   （`/select,"E:\a b\c.png"` 走 CreateProcess 时那对引号会留在参数里）。
 ///   交给 `Command` 正常传参即可：std 在遇到空格时正是把**整个 token** 引起来。
 pub fn explorer_args(dir: &Path, target: Option<&Path>) -> Vec<String> {
+    // 两条分支都要过这把尺子。目录那一支不是次要路径：截图目录为空时走的就是它，
+    // 而 `data_home` 是允许手写的（README 里就写着可以把 `[paths] data_home` 改成
+    // `E:/…`）—— 只修文件那一支的话，"空目录 + 正斜杠配置"仍然是打开「文档」。
+    let shown = |p: &Path| p.display().to_string().replace('/', "\\");
     match target {
-        Some(file) => {
-            let p = file.display().to_string().replace('/', "\\");
-            vec![format!("/select,{p}")]
-        }
-        None => vec![dir.display().to_string()],
+        Some(file) => vec![format!("/select,{}", shown(file))],
+        None => vec![shown(dir)],
     }
 }
 
@@ -182,6 +183,20 @@ mod tests {
         assert_eq!(
             explorer_args(dir, None),
             vec![r"E:\data\screenshots".to_string()]
+        );
+        // 目录那一支也要换斜杠：截图目录为空时走的就是这一支，而 `data_home` 允许手写
+        // 成正斜杠形式（README 里就这么写着）。只修文件那一支的话，这种配置下 Explorer
+        // 仍然静默退化成打开「文档」，日志却写着"已打开 E:/…"。
+        let slashed = Path::new("E:/data/screenshots");
+        assert_eq!(
+            explorer_args(slashed, None),
+            vec![r"E:\data\screenshots".to_string()],
+            "正斜杠的目录也要换成反斜杠"
+        );
+        // 混合形式也不能漏（`E:/a\b` 这种真会出现：一半来自配置、一半来自 join）
+        assert_eq!(
+            explorer_args(Path::new("E:/data\\shots"), None),
+            vec![r"E:\data\shots".to_string()]
         );
     }
 }
