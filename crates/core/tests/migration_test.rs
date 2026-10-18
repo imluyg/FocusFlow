@@ -471,4 +471,140 @@ mod tests {
             "聚合计数不做累加（无法幂等去重），原有按键数必须保持原样"
         );
     }
+
+    /// 目标年度库的导入标记**读不出来**时，那一年必须报错跳过，不能当成"没导过"再累加一遍。
+    ///
+    /// 两道去重闸（源文件大小+mtime、key_log 内容指纹）认的都是"标记里写着的值"，
+    /// 而旧写法是 `read_import_marker(..).unwrap_or(None)` —— 一次占用、或库被同步盘
+    /// 换成占位文件，就被折成"没有标记"，于是同一份旧明细被再聚一遍、那一年整体翻倍，
+    /// 界面上只会显示「导入完成」。整库复制那一支早就改成"读不动就真报错"了
+    /// （见 `record_import_marker` 的注释），这是剩下的读侧一半。
+    ///
+    /// 夹具：目标位置放一个**同名目录** ⇒ 那个"库"打不开，标记自然读不出来。
+    #[test]
+    fn an_unreadable_import_marker_aborts_that_year() {
+        let _g = guard();
+        let _old = paths::test_app_dir("mkold");
+        let old_dir = _old.path().to_path_buf();
+        let _new = paths::test_app_dir("mknew");
+        db::queries::invalidate_years_cache();
+
+        let old_db = old_dir.join("focusflow_2025.db");
+        {
+            let conn = rusqlite::Connection::open(&old_db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE key_log (id INTEGER PRIMARY KEY AUTOINCREMENT, key_name TEXT NOT NULL, timestamp INTEGER NOT NULL);
+                 CREATE INDEX idx_timestamp ON key_log(timestamp);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO key_log (key_name, timestamp) VALUES ('A', 100), ('B', 200)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // 目标库位置换成同名目录：合并分支里第一次碰它就是读标记
+        std::fs::create_dir_all(paths::year_db_path(2025)).unwrap();
+
+        let summary = migration::import_legacy_data(&old_dir);
+        assert!(
+            !summary.year_dbs.contains(&2025),
+            "读不出标记的一年不能被记成已导入: {:?}",
+            summary.year_dbs
+        );
+        assert!(
+            summary
+                .errors
+                .iter()
+                .any(|e| e.contains("2025") && e.contains("标记读不出来")),
+            "必须把原因说出去，而不是安静地什么都不做: {:?}",
+            summary.errors
+        );
+    }
+
+    /// 附属库的 `-wal` 也要一起搬：那里面是还没 checkpoint 进主库的记录。
+    ///
+    /// 年度库那一支早就为此改成"搬不动就回滚报错"，附属库这一支以前只
+    /// `std::fs::copy(&src, &dst)` 那一个文件 —— 旧目录里那段尾巴永久留在原地，
+    /// 而界面报的是「导入完成」（记账/日程/浏览历史都算）。
+    #[test]
+    fn aux_import_carries_the_wal_tail() {
+        let _g = guard();
+        let _old = paths::test_app_dir("auxwal_old");
+        let old_dir = _old.path().to_path_buf();
+        let _new = paths::test_app_dir("auxwal_new");
+        db::queries::invalidate_years_cache();
+
+        let src_aux = old_dir.join("focusflow_accounting.db");
+        std::fs::write(&src_aux, b"main-db-bytes").unwrap();
+        std::fs::write(
+            format!("{}-wal", src_aux.display()),
+            b"the-uncheckpointed-tail",
+        )
+        .unwrap();
+
+        let summary = migration::import_legacy_data(&old_dir);
+        assert!(
+            summary
+                .copied_aux
+                .iter()
+                .any(|s| s.contains("focusflow_accounting.db")),
+            "附属库应报已复制: {:?}",
+            summary.copied_aux
+        );
+        let dst_wal = paths::data_dir().join("focusflow_accounting.db-wal");
+        assert_eq!(
+            std::fs::read(&dst_wal).ok(),
+            Some(b"the-uncheckpointed-tail".to_vec()),
+            "WAL 尾巴必须跟到目标目录，否则那一段永远留在旧目录"
+        );
+    }
+
+    /// `-wal` 搬不过去时：不许报"已导入"，而且要把留档那份回滚回正名。
+    ///
+    /// 回滚这件事不是讲究：`backup_before_overwrite` 已经把旧库连 sidecar 一起 rename 走了，
+    /// 不回滚的话目录里躺着的是一份"主库是新的、WAL 缺失"的残缺库，
+    /// 下一次导入会把它当成"目标库已存在"去合并 —— 读的就是这份残缺。
+    /// 回滚成功后也不许再报"给你留了一份备份"：那份文件已经回到正名上了。
+    #[test]
+    fn aux_import_rolls_back_when_the_wal_cannot_be_copied() {
+        let _g = guard();
+        let _old = paths::test_app_dir("auxrb_old");
+        let old_dir = _old.path().to_path_buf();
+        let _new = paths::test_app_dir("auxrb_new");
+        db::queries::invalidate_years_cache();
+
+        // 让那趟 sidecar 复制必然失败：源目录里的 `-wal` 是个同名**目录**
+        // （同步盘或清理脚本留下的畸形物就是这个形态），`std::fs::copy` 会直接拒绝。
+        let src_aux = old_dir.join("focusflow_accounting.db");
+        std::fs::write(&src_aux, b"new-from-old-dir").unwrap();
+        std::fs::create_dir_all(format!("{}-wal", src_aux.display())).unwrap();
+
+        // 目标位置先放一份现有库：它会被留档，然后必须被回滚回正名
+        let dst_aux = paths::data_dir().join("focusflow_accounting.db");
+        std::fs::write(&dst_aux, b"existing-current-db").unwrap();
+
+        let summary = migration::import_legacy_data(&old_dir);
+        assert!(
+            summary.copied_aux.is_empty(),
+            "sidecar 搬不过去就不能报已导入: {:?}",
+            summary.copied_aux
+        );
+        assert!(
+            summary.errors.iter().any(|e| e.contains("WAL")),
+            "要说出是哪一步没成: {:?}",
+            summary.errors
+        );
+        assert_eq!(
+            std::fs::read(&dst_aux).ok(),
+            Some(b"existing-current-db".to_vec()),
+            "目标库必须还是导入前那一份（已回滚）"
+        );
+        assert!(
+            summary.backed_up_aux.is_empty(),
+            "留档已经搬回正名，报告里不该再留一条指向不存在文件的备份: {:?}",
+            summary.backed_up_aux
+        );
+    }
 }

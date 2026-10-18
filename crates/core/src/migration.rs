@@ -85,9 +85,13 @@ pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
         }
         // 现有库先留档再覆盖：导入目录是用户手选的，选错目录（或新版本里
         // 已记了几个月账）时当前数据不能就这么没了。
-        match backup_before_overwrite(&dst) {
-            Ok(Some(kept)) => summary.backed_up_aux.push(kept.display().to_string()),
-            Ok(None) => {}
+        let kept = match backup_before_overwrite(&dst) {
+            Ok(k) => {
+                if let Some(p) = &k {
+                    summary.backed_up_aux.push(p.display().to_string());
+                }
+                k
+            }
             Err(e) => {
                 // 留档失败就不覆盖：宁可这次不导入，也不能拿用户数据冒险
                 summary
@@ -95,11 +99,44 @@ pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
                     .push(format!("{aux} 覆盖前留档失败，已跳过: {e}"));
                 continue;
             }
-        }
+        };
         match std::fs::copy(&src, &dst) {
-            Ok(_) => summary.copied_aux.push(aux.to_string()),
-            Err(e) => summary.errors.push(format!("{aux} 复制失败: {e}")),
+            Ok(_) => {}
+            Err(e) => {
+                summary.errors.push(format!("{aux} 复制失败: {e}"));
+                restore_after_failed_copy(&mut summary, &dst, &kept);
+                continue;
+            }
         }
+        // `-wal` 里是**还没 checkpoint 进主库的记录**（§十四 在真库上量到 `-wal` 比
+        // 主库还大）。年度库那一支早就为此改成"搬不动就回滚、报错、不报已导入"，
+        // 附属库这一支以前只 `std::fs::copy(&src, &dst)` 那一个文件 ⇒ 旧目录里那段
+        // 尾巴永久留在原地，而界面报的是「导入完成」（记账/日程/浏览历史都算）。
+        let mut sidecar_fail: Option<String> = None;
+        for suffix in ["-wal", "-shm"] {
+            let from = crate::data_location::with_suffix(&src, suffix);
+            if !from.exists() {
+                continue;
+            }
+            let to = crate::data_location::with_suffix(&dst, suffix);
+            if let Err(e) = std::fs::copy(&from, &to) {
+                if suffix == "-shm" {
+                    // 共享内存索引，SQLite 会照着 WAL 自己重建：拿不到就算了
+                    tracing::debug!("跳过 {aux} 的 -shm 副本: {e}");
+                    continue;
+                }
+                sidecar_fail = Some(format!("{} → {}: {e}", from.display(), to.display()));
+                break;
+            }
+        }
+        if let Some(detail) = sidecar_fail {
+            summary.errors.push(format!(
+                "{aux} 复制 WAL 失败（{detail}）—— 那里面可能还有未落盘记录"
+            ));
+            restore_after_failed_copy(&mut summary, &dst, &kept);
+            continue;
+        }
+        summary.copied_aux.push(aux.to_string());
     }
 
     summary
@@ -236,9 +273,25 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
         return Ok(count);
     }
 
-    // 目标库已存在：源文件未变化（大小+修改时间一致）→ 已导入过，跳过
+    // 目标库已存在：先把导入标记读一次，而且**只读一次**（下面两处都用这份）。
+    //
+    // 读不动 ≠ 没有标记。两道去重闸（源文件大小+mtime、key_log 内容指纹）认的都是
+    // "标记里写着的值"，把 Err 折成 `None` 等于当场把两道闸卸掉 —— 而 `migrate_v2`
+    // 是累加式且没有去重键 ⇒ 同一份旧明细被再聚一遍，那一年整体翻倍，界面上一个字
+    // 都没有。上面整库复制那一支的注释（"标记写在聚合之前"）修的是同一个形状的写侧，
+    // `record_import_marker` 的注释修的是它自己的读侧，这是剩下的这一半。
+    let marker = match read_import_marker(&dst_path) {
+        Ok(m) => m,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "{year} 年目标库的导入标记读不出来（{e}）：既不能证明「源文件没变过」，\
+                 也不能证明「明细已经导过」，而累加式导入会把这一年翻倍 —— 本年度跳过。\
+                 先让那个库能正常打开（被同步盘换成占位文件、被另一个进程独占都是这个形态）"
+            ));
+        }
+    };
+    // 源文件未变化（大小+修改时间一致）→ 已导入过，跳过
     if let Ok(meta) = std::fs::metadata(&src_path) {
-        let marker = read_import_marker(&dst_path).unwrap_or(None);
         let same_size = marker.as_ref().map(|m| m.size) == Some(meta.len());
         let same_mtime = match (marker.as_ref().and_then(|m| m.mtime), meta.modified().ok()) {
             (Some(a), Some(b)) => {
@@ -290,10 +343,8 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
     // 暂存表在上轮聚合后已清空，对它没有任何记忆：照旧往下走，整套旧明细会
     // 被**再聚合一遍**，而 migrate_v2 是累加式（`count = count + excluded`），
     // 那一年就整体翻倍，界面上没有任何提示。
-    if let Some((c0, t0)) = read_import_marker(&dst_path)
-        .unwrap_or(None)
-        .and_then(|m| m.key_log)
-    {
+    // 用开头读过的那一份标记（不再第三次开库：读不动的结局上面已经处理过了）
+    if let Some((c0, t0)) = marker.as_ref().and_then(|m| m.key_log) {
         if (c0, t0) == kl_now {
             tracing::info!("{year} 年源库明细内容未变（仅文件时间戳变了），跳过重复导入");
             return Ok(0);
@@ -477,6 +528,47 @@ fn record_import_marker(
         )?;
     }
     Ok(())
+}
+
+/// 覆盖式复制失败之后的回滚：删掉刚复制过来的那半套，把留档那份原样搬回正名。
+///
+/// 为什么必须回滚：`backup_before_overwrite` 已经把旧库连 sidecar 一起 rename 走了，
+/// 失败那一刻目录里躺着的是"新库缺一段 WAL"这种中间态，而**下一次导入会把它当成
+/// "目标库已存在"走合并分支**，读的就是这份残缺的新库。回滚之后状态与导入前一致，
+/// 那句"请重试"才真的成立。回滚成功时把 `backed_up_aux` 里那条撤掉 —— 那份文件已经
+/// 回到正名上，再报"给你留了一份备份"就是让人去删一个不存在的文件。
+fn restore_after_failed_copy(
+    summary: &mut ImportSummary,
+    dst: &Path,
+    kept: &Option<std::path::PathBuf>,
+) {
+    let _ = std::fs::remove_file(dst);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(crate::data_location::with_suffix(dst, suffix));
+    }
+    let Some(kept_path) = kept else { return };
+    for suffix in ["-wal", "-shm"] {
+        let from = crate::data_location::with_suffix(kept_path, suffix);
+        if from.exists() {
+            let _ = std::fs::rename(&from, crate::data_location::with_suffix(dst, suffix));
+        }
+    }
+    match std::fs::rename(kept_path, dst) {
+        Ok(()) => {
+            let kept_text = kept_path.display().to_string();
+            if let Some(i) = summary.backed_up_aux.iter().position(|p| *p == kept_text) {
+                summary.backed_up_aux.remove(i);
+            }
+            summary.errors.push(format!(
+                "已回滚到导入前的那份 {}，本次未导入",
+                dst.display()
+            ));
+        }
+        Err(e) => summary.errors.push(format!(
+            "回滚失败（{e}）：导入前那份完整留在 {}，请手工改回原名",
+            kept_path.display()
+        )),
+    }
 }
 
 /// 导入标记：源文件指纹 + 上次导入时源库 key_log 的内容指纹。
