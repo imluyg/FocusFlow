@@ -42,12 +42,15 @@ const USAGE: &str = "\
   --devices <天数|today|all> 设备维度统计（各键鼠输入次数与占比）
   --backup                   立即备份全部数据库到 backup/（含轮转与残留清理）
   --device-keys [周期]       列出设备标识（device_key）与当前展示名，便于手改别名
+                             周期同 --devices（天数 | today | all，省略 = 全量）
   --rename-device <匹配> <别名>
                              给设备取别名（匹配 device_key 或展示名子串；别名留空则还原）
   --list-years               列出有数据的年份
   --export <csv|html>        导出报表到当前目录
   --vacuum                   压缩数据库
   --cleanup <天数>           保留 N 天（含今天），删除更早的数据
+  --import-legacy <旧目录>   从旧版（Python 原版或旧数据目录）导入全部数据
+                             到当前数据目录（同名年度库会被改写，先 --backup）
   --reset                    清空所有统计记录（需输入 yes 确认）
   -h, --help                 显示本帮助
 ";
@@ -108,7 +111,10 @@ fn run(args: &[String]) -> i32 {
         }
         "--device-keys" => {
             let db = db::Database::init_readonly();
-            print_device_keys(&db)
+            // `[周期]` 写在帮助里就必须真的起作用：旧代码根本不读 args[1]，
+            // `--device-keys 7` 与 `--device-keys 乱写` 都安静地给出**全量**口径，
+            // 而这条命令的用途是"照着数字去手改别名"—— 数错的就是改错设备。
+            print_device_keys(&db, args.get(1).map(String::as_str).unwrap_or("all"))
         }
         "--rename-device" => {
             if args.len() < 3 {
@@ -162,23 +168,21 @@ fn run(args: &[String]) -> i32 {
                     count,
                     failed,
                 } => {
-                    println!("备份完成: {}（共 {count} 份）", first.display());
+                    // 结论只有一句，而且先判失败再选措辞（与 `--cleanup` 的
+                    // `cleanup_outcome` 同一条口径）：旧写法无条件先往 stdout 打
+                    // 「备份完成」，随后才在 stderr 补一句「不完整」—— 计划任务收的是
+                    // stdout，那份日志说的正好是反的。
                     println!(
                         "  目录: {}（已停用插件的数据会跳过）",
                         focusflow_core::paths::backup_dir().display()
                     );
-                    if failed.is_empty() {
-                        0
+                    let (line, code) = backup_outcome(&first, count, &failed);
+                    if code == 0 {
+                        println!("{line}");
                     } else {
-                        // 部分成功必须退非 0：这条是给计划任务用的，而"5 个库里只备份出
-                        // 1 个"在退出码上一直读成成功 —— `Done` 原先不带 `failed`，
-                        // 调用方根本没有信息可以区分。
-                        eprintln!(
-                            "备份不完整: 这些库没能产出通过校验的备份: {failed:?}\
-                             （已经备份到的 {count} 份仍然有效）"
-                        );
-                        1
+                        eprintln!("{line}");
                     }
+                    code
                 }
                 // 没东西可备份不是失败：挂计划任务时退 1 会让用户以为天天在坏，
                 // 而真失败的那一次也混在同一句话里看不出来
@@ -388,29 +392,38 @@ fn print_stats(_db: &db::Database, period: &str) -> i32 {
     0
 }
 
+/// 一个周期参数落到查询层的那两个数（days / date）与要印在标题上的那句说法。
+///
+/// 为什么抽出来共用：`--devices` 与 `--device-keys` 是同一个口径的两扇门，而
+/// `--device-keys` 那一扇以前自己写死了"全量"（帮助里明明写着 `[周期]`）——
+/// 抄第二份尺子漏掉的就是这一条。抽成一处之后，两条命令对同一个参数给同一个数字。
+fn period_window(
+    period: &str,
+    today: chrono::NaiveDate,
+) -> Result<(Option<i64>, Option<chrono::NaiveDate>, String), String> {
+    Ok(match parse_period(period)? {
+        Period::Today => (None, Some(today), "今日".to_string()),
+        Period::All => (None, None, "总计".to_string()),
+        Period::Days(days) => (Some(days), None, format!("最近 {days} 天")),
+    })
+}
+
 /// 设备维度统计：各键鼠设备的输入次数与占比（独立口径，见 device_stats.rs）。
 fn print_devices(_db: &db::Database, period: &str) -> i32 {
     if let Err(e) = check_years_readable() {
         eprintln!("{e}");
         return 1;
     }
-    let (total, devices, label) = match parse_period(period) {
+    let (days, date, label) = match period_window(period, Local::now().date_naive()) {
         Err(e) => {
             eprintln!("{e}");
             return 1;
         }
-        Ok(Period::Today) => {
-            let (t, s) = db::get_device_stats_by_date(Local::now().date_naive());
-            (t, s, "今日".to_string())
-        }
-        Ok(Period::All) => {
-            let (t, s) = db::get_device_stats(None, None);
-            (t, s, "总计".to_string())
-        }
-        Ok(Period::Days(days)) => {
-            let (t, s) = db::get_device_stats(Some(days), None);
-            (t, s, format!("最近 {days} 天"))
-        }
+        Ok(w) => w,
+    };
+    let (total, devices) = match date {
+        Some(d) => db::get_device_stats_by_date(d),
+        None => db::get_device_stats(days, None),
     };
 
     println!("\n{}", "=".repeat(60));
@@ -447,18 +460,30 @@ fn print_devices(_db: &db::Database, period: &str) -> i32 {
 }
 
 /// 列出设备标识与展示名：便于手改 device_aliases.json 或配合 --rename-device。
-fn print_device_keys(_db: &db::Database) -> i32 {
+///
+/// 周期与 `--devices` 走同一把尺子（`period_window`），默认全量。
+fn print_device_keys(_db: &db::Database, period: &str) -> i32 {
     if let Err(e) = check_years_readable() {
         eprintln!("{e}");
         return 1;
     }
-    let (total, devices) = db::get_device_stats(None, None);
+    let (days, date, label) = match period_window(period, Local::now().date_naive()) {
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+        Ok(w) => w,
+    };
+    let (total, devices) = match date {
+        Some(d) => db::get_device_stats_by_date(d),
+        None => db::get_device_stats(days, None),
+    };
     if devices.is_empty() {
-        println!("暂无设备数据（设备统计从功能上线后开始积累）");
+        println!("暂无设备数据（{label}口径；设备统计从功能上线后开始积累）");
         return 0;
     }
     println!(
-        "\n共 {} 个设备，输入总次数 {}\n",
+        "\n共 {} 个设备（{label}），输入总次数 {}\n",
         devices.len(),
         fmt_thousands(total)
     );
@@ -816,7 +841,11 @@ fn reset(_db: &db::Database) -> i32 {
     use std::io::BufRead;
     let mut line = String::new();
     let stdin = std::io::stdin();
-    if stdin.lock().read_line(&mut line).is_err() {
+    if let Err(e) = stdin.lock().read_line(&mut line) {
+        // 读不到回答与"回答不是 yes"是两件事：前者要说清是没读到（管道坏了、
+        // stdin 被计划任务关掉），否则界面上只剩一个退出码 1，用户分不清自己到底
+        // 是没批准还是批准了却没执行。这里一条数据都没动，把这句说明白就够了。
+        eprintln!("读不到确认输入，已取消（没有改动任何数据）: {e}");
         return 1;
     }
     if line.trim().to_lowercase() != "yes" {
@@ -885,9 +914,33 @@ fn cleanup_outcome(days: i64, report: &db::maintenance::MaintenanceReport) -> (S
     }
 }
 
+/// `--backup` 的结论：**先**判有没有失败的库，再决定说哪句话。返回（要打的那句, 退出码）。
+///
+/// 与 `cleanup_outcome` 同一族、同一条口径（`c4aee24` 定下的）：`Done` 里的 `count` 是
+/// "成功份数"，5 个库里只成 1 个也算 `Done`。旧写法先把「备份完成」打到 stdout，
+/// 再往 stderr 补一句不完整 ⇒ 挂在计划任务上的那份日志读起来是成功。
+/// 现在不完整那一句同时带上已经拿到的份数与最新一份的路径，信息一条不少。
+fn backup_outcome(first: &std::path::Path, count: usize, failed: &[String]) -> (String, i32) {
+    if failed.is_empty() {
+        (format!("备份完成: {}（共 {count} 份）", first.display()), 0)
+    } else {
+        (
+            format!(
+                "备份不完整: 这些库没能产出通过校验的备份: {failed:?}\
+                 （已经备份到的 {count} 份仍然有效，最新一份 {}）",
+                first.display()
+            ),
+            1,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_outcome, export_csv, export_html, year_lookup, YearLookup};
+    use super::{
+        backup_outcome, cleanup_outcome, export_csv, export_html, period_window, year_lookup,
+        YearLookup,
+    };
     use super::{parse_keep_days, parse_period, parse_stats_year, Period};
     use super::{reset_plan, ResetPlan};
     use focusflow_core::db::maintenance::MaintenanceReport;
@@ -1188,6 +1241,208 @@ mod tests {
         match reset_plan(Err(bad.to_string())) {
             ResetPlan::Blocked(e) => assert_eq!(e, bad, "拒绝的原因要原样递给用户"),
             other => panic!("读不出清单必须 Blocked，不能退化成空白确认: {other:?}"),
+        }
+    }
+
+    /// 帮助文本与真正接的命令必须是同一份清单（两个方向都查）。
+    ///
+    /// 栽过的两种各一条：`--import-legacy` 会改写当前数据目录里的年度库，却从来没
+    /// 写进 `USAGE` —— 用户与计划任务的运维者不知道这个入口存在，出错也归不到它头上；
+    /// 反过来 `--device-keys [周期]` 写在帮助里，实现根本不读那个参数，于是
+    /// 「按 7 天的数去手改别名」拿到的是全量口径。注释与文档说了而代码没做，
+    /// 在本仓就是缺陷，不是待办。
+    #[test]
+    fn usage_lists_exactly_the_commands_the_cli_handles() {
+        let src = include_str!("main.rs");
+        let open = src
+            .find("const USAGE: &str = \"")
+            .expect("USAGE 常量不见了")
+            + "const USAGE: &str = \"".len();
+        let rel = src[open..].find("\";").expect("USAGE 的结尾找不到");
+        let usage = &src[open..open + rel];
+
+        let take = |text: &str| -> std::collections::BTreeSet<String> {
+            let b = text.as_bytes();
+            let mut set = std::collections::BTreeSet::new();
+            let mut i = 0;
+            while i + 1 < b.len() {
+                if b[i] == b'-' && b[i + 1] == b'-' {
+                    let mut k = i + 2;
+                    while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'-') {
+                        k += 1;
+                    }
+                    if k > i + 2 {
+                        set.insert(text[i..k].to_string());
+                    }
+                    i = k;
+                } else {
+                    i += 1;
+                }
+            }
+            set
+        };
+        let documented = take(usage);
+
+        let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
+        let mut handled = std::collections::BTreeSet::new();
+        let mut at = 0;
+        let pb = prod.as_bytes();
+        // 只认「紧跟在双引号之后的 --」，不去配对引号：源码里有 `\"` 转义，
+        // 按引号成对扫描会错位，然后量出一个不存在的命令。
+        while let Some(i) = prod[at..].find("\"--") {
+            let start = at + i + 1;
+            let mut k = start + 2;
+            while k < pb.len() && (pb[k].is_ascii_alphanumeric() || pb[k] == b'-') {
+                k += 1;
+            }
+            // 只有「串正好在这收尾、后面紧跟 `=>`」的才是 run() 的分派臂
+            // （`"-h" | "--help" =>` 的后半也算）
+            if pb.get(k) == Some(&b'"') && prod[k + 1..].trim_start().starts_with("=>") {
+                handled.insert(prod[start..k].to_string());
+            }
+            at = k;
+        }
+
+        let missing_doc: Vec<&String> = handled
+            .iter()
+            .filter(|c| !documented.contains(*c))
+            .collect();
+        let missing_impl: Vec<&String> = documented
+            .iter()
+            .filter(|c| !handled.contains(*c))
+            .collect();
+        assert!(
+            missing_doc.is_empty(),
+            "这些命令代码里接了、帮助里却没有：{missing_doc:?}"
+        );
+        assert!(
+            missing_impl.is_empty(),
+            "帮助里承诺了、run() 却没有分派臂（写了没做＝静默无效）：{missing_impl:?}"
+        );
+        assert!(
+            documented.contains("--import-legacy") && documented.contains("--device-keys"),
+            "这两条是本轮补进来的：一条会改写当前库却不该藏在源码里，一条的周期参数现在真起作用了"
+        );
+    }
+
+    /// 周期尺子必须真的接到 `--device-keys` 那扇门上（纯函数绿不代表调用方读了参数）。
+    ///
+    /// 这条缺陷原本的形状就是"帮助里写了 `[周期]`、分派臂根本不读 args[1]、函数里
+    /// 再自己写死一次全量"。只测 `period_window` 照不出来 —— 它当时也是绿的，
+    /// 红点落在没人看的接线处。
+    #[test]
+    fn the_device_keys_command_actually_reads_its_period() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
+        let arm_start = prod
+            .find("\"--device-keys\" =>")
+            .expect("--device-keys 的分派臂不见了");
+        let arm_end = prod[arm_start..]
+            .find("\"--rename-device\" =>")
+            .map(|n| arm_start + n)
+            .expect("--device-keys 与 --rename-device 之间的边界找不到");
+        let arm = &prod[arm_start..arm_end];
+        assert!(
+            arm.contains("args.get(1)"),
+            "分派臂没有把第二个参数传下去 ⇒ 帮助里的 `[周期]` 是假的：{arm}"
+        );
+        let fn_start = prod
+            .find("fn print_device_keys(")
+            .expect("print_device_keys 不见了");
+        let body = &prod[fn_start
+            ..prod[fn_start..]
+                .find("\nfn ")
+                .map(|n| n + fn_start)
+                .unwrap_or(prod.len())];
+        assert!(
+            body.contains("period_window("),
+            "这条命令自己写了第二把周期尺子 —— 两条设备门就会给同一个参数两个答案"
+        );
+        assert!(
+            !body.contains("get_device_stats(None, None)"),
+            "又把周期写死成全量了：{body}"
+        );
+    }
+
+    /// 「备份完成」这一句只许存在于 `backup_outcome` 里，而且 `--backup` 必须真的调它。
+    ///
+    /// 旧形状是分派臂里无条件 `println!("备份完成")`、失败之后再补一句 stderr ⇒
+    /// 计划任务收的 stdout 说的正好是反的。结论串抄成两处，就等于随时可以退回那一版。
+    #[test]
+    fn the_backup_verdict_only_exists_in_the_outcome_function() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
+        // 只数「会印出去的那一句」：注释里引用旧文案时带书名号，不带后面那个冒号。
+        assert_eq!(
+            prod.matches("备份完成: ").count(),
+            1,
+            "结论串抄成了多处：分派臂里再手写一句，计划任务收的 stdout 就又会说谎"
+        );
+        let arm_start = prod
+            .find("\"--backup\" =>")
+            .expect("--backup 的分派臂不见了");
+        let arm_end = prod[arm_start..]
+            .find("\"--cleanup\" =>")
+            .map(|n| arm_start + n)
+            .expect("--backup 与 --cleanup 之间的边界找不到");
+        assert!(
+            prod[arm_start..arm_end].contains("backup_outcome("),
+            "--backup 没有走结论函数，失败与成功还是各说一句"
+        );
+    }
+
+    /// `--backup` 的结论必须与 `--cleanup` 同一口径：先判失败，再决定说哪句话。
+    ///
+    /// 旧写法无条件先往 stdout 打「备份完成」，之后才在 stderr 补一句不完整。
+    /// 挂在计划任务上收的是 stdout，那份日志说的正好是反的（`c4aee24` 已经为
+    /// `--cleanup` 定过这条口径，`--backup` 是同族的另一半）。
+    #[test]
+    fn backup_says_incomplete_instead_of_done_when_a_library_failed() {
+        let p = std::path::Path::new("backup/focusflow_2026_20261019.db");
+        let (line, code) = backup_outcome(p, 1, &["focusflow_2025.db".to_string()]);
+        assert_eq!(code, 1, "有库没备份成就不能退 0");
+        assert!(
+            !line.contains("备份完成"),
+            "部分失败那一轮绝不能出现「备份完成」四个字：{line}"
+        );
+        assert!(
+            line.contains("focusflow_2025.db") && line.contains("1 份"),
+            "要点名失败的库、也说清已经拿到几份：{line}"
+        );
+
+        let (ok_line, ok_code) = backup_outcome(p, 3, &[]);
+        assert_eq!(ok_code, 0);
+        assert!(
+            ok_line.contains("备份完成") && ok_line.contains("共 3 份"),
+            "全都成功时才说完成，并把份数带上：{ok_line}"
+        );
+    }
+
+    /// 两条设备命令共用同一把周期尺子：`--devices` 认的参数与 `--device-keys` 认的必须一样。
+    ///
+    /// `--device-keys` 以前把周期写死成全量（还忽略非法值），而它是"照着数字改别名"
+    /// 的那条命令 —— 两条门给同一个参数两个答案，比报错更难查。
+    #[test]
+    fn the_two_device_commands_share_one_period_ruler() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        assert_eq!(
+            period_window("all", today),
+            Ok((None, None, "总计".to_string()))
+        );
+        assert_eq!(
+            period_window("today", today),
+            Ok((None, Some(today), "今日".to_string()))
+        );
+        assert_eq!(
+            period_window("7", today),
+            Ok((Some(7), None, "最近 7 天".to_string()))
+        );
+        // -1 / 0 是 UI 里今日 / 总计的写法，两条门都要翻成同一个窗口
+        assert_eq!(period_window("-1", today), period_window("today", today));
+        assert_eq!(period_window("0", today), period_window("all", today));
+        // 非法值要在入口就报错：旧代码连 `--device-keys abc` 都照旧输出全量并退 0
+        for bad in ["-5", "abc", "", " ", "99999999999"].iter() {
+            assert!(period_window(bad, today).is_err(), "{bad} 应当被拒绝");
         }
     }
 }
