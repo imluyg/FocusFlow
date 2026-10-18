@@ -444,6 +444,13 @@ pub struct FocusFlowConfig {
     /// 不在 ⇒ 文件在运行期被外部改过（记事本/`notepad config.ini`/同步盘），
     /// 那种改动必须被采纳，绝不能被下一次 save 悄悄盖掉。
     pending_writes: Mutex<HashSet<(String, String)>>,
+    /// 最近一次落盘失败的原因；`None` = 上一次落盘成功。
+    ///
+    /// 为什么要记在实例上：`set_config` 那条命令**永远返回 Ok** —— 真正写盘的是 300ms
+    /// 之后的去抖线程，命令返回时盘上还没动过。所以"设置写好了"这句话在界面上从来
+    /// 不是证据，而失败以前只有 `tracing::error!` 一行：用户改完一切看着都对，重启后
+    /// 全部回到旧值。读侧那一族"读不出来必须说话"已经修过好几处，这是剩下的写侧一半。
+    last_save_error: Mutex<Option<String>>,
 }
 
 impl FocusFlowConfig {
@@ -501,6 +508,7 @@ impl FocusFlowConfig {
             values: Mutex::new(values),
             path,
             pending_writes: Mutex::new(HashSet::new()),
+            last_save_error: Mutex::new(None),
         };
         // 结尾这次回写只是把"补齐的默认键"落到盘上，它失败**不能**推翻已经读出来、
         // 已经 reconcile 好的那一份。原来的 `cfg.save()?` 会让整个 `load()` 报错，
@@ -527,9 +535,48 @@ impl FocusFlowConfig {
 
     /// 保存当前配置到文件（缺失 section/key 已补默认值）。
     ///
+    /// 这一层只多干一件事：把**这次到底落没落成**记在实例上，让界面看得见
+    /// （见 `last_save_error` 字段）。真正的写在 `save_inner` 里。
+    pub fn save(&self) -> anyhow::Result<()> {
+        match self.save_inner() {
+            Ok(()) => {
+                *self
+                    .last_save_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                Ok(())
+            }
+            Err(e) => {
+                // 原样递出去，别在这里把错误链换掉；记下的是给人看的那一句
+                *self
+                    .last_save_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(format!("{e:#}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// 最近一次落盘失败的原因（`None` = 上一次落盘成功 / 从没失败）。
+    pub fn last_save_error(&self) -> Option<String> {
+        self.last_save_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 由 save 之外的路径记一句"设置不会落盘"（保存线程死了：那时根本不会再有
+    /// 一次 save，光靠 `save()` 里的记录等于什么都没有）。
+    pub(crate) fn record_save_error(&self, why: &str) {
+        *self
+            .last_save_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(why.to_string());
+    }
+
     /// 仅在锁内做快照，序列化与写盘在锁外完成：
     /// 落盘期间的磁盘 IO 不会阻塞热路径（键鼠监听/统计线程）的配置读取。
-    pub fn save(&self) -> anyhow::Result<()> {
+    fn save_inner(&self) -> anyhow::Result<()> {
         // 把「快照 → 序列化 → rename」整体串行化。
         //
         // 落盘刻意不能放在 `values` 锁里做（否则磁盘 IO 会阻塞键鼠监听/统计线程读配置），
@@ -663,6 +710,7 @@ impl FocusFlowConfig {
             values: Mutex::new(default_config()),
             path,
             pending_writes: Mutex::new(HashSet::new()),
+            last_save_error: Mutex::new(None),
         }
     }
 
@@ -843,7 +891,13 @@ fn saver_tx() -> &'static mpsc::Sender<()> {
 fn warn_saver_dead_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        tracing::error!("配置保存线程不可用：本次运行的设置改动不会落盘（重启程序可恢复）");
+        let why = "配置保存线程不可用：本次运行的设置改动不会落盘（重启程序可恢复）";
+        tracing::error!("{why}");
+        // 这条路径上不会再有一次 save ⇒ `save()` 里的记录永远看不到它。
+        // 不记这一笔，界面就继续显示"设置已改好"，而真实情况是这次运行的一切都不落盘。
+        if let Some(cfg) = INSTANCE.get() {
+            cfg.record_save_error(why);
+        }
     });
 }
 
@@ -876,6 +930,61 @@ pub fn init_with_path(path: impl AsRef<Path>) -> anyhow::Result<&'static FocusFl
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// 落盘失败要留下那句能给人看的原因，落成之后要把它清掉。
+    ///
+    /// 为什么值得单独钉：`set_config` 那条命令**永远返回 Ok** —— 真正写盘的是 300ms
+    /// 之后的去抖线程，命令返回时盘上还没动过。所以"设置写好了"在界面上从来不是证据，
+    /// 这条记录是设置页唯一拿得到的东西。以前失败只有 `tracing::error!` 一行，
+    /// 用户改完一切看着都对、重启后全部回到旧值。
+    ///
+    /// 夹具是本仓那一族的常用造法：把目标位置换成**同名目录**，rename 必然失败。
+    #[test]
+    fn a_failed_save_leaves_the_reason_the_settings_page_shows() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_save_err");
+        let path = app.path().join("config.ini");
+        std::fs::write(&path, "[gui]\ntheme = dark\n").unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+        assert_eq!(cfg.last_save_error(), None, "还没试过盘，不该有话");
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let err = cfg
+            .save()
+            .expect_err("config.ini 的位置上是一个目录，落盘应当失败");
+        let shown = cfg.last_save_error().expect("失败必须留下给人看的那一句");
+        assert!(
+            !shown.trim().is_empty(),
+            "留了个空字符串等于什么都没留（OS 原因: {err}）"
+        );
+
+        // 障碍清掉之后落成功了 ⇒ 那句话必须跟着消失，否则红字会一辈子挂在设置页上
+        std::fs::remove_dir_all(&path).unwrap();
+        cfg.save().expect("目录挪走之后应当写得出去");
+        assert_eq!(
+            cfg.last_save_error(),
+            None,
+            "落成了还留着失败原因＝界面永远红着"
+        );
+    }
+
+    /// 保存线程死了这条路径也必须留痕：那条路上**不会再有一次 save**，
+    /// 只靠 `save()` 里的记录等于什么都没记。
+    #[test]
+    fn the_dead_saver_path_records_its_own_reason() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_saver_dead");
+        let path = app.path().join("config.ini");
+        std::fs::write(&path, "[gui]\ntheme = dark\n").unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+        cfg.record_save_error("配置保存线程不可用：本次运行的设置改动不会落盘（重启程序可恢复）");
+        let shown = cfg.last_save_error().expect("这一条路径也要有话");
+        assert!(
+            shown.contains("不会落盘"),
+            "要说清后果，不只是「出错了」: {shown}"
+        );
+    }
 
     #[test]
     fn defaults_and_overrides() {

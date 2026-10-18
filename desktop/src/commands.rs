@@ -43,6 +43,10 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
     serde_json::json!({
         "theme": c.get("gui", "theme"),
         "paused": state.listener.is_paused(),
+        // 最近一次配置落盘的失败原因（空/缺省 = 上一次写盘是成功的）。
+        // 必须带出来：`set_config` 那条命令永远返回 Ok（真正写盘的是 300ms 之后的
+        // 去抖线程），界面拿不到这一句就只能一直显示"已经改好了"，而重启后全部回退。
+        "config_save_error": c.last_save_error().unwrap_or_default(),
         // 布尔项一律走 `get_bool`，不能拿字符串比 "==true"：`get_bool` 认
         // `true/1/yes/on`，而这里以前只认字面量 "true" —— 手改 config.ini 写成
         // `enabled = 1` 时功能是**开的**（hotkey.rs / state.rs 都用 get_bool 读），

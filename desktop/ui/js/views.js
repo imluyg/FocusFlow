@@ -1260,6 +1260,7 @@ function paintSettingsShell() {
       <div class="ff-body" id="ff-body"></div>
     </div>
     <div class="ff-foot">
+      <div id="set-warn"></div>
       <div id="set-maint"></div>
       <div id="set-msg"></div>
     </div>`;
@@ -1292,7 +1293,23 @@ export async function renderSettings() {
   lastGoalKeys = Number(s.goal_daily_keys ?? 20000) || 20000;
   if (!SETTINGS_CATS.some((c) => c.id === settingsUI.cat)) settingsUI.cat = SETTINGS_CATS[0].id;
   paintSettingsShell();
+  paintConfigWarn();
   renderMaintInfo();
+}
+
+// 配置落盘失败必须常驻顶部，而不是挤在会被下一次操作覆盖掉的 #set-msg 里。
+// `set_config` 那条命令永远返回 Ok —— 真正写盘的是 300ms 之后的去抖线程，
+// 命令返回时盘上还没动过。少了这一句，用户改完一切看着都对，重启后全部回到旧值。
+function paintConfigWarn() {
+  const el = $("set-warn");
+  if (!el) return;
+  const e = settingsUI.data && settingsUI.data.config_save_error
+    ? String(settingsUI.data.config_save_error)
+    : "";
+  el.innerHTML = e
+    ? `<div style="color:var(--danger)">设置没能写进 config.ini：${escapeHtml(e)}\
+（现在改的只在这个进程里生效，重启会回到旧值；确认那个文件没被占用或只读）</div>`
+    : "";
 }
 
 export async function doVacuum() {
