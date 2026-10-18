@@ -195,6 +195,11 @@ fn run(args: &[String]) -> i32 {
                         focusflow_core::paths::data_dir().display()
                     );
                     let report = db::maintenance::cleanup_old_data(days);
+                    // 快照的洞先说出来（走 stderr），再给结论那一句：退出码不变，
+                    // 因为删除本身确实做完了 —— 但"这一次没有退路"不能只留在日志里。
+                    if let Some(w) = report.snapshot_warning.as_deref() {
+                        eprintln!("{w}");
+                    }
                     let (line, code) = cleanup_outcome(days, &report);
                     // 成功那句话只属于成功：走 stdout；未完成走 stderr（这条是给计划任务用的）
                     if code == 0 {
@@ -870,6 +875,11 @@ fn reset(_db: &db::Database) -> i32 {
         return 0;
     }
     let report = db::maintenance::reset_all_data();
+    // 快照没兜住 ⇒ 在说"已清空"之前先把这句说出口（stderr，退出码不变：
+    // 删除确实做完了）。以前这句话只在 `logs/` 里，终端上看到的是一句干净的"已清空"。
+    if let Some(w) = report.snapshot_warning.as_deref() {
+        eprintln!("{w}");
+    }
     if report.incomplete() {
         eprintln!(
             "只清掉了一部分：{}（这些年份已回滚，行还在）。\
@@ -1238,6 +1248,7 @@ mod tests {
             deleted: 12,
             failed_years: vec![],
             dir_error: None,
+            snapshot_warning: None,
         };
         let (line, code) = cleanup_outcome(30, &ok);
         assert_eq!(code, 0);
@@ -1251,6 +1262,7 @@ mod tests {
             deleted: 0,
             failed_years: vec![2025],
             dir_error: None,
+            snapshot_warning: None,
         };
         let (line, code) = cleanup_outcome(30, &partial);
         assert_eq!(code, 1);
@@ -1268,6 +1280,7 @@ mod tests {
             deleted: 0,
             failed_years: vec![],
             dir_error: Some("读取数据目录失败".to_string()),
+            snapshot_warning: None,
         };
         let (line, code) = cleanup_outcome(30, &nodir);
         assert_eq!(code, 1, "目录读不出来不是「没东西可删」");
@@ -1571,5 +1584,36 @@ mod tests {
         for bad in ["-5", "abc", "", " ", "99999999999"].iter() {
             assert!(period_window(bad, today).is_err(), "{bad} 应当被拒绝");
         }
+    }
+
+    /// 两道破坏性命令都必须把执行前快照的洞说出口。
+    ///
+    /// 这一句在 core 里已经 `tracing::error!` 过一遍，但计划任务与终端用户收的是
+    /// stdout/stderr —— 不印出来就等于没说。`--reset` 的原话是一句干净的
+    /// 「所有统计记录已清空」，而它当时可能一个库的快照都没兜住。
+    /// 钉的是接线（两个入口各一处），不是纯函数：core 那边三条臂有自己的用例。
+    #[test]
+    fn the_destructive_commands_echo_the_snapshot_warning() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
+
+        let arm = prod
+            .find("\"--cleanup\" =>")
+            .expect("--cleanup 的分派臂不见了");
+        let arm_end = prod[arm..]
+            .find("\"--import-legacy\" =>")
+            .map(|n| n + arm)
+            .expect("--cleanup 与 --import-legacy 之间的边界");
+        assert!(
+            prod[arm..arm_end].contains("snapshot_warning"),
+            "--cleanup 没把快照结局递给用户，只在日志里喊"
+        );
+
+        let f = prod.find("fn reset(").expect("reset 函数不见了");
+        let f_end = prod[f..].find("\nfn ").map(|n| n + f).unwrap_or(prod.len());
+        assert!(
+            prod[f..f_end].contains("snapshot_warning"),
+            "--reset 在快照没兜住时仍然只说「已清空」"
+        );
     }
 }

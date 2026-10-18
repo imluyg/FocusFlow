@@ -211,7 +211,10 @@ pub fn archive_stale_years(source_year: i32) -> bool {
         // 下次启动会再次归档同一段数据，而 UPSERT 是 `count = count + excluded.count`
         // → 历史计数翻倍且无法自动识别。
         // 只有在确实检测到往年数据时才快照（正常年份不进这里），代价可接受。
-        snapshot_before_destructive("yearly_archive");
+        // 这一处刻意不接返回值：`archive_stale_years` 的信号是 bool（有没有归档），
+        // 而它跑在启动路径上、没有报告可挂；那句警告在 `snapshot_before_destructive`
+        // 里面已经 error! 过一遍，日志这头不缺一句话。
+        let _ = snapshot_before_destructive("yearly_archive");
     }
     for (year, a, b) in stale {
         if archive_year_range(year, source_year, a, b) {
@@ -705,6 +708,12 @@ pub struct MaintenanceReport {
     /// 后者意味着碰过且失败了若干个具体年份。混在一起的话，`--reset` 在目录
     /// 读不出来时会打印"所有统计记录已清空 (0 行)"并退 0 —— 用户以为数据抹了。
     pub dir_error: Option<String>,
+    /// 执行前快照没有完全兜住时的那句话（`None` = 兜住了，或本来就没东西要兜）。
+    ///
+    /// 为什么单独一格、而且刻意**不进 `incomplete()`**：这一轮破坏性操作本身是做完了的，
+    /// 退出码不该因为"退路没准备好"而变。但它绝不能只进日志 —— 用户批准「清空全部」
+    /// 之前看到的那句话，必须同时说明这一次没有回滚用的快照。
+    pub snapshot_warning: Option<String>,
 }
 
 impl MaintenanceReport {
@@ -805,7 +814,12 @@ pub fn cleanup_old_data(keep_days: i64) -> CleanupReport {
         };
         if stale.is_some() {
             if !snapshotted {
-                snapshot_before_destructive("cleanup_old_data");
+                if let Some(w) = snapshot_before_destructive("cleanup_old_data") {
+                    // 只记第一次：后面的年份共用这一轮快照，重复贴同一句只会淹没结论
+                    if report.snapshot_warning.is_none() {
+                        report.snapshot_warning = Some(w);
+                    }
+                }
                 snapshotted = true;
             }
             for table in DATA_TABLES {
@@ -1211,25 +1225,22 @@ pub fn start_periodic_backup() -> crate::startup::CheckResult {
 }
 
 /// 破坏性操作（清空/清理/删除按键）前的兜底快照。
-/// 备份失败不阻断操作本身（用户在 UI 主动发起），但错误日志会高亮，
-/// 并且该次备份不会污染轮转（坏文件已被校验逻辑删除）。
-fn snapshot_before_destructive(op: &str) {
+/// 备份失败不阻断操作本身（用户在 UI 主动发起），但**结局要带回调用方**：
+/// 以前这一句只进日志，于是 `--reset` 在"5 个库里只兜住 1 个"的那一轮里照样
+/// 只说"所有统计记录已清空"并退 0 —— 用户看不到自己刚刚没有退路。
+/// 返回 `Some(...)` = 这一句必须递给界面/终端；日志这边照喊，两遍都不嫌多。
+fn snapshot_before_destructive(op: &str) -> Option<String> {
     let max_backups = crate::config::instance()
         .get_int("database", "max_backups", 5)
         .max(1);
-    match backup_database(max_backups) {
+    let outcome = backup_database(max_backups);
+    let note = snapshot_note(op, &outcome);
+    match &outcome {
         BackupOutcome::Done { count, failed, .. } => {
             if failed.is_empty() {
                 tracing::info!("{op}: 已完成执行前快照（{count} 份）");
             } else {
-                // 这一支原先打的是上面那句"已完成执行前快照"：一轮里 5 个年度库只备份
-                // 出 1 份（还是附属库）也算 Done，于是马上要 DELETE/清空的统计库
-                // 一份覆盖都没有，而日志说的正好相反。不阻断操作（口径不变：用户在 UI
-                // 主动发起），但这句必须比"成功"响。
-                tracing::error!(
-                    "{op}: 执行前快照只兜住了 {count} 份，这些库没备份出去: {failed:?} —— \
-                     接下来的破坏性操作在那些库上没有退路",
-                );
+                tracing::error!("{}", note.as_deref().unwrap_or("执行前快照不完整"));
             }
         }
         // 没东西可备份不是失败：刚装好/刚重置过的目录里本来就没有库。
@@ -1240,6 +1251,29 @@ fn snapshot_before_destructive(op: &str) {
         BackupOutcome::Failed { reason } => {
             tracing::error!("{op}: 执行前快照失败，没有任何数据库被备份 —— {reason}");
         }
+    }
+    note
+}
+
+/// 快照结局 → 要不要给破坏性命令带一句"没有退路"。**纯函数**：真正的"部分失败"
+/// 要在测试里造出一轮"列得出来、却备份不动"的库，那套夹具不是一行的事；
+/// 而这句话会不会说出口全部经过这里，把它钉住就挡住了那个误读本身。
+fn snapshot_note(op: &str, outcome: &BackupOutcome) -> Option<String> {
+    match outcome {
+        BackupOutcome::Done { count, failed, .. } => {
+            if failed.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "{op}: 执行前快照只兜住了 {count} 份，这些库没备份出去: {failed:?} —— \
+                     接下来在这几个库上做的删除没有退路"
+                ))
+            }
+        }
+        BackupOutcome::NothingToDo => None,
+        BackupOutcome::Failed { reason } => Some(format!(
+            "{op}: 执行前快照失败，没有任何数据库被备份 —— {reason}；接下来的删除没有退路"
+        )),
     }
 }
 
@@ -2018,14 +2052,20 @@ fn rotate_backups(policy: RetentionPolicy, freeze: bool) {
 }
 
 /// 清空所有年度库的统计表（键鼠计数/小时分布/按键明细/活跃时长/前台应用）。
-/// 不可逆操作：执行前先做一次全量备份（失败只记日志不阻断，但会在日志中高亮）。
+/// 不可逆操作：执行前先做一次全量备份。备份没兜住**不阻断**操作（口径不变：这是用户
+/// 主动发起的），但结局会放进 `report.snapshot_warning` —— 只在日志里高亮过一次不算说过。
 ///
 /// 每一年单独一个事务：原先是裸着一串 `DELETE ... .unwrap_or(0)`，中途一次
 /// SQLITE_BUSY 就会留下一半删掉、一半没删的库，而调用方拿到的行数照报"已清空"
 /// （`cleanup_old_data` 早就包了 BEGIN IMMEDIATE/COMMIT，这里是漏下的那一个）。
 pub fn reset_all_data() -> MaintenanceReport {
-    snapshot_before_destructive("reset_all_data");
-    let mut report = MaintenanceReport::default();
+    // 快照先做（这次调用本身就要写盘），结局跟着报告走：这一轮清空之后，
+    // 没被兜住的那些库就再没有回滚的地方了。
+    let warning = snapshot_before_destructive("reset_all_data");
+    let mut report = MaintenanceReport {
+        snapshot_warning: warning,
+        ..MaintenanceReport::default()
+    };
     let Some(years) = years_or_record(&mut report) else {
         return report;
     };
@@ -2129,8 +2169,10 @@ pub fn delete_key_today(key_name: &str) -> i64 {
         conn.execute_batch("ROLLBACK").ok();
         return 0;
     }
-    // 到这一步才真的会删东西，快照也只在这种时候才值回它的轮转名额
-    snapshot_before_destructive("delete_key_today");
+    // 到这一步才真的会删东西，快照也只在这种时候才值回它的轮转名额。
+    // 本函数只回一个 i64（删掉的行数），没有地方挂警告；日志那层已经喊过。
+    // 它目前没有生产调用方，等真有界面入口时要一并把这句递上去。
+    let _ = snapshot_before_destructive("delete_key_today");
     let daily_before: i64 = conn
         .query_row(
             "SELECT count FROM daily_counts WHERE date_key=?1",
@@ -3580,6 +3622,69 @@ mod tests {
     }
 
     /// 备份失败时不得留下半成品（半成品会占轮转名额、顶掉好备份）。
+    /// 快照结局要不要变成一句"没有退路"：三条臂各钉一条。
+    ///
+    /// `Done` 不等于全都兜住（`count` 只是成功份数），而以前这个事实**只进日志** ——
+    /// `--reset` 在"五个库里只兜住一个"的那一轮里照样只说"所有统计记录已清空"并退 0，
+    /// 用户看不到自己刚刚把数据删在没有快照的库上。
+    #[test]
+    fn the_snapshot_note_is_said_only_when_the_safety_net_has_holes() {
+        let holes = BackupOutcome::Done {
+            first: std::path::PathBuf::from("backup/a.db"),
+            count: 1,
+            failed: vec!["focusflow_2025.db".to_string()],
+        };
+        let note = snapshot_note("reset_all_data", &holes).expect("只兜住一部分必须说一句");
+        assert!(
+            note.contains("focusflow_2025.db") && note.contains("没有退路"),
+            "要点名没兜住的库：{note}"
+        );
+        assert!(note.contains("1 份"), "已经拿到的份数不能丢：{note}");
+
+        let full = BackupOutcome::Done {
+            first: std::path::PathBuf::from("backup/a.db"),
+            count: 3,
+            failed: vec![],
+        };
+        assert_eq!(
+            snapshot_note("reset_all_data", &full),
+            None,
+            "全都兜住时不多话"
+        );
+        assert_eq!(
+            snapshot_note("reset_all_data", &BackupOutcome::NothingToDo),
+            None,
+            "本来没东西要兜不是失败"
+        );
+
+        let dead = BackupOutcome::Failed {
+            reason: "备份目录建不出来".to_string(),
+        };
+        let note = snapshot_note("cleanup_old_data", &dead).expect("一个都没兜住要有话");
+        assert!(
+            note.contains("备份目录建不出来") && note.contains("cleanup_old_data"),
+            "原因与是哪一道操作都要在里面: {note}"
+        );
+    }
+
+    /// 快照的洞要跟着报告走出去，而且**不许**污染 `incomplete()`：
+    /// 破坏性操作本身做完了，退出码不该因为"退路没备好"而变 —— 那句话只是必须说。
+    #[test]
+    fn the_snapshot_warning_rides_on_the_report_without_changing_the_verdict() {
+        let clean = MaintenanceReport::default();
+        assert!(clean.snapshot_warning.is_none() && !clean.incomplete());
+        let r = MaintenanceReport {
+            snapshot_warning: Some("执行前快照只兜住了 1 份".to_string()),
+            ..MaintenanceReport::default()
+        };
+        assert!(!r.incomplete(), "快照没兜住不等于这一轮删除没做成");
+        assert!(
+            r.why_incomplete().is_empty(),
+            "结论那句里不该混进快照的话: {:?}",
+            r.why_incomplete()
+        );
+    }
+
     #[test]
     fn failed_backup_cleanup_removes_partial_file() {
         let _lock = crate::paths::test_app_dir_lock();
