@@ -62,6 +62,89 @@ pub fn set_watch(watch: bool) {
     }
 }
 
+/// 目录快照：`插件文件名(stem) → mtime`。
+///
+/// 读不到目录时返回 `listed=false`，调用方必须保留旧基线、一个事件都不发：
+/// 否则拿一份空的 `seen` 去比，每个插件都会被判定成「文件已删除」而全部卸载 ——
+/// 而目录整体读不到恰恰是构建脚本正在整份替换、或杀软首扫握着句柄的时候。
+fn scan_plugin_dir(
+    dir: &std::path::Path,
+    prev: &HashMap<String, Option<SystemTime>>,
+) -> (bool, HashMap<String, Option<SystemTime>>) {
+    let mut seen: HashMap<String, Option<SystemTime>> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (false, seen);
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.extension().map(|e| e == "lua").unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = p.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&p) else {
+            continue;
+        };
+        // 编辑器常有「先截断再写入」：0 字节的 .lua 会被解析成空块而且不报错，
+        // 插件就此变成没有任何函数的空壳。本轮当作「还没写完」，沿用上一轮的指纹
+        // （否则删除检测会把它误判成文件消失），等下一次轮询到非空内容再触发重载。
+        if meta.len() == 0 {
+            if let Some(prev_mtime) = prev.get(&name) {
+                seen.insert(name, *prev_mtime);
+            }
+            continue;
+        }
+        seen.insert(name, meta.modified().ok());
+    }
+    (true, seen)
+}
+
+/// 热重载的 mtime 基线。
+///
+/// **必须在扫描线程启动时就武装一次**，不能等插件管理页第一次打开：
+/// 首扫"只建基线不发事件"是为了避免每次开页都把全部文件当变更连发（列表反复重建会
+/// 吞掉用户正在点的行），但把武装也推到第一次开页，就留下一个窗口 ——
+/// 程序启动之后、第一次开页之前放进 `plugins/` 的那个 .lua 会被当成基线本身吸收掉，
+/// 于是列表里它写着已启用、实际从没被 `load_all` 加载过，点「打开」只有一句
+/// 「插件未提供视图」，而唯一让它生效的办法是重启程序。
+#[derive(Default)]
+struct PluginBaseline {
+    map: HashMap<String, Option<SystemTime>>,
+    primed: bool,
+}
+
+impl PluginBaseline {
+    /// 用一轮扫描结果更新基线，返回本轮该发事件的文件名（升序，方便用例断言）。
+    ///
+    /// 未武装的那一轮（启动首扫）只建基线不发事件；`listed=false` 的那轮既不发言、
+    /// 也不替换基线（保持上一轮的，等下一次读到再说）。
+    fn apply(&mut self, listed: bool, seen: HashMap<String, Option<SystemTime>>) -> Vec<String> {
+        let mut changed: Vec<String> = Vec::new();
+        if !listed {
+            return changed;
+        }
+        if self.primed {
+            for (name, mtime) in &seen {
+                if self.map.get(name) != Some(mtime) {
+                    changed.push(name.clone());
+                }
+            }
+            // 删除也要发事件：只遍历 seen 会漏掉消失的文件，插件就得重启才停得下来
+            // —— 而删掉文件表达的意思恰恰是「别再跑它了」。
+            for name in self.map.keys() {
+                if !seen.contains_key(name) {
+                    changed.push(name.clone());
+                }
+            }
+        }
+        self.map = seen;
+        self.primed = true;
+        changed.sort();
+        changed
+    }
+}
+
 /// 启动插件热重载（Tauri 版）。
 /// 核心 PluginManager 自带的热重载需要 GUI 每帧 poll_reload_requests，
 /// Tauri 没有这个循环，这里用独立实现：扫描线程只在插件管理页打开时
@@ -75,15 +158,20 @@ pub fn start_hot_reload(app: &tauri::AppHandle, db: Arc<Database>) -> bool {
     let (tx, rx) = std::sync::mpsc::channel::<String>();
 
     // 扫描线程：仅监听状态下每 2 秒比对 mtime，变更时发送插件文件名。
-    // 首轮只建立 mtime 基线不触发事件：否则每次打开插件管理页都会把全部文件
-    // 当作"变更"连发 plugins-reloaded，列表反复重建会吞掉用户正在进行的点击。
+    // 基线在线程启动时就武装（见 `PluginBaseline`）：只把"第一次成功扫描"当作基线，
+    // 而不是等插件管理页打开 —— 后者会让启动之后才放进目录的插件被当成基线吸收掉，
+    // 于是列表写着已启用、实际从没加载。
     let scan_ok = std::thread::Builder::new()
         .name("plugin-hot-reload-scan".into())
         .spawn(move || {
             let dir = focusflow_core::paths::plugins_dir();
-            let mut last: HashMap<String, Option<SystemTime>> = HashMap::new();
+            let mut bl = PluginBaseline::default();
+            // 武装基线：这一步在"要不要监听"那道闸**之前**。
+            // 读不到目录时 apply() 不置 `primed`，循环里的首轮会接替武装（宁可多等一轮，
+            // 也不要拿一份空基线去比出"全部删除"）。
+            let (listed0, snap0) = scan_plugin_dir(&dir, &bl.map);
+            let _ = bl.apply(listed0, snap0);
             let mut watching = false;
-            let mut primed = false;
             loop {
                 while let Ok(w) = ctl_rx.try_recv() {
                     watching = w;
@@ -97,57 +185,9 @@ pub fn start_hot_reload(app: &tauri::AppHandle, db: Arc<Database>) -> bool {
                     std::thread::sleep(Duration::from_millis(300));
                     continue;
                 }
-                let mut seen: HashMap<String, Option<SystemTime>> = HashMap::new();
-                let mut listed = true;
-                if let Ok(entries) = std::fs::read_dir(&dir) {
-                    for entry in entries.flatten() {
-                        let p = entry.path();
-                        if !p.extension().map(|e| e == "lua").unwrap_or(false) {
-                            continue;
-                        }
-                        let Some(name) = p.file_stem().and_then(|s| s.to_str()).map(str::to_string)
-                        else {
-                            continue;
-                        };
-                        let Ok(meta) = std::fs::metadata(&p) else {
-                            continue;
-                        };
-                        // 编辑器常有「先截断再写入」：0 字节的 .lua 会被解析成空块而且
-                        // 不报错，插件就此变成没有任何函数的空壳。本轮当作「还没写完」，
-                        // 沿用上一轮的指纹（否则删除检测会把它误判成文件消失），
-                        // 等下一次轮询到非空内容再触发重载。
-                        if meta.len() == 0 {
-                            if let Some(prev) = last.get(&name) {
-                                seen.insert(name, *prev);
-                            }
-                            continue;
-                        }
-                        seen.insert(name, meta.modified().ok());
-                    }
-                } else {
-                    listed = false;
-                }
-                // 目录整体没读到（被占用、或构建脚本正在替换整个目录）时不能拿空的
-                // seen 参与比较：否则每个插件都会被判定成「文件已删除」而全部卸载。
-                // 同理也不能覆盖基线 —— 那样下一轮成功读取会把所有文件当成新变更，
-                // 触发一整轮无谓的重载。保持上一轮基线，等下一轮再说。
-                if listed && primed {
-                    for (name, mtime) in &seen {
-                        if last.get(name) != Some(mtime) {
-                            let _ = tx.send(name.clone());
-                        }
-                    }
-                    // 删除也要发事件：只遍历 seen 会漏掉消失的文件，插件就得重启
-                    // 才停得下来 —— 而删掉文件表达的意思恰恰是「别再跑它了」。
-                    for name in last.keys() {
-                        if !seen.contains_key(name) {
-                            let _ = tx.send(name.clone());
-                        }
-                    }
-                }
-                if listed {
-                    primed = true;
-                    last = seen;
+                let (listed, seen) = scan_plugin_dir(&dir, &bl.map);
+                for name in bl.apply(listed, seen) {
+                    let _ = tx.send(name);
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }
@@ -600,4 +640,140 @@ pub fn plugin_set_field(
         pm.plugin_set_field(&name, &field, &value)?;
         Ok(view_dto(pm, &name))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(items: &[(&str, u64)]) -> HashMap<String, Option<SystemTime>> {
+        items
+            .iter()
+            .map(|(name, secs)| {
+                (
+                    name.to_string(),
+                    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(*secs)),
+                )
+            })
+            .collect()
+    }
+
+    /// 启动之后、第一次打开插件页之前放进目录的插件必须被发到事件里。
+    ///
+    /// 这就是被修掉的那个窗口：旧写法把"第一次成功扫描"当成武装基线，而第一次扫描
+    /// 发生在开页之后 —— 于是那个窗口里新增的文件被当成基线本身吸收掉，列表写着
+    /// 已启用、实际从没被 `load_all` 加载过，点「打开」只有一句「插件未提供视图」，
+    /// 唯一生效办法是重启程序。（本用例只跑 `PluginBaseline`，防不住"把武装挪回闸后"
+    /// 那种回潮 —— 那一半由下面那条源码形状用例守着。）
+    #[test]
+    fn a_plugin_dropped_before_the_first_page_open_still_fires() {
+        let mut bl = PluginBaseline::default();
+        // 线程启动时：目录里只有 stats_overview
+        let fired = bl.apply(true, snap(&[("stats_overview", 100)]));
+        assert!(
+            fired.is_empty(),
+            "武装那一轮不该发事件（否则每次开页全量重发）"
+        );
+        // 用户在没人开页的时候放进一个新插件，然后第一次开页
+        let fired = bl.apply(true, snap(&[("stats_overview", 100), ("my_widget", 200)]));
+        assert_eq!(fired, vec!["my_widget".to_string()], "新文件要发事件");
+    }
+
+    /// 目录读不到那一轮：既不发言，也不许替换基线。
+    ///
+    /// 拿一份空的 `seen` 去比，每个插件都会被判成「文件已删除」而全部卸载；
+    /// 覆盖基线则下一轮成功读取会把全部文件当新变更，再来一整轮无谓重载。
+    #[test]
+    fn an_unreadable_round_changes_nothing() {
+        let mut bl = PluginBaseline::default();
+        bl.apply(true, snap(&[("a", 100), ("b", 200)]));
+        assert!(
+            bl.apply(false, HashMap::new()).is_empty(),
+            "读不到目录的那一轮一个事件都不许发"
+        );
+        // 基线还是上一轮那两份 ⇒ 下一轮成功读取且内容没变，仍然不发事件
+        assert!(bl.apply(true, snap(&[("a", 100), ("b", 200)])).is_empty());
+    }
+
+    /// 文件消失也要发事件：删掉插件文件表达的是「别再跑它了」。
+    #[test]
+    fn a_vanished_plugin_fires_so_it_can_be_unloaded() {
+        let mut bl = PluginBaseline::default();
+        bl.apply(true, snap(&[("a", 100), ("gone", 150)]));
+        let fired = bl.apply(true, snap(&[("a", 100)]));
+        assert_eq!(fired, vec!["gone".to_string()]);
+    }
+
+    /// 0 字节的 .lua 是"编辑器截断后还没写完"的中间态：沿用上一轮指纹。
+    ///
+    /// 判成 mtime 变了就会重载出一个没有任何函数的空壳；判成文件消失更糟 ——
+    /// 直接把插件卸载掉。两种都比"这一轮什么都不做"坏。
+    #[test]
+    fn a_zero_byte_file_keeps_the_previous_fingerprint() {
+        struct Tmp(std::path::PathBuf);
+        impl Drop for Tmp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("ff_plugin_scan_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("临时目录该建得出来");
+        let _tmp = Tmp(dir.clone());
+        let file = dir.join("w.lua");
+        std::fs::write(&file, "function focusflow.card() end").unwrap();
+
+        let (listed, first) = scan_plugin_dir(&dir, &HashMap::new());
+        assert!(listed, "目录读到了");
+        assert!(first.contains_key("w"), "有内容的 .lua 要进快照");
+
+        // 截断成 0 字节：指纹必须原样留着（而不是变成 None、更不是消失）
+        std::fs::write(&file, "").unwrap();
+        let (_, second) = scan_plugin_dir(&dir, &first);
+        assert_eq!(
+            second.get("w"),
+            first.get("w"),
+            "0 字节那一轮要沿用上一轮的指纹"
+        );
+        assert!(second.contains_key("w"), "更不能把它判成文件已删除");
+
+        // 全新文件正好是 0 字节：这一轮干脆不提它（上一轮没有指纹可沿用），
+        // 等它有内容了再进事件 —— 否则基线里会出现一条 None 的空壳记录。
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(dir.join("fresh.lua"), "").unwrap();
+        let (_, third) = scan_plugin_dir(&dir, &HashMap::new());
+        assert!(
+            !third.contains_key("fresh"),
+            "没见过的 0 字节文件不该进这一轮快照"
+        );
+    }
+
+    /// 形状守卫：武装基线那一步必须排在"要不要监听"那道闸**之前**。
+    ///
+    /// 上面那条行为用例跑的是抽出来的 `PluginBaseline`，它测不到线程体里"什么时候武装" ——
+    /// 而这场缺陷恰恰就是武装的时机。只能按文本顺序钉（与本仓 `snip.rs`、
+    /// `cli/main.rs` 那几条同族）。
+    #[test]
+    fn the_scan_thread_primes_the_baseline_before_the_watch_gate() {
+        let src = include_str!("plugins.rs");
+        let head = src
+            .find("fn start_hot_reload")
+            .expect("启动函数找不到了（判据要跟着改）");
+        let body = &src[head..head + src[head..].find("\n}\n").expect("启动函数的结尾")];
+        let prime = body
+            .find("bl.apply(listed0, snap0)")
+            .expect("扫描线程不再在启动时武装基线了");
+        let gate = body
+            .find("if !watching")
+            .expect("监听那道闸不见了（判据要跟着改）");
+        assert!(
+            prime < gate,
+            "武装必须排在闸之前（武装在第 {prime} 字、闸在第 {gate} 字）—— \
+             挪回闸后就又留下「启动后、第一次开页前放进去的插件永不加载」那个窗口"
+        );
+        // 夹具自己的前提：切片真盖住了线程体，不是切成空串让上面两条空转
+        assert!(
+            body.contains("PluginBaseline::default()") && body.contains("ctl_rx.try_recv()"),
+            "切片没盖住扫描线程，上面那条次序断言是假绿"
+        );
+    }
 }
