@@ -235,6 +235,33 @@ pub(crate) fn parse_ini(text: &str) -> HashMap<String, HashMap<String, String>> 
     out
 }
 
+/// `config.ini` 的节序，**全仓只有这一份**。
+///
+/// 原先两个序列化器各抄一份同样的数组（逐行重写里"整节没出现过的新节"那段追加、
+/// 与整份重建那条）。抄两遍的病不是难看：新增一节时只改一处，同一份内存快照就会
+/// 因"原文件读不读得到"给出两种节序 —— 而走到整份重建那一条的时机恰恰是文件被
+/// 别的句柄握着（杀软首扫、OneDrive 占位），用户看到的就是"config.ini 的节顺序自己变了"。
+///
+/// 前九个与 Python 版一致（便于阅读与 diff），末尾三个是后来加的节。**清单必须盖住
+/// `default_config()` 的每一节**：清单外的节在整份重建那条路上过去连名字兜底都没有，
+/// 直接按 `HashMap` 迭代序排 ⇒ 实测同一份默认配置，重建路给
+/// `app_stats, plugins, device_stats`、逐行重写路给 `app_stats, device_stats, plugins`，
+/// 每跑一次进程都可能换个样子。现在两边都是"清单位置 → 同名兜底"。
+const SECTION_ORDER: [&str; 12] = [
+    "database",
+    "stats",
+    "paths",
+    "listener",
+    "gui",
+    "hotkey",
+    "floating",
+    "pomodoro",
+    "rest",
+    "app_stats",
+    "device_stats",
+    "plugins",
+];
+
 /// 逐行重写：**只替换自己认识的键行**，其余一律逐字保留。
 ///
 /// 旧实现是「从内存快照整份重建」：用户手写的注释行、空行、节内顺序全部被抹掉，
@@ -323,9 +350,7 @@ fn serialize_preserving_structure(
     }
 
     // 快照里还有整节没出现过的：追加到文件末尾
-    let order = [
-        "database", "stats", "paths", "listener", "gui", "hotkey", "floating", "pomodoro", "rest",
-    ];
+    let order = SECTION_ORDER;
     let mut remaining: Vec<&String> = snapshot
         .keys()
         .filter(|s| !seen_sections.contains(*s))
@@ -389,11 +414,16 @@ fn flush_section(
 fn serialize_rebuilt(snapshot: &HashMap<String, HashMap<String, String>>) -> String {
     let mut out = String::new();
     // 固定 section 顺序，与 Python 版一致，便于阅读与 diff。
-    let order = [
-        "database", "stats", "paths", "listener", "gui", "hotkey", "floating", "pomodoro", "rest",
-    ];
+    let order = SECTION_ORDER;
     let mut sections: Vec<&String> = snapshot.keys().collect();
-    sections.sort_by_key(|s| order.iter().position(|o| o == s).unwrap_or(usize::MAX));
+    // 与逐行重写那条**同一个比较器**：先按清单位置，位置相同（清单外的节）再按名字。
+    // 过去这里只 `sort_by_key(位置)`，清单外的几节就退回 `HashMap` 的迭代序 ——
+    // 那个序每进程随机（SipHash 种子），于是"整份重建"写出的 config.ini 节序会自己变。
+    sections.sort_by(|a, b| {
+        let pa = order.iter().position(|o| o == *a).unwrap_or(usize::MAX);
+        let pb = order.iter().position(|o| o == *b).unwrap_or(usize::MAX);
+        pa.cmp(&pb).then_with(|| a.cmp(b))
+    });
     for section in sections {
         let mut keys: Vec<&String> = snapshot[section].keys().collect();
         if keys.is_empty() {
@@ -1615,5 +1645,67 @@ work_minutes = 45
                 golden_sorted.len()
             );
         }
+    }
+
+    /// 两条落盘路必须用**同一份**节序，而 `default_config()` 的每一节都要在那份清单里。
+    ///
+    /// 这条盯的是"数组抄两份"的回潮：`serialize_preserving_structure`（原文件读得到，
+    /// 逐行重写）与 `serialize_rebuilt`（读不到，整份重建）以前各写一遍同样的数组。
+    /// 只改一处时症状是"config.ini 的节顺序自己变了"—— 而走到整份重建那一条的时机
+    /// 恰恰是文件被杀软/同步盘握着句柄的时候，普通人根本对不上是哪一次保存改的。
+    /// 两个方向的判据都要：节序两边相等（`HashMap` 迭代序每进程随机，所以这条不是在
+    /// 比"插进去的顺序"），以及新增一节时不会悄悄掉到清单外。
+    #[test]
+    fn both_serializers_use_the_same_single_section_order() {
+        let sections_of = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|line| {
+                    let t = line.trim();
+                    t.strip_prefix('[')
+                        .and_then(|rest| rest.strip_suffix(']'))
+                        .map(|name| name.to_string())
+                })
+                .collect()
+        };
+        let defaults = default_config();
+        let rebuilt = sections_of(&serialize_rebuilt(&defaults));
+        let appended = sections_of(&serialize_preserving_structure(&defaults, ""));
+        assert!(
+            rebuilt.len() >= 2,
+            "夹具前提：没抠出节头，上面两条比较是空转"
+        );
+        assert_eq!(
+            rebuilt, appended,
+            "同一份内存快照在两条落盘路上给出两种节序（清单抄回两份了）"
+        );
+
+        let mut missing: Vec<String> = defaults
+            .keys()
+            .filter(|s| !SECTION_ORDER.contains(&s.as_str()))
+            .cloned()
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "这些节在 default_config() 里但没进 SECTION_ORDER ⇒ 会掉到清单外: {missing:?}"
+        );
+
+        // 清单外的节（将来新增、或用户手写的节）也必须有个定数：按名字。
+        let mut odd: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for name in ["zzeta", "aalpha", "database", "mmiddle"] {
+            let mut kv = HashMap::new();
+            kv.insert("k".to_string(), "1".to_string());
+            odd.insert(name.to_string(), kv);
+        }
+        assert_eq!(
+            sections_of(&serialize_rebuilt(&odd)),
+            vec!["database", "aalpha", "mmiddle", "zzeta"],
+            "整份重建那条对清单外的节要按名字排，不能退回 HashMap 的每进程随机序"
+        );
+        assert_eq!(
+            sections_of(&serialize_rebuilt(&odd)),
+            sections_of(&serialize_preserving_structure(&odd, "")),
+            "同一条规则在两条路上得给同一个答案"
+        );
     }
 }
