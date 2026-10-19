@@ -234,38 +234,70 @@ fn import_legacy(src_dir: &str) -> i32 {
         return 1;
     }
     let summary = focusflow_core::migration::import_legacy_data(src);
-    println!("\n=== 旧数据导入完成 ===");
-    if summary.year_dbs.is_empty() && summary.copied_aux.is_empty() {
-        println!("未发现可导入的数据");
+    let (lines, code) = import_report(&summary);
+    for (to_stderr, line) in lines {
+        if to_stderr {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
+    code
+}
+
+/// `--import-legacy` 的结论：**成功才说「完成」**，错误行走 stderr、退出码非 0。
+///
+/// 旧写法先把「旧数据导入完成」打到 stdout，再把错误逐条打到 stdout —— 挂在计划任务上的
+/// 那份日志读起来永远是成功。桌面设置页那条路早已按「有错误就是失败」修过
+/// （`commands::import_outcome`），CLI 这半边当时漏了。
+///
+/// 有错误时也不打「未发现可导入的数据」：那句话会把「一个库都没读成」读成
+/// 「旧目录本来就没数据」，正是这条命令最需要说清楚的分岔。
+///
+/// 返回（按顺序要打印的行, 每行是否走 stderr, 退出码）。命令本体要读真实目录、
+/// 还会写当前数据目录，用例起不来，所以判据收在这个纯函数里。
+fn import_report(summary: &focusflow_core::migration::ImportSummary) -> (Vec<(bool, String)>, i32) {
+    let failed = !summary.errors.is_empty();
+    let mut out: Vec<(bool, String)> = Vec::new();
+    out.push((false, String::new()));
+    out.push((
+        failed,
+        if failed {
+            "=== 旧数据导入未完成 ===".to_string()
+        } else {
+            "=== 旧数据导入完成 ===".to_string()
+        },
+    ));
+    if summary.year_dbs.is_empty() && summary.copied_aux.is_empty() && !failed {
+        out.push((false, "未发现可导入的数据".to_string()));
     }
     for (year, count) in &summary.records_by_year {
-        println!("  {year} 年度键鼠: {count} 条记录");
+        out.push((false, format!("  {year} 年度键鼠: {count} 条记录")));
     }
     if !summary.copied_aux.is_empty() {
-        println!("  附属数据: {}", summary.copied_aux.join(", "));
+        out.push((
+            false,
+            format!("  附属数据: {}", summary.copied_aux.join(", ")),
+        ));
     }
     // 覆盖前的留档路径：选错导入目录时用户靠它找回原数据
     if !summary.backed_up_aux.is_empty() {
-        println!("  原数据已留档（覆盖前）：");
+        out.push((false, "  原数据已留档（覆盖前）：".to_string()));
         for kept in &summary.backed_up_aux {
-            println!("    {kept}");
+            out.push((false, format!("    {kept}")));
         }
     }
     if !summary.skipped.is_empty() {
-        println!("  跳过: {}", summary.skipped.join(", "));
+        out.push((false, format!("  跳过: {}", summary.skipped.join(", "))));
     }
-    if !summary.errors.is_empty() {
-        println!("  错误:");
+    if failed {
+        out.push((true, "  错误:".to_string()));
         for e in &summary.errors {
-            println!("    {e}");
+            out.push((true, format!("    {e}")));
         }
     }
-    println!();
-    if summary.errors.is_empty() {
-        0
-    } else {
-        1
-    }
+    out.push((false, String::new()));
+    (out, if failed { 1 } else { 0 })
 }
 
 /// `--stats` / `--devices` 的周期。
@@ -977,9 +1009,9 @@ fn backup_outcome(outcome: &db::maintenance::BackupOutcome) -> (String, i32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_outcome, cleanup_outcome, export_csv, export_html, export_target, parse_keep_days,
-        parse_period, parse_stats_year, period_window, rank_tail_note, year_lookup, Period,
-        YearLookup,
+        backup_outcome, cleanup_outcome, export_csv, export_html, export_target, import_report,
+        parse_keep_days, parse_period, parse_stats_year, period_window, rank_tail_note,
+        year_lookup, Period, YearLookup,
     };
     use super::{reset_plan, ResetPlan};
     use focusflow_core::db::maintenance::MaintenanceReport;
@@ -1278,6 +1310,88 @@ mod tests {
         let (line, code) = cleanup_outcome(30, &nodir);
         assert_eq!(code, 1, "目录读不出来不是「没东西可删」");
         assert!(!line.contains("已删除"), "实得: {line}");
+    }
+
+    /// `--import-legacy` 有错误时不许在 stdout 上说「完成」，也不许说「未发现数据」。
+    ///
+    /// 旧写法先打「旧数据导入完成」再把错误逐条打到 stdout ⇒ 挂计划任务的日志读起来
+    /// 是成功。桌面设置页那条路（`commands::import_outcome`）早已按同一口径修过。
+    #[test]
+    fn import_never_claims_completion_when_any_year_failed() {
+        use focusflow_core::migration::ImportSummary;
+        let failed = ImportSummary {
+            errors: vec!["focusflow_2024.db 打不开".to_string()],
+            ..Default::default()
+        };
+        let (lines, code) = import_report(&failed);
+        assert_eq!(code, 1);
+        let stdout: Vec<&str> = lines
+            .iter()
+            .filter(|(to_stderr, _)| !*to_stderr)
+            .map(|(_, line)| line.as_str())
+            .collect();
+        let stderr: Vec<&str> = lines
+            .iter()
+            .filter(|(to_stderr, _)| *to_stderr)
+            .map(|(_, line)| line.as_str())
+            .collect();
+        assert!(
+            !stdout.iter().any(|l| l.contains("完成")),
+            "有错误时 stdout 还在说完成：{stdout:?}"
+        );
+        assert!(
+            !stdout.iter().any(|l| l.contains("未发现可导入的数据")),
+            "有错误时「未发现」会把失败读成旧目录本来就没数据：{stdout:?}"
+        );
+        assert!(
+            stderr.iter().any(|l| l.contains("旧数据导入未完成")),
+            "失败抬头要走 stderr：{stderr:?}"
+        );
+        assert!(
+            stderr
+                .iter()
+                .any(|l| l.contains("focusflow_2024.db 打不开")),
+            "错误原因要走 stderr：{stderr:?}"
+        );
+    }
+
+    /// 部分成功：已经导进来的那半句照旧留在 stdout，退出码仍非 0。
+    #[test]
+    fn import_keeps_the_successful_half_and_still_fails_the_command() {
+        use focusflow_core::migration::ImportSummary;
+        let partial = ImportSummary {
+            year_dbs: vec![2026],
+            records_by_year: vec![(2026, 3)],
+            errors: vec!["focusflow_2024.db 打不开".to_string()],
+            ..Default::default()
+        };
+        let (lines, code) = import_report(&partial);
+        assert_eq!(code, 1, "有一年失败就不是成功");
+        assert!(
+            lines
+                .iter()
+                .any(|(to_stderr, l)| !*to_stderr && l.contains("2026 年度键鼠: 3 条记录")),
+            "导入成功的那半年不能跟着错误一起消失：{lines:?}"
+        );
+    }
+
+    /// 干净的成功（含「旧目录本来就没数据」）仍是退出码 0，「未发现」照说。
+    #[test]
+    fn import_success_still_reports_no_data_when_there_is_none() {
+        use focusflow_core::migration::ImportSummary;
+        let empty = ImportSummary::default();
+        let (lines, code) = import_report(&empty);
+        assert_eq!(code, 0);
+        assert!(
+            lines
+                .iter()
+                .any(|(to_stderr, l)| !*to_stderr && l.contains("未发现可导入的数据")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|(to_stderr, _)| !*to_stderr),
+            "干净的成功不该写 stderr：{lines:?}"
+        );
     }
 
     /// 七条读命令都必须先过 `check_years_readable`。
