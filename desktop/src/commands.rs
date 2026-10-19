@@ -232,7 +232,8 @@ fn must_reload_hotkey(section: &str, key: &str) -> bool {
 /// 切换暂停记录，返回新的暂停状态，并广播给前端（与托盘切换保持一致）。
 #[tauri::command]
 pub fn toggle_pause(state: State<'_, Arc<AppState>>, app: AppHandle) -> bool {
-    let paused = state.listener.toggle_pause();
+    // 走 AppState 的这一层：暂停时它会把写线程的活跃锚清零（见 `AppState::toggle_pause`）。
+    let paused = state.toggle_pause();
     let _ = app.emit("pause-changed", paused);
     paused
 }
@@ -956,6 +957,40 @@ mod tests {
         assert!(
             body.contains("export_csv") && body.contains("export_html"),
             "切片没盖住导出的两个格式分支，上面三条是假绿"
+        );
+    }
+
+    /// 暂停的每个入口都要走 `AppState::toggle_pause`（它清活跃锚）。
+    ///
+    /// 只调 `listener.toggle_pause()` 的话，恢复后的第一条事件会把暂停那段
+    /// （≤60 秒）算成活跃时间，并记到暂停前那个应用头上 —— 与"暂停=不统计"相反。
+    #[test]
+    fn pause_goes_through_the_app_state_so_the_active_anchor_is_reset() {
+        // 被禁的调用形态在运行时拼出来，而且带上前面的点：本用例与生产代码的
+        // 注释里都有 `listener.toggle_pause()` 这段文字（没有点），直接搜全形会假红。
+        let banned = format!("{}{}", ".listener.", "toggle_pause()");
+        for (name, src) in [
+            ("commands.rs", include_str!("commands.rs")),
+            ("tray.rs", include_str!("tray.rs")),
+        ] {
+            assert!(
+                src.contains("state.toggle_pause()"),
+                "{name} 没走 AppState::toggle_pause"
+            );
+            assert!(
+                !src.contains(&banned),
+                "{name} 还直接调 listener.toggle_pause —— 暂停那段会被算成活跃"
+            );
+        }
+        // `AppState::toggle_pause` 自己也得真的清锚，否则上面两条只是"走对了门"。
+        let src = include_str!("state.rs");
+        let at = src
+            .find("pub fn toggle_pause")
+            .expect("AppState::toggle_pause 找不到了");
+        let body = &src[at..at + src[at..].find("\n    }").expect("方法体切不出来")];
+        assert!(
+            body.contains("reset_active_anchor()"),
+            "AppState::toggle_pause 暂停时没清活跃锚"
         );
     }
 }

@@ -494,6 +494,17 @@ impl DbWriter {
         self.state.today_active.load(Ordering::Relaxed)
     }
 
+    /// 清掉「上一次事件时刻」这把锚：暂停开始时调用。
+    ///
+    /// `record` 用 `timestamp - last_ts`（≤ ACTIVE_GAP_SECS）算活跃时长；暂停期间
+    /// 不记录事件，锚停在暂停前那一刻 —— 恢复后的第一条事件会把**整段暂停**算成
+    /// 活跃（只要 ≤60 秒），并同时记到暂停前那个应用头上。暂停的语义是"这段时间
+    /// 不统计"，所以进入暂停时把这把锚清零。
+    pub fn reset_active_anchor(&self) {
+        let mut agg = self.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+        agg.last_ts = 0;
+    }
+
     /// 采集线程调用：更新「当前前台应用」（None = 无可归属应用）。
     ///
     /// 这里**不累计秒数** —— 秒数由 `record` 在键鼠事件发生时按事件间隔写入，
@@ -2973,5 +2984,29 @@ mod tests {
         // 时钟往回跳时缓存可能是"未来"的日键；它同样不是今天，显示 0，
         // 随后 `record` 会把日键改回当天并置 reanchor。
         assert_eq!(today_cache_for_display(20261021, 20261020, 9, 9), (0, 0));
+    }
+
+    /// 暂停期间的间隔不能算活跃：进入暂停时要清掉"上一次事件时刻"。
+    ///
+    /// `record` 用 `timestamp - last_ts`（≤ ACTIVE_GAP_SECS）算活跃时长；锚停在
+    /// 暂停前那一刻的话，恢复后的第一条事件会把整段暂停算进去（还记到暂停前那个
+    /// 应用头上）。暂停的语义是"这段时间不统计"。
+    #[test]
+    fn resetting_the_active_anchor_does_not_count_the_pause_gap() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_pause_anchor");
+        let w = start_writer(Duration::from_secs(3600));
+        let t0 = 1_700_000_000i64;
+        w.record("A", t0);
+        w.record("B", t0 + 5);
+        assert_eq!(w.today_active_seconds(), 5, "正常间隔计入活跃");
+        w.reset_active_anchor();
+        w.record("C", t0 + 35); // 不重置的话这里会再加 30 秒
+        assert_eq!(
+            w.today_active_seconds(),
+            5,
+            "暂停那段不能算成活跃（锚已清零，恢复后的第一条事件贡献 0）"
+        );
+        w.stop_and_wait();
     }
 }

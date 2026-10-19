@@ -181,7 +181,8 @@ fn show_main(app: &AppHandle) {
 
 fn toggle_pause(app: &AppHandle) {
     if let Some(state) = app.try_state::<Arc<AppState>>() {
-        let paused = state.listener.toggle_pause();
+        // 走 AppState 的这一层：暂停时它会把写线程的活跃锚清零（见 `AppState::toggle_pause`）。
+        let paused = state.toggle_pause();
         // 同步前端暂停状态
         if let Some(win) = app.get_webview_window("main") {
             let _ = win.emit("pause-changed", paused);

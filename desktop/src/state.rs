@@ -287,6 +287,22 @@ impl AppState {
 
         Ok(())
     }
+
+    /// 暂停/继续记录，返回切换后的状态。
+    ///
+    /// 暂停那一刻要把写线程的**活跃锚**清零：恢复后的第一条事件用
+    /// `timestamp - last_ts` 算活跃时长，锚不清就把整段暂停（≤60 秒）算成活跃，
+    /// 还记到暂停前那个应用头上。暂停的语义是"这段时间不统计"。
+    /// 所有入口（设置页 / 托盘）都走这里，别各自调 `listener.toggle_pause`。
+    pub fn toggle_pause(&self) -> bool {
+        let paused = self.listener.toggle_pause();
+        if paused {
+            if let Some(w) = self.db.writer() {
+                w.reset_active_anchor();
+            }
+        }
+        paused
+    }
 }
 
 /// 悬浮窗改为工具窗口（对齐 Python 版 WS_EX_TOOLWINDOW）：
