@@ -97,6 +97,27 @@ impl Drop for PluginManager {
 /// `[plugins] instruction_limit` 没写或写成 0 时用的默认预算（条 Lua 指令 / 每次调用）。
 const DEFAULT_INSTRUCTION_LIMIT: i64 = 10_000_000;
 
+/// 上面那个默认值允许被配置抬到多高；再高就是笔误，按笔误处理（见
+/// [`instruction_budget_from`]）。
+const MAX_INSTRUCTION_LIMIT: i64 = 100_000_000;
+
+/// `instruction_limit` 的取值口径：**笔误不许等于"没有上限"**。
+///
+/// 旧写法把配置值一律夹到 `u32::MAX` 封顶（0 到最大之间全收），于是多敲一个 0（
+/// `instruction_limit = 999999999999`）被夹成 42.9 亿 —— 而 `every_nth_instruction` 的语义是"跑满这么多条
+/// Lua 指令才查一次钩子"，一次 UI 调用里根本到不了第二次检查，
+/// `while true do end` 照旧把主线程冻死；隔壁 `apply_lua_limits` 里那句
+/// 「防 `while true do end` 冻结主线程」的注释就此变成一句空话。
+/// 同一把尺子在 `memory_limit_mb` 那一处是**回落到默认值**（超出按笔误），
+/// 这一处却往上夹到最大 —— 两处不同、而且错的偏偏是危险的那一边。
+fn instruction_budget_from(cfg_value: i64) -> u32 {
+    match cfg_value {
+        v if v <= 0 => DEFAULT_INSTRUCTION_LIMIT as u32,
+        v if v > MAX_INSTRUCTION_LIMIT => DEFAULT_INSTRUCTION_LIMIT as u32,
+        v => v as u32,
+    }
+}
+
 /// 控件表允许的最大嵌套层数（见 `parse_widget`）。
 const MAX_WIDGET_DEPTH: u32 = 32;
 
@@ -224,13 +245,11 @@ impl PluginManager {
     /// `instruction_limit = 0`（有人当"不限制"写）以前被 `.clamp(1)` 变成 1 →
     /// 每条指令都超限、所有插件在第一条就中断，这里一并退回默认值。
     fn arm_instruction_budget(lua: &Lua, cfg: &FocusFlowConfig) {
-        let instr = match cfg
-            .get_int("plugins", "instruction_limit", DEFAULT_INSTRUCTION_LIMIT)
-            .clamp(0, u32::MAX as i64)
-        {
-            0 => DEFAULT_INSTRUCTION_LIMIT as u32,
-            n => n as u32,
-        };
+        let instr = instruction_budget_from(cfg.get_int(
+            "plugins",
+            "instruction_limit",
+            DEFAULT_INSTRUCTION_LIMIT,
+        ));
         lua.set_hook(
             HookTriggers::new().every_nth_instruction(instr),
             |_lua, _dbg| -> mlua::Result<VmState> {
@@ -2214,6 +2233,59 @@ end
             prod.match_indices("missing_plugin_reason(").count(),
             2,
             "应当是「定义一处 + set_enabled 用一处」，多一处少一处都要查"
+        );
+    }
+
+    /// 指令上限的配置值：笔误的大数按默认处理，不许当成"没有上限"。
+    ///
+    /// 这条防的是把"防死循环"这道保险用一次配置就关掉：`every_nth_instruction` 的
+    /// 粒度是"跑满 N 条才查一次钩子"，N 被夹到 42.9 亿时一次 UI 调用永远查不到第二次，
+    /// `while true do end` 照旧冻住主线程 —— 症状与没有这道保险完全一样，
+    /// 而插件页上不会有任何异常。
+    #[test]
+    fn a_typo_in_instruction_limit_does_not_disable_the_guard() {
+        let default = DEFAULT_INSTRUCTION_LIMIT as u32;
+        assert_eq!(instruction_budget_from(0), default, "没写/写 0 用默认");
+        assert_eq!(
+            instruction_budget_from(-1),
+            default,
+            "负数不能变成 0 次检查"
+        );
+        assert_eq!(
+            instruction_budget_from(5_000_000),
+            5_000_000,
+            "合理值原样采纳"
+        );
+        assert_eq!(
+            instruction_budget_from(MAX_INSTRUCTION_LIMIT),
+            MAX_INSTRUCTION_LIMIT as u32,
+            "上边界本身要收（夹的是越界，不是边界）"
+        );
+        assert_eq!(
+            instruction_budget_from(MAX_INSTRUCTION_LIMIT + 1),
+            default,
+            "越界按笔误回落默认，不能往上夹成 u32::MAX"
+        );
+        assert_eq!(instruction_budget_from(999_999_999_999), default);
+        assert_eq!(
+            instruction_budget_from(i64::MAX),
+            default,
+            "天文数字也不能翻上去"
+        );
+
+        // 接线：旧的那句 clamp 不许回来。needle 用拼接 —— 上面那个函数的**注释里
+        // 就写着这串原文**，直接当字面量会先匹配到说明文字，把判据变成自己盯自己。
+        let src = include_str!("manager.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let old_clamp = format!("clamp(0, {} as i64)", "u32::MAX");
+        assert!(
+            !prod.contains(old_clamp.as_str()),
+            "指令上限又回到「越界就抬到最大」的夹法了"
+        );
+        assert_eq!(
+            prod.match_indices("instruction_budget_from(").count(),
+            2,
+            "应当是「定义一处 + arm_instruction_budget 用一处」"
         );
     }
 }
