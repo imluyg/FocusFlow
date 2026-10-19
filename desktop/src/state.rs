@@ -1263,8 +1263,17 @@ fn spawn_stats_worker(
                 let period_val = period.load(Ordering::Relaxed);
                 let forced = refresh_now.swap(false, Ordering::Relaxed);
                 let period_changed = period_val != prev_period;
-                let cur_today = db.writer().map(|w| w.today_count()).unwrap_or(0) as i64;
-                let cur_active = db.writer().map(|w| w.today_active_seconds()).unwrap_or(0) as i64;
+                // 跨过午夜、今天还没按下第一个键时，写线程的今日缓存仍是昨天的
+                // （它在**下一条事件**到来时才清零）。照抄会让悬浮窗/面板把昨天一整天的
+                // 数当成"今日"挂着，直到用户碰一下键鼠；显示侧按日期对一次。
+                let cur_today = db
+                    .writer()
+                    .map(|w| w.today_count_for_display())
+                    .unwrap_or(0) as i64;
+                let cur_active = db
+                    .writer()
+                    .map(|w| w.today_active_for_display())
+                    .unwrap_or(0) as i64;
                 let active = cur_today != prev_today_count;
                 let heavy_elapsed_ms = last_heavy.elapsed().as_millis() as u64;
                 let day_ce = {
@@ -2198,6 +2207,29 @@ mod restart_gate_tests {
                 RestartDecision::DepthExhausted { .. }
             ),
             "到了上限就该停下"
+        );
+    }
+}
+
+#[cfg(test)]
+mod today_display_wiring {
+    /// 接线腿：统计线程必须走"按日对一次"的显示口径。
+    ///
+    /// 纯函数用例盖不到调用点；退回 `w.today_count()` / `today_active_seconds()`
+    /// 会让程序跨过午夜、今天还没输入时把昨天一整天的数显示成"今日"。
+    #[test]
+    fn the_stats_worker_uses_the_day_checked_today_counters() {
+        let src = include_str!("state.rs");
+        let at = src.find("fn spawn_stats_worker").expect("统计线程找不到了");
+        let body = &src[at..at + src[at..].find("\nfn ").expect("统计线程之后没有顶层函数了")];
+        assert!(
+            body.contains("today_count_for_display()")
+                && body.contains("today_active_for_display()"),
+            "统计线程没走按日对一次的显示口径（午夜后会把昨天当成今日）"
+        );
+        assert!(
+            !body.contains("w.today_count()") && !body.contains("w.today_active_seconds()"),
+            "统计线程里还有直接照抄今日缓存的地方"
         );
     }
 }

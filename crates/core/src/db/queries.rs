@@ -289,9 +289,12 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
 }
 
 /// 获取今日按键数（写入器缓存优先，未启动写入器时查库）。
+///
+/// 走 `today_count_for_display`：跨过午夜、今天还没输入时缓存是昨天的，
+/// 这里必须按日期对一次（插件 `today_count` 随时可能先被问到）。
 pub fn get_today_count(writer: Option<&crate::db::DbWriter>) -> i64 {
     if let Some(w) = writer {
-        w.today_count() as i64
+        w.today_count_for_display() as i64
     } else {
         query_today_count()
     }
@@ -3042,6 +3045,23 @@ mod tests {
         assert_eq!(
             check_years_readable().expect("都能打开时不该报错"),
             vec![good]
+        );
+    }
+
+    /// 接线腿：插件的 `today_count` 也走"按日对一次"的显示口径。
+    ///
+    /// 午夜后、今天还没输入时，写线程缓存仍是昨天的 —— 直接照抄会让插件面板把
+    /// 昨天一整天的数当成"今日"。纯函数用例在 writer.rs，这条钉调用点。
+    #[test]
+    fn get_today_count_uses_the_day_checked_cache() {
+        let src = include_str!("queries.rs");
+        let at = src
+            .find("pub fn get_today_count")
+            .expect("get_today_count 找不到了");
+        let body = &src[at..at + src[at..].find("\n}").expect("函数体切不出来")];
+        assert!(
+            body.contains("today_count_for_display()"),
+            "get_today_count 直接照抄了今日缓存（午夜后会把昨天当成今日）"
         );
     }
 }

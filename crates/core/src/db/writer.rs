@@ -21,9 +21,24 @@ use crate::db::queries;
 use crate::paths;
 
 /// 当前日期键（YYYYMMDD），用于跨天判断。
-fn current_day_key() -> u64 {
+///
+/// 公开给显示侧：统计线程要判断"写线程的今日缓存还是不是今天的"。两处各 format
+/// 一份就是两把尺子（一个用本地日期、一个用 CE 天数，跨天时刻也会差一拍）。
+pub fn current_day_key() -> u64 {
     let now = chrono::Local::now();
     now.year() as u64 * 10000 + now.month() as u64 * 100 + now.day() as u64
+}
+
+/// 显示用的「今日」口径：缓存日期 != 今天 ⇒ (0, 0)。
+///
+/// 纯函数只为能钉住跨界那两晚（午夜后还没输入 / 时钟往回跳）：
+/// 见 `DbWriter::today_count_for_display` 的注释。
+fn today_cache_for_display(stored: u64, now: u64, count: u64, active: u64) -> (u64, u64) {
+    if stored == now {
+        (count, active)
+    } else {
+        (0, 0)
+    }
 }
 
 /// 对写线程的控制信号
@@ -440,6 +455,38 @@ impl DbWriter {
     /// 今日计数（内存缓存值）。
     pub fn today_count(&self) -> u64 {
         self.state.today_count.load(Ordering::Relaxed)
+    }
+
+    /// 今日缓存对应的日期键（YYYYMMDD）。显示侧拿它跟 [`current_day_key`] 比：
+    /// 不相等就说明**今天还没有任何输入**，缓存里是昨天的数（清零发生在下一条事件上）。
+    pub fn today_day_key(&self) -> u64 {
+        self.state.today_key.load(Ordering::Relaxed)
+    }
+
+    /// **显示用**的今日计数：缓存日期不是今天 ⇒ 0。
+    ///
+    /// 写线程只在 `record`（下一条事件）上做跨天清零，而读侧（统计线程 500ms 一拍、
+    /// 插件 `today_count`）随时可能在午夜之后先被问到。少了这一步，程序挂过午夜、
+    /// 今天还没输入之前，卡片与悬浮窗会把**昨天一整天的数**当成"今日"显示。
+    pub fn today_count_for_display(&self) -> u64 {
+        today_cache_for_display(
+            self.today_day_key(),
+            current_day_key(),
+            self.today_count(),
+            0,
+        )
+        .0
+    }
+
+    /// 见 [`Self::today_count_for_display`]：同一把尺子，活跃秒数也按日对一次。
+    pub fn today_active_for_display(&self) -> u64 {
+        today_cache_for_display(
+            self.today_day_key(),
+            current_day_key(),
+            0,
+            self.today_active_seconds(),
+        )
+        .1
     }
 
     /// 今日活跃秒数（内存缓存值）。
@@ -2904,5 +2951,27 @@ mod tests {
         assert_eq!(db_count(), base + 2, "回放数据应恰好落库一次");
         assert!(!recovery_path().exists(), "恢复文件回放后应删除");
         w2.stop_and_wait();
+    }
+
+    /// 午夜之后、今天还没输入时，显示侧不能把昨天的缓存当成"今日"。
+    ///
+    /// 写线程只在**下一条事件**上清零（`record`），而统计线程每 500ms 就推一次数、
+    /// 插件的 `today_count` 也随时可能被调用 —— 少了这条，程序挂过午夜后窗口与悬浮窗
+    /// 会一直显示昨天的一整天，直到用户碰一下键鼠。
+    #[test]
+    fn a_stale_today_cache_reads_as_zero_until_the_first_event() {
+        assert_eq!(
+            today_cache_for_display(20261019, 20261020, 20_000, 3600),
+            (0, 0),
+            "跨过午夜、今天还没输入：昨天的一整天不能当成今日"
+        );
+        assert_eq!(
+            today_cache_for_display(20261020, 20261020, 5, 12),
+            (5, 12),
+            "同一天原样交出缓存"
+        );
+        // 时钟往回跳时缓存可能是"未来"的日键；它同样不是今天，显示 0，
+        // 随后 `record` 会把日键改回当天并置 reanchor。
+        assert_eq!(today_cache_for_display(20261021, 20261020, 9, 9), (0, 0));
     }
 }
