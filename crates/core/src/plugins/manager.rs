@@ -1336,6 +1336,15 @@ fn parse_options(t: &mlua::Table) -> mlua::Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// 内嵌控件解析失败：跳过它，但要说清为什么（与顶层那条 `跳过无法解析的控件` 同一口径）。
+///
+/// 顶层三年前踩过一次"静默丢掉"，内嵌那两处（`row.children` 与 `modal_form.widgets`）
+/// 当时没跟着改：插件作者把上一行的 row 塞进新 row、或子控件的 `type` 打错一个字母，
+/// 界面上就是少一块，而插件行不报红、日志里一个字都没有。
+fn skip_nested_widget(where_: &str, e: mlua::Error) {
+    tracing::warn!("跳过无法解析的{where_}内嵌控件: {e}");
+}
+
 /// 解析 Lua 表为声明式控件。
 fn parse_widget(w: &mlua::Table, depth: u32) -> mlua::Result<crate::plugins::Widget> {
     // 深度闸：`modal_form.widgets` 与 `row.children` 是递归下降解析的，而插件表是
@@ -1414,8 +1423,9 @@ fn parse_widget(w: &mlua::Table, depth: u32) -> mlua::Result<crate::plugins::Wid
             let mut widgets = Vec::new();
             if let Ok(ws_val) = w.get::<mlua::Table>("widgets") {
                 for (_, c) in ws_val.pairs::<mlua::Value, mlua::Table>().flatten() {
-                    if let Ok(widget) = parse_widget(&c, depth + 1) {
-                        widgets.push(widget);
+                    match parse_widget(&c, depth + 1) {
+                        Ok(widget) => widgets.push(widget),
+                        Err(e) => skip_nested_widget("弹窗", e),
                     }
                 }
             }
@@ -1436,8 +1446,9 @@ fn parse_widget(w: &mlua::Table, depth: u32) -> mlua::Result<crate::plugins::Wid
             let mut children = Vec::new();
             if let Ok(children_val) = w.get::<mlua::Table>("children") {
                 for (_, c) in children_val.pairs::<mlua::Value, mlua::Table>().flatten() {
-                    if let Ok(widget) = parse_widget(&c, depth + 1) {
-                        children.push(widget);
+                    match parse_widget(&c, depth + 1) {
+                        Ok(widget) => children.push(widget),
+                        Err(e) => skip_nested_widget("行", e),
                     }
                 }
             }
@@ -2040,5 +2051,31 @@ end
             panic!("io 不可用时必须报错");
         };
         assert!(err.to_string().contains("io"));
+    }
+
+    /// 内嵌控件的两个出口都必须走 `skip_nested_widget`，不许退回静默的 `if let Ok(..)`。
+    ///
+    /// 为什么按源码形状钉而不是跑一遍：这里要防的恰恰是"有人在某个内嵌分支上把
+    /// `match` 改回 `if let`" —— 那种改动的症状是界面上少一块控件、日志里一个字都没有，
+    /// 谁都不会报错，也就没有一条行为用例能盯住它（顶层那条 `跳过无法解析的控件` 当年
+    /// 就是这么补上的，内嵌两处漏了半边）。
+    #[test]
+    fn nested_widget_failures_are_never_silent() {
+        let src = include_str!("manager.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        assert_eq!(
+            prod.match_indices("skip_nested_widget(").count(),
+            3,
+            "应当是「定义一处 + row.children 与 modal_form.widgets 各一处」，多一处少一处都要查"
+        );
+        assert!(
+            !prod.contains("if let Ok(widget) = parse_widget("),
+            "内嵌控件又退回静默丢弃了 —— 少一块控件会重新变成看不见的事"
+        );
+        // 顶层那条同样要在：三个出口共用一把尺子，不能只修内嵌
+        assert!(
+            prod.contains("跳过无法解析的控件"),
+            "顶层的失败留痕被摘掉了"
+        );
     }
 }
