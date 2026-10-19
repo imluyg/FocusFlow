@@ -39,6 +39,9 @@ pub struct ChartAgg {
     pub devices: Vec<focusflow_core::db::DeviceStat>,
     /// 周期内设备输入总次数（占比分母，未截断）
     pub device_total: i64,
+    /// 周期内设备台数（未截断）。`devices` 只留前 `RANK_LIMIT` 台，
+    /// 界面上的「设备数」必须读这个、不能读 `devices.len()`。
+    pub device_count: i64,
     pub group: Vec<(String, i64)>,
     /// 鼠标使用总次数（含点击与滚轮）
     pub mouse_total: i64,
@@ -1696,6 +1699,7 @@ fn compute_charts(
         0 => focusflow_core::db::get_device_stats(None, None),
         n => focusflow_core::db::get_device_stats(Some(n), None),
     };
+    let device_count = devices.len() as i64;
     devices.truncate(RANK_LIMIT);
     let mut rank: Vec<(String, i64)> = key_stats.iter().map(|(k, v)| (k.clone(), *v)).collect();
     sort_rank_desc(&mut rank);
@@ -1800,6 +1804,7 @@ fn compute_charts(
         app_total,
         devices,
         device_total,
+        device_count,
         group,
         mouse_total,
         keyboard_total,
@@ -1815,6 +1820,7 @@ mod compute_charts_tests {
     use super::{
         alltime_total_now, apply_display_total, clamp_floating_into_screen, compute_charts,
         sort_rank_desc, total_for_display, ChartAgg, FloatingBounds, FLOATING_MIN_VISIBLE,
+        RANK_LIMIT,
     };
 
     /// 他这台机器的形状：1920x1080 单屏（任务栏 48px，故工作区底边 1032）、卡片 90x46。
@@ -2051,6 +2057,59 @@ mod compute_charts_tests {
         // 30 天窗口：分母 30（零填充稠密），分子 = 落库 150 + 未落库 37
         let agg = compute_charts(0, None, 37);
         assert_eq!(agg.avg, (150 + 37) / 30, "30 天日均的分子含未落库增量");
+
+        focusflow_core::paths::set_app_dir(focusflow_core::paths::test_scratch_app_dir());
+    }
+
+    /// 「设备数」不能用截断后的 `devices.len()`：列表只留前 RANK_LIMIT 台，
+    /// 101 台时界面会把设备数说成 100。台数必须与次数分母一样在后端截断前取。
+    #[test]
+    fn device_count_survives_the_rank_limit_truncation() {
+        use chrono::Datelike;
+        let _serial = crate::app_dir_lock();
+        let _app = focusflow_core::paths::test_app_dir("device_count");
+        let today = chrono::Local::now().date_naive();
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let dk = (today - epoch).num_days();
+        {
+            let path = focusflow_core::paths::year_db_path(today.year());
+            let conn = focusflow_core::db::connection::open_rw(&path).unwrap();
+            focusflow_core::db::connection::ensure_schema(&conn, today.year()).unwrap();
+            for i in 0..(RANK_LIMIT + 1) {
+                // 每台换一个 PID 才算另一台设备（只换实例后缀会被 B14-2 按硬件身份合并）
+                let key = format!(
+                    "HID#VID_{:04X}&PID_{:04X}&MI_00#inst",
+                    0x1000 + i,
+                    0x2000 + i
+                );
+                conn.execute(
+                    "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, 'mouse')",
+                    [key.as_str(), &format!("HID 鼠标 {i}")],
+                )
+                .unwrap();
+                let id = focusflow_core::db::connection::device_id_of(&conn, &key)
+                    .expect("设备刚登记就该有 id");
+                conn.execute(
+                    "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, 1)",
+                    [dk, id],
+                )
+                .unwrap();
+            }
+        }
+        focusflow_core::db::invalidate_years_cache();
+
+        let agg = compute_charts(0, None, 0);
+        assert_eq!(agg.devices.len(), RANK_LIMIT, "列表本身按上限截断");
+        assert_eq!(
+            agg.device_count,
+            (RANK_LIMIT + 1) as i64,
+            "设备台数必须是截断前的总数，否则第 101 台会被界面说成不存在"
+        );
+        assert_eq!(
+            agg.device_total,
+            (RANK_LIMIT + 1) as i64,
+            "次数分母同样未被截断"
+        );
 
         focusflow_core::paths::set_app_dir(focusflow_core::paths::test_scratch_app_dir());
     }

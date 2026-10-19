@@ -153,7 +153,7 @@ export function renderDevices(s) {
     }
   }
   // 指纹含周期、筛选与编辑态：切周期/切筛选/进改名时重建，纯数据推送则跳过
-  const fp = JSON.stringify([s.period, s.device_total, s.devices, deviceFilter.value, deviceEditing]);
+  const fp = JSON.stringify([s.period, s.device_total, s.device_count, s.devices, deviceFilter.value, deviceEditing]);
   if (skipIfUnchanged(box, fp)) return;
   const summary = (extra) =>
     `<div class="rank-summary"><span>统计周期：<b>${periodText(s.period)}</b></span>${extra}</div>`;
@@ -166,6 +166,8 @@ export function renderDevices(s) {
   }
   // 占比分母用后端返回的周期总次数（未截断）；旧版后端无该字段时回退为列表求和
   const total = Number(s.device_total) || list.reduce((acc, d) => acc + d.count, 0);
+  // 设备台数同样用后端未截断值：列表只留前 100 台，拿 list.length 会把 137 台说成 100 台
+  const deviceCount = Number(s.device_count) || list.length;
   const covered = list.reduce((acc, d) => acc + d.count, 0);
   const cover =
     total && covered < total
@@ -173,7 +175,7 @@ export function renderDevices(s) {
       : "";
   const head = summary(
     `<span>输入总次数：<b>${fmt(total)}</b></span>` +
-      `<span>设备数：<b>${list.length}</b> 个</span>${cover}`
+      `<span>设备数：<b>${fmt(deviceCount)}</b> 个</span>${cover}`
   );
   const filterTabs = (data) => `<div class="tabs" id="device-filter" role="tablist" aria-label="设备筛选" style="margin-bottom:10px;">
       <span style="color:var(--muted);font-size:13px;">筛选</span>
