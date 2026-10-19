@@ -328,10 +328,19 @@ fn try_read_map(path: &std::path::Path) -> AliasRead {
         Ok(map) => AliasRead::Good(map),
         Err(e) => {
             tracing::error!("设备别名文件解析失败，原文另存为 .json.bad 后重新开始: {e}");
-            // 留一份原文，名字还有机会救回来；只留第一次，别把目录刷成一堆备份
+            // 留一份原文，名字还有机会救回来；只留一个文件，别把目录刷成一堆备份。
+            // 判据是"内容是否已相同"而不是"文件是否存在"：第二次弄坏文件时旧的 `.bad`
+            // 是上一代内容，跳过写入就等于下一行 set() 整表写回时把这一代原文直接盖掉 ——
+            // 日志却还写着"原文另存为 .json.bad"。
             let bad = path.with_extension("json.bad");
-            if !bad.exists() {
-                let _ = std::fs::write(&bad, &bytes);
+            let already_saved = std::fs::read(&bad).is_ok_and(|old| old == bytes);
+            if !already_saved {
+                if let Err(e) = std::fs::write(&bad, &bytes) {
+                    tracing::error!(
+                        "设备别名坏文件另存失败（{}）：下一次写回会覆盖这份原文: {e}",
+                        bad.display()
+                    );
+                }
             }
             AliasRead::Broken
         }
@@ -1061,11 +1070,27 @@ mod unreadable_file_tests {
         std::fs::write(&path, b"{ not json \xff\xfe ").expect("写坏文件失败");
         invalidate_cache();
         assert!(table().is_empty(), "坏文件不该让读路径 panic");
+        let first_bad = b"{ not json \xff\xfe ".to_vec();
         set("k4", "重新开始").expect("坏文件应当可以自救（既有测试的语义保留）");
-        assert!(
-            path.with_extension("json.bad").is_file(),
+        assert_eq!(
+            std::fs::read(path.with_extension("json.bad")).expect(".json.bad 应已写出"),
+            first_bad,
             "原文要留一份，名字还有机会救回来"
         );
         assert_eq!(table().resolve("k4"), Some("重新开始"));
+
+        // ③ 第二次弄坏文件：留档必须换成这一代原文。
+        // 旧实现"只在文件不存在时写" ⇒ 新一代原文在随后 set() 写回时被直接覆盖，
+        // 而日志还写着"原文另存为 .json.bad"。
+        let second_bad = b"{ broken again \xfe\xff ".to_vec();
+        std::fs::write(&path, &second_bad).expect("写第二次坏文件失败");
+        invalidate_cache();
+        set("k5", "再来一次").expect("第二次坏文件同样该能自救");
+        assert_eq!(
+            std::fs::read(path.with_extension("json.bad")).expect(".json.bad 应还在"),
+            second_bad,
+            "第二次弄坏文件时，留档的必须是这一代原文，不是上一代"
+        );
+        assert_eq!(table().resolve("k5"), Some("再来一次"));
     }
 }
