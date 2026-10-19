@@ -70,6 +70,10 @@ function get_view()
     }
     if state == "running" then
         widgets[#widgets + 1] = { type = "label", text = "⏳ 正在后台读取 Edge 历史（Edge 运行时会先复制一份快照）…" }
+    elseif state == "write_fail" then
+        -- 与 fail 分开：这一步 Edge 已经读到了，卡住的是 FocusFlow 自己的缓存库。
+        -- 让用户去关 Edge 是错的建议——重试一百次也不会好，要先让 data/ 目录可写。
+        widgets[#widgets + 1] = { type = "label", text = "⚠ Edge 读到了，但本程序的统计目录写不进去（同步盘占位、只读移动盘或被杀软锁定），请让该目录可写后再刷新" }
     elseif state == "fail" then
         widgets[#widgets + 1] = { type = "label", text = "⚠ 读取失败：Edge 历史库被占用或不可读（Edge 后台进程可能仍在运行），请稍后重试" }
     end

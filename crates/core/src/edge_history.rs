@@ -381,6 +381,22 @@ const ST_IDLE: u8 = 0;
 const ST_RUNNING: u8 = 1;
 const ST_OK: u8 = 2;
 const ST_FAIL: u8 = 3;
+/// 读到了 Edge 的数，但**没写进自己的本地缓存**。
+///
+/// 与 `ST_FAIL` 分开是因为给用户的那句话完全不同：读不到是"Edge 还开着、去关掉再试"，
+/// 写不进是"FocusFlow 自己的 `data/` 目录不让写"—— 后者重试一百次也没用，
+/// 得先让那个目录可写（同步盘、杀软、只读移动盘）。过去两者折成一个 `fail`，
+/// 挂件照着后一句提示，用户就一直在关 Edge。
+const ST_WRITE_FAIL: u8 = 4;
+
+/// 一次刷新失败在哪一步。
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum RefreshFail {
+    /// Edge 的历史库读不出来（被独占、快照副本也失败）
+    Read,
+    /// Edge 读到了，本地缓存写不进去
+    Write,
+}
 
 /// RUNNING 超过这个时长就认定为卡死。
 ///
@@ -439,8 +455,8 @@ pub fn spawn_update_today() -> bool {
     let spawned = std::thread::Builder::new()
         .name("edge-refresh".into())
         .spawn(move || {
-            let ok = update_today_edge_history().0;
-            finish_round(gen, ok);
+            let (res, _today, _total) = update_today_edge_history();
+            finish_round(gen, res);
         });
     match spawned {
         Ok(_) => true,
@@ -476,12 +492,16 @@ fn claim_round(now: std::time::Instant) -> Option<u64> {
 }
 
 /// 收尾：只有「本轮仍是当前这一轮」时才允许写回结果。
-fn finish_round(gen: u64, ok: bool) {
+fn finish_round(gen: u64, res: Result<(), RefreshFail>) {
     let mut slot = lock_slot();
     if slot.gen != gen {
         return;
     }
-    slot.state = if ok { ST_OK } else { ST_FAIL };
+    slot.state = match res {
+        Ok(()) => ST_OK,
+        Err(RefreshFail::Read) => ST_FAIL,
+        Err(RefreshFail::Write) => ST_WRITE_FAIL,
+    };
     slot.started_at = None;
 }
 
@@ -495,8 +515,11 @@ fn release_round(gen: u64) {
     slot.started_at = None;
 }
 
-/// 一次后台刷新的状态：`idle` / `running` / `ok` / `fail`。
+/// 一次后台刷新的状态：`idle` / `running` / `ok` / `fail` / `write_fail`。
 ///
+/// `fail` 与 `write_fail` 是两件事（读不到 Edge vs 写不进自己的缓存），挂件要分开说；
+/// 第三方脚本把两者都当"不是 ok"处理仍然正确，所以这是**加值**、没有改旧值的含义。
+//////
 /// 读的时候顺手自愈：光靠 `spawn_update_today` 里的接管救不了刷新按钮 ——
 /// 线程卡死后插件会一直显示「正在后台读取」，用户连再点一次的入口都没有。
 pub fn refresh_state() -> &'static str {
@@ -520,6 +543,7 @@ fn refresh_state_at(now: std::time::Instant) -> &'static str {
         ST_RUNNING => "running",
         ST_OK => "ok",
         ST_FAIL => "fail",
+        ST_WRITE_FAIL => "write_fail",
         _ => "idle",
     }
 }
@@ -527,16 +551,20 @@ fn refresh_state_at(now: std::time::Instant) -> &'static str {
 /// 补档往回看多少天（与趋势表的口径一致）。
 const BACKFILL_DAYS: i64 = 30;
 
-/// 更新今天并返回 (是否成功, 今日数, 总数)。
-/// 读侧任一步失败（Edge 库被锁/不可读）返回 `(false, 0, 0)`；读到数但**没写进本地
-/// 缓存**也返回 `false`（数值仍交回，只是别当成"已落库"）。调用方据此提示用户，
-/// 避免把失败静默当成"0 条记录"。同一次快照顺手把近 30 天里不可信的历史计数重查一遍。
+/// 更新今天并返回 (结果, 今日数, 总数)。
+///
+/// 两种失败要分得开（见 [`RefreshFail`]）：读侧任一步失败（Edge 库被锁/不可读）是
+/// `Err(Read)` 且两个数都是 0；读到数但**没写进本地缓存**是 `Err(Write)`，数值照样交回
+/// —— 把后者也说成"读失败"会让用户去关 Edge，而他的 `data/` 目录才是问题所在。
+/// 调用方据此提示用户，避免把失败静默当成"0 条记录"。同一次快照顺手把近 30 天里
+/// 不可信的历史计数重查一遍。
 ///
 /// 调用方应当用 [`spawn_update_today`] 而不是直接调本函数（本函数会阻塞调用线程）。
-pub fn update_today_edge_history() -> (bool, i64, i64) {
+pub fn update_today_edge_history() -> (Result<(), RefreshFail>, i64, i64) {
     let today = Local::now().date_naive();
     let Some((chrome_start, chrome_end)) = chrome_day_range(today) else {
-        return (false, 0, 0);
+        // 换算不出当天的时间区间 = 这一轮根本没去读 ⇒ 归到读失败那一类（不是写不进）
+        return (Err(RefreshFail::Read), 0, 0);
     };
     // 要补哪些天必须在开快照**之前**定好：这样今日数、总数和整批补档共用同一轮
     // 快照，被锁时也只兜底复制一份副本，且所有数字取自同一时点。
@@ -586,7 +614,7 @@ pub fn update_today_edge_history() -> (bool, i64, i64) {
                 }
             }
             match persisted {
-                Ok(()) => (true, today_count, total),
+                Ok(()) => (Ok(()), today_count, total),
                 Err(e) => {
                     // 面板读的是本地库（`get_edge_history_saved_*`）：今日数没落库时
                     // 它显示 "—"，而状态位还报 ok —— "刷新成功、数据为空"于是与
@@ -594,11 +622,11 @@ pub fn update_today_edge_history() -> (bool, i64, i64) {
                     tracing::error!(
                         "Edge 计数没写进本地缓存（今日 {today_count}／总数 {total} 只在内存里）: {e}"
                     );
-                    (false, today_count, total)
+                    (Err(RefreshFail::Write), today_count, total)
                 }
             }
         }
-        _ => (false, 0, 0),
+        _ => (Err(RefreshFail::Read), 0, 0),
     }
 }
 
@@ -872,10 +900,10 @@ mod tests {
         let _fx = write_edge_fixture("backfill", &rows);
 
         SNAPSHOT_ROUNDS.store(0, std::sync::atomic::Ordering::Relaxed);
-        let (ok, today_count, total) = update_today_edge_history();
+        let (res, today_count, total) = update_today_edge_history();
         let rounds = SNAPSHOT_ROUNDS.load(std::sync::atomic::Ordering::Relaxed);
 
-        assert!(ok, "夹具可读，刷新不该失败");
+        assert!(res.is_ok(), "夹具可读，刷新不该失败");
         assert_eq!((today_count, total), (2, 4));
         assert_eq!(rounds, 1, "今日数+总数+29 天补档必须共用一轮快照");
         // 同步补齐：函数返回时就该已经落库，不是"回头某个时刻出现"
@@ -887,7 +915,7 @@ mod tests {
             "这一行是刚刚写下的（`updated_at` 已在该日之后）→ 已盖完，不该重查"
         );
         // 再刷新一次：没有缺失日了就完全不必再动补档查询
-        assert!(update_today_edge_history().0);
+        assert!(update_today_edge_history().0.is_ok());
         assert_eq!(
             SNAPSHOT_ROUNDS.load(std::sync::atomic::Ordering::Relaxed),
             2,
@@ -913,24 +941,33 @@ mod tests {
         let today = Local::now().date_naive();
         let _fx = write_edge_fixture("unwritable", &[chrome_start_of(today)]);
 
-        let (ok, today_count, total) = update_today_edge_history();
+        let (res, today_count, total) = update_today_edge_history();
         assert_eq!(
             (today_count, total),
             (1, 1),
             "Edge 库可读，数值该照原样交回调用方（别降级成 0）"
         );
-        assert!(!ok, "一条也没落库，本轮不该算成功");
+        assert_eq!(
+            res,
+            Err(RefreshFail::Write),
+            "Edge 读到了、一条也没落库：本轮该算「写不进」，不是「读不到」——\
+             挂件照后一句提示就会让用户去关 Edge"
+        );
         assert_eq!(
             get_edge_history_saved_today(),
             None,
             "落库失败后不该有缓存值可供面板显示"
         );
 
-        // 界面读的是状态位：那一轮该落到 fail，而不是 ok
+        // 界面读的是状态位：那一轮既不该留在 ok，也不该被说成"Edge 读不到"
         reset_slot();
         let gen = claim_round(std::time::Instant::now()).expect("空槽位该能占用");
-        finish_round(gen, ok);
-        assert_eq!(refresh_state(), "fail", "没落库的那一轮不该把界面留在 ok");
+        finish_round(gen, res);
+        assert_eq!(
+            refresh_state(),
+            "write_fail",
+            "没落库的那一轮不该把界面留在 ok，也不该混进「Edge 被占用」"
+        );
     }
 
     /// 直接按指定 `updated_at` 写一行本地缓存。
@@ -985,14 +1022,14 @@ mod tests {
         // 前天：昨天凌晨写的 → 已经盖完（真实值只有 1，重查就会把 42 打回去）
         seed_saved_row(d2, 42, y_end + 3_600);
 
-        let (ok, today_count, total) = update_today_edge_history();
-        assert!(ok, "夹具可读，刷新不该失败");
+        let (res, today_count, total) = update_today_edge_history();
+        assert!(res.is_ok(), "夹具可读，刷新不该失败");
         assert_eq!((today_count, total), (1, 5));
         assert_eq!(saved_count_on(y), Some(3), "深夜那条必须被捞回来");
         assert_eq!(saved_count_on(d2), Some(42), "已盖完的日子不该被重查改写");
 
         // 重查过一次就算盖完了：下一轮不该再回头动它
-        assert!(update_today_edge_history().0);
+        assert!(update_today_edge_history().0.is_ok());
         assert_eq!(saved_count_on(y), Some(3), "每个历史日只该被重查一次");
         assert_eq!(saved_count_on(d2), Some(42));
     }
@@ -1164,15 +1201,76 @@ mod tests {
         let live = claim_round(base + RUNNING_STALE + std::time::Duration::from_millis(1))
             .expect("接管应成功");
         assert_ne!(zombie, live);
-        finish_round(zombie, true);
+        finish_round(zombie, Ok(()));
         assert_eq!(
             refresh_state_at(base + RUNNING_STALE + std::time::Duration::from_secs(1)),
             "running",
             "僵尸线程回来不该把新一轮标成已完成"
         );
-        finish_round(live, true);
+        finish_round(live, Ok(()));
         assert_eq!(refresh_state_at(base + RUNNING_STALE * 2), "ok");
         reset_slot();
+    }
+
+    /// 两种失败在状态通道上必须是两个值。
+    ///
+    /// 挂件那句提示完全按这个串分：折成一个 `fail` 时，"Edge 读到了但本程序的
+    /// `data/` 写不进"会被说成"Edge 被占用，请稍后重试" —— 用户于是反复去关 Edge，
+    /// 而真正要处理的是目录权限/同步盘占位。Rust 侧日志本来就分得开，
+    /// 丢在 API 边界上等于没分。
+    #[test]
+    fn the_two_edge_failures_are_told_apart_in_the_state_channel() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let base = std::time::Instant::now();
+
+        let gen = claim_round(base).expect("这一轮该被接下");
+        finish_round(gen, Err(RefreshFail::Read));
+        assert_eq!(
+            refresh_state_at(base),
+            "fail",
+            "Edge 读不到才是那句「请稍后重试」"
+        );
+        reset_slot();
+
+        let gen = claim_round(base).expect("这一轮该被接下");
+        finish_round(gen, Err(RefreshFail::Write));
+        assert_eq!(
+            refresh_state_at(base),
+            "write_fail",
+            "读到了但没落库得是另一个值，否则挂件给的建议是错的"
+        );
+        reset_slot();
+    }
+
+    /// 跨语言契约：内置挂件对每个要提示的状态都得有句话。
+    ///
+    /// 少一条不报错，症状只是"面板上什么都不说" —— 那正是这一族缺陷的形状。
+    /// 顺带钉住 `write_fail` 那句话不许叫用户去关 Edge。
+    #[test]
+    fn the_bundled_widget_has_a_line_for_each_failing_state() {
+        let lua = include_str!("../plugins/edge_history_plugin.lua");
+        for state in ["running", "fail", "write_fail"] {
+            let needle = format!("state == \"{state}\"");
+            assert!(
+                lua.contains(&needle),
+                "挂件没有处理 `edge_refresh_state` 交出的 {state}：{needle}"
+            );
+        }
+        let at = lua
+            .find("state == \"write_fail\"")
+            .expect("上一轮已经确认有了");
+        // 只取这一支（到下一个 `elseif` 之前）：下一支 `fail` 的提示里正好有
+        // "Edge 后台进程" 那句，整段去比会把两支混成一支
+        let rest = &lua[at..];
+        let chunk = &rest[..rest.find("elseif").unwrap_or(rest.len())];
+        assert!(
+            !chunk.contains("Edge 后台进程"),
+            "写不进自己缓存那一支不该叫用户去关 Edge：{chunk}"
+        );
+        assert!(
+            chunk.contains("写不进去"),
+            "要把问题指到本程序的统计目录上：{chunk}"
+        );
     }
 
     /// 「今日记录数」按日期查表。
