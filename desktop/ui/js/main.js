@@ -4,7 +4,7 @@ import { invoke, listen } from "./tauri.js";
 import { $, toast } from "./utils.js";
 import { appState, analyticsTab } from "./state.js";
 import { renderPlugins, openPlugin, closePlugin, renderPluginDetail, togglePlugin, pluginBtn, pluginBtnSel, pluginField, pluginFieldStay, pluginSelectRow, pluginSelectAll, modalOpen, modalCancel, modalSubmit, modalAction } from "./plugins.js";
-import { applyLive, applyCharts, renderRank, renderApps, renderDevices, deviceRename, deviceRenameSave, deviceRenameClear, deviceRenameCancel, openDeviceDetail, closeDeviceDetail, deviceDetailSetPeriod, renderAnalytics, renderTrendChart, renderSettings, doImport, doExport, doVacuum, doBackup, doWeeklyReport, doChangeDataDir, doSnip, doSnipAnnotate, closeAllPins } from "./views.js";
+import { applyLive, applyCharts, renderRank, renderApps, renderDevices, deviceRename, deviceRenameSave, deviceRenameClear, deviceRenameCancel, openDeviceDetail, closeDeviceDetail, deviceDetailSetPeriod, renderAnalytics, renderTrendChart, renderSettings, doImport, doExport, doVacuum, doBackup, doWeeklyReport, doChangeDataDir, doSnip, doSnipAnnotate, closeAllPins, showPauseState, showFloatingState } from "./views.js";
 
 export function switchView(view) {
   appState.currentView = view;
@@ -200,15 +200,13 @@ document.querySelectorAll("#analytics-tabs .tab").forEach((b) => {
     });
     // 暂停状态在托盘/命令任意入口改变时即时同步设置页勾选
     await listen("pause-changed", (e) => {
-      const cb = $("set-paused");
-      if (cb) cb.checked = !!e.payload;
+      showPauseState(e.payload);
     });
     // 悬浮窗可见性在托盘菜单 / 「立即显示·隐藏」按钮 / 设置页勾选任一入口改变时，
     // 同步那一页的勾选。少了这一步，从托盘切了悬浮窗之后设置页的勾还是旧的
     // （现在配置会被这些入口一并写回，所以勾与现实不一致是看得见的矛盾）。
     await listen("floating-changed", (e) => {
-      const cb = $("set-floating");
-      if (cb) cb.checked = !!e.payload;
+      showFloatingState(e.payload);
     });
     // 截图的结果只在 Rust 侧才知道（存盘与剪贴板是两个独立成败），由 snip.rs 广播一句话。
     // 用 toast 而不是 setMsg：按热键截图时用户多半不在设置页。

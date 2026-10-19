@@ -740,6 +740,30 @@ export function renderAnalytics(s) {
 
 const settingsUI = { cat: "general", q: "", data: null };
 
+// 设置写成功后把同一份值记进设置页快照。
+//
+// 切换分类走的是 `paintSettingsBody()`，它只拿 `settingsUI.data`（上一次
+// `get_settings` 的结果）重画。不记的话，改完目标/暂停/备份开关再切分类，
+// 控件会显示回旧值 —— 最坏的是「定时备份明明关了却显示勾着」：
+// `onBackupIntervalChange` 读这个勾，于是改间隔会把备份重新打开。
+function rememberSetting(patch) {
+  if (settingsUI.data) Object.assign(settingsUI.data, patch);
+}
+
+// 托盘/命令入口改了暂停或悬浮窗可见性时，除了同步控件，还要同步快照：
+// 否则下一次切分类会拿旧值把勾选画回去（与 onPauseChange / onFloatingChange 同一条）。
+export function showPauseState(paused) {
+  const cb = $("set-paused");
+  if (cb) cb.checked = !!paused;
+  rememberSetting({ paused: !!paused });
+}
+
+export function showFloatingState(visible) {
+  const cb = $("set-floating");
+  if (cb) cb.checked = !!visible;
+  rememberSetting({ floating_enabled: !!visible });
+}
+
 const BACKUP_HOURS = [6, 12, 24, 48, 168];
 // 关闭状态（0）下下拉显示的那一档：与 `commands.rs` 的
 // `get_int("database", "online_backup_interval_hours", 24)` 同一个默认值。
@@ -766,6 +790,7 @@ function backupHourSelect(cur) {
 async function onDarkChange(e) {
   const dark = e.target.checked;
   await invoke("set_config", { section: "gui", key: "theme", value: dark ? "dark" : "light" });
+  rememberSetting({ theme: dark ? "dark" : "light" });
   document.body.classList.toggle("dark", dark);
   // 图表配色取自 CSS 变量：切换主题后立即重绘当前统计视图。
   // 不能只重绘 trend——空闲时后端可能长时间不推送 stats-charts，
@@ -781,6 +806,7 @@ async function onPauseChange(e) {
   // 同步到实际暂停状态
   const target = e.target.checked;
   if ((await invoke("is_paused")) !== target) await invoke("toggle_pause");
+  rememberSetting({ paused: target });
 }
 
 async function onHotkeyEnabledChange(e) {
@@ -839,6 +865,7 @@ export async function closeAllPins() {
 
 async function onFloatingChange(e) {
   await invoke("set_config", { section: "floating", key: "enabled", value: e.target.checked ? "true" : "false" });
+  rememberSetting({ floating_enabled: e.target.checked });
 }
 
 // 与 core 的 `stats::effective_goal` 同一把尺子：0/负数不是「没配」，而是按 1 算
@@ -867,6 +894,7 @@ async function onGoalChange(e) {  // 空串/非正整数一律保持原值，不
   lastGoalKeys = v;
   e.target.value = String(v);
   await invoke("set_config", { section: "goal", key: "daily_keys", value: String(v) });
+  rememberSetting({ goal_daily_keys: v });
   refreshGoalStrip(true);
 }
 
@@ -877,6 +905,7 @@ async function onBackupExitChange(e) {
     key: "backup_on_exit",
     value: e.target.checked ? "true" : "false",
   });
+  rememberSetting({ backup_on_exit: e.target.checked });
 }
 
 // 定时备份：勾选写入所选小时数，取消写 0（= 关闭）。定时线程每分钟重读配置，
@@ -894,6 +923,7 @@ async function onBackupOnlineChange(e) {
     key: "online_backup_interval_hours",
     value: String(hours),
   });
+  rememberSetting({ backup_online_hours: hours });
 }
 
 async function onBackupIntervalChange(e) {
@@ -903,6 +933,7 @@ async function onBackupIntervalChange(e) {
     key: "online_backup_interval_hours",
     value: e.target.value,
   });
+  rememberSetting({ backup_online_hours: Number(e.target.value) });
 }
 
 const SETTINGS_CATS = [
