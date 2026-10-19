@@ -86,17 +86,32 @@ function chartKey(W, H, title, payloadSig) {
   return `${W}x${H}|${title}|${document.body.className}|${payloadSig}`;
 }
 
+// 纵轴顶端刻度：把数据最大值进到**能被 4 等份整除**的数，于是一共 5 条等距网格线
+// 各自标出的都是整数、且正好是那条线代表的值。
+//
+// 原来这里直接拿数据最大值当顶格，标签写 `Math.round(max*i/4)`：网格线像素等距、
+// 数字却不等你距。max=7（趋势图上一天 7 次很常见）标出来是 `0,2,4,5,7` —— 步长
+// 2/2/1/2；max=1（空闲日、或某年库读不出被折成 0）标出来是 `0,0,1,1,1`。
+// 于是"对着网格线读个大概"每次最多偏一个整单位，而柱子/折线的高度本身是按真实
+// max 定的、跟这套错标签并不对应（两处得同时按同一个分母才谈得上"读数"）。
+function axisTop(max) {
+  return Math.max(4, Math.ceil(Math.max(1, max) / 4) * 4);
+}
+
 // 坐标轴 + 网格 + 标题骨架（折线/柱状共用）。W/H 为实测像素，1:1 绘制。
+// 返回值里的 `top` 必须被调用方拿去定标：刻度与图形用的是同一把尺子，
+// 只改标签不改定标会让数字与柱高对不上（比原来的错法更难查）。
 function chartSkeleton(W, H, padL, padR, padT, padB, title, max, colors) {
   const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H });
   svg.appendChild(el("text", { x: W / 2, y: 16, "text-anchor": "middle", "font-size": 15, fill: colors.fg }, title));
   const plotW = W - padL - padR, plotH = H - padT - padB;
+  const top = axisTop(max);
   for (let i = 0; i <= 4; i++) {
     const y = padT + plotH - (plotH * i) / 4;
     svg.appendChild(el("line", { x1: padL, y1: y, x2: W - padR, y2: y, stroke: colors.grid, "stroke-width": 1 }));
-    svg.appendChild(el("text", { x: padL - 6, y: y + 4, "text-anchor": "end", "font-size": 10, fill: colors.muted }, String(Math.round((max * i) / 4))));
+    svg.appendChild(el("text", { x: padL - 6, y: y + 4, "text-anchor": "end", "font-size": 10, fill: colors.muted }, String((top * i) / 4)));
   }
-  return { svg, plotW, plotH };
+  return { svg, plotW, plotH, top };
 }
 
 // 折线图：data = [{date, value}]
@@ -120,7 +135,7 @@ export function lineChart(container, title, data) {
     const padL = 50, padR = 16, padT = 30, padB = 30;
     const colors = chartColors();
     const max = Math.max(1, ...data.map((d) => d.value));
-    const { svg, plotW, plotH } = chartSkeleton(W, H, padL, padR, padT, padB, title, max, colors);
+    const { svg, plotW, plotH, top } = chartSkeleton(W, H, padL, padR, padT, padB, title, max, colors);
 
     const n = data.length;
     if (n < 2) {
@@ -132,7 +147,7 @@ export function lineChart(container, title, data) {
     const stepX = plotW / (n - 1);
     const pts = data.map((d, i) => {
       const x = padL + stepX * i;
-      const y = padT + plotH - (plotH * d.value) / max;
+      const y = padT + plotH - (plotH * d.value) / top;
       return { x, y };
     });
 
@@ -201,7 +216,7 @@ export function barChart(container, title, values, labels) {
     const padL = 50, padR = 16, padT = 30, padB = 30;
     const colors = chartColors();
     const max = Math.max(1, ...values);
-    const { svg, plotW, plotH } = chartSkeleton(W, H, padL, padR, padT, padB, title, max, colors);
+    const { svg, plotW, plotH, top } = chartSkeleton(W, H, padL, padR, padT, padB, title, max, colors);
 
     const count = values.length;
     const slot = count ? plotW / count : plotW;
@@ -210,7 +225,7 @@ export function barChart(container, title, values, labels) {
 
     values.forEach((v, i) => {
       const x = padL + i * slot + gap / 2;
-      const barH = (plotH * v) / max;
+      const barH = (plotH * v) / top;
       const y = padT + plotH - barH;
       const rect = el("rect", { x, y, width: barW, height: barH, rx: 2, fill: colors.accent, "fill-opacity": 0.85 });
       // 不可见的全高命中区：悬停整列都能出 tooltip（细柱更好指）
