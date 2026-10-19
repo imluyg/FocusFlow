@@ -48,10 +48,24 @@ pub fn last_error(key: &str) -> Option<String> {
         .cloned()
 }
 
+/// 按下热键时该"藏"还是该"显示"：**最小化也算没在眼前**。
+///
+/// `is_visible()` 对最小化的窗口仍返回 true（Windows 的 WS_VISIBLE 还在，只是窗口
+/// 被最小化了）。只看它会把"最小化着按热键"当成"已经显示"⇒ 藏到托盘，用户要按两次
+/// 才回到面板。显示路径里本来就会 `unminimize()`（`show_main_window_impl`），所以
+/// 这一支走 show 是对的。
+fn hotkey_should_hide(visible: bool, minimized: bool) -> bool {
+    visible && !minimized
+}
+
 /// 显示/隐藏主窗口的回调处理。
 fn toggle_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        if win.is_visible().unwrap_or(false) {
+        let should_hide = hotkey_should_hide(
+            win.is_visible().unwrap_or(false),
+            win.is_minimized().unwrap_or(false),
+        );
+        if should_hide {
             crate::state::hide_main_window(app);
         } else {
             crate::state::show_main_window(app);
@@ -465,5 +479,29 @@ mod tests {
         );
         set_last_error("snip", None);
         set_last_error("toggle_window", None);
+    }
+
+    /// 最小化也算"没在眼前"：`is_visible()` 对最小化的窗口仍返回 true，
+    /// 只看它会让显示/隐藏热键把面板藏到托盘（用户得按两次才回来）。
+    #[test]
+    fn a_minimized_window_is_shown_not_hidden_by_the_toggle_hotkey() {
+        assert!(hotkey_should_hide(true, false), "正常显示着 ⇒ 藏起来");
+        assert!(
+            !hotkey_should_hide(true, true),
+            "最小化着 ⇒ 该显示（显示路径会 unminimize），而不是再藏一层"
+        );
+        assert!(!hotkey_should_hide(false, false), "藏着 ⇒ 显示");
+        assert!(!hotkey_should_hide(false, true), "藏着且最小化 ⇒ 显示");
+
+        // 接线腿：判据在调用点必须拿到最小化状态；只看 is_visible 就退回旧行为。
+        let src = include_str!("hotkey.rs");
+        let head = src
+            .find("fn toggle_main_window")
+            .expect("显示/隐藏主窗口的回调找不到了");
+        let body = &src[head..head + src[head..].find("\n}").expect("函数体切不出来")];
+        assert!(
+            body.contains("is_minimized()"),
+            "调用点没看最小化状态（只凭 is_visible 就会把最小化的窗口藏起来）"
+        );
     }
 }
