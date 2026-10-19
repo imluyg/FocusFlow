@@ -150,6 +150,7 @@ pub fn start_sampler(writer: Arc<DbWriter>) -> crate::startup::CheckResult {
             let mut exclude = exclude;
             let mut cached_raw = String::new();
             let mut was_enabled = enabled;
+            let mut last_hwnd: isize = 0;
             if !was_enabled {
                 writer.set_current_app(None);
             }
@@ -188,11 +189,20 @@ pub fn start_sampler(writer: Arc<DbWriter>) -> crate::startup::CheckResult {
                     writer.set_current_app(None);
                     continue;
                 }
-                match collect::foreground_app_name() {
-                    Some(n) if is_recordable(&n, &exclude) => writer.set_current_app(Some(&n)),
-                    // exclude 命中：按其语义「完全不记录」，
-                    // 同时清空归属，避免这段时长被记到上一个应用头上
-                    Some(_) => writer.set_current_app(None),
+                match collect::foreground_app(last_hwnd) {
+                    Some((hwnd, n)) => {
+                        // 窗口换了就重建一次进程快照：PID 会被系统回收复用，缓存里同一个
+                        // PID 可能已经是另一个进程，继续用旧名字会把前台时长记到刚关掉的
+                        // 应用上（最多错挂到下一次 30 秒刷新）。只在切窗时多付一次枚举。
+                        last_hwnd = hwnd;
+                        if is_recordable(&n, &exclude) {
+                            writer.set_current_app(Some(&n));
+                        } else {
+                            // exclude 命中：按其语义「完全不记录」，
+                            // 同时清空归属，避免这段时长被记到上一个应用头上
+                            writer.set_current_app(None);
+                        }
+                    }
                     // 采集失败（锁屏、窗口切换瞬间、进程名暂未解析）：同样清空归属。
                     // 宁可少记也不张冠李戴，差额会体现为「应用总时长 < 活跃时长」。
                     None => writer.set_current_app(None),
@@ -225,9 +235,12 @@ mod collect {
     use super::{apply_snapshot, SnapshotCache, SNAPSHOT_FORCE_MIN_SECS, SNAPSHOT_REFRESH_SECS};
     use std::time::Duration;
 
-    /// 前台窗口所属进程的 exe 文件名（不读窗口标题）。
+    /// 前台窗口所属进程的 exe 文件名（不读窗口标题），连同窗口句柄一起交回。
+    ///
+    /// `last_hwnd` 是上一次成功解析时的窗口句柄：变了就强制重建一次进程快照，
+    /// 否则 PID 复用后缓存里的旧名字会一直用到下一次定期刷新。
     #[cfg(windows)]
-    pub fn foreground_app_name() -> Option<String> {
+    pub fn foreground_app(last_hwnd: isize) -> Option<(isize, String)> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
             GetForegroundWindow, GetWindowThreadProcessId,
@@ -242,7 +255,9 @@ mod collect {
             if pid == 0 {
                 return None;
             }
-            pid_to_name(pid)
+            let hwnd_id = hwnd.0 as isize;
+            let name = pid_to_name(pid, hwnd_id != last_hwnd)?;
+            Some((hwnd_id, name))
         }
     }
 
@@ -252,39 +267,61 @@ mod collect {
     /// 常常是刚启动的（新开的窗口、UWP 的 ApplicationFrameHost 子进程），
     /// 只靠定期刷新会让这些应用在前 30 秒里查不到名字、整段不归属。
     #[cfg(windows)]
-    fn pid_to_name(pid: u32) -> Option<String> {
+    fn pid_to_name(pid: u32, force_refresh: bool) -> Option<String> {
         use std::cell::RefCell;
         thread_local! {
             static SNAPSHOT: RefCell<SnapshotCache> = RefCell::new(SnapshotCache::default());
         }
         SNAPSHOT.with(|slot| {
             let mut cache = slot.borrow_mut();
-            let stale = cache
-                .at
-                .map(|t| t.elapsed() >= Duration::from_secs(SNAPSHOT_REFRESH_SECS))
-                .unwrap_or(true);
-            if stale {
-                cache.at = Some(std::time::Instant::now());
-                let first_failure = apply_snapshot(&mut cache, take_process_snapshot());
-                warn_once(&cache, first_failure);
-            }
-            if let Some(name) = cache.names.get(&pid) {
-                return Some(name.clone());
-            }
-            // 未命中 → 立即重建再查一次；带最小间隔节流，
-            // 避免「PID 查不到」持续存在时每次都做一遍全进程遍历。
-            let can_force = cache
-                .at
-                .map(|t| t.elapsed() >= Duration::from_secs(SNAPSHOT_FORCE_MIN_SECS))
-                .unwrap_or(true);
-            if !can_force {
-                return None;
-            }
-            cache.at = Some(std::time::Instant::now());
-            let first_failure = apply_snapshot(&mut cache, take_process_snapshot());
-            warn_once(&cache, first_failure);
-            cache.names.get(&pid).cloned()
+            pid_to_name_with(
+                &mut cache,
+                pid,
+                force_refresh,
+                std::time::Instant::now(),
+                take_process_snapshot,
+            )
         })
+    }
+
+    /// 解析决策本体（快照来源可注入，便于钉住"窗口变了必须重建"这条）。
+    #[cfg(windows)]
+    pub(super) fn pid_to_name_with<F>(
+        cache: &mut SnapshotCache,
+        pid: u32,
+        force_refresh: bool,
+        now: std::time::Instant,
+        mut take_snapshot: F,
+    ) -> Option<String>
+    where
+        F: FnMut() -> Result<std::collections::HashMap<u32, String>, &'static str>,
+    {
+        let stale = force_refresh
+            || cache
+                .at
+                .map(|t| now.duration_since(t) >= Duration::from_secs(SNAPSHOT_REFRESH_SECS))
+                .unwrap_or(true);
+        if stale {
+            cache.at = Some(now);
+            let first_failure = apply_snapshot(cache, take_snapshot());
+            warn_once(cache, first_failure);
+        }
+        if let Some(name) = cache.names.get(&pid) {
+            return Some(name.clone());
+        }
+        // 未命中 → 立即重建再查一次；带最小间隔节流，
+        // 避免「PID 查不到」持续存在时每次都做一遍全进程遍历。
+        let can_force = cache
+            .at
+            .map(|t| now.duration_since(t) >= Duration::from_secs(SNAPSHOT_FORCE_MIN_SECS))
+            .unwrap_or(true);
+        if !can_force {
+            return None;
+        }
+        cache.at = Some(now);
+        let first_failure = apply_snapshot(cache, take_snapshot());
+        warn_once(cache, first_failure);
+        cache.names.get(&pid).cloned()
     }
 
     /// 采集侧唯一的留痕出口：只在连续失败的第一次 warn，之后由清零收尾。
@@ -344,13 +381,15 @@ mod collect {
 
     /// 非 Windows 平台：暂不支持前台应用统计。
     #[cfg(not(windows))]
-    pub fn foreground_app_name() -> Option<String> {
+    pub fn foreground_app(_last_hwnd: isize) -> Option<(isize, String)> {
         None
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::collect::pid_to_name_with;
     use super::{apply_snapshot, is_recordable, parse_exclude, SnapshotCache};
     use std::collections::HashMap;
 
@@ -476,5 +515,39 @@ mod tests {
         let mut cold = SnapshotCache::default();
         assert!(apply_snapshot(&mut cold, Ok(HashMap::new())));
         assert!(cold.names.is_empty(), "还没建立过表时缓存保持为空");
+    }
+
+    /// 窗口换了必须重建快照：PID 会被 Windows 回收复用，缓存里同名 PID 可能
+    /// 已经是另一个进程（前台时长会记到刚关掉的应用上）。
+    ///
+    /// 不换窗的那一腿是旧行为的对照：命中缓存一次快照都不做 —— 正是错挂的来源。
+    #[cfg(windows)]
+    #[test]
+    fn a_forced_refresh_rebinds_a_reused_pid_to_the_new_process() {
+        use std::time::Instant;
+        let mut cache = SnapshotCache::default();
+        cache.names.insert(42, "old.exe".to_string());
+        cache.at = Some(Instant::now());
+
+        let mut calls = 0;
+        let hit = pid_to_name_with(&mut cache, 42, false, Instant::now(), || {
+            calls += 1;
+            Ok(HashMap::new())
+        });
+        assert_eq!(hit.as_deref(), Some("old.exe"), "未换窗时用缓存");
+        assert_eq!(calls, 0, "未换窗不该重建快照");
+
+        let mut fresh = HashMap::new();
+        fresh.insert(42u32, "new.exe".to_string());
+        let rebound = pid_to_name_with(&mut cache, 42, true, Instant::now(), || {
+            calls += 1;
+            Ok(fresh.clone())
+        });
+        assert_eq!(
+            rebound.as_deref(),
+            Some("new.exe"),
+            "窗口换了、PID 被复用后必须改用新进程名"
+        );
+        assert_eq!(calls, 1, "换窗那一腿必须真的重建一次快照");
     }
 }
