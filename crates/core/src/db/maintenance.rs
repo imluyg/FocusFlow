@@ -1781,11 +1781,13 @@ fn backup_fingerprint(path: &Path) -> Option<BackupFingerprint> {
     Some(BackupFingerprint { total, days })
 }
 
-/// 新快照相对上一份是否「异常」。判定保守：样本太小（第一份备份、刚装好）时不判定。
+/// 新快照相对上一份是否「异常」。判定保守：**基线**太小（第一份备份、刚装好）时不判定。
 fn is_suspicious_change(prev: BackupFingerprint, cur: BackupFingerprint) -> bool {
-    /// 样本下限：总量低于此值时阈值没有统计意义
+    /// 样本下限：基线总量低于此值时阈值没有统计意义
     const MIN_SAMPLE: i64 = 1_000;
-    if prev.total < MIN_SAMPLE || cur.total < MIN_SAMPLE {
+    // 下限只该看基线：prev 很大、cur 只剩几百正是"几乎全丢"，拿 cur 再卡一遍会让
+    // 最严重的那一档完全静默（同一次骤降只要还剩 1,000+ 反而会报）。
+    if prev.total < MIN_SAMPLE {
         return false;
     }
     let dropped = cur.total * 2 < prev.total; // 掉了一半以上：疑似丢数据
@@ -3643,7 +3645,18 @@ mod tests {
                 },
                 BackupFingerprint { total: 10, days: 1 },
             ),
-            "样本太小不判定（新装用户）"
+            "基线太小不判定（新装用户）"
+        );
+        // 基线够大、这一份只剩几百：几乎全丢，不能因为 cur 也低于样本下限就静默
+        assert!(
+            is_suspicious_change(
+                base,
+                BackupFingerprint {
+                    total: 400,
+                    days: 1
+                }
+            ),
+            "几乎全丢（只剩几百）是最严重的一档，不能静默"
         );
     }
 
