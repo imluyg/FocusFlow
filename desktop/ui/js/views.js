@@ -607,6 +607,10 @@ function renderWeekdayChart(s) {
 // 每日目标与连续打卡条。get_goal_status 要扫近 370 天的按日序列，
 // 不能跟着 2 秒一次的图表推送跑，这里自带 60 秒节流。
 let goalFetchedAt = 0;
+// 请求序号：连续改两次目标时会有两次 get_goal_status 同时在飞。慢的那次带的是旧目标，
+// 后到会把新结果盖回去，还会把 goalFetchedAt 拨回去、按住 60 秒节流。只有最后发出的
+// 那次请求有权写 goalInfo / 页面 / 失败提示。
+let goalRequestSeq = 0;
 // 设置页当前生效的每日目标：非法输入时用它回写控件，避免显示值与后端值不一致
 let lastGoalKeys = 20000;
 // 上次从后端取到的目标信息（含 streak/best/近 7 天），以及 live 推送里的今日数。
@@ -642,10 +646,13 @@ async function refreshGoalStrip(force) {
   if (!box) return;
   const now = Date.now();
   if (!force && now - goalFetchedAt < 60000) return;
+  const seq = ++goalRequestSeq;
   let g;
   try {
     g = await invoke("get_goal_status");
   } catch (e) {
+    // 已有更新的请求在飞/先回来了：这条旧失败不能把新内容换成错误
+    if (seq !== goalRequestSeq) return;
     // 打卡条整块空白，而且此后 60 秒连一次重试都没有 —— 这是原先那句裸 `return`
     // 的两宗罪：`goalFetchedAt` 在 try **之前**就盖了章，失败也当成"刚取过"。
     // 宿主这条命令是 `Result<_, String>`（spawn_blocking 里跨 370 天扫描，炸了真会
@@ -654,6 +661,8 @@ async function refreshGoalStrip(force) {
     box.innerHTML = `<div style="color:var(--danger);">连续打卡读不出来：${escapeHtml(String(e))}</div>`;
     return;
   }
+  // 慢的旧回话：这份结果已经不是用户当前的目标了，直接丢掉
+  if (seq !== goalRequestSeq) return;
   goalFetchedAt = now;
   goalInfo = g;
   const today = Math.max(0, goalToday());
