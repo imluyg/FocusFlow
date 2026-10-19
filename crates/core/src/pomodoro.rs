@@ -175,6 +175,20 @@ pub struct PomodoroTimer {
     state: Arc<Mutex<TimerState>>,
     /// 停止事件
     stop: Arc<AtomicBool>,
+    /// 计时线程是否在跑。spawn 失败时保持 false —— 没有这条线程，倒计时永远不会动，
+    /// 所以 `start_work`/`start_break` 必须拒绝，而不是让界面显示"计时中"、数字却冻住。
+    tick_alive: Arc<AtomicBool>,
+    /// 串行化 spawn，防两个并发调用各起一条计时线程。
+    spawn_lock: Mutex<()>,
+}
+
+/// 计时线程退出时清存活标志（正常退出或 panic 都要清），下次取用时才会重试 spawn。
+struct TickAliveGuard(Arc<AtomicBool>);
+
+impl Drop for TickAliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 struct TimerState {
@@ -215,16 +229,66 @@ impl PomodoroTimer {
         let timer = Arc::new(Self {
             state: Arc::new(Mutex::new(TimerState::default())),
             stop: Arc::new(AtomicBool::new(false)),
+            tick_alive: Arc::new(AtomicBool::new(false)),
+            spawn_lock: Mutex::new(()),
         });
-        // 启动后台计时线程
-        let stop = Arc::clone(&timer.stop);
-        let state = Arc::clone(&timer.state);
-        std::thread::Builder::new()
-            .name("pomodoro".into())
-            .spawn(move || tick_loop(state, stop))
-            .map_err(|e| tracing::error!("启动番茄钟线程失败: {e}"))
-            .ok();
+        if let Err(e) = timer.ensure_tick_thread() {
+            // 不把实例作废：每次取用（`pomodoro_timer`）和每次点开始都会重试 spawn。
+            // 但开始阶段必须能失败，不能再出现"界面说已经开始、倒计时却冻住"。
+            tracing::error!("启动番茄钟线程失败，开始/休息会被拒绝；下次调用会再试: {e}");
+        }
         timer
+    }
+
+    /// 起后台计时线程（幂等）；失败往上传。
+    pub(crate) fn ensure_tick_thread(&self) -> Result<(), String> {
+        let _spawn = self.spawn_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stop.load(Ordering::SeqCst) {
+            return Err("番茄钟计时线程已关闭".to_string());
+        }
+        if self.tick_alive.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let stop = Arc::clone(&self.stop);
+        let state = Arc::clone(&self.state);
+        let alive = Arc::clone(&self.tick_alive);
+        // 先置位再 spawn：新线程若立刻 panic，守卫会把标志清回去；spawn 失败则在这里清。
+        self.tick_alive.store(true, Ordering::SeqCst);
+        let spawned = std::thread::Builder::new()
+            .name("pomodoro".into())
+            .spawn(move || {
+                let _alive = TickAliveGuard(alive);
+                tick_loop(state, stop);
+            });
+        match spawned {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.tick_alive.store(false, Ordering::SeqCst);
+                Err(format!("启动番茄钟线程失败: {e}"))
+            }
+        }
+    }
+
+    /// 开始工作/休息前的同一道闸：计时线程不在跑就拒绝，绝不把状态改成"计时中"。
+    fn require_tick_thread(&self) -> Result<(), String> {
+        if self.stop.load(Ordering::SeqCst) {
+            return Err("番茄钟计时线程已关闭".to_string());
+        }
+        if !self.tick_alive.load(Ordering::SeqCst) {
+            return Err("番茄钟计时线程没有在运行，倒计时无法开始；请重启程序后再试".to_string());
+        }
+        Ok(())
+    }
+
+    /// 测试用：复现 spawn 失败后的状态（实例在、计时线程不在）。
+    #[cfg(test)]
+    fn without_tick_thread() -> Arc<Self> {
+        Arc::new(Self {
+            state: Arc::new(Mutex::new(TimerState::default())),
+            stop: Arc::new(AtomicBool::new(false)),
+            tick_alive: Arc::new(AtomicBool::new(false)),
+            spawn_lock: Mutex::new(()),
+        })
     }
 
     pub fn get_state_info(&self) -> std::collections::HashMap<String, i64> {
@@ -290,7 +354,8 @@ impl PomodoroTimer {
             .auto_break = enabled;
     }
 
-    pub fn start_work(&self) {
+    pub fn start_work(&self) -> Result<(), String> {
+        self.require_tick_thread()?;
         let (pending, started) = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if s.state == STATE_WORK {
@@ -308,15 +373,17 @@ impl PomodoroTimer {
             }
         };
         if !started {
-            return;
+            return Ok(());
         }
         if let Some(session) = pending {
             persist_session(&self.state, &session);
         }
         tracing::info!("番茄钟开始工作");
+        Ok(())
     }
 
-    pub fn start_break(&self) {
+    pub fn start_break(&self) -> Result<(), String> {
+        self.require_tick_thread()?;
         let (pending, started) = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if s.state == STATE_BREAK {
@@ -334,12 +401,13 @@ impl PomodoroTimer {
             }
         };
         if !started {
-            return;
+            return Ok(());
         }
         if let Some(session) = pending {
             persist_session(&self.state, &session);
         }
         tracing::info!("番茄钟开始休息");
+        Ok(())
     }
 
     pub fn toggle_pause(&self) -> bool {
@@ -594,7 +662,7 @@ mod tests {
         init_db().ok();
 
         let t = PomodoroTimer::new();
-        t.start_work();
+        t.start_work().expect("计时线程应可用");
         t.stop();
         t.shutdown();
 
@@ -605,6 +673,41 @@ mod tests {
         );
         assert!(get_recent_sessions(10).is_empty(), "不该落进历史记录");
         assert_eq!(t.get_state_info()["work_finished"], 0, "不该算完成一个番茄");
+    }
+
+    /// 计时线程没起来时，开始工作/休息必须报错，不能把状态改成"计时中"。
+    ///
+    /// `new()` 原先用 `.map_err(日志).ok()` 吞掉 spawn 失败，实例照样被缓存：
+    /// 点开始后状态变成 work、倒计时却永远停在 25:00，而 `record_key` 照常累加；
+    /// 用户停止时 `elapsed` 还是 0，`take_current` 直接丢掉这一段 —— 一场空，且零提示。
+    #[test]
+    fn starting_without_a_tick_thread_is_refused_not_faked() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("pomo_no_tick");
+        init_db().ok();
+
+        let t = PomodoroTimer::without_tick_thread();
+        let err = t.start_work().expect_err("没有计时线程必须拒绝开始工作");
+        assert!(
+            err.contains("计时线程"),
+            "错误要说清是计时线程的问题: {err}"
+        );
+        assert_eq!(t.get_state(), STATE_IDLE, "拒绝之后不许停在 work 状态");
+        assert_eq!(
+            t.get_state_info()["remaining"],
+            0,
+            "不许留下一个冻住的倒计时"
+        );
+
+        let err = t.start_break().expect_err("没有计时线程必须拒绝开始休息");
+        assert!(err.contains("计时线程"));
+        assert_eq!(t.get_state(), STATE_IDLE);
+
+        // 反向腿：同一条闸不能把活着的计时器也拒掉（上面的用例都依赖它放行）。
+        let live = PomodoroTimer::new();
+        live.start_work().expect("线程活着时必须允许开始");
+        assert_eq!(live.get_state(), STATE_WORK);
+        live.shutdown();
     }
 
     /// 锁中毒之后计时必须继续按秒推进。
@@ -662,7 +765,7 @@ mod tests {
         }
 
         let t = PomodoroTimer::new();
-        t.start_work();
+        t.start_work().expect("计时线程应可用");
         // 真的推进 5 秒：零秒会话在 take_current 里就被拦掉，绕不开要验的这条路径
         tick_once(&t.state, 5, Local::now());
         t.stop();
@@ -684,7 +787,7 @@ mod tests {
         init_db().ok();
 
         let t = PomodoroTimer::new();
-        t.start_work();
+        t.start_work().expect("计时线程应可用");
         tick_once(&t.state, 5, Local::now());
         t.stop();
         t.shutdown();
@@ -742,7 +845,7 @@ mod busy_lock_tests {
         let _tmp = crate::paths::test_app_dir("pomo_busy_lock");
         init_db().expect("建库失败");
         let timer = PomodoroTimer::new();
-        timer.start_work();
+        timer.start_work().expect("计时线程应可用");
         // 计时要真的走过一秒，stop() 才有东西要落库（零秒段刻意不写）
         std::thread::sleep(Duration::from_millis(1200));
 
@@ -826,7 +929,7 @@ mod busy_lock_tests {
         t.set_durations(i64::from(i32::MAX) * 1_000, 5);
         let s = t.get_state_info();
         assert_eq!(s["work_minutes"], 180, "程序入口也要夹 1..=180");
-        t.start_work();
+        t.start_work().expect("计时线程应可用");
         let s = t.get_state_info();
         assert_eq!(s["planned"], 180 * 60, "planned 不能绕成负数或荒唐值");
         assert!(s["remaining"] > 0, "倒计时不该一上来就是 0 或负数");

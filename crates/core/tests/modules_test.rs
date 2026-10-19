@@ -91,7 +91,7 @@ mod tests {
         assert_eq!(timer.get_state(), pomodoro::STATE_IDLE);
 
         // 开始工作
-        timer.start_work();
+        timer.start_work().expect("计时线程应可用");
         assert_eq!(timer.get_state(), pomodoro::STATE_WORK);
         let info = timer.get_state_info();
         assert_eq!(info["state"], 1);

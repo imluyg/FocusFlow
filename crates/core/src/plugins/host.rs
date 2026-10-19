@@ -50,6 +50,11 @@ static SCHEDULER: LazyLock<Mutex<SchedulerSlot>> = LazyLock::new(|| {
 fn pomodoro_timer() -> Arc<PomodoroTimer> {
     let mut slot = POMODORO.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(t) = slot.as_ref() {
+        // 上次 spawn 失败时实例照样缓存着；每次取用都再试一次（否则整个进程里
+        // 倒计时永远不动，而面板每 2 秒读一次 `pomodoro_state` 正好当重试点）。
+        if let Err(e) = t.ensure_tick_thread() {
+            tracing::error!("番茄钟计时线程仍起不来，开始/休息会被拒绝: {e}");
+        }
         return Arc::clone(t);
     }
     ensure_pomodoro_db();
@@ -235,7 +240,9 @@ pub fn register_host_api(
     host.set(
         "pomodoro_start_work",
         lua.create_function(|_, ()| {
-            pomodoro_timer().start_work();
+            pomodoro_timer()
+                .start_work()
+                .map_err(mlua::Error::RuntimeError)?;
             Ok(())
         })?,
     )?;
@@ -243,7 +250,9 @@ pub fn register_host_api(
     host.set(
         "pomodoro_start_break",
         lua.create_function(|_, ()| {
-            pomodoro_timer().start_break();
+            pomodoro_timer()
+                .start_break()
+                .map_err(mlua::Error::RuntimeError)?;
             Ok(())
         })?,
     )?;
