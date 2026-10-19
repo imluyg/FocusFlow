@@ -1063,6 +1063,21 @@ fn backup_db_file(src: &Path, dst: &Path) -> bool {
     }
 }
 
+/// `PRAGMA wal_checkpoint(TRUNCATE)` 是否**真的**把 WAL 全部并回了主库。
+///
+/// 不能看 `pragma_update(..).is_ok()`：它走 `execute_batch`，而 SQLite 把「被读写者
+/// 挡住、没检查点完」当成结果行的第一列 `busy=1` 返回，语句本身仍是成功
+/// （bundled `sqlite3.c` 的 `OP_Checkpoint`：`SQLITE_BUSY` 被折成 `SQLITE_OK`）。
+/// 兜底复制路径若在 busy 时误判成功，就会把「只复制了旧主文件」的备份盖上源库指纹，
+/// 历史年度从此被 `year_db_needs_backup` 一路跳过，缺的那截再也不会补。
+fn wal_checkpoint_truncate(conn: &Connection) -> bool {
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|busy| busy == 0)
+    .unwrap_or(false)
+}
+
 /// 备份文件的 sidecar 路径（WAL 模式会生成 `-wal` / `-shm`）。
 fn sidecar_paths(db: &Path) -> [std::path::PathBuf; 2] {
     let mut wal = db.as_os_str().to_owned();
@@ -1506,9 +1521,7 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
             // 必须校验，避免坏备份顶掉轮转中的好备份）
             let mut checkpointed = false;
             if let Ok(conn) = connection::open_rw(&src) {
-                checkpointed = conn
-                    .pragma_update(None, "wal_checkpoint", "TRUNCATE")
-                    .is_ok();
+                checkpointed = wal_checkpoint_truncate(&conn);
                 drop(conn);
             }
             if std::fs::copy(&src, &dst).is_ok() {
@@ -3800,6 +3813,53 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert!(left.is_empty(), "半成品与 sidecar 都应被清掉: {left:?}");
+    }
+
+    /// checkpoint 被读事务挡住时必须判成"没并回去"。
+    ///
+    /// `rusqlite::pragma_update` 走 `execute_batch`，而 SQLite 把 BUSY 当成结果行的
+    /// `busy=1` 返回、语句本身仍是成功 —— 旧判据于是把"只复制了旧主文件"的兜底备份
+    /// 标成完整，历史年度从此不再补备份。
+    #[test]
+    fn a_blocked_wal_checkpoint_is_not_reported_as_success() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("wal_busy");
+
+        let db = paths::year_db_path(Local::now().year());
+        let writer = connection::open_rw(&db).unwrap();
+        writer.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
+        writer.execute("INSERT INTO t VALUES (1)", []).unwrap();
+
+        // 读事务握着旧快照：TRUNCATE 要等所有读者离开
+        let reader = Connection::open(&db).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let one: i64 = reader
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(one, 1, "夹具前提：读得到的正是插进去那一行");
+
+        writer
+            .busy_timeout(std::time::Duration::from_millis(1))
+            .unwrap();
+        // 旧判据在这时是 Ok（这正是要修的假成功），新判据必须是 false
+        assert!(
+            writer
+                .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+                .is_ok(),
+            "夹具前提：pragma_update 会吞掉 BUSY（它若改成会报错，这条测试要重写）"
+        );
+        assert!(
+            !wal_checkpoint_truncate(&writer),
+            "读事务还握着快照，checkpoint 不可能完成"
+        );
+
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        assert!(
+            wal_checkpoint_truncate(&writer),
+            "读者走了之后必须能真正把 WAL 并回主库"
+        );
+        drop(writer);
     }
 
     /// 往年数据只在设备明细里时也必须被归档；归档不得顺手造出空年度库。
