@@ -163,21 +163,47 @@ document.addEventListener("visibilitychange", () => {
 
 // ---------- 缩放 ----------
 // 尺寸由 Rust 算（档位表在那边），这里只报方向。窗口改完尺寸要重排一次图的 CSS 尺寸。
+//
+// 请求必须**排队**：一次 IPC 要过主线程再回来，而 `scale` 要等回话才更新。原先每个滚轮
+// 事件各自 `await`，同一拍里的几格都带着同一个旧倍数发出去 —— Rust 每档只走一步，于是
+// 十格滚轮只走一格；回话乱序时还会把新倍数盖回旧值，窗口尺寸与页面尺寸对不上。
+let queuedSteps = 0;
+let resizeBusy = false;
+
+async function pumpResize() {
+  if (resizeBusy) return;
+  resizeBusy = true;
+  try {
+    while (queuedSteps !== 0) {
+      const dir = queuedSteps > 0 ? 1 : -1;
+      queuedSteps -= dir;
+      try {
+        const [applied] = await invoke("pin_resize", { scale, dir });
+        scale = applied;
+        layout();
+        showBadge(Math.round(scale * 100) + "%");
+      } catch (err) {
+        // 一次失败就把后面那串丢掉：界面已经停在一个和窗口不同的倍数上，
+        // 继续发只会把它推得更远，而且每一格都会再弹一条同样的错。
+        queuedSteps = 0;
+        showBadge("缩放失败：" + err);
+      }
+    }
+  } finally {
+    resizeBusy = false;
+  }
+}
+
 document.addEventListener(
   "wheel",
-  async (e) => {
+  (e) => {
     e.preventDefault();
     if (!imgSize) return;
     const dir = wheelDir(e.deltaY);
     if (dir === 0) return;
-    try {
-      const [applied] = await invoke("pin_resize", { scale, dir });
-      scale = applied;
-      layout();
-      showBadge(Math.round(scale * 100) + "%");
-    } catch (err) {
-      showBadge("缩放失败：" + err);
-    }
+    // 档位表共 7 档，从任何一档走到头最多 6 步；再多也只能停在端点上，不必排队。
+    queuedSteps = Math.max(-6, Math.min(6, queuedSteps + dir));
+    pumpResize();
   },
   { passive: false }
 );
