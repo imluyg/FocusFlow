@@ -224,6 +224,8 @@ pub fn archive_stale_years(source_year: i32) -> bool {
     // 只在真的迁走了数据后才 VACUUM 源库：否则每次启动都要付一次全库重写的代价
     if migrated_any {
         vacuum_path(&source_path);
+        // 往年数据搬走也是当前库的主动缩减：下一次备份不能拿归档前的快照比总量
+        mark_expected_year_shrink();
     }
     migrated_any
 }
@@ -851,6 +853,11 @@ pub fn cleanup_old_data(keep_days: i64) -> CleanupReport {
             tracing::error!("{year} 年数据清理未完成，本年度改动已回滚");
             report.failed_years.push(year);
         } else if year_deleted > 0 {
+            if year == chrono::Local::now().year() {
+                // 当前年度库被主动删掉一截：下一次备份不能拿清理前的快照当基线，
+                // 否则必然报「数据骤降」（见 `expected_shrink_marker`）。
+                mark_expected_year_shrink();
+            }
             tracing::info!("已清理 {year} 年 {cutoff_dk} 前的数据");
             report.deleted += year_deleted;
         }
@@ -1277,6 +1284,65 @@ fn snapshot_note(op: &str, outcome: &BackupOutcome) -> Option<String> {
     }
 }
 
+/// 主动缩减当前年度库（清理过期数据、把往年数据归档出去）留下的标记。
+///
+/// 异常体检拿"上一份备份"当基线：如果上一份产生于缩减之前，下一次备份必然看到总量
+/// 骤降 —— 而那是用户刚删的（或本程序刚归档走的），不是丢数据。标记里写的是缩减
+/// 完成的时刻（与备份文件名同一个毫秒时间戳格式），文件名里的时刻早于它的备份不再
+/// 当基线。
+///
+/// 标记**不删**：等第一份缩减之后的备份成为最新，对比自然回到正常；中途删掉的话，
+/// 下一次又会把那张旧快照拣回来当基线。
+fn expected_shrink_marker() -> std::path::PathBuf {
+    paths::backup_dir().join(".expected-year-shrink")
+}
+
+fn mark_expected_year_shrink() {
+    let path = expected_shrink_marker();
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!("缩减标记的目录建不出来，下一次备份可能把主动清理误报成数据骤降: {e}");
+            return;
+        }
+    }
+    let stamp = Local::now().format("%Y%m%d_%H%M%S%3f").to_string();
+    if let Err(e) = std::fs::write(&path, stamp) {
+        tracing::warn!("缩减标记写入失败，下一次备份可能把主动清理误报成数据骤降: {e}");
+    }
+}
+
+/// 备份文件名里的时间戳（`focusflow_{组}_{YYYYMMDD}_{HHMMSS[mmm]}.db`）。
+///
+/// 不用文件 mtime：清理与下一次备份可能落在同一个 mtime 粒度里（FAT/同步盘是 2 秒），
+/// 那样"清理后新生成的备份"会被误判成清理前。文件名是备份启动那一刻写死的定宽串，
+/// 字典序即时间序。
+fn backup_stamp(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy();
+    let stem = name.strip_suffix(".db")?;
+    let mut parts = stem.rsplit('_');
+    let time = parts.next()?;
+    let date = parts.next()?;
+    let is_num = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
+    if is_num(date, 8) && time.len() >= 6 && time.bytes().all(|b| b.is_ascii_digit()) {
+        Some(format!("{date}_{time}"))
+    } else {
+        None
+    }
+}
+
+/// 这份基线备份是否产生于最近一次主动缩减之前。
+fn baseline_predates_expected_shrink(backup: &Path) -> bool {
+    let Ok(marker) = std::fs::read_to_string(expected_shrink_marker()) else {
+        return false;
+    };
+    let marker = marker.trim();
+    let Some(stamp) = backup_stamp(backup) else {
+        // 名字解不出时间：宁可照常体检，也不要把真异常吞掉
+        return false;
+    };
+    stamp.as_str() <= marker
+}
+
 /// 附属数据库：`(库名, 对应插件的文件名 stem, 路径)`。
 ///
 /// 第二个字段用于判断该插件是否已被停用 —— 停用的插件其库不再被写入，
@@ -1462,7 +1528,16 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
             // 异常体检：与上一份备份比总量/天数（只对当前年份库有意义）
             if year == chrono::Local::now().year() {
                 if let (Some(prev), Some(cur)) = (baseline_fp, backup_fingerprint(&dst)) {
-                    if is_suspicious_change(prev, cur) {
+                    // 主动清理/归档之后，清理前的备份不能当基线：拿它比必然"骤降"，
+                    // 而那批数据是用户自己删的（或本程序刚归档走的），不是丢数据。
+                    let stale_baseline = baseline_path
+                        .as_deref()
+                        .is_some_and(baseline_predates_expected_shrink);
+                    if stale_baseline {
+                        tracing::debug!(
+                            "跳过本轮备份异常体检：基线备份早于最近一次主动缩减（清理/归档）"
+                        );
+                    } else if is_suspicious_change(prev, cur) {
                         suspicious_detail = Some(format!(
                             "对比对象: {}（总次数 {}，天数 {}）\n本次备份: {}（总次数 {}，天数 {}）",
                             baseline_path
@@ -4127,6 +4202,64 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM daily_counts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 1, "过期行应已删除，只剩今天那行");
+    }
+
+    /// 主动清理不是"数据骤降"：下一次备份不许因为自己刚删的数据报警。
+    ///
+    /// 异常体检拿上一份备份当基线，而清理会先做执行前快照、再删过期行 —— 于是下一个
+    /// 备份必然看到总量掉一半以上。旧实现会写 SUSPECT 并冻结轮转，设置页红字让用户
+    /// 去查"是不是丢数据了"，而那批数据正是他自己刚用 `--cleanup` 删的。
+    ///
+    /// 反向腿盯的是标记不能把体检永久关掉：清理后的新基线之下真丢了数据，仍要报警。
+    #[test]
+    fn a_deliberate_cleanup_is_not_reported_as_losing_data() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("cleanup_not_loss");
+
+        let year = Local::now().year();
+        let today = Local::now().date_naive();
+        {
+            let conn = connection::open_rw(&paths::year_db_path(year)).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            for days_ago in 0..60 {
+                let dk = queries::day_key_of_date(today - chrono::Days::new(days_ago));
+                conn.execute(
+                    "INSERT INTO daily_counts (date_key, count) VALUES (?1, 2000)",
+                    [dk],
+                )
+                .unwrap();
+            }
+        }
+        queries::invalidate_years_cache();
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+
+        // 第一份备份当基线：120,000 次 / 60 天
+        assert!(matches!(backup_database(5), BackupOutcome::Done { .. }));
+        // 清理到最近 10 天：执行前快照（仍是 120,000）→ 删掉 50 天
+        let report = cleanup_old_data(10);
+        assert_eq!(report.deleted, 50, "夹具前提：真的删掉了 50 天");
+        // 下一份备份与清理前的快照比会"骤降"，但那是主动清理，不许报异常
+        assert!(matches!(backup_database(5), BackupOutcome::Done { .. }));
+        assert!(
+            suspect_notes().is_empty(),
+            "把自己删的数据报成异常：{:?}",
+            suspect_notes()
+        );
+
+        // 反向腿：清理后的基线已经是最新的，再真丢一截就必须报警
+        {
+            let conn = connection::open_rw(&paths::year_db_path(year)).unwrap();
+            conn.execute(
+                "DELETE FROM daily_counts WHERE date_key < ?1",
+                [queries::day_key_of_date(today - chrono::Days::new(1))],
+            )
+            .unwrap();
+        }
+        assert!(matches!(backup_database(5), BackupOutcome::Done { .. }));
+        assert!(
+            !suspect_notes().is_empty(),
+            "清理之后的真实骤降必须仍然报警（标记不能永久关掉体检）"
+        );
     }
 
     /// 退出时把记下的一批文件恢复可写。
