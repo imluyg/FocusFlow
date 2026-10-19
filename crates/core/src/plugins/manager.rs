@@ -726,8 +726,12 @@ impl PluginManager {
                 view.title = title;
             }
             if let Ok(widgets) = t.get::<mlua::Table>("widgets") {
-                for (_, w) in widgets.pairs::<mlua::Value, mlua::Table>().flatten() {
-                    match parse_widget(&w, 0) {
+                for (i, (_, w)) in widgets
+                    .pairs::<mlua::Value, mlua::Table>()
+                    .flatten()
+                    .enumerate()
+                {
+                    match parse_widget(&w, 0, &format!("w{i}")) {
                         Ok(widget) => view.widgets.push(widget),
                         // 认不出来的控件以前是**静默丢掉**的：`type` 打错一个字母、
                         // headers 里混进一个数字，界面上就是少一块，而插件行不报红、
@@ -1402,8 +1406,30 @@ fn skip_nested_widget(where_: &str, e: mlua::Error) {
     tracing::warn!("跳过无法解析的{where_}内嵌控件: {e}");
 }
 
+/// 弹窗缺 `id` 时按位置派生一个**稳定**的 id。
+///
+/// 前端把"哪个弹窗是开着的"记在 `openModals` 这把集合里，键就是元素的 DOM id；
+/// `id` 为空时它退到 `"pf-modal-" + Math.random()` —— 于是每 2 秒一次的插件数据推送
+/// 都会重画出一个新 id，正在填的弹窗下一次推送就自己关掉了（用户看到的是"填了一半没了"）。
+/// 派生值只依赖控件在列表里的位置，同一份视图每轮渲染都一样的 ⇒ 稳定。
+fn modal_id(raw: mlua::Result<String>, auto_id: &str) -> String {
+    let raw = raw.unwrap_or_default();
+    if raw.trim().is_empty() {
+        format!("pf-modal-{auto_id}")
+    } else {
+        raw
+    }
+}
+
 /// 解析 Lua 表为声明式控件。
-fn parse_widget(w: &mlua::Table, depth: u32) -> mlua::Result<crate::plugins::Widget> {
+///
+/// `auto_id` 是这一格在列表里的位置串（顶层 `w0`、弹窗内嵌 `w0m1`、行内 `w0r2`），
+/// 只给"没写 id 的弹窗"派生稳定 id 用（见 [`modal_id`]）。
+fn parse_widget(
+    w: &mlua::Table,
+    depth: u32,
+    auto_id: &str,
+) -> mlua::Result<crate::plugins::Widget> {
     // 深度闸：`modal_form.widgets` 与 `row.children` 是递归下降解析的，而插件表是
     // **外部数据**。没有上限时一句 `local w={type="row",children={}}; w.children[1]=w`
     // 就成了自引用 → 递归无界 → 打穿线程栈。栈溢出是 SIGSEGV：不走 panic hook
@@ -1479,15 +1505,19 @@ fn parse_widget(w: &mlua::Table, depth: u32) -> mlua::Result<crate::plugins::Wid
             // 弹窗主体内嵌控件（表格等）
             let mut widgets = Vec::new();
             if let Ok(ws_val) = w.get::<mlua::Table>("widgets") {
-                for (_, c) in ws_val.pairs::<mlua::Value, mlua::Table>().flatten() {
-                    match parse_widget(&c, depth + 1) {
+                for (i, (_, c)) in ws_val
+                    .pairs::<mlua::Value, mlua::Table>()
+                    .flatten()
+                    .enumerate()
+                {
+                    match parse_widget(&c, depth + 1, &format!("{auto_id}m{i}")) {
                         Ok(widget) => widgets.push(widget),
                         Err(e) => skip_nested_widget("弹窗", e),
                     }
                 }
             }
             Ok(Widget::ModalForm {
-                id: w.get("id").unwrap_or_default(),
+                id: modal_id(w.get("id"), auto_id),
                 title: w.get("title").unwrap_or_default(),
                 submit: w.get("submit").unwrap_or_default(),
                 submit_text: w.get("submit_text").unwrap_or_default(),
@@ -1502,8 +1532,12 @@ fn parse_widget(w: &mlua::Table, depth: u32) -> mlua::Result<crate::plugins::Wid
         "row" => {
             let mut children = Vec::new();
             if let Ok(children_val) = w.get::<mlua::Table>("children") {
-                for (_, c) in children_val.pairs::<mlua::Value, mlua::Table>().flatten() {
-                    match parse_widget(&c, depth + 1) {
+                for (i, (_, c)) in children_val
+                    .pairs::<mlua::Value, mlua::Table>()
+                    .flatten()
+                    .enumerate()
+                {
+                    match parse_widget(&c, depth + 1, &format!("{auto_id}r{i}")) {
                         Ok(widget) => children.push(widget),
                         Err(e) => skip_nested_widget("行", e),
                     }
@@ -2286,6 +2320,68 @@ end
             prod.match_indices("instruction_budget_from(").count(),
             2,
             "应当是「定义一处 + arm_instruction_budget 用一处」"
+        );
+    }
+
+    /// 没写 `id` 的弹窗要拿到一个**稳定**的 id。
+    ///
+    /// 前端 `plugins.js` 那圈 `modal_form` 的兜底是 `"pf-modal-" + Math.random()`：
+    /// 空 id 每渲染一次就换一个 DOM id，而"哪个弹窗开着"记在 `openModals` 这把集合里、
+    /// 键就是那个 id ⇒ 插件页每 2 秒一次的数据推送会把用户**正在填的弹窗自己关掉**
+    /// （症状是"填了一半突然没了"）。派生只依赖控件在列表里的位置，所以同一份视图
+    /// 每轮渲染都给出同一个值。
+    #[test]
+    fn a_modal_without_id_gets_a_stable_one() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("modal_auto_id");
+        let plugins = tmp.path().join("plugins");
+        let src = r###"
+PLUGIN_NAME = "弹窗插件"
+function get_view()
+  return { title = "t", widgets = {
+    { type = "modal_form", title = "新增", submit = "add",
+      fields = { { kind = "text", field = "f", label = "L" } } },
+    { type = "modal_form", id = "mine", title = "编辑", submit = "edit" },
+  } }
+end
+"###;
+        let file = write_lua(&plugins, "modal", src);
+        let mut pm = manager_in(tmp.path());
+        pm.load_plugin(&file).expect("这份视图该装得起来");
+
+        let ids = |pm: &PluginManager| -> Vec<String> {
+            let info = pm.get_plugin("弹窗插件").expect("插件应在表里");
+            let view = info.view.clone().expect("加载时就该有视图");
+            view.widgets
+                .iter()
+                .map(|w| match w {
+                    crate::plugins::Widget::ModalForm { id, .. } => id.clone(),
+                    other => panic!("第二个控件不是弹窗：{other:?}"),
+                })
+                .collect()
+        };
+
+        let first = ids(&pm);
+        assert_eq!(first.len(), 2, "夹具前提：两个弹窗控件");
+        assert!(
+            first[0].starts_with("pf-modal-"),
+            "缺 id 的弹窗必须拿到带前缀的派生 id，绝不能留空（空 id 会让前端退到 Math.random）：{first:?}"
+        );
+        assert_eq!(first[1], "mine", "插件自己写了 id 就要用他的，一个字不改");
+        assert_ne!(
+            first[0], first[1],
+            "派生值要按位置唯一，两个弹窗不能抢同一个 DOM id"
+        );
+
+        // 再渲染一次：这条才是那场"弹窗自己关掉"的真正判据
+        assert!(
+            pm.reload_plugin("modal"),
+            "内容没变的重载该成功（这一步会重跑 get_view 并重新派生 id）"
+        );
+        assert_eq!(
+            ids(&pm),
+            first,
+            "id 每轮渲染都变 ⇒ 推送一来，正在填的弹窗就没了"
         );
     }
 }
