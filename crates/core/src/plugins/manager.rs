@@ -100,6 +100,25 @@ const DEFAULT_INSTRUCTION_LIMIT: i64 = 10_000_000;
 /// 控件表允许的最大嵌套层数（见 `parse_widget`）。
 const MAX_WIDGET_DEPTH: u32 = 32;
 
+/// 「这一轮没列出这个插件文件名」的两种原因要分开说。
+///
+/// `discover()` 读不出目录时给的是**空列表**（它自己的注释写了这件事有多坏），
+/// 所以调用方那句"列表里没有"既可能是盘上真没有这个名字，也可能是整个目录这会儿
+/// 读不到 —— 后者过去一律报成「插件文件不存在」，而文件明明在盘上：用户照着这句
+/// 话会去重命名、重传插件，甚至以为自己的插件被删了。`discover()` 那半边已经会记
+/// 日志，这里是把话说对的另一半。
+///
+/// 带路径分隔或 `..` 的名字**不走存在性检查**：那是把这里变成"文件存在预言机"，
+/// 而这个 crate 的插件表本就是外部数据（沙箱那段的注释防的就是这类通道）。
+fn missing_plugin_reason(dir: &Path, stem: &str) -> String {
+    let simple =
+        !stem.is_empty() && !stem.contains('/') && !stem.contains('\\') && !stem.contains("..");
+    if simple && dir.join(format!("{stem}.lua")).is_file() {
+        return format!("插件目录这一轮没扫到 {stem}（目录被占用或正在整份替换），请再试一次");
+    }
+    format!("插件文件不存在: {stem}")
+}
+
 impl PluginManager {
     pub fn new(config: &'static FocusFlowConfig, db: Arc<db::Database>) -> Self {
         let (tx, rx) = mpsc::channel();
@@ -301,8 +320,9 @@ impl PluginManager {
         if !self.discover().iter().any(|p| Self::stem_of(p) == stem) {
             // 以前这里是 `return Ok(())`：命令层把 Ok 当成功，前端弹「插件已启用」，
             // 而配置一个字没改 —— 对着一个不存在的插件报成功。
-            tracing::warn!("忽略未知的插件文件名（插件目录里没有它）: {stem}");
-            return Err(format!("插件文件不存在: {stem}"));
+            let reason = missing_plugin_reason(&self.plugins_dir(), stem);
+            tracing::warn!("启用插件被拒（{stem}）: {reason}");
+            return Err(reason);
         }
         let mut list = self.disabled_list();
         if enabled {
@@ -361,6 +381,20 @@ impl PluginManager {
                     .values()
                     .find(|p| Self::stem_of(&p.file_path) == stem)
                 {
+                    // 两条失败要分开说，而且**都得说**：
+                    //   · `info.error` —— 这个实例上一次跑坏了（视图/初始化炸了）；
+                    //   · `load_errors[stem]` —— 最近一次（热）重载失败，旧那份还在跑。
+                    // 过去这里只读前者，于是"存进一个语法错的版本"这条最常见的手势在
+                    // 插件页上是一片安静：热重载的返回值只进日志、`plugins-reloaded`
+                    // 照发、`try_load` 的文档（见它自己那段注释）承诺的"插件页多一条
+                    // 加载失败原因"根本兑不了现 —— 而用户看到的现象是"我改了文件没生效"。
+                    let mut reasons: Vec<String> = Vec::new();
+                    if let Some(e) = &info.error {
+                        reasons.push(format!("上次运行出错：{e}"));
+                    }
+                    if let Some(e) = self.load_errors.get(&stem) {
+                        reasons.push(format!("最近一次重载失败：{e}（界面跑的还是改之前那份）"));
+                    }
                     return DiscoveredPlugin {
                         name: info.name.clone(),
                         desc: info.desc.clone(),
@@ -369,7 +403,11 @@ impl PluginManager {
                         file: stem,
                         enabled,
                         loaded: info.loaded,
-                        error: info.error.clone(),
+                        error: if reasons.is_empty() {
+                            None
+                        } else {
+                            Some(reasons.join("；"))
+                        },
                     };
                 }
                 match Self::scan_meta(&path) {
@@ -2076,6 +2114,106 @@ end
         assert!(
             prod.contains("跳过无法解析的控件"),
             "顶层的失败留痕被摘掉了"
+        );
+    }
+
+    /// 存进一个坏版本之后，插件页必须看得见原因。
+    ///
+    /// 症状是"我改了文件但没生效"：热重载失败只进日志、`plugins-reloaded` 照发、
+    /// 列表那一行既不报红也不说为什么 —— 因为 `list_discovered` 在"插件还活着"那一支
+    /// 只看 `info.error`，从不看 `load_errors`。
+    #[test]
+    fn a_failed_hot_reload_shows_its_reason_on_the_plugin_page() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("reload_error_visible");
+        let plugins = tmp.path().join("plugins");
+        let file = write_lua(&plugins, "w", &view_only("视图插件"));
+        let mut pm = manager_in(tmp.path());
+        pm.load_plugin(&file).expect("第一版该装上");
+
+        // 用户按一次 Ctrl+S：这次写进去的是半截表达式（语法错，Lua 编译就拒）
+        std::fs::write(
+            &file,
+            "PLUGIN_NAME = \"视图插件\"\nfunction get_view() return { ",
+        )
+        .unwrap();
+        assert!(!pm.reload_plugin("w"), "坏版本必须被判定成重载失败");
+
+        let row = pm
+            .list_discovered()
+            .into_iter()
+            .find(|p| p.file == "w")
+            .expect("列表里得有这个文件那一行");
+        let reason = row
+            .error
+            .clone()
+            .expect("重载失败要在插件页上看得见，不能只剩一片安静");
+        assert!(
+            reason.contains("重载失败"),
+            "要说清这是最近一次重载的结论：{reason}"
+        );
+        assert!(
+            reason.contains("改之前"),
+            "还得说清现在跑的是哪一份，否则用户以为新代码生效了：{reason}"
+        );
+        // 旧实例仍在服务（这不是"插件没了"）：`try_load` 刻意不销活着的旧实例，
+        // 那条口径也在这里一起钉住 —— 哪天改成回滚成未加载，这条会红着提醒
+        assert!(row.loaded, "重载失败不该把还在跑的旧实例判成未加载");
+
+        // 改好之后再重载一次：那条原因必须消失，不能挂在行上不走
+        std::fs::write(&file, view_with_name("视图插件", "视图插件-新")).unwrap();
+        assert!(pm.reload_plugin("w"), "修好的版本该重载成功");
+        let row = pm
+            .list_discovered()
+            .into_iter()
+            .find(|p| p.file == "w")
+            .expect("列表里得有这个文件那一行");
+        assert!(
+            row.error.is_none(),
+            "成功那次要把失败原因清掉，否则红字会永久挂着：{:?}",
+            row.error
+        );
+        assert!(row.loaded, "重载成功后跑的就是新那份");
+    }
+
+    /// 「插件文件不存在」不能当成"这一轮没列出它"的默认解释。
+    ///
+    /// `discover()` 读不出目录时给的是空列表，所以那句话在目录被占用/正在整份替换
+    /// 的时候是**假**的 —— 文件就在盘上，而用户照着这句假话会去重命名、重传插件。
+    #[test]
+    fn an_unreadable_directory_is_not_reported_as_a_missing_file() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("missing_reason");
+        let dir = tmp.path().join("plugins");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("w.lua"), "PLUGIN_NAME = \"w\"\n").unwrap();
+
+        let present = missing_plugin_reason(&dir, "w");
+        assert!(
+            present.contains("这一轮没扫到") && present.contains("再试一次"),
+            "文件在盘上就该说\"读不到/没扫到\"，不是\"不存在\": {present}"
+        );
+        let absent = missing_plugin_reason(&dir, "nope");
+        assert!(
+            absent.contains("插件文件不存在") && absent.contains("nope"),
+            "真没有这个名字才配得上那句\"不存在\": {absent}"
+        );
+        // 带路径分隔或 `..` 的名字不许触发存在性检查：那会把这里变成文件存在预言机
+        for evil in ["../plugins/w", "..\\plugins\\w", "a/b", ""] {
+            let r = missing_plugin_reason(&dir, evil);
+            assert!(
+                !r.contains("这一轮没扫到"),
+                "越界/畸形名不该给出探测结果: {evil} → {r}"
+            );
+        }
+
+        // 接线：`set_enabled` 走的必须就是这个函数（判据写在源码里，行为用例碰不得配置）
+        let src = include_str!("manager.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        assert_eq!(
+            prod.match_indices("missing_plugin_reason(").count(),
+            2,
+            "应当是「定义一处 + set_enabled 用一处」，多一处少一处都要查"
         );
     }
 }
