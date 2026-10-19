@@ -841,9 +841,16 @@ async function onFloatingChange(e) {
   await invoke("set_config", { section: "floating", key: "enabled", value: e.target.checked ? "true" : "false" });
 }
 
+// 与 core 的 `stats::effective_goal` 同一把尺子：0/负数不是「没配」，而是按 1 算
+// （否则「每天有 1 次就算达标」）。设置页显示**生效值** —— 旧写法把 0 当 falsy 换成
+// 默认 20000，于是输入框写着 20000、打卡条按 1 判定，同一页两个目标。
+function effectiveGoal(raw) {
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n > 0 ? n : 1;
+}
+
 // 每日目标：夹到 [1, 5000000]。写回输入框，避免显示与实际生效值不一致
-async function onGoalChange(e) {
-  // 空串/非正整数一律保持原值，不写库：Number("") 是 0 而不是 NaN，
+async function onGoalChange(e) {  // 空串/非正整数一律保持原值，不写库：Number("") 是 0 而不是 NaN，
   // 早先的夹取会把「清空输入框顺手一离开」变成「每日目标 = 1」，等于关掉打卡。
   const raw = e.target.value.trim();
   const n = Math.floor(Number(raw));
@@ -1033,7 +1040,7 @@ const SETTINGS_CATS = [
           {
             // 值不加千分位：onGoalChange 用 Number() 解析，"20,000" 会变 NaN 被当成非法输入
             id: "set-goal", t: "text", cls: "ff-num", name: "每日目标次数",
-            v: (s) => String(Number(s.goal_daily_keys ?? 20000) || 20000), on: onGoalChange,
+            v: (s) => String(effectiveGoal(s.goal_daily_keys ?? 20000)), on: onGoalChange,
             desc: "达标即算打卡：按整日总活跃次数判定，连续天数显示在「活跃分析」页顶部（今天没达标不清零昨天的纪录）。",
           },
         ],
@@ -1294,7 +1301,7 @@ function paintSettingsShell() {
 export async function renderSettings() {
   const s = await invoke("get_settings");
   settingsUI.data = s;
-  lastGoalKeys = Number(s.goal_daily_keys ?? 20000) || 20000;
+  lastGoalKeys = effectiveGoal(s.goal_daily_keys ?? 20000);
   if (!SETTINGS_CATS.some((c) => c.id === settingsUI.cat)) settingsUI.cat = SETTINGS_CATS[0].id;
   paintSettingsShell();
   paintConfigWarn();
