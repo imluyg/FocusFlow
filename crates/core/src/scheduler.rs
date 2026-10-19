@@ -239,7 +239,17 @@ fn is_under(root: &std::path::Path, dir: &std::path::Path) -> bool {
     }
 }
 
+/// 两条"去登记 allow_extra"的拒绝提示共用的后半句（一句话只许有一份）。
+const ALLOW_EXTRA_HINT: &str = "（config.ini 只在程序启动时读一次，登记后要重启程序才生效）";
+
 /// `config.ini` `[scheduler] allow_extra` 追加的白名单（逗号分隔文件名）。
+///
+/// **这个函数读到的是内存里那份配置，不是盘上的文件**：`config::instance()` 是 `OnceLock`，
+/// 只在启动时 `load()` 一次，运行期没有任何重读入口（设置页的 `set()` 也只写内存 + 去抖落盘）。
+/// 所以下面两条拒绝提示都必须带上 [`ALLOW_EXTRA_HINT`] —— 它们让用户去手改 `config.ini`，
+/// 而手改之后不重启就等于什么都没发生：用户照着提示改完、保存、回来继续看同一条拒绝，
+/// 只会怀疑自己写错了文件名。逐行重写那条路会保住他写的这一行（未知键不删），
+/// 所以丢的不是编辑，是他的时间与信任。
 fn extra_allowed_executables() -> Vec<String> {
     crate::config::instance()
         .get_or("scheduler", "allow_extra", "")
@@ -615,7 +625,7 @@ fn validate_exe_target(p: &std::path::Path) -> anyhow::Result<()> {
     if !ALLOWED_EXECUTABLES.contains(&file_name.as_str()) && !from_extra {
         anyhow::bail!(
             "{file_name} 不在定时任务白名单内；如需放行请在 config.ini 的 \
-             [scheduler] allow_extra 中添加该文件名"
+             [scheduler] allow_extra 中添加该文件名{ALLOW_EXTRA_HINT}"
         );
     }
     // 内置白名单只保证「这个文件名可信」，来源目录必须同时可信；
@@ -626,7 +636,7 @@ fn validate_exe_target(p: &std::path::Path) -> anyhow::Result<()> {
         if !trusted.iter().any(|root| is_under(root, parent)) {
             anyhow::bail!(
                 "{file_name} 不在系统安装目录内（实际位置 {}），可能是改名后的其他程序；\
-                 确实需要请在 config.ini 的 [scheduler] allow_extra 中登记该文件名",
+                 确实需要请在 config.ini 的 [scheduler] allow_extra 中登记该文件名{ALLOW_EXTRA_HINT}",
                 parent.display()
             );
         }
@@ -1528,16 +1538,27 @@ mod tests {
         matches!(run_check(t, now), RunDecision::Run)
     }
 
-    fn isolate_app_dir(
-        tag: &str,
-    ) -> (std::sync::MutexGuard<'static, ()>, crate::paths::TestAppDir) {
+    /// 调度用例的隔离守卫。**字段顺序有牙齿**，不要换成元组：
+    ///
+    /// `TestAppDir::drop` 会 `set_app_dir(哨兵)` 并 `clear_ro_cache()` —— 那是**进程级全局**
+    /// 的改写。元组 `(MutexGuard, TestAppDir)` 按字段序析构，等于"先放锁、后改全局"：
+    /// 隔壁用例可能就在这两步之间拿到锁、把自己的目录设上去，然后被这次收尾一脚改成
+    /// 哨兵 ⇒ 它的库开在 `target/ff_restore_sentinel/` 下，表现成一堆不相干的调度用例
+    /// 随机红（`no such table`／看到别人的行），而 `--test-threads=1` 永远全绿。
+    /// 结构体按声明序析构：`dir` 先（仍在锁里），`_lock` 后。
+    struct Isolated {
+        dir: crate::paths::TestAppDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn isolate_app_dir(tag: &str) -> Isolated {
         let lock = crate::paths::test_app_dir_lock();
         let dir = crate::paths::test_app_dir(&format!("sched_{tag}"));
         let _ = crate::config::instance();
         // 生产路径上 `Scheduler::start()` 一定会先建表，隔离目录里没有这一步时
         // 任何"成功入库"的写法都会撞上 no such table。
         let _ = init_db();
-        (lock, dir)
+        Isolated { dir, _lock: lock }
     }
 
     /// 回归：插件可通过 `scheduler_add` 启动任意程序，绕过 io/os 沙箱。
@@ -1685,7 +1706,8 @@ mod tests {
     /// "解析不出目标"，安全结论不变。
     #[test]
     fn script_and_shell_link_targets_are_rejected() {
-        let (_g, dir) = isolate_app_dir("script");
+        let g = isolate_app_dir("script");
+        let dir = &g.dir;
         for name in ["daily.bat", "daily.cmd", "notepad.txt"] {
             let p = dir.path().join(name);
             std::fs::write(&p, b"x").unwrap();
@@ -2177,7 +2199,11 @@ mod tests {
             true,
         )
         .expect("带首尾空格的目标应当过入口校验（校验判的是 trim 之后的值）");
-        let t = &get_all_tasks()[0];
+        let tasks = get_all_tasks();
+        // 先数行数再取第一条：并行跑时这条用例偶发会看到别人的行（全量红、单跑绿的
+        // 那一族）。取 `[0]` 断言到别人的路径只会红得看不懂，行数先行才说得出"多了行"。
+        assert_eq!(tasks.len(), 1, "隔离目录里该只有刚加的那一条");
+        let t = &tasks[0];
         assert_eq!(t.target_path, notepad, "入库的必须是校验过的那个串");
         assert_eq!(t.args, ARG, "参数是同一把尺子的另一半");
         assert_eq!(t.schedule_time, "09:00");
@@ -2478,7 +2504,8 @@ mod tests {
     /// 就绕过去。指向 cmd.exe 的 .lnk 依旧要被拒，否则整个黑名单等于没有。
     #[test]
     fn lnk_target_goes_through_the_same_whitelist() {
-        let (_l, dir) = isolate_app_dir("lnk_cmd");
+        let g = isolate_app_dir("lnk_cmd");
+        let dir = &g.dir;
         let cmd = r"C:\Windows\System32\cmd.exe";
         if !std::path::Path::new(cmd).is_file() {
             return;
@@ -2495,7 +2522,8 @@ mod tests {
 
     #[test]
     fn lnk_resolves_to_the_link_body() {
-        let (_l, dir) = isolate_app_dir("lnk_resolve");
+        let g = isolate_app_dir("lnk_resolve");
+        let dir = &g.dir;
         let p = write_lnk(
             dir.path(),
             "np.lnk",
@@ -2542,7 +2570,8 @@ mod tests {
     /// 但目标程序不存在时要报"目标程序不可用"，而不是因为"链接没问题"就放行。
     #[test]
     fn approved_target_validates_the_resolved_path() {
-        let (_l, dir) = isolate_app_dir("lnk_approved");
+        let g = isolate_app_dir("lnk_approved");
+        let dir = &g.dir;
         let p = write_lnk(
             dir.path(),
             "gone.lnk",
@@ -2711,7 +2740,8 @@ mod tests {
 
     #[test]
     fn chained_lnk_is_not_followed() {
-        let (_l, dir) = isolate_app_dir("lnk_chain");
+        let g = isolate_app_dir("lnk_chain");
+        let dir = &g.dir;
         let inner = write_lnk(
             dir.path(),
             "inner.lnk",
@@ -2726,7 +2756,8 @@ mod tests {
 
     #[test]
     fn missing_lnk_and_non_exe_target_report_readable_reasons() {
-        let (_l, dir) = isolate_app_dir("lnk_reasons");
+        let g = isolate_app_dir("lnk_reasons");
+        let dir = &g.dir;
         let e = validate_task_target(r"C:\no-such-dir\nope.lnk")
             .unwrap_err()
             .to_string();
@@ -3146,6 +3177,95 @@ mod tests {
         assert!(
             e.to_string().contains("不能为空"),
             "要说清为什么被拒，实得: {e}"
+        );
+    }
+
+    /// 隔离守卫必须是**结构体且 `dir` 声明在 `_lock` 之前** —— 字段顺序就是析构顺序。
+    ///
+    /// 写成元组 `(MutexGuard, TestAppDir)`（就是本文件以前的样子）看着等价，实际把
+    /// 锁先放了、后改全局：`TestAppDir::drop` 会 `set_app_dir(哨兵)` + `clear_ro_cache()`，
+    /// 那两步落在锁外，隔壁用例刚设好自己的目录就被改走 ⇒ 调度用例族随机红、
+    /// `--test-threads=1` 全绿。这条按文本形状钉住声明顺序。
+    #[test]
+    fn the_isolation_guard_drops_the_dir_before_the_lock() {
+        let src = include_str!("scheduler.rs");
+        // needle 用拼接：本用例自己的注释里就写着 `struct Isolated`，
+        // 直接写常量会先匹配到注释、把比较对象换成自己的说明文字
+        let at = src
+            .find(&format!("{} {}", "struct", "Isolated"))
+            .expect("Isolated 这个守卫结构不在了（那锁与目录的顺序就没人管了）");
+        let head = &src[at..];
+        let body = &head[..head.find('}').expect("Isolated 的定义没有结尾")];
+        let dir_at = body
+            .find("dir:")
+            .expect("Isolated 里那个临时目录字段不见了");
+        let lock_at = body
+            .find("_lock:")
+            .expect("Isolated 不再持锁（那就不叫隔离守卫了）");
+        assert!(
+            dir_at < lock_at,
+            "`dir` 必须声明在 `_lock` 之前：先删目录（改全局）再放锁，顺序反过来就是那场随机红"
+        );
+        assert!(
+            !src.contains(&format!(") -> ({}<", "std::sync::MutexGuard")),
+            "isolate_app_dir 又返回元组了 —— 元组的字段序会先把锁放掉"
+        );
+    }
+
+    /// 白名单类的拒绝必须把「改完要重启」一起说出口。
+    ///
+    /// `config::instance()` 是 `OnceLock`，只在启动时读一次文件，运行期没有重读入口
+    /// （设置页的 `set()` 也只写内存再去抖落盘）。而这两条提示恰恰让用户去手改
+    /// `config.ini` 的 `allow_extra`：不告知要重启，他照做之后看到的还是同一条拒绝，
+    /// 只会怀疑自己文件名写错了。逐行重写那条路会保住他写的行（未知键不删），
+    /// 所以丢掉的不是他的编辑，是他这一轮的时间与信任。
+    #[test]
+    fn a_whitelist_refusal_says_the_config_needs_a_restart() {
+        // 这条用例走的是真校验 ⇒ 会碰 `config::instance()`。必须像本文件其它用例一样
+        // 先拿 app_dir 锁并在锁内初始化那个 OnceLock：否则"配置首次加载"会发生在别的
+        // 用例正切走目录的那一刻，那份 singleton 就永久指着别人的目录（并行跑时
+        // 表现为一堆不相干的调度用例随机红）。
+        let _g = isolate_app_dir("hint_msg");
+        assert!(
+            ALLOW_EXTRA_HINT.contains("重启"),
+            "共用的后半句必须把重启说出口：{ALLOW_EXTRA_HINT}"
+        );
+        // 真文件才有真判决：`validate_exe_target` 会 canonicalize，不存在的目标走
+        // "此刻读不到"那一类，拿不到白名单这句话
+        let dir = std::env::temp_dir().join(format!("ff_sched_hint_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("临时目录建不出来");
+        let exe = dir.join("zz_myprog.exe");
+        std::fs::write(&exe, "这不是真的 exe，只是个存在的文件".as_bytes())
+            .expect("写入临时目标失败");
+        let e =
+            validate_exe_target(&exe).expect_err("白名单外的文件名必须被拒，并且把登记办法说出来");
+        let msg = e.to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(msg.contains("allow_extra"), "要说清去哪儿登记：{msg}");
+        assert!(
+            msg.contains(ALLOW_EXTRA_HINT),
+            "拒绝要带上「改完得重启程序」这句：{msg}"
+        );
+    }
+
+    /// 两处白名单拒绝共用同一句提示，不许一份有、一份没有。
+    ///
+    /// 这条按源码形状钉：两条 bail 走的是不同的判定（一个管文件名不在表里、一个管
+    /// 来源目录不可信），只有第一个被我上面的行为用例跑到了 —— 第二个的夹具要往
+    /// 系统目录放文件，测试里不该那么做。所以第二个出口用形状钉住。
+    #[test]
+    fn both_whitelist_refusals_share_the_same_hint() {
+        let src = include_str!("scheduler.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        assert_eq!(
+            prod.match_indices("{ALLOW_EXTRA_HINT}").count(),
+            2,
+            "两处白名单拒绝都要接上这句提示（现在不是两处，说明有人新开了第三条拒绝或摘掉了一条）"
+        );
+        assert_eq!(
+            prod.match_indices("const ALLOW_EXTRA_HINT").count(),
+            1,
+            "这句话只许有一份"
         );
     }
 }

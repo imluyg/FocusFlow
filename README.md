@@ -85,7 +85,8 @@ desktop\build_nsis.bat
   （`%WINDIR%` / `%ProgramFiles%`）并且文件名在白名单内 —— 只比对文件名的话，
   把任意程序改名成 `notepad.exe` 放进临时目录就能绕过。需要放行其它位置的程序时，
   在 `config.ini` 的 `[scheduler]` 段加 `allow_extra = 你的程序.exe`
-  （用户自己登记的文件名不再限制所在目录）。
+  （用户自己登记的文件名不再限制所在目录）。**改完要重启程序**：`config.ini` 只在启动时
+  读一次，运行中手改这个文件不会生效（设置页改的东西走内存 + 定时落盘，两者不互相重读）。
   以前支持的 `.bat`/`.cmd` 已移除：`CreateProcess` 会交给 `cmd.exe` 解释并二次解析
   参数，等于把黑名单里封掉的 `cmd.exe` 用扩展名请回来；`.lnk` 也已移除：
   `CreateProcess` 根本不解析快捷方式（从来没真启动成功过），改用 ShellExecute
