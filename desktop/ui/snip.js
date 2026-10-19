@@ -567,7 +567,15 @@ function doCommit(pin) {
   }).catch((err) => {
     // 提交失败要留在覆盖层上：底图还在 Rust 侧的会话里，重新框一次就能再交。
     submitted = false;
-    setHint("截图失败：" + err + "（重新框选或按 Esc）", true);
+    // 清掉进度光标：它会让"可以重试"看起来像"还在转"。清成空串回到样式表里的十字，
+    // 标注态那条 `body.annotating #sel { cursor: crosshair }` 也就恢复生效。
+    sel.style.cursor = "";
+    // 标注态下拖框是**画一笔**，不是重新选区 —— 让人去「重新框选」等于教他画错；
+    // 那条路上真正的重试键是 Enter（工具条的「完成」同理）。
+    setHint(
+      "截图失败：" + err + (annotating ? "（按 Enter 重试，或按 Esc 放弃）" : "（重新框选或按 Esc）"),
+      true
+    );
   });
 }
 
