@@ -55,6 +55,20 @@ const USAGE: &str = "\
   -h, --help                 显示本帮助
 ";
 
+/// 每条命令最多接受几个位置参数（不含命令本身）。
+///
+/// `--help` 不在表里：它在前面的早退分支里，带不带多余参数都只显示帮助。
+/// 表里没有的命令交给分派臂的"未知参数"报错，不在这一步拦。
+fn max_args(cmd: &str) -> Option<usize> {
+    match cmd {
+        "--stats" | "--stats-year" | "--devices" | "--export" | "--cleanup" | "--import-legacy"
+        | "--device-keys" => Some(1),
+        "--rename-device" => Some(2),
+        "--list-years" | "--reset" | "--vacuum" | "--backup" => Some(0),
+        _ => None,
+    }
+}
+
 fn run(args: &[String]) -> i32 {
     if args.is_empty() {
         eprint!("{USAGE}");
@@ -67,6 +81,21 @@ fn run(args: &[String]) -> i32 {
             return 0;
         }
         _ => {}
+    }
+
+    // 多出来的位置参数必须拒绝：本程序一次只执行一条命令，而
+    // `--cleanup 30 --vacuum` 只会清理、`--reset --backup` 不会先备份 ——
+    // 两件都退 0，用户以为都做了。放在读配置之前：被拒的命令不产生任何副作用。
+    if let Some(max) = max_args(args[0].as_str()) {
+        if args.len() - 1 > max {
+            eprintln!(
+                "{} 只接受 {max} 个参数，多出来的不会执行：{}",
+                args[0],
+                args[1 + max..].join(" ")
+            );
+            eprintln!("  本程序一次只执行一条命令；要连做几件事请分几次调用");
+            return 1;
+        }
     }
 
     // 读取配置（读当前目录 config.ini，不存在则生成默认）
@@ -1010,8 +1039,8 @@ fn backup_outcome(outcome: &db::maintenance::BackupOutcome) -> (String, i32) {
 mod tests {
     use super::{
         backup_outcome, cleanup_outcome, export_csv, export_html, export_target, import_report,
-        parse_keep_days, parse_period, parse_stats_year, period_window, rank_tail_note,
-        year_lookup, Period, YearLookup,
+        max_args, parse_keep_days, parse_period, parse_stats_year, period_window, rank_tail_note,
+        run, year_lookup, Period, YearLookup,
     };
     use super::{reset_plan, ResetPlan};
     use focusflow_core::db::maintenance::MaintenanceReport;
@@ -1312,6 +1341,39 @@ mod tests {
         assert!(!line.contains("已删除"), "实得: {line}");
     }
 
+    /// 多出来的参数不能被静默丢掉：本程序一次只执行一条命令。
+    ///
+    /// 旧行为：`--cleanup 30 --vacuum` 只清理、`--reset --backup` 不备份，
+    /// 两者都退 0，计划任务与用户都以为两件事都做了。
+    #[test]
+    fn extra_arguments_are_rejected_instead_of_silently_ignored() {
+        assert_eq!(
+            run(&["--cleanup".into(), "30".into(), "--vacuum".into()]),
+            1,
+            "多出来的 --vacuum 不能当作没看见"
+        );
+        assert_eq!(
+            run(&["--reset".into(), "--backup".into()]),
+            1,
+            "多出来的 --backup 不能当作没看见（reset 自己的快照是另一件事）"
+        );
+        assert_eq!(run(&["--stats".into(), "7".into(), "30".into()]), 1);
+        assert_eq!(
+            run(&["--rename-device".into(), "a".into(), "b".into(), "c".into()]),
+            1
+        );
+        assert_eq!(
+            run(&["--device-keys".into(), "7".into(), "extra".into()]),
+            1
+        );
+        // 合法个数不进拒绝分支：--help 是唯一不开库的合法命令
+        assert_eq!(run(&["--help".into()]), 0);
+        assert_eq!(max_args("--device-keys"), Some(1));
+        assert_eq!(max_args("--reset"), Some(0));
+        assert_eq!(max_args("--rename-device"), Some(2));
+        assert_eq!(max_args("--nope"), None);
+    }
+
     /// `--import-legacy` 有错误时不许在 stdout 上说「完成」，也不许说「未发现数据」。
     ///
     /// 旧写法先打「旧数据导入完成」再把错误逐条打到 stdout ⇒ 挂计划任务的日志读起来
@@ -1562,12 +1624,18 @@ mod tests {
     fn the_device_keys_command_actually_reads_its_period() {
         let src = include_str!("main.rs");
         let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
-        let arm_start = prod
+        // 从分派入口往后找：文件前面还有参数元数据（max_args）也写着同一个串，
+        // 从文件头 find 会把那张表当成"分派臂" —— 守卫要盯的是真正执行的那一段。
+        let dispatch = prod
+            .find("focusflow_core::config::instance()")
+            .expect("分派前的配置读取不见了");
+        let arm_start = prod[dispatch..]
             .find("\"--device-keys\" =>")
+            .map(|n| dispatch + n)
             .expect("--device-keys 的分派臂不见了");
-        let arm_end = prod[arm_start..]
+        let arm_end = prod[dispatch..]
             .find("\"--rename-device\" =>")
-            .map(|n| arm_start + n)
+            .map(|n| dispatch + n)
             .expect("--device-keys 与 --rename-device 之间的边界找不到");
         let arm = &prod[arm_start..arm_end];
         assert!(
