@@ -146,6 +146,17 @@ impl Database {
         }
     }
 
+    /// 立即落库，并交回"这批增量是否已确认落完"。
+    ///
+    /// 备份前的调用方必须走这一条：`flush(true)` 只等 3 秒，超时（库被占、跨年
+    /// 建库）时备份仍会**成功读出一个少了最后一批增量的快照**，只回 `()` 就只能
+    /// 在界面上说"备份完成"。只读模式（没有写线程）没有内存增量可确认，回 false。
+    pub fn flush_confirmed(&self, wait: bool) -> bool {
+        self.writer
+            .as_ref()
+            .is_some_and(|w| w.flush_confirmed(wait))
+    }
+
     /// 优雅关闭：flush + 停止写线程 + 备份。
     ///
     /// 备份必须排在 `stop()` 之后：`stop()` 里处理线程还要做最后一次 flush_pending，

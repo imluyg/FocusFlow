@@ -608,15 +608,38 @@ pub fn get_startup_report(
 pub async fn do_backup(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let max_backups = state.config.get_int("database", "max_backups", 5).max(1);
     let db = Arc::clone(&state.db);
-    let outcome = tauri::async_runtime::spawn_blocking(move || {
-        db.flush(true);
-        backup_message(&focusflow_core::db::maintenance::backup_database(
-            max_backups,
-        ))
+    tauri::async_runtime::spawn_blocking(move || {
+        let flushed = db.flush_confirmed(true);
+        backup_outcome_with_flush(
+            backup_message(&focusflow_core::db::maintenance::backup_database(
+                max_backups,
+            )),
+            flushed,
+        )
     })
     .await
-    .map_err(|e| e.to_string())??;
-    Ok(outcome)
+    .map_err(|e| e.to_string())?
+}
+
+/// 「立即备份」的最终结论：备份文件产出来了，还要确认它**包含**此刻内存里的增量。
+///
+/// `flush(true)` 只等 3 秒：写线程正卡在 SQLite 的 busy_timeout（15 秒）或跨年建库时
+/// 会超时，而备份照样能成功读出库 —— 于是那份备份少了最后一批还没落库的统计，界面却
+/// 报「备份完成」。这与退出备份那边修过的「少了最后一截」是同一件事，只是入口不同。
+/// 备份本身照做（文件总比没有强），但结论必须是 Err，把「等几秒再备一次」说出去。
+fn backup_outcome_with_flush(
+    backup: Result<String, String>,
+    flushed: bool,
+) -> Result<String, String> {
+    // 备份本身失败时原错误直接上抛：那句已经说清缺的是哪个库，再叠一句落盘警告只会
+    // 把真正的失败原因挤到后面。
+    let line = backup?;
+    if flushed {
+        return Ok(line);
+    }
+    Err(format!(
+        "{line}；但写入线程 3 秒内没有确认落盘，这份备份可能少了最后一批还没写进库的统计 —— 等几秒再备份一次"
+    ))
 }
 
 /// 「立即备份」这句结论的**唯一**判据：只有全都兜住才许是 Ok。
@@ -752,7 +775,7 @@ pub fn set_plugin_enabled(
 
 #[cfg(test)]
 mod tests {
-    use super::{backup_message, import_outcome, must_reload_hotkey};
+    use super::{backup_message, backup_outcome_with_flush, import_outcome, must_reload_hotkey};
     use focusflow_core::db::maintenance::BackupOutcome;
 
     /// 备份部分失败时设置页不能拿到绿色那句「备份完成」。
@@ -793,6 +816,67 @@ mod tests {
             })
             .unwrap_err(),
             "备份目录建不出来"
+        );
+    }
+
+    /// 「立即备份」还要确认这份快照**包含**内存里的最后一批增量。
+    ///
+    /// `flush(true)` 只等 3 秒，超时后备份仍会成功读出一个偏旧的库；只回一句
+    /// 「备份完成」等于把「少了最后一批」藏起来（与退出备份那条「少了最后一截」
+    /// 同一族）。三腿：确认落盘 ⇒ 原句；没确认 ⇒ Err 且两句都在；备份本身失败 ⇒
+    /// 原错误不被这句警告顶掉。
+    #[test]
+    fn a_backup_whose_flush_was_not_confirmed_is_not_a_clean_success() {
+        let complete = Ok("backup/focusflow_2026_x.db（共 3 份）".to_string());
+        assert_eq!(
+            backup_outcome_with_flush(complete.clone(), true),
+            Ok("backup/focusflow_2026_x.db（共 3 份）".to_string()),
+            "确认落盘时结论原样交给界面"
+        );
+        let warned =
+            backup_outcome_with_flush(complete, false).expect_err("没确认落盘不许报成干净成功");
+        assert!(
+            warned.contains("共 3 份"),
+            "已经拿到的文件不能说丢: {warned}"
+        );
+        assert!(
+            warned.contains("没有确认落盘"),
+            "缺的那一段必须说出来: {warned}"
+        );
+        assert_eq!(
+            backup_outcome_with_flush(Err("只兜住 1 份".to_string()), false),
+            Err("只兜住 1 份".to_string()),
+            "备份本身失败时原错误不能被一句警告顶掉"
+        );
+    }
+
+    /// 接线腿：`do_backup` 必须先拿到 flush 的确认结果，再谈备份的结论。
+    ///
+    /// 纯函数用例盖不到"命令里到底调没调"。退回 `db.flush(true)`（无返回值）时
+    /// 这条会红 —— 那正是这条缺陷原来的形状。
+    #[test]
+    fn do_backup_confirms_the_flush_before_claiming_success() {
+        let src = include_str!("commands.rs");
+        let head = src
+            .find("pub async fn do_backup")
+            .expect("立即备份命令找不到了");
+        let body = &src[head..head
+            + src[head..]
+                .find("\n#[tauri::command]")
+                .expect("do_backup 之后没有别的命令，切片前提变了")];
+        assert!(
+            !body.contains("db.flush(true)"),
+            "退回无返回值的 flush ⇒ 超时又一次被藏起来"
+        );
+        let flush_at = body
+            .find("flush_confirmed(true)")
+            .expect("do_backup 没有确认落盘（flush 的返回值被丢了）");
+        let decide_at = body
+            .find("backup_outcome_with_flush(")
+            .expect("do_backup 没走统一结论");
+        assert!(
+            flush_at < decide_at,
+            "必须先确认落盘、再下结论（flush 在 {flush_at}、结论在 {decide_at}）"
         );
     }
 

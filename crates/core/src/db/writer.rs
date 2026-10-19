@@ -594,7 +594,12 @@ impl DbWriter {
 
     /// 同 [`Self::flush`]，但把"这批增量是否已确认落库"告诉调用方。
     /// `wait=false` 恒返回 false：没等过就不能声称落完了。
-    fn flush_confirmed(&self, wait: bool) -> bool {
+    ///
+    /// **备份前的调用方必须看这个返回值**：`flush(true)` 最多等 3 秒，写线程正卡在
+    /// SQLite 的 busy_timeout（15 秒）里时会超时，而备份照样能读出库来 —— 那份备份
+    /// 就少了最后一批还在内存里的统计，界面上却是一句"备份完成"。退出备份那条路
+    /// 早就为同一件事把备份挪到了 `stop()` 之后（见 `db/mod.rs::shutdown`）。
+    pub fn flush_confirmed(&self, wait: bool) -> bool {
         if !wait {
             let _ = self.state.sig_tx.send(Signal::Flush { done: None });
             return false;
