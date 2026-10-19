@@ -1129,4 +1129,33 @@ mod tests {
             "暂停期间被消费掉的锚点必须在恢复那一沿也清掉，否则这里停在 0 或 1"
         );
     }
+
+    /// 修饰键的键名必须全部落进「修饰键」分组（`format::classify_key` 是那张尺子）。
+    ///
+    /// 右 Alt 是这里唯一一个不叫「右X」的修饰键：rdev 把 VK_RMENU(165) 交成
+    /// `Key::AltGr`，而设备侧与热力板都叫它「右Alt」。分类表原先漏收了这个名字，
+    /// 于是右 Alt 的每一次按下都被记进「其他」—— 同一个物理键在分组页和悬浮窗里
+    /// 被说成两件不同的事。
+    #[test]
+    fn every_modifier_key_classifies_as_a_modifier() {
+        use crate::format::classify_key;
+        for key in [
+            Key::ShiftLeft,
+            Key::ShiftRight,
+            Key::ControlLeft,
+            Key::ControlRight,
+            Key::Alt,
+            Key::AltGr,
+            Key::MetaLeft,
+            Key::MetaRight,
+        ] {
+            let name = normalize_key(&key);
+            assert_eq!(
+                classify_key(&name),
+                "修饰键",
+                "{key:?} 的键名是「{name}」，分类表把它分到了「{}」",
+                classify_key(&name)
+            );
+        }
+    }
 }

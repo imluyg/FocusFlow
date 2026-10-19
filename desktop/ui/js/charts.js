@@ -308,13 +308,19 @@ function khClamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
 }
 
-// 次数：负数/非数字按 0 处理，重复键名合并
+// 右 Alt 在主链路里的键名是「AltGr」（`crates/core/src/listener.rs`：rdev 把
+// VK_RMENU 交成 `Key::AltGr`），而这块板子按设备侧的叫法把它摆在「右Alt」。
+// 不折算的话那一格永远是冷的 —— 次数全跑到下面「其它按键」里，同一个物理键两处各说各的。
+const KH_ALIASES = new Map([["AltGr", "右Alt"]]);
+
+// 次数：负数/非数字按 0 处理，重复键名合并（含别名折算后的重名）
 function khCounts(rank) {
   const counts = new Map();
   if (!Array.isArray(rank)) return counts;
   for (const item of rank) {
-    const name = item && item[0];
+    const raw = item && item[0];
     const c = Math.max(0, Number(item && item[1]) || 0);
+    const name = typeof raw === "string" ? KH_ALIASES.get(raw) || raw : raw;
     if (typeof name !== "string" || !name || c <= 0) continue;
     counts.set(name, (counts.get(name) || 0) + c);
   }

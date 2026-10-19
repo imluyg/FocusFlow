@@ -25,6 +25,9 @@ pub fn classify_key(key_name: &str) -> &'static str {
             | "Win"
             | "左Win"
             | "右Win"
+            // `listener` 把 VK_RMENU（右 Alt）记成 AltGr（rdev 的 Key::AltGr = 165），
+            // 与设备侧的「右Alt」是同一个物理键。不收进来的话它会被分到「其他」。
+            | "AltGr"
     ) {
         return "修饰键";
     }
