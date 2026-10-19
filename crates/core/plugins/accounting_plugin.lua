@@ -252,12 +252,30 @@ function on_action(id)
             draft.category, draft.subcategory, draft.note
         )
         if ok then
-            list_msg = "已更新记录 #" .. tostring(editing_id)
-            focusflow.log("已更新记录 #" .. tostring(editing_id))
+            local updated = editing_id
+            list_msg = "已更新记录 #" .. tostring(updated)
+            focusflow.log("已更新记录 #" .. tostring(updated))
             editing_id = nil
             -- 清空草稿，避免下次"添加记录"弹窗预填旧数据
             draft.item = ""; draft.store = ""; draft.amount = ""
             draft.category = ""; draft.subcategory = ""; draft.date = ""; draft.note = ""
+            -- 改日期（或改成当前筛选不再命中的分类/名称）会把这条移出**当前这一页**：
+            -- 列表按 `purchase_date DESC, id DESC` 排。只回一句「已更新」而列表里没有它，
+            -- 用户多半以为没存上、再改一遍 —— 与 add_record 那条同族（那条早修过：
+            -- 当天记录跳回第 1 页，补记的记录说明排在后面页）。
+            -- 判据是"再查一次当前页里还有没有它"，而不是在 Lua 里重抄一遍 SQL 的筛选条件。
+            local still_here = false
+            for _, r in ipairs(query_page()) do
+                if tonumber(r["id"]) == updated then
+                    still_here = true
+                    break
+                end
+            end
+            if not still_here then
+                page = 1
+                list_msg = list_msg
+                    .. "（按当前筛选或日期排序，它已不在这一页，已回到第 1 页；找不到就用日期或关键词筛选）"
+            end
         else
             list_msg = "没更新 #" .. tostring(editing_id) .. "：写入失败（库被占用或记录已被删除）"
         end

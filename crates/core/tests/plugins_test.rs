@@ -674,6 +674,108 @@ mod tests {
             .expect("无编辑对象时的 save_edit 不该报错");
     }
 
+    /// 编辑把一条记录改到另一页之后，列表要跟着回到能看见它的那一页。
+    ///
+    /// 列表按 `purchase_date DESC, id DESC` 排，而编辑弹窗能改日期：把第 2 页的
+    /// 一条旧记录改到今天，它会跳到第 1 页顶部。旧实现只回一句「已更新记录 #N」
+    /// 而页码不动 —— 用户看到的是「更新成功 + 列表里没有这条」，多半以为没存上，
+    /// 与 `add_record` 当年那条「保存过了却没这条」同一族（那条已修：当天记录跳回
+    /// 第 1 页、补记的记录明说排在后面页）。
+    #[test]
+    fn editing_a_record_onto_another_page_moves_the_view_with_it() {
+        use focusflow_core::plugins::Widget;
+
+        fn widgets(manager: &PluginManager, name: &str) -> Vec<Widget> {
+            manager
+                .get_plugin(name)
+                .and_then(|p| p.view.as_ref())
+                .map(|v| v.widgets.clone())
+                .unwrap_or_default()
+        }
+        fn list_has(manager: &PluginManager, name: &str, needle: &str) -> bool {
+            widgets(manager, name).iter().any(|w| match w {
+                Widget::Table { rows, .. } => {
+                    rows.iter().any(|r| r.iter().any(|c| c.contains(needle)))
+                }
+                _ => false,
+            })
+        }
+        fn pager_page(manager: &PluginManager, name: &str) -> i64 {
+            widgets(manager, name)
+                .iter()
+                .find_map(|w| match w {
+                    Widget::Pager { page, .. } => Some(*page),
+                    _ => None,
+                })
+                .expect("记录列表应有分页条")
+        }
+
+        let _guard = guard();
+        let (_tmp, mut manager, name) = bundled_in("acct_edit_page", "accounting_plugin.lua");
+        // 宿主那侧的 ensure_accounting_db 是"本进程只跑一次"的形状，全量并行时
+        // 闩可能已被别的用例用掉 ⇒ 本目录里没有表。显式建库是用例的前置。
+        focusflow_core::accounting::init_db().expect("记账库应能建起来");
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+
+        // 10 条今天的（第 1 页整页）+ 1 条 2020 年的（第 2 页；id 更大 ⇒ 改成今天后排最前）
+        for i in 0..10 {
+            let id = focusflow_core::accounting::add_expense(
+                "支出",
+                &format!("今日{i}"),
+                None,
+                &today,
+                10.0,
+                None,
+                None,
+                None,
+            );
+            assert!(id > 0, "夹具：今天的记录应能写入");
+        }
+        let old_id = focusflow_core::accounting::add_expense(
+            "支出",
+            "陈年旧账",
+            None,
+            "2020-01-01",
+            5.0,
+            None,
+            None,
+            None,
+        );
+        assert!(old_id > 0, "夹具：旧记录应能写入");
+
+        manager
+            .plugin_action(&name, "page_next")
+            .expect("翻页动作不该失败");
+        assert_eq!(pager_page(&manager, &name), 2, "前置条件：应已翻到第 2 页");
+        assert!(
+            list_has(&manager, &name, "陈年旧账"),
+            "前置条件：第 2 页应能看到这条旧记录"
+        );
+
+        manager
+            .plugin_action(&name, &format!("edit_{old_id}"))
+            .expect("打开编辑弹窗不该失败");
+        manager
+            .plugin_set_field(&name, "d_date", &today)
+            .expect("写回日期不该失败");
+        manager
+            .plugin_action(&name, "save_edit")
+            .expect("保存不该失败");
+
+        assert_eq!(
+            pager_page(&manager, &name),
+            1,
+            "改到今天后它已不在第 2 页，页码必须回到第 1 页 —— 否则「更新成功」与列表里没有它同时发生"
+        );
+        assert!(
+            list_has(&manager, &name, "陈年旧账"),
+            "第 1 页必须能看到刚改过的这条（它 id 更大，按 id 倒序排最前）"
+        );
+    }
+
     // =====================================================================
     // 下面这组用例都跑在**独立临时目录**里：它们要真的写记账/番茄钟/定时任务的
     // 附属库，不能落在仓库目录（`plugins_test.rs` 上面那批只做加载+渲染，才敢用
