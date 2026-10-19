@@ -607,4 +607,86 @@ mod tests {
             summary.backed_up_aux
         );
     }
+
+    /// 清空之后再导入同一份旧目录，数据必须真的回来。
+    ///
+    /// `reset_all_data` 只删六张统计表，`meta` 里的 `imported_src_*`（源库大小/mtime +
+    /// 明细指纹）留着 —— 而它记的是「这份源库已经导过」。清空后用导入把旧数据找回来
+    /// 是最自然的恢复路径；旧实现会被指纹直接跳过、报 0 条，数据永远回不来。
+    #[test]
+    fn a_reset_clears_import_fingerprints_so_the_same_source_can_be_reimported() {
+        let _g = guard();
+        let _old = paths::test_app_dir("reset_reimport_old");
+        let old_dir = _old.path().to_path_buf();
+        let _new = paths::test_app_dir("reset_reimport_new");
+        db::queries::invalidate_years_cache();
+        // `reset_all_data` 的快照会读配置（max_backups）；在临时目录里初始化一份，
+        // 别让它去碰上一个用例留下的全局单例。
+        let _ = focusflow_core::config::instance();
+
+        let old_db = old_dir.join("focusflow_2026.db");
+        {
+            let conn = rusqlite::Connection::open(&old_db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE key_log (
+                    key_name TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    PRIMARY KEY (key_name, timestamp)
+                 ) WITHOUT ROWID;
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO key_log (key_name, timestamp) VALUES ('A', 100), ('B', 200), ('C', 300)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let first = migration::import_legacy_data(&old_dir);
+        assert_eq!(
+            first.records_by_year,
+            vec![(2026, 3)],
+            "首次导入应有 3 条: {first:?}"
+        );
+        assert!(first.errors.is_empty(), "首次导入报错: {:?}", first.errors);
+
+        let report = db::maintenance::reset_all_data();
+        assert!(
+            report.failed_years.is_empty(),
+            "清空失败: {:?}",
+            report.failed_years
+        );
+
+        let target = paths::year_db_path(2026);
+        let query_i64 = |sql: &str| -> i64 {
+            let conn = rusqlite::Connection::open(&target).unwrap();
+            conn.query_row(sql, [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(
+            query_i64("SELECT COALESCE(SUM(count),0) FROM daily_counts"),
+            0,
+            "前置条件：清空后统计应为 0"
+        );
+        assert_eq!(
+            query_i64("SELECT COUNT(*) FROM meta WHERE key GLOB 'imported_src_*'"),
+            0,
+            "清空必须同时清掉导入指纹，否则重导会被它跳过"
+        );
+
+        // 同一份源库、同一个目录再导一次：数据必须原样回来
+        let again = migration::import_legacy_data(&old_dir);
+        assert!(again.errors.is_empty(), "重导报错: {:?}", again.errors);
+        assert_eq!(
+            again.records_by_year,
+            vec![(2026, 3)],
+            "清空后重导同一份旧目录不能被指纹跳过（实得 {:?}）",
+            again.records_by_year
+        );
+        assert_eq!(
+            query_i64("SELECT COALESCE(SUM(count),0) FROM daily_counts"),
+            3,
+            "重导之后统计要真的回来"
+        );
+    }
 }

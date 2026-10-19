@@ -2107,6 +2107,20 @@ pub fn reset_all_data() -> MaintenanceReport {
                 }
             }
         }
+        // 导入指纹也一起清：它记的是「这份旧源库已经导过」，而它描述的那批统计数据
+        // 刚刚被删掉了。留着的话，用户清空之后想用导入把旧目录找回来，会被
+        // 大小+mtime 指纹直接跳过（报 0 条）—— 「清空重导」正是这个命令最自然的
+        // 恢复路径。`year` / `last_vacuum` 不动：它们描述的是库文件本身，不是统计内容。
+        // GLOB 而不是 LIKE：`_` 在 LIKE 里是通配符，会把前缀匹配放宽。
+        if !failed {
+            match conn.execute("DELETE FROM meta WHERE key GLOB 'imported_src_*'", []) {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("{year} 年库的导入指纹清空失败: {e}");
+                    failed = true;
+                }
+            }
+        }
         if failed || conn.execute_batch("COMMIT").is_err() {
             let _ = conn.execute_batch("ROLLBACK");
             tracing::error!("{year} 年清空未完成，本年度改动已回滚");
