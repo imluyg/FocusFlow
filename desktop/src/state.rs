@@ -356,11 +356,16 @@ fn enforce_floating_size(win: &tauri::WebviewWindow, config: &FocusFlowConfig) {
 fn setup_windows(app: &App, state: &AppState) {
     let config = focusflow_core::config::instance();
 
-    // 主窗口：启动进托盘时隐藏
+    // 主窗口：`start_to_tray`（默认 true）＝启动进托盘；关掉它的人要的是"启动就看得见"。
+    // 主窗口是**懒创建**的（tauri.conf.json 里没有它），启动时本来就不存在 ——
+    // 原来只写了"进托盘就 hide()"，于是 false 那一支等于什么都不做，
+    // 窗口直到点托盘/按热键才被建出来，这个设置读起来像是没生效。
     if state.start_to_tray {
         if let Some(win) = app.get_webview_window("main") {
             let _ = win.hide();
         }
+    } else {
+        show_main_window_when_ready(app.handle().clone(), Duration::ZERO);
     }
 
     // 悬浮窗：默认顶部靠右（对齐 Python 版），位置可持久化
@@ -2230,6 +2235,33 @@ mod today_display_wiring {
         assert!(
             !body.contains("w.today_count()") && !body.contains("w.today_active_seconds()"),
             "统计线程里还有直接照抄今日缓存的地方"
+        );
+    }
+}
+
+#[cfg(test)]
+mod startup_window_wiring {
+    /// 接线腿：`start_to_tray = false` 必须在启动时把主窗口建出来并显示。
+    ///
+    /// 主窗口是懒创建的；原来那一支只处理 true（hide），false 什么都不做 ——
+    /// 用户改完配置反而只剩托盘图标，这个设置读起来像没生效。
+    #[test]
+    fn start_to_tray_false_shows_the_lazily_created_main_window() {
+        let src = include_str!("state.rs");
+        let at = src
+            .find("fn setup_windows")
+            .expect("setup_windows 找不到了");
+        let body = &src[at..at
+            + src[at..]
+                .find("\nfn ")
+                .expect("setup_windows 之后没有顶层函数了")];
+        assert!(
+            body.contains("show_main_window_when_ready("),
+            "start_to_tray=false 没有主动显示主窗口（懒创建的窗口没人建）"
+        );
+        assert!(
+            body.contains("if state.start_to_tray"),
+            "托盘开关的分支不见了（判据要跟着改）"
         );
     }
 }
