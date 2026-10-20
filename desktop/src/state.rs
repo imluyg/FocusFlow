@@ -1031,6 +1031,19 @@ fn restart_decision(scheduled: &AtomicBool, user_initiated: bool, depth: u32) ->
     RestartDecision::Proceed { next_depth }
 }
 
+/// 重启线程没起来 ⇒ 把一次性名额还回去。
+///
+/// 名额的含义是「已经有一个线程会去拉起新进程」，而线程压根没起来就没有任何东西在途。
+/// 不还的话，本进程后续任何一次重启（包括用户主动换数据目录那一跳）都会被
+/// 「本进程已经安排过一次重启」挡掉，而那句指向的是一次从未开始的尝试 —— 与
+/// [`restart_decision`] 里「被深度闸拒绝的那一次不占名额」是同一条规矩的另一半。
+fn restart_slot_after_spawn(scheduled: &AtomicBool, spawned: bool) -> bool {
+    if !spawned {
+        scheduled.store(false, Ordering::SeqCst);
+    }
+    spawned
+}
+
 /// 自动重启应用（WebView2 环境损坏等无法在线恢复的场景）：
 /// 后台线程延迟几秒后拉起新进程（当前 exe，数据目录解析与本次一致），
 /// 当前进程干净退出——退出路径完成 flush/备份，未落库增量由恢复文件兜底。
@@ -1068,7 +1081,7 @@ pub(crate) fn schedule_app_restart(app: &tauri::AppHandle, user_initiated: bool)
         RestartDecision::Proceed { next_depth } => next_depth,
     };
     let handle = app.clone();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("app-restart".into())
         .spawn(move || {
             std::thread::sleep(Duration::from_secs(3));
@@ -1098,8 +1111,13 @@ pub(crate) fn schedule_app_restart(app: &tauri::AppHandle, user_initiated: bool)
                 }
             }
         })
-        .map_err(|e| tracing::error!("启动应用重启线程失败（该功能不可用）: {e}"))
-        .is_ok()
+        .map(|_| true)
+        .map_err(|e| {
+            tracing::error!("启动应用重启线程失败（该功能不可用，重启名额已退回）: {e}");
+            false
+        })
+        .unwrap_or(false);
+    restart_slot_after_spawn(&RESTART_SCHEDULED, spawned)
 }
 
 /// 兜底显示主窗口：恢复/重启都失败时至少让窗口可见，
@@ -1223,6 +1241,30 @@ fn keep_floating_on_top(app: &App) {
         .ok();
 }
 
+/// 自动周报的排期：**线程真起来了才把这一周记成「已安排」**。
+///
+/// 原先在 `spawn` 之前就把 marker 推进，末尾再 `.ok()` 把失败咽掉 —— 于是一次资源紧张
+/// （线程数到顶、内存不足）就让那一周的报告永久不再尝试，而设置页与日志都不知道少了
+/// 东西，日志里连那句失败都没有（`.ok()`）。改成起不来就不推进（下一拍再试），
+/// 并用第二个 marker 记住「这一周的失败已经报过」，免得每 500ms 刷一条 error。
+///
+/// 返回 `(新的 last_report_week, 新的失败记录 marker)`。
+fn weekly_report_marking(
+    week_marker: i64,
+    last_marker: i64,
+    error_marker: i64,
+    spawned: bool,
+) -> (i64, i64) {
+    if week_marker == last_marker {
+        return (last_marker, error_marker);
+    }
+    if spawned {
+        (week_marker, error_marker)
+    } else {
+        (last_marker, week_marker)
+    }
+}
+
 /// 窗口此刻是否「在用户眼前」：**最小化也算没在眼前**。
 ///
 /// `is_visible()` 对最小化的窗口仍返回 true（Windows 的 `WS_VISIBLE` 还在，只是窗口被
@@ -1301,6 +1343,8 @@ fn spawn_stats_worker(
             let mut charts_period: i64 = i64::MIN;
             // 上次生成自动周报的锚点（上一个整周周一的 CE 天序号）
             let mut last_report_week: i64 = 0;
+            // 「哪一周的起线程失败已经报过」：失败那一周只报一条，之后每拍静默重试
+            let mut weekly_error_week: i64 = i64::MIN;
 
             loop {
                 let period_val = period.load(Ordering::Relaxed);
@@ -1389,16 +1433,29 @@ fn spawn_stats_worker(
                     f.num_days_from_ce() as i64
                 };
                 if week_marker != last_report_week {
-                    last_report_week = week_marker;
-                    std::thread::Builder::new()
+                    let result = std::thread::Builder::new()
                         .name("weekly-report".into())
                         .spawn(|| match crate::export::write_weekly_report() {
                             Ok(Some(p)) => tracing::info!("自动周报已生成: {}", p.display()),
                             // 新装/长期没用：那一周没有记录，本来就没有可报告的
                             Ok(None) => tracing::debug!("上一个整周没有记录，跳过自动周报"),
                             Err(e) => tracing::warn!("自动周报生成失败: {e}"),
-                        })
-                        .ok();
+                        });
+                    let spawned = result.is_ok();
+                    let reason = result.err().map(|e| e.to_string()).unwrap_or_default();
+                    let (next_week, next_error_week) = weekly_report_marking(
+                        week_marker,
+                        last_report_week,
+                        weekly_error_week,
+                        spawned,
+                    );
+                    if next_error_week != weekly_error_week {
+                        tracing::error!(
+                            "自动周报线程起不来：{reason}；那一周的报告还没生成，稍后会再试"
+                        );
+                    }
+                    last_report_week = next_week;
+                    weekly_error_week = next_error_week;
                 }
 
                 if do_heavy {
@@ -2267,6 +2324,94 @@ mod restart_gate_tests {
                 RestartDecision::DepthExhausted { .. }
             ),
             "到了上限就该停下"
+        );
+    }
+
+    /// 重启线程**没起来**的那一次也不占名额：名额的含义是「已经有一个线程会去
+    /// 拉起新进程」，线程压根没起来就没有任何东西在途。
+    ///
+    /// 回归：原来 `.is_ok()` 直接把结果当返回值交出去，失败时名额仍留着 ——
+    /// 之后用户主动换数据目录那一跳被「本进程已经安排过一次重启」顶回去，
+    /// 而那句指向的是一次从未开始的尝试（与上面深度闸那一条是同一条规矩的两半）。
+    #[test]
+    fn a_failed_restart_thread_gives_the_slot_back() {
+        use super::restart_slot_after_spawn;
+
+        // 模拟 restart_decision 已放行（占住名额）之后的两种落点
+        let slot = AtomicBool::new(true);
+        assert!(
+            !restart_slot_after_spawn(&slot, false),
+            "线程没起来就该报「没安排上」"
+        );
+        assert!(
+            !slot.load(Ordering::SeqCst),
+            "线程没起来时名额必须退回，否则本进程再也重启不了"
+        );
+
+        let slot2 = AtomicBool::new(true);
+        assert!(
+            restart_slot_after_spawn(&slot2, true),
+            "线程起来了就该报「安排上了」"
+        );
+        assert!(
+            slot2.load(Ordering::SeqCst),
+            "真有一个线程在途时名额要留着（一个进程只准拉起一个新进程）"
+        );
+    }
+
+    /// 自动周报：**线程真起来了才把这一周记成「已安排」**，失败那一周只报一条错。
+    ///
+    /// 回归：原先在 spawn 之前 `last_report_week = week_marker`，末尾 `.ok()` 把失败
+    /// 咽掉 —— 一次资源紧张就让那一周的报告永久不再尝试，日志里连失败都没有。
+    #[test]
+    fn weekly_report_marks_only_when_the_thread_started() {
+        use super::weekly_report_marking;
+
+        let (last, err) = weekly_report_marking(100, 90, i64::MIN, true);
+        assert!(
+            last == 100 && err == i64::MIN,
+            "线程起来就推进这一周的锚点，且不该有失败记录，实际 {last}/{err}"
+        );
+
+        let (last, err) = weekly_report_marking(100, 90, i64::MIN, false);
+        assert!(
+            last == 90 && err == 100,
+            "线程没起来时锚点不动（下一拍再试），失败记到这一周，实际 {last}/{err}"
+        );
+
+        // 同一周第二次失败：error 标记未变 ⇒ 调用方据此不再重复出声
+        let (last, err) = weekly_report_marking(100, 90, 100, false);
+        assert!(
+            last == 90 && err == 100,
+            "已经报过的同一周不该再记一次，实际 {last}/{err}"
+        );
+
+        // 同一周已经安排好：什么都不动
+        let (last, err) = weekly_report_marking(100, 100, 100, true);
+        assert!(
+            last == 100 && err == 100,
+            "同一周不重复生成，实际 {last}/{err}"
+        );
+    }
+
+    /// 接线腿：两处 spawn 的结果都必须被看见，不许 `.ok()` 咽掉。
+    #[test]
+    fn both_spawn_sites_observe_their_result() {
+        let src = include_str!("state.rs");
+        let at = src
+            .find("fn schedule_app_restart")
+            .expect("schedule_app_restart 找不到了");
+        let body = &src[at..at + src[at..].find("\nfn ").expect("后面没有顶层函数了")];
+        assert!(
+            body.contains("restart_slot_after_spawn(&RESTART_SCHEDULED"),
+            "重启线程的成败没落到名额判据上"
+        );
+
+        let at2 = src.find("fn spawn_stats_worker").expect("统计线程找不到了");
+        let body2 = &src[at2..at2 + src[at2..].find("\nfn ").expect("后面没有顶层函数了")];
+        assert!(
+            body2.contains("weekly_report_marking("),
+            "周报的名额推进没走「线程真起来了才算」那条判据"
         );
     }
 }
