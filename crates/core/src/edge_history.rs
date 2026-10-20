@@ -97,18 +97,38 @@ const TEMP_COPY_PREFIX: &str = "focusflow_edge_";
 /// 的余量就不会碰到另一个实例正在用的文件；门槛再短就成了"两个实例互删"。
 const STALE_TEMP_COPY_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// 删除目录里老于 `max_age` 的 Edge 副本（含 `-wal`/`-shm`），返回删掉的个数。
+/// 一次清扫的三种结局，分开交回来。
+///
+/// 原先这个函数只回一个 `usize`：「目录读不出来」「目录里没有超龄副本」
+/// 「有超龄副本但一份都删不动」三件事共用同一个 0，而调用方只在 `> 0` 时说话 ⇒
+/// 一份含明文浏览记录的副本可以永远躺在临时目录里，日志一个字都没有。
+/// 这条清扫存在的理由恰恰是"那份 History 谁都能读"，所以删不动与没得删必须分开说。
+#[derive(Debug, Default)]
+struct SweepReport {
+    /// 真删掉的份数
+    removed: usize,
+    /// 超龄却删不动的副本（带系统原因）：杀软实时扫描、另一个实例握着句柄
+    stuck: Vec<String>,
+    /// 目录本身读不出来的原因；`None` = 读到了
+    unreadable: Option<String>,
+}
+
+/// 删除目录里老于 `max_age` 的 Edge 副本（含 `-wal`/`-shm`）。
 ///
 /// 为什么需要这一条：副本里是**明文浏览记录**，正常路径每次都 `remove_temp_copy`，
 /// 但 release 是 `panic = "abort"`、被任务管理器直接杀也来不及删 —— 那份完整的
 /// History 就永久躺在 `%TEMP%`，谁都能读。`dir` 参数是为测试留的：单测扫自己的
 /// 临时目录，不去碰系统 `%TEMP%`。
-fn sweep_stale_temp_copies_in(dir: &std::path::Path, max_age: std::time::Duration) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
+fn sweep_stale_temp_copies_in(dir: &std::path::Path, max_age: std::time::Duration) -> SweepReport {
+    let mut report = SweepReport::default();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            report.unreadable = Some(format!("{}: {e}", dir.display()));
+            return report;
+        }
     };
     let now = std::time::SystemTime::now();
-    let mut removed = 0;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.starts_with(TEMP_COPY_PREFIX) || !name.contains(".db") {
@@ -122,11 +142,15 @@ fn sweep_stale_temp_copies_in(dir: &std::path::Path, max_age: std::time::Duratio
         let age = now
             .duration_since(mtime)
             .unwrap_or(std::time::Duration::ZERO);
-        if age > max_age && std::fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
+        if age <= max_age {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => report.removed += 1,
+            Err(e) => report.stuck.push(format!("{name}: {e}")),
         }
     }
-    removed
+    report
 }
 
 /// 旧版本曾把副本放在程序目录 `data/_edge_history_temp.db`，
@@ -139,11 +163,28 @@ fn cleanup_stale_copies_once() {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", legacy.display(), suffix));
         }
-        let removed = sweep_stale_temp_copies_in(&std::env::temp_dir(), STALE_TEMP_COPY_AGE);
-        if removed > 0 {
+        let report = sweep_stale_temp_copies_in(&std::env::temp_dir(), STALE_TEMP_COPY_AGE);
+        // 三种结局各说一句：副本里是明文浏览记录，"清不动"和"没得清"必须分得开，
+        // 否则这份隐私数据可以一直留着而日志上一个字都没有。
+        if let Some(reason) = report.unreadable {
+            tracing::warn!(
+                "系统临时目录读不出来（{reason}）：上一次异常退出留下的 Edge 历史副本（明文浏览记录）\
+                 可能还在那里，这次一份都没清动"
+            );
+        }
+        if !report.stuck.is_empty() {
+            tracing::warn!(
+                "有 {} 份超龄的 Edge 历史副本删不掉（系统临时目录，内含明文浏览记录）：{} —— \
+                 关掉握着这些文件的程序（杀软实时扫描、另一个 FocusFlow 实例）之后再试，或手动删除",
+                report.stuck.len(),
+                report.stuck.join("；")
+            );
+        }
+        if report.removed > 0 {
             // 说清"为什么会有"，否则用户只看到一句"我删了你临时目录里的东西"
             tracing::warn!(
-                "清理了 {removed} 份上一次异常退出残留的 Edge 历史副本（位于系统临时目录，含明文浏览记录）"
+                "清理了 {} 份上一次异常退出残留的 Edge 历史副本（位于系统临时目录，含明文浏览记录）",
+                report.removed
             );
         }
     });
@@ -1071,13 +1112,76 @@ mod tests {
         let other = mk("focusflow_other_1.db", std::time::Duration::from_secs(7200));
 
         let removed = sweep_stale_temp_copies_in(&dir, STALE_TEMP_COPY_AGE);
-        assert_eq!(removed, 2, "只该删掉那两份超龄的 Edge 副本");
+        assert_eq!(removed.removed, 2, "只该删掉那两份超龄的 Edge 副本");
+        assert!(
+            removed.stuck.is_empty() && removed.unreadable.is_none(),
+            "这条走的是最顺的那一支，另外两种结局不该同时出现: {removed:?}"
+        );
         assert!(
             !stale_db.exists() && !stale_wal.exists(),
             "超龄副本要真删掉"
         );
         assert!(fresh.exists(), "几秒大的副本可能正被另一个实例用着");
         assert!(other.exists(), "前缀不匹配的文件不该被动");
+    }
+
+    /// 「目录读不出来」「里面没得清」「有一份清不动」三件事不许共用一个 0。
+    ///
+    /// 这条清扫管的是异常退出留在临时目录的**明文浏览记录**：原先只回一个 `usize`
+    /// 且调用方只在 `> 0` 时说话，于是"读不动/删不动"这两种真结局与"本来就没有"
+    /// 同形，那份隐私数据可以一直留着而日志一个字都没有。
+    #[test]
+    fn the_sweep_tells_an_unreadable_dir_apart_from_an_undeletable_copy() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("edge_sweep_kinds");
+
+        // ① 目录读不出来：把这个位置做成**普通文件**（read_dir 对文件必然报错）
+        let blocked = app.path().join("blocked");
+        std::fs::write(&blocked, b"x").unwrap();
+        let r = sweep_stale_temp_copies_in(&blocked, STALE_TEMP_COPY_AGE);
+        assert_eq!(r.removed, 0, "读不出来时不该声称清掉了什么");
+        assert!(
+            r.unreadable.is_some(),
+            "「目录读不出来」必须单独交出去，不许折成「里面没有超龄副本」: {r:?}"
+        );
+        assert!(
+            r.stuck.is_empty(),
+            "连目录都没读到，谈不上某一份删不动: {r:?}"
+        );
+
+        // ② 超龄却删不动：用一个只放行读的句柄握着它。std 默认连 FILE_SHARE_DELETE
+        //    也共享了 ⇒ 必须显式 share_mode(1)，那才是杀软实时扫描/另一个实例握着它的形态。
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let dir = app.path().join("sweep2");
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("focusflow_edge_55555_666666.db");
+            std::fs::write(&p, b"plaintext browsing history").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+                .unwrap();
+            let blocker = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&p)
+                .expect("夹具：只放行读的句柄要能开起来");
+            let r = sweep_stale_temp_copies_in(&dir, STALE_TEMP_COPY_AGE);
+            assert_eq!(r.removed, 0, "夹具前提：这一份删不动");
+            assert_eq!(
+                r.stuck.len(),
+                1,
+                "「有一份清不动」要点名到那一份，不能静默地报 0: {r:?}"
+            );
+            assert!(
+                r.unreadable.is_none(),
+                "目录是读得到的，两种原因不许混着说: {r:?}"
+            );
+            drop(blocker);
+        }
     }
 
     /// 把槽位置成「有一轮在 `start` 这一时刻进入 RUNNING」，返回那一轮的世代号。
