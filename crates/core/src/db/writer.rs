@@ -818,6 +818,19 @@ fn snapshot_recovery(state: &WriterState, take: bool) {
     // 不在内存里、也不在兜底文件里 —— 而这恰恰是 stop 超时/panic 最常见的形态。
     let mut merged = agg.clone();
     merged.merge_in(&state.in_flight.lock().unwrap_or_else(|e| e.into_inner()));
+    // 第三次：上一份兜底文件"取走"的那一批。`take=true` 会把批次从 agg 挪进
+    // `snapshot_taken`，此后它**只剩两处副本**：内存里那一份和盘上那一份。
+    // 只按 agg ∪ 在途重写文件的话（panic 钩子在 stop 之后再插一次就是这条，
+    // 见 `logger.rs` 的 hook → `panic_recovery_snapshot`），tmp+rename 正好把带着
+    // 它的那份文件盖掉 —— 于是那批既不在库里（正因为写不进去才要兜底）、
+    // 不在 agg（已被取走）、也不在文件里，进程一退就真的没有了。
+    // `settle_after_stop_snapshot` 并回之后这把是空的，所以不会重复计数。
+    merged.merge_in(
+        &state
+            .snapshot_taken
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    );
     if merged.is_empty() {
         return;
     }
@@ -2101,6 +2114,63 @@ mod tests {
         assert_eq!(
             total, 11,
             "兜底文件里必须是那批未落库的增量：{:?}",
+            saved.daily
+        );
+    }
+
+    /// 第二次兜底快照必须连第一次取走的那一批一起带上，不许把带着它的那份文件盖掉。
+    ///
+    /// `snapshot_recovery(take=true)` 会把批次从 agg 挪进 `snapshot_taken`，此后它只剩
+    /// 内存与盘上两份副本；生产里的第二次快照来自 panic 钩子（`logger.rs` 的 hook，
+    /// 时机正好在 `stop()` 之后、进程终止之前）。只按 agg ∪ 在途重写文件，就等于用一份
+    /// **不含它**的文件盖掉原来那份 —— 而库正因为写不进去才需要兜底，那批按键从此无处可寻。
+    #[test]
+    fn a_second_snapshot_still_covers_the_batch_the_first_one_took() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_second_snapshot");
+        // 周期 flush 拉到 1 小时：这条要盯的是两次快照之间没有别人来并回内存
+        let w = start_writer(Duration::from_secs(3600));
+        let db_path = paths::year_db_path(chrono::Local::now().year());
+        if std::fs::metadata(&db_path).is_ok() {
+            std::fs::remove_file(&db_path).expect("删掉刚建好的年度库");
+        }
+        std::fs::create_dir_all(&db_path).expect("把年度库的位置做成目录");
+
+        let t0 = queries::now_ts();
+        for i in 0..7 {
+            w.record("A", t0 + i);
+        }
+        w.stop_and_wait();
+        assert!(
+            !w.is_alive(),
+            "前提：写线程已退出，否则第二次快照之后还会有一次并回内存"
+        );
+        assert_eq!(w.flush_seq(), 0, "夹具没生效：这 7 条居然落库了");
+        let taken: i64 = w
+            .state
+            .snapshot_taken
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .daily
+            .values()
+            .sum();
+        assert_eq!(
+            taken, 7,
+            "前提：第一次快照得先把这 7 条取走，它们才只剩内存与文件两份副本"
+        );
+
+        // 线程停了之后再进来一次输入，然后走 panic 钩子那一条的形状做第二次快照
+        for i in 0..4 {
+            w.record("B", t0 + 30 + i);
+        }
+        snapshot_recovery(&w.state, true);
+
+        let text = std::fs::read_to_string(recovery_path()).expect("第二次快照要留下文件");
+        let saved: AggDeltasFile = serde_json::from_str(&text).expect("恢复文件要能解析");
+        let total: i64 = saved.daily.iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            total, 11,
+            "文件里得是「第一次取走的 7 条 + 第二次那 4 条」；只盖成第二次那一趟就丢了 7 条：{:?}",
             saved.daily
         );
     }
