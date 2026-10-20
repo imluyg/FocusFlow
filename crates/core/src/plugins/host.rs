@@ -262,13 +262,18 @@ pub fn register_host_api(
         lua.create_function(|_, ()| Ok(pomodoro_timer().toggle_pause()))?,
     )?;
 
-    host.set(
-        "pomodoro_stop",
-        lua.create_function(|_, ()| {
-            pomodoro_timer().stop();
-            Ok(())
-        })?,
-    )?;
+    // 「停止」把结局交回面板：`(阶段类型或 nil, 实际秒数, 有没有落库)`。
+    // 面板原先无条件说「这一段按完成落库，会算进今日完成」，而没在计时、一秒都没计到、
+    // 写库没成这三种情况下它都不成立；休息那半段落了库也不计入今日完成，所以类型也交出。
+    let pomo_stop = lua.create_function(|_, ()| {
+        let out = match pomodoro_timer().stop() {
+            pomodoro::Stopped::Nothing => (None, 0i64, false),
+            pomodoro::Stopped::Recorded { rtype, seconds } => (Some(rtype), seconds, true),
+            pomodoro::Stopped::SaveFailed { rtype, seconds } => (Some(rtype), seconds, false),
+        };
+        Ok(out)
+    })?;
+    host.set("pomodoro_stop", pomo_stop)?;
 
     // 与 pomodoro_stop 的区别：stop 只结束当前番茄会话、线程继续跑；
     // 这个是插件停用/卸载时在 cleanup 里回收计时线程用。

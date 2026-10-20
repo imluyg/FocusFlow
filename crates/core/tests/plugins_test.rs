@@ -1854,4 +1854,76 @@ mod tests {
             "trim 之后还要就地拦下空名，否则空分类被写进库"
         );
     }
+
+    /// 空闲时按「停止」，面板不许说「这一段按完成落库、会算进今日完成」。
+    /// 宿主原先只回 `()`，面板无从分辨三种结局（没在计时 / 一秒都没计到 / 写库没成），
+    /// 于是开着面板直接点停止也当着用户的面说一句没发生过的账。
+    #[test]
+    fn stopping_an_idle_pomodoro_does_not_claim_a_landed_session() {
+        use focusflow_core::plugins::Widget;
+
+        fn sayings(manager: &PluginManager, name: &str) -> String {
+            fn walk(ws: &[Widget], out: &mut Vec<String>) {
+                for w in ws {
+                    match w {
+                        Widget::Label(t) => out.push(t.clone()),
+                        Widget::Row { children } => walk(children, out),
+                        Widget::ModalForm {
+                            content,
+                            widgets: inner,
+                            ..
+                        } => {
+                            if !content.is_empty() {
+                                out.push(content.clone());
+                            }
+                            walk(inner, out);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let ws = manager
+                .get_plugin(name)
+                .and_then(|p| p.view.as_ref())
+                .map(|v| v.widgets.clone())
+                .unwrap_or_default();
+            let mut out = Vec::new();
+            walk(&ws, &mut out);
+            out.join(" | ")
+        }
+
+        let _guard = guard();
+        let (_tmp, mut manager, name) = bundled_in("pomo_stop_hint", "pomodoro_plugin.lua");
+        focusflow_core::pomodoro::init_db().ok();
+
+        manager
+            .plugin_action(&name, "stop")
+            .expect("停止动作不该失败");
+        let said = sayings(&manager, &name);
+        assert!(
+            said.contains("没有在计时的番茄钟"),
+            "空闲停止要说清什么都没结束: {said}"
+        );
+        assert!(
+            !said.contains("会算进「今日完成」"),
+            "空闲时不许承诺计入今日完成: {said}"
+        );
+
+        // 反向腿：刚开始就停（一秒都没计到）同样什么都没落
+        manager
+            .plugin_action(&name, "start_work")
+            .expect("开始工作不该失败");
+        manager
+            .plugin_action(&name, "stop")
+            .expect("停止动作不该失败");
+        let said2 = sayings(&manager, &name);
+        assert!(
+            said2.contains("一秒都没计到"),
+            "刚开始就停要说清这一段没计到时间: {said2}"
+        );
+        assert!(
+            !said2.contains("会算进「今日完成」"),
+            "什么都没落库时不许说算进今日完成: {said2}"
+        );
+    }
 }

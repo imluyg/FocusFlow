@@ -70,6 +70,17 @@ pub struct Session {
     pub created_at: String,
 }
 
+/// 一次「停止（记为完成）」的结局。面板要照它说话，不能替用户猜。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stopped {
+    /// 没在计时，或这一段一秒都没计到：什么都没落库
+    Nothing,
+    /// 落库成功（阶段类型与实际秒数）
+    Recorded { rtype: String, seconds: i64 },
+    /// 有这一段但写库没成（库被占用 / 打不开）：没落库，也不算完成
+    SaveFailed { rtype: String, seconds: i64 },
+}
+
 /// 保存一条会话记录。
 pub fn save_session(s: &Session) -> anyhow::Result<()> {
     let conn = open_local()?;
@@ -442,7 +453,13 @@ impl PomodoroTimer {
         s.key_count = 0;
     }
 
-    pub fn stop(&self) {
+    /// 停止当前阶段：已经计到的时间照常落库，但**只有真的落成了才算这一段**。
+    ///
+    /// 返回的结局是替面板说的那句话：「这一段按完成落库，会算进今日完成」原先是无条件
+    /// 讲的，而它在三种情况下不成立 —— 没在计时、这一段一秒都没计到（`take_current`
+    /// 直接丢掉）、写库没成。休息那半段还会落库但不计入「今日完成」（`today_summary`
+    /// 只数 work 行），所以类型也要一起交出去。
+    pub fn stop(&self) -> Stopped {
         let pending = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let p = take_current(&mut s);
@@ -453,10 +470,23 @@ impl PomodoroTimer {
             s.key_count = 0;
             p
         };
-        if let Some(session) = pending {
-            persist_session(&self.state, &session);
+        match pending {
+            None => {
+                tracing::info!("番茄钟已停止（这一段没有可落库的内容）");
+                Stopped::Nothing
+            }
+            Some(session) => {
+                let rtype = session.rtype.clone();
+                let seconds = session.actual_seconds;
+                let saved = persist_session(&self.state, &session);
+                tracing::info!("番茄钟已停止");
+                if saved {
+                    Stopped::Recorded { rtype, seconds }
+                } else {
+                    Stopped::SaveFailed { rtype, seconds }
+                }
+            }
         }
-        tracing::info!("番茄钟已停止");
     }
 
     /// 按键回调：仅在工作中计数。
@@ -539,15 +569,16 @@ fn take_current(s: &mut TimerState) -> Option<Session> {
     Some(session)
 }
 
-/// 出锁后落盘 `take_current` 交出来的那一段，**真的落进库才计一个番茄**。
+/// 出锁后落盘 `take_current` 交出来的那一段，**真的落进库才计一个番茄**，
+/// 并把结局交给调用方（面板要照它说话，见 [`PomodoroTimer::stop`]）。
 ///
 /// 原来 `take_current` 在锁内就先 `work_finished += 1`，写库失败只留一句
 /// `tracing::error!`：内存里的计数与库里的行数从此永久分叉 —— 卡片上"今日完成 4 个"
 /// 而库里只有 3 行，重启后按库行数读数就无声缩水。改成两边同轨：库里有这一行才算数。
-fn persist_session(state: &Mutex<TimerState>, session: &Session) {
+fn persist_session(state: &Mutex<TimerState>, session: &Session) -> bool {
     if let Err(e) = save_session(session) {
         tracing::error!("保存番茄钟记录失败: {e}（本次不计入已完成番茄数）");
-        return;
+        return false;
     }
     if session.rtype == STATE_WORK && session.actual_seconds >= 1 {
         state
@@ -555,6 +586,7 @@ fn persist_session(state: &Mutex<TimerState>, session: &Session) {
             .unwrap_or_else(|e| e.into_inner())
             .work_finished += 1;
     }
+    true
 }
 
 /// 一次 tick 之间过了多少**墙钟秒**。
@@ -980,5 +1012,68 @@ mod busy_lock_tests {
         assert_eq!(advance_stage_seconds(900, 600, -5), (900, 600));
         // 计划外的畸形 remaining（历史状态里可能是负数）不能推进度
         assert_eq!(advance_stage_seconds(-30, 1500, 5), (-30, 1500));
+    }
+
+    /// 「停止」交出的结局要能撑起面板那句话：空闲时什么都没有落库。
+    /// 面板原先无条件说「这一段按完成落库，会算进今日完成」，开着面板直接点停止
+    /// 就是当着用户的面说一句没发生过的账。
+    #[test]
+    fn stopping_an_idle_timer_records_nothing() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("pomo_stop_idle");
+        init_db().ok();
+
+        let t = PomodoroTimer::new();
+        assert_eq!(t.stop(), Stopped::Nothing, "没在计时时按停止不该有落库的段");
+        t.shutdown();
+    }
+
+    /// 正向对照：真落了库的一段工作必须交出类型与秒数 —— 只有这种结局下
+    /// 「按完成落库、算进今日完成」那句才成立。
+    #[test]
+    fn a_landed_work_session_is_reported_as_work() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("pomo_stop_work");
+        init_db().ok();
+
+        let t = PomodoroTimer::new();
+        t.start_work().expect("计时线程应可用");
+        tick_once(&t.state, 5, Local::now());
+        let out = t.stop();
+        t.shutdown();
+
+        assert!(
+            matches!(out, Stopped::Recorded { ref rtype, seconds }
+                     if rtype == STATE_WORK && seconds >= 1),
+            "落了库的一段工作要交出类型与秒数，实际 {out:?}"
+        );
+        assert_eq!(
+            today_summary().0,
+            1,
+            "夹具前提：这一段确实落进了库（面板那句「算进今日完成」才有依据）"
+        );
+    }
+
+    /// 写库没成时不许说「按完成落库」：夹具把番茄库的路径做成同名目录
+    /// （本仓既有的"这截写不进去"形状）。
+    #[test]
+    fn an_unwritable_session_is_reported_as_save_failed() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("pomo_stop_fail");
+        init_db().ok();
+        std::fs::remove_file(db_path()).ok();
+        std::fs::create_dir_all(db_path()).expect("夹具：把番茄库路径做成目录");
+
+        let t = PomodoroTimer::new();
+        t.start_work().expect("计时线程应可用");
+        tick_once(&t.state, 5, Local::now());
+        let out = t.stop();
+        t.shutdown();
+
+        assert!(
+            matches!(out, Stopped::SaveFailed { ref rtype, .. } if rtype == STATE_WORK),
+            "写不进去要报成「没落成」，实际 {out:?}"
+        );
+        assert_eq!(today_summary().0, 0, "没落库就不该计入今日完成");
     }
 }

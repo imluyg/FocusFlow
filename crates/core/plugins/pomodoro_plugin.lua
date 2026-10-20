@@ -85,10 +85,24 @@ function on_action(id)
             hint = "已继续计时"
         end
     elseif id == "stop" then
-        -- 停止 = 结束这一段，但**已经计到的时间照常落库并计入今日番茄数**
-        -- （核心 `take_current` 只要 actual > 0 就写一行）。要作废请用「跳过」。
-        focusflow.pomodoro_stop()
-        hint = "已停止：这一段按完成落库，会算进「今日完成」"
+        -- 停止 = 结束这一段，**已经计到的时间照常落库**；要作废请用「跳过」。
+        -- 但"按完成落库、算进今日完成"只在真落了库、且落的是工作阶段时成立：
+        -- 没在计时、一秒都没计到、写库没成三种情况下什么都没落，休息段落了库也不计入
+        -- 今日完成。宿主把结局分开交回来（类型、秒数、是否落库），面板照它说。
+        local was_running = (focusflow.pomodoro_state()["state"] or 0) ~= 0
+        local kind, seconds, saved = focusflow.pomodoro_stop()
+        if not was_running then
+            hint = "没有在计时的番茄钟：什么都没有结束，也没有落库"
+        elseif kind == nil then
+            hint = "已停止：这一段一秒都没计到，没有落库，也不计入「今日完成」"
+        elseif not saved then
+            hint = "已停止：这一段（" .. _fmt(seconds)
+                .. "）没能写进库（库被占用或打不开），没有算作完成"
+        elseif kind == "work" then
+            hint = "已停止：这一段 " .. _fmt(seconds) .. " 按完成落库，会算进「今日完成」"
+        else
+            hint = "已停止：这段休息 " .. _fmt(seconds) .. " 落库了，但「今日完成」只数工作阶段"
+        end
     elseif id == "skip" then
         -- 宿主的 pomodoro_skip 早就有"这段作废"的语义（不落库、不计入今日番茄数），
         -- 只是面板一直缺这个按钮：工作到一半只能按停止，于是今日汇总谎报"完成 1 个"。
