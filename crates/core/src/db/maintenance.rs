@@ -844,7 +844,12 @@ pub fn cleanup_old_data(keep_days: i64) -> CleanupReport {
         // 与日期删除解耦：它删的是已经不被任何统计行引用的登记，且设备再出现时
         // 会按同一路径自动重新登记，因此不需要为它单独付一次全量快照。
         if !year_failed {
-            prune_orphan_devices(&conn);
+            if let Err(e) = prune_orphan_devices(&conn) {
+                tracing::error!(
+                    "{year} 年设备登记的孤儿清理没跑成（本轮日期删除照常提交，\
+                     那些没人引用的登记会留到下次）: {e}"
+                );
+            }
         }
         // 提交失败 = 这一年的删除被回滚，不能把它算进「已清理」的回报里
         let committed = !year_failed && conn.execute_batch("COMMIT").is_ok();
@@ -874,13 +879,19 @@ pub fn cleanup_old_data(keep_days: i64) -> CleanupReport {
 /// 清掉已经没有任何统计行引用的设备登记（`devices` 没有 date_key，不能按日期删）。
 ///
 /// 别名存在 `device_aliases.json`，不受影响；设备再出现时会按同一路径重新登记。
-fn prune_orphan_devices(conn: &Connection) -> usize {
+///
+/// 删除失败必须与「确实没有孤儿可删」分开：原先写的是 `.unwrap_or(0)`，于是"表解不开、
+/// 库读不动"也报成一个安静的 0，而这一轮的日期删除照常 COMMIT、照常打「已清理 N 年数据」
+/// —— 那些没人引用的设备登记就永久留在库里，一次日志都没有。口径与
+/// [`backup_alias_snapshot`] 一致：**出声，但不把已经做成的清理改判成失败**
+/// （统计行是真删掉了，回滚它反而会把清理做丢）。
+fn prune_orphan_devices(conn: &Connection) -> Result<usize, String> {
     conn.execute(
         "DELETE FROM devices WHERE id NOT IN (SELECT device_id FROM device_counts) \
                                    AND id NOT IN (SELECT device_id FROM device_key_counts)",
         [],
     )
-    .unwrap_or(0)
+    .map_err(|e| e.to_string())
 }
 
 /// VACUUM 指定数据库，返回是否成功（失败已记日志）。
@@ -1824,6 +1835,29 @@ fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
+/// 备份「谁新谁旧」的键：mtime，**打平时按文件名**。
+///
+/// mtime 单独用不够：一次备份要给多个库写文件、同一秒内还能跑两轮备份，而 FAT/同步盘
+/// 的粒度是 2 秒 —— 打平之后顺序就由目录读取顺序决定，`select_retained` 的契约
+/// （「files 必须已按新→旧排序」）当场失效，于是**最新那份恢复点被删掉、旧的留下**，
+/// 且日志只说「删除 N 份旧备份」。`alias_backups` 早就为同一件事加了文件名次键
+/// （那里的注释写的正是这条后果），`.db` 的这两处排序是漏下的另一半。
+fn backup_order_key(path: &Path) -> (Option<std::time::SystemTime>, String) {
+    (
+        file_mtime(path),
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    )
+}
+
+/// 把同一组的备份排成**新 → 旧**（[`retain_newest_per_bucket`] 要求的输入序）。
+fn sort_backups_newest_first(files: &mut [std::path::PathBuf]) {
+    // sort_by_cached_key：键里带 stat 系统调用，sort_by_key 会按比较次数重复 stat
+    files.sort_by_cached_key(|p| backup_order_key(p));
+    files.reverse();
+}
+
 const SOURCE_SIZE_KEY: &str = "src_size";
 const SOURCE_MTIME_KEY: &str = "src_mtime";
 
@@ -1924,9 +1958,9 @@ fn newest_backup_of_group(group: &str) -> Option<std::path::PathBuf> {
                 .unwrap_or(false)
         })
         .collect();
-    // sort_by_cached_key：key 里有一次 stat 系统调用，用 sort_by_key 会按比较次数重复 stat
-    files.sort_by_cached_key(|p| file_mtime(p.as_path()));
-    files.pop()
+    // 与轮转共用一把尺子：mtime 打平时靠文件名认最新
+    sort_backups_newest_first(&mut files);
+    files.first().cloned()
 }
 
 /// 保留策略：最近 N 份 + 每天/每周/每月各一份。
@@ -1956,11 +1990,14 @@ impl RetentionPolicy {
 /// 从备份文件名解析日期（`focusflow_{组}_{YYYYMMDD}_{HHMMSS[mmm]}.db`），
 /// 解析失败回退文件修改时间。
 fn backup_file_date(path: &Path) -> Option<NaiveDate> {
-    let name = path.file_name()?.to_string_lossy().to_string();
-    if let Some(stem) = name.strip_suffix(".db") {
-        let parts: Vec<&str> = stem.split('_').collect();
-        if parts.len() >= 4 {
-            if let Ok(d) = NaiveDate::parse_from_str(parts[2], "%Y%m%d") {
+    // 与 [`backup_stamp`] 同一把尺子：从**尾部**取两段。原先是从头部数第 3 段，
+    // 组名带下划线的那些（`focusflow_edge_history_{日期}_{时间}.db`）在第 3 段拿到的是
+    // "history"，解不开就静默回落到 mtime —— 于是这一组的日/周/月分层桶用的是另一把尺子，
+    // 而同一个函数里的年份库/单名附属库用的是文件名尺子。mtime 会被同步盘与复制改写，
+    // `backup_stamp` 的注释记的正是这件事。
+    if let Some(stamp) = backup_stamp(path) {
+        if let Some(date) = stamp.split('_').next() {
+            if let Ok(d) = NaiveDate::parse_from_str(date, "%Y%m%d") {
                 return Some(d);
             }
         }
@@ -2116,8 +2153,7 @@ fn rotate_backups(policy: RetentionPolicy, freeze: bool) {
         }
     }
     for (group, files) in groups.iter_mut() {
-        files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-        files.reverse();
+        sort_backups_newest_first(files);
         if freeze {
             tracing::warn!(
                 "数据异常，冻结轮转：{group} 组保留全部 {} 份备份（未删除）",
@@ -2707,6 +2743,147 @@ mod tests {
         assert!(
             !remaining.contains(&"focusflow_accounting_20260911_100000.db".to_string()),
             "accounting 组最旧备份应被删除"
+        );
+    }
+
+    /// mtime 打平时的次键：一轮备份要给多个库写文件、同一秒内还能跑两轮，而 FAT/同步盘的
+    /// 粒度是 2 秒 —— 那时「哪份最新」由目录读取顺序决定，`select_retained` 要求的
+    /// 「输入已按新→旧排序」契约当场失效，于是删掉的是最新那份恢复点、留下旧的。
+    /// 回归：`.db` 的两处排序只认 mtime，而 `alias_backups` 早就带了文件名次键。
+    #[test]
+    fn backup_order_ties_break_to_the_filename_stamp() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("rotate_tie");
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+
+        let same =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let newer = "focusflow_2026_20260911_100000.db";
+        let older = "focusflow_2026_20260910_100000.db";
+        // 先写新的、再写旧的：没有次键时稳定排序原样保留输入序 ⇒ 新的排到末尾被删
+        for name in [newer, older] {
+            let p = paths::backup_dir().join(name);
+            std::fs::write(&p, b"x").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(same)
+                .unwrap();
+        }
+        assert_eq!(
+            file_mtime(&paths::backup_dir().join(newer)),
+            file_mtime(&paths::backup_dir().join(older)),
+            "夹具前提：两份备份的 mtime 必须真的打平，否则这条测的是另一件事"
+        );
+
+        let mut files = vec![
+            paths::backup_dir().join(newer),
+            paths::backup_dir().join(older),
+        ];
+        sort_backups_newest_first(&mut files);
+        assert_eq!(
+            files[0].file_name().unwrap().to_string_lossy(),
+            newer,
+            "mtime 打平时必须按文件名时间戳认最新"
+        );
+
+        let picked = newest_backup_of_group("2026")
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
+        assert_eq!(
+            picked.as_deref(),
+            Some(newer),
+            "「这一组最新的一份」走同一把尺子，它决定历史库要不要重备份"
+        );
+
+        rotate_backups(
+            RetentionPolicy {
+                recent: 1,
+                daily: 0,
+                weekly: 0,
+                monthly: 0,
+            },
+            false,
+        );
+        let left: Vec<String> = std::fs::read_dir(paths::backup_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            left,
+            vec![newer.to_string()],
+            "轮转必须删掉旧那份、留下新那份"
+        );
+    }
+
+    /// 备份文件名里的日期必须与 [`backup_stamp`] 同源（从**尾部**取两段）。
+    /// 回归：旧写法从头部数第 3 段，`focusflow_edge_history_*` 在那里拿到的是 "history"，
+    /// 解不开就静默改用 mtime —— 同一个函数里年份库按文件名归桶、多词组名按 mtime 归桶。
+    #[test]
+    fn backup_file_date_reads_the_stamp_from_the_tail() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("bdate");
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+
+        let p = paths::backup_dir().join("focusflow_edge_history_20260101_075125123.db");
+        std::fs::write(&p, b"x").unwrap();
+        // mtime 故意落在另一刻：文件名解得开时它必须完全不参与判断
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            )
+            .unwrap();
+        assert_eq!(
+            backup_file_date(&p),
+            NaiveDate::from_ymd_opt(2026, 1, 1),
+            "多词组名的备份必须按文件名里的日期归桶，不许静默改用 mtime"
+        );
+
+        // 反向腿：单段组名（年份库）本来就对，确认这次没把它一起改坏
+        let y = paths::backup_dir().join("focusflow_2026_20251231_075125123.db");
+        std::fs::write(&y, b"x").unwrap();
+        assert_eq!(
+            backup_file_date(&y),
+            NaiveDate::from_ymd_opt(2025, 12, 31),
+            "年份库的日期不能被这次改动挪位"
+        );
+    }
+
+    /// 设备字典清理：删除失败与「确实没有孤儿」必须是两种结局。
+    /// 回归：原先的 `.unwrap_or(0)` 把前者折成后者，本轮日期删除照常 COMMIT、
+    /// 照常打「已清理 N 年数据」，那些没人引用的登记永久留在库里且零日志。
+    #[test]
+    fn device_prune_separates_failure_from_nothing_to_delete() {
+        // 失败腿：连 devices 表都没有 ⇒ 旧写法返回 0，和「没有孤儿」长得一模一样
+        let broken = Connection::open_in_memory().unwrap();
+        let err = prune_orphan_devices(&broken).expect_err("表解不开必须报 Err");
+        assert!(err.contains("devices"), "错误里要看得见是哪张表: {err}");
+
+        // 正向腿一：建好表、确实没有登记 ⇒ Ok(0)
+        let good = Connection::open_in_memory().unwrap();
+        connection::ensure_schema(&good, 2026).unwrap();
+        assert_eq!(
+            prune_orphan_devices(&good).unwrap(),
+            0,
+            "没有孤儿时是 Ok(0)，不是 Err"
+        );
+
+        // 正向腿二：有一条没人引用的登记 ⇒ 真删掉（防止这条修成永远不动手）
+        good.execute(
+            "INSERT INTO devices (id, device_key, name, kind) VALUES (77, 'HID#k', '自动名', 'mouse')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(prune_orphan_devices(&good).unwrap(), 1, "孤儿登记必须删掉");
+        assert_eq!(
+            good.query_row("SELECT COUNT(*) FROM devices", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "删完必须真的没有残留"
         );
     }
 
