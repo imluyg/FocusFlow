@@ -46,6 +46,26 @@ pub(crate) fn is_paused_now(flag: &PauseFlag) -> bool {
     flag.load(Ordering::Relaxed)
 }
 
+/// rdev 的 Windows 码表漏登记、而本程序四处已经认了名字的虚拟键码，补回成它应有的 `Key`。
+///
+/// 取证（rdev 0.5.3 `src/windows/keycodes.rs` 的码表，现场读过）：里面只有
+/// `MetaLeft, 91` 一条 —— 92(VK_RWIN)/93(VK_APPS) 都没有臂，`key_from_code` 对它们落到
+/// `_ => Key::Unknown(code)`。而本仓在三个地方已经把「右Win」当一等公民登记：
+/// 本文件的名字表（`Key::MetaRight => "右Win"`）、`format::classify_key` 的修饰键分组、
+/// 热力板 `charts.js` 的「右Win」那一格；设备侧信道 `device_stats.rs` 更是直接按 0x5C 计数。
+/// 结果就是同一个物理键两处各说各的：设备详情里它在涨，而主链路的排行/分组/热力板那一格
+/// 永远是空的 —— 更糟的是它连"未知键"都进不去（下面 `Key::Unknown(_) → return` 按口径丢弃）。
+///
+/// 只补**已经登记过名字**的那一个码；其余 Unknown 仍按原口径丢弃（多媒体键、输入法合成
+/// 事件、厂商 OEM 键没有稳定名字，端给用户只会是 `Unknown(N)`）。菜单键(93) 主链路从没
+/// 认过名字，补它等于新增功能而不是修分叉，所以留在这里不动。
+fn rescue_rdev_gap_key(key: &Key) -> &Key {
+    match key {
+        Key::Unknown(92) => &Key::MetaRight,
+        _ => key,
+    }
+}
+
 /// 修饰键集合（用于过滤）
 fn is_modifier(key: &Key) -> bool {
     matches!(
@@ -528,7 +548,10 @@ impl InputListener {
         let ignore_functions = self.cfg.ignore_functions.load(Relaxed);
 
         match &event.event_type {
-            EventType::KeyPress(key) => {
+            EventType::KeyPress(raw_key) => {
+                // rdev 码表漏登记的键先补回本来的身份（见 `rescue_rdev_gap_key`）：
+                // 补在两道过滤**之前**，"忽略修饰键"这类开关才会对左右 Win 一视同仁。
+                let key = rescue_rdev_gap_key(raw_key);
                 // 过滤修饰键/功能键
                 if ignore_modifiers && is_modifier(key) {
                     return;
@@ -549,7 +572,11 @@ impl InputListener {
                 }
                 self.record_event(db, &name);
             }
-            EventType::KeyRelease(key) => {
+            EventType::KeyRelease(raw_key) => {
+                // 抬起这一侧必须做同一件补登：按下记的是「右Win」而抬起按 Unknown 丢掉，
+                // `pressed` 集合就永远留着那一项，之后每次长按重复过滤都会把它当成
+                // 没抬起来的新键 —— 只在按下那侧补登会把这个键从"不计数"变成"只计一次"。
+                let key = rescue_rdev_gap_key(raw_key);
                 // 未知键从未进入 pressed 集合，直接跳过（同时避免 normalize_key 的格式化分配）
                 if matches!(key, Key::Unknown(_)) {
                     return;
@@ -1157,5 +1184,80 @@ mod tests {
                 classify_key(&name)
             );
         }
+    }
+
+    /// rdev 码表漏登记的那个码要补回它本来的身份，且**只**补我们已登记过名字的。
+    ///
+    /// 现场取证：`rdev-0.5.3/src/windows/keycodes.rs` 的码表里只有 `MetaLeft, 91`，
+    /// 92(VK_RWIN) 没有臂 ⇒ 走 `_ => Key::Unknown(code)`；而本仓的名字表、分组表与
+    /// 热力板都登记了「右Win」，设备侧也按 0x5C 在计 —— 主链路却因为它"未知"而丢掉。
+    #[test]
+    fn the_rdev_gap_rescue_only_covers_registered_names() {
+        assert_eq!(
+            key_display_name(rescue_rdev_gap_key(&Key::Unknown(92))),
+            "右Win",
+            "92 必须补成右Win，否则热力板那一格永远空着"
+        );
+        assert_eq!(
+            rescue_rdev_gap_key(&Key::Unknown(92)),
+            &Key::MetaRight,
+            "补的是身份本身，不是只换个显示名：修饰键过滤与分组都要按修饰键认"
+        );
+        // 其余 Unknown 一律照旧丢弃（93 菜单键主链路从没认过名字，补它等于新增功能）
+        for code in [1u32, 2, 93, 124, 199, 255] {
+            assert_eq!(
+                rescue_rdev_gap_key(&Key::Unknown(code)),
+                &Key::Unknown(code),
+                "Unknown({code}) 不该被这条判据收走"
+            );
+        }
+        // 已经登记过的键不许被动到
+        assert_eq!(rescue_rdev_gap_key(&Key::MetaLeft), &Key::MetaLeft);
+        assert_eq!(rescue_rdev_gap_key(&Key::Delete), &Key::Delete);
+
+        // 补登之后这条键名在分组那把尺子里也算修饰键（与上面那条用例同一判据，
+        // 差别是这里走的是"事件真的以 Unknown 到达"的那条路）
+        assert_eq!(
+            crate::format::classify_key(&normalize_key(rescue_rdev_gap_key(&Key::Unknown(92)))),
+            "修饰键"
+        );
+    }
+
+    /// 接线腿：按下与抬起**两侧**都必须先补登，且补登要排在两道过滤之前。
+    ///
+    /// 只在按下那侧补登 ⇒ `pressed` 集合里的「右Win」永远没人摘掉，之后每次重复过滤都
+    /// 把它当成已按住的旧键，症状从"一次都不计"变成"只计第一次"；补登排在未知键丢弃
+    /// 之后 ⇒ 这条救援根本走不到。
+    #[test]
+    fn both_press_and_release_arms_rescue_before_filtering() {
+        let src = include_str!("listener.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn process_event")
+            .expect("process_event 找不到了");
+        let body = &prod[at..];
+        let hits: Vec<usize> = body
+            .match_indices("rescue_rdev_gap_key(raw_key)")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            2,
+            "按下与抬起两侧都要补登（实际只在 {hits:?} 处看到调用）"
+        );
+        let drop_gate = body
+            .find("matches!(key, Key::Unknown(_))")
+            .expect("未知键丢弃那道闸不见了");
+        assert!(
+            hits[0] < drop_gate,
+            "补登必须排在未知键丢弃之前（补登在第 {} 字、丢弃在第 {} 字），否则这条救援走不到",
+            hits[0],
+            drop_gate
+        );
+        let mod_gate = body.find("is_modifier(key)").expect("修饰键过滤不见了");
+        assert!(
+            hits[0] < mod_gate,
+            "补登必须排在「忽略修饰键」过滤之前，否则左右 Win 的待遇会分叉"
+        );
     }
 }
