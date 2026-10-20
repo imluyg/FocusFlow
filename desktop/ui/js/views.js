@@ -962,7 +962,7 @@ const SETTINGS_CATS = [
           },
           {
             id: "set-paused", t: "switch", name: "暂停记录",
-            desc: "暂停期间不再统计键鼠。托盘与悬浮窗也能切，状态会同步到这里。",
+            desc: "暂停期间不再统计键鼠。托盘也能切，悬浮窗只显示「已暂停」角标；状态会同步到这里。",
             v: (s) => !!s.paused, on: onPauseChange,
           },
         ],
@@ -1053,12 +1053,12 @@ const SETTINGS_CATS = [
         rows: [
           {
             id: "set-floating", t: "switch", name: "显示悬浮窗",
-            desc: "关掉后本次运行不再显示。",
+            desc: "关掉之后本次运行不再显示，并写进配置：下次启动也照它来。",
             v: (s) => !!s.floating_enabled, on: onFloatingChange,
           },
           {
             t: "btns", name: "临时显示 / 隐藏",
-            desc: "只影响当前这一次，不改上面那个开关。",
+            desc: "这两个按钮会把上面那个开关一起改到对应位置，同样写进配置（托盘那一项也一样）。",
             btns: [
               { act: "show-floating", label: "立即显示" },
               { act: "hide-floating", label: "立即隐藏" },
