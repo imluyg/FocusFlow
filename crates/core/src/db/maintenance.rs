@@ -1124,6 +1124,21 @@ fn sidecar_paths(db: &Path) -> [std::path::PathBuf; 2] {
     [std::path::PathBuf::from(wal), std::path::PathBuf::from(shm)]
 }
 
+/// 备份文件的日志模式是否**真的**切成了 rollback journal。
+///
+/// 不能看 `pragma_update(..).is_ok()`：`PRAGMA journal_mode=DELETE` 是"回一行结果模式"的语句，
+/// 切不动时它回的是**当前那一种**（例如还停在 `wal`），而语句本身照样成功 ——
+/// 与本文件上面那条 `wal_checkpoint_truncate` 记的是同一课（rusqlite 走 `execute_batch`
+/// 时连 BUSY 都会折成结果行）。这一格误判的代价不是"多留一个 sidecar"，而是
+/// **删掉一个非空 WAL**：那份备份就此丢掉只写在 WAL 里的那几笔，
+/// 而紧接着盖上的源库指纹会让它以后都被 `year_db_needs_backup` 跳过。
+/// 所以判据取"这条 PRAGMA 交回来的那个词"，不取"它没报错"。
+fn journal_mode_switched_to_delete(conn: &Connection) -> bool {
+    conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get::<_, String>(0))
+        .map(|mode| mode.eq_ignore_ascii_case("delete"))
+        .unwrap_or(false)
+}
+
 /// 收尾备份文件，让它成为**单个自包含文件**。
 ///
 /// 在线备份 API 会把源库的「WAL 模式」头一起复制过去，于是备份本身也是 WAL 库：
@@ -1135,7 +1150,7 @@ fn sidecar_paths(db: &Path) -> [std::path::PathBuf; 2] {
 /// 所以备份完成后切回 rollback journal 并清掉 sidecar。
 fn finalize_backup(dst: &Path) {
     let switched = Connection::open(dst)
-        .map(|conn| conn.pragma_update(None, "journal_mode", "DELETE").is_ok())
+        .map(|conn| journal_mode_switched_to_delete(&conn))
         .unwrap_or(false);
     let [wal, shm] = sidecar_paths(dst);
     // 非空 WAL 里可能有还没并回主库的数据：只有确认切换成功、或 WAL 缺失/0 字节时才删
@@ -2710,6 +2725,75 @@ fn scale_hourly_to_total(conn: &Connection, day_key: i64, target_total: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 日志模式那一格的判据要取「PRAGMA 交回来的那个词」，不是「它没报错」。
+    ///
+    /// 同一个连接里开着事务时 `PRAGMA journal_mode=DELETE` 切不动，交回来的是当前模式，
+    /// 而语句本身照样成功 —— 旧写法 `pragma_update(..).is_ok()` 在这里仍是 true，
+    /// 于是 finalize_backup 会走进"删 sidecar"那一支，把非空 WAL 一起删掉：
+    /// 那份备份丢掉只写在 WAL 里的几笔，而随后盖上的源库指纹让它以后都被跳过。
+    #[test]
+    fn journal_mode_delete_is_confirmed_by_the_mode_it_returns() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("journal_mode_confirm");
+        let p = dir.path().join("t.db");
+        let conn = Connection::open(&p).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        // 切得动的一支：必须确认为真
+        assert!(
+            journal_mode_switched_to_delete(&conn),
+            "没有东西挡着时必须确认为真，否则备份 sidecar 永远留着"
+        );
+        let [wal, _shm] = sidecar_paths(&p);
+        assert!(
+            std::fs::metadata(&wal)
+                .map(|m| m.len() == 0)
+                .unwrap_or(true),
+            "切成 DELETE 之后 -wal 该被并回主库"
+        );
+
+        // 挡着的一支：同连接在事务里，切不动
+        let conn2 = Connection::open(&p).unwrap();
+        conn2.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        conn2.execute("BEGIN", []).unwrap();
+        conn2.execute("INSERT INTO t VALUES (2)", []).unwrap();
+        assert!(
+            !journal_mode_switched_to_delete(&conn2),
+            "事务里切不动时要交回 false；旧判据在这里说 true"
+        );
+        // 夹具前提：同一种状态下"没报错"那个旧判据依然被满足 ——
+        // 这一条才是"新判据不是换了个等价写法"的证据，摘掉它用例就退化成自我确认。
+        assert!(
+            conn2.pragma_update(None, "journal_mode", "DELETE").is_ok(),
+            "夹具没成立：旧判据在这一刻本来是失败的，那这条用例照不出分叉"
+        );
+        conn2.execute("ROLLBACK", []).ok();
+    }
+
+    /// 接线腿：`finalize_backup` 不许再用「它没报错」当确认。
+    #[test]
+    fn finalize_backup_uses_the_returned_mode_as_proof() {
+        let src = include_str!("maintenance.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod.find("fn finalize_backup(").expect("收尾函数找不到了");
+        let rest = &prod[at..];
+        let end = rest.find("\nfn ").expect("收尾函数之后没有顶层函数了");
+        let code: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("journal_mode_switched_to_delete("),
+            "收尾没走那条确认判据"
+        );
+        assert!(
+            !code.contains(".is_ok()"),
+            "「它没报错」又被当成「模式切成了」"
+        );
+    }
 
     /// 一条**平台前提**（本轮现量，三个产品路径都踩在它上面：
     /// `data_location.rs` 的"留档先 `rename` 主库"、备份轮转的删除、改数据目录的搬运）：
