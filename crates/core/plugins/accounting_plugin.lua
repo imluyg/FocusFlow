@@ -213,7 +213,13 @@ function on_action(id)
         if draft.date == "" then
             draft.date = _today()
         else
-            backdated = draft.date ~= _today()
+            -- 「排在后面页」只在它比今天**早**时成立：列表是 purchase_date 降序，
+            -- 比今天晚的日期反而排在第 1 页最前。原先写 `~=`，于是记一笔明天的账
+            -- 也被当成补记 —— 提示让人去翻后面的页，而它就在眼前这页的第一行。
+            -- 比较前先 norm_date 收成补零形态（与宿主写入时同一把尺子），否则
+            -- `2026-9-1` 这种没补零的串按字节序会被判成「不早于今天」。
+            local nd = norm_date(draft.date)
+            backdated = nd ~= nil and nd < _today()
         end
         local new_id = focusflow.accounting_add(
             draft.type, draft.item, draft.store, draft.date, amount,
@@ -297,12 +303,31 @@ function on_action(id)
     elseif id:match("^del_") then
         -- 支持多选：id 形如 del_42,43
         local list = id:sub(5)
-        local deleted = 0
+        local deleted, failed = 0, 0
         for rid in list:gmatch("([^,]+)") do
             local n = tonumber(rid)
-            if n and focusflow.accounting_delete(n) then deleted = deleted + 1 end
+            if not n then
+                failed = failed + 1
+            elseif focusflow.accounting_delete(n) then
+                deleted = deleted + 1
+            else
+                failed = failed + 1
+            end
         end
         if deleted > 0 then focusflow.log("已删除 " .. deleted .. " 条记录") end
+        -- 每次删除都要写一句结论（本文件的规矩：add/save 成功失败都写）。
+        -- `list_msg` 只在 `reset_transient_state` 里清，只写失败那一支的话，
+        -- 下一次成功删除之后上一句「没删掉」还挂在页上。
+        -- 宿主把「记录已不存在」与「库打不开」都回 false，分不开，所以两种一起点名。
+        if failed == 0 then
+            list_msg = "已删除 " .. deleted .. " 条记录"
+        else
+            local head = ""
+            if deleted > 0 then head = "删掉了 " .. deleted .. " 条，" end
+            list_msg = head .. "这 " .. failed ..
+                " 条没删掉（记录可能已被别处删掉，或记账库正被占用），刷新后还在的就是没删掉的"
+            focusflow.log("删除有失败：成功 " .. deleted .. " 条，失败 " .. failed .. " 条")
+        end
         local _, total = query_page()
         clamp_page(total)
     elseif id:match("^days_") then
@@ -463,6 +488,14 @@ function on_action(id)
         end
     elseif id == "m_save_edit_cat" then
         if m_edit_old == nil or m_edit_old == "" then return end
+        -- 与「添加分类」那条同一个前置：先 trim、空名就地拦下。宿主 rename 也是 trim
+        -- 之后才落库，而这里原先把 `m_cat` 设成**没 trim** 的那个串 —— 选中的分类于是
+        -- 指向一条不存在的记录：右侧子分类静默变空，接着「添加子分类」报「分类不存在」。
+        m_name = (m_name or ""):match("^%s*(.-)%s*$")
+        if m_name == "" then
+            result_text = "分类名不能是空的（也别只打空格）"
+            return
+        end
         local ok, msg = focusflow.accounting_category_rename(m_edit_old, m_name, m_type)
         result_text = (ok and "分类已更新为 [" .. m_name .. "]") or ("更新失败：" .. tostring(msg))
         m_edit_open = false; m_edit_old = ""

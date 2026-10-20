@@ -1632,4 +1632,226 @@ mod tests {
         assert!(manager.unload_plugin(&name), "卸载要回收调度线程");
         drop(tmp);
     }
+
+    /// 记账面板的三个读数：分页条上的页码、表格里有没有某条、以及所有会说给人听的话。
+    mod acct_reading {
+        use focusflow_core::plugins::{PluginManager, Widget};
+
+        pub fn widgets(manager: &PluginManager, name: &str) -> Vec<Widget> {
+            manager
+                .get_plugin(name)
+                .and_then(|p| p.view.as_ref())
+                .map(|v| v.widgets.clone())
+                .unwrap_or_default()
+        }
+
+        pub fn list_has(manager: &PluginManager, name: &str, needle: &str) -> bool {
+            widgets(manager, name).iter().any(|w| match w {
+                Widget::Table { rows, .. } => {
+                    rows.iter().any(|r| r.iter().any(|c| c.contains(needle)))
+                }
+                _ => false,
+            })
+        }
+
+        pub fn pager_page(manager: &PluginManager, name: &str) -> i64 {
+            widgets(manager, name)
+                .iter()
+                .find_map(|w| match w {
+                    Widget::Pager { page, .. } => Some(*page),
+                    _ => None,
+                })
+                .expect("记录列表应有分页条")
+        }
+
+        /// 标签、表格单元与弹窗正文拼成一句，供"这话到底有没有说"的断言用。
+        pub fn sayings(manager: &PluginManager, name: &str) -> String {
+            fn walk(ws: &[Widget], out: &mut Vec<String>) {
+                for w in ws {
+                    match w {
+                        Widget::Label(t) => out.push(t.clone()),
+                        Widget::Row { children } => walk(children, out),
+                        Widget::Table { rows, .. } => {
+                            for r in rows {
+                                for c in r {
+                                    out.push(c.clone());
+                                }
+                            }
+                        }
+                        Widget::ModalForm {
+                            content,
+                            widgets: inner,
+                            ..
+                        } => {
+                            if !content.is_empty() {
+                                out.push(content.clone());
+                            }
+                            walk(inner, out);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&widgets(manager, name), &mut out);
+            out.join(" | ")
+        }
+    }
+
+    /// 记一笔**明天**的账：列表按 purchase_date 降序，它排在全表最前。
+    /// 旧判据写的是「日期不是今天就算补记」，于是未来日期也被当成过去的账：
+    /// 页码不动（人还停在第 2 页），提示还要人「用日期筛选去后面的页」——
+    /// 而它就在眼前这一页的第一行，照着提示翻反而找不到。
+    #[test]
+    fn a_future_dated_record_lands_on_the_first_page() {
+        use acct_reading::{list_has, pager_page, sayings};
+
+        let _guard = guard();
+        let (_tmp, mut manager, name) = bundled_in("future_add", "accounting_plugin.lua");
+        focusflow_core::accounting::init_db().expect("记账库应能建起来");
+        let today = chrono::Local::now().date_naive();
+        let today_s = today.format("%Y-%m-%d").to_string();
+        let tomorrow = (today + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+
+        // 11 条才够出第 2 页（PAGE_SIZE=10），否则 `page_next` 会被 clamp 回第 1 页
+        for i in 0..11 {
+            let id = focusflow_core::accounting::add_expense(
+                "支出",
+                &format!("今日{i}"),
+                None,
+                &today_s,
+                10.0,
+                None,
+                None,
+                None,
+            );
+            assert!(id > 0, "夹具：今天的记录应能写入");
+        }
+        manager
+            .plugin_action(&name, "page_next")
+            .expect("翻页动作不该失败");
+        assert_eq!(pager_page(&manager, &name), 2, "前置条件：应已翻到第 2 页");
+
+        manager
+            .plugin_set_field(&name, "d_item", "预定的账")
+            .expect("填名称不该失败");
+        manager
+            .plugin_set_field(&name, "d_amount", "12")
+            .expect("填金额不该失败");
+        manager
+            .plugin_set_field(&name, "d_date", &tomorrow)
+            .expect("填明天不该失败");
+        manager
+            .plugin_action(&name, "add_record")
+            .expect("保存不该失败");
+
+        assert_eq!(
+            pager_page(&manager, &name),
+            1,
+            "明天的记录排在全表最前，页码必须回到第 1 页"
+        );
+        assert!(list_has(&manager, &name, "预定的账"), "第 1 页就该看见它");
+        let said = sayings(&manager, &name);
+        assert!(
+            !said.contains("排在后面页"),
+            "提示不许把人支去后面的页: {said}"
+        );
+
+        // 反向腿：真正的补记（过去的日期）仍然不跳页，并且说明它在后面的页
+        manager
+            .plugin_set_field(&name, "d_item", "补记的旧账")
+            .expect("填名称不该失败");
+        manager
+            .plugin_set_field(&name, "d_amount", "7")
+            .expect("填金额不该失败");
+        manager
+            .plugin_set_field(&name, "d_date", "2020-01-01")
+            .expect("填过去的日期不该失败");
+        manager
+            .plugin_action(&name, "add_record")
+            .expect("保存不该失败");
+        let said2 = sayings(&manager, &name);
+        assert!(
+            said2.contains("排在后面页"),
+            "补记要说清它在后面的页: {said2}"
+        );
+        assert!(
+            !list_has(&manager, &name, "补记的旧账"),
+            "第 1 页看不到这条（它是 2020 年的）"
+        );
+    }
+
+    /// 删除没删成要在面板上讲出来。
+    /// 旧实现只写 `focusflow.log`，界面一个字不写，而那几行照样挂在列表里 ——
+    /// 用户看不出「点了没生效」，只会再点一次删除。
+    #[test]
+    fn a_delete_that_changed_nothing_says_so() {
+        use acct_reading::{list_has, sayings};
+
+        let _guard = guard();
+        let (_tmp, mut manager, name) = bundled_in("del_silent", "accounting_plugin.lua");
+        focusflow_core::accounting::init_db().expect("记账库应能建起来");
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let id = focusflow_core::accounting::add_expense(
+            "支出",
+            "要删掉的这条",
+            None,
+            &today,
+            3.0,
+            None,
+            None,
+            None,
+        );
+        assert!(id > 0, "夹具：记录应能写入");
+
+        manager
+            .plugin_action(&name, "del_999999")
+            .expect("动作本身不该失败（失败是数据层的结论）");
+        let said = sayings(&manager, &name);
+        assert!(
+            said.contains("没删掉"),
+            "一条都没删掉时不许一片安静: {said}"
+        );
+
+        // 反向腿：真删掉了就报「已删除 N 条」，不许把成功也说成失败
+        manager
+            .plugin_action(&name, &format!("del_{id}"))
+            .expect("删除动作不该失败");
+        assert!(
+            !list_has(&manager, &name, "要删掉的这条"),
+            "删掉的这条要从列表里消失"
+        );
+        let said2 = sayings(&manager, &name);
+        assert!(
+            !said2.contains("没删掉"),
+            "全部删成就不要把成功也说成失败: {said2}"
+        );
+    }
+
+    /// 两条「分类改名」的入口必须做同一件前置：先 trim、空名就地拦下。
+    /// 「添加分类」早就这么改了，重命名那半边漏下 —— 宿主是 trim 之后才落库，
+    /// 而面板把「选中的分类」设成没 trim 的那个串，于是它指向一条不存在的记录：
+    /// `reset_stale_filters` 把 m_cat 清成空，右侧子分类静默变空，
+    /// 接着「添加子分类」报「请先在左侧分类列表点击选中一个分类」。
+    #[test]
+    fn both_category_rename_paths_trim_the_name() {
+        let src = include_str!("../plugins/accounting_plugin.lua");
+        let at = src
+            .find("m_save_edit_cat")
+            .expect("重命名分类那条动作找不到了");
+        let body = &src[at..at + 900];
+        assert!(
+            body.contains("m_name = (m_name or \"\"):match(\"^%s*(.-)%s*$\")"),
+            "重命名没有像添加那样先 trim（选中的分类会指向一条不存在的记录）"
+        );
+        assert!(
+            body.contains("分类名不能是空的"),
+            "trim 之后还要就地拦下空名，否则空分类被写进库"
+        );
+    }
 }
