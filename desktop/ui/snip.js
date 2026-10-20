@@ -286,9 +286,14 @@ function redraw() {
   if (live) drawOp(live);
 }
 
+/** 撤销「上一笔」。手还没松开时，最新的那笔是 `live` 而不是 `ops` 的最后一项 ——
+ *  原先两处一起清，按住一笔的同时按 Backspace 会连上一笔一起吃掉。 */
 function undoOp() {
-  ops.pop();
-  live = null;
+  if (live) {
+    live = null;
+  } else {
+    ops.pop();
+  }
   redraw();
 }
 
@@ -416,7 +421,9 @@ function exitAnnotate() {
 
 /** 标注层 PNG 的 base64；一笔都没画就交 null（走原路，与加这个字段之前逐字节一致）。 */
 function layerBase64() {
-  if (!annotating || ops.length === 0) return null;
+  // 「有没有东西」要数 ops **加上手还没松那一笔**：按住一笔的同时按 Enter/P 是正常手势，
+  // 只数 ops 会把整层判成没画 ⇒ 交出去的是一张干净的图，那一笔静默消失。
+  if (!annotating || (ops.length === 0 && !live)) return null;
   const url = annotCanvas.toDataURL("image/png");
   return url.slice(url.indexOf(",") + 1);
 }
