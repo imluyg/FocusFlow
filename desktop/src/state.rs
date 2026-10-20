@@ -1223,6 +1223,25 @@ fn keep_floating_on_top(app: &App) {
         .ok();
 }
 
+/// 窗口此刻是否「在用户眼前」：**最小化也算没在眼前**。
+///
+/// `is_visible()` 对最小化的窗口仍返回 true（Windows 的 `WS_VISIBLE` 还在，只是窗口被
+/// 最小化了）。热键那条已经按同一判据修过一次（`hotkey::hotkey_should_hide`：只看
+/// `is_visible()` 会让「最小化着按热键」变成再藏一次），统计线程这两处是漏下的另一半：
+/// 最小化挂着的面板照样每 2 秒跑一次重聚合，还被 `stats-live` 事件唤醒渲染进程。
+fn window_in_front(visible: bool, minimized: bool) -> bool {
+    visible && !minimized
+}
+
+/// 可见性的**上升沿**：隐藏期间 `prev_*` 照旧在更新，而 emit 被可见性挡掉，于是呼出
+/// 那一刻屏上仍是「藏起来那一拍」的数 —— 藏了一夜就是昨天的一整个「今日」，
+/// 要等用户再碰一下键鼠才纠正。上升沿强制补推一拍。
+fn just_shown(now_visible: bool, was_visible: &mut bool) -> bool {
+    let rising = now_visible && !*was_visible;
+    *was_visible = now_visible;
+    rising
+}
+
 /// 后台统计线程：
 /// 快节奏 500ms 更新今日/CPM 并推送 `stats-live`；
 /// 重聚合在周期切换/超时/强制时执行并推送 `stats-charts`。
@@ -1255,6 +1274,9 @@ fn spawn_stats_worker(
             let mut prev_today_count: i64 = -1;
             let mut prev_cpm: i64 = -1;
             let mut prev_active: i64 = -1;
+            // 上一拍的两个可见性：只用来算上升沿（呼出那一刻补推一拍并做一次重聚合）
+            let mut prev_main_visible = false;
+            let mut prev_floating_visible = false;
             // 上次重聚合时的今日计数：空闲且数据未变时跳过重聚合，避免无谓的整库查询
             let mut last_heavy_today: i64 = -1;
             // 各周期最高单日缓存：period -> (次数, 日期)；重聚合播种，今日破纪录时快节奏即时更新
@@ -1320,12 +1342,22 @@ fn spawn_stats_worker(
                 //   重聚合完全停掉，只在强制/周期切换时执行（打开窗口会触发强制刷新）。
                 let main_visible = app
                     .get_webview_window("main")
-                    .map(|w| w.is_visible().unwrap_or(false))
+                    .map(|w| {
+                        window_in_front(
+                            w.is_visible().unwrap_or(false),
+                            w.is_minimized().unwrap_or(false),
+                        )
+                    })
                     .unwrap_or(false);
+                // 悬浮窗是不带标题栏的工具窗（`make_floating_tool_window`），没有最小化
+                // 这一态，所以只有主窗口需要认 `is_minimized()`；这里少问一次也少一次
+                // 「投递主线程再等回话」。
                 let floating_visible = app
                     .get_webview_window("floating")
                     .map(|w| w.is_visible().unwrap_or(false))
                     .unwrap_or(false);
+                let main_just_shown = just_shown(main_visible, &mut prev_main_visible);
+                let floating_just_shown = just_shown(floating_visible, &mut prev_floating_visible);
                 let heavy_interval_ms = if !main_visible {
                     u64::MAX
                 } else if active {
@@ -1337,7 +1369,12 @@ fn spawn_stats_worker(
                     // 空闲且数据未变：无需重算，等有输入或强制/周期切换
                     u64::MAX
                 };
-                let do_heavy = forced || period_changed || heavy_elapsed_ms >= heavy_interval_ms;
+                // 呼出主窗口也算强制重聚合：最小化期间重聚合停着，恢复后不能等下一个周期
+                // 才把图表补上（"卡片先回昨天、图表还是藏起来那一刻的样子"是两件事）。
+                let do_heavy = forced
+                    || period_changed
+                    || main_just_shown
+                    || heavy_elapsed_ms >= heavy_interval_ms;
 
                 // 自动周报：进程启动后的第一轮、以及跨进新一周后的第一轮，为
                 // 「刚结束的那个整周」生成一次 Markdown 报告。锚点取本周一，
@@ -1531,7 +1568,9 @@ fn spawn_stats_worker(
                     || cpm != prev_cpm
                     || cur_active != prev_active
                     || period_val != prev_period;
-                if live_changed {
+                // 呼出那一刻即使数字没变也要补推一次：隐藏期间这些 prev_* 照样在更新，
+                // 只看 `live_changed` 的话"刚呼出的窗口"永远收不到它缺的那一拍。
+                if live_changed || main_just_shown || floating_just_shown {
                     let live = LiveStats {
                         today_count,
                         cpm,
@@ -2278,6 +2317,69 @@ mod startup_window_wiring {
         assert!(
             body.contains("if state.start_to_tray"),
             "托盘开关的分支不见了（判据要跟着改）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod visibility_wiring {
+    use super::{just_shown, window_in_front};
+
+    /// 最小化也算「没在眼前」—— 与 `hotkey::hotkey_should_hide` 同一把尺子。
+    /// 只看 `is_visible()` 的话，最小化挂着的面板照样每 2 秒跑一次重聚合，
+    /// 还被 `stats-live` 事件唤回渲染进程（那一族已经为热键修过一次，这是漏下的另一半）。
+    #[test]
+    fn a_minimized_window_is_not_in_front() {
+        assert!(window_in_front(true, false), "显示且未最小化才算在眼前");
+        assert!(
+            !window_in_front(true, true),
+            "最小化不算在眼前（WS_VISIBLE 还在）"
+        );
+        assert!(!window_in_front(false, false), "藏起来不算");
+        assert!(!window_in_front(false, true), "藏起来且带最小化标记也不算");
+    }
+
+    /// 上升沿只在「从没在眼前到在眼前」那一拍为真，之后不复现。
+    /// 隐藏期间 `prev_*` 照旧在更新，呼出的窗口就是靠这一拍拿到它缺的那一拍。
+    #[test]
+    fn the_rising_edge_fires_once_per_show() {
+        let mut was = false;
+        assert!(just_shown(true, &mut was), "呼出那一拍必须为真");
+        assert!(!just_shown(true, &mut was), "一直在眼前时不该重复触发");
+        assert!(!just_shown(false, &mut was), "藏起来那一拍不算上升沿");
+        assert!(
+            just_shown(true, &mut was),
+            "再呼出一次还要补推（这期间数字可能已经变了）"
+        );
+    }
+
+    /// 接线腿：统计线程读可见性时问的是「在眼前」而不是 `is_visible()`，
+    /// 且补推与重聚合都认上升沿。纯函数用例盖不到调用点。
+    #[test]
+    fn the_stats_worker_asks_minimization_and_pushes_on_show() {
+        let src = include_str!("state.rs");
+        let at = src.find("fn spawn_stats_worker").expect("统计线程找不到了");
+        let body = &src[at..at + src[at..].find("\nfn ").expect("统计线程之后没有顶层函数了")];
+        assert!(
+            body.contains("window_in_front("),
+            "主窗口的可见性判据没走「在眼前」那把尺子"
+        );
+        assert!(
+            body.contains("w.is_minimized().unwrap_or(false)"),
+            "没有真的问最小化（注释里提一次不算）"
+        );
+        assert!(
+            body.contains("just_shown(main_visible, &mut prev_main_visible)")
+                && body.contains("just_shown(floating_visible, &mut prev_floating_visible)"),
+            "两个窗口的上升沿没都算出来"
+        );
+        assert!(
+            body.contains("live_changed || main_just_shown || floating_just_shown"),
+            "推送条件里没有上升沿（呼出后先显示藏起来那一刻的数）"
+        );
+        assert!(
+            body.contains("|| main_just_shown") && body.contains("let do_heavy"),
+            "呼出主窗口没顺带做一次重聚合"
         );
     }
 }
