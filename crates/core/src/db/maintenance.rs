@@ -1705,22 +1705,27 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
 /// 主键用 mtime，文件名做平手时的次键：文件名里的时间戳是定宽的
 /// （`%Y%m%d_%H%M%S%3f`），字典序即时间序 —— 没有次键时同一毫秒内的两份
 /// 谁先谁后不确定，轮转就可能删掉新的那份。
-fn alias_backups() -> Vec<std::path::PathBuf> {
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(paths::backup_dir())
-        .map(|it| {
-            it.flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .map(|n| {
-                            let n = n.to_string_lossy();
-                            n.starts_with("focusflow_aliases_") && n.ends_with(".json")
-                        })
-                        .unwrap_or(false)
+///
+/// 列表读不出来要交出去，不能折成空表：调用方靠"已有的是哪一份"决定
+/// 这次要不要再留、以及旧的要不要删，空表在那两处都长成"backup/ 里一份都没有"
+/// （见 [`prev_alias_snapshot`]）。
+fn alias_backups() -> Result<Vec<std::path::PathBuf>, String> {
+    let entries = match std::fs::read_dir(paths::backup_dir()) {
+        Ok(it) => it,
+        Err(e) => return Err(format!("{}: {e}", paths::backup_dir().display())),
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| {
+                    let n = n.to_string_lossy();
+                    n.starts_with("focusflow_aliases_") && n.ends_with(".json")
                 })
-                .collect()
+                .unwrap_or(false)
         })
-        .unwrap_or_default();
+        .collect();
     // sort_by_cached_key：key 里带 stat 系统调用，sort_by_key 会按比较次数重复 stat
     files.sort_by_cached_key(|p| {
         (
@@ -1730,7 +1735,43 @@ fn alias_backups() -> Vec<std::path::PathBuf> {
                 .unwrap_or_default(),
         )
     });
-    files
+    Ok(files)
+}
+
+/// 上一份别名快照与当前内容的比对结论。
+///
+/// 抽出来只为一件事：把"读不出来"从"一份都没有"里分出去。旧写法里
+/// `alias_backups()` 把 `read_dir` 的失败折成空表、`read(newest)` 的失败折成
+/// "内容不同"，两条都静默走到"再写一份"——于是备份目录被占用/同步盘占位的那几轮
+/// 里 `backup/` 会堆一串逐字节相同的 json，而这个函数存在的理由（"改名是低频动作，
+/// 不该按轮次无脑复制"）恰恰是不许它堆这个。结论本身仍然保守（多留一份胜过丢掉
+/// 一次真改名），要修的只是**它得说一声**。
+#[derive(Debug)]
+enum PrevAlias {
+    /// `backup/` 里还没有别名快照
+    Absent,
+    /// 内容与最新那份逐字节相同 ⇒ 这次不留
+    Same,
+    /// 内容变了 ⇒ 留一份
+    Changed,
+    /// 比不了（列表或最新那份读不出来），附原因
+    Unreadable(String),
+}
+
+/// 当前 `bytes` 与该组最新一份快照的比对（列表旧→新，取末尾）。
+fn prev_alias_snapshot(bytes: &[u8]) -> PrevAlias {
+    let files = match alias_backups() {
+        Ok(f) => f,
+        Err(e) => return PrevAlias::Unreadable(format!("备份目录读不出来（{e}）")),
+    };
+    let Some(newest) = files.last() else {
+        return PrevAlias::Absent;
+    };
+    match std::fs::read(newest) {
+        Ok(old) if old == bytes => PrevAlias::Same,
+        Ok(_) => PrevAlias::Changed,
+        Err(e) => PrevAlias::Unreadable(format!("上一份快照读不出来（{}）: {e}", newest.display())),
+    }
 }
 
 /// 给 `data/device_aliases.json` 留一份快照，**只在内容真的变了的时候**。
@@ -1744,6 +1785,10 @@ fn alias_backups() -> Vec<std::path::PathBuf> {
 /// 三种"这次不留"要分开：从没改过名（文件不存在）是常态，静默；内容与最新那份相同
 /// 是预期，静默；**文件被占用/权限读不出来**必须记 error —— 那正是需要人知道的一种，
 /// 但它不改变本轮备份的结论（见 [`backup_database`] 里的调用点注释）。
+///
+/// 第四种在**另一头**：比不了上一份（`backup/` 列不出来、或最新那份读不动）。结论仍是
+/// "留一份"（宁可重复，也不丢掉这次改名），但要记一句 warn —— 没有那句，`backup/` 里
+/// 逐字节相同的一串 json 就查不出是哪几轮比不了（见 [`prev_alias_snapshot`]）。
 fn backup_alias_snapshot(timestamp: &str) {
     let src = crate::device_alias::file_path();
     let bytes = match std::fs::read(&src) {
@@ -1757,10 +1802,14 @@ fn backup_alias_snapshot(timestamp: &str) {
             return;
         }
     };
-    if let Some(newest) = alias_backups().pop() {
-        if std::fs::read(&newest).is_ok_and(|old| old == bytes) {
-            return;
+    match prev_alias_snapshot(&bytes) {
+        // 结论不变（照样留一份，宁可重复也不丢掉这次改名），修的是"没说"：
+        // 没有这一句，backup/ 里逐字节相同的一串 json 就查不出是哪几轮比不了。
+        PrevAlias::Unreadable(why) => {
+            tracing::warn!("设备别名快照：{why}，这次按「内容变了」处理，可能多留一份相同的快照")
         }
+        PrevAlias::Same => return,
+        PrevAlias::Absent | PrevAlias::Changed => {}
     }
     let dst = paths::backup_dir().join(format!("focusflow_aliases_{timestamp}.json"));
     if let Err(e) = std::fs::write(&dst, &bytes) {
@@ -1777,7 +1826,15 @@ fn rotate_alias_backups(keep: usize, freeze: bool) {
     if freeze {
         return;
     }
-    let files = alias_backups();
+    let files = match alias_backups() {
+        Ok(f) => f,
+        // 轮转的前提是认得出哪几份是旧的；列表读不出来时它什么都删不到，
+        // 而这句必须留下 —— 否则 `backup/` 一直涨，日志里却是"每次备份都成功"。
+        Err(e) => {
+            tracing::warn!("别名快照轮转跳过：备份目录读不出来（{e}），旧快照一份都没删");
+            return;
+        }
+    };
     if files.len() <= keep {
         return;
     }
@@ -2162,19 +2219,30 @@ fn rotate_suspect_notes() {
 fn rotate_backups(policy: RetentionPolicy, freeze: bool) {
     rotate_suspect_notes();
     let mut groups: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
-    if let Ok(entries) = std::fs::read_dir(paths::backup_dir()) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // focusflow_2026_20260723_075125.db / focusflow_accounting_20260723_075125.db
-            if let Some(stem) = name
-                .strip_prefix("focusflow_")
-                .and_then(|s| s.strip_suffix(".db"))
-            {
-                let parts: Vec<&str> = stem.split('_').collect();
-                if parts.len() >= 3 {
-                    let group = parts[0].to_string();
-                    groups.entry(group).or_default().push(entry.path());
-                }
+    let entries = match std::fs::read_dir(paths::backup_dir()) {
+        Ok(it) => it,
+        // 与别名那半边同一把尺子：列表读不出来 ⇒ 认不出哪些是旧的 ⇒ 这一轮一份都删不到，
+        // 而备份本身照样报成功。不吭声就是"backup/ 无限增长、日志里查不出为什么"
+        // —— 那个症状本仓已经归给过另一个原因（分组键取错段），别再把它折进静默分支。
+        Err(e) => {
+            tracing::warn!(
+                "备份轮转跳过：备份目录读不出来（{}）: {e}，旧备份一份都没删",
+                paths::backup_dir().display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // focusflow_2026_20260723_075125.db / focusflow_accounting_20260723_075125.db
+        if let Some(stem) = name
+            .strip_prefix("focusflow_")
+            .and_then(|s| s.strip_suffix(".db"))
+        {
+            let parts: Vec<&str> = stem.split('_').collect();
+            if parts.len() >= 3 {
+                let group = parts[0].to_string();
+                groups.entry(group).or_default().push(entry.path());
             }
         }
     }
@@ -2957,6 +3025,90 @@ mod tests {
         );
     }
 
+    /// 「比不了上一份」必须与「没有上一份」分开说：结论照旧保守，但要多留一份的原因得留痕。
+    ///
+    /// 旧写法两处折成"没有上一份"：`read_dir` 失败折成空表、`read(newest)` 失败折成
+    /// "内容不同"，两处都静默走到"再写一份"。真实触发面是本仓支持的那几种 ——
+    /// 数据目录放在同步盘里（占位文件读不动）、杀软临时锁住 `backup/`。症状正是这个
+    /// 函数自己的注释禁止的事：`backup/` 堆一串逐字节相同的 json，而日志里查不出是哪几轮比不了。
+    #[test]
+    fn an_unreadable_previous_snapshot_says_why_it_wrote_another_one() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("alias_snap_unreadable");
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+        crate::device_alias::invalidate_cache();
+
+        crate::device_alias::set("HID#VID_24AE&PID_1464&MI_00", "新鼠标").unwrap();
+        backup_alias_snapshot("20260928_100000000");
+        assert_eq!(alias_backups().unwrap().len(), 1, "第一次改名该留一份");
+
+        // 把"最新那一份"变成一个同名目录：列表照样认得出它（过滤器只看文件名），
+        // 而 read() 必然失败 —— 正是"看得见、读不动"那种状态。文件名比已有那份大，
+        // mtime 打平时按名字排它就在末尾，无需再改时间戳。
+        let fake = paths::backup_dir().join("focusflow_aliases_20260928_100000001.json");
+        std::fs::create_dir_all(&fake).unwrap();
+        let bytes = std::fs::read(crate::device_alias::file_path()).unwrap();
+        assert!(
+            matches!(prev_alias_snapshot(&bytes), PrevAlias::Unreadable(_)),
+            "上一份读不出来时不该折成 Absent / Changed"
+        );
+
+        let ((), logs) =
+            crate::logger::capture_logs(|| backup_alias_snapshot("20260928_100000002"));
+        assert!(
+            logs.iter().any(|l| l.contains("上一份快照读不出来")),
+            "比不了上一份时必须说明为什么多留一份: {logs:?}"
+        );
+        assert!(
+            paths::backup_dir()
+                .join("focusflow_aliases_20260928_100000002.json")
+                .is_file(),
+            "结论仍是保守：宁可多留一份，也不丢掉这次改名"
+        );
+        crate::device_alias::invalidate_cache();
+    }
+
+    /// 备份目录整个读不出来时，两处轮转都不许静默"什么都没删"。
+    ///
+    /// `backup` 是个普通文件（用户手建、或同步盘放了一个同名占位）时 `read_dir` 必然失败，
+    /// 于是分组表是空的、别名表也是空的 —— 两份函数都"正常返回"，症状却是 `backup/` 里的
+    /// 旧备份永远删不掉。"目录无限增长"这个病状本仓归因过一次（分组键取错段），
+    /// 这条钉的是同症状的另一半成因。
+    #[test]
+    fn a_backup_dir_that_cannot_be_listed_says_it_skipped_the_rotation() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("alias_snap_blocked");
+        // 先落一个普通文件，再让 `backup_dir()` 去撞它：它内部的 create_dir_all 失败是
+        // `.ok()` 吞掉的，所以拿到的仍是这个路径，而 read_dir 会对它报错。
+        let blocked = paths::data_home().join("backup");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let ((), logs) = crate::logger::capture_logs(|| rotate_alias_backups(1, false));
+        assert!(
+            logs.iter().any(|l| l.contains("别名快照轮转跳过")),
+            "列表读不出来时要说清这一轮一份都没删: {logs:?}"
+        );
+        let ((), logs) = crate::logger::capture_logs(|| {
+            rotate_backups(
+                RetentionPolicy {
+                    recent: 1,
+                    daily: 1,
+                    weekly: 1,
+                    monthly: 1,
+                },
+                false,
+            )
+        });
+        assert!(
+            logs.iter().any(|l| l.contains("备份轮转跳过")),
+            "年度库那套轮转同一条判据，不能只修别名半边: {logs:?}"
+        );
+        assert!(
+            matches!(prev_alias_snapshot(b"x"), PrevAlias::Unreadable(_)),
+            "快照比对也要把'列表读不出来'从'一份都没有'里分出去"
+        );
+    }
+
     /// 别名快照：**只在内容真的变了时**留一份，并按 keep 轮转、冻结时一份不删。
     ///
     /// 钉住两件事 —— 备份每次退出都跑而改名是低频动作，按轮次无脑复制会让 backup/
@@ -2972,21 +3124,21 @@ mod tests {
         backup_alias_snapshot("20260928_100000000");
         backup_alias_snapshot("20260928_100001000");
         assert_eq!(
-            alias_backups().len(),
+            alias_backups().unwrap().len(),
             1,
             "内容没变不该再留一份（改名是低频动作，备份每次退出都跑）"
         );
 
         crate::device_alias::set("HID#VID_24AE&PID_1464&MI_01", "旧键盘").unwrap();
         backup_alias_snapshot("20260928_100002000");
-        assert_eq!(alias_backups().len(), 2, "改过名就该多一份");
+        assert_eq!(alias_backups().unwrap().len(), 2, "改过名就该多一份");
 
         // 冻结轮转（异常体检）时不得删任何东西，与 .db 同口径
         rotate_alias_backups(1, true);
-        assert_eq!(alias_backups().len(), 2, "冻结时一份都不许删");
+        assert_eq!(alias_backups().unwrap().len(), 2, "冻结时一份都不许删");
 
         rotate_alias_backups(1, false);
-        let left = alias_backups();
+        let left = alias_backups().unwrap();
         assert_eq!(left.len(), 1);
         assert!(
             left[0]
@@ -3010,7 +3162,11 @@ mod tests {
 
         let out = backup_database(5);
         assert!(matches!(out, BackupOutcome::NothingToDo), "{out:?}");
-        assert_eq!(alias_backups().len(), 0, "没有别名文件就不该凭空造一份");
+        assert_eq!(
+            alias_backups().unwrap().len(),
+            0,
+            "没有别名文件就不该凭空造一份"
+        );
     }
 
     /// 有别名、一套库都没有：快照照留，而备份结论仍是「无事可做」。
@@ -3030,7 +3186,7 @@ mod tests {
             matches!(out, BackupOutcome::NothingToDo),
             "别名不该改变库的备份结论: {out:?}"
         );
-        let snaps = alias_backups();
+        let snaps = alias_backups().unwrap();
         assert_eq!(snaps.len(), 1);
         let body = std::fs::read_to_string(&snaps[0]).unwrap();
         assert!(body.contains("手柄"), "快照内容就是别名表本身: {body}");
