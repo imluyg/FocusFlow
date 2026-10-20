@@ -976,6 +976,11 @@ fn today_landed_totals(today_dk: i64) -> (i64, i64) {
 /// 那一步也没有意义：调用点正是写线程本身，且它每 tick 都在同步地跑 `flush_pending`，
 /// 没有别人的 flush 在飞，所以"库值 + 内存增量"本来就是一致的瞬间。
 fn reanchor_today(state: &WriterState) {
+    // 日期键必须先立，与 `recompute_today_totals` 同一顺序：`record()` 跑在隔壁线程，
+    // 它看见 `today_key` 不是今天就 `store(0)` 那两个基准，而基准之后只往上加。
+    // 先算基准、后立键 ⇒ 中间隔着一次 SQLite 读的那几毫秒里只要有一次按键落下，
+    // 刚算好的整天基准就被清零后再加 1，「今日」剩 1 次且一整天补不回来。
+    state.today_key.store(current_day_key(), Ordering::Relaxed);
     let today_dk = queries::day_key_of_date(chrono::Local::now().date_naive());
     // 与 recompute_today_totals 同一条规矩：持着 agg 锁读库，让"库里的值"与
     // "内存里的待落库增量"取的是同一瞬间，同一批不会既算进库值又算进增量。
@@ -990,7 +995,6 @@ fn reanchor_today(state: &WriterState) {
     state
         .today_active
         .store(seconds.max(0) as u64 + pending_active, Ordering::Relaxed);
-    state.today_key.store(current_day_key(), Ordering::Relaxed);
 }
 
 /// 读取恢复文件（启动回放）。
@@ -1710,6 +1714,39 @@ mod tests {
     ///
     /// 断言写成"轮询等结果"而不是读那个标志：置位是即时的，但消费它的是写线程的
     /// 每个 tick（≤100 ms），两边赛跑时读标志会看到它已经被抹平。
+    /// 写线程重锚「今日」时必须**先立日期键、再写两个基准**，两处重锚同一条顺序。
+    ///
+    /// 竞态本身没法在用例里确定性复现（要隔壁 `record()` 刚好落进基准写完、日期键还没
+    /// 落地的那几毫秒），所以钉语句顺序：基准在前 ⇒ `record()` 看见 `today_key` 还是
+    /// 昨天/明天就 `store(0)`，整天的「今日」被压成 1 次，而那两个缓存之后只往上加。
+    /// `recompute_today_totals` 一直是键在前（这条把它当尺子），漏的是写线程自己那一半。
+    #[test]
+    fn both_reanchors_set_the_day_key_before_the_baselines() {
+        let src = include_str!("writer.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        for (head, stop) in [
+            ("fn reanchor_today(", "\n}\n"),
+            ("pub fn recompute_today_totals(", "\n    }\n"),
+        ] {
+            let at = prod.find(head).unwrap_or_else(|| panic!("{head} 不见了"));
+            let rest = &prod[at..];
+            let body = &rest[..rest.find(stop).expect("函数体切不出来")];
+            // 注释要先摘掉：本仓的注释会写明隔壁字段名（"record() 看见 today_key…"），
+            // 拿原文比位置就会让守卫跟着注释走 —— 注释在前就永远"绿"，等于没钉。
+            let code: String = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let key_at = code.find("today_key").expect("这一处没写日期键");
+            let count_at = code.find("today_count").expect("这一处没写今日基准");
+            assert!(
+                key_at < count_at,
+                "{head} 里日期键必须排在基准之前，否则隔壁线程的 record() 会在两者之间把基准清零"
+            );
+        }
+    }
+
     #[test]
     fn a_backward_clock_jump_reanchors_today_instead_of_losing_it() {
         let _lock = crate::paths::test_app_dir_lock();
