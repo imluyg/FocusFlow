@@ -355,8 +355,31 @@ pub async fn import_legacy(state: State<'_, Arc<AppState>>) -> Result<String, St
         .refresh_now
         .store(true, std::sync::atomic::Ordering::Relaxed);
 
+    let text = import_summary_text(&summary);
+    // 部分失败必须走 Err：前端 `doImport` 的成功分支把整句渲染成**绿色**"完成"，
+    // 于是"2025 年度键鼠: 1200 条；错误: 2024 年度库导入失败"看着就是一次成功导入 ——
+    // 用户不会再重试那一年，那年的历史从此缺一块。`import_legacy_data` 从不返回 Err
+    // （每个年度库失败只往 summary.errors 里 push），所以结论只能在这里判。
+    let outcome = import_outcome(text, &summary.errors);
+    match &outcome {
+        Ok(t) => tracing::info!("导入完成: 来源={} 结果={}", dir.display(), t),
+        Err(t) => tracing::error!("导入部分失败: 来源={} {}", dir.display(), t),
+    }
+    outcome
+}
+
+/// 把导入的统计文本与失败清单合成命令返回值：**有失败项就是 Err**。
+///
+/// 把 `ImportSummary` 合成界面上那句话。抽成纯函数的原因与 [`import_outcome`] 一样：
+/// `import_legacy` 要先弹目录选择框，测试起不来那条路。
+///
+/// 「未发现可导入的数据」这一句加了 **`errors` 为空**这个前提：每个年度库都失败时
+/// `year_dbs`/`copied_aux` 同样是空的，那句话会把"导入失败"说成"那个目录本来就没东西"
+/// —— 用户于是不会再重试那一年，那年的历史从此缺一块。CLI 侧同一判据早就补了
+/// `&& !failed`（`import_report`），桌面这侧是漏下的另一半。
+fn import_summary_text(summary: &focusflow_core::migration::ImportSummary) -> String {
     let mut lines: Vec<String> = Vec::new();
-    if summary.year_dbs.is_empty() && summary.copied_aux.is_empty() {
+    if summary.year_dbs.is_empty() && summary.copied_aux.is_empty() && summary.errors.is_empty() {
         lines.push("未发现可导入的数据".to_string());
     }
     for (year, count) in &summary.records_by_year {
@@ -375,21 +398,9 @@ pub async fn import_legacy(state: State<'_, Arc<AppState>>) -> Result<String, St
     for note in &summary.skipped {
         lines.push(format!("跳过: {note}"));
     }
-    let text = lines.join("；");
-    // 部分失败必须走 Err：前端 `doImport` 的成功分支把整句渲染成**绿色**"完成"，
-    // 于是"2025 年度键鼠: 1200 条；错误: 2024 年度库导入失败"看着就是一次成功导入 ——
-    // 用户不会再重试那一年，那年的历史从此缺一块。`import_legacy_data` 从不返回 Err
-    // （每个年度库失败只往 summary.errors 里 push），所以结论只能在这里判。
-    let outcome = import_outcome(text, &summary.errors);
-    match &outcome {
-        Ok(t) => tracing::info!("导入完成: 来源={} 结果={}", dir.display(), t),
-        Err(t) => tracing::error!("导入部分失败: 来源={} {}", dir.display(), t),
-    }
-    outcome
+    lines.join("；")
 }
 
-/// 把导入的统计文本与失败清单合成命令返回值：**有失败项就是 Err**。
-///
 /// 抽成纯函数只有一个原因：`import_legacy` 要先弹目录选择框，测试起不来那条路，
 /// 而"部分失败不能报成成功"这一判据正好是这条命令里唯一会骗人的地方。
 fn import_outcome(text: String, errors: &[String]) -> Result<String, String> {
@@ -781,7 +792,10 @@ pub fn set_plugin_enabled(
 
 #[cfg(test)]
 mod tests {
-    use super::{backup_message, backup_outcome_with_flush, import_outcome, must_reload_hotkey};
+    use super::{
+        backup_message, backup_outcome_with_flush, import_outcome, import_summary_text,
+        must_reload_hotkey,
+    };
     use focusflow_core::db::maintenance::BackupOutcome;
 
     /// 备份部分失败时设置页不能拿到绿色那句「备份完成」。
@@ -926,6 +940,54 @@ mod tests {
         // 已经成功的那半也要留在消息里：用户得知道哪些年进来了、哪些没进来
         assert!(err.contains("1200 条"), "已导入的部分不能丢: {err}");
         assert!(err.contains("2024"), "失败项要能定位到是哪一年: {err}");
+    }
+
+    /// 「未发现可导入的数据」只能在**既没导进东西、也没报错**时说。
+    ///
+    /// 每个年度库都失败时 `year_dbs`/`copied_aux` 同样是空的，旧写法于是给出
+    /// 「未发现可导入的数据｜失败项：2024 年度库导入失败」—— 前半句把失败说成"那目录
+    /// 本来就没东西"，用户看完不会再去重试那一年，那年的历史从此缺一块。
+    /// CLI 的 `import_report` 早就带了 `&& !failed`，桌面这一侧是漏下的另一半。
+    #[test]
+    fn an_all_failed_import_does_not_say_there_was_nothing_to_import() {
+        use focusflow_core::migration::ImportSummary;
+
+        let all_failed = ImportSummary {
+            errors: vec!["2024 年度库导入失败: 库被占用".to_string()],
+            ..ImportSummary::default()
+        };
+        let text = import_summary_text(&all_failed);
+        assert!(
+            !text.contains("未发现可导入的数据"),
+            "有失败项时不许说那目录本来就没东西: {text}"
+        );
+        let outcome = import_outcome(text, &all_failed.errors).expect_err("有失败项必须是 Err");
+        assert!(
+            outcome.contains("2024 年度库导入失败"),
+            "失败项本身仍然要留在消息里: {outcome}"
+        );
+
+        // 正向腿一：真的是空目录（无所获也无失败）时那句话仍然要说
+        let nothing = ImportSummary::default();
+        assert!(
+            import_summary_text(&nothing).contains("未发现可导入的数据"),
+            "无所获又无失败时那句不能丢"
+        );
+
+        // 正向腿二：有记录就列条数与跳过项，不提"未发现"
+        let with_rows = ImportSummary {
+            year_dbs: vec![2025],
+            records_by_year: vec![(2025, 1200)],
+            skipped: vec!["2024 年度库: 无数据".to_string()],
+            ..ImportSummary::default()
+        };
+        let text2 = import_summary_text(&with_rows);
+        assert!(
+            text2.contains("2025 年度键鼠: 1200 条")
+                && text2.contains("跳过: 2024")
+                && !text2.contains("未发现可导入的数据"),
+            "{text2}"
+        );
     }
 
     /// 导出必须先问年度库可读，再去做聚合。
