@@ -43,8 +43,13 @@ fn today_cache_for_display(stored: u64, now: u64, count: u64, active: u64) -> (u
 
 /// 对写线程的控制信号
 enum Signal {
-    /// 立即 flush；`done` 为 Some 时等待完成后通知
-    Flush { done: Option<mpsc::Sender<()>> },
+    /// 立即 flush；`done` 为 Some 时等这一批有最终结论后回话。
+    ///
+    /// 回话带的是**「这批全部落成了没有」**，不是"我处理过了"：调用方等这句是为了
+    /// 在读库之前确认盘上已经含这批增量（备份、重锚今日），"处理过但没写进去"对它是
+    /// 同一个结论 —— 那份备份不含这批统计。旧形状里这个 `Sender<()>` 谁都回 true，
+    /// 逐年失败只在写线程里 `tracing::error!`，界面拿到的是一句绿色"备份完成"。
+    Flush { done: Option<mpsc::Sender<bool>> },
     /// 停止线程（退出前 flush 残留）
     Stop,
 }
@@ -671,11 +676,22 @@ impl DbWriter {
         {
             return false;
         }
-        if rx.recv_timeout(Duration::from_secs(3)).is_ok() {
-            return true;
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            // 回了话，但那批里有年度库没写进去（失败的部分已回填内存，下次 flush 重试）。
+            // 对"我要在读库前确认盘上含这批增量"的调用方来说，这和没回音是同一个结论，
+            // 但原因不一样，日志得按原因说：否则排查时会去查一个并不忙的写线程。
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(
+                    "flush 已回话，但这批增量有年度库没写进去（失败部分已回填内存，下次再试）"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!("flush 等待超时（3 秒），写线程可能繁忙，增量仍在内存中: {e}");
+                false
+            }
         }
-        tracing::warn!("flush 等待超时（3 秒），写线程可能繁忙，增量仍在内存中");
-        false
     }
 
     /// 停止写线程（退出前 flush 残留）。
@@ -1098,9 +1114,9 @@ fn writer_loop(state: Arc<WriterState>, sig_rx: mpsc::Receiver<Signal>, flush_in
         loop {
             match sig_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Signal::Flush { done }) => {
-                    flush_pending(&mut conn, &mut conn_year, &state);
+                    let landed = flush_pending(&mut conn, &mut conn_year, &state);
                     if let Some(d) = done {
-                        let _ = d.send(());
+                        let _ = d.send(landed);
                     }
                     last_flush = Instant::now();
                 }
@@ -1190,11 +1206,16 @@ fn year_of_day_key(dk: i64) -> i32 {
 }
 
 /// 把内存增量落库（按年份库分批、每批单事务 UPSERT，失败重试，最终失败回填内存避免丢数据）。
-fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &WriterState) {
+///
+/// 返回值是**「这批全部落成了没有」**：`false` 时失败的那半已回填 `agg`（下次重试，数据不丢），
+/// 但此刻盘上的库里不含它 —— 要读库的人（备份、重锚今日）必须知道这件事。
+/// 没有返回值的那几年，写线程对谁都回"处理过了"，缺哪一年的库只有日志知道。
+/// 内存里本来就没有增量时也是 `true`：没有要落的东西 ≠ 没落成。
+fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &WriterState) -> bool {
     let pending = {
         let mut agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
         if agg.is_empty() {
-            return;
+            return true;
         }
         let taken = agg.take_for_flush();
         // 同一把锁内登记"这批已离开内存、结果还没出来"，恢复快照才看得见它。
@@ -1232,7 +1253,7 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
         // 全部落库：在途记录作废，并把 stop 超时可能留下的恢复文件收敛掉
         *state.in_flight.lock().unwrap_or_else(|e| e.into_inner()) = AggDeltas::default();
         settle_after_stop_snapshot(state);
-        return;
+        return true;
     }
     // 回填内存，避免数据丢失（下次周期 flush 再试）
     let mut agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
@@ -1266,6 +1287,7 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
     // 这批有了最终结论（失败的那部分已回填进 agg）：在途记录作废并收敛恢复文件
     *state.in_flight.lock().unwrap_or_else(|e| e.into_inner()) = AggDeltas::default();
     settle_after_stop_snapshot(state);
+    false
 }
 
 /// 启动时把库里已登记的设备名/类型灌进内存会话态。
@@ -1592,6 +1614,46 @@ mod tests {
     /// `ensure_schema` 的错误整个丢掉，`flush_partition` 只能报"无可用连接"，
     /// `flush_pending` 打进日志的就是那五个字 —— 目录里放的是占位文件、路径不存在、
     /// 还是库结构建不起来，全都看不出来（B14-1 吞线程失败同族）。
+    /// `flush_pending` 的结论要交给等回音的人：这批到底全落成了没有。
+    ///
+    /// 旧形状里写线程收到 `Signal::Flush` 就无条件回话（载荷是 `Sender<()>`），而
+    /// `flush_pending` 连返回值都没有 ⇒ 某个年度库整个没写进去（库位上是个目录、只读、
+    /// 被别的连接锁死）时 `flush_confirmed(true)` 照样返回 true，「立即备份」于是对一份
+    /// **不含这批统计**的备份说"备份完成"，而那半数据只在内存里等下一次重试。
+    /// 内存里没有增量时也是 true —— "没有要落的东西"与"没落成"必须分得开，
+    /// 否则每次空 flush 都叫一句假警，真没落成的那次反而被淹掉。
+    #[test]
+    fn flush_pending_says_whether_the_batch_landed() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_landed");
+        let w = start_writer(Duration::from_secs(3600));
+        let state = Arc::clone(&w.state);
+        let mut conn: Option<Connection> = None;
+        let mut conn_year = 0;
+        assert!(
+            flush_pending(&mut conn, &mut conn_year, &state),
+            "内存里没有增量时不该报成没落成"
+        );
+
+        // 有增量，而今年的库位上是个目录（同步盘/手工放错的典型形状）⇒ 这一批没落成
+        w.record("A", chrono::Local::now().timestamp());
+        std::fs::create_dir_all(paths::year_db_path(chrono::Local::now().year())).unwrap();
+        let mut conn: Option<Connection> = None;
+        let mut conn_year = 0;
+        assert!(
+            !flush_pending(&mut conn, &mut conn_year, &state),
+            "写不进去的那一批必须交回 false，否则备份那侧会被一句绿色「完成」骗过去"
+        );
+        assert!(
+            !state
+                .agg
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "没落成的增量要回填内存：这句结论是「还没落」，不是「丢了」"
+        );
+    }
+
     #[test]
     fn flush_failure_carries_the_reason_the_year_db_could_not_be_opened() {
         let _lock = crate::paths::test_app_dir_lock();

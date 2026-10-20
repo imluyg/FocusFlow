@@ -655,7 +655,7 @@ fn backup_outcome_with_flush(
         return Ok(line);
     }
     Err(format!(
-        "{line}；但写入线程 3 秒内没有确认落盘，这份备份可能少了最后一批还没写进库的统计 —— 等几秒再备份一次"
+        "{line}；但写入线程没有确认落盘（等回音超时，或那批里有年度库最终没写进去），这份备份可能少了最后一批还没进库的统计 —— 等几秒再备份一次"
     ))
 }
 
@@ -862,6 +862,13 @@ mod tests {
         assert!(
             warned.contains("没有确认落盘"),
             "缺的那一段必须说出来: {warned}"
+        );
+        // 这句现在盖**两种**成因：等回音超时，以及写线程回了话但那批里有年度库没写进去
+        // （`flush_pending` 现在把结论随回音交出来）。写死成"3 秒超时"那一种的文案，
+        // 会让"库写不进去"这种更该重试的情况被说成"再等几秒就好"。
+        assert!(
+            warned.contains("等回音超时") && warned.contains("没写进去"),
+            "两种成因都要点到，不能只报那一种: {warned}"
         );
         assert_eq!(
             backup_outcome_with_flush(Err("只兜住 1 份".to_string()), false),
