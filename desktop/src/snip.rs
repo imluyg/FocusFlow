@@ -805,6 +805,33 @@ fn apply_annot_layer(
     Ok(Some(bytes.len()))
 }
 
+/// 选一个**不会盖掉已有那一张**的截图文件名。
+///
+/// 列目录失败不能折成"目录里没有同名文件"：那时 `capture::unique_name` 交回的就是裸名字，
+/// 而紧接着的 `fs::write` 会把同名的那一张就地截断重写 —— 去重后缀存在的全部理由就是
+/// "同一秒里连按两次"（`name_stem` 只带到秒）。但也不能因此不存：这张图是用户刚刚框出来
+/// 的唯一副本，宁可名字难看一点也要落盘，所以读不出来时改用**带纳秒**的后缀，
+/// 它撞不上任何已有名字（同一秒同一纳秒再同名，得两次调用落在同一个 ns 上）。
+/// 目录清单、时间戳与目录名都由调用方交进来：本函数不碰文件系统也不碰时钟
+/// （与 `capture::unique_name` 同规，那一条注释写的就是"必须能脱离真实磁盘被断言"）。
+fn screenshot_file_name(
+    stem: &str,
+    dir_display: &str,
+    listing: Result<Vec<String>, std::io::Error>,
+    nanos: &str,
+) -> String {
+    match listing {
+        Ok(listing) => capture::unique_name(stem, "png", &listing),
+        Err(e) => {
+            tracing::warn!(
+                "截图目录列不出来（{dir_display}）: {e} —— 这次改用带纳秒的文件名，\
+                 免得盖掉同一秒里已经存下的那一张"
+            );
+            format!("{stem}_{nanos}.png")
+        }
+    }
+}
+
 fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, String> {
     // 1) 两把尺子先对齐再动手（页面自己数的 CSS 像素 vs 窗口认定的缩放倍数）。
     let win = app
@@ -894,16 +921,21 @@ fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, S
 
     // 5) 写盘。失败不阻断剪贴板（反过来也一样），两个结果分开交出去。
     let dir = focusflow_core::paths::screenshots_dir();
-    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let now = chrono::Local::now();
+    let ts = now.format("%Y%m%d_%H%M%S").to_string();
     let stem = capture::name_stem(&ts, phys.width, phys.height);
-    let listing: Vec<String> = std::fs::read_dir(&dir)
-        .map(|it| {
-            it.flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
-    let file = dir.join(capture::unique_name(&stem, "png", &listing));
+    // 单个条目读不动也算"这个目录看不清"：原先的 `it.flatten()` 会把它静默丢掉，
+    // 而那正是名单里少掉一个已有名字、下一次就地盖掉它的时候。
+    let listing = std::fs::read_dir(&dir).and_then(|it| {
+        it.map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<String>, std::io::Error>>()
+    });
+    let file = dir.join(screenshot_file_name(
+        &stem,
+        &dir.display().to_string(),
+        listing,
+        &now.format("%9f").to_string(),
+    ));
     let (saved, save_reason) = match std::fs::write(&file, &png) {
         Ok(()) => {
             tracing::info!("截图已存盘：{}（{} 字节）", file.display(), png.len());
@@ -1017,6 +1049,61 @@ pub fn on_snip_close_requested(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 截图文件名必须避开目录里已有的那一张；而"目录读不出来"不能当成"里面没有同名文件"。
+    ///
+    /// 折成空清单时 `capture::unique_name` 交回的就是裸名字，紧接着的 `fs::write`
+    /// 会把同一秒已经存下的那张就地截断重写，而界面照样说「已存盘并复制到剪贴板」。
+    /// 读不出来时改用带纳秒的后缀：图还是要存，名字不许撞。
+    #[test]
+    fn an_unlistable_screenshots_dir_still_gets_a_non_clobbering_name() {
+        let stem = "snip_20260101_120000_800x600";
+        let dir = "E:/shots";
+        // 正常路径：清单里已有同名 → 仍走原来的去重后缀
+        let listing = Ok(vec![format!("{stem}.png")]);
+        assert_eq!(
+            screenshot_file_name(stem, dir, listing, "000000123"),
+            format!("{stem}_2.png"),
+            "同一秒里已经有同名那张时仍然加后缀（这一支不许被改坏）"
+        );
+        assert_eq!(
+            screenshot_file_name(stem, dir, Ok(vec![]), "000000123"),
+            format!("{stem}.png"),
+            "空目录就用裸名字"
+        );
+        // 读不出来：既不是裸名字，也要仍然是一张 .png
+        let unreadable = Err(std::io::Error::from_raw_os_error(5));
+        let name = screenshot_file_name(stem, dir, unreadable, "000000123");
+        assert_ne!(
+            name,
+            format!("{stem}.png"),
+            "看不清目录时不许交回裸名字 —— 那会盖掉同一秒里已经存下的那张"
+        );
+        assert!(
+            name.contains("000000123"),
+            "后缀要用纳秒，才撞不上同一秒的那一张: {name}"
+        );
+        assert!(name.ends_with(".png"), "扩展名不能丢: {name}");
+    }
+
+    /// 接线腿：提交那条路必须把 `read_dir` 的**结果**交给上面那条判据。
+    ///
+    /// 上面那条测的是判据本身；调用点退回 `.unwrap_or_default()` 时它照样全绿，
+    /// 而"同一秒那张被盖掉"只在调用点上发生。
+    #[test]
+    fn the_commit_site_feeds_the_real_listing_to_the_name_rule() {
+        let src = include_str!("snip.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod.find("fn commit_blocking").expect("提交函数找不到了");
+        let rest = &prod[at..];
+        let end = rest.find("\n}\n").expect("提交函数切不出来");
+        let body = &rest[..end + 3];
+        assert!(body.contains("screenshot_file_name("), "文件名没走那条判据");
+        assert!(
+            !body.contains(".unwrap_or_default("),
+            "列目录失败被折成空清单 = 同一秒那张会被就地盖掉，而界面还说「已存盘」"
+        );
+    }
 
     /// 覆盖层自检的判据：**多出来可以，少了不行**。
     ///
