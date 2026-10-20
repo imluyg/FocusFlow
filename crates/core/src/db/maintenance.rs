@@ -710,6 +710,14 @@ pub struct MaintenanceReport {
     /// 后者意味着碰过且失败了若干个具体年份。混在一起的话，`--reset` 在目录
     /// 读不出来时会打印"所有统计记录已清空 (0 行)"并退 0 —— 用户以为数据抹了。
     pub dir_error: Option<String>,
+    /// 这一轮**真的去压缩成**的年度库套数。
+    ///
+    /// 为什么要有这一格：`--vacuum` 与设置页的「立即压缩」原先只看 `incomplete()`，
+    /// 而一套库都没扫到时 `failed_years` 与 `dir_error` 都是空的 ⇒ 终端与界面都说
+    /// 「压缩完成」，实际什么都没碰。与 `--backup` 的 `NothingToDo`、`--reset` 的
+    /// `NothingToClear` 同一个口径：无事可做**退 0 / 不算失败**（计划任务不该天天报红），
+    /// 但那句话必须说实话。
+    pub touched_years: usize,
     /// 执行前快照没有完全兜住时的那句话（`None` = 兜住了，或本来就没东西要兜）。
     ///
     /// 为什么单独一格、而且刻意**不进 `incomplete()`**：这一轮破坏性操作本身是做完了的，
@@ -956,11 +964,29 @@ pub fn vacuum_all() -> MaintenanceReport {
         return report;
     };
     for year in years {
-        if !vacuum_path(&paths::year_db_path(year)) {
+        if vacuum_path(&paths::year_db_path(year)) {
+            report.touched_years += 1;
+        } else {
             report.failed_years.push(year);
         }
     }
     report
+}
+
+/// 「这轮压缩到底做成了什么」那句话说**一遍**：CLI 的 `--vacuum` 与设置页的「立即压缩」
+/// 共用它。两侧原先各写了一句「压缩完成」，而 0 套库时两边都在说假话 ——
+/// 这正是本文件里 `NothingToDo` / `NothingToClear` 已经避过的形状，漏下的第三个出口。
+///
+/// 调用方自己决定语气与去向：CLI 拿 `incomplete()` 决定退出码与 stdout/stderr，
+/// 界面拿 `Err` 显示红字；这里只负责"事实是什么"。
+pub fn vacuum_line(report: &MaintenanceReport) -> String {
+    if report.incomplete() {
+        format!("压缩未完成：{}", report.why_incomplete())
+    } else if report.touched_years == 0 {
+        "没有可压缩的年度库（新建/刚重置过，或年度库里没有统计行）".to_string()
+    } else {
+        format!("压缩完成（{} 套年度库）", report.touched_years)
+    }
 }
 
 /// 这套库到该压缩的时候了吗 —— **每库各算各的**。
@@ -2696,6 +2722,50 @@ mod tests {
             "空目录不该被算成失败: {ok:?}"
         );
         crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
+    }
+
+    /// `vacuum_all` 必须交出"真的压成了几套"，`vacuum_line` 据此说话。
+    ///
+    /// 回归：CLI 与设置页两侧原先都只看 `incomplete()`，于一套库都没扫到时
+    /// 两边都说「压缩完成」—— 与 `--backup` 的 `NothingToDo`、`--reset` 的
+    /// `NothingToClear` 同形，是漏下的第三个出口（这条计数就是为了让那句假话造不出来）。
+    #[test]
+    fn vacuum_counts_the_year_dbs_it_actually_compacted() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _empty = crate::paths::test_app_dir("vac_empty");
+        std::fs::create_dir_all(paths::data_dir()).unwrap();
+
+        let r = vacuum_all();
+        assert!(!r.incomplete(), "空目录不是失败: {r:?}");
+        assert_eq!(r.touched_years, 0, "一套库都没有时计数必须是 0");
+        let line = vacuum_line(&r);
+        assert!(
+            !line.contains("压缩完成") && line.contains("没有可压缩的年度库"),
+            "什么都没压成不许说「压缩完成」: {line}"
+        );
+
+        // 建一套有统计行的年度库（空壳会被年份列表剔掉，测不到"压成了"那一支）
+        let dk = queries::day_key_of_date(chrono::Local::now().date_naive());
+        {
+            let path = paths::year_db_path(2026);
+            let conn = connection::open_rw(&path).unwrap();
+            connection::ensure_schema(&conn, 2026).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 77)",
+                [dk],
+            )
+            .unwrap();
+        }
+        queries::invalidate_years_cache();
+
+        let r2 = vacuum_all();
+        assert!(!r2.incomplete(), "有库且压成了: {r2:?}");
+        assert_eq!(r2.touched_years, 1, "压成几套就要报几套");
+        assert!(
+            vacuum_line(&r2).contains("1 套年度库"),
+            "给人看的那句要带上套数: {}",
+            vacuum_line(&r2)
+        );
     }
 
     /// 轮转分组按文件名第一段（年份/库名）：跨日期同组累加，

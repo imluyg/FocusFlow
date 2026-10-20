@@ -176,15 +176,9 @@ fn run(args: &[String]) -> i32 {
                 focusflow_core::paths::data_dir().display()
             );
             let report = db::maintenance::vacuum_all();
-            if report.incomplete() {
-                // 旧行为是 `vacuum_all(); 0`：每个库的成败都被丢掉，永远退 0，
-                // 挂在计划任务上就是"每天准时什么都不做"。
-                eprintln!("压缩未完成：{}（原因见日志）", report.why_incomplete());
-                1
-            } else {
-                println!("压缩完成");
-                0
-            }
+            let (line, code) = vacuum_outcome(&report);
+            emit_line(&line, code);
+            code
         }
         "--backup" => {
             let _ = db::Database::init_readonly();
@@ -192,20 +186,21 @@ fn run(args: &[String]) -> i32 {
                 .get_int("database", "max_backups", 5)
                 .max(1);
             let outcome = db::maintenance::backup_database(max_backups);
-            if matches!(outcome, db::maintenance::BackupOutcome::Done { .. }) {
-                println!(
-                    "  目录: {}（已停用插件的数据会跳过）",
-                    focusflow_core::paths::backup_dir().display()
-                );
-            }
             // 三种结局（全都兜住 / 只兜住一部分 / 无事可做 / 真失败）由同一个函数挑话：
             // 成功那句只属于成功，走 stdout，其余走 stderr（这条命令是挂在计划任务上的）。
             let (line, code) = backup_outcome(&outcome);
-            if code == 0 {
-                println!("{line}");
-            } else {
-                eprintln!("{line}");
+            if matches!(outcome, db::maintenance::BackupOutcome::Done { .. }) {
+                // 「目录」那句跟着结论走同一个流。它以前无条件进 stdout，于是部分失败的
+                // 一轮里，只收 stdout 的计划任务看到的仍然是一行像成功的话。
+                emit_line(
+                    &format!(
+                        "  目录: {}（已停用插件的数据会跳过）",
+                        focusflow_core::paths::backup_dir().display()
+                    ),
+                    code,
+                );
             }
+            emit_line(&line, code);
             code
         }
         "--cleanup" => {
@@ -1005,6 +1000,31 @@ fn cleanup_outcome(days: i64, report: &db::maintenance::MaintenanceReport) -> (S
 /// 设置页那句结论（`desktop/src/commands.rs` 的 `backup_message`）用的是同一个函数。
 /// 这个判据先前在两个界面各抄了一遍 `failed.is_empty()`，桌面那一份抄成了 `Ok`
 /// ⇒ 部分失败在设置页上照样是一片绿字。三句话（完成 / 不完整 / 无事可做）都在这里挑。
+/// `--vacuum` 的结局：话由 core 的 `vacuum_line` 说**一遍**（设置页的「立即压缩」用的是
+/// 同一句），这里只加"原因见日志"与退出码。
+///
+/// 旧写法是 `if incomplete { eprintln!(压缩未完成) } else { println!("压缩完成") }`：
+/// 一套库都没扫到时 `failed_years`/`dir_error` 都空 ⇒ 明明什么都没做，终端却说「压缩完成」。
+/// 退出码仍按既有口径保持 0（空目录不是失败，`--backup`/`--reset` 两侧早就这么定了）。
+fn vacuum_outcome(report: &db::maintenance::MaintenanceReport) -> (String, i32) {
+    let line = db::maintenance::vacuum_line(report);
+    if report.incomplete() {
+        (format!("{line}（原因见日志）"), 1)
+    } else {
+        (line, 0)
+    }
+}
+
+/// 一行话该进 stdout 还是 stderr：只有退出码 0 才归 stdout。
+/// 这几条命令都挂在计划任务上，"说了没做"与"失败只出现在另一个流里"都是缺陷。
+fn emit_line(line: &str, code: i32) {
+    if code == 0 {
+        println!("{line}");
+    } else {
+        eprintln!("{line}");
+    }
+}
+
 fn backup_outcome(outcome: &db::maintenance::BackupOutcome) -> (String, i32) {
     use db::maintenance::BackupOutcome as B;
     match outcome {
@@ -1040,7 +1060,7 @@ mod tests {
     use super::{
         backup_outcome, cleanup_outcome, export_csv, export_html, export_target, import_report,
         max_args, parse_keep_days, parse_period, parse_stats_year, period_window, rank_tail_note,
-        run, year_lookup, Period, YearLookup,
+        run, vacuum_outcome, year_lookup, Period, YearLookup,
     };
     use super::{reset_plan, ResetPlan};
     use focusflow_core::db::maintenance::MaintenanceReport;
@@ -1303,6 +1323,7 @@ mod tests {
             failed_years: vec![],
             dir_error: None,
             snapshot_warning: None,
+            touched_years: 0,
         };
         let (line, code) = cleanup_outcome(30, &ok);
         assert_eq!(code, 0);
@@ -1317,6 +1338,7 @@ mod tests {
             failed_years: vec![2025],
             dir_error: None,
             snapshot_warning: None,
+            touched_years: 0,
         };
         let (line, code) = cleanup_outcome(30, &partial);
         assert_eq!(code, 1);
@@ -1335,6 +1357,7 @@ mod tests {
             failed_years: vec![],
             dir_error: Some("读取数据目录失败".to_string()),
             snapshot_warning: None,
+            touched_years: 0,
         };
         let (line, code) = cleanup_outcome(30, &nodir);
         assert_eq!(code, 1, "目录读不出来不是「没东西可删」");
@@ -1789,6 +1812,112 @@ mod tests {
         assert!(
             prod[f..f_end].contains("snapshot_warning"),
             "--reset 在快照没兜住时仍然只说「已清空」"
+        );
+    }
+
+    /// `--vacuum` 的三种结局必须分开：一套库都没扫到 ≠ 压缩完成。
+    ///
+    /// 旧写法只看 `incomplete()`，于是空目录/刚重置过的机器上，挂在计划任务里的
+    /// `--vacuum` 天天准时报「压缩完成」，而它一个文件都没碰（同目录的 `--backup`
+    /// 早就老实说「没有需要备份的数据库」—— 两条臂各写一句话，漏了这条）。
+    #[test]
+    fn vacuum_says_nothing_was_done_when_no_year_db_was_found() {
+        use focusflow_core::db::maintenance::MaintenanceReport;
+
+        let three = MaintenanceReport {
+            touched_years: 3,
+            ..MaintenanceReport::default()
+        };
+        let (line, code) = vacuum_outcome(&three);
+        assert_eq!(code, 0);
+        assert!(
+            line.contains("压缩完成") && line.contains("3"),
+            "压成了几套要说出来，否则与「什么都没做」同形: {line}"
+        );
+
+        let none = MaintenanceReport::default();
+        let (line, code) = vacuum_outcome(&none);
+        assert_eq!(
+            code, 0,
+            "没有年度库不是失败（与 --backup/--reset 同一口径）"
+        );
+        assert!(
+            !line.contains("压缩完成") && line.contains("没有可压缩的年度库"),
+            "一套都没扫到时不许说「压缩完成」: {line}"
+        );
+
+        let failed = MaintenanceReport {
+            failed_years: vec![2025],
+            touched_years: 1,
+            ..MaintenanceReport::default()
+        };
+        let (line, code) = vacuum_outcome(&failed);
+        assert_eq!(code, 1, "有年份没压成必须让退出码非 0");
+        assert!(
+            line.contains("压缩未完成") && line.contains("日志"),
+            "{line}"
+        );
+
+        let nodir = MaintenanceReport {
+            dir_error: Some("读取数据目录失败".to_string()),
+            ..MaintenanceReport::default()
+        };
+        let (line, code) = vacuum_outcome(&nodir);
+        assert_eq!(code, 1, "连年份都问不出来时不是「无事可做」");
+        assert!(
+            line.contains("压缩未完成"),
+            "目录读不出要说成未完成: {line}"
+        );
+    }
+
+    /// 失败那一轮里，`--backup` 说的每一句都得进 stderr。
+    ///
+    /// 结论句本来就按退出码分流，而「  目录: …」那行以前无条件 `println!`：
+    /// 部分失败的一轮里，只收 stdout 的计划任务看到的仍是一行像成功的话。
+    #[test]
+    fn the_backup_arm_has_no_unconditional_stdout_print() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        // 锚点必须带 `{`：`max_args` 那张表里也有 `"--backup" => 2`，不带就会从表那里切开
+        let at = prod
+            .find("\"--backup\" => {")
+            .expect("--backup 的分派臂不见了");
+        let body = &prod[at..at
+            + prod[at..]
+                .find("\"--cleanup\" => {")
+                .expect("下一条臂不见了")];
+        // 比"剥掉所有空白"后的形状：这些调用点会被 rustfmt 折行，拿原始缩进比
+        // 要么因为一次无关的格式化而红，要么 needle 根本不可能被满足 —— 后者是假守卫。
+        // 串里那两个前导空格一起被剥掉，所以旧写法在扁平文本里就是 `println!("目录`，
+        // 撤掉修复时这条判据一定拦得住。
+        let flat: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            !flat.contains("println!(\"目录"),
+            "「目录」那句不能再无条件走 stdout"
+        );
+        assert_eq!(
+            flat.matches("emit_line(").count(),
+            2,
+            "目录那句与结论句都要走同一个按退出码分流的出口"
+        );
+
+        // 同一条臂旁边的 `--vacuum` 也一起钉：那句话现在归 core 的 `vacuum_line` 说，
+        // 臂里再留一句字面量「压缩完成」就是把它绕过去了。
+        let vat = prod
+            .find("\"--vacuum\" => {")
+            .expect("--vacuum 的分派臂不见了");
+        let vbody = &prod[vat..vat
+            + prod[vat..]
+                .find("\"--backup\" => {")
+                .expect("下一条臂不见了")];
+        let vflat: String = vbody.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            vflat.contains("vacuum_outcome(&report)"),
+            "--vacuum 没走那个分退出码的判据"
+        );
+        assert!(
+            !vflat.contains("println!(\"压缩完成"),
+            "--vacuum 不许再自己写一句「压缩完成」"
         );
     }
 }

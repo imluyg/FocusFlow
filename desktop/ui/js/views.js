@@ -1365,8 +1365,10 @@ function paintConfigWarn() {
 
 export async function doVacuum() {
   try {
-    await invoke("vacuum_db");
-    $("set-msg").textContent = "压缩完成";
+    // 结论由后端说：它按"真的压成了几套"措辞，一套都没扫到时交来的是
+    // 「没有可压缩的年度库…」，这里原样转达，不再自己写一句「压缩完成」。
+    const line = await invoke("vacuum_db");
+    $("set-msg").textContent = line;
     $("set-msg").style.color = "var(--success)";
   } catch (e) {
     $("set-msg").textContent = "压缩失败: " + e;

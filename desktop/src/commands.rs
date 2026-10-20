@@ -278,22 +278,26 @@ pub fn flush_db(state: State<'_, Arc<AppState>>) {
 
 /// 压缩所有年度数据库（重 IO；同步命令跑在主线程会冻结 UI，故放后台线程）。
 #[tauri::command]
-pub async fn vacuum_db(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn vacuum_db(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let db = Arc::clone(&state.db);
-    tauri::async_runtime::spawn_blocking(move || {
+    let line = tauri::async_runtime::spawn_blocking(move || {
         db.flush(true);
         let report = focusflow_core::db::maintenance::vacuum_all();
         // 以前这里 `let _ =`：哪个库没压缩成、甚至一个库都没枚举到，界面都照旧显示
         // 「压缩完成」。前端 doVacuum 的 catch 会把这句原样打在设置页的消息位上。
+        //
+        // 成功那句现在也由 core 的 `vacuum_line` 说：它按**真的压成了几套**说话，
+        // 于是一套库都没扫到时界面拿到的不是「压缩完成」，而是「没有可压缩的年度库」——
+        // 与 CLI 的 `--vacuum` 共用同一句（两侧各写一遍时漏的就是这条臂）。
         if report.incomplete() {
             Err(report.why_incomplete())
         } else {
-            Ok(())
+            Ok(focusflow_core::db::maintenance::vacuum_line(&report))
         }
     })
     .await
     .map_err(|e| e.to_string())??;
-    Ok(())
+    Ok(line)
 }
 
 /// 退出应用（托盘"退出程序"）。
