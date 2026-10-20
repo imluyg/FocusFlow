@@ -67,24 +67,47 @@ pub fn validate_new_data_home(src: &Path, dst: &Path) -> Result<(), String> {
     // 目标里除了 data / backup 之外还有别的东西就拒绝：往装着旧版 FocusFlow 的
     // 目录里搬是正常的，但那里已经有无关文件时，搬运结果和用户的预期不一致，
     // 而且事后很难分清哪份是谁的。
-    let mut strangers: Vec<String> = Vec::new();
-    if let Ok(it) = std::fs::read_dir(dst) {
-        for entry in it.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name != "data" && name != "backup" {
-                strangers.push(name);
-            }
+    // 单个条目读不动也一并算"看不清这个目录"：那正是会漏掉一个陌生名字的地方。
+    let listing = std::fs::read_dir(dst).and_then(|it| {
+        it.map(|entry| entry.map(|e| e.file_name().to_string_lossy().to_string()))
+            .collect::<Result<Vec<String>, std::io::Error>>()
+    });
+    strangers_verdict(listing, dst)
+}
+
+/// 「目标目录里有没有无关内容」这条校验的结论。抽成纯函数是为了钉住**读不出来**那一支：
+///
+/// 原先写的是 `if let Ok(it) = std::fs::read_dir(dst)` —— 读失败时段落直接落空，
+/// 名单是空的 ⇒ 校验"通过"。可这条校验存在的唯一理由就是"搬进去之前先看清那里有什么"，
+/// 看不清的时候放行，等于在最该停手的形态下把一整年数据搬进一个读不动的目录，
+/// 而界面只会显示"已经安排好了"。刚 `create_dir_all` 成功、下一步就列不出来，
+/// 是受限 ACL、被杀软握着、或那个位置被同步盘换成了别的东西的真实形态 ⇒ 保守做法是停下来问。
+fn strangers_verdict(
+    listing: Result<Vec<String>, std::io::Error>,
+    dst: &Path,
+) -> Result<(), String> {
+    let names = match listing {
+        Err(e) => {
+            return Err(format!(
+                "目标目录（{}）建好了却读不出里面有什么: {e} —— 请换一个能正常打开的文件夹再试",
+                dst.display()
+            ))
         }
+        Ok(names) => names,
+    };
+    let mut strangers: Vec<String> = names
+        .into_iter()
+        .filter(|name| name != "data" && name != "backup")
+        .collect();
+    if strangers.is_empty() {
+        return Ok(());
     }
-    if !strangers.is_empty() {
-        strangers.sort();
-        strangers.truncate(6);
-        return Err(format!(
-            "目标目录里已经有别的内容（{}），请换一个空的或新建的文件夹",
-            strangers.join(", ")
-        ));
-    }
-    Ok(())
+    strangers.sort();
+    strangers.truncate(6);
+    Err(format!(
+        "目标目录里已经有别的内容（{}），请换一个空的或新建的文件夹",
+        strangers.join(", ")
+    ))
 }
 
 /// 把 `src_root` 下的 `data/` 与 `backup/` 复制到 `dst_root` 的对应子目录。
@@ -1108,6 +1131,64 @@ mod tests {
             validate_new_data_home(&elsewhere, &src.join("data/sub")).is_ok(),
             "校验必须用调用方交进来的 src：源换成别处，这个目标就没有套进自己"
         );
+    }
+
+    /// 「目标目录列不出来」不许折成"里面是空的"，那等于放行一次看不清内容的搬家。
+    ///
+    /// 这条只能走纯函数：`create_dir_all` 刚成功、紧接着 `read_dir` 就失败的形态
+    /// （受限 ACL、杀软握着目录、位置被同步盘换成别的东西）在测试里造不出来 ——
+    /// 把那个位置做成同名**文件**会先落进前一条「目标目录建不出来」那一支。
+    #[test]
+    fn an_unreadable_destination_is_not_reported_as_empty() {
+        let dst = std::path::Path::new("E:/wherever");
+        let msg = strangers_verdict(Err(std::io::Error::from_raw_os_error(5)), dst)
+            .expect_err("列不出目标里有什么，不能当成「里面没有别的内容」放行");
+        assert!(msg.contains("读不出"), "拒绝的理由要说清是读不出来: {msg}");
+        assert!(msg.contains("wherever"), "得说清是哪个目录读不出来: {msg}");
+
+        // 同一个判据另外三支也要继续成立，免得这条修复把正常路径一起挡掉
+        assert!(
+            strangers_verdict(Ok(vec![]), dst).is_ok(),
+            "空目录本来就该放行"
+        );
+        assert!(
+            strangers_verdict(Ok(vec!["data".to_string(), "backup".to_string()]), dst).is_ok(),
+            "data/backup 是搬运自己的产物，不该算无关内容"
+        );
+        let many: Vec<String> = (0..9).map(|i| format!("z{i:0>2}")).collect();
+        let msg = strangers_verdict(Ok(many), dst).expect_err("有陌生内容必须拒");
+        assert!(
+            !msg.contains("z06"),
+            "名单要照原来的规矩截到六个，别把整页名字塞进提示: {msg}"
+        );
+        assert!(
+            msg.contains("z00") && msg.contains("z05"),
+            "截断后留前六个: {msg}"
+        );
+    }
+
+    /// 接线腿：校验必须把 `read_dir` 的**结果**交给判据，不许再把失败折成空名单。
+    ///
+    /// 上面那条测的是判据本身；调用点退回 `if let Ok(..)` 时判据照样全绿，
+    /// 而"看不清也放行"这个症状只会在调用点上发生。
+    #[test]
+    fn the_destination_check_feeds_the_real_listing_to_the_verdict() {
+        let src = include_str!("data_location.rs");
+        let at = src
+            .find("pub fn validate_new_data_home(")
+            .expect("校验函数找不到了");
+        let end = src[at..].find("\n}\n").expect("函数切不出来");
+        let body = &src[at..at + end + 3];
+        assert!(
+            body.contains("strangers_verdict("),
+            "判据没接上真实的列目录结果"
+        );
+        for fold in ["if let Ok(", ".unwrap_or_default(", ".unwrap_or(", ".ok()"] {
+            assert!(
+                !body.contains(fold),
+                "列目录的失败被折成「名单为空」（{fold}）= 校验在看不清目标时静默放行"
+            );
+        }
     }
 
     #[test]
