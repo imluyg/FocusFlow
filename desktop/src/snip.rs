@@ -462,10 +462,30 @@ fn show_overlay(app: &AppHandle, epoch: u64) -> Result<(), String> {
         .inner_size()
         .map_err(|e| format!("读不到覆盖层客户区尺寸：{e}"))?;
     if !covers_screen(got.width, got.height, rect.width, rect.height) {
-        return Err(format!(
-            "覆盖层没铺满这块屏：客户区 {}x{}，屏幕 {}x{}",
-            got.width, got.height, rect.width, rect.height
-        ));
+        // 量到的尺寸与刚设下去的不一致，最省力的一条因果链是**摆位置那一步跨到了另一块
+        // 缩放比的屏**：窗口常驻复用，`set_position` 让它进新屏时 tao 会在 WM_DPICHANGED 里
+        // 按新旧比例重算客户区，正好把上面那次 `set_size` 的结果改写掉（150%→100% 时
+        // 1920x1080 变 1280x720）。旧行为是当场判死 —— 症状是"在缩放比更低的那块屏上
+        // 按热键，屏幕暗一下什么都没有"，且日志里没有任何一句指向缩放。
+        // 先重申一次尺寸（这一步在 DPI 通知之后，所以是最后说话的那个），再按老判据收尾。
+        tracing::warn!(
+            "覆盖层尺寸与目标屏不符（{}x{}，要 {}x{}）：重申一次尺寸，常见原因是这块屏的缩放比不同",
+            got.width,
+            got.height,
+            rect.width,
+            rect.height
+        );
+        win.set_size(PhysicalSize::new(rect.width, rect.height))
+            .map_err(|e| format!("重申覆盖层尺寸失败：{e}"))?;
+        let again = win
+            .inner_size()
+            .map_err(|e| format!("读不到覆盖层客户区尺寸：{e}"))?;
+        if !covers_screen(again.width, again.height, rect.width, rect.height) {
+            return Err(format!(
+                "覆盖层没铺满这块屏：客户区 {}x{}，屏幕 {}x{}",
+                again.width, again.height, rect.width, rect.height
+            ));
+        }
     }
     if !win.is_visible().unwrap_or(false) {
         return Err("覆盖层 show() 之后仍处于不可见状态".to_string());
@@ -1730,6 +1750,44 @@ mod tests {
             flat.match_indices("FLOATING_WAS_VISIBLE.store(").count(),
             2,
             "trigger 里两个分支各写一次可见性，收尾再读一次 —— 少一处就是有一支没登记"
+        );
+    }
+
+    /// 接线腿：覆盖层尺寸对不上时要先重申一次，再按老判据判死。
+    ///
+    /// 覆盖层是常驻复用的窗口：`set_position` 那一步把它跨到另一块缩放比的屏上时，
+    /// tao 会在 `WM_DPICHANGED` 里按新旧比例重算客户区，正好把先前的 `set_size` 改写掉。
+    /// 旧行为是当场 `return Err` —— 症状是"在缩放比更低的那块屏上按热键，屏幕暗一下
+    /// 什么都没有"，热键白按一次且日志里没有任何一句指向缩放。
+    /// 剪成只剩标识符的形状：这些调用点会被 rustfmt 折行，而本用例的说明文字里也写着
+    /// `set_size` / `return Err`，留着注释就能被自己的解释判绿。
+    #[test]
+    fn the_overlay_reasserts_its_size_before_giving_up() {
+        let prod = prod_text();
+        let at = prod.find("fn show_overlay").expect("show_overlay 找不到了");
+        let body = &prod[at..at + prod[at..].find("\nfn ").expect("后面没有顶层函数了")];
+        let flat = flat_code(body);
+        let checks: Vec<usize> = flat
+            .match_indices("covers_screen(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            checks.len(),
+            2,
+            "重申之后还要再对账一次：两遍 covers_screen，实际 {checks:?}"
+        );
+        let sets: Vec<usize> = flat
+            .match_indices("win.set_size(PhysicalSize::new(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            sets.len(),
+            2,
+            "设尺寸两次：开头一次、对账失败后重申一次，实际 {sets:?}"
+        );
+        assert!(
+            sets[0] < checks[0] && checks[0] < sets[1] && sets[1] < checks[1],
+            "重申必须夹在两遍对账中间（对账 {checks:?}，设尺寸 {sets:?}）"
         );
     }
 }
