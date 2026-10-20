@@ -230,9 +230,23 @@ pub fn start_sampler(writer: Arc<DbWriter>) -> crate::startup::CheckResult {
     }
 }
 
+/// Toolhelp 遍历的收尾判据：这个 HRESULT 是不是「条目走到头了」。
+///
+/// 只有 `ERROR_NO_MORE_FILES`（Win32 18 ⇒ `HRESULT_FROM_WIN32` 后是 `0x80070012`）
+/// 才是正常结束。旧写法把 `Process32NextW` 的**任何**错误都当结束并交回 `Ok(部分表)`，
+/// 于是遍历被拖断时，采集侧拿一份缺了一批进程的快照去换掉上一张完整的 ——
+/// 症状是应用榜凭空少一批、前台应用「查不到名字」，而唯一那条留痕（`warn_once`）
+/// 也不会响，因为它看见的是 Ok。
+fn toolhelp_next_is_end(code: u32) -> bool {
+    code == 0x8007_0012
+}
+
 /// 前台进程名采集（平台相关）。
 mod collect {
-    use super::{apply_snapshot, SnapshotCache, SNAPSHOT_FORCE_MIN_SECS, SNAPSHOT_REFRESH_SECS};
+    use super::{
+        apply_snapshot, toolhelp_next_is_end, SnapshotCache, SNAPSHOT_FORCE_MIN_SECS,
+        SNAPSHOT_REFRESH_SECS,
+    };
     use std::time::Duration;
 
     /// 前台窗口所属进程的 exe 文件名（不读窗口标题），连同窗口句柄一起交回。
@@ -370,8 +384,14 @@ mod collect {
                 if !name.is_empty() {
                     map.insert(entry.th32ProcessID, name);
                 }
-                if Process32NextW(handle, &mut entry).is_err() {
-                    break;
+                if let Err(e) = Process32NextW(handle, &mut entry) {
+                    // 只有"没有更多条目"才是走完；其它错误说明这张表被截断了，
+                    // 交回 Ok 会让调用方拿它换掉上一张完整的（见 `toolhelp_next_is_end`）。
+                    if toolhelp_next_is_end(e.code().0 as u32) {
+                        break;
+                    }
+                    let _ = CloseHandle(handle);
+                    return Err("Process32NextW 遍历中断");
                 }
             }
             let _ = CloseHandle(handle);
@@ -390,8 +410,41 @@ mod collect {
 mod tests {
     #[cfg(windows)]
     use super::collect::pid_to_name_with;
-    use super::{apply_snapshot, is_recordable, parse_exclude, SnapshotCache};
+    use super::{
+        apply_snapshot, is_recordable, parse_exclude, toolhelp_next_is_end, SnapshotCache,
+    };
     use std::collections::HashMap;
+
+    /// Toolhelp 遍历只有撞上 `ERROR_NO_MORE_FILES` 才算走到头。
+    ///
+    /// 旧写法把 `Process32NextW` 的**任何**错误都 `break` 掉再交回 `Ok(部分表)`：
+    /// 遍历被拖断时，采集侧会用一份缺了一批进程的快照去换掉上一张完整的，
+    /// 而那条"沿用上一张表"的留痕（`warn_once`）根本不会响 —— 它看见的是 Ok。
+    #[test]
+    fn only_no_more_files_ends_a_toolhelp_walk() {
+        assert!(
+            toolhelp_next_is_end(0x8007_0012),
+            "ERROR_NO_MORE_FILES 才是正常结束"
+        );
+        assert!(
+            !toolhelp_next_is_end(0x8007_0008),
+            "内存不足不是结束，那张表是截断的"
+        );
+        assert!(!toolhelp_next_is_end(0x8000_4005), "E_UNEXPECTED 不是结束");
+        assert!(!toolhelp_next_is_end(0), "S_OK 不该被当成结束码");
+
+        // 字面量与 API 常量必须是同一个码：写错一位就是"永远判成截断"或
+        // "永远判成结束"，而这两种都只在真出事的机器上才看得出来。
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::ERROR_NO_MORE_FILES;
+            let code = ERROR_NO_MORE_FILES.to_hresult().0 as u32;
+            assert!(
+                toolhelp_next_is_end(code),
+                "API 给的错误码 {code:#010x} 必须被认成结束"
+            );
+        }
+    }
 
     /// exclude 命中即不归属，且大小写不敏感。
     #[test]
