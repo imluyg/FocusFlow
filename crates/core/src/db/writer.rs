@@ -295,36 +295,16 @@ impl DbWriter {
     /// （原来 `.map_err(日志).ok()` 吞掉后连启动日志都照常打"已启动"）。
     pub fn start(flush_interval: Duration) -> anyhow::Result<Arc<Self>> {
         let (sig_tx, sig_rx) = mpsc::channel();
-        // 今日计数初始值 = 聚合表中今日的记录数
-        let today_base_count = {
-            let path = paths::current_year_db_path();
-            connection::open_ro(&path)
-                .ok()
-                .and_then(|conn| {
-                    conn.query_row(
-                        "SELECT COALESCE(SUM(count), 0) FROM daily_counts WHERE date_key = ?1",
-                        [queries::day_key_of_date(chrono::Local::now().date_naive())],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .ok()
-                })
-                .unwrap_or(0)
-                .max(0) as u64
-        };
-        let today_base_active = {
-            let path = paths::current_year_db_path();
-            connection::open_ro(&path)
-                .ok()
-                .and_then(|conn| {
-                    conn.query_row(
-                        "SELECT COALESCE(seconds, 0) FROM daily_counts WHERE date_key = ?1",
-                        [queries::day_key_of_date(chrono::Local::now().date_naive())],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .ok()
-                })
-                .unwrap_or(0)
-                .max(0) as u64
+        // 今日那两个数「已经在库里」的部分：一次只读连接、同一个 date_key 取两列。
+        // 这里原先自己抄了两遍 SQL、开两次连接 —— 正是下面 `today_landed_totals`
+        // 那条「这条 SQL 只许有一份」禁止的形状，而且两半各自 `unwrap_or(0)`：
+        // 第二次 open 失败（库被别的连接锁住、同步盘占位）时「今日按键」锚住了、
+        // 「今日活跃时长」却是 0，而这两个缓存之后只往上加，一整天补不回来；
+        // 两次 `Local::now()` 要是正好跨午夜，两半读的根本不是同一天。
+        let (today_base_count, today_base_active) = {
+            let dk = queries::day_key_of_date(chrono::Local::now().date_naive());
+            let (count, seconds) = today_landed_totals(dk);
+            (count.max(0) as u64, seconds.max(0) as u64)
         };
         // 启动回放：上次进程异常终止时写入的未落库增量（若存在）并入内存聚合，
         // 随首次周期 flush 正常落库。读到就改名留一份副本，等首批增量真落库再删
@@ -964,9 +944,10 @@ fn neutralize_recovery_file() {
 
 /// 今日那两个数**已经在库里的**部分：`(活跃次数, 活跃秒数)`。库读不到就是 (0, 0)。
 ///
-/// 这条 SQL 只许有一份：`recompute_today_totals`（外部调，先 flush 再读）与
-/// [`reanchor_today`]（写线程自己调，不等 flush）算的是同一个量，两处各写一遍就是
-/// 本仓那个"一把尺子抄多处、改一漏一"的老形状。
+/// 这条 SQL 只许有一份：`start()`（启动时的今日基准）、`recompute_today_totals`
+/// （外部调，先 flush 再读）与 [`reanchor_today`]（写线程自己调，不等 flush）算的是同一个量，
+/// 两处各写一遍就是本仓那个"一把尺子抄多处、改一漏一"的老形状 —— 而抄的那两份还各自
+/// 开一次连接、各折一次 0，于是"一半读不到"会锚出半对半错的今日。
 fn today_landed_totals(today_dk: i64) -> (i64, i64) {
     connection::open_ro(&paths::current_year_db_path())
         .ok()
@@ -1614,6 +1595,32 @@ mod tests {
     /// `ensure_schema` 的错误整个丢掉，`flush_partition` 只能报"无可用连接"，
     /// `flush_pending` 打进日志的就是那五个字 —— 目录里放的是占位文件、路径不存在、
     /// 还是库结构建不起来，全都看不出来（B14-1 吞线程失败同族）。
+    /// 「今日那两个数」这条 SQL 在生产代码里只许出现一次。
+    ///
+    /// `today_landed_totals` 的注释明写"只许有一份"，而 `start()` 里曾各抄一遍
+    /// （两条 SQL、两次 `open_ro`、两次 `Local::now()`）：第二半读不到时按键锚住了、
+    /// 活跃＝0，而这两个缓存之后只往上加 ⇒ 一整天说不清；跨午夜启动时两半读的还不是
+    /// 同一天。守卫按字面数出现次数——再抄一份（哪怕只是改了空格写法）当场红。
+    #[test]
+    fn the_today_totals_sql_has_exactly_one_copy() {
+        let src = include_str!("writer.rs");
+        let prod = &src[..src
+            .find("#[cfg(test)]\nmod tests")
+            .expect("测试模块的起点找不到了")];
+        for needle in [
+            "COALESCE(SUM(count), 0)",
+            "COALESCE(SUM(seconds), 0)",
+            "FROM daily_counts WHERE date_key",
+        ] {
+            assert_eq!(
+                prod.matches(needle).count(),
+                1,
+                "「今日那两个数」的片段 {needle:?} 在生产代码里不是恰好一份：{}",
+                prod.matches(needle).count()
+            );
+        }
+    }
+
     /// `flush_pending` 的结论要交给等回音的人：这批到底全落成了没有。
     ///
     /// 旧形状里写线程收到 `Signal::Flush` 就无条件回话（载荷是 `Sender<()>`），而
