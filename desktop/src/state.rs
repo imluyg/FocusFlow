@@ -653,6 +653,36 @@ fn apply_window_vibrancy(_win: &tauri::WebviewWindow, _dark: bool) -> bool {
     false
 }
 
+/// 主题变了就把系统材质重贴一次。
+///
+/// `apply_window_vibrancy` 那个 `dark` 不是摆设：Mica 分支拿它设
+/// `DWMWA_USE_IMMERSIVE_DARK_MODE`（系统按这个档位挑 Mica 的深浅底），Acrylic 分支直接
+/// 用它挑着色 tint。而这两处原先只在**建窗那一刻**各贴一次 ⇒ 设置页从亮切暗后 CSS 跟着变了，
+/// 窗口那层系统底色却还停在亮色，整圈边缘与标题区留着旧主题的颜色（悬浮窗同一件事）。
+/// 材质贴在窗口上，所以两个窗都得走一遍；主窗口还没建起来时这里是空操作，
+/// 建窗那条本来就读的是当时的主题，不会贴错。
+pub fn refresh_window_vibrancy(app: &tauri::AppHandle) {
+    let dark = focusflow_core::config::instance().get("gui", "theme") == "dark";
+    if let Some(win) = app.get_webview_window("main") {
+        let ok = apply_window_vibrancy(&win, dark);
+        MAIN_GLASS.store(ok, Ordering::SeqCst);
+        use tauri::Emitter;
+        // 前端那层 body.glass 是"材质真的在"才加的半透明令牌：这次贴不成就得摘掉，
+        // 否则窗口已经不是玻璃、CSS 还留着透出桌面的半透明底。
+        // 两条分支各写一次 emit_to、事件名紧跟在第二个实参位上：`wiring_audit` 那条
+        // 是按 `emit_to("窗口", "事件名"` 的形状认账的，把名字算成表达式（这里是 if/else）
+        // 它就读成"前端在等一个从来没人广播的事件"——与本仓那处 emit 跨三行的漏读同一个形状。
+        if ok {
+            let _ = app.emit_to("main", "vibrancy-on", true);
+        } else {
+            let _ = app.emit_to("main", "vibrancy-off", false);
+        }
+    }
+    if let Some(win) = app.get_webview_window("floating") {
+        apply_window_vibrancy(&win, dark);
+    }
+}
+
 pub fn show_main_window(app: &tauri::AppHandle) {
     if app.get_webview_window("main").is_none() {
         if MAIN_CREATING.swap(true, Ordering::SeqCst) {

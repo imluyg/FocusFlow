@@ -215,6 +215,10 @@ pub fn set_config(
     if section == "floating" && key == "enabled" {
         crate::state::set_floating_visible(&app, value == "true");
     }
+    // 主题改了要重贴窗口材质：那一层的深浅是按"贴的那一刻"定死的（见 refresh_window_vibrancy）
+    if must_reapply_vibrancy(&section, &key) {
+        crate::state::refresh_window_vibrancy(&app);
+    }
     Ok(())
 }
 
@@ -227,6 +231,16 @@ pub fn set_config(
 /// 现在键名集合从 `hotkey::BINDINGS` 推，加一条绑定两处自动一起长。
 fn must_reload_hotkey(section: &str, key: &str) -> bool {
     section == "hotkey" && (key == "enabled" || crate::hotkey::is_binding_key(key))
+}
+
+/// 设置页写完一个键之后，要不要重贴窗口材质。
+///
+/// 会改变材质外观的只有 `[gui] theme`：它既决定 Mica 那条分支传给
+/// `DWMWA_USE_IMMERSIVE_DARK_MODE` 的档位，也直接决定 Acrylic 那条分支的着色 tint。
+/// 判据抽成纯函数是为了让用例把"哪些键要重贴、哪些不许白贴一遍"钉成一张表
+/// （与 [`must_reload_hotkey`] 同一个手法：那条写死两个键时漏掉了后来新增的截图热键）。
+fn must_reapply_vibrancy(section: &str, key: &str) -> bool {
+    section == "gui" && key == "theme"
 }
 
 /// 切换暂停记录，返回新的暂停状态，并广播给前端（与托盘切换保持一致）。
@@ -1065,6 +1079,55 @@ mod tests {
         assert!(
             body.contains("reset_active_anchor()"),
             "AppState::toggle_pause 暂停时没清活跃锚"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vibrancy_wiring {
+    use super::must_reapply_vibrancy;
+
+    /// 会改变窗口材质外观的只有 `[gui] theme`：改它必须重贴，改别的键不许白贴一遍。
+    ///
+    /// 反向腿是有意列全的：`[gui]` 里那些键（周期、悬浮窗指标、主题之外的显示项）
+    /// 走的都是同一个写入口，判据一旦松成 `section == "gui"`，每次改设置都会重贴一次材质。
+    #[test]
+    fn only_the_theme_key_reapplies_the_window_material() {
+        assert!(must_reapply_vibrancy("gui", "theme"), "切主题必须重贴材质");
+        for (section, key) in [
+            ("gui", "default_period"),
+            ("gui", "floating_metric"),
+            ("stats", "cpm_window"),
+            ("floating", "theme"),
+            ("hotkey", "theme"),
+            ("app_stats", "enabled"),
+        ] {
+            assert!(
+                !must_reapply_vibrancy(section, key),
+                "[{section}] {key} 不改变材质，不该触发重贴"
+            );
+        }
+    }
+
+    /// 接线腿：`set_config` 必须把这条判据接到 `refresh_window_vibrancy` 上。
+    ///
+    /// 材质是贴在真窗口上的，headless 起不来窗口 ⇒ 这里只钉接线形状，
+    /// 「切主题后那层系统底色真的跟着变」登记为眼验项，不许写成"有用例守着"。
+    #[test]
+    fn the_theme_write_site_reapplies_the_material() {
+        let src = include_str!("commands.rs");
+        let at = src.find("pub fn set_config(").expect("set_config 找不到了");
+        let body = &src[at..at
+            + src[at..]
+                .find("\nfn ")
+                .expect("set_config 之后没有顶层函数了")];
+        assert!(
+            body.contains("must_reapply_vibrancy(&section, &key)"),
+            "set_config 没走那条判据"
+        );
+        assert!(
+            body.contains("refresh_window_vibrancy(&app)"),
+            "判据成立却没真的重贴材质"
         );
     }
 }

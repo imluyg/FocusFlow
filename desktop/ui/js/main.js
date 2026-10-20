@@ -171,6 +171,11 @@ document.querySelectorAll("#analytics-tabs .tab").forEach((b) => {
   try {
     await listen("vibrancy-on", () => document.body.classList.add("glass"));
   } catch (e) {}
+  // 后端重贴材质失败时也要一句话传下来：body.glass 是"系统材质真的在"才加的半透明令牌，
+  // 摘不掉的话窗口已经不是玻璃了、CSS 还在透出桌面。
+  try {
+    await listen("vibrancy-off", () => document.body.classList.remove("glass"));
+  } catch (e) {}
   // 版本号从后端单一来源读取（Cargo 包版本），失败时用默认占位
   try {
     const v = await invoke("get_version");
