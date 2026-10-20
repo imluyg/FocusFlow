@@ -11,12 +11,14 @@ use std::path::{Path, PathBuf};
 ///
 /// 只认 `.png`（大小写都收）且必须是普通文件：子目录、`.tmp` 残骸都不算，
 /// 否则托盘那点一下会"选中一个打不开的目录"。
-pub fn latest_png(dir: &Path) -> Option<PathBuf> {
+///
+/// 两种"没拿到图"要分开交出去：`Ok(None)` ＝ 目录读得出来、里面确实没有 PNG；
+/// `Err` ＝ 这个位置此刻读不出来（目录还不存在、被同步盘换成普通文件、移动盘休眠）。
+/// 旧写法把后者折成 `None`，于是调用方那句成了「截图目录是空的」——
+/// 同一族（`commands.rs` 的备份目录、`vacuum_all`）本仓已经修过两轮。
+pub fn scan_png(dir: &Path) -> Result<Option<PathBuf>, String> {
     let mut best: Option<(std::time::SystemTime, String, PathBuf)> = None;
-    let entries = match std::fs::read_dir(dir) {
-        Ok(it) => it,
-        Err(_) => return None,
-    };
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -43,7 +45,7 @@ pub fn latest_png(dir: &Path) -> Option<PathBuf> {
             best = Some((mtime, name, path));
         }
     }
-    best.map(|(_, _, p)| p)
+    Ok(best.map(|(_, _, p)| p))
 }
 
 /// 组装 `explorer.exe` 的参数：有文件就"打开所在目录并选中它"，没有就只开目录。
@@ -69,7 +71,10 @@ pub fn explorer_args(dir: &Path, target: Option<&Path>) -> Vec<String> {
 /// 托盘点下去"没反应"是本功能唯一故障形态，不吭声就等于把失败吞掉。
 pub fn reveal_last_screenshot() -> Result<String, String> {
     let dir = focusflow_core::paths::screenshots_dir();
-    let target = latest_png(&dir);
+    // 读不出来时不往下开资源管理器：那一支会指着同一个目录说「截图目录是空的，已打开 …」，
+    // 而这个目录既没被读过、也可能根本开不出来（休眠的移动盘、同名普通文件）。
+    let target = scan_png(&dir)
+        .map_err(|why| format!("截图目录读不出来（{why}），本次没有打开资源管理器"))?;
     let args = explorer_args(&dir, target.as_deref());
 
     let mut cmd = std::process::Command::new("explorer");
@@ -102,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_png_picks_newest_and_ignores_junk() {
+    fn scan_png_picks_newest_and_ignores_junk() {
         let _lock = crate::app_dir_lock();
         let app = focusflow_core::paths::test_app_dir("reveal_latest");
         let dir = app.path().join("shots");
@@ -116,7 +121,7 @@ mod tests {
         touch(&dir, "no_extension", 4_000, "x");
 
         assert_eq!(
-            latest_png(&dir).as_deref(),
+            scan_png(&dir).unwrap().as_deref(),
             Some(newest.as_path()),
             "该拿那张最新的 PNG，目录名与 txt 都不许抢走"
         );
@@ -134,26 +139,42 @@ mod tests {
         let second = touch(&dir, "snip_20260929_031000_800x600_2.png", 5_000, "b");
 
         assert_eq!(
-            latest_png(&dir).as_deref(),
+            scan_png(&dir).unwrap().as_deref(),
             Some(second.as_path()),
             "平票要取名字大的那张（=同秒里后写的那张）"
         );
     }
 
+    /// `Ok(None)`＝读得出来、里面没有 PNG；`Err`＝这个位置此刻读不出来。
+    ///
+    /// 旧写法两者都回 `None`，托盘那句就成了「截图目录是空的，已打开 …」——
+    /// 目录还不存在、被同步盘换成同名普通文件、移动盘休眠，都被说成"你还没截过图"，
+    /// 而资源管理器指着那个开不出来的路径也没真打开任何东西。
     #[test]
-    fn latest_png_on_missing_or_empty_dir_is_none() {
+    fn scan_png_tells_empty_apart_from_unreadable() {
         let _lock = crate::app_dir_lock();
         let app = focusflow_core::paths::test_app_dir("reveal_empty");
-        assert_eq!(
-            latest_png(&app.path().join("nope")),
-            None,
-            "目录不存在不该 panic"
+
+        let missing = app.path().join("nope");
+        let why = scan_png(&missing).expect_err("目录不存在不是「空的」，要说读不出来");
+        assert!(
+            why.contains(&missing.display().to_string()),
+            "原因里要带上是哪个目录: {why}"
         );
-        std::fs::create_dir_all(app.path().join("nope")).unwrap();
+
+        std::fs::create_dir_all(&missing).unwrap();
         assert_eq!(
-            latest_png(&app.path().join("nope")),
+            scan_png(&missing).unwrap(),
             None,
-            "空目录应回 None"
+            "读得出的空目录才是「里面没有 PNG」"
+        );
+
+        // 同名普通文件（同步盘占位的形状）：也走 Err，不能被当成"没有截图"
+        let blocker = app.path().join("as_file");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        assert!(
+            scan_png(&blocker).is_err(),
+            "位置是个普通文件 ⇒ 读不出来，不是空目录"
         );
     }
 
