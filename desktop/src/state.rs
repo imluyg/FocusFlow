@@ -778,12 +778,28 @@ fn show_main_window_impl(app: &tauri::AppHandle) {
                 .clone()
                 .and_then(|u| u.parse::<tauri::Url>().ok())
             {
-                Some(u) => {
-                    let _ = win.navigate(u);
-                    // 加载完成前不显示，避免白屏；由恢复线程轮询后恢复渲染并显示
-                    restore_main_after_load(app);
-                    return;
-                }
+                Some(u) => match win.navigate(u) {
+                    Ok(()) => {
+                        // 加载完成前不显示，避免白屏；由恢复线程轮询后恢复渲染并显示
+                        restore_main_after_load(app);
+                        return;
+                    }
+                    // 导航请求没被接受 ⇒ 页面还停在 about:blank。上面那句 swap 已经把
+                    // 「已卸载」摘成 false，不立回去的话下一次呼出走的就是普通路径，
+                    // 而普通路径只会看到 about:blank 并照原样显示 ⇒
+                    // 用户拿到一个永远空白的面板，再按热键也不会好。
+                    // 与 `weekly_report_marking` / `restart_slot_after_spawn` 同一条规矩：
+                    // 事情没做成，不许推进"只做一次"的凭据。这里不 return，
+                    // 接着往下走的普通路径会因为 url 仍是空白而交给恢复线程那套
+                    // 「重试两次 → 还不行就重启程序」的兜底。
+                    Err(e) => {
+                        MAIN_UNLOADED.store(true, Ordering::SeqCst);
+                        tracing::warn!(
+                            "主窗口恢复导航没被接受，页面还是空白: {e} —— 把「已卸载」标记立回去，\
+                             下次呼出再试一次（可恢复的 URL 仍然留着）"
+                        );
+                    }
+                },
                 None => tracing::warn!("show_main: 恢复 URL 无效，按普通路径显示"),
             }
         }
@@ -887,11 +903,26 @@ fn arm_main_unload(app: &tauri::AppHandle) {
             if url.as_str() == "about:blank" {
                 return;
             }
-            // 记录原页面 URL（重新显示时导航回去），再卸载页面
-            *MAIN_URL.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.to_string());
-            MAIN_UNLOADED.store(true, Ordering::SeqCst);
-            let _ = win.navigate(tauri::Url::parse("about:blank").unwrap());
-            tracing::info!("主窗口页面已卸载到 about:blank（释放页面内存）");
+            // 记录原页面 URL（重新显示时导航回去），再卸载页面。
+            //
+            // 两件事都必须排在 `navigate` 的回话之后：`navigate` 是"投递给主循环"，
+            // 它的 Err 说的是这次请求压根没被接受（窗口已经没了/通道断了）。
+            // 原先写的是 `let _ = win.navigate(..)` 然后无条件立 MAIN_UNLOADED、无条件打
+            // 「页面已卸载到 about:blank（释放页面内存）」⇒ 投递失败的那次，
+            // 日志说内存已经释放而其实没有，而下一次 show 又照着 MAIN_UNLOADED 去
+            // "导航回原页面" —— 把一个活得好好的页面白重刷一遍，设置页里正在输入的东西
+            // 就是这么被清掉的（而这是卸载路径，本来不该碰用户的页面）。
+            match win.navigate(tauri::Url::parse("about:blank").unwrap()) {
+                Ok(()) => {
+                    *MAIN_URL.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.to_string());
+                    MAIN_UNLOADED.store(true, Ordering::SeqCst);
+                    tracing::info!("主窗口页面已提交卸载到 about:blank（释放页面内存）");
+                }
+                Err(e) => {
+                    *MAIN_URL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    tracing::warn!("主窗口页面卸载请求没被接受，页面继续留着（内存未释放）: {e}");
+                }
+            }
         })
         .map_err(|e| tracing::error!("启动主窗口页面卸载线程失败（该功能不可用）: {e}"))
         .ok();
@@ -2599,6 +2630,89 @@ mod alltime_anchor_wiring {
                 .count(),
             2,
             "「总计」展示值的两处调用都得传显示锚（基准那份不算触发尺子）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod unload_marker_wiring {
+    /// 接线腿：「页面已卸载」这两件事（`MAIN_UNLOADED` 与那句日志）必须排在
+    /// `navigate` 的回话之后，而且不许把回话丢掉。
+    ///
+    /// 卸载与恢复都要真窗口，headless 起不来 ⇒ 这里钉的是顺序与"必须看见 Err"，
+    /// 「投递失败时页面确实还留着」那半登记为眼验项，别写成有用例守着。
+    #[test]
+    fn the_unload_marker_waits_for_the_navigate_reply() {
+        let src = include_str!("state.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn arm_main_unload(")
+            .expect("页面卸载那条路找不到了");
+        let rest = &prod[at..];
+        let end = rest.find("\nfn ").expect("卸载函数之后没有顶层函数了");
+        // 注释要先摘掉：本文件的注释写着旧形状 `let _ = win.navigate(..)`，
+        // 拿原文比就会让守卫被自己的说明文字喂绿。
+        let code: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 三条腿攒齐了一次断：头一条先 panic 就把后面两条腿的敏感度藏起来了
+        let mut bad: Vec<String> = Vec::new();
+        if code.contains("let _ = win.navigate") {
+            bad.push(
+                "navigate 的回话被丢掉（let _ = ..）：Err 那支没人看，日志与标记都会说谎"
+                    .to_string(),
+            );
+        }
+        match (
+            code.find("win.navigate("),
+            code.find("MAIN_UNLOADED.store(true"),
+        ) {
+            (Some(nav), Some(mark)) => {
+                if nav >= mark {
+                    bad.push(format!(
+                        "标记排在导航回话之前（navigate@{nav}、store@{mark}）：投递失败时下一次 show \
+                         会把活着的页面白重刷一次"
+                    ));
+                }
+            }
+            (nav, mark) => bad.push(format!("两个位置少了一个：navigate={nav:?} store={mark:?}")),
+        }
+        if !code.contains("没被接受") {
+            bad.push("投递失败那一支在日志里查不到手".to_string());
+        }
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    /// 接线腿：恢复路径上那次导航也不许把回话丢掉，被拒绝时要把标记立回去。
+    ///
+    /// 「标记已摘 + 导航又没成」= 一个再按热键也不会好的空白面板；这条规矩与
+    /// 「线程没起来不许推进一次性 marker／名额」是同一个（`weekly_report_marking`、
+    /// `restart_slot_after_spawn`）。导航真被拒绝时的行为只能真机按出来 ⇒ 眼验项照旧。
+    #[test]
+    fn a_refused_restore_navigation_keeps_the_unload_marker() {
+        let src = include_str!("state.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("MAIN_UNLOADED.swap(false")
+            .expect("那条「发现页面被卸载过」的分支找不到了");
+        let rest = &prod[at..];
+        let end = rest
+            .find("set_webview_rendering(app, \"main\", true)")
+            .expect("普通路径的起点找不到了");
+        let code: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("let _ = win.navigate(u)"),
+            "恢复导航的回话被丢掉：页面会停在空白页，而标记已经被摘走"
+        );
+        assert!(
+            code.contains("MAIN_UNLOADED.store(true"),
+            "导航被拒绝时要把「已卸载」标记立回去，否则下一次呼出走普通路径、显示的仍是空白"
         );
     }
 }
