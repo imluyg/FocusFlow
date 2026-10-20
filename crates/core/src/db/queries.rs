@@ -1035,6 +1035,12 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
                         // 会因为键已归一而被当成真名端给用户。
                         && *n != r.device_key.as_str()
                         && *n != identity.as_str()
+                        // 还有第三种：合并行的名字来自**另一条库行**（同一台设备跨年
+                        // 换过口，取的是最新登记年那条的 name），于是它既不等于本行原始键、
+                        // 也不等于身份段本身 —— 整串 `\\?\HID#VID_…#{GUID}` 就被当真名端出去。
+                        // 所以把名字也按身份键归一一次再比：与认设备同一个尺子，
+                        // 三种占位写法一起折成「没名字」，而人起的名字归一后仍是它自己。
+                        && crate::device_alias::hardware_identity_key(n) != identity
                 })
                 // 库里存的英文名在读侧过一次词条表（见 `localize_display_name`）：
                 // 词条是后来加的，旧年度库的行停在登记那一刻的写法上。
@@ -3062,6 +3068,56 @@ mod tests {
         assert!(
             body.contains("today_count_for_display()"),
             "get_today_count 直接照抄了今日缓存（午夜后会把昨天当成今日）"
+        );
+    }
+
+    /// 占位登记名还有第三种形态没被兜住：合并行的名字来自**另一条库行**。
+    ///
+    /// 同一台设备跨年换过口（或两个年度库里各留一条占位登记），合并时"名字取最新登记年
+    /// 那条"，于是展示行的 `device_key` 是 A 的原始键、而 `name` 是 B 的完整实例路径 ——
+    /// 旧判据只比这两者，两条都不命中 ⇒ 榜上直接把 `\\?\HID#VID_…#{GUID}` 端给用户。
+    #[test]
+    fn a_placeholder_name_from_another_row_is_still_recognised() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("devq_merge_name");
+        crate::device_alias::invalidate_cache();
+
+        let a = r"\\?\HID#VID_046D&PID_C52B#7&aaa&0&0000#{GUID-A}";
+        let b = r"\\?\HID#VID_046D&PID_C52B#7&bbb&0&0000#{GUID-B}";
+        // 两条库行都是「name == 自己的键」这种占位登记，只有年份不同
+        let row = |key: &str, year: i32, count: i64| DeviceRow {
+            device_key: key.to_string(),
+            name: Some(key.to_string()),
+            kind: Some("mouse".to_string()),
+            count,
+            year,
+        };
+        let (_, stats) = merge_device_rows(vec![row(a, 2024, 100), row(b, 2025, 50)]);
+
+        assert_eq!(
+            stats.len(),
+            1,
+            "夹具前提：同一身份的两条库行必须并成一行，否则测的不是合并名这一路"
+        );
+        assert!(
+            !stats[0].auto_name.contains('#') && !stats[0].auto_name.contains(r"\\?\"),
+            "合并过来的占位名要一起折成「没名字」走回退，实际端出去的是 {:?}",
+            stats[0].auto_name
+        );
+        assert!(
+            !stats[0].has_alias,
+            "这台设备没起过别名（别名侧不参与这条判据）"
+        );
+
+        // 正向腿：真人起的名字不会被这条判据吃掉
+        let (_, kept) = merge_device_rows(vec![row(a, 2024, 100), {
+            let mut r = row(b, 2025, 50);
+            r.name = Some("书房那只鼠标".to_string());
+            r
+        }]);
+        assert_eq!(
+            kept[0].auto_name, "书房那只鼠标",
+            "归一后不等于身份段的真名必须原样保留"
         );
     }
 }
