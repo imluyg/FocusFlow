@@ -1505,7 +1505,21 @@ fn spawn_stats_worker(
                             alltime_total_base = total_all;
                             alltime_max = Some(max_all.unwrap_or((today_str, 0)));
                             alltime_cache_day = day_ce;
-                            alltime_cache_today = cur_today;
+                            // 锚取的是「base 里已经含到的那一份今日」，不是此刻的今日计数：
+                            // `total_all` 来自 daily_counts 的 SUM，只到上次落库为止，而今日
+                            // 计数是内存里那份（含未落库增量，默认落后最多一个 flush 周期）。
+                            // 读取次序是有意排的：先库（t1）后内存（t2>t1），中间落库的那批
+                            // 只会让显示值暂时偏低、下一次重建就追上；反过来读会把同一批**双计**，
+                            // 「总计」先涨后跌 —— 比偏低更难查，因为用户会以为自己在掉数据。
+                            alltime_cache_today = db
+                                .writer()
+                                .map(|w| {
+                                    alltime_anchor_today(
+                                        w.today_count_for_display() as i64,
+                                        w.today_pending_count(),
+                                    )
+                                })
+                                .unwrap_or(cur_today);
                         }
 
                         // period=0 且缓存有效：直接复用上次聚合结果，不再全库扫描。
@@ -1699,15 +1713,18 @@ fn alltime_total_now(base: i64, cached_today: i64, cur_today: i64) -> i64 {
     base + (cur_today - cached_today).max(0)
 }
 
-/// 「总计」那张卡片该显示哪个数（前端只读 `period_total`，除了「今日」页读
-/// `alltime_total`）。抽成纯函数是为了把这条规则钉住 —— 它出错过一次：
+/// 重建基准时，`alltime_total_now` 的那个 `cached_today` 该钉在哪个数上。
 ///
-/// `applyTotal` 在 `period == -1`（今日）取 `alltime_total`，其余周期取
-/// `period_total`（= `agg.total`）。而**标签写着「总计」的那一页正是 `period == 0`**：
-/// 它显示的是上次重算时从库里读出来的数，重算要等 `alltime_dirty`（每 500 次按键 /
-/// 跨天 / 强制刷新）才发生 —— 于是同一个「总计」，切到「今日」逐键跳动、
-/// 切到「总计」一整天不动。
-///
+/// 锚必须是**已经算进 `base` 里**的那份今日，不能是此刻的今日计数。两者差的正是
+/// 「还没落库的增量」（`today_pending_count`）：拿后者当锚，重建当场 `cur - 锚` 恒为 0，
+/// 显示值就等于刚读出来的 `base`，少的就是那批增量；而上一轮缓存在此之前已经把
+/// 这些键当作增量加过一次，于是**用户正在打字，「总计」却当场退回一截**
+/// （每满 `ALLTIME_RECALC_THRESHOLD` 次按键、每次跨天或强制刷新都会重演一次）。
+/// 锚取 `今日计数 - 未落库` 之后，重建前后的值连续，且当场就等于真值。
+fn alltime_anchor_today(cur_today: i64, pending_today: i64) -> i64 {
+    (cur_today - pending_today).max(0)
+}
+
 /// 悬浮窗"至少还得露出这么多像素"才算看得见；低于这个才认为它跑丢了。
 const FLOATING_MIN_VISIBLE: f64 = 20.0;
 
@@ -1743,6 +1760,15 @@ fn clamp_floating_into_screen(x: f64, y: f64, b: FloatingBounds) -> (f64, f64) {
     )
 }
 
+/// 「总计」那张卡片该显示哪个数（前端只读 `period_total`，除了「今日」页读
+/// `alltime_total`）。抽成纯函数是为了把这条规则钉住 —— 它出错过一次：
+///
+/// `applyTotal` 在 `period == -1`（今日）取 `alltime_total`，其余周期取
+/// `period_total`（= `agg.total`）。而**标签写着「总计」的那一页正是 `period == 0`**：
+/// 它显示的是上次重算时从库里读出来的数，重算要等 `alltime_dirty`（每 500 次按键 /
+/// 跨天 / 强制刷新）才发生 —— 于是同一个「总计」，切到「今日」逐键跳动、
+/// 切到「总计」一整天不动。
+///
 /// `compute_charts(0).total` 与 `alltime_total_base` 是同一个量（都是全跨年库的
 /// Σ`daily_counts.count`），所以 period=0 时直接用那个被"基准 + 今日增量"修正过的值。
 /// 基准还没建立时**不能**覆盖：那时 `alltime_total_now` 回 0，会把一个本来正确的
@@ -1944,9 +1970,9 @@ fn compute_charts(
 #[cfg(test)]
 mod compute_charts_tests {
     use super::{
-        alltime_total_now, apply_display_total, clamp_floating_into_screen, compute_charts,
-        sort_rank_desc, total_for_display, ChartAgg, FloatingBounds, FLOATING_MIN_VISIBLE,
-        RANK_LIMIT,
+        alltime_anchor_today, alltime_total_now, apply_display_total, clamp_floating_into_screen,
+        compute_charts, sort_rank_desc, total_for_display, ChartAgg, FloatingBounds,
+        FLOATING_MIN_VISIBLE, RANK_LIMIT,
     };
 
     /// 他这台机器的形状：1920x1080 单屏（任务栏 48px，故工作区底边 1032）、卡片 90x46。
@@ -2249,6 +2275,38 @@ mod compute_charts_tests {
         assert_eq!(alltime_total_now(1000, 100, 130), 1030, "新增 30 次即计入");
         assert_eq!(alltime_total_now(1000, 100, 0), 1000, "计数回退不减基准");
     }
+
+    /// 重建「总计」基准的那一次，显示值既不许少掉还没落库的增量，也不许往回跳。
+    ///
+    /// 锚用成此刻的今日计数时：重建后 `base` 只到上次落库、锚又等于此刻的 cur，
+    /// 于是 `cur - 锚 = 0`，卡片当场退回「未落库」那么多 —— 而重建前这些键已经作为
+    /// 增量显示过一次了。表现就是**用户正在打字，「总计」却每 500 次按键缩水一次**。
+    #[test]
+    fn rebuilding_the_alltime_base_never_shrinks_the_displayed_total() {
+        // 第一轮：库里今日 970（base 含它），内存里今日 1000，其中 30 次还没落库
+        let anchor1 = alltime_anchor_today(1000, 30);
+        let shown1 = alltime_total_now(970, anchor1, 1000);
+        // 又打 500 次，其间落库 480（含上次那 30）⇒ 库里今日 1450、内存里 1500、未落库 50
+        let shown_before_rebuild = alltime_total_now(970, anchor1, 1500);
+        let shown2 = alltime_total_now(1450, alltime_anchor_today(1500, 50), 1500);
+        // 三条腿攒齐了一次断：头一条先 panic 的话，后面两条腿有没有牙齿就量不出来
+        let mut bad: Vec<String> = Vec::new();
+        if anchor1 != 970 {
+            bad.push(format!("锚该落在已落库的那份今日上（970），实际 {anchor1}"));
+        }
+        if shown1 != 1000 {
+            bad.push(format!(
+                "第一次重建当场显示 {shown1}，真值 1000：少的正是还没落库的那 30 次"
+            ));
+        }
+        if shown2 != 1500 || shown2 < shown_before_rebuild {
+            bad.push(format!(
+                "第二次重建把「总计」从 {shown_before_rebuild} 变成 {shown2}（真值 1500）：\
+                 用户还在打字，总数却不再等于真值、甚至往回跳"
+            ));
+        }
+        assert!(bad.is_empty(), "{bad:?}");
+    }
 }
 
 #[cfg(test)]
@@ -2435,6 +2493,39 @@ mod today_display_wiring {
         assert!(
             !body.contains("w.today_count()") && !body.contains("w.today_active_seconds()"),
             "统计线程里还有直接照抄今日缓存的地方"
+        );
+    }
+}
+
+#[cfg(test)]
+mod alltime_anchor_wiring {
+    /// 接线腿：重建基准时那把锚必须由 `alltime_anchor_today` 交出来。
+    ///
+    /// 上面那条纯函数用例钉的是规则本身；调用点写回 `alltime_cache_today = cur_today`
+    /// 它照样是绿的 —— 而"总计在重建当场掉一截"只发生在调用点上，所以这里按源码形状
+    /// 钉住那一次赋值（比对前先摘注释行，本文件的注释会点名隔壁变量名）。
+    #[test]
+    fn the_rebuild_anchors_on_the_landed_today_count() {
+        let src = include_str!("state.rs");
+        let at = src.find("fn spawn_stats_worker").expect("统计线程找不到了");
+        let body = &src[at..at + src[at..].find("\nfn ").expect("统计线程之后没有顶层函数了")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let needle = "alltime_cache_today =";
+        assert_eq!(
+            code.matches(needle).count(),
+            1,
+            "「总计」基准的赋值处不是恰好一份：{}",
+            code.matches(needle).count()
+        );
+        let at2 = code.find(needle).unwrap() + needle.len();
+        let assign = &code[at2..at2 + code[at2..].find(';').expect("这条赋值没有结尾分号")];
+        assert!(
+            assign.contains("alltime_anchor_today("),
+            "锚没走「已落库的今日」那条判据，退回此刻的今日计数会让「总计」在重建当场缩水"
         );
     }
 }
