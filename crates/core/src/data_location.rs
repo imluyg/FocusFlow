@@ -48,13 +48,20 @@ pub fn current_data_home() -> PathBuf {
 /// 改数据目录之前的体检：目标是不是同一个目录、有没有选进正在被搬的子树里、
 /// 以及**现在**建不建得出来。
 ///
+/// 校验一次"更改数据目录"的目标是否可用。`src` 是**当前**数据根，由调用方交进来。
+///
+/// `src` 以前是这里自己现读 `paths::data_home()`：那是第二个读点。调用方
+/// （`commands.rs` 的 `change_data_dir`）前一行刚用 `current_data_home()` 算出要搬走的
+/// 源目录，转天校验时读的却是另一个时刻解析出来的值 —— 两次解析中间只要有人
+/// `force_data_home`/换过 app_dir，校验的就是一个根本不会被搬运的目录。现在两边
+/// 用的是同一个串，一把尺子。
+///
 /// 这一步必须存在，是因为"选了不合法的目录"原本要等到重启后新进程搬运时才暴露，
 /// 而那时界面早没了 —— 用户看到的就只是"点了没反应、数据还在原地"（实测就是这样：
 /// 他选了 `程序目录\123`，被判定误杀，错误只躺在日志里）。提前判一次，
 /// 报错就能当场显示在设置页上。
-pub fn validate_new_data_home(dst: &Path) -> Result<(), String> {
-    let src = paths::data_home();
-    guard_destination(&src, dst)?;
+pub fn validate_new_data_home(src: &Path, dst: &Path) -> Result<(), String> {
+    guard_destination(src, dst)?;
     std::fs::create_dir_all(dst)
         .map_err(|e| format!("目标目录建不出来（{}）: {e}", dst.display()))?;
     // 目标里除了 data / backup 之外还有别的东西就拒绝：往装着旧版 FocusFlow 的
@@ -1058,31 +1065,49 @@ mod tests {
         );
     }
 
+    /// 「更改数据目录」的提前校验必须照**调用方给的那个源**判，而不是自己再解析一次全局。
+    ///
+    /// 原先函数内部现读 `paths::data_home()`：那是第二个读点 —— 调用方前一行刚用
+    /// `current_data_home()` 算出要搬走的目录，校验时读的却可能是另一个时刻解析出来的值。
+    /// 在测试里这一点尤其要命：并行的别的用例会改写进程级 app_dir，于是
+    /// 「嵌套目标该被拒」这几条断言偶发红（本仓多次把它记成 env flake，
+    /// 现量：单跑本模块 6/6 绿、全量 4 次里红 2 次，红点是
+    /// `validate_new_data_home(&app/data/sub).is_err()`）。src 由调用方交进来之后，
+    /// 这条用例只依赖自己的临时目录。
     #[test]
     fn validate_new_data_home_rejects_bad_choices_up_front() {
         let _lock = paths::test_app_dir_lock();
         let app = paths::test_app_dir("va_app");
-        write_file(&app.path().join("data/focusflow_2026.db"), "x");
+        let src = app.path().to_path_buf();
+        write_file(&src.join("data/focusflow_2026.db"), "x");
 
         // 就是当前数据根
-        assert!(validate_new_data_home(&paths::data_home()).is_err());
+        assert!(validate_new_data_home(&src, &src).is_err());
         // 选进了正在被搬的子树里
-        assert!(validate_new_data_home(&app.path().join("data/sub")).is_err());
+        assert!(validate_new_data_home(&src, &src.join("data/sub")).is_err());
         // 目标建不出来（路径中间是个普通文件）
-        let blocker = app.path().join("not_a_dir");
+        let blocker = src.join("not_a_dir");
         write_file(&blocker, "x");
-        assert!(validate_new_data_home(&blocker.join("inner")).is_err());
+        assert!(validate_new_data_home(&src, &blocker.join("inner")).is_err());
         // 目标里已经有无关内容
-        let messy = app.path().join("messy");
+        let messy = src.join("messy");
         write_file(&messy.join("notes.txt"), "hi");
-        assert!(validate_new_data_home(&messy).is_err());
+        assert!(validate_new_data_home(&src, &messy).is_err());
 
         // 干净的兄弟目录 = 用户实测的那个手势，必须放行
-        assert!(validate_new_data_home(&app.path().join("123")).is_ok());
+        assert!(validate_new_data_home(&src, &src.join("123")).is_ok());
         // `data`/`backup` 是搬运自己的产物，不该被算作"无关内容"（重放第二次也要能过）
-        let next = app.path().join("next");
+        let next = src.join("next");
         write_file(&next.join("data/keep.db"), "k");
-        assert!(validate_new_data_home(&next).is_ok());
+        assert!(validate_new_data_home(&src, &next).is_ok());
+
+        // src 真的被用上了：换一个源，同一个目标就不再是"套在自己里面"
+        let elsewhere = src.join("elsewhere");
+        write_file(&elsewhere.join("data/x.db"), "y");
+        assert!(
+            validate_new_data_home(&elsewhere, &src.join("data/sub")).is_ok(),
+            "校验必须用调用方交进来的 src：源换成别处，这个目标就没有套进自己"
+        );
     }
 
     #[test]

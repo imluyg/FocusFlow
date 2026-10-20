@@ -432,7 +432,8 @@ pub async fn change_data_dir(
             // 顺序是故意的：先写标记、再写新目录。万一中间落盘失败，留下的状态是
             // "标记指向旧目录 + data_home 仍是旧目录"，新进程一看两者相同，只会清掉标记
             // 并记一条 warn，不会搬运、也不会把数据指到一个空目录上。
-            focusflow_core::data_location::validate_new_data_home(&dir_for_thread)
+            // 校验用的就是刚算出来的这一个 `from`：它与后面真正要搬走的源必须是同一个串。
+            focusflow_core::data_location::validate_new_data_home(&from, &dir_for_thread)
                 .map_err(|e| format!("{e}；数据目录没有改动，也不会重启"))?;
             config
                 .set("paths", "data_migrate_from", &from.to_string_lossy())
