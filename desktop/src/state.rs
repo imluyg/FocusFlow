@@ -1366,9 +1366,15 @@ fn spawn_stats_worker(
             // 缓存构建时的全历史总次数（-1 = 尚未构建）
             let mut alltime_total_base: i64 = -1;
             let mut alltime_cache_day: i64 = -1; // 上次缓存构建时的日期（CE 天序号）
-            let mut alltime_cache_today: i64 = -1; // 上次缓存构建时的今日计数
-                                                   // period != 0 图表的落库序号指纹：DB 自上次聚合后没有新落库（序号未变）
-                                                   // 时，重聚合只会重复算出同样结果——增量都在写线程内存里，flush 前不进库。
+                                                 // 显示锚：`alltime_total_base` 里**已经含到的**那份今日（今日计数 - 未落库增量）。
+            let mut alltime_cache_today: i64 = -1;
+            // 重建那一刻的今日计数：只用来量"自上次重建以来又攒了多少新键"。
+            // 这两把尺子必须分开：拿显示锚当触发量，年度库整天写不进去时未落库的那一堆
+            // 就是当天全部按键 —— `今日 - 锚` 恒久超过阈值，于是每次重聚合都要跑一遍
+            // 跨全部年度库的全历史扫描，恰恰在最糟的那一天把机器打满。
+            let mut alltime_stamp_today: i64 = -1;
+            // period != 0 图表的落库序号指纹：DB 自上次聚合后没有新落库（序号未变）
+            // 时，重聚合只会重复算出同样结果——增量都在写线程内存里，flush 前不进库。
             let mut charts_seq: u64 = u64::MAX;
             let mut charts_period: i64 = i64::MIN;
             // 上次生成自动周报的锚点（上一个整周周一的 CE 天序号）
@@ -1400,14 +1406,14 @@ fn spawn_stats_worker(
                 let alltime_dirty = forced
                     || alltime_max.is_none()
                     || day_ce != alltime_cache_day
-                    || (alltime_cache_today >= 0
+                    || (alltime_stamp_today >= 0
                         // 写线程的今日计数只在**新的一天第一次按键**时才归零，所以跨过
                         // 零点后的第一轮重建会把"昨天的计数"当成今天的基准 stamp 进去
                         // —— 之后 cur_today 一直小于它，`cur_today - 基准` 恒为 0，
                         // 「总计」卡片整整一天都不再动。计数往回走本身就说明换了天，
                         // 用它再触发一次重建，把基准重新钉在新的一天上。
-                        && (cur_today - alltime_cache_today >= ALLTIME_RECALC_THRESHOLD
-                            || cur_today < alltime_cache_today));
+                        && (cur_today - alltime_stamp_today >= ALLTIME_RECALC_THRESHOLD
+                            || cur_today < alltime_stamp_today));
 
                 // 重聚合节奏随主窗口可见性自适应：
                 // - 主窗口打开：活跃（打字）时每 active_refresh_interval 秒刷新一次图表；
@@ -1550,6 +1556,7 @@ fn spawn_stats_worker(
                                     )
                                 })
                                 .unwrap_or(cur_today);
+                            alltime_stamp_today = cur_today;
                         }
 
                         // period=0 且缓存有效：直接复用上次聚合结果，不再全库扫描。
@@ -2556,6 +2563,42 @@ mod alltime_anchor_wiring {
         assert!(
             assign.contains("alltime_anchor_today("),
             "锚没走「已落库的今日」那条判据，退回此刻的今日计数会让「总计」在重建当场缩水"
+        );
+    }
+
+    /// 接线腿：显示锚与「该重建了吗」那把尺子必须是两个变量，不许并成一把。
+    ///
+    /// 并成锚那一侧的后果不是数字差一点，而是**最坏那天把机器打满**：年度库整天写不进去时
+    /// 未落库的增量就是当天全部按键，`今日 - 锚` 恒久越过阈值 ⇒ 每 500ms 一次跨全部年度库的
+    /// 全历史扫描。反过来（触发用锚、显示用 stamp）则是卡片当场少一截，两条都要钉。
+    #[test]
+    fn the_rebuild_trigger_and_the_display_anchor_are_two_separate_rulers() {
+        let src = include_str!("state.rs");
+        let at = src.find("fn spawn_stats_worker").expect("统计线程找不到了");
+        let body = &src[at..at + src[at..].find("\nfn ").expect("统计线程之后没有顶层函数了")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trig_at = code
+            .find("let alltime_dirty =")
+            .expect("那条「该重建了吗」的判据不见了");
+        let trig_end = code[trig_at..].find(";\n").expect("判据切不出来");
+        let trig = &code[trig_at..trig_at + trig_end];
+        assert!(
+            !trig.contains("alltime_cache_today"),
+            "重建触发量用上了显示锚：未落库量一旦超过阈值就会每 tick 重跑一次全历史扫描"
+        );
+        assert!(
+            trig.contains("alltime_stamp_today"),
+            "重建触发量必须用「重建那一刻的今日计数」"
+        );
+        assert_eq!(
+            code.matches("alltime_total_now(alltime_total_base, alltime_cache_today, cur_today)")
+                .count(),
+            2,
+            "「总计」展示值的两处调用都得传显示锚（基准那份不算触发尺子）"
         );
     }
 }
