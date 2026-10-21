@@ -669,16 +669,6 @@ impl FocusFlowConfig {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        // 待写集合的快照**单独取**（不与上面嵌锁）：两次 clone 之间落进来的 `set()`
-        // 值既不在写盘快照里、也不在这份清单里 ⇒ 下面收尾时它会被**留下**，
-        // 由它自己那笔去抖保存再写一次。反过来若在这里把整个集合清空，
-        // 那一次设置就同时从文件和清单上消失了 —— 正是上一场用 `SAVE_WRITE_LOCK`
-        // 防住的"设置静默丢失"换个入口回来。
-        let pending_written = self
-            .pending_writes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
         // 原文件读得到 → 逐行重写（保注释/空行/节序/未知键，见函数注释）；
         // 读不到（被占用/刚被删）→ 退回整份重建：那种情况下逐行重写同样没有
         // 输入可用，"文件里有而内存没有"的键本来就已无处可保，与旧行为一致。
@@ -699,19 +689,29 @@ impl FocusFlowConfig {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        // 落盘成功 ⇒ 把**这次写出去的**那些"本进程改过的键"从待写集合里摘掉，此后这些
+        // 落盘成功 ⇒ 把**这次真的写出去的**那些"本进程改过的键"从待写集合里摘掉，此后这些
         // 键再出现差异就都算外部改动（`the_pending_set_clears_after_a_successful_save`
-        // 钉的就是这一半）。刻意不整表清空：写盘之后、摘除之前落进来的新 `set()` 必须
-        // 留在集合里，否则它既不在刚落盘的快照里、又丢了"本进程改过"的身份 ——
-        // 下一次 save 会把它当成外部改动采纳回旧值，那就是上一场防住的"设置静默丢失"。
+        // 钉的就是这一半）。判据必须把写出的值与此刻内存里的值对一遍而不只是看名单：
+        // 快照取完之后才落进来的 `set()` 即便混进了名单，它那一版也没进这份文件
+        // （`a_set_that_landed_mid_save_keeps_its_pending_mark` 钉这一半）。
         // 写失败时 `?` 先返回，摘除整步不执行，待写的值继续保住。
         atomic_write(&self.path, &out)?;
+        self.settle_pending_after_write(&snapshot);
+        Ok(())
+    }
+
+    /// 落盘成功后收敛待写清单：只摘掉"写出去的值就是现在内存里这一版"的键。
+    fn settle_pending_after_write(&self, written: &HashMap<String, HashMap<String, String>>) {
+        let values = self.values.lock().unwrap_or_else(|e| e.into_inner());
         let mut pending = self
             .pending_writes
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pending.retain(|k| !pending_written.contains(k));
-        Ok(())
+        pending.retain(|(section, key)| {
+            let current = values.get(section).and_then(|m| m.get(key));
+            let written = written.get(section).and_then(|m| m.get(key));
+            current != written
+        });
     }
 
     /// 把文件里「不是本进程改的、却与内存不同」的值采纳进内存与快照，返回项名清单。
@@ -738,8 +738,7 @@ impl FocusFlowConfig {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut adopted: Vec<String> = Vec::new();
-        let mut changes: Vec<(String, String, String)> = Vec::new();
+        let mut changes: Vec<((String, String), String)> = Vec::new();
         for (section, keys) in &disk {
             for (key, value) in keys {
                 if DEPRECATED_CONFIG
@@ -762,18 +761,51 @@ impl FocusFlowConfig {
                     .entry(section.clone())
                     .or_default()
                     .insert(key.clone(), value.clone());
-                changes.push((section.clone(), key.clone(), value.clone()));
-                adopted.push(format!("{section}.{key}"));
+                changes.push(((section.clone(), key.clone()), value.clone()));
             }
         }
         // 内存也要跟上：热路径读的是 `values`，只改快照会让"每次判定现读"的那批键
         // 这一轮还是旧值，而写进文件的却是新值 —— 两份真相。
-        if !changes.is_empty() {
-            let mut values = self.values.lock().unwrap_or_else(|e| e.into_inner());
-            for (section, key, value) in changes {
-                values.entry(section).or_default().insert(key, value);
+        //
+        // 落地前必须再核一次待写集合：上面那次 clone 之后、这把锁之前落进来的 `set()`
+        // 内存里已经是新值，盘上读到的那份才是旧值。既不能拿旧值盖内存，也不能把旧值
+        // 写进这次的文件（否则退出前那次强制 save 会把用户刚改的一项留在盘外，
+        // 而已经没有下一笔去抖保存了）。
+        self.apply_adopted_changes(snapshot, changes)
+    }
+
+    /// 采纳的第二步：把 `changes` 落到内存与写盘快照，返回真正采纳的项名。
+    fn apply_adopted_changes(
+        &self,
+        snapshot: &mut HashMap<String, HashMap<String, String>>,
+        mut changes: Vec<((String, String), String)>,
+    ) -> Vec<String> {
+        let mut values = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        let pending_now = self
+            .pending_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        changes.retain(|((section, key), value)| {
+            if pending_now.contains(&(section.clone(), key.clone())) {
+                if let Some(current) = values.get(section).and_then(|m| m.get(key)) {
+                    snapshot
+                        .entry(section.clone())
+                        .or_default()
+                        .insert(key.clone(), current.clone());
+                }
+                return false;
             }
-        }
+            values
+                .entry(section.clone())
+                .or_default()
+                .insert(key.clone(), value.clone());
+            true
+        });
+        let mut adopted: Vec<String> = changes
+            .iter()
+            .map(|((section, key), _)| format!("{section}.{key}"))
+            .collect();
         // 顺序要稳定：`disk` 是 HashMap，不排序的话同一批改动每次列出的次序都不同
         adopted.sort();
         adopted
@@ -866,17 +898,19 @@ impl FocusFlowConfig {
     /// 叫醒它等于让另一个对象往本次测试的 `config.ini` 里写它那份快照（切全局
     /// app_dir 的测试还会把它引到别人的目录去）。生产侧只有 `set()` 调它。
     fn set_local(&self, section: &str, key: &str, value: &str) {
-        {
-            let mut values = self.values.lock().unwrap_or_else(|e| e.into_inner());
-            values
-                .entry(section.to_string())
-                .or_default()
-                .insert(key.to_string(), value.to_string());
-        }
-        self.pending_writes
+        // 值和新值标记在同一临界区里落：中间被 save 看见会出现"值已变、标记还没到"
+        // 的窗口，那次 save 写完旧值后按"两边一致"摘掉标记 —— 下一笔就把文件里的
+        // 旧值当外部改动采纳回来。锁序与 save 侧一致：values → pending。
+        let mut values = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self
+            .pending_writes
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((section.to_string(), key.to_string()));
+            .unwrap_or_else(|e| e.into_inner());
+        values
+            .entry(section.to_string())
+            .or_default()
+            .insert(key.to_string(), value.to_string());
+        pending.insert((section.to_string(), key.to_string()));
     }
 }
 
@@ -1179,6 +1213,127 @@ mod tests {
             "已落盘的键此后再被外部改动应当采纳，而不是永久停在 UI 那次值: {text}"
         );
         assert_eq!(cfg.get("gui", "theme"), "solarized");
+    }
+
+    /// 快照取完之后才落进来的 `set()`：那次 save 写出去的是旧值，标记必须留下。
+    ///
+    /// 真实竞态要卡在两个 clone 之间，单测里做不到；这里把"写出去的那份快照"
+    /// 直接交给收尾函数，代表 save 在 `set()` 之前取到的值。收尾若按名单一律摘掉，
+    /// 下一笔 save 会把文件里的 dark 当成外部改动采纳回来，用户在设置页选的 light
+    /// 静默回退 —— 重启后又变回去。
+    #[test]
+    fn a_set_that_landed_mid_save_keeps_its_pending_mark() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_mid_save_pending");
+        let path = app.path().join("config.ini");
+        std::fs::write(&path, "[gui]\ntheme = dark\n").unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+
+        cfg.set_local("gui", "theme", "light");
+        let mut written: HashMap<String, HashMap<String, String>> = HashMap::new();
+        written.insert(
+            "gui".to_string(),
+            HashMap::from([("theme".to_string(), "dark".to_string())]),
+        );
+        cfg.settle_pending_after_write(&written);
+
+        cfg.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("theme = light"),
+            "中途落下那一笔的待写标记被摘掉了，下一笔保存把盘上的旧值当外部改动采纳回来: {text}"
+        );
+        assert_eq!(cfg.get("gui", "theme"), "light");
+    }
+
+    /// 采纳在落地前必须再看一眼待写集合：`set()` 若落在"读盘后的 pending 快照"
+    /// 与"写内存"之间，盘上的旧值既不能盖掉用户刚写的新值，也不能被写进这次文件
+    /// （退出前那次强制 save 之后没有下一笔去抖保存替它补上）。
+    #[test]
+    fn an_adoption_cannot_overwrite_a_value_set_after_its_first_look() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_adopt_apply");
+        let path = app.path().join("config.ini");
+        std::fs::write(&path, "[gui]\ntheme = dark\n").unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+
+        cfg.set_local("gui", "theme", "light");
+        let mut snapshot: HashMap<String, HashMap<String, String>> = HashMap::new();
+        snapshot.insert(
+            "gui".to_string(),
+            HashMap::from([("theme".to_string(), "solarized".to_string())]),
+        );
+        let adopted = cfg.apply_adopted_changes(
+            &mut snapshot,
+            vec![(
+                ("gui".to_string(), "theme".to_string()),
+                "solarized".to_string(),
+            )],
+        );
+        assert_eq!(
+            cfg.get("gui", "theme"),
+            "light",
+            "盘上的旧值盖掉了刚设置的新值"
+        );
+        assert_eq!(
+            snapshot
+                .get("gui")
+                .and_then(|m| m.get("theme"))
+                .map(String::as_str),
+            Some("light"),
+            "这次文件仍会写出旧值，退出前那次强制 save 之后就没有下一笔了"
+        );
+        assert!(
+            adopted.is_empty(),
+            "这一项没有采纳，日志里不许列它: {adopted:?}"
+        );
+    }
+
+    /// 竞态本身没法在用例里确定性复现（要 `set()` 正好落进 save 快照与写盘之间），
+    /// 所以钉语句顺序：新值和新值标记必须**在同一段值锁持有期内**写入。
+    /// 旧形态先放掉值锁再单独记标记，save 若在两者之间取快照，写出去的是旧值、
+    /// 收尾却按标记当它已落盘 —— 下一笔就把文件里的旧值采纳回来（本文件另外两条
+    /// 用例分别钉住了收尾与采纳那一半，这条钉的是窗口本身不回来）。
+    #[test]
+    fn a_local_set_keeps_the_value_lock_through_the_pending_mark() {
+        let src = include_str!("config.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod.find("fn set_local(").expect("set_local 不见了");
+        let rest = &prod[at..];
+        let body = &rest[..rest.find("\n    }\n").expect("函数体切不出来")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let values_at = code.find("self.values.lock()").expect("这一处没拿值锁");
+        let pending_at = code
+            .find("self.pending_writes.lock()")
+            .expect("这一处没拿待写锁");
+        assert!(
+            values_at < pending_at,
+            "锁序必须是 values → pending（save 侧同向）"
+        );
+        let between = &code[values_at..pending_at];
+        assert!(
+            !between.contains('}'),
+            "值锁在记下待写标记之前就放了：save 会在两者之间看到新值却没有标记"
+        );
+        assert!(
+            !between.contains(".clone()"),
+            "值锁只 clone 了一份就放掉：标记落下之前 save 仍能取到不一致的两半"
+        );
+        assert!(
+            !between.contains("drop("),
+            "值锁在记下待写标记之前就被显式放掉了：save 仍能取到不一致的两半"
+        );
+        assert!(
+            code[pending_at..].contains("pending.insert"),
+            "待写标记没有写进集合"
+        );
     }
 
     /// 废弃键不采纳：`load()` 刻意把它们清掉，采纳等于让它们复活。
