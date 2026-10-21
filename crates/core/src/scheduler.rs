@@ -960,18 +960,43 @@ fn parse_interval(s: &str) -> Option<(i64, i64, i64)> {
     Some((start, end, interval))
 }
 
+/// [`parse_hhmm_checked`] 解不开时的三种分别，让校验侧能说清败在哪一步。
+#[derive(Debug, PartialEq, Eq)]
+enum ClockErr {
+    /// 不是「数字:数字」这个形状（缺冒号、多了段、带符号、非数字、位数超过两位）
+    NotClock,
+    /// 形状对，但小时越过 23
+    HourOut,
+    /// 形状对，但分钟越过 59
+    MinuteOut,
+}
+
+/// 校验侧用的解析：与 [`parse_hhmm`] 共用同一条尺子，失败时说明败在哪一步。
+///
+/// 原先 `validate_schedule` 的 daily 臂自己数了一遍冒号，把"形状不对"与"数字超出范围"
+/// 分给两份代码，而后一半只是一句顺手写下的「时间超出范围」—— 它从来没比较过任何数字。
+/// 于是 `"abc:00"` 在面板上被报成「调度配置无效（时间超出范围）」，
+/// 用户去把一个根本不成立的问题改小。
+fn parse_hhmm_checked(s: &str) -> Result<i64, ClockErr> {
+    let (h, m) = s.split_once(':').ok_or(ClockErr::NotClock)?;
+    let h = parse_clock_number(h.trim()).ok_or(ClockErr::NotClock)?;
+    let m = parse_clock_number(m.trim()).ok_or(ClockErr::NotClock)?;
+    if !(0..=23).contains(&h) {
+        return Err(ClockErr::HourOut);
+    }
+    if !(0..=59).contains(&m) {
+        return Err(ClockErr::MinuteOut);
+    }
+    Ok(h * 60 + m)
+}
+
 /// 解析 'HH:MM' 为「当日第几分钟」；格式或范围不符一律 None。
 ///
 /// 刻意不写成 `parse().unwrap_or(0)`：那种写法下 `"abc:xyz"` 等于 00:00，而
 /// daily 的判定是 `now_min >= target_min`，于是"非法时间"实际含义是"任何时刻都该跑"，
 /// 任务一入库就立刻启动目标程序。`"25:00"` 反过来永远跑不了。两种都比拒绝更糟。
 fn parse_hhmm(s: &str) -> Option<i64> {
-    let (h, m) = s.split_once(':')?;
-    let (h, m) = (parse_clock_number(h.trim())?, parse_clock_number(m.trim())?);
-    if !(0..=23).contains(&h) || !(0..=59).contains(&m) {
-        return None;
-    }
-    Some(h * 60 + m)
+    parse_hhmm_checked(s).ok()
 }
 
 /// 只认纯十进制（`+9`、`-0`、空白、任何非数字字符都是 None），溢出也 None。
@@ -1071,10 +1096,22 @@ fn run_check(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> RunDecision {
             if now.naive_local() < target {
                 return RunDecision::Wait;
             }
-            if last_run.is_none() {
-                RunDecision::Run
-            } else {
-                RunDecision::Wait
+            match last_run {
+                None => RunDecision::Run,
+                Some(lr) => {
+                    // 到点之后只问一句：这条跑过没有。判据原来是 `last_run.is_none()` ⇒ Run、
+                    // 否则 Wait —— 库里那格写着「不是时间」时它既不启动、也一行日志都没有，
+                    // 而同一个坏戳在 daily/interval 两支是按「没跑过」重新放行。
+                    // 这里刻意不跟着重跑：once 的语义是一辈子只启一次，程序多弹一遍比不弹
+                    // 更糟；要补的只是"为什么它永远不跑"这一句。
+                    match NaiveDateTime::parse_from_str(lr, "%Y-%m-%d %H:%M:%S") {
+                        Ok(_) => RunDecision::Wait,
+                        Err(e) => RunDecision::BadConfig(format!(
+                            "once 记录的上次执行时刻「{lr}」不是 YYYY-MM-DD HH:MM:SS（{e}）：\
+                             按已经跑过处理，不再启动"
+                        )),
+                    }
+                }
             }
         }
         "interval" => {
@@ -1494,16 +1531,12 @@ pub fn validate_schedule(schedule_type: &str, schedule_time: &str) -> (bool, Str
         return (false, "执行时间不能为空".into());
     }
     match schedule_type {
-        "daily" => {
-            let parts: Vec<&str> = t.split(':').collect();
-            if parts.len() != 2 {
-                return (false, "每日定时格式应为 HH:MM".into());
-            }
-            match parse_hhmm(t) {
-                Some(_) => (true, String::new()),
-                None => (false, "时间超出范围".into()),
-            }
-        }
+        "daily" => match parse_hhmm_checked(t) {
+            Ok(_) => (true, String::new()),
+            Err(ClockErr::NotClock) => (false, "每日定时格式应为 HH:MM".into()),
+            Err(ClockErr::HourOut) => (false, "每日定时的小时要在 00~23 之间".into()),
+            Err(ClockErr::MinuteOut) => (false, "每日定时的分钟要在 00~59 之间".into()),
+        },
         "once" => {
             if NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M").is_ok() {
                 (true, String::new())
@@ -3045,6 +3078,84 @@ mod tests {
             run_check(&daily_task("09:00"), &noon),
             RunDecision::Run
         ));
+    }
+
+    /// 被拒的调度要说清**这条尺子真的查过的那一件事**。
+    ///
+    /// 回归：daily 那一臂自己数了一遍冒号，剩下的一切都回一句「时间超出范围」，
+    /// 可它从头到尾没比较过任何数字。于是面板上 `"abc:00"` 写成
+    /// 「调度配置无效（时间超出范围）」，用户去把一个根本不成立的问题改小；
+    /// 而真正超范围的两条（`"25:00"`、`"09:70"`）拿到的却是同一句话，
+    /// 分不清该动时还是该动分。现在两半都由同一个 `parse_hhmm_checked` 判定，
+    /// 理由与它检查的那一步一一对应。
+    #[test]
+    fn a_rejected_schedule_names_the_check_that_actually_failed() {
+        let mut wrong: Vec<String> = Vec::new();
+        // 形状本身不对：一个数字都没解出来过，不许暗示"数字太大"
+        for bad in [
+            "abc:00", "09", "0:0:0", "-0:00", "+9:00", "a:b", "12:34:56", "12:3a",
+        ] {
+            let (ok, msg) = validate_schedule("daily", bad);
+            if ok || msg != "每日定时格式应为 HH:MM" {
+                wrong.push(format!("{bad:?} ⇒ ok={ok} 理由={msg:?}（应为格式问题）"));
+            }
+        }
+        // 形状对、数字越界：要点名越的是时还是分，两者的改法不同
+        for (bad, want) in [("25:00", "小时"), ("24:60", "小时"), ("09:70", "分钟")] {
+            let (ok, msg) = validate_schedule("daily", bad);
+            if ok || !msg.contains(want) || msg.contains("格式应为") {
+                wrong.push(format!(
+                    "{bad:?} ⇒ ok={ok} 理由={msg:?}（要含「{want}」且不含「格式应为」）"
+                ));
+            }
+        }
+        // 合法的一半不许被顺手改动
+        for good in ["09:00", "9:05", "0:0", "23:59", " 07:30 "] {
+            let (ok, msg) = validate_schedule("daily", good);
+            if !ok {
+                wrong.push(format!("{good:?} 本该合法，实得 {msg:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "校验理由不合规:\n{}", wrong.join("\n"));
+    }
+
+    /// `once` 的「上次执行」读不出来时必须出声，但**不许**因此重跑。
+    ///
+    /// 判据原来是 `last_run.is_none()` ⇒ Run，否则 `Wait`：库里那格写着「不是时间」时
+    /// 这条任务既不启动、日志也一个字没有，而同一个坏戳在 daily/interval 两支是按
+    /// 「没跑过」重新放行 —— 四处判定、两种结果、零条说明。这里保持"不重跑"那一半
+    /// （once 一辈子只启一次，多弹一遍程序比不弹更糟），只把为什么不说出来补上。
+    #[test]
+    fn an_unreadable_last_run_on_a_once_task_speaks_up() {
+        let noon = Local.with_ymd_and_hms(2026, 3, 5, 12, 0, 0).unwrap();
+        let past_due = |last_run: Option<&str>| ScheduledTask {
+            last_run: last_run.map(|s| s.to_string()),
+            ..sched_task(21, "once", "2026-03-05 09:00")
+        };
+        // 到点、从没跑过 → 跑
+        assert!(matches!(
+            run_check(&past_due(None), &noon),
+            RunDecision::Run
+        ));
+        // 一个读得出的戳 → 正常等待。这一腿不许一起改成 BadConfig：
+        // 坏配置的日志口径是"它永远不会执行"，把它套在正常跑过的 once 上就是噪声。
+        assert!(
+            matches!(
+                run_check(&past_due(Some("2026-03-05 09:00:12")), &noon),
+                RunDecision::Wait
+            ),
+            "跑过的 once 就是 Wait"
+        );
+        // 读不出来的戳：出声，点名是哪个值，但仍然不重跑
+        let d = run_check(&past_due(Some("不是时间")), &noon);
+        assert!(
+            matches!(
+                &d,
+                RunDecision::BadConfig(w) if w.contains("once") && w.contains("不是时间")
+            ),
+            "实得 {d:?}"
+        );
+        assert!(!matches!(d, RunDecision::Run), "坏戳绝不能再把程序弹一遍");
     }
 
     /// 目标"此刻读不到"必须是 Transient，不是 Refused。
