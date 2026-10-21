@@ -305,14 +305,33 @@ fn build_pin(app: &AppHandle, seq: u32, x: i32, y: i32) -> Result<WebviewWindow,
     .map_err(|e| format!("创建贴图窗口失败：{e}"))?;
 
     if let Err(e) = win.set_position(PhysicalPosition::new(x, y)) {
+        close_failed_pin(&win);
         return Err(format!("设置贴图位置失败：{e}"));
     }
-    win.show().map_err(|e| format!("显示贴图失败：{e}"))?;
+    if let Err(e) = win.show() {
+        close_failed_pin(&win);
+        return Err(format!("显示贴图失败：{e}"));
+    }
     if let Err(e) = win.set_focus() {
         // 拿不到键盘不算失败：窗口右上角的 ✕ 是不依赖键盘的退路。
         tracing::warn!("贴图未能取得焦点（Esc 可能要先点一下才生效）：{e}");
     }
     Ok(win)
+}
+
+/// 建出来了、但没摆好或没显示出来的窗口必须收掉。
+///
+/// 它 `visible(false)` + `skip_taskbar`，用户既看不见也点不到；而 `live_pins` 是按
+/// label 数 `webview_windows()` 的，会把它算进 `MAX_PIN_WINDOWS` —— 留着就是一次失败
+/// 永久占掉一个名额，失败几次之后只会得到"已经有 N 张贴图，先关掉一些"而一张都找不到。
+/// 关窗失败也要出声（那时确实只能等进程退出回收）。
+fn close_failed_pin(win: &WebviewWindow) {
+    if let Err(e) = win.close() {
+        tracing::error!(
+            "收掉建失败的贴图窗口也失败了（{}）：它会占着一个贴图名额直到进程退出: {e}",
+            win.label()
+        );
+    }
 }
 
 /// 开一张贴图。**必须在非主线程调用**（现调用点是 `snip_commit` 的 `spawn_blocking` 线程）。
