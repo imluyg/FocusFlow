@@ -1306,6 +1306,42 @@ fn effective_last_run(db: Option<&str>, memo: Option<&str>) -> Option<String> {
     }
 }
 
+/// 进程内那份"这条已经在本次运行里起过了"的兜底记录。
+///
+/// 带着配置指纹是必需的，不是顺手：`fired_memo` 拦的是"**这一份配置**在库里还写着
+/// 没跑过（那次 UPDATE 失败）时别再起第二遍"。用户在插件页改了调度时刻之后，
+/// 库里那条的 `last_run` 已经按新时刻重置，这条兜底就不再属于当前配置。
+#[derive(Debug, Clone)]
+struct Memo {
+    /// 启动成功的时刻（`%Y-%m-%d %H:%M:%S`，与库里那格同格式）
+    at: String,
+    /// 记下它时的 [`task_stamp`]
+    stamp: String,
+}
+
+/// 取这条任务的进程内兜底时刻；配置指纹与记录时不一致就**当场作废并从表里删掉**。
+///
+/// 原先读的是 `fired_memo.get(&task.id).cloned()`：改过时刻的任务在这一轮之后
+/// 仍然带着上一个时刻的戳，于是新时刻到点也不起程序 —— 而面板那一格显示
+/// "上次执行＝空"、日志一个字没有（插件页那句"改了时刻会连同「上次执行」一起重置"
+/// 只对了一半：库里重置了，本进程没有）。同文件的退避表早就按 `task_stamp`
+/// 作废自己（见 [`in_backoff`]：配置一换就重新武装），这里补的是同一条规则缺的另一半。
+/// 作废之后本进程的行为与重启一次完全一致 —— 这张表本来就不跨进程。
+fn take_memo(
+    memo: &mut std::collections::HashMap<i64, Memo>,
+    id: i64,
+    stamp: &str,
+) -> Option<String> {
+    match memo.get(&id) {
+        Some(m) if m.stamp == stamp => Some(m.at.clone()),
+        Some(_) => {
+            memo.remove(&id);
+            None
+        }
+        None => None,
+    }
+}
+
 /// 后台检查循环。
 ///
 /// 30 秒的间隔按 500ms 小片睡：`stop()` 置位后最多 500ms 就能退出，
@@ -1338,7 +1374,7 @@ fn ensure_schema_ready(ready: &AtomicBool) -> bool {
 fn check_loop(stop: Arc<AtomicBool>, schema_ready: Arc<AtomicBool>) {
     // 两张只在本进程有效的兜底表（重启即清零，库里那份才是准）：
     // last_run 写库失败时记下的启动时刻、以及连续启动失败的次数。
-    let mut fired_memo: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    let mut fired_memo: std::collections::HashMap<i64, Memo> = std::collections::HashMap::new();
     let mut backoffs: std::collections::HashMap<i64, Backoff> = std::collections::HashMap::new();
     // 配置解不开的任务：每个调度窗口只说一次（30 秒一条会把日志本身刷成噪声，
     // 与本文件对退避日志的口径一致）
@@ -1362,7 +1398,7 @@ fn check_loop(stop: Arc<AtomicBool>, schema_ready: Arc<AtomicBool>) {
                 continue;
             }
             // 条数就几条，克隆一份把兜底时刻套上去，比到处传参数好读
-            let memo = fired_memo.get(&task.id).cloned();
+            let memo = take_memo(&mut fired_memo, task.id, &stamp);
             let mut t = task.clone();
             t.last_run = effective_last_run(task.last_run.as_deref(), memo.as_deref());
             match run_check(&t, &now) {
@@ -1392,7 +1428,7 @@ fn check_loop(stop: Arc<AtomicBool>, schema_ready: Arc<AtomicBool>) {
 /// 启动一次并把结果记进两张兜底表。
 fn record_launch(
     t: &ScheduledTask,
-    fired_memo: &mut std::collections::HashMap<i64, String>,
+    fired_memo: &mut std::collections::HashMap<i64, Memo>,
     backoffs: &mut std::collections::HashMap<i64, Backoff>,
     window: &str,
     stamp: &str,
@@ -1400,7 +1436,15 @@ fn record_launch(
     let outcome = execute_task(t);
     let fired_at = apply_attempt(backoffs, t.id, window, stamp, &outcome);
     if let Some(at) = fired_at {
-        fired_memo.insert(t.id, at);
+        // 连配置指纹一起记：改了这条任务的时刻之后，这个戳就不再代表当前配置
+        // （见 [`take_memo`]）
+        fired_memo.insert(
+            t.id,
+            Memo {
+                at,
+                stamp: stamp.to_string(),
+            },
+        );
     }
 }
 
@@ -1961,6 +2005,105 @@ mod tests {
             "库里更全时不能被旧记忆盖掉"
         );
         assert_eq!(effective_last_run(None, None), None);
+    }
+
+    /// 改了这条任务的调度时刻，进程内那份"已经起过了"的兜底必须跟着作废。
+    ///
+    /// 回归：`check_loop` 读兜底时只认任务 id，不认配置 —— 库里那条 `last_run`
+    /// 已经被 `update_task` 按新时刻重置（面板上"上次执行"是空的），本进程却还带着
+    /// 旧时刻的戳 ⇒ 新时刻到点也不起程序，日志一行都没有。插件页那句
+    /// "改了时刻会连同「上次执行」一起重置"在这种情形下只对了一半。
+    #[test]
+    fn editing_the_schedule_time_clears_the_in_process_launch_memo() {
+        let mut memo: std::collections::HashMap<i64, Memo> = std::collections::HashMap::new();
+        let old = sched_task(31, "daily", "09:00");
+        let old_stamp = task_stamp(&old);
+        memo.insert(
+            31,
+            Memo {
+                at: "2026-10-21 09:00:03".into(),
+                stamp: old_stamp.clone(),
+            },
+        );
+
+        // 配置一个字没动：兜底照旧算数（库里那次 UPDATE 失败时靠它拦第二次启动）
+        assert_eq!(
+            take_memo(&mut memo, 31, &old_stamp).as_deref(),
+            Some("2026-10-21 09:00:03"),
+            "同一份配置里必须仍然拦得住重复启动"
+        );
+        assert_eq!(memo.len(), 1, "配置没动时不该把兜底擦掉");
+
+        // 改了时刻：这一条既不能再被当成"跑过"，也必须**真的从表里删掉**
+        let edited = sched_task(31, "daily", "14:00");
+        let edited_stamp = task_stamp(&edited);
+        let mut wrong: Vec<String> = Vec::new();
+        let got = take_memo(&mut memo, 31, &edited_stamp);
+        if got.is_some() {
+            wrong.push(format!("改了时刻还带着旧戳：{got:?}"));
+        }
+        if !memo.is_empty() {
+            wrong.push(format!("作废的兜底没从表里删掉，还剩 {} 条", memo.len()));
+        }
+        // 观察量要能看见"重跑一次"：后面三次询问都得是同一个结论
+        if take_memo(&mut memo, 31, &edited_stamp).is_some() {
+            wrong.push("第二次读又把作废的戳捞回来了".to_string());
+        }
+        if take_memo(&mut memo, 31, &old_stamp).is_some() {
+            wrong.push("换回原来那份配置也不该让那条兜底复活".to_string());
+        }
+        if take_memo(&mut memo, 41, &old_stamp).is_some() {
+            wrong.push("别的任务 id 不该看到这条兜底".to_string());
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+
+        // 用户看得见的那一半：兜底作废之后，库里那条 NULL 就是全部事实
+        // ⇒ 新时刻一到，程序会起一次（与重启一次完全一致）
+        let mut t = edited.clone();
+        t.last_run = effective_last_run(None, take_memo(&mut memo, 31, &edited_stamp).as_deref());
+        assert!(
+            matches!(run_check(&t, &at(2026, 10, 21, 14, 30)), RunDecision::Run),
+            "改了时刻就该按新时刻重新计一次，实得 {:?}",
+            run_check(&t, &at(2026, 10, 21, 14, 30))
+        );
+    }
+
+    /// 兜底的作废必须住在**调度线程读它的那一步**，不能只是多一个函数。
+    ///
+    /// 上面那条纯用例把 `take_memo` 换成任何写法都是绿的 —— `check_loop` 在线程里
+    /// 睡 30 秒、还起真进程，没有用例能进得去。所以这里钉调用形态：读兜底那一行
+    /// 必须经过 `take_memo`，而老的 `fired_memo.get(&task.id).cloned()` 不许回来。
+    #[test]
+    fn the_scheduler_thread_reads_its_memo_through_the_staleness_check() {
+        let src = include_str!("scheduler.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let mut wrong: Vec<String> = Vec::new();
+        let n = prod.matches("take_memo(&mut fired_memo").count();
+        if n != 1 {
+            wrong.push(format!(
+                "调度线程读兜底必须恰好一处经过作废检查，实得 {n} 处"
+            ));
+        }
+        if prod.contains("let memo = fired_memo.get(&task.id)") {
+            wrong.push("读兜底又退回成只看任务 id 的老写法".to_string());
+        }
+        // 写侧也得带着指纹，否则读侧比的是两个空串。这一腿按**折叠空白后**的字节找：
+        // 结构体字面量会被 rustfmt 拆成多行，拿原始行文本当针脚就是一条永远
+        // 不可能被满足的断言。
+        let rec_at = prod
+            .find("fn record_launch(")
+            .expect("record_launch 不见了");
+        let rec = &prod[rec_at..];
+        let rec_body = &rec[..rec.find("\nfn ").map(|n| n + 1).unwrap_or(rec.len())];
+        let flat: String = rec_body.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !(flat.contains("fired_memo.insert(")
+            && flat.contains("Memo {")
+            && flat.contains("stamp: stamp.to_string()"))
+        {
+            let head: String = flat.chars().take(200).collect();
+            wrong.push(format!("记兜底那一笔必须带上配置指纹，实得片段: {head}"));
+        }
+        assert!(wrong.is_empty(), "接线守卫红:\n{}", wrong.join("\n"));
     }
 
     /// 「库里没有这一条」与「库读不出来」必须是两种回报。
