@@ -291,11 +291,25 @@ fn resolve_data_home() -> PathBuf {
     }
 }
 
+/// 建目录；失败时把路径与原因说出来。
+///
+/// 这几个构造函数把路径交出去之后，调用方（设置页、写库、截图、备份）会把它当成
+/// "位置就在这里"。原来一律 `create_dir_all(...).ok()`：目录建不出来时界面照旧
+/// 显示那个位置，日志里也没有任何线索，直到写入失败才在别处冒出来。
+/// 返回原路径，行为不变。
+fn ensure_dir(dir: PathBuf) -> PathBuf {
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(
+            "目录建不出来（{}）：{e} —— 设置页仍会显示这个位置，写入这里的文件会失败",
+            dir.display()
+        );
+    }
+    dir
+}
+
 /// `data/` 数据目录，不存在则创建。
 pub fn data_dir() -> PathBuf {
-    let dir = data_home().join("data");
-    std::fs::create_dir_all(&dir).ok();
-    dir
+    ensure_dir(data_home().join("data"))
 }
 
 /// `logs/` 日志目录，不存在则创建。
@@ -303,9 +317,7 @@ pub fn data_dir() -> PathBuf {
 /// 跟着**程序目录**走而不是数据目录：`init_logging()` 在任何命令行参数解析之前就要跑
 /// （见 desktop/src/lib.rs），让它依赖配置文件等于把日志系统架在配置能否读上来的赌注上。
 pub fn log_dir() -> PathBuf {
-    let dir = app_dir().join("logs");
-    std::fs::create_dir_all(&dir).ok();
-    dir
+    ensure_dir(app_dir().join("logs"))
 }
 
 /// `data/screenshots/` 截图目录，不存在则创建。
@@ -316,23 +328,17 @@ pub fn log_dir() -> PathBuf {
 /// 用户改数据文件夹时才会被现有递归 walk 一起带走；放在 `data_home` 根下则要么被落下、
 /// 要么直接把"更改数据文件夹"这个功能挡住。
 pub fn screenshots_dir() -> PathBuf {
-    let dir = data_home().join("data").join("screenshots");
-    std::fs::create_dir_all(&dir).ok();
-    dir
+    ensure_dir(data_home().join("data").join("screenshots"))
 }
 
 /// `backup/` 备份目录，不存在则创建。
 pub fn backup_dir() -> PathBuf {
-    let dir = data_home().join("backup");
-    std::fs::create_dir_all(&dir).ok();
-    dir
+    ensure_dir(data_home().join("backup"))
 }
 
 /// `plugins/` 插件目录，不存在则创建。
 pub fn plugins_dir() -> PathBuf {
-    let dir = app_dir().join("plugins");
-    std::fs::create_dir_all(&dir).ok();
-    dir
+    ensure_dir(app_dir().join("plugins"))
 }
 
 /// `config.ini` 配置文件路径。
@@ -393,5 +399,39 @@ mod tests {
             "screenshots 不在 data/ 下面：{dir:?}"
         );
         assert!(dir.is_dir(), "取用时该已经把目录建好");
+    }
+
+    /// 目录建不出来时不能只 `.ok()`：设置页拿到的路径看起来是好的，写入却会失败。
+    ///
+    /// 夹具把 `data/` 换成同名普通文件（只读卷、同步盘占位、同名文件都是这个形状）。
+    /// 成功路径也必须安静 —— 这些函数在热路径上被反复调用。
+    #[test]
+    fn a_failed_directory_creation_is_reported_with_its_path() {
+        let _lock = test_app_dir_lock();
+        let app = test_app_dir("dir_fail");
+        set_app_dir(app.path());
+        let blocked = data_dir();
+        assert!(blocked.is_dir(), "正常时该建好");
+        std::fs::remove_dir(&blocked).unwrap();
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let (got, logs) = crate::logger::capture_logs(data_dir);
+        assert_eq!(got, blocked, "失败时仍把路径交回去，行为不变");
+        let shown = logs.join("\n");
+        assert!(shown.contains("目录建不出来"), "建不成必须出声: {shown}");
+        assert!(
+            shown.contains(&blocked.display().to_string()),
+            "要点名哪个目录: {shown}"
+        );
+        assert!(shown.contains("写入"), "要说出后果: {shown}");
+
+        std::fs::remove_file(&blocked).unwrap();
+        let (made, logs) = crate::logger::capture_logs(data_dir);
+        assert_eq!(made, blocked);
+        assert!(made.is_dir());
+        assert!(
+            logs.iter().all(|l| !l.contains("目录建不出来")),
+            "成功不该报警: {logs:?}"
+        );
     }
 }
