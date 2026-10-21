@@ -2614,6 +2614,11 @@ pub fn heal_daily_consistency() {
 
         // Σhourly → daily 对齐（只处理确有偏差的天）
         if !dirty.hourly_mismatch_days.is_empty() {
+            // 「重算了几天」要数**真的写完的那些天**：探测之后还会跳过两类天
+            // （daily 读不出来、缩放写不进去），旧写法直接报名单长度，
+            // 于是同一条日志既写"跳过这一天"又写"重算 N 天"，N 里就含那些没做成的天。
+            let mut rescaled = 0usize;
+            let mut not_rescaled = 0usize;
             for dk in &dirty.hourly_mismatch_days {
                 let daily: i64 = match conn.query_row(
                     "SELECT count FROM daily_counts WHERE date_key=?1",
@@ -2626,15 +2631,28 @@ pub fn heal_daily_consistency() {
                         tracing::error!(
                             "一致性自愈：{year} 年库 date_key {dk} 的 daily 读不出来，跳过这一天（不缩放）: {e}"
                         );
+                        not_rescaled += 1;
                         continue;
                     }
                 };
-                scale_hourly_to_total(&conn, *dk, daily);
+                if let Err(e) = scale_hourly_to_total(&conn, *dk, daily) {
+                    tracing::error!(
+                        "一致性自愈：{year} 年库 date_key {dk} 的 hourly 没重算成: {e}"
+                    );
+                    not_rescaled += 1;
+                    continue;
+                }
+                rescaled += 1;
             }
-            tracing::info!(
-                "一致性自愈：{year} 年库重算 {} 天的 hourly_counts",
-                dirty.hourly_mismatch_days.len()
-            );
+            if rescaled > 0 {
+                tracing::info!("一致性自愈：{year} 年库重算 {rescaled} 天的 hourly_counts");
+            }
+            if not_rescaled > 0 {
+                tracing::warn!(
+                    "一致性自愈：{year} 年库另有 {not_rescaled} 天没能重算（原因见上面逐天的报错），\
+                     下一轮启动会再来一次"
+                );
+            }
             queries::invalidate_years_cache();
         }
     }
@@ -2703,7 +2721,14 @@ fn daily_inconsistency(conn: &Connection) -> Inconsistency {
 
 /// 把某天 hourly_counts 各小时按比例缩放，使 Σhourly == target_total。
 /// 整数分摊：每小时扣减 floor(cnt * excess / cur_total)，余数从最大小时补扣。
-fn scale_hourly_to_total(conn: &Connection, day_key: i64, target_total: i64) {
+///
+/// 交回 `Err` 说的是"这一天没缩放成"。原先每条 UPDATE 都是 `let _ = conn.execute(..)`，
+/// 而调用方无论写成没写都打一句「重算 N 天的 hourly_counts」⇒
+/// 库被别的连接握着、页坏了、磁盘满的时候，这句话是假的；更糟的是**部分落地**：
+/// 那些小时已经被改成一半新一半旧，Σhourly 与 daily 的偏差换了个形状，
+/// 而自愈报告说它做完了。读分布那一支以前是 `.unwrap_or_default()` ——
+/// "读不出来"与"这一天没有小时行"也是同一个答案。
+fn scale_hourly_to_total(conn: &Connection, day_key: i64, target_total: i64) -> Result<(), String> {
     let hours: Vec<(i64, i64)> = conn
         .prepare("SELECT hour, count FROM hourly_counts WHERE date_key=?1")
         .and_then(|mut s| {
@@ -2712,10 +2737,11 @@ fn scale_hourly_to_total(conn: &Connection, day_key: i64, target_total: i64) {
             })
             .map(|rows| rows.flatten().collect())
         })
-        .unwrap_or_default();
+        .map_err(|e| format!("读出这一天的 hourly 分布失败: {e}"))?;
     let cur_total: i64 = hours.iter().map(|(_, c)| c).sum();
     if cur_total <= 0 || cur_total == target_total {
-        return;
+        // 本来就没有要重分的量（这一天没有小时行，或已经对齐）：算"没做成事"而不是失败
+        return Ok(());
     }
     let excess = cur_total - target_total; // 可能为正（多记）也可能为负（少记）
     let mut applied: i64 = 0;
@@ -2732,16 +2758,26 @@ fn scale_hourly_to_total(conn: &Connection, day_key: i64, target_total: i64) {
             *c -= residual;
         }
     }
+    let mut stuck: Vec<String> = Vec::new();
     for (h, new_count) in updates {
-        let _ = conn.execute(
+        if let Err(e) = conn.execute(
             "UPDATE hourly_counts SET count=?1 WHERE date_key=?2 AND hour=?3",
             rusqlite::params![new_count, day_key, h],
-        );
+        ) {
+            stuck.push(format!("第 {h} 时写不进: {e}"));
+        }
     }
-    let _ = conn.execute(
+    if let Err(e) = conn.execute(
         "DELETE FROM hourly_counts WHERE count <= 0 AND date_key = ?1",
         [day_key],
-    );
+    ) {
+        stuck.push(format!("清理零值小时失败: {e}"));
+    }
+    if stuck.is_empty() {
+        Ok(())
+    } else {
+        Err(stuck.join("；"))
+    }
 }
 
 #[cfg(test)]
@@ -2898,6 +2934,66 @@ mod tests {
             !after.contains("DETACH DATABASE source\", [])?;"),
             "DETACH 又被 ? 往上抛：已经提交成功的归档会被说成失败"
         );
+    }
+
+    /// 缩放那一步要能说出"这一天没重算成"，别让上层把没写完的天也报进「重算 N 天」。
+    ///
+    /// 夹具用一条 BEFORE UPDATE 触发器把写挡下来：读还是好的，所以偏差探测照常把这一天
+    /// 交给我们，而每条 UPDATE 都失败 —— 这正是"库被别的连接握着 / 页坏了 / 盘满"那一类
+    /// 形态里无头环境能稳定造出来的一个。
+    #[test]
+    fn hourly_rescale_reports_refused_writes_instead_of_claiming_success() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("hourly_rescale");
+        let year = chrono::Local::now().year();
+        let conn = connection::open_rw(&paths::year_db_path(year)).unwrap();
+        connection::ensure_schema(&conn, year).unwrap();
+
+        // 正常一支：写得动 ⇒ 确认为成功，且 Σhourly 真的对齐到 daily
+        conn.execute(
+            "INSERT INTO daily_counts (date_key, count) VALUES (1, 5)",
+            [],
+        )
+        .unwrap();
+        for h in 0..5i64 {
+            conn.execute(
+                "INSERT INTO hourly_counts (date_key, hour, count) VALUES (1, ?1, 2)",
+                [h],
+            )
+            .unwrap();
+        }
+        assert!(
+            scale_hourly_to_total(&conn, 1, 5).is_ok(),
+            "写得动时必须确认为成功，否则自愈每轮都自报失败"
+        );
+        let sum: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM hourly_counts WHERE date_key = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sum, 5, "缩放要真的把 Σhourly 对齐到 5");
+
+        // 被挡的一支：先造出偏差，再让每一条 UPDATE 都失败
+        conn.execute(
+            "INSERT INTO daily_counts (date_key, count) VALUES (2, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO hourly_counts (date_key, hour, count) VALUES (2, 0, 9)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER block_hourly BEFORE UPDATE ON hourly_counts
+             BEGIN SELECT RAISE(ABORT, '夹具：写被挡'); END;",
+        )
+        .unwrap();
+        let err = scale_hourly_to_total(&conn, 2, 1)
+            .expect_err("UPDATE 全被挡下时必须交回错误 —— 旧写法返回 ()，上层照样打「重算 N 天」");
+        assert!(err.contains("写不进"), "要说清是哪一小时的写不进去: {err}");
     }
 
     /// 一条**平台前提**（本轮现量，三个产品路径都踩在它上面：
