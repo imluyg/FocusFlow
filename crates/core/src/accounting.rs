@@ -430,7 +430,12 @@ pub fn add_expense(
 ) -> i64 {
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return -1,
+        // 面板那一头对 -1 说的是「记账库没打开或写入失败」，而宿主对"为什么不写"
+        // 原先一个字都不留（与 `add_category` 那处同形）
+        Err(e) => {
+            tracing::error!("添加记账记录「{item_name}」失败：记账库打不开: {e}");
+            return -1;
+        }
     };
     let rtype = rtype.trim();
     if !EXPENSE_TYPES.contains(&rtype) {
@@ -481,7 +486,12 @@ pub fn add_expense(
 pub fn update_expense(id: i64, e: &Expense) -> bool {
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return false,
+        // 原先是 `Err(_) => return false`，一行日志都不留：面板显示"更新失败"，
+        // 而到底是那句 UPDATE 没写成、还是库压根没打开，事后无从查证
+        Err(e) => {
+            tracing::error!("更新记账记录 #{id} 失败：记账库打不开: {e}");
+            return false;
+        }
     };
     let rtype = e.rtype.trim();
     if !EXPENSE_TYPES.contains(&rtype) {
@@ -500,7 +510,10 @@ pub fn update_expense(id: i64, e: &Expense) -> bool {
             return false;
         }
     };
-    conn.execute(
+    // 三种结局分开：这一条本来就不在（别的窗口删过 / 传进来的 id 是旧的）与
+    // "这次写没写成"是两件事。旧写法 `.map(|n| n > 0).unwrap_or(false)` 把它们
+    // 与"库打不开"折成同一个 false，而且这一条链上一行日志都没有。
+    match conn.execute(
         "UPDATE expenses SET type=?1, item_name=?2, store=?3, purchase_date=?4,
          amount=?5, category=?6, subcategory=?7, note=?8 WHERE id=?9",
         rusqlite::params![
@@ -514,17 +527,46 @@ pub fn update_expense(id: i64, e: &Expense) -> bool {
             e.note,
             id
         ],
-    )
-    .map(|n| n > 0)
-    .unwrap_or(false)
+    ) {
+        Ok(n) if n > 0 => true,
+        Ok(_) => {
+            tracing::warn!(
+                "更新记账记录 #{id}：这一条已经不在了（大概另一个窗口刚删掉），没有任何改动"
+            );
+            false
+        }
+        Err(err) => {
+            tracing::error!("更新记账记录 #{id} 没写成: {err}");
+            false
+        }
+    }
 }
 
 /// 删除记账记录。
+///
+/// 对外的 bool 口径不变（宿主与面板都读它），但把"这件事没得到答案"
+/// 与"这一条本来就不在"分开放进 `Result`：旧写法是一条
+/// `open().and_then(execute).map(n| n>0).unwrap_or(false)`，库打不开、语句失败、
+/// 行不存在三种结局全是同一个 false，而整条链上一行日志都没有 ——
+/// 面板那句「有 N 条没删成」因此既查不到原因，也没法告诉用户
+/// 该刷新一下还是该去看磁盘。
 pub fn delete_expense(id: i64) -> bool {
-    open()
-        .and_then(|conn| conn.execute("DELETE FROM expenses WHERE id=?1", [id]))
+    match try_delete_expense(id) {
+        Ok(deleted) => deleted,
+        Err(e) => {
+            tracing::error!("删除记账记录 #{id} 没做成: {e}");
+            false
+        }
+    }
+}
+
+/// `Ok(true)` 删掉了这一条；`Ok(false)` 执行成功但那一行本来就不在；
+/// `Err(原因)` 是**没机会知道结果**（库打不开、语句失败）。
+fn try_delete_expense(id: i64) -> Result<bool, String> {
+    let conn = open().map_err(|e| format!("记账库打不开: {e}"))?;
+    conn.execute("DELETE FROM expenses WHERE id=?1", [id])
         .map(|n| n > 0)
-        .unwrap_or(false)
+        .map_err(|e| format!("DELETE 失败: {e}"))
 }
 
 /// 获取全部记账记录（按 id 降序）。
@@ -757,14 +799,27 @@ pub fn update_category_type(name: &str, ctype: &str) -> bool {
     };
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(e) => {
+            tracing::error!("改分类 [{name}] 的类型失败：记账库打不开: {e}");
+            return false;
+        }
     };
-    conn.execute(
+    match conn.execute(
         "UPDATE categories SET type=?1 WHERE name=?2",
         rusqlite::params![norm, name],
-    )
-    .map(|n| n > 0)
-    .unwrap_or(false)
+    ) {
+        Ok(n) if n > 0 => true,
+        // 「这个分类不在库里」与「那句 UPDATE 没写成」以前都是同一个 false，
+        // 而面板对两者说的都是"改类型失败" —— 前者刷新一下就好，后者要去查盘
+        Ok(_) => {
+            tracing::warn!("改分类 [{name}] 的类型：库里没有这个分类，没有任何改动");
+            false
+        }
+        Err(e) => {
+            tracing::error!("改分类 [{name}] 的类型没写成: {e}");
+            false
+        }
+    }
 }
 
 /// 为分类添加子分类，返回 (成功, 错误信息)。
@@ -2357,6 +2412,76 @@ mod tests {
             bad.push("id 改为按这一次插入的结果给，不再事后回读猜".to_string());
         }
         assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    /// 删除一条记录有三种结局，不许折成一个 bool 还不留日志。
+    ///
+    /// 旧写法是一条 `open().and_then(execute).map(n| n>0).unwrap_or(false)`：
+    /// 库打不开、DELETE 被挡、那一行本来就不在，全都是同一个 false，而整条链上
+    /// 一行日志都没有 —— 面板那句「有 N 条没删成」既查不到原因，也没法告诉用户
+    /// 该刷新一下（那条其实已经没了）还是该去看磁盘（那条还站着）。
+    #[test]
+    fn a_delete_tells_gone_apart_from_refused() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_delete_kinds");
+        init_db().expect("建库失败");
+        let id = add_expense("支出", "一笔", None, "2026-09-05", 3.0, None, None, None);
+        assert!(id > 0, "夹具：先建一条");
+        assert!(delete_expense(id), "删得掉时要回 true");
+        assert!(
+            matches!(try_delete_expense(id), Ok(false)),
+            "已经不在的那一条是「执行成功但没删到」，不是错误"
+        );
+
+        {
+            let conn = open().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER block_expense_delete BEFORE DELETE ON expenses
+                 BEGIN SELECT RAISE(ABORT, '夹具：删不动'); END;",
+            )
+            .unwrap();
+        }
+        let id2 = add_expense("支出", "第二笔", None, "2026-09-06", 4.0, None, None, None);
+        match try_delete_expense(id2) {
+            Err(e) => assert!(e.contains("DELETE 失败"), "要说清是哪一步没做成: {e}"),
+            Ok(v) => panic!("删不动不许被说成「这一条本来就不在」: Ok({v})"),
+        }
+        assert!(
+            !delete_expense(id2),
+            "对外口径仍是 false（宿主的 bool 契约不变）"
+        );
+        let left: i64 = {
+            let conn = open().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM expenses WHERE id=?1", [id2], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            left, 1,
+            "写被挡下时那一行必须还在 —— 这正是它必须与「已经没了」分开的原因"
+        );
+    }
+
+    /// 接线腿：写入口不许把"库打不开"静默折成哨兵值。
+    ///
+    /// 面板与宿主对 -1/false 说的话都指向"写入失败"，可旧代码在这一支一个字都不留，
+    /// 于是那句提示成了查不到的死路（同 `add_category` 那处，一起钉住这一类）。
+    #[test]
+    fn write_doors_say_why_the_database_could_not_be_opened() {
+        let src = include_str!("accounting.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for fold in ["Err(_) => return false", "Err(_) => return -1"] {
+            assert!(
+                !code.contains(fold),
+                "又有写入口把「库打不开」静默折成 {fold}：面板的提示会指向一条不存在的日志"
+            );
+        }
     }
 
     /// 回归（第 23 轮）：`add_category` 撞重名时 `INSERT OR IGNORE` 整条忽略，紧接着
