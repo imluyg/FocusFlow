@@ -286,6 +286,48 @@ fn row_to_expense(r: &rusqlite::Row<'_>) -> rusqlite::Result<Expense> {
     })
 }
 
+/// 读侧点名的列，**顺序必须与 [`row_to_expense`] 的位置一一对应**。
+///
+/// 原先四处都写 `SELECT *`，而 `row_to_expense` 按 0..10 的位置取列 ⇒ 列序由库决定。
+/// 旧版（Python 时代）整份导入的账本里 `expenses` 用的可以是同一批列名、不同的列序
+/// （`init_db` 只补 `categories` 那一侧，`expenses` 是 `CREATE TABLE IF NOT EXISTS`，
+/// 老表原样留着）：那种库里"店铺"会被读成"金额"，类型对不上的整行被静默丢掉，
+/// 类型碰巧能读的则变成一条数字与文字互换的记录。
+/// 点名之后列序不再参与；写侧本来就点名这十一列（少哪一列 `add_expense` 会直接失败），
+/// 所以这个改法不引入新的失败形态。
+const EXPENSE_COLS: &str = "id, type, item_name, store, purchase_date, amount, \
+                            category, subcategory, delivery_date, record_time, note";
+
+/// 把读出来的行收起来，顺手数出"整行读不出来"的那些。
+///
+/// 原先三处都是 `rows.flatten().collect()`：某一行转换失败就凭空消失。
+/// 分页那一头的条数取的是 `COUNT(*)`，于是界面写着「共 37 条」却只列得出 30 条，
+/// 日志一个字都没有 —— 少了列序这个错因之后这条路仍可能触发（外部工具往 `amount`
+/// 里写过文字就是），所以要说出来。
+fn collect_expenses<I>(rows: I, which: &str) -> Vec<Expense>
+where
+    I: Iterator<Item = rusqlite::Result<Expense>>,
+{
+    let mut out = Vec::new();
+    let mut dropped = 0usize;
+    for row in rows {
+        match row {
+            Ok(e) => out.push(e),
+            Err(e) => {
+                dropped += 1;
+                tracing::debug!("记账有一行读不出来: {e}");
+            }
+        }
+    }
+    if dropped > 0 {
+        tracing::error!(
+            "记账读取（{which}）有 {dropped} 行整行读不出来：它们不会出现在列表里，\
+             却仍被算进那一头的条数"
+        );
+    }
+    out
+}
+
 /// 记账允许的类型值。
 ///
 /// 合计 SQL 用的是**字面量**比较（`type='支出'` / `type='收入'`，见
@@ -420,13 +462,15 @@ pub fn get_all_expenses(limit: i64) -> Vec<Expense> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let mut stmt = match conn.prepare("SELECT * FROM expenses ORDER BY id DESC LIMIT ?1") {
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT {EXPENSE_COLS} FROM expenses ORDER BY id DESC LIMIT ?1"
+    )) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
     let result = stmt.query_map([limit], row_to_expense);
     match result {
-        Ok(rows) => rows.flatten().collect(),
+        Ok(rows) => collect_expenses(rows, "全部记录"),
         Err(_) => Vec::new(),
     }
 }
@@ -437,14 +481,15 @@ pub fn get_expenses_by_date(date: &str) -> Vec<Expense> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let mut stmt =
-        match conn.prepare("SELECT * FROM expenses WHERE purchase_date=?1 ORDER BY id DESC") {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT {EXPENSE_COLS} FROM expenses WHERE purchase_date=?1 ORDER BY id DESC"
+    )) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
     let result = stmt.query_map([date], row_to_expense);
     match result {
-        Ok(rows) => rows.flatten().collect(),
+        Ok(rows) => collect_expenses(rows, "按日期筛选"),
         Err(_) => Vec::new(),
     }
 }
@@ -866,8 +911,12 @@ fn parse_subs(raw: &str) -> Vec<String> {
 /// 按 id 获取记录。
 pub fn get_expense_by_id(id: i64) -> Option<Expense> {
     let conn = open().ok()?;
-    conn.query_row("SELECT * FROM expenses WHERE id=?1", [id], row_to_expense)
-        .ok()
+    conn.query_row(
+        &format!("SELECT {EXPENSE_COLS} FROM expenses WHERE id=?1"),
+        [id],
+        row_to_expense,
+    )
+    .ok()
 }
 
 /// 分类下的子分类列表（分类表中声明的 + 记录中出现过的，去重合并）。
@@ -1033,7 +1082,8 @@ pub fn get_expenses_page(
     // 按日期倒序（最新在前），同日期按 id 倒序。
     // 注意：占位符必须用位置 ?（不能用 ?1/?2 编号），否则带筛选时 LIMIT 会绑到筛选参数上
     let sql = format!(
-        "SELECT * FROM expenses{where_sql} ORDER BY purchase_date DESC, id DESC LIMIT ? OFFSET ?"
+        "SELECT {EXPENSE_COLS} FROM expenses{where_sql}
+         ORDER BY purchase_date DESC, id DESC LIMIT ? OFFSET ?"
     );
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -1047,7 +1097,7 @@ pub fn get_expenses_page(
         row_to_expense,
     );
     let records = match result {
-        Ok(rows) => rows.flatten().collect(),
+        Ok(rows) => collect_expenses(rows, "分页列表"),
         Err(_) => Vec::new(),
     };
     (records, total)
@@ -1979,6 +2029,70 @@ mod tests {
             still, "2026-9-1",
             "没写成的那一行要原样留着，不能被清空、也不能替用户猜一个日期"
         );
+    }
+
+    /// 读侧点名要哪些列 —— 列序不该决定"哪一个值是金额"。
+    ///
+    /// 旧版（Python 时代）整份导入的账本里 `expenses` 可以是同一批列名、不同列序，
+    /// 而 `init_db` 对 `expenses` 只做 `CREATE TABLE IF NOT EXISTS`（老表原样留着）。
+    /// `SELECT *` + 按位置读的那种库上会出两种错：类型对不上的整行被
+    /// `rows.flatten()` 静默丢掉（分页那头条数取 COUNT(*) ⇒「共 N 条」与实际列出的
+    /// 行数不一致，零日志），类型碰巧能读的则变成一条数字与文字互换的记录。
+    #[test]
+    fn expenses_are_read_by_column_name_not_by_position() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_col_order");
+        {
+            let conn = open().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE expenses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_name TEXT NOT NULL,
+                    store TEXT,
+                    type TEXT NOT NULL DEFAULT '支出',
+                    purchase_date TEXT NOT NULL,
+                    category TEXT,
+                    subcategory TEXT,
+                    delivery_date TEXT,
+                    amount REAL NOT NULL,
+                    note TEXT,
+                    record_time TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO expenses (item_name, store, type, purchase_date, amount, record_time)
+                 VALUES ('书', '旧书店', '支出', '2026-09-05', 12.5, '2026-09-05 10:00:00')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let (rows, total) = get_expenses_page(1, 20, None, None, None, None, None);
+        assert_eq!(total, 1, "COUNT(*) 看得见这一行");
+        assert_eq!(
+            rows.len(),
+            1,
+            "列表里也得有这一行 —— 旧写法按位置读，这一行会整行消失而条数照旧"
+        );
+        assert_eq!(rows[0].item_name, "书");
+        assert_eq!(
+            rows[0].amount, 12.5,
+            "金额要来自 amount 那一列，不是按位置撞上的某一列"
+        );
+        assert_eq!(rows[0].purchase_date, "2026-09-05");
+        assert_eq!(rows[0].rtype, "支出");
+
+        // 同一个尺子也要管住另外三条读路（一处修好、三处照旧是本仓最常见的错）
+        let all = get_all_expenses(50);
+        assert_eq!(all.len(), 1, "「全部记录」那条路同样不许按位置读");
+        assert_eq!(all[0].amount, 12.5);
+        let by_date = get_expenses_by_date("2026-09-05");
+        assert_eq!(by_date.len(), 1, "「按日期筛选」那条路同理");
+        assert_eq!(by_date[0].store.as_deref(), Some("旧书店"));
+        let one = get_expense_by_id(all[0].id);
+        assert!(one.is_some(), "「按 id 取一条」同理");
+        assert_eq!(one.map(|e| e.amount), Some(12.5));
     }
 
     /// 回归（第 23 轮）：`add_category` 撞重名时 `INSERT OR IGNORE` 整条忽略，紧接着
