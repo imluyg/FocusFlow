@@ -150,42 +150,47 @@ pub fn init_db() -> anyhow::Result<()> {
         let sql: String = stmt.query_row([], |r| r.get(0)).unwrap_or_default();
         sql.contains("subs")
     };
+    // 迁移第一步：这一列有没有 —— **只补列**。
+    // `ALTER TABLE … ADD COLUMN` 自带提交，所以补完之后"旧表要不要合并"就不能再参考
+    // 这一步做过没有：旧写法把合并整段套在 `if !has_subs` 里，一旦 ALTER 成功而后面
+    // 任何一步失败（合并查询报错、UPDATE 写不动、DROP 被别的连接握着），
+    // 下一次进来 `has_subs` 已为真 ⇒ 整段合并**从此不再执行**：
+    // Python 时代的子分类永远进不了下拉，而旧表还躺在库里，日志只剩一行报错。
     if !has_subs {
-        conn.execute(
+        if let Err(e) = conn.execute(
             "ALTER TABLE categories ADD COLUMN subs TEXT NOT NULL DEFAULT '[]'",
             [],
+        ) {
+            tracing::error!("记账迁移：subs 列补不上（{e}），旧子分类这一轮没法合并，下次启动再试");
+            return Ok(());
+        }
+    }
+    // 第二步：旧表**还在**就合并（与第一步是不是刚跑过无关 ⇒ 半截迁移会被重试）。
+    let has_sub_table: bool = {
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='subcategories'",
         )?;
-        // 旧版子分类在独立 subcategories 表（name, category_id）：合并进 subs 列
-        let has_sub_table: bool = {
-            let mut stmt = conn.prepare(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='subcategories'",
-            )?;
-            stmt.query_row([], |r| r.get::<_, i64>(0)).unwrap_or(0) > 0
-        };
-        if has_sub_table {
-            let merged: Vec<(String, String)> = {
-                let mut stmt = conn.prepare(
-                    "SELECT c.name AS cat, s.name AS sub
-                     FROM subcategories s JOIN categories c ON s.category_id = c.id
-                     ORDER BY c.id, s.sort_order, s.id",
-                )?;
-                let rows =
-                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-                rows.flatten().collect()
-            };
-            let mut cat_subs: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            for (cat, sub) in merged {
-                cat_subs.entry(cat).or_default().push(sub);
+        stmt.query_row([], |r| r.get::<_, i64>(0)).unwrap_or(0) > 0
+    };
+    if has_sub_table {
+        match merge_legacy_subcategories(&conn) {
+            Ok(orphans) => {
+                if orphans > 0 {
+                    tracing::warn!(
+                        "记账迁移：旧 subcategories 表里有 {orphans} 行的 category_id 找不到对应分类，\
+                         它们没有归属、这一轮之后不再保留旧表（其余子分类已并入 subs）"
+                    );
+                }
+                // 只有合并真的走完才收掉旧表；收不掉不算失败：下一次还会重并一次，
+                // 而 `UPDATE categories SET subs=` 是按整串覆盖写的，不会越写越多。
+                if let Err(e) = conn.execute("DROP TABLE IF EXISTS subcategories", []) {
+                    tracing::warn!("旧 subcategories 表没能删掉（{e}）：下一次启动会再并一次");
+                }
             }
-            for (cat, subs) in cat_subs {
-                conn.execute(
-                    "UPDATE categories SET subs=?1 WHERE name=?2",
-                    rusqlite::params![subs.join(","), cat],
-                )?;
-            }
-            // 迁移完成后移除旧表（数据已并入）
-            conn.execute("DROP TABLE IF EXISTS subcategories", [])?;
+            Err(e) => tracing::error!(
+                "记账迁移：旧子分类这一轮没合并成（{e}）；旧表原样留着，下次启动再试，\
+                 这一列先按没有子分类处理"
+            ),
         }
     }
 
@@ -217,6 +222,72 @@ pub fn init_db() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// 把 Python 时代那张 `subcategories` 表并进 `categories.subs`。
+///
+/// 交回"孤儿行数"（`category_id` 找不到对应分类的那些）。旧写法是 INNER JOIN 配
+/// `rows.flatten()`：孤儿与任何一行读不出来的都被静默丢掉，而那句迁移照打不误。
+/// 读不动/写不动一律交回 Err —— 调用方**保留旧表**，下一次启动再并一次，
+/// 而不是像旧写法那样 `?` 抛出后靠 `has_subs` 已经把整段跳过（=永久放弃）。
+///
+/// `sort_order` 按本仓夹具里的旧表结构是存在的；真遇到没有它的库，带它的 ORDER BY
+/// 会让 prepare 直接失败。子分类的先后是用户当年排出来的，不是小事，
+/// 所以先按 `sort_order` 排，排不动才退回按 id 排。
+fn merge_legacy_subcategories(conn: &Connection) -> Result<usize, String> {
+    let read = |sql: &str| -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = conn.prepare(sql)?;
+        let mut out = Vec::new();
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    };
+    let merged = match read(
+        "SELECT c.name, s.name FROM subcategories s
+         JOIN categories c ON s.category_id = c.id
+         ORDER BY c.id, s.sort_order, s.id",
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "旧 subcategories 表按 sort_order 排不出来（{e}）：改按 id 顺序合并，\
+                 子分类的先后可能与你当年排的不一样"
+            );
+            read(
+                "SELECT c.name, s.name FROM subcategories s
+                 JOIN categories c ON s.category_id = c.id
+                 ORDER BY c.id, s.id",
+            )
+            .map_err(|e2| format!("读旧子分类失败: {e2}"))?
+        }
+    };
+    let orphans: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM subcategories s
+             WHERE NOT EXISTS (SELECT 1 FROM categories c WHERE c.id = s.category_id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    // 用 Vec 而不是 HashMap：并进来的顺序跟着查询结果走，`UPDATE` 的先后也就不再
+    // 每进程随机（HashMap 的迭代序是随机的，同一份旧表两次迁移会写出不同的 UPDATE 序）
+    let mut cat_subs: Vec<(String, Vec<String>)> = Vec::new();
+    for (cat, sub) in merged {
+        match cat_subs.iter_mut().find(|(n, _)| *n == cat) {
+            Some((_, list)) => list.push(sub),
+            None => cat_subs.push((cat, vec![sub])),
+        }
+    }
+    for (cat, subs) in &cat_subs {
+        conn.execute(
+            "UPDATE categories SET subs=?1 WHERE name=?2",
+            rusqlite::params![subs.join(","), cat],
+        )
+        .map_err(|e| format!("分类 [{cat}] 的 subs 写不进去: {e}"))?;
+    }
+    Ok(orphans as usize)
 }
 
 /// 一次性把库里**格式不对**的 `purchase_date` 写成这一列声明的尺子（补零形态）。
@@ -2093,6 +2164,113 @@ mod tests {
         let one = get_expense_by_id(all[0].id);
         assert!(one.is_some(), "「按 id 取一条」同理");
         assert_eq!(one.map(|e| e.amount), Some(12.5));
+    }
+
+    /// 建一张"上一轮只补完 subs 列、旧表还没并掉"的库（`ALTER ADD COLUMN` 自带提交，
+    /// 这就是合并中途失败后留下的形状）。
+    fn build_half_done_legacy_db() {
+        let conn = open().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                type TEXT NOT NULL DEFAULT 'both',
+                subs TEXT NOT NULL DEFAULT '[]'
+             );
+             CREATE TABLE subcategories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category_id INTEGER NOT NULL,
+                sort_order INTEGER DEFAULT 0
+             );
+             INSERT INTO categories (name, type) VALUES ('游戏','both');
+             INSERT INTO subcategories (name, category_id, sort_order) VALUES ('梦幻西游',1,0);
+             INSERT INTO subcategories (name, category_id, sort_order) VALUES ('充值',1,1);",
+        )
+        .unwrap();
+    }
+
+    fn legacy_table_still_there() -> bool {
+        let conn = open().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='subcategories'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    /// 旧子分类的合并要盯住"旧表还在不在"，不能盯"这一列是不是刚补的"。
+    ///
+    /// 旧写法把合并整段套在 `if !has_subs {…}` 里：`ALTER TABLE … ADD COLUMN` 自带提交，
+    /// 于是补完列之后任何一步失败（合并查询、UPDATE 写不动、DROP 被握着），
+    /// 下一次进来 `has_subs` 已经是真 ⇒ 整段合并**从此不再执行**。
+    /// 表现是 Python 时代的子分类永远进不了下拉，而旧表还躺在库里，日志只有一行报错。
+    #[test]
+    fn a_half_done_legacy_migration_is_retried_instead_of_abandoned() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_mig_retry");
+        build_half_done_legacy_db();
+
+        init_db().expect("半截迁移不能让初始化失败");
+
+        let game = get_all_categories()
+            .into_iter()
+            .find(|c| c.name == "游戏")
+            .expect("分类还在");
+        assert_eq!(
+            game.subs,
+            vec!["梦幻西游".to_string(), "充值".to_string()],
+            "上一轮没并完的旧子分类这一轮要补上（并按当年的 sort_order 排）"
+        );
+        assert!(
+            !legacy_table_still_there(),
+            "并成功之后旧表要收掉，否则每次启动都重并一次"
+        );
+    }
+
+    /// 合并没做成时：旧表必须留着等下一次，而 `init_db` 不许因此失败。
+    ///
+    /// 旧写法一条 `?` 抛出去 ⇒ 记账整个模块起不来（`host.rs` 那个闩只在成功时落下），
+    /// 而重试时又因为 `has_subs` 已为真而不再合并 —— 一次写不进去就把数据永久锁在旧表里。
+    #[test]
+    fn a_failed_legacy_merge_keeps_the_old_table_and_the_module_usable() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_mig_stuck");
+        build_half_done_legacy_db();
+        {
+            let conn = open().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER block_cat_update BEFORE UPDATE ON categories
+                 BEGIN SELECT RAISE(ABORT, '夹具：写被挡'); END;",
+            )
+            .unwrap();
+        }
+
+        init_db().expect("合并写不进去不能让整次初始化失败");
+        assert!(
+            legacy_table_still_there(),
+            "没并成就不能把旧表删掉 —— 它是那批子分类唯一的副本"
+        );
+
+        // 障碍撤掉之后，下一次启动真的能把它并完（这条才是"重试"而不是"少失败一次"）
+        {
+            let conn = open().unwrap();
+            conn.execute("DROP TRIGGER block_cat_update", []).unwrap();
+        }
+        init_db().expect("障碍移开后要能继续");
+        let game = get_all_categories()
+            .into_iter()
+            .find(|c| c.name == "游戏")
+            .expect("分类还在");
+        assert_eq!(
+            game.subs.len(),
+            2,
+            "重试那一次要把两份旧子分类都并进来：{:?}",
+            game.subs
+        );
+        assert!(!legacy_table_still_there(), "并完了就该收掉旧表");
     }
 
     /// 回归（第 23 轮）：`add_category` 撞重名时 `INSERT OR IGNORE` 整条忽略，紧接着
