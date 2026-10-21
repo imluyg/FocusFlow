@@ -814,10 +814,12 @@ pub fn register_host_api(
     })?;
     host.set("accounting_subcategory_profit", acc_sub_profit)?;
 
-    // 距今多久：入参 id 数组，返回 [{id, years, days}]
+    // 距今多久：入参 id 数组，返回 ([{id, years, days}], [「哪一条没答上、为什么」])。
+    // 第二个值必须有：面板原先在没命中时连结果弹窗都不开，"没填日期"与"库被占住"
+    // 与"这条已被删掉"全是同一个"按钮按了没反应"。
     let acc_days_ago = lua.create_function(|lua, ids: Vec<i64>| {
         ensure_accounting_db();
-        let data = accounting::days_ago(&ids);
+        let (data, misses) = accounting::days_ago(&ids);
         let t = lua.create_table()?;
         for (i, (id, years, days)) in data.iter().enumerate() {
             let row = lua.create_table()?;
@@ -826,7 +828,7 @@ pub fn register_host_api(
             row.set("days", *days)?;
             t.set(i + 1, row)?;
         }
-        Ok(t)
+        Ok((t, misses))
     })?;
     host.set("accounting_days_ago", acc_days_ago)?;
 

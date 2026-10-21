@@ -335,7 +335,8 @@ fn profit_and_days_ago() {
         .format("%Y-%m-%d")
         .to_string();
     let id_year = add(&last_year, "支出", "去年买的", 2.0, "餐饮", "");
-    let days = accounting::days_ago(&[id_today, id_year]);
+    let (days, misses) = accounting::days_ago(&[id_today, id_year]);
+    assert!(misses.is_empty(), "两条都该答上: {misses:?}");
     let d_today = days.iter().find(|(id, _, _)| *id == id_today).unwrap();
     assert_eq!(d_today.1 + d_today.2, 0, "今天的记录应为 0 天");
     let d_year = days.iter().find(|(id, _, _)| *id == id_year).unwrap();

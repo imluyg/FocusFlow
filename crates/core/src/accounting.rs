@@ -1665,37 +1665,89 @@ pub fn years_and_days(from: chrono::NaiveDate, today: chrono::NaiveDate) -> (i64
     (years as i64, (today - anniversary).num_days().max(0))
 }
 
-/// 距今多久：返回 [(id, 年, 天)]（天为去掉整年后的余数）。
-pub fn days_ago(ids: &[i64]) -> Vec<(i64, i64, i64)> {
+/// 距今多久：`交回 [(id, 年, 天)], 与「哪一条没答上、为什么」`（天是去掉整年后的余数）。
+///
+/// 第二个值不是装饰。面板原先只把命中的几条拼成行，`result_text` 为空时**连结果弹窗都不开**
+/// ⇒ 「选中一条按『距今多久』毫无反应」这一个症状，由四种结局共用：库正被别处占着、
+/// 语句准备不了、这一条的日期是认不出来的写法、这一条已经被别处删掉。按钮看着像坏了，
+/// 而那几条里通常只是没填日期。口径与本文件的 `ReadGaps`、`get_all_categories` 一致：
+/// 答不上来要说是哪一条、为什么。
+pub fn days_ago(ids: &[i64]) -> (Vec<(i64, i64, i64)>, Vec<String>) {
+    let mut misses: Vec<String> = Vec::new();
+    if ids.is_empty() {
+        return (Vec::new(), misses);
+    }
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            misses.push(format!("记账库打不开: {e}（这次一条都没查）"));
+            return (Vec::new(), misses);
+        }
     };
     let today = chrono::Local::now().date_naive();
     let mut out = Vec::new();
     let mut stmt = match conn.prepare("SELECT id, purchase_date FROM expenses WHERE id=?1") {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            misses.push(format!("距今多久的语句准备不了: {e}（这次一条都没查）"));
+            return (Vec::new(), misses);
+        }
     };
     for id in ids {
-        if let Ok(mut rows) = stmt.query([id]) {
-            if let Ok(Some(row)) = rows.next() {
-                if let (Ok(rid), Ok(date_str)) = (row.get::<_, i64>(0), row.get::<_, String>(1)) {
-                    // 尺子用本列声明的那把（`normalize_date_filter`）。原先这里用严格
-                    // `%Y-%m-%d`：实测它**能**解 `2026-9-1`（chrono 的数字位宽是弹性的），
-                    // 却只认破折号分隔 —— `2026/9/1`、`2026.9.1`、`20260901` 这些本列
-                    // 承认的写法在它眼里等于"没有日期"，那一行就在"距今多久"里隐身。
-                    let parsed = normalize_date_filter(&date_str)
-                        .and_then(|norm| chrono::NaiveDate::parse_from_str(&norm, "%Y-%m-%d").ok());
-                    if let Some(date) = parsed {
-                        let (years, rest) = years_and_days(date, today);
-                        out.push((rid, years, rest));
-                    }
-                }
+        let mut rows = match stmt.query([id]) {
+            Ok(rows) => rows,
+            Err(e) => {
+                misses.push(format!("id={id} 这一条查不动: {e}"));
+                continue;
+            }
+        };
+        let row = match rows.next() {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                misses.push(format!("库里没有 id={id} 这一条（可能已被删掉）"));
+                continue;
+            }
+            Err(e) => {
+                misses.push(format!("id={id} 这一行读不出来: {e}"));
+                continue;
+            }
+        };
+        let rid = match row.get::<_, i64>(0) {
+            Ok(v) => v,
+            Err(e) => {
+                misses.push(format!("id={id} 这一行读不出来: {e}"));
+                continue;
+            }
+        };
+        let date_str = match row.get::<_, String>(1) {
+            Ok(v) => v,
+            Err(e) => {
+                misses.push(format!("id={id} 这一行的日期列读不出来: {e}"));
+                continue;
+            }
+        };
+        // 尺子用本列声明的那把（`normalize_date_filter`）：原先这里用严格 `%Y-%m-%d`，
+        // 实测 chrono 的数字位宽是弹性的（能解 `2026-9-1`），但它只认破折号分隔 ——
+        // `2026/9/1`、`2026.9.1`、`20260901` 这些本列承认的写法在它眼里等于"没有日期"，
+        // 那一行就在"距今多久"里隐身。
+        let parsed = normalize_date_filter(&date_str)
+            .and_then(|norm| chrono::NaiveDate::parse_from_str(&norm, "%Y-%m-%d").ok());
+        match parsed {
+            Some(date) => {
+                let (years, rest) = years_and_days(date, today);
+                out.push((rid, years, rest));
+            }
+            None if date_str.trim().is_empty() => {
+                misses.push(format!("id={rid} 没填日期，算不出距今多久"));
+            }
+            None => {
+                misses.push(format!(
+                    "id={rid} 的日期「{date_str}」不是能认的写法，算不出距今多久"
+                ));
             }
         }
     }
-    out
+    (out, misses)
 }
 
 /// 月度汇总：返回 (总支出, 总收入)。
@@ -2248,6 +2300,84 @@ mod tests {
         assert_eq!(category_type("交通").as_deref(), Some("expense"));
     }
 
+    /// 「距今多久」答不上来时要说是**哪一条、为什么**，不许一行都不拼。
+    ///
+    /// 立这一条的理由在面板那头的形状：`result_text ~= ""` 才开结果弹窗。原先五条失败臂
+    /// （库打不开 / 语句准备不了 / 这一条查不动 / 这一行是坏值 / 日期认不出来）全折成空
+    /// `Vec` ⇒ 「这条没填日期」「库正被别处占着」「这条已经被删掉」三种结局在用户眼里都是
+    /// 「这个按钮按了没反应」。
+    #[test]
+    fn a_record_days_ago_cannot_answer_names_the_record() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_days_ago_misses");
+        init_db().expect("建库失败");
+        assert!(add_category("餐饮", "expense", &[]) > 0);
+        let mut ids: Vec<i64> = Vec::new();
+        for name in ["有日期", "空的", "坏的"] {
+            let id = add_expense(
+                "支出",
+                name,
+                None,
+                "2026-01-05",
+                1.0,
+                Some("餐饮"),
+                None,
+                None,
+            );
+            assert!(id > 0, "夹具：{name} 该写进去");
+            ids.push(id);
+        }
+        let (ok, blank, junk) = (ids[0], ids[1], ids[2]);
+        {
+            let conn = open().unwrap();
+            conn.execute("UPDATE expenses SET purchase_date='' WHERE id=?1", [blank])
+                .unwrap();
+            conn.execute(
+                "UPDATE expenses SET purchase_date='不是日期' WHERE id=?1",
+                [junk],
+            )
+            .unwrap();
+        }
+
+        let missing = 9_999_999_i64;
+        let (got, misses) = days_ago(&[ok, blank, junk, missing]);
+        assert_eq!(got.len(), 1, "只有那一条日期正常: {got:?}");
+        assert_eq!(got[0].0, ok, "{got:?}");
+        assert_eq!(misses.len(), 3, "三条没答上的都要点名: {misses:?}");
+        assert!(
+            misses
+                .iter()
+                .any(|m| m.contains("没填日期") && m.contains(&format!("id={blank}"))),
+            "空日期要说的是没填，而不是隐身: {misses:?}"
+        );
+        assert!(
+            misses
+                .iter()
+                .any(|m| m.contains("不是能认的写法") && m.contains("不是日期")),
+            "坏日期要把原值带出来，人才知道去改哪一条: {misses:?}"
+        );
+        assert!(
+            misses
+                .iter()
+                .any(|m| m.contains("库里没有") && m.contains(&missing.to_string())),
+            "查无此条也要说一句: {misses:?}"
+        );
+
+        // 库整个读不动时：一批都没查，那句话必须说成"没查"，不能像"这几条没日期"
+        std::fs::write(db_path(), "这不是一个 SQLite 文件").unwrap();
+        let (got2, misses2) = days_ago(&[ok]);
+        assert!(got2.is_empty(), "{got2:?}");
+        assert_eq!(misses2.len(), 1, "{misses2:?}");
+        assert!(misses2[0].contains("一条都没查"), "{misses2:?}");
+
+        // 空输入不该编出一句"没答上"
+        let (got3, misses3) = days_ago(&[]);
+        assert!(
+            got3.is_empty() && misses3.is_empty(),
+            "{got3:?} {misses3:?}"
+        );
+    }
+
     /// 同一列只该有一把日期尺子。
     ///
     /// 回归两半：
@@ -2299,10 +2429,12 @@ mod tests {
         assert_eq!(stored(slashed), "2026/9/2", "前提：这一行真是斜杠写法");
 
         // 第一腿（读侧）：补齐之前这两行就该在「距今多久」里看得见
-        let seen: Vec<i64> = days_ago(&[unpadded, slashed])
-            .into_iter()
-            .map(|(id, _, _)| id)
-            .collect();
+        let (seen_rows, seen_misses) = days_ago(&[unpadded, slashed]);
+        assert!(
+            seen_misses.is_empty(),
+            "这两种写法都该答上: {seen_misses:?}"
+        );
+        let seen: Vec<i64> = seen_rows.into_iter().map(|(id, _, _)| id).collect();
         assert_eq!(
             seen,
             vec![unpadded, slashed],

@@ -947,6 +947,20 @@ mod tests {
             .collect()
     }
 
+    /// 统计结果弹窗（月度汇总 / 分类盈亏 / 距今多久）正文里那份报告。
+    ///
+    /// 它挂在 `Widget::ModalForm.content` 上，`labels_of` 看不见 —— 想断"面板说了什么"
+    /// 就得从这里读。
+    fn report_of(manager: &PluginManager, name: &str) -> String {
+        view_of(manager, name)
+            .into_iter()
+            .find_map(|w| match w {
+                Widget::ModalForm { id, content, .. } if id == "result_modal" => Some(content),
+                _ => None,
+            })
+            .expect("视图里应有统计结果弹窗")
+    }
+
     fn select_value(manager: &PluginManager, name: &str, field: &str) -> Option<String> {
         view_of(manager, name).into_iter().find_map(|w| match w {
             Widget::Select {
@@ -1298,16 +1312,6 @@ mod tests {
     fn an_unreadable_ledger_is_not_reported_as_a_zero_month() {
         use focusflow_core::accounting;
 
-        fn report_of(manager: &PluginManager, name: &str) -> String {
-            view_of(manager, name)
-                .into_iter()
-                .find_map(|w| match w {
-                    Widget::ModalForm { id, content, .. } if id == "result_modal" => Some(content),
-                    _ => None,
-                })
-                .expect("视图里应有统计结果弹窗")
-        }
-
         let _guard = guard();
         let (tmp, mut manager, name) = bundled_in("summary_gap", "accounting_plugin.lua");
         accounting::init_db().expect("记账库应能建起来");
@@ -1356,6 +1360,72 @@ mod tests {
             !monthly.contains("（本月暂无分类明细）"),
             "读不动时不许断定本月没有明细:\n{monthly}"
         );
+
+        assert!(manager.unload_plugin(&name));
+        drop(tmp);
+    }
+
+    /// 「距今多久」按下去一定要出声音：算不出来的那几条要说是哪一条、为什么。
+    ///
+    /// 面板原先只在拼出了行时才开结果弹窗，于是「这条没填日期」「这条已被别处删掉」
+    /// 「库正被别处占着」三种结局都是同一张"按钮坏了"的脸。宿主现在把没答上的原因一起
+    /// 交回来，面板无论有没有命中都开弹窗说话 —— 所以这一条既钉文案，也钉弹窗开没开。
+    #[test]
+    fn the_days_ago_button_answers_even_when_it_cannot_compute() {
+        use focusflow_core::accounting;
+
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("days_ago_voice", "accounting_plugin.lua");
+        accounting::init_db().expect("记账库应能建起来");
+        assert!(accounting::add_category("餐饮", "expense", &[]) > 0);
+        let good = accounting::add_expense(
+            "支出",
+            "午饭",
+            None,
+            "2026-01-05",
+            1.0,
+            Some("餐饮"),
+            None,
+            None,
+        );
+        assert!(good > 0, "夹具：这一笔要写进去");
+
+        // 正常那一条：报告照常给"距今"，也不许多一句没算出来
+        manager
+            .plugin_action(&name, &format!("days_{good}"))
+            .expect("距今多久");
+        let ok = report_of(&manager, &name);
+        assert!(
+            ok.contains("距今") && ok.contains("午饭"),
+            "正常报告:\n{ok}"
+        );
+        assert!(!ok.contains("没算出来"), "{ok}");
+
+        // 把这条的日期改成空白：算不出来时要点名是哪一条、为什么，而且弹窗必须开
+        {
+            let conn = rusqlite::Connection::open(accounting::db_path()).expect("打开记账库");
+            conn.execute("UPDATE expenses SET purchase_date='' WHERE id=?1", [good])
+                .unwrap();
+        }
+        manager
+            .plugin_action(&name, &format!("days_{good}"))
+            .expect("算不出来也不该让动作失败");
+        let bad = report_of(&manager, &name);
+        assert!(
+            bad.contains("没填日期") && bad.contains(&format!("id={good}")),
+            "{bad}"
+        );
+        assert!(
+            open_modal_ids(&manager, &name).contains(&"result_modal".to_string()),
+            "没答上时弹窗必须开：旧行为是一行都不拼、弹窗也不开，按钮看着就是坏了"
+        );
+
+        // 库里没有的那个 id：同样要说话
+        manager
+            .plugin_action(&name, "days_999999")
+            .expect("查无此条也不该没反应");
+        let gone = report_of(&manager, &name);
+        assert!(gone.contains("库里没有"), "查无此条也要说一句:\n{gone}");
 
         assert!(manager.unload_plugin(&name));
         drop(tmp);

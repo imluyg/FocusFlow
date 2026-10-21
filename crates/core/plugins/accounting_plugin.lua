@@ -358,11 +358,17 @@ function on_action(id)
         -- 支持多选：id 形如 days_42,43
         local list = id:sub(6)
         local lines = {}
+        local misses = {}
+        local asked = 0
         for rid in list:gmatch("([^,]+)") do
             local n = tonumber(rid)
             if n then
+                asked = asked + 1
                 local rec = focusflow.accounting_get(n)
-                local data = focusflow.accounting_days_ago({ n })
+                -- 第二个值是「这一条为什么没答上」：原先宿主只交答案，没命中就一行都不拼，
+                -- 而下面那句 `result_text ~= ""` 才开弹窗 ⇒ "没填日期"、"库被别处占着"、
+                -- "这条已被删掉" 三种结局在用户眼里都是"这个按钮按了没反应"。
+                local data, why = focusflow.accounting_days_ago({ n })
                 if data and data[1] then
                     local d = data[1]
                     local name = (rec and rec["item"]) or ("#" .. tostring(n))
@@ -372,6 +378,22 @@ function on_action(id)
                         lines[#lines + 1] = "《" .. name .. "》 距今 " .. d["days"] .. " 天"
                     end
                 end
+                -- 宿主交回的原因一律贴出来：就算这一条答上了，它同时说的话也不能被丢掉
+                for _, w in ipairs(why or {}) do
+                    misses[#misses + 1] = w
+                end
+            else
+                misses[#misses + 1] = "选中的编号「" .. tostring(rid) .. "」不是数字，没去查"
+            end
+        end
+        if asked == 0 and #misses == 0 then
+            misses[#misses + 1] = "没有选中任何记录：先在列表里点一行，再按「距今多久」"
+        end
+        if #misses > 0 then
+            lines[#lines + 1] = ""
+            lines[#lines + 1] = "这几条没算出来："
+            for _, w in ipairs(misses) do
+                lines[#lines + 1] = "  " .. w
             end
         end
         result_text = table.concat(lines, "\n")
