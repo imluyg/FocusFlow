@@ -556,38 +556,76 @@ fn record_import_marker(
 /// "目标库已存在"走合并分支**，读的就是这份残缺的新库。回滚之后状态与导入前一致，
 /// 那句"请重试"才真的成立。回滚成功时把 `backed_up_aux` 里那条撤掉 —— 那份文件已经
 /// 回到正名上，再报"给你留了一份备份"就是让人去删一个不存在的文件。
+///
+/// 顺序是这份报告能不能说实话的关键：**先把主库 rename 回去，再搬 sidecar**。
+/// 旧顺序反过来（先搬 `-wal`/`-shm`，最后才 rename 主库），于是主库那一步失败时
+/// 留档已经只剩一个光杆主库 —— 而那句错误提示写的是「导入前那份**完整**留在 …，
+/// 请手工改回原名」，照着做等于把主库与它的 WAL 拆开：正是 `backup_before_overwrite`
+/// 的注释禁止的那个状态（"留在原位等于让下次打开按错配的 WAL 去恢复"）。
 fn restore_after_failed_copy(
     summary: &mut ImportSummary,
     dst: &Path,
     kept: &Option<std::path::PathBuf>,
 ) {
-    let _ = std::fs::remove_file(dst);
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(crate::data_location::with_suffix(dst, suffix));
-    }
-    let Some(kept_path) = kept else { return };
-    for suffix in ["-wal", "-shm"] {
-        let from = crate::data_location::with_suffix(kept_path, suffix);
-        if from.exists() {
-            let _ = std::fs::rename(&from, crate::data_location::with_suffix(dst, suffix));
+    // 半套新库删不掉也要说出来：它留在原地，下一次导入就会当"目标库已存在"去读它
+    let mut leftover: Vec<String> = Vec::new();
+    if let Err(e) = std::fs::remove_file(dst) {
+        if dst.exists() {
+            leftover.push(format!("删不掉残缺的 {}: {e}", dst.display()));
         }
     }
-    match std::fs::rename(kept_path, dst) {
-        Ok(()) => {
-            let kept_text = kept_path.display().to_string();
-            if let Some(i) = summary.backed_up_aux.iter().position(|p| *p == kept_text) {
-                summary.backed_up_aux.remove(i);
+    for suffix in ["-wal", "-shm"] {
+        let half = crate::data_location::with_suffix(dst, suffix);
+        if let Err(e) = std::fs::remove_file(&half) {
+            if half.exists() {
+                leftover.push(format!("删不掉残缺的 {}: {e}", half.display()));
             }
-            summary.errors.push(format!(
-                "已回滚到导入前的那份 {}，本次未导入",
-                dst.display()
-            ));
         }
-        Err(e) => summary.errors.push(format!(
-            "回滚失败（{e}）：导入前那份完整留在 {}，请手工改回原名",
-            kept_path.display()
-        )),
     }
+    let Some(kept_path) = kept else {
+        summary.errors.extend(leftover);
+        return;
+    };
+    // 主库先回位：这一步成了，留档那一侧才允许被动
+    let main_back = match std::fs::rename(kept_path, dst) {
+        Ok(()) => true,
+        Err(e) => {
+            summary.errors.push(format!(
+                "回滚失败（{e}）：导入前那一份还留在 {}，本次未导入 —— 它旁边的 -wal/-shm \
+                 没有动过，仍然在一起；先让这两个名字都能用（残缺的那份如果删不掉，下面会\
+                 单独说），再手工把它改回原名",
+                kept_path.display()
+            ));
+            false
+        }
+    };
+    if main_back {
+        let kept_text = kept_path.display().to_string();
+        if let Some(i) = summary.backed_up_aux.iter().position(|p| *p == kept_text) {
+            summary.backed_up_aux.remove(i);
+        }
+        summary.errors.push(format!(
+            "已回滚到导入前的那份 {}，本次未导入",
+            dst.display()
+        ));
+        // sidecar 跟着回位；搬不动的那一个必须点名 —— 只搬回主库等于交回一个缺 WAL 尾巴的库
+        for suffix in ["-wal", "-shm"] {
+            let from = crate::data_location::with_suffix(kept_path, suffix);
+            if !from.exists() {
+                continue;
+            }
+            let to = crate::data_location::with_suffix(dst, suffix);
+            if let Err(e) = std::fs::rename(&from, &to) {
+                leftover.push(format!(
+                    "{} 搬不回 {} 旁边（{e}）：那一段未 checkpoint 的记录还留在原地，\
+                     手工处理时要把它一起挪",
+                    from.display(),
+                    dst.display(),
+                ));
+            }
+        }
+    }
+    summary.errors.extend(leftover);
 }
 
 /// 导入标记：源文件指纹 + 上次导入时源库 key_log 的内容指纹。
@@ -1039,5 +1077,100 @@ mod tests {
             again
         );
         assert_eq!(daily_total(), 100, "重导同内容不得把那一年翻倍");
+    }
+
+    /// 回滚那一步：留档的主库与它的 WAL 必须**一起**回位，且每一步的成败都要说实话。
+    ///
+    /// 旧顺序先 rename `-wal`/`-shm`、最后才搬主库；主库那一步失败时留档已经只剩光杆
+    /// 主库，而提示写的是「导入前那份**完整**留在 …，请手工改回原名」—— 照着做就是把
+    /// 主库与它的 WAL 拆开（`backup_before_overwrite` 的注释正禁止这个状态：缺了配套
+    /// WAL 的主库会让下一次打开按错配的尾巴去恢复）。
+    fn rollback_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ff_mig_rollback_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("临时目录该建得出来");
+        let dst = dir.join("focusflow_aux.db");
+        let kept = dir.join("focusflow_aux.db.kept-20260101");
+        std::fs::write(&dst, "半套的新库".as_bytes()).unwrap();
+        std::fs::write(
+            crate::data_location::with_suffix(&dst, "-wal"),
+            "半套的 wal".as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(&kept, "导入前那一份".as_bytes()).unwrap();
+        std::fs::write(
+            crate::data_location::with_suffix(&kept, "-wal"),
+            "没 checkpoint 的记录".as_bytes(),
+        )
+        .unwrap();
+        (dir, dst, kept)
+    }
+
+    #[test]
+    fn a_finished_rollback_puts_the_main_db_and_its_wal_back_together() {
+        let (dir, dst, kept) = rollback_fixture("ok");
+        let mut summary = ImportSummary::default();
+        summary.backed_up_aux.push(kept.display().to_string());
+
+        restore_after_failed_copy(&mut summary, &dst, &Some(kept.clone()));
+
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            "导入前那一份".as_bytes().to_vec(),
+            "主库要回到正名上"
+        );
+        assert_eq!(
+            std::fs::read(crate::data_location::with_suffix(&dst, "-wal")).unwrap(),
+            "没 checkpoint 的记录".as_bytes().to_vec(),
+            "配套 WAL 必须跟着回位，否则下次打开按错配的尾巴恢复"
+        );
+        assert!(!kept.exists() && !crate::data_location::with_suffix(&kept, "-wal").exists());
+        assert!(
+            summary.backed_up_aux.is_empty(),
+            "已经回到正名的那份不该再报成\"给你留了备份\""
+        );
+        let text = summary.errors.join("\n");
+        assert!(text.contains("已回滚"), "实得: {text}");
+        assert!(!text.contains("搬不回"), "全搬回来了不该再有抱怨: {text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 主库搬不回去时：留档那一侧**一个字都不许动**，提示也不许说"完整"。
+    ///
+    /// 这一臂是顺序的探针：旧顺序在这条路上已经先把留档的 `-wal` 搬走了，于是
+    /// "手工改回原名"会拿到一份没有 WAL 的主库。
+    #[test]
+    fn a_failed_rollback_leaves_the_archive_untouched_and_says_so() {
+        let (dir, dst, kept) = rollback_fixture("blocked");
+        // 让主库那一步 rename 必失败：正名上先放一个**非空目录**挡着
+        // （空目录会被当成"搬进去"，这一步就成了成功 —— 夹具要挡的是失败那条路）
+        std::fs::remove_file(&dst).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("挡住"), "非空").unwrap();
+        let kept_wal = crate::data_location::with_suffix(&kept, "-wal");
+
+        let mut summary = ImportSummary::default();
+        restore_after_failed_copy(&mut summary, &dst, &Some(kept.clone()));
+
+        assert!(
+            kept.exists() && kept_wal.exists(),
+            "主库没能回位时，留档的主库与它的 WAL 都该还在原地（旧顺序会先把 WAL 搬走）；\
+             实得 kept={} wal={} errors={:?}",
+            kept.exists(),
+            kept_wal.exists(),
+            summary.errors
+        );
+        let text = summary.errors.join("\n");
+        assert!(text.contains("回滚失败"), "实得: {text}");
+        assert!(
+            !text.contains("完整"),
+            "没能证明它完整就不许说「完整」，实得: {text}"
+        );
+        // 挡路的目录也算"残缺没删掉"：下一次导入会把它当成目标库
+        assert!(
+            text.contains("删不掉"),
+            "正名上删不掉的东西必须点名，实得: {text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
