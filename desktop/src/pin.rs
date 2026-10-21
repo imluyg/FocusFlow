@@ -240,20 +240,24 @@ fn live_pins(app: &AppHandle) -> Vec<(String, WebviewWindow)> {
 /// - **比请求大**（就是上面那 120px 地板）＝多出一条底色边，图本身仍然 1:1
 ///   （页面按图像物理尺寸画，不铺满视口，见 pin.js），所以只 `debug`，
 ///   免得每滚一次轮就刷一行 warn。
-fn apply_pin_size(win: &WebviewWindow, width: u32, height: u32) {
+///
+/// 只有 `set_size` 本身失败才返回 `Err`：那是"这次缩放没发生"，调用方（缩放命令）
+/// 必须把它交给页面，别让界面把百分比改成新值而窗口还停在旧尺寸。`inner_size`
+/// 读不到只是"量不了"，不等于没设成；尺寸偏差也不是失败。
+fn apply_pin_size(win: &WebviewWindow, width: u32, height: u32) -> Result<(), String> {
     if let Err(e) = win.set_size(PhysicalSize::new(width, height)) {
         tracing::warn!("贴图窗口设尺寸失败：{e}");
-        return;
+        return Err(format!("贴图窗口设尺寸失败：{e}"));
     }
     let got = match win.inner_size() {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!("读不到贴图窗口客户区尺寸：{e}");
-            return;
+            return Ok(());
         }
     };
     if got.width == width && got.height == height {
-        return;
+        return Ok(());
     }
     if got.width < width || got.height < height {
         tracing::warn!(
@@ -269,6 +273,7 @@ fn apply_pin_size(win: &WebviewWindow, width: u32, height: u32) {
             got.height
         );
     }
+    Ok(())
 }
 
 /// 在主线程建出贴图窗口。**只能由 `open()` 经 `run_on_main_thread` 调进来。**
@@ -279,7 +284,14 @@ fn apply_pin_size(win: &WebviewWindow, width: u32, height: u32) {
 /// ⚠ 第二个参数的写法有讲究：`lib.rs` 的窗口审计按 `format!("{PIN_LABEL_PREFIX}{…}")`
 /// 这个形状解出动态 label（解不出就 panic 而不是静默漏掉）。换成先 `let label = …`
 /// 再把变量传进来，那条审计就看不见这个建窗点了。
-fn build_pin(app: &AppHandle, seq: u32, x: i32, y: i32) -> Result<WebviewWindow, String> {
+fn build_pin(
+    app: &AppHandle,
+    seq: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<WebviewWindow, String> {
     let win = tauri::WebviewWindowBuilder::new(
         app,
         format!("{PIN_LABEL_PREFIX}{seq}"),
@@ -307,6 +319,12 @@ fn build_pin(app: &AppHandle, seq: u32, x: i32, y: i32) -> Result<WebviewWindow,
     if let Err(e) = win.set_position(PhysicalPosition::new(x, y)) {
         close_failed_pin(&win);
         return Err(format!("设置贴图位置失败：{e}"));
+    }
+    // 尺寸也要在 show 之前定好：建窗用的是 240x180 占位，若设尺寸失败还照常显示，
+    // 用户会先看到一张被裁掉大半的图；这里失败就直接收掉窗口。
+    if let Err(e) = apply_pin_size(&win, width, height) {
+        close_failed_pin(&win);
+        return Err(e);
     }
     if let Err(e) = win.show() {
         close_failed_pin(&win);
@@ -383,9 +401,7 @@ pub fn open(
     let handle = app.clone();
     let t_build = std::time::Instant::now();
     if let Err(e) = app.run_on_main_thread(move || {
-        let result = build_pin(&handle, seq, x, y).map(|win| {
-            apply_pin_size(&win, width, height);
-        });
+        let result = build_pin(&handle, seq, x, y, width, height).map(|_| ());
         if let Err(e) = tx.send(result) {
             // 通道挂了只可能是调用方已经不在了（进程正在退）：窗口留给系统收，别再重试。
             tracing::warn!("贴图窗口建完但结果送不回去：{e:?}");
@@ -448,7 +464,12 @@ pub async fn pin_take(win: WebviewWindow) -> Result<PinPayload, String> {
     // 「Tauri 同步命令在主线程」）。两个诉求拆开，各走自己那条在本仓已经跑通过的路。
     let w = win.clone();
     let (width, height) = (payload.width, payload.height);
-    if let Err(e) = win.run_on_main_thread(move || apply_pin_size(&w, width, height)) {
+    if let Err(e) = win.run_on_main_thread(move || {
+        if let Err(e) = apply_pin_size(&w, width, height) {
+            // 重申失败不拦取图：建窗那一次已按同样尺寸摆过，页面照样有图可画。
+            tracing::warn!("贴图取图时重申尺寸失败：{e}（沿用建窗时那一次）");
+        }
+    }) {
         // 摆不成不算失败：建窗那一次已经按同样的尺寸摆过，页面照样有图可画。
         tracing::warn!("贴图取图时重申尺寸没派发到主线程：{e}（沿用建窗时那一次）");
     }
@@ -482,7 +503,7 @@ pub fn pin_resize(win: WebviewWindow, scale: f64, dir: i32) -> Result<(f64, u32,
     };
     let applied = zoom_step(scale, dir);
     let (w, h) = pin_size(width, height, applied)?;
-    apply_pin_size(&win, w, h);
+    apply_pin_size(&win, w, h)?;
     Ok((applied, w, h))
 }
 
@@ -745,6 +766,14 @@ mod tests {
         assert!(
             !body.contains("png_base64"),
             "缩放不需要那几个字节的 base64"
+        );
+        assert!(
+            body.contains("apply_pin_size(&win, w, h)?"),
+            "设尺寸失败必须交给页面，不能更新一个假的百分比"
+        );
+        assert!(
+            !body.contains("apply_pin_size(&win, w, h);"),
+            "又吞掉设尺寸失败、只 warn 一句就报成功"
         );
     }
 
