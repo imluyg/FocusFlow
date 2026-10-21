@@ -303,7 +303,18 @@ impl DbWriter {
         // 两次 `Local::now()` 要是正好跨午夜，两半读的根本不是同一天。
         let (today_base_count, today_base_active) = {
             let dk = queries::day_key_of_date(chrono::Local::now().date_naive());
-            let (count, seconds) = today_landed_totals(dk);
+            let (count, seconds) = match today_landed_totals(dk) {
+                Some(v) => v,
+                // 启动这一刻没有别的已知量可用，只能从 0 起 —— 但这句必须说清它代价是什么：
+                // 今日会从这一刻的按键开始计，要等下次重锚（导入/重新统计/跨午夜）才补回整天。
+                None => {
+                    tracing::error!(
+                        "启动时的今日基准读不出来：今日会从这一刻的按键开始计，\
+                         直到下一次重锚才补回整天的量"
+                    );
+                    (0, 0)
+                }
+            };
             (count.max(0) as u64, seconds.max(0) as u64)
         };
         // 启动回放：上次进程异常终止时写入的未落库增量（若存在）并入内存聚合，
@@ -607,7 +618,7 @@ impl DbWriter {
         let agg = self.state.agg.lock().unwrap_or_else(|e| e.into_inner());
         let pending_count = agg.daily.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
         let pending_active = agg.active.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
-        let (count, seconds) = today_landed_totals(today_dk);
+        let landed = today_landed_totals(today_dk);
         // 锁到这一步才放：上面那句读库必须和"读内存增量"取同一瞬间的状态
         let base_count = self.state.today_count.load(Ordering::Relaxed);
         let base_active = self.state.today_active.load(Ordering::Relaxed);
@@ -619,12 +630,25 @@ impl DbWriter {
         // 例如 --reset 之后）。超时 → 那批增量可能已被写线程从 agg 里取走、正卡在重试
         // （既不在库里也不在 agg 里），而内存基准**是含它的** → 只能取 max，
         // 让今日只会追平、不会倒退。
-        let landed_count = count.max(0) as u64 + pending_count;
-        let landed_active = seconds.max(0) as u64 + pending_active;
-        let (new_count, new_active) = if flushed {
-            (landed_count, landed_active)
-        } else {
-            (landed_count.max(base_count), landed_active.max(base_active))
+        // 库值压根没答上来（`None`）时走同一保守分支的另一头：连 max 的左边都没有，
+        // 就保持基准不动 —— 把"读不出来"当 0 落进 store 就是今天偏一整天的开始。
+        let (new_count, new_active) = match landed {
+            Some((count, seconds)) => {
+                let landed_count = count.max(0) as u64 + pending_count;
+                let landed_active = seconds.max(0) as u64 + pending_active;
+                if flushed {
+                    (landed_count, landed_active)
+                } else {
+                    (landed_count.max(base_count), landed_active.max(base_active))
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "recompute_today_totals: 今日库值读不出来，这次不重锚（今日保持 {base_count} 次 / \
+                     {base_active} 秒）—— 上面的错误日志写了为什么；等库能读了再点一次即可补全"
+                );
+                (base_count, base_active)
+            }
         };
         self.state.today_count.store(new_count, Ordering::Relaxed);
         self.state.today_active.store(new_active, Ordering::Relaxed);
@@ -955,25 +979,38 @@ fn neutralize_recovery_file() {
     }
 }
 
-/// 今日那两个数**已经在库里的**部分：`(活跃次数, 活跃秒数)`。库读不到就是 (0, 0)。
+/// 今日那两个数**已经在库里的**部分：`Some((活跃次数, 活跃秒数))`。
+///
+/// `None` 表示"这一问没答上来"（库打不开、聚合表读不出来），它和"库里今天就是 0"
+/// 是两件相反的事：拿着 `None` 当 0 重锚，会把内存里本来**正确**的今日基准压成 0，
+/// 而那两个缓存之后只往上加 —— 今日整天偏小，「总计」卡片与悬浮窗跟着偏，
+/// 且没有任何一行日志说它少算了。调用方拿到 `None` 时必须"保持原样"，不是"按 0 重锚"。
 ///
 /// 这条 SQL 只许有一份：`start()`（启动时的今日基准）、`recompute_today_totals`
 /// （外部调，先 flush 再读）与 [`reanchor_today`]（写线程自己调，不等 flush）算的是同一个量，
 /// 两处各写一遍就是本仓那个"一把尺子抄多处、改一漏一"的老形状 —— 而抄的那两份还各自
 /// 开一次连接、各折一次 0，于是"一半读不到"会锚出半对半错的今日。
-fn today_landed_totals(today_dk: i64) -> (i64, i64) {
-    connection::open_ro(&paths::current_year_db_path())
-        .ok()
-        .and_then(|conn| {
-            conn.query_row(
-                "SELECT COALESCE(SUM(count), 0), COALESCE(SUM(seconds), 0) \
-                 FROM daily_counts WHERE date_key = ?1",
-                [today_dk],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-            )
-            .ok()
-        })
-        .unwrap_or((0, 0))
+fn today_landed_totals(today_dk: i64) -> Option<(i64, i64)> {
+    let path = paths::current_year_db_path();
+    let conn = match connection::open_ro(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("今日库值读不出来：{} 开不起来: {e}", path.display());
+            return None;
+        }
+    };
+    match conn.query_row(
+        "SELECT COALESCE(SUM(count), 0), COALESCE(SUM(seconds), 0) \
+         FROM daily_counts WHERE date_key = ?1",
+        [today_dk],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    ) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::error!("今日库值读不出来（date_key={today_dk}）: {e}");
+            None
+        }
+    }
 }
 
 /// 写线程自己用的"今日"重锚：把三个缓存按 **库里的今日聚合 + 内存里未落库的今日增量**
@@ -997,8 +1034,22 @@ fn reanchor_today(state: &WriterState) {
     let agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
     let pending_count = agg.daily.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
     let pending_active = agg.active.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
-    let (count, seconds) = today_landed_totals(today_dk);
+    let landed = today_landed_totals(today_dk);
     drop(agg);
+    // 读不出来时**什么都不写**：把 `None` 当 0 用，等于把整天已经落库的活跃数从今日里
+    // 抹掉，而这两个缓存之后只往上加 —— 一次瞬时读不动就让今日整天偏小，且没人知道。
+    // 保持原样最多让今日多带着上一天的数（日期键已经先立好了，见上面那段），
+    // 等下一次能读时重锚就正过来。
+    let (count, seconds) = match landed {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                "跨午夜重锚这一拍没做成：今日库值读不出来，内存基准保持原样（{pending_count} 次增量已含）；\
+                 下一次能读到时会重新对齐"
+            );
+            return;
+        }
+    };
     state
         .today_count
         .store(count.max(0) as u64 + pending_count, Ordering::Relaxed);
@@ -1973,6 +2024,91 @@ mod tests {
         }
         w.stop_and_wait();
         assert!(w.today_count() >= 5, "落库之后今日计数更不能倒退");
+    }
+
+    /// 「库里今天就是 0」与「今天这一问读不出来」必须是两个答案。
+    ///
+    /// 原先两者都回 `(0, 0)`：三个调用方拿着它重锚今日基准，于是一次瞬时读不动就把
+    /// 整天已经落库的活跃数抹成 0 —— 而那两个缓存之后只往上加，一整天补不回来，
+    /// 日志零字。这里用"聚合表读不出来"造那一臂（瞬间失败，不用等 busy_timeout），
+    /// 并留了反向腿：表回来之后同一个问题要能重新答出 `(0, 0)`。
+    #[test]
+    fn landed_today_totals_separates_zero_from_unanswerable() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_landed_none");
+        let w = start_writer(Duration::from_secs(3600));
+        let dk = queries::day_key_of_date(chrono::Local::now().date_naive());
+        let year = chrono::Local::now().year();
+        // 新目录里 `start_writer` 不会先把年度库的 schema 建起来（它等到第一次写），
+        // 而这里要问的是"有这张表、只是今天还没有行" —— 先把表立起来。
+        {
+            let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+        }
+
+        // 库是好的，只是今天还没有行 ⇒ 这才是真的 0
+        connection::clear_ro_cache();
+        assert_eq!(
+            today_landed_totals(dk),
+            Some((0, 0)),
+            "没有今天的行就该答 (0, 0)"
+        );
+
+        {
+            let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+            conn.execute_batch("DROP TABLE daily_counts").unwrap();
+        }
+        connection::clear_ro_cache();
+        assert_eq!(
+            today_landed_totals(dk),
+            None,
+            "聚合表读不出来时必须交回 None，而不是「今天就是 0」"
+        );
+
+        // 反向腿：表回来之后同一个问题又能答出 (0,0) —— 上面那条不是恒真
+        {
+            let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+        }
+        connection::clear_ro_cache();
+        assert_eq!(today_landed_totals(dk), Some((0, 0)));
+        w.stop_and_wait();
+    }
+
+    /// flush 成了、库值读不出来时，重锚今日基准不许把整天压成 0。
+    ///
+    /// 这条路是设置页「重新统计」与导入之后都会走的：`flush_pending` 见到内存里
+    /// 没有增量就早退回"落成"（空批次不算失败），于是 `flushed = true`，而这一次
+    /// 的库值是 `None` —— 旧写法照样 `store(0 + 0)`，今日从这一刻起归零，
+    /// 之后只会重新累加新按键，整天偏小且没有任何一句日志。
+    #[test]
+    fn a_recompute_with_an_unreadable_day_keeps_the_baseline() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_recompute_unreadable");
+        let w = start_writer(Duration::from_secs(3600));
+        let t0 = queries::now_ts();
+        for i in 0..5 {
+            w.record("A", t0 + i);
+        }
+        w.flush(true);
+        assert_eq!(w.today_count(), 5, "前提：那 5 次已经落库并进基准");
+        let before_secs = w.today_active_seconds();
+
+        {
+            let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+            conn.execute_batch("DROP TABLE daily_counts").unwrap();
+        }
+        connection::clear_ro_cache();
+
+        w.recompute_today_totals();
+        assert_eq!(
+            w.today_count(),
+            5,
+            "库值读不出来时保持原样，不许把整天锚成 0，实得 {}",
+            w.today_count()
+        );
+        assert_eq!(w.today_active_seconds(), before_secs, "活跃时长同理");
+        w.stop_and_wait();
     }
 
     /// 恢复文件写盘失败时，增量必须仍留在内存里。
