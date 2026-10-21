@@ -482,13 +482,22 @@ pub fn archive_year_data(target_year: i32, source_year: i32) {
 /// 幂等：迁移后 `key_log` 被清空，再次调用不重复聚合。
 /// 所有年度库都会被检查（含跨年归档的旧文件与导入的旧格式文件）。
 pub fn migrate_v2() {
+    let dir = paths::data_dir();
     let mut years: Vec<i32> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(paths::data_dir()) {
-        for entry in entries.flatten() {
-            if let Some(y) = paths::is_year_db_file(&entry.path()) {
-                years.push(y);
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if let Some(y) = paths::is_year_db_file(&entry.path()) {
+                    years.push(y);
+                }
             }
         }
+        // 读不出来 ≠ 没有旧库：静默当空地跳过后，这一轮不会聚合任何 key_log，
+        // 而启动照常报成功，只有等下一条输入/下次启动才可能重试。说清是哪一步没做成。
+        Err(e) => tracing::warn!(
+            "旧数据迁移跳过：数据目录读不出来（{}）: {e} —— 本轮不会聚合任何年度库的 key_log，下次启动再试",
+            dir.display()
+        ),
     }
     years.sort_unstable();
     for year in years {
@@ -1274,8 +1283,17 @@ pub fn sweep_stale_sidecars() -> usize {
 /// 段认（`merge_device_rows`），显示不受影响，下次启动再试。
 pub fn migrate_all_year_device_keys() {
     let dir = crate::paths::data_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // 同 `migrate_v2`：读不出来不是"没有库"，这一轮一台设备都不迁；
+            // 不说的话下次启动前跨年视图里同一设备仍会分成两行。
+            tracing::warn!(
+                "设备归组键迁移跳过：数据目录读不出来（{}）: {e} —— 本轮没有迁移任何年度库，下次启动再试",
+                dir.display()
+            );
+            return;
+        }
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -3335,6 +3353,35 @@ mod tests {
             "空目录不该被算成失败: {ok:?}"
         );
         crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
+    }
+
+    /// 启动迁移的目录读失败也要出声：静默跳过下一次启动虽然会重试，但用户当时看到的
+    /// 是"旧数据没进统计"而日志一个字都没有。
+    #[test]
+    fn startup_migrations_say_why_they_skipped_an_unreadable_data_dir() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("migrate_dir_fail");
+        let blocked = paths::data_dir();
+        std::fs::remove_dir(&blocked).unwrap();
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let ((), logs) = crate::logger::capture_logs(|| {
+            migrate_v2();
+            migrate_all_year_device_keys();
+        });
+        let shown = logs.join("\n");
+        assert!(
+            shown.contains("旧数据迁移跳过") && shown.contains("数据目录读不出来"),
+            "migrate_v2 静默跳过了: {shown}"
+        );
+        assert!(
+            shown.contains("设备归组键迁移跳过"),
+            "设备归组键迁移静默跳过了: {shown}"
+        );
+        assert!(
+            shown.contains("下次启动再试"),
+            "要说清这不是永久失败、下次会重试: {shown}"
+        );
     }
 
     /// `vacuum_all` 必须交出"真的压成了几套"，`vacuum_line` 据此说话。
