@@ -143,37 +143,45 @@ pub fn init_db() -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_expenses_purchase_date ON expenses(purchase_date);",
     )?;
 
-    // 迁移：旧库 categories 表没有 subs 列 → 补列
-    let has_subs: bool = {
-        let mut stmt =
-            conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='categories'")?;
-        let sql: String = stmt.query_row([], |r| r.get(0)).unwrap_or_default();
-        sql.contains("subs")
-    };
-    // 迁移第一步：这一列有没有 —— **只补列**。
+    // 迁移第一步：这一列有没有 —— **只补列**，而且读不出来时不乱写。
     // `ALTER TABLE … ADD COLUMN` 自带提交，所以补完之后"旧表要不要合并"就不能再参考
     // 这一步做过没有：旧写法把合并整段套在 `if !has_subs` 里，一旦 ALTER 成功而后面
     // 任何一步失败（合并查询报错、UPDATE 写不动、DROP 被别的连接握着），
     // 下一次进来 `has_subs` 已为真 ⇒ 整段合并**从此不再执行**：
     // Python 时代的子分类永远进不了下拉，而旧表还躺在库里，日志只剩一行报错。
-    if !has_subs {
-        if let Err(e) = conn.execute(
-            "ALTER TABLE categories ADD COLUMN subs TEXT NOT NULL DEFAULT '[]'",
-            [],
-        ) {
-            tracing::error!("记账迁移：subs 列补不上（{e}），旧子分类这一轮没法合并，下次启动再试");
-            return Ok(());
+    //
+    // 判据原来是自己从 `sqlite_master.sql` 里数子串（`sql.contains("subs")`），
+    // 且那次读包着 `unwrap_or_default()` ⇒ 读不出来＝"这一列不存在"：于是拿着一个
+    // 本来就有这列的库去 `ADD COLUMN`，撞出一条意义不明的 duplicate column 报错，
+    // 然后**整段跳过下面的合并**。现在与别的迁移共用同一把尺子（`column_presence`）。
+    match crate::db::connection::column_presence(&conn, "categories", "subs") {
+        crate::db::connection::Presence::Yes => {}
+        crate::db::connection::Presence::No => {
+            if let Err(e) = conn.execute(
+                "ALTER TABLE categories ADD COLUMN subs TEXT NOT NULL DEFAULT '[]'",
+                [],
+            ) {
+                tracing::error!(
+                    "记账迁移：subs 列补不上（{e}），旧子分类这一轮没法合并，下次启动再试"
+                );
+                return Ok(());
+            }
+        }
+        crate::db::connection::Presence::Unreadable(why) => {
+            // 这一轮既不补列（补错就是 duplicate column）也不判"没得合并"：
+            // 真缺列的话下面那步会带着原因报错、旧表原样留着，下次启动重来。
+            tracing::warn!(
+                "记账迁移：读不出 categories 有没有 subs 这一列（{why}）—— 这一轮不补列，\
+                 合并照旧尝试，缺列会带着原因报错而不是静默跳过"
+            );
         }
     }
     // 第二步：旧表**还在**就合并（与第一步是不是刚跑过无关 ⇒ 半截迁移会被重试）。
-    let has_sub_table: bool = {
-        let mut stmt = conn.prepare(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='subcategories'",
-        )?;
-        stmt.query_row([], |r| r.get::<_, i64>(0)).unwrap_or(0) > 0
-    };
-    if has_sub_table {
-        match merge_legacy_subcategories(&conn) {
+    // 这一问原先也是折好的布尔值（`COUNT(*)` 那次读包着 `unwrap_or(0)`）：读不动就
+    // 等于"旧表没了"⇒ 整段合并被跳过，而 `init_db` 照样回 Ok ⇒ 记账的闩落下，
+    // 这一整次运行都不会再并一次，日志一个字没有。
+    match crate::db::connection::table_presence(&conn, "subcategories") {
+        crate::db::connection::Presence::Yes => match merge_legacy_subcategories(&conn) {
             Ok(orphans) => {
                 if orphans > 0 {
                     tracing::warn!(
@@ -191,7 +199,12 @@ pub fn init_db() -> anyhow::Result<()> {
                 "记账迁移：旧子分类这一轮没合并成（{e}）；旧表原样留着，下次启动再试，\
                  这一列先按没有子分类处理"
             ),
-        }
+        },
+        crate::db::connection::Presence::No => {}
+        crate::db::connection::Presence::Unreadable(why) => tracing::warn!(
+            "记账迁移：读不出旧的 subcategories 表还在不在（{why}）：这一轮不合并，\
+             Python 时代的子分类暂时进不了下拉，下次启动会再问一次"
+        ),
     }
 
     // 分类表为空时预置默认分类
@@ -2356,6 +2369,48 @@ mod tests {
             !legacy_table_still_there(),
             "并成功之后旧表要收掉，否则每次启动都重并一次"
         );
+    }
+
+    /// 「有没有 subs 这一列」要按**列名**问，不能在建表 SQL 的文本里数子串。
+    ///
+    /// 旧判据是 `sqlite_master.sql` 里 `contains("subs")`。一份没有这一列、但那句话里带着
+    /// "subs" 字样的旧库就被判成"已经有了"⇒ 不补列；之后每一次
+    /// `INSERT INTO categories (name, type, subs)` 与 `UPDATE categories SET subs=`
+    /// 都撞 "no such column: subs" —— 分类与子分类整个用不了，而 `init_db` 回的是成功、
+    /// 日志零字。旧库那一列当年叫什么我们无法保证（`subsidy`、`subscribe` 这类都会命中），
+    /// 所以这不是假想输入。
+    #[test]
+    fn a_schema_text_lookalike_still_gets_the_subs_column() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_subs_ruler");
+        {
+            let conn = open().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    type TEXT NOT NULL DEFAULT 'both',
+                    subsidy TEXT NOT NULL DEFAULT ''
+                 );
+                 INSERT INTO categories (name, type) VALUES ('游戏', 'both');",
+            )
+            .unwrap();
+        }
+
+        init_db().expect("补列这一步不该让初始化失败");
+
+        // 列真的被补上了（数子串那把尺子在这一刻还以为已经有了）
+        assert!(
+            matches!(
+                crate::db::connection::column_presence(&open().unwrap(), "categories", "subs"),
+                crate::db::connection::Presence::Yes
+            ),
+            "subs 这一列必须补上：旧库里那格叫 subsidy，不算它"
+        );
+        // 分类这条路要真的能用（旧写法在这里撞 no such column: subs）
+        let (ok, why) = add_subcategory("游戏", "梦幻西游");
+        assert!(ok, "写子分类必须成功，实得: {why}");
+        assert_eq!(get_subcategories("游戏"), vec!["梦幻西游".to_string()]);
     }
 
     /// 合并没做成时：旧表必须留着等下一次，而 `init_db` 不许因此失败。

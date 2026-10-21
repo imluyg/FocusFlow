@@ -151,12 +151,56 @@ fn apply_rw_pragmas(conn: &Connection) -> anyhow::Result<()> {
 
 /// 表是否存在。
 pub(crate) fn table_exists(conn: &Connection, table: &str) -> bool {
-    conn.query_row(
+    matches!(table_presence(conn, table), Presence::Yes)
+}
+
+/// 「有没有」的三种结局。
+///
+/// 立这条枚举的理由：`is_ok()` 与 `unwrap_or(false)` 都把"读不出来"折成"没有"，
+/// 而对迁移来说这两件事的下一步**相反** —— "没有"要补列、要合并旧表，
+/// "读不出来"则什么都不该写。折成一件事的症状是：库被别的连接握着的那一轮，
+/// 迁移把"旧表还在"读成"旧表没了"，Python 时代的子分类进不了下拉，而整次初始化
+/// 照样返回成功、日志零字。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Presence {
+    /// 确认有
+    Yes,
+    /// 确认没有（查询本身跑通了，只是没有那一行）
+    No,
+    /// 读不出来，原因带回去（调用方决定：既不按有、也不按没有）
+    Unreadable(String),
+}
+
+/// 表在不在，分得清"没有这张表"与"读不出来"。
+pub fn table_presence(conn: &Connection, table: &str) -> Presence {
+    match conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
         [table],
         |_| Ok(()),
-    )
-    .is_ok()
+    ) {
+        Ok(()) => Presence::Yes,
+        Err(rusqlite::Error::QueryReturnedNoRows) => Presence::No,
+        Err(e) => Presence::Unreadable(format!("查 {table} 这张表时读不出来: {e}")),
+    }
+}
+
+/// 表里有没有指定列，分得清"没有这一列"与"读不出来"。
+///
+/// 两处失败（prepare 与 stepping）刻意汇成**同一个出口**：分开写会留下一条用例走不到的臂 ——
+/// 坏库那份在 prepare 就先失败，探针把 stepping 那一臂折成 `No` 时用例照样绿（假覆盖）。
+pub fn column_presence(conn: &Connection, table: &str, column: &str) -> Presence {
+    // 表名来自本模块与 `accounting` 里的字面量，无注入面；用 format 而非绑定参数
+    // 是为了兼容 pragma_table_info 的参数绑定差异（沿用 `column_exists` 的理由）。
+    let read = conn
+        .prepare(&format!(
+            "SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1"
+        ))
+        .and_then(|mut stmt| stmt.exists([column]));
+    match read {
+        Ok(true) => Presence::Yes,
+        Ok(false) => Presence::No,
+        Err(e) => Presence::Unreadable(format!("读 {table} 的列清单失败: {e}")),
+    }
 }
 
 /// 只读判断某个库里有没有某张表（库/表不存在都返回 false）。用完即关。
@@ -168,14 +212,10 @@ pub fn table_exists_readonly(path: &Path, table: &str) -> bool {
 }
 
 /// 表里是否有指定列（旧形态判定用）。
+///
+/// 这条是"确认有才算有"的窄视图；要看清"读不出来"请用 [`column_presence`]。
 pub(crate) fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
-    // 表名来自本模块内的字面量，无注入面；用 format 而非绑定参数是为了兼容
-    // pragma_table_info 的参数绑定差异。
-    conn.prepare(&format!(
-        "SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1"
-    ))
-    .and_then(|mut stmt| stmt.exists([column]))
-    .unwrap_or(false)
+    matches!(column_presence(conn, table, column), Presence::Yes)
 }
 
 /// 按设备实例路径取整数 id（统计表字典化后只存 id）。
@@ -1275,5 +1315,64 @@ mod ro_pool_thread_tests {
             opens_second, 1,
             "另一个线程 clear_ro_cache() 之后，本线程必须重开连接（旧实现这里复用陈旧句柄 → 0）"
         );
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    /// 「没有这张表/这一列」与「读不出来」必须是两件事。
+    ///
+    /// 回归的落点在记账迁移：那两次探测原先包着 `unwrap_or_default()` / `unwrap_or(0)`，
+    /// 于是库被别的连接握着那一轮，"subs 列在不在"与"旧的 subcategories 表还在不在"
+    /// 都读成"没有"—— 前者去 `ADD COLUMN` 撞出一条意义不明的 duplicate column 并**整段跳过合并**，
+    /// 后者干脆静默不合并，而 `init_db` 照样回 Ok ⇒ 记账的闩落下，这一整次运行不再重试。
+    /// "读不出来"那一臂把库文件换成一份不是 SQLite 的内容（同步盘占位、半截写入那一类，
+    /// 与本仓既有的"落盘失败要这么造"同一族手法），比拿锁更确定。
+    #[test]
+    fn presence_separates_absent_from_unreadable() {
+        let dir = std::env::temp_dir().join("ff_rs_presence_probe");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("临时目录该建得出来");
+        let path = dir.join("probe.db");
+
+        let seed_db = || {
+            std::fs::remove_file(&path).ok();
+            let seed = Connection::open(&path).expect("建库失败");
+            seed.execute_batch("CREATE TABLE t (a INTEGER, b TEXT);")
+                .expect("建表失败");
+        };
+        seed_db();
+        let probe = Connection::open(&path).expect("探测连接开不起来");
+
+        // 确认有 / 确认没有
+        assert_eq!(table_presence(&probe, "t"), Presence::Yes);
+        assert_eq!(table_presence(&probe, "nope"), Presence::No);
+        assert_eq!(column_presence(&probe, "t", "a"), Presence::Yes);
+        assert_eq!(column_presence(&probe, "t", "c"), Presence::No);
+        drop(probe);
+
+        // 同一个文件被换成一份不是 SQLite 的东西（同步盘占位、半截写入那一类）：
+        // 两个探测都必须交回 Unreadable，而不是"没有这张表/这一列"
+        std::fs::write(&path, b"this is not a sqlite database at all").expect("写坏文件该成功");
+        let broken = Connection::open(&path).expect("坏库的连接也开得起来（读的时候才失败）");
+        let mut wrong: Vec<String> = Vec::new();
+        if !matches!(table_presence(&broken, "t"), Presence::Unreadable(_)) {
+            wrong.push("表在不在读不出来时被折成了有/没有".to_string());
+        }
+        if !matches!(column_presence(&broken, "t", "a"), Presence::Unreadable(_)) {
+            wrong.push("列在不在读不出来时被折成了有/没有".to_string());
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        drop(broken);
+
+        // 反向腿：文件修好之后同一个问题要能问出 Yes —— 上面那条不是恒真
+        seed_db();
+        let fixed = Connection::open(&path).expect("重开失败");
+        assert_eq!(table_presence(&fixed, "t"), Presence::Yes);
+        assert_eq!(column_presence(&fixed, "t", "b"), Presence::Yes);
+        drop(fixed);
+        std::fs::remove_dir_all(&dir).expect("临时库该收得掉");
     }
 }
