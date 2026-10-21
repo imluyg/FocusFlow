@@ -763,10 +763,12 @@ pub fn register_host_api(
     )?;
     host.set("accounting_update", acc_update)?;
 
-    // 月度汇总（含分类明细）：返回 (支出, 收入, 条数, [{category, net}])
+    // 月度汇总（含分类明细）：返回 (支出, 收入, 条数, [{category, net}], 没读全的原因)。
+    // 最后那个值空串才许面板把这几个数当成这个月的结论 —— 读不出来的账不能印成
+    // 「总支出 0.00 / 记录数 0 /（本月暂无分类明细）」。
     let acc_monthly = lua.create_function(|lua, ym: String| {
         ensure_accounting_db();
-        let (expense, income, count, cat_stats) = accounting::monthly_summary_detail(&ym);
+        let (expense, income, count, cat_stats, gap) = accounting::monthly_summary_detail(&ym);
         let t = lua.create_table()?;
         for (i, (cat, net)) in cat_stats.iter().enumerate() {
             let row = lua.create_table()?;
@@ -774,14 +776,14 @@ pub fn register_host_api(
             row.set("net", *net)?;
             t.set(i + 1, row)?;
         }
-        Ok((expense, income, count, t))
+        Ok((expense, income, count, t, gap))
     })?;
     host.set("accounting_monthly_detail", acc_monthly)?;
 
-    // 分类盈亏：返回 [{category, invested, earned, count}]
+    // 分类盈亏：返回 ([{category, invested, earned, count}], 没读全的原因)
     let acc_cat_profit = lua.create_function(|lua, ()| {
         ensure_accounting_db();
-        let data = accounting::category_profit_loss();
+        let (data, gap) = accounting::category_profit_loss();
         let t = lua.create_table()?;
         for (i, (cat, inv, earn, cnt)) in data.iter().enumerate() {
             let row = lua.create_table()?;
@@ -791,14 +793,14 @@ pub fn register_host_api(
             row.set("count", *cnt)?;
             t.set(i + 1, row)?;
         }
-        Ok(t)
+        Ok((t, gap))
     })?;
     host.set("accounting_category_profit", acc_cat_profit)?;
 
-    // 细分盈亏：返回 [{subcategory, invested, earned, count}]
+    // 细分盈亏：返回 ([{subcategory, invested, earned, count}], 没读全的原因)
     let acc_sub_profit = lua.create_function(|lua, cat: String| {
         ensure_accounting_db();
-        let data = accounting::subcategory_profit_loss(&cat);
+        let (data, gap) = accounting::subcategory_profit_loss(&cat);
         let t = lua.create_table()?;
         for (i, (sub, inv, earn, cnt)) in data.iter().enumerate() {
             let row = lua.create_table()?;
@@ -808,7 +810,7 @@ pub fn register_host_api(
             row.set("count", *cnt)?;
             t.set(i + 1, row)?;
         }
-        Ok(t)
+        Ok((t, gap))
     })?;
     host.set("accounting_subcategory_profit", acc_sub_profit)?;
 

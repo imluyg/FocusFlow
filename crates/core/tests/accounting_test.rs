@@ -300,7 +300,8 @@ fn profit_and_days_ago() {
     add("2026-08-04", "支出", "地铁", 5.0, "交通", "");
 
     // 分类盈亏：餐饮 投入40 赚取100 记录3；交通 投入5 记录1
-    let profits = accounting::category_profit_loss();
+    let (profits, gap1) = accounting::category_profit_loss();
+    assert!(gap1.is_empty(), "读全了不该带原因: {gap1}");
     let din: Vec<_> = profits.iter().filter(|(c, _, _, _)| c == "餐饮").collect();
     assert_eq!(din.len(), 1);
     let (_, inv, earn, cnt) = din[0];
@@ -309,14 +310,16 @@ fn profit_and_days_ago() {
     assert_eq!(*cnt, 3);
 
     // 细分盈亏：餐饮下 早餐类 投入10 赚取100
-    let subs = accounting::subcategory_profit_loss("餐饮");
+    let (subs, gap2) = accounting::subcategory_profit_loss("餐饮");
+    assert!(gap2.is_empty(), "读全了不该带原因: {gap2}");
     let brk: Vec<_> = subs.iter().filter(|(s, _, _, _)| s == "早餐类").collect();
     assert_eq!(brk.len(), 1);
     assert_eq!(brk[0].1, 10.0);
     assert_eq!(brk[0].2, 100.0);
 
     // 月度汇总明细（当月 8 月）
-    let (expense, income, count, stats) = accounting::monthly_summary_detail("2026-08");
+    let (expense, income, count, stats, gap3) = accounting::monthly_summary_detail("2026-08");
+    assert!(gap3.is_empty(), "读全了不该带原因: {gap3}");
     assert_eq!(expense, 45.0);
     assert_eq!(income, 100.0);
     assert_eq!(count, 4);
@@ -371,7 +374,7 @@ fn monthly_totals_sum_in_cents_not_floats() {
 
     // 分类净额：收 0.3 对支 0.1+0.2，必须恰好抵消成 0.00
     add("2026-04-03", "收入", "c", 0.3, "吃饭", "");
-    let (_, _, _, cats) = accounting::monthly_summary_detail("2026-04");
+    let (_, _, _, cats, _) = accounting::monthly_summary_detail("2026-04");
     let net = cats
         .iter()
         .find(|(c, _)| c == "吃饭")

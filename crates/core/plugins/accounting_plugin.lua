@@ -200,6 +200,18 @@ local function reset_stale_filters()
     end
 end
 
+-- 汇总类报告的「这份数能不能当结论」头一句。三个读数口（月度汇总、分类盈亏、细分盈亏）
+-- 都从这里出声：一次读不动不许被印成一份格式完整的零报告 —— 那等于对用户说
+-- 「这个月没花钱」「这些分类一条记录都没有」，而宿主根本没读到。
+-- 交回 `true` = 这次没读全，调用方据此别再往下说「暂无数据」那两句结论。
+local function gap_head(lines, gap)
+    if gap == nil or gap == "" then
+        return false
+    end
+    lines[#lines + 1] = "  这份数没读全：" .. tostring(gap)
+    return true
+end
+
 function on_action(id)
     if id == PANEL_CLOSED then
         reset_transient_state()
@@ -365,44 +377,55 @@ function on_action(id)
         result_text = table.concat(lines, "\n")
     elseif id == "monthly_detail" then
         local ym = os.date("%Y-%m")
-        local expense, income, count, stats = focusflow.accounting_monthly_detail(ym)
-        local lines = {
-            "【" .. ym .. " 月度汇总】",
-            "  总支出：" .. fmt2(expense),
-            "  总收入：" .. fmt2(income),
-            "  净额：" .. fmt_net(income - expense),
-            "  记录数：" .. tostring(count),
-            "",
-        }
+        local expense, income, count, stats, gap = focusflow.accounting_monthly_detail(ym)
+        local lines = { "【" .. ym .. " 月度汇总】" }
+        local partial = gap_head(lines, gap)
+        lines[#lines + 1] = "  总支出：" .. fmt2(expense)
+        lines[#lines + 1] = "  总收入：" .. fmt2(income)
+        lines[#lines + 1] = "  净额：" .. fmt_net(income - expense)
+        lines[#lines + 1] = "  记录数：" .. tostring(count)
+        lines[#lines + 1] = ""
         if stats and #stats > 0 then
             lines[#lines + 1] = "分类明细（净额，收入为正/支出为负）："
             for _, s in ipairs(stats) do
                 lines[#lines + 1] = "  " .. s["category"] .. ": " .. fmt_net(s["net"])
             end
+        elseif partial then
+            -- 没读全的那一次不许说「本月暂无」：库里可能正躺着这个月的明细
+            lines[#lines + 1] = "分类明细这一次没列出来（见上面那句原因），这不算「本月没有明细」"
         else
             lines[#lines + 1] = "（本月暂无分类明细）"
         end
         result_text = table.concat(lines, "\n")
     elseif id == "cat_profit" then
-        local data = focusflow.accounting_category_profit()
-        local lines = { "【分类盈亏统计】", "" }
-        local total_inv, total_earn = 0, 0
-        for _, d in ipairs(data or {}) do
-            total_inv = total_inv + d["invested"]
-            total_earn = total_earn + d["earned"]
-        end
-        lines[#lines + 1] = "  总投入：" .. fmt2(total_inv) .. "  总赚取：" .. fmt2(total_earn) .. "  净额：" .. fmt_net(total_earn - total_inv)
-        lines[#lines + 1] = ""
-        if data and #data > 0 then
-            for _, d in ipairs(data) do
-                local net = d["earned"] - d["invested"]
-                lines[#lines + 1] = string.format(
-                    "  %-12s 投入 %10s  赚取 %10s  净额 %10s  记录 %d",
-                    d["category"], fmt2(d["invested"]), fmt2(d["earned"]), fmt_net(net), d["count"]
-                )
-            end
+        local data, gap = focusflow.accounting_category_profit()
+        data = data or {}
+        local lines = { "【分类盈亏统计】" }
+        local partial = gap_head(lines, gap)
+        if #data == 0 and partial then
+            -- 一条都没读到 ⇒ 既不给「总投入 0.00」也不写「暂无数据」：那两句都是结论，
+            -- 而这一次宿主压根没读到（库被占住 / 文件读不动）。
+            lines[#lines + 1] = "  这一次一条都没读到：这里不给合计，也不说「暂无数据」"
         else
-            lines[#lines + 1] = "（暂无数据）"
+            local total_inv, total_earn = 0, 0
+            for _, d in ipairs(data) do
+                total_inv = total_inv + d["invested"]
+                total_earn = total_earn + d["earned"]
+            end
+            lines[#lines + 1] = ""
+            lines[#lines + 1] = "  总投入：" .. fmt2(total_inv) .. "  总赚取：" .. fmt2(total_earn) .. "  净额：" .. fmt_net(total_earn - total_inv)
+            lines[#lines + 1] = ""
+            if #data > 0 then
+                for _, d in ipairs(data) do
+                    local net = d["earned"] - d["invested"]
+                    lines[#lines + 1] = string.format(
+                        "  %-12s 投入 %10s  赚取 %10s  净额 %10s  记录 %d",
+                        d["category"], fmt2(d["invested"]), fmt2(d["earned"]), fmt_net(net), d["count"]
+                    )
+                end
+            else
+                lines[#lines + 1] = "（暂无数据）"
+            end
         end
         result_text = table.concat(lines, "\n")
     elseif id == "cancel_edit" then
@@ -420,25 +443,32 @@ function on_action(id)
             result_text = "请先在弹窗中选择分类"
             return
         end
-        local data = focusflow.accounting_subcategory_profit(cat)
-        local lines = { "【" .. cat .. " - 细分盈亏】", "" }
-        local total_inv, total_earn = 0, 0
-        for _, d in ipairs(data or {}) do
-            total_inv = total_inv + d["invested"]
-            total_earn = total_earn + d["earned"]
-        end
-        lines[#lines + 1] = "  总投入：" .. fmt2(total_inv) .. "  总赚取：" .. fmt2(total_earn) .. "  净额：" .. fmt_net(total_earn - total_inv)
-        lines[#lines + 1] = ""
-        if data and #data > 0 then
-            for _, d in ipairs(data) do
-                local net = d["earned"] - d["invested"]
-                lines[#lines + 1] = string.format(
-                    "  %-14s 投入 %10s  赚取 %10s  净额 %10s  记录 %d",
-                    d["subcategory"], fmt2(d["invested"]), fmt2(d["earned"]), fmt_net(net), d["count"]
-                )
-            end
+        local data, gap = focusflow.accounting_subcategory_profit(cat)
+        data = data or {}
+        local lines = { "【" .. cat .. " - 细分盈亏】" }
+        local partial = gap_head(lines, gap)
+        if #data == 0 and partial then
+            lines[#lines + 1] = "  这一次一条都没读到：这里不给合计，也不说「暂无数据」"
         else
-            lines[#lines + 1] = "（暂无数据）"
+            local total_inv, total_earn = 0, 0
+            for _, d in ipairs(data) do
+                total_inv = total_inv + d["invested"]
+                total_earn = total_earn + d["earned"]
+            end
+            lines[#lines + 1] = ""
+            lines[#lines + 1] = "  总投入：" .. fmt2(total_inv) .. "  总赚取：" .. fmt2(total_earn) .. "  净额：" .. fmt_net(total_earn - total_inv)
+            lines[#lines + 1] = ""
+            if #data > 0 then
+                for _, d in ipairs(data) do
+                    local net = d["earned"] - d["invested"]
+                    lines[#lines + 1] = string.format(
+                        "  %-14s 投入 %10s  赚取 %10s  净额 %10s  记录 %d",
+                        d["subcategory"], fmt2(d["invested"]), fmt2(d["earned"]), fmt_net(net), d["count"]
+                    )
+                end
+            else
+                lines[#lines + 1] = "（暂无数据）"
+            end
         end
         result_text = table.concat(lines, "\n")
     elseif id == "open_manage" then

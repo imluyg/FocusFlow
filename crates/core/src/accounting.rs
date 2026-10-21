@@ -1416,79 +1416,146 @@ pub fn normalize_month(raw: &str) -> Option<String> {
     Some(format!("{y:04}-{m:02}"))
 }
 
-/// 月度汇总明细：返回 (总支出, 总收入, 条数, [(分类, 净收入)])。
-pub fn monthly_summary_detail(year_month: &str) -> (f64, f64, i64, Vec<(String, f64)>) {
+/// 汇总类读数的「这份数能不能当完整答案」：空串 = 每一个数都读出来了。
+///
+/// 三个读数口（月度汇总、分类盈亏、细分盈亏）共用这一个通道，因为面板拿到零与空列表时
+/// 说的是同一句话 —— 「这个月没花钱」「（暂无数据）」，而那一次可能什么都没读到。
+/// 口径与上一轮的 `get_all_categories`、本文件的 `collect_expenses` 一致：读不出来的
+/// 那一部分必须点名，不许折进一份格式完整的报告里。
+#[derive(Default)]
+struct ReadGaps(Vec<String>);
+
+impl ReadGaps {
+    fn push(&mut self, why: impl Into<String>) {
+        self.0.push(why.into());
+    }
+
+    /// 收口：读全了交空串；没读全就留一条 error 并交出那句话，让调用方据此**不下结论**。
+    fn finish(self, what: &str) -> String {
+        if self.0.is_empty() {
+            return String::new();
+        }
+        let gap = self.0.join("；");
+        tracing::error!(
+            "记账读数（{what}）没读全：{gap} —— 零与空列表这一次不是结论，界面不许把它们念成结论"
+        );
+        gap
+    }
+}
+
+/// 月度汇总明细：`(总支出, 总收入, 条数, [(分类, 净收入)], 没读全的原因)`。
+///
+/// 最后一个值是空串才许面板说「这个月就这样」。原先 `open()` 失败折成
+/// `(0.0, 0.0, 0, [])`、三个合计各写一处 `unwrap_or`、分类明细那一圈
+/// `if let Ok(..)` 没有 else 且行级失败整行丢掉 ⇒ 一次瞬时读不动就印出
+/// 「总支出 0.00 / 记录数 0 / （本月暂无分类明细）」，而隔壁列表同一帧正写着「共 37 条」。
+pub fn monthly_summary_detail(year_month: &str) -> (f64, f64, i64, Vec<(String, f64)>, String) {
+    let mut gaps = ReadGaps::default();
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return (0.0, 0.0, 0, Vec::new()),
+        Err(e) => {
+            gaps.push(format!("记账库打不开: {e}"));
+            return (0.0, 0.0, 0, Vec::new(), gaps.finish("月度汇总"));
+        }
     };
     let ym = match normalize_month(year_month) {
         Some(v) => v,
         None => {
-            tracing::error!(
-                "月度汇总的月份参数认不出来（{year_month:?}），本次按 0 条返回；需要的是 YYYY-MM"
-            );
-            return (0.0, 0.0, 0, Vec::new());
+            gaps.push(format!("月份写法「{year_month}」认不出来（需要 YYYY-MM）"));
+            return (0.0, 0.0, 0, Vec::new(), gaps.finish("月度汇总"));
         }
     };
     let prefix = format!("{ym}%");
-    let expense: f64 = conn
-        .query_row(
-            &format!(
-                "SELECT {} FROM expenses WHERE type='支出' AND purchase_date LIKE ?1",
-                sum_amount_sql("amount")
-            ),
-            [&prefix],
-            |r| r.get(0),
-        )
-        .unwrap_or(0.0);
-    let income: f64 = conn
-        .query_row(
-            &format!(
-                "SELECT {} FROM expenses WHERE type='收入' AND purchase_date LIKE ?1",
-                sum_amount_sql("amount")
-            ),
-            [&prefix],
-            |r| r.get(0),
-        )
-        .unwrap_or(0.0);
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM expenses WHERE purchase_date LIKE ?1",
-            [&prefix],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    let expense: f64 = match conn.query_row(
+        &format!(
+            "SELECT {} FROM expenses WHERE type='支出' AND purchase_date LIKE ?1",
+            sum_amount_sql("amount")
+        ),
+        [&prefix],
+        |r| r.get::<_, f64>(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            gaps.push(format!("支出合计读不出来: {e}"));
+            0.0
+        }
+    };
+    let income: f64 = match conn.query_row(
+        &format!(
+            "SELECT {} FROM expenses WHERE type='收入' AND purchase_date LIKE ?1",
+            sum_amount_sql("amount")
+        ),
+        [&prefix],
+        |r| r.get::<_, f64>(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            gaps.push(format!("收入合计读不出来: {e}"));
+            0.0
+        }
+    };
+    let count: i64 = match conn.query_row(
+        "SELECT COUNT(*) FROM expenses WHERE purchase_date LIKE ?1",
+        [&prefix],
+        |r| r.get::<_, i64>(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            gaps.push(format!("条数读不出来: {e}"));
+            0
+        }
+    };
     let mut cat_stats: Vec<(String, f64)> = Vec::new();
     // 净额在 SQL 里按分相减、只在最后除一次：分两次查出 inc/exp 再在 Rust 里
     // 相减，等于把浮点漂移又请回来一次
-    if let Ok(mut stmt) = conn.prepare(&format!(
+    let cat_sql = format!(
         "SELECT COALESCE(NULLIF(category, ''), '(未分类)') AS cat,
                 ({inc} - {exp}) / 100.0 AS net
          FROM expenses WHERE purchase_date LIKE ?1 GROUP BY cat
          ORDER BY net DESC",
         inc = sum_cents("CASE WHEN type='收入' THEN amount ELSE 0 END"),
         exp = sum_cents("CASE WHEN type='支出' THEN amount ELSE 0 END"),
-    )) {
-        if let Ok(mut rows) = stmt.query([&prefix]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let (Ok(cat), Ok(net)) = (row.get::<_, String>(0), row.get::<_, f64>(1)) {
-                    cat_stats.push((cat, net));
+    );
+    match conn.prepare(&cat_sql) {
+        Ok(mut stmt) => match stmt.query([&prefix]) {
+            Ok(mut rows) => loop {
+                match rows.next() {
+                    Ok(Some(row)) => match (row.get::<_, String>(0), row.get::<_, f64>(1)) {
+                        (Ok(cat), Ok(net)) => cat_stats.push((cat, net)),
+                        (Ok(_), Err(e)) | (Err(e), _) => {
+                            gaps.push(format!("分类明细里有一行读不出来: {e}"))
+                        }
+                    },
+                    Ok(None) => break,
+                    Err(e) => {
+                        gaps.push(format!("分类明细读到一半断了: {e}"));
+                        break;
+                    }
                 }
-            }
-        }
+            },
+            Err(e) => gaps.push(format!("分类明细查不动: {e}")),
+        },
+        Err(e) => gaps.push(format!("分类明细的语句准备不了: {e}")),
     }
-    (expense, income, count, cat_stats)
+    (expense, income, count, cat_stats, gaps.finish("月度汇总"))
 }
 
-/// 分类盈亏统计：返回 [(分类, 投入=支出合计, 赚取=收入合计, 条数)]。
-pub fn category_profit_loss() -> Vec<(String, f64, f64, i64)> {
+/// 分类盈亏统计：`([(分类, 投入=支出合计, 赚取=收入合计, 条数)], 没读全的原因)`。
+///
+/// 原因空串 = 这一份可以当完整答案。原先库打不开、语句准备不了、遍历中断、
+/// 单行读不出来四种结局全折成一个空 `Vec`，面板接着印「总投入：0.00 总赚取：0.00」
+/// 加一句「（暂无数据）」—— 一份读不出来的账被写成一份确定的零报告。
+pub fn category_profit_loss() -> (Vec<(String, f64, f64, i64)>, String) {
+    let mut gaps = ReadGaps::default();
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            gaps.push(format!("记账库打不开: {e}"));
+            return (Vec::new(), gaps.finish("分类盈亏"));
+        }
     };
     let mut out = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(&format!(
+    let sql = format!(
         "SELECT COALESCE(NULLIF(category, ''), '(未分类)') AS cat,
                 {inv} AS inv,
                 {earn} AS earn,
@@ -1496,31 +1563,23 @@ pub fn category_profit_loss() -> Vec<(String, f64, f64, i64)> {
          FROM expenses GROUP BY cat ORDER BY inv - earn",
         inv = sum_amount_sql("CASE WHEN type='支出' THEN amount ELSE 0 END"),
         earn = sum_amount_sql("CASE WHEN type='收入' THEN amount ELSE 0 END"),
-    )) {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let (Ok(cat), Ok(inv), Ok(earn), Ok(cnt)) = (
-                    row.get::<_, String>(0),
-                    row.get::<_, f64>(1),
-                    row.get::<_, f64>(2),
-                    row.get::<_, i64>(3),
-                ) {
-                    out.push((cat, inv, earn, cnt));
-                }
-            }
-        }
-    }
-    out
+    );
+    read_profit_rows(&conn, &sql, "分类盈亏", None, &mut out, &mut gaps);
+    (out, gaps.finish("分类盈亏"))
 }
 
-/// 指定分类下子分类盈亏：返回 [(子分类, 投入, 赚取, 条数)]。
-pub fn subcategory_profit_loss(category: &str) -> Vec<(String, f64, f64, i64)> {
+/// 指定分类下子分类盈亏：`([(子分类, 投入, 赚取, 条数)], 没读全的原因)`。
+pub fn subcategory_profit_loss(category: &str) -> (Vec<(String, f64, f64, i64)>, String) {
+    let mut gaps = ReadGaps::default();
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            gaps.push(format!("记账库打不开: {e}"));
+            return (Vec::new(), gaps.finish("细分盈亏"));
+        }
     };
     let mut out = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(&format!(
+    let sql = format!(
         "SELECT COALESCE(NULLIF(subcategory, ''), '(未分细类)') AS sub,
                 {inv} AS inv,
                 {earn} AS earn,
@@ -1528,21 +1587,60 @@ pub fn subcategory_profit_loss(category: &str) -> Vec<(String, f64, f64, i64)> {
          FROM expenses WHERE category=?1 GROUP BY sub ORDER BY inv - earn",
         inv = sum_amount_sql("CASE WHEN type='支出' THEN amount ELSE 0 END"),
         earn = sum_amount_sql("CASE WHEN type='收入' THEN amount ELSE 0 END"),
-    )) {
-        if let Ok(mut rows) = stmt.query([category]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let (Ok(sub), Ok(inv), Ok(earn), Ok(cnt)) = (
+    );
+    read_profit_rows(&conn, &sql, "细分盈亏", Some(category), &mut out, &mut gaps);
+    (out, gaps.finish("细分盈亏"))
+}
+
+/// 两张盈亏表共用那一条读法（只有名字列与要不要 `WHERE category=?1` 不同）。
+/// 每一处失败都记进 `gaps`：语句准备不了、查不动、读到一半断了、单行是坏值 ——
+/// 四种结局原先在外头都是同一句「（暂无数据）」。
+fn read_profit_rows(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    what: &str,
+    category: Option<&str>,
+    out: &mut Vec<(String, f64, f64, i64)>,
+    gaps: &mut ReadGaps,
+) {
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(e) => {
+            gaps.push(format!("{what}的语句准备不了: {e}"));
+            return;
+        }
+    };
+    let fetched = match category {
+        Some(cat) => stmt.query([cat]),
+        None => stmt.query([]),
+    };
+    let mut rows = match fetched {
+        Ok(r) => r,
+        Err(e) => {
+            gaps.push(format!("{what}查不动: {e}"));
+            return;
+        }
+    };
+    loop {
+        match rows.next() {
+            Ok(Some(row)) => {
+                match (
                     row.get::<_, String>(0),
                     row.get::<_, f64>(1),
                     row.get::<_, f64>(2),
                     row.get::<_, i64>(3),
                 ) {
-                    out.push((sub, inv, earn, cnt));
+                    (Ok(name), Ok(inv), Ok(earn), Ok(cnt)) => out.push((name, inv, earn, cnt)),
+                    _ => gaps.push(format!("{what}里有一行读不出来")),
                 }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                gaps.push(format!("{what}读到一半断了: {e}"));
+                break;
             }
         }
     }
-    out
 }
 
 /// 两个日期之间的「整年 + 余下天数」，按日历周年数。
@@ -1839,7 +1937,8 @@ mod tests {
         }
 
         // ③ 读取侧：NULL 与空串并成一行 (未分类)，且不许出现空名字的行
-        let profit = category_profit_loss();
+        let (profit, profit_gap) = category_profit_loss();
+        assert!(profit_gap.is_empty(), "读全了不该带原因: {profit_gap}");
         let names: Vec<&str> = profit.iter().map(|(n, ..)| n.as_str()).collect();
         assert!(
             !names.iter().any(|n| n.is_empty()),
@@ -1857,7 +1956,8 @@ mod tests {
         assert!(names.contains(&"餐饮"), "非空白分类照常成行: {names:?}");
 
         // ④ 月度分类明细同一口径
-        let (_, _, _, detail) = monthly_summary_detail(&ym);
+        let (_, _, _, detail, detail_gap) = monthly_summary_detail(&ym);
+        assert!(detail_gap.is_empty(), "读全了不该带原因: {detail_gap}");
         assert_eq!(
             detail.iter().filter(|(n, _)| n == "(未分类)").count(),
             1,
@@ -1888,7 +1988,8 @@ mod tests {
             )
             .unwrap();
         }
-        let sub = subcategory_profit_loss("餐饮");
+        let (sub, sub_gap) = subcategory_profit_loss("餐饮");
+        assert!(sub_gap.is_empty(), "读全了不该带原因: {sub_gap}");
         let sub_names: Vec<&str> = sub.iter().map(|(n, ..)| n.as_str()).collect();
         assert_eq!(
             sub_names.iter().filter(|n| **n == "(未分细类)").count(),
@@ -2710,6 +2811,90 @@ mod tests {
             logs.iter().any(|l| l.contains("读取分类清单失败")),
             "库读不动必须留下日志: {logs:?}"
         );
+    }
+
+    /// 三个汇总读数口都不许把「这次读不动」折成一份格式完整的零报告。
+    ///
+    /// 症状现量：`open()` 失败时月度汇总交回 `0.0 / 0.0 / 0 / []`，面板接着印
+    /// 「总支出 0.00 / 记录数 0 /（本月暂无分类明细）」；分类盈亏与细分盈亏同理，
+    /// 交回空 `Vec` 后写「总投入 0.00 总赚取 0.00」加一句「（暂无数据）」。
+    /// 那两句都是关于用户账本的**结论**，而这一次什么都没读到 —— 隔壁列表同一帧还写着「共 N 条」。
+    #[test]
+    fn a_summary_that_could_not_be_read_says_so_instead_of_printing_zero() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_summary_gap");
+        init_db().expect("建库失败");
+        assert!(add_category("餐饮", "expense", &[]) > 0);
+        assert!(
+            add_expense(
+                "支出",
+                "午饭",
+                None,
+                "2026-08-01",
+                12.5,
+                Some("餐饮"),
+                None,
+                None
+            ) > 0,
+            "夹具：当月记一笔"
+        );
+
+        // 第一档：读全。三个口的原因都必须是空串，数照常给。
+        let (exp, inc, cnt, cats, gap) = monthly_summary_detail("2026-08");
+        assert!(gap.is_empty(), "读全了不该带原因: {gap}");
+        assert_eq!((exp, inc, cnt), (12.5, 0.0, 1), "{exp} {inc} {cnt}");
+        assert_eq!(cats.len(), 1, "夹具: {cats:?}");
+        let (rows, gap2) = category_profit_loss();
+        assert!(gap2.is_empty() && rows.len() == 1, "{gap2} {rows:?}");
+        let (srows, gap3) = subcategory_profit_loss("餐饮");
+        assert!(gap3.is_empty(), "读全了不该带原因: {gap3}");
+        assert_eq!(
+            srows.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>(),
+            vec!["(未分细类)"],
+            "没填子分类的那一笔该并进 (未分细类): {srows:?}"
+        );
+
+        // 第二档：某一行的名字列是坏值（`category` 是动态类型列，塞 BLOB 就让它读不出来）。
+        // 读得出的合计仍要交出，但这份清单是残缺的 —— 不许被念成「这个分类没了」。
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "UPDATE expenses SET category=?1",
+                [rusqlite::types::Value::Blob(vec![1u8, 2, 3])],
+            )
+            .unwrap();
+        }
+        let ((exp2, _, _, cats2, gap4), logs) =
+            crate::logger::capture_logs(|| monthly_summary_detail("2026-08"));
+        assert!(
+            gap4.contains("有一行读不出来"),
+            "分类明细少一行要说出来: {gap4}"
+        );
+        assert!(
+            cats2.is_empty(),
+            "读不出名字的那行不该凭空编一个名字: {cats2:?}"
+        );
+        assert_eq!(exp2, 12.5, "合计那一读没坏，就照常交出: {exp2}");
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("记账读数（月度汇总）没读全") && l.contains("不是结论")),
+            "没读全必须留日志: {logs:?}"
+        );
+        let (rows2, gap5) = category_profit_loss();
+        assert!(gap5.contains("有一行读不出来"), "{gap5}");
+        assert!(rows2.is_empty(), "{rows2:?}");
+
+        // 第三档：整个文件不是数据库（半截文件 / 被同步盘换成的占位内容）。
+        let _ = std::fs::write(db_path(), "这不是一个 SQLite 文件");
+        let (_, _, _, _, gap6) = monthly_summary_detail("2026-08");
+        assert!(
+            gap6.contains("打不开") || gap6.contains("读不出来"),
+            "{gap6}"
+        );
+        let (_, gap7) = category_profit_loss();
+        assert!(!gap7.is_empty(), "库读不动时分类盈亏的原因不能是空串");
+        let (_, gap8) = subcategory_profit_loss("餐饮");
+        assert!(!gap8.is_empty(), "库读不动时细分盈亏的原因不能是空串");
     }
 
     /// 读不出来时，不许把整列子分类覆盖成"只剩刚加的那一个"。

@@ -1288,6 +1288,79 @@ mod tests {
         drop(tmp);
     }
 
+    /// 读不动的账不许被面板印成一份「零报告」。
+    ///
+    /// 症状现量：库里当月明明有记录，`open()` 那一轮读不动时结果弹窗写的是
+    /// 「总支出 0.00 / 记录数 0 /（本月暂无分类明细）」和「总投入 0.00 总赚取 0.00（暂无数据）」
+    /// —— 两句都是关于用户账本的结论。宿主现在多交一个「没读全的原因」，
+    /// 面板只在它为空时才说那两句，否则说明原因（用例的最后两条腿分别钉这两边）。
+    #[test]
+    fn an_unreadable_ledger_is_not_reported_as_a_zero_month() {
+        use focusflow_core::accounting;
+
+        fn report_of(manager: &PluginManager, name: &str) -> String {
+            view_of(manager, name)
+                .into_iter()
+                .find_map(|w| match w {
+                    Widget::ModalForm { id, content, .. } if id == "result_modal" => Some(content),
+                    _ => None,
+                })
+                .expect("视图里应有统计结果弹窗")
+        }
+
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("summary_gap", "accounting_plugin.lua");
+        accounting::init_db().expect("记账库应能建起来");
+        assert!(accounting::add_category("测试餐饮", "expense", &[]) > 0);
+        assert!(
+            accounting::add_expense(
+                "支出",
+                "午饭",
+                None,
+                "2026-08-01",
+                12.5,
+                Some("测试餐饮"),
+                None,
+                None
+            ) > 0,
+            "夹具：记一笔"
+        );
+
+        // 读得出来的那一轮：合计照说，且不许多一句"没读全"（这一腿挡住"永远不说数"）
+        manager
+            .plugin_action(&name, "cat_profit")
+            .expect("分类盈亏");
+        let ok = report_of(&manager, &name);
+        assert!(ok.contains("测试餐饮"), "正常报告该列出分类:\n{ok}");
+        assert!(!ok.contains("没读全"), "读全了不许报任何保留:\n{ok}");
+
+        // 把库换成一份读不出来的字节（半截文件 / 被同步盘换成的占位内容）
+        std::fs::write(accounting::db_path(), "这不是一个 SQLite 文件").expect("写坏文件");
+        manager
+            .plugin_action(&name, "cat_profit")
+            .expect("读不出来不该让动作本身失败");
+        let bad = report_of(&manager, &name);
+        assert!(bad.contains("这份数没读全"), "要说清这次没读到:\n{bad}");
+        assert!(
+            !bad.contains("（暂无数据）"),
+            "读不动不许说成没有数据:\n{bad}"
+        );
+        assert!(!bad.contains("总投入："), "不许给一份零报告:\n{bad}");
+
+        manager
+            .plugin_action(&name, "monthly_detail")
+            .expect("月度汇总");
+        let monthly = report_of(&manager, &name);
+        assert!(monthly.contains("这份数没读全"), "{monthly}");
+        assert!(
+            !monthly.contains("（本月暂无分类明细）"),
+            "读不动时不许断定本月没有明细:\n{monthly}"
+        );
+
+        assert!(manager.unload_plugin(&name));
+        drop(tmp);
+    }
+
     /// A0.7 之一：日期筛选是自由文本，`2026-9-1` 这种不补零的写法过去会**静默漏**。
     ///
     /// `purchase_date >= ?` 是字符串比较，`"2026-9-1" > "2026-09-05"`（字节序里
