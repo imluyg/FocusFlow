@@ -1535,7 +1535,18 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
     let timestamp = Local::now().format("%Y%m%d_%H%M%S%3f").to_string();
     // 异常体检基线：本轮之前最新的一份年度库备份（用于对比体量）
     let baseline_path = newest_backup_of_group(&chrono::Local::now().year().to_string());
-    let baseline_fp = baseline_path.as_deref().and_then(backup_fingerprint);
+    let baseline_fp = match baseline_path.as_deref().map(probe_backup_fingerprint) {
+        Some(BackupProbe::Read(fp)) => Some(fp),
+        Some(BackupProbe::Unreadable(reason)) => {
+            tracing::warn!(
+                "上一份备份读不动（{reason}）：这一轮的异常体检没有比对对象，跳过总量对比"
+            );
+            None
+        }
+        // 首轮备份，或上一份已被轮转掉：本来就没有可比的那份，静默跳过
+        Some(BackupProbe::Absent) => None,
+        None => None,
+    };
     let mut suspicious_detail: Option<String> = None;
     let mut backed_up: Vec<std::path::PathBuf> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
@@ -1614,7 +1625,17 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
         if ok {
             // 异常体检：与上一份备份比总量/天数（只对当前年份库有意义）
             if year == chrono::Local::now().year() {
-                if let (Some(prev), Some(cur)) = (baseline_fp, backup_fingerprint(&dst)) {
+                let cur_fp = match probe_backup_fingerprint(&dst) {
+                    BackupProbe::Read(fp) => Some(fp),
+                    BackupProbe::Unreadable(reason) => {
+                        // 刚通过 quick_check 的备份却读不出体量：体检这一轮对它根本没跑，
+                        // 而"通过校验"那句照打 ⇒ 这句话说出来，别让绿字盖住一次没做成的比对
+                        tracing::warn!("本轮备份的体量读不出来（{reason}）：异常体检这一轮没跑");
+                        None
+                    }
+                    BackupProbe::Absent => None,
+                };
+                if let (Some(prev), Some(cur)) = (baseline_fp, cur_fp) {
                     // 主动清理/归档之后，清理前的备份不能当基线：拿它比必然"骤降"，
                     // 而那批数据是用户自己删的（或本程序刚归档走的），不是丢数据。
                     let stale_baseline = baseline_path
@@ -1892,24 +1913,50 @@ struct BackupFingerprint {
     days: i64,
 }
 
-/// 读取备份文件的体量指纹（打不开或表缺失返回 None）。
-fn backup_fingerprint(path: &Path) -> Option<BackupFingerprint> {
-    let conn = Connection::open_with_flags(
+/// 一份备份"能不能拿来比对体量"的三种结局。
+///
+/// 原先 `backup_fingerprint` 把三件事都折成同一个 `None`：本来就没有可比的那份
+/// （首轮备份，或上一份已被轮转掉）、有一份却打不开（被杀软/同步盘握着、页坏了）、
+/// 打得开但 `daily_counts` 读不出来。而调用方拿 `None` 就**整轮跳过异常体检**，
+/// 同时照打"本轮全部通过校验" ⇒ 体检被静默关掉，真发生骤降那一轮没人看得出它没跑。
+/// 方向仍按本文件已有的那条走：读不动不硬判成"可疑"（一次读盘抖动就冻结轮转代价太大），
+/// 但要把"这一轮没体检成、为什么"说出来。
+#[derive(Debug)]
+enum BackupProbe {
+    /// 读得出体量，可以拿来比对
+    Read(BackupFingerprint),
+    /// 没有可比的那一份（首轮备份）
+    Absent,
+    /// 有一份却读不动：原因
+    Unreadable(String),
+}
+
+fn probe_backup_fingerprint(path: &Path) -> BackupProbe {
+    if !path.exists() {
+        return BackupProbe::Absent;
+    }
+    let conn = match Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
-    let total: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
-            [],
-            |r| r.get(0),
-        )
-        .ok()?;
-    let days: i64 = conn
-        .query_row("SELECT COUNT(*) FROM daily_counts", [], |r| r.get(0))
-        .ok()?;
-    Some(BackupFingerprint { total, days })
+    ) {
+        Ok(conn) => conn,
+        Err(e) => return BackupProbe::Unreadable(format!("打开备份失败: {e}")),
+    };
+    let total = match conn.query_row(
+        "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+        [],
+        |r| r.get::<_, i64>(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => return BackupProbe::Unreadable(format!("读 daily_counts 总量失败: {e}")),
+    };
+    let days = match conn.query_row("SELECT COUNT(*) FROM daily_counts", [], |r| {
+        r.get::<_, i64>(0)
+    }) {
+        Ok(v) => v,
+        Err(e) => return BackupProbe::Unreadable(format!("读 daily_counts 天数失败: {e}")),
+    };
+    BackupProbe::Read(BackupFingerprint { total, days })
 }
 
 /// 新快照相对上一份是否「异常」。判定保守：**基线**太小（第一份备份、刚装好）时不判定。
@@ -2994,6 +3041,50 @@ mod tests {
         let err = scale_hourly_to_total(&conn, 2, 1)
             .expect_err("UPDATE 全被挡下时必须交回错误 —— 旧写法返回 ()，上层照样打「重算 N 天」");
         assert!(err.contains("写不进"), "要说清是哪一小时的写不进去: {err}");
+    }
+
+    /// 「没有可比的那一份」与「有一份却读不动」是两件事，不许共用一个 `None`。
+    ///
+    /// 后者意味着这一轮的异常体检没有比对对象 —— 而"本轮全部通过校验"那句照打，
+    /// 于是骤降真发生时，没人看得出体检根本没跑过。
+    #[test]
+    fn an_unreadable_baseline_is_told_apart_from_a_first_backup() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("baseline_probe");
+        let dir = paths::backup_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("focusflow_2026_20260101_000000.db");
+        {
+            let conn = Connection::open(&good).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE daily_counts(date_key INTEGER PRIMARY KEY, count INTEGER);
+                 INSERT INTO daily_counts VALUES (1, 5);",
+            )
+            .unwrap();
+        }
+        assert!(
+            matches!(
+                probe_backup_fingerprint(&good),
+                BackupProbe::Read(BackupFingerprint { total: 5, days: 1 })
+            ),
+            "读得动时要交出体量"
+        );
+        assert!(
+            matches!(
+                probe_backup_fingerprint(&dir.join("focusflow_2019_20260101_000000.db")),
+                BackupProbe::Absent
+            ),
+            "从来没有过这一份 = Absent（首轮备份本来就没得比，不该报警）"
+        );
+        // 有一份，但它不是个能读的库（被同步盘换成占位、写坏、被截断都是这个形态）
+        let junk = dir.join("focusflow_2026_20260101_000001.db");
+        std::fs::write(&junk, "这不是 sqlite 库".as_bytes()).unwrap();
+        match probe_backup_fingerprint(&junk) {
+            BackupProbe::Unreadable(reason) => {
+                assert!(!reason.is_empty(), "要把读不动的原因带上: {reason}");
+            }
+            other => panic!("非库文件不许被折成「没有可比的那份」: {other:?}"),
+        }
     }
 
     /// 一条**平台前提**（本轮现量，三个产品路径都踩在它上面：
