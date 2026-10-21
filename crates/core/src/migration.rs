@@ -208,9 +208,12 @@ fn list_year_dbs(dir: &Path) -> Vec<i32> {
 
 /// 导入单个年度库：先写暂存表（按 timestamp 去重），再聚合落库。
 /// 返回导入的记录数。
-/// 导入某一份年度库，返回本次落进暂存表的明细行数（`Ok(0)` 也可能是"只剩聚合表、
-/// 按键数没并"或"内容未变跳过"——后者要自己往 `summary.skipped` 里写一条，
-/// 调用方只按数字说话会把"被丢下"报成"这一年没数据"）。
+/// 导入某一份年度库，返回本次落进暂存表的明细行数。
+///
+/// **每一条 `Ok(0)` 都必须自己往 `summary.skipped` 里写一条**：调用方照样把这一年
+/// 记进 `year_dbs`，只按数字说话时「2025 年度键鼠: 0 条」与"这一年本来没数据"逐字节
+/// 同形，而重跑导入正是用户查"刚才到底导进去没有"的动作。现存三处 `Ok(0)`
+/// （只剩聚合表 / 源文件未变 / 明细内容指纹未变）都守这条。
 fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> anyhow::Result<i64> {
     let src_path = src_dir.join(format!("focusflow_{year}.db"));
     let dst_path = paths::year_db_path(year);
@@ -308,6 +311,16 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
             _ => false,
         };
         if same_size && same_mtime {
+            // 这条 `Ok(0)` 也得往 `summary.skipped` 里写一条（本函数开头的契约）：
+            // 调用方照样把这一年记进 `year_dbs`，只按数字说话时「2025 年度键鼠: 0 条」
+            // 与"这一年本来没数据"逐字节同形 —— 而重跑导入正是用户查"刚才到底导进去没有"
+            // 的动作。`tracing::info!` 不算答复：日志埋在 logs/ 里，不主动翻就永远不知道。
+            let note = format!(
+                "{year} 年源文件与上次导入时一模一样（大小与修改时间都没变）：整库跳过，本次没有新数据"
+            );
+            tracing::info!("{note}");
+            tracing::info!("{note}");
+            summary.skipped.push(note);
             return Ok(0);
         }
     }
@@ -346,7 +359,13 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
     // 用开头读过的那一份标记（不再第三次开库：读不动的结局上面已经处理过了）
     if let Some((c0, t0)) = marker.as_ref().and_then(|m| m.key_log) {
         if (c0, t0) == kl_now {
-            tracing::info!("{year} 年源库明细内容未变（仅文件时间戳变了），跳过重复导入");
+            // 同一条契约的第二处：第一道闸（大小+mtime）已经放行、靠内容指纹才跳过，
+            // 报出来的还是一个裸 `0`。
+            let note = format!(
+                "{year} 年源库的明细内容与上次导入逐行相同（只有文件时间戳被改动过）：跳过，不重复聚合"
+            );
+            tracing::info!("{note}");
+            summary.skipped.push(note);
             return Ok(0);
         }
     }

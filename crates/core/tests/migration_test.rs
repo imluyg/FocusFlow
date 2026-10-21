@@ -93,6 +93,13 @@ mod tests {
             vec![(2025, 0)],
             "二次导入应为 0 新增"
         );
+        // 「0 条」单独说不完整：它必须带上"为什么是 0"，否则与"这一年本来没数据"
+        // 逐字节同形，而重跑导入正是用户查"刚才到底导进去没有"的动作。
+        assert!(
+            summary2.skipped.iter().any(|s| s.contains("2025")),
+            "源文件未变那一臂要把这一年写进 skipped，实得 {:?}",
+            summary2.skipped
+        );
         let cnt2: i64 = conn
             .query_row(
                 "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
@@ -101,6 +108,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cnt2, 3, "去重后总数不变");
+
+        // 第三臂：改掉源文件的修改时间（大小不变）⇒ 第一道闸放行，这一轮是靠**内容指纹**
+        // 才跳过的。那一臂原先只留一句 info 日志，报出来的还是一个裸 0。
+        {
+            let when =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_699_991_000);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&old_db)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+        let summary3 = migration::import_legacy_data(&old_dir);
+        assert_eq!(
+            summary3.records_by_year,
+            vec![(2025, 0)],
+            "明细内容逐行没变就不该再聚一遍"
+        );
+        assert!(
+            summary3.skipped.iter().any(|s| s.contains("2025")),
+            "内容指纹那一臂也要把这一年写进 skipped，实得 {:?}",
+            summary3.skipped
+        );
+        let cnt3: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt3, 3, "第三轮之后总数仍不变");
 
         // 用 CLI 查询验证
         let (total, _) = db::get_stats(None, Some(2025));
