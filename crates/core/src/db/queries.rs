@@ -121,6 +121,24 @@ pub fn try_available_years() -> anyhow::Result<Vec<i32>> {
     Ok(years)
 }
 
+/// 这批年度库里有哪些**读不动**。
+///
+/// 「文件本来不存在」不算读不动：首启那一年还没建库，`get_daily_counts` 对它交回全零是正确答案。
+/// 但"stat 说不准"与"打不开"都算 —— 这两种情况下那一年少掉的计数会被界面读成"那几年没输入"。
+fn unopenable_years(years: &[i32]) -> Vec<i32> {
+    years
+        .iter()
+        .copied()
+        .filter(|y| {
+            let path = paths::year_db_path(*y);
+            match std::fs::metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                _ => connection::open_ro(&path).is_err(),
+            }
+        })
+        .collect()
+}
+
 /// 列出口径与读法口径都问一遍：数据目录读得动吗、每个列出来的年度库真打得开吗。
 ///
 /// 这把尺子原先只有 CLI 有（`crates/cli/src/main.rs`），而 `available_years()` 把
@@ -133,13 +151,57 @@ pub fn try_available_years() -> anyhow::Result<Vec<i32>> {
 /// 返回值里的 `Vec<i32>` 就是 `try_available_years()` 那份列表，调用方可以省一次枚举。
 pub fn check_years_readable() -> anyhow::Result<Vec<i32>> {
     let years = try_available_years().map_err(|e| anyhow::anyhow!("年度库列不出来: {e}"))?;
-    let bad: Vec<i32> = years
-        .iter()
-        .copied()
-        .filter(|y| connection::open_ro(&paths::year_db_path(*y)).is_err())
-        .collect();
+    let bad = unopenable_years(&years);
     if !bad.is_empty() {
         anyhow::bail!("这些年度库打不开，它们的计数不会出现在结果里: {bad:?}");
+    }
+    Ok(years)
+}
+
+/// `get_daily_counts` 那一段窗口的**起点与它会去读的年份**，一份算法两处用。
+///
+/// 口径：含当天共 N 天 ⇒ 起点 `今天 - (days-1)`；`days` 先收敛，越界会让日期运算 panic。
+/// 为什么不直接复用 `query_years(days, None)`：那条的起点是 `今天 - days`，跨年头那一天两套
+/// 清单会差一个年份 —— 可读性闸就会要么多拦（把不相干的坏年份算进这次读数），要么漏拦
+/// （放过窗口里真正坏掉的那一年）。
+fn window_start_and_years(
+    today: chrono::NaiveDate,
+    days: i64,
+    year: Option<i32>,
+) -> (chrono::NaiveDate, Vec<i32>) {
+    let days = clamp_query_days(days);
+    let start = date_minus_days(today, days - 1)
+        .unwrap_or_else(|| today - Days::new((MAX_QUERY_DAYS - 1) as u64));
+    let mut years: Vec<i32> = match year {
+        Some(y) => vec![y],
+        None => {
+            let span: Vec<i32> = (start.year()..=today.year()).collect();
+            let available: std::collections::HashSet<i32> = available_years().into_iter().collect();
+            let f: Vec<i32> = span.into_iter().filter(|y| available.contains(y)).collect();
+            // 一年都没有（首启、还没建库）：交回今年，读出来就是全零 —— 这是正确答案，
+            // 不是"读不出来"，所以上面那道闸也不把"文件不存在"算成坏年份。
+            if f.is_empty() {
+                vec![today.year()]
+            } else {
+                f
+            }
+        }
+    };
+    years.sort_unstable();
+    (start, years)
+}
+
+/// 只问「这次读数会碰到的那几个库」读不读得动 —— 打卡条看的是近 370 天，
+/// 更早那一年坏了不该让这条自动刷新的横条整块变红，反之也不能放过窗口里坏掉的那一年
+/// （它原先是**唯一没上这道闸的读数入口**：导出、周报与 CLI 那几条都问，界面这一头不问）。
+///
+/// 闸与读数各取一次"今天"：跨过午夜那一瞬两边的年份清单可能差一年，后果是这一次刷新被
+/// 多拦或漏拦一次，下一次自动重试就一致了 —— 比"为了对齐把两次取时刻做成共享状态"便宜。
+pub fn check_daily_counts_readable(days: i64, year: Option<i32>) -> anyhow::Result<Vec<i32>> {
+    let years = window_start_and_years(Local::now().date_naive(), days, year).1;
+    let bad = unopenable_years(&years);
+    if !bad.is_empty() {
+        anyhow::bail!("这些年度库打不开，那几年的计数不会出现在结果里: {bad:?}");
     }
     Ok(years)
 }
@@ -577,30 +639,14 @@ pub fn get_alltime_summary() -> AlltimeTotals {
 /// 查询最近 N 天每日按键数：返回 [(YYYY-MM-DD, 次数)]。
 pub fn get_daily_counts(days: i64, year: Option<i32>) -> Vec<(String, i64)> {
     let now = Local::now();
-    // 含当天共 N 天：起点为 now-(N-1)；天数先收敛，越界会让日期运算 panic。
+    let today = now.date_naive();
+    // 含当天共 N 天：起点为 today-(N-1)；天数先收敛，越界会让日期运算 panic。
+    // 起点与「读哪几个年份」都走 `window_start_and_years` —— 上面那道可读性闸问的就是
+    // 同一批库，两处不再各算一套。
     let days = clamp_query_days(days);
-    let start = date_minus_days(now.date_naive(), days - 1)
-        .unwrap_or_else(|| now.date_naive() - Days::new((MAX_QUERY_DAYS - 1) as u64));
+    let (start, years_to_query) = window_start_and_years(today, days, year);
     let start_dk = day_key_of_date(start);
-    let end_dk = day_key_of_date(now.date_naive());
-
-    let mut years_to_query: Vec<i32> = match year {
-        Some(y) => vec![y],
-        None => {
-            let years: Vec<i32> = (start.year()..=now.year()).collect();
-            let available: std::collections::HashSet<i32> = available_years().into_iter().collect();
-            let f: Vec<i32> = years
-                .into_iter()
-                .filter(|y| available.contains(y))
-                .collect();
-            if f.is_empty() {
-                vec![now.year()]
-            } else {
-                f
-            }
-        }
-    };
-    years_to_query.sort_unstable();
+    let end_dk = day_key_of_date(today);
 
     // 初始化所有日期为 0
     let mut daily_map: HashMap<i64, i64> = HashMap::new();
@@ -1912,6 +1958,97 @@ mod tests {
         assert!(
             available_years().contains(&2033),
             "损坏的年度库应按「有数据」保守处理"
+        );
+    }
+
+    /// 打卡条那道可读性闸只该拦「这一窗口真会读到的那一年」。
+    ///
+    /// 两半都有真实后果。漏拦：窗口里坏一年会被 `get_daily_counts` 静默跳过（只记一行日志），
+    /// 那一年每天都是 0，于是「连续打卡 N 天」悄悄缩到跨年之后，横条照旧是绿色。
+    /// 多拦：一条每 60 秒自动刷新的横条，因为一个它压根没读的旧年份坏了而整块变红。
+    /// 所以这道闸不能直接套用"全部年度库都问一遍"那一条。
+    #[test]
+    fn the_daily_counts_gate_covers_exactly_the_years_it_reads() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("gate_window");
+        invalidate_years_cache();
+        let this = Local::now().year();
+        let prev = this - 1;
+        let far = this - 5;
+        // 窗口里的两年：都建库，都真有聚合行（不然会被当成空壳从年份列表里退掉）
+        for y in [this, prev] {
+            let conn = connection::open_rw(&paths::year_db_path(y)).unwrap();
+            connection::ensure_schema(&conn, y).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        assert!(
+            check_daily_counts_readable(370, None).is_ok(),
+            "两个库都读得动时不该拦"
+        );
+
+        // 窗口**外**的旧年份坏了：全库那一条要拒绝，这一条必须放行 —— 这两半放在一起
+        // 才说明这道闸不是"抄一份全库口径"
+        std::fs::write(paths::year_db_path(far), b"not a database at all").unwrap();
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        assert!(
+            check_years_readable().is_err(),
+            "对照：全库口径确实把这一年算成坏了"
+        );
+        assert!(
+            check_daily_counts_readable(370, None).is_ok(),
+            "这一年不在这个窗口里，不该让打卡条整块变红"
+        );
+
+        // 窗口**里**的那一年坏了：必须拒绝并点名是哪一年
+        std::fs::write(paths::year_db_path(prev), b"not a database at all").unwrap();
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        let msg = check_daily_counts_readable(370, None)
+            .expect_err("窗口里坏一年时必须拒绝，否则那一年会被静默读成每天 0")
+            .to_string();
+        assert!(
+            msg.contains(&prev.to_string()) && msg.contains("打不开"),
+            "要说清是哪一年读不出来，实得: {msg}"
+        );
+
+        // 反向腿：把它修回来，同一个调用就必须通过（这条判据不是恒真）
+        std::fs::remove_file(paths::year_db_path(prev)).unwrap();
+        let conn = connection::open_rw(&paths::year_db_path(prev)).unwrap();
+        connection::ensure_schema(&conn, prev).unwrap();
+        conn.execute(
+            "INSERT INTO daily_counts (date_key, count, seconds) VALUES (1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        assert!(
+            check_daily_counts_readable(370, None).is_ok(),
+            "坏文件移走之后必须放行"
+        );
+
+        // 首启那一头：一个库都没有（年份清单会退回"今年"，而今年还没建库）——
+        // "文件不存在"是"没有数据"，不是"读不出来"，这道闸不许把全新安装拦掉。
+        for y in [this, prev, far] {
+            let _ = std::fs::remove_file(paths::year_db_path(y));
+        }
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        assert!(
+            check_daily_counts_readable(370, None).is_ok(),
+            "没有任何年度库的首启必须放行（读出来就是全零）"
+        );
+        assert!(
+            get_daily_counts(370, None).iter().all(|(_, c)| *c == 0),
+            "同一批读数交回全零，而不是错误"
         );
     }
 

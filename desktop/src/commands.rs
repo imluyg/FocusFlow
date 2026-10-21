@@ -106,6 +106,18 @@ fn goal_status_json(app: &AppState) -> Result<serde_json::Value, String> {
     // （反过来先读 pending 再查库，中间落库就是双重计数）。
     // 与主卡片（compute_charts / total_for_display）同一族口径：顶部「今日」是
     // 实时值，这里的达标/连续/最长若只认库值，用户刚跨线的一分钟里两处数字打架。
+    //
+    // 先问这一窗口的可读性：`get_daily_counts` 对打不开的那一年是**静默跳过**（只记一行日志），
+    // 于是那一年每一天都是 0，`stats::goal_status` 把 0 读成"那天没达标" ⇒「连续打卡 N 天」
+    // 悄悄缩到跨年之后的数，而横条照旧是绿色。导出、周报与 CLI 那几条读命令都过这道闸，
+    // 界面这一头当时漏下了。只问窗口里那几个库：更早那一年坏了不该让这条自动刷新的横条
+    // 整块变红。前端已经有红色的通道（`views.js` 那句「连续打卡读不出来：…」），
+    // 所以"拒绝"不是没有落点，而是把它本来就该说的话说明白。
+    focusflow_core::db::queries::check_daily_counts_readable(
+        focusflow_core::stats::GOAL_LOOKBACK_DAYS,
+        None,
+    )
+    .map_err(|e| format!("连续打卡的账本读不全：{e}"))?;
     let rows = focusflow_core::db::queries::get_daily_counts(
         focusflow_core::stats::GOAL_LOOKBACK_DAYS,
         None,
@@ -1045,6 +1057,45 @@ mod tests {
         assert!(
             body.contains("export_csv") && body.contains("export_html"),
             "切片没盖住导出的两个格式分支，上面三条是假绿"
+        );
+    }
+
+    /// 打卡条也要先问**这一窗口**的可读性，再去取按日序列。
+    ///
+    /// 命令本体要真库才跑得动（跨 370 天扫两个年度库），无头环境进不去 ⇒ 按文本形状钉次序：
+    /// 闸排在 `get_daily_counts` 之后就等于已经拿少一年的 0 判定完连续天数。
+    /// 还钉"问的是同一个窗口"：拿全库口径去问会拦下这条横条压根不读的旧年份，
+    /// 而它是每 60 秒自动刷新的，红成一片比数字偏小更难解释。
+    #[test]
+    fn goal_status_asks_readability_for_its_own_window_before_it_aggregates() {
+        let src = include_str!("commands.rs");
+        let head = src
+            .find("fn goal_status_json")
+            .expect("打卡条的命令体找不到了（判据要跟着改）");
+        let body = &src[head..head + src[head..].find("\n}\n").expect("命令体切不出来")];
+        let gate = body
+            .find("check_daily_counts_readable(")
+            .expect("打卡条没问可读性：坏掉那一年会被静默读成每天 0");
+        let agg = body
+            .find("get_daily_counts(")
+            .expect("打卡条不再取按日序列？判据要跟着改");
+        assert!(
+            gate < agg,
+            "可读性闸必须排在取数之前（闸在 {gate}、取数在 {agg}）"
+        );
+        let from_gate: String = body[gate..].chars().take(220).collect();
+        assert!(
+            from_gate.contains("GOAL_LOOKBACK_DAYS"),
+            "闸问的窗口要和取数那一个一致，否则拦的是不相干的年份: {from_gate}"
+        );
+        assert!(
+            !body.contains("check_years_readable()"),
+            "这里该问窗口那一条，不是全部年度库那一条: 旧年份坏了不该让自动刷新的横条整块变红"
+        );
+        // 切片前提：这段真盖住了打卡条的判定，不是切在半路让上面几条空转
+        assert!(
+            body.contains("goal_status(") && body.contains("effective_goal("),
+            "切片没盖住打卡条的判定，上面几条是假绿"
         );
     }
 
