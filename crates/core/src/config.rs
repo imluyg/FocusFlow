@@ -483,6 +483,48 @@ pub struct FocusFlowConfig {
     last_save_error: Mutex<Option<String>>,
 }
 
+/// `load()` 结尾那次回写失败时，本次运行手里到底拿的是哪一份值。
+///
+/// 立它的原因：那句 warn 原先对三种状态只有一句话——「配置已读出来…本次运行仍按读出来
+/// 的值」，而其中两种恰恰**没有**读出来（文件读失败 ⇒ 内存里是默认值；文件根本不存在 ⇒
+/// 也是默认值）。同一渠道会被界面当作"保存出过错"显示（`last_save_error` / 设置页），
+/// 于是它把"正在跑默认值"讲成"你的配置还在用"，正好说反。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadedFrom {
+    /// 读到了文件里那一份
+    ReadFromFile,
+    /// 还没有配置文件
+    NoFileYet,
+    /// 文件在，但读失败（备份成没成另说）——内存里是默认值
+    ReadFailed,
+}
+
+/// 回写失败那句话：三种状态三种说法。
+fn rewrite_failure_note(from: LoadedFrom, err: &str) -> String {
+    match from {
+        LoadedFrom::ReadFromFile => format!(
+            "配置已读出来，但补齐默认键的回写没成功（本次运行仍按读出来的值，不会拿默认值盖掉文件）: {err}"
+        ),
+        LoadedFrom::NoFileYet => format!(
+            "还没有配置文件，而第一次落盘没成功（本次运行按默认值；下次启动文件不在时会再试一次）: {err}"
+        ),
+        LoadedFrom::ReadFailed => format!(
+            "配置文件没读出来，本次运行**按默认值**；补齐默认键的回写也没成功，那份默认值还没落到盘上: {err}"
+        ),
+    }
+}
+
+/// 从"文件在不在、读没读成"推出本次拿的是哪一份值。
+fn loaded_from_after_read(file_exists: bool, read_ok: bool) -> LoadedFrom {
+    if !file_exists {
+        LoadedFrom::NoFileYet
+    } else if read_ok {
+        LoadedFrom::ReadFromFile
+    } else {
+        LoadedFrom::ReadFailed
+    }
+}
+
 impl FocusFlowConfig {
     /// 从指定路径加载配置；`path` 不存在时生成默认配置并保存。
     pub fn load(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
@@ -490,9 +532,12 @@ impl FocusFlowConfig {
         let defaults = default_config();
         let mut values = defaults.clone();
 
-        if path.exists() {
+        let file_exists = path.exists();
+        let mut read_ok = false;
+        if file_exists {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
+                    read_ok = true;
                     for (section, keys) in parse_ini(&text) {
                         values.entry(section).or_default().extend(keys);
                     }
@@ -557,7 +602,11 @@ impl FocusFlowConfig {
         // 已经缓存了这份兜底）—— 所以要 warn，不要静默。
         if let Err(rewrite) = cfg.save() {
             tracing::warn!(
-                "配置已读出来，但补齐默认键的回写没成功（本次运行仍按读出来的值，不会拿默认值盖掉文件）: {rewrite:#}"
+                "{}",
+                rewrite_failure_note(
+                    loaded_from_after_read(file_exists, read_ok),
+                    &format!("{rewrite:#}")
+                )
             );
         }
         Ok(cfg)
@@ -1706,6 +1755,88 @@ work_minutes = 45
             sections_of(&serialize_rebuilt(&odd)),
             sections_of(&serialize_preserving_structure(&odd, "")),
             "同一条规则在两条路上得给同一个答案"
+        );
+    }
+
+    /// 回写失败那句话只能说**当前状态成立的事**。
+    ///
+    /// 旧写法对"读成功／没有文件／读失败"三种状态共用一句「配置已读出来…本次运行仍按
+    /// 读出来的值」—— 后两种恰恰跑的是默认值，而这句会被界面当作"保存出过错"显示出去，
+    /// 于是把"正在跑默认值"讲成"你的配置还在用"。
+    #[test]
+    fn the_rewrite_note_only_claims_what_the_current_state_supports() {
+        let mut wrong: Vec<String> = Vec::new();
+        let read_ok = rewrite_failure_note(LoadedFrom::ReadFromFile, "夹具原因");
+        if !(read_ok.contains("配置已读出来") && read_ok.contains("夹具原因")) {
+            wrong.push(format!("读成功那一支要说\"按读出来的值\"，实得 {read_ok}"));
+        }
+        for (from, what) in [
+            (LoadedFrom::ReadFailed, "文件读不出来"),
+            (LoadedFrom::NoFileYet, "还没有配置文件"),
+        ] {
+            let note = rewrite_failure_note(from, "夹具原因");
+            if note.contains("配置已读出来") || note.contains("仍按读出来的值") {
+                wrong.push(format!("{what}那一支不许声称读出来了: {note}"));
+            }
+            if !note.contains("默认值") {
+                wrong.push(format!("{what}那一支要说清本次跑的是默认值: {note}"));
+            }
+            if !note.contains("夹具原因") {
+                wrong.push(format!("{what}那一支要带上失败原因: {note}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// 三种状态各由"文件在不在、读没读成"决定，别的组合不许存在。
+    #[test]
+    fn the_state_comes_from_the_file_and_the_read() {
+        assert_eq!(
+            loaded_from_after_read(false, true),
+            LoadedFrom::NoFileYet,
+            "文件不在就是没得读，read_ok 是什么都不算"
+        );
+        assert_eq!(loaded_from_after_read(true, true), LoadedFrom::ReadFromFile);
+        assert_eq!(loaded_from_after_read(true, false), LoadedFrom::ReadFailed);
+    }
+
+    /// 接线守卫：那句 warn 必须**经过**上面两个函数，读成功与否也必须真的被记下来。
+    ///
+    /// 纯函数写得再对，调用点退回一句写死的话就白搭 —— 而 `load()` 要弹不了的东西
+    /// 太多（真实文件 + 让它失败 + 再让回写也失败），只能钉形状。
+    #[test]
+    fn load_routes_the_note_through_the_actual_read_outcome() {
+        let src = include_str!("config.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = src[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut wrong: Vec<String> = Vec::new();
+        for (needle, what) in [
+            (
+                "loaded_from_after_read(file_exists, read_ok)",
+                "那句 warn 没按真实的读取结局选说法",
+            ),
+            ("read_ok = true;", "读成功那一臂没把结局记下来"),
+            (
+                "let file_exists = path.exists();",
+                "没文件那一支的来源被绕开了",
+            ),
+        ] {
+            if !prod.contains(needle) {
+                wrong.push(format!("{what}（少了「{needle}」）"));
+            }
+        }
+        let n = prod.matches("&format!(\"{rewrite:#}\")").count();
+        if n != 1 {
+            wrong.push(format!("失败原因该恰好交给那句话一次，实得 {n} 次"));
+        }
+        assert!(
+            wrong.is_empty(),
+            "配置回写的接线守卫红:\n{}",
+            wrong.join("\n")
         );
     }
 }
