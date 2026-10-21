@@ -482,7 +482,7 @@ function giveUp(reason) {
   if (submitted) return;
   submitted = true;
   if (reason) setHint(reason, true);
-  invoke("snip_cancel", { reason: reason || "" }).catch(() => {});
+  invoke("snip_cancel", { reason: reason || "", epoch }).catch(() => {});
   // 这次会话到此为止，底图留着没有意义（`submitted` 已立，error 事件也不会再误判）
   clearBottomImage();
 }

@@ -544,8 +544,10 @@ fn raise_topmost(_win: &WebviewWindow) {}
 /// 但"陈旧的那一次不许踩死活的那一张"这条判决可以单独钉住。
 ///
 /// `claim == 0` = 调用方说不出自己属于哪一张（`trigger` 里"再按一次放弃当前这张"、
-/// 页面那条 `snip_cancel`、以及 `run_capture` 在 claim 之前就失败的那两条：抓屏本身
-/// 失败、PNG 编码失败），它们要收的就是当前这张 ⇒ 放行。
+/// `on_snip_close_requested` 的 Alt+F4、以及 `run_capture` 在 claim 之前就失败的那两条：
+/// 抓屏本身失败、PNG 编码失败），它们要收的就是当前这张 ⇒ 放行。
+/// 页面那条 `snip_cancel` 现在会带上它拿到的 epoch（见 `desktop/ui/snip.js` 的 `giveUp`）：
+/// 上一张迟到的取消不能再清掉刚触发的新会话。
 /// 说得出 epoch 的（`run_capture` 入槽之后的四个出口：派发主线程失败、覆盖层显示失败、
 /// 取图看门狗到点、标注绝对上限到点）就必须相等才动手。不等还要收尾的后果不是日志难看，
 /// 是**用户那张图没了**：陈旧的抓屏线程会 `clear_session` + 藏掉正被新会话使用的覆盖层。
@@ -1008,15 +1010,14 @@ fn commit_blocking(app: &AppHandle, sel: SnipSelection) -> Result<SnipOutcome, S
 /// 尺寸对不上、脚本抛异常）原本在这边完全看不见，只剩一条 8 秒后的看门狗超时，
 /// 白烧掉一轮真机测试。
 #[tauri::command]
-pub fn snip_cancel(app: AppHandle, reason: Option<String>) {
+pub fn snip_cancel(app: AppHandle, reason: Option<String>, epoch: Option<u64>) {
     match reason.as_deref() {
         Some(r) if !r.is_empty() => tracing::warn!("截图被页面取消：{r}"),
         _ => tracing::debug!("截图已取消（用户主动）"),
     }
-    // 收尾是幂等的（无会话时也照样把窗口藏好、悬浮窗复位），所以不在这里分叉。
-    // epoch 传 0：这条命令是页面发的"取消我眼前这张"，而页面说不出 epoch 也不能假设
-    // 槽里还是它那张（可能已经被新一轮触发换掉）—— 按"收当前这张"处理，见 `may_finish`。
-    finish_session(&app, 0);
+    // 页面带着它那张的 epoch 回来：上一张迟到的取消不许清掉刚触发的新会话。
+    // 0 只留给真正说不出归属的调用方（页面还没拿到 payload 时、以及 Alt+F4）。
+    finish_session(&app, epoch.unwrap_or(0));
 }
 
 /// 设置页"立即截图"：不依赖热键也能走完整条路（也是手动验证的入口）。
@@ -1648,6 +1649,37 @@ mod tests {
         assert!(
             !may_finish(3, 0),
             "会话已经结束（槽里是 0）时那条陈旧计时器也不许再踩一遍"
+        );
+    }
+
+    /// 接线腿：页面取消必须带着它那张的 epoch，Rust 侧也要真的用它收尾。
+    ///
+    /// 只测 `may_finish` 不够——命令把 epoch 丢掉、仍传 0 时那条纯函数用例照样绿。
+    #[test]
+    fn the_page_cancel_carries_its_epoch_into_finish_session() {
+        let src = include_str!("snip.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod.find("pub fn snip_cancel(").expect("取消命令找不到了");
+        let rest = &prod[at..];
+        let body = &rest[..rest.find("\n}\n").expect("函数体切不出来")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("finish_session(&app, epoch.unwrap_or(0))"),
+            "取消没把页面的 epoch 交进去: {code}"
+        );
+        assert!(
+            !code.contains("finish_session(&app, 0)"),
+            "又退回按当前这张收尾了"
+        );
+
+        let js = include_str!("../ui/snip.js");
+        assert!(
+            js.contains(r#"invoke("snip_cancel", { reason: reason || "", epoch })"#),
+            "页面取消没带上 epoch：上一张迟到的取消会踩掉刚触发的新会话"
         );
     }
 
