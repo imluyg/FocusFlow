@@ -58,10 +58,36 @@ fn wait_pid_arg() -> Option<u32> {
     None
 }
 
+/// 一次进程状态探测的三种结局。
+///
+/// `Unknown` 必须单独存在：旧写法只有 `bool`，把"查不到"折进"没活着"，于是那条轮询
+/// 一遇到查不动的 pid 就当它已经退出（见 [`open_process_says_gone`]）。
+#[derive(Debug)]
+enum Probe {
+    /// 确认已经退出
+    Gone,
+    /// 确认还活着
+    Alive,
+    /// 查不动（句柄开不了、调用失败），原因带在字符串里
+    Unknown(String),
+}
+
+/// `OpenProcess` 失败时，这个错误码是不是"那个进程确实不在了"。
+///
+/// 只有 `ERROR_INVALID_PARAMETER`（87）算数：旧进程退出之后 `OpenProcess` 就是这么失败，
+/// 它是这条轮询**正常收尾的信号**。其余失败说明不了"退出了" —— 最典型的是
+/// `ERROR_ACCESS_DENIED`（5，目标是提权或受保护的进程，句柄开不了），把它折成
+/// "已退出"就等于"一查不动就当场往下初始化"，撞上新进程被单实例守卫转发后自行退出、
+/// 旧进程又在退出路上收不到转发 —— 上面 `ARG_WAIT_PID` 那段记的正是"两个进程都没了"。
+/// 与同仓 `app_stats.rs` 的 `toolhelp_next_is_end` 同一个口径：**只有一个错误码算走到头**。
+fn open_process_says_gone(code: u32) -> bool {
+    code == 87
+}
+
 /// 进程是否仍在运行（Win32 `STILL_ACTIVE`）。
 #[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
-    use windows::Win32::Foundation::CloseHandle;
+fn process_probe(pid: u32) -> Probe {
+    use windows::Win32::Foundation::{CloseHandle, GetLastError};
     use windows::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -69,38 +95,90 @@ fn process_alive(pid: u32) -> bool {
     const STILL_ACTIVE: u32 = 259;
     unsafe {
         let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
-            // 打不开句柄即进程已不存在（无权查询同样按"已退出"处理，比空等更好）
-            return false;
+            let code = GetLastError().0;
+            return if open_process_says_gone(code) {
+                Probe::Gone
+            } else {
+                Probe::Unknown(format!("OpenProcess 失败（错误码 {code}）"))
+            };
         };
         let mut code = 0u32;
-        let alive = GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE;
+        // `GetExitCodeProcess` 的返回值在这里是**证据**，不能只拿来当"成功过"用：
+        // 旧写法 `is_ok() && code == STILL_ACTIVE` 把调用失败也折成"没活着"。
+        // 另一头的已知毛边留着（并说明过）：真退出码恰好是 259 的进程会被当成还活着，
+        // 那只会让这一次多等到超时再出声，比反过来早放行安全。
+        let verdict = match GetExitCodeProcess(handle, &mut code) {
+            Ok(()) if code == STILL_ACTIVE => Probe::Alive,
+            Ok(()) => Probe::Gone,
+            Err(e) => Probe::Unknown(format!("GetExitCodeProcess 失败：{e}")),
+        };
         let _ = CloseHandle(handle);
-        alive
+        verdict
     }
 }
 
 #[cfg(not(windows))]
-fn process_alive(_pid: u32) -> bool {
-    false
+fn process_probe(_pid: u32) -> Probe {
+    // 非 Windows 上没有那套互斥体 + 隐藏窗口的单实例守卫，没有要等的东西
+    Probe::Gone
 }
 
 /// 等旧进程退出（自动重启专用，见 `ARG_WAIT_PID`）。
 fn wait_previous_process_exit(pid: u32) {
     let start = Instant::now();
+    // 最后一直查不到 ≠ 确认它还活着：收尾那两句话得分开说
+    let mut last_unknown: Option<String> = None;
     while start.elapsed() < WAIT_PID_TIMEOUT {
-        if !process_alive(pid) {
-            tracing::info!(
-                "自动重启：旧进程 {pid} 已退出（等待 {} ms），开始初始化",
-                start.elapsed().as_millis()
-            );
-            return;
+        match process_probe(pid) {
+            Probe::Gone => {
+                tracing::info!(
+                    "自动重启：旧进程 {pid} 已退出（等待 {} ms），开始初始化",
+                    start.elapsed().as_millis()
+                );
+                return;
+            }
+            Probe::Alive => last_unknown = None,
+            Probe::Unknown(why) => last_unknown = Some(why),
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    tracing::warn!(
-        "自动重启：等待旧进程 {pid} 退出超时（{} 秒），继续启动（可能被单实例守卫拦截）",
-        WAIT_PID_TIMEOUT.as_secs()
-    );
+    match last_unknown {
+        Some(why) => tracing::warn!(
+            "自动重启：等旧进程 {pid} 等到上限（{} 秒），而最后几次连它的状态都查不出来（{why}）；\
+             这次**没能确认**它退出，继续启动可能被单实例守卫拦下",
+            WAIT_PID_TIMEOUT.as_secs()
+        ),
+        None => tracing::warn!(
+            "自动重启：等待旧进程 {pid} 退出超时（{} 秒），继续启动（可能被单实例守卫拦截）",
+            WAIT_PID_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod restart_wait_tests {
+    use super::open_process_says_gone;
+
+    /// 能宣布"旧进程已经退出"的失败**只有一个错误码**。
+    ///
+    /// 这一判据决定新进程是当场往下初始化（早一步就是"两个进程都没了"那条故障），
+    /// 还是继续等到上限并如实说出"没能确认"。87 是文档里那条：pid 已经不是有效进程；
+    /// 5（句柄开不了：目标是提权/受保护进程，或者那个 pid 已经被别的进程占用）
+    /// 讲的是"我查不动"，不是"它退了"。
+    #[test]
+    fn only_one_open_process_failure_means_the_pid_is_gone() {
+        let mut wrong: Vec<String> = Vec::new();
+        if !open_process_says_gone(87) {
+            wrong.push("87 号（pid 已失效）必须算「已退出」，否则这条轮询要空等 15 秒".to_string());
+        }
+        // 0 = 压根没有错误信息；2 = 找不到文件；1412 = 句柄已失效。三者都推不出"退了"
+        for code in [5u32, 0, 2, 1412] {
+            if open_process_says_gone(code) {
+                wrong.push(format!("{code} 号不该被说成「已退出」"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
 }
 
 /// 启动 Tauri 应用。
@@ -853,5 +931,60 @@ mod wiring_audit {
             return None;
         }
         Some(format!("{prefix}*"))
+    }
+
+    /// 自动重启那条轮询不许把"查不到"折成"已退出"。
+    ///
+    /// 上面那条纯用例钉的是**判据**（哪个错误码算退出），它红不到轮询本身 ——
+    /// 这段代码要的是"句柄开不了的进程 + 十五秒的真实等待"，用例造不出可达的输入。
+    /// 所以这里钉调用形态：`OpenProcess` 失败那一步必须过 `open_process_says_gone`，
+    /// 而旧的两处折法（`!process_alive(pid)` 那个 bool、`is_ok() &&` 那句拿返回值当证据）
+    /// 不许回来。
+    #[test]
+    fn the_restart_wait_never_reports_an_unanswerable_query_as_exit() {
+        let src = read("src/lib.rs");
+        // 切到第一个测试模块之前：本文件里的 `#[cfg(test)]` 字样也出现在文档注释里，
+        // 按那一句切会把整段产品代码切没（针脚于是永远"找不到"，红在正确代码上）。
+        let cut = src
+            .find("#[cfg(test)]\nmod restart_wait_tests")
+            .expect("restart_wait_tests 的起点找不到了");
+        let prod = &src[..cut];
+        let mut wrong: Vec<String> = Vec::new();
+        // 两条针脚合起来才钉得住"错误码是从 GetLastError 现取的、并且过了一次判据"：
+        // 单看 `open_process_says_gone(实参)` 那一行会被 rustfmt 拆掉换行，
+        // 那种针脚在正确代码上永远找不到（本仓上一轮刚踩过一次）。
+        let n = prod.matches("let code = GetLastError().0;").count();
+        if n != 1 {
+            wrong.push(format!(
+                "OpenProcess 失败后必须恰好一次现读错误码，实得 {n} 次"
+            ));
+        }
+        let m = prod.matches("open_process_says_gone(code)").count();
+        if m != 1 {
+            wrong.push(format!(
+                "那份错误码必须恰好过一次「哪个码才算退出」的判据，实得 {m} 次"
+            ));
+        }
+        for gone_old in [
+            "!process_alive(pid)",
+            "fn process_alive",
+            "GetExitCodeProcess(handle, &mut code).is_ok()",
+        ] {
+            if prod.contains(gone_old) {
+                wrong.push(format!("旧写法回来了：{gone_old}（查不到＝已退出）"));
+            }
+        }
+        let arms = prod.matches("Probe::Gone =>").count();
+        if arms != 1 {
+            wrong.push(format!("轮询里「确认已退出」那一臂应恰好一处，实得 {arms}"));
+        }
+        if !prod.contains("Probe::Unknown(why) => last_unknown = Some(why)") {
+            wrong.push("查不动那一臂没把原因留给收尾那句 warn".to_string());
+        }
+        assert!(
+            wrong.is_empty(),
+            "重启轮询的接线守卫红:\n{}",
+            wrong.join("\n")
+        );
     }
 }
