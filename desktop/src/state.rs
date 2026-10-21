@@ -1446,6 +1446,10 @@ fn spawn_stats_worker(
                     .map(|w| w.today_active_for_display())
                     .unwrap_or(0) as i64;
                 let active = cur_today != prev_today_count;
+                // 写线程刚落过一批：`pending` 会被清空，而 `agg.total` 仍是上一轮聚合的
+                // 库值 —— 这拍不重聚合就推送的话，周期总数会当场少掉这批，且空闲时
+                // `last_heavy_today == cur_today` 会让下一轮判成"数据未变"而永远不补。
+                let flush_seq_now = db.writer().map(|w| w.flush_seq()).unwrap_or(0);
                 let heavy_elapsed_ms = last_heavy.elapsed().as_millis() as u64;
                 let day_ce = {
                     use chrono::Datelike;
@@ -1490,8 +1494,15 @@ fn spawn_stats_worker(
                     u64::MAX
                 } else if active {
                     (config.get_int("gui", "active_refresh_interval", 2).max(1) as u64) * 1000
-                } else if cur_today != last_heavy_today {
-                    // 空闲但数据自上次重聚合后有变化：按空闲周期刷新
+                } else if idle_refresh_needed(
+                    cur_today,
+                    last_heavy_today,
+                    flush_seq_now,
+                    charts_seq,
+                ) {
+                    // 空闲但今日计数变了、或库在上一轮聚合之后又落过一批：按空闲周期刷新。
+                    // 后一半不能漏：flush 把 pending 清零而库值要等重聚合才进 `agg.total`，
+                    // 只看今日计数的话，最后一轮聚合之后落的那批就再也补不上。
                     (config.get_int("gui", "full_refresh_interval", 10).max(1) as u64) * 1000
                 } else {
                     // 空闲且数据未变：无需重算，等有输入或强制/周期切换
@@ -1502,7 +1513,10 @@ fn spawn_stats_worker(
                 let do_heavy = forced
                     || period_changed
                     || main_just_shown
-                    || heavy_elapsed_ms >= heavy_interval_ms;
+                    || heavy_elapsed_ms >= heavy_interval_ms
+                    // 只在窗口可见时补这一拍：隐藏/最小化时重聚合本来就停着（成本考虑），
+                    // 落库不需要把它叫醒；等 `main_just_shown` 那一拍会连同最新库值一起算。
+                    || (main_visible && flush_seq_now != charts_seq);
 
                 // 自动周报：进程启动后的第一轮、以及跨进新一周后的第一轮，为
                 // 「刚结束的那个整周」生成一次 Markdown 报告。锚点取本周一，
@@ -1795,6 +1809,20 @@ fn spawn_stats_worker(
         .is_ok()
 }
 
+/// 空闲档要不要再来一轮重聚合。
+///
+/// 只看"今日计数变没变"会漏掉一种：最后一轮聚合之后、人停手之前落进库的那一批。
+/// flush 把写线程的 pending 清零，库里的值却要等重聚合才进 `agg.total`；若这拍
+/// 判成"数据未变"，周期总数就会少掉那批且一直不补（要等下一次输入才回头重算）。
+fn idle_refresh_needed(
+    cur_today: i64,
+    last_heavy_today: i64,
+    flush_seq: u64,
+    charts_seq: u64,
+) -> bool {
+    cur_today != last_heavy_today || flush_seq != charts_seq
+}
+
 /// 全历史总计 = 缓存基准 + 今日自缓存构建以来的增量（零 DB 查询）。
 ///
 /// 今日是唯一会实时增长的部分：跨天、导入、清库都会让 `alltime_dirty` 重建基准。
@@ -2082,8 +2110,8 @@ fn compute_charts(
 mod compute_charts_tests {
     use super::{
         alltime_anchor_today, alltime_total_now, apply_display_total, clamp_floating_into_screen,
-        compute_charts, sort_rank_desc, total_for_display, ChartAgg, FloatingBounds,
-        FLOATING_MIN_VISIBLE, RANK_LIMIT,
+        compute_charts, idle_refresh_needed, sort_rank_desc, total_for_display, ChartAgg,
+        FloatingBounds, FLOATING_MIN_VISIBLE, RANK_LIMIT,
     };
 
     /// 他这台机器的形状：1920x1080 单屏（任务栏 48px，故工作区底边 1032）、卡片 90x46。
@@ -2385,6 +2413,33 @@ mod compute_charts_tests {
         assert_eq!(alltime_total_now(1000, 100, 100), 1000, "无新增：等于基准");
         assert_eq!(alltime_total_now(1000, 100, 130), 1030, "新增 30 次即计入");
         assert_eq!(alltime_total_now(1000, 100, 0), 1000, "计数回退不减基准");
+    }
+
+    /// 空闲重聚合的判据也要看"库在上一轮聚合之后落过库没有"。
+    #[test]
+    fn idle_refresh_notices_a_flush_after_the_last_aggregation() {
+        assert!(!idle_refresh_needed(100, 100, 5, 5), "什么都没变：别重算");
+        assert!(idle_refresh_needed(101, 100, 5, 5), "今日计数变了要重算");
+        assert!(
+            idle_refresh_needed(100, 100, 6, 5),
+            "库刚落过一批、pending 已清零：不重算就会少掉这批且一直不补"
+        );
+        // 接线腿：判据要被循环真的用上，且当拍就要重聚合（不是只把空闲周期改短）。
+        // 只取测试模块之前的生产半边，否则下面的断言字符串会匹配到自己；比较前先去空白，
+        // 因为 rustfmt 会把长调用拆行。
+        let src = include_str!("state.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let flat: String = prod.split_whitespace().collect();
+        assert!(
+            flat.contains(
+                "idle_refresh_needed(cur_today,last_heavy_today,flush_seq_now,charts_seq"
+            ),
+            "空闲间隔没接这条判据"
+        );
+        assert!(
+            flat.contains("main_visible&&flush_seq_now!=charts_seq"),
+            "do_heavy 没把刚落库的一批算进去（且要限定在可见时），推送会当场少一批"
+        );
     }
 
     /// 重建「总计」基准的那一次，显示值既不许少掉还没落库的增量，也不许往回跳。
