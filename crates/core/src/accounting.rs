@@ -201,8 +201,21 @@ pub fn init_db() -> anyhow::Result<()> {
             )?;
         }
     }
-    // 把历史行里没补零的 purchase_date 补齐成这一列的尺子（见函数注释）
-    heal_purchase_date_format(&conn)?;
+    // 把历史行里没补零的 purchase_date 补齐成这一列的尺子（见函数注释）。
+    //
+    // 这一步**不许把整次初始化判成失败**：schema 与默认分类在上面已经做完并落库，
+    // 而记账 API 每次调用都惰性走这条（`host.rs` 的闩只在成功时才落下）⇒
+    // 一次写不进去（盘满、库被别的连接长期握着）就会让闩永不落下、
+    // 每一次 `accounting_add` 都回「记账库没打开或写入失败」，
+    // 而那个库其实开得好好的、数据也完整 —— 少的只是"某些旧行能被月度合计查到"。
+    let stuck = heal_purchase_date_format(&conn);
+    if !stuck.is_empty() {
+        tracing::warn!(
+            "purchase_date 格式有 {} 行没补齐（记账照常可用，这些行在月度合计与日期区间里仍查不到）：{}",
+            stuck.len(),
+            stuck.join("；")
+        );
+    }
     Ok(())
 }
 
@@ -214,8 +227,12 @@ pub fn init_db() -> anyhow::Result<()> {
 /// 所以旧库、以及"整份导入 Python 时代的账本"里那种行是真实存在过的。
 ///
 /// 认不出来的值（含空串）**原样留着**：这是补齐格式，不是替用户猜一个日期。
-fn heal_purchase_date_format(conn: &Connection) -> anyhow::Result<usize> {
-    let fixed: Vec<(i64, String)> = {
+///
+/// 交回"没补成的原因"清单（空 = 全部补齐，或本来就没有要补的行）。原先它回 `Result`
+/// 并由 `init_db` 用 `?` 往外抛 ⇒ 一条 UPDATE 写不动就整次初始化失败（后果见调用点那段）；
+/// 而那句"补齐了 N 行"报的是**打算**改写的行数，不是写成功的那些。
+fn heal_purchase_date_format(conn: &Connection) -> Vec<String> {
+    let pending = (|| -> rusqlite::Result<Vec<(i64, String)>> {
         let mut stmt = conn.prepare("SELECT id, purchase_date FROM expenses")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         let mut out = Vec::new();
@@ -227,21 +244,30 @@ fn heal_purchase_date_format(conn: &Connection) -> anyhow::Result<usize> {
                 }
             }
         }
-        out
+        Ok(out)
+    })();
+    let pending = match pending {
+        Ok(rows) => rows,
+        Err(e) => return vec![format!("读 expenses 失败: {e}")],
     };
-    for (id, norm) in &fixed {
-        conn.execute(
+    let mut fixed = 0usize;
+    let mut stuck: Vec<String> = Vec::new();
+    for (id, norm) in &pending {
+        if let Err(e) = conn.execute(
             "UPDATE expenses SET purchase_date=?1 WHERE id=?2",
             rusqlite::params![norm, id],
-        )?;
+        ) {
+            stuck.push(format!("第 {id} 行没写成: {e}"));
+            continue;
+        }
+        fixed += 1;
     }
-    if !fixed.is_empty() {
+    if fixed > 0 {
         tracing::warn!(
-            "补齐了 {} 行 purchase_date 的格式（它们此前在月度合计与日期区间里查不到）",
-            fixed.len()
+            "补齐了 {fixed} 行 purchase_date 的格式（它们此前在月度合计与日期区间里查不到）"
         );
     }
-    Ok(fixed.len())
+    stuck
 }
 
 fn row_to_expense(r: &rusqlite::Row<'_>) -> rusqlite::Result<Expense> {
@@ -1909,6 +1935,50 @@ mod tests {
             .unwrap()
         };
         assert_eq!(junk, "昨天", "认不出的值不能被改掉");
+    }
+
+    /// 补格式那一步写不进去时，不许把整次初始化判成失败。
+    ///
+    /// 记账 API 每次调用都惰性走 `init_db`，而 `host.rs` 那个闩只在成功时落下：
+    /// 一条 UPDATE 写不动（盘满、库被别的连接长期握着）就让闩永不落下，
+    /// 之后每一次 `accounting_add` 都回「记账库没打开或写入失败」——
+    /// 而那个库其实开得好好的、数据也完整，少的只是"某些旧行能被月度合计查到"。
+    #[test]
+    fn a_stuck_date_backfill_does_not_fail_the_whole_init() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_backfill_stuck");
+        init_db().expect("建库失败");
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO expenses (type, item_name, purchase_date, amount, record_time)
+                 VALUES ('支出', '没补零', '2026-9-1', 12.0, '2026-09-01 08:00:00')",
+                [],
+            )
+            .unwrap();
+            // 读还是好的，只有 UPDATE 被挡 —— 这是"写不动"最稳定的无头形态
+            conn.execute_batch(
+                "CREATE TRIGGER block_expense_update BEFORE UPDATE ON expenses
+                 BEGIN SELECT RAISE(ABORT, '夹具：写被挡'); END;",
+            )
+            .unwrap();
+        }
+
+        init_db().expect("补齐写不动不能让整次初始化失败");
+
+        let still = {
+            let conn = open().unwrap();
+            conn.query_row(
+                "SELECT purchase_date FROM expenses WHERE item_name='没补零'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            still, "2026-9-1",
+            "没写成的那一行要原样留着，不能被清空、也不能替用户猜一个日期"
+        );
     }
 
     /// 回归（第 23 轮）：`add_category` 撞重名时 `INSERT OR IGNORE` 整条忽略，紧接着
