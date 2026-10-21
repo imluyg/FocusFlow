@@ -101,17 +101,59 @@ pub fn save_session(s: &Session) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 读会话时那一条列表里必须**按名字**问的列，顺序就是 `row.get(0..7)` 的顺序。
+///
+/// 原来两条查询都写 `SELECT *` 再按下标取：列的先后由**建表时的顺序**决定，
+/// 而这个库可能是 Python 时代留下的那张（列名与顺序我们无法保证）。少一列或多一列时
+/// 下标会整体错位 —— 最省事的观察是"把 key_count 放到最后一列"，于是 planned 与 actual
+/// 被读成别的数字，面板上的时长/键数安静地变成别的字段；那一列类型对不上时更干脆：
+/// 每一行都转换失败，`flatten()` 把它们全丢掉 ⇒ "今天没做过番茄"。
+const SESSION_COLS: &str =
+    "id, type, start_time, end_time, planned_seconds, actual_seconds, key_count, created_at";
+
+/// 把一批行读成会话；单行读不出来时丢掉**那一行**并数下来，不牵连别的行。
+///
+/// 交回 `(sessions, 被丢掉几行, 第一个失败原因)`：调用方负责把后两样说出来 ——
+/// 原先这里是一条 `rows.flatten().collect()`，一行读不动就少一行，而今日汇总与列表
+/// 都看不出差别。
+fn collect_sessions<R>(rows: R) -> (Vec<Session>, usize, Option<String>)
+where
+    R: Iterator<Item = rusqlite::Result<Session>>,
+{
+    let mut sessions = Vec::new();
+    let mut dropped = 0usize;
+    let mut first_err: Option<String> = None;
+    for row in rows {
+        match row {
+            Ok(s) => sessions.push(s),
+            Err(e) => {
+                dropped += 1;
+                if first_err.is_none() {
+                    first_err = Some(e.to_string());
+                }
+            }
+        }
+    }
+    (sessions, dropped, first_err)
+}
+
 /// 按日期查询会话。
 pub fn get_sessions_by_date(date_str: &str, limit: i64) -> Vec<Session> {
     let conn = match open_local() {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::error!("番茄钟查询（{date_str}）失败：库打不开: {e}");
+            return Vec::new();
+        }
     };
-    let mut stmt = match conn.prepare(
-        "SELECT * FROM pomodoro_sessions WHERE start_time >= ?1 AND start_time < ?2 ORDER BY id DESC LIMIT ?3",
-    ) {
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT {SESSION_COLS} FROM pomodoro_sessions WHERE start_time >= ?1 AND start_time < ?2 ORDER BY id DESC LIMIT ?3",
+    )) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::error!("番茄钟查询（{date_str}）失败：语句准备不了: {e}");
+            return Vec::new();
+        }
     };
     // 上界取「次日 00:00:00」的开区间。原先写成 `start_time < '<date> 23:59:59'`，
     // 把一天最后那一秒（23:59:59 整）开始的会话整个排除在外。
@@ -122,22 +164,43 @@ pub fn get_sessions_by_date(date_str: &str, limit: i64) -> Vec<Session> {
         .unwrap_or_else(|| format!("{date_str} 23:59:59"));
     let result = stmt.query_map(
         rusqlite::params![format!("{date_str} 00:00:00"), end_bound, limit],
-        |r| {
-            Ok(Session {
-                id: r.get(0)?,
-                rtype: r.get(1)?,
-                start_time: r.get(2)?,
-                end_time: r.get(3)?,
-                planned_seconds: r.get(4)?,
-                actual_seconds: r.get(5)?,
-                key_count: r.get(6)?,
-                created_at: r.get(7)?,
-            })
-        },
+        row_to_session,
     );
     match result {
-        Ok(rows) => rows.flatten().collect(),
-        Err(_) => Vec::new(),
+        Ok(rows) => {
+            let (sessions, dropped, why) = collect_sessions(rows);
+            report_dropped(date_str, dropped, why.as_deref());
+            sessions
+        }
+        Err(e) => {
+            tracing::error!("番茄钟查询（{date_str}）失败：这一天的行一条都没读出来: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// 把一行（按下标，顺序即 [`SESSION_COLS`]）读成会话。
+fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: r.get(0)?,
+        rtype: r.get(1)?,
+        start_time: r.get(2)?,
+        end_time: r.get(3)?,
+        planned_seconds: r.get(4)?,
+        actual_seconds: r.get(5)?,
+        key_count: r.get(6)?,
+        created_at: r.get(7)?,
+    })
+}
+
+/// 有几行没读出来时要点名说：不说就等于"那一天少几行"是正常结果。
+fn report_dropped(date_str: &str, dropped: usize, first_err: Option<&str>) {
+    if dropped > 0 {
+        tracing::warn!(
+            "番茄钟查询（{date_str}）有 {dropped} 行读不出来（第一个原因：{}），\
+             它们不会出现在今日汇总与列表里",
+            first_err.unwrap_or("(没带上原因)")
+        );
     }
 }
 
@@ -145,27 +208,31 @@ pub fn get_sessions_by_date(date_str: &str, limit: i64) -> Vec<Session> {
 pub fn get_recent_sessions(limit: i64) -> Vec<Session> {
     let conn = match open_local() {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::error!("番茄钟最近会话查询失败：库打不开: {e}");
+            return Vec::new();
+        }
     };
-    let mut stmt = match conn.prepare("SELECT * FROM pomodoro_sessions ORDER BY id DESC LIMIT ?1") {
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT {SESSION_COLS} FROM pomodoro_sessions ORDER BY id DESC LIMIT ?1",
+    )) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::error!("番茄钟最近会话查询失败：语句准备不了: {e}");
+            return Vec::new();
+        }
     };
-    let result = stmt.query_map([limit], |r| {
-        Ok(Session {
-            id: r.get(0)?,
-            rtype: r.get(1)?,
-            start_time: r.get(2)?,
-            end_time: r.get(3)?,
-            planned_seconds: r.get(4)?,
-            actual_seconds: r.get(5)?,
-            key_count: r.get(6)?,
-            created_at: r.get(7)?,
-        })
-    });
+    let result = stmt.query_map([limit], row_to_session);
     match result {
-        Ok(rows) => rows.flatten().collect(),
-        Err(_) => Vec::new(),
+        Ok(rows) => {
+            let (sessions, dropped, why) = collect_sessions(rows);
+            report_dropped("最近", dropped, why.as_deref());
+            sessions
+        }
+        Err(e) => {
+            tracing::error!("番茄钟最近会话查询失败：一条都没读出来: {e}");
+            Vec::new()
+        }
     }
 }
 
@@ -830,6 +897,115 @@ mod tests {
             "落库成功要计一个番茄"
         );
         assert_eq!(get_recent_sessions(10).len(), 1, "库里要留下那一行");
+    }
+
+    /// 读会话必须按**列名**问，不能拿 `SELECT *` 的下标去猜。
+    ///
+    /// 两条查询原先都写 `SELECT *` 再 `row.get(0..7)`：下标对的是**建表时的列序**，
+    /// 而这个库可能是 Python 时代那张（那一版把 key_count 放在 actual_seconds 之前完全
+    /// 说得通）。列序一不同，"计划时长/实际时长/按键数"三个数就整体错位 —— 面板照样
+    /// 出数字，只是每个都是别的字段；如果那张表少一列，则是每一行都转换失败，
+    /// `flatten()` 把它们全丢掉，看上去"今天没做过番茄"。
+    #[test]
+    fn sessions_are_read_by_name_not_by_column_position() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("pomo_legacy_order");
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        {
+            let conn = open_local().unwrap();
+            // 旧形态：列名一样、顺序不同（key_count 夹在 planned 之前）
+            conn.execute_batch(
+                "CREATE TABLE pomodoro_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    type TEXT NOT NULL,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    key_count INTEGER NOT NULL DEFAULT 0,
+                    planned_seconds INTEGER NOT NULL,
+                    actual_seconds INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pomodoro_sessions
+                 (type, start_time, end_time, key_count, planned_seconds, actual_seconds, created_at)
+                 VALUES ('work', ?1, ?2, 42, 1500, 900, ?2)",
+                rusqlite::params![format!("{today} 09:00:00"), format!("{today} 09:25:00")],
+            )
+            .unwrap();
+        }
+
+        for got in [get_sessions_by_date(&today, 100), get_recent_sessions(10)] {
+            let s = got
+                .first()
+                .expect("旧形态那张表的行必须读得出来，不能变成「今天没做过番茄」");
+            let mut wrong: Vec<String> = Vec::new();
+            if s.rtype != "work" {
+                wrong.push(format!("type 读成 {:?}", s.rtype));
+            }
+            if s.planned_seconds != 1500 {
+                wrong.push(format!("planned_seconds 读成 {}", s.planned_seconds));
+            }
+            if s.actual_seconds != 900 {
+                wrong.push(format!("actual_seconds 读成 {}", s.actual_seconds));
+            }
+            if s.key_count != 42 {
+                wrong.push(format!("key_count 读成 {}", s.key_count));
+            }
+            assert!(wrong.is_empty(), "按位置猜列，实得: {}", wrong.join("、"));
+        }
+
+        // 今日汇总吃的是同一条读路：错位的三个数会直接变成卡片上的键数与时长
+        let (count, keys, secs) = today_summary();
+        assert!(
+            count == 1 && keys == 42 && secs == 900,
+            "今日汇总要按字段本来的意思算，实得 count={count} keys={keys} secs={secs}"
+        );
+    }
+
+    /// 接线守卫：两条读路都得走那份列清单，且不许再把行"折叠"掉。
+    ///
+    /// 上面那条用例钉的是读出来的值；它盯不到有人把 SQL 改回 `SELECT *`（只要列序
+    /// 恰好对上，用例照样绿），也盯不到"少一行没人说"（少的那一行本来就是被 `flatten()`
+    /// 静默吞掉的形状）。所以这两半各钉一条字面判据。
+    #[test]
+    fn the_session_reads_name_their_columns_and_count_their_losses() {
+        let src = include_str!("pomodoro.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = src[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut wrong: Vec<String> = Vec::new();
+        if prod.contains("SELECT * FROM pomodoro_sessions") {
+            wrong.push("又有查询用 SELECT * 猜列的位置".to_string());
+        }
+        let n = prod.matches("SELECT {SESSION_COLS}").count();
+        if n != 2 {
+            wrong.push(format!("两条读路必须都用那份列清单，实得 {n} 处"));
+        }
+        if prod.contains("rows.flatten()") {
+            wrong.push("行又被 flatten() 静默吞掉了（少几行没人知道）".to_string());
+        }
+        for (needle, what) in [
+            (
+                "report_dropped(date_str, dropped, why.as_deref())",
+                "按日期那条读路",
+            ),
+            (
+                "report_dropped(\"最近\", dropped, why.as_deref())",
+                "最近会话那条读路",
+            ),
+        ] {
+            if !prod.contains(needle) {
+                wrong.push(format!(
+                    "{what}没把「少读了几行」说出来（needle 对不上＝被改写了）"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "读路守卫红:\n{}", wrong.join("\n"));
     }
 
     /// 一天最后一秒里开始的会话必须查得到。
