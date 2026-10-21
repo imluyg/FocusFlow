@@ -597,31 +597,48 @@ pub fn add_category(name: &str, ctype: &str, subs: &[String]) -> i64 {
     };
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return -1,
+        // 原先这里是 `Err(_) => return -1`，一行日志都不留 —— 而面板那一头
+        // （`host.rs` 的 `accounting_category_add`）对 -1 说的是
+        // 「记账库没打开或写入失败（详见日志）」，那句话把人指向日志里一条根本不存在的记录。
+        Err(e) => {
+            tracing::error!("添加分类 [{name}] 失败：记账库打不开: {e}");
+            return -1;
+        }
     };
-    // 重名不再"假装添加成功"。`INSERT OR IGNORE` 撞 UNIQUE 时整条被忽略，紧接着回读
-    // id 却拿到**已存在那一条**的 id（> 0），于是面板报"分类 [x] 已添加"，而这次传的
-    // ctype / subs 一个字都没落库 —— 用户以为把类型改掉了。与 update_category 的
-    // "已存在"同口径。
-    if category_type(name).is_some() {
-        tracing::warn!(
-            "分类 [{name}] 已经存在：这次传的类型「{ctype}」与子分类都没有落库（要改请用「修改分类」）"
-        );
-        return -1;
+    // 查重用**同一个连接**，并把"读不出来"与"没有这个分类"分开。
+    // 原先调的是 `category_type(name)`，它自己又 `open().ok()?` 一次：库被别的连接握着时
+    // 它回 `None`，也就是"没有这个分类" ⇒ 于是往下走 INSERT OR IGNORE，被 UNIQUE 挡下
+    // （一条都没插），最后再按名字回读拿到**已存在那一条**的 id（> 0）⇒
+    // 面板报「分类 [x] 已添加」，而这次传的类型与子分类一个字都没落库。
+    let exists = conn.query_row(
+        "SELECT 1 FROM categories WHERE name=?1",
+        [name],
+        |_r| -> rusqlite::Result<()> { Ok(()) },
+    );
+    match exists {
+        Ok(()) => {
+            tracing::warn!(
+                "分类 [{name}] 已经存在：这次传的类型「{ctype}」与子分类都没有落库（要改请用「修改分类」）"
+            );
+            return -1;
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(e) => {
+            tracing::error!(
+                "添加分类 [{name}] 失败：查重这一步读不出来（{e}），不按「没有这个分类」继续往下写"
+            );
+            return -1;
+        }
     }
     let subs_json = subs.join(",");
-    let r = conn.execute(
-        "INSERT OR IGNORE INTO categories (name, type, subs) VALUES (?1, ?2, ?3)",
+    // 不再用 `INSERT OR IGNORE` + 事后按名字回读猜 id：
+    // `execute` 的返回值说的就是"这一条是不是我插进去的"，`last_insert_rowid()` 免掉
+    // 第二次查询 —— 那次回读原先 `unwrap_or(-1)`，读不动时会把**已经建好的分类**报成失败。
+    match conn.execute(
+        "INSERT INTO categories (name, type, subs) VALUES (?1, ?2, ?3)",
         rusqlite::params![name, ctype, subs_json],
-    );
-    match r {
-        Ok(_) => {
-            // 返回 id（存在则查询）
-            conn.query_row("SELECT id FROM categories WHERE name=?1", [name], |r| {
-                r.get(0)
-            })
-            .unwrap_or(-1)
-        }
+    ) {
+        Ok(_) => conn.last_insert_rowid(),
         Err(e) => {
             tracing::error!("添加分类失败: {e}");
             -1
@@ -2271,6 +2288,75 @@ mod tests {
             game.subs
         );
         assert!(!legacy_table_still_there(), "并完了就该收掉旧表");
+    }
+
+    /// `add_category` 交回的 id 必须是"这一次插进去的那一条"的 id，传来的子分类要落库。
+    #[test]
+    fn add_category_returns_the_id_of_the_row_it_inserted() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_cat_id");
+        init_db().expect("建库失败");
+        let id = add_category("交通", "expense", &["地铁".to_string(), "打车".to_string()]);
+        assert!(id > 0, "正常添加要回一个正 id");
+        let stored: i64 = {
+            let conn = open().unwrap();
+            conn.query_row("SELECT id FROM categories WHERE name='交通'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(id, stored, "交回的 id 就是这一条的 id");
+        let got = get_all_categories()
+            .into_iter()
+            .find(|c| c.name == "交通")
+            .expect("分类在库里");
+        assert_eq!(
+            got.subs,
+            vec!["地铁".to_string(), "打车".to_string()],
+            "这次传的子分类要真的落库"
+        );
+    }
+
+    /// 接线腿：查重与插入必须共用一个连接，"插没插进去"要由这一次插入的结果回答。
+    ///
+    /// 三条形状各对一个真实后果：另开一次连接的查重在库被握着时回 `None`
+    /// （＝"没有这个分类"），于是 `INSERT OR IGNORE` 被 UNIQUE 挡下、再按名字回读
+    /// 拿到已存在那条的 id ⇒ 面板说「已添加」而什么都没写；打开库失败被折成 -1
+    /// 时面板那句「详见日志」指向一条不存在的记录。
+    #[test]
+    fn add_category_uses_one_connection_and_the_insert_answer() {
+        let src = include_str!("accounting.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn add_category(")
+            .expect("添加分类函数找不到了");
+        let rest = &prod[at..];
+        let end = rest.find("\n}\n").expect("函数切不出来");
+        // 注释里写着被替换掉的旧调用名，比原文会被自己的说明文字喂绿
+        let code: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 四条腿攒齐了一次断：头一条先 panic 就把后面三条的敏感度藏起来了
+        let mut bad: Vec<String> = Vec::new();
+        if code.contains("category_type(name)") {
+            bad.push(
+                "查重又开了第二个连接：读不动时会被当成「没有这个分类」继续往下写".to_string(),
+            );
+        }
+        if code.contains("Err(_) => return -1") {
+            bad.push(
+                "打开库失败被静默折成 -1：面板那句「详见日志」会指向一条不存在的记录".to_string(),
+            );
+        }
+        if code.contains("INSERT OR IGNORE") {
+            bad.push("又用 OR IGNORE 把冲突吞成成功".to_string());
+        }
+        if !code.contains("last_insert_rowid()") {
+            bad.push("id 改为按这一次插入的结果给，不再事后回读猜".to_string());
+        }
+        assert!(bad.is_empty(), "{bad:?}");
     }
 
     /// 回归（第 23 轮）：`add_category` 撞重名时 `INSERT OR IGNORE` 整条忽略，紧接着
