@@ -1163,16 +1163,36 @@ fn journal_mode_switched_to_delete(conn: &Connection) -> bool {
 ///   拿不到时会被误判为「坏备份」删掉
 ///
 /// 所以备份完成后切回 rollback journal 并清掉 sidecar。
+/// 备份收尾时这份 WAL 能不能删。
+///
+/// 只有三种情况算"可以删"：journal mode 已确认切回 rollback（WAL 已并回主库）、
+/// WAL 不存在、WAL 确实是 0 字节。**metadata 读不出来不等于空**：把它当空删掉，
+/// 只写在 WAL 里的那几笔就从这份备份里永久消失，而源库指纹已经写好，之后的备份
+/// 都会跳过这个库。宁可留一个 sidecar，也不能赌它里面没有数据。
+fn wal_can_be_dropped(switched: bool, wal: &Path) -> bool {
+    if switched {
+        return true;
+    }
+    match std::fs::metadata(wal) {
+        Ok(m) => m.len() == 0,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            tracing::warn!(
+                "读不到备份 WAL 的大小（{}）: {e} —— 当作非空保留，避免删掉还没并回主库的数据",
+                wal.display()
+            );
+            false
+        }
+    }
+}
+
 fn finalize_backup(dst: &Path) {
     let switched = Connection::open(dst)
         .map(|conn| journal_mode_switched_to_delete(&conn))
         .unwrap_or(false);
     let [wal, shm] = sidecar_paths(dst);
     // 非空 WAL 里可能有还没并回主库的数据：只有确认切换成功、或 WAL 缺失/0 字节时才删
-    let wal_empty = std::fs::metadata(&wal)
-        .map(|m| m.len() == 0)
-        .unwrap_or(true);
-    if switched || wal_empty {
+    if wal_can_be_dropped(switched, &wal) {
         let _ = std::fs::remove_file(&wal);
         let _ = std::fs::remove_file(&shm);
     }
@@ -2951,6 +2971,34 @@ mod tests {
             !code.contains(".is_ok()"),
             "「它没报错」又被当成「模式切成了」"
         );
+    }
+
+    /// metadata 读不出来 ≠ WAL 是空的：当空删掉会丢备份里还没并回主库的记录。
+    ///
+    /// NUL 路径让 `metadata` 稳定报 InvalidInput（不依赖权限/杀软），
+    /// 正是"读不到大小"这一类；判据必须保守地保留。
+    #[test]
+    fn an_unreadable_wal_size_is_kept_not_deleted() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("wal_size_unreadable");
+        let wal = dir.path().join("x.db-wal");
+
+        assert!(wal_can_be_dropped(false, &wal), "缺失的 WAL 没有可丢的数据");
+        std::fs::write(&wal, []).unwrap();
+        assert!(wal_can_be_dropped(false, &wal), "0 字节可以直接删");
+        std::fs::write(&wal, b"frames").unwrap();
+        assert!(!wal_can_be_dropped(false, &wal), "非空 WAL 不许删");
+        assert!(
+            wal_can_be_dropped(true, &wal),
+            "已确认切回 rollback 时 WAL 已并回主库"
+        );
+
+        let bad = Path::new("bad\0name.db-wal");
+        let (kept, logs) = crate::logger::capture_logs(|| wal_can_be_dropped(false, bad));
+        assert!(!kept, "读不到大小不能当空");
+        let shown = logs.join("\n");
+        assert!(shown.contains("读不到备份 WAL 的大小"), "要出声: {shown}");
+        assert!(shown.contains("保留"), "要说明保守方向: {shown}");
     }
 
     /// 「列出来却不在原位」的那一年必须算进没备份出去的清单，不许当成"没有要备份的"。
