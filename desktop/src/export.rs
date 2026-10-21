@@ -198,6 +198,13 @@ pub fn write_weekly_report_for(
     use chrono::Datelike;
     use focusflow_core::db::queries as q;
 
+    // 读侧的闸必须先过：`get_stats_by_date` 把「年度库打不开」折成 `(0, 空表)`，
+    // `get_daily_counts` 折成缺行 —— 移动盘还没插、或某一年的库被同步盘换成占位文件时，
+    // 这条路的结局是 `Ok(None)`，于是设置页说「上一个整周没有任何记录，未生成文件」，
+    // 自动那条只留一行 debug。两句都把"读不出来"讲成了"那一周没记录"，而它差着一整年的数。
+    // 判据与 CLI 七条读命令、桌面导出共用 `check_years_readable`（本文件开头写明的口径）。
+    q::check_years_readable().map_err(|e| anyhow::anyhow!("生成周报被拒绝：{e}"))?;
+
     let goal = weekly_goal(focusflow_core::config::instance());
 
     let mut keys: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
@@ -407,6 +414,65 @@ mod tests {
         let r = write_weekly_report_for(d(2020, 3, 2), d(2020, 3, 8))?;
         assert!(r.is_none(), "没有任何记录时不该生成文件");
         assert!(!report_dir().exists(), "连 reports/ 目录都不该被创建出来");
+        Ok(())
+    }
+
+    /// 「那一年的库读不出来」不能说成「那一周没有记录」，也不能出一份偏小的数。
+    ///
+    /// 这条道原先不问可读性：按日查询把打不开折成 0，于是 `total == 0 && prev_total == 0`
+    /// 成立 → 回 `Ok(None)` → 设置页那句「上一个整周没有任何记录，未生成文件」，
+    /// 自动那条一行 debug。坏掉的那年如果在报告窗口之外（连续天数要往回看一年多），
+    /// 结局更糟：文件照写，数字偏小，界面报绿色成功。
+    #[test]
+    fn a_week_that_cannot_be_read_is_not_reported_as_empty() -> anyhow::Result<()> {
+        use chrono::{Datelike, NaiveDate};
+        use focusflow_core::db::connection::{ensure_schema, open_rw};
+        use focusflow_core::db::queries;
+        use focusflow_core::paths;
+
+        let _serial = crate::app_dir_lock();
+        let _app = paths::test_app_dir("weekly_unreadable");
+        queries::invalidate_years_cache();
+        focusflow_core::db::connection::clear_ro_cache();
+
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        let (from, to) = (d(2020, 3, 2), d(2020, 3, 8));
+        let epoch = d(1970, 1, 1);
+        let dk = |day: NaiveDate| day.signed_duration_since(epoch).num_days();
+
+        // 报告那一年的库：建好，并且**真有数据**（这样"读不出来"与"没有记录"才可能被分开）
+        {
+            let c = open_rw(&paths::year_db_path(from.year()))?;
+            ensure_schema(&c, from.year())?;
+            c.execute_batch(&format!(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES ({}, 30000, 3600);",
+                dk(from)
+            ))?;
+        }
+        // 另一年（周报的连续天数序列要往回看一年多）被换成一份不是 SQLite 的文件：
+        // 这正是同步盘占位、移动盘没插那一类
+        std::fs::write(paths::year_db_path(2019), b"not a sqlite file at all")?;
+        queries::invalidate_years_cache();
+        focusflow_core::db::connection::clear_ro_cache();
+
+        let e = write_weekly_report_for(from, to).expect_err("有一年的库读不出来时不该回 Ok(None)");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("打不开") && msg.contains("2019"),
+            "要说清是哪一年读不出来，实得: {msg}"
+        );
+        assert!(
+            !msg.contains("没有任何记录"),
+            "不能把读不出来讲成没有记录，实得: {msg}"
+        );
+        assert!(!report_dir().exists(), "被拒绝的这一次不该留下任何文件");
+
+        // 反向腿：把那份坏文件清掉，同一周就必须正常生成 —— 这条判据不是恒真
+        std::fs::remove_file(paths::year_db_path(2019))?;
+        queries::invalidate_years_cache();
+        focusflow_core::db::connection::clear_ro_cache();
+        let r = write_weekly_report_for(from, to)?;
+        assert!(r.is_some(), "坏文件拿走后同一周就该生成文件，实得 {r:?}");
         Ok(())
     }
 
