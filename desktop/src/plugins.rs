@@ -220,26 +220,67 @@ pub fn start_hot_reload(app: &tauri::AppHandle, db: Arc<Database>) -> bool {
     scan_ok && apply_ok
 }
 
+/// 某个插件文件"在不在"的三种结局。
+///
+/// 刻意不用 `Path::exists()`：那句话对**任何** stat 失败都回 false，于是"查不动"与
+/// "确实被删了"在调用方眼里长得一模一样 —— 而这条道上两种结局要做的事相反。
+/// 本文件上面 `scan_plugin_dir` 那段已经把目录级的那一半钉住了（"整个目录读不到时
+/// 保留旧基线、一个事件都不发，因为读不到恰恰是构建脚本正在整份替换、或杀软首扫
+/// 握着句柄的时候"）；这里是同一条规则缺的那一半：单个文件。
+#[derive(Debug)]
+enum FileState {
+    /// 是个读得到的普通文件
+    Present,
+    /// 确实没有（`NotFound`）：删除检测的唯一合法证据
+    Missing,
+    /// 查不动，或那个名字上挂着的不是普通文件 —— **不能据此卸载**
+    Unreadable(String),
+}
+
+fn probe_plugin_file(dir: &std::path::Path, key: &str) -> FileState {
+    let path = dir.join(format!("{key}.lua"));
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => FileState::Present,
+        Ok(_) => FileState::Unreadable(format!(
+            "{} 不是普通文件（同步占位、或被换成目录）",
+            path.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileState::Missing,
+        Err(e) => FileState::Unreadable(format!("{}: {e}", path.display())),
+    }
+}
+
 /// 按插件文件名（stem）重载插件（主线程调用）。
 /// 文件已消失 → 卸载：删除插件文件表达的就是「别再跑它了」，只 reload 不 remove
 /// 的话它会一直跑到下次重启（其 cleanup 也就一直不执行）。
 /// 未找到已加载实例 → 补扫一次目录：兜底加载运行期间新放入的插件文件。
+///
+/// "查不动"那一臂**两边都不做**，只把原因说出来：原先这里是 `!exists()` ⇒ 卸载，
+/// 一次杀软首扫握着句柄就把还在跑的插件停掉（cleanup 也一并跑掉），而列表上它仍写着
+/// 已启用；日志还多说一句它没证明过的「文件已删除」。更要紧的是这一轮的判定已经被
+/// `PluginBaseline::apply` 连同新 mtime 一起提交了，下一轮看不见变化 ⇒ 这个插件会
+/// **一直**停在卸载态直到重启。留到下一轮重新问一次，代价只是这一轮什么都不做。
 fn reload_plugin_by_key(key: &str, db: &Arc<Database>) {
-    with_manager(db, |pm| {
-        if !focusflow_core::paths::plugins_dir()
-            .join(format!("{key}.lua"))
-            .exists()
-        {
+    let dir = focusflow_core::paths::plugins_dir();
+    with_manager(db, |pm| match probe_plugin_file(&dir, key) {
+        FileState::Missing => {
             if pm.unload_by_stem(key) {
                 tracing::info!("插件文件已删除，已卸载: {key}");
             }
-            return;
         }
-        if pm.reload_plugin(key) {
-            tracing::info!("插件已热重载: {key}");
-        } else {
-            tracing::info!("未找到已加载插件 {key}，尝试补载新插件");
-            pm.load_all();
+        FileState::Unreadable(why) => {
+            tracing::warn!(
+                "插件 {key} 这一轮两边都不做：文件在不在都查不出来（{why}），\
+                 它仍按上一份代码运行 —— 等下一次目录扫描再判，不据此卸载"
+            );
+        }
+        FileState::Present => {
+            if pm.reload_plugin(key) {
+                tracing::info!("插件已热重载: {key}");
+            } else {
+                tracing::info!("未找到已加载插件 {key}，尝试补载新插件");
+                pm.load_all();
+            }
         }
     })
 }
@@ -774,6 +815,100 @@ mod tests {
         assert!(
             body.contains("PluginBaseline::default()") && body.contains("ctl_rx.try_recv()"),
             "切片没盖住扫描线程，上面那条次序断言是假绿"
+        );
+    }
+
+    /// 「这个插件文件还在不在」要分三种结局，`Path::exists()` 把前两种并成一件。
+    ///
+    /// 症状：一次杀软首扫/同步盘握着句柄让 stat 失败，`!exists()` 成立 ⇒ 正在跑的插件被
+    /// `unload_by_stem` 停掉（cleanup 一并跑掉），列表上还写着已启用，而日志多说一句
+    /// 「文件已删除」；这一轮的判定又已经被 `PluginBaseline::apply` 连同新 mtime 提交了，
+    /// 下一轮看不见变化 ⇒ 它会一直停在卸载态直到重启。
+    /// 「那个名字上挂着目录」这条腿是本仓现成的夹具手法（把路径换成目录，`metadata` 成功
+    /// 但 `is_file()` 为假），也是 `exists()` 那一版唯一会**漏掉**的方向。
+    #[test]
+    fn an_unanswerable_file_check_is_not_read_as_a_deletion() {
+        struct Tmp(std::path::PathBuf);
+        impl Drop for Tmp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("ff_plugin_probe_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("临时目录该建得出来");
+        let _tmp = Tmp(dir.clone());
+        std::fs::write(dir.join("good.lua"), "function focusflow.card() end").unwrap();
+        std::fs::create_dir_all(dir.join("weird.lua")).unwrap();
+
+        match probe_plugin_file(&dir, "good") {
+            FileState::Present => {}
+            other => panic!("读得到的普通文件要判成 Present，实得 {other:?}"),
+        }
+        match probe_plugin_file(&dir, "gone") {
+            FileState::Missing => {}
+            other => panic!("确实没有的那个要判成 Missing，实得 {other:?}"),
+        }
+        let weird = probe_plugin_file(&dir, "weird");
+        match &weird {
+            FileState::Unreadable(why) => assert!(
+                why.contains("weird.lua"),
+                "查不动那一臂要带上是哪个文件，实得 {why}"
+            ),
+            other => panic!("挂在目录上的名字不能算「文件在」，更不能算「已删除」，实得 {other:?}"),
+        }
+
+        // 反向腿：`exists()` 会被那个目录骗过去（它确实"存在"），所以判据必须来自 metadata
+        assert!(
+            dir.join("weird.lua").exists(),
+            "夹具前提：那条名字本身是 exists() 为真的"
+        );
+    }
+
+    /// 接线守卫：卸载只能挂在 `FileState::Missing` 那一臂上。
+    ///
+    /// 上面那条纯用例钉的是探测函数怎么分三态，它盯不到调用点拿这三态做了什么 ——
+    /// 而这场缺陷的落点恰恰在调用点（`!exists()` ⇒ 卸载）。重载路径要真管理器 + 主线程，
+    /// 用例进不去，所以钉调用形态。
+    #[test]
+    fn only_a_confirmed_deletion_unloads_a_plugin() {
+        let src = include_str!("plugins.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn reload_plugin_by_key")
+            .expect("重载入口找不到了（判据要跟着改）");
+        let body = &prod[at..at + prod[at..].find("\n}\n").expect("重载入口的结尾")];
+        let mut wrong: Vec<String> = Vec::new();
+        if !body.contains("probe_plugin_file(&dir, key)") {
+            wrong.push("调用点不再过三态探测了".to_string());
+        }
+        if body.contains(".exists()") {
+            wrong.push("调用点又用回 `exists()`（查不动＝已删除）".to_string());
+        }
+        // 卸载那句必须住在 Missing 那一臂里，而不是三态之外
+        let missing = body
+            .find("FileState::Missing")
+            .expect("Missing 那一臂不见了");
+        // 从**这一臂的标签之后**找下一个 `FileState::`：从 missing 本身找会立刻
+        // 撞上标签自己，切出空串让下面两条断言空转（假绿）
+        let arm_start = missing + "FileState::Missing".len();
+        let arm_end = body[arm_start..]
+            .find("FileState::")
+            .map(|n| arm_start + n)
+            .unwrap_or(body.len());
+        if !body[missing..arm_end].contains("unload_by_stem(key)") {
+            wrong.push("卸载没挂在 Missing 那一臂里".to_string());
+        }
+        if !body.contains("FileState::Unreadable(why)") {
+            wrong.push("「查不动」那一臂没人接住 ⇒ 编译不过或已被折掉".to_string());
+        }
+        assert!(
+            !body[missing..arm_end].contains("load_all"),
+            "Missing 那一臂不该顺手补载插件"
+        );
+        assert!(
+            wrong.is_empty() && body.contains("with_manager(db, |pm| match"),
+            "重载入口的接线守卫红（切片没盖住函数体＝假绿）:\n{}",
+            wrong.join("\n")
         );
     }
 }
