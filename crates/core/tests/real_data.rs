@@ -255,12 +255,18 @@ mod tests {
                 assert!(ranks.values().all(|v| *v > 0), "{year} 年榜单里有非正计数");
 
                 // 全历史汇总（跨库遍历）不得小于单年
-                let (all_total, max_day) = queries::get_alltime_summary();
-                assert!(
-                    all_total >= total,
-                    "总计({all_total})比单年({total})还少，跨库遍历漏了年份"
-                );
-                if let Some((day, cnt)) = max_day {
+                let summary = queries::get_alltime_summary();
+                if summary.unreadable.is_empty() {
+                    assert!(
+                        summary.total >= total,
+                        "总计({})比单年({total})还少，跨库遍历漏了年份",
+                        summary.total
+                    );
+                } else {
+                    // 有年度库这次没读出来：那份总计只是下界，跟单年比没有意义
+                    println!("  跳过跨库对比，这些年没读出来: {:?}", summary.unreadable);
+                }
+                if let Some((day, cnt)) = summary.max_day {
                     assert!(cnt > 0, "「最高单日」报出非正计数：{day} = {cnt}");
                 }
 

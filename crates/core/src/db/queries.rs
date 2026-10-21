@@ -465,54 +465,113 @@ pub fn get_stats_by_date(target_date: chrono::NaiveDate) -> (i64, HashMap<String
     result.flatten().unwrap_or((0, HashMap::new()))
 }
 
-/// 全历史汇总（跨年度库）：返回 (总次数, 最高单日)。
+/// 全历史汇总（跨年度库）连同**这次有没有读全**。
+#[derive(Debug, Clone)]
+pub struct AlltimeTotals {
+    /// 读到的那些年度库的次数之和。`unreadable` 非空时它只是**下界**。
+    pub total: i64,
+    /// 读到的那些年度库里的最高单日（`YYYY-MM-DD`, 次数）。
+    pub max_day: Option<(String, i64)>,
+    /// 这一次没能读出来的年度库，每项形如「年份: 原因」。
+    ///
+    /// 非空就是"结果不完整"的信号：调用方（统计线程）据此**不拿这份残缺值去覆盖上一份
+    /// 基线**，否则一次文件锁就会把"全历史总计"永久改低。
+    pub unreadable: Vec<String>,
+}
+
+/// 单个年度库在这一趟汇总里的结局。
+///
+/// 旧写法把三件事折成同一个 `None`／`0`：打不开、没有 `daily_counts` 这张表、表在但
+/// 查询失败 —— 于是「有一年完全读不出来」与「那一年本来就没数据」在总数里长得一模一样，
+/// 而 `SUM` 与「最高单日」各自 `unwrap_or` 之后还能拼出自相矛盾的卡片（总数少了那一年、
+/// 纪录却来自别的年）。
+#[derive(Debug)]
+enum YearTotals {
+    /// 这一年读到了：`sum` 是全年次数，`top` 是本年最高单日（表里没行时是 `None`）。
+    Read { sum: i64, top: Option<(i64, i64)> },
+    /// 这个库里没有 `daily_counts` 表：真的没有可汇总的数据，算 0 是对的。
+    NoTable,
+    /// 这一年**没有答案**（表在，但查询失败）：不能当成 0。
+    Unreadable(String),
+}
+
+/// 在一个年度库连接上取回这一年的 (总次数, 最高单日)，读不出来就说读不出来。
+fn year_totals_in_conn(conn: &Connection) -> YearTotals {
+    match connection::table_presence(conn, "daily_counts") {
+        connection::Presence::No => return YearTotals::NoTable,
+        connection::Presence::Unreadable(why) => return YearTotals::Unreadable(why),
+        connection::Presence::Yes => {}
+    }
+    let sum = match conn.query_row(
+        "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+        [],
+        |r| r.get::<_, i64>(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return YearTotals::Unreadable(format!("汇总这一年的次数时读不出来: {e}"));
+        }
+    };
+    let top = match conn.query_row(
+        "SELECT date_key, count FROM daily_counts ORDER BY count DESC, date_key ASC LIMIT 1",
+        [],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => {
+            return YearTotals::Unreadable(format!("找这一年的最高单日时读不出来: {e}"));
+        }
+    };
+    YearTotals::Read { sum, top }
+}
+
+/// 全历史汇总（跨年度库）：总计与最高单日。
 ///
 /// 「总计」卡片与「最高单日」卡片共用同一份失效条件（强制刷新 / 跨天 /
 /// 今日新增达阈值），因此两者在同一次跨库遍历里一起取出：`daily_counts`
 /// 每天一行，SUM 与 ORDER BY 都是小表扫描，多取一个总数不增加连接开销。
-pub fn get_alltime_summary() -> (i64, Option<(String, i64)>) {
+///
+/// 返回里带 `unreadable`：某一年打不开或读不出来时，那份总数只是**下界**，
+/// 必须让调用方看得见 —— 静默按 0 计入会让"总计"少掉整整一年还显得一切正常。
+pub fn get_alltime_summary() -> AlltimeTotals {
     let mut total: i64 = 0;
     let mut best: Option<(i64, i64)> = None; // (date_key, count)
+    let mut unreadable: Vec<String> = Vec::new();
     for year in available_years() {
         let path = paths::year_db_path(year);
-        let row = connection::with_ro_conn(&path, |conn| {
-            if !table_exists(conn, "daily_counts") {
-                return None;
-            }
-            let sum: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            let top = conn
-                .query_row(
-                    "SELECT date_key, count FROM daily_counts ORDER BY count DESC, date_key ASC LIMIT 1",
-                    [],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-                )
-                .ok();
-            Some((sum, top))
-        })
-        .flatten();
-        if let Some((sum, top)) = row {
-            total += sum;
-            if let Some((dk, c)) = top {
-                if best.is_none_or(|(_, bc)| c > bc) {
-                    best = Some((dk, c));
+        // `with_ro_conn` 返回 `None` 只可能是「连接没拿到」（打开失败已在连接层记过 error），
+        // 拿到连接之后的结局由 `year_totals_in_conn` 自己分臂 —— 两者原先被同一个
+        // `.flatten()` 折成"这一年没数据"。
+        let arm = connection::with_ro_conn(&path, year_totals_in_conn);
+        match arm {
+            Some(YearTotals::Read { sum, top }) => {
+                total += sum;
+                if let Some((dk, c)) = top {
+                    if best.is_none_or(|(_, bc)| c > bc) {
+                        best = Some((dk, c));
+                    }
                 }
             }
+            Some(YearTotals::NoTable) => {}
+            Some(YearTotals::Unreadable(why)) => unreadable.push(format!("{year}: {why}")),
+            None => unreadable.push(format!("{year}: 只读连接打不开（原因见上一行 error 日志）")),
         }
+    }
+    if !unreadable.is_empty() {
+        tracing::warn!(
+            "全历史汇总不完整：{} 个年度库这次没读出来（{}），下面的总数只是已读部分: 总计 {total} 次",
+            unreadable.len(),
+            unreadable.join("；")
+        );
     }
     let max_day =
         best.and_then(|(dk, c)| day_key_to_date(dk).map(|d| (d.format("%Y-%m-%d").to_string(), c)));
-    (total, max_day)
-}
-
-/// 全历史最高单日（跨年度库）：返回 (YYYY-MM-DD, 次数)。无数据时返回 None。
-pub fn get_alltime_max_day() -> Option<(String, i64)> {
-    get_alltime_summary().1
+    AlltimeTotals {
+        total,
+        max_day,
+        unreadable,
+    }
 }
 
 /// 查询最近 N 天每日按键数：返回 [(YYYY-MM-DD, 次数)]。
@@ -3220,5 +3279,104 @@ mod tests {
         invalidate_years_cache();
         connection::clear_ro_cache();
         assert_eq!(device_has_key_detail(identity), DetailVerdict::Absent);
+    }
+
+    /// 「某一年读不出来」不许在「总计」里等于「那一年 0 次」。
+    ///
+    /// 这一次跨库遍历的产出会被统计线程当作全历史基线缓存，界面上念出来的是"你一共按下过
+    /// 多少键"。原先打不开、没有 `daily_counts` 表、表在但查询失败三件事都折成同一个 0：
+    /// 一次瞬时的文件锁（别的实例握着库、移动盘还没醒、同步盘放的是占位）就把总数**永久**改低，
+    /// 而缓存要到跨天或今日增量达阈值才重建 —— 用户看到的是"我在掉历史"。
+    #[test]
+    fn an_unreadable_year_is_not_counted_as_zero_in_the_alltime_total() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_alltime_totals");
+        let day_a = day_key_of_date(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        let day_b = day_key_of_date(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+        {
+            let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+            connection::ensure_schema(&conn, chrono::Local::now().year()).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts(date_key, count) VALUES (?1, 3)",
+                [day_a],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts(date_key, count) VALUES (?1, 5)",
+                [day_b],
+            )
+            .unwrap();
+        }
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        let clean = get_alltime_summary();
+        assert!(
+            clean.unreadable.is_empty(),
+            "夹具前提：这里只有一个能读的库，实得 {:?}",
+            clean.unreadable
+        );
+        assert_eq!(clean.total, 8, "两个交易日之和");
+        assert_eq!(clean.max_day, Some(("2026-01-02".to_string(), 5)));
+
+        // 一整年变成一个不是 SQLite 的文件 ⇒ 那一年**没有答案**
+        let broken = 2031;
+        std::fs::write(paths::year_db_path(broken), b"not a sqlite file at all").unwrap();
+        // 另一年表在、列却不全（旧库里手工拼出来的形状）：总数还算得出、纪录查不动。
+        // 旧写法会把这一年算进总数却不给它纪录 —— 两张卡片来自同一个遍历时，
+        // 这种"半条答案"比整条没有更难查。
+        let half_baked = 2030;
+        {
+            let conn = connection::open_rw(&paths::year_db_path(half_baked)).unwrap();
+            conn.execute("CREATE TABLE daily_counts (count INTEGER)", [])
+                .unwrap();
+            conn.execute("INSERT INTO daily_counts(count) VALUES (7)", [])
+                .unwrap();
+        }
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        let partial = get_alltime_summary();
+        assert_eq!(partial.total, 8, "读不出来的那些年，一秒也不许计入总数");
+        assert_eq!(partial.max_day, Some(("2026-01-02".to_string(), 5)));
+        let said = partial.unreadable.join("；");
+        assert!(
+            said.contains(&broken.to_string()),
+            "要说出是哪一年连不上连接，实得 {said}"
+        );
+        assert!(
+            said.contains(&half_baked.to_string()) && said.contains("最高单日"),
+            "半拉子那一年要按年份＋卡在哪一步说清，实得 {said}"
+        );
+
+        // 反向腿：两份坏文件都拿走 ⇒ 同一次汇总回到「读全了」，上面几条不是恒真
+        // 先放掉只读池里的句柄：半拉子那一年是**能打开**的，连接还握在这个线程的池里，
+        // Windows 上握着句柄就删不掉文件。
+        connection::clear_ro_cache();
+        std::fs::remove_file(paths::year_db_path(broken)).unwrap();
+        std::fs::remove_file(paths::year_db_path(half_baked)).unwrap();
+        invalidate_years_cache();
+        let back = get_alltime_summary();
+        assert!(back.unreadable.is_empty(), "实得 {:?}", back.unreadable);
+        assert_eq!(back.total, 8);
+    }
+
+    /// 「没有这张表」是真答案，「有表但查询失败」不是。
+    #[test]
+    fn a_missing_aggregate_table_is_an_answer_but_a_failed_query_is_not() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(
+            matches!(year_totals_in_conn(&conn), YearTotals::NoTable),
+            "库里压根没有 daily_counts：这就是「没有可汇总的数据」，算 0 是对的"
+        );
+
+        conn.execute("CREATE TABLE daily_counts (count INTEGER)", [])
+            .unwrap();
+        conn.execute("INSERT INTO daily_counts(count) VALUES (7)", [])
+            .unwrap();
+        match year_totals_in_conn(&conn) {
+            YearTotals::Unreadable(why) => {
+                assert!(why.contains("最高单日"), "要说清卡在哪一步，实得 {why}")
+            }
+            other => panic!("缺列的表要落成「读不出来」，实得 {other:?}"),
+        }
     }
 }

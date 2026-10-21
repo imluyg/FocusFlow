@@ -1585,26 +1585,36 @@ fn spawn_stats_worker(
                                 .format("%Y-%m-%d")
                                 .to_string();
                             // 总计与最高单日同源同失效条件：一次跨库遍历同时取回
-                            let (total_all, max_all) = focusflow_core::db::get_alltime_summary();
-                            alltime_total_base = total_all;
-                            alltime_max = Some(max_all.unwrap_or((today_str, 0)));
+                            let totals = focusflow_core::db::get_alltime_summary();
+                            // 换基线的条件见 `alltime_baseline_adoptable`：有某年没读出来
+                            // 而手上又有上一份时，宁可继续用上一份，也不把残缺的总数当成
+                            // 新事实 —— 缓存要到跨天/今日阈值才重建，那会是一整天。
+                            if alltime_baseline_adoptable(
+                                totals.unreadable.is_empty(),
+                                alltime_total_base >= 0,
+                            ) {
+                                alltime_total_base = totals.total;
+                                alltime_max = Some(totals.max_day.unwrap_or((today_str, 0)));
+                                // 锚取的是「base 里已经含到的那一份今日」，不是此刻的今日计数：
+                                // `totals.total` 来自 daily_counts 的 SUM，只到上次落库为止，而今日
+                                // 计数是内存里那份（含未落库增量，默认落后最多一个 flush 周期）。
+                                // 读取次序是有意排的：先库（t1）后内存（t2>t1），中间落库的那批
+                                // 只会让显示值暂时偏低、下一次重建就追上；反过来读会把同一批**双计**，
+                                // 「总计」先涨后跌 —— 比偏低更难查，因为用户会以为自己在掉数据。
+                                alltime_cache_today = db
+                                    .writer()
+                                    .map(|w| {
+                                        alltime_anchor_today(
+                                            w.today_count_for_display() as i64,
+                                            w.today_pending_count(),
+                                        )
+                                    })
+                                    .unwrap_or(cur_today);
+                                alltime_stamp_today = cur_today;
+                            }
+                            // 两支都要推进「哪天重建过」：沿用上一份那一支不更新基准，靠
+                            // `alltime_stamp_today` 没动 → 今日增量攒到阈值再试一次。
                             alltime_cache_day = day_ce;
-                            // 锚取的是「base 里已经含到的那一份今日」，不是此刻的今日计数：
-                            // `total_all` 来自 daily_counts 的 SUM，只到上次落库为止，而今日
-                            // 计数是内存里那份（含未落库增量，默认落后最多一个 flush 周期）。
-                            // 读取次序是有意排的：先库（t1）后内存（t2>t1），中间落库的那批
-                            // 只会让显示值暂时偏低、下一次重建就追上；反过来读会把同一批**双计**，
-                            // 「总计」先涨后跌 —— 比偏低更难查，因为用户会以为自己在掉数据。
-                            alltime_cache_today = db
-                                .writer()
-                                .map(|w| {
-                                    alltime_anchor_today(
-                                        w.today_count_for_display() as i64,
-                                        w.today_pending_count(),
-                                    )
-                                })
-                                .unwrap_or(cur_today);
-                            alltime_stamp_today = cur_today;
                         }
 
                         // period=0 且缓存有效：直接复用上次聚合结果，不再全库扫描。
@@ -1810,6 +1820,20 @@ fn alltime_anchor_today(cur_today: i64, pending_today: i64) -> i64 {
     (cur_today - pending_today).max(0)
 }
 
+/// 这一次跨库汇总能不能当成新的全历史基线。
+///
+/// 规则只有一句：**读全了才换**。有年度库没读出来时，`total` 只是已读部分之和（下界），
+/// 而这份基线一旦写下去就要撑到下次跨天/今日增量达阈值/强制刷新 —— 于是一次瞬时文件锁
+/// （另一个实例握着库、记事本开着 config、杀软首扫）就把「总计」卡片永久改低，用户看到的是
+/// "我在掉历史"，而事实只是那一次没读到。
+///
+/// 例外是手上根本没有上一份（`alltime_total_base` 还是 `-1` 哨兵）：这时只能先用这份残缺值。
+/// 留 `alltime_max = None` 不是选项 —— `alltime_dirty` 的条件里就有 `alltime_max.is_none()`，
+/// 那一轮之后每轮都算脏，统计线程会一直重扫全部年度库。
+fn alltime_baseline_adoptable(read_all_years: bool, have_previous: bool) -> bool {
+    read_all_years || !have_previous
+}
+
 /// 悬浮窗"至少还得露出这么多像素"才算看得见；低于这个才认为它跑丢了。
 const FLOATING_MIN_VISIBLE: f64 = 20.0;
 
@@ -1992,8 +2016,10 @@ fn compute_charts(
         match alltime_max {
             Some((d, c)) => (c, d),
             None => {
-                let (d, c) =
-                    focusflow_core::db::get_alltime_max_day().unwrap_or((today_str.clone(), 0));
+                // 缓存还没建起来时当场跨库取一次；没有纪录就沿用「今天 0 次」这个占位。
+                let (d, c) = focusflow_core::db::get_alltime_summary()
+                    .max_day
+                    .unwrap_or((today_str.clone(), 0));
                 (c, d)
             }
         }
@@ -2647,6 +2673,51 @@ mod alltime_anchor_wiring {
                 .count(),
             2,
             "「总计」展示值的两处调用都得传显示锚（基准那份不算触发尺子）"
+        );
+    }
+
+    /// 全历史基线只许在「每一年都读到了」的时候更换。
+    #[test]
+    fn a_partial_alltime_read_keeps_the_previous_baseline() {
+        use super::alltime_baseline_adoptable;
+        assert!(alltime_baseline_adoptable(true, true), "读全了就换");
+        assert!(alltime_baseline_adoptable(true, false), "读全了，首轮也换");
+        assert!(
+            !alltime_baseline_adoptable(false, true),
+            "有年没读出来而手上已有上一份：残缺的那份会把「总计」写低一整天"
+        );
+        assert!(
+            alltime_baseline_adoptable(false, false),
+            "首轮且读不全只能先用这份：留 None 会让重建判据每轮都成立，统计线程一直重扫"
+        );
+    }
+
+    /// 接线腿：换基线那几行必须真的过这把尺子（纯函数对了，调用点无条件覆盖照样是绿的）。
+    ///
+    /// 比对用"去掉全部空白"的形态：`alltime_total_base >= 0,` 这个形状在本函数里还被
+    /// `apply_display_total` 用过两次，按整行 `contains` 会被它们顶班，等于没钉。
+    #[test]
+    fn the_alltime_baseline_write_is_gated_on_the_read_being_complete() {
+        let src = include_str!("state.rs");
+        let at = src.find("fn spawn_stats_worker").expect("统计线程找不到了");
+        let body = &src[at..at + src[at..].find("\nfn ").expect("统计线程之后没有顶层函数了")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        let gate = flat
+            .find("ifalltime_baseline_adoptable(totals.unreadable.is_empty(),alltime_total_base>=0")
+            .expect("换基线没过这把尺子（或两问被换掉了）");
+        let write = flat
+            .find("alltime_total_base=totals.total;")
+            .expect("全历史基线那次赋值不见了");
+        assert!(write > gate, "基线赋值必须排在那把尺子之后");
+        assert_eq!(
+            flat.matches("alltime_total_base=totals.total;").count(),
+            1,
+            "全历史基线只许有一处写入，否则第二处绕开了尺子"
         );
     }
 }

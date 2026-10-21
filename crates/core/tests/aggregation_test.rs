@@ -129,16 +129,23 @@ mod tests {
             .date_naive()
             .format("%Y-%m-%d")
             .to_string();
-        let (total, max_day) = db::get_alltime_summary();
-        assert_eq!(total, 10, "总计应为全部日期之和（回归：只统计今日）");
+        let summary = db::get_alltime_summary();
+        assert!(
+            summary.unreadable.is_empty(),
+            "夹具里这几年都该读得出来，实得 {:?}",
+            summary.unreadable
+        );
         assert_eq!(
-            max_day,
-            Some((today.clone(), 7)),
+            summary.total, 10,
+            "总计应为全部日期之和（回归：只统计今日）"
+        );
+        assert_eq!(
+            summary.max_day,
+            Some((today, 7)),
             "最高单日应取全历史最大值"
         );
 
-        // 与既有口径一致：最高单日 = get_alltime_max_day，总计 = get_stats(None, None)
-        assert_eq!(db::get_alltime_max_day(), Some((today, 7)));
+        // 与既有口径一致：总计 = get_stats(None, None)
         assert_eq!(db::get_stats(None, None).0, 10);
 
         database.shutdown(&config);
