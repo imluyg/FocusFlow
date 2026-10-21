@@ -1351,26 +1351,68 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
 /// UPSERT 到对应年库，当年库覆盖全部活跃设备，读历史年库没有额外收益。
 fn preload_device_meta(agg: &mut AggDeltas) {
     let path = paths::current_year_db_path();
-    if !connection::table_exists_readonly(&path, "devices") {
+    // 文件不在＝今年还没有库，正常首启：没有名字可载入，不必出声。
+    if !path.exists() {
         return;
     }
-    let Ok(conn) = connection::open_ro(&path) else {
-        return;
+    // 不能用 `table_exists_readonly`：它把"打不开"折成"没有这张表"，而这两件事里
+    // 只有后者是正常的。打不开的那次启动里，所有还没产生输入事件的设备都会退成
+    // 占位名，而日志一个字都不留（旧形态；见 `meta_less_round_keeps_an_existing_registration`）。
+    let conn = match connection::open_ro(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn_preload_skipped(&path, &format!("库打不开: {e}"));
+            return;
+        }
     };
-    let Ok(mut stmt) = conn.prepare("SELECT device_key, name, kind FROM devices") else {
-        return;
+    match connection::table_presence(&conn, "devices") {
+        connection::Presence::Yes => {}
+        connection::Presence::No => {
+            tracing::debug!(
+                "设备登记预热跳过：{} 还没有 devices 表，没有名字可载入",
+                path.display()
+            );
+            return;
+        }
+        connection::Presence::Unreadable(why) => {
+            warn_preload_skipped(&path, &why);
+            return;
+        }
+    }
+    let mut stmt = match conn.prepare("SELECT device_key, name, kind FROM devices") {
+        Ok(s) => s,
+        Err(e) => {
+            warn_preload_skipped(&path, &format!("语句准备不了: {e}"));
+            return;
+        }
     };
-    let Ok(rows) = stmt.query_map([], |r| {
+    let rows = match stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
         ))
-    }) else {
-        return;
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn_preload_skipped(&path, &format!("查询走不起来: {e}"));
+            return;
+        }
     };
     let mut loaded = 0usize;
-    for (key, name, kind) in rows.flatten() {
+    let mut dropped = 0usize;
+    let mut first_err: Option<String> = None;
+    for row in rows {
+        let (key, name, kind) = match row {
+            Ok(v) => v,
+            Err(e) => {
+                dropped += 1;
+                if first_err.is_none() {
+                    first_err = Some(e.to_string());
+                }
+                continue;
+            }
+        };
         // 占位登记不算名字：空名、或之前被补登成了 device_key 本身（写入/迁移/
         // 归档三条路径都会这么写）。把它们读回来等于把脏名字固化成「真名」。
         if name.trim().is_empty() || name == key {
@@ -1381,9 +1423,24 @@ fn preload_device_meta(agg: &mut AggDeltas) {
             .or_insert(DeviceMeta { name, kind });
         loaded += 1;
     }
+    if dropped > 0 {
+        tracing::warn!(
+            "设备登记预热：{dropped} 行读不出来，已跳过（第一条原因：{}）—— \
+             这些设备会先显示占位名，直到它们产生第一次输入事件",
+            first_err.as_deref().unwrap_or("(没带上原因)")
+        );
+    }
     if loaded > 0 {
         tracing::debug!("设备登记预热：已从 devices 表载入 {loaded} 项");
     }
+}
+
+/// 预热没做成时的那一句：必须点名哪个库、为什么，以及用户会看到什么。
+fn warn_preload_skipped(path: &std::path::Path, why: &str) {
+    tracing::warn!(
+        "设备登记预热跳过：{}（{why}）—— 在设备产生第一次输入事件之前，界面会先显示占位名",
+        path.display()
+    );
 }
 
 /// 把批次里的设备键统一归一到硬件身份段（B14-2）。
@@ -3080,6 +3137,96 @@ mod tests {
         assert_eq!(fname, "HID 设备 · 9999/8888", "补登要写人话，不是裸路径");
         assert_eq!(fkind, "unknown");
         drop(conn);
+    }
+
+    /// 预热没做成时必须说出"哪个库、败在哪一步、用户会看到什么"。
+    ///
+    /// 旧写法四个早退全是静默 return：当年库被同步盘换成占位文件、被另一个进程独占
+    /// 的那次启动，会话态里没有任何登记信息，界面上设备名先退成占位串，日志一个字没有。
+    /// 正常的"今年还没有库"仍要安静 —— 那是首启，不是故障。
+    #[test]
+    fn a_failed_device_preload_says_which_step_failed() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_preload_fail");
+        let path = paths::current_year_db_path();
+
+        let mut agg = AggDeltas::default();
+        let ((), logs) = crate::logger::capture_logs(|| preload_device_meta(&mut agg));
+        assert!(
+            logs.iter().all(|l| !l.contains("设备登记预热")),
+            "今年还没有库是正常首启，不该报警: {logs:?}"
+        );
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+        let mut agg = AggDeltas::default();
+        let ((), logs) = crate::logger::capture_logs(|| preload_device_meta(&mut agg));
+        let shown = logs.join("\n");
+        assert!(
+            shown.contains("设备登记预热跳过"),
+            "打不开必须出声: {shown}"
+        );
+        assert!(shown.contains("库打不开"), "要说清败在哪一步: {shown}");
+        assert!(
+            shown.contains(&path.file_name().unwrap().to_string_lossy().into_owned()),
+            "要点名哪个库: {shown}"
+        );
+        assert!(agg.device_meta.is_empty());
+
+        // 库能打开、但表形态不对（旧版 devices 只有两列）⇒ 准备语句这一步失败
+        std::fs::remove_file(&path).unwrap();
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE devices (device_key TEXT NOT NULL, name TEXT NOT NULL);",
+            )
+            .unwrap();
+        }
+        let mut agg = AggDeltas::default();
+        let ((), logs) = crate::logger::capture_logs(|| preload_device_meta(&mut agg));
+        let shown = logs.join("\n");
+        assert!(shown.contains("语句准备不了"), "要说清败在哪一步: {shown}");
+        assert!(
+            shown.contains("占位名"),
+            "要说出用户会看到什么，而不只是失败了: {shown}"
+        );
+    }
+
+    /// 表里有坏行时只丢那一行，但必须数出来并带第一条原因。
+    #[test]
+    fn device_preload_drops_only_the_unreadable_row() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_preload_badrow");
+        let path = paths::current_year_db_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            connection::ensure_schema(&conn, chrono::Local::now().year()).unwrap();
+            // name 是 TEXT 列，塞一个 BLOB：好行照读，坏行只影响自己
+            conn.execute(
+                "INSERT INTO devices (device_key, name, kind) VALUES ('k-bad', X'FF', 'keyboard')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO devices (device_key, name, kind) VALUES ('k-good', '真名', 'mouse')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mut agg = AggDeltas::default();
+        let ((), logs) = crate::logger::capture_logs(|| preload_device_meta(&mut agg));
+        let shown = logs.join("\n");
+        assert!(
+            shown.contains("1 行读不出来"),
+            "坏行要数出来，不能只丢不报: {shown}"
+        );
+        assert!(
+            agg.device_meta.contains_key("k-good"),
+            "好行照常载入，坏行不牵连别人"
+        );
+        assert!(!agg.device_meta.contains_key("k-bad"));
     }
 
     /// A 道⑦：开库与建表两步的失败要各说各话，且都必须带上是哪一年的库。
