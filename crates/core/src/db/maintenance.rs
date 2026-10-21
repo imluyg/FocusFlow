@@ -1253,10 +1253,12 @@ pub fn sweep_stale_sidecars() -> usize {
             continue;
         };
         let db_exists = dir.join(base).exists();
-        let wal_empty = std::fs::metadata(dir.join(format!("{base}-wal")))
-            .map(|m| m.len() == 0)
-            .unwrap_or(true);
-        if (!db_exists || wal_empty) && std::fs::remove_file(entry.path()).is_ok() {
+        let wal = dir.join(format!("{base}-wal"));
+        // 主库还在时，只有空/缺失的 WAL 才能动；非空或读不到大小都必须留着
+        // （后者与 finalize_backup 共用同一把尺子，别在这里另抄一份）。
+        // 主库已不在的孤儿 sidecar 留着没用，直接清。
+        let can_drop = !db_exists || wal_can_be_dropped(false, &wal);
+        if can_drop && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
     }
@@ -3001,6 +3003,35 @@ mod tests {
         assert!(shown.contains("保留"), "要说明保守方向: {shown}");
     }
 
+    /// 接线腿：清 sidecar 的那条路也要用同一把"读不到大小 ≠ 空"的尺子。
+    ///
+    /// 它每次备份前都跑；若在这里另抄一份 `unwrap_or(true)`，上一轮 finalize 刚
+    /// 保守留下的非空 WAL，下一轮就会被这次清扫按"空"删掉。
+    #[test]
+    fn the_sidecar_sweep_uses_the_same_wal_size_ruler() {
+        let src = include_str!("maintenance.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn sweep_stale_sidecars(")
+            .expect("清扫函数找不到了");
+        let rest = &prod[at..];
+        let body = &rest[..rest.find("\n}\n").expect("函数体切不出来")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("wal_can_be_dropped(false"),
+            "清 sidecar 没走那条判据"
+        );
+        assert!(!code.contains("unwrap_or(true)"), "读不到大小又被当成空");
+        assert!(
+            !code.contains(".map(|m| m.len() == 0)"),
+            "别再自己抄一份大小判据"
+        );
+    }
+
     /// 「列出来却不在原位」的那一年必须算进没备份出去的清单，不许当成"没有要备份的"。
     ///
     /// 时序是这条缺陷成立的关键：那份名单带 30 秒缓存，所以"列得到"与"备份时文件还在"
@@ -3596,13 +3627,26 @@ mod tests {
         // `.ok()` 吞掉的，所以拿到的仍是这个路径，而 read_dir 会对它报错。
         let blocked = paths::data_home().join("backup");
         std::fs::write(&blocked, b"not a directory").unwrap();
+        // 别的用例留下的后台线程可能在这几行之间惰性解析/改写全局 app_dir（实测本
+        // 用例整套跑时偶发 `backup_dir` 变成 crates/core）—— 调用前重新钉住，
+        // 别把"全局路径漂了"记成"轮转没出声"。
+        let pin = |p: &std::path::Path| {
+            crate::paths::set_app_dir(p);
+            crate::paths::force_data_home(p);
+        };
 
-        let ((), logs) = crate::logger::capture_logs(|| rotate_alias_backups(1, false));
+        let ((), logs) = crate::logger::capture_logs(|| {
+            pin(_tmp.path());
+            rotate_alias_backups(1, false)
+        });
         assert!(
             logs.iter().any(|l| l.contains("别名快照轮转跳过")),
-            "列表读不出来时要说清这一轮一份都没删: {logs:?}"
+            "列表读不出来时要说清这一轮一份都没删: {logs:?}（实际 backup_dir={:?}，阻塞位置在 {:?}）",
+            paths::backup_dir(),
+            blocked
         );
         let ((), logs) = crate::logger::capture_logs(|| {
+            pin(_tmp.path());
             rotate_backups(
                 RetentionPolicy {
                     recent: 1,
