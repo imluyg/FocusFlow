@@ -570,21 +570,35 @@ fn try_delete_expense(id: i64) -> Result<bool, String> {
 }
 
 /// 获取全部记账记录（按 id 降序）。
+///
+/// 读不出来与"一条记录都没有"必须分开说话：这里的调用方（`host.rs` 的 `accounting_list`）
+/// 把返回的数组直接交给面板，空数组会被渲染成「（暂无数据）」——
+/// 库被别的连接握着、页坏了、临时目录读不动都会走成那句话，而日志里一个字都没有，
+/// 用户看到的和"我把记录删光了"完全一样。
 pub fn get_all_expenses(limit: i64) -> Vec<Expense> {
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::error!("读记账记录列表失败：记账库打不开: {e}");
+            return Vec::new();
+        }
     };
     let mut stmt = match conn.prepare(&format!(
         "SELECT {EXPENSE_COLS} FROM expenses ORDER BY id DESC LIMIT ?1"
     )) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::error!("读记账记录列表失败：准备查询就没过（{e}）");
+            return Vec::new();
+        }
     };
     let result = stmt.query_map([limit], row_to_expense);
     match result {
         Ok(rows) => collect_expenses(rows, "全部记录"),
-        Err(_) => Vec::new(),
+        Err(e) => {
+            tracing::error!("读记账记录列表失败：查询开始就失败（{e}）");
+            Vec::new()
+        }
     }
 }
 
@@ -1169,7 +1183,10 @@ pub fn get_expenses_page(
 ) -> (Vec<Expense>, i64) {
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return (Vec::new(), 0),
+        Err(e) => {
+            tracing::error!("读记账分页失败：记账库打不开: {e}");
+            return (Vec::new(), 0);
+        }
     };
     let mut conds: Vec<String> = Vec::new();
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -1228,15 +1245,25 @@ pub fn get_expenses_page(
         let sql = format!("SELECT COUNT(*) FROM expenses{where_sql}");
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
-            Err(_) => return (Vec::new(), 0),
+            Err(e) => {
+                tracing::error!("读记账分页的条数失败（{e}）");
+                return (Vec::new(), 0);
+            }
         };
         let mut rows = match stmt.query(rusqlite::params_from_iter(params.iter())) {
             Ok(r) => r,
-            Err(_) => return (Vec::new(), 0),
+            Err(e) => {
+                tracing::error!("读记账分页的条数失败：查询没跑起来（{e}）");
+                return (Vec::new(), 0);
+            }
         };
         match rows.next() {
             Ok(Some(row)) => row.get(0).unwrap_or(0),
-            _ => 0,
+            Ok(None) => 0,
+            Err(e) => {
+                tracing::error!("读记账分页的条数失败：结果读不出来（{e}）");
+                0
+            }
         }
     };
 
@@ -1248,7 +1275,15 @@ pub fn get_expenses_page(
     );
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
-        Err(_) => return (Vec::new(), total),
+        Err(e) => {
+            // 条数是刚刚才查证过的真数，不许在这里被改成 0：面板会因此显示
+            // 「共 0 条」，而用户的记录一条都没少 —— 那是比"列不出来"更坏的一句假话。
+            // 这一支的矛盾（有 N 条却列不出行）由日志说清，不由返回值撒谎来遮。
+            tracing::error!(
+                "读记账分页的明细失败（{e}）：条数 {total} 仍然有效，但这一页没有行可读"
+            );
+            return (Vec::new(), total);
+        }
     };
     let mut all_params: Vec<rusqlite::types::Value> = params;
     all_params.push(page_size.into());
@@ -1259,7 +1294,10 @@ pub fn get_expenses_page(
     );
     let records = match result {
         Ok(rows) => collect_expenses(rows, "分页列表"),
-        Err(_) => Vec::new(),
+        Err(e) => {
+            tracing::error!("读记账分页的明细失败：查询没跑起来（{e}）：条数 {total} 仍然有效");
+            Vec::new()
+        }
     };
     (records, total)
 }
@@ -2553,6 +2591,71 @@ mod tests {
             !ok2 && msg2.contains("不存在"),
             "缺分类不许被说成读不动，反之也不行: {msg2}"
         );
+    }
+
+    /// 「条数是真的、明细读不出来」时，返回值不许把条数一起归零。
+    ///
+    /// 面板按 `total` 写「共 N 条」、还拿它算页码；把 N 变成 0 等于对用户说
+    /// "你一条记录都没有"，而记录全在库里 —— 那是比"这一页暂时列不出行"更坏的一句假话。
+    /// 这一支的矛盾交给日志说清楚。
+    #[test]
+    fn a_page_whose_rows_cannot_be_read_keeps_the_count_it_verified() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_page_no_column");
+        {
+            let conn = open().unwrap();
+            // 一张少了 `delivery_date` 的旧表：COUNT 照样能跑，点名 11 列的明细查询准备不过
+            conn.execute_batch(
+                "CREATE TABLE expenses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    type TEXT NOT NULL DEFAULT '支出',
+                    item_name TEXT NOT NULL,
+                    store TEXT,
+                    purchase_date TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    category TEXT,
+                    subcategory TEXT,
+                    record_time TEXT NOT NULL,
+                    note TEXT
+                 );
+                 INSERT INTO expenses (item_name, purchase_date, amount, record_time)
+                 VALUES ('一笔','2026-09-05',3.0,'2026-09-05 10:00:00');",
+            )
+            .unwrap();
+        }
+        let (records, total) = get_expenses_page(1, 20, None, None, None, None, None);
+        assert!(
+            records.is_empty(),
+            "这张表读不出明细（少一列），不该硬凑出行来"
+        );
+        assert_eq!(
+            total, 1,
+            "COUNT 查证过的条数不许被归零：那等于对用户说「你一条记录都没有」"
+        );
+    }
+
+    /// 接线腿：两条读路不许再把错误整个吞掉换成"没有记录"。
+    ///
+    /// 空列表在面板上渲染成「（暂无数据）」，与"我把记录删光了"长得一样；
+    /// 库被握着 / 页坏了 / 临时目录读不动都会走成那句话，旧代码一个字都不留。
+    #[test]
+    fn the_read_paths_say_why_the_records_could_not_be_read() {
+        let src = include_str!("accounting.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        for head in ["pub fn get_all_expenses(", "pub fn get_expenses_page("] {
+            let at = prod.find(head).unwrap_or_else(|| panic!("{head} 不见了"));
+            let rest = &prod[at..];
+            let end = rest.find("\n}\n").expect("函数切不出来");
+            let code: String = rest[..end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("Err(_)"),
+                "{head} 里还有把错误整个吞掉的臂：读不出来与「没有记录」必须是两件事"
+            );
+        }
     }
 
     /// 回归（第 23 轮）：`add_category` 撞重名时 `INSERT OR IGNORE` 整条忽略，紧接着
