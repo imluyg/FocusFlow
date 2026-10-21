@@ -1078,23 +1078,117 @@ pub fn maybe_auto_vacuum(auto_vacuum_days: i64) {
     tracing::info!("自动 VACUUM 完成");
 }
 
-/// 校验备份数据库可打开且通过 quick_check。
-/// 坏备份（撕裂的文件拷贝/中断的备份）不删除会占用轮转名额、顶掉好备份。
-fn verify_backup_file(dst: &Path) -> bool {
+/// 备份校验的三种结局。
+///
+/// 原先只有"过/不过"两态：`BUSY`、被占用、打不开都和不存在的 SQLite 文件一样
+/// 落进"坏备份"，调用方随即把它删掉。可"这次验不了"不等于"文件坏了" ——
+/// 杀软/同步盘握一下文件就能让一份刚写好的备份被自己人清掉。
+#[derive(Debug, PartialEq)]
+enum BackupVerify {
+    Healthy,
+    /// 确认这份文件不能用：quick_check 报错或根本不是数据库。
+    Corrupt(String),
+    /// 这次验不了（占用、打不开、IO）：内容可能是好的，不能据此删。
+    Unreadable(String),
+}
+
+/// 打开/查询备份时的错误 → 三态。只有 SQLite 明确报告损坏或不是数据库才算 Corrupt。
+fn classify_verify_error(e: &rusqlite::Error) -> BackupVerify {
+    let corrupt = matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            )
+    );
+    if corrupt {
+        BackupVerify::Corrupt(e.to_string())
+    } else {
+        BackupVerify::Unreadable(e.to_string())
+    }
+}
+
+fn verify_backup(dst: &Path) -> BackupVerify {
     let result = Connection::open_with_flags(
         dst,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .and_then(|conn| conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)));
+    .and_then(|conn| {
+        // 校验不该等锁：BUSY 立刻交回三态，由调用方决定留档/重试。默认 busy 等待
+        // 会让一次被占用的校验拖住整轮备份（实测单测能慢十几秒）。
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
+    });
     match result {
-        Ok(status) if status == "ok" => true,
-        other => {
-            tracing::error!("备份完整性校验失败 {}: {other:?}", dst.display());
+        Ok(status) if status == "ok" => BackupVerify::Healthy,
+        // quick_check 跑通了却回了别的：这是它真的看到了坏页。
+        Ok(status) => BackupVerify::Corrupt(format!("quick_check 报错: {status}")),
+        Err(e) => classify_verify_error(&e),
+    }
+}
+
+/// 把"这次验不了"的备份改名留档，返回新路径。
+///
+/// 名字以 `.db.unverified` 结尾：轮转与 `newest_backup_of_group` 只认 `.db`，
+/// 不会把它当成最新那份；`remove_backup` 对 NotFound 返回 Ok，所以调用方随后
+/// 的清理不会把它删掉。改名失败（文件被独占）就交回原因 —— 那种情况下删除
+/// 通常也会失败，文件仍在。
+fn quarantine_backup(dst: &Path) -> Result<std::path::PathBuf, String> {
+    let mut target = dst.with_extension("db.unverified");
+    let mut n = 0u32;
+    while target.exists() {
+        n += 1;
+        if n > 100 {
+            return Err(format!("找不到可用的留档名（{}）", dst.display()));
+        }
+        target = dst.with_extension(format!("db.unverified-{n}"));
+    }
+    std::fs::rename(dst, &target)
+        .map_err(|e| format!("改名 {} → {} 失败: {e}", dst.display(), target.display()))?;
+    for suffix in ["-wal", "-shm"] {
+        let from = crate::data_location::with_suffix(dst, suffix);
+        if from.exists() {
+            let to = crate::data_location::with_suffix(&target, suffix);
+            if let Err(e) = std::fs::rename(&from, &to) {
+                tracing::warn!(
+                    "验不了的备份留档时，sidecar 没跟着搬（{}）：{e}",
+                    from.display()
+                );
+            }
+        }
+    }
+    Ok(target)
+}
+
+/// 校验备份数据库可打开且通过 quick_check。
+/// 确认损坏的备份删除（不删会占轮转名额、顶掉好备份）；只是这次验不了的先改名留档。
+fn verify_backup_file(dst: &Path) -> bool {
+    match verify_backup(dst) {
+        BackupVerify::Healthy => true,
+        BackupVerify::Corrupt(why) => {
+            tracing::error!("备份完整性校验失败（确认损坏） {}: {why}", dst.display());
             if let Err(e) = remove_backup(dst) {
                 tracing::error!(
                     "坏备份没能删掉（{e}）：下一轮会把它当成现成的那一份，\
                      还占着一个轮转名额把好的旧那份挤掉 —— 请手动清理它"
                 );
+            }
+            false
+        }
+        BackupVerify::Unreadable(why) => {
+            tracing::warn!(
+                "备份完整性校验这次做不了（{}）: {why} —— 不按坏备份删除，先改名留档",
+                dst.display()
+            );
+            match quarantine_backup(dst) {
+                Ok(path) => tracing::warn!(
+                    "验不了的备份已留档：{}（确认内容后可手动删除；轮转不会把它当成最新备份）",
+                    path.display()
+                ),
+                Err(e) => tracing::error!(
+                    "验不了的备份也移不开（{e}）：接下来调用方若删得掉就会把它删掉，请手动保留"
+                ),
             }
             false
         }
@@ -3021,8 +3115,117 @@ mod tests {
         assert!(shown.contains("保留"), "要说明保守方向: {shown}");
     }
 
-    /// 接线腿：清 sidecar 的那条路也要用同一把"读不到大小 ≠ 空"的尺子。
-    ///
+    fn ffi_err(code: rusqlite::ErrorCode) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code: 0,
+            },
+            None,
+        )
+    }
+
+    /// 校验三态：只有明确的损坏/非数据库才算坏；打不开/被占用是"这次验不了"。
+    #[test]
+    fn backup_verify_tells_corrupt_apart_from_unreadable() {
+        for code in [
+            rusqlite::ErrorCode::DatabaseBusy,
+            rusqlite::ErrorCode::CannotOpen,
+        ] {
+            assert!(
+                matches!(
+                    classify_verify_error(&ffi_err(code)),
+                    BackupVerify::Unreadable(_)
+                ),
+                "{code:?} 是环境问题，不是确认损坏"
+            );
+        }
+        assert!(matches!(
+            classify_verify_error(&rusqlite::Error::InvalidQuery),
+            BackupVerify::Unreadable(_)
+        ));
+        for code in [
+            rusqlite::ErrorCode::DatabaseCorrupt,
+            rusqlite::ErrorCode::NotADatabase,
+        ] {
+            assert!(
+                matches!(
+                    classify_verify_error(&ffi_err(code)),
+                    BackupVerify::Corrupt(_)
+                ),
+                "{code:?} 必须按确认损坏处理"
+            );
+        }
+
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("backup_verify_shapes");
+        let good = dir.path().join("good.db");
+        {
+            let conn = Connection::open(&good).unwrap();
+            conn.execute_batch("CREATE TABLE t(x);").unwrap();
+        }
+        assert_eq!(verify_backup(&good), BackupVerify::Healthy);
+
+        let junk = dir.path().join("junk.db");
+        std::fs::write(&junk, b"not a sqlite database").unwrap();
+        assert!(
+            matches!(verify_backup(&junk), BackupVerify::Corrupt(_)),
+            "垃圾字节是确认损坏，不是「这次验不了」"
+        );
+        assert!(!verify_backup_file(&junk));
+        assert!(!junk.exists(), "确认损坏的备份该删掉，别占轮转名额");
+    }
+
+    /// 被独占、这次验不了的备份不许被当坏备份删掉：原文件或留档必须留一个。
+    #[test]
+    fn an_unverifiable_backup_is_quarantined_instead_of_deleted() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("backup_verify_locked");
+        let dst = dir.path().join("focusflow_2026_20260101_000000.db");
+        let conn = Connection::open(&dst).unwrap();
+        conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE;")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2)", []).unwrap();
+
+        assert!(
+            matches!(verify_backup(&dst), BackupVerify::Unreadable(_)),
+            "被独占的库不是损坏"
+        );
+        assert!(!verify_backup_file(&dst));
+        let quarantined = dst.with_extension("db.unverified");
+        assert!(
+            dst.exists() || quarantined.exists(),
+            "验不了的备份不许被删掉（原文件或留档必须有一个在）"
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&dst);
+        let _ = std::fs::remove_file(&quarantined);
+    }
+
+    /// 留档改名要把主文件与 sidecar 一起带走。
+    #[test]
+    fn quarantine_moves_the_main_and_sidecars() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("backup_quarantine");
+        let dst = dir.path().join("focusflow_2026_20260102_000000.db");
+        std::fs::write(&dst, b"db").unwrap();
+        for suffix in ["-wal", "-shm"] {
+            std::fs::write(crate::data_location::with_suffix(&dst, suffix), b"x").unwrap();
+        }
+        let moved = quarantine_backup(&dst).unwrap();
+        assert!(!dst.exists());
+        assert_eq!(std::fs::read(&moved).unwrap(), b"db");
+        for suffix in ["-wal", "-shm"] {
+            assert!(
+                crate::data_location::with_suffix(&moved, suffix).exists(),
+                "sidecar 要跟着搬: {suffix}"
+            );
+        }
+    }
+
+    /// 接线腿：清 sidecar 的那条路也要用同一把"读不到大小 ≠ 空"的尺子。    ///
     /// 它每次备份前都跑；若在这里另抄一份 `unwrap_or(true)`，上一轮 finalize 刚
     /// 保守留下的非空 WAL，下一轮就会被这次清扫按"空"删掉。
     #[test]
