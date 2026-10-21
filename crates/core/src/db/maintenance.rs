@@ -340,7 +340,17 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
         match migrate {
             Ok(moved) => {
                 conn.execute("COMMIT;", [])?;
-                conn.execute("DETACH DATABASE source", [])?;
+                // DETACH 是**提交之后**的收尾，它失败不能把已经做成的归档说成失败：
+                // 上层 `archive_stale_years` 拿到 false 会连带跳过 `mark_expected_year_shrink()`，
+                // 下一次备份就拿归档**前**的基线比总量 ⇒ 一句假"骤降" + 轮转被冻结
+                // （旧备份从此不再回收），而日志说的是"年度归档失败"——
+                // 数据其实已经在上面那个 COMMIT 里搬过去了（源库那些行就是同一条事务删掉的）。
+                // 与本文件"提交后的清理只出声"那条（`vacuum_path` 的 last_vacuum 那一处）同形状。
+                if let Err(e) = conn.execute("DETACH DATABASE source", []) {
+                    tracing::warn!(
+                        "年度归档已提交，只是没能脱离源库（{e}）：不重做归档，连接释放时自然会脱离"
+                    );
+                }
                 Ok(moved)
             }
             Err(e) => {
@@ -1542,6 +1552,18 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
     for year in years {
         let src = paths::year_db_path(year);
         if !src.exists() {
+            // 列得出来、备份时却不在原位 —— 这不是"没有要备份的"。
+            // `try_available_years` 是按"那个文件里还有聚合行"判有数据的，而且那份名单
+            // 带 30 秒缓存：能进名单就说明它不久前还在。随后它没了（手工清理 `data/`、
+            // 同步盘/杀软把它搬走、移动盘休眠），原先的写法只是一个 `continue` ⇒
+            // `failed` 是空的 ⇒ `is_complete()` 说干净 ⇒ CLI 退 0 打「备份完成」，
+            // 而那一整年的数据这一轮一个字都没进备份。
+            // 附属库那一支的 `!src.exists()` 是正常态（插件没建过库），不并入这条判据。
+            tracing::error!(
+                "年度库被列进备份名单却不在原位，这一年本轮没有备份: {year}（{}）",
+                src.display()
+            );
+            failed.push(format!("{year} 年库（文件不在原位）"));
             continue;
         }
         // 源库指纹必须在**任何备份动作之前**取：备份过程本身可能触碰源库
@@ -2792,6 +2814,89 @@ mod tests {
         assert!(
             !code.contains(".is_ok()"),
             "「它没报错」又被当成「模式切成了」"
+        );
+    }
+
+    /// 「列出来却不在原位」的那一年必须算进没备份出去的清单，不许当成"没有要备份的"。
+    ///
+    /// 时序是这条缺陷成立的关键：那份名单带 30 秒缓存，所以"列得到"与"备份时文件还在"
+    /// 之间本来就有窗口（手工清理 `data/`、同步盘或杀软把库搬走、移动盘休眠中读不出来）。
+    /// 旧写法只是一个 `continue` ⇒ `failed` 空 ⇒ `is_complete()` 说干净 ⇒
+    /// 设置页与 CLI 都在说"备份完成"，而那一整年这一轮一个字都没进备份。
+    #[test]
+    fn a_year_that_vanished_after_listing_is_not_reported_as_nothing_to_back_up() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("backup_vanished_year");
+        let this_year = chrono::Local::now().year();
+        {
+            let conn = connection::open_rw(&paths::year_db_path(this_year)).unwrap();
+            connection::ensure_schema(&conn, this_year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (1, 7)",
+                [],
+            )
+            .unwrap();
+        }
+        let gone = 2019;
+        {
+            let conn = connection::open_rw(&paths::year_db_path(gone)).unwrap();
+            connection::ensure_schema(&conn, gone).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (1, 9)",
+                [],
+            )
+            .unwrap();
+        }
+        queries::invalidate_years_cache();
+        let listed = queries::try_available_years().expect("名单要读得出来");
+        assert!(
+            listed.contains(&gone),
+            "夹具前提：那一年得先被列进名单: {listed:?}"
+        );
+        // 名单取到之后文件才没 —— 这正是"缓存里说有数据、磁盘上已经没有"的那个窗口
+        std::fs::remove_file(paths::year_db_path(gone)).unwrap();
+
+        let outcome = backup_database(5);
+        let failed: Vec<String> = match &outcome {
+            BackupOutcome::Done { failed, .. } => failed.clone(),
+            BackupOutcome::Failed { reason } => vec![reason.clone()],
+            BackupOutcome::NothingToDo => Vec::new(),
+        };
+        assert!(
+            !outcome.is_complete(),
+            "少了一整年却被算成「这轮兜住了」: {failed:?}"
+        );
+        assert!(
+            failed.iter().any(|f| f.contains("2019")),
+            "没备份出去的那一年必须被点名: {failed:?}"
+        );
+    }
+
+    /// 接线腿：`COMMIT` 之后的收尾步骤不许再把错误往上抛。
+    ///
+    /// 归档已经提交成功，DETACH 失败只该出声；往上抛会让调用方以为"没搬成"，
+    /// 连带跳过 `mark_expected_year_shrink()` —— 下一次备份就拿归档**前**的基线比总量，
+    /// 一句假"骤降" + 轮转被冻结（旧备份不再回收）。真让 DETACH 失败要在真机上把源库
+    /// 锁住才造得出，无头环境给不出那个形态 ⇒ 这里钉形状，行为那半登记为眼验项。
+    #[test]
+    fn post_commit_cleanup_does_not_retract_a_committed_archive() {
+        let src = include_str!("maintenance.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn archive_year_range(")
+            .expect("归档函数找不到了");
+        let rest = &prod[at..];
+        let end = rest.find("\nfn ").expect("归档函数之后没有顶层函数了");
+        let body = &rest[..end];
+        let commit_at = body.find("\"COMMIT;\"").expect("那次提交不见了");
+        let after = &body[commit_at..];
+        assert!(
+            after.contains("if let Err(e) = conn.execute(\"DETACH DATABASE source\", [])"),
+            "提交后的 DETACH 要自己接住错误、只出声"
+        );
+        assert!(
+            !after.contains("DETACH DATABASE source\", [])?;"),
+            "DETACH 又被 ? 往上抛：已经提交成功的归档会被说成失败"
         );
     }
 
