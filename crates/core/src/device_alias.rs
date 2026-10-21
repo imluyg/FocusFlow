@@ -18,7 +18,7 @@
 //! 注意：别名只影响展示，不改动统计口径，也不回写 `devices` 登记表。
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -275,14 +275,18 @@ fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
 /// 读取别名表（带 mtime 缓存；文件不存在或损坏时返回空表，不报错）。
 pub fn table() -> AliasTable {
     let path = alias_path();
+    if let Some(table) = cached_table(&path, file_mtime(&path)) {
+        return table;
+    }
+    // 重载必须与写盘串行。`write_map` 是在 rename **之后**才清缓存；读侧若在
+    // "mtime 已取、文件已读"之后、清缓存之前把旧表存回去，而新旧 mtime 又恰好
+    // 相同（同一次时钟 tick 里先后写），之后每次都会命中这份旧表，直到文件
+    // 再次变化 —— 表现就是改完设备名、面板刷新仍是旧名字。
+    let _serial = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 等锁期间可能已经有人写过：mtime 与缓存都要重取，别拿锁外的旧判断继续。
     let mtime = file_mtime(&path);
-    {
-        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cached_mtime, table, cached_path)) = cache.as_ref() {
-            if *cached_mtime == mtime && *cached_path == path {
-                return table.clone();
-            }
-        }
+    if let Some(table) = cached_table(&path, mtime) {
+        return table;
     }
     let map = match try_read_map(&path) {
         AliasRead::Good(m) => m,
@@ -294,6 +298,16 @@ pub fn table() -> AliasTable {
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *cache = Some((mtime, table.clone(), path));
     table
+}
+
+fn cached_table(path: &Path, mtime: Option<SystemTime>) -> Option<AliasTable> {
+    let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let (cached_mtime, table, cached_path) = cache.as_ref()?;
+    if *cached_mtime == mtime && *cached_path == path {
+        Some(table.clone())
+    } else {
+        None
+    }
 }
 
 /// 读别名文件的结果 —— 分三类，因为只有"读不出、但内容可能完好"这一类该拒绝写回。
@@ -504,6 +518,41 @@ mod tests {
             clear(key).unwrap();
             assert!(table().resolve(key).is_none());
         });
+    }
+
+    /// 重载（读文件 + 写缓存）必须在写锁之内，且锁要在两者之前拿到。
+    ///
+    /// 竞态窗口没法在用例里确定性复现（要读侧正好落在"文件读完、缓存未存"、
+    /// 而写侧已经 rename 并清掉缓存的那一瞬，还得新旧 mtime 相同），所以钉顺序：
+    /// 锁一旦被挪到读文件之后，这份旧表就可能带着旧 mtime 存回缓存，之后一直命中。
+    #[test]
+    fn table_reload_is_serialized_with_writers() {
+        let src = include_str!("device_alias.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod.find("pub fn table(").expect("table 不见了");
+        let rest = &prod[at..];
+        let body = &rest[..rest.find("\n}\n").expect("函数体切不出来")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lock_at = code.find("WRITE_LOCK.lock()").expect("重载没有拿写锁");
+        let read_at = code.find("try_read_map").expect("没有读文件");
+        let store_at = code.find("*cache = Some").expect("没有写缓存");
+        assert!(
+            lock_at < read_at,
+            "读文件必须发生在拿到写锁之后，否则可能把写侧刚作废的旧表存回缓存"
+        );
+        assert!(
+            lock_at < store_at,
+            "写缓存必须发生在拿到写锁之后，否则旧表会带着旧 mtime 留在缓存里"
+        );
+        assert_eq!(
+            code.matches("WRITE_LOCK.lock()").count(),
+            1,
+            "table() 只该在重载这一处拿写锁"
+        );
     }
 
     /// 型号回退：实例路径变了（换 USB 口），同型号的别名仍生效。
