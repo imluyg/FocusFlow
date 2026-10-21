@@ -607,15 +607,17 @@ pub fn register_host_api(
     )?;
     host.set("accounting_query", acc_query)?;
 
-    // 分类列表（名字数组）
+    // 分类列表：`(名字数组, 这次没读全的原因)`，原因空串 = 读全了。
+    // 第二个值必须交出去：面板拿这份清单去过「用户筛的分类还在不在」，
+    // 读不动的那一轮清单是残缺的，据它下结论会把用户的筛选条件当成悬空清掉。
     let acc_cats = lua.create_function(|lua, ()| {
         ensure_accounting_db();
-        let cats = accounting::get_all_categories();
+        let (cats, why) = accounting::get_all_categories();
         let t = lua.create_table()?;
         for (i, c) in cats.iter().enumerate() {
             t.set(i + 1, c.name.as_str())?;
         }
-        Ok(t)
+        Ok((t, why))
     })?;
     host.set("accounting_categories", acc_cats)?;
 

@@ -177,7 +177,7 @@ mod tests {
 
         // 分类：init_db 预置默认分类（13 个），再添加自定义分类
         accounting::add_category("食品", "expense", &["早餐".into(), "午餐".into()]);
-        let cats = accounting::get_all_categories();
+        let cats = accounting::get_all_categories().0;
         assert_eq!(cats.len(), 14);
         assert!(cats.iter().any(|c| c.name == "食品" && c.subs.len() == 2));
         assert!(cats.iter().any(|c| c.name == "食品饮料"));

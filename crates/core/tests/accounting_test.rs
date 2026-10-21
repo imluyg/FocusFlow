@@ -35,6 +35,7 @@ fn category_names_are_trimmed_and_blank_ones_rejected() {
     let _d = setup();
     let names = || -> Vec<String> {
         accounting::get_all_categories()
+            .0
             .iter()
             .map(|c| c.name.clone())
             .collect()
@@ -195,7 +196,7 @@ fn legacy_db_migration() {
 
     // init_db 应迁移：补 subs 列、合并旧子分类、不重复预置
     accounting::init_db().unwrap();
-    let cats = accounting::get_all_categories();
+    let cats = accounting::get_all_categories().0;
     assert_eq!(cats.len(), 2, "迁移后分类数不变");
     let game = cats.iter().find(|c| c.name == "游戏").unwrap();
     assert_eq!(game.subs, vec!["梦幻西游", "充值"]);
@@ -223,7 +224,7 @@ fn category_management_crud() {
     assert!(id1 > 0);
 
     // 预置分类已存在：找"游戏"
-    let cats = accounting::get_all_categories();
+    let cats = accounting::get_all_categories().0;
     let game = cats.iter().find(|c| c.name == "游戏").unwrap();
     assert!(game.subs.contains(&"梦幻西游".to_string()));
 
@@ -232,6 +233,7 @@ fn category_management_crud() {
     assert!(new_id > 0);
     assert!(
         accounting::get_all_categories()
+            .0
             .iter()
             .any(|c| c.name == "宠物"),
         "新分类应存在"
@@ -242,6 +244,7 @@ fn category_management_crud() {
     assert!(ok);
     assert!(
         accounting::get_all_categories()
+            .0
             .iter()
             .any(|c| c.name == "宠物用品"),
         "重命名后新名应存在"
@@ -260,7 +263,7 @@ fn category_management_crud() {
     // 重命名子分类 → 历史记录同步
     let (ok, _) = accounting::update_subcategory("游戏", "梦幻西游", "梦幻西游2");
     assert!(ok);
-    let after = accounting::get_all_categories();
+    let after = accounting::get_all_categories().0;
     let game2 = after.iter().find(|c| c.name == "游戏").unwrap();
     assert!(game2.subs.contains(&"梦幻西游2".to_string()));
     let rec = accounting::get_expense_by_id(id1).unwrap();
@@ -277,6 +280,7 @@ fn category_management_crud() {
     assert!(ok);
     assert!(
         !accounting::get_all_categories()
+            .0
             .iter()
             .any(|c| c.name == "宠物用品"),
         "删除后分类不应存在"

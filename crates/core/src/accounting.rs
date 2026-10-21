@@ -1055,15 +1055,33 @@ pub fn category_type(name: &str) -> Option<String> {
     .ok()
 }
 
-/// 获取所有分类。
-pub fn get_all_categories() -> Vec<Category> {
+/// 获取所有分类，并说清这份清单**能不能当完整答案用**：`(清单, 没读全的原因)`，
+/// 原因空串 = 每一行都读出来了。
+///
+/// 第二个值不是装饰：界面调用方拿这份清单去判「用户筛的那个分类还在不在」
+/// （`accounting_plugin.lua` 的 `reset_stale_filters`）。原先三个失败臂一律
+/// `return Vec::new()` 且一条日志不写，「这一行读不动 / 库被别的连接握着 / 库打不开」
+/// 与「用户把分类删光了」是同一个答案 —— 于是面板替用户把筛选条件与弹窗草稿里的分类
+/// 一起清零，看起来就像用户自己删掉的。口径与本文件里的 `collect_expenses` 一致：
+/// 读不出来的那些必须点名，且不许被当成「没有」。
+pub fn get_all_categories() -> (Vec<Category>, String) {
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            let why = format!("记账库打不开: {e}");
+            tracing::error!(
+                "读取分类清单失败：{why}（分类不是被删了，是这一次读不出来，界面不会据此改掉筛选条件）"
+            );
+            return (Vec::new(), why);
+        }
     };
     let mut stmt = match conn.prepare("SELECT id, name, type, subs FROM categories ORDER BY id") {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            let why = format!("分类表读不出来（语句准备不了）: {e}");
+            tracing::error!("读取分类清单失败：{why}");
+            return (Vec::new(), why);
+        }
     };
     let result = stmt.query_map([], |r| {
         let subs_raw: String = r.get(3)?;
@@ -1075,10 +1093,41 @@ pub fn get_all_categories() -> Vec<Category> {
             subs,
         })
     });
-    match result {
-        Ok(rows) => rows.flatten().collect(),
-        Err(_) => Vec::new(),
+    let rows = match result {
+        Ok(rows) => rows,
+        Err(e) => {
+            let why = format!("分类一条都没读出来: {e}");
+            tracing::error!("读取分类清单失败：{why}");
+            return (Vec::new(), why);
+        }
+    };
+
+    let mut cats: Vec<Category> = Vec::new();
+    let mut dropped = 0usize;
+    let mut first_err: Option<String> = None;
+    for row in rows {
+        match row {
+            Ok(c) => cats.push(c),
+            Err(e) => {
+                dropped += 1;
+                if first_err.is_none() {
+                    first_err = Some(e.to_string());
+                }
+            }
+        }
     }
+    if dropped > 0 {
+        let why = format!(
+            "有 {dropped} 行分类整行读不出来（第一个原因：{}）",
+            first_err.unwrap_or_else(|| "(没带上原因)".to_string())
+        );
+        tracing::error!(
+            "读取分类清单：{why}：它们不会出现在列表里，\
+             所以这份清单不能用来断定某个分类已经没了"
+        );
+        return (cats, why);
+    }
+    (cats, String::new())
 }
 
 /// `categories.subs` 的解析口径（逗号分隔），全模块共用。
@@ -1676,6 +1725,7 @@ mod tests {
         }
 
         let migrated = get_all_categories()
+            .0
             .into_iter()
             .find(|c| c.name == "迁移来的")
             .expect("应读到该分类");
@@ -2070,7 +2120,7 @@ mod tests {
             "打错的值不能默默落库"
         );
         assert!(
-            get_all_categories().iter().all(|c| c.name != "交通"),
+            get_all_categories().0.iter().all(|c| c.name != "交通"),
             "被拒的分类一条都不能留在库里"
         );
         assert!(add_category("交通", "both", &[]) > 0, "换个合法值照常建");
@@ -2357,6 +2407,7 @@ mod tests {
         init_db().expect("半截迁移不能让初始化失败");
 
         let game = get_all_categories()
+            .0
             .into_iter()
             .find(|c| c.name == "游戏")
             .expect("分类还在");
@@ -2444,6 +2495,7 @@ mod tests {
         }
         init_db().expect("障碍移开后要能继续");
         let game = get_all_categories()
+            .0
             .into_iter()
             .find(|c| c.name == "游戏")
             .expect("分类还在");
@@ -2473,6 +2525,7 @@ mod tests {
         };
         assert_eq!(id, stored, "交回的 id 就是这一条的 id");
         let got = get_all_categories()
+            .0
             .into_iter()
             .find(|c| c.name == "交通")
             .expect("分类在库里");
@@ -2593,6 +2646,70 @@ mod tests {
                 "又有写入口把「库打不开」静默折成 {fold}：面板的提示会指向一条不存在的日志"
             );
         }
+    }
+
+    /// 分类清单没读全时要交出**原因**并留下日志，不许看着像"用户把分类删光了"。
+    ///
+    /// 这一头少一个值就等于界面多说一句假话：`accounting_plugin.lua` 的
+    /// `reset_stale_filters` 拿这份清单判「用户筛的那个分类还在不在」。原先三个失败臂
+    /// （库打不开 / 语句准备不了 / 某一行整行读不出来）全部折成 `Vec::new()` 且零日志，
+    /// 于是面板会把用户的筛选条件与弹窗草稿清零，看起来像用户自己删的。
+    #[test]
+    fn an_incomplete_category_list_says_so_instead_of_looking_empty() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_cats_partial");
+        init_db().expect("建库失败");
+        assert!(add_category("收藏", "both", &["充值".to_string()]) > 0);
+        assert!(add_category("交通", "expense", &[]) > 0);
+
+        // 读全的那一轮：原因必须是空串 —— 界面只在这一轮才允许校正筛选条件
+        let ((cats, gap), logs) = crate::logger::capture_logs(get_all_categories);
+        assert!(gap.is_empty(), "读全了不该带原因: {gap}");
+        assert!(
+            cats.iter().any(|c| c.name == "收藏") && cats.iter().any(|c| c.name == "交通"),
+            "夹具应读到这两个分类: {cats:?}"
+        );
+        assert!(
+            !logs.iter().any(|l| l.contains("读取分类清单")),
+            "读全了不该出声: {logs:?}"
+        );
+
+        // 第一档：某一行整行读不出来（subs 换成非文本值）。
+        // 读得出来的那一行照常交出，但这份清单从此不可当完整答案用。
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "UPDATE categories SET subs=?1 WHERE name='收藏'",
+                [rusqlite::types::Value::Blob("充值".as_bytes().to_vec())],
+            )
+            .unwrap();
+        }
+        let ((cats, gap), logs) = crate::logger::capture_logs(get_all_categories);
+        assert!(
+            cats.iter().any(|c| c.name == "交通"),
+            "读得出来的那一行仍要交出: {cats:?}"
+        );
+        assert!(
+            !cats.iter().any(|c| c.name == "收藏"),
+            "读不出来那一行不该凭空出现: {cats:?}"
+        );
+        assert!(gap.contains("1 行"), "要说清少了几行: {gap}");
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("读取分类清单") && l.contains("行分类整行读不出来")),
+            "读不全必须留下日志: {logs:?}"
+        );
+
+        // 第二档：整个文件不是数据库（移动盘上的半截文件、被同步盘换成的占位内容）。
+        // 这一档连一行都没有，原因照样要交出，且不许与"一个分类都没有"同形。
+        std::fs::write(db_path(), "这不是一个 SQLite 文件").unwrap();
+        let ((cats, gap), logs) = crate::logger::capture_logs(get_all_categories);
+        assert!(cats.is_empty(), "读不动时不该凭空给出分类: {cats:?}");
+        assert!(!gap.is_empty(), "库读不动时原因不能是空串");
+        assert!(
+            logs.iter().any(|l| l.contains("读取分类清单失败")),
+            "库读不动必须留下日志: {logs:?}"
+        );
     }
 
     /// 读不出来时，不许把整列子分类覆盖成"只剩刚加的那一个"。

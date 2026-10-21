@@ -112,8 +112,13 @@ function norm_date(s)
     return string.format("%04d-%02d-%02d", y, m, d)
 end
 
+-- 分类清单，连同「这次有没有读全」（空串 = 每一行都读出来了）。
+-- 第二个值不能省：下面 `reset_stale_filters` 拿这份清单判「用户筛的分类还在不在」，
+-- 于是"库读不动 / 某一行读不出来"会被念成"这个分类被删了"，用户的筛选条件跟草稿
+-- 就被一起清零。清单本身照样交出去（下拉里能显示几条显示几条），只是不许据残缺的它下结论。
 local function cats()
-    return focusflow.accounting_categories()
+    local list, why = focusflow.accounting_categories()
+    return list or {}, why or ""
 end
 
 local function subs(cat)
@@ -158,9 +163,16 @@ end
 --    列表却是空的，两边各说一套，比单纯显示 0 条更难看懂。
 -- 弹窗草稿里的分类同样会悬空：留着它，下一次"保存"就会把记录写进一个**已经不存在的分类**。
 local function reset_stale_filters()
+    local all, why = cats()
+    if why ~= "" then
+        -- 清单没读全 ⇒ 一个字都不改。这里要清的是用户手选的筛选条件与弹窗草稿：
+        -- 一次瞬时读不动就把它们清零，比留着那个"也许已经不存在的名字"更难解释，
+        -- 而且下一次读全了还会照常校正。界面上另有一行说明这次没读全。
+        return
+    end
     local valid = {}
     local sub_of = {}
-    for _, c in ipairs(cats()) do
+    for _, c in ipairs(all) do
         valid[c] = true
         local set = {}
         for _, x in ipairs(subs(c)) do
@@ -670,6 +682,7 @@ function get_view()
     add({ type = "separator" })
 
     -- 筛选栏（两行：分类/子分类 + 关键词/日期/查询/重置）
+    local _, cat_gap = cats()
     add({
         type = "row",
         children = {
@@ -679,6 +692,12 @@ function get_view()
               options = sub_opts_with("全部", "全部", f_cat) },
         },
     })
+    -- 下拉里没有的名字不等于分类被删了：这一头没读全时必须说出来，否则用户看到
+    -- 一个变短的下拉，以为自己的分类没了（本文件另一处 `reset_stale_filters` 也照这条走）。
+    if cat_gap ~= "" then
+        add({ type = "label", text = "分类清单这次没读全：" .. cat_gap
+            .. "。下拉里缺的名字不代表已被删除，筛选条件也按原样保留" })
+    end
     add({
         type = "row",
         children = {

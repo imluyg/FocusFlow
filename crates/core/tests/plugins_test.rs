@@ -1172,6 +1172,7 @@ mod tests {
             .plugin_action(&name, "m_save_edit_cat")
             .expect("保存改名");
         assert!(accounting::get_all_categories()
+            .0
             .iter()
             .any(|c| c.name == "测试分类改名"));
         assert_eq!(
@@ -1199,6 +1200,90 @@ mod tests {
             "被删掉的分类名不该留在筛选里"
         );
         assert_eq!(pager_of(&manager, &name).2, 5, "同理：共 0 条就是那条假象");
+        assert!(manager.unload_plugin(&name));
+        drop(tmp);
+    }
+
+    /// 分类清单**没读全**时，面板既不许据此清掉用户的筛选条件，也要把"这次没读全"说出来。
+    ///
+    /// 上一条用例守的是"读全了要校正"，这一条守它的另一半：读不全时什么都不许改。
+    /// 少了这一半，一次瞬时读不动（库被别的连接握着、某一行是坏值）就足以让用户看到
+    /// 「我的分类和筛选条件都没了」—— 而库里一条都没少。
+    #[test]
+    fn an_incomplete_category_list_neither_resets_the_filter_nor_stays_silent() {
+        use focusflow_core::accounting;
+
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("stale_filter_gap", "accounting_plugin.lua");
+        accounting::init_db().expect("记账库应能建起来");
+        assert!(accounting::add_category("测试分类", "both", &[]) > 0);
+        // 「食品饮料」是 `init_db` 的预置分类：改名要落在**读得出来**的那个分类上，用它
+        assert!(accounting::get_all_categories()
+            .0
+            .iter()
+            .any(|c| c.name == "食品饮料"));
+        manager
+            .plugin_set_field(&name, "f_cat", "测试分类")
+            .expect("设置分类筛选");
+        assert_eq!(
+            select_value(&manager, &name, "f_cat").as_deref(),
+            Some("测试分类"),
+            "夹具：筛选立在测试分类上"
+        );
+
+        // 把「测试分类」这一行换成读不出来的值（`subs` 是动态类型列）：清单从此少一条，
+        // 而"少这一条"的原因是被挡住，不是被删除。
+        let bake = |subs: rusqlite::types::Value| {
+            let conn =
+                rusqlite::Connection::open(accounting::db_path()).expect("夹具应能打开记账库");
+            let n = conn
+                .execute(
+                    "UPDATE categories SET subs=?1 WHERE name='测试分类'",
+                    [subs],
+                )
+                .expect("夹具：改 subs 这一列");
+            assert_eq!(n, 1, "夹具：那一行还在库里");
+        };
+        bake(rusqlite::types::Value::Blob("充值".as_bytes().to_vec()));
+
+        // 走一次会调 `reset_stale_filters` 的动作：改的是读得出来的那个分类
+        manager
+            .plugin_action(&name, "open_manage")
+            .expect("进分类管理");
+        manager
+            .plugin_action(&name, "m_edit_cat_sel食品饮料")
+            .expect("选中要改名的分类");
+        manager
+            .plugin_set_field(&name, "m_name", "食品饮料改名")
+            .expect("填新名字");
+        manager
+            .plugin_action(&name, "m_save_edit_cat")
+            .expect("保存改名");
+
+        assert_eq!(
+            select_value(&manager, &name, "f_cat").as_deref(),
+            Some("测试分类"),
+            "清单没读全时不许改动用户的筛选条件：库里那一行还在，只是这次读不出来"
+        );
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("分类清单这次没读全")),
+            "下拉里少了名字这件事要说给用户，不能让它看着像被删了: {:?}",
+            labels_of(&manager, &name)
+        );
+
+        // 读全之后照常校正：这一腿证明上面那条不是"永远不动"。
+        // 删掉的正是在筛的那个分类，读得出来了，名字就该从筛选里清掉。
+        bake(rusqlite::types::Value::Text(String::new()));
+        manager
+            .plugin_action(&name, "m_del_cat_sel测试分类")
+            .expect("删除分类");
+        assert_eq!(
+            select_value(&manager, &name, "f_cat").as_deref(),
+            Some("全部"),
+            "读全之后，被删掉的分类名照常从筛选里清掉"
+        );
         assert!(manager.unload_plugin(&name));
         drop(tmp);
     }
