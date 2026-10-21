@@ -206,6 +206,36 @@ fn list_year_dbs(dir: &Path) -> Vec<i32> {
     years
 }
 
+/// 回滚刚整体复制过来的半套年度库，返回删不掉的残留（路径 + 原因）。
+fn rollback_fresh_copy(dst: &Path) -> Vec<String> {
+    let mut leftover = Vec::new();
+    let mut remove = |path: &Path| {
+        if let Err(e) = std::fs::remove_file(path) {
+            if path.exists() {
+                leftover.push(format!("{}（{e}）", path.display()));
+            }
+        }
+    };
+    remove(dst);
+    for suffix in ["-wal", "-shm"] {
+        remove(&crate::data_location::with_suffix(dst, suffix));
+    }
+    leftover
+}
+
+/// 回滚结局对应的"接下来怎么办"：清理干净才允许说"直接重试"。
+fn retry_hint(leftover: &[String]) -> String {
+    if leftover.is_empty() {
+        "这次复制的半份副本已清掉，处理后可以直接重试".to_string()
+    } else {
+        format!(
+            "但自动清理没成功（{}）。这些残留不清掉，下次导入可能仍走不成、或被当成\
+             「目标库已存在」改走合并分支（读的正是缺这段尾巴的副本）—— 请先手动删掉再重试",
+            leftover.join("；")
+        )
+    }
+}
+
 /// 导入单个年度库：先写暂存表（按 timestamp 去重），再聚合落库。
 /// 返回导入的记录数。
 /// 导入某一份年度库，返回本次落进暂存表的明细行数。
@@ -223,10 +253,13 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
         std::fs::copy(&src_path, &dst_path)?;
         // 复制 WAL/SHM（若有未 checkpoint 数据）
         for suffix in ["-wal", "-shm"] {
-            let s = format!("{}{}", src_path.display(), suffix);
-            if Path::new(&s).exists() {
-                let d = format!("{}{}", dst_path.display(), suffix);
-                if let Err(e) = std::fs::copy(&s, &d) {
+            // 不能用 `format!("{}{}", path.display(), suffix)`：display() 对非 UTF-8 的
+            // 目录名是 lossy 转换，拼出来的路径根本不存在 ⇒ WAL 被静默跳过（它正是还没
+            // 进主库的那一段），整年照报"已导入"并写标记。
+            let from = crate::data_location::with_suffix(&src_path, suffix);
+            if from.exists() {
+                let to = crate::data_location::with_suffix(&dst_path, suffix);
+                if let Err(e) = std::fs::copy(&from, &to) {
                     if suffix == "-shm" {
                         // 共享内存索引，SQLite 会照着 WAL 自己重建：拿不到就算了
                         tracing::debug!("跳过 {year} 年库的 -shm 副本: {e}");
@@ -240,13 +273,14 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
                     // 所以：回滚刚复制的主库、报错、**不写标记**。回滚是为了让重试仍走
                     // 这条整体复制分支；留着半份库会让下次导入改走合并分支，
                     // 而它读的是已复制过来的主库（正缺那段尾巴）。
-                    let _ = std::fs::remove_file(&dst_path);
-                    for extra in ["-wal", "-shm"] {
-                        let _ = std::fs::remove_file(format!("{}{}", dst_path.display(), extra));
-                    }
+                    // 回滚本身失败时不能还说"请重试"：半份库留在原地，重试就换了分支。
+                    let leftover = rollback_fresh_copy(&dst_path);
                     return Err(anyhow::anyhow!(
-                        "复制 {year} 年库的 WAL 失败（{s} → {d}）: {e} —— \
-                         那里面可能还有未落盘记录，本次导入未完成，请重试"
+                        "复制 {year} 年库的 WAL 失败（{} → {}）: {e} —— \
+                         那里面可能还有未落盘记录，本次导入未完成。{}",
+                        from.display(),
+                        to.display(),
+                        retry_hint(&leftover)
                     ));
                 }
             }
@@ -774,6 +808,105 @@ mod tests {
             "半份主库必须回滚：留着它，下次导入会改走合并分支，\
              而它读的正是缺了那段尾巴的副本"
         );
+        let shown = summary.errors.join("\n");
+        assert!(
+            shown.contains("自动清理没成功"),
+            "占位的 -wal 是目录、删不掉，必须按「清理失败」报而不是说可以重试: {shown}"
+        );
+        assert!(
+            shown.contains("手动删掉"),
+            "删不掉的残留要告诉用户动手清: {shown}"
+        );
+        assert!(
+            !shown.contains("可以直接重试"),
+            "残留还在时不许说可以重试: {shown}"
+        );
+    }
+
+    /// 回滚真清干净时（失败原因不占着目标文件名）要明确说可以重试。
+    ///
+    /// 源侧的 `-wal` 是目录 ⇒ copy 读源就失败，目标侧没有留下任何删不掉的障碍。
+    #[test]
+    fn a_clean_rollback_tells_the_user_to_retry() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("mig_rollback_clean");
+        let data = crate::paths::data_dir();
+        let name = "focusflow_2034.db".to_string();
+
+        let src_dir = _dir.path().join("old");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join(&name);
+        {
+            let conn = Connection::open(&src).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE daily_counts (
+                    date_key INTEGER PRIMARY KEY,
+                    count INTEGER NOT NULL,
+                    seconds INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO daily_counts (date_key, count, seconds) VALUES (20000, 1, 1);",
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(crate::data_location::with_suffix(&src, "-wal")).unwrap();
+
+        let summary = import_legacy_data(&src_dir);
+        let shown = summary.errors.join("\n");
+        assert!(!data.join(&name).exists(), "半份主库必须回滚: {shown}");
+        assert!(
+            shown.contains("可以直接重试"),
+            "清干净后要明确说可以重试: {shown}"
+        );
+        assert!(
+            !shown.contains("手动删掉"),
+            "没有残留，不该让人去删不存在的文件: {shown}"
+        );
+    }
+
+    /// 回滚自己失败时不许还说"重试"：半份库留在原地，重试会改走合并分支。
+    ///
+    /// 删文件失败在真实环境里不可控（杀软握着句柄、只读属性），这里用目录占住
+    /// 目标名让 `remove_file` 必失败 —— 测的是"删不掉要进残留清单、话要跟着改"，
+    /// 不是那个 IO 错误本身。
+    #[test]
+    fn a_failed_rollback_is_not_reported_as_retryable() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("mig_rollback_fail");
+
+        let dst = app.path().join("focusflow_2032.db");
+        std::fs::create_dir_all(&dst).unwrap();
+        let leftover = rollback_fresh_copy(&dst);
+        assert!(
+            !leftover.is_empty(),
+            "删不掉的主库必须进残留清单，不许 `let _ =` 吞掉"
+        );
+        assert!(
+            leftover[0].contains("focusflow_2032.db"),
+            "残留要点名让人能删: {leftover:?}"
+        );
+        let hint = retry_hint(&leftover);
+        assert!(
+            !hint.contains("可以直接重试"),
+            "残留还在时不许说可以重试: {hint}"
+        );
+        assert!(
+            hint.contains("手动删掉"),
+            "要说清怎么恢复，而不是只说失败了: {hint}"
+        );
+
+        // sidecar 也要按真后缀拼，且同样收进残留清单
+        let dst2 = app.path().join("focusflow_2033.db");
+        let side = crate::data_location::with_suffix(&dst2, "-wal");
+        std::fs::create_dir_all(&side).unwrap();
+        let leftover = rollback_fresh_copy(&dst2);
+        assert!(
+            leftover.iter().any(|s| s.contains("focusflow_2033.db-wal")),
+            "sidecar 删不掉也要点名: {leftover:?}"
+        );
+
+        let clean = retry_hint(&[]);
+        assert!(clean.contains("可以直接重试"));
+        assert!(!clean.contains("手动"));
     }
 
     /// **重试不得把那一年累加第二遍**：聚合是 `count = count + excluded` 且没有去重键，
