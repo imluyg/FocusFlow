@@ -822,6 +822,32 @@ pub fn update_category_type(name: &str, ctype: &str) -> bool {
     }
 }
 
+/// 一个分类现有的子分类清单，三种结局分开交回来。
+///
+/// 三个调用点接下来写的都是 `UPDATE categories SET subs=<整列>` —— **覆盖**，不是追加。
+/// 所以"读不出来"绝不能被折成"里面是空的"：`add_subcategory` 正是那条路 ——
+/// 一次读失败（值类型不对、页面坏了、库被握着）之后它照样往下写，
+/// 结果是把用户已有的整列子分类换成刚加的那一个，还回一句「添加成功」。
+enum SubsRead {
+    Present(Vec<String>),
+    MissingCategory,
+    Unreadable(String),
+}
+
+fn read_subs(conn: &Connection, category: &str) -> SubsRead {
+    match conn.query_row(
+        "SELECT subs FROM categories WHERE name=?1",
+        [category],
+        |r| r.get::<_, String>(0),
+    ) {
+        Ok(raw) => SubsRead::Present(parse_subs(&raw)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => SubsRead::MissingCategory,
+        Err(e) => SubsRead::Unreadable(format!(
+            "读分类 [{category}] 的子分类清单失败: {e} —— 这一列要被整列覆盖，读不动时不能接着写"
+        )),
+    }
+}
+
 /// 为分类添加子分类，返回 (成功, 错误信息)。
 pub fn add_subcategory(category: &str, sub_name: &str) -> (bool, String) {
     let sub_name = sub_name.trim();
@@ -838,14 +864,12 @@ pub fn add_subcategory(category: &str, sub_name: &str) -> (bool, String) {
         Ok(c) => c,
         Err(e) => return (false, format!("打开数据库失败: {e}")),
     };
-    let subs_raw: String = conn
-        .query_row(
-            "SELECT subs FROM categories WHERE name=?1",
-            [category],
-            |r| r.get(0),
-        )
-        .unwrap_or_default();
-    let mut subs: Vec<String> = parse_subs(&subs_raw);
+    let subs_raw: Vec<String> = match read_subs(&conn, category) {
+        SubsRead::Present(v) => v,
+        SubsRead::MissingCategory => return (false, format!("分类 [{category}] 不存在")),
+        SubsRead::Unreadable(e) => return (false, e),
+    };
+    let mut subs = subs_raw;
     if subs.iter().any(|s| s == sub_name) {
         return (
             false,
@@ -876,14 +900,11 @@ pub fn update_subcategory(category: &str, old_sub: &str, new_sub: &str) -> (bool
         Ok(c) => c,
         Err(e) => return (false, format!("打开数据库失败: {e}")),
     };
-    let subs_raw: String = conn
-        .query_row(
-            "SELECT subs FROM categories WHERE name=?1",
-            [category],
-            |r| r.get(0),
-        )
-        .unwrap_or_default();
-    let mut subs: Vec<String> = parse_subs(&subs_raw);
+    let mut subs: Vec<String> = match read_subs(&conn, category) {
+        SubsRead::Present(v) => v,
+        SubsRead::MissingCategory => return (false, format!("分类 [{category}] 不存在")),
+        SubsRead::Unreadable(e) => return (false, e),
+    };
     if new_sub.contains(',') {
         return (
             false,
@@ -946,14 +967,11 @@ pub fn delete_subcategory(category: &str, sub_name: &str) -> (bool, String) {
         Ok(c) => c,
         Err(e) => return (false, format!("打开数据库失败: {e}")),
     };
-    let subs_raw: String = conn
-        .query_row(
-            "SELECT subs FROM categories WHERE name=?1",
-            [category],
-            |r| r.get(0),
-        )
-        .unwrap_or_default();
-    let all = parse_subs(&subs_raw);
+    let all: Vec<String> = match read_subs(&conn, category) {
+        SubsRead::Present(v) => v,
+        SubsRead::MissingCategory => return (false, format!("分类 [{category}] 不存在")),
+        SubsRead::Unreadable(e) => return (false, e),
+    };
     let subs: Vec<String> = all
         .iter()
         .filter(|s| s.as_str() != sub_name)
@@ -2482,6 +2500,59 @@ mod tests {
                 "又有写入口把「库打不开」静默折成 {fold}：面板的提示会指向一条不存在的日志"
             );
         }
+    }
+
+    /// 读不出来时，不许把整列子分类覆盖成"只剩刚加的那一个"。
+    ///
+    /// 这三个调用点接下来写的都是 `UPDATE categories SET subs=<整列>` —— 覆盖而不是追加。
+    /// 旧写法把 `SELECT subs` 包成 `.unwrap_or_default()`，于是"读不出来"与"这个分类没有
+    /// 子分类"是同一个答案：`add_subcategory` 拿到空清单、加上一个、整列写回去、回一句
+    /// 「添加成功」—— 用户当年排好的子分类全没了。另外两个（改名/删除）因为后面还有一道
+    /// "清单里找不到"的检查，坏的是一个错消息而不是丢数据，这次一并分开。
+    #[test]
+    fn an_unreadable_subs_column_is_not_treated_as_an_empty_one() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_subs_unreadable");
+        init_db().expect("建库失败");
+        assert!(
+            add_category("收藏", "both", &["充值".to_string(), "道具".to_string()],) > 0,
+            "夹具：先建一个带子分类的分类"
+        );
+        // `subs` 这一列是动态类型的：换成非文本值就能让"读出来"这一步稳定失败，
+        // 这就是页面坏了 / 库被握着那一类形态的最小可复现版本
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "UPDATE categories SET subs=?1 WHERE name='收藏'",
+                [rusqlite::types::Value::Blob(
+                    "充值,道具".as_bytes().to_vec(),
+                )],
+            )
+            .unwrap();
+        }
+
+        let (ok, msg) = add_subcategory("收藏", "新手村");
+        assert!(!ok, "读不出来时不能报成功：{msg}");
+        assert!(msg.contains("失败"), "要说清是这一步读不出来: {msg}");
+        let raw: Vec<u8> = {
+            let conn = open().unwrap();
+            conn.query_row("SELECT subs FROM categories WHERE name='收藏'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            raw,
+            "充值,道具".as_bytes().to_vec(),
+            "读失败之后整列被覆盖 = 用户当年的子分类没了"
+        );
+
+        // 「分类不存在」与「读不出来」是两件事，得各说各的
+        let (ok2, msg2) = add_subcategory("没有这个分类", "随便");
+        assert!(
+            !ok2 && msg2.contains("不存在"),
+            "缺分类不许被说成读不动，反之也不行: {msg2}"
+        );
     }
 
     /// 回归（第 23 轮）：`add_category` 撞重名时 `INSERT OR IGNORE` 整条忽略，紧接着
