@@ -36,6 +36,10 @@ pub fn edge_history_path() -> PathBuf {
 #[cfg(test)]
 static EDGE_PATH_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
+/// 测试夹具的临时副本路径（进程级，靠 `test_app_dir_lock` 串行化）。
+#[cfg(test)]
+static TEMP_COPY_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 /// 本进程进过 `with_edge_snapshot` 几次 —— 补档那条路要求"一批查询只走一轮"，
 /// 光看代码结构断言不住，只能数。
 #[cfg(test)]
@@ -70,6 +74,14 @@ const EDGE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
 /// 副本包含 Edge 完整浏览记录（URL/标题/时间），不落在程序目录，
 /// 且随机名 + 短生命周期把崩溃残留的风险窗口压到最低。
 fn temp_copy_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = TEMP_COPY_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return p;
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -84,7 +96,7 @@ fn temp_copy_path() -> PathBuf {
 fn remove_temp_copy(temp: &std::path::Path) {
     let _ = std::fs::remove_file(temp);
     for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{}", temp.display(), suffix));
+        let _ = std::fs::remove_file(crate::data_location::with_suffix(temp, suffix));
     }
 }
 
@@ -160,8 +172,9 @@ fn cleanup_stale_copies_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let legacy = paths::data_dir().join("_edge_history_temp.db");
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{}", legacy.display(), suffix));
+        let _ = std::fs::remove_file(&legacy);
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(crate::data_location::with_suffix(&legacy, suffix));
         }
         let report = sweep_stale_temp_copies_in(&std::env::temp_dir(), STALE_TEMP_COPY_AGE);
         // 三种结局各说一句：副本里是明文浏览记录，"清不动"和"没得清"必须分得开，
@@ -233,19 +246,22 @@ fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
     }
     let temp = temp_copy_path();
     for attempt in 0..3 {
-        if std::fs::copy(&path, &temp).is_ok() {
-            for suffix in ["-wal", "-shm"] {
-                let src = format!("{}{}", path.display(), suffix);
-                if std::path::Path::new(&src).exists() {
-                    let _ = std::fs::copy(&src, format!("{}{}", temp.display(), suffix));
-                }
-            }
-            if let Ok(conn) = Connection::open(&temp) {
-                if let Some(v) = f(&conn) {
-                    drop(conn);
-                    remove_temp_copy(&temp);
-                    return Some(v);
-                }
+        // 缺 -wal 的副本不拿去做查询：那份历史会比真实值小，而补档写进本地缓存后
+        // 历史日不会被再挑出来重查（见 `try_snapshot_copy` 的注释）。
+        if let Err(e) = try_snapshot_copy(&path, &temp) {
+            remove_temp_copy(&temp);
+            tracing::warn!(
+                "Edge 历史库快照不完整（第{}次）：{e} —— 不拿缺 WAL 的副本去查",
+                attempt + 1
+            );
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            continue;
+        }
+        if let Ok(conn) = Connection::open(&temp) {
+            if let Some(v) = f(&conn) {
+                drop(conn);
+                remove_temp_copy(&temp);
+                return Some(v);
             }
         }
         remove_temp_copy(&temp);
@@ -254,6 +270,41 @@ fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
     }
     tracing::warn!("Edge 历史库无法读取（直连被锁且复制失败）");
     None
+}
+
+/// 把 Edge 历史库连同 sidecar 复制成一份可查询的快照。
+///
+/// `-wal` 必须搬成功：Edge 运行时刚写入的记录还在 WAL 里，缺了它这份副本就是一份
+/// **偏小**的历史。旧写法 `let _ = copy(…)` 吞掉失败后照查不误，补档那些历史日会把
+/// 偏小的数写进本地缓存，而 `stale_days_before` 之后不再重查 —— 永久少算。
+/// `-shm` 拿不到无所谓：SQLite 会照着 WAL 自己重建。
+fn try_snapshot_copy(src: &std::path::Path, temp: &std::path::Path) -> Result<(), String> {
+    std::fs::copy(src, temp).map_err(|e| {
+        format!(
+            "复制主库失败（{} → {}）: {e}",
+            src.display(),
+            temp.display()
+        )
+    })?;
+    for suffix in ["-wal", "-shm"] {
+        let from = crate::data_location::with_suffix(src, suffix);
+        if !from.exists() {
+            continue;
+        }
+        let to = crate::data_location::with_suffix(temp, suffix);
+        match std::fs::copy(&from, &to) {
+            Ok(_) => {}
+            Err(e) if suffix == "-wal" => {
+                return Err(format!(
+                    "复制 -wal 失败（{} → {}）: {e}",
+                    from.display(),
+                    to.display()
+                ));
+            }
+            Err(e) => tracing::debug!("跳过 Edge 快照的 -shm 副本: {e}"),
+        }
+    }
+    Ok(())
 }
 
 /// 在**一份**快照上逐日取计数（`days` 通常是一批缺失的历史日期）。
@@ -831,6 +882,14 @@ mod tests {
         }
     }
 
+    /// 临时副本路径的夹具：析构时还原（panic 时也不会留给下一个用例）。
+    struct TempCopyFixture;
+    impl Drop for TempCopyFixture {
+        fn drop(&mut self) {
+            *TEMP_COPY_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
     /// 造一份 Edge 形状的 History 库（列名对齐 Chrome 的 `urls` 表）。
     fn write_edge_fixture(tag: &str, last_visit_times: &[i64]) -> EdgeFixture {
         let path = paths::data_dir().join(format!("{tag}_edge_history.db"));
@@ -896,6 +955,81 @@ mod tests {
         let conn = Connection::open(edge_history_path()).unwrap();
         let got = counts_on_snapshot(&conn, &[y, today]).unwrap();
         assert_eq!(got, vec![(y, 2), (today, 2)], "零点整那条必须落到下一天");
+    }
+
+    /// 快照的 sidecar：`-wal` 搬不成必须报错，`-shm` 拿不到无所谓。
+    #[test]
+    fn snapshot_copy_requires_the_wal_but_not_the_shm() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("edge_copy_sidecar");
+        let src = app.path().join("History");
+        std::fs::write(&src, b"main").unwrap();
+        std::fs::write(crate::data_location::with_suffix(&src, "-wal"), b"wal").unwrap();
+
+        let temp = app.path().join("snap_ok.db");
+        try_snapshot_copy(&src, &temp).expect("主库与 WAL 都在时应复制成功");
+        assert!(temp.exists());
+        assert!(
+            crate::data_location::with_suffix(&temp, "-wal").exists(),
+            "WAL 必须一起搬走"
+        );
+        remove_temp_copy(&temp);
+        assert!(
+            !temp.exists() && !crate::data_location::with_suffix(&temp, "-wal").exists(),
+            "清理必须把 sidecar 一起带走"
+        );
+
+        // 目标 -wal 被占成目录 ⇒ 这份副本不完整，调用方不许拿去查
+        let temp = app.path().join("snap_bad.db");
+        let bad_wal = crate::data_location::with_suffix(&temp, "-wal");
+        std::fs::create_dir_all(&bad_wal).unwrap();
+        let err = try_snapshot_copy(&src, &temp).expect_err("-wal 复制失败不能当成功");
+        assert!(err.contains("-wal"), "要说是哪一步败了: {err}");
+        remove_temp_copy(&temp);
+        let _ = std::fs::remove_dir_all(&bad_wal);
+
+        // -shm 只是索引，SQLite 会照 WAL 重建 ⇒ 失败不影响整份快照
+        let src2 = app.path().join("History2");
+        std::fs::write(&src2, b"main").unwrap();
+        std::fs::create_dir_all(crate::data_location::with_suffix(&src2, "-shm")).unwrap();
+        let temp2 = app.path().join("snap_shm.db");
+        try_snapshot_copy(&src2, &temp2).expect("-shm 失败不该毁掉整份快照");
+        assert!(temp2.exists());
+        remove_temp_copy(&temp2);
+    }
+
+    /// 缺 WAL 的副本不许拿去查：补档历史日会把偏小的数永久写进本地缓存。
+    ///
+    /// 夹具：第一次查询返回 `None` 强制走复制兜底；源侧放一个 `-wal`，目标 `-wal`
+    /// 用目录占住让复制必失败。旧写法吞掉失败后照查主库（2 行）⇒ 返回 `Some(2)`；
+    /// 现在必须返回 `None`（这一轮没拿到可信快照，下一轮再试）。
+    #[test]
+    fn a_snapshot_without_its_wal_is_not_used() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("edge_no_wal_snapshot");
+        let _fx = write_edge_fixture("no_wal", &[1, 2]);
+        let src = edge_history_path();
+        std::fs::write(crate::data_location::with_suffix(&src, "-wal"), b"tail").unwrap();
+
+        let temp = app.path().join("snap.db");
+        let bad_wal = crate::data_location::with_suffix(&temp, "-wal");
+        std::fs::create_dir_all(&bad_wal).unwrap();
+        *TEMP_COPY_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(temp.clone());
+        let _copy = TempCopyFixture;
+
+        let first = std::cell::Cell::new(true);
+        let got = with_edge_snapshot(|conn| {
+            if first.replace(false) {
+                return None;
+            }
+            conn.query_row("SELECT COUNT(*) FROM urls", [], |r| r.get::<_, i64>(0))
+                .ok()
+        });
+        assert_eq!(
+            got, None,
+            "缺 WAL 的副本被拿去查了；补档历史日会把数永久写小"
+        );
+        let _ = std::fs::remove_dir_all(&bad_wal);
     }
 
     /// 相邻两天的区间必须严丝合缝地拼起来：既不重叠也不留空洞。
