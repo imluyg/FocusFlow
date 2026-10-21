@@ -987,4 +987,39 @@ mod wiring_audit {
             wrong.join("\n")
         );
     }
+
+    /// 启动报告必须问一次"文件日志那一层建起来没有"。
+    ///
+    /// 这条缺陷的形状是"故障只往 stderr 说话，而桌面端没有控制台"：文件层没建起来时
+    /// 本进程一辈子都没有 `logs/`（subscriber 只装一次），而 `logs/` 是本仓每个故障的
+    /// 默认下一步。所以这件事必须由**用户看得见的那条道**（启动报告 → toast → 托盘 ⚠）
+    /// 带出来。core 那边钉的是两个臂，这里钉的是接线。
+    #[test]
+    fn the_startup_report_carries_the_file_log_outcome() {
+        let src = read("src/state.rs");
+        // 摘掉注释行：判据的字样也写在这条用例的说明里，不摘就会在正确代码上误报
+        let prod = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let needle = "focusflow_core::logger::file_log_failure()";
+        let n = prod.matches(needle).count();
+        assert_eq!(
+            n, 1,
+            "启动报告要恰好问一次文件日志那一层的结局，实得 {n} 次"
+        );
+        // 问完还得把两种结局都带进报告：失败那一臂必须是 fail（全绿静默、出事要显性化）
+        let at = prod.find(needle).expect("上面数过了，这里不该找不到");
+        let rest = &prod[at..];
+        let window = &rest[..rest.len().min(900)];
+        assert!(
+            window.contains("CheckResult::ok") && window.contains("CheckResult::fail"),
+            "两种结局都得进报告，实得片段: {window}"
+        );
+        assert!(
+            window.contains("\"文件日志\""),
+            "报告里那一行要写清是哪个子系统，实得片段: {window}"
+        );
+    }
 }

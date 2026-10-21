@@ -179,6 +179,23 @@ impl AppState {
         // 启动自检（B15）：DB 侧三项（备份/采样/设备统计）已收在 Database 里，
         // 键鼠监听是致命项（失败直接 ? 让启动失败），成功也记一行备查。
         let mut startup_report = db.take_startup_checks();
+        // 文件日志这一层排在最前面：它要是没建起来，本进程**一辈子**都不会再建
+        // （subscriber 只装一次），而 `logs/` 是本仓每个故障的默认下一步。
+        // 原先这件事只往 stderr 印一句，桌面端是 windows 子系统、没有控制台 ⇒ 完全无声：
+        // 用户按提示去翻 logs/ 翻到空目录，谁也不知道少了一层。
+        match focusflow_core::logger::file_log_failure() {
+            None => startup_report.push(focusflow_core::startup::CheckResult::ok(
+                "文件日志",
+                "按天轮转，最多保留 4 份",
+            )),
+            Some(why) => startup_report.push(focusflow_core::startup::CheckResult::fail(
+                "文件日志",
+                format!(
+                    "{why} —— 本次运行不会往 logs/ 落任何东西，这次排查别指望日志；\
+                     修好那个目录后重启才有文件日志"
+                ),
+            )),
+        }
         // 数据目录搬运的结论（只有失败才有话，成功只进日志）：跟着启动报告一起 toast，
         // 免得"没搬成、还在旧目录记着"这件事只有翻日志的人才知道。
         if let Some(notice) = focusflow_core::data_location::take_startup_notice() {

@@ -27,6 +27,31 @@ static LOG_GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);
 /// 第二次调用直接 panic（release 下 panic=abort），所以幂等必须自己挡。
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// 文件日志那一层**没**建起来的原因；`None` = 建起来了（或还没试过）。
+///
+/// 立这一格的理由：`init_logging` 在装好 subscriber 之后就不会再装第二次，所以
+/// 文件层一旦没建成，**本进程一辈子都没有文件日志** —— 而 `logs/` 是本仓每个故障
+/// 的默认下一步（"去日志里查原因"）。原先这件事只往 stderr 印一句，而桌面端是
+/// windows 子系统、没有控制台，等于完全无声：用户按提示去翻 `logs/`，翻到的是空目录，
+/// 谁也不知道少了一层。现在把它存下来，由启动报告带出来（`is_initialized()` 说的
+/// 是"subscriber 装过"，不代表文件日志可用 —— 这两件事别再混）。
+static FILE_LOG_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// 记录一次文件层的结局：成功清掉旧原因，失败留下原因。
+fn record_file_log_outcome(outcome: Result<(), String>) {
+    let mut slot = FILE_LOG_ERROR.lock().unwrap_or_else(|e| e.into_inner());
+    // 成功 ⇒ 清掉旧原因；失败 ⇒ 留下它（`Option::err` 正好是这个形状）
+    *slot = outcome.err();
+}
+
+/// 文件日志这一层此刻是否可用；不可用时带回**为什么**（供启动报告/自检显示）。
+pub fn file_log_failure() -> Option<String> {
+    FILE_LOG_ERROR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// 停掉日志 worker 并写完缓冲区中的日志。
 ///
 /// 只会在「本函数返回后进程即终止」的出口上用到（见 desktop 的
@@ -123,6 +148,7 @@ pub fn init_logging() {
                     .finish(file_appender);
             // 收好 guard：它一被 drop，worker 线程就停转、后续日志静默丢弃
             *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+            record_file_log_outcome(Ok(()));
             Some(
                 fmt::layer()
                     .with_writer(file_writer)
@@ -133,10 +159,15 @@ pub fn init_logging() {
             )
         }
         Err(e) => {
-            eprintln!(
-                "日志文件建不出来（目录 {}）：本次只输出到控制台、不落盘文件。原因: {e}",
+            // 同一句话两个去处：stderr 给 CLI（它的结论分流本来就靠这条），
+            // 而桌面端没有控制台 ⇒ 只能靠 `file_log_failure()` 让启动报告说得出这件事
+            // （见 desktop 的 `AppState::init`）。
+            let why = format!(
+                "日志文件建不出来（目录 {}）：本次运行只有控制台输出、不落盘文件。原因: {e}",
                 crate::paths::log_dir().display()
             );
+            record_file_log_outcome(Err(why.clone()));
+            eprintln!("{why}");
             None
         }
     };
@@ -276,6 +307,69 @@ mod tests {
             written,
             "shutdown 之后尾部日志应已落盘到 {}",
             logs.display()
+        );
+    }
+
+    /// 文件层那一层的结局必须存得住、也清得掉。
+    ///
+    /// `init_logging` 只有第一次会真正装 subscriber ⇒ "这次没建成"是一整轮的既成事实，
+    /// 所以这件事得有个能被别人读走的地方，而不是只往 stderr 印一句（桌面端没有控制台）。
+    /// 这里钉的是那对读写本身；appender 到底建没建得起来不是用例能重复演的
+    /// （全局 subscriber 装好就撤不下来），那一半由下面的形状守卫守着两个臂。
+    #[test]
+    fn the_file_layer_outcome_is_readable_and_a_success_clears_it() {
+        let _lock = crate::paths::test_app_dir_lock();
+        // 串行前提：同一条锁也是别的用例调 `init_logging` 时用的那把，
+        // 否则并发的一次初始化会把这里刚存的擦掉（表现为偶发红）。
+        super::record_file_log_outcome(Err("目录 X 建不出来".to_string()));
+        assert_eq!(
+            super::file_log_failure().as_deref(),
+            Some("目录 X 建不出来"),
+            "没建起来的这一层要把原因留给人读"
+        );
+        super::record_file_log_outcome(Ok(()));
+        assert_eq!(
+            super::file_log_failure(),
+            None,
+            "建成之后不许还留着上一次的失败（启动报告会说假话）"
+        );
+    }
+
+    /// 形状守卫：`init_logging` 的两个臂各记录一次结局，且 CLI 那半句仍然出声。
+    ///
+    /// 上面那条用例跑的是抽出来的那对读写，它盯不到真正的构造点 —— 而这场缺陷的落点
+    /// 就在那两个臂里（原先失败只 `eprintln!`，桌面端没人能看见）。
+    #[test]
+    fn both_file_layer_arms_record_their_outcome() {
+        let src = include_str!("logger.rs");
+        let at = src
+            .find("pub fn init_logging()")
+            .expect("init_logging 不见了");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("init_logging 的结尾")];
+        // 摘掉注释行再比：判据的字样也出现在注释里时，一条被注释掉的调用会替
+        // 真正的那一条"过关"（本仓为同一件事红过两次）。
+        let body = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut wrong: Vec<String> = Vec::new();
+        for needle in [
+            "record_file_log_outcome(Ok(()))",
+            "record_file_log_outcome(Err(why.clone()))",
+            "eprintln!(\"{why}\")",
+        ] {
+            if !body.contains(needle) {
+                wrong.push(needle.to_string());
+            }
+        }
+        if body.matches("record_file_log_outcome(").count() != 2 {
+            wrong.push("两个臂应各记录一次结局".to_string());
+        }
+        assert!(
+            wrong.is_empty(),
+            "文件日志层的结局没被记下来（缺: {}）—— 切片没盖住函数体也会红在这里",
+            wrong.join("、")
         );
     }
 }
