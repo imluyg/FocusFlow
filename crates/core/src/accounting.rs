@@ -1750,42 +1750,15 @@ pub fn days_ago(ids: &[i64]) -> (Vec<(i64, i64, i64)>, Vec<String>) {
     (out, misses)
 }
 
-/// 月度汇总：返回 (总支出, 总收入)。
+/// 月度汇总：`(总支出, 总收入)`，与面板那份月报**同一个读数口**。
+///
+/// 原先这里自己抄了两条 `SELECT … WHERE type='支出'/'收入' AND purchase_date LIKE ?1`，
+/// 各写一处 `unwrap_or(0.0)`，而 `open()` 失败只把 `(0.0, 0.0)` 交出去、一个字都不记：
+/// 插件拿这两个零画报表，看不出手上那份其实是读不动的账。改成走 [`monthly_summary_detail`]
+/// —— 同一把尺子、同一条留痕（没读全时它自己会记「记账读数（月度汇总）没读全：…」），
+/// 两个数从此不会各读一套 SQL。
 pub fn monthly_summary(year_month: &str) -> (f64, f64) {
-    let conn = match open() {
-        Ok(c) => c,
-        Err(_) => return (0.0, 0.0),
-    };
-    let ym = match normalize_month(year_month) {
-        Some(v) => v,
-        None => {
-            tracing::error!(
-                "月度汇总的月份参数认不出来（{year_month:?}），本次按 0 返回；需要的是 YYYY-MM"
-            );
-            return (0.0, 0.0);
-        }
-    };
-    let prefix = format!("{ym}%");
-    let expense: f64 = conn
-        .query_row(
-            &format!(
-                "SELECT {} FROM expenses WHERE type='支出' AND purchase_date LIKE ?1",
-                sum_amount_sql("amount")
-            ),
-            [&prefix],
-            |r| r.get(0),
-        )
-        .unwrap_or(0.0);
-    let income: f64 = conn
-        .query_row(
-            &format!(
-                "SELECT {} FROM expenses WHERE type='收入' AND purchase_date LIKE ?1",
-                sum_amount_sql("amount")
-            ),
-            [&prefix],
-            |r| r.get(0),
-        )
-        .unwrap_or(0.0);
+    let (expense, income, _, _, _) = monthly_summary_detail(year_month);
     (expense, income)
 }
 
@@ -2766,6 +2739,92 @@ mod tests {
             got.subs,
             vec!["地铁".to_string(), "打车".to_string()],
             "这次传的子分类要真的落库"
+        );
+    }
+
+    /// 月度汇总不许自己抄一份读数：它原先是面板那份月报的第二套实现，且读不动时一个字不记。
+    ///
+    /// 旧代码是两条 `SELECT … LIKE ?1` 各写一处 `unwrap_or(0.0)`，`open()` 失败直接交
+    /// `(0.0, 0.0)` —— 插件拿这两个零画报表，看不出手上那份其实是**读不动的账**；而面板
+    /// 那一头同一次失败说的是另一套话。现在两个口共用一把尺子，留痕也只有一处。
+    #[test]
+    fn monthly_summary_reads_through_the_detail_ruler_instead_of_its_own_copy() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_monthly_summary_ruler");
+        init_db().expect("建库失败");
+        assert!(add_category("餐饮", "expense", &[]) > 0);
+        assert!(
+            add_expense(
+                "支出",
+                "午饭",
+                None,
+                "2026-08-01",
+                30.0,
+                Some("餐饮"),
+                None,
+                None
+            ) > 0
+        );
+        assert!(
+            add_expense(
+                "收入",
+                "退款",
+                None,
+                "2026-08-02",
+                5.0,
+                Some("餐饮"),
+                None,
+                None
+            ) > 0
+        );
+
+        // 同一次读：两个口给的是同一对数
+        let summary = monthly_summary("2026-08");
+        let (de, di, _, _, gap) = monthly_summary_detail("2026-08");
+        assert!(gap.is_empty(), "夹具：这一轮该读全: {gap}");
+        assert_eq!(summary, (30.0, 5.0), "{summary:?}");
+        assert_eq!(summary, (de, di), "{summary:?} 对 {de} {di}");
+
+        // 库读不动：这一路也必须把那句留痕说出口（旧行为是安静地交零）
+        std::fs::write(db_path(), "这不是一个 SQLite 文件").unwrap();
+        let (s2, logs) = crate::logger::capture_logs(|| monthly_summary("2026-08"));
+        assert_eq!(s2, (0.0, 0.0), "{s2:?}");
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("记账读数（月度汇总）没读全")),
+            "月度汇总读不动时不能一个字不记: {logs:?}"
+        );
+
+        // 认不出的月份写法同样要说得出为什么（旧代码有那句 error，共用尺子后不许把它弄丢）
+        let (_, logs2) = crate::logger::capture_logs(|| monthly_summary("2026-13"));
+        assert!(
+            logs2
+                .iter()
+                .any(|l| l.contains("没读全") && l.contains("认不出来")),
+            "非法月份写法要带上原因: {logs2:?}"
+        );
+
+        // 形状腿：这一路只许转读那个共用口。注释会被自己的说明文字喂绿，所以先切函数体、
+        // 再摘掉注释行，最后数它有没有第二次自己开库、自己发 SQL。
+        let src = include_str!("accounting.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn monthly_summary(")
+            .expect("月度汇总函数找不到了");
+        let rest = &prod[at..];
+        let end = rest.find("\n}\n").expect("函数切不出来");
+        let code: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("monthly_summary_detail("),
+            "月度汇总不再转读共用口，两份读数就会各自漂: {code}"
+        );
+        assert!(
+            !code.contains("query_row") && !code.contains("open()"),
+            "月度汇总里不许再有第二套 SQL / 再一次开库: {code}"
         );
     }
 
