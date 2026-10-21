@@ -289,13 +289,31 @@ fn copy_file(from: &Path, to: &Path, summary: &mut CopySummary) -> anyhow::Resul
     Ok(())
 }
 
-/// 把目标上原有的文件改名成 `<原名>.pre-switch-<时间戳>`；它不存在时是 No-op。
+/// 把目标上原有的文件改名成 `<原名>.pre-switch-<时间戳>`；**确认**不存在时才是 No-op。
 ///
 /// 用 rename 而不是 copy：省一次全量读写，也不会出现"复制到一半失败、原文件与
-/// 副本都不完整"的中间态（同 `migration::backup_before_overwrite`）。
+/// 副本都不完整"的中间态。
+///
+/// 附属文件**先**搬、主库**后**搬，搬不动就整次失败（这条顺序与
+/// `migration::backup_before_overwrite` 现在一致 —— 那边原先也是先搬主库、再 `let _ =`
+/// 吞掉附属的失败，被现量之后改了过来，这里当时漏下了）。反过来的话失败那一刻目录里躺着的是
+/// 「主库已改名带走、它那份 `-wal` 还在原位」的半套状态，而调用方只看到一句错误文案，
+/// 不知道目录被动过；下一次重试时目标名已经空了 ⇒ 直接用源副本**盖上那份没搬走的旧
+/// `-wal`**，SQLite 打开它时照这份错配的 WAL 恢复，而搬运随后还要删源 —— 唯一一份好数据
+/// 就在那个被删的源目录里。
+///
+/// 「读不出它在不在」也不许当「不在」：这一步之后就是截断覆盖（`fs::copy`），
+/// 说不准时宁可这次不搬。
 fn keep_aside(dst: &Path) -> anyhow::Result<Option<PathBuf>> {
-    if !dst.exists() {
-        return Ok(None);
+    match dst.metadata() {
+        Ok(_) => {}
+        Err(e) if is_confirmed_absent(&e) => return Ok(None),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "读不出 {} 在不在（{e}）：说不准就不覆盖它",
+                dst.display()
+            ))
+        }
     }
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S%3f").to_string();
     let mut name = dst
@@ -304,19 +322,36 @@ fn keep_aside(dst: &Path) -> anyhow::Result<Option<PathBuf>> {
         .unwrap_or_default();
     name.push(format!(".pre-switch-{timestamp}"));
     let kept = dst.with_file_name(name);
-    std::fs::rename(dst, &kept)?;
-    // WAL 附属文件必须跟着主库走（同 `migration::backup_before_overwrite`）：只搬主库，
-    // 目标目录里那份**别人的** `-wal` 就留在原位配上了新主库，SQLite 打开时照那份 wal
-    // 恢复 —— 而这次搬运随后还要删源，唯一一份可能就是那个错配的组合。
+    // WAL 附属文件必须跟着主库走：只搬主库，目标目录里那份 `-wal` 就留在原位配上了新主库。
     // 附属文件本就不存在是常态（多数库早就 checkpoint 了），所以只在存在时搬；
     // 搬不动就当失败：宁可这次不覆盖，也不能留下主库与 wal 成套但来源不同的两份。
     for suffix in ["-wal", "-shm"] {
         let sidecar = with_suffix(dst, suffix);
-        if sidecar.exists() {
-            std::fs::rename(&sidecar, with_suffix(&kept, suffix))?;
+        match sidecar.metadata() {
+            Ok(_) => {
+                std::fs::rename(&sidecar, with_suffix(&kept, suffix))
+                    .map_err(|e| anyhow::anyhow!("{} 没能一起留档: {e}", sidecar.display()))?;
+            }
+            Err(e) if is_confirmed_absent(&e) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "读不出 {} 在不在（{e}）：说不准就不动它旁边那份主库",
+                    sidecar.display()
+                ))
+            }
         }
     }
+    std::fs::rename(dst, &kept)?;
     Ok(Some(kept))
+}
+
+/// `metadata()` 报回来的错里，只有「确实没有这个东西」才算 No-op。
+///
+/// `Path::exists()` / `is_dir()` 把「查不动」（移动盘刚唤醒、杀软首扫、同步盘占位、
+/// 只读句柄挡着）折成「没有」，而这一步之后是**截断覆盖**。口径与
+/// `desktop/src/plugins.rs` 的 `FileState`、本仓库 `Presence` 那一条一致：三种结局分开。
+fn is_confirmed_absent(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound
 }
 
 /// 在文件名的**末尾**接一段后缀（`focusflow_2026.db` → `focusflow_2026.db-wal`）。
@@ -746,6 +781,102 @@ fn contents_equal(a: &Path, b: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::paths;
+
+    /// `-wal` 搬不动时，主库必须原样留在原地：留档要么整套搬走，要么一步都不动。
+    ///
+    /// 旧写法先 `rename` 主库、再搬附属。附属失败那一刻，目录里躺着的是「主库已被改名带走、
+    /// 它那份 `-wal` 还在原位」的半套状态，而调用方只看到一句错误文案，不知道目录被动过。
+    /// 下一次重试时目标名已经空了 ⇒ 源的副本被直接盖在那份旧 `-wal` 上，SQLite 按错配的
+    /// WAL 恢复；而这次搬运随后还要删源 —— 唯一一份好数据就在被删的那个目录里。
+    #[test]
+    fn a_sidecar_that_will_not_move_leaves_the_main_db_where_it_was() {
+        let _lock = paths::test_app_dir_lock();
+        let app = paths::test_app_dir("keep_aside_order");
+        let dst = app.path().join("focusflow_2099.db");
+        std::fs::write(&dst, "主库原本的字节").unwrap();
+        // 把 `-wal` 做成一个"里面有打开句柄"的目录：Windows 上搬这种名字必失败，
+        // 而随机时间戳的留档名没法提前占住
+        let wal = with_suffix(&dst, "-wal");
+        std::fs::create_dir_all(&wal).unwrap();
+        let _hold = std::fs::File::create(wal.join("holding.bin")).unwrap();
+
+        let err =
+            keep_aside(&dst).expect_err("附属搬不动时整次留档必须失败，不许只记一句就当搬过了");
+        let shown = err.to_string();
+        assert!(shown.contains("-wal"), "要点名是哪一个搬不动: {shown}");
+        assert!(
+            dst.exists(),
+            "主库不许在半套状态里被搬走: {}",
+            dst.display()
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(app.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".pre-switch-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "失败那一次不该留下半个留档（那意味着主库已被改名）: {leftovers:?}"
+        );
+    }
+
+    /// 确认没有这个东西时才是 No-op —— 而「说不准」不是「没有」。
+    #[test]
+    fn only_a_confirmed_missing_target_is_a_no_op() {
+        let missing = paths::data_dir().join("focusflow_2098.db");
+        let _ = std::fs::remove_file(&missing);
+        assert!(
+            keep_aside(&missing).unwrap().is_none(),
+            "确认不在 ⇒ 什么都不做"
+        );
+        // 两个错误码各管一头：2/3 是"确实没有"，5 是"查不动"，后者不许折成前者
+        for code in [2, 3] {
+            let e = std::io::Error::from_raw_os_error(code);
+            assert!(is_confirmed_absent(&e), "code {code} 该算「确实没有」: {e}");
+        }
+        for code in [5, 32] {
+            let e = std::io::Error::from_raw_os_error(code);
+            assert!(
+                !is_confirmed_absent(&e),
+                "code {code}（受限或被握着）说不准，不能当「没有」就去覆盖: {e}"
+            );
+        }
+    }
+
+    /// 接线腿：这一步现在靠 `metadata()` 的三态，而不是把「查不动」折成「没有」的
+    /// `exists()`；附属文件也必须在主库之前搬。这两件事都是字节顺序上的约束，
+    /// 行为用例只挡住其中一半（附属搬不动那条），所以这里把形状钉住。
+    #[test]
+    fn keep_aside_reads_metadata_and_moves_sidecars_first() {
+        let src = include_str!("data_location.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod.find("fn keep_aside(").expect("keep_aside 找不到了");
+        let rest = &prod[at..];
+        let end = rest.find("\n}\n").expect("函数切不出来");
+        let code: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut bad: Vec<String> = Vec::new();
+        if code.contains(".exists()") {
+            bad.push(
+                "又用 `exists()` 判断在不在：查不动会被折成「没有」，随后就是截断覆盖".to_string(),
+            );
+        }
+        let sidecars_first = match (
+            code.find("for suffix in [\"-wal\", \"-shm\"]"),
+            code.find("std::fs::rename(dst, &kept)"),
+        ) {
+            (Some(side), Some(main)) => side < main,
+            _ => false,
+        };
+        if !sidecars_first {
+            bad.push("主库必须在附属文件之后搬：先搬主库就会留下半套状态".to_string());
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
 
     fn write_file(p: &Path, content: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
