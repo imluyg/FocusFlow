@@ -1218,6 +1218,17 @@ pub struct DeviceDetail {
 /// 库内 id，直接解出来；只认与本库年份相符的那一个，别的库的同编号设备不算它
 /// （那正是 C6 要避免的形态）。
 fn device_ids_of_identity(conn: &Connection, device_key: &str, db_year: i32) -> Vec<i64> {
+    // 别的调用方按"随便取一条即可"的口径可以咽下读失败，
+    // 问「这台设备到底有没有明细」的那一个不行 —— 见 [`device_ids_of_identity_checked`]。
+    device_ids_of_identity_checked(conn, device_key, db_year).unwrap_or_default()
+}
+
+/// 同一件事的"读不出来要说出来"版本：`Err` = 这一问没答案，不是"没有登记行"。
+fn device_ids_of_identity_checked(
+    conn: &Connection,
+    device_key: &str,
+    db_year: i32,
+) -> Result<Vec<i64>, String> {
     // 传进来的可以是任意形态（`get_device_detail` 已经归一，直接调这些 helper 的
     // 用例与日后别的调用方未必）：归一是幂等的，这里再归一次不改变答案，
     // 却省掉了"helper 只收身份键"这种看不见的约定。
@@ -1230,10 +1241,10 @@ fn device_ids_of_identity(conn: &Connection, device_key: &str, db_year: i32) -> 
                     .filter(|(_, key)| crate::device_alias::hardware_identity_key(key) == identity)
                     .map(|(id, _)| id)
                     .collect(),
-                Err(_) => Vec::new(),
+                Err(e) => return Err(format!("读登记表失败: {e}")),
             }
         }
-        Err(_) => Vec::new(),
+        Err(e) => return Err(format!("准备登记表的查询失败: {e}")),
     };
     if let Some(rest) = identity.strip_prefix(ARCHIVED_DEVICE_KEY_PREFIX) {
         // 现形 `<年份>:<库内 id>`；旧形是裸 id（那个库连占位登记都没写过），
@@ -1252,7 +1263,7 @@ fn device_ids_of_identity(conn: &Connection, device_key: &str, db_year: i32) -> 
             }
         }
     }
-    ids
+    Ok(ids)
 }
 
 /// `IN (?,?,…)` 的占位符串：只有 `?n`，值一律走绑定参数。
@@ -1268,38 +1279,76 @@ fn id_params(ids: &[i64]) -> Vec<&dyn rusqlite::ToSql> {
     ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect()
 }
 
+/// 「这台设备有没有键名明细」的三种结局。
+///
+/// 立三态的理由：`false` 会被界面念成一句关于**用户历史**的断言 ——
+/// 「键名明细从该功能上线后开始积累，此前的历史数据无法回溯」。
+/// 而原先每一条读不动的年份库（移动盘休眠、同步盘占位、库被别的连接握着）都会折进
+/// 那句"没有"：某一年打不开 ⇒ 那一年不算数 ⇒ 只要别处也没查到就报"没有"。
+/// 保守方向与本文件 `year_has_aggregates` 一致：**读不了就按"有"处理**，
+/// 宁可那一格显示成"有明细、这次没列出来"，也不替用户编一段历史。
+#[derive(Debug, PartialEq, Eq)]
+enum DetailVerdict {
+    /// 某一年库里确实查到过一条
+    Has,
+    /// 每一个能读的库都读完了，都说没有 —— 这才许界面念那句"无法回溯"
+    Absent,
+    /// 有年份库没答上来，原因都收在字符串里
+    Unknown(String),
+}
+
 /// 该设备在任何年份库里有没有一条键名明细。
 ///
 /// 与「本周期内有没有」是两件事，混起来会对着设备说谎：点「今日」看一台
 /// 上周还在用、今天没按过的鼠标，界面说的是"键名明细从该功能上线后开始积累，
 /// 此前的历史数据无法回溯"，而那台鼠标库里其实有几十条明细。
-fn device_has_key_detail(identity: &str) -> bool {
+fn device_has_key_detail(identity: &str) -> DetailVerdict {
+    let mut unknown: Vec<String> = Vec::new();
     for year in query_years(None, None) {
         let path = paths::year_db_path(year);
-        let found = connection::with_ro_conn(&path, |conn| {
-            if !table_exists(conn, "device_key_counts") {
-                return None;
+        let verdict = connection::with_ro_conn(&path, |conn| {
+            match connection::table_presence(conn, "device_key_counts") {
+                // 这一年还没有这张表（键名明细是后来才加的功能）：这是**一个答案**
+                connection::Presence::No => DetailVerdict::Absent,
+                connection::Presence::Unreadable(why) => {
+                    DetailVerdict::Unknown(format!("{year} 年：{why}"))
+                }
+                connection::Presence::Yes => {
+                    match device_ids_of_identity_checked(conn, identity, year) {
+                        // 这台设备在这一年没登记过：也是一个答案
+                        Ok(ids) if ids.is_empty() => DetailVerdict::Absent,
+                        Err(why) => DetailVerdict::Unknown(format!("{year} 年：{why}")),
+                        Ok(ids) => {
+                            let sql = format!(
+                                "SELECT 1 FROM device_key_counts k \
+                                 WHERE k.device_id IN ({}) LIMIT 1",
+                                in_placeholders(ids.len())
+                            );
+                            let pv = id_params(&ids);
+                            // 两处失败原先都折成 `false`（`ok()?` 与 `unwrap_or(false)`）
+                            match conn.prepare(&sql).and_then(|mut s| s.exists(pv.as_slice())) {
+                                Ok(true) => DetailVerdict::Has,
+                                Ok(false) => DetailVerdict::Absent,
+                                Err(e) => DetailVerdict::Unknown(format!("{year} 年查不动: {e}")),
+                            }
+                        }
+                    }
+                }
             }
-            let ids = device_ids_of_identity(conn, identity, year);
-            if ids.is_empty() {
-                return Some(false);
-            }
-            let sql = format!(
-                "SELECT 1 FROM device_key_counts k \
-                 WHERE k.device_id IN ({}) LIMIT 1",
-                in_placeholders(ids.len())
-            );
-            let pv = id_params(&ids);
-            let mut stmt = conn.prepare(&sql).ok()?;
-            Some(stmt.exists(pv.as_slice()).unwrap_or(false))
         })
-        .flatten()
-        .unwrap_or(false);
-        if found {
-            return true;
+        // 库根本打不开：`with_ro_conn` 自己已经记了 error，这里把它记成"没答案"
+        .unwrap_or_else(|| DetailVerdict::Unknown(format!("{year} 年的库打不开")));
+        match verdict {
+            DetailVerdict::Has => return DetailVerdict::Has,
+            DetailVerdict::Unknown(why) => unknown.push(why),
+            DetailVerdict::Absent => {}
         }
     }
-    false
+    if unknown.is_empty() {
+        DetailVerdict::Absent
+    } else {
+        DetailVerdict::Unknown(unknown.join("；"))
+    }
 }
 
 /// 单设备在周期内的键名排行（跨年度库合并，次数降序）。
@@ -1549,7 +1598,19 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
         trend,
         keys: key_rows,
         key_total,
-        has_key_detail: device_has_key_detail(&device_key),
+        // 只有"每一个能读的库都说没有"才报 false：那一句界面文案讲的是用户的历史，
+        // 拿一次读不动当证据就等于替用户编一段历史。读不动时按 true 走
+        // （那一格会显示成"有明细、这次没列出来"），并把原因留在日志里。
+        has_key_detail: match device_has_key_detail(&device_key) {
+            DetailVerdict::Absent => false,
+            DetailVerdict::Has => true,
+            DetailVerdict::Unknown(why) => {
+                tracing::warn!(
+                    "设备 {device_key} 有没有键名明细查不出来（{why}）：本次不断言「没有」"
+                );
+                true
+            }
+        },
     }
 }
 
@@ -3119,5 +3180,45 @@ mod tests {
             kept[0].auto_name, "书房那只鼠标",
             "归一后不等于身份段的真名必须原样保留"
         );
+    }
+
+    /// 「这台设备没有键名明细」只许在**每一个能读的库都说没有**的时候说。
+    ///
+    /// 这个布尔在界面上念出来的是「键名明细从该功能上线后开始积累，此前的历史数据
+    /// 无法回溯」—— 一句关于用户历史的话。原先某一年库打不开（移动盘还没醒、
+    /// 同步盘放的是占位、库被别的连接握着）也走同一句话，而且零日志。
+    #[test]
+    fn an_unreadable_year_is_not_reported_as_no_detail() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_device_detail");
+        let identity = "HID#VID_046D&PID_C52B&MI_00#夹具";
+        let broken = 2031;
+        {
+            let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+            connection::ensure_schema(&conn, chrono::Local::now().year()).unwrap();
+        }
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        assert_eq!(
+            device_has_key_detail(identity),
+            DetailVerdict::Absent,
+            "有这张表、而这台设备一行明细都没有：这才是「没有明细」"
+        );
+
+        // 另一年变成一个不是 SQLite 的文件 ⇒ 那一年**答不上来**，不能算"没有"
+        std::fs::write(paths::year_db_path(broken), b"not a sqlite file at all").unwrap();
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        let verdict = device_has_key_detail(identity);
+        assert!(
+            matches!(&verdict, DetailVerdict::Unknown(why) if why.contains(&broken.to_string())),
+            "要说清是哪一年答不上来，实得 {verdict:?}"
+        );
+
+        // 反向腿：坏文件拿走之后同一个问题回到 Absent —— 上面那条不是恒真
+        std::fs::remove_file(paths::year_db_path(broken)).unwrap();
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        assert_eq!(device_has_key_detail(identity), DetailVerdict::Absent);
     }
 }
