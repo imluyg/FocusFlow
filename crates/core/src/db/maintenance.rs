@@ -1081,7 +1081,12 @@ fn verify_backup_file(dst: &Path) -> bool {
         Ok(status) if status == "ok" => true,
         other => {
             tracing::error!("备份完整性校验失败 {}: {other:?}", dst.display());
-            let _ = std::fs::remove_file(dst);
+            if let Err(e) = remove_backup(dst) {
+                tracing::error!(
+                    "坏备份没能删掉（{e}）：下一轮会把它当成现成的那一份，\
+                     还占着一个轮转名额把好的旧那份挤掉 —— 请手动清理它"
+                );
+            }
             false
         }
     }
@@ -1173,11 +1178,34 @@ fn finalize_backup(dst: &Path) {
     }
 }
 
-/// 删除备份文件及其 sidecar（轮转、失败清理共用）。
-fn remove_backup(db: &Path) {
-    let _ = std::fs::remove_file(db);
+/// 删除备份文件（连带它的 sidecar）。`Err` 说的是**主文件**删不掉的原因。
+///
+/// "删不掉"在本仓是常态而不是意外：别的进程握着句柄时 Windows 给 os error 32
+/// （本文件就有一条用例钉着这个平台事实）。原先这里是三处 `let _ =`，于是
+/// - 坏备份/半成品留在原地，下一轮 `newest_backup_of_group` 把它当成"最新那一份"
+///   （异常体检的基线与指纹跳过判断都照着它走），
+/// - 它还占着一个轮转名额，把真正好的旧那份挤出去，
+/// - `backup/` 一直涨，而日志说的是"删除 N 份旧备份"。
+///
+/// sidecar 删不掉不算失败：`sweep_stale_sidecars` 每轮启动都会再清一遍。
+fn remove_backup(db: &Path) -> Result<(), String> {
+    let main = std::fs::remove_file(db);
     for p in sidecar_paths(db) {
-        let _ = std::fs::remove_file(p);
+        if let Err(e) = std::fs::remove_file(&p) {
+            // rollback journal 模式下根本没有 sidecar：不存在是常态，不进这一格
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(
+                    "备份的 sidecar 没删掉（下一轮启动的清扫还会再试）: {} {e}",
+                    p.display()
+                );
+            }
+        }
+    }
+    match main {
+        Ok(()) => Ok(()),
+        // 主文件本来就不在 = 目标状态已经达成，不是失败
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", db.display())),
     }
 }
 
@@ -1601,7 +1629,11 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
         }
         if !ok {
             // 失败的半成品会占轮转名额、顶掉好备份：先清干净再走兜底
-            remove_backup(&dst);
+            if let Err(e) = remove_backup(&dst) {
+                tracing::warn!(
+                    "备份半成品没能清掉（{e}）：兜底复制会就地覆盖它，删不动时请手动清理"
+                );
+            }
             // 兜底：checkpoint 后直接复制主文件（复制的是变化中的文件，可能撕裂，
             // 必须校验，避免坏备份顶掉轮转中的好备份）
             let mut checkpointed = false;
@@ -1663,7 +1695,11 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
             }
             backed_up.push(dst);
         } else {
-            remove_backup(&dst);
+            if let Err(e) = remove_backup(&dst) {
+                tracing::error!(
+                    "年度库的坏备份没能删掉（{e}）：下一轮会把它当成最新那一份，请手动清理"
+                );
+            }
             failed.push(format!("{year} 年库"));
             tracing::error!("年度库备份失败（已清理半成品）: {year}");
         }
@@ -1690,7 +1726,11 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
         if ok {
             backed_up.push(dst);
         } else {
-            remove_backup(&dst);
+            if let Err(e) = remove_backup(&dst) {
+                tracing::error!(
+                    "附属库 {name} 的坏备份没能删掉（{e}）：下一轮会把它当成最新那一份，请手动清理"
+                );
+            }
             failed.push(name.to_string());
             tracing::error!("附属库备份失败（已清理半成品）: {name}");
         }
@@ -1897,7 +1937,11 @@ fn rotate_alias_backups(keep: usize, freeze: bool) {
         return;
     }
     for old in files.iter().take(files.len() - keep) {
-        remove_backup(old);
+        if let Err(e) = remove_backup(old) {
+            tracing::warn!(
+                "别名快照轮转：这一份该删的旧快照删不掉（{e}），它会继续占着「最近 N 份」的名额"
+            );
+        }
     }
 }
 
@@ -2340,10 +2384,19 @@ fn rotate_backups(policy: RetentionPolicy, freeze: bool) {
             continue;
         }
         let keep = select_retained(files, policy);
-        let removed = keep.iter().filter(|k| !**k).count();
+        // 「删了几份」要数**真的删掉的**那些：原先先按名单算好 N 再去删，
+        // 每条 remove_file 的结果都丢掉 ⇒ 删不掉时这句 debug 说的是"删除 N 份"，
+        // 而 backup/ 里那几份还站着、名额也被它们占着。
+        let mut removed = 0usize;
         for (i, f) in files.iter().enumerate() {
             if !keep[i] {
-                remove_backup(f);
+                match remove_backup(f) {
+                    Ok(()) => removed += 1,
+                    Err(e) => tracing::warn!(
+                        "轮转：{group} 组这一份该删的旧备份删不掉（{e}），\
+                         它还占着名额，backup/ 不会按配置缩小"
+                    ),
+                }
             }
         }
         if removed > 0 {
@@ -3085,6 +3138,43 @@ mod tests {
             }
             other => panic!("非库文件不许被折成「没有可比的那份」: {other:?}"),
         }
+    }
+
+    /// 「该删的备份删不掉」要交出原因 —— 在这台机器上它是常态而不是意外。
+    ///
+    /// 上层拿它出声：坏备份站着会被下一轮当成"最新那一份"，旧名额也被它占着，
+    /// 而原先三处 `let _ =` 之后，日志说的"删除 N 份"与 `backup/` 里实际还剩几份
+    /// 是两件事。夹具用本文件已有的那条平台事实：一个只读的 SQLite 句柄就足以
+    /// 让 Windows 的删除返回 sharing violation。
+    #[test]
+    fn a_held_backup_reports_the_refusal_instead_of_vanishing_silently() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("remove_backup_stuck");
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+        let p = paths::backup_dir().join("focusflow_2026_20260102_000000.db");
+        {
+            let w = Connection::open(&p).unwrap();
+            w.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x);")
+                .unwrap();
+            w.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        }
+        let hold = Connection::open_with_flags(
+            &p,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("夹具：只读句柄要能开起来");
+        let err = remove_backup(&p)
+            .expect_err("只读句柄握着时主文件删不动，这一格必须交出原因而不是吞掉");
+        assert!(
+            err.contains("focusflow_2026_20260102_000000.db"),
+            "要说清是哪一份删不掉: {err}"
+        );
+        assert!(p.exists(), "删不动的那一份确实还站在原地（上层据此出声）");
+        drop(hold);
+        assert!(
+            remove_backup(&p).is_ok(),
+            "句柄放开之后该删得掉 —— 证明上面的失败原因是句柄，不是路径或权限"
+        );
     }
 
     /// 一条**平台前提**（本轮现量，三个产品路径都踩在它上面：
@@ -4597,7 +4687,10 @@ mod tests {
         )
         .unwrap();
 
-        remove_backup(&dst);
+        assert!(
+            remove_backup(&dst).is_ok(),
+            "没人握着时主文件与两个 sidecar 都该删掉"
+        );
 
         let left: Vec<String> = std::fs::read_dir(paths::backup_dir())
             .unwrap()
