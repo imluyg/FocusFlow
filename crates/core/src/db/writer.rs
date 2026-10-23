@@ -1022,7 +1022,12 @@ fn today_landed_totals(today_dk: i64) -> Option<(i64, i64)> {
 /// 等一个永远不会被处理的请求，白卡满 3 秒还把 flush 判成超时。走到本函数这条路上时
 /// 那一步也没有意义：调用点正是写线程本身，且它每 tick 都在同步地跑 `flush_pending`，
 /// 没有别人的 flush 在飞，所以"库值 + 内存增量"本来就是一致的瞬间。
-fn reanchor_today(state: &WriterState) {
+///
+/// 交出**这一拍做成了没有**（`#[must_use]`）：调用方把 false 排回去重试。原先回 `()`，
+/// 而唯一的置位者 `record()` 只在往回跨过午夜那一次点一下旗标 —— 旗标被摘掉又没人补，
+/// 日志里那句"下一次能读到时会重新对齐"就成了一句谁也承诺不了的许诺。
+#[must_use = "重锚有没有做成要交给调用方排队重试，不许丢弃"]
+fn reanchor_today(state: &WriterState) -> bool {
     // 日期键必须先立，与 `recompute_today_totals` 同一顺序：`record()` 跑在隔壁线程，
     // 它看见 `today_key` 不是今天就 `store(0)` 那两个基准，而基准之后只往上加。
     // 先算基准、后立键 ⇒ 中间隔着一次 SQLite 读的那几毫秒里只要有一次按键落下，
@@ -1039,15 +1044,15 @@ fn reanchor_today(state: &WriterState) {
     // 读不出来时**什么都不写**：把 `None` 当 0 用，等于把整天已经落库的活跃数从今日里
     // 抹掉，而这两个缓存之后只往上加 —— 一次瞬时读不动就让今日整天偏小，且没人知道。
     // 保持原样最多让今日多带着上一天的数（日期键已经先立好了，见上面那段），
-    // 等下一次能读时重锚就正过来。
+    // 等下一拍能读时重锚就正过来（排队见 `reanchor_retry_due`）。
     let (count, seconds) = match landed {
         Some(v) => v,
         None => {
             tracing::warn!(
                 "跨午夜重锚这一拍没做成：今日库值读不出来，内存基准保持原样（{pending_count} 次增量已含）；\
-                 下一次能读到时会重新对齐"
+                 每秒再试一次，读到为止"
             );
-            return;
+            return false;
         }
     };
     state
@@ -1056,6 +1061,22 @@ fn reanchor_today(state: &WriterState) {
     state
         .today_active
         .store(seconds.max(0) as u64 + pending_active, Ordering::Relaxed);
+    true
+}
+
+/// 没做成的那一拍多久再试一次（见 `reanchor_retry_due`）。
+const REANCHOR_RETRY_GAP: Duration = Duration::from_secs(1);
+
+/// 没做成的那一拍该怎么排队：`None` = 没有在等的重锚；`Some(t)` = 上一次试的时刻。
+///
+/// 为什么不每个 tick（≤100 毫秒）都试：那一问是开库 + 查询，读不动的时候 10 次/秒
+/// 既打不动源头、又把日志刷成一堵墙（`today_landed_totals` 每次失败都 `error!` 一行）。
+/// 为什么不能不试：置位只有一次，跳过的这一拍就是"少报到下次重启"。
+fn reanchor_retry_due(last_try: Option<Instant>, now: Instant, gap: Duration) -> bool {
+    match last_try {
+        None => false,
+        Some(t) => now.duration_since(t) >= gap,
+    }
 }
 
 /// 读取恢复文件（启动回放）。
@@ -1149,6 +1170,8 @@ pub fn panic_recovery_snapshot() {
 
 fn writer_loop(state: Arc<WriterState>, sig_rx: mpsc::Receiver<Signal>, flush_interval: Duration) {
     let mut last_flush = Instant::now();
+    // 排着却没做成的那次重锚（`Some(上一次尝试的时刻)`）—— 见 `reanchor_retry_due`
+    let mut reanchor_at: Option<Instant> = None;
     // 持久连接：跨年时重建，避免每批重开
     let mut conn: Option<Connection> = None;
     let mut conn_year: i32 = 0;
@@ -1192,13 +1215,24 @@ fn writer_loop(state: Arc<WriterState>, sig_rx: mpsc::Receiver<Signal>, flush_in
         // 时钟往回跨过午夜那一次，`record()` 只敢置位（它在键鼠热路径上，读库会把
         // SQLite IO 压进每一次按键），重锚在这里做。摆在周期落库之后：这样读到的库值
         // 已经含刚落下去的那一批，未落库的部分由 `reanchor_today` 从 agg 里补。
-        // 每个 tick（≤100 ms）看一眼，把"少报到下次重启"缩成"少报一个 tick"。
+        // 每个 tick（≤100 ms）看一眼标志；这一拍读不动时**不能把这拍丢掉** ——
+        // 置位只有跨回午夜那一次，摘了旗标不补做，「今日」就停在跳表后的那个值一整天，
+        // 而日志里只留下一句没人兑现的"下一次能读到时会重新对齐"。
         if state.today_reanchor.swap(false, Ordering::Relaxed) {
             tracing::warn!(
                 "检测到本地日期往回跳（改时钟、NTP 回拨或向西跨时区）：按库里的真值重锚今日\
                  计数 —— 不重锚的话今天此前记下的量会被清零后一整天补不回来"
             );
-            reanchor_today(&state);
+            reanchor_at = Some(Instant::now());
+            if reanchor_today(&state) {
+                reanchor_at = None;
+            }
+        } else if reanchor_retry_due(reanchor_at, Instant::now(), REANCHOR_RETRY_GAP) {
+            reanchor_at = Some(Instant::now());
+            if reanchor_today(&state) {
+                reanchor_at = None;
+                tracing::info!("补做的跨午夜重锚已经对上（此前今日库值读不出来）");
+            }
         }
     }
 }
@@ -1972,6 +2006,145 @@ mod tests {
         assert_eq!(
             got, 8,
             "回拨那一次把基准清零之后没人重锚：今天此前那 7 次永久从「今日」里丢了（停在 {got}）"
+        );
+    }
+
+    /// 重锚要做成没有，必须交得出来 —— 并且读不动那一拍不许把基准写成 0。
+    ///
+    /// 原先回 `()`：调用方无从知道要不要补做，那句 warn 只能写成一句许诺。
+    #[test]
+    fn reanchor_today_says_whether_it_could_read_the_baseline() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_reanchor_verdict");
+        let w = start_writer(Duration::from_secs(3600));
+        w.state.today_count.store(42, Ordering::Relaxed);
+
+        // 全新目录里还没有年度库 ⇒ 今日库值这一问没有答案
+        assert!(
+            !reanchor_today(&w.state),
+            "读不动时这一拍要算「没做成」，交给调用方排队重试"
+        );
+        assert_eq!(
+            w.state.today_count.load(Ordering::Relaxed),
+            42,
+            "读不出来不许把基准压成 0（那两个缓存之后只往上加）"
+        );
+
+        w.record("A", queries::now_ts());
+        w.flush(true);
+        assert!(reanchor_today(&w.state), "库读得开时这一拍要做成");
+        assert_eq!(
+            w.state.today_count.load(Ordering::Relaxed),
+            1,
+            "对齐到「库里的今日聚合 + 内存里未落库的增量」"
+        );
+        w.stop_and_wait();
+        crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
+    }
+
+    /// 排队的节奏：没有在等 ⇒ 不问库；刚问过 ⇒ 不立刻再问；满一个间隔 ⇒ 再问一次。
+    ///
+    /// 为什么要间隔：`today_landed_totals` 每失败一次就打一行 error，而这个 tick 只有
+    /// ≤100 毫秒 ⇒ 每个 tick 都问就是一堵每秒十行的墙，还把一次瞬时故障念成永久故障。
+    #[test]
+    fn the_queued_reanchor_waits_between_tries() {
+        let gap = REANCHOR_RETRY_GAP;
+        let now = Instant::now();
+        assert!(
+            !reanchor_retry_due(None, now, gap),
+            "没有在等的重锚不该去开库"
+        );
+        assert!(
+            !reanchor_retry_due(Some(now), now, gap),
+            "刚试过的这一拍不该立刻再来一次"
+        );
+        assert!(
+            reanchor_retry_due(Some(now - Duration::from_millis(1_200)), now, gap),
+            "过了间隔就该再试一次"
+        );
+        assert!(
+            reanchor_retry_due(Some(now - gap), now, gap),
+            "整满一个间隔就算到点（不许写成严格大于）"
+        );
+    }
+
+    /// 库读不动的那一拍要**补做**，不能让「今日」停在跳表后的 1 等下次重启。
+    ///
+    /// 夹具形状：把年度库的位置占成目录（此刻写线程还没开过它，没有句柄挡路）⇒ 回拨触发
+    /// 重锚、这一拍必然读不出来。原先这就是终点：旗标已被 `swap(false)` 摘掉，而唯一的
+    /// 置位者 `record()` 只在跨过午夜那一次点过 ⇒ 日志里那句"下一次能读到时会重新对齐"
+    /// 谁都不兑现，今日卡片、悬浮窗与插件的 `today_count` 整天都停在 1。
+    #[test]
+    fn an_unreadable_baseline_is_retried_instead_of_awaiting_a_restart() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_reanchor_retry");
+        let w = start_writer(Duration::from_secs(3600));
+        let db = crate::paths::current_year_db_path();
+        std::fs::create_dir_all(&db).expect("把年度库的位置占成目录");
+
+        let t0 = queries::now_ts();
+        for i in 0..7 {
+            w.record("A", t0 + i);
+        }
+        w.state
+            .today_key
+            .store(current_day_key() + 1, Ordering::Relaxed);
+        w.record("A", queries::now_ts());
+
+        // 回拨那一次把基准清成了 1，而这一拍读不出库值 ⇒ 补做之前就该一直停在 1
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            w.state.today_count.load(Ordering::Relaxed),
+            1,
+            "夹具前提：库读不动时不许把基准当成 0 之后又加回去"
+        );
+
+        // 撤掉占位、把这 8 条真的落库 ⇒ 从这一刻起库里有了答案，等的是补做那一拍
+        std::fs::remove_dir(&db).expect("写线程没碰过这个位置，目录该撤得掉");
+        w.flush(true);
+        assert_eq!(w.today_pending_count(), 0, "夹具前提：这 8 条要已经落库");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = w.state.today_count.load(Ordering::Relaxed);
+        while got != 8 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            got = w.state.today_count.load(Ordering::Relaxed);
+        }
+        w.stop_and_wait();
+        crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
+
+        assert_eq!(
+            got, 8,
+            "读不动那一拍被丢掉了：今日停在 {got}，要等下次重启才对得上（库里是 8）"
+        );
+    }
+
+    /// 写线程那一头要把"没做成"排回去，不许摘了旗标就完事。
+    ///
+    /// 接线只能由判据拦：行为用例走的是同一份 `reanchor_retry_due`，把循环里的补做那一支
+    /// 整段删掉，`reanchor_today` 与调度函数各自都还对 ⇒ 只有这条看得出少了一处调用。
+    #[test]
+    fn the_writer_loop_queues_the_failed_reanchor_itself() {
+        let src = include_str!("writer.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn writer_loop(")
+            .expect("写线程主循环找不到了（判据要跟着改）");
+        let body = &prod[at..];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("if reanchor_today(&state) {").count(),
+            2,
+            "置位那一拍与补做那一拍都要看返回值，实得 {}",
+            code.matches("if reanchor_today(&state) {").count()
+        );
+        assert!(
+            code.contains("reanchor_retry_due(reanchor_at, Instant::now(), REANCHOR_RETRY_GAP)"),
+            "补做没有接到循环里 ⇒ 那句 warn 又成了没人兑现的许诺"
         );
     }
 
