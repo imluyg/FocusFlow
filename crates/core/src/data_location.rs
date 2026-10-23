@@ -246,7 +246,22 @@ fn stable_abs(p: &Path) -> Option<PathBuf> {
 
 /// 单文件复制：同大小且同内容才跳过；否则先把目标改名留档，再整份写过来。
 fn copy_file(from: &Path, to: &Path, summary: &mut CopySummary) -> anyhow::Result<()> {
-    if to.exists() {
+    use crate::db::connection::Presence;
+    // 目标那一格要答三件事，`to.exists()` 只答得了两件：确认没有、读得动，以及**这一刻问不出**
+    // （那份正被别的程序握着、杀软首扫、移动盘刚休眠）。第三件被读成「没有」时，下面整段保护
+    // （同文件判据、内容比对、`keep_aside` 留档）一起被跳过，直奔最后那句 `fs::copy`
+    // **截断覆盖**目标上那份唯一副本 —— 而换完目录随后还要删源，好数据两头都没了。
+    // `keep_aside` 自己认得"读不出就不覆盖"（它上面的注释写的就是这条），却被这一问绕了过去：
+    // 尺子要用在同一层上，而不是只在里面那一层。
+    let target = probe_open(to);
+    if let Presence::Unreadable(reason) = &target {
+        summary.errors.push(format!(
+            "说不出 {} 在不在（{reason}）—— 这一次不覆盖它：先让那个名字读得出来再改目录",
+            to.display()
+        ));
+        return Ok(());
+    }
+    if matches!(target, Presence::Yes) {
         if same_file(from, to) {
             summary
                 .skipped_existing
@@ -903,6 +918,19 @@ mod tests {
         if !sidecars_first {
             bad.push("主库必须在附属文件之后搬：先搬主库就会留下半套状态".to_string());
         }
+        // 外层那一问也要钉住：`keep_aside` 里面的三态挡不住"外面先判成没有、整段保护被绕过"
+        let cf_rest = &prod[prod.find("fn copy_file(").expect("copy_file 找不到了")..];
+        let cf_code: String = cf_rest[..cf_rest.find("\n}\n").expect("copy_file 函数体切不出来")]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if cf_code.contains(".exists()") {
+            bad.push("覆盖前那一问又用 exists()：保护段会被它整段绕过".to_string());
+        }
+        if !cf_code.contains("probe_open(to)") {
+            bad.push("保护段必须走那把三态尺子".to_string());
+        }
         assert!(bad.is_empty(), "{bad:#?}");
     }
 
@@ -1191,6 +1219,59 @@ mod tests {
         std::fs::create_dir_all(&fresh).unwrap();
         let rep = migrate_data_tree(&fresh, to.path()).expect("空的旧根不该卡住迁移");
         assert_eq!(rep.summary.copied, 0);
+    }
+
+    /// 目标那份**问不出在不在**时，`copy_file` 不许往下覆盖 —— 保护段不许被这一问绕过。
+    ///
+    /// 旧写法 `if to.exists() { …保护… }` 在属性问不出的那一刻连 `keep_aside` 都不进，直接落到
+    /// 最后一句 `fs::copy` 把目标截断。`keep_aside` 上面那句"说不准就不覆盖"是同一件事，
+    /// 只是原先写在了里面那一层、外面这一问先把它短路掉了。
+    #[cfg(windows)]
+    #[test]
+    fn an_unanswerable_target_is_not_overwritten_when_switching_dirs() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = paths::test_app_dir_lock();
+        let src = paths::test_app_dir("cow_src");
+        let dst = paths::test_app_dir("cow_dst");
+        let from = src.path().join("focusflow_2026.db");
+        let to = dst.path().join("focusflow_2026.db");
+        write_file(&from, "new-copy");
+        write_file(&to, "the-only-copy");
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&to)
+            .expect("占位句柄应能打开");
+        assert!(
+            std::fs::File::open(&to).is_err(),
+            "夹具没成立：这个句柄没挡住读，测不到「问不出」那一支"
+        );
+
+        let mut summary = CopySummary::default();
+        copy_file(&from, &to, &mut summary).expect("说不准的那一格是停手，不是崩");
+        assert!(
+            summary.errors.iter().any(|e| e.contains("说不出")),
+            "要说清是哪一问没答上，而不是「留档失败」那种猜出来的话: {:?}",
+            summary.errors
+        );
+        assert_eq!(summary.copied, 0, "问不出就不许算搬过来了");
+
+        drop(_holder);
+        assert_eq!(
+            std::fs::read_to_string(&to).expect("目标必须还在"),
+            "the-only-copy",
+            "被拒绝的那一步绝不能截断目标"
+        );
+
+        // 对照腿：读得动之后同一次复制要照常留档再覆盖（防修法做成"永远不搬"）
+        let mut again = CopySummary::default();
+        copy_file(&from, &to, &mut again).expect("读得动时照常搬");
+        assert_eq!(again.copied, 1, "撤掉占用后要真的搬过去: {again:?}");
+        assert!(
+            again.backed_up.len() == 1 && again.backed_up[0].contains(".pre-switch-"),
+            "覆盖前那份留档不许丢: {:?}",
+            again.backed_up
+        );
     }
 
     #[test]
