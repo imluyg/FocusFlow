@@ -265,17 +265,50 @@ pub fn file_path() -> PathBuf {
     alias_path()
 }
 
-/// 缓存：`(文件 mtime, 别名表)`；mtime 未变则复用。
-static CACHE: Mutex<Option<(Option<SystemTime>, AliasTable, PathBuf)>> = Mutex::new(None);
+/// 别名文件「这一刻的时间戳问不问得出」有三种结局 —— 旧写法用 `Option<SystemTime>`，
+/// 两个格子装不下三件事。
+///
+/// 缓存命中的判据是 `*cached_mtime == mtime`，而 `file_mtime` 把"文件真的还没建出来"
+/// 与"文件在、这一刻问不出时间"（移动盘刚休眠、同步盘占位、权限被拒）全折成同一个 `None`
+/// ⇒ 两份 `None` 相等 ⇒ **问不出被当成"时间没变"**：第一次问不出时存进缓存的那份表会一直
+/// 命中，之后手改别名文件、从备份恢复都不会被重读，直到进程重启或本进程自己写过一次才正过来。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stamp {
+    /// 问到了
+    Known(SystemTime),
+    /// 确认这个文件还不存在（正常首启：没有别名可载入，也不该反复去读盘）
+    Absent,
+    /// 这一刻问不出 ⇒ 谁都不许拿它声称"没变化"
+    Unknown,
+}
 
-fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
-    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+/// 缓存：`(这一问的结局, 别名表, 文件路径)`；只有问得出的结局才落缓存、才允许命中。
+static CACHE: Mutex<Option<(Stamp, AliasTable, PathBuf)>> = Mutex::new(None);
+
+/// 把一次 stat 的结局换算成三态（不经系统调用，才能拿错误码把表钉死 ——
+/// 手法同 `db::queries::classify_stat`、`data_location::is_confirmed_absent`）。
+fn classify_stamp(stat: std::io::Result<SystemTime>) -> Stamp {
+    match stat {
+        Ok(t) => Stamp::Known(t),
+        Err(e) if crate::data_location::is_confirmed_absent(&e) => Stamp::Absent,
+        Err(_) => Stamp::Unknown,
+    }
+}
+
+/// 这个结局能不能拿来当"没变化"的依据（同时决定它能不能写进缓存）。
+/// 问不出时宁可每次都重读：多读一次文件是开销，把旧表锁在缓存里是错数据。
+fn stamp_is_comparable(stamp: &Stamp) -> bool {
+    !matches!(stamp, Stamp::Unknown)
+}
+
+fn stamp_of(path: &std::path::Path) -> Stamp {
+    classify_stamp(std::fs::metadata(path).and_then(|m| m.modified()))
 }
 
 /// 读取别名表（带 mtime 缓存；文件不存在或损坏时返回空表，不报错）。
 pub fn table() -> AliasTable {
     let path = alias_path();
-    if let Some(table) = cached_table(&path, file_mtime(&path)) {
+    if let Some(table) = cached_table(&path, stamp_of(&path)) {
         return table;
     }
     // 重载必须与写盘串行。`write_map` 是在 rename **之后**才清缓存；读侧若在
@@ -284,8 +317,8 @@ pub fn table() -> AliasTable {
     // 再次变化 —— 表现就是改完设备名、面板刷新仍是旧名字。
     let _serial = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 等锁期间可能已经有人写过：mtime 与缓存都要重取，别拿锁外的旧判断继续。
-    let mtime = file_mtime(&path);
-    if let Some(table) = cached_table(&path, mtime) {
+    let stamp = stamp_of(&path);
+    if let Some(table) = cached_table(&path, stamp) {
         return table;
     }
     let map = match try_read_map(&path) {
@@ -296,14 +329,21 @@ pub fn table() -> AliasTable {
     };
     let table = AliasTable::from_map(&map);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    *cache = Some((mtime, table.clone(), path));
+    // 时间问不出的这一拍**不许落缓存**：留着上一份"问得出的时间"，等 stat 恢复了
+    // 还能靠它判变化；存进一个 `Unknown` 就等于把上面那个"两份 None 相等"的坑重新挖回来。
+    if stamp_is_comparable(&stamp) {
+        *cache = Some((stamp, table.clone(), path));
+    }
     table
 }
 
-fn cached_table(path: &Path, mtime: Option<SystemTime>) -> Option<AliasTable> {
+fn cached_table(path: &Path, stamp: Stamp) -> Option<AliasTable> {
+    if !stamp_is_comparable(&stamp) {
+        return None;
+    }
     let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let (cached_mtime, table, cached_path) = cache.as_ref()?;
-    if *cached_mtime == mtime && *cached_path == path {
+    let (cached_stamp, table, cached_path) = cache.as_ref()?;
+    if *cached_stamp == stamp && *cached_path == path {
         Some(table.clone())
     } else {
         None
@@ -498,6 +538,153 @@ mod tests {
         let out = f();
         invalidate_cache();
         out
+    }
+
+    /// 三态换算表钉死：只有 `NotFound` 算"确认没有"，其余一律是"问不出"。
+    #[test]
+    fn the_stamp_classification_is_a_closed_table() {
+        let t = std::time::UNIX_EPOCH;
+        assert_eq!(classify_stamp(Ok(t)), Stamp::Known(t));
+        assert_eq!(
+            classify_stamp(Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "没有",
+            ))),
+            Stamp::Absent,
+            "确认没有才是 Absent"
+        );
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            assert_eq!(
+                classify_stamp(Err(std::io::Error::new(kind, "问不出"))),
+                Stamp::Unknown,
+                "{kind:?} 这类失败不许被读成「这个文件没有」"
+            );
+        }
+        // 本机实测：Windows 那两个真会撞上的码 —— 32「文件被另一个进程占用」(杀软/同步盘握着)
+        // 与 5「拒绝访问」—— 都不落在 `NotFound`，所以都归"问不出"，而不是"没有这个文件"。
+        for raw in [32, 5] {
+            let e = std::io::Error::from_raw_os_error(raw);
+            assert!(
+                !crate::data_location::is_confirmed_absent(&e),
+                "os error {raw} 该是「问不出」，实得 kind={:?}",
+                e.kind()
+            );
+            assert_eq!(
+                classify_stamp(Err(std::io::Error::from_raw_os_error(raw))),
+                Stamp::Unknown,
+                "os error {raw} 要落进 Unknown 那一格"
+            );
+        }
+        assert!(
+            !stamp_is_comparable(&Stamp::Unknown),
+            "问不出不能拿来声称没变化"
+        );
+        assert!(stamp_is_comparable(&Stamp::Absent));
+        assert!(stamp_is_comparable(&Stamp::Known(t)));
+    }
+
+    /// 「这一刻问不出时间」永远不算命中 —— 旧写法的两份 `None` 相等就是在这里翻的车。
+    #[test]
+    fn an_unanswerable_mtime_never_counts_as_unchanged() {
+        with_temp_dir("stamp", || {
+            let path = alias_path();
+            let mut map = BTreeMap::new();
+            map.insert(
+                "HID#VID_1111&PID_2222".to_string(),
+                "缓存里的名字".to_string(),
+            );
+            let table = AliasTable::from_map(&map);
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+
+            *CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((Stamp::Known(t), table.clone(), path.clone()));
+            assert!(
+                cached_table(&path, Stamp::Known(t)).is_some(),
+                "时间没变该命中（这是缓存的本分）"
+            );
+            assert!(
+                cached_table(&path, Stamp::Known(t + std::time::Duration::from_secs(1))).is_none(),
+                "时间变了该重读"
+            );
+            assert!(
+                cached_table(&path, Stamp::Absent).is_none(),
+                "文件不见了该重读"
+            );
+            assert!(
+                cached_table(&path, Stamp::Unknown).is_none(),
+                "问不出时间时不许拿旧表当「没变化」"
+            );
+
+            // 缓存本身是"问不出"那一拍存进去的（旧写法的 `None`）：此后每次都问不出，也不许命中
+            *CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((Stamp::Unknown, table.clone(), path.clone()));
+            assert!(
+                cached_table(&path, Stamp::Unknown).is_none(),
+                "两份「问不出」相等不等于文件没变"
+            );
+        });
+    }
+
+    /// 首启时还没有别名文件，之后**外部**写进去的别名（手改、从备份恢复）不该等重启。
+    ///
+    /// 旧写法：首启 `file_mtime` 交回 `None`，把空表连同 `None` 存进缓存；此后只要 stat
+    /// 一直问不出（网络盘/同步盘占位），两份 `None` 相等 ⇒ 永远命中那份空表，
+    /// 界面上一直是"这个用户没有任何别名"。
+    #[test]
+    fn an_external_write_after_an_absent_start_is_picked_up() {
+        with_temp_dir("external", || {
+            let key = "HID#VID_3344&PID_5566&MI_00#7&2";
+            assert!(table().is_empty(), "夹具前提：还没有别名");
+            assert!(!alias_path().exists(), "夹具前提：这个文件确实不存在");
+
+            // 不经 `set()` 写入 ⇒ 不会顺手清缓存，这正是"从备份恢复/记事本手改"的形状
+            std::fs::create_dir_all(alias_path().parent().unwrap()).unwrap();
+            std::fs::write(alias_path(), format!("{{\"{key}\":\"外部起的名字\"}}")).unwrap();
+
+            assert_eq!(
+                table().exact_alias(key),
+                Some("外部起的名字"),
+                "文件一出现（时间问得到）就必须重读，而不是等重启"
+            );
+        });
+    }
+
+    /// 接线判据：时间问不出的那一拍不许落缓存。
+    ///
+    /// 纯函数各自都对，但把 `Unknown` 存进缓存就等于把"两份 None 相等"这个坑重新挖回来，
+    /// 而这条只有钉调用点才看得见。
+    #[test]
+    fn the_unanswerable_stamp_is_never_cached() {
+        let src = include_str!("device_alias.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn table(")
+            .expect("table() 找不到了（判据要跟着改）");
+        let raw = &prod[at..at + prod[at..].find("\n}").expect("函数体切不出来")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            body.matches("*cache = Some(").count(),
+            1,
+            "写缓存只该有一处"
+        );
+        assert!(
+            body.contains("if stamp_is_comparable(&stamp) {"),
+            "写缓存要被「这一问问不问得出」挡住"
+        );
+        assert!(
+            body.contains("cached_table(&path, stamp_of(&path))")
+                && body.contains("cached_table(&path, stamp)"),
+            "两次命中判断都得走那把三态尺子"
+        );
+        assert!(!body.contains("file_mtime"), "旧的 Option 尺子不许回来");
     }
 
     /// 设置 → 精确命中 → 删除 → 落回自动名。
