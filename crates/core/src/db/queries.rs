@@ -129,10 +129,14 @@ pub fn try_available_years() -> anyhow::Result<Vec<i32>> {
 /// 判据与 `data_location::is_confirmed_absent`、`unopenable_years` 一致：只有 `NotFound`
 /// 算确认没有。
 ///
+/// `pub(crate)`：问"这个年度库在不在"的地方都共用这一句（`db::writer::preload_device_meta`
+/// 原先用 `Path::exists()`，把"这一次 stat 失败了"读成"今年还没建库"，于是那次启动
+/// 所有设备名退成占位而日志一个字没有）。
+/// 原先只在本模块用；写侧那处 `Path::exists()` 的漏读法（见下）把它提成共用的尺子。
 /// 本机实测（写在用例里）：路径的**父那一格是普通文件**时报的是 `ERROR_PATH_NOT_FOUND`
 /// （⇒ NotFound ⇒ 按"没有"处理），所以那种形状不落在「说不出」这一支；`data` 位置被换成
 /// 文件另有 `paths::ensure_dir` 的日志负责。
-fn year_db_presence(path: &std::path::Path) -> Result<bool, std::io::Error> {
+pub(crate) fn year_db_presence(path: &std::path::Path) -> Result<bool, std::io::Error> {
     classify_stat(std::fs::metadata(path))
 }
 

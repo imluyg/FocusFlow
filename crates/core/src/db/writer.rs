@@ -1404,9 +1404,18 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
 /// UPSERT 到对应年库，当年库覆盖全部活跃设备，读历史年库没有额外收益。
 fn preload_device_meta(agg: &mut AggDeltas) {
     let path = paths::current_year_db_path();
-    // 文件不在＝今年还没有库，正常首启：没有名字可载入，不必出声。
-    if !path.exists() {
-        return;
+    // 「在不在」问成三态（`queries::year_db_presence` 那把尺子）：确认没有 = 今年还没建库，
+    // 正常首启，不必出声。但 `Path::exists()` 只答得了三件事里的两件 —— 真没有／读得动／
+    // **这一次 stat 自己失败了**，第三种被它读成"没有库"⇒ 那次启动所有还没产生输入事件的
+    // 设备全退成占位名，而日志一个字没有。下面三处早退各自都要说出原因（`warn_preload_skipped`），
+    // 漏的正是这第一问。
+    match queries::year_db_presence(&path) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            warn_preload_skipped(&path, &format!("说不出这个库在不在: {e}"));
+            return;
+        }
     }
     // 不能用 `table_exists_readonly`：它把"打不开"折成"没有这张表"，而这两件事里
     // 只有后者是正常的。打不开的那次启动里，所有还没产生输入事件的设备都会退成
@@ -3436,6 +3445,41 @@ mod tests {
         assert!(
             shown.contains("占位名"),
             "要说出用户会看到什么，而不只是失败了: {shown}"
+        );
+    }
+
+    /// 预热的第一问也必须走那把三态尺子 —— `Path::exists()` 不许再出现在这里。
+    ///
+    /// `exists()` 把「这一次 stat 自己失败了」（移动盘休眠、同步盘占位、杀软握着句柄）
+    /// 读成"今年还没建库"⇒ 整次启动退成占位名而日志一个字没有，而同一函数下面三处早退
+    /// 各自都要说出原因（上面那条用例盯的就是那三处）。
+    /// ⚠ 这一支**无头造不出**（要 ACL 拒绝），所以行为用例只能覆盖"确认没有⇒安静"与
+    /// "库在而打不开⇒出声"两臂，第三种结局由这条判据守着 ⇒ 登记为眼验：真撞上网络盘
+    /// 休眠那次启动，日志里要有一行「说不出这个库在不在」。
+    #[test]
+    fn the_preload_asks_presence_before_it_opens() {
+        let src = include_str!("writer.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn preload_device_meta(")
+            .expect("预热函数找不到了（判据要跟着改）");
+        let raw = &prod[at..at + prod[at..].find("\n}").expect("函数体切不出来")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains(".exists()"),
+            "又用 exists() 猜在不在 —— stat 失败会被读成「今年没建库」而一声不吭"
+        );
+        assert!(
+            body.contains("queries::year_db_presence(&path)"),
+            "这一问要走那把共用的三态尺子"
+        );
+        assert!(
+            body.contains("说不出这个库在不在"),
+            "问不出时要交回原因，而不是当成「没有」"
         );
     }
 
