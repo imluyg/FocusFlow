@@ -1180,11 +1180,30 @@ fn quarantine_backup(dst: &Path) -> Result<std::path::PathBuf, String> {
     Ok(target)
 }
 
-/// 校验备份数据库可打开且通过 quick_check。
-/// 确认损坏的备份删除（不删会占轮转名额、顶掉好备份）；只是这次验不了的先改名留档。
-fn verify_backup_file(dst: &Path) -> bool {
+/// 校验过的那份文件现在在哪儿 —— 三件事原先都折成同一个 `false`：
+///
+/// - 确认损坏 ⇒ 已删掉
+/// - 这次验不了、改名留档成功 ⇒ 还在 `backup/`，只是换了名字（`.db.unverified`）
+/// - 这次验不了、连改名也没做成 ⇒ 还原样躺在 `dst`
+///
+/// 调用方拿 `false` 只会说一句"已清理半成品"，而后两种那份文件明明还在（轮转永远不碰
+/// 留档名，一轮攒一个），话与现场相反；更要紧的是它随后又 `remove_backup(dst)` ——
+/// 对"这一刻验不了但可能完好"的那份，那正是本文件反复说过的那条口径的反面：**确认损坏
+/// 才删，验不了先留档**。
+#[derive(Debug)]
+enum BackupCheck {
+    /// 打得开且 quick_check 通过
+    Passed,
+    /// 确认损坏：已删（删不动时原文件仍在，日志已点名）
+    Removed,
+    /// 这次验不了：那份文件还在，路径交出（留档名，改名没做成时是原路径）
+    StillThere(std::path::PathBuf),
+}
+
+/// 校验备份数据库可打开且通过 quick_check，并交出上面那个结论。
+fn verify_backup_file(dst: &Path) -> BackupCheck {
     match verify_backup(dst) {
-        BackupVerify::Healthy => true,
+        BackupVerify::Healthy => BackupCheck::Passed,
         BackupVerify::Corrupt(why) => {
             tracing::error!("备份完整性校验失败（确认损坏） {}: {why}", dst.display());
             if let Err(e) = remove_backup(dst) {
@@ -1193,7 +1212,7 @@ fn verify_backup_file(dst: &Path) -> bool {
                      还占着一个轮转名额把好的旧那份挤掉 —— 请手动清理它"
                 );
             }
-            false
+            BackupCheck::Removed
         }
         BackupVerify::Unreadable(why) => {
             tracing::warn!(
@@ -1201,16 +1220,32 @@ fn verify_backup_file(dst: &Path) -> bool {
                 dst.display()
             );
             match quarantine_backup(dst) {
-                Ok(path) => tracing::warn!(
-                    "验不了的备份已留档：{}（确认内容后可手动删除；轮转不会把它当成最新备份）",
-                    path.display()
-                ),
-                Err(e) => tracing::error!(
-                    "验不了的备份也移不开（{e}）：接下来调用方若删得掉就会把它删掉，请手动保留"
-                ),
+                Ok(path) => {
+                    tracing::warn!(
+                        "验不了的备份已留档：{}（确认内容后可手动删除；轮转不会把它当成最新备份）",
+                        path.display()
+                    );
+                    BackupCheck::StillThere(path)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "验不了的备份也移不开（{e}）：那份仍原样留着，调用方不会再动它，请手动确认内容后再删"
+                    );
+                    BackupCheck::StillThere(dst.to_path_buf())
+                }
             }
-            false
         }
+    }
+}
+
+/// 这一轮这个库没产出通过校验的备份时，那句话该怎么说 —— 取决于那份文件现在在哪儿。
+fn failed_backup_note(kept: Option<&Path>) -> String {
+    match kept {
+        Some(p) => format!(
+            "这轮没产出通过校验的备份；这次验不了的那份仍留在 {}（确认内容后可手动删除）",
+            p.display()
+        ),
+        None => "备份失败，半成品已清理（不占轮转名额）".to_string(),
     }
 }
 
@@ -1664,14 +1699,12 @@ fn should_backup_aux(plugin_stem: &str, disabled: &[String], force: bool) -> boo
     force || !disabled.iter().any(|s| s == plugin_stem)
 }
 
-/// 备份所有年度数据库与附属数据库到 backup/ 目录，返回首个备份路径。
-/// 每个备份都做 quick_check 校验，坏备份会被删除、不占用轮转名额。
 /// 备份串行化锁。
 ///
 /// 备份有多个并发触发点（运行中定时备份线程、退出前备份、UI 手动备份、
 /// 破坏性操作前的快照），而备份目标名原先只精确到秒：两个并发备份会写同一个
-/// 文件，且 `verify_backup_file` 在打开失败时会删除 dst —— Windows 下读取另一个
-/// 线程正在写的文件必然失败，于是刚写好的备份被自己人删掉、轮转也可能误删。
+/// 文件，且校验对"打不开"那份会改名留档、对"确认损坏"那份会删除 —— Windows 下读取另一个
+/// 线程正在写的文件必然失败，于是刚写好的备份被自己人搬走或删掉、轮转也可能误删。
 /// 整个「备份 -> 校验 -> 轮转」过程持锁执行，保证同一时刻只有一次备份在跑。
 static BACKUP_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1731,6 +1764,10 @@ impl BackupOutcome {
     }
 }
 
+/// 备份所有年度数据库与附属数据库到 backup/ 目录，返回首个备份路径。
+///
+/// 每份备份都过一遍 quick_check：确认损坏的那份删掉（不占轮转名额），只是这一刻验不了的
+/// 那份改名留档、仍留在 `backup/`，而报告与日志说的是它现在到底在哪儿（见 `verify_backup_file`）。
 pub fn backup_database(max_backups: i64) -> BackupOutcome {
     let _guard = BACKUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::fs::create_dir_all(paths::backup_dir()).ok();
@@ -1807,16 +1844,27 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
         }
         let dst = paths::backup_dir().join(format!("focusflow_{year}_{timestamp}.db"));
         let mut ok = backup_db_file(&src, &dst);
+        // "这次验不了"的那份留在 backup/ 里时，把它的现名记在这儿：随后既不该再删它，
+        // 报告里那句话也得换成"仍留在 X"（原先两支共用"已清理半成品"，说的是反话）
+        let mut kept: Option<std::path::PathBuf> = None;
         if ok {
             // 指纹要在 finalize 之前写：finalize 负责把备份收尾成"单个自包含
             // 文件"（切回 rollback journal 并清掉 -wal/-shm）。用 open_rw 写
             // meta 会重新产生 sidecar，等于把 finalize 的成果作废。
             write_source_fingerprint(&dst, src_fp);
             finalize_backup(&dst);
-            ok = verify_backup_file(&dst);
+            match verify_backup_file(&dst) {
+                BackupCheck::Passed => {}
+                BackupCheck::Removed => ok = false,
+                BackupCheck::StillThere(p) => {
+                    ok = false;
+                    kept = Some(p);
+                }
+            }
         }
-        if !ok {
-            // 失败的半成品会占轮转名额、顶掉好备份：先清干净再走兜底
+        if !ok && kept.is_none() {
+            // 失败的半成品会占轮转名额、顶掉好备份：先清干净再走兜底。
+            // `kept` 那一支不进这里 —— 那份文件只是这一刻验不了，可能完好。
             if let Err(e) = remove_backup(&dst) {
                 tracing::warn!(
                     "备份半成品没能清掉（{e}）：兜底复制会就地覆盖它，删不动时请手动清理"
@@ -1839,7 +1887,14 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
                     write_source_fingerprint(&dst, src_fp);
                 }
                 finalize_backup(&dst);
-                ok = verify_backup_file(&dst);
+                match verify_backup_file(&dst) {
+                    BackupCheck::Passed => ok = true,
+                    BackupCheck::Removed => ok = false,
+                    BackupCheck::StillThere(p) => {
+                        ok = false;
+                        kept = Some(p);
+                    }
+                }
             }
         }
         if ok {
@@ -1883,13 +1938,15 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
             }
             backed_up.push(dst);
         } else {
-            if let Err(e) = remove_backup(&dst) {
-                tracing::error!(
-                    "年度库的坏备份没能删掉（{e}）：下一轮会把它当成最新那一份，请手动清理"
-                );
+            if kept.is_none() {
+                if let Err(e) = remove_backup(&dst) {
+                    tracing::error!(
+                        "年度库的坏备份没能删掉（{e}）：下一轮会把它当成最新那一份，请手动清理"
+                    );
+                }
             }
             failed.push(format!("{year} 年库"));
-            tracing::error!("年度库备份失败（已清理半成品）: {year}");
+            tracing::error!("年度库 {year}：{}", failed_backup_note(kept.as_deref()));
         }
     }
     // 附属库同样纳入备份与轮转（命名沿用 focusflow_{组名}_{时间戳}.db，
@@ -1907,20 +1964,34 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
             continue;
         }
         let dst = paths::backup_dir().join(format!("focusflow_{name}_{timestamp}.db"));
-        let ok = backup_db_file(&src, &dst) && {
+        let mut kept: Option<std::path::PathBuf> = None;
+        let checked = if backup_db_file(&src, &dst) {
             finalize_backup(&dst);
             verify_backup_file(&dst)
+        } else {
+            // 连"生成一份"都没做成：dst 里那位（要是有）就是半成品，照旧交给下面清理
+            BackupCheck::Removed
+        };
+        let ok = match checked {
+            BackupCheck::Passed => true,
+            BackupCheck::Removed => false,
+            BackupCheck::StillThere(p) => {
+                kept = Some(p);
+                false
+            }
         };
         if ok {
             backed_up.push(dst);
         } else {
-            if let Err(e) = remove_backup(&dst) {
-                tracing::error!(
-                    "附属库 {name} 的坏备份没能删掉（{e}）：下一轮会把它当成最新那一份，请手动清理"
-                );
+            if kept.is_none() {
+                if let Err(e) = remove_backup(&dst) {
+                    tracing::error!(
+                        "附属库 {name} 的坏备份没能删掉（{e}）：下一轮会把它当成最新那一份，请手动清理"
+                    );
+                }
             }
             failed.push(name.to_string());
-            tracing::error!("附属库备份失败（已清理半成品）: {name}");
+            tracing::error!("附属库 {name}：{}", failed_backup_note(kept.as_deref()));
         }
     }
     // 设备别名表跟着这一轮一起快照与轮转：它既不在年度库也不在附属库里，
@@ -3245,7 +3316,10 @@ mod tests {
             matches!(verify_backup(&junk), BackupVerify::Corrupt(_)),
             "垃圾字节是确认损坏，不是「这次验不了」"
         );
-        assert!(!verify_backup_file(&junk));
+        assert!(
+            matches!(verify_backup_file(&junk), BackupCheck::Removed),
+            "确认损坏那一支要交出「已删」，不是笼统的 false"
+        );
         assert!(!junk.exists(), "确认损坏的备份该删掉，别占轮转名额");
     }
 
@@ -3266,7 +3340,15 @@ mod tests {
             matches!(verify_backup(&dst), BackupVerify::Unreadable(_)),
             "被独占的库不是损坏"
         );
-        assert!(!verify_backup_file(&dst));
+        let kept = match verify_backup_file(&dst) {
+            BackupCheck::StillThere(p) => p,
+            other => panic!("被独占的备份不许被折成「已清理」: {other:?}"),
+        };
+        assert!(
+            kept.exists(),
+            "验不了的那份必须还在某处（留档名或原地），实得 {}",
+            kept.display()
+        );
         let quarantined = dst.with_extension("db.unverified");
         assert!(
             dst.exists() || quarantined.exists(),
@@ -3275,6 +3357,54 @@ mod tests {
         drop(conn);
         let _ = std::fs::remove_file(&dst);
         let _ = std::fs::remove_file(&quarantined);
+    }
+
+    /// 那句"备份失败"要说清那份文件现在在哪儿 —— 两支互斥，各钉一条。
+    ///
+    /// 旧写法把"确认损坏已删"与"这次验不了、已改名留档"折成同一个 `false`，调用方随后统一
+    /// 说「已清理半成品」：那份留档其实还躺在 `backup/`（轮转永远不碰它，一轮攒一个），
+    /// 而且它随后还会再被 `remove_backup` 动一次刀 —— 对"只是这一刻验不了、内容可能是好的"
+    /// 那份，那正是本文件"确认损坏才删"这条口径的反面。
+    #[test]
+    fn the_failure_sentence_follows_where_the_backup_file_actually_is() {
+        let cleaned = failed_backup_note(None);
+        assert!(
+            cleaned.contains("已清理") && !cleaned.contains("仍留在"),
+            "真的删掉了就不该说还在: {cleaned}"
+        );
+        let kept = std::path::PathBuf::from("backup/focusflow_2026_20260101_000000.db.unverified");
+        let kept_note = failed_backup_note(Some(&kept));
+        assert!(
+            kept_note.contains("仍留在") && kept_note.contains("unverified"),
+            "留档那份要说出现场的名字: {kept_note}"
+        );
+        assert!(
+            !kept_note.contains("已清理"),
+            "文件还在就不许说已清理: {kept_note}"
+        );
+    }
+
+    /// 接线判据：两个备份循环都按 `kept` 分流 —— 能动那份文件的口子只在"没有留档"那一支开着。
+    #[test]
+    fn the_backup_loops_do_not_delete_what_they_could_not_verify() {
+        let src = include_str!("maintenance.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("failed_backup_note(kept.as_deref())").count(),
+            2,
+            "年度库与附属库两支都要走那句会跟着现场变的话"
+        );
+        assert_eq!(
+            code.matches("if kept.is_none() {").count(),
+            2,
+            "只有这一轮没留下验不了的备份时才许再动 remove_backup"
+        );
+        assert!(!code.contains("已清理半成品"), "那句反话不许回到调用点");
     }
 
     /// 留档改名要把主文件与 sidecar 一起带走。
