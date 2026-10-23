@@ -445,6 +445,25 @@ fn open_local() -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// 本地 Edge 缓存库**在不在**：`Ok(true)` 在、`Ok(false)` 确认没有、`Err` 这一问问不出来。
+///
+/// 这一问必须先有，因为 [`open_local`] 会把文件创建出来，读侧不能拿"库里有没有行"
+/// 当"有没有刷过"。但 `Path::exists()` 只答得了三件事里的两件（真没有／读得动／
+/// **这一次 stat 自己失败了**），第三种被它折成"没有" ⇒ 挂件上就只剩那个 "—"
+/// （从没刷过），而真正的原因一个字都没留下。判据与 `get_edge_history_counts`
+/// 共用这一份（原先各处自己 `match std::fs::metadata`）。
+fn local_cache_present() -> Result<bool, String> {
+    let path = edge_db_path();
+    match std::fs::metadata(&path) {
+        Ok(_) => Ok(true),
+        Err(e) if crate::data_location::is_confirmed_absent(&e) => Ok(false),
+        Err(e) => Err(format!(
+            "说不出本地 Edge 缓存库在不在（{}）: {e}",
+            path.display()
+        )),
+    }
+}
+
 /// 保存指定日期的计数到本地。失败原因交回调用方 —— 本轮刷新要据此改口，
 /// 不许把"写不进去"吞成"刷新成功"（见 [`update_today_edge_history`]）。
 pub fn save_edge_history_count(target_date: NaiveDate, count: i64) -> Result<(), String> {
@@ -485,20 +504,11 @@ pub fn save_edge_history_count(target_date: NaiveDate, count: i64) -> Result<(),
 /// 没有行"是两件事：旧写法把两种都回成空表，于是"刷新成功、数据为空"与"本地缓存根本
 /// 读不动"在界面上长得一模一样（与上一场修掉的落盘假成功同族）。
 pub fn get_edge_history_counts(days: i64) -> Result<Vec<(String, i64)>, String> {
-    let path = edge_db_path();
-    // 上面自己写着"不能靠文件在不在判"，却先用 `exists()` 判了一次 —— 那一问有三件事，
-    // `exists()` 只能答两件：真没有这个缓存库、读得动、以及**这一次 stat 自己失败了**。
-    // 第三种被折成"没有"，界面上就是"从没刷过"（峰值 "—"），而不是"读不出来"；
-    // `open_local()` 会创建文件那条理由仍然成立，所以这里保留这一问，只把它问成三态。
-    match std::fs::metadata(&path) {
-        Ok(_) => {}
-        Err(e) if crate::data_location::is_confirmed_absent(&e) => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(format!(
-                "说不出本地 Edge 缓存库在不在（{}）: {e}",
-                path.display()
-            ))
-        }
+    // 上面自己写着"不能靠文件在不在判"，所以这一问保留，只把它问成三态
+    // （见 [`local_cache_present`]）：确认没有 ⇒ 空表；stat 自己失败 ⇒ `Err`，
+    // 不许冒充"这个窗口一次都没刷过"。
+    if !local_cache_present()? {
+        return Ok(Vec::new());
     }
     let conn = open_local().map_err(|e| format!("打开本地缓存库失败: {e}"))?;
     // 「表还没建过」与「表在但这一窗没有行」都是真的没刷过，不是读不动 ——
@@ -882,17 +892,21 @@ fn day_end(updated_at: i64, day: NaiveDate) -> bool {
 ///
 /// 拆出来是因为两条读路都把"表还没建"当成判据：首刷之前 `open_local()` 刚创建的
 /// 空库就是这种状态，直接查 `edge_history` 会报 `no such table`，那不该混进"读不动"。
-fn history_table_exists(conn: &Connection) -> Result<bool, String> {
+fn table_exists(conn: &Connection, name: &str) -> Result<bool, String> {
     let mut stmt = conn
-        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='edge_history' LIMIT 1")
-        .map_err(|e| format!("检查 edge_history 表失败: {e}"))?;
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1")
+        .map_err(|e| format!("检查 {name} 表失败: {e}"))?;
     let found = stmt
-        .query_map([], |r| r.get::<_, i64>(0))
+        .query_map([name], |r| r.get::<_, i64>(0))
         .map_err(|e| format!("读取表清单失败: {e}"))?
         .flatten()
         .next()
         .is_some();
     Ok(found)
+}
+
+fn history_table_exists(conn: &Connection) -> Result<bool, String> {
+    table_exists(conn, "edge_history")
 }
 
 /// 本地缓存库里 `start` 之后（含）已有记录的日子 → 该行的写入时刻。
@@ -933,37 +947,71 @@ fn save_edge_history_meta(key: &str, value: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// 读取本地缓存库中某一天已保存的计数（没刷新过那一天返回 None）。
-fn saved_count_on(target_date: NaiveDate) -> Option<i64> {
-    if !edge_db_path().exists() {
-        return None;
+/// 读取本地缓存库中某一天已保存的计数：`Ok(Some(n))` 读到了、`Ok(None)` **确认**那天
+/// 没刷过、`Err` 这一问问不出来（带原因）。
+///
+/// 原先三种结局全折成 `None`：`edge_db_path().exists()` 把"这一次 stat 失败了"读成
+/// "没有"，`open_local().ok()?` 把"缓存库打不开"读成"没刷过"，`query_row(..).ok()` 把
+/// "这一行查不动"也读成"没刷过"。挂件那侧 `today and tostring(today) or "—"` ⇒
+/// 用户看到的是"这个功能你还没用过"，而真实原因是它的缓存库此刻读不动。
+/// 「还没建过 `edge_history` 这张表」仍归 `Ok(None)`（还没建 ≠ 坏了），与
+/// `accounting::CategoryType`、本文件 `Snapshot` 同一把尺子。
+fn saved_count_on(target_date: NaiveDate) -> Result<Option<i64>, String> {
+    use rusqlite::OptionalExtension;
+    if !local_cache_present()? {
+        return Ok(None);
     }
-    let conn = open_local().ok()?;
+    let conn = open_local().map_err(|e| format!("打开本地 Edge 缓存库失败: {e}"))?;
+    if !history_table_exists(&conn)? {
+        return Ok(None);
+    }
+    let day = target_date.format("%Y-%m-%d").to_string();
     conn.query_row(
         "SELECT count FROM edge_history WHERE date = ?1",
-        [target_date.format("%Y-%m-%d").to_string()],
+        [&day],
         |r| r.get::<_, i64>(0),
     )
-    .ok()
+    .optional()
+    .map_err(|e| format!("{day} 那一天的 Edge 计数读不出来: {e}"))
 }
 
-/// 读取今天的 Edge 记录数（本地缓存，今天没刷新过返回 None）。
+/// 读取今天的 Edge 记录数（本地缓存）。
 ///
 /// 按日期查 `edge_history` 表，而不是读 meta 里那个"上次刷新时当作今天"的值：
 /// meta 不会自己跨零点更新，应用通宵开着的话，第二天早上就会把昨天的数当成
 /// "今日记录数"显示给用户。
-pub fn get_edge_history_saved_today() -> Option<i64> {
+///
+/// 结局三态见 `saved_count_on`；`Err` 时调用方不许把它印成"从没刷过"。
+pub fn get_edge_history_saved_today() -> Result<Option<i64>, String> {
     saved_count_on(Local::now().date_naive())
 }
 
-/// 读取上次保存的总记录数（本地缓存，未刷新过返回 None）。
-pub fn get_edge_history_saved_total() -> Option<i64> {
-    let conn = open_local().ok()?;
-    conn.query_row("SELECT value FROM meta WHERE key='total'", [], |r| {
-        r.get::<_, String>(0)
-    })
-    .ok()
-    .and_then(|v| v.parse().ok())
+/// 读取上次保存的总记录数（本地缓存），结局三态同 `saved_count_on`。
+///
+/// 这条原先没有"在不在"那一问，直接 `open_local()` —— 而 `open_local()` 会建目录、
+/// `Connection::open` 会把库文件创建出来。挂件每渲染一次就调它一次（`get_view`），
+/// 于是**从没用过 Edge 功能的机器上也会躺着一个空缓存库**：与"插件停用了但数据目录里
+/// 却躺着它的空库"同族，只是这次是渲染路径干的。
+pub fn get_edge_history_saved_total() -> Result<Option<i64>, String> {
+    use rusqlite::OptionalExtension;
+    if !local_cache_present()? {
+        return Ok(None);
+    }
+    let conn = open_local().map_err(|e| format!("打开本地 Edge 缓存库失败: {e}"))?;
+    // 库里还没有 meta 这张表 = 一次都没刷过，不是读不动
+    if !table_exists(&conn, "meta")? {
+        return Ok(None);
+    }
+    let raw = conn
+        .query_row("SELECT value FROM meta WHERE key='total'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|e| format!("上次保存的 Edge 总数读不出来: {e}"))?;
+    let Some(raw) = raw else { return Ok(None) };
+    raw.parse::<i64>()
+        .map(Some)
+        .map_err(|e| format!("本地缓存里 total 那格写的是「{raw}」，不是数字: {e}"))
 }
 
 /// 本地趋势（近 N 天），供插件展示。
@@ -974,6 +1022,14 @@ pub fn trend_counts(days: i64) -> Result<Vec<(String, i64)>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 用例侧读缓存计数：`Err` 一律算用例失败，不许悄悄当"没有"。
+    ///
+    /// 这一场起「问不出来」是第三种独立结局，既有那些"该读到某个数"的用例如果退回
+    /// 折成 `None` 的写法，就必须红在这里而不是绿着往下走。
+    fn saved(day: NaiveDate) -> Option<i64> {
+        saved_count_on(day).expect("这一问本该答得出来")
+    }
 
     /// 把"Edge 的库"指向夹具文件，析构时还原（panic 时也不会留给下一个用例）。
     struct EdgeFixture;
@@ -1122,27 +1178,51 @@ mod tests {
         // ⚠ 本文件的**生产代码里就有 `#[cfg(test)]`**（测试夹具那几处），
         // 所以不能按第一次出现切：那会把整段生产代码切成第 20 行之前那一小截。
         let prod = &src[..src.find("\nmod tests {").expect("测试模块的起点找不到了")];
-        let at = prod
-            .find("pub fn get_edge_history_counts(")
-            .expect("这个读函数找不到了（判据要跟着改）");
-        let raw = &prod[at..at + prod[at..].find("\n}").expect("函数体切不出来")];
-        // 先摘注释行：这段说明文字里就写着 `exists()` 与"文件在不在"
-        let body: String = raw
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // 先摘注释行：这些说明文字里本来就写着 `exists()` 与"文件在不在"
+        let body = |head: &str| -> String {
+            let at = prod.find(head).expect("这个函数找不到了（判据要跟着改）");
+            let raw = &prod[at..at + prod[at..].find("\n}").expect("函数体切不出来")];
+            raw.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // 三条读路径共用一份尺子，谁都不许再自己 `match std::fs::metadata`
+        for head in [
+            "pub fn get_edge_history_counts(",
+            "fn saved_count_on(",
+            "pub fn get_edge_history_saved_total(",
+        ] {
+            let b = body(head);
+            assert!(
+                !b.contains(".exists()"),
+                "又用 exists() 猜在不在 —— 第三种结局会被读成「从没刷过」: {head}"
+            );
+            assert!(
+                b.contains("local_cache_present()?"),
+                "这一问必须走那把共用的三态尺子: {head}"
+            );
+        }
+        assert_eq!(
+            prod.matches("local_cache_present()?").count(),
+            3,
+            "这一问在读侧该恰好三处"
+        );
+        let ruler = body("fn local_cache_present(");
         assert!(
-            !body.contains(".exists()"),
-            "又用 exists() 猜在不在 —— 第三种结局会被读成「从没刷过」"
+            ruler.contains("is_confirmed_absent(&e)"),
+            "「确认没有」的判据不许在文件里各写一遍"
         );
         assert!(
-            body.contains("is_confirmed_absent(&e)"),
-            "这一问必须走那把共用的三态尺子"
-        );
-        assert!(
-            body.contains("说不出本地 Edge 缓存库在不在"),
+            ruler.contains("说不出本地 Edge 缓存库在不在"),
             "说不出那一支要交 Err，让面板说得出为什么"
+        );
+        // 顺序也是判据的一半：`open_local()` 会建目录、`Connection::open` 会建库文件
+        let total_body = body("pub fn get_edge_history_saved_total(");
+        assert!(
+            total_body.find("local_cache_present()?").unwrap()
+                < total_body.find("open_local()").unwrap(),
+            "先开库再问在不在 ⇒ 挂件每渲染一次就凭空建出一个空缓存库"
         );
     }
 
@@ -1283,10 +1363,10 @@ mod tests {
         assert_eq!((today_count, total), (2, 4));
         assert_eq!(rounds, 1, "今日数+总数+29 天补档必须共用一轮快照");
         // 同步补齐：函数返回时就该已经落库，不是"回头某个时刻出现"
-        assert_eq!(saved_count_on(y), Some(1), "缺失日应在本次调用内补齐");
-        assert_eq!(saved_count_on(today), Some(2));
+        assert_eq!(saved(y), Some(1), "缺失日应在本次调用内补齐");
+        assert_eq!(saved(today), Some(2));
         assert_eq!(
-            saved_count_on(two),
+            saved(two),
             Some(7),
             "这一行是刚刚写下的（`updated_at` 已在该日之后）→ 已盖完，不该重查"
         );
@@ -1308,6 +1388,8 @@ mod tests {
     /// 把「今日记录数 / 总记录数」画成 "—" —— "刷新成功、数据为空"与"真的没数据"
     /// 在界面上长成同一个样子（B15 同族）。
     /// 注回旧写法（ok 位不看落盘结果）时，前两条断言里红在 `assert!(!ok)`。
+    /// 第三条是另一场改的口径：那个夹具把缓存库的位置占成了目录，读侧现在要交回
+    /// 「问不出来＋原因」，不再冒充"今天没刷过"。
     #[test]
     fn a_refresh_that_cannot_persist_does_not_report_ok() {
         let _lock = crate::paths::test_app_dir_lock();
@@ -1329,10 +1411,9 @@ mod tests {
             "Edge 读到了、一条也没落库：本轮该算「写不进」，不是「读不到」——\
              挂件照后一句提示就会让用户去关 Edge"
         );
-        assert_eq!(
-            get_edge_history_saved_today(),
-            None,
-            "落库失败后不该有缓存值可供面板显示"
+        assert!(
+            get_edge_history_saved_today().is_err(),
+            "缓存库的位置被目录占住 ⇒ 这一问问不出来，不许折成「今天没刷过」"
         );
 
         // 界面读的是状态位：那一轮既不该留在 ok，也不该被说成"Edge 读不到"
@@ -1401,13 +1482,13 @@ mod tests {
         let (res, today_count, total) = update_today_edge_history();
         assert!(res.is_ok(), "夹具可读，刷新不该失败");
         assert_eq!((today_count, total), (1, 5));
-        assert_eq!(saved_count_on(y), Some(3), "深夜那条必须被捞回来");
-        assert_eq!(saved_count_on(d2), Some(42), "已盖完的日子不该被重查改写");
+        assert_eq!(saved(y), Some(3), "深夜那条必须被捞回来");
+        assert_eq!(saved(d2), Some(42), "已盖完的日子不该被重查改写");
 
         // 重查过一次就算盖完了：下一轮不该再回头动它
         assert!(update_today_edge_history().0.is_ok());
-        assert_eq!(saved_count_on(y), Some(3), "每个历史日只该被重查一次");
-        assert_eq!(saved_count_on(d2), Some(42));
+        assert_eq!(saved(y), Some(3), "每个历史日只该被重查一次");
+        assert_eq!(saved(d2), Some(42));
     }
 
     /// 崩溃/被杀留在 `%TEMP%` 的副本是**明文浏览记录**，必须能被扫掉；
@@ -1803,17 +1884,123 @@ mod tests {
         let today = Local::now().date_naive();
         let yesterday = today - chrono::Days::new(1);
 
-        assert_eq!(get_edge_history_saved_today(), None, "从未刷新过不该有值");
+        assert_eq!(
+            get_edge_history_saved_today().unwrap(),
+            None,
+            "从未刷新过不该有值"
+        );
+        assert!(
+            !edge_db_path().exists(),
+            "只是问一句「今天刷过没有」，不该把缓存库创建出来: {}",
+            edge_db_path().display()
+        );
+        assert_eq!(
+            get_edge_history_saved_total().unwrap(),
+            None,
+            "总数同一口径：确认没刷过是 `Ok(None)`，不是「问不出来」"
+        );
+        assert!(
+            !edge_db_path().exists(),
+            "总数那条原先连「在不在」都不问就 `open_local()` —— 挂件每渲染一次就凭空\
+             建出一个空缓存库: {}",
+            edge_db_path().display()
+        );
         save_edge_history_count(yesterday, 111).unwrap();
         assert_eq!(
-            get_edge_history_saved_today(),
+            get_edge_history_saved_today().unwrap(),
             None,
             "昨天的计数不该被当成今天"
         );
         save_edge_history_count(today, 42).unwrap();
-        assert_eq!(get_edge_history_saved_today(), Some(42));
+        assert_eq!(get_edge_history_saved_today().unwrap(), Some(42));
         save_edge_history_meta("total", 900).unwrap();
-        assert_eq!(get_edge_history_saved_total(), Some(900));
+        assert_eq!(get_edge_history_saved_total().unwrap(), Some(900));
+    }
+
+    /// 「缓存库此刻读不出来」与「这个功能还没刷过」是两种结局。
+    ///
+    /// 旧形状把三种失败全折成同一个 `None`：`edge_db_path().exists()`（stat 自己失败读成
+    /// "没有"）、`open_local().ok()?`（库打不开读成"没刷过"）、`query_row(..).ok()`
+    /// （这一行查不动读成"没刷过"）。宿主再 `unwrap_or(0)`，挂件那句
+    /// `today and tostring(today) or "—"` ⇒ "你的缓存库读不动"被说成"你从没用过这个功能"。
+    /// 前者的下一步是让统计目录可写，后者的下一步是点「刷新数据」。
+    /// 「还没建这张表」仍归 `Ok(None)`（还没建 ≠ 坏了），与 `CategoryType` 同一把尺子。
+    #[test]
+    fn the_saved_number_channels_answer_in_three_states() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _app = crate::paths::test_app_dir("edge_saved_states");
+        let today = Local::now().date_naive();
+        // 把缓存库的位置占成目录：`metadata` 答"有"，`Connection::open` 必失败
+        std::fs::create_dir_all(edge_db_path()).unwrap();
+
+        let e = get_edge_history_saved_today().expect_err("位置被占住时不许回 Ok(None)");
+        assert!(
+            e.contains("打开本地 Edge 缓存库失败"),
+            "要说清是哪一步问不出来: {e}"
+        );
+        assert!(
+            get_edge_history_saved_total().is_err(),
+            "总数那一条同理：打不开就是打不开"
+        );
+
+        // 撤掉占位 ⇒ 确认没有这个库，必须是 `Ok(None)`（别矫枉过正成见谁都报错）
+        std::fs::remove_dir(edge_db_path()).unwrap();
+        assert_eq!(
+            get_edge_history_saved_today().unwrap(),
+            None,
+            "真没刷过时不许说「读不出来」"
+        );
+        assert_eq!(get_edge_history_saved_total().unwrap(), None);
+
+        // 库建出来了但还没有 `edge_history` 这张表 = 还没刷过，不是读不动
+        Connection::open(edge_db_path()).unwrap();
+        assert_eq!(
+            get_edge_history_saved_today().unwrap(),
+            None,
+            "还没这张表 ⇒ 确认没刷过"
+        );
+        // 有 `edge_history`、还没有 meta 那一格：总数也该是"没刷过"
+        save_edge_history_count(today, 7).unwrap();
+        assert_eq!(saved(today), Some(7));
+        assert_eq!(
+            get_edge_history_saved_total().unwrap(),
+            None,
+            "还没有 meta 这张表 = 总数没存过，不该报「读不出来」"
+        );
+    }
+
+    /// 缓存里 total 那格写的不是数字时要点名，不许再折成"没刷过"。
+    ///
+    /// 旧形状是 `.ok().and_then(|v| v.parse().ok())`：库里明明有一格、内容是坏的，
+    /// 也被读成"没这一格" ⇒ 挂件画 "—"。而这与"从没刷过"下一步相反 ——
+    /// 那种形状要清掉/重建本地缓存，点刷新只是白等。
+    #[test]
+    fn a_broken_total_cell_is_named_not_quietly_absent() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _app = crate::paths::test_app_dir("edge_total_garbage");
+        let today = Local::now().date_naive();
+        save_edge_history_count(today, 1).unwrap();
+        {
+            // 脏值不走生产入口（生产只会写数字）：形状是上一版程序留下的或手工改过的库
+            let conn = Connection::open(edge_db_path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('total', 'abc')",
+                [],
+            )
+            .unwrap();
+        }
+        let e = get_edge_history_saved_total().expect_err("坏的那一格不能被读成「没刷过」");
+        assert!(
+            e.contains("不是数字") && e.contains("abc"),
+            "要点名是哪一格写坏了: {e}"
+        );
+        // 对照腿：同一格写回数字 ⇒ 正常读出（别修成见谁都报错）
+        save_edge_history_meta("total", 5).unwrap();
+        assert_eq!(get_edge_history_saved_total().unwrap(), Some(5));
     }
 
     /// 「近 30 天」必须真的给满 30 天：库里没有的日子补 0。

@@ -39,17 +39,31 @@ function on_action(id)
     end
 end
 
+-- 缓存里的数值怎么画：读到就画数字；确认没刷过画 "—"；这一问根本答不出来要画
+-- "读不出来"。前两者可以并成一格（都是"这里没有数"），后一种不行 ——
+-- "从没刷过"的下一步是点「刷新数据」，"读不出来"的下一步是让统计目录可读，
+-- 而画成 "—" 时用户会一直点前者。
+local function saved_display(value, why)
+    if value ~= nil then
+        return tostring(value)
+    end
+    if why ~= nil then
+        return "读不出来"
+    end
+    return "—"
+end
+
 function get_view()
     -- 数值只取本地缓存库（上次后台刷新保存的结果）：渲染路径不碰 Edge 库，
-    -- 所以打开面板永远不卡。从未刷新过时显示 "—"。
-    local today = focusflow.edge_saved_today()
-    local total = focusflow.edge_saved_total()
-    local today_display = today and tostring(today) or "—"
-    local total_display = total and tostring(total) or "—"
+    -- 所以打开面板永远不卡。
+    local today, today_why = focusflow.edge_saved_today()
+    local total, total_why = focusflow.edge_saved_total()
+    local today_display = saved_display(today, today_why)
+    local total_display = saved_display(total, total_why)
     local state = focusflow.edge_refresh_state()
 
     -- 30 天趋势（本地缓存库，快）；日期从新到旧排列（近 → 远）
-    local counts = focusflow.edge_counts(30)
+    local counts, counts_why = focusflow.edge_counts(30)
     local max_count = 0
     local rows = {}
     for i = #counts, 1, -1 do
@@ -57,9 +71,16 @@ function get_view()
         if c["count"] > max_count then max_count = c["count"] end
         rows[#rows + 1] = { c["date"], tostring(c["count"]) }
     end
-    -- 峰值与今日/总数同一口径：一次都没刷新过时显示 "—"。
+    -- 峰值与今日/总数同一口径：一次都没刷新过时显示 "—"，读不出来时显示"读不出来"。
     -- 以前这里恒显示 0，而 0 在标题写着「近 30 天」的表里是句真话还是假话分不清。
-    local peak_display = (#counts > 0) and tostring(max_count) or "—"
+    local peak_display
+    if #counts > 0 then
+        peak_display = tostring(max_count)
+    elseif counts_why ~= nil then
+        peak_display = "读不出来"
+    else
+        peak_display = "—"
+    end
 
     local widgets = {
         { type = "heading", text = "概览" },

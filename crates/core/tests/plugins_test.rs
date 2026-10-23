@@ -2244,4 +2244,93 @@ mod tests {
             "声明一次 + 保存清 + 取消清 + 关面板清 + 用户挑时撤销，多一处少一处都要查"
         );
     }
+
+    /// 跨语言契约：Edge 挂件要把宿主交回的**第二个返回值**（原因）读掉。
+    ///
+    /// 少读一处不报错，症状只是"面板上继续画那个 "—"" —— 与这一族别的轮次一样，
+    /// 形状上最危险的就是"Rust 改成了三态，Lua 那头还在按一个值接"。
+    #[test]
+    fn the_edge_widget_reads_the_reason_from_all_three_channels() {
+        let src = include_str!("../plugins/edge_history_plugin.lua");
+        // 先摘注释行（`--`）：说明文字里本来就写着「读不出来」与"从没刷过"
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in [
+            "local today, today_why = focusflow.edge_saved_today()",
+            "local total, total_why = focusflow.edge_saved_total()",
+            "local counts, counts_why = focusflow.edge_counts(30)",
+        ] {
+            assert!(code.contains(needle), "挂件没接住第二个返回值: {needle}");
+        }
+        assert!(
+            code.contains("counts_why ~= nil"),
+            "峰值那一格没读趋势通道交回的原因"
+        );
+        assert!(code.contains("return \"—\""), "确认没刷过时仍要画短横");
+    }
+
+    /// 端到端：本地缓存读不出来时，挂件上不许再画那个 "—"。
+    ///
+    /// 这条只有真过一遍 Lua 才测得到，它同时钉住三件事：Rust 那侧交出三态、宿主通道
+    /// 把原因作为第二个值带出来（Lua 的 `local a, b = f()`）、挂件真的读了它。
+    /// 少任一件，界面上都是"你从没用过这个功能"，而真实原因是它的缓存库读不动。
+    /// 对照腿（全新目录）还钉住另一半：渲染路径不许把空缓存库创建出来。
+    #[test]
+    fn the_edge_widget_names_a_read_failure_instead_of_a_dash() {
+        let _guard = guard();
+        fn kv_of(manager: &PluginManager, name: &str) -> Vec<(String, String)> {
+            let mut out = Vec::new();
+            if let Some(p) = manager.get_plugin(name) {
+                if let Some(view) = &p.view {
+                    for w in &view.widgets {
+                        if let Widget::KeyValue(k, v) = w {
+                            out.push((k.clone(), v.clone()));
+                        }
+                    }
+                }
+            }
+            out
+        }
+        fn pick(kv: &[(String, String)], key: &str) -> String {
+            kv.iter()
+                .find(|(k, _)| k == key)
+                .unwrap_or_else(|| panic!("挂件上没有「{key}」这一格，实得 {kv:?}"))
+                .1
+                .clone()
+        }
+
+        // ---- 对照腿：一次都没刷过 ⇒ "—"，而且问一句不该把库建出来 ----
+        let (tmp, mut manager, name) = bundled_in("edge_kv_absent", "edge_history_plugin.lua");
+        manager.refresh_view(&name).expect("重新出图应有视图");
+        let kv = kv_of(&manager, &name);
+        assert_eq!(
+            pick(&kv, "今日记录数"),
+            "—",
+            "从没刷过时仍要画短横，别修成见谁都报「读不出来」"
+        );
+        assert_eq!(pick(&kv, "近30天峰值"), "—");
+        assert!(
+            !focusflow_core::edge_history::edge_db_path().exists(),
+            "渲染一次就把空缓存库建出来 ⇒ 从没用过这个功能的机器上也躺着一个空库"
+        );
+        drop(tmp);
+
+        // ---- 缺陷腿：缓存库的位置被目录占住 ⇒ 这一问问不出来 ----
+        let (tmp, mut manager, name) = bundled_in("edge_kv_unreadable", "edge_history_plugin.lua");
+        let db = focusflow_core::edge_history::edge_db_path();
+        std::fs::create_dir_all(&db).expect("此时缓存库的位置该还是空的");
+        manager.refresh_view(&name).expect("重新出图应有视图");
+        let kv = kv_of(&manager, &name);
+        assert_eq!(
+            pick(&kv, "今日记录数"),
+            "读不出来",
+            "打不开自己的缓存库，不是「这功能没刷过」"
+        );
+        assert_eq!(pick(&kv, "总记录数"), "读不出来");
+        assert_eq!(pick(&kv, "近30天峰值"), "读不出来");
+        drop(tmp);
+    }
 }

@@ -896,13 +896,14 @@ pub fn register_host_api(
     host.set("edge_refresh_state", edge_state)?;
 
     let edge_counts = lua.create_function(|lua, days: i64| {
-        // 读不出本地缓存与"从没刷过"对 Lua 仍是同一张空表（第三方脚本的签名不动），
-        // 但两者在日志里必须分得开：前者是缓存库读不动，后者是这个功能还没用过。
-        let data = match edge_history::get_edge_history_counts(days.clamp(1, 90)) {
-            Ok(rows) => rows,
+        // 读不出本地缓存与"从没刷过"对第三方仍是同一张空表（签名不动），但**第二个返回值**
+        // 交出原因：内置挂件据此把峰值画成"读不出来"而不是 "—"。日志照旧要出声，
+        // 因为第三方脚本只看第一个值，它拿到空表时不会知道自己问不出结果。
+        let (data, why) = match edge_history::get_edge_history_counts(days.clamp(1, 90)) {
+            Ok(rows) => (rows, None::<String>),
             Err(e) => {
-                tracing::error!("Edge 趋势读不出来（面板会画成「从没刷过」）: {e}");
-                Vec::new()
+                tracing::error!("Edge 趋势读不出来: {e}");
+                (Vec::new(), Some(e))
             }
         };
         let t = lua.create_table()?;
@@ -912,7 +913,7 @@ pub fn register_host_api(
             row.set("count", *count)?;
             t.set(i + 1, row)?;
         }
-        Ok(t)
+        Ok((t, why))
     })?;
     host.set("edge_counts", edge_counts)?;
 
@@ -920,21 +921,50 @@ pub fn register_host_api(
     // 脚本在用，所以保留签名（永远返回整数、没刷新过就是 0），但绝不碰 Edge 文件。
     // 否则插件一调它们，就把 ea7b2d3 刚修掉的主线程卡顿（300ms busy + 三轮
     // ≤100MB 复制）原样请回来。
-    let edge_today =
-        lua.create_function(|_, ()| Ok(edge_history::get_edge_history_saved_today().unwrap_or(0)))?;
+    //
+    // 「问不出来」也只会交回 0（签名不许动），所以那一支必须同时**出声**：
+    // 否则日志里一个字没有，而面板上是一个看着像真话的 0。
+    let edge_today = lua.create_function(|_, ()| {
+        let saved = match edge_history::get_edge_history_saved_today() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Edge 今日数读不出来（这个通道只会交回 0）: {e}");
+                None
+            }
+        };
+        Ok(saved.unwrap_or(0))
+    })?;
     host.set("edge_today_count", edge_today)?;
 
-    let edge_total =
-        lua.create_function(|_, ()| Ok(edge_history::get_edge_history_saved_total().unwrap_or(0)))?;
+    let edge_total = lua.create_function(|_, ()| {
+        let saved = match edge_history::get_edge_history_saved_total() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Edge 总数读不出来（这个通道只会交回 0）: {e}");
+                None
+            }
+        };
+        Ok(saved.unwrap_or(0))
+    })?;
     host.set("edge_total_count", edge_total)?;
 
-    // 本地缓存（上次刷新保存的值），插件重启后恢复显示
+    // 本地缓存（上次刷新保存的值），插件重启后恢复显示。
+    //
+    // 这里多交回**第二个值**（说不出时的原因）：Lua 的 `local x = f()` 只取第一个返回值，
+    // 第三方脚本一字不改照样拿到数值或 nil；内置挂件读第二个值，才画得出"读不出来"
+    // 与"从没刷过"这两种不同结局。
     let edge_saved_today =
-        lua.create_function(|_, ()| Ok(edge_history::get_edge_history_saved_today()))?;
+        lua.create_function(|_, ()| match edge_history::get_edge_history_saved_today() {
+            Ok(v) => Ok((v, None::<String>)),
+            Err(e) => Ok((None::<i64>, Some(e))),
+        })?;
     host.set("edge_saved_today", edge_saved_today)?;
 
     let edge_saved_total =
-        lua.create_function(|_, ()| Ok(edge_history::get_edge_history_saved_total()))?;
+        lua.create_function(|_, ()| match edge_history::get_edge_history_saved_total() {
+            Ok(v) => Ok((v, None::<String>)),
+            Err(e) => Ok((None::<i64>, Some(e))),
+        })?;
     host.set("edge_saved_total", edge_saved_total)?;
 
     // 注册为全局 `focusflow`
