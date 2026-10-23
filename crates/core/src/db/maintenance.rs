@@ -142,8 +142,27 @@ pub fn check_yearly_archive(yearly_archive_enabled: bool) {
 /// 返回是否真的迁移了数据。
 pub fn archive_stale_years(source_year: i32) -> bool {
     let source_path = paths::year_db_path(source_year);
-    if !source_path.exists() {
-        return false;
+    // 这一问要答三件事，`Path::exists()` 只答得了两件：源库确实读得动、确认不在原位，
+    // 以及**这一次问不出**（移动盘刚休眠、同步盘正握着、杀软首扫）。后两种原先都折成
+    // 一句静默 `return false`，而调用方 `check_yearly_archive` 上面刚打过「开始归档…」——
+    // 于是那批往年行整轮留在当前库里，下次启动重跑再一次、再静默一次，日志里只有"开始"。
+    // 判据与读侧共用一把尺子（只有 `NotFound` 算确认没有）。
+    match queries::year_db_presence(&source_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::error!(
+                "{source_year} 年库不在原位（{}）：本轮归档没有做任何改动，那些早于本年的数据仍留在当前库里",
+                source_path.display()
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::error!(
+                "说不出 {source_year} 年库在不在（{}）: {e} —— 本轮归档跳过，未做任何改动，下次启动再试",
+                source_path.display()
+            );
+            return false;
+        }
     }
     // 先查出需要迁移的年份及各年起始 date_key（用源库自己的连接查，不依赖猜测）
     let y0 = queries::day_key_of_date(NaiveDate::from_ymd_opt(source_year, 1, 1).expect("date"));
@@ -6162,6 +6181,81 @@ mod tests {
         shells.sort();
         let want = vec!["1969".to_string(), "2024".to_string(), "2025".to_string()];
         assert_eq!(shells, want, "归档只能在真有数据的那几年建库");
+    }
+
+    /// 说过「开始归档…」之后不许闭嘴：源库不在原位要点名是哪一年、哪个路径。
+    ///
+    /// 旧写法 `if !source_path.exists() { return false; }` 一次顶掉了三件事：源库读得动、
+    /// 确认不在原位、**这一次问不出**（移动盘休眠／同步盘正握着／杀软首扫）。后两种都静默
+    /// 返回，而那批早于本年的行留在当前库里，下次启动重跑一遍、再静默一遍。
+    /// 两条腿各管一头：库不在要出声；库在、里面没有往年数据时仍要安静。
+    #[test]
+    fn a_missing_source_year_is_said_out_loud_after_the_archive_promise() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("archive_missing_source");
+
+        // ① 数据目录是空的 ⇒ 确认没有 ⇒ 要说清是哪一年的库不在原位
+        let (migrated, logs) = crate::logger::capture_logs(|| archive_stale_years(2025));
+        assert!(!migrated, "源库不在 ⇒ 什么都没迁");
+        assert!(
+            logs.iter().any(|l| l.contains("2025 年库不在原位")),
+            "要点名是哪一年的库不在，实得 {logs:?}"
+        );
+
+        // ② 对照腿：库在、里面只有本年的数据 ⇒ 照样是 false，但这一支该安静
+        let path = paths::year_db_path(2025);
+        let y0 = queries::day_key_of_date(NaiveDate::from_ymd_opt(2025, 1, 1).expect("date"));
+        let dk = queries::day_key_of_date(NaiveDate::from_ymd_opt(2025, 6, 1).expect("date"));
+        assert!(
+            dk >= y0,
+            "前提：这一行要落在 2025 年内，实得 dk={dk} y0={y0}"
+        );
+        {
+            let conn = connection::open_rw(&path).expect("建源库");
+            connection::ensure_schema(&conn, 2025).expect("建表");
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 3)",
+                [dk],
+            )
+            .expect("插一行本年的聚合");
+            drop(conn);
+        }
+        let (m2, logs2) = crate::logger::capture_logs(|| archive_stale_years(2025));
+        assert!(!m2, "只有本年的数据 ⇒ 没有往年要迁");
+        assert!(
+            !logs2.iter().any(|l| l.contains("不在原位")),
+            "库在的时候不许喊不在，实得 {logs2:?}"
+        );
+    }
+
+    /// 接线判据：源库那一问不许再用 `exists()` 猜，且两种"做不成"都要带原因。
+    ///
+    /// 上面那两条腿钉得住"确认没有⇒出声"，钉不住"问不出⇒也出声"—— 真实 stat 失败这一臂
+    /// 无头造不出（要 ACL 拒绝或占位盘），所以那一支由这条判据守着，另登记眼验。
+    #[test]
+    fn the_archive_still_asks_the_source_year_in_three_states() {
+        let src = include_str!("maintenance.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn archive_stale_years(")
+            .expect("归档函数找不到了");
+        let rest = &prod[at..];
+        let body = &rest[..rest.find("\n}\n").expect("函数体切不出来")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains(".exists()"), "源库在不在不许用 exists() 猜");
+        assert_eq!(
+            code.matches("year_db_presence(&source_path)").count(),
+            1,
+            "那一问只许走共用的尺子，且恰好一次"
+        );
+        assert!(
+            code.contains("说不出") && code.contains("不在原位"),
+            "两种做不成都要各自说出原因"
+        );
     }
 
     /// 序号**超出可换算范围**时仍然要出声并跳过这一轮。负数如今解得开了，这一支只剩
