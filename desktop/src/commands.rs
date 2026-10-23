@@ -559,6 +559,90 @@ pub async fn export_report(fmt: String) -> Result<String, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// 备份文件的时间（抽成具名函数：注入给 `pick_latest_backup`，用例才能造出"这一份问不出"）。
+fn file_mtime(p: &std::path::Path) -> std::io::Result<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified())
+}
+
+/// 备份异常体检留下的说明原文。
+fn read_note_text(p: &std::path::Path) -> std::io::Result<String> {
+    std::fs::read_to_string(p)
+}
+
+/// 从这些 `.db` 备份里挑最新的一条，并交出「最新」这条说不准的原因。
+///
+/// 原先是 `backups.sort_by_key(|p| metadata(p).and_then(|m| m.modified()).ok())` ——
+/// `Err` 折成 `None`，而 `None` 在这个键序里排**最前** ⇒ 正被杀软实时扫描/同步盘握着的那一份
+/// 自动降级成"最旧"，界面那句「最新」念的是另一个文件，份数却照样把它算进去，一处线索都不留。
+/// 问不出的那几份**可能**正是最新的一份，所以既不假装没有最新，也不照念问得出的那个，
+/// 而是把"只在问得出的 N 份里挑"说出来。（上一次修的"哪个时间戳算新"是另一回事。）
+fn pick_latest_backup(
+    db_files: &[std::path::PathBuf],
+    mtime: impl Fn(&std::path::Path) -> std::io::Result<std::time::SystemTime>,
+) -> (Option<String>, Option<String>) {
+    let mut timed: Vec<(std::time::SystemTime, &std::path::PathBuf)> = Vec::new();
+    let mut unknown = 0usize;
+    let mut first_error = String::new();
+    for p in db_files {
+        match mtime(p) {
+            Ok(t) => timed.push((t, p)),
+            Err(e) => {
+                unknown += 1;
+                if first_error.is_empty() {
+                    first_error = e.to_string();
+                }
+            }
+        }
+    }
+    timed.sort_by_key(|(t, _)| *t);
+    let latest = timed
+        .last()
+        .and_then(|(_, p)| p.file_name())
+        .map(|n| n.to_string_lossy().to_string());
+    let error = (unknown > 0).then(|| {
+        format!(
+            "有 {unknown} 份的时间问不出（{first_error}），下面这条只在问得出的 {} 份里挑",
+            timed.len()
+        )
+    });
+    (latest, error)
+}
+
+/// 备份异常说明（`SUSPECT-*.txt`）：取最近两条，读不动的那条要点名。
+///
+/// 原先是 `if let Ok(text) = read_to_string(p)` —— 那份说明是"轮转被冻住"的唯一现场证据，
+/// 打不开就等于"没有异常"，界面一个字都不提。页面最多念两条，所以**被截断也要说出来**，
+/// 否则"只剩两条"与"只有两条"又是一个形状。
+fn suspect_notes(
+    mut files: Vec<std::path::PathBuf>,
+    read: impl Fn(&std::path::Path) -> std::io::Result<String>,
+) -> Vec<String> {
+    files.sort();
+    let hidden = files.len().saturating_sub(2);
+    let mut out: Vec<String> = files
+        .iter()
+        .rev()
+        .take(2)
+        .map(|p| match read(p) {
+            // 只取前两行（第一行结论 + 时间），够提示即可
+            Ok(text) => text.lines().take(2).collect::<Vec<_>>().join("｜"),
+            Err(e) => {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                format!("{name} 这份说明读不出来: {e}")
+            }
+        })
+        .collect();
+    if hidden > 0 {
+        out.push(format!(
+            "另有 {hidden} 条更早的异常说明没列出（这里只念最近两条）"
+        ));
+    }
+    out
+}
+
 /// 维护信息：上次压缩时间 / 备份数量 / 最新备份（读目录与 DB，后台线程执行）。
 #[tauri::command]
 pub async fn get_maintenance_info() -> Result<serde_json::Value, String> {
@@ -579,12 +663,11 @@ pub async fn get_maintenance_info() -> Result<serde_json::Value, String> {
         // 而原先照样显示"备份数量 0"，看起来就像一次都没备份过
         // （同一族已在 vacuum_all / reset / backup_database 修过）。
         let backup_dir = focusflow_core::paths::backup_dir();
-        let (mut backups, backup_error) = match std::fs::read_dir(&backup_dir) {
+        // 一次列目录就够：原先数份数与挑说明**各 read_dir 一次**，第二次失败被
+        // `unwrap_or_default()` 折成"没有异常说明"，而 `backup_error` 只覆盖第一次那一个问。
+        let (all, backup_error) = match std::fs::read_dir(&backup_dir) {
             Ok(it) => (
-                it.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().is_some_and(|e| e == "db"))
-                    .collect::<Vec<_>>(),
+                it.flatten().map(|e| e.path()).collect::<Vec<_>>(),
                 String::new(),
             ),
             Err(e) => (
@@ -592,43 +675,30 @@ pub async fn get_maintenance_info() -> Result<serde_json::Value, String> {
                 format!("备份目录读不出来（{}）: {e}", backup_dir.display()),
             ),
         };
-        backups.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-        let latest = backups
-            .last()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string());
-
-        // 备份异常体检留下的说明（backup/SUSPECT-*.txt），最近 2 条
-        let suspect_notes: Vec<String> = {
-            let mut notes: Vec<String> = Vec::new();
-            let mut files: Vec<std::path::PathBuf> =
-                std::fs::read_dir(focusflow_core::paths::backup_dir())
-                    .map(|it| {
-                        it.flatten()
-                            .map(|e| e.path())
-                            .filter(|p| {
-                                p.file_name()
-                                    .map(|n| n.to_string_lossy().starts_with("SUSPECT-"))
-                                    .unwrap_or(false)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-            files.sort();
-            for p in files.iter().rev().take(2) {
-                if let Ok(text) = std::fs::read_to_string(p) {
-                    // 只取前两行（第一行结论 + 时间），够提示即可
-                    notes.push(text.lines().take(2).collect::<Vec<_>>().join("｜"));
-                }
-            }
-            notes
-        };
+        let db_files: Vec<std::path::PathBuf> = all
+            .iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "db"))
+            .cloned()
+            .collect();
+        let notes: Vec<std::path::PathBuf> = all
+            .iter()
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("SUSPECT-"))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        let (latest, latest_backup_error) = pick_latest_backup(&db_files, file_mtime);
+        let suspect_notes = suspect_notes(notes, read_note_text);
 
         serde_json::json!({
             "last_vacuum": last_vacuum,
             "last_vacuum_error": last_vacuum_error,
-            "backup_count": backups.len(),
+            "backup_count": db_files.len(),
             "latest_backup": latest,
             "backup_error": backup_error,
+            "latest_backup_error": latest_backup_error,
             "suspect_notes": suspect_notes,
         })
     })
@@ -825,7 +895,7 @@ pub fn set_plugin_enabled(
 mod tests {
     use super::{
         backup_message, backup_outcome_with_flush, import_outcome, import_summary_text,
-        must_reload_hotkey,
+        must_reload_hotkey, pick_latest_backup, suspect_notes,
     };
     use focusflow_core::db::maintenance::BackupOutcome;
 
@@ -935,6 +1005,159 @@ mod tests {
         assert!(
             flush_at < decide_at,
             "必须先确认落盘、再下结论（flush 在 {flush_at}、结论在 {decide_at}）"
+        );
+    }
+
+    /// 时间问不出的那几份备份不许被排成"最旧"：「最新」要么说得出，要么承认是挑出来的。
+    ///
+    /// 旧形状 `sort_by_key(|p| metadata(p).and_then(|m| m.modified()).ok())` 把 `Err` 折成
+    /// `None`，而 `None` 在这个键序里排最前 ⇒ 正被杀软/同步盘握着的那一份自动降级成最旧，
+    /// 设置页那句「最新」念的是另一个文件，份数却照样算上它，一处线索都不留。
+    /// 失败臂靠注入造（本机造不出真实的 stat 拒绝），两种句柄形状各管一条链。
+    #[test]
+    fn the_latest_backup_admits_when_a_mtime_cannot_be_read() {
+        use std::collections::HashMap;
+        let p = |n: &str| std::path::PathBuf::from(n);
+        let files = vec![p("a_old.db"), p("b_unknown.db"), p("c_newer.db")];
+        let times: HashMap<&str, Option<u64>> = HashMap::from([
+            ("a_old.db", Some(1_000)),
+            ("b_unknown.db", None), // 这一份其实是最大的那份
+            ("c_newer.db", Some(2_000)),
+        ]);
+        let (latest, err) = pick_latest_backup(&files, |f| {
+            match times[f.file_name().unwrap().to_str().unwrap()] {
+                Some(secs) => Ok(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "被占用",
+                )),
+            }
+        });
+        assert_eq!(
+            latest.as_deref(),
+            Some("c_newer.db"),
+            "只能在问得出时间的那些里挑最新"
+        );
+        let why = err.expect("时间问不出时必须说清「最新」是挑出来的");
+        assert!(
+            why.contains("1 份") && why.contains("被占用") && why.contains("2 份"),
+            "要点名有几份问不出、为什么，以及在几份里挑的: {why}"
+        );
+    }
+
+    /// 对照腿：时间全问得出时不许念那句"说不准"，一份都没有时两样都不许有。
+    ///
+    /// 这一半单独成一条用例，是为了让"过度声明"那种改法有地方红 ——
+    /// 它与上面那条住在同一个函数里时，第一个断言就先 panic，这半边等于没被盯。
+    #[test]
+    fn a_fully_readable_backup_set_claims_a_plain_latest() {
+        use std::path::PathBuf;
+        let p = |n: &str| PathBuf::from(n);
+        let (l2, e2) = pick_latest_backup(&[p("a_old.db"), p("c_newer.db")], |f| {
+            let secs = if f == p("a_old.db") { 1_000 } else { 2_000 };
+            Ok(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        });
+        assert_eq!(l2.as_deref(), Some("c_newer.db"), "问得出时挑的就是真最新");
+        assert!(e2.is_none(), "问得出时间时不该说「说不准」，实得 {e2:?}");
+
+        let (l3, e3) = pick_latest_backup(&[], |_| Err(std::io::Error::other("用不上")));
+        assert!(l3.is_none() && e3.is_none(), "一份都没有时两样都不该有");
+    }
+
+    /// 备份异常说明：读不动的那条要点名，被截断的条数也要说出来。
+    ///
+    /// 旧形状 `if let Ok(text) = read_to_string(p)` 把"这份说明打不开"折成"没有这条说明"：
+    /// 那份说明正是"轮转被冻住"的唯一现场证据，读不动时界面一个字都不提。
+    #[test]
+    fn unreadable_and_hidden_suspect_notes_are_named() {
+        let p = |n: &str| std::path::PathBuf::from(n);
+        let files = vec![
+            p("SUSPECT-2026-10-01.txt"),
+            p("SUSPECT-2026-10-02.txt"),
+            p("SUSPECT-2026-10-03.txt"),
+        ];
+        let out = suspect_notes(files, |f| match f.file_name().unwrap().to_str().unwrap() {
+            "SUSPECT-2026-10-03.txt" => {
+                Ok("骤降 12%\n2026-10-03 12:00｜时间\n第三行不进页面".to_string())
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "被杀软握着",
+            )),
+        });
+        assert_eq!(out.len(), 3, "最近两条 + 一条截断声明，实得 {out:?}");
+        assert!(
+            out[0].contains("骤降 12%") && out[0].contains("｜") && !out[0].contains("第三行"),
+            "只取前两行并用竖线连: {}",
+            out[0]
+        );
+        assert!(
+            out[1].contains("这份说明读不出来") && out[1].contains("SUSPECT-2026-10-02.txt"),
+            "读不动的那份要点名: {}",
+            out[1]
+        );
+        assert!(
+            out[2].contains("另有 1 条更早的"),
+            "被截断要说出条数: {out:?}"
+        );
+    }
+
+    /// 对照腿：都读得动、也没超过两条 ⇒ 就是两条，不多一句。
+    ///
+    /// 同样单独成条，好让"见谁都喊截断/见谁都喊读不出来"那种改法有地方红。
+    #[test]
+    fn readable_suspect_notes_are_shown_without_padding() {
+        let p = |n: &str| std::path::PathBuf::from(n);
+        let out2 = suspect_notes(vec![p("SUSPECT-a.txt"), p("SUSPECT-b.txt")], |_| {
+            Ok("结论\n时间".to_string())
+        });
+        assert_eq!(
+            out2,
+            vec!["结论｜时间".to_string(), "结论｜时间".to_string()],
+            "两页都读得动时不该多出一句"
+        );
+    }
+
+    /// 接线腿：这条命令里只能有**一次**列目录，两处折损形状都不许回来。
+    ///
+    /// 纯函数用例盖不到"命令里到底调没调"——第二次 `read_dir(...).unwrap_or_default()`
+    /// 与 `sort_by_key(...ok())` 都住在命令体里。
+    #[test]
+    fn maintenance_info_lists_the_backup_dir_only_once() {
+        let src = include_str!("commands.rs");
+        let head = src
+            .find("pub async fn get_maintenance_info")
+            .expect("维护信息命令找不到了");
+        let body = &src[head..head
+            + src[head..]
+                .find("\n#[tauri::command]")
+                .expect("它后面没有别的命令，切片前提变了")];
+        // 先摘注释行：那些说明文字里就写着 `read_dir`、`unwrap_or_default()` 与 `.ok())`
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("std::fs::read_dir(").count(),
+            1,
+            "列目录该只问一次（第二次的失败原先被折成「没有异常说明」）: {code}"
+        );
+        assert!(
+            !code.contains("unwrap_or_default()"),
+            "第二次列目录不许再折成空清单"
+        );
+        assert!(
+            !code.contains(".ok())"),
+            "时间/说明的读取失败不许再折成 None 参与排序"
+        );
+        assert!(
+            code.contains("pick_latest_backup(&db_files, file_mtime)"),
+            "挑最新要走那把问不出就承认的尺子"
+        );
+        assert!(
+            code.contains("suspect_notes(notes, read_note_text)"),
+            "异常说明要走那条会点名的画法"
         );
     }
 

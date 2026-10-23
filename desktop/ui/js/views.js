@@ -1475,11 +1475,17 @@ async function renderMaintInfo() {
     const info = await invoke("get_maintenance_info");
     // 备份目录读不出来时不能报"备份数量 0" —— 那和"确实一次没备份过"长得一模一样
     const backupError = info.backup_error ? String(info.backup_error) : "";
+    // 有几份备份的时间问不出时，"最新"只是在问得出的那些里挑 —— 不声明就是把猜的念成事实
+    const latestError = info.latest_backup_error ? String(info.latest_backup_error) : "";
     const backupLine = backupError
       ? "备份数量: 未知 —— " + backupError
       : "备份数量: " +
         info.backup_count +
-        (info.latest_backup ? "，最新: " + info.latest_backup : "");
+        (latestError
+          ? "，最新: 说不准 ——" + latestError
+          : info.latest_backup
+            ? "，最新: " + info.latest_backup
+            : "");
     // 压缩时间同理：查不到不能报成"尚未压缩"（当年库被同步盘换成占位文件就是这个形态）
     const vacuumError = info.last_vacuum_error ? String(info.last_vacuum_error) : "";
     const vacuumLine = vacuumError
