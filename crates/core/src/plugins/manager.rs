@@ -1077,6 +1077,11 @@ impl PluginManager {
     }
 
     /// 向插件投递按键事件（番茄钟联动等）。
+    ///
+    /// 这是唯一一个**没有调用方会看见失败**的 Lua 入口：`on_action` 与 `set_field` 把原因
+    /// `return Err` 给点的那个人，而这条的返回值是 `()`，调用方是按键分发线程。
+    /// 所以非限额的报错过去整包丢掉 —— 插件的 `record_key` 一抛错，按键数从这一次起
+    /// 再也不涨，插件页却仍写着已加载、没有一行原因。
     pub fn plugin_key_event(&mut self, name: &str, key: &str) {
         let cfg = self.config;
         let info = match self.plugins.get(name) {
@@ -1087,14 +1092,51 @@ impl PluginManager {
             Some(l) => l,
             None => return,
         };
-        if let Ok(record_key) = lua.globals().get::<mlua::Function>("record_key") {
-            Self::arm_instruction_budget(lua, cfg);
-            if let Err(e) = record_key.call::<()>(key) {
-                if is_limit_error(&e) {
-                    self.mark_plugin_error(name, format!("record_key 失败: {e}"));
-                }
+        // 「没定义这个钩子」是正常形态（多数插件不收按键），不许因此出声；
+        // 但"有一个同名的东西、偏偏不是函数"是作者写错了，过去跟前者共用同一个静默出口。
+        let hook = match lua.globals().get::<mlua::Value>("record_key") {
+            Ok(mlua::Value::Function(f)) => f,
+            Ok(mlua::Value::Nil) => return,
+            Ok(_other) => {
+                // 有个同名的东西、偏偏不是函数（写成字符串或表是作者最常见的笔误）
+                self.note_key_hook_failure(name, "record_key 有值但不是函数".to_string());
+                return;
+            }
+            Err(e) => {
+                self.note_key_hook_failure(name, format!("读取 record_key 失败: {e}"));
+                return;
+            }
+        };
+        Self::arm_instruction_budget(lua, cfg);
+        if let Err(e) = hook.call::<()>(key) {
+            if is_limit_error(&e) {
+                // 跑飞了：这一类必须停用整个插件（原有口径，不许被下面那条弱化）
+                self.mark_plugin_error(name, format!("record_key 失败: {e}"));
+            } else {
+                self.note_key_hook_failure(name, format!("record_key 抛错，按键数不再累计: {e}"));
             }
         }
+    }
+
+    /// 按键钩子出问题时"挂个原因"，但**不停用插件**、也**不每次按键都喊**。
+    ///
+    /// 为什么不复用 `mark_plugin_error`：那一条是给"这 Lua 环境已经不可信"（跑满指令上限）
+    /// 用的，会卸实例、归还调度线程所有权；作者在一次按键的表达式里写错一个 nil，
+    /// 不该没收整个面板。为什么不每轮 warn：这条是每个按键调一次，日志会被刷满，
+    /// 而那一句真正要说的只有"从这一次起不再累计"。
+    ///
+    /// `error` 已有值时不覆盖：那是别处挂上的原因（例如热重载失败），这一行本来就红的。
+    /// 代价是按键停摆这件事在那一行上被前一个原因挡住 —— 日志里那一句仍然只记一次，
+    /// 而两种失败本来就要分开看。
+    fn note_key_hook_failure(&mut self, name: &str, msg: String) {
+        let Some(info) = self.plugins.get_mut(name) else {
+            return;
+        };
+        if info.error.is_some() {
+            return;
+        }
+        info.error = Some(msg.clone());
+        tracing::warn!("插件 {name} 收按键失败：{msg}");
     }
 
     /// 调用插件 set_field(field, value)（输入框回传，随后刷新视图缓存）。
@@ -2593,6 +2635,191 @@ end
             ids(&pm),
             first,
             "id 每轮渲染都变 ⇒ 推送一来，正在填的弹窗就没了"
+        );
+    }
+
+    /// 插件的 `record_key` 抛错时，按键停摆必须看得见。
+    ///
+    /// 同一族里 `on_action` 与 `set_field` 都把原因 `return Err` 给点按钮的那个人，
+    /// 唯独按键投递的返回值是 `()`、调用方是键盘分发线程 —— 于是非限额的报错过去整包丢掉：
+    /// 番茄钟插件的按键数从第一次抛错起再也不涨，而插件页仍写着已加载、一行原因都没有
+    /// （用户看到的只是"这个面板不数我的按键了"）。
+    #[test]
+    fn a_key_hook_that_throws_leaves_a_reason_on_the_plugin_page() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("key_hook_throws");
+        let file = write_lua(
+            &tmp.path().join("plugins"),
+            "boom",
+            r###"
+PLUGIN_NAME = "按键会炸"
+function record_key(k)
+  local t = nil
+  return t.x
+end
+"###,
+        );
+        let mut pm = manager_in(tmp.path());
+        let name = pm.load_plugin(&file).expect("插件本身该装得上");
+
+        let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A"));
+        let info = pm.get_plugin(&name).expect("插件应还在表里");
+        assert!(info.loaded, "一次表达式写错不该没收整个面板");
+        let reason = info
+            .error
+            .clone()
+            .expect("按键停摆要在插件页上看得见，不能只剩一片安静");
+        assert!(
+            reason.contains("record_key"),
+            "要说清是哪个钩子坏了: {reason}"
+        );
+        assert!(reason.contains("按键数"), "还得说清现在的症状: {reason}");
+        assert!(
+            logs.iter().any(|l| l.contains("收按键失败")),
+            "第一次要出声，否则这一刻只有用户在猜: {logs:?}"
+        );
+
+        // 观察量：这条是每个按键调一次，已经挂过原因就不许再刷日志
+        let (_, logs) = crate::logger::capture_logs(|| {
+            for i in 0..50 {
+                pm.plugin_key_event(&name, &format!("K{i}"));
+            }
+        });
+        assert_eq!(
+            logs.iter().filter(|l| l.contains("收按键失败")).count(),
+            0,
+            "同一件事不该每按一键喊一次: {logs:?}"
+        );
+        assert!(
+            pm.get_plugin(&name).expect("插件应还在表里").loaded,
+            "五十次抛错之后仍然不该停用"
+        );
+    }
+
+    /// 跑满指令上限那一类**仍然**停用整个插件。
+    ///
+    /// 新加的那一支只挂原因、不停用；这条腿防的是"把这条弱化口径一路带下去"，
+    /// 因为限额命中的语义是"这个 Lua 环境已经不可信"（`is_limit_error` 的注释写着）。
+    #[test]
+    fn an_over_limit_key_hook_is_still_disabled_not_just_annotated() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("key_hook_limit");
+        std::fs::write(
+            tmp.path().join("config.ini"),
+            "[plugins]\ninstruction_limit = 3000\n",
+        )
+        .unwrap();
+        let file = write_lua(
+            &tmp.path().join("plugins"),
+            "hog",
+            r###"
+PLUGIN_NAME = "按键跑飞"
+function record_key(k)
+  local n = 0
+  for i = 1, 200000 do n = n + i end
+  return n
+end
+"###,
+        );
+        let mut pm = manager_in(tmp.path());
+        let name = pm.load_plugin(&file).expect("插件本身该装得上");
+
+        let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A"));
+        let info = pm.get_plugin(&name).expect("插件应还在表里");
+        assert!(
+            !info.loaded,
+            "限额命中必须停用，不能只挂个原因继续复用这个 Lua 环境"
+        );
+        let reason = info.error.clone().expect("停用的原因也要写出来");
+        assert!(reason.contains("record_key 失败"), "{reason}");
+        assert!(
+            logs.iter().any(|l| l.contains("插件已停用")),
+            "限额那一支走的是停用，日志要这么说: {logs:?}"
+        );
+        assert!(
+            !logs.iter().any(|l| l.contains("收按键失败")),
+            "限额那一支不该被新加的弱口径接走: {logs:?}"
+        );
+    }
+
+    /// 「这个插件不收按键」是正常形态，不许因此出声、也不许挂原因。
+    ///
+    /// 反向腿：新加的三态里 `nil`（没定义这个钩子）必须仍然安静 —— 多数插件都没有
+    /// `record_key`，一次按键给每个插件各喊一句红字的话，这条链就再没人看了。
+    #[test]
+    fn a_plugin_without_a_key_hook_stays_quiet() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("key_hook_absent");
+        let file = write_lua(&tmp.path().join("plugins"), "quiet", &view_only("不收按键"));
+        let mut pm = manager_in(tmp.path());
+        let name = pm.load_plugin(&file).expect("插件该装得上");
+
+        let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A"));
+        let info = pm.get_plugin(&name).expect("插件应还在表里");
+        assert!(
+            info.error.is_none(),
+            "没有这个钩子不是失败: {:?}",
+            info.error
+        );
+        assert!(info.loaded);
+        assert!(
+            !logs.iter().any(|l| l.contains("收按键失败")),
+            "没定义钩子不该出声: {logs:?}"
+        );
+    }
+
+    /// 同名存在但**不是函数**：过去与"没定义"共用同一个静默出口。
+    ///
+    /// `record_key = "..."` 这类笔误的症状与抛错那条一模一样（按键数永远不涨、
+    /// 页面说健康），所以它得有自己的那句原因 —— 而这条又不能被"没定义"那条腿吞掉。
+    #[test]
+    fn a_key_hook_that_is_not_a_function_says_so() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("key_hook_not_function");
+        let file = write_lua(
+            &tmp.path().join("plugins"),
+            "str",
+            "PLUGIN_NAME = \"钩子写成字符串\"\nrecord_key = \"我把它写成字符串了\"\n",
+        );
+        let mut pm = manager_in(tmp.path());
+        let name = pm.load_plugin(&file).expect("插件该装得上");
+
+        let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A"));
+        let info = pm.get_plugin(&name).expect("插件应还在表里");
+        let reason = info.error.clone().expect("非函数的钩子要有原因");
+        assert!(reason.contains("不是函数"), "{reason}");
+        assert!(info.loaded, "写错类型也只挂原因，不停用");
+        assert!(
+            logs.iter().any(|l| l.contains("收按键失败")),
+            "这一支同样要出声: {logs:?}"
+        );
+
+        // 形状腿：四个出口各有归属，谁被摘掉都要红
+        let src = include_str!("manager.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let flat: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            flat.matches("self.note_key_hook_failure(").count(),
+            3,
+            "非函数、取不出、非限额抛错三条都要挂原因，多一条少一条都要查"
+        );
+        // 判据里不写引号：这段要在**去掉全部空白**的源码上比，带引号的片段一旦被转义写错
+        // 就是语法错，而它的形状本身（停用走 `mark_plugin_error`）已经够用。
+        assert_eq!(
+            flat.matches("self.mark_plugin_error(name,format!(").count(),
+            1,
+            "限额那一支必须仍然走停用，多一处停用要说清是谁"
+        );
+        assert!(
+            flat.contains("record_key失败:"),
+            "停用的那句原因还是要点名 record_key"
         );
     }
 }
