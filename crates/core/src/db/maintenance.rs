@@ -1386,29 +1386,13 @@ fn remove_backup(db: &Path) -> Result<(), String> {
     }
 }
 
-/// 备份目录里**主库那一格**问得出什么结论：在 / 确认没有 / 说不出。
-///
-/// 不许用 `Path::exists()`：它对任何一次失败都回 `false`，于是"别的程序正握着这个文件"、
-/// "杀软首扫"、"移动盘刚唤醒"全被读成「主库已不在」。清扫紧接着就会把旁边那份**非空**
-/// `-wal` 当孤儿删掉 —— 删掉的正是只写在 WAL 里、还没并回主库的那几笔，而源库指纹已经
-/// 盖上，那一年之后的备份都会被 `year_db_needs_backup` 跳过，少掉的量再也补不回来。
-/// 判据取"真开一次只读句柄"（与 `queries::unopenable_years` 同一个思路）：挡读的占用
-/// 落在 `Unreadable`，只有 `NotFound` 算 `No`（`data_location::is_confirmed_absent`）。
-fn backup_main_presence(db: &Path) -> connection::Presence {
-    match std::fs::File::open(db) {
-        Ok(_) => connection::Presence::Yes,
-        Err(e) if crate::data_location::is_confirmed_absent(&e) => connection::Presence::No,
-        Err(e) => connection::Presence::Unreadable(format!("{}: {e}", db.display())),
-    }
-}
-
 /// 清理备份目录里遗留的 sidecar（`-wal`/`-shm`）垃圾。
 ///
 /// 旧版备份会把源库的 WAL 头复制进备份文件、并在旁边留下 sidecar，而轮转只认
 /// `.db` —— 被轮转掉的备份留下孤儿 sidecar，保留下来的备份也一直挂着两个垃圾文件。
 /// 这里的判据是安全的：**主库已确认不存在**（孤儿），或**对应 `-wal` 为空/缺失**
 /// （内容已全部并回主库）。非空 WAL 绝不删（里面可能有未合并的数据）；主库那一格
-/// **问不出**时整条跳过 —— 既不按孤儿处理也不按"还在"处理（见 `backup_main_presence`）。
+/// **问不出**时整条跳过 —— 既不按孤儿处理也不按"还在"处理（尺子在 `data_location::probe_open`）。
 pub fn sweep_stale_sidecars() -> usize {
     let dir = paths::backup_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1429,7 +1413,7 @@ pub fn sweep_stale_sidecars() -> usize {
         let db_path = dir.join(base);
         let wal = dir.join(format!("{base}-wal"));
         // 主库**确认已不在**才算孤儿；这一次问不出就整条跳过，绝不折成"没有"
-        let orphan = match backup_main_presence(&db_path) {
+        let orphan = match crate::data_location::probe_open(&db_path) {
             connection::Presence::No => true,
             connection::Presence::Yes => false,
             connection::Presence::Unreadable(reason) => {
@@ -2238,7 +2222,7 @@ fn probe_backup_fingerprint(path: &Path) -> BackupProbe {
     // 与清扫共用那一把三态尺子：`Absent` 只在**确认没有**这一份时才允许安静跳过。
     // 原先的 `!path.exists()` 把"这一刻问不出"也交成 Absent ⇒ 调用方按"首轮备份"处理，
     // 异常体检整轮没跑而一个字不说（`Unreadable` 那一支本来就会 warn）。
-    match backup_main_presence(path) {
+    match crate::data_location::probe_open(path) {
         connection::Presence::No => return BackupProbe::Absent,
         connection::Presence::Unreadable(reason) => {
             return BackupProbe::Unreadable(format!("问不出这份备份在不在: {reason}"))
@@ -3459,7 +3443,8 @@ mod tests {
             "主库在不在不许用 exists() 猜：stat 问不出会被读成「已不在」⇒ 非空 WAL 当孤儿删掉"
         );
         assert_eq!(
-            code.matches("backup_main_presence(&db_path)").count(),
+            code.matches("crate::data_location::probe_open(&db_path)")
+                .count(),
             1,
             "问主库在不在只许走那一把尺子，且恰好一次"
         );

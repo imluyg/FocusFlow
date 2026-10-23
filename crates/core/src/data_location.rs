@@ -358,6 +358,30 @@ pub(crate) fn is_confirmed_absent(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::NotFound
 }
 
+/// 「这个东西在不在」——**真开一次只读句柄**来问，交回三种结局。
+///
+/// 用在"问完这一步就要覆盖或搬走那个文件"的地方。`Path::exists()` 与 `metadata()` 问的
+/// 都是"能不能取到属性"，而那一刻要防的是「文件在、却问不出」（别的程序正握着句柄、杀软
+/// 首扫、移动盘刚唤醒）：`exists()` 把它读成"没有"，调用方就当场覆盖那份还在被用的库，
+/// 连留档都不留。开一次句柄分得清三件事 —— 开得上＝在，`NotFound`＝确认没有，其余＝说不出。
+/// 口径与 [`is_confirmed_absent`] 一致：只有 `NotFound` 算"确认没有"。
+///
+/// `pub(crate)`：导入链（`migration::backup_before_overwrite`、`import_year_db`）与备份
+/// 侧（`db::maintenance` 的清扫、体量探针）原先各写一遍"在不在"，现在共用这一把尺子。
+///
+/// 开不上时先看一眼是不是**目录占着这个名字**（导入时被同步盘挪过、或被换成同名目录的现场）：
+/// 那是"有东西挡着"的确证而不是"问不出"，按 `Yes` 交回 —— 让调用方走到它自己那一步的
+/// "这个库打不开"分支去说清细节，别在这一问就被折成"说不出在不在"。
+pub(crate) fn probe_open(path: &Path) -> crate::db::connection::Presence {
+    use crate::db::connection::Presence;
+    match std::fs::File::open(path) {
+        Ok(_) => Presence::Yes,
+        Err(e) if is_confirmed_absent(&e) => Presence::No,
+        Err(_) if path.is_dir() => Presence::Yes,
+        Err(e) => Presence::Unreadable(format!("{}: {e}", path.display())),
+    }
+}
+
 /// 在文件名的**末尾**接一段后缀（`focusflow_2026.db` → `focusflow_2026.db-wal`）。
 ///
 /// 走 `OsString` 而不是 `format!("{}", path.display())`：后者对非 UTF-8 文件名是 lossy

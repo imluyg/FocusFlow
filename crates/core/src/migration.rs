@@ -158,8 +158,19 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// 用 rename 而不是 copy —— 既省一次全量拷贝，也保证不会出现"复制到一半
 /// 失败、原文件和新文件都不完整"的中间态。返回被留下的路径（原先不存在时为 None）。
 fn backup_before_overwrite(dst: &Path) -> anyhow::Result<Option<std::path::PathBuf>> {
-    if !dst.exists() {
-        return Ok(None);
+    use crate::db::connection::Presence;
+    // 覆盖前这一问必须分得清三件事。旧写法 `!dst.exists()` 把"这一刻问不出"（现有库正被
+    // 别的程序握着、杀软首扫、移动盘刚休眠）读成「没有要留档的东西」，于是那份**还在被用**
+    // 的附属库被直接覆盖、一份留档都没留 —— 与这个函数存在的理由（"宁可这次不导入，也不能
+    // 拿用户数据冒险"）正好相反，而且事后无从找回。
+    match crate::data_location::probe_open(dst) {
+        Presence::No => return Ok(None),
+        Presence::Unreadable(reason) => {
+            return Err(anyhow::anyhow!(
+                "说不出这份现有库在不在（{reason}）—— 先让那个名字读得出来，本次不覆盖"
+            ))
+        }
+        Presence::Yes => {}
     }
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S%3f").to_string();
     let mut name = dst
@@ -178,9 +189,20 @@ fn backup_before_overwrite(dst: &Path) -> anyhow::Result<Option<std::path::PathB
     //    文件名是 lossy 转换，拼出来的路径根本不存在 ⇒ 配合 `let _ =` 连失败都不会报。
     for suffix in ["-wal", "-shm"] {
         let from = crate::data_location::with_suffix(dst, suffix);
-        if from.exists() {
-            std::fs::rename(&from, crate::data_location::with_suffix(&kept, suffix))
-                .map_err(|e| anyhow::anyhow!("{} 没能一起留档: {e}", from.display()))?;
+        match crate::data_location::probe_open(&from) {
+            Presence::No => {}
+            // 问不出就一步都不搬：主库的 rename 紧跟在后面，把它搬走而这一格留在原地，
+            // 目录里就剩下"主库已改名带走、那段 -wal 还在原位"的半套状态
+            Presence::Unreadable(reason) => {
+                return Err(anyhow::anyhow!(
+                    "{} 在不在问不出（{reason}）—— 整次留档不做，免得主库搬走后这段尾巴留在原位",
+                    from.display()
+                ))
+            }
+            Presence::Yes => {
+                std::fs::rename(&from, crate::data_location::with_suffix(&kept, suffix))
+                    .map_err(|e| anyhow::anyhow!("{} 没能一起留档: {e}", from.display()))?;
+            }
         }
     }
     std::fs::rename(dst, &kept)?;
@@ -245,11 +267,24 @@ fn retry_hint(leftover: &[String]) -> String {
 /// 同形，而重跑导入正是用户查"刚才到底导进去没有"的动作。现存三处 `Ok(0)`
 /// （只剩聚合表 / 源文件未变 / 明细内容指纹未变）都守这条。
 fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> anyhow::Result<i64> {
+    use crate::db::connection::Presence;
     let src_path = src_dir.join(format!("focusflow_{year}.db"));
     let dst_path = paths::year_db_path(year);
 
-    // 目标库不存在 → 整体复制（最快）
-    if !dst_path.exists() {
+    // 目标库不存在 → 整体复制（最快）。这一问原先用 `!dst_path.exists()`：那一刻问不出
+    // （目标库正被别的程序握着、移动盘刚休眠）会被读成「目标库还没有」⇒ 紧跟着的
+    // `fs::copy` 把那一整年的**现有库整份覆盖**，而这一支不像附属库那一路会先留档 ——
+    // 覆盖掉的那一年再也找不回来。说不出就两条路都不走：既不整库覆盖，也不当成空库去合并。
+    let dst_there = match crate::data_location::probe_open(&dst_path) {
+        Presence::Yes => true,
+        Presence::No => false,
+        Presence::Unreadable(reason) => {
+            return Err(anyhow::anyhow!(
+                "说不出 {year} 年目标库在不在（{reason}）：既不能整库覆盖，也不能当成空库走合并 —— 本年度跳过"
+            ));
+        }
+    };
+    if !dst_there {
         std::fs::copy(&src_path, &dst_path)?;
         // 复制 WAL/SHM（若有未 checkpoint 数据）
         for suffix in ["-wal", "-shm"] {
@@ -352,7 +387,6 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
             let note = format!(
                 "{year} 年源文件与上次导入时一模一样（大小与修改时间都没变）：整库跳过，本次没有新数据"
             );
-            tracing::info!("{note}");
             tracing::info!("{note}");
             summary.skipped.push(note);
             return Ok(0);
@@ -718,6 +752,91 @@ fn read_import_marker(dst_path: &Path) -> anyhow::Result<Option<ImportMarker>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 现有库**问不出在不在**时，覆盖前留档那一步必须停手，不许当成"没有要留档的东西"。
+    ///
+    /// 旧写法 `if !dst.exists() { return Ok(None); }`：那份库正被别的程序握着（杀软首扫、
+    /// 同步盘占位、移动盘休眠）时这一问照样回 false ⇒ 调用方拿着"不用留档"直接往下走
+    /// `fs::copy` ⇒ 当前那份记账/日程库被整份覆盖，一条退路都没留。
+    #[cfg(windows)]
+    #[test]
+    fn an_unanswerable_existing_aux_db_is_not_treated_as_absent() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("import_aux_guard");
+        let dst = crate::paths::data_dir().join("accounting.db");
+        std::fs::write(&dst, "我是要紧的数据".as_bytes()).expect("写现有库");
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&dst)
+            .expect("占位句柄应能打开");
+        assert!(
+            std::fs::File::open(&dst).is_err(),
+            "夹具没成立：这个句柄没挡住读，测不到「问不出」那一支"
+        );
+        let err = backup_before_overwrite(&dst).expect_err("问不出时不许交回「不用留档」");
+        assert!(
+            err.to_string().contains("说不出这份现有库在不在"),
+            "要说清是哪一问没答上: {err}"
+        );
+        // 撤掉占用 ⇒ 库还在原位、内容一字没动，这一次才照常留档
+        drop(_holder);
+        assert_eq!(
+            std::fs::read(&dst).expect("现有库必须还在"),
+            "我是要紧的数据".as_bytes(),
+            "被拒绝的那一步绝不能碰原文件"
+        );
+        assert!(
+            backup_before_overwrite(&dst)
+                .expect("读得动时照常留档")
+                .is_some(),
+            "有现有库就该留下一份"
+        );
+    }
+
+    /// 目标年度库问不出 ⇒ 既不整库覆盖、也不当成空库走合并（这一支原先一份留档都不做）。
+    #[cfg(windows)]
+    #[test]
+    fn an_unanswerable_target_year_db_is_not_copied_over() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("import_year_guard");
+        let year = 2025;
+        let src_dir = crate::paths::app_dir().join("import_src");
+        std::fs::create_dir_all(&src_dir).expect("建源目录");
+        std::fs::write(
+            src_dir.join(format!("focusflow_{year}.db")),
+            "别人的库".as_bytes(),
+        )
+        .expect("写源库");
+        let dst = paths::year_db_path(year);
+        std::fs::write(&dst, "我这一年还在用".as_bytes()).expect("写目标年度库");
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&dst)
+            .expect("占位句柄应能打开");
+
+        let mut summary = ImportSummary::default();
+        let err = import_year_db(&src_dir, year, &mut summary)
+            .expect_err("问不出时本年度必须跳过，不能整库覆盖");
+        assert!(
+            err.to_string().contains("说不出 2025 年目标库在不在"),
+            "要说清是哪一问没答上: {err}"
+        );
+        assert!(
+            summary.errors.is_empty(),
+            "报错仍由调用方记账，这里不重复塞"
+        );
+
+        drop(_holder);
+        assert_eq!(
+            std::fs::read(&dst).expect("现有年度库必须原样留着"),
+            "我这一年还在用".as_bytes(),
+            "这一支不留档，覆盖一次就再也找不回来"
+        );
+    }
 
     /// 把**当前**数据目录当成导入源（目录选择器里挑到自己 data/ 上很常见）：
     /// 附属库必须原地不动。
