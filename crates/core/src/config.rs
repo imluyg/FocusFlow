@@ -687,7 +687,23 @@ impl FocusFlowConfig {
             Err(_) => serialize_rebuilt(&snapshot),
         };
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            // 父目录已经不在了就**不写**，也不去把它凭空建回来。
+            //
+            // 这里原先是 `create_dir_all(parent).ok()`：一次迟到的去抖保存（改完设置 300ms
+            // 后才落盘、退出前那次强制 save 之外的另一条路）会把一个刚被删掉的目录复活，
+            // 里面只躺一份新写的 `config.ini`。产品上这就是"换目录留档 / 拔掉移动盘之后
+            // 手工清理过"那些路径上凭空多出来的空壳目录，而那次 `atomic_write` 还报成功 ——
+            // 没有任何一句话说明它把目录建回来了。测试侧同样的形状会骗过收尾：目录被
+            // `TestAppDir` 删掉之后保存线程才落地，于是每跑一次全套留一个目录。
+            //
+            // 不建了之后 `atomic_write` 自然失败：待写标记保住（`?` 在摘除之前返回）、
+            // `last_save_error` 会被设置页当"保存出过错"显示出来，比静默复活一个空目录诚实。
+            if !parent.is_dir() {
+                return Err(anyhow::anyhow!(
+                    "配置目录不存在，本次没写（也不会替你把它建出来）: {}",
+                    parent.display()
+                ));
+            }
         }
         // 落盘成功 ⇒ 把**这次真的写出去的**那些"本进程改过的键"从待写集合里摘掉，此后这些
         // 键再出现差异就都算外部改动（`the_pending_set_clears_after_a_successful_save`
@@ -1079,6 +1095,46 @@ mod tests {
             cfg.last_save_error(),
             None,
             "落成了还留着失败原因＝界面永远红着"
+        );
+    }
+
+    /// 迟到的保存不许把已经删掉的目录凭空建回来。
+    ///
+    /// 写点原先是 `create_dir_all(parent).ok()`，于是"目录被删了之后才落地的那一次保存"
+    /// 会把它复活成一个只装 `config.ini` 的空壳，而 `atomic_write` 照样报成功 ——
+    /// 产品上这正是"换目录留档 / 拔掉移动盘后手工清理过"那些路径上凭空多出来的目录，
+    /// 测试上则是每跑一次全套留一个 `%TEMP%` 目录（本仓的泄漏判据要求跑完回到跑前状态）。
+    #[test]
+    fn a_late_save_does_not_resurrect_a_deleted_directory() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_no_resurrect");
+        let path = app.path().join("config.ini");
+        std::fs::write(&path, "[gui]\ntheme = dark\n").unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+
+        // 正向腿：目录还在 ⇒ 照常落地，且成功后不许留着失败原因
+        cfg.set_local("gui", "theme", "light");
+        cfg.save().expect("目录还在时这一次就该写成");
+        assert!(
+            cfg.last_save_error().is_none(),
+            "落成了还留着原因＝界面永远红着"
+        );
+
+        // 目录没了 ⇒ 这次不能报成功，也不能把目录变回来
+        std::fs::remove_dir_all(app.path()).expect("先把目录删掉");
+        let err = cfg.save().expect_err("父目录已经不在了，这一次不能算写成");
+        assert!(
+            err.to_string().contains("配置目录不存在"),
+            "要说是哪个目录不在了: {err}"
+        );
+        assert!(
+            !app.path().exists(),
+            "一次失败的保存不该把删掉的目录建回来: {}",
+            app.path().display()
+        );
+        assert!(
+            cfg.last_save_error().is_some(),
+            "失败要留下设置页能看见的那一句"
         );
     }
 
