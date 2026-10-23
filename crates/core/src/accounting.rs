@@ -1046,13 +1046,52 @@ pub fn delete_subcategory(category: &str, sub_name: &str) -> (bool, String) {
     }
 }
 
-/// 查询分类类型（expense/income/both），不存在返回 None。
-pub fn category_type(name: &str) -> Option<String> {
-    let conn = open().ok()?;
-    conn.query_row("SELECT type FROM categories WHERE name=?1", [name], |r| {
-        r.get(0)
-    })
-    .ok()
+/// 「这个分类是什么类型」的三种结局。
+///
+/// 形状与理由同 `db::connection::Presence`（那边钉的是"有没有这张表/这一列"）：
+/// 旧写法是 `open().ok()?` 再 `.ok()`，三个臂全折成同一个 `None`，而它们的下一步**相反** ——
+/// "真没有这条分类"该照旧走写入，"这一轮读不出来"什么都不该决定。
+/// 折成一件事的症状在插件那一头最刺眼：`accounting_category_type` 把 `None` 印成空串，
+/// 分类表里那一格被画成「双向」，而「修改分类」弹窗拿不到类型时**留着上一个分类的类型**
+/// 显示，用户按保存就把那个旧值写进了这个分类。
+#[derive(Debug, PartialEq, Eq)]
+pub enum CategoryType {
+    /// 读出来了：库里那一格的内容（旧数据里可能是空串 —— 那是"没设类型"，仍算读全了）
+    Value(String),
+    /// 读全了，但没有这么一条分类（连 `categories` 这张表都还没有，也算这一支）
+    Absent,
+    /// 这一轮答不上来：库打不开、被别的连接握着、或这一行读不动；原因带回去
+    Unreadable(String),
+}
+
+/// 查询分类类型（expense/income/both），并说清**这一轮到底答没答上**。
+pub fn category_type(name: &str) -> CategoryType {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(e) => {
+            let why = format!("记账库打不开: {e}");
+            tracing::error!("分类 [{name}] 的类型读不出来（{why}）—— 这不是「没有这个分类」");
+            return CategoryType::Unreadable(why);
+        }
+    };
+    match conn.query_row("SELECT type FROM categories WHERE name=?1", [name], |r| {
+        r.get::<_, Option<String>>(0)
+    }) {
+        Ok(Some(v)) => CategoryType::Value(v),
+        // 库里这格是 NULL：读全了，只是没设类型。与"读不出来"要分开（前者画「双向」是对的）
+        Ok(None) => CategoryType::Value(String::new()),
+        Err(rusqlite::Error::QueryReturnedNoRows) => CategoryType::Absent,
+        Err(e) => {
+            // 「没有 categories 这张表」是真没有数据（全新库、或还没跑过建表），
+            // 与"这张表读不动"是两种结局 —— 口径同全历史汇总那条（读不出来的那一年不许当零）。
+            if e.to_string().contains("no such table") {
+                return CategoryType::Absent;
+            }
+            let why = format!("分类 [{name}] 的类型读不出来: {e}");
+            tracing::error!("{why} —— 这不是「没有这个分类」");
+            CategoryType::Unreadable(why)
+        }
+    }
 }
 
 /// 获取所有分类，并说清这份清单**能不能当完整答案用**：`(清单, 没读全的原因)`，
@@ -1764,6 +1803,16 @@ pub fn monthly_summary(year_month: &str) -> (f64, f64) {
 
 #[cfg(test)]
 mod tests {
+    /// 断言"读出来的那一格"时的写法：三种结局各回各的字，所以"读不出来"与"没这条分类"
+    /// 都不会被压成某个合法类型值而蒙过 `assert_eq!`（它们各自是独有的一句）。
+    fn ctype_of(name: &str) -> String {
+        match category_type(name) {
+            CategoryType::Value(v) => v,
+            CategoryType::Absent => "（没有这条分类）".to_string(),
+            CategoryType::Unreadable(w) => format!("（读不出来：{w}）"),
+        }
+    }
+
     /// 宿主侧这道日期规范化得有自己的网。
     ///
     /// 面板与宿主两侧都做（同规则、双保险），于是面板级用例**证明不了宿主这半边**：
@@ -2254,23 +2303,119 @@ mod tests {
         // 三个写入口都要挡，且被拒的那次不能改到原值
         assert!(!update_category_type("食品", "支出"));
         assert_eq!(
-            category_type("食品").as_deref(),
-            Some("expense"),
-            "被拒的那次不该已经把库改了"
+            ctype_of("食品"),
+            "expense",
+            "被拒的那次不该已经把库改了（读出别的三种结局也算这条红）"
         );
         assert!(update_category_type("食品", "income"));
-        assert_eq!(category_type("食品").as_deref(), Some("income"));
+        assert_eq!(ctype_of("食品"), "income");
         let (ok, msg) = update_category("交通", "交通", Some("双向"));
         assert!(!ok, "中文名不是合法分类类型: {msg}");
-        assert_eq!(
-            category_type("交通").as_deref(),
-            Some("both"),
-            "被拒的那次不该已经把库改了"
-        );
+        assert_eq!(ctype_of("交通"), "both", "被拒的那次不该已经把库改了");
         // 正向腿：带空格但合法的取值照常收（与分类名同口径的 trim）
         let (ok, msg) = update_category("交通", "交通", Some(" expense "));
         assert!(ok, "trim 之后合法就该收: {msg}");
-        assert_eq!(category_type("交通").as_deref(), Some("expense"));
+        assert_eq!(ctype_of("交通"), "expense");
+    }
+
+    /// 「这个分类是什么类型」要交出**这一轮到底答没答上**，三种结局三种写法。
+    ///
+    /// 旧签名回 `Option<String>`，`open().ok()?` 与 `.ok()` 把三件事折成同一个 `None`：
+    /// 库打不开（被别的连接握着、那个位置被同步盘换成目录）、没有 `categories` 这张表、
+    /// 真没有这个名字。宿主再把它印成空串给插件，于是"没读出来"与"库里没设类型"共用一个
+    /// 「双向」，而「修改分类」弹窗在拿不到类型时留着**上一个分类**的值 —— 用户按保存
+    /// 就把那个旧值写进了这个分类，一句错都不报。
+    #[test]
+    fn the_category_type_says_which_question_it_answered() {
+        let _lock = crate::paths::test_app_dir_lock();
+
+        // —— 表都还没有（全新目录，一句建表 SQL 都没跑过）⇒ 是"没有这条分类"，不是"读不出来" ——
+        let _fresh = crate::paths::test_app_dir("cat_type_no_table");
+        assert_eq!(
+            category_type("食品"),
+            CategoryType::Absent,
+            "没有这张表＝没有数据；报成 Unreadable 会把「还没建」说成「坏了」"
+        );
+
+        // —— 读全了：有值、库里这格是空串、以及没有这个名字 ——
+        let _db = crate::paths::test_app_dir("cat_type_three_reads");
+        init_db().expect("建库失败");
+        assert!(add_category("食品", "expense", &[]) > 0);
+        assert_eq!(
+            category_type("食品"),
+            CategoryType::Value("expense".to_string()),
+            "读出来就照实给"
+        );
+        {
+            // 表里那一格可以是空串（列是 NOT NULL DEFAULT 'both'，所以只有"没设类型"这一种空）
+            let conn = open().expect("这里要的就是刚建的那个库");
+            conn.execute(
+                "INSERT INTO categories(name, type) VALUES('空类型', '')",
+                [],
+            )
+            .expect("插一行空类型的分类");
+        }
+        assert_eq!(
+            category_type("空类型"),
+            CategoryType::Value(String::new()),
+            "库里那格是空串＝读全了只是没设类型，不许混进「读不出来」"
+        );
+        assert_eq!(
+            category_type("没建过的名字"),
+            CategoryType::Absent,
+            "读全了才知道是真没有"
+        );
+
+        // —— 这一**列**查不动（旧库缺列、迁移只跑了一半）：与"没有这张表"两种结局 ——
+        // 立这一条是因为探针暴露过：把这一臂折成 Absent 时，库里位置被占成目录那条夹具
+        // 走的是 `open()` 那一臂，整条查询失败的分支没有任何行为用例覆盖。
+        {
+            let conn = open().expect("还是刚建的那个库");
+            conn.execute("ALTER TABLE categories DROP COLUMN type", [])
+                .expect("把类型列去掉，模拟一条会失败的查询");
+        }
+        let (got, logs) = crate::logger::capture_logs(|| category_type("食品"));
+        let CategoryType::Unreadable(why) = got else {
+            panic!("这一列查不动时必须交 Unreadable，实得 {got:?}");
+        };
+        assert!(
+            why.contains("no such column"),
+            "原因里要留着 SQLite 的原始说法，否则没法对着日志查: {why}"
+        );
+        assert!(
+            logs.iter().any(|l| l.contains("读不出来")),
+            "这一臂同样要出声: {logs:?}"
+        );
+
+        // —— 这一轮答不上来：库那个位置被占成目录 ⇒ Unreadable 并出声 ——
+        let _blocked = crate::paths::test_app_dir("cat_type_blocked");
+        std::fs::create_dir_all(db_path()).expect("把库的位置做成一个目录");
+        let (got, logs) = crate::logger::capture_logs(|| category_type("食品"));
+        let CategoryType::Unreadable(why) = got else {
+            panic!("库打不开必须交出原因并归到 Unreadable，实得 {got:?}");
+        };
+        assert!(!why.is_empty(), "原因不许是空串，否则日志里等于没说: {why}");
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("读不出来") && l.contains("记账库打不开")),
+            "这一轮的错要出声，而且要说清是打不开导致的读不出来: {logs:?}"
+        );
+
+        // 形状腿：宿主给插件的那条通道必须把原因一起交出去（只回一个字符串就等于又折一次）
+        let src = include_str!("plugins/host.rs");
+        let at = src
+            .find("let acc_cat_type = lua.create_function")
+            .expect("accounting_category_type 的注册处找不到了（判据要跟着改）");
+        let body = &src[at..at + src[at..].find("})?;").expect("这个注册块切不出来")];
+        assert!(
+            body.contains("Unreadable(why) => (String::new(), why)"),
+            "读不出来的那条必须把原因放进第二个返回值，插件才有两种结局可分"
+        );
+        assert_eq!(
+            body.matches("accounting::CategoryType::").count(),
+            3,
+            "三种结局各有一条映射，少一条就是又被折起来了"
+        );
     }
 
     /// 「距今多久」答不上来时要说是**哪一条、为什么**，不许一行都不拼。
@@ -3221,7 +3366,7 @@ mod tests {
             "重名不能回一个已存在记录的 id"
         );
         // 原来的那条不能被这次"添加"改掉
-        assert_eq!(category_type("食品").as_deref(), Some("expense"));
+        assert_eq!(ctype_of("食品"), "expense", "重名那次传的 income 不该落库");
         assert!(
             get_subcategories("食品").is_empty(),
             "重名那次传的 subs 不该落库"

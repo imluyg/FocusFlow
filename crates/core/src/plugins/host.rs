@@ -632,10 +632,21 @@ pub fn register_host_api(
             String::new()
         } else if trimmed.is_empty() {
             "分类名不能是空的（也别只打空格）".to_string()
-        } else if accounting::category_type(trimmed).is_some() {
-            format!("分类 [{trimmed}] 已经存在，要改类型请用「修改分类」")
         } else {
-            "记账库没打开或写入失败（详见日志）".to_string()
+            // 这一问只是给"为什么没写进去"挑话说法，本身不改变结果：
+            // 读不出来的时候**两种说法都不许说** —— 既不能说"已经存在"（那是假的可能让人去改类型），
+            // 也不能把原因全推给"写入失败"而不交代这一轮连查重都没做成。
+            match accounting::category_type(trimmed) {
+                accounting::CategoryType::Value(_) => {
+                    format!("分类 [{trimmed}] 已经存在，要改类型请用「修改分类」")
+                }
+                accounting::CategoryType::Absent => {
+                    "记账库没打开或写入失败（详见日志）".to_string()
+                }
+                accounting::CategoryType::Unreadable(why) => {
+                    format!("写入失败，而这一轮说不出它是否已存在：{why}")
+                }
+            }
         };
         Ok((id, msg))
     })?;
@@ -661,7 +672,10 @@ pub fn register_host_api(
     })?;
     host.set("accounting_category_delete", acc_cat_del)?;
 
-    // 查询分类类型（expense/income/both），无则空串。
+    // 查询分类类型（expense/income/both），返回 `(类型, 没答上的原因)`：
+    // 原样只回一个字符串时，「这个分类没设类型」与「这一轮读不出来」在插件里是同一个空串，
+    // 分类表那一格于是被印成「双向」，而「修改分类」弹窗会留着上一个分类的类型显示、
+    // 用户按保存就把旧值写进去。第二个值空串 = 这一轮答上了。
     //
     // 注意：这里曾同时注册过一个「修改分类类型」的同名写接口，被本块覆盖成
     // 不可达死代码 —— 而 Lua 插件按注释把它当读接口用（返回值是类型字符串，
@@ -672,7 +686,11 @@ pub fn register_host_api(
     // Connection::open —— 库文件不存在时会顺手建出一个没有任何表的空库。
     let acc_cat_type = lua.create_function(|_, name: String| {
         ensure_accounting_db();
-        Ok(accounting::category_type(&name).unwrap_or_default())
+        Ok(match accounting::category_type(&name) {
+            accounting::CategoryType::Value(v) => (v, String::new()),
+            accounting::CategoryType::Absent => (String::new(), String::new()),
+            accounting::CategoryType::Unreadable(why) => (String::new(), why),
+        })
     })?;
     host.set("accounting_category_type", acc_cat_type)?;
 

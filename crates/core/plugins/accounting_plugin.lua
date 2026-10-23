@@ -38,6 +38,9 @@ local manage_open = false
 local m_cat = ""
 local m_name = "" -- 添加/重命名分类名
 local m_type = "both"
+-- 「修改分类」弹窗里这一轮没能读出这个分类的类型。true 时下拉里显示的是默认值，
+-- 保存必须只改名（第三个参数传空串 = 保持原类型），不许把那个我们不知道的值写回去。
+local m_type_unknown = false
 local m_sub_name = "" -- 添加/重命名子分类名
 local m_edit_old = "" -- 编辑中的原分类名
 local m_edit_open = false -- 分类编辑小弹窗
@@ -73,6 +76,8 @@ local function reset_transient_state()
     m_sub_name = ""
     m_edit_old = ""
     m_edit_open = false
+    -- 面板关了再开，"这一轮没读出类型"不许还挂着：挂着的话下一次保存会静默不改类型
+    m_type_unknown = false
     m_sub_edit_old = ""
     m_sub_edit_open = false
 end
@@ -520,8 +525,19 @@ function on_action(id)
         if name == "" then return end
         m_edit_old = name
         m_name = name
-        local t = focusflow.accounting_category_type(name)
-        if t ~= "" then m_type = t end
+        local t, why = focusflow.accounting_category_type(name)
+        -- 第二个值是"这一轮到底答没答上"（宿主返回 (类型, 原因)）。旧写法只取第一个值：
+        -- 读不出来时它是空串，`if t ~= ""` 不成立 ⇒ 下拉留着**上一个分类**的类型显示，
+        -- 而用户按保存就把那个旧值写进了这个分类 —— 一句错都没报。
+        m_type_unknown = why ~= nil and why ~= ""
+        if m_type_unknown then
+            m_type = "both"
+            result_text = "分类 [" .. name
+                .. "] 的类型这一轮读不出来：" .. why
+                .. "；下拉里是默认值，保存只改名、不动类型"
+        elseif t ~= "" then
+            m_type = t
+        end
         m_edit_open = true
     elseif id:match("^m_del_cat_sel") then
         local name = id:sub(14)
@@ -560,13 +576,18 @@ function on_action(id)
             result_text = "分类名不能是空的（也别只打空格）"
             return
         end
-        local ok, msg = focusflow.accounting_category_rename(m_edit_old, m_name, m_type)
-        result_text = (ok and "分类已更新为 [" .. m_name .. "]") or ("更新失败：" .. tostring(msg))
-        m_edit_open = false; m_edit_old = ""
+        -- 类型这一轮没读出来 ⇒ 第三个参数传空串，宿主那侧对空串的解释是"保持原类型"，
+        -- 于是改名照常做，而那个我们并不知道的旧值不会被写进这个分类。
+        local ctype = m_type_unknown and "" or m_type
+        local ok, msg = focusflow.accounting_category_rename(m_edit_old, m_name, ctype)
+        result_text = (ok and ("分类已更新为 [" .. m_name .. "]"
+            .. (m_type_unknown and "（类型没动：这一轮没读出来）" or "")))
+            or ("更新失败：" .. tostring(msg))
+        m_edit_open = false; m_edit_old = ""; m_type_unknown = false
         if ok then m_cat = m_name; m_name = "" end
         reset_stale_filters()
     elseif id == "m_cancel_edit_cat" then
-        m_edit_open = false; m_edit_old = ""
+        m_edit_open = false; m_edit_old = ""; m_type_unknown = false
     elseif id == "m_add_sub" then
         if m_cat == "" then
             result_text = "请先在左侧分类列表点击选中一个分类"
@@ -612,7 +633,11 @@ function set_field(field, value)
     elseif field == "profit_cat" then profit_cat = value
     elseif field == "m_cat" then m_cat = value
     elseif field == "m_name" then m_name = value
-    elseif field == "m_type" then m_type = value
+    elseif field == "m_type" then
+        m_type = value
+        -- 用户在这个下拉里挑过一次，这一格就不再是"我们不知道的值"了：
+        -- 保存要按他挑的写（不设这条，读不出来那一轮就永远改不了类型）
+        m_type_unknown = false
     elseif field == "m_sub_name" then m_sub_name = value
     end
 end
@@ -812,8 +837,15 @@ function get_view()
         local cat_rows = {}
         local cat_ids = {}
         for _, c in ipairs(all_cats) do
-            local t = focusflow.accounting_category_type(c)
-            local tlabel = t == "income" and "收入" or (t == "expense" and "支出" or "双向")
+            local t, why = focusflow.accounting_category_type(c)
+            local tlabel
+            if why ~= nil and why ~= "" then
+                -- 读不出来时不许印成「双向」：那一格与"库里真没设类型"长得一模一样，
+                -- 而用户会照着这个假读数去判断这个分类的钱算收入还是支出
+                tlabel = "读不出来"
+            else
+                tlabel = t == "income" and "收入" or (t == "expense" and "支出" or "双向")
+            end
             cat_rows[#cat_rows + 1] = { c, tlabel }
             cat_ids[#cat_ids + 1] = c
         end

@@ -863,8 +863,8 @@ mod tests {
         );
         // 那次"添加"不能把已有分类的类型改掉
         assert_eq!(
-            focusflow_core::accounting::category_type("宠物").as_deref(),
-            Some("expense"),
+            focusflow_core::accounting::category_type("宠物"),
+            focusflow_core::accounting::CategoryType::Value("expense".to_string()),
             "重名那次传的 income 不该落库"
         );
 
@@ -2156,6 +2156,92 @@ mod tests {
         assert!(
             !said2.contains("会算进「今日完成」"),
             "什么都没落库时不许说算进今日完成: {said2}"
+        );
+    }
+
+    /// 插件这一头必须把"类型读不出来"与"库里没设类型"当两件事。
+    ///
+    /// 宿主这条通道原先只回一个字符串：`None` 被印成空串，于是分类表里那一格画「双向」
+    /// （与"真没设类型"一模一样），而「修改分类」弹窗在拿不到类型时**留着上一个分类的类型**
+    /// 显示 —— 用户按保存就把那个旧值写进了这个分类，一句错都不报。
+    /// 弹窗里没有可放"这一格没读出来"的位置（`modal_form` 只有 fields），只能按文本形状钉。
+    #[test]
+    fn the_category_type_channel_keeps_unreadable_and_unset_apart() {
+        let src = include_str!("../plugins/accounting_plugin.lua");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 两个调用点都要接住第二个返回值（原因）
+        assert_eq!(
+            code.matches("local t, why = focusflow.accounting_category_type(")
+                .count(),
+            2,
+            "两处调用（分类表那一列、打开修改弹窗）都要接住原因，少一处就有一处把它折回空串"
+        );
+        assert!(
+            !code.contains("local t = focusflow.accounting_category_type("),
+            "又有一处只取第一个返回值了"
+        );
+
+        // 分类表：读不出来不许画成「双向」
+        let table_at = code
+            .find("tlabel = \"读不出来\"")
+            .expect("分类表那一列没有\"读不出来\"这种画法");
+        let both_at = code
+            .find("or \"双向\"")
+            .expect("类型标签的默认画法找不到了");
+        assert!(table_at < both_at, "读不出来必须在「双向」之前被拦住");
+
+        // 打开弹窗：读不出来时把标志立起来，并给出一句话
+        let open_at = code
+            .find("m_edit_cat_sel")
+            .expect("打开修改弹窗那条动作找不到了");
+        let open_body = &code[open_at..open_at + 1200];
+        assert!(
+            open_body.contains("m_type_unknown = why ~= nil and why ~= \"\""),
+            "打开弹窗时没接住\"这一轮答没答上\""
+        );
+
+        // 保存：标志还在 ⇒ 第三个参数传空串（宿主解释为"保持原类型"），旧值不许被写进去
+        let save_at = code
+            .find("m_save_edit_cat")
+            .expect("保存修改那条动作找不到了");
+        let save_body = &code[save_at..save_at + 1200];
+        assert!(
+            save_body.contains("local ctype = m_type_unknown and \"\" or m_type"),
+            "保存时还在用下拉里显示的那个值 —— 读不出来时它是上一个分类留下的"
+        );
+        assert!(
+            save_body.contains("accounting_category_rename(m_edit_old, m_name, ctype)"),
+            "重命名要走 ctype 这一份，不许绕回 m_type"
+        );
+
+        // 用户在弹窗里挑过一次 ⇒ 这一格不再是"不知道的值"（否则类型永远改不了）
+        let field_at = code
+            .find("elseif field == \"m_type\" then")
+            .expect("m_type 的回写入口找不到了");
+        let field_body = &code[field_at..field_at + 400];
+        assert!(
+            field_body.contains("m_type_unknown = false"),
+            "用户挑过类型之后必须撤销\"没读出来\"的标志，不然这个分类从此改不了类型"
+        );
+        // 面板关闭也要清掉这个标志（`reset_transient_state` 列的就是这批一次性状态）：
+        // 挂着它，下一次开面板保存会静默不改类型，而屏幕上一个字都没提。
+        let reset_at = code
+            .find("local function reset_transient_state")
+            .expect("面板关闭时清一次性状态那段找不到了");
+        let reset_body = &code[reset_at..reset_at + 700];
+        assert!(
+            reset_body.contains("m_type_unknown = false"),
+            "关面板没把这个标志清掉 ⇒ 它会漏到下一次会话"
+        );
+        assert_eq!(
+            code.matches("m_type_unknown = false").count(),
+            5,
+            "声明一次 + 保存清 + 取消清 + 关面板清 + 用户挑时撤销，多一处少一处都要查"
         );
     }
 }
