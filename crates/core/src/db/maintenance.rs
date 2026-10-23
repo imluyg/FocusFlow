@@ -1742,7 +1742,15 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
     // 毫秒精度：即使锁被绕过，同秒内的两次备份也不会撞同一个文件名
     let timestamp = Local::now().format("%Y%m%d_%H%M%S%3f").to_string();
     // 异常体检基线：本轮之前最新的一份年度库备份（用于对比体量）
-    let baseline_path = newest_backup_of_group(&chrono::Local::now().year().to_string());
+    let baseline_group = chrono::Local::now().year().to_string();
+    let baseline_path = match newest_backup_of_group(&baseline_group) {
+        Ok(path) => path,
+        // 这不是"还没有上一份"，是这一问没答上来：体检这一轮不比总量，就得说出来
+        Err(e) => {
+            tracing::warn!("异常体检没有比对对象：{e} —— 本轮不做总量对比，下次备份再试");
+            None
+        }
+    };
     let baseline_fp = match baseline_path.as_deref().map(probe_backup_fingerprint) {
         Some(BackupProbe::Read(fp)) => Some(fp),
         Some(BackupProbe::Unreadable(reason)) => {
@@ -2156,8 +2164,15 @@ enum BackupProbe {
 }
 
 fn probe_backup_fingerprint(path: &Path) -> BackupProbe {
-    if !path.exists() {
-        return BackupProbe::Absent;
+    // 与清扫共用那一把三态尺子：`Absent` 只在**确认没有**这一份时才允许安静跳过。
+    // 原先的 `!path.exists()` 把"这一刻问不出"也交成 Absent ⇒ 调用方按"首轮备份"处理，
+    // 异常体检整轮没跑而一个字不说（`Unreadable` 那一支本来就会 warn）。
+    match backup_main_presence(path) {
+        connection::Presence::No => return BackupProbe::Absent,
+        connection::Presence::Unreadable(reason) => {
+            return BackupProbe::Unreadable(format!("问不出这份备份在不在: {reason}"))
+        }
+        connection::Presence::Yes => {}
     }
     let conn = match Connection::open_with_flags(
         path,
@@ -2324,20 +2339,32 @@ fn year_db_needs_backup(year: i32, current: Option<(i64, i128)>) -> bool {
         // 源库状态读不到（刚被删/权限异常）：保守备份
         return true;
     };
-    match newest_backup_of_group(&year.to_string())
-        .as_deref()
-        .and_then(backup_source_fingerprint)
-    {
+    let newest = match newest_backup_of_group(&year.to_string()) {
+        Ok(path) => path,
+        // 问不出这一组有没有备份 ⇒ 保守再备份一次：多备份一份只是开销，跳过一年是损失。
+        // （目录读不动时那一年的备份本身也会失败并出声，这里不重复喊）
+        Err(_) => return true,
+    };
+    match newest.as_deref().and_then(backup_source_fingerprint) {
         Some(recorded) => recorded != current,
         None => true,
     }
 }
 
 /// 某分组（年份 / 插件名）中最新的一份备份。
-fn newest_backup_of_group(group: &str) -> Option<std::path::PathBuf> {
+///
+/// `Ok(None)` 与 `Err` 是两件事实，原先都折成同一个 `None`：这一组确实还没有备份
+/// （首轮备份，该安静）／**备份目录这一问没答上来**（`backup` 那个位置被同步盘换成同名
+/// 文件、移动盘刚休眠、目录被杀软握着）。后者被读成前者 ⇒ 异常体检整轮没有比对对象，
+/// 而"已备份 N 个数据库"照打，骤降那道闸静默失效一轮又一轮。
+fn newest_backup_of_group(group: &str) -> Result<Option<std::path::PathBuf>, String> {
     let prefix = format!("focusflow_{group}_");
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(paths::backup_dir())
-        .ok()?
+    let dir = paths::backup_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => return Err(format!("备份目录读不出来（{}）: {e}", dir.display())),
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
@@ -2351,7 +2378,7 @@ fn newest_backup_of_group(group: &str) -> Option<std::path::PathBuf> {
         .collect();
     // 与轮转共用一把尺子：mtime 打平时靠文件名认最新
     sort_backups_newest_first(&mut files);
-    files.first().cloned()
+    Ok(files.first().cloned())
 }
 
 /// 保留策略：最近 N 份 + 每天/每周/每月各一份。
@@ -3495,6 +3522,117 @@ mod tests {
         }
     }
 
+    /// 「备份目录问不出」与「这一组还没有备份」是两件事。
+    ///
+    /// 旧写法 `read_dir(...).ok()?` 把两者折成同一个 `None`，而调用方拿 `None` 就按
+    /// "首轮备份"静默跳过异常体检 —— 骤降那道闸整轮不跑，日志照打"已备份 N 个数据库"。
+    /// 三条腿：目录读不动 ⇒ Err 带原因；目录能读而这一组是空的 ⇒ Ok(None)；放了备份 ⇒ Ok(Some)。
+    #[test]
+    fn an_unreadable_backup_dir_is_not_reported_as_having_no_backups() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("baseline_dir_unreadable");
+        let dir = paths::backup_dir();
+        let _ = std::fs::remove_dir(&dir);
+        std::fs::write(&dir, b"junk").expect("把 backup 那个位置做成同名文件");
+
+        let got = newest_backup_of_group("2026");
+        let Err(e) = &got else {
+            panic!("目录读不动时要交回 Err（问不出≠没有），实得 {got:?}");
+        };
+        assert!(e.contains("备份目录读不出来"), "要说清是哪一问没答上: {e}");
+
+        // 对照腿：撤掉占位 ⇒ 目录读得动，只是这一组还没有备份
+        std::fs::remove_file(&dir).expect("撤掉占位文件");
+        assert_eq!(
+            newest_backup_of_group("2026").expect("备份目录读得动"),
+            None,
+            "这一组确实还没有备份 = Ok(None)（首轮备份该安静）"
+        );
+
+        // 第三条腿：有了就要挑出那一份
+        std::fs::create_dir_all(&dir).expect("重建备份目录");
+        let one = dir.join("focusflow_2026_20260101_000000.db");
+        std::fs::write(&one, b"x").expect("放一份备份");
+        assert_eq!(
+            newest_backup_of_group("2026")
+                .expect("备份目录读得动")
+                .as_deref(),
+            Some(one.as_path()),
+            "读得动就要交出最新那一份"
+        );
+    }
+
+    /// 备份那一轮要把"体检没跑成"说出来，而首轮仍要安静。
+    ///
+    /// 消费侧的腿：只改 `newest_backup_of_group` 的返回值不够 —— 调用方若把 Err 与 Ok(None)
+    /// 又汇成同一个 `None`，这一问照样白问。两条腿各钉一头。
+    #[test]
+    fn the_backup_round_says_when_the_anomaly_check_has_nothing_to_compare() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("baseline_says_so");
+        let year = chrono::Local::now().year();
+        {
+            let path = paths::year_db_path(year);
+            let conn = connection::open_rw(&path).expect("建当年库");
+            connection::ensure_schema(&conn, year).expect("建表");
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 3)",
+                [queries::day_key_of_date(chrono::Local::now().date_naive())],
+            )
+            .expect("插一行聚合");
+            drop(conn);
+        }
+        queries::invalidate_years_cache();
+
+        // ① 备份目录问不出 ⇒ 这一轮要比总量，就得承认它没有比对对象
+        let dir = paths::backup_dir();
+        let _ = std::fs::remove_dir(&dir);
+        std::fs::write(&dir, b"junk").expect("把 backup 那个位置做成同名文件");
+        let (_, logs) = crate::logger::capture_logs(|| backup_database(5));
+        assert!(
+            logs.iter().any(|l| l.contains("异常体检没有比对对象")),
+            "目录问不出时要说出体检没跑，实得 {logs:?}"
+        );
+
+        // ② 对照腿：目录读得动、而这一组还没有备份 ⇒ 首轮本来就没得比，该安静
+        std::fs::remove_file(&dir).expect("撤掉占位文件");
+        std::fs::create_dir_all(&dir).expect("重建备份目录");
+        let (_, logs2) = crate::logger::capture_logs(|| backup_database(5));
+        assert!(
+            !logs2.iter().any(|l| l.contains("异常体检没有比对对象")),
+            "首轮备份不该喊「没有比对对象」，实得 {logs2:?}"
+        );
+    }
+
+    /// 备份文件**被别的程序握着**时，体检要说"问不出"，不许当成"没有上一份"。
+    #[cfg(windows)]
+    #[test]
+    fn a_held_baseline_backup_is_not_told_as_absent() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("baseline_held");
+        let dir = paths::backup_dir();
+        std::fs::create_dir_all(&dir).expect("建备份目录");
+        let prev = dir.join("focusflow_2026_20260101_000000.db");
+        std::fs::write(&prev, b"x").expect("写上一份备份");
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&prev)
+            .expect("占位句柄应能打开");
+        assert!(
+            std::fs::File::open(&prev).is_err(),
+            "夹具没成立：这个句柄没挡住读，测不到「问不出」那一支"
+        );
+        match probe_backup_fingerprint(&prev) {
+            BackupProbe::Unreadable(reason) => assert!(
+                reason.contains("问不出这份备份在不在"),
+                "要带上是哪一问没答上: {reason}"
+            ),
+            other => panic!("被握着的备份不许被折成「没有可比的那份」: {other:?}"),
+        }
+    }
+
     /// 「该删的备份删不掉」要交出原因 —— 在这台机器上它是常态而不是意外。
     ///
     /// 上层拿它出声：坏备份站着会被下一轮当成"最新那一份"，旧名额也被它占着，
@@ -3777,6 +3915,7 @@ mod tests {
         );
 
         let picked = newest_backup_of_group("2026")
+            .expect("备份目录读得动")
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
         assert_eq!(
             picked.as_deref(),
@@ -4054,7 +4193,12 @@ mod tests {
         let body = std::fs::read_to_string(&snaps[0]).unwrap();
         assert!(body.contains("手柄"), "快照内容就是别名表本身: {body}");
         // 库的分组查找不能把 json 认成备份
-        assert!(newest_backup_of_group("aliases").is_none());
+        assert!(
+            newest_backup_of_group("aliases")
+                .expect("备份目录读得动")
+                .is_none(),
+            "别名快照不是库的备份，也不该被当成「问不出」"
+        );
         crate::device_alias::invalidate_cache();
     }
 
