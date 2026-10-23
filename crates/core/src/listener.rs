@@ -422,6 +422,23 @@ impl InputListener {
         self.cfg.reload(self.config);
     }
 
+    /// 「现在真正生效的那几个开关」—— 从热路径读的那份快照里取，不再现读配置。
+    ///
+    /// 这三个原子才是每次按键与滚轮真正查的东西（`is_new_press` 的长按判定、
+    /// 滚轮突发窗口、修饰键与功能键的过滤），而 `config` 是"内存/盘上写着什么"。
+    /// 两者在 `refresh_config()` 之前**可以不一致** —— 那句启动日志原先现读 `config`，
+    /// 于是它可能报出一组热路径根本没在用的值。这台机器上 `logs/` 是唯一的诊断渠道，
+    /// 一条与现场不符的日志比没有日志更坏（同"校验不许说出没做过的检查"那条口径）。
+    fn effective_switches(cfg: &ListenerCfg) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        format!(
+            "键鼠监听已启动 (ignore_modifiers={}, ignore_functions={}, mouse_enabled={})",
+            cfg.ignore_modifiers.load(Relaxed),
+            cfg.ignore_functions.load(Relaxed),
+            cfg.mouse_enabled.load(Relaxed),
+        )
+    }
+
     /// 注册输入回调（每个有效键鼠事件触发一次）。
     pub fn add_key_callback(&self, cb: Arc<dyn Fn(&str) + Send + Sync>) {
         self.key_callbacks
@@ -674,14 +691,7 @@ impl InputListener {
             })?;
         *alive = true;
         drop(alive);
-        tracing::info!(
-            "键鼠监听已启动 (ignore_modifiers={}, ignore_functions={}, mouse_enabled={})",
-            self.config
-                .get_bool("listener", "ignore_modifier_keys", false),
-            self.config
-                .get_bool("listener", "ignore_function_keys", false),
-            self.config.get_bool("listener", "mouse_enabled", true),
-        );
+        tracing::info!("{}", Self::effective_switches(&self.cfg));
         Ok(())
     }
 
@@ -762,6 +772,68 @@ mod tests {
         Box::leak(Box::new(
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
         ))
+    }
+
+    /// 启动日志要说的是"热路径现在按哪套开关跑"，不是"配置里写着什么"。
+    ///
+    /// 那句 info 原先现读 `config.get_bool`，而这三个原子才是每次按键与滚轮真正查的；
+    /// `refresh_config()` 之前两者可以不一致 ⇒ 日志报出一组现场根本没在用的值。
+    /// 这台机器上 `logs/` 是唯一诊断渠道，一条与现场不符的日志比没有日志更坏。
+    #[test]
+    fn the_startup_line_names_the_switches_the_hot_path_actually_uses() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/ff_listener_startup.ini");
+        std::fs::write(
+            &path,
+            "[listener]\nmouse_enabled = false\nignore_modifier_keys = false\n\
+             ignore_function_keys = false\n",
+        )
+        .unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+        let snap = ListenerCfg::default();
+        snap.reload(&cfg);
+
+        // 配置被改了、但快照还没 refresh：这一刻现场仍然是 false
+        cfg.set("listener", "mouse_enabled", "true").unwrap();
+        cfg.set("listener", "ignore_function_keys", "true").unwrap();
+        let line = InputListener::effective_switches(&snap);
+        assert!(
+            line.contains("mouse_enabled=false") && line.contains("ignore_functions=false"),
+            "日志要跟着现场那份快照，不许报配置里刚写下的新值: {line}"
+        );
+
+        // refresh 之后两者一致了，那句才跟着变 —— 这条腿证明它不是恒说 false 的空话
+        snap.reload(&cfg);
+        let line = InputListener::effective_switches(&snap);
+        assert!(
+            line.contains("mouse_enabled=true") && line.contains("ignore_functions=true"),
+            "快照跟上之后要说出现场真正生效的值: {line}"
+        );
+        // 三个字段各自的配对：只断"值在不在句子里"会被张冠李戴混过去
+        // （这一句里 `ignore_modifier_keys` 始终是配置里那个 false）
+        assert!(
+            line.contains("ignore_modifiers=false"),
+            "修饰键过滤没开就该说 false，字段不许串位: {line}"
+        );
+
+        // 形状腿：`start()` 里那句日志不许再自己去问 config
+        let src = include_str!("listener.rs");
+        let prod = &src[..src
+            .find("\nmod tests {")
+            .or_else(|| src.find("#[cfg(test)]"))
+            .expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn start(self: &Arc<Self>")
+            .expect("start 找不到了（判据要跟着改）");
+        let body = &prod[at..at + prod[at..].find("\n    }").expect("方法体切不出来")];
+        assert!(
+            body.contains("effective_switches(&self.cfg)"),
+            "启动那句必须取自热路径那份快照"
+        );
+        assert!(
+            !body.contains("get_bool"),
+            "start() 又在日志里现读配置了 —— 那报出来的可能不是现场值"
+        );
     }
 
     /// `[listener] key_repeat_stale_seconds = inf` 这一句手写配置，改之前会让
