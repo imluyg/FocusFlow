@@ -121,19 +121,47 @@ pub fn try_available_years() -> anyhow::Result<Vec<i32>> {
     Ok(years)
 }
 
+/// 年度库文件**在不在**，只许回答三态：在、确认不在、说不出（把错误交回调用方）。
+///
+/// 立这一条是因为 `Path::exists()` 对任何一次 stat 失败都回 `false`，于是"父目录所在的
+/// 移动盘刚休眠"、"杀软首扫握着句柄"这类情况全被读成「那一年没有库」。在 `get_daily_counts`
+/// 里，那一年每天都是 0，而日志一个字没有 —— 同一页上「今日」卡片还是真数。
+/// 判据与 `data_location::is_confirmed_absent`、`unopenable_years` 一致：只有 `NotFound`
+/// 算确认没有。
+///
+/// 本机实测（写在用例里）：路径的**父那一格是普通文件**时报的是 `ERROR_PATH_NOT_FOUND`
+/// （⇒ NotFound ⇒ 按"没有"处理），所以那种形状不落在「说不出」这一支；`data` 位置被换成
+/// 文件另有 `paths::ensure_dir` 的日志负责。
+fn year_db_presence(path: &std::path::Path) -> Result<bool, std::io::Error> {
+    classify_stat(std::fs::metadata(path))
+}
+
+/// `year_db_presence` 的判据部分（不经系统调用就能钉）。
+fn classify_stat(stat: Result<std::fs::Metadata, std::io::Error>) -> Result<bool, std::io::Error> {
+    match stat {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// 这批年度库里有哪些**读不动**。
 ///
 /// 「文件本来不存在」不算读不动：首启那一年还没建库，`get_daily_counts` 对它交回全零是正确答案。
-/// 但"stat 说不准"与"打不开"都算 —— 这两种情况下那一年少掉的计数会被界面读成"那几年没输入"。
+/// 除此之外（确认在、以及 stat 说不出在不在）都去真开一次，**以开不开得起来定论** ——
+/// 而不是把"stat 失败"直接当成读不动：那会让一道每 60 秒问一次的闸在数据其实读得出来的
+/// 那一轮也拦下来。要说清的是这一句，不是"stat 失败也算读不动"。
 fn unopenable_years(years: &[i32]) -> Vec<i32> {
     years
         .iter()
         .copied()
         .filter(|y| {
             let path = paths::year_db_path(*y);
-            match std::fs::metadata(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                _ => connection::open_ro(&path).is_err(),
+            match year_db_presence(&path) {
+                Ok(false) => false,
+                // 确认在、以及"说不出在不在"，都去问一次真能不能打开（后者不预设结论）：
+                // 这一支与 `Ok(true)` 同路是**刻意保持原口径**，别在这里顺手改成"当打不开"。
+                Ok(true) | Err(_) => connection::open_ro(&path).is_err(),
             }
         })
         .collect()
@@ -656,8 +684,22 @@ pub fn get_daily_counts(days: i64, year: Option<i32>) -> Vec<(String, i64)> {
 
     for y in &years_to_query {
         let path = paths::year_db_path(*y);
-        if !path.exists() {
-            continue;
+        match year_db_presence(&path) {
+            // 没有这一年的库文件是**正常答案**（那年没数据、或全新安装）：安静跳过，
+            // 那些天留在初始化好的 0 上。
+            Ok(false) => continue,
+            Ok(true) => {}
+            // 说不出在不在（父目录在休眠的移动盘上、`data` 那个位置被换成普通文件、
+            // 杀软首扫握着句柄）：过去 `path.exists()` 把这一支和上面那支并成同一句"没有"，
+            // 于是那一年每天都是 0、日志一个字没有，而同一页上「今日」卡片还是真数。
+            Err(e) => {
+                tracing::error!(
+                    "说不出 {y} 年的库在不在（{}）：{e} —— 这一次这一年不进每日计数，\
+                     但那不是「那一年没有数据」",
+                    path.display()
+                );
+                continue;
+            }
         }
         let year_result = connection::with_ro_conn(&path, |conn| -> rusqlite::Result<()> {
             if !table_exists(conn, "daily_counts") {
@@ -1958,6 +2000,103 @@ mod tests {
         assert!(
             available_years().contains(&2033),
             "损坏的年度库应按「有数据」保守处理"
+        );
+    }
+
+    /// 「这一年的库在不在」必须能说出"我不知道"。
+    ///
+    /// `Path::exists()` 把任何一次 stat 失败都答成"没有"，而 `get_daily_counts` 对"没有"
+    /// 的做法是安静地跳过那一年 —— 于是休眠的移动盘、被同步盘换成普通文件的 `data`、
+    /// 杀软首扫，全都被读成「那几年我没打字」，日志零字，而同一页上「今日」卡片还是真数。
+    /// 这个 helper 按路径问（不收 `&self`），所以三态都能直接钉，不用碰进程全局。
+    #[test]
+    fn the_year_db_presence_question_can_also_say_it_cannot_tell() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let tmp = crate::paths::test_app_dir("year_presence");
+        let present = tmp.path().join("focusflow_2026.db");
+        std::fs::write(&present, b"whatever").expect("写一个存在的库文件");
+        let absent = tmp.path().join("focusflow_1999.db");
+
+        assert!(year_db_presence(&present).unwrap(), "在就是在");
+        assert!(
+            !year_db_presence(&absent).unwrap(),
+            "确认没有（NotFound）才是「那一年没有库」"
+        );
+        // 目录也算"在"：它会在后面真开一次连接时失败，那条路上有自己的日志
+        // （`每日计数查询失败`），不该在这里被折成"没有"。
+        let dir = tmp.path().join("focusflow_2027.db");
+        std::fs::create_dir_all(&dir).expect("把某年的库位置做成目录");
+        assert!(year_db_presence(&dir).unwrap(), "是个目录也不能说成没有");
+
+        // 实测那一支：**`data` 被换成普通文件时，这台 Windows 的 stat 报的是 NotFound**，
+        // 所以它落在「确认没有」而不是「说不出」。上一版用例假设它报"不是目录"，跑出来是
+        // `Ok(false)` —— 判据要按量出来的写。（上游 `paths::ensure_dir` 在那个位置建不成
+        // 目录时另有它自己的 error 日志，见 bc86445 那轮。）
+        let plain = tmp.path().join("focusflow_2028.db");
+        std::fs::write(&plain, b"not a folder").unwrap();
+        let nested = plain.join("focusflow_2029.db");
+        assert!(
+            !year_db_presence(&nested).unwrap(),
+            "父是普通文件在本机的读法是 NotFound ⇒ 按「没有」处理"
+        );
+
+        // 判据表：哪些码算"确认没有"、哪些算"说不出"。
+        // ⚠ 这一臂在无头环境里造不出**真实**的 stat 失败（要 ACL 拒绝或杀软握着句柄），
+        // 所以这里是按错误码钉映射规则，端到端那一半登记为眼验，不许写成"有用例守着"。
+        for code in [2, 3] {
+            // ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+            assert!(
+                matches!(
+                    classify_stat(Err(std::io::Error::from_raw_os_error(code))),
+                    Ok(false)
+                ),
+                "错误码 {code} 该算「确认没有」：全新安装与那年没数据都是这个形状"
+            );
+        }
+        for code in [5, 32, 267] {
+            // ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION / ERROR_DIRECTORY
+            let got = classify_stat(Err(std::io::Error::from_raw_os_error(code)));
+            let Err(e) = got else {
+                panic!("错误码 {code} 不许被折成「没有」，实得 {got:?}");
+            };
+            assert_ne!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "码 {code} 要落在「说不出」这一支"
+            );
+        }
+
+        // 形状腿：`get_daily_counts` 里那把 `exists()` 尺子不许回来，也不许把三态又折成 bool
+        let src = include_str!("queries.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn get_daily_counts(")
+            .expect("get_daily_counts 找不到了");
+        let raw = &prod[at..at + prod[at..].find("\n}").expect("函数体切不出来")];
+        // 先摘注释行：这一段自己的说明文字里就写着 `path.exists()`，带着它判"不许再用"
+        // 会红在该改的地方之外、绿在真正要防的地方之上。
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains(".exists()"),
+            "又用 exists() 猜在不在 —— 那次失败会被读成「那一年没有库」"
+        );
+        assert!(
+            body.contains("year_db_presence(&path)"),
+            "这一处必须问三态那把尺子"
+        );
+        assert!(
+            body.contains("不进每日计数"),
+            "说不出在不在那一支必须出声，而不是安静跳过"
+        );
+        // 共用一把尺子之后，闸那一头的口径不许被顺手改掉（本轮只是把两处并成一份判据，
+        // 没有改变"确认在/说不出都去真开一次"这件事）
+        assert!(
+            prod.contains("Ok(true) | Err(_) => connection::open_ro(&path).is_err()"),
+            "那道闸的口径变了要显式改这条判据，别顺手把「说不出」当成打不开"
         );
     }
 
