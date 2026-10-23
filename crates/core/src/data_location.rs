@@ -350,7 +350,11 @@ fn keep_aside(dst: &Path) -> anyhow::Result<Option<PathBuf>> {
 /// `Path::exists()` / `is_dir()` 把「查不动」（移动盘刚唤醒、杀软首扫、同步盘占位、
 /// 只读句柄挡着）折成「没有」，而这一步之后是**截断覆盖**。口径与
 /// `desktop/src/plugins.rs` 的 `FileState`、本仓库 `Presence` 那一条一致：三种结局分开。
-fn is_confirmed_absent(err: &std::io::Error) -> bool {
+///
+/// `pub(crate)` 之后本 crate 里问"在不在"的地方都共用这一句判据
+/// （`db::queries::classify_stat`、`edge_history::remove_temp_copy` 与
+/// `edge_history::get_edge_history_counts`）—— 这条规则原先在三个文件里各写了一遍。
+pub(crate) fn is_confirmed_absent(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::NotFound
 }
 

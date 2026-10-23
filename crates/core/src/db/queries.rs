@@ -140,7 +140,7 @@ fn year_db_presence(path: &std::path::Path) -> Result<bool, std::io::Error> {
 fn classify_stat(stat: Result<std::fs::Metadata, std::io::Error>) -> Result<bool, std::io::Error> {
     match stat {
         Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) if crate::data_location::is_confirmed_absent(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }

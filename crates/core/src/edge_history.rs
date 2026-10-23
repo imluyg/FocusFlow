@@ -92,12 +92,47 @@ fn temp_copy_path() -> PathBuf {
     ))
 }
 
-/// 删除副本及其 WAL/SHM 附属文件。
-fn remove_temp_copy(temp: &std::path::Path) {
-    let _ = std::fs::remove_file(temp);
+/// 删除副本及其 WAL/SHM 附属文件，回**删不动的那几份**（带系统原因）。
+///
+/// 副本里是明文浏览记录（URL、标题、时间）。正常路径每一轮兜底都走这里，而
+/// `cleanup_stale_copies_once` 一个进程只跑一次、门槛又是一小时 ⇒ 这一份此刻删不动时
+/// 没有任何机制会在本次运行里再扫它一遍，只能等下次启动 —— 原先三处 `let _ =`
+/// 让这件事在日志里一个字都没有。上面 `SweepReport` 那段立的规矩（"删不动"与"没得删"
+/// 必须分开说）当时只落了清扫那半边，正常路径这半边漏下了。
+///
+/// `NotFound` 不算删不动：那份本来就不在（复制没建成、或只建了主文件没有 sidecar），
+/// 把它报成"有一份清不掉"是让假警。
+fn remove_temp_copy(temp: &std::path::Path) -> Vec<String> {
+    let mut stuck: Vec<String> = Vec::new();
+    let mut discard = |path: &std::path::Path| {
+        if let Err(e) = std::fs::remove_file(path) {
+            if !crate::data_location::is_confirmed_absent(&e) {
+                stuck.push(format!("{}: {e}", path.display()));
+            }
+        }
+    };
+    discard(temp);
     for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(crate::data_location::with_suffix(temp, suffix));
+        discard(&crate::data_location::with_suffix(temp, suffix));
     }
+    stuck
+}
+
+/// 丢掉副本，并把"哪一份还留在临时目录里"说到日志上（清单原样交回，供用例数）。
+///
+/// 调用方是快照读取的三条出路（复制没成／查成功／查不动），每一条都不该因为
+/// "这只是收尾"就把话咽下去：这一刻留在 `%TEMP%` 里的那份文件比什么都可读。
+fn discard_temp_copy(temp: &std::path::Path) -> Vec<String> {
+    let stuck = remove_temp_copy(temp);
+    if !stuck.is_empty() {
+        tracing::warn!(
+            "有 {} 份 Edge 历史的明文副本删不掉（{}）—— 它会留在系统临时目录里，\
+             直到下一次启动的清扫（约一小时后才会再试一次）",
+            stuck.len(),
+            stuck.join("；")
+        );
+    }
+    stuck
 }
 
 /// 副本名里稳定的前缀，供启动时清扫识别。
@@ -127,7 +162,8 @@ struct SweepReport {
 
 /// 删除目录里老于 `max_age` 的 Edge 副本（含 `-wal`/`-shm`）。
 ///
-/// 为什么需要这一条：副本里是**明文浏览记录**，正常路径每次都 `remove_temp_copy`，
+/// 为什么需要这一条：副本里是**明文浏览记录**，正常路径每次都走 `discard_temp_copy`
+/// （它把删不动的那几份说到日志上），
 /// 但 release 是 `panic = "abort"`、被任务管理器直接杀也来不及删 —— 那份完整的
 /// History 就永久躺在 `%TEMP%`，谁都能读。`dir` 参数是为测试留的：单测扫自己的
 /// 临时目录，不去碰系统 `%TEMP%`。
@@ -249,7 +285,7 @@ fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
         // 缺 -wal 的副本不拿去做查询：那份历史会比真实值小，而补档写进本地缓存后
         // 历史日不会被再挑出来重查（见 `try_snapshot_copy` 的注释）。
         if let Err(e) = try_snapshot_copy(&path, &temp) {
-            remove_temp_copy(&temp);
+            discard_temp_copy(&temp);
             tracing::warn!(
                 "Edge 历史库快照不完整（第{}次）：{e} —— 不拿缺 WAL 的副本去查",
                 attempt + 1
@@ -260,11 +296,11 @@ fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
         if let Ok(conn) = Connection::open(&temp) {
             if let Some(v) = f(&conn) {
                 drop(conn);
-                remove_temp_copy(&temp);
+                discard_temp_copy(&temp);
                 return Some(v);
             }
         }
-        remove_temp_copy(&temp);
+        discard_temp_copy(&temp);
         tracing::debug!("Edge 历史库复制查询失败（第{}次），重试", attempt + 1);
         std::thread::sleep(std::time::Duration::from_millis(150));
     }
@@ -416,8 +452,19 @@ pub fn save_edge_history_count(target_date: NaiveDate, count: i64) -> Result<(),
 /// 读不动"在界面上长得一模一样（与上一场修掉的落盘假成功同族）。
 pub fn get_edge_history_counts(days: i64) -> Result<Vec<(String, i64)>, String> {
     let path = edge_db_path();
-    if !path.exists() {
-        return Ok(Vec::new());
+    // 上面自己写着"不能靠文件在不在判"，却先用 `exists()` 判了一次 —— 那一问有三件事，
+    // `exists()` 只能答两件：真没有这个缓存库、读得动、以及**这一次 stat 自己失败了**。
+    // 第三种被折成"没有"，界面上就是"从没刷过"（峰值 "—"），而不是"读不出来"；
+    // `open_local()` 会创建文件那条理由仍然成立，所以这里保留这一问，只把它问成三态。
+    match std::fs::metadata(&path) {
+        Ok(_) => {}
+        Err(e) if crate::data_location::is_confirmed_absent(&e) => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(format!(
+                "说不出本地 Edge 缓存库在不在（{}）: {e}",
+                path.display()
+            ))
+        }
     }
     let conn = open_local().map_err(|e| format!("打开本地缓存库失败: {e}"))?;
     // 「表还没建过」与「表在但这一窗没有行」都是真的没刷过，不是读不动 ——
@@ -996,6 +1043,106 @@ mod tests {
         try_snapshot_copy(&src2, &temp2).expect("-shm 失败不该毁掉整份快照");
         assert!(temp2.exists());
         remove_temp_copy(&temp2);
+    }
+
+    /// 本地缓存那一问也必须是三态：「说不出在不在」不许被读成"从没刷过"。
+    ///
+    /// 这个函数自己的注释就写着"不能靠文件在不在判"，而它第一句用的正是 `exists()`。
+    /// 界面后果：峰值显示 "—"、趋势图空白，读起来与"这个功能上线后一次都没刷过"一模一样，
+    /// 而真实原因是那次 stat 失败了 —— 插件因此不会去刷新，用户也等不到自愈。
+    #[test]
+    fn the_edge_cache_read_does_not_guess_from_file_existence() {
+        let _lock = crate::paths::test_app_dir_lock();
+        // 对照组：缓存库真的还不存在 ⇒ 空表（不是错误），这条不许被矫枉过正改掉
+        let app = crate::paths::test_app_dir("edge_cache_absent_ok");
+        let got = get_edge_history_counts(30).expect("没有缓存库是真答案，不是读不出来");
+        assert!(got.is_empty(), "全新那一份就该回空表，实得 {got:?}");
+        assert!(
+            !edge_db_path().exists(),
+            "夹具前提：这一路不该把缓存库创建出来: {}",
+            edge_db_path().display()
+        );
+        drop(app);
+
+        let src = include_str!("edge_history.rs");
+        // ⚠ 本文件的**生产代码里就有 `#[cfg(test)]`**（测试夹具那几处），
+        // 所以不能按第一次出现切：那会把整段生产代码切成第 20 行之前那一小截。
+        let prod = &src[..src.find("\nmod tests {").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn get_edge_history_counts(")
+            .expect("这个读函数找不到了（判据要跟着改）");
+        let raw = &prod[at..at + prod[at..].find("\n}").expect("函数体切不出来")];
+        // 先摘注释行：这段说明文字里就写着 `exists()` 与"文件在不在"
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains(".exists()"),
+            "又用 exists() 猜在不在 —— 第三种结局会被读成「从没刷过」"
+        );
+        assert!(
+            body.contains("is_confirmed_absent(&e)"),
+            "这一问必须走那把共用的三态尺子"
+        );
+        assert!(
+            body.contains("说不出本地 Edge 缓存库在不在"),
+            "说不出那一支要交 Err，让面板说得出为什么"
+        );
+    }
+
+    /// 明文副本删不掉时必须点名，而且"本来就没有"不许被报成"有一份清不掉"。
+    ///
+    /// 这条链自己的注释（`SweepReport` 那段）立的规矩是"删不动与没得删必须分开说"，
+    /// 当时只落了**启动清扫**那半边；正常路径每轮兜底都走这里，原先是三处 `let _ =`。
+    /// 而 `cleanup_stale_copies_once` 一个进程只跑一次、门槛又是一小时 ⇒ 此刻删不动的
+    /// 这份明文浏览记录，在本次运行里没有任何机制会再碰它 —— 日志还一个字没有。
+    #[test]
+    fn an_undeletable_plaintext_copy_is_named_not_swallowed() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("edge_temp_stuck");
+        let temp = app.path().join("snap_stuck.db");
+        let side = crate::data_location::with_suffix(&temp, "-wal");
+        std::fs::write(&temp, b"plaintext browsing history").unwrap();
+        std::fs::write(&side, b"wal").unwrap();
+
+        // 正向腿：返回值不是摆设 —— 两份都删得动时清单是空的，且 sidecar 一起带走
+        let stuck = remove_temp_copy(&temp);
+        assert!(stuck.is_empty(), "两份都该删动，实得 {stuck:?}");
+        assert!(
+            !temp.exists() && !side.exists(),
+            "清理必须把 sidecar 一起带走"
+        );
+
+        // 文件已经不在了 ⇒ 那是"没得删"，不许报成"有一份清不掉"（假警）
+        let stuck = remove_temp_copy(&temp);
+        assert!(stuck.is_empty(), "NotFound 不是删不动: {stuck:?}");
+
+        // 真删不动：只放行读的句柄握着它（std 默认连 FILE_SHARE_DELETE 也共享 ⇒
+        // 必须显式 share_mode(1)，那才是杀软实时扫描/另一个实例握着它的形态）
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::write(&temp, b"plaintext browsing history").unwrap();
+            let blocker = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&temp)
+                .expect("夹具：只放行读的句柄要能开起来");
+            let (stuck, logs) = crate::logger::capture_logs(|| discard_temp_copy(&temp));
+            assert_eq!(stuck.len(), 1, "主文件删不动要点名一份，实得 {stuck:?}");
+            assert!(
+                stuck[0].contains(&temp.display().to_string()),
+                "要说清是哪一份留在临时目录里: {stuck:?}"
+            );
+            assert!(
+                logs.iter()
+                    .any(|l| l.contains("删不掉") && l.contains("明文")),
+                "收尾这一步也要出声，否则这份隐私留到下次启动都没人知道: {logs:?}"
+            );
+            drop(blocker);
+        }
     }
 
     /// 缺 WAL 的副本不许拿去查：补档历史日会把偏小的数永久写进本地缓存。
