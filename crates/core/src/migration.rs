@@ -544,6 +544,46 @@ fn read_day_seconds(conn: &Connection, sql: &str) -> anyhow::Result<Vec<(i64, i6
     Ok(list)
 }
 
+/// 「旧库那段每天活跃时长存在哪儿」的四种结局。
+#[derive(Debug, PartialEq)]
+enum SecondsSource {
+    /// 旧版的独立表
+    ActiveTable,
+    /// 2026-09-21 之后并进的 `daily_counts.seconds`
+    DailyColumn,
+    /// 两问都答得上来，两处都确实没有 ⇒ 真的没东西可搬
+    Neither,
+    /// 有一问没答上来（坏页、schema 读不出、被别的连接挡着）⇒ 不许当"没有"
+    CannotTell(String),
+}
+
+/// 把上面那两问汇成一件**不经系统调用就能钉死**的判断。
+///
+/// 顺序照旧：有 `active_seconds` 就用它，否则看 `daily_counts` 有没有 `seconds` 那一列。
+/// 新增的只有第四格：任何一问读不出都不许折成「没有」—— 折成没有就等于把这一年说成
+/// "旧版本来没记时长"，而调用方随后还要写导入标记，下次重导被大小+mtime 与内容指纹一路跳过。
+fn pick_active_seconds_source(
+    active: connection::Presence,
+    daily_column: connection::Presence,
+) -> SecondsSource {
+    use crate::db::connection::Presence;
+    if let Presence::Unreadable(reason) = &active {
+        return SecondsSource::CannotTell(format!(
+            "读不出旧库里有没有 active_seconds 这张表: {reason}"
+        ));
+    }
+    if active == Presence::Yes {
+        return SecondsSource::ActiveTable;
+    }
+    match daily_column {
+        Presence::Yes => SecondsSource::DailyColumn,
+        Presence::No => SecondsSource::Neither,
+        Presence::Unreadable(reason) => SecondsSource::CannotTell(format!(
+            "读不出旧库 daily_counts 里有没有 seconds 那一列: {reason}"
+        )),
+    }
+}
+
 /// 把源库的「每天活跃秒数」并进目标库，返回目标库净增的秒数。
 ///
 /// 合并分支（目标年库已存在）原先只搬 `key_log` 明细，而**明细里没有时长信息**：
@@ -554,14 +594,24 @@ fn read_day_seconds(conn: &Connection, sql: &str) -> anyhow::Result<Vec<(i64, i6
 /// 取 `MAX()` 而不是相加：重复导入不能把一天算成两天；而目标库某天是新版本
 /// 自己采集的，它的时长就是真值，不能被旧库那天的 0 覆盖（旧版早期没记时长）。
 fn merge_active_seconds_from_src(src: &Connection, dst: &Connection) -> anyhow::Result<i64> {
-    let rows: Vec<(i64, i64)> = if connection::table_exists(src, "active_seconds") {
-        read_day_seconds(src, "SELECT date_key, seconds FROM active_seconds")?
-    } else if connection::column_exists(src, "daily_counts", "seconds") {
-        read_day_seconds(src, "SELECT date_key, seconds FROM daily_counts")?
-    } else {
-        // 最早的旧版根本没记活跃时长 —— 没东西可搬，不是丢数据
-        return Ok(0);
+    // 两问原先走 `table_exists` / `column_exists` —— 那两者就是把"这次读不出来"折成 `false`
+    // 的判据（`table_exists` 字面是 `matches!(table_presence(..), Yes)`）。坏页、被截断的
+    // schema、别的连接正挡着查询的那一轮，全走到"没东西可搬 ⇒ `Ok(0)`"那句。
+    let chosen = pick_active_seconds_source(
+        connection::table_presence(src, "active_seconds"),
+        connection::column_presence(src, "daily_counts", "seconds"),
+    );
+    let sql = match &chosen {
+        SecondsSource::ActiveTable => "SELECT date_key, seconds FROM active_seconds",
+        SecondsSource::DailyColumn => "SELECT date_key, seconds FROM daily_counts",
+        SecondsSource::Neither => return Ok(0),
+        SecondsSource::CannotTell(reason) => {
+            return Err(anyhow::anyhow!(
+                "{reason}：这一年先跳过，不写导入标记，旧库里那段时长下次重导还能补"
+            ));
+        }
     };
+    let rows: Vec<(i64, i64)> = read_day_seconds(src, sql)?;
     if rows.iter().all(|(_, s)| *s <= 0) {
         return Ok(0);
     }
@@ -593,20 +643,31 @@ fn merge_active_seconds_from_src(src: &Connection, dst: &Connection) -> anyhow::
     Ok(gained)
 }
 
-/// 源库 key_log 的内容指纹：(行数, 最大时间戳)。没有这张表返回 None。
+/// 源库 key_log 的内容指纹：(行数, 最大时间戳)。**确认**没有这张表才返回 None。
 ///
 /// 行数 + 最大时间戳足以分辨"这份旧库的明细变没变"：key_log 是按键发生时
 /// 逐条追加的，内容没变时两者恒定，摸一摸 mtime 不会动它们。反推不成立
 /// （两份不同内容可能撞上同一对数）不碍事 —— 误判的代价只是少跳过一次
 /// 幂等的导入，而**不是**漏导或翻倍。
+///
+/// 「查不动」不能折成「没有这张表」：那条路上调用方说的是"源库只剩聚合表、按键明细本来就没有"，
+/// 而真实情况是这一问没答上（坏页、schema 被截断、别的连接正挡着查询）—— 那一年整段按键数
+/// 会被安静地丢下。交回 Err 让本年度跳过、不写标记，下次重导还能补。
 fn key_log_fingerprint(conn: &Connection) -> anyhow::Result<Option<(i64, i64)>> {
     let has = conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='key_log'",
         [],
         |_| Ok(()),
     );
-    if has.is_err() {
-        return Ok(None);
+    match has {
+        Ok(()) => {}
+        // 查询跑通了却没有那一行 = 确认没有这张表（明细聚完就丢表，是本仓年度库的常态）
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "读不出旧库里有没有 key_log 这张表: {e} —— 这不是「没有明细」"
+            ))
+        }
     }
     let row = conn.query_row(
         "SELECT COUNT(*), COALESCE(MAX(timestamp), 0) FROM key_log",
@@ -1044,6 +1105,164 @@ mod tests {
                 "那一问不许退回 exists() 猜：{forbidden}"
             );
         }
+    }
+
+    /// 旧库**读不出来**时不许说成"这库里没记过活跃时长"。
+    ///
+    /// `table_exists` / `column_exists` 都把"这次查不动"折成 `false`，于是坏页、schema 被截断、
+    /// 别的连接挡着查询那几轮，全走到"没东西可搬 ⇒ `Ok(0)`"，而调用方随后写标记、报告说的是
+    /// "活跃时长已并" —— 那一年在旧文件里的那段时长就这么掉了。
+    #[test]
+    fn an_unreadable_source_is_not_reported_as_having_no_active_seconds() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("merge_active_unreadable");
+        let dst = Connection::open(_dir.path().join("dst.db")).expect("开目标库");
+        dst.execute_batch(
+            "CREATE TABLE daily_counts(date_key INTEGER PRIMARY KEY, count INTEGER, seconds INTEGER);",
+        )
+        .expect("建目标表");
+
+        // ① 坏页（头部不是 sqlite 那十六个字节）⇒ 要说"读不出"，不许说"没记过"
+        let junk = _dir.path().join("src_junk.db");
+        std::fs::write(&junk, "这看着就不是一个 sqlite 库").expect("写坏库");
+        let src = Connection::open(&junk).expect("坏库开连接本身该成功，失败在第一次查询");
+        let err = merge_active_seconds_from_src(&src, &dst)
+            .expect_err("读不出时必须交回错误，不能当成「没有时长」");
+        assert!(
+            err.to_string()
+                .contains("读不出旧库里有没有 active_seconds"),
+            "要说清是哪一问没答上: {err}"
+        );
+
+        // ② 对照腿：问得出、里面确实没有 ⇒ 仍是 Ok(0)（最早的旧版根本没记时长，该安静）
+        let src2 = Connection::open(_dir.path().join("src_none.db")).expect("开一个干净的空库");
+        src2.execute_batch("CREATE TABLE t(x);")
+            .expect("建一张无关表");
+        assert_eq!(
+            merge_active_seconds_from_src(&src2, &dst).expect("问得出就没有就是没有"),
+            0,
+            "确认没有时长与读不出是两件事"
+        );
+        let total: i64 = dst
+            .query_row(
+                "SELECT COALESCE(SUM(seconds),0) FROM daily_counts",
+                [],
+                |r| r.get(0),
+            )
+            .expect("读目标库");
+        assert_eq!(total, 0, "被拒绝的那一步不该写目标库");
+    }
+
+    /// 上面那把换算表不经系统调用就能钉死 —— 四格各有断言，顺序与"读不出优先"都要按住。
+    #[test]
+    fn the_active_seconds_lookup_table_has_four_answers_not_two() {
+        use crate::db::connection::Presence as P;
+        let why = |s: SecondsSource| match s {
+            SecondsSource::CannotTell(reason) => reason,
+            other => panic!("这一格该交「读不出」，实得 {other:?}"),
+        };
+        // ① 有独立表：第二问什么都不能改结论（顺序照旧）
+        assert_eq!(
+            pick_active_seconds_source(P::Yes, P::No),
+            SecondsSource::ActiveTable
+        );
+        assert_eq!(
+            pick_active_seconds_source(P::Yes, P::Unreadable("x".into())),
+            SecondsSource::ActiveTable,
+            "第一问答成「有表」时不该被第二问拖走"
+        );
+        // ② 没有独立表、有那一列
+        assert_eq!(
+            pick_active_seconds_source(P::No, P::Yes),
+            SecondsSource::DailyColumn
+        );
+        // ③ 两问都答得上来、两处都确实没有 ⇒ 才是"没东西可搬"
+        assert_eq!(
+            pick_active_seconds_source(P::No, P::No),
+            SecondsSource::Neither
+        );
+        // ④ 任何一问读不出 ⇒ CannotTell，且点名是哪一问
+        assert!(why(pick_active_seconds_source(
+            P::Unreadable("坏页".into()),
+            P::No
+        ))
+        .contains("active_seconds"));
+        assert!(why(pick_active_seconds_source(
+            P::No,
+            P::Unreadable("被挡".into())
+        ))
+        .contains("seconds 那一列"));
+        // 第一问读不出时，第二问答什么都不能把它洗成"有/没有"
+        assert!(why(pick_active_seconds_source(
+            P::Unreadable("坏页".into()),
+            P::Yes
+        ))
+        .contains("active_seconds"));
+    }
+
+    /// key_log 那一问同样分得开「确认没有这张表」与「这次读不出」。
+    ///
+    /// 旧的 `has.is_err() ⇒ Ok(None)` 把两者并成一件，于是坏库会被上游报成「源库只剩聚合表：
+    /// 按键明细本来就没有」—— 那一年整段按键数被安静地丢下，而话说得像查过了。
+    #[test]
+    fn key_log_fingerprint_separates_no_table_from_cannot_read() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("kl_probe");
+        // ① 问得出、确实没有这张表 ⇒ Ok(None)（本仓年度库的常态，那句"只剩聚合表"是对的）
+        let conn = Connection::open(_dir.path().join("clean.db")).expect("开干净库");
+        conn.execute_batch(
+            "CREATE TABLE daily_counts(date_key INTEGER PRIMARY KEY, count INTEGER);",
+        )
+        .expect("建聚合表");
+        assert_eq!(key_log_fingerprint(&conn).expect("问得出"), None);
+        drop(conn);
+
+        // ② 读不出 ⇒ 交回错误，不许折成「没有明细」
+        let junk = _dir.path().join("junk.db");
+        std::fs::write(&junk, "junk bytes").expect("写坏库");
+        let src = Connection::open(&junk).expect("坏库开连接本身成功");
+        let err = key_log_fingerprint(&src).expect_err("读不出时不许折成 None");
+        assert!(
+            err.to_string().contains("读不出旧库里有没有 key_log"),
+            "要说清是哪一问没答上: {err}"
+        );
+    }
+
+    /// 端到端：坏源库年度那一条要报错、**不许写导入标记**（写了以后重导被指纹一路跳过）。
+    #[test]
+    fn a_corrupt_source_year_db_is_skipped_without_writing_the_import_marker() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("merge_corrupt_src");
+        let year = 2025;
+        let src_dir = _dir.path().join("src_dir");
+        std::fs::create_dir_all(&src_dir).expect("建源目录");
+        std::fs::write(src_dir.join(format!("focusflow_{year}.db")), "坏掉的旧库")
+            .expect("写坏源库");
+        {
+            let dst = paths::year_db_path(year);
+            let conn = connection::open_rw(&dst).expect("建目标年度库");
+            connection::ensure_schema(&conn, year).expect("建表");
+            drop(conn);
+        }
+
+        let mut summary = ImportSummary::default();
+        let err = import_year_db(&src_dir, year, &mut summary)
+            .expect_err("读不出的那一年必须报错，不能报成「只剩聚合表」");
+        assert!(
+            err.to_string().contains("读不出"),
+            "要说清是哪一问没答上: {err}"
+        );
+        assert!(
+            summary.skipped.is_empty(),
+            "不许把读不出说成「本来就没明细」: {:?}",
+            summary.skipped
+        );
+        assert!(
+            read_import_marker(&paths::year_db_path(year))
+                .expect("目标库读得动")
+                .is_none(),
+            "标记没写才谈得上下次重导还能补"
+        );
     }
 
     /// 把**当前**数据目录当成导入源（目录选择器里挑到自己 data/ 上很常见）：
