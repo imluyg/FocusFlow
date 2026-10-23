@@ -33,7 +33,7 @@ mod tests {
         let mut manager = PluginManager::new(config, database);
 
         // 发现插件
-        let files = manager.discover();
+        let files = manager.discover().expect("内置插件目录该读得动");
         assert!(
             files.iter().any(|f| f.ends_with("stats_overview.lua")),
             "应发现 stats_overview.lua, got {files:?}"
@@ -88,7 +88,7 @@ mod tests {
         let database = db::Database::init_readonly();
         let mut manager = PluginManager::new(config, database);
 
-        let files = manager.discover();
+        let files = manager.discover().expect("内置插件目录该读得动");
         assert!(
             files.len() >= 4,
             "内置插件目录应有至少 4 个插件，实际 {files:?}"
@@ -144,7 +144,7 @@ mod tests {
         let database = db::Database::init_readonly();
         let mut manager = PluginManager::new(config, database);
 
-        let files = manager.discover();
+        let files = manager.discover().expect("内置插件目录该读得动");
         let file = files
             .iter()
             .find(|f| f.ends_with("accounting_plugin.lua"))
@@ -248,7 +248,7 @@ mod tests {
         let database = db::Database::init_readonly();
         let mut manager = PluginManager::new(config, database);
 
-        let files = manager.discover();
+        let files = manager.discover().expect("内置插件目录该读得动");
         let file = files
             .iter()
             .find(|f| f.ends_with("accounting_plugin.lua"))
@@ -435,6 +435,7 @@ mod tests {
         // 加载
         let file = manager
             .discover()
+            .expect("内置插件目录该读得动")
             .into_iter()
             .find(|f| f.ends_with("stats_overview.lua"))
             .unwrap();
@@ -504,6 +505,7 @@ mod tests {
         let mut manager = PluginManager::new(config, database);
         let file = manager
             .discover()
+            .expect("内置插件目录该读得动")
             .into_iter()
             .find(|f| f.ends_with("scheduler_plugin.lua"))
             .expect("应发现 scheduler_plugin.lua");
@@ -582,6 +584,7 @@ mod tests {
         let mut manager = PluginManager::new(config, database);
         let file = manager
             .discover()
+            .expect("内置插件目录该读得动")
             .into_iter()
             .find(|f| f.ends_with("accounting_plugin.lua"))
             .expect("应发现 accounting_plugin.lua");
@@ -648,6 +651,7 @@ mod tests {
         let mut manager = PluginManager::new(config, db::Database::init_readonly());
         let file = manager
             .discover()
+            .expect("内置插件目录该读得动")
             .into_iter()
             .find(|f| f.ends_with("accounting_plugin.lua"))
             .expect("应发现 accounting_plugin.lua");

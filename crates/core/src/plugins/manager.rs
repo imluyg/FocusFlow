@@ -46,6 +46,7 @@ struct PluginMeta {
 }
 
 /// 目录中发现的插件（含已停用的），供插件管理页展示。
+#[derive(Debug)]
 pub struct DiscoveredPlugin {
     /// 展示名（PLUGIN_NAME，读取失败时回退为文件名）
     pub name: String,
@@ -123,14 +124,11 @@ const MAX_WIDGET_DEPTH: u32 = 32;
 
 /// 「这一轮没列出这个插件文件名」的两种原因要分开说。
 ///
-/// `discover()` 读不出目录时给的是**空列表**（它自己的注释写了这件事有多坏），
-/// 所以调用方那句"列表里没有"既可能是盘上真没有这个名字，也可能是整个目录这会儿
-/// 读不到 —— 后者过去一律报成「插件文件不存在」，而文件明明在盘上：用户照着这句
-/// 话会去重命名、重传插件，甚至以为自己的插件被删了。`discover()` 那半边已经会记
-/// 日志，这里是把话说对的另一半。
-///
-/// 带路径分隔或 `..` 的名字**不走存在性检查**：那是把这里变成"文件存在预言机"，
-/// 而这个 crate 的插件表本就是外部数据（沙箱那段的注释防的就是这类通道）。
+/// 走到这里时目录已经**读全了**（`discover()` 读不出目录会直接交 Err，`set_enabled`
+/// 在它那一步就返回，不会落到这句话），所以"列表里没有"只剩盘上真没有这个名字、
+/// 或这一瞬间目录被换成另一份两种可能。带路径分隔或 `..` 的名字**不走存在性检查**：
+/// 那是把这里变成"文件存在预言机"，而这个 crate 的插件表本就是外部数据
+/// （沙箱那段的注释防的就是这类通道）。
 fn missing_plugin_reason(dir: &Path, stem: &str) -> String {
     let simple =
         !stem.is_empty() && !stem.contains('/') && !stem.contains('\\') && !stem.contains("..");
@@ -138,6 +136,37 @@ fn missing_plugin_reason(dir: &Path, stem: &str) -> String {
         return format!("插件目录这一轮没扫到 {stem}（目录被占用或正在整份替换），请再试一次");
     }
     format!("插件文件不存在: {stem}")
+}
+
+/// 读一个插件目录，回 `(排序后的 .lua 清单)`，或者**这个目录读不出来的原因**。
+///
+/// 三种结局要分开：
+/// · 读得动 ⇒ `Ok(清单)`，哪怕清单是空的（那就是"目录里真没有插件"）；
+/// · `NotFound` ⇒ `Ok(空)`：整个目录不存在就是"一个插件都没有"，全新安装是这个形状，
+///   把它报成错误会让第一次打开插件页的人看见一句红字"读不出来"；
+/// · 其余错误码 ⇒ `Err(带上路径与原因)`：`plugins` 被建成同名文件、整份放在断线的网盘上、
+///   移动盘休眠、杀软首扫握着句柄、构建脚本正在整份替换目录 —— 这些时候盘上**有**插件，
+///   把它们折成空清单就是谎报"暂无插件"。
+///
+/// 单独收一个 `dir` 参数（而不是挂在 `&self` 上）是为了让三种结局都能被用例直接按路径钉住：
+/// `plugins_dir()` 走的是进程全局的 app_dir，别的用例换过一次就会漂。
+fn list_lua_plugins(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "lua").unwrap_or(false))
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(format!(
+                "插件目录读不出来（{}）：{e} —— 这不是「没有插件」",
+                dir.display()
+            ))
+        }
+    };
+    files.sort();
+    Ok(files)
 }
 
 impl PluginManager {
@@ -336,7 +365,11 @@ impl PluginManager {
             tracing::error!("插件名不能含逗号/换行（会破坏 [plugins] disabled 列表）: {stem}");
             return Err(format!("插件名不合法（含逗号或换行）: {stem}"));
         }
-        if !self.discover().iter().any(|p| Self::stem_of(p) == stem) {
+        // 扫一次，两次判断共用同一份清单：原先这里扫一遍、启用时再扫一遍，
+        // 目录正在被整份替换时两半能各读到不同的东西（前一半说"在"、后一半找不到那个文件，
+        // 于是配置写了、插件却没加载，页面还报成功）。
+        let files = self.discover()?;
+        if !files.iter().any(|p| Self::stem_of(p) == stem) {
             // 以前这里是 `return Ok(())`：命令层把 Ok 当成功，前端弹「插件已启用」，
             // 而配置一个字没改 —— 对着一个不存在的插件报成功。
             let reason = missing_plugin_reason(&self.plugins_dir(), stem);
@@ -359,12 +392,8 @@ impl PluginManager {
                 .values()
                 .any(|p| Self::stem_of(&p.file_path) == stem);
             if !already {
-                if let Some(path) = self
-                    .discover()
-                    .into_iter()
-                    .find(|p| Self::stem_of(p) == stem)
-                {
-                    if let Err(e) = self.try_load(&path) {
+                if let Some(path) = files.iter().find(|p| Self::stem_of(p) == stem) {
+                    if let Err(e) = self.try_load(path) {
                         tracing::warn!("启用插件失败 ({stem}): {e}");
                         return Err(format!("插件已记录为启用，但加载失败：{e}"));
                     }
@@ -388,9 +417,14 @@ impl PluginManager {
     ///
     /// 已加载的插件直接取内存中的信息，避免重复执行其顶层代码；
     /// 未加载的（停用或加载失败）才读取元数据。
-    pub fn list_discovered(&self) -> Vec<DiscoveredPlugin> {
+    ///
+    /// 目录读不出来时回 `Err(原因)`：那一页的空列表原本既可能是"真没插件"也可能是
+    /// "整个目录读不动"，而前端只有一种画法（「暂无插件」）。现在错误由命令层交给页面，
+    /// 页面上两种结局长得不一样。
+    pub fn list_discovered(&self) -> Result<Vec<DiscoveredPlugin>, String> {
         let disabled = self.disabled_list();
-        self.discover()
+        Ok(self
+            .discover()?
             .into_iter()
             .map(|path| {
                 let stem = Self::stem_of(&path);
@@ -453,34 +487,21 @@ impl PluginManager {
                     },
                 }
             })
-            .collect()
+            .collect())
     }
 
-    /// 扫描插件目录，返回 .lua 文件列表。
-    pub fn discover(&self) -> Vec<PathBuf> {
+    /// 扫描插件目录，返回 .lua 文件列表；**目录读不出来时交回原因，不交回空清单**。
+    ///
+    /// 空清单从此只有一种含义：这个目录读全了、里面确实没有 .lua。以前是
+    /// `.unwrap_or_default()`：`plugins` 被建成同名文件、整份放在断线的网盘上、或替换目录
+    /// 的那一刻，插件页显示「暂无插件」而 5 个插件都还在盘上，日志里一个字都没有；
+    /// 点启用还会得到一句假原因「插件文件不存在」。桌面侧那份扫描早就区分了这两件事
+    /// （见 desktop/src/plugins.rs 的读失败处理），这一头只补了一行日志、结论照样是空的
+    /// —— 注释声称"已经分开"，实际没有。
+    pub fn discover(&self) -> Result<Vec<PathBuf>, String> {
         let dir = self.plugins_dir();
         std::fs::create_dir_all(&dir).ok();
-        let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().map(|e| e == "lua").unwrap_or(false))
-                .collect(),
-            // 读不出来 **不等于** 没有插件。以前是 `.unwrap_or_default()`：
-            // `plugins` 被建成同名文件、整份放在断线的网盘上、或替换目录的那一刻，
-            // 插件页显示「暂无插件」而 5 个插件都还在盘上，日志里一个字都没有；
-            // 此时点启用还会得到一句假原因「插件文件不存在」。
-            // 桌面侧那份扫描早就区分了这两件事（见 desktop/src/plugins.rs 的读失败处理）。
-            Err(e) => {
-                tracing::error!(
-                    "插件目录读不出来（{}），本次看不到任何插件 —— 这不是「没有插件」: {e}",
-                    dir.display()
-                );
-                Vec::new()
-            }
-        };
-        files.sort();
-        files
+        list_lua_plugins(&dir)
     }
 
     /// 只做文本扫描读元数据，**不执行插件代码**：`(name, desc, version, author)`。
@@ -837,9 +858,20 @@ impl PluginManager {
     }
 
     /// 加载所有未停用的插件（停用的跳过，其代码完全不执行）。
+    ///
+    /// 目录读不出来时必须出声并直接收手：这里过去吃的是一个被折成空的 `discover()`，
+    /// 于是"5 个插件一个都没加载"与"本来就没装插件"在启动路径上是同一段安静 ——
+    /// 插件页要等用户点开才发现全是空的，而那一刻目录可能早已能读了。
     pub fn load_all(&mut self) {
         let disabled = self.disabled_list();
-        for path in self.discover() {
+        let files = match self.discover() {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::error!("{e}：本次一个插件也不加载");
+                return;
+            }
+        };
+        for path in files {
             let stem = Self::stem_of(&path);
             if disabled.iter().any(|s| s.as_str() == stem) {
                 continue;
@@ -2194,6 +2226,7 @@ end
 
         let row = pm
             .list_discovered()
+            .expect("这一轮的插件目录该读得动")
             .into_iter()
             .find(|p| p.file == "w")
             .expect("列表里得有这个文件那一行");
@@ -2218,6 +2251,7 @@ end
         assert!(pm.reload_plugin("w"), "修好的版本该重载成功");
         let row = pm
             .list_discovered()
+            .expect("这一轮的插件目录该读得动")
             .into_iter()
             .find(|p| p.file == "w")
             .expect("列表里得有这个文件那一行");
@@ -2229,10 +2263,187 @@ end
         assert!(row.loaded, "重载成功后跑的就是新那份");
     }
 
+    /// 插件目录"这一轮读不动"与"一个插件都没有"必须是两种结局。
+    ///
+    /// 症状是界面上一句「暂无插件」：`discover()` 过去把 `read_dir` 的错误折成空清单，
+    /// 而插件页对两种结局的画法是同一个。插件明明在盘上时这句话会把用户推向
+    /// 重命名、重传插件，甚至以为自己的插件被删了。
+    /// 四种读数缺一不可：读得动的清单／空目录／目录本来不存在（首启）／这一轮读不动（带原因）。
+    #[test]
+    fn an_unreadable_plugin_dir_is_not_reported_as_having_no_plugins() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("unreadable_plugin_dir");
+
+        // —— 尺子本身：按路径钉住三种结局，先不碰进程全局 ——
+        let ok_dir = tmp.path().join("scan_ok");
+        std::fs::create_dir_all(&ok_dir).unwrap();
+        std::fs::write(ok_dir.join("beta.lua"), "PLUGIN_NAME = \"乙\"\n").unwrap();
+        std::fs::write(ok_dir.join("alpha.lua"), "PLUGIN_NAME = \"甲\"\n").unwrap();
+        std::fs::write(ok_dir.join("readme.txt"), "这不是插件\n").unwrap();
+        let got = list_lua_plugins(&ok_dir).expect("这个目录该读得动");
+        assert_eq!(
+            got.iter()
+                .map(|p| p.file_stem().unwrap().to_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"],
+            "只收 .lua、并按文件名排序（列表稳定是页面上的顺序）: {got:?}"
+        );
+
+        let empty_dir = tmp.path().join("scan_empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        assert!(
+            list_lua_plugins(&empty_dir)
+                .expect("空目录是读得动的")
+                .is_empty(),
+            "读全了、里面确实没有 ⇒ 空清单"
+        );
+        let absent = tmp.path().join("scan_never_created");
+        assert!(
+            list_lua_plugins(&absent)
+                .expect("目录不存在＝一个插件都没有，不是读不出来")
+                .is_empty(),
+            "全新安装一个目录都没建，此刻该报\"没有插件\"，不许报读不出来"
+        );
+
+        let not_a_dir = tmp.path().join("scan_is_a_file");
+        std::fs::write(&not_a_dir, "这是一个文件，不是目录\n").unwrap();
+        let err = list_lua_plugins(&not_a_dir)
+            .expect_err("把一个普通文件当插件目录读，必须交回原因而不是空清单");
+        assert!(
+            err.contains("读不出来") && err.contains("没有插件"),
+            "要说清\"读不出来\"并且不许被读成\"没有插件\": {err}"
+        );
+        assert!(
+            err.contains(&not_a_dir.display().to_string()),
+            "得说出是哪个目录读不动，否则用户只能猜: {err}"
+        );
+
+        // —— 消费侧：命令层拿到的必须是同一个 Err ——
+        // `plugins` 占成同名文件：`create_dir_all` 建不成，`read_dir` 也读不动。
+        let plugins = tmp.path().join("plugins");
+        std::fs::write(&plugins, "占位：这是一个文件\n").unwrap();
+        let mut pm = manager_in(tmp.path());
+        let err = pm
+            .discover()
+            .expect_err("插件目录是个文件时，取数这一头必须拿到原因");
+        assert!(err.contains("读不出来"), "discover() 把结局弄丢了: {err}");
+        let Err(err) = pm.list_discovered() else {
+            panic!(
+                "插件目录读不动时，列表这一头必须交 Err，而不是回一份空清单让页面画「暂无插件」"
+            );
+        };
+        assert!(err.contains("读不出来"), "原因要原样交给命令层: {err}");
+
+        // 点「启用」时那句假话（「插件文件不存在」）也不许再出现：文件在不在，
+        // 这一轮根本没读出来，用户照着那句去重传插件是白跑一趟。
+        let err = pm
+            .set_enabled("w", true)
+            .expect_err("目录读不动时启用必须失败");
+        assert!(
+            !err.contains("不存在"),
+            "目录整体读不动时那句\"插件文件不存在\"是假的: {err}"
+        );
+        assert!(
+            err.contains("读不出来"),
+            "启用被拒的原因要落在目录上: {err}"
+        );
+
+        // —— 对照组：不许把矫枉过正当成修好 ——
+        std::fs::remove_file(&plugins).unwrap();
+        std::fs::create_dir_all(&plugins).unwrap();
+        assert!(
+            pm.list_discovered()
+                .unwrap_or_else(|e| panic!("空的插件目录该读得动，实得 Err: {e}"))
+                .is_empty(),
+            "真没有插件时仍回空清单，页面那句「暂无插件」才说得起"
+        );
+    }
+
+    /// 启动那一次加载，目录读不动必须出声。
+    ///
+    /// `load_all` 吃的是启动路径上唯一一份清单：它静默回手时，"5 个插件一个都没加载"
+    /// 与"本来就没装插件"是同一个样子，而用户要等自己点开插件页才发现全是空的 ——
+    /// 那一刻目录可能早已能读了，现场也就没了。
+    #[test]
+    fn load_all_announces_an_unreadable_plugin_directory() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("load_all_unreadable");
+        std::fs::write(tmp.path().join("plugins"), "占位：这是一个文件\n").unwrap();
+        let mut pm = manager_in(tmp.path());
+        let (_, logs) = crate::logger::capture_logs(|| pm.load_all());
+        assert!(
+            pm.get_all_plugins().is_empty(),
+            "读不动时一个插件也不该被加载（半份清单比没清单更难解释）"
+        );
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("读不出来") && l.contains("不加载")),
+            "启动那一次的静默等于永远没人知道: {logs:?}"
+        );
+
+        // 对照组：目录读得动（哪怕空）时不许喊
+        let plugins = tmp.path().join("plugins");
+        std::fs::remove_file(&plugins).unwrap();
+        std::fs::create_dir_all(&plugins).unwrap();
+        let (_, logs) = crate::logger::capture_logs(|| pm.load_all());
+        assert!(
+            !logs.iter().any(|l| l.contains("不加载")),
+            "读得动就别喊，否则每启动一次都假警: {logs:?}"
+        );
+    }
+
+    /// 这道闸的形状：`discover()` 的三个消费点，一个也不许偷偷把 Err 折回"空"。
+    ///
+    /// 上面两条行为用例盯的是现在的写法；这里防的是"下一次有人把 `?` 换成
+    /// `unwrap_or_default()`" —— 那种改动的症状恰恰是界面重新变成一片安静的「暂无插件」，
+    /// 而改的那一瞬间之外没有任何东西会响。判序按归一化后的调用形态数，
+    /// 光数函数名会被 `discover()` 的注释与另一种写法顶班。
+    #[test]
+    fn no_caller_folds_an_unreadable_plugin_dir_back_into_empty() {
+        let src = include_str!("manager.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let flat: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            flat.matches("self.discover()").count(),
+            3,
+            "取数只有三个消费点（列表、启用、启动加载），多一处要先说清它吃的是哪种结局"
+        );
+        assert_eq!(
+            flat.matches("self.discover()?").count(),
+            2,
+            "列表与启用两处必须把 Err 原样交出去（`?`），而不是就地折成空"
+        );
+        assert_eq!(
+            flat.matches("matchself.discover()").count(),
+            1,
+            "启动加载那一处必须自己接住 Err 并出声"
+        );
+        for (at, call) in flat.match_indices("self.discover()") {
+            let after = &flat[at + call.len()..];
+            let taken_by_question = after.starts_with('?');
+            let taken_by_match = flat[..at].ends_with("match");
+            assert!(
+                taken_by_question || taken_by_match,
+                "第 {} 个字符处这一处 `discover()` 既没把 Err 交出去（`?`），也没自己接住并出声\
+                 （match）—— 它接下来一定会把\"读不出来\"折成空清单",
+                at
+            );
+        }
+    }
+
     /// 「插件文件不存在」不能当成"这一轮没列出它"的默认解释。
     ///
-    /// `discover()` 读不出目录时给的是空列表，所以那句话在目录被占用/正在整份替换
-    /// 的时候是**假**的 —— 文件就在盘上，而用户照着这句假话会去重命名、重传插件。
+    /// 目录整体读不出来的那条路已经由 `discover()` 直接交 Err（见
+    /// `an_unreadable_plugin_dir_is_not_reported_as_having_no_plugins`），剩下的"目录读全了、
+    /// 清单里却没有这个名字"仍然有两种可能：文件在盘上但这一轮没扫到（目录正在被整份替换），
+    /// 或真没有这个名字。后者才配得上「不存在」—— 把前者说成不存在，用户会去重命名、重传插件。
     #[test]
     fn an_unreadable_directory_is_not_reported_as_a_missing_file() {
         let _lock = paths::test_app_dir_lock();

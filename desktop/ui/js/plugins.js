@@ -71,7 +71,9 @@ export async function renderPlugins() {
       })
       .join("");
   } catch (e) {
-    $("view-plugins").innerHTML = '<div class="empty">插件加载失败</div>';
+    // 这一支现在只代表一件事：宿主没能把目录读全。空列表才是「暂无插件」，
+    // 过去两条画的是同一句话，插件明明还在盘上却被说成一个都没有。
+    $("view-plugins").innerHTML = `<div class="empty" style="color:var(--danger);">插件列表读不出来：${escapeHtml(String(e))}</div>`;
   }
 }
 

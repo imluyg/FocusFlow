@@ -33,7 +33,7 @@ mod tests {
         let mut manager = PluginManager::new(config, database);
 
         // 加载所有插件
-        for f in manager.discover() {
+        for f in manager.discover().expect("内置插件目录该读得动") {
             manager.load_plugin(&f).unwrap();
         }
         assert!(!manager.get_all_plugins().is_empty());
@@ -54,12 +54,15 @@ mod tests {
             for name in ["统计速览", "番茄工作法", "记账本", "定时任务"] {
                 assert!(manager.unload_plugin(name), "卸载 {name}");
             }
-            for f in manager.discover() {
+            for f in manager.discover().expect("内置插件目录该读得动") {
                 manager.load_plugin(&f).unwrap();
             }
         }
 
-        assert_eq!(manager.get_all_plugins().len(), manager.discover().len());
+        assert_eq!(
+            manager.get_all_plugins().len(),
+            manager.discover().expect("内置插件目录该读得动").len()
+        );
     }
 
     #[test]
@@ -74,7 +77,7 @@ mod tests {
         ));
         let database = db::Database::init_readonly();
         let mut manager = PluginManager::new(config, database);
-        for f in manager.discover() {
+        for f in manager.discover().expect("内置插件目录该读得动") {
             manager.load_plugin(&f).unwrap();
         }
 

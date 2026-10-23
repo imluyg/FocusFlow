@@ -230,6 +230,7 @@ fn enabling_a_broken_plugin_reports_the_reason() {
     assert!(err.contains("这行不该通过"), "原因要原样带出来: {err}");
     assert!(
         pm.list_discovered()
+            .expect("这一轮的插件目录该读得动")
             .iter()
             .any(|p| p.file == "broken_enable" && !p.loaded),
         "该插件不该被当成已加载"
@@ -286,7 +287,7 @@ fn listing_plugins_never_runs_their_code() {
         .get_or("plugins", "disabled", "")
         .contains("top_level_boom"));
 
-    let listed = pm.list_discovered();
+    let listed = pm.list_discovered().expect("这一轮的插件目录该读得动");
     let entry = listed
         .iter()
         .find(|p| p.file == "top_level_boom")
@@ -316,6 +317,7 @@ fn load_failure_is_visible_in_the_list() {
 
     let entry = pm
         .list_discovered()
+        .expect("这一轮的插件目录该读得动")
         .into_iter()
         .find(|p| p.file == "broken")
         .expect("应列出该文件");

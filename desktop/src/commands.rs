@@ -781,10 +781,15 @@ pub fn plugins_watch(watch: bool) {
 }
 
 /// 列出插件（含已停用的，供管理页显示开关）。
+///
+/// 目录读不出来时回 `Err(原因)` 而不是空列表：空列表在页面上画的是「暂无插件」，
+/// 那句话在这种时候是假的（插件还在盘上），而且用户会照着它去重传插件。
+/// 前端这一头的拒绝通道本来就有（`plugins.js` 的 catch），只是过去只会画「加载失败」。
 #[tauri::command]
-pub fn get_plugins(state: State<'_, Arc<AppState>>) -> Vec<PluginMeta> {
+pub fn get_plugins(state: State<'_, Arc<AppState>>) -> Result<Vec<PluginMeta>, String> {
     crate::plugins::with_manager(&state.db, |pm| {
-        pm.list_discovered()
+        let list = pm.list_discovered()?;
+        Ok(list
             .into_iter()
             .map(|p| PluginMeta {
                 name: p.name,
@@ -796,7 +801,7 @@ pub fn get_plugins(state: State<'_, Arc<AppState>>) -> Vec<PluginMeta> {
                 loaded: p.loaded,
                 error: p.error,
             })
-            .collect()
+            .collect::<Vec<_>>())
     })
 }
 
@@ -1131,6 +1136,81 @@ mod tests {
             body.contains("reset_active_anchor()"),
             "AppState::toggle_pause 暂停时没清活跃锚"
         );
+    }
+
+    /// 命令层必须把"插件目录读不出来"原样交给页面。
+    ///
+    /// 这一层的空列表只有一种画法（「暂无插件」），所以 core 那三条用例守住的结论
+    /// 一旦在这里被折回去，就到不了用户眼前。先例：
+    /// `export_asks_readability_before_it_aggregates` 钉的是同一条"闸要排在取数之前"。
+    #[test]
+    fn the_plugin_list_command_hands_an_unreadable_dir_to_the_page() {
+        let src = include_str!("commands.rs");
+        let head = src
+            .find("pub fn get_plugins(")
+            .expect("get_plugins 找不到了（判据要跟着改）");
+        let body = &src[head..head
+            + src[head..]
+                .find("\n#[tauri::command]")
+                .expect("get_plugins 之后没有别的命令，切片前提变了")];
+
+        assert!(
+            body.contains("-> Result<Vec<PluginMeta>, String>"),
+            "签名回裸 Vec 就等于把\"读不出来\"与\"一个都没有\"并成一种结局"
+        );
+        assert!(
+            body.contains("list_discovered()?"),
+            "core 交出的原因必须原样往上抛，不许在这一层就地折成空列表"
+        );
+        // 夹具自己的前提：切片真盖住了这个命令的取数与映射，不是切在中间让上面两条空转
+        assert!(
+            body.contains("with_manager") && body.contains("PluginMeta {"),
+            "切片没盖住这个命令的取数与映射，上面两条是空转"
+        );
+    }
+
+    /// 插件页上两种结局长得不一样：空列表才是「暂无插件」，被拒绝要写原因。
+    ///
+    /// 这条只能按文本形状钉（无头环境里这一页要真窗口才画得出来），
+    /// 「断开插件目录后页面上那行红字真的说得出原因」登记为眼验项。
+    #[test]
+    fn the_plugin_page_keeps_missing_plugins_and_unreadable_dir_apart() {
+        let js = include_str!("../ui/js/plugins.js");
+        // 先摘掉注释行：本文件（和这段说明本身）里就会出现「暂无插件」这几个字，
+        // 带着注释判"读不出来那一支不许写它"会红在注释上、绿在该改的地方。
+        let code = js
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("export async function renderPlugins")
+            .expect("renderPlugins 找不到了");
+        let body = &code[at..at
+            + code[at..]
+                .find("export async function togglePlugin")
+                .expect("下一个函数切不出来，切片前提变了")];
+        let catch_at = body
+            .find("catch (e) {")
+            .expect("renderPlugins 里没有 catch 分支了 —— 拒绝通道断在哪一步？");
+        let catch_body = &body[catch_at..];
+
+        assert!(
+            catch_body.contains("插件列表读不出来"),
+            "被拒绝时要说清是\"没读出来\"，「加载失败」那种含糊话分不清是没装还是读不动"
+        );
+        assert!(
+            catch_body.contains("escapeHtml"),
+            "原因里带着目录路径，裸拼进 innerHTML 等于开一条注入通道"
+        );
+        assert!(
+            !catch_body.contains("暂无插件"),
+            "读不出来那一支不许又画成「暂无插件」—— 那正是本次要分开的两句"
+        );
+        let empty_at = body
+            .find("暂无插件")
+            .expect("空列表那一支的文案不见了，两种结局又并成一种了");
+        assert!(empty_at < catch_at, "「暂无插件」必须只在空列表那一支");
     }
 }
 
