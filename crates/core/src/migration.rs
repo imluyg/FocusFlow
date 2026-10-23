@@ -52,6 +52,7 @@ const AUX_DBS: &[&str] = &[
 
 /// 从旧数据目录导入全部数据到当前数据目录。
 pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
+    use crate::db::connection::Presence;
     let mut summary = ImportSummary::default();
 
     // 1) 年度键鼠库
@@ -69,8 +70,18 @@ pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
     // 2) 附属库：整体复制（表独立，无法按行合并）
     for aux in AUX_DBS {
         let src = src_dir.join(aux);
-        if !src.exists() {
-            continue;
+        // 这一问也走那把三态尺子：`!src.exists()` 在"旧目录里那份正被握着、属性问不出"时同样
+        // 回 false ⇒ 整块附属库被当成「旧目录里没有」跳过，而这一轮报的还是"导入完成"——
+        // 用户随后清掉旧目录，那份记账/日程/浏览历史就没了。只有 `NotFound` 才算确认没有。
+        match crate::data_location::probe_open(&src) {
+            Presence::No => continue,
+            Presence::Unreadable(reason) => {
+                summary.errors.push(format!(
+                    "{aux} 问不出旧目录里有没有（{reason}）—— 本次跳过这一份"
+                ));
+                continue;
+            }
+            Presence::Yes => {}
         }
         let dst = paths::data_dir().join(aux);
         // 自己导自己必须先看住：用户在目录选择器里挑到自己当前的 data/ 上是很常见的
@@ -115,23 +126,37 @@ pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
         let mut sidecar_fail: Option<String> = None;
         for suffix in ["-wal", "-shm"] {
             let from = crate::data_location::with_suffix(&src, suffix);
-            if !from.exists() {
-                continue;
-            }
             let to = crate::data_location::with_suffix(&dst, suffix);
-            if let Err(e) = std::fs::copy(&from, &to) {
-                if suffix == "-shm" {
-                    // 共享内存索引，SQLite 会照着 WAL 自己重建：拿不到就算了
-                    tracing::debug!("跳过 {aux} 的 -shm 副本: {e}");
+            // 这里也不许用 `!from.exists()`：源 `-wal` 正被别的程序握着时它回 false ⇒ 那段还没
+            // checkpoint 的记录被静默留在旧目录，而这一支照常 push `copied_aux`（界面说"已复制"）
+            match crate::data_location::probe_open(&from) {
+                Presence::No => continue,
+                // 共享内存索引，SQLite 会照着 WAL 自己重建：拿不到、问不出都算了
+                Presence::Unreadable(reason) if suffix == "-shm" => {
+                    tracing::debug!(
+                        "说不出 {aux} 的 -shm 在不在（{reason}）：它会照着 WAL 重建，跳过"
+                    );
                     continue;
                 }
-                sidecar_fail = Some(format!("{} → {}: {e}", from.display(), to.display()));
-                break;
+                Presence::Unreadable(reason) => {
+                    sidecar_fail = Some(format!("问不出 {} 在不在（{reason}）", from.display()));
+                    break;
+                }
+                Presence::Yes => {
+                    if let Err(e) = std::fs::copy(&from, &to) {
+                        if suffix == "-shm" {
+                            tracing::debug!("跳过 {aux} 的 -shm 副本: {e}");
+                            continue;
+                        }
+                        sidecar_fail = Some(format!("{} → {}: {e}", from.display(), to.display()));
+                        break;
+                    }
+                }
             }
         }
         if let Some(detail) = sidecar_fail {
             summary.errors.push(format!(
-                "{aux} 复制 WAL 失败（{detail}）—— 那里面可能还有未落盘记录"
+                "{aux} 的 WAL 没搬过来（{detail}）—— 那里面可能还有未落盘记录"
             ));
             restore_after_failed_copy(&mut summary, &dst, &kept);
             continue;
@@ -286,39 +311,58 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
     };
     if !dst_there {
         std::fs::copy(&src_path, &dst_path)?;
-        // 复制 WAL/SHM（若有未 checkpoint 数据）
+        // 复制 WAL/SHM（若有未 checkpoint 数据）。这一问原先用的是 `from.exists()`：源 `-wal`
+        // 正被别的程序握着（同步盘在传、杀软首扫、移动盘休眠）时它也回 false ⇒ 那段尾巴被静默
+        // 跳过，然后照常写 `imported_src_*` 标记、把整年报成"已导入" ⇒ 之后重导被大小+mtime 与
+        // 内容指纹一路跳过，那一年最新的一段**永久拿不回来**。问不出与搬不动是同一种结局，
+        // 所以两条都汇成同一个 abort：回滚刚复制的主库、报错、不写标记。
+        let mut wal_missing: Option<String> = None;
         for suffix in ["-wal", "-shm"] {
             // 不能用 `format!("{}{}", path.display(), suffix)`：display() 对非 UTF-8 的
             // 目录名是 lossy 转换，拼出来的路径根本不存在 ⇒ WAL 被静默跳过（它正是还没
             // 进主库的那一段），整年照报"已导入"并写标记。
             let from = crate::data_location::with_suffix(&src_path, suffix);
-            if from.exists() {
-                let to = crate::data_location::with_suffix(&dst_path, suffix);
-                if let Err(e) = std::fs::copy(&from, &to) {
-                    if suffix == "-shm" {
-                        // 共享内存索引，SQLite 会照着 WAL 自己重建：拿不到就算了
-                        tracing::debug!("跳过 {year} 年库的 -shm 副本: {e}");
-                        continue;
+            let to = crate::data_location::with_suffix(&dst_path, suffix);
+            match crate::data_location::probe_open(&from) {
+                Presence::No => continue,
+                // `-shm` 是共享内存索引，SQLite 会照着 WAL 自己重建：拿不到、问不出都算了
+                Presence::Unreadable(reason) if suffix == "-shm" => {
+                    tracing::debug!(
+                        "说不出 {year} 年库的 -shm 在不在（{reason}）：它会照着 WAL 重建，跳过"
+                    );
+                    continue;
+                }
+                Presence::Unreadable(reason) => {
+                    wal_missing = Some(format!("问不出 {} 在不在（{reason}）", from.display()));
+                    break;
+                }
+                Presence::Yes => {
+                    if let Err(e) = std::fs::copy(&from, &to) {
+                        if suffix == "-shm" {
+                            tracing::debug!("跳过 {year} 年库的 -shm 副本: {e}");
+                            continue;
+                        }
+                        // `-wal` 不一样：那里面是**还没 checkpoint 进主库的记录**。吞掉它
+                        // （原来是 `let _ =`）会继续往下走、把整年总量报成"已导入"，
+                        // 并写下 `imported_src_*` 标记 —— 之后重导会被大小+mtime 与内容
+                        // 指纹比对直接跳过（见下面的 same_size / key_log 指纹），
+                        // 那一年最新的一段就永久拿不回来了。
+                        // 回滚本身失败时不能还说"请重试"：半份库留在原地，重试就换了分支。
+                        wal_missing = Some(format!("{} → {}: {e}", from.display(), to.display()));
+                        break;
                     }
-                    // `-wal` 不一样：那里面是**还没 checkpoint 进主库的记录**。吞掉它
-                    // （原来是 `let _ =`）会继续往下走、把整年总量报成"已导入"，
-                    // 并写下 `imported_src_*` 标记 —— 之后重导会被大小+mtime 与内容
-                    // 指纹比对直接跳过（见下面的 same_size / key_log 指纹），
-                    // 那一年最新的一段就永久拿不回来了。
-                    // 所以：回滚刚复制的主库、报错、**不写标记**。回滚是为了让重试仍走
-                    // 这条整体复制分支；留着半份库会让下次导入改走合并分支，
-                    // 而它读的是已复制过来的主库（正缺那段尾巴）。
-                    // 回滚本身失败时不能还说"请重试"：半份库留在原地，重试就换了分支。
-                    let leftover = rollback_fresh_copy(&dst_path);
-                    return Err(anyhow::anyhow!(
-                        "复制 {year} 年库的 WAL 失败（{} → {}）: {e} —— \
-                         那里面可能还有未落盘记录，本次导入未完成。{}",
-                        from.display(),
-                        to.display(),
-                        retry_hint(&leftover)
-                    ));
                 }
             }
+        }
+        if let Some(detail) = wal_missing {
+            // 回滚是为了让重试仍走这条整体复制分支；留着半份库会让下次导入改走合并分支，
+            // 而它读的是已复制过来的主库（正缺那段尾巴）。
+            let leftover = rollback_fresh_copy(&dst_path);
+            return Err(anyhow::anyhow!(
+                "{year} 年库的 WAL 没搬过来（{detail}）—— \
+                 那里面可能还有未落盘记录，本次导入未完成。{}",
+                retry_hint(&leftover)
+            ));
         }
         // 用 Rusqlite 打开确认可用 + 建聚合表
         let conn = connection::open_rw(&dst_path)?;
@@ -836,6 +880,170 @@ mod tests {
             "我这一年还在用".as_bytes(),
             "这一支不留档，覆盖一次就再也找不回来"
         );
+    }
+
+    /// 源 `-wal` **问不出在不在**时不许静默跳过：年度库这一支随后要写导入标记，
+    /// 缺的那段尾巴就永久拿不回来了（与"搬不动"那一支汇成同一个出口）。
+    #[cfg(windows)]
+    #[test]
+    fn an_unanswerable_source_wal_stops_the_year_import() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("import_src_wal");
+        let year = 2025;
+        let src_dir = _dir.path().join("src_year");
+        std::fs::create_dir_all(&src_dir).expect("建源目录");
+        let src = src_dir.join(format!("focusflow_{year}.db"));
+        std::fs::write(&src, "main").expect("写源主库");
+        let src_wal = crate::data_location::with_suffix(&src, "-wal");
+        std::fs::write(&src_wal, "tail").expect("写源 WAL");
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&src_wal)
+            .expect("占位句柄应能打开");
+        assert!(
+            std::fs::File::open(&src_wal).is_err(),
+            "夹具没成立：这个句柄没挡住读，测不到「问不出」那一支"
+        );
+
+        let mut summary = ImportSummary::default();
+        let err = import_year_db(&src_dir, year, &mut summary)
+            .expect_err("源 WAL 问不出时必须停下，不许照报已导入");
+        let text = err.to_string();
+        assert!(
+            text.contains("WAL") && text.contains("问不出"),
+            "要说清缺的是那段尾巴、以及是哪一问没答上: {text}"
+        );
+        // 半份目标库要回滚掉：留着它，下次导入改走合并分支、读的正是缺尾巴的那份
+        assert!(
+            !crate::paths::year_db_path(year).exists(),
+            "整库复制的半成品必须回滚，否则下次换分支读半份"
+        );
+
+        drop(_holder);
+        assert_eq!(
+            std::fs::read(&src_wal).expect("源 WAL 要原样留在旧目录"),
+            "tail".as_bytes(),
+            "这一步不该碰源文件"
+        );
+    }
+
+    /// 附属库那一支同理：问不出要进 `errors`，不许只 push `copied_aux`（界面那句"已复制"）。
+    #[cfg(windows)]
+    #[test]
+    fn an_unanswerable_source_wal_is_not_reported_as_copied_for_aux_dbs() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("import_aux_src_wal");
+        let src_dir = _dir.path().join("src_aux");
+        std::fs::create_dir_all(&src_dir).expect("建源目录");
+        let src = src_dir.join("focusflow_accounting.db");
+        std::fs::write(&src, "main").expect("写源附属库");
+        let src_wal = crate::data_location::with_suffix(&src, "-wal");
+        std::fs::write(&src_wal, "tail").expect("写源 WAL");
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&src_wal)
+            .expect("占位句柄应能打开");
+        assert!(
+            std::fs::File::open(&src_wal).is_err(),
+            "夹具没成立：这个句柄没挡住读，测不到「问不出」那一支"
+        );
+
+        let summary = import_legacy_data(&src_dir);
+        assert!(
+            summary
+                .errors
+                .iter()
+                .any(|e| e.contains("WAL") && e.contains("问不出")),
+            "要说清是哪一段没搬来、哪一问没答上: {:?}",
+            summary.errors
+        );
+        assert!(
+            !summary.copied_aux.iter().any(|a| a.contains("accounting")),
+            "问不出的那一支不许算成已复制: {:?}",
+            summary.copied_aux
+        );
+    }
+
+    /// 旧目录里那份**主库**问不出时要点头名，不许当成「旧目录里没有这一份」而照报完成。
+    ///
+    /// 用户随后清掉旧目录，那份番茄钟/日程数据就没了 —— 而 `Path::exists()` 在属性问不出的
+    /// 那一刻回的就是 false。对照腿钉住"撤掉占用就照常导入"，防修法做成"握着就永远导不了"。
+    #[cfg(windows)]
+    #[test]
+    fn an_unanswerable_aux_source_is_said_out_loud_not_skipped_silently() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("import_aux_src_main");
+        let src_dir = _dir.path().join("src_main");
+        std::fs::create_dir_all(&src_dir).expect("建源目录");
+        let src = src_dir.join("focusflow_pomodoro.db");
+        std::fs::write(&src, "main").expect("写源库");
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&src)
+            .expect("占位句柄应能打开");
+        assert!(
+            std::fs::File::open(&src).is_err(),
+            "夹具没成立：这个句柄没挡住读，测不到「问不出」那一支"
+        );
+
+        let summary = import_legacy_data(&src_dir);
+        assert!(
+            summary
+                .errors
+                .iter()
+                .any(|e| e.contains("pomodoro") && e.contains("问不出")),
+            "被握着的那一份要点头名: {:?}",
+            summary.errors
+        );
+        assert!(
+            !summary.copied_aux.iter().any(|a| a.contains("pomodoro")),
+            "没搬成就不许算已复制: {:?}",
+            summary.copied_aux
+        );
+
+        drop(_holder);
+        let again = import_legacy_data(&src_dir);
+        assert!(
+            again.copied_aux.iter().any(|a| a.contains("pomodoro")),
+            "撤掉占用后这一份要照常导入，实得 {:?}",
+            again
+        );
+    }
+
+    /// 接线判据：导入链那几问都走同一把尺子（`exists()` 只许留在"删不掉的残留"那一类判断题上）。
+    #[test]
+    fn the_import_chain_asks_its_source_files_with_one_ruler() {
+        let text = include_str!("migration.rs");
+        let prod = &text[..text.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("probe_open(&from)").count(),
+            3,
+            "三处 sidecar 那一问（留档、附属库复制、年度库复制）都要走三态尺子"
+        );
+        for shape in [
+            "probe_open(&src)",
+            "probe_open(dst)",
+            "probe_open(&dst_path)",
+        ] {
+            assert!(code.contains(shape), "那一问要走共用的尺子，少了 {shape}");
+        }
+        for forbidden in ["if from.exists()", "if !src.exists()", "if !dst.exists()"] {
+            assert!(
+                !code.contains(forbidden),
+                "那一问不许退回 exists() 猜：{forbidden}"
+            );
+        }
     }
 
     /// 把**当前**数据目录当成导入源（目录选择器里挑到自己 data/ 上很常见）：
