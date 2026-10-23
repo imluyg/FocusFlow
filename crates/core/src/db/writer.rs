@@ -1090,10 +1090,29 @@ fn reanchor_retry_due(last_try: Option<Instant>, now: Instant, gap: Duration) ->
 ///
 /// 三个结局要分开：改名走 ⇒ 第二个字段是副本路径；改不动但删掉了原文件 ⇒ 第二个字段是
 /// `None`（根本没有副本可"等资源落库后再删"）；两样都失败 ⇒ **不回放**、文件留在原地。
+///
+/// 开头那一问也分两支：确认没有这个文件 ⇒ 安静（首次启动本来就没东西要回放）；
+/// 文件在而这一刻读不动 ⇒ 同样不回放，但**要出一行**，否则"这批还没拿到"与
+/// "本来就没有这批"在日志里长成同一个样子。
 fn take_recovery() -> (Option<AggDeltas>, Option<std::path::PathBuf>) {
     let path = recovery_path();
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return (None, None);
+    // 「还没这个文件」与「这一刻读不动」是两件事。原先一句
+    // `let Ok(text) = read_to_string(&path) else { return (None, None) }` 把它们折成
+    // 同一个安静早退：上一轮崩之前攒下的增量其实还躺在盘上（被杀软实时扫描握着、
+    // 同步盘占位、移动盘刚唤醒），日志里却一个字没有，与"干净退出、本来就没东西要回放"
+    // 一模一样 —— 而用户能做的（关掉握着文件的程序）恰好只能对着前一种形状说。
+    // 结论仍然是保守的"不回放"，只是把问不出的那一支说出声。
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if crate::data_location::is_confirmed_absent(&e) => return (None, None),
+        Err(e) => {
+            tracing::error!(
+                "启动回放读不出恢复文件（{}）: {e} —— 这一批不回放，文件留在原地，下次启动会再试。\
+                 每次都出这一行，请查握着这个文件的程序（杀软实时扫描、同步盘占位）。",
+                path.display()
+            );
+            return (None, None);
+        }
     };
     let kept = recovery_kept_path();
     // Windows 上目标已存在时 rename 会失败（上次崩留下的副本还没到删除时机）→ 先清掉它。
@@ -2590,6 +2609,61 @@ mod tests {
             "没有真的留下 kept 副本，就不能登记一个以后要删的路径"
         );
         assert!(path.exists(), "清不掉就留在原地，给人留一个能查的现场");
+    }
+
+    /// 「这一刻读不出恢复文件」要出声，不许与「本来就没有这个文件」共用同一个安静早退。
+    ///
+    /// 形状：上一轮崩之前攒下的增量还躺在盘上，而这一刻被别的程序独占着（杀软实时扫描、
+    /// 同步盘握句柄）。旧写法一句 `let Ok(text) = read_to_string(&path) else { return .. }`
+    /// 连一行日志都不写，与"干净退出、没东西要回放"完全同形 —— 而用户唯一能做的事
+    /// （松开握着这个文件的程序）恰恰只有前一种形状才说得出该不该做。
+    /// 结论照旧保守：不回放、文件留在原地；这一场改的只是"问不出要说得出为什么"。
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_recovery_file_says_so() {
+        use crate::logger::capture_logs;
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_recovery_unreadable");
+        let path = recovery_path();
+        std::fs::create_dir_all(path.parent().expect("恢复文件该有个目录")).expect("建数据目录");
+        std::fs::write(
+            &path,
+            r#"{"daily":[[1,3]],"hourly":[],"keys":[],"active":[],"apps":[],"devices":[],"device_keys":[],"last_ts":0}"#,
+        )
+        .expect("写恢复文件");
+        // 放行 0 号共享 ⇒ 连读都挡住 ⇒ 走的是"读不动"那一支，不是"没有这个文件"
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .expect("独占句柄应能打开");
+        assert!(
+            std::fs::read_to_string(&path).is_err(),
+            "夹具没成立：这个句柄没挡住读，测不到「读不动」那一支"
+        );
+
+        let ((deltas, leftover), logs) = capture_logs(take_recovery);
+        assert!(deltas.is_none(), "读不动时保守不回放（这条口径不动）");
+        assert!(leftover.is_none(), "没真的留下副本就不登记待删路径");
+        assert!(
+            logs.iter().any(|l| l.contains("读不出恢复文件")),
+            "读不动要留下一行，实得 {logs:?}"
+        );
+        assert!(
+            path.exists(),
+            "读不动更要留在原地，否则连人能查的现场都没了"
+        );
+
+        // 对照腿：位置上空着 ⇒ 同样 None，但必须安静（首次启动本来就没东西要回放）
+        drop(_holder);
+        std::fs::remove_file(&path).expect("撤掉夹具文件");
+        let ((d2, _), logs2) = capture_logs(take_recovery);
+        assert!(d2.is_none(), "确认没有这个文件也是 None");
+        assert!(
+            !logs2.iter().any(|l| l.contains("恢复文件")),
+            "「本来就没有」不该出一行，实得 {logs2:?}"
+        );
     }
 
     /// 一批**已经落库**的增量，碰上"删不掉的恢复文件"：内容必须被中和掉。
