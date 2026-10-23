@@ -1332,12 +1332,29 @@ fn remove_backup(db: &Path) -> Result<(), String> {
     }
 }
 
+/// 备份目录里**主库那一格**问得出什么结论：在 / 确认没有 / 说不出。
+///
+/// 不许用 `Path::exists()`：它对任何一次失败都回 `false`，于是"别的程序正握着这个文件"、
+/// "杀软首扫"、"移动盘刚唤醒"全被读成「主库已不在」。清扫紧接着就会把旁边那份**非空**
+/// `-wal` 当孤儿删掉 —— 删掉的正是只写在 WAL 里、还没并回主库的那几笔，而源库指纹已经
+/// 盖上，那一年之后的备份都会被 `year_db_needs_backup` 跳过，少掉的量再也补不回来。
+/// 判据取"真开一次只读句柄"（与 `queries::unopenable_years` 同一个思路）：挡读的占用
+/// 落在 `Unreadable`，只有 `NotFound` 算 `No`（`data_location::is_confirmed_absent`）。
+fn backup_main_presence(db: &Path) -> connection::Presence {
+    match std::fs::File::open(db) {
+        Ok(_) => connection::Presence::Yes,
+        Err(e) if crate::data_location::is_confirmed_absent(&e) => connection::Presence::No,
+        Err(e) => connection::Presence::Unreadable(format!("{}: {e}", db.display())),
+    }
+}
+
 /// 清理备份目录里遗留的 sidecar（`-wal`/`-shm`）垃圾。
 ///
 /// 旧版备份会把源库的 WAL 头复制进备份文件、并在旁边留下 sidecar，而轮转只认
 /// `.db` —— 被轮转掉的备份留下孤儿 sidecar，保留下来的备份也一直挂着两个垃圾文件。
-/// 这里的判据是安全的：**主库已不存在**（孤儿），或**对应 `-wal` 为空/缺失**
-/// （内容已全部并回主库）。非空 WAL 绝不删（里面可能有未合并的数据）。
+/// 这里的判据是安全的：**主库已确认不存在**（孤儿），或**对应 `-wal` 为空/缺失**
+/// （内容已全部并回主库）。非空 WAL 绝不删（里面可能有未合并的数据）；主库那一格
+/// **问不出**时整条跳过 —— 既不按孤儿处理也不按"还在"处理（见 `backup_main_presence`）。
 pub fn sweep_stale_sidecars() -> usize {
     let dir = paths::backup_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1355,12 +1372,22 @@ pub fn sweep_stale_sidecars() -> usize {
         else {
             continue;
         };
-        let db_exists = dir.join(base).exists();
+        let db_path = dir.join(base);
         let wal = dir.join(format!("{base}-wal"));
+        // 主库**确认已不在**才算孤儿；这一次问不出就整条跳过，绝不折成"没有"
+        let orphan = match backup_main_presence(&db_path) {
+            connection::Presence::No => true,
+            connection::Presence::Yes => false,
+            connection::Presence::Unreadable(reason) => {
+                tracing::warn!(
+                    "备份清扫跳过 {name}：问不出主库在不在（{reason}）—— 它的 sidecar 这一轮一个都不删，下次再试"
+                );
+                continue;
+            }
+        };
         // 主库还在时，只有空/缺失的 WAL 才能动；非空或读不到大小都必须留着
         // （后者与 finalize_backup 共用同一把尺子，别在这里另抄一份）。
-        // 主库已不在的孤儿 sidecar 留着没用，直接清。
-        let can_drop = !db_exists || wal_can_be_dropped(false, &wal);
+        let can_drop = orphan || wal_can_be_dropped(false, &wal);
         if can_drop && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
@@ -3251,6 +3278,15 @@ mod tests {
             !code.contains(".map(|m| m.len() == 0)"),
             "别再自己抄一份大小判据"
         );
+        assert!(
+            !code.contains(".exists()"),
+            "主库在不在不许用 exists() 猜：stat 问不出会被读成「已不在」⇒ 非空 WAL 当孤儿删掉"
+        );
+        assert_eq!(
+            code.matches("backup_main_presence(&db_path)").count(),
+            1,
+            "问主库在不在只许走那一把尺子，且恰好一次"
+        );
     }
 
     /// 「列出来却不在原位」的那一年必须算进没备份出去的清单，不许当成"没有要备份的"。
@@ -4555,6 +4591,64 @@ mod tests {
             assert!(!d.has_daily_mismatch);
             assert!(d.hourly_mismatch_days.is_empty());
         }
+    }
+
+    /// 主库那一格**问不出**（被别的程序挡着读）时，清扫不许把它的 sidecar 当孤儿删掉。
+    ///
+    /// 旧写法 `dir.join(base).exists()` 在这种场合回 `false` ⇒ `!db_exists` 短路掉
+    /// `wal_can_be_dropped` ⇒ 那份**非空** `-wal` 被删：只写在 WAL 里的几笔从这份备份里永久
+    /// 消失，而源库指纹已经盖上，那一年之后的备份都会被跳过。三档各留一条腿：问不出 /
+    /// 确认在 / 确认没有 —— 第三条腿是防修法做成"永远不删"。
+    #[cfg(windows)]
+    #[test]
+    fn an_unanswerable_main_file_does_not_orphan_its_sidecars() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("backup_sweep_unreadable");
+        let dir = paths::backup_dir();
+        std::fs::create_dir_all(&dir).expect("建备份目录");
+        let db = dir.join("focusflow_2026_20260910_100000.db");
+        let wal = crate::data_location::with_suffix(&db, "-wal");
+        std::fs::write(&db, b"x").expect("写主库");
+        std::fs::write(&wal, b"data").expect("写非空 WAL");
+
+        // ① 问不出：占位句柄放行 0 号共享 ⇒ 连读都挡 ⇒ 这一档不等于「没有主库」
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&db)
+            .expect("占位句柄应能打开");
+        assert!(
+            std::fs::File::open(&db).is_err(),
+            "夹具没成立：这个句柄没挡住读，测不到「问不出」那一支"
+        );
+        let (removed, logs) = crate::logger::capture_logs(sweep_stale_sidecars);
+        assert_eq!(removed, 0, "问不出主库在不在时一个 sidecar 都不许删");
+        assert!(wal.exists(), "非空 WAL 绝不能被当成孤儿删掉");
+        assert!(
+            logs.iter().any(|l| l.contains("问不出主库在不在")),
+            "跳过要留下一行，实得 {logs:?}"
+        );
+
+        // ② 确认在（撤掉占用）：同一份非空 WAL 仍保留，但不该再喊「问不出」
+        drop(_holder);
+        let (r2, logs2) = crate::logger::capture_logs(sweep_stale_sidecars);
+        assert_eq!(r2, 0, "主库在、WAL 非空 ⇒ 照样保留");
+        assert!(wal.exists(), "主库确认还在时 WAL 更不该消失");
+        assert!(
+            !logs2.iter().any(|l| l.contains("问不出主库在不在")),
+            "问得出来就不该说问不出，实得 {logs2:?}"
+        );
+
+        // ③ 确认没有：孤儿 sidecar 照旧要被清掉
+        std::fs::remove_file(&db).expect("撤掉主库文件");
+        let (r3, logs3) = crate::logger::capture_logs(sweep_stale_sidecars);
+        assert_eq!(r3, 1, "主库确认不在时非空 WAL 才是孤儿，该被清掉");
+        assert!(!wal.exists(), "孤儿 WAL 应已删除");
+        assert!(
+            !logs3.iter().any(|l| l.contains("问不出主库在不在")),
+            "确认没有不等于问不出，实得 {logs3:?}"
+        );
     }
 
     /// 轮转删除旧备份时要连 sidecar 一起删；遗留的 sidecar 垃圾也要被清理
