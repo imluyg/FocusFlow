@@ -76,6 +76,12 @@ function get_view()
         widgets[#widgets + 1] = { type = "label", text = "⚠ Edge 读到了，但本程序的统计目录写不进去（同步盘占位、只读移动盘或被杀软锁定），请让该目录可写后再刷新" }
     elseif state == "fail" then
         widgets[#widgets + 1] = { type = "label", text = "⚠ 读取失败：Edge 历史库被占用或不可读（Edge 后台进程可能仍在运行），请稍后重试" }
+    elseif state == "no_source" then
+        -- 与 fail 分开：这一条不是"Edge 正开着"。程序读的是
+        -- %LOCALAPPDATA%\Microsoft\Edge\User Data\Default\History，
+        -- 没装 Edge、用的是 Profile 1 之类的其它 Profile、或便携版把数据放别处，都会走到这里。
+        -- 叫用户去关浏览器、再点刷新，一百次也不会好。
+        widgets[#widgets + 1] = { type = "label", text = "⚠ 没找到 Edge 的历史库（不在默认的 User Data\\Default 里）。没装 Edge、用的是别的 Profile（如 Profile 1）或便携版时就是这样 —— 这跟 Edge 开不开着没关系，具体路径写在日志里" }
     end
     if hint then
         widgets[#widgets + 1] = { type = "label", text = hint }

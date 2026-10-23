@@ -239,7 +239,23 @@ fn cleanup_stale_copies_once() {
     });
 }
 
-/// 在一份 Edge History 快照上执行一批查询，返回 Option（None 表示读取失败/被锁）。
+/// 一次快照读取的三种结局。
+#[derive(Debug, PartialEq, Eq)]
+enum Snapshot<T> {
+    /// 查到了
+    Value(T),
+    /// **没找到** Edge 的历史库（带路径）：没装 Edge、别的 Profile、便携版
+    Absent(String),
+    /// 找到了但这一轮读不出来（被独占、库过大不敢复制、副本三轮都失败）
+    Unreadable(String),
+}
+
+/// 在一份 Edge History 快照上执行一批查询，交出**这一轮到底是哪一种结局**。
+///
+/// 原先回 `Option`：`None` 同时表示"没找到这个文件"（那条早退连一行日志都不写）与
+/// "找到了但读不动"（各有一行 warn），调用方只能把两者并成一句
+/// 「Edge 历史库被占用或不可读，请稍后重试」。那句话对"没装 Edge / 用的是 Profile 1"
+/// 的用户是错的建议 —— 关浏览器、重启、再点刷新，一百次也不会好。
 ///
 /// 策略：
 /// 1) 只读直连（busy_timeout 300ms）：Edge 未运行或锁间隙时最快。
@@ -250,13 +266,28 @@ fn cleanup_stale_copies_once() {
 /// 之所以是「一批查询」而不是「每个查询各走一遍」：刷新一次要同时取今日数与
 /// 总数，若各自兜底，被锁时最坏要走两轮 300ms busy 等 + 两轮各 3 次 ≤100MB 复制。
 /// 共用快照后只剩一轮，且两个数取自同一时点，不会出现「总数比昨天小」。
-fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
+fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Snapshot<T> {
     #[cfg(test)]
     SNAPSHOT_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     cleanup_stale_copies_once();
     let path = edge_history_path();
-    if !path.exists() {
-        return None;
+    // 「在不在」问成三态（判据同 `data_location::is_confirmed_absent`）：确认没有 ⇒
+    // 没装/别的 Profile；stat 自己失败 ⇒ 不许冒充"没装"，走读不出来那一句。
+    match std::fs::metadata(&path) {
+        Ok(_) => {}
+        Err(e) if crate::data_location::is_confirmed_absent(&e) => {
+            tracing::warn!(
+                "没找到 Edge 的历史库（{}）—— 没装 Edge、用的是别的 Profile（如 Profile 1）\
+                 或便携版时就是这个形状；这不是「Edge 正开着把库占住了」",
+                path.display()
+            );
+            return Snapshot::Absent(format!("{}", path.display()));
+        }
+        Err(e) => {
+            let why = format!("说不出 Edge 历史库在不在（{}）: {e}", path.display());
+            tracing::error!("{why}");
+            return Snapshot::Unreadable(why);
+        }
     }
 
     // 1) 只读直连：rusqlite 打开不一定失败（锁在首个查询才报 SQLITE_BUSY），
@@ -267,7 +298,7 @@ fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
     ) {
         let _ = conn.busy_timeout(EDGE_BUSY_TIMEOUT);
         if let Some(v) = f(&conn) {
-            return Some(v);
+            return Snapshot::Value(v);
         }
     }
 
@@ -278,7 +309,10 @@ fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
             "Edge 历史库过大（{}MB），跳过复制（只读直连被锁定）",
             size / (1024 * 1024)
         );
-        return None;
+        return Snapshot::Unreadable(format!(
+            "Edge 历史库过大（{}MB），这次不复制快照去读",
+            size / (1024 * 1024)
+        ));
     }
     let temp = temp_copy_path();
     for attempt in 0..3 {
@@ -297,7 +331,7 @@ fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
             if let Some(v) = f(&conn) {
                 drop(conn);
                 discard_temp_copy(&temp);
-                return Some(v);
+                return Snapshot::Value(v);
             }
         }
         discard_temp_copy(&temp);
@@ -305,7 +339,7 @@ fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Option<T> {
         std::thread::sleep(std::time::Duration::from_millis(150));
     }
     tracing::warn!("Edge 历史库无法读取（直连被锁且复制失败）");
-    None
+    Snapshot::Unreadable("直连被锁，且三轮复制快照都没读到".to_string())
 }
 
 /// 把 Edge 历史库连同 sidecar 复制成一份可查询的快照。
@@ -527,6 +561,15 @@ const ST_FAIL: u8 = 3;
 /// 得先让那个目录可写（同步盘、杀软、只读移动盘）。过去两者折成一个 `fail`，
 /// 挂件照着后一句提示，用户就一直在关 Edge。
 const ST_WRITE_FAIL: u8 = 4;
+/// 压根**没找到** Edge 的历史库（不是它被占用）。
+///
+/// 与 `ST_FAIL` 分开的原因和上面那条一样：给用户的话完全不同。路径是写死的
+/// `%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\History`，所以"没装 Edge"、
+/// "用的是 `Profile 1` 之类的其它 Profile"、"便携版把 User Data 放在别处"这三种
+/// 常见形态都落在这里 —— 原先它们和"Edge 正开着、锁着库"共用一句
+/// 「被占用或不可读…请稍后重试」，于是用户反复关 Edge、重启浏览器，重试一百次
+/// 也不会好，而日志一个字都没有（那条早退既没 warn 也没 error）。
+const ST_NO_SOURCE: u8 = 5;
 
 /// 一次刷新失败在哪一步。
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
@@ -535,6 +578,8 @@ pub enum RefreshFail {
     Read,
     /// Edge 读到了，本地缓存写不进去
     Write,
+    /// 没找到 Edge 的历史库（没装 Edge、别的 Profile、便携版）—— 重试不解决问题
+    NoSource,
 }
 
 /// RUNNING 超过这个时长就认定为卡死。
@@ -640,6 +685,7 @@ fn finish_round(gen: u64, res: Result<(), RefreshFail>) {
         Ok(()) => ST_OK,
         Err(RefreshFail::Read) => ST_FAIL,
         Err(RefreshFail::Write) => ST_WRITE_FAIL,
+        Err(RefreshFail::NoSource) => ST_NO_SOURCE,
     };
     slot.started_at = None;
 }
@@ -654,10 +700,12 @@ fn release_round(gen: u64) {
     slot.started_at = None;
 }
 
-/// 一次后台刷新的状态：`idle` / `running` / `ok` / `fail` / `write_fail`。
+/// 一次后台刷新的状态：`idle` / `running` / `ok` / `fail` / `write_fail` / `no_source`。
 ///
-/// `fail` 与 `write_fail` 是两件事（读不到 Edge vs 写不进自己的缓存），挂件要分开说；
-/// 第三方脚本把两者都当"不是 ok"处理仍然正确，所以这是**加值**、没有改旧值的含义。
+/// 三种失败各说一句：读不到 Edge（`fail`，去关 Edge 有用）、写不进自己的缓存
+/// （`write_fail`，要让 `data/` 可写）、压根没找到 Edge 的历史库（`no_source`，
+/// 关浏览器与重试都不解决问题，要指的是 Profile 路径）。
+/// 第三方脚本把三者都当"不是 ok"处理仍然正确，所以这些是**加值**、没有改旧值的含义。
 //////
 /// 读的时候顺手自愈：光靠 `spawn_update_today` 里的接管救不了刷新按钮 ——
 /// 线程卡死后插件会一直显示「正在后台读取」，用户连再点一次的入口都没有。
@@ -683,6 +731,7 @@ fn refresh_state_at(now: std::time::Instant) -> &'static str {
         ST_OK => "ok",
         ST_FAIL => "fail",
         ST_WRITE_FAIL => "write_fail",
+        ST_NO_SOURCE => "no_source",
         _ => "idle",
     }
 }
@@ -692,9 +741,10 @@ const BACKFILL_DAYS: i64 = 30;
 
 /// 更新今天并返回 (结果, 今日数, 总数)。
 ///
-/// 两种失败要分得开（见 [`RefreshFail`]）：读侧任一步失败（Edge 库被锁/不可读）是
-/// `Err(Read)` 且两个数都是 0；读到数但**没写进本地缓存**是 `Err(Write)`，数值照样交回
-/// —— 把后者也说成"读失败"会让用户去关 Edge，而他的 `data/` 目录才是问题所在。
+/// 三种失败要分得开（见 [`RefreshFail`]）：Edge 库被锁/副本失败是 `Err(Read)` 且两个数都是 0；
+/// 压根**没找到** Edge 的历史库是 `Err(NoSource)`（没装、别的 Profile、便携版 —— 关浏览器
+/// 与重试都不解决问题）；读到数但**没写进本地缓存**是 `Err(Write)`，数值照样交回
+/// —— 把后两者也说成"读失败"会让用户去关 Edge，而他的 `data/` 目录或路径假设才是问题所在。
 /// 调用方据此提示用户，避免把失败静默当成"0 条记录"。同一次快照顺手把近 30 天里
 /// 不可信的历史计数重查一遍。
 ///
@@ -725,7 +775,7 @@ pub fn update_today_edge_history() -> (Result<(), RefreshFail>, i64, i64) {
         Some((day, total, filled))
     });
     match batch {
-        Some((today_count, total, filled)) => {
+        Snapshot::Value((today_count, total, filled)) => {
             let persisted = save_edge_history_count(today, today_count)
                 .and_then(|_| save_edge_history_meta("total", total));
             let mut backfill_failed = 0usize;
@@ -765,7 +815,11 @@ pub fn update_today_edge_history() -> (Result<(), RefreshFail>, i64, i64) {
                 }
             }
         }
-        _ => (Err(RefreshFail::Read), 0, 0),
+        // 「没找到 Edge 的历史库」与「找到了但读不动」分开：前者叫用户去关 Edge 是错的建议，
+        // 具体路径已经由 `with_edge_snapshot` 写进日志（面板这一头只有状态字符串，
+        // 带不动路径 —— 挂件那句要指的是 Profile 路径这件事）。
+        Snapshot::Absent(_) => (Err(RefreshFail::NoSource), 0, 0),
+        Snapshot::Unreadable(_) => (Err(RefreshFail::Read), 0, 0),
     }
 }
 
@@ -1172,9 +1226,9 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM urls", [], |r| r.get::<_, i64>(0))
                 .ok()
         });
-        assert_eq!(
-            got, None,
-            "缺 WAL 的副本被拿去查了；补档历史日会把数永久写小"
+        assert!(
+            matches!(got, Snapshot::Unreadable(_)),
+            "缺 WAL 的副本被拿去查了；补档历史日会把数永久写小。实得 {got:?}"
         );
         let _ = std::fs::remove_dir_all(&bad_wal);
     }
@@ -1634,7 +1688,7 @@ mod tests {
     #[test]
     fn the_bundled_widget_has_a_line_for_each_failing_state() {
         let lua = include_str!("../plugins/edge_history_plugin.lua");
-        for state in ["running", "fail", "write_fail"] {
+        for state in ["running", "fail", "write_fail", "no_source"] {
             let needle = format!("state == \"{state}\"");
             assert!(
                 lua.contains(&needle),
@@ -1655,6 +1709,86 @@ mod tests {
         assert!(
             chunk.contains("写不进去"),
             "要把问题指到本程序的统计目录上：{chunk}"
+        );
+
+        // no_source 那一支不许复用 `fail` 的话术：路径是写死的 `User Data\Default`，
+        // 没装 Edge / 别的 Profile / 便携版都会走到这里，而"关掉 Edge 再试"对它们没用。
+        let ns_at = lua
+            .find("state == \"no_source\"")
+            .expect("挂件没有 no_source 这一支");
+        let ns_rest = &lua[ns_at..];
+        let ns_chunk = &ns_rest[..ns_rest.find("end").expect("这一支没有收尾")];
+        assert!(
+            !ns_chunk.contains("请稍后重试") && !ns_chunk.contains("Edge 后台进程"),
+            "没找到库那一支不该叫用户去关 Edge、再试一次: {ns_chunk}"
+        );
+        assert!(
+            ns_chunk.contains("Profile"),
+            "要说清这是路径／Profile 的事: {ns_chunk}"
+        );
+    }
+
+    /// 「没找到 Edge 的历史库」与「找到了但读不动」必须是两种结局。
+    ///
+    /// 原先 `with_edge_snapshot` 回 `Option`：那条 `if !path.exists() { return None }`
+    /// 连一行日志都不写，而调用方把两种 None 并成一句「被占用或不可读…请稍后重试」。
+    /// 于是没装 Edge、用的是 `Profile 1`、或便携版把数据放在别处的机器上，
+    /// 用户被反复支去关浏览器，日志里却始终一个字没有。
+    #[test]
+    fn a_missing_edge_history_is_not_reported_as_a_locked_one() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("edge_no_source");
+
+        // —— 确认没有 ⇒ Absent，且要点名路径、出声 ——
+        let missing = paths::data_dir().join("this_edge_history_is_not_there.db");
+        *EDGE_PATH_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(missing.clone());
+        let _fx = EdgeFixture;
+        let (outcome, logs) = crate::logger::capture_logs(|| {
+            with_edge_snapshot(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM urls", [], |r| r.get::<_, i64>(0))
+                    .ok()
+            })
+        });
+        let Snapshot::Absent(shown) = outcome else {
+            panic!("文件本来不存在必须归 Absent，实得 {outcome:?}");
+        };
+        assert!(
+            shown.contains("this_edge_history_is_not_there"),
+            "要说清去找哪个路径没找到: {shown}"
+        );
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("没找到") && !l.contains("占用")),
+            "这一条要出声，而且不许顺口说成被占用: {logs:?}"
+        );
+
+        // 面板拿到的状态也得分开：挂件那句"去关 Edge"来自 fail
+        let (res, today, total) = update_today_edge_history();
+        assert_eq!(
+            res,
+            Err(RefreshFail::NoSource),
+            "没找到库不是 Read 失败，挂件那句建议对它是错的"
+        );
+        assert_eq!((today, total), (0, 0), "什么都没读到时就该交回 0");
+        // 状态串是挂件唯一能分开的东西：`update_today_edge_history` 自己不动槽位
+        // （那是线程收尾时 `finish_round` 的事），所以这一条要按同样的顺序走一遍。
+        let gen = fake_running_round(std::time::Instant::now());
+        finish_round(gen, res);
+        assert_eq!(
+            refresh_state(),
+            "no_source",
+            "没找到库要和\"被占用\"分成两个状态串，否则挂件那句还是同一句话"
+        );
+
+        // 对照腿：Edge 库真在、能读 ⇒ 仍走 Value（别把这条修成见谁都报 no_source）
+        let _fx2 = write_edge_fixture("present", &[chrome_start_of(Local::now().date_naive())]);
+        let got = with_edge_snapshot(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM urls", [], |r| r.get::<_, i64>(0))
+                .ok()
+        });
+        assert!(
+            matches!(got, Snapshot::Value(1)),
+            "读得到时必须照常交回数值，实得 {got:?}"
         );
     }
 
