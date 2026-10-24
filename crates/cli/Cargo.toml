@@ -14,5 +14,11 @@ tracing.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 
+[dev-dependencies]
+# 用例里的「隔离临时程序目录」助手（paths::test_app_dir / test_app_dir_lock）挂在 core 的
+# test-utils 特征上，只对 dev 构建打开（与 desktop 同一套路）。这里要用它，是因为
+# 读命令的"读不全就拒绝"得对着真库跑一遍才算被测到：形状判据只盯得住调用形态。
+focusflow-core = { path = "../core", features = ["test-utils"] }
+
 [lints]
 workspace = true

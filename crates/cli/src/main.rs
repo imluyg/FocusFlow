@@ -400,30 +400,63 @@ fn check_years_readable() -> Result<Vec<i32>, String> {
     db::queries::check_years_readable().map_err(|e| e.to_string())
 }
 
+/// 读数自己交回的"这一轮没答上来的问"要说成一段话（纯函数：判据要能断言它说了哪一栏、
+/// 哪一年，而不是只在终端上闪一下）。
+///
+/// 为什么还需要这一层，`check_years_readable` 那道闸不够：它问的是"这个库开得住吗"，
+/// 而**库头合法、后半段页坏**的那一份 SQLite 是开得住的 —— 真读到某一栏的行才失败。
+/// 那种失败只有真读一遍才知道，所以它住在各条读数的 `unreadable` 里，不在闸里。
+/// 少了这一段，`--stats` 会对着一份残缺的读数印出"总活跃次数: N"并退 0，
+/// 那正是本文件上面那条注释说的"分不清没有数据与读不到数据"。
+fn partial_read_note(cmd: &str, gaps: &[String]) -> Option<String> {
+    if gaps.is_empty() {
+        return None;
+    }
+    let mut note = format!(
+        "{cmd} 这一轮没读全（{} 问），交出的数字只是下界，不当结论印出：",
+        gaps.len()
+    );
+    for g in gaps {
+        note.push_str(&format!("\n  - {g}"));
+    }
+    Some(note)
+}
+
+/// 读命令共同的收尾：读不全就与"打不开"那一支同样拒绝出报告并退 1。
+fn reject_partial_read(cmd: &str, gaps: &[String]) -> Option<i32> {
+    partial_read_note(cmd, gaps).map(|note| {
+        eprintln!("{note}");
+        1
+    })
+}
+
 fn print_stats(_db: &db::Database, period: &str) -> i32 {
     if let Err(e) = check_years_readable() {
         eprintln!("{e}");
         return 1;
     }
-    let (total, stats, label) = match parse_period(period) {
+    let (total, stats, label, gaps) = match parse_period(period) {
         Err(e) => {
             eprintln!("{e}");
             return 1;
         }
         Ok(Period::Today) => {
             let d = Local::now().date_naive();
-            let (t, s) = db::get_stats_by_date(d);
-            (t, s, "今日".to_string())
+            let r = db::stats_totals_on(d);
+            (r.total, r.rows, "今日".to_string(), r.unreadable)
         }
         Ok(Period::All) => {
-            let (t, s) = db::get_stats(None, None);
-            (t, s, "总计".to_string())
+            let r = db::stats_totals(None, None);
+            (r.total, r.rows, "总计".to_string(), r.unreadable)
         }
         Ok(Period::Days(days)) => {
-            let (t, s) = db::get_stats(Some(days), None);
-            (t, s, format!("最近 {days} 天"))
+            let r = db::stats_totals(Some(days), None);
+            (r.total, r.rows, format!("最近 {days} 天"), r.unreadable)
         }
     };
+    if let Some(code) = reject_partial_read("--stats", &gaps) {
+        return code;
+    }
 
     println!("\n{}", "=".repeat(50));
     println!("  FocusFlow 活跃统计 - {label}");
@@ -499,10 +532,14 @@ fn print_devices(_db: &db::Database, period: &str) -> i32 {
         }
         Ok(w) => w,
     };
-    let (total, devices) = match date {
-        Some(d) => db::get_device_stats_by_date(d),
-        None => db::get_device_stats(days, None),
+    let read = match date {
+        Some(d) => db::device_totals_on(d),
+        None => db::device_totals(days, None),
     };
+    let (total, devices, gaps) = (read.total, read.devices, read.unreadable);
+    if let Some(code) = reject_partial_read("--devices", &gaps) {
+        return code;
+    }
 
     println!("\n{}", "=".repeat(60));
     println!("  FocusFlow 设备统计 - {label}");
@@ -553,10 +590,14 @@ fn print_apps(_db: &db::Database, period: &str) -> i32 {
         }
         Ok(w) => w,
     };
-    let (total, map) = match date {
-        Some(d) => db::get_app_stats_by_date(d),
-        None => db::get_app_stats(days, None),
+    let read = match date {
+        Some(d) => db::app_stats_totals_on(d),
+        None => db::app_stats_totals(days, None),
     };
+    let (total, map, gaps) = (read.total, read.rows, read.unreadable);
+    if let Some(code) = reject_partial_read("--apps", &gaps) {
+        return code;
+    }
     let mut items: Vec<(String, i64)> = map.into_iter().collect();
     items.sort_by(|a, b| cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
 
@@ -623,7 +664,11 @@ fn print_hours(_db: &db::Database, period: &str) -> i32 {
         Period::Days(n) => format!("最近 {n} 天"),
         Period::All => format!("总计（按小时这一问只数近 {days} 天，与界面同尺）"),
     };
-    let hourly = db::queries::get_hourly_totals(days, None);
+    let hourly_read = db::hourly_window_totals(days, None);
+    if let Some(code) = reject_partial_read("--hours", &hourly_read.unreadable) {
+        return code;
+    }
+    let hourly = hourly_read.hours;
     let total: i64 = hourly.iter().sum();
 
     println!("\n{}", "=".repeat(60));
@@ -667,10 +712,16 @@ fn print_device_keys(_db: &db::Database, period: &str) -> i32 {
         }
         Ok(w) => w,
     };
-    let (total, devices) = match date {
-        Some(d) => db::get_device_stats_by_date(d),
-        None => db::get_device_stats(days, None),
+    let read = match date {
+        Some(d) => db::device_totals_on(d),
+        None => db::device_totals(days, None),
     };
+    let (total, devices, gaps) = (read.total, read.devices, read.unreadable);
+    // 这份列表是"有哪些设备可改"的名册：读不全时它会把读不到的那台**整个漏掉**，
+    // 用户接着就会以为那台不存在。
+    if let Some(code) = reject_partial_read("--device-keys", &gaps) {
+        return code;
+    }
     if devices.is_empty() {
         println!("暂无设备数据（{label}口径；设备统计从功能上线后开始积累）");
         return 0;
@@ -697,7 +748,13 @@ fn rename_device(pattern: &str, alias: &str) -> i32 {
         eprintln!("{e}");
         return 1;
     }
-    let (_, devices) = db::get_device_stats(None, None);
+    let devices_read = db::device_totals(None, None);
+    // 匹配用的名册读不全 ⇒ 要么"未找到匹配的设备"（其实找到了、只是那一年没读到），
+    // 要么把改动落到另一台上。这比拒绝出报告更值得拦。
+    if let Some(code) = reject_partial_read("--rename-device", &devices_read.unreadable) {
+        return code;
+    }
+    let devices = devices_read.devices;
     let needle = pattern.to_lowercase();
     let matched: Vec<&db::DeviceStat> = devices
         .iter()
@@ -777,7 +834,11 @@ fn print_year_stats(_db: &db::Database, year: i32) -> i32 {
         }
         YearLookup::Queryable => {}
     }
-    let (total, stats) = db::get_stats(None, Some(year));
+    let read = db::stats_totals(None, Some(year));
+    if let Some(code) = reject_partial_read(&format!("--stats-year {year}"), &read.unreadable) {
+        return code;
+    }
+    let (total, stats) = (read.total, read.rows);
     println!("\n{}", "=".repeat(50));
     println!("  FocusFlow 活跃统计 - {year} 年度");
     println!("{}", "=".repeat(50));
@@ -855,10 +916,15 @@ fn export(_db: &db::Database, fmt: &str, period: &str) -> i32 {
         eprintln!("导出的会是一份偏小的数据：{e}");
         return 1;
     }
-    let (total, stats) = match date {
-        Some(d) => db::get_stats_by_date(d),
-        None => db::get_stats(days, None),
+    let read = match date {
+        Some(d) => db::stats_totals_on(d),
+        None => db::stats_totals(days, None),
     };
+    // 这份是要留档的文件：读不全时它看起来仍然完整，比屏幕上的一次读数更值得拦
+    if let Some(code) = reject_partial_read("--export", &read.unreadable) {
+        return code;
+    }
+    let (total, stats) = (read.total, read.rows);
     // 导出文件名是相对路径 ⇒ 成败都要把**绝对位置**说出来：写到当前目录这件事，
     // 对挂着计划任务的人来说从来不是显然的（当前目录可能是 System32）。
     let target = match std::env::current_dir() {
@@ -1180,8 +1246,9 @@ fn backup_outcome(outcome: &db::maintenance::BackupOutcome) -> (String, i32) {
 mod tests {
     use super::{
         backup_outcome, cleanup_outcome, export_csv, export_html, export_target, import_report,
-        max_args, parse_period, parse_stats_year, period_window, rank_tail_note, run,
-        vacuum_outcome, year_lookup, Period, YearLookup,
+        max_args, parse_period, parse_stats_year, partial_read_note, period_window,
+        print_list_years, print_stats, rank_tail_note, reject_partial_read, run, vacuum_outcome,
+        year_lookup, Period, YearLookup,
     };
     use super::{reset_plan, ResetPlan};
     use focusflow_core::db::maintenance::MaintenanceReport;
@@ -1615,11 +1682,17 @@ mod tests {
         );
     }
 
-    /// 七条读命令都必须先过 `check_years_readable`。
+    /// 每一条读命令都要过**两道**闸：`check_years_readable`（这库开不开得住）与
+    /// 读数自己交回的 `unreadable`（开得住、读到一半读不出来）。
     ///
-    /// 这道闸原先只罩着其中三条，剩下四条把"读不到"折成 0 / 空表照样印出来并退 0。
+    /// 这道闸原先只罩着其中三条，剩下几条把"读不到"折成 0 / 空表照样印出来并退 0。
     /// 与本文件那条排名守卫同一个理由：**这个 crate 的覆盖面要在这儿自己盯住**，
     /// 桌面侧的用例管不到它，而"加了一条读命令却忘了出声"是这条线上反复出现的漏法。
+    ///
+    /// 第二道为什么要分开钉：`check_years_readable` 问的是"开得住吗"，而库头合法、
+    /// 后半段页坏的那份 SQLite 是开得住的 —— 那种失败只在真读一遍时露头，住在
+    /// `RankTotals::unreadable` 这类字段里。所以读命令不许再消费二元组那几个 getter：
+    /// 它们把这一支折掉了，接住它的是形状判据而不是编译器。
     #[test]
     fn every_cli_read_command_checks_the_years_are_readable() {
         let src = include_str!("main.rs");
@@ -1635,18 +1708,168 @@ mod tests {
             "rename_device",
             "export",
         ];
-        for name in readers {
+        // `print_list_years` 只列年份：它问的就是闸那一层，没有读数可接
+        let with_readouts = [
+            "print_stats",
+            "print_year_stats",
+            "print_devices",
+            "print_device_keys",
+            "print_apps",
+            "print_hours",
+            "rename_device",
+            "export",
+        ];
+        let folded_getters = [
+            "get_stats(",
+            "get_stats_by_date(",
+            "get_app_stats(",
+            "get_app_stats_by_date(",
+            "get_device_stats(",
+            "get_device_stats_by_date(",
+            "get_hourly_totals(",
+            "get_daily_counts(",
+        ];
+        let strip = |raw: &str| -> String {
+            raw.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let body_of = |name: &str| -> String {
             let at = prod
                 .find(&format!("fn {name}("))
                 .unwrap_or_else(|| panic!("读命令的函数不见了: {name}"));
             let rest = &prod[at..];
             let end = rest[1..].find("\nfn ").map(|n| n + 1).unwrap_or(rest.len());
-            let body = &rest[..end];
+            rest[..end].to_string()
+        };
+        for name in readers {
             assert!(
-                body.contains("check_years_readable"),
+                body_of(name).contains("check_years_readable"),
                 "{name} 没有先问年度库读不读得动 —— 它会对着读不到的库印一个自信的数字并退 0",
             );
         }
+        for name in with_readouts {
+            let body = strip(&body_of(name));
+            assert!(
+                body.contains("reject_partial_read("),
+                "{name} 没接住读数交回的 unreadable —— 读不全时它照样印完整报告并退 0"
+            );
+            assert!(
+                body.contains("_totals"),
+                "{name} 消费的还是二元组读数 —— 那条口子说不出是哪一栏哪一年读不出来"
+            );
+            for g in folded_getters {
+                assert!(!body.contains(g), "{name} 又用回分不出两件事的 {g}");
+            }
+        }
+    }
+
+    /// 「这一轮没读全」那句话要说得出是哪几问、并且真的把退出码换成拒绝。
+    #[test]
+    fn a_partial_read_is_named_and_rejected() {
+        assert!(
+            partial_read_note("--stats", &[]).is_none(),
+            "读全了不许凭空造一句警告"
+        );
+        let gaps = vec![
+            "2025 年库按键统计读不出来: 按键榜读不出来: database disk image is malformed"
+                .to_string(),
+            "2026 年库每日趋势读不出来: 说不出这一年的库在不在: 拒绝访问".to_string(),
+        ];
+        let note = partial_read_note("--stats", &gaps).expect("两问没答上来就该有话要说");
+        assert!(
+            note.contains("2 问") && note.contains("--stats"),
+            "要说清这条命令这一轮有几问没答上，实得: {note}"
+        );
+        for g in &gaps {
+            assert!(
+                note.contains(g.as_str()),
+                "每一问的原因都要原样带出，实得: {note}"
+            );
+        }
+        assert_eq!(
+            reject_partial_read("--stats", &gaps),
+            Some(1),
+            "读不全要与「打不开」那一支同样拒绝出报告"
+        );
+        assert_eq!(reject_partial_read("--stats", &[]), None);
+    }
+
+    /// 读命令的"读不全就拒绝"要对着**真库**跑一遍才算被测到：上面那条只钉得住调用形态，
+    /// 而这条线上真正的症状是"对着一份残缺读数印出自信的数字并退 0"。
+    ///
+    /// 三条腿按两道闸的分工排：
+    /// - 库是好的 ⇒ `--stats` 退 0（反向腿，证明这不是恒真的拒绝）；
+    /// - 库头合法、后半段页坏 ⇒ `open_ro` 打得开，只有真读一遍才知道读不出来 ⇒ `--stats` 退 1，
+    ///   而只问"开得住吗"的 `--list-years` 在这一份上照旧退 0 —— 两道闸各管半边，不许混成一条；
+    /// - 文件根本不是库 ⇒ 老的开闸就先拦住，`--stats` 同样退 1（这一支的口径本轮没改）。
+    #[test]
+    fn the_stats_command_refuses_a_reading_it_cannot_finish() {
+        use chrono::{Datelike, Local};
+        use focusflow_core::db::connection::{clear_ro_cache, ensure_schema, open_rw};
+        use focusflow_core::db::Database;
+        use focusflow_core::paths;
+
+        let _serial = focusflow_core::paths::test_app_dir_lock();
+        let _app = paths::test_app_dir("cli_partial_read");
+        let year = Local::now().year();
+        let path = paths::year_db_path(year);
+        {
+            let conn = open_rw(&path).unwrap();
+            ensure_schema(&conn, year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (1, 1234, 100)",
+                [],
+            )
+            .unwrap();
+            // 键名榜铺到文件后半段：坏页落在"读榜"那一步才会露头
+            for i in 0..12_000i64 {
+                conn.execute(
+                    "INSERT INTO key_counts (date_key, key_name, count) VALUES (1, ?1, 1)",
+                    [format!("KK{i}")],
+                )
+                .unwrap();
+            }
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        focusflow_core::db::invalidate_years_cache();
+        clear_ro_cache();
+        let db = Database::init_readonly();
+        assert_eq!(
+            print_stats(&db, "all"),
+            0,
+            "库好的时候必须照常出报告 —— 不然上面那些拒绝是恒真的"
+        );
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.len() > 4096 * 40,
+            "夹具太小，键名榜没铺到文件后半段（实得 {} 字节）",
+            bytes.len()
+        );
+        let cut = bytes.len() / 2;
+        for b in bytes.iter_mut().skip(cut) {
+            *b = 0xA5;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        focusflow_core::db::invalidate_years_cache();
+        clear_ro_cache();
+        assert_eq!(
+            print_stats(&db, "all"),
+            1,
+            "打得开、读到一半坏页时 --stats 不许印出数字并退 0"
+        );
+        assert_eq!(
+            print_list_years(&db),
+            0,
+            "只问「开得住吗」的那条读命令在这一份上不该被拦 —— 两道闸管的是半边"
+        );
+
+        std::fs::write(&path, b"this is not a sqlite database at all").unwrap();
+        focusflow_core::db::invalidate_years_cache();
+        clear_ro_cache();
+        assert_eq!(print_stats(&db, "all"), 1, "打不开那一支的口径没变");
     }
     /// `--stats-year` 的三种"读不到"必须是三句不同的话。
     ///

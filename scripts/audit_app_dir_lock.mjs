@@ -28,7 +28,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 const roots = process.argv.slice(2);
-const dirs = roots.length ? roots : ["crates/core/src", "crates/core/tests", "desktop/src"];
+const dirs = roots.length
+  ? roots
+  : ["crates/core/src", "crates/core/tests", "crates/cli/src", "desktop/src"];
 const files = [];
 (function walk(dir) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
