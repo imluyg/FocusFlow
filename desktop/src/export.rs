@@ -9,7 +9,7 @@ use std::io::Write;
 use anyhow::Context;
 use chrono::Local;
 
-use focusflow_core::format::{cmp_rank_desc, csv_field, fmt_thousands, html_escape};
+use focusflow_core::format::{cmp_rank_desc, csv_field, fmt_duration, fmt_thousands, html_escape};
 
 /// 导出用的窗口。与界面顶部那六个周期一档一档对得上。
 #[derive(Debug, Clone, PartialEq)]
@@ -133,8 +133,10 @@ pub fn collect_report(w: &ReportWindow) -> ReportData {
     let (app_total, app_map) = apps_src;
     let (device_total, device_list) = devices_src;
     // 时间切面那三段：天数交给 `chart_window_days` 那一把尺子（「总计」= 近 30 天）
-    let daily = q::get_daily_counts(crate::state::chart_window_days(days), None);
-    let hourly = q::get_hourly_totals(crate::state::chart_window_days(days), None);
+    // 天数一律问 core 那把尺子（界面、导出、命令行三处同一个答案）
+    let days_window = q::chart_window_days(days);
+    let daily = q::get_daily_counts(days_window, None);
+    let hourly = q::get_hourly_totals(days_window, None);
     let agg_wd = q::aggregate_weekday(&daily);
     let weekday: Vec<(i64, i64)> = (0..7i64)
         .map(|d| (d, *agg_wd.get(&d).unwrap_or(&0)))
@@ -399,19 +401,6 @@ fn pct(part: i64, total: i64) -> String {
         format!("{:.1}%", part as f64 / total as f64 * 100.0)
     } else {
         "0.0%".to_string()
-    }
-}
-
-/// 秒 → 「1小时23分」/「45分」/「30秒」。
-fn fmt_duration(secs: i64) -> String {
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    if h > 0 {
-        format!("{h}小时{m}分")
-    } else if m > 0 {
-        format!("{m}分")
-    } else {
-        format!("{secs}秒")
     }
 }
 

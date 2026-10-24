@@ -2022,7 +2022,7 @@ fn compute_charts(
         .map(|g| groups.get(*g).copied().unwrap_or(0))
         .sum();
     let keyboard_total = total - mouse_total;
-    let daily_days = chart_window_days(period_val);
+    let daily_days = focusflow_core::db::queries::chart_window_days(period_val);
     let needed = daily_days.max(7).max(30);
     let daily_all = focusflow_core::db::get_daily_counts(needed, None);
     let total_days = daily_all.len() as usize;
@@ -2127,20 +2127,6 @@ fn compute_charts(
     }
 }
 
-/// 顶部周期 → 这几张图该数几天。规则一字未改（原先就散在 `compute_charts` 里的那个 `match`），
-/// 抽出来只因为现在有三处要问同一件事：每日趋势、星期分布、每小时分布。
-///
-/// `0`（「总计」）刻意是 30 而不是 `MAX_QUERY_DAYS`：卡片上那句「日均(近30天)」用的就是
-/// 这把尺子，图要是横跨全部历史，同一页的"日均"与趋势图的均值就对不上。
-pub(crate) fn chart_window_days(period: i64) -> i64 {
-    match period {
-        -1 => 1,
-        0 => 30,
-        n if n > 0 => n,
-        _ => 7,
-    }
-}
-
 /// 最近一条久坐提醒，与它还"值得再说一遍"的截止时刻（unix 秒；0 = 一条都没有）。
 ///
 /// 写者是统计线程，读者是托盘更新线程（每 5 秒一轮）。这两个量必须成对读写：只挂提醒
@@ -2185,9 +2171,9 @@ pub(crate) fn rest_notice_now() -> Option<focusflow_core::stats::RestNotice> {
 #[cfg(test)]
 mod compute_charts_tests {
     use super::{
-        alltime_anchor_today, alltime_total_now, apply_display_total, chart_window_days,
-        clamp_floating_into_screen, compute_charts, idle_refresh_needed, sort_rank_desc,
-        total_for_display, ChartAgg, FloatingBounds, FLOATING_MIN_VISIBLE, RANK_LIMIT,
+        alltime_anchor_today, alltime_total_now, apply_display_total, clamp_floating_into_screen,
+        compute_charts, idle_refresh_needed, sort_rank_desc, total_for_display, ChartAgg,
+        FloatingBounds, FLOATING_MIN_VISIBLE, RANK_LIMIT,
     };
 
     /// 他这台机器的形状：1920x1080 单屏（任务栏 48px，故工作区底边 1032）、卡片 90x46。
@@ -2553,6 +2539,7 @@ mod compute_charts_tests {
     /// 周期 → 天数的尺子：三张图与「日均」卡片问的是同一个问题，必须只有一个答案。
     #[test]
     fn chart_window_days_matches_the_cards_on_the_same_page() {
+        use focusflow_core::db::queries::chart_window_days;
         assert_eq!(chart_window_days(-1), 1, "今日就是一天");
         assert_eq!(
             chart_window_days(0),

@@ -17,7 +17,7 @@ use chrono::Local;
 use focusflow_core::db;
 use focusflow_core::logger;
 
-use focusflow_core::format::{cmp_rank_desc, csv_field, fmt_thousands, html_escape};
+use focusflow_core::format::{cmp_rank_desc, csv_field, fmt_duration, fmt_thousands, html_escape};
 
 fn main() -> ExitCode {
     logger::init_logging();
@@ -40,13 +40,15 @@ const USAGE: &str = "\
   --stats <天数|today|all>   统计最近 N 天 / 今日 / 总计
   --stats-year <年份>        指定年度的统计
   --devices <天数|today|all> 设备维度统计（各键鼠输入次数与占比）
+  --apps <天数|today|all>   前台应用使用时长排行（与界面「应用排行」同一口径）
+  --hours <天数|today|all>  每小时活跃分布（24 行；「总计」按近 30 天计，与界面同尺）
   --backup                   立即备份全部数据库到 backup/（含轮转与残留清理）
   --device-keys [周期]       列出设备标识（device_key）与当前展示名，便于手改别名
                              周期同 --devices（天数 | today | all，省略 = 全量）
   --rename-device <匹配> <别名>
                              给设备取别名（匹配 device_key 或展示名子串；别名留空则还原）
   --list-years               列出有数据的年份
-  --export <csv|html>        导出报表到当前目录
+  --export <csv|html> [周期] 导出报表到当前目录（周期同 --stats：天数 | today | all，省略 = 总计）
   --vacuum                   压缩数据库
   --cleanup <天数>           保留 N 天（含今天），删除更早的数据
   --import-legacy <旧目录>   从旧版（Python 原版或旧数据目录）导入全部数据
@@ -61,8 +63,11 @@ const USAGE: &str = "\
 /// 表里没有的命令交给分派臂的"未知参数"报错，不在这一步拦。
 fn max_args(cmd: &str) -> Option<usize> {
     match cmd {
-        "--stats" | "--stats-year" | "--devices" | "--export" | "--cleanup" | "--import-legacy"
-        | "--device-keys" => Some(1),
+        "--stats" | "--stats-year" | "--devices" | "--apps" | "--hours" | "--cleanup"
+        | "--import-legacy" | "--device-keys" => Some(1),
+        // `--export` 现在收两个：格式 + 可选周期。少了那个"可选"就导不出近 30 天的账，
+        // 而界面上正在看的那一页就是近 30 天。
+        "--export" => Some(2),
         "--rename-device" => Some(2),
         "--list-years" | "--reset" | "--vacuum" | "--backup" => Some(0),
         _ => None,
@@ -157,11 +162,16 @@ fn run(args: &[String]) -> i32 {
         }
         "--export" => {
             if args.len() < 2 {
-                eprintln!("用法: --export <csv|html>");
+                eprintln!("用法: --export <csv|html> [天数|today|all]");
+                eprintln!("  周期省略时 = 总计（与旧版行为一致）");
                 return 1;
             }
             let db = db::Database::init_readonly();
-            export(&db, &args[1])
+            export(
+                &db,
+                &args[1],
+                args.get(2).map(|s| s.as_str()).unwrap_or("all"),
+            )
         }
         "--reset" => {
             let db = db::Database::init_readonly();
@@ -242,6 +252,22 @@ fn run(args: &[String]) -> i32 {
                 return 1;
             }
             import_legacy(&args[1])
+        }
+        "--apps" => {
+            if args.len() < 2 {
+                eprintln!("用法: --apps <天数|today|all>");
+                return 1;
+            }
+            let db = db::Database::init_readonly();
+            print_apps(&db, &args[1])
+        }
+        "--hours" => {
+            if args.len() < 2 {
+                eprintln!("用法: --hours <天数|today|all>");
+                return 1;
+            }
+            let db = db::Database::init_readonly();
+            print_hours(&db, &args[1])
         }
         other => {
             eprintln!("未知参数: {other}");
@@ -511,6 +537,121 @@ fn print_devices(_db: &db::Database, period: &str) -> i32 {
     0
 }
 
+/// 前台应用使用时长排行 —— 与界面「应用排行」同一口径（`app_usage` 按天×程序存秒数）。
+///
+/// 占比的分母用查询交回的**未截断**总时长，不拿榜单求和代替：只列前 N 个却让百分比
+/// 加到 100%，是"占前 20 名"被说成"占全部"的同一个毛病。
+fn print_apps(_db: &db::Database, period: &str) -> i32 {
+    if let Err(e) = check_years_readable() {
+        eprintln!("{e}");
+        return 1;
+    }
+    let (days, date, label) = match period_window(period, Local::now().date_naive()) {
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+        Ok(w) => w,
+    };
+    let (total, map) = match date {
+        Some(d) => db::get_app_stats_by_date(d),
+        None => db::get_app_stats(days, None),
+    };
+    let mut items: Vec<(String, i64)> = map.into_iter().collect();
+    items.sort_by(|a, b| cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
+
+    println!("\n{}", "=".repeat(60));
+    println!("  FocusFlow 应用使用时长 - {label}");
+    println!("{}", "=".repeat(60));
+    println!("  前台总时长: {}", fmt_duration(total));
+    println!("{}", "-".repeat(60));
+    if items.is_empty() {
+        // 「没有应用数据」有两种：确实一直没前台，与 `[app_stats] enabled = false`
+        // 关掉了采集。混成一句"暂无数据"就让人去查一个本来就没开功能
+        println!("  暂无应用数据（`[app_stats] enabled` 被关掉，或这段时间没识别到前台程序）");
+        println!("{}\n", "=".repeat(60));
+        return 0;
+    }
+    println!("  {:<6}{:<40}{:<14}{:<8}", "排名", "应用", "时长", "占比");
+    println!("  {}", "-".repeat(56));
+    for (rank, (name, secs)) in items.iter().enumerate().take(RANK_LIMIT) {
+        let percent = if total > 0 {
+            format!("{:.1}%", (*secs as f64 / total as f64) * 100.0)
+        } else {
+            "0%".to_string()
+        };
+        println!(
+            "  {:<6}{:<40}{:<14}{:<8}",
+            rank + 1,
+            name,
+            fmt_duration(*secs),
+            percent
+        );
+    }
+    if items.len() > RANK_LIMIT {
+        println!("  ... 只列前 {RANK_LIMIT}，共 {} 个应用", items.len());
+    }
+    println!("{}\n", "=".repeat(60));
+    0
+}
+
+/// 每小时活跃分布（固定 24 行）。
+///
+/// 窗口天数交给 `db::queries::chart_window_days` —— 与界面那三张图、与导出报告的
+/// "时间切面"三段同一个答案：`all` 在这里是**近 30 天**而不是全部历史。按小时铺开
+/// 几百个"日 × 24"格既没有可读性，也会让命令行与屏幕上各说一套。
+fn print_hours(_db: &db::Database, period: &str) -> i32 {
+    if let Err(e) = check_years_readable() {
+        eprintln!("{e}");
+        return 1;
+    }
+    let parsed = match parse_period(period) {
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+        Ok(p) => p,
+    };
+    let period_val = match parsed {
+        Period::Today => -1,
+        Period::All => 0,
+        Period::Days(n) => n,
+    };
+    let days = db::queries::chart_window_days(period_val);
+    let label = match parsed {
+        Period::Today => "今日".to_string(),
+        Period::Days(n) => format!("最近 {n} 天"),
+        Period::All => format!("总计（按小时这一问只数近 {days} 天，与界面同尺）"),
+    };
+    let hourly = db::queries::get_hourly_totals(days, None);
+    let total: i64 = hourly.iter().sum();
+
+    println!("\n{}", "=".repeat(60));
+    println!("  FocusFlow 每小时活跃 - {label}");
+    println!("{}", "=".repeat(60));
+    println!("  窗口内总次数: {}", fmt_thousands(total));
+    println!("{}", "-".repeat(60));
+    if total == 0 {
+        println!("  这个窗口里没有任何按小时的记录");
+        println!("{}\n", "=".repeat(60));
+        return 0;
+    }
+    for (hour, count) in hourly.iter().enumerate() {
+        let percent = if total > 0 {
+            format!("{:.1}%", (*count as f64 / total as f64) * 100.0)
+        } else {
+            "0%".to_string()
+        };
+        println!(
+            "  {hour:>2}时  {:>10}  {:>7}",
+            fmt_thousands(*count),
+            percent
+        );
+    }
+    println!("{}\n", "=".repeat(60));
+    0
+}
+
 /// 列出设备标识与展示名：便于手改 device_aliases.json 或配合 --rename-device。
 ///
 /// 周期与 `--devices` 走同一把尺子（`period_window`），默认全量。
@@ -694,7 +835,7 @@ fn export_target(fmt: &str) -> Result<std::path::PathBuf, String> {
     Ok(std::path::PathBuf::from(format!("focusflow_export.{ext}")))
 }
 
-fn export(_db: &db::Database, fmt: &str) -> i32 {
+fn export(_db: &db::Database, fmt: &str, period: &str) -> i32 {
     let filepath = match export_target(fmt) {
         Ok(p) => p,
         Err(e) => {
@@ -702,11 +843,22 @@ fn export(_db: &db::Database, fmt: &str) -> i32 {
             return 1;
         }
     };
+    // 周期先解析：非法值要在这里就停住，不能带着一个猜出来的窗口往下走
+    let (days, date, label) = match period_window(period, Local::now().date_naive()) {
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+        Ok(w) => w,
+    };
     if let Err(e) = check_years_readable() {
         eprintln!("导出的会是一份偏小的数据：{e}");
         return 1;
     }
-    let (total, stats) = db::get_stats(None, None);
+    let (total, stats) = match date {
+        Some(d) => db::get_stats_by_date(d),
+        None => db::get_stats(days, None),
+    };
     // 导出文件名是相对路径 ⇒ 成败都要把**绝对位置**说出来：写到当前目录这件事，
     // 对挂着计划任务的人来说从来不是显然的（当前目录可能是 System32）。
     let target = match std::env::current_dir() {
@@ -715,9 +867,9 @@ fn export(_db: &db::Database, fmt: &str) -> i32 {
     };
     // 写哪一格式由那个已经通过校验的文件名决定，不再第二次判 `fmt`
     let outcome = if filepath.extension().is_some_and(|e| e == "csv") {
-        export_csv(&filepath, total, &stats)
+        export_csv(&filepath, total, &stats, &label)
     } else {
-        export_html(&filepath, total, &stats)
+        export_html(&filepath, total, &stats, &label)
     };
     match outcome {
         Ok(()) => {
@@ -738,6 +890,7 @@ fn export_csv(
     path: &std::path::Path,
     total: i64,
     stats: &std::collections::HashMap<String, i64>,
+    period_label: &str,
 ) -> Result<(), String> {
     use std::io::Write;
     let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
@@ -745,7 +898,9 @@ fn export_csv(
     let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut out = String::new();
     out.push_str("# FocusFlow 键鼠活跃统计导出\n");
-    out.push_str("# 统计周期 总计\n");
+    // 周期名由调用方交进来：以前这里写死「总计」，于是 `--export csv 30` 产出的文件
+    // 自称总计、内容却只有 30 天 —— 名字与内容各说一套
+    out.push_str(&format!("# 统计周期 {period_label}\n"));
     out.push_str(&format!("# 总活跃次数 {total}\n"));
     out.push_str(&format!("# 导出时间 {now_str}\n\n"));
     out.push_str("排名,键鼠,次数,占比(%)\n");
@@ -773,6 +928,7 @@ fn export_html(
     path: &std::path::Path,
     total: i64,
     stats: &std::collections::HashMap<String, i64>,
+    period_label: &str,
 ) -> Result<(), String> {
     let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
     sorted.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
@@ -821,7 +977,7 @@ fn export_html(
 <body>
 <div class="container">
     <h1>FocusFlow 活跃统计报告</h1>
-    <div class="meta"><div>统计周期：总计</div><div>导出时间：{now_str}</div></div>
+    <div class="meta"><div>统计周期：{period_label}</div><div>导出时间：{now_str}</div></div>
     <div class="total">总活跃次数：{}</div>
     <table>
         <thead><tr><th>排名</th><th>键鼠</th><th>次数</th><th>占比</th></tr></thead>
@@ -1168,10 +1324,16 @@ mod tests {
         let _ = std::fs::remove_file(&csv);
         let _ = std::fs::remove_file(&html);
 
-        export_csv(&csv, 10, &stats).expect("CSV 导出应成功");
-        export_html(&html, 10, &stats).expect("HTML 导出应成功");
+        export_csv(&csv, 10, &stats, "最近 30 天").expect("CSV 导出应成功");
+        export_html(&html, 10, &stats, "最近 30 天").expect("HTML 导出应成功");
 
         let csv_text = std::fs::read_to_string(&csv).expect("读 CSV");
+        // 文件里那个周期名必须就是调用方交来的那一个：以前两处都写死「总计」，
+        // 于是 `--export csv 30` 产出的文件自称总计、装的却是 30 天
+        assert!(
+            csv_text.contains("# 统计周期 最近 30 天"),
+            "CSV 的周期名没跟着参数走: {csv_text}"
+        );
         assert!(csv_text.contains("\"a,b\""), "逗号字段应加引号: {csv_text}");
         assert!(
             csv_text.contains("'=cmd()"),
@@ -1179,6 +1341,10 @@ mod tests {
         );
 
         let html_text = std::fs::read_to_string(&html).expect("读 HTML");
+        assert!(
+            html_text.contains("统计周期：最近 30 天"),
+            "HTML 的周期名没跟着参数走: {html_text}"
+        );
         assert!(
             html_text.contains("&lt;b&gt;x&amp;y&lt;/b&gt;"),
             "HTML 键名应转义，不得出现原始尖括号: {html_text}"
@@ -1206,8 +1372,8 @@ mod tests {
         let sorts: Vec<usize> = prod.match_indices(".sort_by(").map(|(i, _)| i).collect();
         assert_eq!(
             sorts.len(),
-            4,
-            "CLI 的排名应当正好四处（两个统计面板 + CSV / HTML 导出），现在数到 {} 处 ——\
+            5,
+            "CLI 的排名应当正好五处（两个统计面板 + 应用排行 + CSV / HTML 导出），现在数到 {} 处 ——\
              加了新的榜就要一并进这条断言",
             sorts.len()
         );
@@ -1269,7 +1435,7 @@ mod tests {
         // 夹具：把一个目录摆在要写的位置上，File::create 与 fs::write 都会失败
         let blocked = dir.join("out.csv");
         std::fs::create_dir_all(&blocked).expect("把 csv 目标做成一个目录");
-        let e = export_csv(&blocked, 7, &stats).expect_err("目标是个目录时必须失败");
+        let e = export_csv(&blocked, 7, &stats, "总计").expect_err("目标是个目录时必须失败");
         assert!(
             e.contains(&blocked.display().to_string()),
             "要说清楚写不出去的是哪个文件，实得: {e}",
@@ -1277,7 +1443,7 @@ mod tests {
         assert!(e.len() > 20, "还得带上 OS 给的原因，实得: {e}");
         let blocked_html = dir.join("out.html");
         std::fs::create_dir_all(&blocked_html).expect("把 html 目标做成一个目录");
-        let e2 = export_html(&blocked_html, 7, &stats).expect_err("同上");
+        let e2 = export_html(&blocked_html, 7, &stats, "总计").expect_err("同上");
         assert!(e2.contains("out.html"), "实得: {e2}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1464,6 +1630,8 @@ mod tests {
             "print_list_years",
             "print_devices",
             "print_device_keys",
+            "print_apps",
+            "print_hours",
             "rename_device",
             "export",
         ];

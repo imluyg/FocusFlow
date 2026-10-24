@@ -129,6 +129,23 @@ pub fn fmt_thousands(n: i64) -> String {
     }
 }
 
+/// 秒 → 「1小时23分」/「45分」/「30秒」。
+///
+/// 放在 core 是因为同一份时长要在两处念：桌面那份 HTML/CSV 报告与 `focusflow-cli --apps`。
+/// 各写一份就会出现"同一屏数据两种说法"（本仓对 `check_years_readable`、`vacuum_line`
+/// 走的是同一条路：话只说一遍）。
+pub fn fmt_duration(secs: i64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    if h > 0 {
+        format!("{h}小时{m}分")
+    } else if m > 0 {
+        format!("{m}分")
+    } else {
+        format!("{secs}秒")
+    }
+}
+
 /// CSV 字段转义：含逗号/引号/换行时加引号并将内部引号双写；
 /// `=`/`+`/`-`/`@`/Tab/CR 开头加前导单引号，防止 Excel 公式注入。
 ///

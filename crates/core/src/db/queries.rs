@@ -738,6 +738,23 @@ pub fn get_daily_counts(days: i64, year: Option<i32>) -> Vec<(String, i64)> {
     result
 }
 
+/// 顶部周期 → 该数几天。`-1` 今日 / `0` 总计 / 正整数 = 近 N 天 / 其余退回 7 天。
+///
+/// 尺子放在 core 是因为同一件事有三处在问：界面的趋势/小时/星期三张图、导出报告里那
+/// 三段"时间切面"、以及 `focusflow-cli --hours`。各写一份就会出现"同一份库、
+/// 屏幕上说是近 30 天、命令行里说是全部历史"。
+///
+/// `0`（「总计」）刻意是 30 而不是 `MAX_QUERY_DAYS`：卡片那句「日均(近30天)」用的
+/// 就是这把尺子，图横跨全部历史就会与同一页的均值对不上。
+pub fn chart_window_days(period: i64) -> i64 {
+    match period {
+        -1 => 1,
+        0 => 30,
+        n if n > 0 => n,
+        _ => 7,
+    }
+}
+
 /// 查询指定日期每小时按键数（返回长度 24 的列表）。
 pub fn get_hourly_stats(target_date: Option<chrono::NaiveDate>) -> Vec<i64> {
     let d = target_date.unwrap_or_else(|| Local::now().date_naive());
