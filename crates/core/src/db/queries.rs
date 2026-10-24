@@ -722,8 +722,144 @@ pub fn get_alltime_summary() -> AlltimeTotals {
     }
 }
 
-/// 查询最近 N 天每日按键数：返回 [(YYYY-MM-DD, 次数)]。
-pub fn get_daily_counts(days: i64, year: Option<i32>) -> Vec<(String, i64)> {
+/// 每日趋势读数（含"这一轮没读全"）。`series` 在读不全时只是**下界**：
+/// 没读出来的那一年，它那些天挂在 0 上。
+#[derive(Debug, Clone, Default)]
+pub struct DailyTotals {
+    pub series: Vec<(String, i64)>,
+    /// 每项形如「N 年库每日趋势读不出来: 原因」。空 = 读全了。
+    pub unreadable: Vec<String>,
+}
+
+/// 所选窗口内每小时合计的读数（长度 24）。同样：读不全时只是下界。
+#[derive(Debug, Clone, Default)]
+pub struct HourlyTotals {
+    pub hours: Vec<i64>,
+    pub unreadable: Vec<String>,
+}
+
+/// 面板与导出按这两个词挑该说的那句 gap（`views.js::gapNote` 有同名判据，
+/// `the_panel_names_the_same_domains_as_the_core` 盯着两边不许各写一套）。
+const DAILY_LABEL: &str = "每日趋势";
+const HOURLY_LABEL: &str = "每小时分布";
+
+/// 窗口内 `(第一列, 第二列)` 两段查询只差 SQL 一句，取行的错误处理完全一样：
+/// 收成一个函数，免得一处补了另一处漏（这一轮之前两处都在 `rows.flatten()` 上把坏页折掉）。
+fn read_pairs(
+    conn: &Connection,
+    sql: &str,
+    start_dk: i64,
+    end_dk: i64,
+    why: &str,
+) -> YearRead<Vec<(i64, i64)>> {
+    let mapper = |r: &rusqlite::Row<'_>| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?));
+    // `query_map` 借的是 `stmt`，所以这一步不能写成 `prepare(..).and_then(..)`（那要
+    // 把借用带出闭包）；prepare 的错误与取行的错误在下面汇成同一个出口。
+    let rows = match conn.prepare(sql) {
+        Ok(mut stmt) => stmt
+            .query_map(rusqlite::params![start_dk, end_dk], mapper)
+            .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
+        Err(e) => Err(e),
+    };
+    match rows {
+        Ok(list) => YearRead::Read(list),
+        Err(e) => {
+            tracing::error!("{why}（{sql}）: {e}");
+            YearRead::Unreadable(format!("{why}: {e}"))
+        }
+    }
+}
+
+/// 单库读窗口内的每日计数 `(date_key, count)`；三种结局分开（理由同 [`query_stats_in_conn`]）。
+fn query_daily_window_in_conn(
+    conn: &Connection,
+    start_dk: i64,
+    end_dk: i64,
+) -> YearRead<Vec<(i64, i64)>> {
+    match connection::table_presence(conn, "daily_counts") {
+        connection::Presence::No => return YearRead::NoTable,
+        connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
+        connection::Presence::Yes => {}
+    }
+    read_pairs(
+        conn,
+        "SELECT date_key, count FROM daily_counts WHERE date_key >= ?1 AND date_key <= ?2",
+        start_dk,
+        end_dk,
+        "每日计数读不出来",
+    )
+}
+
+/// 单库读窗口内的每小时合计 `(hour, SUM(count))`。
+fn query_hourly_window_in_conn(
+    conn: &Connection,
+    start_dk: i64,
+    end_dk: i64,
+) -> YearRead<Vec<(i64, i64)>> {
+    match connection::table_presence(conn, "hourly_counts") {
+        connection::Presence::No => return YearRead::NoTable,
+        connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
+        connection::Presence::Yes => {}
+    }
+    read_pairs(
+        conn,
+        "SELECT hour, SUM(count) FROM hourly_counts \
+         WHERE date_key >= ?1 AND date_key <= ?2 GROUP BY hour",
+        start_dk,
+        end_dk,
+        "每小时计数读不出来",
+    )
+}
+
+/// 逐年度库把窗口内的行读回来。`label` 只用于把 gap 说到"是哪个域的哪一年"。
+///
+/// 这一支以前有四道各自为政的折：`year_db_presence` 说不出在不在只留一行日志、
+/// `with_ro_conn` 把"打不开"折成 `None`（连那句日志都不给调用方）、`table_exists` 把
+/// "问不出有没有这张表"折成"没有"、`rows.flatten()` 把"读到一半坏页"折成"到这儿为止"。
+/// 四道现在都落到 `unreadable`，交回的行只是**已读部分**。
+fn read_window_years(
+    label: &str,
+    years: &[i32],
+    start_dk: i64,
+    end_dk: i64,
+    query: impl Fn(&Connection, i64, i64) -> YearRead<Vec<(i64, i64)>>,
+) -> (Vec<(i64, i64)>, Vec<String>) {
+    let mut pairs: Vec<(i64, i64)> = Vec::new();
+    let mut gaps: Vec<String> = Vec::new();
+    for y in years.iter().copied() {
+        let path = paths::year_db_path(y);
+        match year_db_presence(&path) {
+            // 没有这一年的库文件是**正常答案**（那年没数据、或全新安装）：安静跳过，
+            // 那些天留在初始化好的 0 上。
+            Ok(false) => continue,
+            Ok(true) => {}
+            // 说不出在不在（父目录在休眠的移动盘上、`data` 那个位置被换成普通文件、
+            // 杀软首扫握着句柄）：过去 `path.exists()` 把这一支和上面那支并成同一句"没有"。
+            Err(e) => {
+                tracing::error!(
+                    "说不出 {y} 年的库在不在（{}）：{e} —— 这一次这一年不进{label}的读数，\
+                     但那不是「那一年没有数据」",
+                    path.display()
+                );
+                gaps.push(format!(
+                    "{y} 年库{label}读不出来: 说不出这一年的库在不在: {e}"
+                ));
+                continue;
+            }
+        }
+        match connection::with_ro_conn_why(&path, |conn| query(conn, start_dk, end_dk)) {
+            Err(why) => gaps.push(format!("{y} 年库{label}读不出来: {why}")),
+            Ok(YearRead::Unreadable(why)) => gaps.push(format!("{y} 年库{label}读不出来: {why}")),
+            // 没有这张表 = 这一年确实没有可汇总的数据；安静按 0 计
+            Ok(YearRead::NoTable) => {}
+            Ok(YearRead::Read(v)) => pairs.extend(v),
+        }
+    }
+    (pairs, gaps)
+}
+
+/// 查询最近 N 天每日按键数：[(YYYY-MM-DD, 次数)]，含"这一轮没读全"。
+pub fn daily_counts_totals(days: i64, year: Option<i32>) -> DailyTotals {
     let now = Local::now();
     let today = now.date_naive();
     // 含当天共 N 天：起点为 today-(N-1)；天数先收敛，越界会让日期运算 panic。
@@ -740,56 +876,35 @@ pub fn get_daily_counts(days: i64, year: Option<i32>) -> Vec<(String, i64)> {
         daily_map.insert(start_dk + i, 0);
     }
 
-    for y in &years_to_query {
-        let path = paths::year_db_path(*y);
-        match year_db_presence(&path) {
-            // 没有这一年的库文件是**正常答案**（那年没数据、或全新安装）：安静跳过，
-            // 那些天留在初始化好的 0 上。
-            Ok(false) => continue,
-            Ok(true) => {}
-            // 说不出在不在（父目录在休眠的移动盘上、`data` 那个位置被换成普通文件、
-            // 杀软首扫握着句柄）：过去 `path.exists()` 把这一支和上面那支并成同一句"没有"，
-            // 于是那一年每天都是 0、日志一个字没有，而同一页上「今日」卡片还是真数。
-            Err(e) => {
-                tracing::error!(
-                    "说不出 {y} 年的库在不在（{}）：{e} —— 这一次这一年不进每日计数，\
-                     但那不是「那一年没有数据」",
-                    path.display()
-                );
-                continue;
-            }
-        }
-        let year_result = connection::with_ro_conn(&path, |conn| -> rusqlite::Result<()> {
-            if !table_exists(conn, "daily_counts") {
-                return Ok(());
-            }
-            let mut stmt = conn.prepare(
-                "SELECT date_key, count FROM daily_counts WHERE date_key >= ?1 AND date_key <= ?2",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![start_dk, end_dk], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-            })?;
-            for row in rows.flatten() {
-                if let Some(e) = daily_map.get_mut(&row.0) {
-                    *e += row.1;
-                }
-            }
-            Ok(())
-        });
-        // 单个年度库查询失败只记日志跳过，不影响其余年份与进程存活
-        if let Some(Err(e)) = year_result {
-            tracing::error!("每日计数查询失败（{y} 年库）: {e}");
+    let (pairs, unreadable) = read_window_years(
+        DAILY_LABEL,
+        &years_to_query,
+        start_dk,
+        end_dk,
+        query_daily_window_in_conn,
+    );
+    for (dk, c) in pairs {
+        if let Some(e) = daily_map.get_mut(&dk) {
+            *e += c;
         }
     }
 
-    let mut result: Vec<(String, i64)> = Vec::with_capacity(daily_map.len());
+    let mut series: Vec<(String, i64)> = Vec::with_capacity(daily_map.len());
     for (dk, c) in daily_map {
         if let Some(d) = day_key_to_date(dk) {
-            result.push((d.format("%Y-%m-%d").to_string(), c));
+            series.push((d.format("%Y-%m-%d").to_string(), c));
         }
     }
-    result.sort();
-    result
+    series.sort();
+    DailyTotals { series, unreadable }
+}
+
+/// 查询最近 N 天每日按键数：返回 [(YYYY-MM-DD, 次数)]。
+///
+/// ⚠ 数组交不回"这一轮有没有读全"；面板与导出请走 [`daily_counts_totals`]。
+/// 留给 Lua 宿主、打卡条那条（它上面另有 `check_daily_counts_readable` 那道闸）与 CLI。
+pub fn get_daily_counts(days: i64, year: Option<i32>) -> Vec<(String, i64)> {
+    daily_counts_totals(days, year).series
 }
 
 /// 顶部周期 → 该数几天。`-1` 今日 / `0` 总计 / 正整数 = 近 N 天 / 其余退回 7 天。
@@ -841,60 +956,44 @@ pub fn get_hourly_stats(target_date: Option<chrono::NaiveDate>) -> Vec<i64> {
     result.flatten().unwrap_or_else(|| vec![0i64; 24])
 }
 
-/// 所选窗口内每小时的合计键数（返回长度 24 的列表）。
+/// 所选窗口内每小时的合计键数（长度 24），含"这一轮没读全"。
 ///
-/// 与 `get_hourly_stats`（只看某一天）不是一件事，两个都留着：周报的时段直方图问的就是
+/// 与 [`get_hourly_stats`]（只看某一天）不是一件事，两个都留着：周报的时段直方图问的就是
 /// "那一天几点"，而分析页的每小时分布要跟顶部周期走 —— 把一头硬套成另一头，就会有一头
 /// 说错话（旧写法是整页写死今日，顶部选了「近 1 年」图上的标题却还写着"今日"）。
+/// ⚠ 那一天那一问（`get_hourly_stats`）本轮没动，还是把四道折都吞掉的旧尺子。
 ///
-/// 跨年份那套口径照 `get_daily_counts`：某一年的库**问不出在不在**时跳过它并点名是哪一年、
+/// 跨年份那套口径照 [`daily_counts_totals`]：某一年的库**问不出在不在**时跳过它并点名是哪一年、
 /// 为什么，绝不折成"那一年每小时都是 0"。
-pub fn get_hourly_totals(days: i64, year: Option<i32>) -> Vec<i64> {
+pub fn hourly_window_totals(days: i64, year: Option<i32>) -> HourlyTotals {
     let today = Local::now().date_naive();
     let days = clamp_query_days(days);
     let (start, years_to_query) = window_start_and_years(today, days, year);
     let start_dk = day_key_of_date(start);
     let end_dk = day_key_of_date(today);
-    let mut hourly = vec![0i64; 24];
-    for y in &years_to_query {
-        let path = paths::year_db_path(*y);
-        match year_db_presence(&path) {
-            // 没有这一年的库文件是正常答案（那年没数据、或全新安装）：安静跳过
-            Ok(false) => continue,
-            Ok(true) => {}
-            Err(e) => {
-                tracing::error!(
-                    "说不出 {y} 年的库在不在（{}）：{e} —— 这一次这一年不进每小时计数，\
-                     但那不是「那一年每小时都是 0」",
-                    path.display()
-                );
-                continue;
-            }
-        }
-        let year_result = connection::with_ro_conn(&path, |conn| -> rusqlite::Result<()> {
-            if !table_exists(conn, "hourly_counts") {
-                return Ok(());
-            }
-            let mut stmt = conn.prepare(
-                "SELECT hour, SUM(count) FROM hourly_counts \
-                 WHERE date_key >= ?1 AND date_key <= ?2 GROUP BY hour",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![start_dk, end_dk], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-            })?;
-            for row in rows.flatten() {
-                // 越界的小时值历史上真存过，这一问是承重的（与 `get_hourly_stats` 同一道闸）
-                if (0..24).contains(&row.0) {
-                    hourly[row.0 as usize] += row.1;
-                }
-            }
-            Ok(())
-        });
-        if let Some(Err(e)) = year_result {
-            tracing::error!("每小时计数查询失败（{y} 年库）: {e}");
+    let mut hours = vec![0i64; 24];
+    let (pairs, unreadable) = read_window_years(
+        HOURLY_LABEL,
+        &years_to_query,
+        start_dk,
+        end_dk,
+        query_hourly_window_in_conn,
+    );
+    for (h, c) in pairs {
+        // 越界的小时值历史上真存过，这一问是承重的（与 `get_hourly_stats` 同一道闸）
+        if (0..24).contains(&h) {
+            hours[h as usize] += c;
         }
     }
-    hourly
+    HourlyTotals { hours, unreadable }
+}
+
+/// 查询所选窗口内每小时的合计键数（返回长度 24 的列表）。
+///
+/// ⚠ 同 [`get_daily_counts`]：长度 24 的数组说不出"这一轮没读全"。面板与导出走
+/// [`hourly_window_totals`]。
+pub fn get_hourly_totals(days: i64, year: Option<i32>) -> Vec<i64> {
+    hourly_window_totals(days, year).hours
 }
 
 /// 查询前台应用使用时长公共实现：app_usage 求总秒数 + 按应用聚合。
@@ -2211,12 +2310,14 @@ mod tests {
             );
         }
 
-        // 形状腿：`get_daily_counts` 里那把 `exists()` 尺子不许回来，也不许把三态又折成 bool
+        // 形状腿：逐库取数那一段里 `exists()` 尺子不许回来，也不许把三态又折成 bool。
+        // 锚点从 `get_daily_counts` 搬到 `read_window_years`：本轮把"逐年度库那一圈"挪进了
+        // 每日与每小时共用的取数函数，判据留在旧函数上就切不到任何真正读库的代码（假绿）。
         let src = include_str!("queries.rs");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
-            .find("pub fn get_daily_counts(")
-            .expect("get_daily_counts 找不到了");
+            .find("fn read_window_years(")
+            .expect("read_window_years 找不到了");
         let raw = &prod[at..at + prod[at..].find("\n}").expect("函数体切不出来")];
         // 先摘注释行：这一段自己的说明文字里就写着 `path.exists()`，带着它判"不许再用"
         // 会红在该改的地方之外、绿在真正要防的地方之上。
@@ -2234,9 +2335,32 @@ mod tests {
             "这一处必须问三态那把尺子"
         );
         assert!(
-            body.contains("不进每日计数"),
+            body.contains("不进{label}的读数"),
             "说不出在不在那一支必须出声，而不是安静跳过"
         );
+        assert!(
+            body.contains("with_ro_conn_why("),
+            "「打不开」要带着原因进 gap，不许再用只回 None 的那把"
+        );
+        assert!(
+            body.matches("gaps.push(").count() >= 3,
+            "说不出在不在／打不开／读不出来三道折各该有一处出声，实得 {}",
+            body.matches("gaps.push(").count()
+        );
+        // 两个二元组口子必须是薄包装：它们自己再去读一遍库的话，上面那套判据就管不到它们了
+        for head in ["pub fn get_daily_counts(", "pub fn get_hourly_totals("] {
+            let w_at = prod.find(head).unwrap_or_else(|| panic!("{head} 找不到了"));
+            let w_raw = &prod[w_at..w_at + prod[w_at..].find("\n}").expect("包装函数体切不出来")];
+            let w_body: String = w_raw
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !w_body.contains("with_ro_conn"),
+                "{head} 自己又开了一次库 —— gap 会从这条包装里漏掉"
+            );
+        }
         // 共用一把尺子之后，闸那一头的口径不许被顺手改掉（本轮只是把两处并成一份判据，
         // 没有改变"确认在/说不出都去真开一次"这件事）
         assert!(
@@ -3997,14 +4121,15 @@ mod tests {
         }
     }
 
-    /// 上面那条第四腿的守门人：`rows.flatten()` 一旦回到三个榜的取行处，行为用例里
-    /// 的那份"库头合法、页坏"夹具会重新被念成"榜短了一截、读全了"。
+    /// 上面那条第四腿的守门人：`rows.flatten()` 一旦回到取行处，行为用例里
+    /// 的那份"库头合法、页坏"夹具会重新被念成"榜短了一截／趋势全是 0，但读全了"。
     ///
     /// 应用榜的取行是**只有这条**守得住（聚合先失败，取行轮不到出声，见上面那条注释），
     /// 所以它不许被当成冗余的源码判据删掉。
     ///
-    /// 只圈三个榜函数：每日趋势／每小时（`get_daily_counts`／`get_hourly_*`）与设备详情
-    /// 那两条helper还在用 `flatten()`，本轮没动它们，写成全文件判据会立刻红在该轮之外。
+    /// 只圈这几处取行：设备详情那两条 helper（`device_key_rows`／`device_date_series`）
+    /// 与单日那一问（`get_hourly_stats`）还在用 `flatten()`，本轮没动它们，
+    /// 写成全文件判据会立刻红在该轮之外。
     #[test]
     fn the_rank_readings_do_not_fold_a_broken_page_into_a_short_list() {
         let src = include_str!("queries.rs");
@@ -4013,6 +4138,7 @@ mod tests {
             "fn query_stats_in_conn(",
             "fn query_apps_in_conn(",
             "fn query_devices_in_conn(",
+            "fn read_pairs(",
         ] {
             let at = prod
                 .find(header)
@@ -4030,6 +4156,43 @@ mod tests {
             assert!(
                 body.contains("collect::<Result<Vec<_>"),
                 "{header} 必须让取行错误变成 Err，而不是凑出一个能用的 Vec"
+            );
+        }
+    }
+
+    /// 每日与每小时那两个单库读数的三态接线：`table_exists` 那把 bool 尺子不许回来。
+    ///
+    /// 这条是**形状**判据不是行为判据：`Presence::Unreadable` 那一臂要一份"表问得出、
+    /// 内容问不出"的库才触发得了，本轮没造出那种夹具（行为腿覆盖的是 NoTable／
+    /// 打不开／扫到坏页三臂）。留这条是为了把"问不出＝没有"那次回退挡在编译之外。
+    #[test]
+    fn the_window_readers_ask_the_three_state_table_ruler() {
+        let src = include_str!("queries.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        for header in [
+            "fn query_daily_window_in_conn(",
+            "fn query_hourly_window_in_conn(",
+        ] {
+            let at = prod
+                .find(header)
+                .unwrap_or_else(|| panic!("{header} 找不到了"));
+            let raw = &prod[at..at + prod[at..].find("\n}").expect("函数体切不出来")];
+            let body: String = raw
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !body.contains("table_exists("),
+                "{header} 又用 bool 那把尺子问表 —— 「问不出」会被折成「没有这张表」"
+            );
+            assert!(
+                body.contains("connection::table_presence(conn,"),
+                "{header} 必须问三态那把尺子"
+            );
+            assert!(
+                body.contains("Presence::Unreadable(why) => return YearRead::Unreadable(why)"),
+                "{header} 问不出那一臂必须原样交出去，不许落进 NoTable"
             );
         }
     }
@@ -4069,6 +4232,147 @@ mod tests {
         assert_eq!(
             broken.total, 0,
             "旧写法在这里交回 0 台 / 0 次，与「今天没插设备」同形"
+        );
+    }
+
+    /// 每日趋势与每小时分布同一条口径：没这张表＝安静按 0；问不出／打不开／读到一半坏页＝点名。
+    ///
+    /// 这一支以前有四道各自为政的折（`year_db_presence` 说不出只留一行日志、`with_ro_conn`
+    /// 把打不开折成 `None`、`table_exists` 把问不出折成"没有"、`rows.flatten()` 把坏页折成
+    /// "到这儿为止"），面板那两条曲线与导出那两段切面都把"读不出来"画成了 0。
+    #[test]
+    fn the_daily_and_hourly_readings_name_the_year_they_cannot_read() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_window_gaps");
+        std::fs::create_dir_all(crate::paths::data_dir()).unwrap();
+        let year = Local::now().year();
+        let path = paths::year_db_path(year);
+        let dk = day_key_of_date(Local::now().date_naive());
+
+        // 一、两张表都真没有：安静按 0，不许凭空造一句"读不出来"
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            conn.execute_batch("CREATE TABLE unrelated (a INTEGER);")
+                .unwrap();
+        }
+        connection::clear_ro_cache();
+        let none = daily_counts_totals(7, Some(year));
+        assert!(
+            none.unreadable.is_empty() && none.series.len() == 7,
+            "没这张表是真没有数据，实得 {:?}",
+            none.unreadable
+        );
+        let none_hourly = hourly_window_totals(7, Some(year));
+        assert!(
+            none_hourly.unreadable.is_empty() && none_hourly.hours.iter().all(|v| *v == 0),
+            "每小时那一栏同理，实得 {:?}",
+            none_hourly.unreadable
+        );
+        connection::clear_ro_cache();
+        std::fs::remove_file(&path).expect("删掉这一年的库（先 clear_ro_cache）");
+
+        // 二、文件根本不是库（同步盘占位、移动盘没醒那一类）：两个域都要说出是哪一年
+        std::fs::write(&path, b"this is not a sqlite database at all").unwrap();
+        connection::clear_ro_cache();
+        for (domain, gaps) in [
+            ("每日趋势", daily_counts_totals(7, Some(year)).unreadable),
+            ("每小时分布", hourly_window_totals(7, Some(year)).unreadable),
+        ] {
+            assert_eq!(
+                gaps.len(),
+                1,
+                "{domain} 那一年读不出来该只点一条名，实得 {gaps:?}"
+            );
+            assert!(
+                gaps[0].contains(domain) && gaps[0].contains(&year.to_string()),
+                "gap 要能认出域名与年份，实得 {:?}",
+                gaps[0]
+            );
+        }
+        // 二元组那个旧口子照旧交回全零数组 —— 它分不出这两件事，所以面板不许再用它
+        assert!(
+            get_daily_counts(7, Some(year)).iter().all(|(_, c)| *c == 0),
+            "旧口子在这一支还是把读不出来念成 0"
+        );
+        connection::clear_ro_cache();
+        std::fs::remove_file(&path).expect("换夹具前要删掉这一年的库（先 clear_ro_cache）");
+
+        // 三、**库头合法、窗口那几页坏**：`open_ro` 打得开，是扫描那一步失败。
+        // 先把窗口要读的那几行放在文件的**后半段**（填 12000 行小 date_key 把页往前推，
+        // 再写今天这一行），否则 range seek 只碰前半段，坏页永远轮不到出声（假绿）。
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            for k in 1..12_000i64 {
+                conn.execute(
+                    "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 1, 1)",
+                    [k],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO hourly_counts (date_key, hour, count) VALUES (?1, 8, 1)",
+                    [k],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 77, 60)",
+                [dk],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO hourly_counts (date_key, hour, count) VALUES (?1, 21, 5)",
+                [dk],
+            )
+            .unwrap();
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        connection::clear_ro_cache();
+        // 夹具自检（改前先跑）：库好的时候这两笔数确实读得出来，坏页那一腿红才有意义
+        let healthy = daily_counts_totals(7, Some(year));
+        assert!(
+            healthy.unreadable.is_empty() && healthy.series.last().map(|(_, c)| *c) == Some(77),
+            "夹具没被读进来说不出回归： {:?}",
+            healthy.series.last()
+        );
+        assert_eq!(
+            hourly_window_totals(7, Some(year)).hours[21],
+            5,
+            "每小时那份夹具同样要真被读进来"
+        );
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.len() > 4096 * 40,
+            "夹具太小，窗口那几行没铺到文件后半段（实得 {} 字节）",
+            bytes.len()
+        );
+        let cut = bytes.len() / 2;
+        for b in bytes.iter_mut().skip(cut) {
+            *b = 0xA5;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        connection::clear_ro_cache();
+        let broken = daily_counts_totals(7, Some(year));
+        assert_eq!(
+            broken.unreadable.len(),
+            1,
+            "「打得开、扫到坏页」也必须点名（这条测的就是取行那一臂）",
+        );
+        assert!(
+            !broken.unreadable[0].contains("打不开"),
+            "这一臂不是打不开，原因别说错：{}",
+            broken.unreadable[0]
+        );
+        assert!(
+            broken.series.iter().all(|(_, c)| *c == 0),
+            "读不全时数组只是下界，不许把窗口里那半截行算成数"
+        );
+        let broken_hourly = hourly_window_totals(7, Some(year));
+        assert_eq!(
+            broken_hourly.unreadable.len(),
+            1,
+            "每小时那一栏同一条口径，实得 {:?}",
+            broken_hourly.unreadable
         );
     }
 

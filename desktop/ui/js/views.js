@@ -624,16 +624,22 @@ export function renderTrendChart(s) {
         : s.trend) || [];
   const mapped = data.map(([date, value]) => ({ date, value }));
   const label = appState.trendDays === 0 ? windowText(s) : `近${appState.trendDays}天`;
+  // 每日趋势这条线读不全时画的是下界：不在这儿说一句，用户看到的就是一条"看着正常的低平线"
+  $("trend-gap").innerHTML = gapNote(s, "每日趋势");
   lineChart($("trend-chart"), `每日活跃趋势（${label}）`, mapped);
 }
 
 function renderHourlyChart(s) {
   const hourly = s.hourly || [];
+  $("hourly-gap").innerHTML = gapNote(s, "每小时分布");
   barChart($("hourly-chart"), `${windowText(s)}每小时活跃`, hourly, hourly.map((_, h) => h + "时"));
 }
 
 function renderWeekdayChart(s) {
   const weekday = s.weekday || [];
+  // 星期分布是从每日计数里聚合出来的（core 里 `aggregate_weekday(&trend_period)`），
+  // 库里读不全时它继承的是「每日趋势」那句原因，不是自己另问了一次库
+  $("weekday-gap").innerHTML = gapNote(s, "每日趋势");
   // 后端交回的是固定 7 格（周一..周日，窗口里没有的那天是 0）：下标与 WD 一一对得上。
   // 少了这个约定，短窗口（今日周期只有 1 天）就会把周四的数挂在「周一」那一格上。
   barChart($("weekday-chart"), `${windowText(s)}星期活跃`, weekday.map(([, v]) => v), WD);

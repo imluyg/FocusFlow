@@ -71,12 +71,17 @@
             <button class="tab" data-days="7" role="tab" aria-selected="false">近7天</button>
             <button class="tab" data-days="30" role="tab" aria-selected="false">近30天</button>
           </div>
+          <!-- 三张图各有一条「这一轮没读全」的落点：曲线读不全时画的是下界，
+               不把那句话写在图旁边，用户看到的就是一条看着正常的低平线 -->
+          <div id="trend-gap"></div>
           <div id="trend-chart" style="height:300px;margin-top:8px;"></div>
         </div>
         <div id="ana-hourly" style="display:none;">
+          <div id="hourly-gap"></div>
           <div id="hourly-chart" style="height:300px;"></div>
         </div>
         <div id="ana-weekday" style="display:none;">
+          <div id="weekday-gap"></div>
           <div id="weekday-chart" style="height:300px;"></div>
         </div>
         <div id="ana-heat" style="display:none;">

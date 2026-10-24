@@ -2038,7 +2038,9 @@ fn compute_charts(
     let keyboard_total = total - mouse_total;
     let daily_days = focusflow_core::db::queries::chart_window_days(period_val);
     let needed = daily_days.max(7).max(30);
-    let daily_all = focusflow_core::db::get_daily_counts(needed, None);
+    // 每日趋势走带原因的读数：读不全时这条曲线只是下界，前端要把"这一轮没读全"说出来
+    let daily_read = focusflow_core::db::daily_counts_totals(needed, None);
+    let daily_all = daily_read.series;
     let total_days = daily_all.len() as usize;
     let counts: Vec<i64> = if total_days >= daily_days as usize {
         daily_all[total_days - daily_days as usize..]
@@ -2112,7 +2114,10 @@ fn compute_charts(
         .map(|d| (d, *agg_wd.get(&d).unwrap_or(&0)))
         .collect();
     // 每小时分布跟着所选窗口：写死"今天"的时候，顶部选了「近 1 年」而图上念的还是"今日"
-    let hourly = focusflow_core::db::queries::get_hourly_totals(daily_days, None);
+    let hourly_read = focusflow_core::db::hourly_window_totals(daily_days, None);
+    let hourly = hourly_read.hours;
+    // 星期分布是从每日趋势那一段里聚合出来的（`aggregate_weekday(&trend_period)`），
+    // 所以它不另问一次库 —— 每日那一栏的 gap 就是这张图的 gap，前端按域名去挑。
     ChartAgg {
         total,
         // 展示值要等统计线程拿到 alltime 缓存与本轮 pending 才能定（apply_display_total）；
@@ -2130,7 +2135,14 @@ fn compute_charts(
         devices,
         device_total,
         device_count,
-        read_gaps: [key_gaps, app_gaps, device_gaps].concat(),
+        read_gaps: [
+            key_gaps,
+            app_gaps,
+            device_gaps,
+            daily_read.unreadable,
+            hourly_read.unreadable,
+        ]
+        .concat(),
         group,
         mouse_total,
         keyboard_total,
@@ -2661,8 +2673,16 @@ mod compute_charts_tests {
             "周期到天数那把尺子没被用上，说明有人本地又抄了一份 match"
         );
         assert!(
-            body.contains("get_hourly_totals(daily_days, None)"),
+            body.contains("hourly_window_totals(daily_days, None)"),
             "每小时分布还在问某一天，而不是所选窗口"
+        );
+        assert!(
+            body.contains("daily_counts_totals(needed, None)"),
+            "每日趋势回到了说不出原因的数组口子（那一栏的 gap 会整块消失）"
+        );
+        assert!(
+            !body.contains("get_hourly_totals(") && !body.contains("get_daily_counts("),
+            "面板又用回二元组那两条：数组交不回「这一轮没读全」"
         );
         assert!(
             !body.contains("get_hourly_stats(None)"),
@@ -2694,11 +2714,12 @@ mod compute_charts_tests {
         let agg = compute_charts(0, None, 0);
         assert_eq!(agg.total, 0, "读不出来时交回的总数是下界，这里就是 0");
         assert!(
-            agg.read_gaps.len() >= 3,
-            "三个排行榜各该说一条没读全，实得 {:?}",
+            agg.read_gaps.len() >= 5,
+            "三个排行榜加两条时间切面各该说一条没读全，实得 {:?}",
             agg.read_gaps
         );
-        for domain in ["按键统计", "应用时长", "设备统计"] {
+        for domain in ["按键统计", "应用时长", "设备统计", "每日趋势", "每小时分布"]
+        {
             assert!(
                 agg.read_gaps.iter().any(|g| g.contains(domain)),
                 "{domain} 那一栏的 gap 没进面板，实得 {:?}",
@@ -2711,11 +2732,13 @@ mod compute_charts_tests {
     ///
     /// 探针：把 core 里 `"应用时长"` 改成别的词 ⇒ 这条红（前端会从此滤不到那一栏的 gap，
     /// 而那个 gap 仍在数组里 —— 界面上就是一句都不显示）。
+    /// 「每日趋势／每小时分布」是同一批里的另外两栏（星期分布继承每日那句，所以不另列）。
     #[test]
     fn the_panel_names_the_same_domains_as_the_core() {
         let js = include_str!("../ui/js/views.js");
         let core = include_str!("../../crates/core/src/db/queries.rs");
-        for domain in ["按键统计", "应用时长", "设备统计"] {
+        for domain in ["按键统计", "应用时长", "设备统计", "每日趋势", "每小时分布"]
+        {
             assert!(
                 core.contains(&format!("\"{domain}\"")),
                 "core 那一侧的域名 label「{domain}」不见了（gap 文案会跟着变）"

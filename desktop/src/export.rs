@@ -146,8 +146,14 @@ pub fn collect_report(w: &ReportWindow) -> ReportData {
     // 时间切面那三段：天数交给 `chart_window_days` 那一把尺子（「总计」= 近 30 天）
     // 天数一律问 core 那把尺子（界面、导出、命令行三处同一个答案）
     let days_window = q::chart_window_days(days);
-    let daily = q::get_daily_counts(days_window, None);
-    let hourly = q::get_hourly_totals(days_window, None);
+    let daily_read = q::daily_counts_totals(days_window, None);
+    let hourly_read = q::hourly_window_totals(days_window, None);
+    let daily = daily_read.series;
+    let hourly = hourly_read.hours;
+    // 时间切面那三段读不全也要进同一份 gap 名单：星期分布是从 `daily` 里聚合出来的，
+    // 它继承每日那一栏的原因，不另开一域。
+    read_gaps.extend(daily_read.unreadable);
+    read_gaps.extend(hourly_read.unreadable);
     let agg_wd = q::aggregate_weekday(&daily);
     let weekday: Vec<(i64, i64)> = (0..7i64)
         .map(|d| (d, *agg_wd.get(&d).unwrap_or(&0)))
