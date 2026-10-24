@@ -223,9 +223,49 @@ for (const k of anchored) {
 
 console.log(`APP_DIR_LOCK_AUDIT anchored=${anchored.size} violations=${bad}`);
 console.log(`APP_DIR_CWD_PIN_AUDIT pins=${pins} violations=${cwdBad}`);
+
+// ---- 第三判据：串行化 app_dir 的锁全仓只能有一把 ------------------------------------------
+// 上面那张守卫名单把 `app_dir_lock` 与 `test_app_dir_lock` **同等看待**，于是"各自另开一把"
+// 这种形状在这条判据里是完全合规的 —— desktop 就真的自己 `static LOCK` 开过一把（注释写着
+// "core 那把是 #[cfg(test)]，跨 crate 拿不到"，而它现在挂在 `test-utils` 特征上，拿得到）。
+// 后果不是编译错误，而是两个用例组各自以为串行化了：它们并发跑，症状是随机红在
+// `export::a_week_that_cannot_be_read…` 的反向腿与 `state::the_panel_is_told_which_readings_are_incomplete`
+// 上（单跑绿、整套绿里夹红）。所以这里钉的是"调用形态"：只许一把自己建互斥体，其余必须委托。
+//
+// 范围说明：`crates/core/tests/*.rs` 各文件自己的 `test_lock()` / `guard()` 不被这条计入
+// （名字不匹配），这是刻意的 —— 每个集成测试是**独立进程**，而 cargo 一次只跑一个测试
+// 二进制，要串行化的是同一进程内的并行；实测那九个文件里没有混用两把锁的。
+let lockDefiners = 0;
+let lockDelegators = 0;
+let lockBad = 0;
+for (const p of perFile) {
+  for (const fn of p.fns) {
+    if (!/app_dir_lock$/.test(fn.name)) continue;
+    const defines = /Mutex\s*::\s*new\s*\(/.test(fn.body);
+    const delegates = callsName(fn.body, "test_app_dir_lock");
+    if (defines && fn.name === "test_app_dir_lock") {
+      lockDefiners++;
+    } else if (delegates && !defines) {
+      lockDelegators++;
+    } else {
+      lockBad++;
+      console.log(
+        `LOCK_SPLIT_VIOLATION ${p.file}:${fn.line}  ${fn.name}() 既不是那把唯一的锁，也没有委托给它`
+      );
+    }
+  }
+}
+console.log(
+  `APP_DIR_ONE_LOCK_AUDIT definers=${lockDefiners} delegators=${lockDelegators} violations=${lockBad}`
+);
+if (lockDefiners === 0) {
+  // 一把定义都扫不到 = 解析器或名单坏了，而不是"纪律变好了"
+  console.log("AUDIT_BROKEN: 没扫到任何定义 app_dir 串行锁的函数，判据本身大概失效了");
+  process.exit(1);
+}
 if (anchored.size < 100 || pins < 20) {
   // 扫到的量突然变少 = 解析器或目录清单坏了，那比漏报更危险（它会一直"绿"）
   console.log("AUDIT_BROKEN: 锚定函数或 set_app_dir 调用点少到不合理，判据本身大概失效了");
   process.exit(1);
 }
-process.exit(bad === 0 && cwdBad === 0 ? 0 : 1);
+process.exit(bad === 0 && cwdBad === 0 && lockBad === 0 ? 0 : 1);

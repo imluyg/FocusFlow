@@ -92,6 +92,7 @@ if command -v node >/dev/null 2>&1; then
     mark LOCK_AUDIT $?
     say "LOCK_AUDIT_DETAIL=$(grep -a '^APP_DIR_LOCK_AUDIT' "$OUT/lock-audit.txt")"
     say "CWD_PIN_AUDIT_DETAIL=$(grep -a '^APP_DIR_CWD_PIN_AUDIT' "$OUT/lock-audit.txt")"
+    say "ONE_LOCK_AUDIT_DETAIL=$(grep -a '^APP_DIR_ONE_LOCK_AUDIT' "$OUT/lock-audit.txt")"
 else
     say "LOCK_AUDIT=node 不可用：这条判据不能跳过（它查的是测试纪律，不是环境）"
     mark LOCK_AUDIT 1

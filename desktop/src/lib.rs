@@ -13,16 +13,20 @@ pub mod snip;
 pub mod state;
 pub mod tray;
 
-/// 测试专用：凡是调用 `paths::set_app_dir` 的用例都必须持有此锁跑完全程。
+/// 测试专用：凡是调用 `paths::set_app_dir` / `paths::test_app_dir` 的用例都必须持有此锁跑完全程。
 ///
 /// app_dir 是进程级全局，而 cargo 默认并行跑用例：不串行时 A 用例刚把目录换成
 /// 自己造的年度库，B 用例正在查的就已经是 A 的数据（本 crate 曾因此出现
-/// 「空库应为 0」读到 42 万的偶发失败）。core 侧的同名锁是 `#[cfg(test)]`，
-/// 跨 crate 拿不到，所以这里各留一份。
+/// 「空库应为 0」读到 42 万的偶发失败）。
+///
+/// 锁必须是 **core 那一份**：本函数曾自己 `static LOCK` 另开一把，理由是"core 的同名锁
+/// 是 `#[cfg(test)]`，跨 crate 拿不到"—— 那句话现在已经不成立（core 侧挂在 `test-utils`
+/// 特征上，dev 构建拿得到）。两把锁的代价不是编译错误，而是**两个用例各自觉得自己串行化了**：
+/// 一把锁的组与另一把锁的组照样并发跑，实测红在 `export::a_week_that_cannot_be_read…`
+/// 的反向腿与 `state::the_panel_is_told_which_readings_are_incomplete` 上（单跑绿、整套红）。
 #[cfg(test)]
 pub(crate) fn app_dir_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    focusflow_core::paths::test_app_dir_lock()
 }
 
 use std::time::{Duration, Instant};
