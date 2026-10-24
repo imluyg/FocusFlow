@@ -258,7 +258,10 @@ fn rollback_fresh_copy(dst: &Path) -> Vec<String> {
     let mut leftover = Vec::new();
     let mut remove = |path: &Path| {
         if let Err(e) = std::fs::remove_file(path) {
-            if path.exists() {
+            // 删完再回头 `exists()` 问一遍是第二个能失败的调用：那一刻"问不出"会被读成
+            // "没有"，于是这份残缺副本从此没人点名，而下一次导入照样把它当目标库。
+            // `NotFound`＝确实没有（别人删掉了），其余＝必须出声。
+            if !crate::data_location::is_confirmed_absent(&e) {
                 leftover.push(format!("{}（{e}）", path.display()));
             }
         }
@@ -740,17 +743,18 @@ fn restore_after_failed_copy(
     dst: &Path,
     kept: &Option<std::path::PathBuf>,
 ) {
-    // 半套新库删不掉也要说出来：它留在原地，下一次导入就会当"目标库已存在"去读它
+    // 半套新库删不掉也要说出来：它留在原地，下一次导入就会当"目标库已存在"去读它。
+    // 判断用这一次删除自己的回音，不再回头 `exists()` 问（问不出＝会被读成"没有"⇒ 沉默）。
     let mut leftover: Vec<String> = Vec::new();
     if let Err(e) = std::fs::remove_file(dst) {
-        if dst.exists() {
+        if !crate::data_location::is_confirmed_absent(&e) {
             leftover.push(format!("删不掉残缺的 {}: {e}", dst.display()));
         }
     }
     for suffix in ["-wal", "-shm"] {
         let half = crate::data_location::with_suffix(dst, suffix);
         if let Err(e) = std::fs::remove_file(&half) {
-            if half.exists() {
+            if !crate::data_location::is_confirmed_absent(&e) {
                 leftover.push(format!("删不掉残缺的 {}: {e}", half.display()));
             }
         }
@@ -784,17 +788,19 @@ fn restore_after_failed_copy(
         // sidecar 跟着回位；搬不动的那一个必须点名 —— 只搬回主库等于交回一个缺 WAL 尾巴的库
         for suffix in ["-wal", "-shm"] {
             let from = crate::data_location::with_suffix(kept_path, suffix);
-            if !from.exists() {
-                continue;
-            }
             let to = crate::data_location::with_suffix(dst, suffix);
-            if let Err(e) = std::fs::rename(&from, &to) {
-                leftover.push(format!(
+            // 这一问由改名自己回答，不再回头 `exists()` 猜。旧写法 `if !from.exists() { continue }`
+            // 把"这一刻问不出"读成"没有"⇒ 主库回了位、那段未 checkpoint 的尾巴却留在留档名
+            // 旁边，交回的正是上面那句注释禁止的状态。`NotFound` 才是"确实没有要搬的"。
+            match std::fs::rename(&from, &to) {
+                Ok(()) => {}
+                Err(e) if crate::data_location::is_confirmed_absent(&e) => {}
+                Err(e) => leftover.push(format!(
                     "{} 搬不回 {} 旁边（{e}）：那一段未 checkpoint 的记录还留在原地，\
                      手工处理时要把它一起挪",
                     from.display(),
                     dst.display(),
-                ));
+                )),
             }
         }
     }
@@ -1077,12 +1083,16 @@ mod tests {
         );
     }
 
-    /// 接线判据：导入链那几问都走同一把尺子（`exists()` 只许留在"删不掉的残留"那一类判断题上）。
+    /// 接线判据：导入链那几问都走同一把尺子，且"删完/搬完再问一遍在不在"这种写法不许回来。
+    ///
+    /// 后半句是本轮补的：原先只禁 `"if from.exists()"` 这一个串，而回滚那一问写的是
+    /// `if !from.exists()` —— 多了两个字符就抓不到，于是"第四处 sidecar 那一问"从来没上
+    /// 尺子，判据却以为整条链都上了（`probe_open(&from)` 钉在 3，现场也正好是 3）。
     #[test]
     fn the_import_chain_asks_its_source_files_with_one_ruler() {
         let text = include_str!("migration.rs");
         let prod = &text[..text.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
-        let code: String = prod
+        let code = prod
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
@@ -1099,7 +1109,24 @@ mod tests {
         ] {
             assert!(code.contains(shape), "那一问要走共用的尺子，少了 {shape}");
         }
-        for forbidden in ["if from.exists()", "if !src.exists()", "if !dst.exists()"] {
+        // "残留删没删掉"与"sidecar 搬没搬走"这四问由**那一次 syscall 自己的错误**回答，
+        // 口径与上面同一把尺子：只有 `NotFound` 算"确实没有"。
+        assert_eq!(
+            code.matches("is_confirmed_absent(&e)").count(),
+            4,
+            "四问（整体复制回滚 1 处、覆盖回滚主库 1 处 + sidecar 2 处、搬回留档 1 处里的\
+             删除与改名）都该按错误分类，实得 {}",
+            code.matches("is_confirmed_absent(&e)").count()
+        );
+        for forbidden in [
+            "if from.exists()",
+            "if !from.exists()",
+            "if !src.exists()",
+            "if !dst.exists()",
+            "if dst.exists()",
+            "if half.exists()",
+            "if path.exists()",
+        ] {
             assert!(
                 !code.contains(forbidden),
                 "那一问不许退回 exists() 猜：{forbidden}"
