@@ -949,9 +949,28 @@ fn settle_after_stop_snapshot(state: &WriterState) {
 /// 必须保住副本，能判断"已经落库了"的只有这里。
 fn neutralize_recovery_file() {
     let path = recovery_path();
-    if !path.is_file() {
-        // 快照根本没写出来（写失败时不取走，数据一直在内存里）：没有要中和的东西
-        return;
+    // 先问一次"这个名字上是什么"，三种结局分开。旧写法 `!path.is_file()` 把"属性问不出"
+    // 和"同名被非文件占着"都折成"没有要中和的东西"，一句不说就走 —— 而漏做这一次中和的
+    // 代价是下次开机把同一批**再加一遍**（落库是 `count = count + excluded` 的纯累加，
+    // 没有幂等键）。
+    match std::fs::metadata(&path) {
+        // 确认没有（快照根本没写出来：写失败时不取走，数据一直在内存里）——这里也不许
+        // 顺手建出一个空壳，`neutralizing_leaves_no_file_when_there_was_none_to_begin_with` 钉着。
+        Err(e) if crate::data_location::is_confirmed_absent(&e) => return,
+        // 问不出：按「可能在」处理，宁可多写一个空壳，不能沉默。
+        Err(e) => tracing::warn!(
+            "恢复文件（{}）的属性问不出（{e}）：按「可能在」处理，照常中和",
+            path.display()
+        ),
+        Ok(m) if !m.is_file() => {
+            tracing::warn!(
+                "恢复文件（{}）的名字被非文件占着：这一次中和没做成，若那个位置里还有未落库的\
+                 增量，下次启动可能把同一批再加一遍",
+                path.display()
+            );
+            return;
+        }
+        Ok(_) => {}
     }
     let json = match serde_json::to_string(&AggDeltasFile::from(&AggDeltas::default())) {
         Ok(j) => j,
@@ -2762,6 +2781,27 @@ mod tests {
             !path.exists(),
             "没有文件时把「中和」做成了新建一个空文件 —— 那会让下次启动白读一趟"
         );
+    }
+
+    /// 恢复文件的位置被**目录**占着时，"中和没做成"必须点名。
+    ///
+    /// 旧写法是一句 `!path.is_file() { return }`：那既不是"确认没有"（不能算没做过就没事），
+    /// 也不是"中和成了"，而现场一个字都不会有。
+    /// 探针：把这段换回 `!path.is_file()` 早退 ⇒ 本条红在日志断言（一行都不出）。
+    #[test]
+    fn a_non_file_in_the_recovery_slot_is_reported() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_settle_dir_slot");
+        let path = recovery_path();
+        std::fs::create_dir_all(&path).expect("用目录占住恢复文件的位置");
+
+        let ((), logs) = crate::logger::capture_logs(neutralize_recovery_file);
+        let text = logs.join("\n");
+        assert!(
+            text.contains("被非文件占着"),
+            "这个名字中和不出去，不许当成「没有要中和的东西」，实得: {text}"
+        );
+        assert!(path.is_dir(), "不该去动占着位置的目录");
     }
 
     /// `stop()` 超时快照**取走**的那一批只存在于文件里：在途批次落成之后，不许因为
