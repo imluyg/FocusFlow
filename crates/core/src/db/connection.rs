@@ -225,13 +225,6 @@ pub fn table_exists_readonly(path: &Path, table: &str) -> bool {
     matches!(table_presence_readonly(path, table), Presence::Yes)
 }
 
-/// 表里是否有指定列（旧形态判定用）。
-///
-/// 这条是"确认有才算有"的窄视图；要看清"读不出来"请用 [`column_presence`]。
-pub(crate) fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
-    matches!(column_presence(conn, table, column), Presence::Yes)
-}
-
 /// 按设备实例路径取整数 id（统计表字典化后只存 id）。
 pub fn device_id_of(conn: &Connection, device_key: &str) -> Option<i64> {
     conn.query_row(
@@ -505,10 +498,12 @@ fn migrate_device_identity_keys(conn: &Connection, year: i32) -> anyhow::Result<
         }
         rebuild_device_counts_by_identity(conn, "device_counts", &new_id_of, false)?;
         rebuild_device_counts_by_identity(conn, "device_key_counts", &new_id_of, true)?;
-        // 旧登记表整体换掉
-        if table_exists(conn, "devices") {
-            conn.execute("DROP TABLE devices", [])?;
-        }
+        // 旧登记表整体换掉。这里**不再问一次"devices 在不在"**：上面那句
+        // `prepare("SELECT device_key FROM devices")` 跑通就已经证明它在（而 `ensure_schema`
+        // 更是先 `CREATE TABLE IF NOT EXISTS devices` 才走到这里）。旧写法多问一遍，
+        // 那一刻问不出就被折成"不在"⇒ 跳过 DROP ⇒ 紧接着的 RENAME 撞车 ⇒ 整次
+        // `ensure_schema` 失败 ⇒ 程序每个启动都起不来。多问一次只会多一个能失败的地方。
+        conn.execute("DROP TABLE devices", [])?;
         conn.execute("ALTER TABLE devices_new RENAME TO devices", [])?;
         Ok(())
     })();
@@ -740,18 +735,79 @@ fn reconcile_island_active_seconds(conn: &Connection) -> anyhow::Result<()> {
     }
 }
 
+/// 设备表迁移的三种结局。
+#[derive(Debug, PartialEq, Eq)]
+enum DeviceMigration {
+    /// 有一个问题答不上来 ⇒ 本轮什么都不动（下一步就是 `DROP`/`RENAME`）
+    Hold,
+    /// 已经是新形态，无需迁移
+    Skip,
+    /// 有旧形态要迁
+    Run,
+}
+
+/// 四个"有没有"的三种结局 → 「迁 / 不迁 / 不动」这张决策表。
+///
+/// 抽成纯函数的原因和 `classify_stamp`、`pick_active_seconds_source` 一样：健康库上的
+/// `sqlite_master` 与 `pragma_table_info` 读不会失败，"问不出"那一臂**无头造不出来**，
+/// 但它折错的代价不是"这一条没测到"，而是 `ALTER TABLE devices_new RENAME TO devices`
+/// 撞上一条已存在的表 ⇒ 整次 `ensure_schema` 失败 ⇒ 程序每个启动都起不来。
+/// 那就只能把判据钉在表上，而不是钉在行为用例上。
+fn decide_device_migration(
+    counts: &Presence,
+    detail: &Presence,
+    devices_table: &Presence,
+    devices_id: &Presence,
+) -> (DeviceMigration, Option<String>) {
+    let mut unsure: Vec<String> = Vec::new();
+    for (what, probe) in [
+        ("device_counts 的 device_key 列", counts),
+        ("device_key_counts 的 device_key 列", detail),
+        ("devices 这张表", devices_table),
+        ("devices 的 id 列", devices_id),
+    ] {
+        if let Presence::Unreadable(why) = probe {
+            unsure.push(format!("{what}读不出来（{why}）"));
+        }
+    }
+    if !unsure.is_empty() {
+        return (DeviceMigration::Hold, Some(unsure.join("；")));
+    }
+    let legacy = matches!(counts, Presence::Yes)
+        || matches!(detail, Presence::Yes)
+        || (matches!(devices_table, Presence::Yes) && matches!(devices_id, Presence::No));
+    if legacy {
+        (DeviceMigration::Run, None)
+    } else {
+        (DeviceMigration::Skip, None)
+    }
+}
+
 /// 把旧的「统计表直接存 device_key 文本」形态迁移成整数 id 形态（幂等）。
 ///
 /// 旧形态每行都要带 84~151 字符的设备实例路径（实测 ≈200~300B/行），
 /// 设备明细表一年涨 4~7MB。迁移只在首次遇到旧形态时执行，之后检测零成本
 /// （一次 `pragma_table_info`）。整段在单事务里完成，失败即整体回滚。
 fn migrate_device_tables(conn: &Connection) -> anyhow::Result<()> {
-    let legacy_counts = column_exists(conn, "device_counts", "device_key");
-    let legacy_detail = column_exists(conn, "device_key_counts", "device_key");
-    let legacy_devices = table_exists(conn, "devices") && !column_exists(conn, "devices", "id");
-    if !legacy_counts && !legacy_detail && !legacy_devices {
+    // 这四问全部用三态尺子，且**只用这一次的答案**：旧写法用 bool 版的 `column_exists`，
+    // "读不出来"被折成"没有 id 列" ⇒ 已经是新形态的库被判成旧形态，而守卫末尾那句
+    // `if table_exists(conn, "devices")` 一旦同样读不出来就跳过 `DROP`，紧接着的
+    // `ALTER ... RENAME TO devices` 撞车 ⇒ 回滚 ⇒ `Database::init` 失败 ⇒ 起不来。
+    let counts = column_presence(conn, "device_counts", "device_key");
+    let detail = column_presence(conn, "device_key_counts", "device_key");
+    let devices_table = table_presence(conn, "devices");
+    let devices_id = column_presence(conn, "devices", "id");
+    let (intent, unsure) = decide_device_migration(&counts, &detail, &devices_table, &devices_id);
+    if let Some(why) = unsure {
+        tracing::warn!("设备统计表迁移本轮什么都不动，等这一问有答案（下次打开会重试）: {why}");
         return Ok(());
     }
+    if intent == DeviceMigration::Skip {
+        return Ok(());
+    }
+    let legacy_counts = matches!(counts, Presence::Yes);
+    let legacy_detail = matches!(detail, Presence::Yes);
+    let devices_there = matches!(devices_table, Presence::Yes);
 
     tracing::info!("设备统计表迁移：device_key 文本 → 整数 id 字典");
     conn.execute("BEGIN IMMEDIATE;", [])?;
@@ -765,7 +821,7 @@ fn migrate_device_tables(conn: &Connection) -> anyhow::Result<()> {
                 kind TEXT NOT NULL
              );",
         )?;
-        if table_exists(conn, "devices") {
+        if devices_there {
             conn.execute(
                 "INSERT OR IGNORE INTO devices_new (device_key, name, kind)
                  SELECT device_key, name, kind FROM devices",
@@ -774,8 +830,11 @@ fn migrate_device_tables(conn: &Connection) -> anyhow::Result<()> {
         }
         // 统计行出现、登记表缺失的设备（归档早于登记表落地的历史库）补一行，
         // 否则下面的 JOIN 会静默丢行。
-        for table in ["device_counts", "device_key_counts"] {
-            if column_exists(conn, table, "device_key") {
+        for (table, legacy) in [
+            ("device_counts", legacy_counts),
+            ("device_key_counts", legacy_detail),
+        ] {
+            if legacy {
                 conn.execute(
                     &format!(
                         "INSERT OR IGNORE INTO devices_new (device_key, name, kind)
@@ -786,19 +845,21 @@ fn migrate_device_tables(conn: &Connection) -> anyhow::Result<()> {
             }
         }
         // 重建两张统计表：行数、数值不变，只把 device_key 换成 id
-        for (table, pk, cols) in [
+        for (table, pk, cols, legacy) in [
             (
                 "device_counts",
                 "date_key, device_id",
                 "date_key, device_id, count",
+                legacy_counts,
             ),
             (
                 "device_key_counts",
                 "date_key, device_id, key_name",
                 "date_key, device_id, key_name, count",
+                legacy_detail,
             ),
         ] {
-            if !column_exists(conn, table, "device_key") {
+            if !legacy {
                 continue;
             }
             conn.execute_batch(&format!(
@@ -831,7 +892,7 @@ fn migrate_device_tables(conn: &Connection) -> anyhow::Result<()> {
             conn.execute(&format!("ALTER TABLE {table}_new RENAME TO {table}"), [])?;
         }
         // 旧 devices 表整体换掉（WITHOUT ROWID + 文本主键 → 整数 id + 唯一键）
-        if table_exists(conn, "devices") {
+        if devices_there {
             conn.execute("DROP TABLE devices", [])?;
         }
         conn.execute("ALTER TABLE devices_new RENAME TO devices", [])?;
@@ -906,8 +967,16 @@ mod tests {
 
         ensure_schema(&conn, 2026).unwrap();
 
-        assert!(column_exists(&conn, "devices", "id"), "devices 应有整数 id");
-        assert!(!column_exists(&conn, "device_counts", "device_key"));
+        assert_eq!(
+            column_presence(&conn, "devices", "id"),
+            Presence::Yes,
+            "devices 应有整数 id"
+        );
+        assert_eq!(
+            column_presence(&conn, "device_counts", "device_key"),
+            Presence::No,
+            "旧列要**确认消失**才算迁完：问不出不能算通过"
+        );
         assert!(
             !table_exists(&conn, "key_log"),
             "运行期不再无条件创建暂存表"
@@ -966,6 +1035,145 @@ mod tests {
 
         drop(conn);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 决策表：四个"有没有"里任何一个问不出 ⇒ 本轮什么都不动，并点名是哪一问。
+    ///
+    /// 这一臂无头造不出来（健康库上的 `sqlite_master` / `pragma_table_info` 读不会失败），
+    /// 所以钉在纯函数上而不是行为用例上 —— 同 `classify_stamp`、`pick_active_seconds_source`。
+    /// 表里 `devices 在 / id 列问不出` 那一格就是本轮的病灶：旧写法把它折成"没有 id 列"
+    /// ⇒ 判成旧形态 ⇒ 末尾 `ALTER TABLE devices_new RENAME TO devices` 撞上一条没被 DROP
+    /// 掉的表 ⇒ 回滚 ⇒ `ensure_schema` 失败 ⇒ **程序每个启动都起不来**。
+    #[test]
+    fn the_device_migration_decision_holds_when_any_probe_cannot_answer() {
+        let yes = || Presence::Yes;
+        let no = || Presence::No;
+        let unknown = || Presence::Unreadable("夹具：读不出来".to_string());
+        // (counts, detail, devices 表, devices.id, 期望, 期望点名的那一问)
+        type Case = (
+            Presence,
+            Presence,
+            Presence,
+            Presence,
+            DeviceMigration,
+            Option<&'static str>,
+        );
+        let cases: Vec<Case> = vec![
+            (yes(), no(), no(), no(), DeviceMigration::Run, None),
+            (no(), yes(), no(), no(), DeviceMigration::Run, None),
+            (no(), no(), yes(), no(), DeviceMigration::Run, None),
+            (no(), no(), yes(), yes(), DeviceMigration::Skip, None),
+            (
+                unknown(),
+                no(),
+                yes(),
+                yes(),
+                DeviceMigration::Hold,
+                Some("device_counts"),
+            ),
+            (
+                no(),
+                unknown(),
+                yes(),
+                yes(),
+                DeviceMigration::Hold,
+                Some("device_key_counts"),
+            ),
+            (
+                no(),
+                no(),
+                unknown(),
+                yes(),
+                DeviceMigration::Hold,
+                Some("devices 这张表"),
+            ),
+            (
+                no(),
+                no(),
+                yes(),
+                unknown(),
+                DeviceMigration::Hold,
+                Some("devices 的 id 列"),
+            ),
+            (
+                yes(),
+                yes(),
+                yes(),
+                unknown(),
+                DeviceMigration::Hold,
+                Some("devices 的 id 列"),
+            ),
+        ];
+        let wrong: Vec<String> = cases
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, (c, d, t, id, want, frag))| {
+                let tag = i + 1;
+                let (got, why) = decide_device_migration(&c, &d, &t, &id);
+                if got != want {
+                    return Some(format!("第 {tag} 格判成 {got:?}，期望 {want:?}"));
+                }
+                match (want, frag) {
+                    (DeviceMigration::Hold, Some(needle)) => match why {
+                        None => Some(format!("第 {tag} 格 Hold 却没说原因")),
+                        Some(text) if text.contains(needle) => None,
+                        Some(text) => Some(format!("第 {tag} 格的原因没点名「{needle}」：{text}")),
+                    },
+                    _ if why.is_some() => Some(format!("第 {tag} 格本不该有原因，实得 {why:?}")),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// 接线判据：**两条**设备整表重建的迁移（归组键迁移 + 字典化迁移）里，"有没有"只许走
+    /// 三态尺子，bool 版一条不许留。
+    ///
+    /// 切片必须盖到 `mod tests {` 为止，不能只切一个函数：第一版只切
+    /// `migrate_device_tables`，探针把 `migrate_device_identity_keys` 末尾的 DROP 改回
+    /// "再问一次 in 不在" ⇒ **三条用例全绿**（那条链的折叠代价同样是启动失败，却没人盯）。
+    /// 区间里现在是 0 处 bool 版探测；`table_exists` 在别的函数（如
+    /// `ensure_staging_table`）里仍是"确认有才算有"的窄视图，不在本判据范围内。
+    #[test]
+    fn the_device_migration_asks_only_with_the_three_state_ruler() {
+        let src = include_str!("connection.rs");
+        let from = src
+            .find("fn migrate_device_identity_keys(")
+            .expect("归组键迁移函数找不到了");
+        let prod_end = src[from..]
+            .find("\nmod tests {")
+            .map(|i| from + i)
+            .expect("测试模块的起点找不到了");
+        let body: String = src[from..prod_end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in ["table_exists(", "column_exists("] {
+            assert_eq!(
+                body.matches(forbidden).count(),
+                0,
+                "两条设备迁移里不许留 bool 版探测（它把问不出折成没有，代价是 RENAME 撞车、\
+                 程序起不来）：{forbidden}"
+            );
+        }
+        // 计数只按 `migrate_device_tables` 那一个函数体数（整段里还有别家迁移，
+        // 它们的探测数目不是这条要钉的东西）。
+        let guard_from = body
+            .find("fn migrate_device_tables(")
+            .expect("字典化迁移函数找不到了");
+        let guard_body = &body[guard_from..];
+        assert_eq!(
+            guard_body.matches("column_presence(").count(),
+            3,
+            "三列之问都要走 `column_presence`，多了少了都说明守卫被改过"
+        );
+        assert_eq!(
+            guard_body.matches("table_presence(").count(),
+            1,
+            "devices 在不在要走 `table_presence`"
+        );
     }
 
     /// B14-2：完整实例路径键 → 硬件身份段，同一硬件（只差拓扑实例号）的历史计数
@@ -1094,9 +1302,15 @@ mod tests {
         assert_eq!(total, 1);
 
         // 新库直接就是字典化形态，且不建运行期用不到的 key_log
-        assert!(column_exists(&conn, "devices", "id"));
-        assert!(column_exists(&conn, "device_counts", "device_id"));
-        assert!(column_exists(&conn, "device_key_counts", "device_id"));
+        assert_eq!(column_presence(&conn, "devices", "id"), Presence::Yes);
+        assert_eq!(
+            column_presence(&conn, "device_counts", "device_id"),
+            Presence::Yes
+        );
+        assert_eq!(
+            column_presence(&conn, "device_key_counts", "device_id"),
+            Presence::Yes
+        );
         assert!(
             !table_exists(&conn, "key_log"),
             "key_log 只在导入时按需创建"
