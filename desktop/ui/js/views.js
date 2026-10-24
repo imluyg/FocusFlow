@@ -480,6 +480,15 @@ function deviceDetailHtml(d) {
       ${d.has_alias ? `<span class="dev-detail-sub">原名 ${escapeHtml(d.auto_name)}</span>` : ""}
     </div>
     <div class="dev-detail-sub" title="${escapeHtml(d.key)}">设备标识 ${escapeHtml(d.key)}</div>
+    ${
+      // 这一页按年份库要问四趟，读不全时上面所有数字都只是下界。
+      // 不写这句，"这一年读不动"就穿成"这台设备最近用得少了"。
+      (d.unreadable || []).length
+        ? `<div class="dev-detail-line" style="color:var(--muted);font-size:12px;">${escapeHtml(
+            "这一轮没读全：" + d.unreadable.join("；")
+          )}</div>`
+        : ""
+    }
 
     ${periodTabs}
 

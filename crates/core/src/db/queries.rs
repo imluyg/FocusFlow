@@ -1588,6 +1588,10 @@ pub struct DeviceDetail {
     /// 该设备**任何时候**有没有键名明细（区分「从没记过」与「本周期没有」）。
     /// 周期内有没有数据看 `keys` 是否为空，不要拿这个字段代替。
     pub has_key_detail: bool,
+    /// 这一轮没答上来的那些问（详情按年份库要问四趟：按天序列、键名明细、
+    /// 明细标记、排行）。**非空时上面这一页所有数字都只是下界**，界面必须说出来，
+    /// 否则"这一年读不动"会穿成"这台设备最近没怎么用"。空 = 读全了。
+    pub unreadable: Vec<String>,
 }
 
 /// 这台设备在**本库**里的所有 `devices.id`（按硬件身份段认，见
@@ -1626,9 +1630,15 @@ fn device_ids_of_identity_checked(
     let identity = crate::device_alias::hardware_identity_key(device_key);
     let mut ids: Vec<i64> = match conn.prepare("SELECT id, device_key FROM devices") {
         Ok(mut stmt) => {
-            match stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
-                Ok(rows) => rows
-                    .flatten()
+            // 取行不许用 `rows.flatten()`：`Result` 自身是 `IntoIterator`，坏页那一项的
+            // `Err` 会被丢掉 ⇒ 这台设备在这个库里的**一部分 id** 悄悄消失，
+            // 后面按 id 查明细就少查几行，界面交出的是"这台设备用得少了"。
+            match stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>())
+            {
+                Ok(list) => list
+                    .into_iter()
                     .filter(|(_, key)| crate::device_alias::hardware_identity_key(key) == identity)
                     .map(|(id, _)| id)
                     .collect(),
@@ -1742,10 +1752,14 @@ fn device_has_key_detail(identity: &str) -> DetailVerdict {
     }
 }
 
-/// 单设备在周期内的键名排行（跨年度库合并，次数降序）。
+/// 单设备在周期内的键名排行（跨年度库合并，次数降序），连同"这一轮没答上来的那些问"。
 ///
-/// 表不存在（旧库）时返回空 —— 键名明细从该功能上线后开始积累，历史无法回溯。
-fn device_key_rows(identity: &str, period: i64) -> Vec<(String, i64)> {
+/// 表不存在（旧库）时安静交回空 —— 键名明细从该功能上线后开始积累，历史无法回溯。
+/// ⚠ 但"读不出来"不是"没有"：这一支以前有四道折（`with_ro_conn` 把打不开折成 `None`、
+/// `table_exists` 把问不出折成"没这张表"、`prepare(..).ok()` 与 `rows.flatten()` 把坏页
+/// 折成"明细就这些"），四道最后都穿成一句"这台设备的键名明细短了一截"。
+/// 现在四道都进 `unreadable`，交回的榜只是**已读部分**。
+fn device_key_rows(identity: &str, period: i64) -> (Vec<(String, i64)>, Vec<String>) {
     let today_key = day_key_of_date(Local::now().date_naive());
     let start_key = match period {
         -1 => Some(today_key),
@@ -1758,15 +1772,23 @@ fn device_key_rows(identity: &str, period: i64) -> Vec<(String, i64)> {
         n => Some(period_start_key(today_key, n)),
     };
     let mut merged: HashMap<String, i64> = HashMap::new();
+    let mut gaps: Vec<String> = Vec::new();
     for year in query_years(None, None) {
         let path = paths::year_db_path(year);
-        let rows = connection::with_ro_conn(&path, |conn| {
-            if !table_exists(conn, "device_key_counts") {
-                return None;
+        let gap_of = |why: String| format!("{year} 年库键名明细读不出来: {why}");
+        let got = connection::with_ro_conn_why(&path, |conn| -> YearRead<Vec<(String, i64)>> {
+            match connection::table_presence(conn, "device_key_counts") {
+                connection::Presence::No => return YearRead::NoTable,
+                connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
+                connection::Presence::Yes => {}
             }
-            let ids = device_ids_of_identity(conn, identity, year);
+            // 这台设备在本库的 id 问不出 ⇒ 这一年的明细一条都没核对过，不能算"没有"
+            let ids = match device_ids_of_identity_checked(conn, identity, year) {
+                Ok(ids) => ids,
+                Err(why) => return YearRead::Unreadable(why),
+            };
             if ids.is_empty() {
-                return Some(Vec::new());
+                return YearRead::Read(Vec::new());
             }
             let ph = in_placeholders(ids.len());
             // GROUP BY key_name 在这台设备的**所有 id** 上做：同一台设备在同库里
@@ -1793,40 +1815,60 @@ fn device_key_rows(identity: &str, period: i64) -> Vec<(String, i64)> {
             if let Some(ref sk) = tail {
                 pv.push(sk as &dyn rusqlite::ToSql);
             }
-            let list: Vec<(String, i64)> = conn
-                .prepare(&sql)
-                .ok()
-                .and_then(|mut stmt| {
-                    stmt.query_map(pv.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))
-                        .ok()
-                        .map(|rows| rows.flatten().collect())
-                })
-                .unwrap_or_default();
-            Some(list)
+            let rows = match conn.prepare(&sql) {
+                Ok(mut stmt) => stmt
+                    .query_map(pv.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
+                Err(e) => Err(e),
+            };
+            match rows {
+                Ok(list) => YearRead::Read(list),
+                Err(e) => {
+                    tracing::error!("device_key_counts 查询失败（{year} 年库，{sql}）: {e}");
+                    YearRead::Unreadable(format!("键名明细读不出来: {e}"))
+                }
+            }
         });
-        for (name, c) in rows.flatten().unwrap_or_default() {
-            *merged.entry(name).or_insert(0) += c;
+        match got {
+            Err(why) => gaps.push(gap_of(why)),
+            Ok(YearRead::Unreadable(why)) => gaps.push(gap_of(why)),
+            // 没有这张表 = 这一年还没开始记键名明细；安静按空计
+            Ok(YearRead::NoTable) => {}
+            Ok(YearRead::Read(list)) => {
+                for (name, c) in list {
+                    *merged.entry(name).or_insert(0) += c;
+                }
+            }
         }
     }
     let mut list: Vec<(String, i64)> = merged.into_iter().collect();
     list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    list
+    (list, gaps)
 }
 
-/// 单设备按天次数序列（跨年度库合并，date_key 升序）。
+/// 单设备按天次数序列（跨年度库合并，date_key 升序），连同"这一轮没答上来的那些问"。
 ///
 /// 设备维度按年份分库存储，查询必须跨库合并 —— 与 `get_device_stats` 同理。
-fn device_date_series(identity: &str) -> Vec<(i64, i64)> {
+/// 四道折的收口理由同 [`device_key_rows`]：这一栏读不全时界面念的是
+/// "活跃 N 天 / 首次与最近使用日期"，那都是关于**用户历史**的断言。
+fn device_date_series(identity: &str) -> (Vec<(i64, i64)>, Vec<String>) {
     let mut merged: HashMap<i64, i64> = HashMap::new();
+    let mut gaps: Vec<String> = Vec::new();
     for year in query_years(None, None) {
         let path = paths::year_db_path(year);
-        let rows = connection::with_ro_conn(&path, |conn| {
-            if !table_exists(conn, "device_counts") {
-                return None;
+        let gap_of = |why: String| format!("{year} 年库按天序列读不出来: {why}");
+        let got = connection::with_ro_conn_why(&path, |conn| -> YearRead<Vec<(i64, i64)>> {
+            match connection::table_presence(conn, "device_counts") {
+                connection::Presence::No => return YearRead::NoTable,
+                connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
+                connection::Presence::Yes => {}
             }
-            let ids = device_ids_of_identity(conn, identity, year);
+            let ids = match device_ids_of_identity_checked(conn, identity, year) {
+                Ok(ids) => ids,
+                Err(why) => return YearRead::Unreadable(why),
+            };
             if ids.is_empty() {
-                return Some(Vec::new());
+                return YearRead::Read(Vec::new());
             }
             let sql = format!(
                 "SELECT c.date_key, c.count FROM device_counts c \
@@ -1834,24 +1876,34 @@ fn device_date_series(identity: &str) -> Vec<(i64, i64)> {
                 in_placeholders(ids.len())
             );
             let pv = id_params(&ids);
-            let list: Vec<(i64, i64)> = conn
-                .prepare(&sql)
-                .ok()
-                .and_then(|mut stmt| {
-                    stmt.query_map(pv.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))
-                        .ok()
-                        .map(|rows| rows.flatten().collect())
-                })
-                .unwrap_or_default();
-            Some(list)
+            let rows = match conn.prepare(&sql) {
+                Ok(mut stmt) => stmt
+                    .query_map(pv.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
+                Err(e) => Err(e),
+            };
+            match rows {
+                Ok(list) => YearRead::Read(list),
+                Err(e) => {
+                    tracing::error!("device_counts 查询失败（{year} 年库，{sql}）: {e}");
+                    YearRead::Unreadable(format!("按天序列读不出来: {e}"))
+                }
+            }
         });
-        for (dk, c) in rows.flatten().unwrap_or_default() {
-            *merged.entry(dk).or_insert(0) += c;
+        match got {
+            Err(why) => gaps.push(gap_of(why)),
+            Ok(YearRead::Unreadable(why)) => gaps.push(gap_of(why)),
+            Ok(YearRead::NoTable) => {}
+            Ok(YearRead::Read(list)) => {
+                for (dk, c) in list {
+                    *merged.entry(dk).or_insert(0) += c;
+                }
+            }
         }
     }
     let mut series: Vec<(i64, i64)> = merged.into_iter().collect();
     series.sort_by_key(|(dk, _)| *dk);
-    series
+    (series, gaps)
 }
 
 /// 查询单台设备详情。`period` 与统计视图一致：-1 今日 / 0 全部 / n 近 n 天。
@@ -1875,7 +1927,7 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
     let device_key = crate::device_alias::hardware_identity_key(device_key);
     let today_date = Local::now().date_naive();
     let today_key = day_key_of_date(today_date);
-    let series = device_date_series(&device_key);
+    let (series, mut gaps) = device_date_series(&device_key);
 
     let from_key = period_start_key(today_key, period);
     let in_period = |dk: i64| dk >= from_key;
@@ -1931,7 +1983,8 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
         .unwrap_or(0);
 
     // 周期内键名排行（设备 × 键名明细；旧库无该表时为空）
-    let key_rows = device_key_rows(&device_key, period);
+    let (key_rows, key_gaps) = device_key_rows(&device_key, period);
+    gaps.extend(key_gaps);
     let key_total: i64 = key_rows.iter().map(|(_, c)| *c).sum();
 
     // 近 30 天分布（缺数据补 0，便于前端直接画柱）
@@ -1955,6 +2008,15 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
         })
         .collect();
 
+    // 只有"每一个能读的库都说没有"才报 false：那一格界面文案讲的是用户的历史，
+    // 拿一次读不动当证据就等于替用户编一段历史。读不动时按 true 走
+    // （那一格会显示成"有明细、这次没列出来"），原因除了留日志还进 `unreadable`，
+    // 让界面把它说给人听。
+    let detail_verdict = device_has_key_detail(&device_key);
+    if let DetailVerdict::Unknown(why) = &detail_verdict {
+        tracing::warn!("设备 {device_key} 有没有键名明细查不出来（{why}）：本次不断言「没有」");
+        gaps.push(format!("这台设备有没有键名明细问不出来: {why}"));
+    }
     DeviceDetail {
         key: device_key.clone(),
         name,
@@ -1989,19 +2051,8 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
         trend,
         keys: key_rows,
         key_total,
-        // 只有"每一个能读的库都说没有"才报 false：那一句界面文案讲的是用户的历史，
-        // 拿一次读不动当证据就等于替用户编一段历史。读不动时按 true 走
-        // （那一格会显示成"有明细、这次没列出来"），并把原因留在日志里。
-        has_key_detail: match device_has_key_detail(&device_key) {
-            DetailVerdict::Absent => false,
-            DetailVerdict::Has => true,
-            DetailVerdict::Unknown(why) => {
-                tracing::warn!(
-                    "设备 {device_key} 有没有键名明细查不出来（{why}）：本次不断言「没有」"
-                );
-                true
-            }
-        },
+        has_key_detail: !matches!(detail_verdict, DetailVerdict::Absent),
+        unreadable: gaps,
     }
 }
 
@@ -3626,14 +3677,14 @@ mod tests {
             today_key - old_dk
         );
         // 全表那一档必须看得见它
-        let all = device_key_rows(key, 0);
+        let all = device_key_rows(key, 0).0;
         assert_eq!(
             all,
             vec![("A".to_string(), 5)],
             "period=0 是全表，实得 {all:?}"
         );
         // 极端周期：夹住 ⇒ 1900 年那行不计进来（注回旧写法会算进来 ⇒ 这条红）
-        let huge = device_key_rows(key, i64::MAX);
+        let huge = device_key_rows(key, i64::MAX).0;
         assert!(
             huge.is_empty(),
             "i64::MAX 要夹到 {MAX_QUERY_DAYS} 天，不能等于「没有下界」，实得 {huge:?}"
@@ -3656,14 +3707,14 @@ mod tests {
             let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
         }
         invalidate_years_cache();
-        let got = device_key_rows(key, i64::MAX);
+        let got = device_key_rows(key, i64::MAX).0;
         assert_eq!(
             got,
             vec![("B".to_string(), 3)],
             "窗口内的行要照常计入、窗口外的不计（实得 {got:?}）"
         );
         assert_eq!(
-            device_key_rows(key, MAX_QUERY_DAYS),
+            device_key_rows(key, MAX_QUERY_DAYS).0,
             got,
             "i64::MAX 与 MAX_QUERY_DAYS 必须是同一档，不能一份回绕一份夹住"
         );
@@ -4121,15 +4172,19 @@ mod tests {
         }
     }
 
-    /// 上面那条第四腿的守门人：`rows.flatten()` 一旦回到取行处，行为用例里
-    /// 的那份"库头合法、页坏"夹具会重新被念成"榜短了一截／趋势全是 0，但读全了"。
+    /// 上面那些"库头合法、页坏"夹具的守门人：`rows.flatten()` 一旦回到取行处，
+    /// 榜会短一截、趋势全是 0，而交回的数组看起来是"读全了"。
     ///
-    /// 应用榜的取行是**只有这条**守得住（聚合先失败，取行轮不到出声，见上面那条注释），
-    /// 所以它不许被当成冗余的源码判据删掉。
+    /// 圈这几处：三个榜的单库读数、每日／每小时共用的 `read_pairs`、
+    /// 设备详情的两条 helper，以及它们都要问的登记表 `device_ids_of_identity_checked`。
     ///
-    /// 只圈这几处取行：设备详情那两条 helper（`device_key_rows`／`device_date_series`）
-    /// 与单日那一问（`get_hourly_stats`）还在用 `flatten()`，本轮没动它们，
-    /// 写成全文件判据会立刻红在该轮之外。
+    /// **实测过的两处"只有这条守得住"**（别把它们当冗余删掉）：
+    /// - 应用榜的取行 —— 它前面那句 `SUM(seconds)` 与聚合读同一批页，坏页先撞聚合，取行轮不到出声；
+    /// - 登记表的扫描 —— 详情那份夹具把坏字节放在后半段，`devices` 只有几行、落在合法页里，
+    ///   把它的取行换回 `flatten()` 时行为用例照绿（第 212 轮探针实测），只有这条红。
+    ///
+    /// 还没动的同族留在判据之外（写成全文件判据会立刻红在该轮之外）：单日那一问
+    /// `get_hourly_stats`、以及 `registered_kind` 那把 bool 问表。
     #[test]
     fn the_rank_readings_do_not_fold_a_broken_page_into_a_short_list() {
         let src = include_str!("queries.rs");
@@ -4139,6 +4194,9 @@ mod tests {
             "fn query_apps_in_conn(",
             "fn query_devices_in_conn(",
             "fn read_pairs(",
+            "fn device_ids_of_identity_checked(",
+            "fn device_key_rows(",
+            "fn device_date_series(",
         ] {
             let at = prod
                 .find(header)
@@ -4193,6 +4251,202 @@ mod tests {
             assert!(
                 body.contains("Presence::Unreadable(why) => return YearRead::Unreadable(why)"),
                 "{header} 问不出那一臂必须原样交出去，不许落进 NoTable"
+            );
+        }
+    }
+
+    /// 单设备详情那两条 helper 也走同一批三态尺子（形状判据，理由同
+    /// `the_window_readers_ask_the_three_state_table_ruler`）。
+    ///
+    /// 额外钉一条：它们必须问 `device_ids_of_identity_checked`，不许回到那个吞错误的
+    /// `device_ids_of_identity` —— 后者把"登记表读不动"折成"这台设备在这个库没有 id"，
+    /// 于是整年的明细安静消失，界面念的是"这台设备最近用得少了"。
+    #[test]
+    fn the_device_detail_readers_ask_the_three_state_rulers() {
+        let src = include_str!("queries.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        for header in ["fn device_key_rows(", "fn device_date_series("] {
+            let at = prod
+                .find(header)
+                .unwrap_or_else(|| panic!("{header} 找不到了"));
+            let raw = &prod[at..at + prod[at..].find("\n}").expect("函数体切不出来")];
+            let body: String = raw
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !body.contains("table_exists("),
+                "{header} 又用 bool 那把尺子问表"
+            );
+            assert!(
+                !body.contains("device_ids_of_identity(conn,"),
+                "{header} 回到了吞错误的 ids 那一条：登记表读不动会被折成「这台设备这年没记录」"
+            );
+            assert!(
+                body.contains("device_ids_of_identity_checked("),
+                "{header} 必须问那条会说出原因的 ids"
+            );
+            assert!(
+                !body.contains("with_ro_conn(&path"),
+                "{header} 用只回 None 的那条打开库 —— 「打不开」就没人说了"
+            );
+            assert!(
+                body.contains("with_ro_conn_why("),
+                "{header} 必须带走打开失败的原因"
+            );
+        }
+    }
+
+    /// 设备详情那一页必须说得出"这一轮哪几问没答上来"。
+    ///
+    /// 详情按年份库要跑四趟（按天序列、键名明细、明细标记、排行），这四问以前各折各的：
+    /// 读不动时界面交出的是一句关于用户历史的假话，而不是"这次没读全"。
+    #[test]
+    fn the_device_detail_says_which_readings_are_incomplete() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_detail_gaps");
+        let this = Local::now().year();
+        let key = r"\\?\hid#vid_1234&pid_5678#fake&0000";
+        let dk = day_key_of_date(Local::now().date_naive());
+
+        // 好的一年：明细与按天都有；读全了就不许凭空造一句
+        {
+            let conn = connection::open_rw(&paths::year_db_path(this)).unwrap();
+            connection::ensure_schema(&conn, this).unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO devices (id, device_key, name, kind) VALUES (7, ?1, '鼠标', 'mouse')",
+                [key],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, 7, 40)",
+                [dk],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO device_key_counts (date_key, device_id, key_name, count) VALUES (?1, 7, '左键', 25)",
+                [dk],
+            )
+            .unwrap();
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        let healthy = get_device_detail(key, 0);
+        assert!(
+            healthy.unreadable.is_empty(),
+            "读全了不该造一句警告，实得 {:?}",
+            healthy.unreadable
+        );
+        assert_eq!(
+            healthy.keys,
+            vec![("左键".to_string(), 25)],
+            "夹具得真被读进来，否则下面那些断言测的是空集"
+        );
+        assert_eq!(
+            healthy.all, 40,
+            "按天那份同样要真读进来，实得 {}",
+            healthy.all
+        );
+
+        // 坏的一年（文件不是 SQLite）：两栏各点一条名，已读到的数不许一起归零
+        let broken = this + 1;
+        std::fs::write(
+            paths::year_db_path(broken),
+            b"this is not a sqlite database at all",
+        )
+        .unwrap();
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        let detail = get_device_detail(key, 0);
+        for domain in ["键名明细", "按天序列"] {
+            assert!(
+                detail
+                    .unreadable
+                    .iter()
+                    .any(|g| g.contains(domain) && g.contains(&broken.to_string())),
+                "{domain} 那一年读不出来必须点名，实得 {:?}",
+                detail.unreadable
+            );
+        }
+        assert_eq!(
+            detail.keys,
+            vec![("左键".to_string(), 25)],
+            "坏掉那一年不该把已读到的明细一起吃掉"
+        );
+
+        // **库头合法、明细那几页坏**：取行撞上就是 `Err`，不许折成"这台设备的明细就这些"
+        let tail = this + 2;
+        let tail_path = paths::year_db_path(tail);
+        if let Err(e) = std::fs::remove_file(&tail_path) {
+            assert!(
+                crate::data_location::is_confirmed_absent(&e),
+                "换夹具前删不掉这一年的库（不是「本来就没有」）: {e}"
+            );
+        }
+        {
+            let conn = connection::open_rw(&tail_path).unwrap();
+            connection::ensure_schema(&conn, tail).unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO devices (id, device_key, name, kind) VALUES (7, ?1, '鼠标', 'mouse')",
+                [key],
+            )
+            .unwrap();
+            // 别人家的设备把页铺到文件后半段：这一台的行要到 seek 之后才撞坏页
+            for i in 0..12_000i64 {
+                conn.execute(
+                    "INSERT INTO device_counts (date_key, device_id, count) VALUES (1, ?1, 1)",
+                    [100 + i],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO device_key_counts (date_key, device_id, key_name, count) VALUES (1, ?1, ?2, 1)",
+                    rusqlite::params![100 + i, format!("K{i}")],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, 7, 60)",
+                [dk],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO device_key_counts (date_key, device_id, key_name, count) VALUES (?1, 7, '右键', 33)",
+                [dk],
+            )
+            .unwrap();
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        connection::clear_ro_cache();
+        let mut bytes = std::fs::read(&tail_path).unwrap();
+        assert!(
+            bytes.len() > 4096 * 40,
+            "夹具太小，明细没铺到文件后半段（实得 {} 字节）",
+            bytes.len()
+        );
+        let cut = bytes.len() / 2;
+        for b in bytes.iter_mut().skip(cut) {
+            *b = 0xA5;
+        }
+        std::fs::write(&tail_path, &bytes).unwrap();
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        let half = get_device_detail(key, 0);
+        let named: Vec<&String> = half
+            .unreadable
+            .iter()
+            .filter(|g| g.contains(&tail.to_string()))
+            .collect();
+        assert!(
+            named.len() >= 2,
+            "{tail} 这一年两栏都该点名（明细标记那一问也算一问），实得 {:?}",
+            half.unreadable
+        );
+        for g in &named {
+            assert!(
+                !g.contains("打不开"),
+                "这一臂是打得开、读到一半坏页，原因别说错：{g}"
             );
         }
     }
