@@ -1,4 +1,4 @@
-// app_dir 串行锁审计：切全局程序目录的用例必须全程持有那把锁。
+// app_dir 串行锁审计：切全局程序目录的用例必须全程持有那把锁，也不许把它锚到 cwd。
 //
 //   node scripts/audit_app_dir_lock.mjs        # 违规则以退出码 1 结束并列出位置
 //
@@ -6,6 +6,12 @@
 // 而测试并行跑在同一进程里。少了串行锁，症状不是"这条用例红"，而是隔壁用例的库被开到
 // `target/ff_restore_sentinel/` 下、或者撞进仓库里的 `crates/core/data/` —— 随机红、
 // 且 `--test-threads=1` 永远全绿。这类事不该靠人记得，所以写成机器判据。
+//
+// 第二条判据（CWD_PIN）查的是"锚到哪"：集成测试的 cwd 就是包目录 `crates/core`，
+// `set_app_dir(current_dir())` 等于把**仓库**声明成程序目录 —— 宿主会在里面建 `data/`、
+// `backup/`、`config.ini`，给下一条用例留旧行（`db/maintenance.rs` 里那条"实测本用例整套
+// 跑时偶发 backup_dir 变成 crates/core"就是同一场事）。要读随包 `.lua` 就复制进临时目录
+// （`crates/core/tests/common/mod.rs` 的 `isolated_app_dir`），仓库字节全程不动。
 //
 // 认三种"取了锁"的写法（都是本仓库里实际存在的形状）：
 //   1) 直接调 `test_app_dir_lock()` / `app_dir_lock()`；
@@ -56,8 +62,43 @@ function parse(src) {
 
 let bad = 0;
 let anchored = 0;
+// 第二条判据的计数：`set_app_dir` 调用点总数（pins）与其中锚到 cwd 的条数（cwdBad）。
+let pins = 0;
+let cwdBad = 0;
+
+// 剥掉注释再匹配：`tests/common/mod.rs` 的文件头就写着"旧写法于是直接
+// `set_app_dir(current_dir())`"，不剥会红在一句说明上（本仓库在 presence 腿上进过同形亏）。
+// 按行剥、保留行号。字符串里恰好含 `//` 的会被截短 —— 只会让判据更宽，不会假红。
+const stripComments = (src) =>
+  src
+    .split("\n")
+    .map((line) => {
+      const t = line.trimStart();
+      if (t.startsWith("//")) return "";
+      const i = line.indexOf("//");
+      return i >= 0 ? line.slice(0, i) : line;
+    })
+    .join("\n");
+
 for (const f of files) {
   const src = fs.readFileSync(f, "utf8");
+  const code = stripComments(src);
+  const lineOf = (idx) => code.slice(0, idx).split("\n").length;
+  // 谁把 cwd 存进了哪个变量：`let dir = std::env::current_dir()...`
+  const cwdVars = new Set();
+  for (const m of code.matchAll(/let\s+([A-Za-z_]\w*)\s*=\s*[\w:]*env::current_dir\s*\(/g)) {
+    cwdVars.add(m[1]);
+  }
+  for (const m of code.matchAll(/set_app_dir\s*\(\s*([^)\n]*)\)/g)) {
+    pins++;
+    const arg = m[1].trim();
+    const inline = arg.includes("current_dir(");
+    const named = [...cwdVars].some((v) => new RegExp(`^&?\\s*\\b${v}\\b`).test(arg));
+    if (inline || named) {
+      cwdBad++;
+      console.log(`CWD_PIN_VIOLATION ${f}:${lineOf(m.index)} 把 app_dir 锚到了 cwd(${arg})`);
+    }
+  }
   if (!src.includes("test_app_dir(")) continue;
   const fns = parse(src);
   // 第 1、2 类：自己取锁，或调了本文件里某个"已经在取锁"的函数。
@@ -108,9 +149,10 @@ for (const f of files) {
   }
 }
 console.log(`APP_DIR_LOCK_AUDIT anchored=${anchored} violations=${bad}`);
-if (anchored < 100) {
-  // 扫到的锚定函数突然变少 = 解析器或目录清单坏了，那比漏报更危险（它会一直"绿"）
-  console.log("AUDIT_BROKEN: 锚定函数少到不合理，判据本身大概失效了");
+console.log(`APP_DIR_CWD_PIN_AUDIT pins=${pins} violations=${cwdBad}`);
+if (anchored < 100 || pins < 20) {
+  // 扫到的量突然变少 = 解析器或目录清单坏了，那比漏报更危险（它会一直"绿"）
+  console.log("AUDIT_BROKEN: 锚定函数或 set_app_dir 调用点少到不合理，判据本身大概失效了");
   process.exit(1);
 }
-process.exit(bad === 0 ? 0 : 1);
+process.exit(bad === 0 && cwdBad === 0 ? 0 : 1);

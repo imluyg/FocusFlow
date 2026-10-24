@@ -81,15 +81,17 @@ say "DOC_WARNING_LINES=$(grep -ac '^warning' "$OUT/doc.txt")"
 [ "$(grep -ac '^warning' "$OUT/doc.txt")" = "0" ]
 mark DOC_WARNINGS $?
 
-# ---- 4b) app_dir 串行锁审计（切全局程序目录的用例必须持锁跑完）--------------------------
+# ---- 4b) app_dir 审计：切全局程序目录的用例必须持锁跑完，且不许锚到 cwd ------------------
 # 判据在 scripts/audit_app_dir_lock.mjs：违规则列位置并退非 0。
 # 这条为什么归门禁而不是归人记：`set_app_dir` 写的是进程级 `Mutex<Option<PathBuf>>`，
 # 后写覆盖前者；少一把锁的症状不是"这条用例红"，而是隔壁用例的库被开到哨兵目录、
 # 或撞进仓库里的 crates/core/data —— 随机红且 `--test-threads=1` 永远全绿。
+# 锚到 cwd 是同一家族的另一半：集成测试的 cwd 就是包目录，那等于把仓库当程序目录用。
 if command -v node >/dev/null 2>&1; then
     node scripts/audit_app_dir_lock.mjs > "$OUT/lock-audit.txt" 2>&1
     mark LOCK_AUDIT $?
-    say "LOCK_AUDIT_DETAIL=$(tail -n 1 "$OUT/lock-audit.txt")"
+    say "LOCK_AUDIT_DETAIL=$(grep -a '^APP_DIR_LOCK_AUDIT' "$OUT/lock-audit.txt")"
+    say "CWD_PIN_AUDIT_DETAIL=$(grep -a '^APP_DIR_CWD_PIN_AUDIT' "$OUT/lock-audit.txt")"
 else
     say "LOCK_AUDIT=node 不可用：这条判据不能跳过（它查的是测试纪律，不是环境）"
     mark LOCK_AUDIT 1
