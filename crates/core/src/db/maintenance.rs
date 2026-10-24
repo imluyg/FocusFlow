@@ -529,14 +529,25 @@ pub fn migrate_v2() {
 fn migrate_v2_file(path: &Path, year: i32) -> i64 {
     let result = (|| -> anyhow::Result<i64> {
         // 廉价守卫放最前：绝大多数库没有旧版暂存表，连写连接都不该开。
-        if !connection::table_exists_readonly(path, "key_log") {
-            return Ok(0);
+        // 但"问不出"不等于"没有"：库正被别的进程握着、半截写入的那一轮，旧明细既不迁移
+        // 也不出声，而 `Database::init` 照样报成功（同一族口径见 `connection::Presence`）。
+        match connection::table_presence_readonly(path, "key_log") {
+            connection::Presence::No => return Ok(0),
+            connection::Presence::Unreadable(why) => {
+                tracing::warn!(
+                    "{year} 年库这一轮问不出有没有 key_log（{}），既不迁移也不删表：\
+                     旧版逐条明细会继续占着库，直到这一问有答案",
+                    why
+                );
+                return Ok(0);
+            }
+            connection::Presence::Yes => {}
         }
         let conn = connection::open_rw(path)?;
         connection::ensure_schema(&conn, year)?;
         // 「读不出来」与「空表」不是一件事实，而下面那条 if 紧接着就要 DROP TABLE：
         // 损坏/半截的导入库里 `COUNT(*)` 报错 ⇒ 当成 0 ⇒ 把用户仅存的一份旧明细连表
-        // 删掉；下次启动 `table_exists_readonly` 已经是 false ⇒ 连重试的机会都没了。
+        // 删掉；表被删了，那道守卫下次也就再也问不出这里曾经有过什么。
         // 这就是"吞掉的失败 + 顺手做一个不可逆动作 = 从这次没读动升级成永远没了"。
         let row_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM key_log", [], |r| r.get(0))
@@ -6179,6 +6190,91 @@ mod tests {
         assert!(
             connection::table_exists_readonly(&path, "key_log"),
             "COUNT 读不出来被当成空表 ⇒ key_log 被 DROP 掉了，那份旧明细从此不会再被迁移"
+        );
+    }
+
+    /// 库这一轮**打不开**时，"有没有 key_log"那一问不能折成"没有"：旧写法用
+    /// `table_exists_readonly`（`Err(_) => false`）⇒ 安静 `Ok(0)`，而 `Database::init`
+    /// 照样报成功 ⇒ 那一年的旧版逐条明细既不迁移，也没人知道它为什么还在。
+    ///
+    /// 反向腿（句柄放开后同一次调用要真的迁移成）证明上面那条断言不是恒真。
+    #[cfg(windows)]
+    #[test]
+    fn an_unopenable_year_db_says_so_instead_of_skipping_the_migration() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("migrate_v2_locked");
+        let year = 2027i32;
+        let path = paths::year_db_path(year);
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            connection::ensure_staging_table(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO key_log (key_name, timestamp) VALUES ('A', ?1)",
+                [1_700_000_000i64],
+            )
+            .unwrap();
+            drop(conn);
+        }
+        // 放行 0 号共享 ⇒ 连读都挡住 ⇒ 走的正是"问不出"那一支，不是"没有这张表"
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .expect("独占句柄应能打开");
+        assert!(
+            connection::open_ro(&path).is_err(),
+            "夹具没成立：这个句柄没挡住只读打开"
+        );
+
+        let ((), logs) = crate::logger::capture_logs(|| {
+            assert_eq!(
+                migrate_v2_file(&path, year),
+                0,
+                "问不出时不能报成「迁了几条」"
+            );
+        });
+        let text = logs.join("\n");
+        assert!(
+            text.contains("问不出有没有 key_log"),
+            "跳过这件事必须点名，实得: {text}"
+        );
+        drop(holder);
+        // 表还在不在只能在句柄放开之后问 —— 握着的那一刻连 `open_ro` 都被挡，
+        // 拿它当"没动表"的证据只会测到夹具自己。
+        assert!(
+            connection::table_exists_readonly(&path, "key_log"),
+            "问不出那一轮不该动表"
+        );
+
+        let n = migrate_v2_file(&path, year);
+        assert_eq!(n, 1, "句柄放开之后同一条 key_log 该被聚合并清掉，实得 {n}");
+    }
+
+    /// 接线判据：那道守卫走三态尺子，bool 版只许留在测试断言里。
+    ///
+    /// 探针：把守卫换回 `!connection::table_exists_readonly(path, "key_log")` ⇒
+    /// 两条计数一起红（生产半边出现 bool 版、三态版少一处）。
+    #[test]
+    fn the_v2_migration_guard_asks_with_the_three_state_ruler() {
+        let src = include_str!("maintenance.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("table_exists_readonly(").count(),
+            0,
+            "生产半边不许再用 bool 版问「有没有这张表」：它把打不开折成没有"
+        );
+        assert_eq!(
+            code.matches("table_presence_readonly(path, \"key_log\")")
+                .count(),
+            1,
+            "那一问要走三态尺子，且只问一次"
         );
     }
 

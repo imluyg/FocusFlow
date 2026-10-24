@@ -203,12 +203,26 @@ pub fn column_presence(conn: &Connection, table: &str, column: &str) -> Presence
     }
 }
 
-/// 只读判断某个库里有没有某张表（库/表不存在都返回 false）。用完即关。
-pub fn table_exists_readonly(path: &Path, table: &str) -> bool {
+/// 只读判断某个库里有没有某张表，三种结局分开（用完即关）。
+///
+/// 立它的原因：库打不开（被第二个实例握着、同步盘占用、移动盘休眠）与库里确实没有这张表
+/// 是两件事，而调用方接下来要做的事**相反** —— "没有"可以跳过，"打不开"必须说出来并留着
+/// 下次重试。`writer.rs` 里早就为这一问写过一句"不能用 `table_exists_readonly`"，
+/// 但那条尺子本身一直没补，于是同一句警告在另一条链上又被用了一遍。
+pub fn table_presence_readonly(path: &Path, table: &str) -> Presence {
     match open_ro(path) {
-        Ok(conn) => table_exists(&conn, table),
-        Err(_) => false,
+        Ok(conn) => table_presence(&conn, table),
+        Err(e) => Presence::Unreadable(format!("库打不开: {}（{e}）", path.display())),
     }
+}
+
+/// 只读判断某个库里有没有某张表（库/表不存在都返回 false）。用完即关。
+///
+/// ⚠ 这是 [`table_presence_readonly`] 的"确认有才算有"窄视图：它把"打不开"与"读不出来"
+/// 都折成 false。**生产代码里问"有没有"不要用这条** —— 折掉的正是需要出声的那一支；
+/// 现在它只留给测试断言与"答案错了也不影响任何写入"的判断。
+pub fn table_exists_readonly(path: &Path, table: &str) -> bool {
+    matches!(table_presence_readonly(path, table), Presence::Yes)
 }
 
 /// 表里是否有指定列（旧形态判定用）。
@@ -594,14 +608,17 @@ fn rebuild_device_counts_by_identity(
 /// 补列 → 把旧表的秒数 UPDATE 过来 → 删旧表。整段在单事务里完成，失败即回滚，
 /// 下次打开会重试；已完成时只做一次 `column_exists` 检测（一次 pragma 查询）。
 fn merge_active_seconds_into_daily(conn: &Connection) -> anyhow::Result<()> {
-    let already_merged = column_exists(conn, "daily_counts", "seconds");
-    if already_merged {
-        // 上次迁移中途失败时会剩下孤岛旧表，这里补删；正常路径是 no-op。
-        if table_exists(conn, "active_seconds") {
-            tracing::info!("清理残留的 active_seconds 表（已完成合并）");
-            conn.execute_batch("DROP TABLE active_seconds")?;
+    match column_presence(conn, "daily_counts", "seconds") {
+        // 连"合并做过没有"都问不出来时，这一轮什么都不写：`ALTER` 会撞出一条意义不明的
+        // duplicate column，而下面那条孤岛清理会把唯一一份历史时长当成垃圾删掉。
+        Presence::Unreadable(why) => {
+            tracing::warn!(
+                "daily_counts 的列清单读不出来，本轮不做活跃时长迁移（下次打开会重试）: {why}"
+            );
+            return Ok(());
         }
-        return Ok(());
+        Presence::Yes => return reconcile_island_active_seconds(conn),
+        Presence::No => {}
     }
 
     tracing::info!("活跃时长迁移：active_seconds → daily_counts.seconds");
@@ -610,23 +627,32 @@ fn merge_active_seconds_into_daily(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "ALTER TABLE daily_counts ADD COLUMN seconds INTEGER NOT NULL DEFAULT 0",
         )?;
-        if table_exists(conn, "active_seconds") {
-            // 两步走，**不允许丢任何一天的时长**：
-            //   1) 先把「有活跃记录但 daily_counts 没有这一天」的行补进去（count=0）。
-            //      正常采集下不会出现（时长由键鼠事件产生，同一事件也记 daily），
-            //      但历史库的口径随版本变过，迁移逻辑宁可信其有。
-            //   2) 再 UPDATE 其余各行 —— 反过来「有按键没时长」的早期日期保持默认 0，
-            //      因为活跃统计本来就上线得更晚。
-            conn.execute_batch(
-                "INSERT OR IGNORE INTO daily_counts (date_key, count, seconds)
-                   SELECT a.date_key, 0, a.seconds FROM active_seconds a;
-                 UPDATE daily_counts
-                    SET seconds = (SELECT a.seconds FROM active_seconds a
-                                    WHERE a.date_key = daily_counts.date_key)
-                  WHERE EXISTS (SELECT 1 FROM active_seconds a
-                                 WHERE a.date_key = daily_counts.date_key);
-                 DROP TABLE active_seconds;",
-            )?;
+        match table_presence(conn, "active_seconds") {
+            Presence::No => {}
+            // 这一问之后紧跟着就是 `COMMIT`（建列落定、旧表原样留着），所以"问不出"
+            // 绝不能折成"没有旧表"：那一轮会交出一个「列已建好、秒数一条没搬」的中间态,
+            // 而下一次启动在这里看成"已完成合并" ⇒ 唯一那份历史活跃时长被删掉。
+            Presence::Unreadable(why) => {
+                anyhow::bail!("active_seconds 在不在问不出来，本轮不合并: {why}")
+            }
+            Presence::Yes => {
+                // 两步走，**不允许丢任何一天的时长**：
+                //   1) 先把「有活跃记录但 daily_counts 没有这一天」的行补进去（count=0）。
+                //      正常采集下不会出现（时长由键鼠事件产生，同一事件也记 daily），
+                //      但历史库的口径随版本变过，迁移逻辑宁可信其有。
+                //   2) 再 UPDATE 其余各行 —— 反过来「有按键没时长」的早期日期保持默认 0，
+                //      因为活跃统计本来就上线得更晚。
+                conn.execute_batch(
+                    "INSERT OR IGNORE INTO daily_counts (date_key, count, seconds)
+                       SELECT a.date_key, 0, a.seconds FROM active_seconds a;
+                     UPDATE daily_counts
+                        SET seconds = (SELECT a.seconds FROM active_seconds a
+                                        WHERE a.date_key = daily_counts.date_key)
+                      WHERE EXISTS (SELECT 1 FROM active_seconds a
+                                     WHERE a.date_key = daily_counts.date_key);
+                     DROP TABLE active_seconds;",
+                )?;
+            }
         }
         Ok(())
     })();
@@ -638,6 +664,78 @@ fn merge_active_seconds_into_daily(conn: &Connection) -> anyhow::Result<()> {
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK;");
             Err(e)
+        }
+    }
+}
+
+/// 「已经合并完」那一支里的孤岛旧表：只有在**证明它不再被需要**之后才允许删。
+///
+/// 为什么不看见就删：`daily_counts.seconds` 已建、而旧表里的秒数一条没搬，是可以真实存在的
+/// 中间态（上面那次合并的 `table_presence` 走到 `Unreadable` 之外的更早一轮、或者中途被
+/// 强杀）。旧写法把 `table_exists(active_seconds)` 当成唯一判据，那一刻库里剩下的
+/// 正是唯一一份历史活跃时长，而日志写的是「已完成合并」⇒ 界面上这段时长永久归零。
+/// 所以这里先对账：缺的那几天**补并进来**，确认一天不剩才删；任何一步问不出就保留旧表、
+/// 出声等下一次重试（留一张没人读的表，代价远小于删掉唯一一份数据）。
+fn reconcile_island_active_seconds(conn: &Connection) -> anyhow::Result<()> {
+    const ORPHANS_SQL: &str = "SELECT COUNT(*) FROM active_seconds a \
+         WHERE a.seconds > COALESCE((SELECT d.seconds FROM daily_counts d \
+                                     WHERE d.date_key = a.date_key), -1)";
+    match table_presence(conn, "active_seconds") {
+        Presence::No => return Ok(()),
+        Presence::Unreadable(why) => {
+            tracing::warn!("active_seconds 在不在问不出来，本轮不删这张表: {why}");
+            return Ok(());
+        }
+        Presence::Yes => {}
+    }
+    let orphans: i64 = match conn.query_row(ORPHANS_SQL, [], |r| r.get(0)) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("孤岛 active_seconds 的对账读不出来，本轮不删这张表: {e}");
+            return Ok(());
+        }
+    };
+    if orphans == 0 {
+        tracing::info!("清理残留的 active_seconds 表（已完成合并）");
+        if let Err(e) = conn.execute_batch("DROP TABLE active_seconds") {
+            tracing::warn!("残留的 active_seconds 没删掉（不影响数据，只是白占一页）: {e}");
+        }
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let repair = (|| -> anyhow::Result<()> {
+        conn.execute_batch(
+            "INSERT INTO daily_counts (date_key, count, seconds)
+               SELECT a.date_key, 0, a.seconds FROM active_seconds a
+              WHERE NOT EXISTS (SELECT 1 FROM daily_counts d WHERE d.date_key = a.date_key);
+             UPDATE daily_counts SET seconds =
+               (SELECT a.seconds FROM active_seconds a WHERE a.date_key = daily_counts.date_key)
+              WHERE EXISTS (SELECT 1 FROM active_seconds a
+                             WHERE a.date_key = daily_counts.date_key
+                               AND a.seconds > daily_counts.seconds);",
+        )?;
+        let left: i64 = conn.query_row(ORPHANS_SQL, [], |r| r.get(0))?;
+        if left != 0 {
+            anyhow::bail!("补并之后还剩 {left} 天没并进 daily_counts");
+        }
+        conn.execute_batch("DROP TABLE active_seconds;")?;
+        Ok(())
+    })();
+    match repair {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            tracing::warn!(
+                "上次活跃时长迁移漏了 {orphans} 天（列已建好而秒数没搬）：\
+                 已补并进 daily_counts 并清掉孤岛表"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            tracing::warn!(
+                "孤岛 active_seconds 的补并没做成，保留旧表等下次重试（删掉就是永久丢）: {e}"
+            );
+            Ok(())
         }
     }
 }
@@ -1170,6 +1268,112 @@ mod tests {
         let conn = open_rw(&path).unwrap();
         ensure_schema(&conn, year).unwrap();
         assert_eq!(ones_reopen(&conn, 1000), (42, 3600), "重复迁移必须幂等");
+        drop(conn);
+    }
+
+    /// 中间态（`daily_counts.seconds` 已建好、旧表的秒数一条没搬）必须被**补并**，
+    /// 而不是被当成"已完成合并"删掉。
+    ///
+    /// 旧写法只问一句"孤岛表还在吗"就在 `DROP`，那一刻孤岛是历史活跃时长的唯一一份
+    /// 副本 —— 界面上这段时长永久归零，而日志写的是「已完成合并」。
+    /// 探针：把 `reconcile_island_active_seconds` 换回"看见就删" ⇒ 本条红在 `ones(1000)`
+    /// 的 seconds（0 而非 3600），且孤岛表被删后无从重试。
+    #[test]
+    fn an_island_holding_unmerged_seconds_is_repaired_not_dropped() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("conn_island");
+        let year = chrono::Local::now().date_naive().year();
+        let path = crate::paths::year_db_path(year);
+
+        // 手工搭出上面那个中间态：新列已经在，秒数还留在孤岛表里
+        let conn = open_rw(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE daily_counts (
+                date_key INTEGER PRIMARY KEY,
+                count INTEGER NOT NULL,
+                seconds INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE active_seconds (
+                date_key INTEGER PRIMARY KEY,
+                seconds INTEGER NOT NULL
+             );
+             INSERT INTO daily_counts VALUES (1000, 42, 0);
+             INSERT INTO active_seconds VALUES (1000, 3600);
+             INSERT INTO active_seconds VALUES (1002, 900);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open_rw(&path).unwrap();
+        let ((), logs) = crate::logger::capture_logs(|| ensure_schema(&conn, year).unwrap());
+        let days = |dk: i64| -> (i64, i64) {
+            conn.query_row(
+                "SELECT count, seconds FROM daily_counts WHERE date_key=?1",
+                [dk],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            days(1000),
+            (42, 3600),
+            "缺的那一天时长必须补并回 daily_counts"
+        );
+        assert_eq!(
+            days(1002),
+            (0, 900),
+            "daily_counts 里压根没有的那一天要新建一行（count=0）"
+        );
+        assert!(
+            !table_exists(&conn, "active_seconds"),
+            "补并成功之后孤岛表才允许删掉"
+        );
+        let text = logs.join("\n");
+        assert!(
+            text.contains("漏了 2 天"),
+            "补并这件事要说出漏了几天，不能静悄悄改完，实得: {text}"
+        );
+        drop(conn);
+    }
+
+    /// 对照腿：孤岛表里的天数库里都兜得住时，照旧安静删掉（别把清理改成永远留着垃圾）。
+    #[test]
+    fn a_fully_reflected_island_is_still_dropped() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("conn_island_clean");
+        let year = chrono::Local::now().date_naive().year();
+        let path = crate::paths::year_db_path(year);
+
+        let conn = open_rw(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE daily_counts (
+                date_key INTEGER PRIMARY KEY,
+                count INTEGER NOT NULL,
+                seconds INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE active_seconds (
+                date_key INTEGER PRIMARY KEY,
+                seconds INTEGER NOT NULL
+             );
+             INSERT INTO daily_counts VALUES (1000, 42, 3600);
+             INSERT INTO active_seconds VALUES (1000, 3600);",
+        )
+        .unwrap();
+        ensure_schema(&conn, year).unwrap();
+        assert!(
+            !table_exists(&conn, "active_seconds"),
+            "对账通过就该把垃圾清掉"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT seconds FROM daily_counts WHERE date_key=?1",
+                [1000i64],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3600,
+            "清理不许动到已经落好的数"
+        );
         drop(conn);
     }
 
