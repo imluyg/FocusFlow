@@ -90,6 +90,11 @@ pub struct ReportData {
     pub apps: Vec<(String, i64)>,
     pub device_total: i64,
     pub devices: Vec<(String, i64)>,
+    /// 这一轮没答上来的那些问（哪一年、哪个库、为什么），每项一句人话。
+    ///
+    /// 非空时上面的总数与三份榜单都只是**下界**：三份导出文件都必须把它写出来，
+    /// 否则"2026 年库此刻打不开"就变成了一份看起来完整的报告。
+    pub read_gaps: Vec<String>,
 }
 
 /// 0=周一 .. 6=周日，与 `queries::aggregate_weekday` 用的 `num_days_from_monday` 同一约定。
@@ -109,9 +114,11 @@ fn ranked(mut items: Vec<(String, i64)>) -> Vec<(String, i64)> {
 pub fn collect_report(w: &ReportWindow) -> ReportData {
     use focusflow_core::db::queries as q;
     let days = slice_days(w);
-    let (total, key_map) = match w {
-        ReportWindow::Today(d) => q::get_stats_by_date(*d),
-        other => q::get_stats(
+    // 三个排行榜都走"带原因"的读数口子：过去的二元组版本把"库打不开"折成 0/空榜，
+    // 一份不完整的报告与一份完整的报告长得一模一样。
+    let key_read = match w {
+        ReportWindow::Today(d) => q::stats_totals_on(*d),
+        other => q::stats_totals(
             if other == &ReportWindow::All {
                 None
             } else {
@@ -120,18 +127,22 @@ pub fn collect_report(w: &ReportWindow) -> ReportData {
             None,
         ),
     };
+    let (total, key_map) = (key_read.total, key_read.rows);
     let apps_src = match w {
-        ReportWindow::Today(d) => q::get_app_stats_by_date(*d),
-        ReportWindow::All => q::get_app_stats(None, None),
-        ReportWindow::Days(n) => q::get_app_stats(Some(*n), None),
+        ReportWindow::Today(d) => q::app_stats_totals_on(*d),
+        ReportWindow::All => q::app_stats_totals(None, None),
+        ReportWindow::Days(n) => q::app_stats_totals(Some(*n), None),
     };
     let devices_src = match w {
-        ReportWindow::Today(d) => q::get_device_stats_by_date(*d),
-        ReportWindow::All => q::get_device_stats(None, None),
-        ReportWindow::Days(n) => q::get_device_stats(Some(*n), None),
+        ReportWindow::Today(d) => q::device_totals_on(*d),
+        ReportWindow::All => q::device_totals(None, None),
+        ReportWindow::Days(n) => q::device_totals(Some(*n), None),
     };
-    let (app_total, app_map) = apps_src;
-    let (device_total, device_list) = devices_src;
+    let (app_total, app_map) = (apps_src.total, apps_src.rows);
+    let (device_total, device_list) = (devices_src.total, devices_src.devices);
+    let mut read_gaps = key_read.unreadable;
+    read_gaps.extend(apps_src.unreadable);
+    read_gaps.extend(devices_src.unreadable);
     // 时间切面那三段：天数交给 `chart_window_days` 那一把尺子（「总计」= 近 30 天）
     // 天数一律问 core 那把尺子（界面、导出、命令行三处同一个答案）
     let days_window = q::chart_window_days(days);
@@ -154,6 +165,7 @@ pub fn collect_report(w: &ReportWindow) -> ReportData {
         apps: ranked(app_map.into_iter().collect()),
         device_total,
         devices: ranked(device_list.into_iter().map(|d| (d.name, d.count)).collect()),
+        read_gaps,
     }
 }
 
@@ -177,6 +189,10 @@ pub fn export_csv(path: &std::path::Path, d: &ReportData) -> anyhow::Result<()> 
         d.slice_label
     ));
     out.push_str(&format!("# 导出时间 {}\n", d.generated_at));
+    // 与 HTML / JSON 同一件事：没读全就要在文件里说出来，否则这份 CSV 看起来是完整的
+    for gap in &d.read_gaps {
+        out.push_str(&format!("# 这一轮没读全: {gap}\n"));
+    }
     out.push_str("\n# 键鼠排行\n排名,键鼠,次数,占比(%)\n");
     for (i, (key, count)) in d.keys.iter().enumerate() {
         out.push_str(&format!(
@@ -311,6 +327,19 @@ pub fn export_html(path: &std::path::Path, d: &ReportData) -> anyhow::Result<()>
             ]
         })
         .collect();
+    let gaps_html = if d.read_gaps.is_empty() {
+        String::new()
+    } else {
+        let items: Vec<String> = d
+            .read_gaps
+            .iter()
+            .map(|g| format!("<li>{}</li>", html_escape(g)))
+            .collect();
+        format!(
+            "<div class=\"gap\">这一轮没读全，下面的数字是下界（不是完整值）：<ul>{}</ul></div>",
+            items.join("")
+        )
+    };
     let body = [
         html_table("键鼠排行", &["排名", "键鼠", "次数", "占比"], &rank_rows),
         html_table(
@@ -348,6 +377,7 @@ pub fn export_html(path: &std::path::Path, d: &ReportData) -> anyhow::Result<()>
     h1 {{ color: #0078d4; }}
     h2 {{ color: #0078d4; margin-top: 32px; font-size: 16px; }}
     .meta {{ color: #666; margin-bottom: 20px; }}
+    .gap {{ color: #a1260d; margin: 8px 0 12px; font-size: 14px; }}
     .total {{ font-size: 28px; font-weight: bold; color: #0078d4; }}
     table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
     th {{ background: #0078d4; color: white; padding: 12px; }}
@@ -362,6 +392,7 @@ pub fn export_html(path: &std::path::Path, d: &ReportData) -> anyhow::Result<()>
     <h1>FocusFlow 活跃统计报告</h1>
     <div class="meta"><div>统计周期：{period}（时间切面按 {slice} 计）</div><div>导出时间：{at}</div></div>
     <div class="total">总活跃次数：{total}</div>
+    {gaps}
     {body}
 </div>
 </body>
@@ -370,6 +401,7 @@ pub fn export_html(path: &std::path::Path, d: &ReportData) -> anyhow::Result<()>
         slice = html_escape(&d.slice_label),
         at = html_escape(&d.generated_at),
         total = fmt_thousands(d.total),
+        gaps = gaps_html,
         body = body,
     );
     std::fs::write(path, html).with_context(|| format!("写入文件失败: {}", path.display()))?;
@@ -1014,7 +1046,61 @@ mod tests {
             apps: vec![],
             device_total: 0,
             devices: vec![],
+            read_gaps: vec![],
         }
+    }
+
+    /// 「这一轮没读全」必须出现在**三份**导出文件里：只写进一份，另外两份就仍是一份
+    /// 看起来完整的报告（总数与榜单都是下界，却没有任何一句话说明这一点）。
+    #[test]
+    fn an_incomplete_reading_is_written_into_all_three_formats() {
+        let dir = std::env::temp_dir().join("ff_export_gaps");
+        std::fs::create_dir_all(&dir).ok();
+        let mut stats = HashMap::new();
+        stats.insert("A".to_string(), 7);
+        let mut d = report_from(7, &stats);
+        d.read_gaps = vec![
+            "2025 年库按键统计读不出来: 打不开".to_string(),
+            "2026 年库设备统计读不出来: 打不开".to_string(),
+        ];
+
+        let html_path = dir.join("r.html");
+        export_html(&html_path, &d).unwrap();
+        let csv_path = dir.join("r.csv");
+        export_csv(&csv_path, &d).unwrap();
+        let json_path = dir.join("r.json");
+        export_json(&json_path, &d).unwrap();
+
+        let html = std::fs::read_to_string(&html_path).unwrap();
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        let json = std::fs::read_to_string(&json_path).unwrap();
+        for (name, text) in [("html", &html), ("csv", &csv), ("json", &json)] {
+            assert!(
+                text.contains("2025 年库按键统计读不出来"),
+                "{name} 里没写出那条 gap"
+            );
+            assert!(
+                text.contains("2026 年库设备统计读不出来"),
+                "{name} 里没写出第二条 gap"
+            );
+        }
+        assert!(
+            html.contains("这一轮没读全"),
+            "HTML 要有一句人话的标题，实得 {html}"
+        );
+        assert!(
+            csv.starts_with("\u{feff}# FocusFlow"),
+            "gap 行不许挤掉 CSV 的文件头与 BOM"
+        );
+        let gone = report_from(7, &stats);
+        let html2 = dir.join("clean.html");
+        export_html(&html2, &gone).unwrap();
+        assert!(
+            !std::fs::read_to_string(&html2)
+                .unwrap()
+                .contains("这一轮没读全"),
+            "读全了不该凭空造一句警告（反向腿）"
+        );
     }
 
     #[test]

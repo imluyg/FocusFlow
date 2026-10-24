@@ -74,15 +74,30 @@ function periodText(p) {
   return "近" + p + "天";
 }
 
+// 「这一轮没读全」的牌子。后端把没答上来的问原样交回来（每项一句话，含域名与年份），
+// 空榜与"读不出来"必须是两副面孔：过去两者长得一样，用户只能等下一轮自愈或重启，
+// 而同一页上「总计」走的是带原因的口子 —— 两张卡片互相打脸。
+// 三个域名串与 core 里 `gather_rank_totals`/`gather_device_totals` 的 label 同源，
+// 由 `state.rs` 的 `the_panel_names_the_same_domains_as_the_core` 钉住。
+function gapNote(s, domain) {
+  const gaps = (s.read_gaps || []).filter((g) => String(g).includes(domain));
+  if (gaps.length === 0) return "";
+  return (
+    `<span style="color:var(--muted);font-size:12px;">` +
+    escapeHtml(gaps.join("；")) +
+    "</span>"
+  );
+}
+
 export function renderApps(s) {
   const box = $("view-apps");
   const head = (extra) =>
     `<div class="rank-summary"><span>统计周期：<b>${periodText(s.period)}</b></span>${extra}</div>`;
   // 指纹含周期：切周期后即使数据内容恰巧相同也要重建（标签随周期变化）
-  const fp = JSON.stringify([s.period, s.app_total, s.apps]);
+  const fp = JSON.stringify([s.period, s.app_total, s.apps, s.read_gaps]);
   if (skipIfUnchanged(box, fp)) return;
   if (!s.apps || s.apps.length === 0) {
-    box.innerHTML = head("") + '<div class="empty">暂无数据</div>';
+    box.innerHTML = head(gapNote(s, "应用时长")) + '<div class="empty">暂无数据</div>';
     return;
   }
   // 占比分母用后端返回的周期总时长（未截断）；旧版后端无该字段时回退为列表求和
@@ -94,7 +109,8 @@ export function renderApps(s) {
     : "";
   const summary = head(
     `<span>应用总时长：<b>${fmtDuration(total)}</b></span>` +
-      `<span>覆盖应用：<b>${fmt(s.apps.length)}</b> 个</span>${cover}`
+      `<span>覆盖应用：<b>${fmt(s.apps.length)}</b> 个</span>${cover}` +
+      gapNote(s, "应用时长")
   );
   const rows = s.apps
     .map(
@@ -153,14 +169,14 @@ export function renderDevices(s) {
     }
   }
   // 指纹含周期、筛选与编辑态：切周期/切筛选/进改名时重建，纯数据推送则跳过
-  const fp = JSON.stringify([s.period, s.device_total, s.device_count, s.devices, deviceFilter.value, deviceEditing]);
+  const fp = JSON.stringify([s.period, s.device_total, s.device_count, s.devices, deviceFilter.value, deviceEditing, s.read_gaps]);
   if (skipIfUnchanged(box, fp)) return;
   const summary = (extra) =>
     `<div class="rank-summary"><span>统计周期：<b>${periodText(s.period)}</b></span>${extra}</div>`;
   const list = Array.isArray(s.devices) ? s.devices : [];
   if (list.length === 0) {
     box.innerHTML =
-      summary("") +
+      summary(gapNote(s, "设备统计")) +
       '<div class="empty">暂无设备数据<br><span style="font-size:12px;color:var(--muted);">设备统计随程序运行开始积累，更换键鼠后各自独立计数</span></div>';
     return;
   }
@@ -175,7 +191,8 @@ export function renderDevices(s) {
       : "";
   const head = summary(
     `<span>输入总次数：<b>${fmt(total)}</b></span>` +
-      `<span>设备数：<b>${fmt(deviceCount)}</b> 个</span>${cover}`
+      `<span>设备数：<b>${fmt(deviceCount)}</b> 个</span>${cover}` +
+      gapNote(s, "设备统计")
   );
   const filterTabs = (data) => `<div class="tabs" id="device-filter" role="tablist" aria-label="设备筛选" style="margin-bottom:10px;">
       <span style="color:var(--muted);font-size:13px;">筛选</span>
@@ -504,7 +521,7 @@ function rankIsMouse(k) {
 export function renderRank(s) {
   const box = $("view-rank");
   // 指纹含周期、页内视图（排行/分组）与筛选状态：切换时仍会重建，纯数据推送则跳过
-  const fp = JSON.stringify([s.period, s.rank, s.group, s.mouse_total, s.keyboard_total, s.total, rankFilter.value, rankTab.value]);
+  const fp = JSON.stringify([s.period, s.rank, s.group, s.mouse_total, s.keyboard_total, s.total, rankFilter.value, rankTab.value, s.read_gaps]);
   if (skipIfUnchanged(box, fp)) return;
   const summary = (hasData) =>
     `<div class="rank-summary"><span>统计周期：<b>${periodText(s.period)}</b></span>${
@@ -512,7 +529,7 @@ export function renderRank(s) {
         ? `<span>鼠标总次数：<b>${fmt(s.mouse_total)}</b></span>
         <span>键盘总次数：<b>${fmt(s.keyboard_total)}</b></span>`
         : ""
-    }</div>`;
+    }${gapNote(s, "按键统计")}</div>`;
   // 页内视图切换：分组统计与排行同源同周期（同吃 keys 数据），收进同一页
   const viewTabs = `<div class="tabs" id="rank-tabs" role="tablist" aria-label="视图" style="margin-bottom:10px;">
       <span style="color:var(--muted);font-size:13px;">视图</span>

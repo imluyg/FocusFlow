@@ -13,10 +13,11 @@ use std::time::Duration;
 use chrono::Datelike;
 
 pub use queries::{
-    available_years, get_alltime_summary, get_app_stats, get_app_stats_by_date, get_daily_counts,
-    get_device_detail, get_device_stats, get_device_stats_by_date, get_hourly_stats, get_stats,
-    get_stats_by_date, get_today_count, get_weekday_stats, invalidate_years_cache, AlltimeTotals,
-    DeviceDetail, DeviceStat,
+    app_stats_totals, app_stats_totals_on, available_years, device_totals, device_totals_on,
+    get_alltime_summary, get_app_stats, get_app_stats_by_date, get_daily_counts, get_device_detail,
+    get_device_stats, get_device_stats_by_date, get_hourly_stats, get_stats, get_stats_by_date,
+    get_today_count, get_weekday_stats, invalidate_years_cache, stats_totals, stats_totals_on,
+    AlltimeTotals, DeviceDetail, DeviceStat, DeviceTotals, RankTotals,
 };
 pub use writer::DbWriter;
 

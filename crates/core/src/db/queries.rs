@@ -426,51 +426,156 @@ fn cutoff_day_key(days: Option<i64>) -> Option<i64> {
 }
 
 /// 查询统计：返回 (总数, {键名: 次数})。
+///
+/// ⚠ 这条二元组口子**分不出**"读不出来"与"没有数据"（它把 `unreadable` 丢掉了）：
+/// 面板与导出请走 [`stats_totals`] / [`app_stats_totals`] / [`device_totals`]。
+/// 留着它是因为宿主 API 与 CLI 那三十来处调用者都按 `(总数, 榜)` 用。
 pub fn get_stats(days: Option<i64>, year: Option<i32>) -> (i64, HashMap<String, i64>) {
-    if let Some(y) = year {
-        return stats_single_year(y, days);
+    let totals = stats_totals(days, year);
+    (totals.total, totals.rows)
+}
+
+/// 查询指定日期统计。⚠ 同 [`get_stats`]：交回的是下界，说不出"没读全"。
+pub fn get_stats_by_date(target_date: chrono::NaiveDate) -> (i64, HashMap<String, i64>) {
+    let totals = stats_totals_on(target_date);
+    (totals.total, totals.rows)
+}
+
+/// 一个年度库在这一趟读数里的结局。口径同 [`YearTotals`]：
+/// "打不开/查询失败"、"库里没这张表"、"读到了"是三件事，折成两件就会说谎。
+enum YearRead<T> {
+    /// 读到了（`T` 由各域决定形状）
+    Read(T),
+    /// 库里没有这张表：真没有可汇总的数据，按 0 计是对的
+    NoTable,
+    /// 这一问没有答案（表在而读不出来、或 SUM/查询失败）：不能按 0 计
+    Unreadable(String),
+}
+
+/// 一个窗口内的排行读数（总次数/总秒数 + 榜单）连同**这次有没有读全**。
+///
+/// 立它的形状照 [`AlltimeTotals`]：`unreadable` 非空就是"结果不完整"的信号，
+/// 面板与导出必须把它说出来，而不是把一份下界念成"今日 0 次、排行榜为空"。
+#[derive(Debug, Clone, Default)]
+pub struct RankTotals {
+    /// 读到的那些年度库之和。`unreadable` 非空时它只是**下界**。
+    pub total: i64,
+    /// 读到的那些榜行（跨年已按名字合并；降序与截断由调用方负责）。
+    pub rows: HashMap<String, i64>,
+    /// 这一轮没答上来的年度库，每项形如「N 年库<域>读不出来: 原因」。空 = 读全了。
+    pub unreadable: Vec<String>,
+}
+
+/// 逐年度库取排行读数并合并；`label` 只用于把 gap 说到"是哪个域的哪一年"。
+fn gather_rank_totals(
+    years: &[i32],
+    label: &str,
+    cond: &str,
+    param: Option<i64>,
+    query: impl Fn(&Connection, &str, Option<i64>) -> YearRead<(i64, HashMap<String, i64>)>,
+) -> RankTotals {
+    let mut out = RankTotals::default();
+    for year in years.iter().copied() {
+        let path = paths::year_db_path(year);
+        let got = connection::with_ro_conn_why(&path, |conn| query(conn, cond, param));
+        match got {
+            Err(why) => out
+                .unreadable
+                .push(format!("{year} 年库{label}读不出来: {why}")),
+            Ok(YearRead::Unreadable(why)) => out
+                .unreadable
+                .push(format!("{year} 年库{label}读不出来: {why}")),
+            // 没有这张表 = 这一年确实没有可汇总的数据；安静按 0 计
+            Ok(YearRead::NoTable) => {}
+            Ok(YearRead::Read((total, rows))) => {
+                out.total += total;
+                for (k, v) in rows {
+                    *out.rows.entry(k).or_insert(0) += v;
+                }
+            }
+        }
     }
-    let years = query_years(days, None);
-    if years.len() == 1 {
-        return stats_single_year(years[0], days);
-    }
-    stats_multi_year(&years, days)
+    out
+}
+
+/// 按键统计的读数（含"这一轮有没有读全"）。
+pub fn stats_totals(days: Option<i64>, year: Option<i32>) -> RankTotals {
+    let years = match year {
+        Some(y) => vec![y],
+        None => query_years(days, None),
+    };
+    let start_dk = cutoff_day_key(days);
+    let cond = if start_dk.is_some() {
+        "date_key >= ?1"
+    } else {
+        ""
+    };
+    gather_rank_totals(
+        &years,
+        "按键统计",
+        cond,
+        start_dk,
+        |conn, cond, param| query_stats_in_conn(conn, cond, param, true),
+    )
+}
+
+/// 某一天的按键统计读数。
+pub fn stats_totals_on(target_date: chrono::NaiveDate) -> RankTotals {
+    let dk = day_key_of_date(target_date);
+    gather_rank_totals(
+        &[target_date.year()],
+        "按键统计",
+        "date_key = ?1",
+        Some(dk),
+        |conn, cond, param| query_stats_in_conn(conn, cond, param, false),
+    )
 }
 
 /// 单库统计公共实现：`daily_counts` 求总数 + `key_counts` 按键聚合。
 ///
 /// `cond` 为日期条件片段（如 "date_key >= ?1"），空串表示全表；`param` 与 `cond`
 /// 配套（None = 无参数）。`group=true` 时键聚合用 SUM+GROUP BY（多日窗口需合并），
-/// false 时单日内键唯一、直接取 count。表不存在时返回 None（调用方回退空结果）。
+/// false 时单日内键唯一、直接取 count。
+/// 三种结局分开：旧写法先 `table_exists` 折一次、`SUM` 再 `unwrap_or(0)` 折一次，
+/// 于是"库损坏那一刻读不出来"与"这一年没数据"交回同一个 `None` ⇒ 上层念成 0。
+///
+/// ⚠ 取行要用 `collect::<Result<Vec<_>, _>>()`，不许回到旧写法 `rows.flatten()`：
+/// `Result` 自身是 `IntoIterator`，flatten 会丢掉那一次错误、只交出坏点之前的行 ⇒
+/// "读到第 N 页库坏了"被念成"榜就 N−1 行，读全了"。这条用例是
+/// `a_rank_reading_separates_cannot_read_from_no_data` 的第四条腿（库头合法、页坏）。
 fn query_stats_in_conn(
     conn: &rusqlite::Connection,
     cond: &str,
     param: Option<i64>,
     group: bool,
-) -> Option<(i64, HashMap<String, i64>)> {
-    if !table_exists(conn, "daily_counts") {
-        return None;
+) -> YearRead<(i64, HashMap<String, i64>)> {
+    match connection::table_presence(conn, "daily_counts") {
+        connection::Presence::No => return YearRead::NoTable,
+        connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
+        connection::Presence::Yes => {}
     }
     let where_clause = if cond.is_empty() {
         String::new()
     } else {
         format!(" WHERE {cond}")
     };
-    let total: i64 = match param {
-        Some(p) => conn
-            .query_row(
-                &format!("SELECT COALESCE(SUM(count), 0) FROM daily_counts{where_clause}"),
-                [p],
-                |r| r.get(0),
-            )
-            .unwrap_or(0),
-        None => conn
-            .query_row(
-                "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0),
+    let summed = match param {
+        Some(p) => conn.query_row(
+            &format!("SELECT COALESCE(SUM(count), 0) FROM daily_counts{where_clause}"),
+            [p],
+            |r| r.get::<_, i64>(0),
+        ),
+        None => conn.query_row(
+            "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+            [],
+            |r| r.get::<_, i64>(0),
+        ),
+    };
+    let total: i64 = match summed {
+        Ok(v) => v,
+        Err(e) => {
+            return YearRead::Unreadable(format!("汇总这一窗口的次数时读不出来: {e}"));
+        }
     };
     let (agg, group_clause, order) = if group {
         (
@@ -486,13 +591,14 @@ fn query_stats_in_conn(
         let mapper = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?));
         let rows = match conn.prepare(&sql) {
             Ok(mut stmt) => match param {
-                // SQL 出错时回退空结果并记日志，进程不因查询异常 panic 崩溃
+                // 迭代器每一项都是 Result：库读到一半坏了、还是某行取值失败，都出在这里。
+                // collect 让它们都变成 Err；旧写法 flatten() 会把第一项错误之后的一切当"读完了"。
                 Some(p) => stmt
                     .query_map([p], mapper)
-                    .map(|rows| rows.flatten().collect::<Vec<_>>()),
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
                 None => stmt
                     .query_map([], mapper)
-                    .map(|rows| rows.flatten().collect::<Vec<_>>()),
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
             },
             Err(e) => Err(e),
         };
@@ -500,63 +606,11 @@ fn query_stats_in_conn(
             Ok(list) => list.into_iter().collect(),
             Err(e) => {
                 tracing::error!("key_counts 查询失败 ({sql}): {e}");
-                return None;
+                return YearRead::Unreadable(format!("键名榜读不出来: {e}"));
             }
         }
     };
-    Some((total, map))
-}
-
-fn stats_single_year(year: i32, days: Option<i64>) -> (i64, HashMap<String, i64>) {
-    let path = paths::year_db_path(year);
-    let start_dk = cutoff_day_key(days);
-    let cond = if start_dk.is_some() {
-        "date_key >= ?1"
-    } else {
-        ""
-    };
-    let result = connection::with_ro_conn(&path, |conn| {
-        query_stats_in_conn(conn, cond, start_dk, true)
-    });
-    result.flatten().unwrap_or((0, HashMap::new()))
-}
-
-/// 跨年查询：逐库聚合后在 Rust 侧合并。
-fn stats_multi_year(years: &[i32], days: Option<i64>) -> (i64, HashMap<String, i64>) {
-    if years.is_empty() {
-        return (0, HashMap::new());
-    }
-    let start_dk = cutoff_day_key(days);
-    let mut total_all: i64 = 0;
-    let mut map_all: HashMap<String, i64> = HashMap::new();
-    for year in years.iter().copied() {
-        let path = paths::year_db_path(year);
-        let cond = if start_dk.is_some() {
-            "date_key >= ?1"
-        } else {
-            ""
-        };
-        let result = connection::with_ro_conn(&path, |conn| {
-            query_stats_in_conn(conn, cond, start_dk, true)
-        });
-        if let Some((t, m)) = result.flatten() {
-            total_all += t;
-            for (k, v) in m {
-                *map_all.entry(k).or_insert(0) += v;
-            }
-        }
-    }
-    (total_all, map_all)
-}
-
-/// 查询指定日期统计。
-pub fn get_stats_by_date(target_date: chrono::NaiveDate) -> (i64, HashMap<String, i64>) {
-    let dk = day_key_of_date(target_date);
-    let path = paths::year_db_path(target_date.year());
-    let result = connection::with_ro_conn(&path, |conn| {
-        query_stats_in_conn(conn, "date_key = ?1", Some(dk), false)
-    });
-    result.flatten().unwrap_or((0, HashMap::new()))
+    YearRead::Read((total, map))
 }
 
 /// 全历史汇总（跨年度库）连同**这次有没有读全**。
@@ -844,33 +898,37 @@ pub fn get_hourly_totals(days: i64, year: Option<i32>) -> Vec<i64> {
 }
 
 /// 查询前台应用使用时长公共实现：app_usage 求总秒数 + 按应用聚合。
-/// `cond` 为日期条件片段，空串表示全表；表不存在（旧库）时返回 None。
+/// `cond` 为日期条件片段，空串表示全表；三种结局分开（理由同 [`query_stats_in_conn`]）。
 fn query_apps_in_conn(
     conn: &rusqlite::Connection,
     cond: &str,
     param: Option<i64>,
-) -> Option<(i64, HashMap<String, i64>)> {
-    if !table_exists(conn, "app_usage") {
-        return None;
+) -> YearRead<(i64, HashMap<String, i64>)> {
+    match connection::table_presence(conn, "app_usage") {
+        connection::Presence::No => return YearRead::NoTable,
+        connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
+        connection::Presence::Yes => {}
     }
     let where_clause = if cond.is_empty() {
         String::new()
     } else {
         format!(" WHERE {cond}")
     };
-    let total: i64 = match param {
-        Some(p) => conn
-            .query_row(
-                &format!("SELECT COALESCE(SUM(seconds), 0) FROM app_usage{where_clause}"),
-                [p],
-                |r| r.get(0),
-            )
-            .unwrap_or(0),
-        None => conn
-            .query_row("SELECT COALESCE(SUM(seconds), 0) FROM app_usage", [], |r| {
-                r.get(0)
-            })
-            .unwrap_or(0),
+    let summed = match param {
+        Some(p) => conn.query_row(
+            &format!("SELECT COALESCE(SUM(seconds), 0) FROM app_usage{where_clause}"),
+            [p],
+            |r| r.get::<_, i64>(0),
+        ),
+        None => conn.query_row("SELECT COALESCE(SUM(seconds), 0) FROM app_usage", [], |r| {
+            r.get::<_, i64>(0)
+        }),
+    };
+    let total: i64 = match summed {
+        Ok(v) => v,
+        Err(e) => {
+            return YearRead::Unreadable(format!("汇总这一窗口的应用时长时读不出来: {e}"));
+        }
     };
     // 必须按应用聚合后再进 HashMap：app_usage 主键是 (date_key, app_name)，
     // 同一应用跨多天有多行，裸选行 collect 会同名覆盖（只剩最后一天），总时长被吃掉一大截。
@@ -882,10 +940,10 @@ fn query_apps_in_conn(
             Ok(mut stmt) => match param {
                 Some(p) => stmt
                     .query_map([p], mapper)
-                    .map(|rows| rows.flatten().collect::<Vec<_>>()),
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
                 None => stmt
                     .query_map([], mapper)
-                    .map(|rows| rows.flatten().collect::<Vec<_>>()),
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
             },
             Err(e) => Err(e),
         };
@@ -893,65 +951,52 @@ fn query_apps_in_conn(
             Ok(list) => list.into_iter().collect(),
             Err(e) => {
                 tracing::error!("app_usage 查询失败 ({sql}): {e}");
-                return None;
+                return YearRead::Unreadable(format!("应用榜读不出来: {e}"));
             }
         }
     };
-    Some((total, map))
+    YearRead::Read((total, map))
 }
 
 /// 查询前台应用使用时长：返回 (总秒数, {应用名: 秒数})，周期选择与按键统计一致。
+///
+/// ⚠ 二元组丢掉了"这一轮有没有读全"；面板与导出请走 [`app_stats_totals`]。
 pub fn get_app_stats(days: Option<i64>, year: Option<i32>) -> (i64, HashMap<String, i64>) {
-    if let Some(y) = year {
-        return apps_single_year(y, days);
-    }
-    let years = query_years(days, None);
-    if years.len() == 1 {
-        return apps_single_year(years[0], days);
-    }
-    // 跨年逐库聚合后在 Rust 侧合并
-    let start_dk = cutoff_day_key(days);
-    let mut total_all: i64 = 0;
-    let mut map_all: HashMap<String, i64> = HashMap::new();
-    for year in years {
-        let path = paths::year_db_path(year);
-        let cond = if start_dk.is_some() {
-            "date_key >= ?1"
-        } else {
-            ""
-        };
-        let result =
-            connection::with_ro_conn(&path, |conn| query_apps_in_conn(conn, cond, start_dk));
-        if let Some((t, m)) = result.flatten() {
-            total_all += t;
-            for (k, v) in m {
-                *map_all.entry(k).or_insert(0) += v;
-            }
-        }
-    }
-    (total_all, map_all)
+    let totals = app_stats_totals(days, year);
+    (totals.total, totals.rows)
 }
 
-fn apps_single_year(year: i32, days: Option<i64>) -> (i64, HashMap<String, i64>) {
-    let path = paths::year_db_path(year);
+/// 前台应用时长读数（含"这一轮有没有读全"），周期选择与按键统计一致。
+pub fn app_stats_totals(days: Option<i64>, year: Option<i32>) -> RankTotals {
+    let years = match year {
+        Some(y) => vec![y],
+        None => query_years(days, None),
+    };
     let start_dk = cutoff_day_key(days);
     let cond = if start_dk.is_some() {
         "date_key >= ?1"
     } else {
         ""
     };
-    let result = connection::with_ro_conn(&path, |conn| query_apps_in_conn(conn, cond, start_dk));
-    result.flatten().unwrap_or((0, HashMap::new()))
+    gather_rank_totals(&years, "应用时长", cond, start_dk, query_apps_in_conn)
+}
+
+/// 某一天的前台应用时长读数。
+pub fn app_stats_totals_on(target_date: chrono::NaiveDate) -> RankTotals {
+    let dk = day_key_of_date(target_date);
+    gather_rank_totals(
+        &[target_date.year()],
+        "应用时长",
+        "date_key = ?1",
+        Some(dk),
+        query_apps_in_conn,
+    )
 }
 
 /// 查询指定日期前台应用使用时长。
 pub fn get_app_stats_by_date(target_date: chrono::NaiveDate) -> (i64, HashMap<String, i64>) {
-    let dk = day_key_of_date(target_date);
-    let path = paths::year_db_path(target_date.year());
-    let result = connection::with_ro_conn(&path, |conn| {
-        query_apps_in_conn(conn, "date_key = ?1", Some(dk))
-    });
-    result.flatten().unwrap_or((0, HashMap::new()))
+    let totals = app_stats_totals_on(target_date);
+    (totals.total, totals.rows)
 }
 
 // ===== 设备维度统计（Raw Input 侧信道，独立口径）=====
@@ -1134,9 +1179,11 @@ fn query_devices_in_conn(
     cond: &str,
     param: Option<i64>,
     year: i32,
-) -> Option<Vec<DeviceRow>> {
-    if !table_exists(conn, "device_counts") {
-        return None;
+) -> YearRead<Vec<DeviceRow>> {
+    match connection::table_presence(conn, "device_counts") {
+        connection::Presence::No => return YearRead::NoTable,
+        connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
+        connection::Presence::Yes => {}
     }
     let where_clause = if cond.is_empty() {
         String::new()
@@ -1167,18 +1214,18 @@ fn query_devices_in_conn(
         Ok(mut stmt) => match param {
             Some(p) => stmt
                 .query_map([p], mapper)
-                .map(|rows| rows.flatten().collect::<Vec<_>>()),
+                .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
             None => stmt
                 .query_map([], mapper)
-                .map(|rows| rows.flatten().collect::<Vec<_>>()),
+                .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
         },
         Err(e) => Err(e),
     };
     match rows {
-        Ok(list) => Some(list),
+        Ok(list) => YearRead::Read(list),
         Err(e) => {
             tracing::error!("device_counts 查询失败 ({sql}): {e}");
-            None
+            YearRead::Unreadable(format!("设备榜读不出来: {e}"))
         }
     }
 }
@@ -1316,59 +1363,80 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
     (total, stats)
 }
 
-/// 查询设备维度统计：返回 (总输入次数, 设备行列表)，周期选择与按键统计一致。
-pub fn get_device_stats(days: Option<i64>, year: Option<i32>) -> (i64, Vec<DeviceStat>) {
-    let rows = if let Some(y) = year {
-        devices_single_year(y, days)
-    } else {
-        let years = query_years(days, None);
-        if years.len() == 1 {
-            devices_single_year(years[0], days)
-        } else {
-            let start_dk = cutoff_day_key(days);
-            let mut merged: Vec<DeviceRow> = Vec::new();
-            for year in years {
-                let path = paths::year_db_path(year);
-                let cond = if start_dk.is_some() {
-                    "date_key >= ?1"
-                } else {
-                    ""
-                };
-                let result = connection::with_ro_conn(&path, |conn| {
-                    query_devices_in_conn(conn, cond, start_dk, year)
-                });
-                if let Some(mut list) = result.flatten() {
-                    merged.append(&mut list);
-                }
-            }
-            merged
-        }
-    };
-    merge_device_rows(rows)
+/// 设备维度的一次读数（总次数 + 展示行）连同**这次有没有读全**。
+///
+/// 形状照 [`AlltimeTotals`]：`unreadable` 非空时 `total`/`devices` 都只是**下界**，
+/// 面板不能把一次"有一年库没打开"念成"这一年没插设备"。
+#[derive(Debug, Clone, Default)]
+pub struct DeviceTotals {
+    /// 读到的那些年度库的输入总次数（占比分母，未截断）。
+    pub total: i64,
+    /// 展示行：跨年已合并、别名优先、按次数降序（未截断）。
+    pub devices: Vec<DeviceStat>,
+    /// 这一轮没答上来的年度库，每项形如「N 年库设备统计读不出来: 原因」。空 = 读全了。
+    pub unreadable: Vec<String>,
 }
 
-fn devices_single_year(year: i32, days: Option<i64>) -> Vec<DeviceRow> {
-    let path = paths::year_db_path(year);
+/// 逐年度库取设备行并合并；读不出来的那一年进 `unreadable`，不按"没设备"计。
+fn gather_device_totals(years: &[i32], cond: &str, param: Option<i64>) -> DeviceTotals {
+    let mut rows: Vec<DeviceRow> = Vec::new();
+    let mut out = DeviceTotals::default();
+    for year in years.iter().copied() {
+        let path = paths::year_db_path(year);
+        let got = connection::with_ro_conn_why(&path, |conn| {
+            query_devices_in_conn(conn, cond, param, year)
+        });
+        match got {
+            Err(why) => out
+                .unreadable
+                .push(format!("{year} 年库设备统计读不出来: {why}")),
+            Ok(YearRead::Unreadable(why)) => out
+                .unreadable
+                .push(format!("{year} 年库设备统计读不出来: {why}")),
+            // 没有 `device_counts` = 这一年确实还没积累设备数据
+            Ok(YearRead::NoTable) => {}
+            Ok(YearRead::Read(list)) => rows.extend(list),
+        }
+    }
+    let (total, devices) = merge_device_rows(rows);
+    out.total = total;
+    out.devices = devices;
+    out
+}
+
+/// 查询设备维度统计：返回 (总输入次数, 设备行列表)，周期选择与按键统计一致。
+///
+/// ⚠ 二元组丢掉了"这一轮有没有读全"；面板与导出请走 [`device_totals`]。
+pub fn get_device_stats(days: Option<i64>, year: Option<i32>) -> (i64, Vec<DeviceStat>) {
+    let totals = device_totals(days, year);
+    (totals.total, totals.devices)
+}
+
+/// 设备维度读数（含"这一轮有没有读全"）。
+pub fn device_totals(days: Option<i64>, year: Option<i32>) -> DeviceTotals {
+    let years = match year {
+        Some(y) => vec![y],
+        None => query_years(days, None),
+    };
     let start_dk = cutoff_day_key(days);
     let cond = if start_dk.is_some() {
         "date_key >= ?1"
     } else {
         ""
     };
-    let result = connection::with_ro_conn(&path, |conn| {
-        query_devices_in_conn(conn, cond, start_dk, year)
-    });
-    result.flatten().unwrap_or_default()
+    gather_device_totals(&years, cond, start_dk)
 }
 
-/// 查询指定日期设备维度统计。
+/// 查询指定日期设备维度统计。⚠ 同 [`get_device_stats`]：说不出"没读全"。
 pub fn get_device_stats_by_date(target_date: chrono::NaiveDate) -> (i64, Vec<DeviceStat>) {
+    let totals = device_totals_on(target_date);
+    (totals.total, totals.devices)
+}
+
+/// 某一天的设备维度读数。
+pub fn device_totals_on(target_date: chrono::NaiveDate) -> DeviceTotals {
     let dk = day_key_of_date(target_date);
-    let path = paths::year_db_path(target_date.year());
-    let result = connection::with_ro_conn(&path, |conn| {
-        query_devices_in_conn(conn, "date_key = ?1", Some(dk), target_date.year())
-    });
-    merge_device_rows(result.flatten().unwrap_or_default())
+    gather_device_totals(&[target_date.year()], "date_key = ?1", Some(dk))
 }
 
 /// 单台设备的详情（点击「设备排行」某一行时按需查询）。
@@ -3731,6 +3799,277 @@ mod tests {
             }
             other => panic!("缺列的表要落成「读不出来」，实得 {other:?}"),
         }
+    }
+
+    /// 「这一年读不出来」与「这一年没数据」必须是两件事：前者要在 `unreadable` 里点名，
+    /// 后者才允许安静地按 0 计。
+    ///
+    /// 旧写法把三件事（库打不开、表读不出来、真没这张表）全折成 `(0, 空榜)`，而面板吃的
+    /// 就是那个二元组 ⇒ "2026 年库此刻打不开"念出来跟"你今天一次键盘都没敲"一模一样；
+    /// 跨年合并更糟：坏掉那一年被 `if let Some(..)` 直接跳过，报出来的总数看着像完整值。
+    #[test]
+    fn a_rank_reading_separates_cannot_read_from_no_data() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_rank_gaps");
+        let year = Local::now().year();
+        let path = paths::year_db_path(year);
+
+        // 一、库里没有 `daily_counts`：真没有可汇总的数据 ⇒ 0，且不该被说成读不出来
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            conn.execute_batch("CREATE TABLE unrelated (a INTEGER);")
+                .unwrap();
+        }
+        let empty = stats_totals(None, Some(year));
+        assert_eq!(empty.total, 0);
+        assert!(
+            empty.unreadable.is_empty(),
+            "确认没有这张表不该进 gap，实得 {:?}",
+            empty.unreadable
+        );
+        connection::clear_ro_cache();
+        std::fs::remove_file(&path).expect("删掉这一年的库（先 clear_ro_cache）");
+
+        // 二、这个文件不是一份 SQLite（同步盘占位、半截写入那一族）⇒ 必须点名
+        std::fs::write(&path, b"this is not a sqlite database at all").unwrap();
+        let broken = stats_totals(None, Some(year));
+        assert_eq!(broken.total, 0, "读不出来时不许凭空报出数");
+        assert_eq!(
+            broken.unreadable.len(),
+            1,
+            "那一年要被点名，实得 {:?}",
+            broken.unreadable
+        );
+        let gap = &broken.unreadable[0];
+        assert!(gap.contains("按键统计"), "gap 要说清是哪个域，实得 {gap}");
+        assert!(
+            gap.contains(&year.to_string()),
+            "gap 要带年份，不然用户不知道该拿哪个库怎么办，实得 {gap}"
+        );
+        // 前端按域名过滤这三个串（views.js `gapNote`），应用时长那一栏走同一条合并路径
+        let apps_broken = app_stats_totals(None, Some(year));
+        assert!(
+            apps_broken
+                .unreadable
+                .iter()
+                .any(|g| g.contains("应用时长")),
+            "应用时长的 gap 要能认出域名，实得 {:?}",
+            apps_broken.unreadable
+        );
+        // 旧的二元组口子照旧给 0：它分不出这两件事 ⇒ 面板不许再用它
+        assert_eq!(get_stats(None, Some(year)).0, 0);
+        // 换文件之前必须作废只读池：那条连接还握着这个路径，Windows 上删不掉
+        // （旧写法 `.ok()` 吞掉失败，于是下面写进去的还是那份坏文件 —— 测的就不是第三件事了）
+        connection::clear_ro_cache();
+        std::fs::remove_file(&path).expect("删掉这一年的库（先 clear_ro_cache）");
+
+        // 三、跨年合并：坏掉那一年不许被静默丢掉，读到的那一年照原样进总数
+        connection::open_rw(&path)
+            .and_then(|conn| connection::ensure_schema(&conn, year))
+            .unwrap();
+        std::fs::write(&path, b"this is not a sqlite database at all").unwrap();
+        let good = year + 1;
+        let good_path = paths::year_db_path(good);
+        {
+            let conn = connection::open_rw(&good_path).unwrap();
+            connection::ensure_schema(&conn, good).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 11, 0)",
+                [day_key_of_date(Local::now().date_naive())],
+            )
+            .unwrap();
+        }
+        let merged = stats_totals(None, None);
+        assert_eq!(
+            merged.total, 11,
+            "好的那一年要照常计入，实得 {} / gap {:?}",
+            merged.total, merged.unreadable
+        );
+        assert!(
+            merged
+                .unreadable
+                .iter()
+                .any(|g| g.contains(&year.to_string())),
+            "坏掉那一年必须出现在 gap 里，实得 {:?}",
+            merged.unreadable
+        );
+
+        // 四、**库头合法、页坏**：`open_ro` 打得开，是"问有没有这张表 / 读榜"那一步失败。
+        // 上面几条用的是没有 SQLite 魔数的文件，走的是"打不开"那一臂 —— 探针把
+        // `YearRead::Unreadable` 折成"没有这张表"时，只有这一条会红，另三条照绿。
+        //
+        // 三份榜都要铺到文件后半段：取行是 `collect::<Result<Vec<_>, _>>()`，坏页落在
+        // 哪张表上就只有那张表报错。夹具只喂 `key_counts` 的话，把应用榜或设备榜的
+        // 取行改回 `rows.flatten()`（错误折成"数据到此为止"）这一条照绿 —— 探针实测过。
+        let tail = year + 2;
+        let tail_path = paths::year_db_path(tail);
+        connection::clear_ro_cache();
+        if let Err(e) = std::fs::remove_file(&tail_path) {
+            // 这一年本来就还没建库（NotFound 可以安静），别的失败都是"没删掉"——
+            // 留着旧文件往下写，测的就不是这份夹具了
+            assert!(
+                crate::data_location::is_confirmed_absent(&e),
+                "换夹具前删不掉这一年的库（不是「本来就没有」）: {e}"
+            );
+        }
+        {
+            let conn = connection::open_rw(&tail_path).unwrap();
+            connection::ensure_schema(&conn, tail).unwrap();
+            let dk = day_key_of_date(Local::now().date_naive());
+            for i in 0..12_000i64 {
+                // 交错写入：让三张表的叶子页都摊到文件的前后两半
+                conn.execute(
+                    "INSERT INTO key_counts (date_key, key_name, count) VALUES (?1, ?2, 1)",
+                    rusqlite::params![dk, format!("KK{i}")],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO app_usage (date_key, app_name, seconds) VALUES (?1, ?2, 1)",
+                    rusqlite::params![dk, format!("AA{i}")],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, 1)",
+                    rusqlite::params![dk, i],
+                )
+                .unwrap();
+            }
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        connection::clear_ro_cache();
+        let mut bytes = std::fs::read(&tail_path).unwrap();
+        assert!(
+            bytes.len() > 4096 * 40,
+            "夹具太小，三份榜没铺到文件后半段（实得 {} 字节）",
+            bytes.len()
+        );
+        let cut = bytes.len() / 2;
+        for b in bytes.iter_mut().skip(cut) {
+            *b = 0xA5;
+        }
+        std::fs::write(&tail_path, &bytes).unwrap();
+        connection::clear_ro_cache();
+        let half_broken = stats_totals(None, Some(tail));
+        assert_eq!(
+            half_broken.total, 0,
+            "这一年没读全，总数不许报出半个数（实得 {}）",
+            half_broken.total
+        );
+        assert_eq!(
+            half_broken.unreadable.len(),
+            1,
+            "「打得开、读不出来」也必须点名（这条测的就是 `Unreadable` 那一臂）",
+        );
+        assert!(
+            !half_broken.unreadable[0].contains("打不开"),
+            "这一臂不是打不开，原因别说错：{}",
+            half_broken.unreadable[0]
+        );
+        // 三个榜 × 两种取参（全表 / 带日期窗口）各一条腿：`query_*_in_conn` 的
+        // `param` 两个分支是两段取行代码，只喂一边时另一边的 fold 探针照绿（实测）。
+        //
+        // ⚠ 应用榜这两条盯的是"取行之前那句聚合先报错"那一臂：`app_usage` 的
+        // `SUM(seconds)` 与按应用聚合读的是同一批页，页坏时聚合就先失败，取行处的
+        // `collect` 永远轮不到出声 —— 探针（把应用榜的取行改回 flatten()）只有形状
+        // 守卫红、这六条全绿，实测过。设备榜不同：它只有那一条聚合查询，探针把取行
+        // 改回 flatten() 时这里会红（「设备 榜那一年读不出来…实得 []」），所以设备
+        // 这两条是真腿。应用那两条留在这是为了口径齐，别把它当成 flatten 的守卫。
+        let mut arms: Vec<(&str, Vec<String>)> = Vec::new();
+        for (domain, got) in [
+            ("按键", stats_totals(Some(30), Some(tail))),
+            ("应用", app_stats_totals(None, Some(tail))),
+            ("应用", app_stats_totals(Some(30), Some(tail))),
+        ] {
+            arms.push((domain, got.unreadable));
+        }
+        for (domain, got) in [
+            ("设备", device_totals(None, Some(tail))),
+            ("设备", device_totals(Some(30), Some(tail))),
+        ] {
+            arms.push((domain, got.unreadable));
+        }
+        for (domain, gaps) in arms {
+            assert_eq!(
+                gaps.len(),
+                1,
+                "{domain} 榜那一年读不出来，必须点名（实得 {gaps:?}）"
+            );
+        }
+    }
+
+    /// 上面那条第四腿的守门人：`rows.flatten()` 一旦回到三个榜的取行处，行为用例里
+    /// 的那份"库头合法、页坏"夹具会重新被念成"榜短了一截、读全了"。
+    ///
+    /// 应用榜的取行是**只有这条**守得住（聚合先失败，取行轮不到出声，见上面那条注释），
+    /// 所以它不许被当成冗余的源码判据删掉。
+    ///
+    /// 只圈三个榜函数：每日趋势／每小时（`get_daily_counts`／`get_hourly_*`）与设备详情
+    /// 那两条helper还在用 `flatten()`，本轮没动它们，写成全文件判据会立刻红在该轮之外。
+    #[test]
+    fn the_rank_readings_do_not_fold_a_broken_page_into_a_short_list() {
+        let src = include_str!("queries.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        for header in [
+            "fn query_stats_in_conn(",
+            "fn query_apps_in_conn(",
+            "fn query_devices_in_conn(",
+        ] {
+            let at = prod
+                .find(header)
+                .unwrap_or_else(|| panic!("{header} 找不到了"));
+            let raw = &prod[at..at + prod[at..].find("\n}").expect("函数体切不出来")];
+            let body: String = raw
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !body.contains("rows.flatten()"),
+                "{header} 又用 flatten() 收行 —— 它会把「读到一半坏了」折成「数据就到这里为止」"
+            );
+            assert!(
+                body.contains("collect::<Result<Vec<_>"),
+                "{header} 必须让取行错误变成 Err，而不是凑出一个能用的 Vec"
+            );
+        }
+    }
+
+    /// 设备维度同一条口径：`device_counts` 没这张表 ⇒ 安静空榜；读不出来 ⇒ 点名。
+    #[test]
+    fn device_totals_says_which_year_it_cannot_read() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_device_gaps");
+        let year = Local::now().year();
+        let path = paths::year_db_path(year);
+
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            conn.execute_batch("CREATE TABLE unrelated (a INTEGER);")
+                .unwrap();
+        }
+        let none = device_totals(None, Some(year));
+        assert!(
+            none.devices.is_empty() && none.unreadable.is_empty(),
+            "没有 `device_counts` 是真没有数据，实得 {:?}",
+            none.unreadable
+        );
+        connection::clear_ro_cache();
+        std::fs::remove_file(&path).expect("删掉这一年的库（先 clear_ro_cache）");
+
+        std::fs::write(&path, b"this is not a sqlite database at all").unwrap();
+        let broken = device_totals(None, Some(year));
+        assert!(
+            broken
+                .unreadable
+                .iter()
+                .any(|g| g.contains("设备统计") && g.contains(&year.to_string())),
+            "读不出来的那一年必须点名，实得 {:?}",
+            broken.unreadable
+        );
+        assert_eq!(
+            broken.total, 0,
+            "旧写法在这里交回 0 台 / 0 次，与「今天没插设备」同形"
+        );
     }
 
     /// 窗口内的每小时合计：只数窗口里那几天，越界的小时值不进任何一格。

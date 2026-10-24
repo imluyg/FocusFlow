@@ -42,6 +42,12 @@ pub struct ChartAgg {
     /// 周期内设备台数（未截断）。`devices` 只留前 `RANK_LIMIT` 台，
     /// 界面上的「设备数」必须读这个、不能读 `devices.len()`。
     pub device_count: i64,
+    /// 这一轮**没读全**的那些问，每项一句人话（哪一年、哪个库、为什么）。
+    ///
+    /// 空 = 三个排行榜都读全了。非空时上面那些数只是**下界**：界面必须把它说出来，
+    /// 不能把"2026 年库此刻打不开"念成"今日 0 次、暂无数据"——那是同一页上
+    /// 「总计」(走三态口子) 与「排行」(过去折成 0) 互相打脸的根源。
+    pub read_gaps: Vec<String>,
     pub group: Vec<(String, i64)>,
     /// 鼠标使用总次数（含点击与滚轮）
     pub mouse_total: i64,
@@ -1979,30 +1985,38 @@ fn compute_charts(
     alltime_max: Option<(String, i64)>,
     pending_today: i64,
 ) -> ChartAgg {
-    let (total, key_stats) = match period_val {
-        -1 => focusflow_core::db::get_stats_by_date(chrono::Local::now().date_naive()),
-        0 => focusflow_core::db::get_stats(None, None),
-        n => focusflow_core::db::get_stats(Some(n), None),
+    // 三个排行榜各自交回"这一轮没答上来的那些问"；合起来交给前端说（见 `ChartAgg::read_gaps`）。
+    let key_totals = match period_val {
+        -1 => focusflow_core::db::stats_totals_on(chrono::Local::now().date_naive()),
+        0 => focusflow_core::db::stats_totals(None, None),
+        n => focusflow_core::db::stats_totals(Some(n), None),
     };
+    let (total, key_stats) = (key_totals.total, key_totals.rows);
+    let key_gaps = key_totals.unreadable;
     // 前台应用使用时长排行（秒数），周期选择与按键统计联动。
     // 保留查询返回的总秒数作为占比分母（未截断，与 apps 之和不是一回事）。
-    let (app_total, mut apps): (i64, Vec<(String, i64)>) = {
-        let (total, map) = match period_val {
-            -1 => focusflow_core::db::get_app_stats_by_date(chrono::Local::now().date_naive()),
-            0 => focusflow_core::db::get_app_stats(None, None),
-            n => focusflow_core::db::get_app_stats(Some(n), None),
+    let (app_total, mut apps, app_gaps): (i64, Vec<(String, i64)>, Vec<String>) = {
+        let read = match period_val {
+            -1 => focusflow_core::db::app_stats_totals_on(chrono::Local::now().date_naive()),
+            0 => focusflow_core::db::app_stats_totals(None, None),
+            n => focusflow_core::db::app_stats_totals(Some(n), None),
         };
-        (total, map.into_iter().collect())
+        (read.total, read.rows.into_iter().collect(), read.unreadable)
     };
     sort_rank_desc(&mut apps);
     apps.truncate(RANK_LIMIT);
     // 设备维度统计（Raw Input 侧信道，独立口径：键盘按下 + 鼠标按键 + 滚轮）。
     // 查询侧已按次数降序、显示名去重，这里只截断。
-    let (device_total, mut devices) = match period_val {
-        -1 => focusflow_core::db::get_device_stats_by_date(chrono::Local::now().date_naive()),
-        0 => focusflow_core::db::get_device_stats(None, None),
-        n => focusflow_core::db::get_device_stats(Some(n), None),
+    let device_read = match period_val {
+        -1 => focusflow_core::db::device_totals_on(chrono::Local::now().date_naive()),
+        0 => focusflow_core::db::device_totals(None, None),
+        n => focusflow_core::db::device_totals(Some(n), None),
     };
+    let (device_total, mut devices, device_gaps) = (
+        device_read.total,
+        device_read.devices,
+        device_read.unreadable,
+    );
     let device_count = devices.len() as i64;
     devices.truncate(RANK_LIMIT);
     let mut rank: Vec<(String, i64)> = key_stats.iter().map(|(k, v)| (k.clone(), *v)).collect();
@@ -2116,6 +2130,7 @@ fn compute_charts(
         devices,
         device_total,
         device_count,
+        read_gaps: [key_gaps, app_gaps, device_gaps].concat(),
         group,
         mouse_total,
         keyboard_total,
@@ -2657,6 +2672,59 @@ mod compute_charts_tests {
             body.contains("aggregate_weekday(&trend_period)"),
             "星期分布还钉在 tail30 上"
         );
+    }
+
+    /// 面板拿得到"这一轮没读全"：库读不出来时 `read_gaps` 非空，
+    /// 而不是把一份下界念成"今日 0 次、暂无数据"。
+    #[test]
+    fn the_panel_is_told_which_readings_are_incomplete() {
+        let _lock = crate::app_dir_lock();
+        let _tmp = focusflow_core::paths::test_app_dir("panel_read_gaps");
+        std::fs::create_dir_all(focusflow_core::paths::data_dir()).unwrap();
+        let year = {
+            use chrono::Datelike;
+            chrono::Local::now().year()
+        };
+        std::fs::write(
+            focusflow_core::paths::year_db_path(year),
+            b"this is not a sqlite database at all",
+        )
+        .unwrap();
+
+        let agg = compute_charts(0, None, 0);
+        assert_eq!(agg.total, 0, "读不出来时交回的总数是下界，这里就是 0");
+        assert!(
+            agg.read_gaps.len() >= 3,
+            "三个排行榜各该说一条没读全，实得 {:?}",
+            agg.read_gaps
+        );
+        for domain in ["按键统计", "应用时长", "设备统计"] {
+            assert!(
+                agg.read_gaps.iter().any(|g| g.contains(domain)),
+                "{domain} 那一栏的 gap 没进面板，实得 {:?}",
+                agg.read_gaps
+            );
+        }
+    }
+
+    /// 域名串两头同源：core 的 `label` 与前端 `gapNote` 的过滤词必须是同一批字面量。
+    ///
+    /// 探针：把 core 里 `"应用时长"` 改成别的词 ⇒ 这条红（前端会从此滤不到那一栏的 gap，
+    /// 而那个 gap 仍在数组里 —— 界面上就是一句都不显示）。
+    #[test]
+    fn the_panel_names_the_same_domains_as_the_core() {
+        let js = include_str!("../ui/js/views.js");
+        let core = include_str!("../../crates/core/src/db/queries.rs");
+        for domain in ["按键统计", "应用时长", "设备统计"] {
+            assert!(
+                core.contains(&format!("\"{domain}\"")),
+                "core 那一侧的域名 label「{domain}」不见了（gap 文案会跟着变）"
+            );
+            assert!(
+                js.contains(&format!("gapNote(s, \"{domain}\")")),
+                "前端按「{domain}」过滤 gap 的那一处不见了"
+            );
+        }
     }
 }
 

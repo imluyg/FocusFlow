@@ -60,6 +60,16 @@ const RO_POOL_MAX: usize = 12;
 
 /// 使用缓存中的只读连接执行 `f`。连接不存在或打开失败时返回 `None`。
 pub fn with_ro_conn<T>(path: &Path, f: impl FnOnce(&Connection) -> T) -> Option<T> {
+    with_ro_conn_why(path, f).ok()
+}
+
+/// 同 [`with_ro_conn`]，但把"这个库连打开都办不到"**为什么**交回调用方。
+///
+/// 立它的原因：`with_ro_conn` 只能给 `None`，而调用方普遍拿 `unwrap_or(0)` /
+/// `unwrap_or_default()` 兜底 ⇒ "库被别的进程握着、损坏、移动盘没醒"与"这一年就是没数据"
+/// 在界面上长成同一个 0 与一张空榜（见 `queries::RankTotals::unreadable`）。
+/// 这一层仍然记一行 error：CLI 与宿主 API 走的是不带原因的旧口子，日志是它们唯一的痕迹。
+pub fn with_ro_conn_why<T>(path: &Path, f: impl FnOnce(&Connection) -> T) -> Result<T, String> {
     RO_POOL.with(|pool| {
         let gen = RO_GEN.load(std::sync::atomic::Ordering::Acquire);
         let mut pool = pool.borrow_mut();
@@ -90,16 +100,16 @@ pub fn with_ro_conn<T>(path: &Path, f: impl FnOnce(&Connection) -> T) -> Option<
                     // "库损坏/被锁/不可读"会表现为"今日 0 次、排行榜为空"，
                     // 用户与排查者都无法区分"没有数据"和"读不出来"。
                     tracing::error!("只读连接打开失败 {}: {e}", path.display());
-                    return None;
+                    return Err(format!("{} 打不开: {e}", path.display()));
                 }
             }
         }
         match pool.get_mut(path) {
             Some((conn, last_used)) => {
                 *last_used = std::time::Instant::now();
-                Some(f(conn))
+                Ok(f(conn))
             }
-            None => None,
+            None => Err("只读连接缓存里没有这个库（并发失效）".to_string()),
         }
     })
 }
