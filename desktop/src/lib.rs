@@ -240,6 +240,7 @@ pub fn run() {
             commands::get_plugins,
             commands::set_plugin_enabled,
             commands::set_autostart,
+            commands::cleanup_data,
             commands::plugins_watch,
             commands::dbg_log,
             commands::import_legacy,

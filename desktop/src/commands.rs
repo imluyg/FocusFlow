@@ -946,6 +946,66 @@ pub async fn set_autostart(enable: bool) -> Result<String, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// 一次清理的结局该怎么说：做完 / 没做完 / 做完了但没有退路，各是一句话。
+///
+/// 那句"是什么结果"由 core 的 `cleanup_line` 说**一遍**（与 `vacuum_line` 同一族），
+/// 这里只决定它该进 Ok 还是进 Err —— 两侧各抄一遍时漏的总是"未完成"那一臂。
+///
+/// 快照的洞跟在 `Ok` 后面而不是折成 `Err`：删除确实做完了，报成失败会让人以为还能撤销，
+/// 而 `incomplete()` 才是"没做完"那一档（`MaintenanceReport` 自己就这么定义，有用例钉着）。
+fn cleanup_verdict(
+    days: i64,
+    report: &focusflow_core::db::maintenance::MaintenanceReport,
+) -> Result<String, String> {
+    let line = focusflow_core::db::maintenance::cleanup_line(days, report);
+    if report.incomplete() {
+        return Err(line);
+    }
+    match report.snapshot_warning.as_deref() {
+        Some(w) => Ok(format!("{line}；{w}")),
+        None => Ok(line),
+    }
+}
+
+/// 按日期清理旧记录（设置页的「按日期清理」）。**破坏性操作**。
+///
+/// 三道闸，每一道都问不出就不动手：
+/// 1. `confirm` —— 闸在 Rust，不在界面：写在前端的话，未来的任何调用方都能跳过它。
+/// 2. 天数口径 —— 用 core 那把 `parse_keep_days`（命令行与界面同一把尺子）。
+/// 3. 落盘确认 —— 兜底快照是从**库**里复制出来的，还压在内存里的那一批进不了快照；
+///    没确认落成就删，等于先自断退路再赌它够长。
+#[tauri::command]
+pub async fn cleanup_data(
+    state: State<'_, Arc<AppState>>,
+    days: String,
+    confirm: bool,
+) -> Result<String, String> {
+    if !confirm {
+        return Err("这是删除操作：需要再点一次「确认清理」才真的动手".to_string());
+    }
+    let days = focusflow_core::db::maintenance::parse_keep_days(&days)?;
+    let db = Arc::clone(&state.db);
+    let refresh = Arc::clone(&state.refresh_now);
+    tauri::async_runtime::spawn_blocking(move || {
+        if !db.flush_confirmed(true) {
+            return Err(
+                "清理没有动手：还有一批统计没确认落盘，删之前那份快照会缺这一段（稍等几秒再点一次）"
+                    .to_string(),
+            );
+        }
+        let report = focusflow_core::db::maintenance::cleanup_old_data(days);
+        let verdict = cleanup_verdict(days, &report);
+        if verdict.is_ok() {
+            // 删掉的是往期，界面上那几张按周期聚合的图必须重算一次；今日基准不在删除范围内
+            // （`parse_keep_days` 保证天数 >= 1），所以不动它。
+            refresh.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        verdict
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1607,6 +1667,93 @@ mod autostart_wiring {
         assert!(
             js.contains("invoke(\"set_autostart\""),
             "行在、命令也在，却没接上"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_wiring {
+    use super::cleanup_verdict;
+    use focusflow_core::db::maintenance::MaintenanceReport;
+
+    fn nothing_wrong(deleted: i64) -> MaintenanceReport {
+        MaintenanceReport {
+            deleted,
+            failed_years: vec![],
+            dir_error: None,
+            snapshot_warning: None,
+            touched_years: 0,
+        }
+    }
+
+    /// 三种结局三句话：删成了 / 有库没做成 / 删成了但这一次没有退路。
+    #[test]
+    fn the_snapshot_hole_is_told_without_calling_the_delete_a_failure() {
+        let line = cleanup_verdict(30, &nothing_wrong(12)).unwrap();
+        assert!(
+            line.contains("已删除") && line.contains("12"),
+            "实得：{line}"
+        );
+
+        let mut partial = nothing_wrong(0);
+        partial.failed_years = vec![2024];
+        let why = cleanup_verdict(30, &partial).unwrap_err();
+        assert!(
+            why.contains("未完成") && why.contains("2024"),
+            "实得：{why}"
+        );
+        assert!(
+            !why.contains("已删除"),
+            "没做成的那一轮不许报删除数，实得：{why}"
+        );
+
+        // 快照的洞：删除确实完成 ⇒ 跟在 Ok 里，但必须逐字带上"这一次没有退路"
+        let mut no_way = nothing_wrong(7);
+        no_way.snapshot_warning = Some("执行前快照只兜住了 0 份".to_string());
+        let line = cleanup_verdict(30, &no_way).unwrap();
+        assert!(
+            line.contains("执行前快照只兜住了 0 份"),
+            "退路的洞必须点名，实得：{line}"
+        );
+        assert!(
+            line.contains("已删除"),
+            "删除本身做成了，这句也要在，实得：{line}"
+        );
+    }
+
+    /// 三道闸的接线判据：确认闸排在 Rust（写在前端的话任何调用方都跳得过），
+    /// 落盘确认排在删除**之前**（没落成的那一批进不了兜底快照）。
+    #[test]
+    fn the_destructive_command_asks_before_it_deletes() {
+        let src = include_str!("commands.rs");
+        let at = src
+            .find("pub async fn cleanup_data(")
+            .expect("清理命令找不到了");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("命令体切不出来")];
+        let confirm = body.find("if !confirm").expect("确认闸不见了");
+        let flushed = body.find("flush_confirmed(true)").expect("落盘确认不见了");
+        let deleted = body.find("cleanup_old_data(").expect("删除这一步不见了");
+        assert!(confirm < flushed, "确认闸必须排在任何动作之前");
+        assert!(flushed < deleted, "没确认落盘就删，那份兜底快照会缺一段");
+        assert!(
+            body.contains("parse_keep_days("),
+            "天数得问 core 那把尺子，不许在界面一侧另夹一次"
+        );
+        assert!(
+            body.contains(r#""这是删除操作"#),
+            "没确认那一句要自己就能说清下一步该干什么"
+        );
+        // 前端这一头：两步确认的第一击不许真的调用命令（行为由浏览器夹具盯，
+        // 这里只钉"接线在不在"：行、控件 id、命令名三处都得有）
+        let js = include_str!("../ui/js/views.js");
+        assert!(js.contains(r#""do-cleanup""#), "清理按钮不见了");
+        assert!(
+            js.contains(r#"id="set-cleanup-days""#),
+            "保留天数那个输入框不见了"
+        );
+        assert!(
+            js.contains(r#"invoke("cleanup_data""#),
+            "按钮在、命令在，却没接上"
         );
     }
 }

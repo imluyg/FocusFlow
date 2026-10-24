@@ -1200,6 +1200,16 @@ const SETTINGS_CATS = [
             btns: [{ act: "do-vacuum", label: "压缩数据库" }],
             desc: "重建库文件、回收空间；数据量大时耗时较久。",
           },
+          {
+            t: "raw", name: "按日期清理",
+            ctl: () =>
+              `<input type="number" class="ff-in" id="set-cleanup-days" min="1" max="3660" value="${cleanupDaysEcho()}" style="width:7em;">` +
+              `<button class="btn ghost" data-act="do-cleanup">清理更早的记录</button>`,
+            desc:
+              "删除「保留天数」以前的记录（键鼠计数、键名明细、应用与设备时长一起删）。" +
+              "确认分两步：第一下只说要删哪些，再点一次才真的动手。删除前会自动留一份兜底快照，" +
+              "没兜住时会在那句话后面点名。要清全部历史请用命令行 --reset。",
+          },
         ],
       },
     ],
@@ -1394,6 +1404,48 @@ export async function doVacuum() {
     $("set-msg").textContent = "压缩失败: " + e;
     $("set-msg").style.color = "var(--danger)";
   }
+}
+
+// 「按日期清理」是这一页唯一的删除操作，确认做成两步：
+// 第一击只把"要删哪些"说出来并挂一个 60 秒的令牌，第二击才真的调用命令。
+// 不用原生 confirm（本页其它地方同理都避开它），也不把它做成"只在前端的保险" ——
+// 命令那边还有第二道闸（confirm=false 直接拒），所以跳过界面也删不掉。
+let cleanupArmedAt = 0;
+let cleanupDaysTyped = "365";
+
+// 重渲染后要还能看见用户刚填的那个数（这一页每次 setMsg/renderSettings 都可能重画）。
+// 输入框是 number，非法串本来就会被浏览器读成空；这里再限一次字符，
+// 免得把任何外部来源的东西裸拼进属性里。
+function cleanupDaysEcho() {
+  const digits = String(cleanupDaysTyped).replace(/[^0-9]/g, "");
+  return digits || "365";
+}
+
+export async function doCleanup() {
+  const el = $("set-cleanup-days");
+  const days = el ? String(el.value).trim() : "";
+  cleanupDaysTyped = days || cleanupDaysTyped;
+  const now = Date.now();
+  if (cleanupArmedAt === 0 || now - cleanupArmedAt > 60000) {
+    cleanupArmedAt = now;
+    setMsg(
+      `下一步会删除 ${days || "（天数没填）"} 天以前的全部记录，删除前会自动留一份兜底快照。` +
+        "再点一次「清理更早的记录」才真的动手。",
+      "var(--warning)",
+    );
+    return;
+  }
+  cleanupArmedAt = 0;
+  setMsg("正在清理…", "var(--muted)");
+  try {
+    // 那句话（含"这一次没有退路"那一半）由后端说，这里原样转达：
+    // 界面自己写一句「清理完成」就又会回到"绿色说失败"那一族。
+    setMsg(await invoke("cleanup_data", { days, confirm: true }), "var(--success)");
+  } catch (e) {
+    setMsg("清理没有做成：" + e, "var(--danger)");
+  }
+  // 删的是往期，页面那几张按周期聚合的图要按新账本重画一次
+  await renderSettings();
 }
 
 export async function doImport() {
