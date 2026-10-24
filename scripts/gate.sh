@@ -81,6 +81,20 @@ say "DOC_WARNING_LINES=$(grep -ac '^warning' "$OUT/doc.txt")"
 [ "$(grep -ac '^warning' "$OUT/doc.txt")" = "0" ]
 mark DOC_WARNINGS $?
 
+# ---- 4b) app_dir 串行锁审计（切全局程序目录的用例必须持锁跑完）--------------------------
+# 判据在 scripts/audit_app_dir_lock.mjs：违规则列位置并退非 0。
+# 这条为什么归门禁而不是归人记：`set_app_dir` 写的是进程级 `Mutex<Option<PathBuf>>`，
+# 后写覆盖前者；少一把锁的症状不是"这条用例红"，而是隔壁用例的库被开到哨兵目录、
+# 或撞进仓库里的 crates/core/data —— 随机红且 `--test-threads=1` 永远全绿。
+if command -v node >/dev/null 2>&1; then
+    node scripts/audit_app_dir_lock.mjs > "$OUT/lock-audit.txt" 2>&1
+    mark LOCK_AUDIT $?
+    say "LOCK_AUDIT_DETAIL=$(tail -n 1 "$OUT/lock-audit.txt")"
+else
+    say "LOCK_AUDIT=node 不可用：这条判据不能跳过（它查的是测试纪律，不是环境）"
+    mark LOCK_AUDIT 1
+fi
+
 # ---- 5) 真浏览器夹具与本机探针（存在即跑，跑了即致命）------------------------------------
 # 表：脚本|成功标记。成功标记留空 ⇒ 用 RESULT::PASS/FAIL 计数判（PASS 必须 >0，防"整段没跑"）。
 HARNESSES="

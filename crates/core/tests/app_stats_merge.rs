@@ -17,6 +17,11 @@ fn day_key_of(date: chrono::NaiveDate) -> i64 {
 
 #[test]
 fn app_stats_merges_across_days() {
+    // 切换全局 `app_dir` 的用例必须全程持有这把锁（`set_app_dir` 写的是进程级
+    // `Mutex<Option<PathBuf>>`，后写覆盖前者）。这个二进制今天只有这一条用例，所以
+    // 不取锁暂时不会出事 —— 但"暂时只有一个"正是下一个用例进来时随机红的成因：
+    // 表现是别人的库开在 `target/ff_restore_sentinel/` 下、或撞进本仓库的 crates/core/data。
+    let _lock = paths::test_app_dir_lock();
     let _app = paths::test_app_dir("app_merge");
 
     let today = Local::now().date_naive();
