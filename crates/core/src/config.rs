@@ -446,18 +446,53 @@ fn serialize_rebuilt(snapshot: &HashMap<String, HashMap<String, String>>) -> Str
 ///
 /// 这是对唯一一份用户配置的结构性改动：`atomic_write` 只保证"不写半截"，
 /// 不保证"写出来的内容一定对"。留一份改动前的原貌，最坏情况照它手工恢复。
+///
+/// "只在没有时创建"交给操作系统一次调用做完（`create_new`），不是先 `exists()` 问一遍
+/// 再 `fs::write`：后者是两步，而第一步会失败成"查不动"—— `exists()` 把那一刻读成
+/// "没有"，第二步就是**截断写**，唯一那份改前原貌当场被改后的内容盖掉（同形病根见
+/// `data_location::copy_file` 那条：保护段被 `to.exists()` 整段绕过）。
+/// 名字已经被占住也不等于留档存在：那是目录或属性问不出时，这份原貌其实没留下来，
+/// 必须出声——安静返回等于让人以为最坏情况还有退路。实测本机（Windows）目录占名时报的是
+/// os error 5（拒绝访问）而不是 `AlreadyExists`，所以"创建失败"那一支同样是出声的落点。
 fn backup_original_once(path: &Path, original: &str) {
+    use std::io::Write as _;
     let mut name = path
         .file_name()
         .map(|s| s.to_os_string())
         .unwrap_or_default();
     name.push(".bak");
     let bak = path.with_file_name(name);
-    if bak.exists() {
-        return;
-    }
-    if let Err(e) = std::fs::write(&bak, original) {
-        tracing::warn!("配置备份（{}）写入失败: {e}", bak.display());
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&bak)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match std::fs::metadata(&bak) {
+            Ok(m) if m.is_file() => return,
+            Ok(_) => {
+                tracing::warn!(
+                    "配置留档（{}）没能留下：这个名字被非文件占着，本次改动之前的原貌没有备份",
+                    bak.display()
+                );
+                return;
+            }
+            Err(e2) => {
+                tracing::warn!(
+                    "配置留档（{}）没能留下：这个名字已存在却问不出它是不是文件（{e2}），\
+                         不敢把它当留档，也不去覆盖它",
+                    bak.display()
+                );
+                return;
+            }
+        },
+        Err(e) => {
+            tracing::warn!("配置留档（{}）创建失败: {e}", bak.display());
+            return;
+        }
+    };
+    if let Err(e) = file.write_all(original.as_bytes()) {
+        tracing::warn!("配置留档（{}）写入失败: {e}", bak.display());
     }
 }
 
@@ -1275,6 +1310,72 @@ mod tests {
             "已落盘的键此后再被外部改动应当采纳，而不是永久停在 UI 那次值: {text}"
         );
         assert_eq!(cfg.get("gui", "theme"), "solarized");
+    }
+
+    /// 留档只留第一份：改前的原貌一旦留下，后面每次保存都不许再盖它。
+    #[test]
+    fn the_first_backup_survives_later_saves() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_bak_first_wins");
+        let path = app.path().join("config.ini");
+        std::fs::write(&path, "[gui]\ntheme = dark\n").unwrap();
+        let bak = path.with_file_name("config.ini.bak");
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+
+        cfg.set_local("gui", "theme", "light");
+        cfg.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "[gui]\ntheme = dark\n",
+            "第一次逐行重写之前，必须把改前的原貌留在 .bak"
+        );
+
+        // 中间态（上一次写出去的内容）绝不能顶掉那份原貌
+        std::fs::write(&path, "[gui]\ntheme = solarized\n").unwrap();
+        cfg.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "[gui]\ntheme = dark\n",
+            "只留第一份：第二次保存不许把原貌盖成中间态"
+        );
+    }
+
+    /// `.bak` 这个名字被**目录**占住时，这份原貌其实没留下来 —— 必须出声。
+    ///
+    /// 旧写法是 `if bak.exists() { return }` 再 `fs::write`：那条路上"名字被占着"与
+    /// "留档真的在"长成同一个样子，安静返回等于让人以为最坏情况还有退路。改成
+    /// `create_new` 之后占位那一支分得出来。
+    /// ⚠ 实测（本机 Windows）：名字是目录时 `create_new` 报的是 **os error 5 拒绝访问**，
+    /// 不是 `AlreadyExists`；`AlreadyExists` 走的是"已存在但不是文件/问不出"那两支。
+    /// 所以断言按两支共用的前缀「配置留档」，不锁某一句措辞。
+    /// 探针：把 `create_new` 换回 `exists()` + `fs::write` ⇒ 这条红（旧写法安静返回，
+    /// 一行都不出声），而"只留第一份"那条照样绿 —— 区分度全在出声这一臂上。
+    #[test]
+    fn an_occupied_backup_name_is_reported_instead_of_silently_skipped() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_bak_name_taken");
+        let path = app.path().join("config.ini");
+        std::fs::write(&path, "[gui]\ntheme = dark\n").unwrap();
+        let bak = path.with_file_name("config.ini.bak");
+        std::fs::create_dir_all(&bak).expect("用目录占住留档的名字");
+
+        let ((), logs) = crate::logger::capture_logs(|| {
+            let cfg = FocusFlowConfig::load(&path).unwrap();
+            cfg.set_local("gui", "theme", "light");
+            cfg.save().unwrap();
+        });
+        let text = logs.join("\n");
+        assert!(
+            text.contains("配置留档"),
+            "留档没做成不该安静，实得: {text}"
+        );
+        assert!(bak.is_dir(), "不该去动占着名字的那个目录");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("theme = light"),
+            "留档没做成不许顺手把本次设置也弄丢"
+        );
     }
 
     /// 快照取完之后才落进来的 `set()`：那次 save 写出去的是旧值，标记必须留下。
