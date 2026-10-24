@@ -396,9 +396,14 @@ mod tests {
     impl Drop for TempRoot {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
-            if let Ok(dir) = std::env::current_dir() {
-                paths::set_app_dir(&dir);
-            }
+            // 收尾要指到**哨兵**，不是当前工作目录。恢复到 cwd 就等于把 `crates/core`
+            // 声明成程序目录：之后任何一条还没锚定的用例（或常驻线程的一次惰性解析）
+            // 都会把 SQLite 库与 config.ini 静默写进仓库里 —— 实测 `crates/core/data/`
+            // 就是这么长出来的，被 .gitignore 挡住看不见，还会让下一个用例撞
+            // `UNIQUE constraint failed: daily_counts.date_key`（随机红、
+            // 而 `--test-threads=1` 永远全绿）。本文件上面那条 hot_reload 的注释
+            // 记的就是同一件事的另一半：那次把用例搬走了，收尾这一行却还留着 cwd。
+            paths::set_app_dir(paths::test_scratch_app_dir());
             db::queries::invalidate_years_cache();
         }
     }

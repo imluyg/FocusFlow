@@ -194,7 +194,8 @@ pub fn test_scratch_app_dir() -> PathBuf {
 ///
 /// release 下默认取 exe 所在目录：数据/配置固定跟程序走（README 承诺"数据存放在程序目录"），
 /// 且不受快捷方式"起始位置"错误导致的静默数据写错目录影响。
-/// debug 下保留当前工作目录（cargo run 的 cwd 即工程目录，便于开发调试）。
+/// debug（非测试）下保留当前工作目录（cargo run 的 cwd 即工程目录，便于开发调试）。
+/// **测试构建例外**：忘了锚定时不许写到仓库里去，见下面那段注释与 `test_scratch_app_dir`。
 pub fn app_dir() -> PathBuf {
     if let Some(dir) = app_dir_override()
         .lock()
@@ -214,6 +215,15 @@ pub fn app_dir() -> PathBuf {
             return dir.to_path_buf();
         }
     }
+    // 测试构建里**不许**回落到当前工作目录：cargo 的 cwd 就是包目录（`crates/core`），
+    // 于是一条忘了锚定的用例、或常驻线程的一次惰性解析，会把库与配置静默写进仓库 ——
+    // 实测留下过 `crates/core/data/focusflow_2026.db`（.gitignore 挡住看不见），
+    // 而它的下一次命中表现成隔壁用例 `UNIQUE constraint failed: daily_counts.date_key`：
+    // 随机红，且 `--test-threads=1` 永远全绿。指到 `target/` 下那个哨兵：
+    // 一次 `cargo clean` 带走，也不会谎称程序目录在仓库里。
+    #[cfg(any(test, feature = "test-utils"))]
+    return test_scratch_app_dir();
+    #[cfg(not(any(test, feature = "test-utils")))]
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
