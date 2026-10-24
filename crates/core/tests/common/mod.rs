@@ -13,7 +13,6 @@
 //! `ensure_accounting_db` / `ensure_pomodoro_db` 用的是进程级 `OnceLock` 闩，一个进程
 //! 只建一次，谁先跑就在谁的目录里建。本文件里已经有用例踩过这个形状
 //! （`host_accounting_category_add_returns_a_reason` 的注释记着同一条）。
-#![allow(dead_code)]
 
 use focusflow_core::paths;
 
