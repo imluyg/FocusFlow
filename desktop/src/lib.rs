@@ -239,6 +239,7 @@ pub fn run() {
             commands::quit,
             commands::get_plugins,
             commands::set_plugin_enabled,
+            commands::set_autostart,
             commands::plugins_watch,
             commands::dbg_log,
             commands::import_legacy,

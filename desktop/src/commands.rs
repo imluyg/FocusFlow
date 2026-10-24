@@ -78,6 +78,10 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
         "data_home": data_home.display().to_string(),
         // 数据与程序是否还在同一个目录（= 从没挪出去过）；前端据此给一句可选提示
         "data_home_shared_with_app": data_home == app_dir,
+        // 开机自启：**现读**启动文件夹里那个快捷方式，不读任何配置键 —— 这个功能的真相
+        // 只在文件系统里（`[gui]`/`[plugins]` 都没有它的记账位）。所以在资源管理器里
+        // 手动删掉 FocusFlow.lnk，设置页下一帧就会跟着变成未启用，而不是停在最后一次勾。
+        "autostart_enabled": focusflow_core::autostart::is_autostart_enabled(),
     })
 }
 
@@ -891,6 +895,57 @@ pub fn set_plugin_enabled(
     Ok(enabled)
 }
 
+/// 开机自启：只有一步调用成不成、加上现场复查，才允许对用户说「已经改好了」。
+///
+/// `run` 是那次真的往启动文件夹写（或删）快捷方式的调用，`read` 是写完之后的现场复查。
+/// 两道闸都必须过：PowerShell 报了成功而快捷方式没落盘（同步盘/杀软握着、`%APPDATA%`
+/// 指向别处、启动文件夹被换成了占位文件）时，用户看到的必须是一句红字，而不是绿色那句
+/// 「已启用开机自启，开机后将自动后台运行」—— 这个功能的失败没有任何症状，
+/// 只有下一次开机那一刻才知道，那时已经来不及了。
+fn autostart_apply(
+    enable: bool,
+    run: &dyn Fn() -> (bool, String),
+    read: &dyn Fn() -> bool,
+) -> Result<String, String> {
+    let (ok, msg) = run();
+    if !ok {
+        // 前端把 Ok 渲染成绿字：这一支绝不能返回 Ok(消息)。
+        return Err(msg);
+    }
+    if read() != enable {
+        return Err(format!(
+            "{}开机自启没有生效：调用报了成功，但启动文件夹里{}指向本程序的快捷方式\
+             （被同步盘或杀软握着、那个目录不可写时就是这样）；等几秒再试一次，\
+             或直接到 Windows 的启动文件夹里看一眼 FocusFlow.lnk",
+            if enable { "启用" } else { "取消" },
+            if enable { "读不到" } else { "仍留着" }
+        ));
+    }
+    Ok(msg)
+}
+
+/// 打开/关闭开机自启，返回要写给用户那一句。
+///
+/// async：建快捷方式要走一次 PowerShell，同步命令会把它压在主线程上。
+#[tauri::command]
+pub async fn set_autostart(enable: bool) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        autostart_apply(
+            enable,
+            &|| {
+                if enable {
+                    focusflow_core::autostart::enable_autostart()
+                } else {
+                    focusflow_core::autostart::disable_autostart()
+                }
+            },
+            &|| focusflow_core::autostart::is_autostart_enabled(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1482,6 +1537,76 @@ mod vibrancy_wiring {
         assert!(
             body.contains("refresh_window_vibrancy(&app)"),
             "判据成立却没真的重贴材质"
+        );
+    }
+}
+
+#[cfg(test)]
+mod autostart_wiring {
+    use super::autostart_apply;
+
+    /// 「调用报了成功」与「开机时真会起来」是两件事：只有现场读回来对得上，才允许那句绿的。
+    #[test]
+    fn success_is_only_claimed_after_the_field_matches() {
+        // 调用本身失败 ⇒ 原样交回那句原因，绝不折成 Ok（前端把 Ok 画成绿字）
+        assert_eq!(
+            autostart_apply(
+                false,
+                &|| (false, "PowerShell 拒绝了".to_string()),
+                &|| false
+            )
+            .unwrap_err(),
+            "PowerShell 拒绝了"
+        );
+        // 报成功、可现场读回来还是「没启用」⇒ 必须红，并且说清是哪一头
+        let why =
+            autostart_apply(true, &|| (true, "已启用开机自启".to_string()), &|| false).unwrap_err();
+        assert!(why.contains("启用开机自启没有生效"), "实得：{why}");
+        assert!(
+            why.contains("读不到"),
+            "启用那一支要说「读不到」，实得：{why}"
+        );
+        // 反向：报「已取消」而快捷方式还留着 ⇒ 同样不能算成
+        let why =
+            autostart_apply(false, &|| (true, "已取消开机自启".to_string()), &|| true).unwrap_err();
+        assert!(why.contains("取消开机自启没有生效"), "实得：{why}");
+        assert!(
+            why.contains("仍留着"),
+            "取消那一支要说「仍留着」，实得：{why}"
+        );
+        // 两道闸都过才 Ok，消息原样交给前端
+        assert_eq!(
+            autostart_apply(true, &|| (true, "已启用开机自启".to_string()), &|| true).unwrap(),
+            "已启用开机自启"
+        );
+    }
+
+    /// 接线判据：设置页那个勾只能读启动文件夹的现场，且两侧都得有对应的字。
+    ///
+    /// 读成配置键就是「勾着、开机却什么都不发生」的成因 —— 这个功能没有配置键，
+    /// 生效与否只由启动文件夹里那个指向本程序的快捷方式说了算，所以外部删掉它
+    /// 必须立刻反映到界面上（`lib.rs` 的 `every_invoked_command_is_registered`
+    /// 另盯住「前端叫了、后端没注册」那一半，症状同样是点了没反应）。
+    #[test]
+    fn the_toggle_reads_the_field_and_is_wired_on_both_sides() {
+        let src = include_str!("commands.rs");
+        let at = src
+            .find("pub fn get_settings(")
+            .expect("get_settings 找不到了");
+        let body = &src[at..at + src[at..].find("\n}").expect("函数体切不出来")];
+        assert!(
+            body.contains("autostart::is_autostart_enabled()"),
+            "get_settings 没现读启动文件夹的现场，那个勾是拿别处的数画出来的"
+        );
+        assert!(
+            !body.contains("\"autostart_enabled\": c.get"),
+            "把现场读换成配置键就读不出「用户在资源管理器里删掉它」那一次"
+        );
+        let js = include_str!("../ui/js/views.js");
+        assert!(js.contains("\"set-autostart\""), "设置页那一行不见了");
+        assert!(
+            js.contains("invoke(\"set_autostart\""),
+            "行在、命令也在，却没接上"
         );
     }
 }

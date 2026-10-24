@@ -818,6 +818,19 @@ async function onPauseChange(e) {
   rememberSetting({ paused: target });
 }
 
+async function onAutostartChange(e) {
+  const on = e.target.checked;
+  try {
+    setMsg(await invoke("set_autostart", { enable: on }), "var(--success)");
+  } catch (err) {
+    setMsg(`开机自启${on ? "启用" : "取消"}失败：` + err, "var(--danger)");
+  }
+  // 成没成都要重读现场：这件事的真相在启动文件夹里，不在内存快照里。
+  // 「调用报了成功、快捷方式却没落盘」走的是上面那条 Err，此时勾必须回到实际状态，
+  // 不能停在用户刚点的那一下（同 onHotkeyEnabledChange 的口径：写进去了 ≠ 生效了）。
+  await renderSettings();
+}
+
 async function onHotkeyEnabledChange(e) {
   await invoke("set_config", { section: "hotkey", key: "enabled", value: e.target.checked ? "true" : "false" });
   // 重读一遍设置：配置写入成功但注册失败时 set_config 仍返回 Ok（不能拿它
@@ -964,6 +977,13 @@ const SETTINGS_CATS = [
             id: "set-paused", t: "switch", name: "暂停记录",
             desc: "暂停期间不再统计键鼠。托盘也能切，悬浮窗只显示「已暂停」角标；状态会同步到这里。",
             v: (s) => !!s.paused, on: onPauseChange,
+          },
+          {
+            id: "set-autostart", t: "switch", name: "开机自动在后台运行",
+            desc: "在 Windows 的启动文件夹里放一个指向本程序的 FocusFlow.lnk，开机后它自己起来（照旧的启动设置进托盘，不弹面板）。"
+              + "这个勾读的是那个快捷方式**此刻在不在、指不指着本程序**：你自己在资源管理器里删掉它、"
+              + "或把它改指向别处的副本，勾就会灭。换了安装位置之后要重新勾一次。",
+            v: (s) => !!s.autostart_enabled, on: onAutostartChange,
           },
         ],
       },
