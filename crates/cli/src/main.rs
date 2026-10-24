@@ -208,7 +208,7 @@ fn run(args: &[String]) -> i32 {
                 eprintln!("用法: --cleanup <保留天数>");
                 return 1;
             }
-            match parse_keep_days(&args[1]) {
+            match db::maintenance::parse_keep_days(&args[1]) {
                 Err(msg) => {
                     eprintln!("{msg}，已取消");
                     1
@@ -835,31 +835,6 @@ fn export_html(
     std::fs::write(path, html).map_err(|e| format!("写 {} 失败: {e}", path.display()))
 }
 
-/// `--cleanup <保留天数>` 的取值口径：必须落在 1..=3660。
-///
-/// 与 `parse_period` 同一个理由：core 对非法天数只会返回 0，直接打「已删除 0 条」
-/// 看起来就像成功，用户不会发现自己把天数打成了 0 或负数（那会连今天一起删）。
-/// 上限是给打错字兜底的：旧代码接受任意 `>= 1`，于是 `--cleanup 3000` 与
-/// `--cleanup 999999` 都合法，而它们的真实含义是"把历史全删了"；十年以上的保留期
-/// 没有合理用途，超出就当笔误处理。
-fn parse_keep_days(raw: &str) -> Result<i64, String> {
-    let days = raw
-        .parse::<i64>()
-        .map_err(|_| format!("保留天数必须是整数（收到 {raw:?}）"))?;
-    if days < 1 {
-        return Err(format!(
-            "保留天数必须 >= 1（收到 {days}）：0 或负数会连今天一起删掉"
-        ));
-    }
-    if days > 3660 {
-        return Err(format!(
-            "保留天数 {days} 超出可理解的范围（上限 3660 天）：这个值等价于清空全部历史，\
-             真要清空请用 --reset"
-        ));
-    }
-    Ok(days)
-}
-
 /// `--reset` 在向人要确认**之前**必须先看清要清哪些库（三种结局；纯函数好钉住）。
 #[derive(Debug)]
 enum ResetPlan {
@@ -971,23 +946,13 @@ fn parse_stats_year(raw: &str) -> Result<i32, String> {
 /// 挂在计划任务上的（第 57 轮 `c4aee24` 已经定过口径：结论必须带上失败项）。
 /// 返回（要打的那句, 退出码）。
 fn cleanup_outcome(days: i64, report: &db::maintenance::MaintenanceReport) -> (String, i32) {
-    if report.incomplete() {
-        (
-            format!(
-                "清理未完成：{}（已回滚的年份未删的行还在；原因见日志）",
-                report.why_incomplete()
-            ),
-            1,
-        )
-    } else {
-        (
-            format!(
-                "已删除 {days} 天前的记录 {} 条",
-                fmt_thousands(report.deleted)
-            ),
-            0,
-        )
-    }
+    // 那句话由 core 说一遍（`cleanup_line`，与 `vacuum_line` 同一族）：界面上的
+    // 「按日期清理」要把同一个结果说成同一句话，两把尺子就会出现"命令行说未完成、
+    // 按钮报已删除 0 条"。这里只决定退出码。
+    (
+        db::maintenance::cleanup_line(days, report),
+        if report.incomplete() { 1 } else { 0 },
+    )
 }
 
 /// `--backup` 的结论：**先**判有没有失败的库，再决定说哪句话。返回（要打的那句, 退出码）。
@@ -1059,8 +1024,8 @@ fn backup_outcome(outcome: &db::maintenance::BackupOutcome) -> (String, i32) {
 mod tests {
     use super::{
         backup_outcome, cleanup_outcome, export_csv, export_html, export_target, import_report,
-        max_args, parse_keep_days, parse_period, parse_stats_year, period_window, rank_tail_note,
-        run, vacuum_outcome, year_lookup, Period, YearLookup,
+        max_args, parse_period, parse_stats_year, period_window, rank_tail_note, run,
+        vacuum_outcome, year_lookup, Period, YearLookup,
     };
     use super::{reset_plan, ResetPlan};
     use focusflow_core::db::maintenance::MaintenanceReport;
@@ -1137,32 +1102,37 @@ mod tests {
         }
     }
 
-    /// `--cleanup` 的天数口径：0 / 负数 / 非整数 / 大得离谱都要在入口挡住。
+    /// 保留天数与结论那两句都在 core（`parse_keep_days` / `cleanup_line`），这一头只许调用、
+    /// 不许再抄一份 —— 界面上的「按日期清理」用的是同一把尺子，命令行自己留一把就会出现
+    /// "同一个天数、从按钮删和从命令行删是两种结果"。
     ///
-    /// 旧代码只挡 `< 1`，于是 `--cleanup 3000` 与 `--cleanup 999999` 一路放行，
-    /// 而它们实际等价于"把历史全删了"。core 那边对非法值只返回 0，直接打
-    /// 「已删除 0 条」看起来就是成功。
+    /// 边界值本身（0 / 负数 / 非整数 / 大得离谱）的用例随函数搬进了 core 的
+    /// `keep_days_argument_is_bounded`：旧代码只挡 `< 1`，于是 `--cleanup 3000` 与
+    /// `--cleanup 999999` 一路放行，而它们实际等价于"把历史全删了"。
     #[test]
-    fn keep_days_argument_is_bounded() {
-        assert_eq!(parse_keep_days("30"), Ok(30));
-        assert_eq!(parse_keep_days("1"), Ok(1));
-        assert_eq!(parse_keep_days("3660"), Ok(3660), "上限本身是合法保留期");
-        for bad in [
-            "0",
-            "-5",
-            "abc",
-            "",
-            " ",
-            "30.5",
-            "3661",
-            "999999",
-            "99999999999",
-        ] {
-            assert!(parse_keep_days(bad).is_err(), "{bad} 应当被拒绝");
-        }
-        // 文案要能分清是哪一种：会连今天一起删，与"笔误"是两件事
-        assert!(parse_keep_days("0").unwrap_err().contains(">= 1"));
-        assert!(parse_keep_days("999999").unwrap_err().contains("--reset"));
+    fn cleanup_takes_both_calipers_from_core() {
+        let src = include_str!("main.rs");
+        let at = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..at];
+        assert!(
+            !prod.contains("fn parse_keep_days("),
+            "命令行又自己定义了一把天数尺子"
+        );
+        assert!(
+            !prod.contains("清理未完成："),
+            "结论那句话又在这里重写了一遍（core 的 cleanup_line 是唯一出处）"
+        );
+        let arm_at = prod
+            .find("\"--cleanup\" =>")
+            .expect("--cleanup 那条分派不见了");
+        let arm = &prod[arm_at..];
+        let arm = &arm[..arm
+            .find("\"--import-legacy\" =>")
+            .expect("下一条分派不见了")];
+        assert!(
+            arm.contains("db::maintenance::parse_keep_days("),
+            "分派没走 core 那把尺子"
+        );
     }
 
     /// 周期参数必须与 UI 的 `set_period` 同一口径，越界值要报错而不是被静默钳制。

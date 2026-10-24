@@ -1027,6 +1027,51 @@ pub fn vacuum_line(report: &MaintenanceReport) -> String {
     }
 }
 
+/// 「按日期清理」的保留天数：把一句手打的数字变成要么是一个可信的天数、要么是一句原因。
+///
+/// 原先这把尺子私有在 CLI 里，而 core 对非法天数只会返回 0 —— 直接打「已删除 0 条」
+/// 看起来就像成功，用户不会发现自己把天数打成了 0 或负数（那会连今天一起删）。
+/// 现在界面也要调清理，所以它必须在 core：**同一 destructive 参数有两把尺子**，
+/// 就是"从命令行删是一种结果、从按钮删是另一种结果"的成因。
+///
+/// 上限是给打错字兜底的：旧代码接受任意 `>= 1`，于是 `--cleanup 3000` 与
+/// `--cleanup 999999` 都合法，而它们的真实含义是"把历史全删了"；十年以上的保留期
+/// 没有合理用途，超出就当笔误处理。
+pub fn parse_keep_days(raw: &str) -> Result<i64, String> {
+    let days = raw
+        .parse::<i64>()
+        .map_err(|_| format!("保留天数必须是整数（收到 {raw:?}）"))?;
+    if days < 1 {
+        return Err(format!(
+            "保留天数必须 >= 1（收到 {days}）：0 或负数会连今天一起删掉"
+        ));
+    }
+    if days > 3660 {
+        return Err(format!(
+            "保留天数 {days} 超出可理解的范围（上限 3660 天）：这个值等价于清空全部历史，\
+             真要清空请用 --reset"
+        ));
+    }
+    Ok(days)
+}
+
+/// 一次清理的结论那一句（**只说一次**，CLI 的退出码与设置页的红/绿都读同一个 `incomplete()`）。
+///
+/// 与 `vacuum_line` 同一族做法：话在 core 说一遍，两个入口各自只决定"怎么说、什么颜色"。
+pub fn cleanup_line(days: i64, report: &MaintenanceReport) -> String {
+    if report.incomplete() {
+        format!(
+            "清理未完成：{}（已回滚的年份未删的行还在；原因见日志）",
+            report.why_incomplete()
+        )
+    } else {
+        format!(
+            "已删除 {days} 天前的记录 {} 条",
+            crate::format::fmt_thousands(report.deleted)
+        )
+    }
+}
+
 /// 这套库到该压缩的时候了吗 —— **每库各算各的**。
 ///
 /// 三种"拿不准"（没有这一格 / 戳解不开 / 库打不开）都按**到期**处理：
@@ -6594,5 +6639,29 @@ mod tests {
             logs.iter().any(|l| l.contains("年度库列不出来")),
             "读不出清单要出声，不能静默停摆（这一轮本来会修的偏差就没人管了）: {logs:?}",
         );
+    }
+
+    /// 保留天数这把尺子（随函数从命令行搬过来：界面上的「按日期清理」用的是同一份）。
+    #[test]
+    fn keep_days_argument_is_bounded() {
+        assert_eq!(parse_keep_days("30"), Ok(30));
+        assert_eq!(parse_keep_days("1"), Ok(1));
+        assert_eq!(parse_keep_days("3660"), Ok(3660), "上限本身是合法保留期");
+        for bad in [
+            "0",
+            "-5",
+            "abc",
+            "",
+            " ",
+            "30.5",
+            "3661",
+            "999999",
+            "99999999999",
+        ] {
+            assert!(parse_keep_days(bad).is_err(), "{bad} 应当被拒绝");
+        }
+        // 文案要能分清是哪一种：会连今天一起删，与"笔误"是两件事
+        assert!(parse_keep_days("0").unwrap_err().contains(">= 1"));
+        assert!(parse_keep_days("999999").unwrap_err().contains("--reset"));
     }
 }
