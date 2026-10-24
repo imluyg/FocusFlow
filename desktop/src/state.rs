@@ -49,6 +49,10 @@ pub struct ChartAgg {
     pub keyboard_total: i64,
     pub trend: Vec<(String, i64)>,
     pub trend30: Vec<(String, i64)>,
+    /// 与顶部周期同窗口的每日序列（「总计」那一档是近 30 天，见 `chart_window_days`）。
+    /// `trend` / `trend30` 是趋势图那两个固定档，留着是因为它们各自还有别的用处；
+    /// 「跟随周期」这一档读的是下面这一格。
+    pub trend_period: Vec<(String, i64)>,
     pub hourly: Vec<i64>,
     pub weekday: Vec<(i64, i64)>,
 }
@@ -2079,12 +2083,22 @@ fn compute_charts(
     } else {
         daily_all.clone()
     };
-    // 星期分布天然稠密：上面的 needed 恒 >=30 天，而 get_daily_counts
-    // 会把整个窗口零填充，故 7 个星期几必定都有值（可能为 0）。
-    let wd = focusflow_core::db::queries::aggregate_weekday(&tail30);
-    let mut weekday: Vec<(i64, i64)> = wd.into_iter().collect();
-    weekday.sort_by_key(|(d, _)| *d);
-    let hourly = focusflow_core::db::queries::get_hourly_stats(None);
+    // 与顶部周期同窗口的那一段：三张图与「日均」卡片问的是同一个天数（`chart_window_days`）。
+    // `needed` 本来就取到 `daily_days.max(7).max(30)`，所以这里不多问一次库。
+    let trend_period: Vec<(String, i64)> = if total_days >= daily_days as usize {
+        daily_all[total_days - daily_days as usize..].to_vec()
+    } else {
+        daily_all.clone()
+    };
+    // 星期分布在这里就铺成固定 7 格（周一..周日，窗口里没有的那天填 0）。
+    // 原先交回的是"只有数据的那几天"，靠的是"窗口恒 >=30 天"这个巧合：今日周期只有 1 天，
+    // 而前端按数组下标贴标签 —— 周四的数会挂在「周一」那一格上。密度由这里保证。
+    let agg_wd = focusflow_core::db::queries::aggregate_weekday(&trend_period);
+    let weekday: Vec<(i64, i64)> = (0..7i64)
+        .map(|d| (d, *agg_wd.get(&d).unwrap_or(&0)))
+        .collect();
+    // 每小时分布跟着所选窗口：写死"今天"的时候，顶部选了「近 1 年」而图上念的还是"今日"
+    let hourly = focusflow_core::db::queries::get_hourly_totals(daily_days, None);
     ChartAgg {
         total,
         // 展示值要等统计线程拿到 alltime 缓存与本轮 pending 才能定（apply_display_total）；
@@ -2107,6 +2121,7 @@ fn compute_charts(
         keyboard_total,
         trend,
         trend30: tail30,
+        trend_period,
         hourly,
         weekday,
     }
@@ -2556,6 +2571,104 @@ mod compute_charts_tests {
             chart_window_days(-2),
             7,
             "说不清的周期退回 7 天，与抽出来之前那个 match 一字不差"
+        );
+    }
+
+    /// 三张图读的是同一个窗口，而星期分布必须是固定 7 格。
+    ///
+    /// 后半条是这次改动真正的牙：原先后端交回"只有数据的那几天"，前端按数组下标贴 `WD`
+    /// 标签 —— 窗口一短（今日周期只有 1 天）就会把周四的数挂在「周一」那一格上。
+    /// 旧写法靠"窗口恒 >=30 天"躲过了这件事，所以这条只能在窗口变短之后才照得出来。
+    #[test]
+    fn the_three_charts_share_one_window_and_weekday_is_always_seven_slots() {
+        use chrono::Datelike;
+        let _serial = crate::app_dir_lock();
+        let _app = focusflow_core::paths::test_app_dir("charts_window");
+        let today = chrono::Local::now().date_naive();
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let dk_today = (today - epoch).num_days();
+        {
+            let conn = focusflow_core::db::connection::open_rw(
+                &focusflow_core::paths::year_db_path(today.year()),
+            )
+            .unwrap();
+            focusflow_core::db::connection::ensure_schema(&conn, today.year()).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 400, 0)",
+                [dk_today],
+            )
+            .unwrap();
+            // 两条小时记录：一条在今天、一条在 40 天前 —— 窗口拉不拉宽，差别就在后者
+            for (dk, n) in [(dk_today, 7i64), (dk_today - 40, 3i64)] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO hourly_counts (date_key, hour, count) VALUES ({dk}, 14, {n})"
+                    ),
+                    [],
+                )
+                .unwrap();
+            }
+        }
+        focusflow_core::db::invalidate_years_cache();
+
+        let agg = compute_charts(-1, None, 0);
+        assert_eq!(agg.trend_period.len(), 1, "今日周期的趋势窗口就是一天");
+        assert_eq!(
+            agg.weekday.len(),
+            7,
+            "星期分布必须铺满 7 格，前端才贴得对标签"
+        );
+        let today_slot = today.weekday().num_days_from_monday() as usize;
+        assert!(
+            agg.weekday[today_slot].1 == 400
+                && agg
+                    .weekday
+                    .iter()
+                    .enumerate()
+                    .all(|(i, (_, v))| if i == today_slot { *v == 400 } else { *v == 0 }),
+            "只有今天那一格有数，实得 {:?}",
+            agg.weekday
+        );
+        assert_eq!(agg.hourly[14], 7, "今日窗口只数今天那笔小时记录");
+
+        // 近 60 天：40 天前那笔才进账（这条防的是"每小时永远只数今天"）
+        let wide = compute_charts(60, None, 0);
+        assert_eq!(wide.trend_period.len(), 60, "趋势窗口跟着周期到 60 天");
+        assert_eq!(
+            wide.hourly[14], 10,
+            "近 60 天要含上 40 天前那笔，实得 {}",
+            wide.hourly[14]
+        );
+
+        // 「总计」这一档按近 30 天：与卡片那句「日均(近30天)」同一把尺子，不是全部历史
+        let all = compute_charts(0, None, 0);
+        assert_eq!(all.trend_period.len(), 30, "总计的趋势窗口是近 30 天");
+        assert_eq!(all.hourly[14], 7, "近 30 天里不含 40 天前那笔");
+    }
+
+    /// 接线判据：这三处问的是刚立的那把尺子，不许有人把某一处又写回固定窗口。
+    #[test]
+    fn the_charts_ask_the_one_window_ruler() {
+        let src = include_str!("state.rs");
+        let at = src
+            .find("fn compute_charts(")
+            .expect("compute_charts 找不到了");
+        let body = &src[at..at + src[at..].find("\nfn ").expect("后面没有顶层函数了")];
+        assert!(
+            body.contains("chart_window_days(period_val)"),
+            "周期到天数那把尺子没被用上，说明有人本地又抄了一份 match"
+        );
+        assert!(
+            body.contains("get_hourly_totals(daily_days, None)"),
+            "每小时分布还在问某一天，而不是所选窗口"
+        );
+        assert!(
+            !body.contains("get_hourly_stats(None)"),
+            "写死今日那一问回到了分析页（周报用的那一问不许动）"
+        );
+        assert!(
+            body.contains("aggregate_weekday(&trend_period)"),
+            "星期分布还钉在 tail30 上"
         );
     }
 }

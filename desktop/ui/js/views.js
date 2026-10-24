@@ -583,25 +583,43 @@ function bindRankFilter(s) {
 }
 
 // ===== 活跃分析 =====
-// 趋势 / 小时 / 星期三张图同属「活跃时长」的时间切面，但数据窗口各自固定
-// （趋势 7/30 可切、小时固定今日、星期固定近30天），收进一页做页内切换；
-// 每张图标题自带窗口说明，不再与顶部的统计周期选择器混淆。
+// 趋势 / 小时 / 星期这三张图的窗口跟着顶部周期走（Rust 侧的尺子是 `chart_window_days`：
+// 「总计」按近 30 天算，与卡片那句「日均(近30天)」同一个分母）。趋势图页签上还留着
+// 固定 7 天 / 固定 30 天两档，切到它们时窗口与顶部周期无关 —— 所以标题必须由这里
+// 现算，不能写死。
 
-// 趋势图单独导出：切「近7天/近30天」时只重绘这一张
+// 这三张图当前数的是哪一段：今日周期写「今日」，「总计」写「近30天」而不是「全部历史」
+// （`periodText` 那一套是给排行榜/卡片用的，它对 0 的说法在这里会夸大窗口）。
+function windowText(s) {
+  const p = s && typeof s.period === "number" ? s.period : 7;
+  if (p === -1) return "今日";
+  if (p === 0) return "近30天";
+  return "近" + p + "天";
+}
+
+// 趋势图单独导出：切窗口时只重绘这一张
 export function renderTrendChart(s) {
-  const data = (appState.trendDays === 30 ? s.trend30 : s.trend) || [];
+  const data =
+    (appState.trendDays === 0
+      ? s.trend_period
+      : appState.trendDays === 30
+        ? s.trend30
+        : s.trend) || [];
   const mapped = data.map(([date, value]) => ({ date, value }));
-  lineChart($("trend-chart"), `每日活跃趋势（近${appState.trendDays}天）`, mapped);
+  const label = appState.trendDays === 0 ? windowText(s) : `近${appState.trendDays}天`;
+  lineChart($("trend-chart"), `每日活跃趋势（${label}）`, mapped);
 }
 
 function renderHourlyChart(s) {
   const hourly = s.hourly || [];
-  barChart($("hourly-chart"), "今日每小时活跃", hourly, hourly.map((_, h) => h + "时"));
+  barChart($("hourly-chart"), `${windowText(s)}每小时活跃`, hourly, hourly.map((_, h) => h + "时"));
 }
 
 function renderWeekdayChart(s) {
   const weekday = s.weekday || [];
-  barChart($("weekday-chart"), "近30天星期活跃", weekday.map(([, v]) => v), WD);
+  // 后端交回的是固定 7 格（周一..周日，窗口里没有的那天是 0）：下标与 WD 一一对得上。
+  // 少了这个约定，短窗口（今日周期只有 1 天）就会把周四的数挂在「周一」那一格上。
+  barChart($("weekday-chart"), `${windowText(s)}星期活跃`, weekday.map(([, v]) => v), WD);
 }
 
 // 每日目标与连续打卡条。get_goal_status 要扫近 370 天的按日序列，

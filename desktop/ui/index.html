@@ -54,7 +54,8 @@
       <div id="view-rank"></div>
       <div id="view-apps" style="display:none;"></div>
       <div id="view-devices" style="display:none;"></div>
-      <!-- 活跃分析：页内三视图切换，数据窗口各自固定（见各图标题） -->
+      <!-- 活跃分析：页内四视图切换。小时/星期/趋势默认跟随顶部统计周期
+           （「总计」按近 30 天，与「日均」同一把尺子），趋势图另可切固定 7 天 / 30 天 -->
       <div id="view-analytics" style="display:none;">
         <div id="goal-strip"></div>
         <div class="tabs" id="analytics-tabs" role="tablist" aria-label="分析视图" style="margin-bottom:10px;">
@@ -66,7 +67,8 @@
         <div id="ana-trend">
           <div class="tabs" id="trend-days" role="tablist" aria-label="趋势窗口">
             <span style="color:var(--muted);font-size:13px;">窗口</span>
-            <button class="tab active" data-days="7" role="tab" aria-selected="true">近7天</button>
+            <button class="tab active" data-days="0" role="tab" aria-selected="true">跟随周期</button>
+            <button class="tab" data-days="7" role="tab" aria-selected="false">近7天</button>
             <button class="tab" data-days="30" role="tab" aria-selected="false">近30天</button>
           </div>
           <div id="trend-chart" style="height:300px;margin-top:8px;"></div>

@@ -5,7 +5,7 @@ export const appState = {
   /// 当前可见视图（rank/apps/devices/analytics/plugins/settings）
   currentView: "rank",
   /// 趋势图天数（7/30）
-  trendDays: 7,
+  trendDays: 0,
   /// 最近一次 charts 推送快照
   chartsData: null,
   /// 正在打开的插件名（null=插件列表页）
