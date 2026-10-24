@@ -172,7 +172,17 @@ pub struct RestNotice {
     pub events_in_window: i64,
     /// 建议休息时长（秒），来自 `[rest] rest_seconds`
     pub rest_seconds: i64,
+    /// 这条提醒还"值得被看见"的秒数 —— **所有出口共用这一格**：悬浮窗那条横条、
+    /// 托盘 tooltip 里那一句，都按它消失，不许各自再算一遍（原先横条写死 20 秒，
+    /// 而 `[rest] rest_seconds = 60` 时它念着"活动 60 秒"却只亮 20 秒，两把尺子）。
+    ///
+    /// 与建议时长大致同值，但有个下限（`REST_SHOWN_MIN_SECONDS`）：`rest_seconds`
+    /// 被写成 1 时，一条闪一下的消息等于没说 —— 下限保的是"读得完"，不是"建议更久"。
+    pub shown_seconds: i64,
 }
+
+/// 一条提醒最短可见秒数（见 [`RestNotice::shown_seconds`]）。
+const REST_SHOWN_MIN_SECONDS: i64 = 20;
 
 /// `[rest]` 的参数（越界值一律夹住，别让一句手写的 0 把提醒变成每 tick 一次）。
 struct RestParams {
@@ -268,6 +278,7 @@ impl RestMonitor {
             window_minutes: p.window.as_secs() as i64 / 60,
             events_in_window: events,
             rest_seconds: p.rest_seconds,
+            shown_seconds: p.rest_seconds.max(REST_SHOWN_MIN_SECONDS),
         })
     }
 }
@@ -830,5 +841,40 @@ mod tests {
         assert_eq!(effective_goal(0), 1, "0 会让每一天都算达标");
         assert_eq!(effective_goal(-5), 1, "负数同理，不能被当成「没目标」");
         assert_eq!(effective_goal(20000), 20000, "正常值一字不动");
+    }
+
+    /// 可见时长跟着建议时长走，但有一个下限：提醒不能一闪而过，也不许永远停在 20。
+    ///
+    /// 这一格是悬浮窗那条横条与托盘 tooltip 共用的尺子。原先横条写死 20 秒，
+    /// `[rest] rest_seconds = 60` 时它念着"活动 60 秒"却只亮 20 秒 —— 两句话两把尺子；
+    /// 反过来 `rest_seconds = 5` 时"看得见 5 秒"读不完就等于没说。
+    #[test]
+    fn shown_seconds_follows_the_advice_but_keeps_a_readable_floor() {
+        let fire = |tag: &str, rest_seconds: i64| {
+            let body = format!(
+                "[rest]\nenabled = true\nwindow_minutes = 30\nkey_threshold = 100\n\
+                 cooldown_minutes = 10\nrest_seconds = {rest_seconds}\ncheck_interval = 60\n"
+            );
+            let cfg = cfg_from(tag, &body);
+            let mut m = RestMonitor::default();
+            let t0 = Instant::now();
+            let at = |mins: u64| t0 + Duration::from_secs(mins * 60);
+            let mut last = None;
+            for i in 0..7u64 {
+                last = m.observe(at(i * 5), (i * 100) as i64, &cfg);
+            }
+            last.expect("窗口铺满且事件数过阈值，该发一条")
+        };
+        let short = fire("shown_floor", 5);
+        assert_eq!(short.rest_seconds, 5, "建议那一句要照用户写的说");
+        assert_eq!(
+            short.shown_seconds, 20,
+            "可见时长有下限：一闪而过的提醒读不完"
+        );
+        let long = fire("shown_follow", 60);
+        assert_eq!(
+            long.shown_seconds, 60,
+            "建议 60 秒就该看得见 60 秒，不许还钉在 20"
+        );
     }
 }

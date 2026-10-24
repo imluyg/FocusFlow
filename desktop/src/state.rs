@@ -1784,12 +1784,23 @@ fn spawn_stats_worker(
                         notice.events_in_window,
                         notice.rest_seconds
                     );
+                    // 先挂到托盘读得到的那一份，**再**判窗口在不在眼前：下面两支都要看可见性，
+                    // 而"两支都不成立"正是这条提醒整条无声消失的那一档 —— 面板没开、悬浮窗
+                    // 关掉或隐藏着（渲染进程停着，收了也不会画），用户能拿到的只剩日志里那一句，
+                    // 而日志是这个程序最后才有人翻的地方。托盘是常驻的，理由与启动自检的 ⚠ 计数
+                    // 挂在 tooltip 上那一条相同。
+                    publish_rest_notice(&notice);
                     // 与 stats-live 同一套定向推送：隐藏的窗口渲染进程是停着的
                     if main_visible {
-                        let _ = app.emit_to("main", "rest-reminder", &notice);
+                        // 送不到要点名：`let _ =` 会把"没人收"读成"发成功了"
+                        if let Err(e) = app.emit_to("main", "rest-reminder", &notice) {
+                            tracing::warn!("久坐提醒没能送到主窗口：{e}（托盘那一句还会说）");
+                        }
                     }
                     if floating_visible {
-                        let _ = app.emit_to("floating", "rest-reminder", notice);
+                        if let Err(e) = app.emit_to("floating", "rest-reminder", &notice) {
+                            tracing::warn!("久坐提醒没能送到悬浮窗：{e}（托盘那一句还会说）");
+                        }
                     }
                 }
 
@@ -2104,6 +2115,47 @@ fn compute_charts(
         hourly,
         weekday,
     }
+}
+
+/// 最近一条久坐提醒，与它还"值得再说一遍"的截止时刻（unix 秒；0 = 一条都没有）。
+///
+/// 写者是统计线程，读者是托盘更新线程（每 5 秒一轮）。这两个量必须成对读写：只挂提醒
+/// 不挂截止，托盘就会在半小时后继续念一条早就不成立的建议；只挂截止不挂提醒则什么也说不出。
+static REST_NOTICE: Mutex<Option<focusflow_core::stats::RestNotice>> = Mutex::new(None);
+static REST_NOTICE_UNTIL: AtomicI64 = AtomicI64::new(0);
+
+/// 现在这一刻，这条提醒还算不算"眼前的话"。
+///
+/// 抽成纯函数是为了能把边界钉死（截止那一秒起就不许再说），`until = 0` 是"从来没有过"，
+/// 与"曾经有过但已过期"同样交回 false，但两者都不该让托盘念旧账。
+fn rest_is_fresh(now: i64, until: i64) -> bool {
+    until > 0 && now < until
+}
+
+/// 统计线程发出一条提醒时先调这个：把提醒和它的可见时长挂到托盘读得到的地方。
+///
+/// 挂在可见性判断**之前**，见调用处那段 —— 这一步是整个"送达"里唯一不依赖窗口的一支。
+fn publish_rest_notice(notice: &focusflow_core::stats::RestNotice) {
+    let secs = notice.shown_seconds.max(0);
+    // 先挂截止再挂内容：反过来的话中间那一拍读者会拿到"旧内容 + 新截止"，
+    // 念的是上一条提醒却说不出它早该消失。
+    REST_NOTICE_UNTIL.store(
+        chrono::Local::now().timestamp().saturating_add(secs),
+        Ordering::SeqCst,
+    );
+    *REST_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(notice.clone());
+}
+
+/// 托盘要念的那一条：过期或没有都交回 `None`（不许念旧账）。
+pub(crate) fn rest_notice_now() -> Option<focusflow_core::stats::RestNotice> {
+    let until = REST_NOTICE_UNTIL.load(Ordering::SeqCst);
+    if !rest_is_fresh(chrono::Local::now().timestamp(), until) {
+        return None;
+    }
+    REST_NOTICE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 #[cfg(test)]
@@ -2946,6 +2998,87 @@ mod visibility_wiring {
         assert!(
             body.contains("|| main_just_shown") && body.contains("let do_heavy"),
             "呼出主窗口没顺带做一次重聚合"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rest_delivery_tests {
+    use super::rest_is_fresh;
+
+    /// 到点就不该再念：`until = 0` 是"从来没有过"，`now >= until` 是"说过就完了"。
+    #[test]
+    fn a_rest_notice_stops_being_fresh_at_its_deadline() {
+        assert!(!rest_is_fresh(100, 0), "一条都没有时不许编出一句提醒");
+        assert!(rest_is_fresh(99, 100), "还在有效期内就该说得出");
+        assert!(!rest_is_fresh(100, 100), "到期的那一秒起就不再是眼前的话");
+        assert!(!rest_is_fresh(101, 100), "过期之后一律不再念旧账");
+    }
+
+    /// 接线判据：提醒要**先**挂进托盘读得到的那一份，再走到"窗口在不在眼前"那两支。
+    ///
+    /// 这条的病症是无声的：面板没开、悬浮窗关掉或藏着时，旧写法只剩日志里一行
+    /// 「建议休息」。牙不在屏幕上（headless 起不来窗口），在**顺序**上 ——
+    /// 把挂载那一步挪进 `if main_visible` 里面，屏幕上一切照旧、等于没修。
+    #[test]
+    fn the_notice_is_parked_before_the_visibility_branches() {
+        let src = include_str!("state.rs");
+        let at = src.find("fn spawn_stats_worker").expect("统计线程找不到了");
+        let body = &src[at..at + src[at..].find("\nfn ").expect("统计线程后面没有顶层函数了")];
+        // 判据要落在**提醒这一块之内**：整段线程体里 `if main_visible` 出现过好几处，
+        // 光比"publish 排在 emit 前面"的话，把挂载挪进 `if main_visible {` 里面照样满足
+        // —— 探针实测过：那样这条守卫仍然绿，而那时两扇窗都不在眼前，提醒又只剩一行日志。
+        let block_at = body
+            .find("if let Some(notice) = rest_monitor.observe(")
+            .expect("久坐提醒那一块找不到了");
+        let block = &body[block_at..];
+        let parked = block
+            .find("publish_rest_notice(&notice)")
+            .expect("提醒没有挂到托盘读得到的那一份");
+        let gated = block.find("if main_visible").expect("可见性那一问不见了");
+        assert!(
+            parked < gated,
+            "挂载落进了可见性分支里面：面板与悬浮窗都不在眼前时，这条提醒只剩一行日志"
+        );
+        assert_eq!(
+            block.match_indices("publish_rest_notice(&notice)").count(),
+            1,
+            "挂载只能有一处：多出来的那些等于把它塞进了某个分支里补做"
+        );
+        for label in ["main", "floating"] {
+            let needle = format!(r#"emit_to("{label}", "rest-reminder""#);
+            let sent = block.find(&needle).expect("久坐提醒的定向推送不见了");
+            assert!(parked < sent, "必须先挂托盘、再判{label}在不在眼前");
+        }
+        // "没人收"不许折成"发成功了"
+        assert!(
+            !body.contains(r#"let _ = app.emit_to("main", "rest-reminder""#),
+            "主窗口那一支又把失败咽回去了"
+        );
+        assert!(body.contains("久坐提醒没能送到主窗口"), "送到失败要点名");
+        assert!(body.contains("久坐提醒没能送到悬浮窗"), "两支各说各的");
+    }
+
+    /// 可见时长的算式只许在 core 那一处（托盘与悬浮窗读同一格）。
+    #[test]
+    fn the_visible_window_is_spoken_once() {
+        let core = include_str!("../../crates/core/src/stats.rs");
+        let at = core.find("pub struct RestNotice").expect("载荷找不到了");
+        let body = &core[at..core
+            .find("const REST_SHOWN_MIN_SECONDS")
+            .expect("下限常量不见了")];
+        assert!(
+            body.contains("pub shown_seconds: i64"),
+            "载荷里没有那一格，两个出口就只能各算各的"
+        );
+        let js = include_str!("../ui/floating.js");
+        assert!(
+            js.contains("n.shown_seconds"),
+            "悬浮窗那条横条还在自己算存活时长"
+        );
+        assert!(
+            !js.contains("}, 20000)"),
+            "写死的 20 秒回来了：建议 60 秒时它念着 60 秒却只亮 20 秒"
         );
     }
 }

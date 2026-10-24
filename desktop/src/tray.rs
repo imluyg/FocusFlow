@@ -31,6 +31,15 @@ static LAST_PAUSED: AtomicBool = AtomicBool::new(false);
 static ICON_FAILURE_NOTED: AtomicBool = AtomicBool::new(false);
 /// 托盘更新是否进行中（防止 set_tooltip/set_icon 卡住时下一轮再抢锁）
 static UPDATING: AtomicBool = AtomicBool::new(false);
+/// 托盘上**已经确认写上去了**的那句 tooltip（"已认领"，不是"这一轮想写的"）。
+///
+/// 与 `LAST_PAUSED` 同一族规矩：只有那次 `set_tooltip` 真成功才推进，失败的一拍留着
+/// 旧值、下一轮自动重写。原先这里是 `let _ = tray.set_tooltip(...)` —— 写没写上没人知道，
+/// 于是"今日数字停在十分钟前"与"刚刚更新过"在界面上长得一样，而 tooltip 恰恰是这个
+/// 常驻程序唯一会在屏的那几行字。
+static TOOLTIP_ACKED: Mutex<Option<String>> = Mutex::new(None);
+/// tooltip 写失败已经报过没有（报一次就够，5 秒一条会把日志刷成噪声）
+static TOOLTIP_FAILURE_NOTED: AtomicBool = AtomicBool::new(false);
 
 /// 一次"把暂停状态换成托盘图标"的尝试结果。
 #[derive(Debug, PartialEq, Eq)]
@@ -62,6 +71,48 @@ fn apply_pause_icon(
     match set(paused) {
         Ok(()) => IconRound::Done,
         Err(why) => IconRound::Failed(why),
+    }
+}
+
+/// 一次"把 tooltip 换成这一轮想说的话"的尝试结果 —— 形状与 [`IconRound`] 同一族。
+#[derive(Debug, PartialEq, Eq)]
+enum TextRound {
+    /// 屏上已经是这一句，什么都不用做
+    Nothing,
+    /// 那次调用成功了，这一句才允许被认领下来
+    Done,
+    /// 没换成（托盘没建出来，或那次 COM 调用回错），原因原样带回去
+    Failed(String),
+}
+
+/// 把"换 tooltip"这一步抽出来的唯一目的：**认领排在这次调用成功之后**。
+///
+/// `set` 就是那次真的写 tooltip 的调用，不会假装成功。这一句在这个程序里是"今天到现在
+/// 记了多少"唯一的常驻读数，而它每 5 秒被整段重算一次：内容没变时不必再调一次 COM
+/// （白跑），内容变了却没换成时必须**不**推进 `TOOLTIP_ACKED`，让下一拍自己补回来 ——
+/// 原先 `let _ =` 直接把这两件事都抹平成"看起来一直在更新"。
+fn apply_tooltip_text(
+    acked: Option<&str>,
+    want: &str,
+    set: &mut dyn FnMut(&str) -> Result<(), String>,
+) -> TextRound {
+    if acked == Some(want) {
+        return TextRound::Nothing;
+    }
+    match set(want) {
+        Ok(()) => TextRound::Done,
+        Err(why) => TextRound::Failed(why),
+    }
+}
+
+/// 托盘 tooltip 上那一句久坐提醒（没有提醒时交回空串，整句照常）。
+///
+/// 只说"该活动几秒"这一件事：窗口数、建议时长都在悬浮窗/面板那两处，tooltip 的位置
+/// 本来就挤（今日、速度、活跃时长、已暂停、自检异常已经占了五段）。
+fn rest_segment(notice: Option<&focusflow_core::stats::RestNotice>) -> String {
+    match notice {
+        Some(n) => format!(" · ⚠ 久坐，建议活动 {} 秒", n.rest_seconds),
+        None => String::new(),
     }
 }
 
@@ -162,13 +213,18 @@ fn spawn_tray_updater(app: &App, paused_icon: tauri::image::Image<'static>) {
                 } else {
                     String::new()
                 };
+                // 久坐提醒那一句：面板与悬浮窗都不在眼前时，托盘是唯一还会说话的出口。
+                // "还在不在有效期"这一问只由 `rest_notice_now()` 答一次（过期就不交回来），
+                // 这里不许再判一遍时间 —— 两处各判就会有两把尺子。
+                let rest_str = rest_segment(crate::state::rest_notice_now().as_ref());
                 let tooltip = format!(
-                    "FocusFlow - 今日 {} · 速度 {}/分{}{}{}",
+                    "FocusFlow - 今日 {} · 速度 {}/分{}{}{}{}",
                     s.today_count,
                     s.cpm,
                     active_str,
                     if paused { " · 已暂停" } else { "" },
                     check_str,
+                    rest_str,
                 );
                 (
                     tooltip,
@@ -179,7 +235,34 @@ fn spawn_tray_updater(app: &App, paused_icon: tauri::image::Image<'static>) {
             };
 
             if let Some(tray) = tray {
-                let _ = tray.set_tooltip(Some(&tooltip));
+                // 先读「屏上已经确认是哪一句」，**不**在这里把它消费掉（与图标那一问同规矩）：
+                // 没换成就不推进 `TOOLTIP_ACKED`，下一拍（5 秒后）自己补回来，
+                // 而不是等用户再开关一回什么才重画。出声只出一次（`TOOLTIP_FAILURE_NOTED`）。
+                let text_acked = TOOLTIP_ACKED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let text_round = apply_tooltip_text(
+                    text_acked.as_deref(),
+                    &tooltip,
+                    &mut |t| tray.set_tooltip(Some(t)).map_err(|e| e.to_string()),
+                );
+                match text_round {
+                    TextRound::Done => {
+                        *TOOLTIP_ACKED.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(tooltip.clone());
+                        TOOLTIP_FAILURE_NOTED.store(false, Ordering::SeqCst);
+                    }
+                    TextRound::Failed(why) => {
+                        if !TOOLTIP_FAILURE_NOTED.swap(true, Ordering::SeqCst) {
+                            tracing::warn!(
+                                "托盘那句读数没换成（{why}）：不认领这次的内容，\
+                                 下一拍还会再试（同样的失败不再重复报）"
+                            );
+                        }
+                    }
+                    TextRound::Nothing => {}
+                }
                 // 这次调用没成就**不**推进 `LAST_PAUSED`：下一拍（5 秒后）会自己再试一次，
                 // 而不是等用户再开关一回暂停。出声也只出一次（`ICON_FAILURE_NOTED`）。
                 let round = apply_pause_icon(acked, paused, &mut |p| {
@@ -376,6 +459,58 @@ mod tests {
             wrong.is_empty(),
             "托盘更新的接线守卫红:\n{}",
             wrong.join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod rest_tooltip_tests {
+    use super::{apply_tooltip_text, rest_segment, TextRound};
+    use std::cell::Cell;
+
+    /// 没有活的提醒时那一段必须是空串：前五段照旧，不许拖出一个「 · 」的尾巴。
+    #[test]
+    fn the_rest_segment_only_appears_while_a_notice_is_live() {
+        assert_eq!(rest_segment(None), "", "没有提醒时不该留下分隔符");
+        let n = focusflow_core::stats::RestNotice {
+            window_minutes: 30,
+            events_in_window: 1200,
+            rest_seconds: 45,
+            shown_seconds: 45,
+        };
+        let line = rest_segment(Some(&n));
+        assert!(
+            line.starts_with(" · "),
+            "与前几段同一个分隔写法，实得：{line}"
+        );
+        assert!(line.contains("45 秒"), "要说得出该活动几秒，实得：{line}");
+    }
+
+    /// 「写了」不等于「屏上是这句」：只有那次调用成功才允许认领；内容没变不许白跑一次 COM。
+    #[test]
+    fn the_tooltip_is_acked_only_after_the_call_succeeded() {
+        let calls = Cell::new(0usize);
+        let round = apply_tooltip_text(Some("今日 10"), "今日 10", &mut |t| {
+            calls.set(calls.get() + 1);
+            let _ = t;
+            Ok(())
+        });
+        assert_eq!(round, TextRound::Nothing, "内容没变不必再写一遍");
+        assert_eq!(calls.get(), 0, "Nothing 那一支连调用都不该发生");
+        assert_eq!(
+            apply_tooltip_text(Some("今日 10"), "今日 11", &mut |_| Ok(())),
+            TextRound::Done,
+            "换了句子且写成 ⇒ 这一句才可以被认领下来"
+        );
+        assert_eq!(
+            apply_tooltip_text(None, "今日 12", &mut |_| Err("托盘还没建出来".to_string())),
+            TextRound::Failed("托盘还没建出来".to_string()),
+            "没写成必须把原因原样交回，绝不能算成 Done"
+        );
+        assert_eq!(
+            apply_tooltip_text(None, "", &mut |_| Ok(())),
+            TextRound::Done,
+            "从没认领过（acked=None）而这一句是空串 ⇒ 仍要真去写一次"
         );
     }
 }

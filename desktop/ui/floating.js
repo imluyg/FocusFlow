@@ -155,9 +155,13 @@ function apply(s) {
       el.textContent = `久坐提醒：已连用 ${Number(n.window_minutes) || 0} 分钟，起来活动 ${Number(n.rest_seconds) || 0} 秒`;
       el.style.display = "";
       clearTimeout(el._hide);
+      // 存活时长由 core 那一格说一遍（`RestNotice.shown_seconds` = 建议时长，带可读下限）：
+      // 原先这里写死 20 秒，于是 `[rest] rest_seconds = 60` 时条上念着"活动 60 秒"、
+      // 20 秒就消失 —— 同一句话两处尺子。兜底的 20 只给缺这一格的老载荷用。
+      const shown = Number(n.shown_seconds) > 0 ? Number(n.shown_seconds) : 20;
       el._hide = setTimeout(() => {
         el.style.display = "none";
-      }, 20000);
+      }, shown * 1000);
     });
   } catch (e) {}
   // 主题跟随主窗口：设置页切暗色时广播 theme-changed，悬浮窗实时切换（原需重启）
