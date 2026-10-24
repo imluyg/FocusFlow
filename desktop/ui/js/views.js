@@ -976,6 +976,111 @@ async function onBackupIntervalChange(e) {
   rememberSetting({ backup_online_hours: Number(e.target.value) });
 }
 
+// ===== 高级设置 =====
+// 这一页的行 = 名称 + 说明两样，其余全由后端那一格给：`s.adv["段.键"]` 里的
+// `value`（已经是规范值，布尔就是 "true"/"false"）、`kind`（该画什么控件）、
+// `live`（改完什么时候生效）。这里**不写默认值、不写控件类型、不写要不要重启** ——
+// 那些都在 `desktop/src/commands.rs` 的 `EXPOSED_SETTINGS` 里，两边各存一份就会出现
+// "界面说立即生效、其实要重启"，而这一族是本仓修得最多的一类缺陷。
+// 行集合与那张表由 `the_advanced_rows_and_the_rust_caliper_agree` 双向钉住。
+const ADV = [
+  ["listener.ignore_modifier_keys", "不单独统计修饰键", "单独按下 Ctrl / Alt / Shift / Win 不计一次活跃；与它们组合出来的键照常计。"],
+  ["listener.ignore_function_keys", "不统计功能键", "F1–F24 不计入活跃次数。"],
+  ["listener.ignore_key_repeat", "长按只算一次", "开着时长按同一个键只按按下那一次计；关掉则按住期间的自动重复也计次。"],
+  ["listener.key_repeat_stale_seconds", "长按判定秒数", "同一个键按下后超过这么久还在重复，就当成又在长按，后面的重复不再计数。"],
+  ["listener.mouse_enabled", "统计鼠标", "关掉后鼠标点击与滚轮都不计入，键盘照常。已经记下的历史不会重算。"],
+  ["listener.scroll_burst_window", "滚轮合并窗口（秒）", "从上次计数起这么久之内、同一方向的连续滚动合并成一批；一批计多少由那条消息里的格数定。"],
+  ["device_stats.enabled", "统计每台键鼠", "关掉后不再按设备分别计数（历史保留）。这一路走的是 Raw Input 侧信道，与「键鼠排行」是两套口径。"],
+  ["app_stats.enabled", "统计前台应用", "关掉后不再记录哪个程序在前台，应用排行从此不再增长（历史保留）。"],
+  ["app_stats.exclude", "不记录的应用", "逗号分隔的可执行文件名（如 chrome.exe, code.exe）：命中的进程完全不记录。这是那条隐私保险丝 —— 它管的是“要不要记录”，对你自己手动截下来的屏幕像素无效。"],
+  ["rest.enabled", "久坐提醒", "连续用满一个窗口、且事件数过阈值时催一下。面板、悬浮窗、托盘三个出口都会说。"],
+  ["rest.window_minutes", "久坐判定窗口（分钟）", "要连续多久才算久坐。"],
+  ["rest.key_threshold", "窗口内事件阈值", "这个窗口里至少这么多键鼠事件才提醒 —— 只是挂着不动不算。"],
+  ["rest.cooldown_minutes", "两次提醒的间隔（分钟）", "催过一次之后，这么久之内不再催第二遍。"],
+  ["rest.rest_seconds", "建议活动秒数", "提醒里那句「起来活动 N 秒」，也是这条提醒还能被看见的时长（最短 20 秒）。"],
+  ["rest.check_interval", "检查间隔（秒）", "判定多久跑一次。"],
+  ["gui.active_refresh_interval", "打字时图表刷新（秒）", "主窗口开着、且你在动的时候，统计图多久重算一次。"],
+  ["gui.full_refresh_interval", "空闲时图表刷新（秒）", "主窗口开着但没动静时的刷新间隔；窗口隐藏时重聚合完全停掉。"],
+  ["gui.unload_hidden", "隐藏后卸载页面", "主窗口隐藏够久就把渲染进程卸掉（省下几百 MB）；关掉就一直留着。"],
+  ["gui.unload_hidden_delay", "卸载等待（秒）", "隐藏多久之后才卸。"],
+  ["gui.start_to_tray", "启动后进托盘", "开机后不弹主界面，只在托盘里待着。想“启动就看得见”就关掉它。开机自启是另一个开关，在「常规」那一页。"],
+  ["database.max_backups", "最近份数", "备份轮转里「最近 N 份全留」那一档的 N；每天 / 每周 / 每月还各另留一份。"],
+  ["database.backup_disabled_plugins", "连停用插件的数据一起备份", "默认不备：插件停用之后它的库不再被写，备了只占轮转名额。"],
+  ["database.auto_vacuum_days", "自动压缩间隔（天）", "每隔几天自动做一次数据库压缩。"],
+];
+
+function advId(k) {
+  return "ff-adv-" + k.replace(".", "_");
+}
+
+function advEntry(s, k) {
+  return (s && s.adv && s.adv[k]) || { value: "", kind: "text", live: "" };
+}
+
+function advCtl(s, k) {
+  const e = advEntry(s, k);
+  const id = advId(k);
+  if (e.kind === "switch") {
+    // 值已由后端用 `get_bool` 归一（`= 1` / `yes` / `on` 都会变成 "true"），
+    // 这里只许比字面量，不许再拿原始字符串猜一次
+    return `<input type="checkbox" class="sw" id="${id}"${e.value === "true" ? " checked" : ""}>`;
+  }
+  const type = e.kind === "int" || e.kind === "float" ? "number" : "text";
+  return `<input type="${type}" class="ff-in" id="${id}" value="${escapeHtml(String(e.value))}">`;
+}
+
+async function onAdvChange(k) {
+  const el = $(advId(k));
+  if (!el) return;
+  const e = advEntry(settingsUI.data, k);
+  const dot = k.indexOf(".");
+  const section = k.slice(0, dot);
+  const key = k.slice(dot + 1);
+  const value = el.type === "checkbox" ? (el.checked ? "true" : "false") : String(el.value).trim();
+  const label = (ADV.find((a) => a[0] === k) || [k, k])[1];
+  // 数字那一类先挡在门口：非法串交给 core 会被 `get_int` 折成默认值，
+  // 于是"我明明填了字，它把我的数换成默认值还报成功"。
+  if (e.kind === "int" && !/^-?\d+$/.test(value)) {
+    setMsg(`「${label}」要的是整数，刚才填的「${value || "（空）"}」没有写进去`, "var(--danger)");
+    await renderSettings();
+    return;
+  }
+  if (e.kind === "float" && !/^\d+(\.\d+)?$/.test(value)) {
+    setMsg(`「${label}」要的是小数（如 0.25），刚才填的「${value || "（空）"}」没有写进去`, "var(--danger)");
+    await renderSettings();
+    return;
+  }
+  try {
+    await invoke("set_config", { section, key, value });
+  } catch (err) {
+    setMsg(`「${label}」没有写上：` + err, "var(--danger)");
+    await renderSettings();
+    return;
+  }
+  // 一律重读现场：`set_config` 返回成功只代表写进了内存，真正落盘的是 300ms 之后的
+  // 去抖那一轮（它失败会由页面顶部那条黄字常驻说明），而"要不要重启"由后端那一格说。
+  await renderSettings();
+}
+
+function advRows(keys) {
+  return keys.map((k) => ({
+    t: "raw",
+    id: advId(k),
+    name: (ADV.find((a) => a[0] === k) || [k, k])[1],
+    ctl: (s) => advCtl(s, k),
+    bind: () => {
+      const el = $(advId(k));
+      if (el) el.addEventListener("change", () => onAdvChange(k));
+    },
+    // 生效时机由后端那一格给，界面不许自己判"这个键要不要重启"
+    desc: (s) => {
+      const item = ADV.find((a) => a[0] === k) || [];
+      const e = advEntry(s, k);
+      return item[2] + (e.live ? " " + e.live + "。" : "");
+    },
+  }));
+}
+
 const SETTINGS_CATS = [
   {
     id: "general",
@@ -1188,6 +1293,57 @@ const SETTINGS_CATS = [
             desc: "马上对当前各类库各存一份快照。",
           },
         ],
+      },
+    ],
+  },
+  {
+    id: "advanced",
+    cap: "应用",
+    label: "高级",
+    icon: "⚙",
+    cards: [
+      {
+        title: "统计口径",
+        rows: advRows([
+          "listener.ignore_modifier_keys",
+          "listener.ignore_function_keys",
+          "listener.ignore_key_repeat",
+          "listener.key_repeat_stale_seconds",
+          "listener.mouse_enabled",
+          "listener.scroll_burst_window",
+          "device_stats.enabled",
+          "app_stats.enabled",
+          "app_stats.exclude",
+        ]),
+      },
+      {
+        title: "久坐提醒",
+        rows: advRows([
+          "rest.enabled",
+          "rest.window_minutes",
+          "rest.key_threshold",
+          "rest.cooldown_minutes",
+          "rest.rest_seconds",
+          "rest.check_interval",
+        ]),
+      },
+      {
+        title: "界面与刷新",
+        rows: advRows([
+          "gui.active_refresh_interval",
+          "gui.full_refresh_interval",
+          "gui.unload_hidden",
+          "gui.unload_hidden_delay",
+          "gui.start_to_tray",
+        ]),
+      },
+      {
+        title: "备份与维护",
+        rows: advRows([
+          "database.max_backups",
+          "database.backup_disabled_plugins",
+          "database.auto_vacuum_days",
+        ]),
       },
     ],
   },

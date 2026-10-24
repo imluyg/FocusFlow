@@ -93,6 +93,7 @@ HARNESSES="
 .scratch/run_chart_axis_harness.sh|CHART_AXIS_HARNESS_OK
 .scratch/run_cleanup_harness.sh|CLEANUP_HARNESS_OK
 .scratch/run_analysis_window_harness.sh|ANALYSIS_WINDOW_HARNESS_OK
+.scratch/run_advanced_settings_harness.sh|ADVANCED_SETTINGS_HARNESS_OK
 "
 harness_ran=0
 for entry in $HARNESSES; do

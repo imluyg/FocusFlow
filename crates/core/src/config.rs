@@ -732,9 +732,12 @@ impl FocusFlowConfig {
 
     /// 把文件里「不是本进程改的、却与内存不同」的值采纳进内存与快照，返回项名清单。
     ///
-    /// 这一步防的是**静默销毁用户手写的那一行**：`[app_stats] exclude`（隐私保险丝）、
-    /// `[rest] *`、`[stats] cpm_window`、`[device_stats] enabled` 这些键都没有界面入口，
+    /// 这一步防的是**静默销毁用户手写的那一行**：`[scheduler] allow_extra`、
+    /// `[stats] cpm_window`、`[database] flush_interval`、`[plugins] memory_limit_mb` /
+    /// `instruction_limit`、`[gui] floating_metric`、`[pomodoro] *` 这些键仍然没有界面入口，
     /// 手改 config.ini 是唯一的写法，而程序常驻后台 ⇒ 用户永远是在"程序运行中"改的。
+    /// （`[rest] *`、`[app_stats] exclude`、`[device_stats] enabled` 从前也在这份名单里，
+    /// 现在「设置 → 高级」那一页能改了 —— 但这一句话对剩下这些键一直成立。）
     /// 旧写法里 `serialize_preserving_structure` 对"文件与内存都有这个键"一律写内存值
     /// （那是启动时读进来的快照），于是退出前那次强制 save 把他刚改的那一行盖回旧值，
     /// 一行日志都没有 —— `app_stats.rs` 与 `stats.rs` 注释里"改文件立刻生效"那句
@@ -1189,11 +1192,14 @@ mod tests {
 
     /// 程序运行期间用户手改 config.ini 的那一行，绝不能被下一次落盘盖掉。
     ///
-    /// `[app_stats] exclude`（隐私保险丝）、`[rest] *`、`[stats] cpm_window`、
-    /// `[device_stats] enabled` 都没有界面入口，手改文件是唯一写法，而程序是常驻后台的
+    /// `[scheduler] allow_extra`、`[stats] cpm_window`、`[database] flush_interval`、
+    /// `[plugins] *`、`[gui] floating_metric`、`[pomodoro] *` 都还没有界面入口，
+    /// 手改文件是唯一写法，而程序是常驻后台的
     /// ⇒ 他永远是在"运行中"改的。旧写法对"文件与内存都有这个键"一律写内存值（启动时
     /// 那份快照），退出前的强制 save 就把那一行还原了，一行日志都没有 ——
     /// `app_stats.rs`/`stats.rs` 注释里"改文件立刻生效"因此从来没成立过。
+    /// （`[rest] *`、`[app_stats] exclude`、`[device_stats] enabled` 这几个从前也在名单里，
+    /// 现在设置页能改了；这条用例保护的仍然是"任何手改的行都不许被盖掉"。）
     #[test]
     fn an_external_edit_survives_the_next_save() {
         let _lock = crate::paths::test_app_dir_lock();

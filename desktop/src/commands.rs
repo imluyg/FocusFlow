@@ -82,6 +82,10 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
         // 只在文件系统里（`[gui]`/`[plugins]` 都没有它的记账位）。所以在资源管理器里
         // 手动删掉 FocusFlow.lnk，设置页下一帧就会跟着变成未启用，而不是停在最后一次勾。
         "autostart_enabled": focusflow_core::autostart::is_autostart_enabled(),
+        // 「高级设置」那一页的全部行：值、控件类型、什么时候生效都由这一侧交出。
+        // 界面不许再解析 config.ini，也不许自己判断某个键要不要重启 —— 那正是
+        // "改了没生效也没人告诉你"的成因。
+        "adv": exposed_settings_json(c),
     })
 }
 
@@ -1006,6 +1010,253 @@ pub async fn cleanup_data(
     .map_err(|e| e.to_string())?
 }
 
+/// 一条设置「改完之后什么时候才生效」。**这句话由 Rust 说一遍**，界面只负责把它贴上去 ——
+/// 让 JS 自己打一份，就是本仓记过最多次的「同一个开关两处口径」，而它的病症是
+/// 「用户改了、界面也说改好了、重启才发现一直没生效」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Live {
+    /// 下一次读它的地方就生效（读者每 tick / 每一次动作重读配置）
+    Hot,
+    /// 下一次隐藏主窗口起效（读点在 `arm_main_unload` 里）
+    NextHide,
+    /// 要重启程序（读点只在启动时跑一次）
+    Restart,
+}
+
+impl Live {
+    fn label(self) -> &'static str {
+        match self {
+            Live::Hot => "改完立即生效",
+            Live::NextHide => "下一次隐藏主窗口起效",
+            Live::Restart => "重启程序后生效",
+        }
+    }
+}
+
+/// 控件类型。也由这一侧说出：界面不许自己猜"这个键是不是布尔"。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Switch,
+    Int,
+    Float,
+    Text,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Switch => "switch",
+            Kind::Int => "int",
+            Kind::Float => "float",
+            Kind::Text => "text",
+        }
+    }
+}
+
+/// 高级设置里的一个可调项。
+struct Exposed {
+    section: &'static str,
+    key: &'static str,
+    kind: Kind,
+    live: Live,
+}
+
+/// 「高级设置」这一页的**唯一**清单。
+///
+/// 每一行的 `live` 都对着它的读者核过（写在每行后面那个标注里），不是按"看起来像不像热配置"猜的。
+///
+/// 这一批**故意不暴露**的键，是决定不是漏：
+/// - `[database] flush_interval`：它调的是崩溃时最多丢多少秒统计，挨着一个「保存」按钮摆
+///   就等于请人把它调大；
+/// - `[plugins] memory_limit_mb` / `instruction_limit`：`manager.rs` 自己写着一个笔误会让
+///   所有插件在第 1 条指令就停摆，而症状看着像"插件自己坏了"；
+/// - `[database] yearly_archive`：关掉它之后跨库查询的假设就不成立了；
+/// - `[stats] cpm_window`：`OnceLock`，本进程第一次读之后改不动，界面上无论怎么写都得说
+///   "重启"，而它只影响那个「速度」卡片；
+/// - `[gui] default_period`：顶部周期标签页每切一次就在写它（`main.js`），再加一个入口
+///   就是「同一开关两处口径」；
+/// - `[paths] data_home`：保留现在那个选目录的按钮（它还要顺带搬数据）；
+/// - `[pomodoro] *`：读点在计时器创建时，改了要停用再启用番茄钟才生效 —— 那句话属于插件页，
+///   放进这一页会让人以为动一下数字就走。
+const EXPOSED_SETTINGS: &[Exposed] = &[
+    // —— 采集口径：读者是 `listener::ListenerCfg::reload`，`set_config` 里那一步会立刻刷新原子量
+    Exposed {
+        section: "listener",
+        key: "ignore_modifier_keys",
+        kind: Kind::Switch,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "listener",
+        key: "ignore_function_keys",
+        kind: Kind::Switch,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "listener",
+        key: "ignore_key_repeat",
+        kind: Kind::Switch,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "listener",
+        key: "key_repeat_stale_seconds",
+        kind: Kind::Int,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "listener",
+        key: "mouse_enabled",
+        kind: Kind::Switch,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "listener",
+        key: "scroll_burst_window",
+        kind: Kind::Float,
+        live: Live::Hot,
+    },
+    // —— 久坐提醒：`RestMonitor::observe` 每 tick 重读一份 `[rest]`
+    Exposed {
+        section: "rest",
+        key: "enabled",
+        kind: Kind::Switch,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "rest",
+        key: "window_minutes",
+        kind: Kind::Int,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "rest",
+        key: "key_threshold",
+        kind: Kind::Int,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "rest",
+        key: "cooldown_minutes",
+        kind: Kind::Int,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "rest",
+        key: "rest_seconds",
+        kind: Kind::Int,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "rest",
+        key: "check_interval",
+        kind: Kind::Int,
+        live: Live::Hot,
+    },
+    // —— 图表节奏：统计线程每一轮各读一次（`state.rs` 的 2s / 10s 那两个表达式）
+    Exposed {
+        section: "gui",
+        key: "active_refresh_interval",
+        kind: Kind::Int,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "gui",
+        key: "full_refresh_interval",
+        kind: Kind::Int,
+        live: Live::Hot,
+    },
+    // —— 备份：每一次备份开始时才读
+    Exposed {
+        section: "database",
+        key: "max_backups",
+        kind: Kind::Int,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "database",
+        key: "backup_disabled_plugins",
+        kind: Kind::Switch,
+        live: Live::Hot,
+    },
+    // —— 应用统计：每个采样 tick 重读（`exclude` 就是那条隐私保险丝）
+    Exposed {
+        section: "app_stats",
+        key: "enabled",
+        kind: Kind::Switch,
+        live: Live::Hot,
+    },
+    Exposed {
+        section: "app_stats",
+        key: "exclude",
+        kind: Kind::Text,
+        live: Live::Hot,
+    },
+    // —— 主窗口卸载：读点在"隐藏"那一步里
+    Exposed {
+        section: "gui",
+        key: "unload_hidden",
+        kind: Kind::Switch,
+        live: Live::NextHide,
+    },
+    Exposed {
+        section: "gui",
+        key: "unload_hidden_delay",
+        kind: Kind::Int,
+        live: Live::NextHide,
+    },
+    // —— 只在启动时读一次
+    Exposed {
+        section: "gui",
+        key: "start_to_tray",
+        kind: Kind::Switch,
+        live: Live::Restart,
+    },
+    Exposed {
+        section: "database",
+        key: "auto_vacuum_days",
+        kind: Kind::Int,
+        live: Live::Restart,
+    },
+    Exposed {
+        section: "device_stats",
+        key: "enabled",
+        kind: Kind::Switch,
+        live: Live::Restart,
+    },
+];
+
+/// 高级设置那一页要的全部东西：值、控件类型、什么时候生效。
+///
+/// 默认值不在这张表里重抄一遍 —— 问的就是 `config::default_config()`，与程序自己种进
+/// `config.ini` 的那份同一个来源（这里再写一份，就会出现"界面显示的默认值与真实默认值
+/// 不是一个数"）。
+fn exposed_settings_json(c: &focusflow_core::config::FocusFlowConfig) -> serde_json::Value {
+    let defaults = focusflow_core::config::default_config();
+    let mut map = serde_json::Map::new();
+    for e in EXPOSED_SETTINGS {
+        let d = defaults
+            .get(e.section)
+            .and_then(|s| s.get(e.key))
+            .cloned()
+            .unwrap_or_default();
+        let value = match e.kind {
+            // 布尔一律走 `get_bool`：手改 config.ini 写成 `= 1` / `yes` / `on` 时功能确实
+            // 是开的（读者就是 `get_bool`），拿字符串比 "==true" 就会画出一个灭勾 ——
+            // 与本函数顶上那段关于 hotkey/floating 的注释是同一条口径。
+            Kind::Switch => c
+                .get_bool(e.section, e.key, d.parse::<bool>().unwrap_or(false))
+                .to_string(),
+            Kind::Int | Kind::Float | Kind::Text => c.get_or(e.section, e.key, &d),
+        };
+        map.insert(
+            format!("{}.{}", e.section, e.key),
+            serde_json::json!({ "value": value, "kind": e.kind.name(), "live": e.live.label() }),
+        );
+    }
+    serde_json::Value::Object(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1755,5 +2006,138 @@ mod cleanup_wiring {
             js.contains(r#"invoke("cleanup_data""#),
             "按钮在、命令在，却没接上"
         );
+    }
+}
+
+#[cfg(test)]
+mod advanced_settings_wiring {
+    use super::{exposed_settings_json, Exposed, EXPOSED_SETTINGS};
+
+    /// 找一条清单项（找不到就直接红，别拿 `unwrap()` 的空话糊过去）。
+    fn find(section: &str, key: &str) -> &'static Exposed {
+        EXPOSED_SETTINGS
+            .iter()
+            .find(|e| e.section == section && e.key == key)
+            .unwrap_or_else(|| panic!("{section}.{key} 不在清单里"))
+    }
+
+    /// 「要重启才生效」的那几个键不许被标成立即生效 —— 标错就是界面在撒谎，
+    /// 而这一族的病状是"改了、界面也说改好了、重启之后才发现一直没生效"。
+    #[test]
+    fn a_restart_only_key_is_never_labelled_hot() {
+        for (s, k) in [
+            ("gui", "start_to_tray"),
+            ("database", "auto_vacuum_days"),
+            ("device_stats", "enabled"),
+        ] {
+            assert_eq!(
+                find(s, k).live,
+                super::Live::Restart,
+                "{s}.{k} 的读者只在启动时跑一次，标成立即生效就是骗人"
+            );
+        }
+        for (s, k) in [("gui", "unload_hidden"), ("gui", "unload_hidden_delay")] {
+            assert_eq!(
+                find(s, k).live,
+                super::Live::NextHide,
+                "{s}.{k} 读在「隐藏主窗口」那一步里，要说下一次隐藏起效"
+            );
+        }
+        // 每一行都得有那三档里的一档，不许出现"没标"的默认值
+        for e in EXPOSED_SETTINGS {
+            let _ = e.live.label();
+        }
+    }
+
+    /// 「高级设置」两边的行必须一字不差：界面少一行 = 那个键没人能改；
+    /// Rust 少一行 = 行画出来了却取不到值与生效时机。
+    #[test]
+    fn the_advanced_rows_and_the_rust_caliper_agree() {
+        let js = include_str!("../ui/js/views.js");
+        let at = js.find("const ADV = [").expect("ADV 那张表不见了");
+        let body = &js[at..at + js[at..].find("];").expect("ADV 表收不到尾")];
+        let mut js_keys: Vec<String> = Vec::new();
+        for line in body.lines() {
+            if let Some(rest) = line.trim().strip_prefix("[\"") {
+                if let Some(end) = rest.find('"') {
+                    js_keys.push(rest[..end].to_string());
+                }
+            }
+        }
+        let rust_keys: Vec<String> = EXPOSED_SETTINGS
+            .iter()
+            .map(|e| format!("{}.{}", e.section, e.key))
+            .collect();
+        let only_js: Vec<&String> = js_keys.iter().filter(|k| !rust_keys.contains(k)).collect();
+        let only_rust: Vec<&String> = rust_keys.iter().filter(|k| !js_keys.contains(k)).collect();
+        assert!(
+            only_js.is_empty(),
+            "界面有行而清单里没有（值、控件、生效时机都取不到）: {only_js:?}"
+        );
+        assert!(
+            only_rust.is_empty(),
+            "清单里有而界面没有（等于这个键没人能改）: {only_rust:?}"
+        );
+        assert_eq!(
+            js_keys.len(),
+            rust_keys.len(),
+            "两边行数一样但里面有重复键（重复那一行会互相盖）"
+        );
+
+        // 进了表还得真的挂进某一张卡：漏掉的症状是"那一行根本不出现"，
+        // 而行与清单的相等检查照样绿
+        let cats_at = js.find("const SETTINGS_CATS").expect("分类表不见了");
+        for k in &rust_keys {
+            let needle = format!("\"{k}\"");
+            assert!(
+                js[cats_at..].contains(&needle),
+                "「{k}」进了表却没挂进任何一张卡，界面上看不见它"
+            );
+        }
+
+        // 「什么时候生效」只许在一侧出现：界面那张表里再打一份就是两把尺子
+        assert!(
+            !body.contains("重启程序后生效") && !body.contains("改完立即生效"),
+            "界面自己写了一份生效时机"
+        );
+    }
+
+    /// 载荷那一格由 Rust 现算：界面不许自己解析 config.ini、也不许猜控件类型。
+    #[test]
+    fn the_payload_carries_the_value_the_kind_and_the_label() {
+        // 单独一份空配置文件走默认值：不碰真实程序目录，也不依赖谁的 config.ini
+        let _serial = crate::app_dir_lock();
+        let _app = focusflow_core::paths::test_app_dir("adv_payload");
+        let path = focusflow_core::paths::app_dir().join("config.ini");
+        std::fs::write(&path, "").unwrap();
+        let cfg = focusflow_core::config::FocusFlowConfig::load(&path).unwrap();
+        let json = exposed_settings_json(&cfg);
+        let one = &json["rest.window_minutes"];
+        assert_eq!(
+            one["kind"], "int",
+            "整数键要由这一侧说是 int，界面据此选控件"
+        );
+        assert_eq!(
+            one["value"], "30",
+            "没写过这个键时交回的是默认值，与种进 config.ini 的那份同源"
+        );
+        assert_eq!(one["live"], "改完立即生效", "生效时机跟着值一起交出去");
+        let sw = &json["listener.mouse_enabled"];
+        assert_eq!(sw["kind"], "switch");
+        assert!(
+            sw["value"] == "true" || sw["value"] == "false",
+            "布尔必须先归一成 \"true\"/\"false\"，否则 `= 1` / `yes` 会被画成灭勾，实得 {sw}"
+        );
+        // 每一条都有这三格，少一条界面就会画出没有值的行
+        for e in EXPOSED_SETTINGS {
+            let k = format!("{}.{}", e.section, e.key);
+            let cell = &json[&k];
+            assert!(
+                cell.get("value").is_some()
+                    && cell.get("kind").is_some()
+                    && cell.get("live").is_some(),
+                "{k} 那一格缺东西"
+            );
+        }
     }
 }
