@@ -1,5 +1,7 @@
 //! 插件稳健性：反复 get_view 渲染 + 加载/卸载循环，检查无泄漏/无崩溃。
 
+mod common;
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -7,7 +9,6 @@ mod tests {
 
     use focusflow_core::config::FocusFlowConfig;
     use focusflow_core::db;
-    use focusflow_core::paths;
     use focusflow_core::plugins::manager::PluginManager;
 
     fn test_lock() -> &'static Mutex<()> {
@@ -22,9 +23,8 @@ mod tests {
     #[test]
     fn repeated_view_render_stability() {
         let _g = guard();
-        let dir = std::env::current_dir().unwrap();
-        paths::set_app_dir(&dir);
-        db::queries::invalidate_years_cache();
+        let app = crate::common::isolated_app_dir("render_stability");
+        let dir = app.path();
 
         let config: &'static FocusFlowConfig = Box::leak(Box::new(
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
@@ -68,9 +68,8 @@ mod tests {
     #[test]
     fn plugin_key_event_robust() {
         let _g = guard();
-        let dir = std::env::current_dir().unwrap();
-        paths::set_app_dir(&dir);
-        db::queries::invalidate_years_cache();
+        let app = crate::common::isolated_app_dir("key_event_robust");
+        let dir = app.path();
 
         let config: &'static FocusFlowConfig = Box::leak(Box::new(
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),

@@ -1,5 +1,7 @@
 //! 插件系统集成测试：加载/卸载/热重载/宿主 API。
 
+mod common;
+
 #[cfg(test)]
 mod tests {
     use focusflow_core::config::FocusFlowConfig;
@@ -21,10 +23,9 @@ mod tests {
     #[test]
     fn load_unload_plugin() {
         let _guard = guard();
-        // 用 core crate 所在目录作为 app_dir（plugins/ 在其中）
-        let dir = std::env::current_dir().unwrap();
-        paths::set_app_dir(&dir);
-        db::queries::invalidate_years_cache();
+        // 随包 plugins/ 复制进临时程序目录（见 `common::isolated_app_dir`）
+        let app = crate::common::isolated_app_dir("load_unload");
+        let dir = app.path();
 
         let config: &'static FocusFlowConfig = Box::leak(Box::new(
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
@@ -79,9 +80,8 @@ mod tests {
     #[test]
     fn all_bundled_plugins_load_render_and_act() {
         let _guard = guard();
-        let dir = std::env::current_dir().unwrap();
-        paths::set_app_dir(&dir);
-        db::queries::invalidate_years_cache();
+        let app = crate::common::isolated_app_dir("bundled_all");
+        let dir = app.path();
         let config: &'static FocusFlowConfig = Box::leak(Box::new(
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
         ));
@@ -134,9 +134,8 @@ mod tests {
     fn accounting_view_widgets() {
         // 新控件类型（select / modal_form / 分页按钮 disabled）解析回归测试
         let _guard = guard();
-        let dir = std::env::current_dir().unwrap();
-        paths::set_app_dir(&dir);
-        db::queries::invalidate_years_cache();
+        let app = crate::common::isolated_app_dir("accounting_widgets");
+        let dir = app.path();
 
         let config: &'static FocusFlowConfig = Box::leak(Box::new(
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
@@ -238,9 +237,8 @@ mod tests {
     #[test]
     fn accounting_category_sel_buttons_are_wired() {
         let _guard = guard();
-        let dir = std::env::current_dir().unwrap();
-        paths::set_app_dir(&dir);
-        db::queries::invalidate_years_cache();
+        let app = crate::common::isolated_app_dir("sel_buttons");
+        let dir = app.path();
 
         let config: &'static FocusFlowConfig = Box::leak(Box::new(
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
@@ -329,9 +327,8 @@ mod tests {
     #[test]
     fn host_api_stats() {
         let _guard = guard();
-        let dir = std::env::current_dir().unwrap();
-        paths::set_app_dir(&dir);
-        db::queries::invalidate_years_cache();
+        let app = crate::common::isolated_app_dir("host_api_stats");
+        let dir = app.path();
 
         // 用 Lua 直接调宿主 API 验证
         let lua = mlua::Lua::new();
@@ -501,8 +498,8 @@ mod tests {
     fn scheduler_plugin_declares_row_actions_instead_of_action_text() {
         use focusflow_core::plugins::Widget;
         let _guard = guard();
-        let dir = std::env::current_dir().unwrap();
-        paths::set_app_dir(&dir);
+        let app = crate::common::isolated_app_dir("scheduler_rows");
+        let dir = app.path();
         let config: &'static FocusFlowConfig = Box::leak(Box::new(
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
         ));
@@ -580,8 +577,8 @@ mod tests {
     fn accounting_modal_form_keeps_refresh_flag() {
         use focusflow_core::plugins::Widget;
         let _guard = guard();
-        let dir = std::env::current_dir().unwrap();
-        paths::set_app_dir(&dir);
+        let app = crate::common::isolated_app_dir("modal_refresh_flag");
+        let dir = app.path();
         let config: &'static FocusFlowConfig = Box::leak(Box::new(
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
         ));
@@ -647,9 +644,8 @@ mod tests {
         }
 
         let _guard = guard();
-        let dir = std::env::current_dir().unwrap();
-        paths::set_app_dir(&dir);
-        db::queries::invalidate_years_cache();
+        let app = crate::common::isolated_app_dir("rejected_save_reason");
+        let dir = app.path();
         let config: &'static FocusFlowConfig = Box::leak(Box::new(
             FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
         ));
@@ -787,8 +783,8 @@ mod tests {
 
     // =====================================================================
     // 下面这组用例都跑在**独立临时目录**里：它们要真的写记账/番茄钟/定时任务的
-    // 附属库，不能落在仓库目录（`plugins_test.rs` 上面那批只做加载+渲染，才敢用
-    // `set_app_dir(当前目录)`）。
+    // 附属库，不能落在程序目录（上面那批只做加载+渲染，走 `common::isolated_app_dir`，
+    // 同样不碰仓库目录）。
     // =====================================================================
 
     /// 把一个内置插件复制进隔离的临时程序目录并加载。

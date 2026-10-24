@@ -14,8 +14,12 @@ use focusflow_core::db;
 use focusflow_core::paths;
 use focusflow_core::plugins::host;
 use mlua::Lua;
+use std::path::Path;
 
-/// 串行锁：本文件用 `current_dir()` 当 app_dir，与同 crate 其它动 app_dir 的测试互斥。
+mod common;
+
+/// 串行锁：本文件要把进程级 `app_dir` 锚到自己的临时程序目录，与同 crate
+/// 其它动 app_dir 的测试互斥。
 mod round7 {
     use std::sync::Mutex;
     pub(super) fn guard() -> std::sync::MutexGuard<'static, ()> {
@@ -25,9 +29,7 @@ mod round7 {
 }
 
 /// 真环境里注册着 API 表 `focusflow`，把它的键名全列出来。
-fn registered_names() -> Vec<String> {
-    let dir = std::env::current_dir().expect("测试的 cwd 是 crate 根目录");
-    paths::set_app_dir(&dir);
+fn registered_names(dir: &Path) -> Vec<String> {
     let config: &'static FocusFlowConfig = Box::leak(Box::new(
         FocusFlowConfig::load(dir.join("config.ini")).expect("读取 config.ini 失败"),
     ));
@@ -143,7 +145,10 @@ fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
 #[test]
 fn bundled_plugins_only_call_registered_host_apis() {
     let _g = round7::guard();
-    let registered = registered_names();
+    // 夹具必须活到本用例结束：`paths::plugins_dir()` 读的是进程级 app_dir，
+    // 而注册表也是在同一个目录里建起来的。
+    let app = common::isolated_app_dir("wiring_audit");
+    let registered = registered_names(app.path());
     // 反向断言：注册表必须真的列出来了。空表会让下面每一条都"全对"，那是假绿。
     assert!(
         registered.len() >= 40,
