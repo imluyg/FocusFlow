@@ -82,6 +82,19 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> serde_json::Value {
         // 只在文件系统里（`[gui]`/`[plugins]` 都没有它的记账位）。所以在资源管理器里
         // 手动删掉 FocusFlow.lnk，设置页下一帧就会跟着变成未启用，而不是停在最后一次勾。
         "autostart_enabled": focusflow_core::autostart::is_autostart_enabled(),
+        // 顶部那个周期选择器此刻的值（-1 今日 / 0 总计 / N 近 N 天）。
+        // 「导出」那一行的说明要念出它，而念的必须就是后端那份状态 ——
+        // 在 JS 里另猜一个数，就会出现"说明写近30天、文件里写总计"。
+        "period": state.period.load(std::sync::atomic::Ordering::Relaxed),
+        // 周期与"时间切面"的名字也由后端给：界面里那个标签页写着「总计」，而
+        // `views.js` 的 `periodText(0)` 写的是「全部历史」—— 让 JS 自己拼名字，
+        // 就会出现「导出」那一行念一个名字、文件里写另一个名字。
+        "period_label": crate::export::report_window(state.period.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|w| crate::export::period_label(&w))
+            .unwrap_or_else(|_| "说不准".to_string()),
+        "slice_label": crate::export::report_window(state.period.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|w| crate::export::slice_label(&w))
+            .unwrap_or_else(|_| "说不准".to_string()),
         // 「高级设置」那一页的全部行：值、控件类型、什么时候生效都由这一侧交出。
         // 界面不许再解析 config.ini，也不许自己判断某个键要不要重启 —— 那正是
         // "改了没生效也没人告诉你"的成因。
@@ -531,11 +544,33 @@ pub async fn change_data_dir(
     Ok(msg)
 }
 
-/// 导出统计报告（CSV / HTML）。
+/// 导出格式 → 扩展名；不认识的名字在**弹框之前**就拒。
+///
+/// 旧写法是 `if fmt == "csv" { "csv" } else { "html" }`：叫 `pdf` 的请求会拿着一个
+/// `.html` 的默认文件名去弹保存框，写出来的也确实是一份 HTML —— 名字与内容各说各的。
+fn export_ext(fmt: &str) -> Result<&'static str, String> {
+    match fmt {
+        "csv" => Ok("csv"),
+        "html" => Ok("html"),
+        "json" => Ok("json"),
+        other => Err(format!(
+            "不认识的导出格式「{other}」：只支持 csv / html / json"
+        )),
+    }
+}
+
+/// 导出统计报告（CSV / HTML / JSON）。
 /// 对话框 + 全历史扫描 + 写文件均为重 IO，整体放后台线程执行。
+///
+/// `period` 与界面顶部那个周期选择器同源（-1 今日 / 0 总计 / N 近 N 天）：以前写死
+/// `get_stats(None, None)`，于是"导出的东西永远与你正在看的那一页无关"，而且四个板块
+/// （每日趋势、每小时、应用、设备）根本导不出去 —— 数据都在库里躺着。
 #[tauri::command]
-pub async fn export_report(fmt: String) -> Result<String, String> {
+pub async fn export_report(fmt: String, period: i64) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // 先问格式与周期，再挑文件名：非法值一路走到弹框，用户选完目录才被告知写不出来
+        let ext = export_ext(&fmt)?;
+        let window = crate::export::report_window(period)?;
         // 先问可读性，再挑文件名：`available_years()` 把 `read_dir` 失败折成空列表、
         // `stats_multi_year` 把打不开的那一年静默跳过，所以移动盘没插、或某年的库被
         // 同步盘换成占位文件时，原先这条路会写出一份"总活跃次数 0"或明显偏小的报告，
@@ -543,21 +578,22 @@ pub async fn export_report(fmt: String) -> Result<String, String> {
         if let Err(e) = focusflow_core::db::queries::check_years_readable() {
             return Err(format!("导出被拒绝：{e}"));
         }
-        let ext = if fmt == "csv" { "csv" } else { "html" };
         let file = rfd::FileDialog::new()
             .set_title("导出统计报告")
             .set_file_name(format!("focusflow_export.{ext}"))
-            .add_filter(if fmt == "csv" { "CSV" } else { "HTML" }, &[ext])
+            .add_filter(ext.to_uppercase(), &[ext])
             .save_file();
         let Some(path) = file else {
             return Ok("已取消".to_string());
         };
 
-        let (total, stats) = focusflow_core::db::get_stats(None, None);
-        let result = if fmt == "csv" {
-            crate::export::export_csv(&path, total, &stats)
-        } else {
-            crate::export::export_html(&path, total, &stats)
+        // 一次查询、三种格式共用同一份数据：两个 writer 各自查库时，中间落一次盘
+        // 就能给出两份对不上的总数
+        let data = crate::export::collect_report(&window);
+        let result = match ext {
+            "csv" => crate::export::export_csv(&path, &data),
+            "json" => crate::export::export_json(&path, &data),
+            _ => crate::export::export_html(&path, &data),
         };
         result
             .map(|_| path.display().to_string())
@@ -1617,11 +1653,11 @@ mod tests {
         );
     }
 
-    /// 导出必须先问年度库可读，再去做聚合。
+    /// 导出必须先问格式与周期、再问年度库可读，最后才去聚合与弹框。
     ///
     /// 命令本体会弹真文件对话框、也要真库才跑得动，无头环境进不去，所以按文本形状钉
     /// （与 `crates/cli/src/main.rs` 里"七条读命令都要过这把尺子"同一族做法）。
-    /// 钉的是**次序**：闸排在 `get_stats` 之后就等于已经拿少一年的总数写完了报告。
+    /// 钉的是**次序**：闸排在聚合之后就等于已经拿少一年的总数写完了报告。
     #[test]
     fn export_asks_readability_before_it_aggregates() {
         let src = include_str!("commands.rs");
@@ -1633,12 +1669,30 @@ mod tests {
                 .find("\n#[tauri::command]")
                 .expect("导出命令之后没有别的命令，切片前提变了")];
 
+        let ext = body
+            .find("export_ext(&fmt)?")
+            .expect("格式没在弹框之前问 —— 未知格式会拿到一个名字与内容不一样的文件");
+        let window = body
+            .find("report_window(period)?")
+            .expect("周期没在弹框之前问 —— 非法周期会走到写文件那一步才炸");
         let gate = body
             .find("check_years_readable()")
             .expect("导出没问可读性 —— 读不到的那一年会被静默跳过");
+        let dialog = body
+            .find("rfd::FileDialog::new()")
+            .expect("保存框那一步不见了，判据的参照物没了");
         let agg = body
-            .find("get_stats(None, None)")
+            .find("collect_report(&window)")
             .expect("导出不再聚合？判据要跟着改");
+        assert!(ext < gate, "格式要排在可读性闸之前（{ext} vs {gate}）");
+        assert!(
+            window < gate,
+            "周期要排在可读性闸之前（{window} vs {gate}）"
+        );
+        assert!(
+            gate < dialog,
+            "闸要排在弹框之前：别让人选完目录才被告知读不全"
+        );
         assert!(
             gate < agg,
             "可读性闸必须排在聚合之前（闸在 {gate}、聚合在 {agg}）"
@@ -1647,10 +1701,23 @@ mod tests {
             body.contains("导出被拒绝"),
             "拒绝时要给前端一句能显示的话，不能只 return Err(空)"
         );
-        // 夹具自己的前提：切片真盖住了整个命令体，不是切在中间让上面两条空转
+        // 这一句就是被 `if fmt == "csv" { "csv" } else { "html" }` 顶掉的那种写法
         assert!(
-            body.contains("export_csv") && body.contains("export_html"),
-            "切片没盖住导出的两个格式分支，上面三条是假绿"
+            !body.contains("if fmt == \"csv\" { \"csv\" } else { \"html\" }"),
+            "未知格式又去算 html 的文件名了"
+        );
+        // 三个格式都真接到了 writer 上
+        assert!(
+            body.contains("export_csv")
+                && body.contains("export_html")
+                && body.contains("export_json"),
+            "切片没盖住导出的三个格式分支，上面几条是假绿"
+        );
+        // 聚合只许问一次：两个 writer 各自查库时，中间落一次盘就能给出两份对不上的总数
+        assert_eq!(
+            body.match_indices("collect_report(").count(),
+            1,
+            "聚合不止一次 —— 三个格式会各拿一份不同时点的账"
         );
     }
 

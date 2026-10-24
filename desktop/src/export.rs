@@ -4,7 +4,6 @@
 //! 不是"两份实现互为镜像"——列结构、周期标签与 CLI 那份本来就不一样。
 //! 读侧的可读性闸两边都要问，判据在 `db::queries::check_years_readable`。
 
-use std::collections::HashMap;
 use std::io::Write;
 
 use anyhow::Context;
@@ -12,30 +11,211 @@ use chrono::Local;
 
 use focusflow_core::format::{cmp_rank_desc, csv_field, fmt_thousands, html_escape};
 
+/// 导出用的窗口。与界面顶部那六个周期一档一档对得上。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReportWindow {
+    /// 某一天（「今日」周期）
+    Today(chrono::NaiveDate),
+    /// 近 N 天
+    Days(i64),
+    /// 「总计」：排行榜与总数看全部历史，而按日/按小时/按星期那三段仍只看近 30 天
+    All,
+}
+
+/// 顶部周期的数字 → 导出窗口。**非法值拒绝，不夹**。
+///
+/// 夹一下也会"能导出"，但标题与内容就对不上了 —— 命令行里那句「标题写 -5 天、拿到 1 天
+/// 数据」记的就是这一族。周期合法性的唯一判据是 `queries::is_valid_period`，这里不另立。
+pub fn report_window(period: i64) -> Result<ReportWindow, String> {
+    if !focusflow_core::db::queries::is_valid_period(period) {
+        return Err(format!(
+            "无法导出不存在的统计周期（收到 {period}）：-1 = 今日、0 = 总计、正整数 = 近 N 天"
+        ));
+    }
+    Ok(match period {
+        -1 => ReportWindow::Today(Local::now().date_naive()),
+        0 => ReportWindow::All,
+        n => ReportWindow::Days(n),
+    })
+}
+
+/// 排行榜与总数那几段挂的名字。
+pub(crate) fn period_label(w: &ReportWindow) -> String {
+    match w {
+        ReportWindow::Today(_) => "今日".to_string(),
+        ReportWindow::Days(n) => format!("近{n}天"),
+        ReportWindow::All => "总计".to_string(),
+    }
+}
+
+/// 按日/按小时/按星期那三段挂的名字：`总计` 这一档它们只数近 30 天。
+///
+/// 这两个标签必须分开写。合成一个"总计"就会让趋势那一段看着像全部历史，
+/// 而它其实只有 30 天 —— 天数与"日均"那一格用的是同一把尺子（`chart_window_days`），
+/// 这里只是把它说出来，不再另算一次。
+pub(crate) fn slice_label(w: &ReportWindow) -> String {
+    match w {
+        ReportWindow::Today(_) => "今日".to_string(),
+        ReportWindow::Days(n) => format!("近{n}天"),
+        ReportWindow::All => "近30天".to_string(),
+    }
+}
+
+/// 三段"时间切面"实际查多少天 —— 尺子在 `state::chart_window_days`，这里只调用。
+fn slice_days(w: &ReportWindow) -> i64 {
+    match w {
+        ReportWindow::Today(_) => -1,
+        ReportWindow::Days(n) => *n,
+        ReportWindow::All => 0,
+    }
+}
+
+/// 一份报告的全部数据：查一次，三种格式共用。
+///
+/// 三个 writer 不再各自查库：过去 `export_csv` 与 `export_html` 都只接 `(total, stats)`，
+/// 于是"导出的东西比页面上看到的少一大半"，而且两份各自查一次库时，中间落了一次盘
+/// 就会给出两个不同的总数。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReportData {
+    pub period_label: String,
+    pub slice_label: String,
+    pub generated_at: String,
+    pub total: i64,
+    pub keys: Vec<(String, i64)>,
+    pub daily: Vec<(String, i64)>,
+    pub hourly: Vec<i64>,
+    /// (0=周一 .. 6=周日, 次数) —— 固定 7 格，与界面那把尺子同一个约定
+    pub weekday: Vec<(i64, i64)>,
+    pub app_total: i64,
+    pub apps: Vec<(String, i64)>,
+    pub device_total: i64,
+    pub devices: Vec<(String, i64)>,
+}
+
+/// 0=周一 .. 6=周日，与 `queries::aggregate_weekday` 用的 `num_days_from_monday` 同一约定。
+const WD_CN: [&str; 7] = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+fn weekday_name(d: i64) -> &'static str {
+    // 越界按周日处理：这里是显示标签，不许因为它把整份导出炸成 panic
+    WD_CN[d.clamp(0, 6) as usize]
+}
+
+/// 按次数降序排一份榜单（比较器只许用 `cmp_rank_desc`，`export.rs` 末尾那条断言钉着）。
+fn ranked(mut items: Vec<(String, i64)>) -> Vec<(String, i64)> {
+    items.sort_by(|a, b| cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
+    items
+}
+
+/// 查一次库，凑齐一份报告。全部走现成的读函数，不在这里重写任何口径。
+pub fn collect_report(w: &ReportWindow) -> ReportData {
+    use focusflow_core::db::queries as q;
+    let days = slice_days(w);
+    let (total, key_map) = match w {
+        ReportWindow::Today(d) => q::get_stats_by_date(*d),
+        other => q::get_stats(
+            if other == &ReportWindow::All {
+                None
+            } else {
+                Some(days)
+            },
+            None,
+        ),
+    };
+    let apps_src = match w {
+        ReportWindow::Today(d) => q::get_app_stats_by_date(*d),
+        ReportWindow::All => q::get_app_stats(None, None),
+        ReportWindow::Days(n) => q::get_app_stats(Some(*n), None),
+    };
+    let devices_src = match w {
+        ReportWindow::Today(d) => q::get_device_stats_by_date(*d),
+        ReportWindow::All => q::get_device_stats(None, None),
+        ReportWindow::Days(n) => q::get_device_stats(Some(*n), None),
+    };
+    let (app_total, app_map) = apps_src;
+    let (device_total, device_list) = devices_src;
+    // 时间切面那三段：天数交给 `chart_window_days` 那一把尺子（「总计」= 近 30 天）
+    let daily = q::get_daily_counts(crate::state::chart_window_days(days), None);
+    let hourly = q::get_hourly_totals(crate::state::chart_window_days(days), None);
+    let agg_wd = q::aggregate_weekday(&daily);
+    let weekday: Vec<(i64, i64)> = (0..7i64)
+        .map(|d| (d, *agg_wd.get(&d).unwrap_or(&0)))
+        .collect();
+    ReportData {
+        period_label: period_label(w),
+        slice_label: slice_label(w),
+        generated_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        total,
+        keys: ranked(key_map.into_iter().collect()),
+        daily,
+        hourly,
+        weekday,
+        app_total,
+        apps: ranked(app_map.into_iter().collect()),
+        device_total,
+        devices: ranked(device_list.into_iter().map(|d| (d.name, d.count)).collect()),
+    }
+}
+
+/// 占比：分母是 0 就说 0，不写出"除以零"的那种漂亮数字。
+fn share(count: i64, total: i64) -> f64 {
+    if total > 0 {
+        (count as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    }
+}
+
 /// 导出 CSV（带 BOM，Excel 打开中文不乱码）。
-pub fn export_csv(
-    path: &std::path::Path,
-    total: i64,
-    stats: &HashMap<String, i64>,
-) -> anyhow::Result<()> {
-    let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
-    sorted.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
-    let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+pub fn export_csv(path: &std::path::Path, d: &ReportData) -> anyhow::Result<()> {
     let mut out = String::new();
-    out.push_str("# FocusFlow 键鼠活跃统计导出\n");
-    out.push_str("# 统计周期 总计\n");
-    out.push_str(&format!("# 总活跃次数 {total}\n"));
-    out.push_str(&format!("# 导出时间 {now_str}\n\n"));
-    out.push_str("排名,键鼠,次数,占比(%)\n");
-    let mut rank = 0;
-    for (key, count) in sorted {
-        rank += 1;
-        let percent = if total > 0 {
-            format!("{:.2}", (*count as f64 / total as f64) * 100.0)
-        } else {
-            "0.00".to_string()
-        };
-        out.push_str(&format!("{rank},{},{count},{percent}\n", csv_field(key)));
+    out.push_str("# FocusFlow 活跃统计导出\n");
+    out.push_str(&format!("# 统计周期 {}\n", d.period_label));
+    out.push_str(&format!("# 总活跃次数 {}\n", d.total));
+    out.push_str(&format!(
+        "# 时间切面窗口 {}（按日 / 按小时 / 按星期）\n",
+        d.slice_label
+    ));
+    out.push_str(&format!("# 导出时间 {}\n", d.generated_at));
+    out.push_str("\n# 键鼠排行\n排名,键鼠,次数,占比(%)\n");
+    for (i, (key, count)) in d.keys.iter().enumerate() {
+        out.push_str(&format!(
+            "{},{},{},{:.2}\n",
+            i + 1,
+            csv_field(key),
+            count,
+            share(*count, d.total)
+        ));
+    }
+    out.push_str("\n# 每日趋势\n日期,次数\n");
+    for (day, count) in &d.daily {
+        out.push_str(&format!("{day},{count}\n"));
+    }
+    out.push_str("\n# 每小时分布\n小时,次数\n");
+    for (h, count) in d.hourly.iter().enumerate() {
+        out.push_str(&format!("{h},{count}\n"));
+    }
+    out.push_str("\n# 星期分布\n星期,次数\n");
+    for (wd, count) in &d.weekday {
+        out.push_str(&format!("{},{count}\n", weekday_name(*wd)));
+    }
+    out.push_str("\n# 应用使用时长（秒）\n排名,应用,秒数,占比(%)\n");
+    for (i, (app, secs)) in d.apps.iter().enumerate() {
+        out.push_str(&format!(
+            "{},{},{},{:.2}\n",
+            i + 1,
+            csv_field(app),
+            secs,
+            share(*secs, d.app_total)
+        ));
+    }
+    out.push_str("\n# 设备输入次数\n排名,设备,次数,占比(%)\n");
+    for (i, (dev, count)) in d.devices.iter().enumerate() {
+        out.push_str(&format!(
+            "{},{},{},{:.2}\n",
+            i + 1,
+            csv_field(dev),
+            count,
+            share(*count, d.device_total)
+        ));
     }
     let mut f =
         std::fs::File::create(path).with_context(|| format!("创建文件失败: {}", path.display()))?;
@@ -44,35 +224,116 @@ pub fn export_csv(
     Ok(())
 }
 
-/// 导出 HTML 统计报告。
-pub fn export_html(
-    path: &std::path::Path,
-    total: i64,
-    stats: &HashMap<String, i64>,
-) -> anyhow::Result<()> {
-    let mut sorted: Vec<(&String, &i64)> = stats.iter().collect();
-    sorted.sort_by(|a, b| cmp_rank_desc(a.0, a.1, b.0, b.1));
-    let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let mut rows = String::new();
-    let mut rank = 0;
-    for (key, count) in sorted {
-        rank += 1;
-        let percent = if total > 0 {
-            format!("{:.2}%", (*count as f64 / total as f64) * 100.0)
-        } else {
-            "0.00%".to_string()
-        };
-        let bar_width = if total > 0 {
-            (*count as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        };
-        rows.push_str(&format!(
-            r#"<tr><td class="rank">{rank}</td><td class="key">{}</td><td class="count">{}</td><td class="percent"><div class="bar-container"><div class="bar" style="width:{bar_width:.1}%"></div><span>{percent}</span></div></td></tr>"#,
-            html_escape(key),
-            fmt_thousands(*count)
-        ));
+/// HTML 里一段小标题 + 一张表。六个板块共用这一份，省得每加一列就漏一处转义。
+fn html_table(title: &str, head: &[&str], rows: &[Vec<String>]) -> String {
+    let mut s = format!("<h2>{}</h2><table><thead><tr>", html_escape(title));
+    for col in head {
+        if !col.is_empty() {
+            s.push_str(&format!("<th>{}</th>", html_escape(col)));
+        }
     }
+    s.push_str("</tr></thead><tbody>");
+    for r in rows {
+        s.push_str("<tr>");
+        for cell in r {
+            s.push_str(&format!("<td>{cell}</td>"));
+        }
+        s.push_str("</tr>");
+    }
+    s.push_str("</tbody></table>");
+    s
+}
+
+/// 带条形图的占比单元格（与旧版那份 HTML 的视觉保持一致）。
+fn bar_cell(count: i64, total: i64) -> String {
+    let pct = share(count, total);
+    format!(
+        r#"<div class="bar-container"><div class="bar" style="width:{pct:.1}%"></div><span>{pct:.2}%</span></div>"#
+    )
+}
+
+/// 导出 HTML 统计报告。
+pub fn export_html(path: &std::path::Path, d: &ReportData) -> anyhow::Result<()> {
+    let rank_rows: Vec<Vec<String>> = d
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(i, (k, c))| {
+            vec![
+                (i + 1).to_string(),
+                html_escape(k),
+                fmt_thousands(*c),
+                bar_cell(*c, d.total),
+            ]
+        })
+        .collect();
+    let daily_rows: Vec<Vec<String>> = d
+        .daily
+        .iter()
+        .map(|(day, c)| vec![html_escape(day), fmt_thousands(*c)])
+        .collect();
+    let hourly_rows: Vec<Vec<String>> = d
+        .hourly
+        .iter()
+        .enumerate()
+        .map(|(h, c)| vec![format!("{h}时"), fmt_thousands(*c), bar_cell(*c, d.total)])
+        .collect();
+    let weekday_rows: Vec<Vec<String>> = d
+        .weekday
+        .iter()
+        .map(|(w, c)| vec![weekday_name(*w).to_string(), fmt_thousands(*c)])
+        .collect();
+    let app_rows: Vec<Vec<String>> = d
+        .apps
+        .iter()
+        .enumerate()
+        .map(|(i, (a, s))| {
+            vec![
+                (i + 1).to_string(),
+                html_escape(a),
+                format!("{} 秒", fmt_thousands(*s)),
+                bar_cell(*s, d.app_total),
+            ]
+        })
+        .collect();
+    let device_rows: Vec<Vec<String>> = d
+        .devices
+        .iter()
+        .enumerate()
+        .map(|(i, (n, c))| {
+            vec![
+                (i + 1).to_string(),
+                html_escape(n),
+                fmt_thousands(*c),
+                bar_cell(*c, d.device_total),
+            ]
+        })
+        .collect();
+    let body = [
+        html_table("键鼠排行", &["排名", "键鼠", "次数", "占比"], &rank_rows),
+        html_table(
+            &format!("每日趋势（{}）", d.slice_label),
+            &["日期", "次数"],
+            &daily_rows,
+        ),
+        html_table(
+            &format!("每小时分布（{}）", d.slice_label),
+            &["小时", "次数", "占比"],
+            &hourly_rows,
+        ),
+        html_table(
+            &format!("星期分布（{}）", d.slice_label),
+            &["星期", "次数"],
+            &weekday_rows,
+        ),
+        html_table("应用使用时长", &["排名", "应用", "时长", "占比"], &app_rows),
+        html_table(
+            "设备输入次数",
+            &["排名", "设备", "次数", "占比"],
+            &device_rows,
+        ),
+    ]
+    .join("\n");
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="zh-CN">
@@ -83,9 +344,10 @@ pub fn export_html(
     body {{ font-family: "Segoe UI", "Microsoft YaHei", sans-serif; margin: 40px; background: #f5f5f5; }}
     .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; }}
     h1 {{ color: #0078d4; }}
+    h2 {{ color: #0078d4; margin-top: 32px; font-size: 16px; }}
     .meta {{ color: #666; margin-bottom: 20px; }}
     .total {{ font-size: 28px; font-weight: bold; color: #0078d4; }}
-    table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
     th {{ background: #0078d4; color: white; padding: 12px; }}
     td {{ padding: 10px; border-bottom: 1px solid #eee; }}
     .bar-container {{ position: relative; min-width: 200px; }}
@@ -96,18 +358,29 @@ pub fn export_html(
 <body>
 <div class="container">
     <h1>FocusFlow 活跃统计报告</h1>
-    <div class="meta"><div>统计周期：总计</div><div>导出时间：{now_str}</div></div>
-    <div class="total">总活跃次数：{}</div>
-    <table>
-        <thead><tr><th>排名</th><th>键鼠</th><th>次数</th><th>占比</th></tr></thead>
-        <tbody>{rows}</tbody>
-    </table>
+    <div class="meta"><div>统计周期：{period}（时间切面按 {slice} 计）</div><div>导出时间：{at}</div></div>
+    <div class="total">总活跃次数：{total}</div>
+    {body}
 </div>
 </body>
 </html>"#,
-        fmt_thousands(total)
+        period = html_escape(&d.period_label),
+        slice = html_escape(&d.slice_label),
+        at = html_escape(&d.generated_at),
+        total = fmt_thousands(d.total),
+        body = body,
     );
     std::fs::write(path, html).with_context(|| format!("写入文件失败: {}", path.display()))?;
+    Ok(())
+}
+
+/// 导出 JSON：给人写的脚本读的那一份。
+///
+/// 字段名、周期标签与上面两个格式出自**同一个** `ReportData`（三份文件不会互相打脸）。
+pub fn export_json(path: &std::path::Path, d: &ReportData) -> anyhow::Result<()> {
+    let f =
+        std::fs::File::create(path).with_context(|| format!("创建文件失败: {}", path.display()))?;
+    serde_json::to_writer_pretty(f, d).context("写入 JSON 失败")?;
     Ok(())
 }
 
@@ -734,6 +1007,27 @@ mod tests {
         Ok(())
     }
 
+    /// 不查库、直接喂一份 `ReportData` 给三个 writer 用。
+    ///
+    /// 三个格式必须出自同一份数据，所以测试也造同一份数据 —— 让测试去查库，
+    /// 测的就变成"读函数对不对"，而那一层 core 自己有用例。
+    fn report_from(total: i64, stats: &HashMap<String, i64>) -> ReportData {
+        ReportData {
+            period_label: "总计".to_string(),
+            slice_label: "近30天".to_string(),
+            generated_at: "2026-10-24 10:00:00".to_string(),
+            total,
+            keys: ranked(stats.iter().map(|(k, v)| (k.clone(), *v)).collect()),
+            daily: vec![("2026-10-20".to_string(), 40)],
+            hourly: vec![0i64; 24],
+            weekday: (0..7i64).map(|d| (d, 0i64)).collect(),
+            app_total: 0,
+            apps: vec![],
+            device_total: 0,
+            devices: vec![],
+        }
+    }
+
     #[test]
     fn export_csv_has_bom_header_and_rows() -> anyhow::Result<()> {
         let dir = std::env::temp_dir().join("ff_export_test");
@@ -741,7 +1035,7 @@ mod tests {
         let path = dir.join("out.csv");
         let _ = std::fs::remove_file(&path);
 
-        export_csv(&path, 80, &sample_stats()).expect("export_csv should succeed");
+        export_csv(&path, &report_from(80, &sample_stats())).expect("export_csv should succeed");
         let data = std::fs::read(&path)?;
         // 带 UTF-8 BOM
         assert_eq!(&data[0..3], b"\xef\xbb\xbf", "CSV should have BOM");
@@ -770,7 +1064,7 @@ mod tests {
         let dir = std::env::temp_dir().join("ff_export_test_esc");
         std::fs::create_dir_all(&dir).ok();
         let path = dir.join("esc.csv");
-        export_csv(&path, 8, &stats).expect("export_csv should succeed");
+        export_csv(&path, &report_from(8, &stats)).expect("export_csv should succeed");
         let text = std::fs::read_to_string(&path).expect("read csv");
         assert!(text.contains("\"a,b\""), "逗号字段应加引号: {text}");
         assert!(text.contains("'=cmd()"), "公式注入应加前导引号: {text}");
@@ -784,7 +1078,7 @@ mod tests {
         let path = dir.join("out.html");
         let _ = std::fs::remove_file(&path);
 
-        export_html(&path, 80, &sample_stats()).expect("export_html should succeed");
+        export_html(&path, &report_from(80, &sample_stats())).expect("export_html should succeed");
         let html = std::fs::read_to_string(&path)?;
         assert!(html.contains("总活跃次数：80"), "should contain total");
         assert!(html.contains("<html"), "should be html");
@@ -801,13 +1095,101 @@ mod tests {
         let dir = std::env::temp_dir().join("ff_export_test_esc2");
         std::fs::create_dir_all(&dir).ok();
         let path = dir.join("esc.html");
-        export_html(&path, 1, &stats).expect("export_html should succeed");
+        export_html(&path, &report_from(1, &stats)).expect("export_html should succeed");
         let html = std::fs::read_to_string(&path).expect("read html");
         assert!(
             html.contains("&lt;b&gt;x&amp;y&lt;/b&gt;"),
             "HTML 键名应转义"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 周期 → 窗口：非法值**拒绝**而不是夹一下。
+    ///
+    /// 夹一下也"能导出"，但标题与内容就对不上了 —— 命令行里那句「标题写 -5 天、拿到 1 天
+    /// 数据」记的就是这一族。合法值那几条同时钉住两个标签：`总计` 的排行榜看全部历史，
+    /// 而按日/按小时那几段只数近 30 天，两个名字必须分开写。
+    #[test]
+    fn report_window_refuses_a_period_that_does_not_exist() {
+        assert_eq!(
+            report_window(-1).unwrap(),
+            ReportWindow::Today(Local::now().date_naive())
+        );
+        assert_eq!(report_window(7).unwrap(), ReportWindow::Days(7));
+        assert_eq!(report_window(0), Ok(ReportWindow::All));
+        for bad in [-2, -100, 40_000] {
+            let why = report_window(bad).unwrap_err();
+            assert!(
+                why.contains("无法导出不存在的统计周期") && why.contains(&bad.to_string()),
+                "要说清收到的是什么，实得: {why}"
+            );
+        }
+        let all = ReportWindow::All;
+        assert_eq!(period_label(&all), "总计", "排行榜那几段的名字");
+        assert_eq!(
+            slice_label(&all),
+            "近30天",
+            "时间切面不许挂着「总计」报 30 天的数"
+        );
+        assert_eq!(
+            slice_days(&all),
+            0,
+            "天数交给 chart_window_days，不在这里夹"
+        );
+        assert_eq!(
+            slice_days(&ReportWindow::Today(Local::now().date_naive())),
+            -1
+        );
+    }
+
+    /// JSON 是给人写的脚本读的那一份：板块齐不齐、标签在不在，都得当场能验。
+    #[test]
+    fn export_json_carries_every_section_and_both_labels() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join("ff_export_json");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("out.json");
+        let mut stats = HashMap::new();
+        stats.insert("A".to_string(), 40);
+        let d = ReportData {
+            hourly: (0..24).map(|h| h as i64).collect(),
+            app_total: 90,
+            apps: vec![("notepad.exe".to_string(), 90)],
+            device_total: 5,
+            devices: vec![("新鼠标".to_string(), 5)],
+            ..report_from(80, &stats)
+        };
+        export_json(&path, &d).expect("export_json should succeed");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)
+            .expect("写出来的必须是合法 JSON");
+        assert_eq!(v["period_label"], "总计");
+        assert_eq!(v["slice_label"], "近30天");
+        assert_eq!(v["total"], 80);
+        assert_eq!(v["keys"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["hourly"].as_array().unwrap().len(),
+            24,
+            "小时必须固定 24 格"
+        );
+        assert_eq!(
+            v["weekday"].as_array().unwrap().len(),
+            7,
+            "星期必须固定 7 格"
+        );
+        assert!(
+            !v["daily"].as_array().unwrap().is_empty(),
+            "每日趋势那一段不见了"
+        );
+        assert!(v["apps"].as_array().unwrap().len() == 1, "应用一段不见了");
+        assert!(
+            v["devices"].as_array().unwrap().len() == 1,
+            "设备一段不见了"
+        );
+        assert!(
+            v["generated_at"].is_string(),
+            "导出时间要在，两份文件才比得出谁新"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     /// 写一份临时 config.ini 并加载。`config::instance()` 是进程内单例，用例改不动它，
@@ -894,11 +1276,14 @@ mod tests {
         );
     }
 
-    /// 四条导出榜单必须都走那**一个**比较器 —— 屏幕上修过的那条规则不许只在屏幕上有。
+    /// 导出与周报的每一张榜单都必须都走那**一个**比较器 —— 屏幕上修过的那条规则不许只在屏幕上有。
     ///
     /// 与本文件 `weekly_goal_shares_the_settings_page_caliper` 同一族的教训：一把尺子
     /// 写在几处，就会有一处被漏掉，而这里的漏法是"每次导出可能给不同的 Top 10"，
     /// 不报错、不崩溃，只有人对过两份文件时才会发现。
+    ///
+    /// 三处而不是六处：CSV 与 HTML 的键鼠/应用/设备三张榜现在都从同一个 `ranked()`
+    /// 出来（改之前是两份文件各写一遍 `.sort_by(`，那是六处）。
     #[test]
     fn every_export_rank_goes_through_the_one_comparator() {
         let src = include_str!("export.rs");
@@ -906,9 +1291,9 @@ mod tests {
         let sorts: Vec<usize> = prod.match_indices(".sort_by(").map(|(i, _)| i).collect();
         assert_eq!(
             sorts.len(),
-            4,
-            "导出的排名榜单应当正好四处（CSV / HTML / 周报 Top 10 / 周报应用 Top 5），\
-             现在数到 {} 处 —— 加了新榜单就要一并进这条断言",
+            3,
+            "导出的排名排序应当正好三处（共用的 `ranked` / 周报 Top 10 / 周报应用 Top 5），\
+             现在数到 {} 处 —— 加了新榜单就要一并进这条断言（并优先接进 `ranked`，别再手抄一遍）",
             sorts.len()
         );
         for (n, at) in sorts.iter().enumerate() {

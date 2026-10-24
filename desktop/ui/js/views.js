@@ -1361,8 +1361,14 @@ const SETTINGS_CATS = [
             btns: [
               { act: "do-export", label: "导出 CSV", fmt: "csv" },
               { act: "do-export", label: "导出 HTML", fmt: "html" },
+              { act: "do-export", label: "导出 JSON", fmt: "json" },
             ],
-            desc: "导出全部历史数据，与顶部统计周期无关。",
+            desc: (s) =>
+              "按顶部统计周期导出（现在是「" + (s.period_label || "说不准") + "」，时间切面按「" +
+              (s.slice_label || "说不准") + "」计）：键鼠排行、每日趋势、" +
+              "每小时与星期分布、应用时长、设备次数六张表，三种格式出自同一次查询。" +
+              "「总计」这一档里排行榜看全部历史，而按日/按小时那几段只数近 30 天 —— " +
+              "文件里这两个名字分开写着，不合成一个含糊的标题。",
           },
           {
             t: "btns", name: "导入旧数据",
@@ -1694,13 +1700,26 @@ async function refreshDataHome() {
 }
 
 export async function doExport(fmtName) {
+  // 导出跟着顶部那个周期选择器走（这一行的全部意义所在：以前永远导全历史，
+  // 页面上看的是近 30 天、交出去的却是全部历史，两份数对不上）。
+  // 数只从一处取：`get_settings` 交回的那份后端状态 —— 与上面那行说明念的是同一个值。
+  const period = settingsUI.data && typeof settingsUI.data.period === "number"
+    ? settingsUI.data.period
+    : null;
+  if (period === null) {
+    setMsg("后端还没把当前周期交出来，此刻不知道要导哪一段 —— 稍等一秒再导出（不猜一个数发出去）", "var(--warning)");
+    return;
+  }
   try {
-    const path = await invoke("export_report", { fmt: fmtName });
-    $("set-msg").textContent = path && path !== "已取消" ? "已导出: " + path : "已取消";
-    $("set-msg").style.color = "var(--success)";
+    const path = await invoke("export_report", { fmt: fmtName, period });
+    if (!path || path === "已取消") {
+      // 取消不是成功：画成绿色就等于"导出完成了"，而盘上一个文件都没多
+      setMsg("已取消，没有写出文件", "var(--muted)");
+      return;
+    }
+    setMsg("已导出: " + path, "var(--success)");
   } catch (e) {
-    $("set-msg").textContent = "导出失败: " + e;
-    $("set-msg").style.color = "var(--danger)";
+    setMsg("导出失败: " + e, "var(--danger)");
   }
 }
 

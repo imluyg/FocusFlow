@@ -2132,7 +2132,7 @@ fn compute_charts(
 ///
 /// `0`（「总计」）刻意是 30 而不是 `MAX_QUERY_DAYS`：卡片上那句「日均(近30天)」用的就是
 /// 这把尺子，图要是横跨全部历史，同一页的"日均"与趋势图的均值就对不上。
-fn chart_window_days(period: i64) -> i64 {
+pub(crate) fn chart_window_days(period: i64) -> i64 {
     match period {
         -1 => 1,
         0 => 30,
