@@ -770,6 +770,62 @@ pub fn get_hourly_stats(target_date: Option<chrono::NaiveDate>) -> Vec<i64> {
     result.flatten().unwrap_or_else(|| vec![0i64; 24])
 }
 
+/// 所选窗口内每小时的合计键数（返回长度 24 的列表）。
+///
+/// 与 `get_hourly_stats`（只看某一天）不是一件事，两个都留着：周报的时段直方图问的就是
+/// "那一天几点"，而分析页的每小时分布要跟顶部周期走 —— 把一头硬套成另一头，就会有一头
+/// 说错话（旧写法是整页写死今日，顶部选了「近 1 年」图上的标题却还写着"今日"）。
+///
+/// 跨年份那套口径照 `get_daily_counts`：某一年的库**问不出在不在**时跳过它并点名是哪一年、
+/// 为什么，绝不折成"那一年每小时都是 0"。
+pub fn get_hourly_totals(days: i64, year: Option<i32>) -> Vec<i64> {
+    let today = Local::now().date_naive();
+    let days = clamp_query_days(days);
+    let (start, years_to_query) = window_start_and_years(today, days, year);
+    let start_dk = day_key_of_date(start);
+    let end_dk = day_key_of_date(today);
+    let mut hourly = vec![0i64; 24];
+    for y in &years_to_query {
+        let path = paths::year_db_path(*y);
+        match year_db_presence(&path) {
+            // 没有这一年的库文件是正常答案（那年没数据、或全新安装）：安静跳过
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(e) => {
+                tracing::error!(
+                    "说不出 {y} 年的库在不在（{}）：{e} —— 这一次这一年不进每小时计数，\
+                     但那不是「那一年每小时都是 0」",
+                    path.display()
+                );
+                continue;
+            }
+        }
+        let year_result = connection::with_ro_conn(&path, |conn| -> rusqlite::Result<()> {
+            if !table_exists(conn, "hourly_counts") {
+                return Ok(());
+            }
+            let mut stmt = conn.prepare(
+                "SELECT hour, SUM(count) FROM hourly_counts \
+                 WHERE date_key >= ?1 AND date_key <= ?2 GROUP BY hour",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![start_dk, end_dk], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows.flatten() {
+                // 越界的小时值历史上真存过，这一问是承重的（与 `get_hourly_stats` 同一道闸）
+                if (0..24).contains(&row.0) {
+                    hourly[row.0 as usize] += row.1;
+                }
+            }
+            Ok(())
+        });
+        if let Some(Err(e)) = year_result {
+            tracing::error!("每小时计数查询失败（{y} 年库）: {e}");
+        }
+    }
+    hourly
+}
+
 /// 查询前台应用使用时长公共实现：app_usage 求总秒数 + 按应用聚合。
 /// `cond` 为日期条件片段，空串表示全表；表不存在（旧库）时返回 None。
 fn query_apps_in_conn(
@@ -3658,5 +3714,61 @@ mod tests {
             }
             other => panic!("缺列的表要落成「读不出来」，实得 {other:?}"),
         }
+    }
+
+    /// 窗口内的每小时合计：只数窗口里那几天，越界的小时值不进任何一格。
+    #[test]
+    fn hourly_totals_sum_the_window_and_ignore_out_of_range_hours() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_hourly_totals");
+        let year = Local::now().year();
+        let today = Local::now().date_naive();
+        {
+            let conn = connection::open_rw(&paths::year_db_path(year)).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            let dk = day_key_of_date(today);
+            // 窗口内（今天、3 天前）与窗口外（40 天前）各一条同一小时的记录：
+            // 上界写错就是把 40 天前那笔也加进来
+            conn.execute(
+                "INSERT INTO hourly_counts (date_key, hour, count) VALUES (?1, 10, 5)",
+                [dk],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO hourly_counts (date_key, hour, count) VALUES (?1, 10, 7)",
+                [dk - 3],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO hourly_counts (date_key, hour, count) VALUES (?1, 10, 9)",
+                [dk - 40],
+            )
+            .unwrap();
+            // 越界的小时值历史上真存过：不能进账，也不能把 24 格撑爆
+            conn.execute(
+                "INSERT INTO hourly_counts (date_key, hour, count) VALUES (?1, 99, 1000)",
+                [dk],
+            )
+            .unwrap();
+        }
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+
+        let win = get_hourly_totals(4, None);
+        assert_eq!(win.len(), 24, "交回的永远是 24 格");
+        assert_eq!(win[10], 12, "窗口内那两天要相加，实得 {}", win[10]);
+        assert_eq!(
+            win.iter().sum::<i64>(),
+            12,
+            "越界的小时值一分都不许进账，实得 {win:?}"
+        );
+
+        // 窗口拉到 60 天，40 天前那笔才算数（这条防的是"永远只数今天"那种修法）
+        let wide = get_hourly_totals(60, None);
+        assert_eq!(
+            wide[10], 21,
+            "近 60 天要含上 40 天前那笔，实得 {}",
+            wide[10]
+        );
     }
 }
