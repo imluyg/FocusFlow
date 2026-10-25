@@ -1329,28 +1329,162 @@ fn keep_floating_on_top(app: &App) {
         .ok();
 }
 
-/// 自动周报的排期：**线程真起来了才把这一周记成「已安排」**。
+/// 自动周报这一趟的结局：**四种分开**，别把"没做成"与"那一周本来没记录"并成一类。
 ///
-/// 原先在 `spawn` 之前就把 marker 推进，末尾再 `.ok()` 把失败咽掉 —— 于是一次资源紧张
-/// （线程数到顶、内存不足）就让那一周的报告永久不再尝试，而设置页与日志都不知道少了
-/// 东西，日志里连那句失败都没有（`.ok()`）。改成起不来就不推进（下一拍再试），
-/// 并用第二个 marker 记住「这一周的失败已经报过」，免得每 500ms 刷一条 error。
+/// 立这一族的原因：这一支原先只认"线程起没起来"。而生成被拒绝时（某一年的库读不动，
+/// 周报宁可不出半份）`Err` 只留下一行 warn，锚点照推进 ⇒ 那一周的报告从此没有，
+/// 设置页与托盘都不说，用户只能自己发现"周报怎么不出了"。上一版补上了"起不来不推进"，
+/// 这次补的是另一半：**做没做成要由这一趟的实际结局说，而不是由线程的生命周期说**。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WeeklyRound {
+    /// 文件真写出来了（带上路径，日志里要说的是它）
+    Written(String),
+    /// 那一周确实没有记录：这是答案，不是故障（新装、长期没用）
+    NoRecord,
+    /// 试过而没做成，原因原样带回去（读不动、写不出去都算这一支）
+    Failed(String),
+    /// 线程压根没起来（资源紧张）：同样没做成，同样要再试
+    NotSpawned(String),
+}
+
+/// 这一周算不算「做完了」：做完了才推进锚点，没做完到点再试。
 ///
-/// 返回 `(新的 last_report_week, 新的失败记录 marker)`。
-fn weekly_report_marking(
-    week_marker: i64,
-    last_marker: i64,
-    error_marker: i64,
-    spawned: bool,
-) -> (i64, i64) {
-    if week_marker == last_marker {
-        return (last_marker, error_marker);
+/// `NoRecord` 也算做完 —— 为"那一周本来没记录"每十分钟重跑一遍十四天的聚合只是占机器，
+/// 而界面上本来就该什么都没有（这与"没有那一年库要说成读不出来"是同一条口径的另一头）。
+fn weekly_round_settles(round: &WeeklyRound) -> bool {
+    matches!(round, WeeklyRound::Written(_) | WeeklyRound::NoRecord)
+}
+
+/// 「上一次为这一周起过线程」到现在隔了多少秒 ⇒ 现在该不该再试一次。
+///
+/// `None` = 本进程还没试过（启动后那一拍立刻试，与旧口径一致）。间隔是为了不让"读不动的
+/// 那一年"变成每 500ms 一次的十四天聚合 —— 那是这条判据要防的第二种病。
+/// 参数已经是秒数而不是 `Instant`：`Instant - Duration` 在开机时间短于那个间隔时会 panic，
+/// 而 release 是 `panic = "abort"`。
+fn weekly_retry_due(since_last_attempt_secs: Option<u64>) -> bool {
+    match since_last_attempt_secs {
+        None => true,
+        Some(secs) => secs >= WEEKLY_RETRY_SECS,
     }
-    if spawned {
-        (week_marker, error_marker)
+}
+
+/// 没做成时再试的间隔（秒）。一周一份的报告，十分钟的补救窗口足够接住
+/// "移动盘还没醒/杀软首扫正握着"那一类瞬时的问不出。
+const WEEKLY_RETRY_SECS: u64 = 600;
+
+/// 「这一周的失败报过没有」：交回 `(这是第一次吗, 新的已报记录)`。
+///
+/// 同一周每十分钟重试一次，只在第一次走 error，之后降到 debug —— 否则日志被刷成噪声
+/// （与托盘 tooltip 写失败那一处同一族规矩：出声只出一次，但**不许不出声**）。
+fn weekly_speaks_once(reported_week: i64, this_week: i64) -> (bool, i64) {
+    (reported_week != this_week, this_week)
+}
+
+/// 日志该走哪一档（调用方按这个选 `info!`／`debug!`／`error!`，判据只算"是哪一档"）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeeklyLog {
+    Info,
+    Debug,
+    Error,
+}
+
+/// 收到上一趟回话之后，这一拍要改哪些状态。抽成纯函数是因为这次要修的正是**状态推进**：
+/// 上一版的病不在算式，而在"做成没做成"这一问被"线程起没起来"替掉了，而那两种改法
+/// 在没有真线程的测试里长得一模一样。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WeeklyReconcile {
+    /// 那一趟还没回来（或从来没跑过）：什么都不动
+    Nothing,
+    /// 这一周做完了：推进锚点、摘掉托盘那句"欠着"，并出这一条日志
+    Settled {
+        week: i64,
+        line: String,
+        level: WeeklyLog,
+    },
+    /// 这一周还欠着：挂上那句"欠着"并出这一条日志（同一周第二次起降到 debug）
+    Outstanding {
+        week: i64,
+        line: String,
+        level: WeeklyLog,
+    },
+}
+
+/// 上一趟的回话落到哪一格。`reported = None` 是"还在跑"，不许被折成 `Nothing` 之外的一格
+/// —— 折成"做完了"就是这次要修的那个洞。
+fn weekly_reconcile(
+    reported: Option<(i64, WeeklyRound)>,
+    error_week: i64,
+) -> (WeeklyReconcile, i64) {
+    let Some((week, round)) = reported else {
+        return (WeeklyReconcile::Nothing, error_week);
+    };
+    if weekly_round_settles(&round) {
+        let (line, level) = match round {
+            WeeklyRound::Written(p) => {
+                (format!("自动周报已生成（{week} 周）: {p}"), WeeklyLog::Info)
+            }
+            _ => (
+                "上一个整周没有记录，跳过自动周报".to_string(),
+                WeeklyLog::Debug,
+            ),
+        };
+        return (WeeklyReconcile::Settled { week, line, level }, error_week);
+    }
+    let why = match &round {
+        WeeklyRound::Failed(w) | WeeklyRound::NotSpawned(w) => w.clone(),
+        // 走到这里不可能（settle 的两支上面已经交出去了），但交回空串比 panic 便宜
+        _ => String::new(),
+    };
+    let (first_time, next_error) = weekly_speaks_once(error_week, week);
+    let level = if first_time {
+        WeeklyLog::Error
     } else {
-        (last_marker, week_marker)
-    }
+        WeeklyLog::Debug
+    };
+    let line = if first_time {
+        format!(
+            "自动周报没生成（{week} 周）：{why} —— 每 {WEEKLY_RETRY_SECS} 秒再试一次；\
+             托盘那句「周报没生成」会说这一刻还欠着，设置页那颗按钮也点得出完整原因"
+        )
+    } else {
+        format!("自动周报还是没生成（{week} 周）：{why}")
+    };
+    (
+        WeeklyReconcile::Outstanding { week, line, level },
+        next_error,
+    )
+}
+
+/// 上一趟的结局：写者是周报线程（与"起线程就失败"那一支的调用方），读者是统计线程的下一拍。
+/// **读走即清** —— 同一趟结果被算两次就会把锚点推进两回。
+static WEEKLY_ROUND: Mutex<Option<(i64, WeeklyRound)>> = Mutex::new(None);
+/// 「此刻是否还欠着一份周报」：托盘那句话读它（唯一的常驻出口 —— 启动进托盘是这个程序的
+/// 默认形态，前端 toast 看不见的时候只剩这里能说）。完整原因在日志，也在设置页那颗按钮
+/// 点下去之后的红字里。
+static WEEKLY_OUTSTANDING: AtomicBool = AtomicBool::new(false);
+
+/// 周报线程把结局交回统计线程的那一步。
+pub(crate) fn publish_weekly_round(week: i64, round: WeeklyRound) {
+    *WEEKLY_ROUND.lock().unwrap_or_else(|e| e.into_inner()) = Some((week, round));
+}
+
+/// 统计线程收一次回话：拿不到就是那一趟还在跑（或从来没跑过）。
+fn take_weekly_round() -> Option<(i64, WeeklyRound)> {
+    WEEKLY_ROUND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// 托盘读的那一问：还欠着一份周报吗。
+pub(crate) fn weekly_report_outstanding() -> bool {
+    WEEKLY_OUTSTANDING.load(Ordering::SeqCst)
+}
+
+/// 挂上/摘掉那句"欠着"。摘的时机有两个：这一周真做完了，以及**为新一周起新趟之前**
+/// （旧那一周的欠账不该被这一周继续念着 —— 那是念旧账）。
+fn mark_weekly_outstanding(outstanding: bool) {
+    WEEKLY_OUTSTANDING.store(outstanding, Ordering::SeqCst);
 }
 
 /// 窗口此刻是否「在用户眼前」：**最小化也算没在眼前**。
@@ -1435,9 +1569,12 @@ fn spawn_stats_worker(
             // 时，重聚合只会重复算出同样结果——增量都在写线程内存里，flush 前不进库。
             let mut charts_seq: u64 = u64::MAX;
             let mut charts_period: i64 = i64::MIN;
-            // 上次生成自动周报的锚点（上一个整周周一的 CE 天序号）
-            let mut last_report_week: i64 = 0;
-            // 「哪一周的起线程失败已经报过」：失败那一周只报一条，之后每拍静默重试
+            // 自动周报：**做成过**的那一周的锚点（写出来了，或确认那一周没有记录）。
+            // 旧口径记的是"起过线程的那一周"—— 那不等于做成了，失败那一周从此不再试。
+            let mut settled_report_week: i64 = 0;
+            // 上一次为这一周起线程的时刻（None = 本进程还没试过）：再试的间隔由它算
+            let mut weekly_attempt_at: Option<Instant> = None;
+            // 「哪一周的失败已经报过」：失败那一周只 error 一条，之后降到 debug
             let mut weekly_error_week: i64 = i64::MIN;
 
             loop {
@@ -1529,10 +1666,15 @@ fn spawn_stats_worker(
                     || (main_visible && flush_seq_now != charts_seq);
 
                 // 自动周报：进程启动后的第一轮、以及跨进新一周后的第一轮，为
-                // 「刚结束的那个整周」生成一次 Markdown 报告。锚点取本周一，
-                // 所以同一周内 marker 恒定 —— 每周最多一次，重启也只是重写同一份
-                // 文件。生成要跑 7 天的聚合查询，放进独立线程，不占用本线程的
-                // 500ms 快节奏。
+                // 「刚结束的那个整周」生成一次 Markdown 报告。锚点取本周一，所以同一周内
+                // marker 恒定 —— 做成一次就不再重做。生成要跑 7 天的聚合查询，
+                // 放进独立线程，不占用本线程的 500ms 快节奏。
+                //
+                // 三件事分开：**写出来了**、**那一周确实没有记录**（那是答案，安静）、
+                // **没做成**（原因进日志、托盘那句"周报没生成"挂上、按 `WEEKLY_RETRY_SECS` 再试）。
+                // 旧写法只认"线程起没起来"：一次生成被拒绝（某一年的库读不动时周报宁可不出半份）
+                // 只留下一行 warn，锚点照推进 ⇒ 那一周的报告从此没有，而设置页与托盘一个字都不说 ——
+                // 用户只能自己发现"周报怎么不出了"。
                 let week_marker = {
                     use chrono::Datelike;
                     let (f, _) = focusflow_core::stats::last_finished_week(
@@ -1540,30 +1682,52 @@ fn spawn_stats_worker(
                     );
                     f.num_days_from_ce() as i64
                 };
-                if week_marker != last_report_week {
-                    let result = std::thread::Builder::new()
-                        .name("weekly-report".into())
-                        .spawn(|| match crate::export::write_weekly_report() {
-                            Ok(Some(p)) => tracing::info!("自动周报已生成: {}", p.display()),
-                            // 新装/长期没用：那一周没有记录，本来就没有可报告的
-                            Ok(None) => tracing::debug!("上一个整周没有记录，跳过自动周报"),
-                            Err(e) => tracing::warn!("自动周报生成失败: {e}"),
-                        });
-                    let spawned = result.is_ok();
-                    let reason = result.err().map(|e| e.to_string()).unwrap_or_default();
-                    let (next_week, next_error_week) = weekly_report_marking(
-                        week_marker,
-                        last_report_week,
-                        weekly_error_week,
-                        spawned,
-                    );
-                    if next_error_week != weekly_error_week {
-                        tracing::error!(
-                            "自动周报线程起不来：{reason}；那一周的报告还没生成，稍后会再试"
-                        );
+                // 先把上一趟的回话收走（收不到就是那一趟还在跑）
+                let (reconcile, next_error_week) =
+                    weekly_reconcile(take_weekly_round(), weekly_error_week);
+                match reconcile {
+                    WeeklyReconcile::Nothing => {}
+                    WeeklyReconcile::Settled { week, line, level } => {
+                        settled_report_week = week;
+                        mark_weekly_outstanding(false);
+                        match level {
+                            WeeklyLog::Info => tracing::info!("{line}"),
+                            _ => tracing::debug!("{line}"),
+                        }
                     }
-                    last_report_week = next_week;
-                    weekly_error_week = next_error_week;
+                    WeeklyReconcile::Outstanding {
+                        week: _,
+                        line,
+                        level,
+                    } => {
+                        mark_weekly_outstanding(true);
+                        match level {
+                            WeeklyLog::Error => tracing::error!("{line}"),
+                            _ => tracing::debug!("{line}"),
+                        }
+                    }
+                }
+                weekly_error_week = next_error_week;
+                let since_attempt = weekly_attempt_at.map(|t| t.elapsed().as_secs());
+                if week_marker != settled_report_week && weekly_retry_due(since_attempt) {
+                    // 起新趟之前先把那句"欠着"摘掉：上一周那笔不该被这一周继续挂着念
+                    mark_weekly_outstanding(false);
+                    weekly_attempt_at = Some(Instant::now());
+                    let spawned = std::thread::Builder::new()
+                        .name("weekly-report".into())
+                        .spawn(move || {
+                            let round = match crate::export::write_weekly_report() {
+                                Ok(Some(p)) => WeeklyRound::Written(p.display().to_string()),
+                                // 新装/长期没用：那一周没有记录，本来就没有可报告的
+                                Ok(None) => WeeklyRound::NoRecord,
+                                Err(e) => WeeklyRound::Failed(e.to_string()),
+                            };
+                            publish_weekly_round(week_marker, round);
+                        });
+                    if let Err(e) = spawned {
+                        // 线程压根没起来也算这一周没做成：挂上原因、到点再试，不许咽掉
+                        publish_weekly_round(week_marker, WeeklyRound::NotSpawned(e.to_string()));
+                    }
                 }
 
                 if do_heavy {
@@ -2949,38 +3113,192 @@ mod restart_gate_tests {
         );
     }
 
-    /// 自动周报：**线程真起来了才把这一周记成「已安排」**，失败那一周只报一条错。
+    /// 自动周报的四种结局：**做没做成由这一趟的实际结局说，不由线程的生命周期说**。
     ///
-    /// 回归：原先在 spawn 之前 `last_report_week = week_marker`，末尾 `.ok()` 把失败
-    /// 咽掉 —— 一次资源紧张就让那一周的报告永久不再尝试，日志里连失败都没有。
+    /// 回归的两代病：第一代在 `spawn` 之前就推进锚点、末尾 `.ok()` 咽掉失败 ⇒ 一次资源紧张
+    /// 就让那一周永不再试且日志零字；第二代（上一版修完那一半之后）只认"线程起没起来"，
+    /// 于是**生成被拒绝**（某一年的库读不动时周报宁可不出半份）照旧推进锚点，只剩一行 warn，
+    /// 设置页与托盘都不说。这两种都必须落进"没做成"，而"那一周确实没有记录"不许跟着一起重试。
     #[test]
-    fn weekly_report_marks_only_when_the_thread_started() {
-        use super::weekly_report_marking;
+    fn the_weekly_round_separates_written_from_absent_record_and_two_kinds_of_failure() {
+        use super::{weekly_round_settles, WeeklyRound};
 
-        let (last, err) = weekly_report_marking(100, 90, i64::MIN, true);
         assert!(
-            last == 100 && err == i64::MIN,
-            "线程起来就推进这一周的锚点，且不该有失败记录，实际 {last}/{err}"
+            weekly_round_settles(&WeeklyRound::Written("r.md".into())),
+            "写出来了就是做完了"
+        );
+        assert!(
+            weekly_round_settles(&WeeklyRound::NoRecord),
+            "那一周确实没有记录也是做完了：没有是答案，为它每十分钟重跑十四天聚合只是占机器"
+        );
+        assert!(
+            !weekly_round_settles(&WeeklyRound::Failed("这些年度库打不开".into())),
+            "生成被拒绝不许算成做完——那一周的报告还欠着"
+        );
+        assert!(
+            !weekly_round_settles(&WeeklyRound::NotSpawned("资源不足".into())),
+            "线程压根没起来同样没做成（这一半是上一版立的，别退回去）"
+        );
+    }
+
+    /// 没做成时要再试，但不能每 500ms 试一次：再试的间隔由这把尺子答。
+    #[test]
+    fn the_weekly_retry_waits_instead_of_hammering() {
+        use super::{weekly_retry_due, WEEKLY_RETRY_SECS};
+
+        assert!(
+            weekly_retry_due(None),
+            "本进程还没试过：启动后那一拍就该试（与旧口径一致）"
+        );
+        assert!(
+            !weekly_retry_due(Some(0)),
+            "刚起过一趟就每拍再 spawn 一次 = 十四天聚合跑在 500ms 节奏上"
+        );
+        assert!(
+            !weekly_retry_due(Some(WEEKLY_RETRY_SECS - 1)),
+            "间隔没到就再试，这条判据等于没立"
+        );
+        assert!(
+            weekly_retry_due(Some(WEEKLY_RETRY_SECS)),
+            "到点就该再试：移动盘刚醒/杀软首扫那一类是过得去的"
+        );
+    }
+
+    /// 同一周的重试只在第一次走 error，之后降到 debug；**但第一次不许省**。
+    #[test]
+    fn the_weekly_failure_is_said_once_per_week() {
+        use super::weekly_speaks_once;
+
+        let (speak, next) = weekly_speaks_once(i64::MIN, 100);
+        assert!(speak && next == 100, "这一周第一次失败必须出声");
+        let (speak2, next2) = weekly_speaks_once(100, 100);
+        assert!(!speak2 && next2 == 100, "同一周第二次不许刷屏");
+        let (speak3, next3) = weekly_speaks_once(100, 107);
+        assert!(speak3 && next3 == 107, "换了一周就是新的欠账，要再出声一次");
+    }
+
+    /// 状态的推进本身：**做完了才动锚点，没做成才挂"欠着"**，四种结局各走各的。
+    ///
+    /// 这一条钉的是这次要修的那件事：上一版的病不在算式，而在"做成没做成"被
+    /// "线程起没起来"替掉 —— 而那两种写法在没有真线程的测试里长得一模一样，
+    /// 所以判据必须落在纯函数这一层。
+    #[test]
+    fn the_weekly_state_moves_only_when_the_round_actually_finished() {
+        use super::{weekly_reconcile, WeeklyLog, WeeklyReconcile, WeeklyRound};
+
+        // 还没回话：什么都不动，`error_week` 也不动
+        let (rec, err) = weekly_reconcile(None, i64::MIN);
+        assert!(
+            matches!(rec, WeeklyReconcile::Nothing) && err == i64::MIN,
+            "那一趟还在跑时不许推进任何东西，实得 {rec:?}/{err}"
         );
 
-        let (last, err) = weekly_report_marking(100, 90, i64::MIN, false);
-        assert!(
-            last == 90 && err == 100,
-            "线程没起来时锚点不动（下一拍再试），失败记到这一周，实际 {last}/{err}"
-        );
+        // 写出来了：推进锚点 + Info 那一句
+        let (rec, err) =
+            weekly_reconcile(Some((100, WeeklyRound::Written("r.md".into()))), i64::MIN);
+        match &rec {
+            WeeklyReconcile::Settled { week, line, level } => {
+                assert_eq!(*week, 100, "做完了要把这一周的锚点推上去");
+                assert_eq!(*level, WeeklyLog::Info, "写出来了走 info");
+                assert!(line.contains("r.md"), "路径要说得出，实得 {line}");
+            }
+            other => panic!("写出来那一支该落 Settled，实得 {other:?}"),
+        }
+        assert_eq!(err, i64::MIN, "做成那一趟不占用失败记录");
 
-        // 同一周第二次失败：error 标记未变 ⇒ 调用方据此不再重复出声
-        let (last, err) = weekly_report_marking(100, 90, 100, false);
-        assert!(
-            last == 90 && err == 100,
-            "已经报过的同一周不该再记一次，实际 {last}/{err}"
-        );
+        // 那一周确实没有记录：也算做完，但不许用 info 吓唬人
+        let (rec, _) = weekly_reconcile(Some((100, WeeklyRound::NoRecord)), i64::MIN);
+        match rec {
+            WeeklyReconcile::Settled { level, line, .. } => {
+                assert_eq!(level, WeeklyLog::Debug, "没有记录是答案，不是成绩");
+                assert!(line.contains("没有记录"), "实得 {line}");
+            }
+            other => panic!("NoRecord 那一支该落 Settled，实得 {other:?}"),
+        }
 
-        // 同一周已经安排好：什么都不动
-        let (last, err) = weekly_report_marking(100, 100, 100, true);
+        // 生成被拒绝：不推进、挂"欠着"、第一次走 error 且把原因带在句子里
+        let why = "这一轮没读全（2026 年库打不开）";
+        let (rec, err) = weekly_reconcile(Some((100, WeeklyRound::Failed(why.into()))), i64::MIN);
+        match &rec {
+            WeeklyReconcile::Outstanding { week, line, level } => {
+                assert_eq!(*week, 100);
+                assert_eq!(*level, WeeklyLog::Error, "第一次必须走得响一点");
+                assert!(line.contains(why), "原因要原样在句子里，实得 {line}");
+                assert!(line.contains("再试"), "要说这是会重试的，实得 {line}");
+            }
+            other => panic!("生成被拒绝那一支必须落 Outstanding，实得 {other:?}"),
+        }
+        assert_eq!(err, 100, "这一周的失败已经记下了");
+
+        // 同一周第二次（十分钟后再试还是失败）：仍然挂著，但降到 debug
+        let (rec, err2) = weekly_reconcile(Some((100, WeeklyRound::Failed(why.into()))), 100);
+        match rec {
+            WeeklyReconcile::Outstanding { level, line, .. } => {
+                assert_eq!(level, WeeklyLog::Debug, "同一周不许把日志刷成噪声");
+                assert!(line.contains(why), "降档不许把原因一起降掉，实得 {line}");
+            }
+            other => panic!("还是失败，实得 {other:?}"),
+        }
+        assert_eq!(err2, 100);
+
+        // 线程压根没起来：同一格（这一周没做成），换到新的一周要再出声一次
+        let (rec, err3) =
+            weekly_reconcile(Some((107, WeeklyRound::NotSpawned("资源不足".into()))), 100);
+        match rec {
+            WeeklyReconcile::Outstanding { level, .. } => {
+                assert_eq!(level, WeeklyLog::Error, "换了一周就是新的欠账")
+            }
+            other => panic!("NotSpawned 不许算成做完，实得 {other:?}"),
+        }
+        assert_eq!(err3, 107);
+    }
+
+    /// 接线判据：那一趟的**结果**必须被交回统计线程，三种结局各交一次，一处都不许咽。
+    ///
+    /// 行为用例钉得住判据本身，钉不住"线程体里到底有没有把结局交回来"——那一支在无头环境里
+    /// 要真起线程、真跑十四天聚合才走得到，所以这里按形状钉：`publish_weekly_round` 在
+    /// 写出来／没记录／失败／起不来四处都出现过，锚点与那句"欠着"只由 `weekly_reconcile`
+    /// 那一问推进，不再看 `spawn` 的 `is_ok()`。
+    #[test]
+    fn the_weekly_thread_reports_its_outcome_on_every_arm() {
+        let src = include_str!("state.rs");
+        let at = src.find("fn spawn_stats_worker").expect("统计线程找不到了");
+        let body = &src[at..at + src[at..].find("\nfn ").expect("后面没有顶层函数了")];
+        // 剪掉整行注释：这一段自己的说明文字里就写着"旧写法只认线程起没起来"，
+        // 带着注释判"不许再看 is_ok()"会红在该改的地方之外。
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for arm in [
+            "WeeklyRound::Written(",
+            "WeeklyRound::NoRecord,",
+            "WeeklyRound::Failed(",
+            "WeeklyRound::NotSpawned(",
+        ] {
+            assert!(
+                code.contains(arm),
+                "周报那一趟的结局少了「{arm}」这一支 —— 少一支就是一种新的静默"
+            );
+        }
         assert!(
-            last == 100 && err == 100,
-            "同一周不重复生成，实际 {last}/{err}"
+            code.matches("publish_weekly_round(").count() >= 2,
+            "线程体与「起线程就失败」那一支都要把结局交回来，实得 {}",
+            code.matches("publish_weekly_round(").count()
+        );
+        assert!(
+            code.contains("weekly_reconcile(take_weekly_round("),
+            "锚点的推进必须问「这一趟做成了吗」，不是问「线程起来了吗」"
+        );
+        assert!(
+            !code.contains("result.is_ok()"),
+            "又只看 spawn 成没成来推进锚点 —— 生成被拒绝那一支会重新变回静默"
+        );
+        assert!(
+            code.contains("mark_weekly_outstanding(false)")
+                && code.contains("mark_weekly_outstanding(true)"),
+            "做成要摘掉托盘那句、没做成要挂上 —— 少一边就是念旧账或永远不说"
         );
     }
 
@@ -3000,8 +3318,8 @@ mod restart_gate_tests {
         let at2 = src.find("fn spawn_stats_worker").expect("统计线程找不到了");
         let body2 = &src[at2..at2 + src[at2..].find("\nfn ").expect("后面没有顶层函数了")];
         assert!(
-            body2.contains("weekly_report_marking("),
-            "周报的名额推进没走「线程真起来了才算」那条判据"
+            body2.contains("if let Err(e) = spawned"),
+            "周报线程起不来时要把原因交回去（NotSpawned 那一支），不许 `.ok()` 咽掉"
         );
     }
 }

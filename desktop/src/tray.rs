@@ -116,6 +116,20 @@ fn rest_segment(notice: Option<&focusflow_core::stats::RestNotice>) -> String {
     }
 }
 
+/// 托盘 tooltip 上那一句"这一周的周报还没生成"（不欠着时交回空串，整句照常）。
+///
+/// 只答"欠不欠"这一件事，不念原因也不念周数：原因有整句那么长（"这些年度库打不开…"），
+/// 而这一格每 5 秒被整段重算一次，位置是今日/速度那两行的位置。
+/// 挂着就代表此刻确实还欠着一份 —— 统计线程在那一周做成之后、以及为新一周起新趟之前
+/// 都会把它摘掉，所以它不会念旧账（那两处的顺序由 `state.rs` 的接线判据钉）。
+fn weekly_segment(outstanding: bool) -> String {
+    if outstanding {
+        " · ⚠ 周报没生成".to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// 设置托盘图标 + 菜单 + 事件 + 后台 tooltip/图标更新。
 pub fn setup_tray(app: &mut App) -> anyhow::Result<()> {
     let show_item = MenuItem::with_id(app, MENU_SHOW, "显示统计面板", true, None::<&str>)?;
@@ -213,17 +227,24 @@ fn spawn_tray_updater(app: &App, paused_icon: tauri::image::Image<'static>) {
                 } else {
                     String::new()
                 };
+                // 周报还欠着那一句：与久坐同一族道理 —— 启动进托盘是这个程序的默认形态，
+                // 主窗口可能压根没开，前端那句红字没人看见，而自动周报是**后台**失败的，
+                // 用户唯一能察觉的是"这周的周报怎么没出现"。完整原因在日志与设置页那颗按钮，
+                // tooltip 的位置本来就挤（今日、速度、活跃、已暂停、自检、久坐已经占了六段），
+                // 这里只说"欠着"这一件事。
+                let weekly_str = weekly_segment(crate::state::weekly_report_outstanding());
                 // 久坐提醒那一句：面板与悬浮窗都不在眼前时，托盘是唯一还会说话的出口。
                 // "还在不在有效期"这一问只由 `rest_notice_now()` 答一次（过期就不交回来），
                 // 这里不许再判一遍时间 —— 两处各判就会有两把尺子。
                 let rest_str = rest_segment(crate::state::rest_notice_now().as_ref());
                 let tooltip = format!(
-                    "FocusFlow - 今日 {} · 速度 {}/分{}{}{}{}",
+                    "FocusFlow - 今日 {} · 速度 {}/分{}{}{}{}{}",
                     s.today_count,
                     s.cpm,
                     active_str,
                     if paused { " · 已暂停" } else { "" },
                     check_str,
+                    weekly_str,
                     rest_str,
                 );
                 (
@@ -465,10 +486,10 @@ mod tests {
 
 #[cfg(test)]
 mod rest_tooltip_tests {
-    use super::{apply_tooltip_text, rest_segment, TextRound};
+    use super::{apply_tooltip_text, rest_segment, weekly_segment, TextRound};
     use std::cell::Cell;
 
-    /// 没有活的提醒时那一段必须是空串：前五段照旧，不许拖出一个「 · 」的尾巴。
+    /// 没有活的提醒时那一段必须是空串：前面几段照旧，不许拖出一个「 · 」的尾巴。
     #[test]
     fn the_rest_segment_only_appears_while_a_notice_is_live() {
         assert_eq!(rest_segment(None), "", "没有提醒时不该留下分隔符");
@@ -484,6 +505,25 @@ mod rest_tooltip_tests {
             "与前几段同一个分隔写法，实得：{line}"
         );
         assert!(line.contains("45 秒"), "要说得出该活动几秒，实得：{line}");
+    }
+
+    /// 周报欠着时托盘要说那一句，不欠时要闭嘴 —— 同样不许拖出分隔符的尾巴。
+    ///
+    /// 这一句是"自动周报没生成"唯一的常驻出口：主窗口可能压根没开（启动进托盘是默认形态），
+    /// 而这一支的失败发生在后台，人不看日志就永远不知道少了什么。
+    /// ⚠ 屏上到底重画没重画是眼验账（与久坐那一条同一族），这条用例钉的是那句话的**有无**。
+    #[test]
+    fn the_weekly_segment_appears_only_while_a_report_is_outstanding() {
+        assert_eq!(
+            weekly_segment(false),
+            "",
+            "做成或还没试过都不许说话，别拖出一个「 · 」的尾巴"
+        );
+        let line = weekly_segment(true);
+        assert!(
+            line.starts_with(" · ") && line.contains("周报没生成"),
+            "欠着一份周报时托盘要说出这一件事，实得：{line}"
+        );
     }
 
     /// 「写了」不等于「屏上是这句」：只有那次调用成功才允许认领；内容没变不许白跑一次 COM。
