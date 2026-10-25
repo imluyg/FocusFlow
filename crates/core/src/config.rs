@@ -93,6 +93,10 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             // 主窗口隐藏够久就卸载渲染进程（省几百 MB；false = 一直留着）
             ("unload_hidden", "true"),
             ("unload_hidden_delay", "60"),
+            // 按住（隐藏）一个窗口时要不要连 `TrySuspend` 一起按 —— 让那条渲染进程真的停下。
+            // 默认关：这个 API 全仓从未用过、一个数都没有，所以对拍出局之前它不许改任何行为。
+            // 读点：`desktop/src/state.rs` 的 `suspend_hidden_enabled`。
+            ("suspend_hidden", "false"),
             // 悬浮窗显示口径：times / duration / both（desktop/ui/floating.js 读）
             ("floating_metric", "times"),
             // 悬浮窗用哪套绘制：webview（WebView2，一直以来的样子）/ native（原生分层窗口）。

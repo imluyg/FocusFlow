@@ -620,6 +620,75 @@ fn set_webview_memory_level(app: &tauri::AppHandle, label: &str, low: bool) -> b
     })
 }
 
+/// 按住/抬起时要不要动第三个开关（挂起渲染进程）。
+///
+/// 三态而不是 bool：`Skip` 必须真的是"一个字都不发"。出厂配置走的就是 `Skip` ——
+/// 那条 API 一个实测数都没有，混进已经验证过的两个开关里就等于未经度量改行为。
+#[derive(Debug, PartialEq, Eq)]
+enum SuspendChoice {
+    Skip,
+    Suspend,
+    Resume,
+}
+
+/// 纯判据：`[gui] suspend_hidden` 开不开 × 这次是抬起还是按住 ⇒ 第三个开关怎么办。
+/// 单独成一个函数，是因为它的全部风险都在"什么时候不许发"这一格，而这一格能无头钉住。
+fn suspend_choice(suspend_enabled: bool, active: bool) -> SuspendChoice {
+    match (suspend_enabled, active) {
+        (false, _) => SuspendChoice::Skip,
+        (true, false) => SuspendChoice::Suspend,
+        (true, true) => SuspendChoice::Resume,
+    }
+}
+
+/// 读 `[gui] suspend_hidden`。认不出的一律按关：这条还在"有没有收益要先量"的阶段。
+fn suspend_hidden_enabled() -> bool {
+    focusflow_core::config::instance().get_bool("gui", "suspend_hidden", false)
+}
+
+/// 第三个开关：`TrySuspend` 让那条渲染进程停手，`Resume` 叫醒它。
+///
+/// 与前两个开关的分工：`SetIsVisible(false)` 只是不再合成，进程还活着、还占着它那一坨；
+/// `SetMemoryUsageTargetLevel(LOW)` 是"允许它压掉自己的缓存"；这一条才是让它停下来。
+///
+/// 三态返回值与 [`set_webview_memory_level`] 一致：窗口不存在 ⇒ `true`（懒建的还没建起来，
+/// 不算失败）；控制器未就绪 ⇒ `false`（调用方重试）；运行时太旧 ⇒ `true`
+/// （永久性不可用，重试到 60 秒之外也不会变好）。
+/// 不挂完成回调：它给的是"这一次有没有真停下来"，而这条的验收是两次场景读数，不是日志里
+/// 多一行；为一个量不到的观察量建 COM 实现，是这条实验不需要的复杂度。
+fn set_webview_suspend(app: &tauri::AppHandle, label: &str, suspend: bool) -> bool {
+    let Some(win) = app.get_webview_window(label) else {
+        return true;
+    };
+    with_webview_sync(&win, move |webview| {
+        #[cfg(windows)]
+        unsafe {
+            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_3;
+            use windows::core::Interface;
+            let controller = webview.controller();
+            if let Ok(core) = controller.CoreWebView2() {
+                if let Ok(v3) = core.cast::<ICoreWebView2_3>() {
+                    return if suspend {
+                        v3.TrySuspend(None).is_ok()
+                    } else {
+                        v3.Resume().is_ok()
+                    };
+                }
+                tracing::warn!("WebView2 运行时过旧，不支持挂起/恢复渲染进程");
+                // 永久性不可用：报 true，别让调用方为它重试到一分钟之外
+                return true;
+            }
+            // CoreWebView2 未就绪：报 false，让调用方重试
+            false
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = suspend;
+            true
+        }
+    })
+}
+
 /// 一个窗口自己隐藏/显示时，把 WebView2 的两个开关一起跟上：
 /// 隐藏 ⇒ 停渲染合成 + 降内存档位；显示 ⇒ 恢复渲染 + Normal，且必须排在 `show()` **之前**
 /// （见 [`set_webview_rendering`] 的注释：不先恢复就不重绘）。
@@ -627,10 +696,20 @@ fn set_webview_memory_level(app: &tauri::AppHandle, label: &str, low: bool) -> b
 /// 为什么绑成一个动作而不是两处各写一遍：2026-10-06 那次实测里，主窗口隐藏那一刻省下的
 /// **−62.9 MB 工作集**是这两个开关共同买到的；单独一项没测过，而"页面卸载到 about:blank"
 /// 那条机制实测 ≈0（−16.8 MB 工作集、私有提交在噪声内反升）。少做一件就是白做一半。
+///
+/// 第三个开关（`set_webview_suspend`）走 `suspend_choice` 的三态：出厂按关 ⇒ 与只有
+/// 上面两件事时逐字一致；按开才多挂一条挂起/唤醒。**它的收益目前没有数**，要拿同一个
+/// 二进制改一次配置对拍才知道。
 pub fn set_window_webview_active(app: &tauri::AppHandle, label: &str, active: bool) -> bool {
     let rendering = set_webview_rendering(app, label, active);
     let level = set_webview_memory_level(app, label, !active);
-    rendering && level
+    let suspend = match suspend_choice(suspend_hidden_enabled(), active) {
+        // 按关 ⇒ 一个字都不发：这一格必须是 `true`，不能是"发一条再说"
+        SuspendChoice::Skip => true,
+        SuspendChoice::Suspend => set_webview_suspend(app, label, true),
+        SuspendChoice::Resume => set_webview_suspend(app, label, false),
+    };
+    rendering && level && suspend
 }
 
 /// 设置 WebView2 控制器可见性（IsVisible）。
@@ -3609,7 +3688,7 @@ mod startup_window_wiring {
 
 #[cfg(test)]
 mod visibility_wiring {
-    use super::{just_shown, window_in_front};
+    use super::{just_shown, suspend_choice, window_in_front, SuspendChoice};
 
     /// 最小化也算「没在眼前」—— 与 `hotkey::hotkey_should_hide` 同一把尺子。
     /// 只看 `is_visible()` 的话，最小化挂着的面板照样每 2 秒跑一次重聚合，
@@ -3736,6 +3815,109 @@ mod visibility_wiring {
         assert!(
             flat.contains("set_webview_memory_level(app,label,!active)"),
             "没设内存档位，或者方向写反了（应当与渲染反向）：{flat}"
+        );
+    }
+
+    /// 第三个开关的三态：**默认按关时必须是一个字都不发**。
+    /// 它的病症不是崩，是"未经度量就多挂了一条指令" —— 那条指令会不会让画面迟一帧，没人量过。
+    #[test]
+    fn the_third_switch_stays_silent_until_the_config_arms_it() {
+        assert_eq!(
+            suspend_choice(false, false),
+            SuspendChoice::Skip,
+            "按住时按关 ⇒ 不许挂起"
+        );
+        assert_eq!(
+            suspend_choice(false, true),
+            SuspendChoice::Skip,
+            "抬起时按关 ⇒ 也不许唤醒（没挂起过，唤醒就是一条没人等的指令）"
+        );
+        assert_eq!(suspend_choice(true, false), SuspendChoice::Suspend);
+        assert_eq!(suspend_choice(true, true), SuspendChoice::Resume);
+    }
+
+    /// 接线腿：那只手现在要**先问配置**再决定第三件事，而"按关就是不发"必须写在它的臂上。
+    #[test]
+    fn the_park_helper_asks_the_config_before_touching_the_third_switch() {
+        let src = include_str!("state.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn set_window_webview_active")
+            .expect("那个助手不见了");
+        let body = &prod[at..at + prod[at..].find("\n}").expect("助手没有收尾")];
+        let flat: String = body
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("suspend_choice(suspend_hidden_enabled(),active)"),
+            "第三个开关没先问配置就走：出厂默认也会多挂一条指令：{flat}"
+        );
+        assert!(
+            flat.contains("SuspendChoice::Skip=>true"),
+            "按关那一臂不是直接给 true，就是照样发了消息：{flat}"
+        );
+        assert!(
+            flat.contains("set_webview_suspend(app,label,true)")
+                && flat.contains("set_webview_suspend(app,label,false)"),
+            "挂起与唤醒不是同一条 switch 的两支：抬起那一支永远不会叫醒那条进程：{flat}"
+        );
+        // 读点自己的兜底默认也要钉住：认不出配置时按关。否则一条没人量的指令会因为
+        // 一个键被写错而默认生效 —— 与 `floating_renderer` 认不出按 webview 同一条口径。
+        let read_at = prod
+            .find("fn suspend_hidden_enabled")
+            .expect("那个读点不见了");
+        let read_body =
+            &prod[read_at..read_at + prod[read_at..].find("\n}").expect("读点没有收尾")];
+        assert!(
+            read_body.contains(r#"get_bool("gui", "suspend_hidden", false)"#),
+            "读点的兜底默认不是关：没人量的那条指令会默认生效"
+        );
+    }
+
+    /// 挂起/唤醒这第三条指令的三态结论必须与档位那条同形：问的是 `ICoreWebView2_3`，
+    /// 两条调用都在，而"运行时太旧"要提前报 true —— 不写清楚的话，下一个改这里的人会
+    /// 把它当成"失败"报 false，于是每次按住都白重试到一分钟之外。
+    #[test]
+    fn the_suspend_switch_asks_the_right_interface_and_keeps_the_permanent_verdict() {
+        let src = include_str!("state.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn set_webview_suspend")
+            .expect("挂起那个开关不见了");
+        let body = &prod[at..at + prod[at..].find("\n}\n").expect("函数没有收尾")];
+        let flat: String = body
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("core.cast::<ICoreWebView2_3>()"),
+            "问错了接口：挂起与唤醒只在 ICoreWebView2_3 上：{flat}"
+        );
+        assert!(
+            flat.contains("v3.TrySuspend(None).is_ok()") && flat.contains("v3.Resume().is_ok()"),
+            "挂起与唤醒两条调用少了一条，或者不是拿调用结果当结论：{flat}"
+        );
+        let doc: String = prod[..at]
+            .lines()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            doc.contains("永久性") && doc.contains("重试"),
+            "没写明为什么太旧要报 true：这条不写就会被人改成 false，然后每次按住都白重试"
         );
     }
 }
