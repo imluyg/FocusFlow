@@ -97,6 +97,13 @@ static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// 触发本次会话前悬浮窗是否可见 —— 结束时**原样**恢复，而不是按 `[floating] enabled` 恢复。
 /// 用户完全可以在开着悬浮窗的时候截图，也可以在关着的时候截图，两种都要回到原样。
 static FLOATING_WAS_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// 覆盖层当前是否被"停渲染 + 降内存档位"按住（见 `park_overlay`）。
+///
+/// 为什么要有这一格：这两个开关只能凭 `SetIsVisible(false)` 那种一次性指令去设，读不回来。
+/// 没有这格的话，每次显示都要盲发一次"恢复"—— 而**首次**创建时控制器还没就绪，那次盲发
+/// 必然报 false，日志里每次正常的首图都夹一句警告，警告就废了。有了这格，警告只在
+/// "确实按住过、却没解开"时出声，那才是要人看的那一条。
+static OVERLAY_PARKED: AtomicBool = AtomicBool::new(false);
 
 /// 页面回报的选区（CSS 像素）+ 它自己看到的缩放倍数。
 #[derive(Debug, Deserialize)]
@@ -449,6 +456,8 @@ fn show_overlay(app: &AppHandle, epoch: u64) -> Result<(), String> {
         .map_err(|e| format!("设置覆盖层尺寸失败：{e}"))?;
     win.set_position(PhysicalPosition::new(rect.x, rect.y))
         .map_err(|e| format!("设置覆盖层位置失败：{e}"))?;
+    // 抬渲染必须排在显示之前，且抬不开就不显示（见 `unpark_overlay`）。
+    unpark_overlay(app)?;
     win.show().map_err(|e| format!("显示覆盖层失败：{e}"))?;
     win.set_focus()
         .map_err(|e| format!("覆盖层取焦点失败：{e}"))?;
@@ -555,6 +564,49 @@ fn may_finish(claim: u64, current: u64) -> bool {
     claim == 0 || claim == current
 }
 
+/// 覆盖层隐藏之后把它按住：停渲染合成 + 降内存档位。
+///
+/// 覆盖层是懒创建、建完就常驻复用的（见模块头第 1 条：不销毁是因为 WebView2 在同进程内
+/// 销毁后重建控制器不可靠）。所以**按过一次截图热键，就多一个整屏的渲染进程常驻**——
+/// 它今天只有 `win.hide()`，Windows 的隐藏窗口不会让 WebView2 认为自己不可见，于是渲染合成
+/// 管线和内核对它的全部缓存一直保留着。主窗口 2026-10-06 那次实测证明这两个开关值 −62.9 MB
+/// 工作集，而覆盖层从来没被喂过（它不在 `APP_MANAGED_LABELS` 里，理由见那个常量的注释）。
+///
+/// 设失败时保持"未按住"，下次显示不去盲目恢复、下次隐藏再试一次；出声，因为这条是省内存
+/// 的正主，不是可有可无的收尾。
+fn park_overlay(app: &AppHandle) {
+    if crate::state::set_window_webview_active(app, SNIP_LABEL, false) {
+        OVERLAY_PARKED.store(true, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        tracing::warn!("截图覆盖层没能停住渲染/降档（控制器未就绪），这次隐藏省不下那份内存");
+    }
+}
+
+/// 显示前把按住的那两个开关抬回来。**必须排在 `win.show()` 之前**：`SetIsVisible(false)`
+/// 之后不先恢复就显示，WebView2 不会重绘。
+///
+/// 抬不回来就**不显示**并让这次会话失败：覆盖层是一张全屏不透明 topmost 窗口，抬不开时
+/// 用户面前是一块什么都没有的黑屏，比"热键白按一次"糟得多 —— 后者至少还能再按一次，
+/// 前者只能 Esc（而 Esc 那条路要靠页面 JS 跑起来才走得通）。失败原因由调用方 `abort_session`
+/// 说给用户。
+///
+/// 从没按住过（首次创建，或上次停住失败）时直接成功返回：那种情况下没有要解的东西，
+/// 而首次显示的控制器还在建，盲目发一次指令只会每次首图都报一条假警。
+fn unpark_overlay(app: &AppHandle) -> Result<(), String> {
+    if !OVERLAY_PARKED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
+    if crate::state::set_window_webview_active(app, SNIP_LABEL, true) {
+        OVERLAY_PARKED.store(false, std::sync::atomic::Ordering::SeqCst);
+        return Ok(());
+    }
+    // 保持"按住"状态：下一次显示还会重试，而不是把它当成已经解开。
+    Err(
+        "覆盖层的渲染没能恢复（WebView2 控制器没接这条指令），这次不显示，以免端出一块黑屏"
+            .to_string(),
+    )
+}
+
 /// 失败收尾：关窗、清会话、恢复悬浮窗、给前端一句话。
 ///
 /// `claim` 见 `may_finish`。
@@ -567,8 +619,11 @@ fn abort_session(app: &AppHandle, claim: u64, reason: &str) {
     clear_session();
     IN_FLIGHT.store(false, Ordering::SeqCst);
     if let Some(win) = app.get_webview_window(SNIP_LABEL) {
-        if let Err(e) = win.hide() {
-            tracing::error!("关闭截图覆盖层失败：{e}");
+        match win.hide() {
+            Ok(()) => park_overlay(app),
+            // 窗口还盖在屏幕上时**绝不**停渲染：那会把"关不掉的覆盖层"从"看得见但没用"
+            // 升级成"看得见一块黑"。这一支只剩用户手按 Esc 一条退路。
+            Err(e) => tracing::error!("关闭截图覆盖层失败：{e}"),
         }
     }
     restore_floating(app);
@@ -587,9 +642,10 @@ fn finish_session(app: &AppHandle, claim: u64) {
     clear_session();
     IN_FLIGHT.store(false, Ordering::SeqCst);
     if let Some(win) = app.get_webview_window(SNIP_LABEL) {
-        if let Err(e) = win.hide() {
-            // 关不掉覆盖层比丢一张图严重：整屏被盖住。出声，但不 panic。
-            tracing::error!("隐藏截图覆盖层失败：{e}");
+        match win.hide() {
+            Ok(()) => park_overlay(app),
+            // 关不掉覆盖层比丢一张图严重：整屏被盖住。出声，但不 panic，更不停渲染。
+            Err(e) => tracing::error!("隐藏截图覆盖层失败：{e}"),
         }
     }
     restore_floating(app);
@@ -1907,6 +1963,70 @@ mod tests {
         assert!(
             sets[0] < checks[0] && checks[0] < sets[1] && sets[1] < checks[1],
             "重申必须夹在两遍对账中间（对账 {checks:?}，设尺寸 {sets:?}）"
+        );
+    }
+
+    /// 取一段顶层函数的文本（从 `fn 名字` 到下一个顶层 `fn`），并把注释与空白剪掉。
+    /// 剪注释的理由同 `flat_code`：本文件的注释里就写着 `park_overlay` 这类字样。
+    fn fn_body(prod: &str, name: &str) -> String {
+        let at = prod.find(name).unwrap_or_else(|| panic!("{name} 找不到了"));
+        let body = &prod[at..at + prod[at..].find("\nfn ").unwrap_or(prod.len() - at)];
+        body.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// 接线腿：覆盖层两条出口（提交/取消共用 `finish_session`，失败走 `abort_session`）
+    /// 都必须把渲染与内存档位一起按住，而且**只在窗口真的藏起来之后**按。
+    ///
+    /// 为什么钉"藏成功才按"：`SetIsVisible(false)` 之后 WebView2 不再重绘，若窗口还盖在
+    /// 屏幕上（hide 失败那一支的原文就写着"整屏被盖住"），按住它等于把用户的整块屏变成
+    /// 一块黑的、且没有比 Esc 更快的退路。
+    #[test]
+    fn both_exit_paths_park_the_overlay_only_after_the_window_is_really_hidden() {
+        let prod = prod_text();
+        for name in ["fn abort_session", "fn finish_session"] {
+            let flat = fn_body(&prod, name);
+            assert!(
+                flat.contains("matchwin.hide()") && flat.contains("Ok(())=>park_overlay(app)"),
+                "{name} 没有把按住挂在 hide 成功那一支（藏失败时绝不许停渲染）：{flat}"
+            );
+            assert_eq!(
+                flat.match_indices("park_overlay(app)").count(),
+                1,
+                "{name} 里按住该只有一次，多出来的是往某个分支里补做：{flat}"
+            );
+        }
+    }
+
+    /// 接线腿：显示覆盖层之前必须先把渲染抬回来，且抬不开就**不显示**。
+    ///
+    /// 两条各管一半：顺序反了 → 端出一块不重绘的黑屏；少了那个 `?` → 抬失败也照样 show，
+    /// 症状同样是黑屏，只是这次是全屏不透明 topmost 的黑屏，比热键白按一次糟得多。
+    #[test]
+    fn the_overlay_unparks_before_show_and_refuses_to_show_otherwise() {
+        let prod = prod_text();
+        let flat = fn_body(&prod, "fn show_overlay");
+        let unpark = flat
+            .find("unpark_overlay(app)")
+            .expect("显示路径里没有抬渲染那一步（覆盖层会被端成一块黑）");
+        let show = flat.find("win.show()").expect("覆盖层的 show 不见了");
+        assert!(
+            unpark < show,
+            "抬渲染排在 show 之后（顺序反了 WebView2 不重绘）：unpark@{unpark} show@{show}"
+        );
+        assert!(
+            flat.contains("unpark_overlay(app)?"),
+            "抬失败没有早退：那个 `?` 是「抬不开就别显示」唯一的执行手段"
+        );
+        let parked = fn_body(&prod, "fn unpark_overlay");
+        assert!(
+            parked.contains("OVERLAY_PARKED.load") && parked.contains("set_window_webview_active"),
+            "抬的那一步没真去设两个开关：{parked}"
         );
     }
 }

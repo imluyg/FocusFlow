@@ -136,6 +136,15 @@ fn sort_rank_desc(items: &mut [(String, i64)]) {
 pub(crate) const WEBVIEW_BROWSER_ARGS: &str =
     "--disable-background-networking --disable-component-update --no-first-run --disable-domain-reliability --disable-features=MediaRouter";
 
+/// 由「应用活跃与否」统一同步 WebView2 两个开关（渲染、内存档位）的窗口。
+///
+/// **截图覆盖层不在这里，这不是漏项**：这张表的档位由 `main_visible` 决定，而用户拖着选区
+/// 的时候恰恰是 `main_visible == false` —— 对一个正在交互的全屏页面报 LOW 是反效果。
+/// 覆盖层的两个开关跟着它自己的显示/隐藏走，见 [`set_window_webview_active`]。
+///
+/// **贴图 `pin-*` 也不在这里**：贴图按定义就是可见的窗口，对它报 LOW 是错误信号。
+pub(crate) const APP_MANAGED_LABELS: [&str; 2] = ["main", "floating"];
+
 /// 主窗口页面是否已被卸载到 about:blank（隐藏超时后卸载，释放页面内存）
 static MAIN_UNLOADED: AtomicBool = AtomicBool::new(false);
 /// 卸载前的页面 URL（重新显示时导航回去）
@@ -478,7 +487,7 @@ fn setup_windows(app: &App, state: &AppState) {
                 let mut all_ok = true;
                 // 渲染管线随窗口实际可见性同步（控制器未就绪时返回 false，继续重试；
                 // 主窗口懒创建：尚未创建的窗口跳过，不阻塞其他窗口的同步）
-                for label in ["main", "floating"] {
+                for label in APP_MANAGED_LABELS {
                     let Some(win) = handle.get_webview_window(label) else {
                         continue;
                     };
@@ -568,43 +577,63 @@ fn with_webview_sync(
 /// 返回是否全部设置成功（WebView2 控制器未就绪时返回 false，调用方可重试）。
 pub fn set_floating_memory_level(app: &tauri::AppHandle, low: bool) -> bool {
     let mut all_ok = true;
-    for label in ["main", "floating"] {
-        if let Some(win) = app.get_webview_window(label) {
-            let ok = with_webview_sync(&win, move |webview| {
-                #[cfg(windows)]
-                unsafe {
-                    use webview2_com::Microsoft::Web::WebView2::Win32::{
-                        ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
-                        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
-                    };
-                    use windows::core::Interface;
-                    let controller = webview.controller();
-                    if let Ok(core) = controller.CoreWebView2() {
-                        if let Ok(v19) = core.cast::<ICoreWebView2_19>() {
-                            let level = if low {
-                                COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
-                            } else {
-                                COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
-                            };
-                            return v19.SetMemoryUsageTargetLevel(level).is_ok();
-                        }
-                        tracing::warn!("WebView2 运行时过旧，不支持内存档位 API（需 1.0.2390+）");
-                        // 运行时太旧是**永久性**的不可用，重试到 60 秒之外也不会变好
-                        return true;
-                    }
-                    // CoreWebView2 未就绪：报 false，让调用方重试
-                    false
-                }
-                #[cfg(not(windows))]
-                {
-                    let _ = low;
-                    true
-                }
-            });
-            all_ok = all_ok && ok;
-        }
+    for label in APP_MANAGED_LABELS {
+        all_ok = set_webview_memory_level(app, label, low) && all_ok;
     }
     all_ok
+}
+
+/// 单个窗口的 WebView2 内存档位。
+/// 窗口不存在 ⇒ `true`：懒创建的窗口还没建起来，不算失败。
+/// 控制器未就绪 ⇒ `false`，调用方重试；运行时太旧 ⇒ `true`（永久性不可用，重试也不会变好）。
+fn set_webview_memory_level(app: &tauri::AppHandle, label: &str, low: bool) -> bool {
+    let Some(win) = app.get_webview_window(label) else {
+        return true;
+    };
+    with_webview_sync(&win, move |webview| {
+        #[cfg(windows)]
+        unsafe {
+            use webview2_com::Microsoft::Web::WebView2::Win32::{
+                ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+                COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+            };
+            use windows::core::Interface;
+            let controller = webview.controller();
+            if let Ok(core) = controller.CoreWebView2() {
+                if let Ok(v19) = core.cast::<ICoreWebView2_19>() {
+                    let level = if low {
+                        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+                    } else {
+                        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+                    };
+                    return v19.SetMemoryUsageTargetLevel(level).is_ok();
+                }
+                tracing::warn!("WebView2 运行时过旧，不支持内存档位 API（需 1.0.2390+）");
+                // 运行时太旧是**永久性**的不可用，重试到 60 秒之外也不会变好
+                return true;
+            }
+            // CoreWebView2 未就绪：报 false，让调用方重试
+            false
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = low;
+            true
+        }
+    })
+}
+
+/// 一个窗口自己隐藏/显示时，把 WebView2 的两个开关一起跟上：
+/// 隐藏 ⇒ 停渲染合成 + 降内存档位；显示 ⇒ 恢复渲染 + Normal，且必须排在 `show()` **之前**
+/// （见 [`set_webview_rendering`] 的注释：不先恢复就不重绘）。
+///
+/// 为什么绑成一个动作而不是两处各写一遍：2026-10-06 那次实测里，主窗口隐藏那一刻省下的
+/// **−62.9 MB 工作集**是这两个开关共同买到的；单独一项没测过，而"页面卸载到 about:blank"
+/// 那条机制实测 ≈0（−16.8 MB 工作集、私有提交在噪声内反升）。少做一件就是白做一半。
+pub fn set_window_webview_active(app: &tauri::AppHandle, label: &str, active: bool) -> bool {
+    let rendering = set_webview_rendering(app, label, active);
+    let level = set_webview_memory_level(app, label, !active);
+    rendering && level
 }
 
 /// 设置 WebView2 控制器可见性（IsVisible）。
@@ -3630,6 +3659,76 @@ mod visibility_wiring {
         assert!(
             body.contains("|| main_just_shown") && body.contains("let do_heavy"),
             "呼出主窗口没顺带做一次重聚合"
+        );
+    }
+
+    /// 接线腿：按「应用活跃与否」统一同步两个开关的表里只有主窗口与悬浮窗，
+    /// **覆盖层与贴图必须在表外，而且各自的理由要写在表上方** —— 否则下一个人把它当漏项补上，
+    /// 补出来的正是这轮想避免的反效果：用户拖着选区时 `main_visible` 恰好是假，
+    /// 拿这张表去降档等于对一张正在交互的全屏页面报 LOW。
+    #[test]
+    fn the_app_active_table_holds_main_and_floating_only() {
+        let src = include_str!("state.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("APP_MANAGED_LABELS: [&str; 2] = [")
+            .expect("那张表不见了（改名要连判据一起改）");
+        let table = &prod[at..at + prod[at..].find("];").expect("表没有收尾") + 2];
+        assert!(
+            table.contains("\"main\"") && table.contains("\"floating\""),
+            "表里少了这两个中的一个：{table}"
+        );
+        assert!(
+            !table.contains("snip"),
+            "覆盖层被塞进按应用活跃降档的表里了：它归 `set_window_webview_active` 管"
+        );
+        assert!(
+            !table.contains("pin"),
+            "贴图被塞进来了：可见窗口对它报 LOW 是错误信号"
+        );
+        // 理由必须落在紧邻这张表上方那一段文档注释里（整文件 contains 会让别处的同词顶班）。
+        // 剪到**行首**为止：`at` 指向的是常量名，那一行前面还挂着 `pub(crate) const `，
+        // 直接从 at 往回切 lines() 会把这半行当成"第一行"，take_while 当场停下，
+        // 于是注释块永远是空的、这条判据红得让人想删掉它。
+        let before = &prod[..at];
+        let head = &before[..before.rfind('\n').unwrap_or(0)];
+        let doc: Vec<&str> = head
+            .lines()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with("///"))
+            .collect();
+        let doc: String = doc.into_iter().rev().collect::<Vec<_>>().join("\n");
+        assert!(
+            doc.contains("覆盖层") && doc.contains("贴图"),
+            "表上方没写明这两类窗口为什么不在这里"
+        );
+    }
+
+    /// 接线腿：按住/抬起一个窗口时，**两个开关都要设**，且档位是渲染的反向。
+    /// 少设一个就是白做一半 —— 主窗口那次实测的 −62.9 MB 工作集是两个开关共同买到的。
+    #[test]
+    fn the_park_helper_sets_both_switches_in_the_same_move() {
+        let src = include_str!("state.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn set_window_webview_active")
+            .expect("那个助手不见了");
+        let body = &prod[at..at + prod[at..].find("\n}").expect("助手没有收尾")];
+        let flat: String = body
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("set_webview_rendering(app,label,active)"),
+            "没设渲染（停渲染是省内存的那一半）：{flat}"
+        );
+        assert!(
+            flat.contains("set_webview_memory_level(app,label,!active)"),
+            "没设内存档位，或者方向写反了（应当与渲染反向）：{flat}"
         );
     }
 }
