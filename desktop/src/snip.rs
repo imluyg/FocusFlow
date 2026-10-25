@@ -52,6 +52,10 @@ const TAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 /// —— 卡住时计时器也不跑了，而这是一张不透明的全屏 topmost 冻结图，盖在用户桌面上
 /// 没有上限是不能接受的（老手势松手即提交，最多盖几百毫秒）。
 const ANNOTATE_LIVE_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+/// 直出那张的绝对上限。比标注态短得多，因为直出不需要画：几百毫秒就该交差，
+/// 60 秒之后这张还盖在屏幕上就是人不在这儿。而这张覆盖层是**不透明的、盖住整个桌面**，
+/// 会话里还压着一整帧全屏像素（1080p 8.3 MB / 4K 33 MB 那一档），没人收就两样一起白留。
+const DIRECT_LIVE_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 再按一次热键时，该不该把在飞的那张标注放弃（口径①：这条热键本来就该幂等）。
 ///
@@ -61,13 +65,26 @@ fn should_abandon_on_repress(in_flight_annotate: Option<bool>, requested_annotat
     in_flight_annotate == Some(true) && requested_annotate
 }
 
-/// 标注态的绝对上限到点了该不该收（纯函数，给用例钉判据）。
+/// 绝对上限到点了该不该收这张覆盖层（纯函数，给用例钉判据）。
 ///
 /// `same_epoch` 是关键那道：计时器是**上一张**起的，晚一步醒来时槽里可能已经是下一张
-/// （用户 10 分钟内又截了一张），那时砍它就是误杀。直出模式也不归这条管（它有 8 秒
-/// 那条取图看门狗）。
-fn annotate_ceiling_fires(same_epoch: bool, annotate: bool) -> bool {
-    same_epoch && annotate
+/// （用户几分钟内又截了一张），那时砍它就是误杀。
+///
+/// 判据里**不再有模式这一格**：以前只有标注态起这条计时，直出那张没人管 ——
+/// 页面那份闲置计时器也只在进标注态时才起（`ui/snip.js` 的 `enterAnnotate`），
+/// 于是"按下直出热键、覆盖层亮了、人走开"这条路会让一张不透明全屏覆盖层
+/// 连着一整帧全屏像素一直留到进程结束。模式的差别现在只体现在**时长**上。
+fn live_ceiling_fires(same_epoch: bool) -> bool {
+    same_epoch
+}
+
+/// 这张会话的绝对上限该多长。直出短、标注长，两个数写在常量上各有一条用例盯着。
+fn live_limit(annotate: bool) -> std::time::Duration {
+    if annotate {
+        ANNOTATE_LIVE_LIMIT
+    } else {
+        DIRECT_LIVE_LIMIT
+    }
 }
 
 /// 一次冻结的会话。
@@ -709,39 +726,43 @@ pub fn trigger(app: &AppHandle, annotate: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// 起一条标注态的绝对上限计时。只在页面**真把底图取走了**、且这张是标注模式时起 ——
-/// 直出那张几百毫秒就交了，不该为它多留一个活十分钟的线程。
+/// 起一条覆盖层会话的绝对上限计时。**两种模式都起**，时长按模式分（见 `live_limit`）；
+/// 起这一条的时机是页面**真把底图取走了**之后 —— 取走之前那张归 8 秒那条看门狗管。
 ///
-/// 页面自己那份闲置计时器（3 分钟无操作）管"人走了"，管不了"页面卡住"：卡住时计时器
-/// 也不跑了。这条是最后一道，专门保证那张不透明全屏覆盖层不会无限期盖住桌面。
-fn spawn_annotate_ceiling(app: &AppHandle, epoch: u64) {
+/// 页面自己那份闲置计时器（3 分钟无操作）只在标注态起，而且管不了"页面卡住"：
+/// 卡住时计时器也不跑了。这条是最后一道，专门保证那张不透明全屏覆盖层不会无限期盖住桌面。
+fn spawn_live_ceiling(app: &AppHandle, epoch: u64, annotate: bool) {
+    let limit = live_limit(annotate);
     let handle = app.clone();
     if let Err(e) = std::thread::Builder::new()
-        .name("snip-annotate-ceiling".into())
+        .name("snip-live-ceiling".into())
         .spawn(move || {
-            std::thread::sleep(ANNOTATE_LIVE_LIMIT);
+            std::thread::sleep(limit);
             let stuck = SESSION
                 .lock()
                 .ok()
-                .and_then(|g| {
-                    g.as_ref()
-                        .map(|s| annotate_ceiling_fires(s.epoch == epoch, s.annotate))
-                })
+                .and_then(|g| g.as_ref().map(|s| live_ceiling_fires(s.epoch == epoch)))
                 .unwrap_or(false);
             if stuck {
                 tracing::warn!(
-                    "标注态存活超过 {ANNOTATE_LIVE_LIMIT:?}（页面既没交也没取消），自动放弃并恢复桌面"
+                    "截图覆盖层存活超过 {limit:?}（{}模式，页面既没交也没取消），自动放弃并恢复桌面",
+                    if annotate { "标注" } else { "直出" }
                 );
                 abort_session(
                     &handle,
                     epoch,
-                    "标注时间过长，已自动放弃（不是失败），什么都没保存",
+                    if annotate {
+                        "标注时间过长，已自动放弃（不是失败），什么都没保存"
+                    } else {
+                        "直出的覆盖层停留过久（人不在这儿），已自动放弃（不是失败），什么都没保存"
+                    },
                 );
             }
         })
     {
-        // 起不了这条计时不是失败：还有页面那份闲置计时器在管，只是少了一道兜底。
-        tracing::warn!("启动标注上限计时失败：{e}（只剩页面那份闲置计时器在管）");
+        // 起不了这条计时不是失败：标注态还有页面那份闲置计时器兜着，只是少了一道。
+        // 直出态**没有**页面计时器 —— 这条起不来就只能靠人回来按 Esc 或再按一次热键。
+        tracing::warn!("启动覆盖层绝对上限计时失败：{e}（标注态还剩页面那份闲置计时器，直出态没有）");
     }
 }
 
@@ -793,9 +814,9 @@ pub async fn snip_take(app: AppHandle) -> Result<SnipPayload, String> {
         started.elapsed().as_millis()
     );
     // 从这一行起没有会 `?` 走人的步骤了 —— 底图已经取走，中途退出就是一个没人收的会话。
-    if annotate {
-        spawn_annotate_ceiling(&app, epoch);
-    }
+    // 两种模式都起这一条：以前只给标注态起，直出那张亮了之后没人管，整帧全屏像素与那张
+    // 不透明覆盖层就一直留到进程结束。模式的差别只在时长上。
+    spawn_live_ceiling(&app, epoch, annotate);
     Ok(SnipPayload {
         epoch,
         png_base64: png,
@@ -1461,20 +1482,70 @@ mod tests {
         );
     }
 
-    /// 绝对上限只砍"还是这一张、且是标注模式"那一种组合。
+    /// 绝对上限只砍"还是这一张"那一种；**模式不再参与判据** —— 两种模式现在都起这一条。
     #[test]
-    fn annotate_ceiling_only_fires_for_its_own_session() {
+    fn live_ceiling_only_fires_for_its_own_session() {
+        assert!(live_ceiling_fires(true), "还是这一张 → 到点就该收");
         assert!(
-            annotate_ceiling_fires(true, true),
-            "还是那张标注 → 到点就该收"
-        );
-        assert!(
-            !annotate_ceiling_fires(false, true),
+            !live_ceiling_fires(false),
             "槽里已经是下一张了，砍它就是误杀（计时器是上一张起的）"
         );
+    }
+
+    /// 时长按模式分：直出那张短到一分钟，标注那张仍是十分钟。
+    /// 一分钟这条不是随手给的：直出不需要画，几百毫秒就该交差，超时还亮着就是人不在。
+    #[test]
+    fn the_direct_overlay_gives_up_far_sooner_than_the_annotating_one() {
+        assert_eq!(
+            live_limit(true),
+            ANNOTATE_LIVE_LIMIT,
+            "标注那一档不许被顺手改短"
+        );
+        assert_eq!(live_limit(false), DIRECT_LIVE_LIMIT);
         assert!(
-            !annotate_ceiling_fires(true, false),
-            "直出那张归 8 秒那条取图看门狗管"
+            DIRECT_LIVE_LIMIT <= std::time::Duration::from_secs(120),
+            "直出那张是不透明盖住整个桌面、会话里还压着一整帧全屏像素：一分钟都嫌久，不许往长调：{DIRECT_LIVE_LIMIT:?}"
+        );
+        assert!(
+            DIRECT_LIVE_LIMIT > TAKE_DEADLINE,
+            "直出的绝对上限必须排在 8 秒那条取图看门狗之后，否则两条会抢同一张：{DIRECT_LIVE_LIMIT:?}"
+        );
+    }
+
+    /// 接线腿：这条计时现在**两种模式都起**，时长由模式算出来。
+    /// 它的病症是无声的：直出那张没人收 ⇒ 桌面被盖到进程结束，全屏像素一起白留。
+    #[test]
+    fn the_ceiling_is_armed_for_both_modes_with_a_mode_dependent_limit() {
+        let prod = prod_text();
+        let at = prod
+            .find("pub async fn snip_take")
+            .expect("取图命令找不到了");
+        let flat: String = prod[at..]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("spawn_live_ceiling(&app,epoch,annotate)"),
+            "起计时这一步又按模式分叉了，或者不再把模式交给时长那一格：{flat}"
+        );
+        assert!(
+            !flat.contains("ifannotate{spawn_live_ceiling"),
+            "直出那张又没人管了：不透明全屏覆盖层 + 一整帧像素留到进程结束"
+        );
+        let spawn_at = prod
+            .find("fn spawn_live_ceiling")
+            .expect("那条计时函数不见了");
+        let spawn_body =
+            &prod[spawn_at..spawn_at + prod[spawn_at..].find("\n}\n").expect("函数没有收尾")];
+        let spawn_flat: String = spawn_body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            spawn_flat.contains("letlimit=live_limit(annotate)")
+                && spawn_flat.contains("sleep(limit)"),
+            "计时睡的是写死的那个常量，不是按模式算出来的时长：{spawn_flat}"
         );
     }
 
@@ -1613,7 +1684,7 @@ mod tests {
         );
         // 夹具自己的前提：切片真盖住了函数体，而不是切成空串让上面的断言空转
         assert!(
-            body.contains("spawn_annotate_ceiling"),
+            body.contains("spawn_live_ceiling"),
             "切片没盖住整个函数体，上面三条是假绿"
         );
     }
@@ -1824,9 +1895,9 @@ mod tests {
             .expect("兜底出口不见了");
         let head = flat.find("pubfntrigger(app").expect("trigger 找不到了");
         let tail = flat[head..]
-            .find("fnspawn_annotate_ceiling")
+            .find("fnspawn_live_ceiling")
             .map(|i| i + head)
-            .expect("trigger 后面没有标注上限那条，切片前提变了");
+            .expect("trigger 后面没有那条绝对上限，切片前提变了");
         assert!(
             zero > head && zero < tail,
             "传 0 的那条兜底挪出 trigger 了（在第 {zero} 字，trigger 区间 {head}..{tail}）—— \
