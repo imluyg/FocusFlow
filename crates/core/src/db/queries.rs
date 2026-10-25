@@ -133,9 +133,15 @@ pub fn try_available_years() -> anyhow::Result<Vec<i32>> {
 /// 原先用 `Path::exists()`，把"这一次 stat 失败了"读成"今年还没建库"，于是那次启动
 /// 所有设备名退成占位而日志一个字没有）。
 /// 原先只在本模块用；写侧那处 `Path::exists()` 的漏读法（见下）把它提成共用的尺子。
-/// 本机实测（写在用例里）：路径的**父那一格是普通文件**时报的是 `ERROR_PATH_NOT_FOUND`
+/// 本机实测（都写在用例里）：路径的**父那一格是普通文件**时报的是 `ERROR_PATH_NOT_FOUND`
 /// （⇒ NotFound ⇒ 按"没有"处理），所以那种形状不落在「说不出」这一支；`data` 位置被换成
 /// 文件另有 `paths::ensure_dir` 的日志负责。
+/// ⚠ 同一批现量还钉下这一支的两条边界。**走得到**：这个名字被换成自指 junction 时 stat 报
+/// os error 1921（`FilesystemLoop`），用例是 `an_unanswerable_presence_question_is_not_read_as_no_database`。
+/// **够不着它**：UNC 上那个共享不存在（os error 67/53）与盘符根本不存在（os error 3）都被
+/// 标准库折成 `NotFound` ⇒ 落在「确认没有」那一支。所以"网络位置整个连不上"现在念起来
+/// 与"那一年没建库"同形 —— 那是这把尺子已知的边界，要动它得先改 `is_confirmed_absent`
+/// 的口径（只认 `NotFound`），已记台账等裁决，别在这里顺手改。
 pub(crate) fn year_db_presence(path: &std::path::Path) -> Result<bool, std::io::Error> {
     classify_stat(std::fs::metadata(path))
 }
@@ -513,8 +519,12 @@ fn gather_rank_totals(
 /// 为什么单独成一个判据而不是各写一份：**那一年根本没有库**（首启那年、整年没记录、
 /// 历史那年已归档清掉）是一个正确答案，不是"读不出来"；把它说成读不出来，周报逐日问
 /// 2020 年时会拒绝生成一份本来正常的文件（本轮现量过一次，另一头则由面板念 0 过一次）。
-/// 而"说不出在不在"（休眠的移动盘、`data` 那个位置被换成普通文件、杀软首扫握着句柄）
-/// 又不许折回"没有"。三个结局必须是三条不同的路，`bool` 只能给两条。
+/// 而"说不出在不在"又不许折回"没有"。三个结局必须是三条不同的路，`bool` 只能给两条。
+/// 这一臂现量走得到的一种形状：这个名字是个解析不出目标的重解析点（自指／成环的目录
+/// junction），stat 报 os error 1921 ⇒ 有用例端到端守着；按错误码钉的还有 5（拒绝访问）
+/// 与 267。反过来，"父那一格是普通文件"、"UNC 上的共享不存在"、"盘符根本不存在"本机
+/// 都报 `NotFound` ⇒ 走的是「确认没有」，别以为这道闸把它们也拦住了（那两条边界写在
+/// `year_db_presence` 的文档上）。
 enum YearGate {
     /// 确认在：照常开库去读
     Read,
@@ -2425,8 +2435,12 @@ mod tests {
         );
 
         // 判据表：哪些码算"确认没有"、哪些算"说不出"。
-        // ⚠ 这一臂在无头环境里造不出**真实**的 stat 失败（要 ACL 拒绝或杀软握着句柄），
-        // 所以这里是按错误码钉映射规则，端到端那一半登记为眼验，不许写成"有用例守着"。
+        // ⚠ 这一臂**不再是眼验账**：`an_unanswerable_presence_question_is_not_read_as_no_database`
+        // 用自指目录 junction 让真实的 stat 失败（os error 1921）走满整条链。这里按码钉的是
+        // **映射规则**（哪些码不许折成"没有"），那条用例钉的是**真实系统调用下这一臂走得到**
+        // ——两件事，谁也不替代谁，所以两条都留着。
+        // （上一版这里写着"无头造不出真实的 stat 失败，要 ACL 拒绝或杀软握着句柄"：前一句被
+        // 现量推翻——`mklink /J` 不要管理员，而这一臂要的只是 stat 回来的码不是 2/3。）
         for code in [2, 3] {
             // ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
             assert!(
@@ -4755,6 +4769,111 @@ mod tests {
             hourly_stats_totals(Some(gone_day)).unreadable.is_empty()
                 && stats_totals(None, Some(gone)).unreadable.is_empty(),
             "文件消失后回到「确认没有」，gap 不许留着"
+        );
+    }
+
+    /// 「说不出这一年的库在不在」不许被念成「那一年没有库」：这一臂第一次拿到真实
+    /// 系统调用下的行为见证（此前只有形状判据与按错误码钉的那张映射表守着）。
+    ///
+    /// 夹具形状是把这一年的库位置做成**自指目录 junction**。本机现量：
+    /// `std::fs::metadata` 对它报 os error 1921（`FilesystemLoop`），既不是"在"也不是
+    /// `NotFound`，三态那把尺子于是只剩「说不出」这一条路。上一版这里登记成"无头造不出、
+    /// 只能眼验"，理由是"要 ACL 拒绝或杀软握着句柄"——两条都不必：`mklink /J` 不要管理员
+    /// （符号链接要，本机实测 os error 1314 拒建），而这一臂要的只是"stat 回来的码不是 2/3"。
+    /// ⚠ 同一次现量还量出一条与本用例无关的读数：UNC 死共享（os error 67/53）与不存在的
+    /// 盘符（os error 3）在本机都报 **NotFound** ⇒ "网络位置整个够不着"落在的是
+    /// 「确认没有」那一臂，不是这一臂。那条另记台账，别以为这条用例把它也守住了。
+    #[cfg(windows)]
+    #[test]
+    fn an_unanswerable_presence_question_is_not_read_as_no_database() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_presence_unanswerable");
+        std::fs::create_dir_all(crate::paths::data_dir()).unwrap();
+        let today = Local::now().date_naive();
+        let gone = today.year() + 7;
+        let gone_day = chrono::NaiveDate::from_ymd_opt(gone, 6, 15).unwrap();
+        let path = paths::year_db_path(gone);
+
+        // 夹具：自指 junction。`mklink` 是 cmd 内置，只吃反斜杠路径。建不上就跳过并出声
+        // ——那是这台机器的环境限制，不是产品的失败；静默跳过会把这一臂重新变回没人守。
+        let link = path.to_string_lossy().replace('/', "\\");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J", &link, &link])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("mklink /J 建不出自指 junction，跳过（夹具做不出来）");
+            return;
+        }
+        // 断言失败也要摘掉这个重解析点：留着它，用例收尾删的是链接而不是我们建的那格
+        struct JunctionGuard<'a>(&'a std::path::Path);
+        impl Drop for JunctionGuard<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir(self.0);
+            }
+        }
+        let _loop = JunctionGuard(&path);
+        connection::clear_ro_cache();
+
+        // 一、夹具前提：这一问在真实 stat 之下确实"说不出"。少了这条腿，下面每一腿
+        // 都可能落在"stat 其实成功了"的库上空跑，而读起来照样一片绿。
+        let presence = year_db_presence(&path);
+        assert!(
+            presence.is_err(),
+            "自指 junction 的 stat 该报错，实得 {presence:?} —— 夹具没生效，这条用例是空跑"
+        );
+        let stat_err = presence.unwrap_err();
+        assert!(
+            !crate::data_location::is_confirmed_absent(&stat_err),
+            "stat 报回来的码（{:?}）不许被读成「确认没有」",
+            stat_err.kind()
+        );
+
+        // 二、闸本身走的是第三条路：既不是「确认没有」也不是「确认在」
+        match gate_year(gone, &path, "按键统计") {
+            YearGate::CannotTell(why) => assert!(
+                why.contains("说不出这一年的库在不在"),
+                "原因要说的是「在不在问不出」，实得 {why}"
+            ),
+            YearGate::SkipAbsent => panic!("「问不出在不在」被折成了「那一年没有库」"),
+            YearGate::Read => panic!("这一臂没被真实 stat 触发，夹具的形状变了"),
+        }
+
+        // 三、四个调用方各自把它拼成点名（`gate_year` 的四个调用点一处处过）
+        for (domain, gaps) in [
+            ("按键统计", stats_totals(None, Some(gone)).unreadable),
+            ("设备统计", device_totals(None, Some(gone)).unreadable),
+            ("每日趋势", daily_counts_totals(30, Some(gone)).unreadable),
+            (
+                "当日小时分布",
+                hourly_stats_totals(Some(gone_day)).unreadable,
+            ),
+        ] {
+            assert_eq!(gaps.len(), 1, "{domain} 该只点这一年的名，实得 {gaps:?}");
+            assert!(
+                gaps[0].contains(domain)
+                    && gaps[0].contains(&gone.to_string())
+                    && gaps[0].contains("说不出这一年的库在不在"),
+                "{domain} 的 gap 要说清域名、年份与「在不在问不出」，实得 {}",
+                gaps[0]
+            );
+            assert!(
+                !gaps[0].contains("打不开"),
+                "这一臂连库都没去开，原因别说成打不开：{}",
+                gaps[0]
+            );
+        }
+
+        // 四、数字那头照旧交回 0：把这一轮与"那一年真没数据"分开的只有上面那条 gap，
+        // 所以断言落在"0 与 gap 同时在场"，不是落在 0 本身。
+        assert_eq!(stats_totals(None, Some(gone)).total, 0);
+        assert!(
+            daily_counts_totals(30, Some(gone))
+                .series
+                .iter()
+                .all(|(_, c)| *c == 0),
+            "说不出在不在那一年，趋势仍交回稠密全零——区分它的是 gap，不是形状"
         );
     }
 
