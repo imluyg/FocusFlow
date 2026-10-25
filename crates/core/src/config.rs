@@ -971,12 +971,18 @@ impl FocusFlowConfig {
 /// 原子写入：先写同目录临时文件并 fsync，再 rename 替换目标
 /// （Windows 上 rename 同样会替换已存在的目标）。
 /// 直接 `fs::write` 截断重写，掉电/崩溃会留下空文件或半截 INI；
-/// 原子替换保证任意时刻磁盘上的 config.ini 要么是旧的完整内容，要么是新的。
+/// 原子替换保证任意时刻磁盘上的目标文件要么是旧内容，要么是新的。
 ///
-/// 对 crate 内开放：`device_aliases.json` 是同一类"用户手工录入、丢了找不回来"的
-/// 小文件，两条写路径共用这一份实现，别再各写一套半成品（那边原来用的
+/// 第三个调用方是桌面端的**统计报告导出**（`desktop/src/export.rs`）：那条路径上
+/// 用户挑的位置可能已经躺着上一周的报告，`File::create` 一上来就把它截断了，
+/// 接着 `write_all` 中途失败（盘满、权限变了）时屏幕上只剩一个半截文件，
+/// 而原来那份已经没了 —— 界面上那句"导出失败"说得没错，用户以为"没写成"，
+/// 其实"旧的也没了"。
+///
+/// `pub`：`device_aliases.json` 与导出报告都是同一类"丢了找不回来"的用户文件，
+/// 三条写路径共用这一份实现，别再各写一套半成品（别名那边原来用的
 /// 固定名 `.json.tmp` + 无 fsync，正是本函数注释里要避免的形态）。
-pub(crate) fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
+pub fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);

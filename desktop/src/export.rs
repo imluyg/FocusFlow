@@ -4,8 +4,6 @@
 //! 不是"两份实现互为镜像"——列结构、周期标签与 CLI 那份本来就不一样。
 //! 读侧的可读性闸两边都要问，判据在 `db::queries::check_years_readable`。
 
-use std::io::Write;
-
 use anyhow::Context;
 use chrono::Local;
 
@@ -241,11 +239,8 @@ pub fn export_csv(path: &std::path::Path, d: &ReportData) -> anyhow::Result<()> 
             share(*count, d.device_total)
         ));
     }
-    let mut f =
-        std::fs::File::create(path).with_context(|| format!("创建文件失败: {}", path.display()))?;
-    f.write_all(b"\xef\xbb\xbf").context("写入 BOM 失败")?;
-    f.write_all(out.as_bytes()).context("写入 CSV 内容失败")?;
-    Ok(())
+    // BOM 是内容的一部分：交给原子写那一条整串落盘（`\u{FEFF}` 的 UTF-8 编码就是 EF BB BF）
+    write_out(path, &format!("\u{FEFF}{out}"))
 }
 
 /// HTML 里一段小标题 + 一张表。六个板块共用这一份，省得每加一列就漏一处转义。
@@ -410,7 +405,7 @@ pub fn export_html(path: &std::path::Path, d: &ReportData) -> anyhow::Result<()>
         gaps = gaps_html,
         body = body,
     );
-    std::fs::write(path, html).with_context(|| format!("写入文件失败: {}", path.display()))?;
+    write_out(path, &html)?;
     Ok(())
 }
 
@@ -418,10 +413,26 @@ pub fn export_html(path: &std::path::Path, d: &ReportData) -> anyhow::Result<()>
 ///
 /// 字段名、周期标签与上面两个格式出自**同一个** `ReportData`（三份文件不会互相打脸）。
 pub fn export_json(path: &std::path::Path, d: &ReportData) -> anyhow::Result<()> {
-    let f =
-        std::fs::File::create(path).with_context(|| format!("创建文件失败: {}", path.display()))?;
-    serde_json::to_writer_pretty(f, d).context("写入 JSON 失败")?;
-    Ok(())
+    let text = serde_json::to_string_pretty(d).context("生成 JSON 失败")?;
+    write_out(path, &text)
+}
+
+/// 三个格式共用这一条落盘：同目录临时文件 + `sync_all` 确认 + rename 换正名，
+/// 失败时把临时文件清掉（共享实现在 [`focusflow_core::config::atomic_write`]，
+/// 与 `config.ini`、`device_aliases.json` 同一套纪律一份实现）。
+///
+/// 为什么导出也要走它：用户在这个对话框里挑的位置**可能已经有一份上一周的报告**，
+/// 而旧写法是 `File::create(path)` —— 一上来就把那一份截断了，接着 `write_all`
+/// 中途失败（盘满、权限变了、序列化报错）时屏幕上只剩一个半截文件，旧的那份已经没了。
+/// 界面上那句"导出失败"本身没说错，但用户读到的"没写成"与现场的"旧的也没了"
+/// 是两件事 —— 这一族的老规矩是：**任何时刻磁盘上要么是旧的完整内容，要么是新的**。
+///
+/// 错误文案由这一处一次说全：败在哪一步、哪个文件、用户那一份还在不在。
+/// 调用方**不要再包一层** `with_context` —— anyhow 的 `Display` 只念最外层那句，
+/// 一包就把"原来那份没动"这半句包丢了（界面上拿到的正是 `to_string()`，实测过一次）。
+fn write_out(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    focusflow_core::config::atomic_write(path, contents)
+        .map_err(|e| anyhow::anyhow!("导出没写成（{} 上原来那份没动）: {e:#}", path.display()))
 }
 
 /// Markdown 表格单元格：键名里可能带 `|` 或换行，会直接破坏表格结构。
@@ -712,7 +723,10 @@ pub fn write_weekly_report_for(
         from.format("%Y-%m-%d"),
         to.format("%Y-%m-%d")
     ));
-    std::fs::write(&path, out).with_context(|| format!("写入失败: {}", path.display()))?;
+    // 同一条落盘纪律：这一份虽然写在程序自己的 `data/reports/` 里，但同一周的文件
+    // 会被重写（重启后仍欠着的那一周），截断重写留下的半截 Markdown 会被当成
+    // "上周的报告"读下去 —— 与三种导出格式共用 `write_out`，别再各写一套。
+    write_out(&path, &out)?;
     Ok(Some(path))
 }
 
@@ -1261,12 +1275,112 @@ mod tests {
         }
     }
 
+    /// 三份导出文件与周报都必须走**那条原子落盘**：同目录临时文件 → `sync_all` → rename。
+    ///
+    /// 保存对话框里挑中的位置可能已经躺着上一份报告，而旧写法一上来 `File::create(path)`
+    /// 就把它截断了；中途写失败（盘满、权限变了）时屏幕上只剩一个半截文件，
+    /// 那句"导出失败"让用户以为"没写成"，其实"旧的也没了"。
+    /// ⚠ 这条是**形状**判据：它拦的是那种写法被重新引进来（探针：把 CSV 那一支换回
+    /// `File::create` ⇒ 红在"恰好五处"那一句）。至于"截断之后那次写失败"本身，
+    /// 要盘满或掉电才造得出来，无头给不出 ⇒ 那一半是构造保证 + 下面那条改名失败的用例，
+    /// 不许写成"截断损害有行为覆盖"。
+    #[test]
+    fn the_user_facing_writers_all_go_through_the_atomic_one() {
+        let src = include_str!("export.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("write_out(").count(),
+            5,
+            "三个导出格式 + 周报 + `write_out` 自己的定义，恰好五处；对不上就是有人又自己写一遍落盘"
+        );
+        for old in ["File::create(path)", "fs::write(path"] {
+            assert!(
+                !code.contains(old),
+                "生产半边又出现「{old}」—— 截断发生在确认写成之前"
+            );
+        }
+        assert!(
+            code.contains("focusflow_core::config::atomic_write"),
+            "落盘那一步必须走 core 那份共享实现，别再抄一套半成品的原子写"
+        );
+    }
+
+    /// 换成正名那一步失败时：**原来那份一字不动，也不留临时文件**。
+    ///
+    /// 夹具是"上一份报告还开着"这个真实现场：另一个句柄只放行读，改名与删除要的
+    /// DELETE 访问撞共享冲突（`rfd` 的保存框完全允许你选中一份被 Excel 占着的文件）。
+    /// 这条钉得住两件事：失败路径把临时文件清掉（共享实现里那句 `remove_file` 被摘掉就红），
+    /// 以及报错说的是"原来那份没动"而不是含糊一句"导出失败"。
+    /// ⚠ 它**钉不到**"中途写失败会不会把旧内容截掉"：那个形态要盘满/掉电才造得出，
+    ///    旧写法在这份夹具下连 `File::create` 都会先失败，两条路都停在改名之前 ——
+    ///    那一半只有上面那条形状判据与构造本身在守。
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_rename_keeps_the_previous_report_and_leaves_no_temp_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _serial = crate::app_dir_lock();
+        let _app = focusflow_core::paths::test_app_dir("export_atomic_rename");
+        let dir = _app.path().join("exports");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.csv");
+        std::fs::write(&path, b"OLD REPORT BYTES").unwrap();
+
+        let mut stats = HashMap::new();
+        stats.insert("A".to_string(), 7);
+        let d = report_from(7, &stats);
+
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // 只放行读：改名与删除都要 DELETE 访问
+            .open(&path)
+            .expect("夹具：原文件应能被只读占住");
+        assert!(
+            std::fs::remove_file(&path).is_err(),
+            "夹具没成立：这个句柄挡不住删除，也就挡不住改名"
+        );
+
+        let e = export_csv(&path, &d).expect_err("换不成正名就不许报成功");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("原来那份没动"),
+            "报错要说清用户那一份还在（这句会直接进界面的\"导出失败:\"），实得 {msg}"
+        );
+        assert!(msg.contains("r.csv"), "报错要点名是哪个文件，实得 {msg}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"OLD REPORT BYTES",
+            "失败那一次不许吃掉用户原来那一份"
+        );
+
+        drop(_holder);
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "临时文件必须被清掉，否则每失败一次就往用户目录里堆一个垃圾，实得 {leftovers:?}"
+        );
+    }
+
     /// 「这一轮没读全」必须出现在**三份**导出文件里：只写进一份，另外两份就仍是一份
     /// 看起来完整的报告（总数与榜单都是下界，却没有任何一句话说明这一点）。
     #[test]
     fn an_incomplete_reading_is_written_into_all_three_formats() {
-        let dir = std::env::temp_dir().join("ff_export_gaps");
-        std::fs::create_dir_all(&dir).ok();
+        // 目录改走 `TestAppDir`：原先这里 `temp_dir().join("ff_export_gaps")` 只建不删，
+        // 于是 %TEMP% 里常驻一份化石（门禁的 `TEMP_FLAT` 是"前后相减"，看不穿这种
+        // "每轮都在、谁也不清"的旧账 —— 基线那 18 项里就有它）。
+        let _serial = crate::app_dir_lock();
+        let _app = focusflow_core::paths::test_app_dir("export_gaps");
+        let dir = _app.path().join("exports");
+        std::fs::create_dir_all(&dir).unwrap();
         let mut stats = HashMap::new();
         stats.insert("A".to_string(), 7);
         let mut d = report_from(7, &stats);
