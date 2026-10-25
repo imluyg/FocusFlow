@@ -240,7 +240,20 @@ pub fn check_years_readable() -> anyhow::Result<Vec<i32>> {
     let years = try_available_years().map_err(|e| anyhow::anyhow!("年度库列不出来: {e}"))?;
     let bad = unopenable_years(&years);
     if !bad.is_empty() {
-        anyhow::bail!("这些年度库打不开，它们的计数不会出现在结果里: {bad:?}");
+        // 只报年份不够：`[2026, 2020]` 这种形状告诉不了用户去动哪个文件，而这一句会一路
+        // 走到 CLI 的退出与导出的拒绝那儿 —— 那一轮他什么数字都没拿到，手里只该有一件
+        // 能做的事。文件路径这里给全（导出/命令行都是整段文字，容得下）；
+        // 打卡条那一头走 `check_daily_counts_readable`，那是一行横条，不塞长路径。
+        let files: Vec<String> = bad
+            .iter()
+            .map(|y| paths::year_db_path(*y).display().to_string())
+            .collect();
+        anyhow::bail!(
+            "这些年度库打不开，它们的计数不会出现在结果里: {bad:?}（{}）—— \
+             先确认这些文件还在原位、没有被同步盘换成占位文件、也没有被别的程序开着；\
+             处理完再跑一次就有数",
+            files.join("、")
+        );
     }
     Ok(years)
 }
@@ -3955,6 +3968,15 @@ mod tests {
         assert!(
             e.contains(&broken.to_string()) && e.contains("打不开"),
             "要报出是哪一年，不能只说\"读不出来\"：{e}"
+        );
+        // 那一轮用户什么数字都没拿到，手里只剩一件事可做 ⇒ 这句话要点名文件、并说清下一步
+        assert!(
+            e.contains(&format!("focusflow_{broken}.db")),
+            "要报出是哪个文件（只给年份的话，用户不知道该去动哪一份）：{e}"
+        );
+        assert!(
+            e.contains("再跑一次就有数"),
+            "要说出处理完之后怎么办，而不是把一个死路当结论：{e}"
         );
 
         // 修好之后同一句话就不再响 —— 这条判据不是恒真

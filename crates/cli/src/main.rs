@@ -1887,6 +1887,8 @@ mod tests {
             }
             other => panic!("没有库要报 NoLibrary，实得 {other:?}"),
         }
+        // 这句只是"core 交回来一段拒绝文字"的替身：这里测的是**原样递给用户**，
+        // 措辞本身的判据在 core（`check_years_readable` 那条用例钉年份、文件与下一步）。
         let bad = "这些年度库打不开，它们的计数不会出现在结果里: [2025]";
         match year_lookup(2025, Err(bad.to_string())) {
             YearLookup::Unreadable(e) => assert_eq!(e, bad),
@@ -1911,6 +1913,8 @@ mod tests {
             matches!(reset_plan(Ok(Vec::new())), ResetPlan::NothingToClear),
             "一套库都没有时不该讨一次 yes，更不该做执行前快照"
         );
+        // 这句只是"core 交回来一段拒绝文字"的替身：这里测的是**原样递给用户**，
+        // 措辞本身的判据在 core（`check_years_readable` 那条用例钉年份、文件与下一步）。
         let bad = "这些年度库打不开，它们的计数不会出现在结果里: [2025]";
         match reset_plan(Err(bad.to_string())) {
             ResetPlan::Blocked(e) => assert_eq!(e, bad, "拒绝的原因要原样递给用户"),
