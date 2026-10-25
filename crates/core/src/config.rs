@@ -123,6 +123,9 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
         ],
     );
     s("floating", &[("enabled", "true")]);
+    // 贴图用哪套绘制：webview（默认）/ native（原生分层窗口，一张图一个窗口而不是一整个
+    // 浏览器进程）。只在开窗时读一次（`desktop/src/pin.rs::renderer_is_native`），改了要重新贴图。
+    s("pin", &[("renderer", "webview")]);
     s(
         "pomodoro",
         &[
@@ -251,7 +254,7 @@ pub(crate) fn parse_ini(text: &str) -> HashMap<String, HashMap<String, String>> 
 /// 直接按 `HashMap` 迭代序排 ⇒ 实测同一份默认配置，重建路给
 /// `app_stats, plugins, device_stats`、逐行重写路给 `app_stats, device_stats, plugins`，
 /// 每跑一次进程都可能换个样子。现在两边都是"清单位置 → 同名兜底"。
-const SECTION_ORDER: [&str; 12] = [
+const SECTION_ORDER: [&str; 13] = [
     "database",
     "stats",
     "paths",
@@ -259,6 +262,7 @@ const SECTION_ORDER: [&str; 12] = [
     "gui",
     "hotkey",
     "floating",
+    "pin",
     "pomodoro",
     "rest",
     "app_stats",

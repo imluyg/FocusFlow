@@ -25,11 +25,13 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
+mod native;
+
 use base64::Engine as _;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
 
-use focusflow_core::capture::MonitorRect;
+use focusflow_core::capture::{self, MonitorRect};
 
 /// label 前缀。`capabilities/default.json` 的 `windows` 里那条 `pin-*` 就是照这个串写的，
 /// 有一条用例盯着两边一致 —— 改这里不改那边，新窗口会像当年 snip 那样「调什么都被拒」。
@@ -58,6 +60,26 @@ const BUILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 /// 贴图窗口滚轮能用到的缩放档位（相对 100%）。档位是离散的：连续缩放会让「1:1」这一档
 /// 再也回不去，而 1:1 恰好是这张图唯一不失真的看法。
 const ZOOM_STEPS: [f64; 7] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0];
+
+/// 贴图用哪一套绘制：`[pin] renderer = webview | native`，默认 webview。
+/// 认不出的值按 webview —— 与悬浮窗那条同一口径：写错一个字不该让功能消失。
+pub fn renderer_is_native() -> bool {
+    focusflow_core::config::instance()
+        .get("pin", "renderer")
+        .trim()
+        .eq_ignore_ascii_case("native")
+}
+
+/// 原生贴图销毁之后的账。原生这一侧**不**在 `PENDING`/`DIMS` 里留底图：像素归那条线程
+/// 的位图，窗口没了就跟着没了，所以既没有槽可收，也没有尺寸账可丢。
+/// 这里只留一句还剩几张 —— 名额是按 `native::live_count()` 算的，数错了用户会看到
+/// "已经有 12 张贴图"而桌上一张都找不到。
+pub fn note_native_pin_gone(seq: u32) {
+    tracing::info!(
+        "原生贴图 pin-{seq} 已关闭（还活着 {} 张）",
+        native::live_count()
+    );
+}
 
 /// 槽里的一份底图。`width`/`height` 是**物理像素**，与 png 的像素尺寸严格一致 ——
 /// 窗口尺寸与页面绘制都从这两个数算，所以「尺寸恰好等于图」只在这一处定义。
@@ -366,7 +388,15 @@ pub fn open(
     phys: &MonitorRect,
     monitor: &MonitorRect,
 ) -> Result<u32, String> {
-    let alive = live_pins(app).len();
+    let as_native = renderer_is_native();
+    // 名额两边各数各的：webview 那条以 `webview_windows()` 为唯一真相（不另建登记表），
+    // 原生那侧根本不在那个集合里，只能数自己的登记表。混用会得到"原生贴图不占名额"，
+    // 于是可以无限开窗 —— 那正是这条上限存在的理由。
+    let alive = if as_native {
+        native::live_count()
+    } else {
+        live_pins(app).len()
+    };
     if alive >= MAX_PIN_WINDOWS {
         return Err(format!(
             "已经有 {alive} 张贴图，先关掉一些（上限 {MAX_PIN_WINDOWS} 张）"
@@ -376,6 +406,27 @@ pub fn open(
     let (x, y) = pin_origin(monitor, phys.x, phys.y);
 
     let seq = PIN_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+
+    if as_native {
+        // 底图解码走 `capture::decode_png_rgba`（与标注层同一个解码器：只接 8 位 RGBA，
+        // 别的色型直接报错而不是猜）。原生这一侧**不**进 `PENDING`：那张槽是给页面
+        // 重新加载用的，而原生窗口没有页面可重载，留着就是白占几 MB base64。
+        let (rgba, dw, dh) =
+            capture::decode_png_rgba(png).map_err(|e| format!("原生贴图无法解码这张底图：{e}"))?;
+        if dw != width || dh != height {
+            return Err(format!(
+                "这张底图的尺寸是 {dw}x{dh}，与选区记下的 {width}x{height} 不符，不开窗以免贴一张对不上号的图"
+            ));
+        }
+        native::open(seq, rgba, width, height, x, y)
+            .map_err(|e| format!("原生贴图开窗失败：{e}"))?;
+        tracing::info!(
+            "贴图已开窗（原生）：pin-{seq}（{width}x{height} 物理 @ ({x},{y})，PNG {} 字节，当前活着 {} 张）",
+            png.len(),
+            native::live_count()
+        );
+        return Ok(seq);
+    }
     let slot = PinSlot {
         png_base64: base64::engine::general_purpose::STANDARD.encode(png),
         width,
@@ -534,6 +585,11 @@ pub fn pin_close(win: WebviewWindow) -> Result<(), String> {
 /// 主窗口里还得有一个能把桌面清空的地方。
 #[tauri::command]
 pub fn pin_close_all(app: AppHandle) -> usize {
+    if renderer_is_native() {
+        let n = native::close_all();
+        tracing::info!("贴图已全部关闭（原生，请求 {n} 张）");
+        return n;
+    }
     let pins = live_pins(&app);
     let n = pins.len();
     for (label, win) in pins {
@@ -568,7 +624,13 @@ pub fn on_destroyed(app: &AppHandle, label: &str) {
 /// 进程要退出时的一句账：贴图窗口里没有任何「没存下来的东西」（模块头第 1 条），
 /// 所以这里只出声、不挽留、不阻塞退出。
 pub fn log_on_quit(app: &AppHandle) {
-    let n = live_pins(app).len();
+    // 两边各数各的：只数 `webview_windows()` 的话，原生贴图全在桌面上盖着，
+    // 退出日志却写"没有贴图"—— 这一句是查"退出时到底带走了什么"的人唯一能读到的账。
+    let n = if renderer_is_native() {
+        native::live_count()
+    } else {
+        live_pins(app).len()
+    };
     if n > 0 {
         tracing::info!("退出程序时仍有 {n} 张贴图：每张都已落盘，窗口随进程一起关闭");
     }

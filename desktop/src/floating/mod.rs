@@ -16,7 +16,7 @@
 //! （托盘、设置页、截图前藏窗恢复的都是 label，不是渲染器）。
 
 mod native;
-mod render;
+pub(crate) mod render;
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
