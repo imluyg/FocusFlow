@@ -1073,8 +1073,17 @@ async function onAdvChange(k) {
   const label = (ADV.find((a) => a[0] === k) || [k, k])[1];
   // 数字那一类先挡在门口：非法串交给 core 会被 `get_int` 折成默认值，
   // 于是"我明明填了字，它把我的数换成默认值还报成功"。
-  if (e.kind === "int" && !/^-?\d+$/.test(value)) {
-    setMsg(`「${label}」要的是整数，刚才填的「${value || "（空）"}」没有写进去`, "var(--danger)");
+  if (e.kind === "int" && !/^\d+$/.test(value)) {
+    // 负数也挡在门外：这一页的 int 键全是分钟/秒/次数/天数，读侧一律夹到 ≥1
+    // （`stats.rs` 的 `secs`、`maintenance.rs` 的 `.max(1)`、`state.rs` 的间隔），
+    // 放行 -5 的结果是"框里写着 -5、行尾说改完立即生效、实际按 1 跑"——三个读数各说各话。
+    setMsg(`「${label}」要的是非负整数，刚才填的「${value || "（空）"}」没有写进去`, "var(--danger)");
+    await renderSettings();
+    return;
+  }
+  if (e.kind === "int" && value.length > 15) {
+    // 超过 15 位的数字串交给 core 迟早 parse 不动 ⇒ 静默退回默认值；在这儿就拒绝。
+    setMsg(`「${label}」这个数字大到程序用不了（最多 15 位），没有写进去`, "var(--danger)");
     await renderSettings();
     return;
   }
@@ -1624,6 +1633,9 @@ export async function doVacuum() {
 // 不用原生 confirm（本页其它地方同理都避开它），也不把它做成"只在前端的保险" ——
 // 命令那边还有第二道闸（confirm=false 直接拒），所以跳过界面也删不掉。
 let cleanupArmedAt = 0;
+// 令牌绑住"哪一个天数"：只绑时刻的话，第一击说的是「删除 365 天以前」，中途把框改成 5，
+// 第二击就删 5 天 —— 用户确认的内容与真的动手的内容可以不是一个数。
+let cleanupArmedFor = null;
 let cleanupDaysTyped = "365";
 
 // 重渲染后要还能看见用户刚填的那个数（这一页每次 setMsg/renderSettings 都可能重画）。
@@ -1639,8 +1651,11 @@ export async function doCleanup() {
   const days = el ? String(el.value).trim() : "";
   cleanupDaysTyped = days || cleanupDaysTyped;
   const now = Date.now();
-  if (cleanupArmedAt === 0 || now - cleanupArmedAt > 60000) {
+  if (cleanupArmedAt === 0 || now - cleanupArmedAt > 60000 || days !== cleanupArmedFor) {
+    // 三种情形都重新确认：没令牌、令牌过期、以及**框里的数被改过**。
+    // 改过数却不重新确认，就是拿一次针对 365 天的点头去执行 5 天的删除。
     cleanupArmedAt = now;
+    cleanupArmedFor = days;
     setMsg(
       `下一步会删除 ${days || "（天数没填）"} 天以前的全部记录，删除前会自动留一份兜底快照。` +
         "再点一次「清理更早的记录」才真的动手。",
@@ -1649,6 +1664,7 @@ export async function doCleanup() {
     return;
   }
   cleanupArmedAt = 0;
+  cleanupArmedFor = null;
   setMsg("正在清理…", "var(--muted)");
   try {
     // 那句话（含"这一次没有退路"那一半）由后端说，这里原样转达：

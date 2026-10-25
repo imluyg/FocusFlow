@@ -1007,6 +1007,15 @@ fn cleanup_verdict(
     }
 }
 
+/// 清理之后要不要叫界面重算一次：**只要真删掉过行就要**，与这一轮的结论是 Ok 还是 Err 无关。
+///
+/// 旧写法是 `verdict.is_ok()` 才置标记，于是"部分成功"那一格（有些年份已提交、有些回滚）
+/// 屏幕上仍画着刚被删掉的那些数据 —— 数据库与图表对不上，而用户读到的是"未完成"，
+/// 下一步很可能是"那我再点一次"，图表却还告诉他那些数据在。
+fn cleanup_refresh_needed(report: &focusflow_core::db::maintenance::MaintenanceReport) -> bool {
+    report.deleted > 0
+}
+
 /// 按日期清理旧记录（设置页的「按日期清理」）。**破坏性操作**。
 ///
 /// 三道闸，每一道都问不出就不动手：
@@ -1035,9 +1044,11 @@ pub async fn cleanup_data(
         }
         let report = focusflow_core::db::maintenance::cleanup_old_data(days);
         let verdict = cleanup_verdict(days, &report);
-        if verdict.is_ok() {
+        if cleanup_refresh_needed(&report) {
             // 删掉的是往期，界面上那几张按周期聚合的图必须重算一次；今日基准不在删除范围内
             // （`parse_keep_days` 保证天数 >= 1），所以不动它。
+            // 这一问只看"真删掉过行没有"，不看结论是 Ok 还是 Err —— 部分成功那一格
+            // 数据已经变了，屏幕不许继续画着刚被删掉的东西（见 `cleanup_refresh_needed`）。
             refresh.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         verdict
@@ -1137,7 +1148,10 @@ const EXPOSED_SETTINGS: &[Exposed] = &[
     Exposed {
         section: "listener",
         key: "key_repeat_stale_seconds",
-        kind: Kind::Int,
+        // 读者是 `get_float` + 下限 0.1（`listener.rs` 的 `cfg_seconds`），所以这一格
+        // 得按小数画：原先写成 `Kind::Int` 时界面拒 0.5，而填 0 又会被悄悄兜成 0.1，
+        // 框里回显的却还是 0 —— 一行三个读数各说各话。
+        kind: Kind::Float,
         live: Live::Hot,
     },
     Exposed {
@@ -2021,8 +2035,27 @@ mod cleanup_wiring {
             "实得：{why}"
         );
         assert!(
-            !why.contains("已删除"),
-            "没做成的那一轮不许报删除数，实得：{why}"
+            !why.contains("删掉") && !why.contains("已删除"),
+            "一个字节都没删的那一轮不许报删除数（那是替用户编一个已发生的损失），实得：{why}"
+        );
+
+        // 部分成功：清理是逐年各自 COMMIT 的，所以"有些年份已经删掉、只有失败那些年被回滚"
+        // 是一个真存在的结局。只说"未完成"会被读成"什么都没动"，而用户接下来要不要核对图表、
+        // 要不要再点一次，正好依赖这件事 —— 两头都必须在这一句里说到。
+        let mut half = nothing_wrong(1200);
+        half.failed_years = vec![2024];
+        let why = cleanup_verdict(30, &half).unwrap_err();
+        assert!(
+            why.contains("未完成") && why.contains("2024"),
+            "回滚的那几年要点名，实得：{why}"
+        );
+        assert!(
+            why.contains("已经删掉") && why.contains("1,200"),
+            "已提交的那一半也要说清（不说就等于把部分成功念成整体失败），实得：{why}"
+        );
+        assert!(
+            why.contains("已回滚的年份未删的行还在"),
+            "两句要各归各：不许让人以为已删的还能回来，实得：{why}"
         );
 
         // 快照的洞：删除确实完成 ⇒ 跟在 Ok 里，但必须逐字带上"这一次没有退路"
@@ -2036,6 +2069,50 @@ mod cleanup_wiring {
         assert!(
             line.contains("已删除"),
             "删除本身做成了，这句也要在，实得：{line}"
+        );
+    }
+
+    /// 清理之后叫不叫界面重算，只看"真删掉过行没有"，与这一轮的结论是 Ok 还是 Err 无关。
+    ///
+    /// 旧写法是 `verdict.is_ok()` 才置标记 ⇒ 部分成功那一格（有些年份已提交、有些回滚）
+    /// 屏幕上仍画着刚被删掉的数据：数据库与图表对不上，而用户读到的那句是"未完成"，
+    /// 下一步多半是"那我再点一次"。
+    #[test]
+    fn a_partial_cleanup_still_redraws_the_charts_it_changed() {
+        use super::cleanup_refresh_needed;
+        assert!(
+            cleanup_refresh_needed(&nothing_wrong(1)),
+            "删掉过一行就要重算一次"
+        );
+        assert!(
+            !cleanup_refresh_needed(&nothing_wrong(0)),
+            "什么都没删就别让整套按周期聚合白跑一次"
+        );
+        let mut half = nothing_wrong(1200);
+        half.failed_years = vec![2024];
+        assert!(
+            cleanup_refresh_needed(&half),
+            "已提交的那几年必须反映到图上，这一轮结论是 Err 也不例外"
+        );
+
+        // 接线判据：调用点必须问这一问，不许再退回"结论是不是 Ok"
+        let src = include_str!("commands.rs");
+        let at = src
+            .find("pub async fn cleanup_data(")
+            .expect("清理命令找不到了");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("命令体切不出来")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("cleanup_refresh_needed(&report)"),
+            "刷新那一步不再问「真删掉过行没有」—— 部分成功那一格图会留着已删的数据"
+        );
+        assert!(
+            !code.contains("if verdict.is_ok()"),
+            "又把「结论是不是 Ok」当成了「数据有没有变」—— 这两问在部分成功那一格是分开的"
         );
     }
 
@@ -2206,5 +2283,19 @@ mod advanced_settings_wiring {
                 "{k} 那一格缺东西"
             );
         }
+
+        // 控件类型必须与**读者**一致。这一格错过一次：`key_repeat_stale_seconds` 原先声明
+        // `Kind::Int`，而 `listener.rs` 用 `get_float` 读并按 0.1 兜底 —— 于是界面拒 0.5、
+        // 填 0 会被兜成 0.1 而框里回显的还是 0，一行里三个读数各说各话。
+        let stale = &json["listener.key_repeat_stale_seconds"];
+        assert_eq!(
+            stale["kind"], "float",
+            "读者是 get_float 的键不许画成整数框（拒小数 + 兜底后回显不一致）"
+        );
+        let reader = include_str!("../../crates/core/src/listener.rs");
+        assert!(
+            reader.contains("get_float(\"listener\", \"key_repeat_stale_seconds\""),
+            "这一格的读者若不再是 get_float，上面那条 kind 断言就得跟着改，别只改一边"
+        );
     }
 }

@@ -1071,8 +1071,20 @@ pub fn parse_keep_days(raw: &str) -> Result<i64, String> {
 /// 与 `vacuum_line` 同一族做法：话在 core 说一遍，两个入口各自只决定"怎么说、什么颜色"。
 pub fn cleanup_line(days: i64, report: &MaintenanceReport) -> String {
     if report.incomplete() {
+        // 「未完成」不是一个整体结论：清理是**逐年各自 COMMIT** 的，所以"有些年份已经删掉、
+        // 只有失败那些年被回滚"是一个真存在的结局。只说"未完成"会被读成"什么都没动"，
+        // 而用户接下来做的两件事正好依赖这件事：要不要去核对图表上的历史、要不要再点一次。
+        // 两头都要说，且已删的那一半要说清是"已提交"，不许与回滚那些年混成一句。
+        let done = if report.deleted > 0 {
+            format!(
+                "已经删掉 {} 条（那几年已提交，不会再来第二次）；",
+                crate::format::fmt_thousands(report.deleted)
+            )
+        } else {
+            "一个字节都没删；".to_string()
+        };
         format!(
-            "清理未完成：{}（已回滚的年份未删的行还在；原因见日志）",
+            "清理未完成：{done}{}（已回滚的年份未删的行还在；原因见日志）",
             report.why_incomplete()
         )
     } else {
