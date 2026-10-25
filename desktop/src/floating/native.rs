@@ -361,6 +361,11 @@ unsafe fn repaint(hwnd: HWND) -> bool {
         render::scale_opacity(card.buf(), PAUSED_NUM, PAUSED_DEN);
     }
 
+    // 交出去之前必须把卡片选回 DC：上面那段文字循环把蒙版选了上去，而蒙版的 alpha 全是 0
+    // （GDI 画字不写 alpha，见上面第 2 步）。少这一句，`UpdateLayeredWindow` 提交的就是那张
+    // 覆盖度层，`ULW_ALPHA` 下整面透明 —— 窗口在、置顶在、返回值成功，屏幕上却什么都没有。
+    let _ = g::SelectObject(hdc, g::HGDIOBJ(card.bmp.0));
+
     let blend = g::BLENDFUNCTION {
         BlendOp: g::AC_SRC_OVER as u8,
         BlendFlags: 0,
@@ -704,4 +709,40 @@ pub fn shutdown() {
 // 集中在这里也方便审计"到底碰了哪些用户32/Gdi 入口"。
 unsafe fn get_rect(hwnd: HWND, rc: &mut RECT) -> bool {
     wm::GetWindowRect(hwnd, rc).is_ok()
+}
+
+#[cfg(test)]
+mod wiring {
+    /// 交给 DWM 的那一张必须是卡片本身，不是文字蒙版 —— 蒙版的 alpha 全是 0，
+    /// 交错了症状是「窗口在、置顶在、调用返回成功，屏幕上却什么都没有」。
+    #[test]
+    fn the_card_is_selected_back_before_the_surface_is_submitted() {
+        let src = include_str!("native.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let flat: String = prod
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let mask_at = flat
+            .find("g::SelectObject(hdc,g::HGDIOBJ(mask.bmp.0))")
+            .expect("把文字蒙版选上 DC 那一步不见了");
+        let card_at = flat
+            .find("g::SelectObject(hdc,g::HGDIOBJ(card.bmp.0))")
+            .expect("提交前把卡片选回 DC 那一步不见了");
+        let ulw_at = flat
+            .find("wm::UpdateLayeredWindow(")
+            .expect("提交分层表面那一步不见了");
+        assert!(
+            card_at > mask_at,
+            "卡片必须在蒙版之后选回去：最后选上去的那一张才是会被交出去的"
+        );
+        assert!(
+            card_at < ulw_at,
+            "提交之前没把卡片选回 DC ⇒ 交上去的是 alpha 全 0 的蒙版，卡片在屏幕上彻底不出现"
+        );
+    }
 }
