@@ -15,6 +15,7 @@ floating/enabled
 gui/active_refresh_interval
 gui/default_period
 gui/floating_metric
+gui/floating_renderer
 gui/full_refresh_interval
 gui/start_to_tray
 gui/theme

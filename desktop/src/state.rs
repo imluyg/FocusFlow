@@ -337,6 +337,10 @@ impl AppState {
                 w.reset_active_anchor();
             }
         }
+        // 挂给悬浮窗：WebView2 那一支靠 `pause-changed` 事件，原生那张卡片读的是这一格
+        // （它收不到事件）。两个读者都不会漏，前提是所有暂停入口都走这一个函数 ——
+        // 这句话原本就写在本函数的注释里。
+        crate::floating::publish_paused(paused);
         paused
     }
 }
@@ -406,8 +410,6 @@ fn enforce_floating_size(win: &tauri::WebviewWindow, config: &FocusFlowConfig) {
 
 /// 设置窗口初始可见性与悬浮窗位置。
 fn setup_windows(app: &App, state: &AppState) {
-    let config = focusflow_core::config::instance();
-
     // 主窗口：`start_to_tray`（默认 true）＝启动进托盘；关掉它的人要的是"启动就看得见"。
     // 主窗口是**懒创建**的（tauri.conf.json 里没有它），启动时本来就不存在 ——
     // 原来只写了"进托盘就 hide()"，于是 false 那一支等于什么都不做，
@@ -420,54 +422,11 @@ fn setup_windows(app: &App, state: &AppState) {
         show_main_window_when_ready(app.handle().clone(), Duration::ZERO);
     }
 
-    // 悬浮窗：默认顶部靠右（对齐 Python 版），位置可持久化
-    if let Some(win) = app.get_webview_window("floating") {
-        make_floating_tool_window(&win);
-        // 悬浮窗本来就是透明窗口：Acrylic 生效时卡片背后是真实的系统级模糊；
-        // 失败则维持原有"半透明卡片"外观，无需前端配合
-        let dark = config.get("gui", "theme") == "dark";
-        apply_window_vibrancy(&win, dark);
-        // WebView2 创建控制器时会把窗口强制放宽到至少 120px（内容实际只需 ~81px），
-        // 因此在窗口构建完成后主动缩回目标宽度，并延时重复几次兜底异步放大。
-        enforce_floating_size(&win, config);
-        let x = config.get_float("floating", "pos_x", f64::NAN);
-        let y = config.get_float("floating", "pos_y", f64::NAN);
-        if x.is_nan() || y.is_nan() {
-            if let Ok(Some(mon)) = win.current_monitor() {
-                let scale = win.scale_factor().unwrap_or(1.0);
-                let w = mon.size().width as f64 / scale;
-                let _ = win.set_position(tauri::LogicalPosition::new(w - 120.0, 60.0));
-            }
-        } else {
-            // 存过的坐标只在"基本看不见"时才夹回来（判据与为什么不用工作区，
-            // 都写在 `clamp_floating_into_screen` 上）。
-            let (cx, cy) = match win.current_monitor() {
-                Ok(Some(mon)) => {
-                    let scale = win.scale_factor().unwrap_or(1.0);
-                    clamp_floating_into_screen(
-                        x,
-                        y,
-                        FloatingBounds {
-                            left: mon.position().x as f64 / scale,
-                            top: mon.position().y as f64 / scale,
-                            screen_w: mon.size().width as f64 / scale,
-                            screen_h: mon.size().height as f64 / scale,
-                            win_w: config.get_float("floating", "width", 90.0),
-                            win_h: config.get_float("floating", "height", 46.0),
-                        },
-                    )
-                }
-                // 拿不到显示器信息就不动它：瞎夹一次可能把一个好位置弄坏
-                _ => (x, y),
-            };
-            let _ = win.set_position(tauri::LogicalPosition::new(cx, cy));
-        }
-
-        // 启动时按配置显示悬浮窗
-        if config.get_bool("floating", "enabled", true) {
-            let _ = win.show();
-        }
-    }
+    // 悬浮窗：由 `floating` 那层按 `[gui] floating_renderer` 决定建哪一套。
+    // 以前这一段直接摸 `app.get_webview_window("floating")`，而那个窗口是
+    // `tauri.conf.json` 在启动时无条件建出来的 —— 于是即便选了原生渲染器，
+    // 整套 WebView2 照样起着，内存一点都省不下来。现在配置里那张表是空的。
+    crate::floating::setup(app, state);
 
     // 启动即同步 WebView2 后台状态（对齐 hide_main_window 的行为）：
     // 1) 渲染管线：主窗口/悬浮窗隐藏时控制器仍认为自己可见、维持渲染合成管线，
@@ -524,21 +483,59 @@ fn setup_windows(app: &App, state: &AppState) {
 ///
 /// 窗口不存在（构建失败）时以前是静默什么都不发生，这里至少留一条日志。
 pub fn set_floating_visible(app: &tauri::AppHandle, visible: bool) {
-    let Some(win) = app.get_webview_window("floating") else {
-        tracing::warn!("悬浮窗不存在，忽略可见性切换 (visible={visible})");
-        return;
-    };
-    if visible {
-        set_webview_rendering(app, "floating", true);
-        let _ = win.show();
-        let _ = win.set_focus();
+    // 两种渲染器都走 façade：它同时负责"渲染开关跟着可见性走"（WebView2 那一支）
+    // 与 `floating-changed` 广播（设置页那个勾选靠它同步）。
+    // 窗口不存在时 façade 自己会出声，这里不再叠一条同源的 warn —— 两条讲的是同一件事，
+    // 读日志的人会以为是两个不同的故障。
+    crate::floating::set_visible(app, visible);
+}
+
+/// WebView2 那一支悬浮窗的一次性设置。整段是从前的 `setup_windows` 里搬过来的，
+/// 搬的理由：窗口现在由 `floating` 那层建，这些动作必须紧跟在建窗之后，
+/// 而不是"启动时如果它存在"。少做一件都是"看着对、其实坏"：
+/// 漏工具窗样式 → 任务管理器把它当应用；漏尺寸修正 → WebView2 把 90px 撑成 120px；
+/// 漏位置夹取 → 存过的坐标在拔掉一块屏之后落在屏幕外，卡片看不见也点不到。
+pub(crate) fn finish_floating_setup(win: &tauri::WebviewWindow, config: &FocusFlowConfig) {
+    make_floating_tool_window(win);
+    // 悬浮窗本来就是透明窗口：Acrylic 生效时卡片背后是真实的系统级模糊；
+    // 失败则维持原有"半透明卡片"外观，无需前端配合
+    let dark = config.get("gui", "theme") == "dark";
+    apply_window_vibrancy(win, dark);
+    // WebView2 创建控制器时会把窗口强制放宽到至少 120px（内容实际只需 ~81px），
+    // 因此在窗口构建完成后主动缩回目标宽度，并延时重复几次兜底异步放大。
+    enforce_floating_size(win, config);
+    let x = config.get_float("floating", "pos_x", f64::NAN);
+    let y = config.get_float("floating", "pos_y", f64::NAN);
+    if x.is_nan() || y.is_nan() {
+        if let Ok(Some(mon)) = win.current_monitor() {
+            let scale = win.scale_factor().unwrap_or(1.0);
+            let w = mon.size().width as f64 / scale;
+            let _ = win.set_position(tauri::LogicalPosition::new(w - 120.0, 60.0));
+        }
     } else {
-        let _ = win.hide();
-        set_webview_rendering(app, "floating", false);
+        // 存过的坐标只在"基本看不见"时才夹回来（判据与为什么不用工作区，
+        // 都写在 `clamp_floating_into_screen` 上）。
+        let (cx, cy) = match win.current_monitor() {
+            Ok(Some(mon)) => {
+                let scale = win.scale_factor().unwrap_or(1.0);
+                clamp_floating_into_screen(
+                    x,
+                    y,
+                    FloatingBounds {
+                        left: mon.position().x as f64 / scale,
+                        top: mon.position().y as f64 / scale,
+                        screen_w: mon.size().width as f64 / scale,
+                        screen_h: mon.size().height as f64 / scale,
+                        win_w: config.get_float("floating", "width", 90.0),
+                        win_h: config.get_float("floating", "height", 46.0),
+                    },
+                )
+            }
+            // 拿不到显示器信息就不动它：瞎夹一次可能把一个好位置弄坏
+            _ => (x, y),
+        };
+        let _ = win.set_position(tauri::LogicalPosition::new(cx, cy));
     }
-    // 通知前端同步设置页那个勾选：入口有三个（设置页勾选、页内两个按钮、托盘菜单），
-    // 不广播的话从托盘切完之后，设置页的勾就和屏幕上有没有悬浮窗对不上。
-    let _ = app.emit("floating-changed", visible);
 }
 
 /// 设置各窗口 WebView2 内存档位：
@@ -682,7 +679,7 @@ pub static MAIN_GLASS: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// 前端收到 `vibrancy-on` 事件（或启动时查询 get_vibrancy）后切换
 /// body.glass 半透明令牌，让材质透出。
 #[cfg(windows)]
-fn apply_window_vibrancy(win: &tauri::WebviewWindow, dark: bool) -> bool {
+pub(crate) fn apply_window_vibrancy(win: &tauri::WebviewWindow, dark: bool) -> bool {
     use window_vibrancy::{apply_acrylic, apply_mica};
     if apply_mica(win, Some(dark)).is_ok() {
         tracing::info!("窗口材质已启用: Mica ({})", win.label());
@@ -705,7 +702,7 @@ fn apply_window_vibrancy(win: &tauri::WebviewWindow, dark: bool) -> bool {
 }
 
 #[cfg(not(windows))]
-fn apply_window_vibrancy(_win: &tauri::WebviewWindow, _dark: bool) -> bool {
+pub(crate) fn apply_window_vibrancy(_win: &tauri::WebviewWindow, _dark: bool) -> bool {
     false
 }
 
@@ -734,9 +731,9 @@ pub fn refresh_window_vibrancy(app: &tauri::AppHandle) {
             let _ = app.emit_to("main", "vibrancy-off", false);
         }
     }
-    if let Some(win) = app.get_webview_window("floating") {
-        apply_window_vibrancy(&win, dark);
-    }
+    // 悬浮窗那一支交给 façade：WebView2 那张卡片要重贴系统材质，
+    // 原生那张卡片没有材质可贴（分层窗口拿不到 Mica/Acrylic），它下一拍自己读 `[gui] theme`。
+    crate::floating::apply_theme(app, dark);
 }
 
 pub fn show_main_window(app: &tauri::AppHandle) {
@@ -1277,6 +1274,12 @@ pub fn show_main_window_when_ready(app: AppHandle, delay: Duration) {
 /// 任务栏本身是置顶窗口，鼠标指向时会把悬浮窗压到下面；
 /// 每 500ms 用 SetWindowPos(HWND_TOPMOST) 把它重新抬到任务栏之上。
 fn keep_floating_on_top(app: &App) {
+    // 只有 WebView2 那一支需要这个轮询：原生窗口在 `WM_WINDOWPOSCHANGING` 里当场答
+    // topmost（`floating/native.rs`），不用每秒两次 `SetWindowPos`。
+    if !crate::floating::needs_topmost_poll() {
+        tracing::info!("悬浮窗走原生渲染，不启动 500ms 置顶轮询");
+        return;
+    }
     let Some(win) = app.get_webview_window("floating") else {
         return;
     };
@@ -1660,10 +1663,9 @@ fn spawn_stats_worker(
                 // 悬浮窗是不带标题栏的工具窗（`make_floating_tool_window`），没有最小化
                 // 这一态，所以只有主窗口需要认 `is_minimized()`；这里少问一次也少一次
                 // 「投递主线程再等回话」。
-                let floating_visible = app
-                    .get_webview_window("floating")
-                    .map(|w| w.is_visible().unwrap_or(false))
-                    .unwrap_or(false);
+                // 走 façade 而不是 `get_webview_window("floating")`：原生那张卡片不在 Tauri 的
+                // 窗口集合里，按 label 找会静默拿到 None（`floating` 模块头点名了这类接线）。
+                let floating_visible = crate::floating::is_visible(&app);
                 let main_just_shown = just_shown(main_visible, &mut prev_main_visible);
                 let floating_just_shown = just_shown(floating_visible, &mut prev_floating_visible);
                 let heavy_interval_ms = if !main_visible {
@@ -1966,7 +1968,12 @@ fn spawn_stats_worker(
                     };
                     // 事件定向推送：只发给实际可见的窗口。
                     // 隐藏的窗口渲染进程已停（SetIsVisible=false），不再被 500ms 事件唤醒。
-                    if floating_visible {
+                    //
+                    // 原生那张卡片收不到事件（它不在 Tauri 的窗口注册表里），改读同一格
+                    // parked 快照；所以推送这一支要先问"这一轮是不是 WebView2 在渲染"，
+                    // 否则每条 emit 都在往一个不存在的窗口发，而 `let _ =` 会把这件事咽下去。
+                    crate::floating::publish_live(&live);
+                    if floating_visible && crate::floating::pushes_events() {
                         let _ = app.emit_to("floating", "stats-live", &live);
                     }
                     if main_visible {
@@ -2000,7 +2007,7 @@ fn spawn_stats_worker(
                             tracing::warn!("久坐提醒没能送到主窗口：{e}（托盘那一句还会说）");
                         }
                     }
-                    if floating_visible {
+                    if floating_visible && crate::floating::pushes_events() {
                         if let Err(e) = app.emit_to("floating", "rest-reminder", &notice) {
                             tracing::warn!("久坐提醒没能送到悬浮窗：{e}（托盘那一句还会说）");
                         }

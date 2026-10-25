@@ -348,25 +348,20 @@ fn show_main(app: &AppHandle) {
 
 fn toggle_pause(app: &AppHandle) {
     if let Some(state) = app.try_state::<Arc<AppState>>() {
-        // 走 AppState 的这一层：暂停时它会把写线程的活跃锚清零（见 `AppState::toggle_pause`）。
+        // 走 AppState 的这一层：暂停时它会把写线程的活跃锚清零（见 `AppState::toggle_pause`），
+        // 并把暂停态挂给悬浮窗那一格（原生卡片收不到事件，读的就是这一格）。
         let paused = state.toggle_pause();
-        // 同步前端暂停状态
-        if let Some(win) = app.get_webview_window("main") {
-            let _ = win.emit("pause-changed", paused);
-        }
-        if let Some(win) = app.get_webview_window("floating") {
-            let _ = win.emit("pause-changed", paused);
-        }
+        // 全局广播一次，两个 webview 都收到 —— 与 `commands::toggle_pause` 同一条口径。
+        // 这里原先是"主窗口发一次、悬浮窗发一次"：那种逐窗口的写法正是会在
+        // "悬浮窗不再是 webview"的那天悄悄少发一份的形状。
+        let _ = app.emit("pause-changed", paused);
     }
 }
 
 fn toggle_floating(app: &tauri::AppHandle) {
     // 走与设置页同一个动作，并把结果写回 [floating] enabled：
     // 托盘点了不算数、下次启动又按老配置冒出来，是同一个开关两处口径不一致。
-    let now_visible = app
-        .get_webview_window("floating")
-        .and_then(|w| w.is_visible().ok())
-        .unwrap_or(false);
+    let now_visible = crate::floating::is_visible(app);
     let want = !now_visible;
     let _ = focusflow_core::config::instance().set(
         "floating",

@@ -266,19 +266,11 @@ fn stale_reason(epoch: u64) -> String {
 
 /// 恢复悬浮窗到触发前的样子。
 ///
-/// 用 `WebviewWindow::show()` 而不是 `commands::show_floating`：后者会写
+/// 用 façade 的"按上一次记下的可见性恢复"而不是 `commands::show_floating`：后者会写
 /// `[floating] enabled = true`，于是"关着悬浮窗截一张图"会把用户的开关悄悄打开。
 fn restore_floating(app: &AppHandle) {
-    if !FLOATING_WAS_VISIBLE.swap(false, Ordering::SeqCst) {
-        return;
-    }
-    let Some(win) = app.get_webview_window("floating") else {
-        tracing::warn!("恢复悬浮窗：窗口不存在，用户需要自己再打开一次");
-        return;
-    };
-    if let Err(e) = win.show() {
-        tracing::error!("恢复悬浮窗失败：{e}");
-    }
+    let was_visible = FLOATING_WAS_VISIBLE.swap(false, Ordering::SeqCst);
+    crate::floating::restore_after_capture(app, was_visible);
 }
 
 /// 抓屏 + 编码 + 入槽 + 开覆盖层。在专用线程上跑（`trigger` 派下来的）。
@@ -681,20 +673,12 @@ pub fn trigger(app: &AppHandle, annotate: bool) -> Result<(), String> {
     }
 
     // 悬浮窗的可见性必须在主线程读、也必须先藏起来再抓屏，顺序反了就把悬浮窗截进图里。
-    match app.get_webview_window("floating") {
-        Some(floating) => {
-            let visible = floating.is_visible().unwrap_or(false);
-            FLOATING_WAS_VISIBLE.store(visible, Ordering::SeqCst);
-            if visible {
-                if let Err(e) = floating.hide() {
-                    tracing::warn!("藏悬浮窗失败，截图里可能带上它：{e}");
-                }
-            }
-        }
-        // 悬浮窗不存在时不能什么都不做：FLOATING_WAS_VISIBLE 得留在 false，
-        // 否则上一张截图留下的 true 会让收尾去 show() 一个不存在的窗口。
-        None => FLOATING_WAS_VISIBLE.store(false, Ordering::SeqCst),
-    }
+    // 走 façade 而不是按 label 找 webview：原生那张卡片不在 Tauri 的窗口集合里，
+    // `get_webview_window` 会拿到 None，于是"藏起来"这一步静默跳过 —— 症状是
+    // 每张截图上都带着一块小卡片，而日志里一个字都没有。
+    // façade 自己负责"窗口不存在时把标记留在 false"（否则上一张留下的 true
+    // 会让收尾去 show() 一个不存在的窗口）。
+    FLOATING_WAS_VISIBLE.store(crate::floating::hide_for_capture(app), Ordering::SeqCst);
 
     let handle = app.clone();
     std::thread::Builder::new()
@@ -1920,11 +1904,25 @@ mod tests {
              隔开太远说明它被挪去了别处"
         );
         // 反向的那半也要成立：藏过东西时确实要睡。它靠的是 store→load 都读同一个原子，
-        // 所以 trigger 里那次 store 不许被换成局部变量
+        // 所以 trigger 里那次 store 不许被换成局部变量。
+        //
+        // 形状在本轮变过一次，判据跟着换、意图没变：以前是"可见/不可见两个分支各写一次"
+        // （所以数到 2），现在藏与不藏都由 `floating::hide_for_capture` 一个返回值说话
+        // （所以只有一处 store）。这比旧形状更强 —— 旧的那份要两个分支都记得写，
+        // 少写一支就是上一张留下的 true 让收尾去 show() 一个没被藏起来的窗口。
+        // 钉的是**调用形态**（实参必须是那次 hide 的返回值），不是"文件里出现过 store"。
+        assert_eq!(
+            flat.match_indices("FLOATING_WAS_VISIBLE.store(crate::floating::hide_for_capture(app)")
+                .count(),
+            1,
+            "可见性必须无条件登记一次，而且登记的是「这次真藏住了没有」的返回值：\
+             换成局部变量或写死一个值，收尾那一步就读不到真相了"
+        );
         assert_eq!(
             flat.match_indices("FLOATING_WAS_VISIBLE.store(").count(),
-            2,
-            "trigger 里两个分支各写一次可见性，收尾再读一次 —— 少一处就是有一支没登记"
+            1,
+            "只许有一处登记：多出来的那些等于绕过 façade 自己判断可见性，\
+             而原生卡片不在 Tauri 的窗口集合里，那样判会永远读到「不可见」"
         );
     }
 

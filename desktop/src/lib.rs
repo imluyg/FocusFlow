@@ -5,6 +5,7 @@
 
 pub mod commands;
 pub mod export;
+pub mod floating;
 pub mod hotkey;
 pub mod pin;
 pub mod plugins;
@@ -280,6 +281,14 @@ pub fn run() {
                 if window.label() == snip::SNIP_LABEL {
                     api.prevent_close();
                     snip::on_snip_close_requested(window.app_handle());
+                }
+                // 悬浮窗同样拦下来。以前它由 `tauri.conf.json` 在启动时建出来，Alt+F4 掉它
+                // 之后只剩"置顶轮询线程自己发现窗口没了退出"这一条后果；现在它是懒创建的 ——
+                // 主窗口可能压根还没建过，于是这张卡片是**唯一**的窗口，真销毁就让窗口集变空，
+                // Tauri 会据此发 ExitRequested ⇒ 整个程序端着用户的统计数据退出。
+                if window.label() == floating::FLOATING_LABEL {
+                    api.prevent_close();
+                    floating::set_visible(window.app_handle(), false);
                 }
             }
             // 贴图窗口销毁之后才收回它那份底图（`CloseRequested` 时窗口还在，那时收就早了）。

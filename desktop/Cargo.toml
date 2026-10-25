@@ -34,6 +34,10 @@ windows = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
+    # 原生悬浮窗（`floating/native.rs`）：分层窗口的位图与文字要 GDI，
+    # 每窗 DPI 要 HiDpi（`GetDpiForWindow` 在 0.61 里挂在 HiDpi 之下，不在 Gdi）。
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
 ] }
 # 系统级窗口材质（Win11 Mica / Win10 Acrylic，液态玻璃）
 window-vibrancy = "0.5"

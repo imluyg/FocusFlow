@@ -95,6 +95,10 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             ("unload_hidden_delay", "60"),
             // 悬浮窗显示口径：times / duration / both（desktop/ui/floating.js 读）
             ("floating_metric", "times"),
+            // 悬浮窗用哪套绘制：webview（WebView2，一直以来的样子）/ native（原生分层窗口）。
+            // 默认 webview —— 原生化第一版不把它设成默认，改动要能在设置页一句话退回。
+            // 只在启动时读一次（`desktop/src/floating/renderer_of`），改了要重启。
+            ("floating_renderer", "webview"),
             // 启动时选中的统计周期（-1 = 今日）：前端每次切换都写回它，
             // 用来"记住上次退出前看的周期"（desktop/src/state.rs 读，非法值在入口拦掉）。
             // 和 floating_metric 同一类：代码一直在读、默认值里却没有，

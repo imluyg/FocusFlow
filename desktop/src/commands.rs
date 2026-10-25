@@ -229,6 +229,17 @@ pub fn set_config(
     key: String,
     value: String,
 ) -> Result<(), String> {
+    // 悬浮窗渲染器这一格只能填两个值，别的都在门口拦掉。理由：认不出的值在
+    // `floating::renderer_of` 那里会**静默退回 webview**，那是对的兜底，但设置页不能
+    // 因此撒谎 —— 填了 "natvite" 却写着"已生效"，人只会以为自己那台机器上原生不工作。
+    if section == "gui" && key == "floating_renderer" {
+        let v = value.trim().to_ascii_lowercase();
+        if v != "webview" && v != "native" {
+            return Err(format!(
+                "「悬浮窗渲染方式」只能填 webview 或 native，收到的是 {value:?}"
+            ));
+        }
+    }
     state
         .config
         .set(&section, &key, &value)
@@ -251,6 +262,14 @@ pub fn set_config(
     // 主题改了要重贴窗口材质：那一层的深浅是按"贴的那一刻"定死的（见 refresh_window_vibrancy）
     if must_reapply_vibrancy(&section, &key) {
         crate::state::refresh_window_vibrancy(&app);
+    }
+    // 卡片上画什么、画多大：原生那一支每秒读一次配置，这里催它立刻重算，
+    // 免得"改完口径、卡片上一秒还是旧样子"。WebView2 那一支的页面自己会重读，
+    // 所以 `floating::refresh` 在那边是空操作 —— 两个分支都不用加条件。
+    if (section == "gui" && key == "floating_metric")
+        || (section == "floating" && (key == "width" || key == "height"))
+    {
+        crate::floating::refresh(&app);
     }
     Ok(())
 }
@@ -1260,6 +1279,14 @@ const EXPOSED_SETTINGS: &[Exposed] = &[
         section: "gui",
         key: "start_to_tray",
         kind: Kind::Switch,
+        live: Live::Restart,
+    },
+    // 悬浮窗用哪套绘制：webview（默认，一直以来的样子）/ native（原生分层窗口，
+    // 空载时不再养一整套浏览器进程）。填错会被 `set_config` 在门口拒掉。
+    Exposed {
+        section: "gui",
+        key: "floating_renderer",
+        kind: Kind::Text,
         live: Live::Restart,
     },
     Exposed {

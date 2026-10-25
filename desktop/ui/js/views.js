@@ -1037,6 +1037,7 @@ const ADV = [
   ["gui.unload_hidden", "隐藏后卸载页面", "主窗口隐藏够久就把渲染进程卸掉（省下几百 MB）；关掉就一直留着。"],
   ["gui.unload_hidden_delay", "卸载等待（秒）", "隐藏多久之后才卸。"],
   ["gui.start_to_tray", "启动后进托盘", "开机后不弹主界面，只在托盘里待着。想“启动就看得见”就关掉它。开机自启是另一个开关，在「常规」那一页。"],
+  ["gui.floating_renderer", "悬浮窗渲染方式", "填 webview（默认，用浏览器画）或 native（原生分层窗口，空载时不再养一整套浏览器进程）。改完要重启程序才生效；填别的值会被拒。"],
   ["database.max_backups", "最近份数", "备份轮转里「最近 N 份全留」那一档的 N；每天 / 每周 / 每月还各另留一份。"],
   ["database.backup_disabled_plugins", "连停用插件的数据一起备份", "默认不备：插件停用之后它的库不再被写，备了只占轮转名额。"],
   ["database.auto_vacuum_days", "自动压缩间隔（天）", "每隔几天自动做一次数据库压缩。"],
@@ -1383,6 +1384,7 @@ const SETTINGS_CATS = [
           "gui.unload_hidden",
           "gui.unload_hidden_delay",
           "gui.start_to_tray",
+          "gui.floating_renderer",
         ]),
       },
       {
