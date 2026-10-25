@@ -38,6 +38,55 @@ pub fn clamp_query_days(days: i64) -> i64 {
     days.clamp(1, MAX_QUERY_DAYS)
 }
 
+/// 「这一轮没读全」用来点名的**域名清单，唯一出处**。
+///
+/// 一句 gap 长这样：`{哪一年} 年库{域名}读不出来: {原因}`。四个读数出口各自填自己的域名
+/// （三个榜走 `gather_rank_totals`、设备走 `gather_device_totals`、时间窗口走
+/// `read_window_years`、单日小时走 `hourly_stats_totals`），消费侧再按域名把那句挑到
+/// 对应的栏位：面板是 `desktop/ui/js/views.js` 的 `gapNote(s, "域名")`，周报是
+/// `desktop/src/export.rs` 逐日那四趟。
+///
+/// 域名只许从这里取：`desktop/src/state.rs` 的
+/// `the_domain_list_is_the_single_source_for_every_side` 按这份清单逐条比三处
+/// （core 生产半边不许再抄一份字面量、清单上每个名字都要有人点、面板与周报都不许自创名字）。
+/// 加一栏时只改一处的后果就是界面那一栏对着空榜说"暂无数据"，而这正是这一族最初的症状。
+pub const DOMAIN_KEYS: &str = "按键统计";
+/// 前台应用时长榜。
+pub const DOMAIN_APPS: &str = "应用时长";
+/// 设备维度榜（Raw Input 那条侧信道）。
+pub const DOMAIN_DEVICES: &str = "设备统计";
+/// 按日序列（趋势图与星期分布都从它聚合出来，所以星期那一栏继承它的那句）。
+pub const DOMAIN_DAILY: &str = "每日趋势";
+/// 窗口内的每小时分布（跟着顶部周期那一问）。
+pub const DOMAIN_HOURLY: &str = "每小时分布";
+/// 某一天的 24 格（周报的时段直方图那一问，与上面那把窗口尺子是两件事）。
+pub const DOMAIN_DAY_HOURS: &str = "当日小时分布";
+
+/// 上面六条的一份清单，跨文件判据按它逐条走。
+///
+/// 新增域名时必须同时登记到这里 —— 漏了登记，判据会红在"core 里多出一个没人认领的
+/// `pub const DOMAIN_*`"那一句。
+pub const READ_DOMAINS: &[&str] = &[
+    DOMAIN_KEYS,
+    DOMAIN_APPS,
+    DOMAIN_DEVICES,
+    DOMAIN_DAILY,
+    DOMAIN_HOURLY,
+    DOMAIN_DAY_HOURS,
+];
+
+/// 其中面板真的有一栏来接的那几条（`gapNote` 逐条要有对应的调用）。
+///
+/// 不在这一份里的域名（当日小时分布）只有周报会念：面板上没有"某一天几点"那一栏，
+/// 硬要求它也有个 gap 牌子就会造出一个永远为真的空位。
+pub const PANEL_READ_DOMAINS: &[&str] = &[
+    DOMAIN_KEYS,
+    DOMAIN_APPS,
+    DOMAIN_DEVICES,
+    DOMAIN_DAILY,
+    DOMAIN_HOURLY,
+];
+
 /// 统计周期取值是否合法：-1=今日 / 0=总计 / 1..=MAX_QUERY_DAYS 天。
 ///
 /// 周期值来自前端 IPC 与 `gui.default_period`（用户可手改），必须在入口拦截：
@@ -561,13 +610,9 @@ pub fn stats_totals(days: Option<i64>, year: Option<i32>) -> RankTotals {
     } else {
         ""
     };
-    gather_rank_totals(
-        &years,
-        "按键统计",
-        cond,
-        start_dk,
-        |conn, cond, param| query_stats_in_conn(conn, cond, param, true),
-    )
+    gather_rank_totals(&years, DOMAIN_KEYS, cond, start_dk, |conn, cond, param| {
+        query_stats_in_conn(conn, cond, param, true)
+    })
 }
 
 /// 某一天的按键统计读数。
@@ -575,7 +620,7 @@ pub fn stats_totals_on(target_date: chrono::NaiveDate) -> RankTotals {
     let dk = day_key_of_date(target_date);
     gather_rank_totals(
         &[target_date.year()],
-        "按键统计",
+        DOMAIN_KEYS,
         "date_key = ?1",
         Some(dk),
         |conn, cond, param| query_stats_in_conn(conn, cond, param, false),
@@ -789,11 +834,6 @@ pub struct HourlyTotals {
     pub unreadable: Vec<String>,
 }
 
-/// 面板与导出按这两个词挑该说的那句 gap（`views.js::gapNote` 有同名判据，
-/// `the_panel_names_the_same_domains_as_the_core` 盯着两边不许各写一套）。
-const DAILY_LABEL: &str = "每日趋势";
-const HOURLY_LABEL: &str = "每小时分布";
-
 /// 窗口内 `(第一列, 第二列)` 两段查询只差 SQL 一句，取行的错误处理完全一样：
 /// 收成一个函数，免得一处补了另一处漏（这一轮之前两处都在 `rows.flatten()` 上把坏页折掉）。
 fn read_pairs(
@@ -919,7 +959,7 @@ pub fn daily_counts_totals(days: i64, year: Option<i32>) -> DailyTotals {
     }
 
     let (pairs, unreadable) = read_window_years(
-        DAILY_LABEL,
+        DOMAIN_DAILY,
         &years_to_query,
         start_dk,
         end_dk,
@@ -980,11 +1020,11 @@ pub fn hourly_stats_totals(target_date: Option<chrono::NaiveDate>) -> HourlyTota
     let dk = day_key_of_date(d);
     let year = d.year();
     let path = paths::year_db_path(year);
-    let gap_of = |why: String| format!("{year} 年库当日小时分布读不出来: {why}");
+    let gap_of = |why: String| format!("{year} 年库{DOMAIN_DAY_HOURS}读不出来: {why}");
     // 先过那道"在不在"的三态闸：没有这一年的库是答案（安静 24 个 0），
     // 说不出才要出声 —— 少了这一步，周报会把"没有 2020 年的库"讲成一份拒绝。
     let mut unreadable: Vec<String> = Vec::new();
-    match gate_year(year, &path, "当日小时分布") {
+    match gate_year(year, &path, DOMAIN_DAY_HOURS) {
         YearGate::SkipAbsent => {
             return HourlyTotals {
                 hours: vec![0i64; 24],
@@ -1016,7 +1056,7 @@ pub fn hourly_stats_totals(target_date: Option<chrono::NaiveDate>) -> HourlyTota
             Ok(list) => YearRead::Read(list),
             Err(e) => {
                 tracing::error!("小时分布查询失败（{year} 年库）: {e}");
-                YearRead::Unreadable(format!("当日小时分布读不出来: {e}"))
+                YearRead::Unreadable(format!("{DOMAIN_DAY_HOURS}读不出来: {e}"))
             }
         }
     });
@@ -1063,7 +1103,7 @@ pub fn hourly_window_totals(days: i64, year: Option<i32>) -> HourlyTotals {
     let end_dk = day_key_of_date(today);
     let mut hours = vec![0i64; 24];
     let (pairs, unreadable) = read_window_years(
-        HOURLY_LABEL,
+        DOMAIN_HOURLY,
         &years_to_query,
         start_dk,
         end_dk,
@@ -1116,7 +1156,7 @@ fn query_apps_in_conn(
     let total: i64 = match summed {
         Ok(v) => v,
         Err(e) => {
-            return YearRead::Unreadable(format!("汇总这一窗口的应用时长时读不出来: {e}"));
+            return YearRead::Unreadable(format!("汇总这一窗口的{DOMAIN_APPS}时读不出来: {e}"));
         }
     };
     // 必须按应用聚合后再进 HashMap：app_usage 主键是 (date_key, app_name)，
@@ -1167,7 +1207,7 @@ pub fn app_stats_totals(days: Option<i64>, year: Option<i32>) -> RankTotals {
     } else {
         ""
     };
-    gather_rank_totals(&years, "应用时长", cond, start_dk, query_apps_in_conn)
+    gather_rank_totals(&years, DOMAIN_APPS, cond, start_dk, query_apps_in_conn)
 }
 
 /// 某一天的前台应用时长读数。
@@ -1175,7 +1215,7 @@ pub fn app_stats_totals_on(target_date: chrono::NaiveDate) -> RankTotals {
     let dk = day_key_of_date(target_date);
     gather_rank_totals(
         &[target_date.year()],
-        "应用时长",
+        DOMAIN_APPS,
         "date_key = ?1",
         Some(dk),
         query_apps_in_conn,
@@ -1571,12 +1611,12 @@ fn gather_device_totals(years: &[i32], cond: &str, param: Option<i64>) -> Device
     let mut rows: Vec<DeviceRow> = Vec::new();
     let mut out = DeviceTotals::default();
     for year in years.iter().copied() {
+        let gap_of = |why: String| format!("{year} 年库{DOMAIN_DEVICES}读不出来: {why}");
         let path = paths::year_db_path(year);
-        match gate_year(year, &path, "设备统计") {
+        match gate_year(year, &path, DOMAIN_DEVICES) {
             YearGate::SkipAbsent => continue,
             YearGate::CannotTell(why) => {
-                out.unreadable
-                    .push(format!("{year} 年库设备统计读不出来: {why}"));
+                out.unreadable.push(gap_of(why));
                 continue;
             }
             YearGate::Read => {}
@@ -1585,12 +1625,8 @@ fn gather_device_totals(years: &[i32], cond: &str, param: Option<i64>) -> Device
             query_devices_in_conn(conn, cond, param, year)
         });
         match got {
-            Err(why) => out
-                .unreadable
-                .push(format!("{year} 年库设备统计读不出来: {why}")),
-            Ok(YearRead::Unreadable(why)) => out
-                .unreadable
-                .push(format!("{year} 年库设备统计读不出来: {why}")),
+            Err(why) => out.unreadable.push(gap_of(why)),
+            Ok(YearRead::Unreadable(why)) => out.unreadable.push(gap_of(why)),
             // 没有 `device_counts` = 这一年确实还没积累设备数据
             Ok(YearRead::NoTable) => {}
             Ok(YearRead::Read(list)) => rows.extend(list),

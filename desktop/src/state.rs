@@ -2718,8 +2718,7 @@ mod compute_charts_tests {
             "三个排行榜加两条时间切面各该说一条没读全，实得 {:?}",
             agg.read_gaps
         );
-        for domain in ["按键统计", "应用时长", "设备统计", "每日趋势", "每小时分布"]
-        {
+        for domain in focusflow_core::db::queries::PANEL_READ_DOMAINS {
             assert!(
                 agg.read_gaps.iter().any(|g| g.contains(domain)),
                 "{domain} 那一栏的 gap 没进面板，实得 {:?}",
@@ -2728,24 +2727,115 @@ mod compute_charts_tests {
         }
     }
 
-    /// 域名串两头同源：core 的 `label` 与前端 `gapNote` 的过滤词必须是同一批字面量。
+    /// 域名清单三处同源：core 那份 `READ_DOMAINS` 是唯一出处，面板与周报都按它逐条比。
     ///
-    /// 探针：把 core 里 `"应用时长"` 改成别的词 ⇒ 这条红（前端会从此滤不到那一栏的 gap，
-    /// 而那个 gap 仍在数组里 —— 界面上就是一句都不显示）。
-    /// 「每日趋势／每小时分布」是同一批里的另外两栏（星期分布继承每日那句，所以不另列）。
+    /// 三个方向都查 —— 少一个方向就留着一个"加一栏只改一处"的口子：
+    /// 一、core 生产半边每个域名只许出现一次（就是它那行 `pub const DOMAIN_*` 的定义）。
+    ///    多出来的一次就是有人在清单之外又抄了一份字面量，改一处漏一处正是这一族的病根；
+    /// 二、定义了 `pub const DOMAIN_x` 就必须登记进 `READ_DOMAINS`，清单上每条也要真有定义；
+    /// 三、面板按 `gapNote(s, "域名")` 点的名字必须在清单上，清单上面板该接的每一栏也不能缺；
+    ///    面板没有的那条（当日小时分布）必须由周报按常量名认领。
+    ///
+    /// 探针（都实测过红）：把 `gather_device_totals` 的 gap 换回硬写「设备统计」⇒ 第一方向红；
+    /// 新加一条 `pub const DOMAIN_WEEK = "星期分布"` 而不登记 ⇒ 第二方向红；
+    /// 把 views.js 里 `gapNote(s, "每日趋势")` 的一处换成清单外的词 ⇒ 第三方向红，删掉一处 ⇒ 也红。
     #[test]
-    fn the_panel_names_the_same_domains_as_the_core() {
+    fn the_domain_list_is_the_single_source_for_every_side() {
+        use focusflow_core::db::queries::{PANEL_READ_DOMAINS, READ_DOMAINS};
         let js = include_str!("../ui/js/views.js");
-        let core = include_str!("../../crates/core/src/db/queries.rs");
-        for domain in ["按键统计", "应用时长", "设备统计", "每日趋势", "每小时分布"]
-        {
+        let weekly = include_str!("export.rs");
+        let core_src = include_str!("../../crates/core/src/db/queries.rs");
+        // 生产半边，并把整行注释摘掉：这一段自己的说明文字里就写着这些域名，
+        // 带着注释判"只许出现一次"会红在文档上、绿在真正的第二份字面量之上。
+        let prod: String = core_src[..core_src
+            .find("#[cfg(test)]")
+            .expect("core 测试模块的起点找不到了")]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // core 里定义了哪些 `pub const DOMAIN_x = "…"`：名字与串都要拿到，
+        // 后者供"清单"比对，前者供周报那一侧按名认领。
+        let mut defined: Vec<(String, String)> = Vec::new();
+        for line in prod.lines() {
+            let Some(rest) = line.trim().strip_prefix("pub const DOMAIN_") else {
+                continue;
+            };
+            let name = format!("DOMAIN_{}", rest.split(':').next().unwrap_or("").trim());
+            let Some(value) = line.split('"').nth(1) else {
+                panic!("常量 {name} 的定义里读不出一串字面量: {}", line.trim());
+            };
+            defined.push((name, value.to_string()));
+        }
+        assert!(
+            !defined.is_empty(),
+            "core 里一个 `pub const DOMAIN_*` 都没扫到 —— 域名清单搬家了，这条判据的锚点也要跟着搬"
+        );
+
+        // 二、定义与清单互为充要：加一条常量不登记 ⇒ 红；清单凭空列一条 ⇒ 也红
+        for (name, value) in &defined {
             assert!(
-                core.contains(&format!("\"{domain}\"")),
-                "core 那一侧的域名 label「{domain}」不见了（gap 文案会跟着变）"
+                READ_DOMAINS.contains(&value.as_str()),
+                "{name}＝「{value}」没登记进 `READ_DOMAINS`：加一栏要连着清单一起加"
+            );
+        }
+        for domain in READ_DOMAINS.iter().copied() {
+            assert!(
+                defined.iter().any(|(_, v)| v.as_str() == domain),
+                "清单上的「{domain}」没有对应的 `pub const DOMAIN_*` 定义"
+            );
+        }
+
+        // 一、core 生产半边不许在清单之外再抄一份字面量
+        for domain in READ_DOMAINS.iter().copied() {
+            let hits = prod.matches(domain).count();
+            assert_eq!(
+                hits, 1,
+                "「{domain}」在 core 生产代码里出现 {hits} 次：清单之外又抄了一份，\
+                 改一处漏一处就长这样"
+            );
+        }
+
+        // 三、面板按什么名过滤 gap，必须是清单上的名
+        let mut panel_named: Vec<String> = Vec::new();
+        let mut rest = js;
+        while let Some(at) = rest.find("gapNote(s, \"") {
+            let tail = &rest[at + "gapNote(s, \"".len()..];
+            let Some(end) = tail.find('"') else { break };
+            panel_named.push(tail[..end].to_string());
+            rest = &tail[end..];
+        }
+        assert!(
+            !panel_named.is_empty(),
+            "面板一处 gapNote 都没扫到 —— views.js 的调用形状变了，这条判据要先搬锚点"
+        );
+        for name in &panel_named {
+            assert!(
+                PANEL_READ_DOMAINS.contains(&name.as_str()),
+                "面板按「{name}」过滤 gap，可它不在面板该接的域名清单上（core 交不回这种句子）"
+            );
+        }
+        for domain in PANEL_READ_DOMAINS.iter().copied() {
+            assert!(
+                READ_DOMAINS.contains(&domain),
+                "面板清单上的「{domain}」不在总清单上"
             );
             assert!(
-                js.contains(&format!("gapNote(s, \"{domain}\")")),
-                "前端按「{domain}」过滤 gap 的那一处不见了"
+                panel_named.iter().any(|n| n.as_str() == domain),
+                "面板没有接「{domain}」的那一栏了：`gapNote(s, \"{domain}\")` 一处都找不到"
+            );
+        }
+
+        // 面板不接的那几条，必须由周报按常量名认领 —— 否则这一栏加进清单却没人显示它
+        for (name, value) in &defined {
+            if PANEL_READ_DOMAINS.contains(&value.as_str()) {
+                continue;
+            }
+            assert!(
+                weekly.contains(name.as_str()),
+                "域名「{value}」面板没有对应栏位，周报也没按 `{name}` 认领它：\
+                 加一栏得有人在界面上说得出这句话"
             );
         }
     }

@@ -77,8 +77,9 @@ function periodText(p) {
 // 「这一轮没读全」的牌子。后端把没答上来的问原样交回来（每项一句话，含域名与年份），
 // 空榜与"读不出来"必须是两副面孔：过去两者长得一样，用户只能等下一轮自愈或重启，
 // 而同一页上「总计」走的是带原因的口子 —— 两张卡片互相打脸。
-// 三个域名串与 core 里 `gather_rank_totals`/`gather_device_totals` 的 label 同源，
-// 由 `state.rs` 的 `the_panel_names_the_same_domains_as_the_core` 钉住。
+// 下面按域名过滤用的那几串字面量与 core 的 `db/queries.rs::READ_DOMAINS` 同源（每个域名
+// 只在 core 定义一次），逐条由 `state.rs` 的
+// `the_domain_list_is_the_single_source_for_every_side` 钉住：清单加一栏而这里没接，红。
 function gapNote(s, domain) {
   const gaps = (s.read_gaps || []).filter((g) => String(g).includes(domain));
   if (gaps.length === 0) return "";

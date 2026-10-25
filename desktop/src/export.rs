@@ -891,7 +891,11 @@ mod tests {
 
         let e = write_weekly_report_for(from, to).expect_err("时段直方图读不全时不该写半份");
         let msg = e.to_string();
-        for domain in ["当日小时分布", "按键统计", "应用时长"] {
+        for domain in [
+            queries::DOMAIN_DAY_HOURS,
+            queries::DOMAIN_KEYS,
+            queries::DOMAIN_APPS,
+        ] {
             assert!(
                 msg.contains(domain) && msg.contains(&year.to_string()),
                 "{domain} 那一问没读全也要点名，实得: {msg}"
