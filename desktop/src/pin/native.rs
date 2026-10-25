@@ -46,17 +46,24 @@ pub fn live_count() -> usize {
 
 // ===== 纯函数部分（能在无头用例里钉死的那三件）=====
 
-/// RGBA8（解码器给的顺序）→ 预乘 BGRA8，并把 alpha 钉成 255。
+/// RGBA8（解码器给的顺序）→ 预乘 BGRA8，并把 alpha 钉成 255，**写进调用方给的缓冲区**
+/// （也就是位图自己那块），返回真正写进去的字节数。
 ///
-/// 拆出来的理由：换序 = 红蓝反了（"有颜色但不对劲"），alpha 忘了抬 = 整张透明
+/// 为什么形参是 `dst` 而不是返回一个新的 `Vec`：一张整屏 4K 的像素是 33 MB，返回 `Vec`
+/// 就等于"传进来的 RGBA + 新分配的一份 + 位图"三份同时活着，而且前两份会一路活到这张图
+/// 关掉为止。写进目标缓冲 ⇒ 换序那一刻峰值只有两份；写完把解码缓冲交回去 ⇒ 稳态只剩位图
+/// 一份，后面每一帧都从它缩放。
+///
+/// 拆出来的理由不变：换序 = 红蓝反了（"有颜色但不对劲"），alpha 忘了抬 = 整张透明
 /// （"图根本看不见"）。两个症状都不报错，只能在用例里判。
 /// 不透明 ⇒ 预乘就是原样，所以这里不需要再乘一遍。
-pub fn to_premultiplied_bgra(rgba: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rgba.len());
-    for p in rgba.as_chunks::<4>().0 {
-        out.extend_from_slice(&[p[2], p[1], p[0], 255]);
+pub fn fill_dib_from_rgba(dst: &mut [u8], src: &[u8]) -> usize {
+    let (out, _) = dst.as_chunks_mut::<4>();
+    let (inp, _) = src.as_chunks::<4>();
+    for (d, s) in out.iter_mut().zip(inp) {
+        d.copy_from_slice(&[s[2], s[1], s[0], 255]);
     }
-    out
+    out.len().min(inp.len()) * 4
 }
 
 /// ✕ 按钮的客户区矩形（物理像素，右上角）。
@@ -481,7 +488,6 @@ fn run_pin(
     y: i32,
     tx: &std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
-    let pixels = to_premultiplied_bgra(&rgba);
     unsafe {
         let hmodule = match GetModuleHandleW(None) {
             Ok(h) => h,
@@ -490,13 +496,16 @@ fn run_pin(
                 return;
             }
         };
-        // 源位图：1:1 那一张，整条线程只建这一次，缩放靠 StretchBlt 而不是重解码
+        // 源位图：1:1 那一张，整条线程只建这一次，缩放靠 StretchBlt 而不是重解码。
+        // 换序与 alpha 直接写进这块位图自己的缓冲（不再中间复制一份），写完就把解码
+        // 缓冲交回去：此后每一帧都只从位图缩放，那份 RGBA 再没有第二个人读。
         let prep = g::CreateCompatibleDC(None);
-        let src = make_dib(prep, w as i32, h as i32).inspect(|d| {
-            let n = pixels.len().min((d.w * d.h * 4) as usize);
-            std::ptr::copy_nonoverlapping(pixels.as_ptr(), d.bits, n);
+        let src = make_dib(prep, w as i32, h as i32).map(|mut d| {
+            fill_dib_from_rgba(d.pixels(), &rgba);
+            d
         });
         let _ = g::DeleteDC(prep);
+        drop(rgba);
         let Some(src) = src else {
             let _ = tx.send(Err("给贴图建源位图失败".to_string()));
             return;
@@ -624,21 +633,61 @@ pub fn close_all() -> usize {
 mod tests {
     use super::*;
 
-    /// RGBA → BGRA 换序 + alpha 钉成 255。
+    /// RGBA → BGRA 换序 + alpha 钉成 255，落在**调用方给的**缓冲区里。
     /// 这两个症状都不报错：换序 = "颜色有但不对劲"，alpha 没抬 = "整张透明、看不见"。
     /// 截图链路交出来的 alpha 就是 0（BGRA 凑字节），所以这一条不是假想敌。
     #[test]
-    fn swaps_to_bgra_and_pins_alpha_opaque() {
+    fn swaps_to_bgra_and_pins_alpha_opaque_into_the_callers_buffer() {
         let rgba = [10u8, 20, 30, 0, 250, 128, 7, 255];
-        let out = to_premultiplied_bgra(&rgba);
-        assert_eq!(out, vec![30, 20, 10, 255, 7, 128, 250, 255]);
+        let mut dst = [0u8; 8];
+        assert_eq!(fill_dib_from_rgba(&mut dst, &rgba), 8);
+        assert_eq!(dst, [30, 20, 10, 255, 7, 128, 250, 255]);
     }
 
+    /// 两边的长度关系要显式算出来，而不是靠 panic 或写出缓冲区外面：目标为空一个字节
+    /// 都不写、源有不成组的尾巴就丢掉尾巴、目标比源窄就只写满目标。
     #[test]
-    fn conversion_keeps_length_and_ignores_a_stray_tail() {
-        assert_eq!(to_premultiplied_bgra(&[]).len(), 0);
-        // 不是 4 的倍数：按四个一组的迭代丢掉不成组的尾巴字节，而不是 panic 或写出半个像素
-        assert_eq!(to_premultiplied_bgra(&[1, 2, 3, 4, 5]).len(), 4);
+    fn the_fill_only_writes_whole_pixels_that_fit_the_destination() {
+        let mut none = [0u8; 0];
+        assert_eq!(fill_dib_from_rgba(&mut none, &[1, 2, 3, 4]), 0);
+        assert!(none.is_empty(), "目标为空时不许越界写");
+        let mut one = [9u8; 4];
+        assert_eq!(fill_dib_from_rgba(&mut one, &[1, 2, 3, 4, 5]), 4);
+        assert_eq!(one, [3, 2, 1, 255], "不成组的尾巴字节不算半个像素");
+        let mut tight = [0u8; 4];
+        assert_eq!(fill_dib_from_rgba(&mut tight, &[1, 2, 3, 4, 5, 6, 7, 8]), 4);
+        assert_eq!(tight, [3, 2, 1, 255], "位图比解码窄时写满就停");
+    }
+
+    /// A2 那笔账：整屏 4K 的一帧像素是 33 MB，"解码缓冲 → 新分配一份 → 再拷进位图"
+    /// 会让同一张图三份缓冲同时活着，而前两份一路活到这张图关掉为止。
+    /// 钉的是**调用形态**（目的参数必须是位图自己的缓冲、源必须是解码缓冲本身）——
+    /// 只钉函数名的话，换回中间复制也照样过。扫描范围切在 `#[cfg(test)]` 之前：
+    /// 本用例正文里就有那个旧函数名，整文件扫会永远红。
+    #[test]
+    fn the_pixels_are_rewritten_in_place_and_the_source_is_released() {
+        let src = include_str!("native.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let flat: String = prod
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("fill_dib_from_rgba(d.pixels(),&rgba)"),
+            "换序没有直接写进位图自己的缓冲、源也不是解码缓冲本身：中间又多了一份整图"
+        );
+        assert!(
+            flat.contains("drop(rgba)"),
+            "解码缓冲一直活到这张图关掉：位图此后是唯一的真相，那份 RGBA 没人再读"
+        );
+        assert!(
+            !flat.contains("to_premultiplied_bgra"),
+            "返回 Vec 的那版转换又回来了：一张图白多占一整屏的内存"
+        );
     }
 
     /// ✕ 必须整个落在客户区里，且中心点绝不命中 ——
