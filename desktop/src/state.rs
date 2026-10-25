@@ -697,19 +697,22 @@ fn set_webview_suspend(app: &tauri::AppHandle, label: &str, suspend: bool) -> bo
 /// **−62.9 MB 工作集**是这两个开关共同买到的；单独一项没测过，而"页面卸载到 about:blank"
 /// 那条机制实测 ≈0（−16.8 MB 工作集、私有提交在噪声内反升）。少做一件就是白做一半。
 ///
-/// 第三个开关（`set_webview_suspend`）走 `suspend_choice` 的三态：出厂按关 ⇒ 与只有
-/// 上面两件事时逐字一致；按开才多挂一条挂起/唤醒。**它的收益目前没有数**，要拿同一个
-/// 二进制改一次配置对拍才知道。
+/// 第三个开关（挂起/唤醒渲染进程）**不在这个助手里**，它挂在 [`set_webview_rendering`] 上：
+/// 主窗口的显示路径有三处（托盘呼出、恢复线程、加载完成回调），把"叫醒"只写在某个调用点
+/// 迟早漏一处 —— 漏掉的症状是"面板打开了但是黑的"，比"没省到内存"难查一个量级。
 pub fn set_window_webview_active(app: &tauri::AppHandle, label: &str, active: bool) -> bool {
     let rendering = set_webview_rendering(app, label, active);
     let level = set_webview_memory_level(app, label, !active);
-    let suspend = match suspend_choice(suspend_hidden_enabled(), active) {
-        // 按关 ⇒ 一个字都不发：这一格必须是 `true`，不能是"发一条再说"
+    rendering && level
+}
+
+/// 三态开关本身：**按关 ⇒ 一个字都不发**（那一格必须是 `true`，不能是"发一条再说"）。
+fn apply_suspend_switch(app: &tauri::AppHandle, label: &str, active: bool) -> bool {
+    match suspend_choice(suspend_hidden_enabled(), active) {
         SuspendChoice::Skip => true,
         SuspendChoice::Suspend => set_webview_suspend(app, label, true),
         SuspendChoice::Resume => set_webview_suspend(app, label, false),
-    };
-    rendering && level && suspend
+    }
 }
 
 /// 设置 WebView2 控制器可见性（IsVisible）。
@@ -717,11 +720,20 @@ pub fn set_window_webview_active(app: &tauri::AppHandle, label: &str, active: bo
 /// 调用 put_IsVisible(false) 可停止渲染、进一步释放内存与 CPU（WebView2 官方建议）。
 /// 显示窗口前必须先恢复 true，否则内容不会重绘。
 /// 返回是否真正设置成功（控制器未就绪时返回 false，调用方可重试）。
+///
+/// 这里同时是第三个开关**唯一**的挂载点。顺序是刻意的：抬起 ⇒ 先叫醒再设可见
+/// （反过来就有一帧"窗口已可见而那条进程还睡着" = 一块不重绘的画面）；
+/// 按住 ⇒ 先设不可见、再挂起（对一个还在被合成的窗口挂起是错的）。
+/// 按住那一步的结果**不参与返回值**：它只代表"这一次有没有多省到"，
+/// 而调用方拿返回值重试的是可见性本身。
 pub fn set_webview_rendering(app: &tauri::AppHandle, label: &str, visible: bool) -> bool {
+    if visible {
+        apply_suspend_switch(app, label, true);
+    }
     let Some(win) = app.get_webview_window(label) else {
         return false;
     };
-    with_webview_sync(&win, move |webview| {
+    let ok = with_webview_sync(&win, move |webview| {
         #[cfg(windows)]
         unsafe {
             let controller = webview.controller();
@@ -732,7 +744,11 @@ pub fn set_webview_rendering(app: &tauri::AppHandle, label: &str, visible: bool)
             let _ = visible;
             true
         }
-    })
+    });
+    if !visible {
+        apply_suspend_switch(app, label, false);
+    }
+    ok
 }
 
 /// 显示主窗口（不存在则懒创建）。
@@ -3836,14 +3852,15 @@ mod visibility_wiring {
         assert_eq!(suspend_choice(true, true), SuspendChoice::Resume);
     }
 
-    /// 接线腿：那只手现在要**先问配置**再决定第三件事，而"按关就是不发"必须写在它的臂上。
+    /// 三态本身：**先问配置**，而"按关就是不发"必须写在它的臂上。
+    /// 这条的病症不是崩，是"未经度量就多挂了一条指令" —— 那条指令会不会让画面迟一帧，没人量过。
     #[test]
-    fn the_park_helper_asks_the_config_before_touching_the_third_switch() {
+    fn the_third_switch_arms_only_from_the_config() {
         let src = include_str!("state.rs");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
-            .find("fn set_window_webview_active")
-            .expect("那个助手不见了");
+            .find("fn apply_suspend_switch")
+            .expect("那个三态助手不见了");
         let body = &prod[at..at + prod[at..].find("\n}").expect("助手没有收尾")];
         let flat: String = body
             .lines()
@@ -3876,6 +3893,48 @@ mod visibility_wiring {
         assert!(
             read_body.contains(r#"get_bool("gui", "suspend_hidden", false)"#),
             "读点的兜底默认不是关：没人量的那条指令会默认生效"
+        );
+    }
+
+    /// 接线腿：第三个开关只挂在"要不要合成"那**一个漏斗**上，且顺序是抬起先叫醒、按住后挂起。
+    /// 为什么不写在各个调用点：主窗口的显示路径有三处（托盘呼出、恢复线程、加载完成回调），
+    /// 漏掉任何一处叫醒，症状都是"面板打开了但是黑的" —— 比"没省到内存"难查一个量级。
+    #[test]
+    fn the_third_switch_hangs_on_the_only_visibility_funnel() {
+        let src = include_str!("state.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn set_webview_rendering")
+            .expect("那个漏斗不见了");
+        let body = &prod[at..at + prod[at..].find("\n}\n").expect("函数没有收尾")];
+        let flat: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let wake = flat
+            .find("ifvisible{apply_suspend_switch(app,label,true);}")
+            .expect("抬起时没先叫醒：会有一帧窗口已可见而那条进程还睡着");
+        let set_at = flat
+            .find("SetIsVisible(visible)")
+            .expect("设可见性那一步不见了：漏斗本身变了");
+        let sleep = flat
+            .find("if!visible{apply_suspend_switch(app,label,false);}")
+            .expect("按住时没挂起：这条实验一点作用都没有");
+        assert!(
+            wake < set_at && set_at < sleep,
+            "顺序不对（叫醒 {wake} / 设可见 {set_at} / 挂起 {sleep}）：抬起必须先叫醒，按住必须先停合成再挂起"
+        );
+        assert!(
+            flat.contains("letok=with_webview_sync")
+                && !flat.contains("letok=apply_suspend_switch"),
+            "返回值不再是可见性那一步的结果：按住失败会让调用方对可见性白重试：{flat}"
+        );
+        // 只有一个挂载点：那个绑两个开关的助手不许再自己发第三腿（两处挂载点早晚不一致）
+        let helper_at = prod
+            .find("pub fn set_window_webview_active")
+            .expect("那个助手不见了");
+        let helper =
+            &prod[helper_at..helper_at + prod[helper_at..].find("\n}\n").expect("助手没有收尾")];
+        assert!(
+            !helper.contains("set_webview_suspend"),
+            "第三腿又出现在第二个地方：漏斗外多了一处，主窗口那三条显示路径就有人管不到"
         );
     }
 
