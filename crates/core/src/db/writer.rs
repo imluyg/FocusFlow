@@ -3486,16 +3486,43 @@ mod tests {
             shown.contains("占位名"),
             "要说出用户会看到什么，而不只是失败了: {shown}"
         );
+
+        // 第四臂：**这一次 stat 自己问不出**。原先登记成眼验账（"要 ACL 拒绝才造得出"），
+        // 现量推翻了那句：把库位置做成自指 junction，`metadata` 报 os error 1921，
+        // 就是这一臂在真实系统调用下的形状（工装 `paths::test_self_loop_junction`）。
+        // 旧写法在这里是 `Path::exists()` ⇒ 那次失败读成"今年还没建库"⇒ 整次启动安静退成占位名。
+        connection::clear_ro_cache();
+        std::fs::remove_file(&path).expect("换夹具前要拿掉那份旧表形态的库（先 clear_ro_cache）");
+        if !paths::test_self_loop_junction(&path) {
+            eprintln!("这台机器建不出自指 junction，第四臂跳过（不是测过了）");
+            return;
+        }
+        let mut agg = AggDeltas::default();
+        let ((), logs) = crate::logger::capture_logs(|| preload_device_meta(&mut agg));
+        let shown = logs.join("\n");
+        assert!(
+            shown.contains("说不出这个库在不在"),
+            "stat 问不出那一臂要出声，不许与「今年还没建库」共用同一个安静早退: {shown}"
+        );
+        assert!(
+            shown.contains("占位名"),
+            "这一臂也要说出用户会看到什么: {shown}"
+        );
+        assert!(
+            agg.device_meta.is_empty(),
+            "问不出时不许带进任何登记基线（那是「没有名字」的另一副面孔）"
+        );
     }
 
     /// 预热的第一问也必须走那把三态尺子 —— `Path::exists()` 不许再出现在这里。
     ///
-    /// `exists()` 把「这一次 stat 自己失败了」（移动盘休眠、同步盘占位、杀软握着句柄）
-    /// 读成"今年还没建库"⇒ 整次启动退成占位名而日志一个字没有，而同一函数下面三处早退
-    /// 各自都要说出原因（上面那条用例盯的就是那三处）。
-    /// ⚠ 这一支**无头造不出**（要 ACL 拒绝），所以行为用例只能覆盖"确认没有⇒安静"与
-    /// "库在而打不开⇒出声"两臂，第三种结局由这条判据守着 ⇒ 登记为眼验：真撞上网络盘
-    /// 休眠那次启动，日志里要有一行「说不出这个库在不在」。
+    /// `exists()` 把「这一次 stat 自己失败了」读成"今年还没建库"⇒ 整次启动退成占位名而日志
+    /// 一个字没有，而同一函数下面三处早退各自都要说出原因（上面那条用例盯的就是那三处）。
+    /// ⚠ 这一支**不再是眼验账**：`a_failed_device_preload_says_which_step_failed` 的第四臂
+    /// 用自指 junction 拿到真实的 stat 失败（os error 1921）。上一版这里写着"无头造不出
+    /// （要 ACL 拒绝）"，那条判断被现量推翻 —— 要的不是特权，只是 stat 回来的码不是 2/3。
+    /// 这条判据仍留着：它守的是"第一问必须问三态那把尺子、且排在开库之前"这个**顺序**，
+    /// 那是行为用例在"库根本不存在"那种夹具下照不出来的东西。
     #[test]
     fn the_preload_asks_presence_before_it_opens() {
         let src = include_str!("writer.rs");

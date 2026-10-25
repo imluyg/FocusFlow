@@ -173,6 +173,34 @@ pub fn test_app_dir(tag: &str) -> TestAppDir {
     TestAppDir { dir }
 }
 
+/// 把 `path` 那一格做成**自指目录 junction**：`std::fs::metadata` 与 `File::open` 在它上面
+/// 都报 os error 1921（`FilesystemLoop`，本机现量）—— 既不是"在"也不是 `NotFound`，
+/// 于是"这一次问不出"那一臂第一次有了真实系统调用下的形状（符号链接那条路要特权，
+/// 本机实测 os error 1314 拒建，所以走 `mklink /J`，它不要管理员）。
+///
+/// 返回 `false` = 这台机器建不出这个夹具。调用方必须**出声跳过**，不许静默当绿：
+/// 那样那些臂会重新变回没人守。收尾用 `std::fs::remove_dir` 摘掉链接本身
+/// （`RemoveDirectoryW` 删的是重解析点，不跟着删进目标；`TestAppDir::drop` 也认得这个形状）。
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn test_self_loop_junction(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // `mklink` 是 cmd 内置，只吃反斜杠路径
+        let link = path.to_string_lossy().replace('/', "\\");
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J", &link, &link])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// 用例收尾时把全局 `app_dir` 指到这里：**哨兵，不是数据目录**。
 ///
 /// `set_app_dir` 是进程级全局，而 `stop()` 放弃等待之后仍可能有线程惰性去解析它；

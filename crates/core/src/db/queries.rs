@@ -5069,15 +5069,10 @@ mod tests {
         let gone_day = chrono::NaiveDate::from_ymd_opt(gone, 6, 15).unwrap();
         let path = paths::year_db_path(gone);
 
-        // 夹具：自指 junction。`mklink` 是 cmd 内置，只吃反斜杠路径。建不上就跳过并出声
-        // ——那是这台机器的环境限制，不是产品的失败；静默跳过会把这一臂重新变回没人守。
-        let link = path.to_string_lossy().replace('/', "\\");
-        let made = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J", &link, &link])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !made {
+        // 夹具：自指 junction（工装与预热／归档那两条眼验账共用 `paths::test_self_loop_junction`）。
+        // 建不上就跳过并出声 —— 那是这台机器的环境限制，不是产品的失败；静默跳过会把这一臂
+        // 重新变回没人守。
+        if !paths::test_self_loop_junction(&path) {
             eprintln!("mklink /J 建不出自指 junction，跳过（夹具做不出来）");
             return;
         }

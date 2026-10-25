@@ -6588,7 +6588,8 @@ mod tests {
     /// 旧写法 `if !source_path.exists() { return false; }` 一次顶掉了三件事：源库读得动、
     /// 确认不在原位、**这一次问不出**（移动盘休眠／同步盘正握着／杀软首扫）。后两种都静默
     /// 返回，而那批早于本年的行留在当前库里，下次启动重跑一遍、再静默一遍。
-    /// 两条腿各管一头：库不在要出声；库在、里面没有往年数据时仍要安静。
+    /// 三条腿各管一头：库不在要出声；库在、里面没有往年数据时仍要安静；
+    /// **这一次问不出**要按第三种说法念（不许念成「不在原位」那句关于用户历史的断言）。
     #[test]
     fn a_missing_source_year_is_said_out_loud_after_the_archive_promise() {
         let _lock = crate::paths::test_app_dir_lock();
@@ -6626,12 +6627,40 @@ mod tests {
             !logs2.iter().any(|l| l.contains("不在原位")),
             "库在的时候不许喊不在，实得 {logs2:?}"
         );
+
+        // ③ 第三种结局：**这一次 stat 自己问不出**。旧形态是被 `exists()` 读成"没有这个文件"，
+        // 于是那一轮喊的是「年库不在原位」——一句关于用户历史的假话，而文件其实躺在原地。
+        // 这一臂原先登记为眼验（"要 ACL 拒绝或占位盘"），现量推翻了那句：自指 junction 让
+        // `metadata` 报 os error 1921，正是这一臂的形状（工装 `paths::test_self_loop_junction`）。
+        crate::db::connection::clear_ro_cache();
+        std::fs::remove_file(&path).expect("换夹具前要拿掉那一年那份合法的库");
+        if !crate::paths::test_self_loop_junction(&path) {
+            eprintln!("这台机器建不出自指 junction，第③臂跳过（不是测过了）");
+            return;
+        }
+        let (m3, logs3) = crate::logger::capture_logs(|| archive_stale_years(2025));
+        let shown3 = logs3.join("\n");
+        assert!(!m3, "问不出时本轮什么都不动");
+        assert!(
+            shown3.contains("说不出 2025 年库在不在"),
+            "第三种结局要按第三种说法念，实得 {shown3}"
+        );
+        assert!(
+            !shown3.contains("不在原位"),
+            "问不出不许念成「确认不在原位」——那是替用户断言文件不在: {shown3}"
+        );
+        assert!(
+            shown3.contains("未做任何改动"),
+            "要说出这一轮没动过数据，下次启动还会再试: {shown3}"
+        );
     }
 
     /// 接线判据：源库那一问不许再用 `exists()` 猜，且两种"做不成"都要带原因。
     ///
-    /// 上面那两条腿钉得住"确认没有⇒出声"，钉不住"问不出⇒也出声"—— 真实 stat 失败这一臂
-    /// 无头造不出（要 ACL 拒绝或占位盘），所以那一支由这条判据守着，另登记眼验。
+    /// 上面那条用例的三腿现在把三种结局都钉住了（第③臂用的是自指 junction，os error 1921），
+    /// 这条判据守的是另一头：**共用的尺子只许问一次**（`year_db_presence(&source_path)`
+    /// 恰好一份）与两种"做不成"各带各的原因 —— 有人把第③臂的措辞改掉时，行为用例红在这里，
+    /// 而把尺子换回 `exists()` 时两条一起红。
     #[test]
     fn the_archive_still_asks_the_source_year_in_three_states() {
         let src = include_str!("maintenance.rs");
