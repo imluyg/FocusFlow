@@ -261,7 +261,21 @@ pub fn hide_for_capture(app: &AppHandle) -> bool {
         }
         Renderer::Webview => match app.get_webview_window(FLOATING_LABEL) {
             Some(win) => match win.hide() {
-                Ok(()) => true,
+                Ok(()) => {
+                    // 卡片藏起来了才按：窗口还亮着就按住渲染 = 用户盯着一块不再重绘的卡片。
+                    // 按的是**那两个开关**（停渲染 + 降档）—— 实测那 −62.9 MB 是两个一起买到的，
+                    // 只做一件等于白做一半。整段截图期间（抓屏、编码、人选区）这张卡片
+                    // 不用再养着一条渲染管线。
+                    //
+                    // 按失败只记一行：它代表"这一张没省到"，不代表卡片没藏住 ——
+                    // 这一格答案如果被拿去当返回值，症状就是"截图之后卡片再也不出现"。
+                    if !crate::state::set_window_webview_active(app, FLOATING_LABEL, false) {
+                        tracing::warn!(
+                            "截图期间按住卡片的渲染/档位没成功：这一张省不到内存，但收尾照样会把它放回来"
+                        );
+                    }
+                    true
+                }
                 Err(e) => {
                     // 没藏住 = 那张卡片会被截进图里。要说清后果，不能只留一句"失败"。
                     tracing::warn!("藏悬浮窗失败，截图里可能带上它：{e}");
@@ -277,6 +291,15 @@ pub fn hide_for_capture(app: &AppHandle) -> bool {
 pub fn restore_after_capture(app: &AppHandle, was_visible: bool) {
     if !was_visible {
         return;
+    }
+    // 抬渲染与抬档位必须排在 `show()` **之前**，而且两件一起抬（`set_visible` 里还有一次
+    // 抬渲染，重复设一次是幂等的）。顺序反了的症状是"卡片回来了但那是一块旧画面/一块黑"。
+    // 抬渲染与抬档位必须排在 `show()` **之前**，而且两件一起抬（`set_visible` 里还有一次
+    // 抬渲染，重复设一次是幂等的）。顺序反了的症状是"卡片回来了但那是一块旧画面/一块黑"。
+    if matches!(active_renderer(), Renderer::Webview)
+        && !crate::state::set_window_webview_active(app, FLOATING_LABEL, true)
+    {
+        tracing::warn!("恢复卡片前抬起渲染/档位没全成：可能出现一帧不重绘的卡片");
     }
     if !set_visible(app, true) {
         tracing::warn!("恢复悬浮窗：窗口不存在，用户需要自己再打开一次");
@@ -440,6 +463,61 @@ mod tests {
         assert!(
             prod.contains("floating::publish_paused("),
             "暂停态没挂进 parked 那格：原生卡片上「已暂停」永远不会出现"
+        );
+    }
+
+    /// 截图藏窗那一步：按住渲染/档位的失败**不许**顶掉"藏没藏住"这个答案。
+    /// 病症是"截图之后卡片再也不出现" —— 那个答案决定收尾会不会去 `show()`，一旦被人
+    /// 写成返回按住的结果，卡片就在没人察觉的情况下永久消失（原生模式下连日志都没有）。
+    #[test]
+    fn the_capture_park_cannot_answer_for_the_hide() {
+        let src = include_str!("mod.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn hide_for_capture")
+            .expect("藏窗那一步不见了");
+        let body = &prod[at..at + prod[at..].find("\n}\n").expect("函数没有收尾")];
+        let flat: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("if!crate::state::set_window_webview_active(app,FLOATING_LABEL,false)"),
+            "那两个开关要么没按（只做半件等于白做），要么它的结果被拿去当返回值了：{flat}"
+        );
+        let park_at = flat
+            .find("crate::state::set_window_webview_active(app,FLOATING_LABEL,false)")
+            .expect("那两个开关没按：只做半件等于白做");
+        // 夹具自己的前提：这条判据真在看"藏住那一支"的返回值，而不是切片切空让上面那条空转
+        assert!(
+            flat[..park_at].contains("Ok(())=>"),
+            "按住那一步不在『藏住了』那一支里（窗口还亮着就按渲染 = 用户盯着一块不重绘的卡片）：{flat}"
+        );
+        assert!(
+            flat[park_at..].contains("true}Err("),
+            "藏住那一支的返回值不再是字面量 true —— 按住的结果被拿去当『藏没藏住』的答案了，\
+             症状就是截图之后卡片再也不出现：{}",
+            &flat[park_at..]
+        );
+    }
+
+    /// 恢复卡片：抬渲染与抬档位必须排在 `set_visible`（`show()` 在它里面）之前。
+    /// 顺序反了的症状是"卡片回来了，可那是一块不重绘的旧画面"。
+    #[test]
+    fn the_unpark_happens_before_the_show() {
+        let src = include_str!("mod.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn restore_after_capture")
+            .expect("恢复那一步不见了");
+        let body = &prod[at..at + prod[at..].find("\n}\n").expect("函数没有收尾")];
+        let flat: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let unpark = flat
+            .find("set_window_webview_active(app,FLOATING_LABEL,true)")
+            .expect("恢复时没抬那两个开关：档位会一直停在 LOW");
+        let show = flat
+            .find("set_visible(app,true)")
+            .expect("恢复没走那个唯一入口，判据要跟不动了");
+        assert!(
+            unpark < show,
+            "抬档位排在 show 之后了（{unpark} vs {show}）：用户会先看见一帧不重绘的卡片"
         );
     }
 
