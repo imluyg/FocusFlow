@@ -510,6 +510,7 @@ pub fn write_weekly_report_for(
     let mut keys: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut apps: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut hourly = [0i64; 24];
+    let mut hourly_gaps: Vec<String> = Vec::new();
     let mut rows: Vec<(chrono::NaiveDate, i64)> = Vec::new();
     // 上一周 + 本周共 14 天：上一周只用来做环比；连续/最长另按
     // `GOAL_LOOKBACK_DAYS` 取序列（见下面 `goal_state`，与设置页同一把尺子）。
@@ -536,17 +537,32 @@ pub fn write_weekly_report_for(
             for (a, s) in day_apps {
                 *apps.entry(a).or_insert(0) += s;
             }
-            for (i, v) in q::get_hourly_stats(Some(day))
-                .into_iter()
-                .take(24)
-                .enumerate()
-            {
+            let day_hours = q::hourly_stats_totals(Some(day));
+            for g in day_hours.unreadable {
+                // 同一年在 14 天循环里会被问很多次：一份原因说一次就够
+                if !hourly_gaps.contains(&g) {
+                    hourly_gaps.push(g);
+                }
+            }
+            for (i, v) in day_hours.hours.into_iter().take(24).enumerate() {
                 hourly[i] += v;
             }
         } else {
             prev_total += total;
         }
         day += chrono::Duration::days(1);
+    }
+    // 时段直方图读不全时不写半份：这一路今天已经有一条"读不出来就别生成"的口径
+    // （见上面 `check_years_readable` 那句 `生成周报被拒绝`），这里补的是它管不到的半边 ——
+    // 库头合法、页坏的那种库 `open_ro` 打得开，只有真按天读小时才失败。
+    // 少了这一句，`total == 0 && prev_total == 0` 那条会把"读不动"讲成
+    // 「上一个整周没有任何记录」，而写出去的那份文件里的 24 格直方图看着是完整的。
+    if !hourly_gaps.is_empty() {
+        anyhow::bail!(
+            "生成周报被拒绝：当日小时分布这一轮没读全（{} 问）：{}",
+            hourly_gaps.len(),
+            hourly_gaps.join("；")
+        );
     }
 
     let total: i64 = rows.iter().map(|(_, c)| c).sum();
@@ -774,6 +790,140 @@ mod tests {
         let r = write_weekly_report_for(from, to)?;
         assert!(r.is_some(), "坏文件拿走后同一周就该生成文件，实得 {r:?}");
         Ok(())
+    }
+
+    /// 时段直方图读不全时，周报也不能写：上面那道闸只问"这库开得住吗"，而
+    /// **库头合法、后半段页坏**的那一份是开得住的 —— 只有按天真读小时才失败。
+    /// 少了这一句，`total == 0 && prev_total == 0` 那条会把读不动讲成
+    /// 「上一个整周没有任何记录」，而写出去那份文件里的 24 格看着是完整的。
+    #[test]
+    fn a_week_whose_hourly_pages_are_broken_is_not_written_as_a_quiet_week() -> anyhow::Result<()> {
+        use chrono::{Datelike, NaiveDate};
+        use focusflow_core::db::connection::{clear_ro_cache, ensure_schema, open_rw};
+        use focusflow_core::db::queries;
+        use focusflow_core::paths;
+
+        let _serial = crate::app_dir_lock();
+        let _app = paths::test_app_dir("weekly_hourly_gaps");
+        queries::invalidate_years_cache();
+        clear_ro_cache();
+
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        let (from, to) = (d(2020, 3, 2), d(2020, 3, 8));
+        let epoch = d(1970, 1, 1);
+        let dk = |day: NaiveDate| day.signed_duration_since(epoch).num_days();
+        let year = from.year();
+        let path = paths::year_db_path(year);
+
+        // 报告这一周真有数据；再把 12000 个更早的 date_key 铺进去，把这一周那几页推到
+        // 文件后半段 —— 不这么排，`date_key = ?1` 那一问只碰合法页，坏页永远轮不到出声。
+        {
+            let conn = open_rw(&path)?;
+            ensure_schema(&conn, year)?;
+            for k in 1..12_000i64 {
+                conn.execute(
+                    "INSERT INTO hourly_counts (date_key, hour, count) VALUES (?1, 0, 1)",
+                    [k],
+                )?;
+            }
+            let mut day = from;
+            while day <= to {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO daily_counts (date_key, count, seconds) VALUES ({}, 4000, 900)",
+                        dk(day)
+                    ),
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO hourly_counts (date_key, hour, count) VALUES (?1, 21, 7)",
+                    [dk(day)],
+                )?;
+                day += chrono::Duration::days(1);
+            }
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        queries::invalidate_years_cache();
+        clear_ro_cache();
+
+        // 先跑正常那一趟：这一周必须真能生成文件（否则下面的"拒绝"是恒真的）
+        let written = write_weekly_report_for(from, to)?;
+        assert!(written.is_some(), "库好的时候必须照常出周报");
+        let dir = report_dir();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut bytes = std::fs::read(&path)?;
+        assert!(
+            bytes.len() > 4096 * 40,
+            "夹具太小，这一周那几页没铺到文件后半段（实得 {} 字节）",
+            bytes.len()
+        );
+        let cut = bytes.len() / 2;
+        for b in bytes.iter_mut().skip(cut) {
+            *b = 0xA5;
+        }
+        std::fs::write(&path, &bytes)?;
+        queries::invalidate_years_cache();
+        clear_ro_cache();
+
+        let e = write_weekly_report_for(from, to).expect_err("时段直方图读不全时不该写半份");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("当日小时分布") && msg.contains(&year.to_string()),
+            "要说清是哪一栏、哪一年没读全，实得: {msg}"
+        );
+        assert!(
+            !msg.contains("没有任何记录"),
+            "不能把读不出来讲成没有记录，实得: {msg}"
+        );
+        assert!(
+            !dir.exists() || std::fs::read_dir(&dir)?.next().is_none(),
+            "被拒绝的这一次不该留下任何文件"
+        );
+        Ok(())
+    }
+
+    /// 接线判据：周报里那一问必须走"会说原因"的小时读数，并把没读全变成一次拒绝。
+    ///
+    /// 行为用例钉的是"坏页时拒绝"，这条钉的是形状：有人把循环里的读数换回数组口子，
+    /// 拒绝那条腿会立刻失去弹药而界面上一个字都不变。
+    #[test]
+    fn the_weekly_report_asks_the_hourly_question_that_can_refuse() {
+        let src = include_str!("export.rs");
+        let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn write_weekly_report_for(")
+            .expect("周报生成函数找不到了");
+        let rest = &prod[at..];
+        // 下一个顶层项可能是 `pub fn`/`async fn`：只找 `\nfn ` 会一路切到文件尾，
+        // 把这条判据自己的断言字符串圈进"被测代码"里（假红过一次）。
+        let end = ["\nfn ", "\npub fn ", "\nasync fn ", "\npub async fn "]
+            .iter()
+            .filter_map(|p| rest[1..].find(p).map(|n| n + 1))
+            .min()
+            .unwrap_or(rest.len());
+        let raw = &rest[..end];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("hourly_stats_totals(Some(day))"),
+            "周报又用回说不出原因的 24 个 0"
+        );
+        assert!(
+            !body.contains("get_hourly_stats("),
+            "周报里出现了二元组那个旧口子：读不全时它会安静交回全零"
+        );
+        assert!(
+            body.contains("if !hourly_gaps.is_empty()"),
+            "收集到的 gap 必须真的决定生不生这份文件，不然只是攒着好看"
+        );
+        assert!(
+            body.contains("anyhow::bail!"),
+            "拒绝要走既有那条 `生成周报被拒绝` 的出口，不要换一种失败形状"
+        );
     }
 
     #[test]
