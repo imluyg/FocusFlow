@@ -2246,6 +2246,30 @@ mod advanced_settings_wiring {
         );
     }
 
+    /// 已经给了行的键，界面别处不许再叫用户去手改 `config.ini`。
+    ///
+    /// 真实错过的一次：备份那张卡的说明还写着「数量见 config.ini 的 max_backups」，
+    /// 而高级页早就有「最近份数」这一格 —— 两处两把尺子，看到那句的人会去手改文件，
+    /// 而那一路正好是这一页最难自证的一条（改动要被当"外部改动"采纳回来才看得见）。
+    #[test]
+    fn no_row_points_a_key_it_owns_back_at_hand_editing_the_file() {
+        let js = include_str!("../ui/js/views.js");
+        let code: String = js
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for e in EXPOSED_SETTINGS {
+            let needle = format!("config.ini 的 {}", e.key);
+            assert!(
+                !code.contains(&needle),
+                "「{}.{}」在高级页已经有格子了，别处却还写着「{needle}」让用户去手改文件",
+                e.section,
+                e.key
+            );
+        }
+    }
+
     /// 载荷那一格由 Rust 现算：界面不许自己解析 config.ini、也不许猜控件类型。
     #[test]
     fn the_payload_carries_the_value_the_kind_and_the_label() {

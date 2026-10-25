@@ -1101,7 +1101,13 @@ async function onAdvChange(k) {
   }
   // 一律重读现场：`set_config` 返回成功只代表写进了内存，真正落盘的是 300ms 之后的
   // 去抖那一轮（它失败会由页面顶部那条黄字常驻说明），而"要不要重启"由后端那一格说。
-  await renderSettings();
+  // 重读本身也可能失败（这一次 `get_settings` 被拒）—— 那是"改成了什么我看不到"这件事
+  // 唯一的出口，静默返回就等于让用户继续相信屏上那个旧值。
+  try {
+    await renderSettings();
+  } catch (e) {
+    setMsg(`「${label}」已经写进去了，但页面没能重读现场：${e}（再进一次这一页会重读）`, "var(--warning)");
+  }
 }
 
 function advRows(keys) {
@@ -1327,7 +1333,7 @@ const SETTINGS_CATS = [
               $("set-backup-online").addEventListener("change", onBackupOnlineChange);
               $("set-backup-interval").addEventListener("change", onBackupIntervalChange);
             },
-            desc: "备份为单文件快照（不受插件开关影响，属核心功能），每类库与设备别名表各保留最近若干份（数量见 config.ini 的 max_backups，别名只在真的改过名时留新的一份）；清空/清理数据、跨年归档前的自动快照始终保留，用于兜底恢复。",
+            desc: "备份为单文件快照（不受插件开关影响，属核心功能），每类库与设备别名表各保留最近若干份（份数在「高级」那一页的「最近份数」里改，别名只在真的改过名时留新的一份）；清空/清理数据、跨年归档前的自动快照始终保留，用于兜底恢复。",
           },
           {
             t: "btns", name: "立即备份",
@@ -1666,15 +1672,24 @@ export async function doCleanup() {
   cleanupArmedAt = 0;
   cleanupArmedFor = null;
   setMsg("正在清理…", "var(--muted)");
+  let result, color;
   try {
     // 那句话（含"这一次没有退路"那一半）由后端说，这里原样转达：
     // 界面自己写一句「清理完成」就又会回到"绿色说失败"那一族。
-    setMsg(await invoke("cleanup_data", { days, confirm: true }), "var(--success)");
+    result = await invoke("cleanup_data", { days, confirm: true });
+    color = "var(--success)";
   } catch (e) {
-    setMsg("清理没有做成：" + e, "var(--danger)");
+    result = "清理没有做成：" + e;
+    color = "var(--danger)";
   }
-  // 删的是往期，页面那几张按周期聚合的图要按新账本重画一次
-  await renderSettings();
+  setMsg(result, color);
+  // 删的是往期，页面那几张按周期聚合的图要按新账本重画一次。
+  // 重读失败时不许把上面那句结论顶掉：它是这一轮唯一的结果，只能把失败附在后面。
+  try {
+    await renderSettings();
+  } catch (e) {
+    setMsg(`${result}；（页面重读现场失败：${e}）`, "var(--warning)");
+  }
 }
 
 export async function doImport() {
