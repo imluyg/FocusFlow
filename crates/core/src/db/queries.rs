@@ -1091,7 +1091,8 @@ pub fn get_hourly_stats(target_date: Option<chrono::NaiveDate>) -> Vec<i64> {
 /// 与 [`get_hourly_stats`]（只看某一天）不是一件事，两个都留着：周报的时段直方图问的就是
 /// "那一天几点"，而分析页的每小时分布要跟顶部周期走 —— 把一头硬套成另一头，就会有一头
 /// 说错话（旧写法是整页写死今日，顶部选了「近 1 年」图上的标题却还写着"今日"）。
-/// ⚠ 那一天那一问（`get_hourly_stats`）本轮没动，还是把四道折都吞掉的旧尺子。
+/// ⚠ 那一天那一问（`get_hourly_stats`）现在只是它的薄包装：二元组交不回"这一轮有没有读全"，
+/// 所以面板与周报都问这一条，那条只留给 Lua 宿主与 CLI 那类保持二元组口径的出口。
 ///
 /// 跨年份那套口径照 [`daily_counts_totals`]：某一年的库**问不出在不在**时跳过它并点名是哪一年、
 /// 为什么，绝不折成"那一年每小时都是 0"。
@@ -1732,6 +1733,8 @@ pub struct DeviceDetail {
 /// 这台设备在**本库**里的所有 `devices.id`（按硬件身份段认，见
 /// [`crate::device_alias::hardware_identity_key`]）。
 ///
+/// `Err` = 这一问没答案，不是「没有登记行」—— 调用方得把这两件事分开说。
+///
 /// 为什么不写 `WHERE d.device_key = ?1`：`devices.device_key` 的形态不止一种 ——
 /// 归组键迁移（`connection::migrate_device_identity_keys`）按库做，历史库被占用时
 /// 只跳过（`maintenance::migrate_all_year_device_keys`），于是同一台设备在旧库里
@@ -1746,14 +1749,11 @@ pub struct DeviceDetail {
 /// （排行靠 `query_devices_in_conn` 的 COALESCE 兜底才出现在界面上），光扫 `devices`
 /// 永远扫不到 —— 不接住的话界面就是"排行有次数、点开详情全是 0"。键里就写着它的
 /// 库内 id，直接解出来；只认与本库年份相符的那一个，别的库的同编号设备不算它
-/// （那正是 C6 要避免的形态）。
-fn device_ids_of_identity(conn: &Connection, device_key: &str, db_year: i32) -> Vec<i64> {
-    // 别的调用方按"随便取一条即可"的口径可以咽下读失败，
-    // 问「这台设备到底有没有明细」的那一个不行 —— 见 [`device_ids_of_identity_checked`]。
-    device_ids_of_identity_checked(conn, device_key, db_year).unwrap_or_default()
-}
-
-/// 同一件事的"读不出来要说出来"版本：`Err` = 这一问没答案，不是"没有登记行"。
+/// （那正是归档占位键要避免的形态）。
+///
+/// ⚠ 这一条原先配着一个吞错误的 `Vec` 版包装（把读失败折成空表），唯一的调用方
+/// （`registered_kind`）改走三态之后它就没人用了，已删。别再造回那种形状：
+/// 折成空表等于把「登记表读不动」念成「这台设备这一年没记录」，界面念的是"用得少了"。
 fn device_ids_of_identity_checked(
     conn: &Connection,
     device_key: &str,
@@ -2101,11 +2101,15 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
             let alias = crate::device_alias::table()
                 .resolve(&device_key)
                 .map(|s| s.to_string());
+            let (registered, kind_gaps) = registered_kind(&device_key);
+            // 登记表那一问问不出的一句也进这一轮那份账：类型那格回退成 unknown 是显示层的
+            // 事，但"哪几问没答上来"这一栏要如实带上它，不然这一格看着与"这台设备没登记"同形
+            gaps.extend(kind_gaps);
             (
                 alias.clone().unwrap_or_else(|| auto.clone()),
                 auto,
                 alias.is_some(),
-                registered_kind(&device_key).unwrap_or_else(|| "unknown".to_string()),
+                registered.unwrap_or_else(|| "unknown".to_string()),
             )
         }
     };
@@ -2193,27 +2197,59 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
 
 /// 读取设备登记表里的类型（用于周期内无数据、无法从排行取到类型的情况）。
 ///
-/// 按身份段找（[`device_ids_of_identity`]）：同一台设备在一个库里可能占着两种
-/// 键形态的历史登记，随便取一条的类型即可。
-fn registered_kind(identity: &str) -> Option<String> {
+/// 交回 `(类型, 这一轮没问出来的那几问)`。按身份段找（[`device_ids_of_identity_checked`]）：
+/// 同一台设备在一个库里可能占着两种键形态的历史登记，随便取一条的类型即可。
+///
+/// 「那一格写 unknown」是显示层的决定，但**某一年问不出**不许再被折成「那一年没登记这台
+/// 设备」而一个字都不留。这一支原先有四道各自为政的折：`with_ro_conn` 把打不开折成 `None`、
+/// bool 的 `table_exists` 把问不出折成「没这张表」、`device_ids_of_identity` 把登记表读不动
+/// 折成「这台设备在这个库没有 id」、`query_row(..).ok()` 把那一行读不动折成「没有类型」。
+/// 后果只到"类型那格写着未知"（名称、次数、别名都不受影响，也不写任何东西），
+/// 所以它排在同族最后一名 —— 但**判低不等于可以继续静默**：原因并进调用方
+/// `get_device_detail` 已有的那份 `unreadable`，详情页那句"这一轮没读全"跟着念出来。
+fn registered_kind(identity: &str) -> (Option<String>, Vec<String>) {
+    let mut gaps: Vec<String> = Vec::new();
     for year in query_years(None, None) {
         let path = paths::year_db_path(year);
-        let kind = connection::with_ro_conn(&path, |conn| {
-            if !table_exists(conn, "devices") {
-                return None;
+        let got = connection::with_ro_conn_why(&path, |conn| -> YearRead<String> {
+            match connection::table_presence(conn, "devices") {
+                // 没有这张表＝这个库压根没登记过设备：安静（那是答案，不是问不出）
+                connection::Presence::No => return YearRead::NoTable,
+                connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
+                connection::Presence::Yes => {}
             }
-            let ids = device_ids_of_identity(conn, identity, year);
-            let first = *ids.first()?;
-            conn.query_row("SELECT kind FROM devices WHERE id = ?1", [first], |r| {
+            let ids = match device_ids_of_identity_checked(conn, identity, year) {
+                Err(why) => return YearRead::Unreadable(why),
+                Ok(list) => list,
+            };
+            let Some(first) = ids.first().copied() else {
+                // 这台设备在这一年没登记过：同样是答案，安静
+                return YearRead::NoTable;
+            };
+            match conn.query_row("SELECT kind FROM devices WHERE id = ?1", [first], |r| {
                 r.get::<_, String>(0)
-            })
-            .ok()
+            }) {
+                Ok(kind) => YearRead::Read(kind),
+                Err(rusqlite::Error::QueryReturnedNoRows) => YearRead::NoTable,
+                Err(e) => YearRead::Unreadable(format!("读那一行登记的类型时读不出来: {e}")),
+            }
         });
-        if let Some(Some(k)) = kind {
-            return Some(k);
+        match got {
+            Err(why) => {
+                gaps.push(format!("{year} 年库设备登记表连打开都办不到: {why}"));
+            }
+            Ok(YearRead::Unreadable(why)) => {
+                gaps.push(format!("{year} 年库设备登记表读不出来: {why}"));
+            }
+            Ok(YearRead::NoTable) => {}
+            Ok(YearRead::Read(kind)) => {
+                // 拿到一条就够（同一台设备在多个库里各有一条登记，类型取先问到的那一条）；
+                // 前面那些年没问出来的那几句照样要说出去
+                return (Some(kind), gaps);
+            }
         }
     }
-    None
+    (None, gaps)
 }
 
 /// 查询最近 N 天按星期统计（0=周一 ... 6=周日）。
@@ -4339,13 +4375,21 @@ mod tests {
     /// 圈这几处：三个榜的单库读数、每日／每小时共用的 `read_pairs`、
     /// 设备详情的两条 helper，以及它们都要问的登记表 `device_ids_of_identity_checked`。
     ///
-    /// **实测过的两处"只有这条守得住"**（别把它们当冗余删掉）：
-    /// - 应用榜的取行 —— 它前面那句 `SUM(seconds)` 与聚合读同一批页，坏页先撞聚合，取行轮不到出声；
-    /// - 登记表的扫描 —— 详情那份夹具把坏字节放在后半段，`devices` 只有几行、落在合法页里，
-    ///   把它的取行换回 `flatten()` 时行为用例照绿（第 212 轮探针实测），只有这条红。
+    /// **实测过的"只有这条守得住"**（别把它当冗余删掉）：
+    /// - 应用榜的取行 —— 它前面那句 `SUM(seconds)` 与聚合读同一批页，坏页先撞聚合，取行轮不到出声。
+    ///   探针实测：把 `flatten()` 折回放回设备榜 ⇒ 行为用例红；放回应用榜 ⇒ 只有这条红。
     ///
-    /// 还没动的同族留在判据之外（写成全文件判据会立刻红在该轮之外）：单日那一问
-    /// `get_hourly_stats`、以及 `registered_kind` 那把 bool 问表。
+    /// 登记表的扫描（`device_ids_of_identity_checked`）原先也只有这一条守着：详情那份夹具只把
+    /// `device_counts` 铺到后半段，而 `devices` 就一两行住在合法页里，取行换回 `flatten()` 时
+    /// 行为用例照绿（第 212 轮探针实测）。**这一轮它有第二只眼睛了**：
+    /// `the_device_kind_question_names_the_year_it_cannot_ask` 把 `devices` 自己铺到后半段，
+    /// 同一个探针现在两条一起红（已现量）。形状判据仍留着 —— 它管的是"以后新加一处取行也得
+    /// 走这条路"，那不在任何行为夹具的射程里。
+    ///
+    /// `registered_kind`（类型那一格背后的那一问）本轮也从四道折收进三态，由上面那条行为用例与
+    /// `the_device_detail_readers_ask_the_three_state_rulers` 一起守。留在**这条**判据之外的
+    /// 只剩 `get_hourly_stats`：它是 `hourly_stats_totals` 的薄包装，自己不再有取行可折，
+    /// 归另一条"三个二元组口子必须是薄包装"的判据管。
     #[test]
     fn the_rank_readings_do_not_fold_a_broken_page_into_a_short_list() {
         let src = include_str!("queries.rs");
@@ -4418,17 +4462,27 @@ mod tests {
         }
     }
 
-    /// 单设备详情那两条 helper 也走同一批三态尺子（形状判据，理由同
-    /// `the_window_readers_ask_the_three_state_table_ruler`）。
+    /// 单设备详情那两条 helper 与「类型那一格背后的那一问」都走同一批三态尺子
+    /// （形状判据，理由同 `the_window_readers_ask_the_three_state_table_ruler`）。
     ///
-    /// 额外钉一条：它们必须问 `device_ids_of_identity_checked`，不许回到那个吞错误的
-    /// `device_ids_of_identity` —— 后者把"登记表读不动"折成"这台设备在这个库没有 id"，
-    /// 于是整年的明细安静消失，界面念的是"这台设备最近用得少了"。
+    /// 额外钉一条：它们必须问 `device_ids_of_identity_checked`，不许再写一条吞错误的变体
+    /// （把"登记表读不动"折成"这台设备在这个库没有 id"，于是整年的明细安静消失，界面念的是
+    /// "这台设备最近用得少了"）。那个 `Vec` 版包装本轮已随唯一调用方改走三态而删掉，
+    /// 这条判据防的是它被造回来。
+    ///
+    /// ⚠ 与上一条判据同理，`registered_kind` 的臂各有几只是**行为**覆盖、几只是形状：
+    /// 现量过的行为腿是"连库都打不开"与"登记表扫不动"，`table_presence` 问不出那一臂
+    /// 与 `QueryReturnedNoRows` 那一臂只有这条形状判据守着（要"表问得出、内容问不出"以外
+    /// 的形状才触发，本轮没造那种夹具）。
     #[test]
     fn the_device_detail_readers_ask_the_three_state_rulers() {
         let src = include_str!("queries.rs");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
-        for header in ["fn device_key_rows(", "fn device_date_series("] {
+        for header in [
+            "fn device_key_rows(",
+            "fn device_date_series(",
+            "fn registered_kind(",
+        ] {
             let at = prod
                 .find(header)
                 .unwrap_or_else(|| panic!("{header} 找不到了"));
@@ -4457,6 +4511,14 @@ mod tests {
             assert!(
                 body.contains("with_ro_conn_why("),
                 "{header} 必须带走打开失败的原因"
+            );
+            assert!(
+                body.contains("connection::table_presence(conn,"),
+                "{header} 问表要走三态那把尺子，不是 bool"
+            );
+            assert!(
+                body.contains("Presence::Unreadable(why) => return YearRead::Unreadable(why)"),
+                "{header} 问不出那一臂必须原样交出去，不许落进 NoTable（「没这张表」）"
             );
         }
     }
@@ -4612,6 +4674,183 @@ mod tests {
                 "这一臂是打得开、读到一半坏页，原因别说错：{g}"
             );
         }
+    }
+
+    /// 「这台设备的类型问得出吗」也走同一把三态尺子：答不出的那一年要进详情页那份账。
+    ///
+    /// 后果本来只到「类型」那一格写 `unknown`（名称、次数、别名都不受影响，也不写任何东西），
+    /// 所以它排在同族最后一名；但静默才是这一族的病根 —— 旧写法四道各自折：
+    /// `with_ro_conn` 折掉打不开、bool 的 `table_exists` 折掉"表问不出"、
+    /// `device_ids_of_identity` 折掉"登记表读不动"、`query_row(..).ok()` 折掉"那一行读不动"，
+    /// 四道的结局都是"这台设备没登记类型"。
+    ///
+    /// 四段按「答得出 → 那一年连库都打不开 → 库打得开而登记表扫不动 → 又拿走」排：
+    /// 中间两段是区分度，少了它们，"点一名"可能只是整段压根没去问；最后一段证明那句
+    /// 不是缓存留着的老话。第三段用的夹具（把这台设备的登记表本身铺到文件后半段）
+    /// 正是台账里登记过"造不出"的那一类，这一轮造出来了。
+    #[test]
+    fn the_device_kind_question_names_the_year_it_cannot_ask() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_registered_kind");
+        std::fs::create_dir_all(crate::paths::data_dir()).unwrap();
+        let this = Local::now().year();
+        let key = r"\\?\hid#vid_1a2b&pid_3c4d#fake&0100";
+        // 按天那一行放在 400 天前：这一年仍是「有数据的年」，而今日那一档里没有这台设备
+        // —— 详情只有在这时才会回退去问登记表（`rank == 0` 就是这条路的现量凭据）。
+        let old_dk = day_key_of_date(Local::now().date_naive()) - 400;
+
+        // 一、答得出：类型从登记表来，且不许多造一句
+        {
+            let conn = connection::open_rw(&paths::year_db_path(this)).unwrap();
+            connection::ensure_schema(&conn, this).unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO devices (id, device_key, name, kind) VALUES (9, ?1, '键盘', 'keyboard')",
+                [key],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, 9, 12)",
+                [old_dk],
+            )
+            .unwrap();
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        let (kind, gaps) = registered_kind(key);
+        assert_eq!(
+            kind.as_deref(),
+            Some("keyboard"),
+            "夹具要走的就是登记表那条回退，实得 {kind:?} / {gaps:?}"
+        );
+        assert!(gaps.is_empty(), "答得出就不许造一句，实得 {gaps:?}");
+        let detail = get_device_detail(key, -1);
+        assert_eq!(
+            detail.rank, 0,
+            "夹具前提：今日那一档里没有这台设备，否则问不到登记表"
+        );
+        assert_eq!(detail.kind, "keyboard", "详情页那一格要从登记表来");
+        assert!(
+            detail.unreadable.is_empty(),
+            "读全了不许凭空造一句，实得 {:?}",
+            detail.unreadable
+        );
+
+        // 二、那一年连库都打不开（同步盘换成占位文件那一类）：类型照旧答得出，但要说出这一年
+        let gone = this + 1;
+        std::fs::write(
+            paths::year_db_path(gone),
+            b"this is not a sqlite database at all",
+        )
+        .unwrap();
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        let (kind, gaps) = registered_kind(key);
+        assert_eq!(
+            kind.as_deref(),
+            Some("keyboard"),
+            "坏一年不许把别年问到的类型一起吃掉"
+        );
+        assert!(
+            gaps.iter().any(|g| g.contains("设备登记表")
+                && g.contains(&gone.to_string())
+                && g.contains("连打开都办不到")),
+            "{gone} 这一年连库都打不开，类型那一问要说出是哪一年问的，实得 {gaps:?}"
+        );
+        let detail = get_device_detail(key, -1);
+        assert!(
+            detail
+                .unreadable
+                .iter()
+                .any(|g| g.contains("设备登记表") && g.contains(&gone.to_string())),
+            "接线腿：登记表那一问的原因要走进详情页那份账，实得 {:?}",
+            detail.unreadable
+        );
+
+        // 三、库打得开、**登记表本身**扫不动：把这台设备的登记行铺到文件后半段再涂坏后半段
+        let tail = this + 2;
+        let tail_path = paths::year_db_path(tail);
+        {
+            let conn = connection::open_rw(&tail_path).unwrap();
+            connection::ensure_schema(&conn, tail).unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO devices (id, device_key, name, kind) VALUES (9, ?1, '键盘', 'keyboard')",
+                [key],
+            )
+            .unwrap();
+            // 别人家的登记把 `devices` 这张表推到后半段：扫全表才撞得上坏页
+            // （前一轮的详情夹具只把 `device_counts` 铺到后半段，`devices` 就一两行住在合法页里，
+            // 所以那一轮这一臂拿不到行为见证）
+            for i in 0..12_000i64 {
+                conn.execute(
+                    "INSERT INTO devices (id, device_key, name, kind) VALUES (?1, ?2, '别家', 'mouse')",
+                    rusqlite::params![200 + i, format!(r"\\?\hid#vid_9999&pid_{i}#other&0000")],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, 9, 5)",
+                [old_dk],
+            )
+            .unwrap();
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        connection::clear_ro_cache();
+        let mut bytes = std::fs::read(&tail_path).unwrap();
+        assert!(
+            bytes.len() > 4096 * 40,
+            "夹具太小，登记表那几页没铺到文件后半段（实得 {} 字节）",
+            bytes.len()
+        );
+        let cut = bytes.len() / 2;
+        for b in bytes.iter_mut().skip(cut) {
+            *b = 0xA5;
+        }
+        std::fs::write(&tail_path, &bytes).unwrap();
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        let (kind, gaps) = registered_kind(key);
+        assert_eq!(
+            kind.as_deref(),
+            Some("keyboard"),
+            "别年问到的类型不许被这一年吃掉"
+        );
+        let tail_gap = gaps
+            .iter()
+            .find(|g| g.contains("设备登记表") && g.contains(&tail.to_string()))
+            .unwrap_or_else(|| panic!("{tail} 这一年登记表扫不动也要点名，实得 {gaps:?}"));
+        assert!(
+            !tail_gap.contains("打不开"),
+            "这一臂是打得开、读到一半坏页，原因别说错：{tail_gap}"
+        );
+        assert!(
+            tail_gap.contains("读登记表失败") || tail_gap.contains("准备登记表的查询失败"),
+            "这一臂钉的是「表问得出、内容问不出」那个形状：`sqlite_master` 读得到，\
+             扫全表才撞坏页（若红在这里，说明夹具让更早那一问就先失败了），实得 {tail_gap}"
+        );
+
+        // 四、把坏的那两年拿走：又回到安静（证明上面那句"点名"不是缓存留着的老话）
+        connection::clear_ro_cache();
+        std::fs::remove_file(paths::year_db_path(gone))
+            .expect("删掉占位那一年（先 clear_ro_cache）");
+        std::fs::remove_file(&tail_path).expect("删掉坏页那一年（先 clear_ro_cache）");
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        let (kind, gaps) = registered_kind(key);
+        assert_eq!(kind.as_deref(), Some("keyboard"));
+        assert!(
+            gaps.is_empty(),
+            "坏年份拿走之后回到答得出，gap 不许留着，实得 {gaps:?}"
+        );
+
+        // 五、这台设备压根没登记过：那是答案，安静交回 `None`（详情页那一格写 unknown）。
+        // 少了这一腿，"凡是问不到就点一名"那种改法照样能让上面四段都绿。
+        let (never_kind, never_gaps) = registered_kind(r"\\?\hid#vid_dead&pid_beef#nobody&0000");
+        assert_eq!(never_kind, None, "没登记过的设备不该被编出一个类型");
+        assert!(
+            never_gaps.is_empty(),
+            "「确实没登记」不是「问不出」，不许造 gap，实得 {never_gaps:?}"
+        );
     }
 
     /// 单日那一问同一条口径：没这张表＝安静 24 个 0；问不出／打不开／读到坏页＝点名。
