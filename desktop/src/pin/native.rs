@@ -202,6 +202,19 @@ unsafe fn state_of(hwnd: HWND) -> Option<&'static mut PinState> {
     }
 }
 
+/// 把整块缓冲的 alpha 钉成不透明。
+///
+/// 为什么需要：`StretchBlt` 走的是颜色通路，32bpp 目标位图的第 4 个字节会被写成 **0**，
+/// 而提交用的是 `AC_SRC_ALPHA` —— alpha=0 在 DWM 那里等于"源色 + 背景全量"，于是贴图看着
+/// 过曝一倍（现量：同一块静止壁纸，本底 97.7,147.9,228.9，贴上去 193.6,251.9,253.1）。
+/// 缩放后的源本来就是不透明的，所以这里直接钉回 255，不动 RGB。
+fn force_opaque(buf: &mut [u8]) {
+    let (pixels, _) = buf.as_chunks_mut::<4>();
+    for px in pixels {
+        px[3] = 255;
+    }
+}
+
 /// 一次合成：1:1 源图 → 目标尺寸（带滤波拉伸）→ 加 ✕ → 交给 DWM。
 unsafe fn paint(hwnd: HWND, st: &mut PinState) -> bool {
     let (tw, th) = match pin_size(st.w, st.h, st.scale) {
@@ -255,6 +268,7 @@ unsafe fn paint(hwnd: HWND, st: &mut PinState) -> bool {
     )
     .as_bool();
     if ok {
+        force_opaque(dst.pixels());
         paint_close_mark(dst.pixels(), tw, th, scale_of(hwnd));
         let blend = g::BLENDFUNCTION {
             BlendOp: g::AC_SRC_OVER as u8,
@@ -693,6 +707,53 @@ mod tests {
     /// ✕ 必须整个落在客户区里，且中心点绝不命中 ——
     /// 命中区跑到图外面，用户就会在桌面上"隔空"关掉贴图；反过来 ✕ 点不到，
     /// 一张关不掉的贴图就一直盖在桌面上（模块头把这条列为最烦的事）。
+    /// `StretchBlt` 会把目标位图的 alpha 写成 0，而提交按 `AC_SRC_ALPHA` 算 ——
+    /// 漏掉那一步的症状不是「看不见」，是**过曝一倍**（源色 + 背景全量），更难查。
+    #[test]
+    fn the_alpha_is_pinned_opaque_and_the_colors_survive() {
+        let mut buf = vec![10, 20, 30, 0, 40, 50, 60, 7];
+        force_opaque(&mut buf);
+        assert_eq!(buf, vec![10, 20, 30, 255, 40, 50, 60, 255]);
+    }
+
+    /// 尾数不足一个像素时不许越界，也不许顺手改它。
+    #[test]
+    fn a_trailing_partial_pixel_is_left_alone() {
+        let mut buf = vec![1, 2, 3, 0, 9, 8];
+        force_opaque(&mut buf);
+        assert_eq!(buf, vec![1, 2, 3, 255, 9, 8]);
+    }
+
+    /// 接线腿：钉成不透明必须排在缩放之后、提交之前 —— 排在缩放前等于白做（`StretchBlt`
+    /// 随后又会把 alpha 抹成 0），排在提交之后等于这一帧已经以 2 倍亮度交出去了。
+    #[test]
+    fn the_opaque_pin_sits_between_the_stretch_and_the_submit() {
+        let src = include_str!("native.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let flat: String = prod
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let blt = flat
+            .find("g::StretchBlt(")
+            .expect("缩放拷贝那一步不见了（这条判据就没意义了）");
+        let pin = flat
+            .find("force_opaque(dst.pixels())")
+            .expect("提交前把 alpha 钉成不透明那一步不见了");
+        let ulw = flat
+            .find("wm::UpdateLayeredWindow(")
+            .expect("提交那一步不见了");
+        assert!(
+            pin > blt,
+            "钉不透明排在缩放之前 ⇒ 缩放会把 alpha 再抹成 0：{pin}<= {blt}"
+        );
+        assert!(pin < ulw, "提交之前没钉 alpha ⇒ 交出去的是过曝一倍的一帧");
+    }
+
     #[test]
     fn the_close_box_sits_inside_and_only_the_corner_is_hit() {
         let (w, scale) = (800, 1.0);
