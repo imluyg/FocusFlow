@@ -477,6 +477,16 @@ fn gather_rank_totals(
     let mut out = RankTotals::default();
     for year in years.iter().copied() {
         let path = paths::year_db_path(year);
+        // 先过那道"在不在"的三态闸：没有库是答案，说不出才要出声
+        match gate_year(year, &path, label) {
+            YearGate::SkipAbsent => continue,
+            YearGate::CannotTell(why) => {
+                out.unreadable
+                    .push(format!("{year} 年库{label}读不出来: {why}"));
+                continue;
+            }
+            YearGate::Read => {}
+        }
         let got = connection::with_ro_conn_why(&path, |conn| query(conn, cond, param));
         match got {
             Err(why) => out
@@ -496,6 +506,37 @@ fn gather_rank_totals(
         }
     }
     out
+}
+
+/// 逐年开库之前的那一道"在不在"之问（三处读数共用：榜、设备、时间窗口）。
+///
+/// 为什么单独成一个判据而不是各写一份：**那一年根本没有库**（首启那年、整年没记录、
+/// 历史那年已归档清掉）是一个正确答案，不是"读不出来"；把它说成读不出来，周报逐日问
+/// 2020 年时会拒绝生成一份本来正常的文件（本轮现量过一次，另一头则由面板念 0 过一次）。
+/// 而"说不出在不在"（休眠的移动盘、`data` 那个位置被换成普通文件、杀软首扫握着句柄）
+/// 又不许折回"没有"。三个结局必须是三条不同的路，`bool` 只能给两条。
+enum YearGate {
+    /// 确认在：照常开库去读
+    Read,
+    /// 确认没有这个文件：安静跳过，这一年按 0 计
+    SkipAbsent,
+    /// 说不出在不在：把原因交出去（调用方按自己的域名拼成 gap）
+    CannotTell(String),
+}
+
+fn gate_year(year: i32, path: &std::path::Path, label: &str) -> YearGate {
+    match year_db_presence(path) {
+        Ok(false) => YearGate::SkipAbsent,
+        Ok(true) => YearGate::Read,
+        Err(e) => {
+            tracing::error!(
+                "说不出 {year} 年的库在不在（{}）：{e} —— 这一年不进{label}的读数，\
+                 但那不是「那一年没有数据」",
+                path.display()
+            );
+            YearGate::CannotTell(format!("说不出这一年的库在不在: {e}"))
+        }
+    }
 }
 
 /// 按键统计的读数（含"这一轮有没有读全"）。
@@ -828,24 +869,15 @@ fn read_window_years(
     let mut gaps: Vec<String> = Vec::new();
     for y in years.iter().copied() {
         let path = paths::year_db_path(y);
-        match year_db_presence(&path) {
+        match gate_year(y, &path, label) {
             // 没有这一年的库文件是**正常答案**（那年没数据、或全新安装）：安静跳过，
             // 那些天留在初始化好的 0 上。
-            Ok(false) => continue,
-            Ok(true) => {}
-            // 说不出在不在（父目录在休眠的移动盘上、`data` 那个位置被换成普通文件、
-            // 杀软首扫握着句柄）：过去 `path.exists()` 把这一支和上面那支并成同一句"没有"。
-            Err(e) => {
-                tracing::error!(
-                    "说不出 {y} 年的库在不在（{}）：{e} —— 这一次这一年不进{label}的读数，\
-                     但那不是「那一年没有数据」",
-                    path.display()
-                );
-                gaps.push(format!(
-                    "{y} 年库{label}读不出来: 说不出这一年的库在不在: {e}"
-                ));
+            YearGate::SkipAbsent => continue,
+            YearGate::CannotTell(why) => {
+                gaps.push(format!("{y} 年库{label}读不出来: {why}"));
                 continue;
             }
+            YearGate::Read => {}
         }
         match connection::with_ro_conn_why(&path, |conn| query(conn, start_dk, end_dk)) {
             Err(why) => gaps.push(format!("{y} 年库{label}读不出来: {why}")),
@@ -939,30 +971,24 @@ pub fn hourly_stats_totals(target_date: Option<chrono::NaiveDate>) -> HourlyTota
     let year = d.year();
     let path = paths::year_db_path(year);
     let gap_of = |why: String| format!("{year} 年库当日小时分布读不出来: {why}");
-    // 先问"这一年的库在不在"，而且要用那把答得出"说不出"的尺子：那一天所属的年度库
-    // **本来就不存在**（首启那年、或那一整年没记录）是一个正确答案，不是"读不出来" ——
-    // 少了这一步，周报会把"没有 2020 年的库"讲成一份拒绝，而这条拒绝的文案里还写着打不开。
+    // 先过那道"在不在"的三态闸：没有这一年的库是答案（安静 24 个 0），
+    // 说不出才要出声 —— 少了这一步，周报会把"没有 2020 年的库"讲成一份拒绝。
     let mut unreadable: Vec<String> = Vec::new();
-    match year_db_presence(&path) {
-        Ok(false) => {
+    match gate_year(year, &path, "当日小时分布") {
+        YearGate::SkipAbsent => {
             return HourlyTotals {
                 hours: vec![0i64; 24],
                 unreadable,
             }
         }
-        Ok(true) => {}
-        Err(e) => {
-            tracing::error!(
-                "说不出 {year} 年的库在不在（{}）：{e} —— 那一天的小时分布不进这一问，\
-                 但那不是「那天没有记录」",
-                path.display()
-            );
-            unreadable.push(gap_of(format!("说不出这一年的库在不在: {e}")));
+        YearGate::CannotTell(why) => {
+            unreadable.push(gap_of(why));
             return HourlyTotals {
                 hours: vec![0i64; 24],
                 unreadable,
             };
         }
+        YearGate::Read => {}
     }
     let got = connection::with_ro_conn_why(&path, |conn| -> YearRead<Vec<(i64, i64)>> {
         match connection::table_presence(conn, "hourly_counts") {
@@ -1536,6 +1562,15 @@ fn gather_device_totals(years: &[i32], cond: &str, param: Option<i64>) -> Device
     let mut out = DeviceTotals::default();
     for year in years.iter().copied() {
         let path = paths::year_db_path(year);
+        match gate_year(year, &path, "设备统计") {
+            YearGate::SkipAbsent => continue,
+            YearGate::CannotTell(why) => {
+                out.unreadable
+                    .push(format!("{year} 年库设备统计读不出来: {why}"));
+                continue;
+            }
+            YearGate::Read => {}
+        }
         let got = connection::with_ro_conn_why(&path, |conn| {
             query_devices_in_conn(conn, cond, param, year)
         });
@@ -2415,14 +2450,14 @@ mod tests {
             );
         }
 
-        // 形状腿：逐库取数那一段里 `exists()` 尺子不许回来，也不许把三态又折成 bool。
-        // 锚点从 `get_daily_counts` 搬到 `read_window_years`：本轮把"逐年度库那一圈"挪进了
-        // 每日与每小时共用的取数函数，判据留在旧函数上就切不到任何真正读库的代码（假绿）。
+        // 形状腿：那道"在不在"之问里 `exists()` 尺子不许回来，三态也不许再折成 bool。
+        // 锚点第二次搬家：这轮把四处读数各自问的那一遍并成了共用的 `gate_year`
+        // （榜／设备／时间窗口／当日小时）。判据留在调用方就只剩"它调了谁"，
+        // 抽掉的那半边反而没人守 —— 探针＝把 `Ok(false) => SkipAbsent` 那一臂删掉，
+        // 这条与 `a_missing_year_db_is_an_answer_not_a_refusal` 一起红。
         let src = include_str!("queries.rs");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
-        let at = prod
-            .find("fn read_window_years(")
-            .expect("read_window_years 找不到了");
+        let at = prod.find("fn gate_year(").expect("gate_year 找不到了");
         let raw = &prod[at..at + prod[at..].find("\n}").expect("函数体切不出来")];
         // 先摘注释行：这一段自己的说明文字里就写着 `path.exists()`，带着它判"不许再用"
         // 会红在该改的地方之外、绿在真正要防的地方之上。
@@ -2436,23 +2471,41 @@ mod tests {
             "又用 exists() 猜在不在 —— 那次失败会被读成「那一年没有库」"
         );
         assert!(
-            body.contains("year_db_presence(&path)"),
+            body.contains("year_db_presence(path)"),
             "这一处必须问三态那把尺子"
+        );
+        assert!(
+            body.contains("Ok(false) => YearGate::SkipAbsent"),
+            "「确认没有」必须是第三条路，不能与「说不出」并成同一句读不出来"
         );
         assert!(
             body.contains("不进{label}的读数"),
             "说不出在不在那一支必须出声，而不是安静跳过"
         );
-        assert!(
-            body.contains("with_ro_conn_why("),
-            "「打不开」要带着原因进 gap，不许再用只回 None 的那把"
-        );
-        assert!(
-            body.matches("gaps.push(").count() >= 3,
-            "说不出在不在／打不开／读不出来三道折各该有一处出声，实得 {}",
-            body.matches("gaps.push(").count()
-        );
-        // 两个二元组口子必须是薄包装：它们自己再去读一遍库的话，上面那套判据就管不到它们了
+        // 四个调用方都要经过这道闸：谁绕过它自己开库，"没有那一年库"就又会被说成"读不出来"
+        for head in [
+            "fn gather_rank_totals(",
+            "fn gather_device_totals(",
+            "fn read_window_years(",
+            "pub fn hourly_stats_totals(",
+        ] {
+            let w_at = prod.find(head).unwrap_or_else(|| panic!("{head} 找不到了"));
+            let w_raw = &prod[w_at..w_at + prod[w_at..].find("\n}").expect("函数体切不出来")];
+            let w_body: String = w_raw
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                w_body.contains("gate_year("),
+                "{head} 绕过了那道三态闸 —— 「没有库」会在这一支被念成「读不出来」"
+            );
+            assert!(
+                !w_body.contains("year_db_presence("),
+                "{head} 自己又问了一遍在不在：判据要从共用那一份走，别在这里分叉"
+            );
+        }
+        // 三个二元组口子必须是薄包装：它们自己再去读一遍库的话，上面那套判据就管不到它们了
         for head in [
             "pub fn get_daily_counts(",
             "pub fn get_hourly_totals(",
@@ -4633,6 +4686,75 @@ mod tests {
         assert!(
             half.hours.iter().all(|v| *v == 0),
             "读不全时 24 个格子只是下界，不许把读到的半格当结论"
+        );
+    }
+
+    /// 「那一年根本没有库」是一个**答案**，不是"读不出来"：五处读数都要安静交回 0 而不造 gap。
+    ///
+    /// 这条腿守的是本轮真实制造过的那个缺陷：逐日问榜时把"没有 2020 年的库"说成读不出来，
+    /// 于是周报拒绝生成一份本来正常的文件。三小段按"没有 → 有但读不动 → 又拿走"排，
+    /// 中间那段是区分度：少了它，"安静"可能只是整段根本没去读。
+    #[test]
+    fn a_missing_year_db_is_an_answer_not_a_refusal() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_absent_answers");
+        std::fs::create_dir_all(crate::paths::data_dir()).unwrap();
+        let today = Local::now().date_naive();
+        let gone = today.year() + 7;
+        let gone_day = chrono::NaiveDate::from_ymd_opt(gone, 6, 15).unwrap();
+        let path = paths::year_db_path(gone);
+        connection::clear_ro_cache();
+
+        // 一、文件不存在：四处都安静
+        assert!(!path.exists(), "夹具前提：这一年不该有库");
+        let keys = stats_totals(None, Some(gone));
+        let apps = app_stats_totals(None, Some(gone));
+        let devices = device_totals(None, Some(gone));
+        let daily = daily_counts_totals(30, Some(gone));
+        let hours = hourly_stats_totals(Some(gone_day));
+        assert!(
+            keys.unreadable.is_empty()
+                && apps.unreadable.is_empty()
+                && devices.unreadable.is_empty()
+                && daily.unreadable.is_empty()
+                && hours.unreadable.is_empty(),
+            "没有那一年库要被当成答案，实得 {:?} / {:?} / {:?}",
+            keys.unreadable,
+            daily.unreadable,
+            hours.unreadable
+        );
+        assert_eq!(keys.total, 0);
+        assert_eq!(daily.series.len(), 30, "缺库那一年仍然交回稠密的 30 格");
+        assert!(daily.series.iter().all(|(_, c)| *c == 0));
+        assert!(hours.hours.iter().all(|v| *v == 0));
+
+        // 二、同一路径换成一份不是 SQLite 的文件：同一批读数必须立刻改口
+        std::fs::write(&path, b"this is not a sqlite database at all").unwrap();
+        connection::clear_ro_cache();
+        for (domain, got) in [
+            ("按键统计", stats_totals(None, Some(gone)).unreadable),
+            ("应用时长", app_stats_totals(None, Some(gone)).unreadable),
+            ("设备统计", device_totals(None, Some(gone)).unreadable),
+            ("每日趋势", daily_counts_totals(30, Some(gone)).unreadable),
+            (
+                "当日小时分布",
+                hourly_stats_totals(Some(gone_day)).unreadable,
+            ),
+        ] {
+            assert!(
+                got.iter()
+                    .any(|g| g.contains(domain) && g.contains(&gone.to_string())),
+                "{domain} 在文件存在却读不动时要点名，实得 {got:?}"
+            );
+        }
+
+        // 三、再把文件拿走：又要安静回去（证明上面那个"安静"不是缓存或一次性跳过）
+        connection::clear_ro_cache();
+        std::fs::remove_file(&path).expect("删掉这一年的库（先 clear_ro_cache）");
+        assert!(
+            hourly_stats_totals(Some(gone_day)).unreadable.is_empty()
+                && stats_totals(None, Some(gone)).unreadable.is_empty(),
+            "文件消失后回到「确认没有」，gap 不许留着"
         );
     }
 

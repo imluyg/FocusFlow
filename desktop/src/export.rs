@@ -485,6 +485,16 @@ fn weekly_goal(cfg: &focusflow_core::config::FocusFlowConfig) -> i64 {
     focusflow_core::stats::effective_goal(cfg.get_int("goal", "daily_keys", 20000))
 }
 
+/// 把某一问交回的"没读全"并进总账：周报逐日要问十四趟，同一年的同一个原因
+/// 会被端回来十四次，那份文件读起来像出了十四件事。
+fn push_gaps(into: &mut Vec<String>, gaps: Vec<String>) {
+    for g in gaps {
+        if !into.contains(&g) {
+            into.push(g);
+        }
+    }
+}
+
 /// 写出指定「周一~周日」区间的周报。
 ///
 /// 环比、连续打卡都改用同一批**按日**查询取数，而不是拿「相对今天的 21 天」去套：
@@ -510,7 +520,9 @@ pub fn write_weekly_report_for(
     let mut keys: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut apps: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut hourly = [0i64; 24];
-    let mut hourly_gaps: Vec<String> = Vec::new();
+    // 这一路要问四趟（逐日按键、逐日应用、逐日小时、连续/最长用的按日序列），
+    // 哪一趟没读全都并进这一份账，最后一起决定生不生成。
+    let mut read_gaps: Vec<String> = Vec::new();
     let mut rows: Vec<(chrono::NaiveDate, i64)> = Vec::new();
     // 上一周 + 本周共 14 天：上一周只用来做环比；连续/最长另按
     // `GOAL_LOOKBACK_DAYS` 取序列（见下面 `goal_state`，与设置页同一把尺子）。
@@ -520,7 +532,10 @@ pub fn write_weekly_report_for(
 
     let mut day = from - chrono::Duration::days(7);
     while day <= to {
-        let (total, day_keys) = q::get_stats_by_date(day);
+        let day_stats = q::stats_totals_on(day);
+        push_gaps(&mut read_gaps, day_stats.unreadable);
+        let total = day_stats.total;
+        let day_keys = day_stats.rows;
         if day >= from {
             rows.push((day, total));
             for (k, c) in &day_keys {
@@ -533,17 +548,13 @@ pub fn write_weekly_report_for(
                     keyboard += *c;
                 }
             }
-            let (_, day_apps) = q::get_app_stats_by_date(day);
-            for (a, s) in day_apps {
+            let day_apps = q::app_stats_totals_on(day);
+            push_gaps(&mut read_gaps, day_apps.unreadable);
+            for (a, s) in day_apps.rows {
                 *apps.entry(a).or_insert(0) += s;
             }
             let day_hours = q::hourly_stats_totals(Some(day));
-            for g in day_hours.unreadable {
-                // 同一年在 14 天循环里会被问很多次：一份原因说一次就够
-                if !hourly_gaps.contains(&g) {
-                    hourly_gaps.push(g);
-                }
-            }
+            push_gaps(&mut read_gaps, day_hours.unreadable);
             for (i, v) in day_hours.hours.into_iter().take(24).enumerate() {
                 hourly[i] += v;
             }
@@ -552,19 +563,8 @@ pub fn write_weekly_report_for(
         }
         day += chrono::Duration::days(1);
     }
-    // 时段直方图读不全时不写半份：这一路今天已经有一条"读不出来就别生成"的口径
-    // （见上面 `check_years_readable` 那句 `生成周报被拒绝`），这里补的是它管不到的半边 ——
-    // 库头合法、页坏的那种库 `open_ro` 打得开，只有真按天读小时才失败。
-    // 少了这一句，`total == 0 && prev_total == 0` 那条会把"读不动"讲成
-    // 「上一个整周没有任何记录」，而写出去的那份文件里的 24 格直方图看着是完整的。
-    if !hourly_gaps.is_empty() {
-        anyhow::bail!(
-            "生成周报被拒绝：当日小时分布这一轮没读全（{} 问）：{}",
-            hourly_gaps.len(),
-            hourly_gaps.join("；")
-        );
-    }
-
+    // 下面那段拒绝排在 `total == 0 && prev_total == 0` 之前：读不动时不许退化成
+    // 「上一个整周没有任何记录」那句关于用户历史的断言（见 `a_week_that_cannot_be_read…`）。
     let total: i64 = rows.iter().map(|(_, c)| c).sum();
     let best = rows.iter().max_by_key(|(_, c)| *c).copied();
     let worst = rows.iter().min_by_key(|(_, c)| *c).copied();
@@ -582,8 +582,22 @@ pub fn write_weekly_report_for(
     // 「两处两把尺子」。上面那条修的是同族的另一头（周报喂 14 天序列），那次播的纪录
     // 只有 41 天，正好跨不过窗口左端，所以这个缺口没被现有用例照出来。
     let anchor_gap = (Local::now().date_naive() - to).num_days().max(0);
-    let goal_rows =
-        q::get_daily_counts(focusflow_core::stats::GOAL_LOOKBACK_DAYS + anchor_gap, None);
+    let goal_read =
+        q::daily_counts_totals(focusflow_core::stats::GOAL_LOOKBACK_DAYS + anchor_gap, None);
+    push_gaps(&mut read_gaps, goal_read.unreadable);
+    let goal_rows = goal_read.series;
+    // 四问里任何一问没读全都不写半份：这一路本来就有"读不出来就别生成"那条口径
+    // （上面 `check_years_readable` 那句 `生成周报被拒绝`），这里补的是它管不到的半边 ——
+    // 库头合法、页坏的那种库 `open_ro` 打得开，只有真按天读下去才失败。
+    // 少了这一段，`total == 0 && prev_total == 0` 那条会把"读不动"讲成
+    // 「上一个整周没有任何记录」，而写出去那份文件里的榜、直方图与连续打卡都看着是完整的。
+    if !read_gaps.is_empty() {
+        anyhow::bail!(
+            "生成周报被拒绝：这一轮没读全（{} 问）：{}",
+            read_gaps.len(),
+            read_gaps.join("；")
+        );
+    }
     let goal_state =
         focusflow_core::stats::goal_status(goal, &goal_rows, &to.format("%Y-%m-%d").to_string(), 0);
     let app_total: i64 = apps.values().sum();
@@ -792,10 +806,11 @@ mod tests {
         Ok(())
     }
 
-    /// 时段直方图读不全时，周报也不能写：上面那道闸只问"这库开得住吗"，而
-    /// **库头合法、后半段页坏**的那一份是开得住的 —— 只有按天真读小时才失败。
-    /// 少了这一句，`total == 0 && prev_total == 0` 那条会把读不动讲成
-    /// 「上一个整周没有任何记录」，而写出去那份文件里的 24 格看着是完整的。
+    /// 报告那一年"打得开、读不全"时，周报不写半份，并把**每一问**没答上的都点名。
+    ///
+    /// 这一路要按日问四趟（按键、应用、小时分布、连续/最长用的按日序列）。第 214 轮先收了
+    /// 小时那一问，这条把它同一次夹具能顺带照出来的另外两问（按键／应用）也钉上，并钉去重：
+    /// 十四天里同一个原因只说一次，否则那份文件读起来像出了四十二件事。
     #[test]
     fn a_week_whose_hourly_pages_are_broken_is_not_written_as_a_quiet_week() -> anyhow::Result<()> {
         use chrono::{Datelike, NaiveDate};
@@ -815,8 +830,8 @@ mod tests {
         let year = from.year();
         let path = paths::year_db_path(year);
 
-        // 报告这一周真有数据；再把 12000 个更早的 date_key 铺进去，把这一周那几页推到
-        // 文件后半段 —— 不这么排，`date_key = ?1` 那一问只碰合法页，坏页永远轮不到出声。
+        // 报告这一周真有数据；再把 12000 个更早的 date_key **交错**铺进三张表，
+        // 把这一周那几页推到文件后半段 —— 不这么排，按日那一问只碰合法页，坏页永远轮不到出声。
         {
             let conn = open_rw(&path)?;
             ensure_schema(&conn, year)?;
@@ -824,6 +839,14 @@ mod tests {
                 conn.execute(
                     "INSERT INTO hourly_counts (date_key, hour, count) VALUES (?1, 0, 1)",
                     [k],
+                )?;
+                conn.execute(
+                    "INSERT INTO key_counts (date_key, key_name, count) VALUES (?1, ?2, 1)",
+                    (k, format!("KK{k}")),
+                )?;
+                conn.execute(
+                    "INSERT INTO app_usage (date_key, app_name, seconds) VALUES (?1, ?2, 1)",
+                    (k, format!("AA{k}")),
                 )?;
             }
             let mut day = from;
@@ -868,9 +891,15 @@ mod tests {
 
         let e = write_weekly_report_for(from, to).expect_err("时段直方图读不全时不该写半份");
         let msg = e.to_string();
+        for domain in ["当日小时分布", "按键统计", "应用时长"] {
+            assert!(
+                msg.contains(domain) && msg.contains(&year.to_string()),
+                "{domain} 那一问没读全也要点名，实得: {msg}"
+            );
+        }
         assert!(
-            msg.contains("当日小时分布") && msg.contains(&year.to_string()),
-            "要说清是哪一栏、哪一年没读全，实得: {msg}"
+            msg.contains("3 问"),
+            "十四天里同一个原因要去重成一条，实得: {msg}"
         );
         assert!(
             !msg.contains("没有任何记录"),
@@ -913,16 +942,38 @@ mod tests {
             "周报又用回说不出原因的 24 个 0"
         );
         assert!(
-            !body.contains("get_hourly_stats("),
-            "周报里出现了二元组那个旧口子：读不全时它会安静交回全零"
+            body.contains("stats_totals_on(day)")
+                && body.contains("app_stats_totals_on(day)")
+                && body.contains("daily_counts_totals("),
+            "周报这四问里有任何一问回到了二元组口子"
         );
+        for folded in [
+            "get_hourly_stats(",
+            "get_stats_by_date(",
+            "get_app_stats_by_date(",
+            "get_daily_counts(",
+        ] {
+            assert!(
+                !body.contains(folded),
+                "周报里出现了说不出原因的 {folded}：读不全时它安静交回偏小的数"
+            );
+        }
         assert!(
-            body.contains("if !hourly_gaps.is_empty()"),
+            body.contains("if !read_gaps.is_empty()"),
             "收集到的 gap 必须真的决定生不生这份文件，不然只是攒着好看"
         );
         assert!(
             body.contains("anyhow::bail!"),
             "拒绝要走既有那条 `生成周报被拒绝` 的出口，不要换一种失败形状"
+        );
+        // 拒绝必须排在"这一周没记录"那条之前，否则读不动会退化成一句关于用户历史的话
+        let reject_at = body.find("if !read_gaps.is_empty()").unwrap();
+        let empty_at = body
+            .find("if total == 0 && prev_total == 0")
+            .expect("找不到那条\"没记录就不生成\"");
+        assert!(
+            reject_at < empty_at,
+            "拒绝排在了「没有任何记录」之后：读不动会被那一句先返回，闸门形同虚设"
         );
     }
 
