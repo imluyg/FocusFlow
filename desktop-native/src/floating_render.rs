@@ -398,13 +398,12 @@ pub fn over(dst: &mut [u8], di: usize, sr: u16, sg: u16, sb: u16, sa: u16) {
 
 /// 把 GDI 画出来的"白字黑底"覆盖度层叠进缓冲。
 ///
-/// 为什么绕这一圈：GDI 往 32bpp DIB 里画字时会把 alpha 字节写成 0，
-/// 于是"直接在卡片缓冲上 DrawText"得到的是一堆透明像素。改成单独一层：
-/// 白色文字画在黑底上，R 通道就是覆盖度，再按色相乘叠上去 ——
-/// 顺带让抗锯齿只能用灰度（`ANTIALIASED_QUALITY`），ClearType 的子像素在这里会变成彩边。
+/// 为什么绕这一圈：文字渲染（DirectWrite 或 GDI）往 32bpp DIB 里画字时会把 alpha 字节
+/// 写成 0，于是"直接在卡片缓冲上画字"得到的是一堆透明像素。改成单独一层：白字画在黑底上，
+/// R 通道就是覆盖度，再按色相乘叠上去 —— 代价是抗锯齿只能用灰度。
 pub fn overlay_text_coverage(buf: &mut [u8], text: &[u8], fg: Color) {
     for i in 0..(buf.len() / 4) {
-        let cov = text[i * 4 + 2] as u16; // GDI 写的白色 → R 通道即覆盖度
+        let cov = text[i * 4 + 2] as u16; // 白字黑底：R 通道即覆盖度
         if cov == 0 {
             continue;
         }

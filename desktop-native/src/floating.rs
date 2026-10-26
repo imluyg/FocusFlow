@@ -18,15 +18,33 @@
 //! 不做 `WS_EX_TRANSPARENT` 式穿透：穿透之后卡片既拖不动也点不到，而收起来的入口
 //! 只有托盘与设置页（确实要穿透的话，那是另一个"锁定"开关的活，不该默认开）。
 
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+};
+use windows::Win32::Graphics::Direct2D::{
+    D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+    D2D1_RENDER_TARGET_USAGE_NONE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+};
+use windows::Win32::Graphics::DirectWrite::{
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi as g;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging as wm;
+use windows_numerics::Vector2;
 
 use crate::floating_render as fr;
 use fr::{Color, Palette, Rect};
@@ -276,6 +294,299 @@ fn text_runs(c: &fr::PillContent, w: i32, scale: f64, pal: Palette) -> Vec<Run> 
     out
 }
 
+/// 悬浮窗文字用 DirectWrite 画（与旧 WebView 同一个渲染栈）。
+///
+/// 原来走 GDI：13px 在透明底上只有灰度 AA，比浏览器（DirectWrite）毛糙一档；而且
+/// GDI 里标签写死 `Microsoft YaHei UI`，数字也归雅黑。现在统一 Segoe UI + 系统字体回退，
+/// 中文照样落到雅黑，数字/英文与主界面、旧 WebView 一致。
+struct TextCtx {
+    rt: ID2D1DCRenderTarget,
+    dwrite: IDWriteFactory,
+    brush: ID2D1SolidColorBrush,
+    /// 只为保活：DCRenderTarget 背后还引用着工厂。
+    _factory: ID2D1Factory,
+}
+
+thread_local! {
+    static TEXT: RefCell<Option<TextCtx>> = const { RefCell::new(None) };
+    static TEXT_TRIED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 建一次（每个悬浮窗线程一份）。失败就退回 GDI 路径，不让"字画不出来"变成空卡片。
+unsafe fn ensure_text_ctx() -> bool {
+    unsafe {
+        if TEXT_TRIED.with(|t| t.get()) {
+            return TEXT.with(|c| c.borrow().is_some());
+        }
+        TEXT_TRIED.with(|t| t.set(true));
+        let made = (|| -> windows::core::Result<TextCtx> {
+            let factory: ID2D1Factory =
+                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let props = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+            };
+            let rt = factory.CreateDCRenderTarget(&props)?;
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let brush = rt.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                },
+                None,
+            )?;
+            Ok(TextCtx {
+                rt,
+                dwrite,
+                brush,
+                _factory: factory,
+            })
+        })().ok();
+        let ok = made.is_some();
+        TEXT.with(|c| *c.borrow_mut() = made);
+        crate::tracing_note(if ok {
+            "悬浮窗文字：DirectWrite（Segoe UI，中文走系统回退）"
+        } else {
+            "悬浮窗文字：DirectWrite 起不来，退回 GDI"
+        });
+        ok
+    }
+}
+
+/// 用 DirectWrite 把一行白字画进蒙版（黑底），返回行宽（物理像素）。
+///
+/// 字号与坐标都按物理像素传：渲染目标固定 96 dpi，1 DIP = 1 px。
+unsafe fn dw_line(
+    ctx: &TextCtx,
+    hdc: g::HDC,
+    w: i32,
+    h: i32,
+    text: &str,
+    rc: Rect,
+    font_px: i32,
+    face: &str,
+    right: bool,
+) -> Option<f32> {
+    unsafe {
+        if rc.w <= 0 || rc.h <= 0 {
+            return None;
+        }
+        ctx.rt
+            .BindDC(
+                hdc,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                },
+            )
+            .ok()?;
+        let family = wide(face);
+        let locale = wide("zh-cn");
+        let fmt: IDWriteTextFormat = ctx.dwrite.CreateTextFormat(
+            windows::core::PCWSTR(family.as_ptr()),
+            None,
+            DWRITE_FONT_WEIGHT(400),
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            font_px as f32,
+            windows::core::PCWSTR(locale.as_ptr()),
+        ).ok()?;
+        let _ = fmt.SetTextAlignment(if right {
+            DWRITE_TEXT_ALIGNMENT_TRAILING
+        } else {
+            DWRITE_TEXT_ALIGNMENT_LEADING
+        });
+        let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        let _ = fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        let text16: Vec<u16> = text.encode_utf16().collect();
+        let layout = ctx
+            .dwrite
+            .CreateTextLayout(&text16, &fmt, rc.w as f32, rc.h as f32)
+            .ok()?;
+        let mut metrics = DWRITE_TEXT_METRICS::default();
+        layout.GetMetrics(&mut metrics).ok()?;
+
+        ctx.rt.BeginDraw();
+        ctx.rt.Clear(Some(&D2D1_COLOR_F {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        }));
+        ctx.rt
+            .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        ctx.rt.DrawTextLayout(
+            Vector2 {
+                X: rc.x as f32,
+                Y: rc.y as f32,
+            },
+            &layout,
+            &ctx.brush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+        );
+        ctx.rt.EndDraw(None, None).ok()?;
+        Some(metrics.widthIncludingTrailingWhitespace)
+    }
+}
+
+/// DirectWrite 版本的整卡文字。返回 false 表示这一拍根本没画（上下文起不来）。
+unsafe fn draw_text_dw(
+    hdc: g::HDC,
+    mask: &mut Surface,
+    card: &mut Surface,
+    content: &fr::PillContent,
+    w: i32,
+    h: i32,
+    scale: f64,
+    pal: Palette,
+) {
+    TEXT.with(|cell| {
+        let Ok(cell) = cell.try_borrow() else {
+            return;
+        };
+        let Some(ctx) = cell.as_ref() else {
+            return;
+        };
+        for run in text_runs(content, w, scale, pal) {
+            mask.buf().fill(0);
+            let Some(adv) = dw_line(
+                ctx,
+                hdc,
+                w,
+                h,
+                &run.text,
+                run.rc,
+                fr::px(run.font_px, scale),
+                run.face,
+                run.right,
+            ) else {
+                continue;
+            };
+            fr::overlay_text_coverage(card.buf(), mask.buf(), run.color);
+            if let Some(sfx) = &run.suffix {
+                let sx = (run.rc.x + adv.round() as i32 + fr::px(1, scale))
+                    .min(run.rc.x + run.rc.w);
+                let srect = Rect {
+                    x: sx,
+                    y: run.rc.y,
+                    w: (run.rc.x + run.rc.w - sx).max(0),
+                    h: run.rc.h,
+                };
+                mask.buf().fill(0);
+                if dw_line(
+                    ctx,
+                    hdc,
+                    w,
+                    h,
+                    &sfx.text,
+                    srect,
+                    fr::px(sfx.font_px, scale),
+                    sfx.face,
+                    false,
+                )
+                .is_some()
+                {
+                    fr::overlay_text_coverage(card.buf(), mask.buf(), sfx.color);
+                }
+            }
+        }
+    });
+}
+
+/// GDI 兜底：DirectWrite 上下文起不来时才走（老机器/极端权限）。
+/// 画的仍是"白字黑底"蒙版，之后按 R 通道叠色 —— 抗锯齿只有灰度。
+unsafe fn draw_text_gdi(
+    hdc: g::HDC,
+    mask: &mut Surface,
+    card: &mut Surface,
+    content: &fr::PillContent,
+    w: i32,
+    _h: i32,
+    scale: f64,
+    pal: Palette,
+) {
+    for run in text_runs(content, w, scale, pal) {
+        let Some(font) = make_font(run.font_px, scale, run.face, run.weight) else {
+            crate::tracing_note(&format!("悬浮窗建字体失败，这一段没画出来: {}", run.text));
+            continue;
+        };
+        let adv = {
+            mask.buf().fill(0);
+            let prev_font = g::SelectObject(hdc, g::HGDIOBJ(font.0));
+            // BACKGROUND_MODE(1) = wingdi.h 的 TRANSPARENT：不填背景，蒙版上没字的地方
+            // 保持黑色（覆盖度 0）。留成 OPAQUE 会把整个矩形涂白，整行都变成"字"。
+            let _ = g::SetBkMode(hdc, g::BACKGROUND_MODE(1));
+            let _ = g::SetTextColor(hdc, COLORREF(0x00FF_FFFF));
+            let mut rc = RECT {
+                left: run.rc.x,
+                top: run.rc.y,
+                right: run.rc.x + run.rc.w,
+                bottom: run.rc.y + run.rc.h,
+            };
+            // 注意：这里的文本**不能**带结尾 NUL。`DrawTextW` 按切片长度认字符数，
+            // 多送一个 0 就是多一个字符 —— 它会占掉一个字形宽度。
+            let mut text: Vec<u16> = run.text.encode_utf16().collect();
+            let mut adv = SIZE::default();
+            let _ = g::GetTextExtentPoint32W(hdc, &text, &mut adv);
+            let mut flags = g::DT_SINGLELINE.0
+                | g::DT_VCENTER.0
+                | g::DT_NOPREFIX.0
+                | g::DT_END_ELLIPSIS.0;
+            if run.right {
+                flags |= g::DT_RIGHT.0;
+            }
+            let _ = g::DrawTextW(hdc, &mut text, &raw mut rc, g::DRAW_TEXT_FORMAT(flags));
+            let _ = g::SelectObject(hdc, prev_font);
+            adv.cx
+        };
+        let _ = g::DeleteObject(g::HGDIOBJ(font.0));
+        fr::overlay_text_coverage(card.buf(), mask.buf(), run.color);
+
+        if let Some(sfx) = &run.suffix {
+            let Some(sfont) = make_font(sfx.font_px, scale, sfx.face, 400) else {
+                continue;
+            };
+            mask.buf().fill(0);
+            let prev = g::SelectObject(hdc, g::HGDIOBJ(sfont.0));
+            let _ = g::SetBkMode(hdc, g::BACKGROUND_MODE(1));
+            let _ = g::SetTextColor(hdc, COLORREF(0x00FF_FFFF));
+            let sx = (run.rc.x + adv + fr::px(1, scale)).min(run.rc.x + run.rc.w);
+            let mut rc = RECT {
+                left: sx,
+                top: run.rc.y,
+                right: run.rc.x + run.rc.w,
+                bottom: run.rc.y + run.rc.h,
+            };
+            let mut text: Vec<u16> = sfx.text.encode_utf16().collect();
+            let _ = g::DrawTextW(
+                hdc,
+                &mut text,
+                &raw mut rc,
+                g::DRAW_TEXT_FORMAT(
+                    g::DT_SINGLELINE.0
+                        | g::DT_VCENTER.0
+                        | g::DT_NOPREFIX.0
+                        | g::DT_END_ELLIPSIS.0,
+                ),
+            );
+            let _ = g::SelectObject(hdc, prev);
+            let _ = g::DeleteObject(g::HGDIOBJ(sfont.0));
+            fr::overlay_text_coverage(card.buf(), mask.buf(), sfx.color);
+        }
+    }
+}
+
 unsafe fn make_font(
     logical_px: i32,
     scale: f64,
@@ -393,79 +704,12 @@ unsafe fn repaint(hwnd: HWND) -> bool {
             }
         }
 
-        // 2) 文字。GDI 往 32bpp DIB 里画字只写 RGB、把 alpha 留在原值，所以不能直接往卡片上画
-        //    （会得到一堆 alpha=0 的像素）。改成每段先画进"白字黑底"的蒙版，R 通道即覆盖度，
-        //    再按覆盖度叠成目标色 —— 代价是抗锯齿只能用灰度。
-        for run in text_runs(&content, w, scale, pal) {
-            let Some(font) = make_font(run.font_px, scale, run.face, run.weight) else {
-                crate::tracing_note(&format!("悬浮窗建字体失败，这一段没画出来: {}", run.text));
-                continue;
-            };
-            let adv = {
-                mask.buf().fill(0);
-                let prev_font = g::SelectObject(hdc, g::HGDIOBJ(font.0));
-                // BACKGROUND_MODE(1) = wingdi.h 的 TRANSPARENT：不填背景，蒙版上没字的地方
-                // 保持黑色（覆盖度 0）。留成 OPAQUE 会把整个矩形涂白，整行都变成"字"。
-                let _ = g::SetBkMode(hdc, g::BACKGROUND_MODE(1));
-                let _ = g::SetTextColor(hdc, COLORREF(0x00FF_FFFF));
-                let mut rc = RECT {
-                    left: run.rc.x,
-                    top: run.rc.y,
-                    right: run.rc.x + run.rc.w,
-                    bottom: run.rc.y + run.rc.h,
-                };
-                // 注意：这里的文本**不能**带结尾 NUL。`DrawTextW` 按切片长度认字符数，
-                // 多送一个 0 就是多一个字符 —— 它会占掉一个字形宽度，把本来刚好放得下的
-                // 「活跃」「14,114」挤成「活…」「14,11…」，还在末尾画出一个方框。
-                let mut text: Vec<u16> = run.text.encode_utf16().collect();
-                // 量一下实际宽度：速度单位 `/分` 要紧接着数字画，不能按固定宽度猜。
-                let mut adv = SIZE::default();
-                let _ = g::GetTextExtentPoint32W(hdc, &text, &mut adv);
-                let mut flags = g::DT_SINGLELINE.0
-                    | g::DT_VCENTER.0
-                    | g::DT_NOPREFIX.0
-                    | g::DT_END_ELLIPSIS.0;
-                if run.right {
-                    flags |= g::DT_RIGHT.0;
-                }
-                let _ = g::DrawTextW(hdc, &mut text, &raw mut rc, g::DRAW_TEXT_FORMAT(flags));
-                let _ = g::SelectObject(hdc, prev_font);
-                adv.cx
-            };
-            let _ = g::DeleteObject(g::HGDIOBJ(font.0));
-            fr::overlay_text_coverage(card.buf(), mask.buf(), run.color);
-
-            if let Some(sfx) = &run.suffix {
-                let Some(sfont) = make_font(sfx.font_px, scale, sfx.face, 400) else {
-                    continue;
-                };
-                mask.buf().fill(0);
-                let prev = g::SelectObject(hdc, g::HGDIOBJ(sfont.0));
-                let _ = g::SetBkMode(hdc, g::BACKGROUND_MODE(1));
-                let _ = g::SetTextColor(hdc, COLORREF(0x00FF_FFFF));
-                let sx = (run.rc.x + adv + fr::px(1, scale)).min(run.rc.x + run.rc.w);
-                let mut rc = RECT {
-                    left: sx,
-                    top: run.rc.y,
-                    right: run.rc.x + run.rc.w,
-                    bottom: run.rc.y + run.rc.h,
-                };
-                let mut text: Vec<u16> = sfx.text.encode_utf16().collect();
-                let _ = g::DrawTextW(
-                    hdc,
-                    &mut text,
-                    &raw mut rc,
-                    g::DRAW_TEXT_FORMAT(
-                        g::DT_SINGLELINE.0
-                            | g::DT_VCENTER.0
-                            | g::DT_NOPREFIX.0
-                            | g::DT_END_ELLIPSIS.0,
-                    ),
-                );
-                let _ = g::SelectObject(hdc, prev);
-                let _ = g::DeleteObject(g::HGDIOBJ(sfont.0));
-                fr::overlay_text_coverage(card.buf(), mask.buf(), sfx.color);
-            }
+        // 2) 文字。优先 DirectWrite（与旧 WebView 同一渲染栈）；上下文起不来再退回 GDI。
+        //    两条路都画进"白字黑底"蒙版，R 通道即覆盖度，再按颜色叠到卡片上。
+        if ensure_text_ctx() {
+            draw_text_dw(hdc, &mut mask, &mut card, &content, w, h, scale, pal);
+        } else {
+            draw_text_gdi(hdc, &mut mask, &mut card, &content, w, h, scale, pal);
         }
 
         // 交出去之前必须把卡片选回 DC：上面那段文字循环把蒙版选了上去，而蒙版的 alpha 全是 0。
