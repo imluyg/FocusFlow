@@ -1228,7 +1228,7 @@ let snap_data = if which >= 3 {
                             Err(e) => format!("导出失败：{e}"),
                         }
                     }
-                    _ => {
+                    2 => {
                         let r = cleanup_old_data(30);
                         let mut s = format!("已清理 {} 条（保留 30 天）", r.deleted);
                         if !r.failed_years.is_empty() {
@@ -1239,6 +1239,47 @@ let snap_data = if which >= 3 {
                         }
                         s
                     }
+                    6 => {
+                        let dir = match std::env::var("FOCUSFLOW_IMPORT_DIR") {
+                            // 测试钩子：给了目录就不弹框
+                            Ok(p) => std::path::PathBuf::from(p),
+                            Err(_) => {
+                                let picked = rfd::FileDialog::new()
+                                    .set_title("选择旧版数据目录（含 focusflow_YYYY.db 的那个 data 目录）")
+                                    .pick_folder();
+                                match picked {
+                                    Some(p) => p,
+                                    None => {
+                                        if let Ok(mut q) = ops.lock() {
+                                            q.push("已取消".to_string());
+                                        }
+                                        let target = HWND(hwnd_val as *mut core::ffi::c_void);
+                                        let _ = unsafe {
+                                            PostMessageW(Some(target), WM_OP_DONE, WPARAM(0), LPARAM(0))
+                                        };
+                                        return;
+                                    }
+                                }
+                            }
+                        };
+                        let s = focusflow_core::migration::import_legacy_data(&dir);
+                        let mut line = format!("导入完成：{} 个年度库", s.year_dbs.len());
+                        if !s.records_by_year.is_empty() {
+                            let total: i64 = s.records_by_year.iter().map(|(_, n)| *n).sum();
+                            line.push_str(&format!("，共 {total} 条"));
+                        }
+                        if !s.copied_aux.is_empty() {
+                            line.push_str(&format!("；附属库 {} 份", s.copied_aux.len()));
+                        }
+                        if !s.skipped.is_empty() {
+                            line.push_str(&format!("；跳过 {} 项", s.skipped.len()));
+                        }
+                        if !s.errors.is_empty() {
+                            line.push_str(&format!("；错误：{}", s.errors.join("；")));
+                        }
+                        line
+                    }
+                    _ => "未知操作".to_string(),
                 };
                 if let Ok(mut q) = ops.lock() {
                     q.push(line);
@@ -1979,13 +2020,14 @@ let max_rows = (((h - 32.0 - 30.0 - list_top) / row_h).floor() as usize).max(1);
 }
 
 /// 设置页底部的数据操作（后台线程跑，结果回投 `WM_OP_DONE`）。
-const ACTIONS: [(&str, &str); 6] = [
+const ACTIONS: [(&str, &str); 7] = [
     ("立即备份", "把年度库各快照一份到 backup/"),
     ("压缩数据库", "重建年度库，回收空闲页"),
     ("清理 30 天前", "删掉 30 天以前的明细（不可撤销）"),
     ("导出 CSV", "把当前周期的数据写成表格"),
     ("导出 HTML", "写成一份可直接打开的网页报告"),
     ("导出 JSON", "写成结构化数据（脚本可读）"),
+    ("导入旧数据…", "从旧版数据目录合并进来（先留档再覆盖）"),
 ];
 
 /// 设置页右上角那个搜索框（底框；真正的输入是叠上去的原。
