@@ -28,6 +28,10 @@ use super::render::{
     FONT_PX, NOTICE_FONT_PX, PAUSED_DEN, PAUSED_NUM,
 };
 use super::{live_snapshot, paused_now, rest_notice_text};
+// 夹取判据与那份数学只有一份：webview 那条路用的就是这两个符号（见 `state`），
+// 原生这条复用而不是重抄 —— 抄第二把尺子的代价仓库里记过账。
+use crate::state::{clamp_floating_into_screen, FloatingBounds};
+use focusflow_core::capture::MonitorRect;
 
 /// 悬浮窗线程唯一的一份句柄。0 = 还没建起来或已经销毁。
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
@@ -475,7 +479,172 @@ fn initial_position(scale: f64) -> (i32, i32) {
             render::px(60, scale),
         )
     } else {
-        (render::px(x as i32, scale), render::px(y as i32, scale))
+        // 存过的坐标必须过一遍夹取。拔掉头显示器再启动，那对数字整张落在屏幕之外，
+        // 而下面照样 `show`：分层窗口不在 Tauri 的窗口集合里、没有任何界面入口能把它
+        // 召回来，只剩手改 config.ini 这一条路。webview 那条路径一直有这一夹（判据写在
+        // `state::clamp_floating_into_screen`），这一条以前没有 —— 注释里"两种渲染器共用
+        // 同一个 clamp"从此才是事实，而不是一句承诺。
+        let mon = nearest_monitor(
+            render::px(x.round() as i32, scale),
+            render::px(y.round() as i32, scale),
+        );
+        landed_position(
+            x,
+            y,
+            scale,
+            mon,
+            cfg.get_float("floating", "width", 90.0),
+            cfg.get_float("floating", "height", 46.0),
+        )
+    }
+}
+
+/// 存过的坐标该落在哪（物理像素）：先按 webview 那条路同一份判据夹回屏幕，再换成物理像素。
+///
+/// 卡片矩形由调用方交进来而不是在这里读屏幕：这样"拔了副屏""负坐标那块左屏""1.5 倍缩放"
+/// 三种几何都能无头量到，而真实屏幕只在 `nearest_monitor` 那一层参与。
+fn landed_position(
+    x: f64,
+    y: f64,
+    scale: f64,
+    mon: MonitorRect,
+    win_w: f64,
+    win_h: f64,
+) -> (i32, i32) {
+    let (cx, cy) = clamp_floating_into_screen(
+        x,
+        y,
+        FloatingBounds {
+            left: mon.x as f64 / scale,
+            top: mon.y as f64 / scale,
+            screen_w: mon.width as f64 / scale,
+            screen_h: mon.height as f64 / scale,
+            win_w,
+            win_h,
+        },
+    );
+    // 逻辑像素取整再乘倍数：`x as i32` 那种截断会让 1.5 倍屏上的落点比夹取值少半像素，
+    // 而这条判据的边界就是"至少露出 20 像素"，别再往里挪。
+    (
+        render::px(cx.round() as i32, scale),
+        render::px(cy.round() as i32, scale),
+    )
+}
+
+/// 离这个物理坐标最近的那块屏。`MONITOR_DEFAULTTONEAREST` 对屏幕外的点也回一块，
+/// 这正是"那块屏已经不在了，该往哪儿夹"要的量。
+///
+/// 拿不到就退回主屏尺寸（与"没存过坐标"那条用的是同一块屏）：那也比**不夹**强 ——
+/// 卡片至少会被拉回看得见的地方。
+fn nearest_monitor(px_x: i32, px_y: i32) -> MonitorRect {
+    unsafe {
+        let hmon = g::MonitorFromPoint(POINT { x: px_x, y: px_y }, g::MONITOR_DEFAULTTONEAREST);
+        // MONITORINFO 靠 cbSize 自报版本，没有可用的 Default，先清零。
+        let mut mi: g::MONITORINFO = std::mem::zeroed();
+        mi.cbSize = core::mem::size_of::<g::MONITORINFO>() as u32;
+        if !hmon.is_invalid() && g::GetMonitorInfoW(hmon, &raw mut mi).as_bool() {
+            let wide = MonitorRect::new(
+                mi.rcMonitor.left,
+                mi.rcMonitor.top,
+                (mi.rcMonitor.right - mi.rcMonitor.left).max(0) as u32,
+                (mi.rcMonitor.bottom - mi.rcMonitor.top).max(0) as u32,
+            );
+            if let Ok(m) = wide {
+                return m;
+            }
+        }
+        primary_monitor()
+    }
+}
+
+/// 主屏整块矩形（不是工作区：判据用整屏是刻意的，理由写在 `state::clamp_floating_into_screen`）。
+fn primary_monitor() -> MonitorRect {
+    unsafe {
+        MonitorRect {
+            x: 0,
+            y: 0,
+            width: wm::GetSystemMetrics(wm::SM_CXSCREEN).max(1) as u32,
+            height: wm::GetSystemMetrics(wm::SM_CYSCREEN).max(1) as u32,
+        }
+    }
+}
+
+#[cfg(test)]
+mod placement {
+    use super::*;
+
+    fn mon(x: i32, y: i32, w: u32, h: u32) -> MonitorRect {
+        MonitorRect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    /// 坐标落在已不存在的副屏那边：卡片得被拉回露出 20 像素的地方，而不是整张消失。
+    #[test]
+    fn a_saved_point_beyond_the_only_screen_is_pulled_back() {
+        let screen = mon(0, 0, 1920, 1080);
+        let (x, y) = landed_position(4000.0, 300.0, 1.0, screen, 90.0, 46.0);
+        assert_eq!(
+            x, 1900,
+            "右边界是 1920-20，卡片必须还露着一截（旧写法是原样 4000，屏幕上看不见）"
+        );
+        assert_eq!(y, 300, "只有一个轴越界时不许动另一个轴");
+
+        let (x, _) = landed_position(-2500.0, 300.0, 1.0, screen, 90.0, 46.0);
+        assert_eq!(x, -70, "左边界是 0-90+20：露出 20 像素就算看得见");
+    }
+
+    /// 反向腿：人自己放好的位置一个字都不许动 —— 尤其是贴在屏幕底边那一种。
+    ///
+    /// 这条判据当年坏在拿工作区夹：1920x1080、卡片高 46、存 `pos_y = 1031` 被拽到 992，
+    /// 于是"我放好了，重开又跑到固定位置"。整屏边界 + 允许贴边才是对的。
+    #[test]
+    fn a_saved_point_that_is_already_visible_is_left_alone() {
+        let screen = mon(0, 0, 1920, 1080);
+        assert_eq!(
+            landed_position(82.0, 1031.0, 1.0, screen, 90.0, 46.0),
+            (82, 1031),
+            "贴着底边的位置是用户放的，不许每次启动往上拽"
+        );
+        // 左边那块屏的原点是负数，那是正确结果，不是"跑丢了"。
+        let left = mon(-1920, 0, 1920, 1080);
+        assert_eq!(
+            landed_position(-1900.0, 100.0, 1.0, left, 90.0, 46.0),
+            (-1900, 100),
+            "落在副屏上的坐标要按那块屏自己的矩形判，不是按主屏"
+        );
+    }
+
+    /// 缩放倍数换算：夹取在逻辑像素上做，落点在物理像素上交。
+    #[test]
+    fn the_clamp_is_logical_and_the_landing_is_physical() {
+        let screen = mon(0, 0, 1920, 1080);
+        // 1.5 倍：屏幕逻辑宽 1280，右边界 1280-20=1260 逻辑 ⇒ 1890 物理
+        assert_eq!(
+            landed_position(4000.0, 300.0, 1.5, screen, 90.0, 46.0),
+            (1890, 450),
+            "越界夹回后要按倍数换成物理像素"
+        );
+        assert_eq!(
+            landed_position(82.0, 100.0, 1.5, screen, 90.0, 46.0),
+            (123, 150),
+            "不动的那个轴也要换算"
+        );
+    }
+
+    /// 屏幕比卡片还小时夹成一个点，而不是 panic 或反过来把卡片推得更远。
+    #[test]
+    fn a_screen_smaller_than_the_card_degrades_to_a_point() {
+        let tiny = mon(0, 0, 64, 48);
+        let (x, y) = landed_position(500.0, 500.0, 1.0, tiny, 90.0, 46.0);
+        assert_eq!(
+            (x, y),
+            (44, 28),
+            "min 大于 max 时取那一个点（这条判据的旧实现就是这么设计的），实得 {x},{y}"
+        );
     }
 }
 

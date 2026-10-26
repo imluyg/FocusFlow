@@ -2182,13 +2182,17 @@ fn alltime_baseline_adoptable(read_all_years: bool, have_previous: bool) -> bool
 const FLOATING_MIN_VISIBLE: f64 = 20.0;
 
 /// 一块屏幕的位置与尺寸 + 悬浮卡片尺寸（合成一个参数，避开 `too_many_arguments`）。
-struct FloatingBounds {
-    left: f64,
-    top: f64,
-    screen_w: f64,
-    screen_h: f64,
-    win_w: f64,
-    win_h: f64,
+///
+/// `pub(crate)` 是为了让**两种渲染器共用同一份判据**：原生那条路在
+/// `floating::native::landed_position`，它需要的夹取与这条一字不差。再抄一把尺子的下场
+/// 这个仓库记过账（两把尺子被并成一把那次就是同一处数字写了两遍引起的）。
+pub(crate) struct FloatingBounds {
+    pub(crate) left: f64,
+    pub(crate) top: f64,
+    pub(crate) screen_w: f64,
+    pub(crate) screen_h: f64,
+    pub(crate) win_w: f64,
+    pub(crate) win_h: f64,
 }
 
 /// 把存过的悬浮窗坐标夹回屏幕，但**只在卡片基本看不见时才动它**。
@@ -2201,7 +2205,7 @@ struct FloatingBounds {
 /// （他实测：1920x1080、工作区底边 1032、卡片高 46、存的 `pos_y = 1031` → 被夹到 992，
 /// 于是"我放好了，重开又跑到固定位置"）。所以用整块屏幕的边界，并允许卡片只要
 /// 露出 `FLOATING_MIN_VISIBLE` 就原样保留 —— 越界时也只朝看不见的方向挪最小的一步。
-fn clamp_floating_into_screen(x: f64, y: f64, b: FloatingBounds) -> (f64, f64) {
+pub(crate) fn clamp_floating_into_screen(x: f64, y: f64, b: FloatingBounds) -> (f64, f64) {
     let min_x = b.left - b.win_w + FLOATING_MIN_VISIBLE;
     let max_x = b.left + b.screen_w - FLOATING_MIN_VISIBLE;
     let min_y = b.top - b.win_h + FLOATING_MIN_VISIBLE;
