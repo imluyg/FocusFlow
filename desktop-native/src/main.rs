@@ -4479,7 +4479,7 @@ fn draw_plugin_view(
 
     if ops.is_empty() {
         p.text(
-            "这个插件没有声明视图（get_view 返回空）",
+            "这个插件没有可显示的视图（可能未启用、加载失败，或 get_view 返回空）",
             rect(card.left, card.top + 120.0, card.right - card.left, 20.0),
             &p.fmt.center_small,
             &p.br.muted,
@@ -5519,7 +5519,7 @@ unsafe extern "system" fn edit_proc(
         WM_CHAR if w.0 == VK_RETURN || w.0 == VK_ESCAPE => LRESULT(0),
         // 不在这里�?失焦即提�?：窗口不是前台时 `SetFocus` 不会真正生效�?        // EDIT 刚建出来就会收到一次假�?WM_KILLFOCUS，提交的会是预填的旧名字
         // �?026-10-26 实测）。提交由 Enter/Esc �?点编辑框外面"两条路负责。
-_ => unsafe { DefSubclassProc(hwnd, msg, w, l) },
+        _ => DefSubclassProc(hwnd, msg, w, l),
     }
     }
 }
@@ -5585,7 +5585,7 @@ while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
             while let Ok(ev) = MenuEvent::receiver().try_recv() {
                 match ev.id.as_ref() {
                     "show" => unsafe { bring_to_front(hwnd) },
-                    "snip" => unsafe { start_snip(hwnd) },
+                    "snip" => start_snip(hwnd),
                     "quit" => unsafe {
                         let _ = DestroyWindow(hwnd);
                     },
@@ -5599,7 +5599,7 @@ while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
                     .unwrap_or(false);
                 if is_snip {
                     tracing_note("收到截图热键");
-                    unsafe { start_snip(hwnd) };
+                    start_snip(hwnd);
                 } else {
                     tracing_note("收到热键事件，唤出窗口");
                     unsafe { bring_to_front(hwnd) };
