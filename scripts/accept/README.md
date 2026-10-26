@@ -34,11 +34,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 | `accept-theme.ps1` | 深色 16 张 + 浅色 16 张逐视图截图 / 设置页「主题」行当场切换 / 行内 `EDIT` 背景色随主题（取主色，浅色 246,249,255、深色 31,40,59） | 10 项 |
 | `accept-collect.ps1` | 点 5 下 → 今日 +5、速度 >0 / 暂停后不再涨、速度归 0 / 继续再 +5 / 退出 flush + 退出备份 / core 日志「数据库已关闭」 | 14 项 |
 | `accept-plugins.ps1` | 插件视图：`button.modal` 开弹窗、弹窗与正文的 Select 写回、提交/关闭触发插件动作、Esc 关弹窗 | 11 项 |
+| `accept-hotkey.ps1` | 两轮启动：配置里的两条组合按原样注册（日志逐字对）/ 一条写成裸键时程序照样起、日志点名被拒的那条、另一条照样注册 | 9 项 |
 | `accept-installer.ps1` | 静默装 → 目录/卸载器/快捷方式/注册表/版本号/exe 图标 → 装出来的 exe 默认在采集 → 静默卸 → 全部清干净 | 17 项 |
 
 `accept-plugins.ps1` 断言的是应用日志里的 **ASCII 片段**（字段名 `d_type`/`f_cat`、动作 id
 `add_modal`/`add_record`/`monthly_detail`/`clear_result`），不 OCR 截图；它把 `plugins/*.lua`
 拷进 probe 副本，坐标按 100% DPI 的客户区算（与其它脚本同一假设）。
+
+`accept-hotkey.ps1` 断言的也是日志里的 ASCII 片段（`toggle_window = ctrl+alt+7` 这类）：
+注入的键盘到不了低级钩子（下面坑 1），按不出热键，所以它验的是「真正注册的那把 ==
+配置与设置页显示的那把」，不是按下之后的效果。按下效果（含在设置页里改一格）要眼验。
 
 ## 共享库
 

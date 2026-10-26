@@ -18,7 +18,7 @@ use std::time::Duration;
 use focusflow_core::db::queries::DeviceDetail;
 use focusflow_core::plugins::manager::PluginManager;
 
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -613,8 +613,11 @@ struct App {
 #[allow(dead_code)]
     /// 全局热键管理器与当前注册的组合键（None = 没注册）。
 hotkeys: Option<GlobalHotKeyManager>,
+    /// 总开关：开 = 按 `[hotkey]` 里两行注册，关 = 一条都不占用全局键。
+    /// 它是运行时状态（设置页那一行显示的就是它），改组合也走它这道闸。
+    hotkeys_on: bool,
     hotkey_hk: Option<HotKey>,
-    /// 截图热键（Ctrl+Shift+A）。与唤出窗口的那个分开记，才能按事件 id 分流。
+    /// 截图热键（`[hotkey] snip`）。与唤出窗口的那个分开记，才能按事件 id 分流。
     snip_hk: Option<HotKey>,
     /// 系统材质贴上了（Win11 Mica）。
 mica: bool,
@@ -798,6 +801,7 @@ let dpi = GetDpiForWindow(hwnd) as f32;
                 snap,
                 tray,
                 hotkeys,
+            hotkeys_on: hotkey_hk.is_some() || snip_hk.is_some(),
             hotkey_hk,
             snip_hk,
                 mica,
@@ -954,7 +958,7 @@ fn ensure_target(&mut self, hwnd: HWND) {
                 sel: self.sel,
                 editing: self.edit_row,
                 heat_hover: self.heat_hover,
-                hotkey_on: self.hotkey_hk.is_some(),
+                hotkey_on: self.hotkey_hk.is_some() || self.snip_hk.is_some(),
                 floating_on: floating::is_visible(),
                 dark: tokens.dark,
                 collector_on: collect::is_started(),
@@ -1762,36 +1766,36 @@ fn toggle_autostart(&mut self, hwnd: HWND) {
         }
     }
 
-    /// 全局热键开关：注册/取消注册都是即时动作，配置键跟着写一份留给下次启动。
+    /// 让「真正注册的键」重新等于 `[hotkey]` 里那两行：先注销此刻注册着的，
+    /// 再按总开关与配置重注册。返回一行给状态栏。
+    fn reload_hotkeys(&mut self) -> String {
+        unregister_combos(self.hotkeys.as_ref(), [self.hotkey_hk, self.snip_hk]);
+        self.hotkey_hk = None;
+        self.snip_hk = None;
+        if !self.hotkeys_on {
+            return "全局热键已关闭：两条组合都不注册".to_string();
+        }
+        let toggle = register_combo(self.hotkeys.as_ref(), "toggle_window");
+        self.hotkey_hk = toggle;
+        let snip = register_combo(self.hotkeys.as_ref(), "snip");
+        self.snip_hk = snip;
+        match (toggle, snip) {
+            (Some(_), Some(_)) => "两条热键已按配置注册".to_string(),
+            (None, None) => "热键没能注册上（组合无效或被别的程序占用，详见日志）".to_string(),
+            _ => "只注册上一半热键（哪一条失败写在日志里）".to_string(),
+        }
+    }
+
+    /// 全局热键总开关：两条绑定（唤出 / 截图）一起注册或一起取消，
+    /// 配置键跟着写一份留给读它的人（启动时是否照它注册是另一回事，见交接文档）。
 fn toggle_hotkey(&mut self, hwnd: HWND) {
-        let combo = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyF);
-        let msg = if let Some(hk) = self.hotkey_hk.take() {
-            match self.hotkeys.as_ref().map(|m| m.unregister(hk)) {
-                Some(Ok(())) => {
-                    let _ = focusflow_core::config::instance().set("hotkey", "enabled", "false");
-                    "热键已取消：Ctrl+Shift+F".to_string()
-                }
-                Some(Err(e)) => {
-                    // 取消失败：把它放回去，界面别显示"关了"却还在响应。
-self.hotkey_hk = Some(hk);
-                    format!("取消热键失败：{e}")
-                }
-                None => {
-                    self.hotkey_hk = Some(hk);
-                    "没有热键管理器".to_string()
-                }
-            }
-        } else {
-            match self.hotkeys.as_ref().map(|m| m.register(combo)) {
-                Some(Ok(())) => {
-                    self.hotkey_hk = Some(combo);
-                    let _ = focusflow_core::config::instance().set("hotkey", "enabled", "true");
-                    "热键已注册：Ctrl+Shift+F".to_string()
-                }
-                Some(Err(e)) => format!("热键注册失败（可能被别的程序占用）：{e}"),
-                None => "没有热键管理器".to_string(),
-            }
-        };
+        self.hotkeys_on = !self.hotkeys_on;
+        let msg = self.reload_hotkeys();
+        let _ = focusflow_core::config::instance().set(
+            "hotkey",
+            "enabled",
+            if self.hotkeys_on { "true" } else { "false" },
+        );
         tracing_note(&msg);
         self.status = Some(msg);
         unsafe {
@@ -2349,14 +2353,31 @@ let numeric_ok = match kind {
                                 2 => value.parse::<f64>().is_ok(),
                                 _ => true,
                             };
+                            // 热键组合同样先验：写进去解析不了的值会让界面显示的和注册的各说各话。
+                            // 空串是既有的"恢复默认"手势，默认值本身一定可用，不用验。
+                            let hotkey_err = if section == "hotkey"
+                                && matches!(key, "toggle_window" | "snip")
+                                && !value.is_empty()
+                            {
+                                combo_reject_reason(key, &value)
+                            } else {
+                                None
+                            };
                             if !numeric_ok {
                                 tracing_note(&format!(
                                     "设置 {section}.{key} 的值 {value:?} 不是数字，未写入"
                                 ));
+                            } else if let Some(why) = hotkey_err {
+                                self.status = Some(format!("热键没有改：{why}"));
+                                tracing_note(&format!("热键 {key} 未写入：{why}"));
                             } else {
                                 let v = if value.is_empty() { default } else { value };
                                 match focusflow_core::config::instance().set(section, key, &v) {
                                     Ok(()) => {
+                                        if section == "hotkey" {
+                                            let msg = self.reload_hotkeys();
+                                            self.status = Some(msg);
+                                        }
                                         self.refresh_now();
                                         tracing_note(&format!("设置已写入 {section}.{key}={v:?}"));
                                     }
@@ -2590,10 +2611,21 @@ fn basic_cat(b: Basic) -> usize {
 
 fn setting_cat(section: &str) -> usize {
     match section {
+        "hotkey" => 1,
         "goal" => 3,
         "database" => 4,
         _ => 5,
     }
+}
+
+/// 快照里某一行设置的当前值。画面上要说"现在用的是哪个组合"时读它，
+/// 别再自己抄一遍硬编码——抄一次就已经错过一次。
+fn snap_setting(snap: &Snapshot, section: &str, key: &str) -> String {
+    snap.settings
+        .iter()
+        .find(|r| r.section == section && r.key == key)
+        .map(|r| r.value.clone())
+        .unwrap_or_else(|| "（没有这一行）".to_string())
 }
 
 /// 当前分类 / 搜索词下要显示的行。
@@ -2947,9 +2979,13 @@ let sbox = search_box_rect(w);
                             &p.fmt.center_small,
                             if on { &p.br.white } else { &p.br.muted },
                         );
+                        let toggle = snap_setting(snap, "hotkey", "toggle_window");
+                        let snip = snap_setting(snap, "hotkey", "snip");
                         p.text(
-                            "Ctrl + Shift + F（global-hotkey 注册状态，不是配置键）",
-                            rect(r.left + 12.0, y + 21.0, 420.0, 18.0),
+                            &format!(
+                                "总开关：开 = 注册下面两行（{toggle} / {snip}）；关 = 一条都不占用"
+                            ),
+                            rect(r.left + 12.0, y + 21.0, 520.0, 18.0),
                             &p.fmt.small,
                             &p.br.muted,
                         );
@@ -2957,8 +2993,11 @@ let sbox = search_box_rect(w);
                     Basic::Snip => {
                         p.round(vb, 6.0, &p.br.accent, None);
                         p.text("截图…", vb, &p.fmt.center_small, &p.br.white);
+                        let snip = snap_setting(snap, "hotkey", "snip");
                         p.text(
-                            "Ctrl+Shift+A 或托盘「截图」；PNG 存到 data/screenshots 并复制到剪贴板",
+                            &format!(
+                                "也可按「区域截图热键」（{snip}）；PNG 存到 data/screenshots 并复制到剪贴板"
+                            ),
                             rect(r.left + 12.0, y + 21.0, 600.0, 15.0),
                             &p.fmt.small,
                             &p.br.muted,
@@ -6697,42 +6736,113 @@ fn tray_tooltip(today: i64) -> String {
     tip
 }
 
+/// 一条组合字符串解析成 `HotKey`；坏值/空值/没有修饰键的裸键返回 `None`。
+/// 设置页写入前与注册时都用它，两边同源才不会"显示的是一个键、注册的是另一个"。
+fn parse_combo(raw: &str) -> Option<HotKey> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let hk = trimmed.parse::<HotKey>().ok()?;
+    // 裸键（`f1` 这种）解析得过，但注册上去等于把这个键在整个系统里吞掉，
+    // 别的应用再也按不到它 —— 全局热键必须带至少一个修饰键。
+    if hk.mods.is_empty() {
+        return None;
+    }
+    Some(hk)
+}
+
+/// 这一条组合能不能用。`None` = 能用；`Some(原因)` = 拒写并解释。
+/// `other_raw` 是同段里另一条热键的当前值：两条撞在一起时第二条必然注册失败，
+/// 那会让界面显示"已经设上了"、实际却按不出来，所以在这里就拒掉。
+fn combo_check(key: &str, raw: &str, other_raw: &str) -> Option<String> {
+    let value = raw.trim();
+    let Some(hk) = parse_combo(value) else {
+        return Some(format!(
+            "{value:?} 不成一个组合；要写成一个修饰键加一个主键，如 ctrl+shift+f"
+        ));
+    };
+    let other_label = if key == "toggle_window" {
+        "区域截图热键"
+    } else {
+        "唤出窗口热键"
+    };
+    if parse_combo(other_raw) == Some(hk) {
+        return Some(format!("{value} 已经被「{other_label}」占用，两条热键要分开"));
+    }
+    None
+}
+
+/// `[hotkey]` 里这一条组合当前配置的原串（文件里没有或写着空 → 核心默认值）。
+/// 设置页显示的就是它，注册的键是它解析出来的，所以两边不会分叉。
+fn hotkey_config_raw(key: &str) -> String {
+    let defaults = focusflow_core::config::default_config();
+    let def = defaults
+        .get("hotkey")
+        .and_then(|s| s.get(key))
+        .cloned()
+        .unwrap_or_default();
+    focusflow_core::config::instance().get_or("hotkey", key, &def)
+}
+
+/// 拿配置里的另一条热键做重复检查（`combo_check` 的那份判据）。
+fn combo_reject_reason(key: &str, raw: &str) -> Option<String> {
+    let other = if key == "toggle_window" {
+        "snip"
+    } else {
+        "toggle_window"
+    };
+    combo_check(key, raw, &hotkey_config_raw(other))
+}
+
+/// 读 `[hotkey] <key>` 并注册它；成功返回组合，失败返回 `None`（这一条不占用全局键）。
+/// 日志里带 `key = 原串` 这段 ASCII，验收脚本据此核对"配置写的"和"注册的"是不是同一个。
+fn register_combo(manager: Option<&GlobalHotKeyManager>, key: &str) -> Option<HotKey> {
+    let manager = manager?;
+    let raw = hotkey_config_raw(key);
+    let hk = match parse_combo(&raw) {
+        Some(hk) => hk,
+        None => {
+            tracing_note(&format!("热键 {key} = {raw:?} 解析失败：这一条没有注册"));
+            return None;
+        }
+    };
+    match manager.register(hk) {
+        Ok(()) => {
+            tracing_note(&format!("热键已注册 {key} = {raw}"));
+            Some(hk)
+        }
+        Err(e) => {
+            tracing_note(&format!("热键注册失败 {key} = {raw}：{e}"));
+            None
+        }
+    }
+}
+
+/// 注销此刻真正注册着的组合（总开关关掉、或改完要重注册时先走这一步）。
+fn unregister_combos(manager: Option<&GlobalHotKeyManager>, list: [Option<HotKey>; 2]) {
+    let Some(manager) = manager else { return };
+    let all: Vec<HotKey> = list.into_iter().flatten().collect();
+    if !all.is_empty() {
+        let _ = manager.unregister_all(&all);
+    }
+}
+
 fn make_hotkeys() -> (
     Option<GlobalHotKeyManager>,
     Option<HotKey>,
     Option<HotKey>,
 ) {
     let manager = match GlobalHotKeyManager::new() {
-        Ok(m) => m,
+        Ok(m) => Some(m),
         Err(e) => {
             tracing_note(&format!("热键管理器创建失败：{e}"));
-            return (None, None, None);
-        }
-    };
-    let hk = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyF);
-    let toggle = match manager.register(hk) {
-        Ok(()) => {
-            tracing_note("热键已注册：Ctrl+Shift+F");
-            Some(hk)
-        }
-        Err(e) => {
-            tracing_note(&format!("热键注册失败（可能被别的程序占用）：{e}"));
             None
         }
     };
-    // 截图热键：Ctrl+Shift+A（旧版的 [hotkey] snip 默认值就是它）
-    let snip = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyA);
-    let snip_ok = match manager.register(snip) {
-        Ok(()) => {
-            tracing_note("截图热键已注册：Ctrl+Shift+A");
-            Some(snip)
-        }
-        Err(e) => {
-            tracing_note(&format!("截图热键注册失败：{e}"));
-            None
-        }
-    };
-    (Some(manager), toggle, snip_ok)
+    let toggle = register_combo(manager.as_ref(), "toggle_window");
+    let snip = register_combo(manager.as_ref(), "snip");
+    (manager, toggle, snip)
 }
 
 /// 托盘图标：一个蓝色圆点。真实版本换。
@@ -7049,15 +7159,27 @@ while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
             }
             while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
                 // 两个热键共用一个通道：按 id 分流，否则截图的键会把窗口唤出来。
-                let is_snip = unsafe { app_ptr(hwnd) }
-                    .and_then(|app| app.snip_hk.map(|h| h.id() == ev.id))
-                    .unwrap_or(false);
-                if is_snip {
-                    tracing_note("收到截图热键");
-                    start_snip(hwnd);
-                } else {
-                    tracing_note("收到热键事件，唤出窗口");
-                    unsafe { bring_to_front(hwnd) };
+                // 组合键现在能被用户改掉，所以只响应"此刻真正注册着的那两个 id"，
+                // 刚注销/换掉的旧 id 投过来的事件一律不认。
+                let role = unsafe { app_ptr(hwnd) }.and_then(|app| {
+                    if app.snip_hk.map(|h| h.id() == ev.id).unwrap_or(false) {
+                        Some("snip")
+                    } else if app.hotkey_hk.map(|h| h.id() == ev.id).unwrap_or(false) {
+                        Some("toggle")
+                    } else {
+                        None
+                    }
+                });
+                match role {
+                    Some("snip") => {
+                        tracing_note("收到截图热键");
+                        start_snip(hwnd);
+                    }
+                    Some("toggle") => {
+                        tracing_note("收到热键事件，唤出窗口");
+                        unsafe { bring_to_front(hwnd) };
+                    }
+                    _ => tracing_note(&format!("收到没注册的热键事件 id={}", ev.id)),
                 }
             }
             // 插件视图要按 1 秒重算一次：番茄钟的倒计时、键鼠计数都是插件自己在
@@ -7626,4 +7748,55 @@ if let Ok(spec) = std::env::var("FOCUSFLOW_SNIP_TEST") {
         drop(Box::from_raw(app));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::*;
+
+    /// 设置页里显示的就是核心默认值，注册时解析的也是它：默认值解析不了 = 一开机就分叉。
+    #[test]
+    fn the_core_defaults_parse_into_hotkeys() {
+        let defaults = focusflow_core::config::default_config();
+        let hotkey = defaults.get("hotkey").expect("核心默认里有 [hotkey] 段");
+        for key in ["toggle_window", "snip", "snip_annotate"] {
+            let raw = hotkey.get(key).unwrap_or_else(|| panic!("[hotkey] 默认缺 {key}"));
+            assert!(
+                parse_combo(raw).is_some(),
+                "默认组合 {key} = {raw:?} 解析不了，设置页显示的值和注册的键会分叉"
+            );
+        }
+    }
+
+    /// 判重按解析结果比，不按字符串：换个写法（control / ctrl、多加空格）也是同一条键。
+    #[test]
+    fn the_same_combo_is_detected_across_spellings() {
+        assert_eq!(
+            parse_combo("ctrl+shift+f"),
+            parse_combo("control + shift + f"),
+            "ctrl 与 control 应当算同一个修饰键"
+        );
+        let why = combo_check("snip", "control+shift+f", "ctrl+shift+f").expect("换写法躲不掉判重");
+        assert!(why.contains("占用"), "要说清被谁占用：{why}");
+        assert!(why.contains("唤出窗口热键"), "要点名另一条的中文名：{why}");
+    }
+
+    #[test]
+    fn two_different_combos_are_accepted() {
+        assert_eq!(combo_check("snip", "shift+f2", "shift+f1"), None);
+        assert_eq!(combo_check("toggle_window", "ctrl+alt+9", "shift+f1"), None);
+        // 三个修饰键也算一个合法组合，别把它当坏值拒了。
+        assert!(parse_combo("ctrl+shift+alt+f").is_some());
+    }
+
+    /// 裸键能解析成 HotKey，但注册上去会在整个系统里吞掉那个键，必须当坏值拒掉。
+    #[test]
+    fn a_bare_key_is_refused_and_explained() {
+        assert_eq!(parse_combo("f1"), None, "裸键 f1 不该当成可用的全局热键");
+        for bad in ["", "   ", "f1", "ctrl+shift", "ctrl++f", "shift+f1+f2", "乱码"] {
+            let why = combo_check("toggle_window", bad, "shift+f1")
+                .unwrap_or_else(|| panic!("{bad:?} 应该被拒"));
+            assert!(why.contains("修饰键"), "{bad:?} 的说明要给能照写的格式：{why}");
+        }
+    }
 }
