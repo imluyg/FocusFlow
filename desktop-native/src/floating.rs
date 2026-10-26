@@ -52,11 +52,12 @@ const CLASS_NAME: &str = "FocusFlowFloatingPill";
 
 /// `[floating] width` 的默认值（逻辑像素）。
 ///
-/// 旧版是 90 —— 那是按「活跃 1,234 / 速度 45/分」量的。原生端最后一格换成了「目标 470%」、
-/// 次数也常是五位带千分位，90 宽刚好把值顶到卡片右边（实测："14,114" 与边框只差几个像素）。
-const DEFAULT_W: f64 = 104.0;
-/// `[floating] height` 的默认值（逻辑像素）。两行 46 是内容需要的最小高度，见 `content_height`。
-const DEFAULT_H: f64 = 46.0;
+/// 2026-10-27 从 104 加到 148：104 是照旧版「活跃 1,234 / 速度 45/分」量的，标签与值之间
+/// 没有空隙；换成 16px 值 + 11px 标签之后，148 才让「14,114」和「3h 30m」都留得下边距。
+/// 配置里存着旧默认 104 的，按 [`fr::MIN_W`] 抬到 136，不被省略号切掉。
+const DEFAULT_W: f64 = 148.0;
+/// `[floating] height` 的默认值（逻辑像素）。两行 60 是内容需要的高度，见 `content_height`。
+const DEFAULT_H: f64 = 60.0;
 
 /// 卡片要显示的三格数。由主窗口读库后推过来（[`publish`]）。
 ///
@@ -176,43 +177,59 @@ fn current_content() -> fr::PillContent {
     fr::build_content(metric, live.today, live.duration_sec, live.goal_pct)
 }
 
-/// 一段要画的文字：内容、矩形、颜色、字号。
+/// 一段要画的文字：内容、矩形、颜色、字号、字体、是否右对齐。
 struct Run {
     text: String,
     rc: Rect,
     color: Color,
     font_px: i32,
+    face: &'static str,
+    weight: i32,
+    right: bool,
 }
 
 fn text_runs(c: &fr::PillContent, w: i32, scale: f64, pal: Palette) -> Vec<Run> {
     let mut out = Vec::new();
     let rows = fr::layout_rows(w, scale, c.rows.len());
     for (row, lay) in c.rows.iter().zip(rows.iter()) {
+        // 标签用雅黑（中文），值用 Segoe UI Semibold（数字/单位）—— 一格里两种字，
+        // 中文标签小、数字大且右对齐，扫一眼先看到数字。
         out.push(Run {
             text: row.label.to_string(),
             rc: lay.label,
             color: pal.muted,
-            font_px: fr::FONT_PX,
+            font_px: fr::LABEL_PX,
+            face: "Microsoft YaHei UI",
+            weight: 400,
+            right: false,
         });
         out.push(Run {
             text: row.value.clone(),
             rc: lay.value,
             color: if row.accent { pal.accent } else { pal.fg },
-            font_px: fr::FONT_PX,
+            font_px: fr::VALUE_PX,
+            face: "Segoe UI",
+            weight: 600,
+            right: true,
         });
     }
     out
 }
 
-unsafe fn make_font(logical_px: i32, scale: f64) -> Option<g::HFONT> {
+unsafe fn make_font(
+    logical_px: i32,
+    scale: f64,
+    face: &str,
+    weight: i32,
+) -> Option<g::HFONT> {
     unsafe {
         let mut lf: g::LOGFONTW = std::mem::zeroed();
         // 负高度 = 按字符高度（不含内部 Leading），与 CSS font-size 同口径
         lf.lfHeight = -fr::px(logical_px, scale);
-        lf.lfWeight = 400;
+        lf.lfWeight = weight;
         lf.lfCharSet = g::DEFAULT_CHARSET;
         lf.lfQuality = g::ANTIALIASED_QUALITY;
-        let face = wide("Microsoft YaHei UI");
+        let face = wide(face);
         for (i, c) in face.iter().take(31).enumerate() {
             lf.lfFaceName[i] = *c;
         }
@@ -232,7 +249,9 @@ unsafe fn repaint(hwnd: HWND) -> bool {
         let pal = palette_now();
         let content = current_content();
 
-        let cfg_w = cfg.get_float("floating", "width", DEFAULT_W).max(40.0) as i32;
+        let cfg_w = cfg
+            .get_float("floating", "width", DEFAULT_W)
+            .max(fr::MIN_W as f64) as i32;
         // 高度取「配置值」与「内容需要值」的大者：`metric=both` 多一行，
         // 而分层窗口没有滚动条 —— 画不下就是看不见。
         let h_logical = fr::pill_height(cfg.get_float("floating", "height", DEFAULT_H), content.rows.len());
@@ -266,20 +285,48 @@ unsafe fn repaint(hwnd: HWND) -> bool {
         };
         let _ = g::SelectObject(hdc, g::HGDIOBJ(mask.bmp.0));
 
-        // 1) 卡片底 + 1px 边框（都按圆角覆盖率裁，边框那一圈同样不能漏到角外）
+        // 1) 卡片底 + 1px 边框。两层圆角覆盖率：外层 = 整张卡，内层 = 缩进一个边框，
+        //    两者之差就是边框那一圈 —— 四个角因此是抗锯齿的，不再是 1px 台阶。
         let border_px = fr::px(fr::BORDER, scale).max(1);
+        let radius_px = fr::px(fr::RADIUS, scale);
         {
             let buf = card.buf();
+            let (iw, ih) = (w - border_px * 2, h - border_px * 2);
+            let inner_radius = (radius_px - border_px).max(0);
             for y in 0..h {
                 for x in 0..w {
-                    let a = fr::card_alpha_at(x, y, w, h, fr::RADIUS, pal.card.a);
-                    if a == 0 {
+                    let cov_out = fr::rounded_rect_coverage(x, y, w, h, radius_px);
+                    if cov_out == 0 {
                         continue;
                     }
-                    let on_border =
-                        x < border_px || y < border_px || x >= w - border_px || y >= h - border_px;
-                    let c = if on_border { pal.border } else { pal.card };
-                    fr::put_premultiplied(buf, (y * w + x) as usize, c, a);
+                    let cov_in = if iw > 0 && ih > 0 {
+                        fr::rounded_rect_coverage(
+                            x - border_px,
+                            y - border_px,
+                            iw,
+                            ih,
+                            inner_radius,
+                        )
+                    } else {
+                        0
+                    };
+                    let idx = (y * w + x) as usize;
+                    if cov_in > 0 {
+                        let a = (cov_in as u16 * pal.card.a as u16 / 255) as u8;
+                        fr::put_premultiplied(buf, idx, pal.card, a);
+                    }
+                    let ring = cov_out.saturating_sub(cov_in);
+                    if ring > 0 {
+                        let a = (ring as u16 * pal.border.a as u16 / 255) as u16;
+                        fr::over(
+                            buf,
+                            idx,
+                            pal.border.r as u16 * a / 255,
+                            pal.border.g as u16 * a / 255,
+                            pal.border.b as u16 * a / 255,
+                            a,
+                        );
+                    }
                 }
             }
         }
@@ -289,7 +336,7 @@ unsafe fn repaint(hwnd: HWND) -> bool {
         //    再按覆盖度叠成目标色 —— 代价是抗锯齿只能用灰度。
         for run in text_runs(&content, w, scale, pal) {
             mask.buf().fill(0);
-            let Some(font) = make_font(run.font_px, scale) else {
+            let Some(font) = make_font(run.font_px, scale, run.face, run.weight) else {
                 crate::tracing_note(&format!("悬浮窗建字体失败，这一段没画出来: {}", run.text));
                 continue;
             };
@@ -308,14 +355,14 @@ unsafe fn repaint(hwnd: HWND) -> bool {
             // 多送一个 0 就是多一个字符 —— 它会占掉一个字形宽度，把本来刚好放得下的
             // 「活跃」「14,114」挤成「活…」「14,11…」，还在末尾画出一个方框。
             let mut text: Vec<u16> = run.text.encode_utf16().collect();
-            let _ = g::DrawTextW(
-                hdc,
-                &mut text,
-                &raw mut rc,
-                g::DRAW_TEXT_FORMAT(
-                    g::DT_SINGLELINE.0 | g::DT_VCENTER.0 | g::DT_NOPREFIX.0 | g::DT_END_ELLIPSIS.0,
-                ),
-            );
+            let mut flags = g::DT_SINGLELINE.0
+                | g::DT_VCENTER.0
+                | g::DT_NOPREFIX.0
+                | g::DT_END_ELLIPSIS.0;
+            if run.right {
+                flags |= g::DT_RIGHT.0;
+            }
+            let _ = g::DrawTextW(hdc, &mut text, &raw mut rc, g::DRAW_TEXT_FORMAT(flags));
             let _ = g::SelectObject(hdc, prev_font);
             let _ = g::DeleteObject(g::HGDIOBJ(font.0));
             fr::overlay_text_coverage(card.buf(), mask.buf(), run.color);
@@ -461,7 +508,10 @@ fn initial_position(scale: f64) -> (i32, i32, i32) {
     if x.is_nan() || y.is_nan() {
         let sw = unsafe { wm::GetSystemMetrics(wm::SM_CXSCREEN) }.max(1) as f64;
         (
-            fr::px((sw / scale - 120.0).max(0.0) as i32, scale),
+            fr::px(
+                (sw / scale - (DEFAULT_W + 16.0)).max(0.0) as i32,
+                scale,
+            ),
             fr::px(60, scale),
             60,
         )

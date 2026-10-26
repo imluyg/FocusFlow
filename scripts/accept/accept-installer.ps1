@@ -40,7 +40,7 @@ if (Test-Path (Join-Path $inst 'uninstall.exe')) {
 $code = Invoke-Setup $Setup
 Check 'silent install exits 0' ($code -eq 0) "exit=$code"
 Check 'install dir created' (Test-Path $inst) $inst
-Check 'focusflow-native.exe installed' (Test-Path (Join-Path $inst 'focusflow-native.exe')) ''
+Check 'FocusFlow.exe installed' (Test-Path (Join-Path $inst 'FocusFlow.exe')) ''
 Check 'uninstall.exe installed' (Test-Path (Join-Path $inst 'uninstall.exe')) ''
 Check 'desktop shortcut created' (Test-Path $desktopLnk) ''
 Check 'start menu folder created' (Test-Path $startMenu) ''
@@ -49,15 +49,15 @@ $ver = if (Test-Path $uninstallKey) { (Get-ItemProperty $uninstallKey).DisplayVe
 Check 'uninstall key carries the version' ($ver -eq '0.5.0') "DisplayVersion=$ver"
 
 Add-Type -AssemblyName System.Drawing
-$ico = [System.Drawing.Icon]::ExtractAssociatedIcon((Join-Path $inst 'focusflow-native.exe'))
+$ico = [System.Drawing.Icon]::ExtractAssociatedIcon((Join-Path $inst 'FocusFlow.exe'))
 Check 'installed exe carries an icon resource' ($ico.Width -gt 0) "$($ico.Width)x$($ico.Height)"
 $ico.Dispose()
 
 # Run the INSTALLED exe, but point it at a probe copy so the install dir stays pristine.
 $app = Join-Path $WorkDir 'app'
 New-AppDir $app @('[collector]', 'enabled = false')
-Remove-Item (Join-Path $WorkDir 'focusflow-native.log') -ErrorAction SilentlyContinue
-$p = Start-App (Join-Path $inst 'focusflow-native.exe') $app $WorkDir
+Remove-Item (Join-Path $WorkDir 'focusflow.log') -ErrorAction SilentlyContinue
+$p = Start-App (Join-Path $inst 'FocusFlow.exe') $app $WorkDir
 $h = Wait-Window $p.Id
 Check 'installed exe starts' ($h -ne [IntPtr]::Zero)
 Start-Sleep -Milliseconds 3000
@@ -70,7 +70,7 @@ Save-WindowShot $h (Join-Path $WorkDir 'installed-run.png') | Out-Null
 [void][FF]::PostMessage($h, 0x8009, [IntPtr]::Zero, [IntPtr]::Zero)
 $sw = [Diagnostics.Stopwatch]::StartNew()
 while (-not $p.HasExited -and $sw.Elapsed.TotalMilliseconds -lt 8000) { Start-Sleep -Milliseconds 150 }
-if (-not $p.HasExited) { Stop-App }
+if (-not $p.HasExited) { Stop-App (Join-Path $inst 'FocusFlow.exe') }
 
 $code2 = (Start-Process -FilePath (Join-Path $inst 'uninstall.exe') -ArgumentList '/S' -Wait -PassThru).ExitCode
 Start-Sleep -Milliseconds 1000

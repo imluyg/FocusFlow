@@ -25,7 +25,7 @@ if (-not $WorkDir) { $WorkDir = Join-Path (Get-RepoRoot) 'target\accept\collect'
 Stop-App
 $app = Join-Path $WorkDir 'app'
 New-AppDir $app @('[collector]', 'enabled = true')
-Remove-Item (Join-Path $WorkDir 'focusflow-native.log') -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $WorkDir 'focusflow.log') -ErrorAction SilentlyContinue
 $backupDir = Join-Path $app 'backup'
 $backupBefore = @(Get-ChildItem $backupDir -ErrorAction SilentlyContinue).Count
 "exe : $Exe"

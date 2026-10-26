@@ -25,7 +25,7 @@ New-AppDir $app @('[collector]', 'enabled = false')
 Set-ConfigLine $app 'floating' 'enabled' 'true'
 Set-ConfigLine $app 'floating' 'pos_x' '1500'
 Set-ConfigLine $app 'floating' 'pos_y' '140'
-Remove-Item (Join-Path $WorkDir 'focusflow-native.log') -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $WorkDir 'focusflow.log') -ErrorAction SilentlyContinue
 
 $p = Start-App $Exe $app $WorkDir
 $h = Wait-Window $p.Id
@@ -37,7 +37,7 @@ Start-Sleep -Milliseconds 900
 
 $r = Get-Rect $pill
 Check 'pill lands where the config says (1500,140)' ($r.X -eq 1500 -and $r.Y -eq 140) "$($r.X),$($r.Y)"
-Check 'pill uses the 104x46 content default' ($r.W -eq 104 -and $r.H -eq 46) "$($r.W)x$($r.H)"
+Check 'pill uses the 148x60 content default' ($r.W -eq 148 -and $r.H -eq 60) "$($r.W)x$($r.H)"
 Check 'WM_NCHITTEST answers HTCAPTION (2)' ([FF]::HitTest([uint32]$p.Id, 'FocusFlowFloatingPill') -eq 2)
 
 # A drag ends with WM_EXITSIZEMOVE; the pill then writes pos_x/pos_y back to config.

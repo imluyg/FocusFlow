@@ -30,7 +30,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 | 脚本 | 检查点 | 现在的结果 |
 |---|---|---|
 | `accept-smoke.ps1` | 主窗出现 / 悬浮窗在 / `WM_NCHITTEST`=HTCAPTION / 窗口 1200×860 / 内存 ≤120 MB / PrintWindow 抓得到 / 验收状态行 / 无 error / 8 秒内退出 | 10 项；`-Collector` 时多验"采集开着" |
-| `accept-floating.ps1` | 落点=配置 / 默认 104×46 / 拖完写回 `pos_x,pos_y` / 重启位置还在 / 存 4000 被夹回 1900 / 双击唤回收起的主窗 | 11 项 |
+| `accept-floating.ps1` | 落点=配置 / 默认 148×60 / 拖完写回 `pos_x,pos_y` / 重启位置还在 / 存 4000 被夹回 1900 / 双击唤回收起的主窗 | 11 项 |
 | `accept-theme.ps1` | 深色 16 张 + 浅色 16 张逐视图截图 / 设置页「主题」行当场切换 / 行内 `EDIT` 背景色随主题（取主色，浅色 246,249,255、深色 31,40,59） | 10 项 |
 | `accept-collect.ps1` | 点 5 下 → 今日 +5、速度 >0 / 暂停后不再涨、速度归 0 / 继续再 +5 / 退出 flush + 退出备份 / core 日志「数据库已关闭」 | 14 项 |
 | `accept-plugins.ps1` | 插件视图：`button.modal` 开弹窗、弹窗与正文的 Select 写回、提交/关闭触发插件动作、Esc 关弹窗 | 11 项 |

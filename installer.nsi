@@ -31,9 +31,9 @@ Unicode true
   !define DISTDIR "${__FILEDIR__}\dist\FocusFlow-${VERSION}"
 !endif
 
-!if /FILEEXISTS "${DISTDIR}\focusflow-native.exe"
+!if /FILEEXISTS "${DISTDIR}\FocusFlow.exe"
 !else
-  !error "Missing ${DISTDIR}\focusflow-native.exe - run build_native.bat first."
+  !error "Missing ${DISTDIR}\FocusFlow.exe - run build_native.bat first."
 !endif
 
 Name "${APPNAME} ${VERSION}"
@@ -61,9 +61,9 @@ Section "Install"
   File /r "${DISTDIR}\*.*"
   CreateDirectory "$INSTDIR\data"
 
-  CreateShortCut "$DESKTOP\FocusFlow.lnk" "$INSTDIR\focusflow-native.exe"
+  CreateShortCut "$DESKTOP\FocusFlow.lnk" "$INSTDIR\FocusFlow.exe"
   CreateDirectory "$SMPROGRAMS\FocusFlow"
-  CreateShortCut "$SMPROGRAMS\FocusFlow\FocusFlow.lnk" "$INSTDIR\focusflow-native.exe"
+  CreateShortCut "$SMPROGRAMS\FocusFlow\FocusFlow.lnk" "$INSTDIR\FocusFlow.exe"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   CreateShortCut "$SMPROGRAMS\FocusFlow\卸载.lnk" "$INSTDIR\uninstall.exe"
 
@@ -71,7 +71,7 @@ Section "Install"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FocusFlow" "DisplayName" "${APPNAME}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FocusFlow" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FocusFlow" "Publisher" "${PUBLISHER}"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FocusFlow" "DisplayIcon" "$INSTDIR\focusflow-native.exe"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FocusFlow" "DisplayIcon" "$INSTDIR\FocusFlow.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FocusFlow" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FocusFlow" "InstallLocation" "$INSTDIR"
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FocusFlow" "NoModify" 1

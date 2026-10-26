@@ -258,7 +258,10 @@ pub fn shutdown(cfg: &'static FocusFlowConfig) {
     rt.db.shutdown(cfg);
 }
 
-/// 旧版 Tauri 版还在跑吗？（`FocusFlow.exe` 是它打包后的进程名）
+/// 旧版 Tauri 版还在跑吗？（它和本端现在都叫 `FocusFlow.exe`）
+///
+/// 本端改名之后，按进程名扫会先扫到**自己**，所以必须跳过当前 PID；否则每次启动都报
+/// "旧版在跑"，那条红字与双计提示就全成了噪声。
 ///
 /// 只做**提示**不做拦截：同名进程也可能只是躺在任务栏里的旧版托盘。两个采集器各写一份
 /// 会让数字翻倍，所以这件事必须出现在日志与设置页里，而不是悄悄发生。
@@ -268,10 +271,12 @@ fn legacy_collector_running() -> bool {
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
+    use windows::Win32::System::Threading::GetCurrentProcessId;
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return false;
         };
+        let me = GetCurrentProcessId();
         let mut pe: PROCESSENTRY32W = std::mem::zeroed();
         pe.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         let mut found = false;
@@ -280,7 +285,7 @@ fn legacy_collector_running() -> bool {
                 let raw = &pe.szExeFile;
                 let end = raw.iter().position(|c| *c == 0).unwrap_or(raw.len());
                 let name = String::from_utf16_lossy(&raw[..end]);
-                if name.eq_ignore_ascii_case("FocusFlow.exe") {
+                if pe.th32ProcessID != me && name.eq_ignore_ascii_case("FocusFlow.exe") {
                     found = true;
                     break;
                 }

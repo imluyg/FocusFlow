@@ -60,11 +60,11 @@ dist/       打包输出（绿色版 + 安装包，不入库）
 # 全 workspace（core + cli + desktop-native）
 cargo build --release
 
-# 只构建桌面端 → target/release/focusflow-native.exe
+# 只构建桌面端 → target/release/FocusFlow.exe
 cargo build --release -p focusflow-native
 ```
 
-运行：直接双击 `focusflow-native.exe`。程序目录（exe 所在目录）放程序本体：
+运行：直接双击 `FocusFlow.exe`。程序目录（exe 所在目录）放程序本体：
 `config.ini`、`window_state.ini`、`plugins/`、`logs/`；
 数据放 `data/`（键鼠记录与各附属库）和 `backup/`，默认也在程序目录里 ——
 拷走整个文件夹即迁移。要把数据放到别处：设置页「数据目录 → 更改数据文件夹…」，

@@ -24,7 +24,7 @@ Stop-App
 $app = Join-Path $WorkDir 'app'
 New-AppDir $app @('[collector]', 'enabled = false')
 Set-ConfigLine $app 'gui' 'theme' 'dark'
-Remove-Item (Join-Path $WorkDir 'focusflow-native.log') -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $WorkDir 'focusflow.log') -ErrorAction SilentlyContinue
 
 $p = Start-App $Exe $app $WorkDir
 $h = Wait-Window $p.Id

@@ -38,7 +38,7 @@ pub struct Palette {
 }
 
 pub const LIGHT: Palette = Palette {
-    card: Color::rgba(255, 255, 255, 184), // rgba(255,255,255,.72)
+    card: Color::rgba(255, 255, 255, 232), // rgba(255,255,255,.91)
     border: Color::rgba(224, 233, 248, 242), // rgba(224,233,248,.95)
     fg: Color::rgba(26, 26, 46, 255),      // --fg #1A1A2E
     muted: Color::rgba(74, 74, 106, 255),  // --muted #4A4A6A
@@ -46,7 +46,7 @@ pub const LIGHT: Palette = Palette {
 };
 
 pub const DARK: Palette = Palette {
-    card: Color::rgba(30, 35, 49, 184),      // rgba(30,35,49,.72)
+    card: Color::rgba(30, 35, 49, 232),      // rgba(30,35,49,.91)
     border: Color::rgba(43, 50, 70, 242),    // rgba(43,50,70,.95)
     fg: Color::rgba(232, 234, 238, 255),     // --fg #E8EAEE
     muted: Color::rgba(138, 146, 166, 255),  // --muted #8A92A6
@@ -173,16 +173,23 @@ pub fn build_content(
 
 // ===== 版面 =====
 
-/// CSS 侧的固定量（逻辑像素）：`line-height: 1.35` × `font-size: 13px` ≈ 17.55 → 取 18；
-/// 卡片 `padding: 4px 8px`、圆角 8、边框 1、标签列 26、列间距 2。
-pub const PAD_X: i32 = 8;
-pub const PAD_Y: i32 = 4;
-pub const ROW_H: i32 = 18;
-pub const LABEL_W: i32 = 26;
-pub const GAP: i32 = 2;
-pub const RADIUS: i32 = 8;
+// 2026-10-27 重新排版：原来的 104×46 是照旧版「活跃 1,234 / 速度 45/分」量的，标签列只有
+// 26px、行高 18、字号 13，标签与值之间没有空隙 —— 四个汉字 + 五位数挤在一起，角落还是
+// 1bit 台阶。现在按「标签小、值大、右对齐」重排：字号 11/16、行高 21、左右各 14。
+pub const PAD_X: i32 = 14;
+pub const PAD_Y: i32 = 8;
+pub const ROW_H: i32 = 21;
+pub const LABEL_W: i32 = 30;
+pub const GAP: i32 = 8;
+pub const RADIUS: i32 = 12;
 pub const BORDER: i32 = 1;
-pub const FONT_PX: i32 = 13;
+/// 标签字号（Microsoft YaHei UI）。
+pub const LABEL_PX: i32 = 11;
+/// 值字号（Segoe UI Semibold）：数字与 `3h 30m` 都按这个口径。
+pub const VALUE_PX: i32 = 16;
+/// 卡片再窄就放不下「标签 + 五位数 + 两侧边距」。旧配置里存着 104 的按这个下限抬，
+/// 否则新字号下值会被省略号切掉。
+pub const MIN_W: i32 = 136;
 
 /// 内容需要的最小高度（逻辑像素）。
 ///
@@ -312,41 +319,43 @@ pub fn clamp_into_screen(x: f64, y: f64, b: &Bounds) -> (f64, f64) {
 //   a' = a_s + a_d·(1−a_s)，rgb' = rgb_s + rgb_d·(1−a_s)
 // 8 位定点下用 255 作分母，误差 ≤1/255，肉眼不可见，且能写成纯函数被测。
 
-/// 圆角矩形在某像素处的覆盖率（0 或 `alpha`）。四角 1bit 锯齿：
-/// 卡片只有 90×46，1px 圆角阶跃在缩放下看不出来，换来的是这条能单元测试。
-pub fn card_alpha_at(x: i32, y: i32, w: i32, h: i32, radius: i32, alpha: u8) -> u8 {
-    if x < 0 || y < 0 || x >= w || y >= h {
+/// 圆角矩形在某个像素上的覆盖率（4×4 超采样，255 = 完全在内部）。
+///
+/// 旧实现按"像素中心在不在圆内"给 0/alpha 两档，四个角是 1px 台阶；分层窗口没有系统圆角，
+/// 那圈台阶在浅色壁纸上很显眼。超采样只影响边缘那一圈像素，内部仍是 255。
+pub fn rounded_rect_coverage(x: i32, y: i32, w: i32, h: i32, radius: i32) -> u8 {
+    if w <= 0 || h <= 0 || x < 0 || y < 0 || x >= w || y >= h {
         return 0;
     }
-    let r = radius.clamp(0, (w / 2).min(h / 2));
-    if r == 0 {
-        return alpha;
+    let r = radius.clamp(0, (w / 2).min(h / 2)) as f64;
+    if r == 0.0 {
+        return 255;
     }
-    // 离"最近的角心"超出了多少（负数 = 根本不在那一条角带上）
-    let dx = if x < r {
-        r - 1 - x
-    } else if x >= w - r {
-        x - (w - r)
-    } else {
-        -1
-    };
-    let dy = if y < r {
-        r - 1 - y
-    } else if y >= h - r {
-        y - (h - r)
-    } else {
-        -1
-    };
-    if dx < 0 && dy < 0 {
-        return alpha; // 直边带里，圆角管不着
+    let fw = w as f64;
+    let fh = h as f64;
+    let mut hits = 0u32;
+    for sy in 0..4 {
+        for sx in 0..4 {
+            let px = x as f64 + (sx as f64 + 0.5) / 4.0;
+            let py = y as f64 + (sy as f64 + 0.5) / 4.0;
+            let cx = px.clamp(r, fw - r);
+            let cy = py.clamp(r, fh - r);
+            let dx = px - cx;
+            let dy = py - cy;
+            if dx * dx + dy * dy <= r * r {
+                hits += 1;
+            }
+        }
     }
-    let (ddx, ddy) = (dx.max(0) as i64, dy.max(0) as i64);
-    let rr = (r - 1) as i64;
-    if ddx * ddx + ddy * ddy <= rr * rr {
-        alpha
-    } else {
-        0
-    }
+    (hits * 255 / 16) as u8
+}
+
+/// 卡片（圆角矩形）在像素上的 alpha：覆盖率 × 卡片不透明度。
+/// 产品路径直接用 [`rounded_rect_coverage`] 分别算内层/边框，这里只留给版面测试。
+#[cfg(test)]
+pub fn card_alpha_at(x: i32, y: i32, w: i32, h: i32, radius: i32, alpha: u8) -> u8 {
+    let cov = rounded_rect_coverage(x, y, w, h, radius) as u16;
+    (cov * alpha as u16 / 255) as u8
 }
 
 /// 把一层纯色（非预乘）按覆盖率打进预乘缓冲。`idx` 是像素下标。
@@ -454,11 +463,11 @@ mod tests {
         assert_eq!(c.rows[1].value, "—");
     }
 
-    /// 卡片默认 90×46 —— 两行版面的高度必须**正好**等于配置默认值。
+    /// 卡片默认 148×60 —— 两行版面的高度必须**正好**等于配置默认值。
     #[test]
     fn two_row_layout_is_exactly_the_shipped_pill_height() {
-        assert_eq!(content_height(2), 46);
-        assert_eq!(content_height(3), 64, "metric=both 多一行");
+        assert_eq!(content_height(2), 60);
+        assert_eq!(content_height(3), 81, "metric=both 多一行");
     }
 
     #[test]
@@ -467,10 +476,11 @@ mod tests {
         assert_eq!(row_count(Metric::Duration), 2, "换口径不该多出一行");
         assert_eq!(row_count(Metric::Both), 3);
 
-        assert_eq!(pill_height(46.0, 2), 46, "默认配置正好容下两行");
-        assert_eq!(pill_height(46.0, 3), 64, "both 的第三行");
+        assert_eq!(pill_height(46.0, 2), 60, "旧的 46 现在低于内容需要值");
+        assert_eq!(pill_height(60.0, 2), 60, "默认配置正好容下两行");
+        assert_eq!(pill_height(60.0, 3), 81, "both 的第三行");
         assert_eq!(pill_height(200.0, 2), 200, "人把卡片调大时就照他的");
-        assert_eq!(pill_height(f64::NAN, 2), 46, "配置读不出来也要有能看见的高度");
+        assert_eq!(pill_height(f64::NAN, 2), 60, "配置读不出来也要有能看见的高度");
     }
 
     /// 长高之后卡片该待在哪：往下够就不动，不够就整张往上让，收回来时回到**锚点**。
@@ -490,36 +500,49 @@ mod tests {
 
     #[test]
     fn rows_stack_from_the_top_padding() {
-        let r = layout_rows(90, 1.0, 2);
+        let r = layout_rows(148, 1.0, 2);
         assert_eq!(
             r[0].label,
             Rect {
-                x: 8,
-                y: 4,
-                w: 26,
-                h: 18
+                x: 14,
+                y: 8,
+                w: 30,
+                h: 21
             }
         );
-        assert_eq!(r[1].label.y, 22);
-        assert_eq!(r[0].value.x, 36);
-        assert_eq!(r[0].value.w, 46, "90 - 36 - 8");
+        assert_eq!(r[1].label.y, 29);
+        assert_eq!(r[0].value.x, 52);
+        assert_eq!(r[0].value.w, 82, "148 - 52 - 14");
 
-        let scaled = layout_rows(135, 1.5, 2);
-        assert_eq!(scaled[0].label.x, 12, "8 × 1.5");
-        assert_eq!(scaled[0].label.h, 27, "18 × 1.5");
+        let scaled = layout_rows(222, 1.5, 2);
+        assert_eq!(scaled[0].label.x, 21, "14 × 1.5");
+        assert_eq!(scaled[0].label.h, 32, "21 × 1.5 四舍五入");
     }
 
     #[test]
     fn corners_are_transparent_and_the_middle_is_solid() {
-        let a = |x, y| card_alpha_at(x, y, 90, 46, 8, 184);
+        let a = |x, y| card_alpha_at(x, y, 148, 60, 12, 184);
         assert_eq!(a(0, 0), 0, "左上角在圆外");
         assert_eq!(a(1, 1), 0, "贴着角的像素也要真透明");
-        assert_eq!(a(45, 23), 184, "正中");
-        assert_eq!(a(3, 3), 184, "半径 7 之内");
-        assert_eq!(a(89, 45), 0, "右下角同样");
-        assert_eq!(a(45, 0), 184, "上边正中不受圆角影响");
+        assert_eq!(a(74, 30), 184, "正中");
+        assert_eq!(a(5, 5), 184, "半径之内");
+        assert_eq!(a(147, 59), 0, "右下角同样");
+        assert_eq!(a(74, 0), 184, "上边正中不受圆角影响");
         assert_eq!(a(-1, 5), 0, "窗口外");
-        assert_eq!(card_alpha_at(0, 0, 90, 46, 0, 184), 184, "半径 0 = 直角");
+        assert_eq!(card_alpha_at(0, 0, 148, 60, 0, 184), 184, "半径 0 = 直角");
+    }
+
+    /// 角上的过渡像素必须是**部分** alpha：0/满两档就是旧版的 1px 台阶。
+    #[test]
+    fn rounded_corners_have_partial_coverage_instead_of_a_hard_step() {
+        let partial = (0..12)
+            .flat_map(|y| (0..12).map(move |x| (x, y)))
+            .map(|(x, y)| rounded_rect_coverage(x, y, 148, 60, 12))
+            .filter(|c| *c > 0 && *c < 255)
+            .count();
+        assert!(partial >= 4, "角上至少要有一圈部分覆盖的像素，实得 {partial}");
+        assert_eq!(rounded_rect_coverage(74, 30, 148, 60, 12), 255);
+        assert_eq!(rounded_rect_coverage(0, 0, 148, 60, 12), 0);
     }
 
     #[test]
@@ -547,7 +570,7 @@ mod tests {
         let mut mask = vec![0u8; 8];
         mask[6] = 255; // 第二个像素的 R 通道：满覆盖
         overlay_text_coverage(&mut buf, &mask, LIGHT.fg);
-        assert_eq!(buf[3], 184, "没字的地方仍是卡片的 .72");
+        assert_eq!(buf[3], 232, "没字的地方仍是卡片的 .91");
         assert_eq!(buf[7], 255, "满覆盖的字完全不透明");
         assert_eq!(buf[6], 26, "字色 r=26 预乘 255 不变");
     }

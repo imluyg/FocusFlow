@@ -25,7 +25,7 @@ $collectorOn = if ($Collector) { 'true' } else { 'false' }
 Stop-App
 $app = Join-Path $WorkDir 'app'
 New-AppDir $app @('[collector]', "enabled = $collectorOn")
-Remove-Item (Join-Path $WorkDir 'focusflow-native.log') -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $WorkDir 'focusflow.log') -ErrorAction SilentlyContinue
 "exe : $Exe"
 "app : $app"
 

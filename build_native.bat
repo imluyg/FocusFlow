@@ -36,7 +36,7 @@ mkdir "%DIST%"
 mkdir "%DIST%\plugins"
 mkdir "%DIST%\data"
 mkdir "%DIST%\assets"
-copy /y "%ROOT%target\release\focusflow-native.exe" "%DIST%\focusflow-native.exe" >nul
+copy /y "%ROOT%target\release\FocusFlow.exe" "%DIST%\FocusFlow.exe" >nul
 if exist "%ROOT%desktop-native\assets\*" copy /y "%ROOT%desktop-native\assets\*" "%DIST%\assets\" >nul
 if exist "%ROOT%config.ini" copy /y "%ROOT%config.ini" "%DIST%\config.ini" >nul
 copy /y "%ROOT%crates\core\plugins\*.lua" "%DIST%\plugins\" >nul
@@ -73,7 +73,7 @@ echo.
 echo Portable folder: %DIST%
 echo Portable zip   : %ZIP%
 if exist "%SETUP%" echo Installer     : %SETUP%
-echo Run            : %DIST%\focusflow-native.exe
+echo Run            : %DIST%\FocusFlow.exe
 goto :eof
 
 :err

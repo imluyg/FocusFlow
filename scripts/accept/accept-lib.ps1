@@ -8,7 +8,7 @@
 #     . "$PSScriptRoot\accept-lib.ps1"
 #
 # Conventions:
-#   * the exe defaults to <repo>\target\release\focusflow-native.exe (override with -Exe)
+#   * the exe defaults to <repo>\target\release\FocusFlow.exe (override with -Exe)
 #   * every harness works on a COPY of desktop-native\probe (never the real app dir)
 #   * results are printed as PASS/FAIL lines; the harness exits 1 if anything failed
 
@@ -125,7 +125,7 @@ $script:RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 function Get-RepoRoot { $script:RepoRoot }
 
 function Get-DefaultExe {
-    Join-Path $script:RepoRoot 'target\release\focusflow-native.exe'
+    Join-Path $script:RepoRoot 'target\release\FocusFlow.exe'
 }
 
 # The app writes Chinese log lines, but this folder must stay ASCII-only (see the header).
@@ -152,8 +152,15 @@ function Show-Summary {
     if ($bad -gt 0) { exit 1 }
 }
 
-function Stop-App {
-    Get-Process focusflow-native -ErrorAction SilentlyContinue | Stop-Process -Force
+# Kill only the process started from the given exe path.
+# The old Tauri app is also called FocusFlow.exe (it may sit in the tray on this machine),
+# so killing by process name would take the user's legacy app down with us.
+function Stop-App([string]$Exe = '') {
+    if (-not $Exe) { $Exe = Get-DefaultExe }
+    $full = [IO.Path]::GetFullPath($Exe)
+    Get-Process -Name FocusFlow,focusflow-native -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -eq $full) } |
+        Stop-Process -Force
     Start-Sleep -Milliseconds 350
 }
 
@@ -245,7 +252,7 @@ function Get-Memory([Diagnostics.Process]$Proc) {
 }
 
 function Read-AppLog([string]$WorkDir) {
-    $p = Join-Path $WorkDir 'focusflow-native.log'
+    $p = Join-Path $WorkDir 'focusflow.log'
     if (Test-Path $p) { Get-Content $p -Encoding UTF8 } else { @() }
 }
 

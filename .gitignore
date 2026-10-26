@@ -42,4 +42,4 @@ AGENTS.md
 docs/
 
 # 原生端的运行日志（在仓库根跑 exe 时会写到这里）
-/focusflow-native.log
+/focusflow.log

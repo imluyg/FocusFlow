@@ -3,7 +3,7 @@
 /probe/
 /target/
 /*.png
-focusflow-native.log
+focusflow.log
 
 # 验收跑批的临时 app 目录（数据 + 截图）
 /accept/

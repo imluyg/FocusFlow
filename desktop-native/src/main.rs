@@ -6556,7 +6556,7 @@ fn tracing_note(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("focusflow-native.log")
+        .open("focusflow.log")
     {
         let _ = writeln!(f, "{msg}");
     }

@@ -4,6 +4,13 @@ version = "0.5.0"
 edition = "2021"
 publish = false
 license = "MIT"
+# 用户看到的可执行文件名是产品名 `FocusFlow.exe`；包名仍是 focusflow-native（测试/构建用）。
+# autobins=false：否则 src/main.rs 会被自动再发现一次，同一份代码产出两个二进制。
+autobins = false
+
+[[bin]]
+name = "FocusFlow"
+path = "src/main.rs"
 
 [dependencies]
 # 不加任何 UI 框架：窗口、控件、文字、图表全部走 Windows 自己的绘制栈。

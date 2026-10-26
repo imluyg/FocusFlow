@@ -30,7 +30,7 @@ $dst = Join-Path $app 'plugins'
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 Copy-Item (Join-Path (Get-RepoRoot) 'plugins\*.lua') $dst -Force
 Copy-Item (Join-Path (Get-RepoRoot) 'desktop-native\probe\plugins\*.lua') $dst -Force
-Remove-Item (Join-Path $WorkDir 'focusflow-native.log') -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $WorkDir 'focusflow.log') -ErrorAction SilentlyContinue
 "exe : $Exe"
 "app : $app"
 
