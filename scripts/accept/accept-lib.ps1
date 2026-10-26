@@ -313,12 +313,18 @@ function Get-Status([string]$WorkDir) {
     }
 }
 
-# Wait until a status line newer than the call appears (or the timeout passes).
+# Wait until a status line NEWER than the call appears (or the timeout passes).
+#
+# The app writes one status line per second, so a caller that sleeps less than a second
+# after an action (pause / resume is 900 ms) would otherwise read the line written BEFORE
+# that action and conclude it did not happen. Count the lines already there, then wait for
+# one more -- the previous version returned any line, stale or not.
 function Wait-Status([string]$WorkDir, [int]$TimeoutMs = 6000) {
+    $seen = @(Read-AppLog $WorkDir | Select-String -Pattern 'today=').Count
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while ($sw.Elapsed.TotalMilliseconds -lt $TimeoutMs) {
-        $s = Get-Status $WorkDir
-        if ($s) { return $s }
+        $lines = @(Read-AppLog $WorkDir | Select-String -Pattern 'today=')
+        if ($lines.Count -gt $seen) { return Get-Status $WorkDir }
         Start-Sleep -Milliseconds 200
     }
     $null
