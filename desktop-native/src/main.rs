@@ -47,7 +47,8 @@ use windows::Win32::Graphics::Gdi::{
     InvalidateRect, LineTo, MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkColor, SetBkMode,
     SetDIBits, SetDIBitsToDevice, SetTextColor, TextOutW, UpdateWindow, BI_RGB, BITMAPINFO,
     BITMAPINFOHEADER, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DIB_RGB_COLORS, FW_NORMAL, HBRUSH, HDC, HFONT, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+    DIB_RGB_COLORS, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, NULL_BRUSH, OUT_DEFAULT_PRECIS,
+    PAINTSTRUCT,
     PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::DataExchange::{
@@ -114,6 +115,11 @@ fn color_a(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
     c
 }
 
+/// `COLORREF` 是 `0x00BBGGRR`（与网页里的 RRGGBB 反着）—— GDI 那几个入口只收这个。
+fn rgb_ref(r: u8, g: u8, b: u8) -> u32 {
+    ((b as u32) << 16) | ((g as u32) << 8) | r as u32
+}
+
 fn rect(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
     D2D_RECT_F {
         left: x,
@@ -125,6 +131,151 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
 
 fn hit(r: D2D_RECT_F, x: f32, y: f32) -> bool {
     x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+}
+
+// ===== 主题令牌 =====
+//
+// 两套颜色，逐项照抄旧 `desktop/ui/tokens.css`：`:root` 是浅色、`body.dark` 是深色；
+// `body.glass` / `body.glass.dark` 只把**页面底 / 卡片底 / 标题栏底 / 边框**改成半透明，
+// 文字与强调色不随档变。
+// 切换只认 `[gui] theme`：`dark` 走深色，其余（含读不到）一律浅色 —— 与旧版默认一致。
+
+/// 一套主题的颜色。
+#[derive(Clone, Copy)]
+pub struct Theme {
+    pub card: D2D1_COLOR_F,
+    pub header: D2D1_COLOR_F,
+    pub border: D2D1_COLOR_F,
+    pub fg: D2D1_COLOR_F,
+    pub muted: D2D1_COLOR_F,
+    pub accent: D2D1_COLOR_F,
+    pub accent_soft: D2D1_COLOR_F,
+    pub grid: D2D1_COLOR_F,
+    pub white: D2D1_COLOR_F,
+    /// 达标/周末用的绿色。
+    pub success: D2D1_COLOR_F,
+    /// 危险/失败用的红色（插件加载失败、开机自启没生效）。
+    pub danger: D2D1_COLOR_F,
+    /// 弹窗底色：**始终不透明**。玻璃模式下 `card` 是半透明的，
+    /// 拿它当弹窗底会把下面的表格文字透出来（tokens.css 的 `--modal-bg` 就是为这个单开的）。
+    pub modal: D2D1_COLOR_F,
+    /// 模态遮罩：压在整屏上的半透明层。
+    pub overlay: D2D1_COLOR_F,
+    /// 页面底色（清屏色）。
+    pub page: D2D1_COLOR_F,
+    /// 原生 EDIT 的底色与文字色：EDIT 不认 D2D，只能单独喂给 `WM_CTLCOLOREDIT`。
+    pub edit_bg: (u8, u8, u8),
+    pub edit_fg: (u8, u8, u8),
+}
+
+/// 一个主题的两档：玻璃（Mica 可用）与不透明（材质不可用）。
+pub struct Tokens {
+    pub dark: bool,
+    pub glass: Theme,
+    pub solid: Theme,
+}
+
+impl Tokens {
+    pub fn pick(&self, glass: bool) -> &Theme {
+        if glass {
+            &self.glass
+        } else {
+            &self.solid
+        }
+    }
+}
+
+fn light_theme(glass: bool) -> Theme {
+    let (page, card, header, border) = if glass {
+        (
+            color_a(0xF7, 0xFA, 0xFE, 0.86),
+            color_a(0xFF, 0xFF, 0xFF, 0.62),
+            color_a(0xF1, 0xF5, 0xFB, 0.72),
+            color(0xE5, 0xEC, 0xF8),
+        )
+    } else {
+        (
+            color(0xF7, 0xFA, 0xFE),
+            color(0xFF, 0xFF, 0xFF),
+            color(0xF1, 0xF5, 0xFB),
+            color(0xE5, 0xEC, 0xF8),
+        )
+    };
+    Theme {
+        card,
+        header,
+        border,
+        fg: color(0x1A, 0x1A, 0x2E),
+        muted: color(0x4A, 0x4A, 0x6A),
+        accent: color(0x4D, 0x8C, 0xF7),
+        accent_soft: color(0xE8, 0xF0, 0xFE),
+        grid: color(0xE3, 0xEA, 0xF6),
+        white: color(0xFF, 0xFF, 0xFF),
+        success: color(0x10, 0xB9, 0x81),
+        danger: color(0xE5, 0x48, 0x4D),
+        modal: color(0xFF, 0xFF, 0xFF),
+        overlay: color_a(0x18, 0x28, 0x50, 0.35),
+        page,
+        edit_bg: (0xFF, 0xFF, 0xFF),
+        edit_fg: (0x1A, 0x1A, 0x2E),
+    }
+}
+
+fn dark_theme(glass: bool) -> Theme {
+    let (page, card, header, border) = if glass {
+        (
+            // 深色玻璃这一档沿用 §10b 调过的 0.86：壁纸只淡淡透出，界面仍是深色。
+            color_a(0x10, 0x13, 0x1C, 0.86),
+            color_a(0x1E, 0x23, 0x31, 0.55),
+            color_a(0x23, 0x2A, 0x3C, 0.70),
+            color_a(0x2A, 0x30, 0x42, 0.90),
+        )
+    } else {
+        (
+            color(0x10, 0x13, 0x1C),
+            color(0x1E, 0x23, 0x31),
+            color(0x23, 0x2A, 0x3C),
+            color(0x2A, 0x30, 0x42),
+        )
+    };
+    Theme {
+        card,
+        header,
+        border,
+        fg: color(0xE8, 0xEA, 0xEE),
+        muted: color(0x8A, 0x92, 0xA6),
+        accent: color(0x5B, 0x9C, 0xF7),
+        accent_soft: color_a(0x22, 0x30, 0x4A, 0.95),
+        grid: color(0x2E, 0x35, 0x48),
+        white: color(0xFF, 0xFF, 0xFF),
+        success: color(0x34, 0xD3, 0x99),
+        danger: color(0xF8, 0x71, 0x71),
+        modal: color(0x1E, 0x23, 0x31),
+        overlay: color_a(0x05, 0x07, 0x0B, 0.55),
+        page,
+        edit_bg: (0x1E, 0x23, 0x31),
+        edit_fg: (0xE8, 0xEA, 0xEE),
+    }
+}
+
+pub fn tokens_for(name: &str) -> Tokens {
+    let dark = name.trim() == "dark";
+    let (solid, glass) = if dark {
+        (dark_theme(false), dark_theme(true))
+    } else {
+        (light_theme(false), light_theme(true))
+    };
+    Tokens { dark, solid, glass }
+}
+
+/// 现在配置说的是哪一套（`[gui] theme`）。
+pub fn theme_name() -> String {
+    focusflow_core::config::instance().get("gui", "theme")
+}
+
+/// 同色换一个 alpha（图表柱/热力块按强度叠色要用）。
+fn with_alpha(c: D2D1_COLOR_F, a: f32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F { a, ..c }
 }
 
 // ===== 绘制资源 =====
@@ -144,40 +295,29 @@ success: ID2D1SolidColorBrush,
     /// 弹窗底色�?*始终不透明**。玻璃模式下 `card` 是半透明的，
     /// 拿它当弹窗底会把下面的表格文字透出来（tokens.css �?--modal-bg 就是为这个单开的）。
 modal: ID2D1SolidColorBrush,
-    /// 模态遮罩：半透明黑，压在整屏上。
-overlay: ID2D1SolidColorBrush,
+    /// 危险/失败用的红色（插件加载失败、开机自启没生效）。
+    danger: ID2D1SolidColorBrush,
+    /// 模态遮罩：压在整屏上的半透明层。
+    overlay: ID2D1SolidColorBrush,
 }
 
 impl Brushes {
-    fn new(rt: &ID2D1RenderTarget, glass: bool) -> windows::core::Result<Self> {
+    fn new(rt: &ID2D1RenderTarget, t: &Theme) -> windows::core::Result<Self> {
         let mk = |c: D2D1_COLOR_F| unsafe { rt.CreateSolidColorBrush(&c, None) };
-        // 玻璃模式下卡片半透明（对。
-let (card, header, border) = if glass {
-            (
-                color_a(0x1E, 0x23, 0x31, 0.55),
-                color_a(0x23, 0x2A, 0x3C, 0.70),
-                color_a(0x2A, 0x30, 0x42, 0.90),
-            )
-        } else {
-            (
-                color(0x1E, 0x23, 0x31),
-                color(0x23, 0x2A, 0x3C),
-                color(0x2A, 0x30, 0x42),
-            )
-        };
         Ok(Self {
-            card: mk(card)?,
-            header: mk(header)?,
-            border: mk(border)?,
-            fg: mk(color(0xE8, 0xEA, 0xEE))?,
-            muted: mk(color(0x8A, 0x92, 0xA6))?,
-            accent: mk(color(0x5B, 0x9C, 0xF7))?,
-            accent_soft: mk(color_a(0x22, 0x30, 0x4A, 0.95))?,
-            grid: mk(color(0x2E, 0x35, 0x48))?,
-            white: mk(color(0xFF, 0xFF, 0xFF))?,
-            success: mk(color(0x34, 0xD3, 0x99))?,
-            modal: mk(color(0x1E, 0x23, 0x31))?,
-            overlay: mk(color_a(0x05, 0x07, 0x0B, 0.55))?,
+            card: mk(t.card)?,
+            header: mk(t.header)?,
+            border: mk(t.border)?,
+            fg: mk(t.fg)?,
+            muted: mk(t.muted)?,
+            accent: mk(t.accent)?,
+            accent_soft: mk(t.accent_soft)?,
+            grid: mk(t.grid)?,
+            white: mk(t.white)?,
+            success: mk(t.success)?,
+            danger: mk(t.danger)?,
+            modal: mk(t.modal)?,
+            overlay: mk(t.overlay)?,
         })
     }
 }
@@ -441,6 +581,8 @@ struct App {
     dwrite: IDWriteFactory,
     target: Option<Target>,
     br: Option<Brushes>,
+    /// 现有的 `br` 是按哪套主题、哪个玻璃档建的：`[gui] theme` 一改就要重建。
+    br_pick: Option<(String, bool)>,
     fmt: Formats,
     snap: Arc<Mutex<Snapshot>>,
     tray: Option<TrayIcon>,
@@ -501,6 +643,9 @@ edit: Option<HWND>,
     edit_row: Option<usize>,
     ui_font: HFONT,
     edit_bg: HBRUSH,
+    /// EDIT 的文字色与底色（`WM_CTLCOLOREDIT` 用）。跟着主题走，与 `edit_bg` 同一份。
+    edit_fg: COLORREF,
+    edit_bg_color: COLORREF,
 }
 
 impl App {
@@ -564,7 +709,15 @@ let dpi = GetDpiForWindow(hwnd) as f32;
                 DEFAULT_PITCH.0 as u32,
                 w!("Microsoft YaHei UI"),
             );
-            let edit_bg = CreateSolidBrush(COLORREF(0x0031_231E));
+            // EDIT 的字体与颜色：EDIT 不认 D2D 主题，只能单独喂。
+            // 颜色取当前主题的那一档（主题在设置页里一改，`ensure_brushes` 会重建这把刷子）。
+            let boot_tokens = tokens_for(&theme_name());
+            let boot_pal = boot_tokens.pick(true);
+            let (bg_r, bg_g, bg_b) = boot_pal.edit_bg;
+            let (fg_r, fg_g, fg_b) = boot_pal.edit_fg;
+            let edit_bg_color = COLORREF(rgb_ref(bg_r, bg_g, bg_b));
+            let edit_fg = COLORREF(rgb_ref(fg_r, fg_g, fg_b));
+            let edit_bg = CreateSolidBrush(edit_bg_color);
 
             let s = Arc::clone(&snap);
             let p = Arc::clone(&period);
@@ -589,6 +742,7 @@ let dpi = GetDpiForWindow(hwnd) as f32;
                 dwrite,
                 target: None,
                 br: None,
+                br_pick: None,
                 fmt,
                 snap,
                 tray,
@@ -623,6 +777,8 @@ let dpi = GetDpiForWindow(hwnd) as f32;
                 edit_row: None,
                 ui_font,
                 edit_bg,
+                edit_fg,
+                edit_bg_color,
             })
         }
     }
@@ -657,15 +813,46 @@ fn ensure_target(&mut self, hwnd: HWND) {
             return;
         };
         self.glass = self.mica && comp_ok;
-        match Brushes::new(&t.rt, self.glass) {
+        // 画笔等下一帧按主题建（`ensure_brushes`）：主题名与玻璃档都在那里对账。
+        self.br = None;
+        self.br_pick = None;
+        tracing_note(&format!(
+            "渲染目标就绪：{}，glass={}",
+            if comp_ok { "DComp" } else { "Hwnd" },
+            self.glass
+        ));
+        self.target = Some(t);
+    }
+
+    /// 画笔按当前主题建；主题或玻璃档变了就重建一次（设置页里改主题当下生效）。
+    fn ensure_brushes(&mut self, name: &str) {
+        let stale = self.br.is_none()
+            || self
+                .br_pick
+                .as_ref()
+                .map(|(n, g)| n != name || *g != self.glass)
+                .unwrap_or(true);
+        if !stale {
+            return;
+        }
+        let Some(t) = self.target.as_ref() else { return };
+        let tokens = tokens_for(name);
+        let pal = tokens.pick(self.glass);
+        match Brushes::new(&t.rt, pal) {
             Ok(br) => {
-                tracing_note(&format!(
-                    "渲染目标就绪：{}，glass={}",
-                    if comp_ok { "DComp" } else { "Hwnd" },
-                    self.glass
-                ));
                 self.br = Some(br);
-                self.target = Some(t);
+                self.br_pick = Some((name.to_string(), self.glass));
+                // EDIT 的底色/文字色跟着同一套令牌走：它不吃 D2D，只能重建 GDI 刷子。
+                let (bg_r, bg_g, bg_b) = pal.edit_bg;
+                let (fg_r, fg_g, fg_b) = pal.edit_fg;
+                if !self.edit_bg.is_invalid() {
+                    unsafe {
+                        let _ = DeleteObject(HGDIOBJ(self.edit_bg.0));
+                    }
+                }
+                self.edit_bg_color = COLORREF(rgb_ref(bg_r, bg_g, bg_b));
+                self.edit_fg = COLORREF(rgb_ref(fg_r, fg_g, fg_b));
+                self.edit_bg = unsafe { CreateSolidBrush(self.edit_bg_color) };
             }
             Err(e) => tracing_note(&format!("画刷创建失败：{e}")),
         }
@@ -674,22 +861,23 @@ fn ensure_target(&mut self, hwnd: HWND) {
     fn drop_target(&mut self) {
         self.target = None;
         self.br = None;
+        self.br_pick = None;
         self.glass = false;
     }
 
     fn draw(&mut self, hwnd: HWND) {
         self.ensure_target(hwnd);
+        let name = theme_name();
+        self.ensure_brushes(&name);
+        let tokens = tokens_for(&name);
+        let pal = tokens.pick(self.glass);
         let Some(t) = self.target.as_ref() else { return };
         let Some(br) = self.br.as_ref() else { return };
         let snap = self.snap.lock().map(|s| s.clone()).unwrap_or_default();
 
         let size = unsafe { t.rt.GetSize() };
-        // 玻璃模式：先压一层半透明深色（对。
-let clear = if self.glass {
-            color_a(0x10, 0x13, 0x1C, 0.86)
-        } else {
-            color(0x10, 0x13, 0x1C)
-        };
+        // 页面底就是主题里的 `--page-bottom`：玻璃档带 alpha，让 Mica 的壁纸透出来。
+        let clear = pal.page;
         unsafe {
             t.rt.BeginDraw();
             t.rt.Clear(Some(&clear));
@@ -699,6 +887,7 @@ let clear = if self.glass {
                 rt: &t.rt,
                 br,
                 fmt: &self.fmt,
+                pal,
             };
             let vs = ViewState {
                 view: self.view,
@@ -711,6 +900,7 @@ let clear = if self.glass {
                 heat_hover: self.heat_hover,
                 hotkey_on: self.hotkey_hk.is_some(),
                 floating_on: floating::is_visible(),
+                dark: tokens.dark,
             };
             let pv = self.plugin_open.as_ref().and_then(|name| {
                 self.pm
@@ -1071,6 +1261,7 @@ let y0 = g.list_top + vis as f32 * g.row_h;
                                 let _ = InvalidateRect(Some(hwnd), None, false);
                             }
                         }
+                        SItem::Basic(Basic::Theme) => toggle_theme(hwnd),
                         SItem::Basic(Basic::DataDir) => self.open_data_dir(),
                         SItem::Setting(i) => {
                             let kind = self
@@ -1924,6 +2115,8 @@ struct P<'a> {
     rt: &'a ID2D1RenderTarget,
     br: &'a Brushes,
     fmt: &'a Formats,
+    /// 当前主题的原始颜色：图表柱/热力块要按强度现调 alpha，画笔里没有这一档。
+    pal: &'a Theme,
 }
 
 impl P<'_> {
@@ -1931,6 +2124,11 @@ impl P<'_> {
         unsafe {
             let _ = self.rt.FillRectangle(&r, b);
         }
+    }
+
+    /// 现调一支笔（图表柱、热力块要按强度改 alpha）。建失败就当这一块不画，不 panic。
+    fn brush(&self, c: D2D1_COLOR_F) -> Option<ID2D1SolidColorBrush> {
+        unsafe { self.rt.CreateSolidColorBrush(&c, None).ok() }
     }
 
     fn round(
@@ -2003,6 +2201,7 @@ enum Basic {
     Autostart,
     Hotkey,
     Floating,
+    Theme,
     DataDir,
 }
 
@@ -2011,6 +2210,7 @@ fn basic_label(b: Basic) -> &'static str {
         Basic::Autostart => "开机自启",
         Basic::Hotkey => "全局热键",
         Basic::Floating => "悬浮窗",
+        Basic::Theme => "主题",
         Basic::DataDir => "数据目录",
     }
 }
@@ -2023,6 +2223,7 @@ fn settings_items(snap: &Snapshot, filter: &str) -> Vec<SItem> {
         Basic::Autostart,
         Basic::Hotkey,
         Basic::Floating,
+        Basic::Theme,
         Basic::DataDir,
     ] {
         if f.is_empty() || basic_label(b).contains(&f) {
@@ -2229,6 +2430,22 @@ let sbox = search_box_rect(w);
                         );
                         p.text(
                             "拖到哪记哪；双击卡片叫回主窗口（[floating] 段）",
+                            rect(vb.right + 12.0, y + 5.0, 420.0, 18.0),
+                            &p.fmt.small,
+                            &p.br.muted,
+                        );
+                    }
+                    Basic::Theme => {
+                        let dark = vs.dark;
+                        p.round(vb, 6.0, if dark { &p.br.header } else { &p.br.accent }, Some(&p.br.border));
+                        p.text(
+                            if dark { "深色" } else { "浅色" },
+                            vb,
+                            &p.fmt.center_small,
+                            &p.br.fg,
+                        );
+                        p.text(
+                            "点一下切换；配色照 tokens.css 的两套令牌（[gui] theme）",
                             rect(vb.right + 12.0, y + 5.0, 420.0, 18.0),
                             &p.fmt.small,
                             &p.br.muted,
@@ -2466,7 +2683,7 @@ let ty = dialog.bottom - 74.0;
     for (i, (_, v)) in d.trend.iter().enumerate() {
         let hh = (*v as f32 / max) * plot_height(plot);
         let bx = plot.left + i as f32 * (bw + 2.0);
-        if let Ok(b) = unsafe { p.rt.CreateSolidColorBrush(&color(0x5B, 0x9C, 0xF7), None) } {
+        if let Some(b) = p.brush(p.pal.accent) {
             p.round(rect(bx, plot.bottom - hh, bw, hh), 1.0, &b, None);
         }
     }
@@ -2504,6 +2721,8 @@ hotkey_on: bool,
     /// 悬浮窗此刻是否真的显示着（同上：读运行时状态，不读配置键 ——
     /// 手改 `[floating] enabled` 并不会让卡片出现或消失）。
     floating_on: bool,
+    /// 当前主题是不是深色（设置页那一行显示"深色/浅色"）。
+    dark: bool,
 }
 
 /// 左表格卡片的矩形：画图与命中测试共用。
@@ -2885,14 +3104,9 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         let hh = (v / max) * plot_height(plot);
         let x = plot.left + i as f32 * (bw + gap);
         let bar = rect(x, plot.bottom - hh, bw, hh);
-        let color = if i >= 5 { 0x34D399u32 } else { 0x5B9C_F7 };
-        let c = color_a(
-            ((color >> 16) & 0xFF) as u8,
-            ((color >> 8) & 0xFF) as u8,
-            (color & 0xFF) as u8,
-            0.85,
-        );
-        if let Ok(b) = unsafe { p.rt.CreateSolidColorBrush(&c, None) } {
+        // 周末用绿色、工作日用强调色 —— 两套主题里都是这两个令牌。
+        let base_c = if i >= 5 { p.pal.success } else { p.pal.accent };
+        if let Some(b) = p.brush(with_alpha(base_c, 0.85)) {
             p.round(bar, 4.0, &b, None);
         }
         p.text(
@@ -3125,9 +3339,7 @@ let mut counts: HashMap<&str, i64> = HashMap::new();
         p.round(base, 3.0, &p.br.card, Some(&p.br.grid));
         if count > 0 {
             let heat = 0.06 + 0.8 * (count as f32 / max).min(1.0);
-            if let Ok(b) =
-                unsafe { p.rt.CreateSolidColorBrush(&color_a(0x5B, 0x9C, 0xF7, heat), None) }
-            {
+            if let Some(b) = p.brush(with_alpha(p.pal.accent, heat)) {
                 p.round(base, 3.0, &b, None);
             }
         }
@@ -3158,9 +3370,7 @@ let fmt = if base.right - base.left < 34.0 {
     );
     for i in 0..5 {
         let t = i as f32 / 4.0;
-        if let Ok(b) =
-            unsafe { p.rt.CreateSolidColorBrush(&color_a(0x5B, 0x9C, 0xF7, 0.06 + 0.8 * t), None) }
-        {
+        if let Some(b) = p.brush(with_alpha(p.pal.accent, 0.06 + 0.8 * t)) {
             p.round(
                 rect(r.left + 54.0 + i as f32 * 18.0, ly + 4.0, 14.0, 14.0),
                 3.0,
@@ -4593,19 +4803,17 @@ fn draw_plugins(
     );
 
     if let Some(e) = err {
-        if let Ok(b) = unsafe { p.rt.CreateSolidColorBrush(&color(0xF8, 0x71, 0x71), None) } {
-            p.text(
-                &format!("插件目录读不出来：{e}"),
-                rect(
-                    card.left + 16.0,
-                    card.top + 36.0,
-                    card.right - card.left - 32.0,
-                    18.0,
-                ),
-                &p.fmt.small,
-                &b,
-            );
-        }
+        p.text(
+            &format!("插件目录读不出来：{e}"),
+            rect(
+                card.left + 16.0,
+                card.top + 36.0,
+                card.right - card.left - 32.0,
+                18.0,
+            ),
+            &p.fmt.small,
+            &p.br.danger,
+        );
         return;
     }
 
@@ -4666,16 +4874,12 @@ fn draw_plugins(
         // 第二行：加载失败说失败原因，否则说它是什。
 match &row.error {
             Some(e) => {
-                if let Ok(b) =
-                    unsafe { p.rt.CreateSolidColorBrush(&color(0xF8, 0x71, 0x71), None) }
-                {
-                    p.text(
-                        &format!("加载失败：{}", one_line(e, 72)),
-                        rect(r.left + 8.0, y + 23.0, r.right - r.left - 92.0, 16.0),
-                        &p.fmt.small,
-                        &b,
-                    );
-                }
+                p.text(
+                    &format!("加载失败：{}", one_line(e, 72)),
+                    rect(r.left + 8.0, y + 23.0, r.right - r.left - 92.0, 16.0),
+                    &p.fmt.small,
+                    &p.br.danger,
+                );
             }
             None => {
                 // 启用了却没加载上（还没轮到、或加载被静默跳过）要说出来。
@@ -5338,7 +5542,7 @@ fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         let hp = (*v as f32 / max) * plot_height(plot);
         let x = plot.left + i as f32 * (bw + gap);
         let bar = rect(x, plot.bottom - hp, bw, hp);
-        if let Ok(b) = unsafe { p.rt.CreateSolidColorBrush(&color(0x5B, 0x9C, 0xF7), None) } {
+        if let Some(b) = p.brush(p.pal.accent) {
             p.round(bar, 2.0, &b, None);
         }
     }
@@ -5568,6 +5772,27 @@ fn toggle_floating(main: HWND, want: Option<bool>) -> bool {
     visible
 }
 
+/// 深色 / 浅色切换（设置页那一行）。写 `[gui] theme`，当下重画，悬浮窗也立刻换色。
+fn toggle_theme(hwnd: HWND) {
+    let next = if theme_name().trim() == "dark" {
+        "light"
+    } else {
+        "dark"
+    };
+    let cfg = focusflow_core::config::instance();
+    match cfg.set("gui", "theme", next) {
+        Ok(()) => tracing_note(&format!("主题已切换：{next}")),
+        Err(e) => tracing_note(&format!("主题写入失败：{e}")),
+    }
+    // 标题栏是非客户区，不归 D2D 管：深浅得单独告诉 DWM 一次。
+    apply_title_theme(hwnd);
+    // 悬浮窗自己每秒重读配置，这里催一帧让它当场变色（与主界面同一刻）。
+    floating::refresh();
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
 /// GUI 程序没有控制台，出错时留一份文件，别静默消失。
 fn tracing_note(msg: &str) {
     use std::io::Write;
@@ -5789,12 +6014,13 @@ let mut tme = TRACKMOUSEEVENT {
         }
         WM_CTLCOLOREDIT => {
             // 原生 EDIT 不认 D2D 主题：文字色/底色只能走这条老路。
-let hdc = HDC(w.0 as *mut core::ffi::c_void);
-            unsafe {
-                SetTextColor(hdc, COLORREF(0x00EE_EAE8));
-                SetBkColor(hdc, COLORREF(0x0031_231E));
-            }
+            // 值跟着主题走（`ensure_brushes` 每次换主题时把它们与刷子一起重建）。
+            let hdc = HDC(w.0 as *mut core::ffi::c_void);
             if let Some(app) = unsafe { app_ptr(hwnd) } {
+                unsafe {
+                    SetTextColor(hdc, app.edit_fg);
+                    SetBkColor(hdc, app.edit_bg_color);
+                }
                 return LRESULT(app.edit_bg.0 as isize);
             }
             LRESULT(0)
@@ -6000,21 +6226,20 @@ impl raw_window_handle::HasWindowHandle for HwndWrap {
 /// 就保持不透明深色 —�?与现�?Tauri �?`apply_window_vibrancy` 同一口径�?///
 /// 注意：透明只是"贴上了材。
 fn apply_glass(hwnd: HWND) -> bool {
-    if window_vibrancy::apply_mica(HwndWrap(hwnd), Some(true)).is_err() {
-        tracing_note("Mica 不可用，退回不透明深色");
+    // 测试钩子：Win10 / 远程桌面 / 关掉透明效果时拿不到 Mica，走的是不透明那一档。
+    // 有了它，自动化才能把那条路也跑一遍 —— 否则"退回档也能看"永远只是一句话。
+    if std::env::var("FOCUSFLOW_NO_GLASS").is_ok() {
+        tracing_note("FOCUSFLOW_NO_GLASS：强制不走 Mica/DComp，走不透明档");
+        apply_title_theme(hwnd);
         return false;
     }
-    // `apply_mica` 内部设过一次深色属性，但实测在窗口还没显示时设不进。
-let dark: u32 = 1;
-    unsafe {
-        let set = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &dark as *const _ as *const core::ffi::c_void,
-            4,
-        );
-        tracing_note(&format!("深色标题栏属性设置结果：{set:?}"));
+    if window_vibrancy::apply_mica(HwndWrap(hwnd), Some(true)).is_err() {
+        tracing_note("Mica 不可用，退回不透明深色");
+        apply_title_theme(hwnd);
+        return false;
     }
+    // 标题栏深浅跟着 `[gui] theme` 走 —— 浅色界面顶着一条深色标题栏是最扎眼的不一致。
+    apply_title_theme(hwnd);
     let margins = MARGINS {
         cxLeftWidth: -1,
         cxRightWidth: -1,
@@ -6026,6 +6251,23 @@ let dark: u32 = 1;
     }
     tracing_note("Mica 已启用");
     true
+}
+
+/// 标题栏深浅（DWM 的 immersive dark mode）。
+///
+/// 贴材质时调一次，主题切换时再调一次：否则浅色界面会顶着一条深色标题栏。
+/// 注：这条只影响**非客户区**（标题栏、边框），客户区是自己画的。
+fn apply_title_theme(hwnd: HWND) {
+    let dark: u32 = u32::from(theme_name().trim() == "dark");
+    unsafe {
+        let set = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const _ as *const core::ffi::c_void,
+            4,
+        );
+        tracing_note(&format!("标题栏深浅已设置（dark={dark}）：{set:?}"));
+    }
 }
 
 /// 应用图标：优先用程序目录下的 `assets/focusflow.ico`（打包时随 exe 一起放），
