@@ -580,6 +580,23 @@ enum EditTarget {
     PluginField(String, String),
 }
 
+/// 插件视图里打开的一个下拉。
+///
+/// 选项在打开那一刻从视图里拍下来：视图每秒都会重算，菜单开着时锚点不能跟着跳；
+/// 选中之后走 `set_field`，插件自己重算视图。
+#[derive(Clone)]
+struct PvSelect {
+    /// 属于哪个插件（切走/换插件时据此丢弃）。
+    plugin: String,
+    field: String,
+    value: String,
+    options: Vec<(String, String)>,
+    /// 值框的矩形（客户区 DIP）——菜单挂在它下面，放不下就翻到上面。
+    anchor: D2D_RECT_F,
+    /// 选项很多时滚到第几项。
+    scroll: usize,
+}
+
 struct App {
     d2d: ID2D1Factory,
     /// 只为持有生命周期：文本格式对象各自持有自己的引用，但工厂得活着。
@@ -639,6 +656,10 @@ plugins_loaded: bool,
 plugin_open: Option<String>,
     /// 插件视图的纵向滚动（像素）。
     pv_scroll: i32,
+    /// 插件视图里打开的下拉（None = 没开）。
+    pv_select: Option<PvSelect>,
+    /// 本地打开的 `modal_form` id（插件自己 `open=true` 的弹窗不走这里）。
+    pv_modal: Option<String>,
     /// 上一次重算插件视图的时间�? 秒一次就够，别跟着 100ms 心跳跑）。
 last_pv_refresh: Option<std::time::Instant>,
     hover: Option<usize>,
@@ -797,6 +818,8 @@ let dpi = GetDpiForWindow(hwnd) as f32;
                 plugins_loaded: false,
                 plugin_open: None,
                 pv_scroll: 0,
+                pv_select: None,
+                pv_modal: None,
                 last_pv_refresh: None,
                 hover: None,
                 sel: None,
@@ -955,6 +978,8 @@ fn ensure_target(&mut self, hwnd: HWND) {
                 self.plugin_err.as_deref(),
                 pv,
                 self.pv_scroll,
+                self.pv_select.as_ref(),
+                self.pv_modal.as_deref(),
             );
         }
         let ok = unsafe { t.rt.EndDraw(None, None).is_ok() } && t.present();
@@ -1131,6 +1156,8 @@ for (i, tab) in view_tabs().iter().enumerate() {
                 self.sel = None;
                 self.hover = None;
                 self.heat_hover = None;
+                self.pv_select = None;
+                self.pv_modal = None;
                 if i == 5 {
                     self.place_search_edit(hwnd);
                 } else {
@@ -1160,49 +1187,155 @@ for (i, tab) in view_tabs().iter().enumerate() {
             return;
         }
         if self.view == 4 {
-            // 插件视图打开时：只认「返回」和视图里的按钮。
-if let Some(name) = self.plugin_open.clone() {
+            // 插件视图打开时：弹窗/下拉 → 返回 → 视图里的控件。
+            if let Some(name) = self.plugin_open.clone() {
                 let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
-                let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
-                if hit(back, x, y) {
-                    self.plugin_open = None;
-                    self.pv_scroll = 0;
-                    unsafe {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
-                    return;
-                }
                 let pv = self.pm.as_ref().and_then(|pm| {
                     pm.get_plugin(&name)
                         .and_then(|p| p.view.as_ref())
                         .map(|v| (name.clone(), v.clone()))
                 });
-                if let Some((n, view)) = pv {
-                    let ops = plugin_view_ops(
-                        &view,
-                        rect(
-                            card.left,
-                            card.top + 40.0,
-                            card.right - card.left,
-                            card.bottom - card.top,
-                        ),
-                        self.pv_scroll as f32,
-                    );
-                    for op in &ops {
-                        if let POp::Button {
+                let Some((n, view)) = pv else {
+                    // 视图取不出来（插件加载失败/返回空）时，至少「返回」还能用。
+                    let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
+                    if hit(back, x, y) {
+                        self.plugin_open = None;
+                        self.pv_scroll = 0;
+                        self.pv_select = None;
+                        self.pv_modal = None;
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+                    return;
+                };
+                // 1) 下拉菜单在最上层：点菜单里就选，点外面就关掉（这次点击继续往下走）。
+                if let Some(sel) = self.pv_select.clone().filter(|s| s.plugin == n) {
+                    let (menu, items, start) =
+                        select_menu_geom(sel.anchor, sel.options.len(), sel.scroll, w, h);
+                    if hit(menu, x, y) {
+                        for (i, ir) in items.iter().enumerate() {
+                            if hit(*ir, x, y) {
+                                if let Some((val, _)) = sel.options.get(start + i).cloned() {
+                                    self.pv_select = None;
+                                    self.set_plugin_field(hwnd, &n, &sel.field, &val);
+                                }
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                    // 再点一次值框 = 收起（不然会"关了又立刻打开"）。
+                    if hit(sel.anchor, x, y) {
+                        self.pv_select = None;
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                        return;
+                    }
+                    self.pv_select = None;
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+                // 2) 模态：开着就只认它（点遮罩也吞掉，不穿透到后面的控件）。
+                if let Some(m) = find_modal(&view, self.pv_modal.as_deref()) {
+                    let g = modal_geom(&m, w, h);
+                    match modal_hit(&m, &g, x, y) {
+                        Some(ModalHit::Close) | Some(ModalHit::Cancel) => {
+                            self.close_plugin_modal(hwnd, &n, &m);
+                        }
+                        Some(ModalHit::Submit) => {
+                            let submit = m.submit.to_string();
+                            self.pv_modal = None;
+                            self.pv_select = None;
+                            // 值改完还没回车就点保存：先把 EDIT 里的内容提交掉。
+                            if self.edit_target.is_some() {
+                                self.finish_edit(hwnd, true);
+                            }
+                            self.run_plugin_action(hwnd, &n, &submit);
+                        }
+                        Some(ModalHit::Button(i)) => {
+                            if let Some((id, _)) = m.buttons.get(i).cloned() {
+                                self.run_plugin_action(hwnd, &n, &id);
+                            }
+                        }
+                        Some(ModalHit::Field(i)) => {
+                            if let Some(f) = m.fields.get(i).cloned() {
+                                if let Some(row) = g.fields.get(i) {
+                                    let vb = modal_field_box(*row);
+                                    if f.kind == "select" {
+                                        self.pv_select = Some(PvSelect {
+                                            plugin: n.clone(),
+                                            field: f.field.clone(),
+                                            value: f.value.clone(),
+                                            options: f.options.clone(),
+                                            anchor: vb,
+                                            scroll: 0,
+                                        });
+                                        unsafe {
+                                            let _ = InvalidateRect(Some(hwnd), None, false);
+                                        }
+                                    } else {
+                                        self.start_plugin_field_edit(
+                                            hwnd, &n, &f.field, &f.value, vb,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                    return;
+                }
+                // 3) 返回按钮
+                let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
+                if hit(back, x, y) {
+                    self.plugin_open = None;
+                    self.pv_scroll = 0;
+                    self.pv_select = None;
+                    self.pv_modal = None;
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+                // 4) 正文控件
+                let ops = plugin_view_ops(
+                    &view,
+                    rect(
+                        card.left,
+                        card.top + 40.0,
+                        card.right - card.left,
+                        card.bottom - card.top,
+                    ),
+                    self.pv_scroll as f32,
+                );
+                for op in &ops {
+                    match op {
+                        POp::Button {
                             rect: r,
                             id,
                             disabled,
+                            modal,
                             ..
-                        } = op
-                        {
+                        } => {
                             if !*disabled && hit(*r, x, y) {
-                                self.run_plugin_action(hwnd, &n, id);
+                                if let Some(mid) = modal {
+                                    self.pv_select = None;
+                                    self.pv_modal = Some(mid.clone());
+                                    tracing_note(&format!("插件弹窗：{n} / {mid}"));
+                                    unsafe {
+                                        let _ = InvalidateRect(Some(hwnd), None, false);
+                                    }
+                                } else {
+                                    self.run_plugin_action(hwnd, &n, id);
+                                }
                                 return;
                             }
                         }
                         // 表格行内操作按钮
-                        if let POp::Table { buttons, .. } = op {
+                        POp::Table { buttons, .. } => {
                             for (br, id, _) in buttons {
                                 if hit(*br, x, y) {
                                     self.run_plugin_action(hwnd, &n, id);
@@ -1210,26 +1343,47 @@ if let Some(name) = self.plugin_open.clone() {
                                 }
                             }
                         }
+                        POp::Select {
+                            rect: r,
+                            value,
+                            field,
+                            options,
+                            ..
+                        } => {
+                            let vb = select_value_rect(*r);
+                            if hit(vb, x, y) {
+                                self.pv_select = Some(PvSelect {
+                                    plugin: n.clone(),
+                                    field: field.clone(),
+                                    value: value.clone(),
+                                    options: options.clone(),
+                                    anchor: vb,
+                                    scroll: 0,
+                                });
+                                unsafe {
+                                    let _ = InvalidateRect(Some(hwnd), None, false);
+                                }
+                                return;
+                            }
+                        }
                         // 输入框：点值那一格 → 开同一个行内 EDIT，回车回写给插件
-                        if let POp::Field {
+                        POp::Field {
                             rect: r,
                             value,
                             field,
                             ..
-                        } = op
-                        {
-                            if !field.is_empty() {
-                                let vb = rect(r.left + 146.0, r.top, 260.0, 24.0);
-                                if hit(vb, x, y) {
-                                    tracing_note(&format!(
-                                        "点中插件字段 {field} at ({x:.0},{y:.0}) rect=({:.0},{:.0})",
-                                        vb.left, vb.top
-                                    ));
-                                    self.start_plugin_field_edit(hwnd, &n, field, value, vb);
-                                    return;
-                                }
+                        } => {
+                            let vb = rect(r.left + 146.0, r.top, 260.0, 24.0);
+                            if !field.is_empty() && hit(vb, x, y) {
+                                tracing_note(&format!(
+                                    "点中插件字段 {field} at ({x:.0},{y:.0}) rect=({:.0},{:.0})",
+                                    vb.left, vb.top
+                                ));
+                                self.start_plugin_field_edit(hwnd, &n, field, value, vb);
+                                return;
                             }
                         }
+                        _ => {}
                     }
                 }
                 return;
@@ -1751,6 +1905,8 @@ fn open_plugin_view(&mut self, hwnd: HWND, name: &str) {
         }
         self.plugin_open = Some(name.to_string());
         self.pv_scroll = 0;
+        self.pv_select = None;
+        self.pv_modal = None;
         tracing_note(&format!("打开插件视图：{name}"));
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -1788,6 +1944,53 @@ fn open_plugin_view(&mut self, hwnd: HWND, name: &str) {
         ));
         self.edit_row = None;
         tracing_note(&format!("开始编辑插件字段：{plugin} / {field}"));
+    }
+
+    /// 下拉选中 / 任何字段回写：交给插件，再让插件重算视图。
+    fn set_plugin_field(&mut self, hwnd: HWND, plugin: &str, field: &str, value: &str) {
+        let res = match self.pm.as_mut() {
+            Some(pm) => pm.plugin_set_field(plugin, field, value),
+            None => Err("没有插件管理器".to_string()),
+        };
+        match res {
+            Ok(()) => {
+                if let Some(pm) = self.pm.as_mut() {
+                    let _ = pm.refresh_view(plugin);
+                }
+                tracing_note(&format!(
+                    "插件字段已回写：{plugin} / {field} = {value:?}"
+                ));
+            }
+            Err(e) => {
+                self.status = Some(format!("插件字段回写失败：{e}"));
+                tracing_note(self.status.as_deref().unwrap_or(""));
+            }
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    /// 关掉插件弹窗：有取消动作就先交给插件（它要清编辑状态），本地打开的直接收起。
+    fn close_plugin_modal(
+        &mut self,
+        hwnd: HWND,
+        plugin: &str,
+        m: &ModalRef<'_>,
+    ) {
+        if self.edit_target.is_some() {
+            self.finish_edit(hwnd, false);
+        }
+        let cancel = m.cancel.to_string();
+        self.pv_modal = None;
+        self.pv_select = None;
+        if cancel.is_empty() {
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        } else {
+            self.run_plugin_action(hwnd, plugin, &cancel);
+        }
     }
 
     /// 插件视图里的按钮：把动作 id 交给插件，再把视图重算一遍。
@@ -2904,6 +3107,8 @@ fn draw_screen(
     plugin_err: Option<&str>,
     plugin_view: Option<(&str, &focusflow_core::plugins::PluginView)>,
     pv_scroll: i32,
+    pv_select: Option<&PvSelect>,
+    pv_modal: Option<&str>,
 ) {
     let m = 16.0;
 
@@ -3047,6 +3252,16 @@ fn draw_screen(
         },
         5 => draw_settings(p, w, h, snap, vs, status, busy, filter),
         v => draw_placeholder(p, w, h, v),
+    }
+
+    // 插件弹窗/下拉压在正文上面：弹窗先画，下拉再压在弹窗上面（模态里的 select 要用）。
+    if let Some((name, view)) = plugin_view {
+        if let Some(m) = find_modal(view, pv_modal) {
+            draw_plugin_modal(p, w, h, &m);
+        }
+        if let Some(sel) = pv_select.filter(|s| s.plugin == name) {
+            draw_select_menu(p, w, h, sel);
+        }
     }
 
     // 模态最后画：它压在所有东西上面。
@@ -4520,14 +4735,24 @@ enum POp {
         rect: D2D_RECT_F,
         label: String,
         value: String,
-        /// 回写给插件的字段名（`set_field`）；空串 = 只读（下拉等没做交互的控件）。
+        /// 回写给插件的字段名（`set_field`）；空串 = 只读。
         field: String,
+    },
+    /// 下拉：值框 + 菜单（菜单本体由 [`draw_select_menu`] 画在最上层）。
+    Select {
+        rect: D2D_RECT_F,
+        label: String,
+        value: String,
+        field: String,
+        options: Vec<(String, String)>,
     },
     Button {
         rect: D2D_RECT_F,
         text: String,
         id: String,
         disabled: bool,
+        /// 非空 = 点它只打开这个 `modal_form`，不触发插件动作（与 Web 端 `button.modal` 同义）。
+        modal: Option<String>,
     },
     Table {
         rect: D2D_RECT_F,
@@ -4549,6 +4774,7 @@ impl POp {
             | POp::Sep { rect }
             | POp::Body { rect, .. }
             | POp::Field { rect, .. }
+            | POp::Select { rect, .. }
             | POp::Button { rect, .. }
             | POp::Table { rect, .. } => *rect,        }
     }
@@ -4631,13 +4857,19 @@ fn plugin_view_ops(
                     });
                     *y += 30.0;
                 }
-                Widget::Select { label, value, .. } => {
-                    // 下拉还没做交互：只显示当前值，field 留空表示"点了也别开编辑框"
-                    ops.push(POp::Field {
+                Widget::Select {
+                    field,
+                    label,
+                    value,
+                    options,
+                    ..
+                } => {
+                    ops.push(POp::Select {
                         rect: rect(x, *y, w, 26.0),
                         label: label.clone(),
                         value: value.clone(),
-                        field: String::new(),
+                        field: field.clone(),
+                        options: options.clone(),
                     });
                     *y += 30.0;
                 }
@@ -4645,6 +4877,7 @@ fn plugin_view_ops(
                     id,
                     text,
                     disabled,
+                    modal,
                     ..
                 } => {
                     let bw = ((text.chars().count() as f32) * 15.0 + 28.0).max(96.0);
@@ -4653,6 +4886,7 @@ fn plugin_view_ops(
                         text: text.clone(),
                         id: id.clone(),
                         disabled: *disabled,
+                        modal: modal.clone(),
                     });
                     *y += 38.0;
                 }
@@ -4713,27 +4947,10 @@ fn plugin_view_ops(
                     // 横向容器先按纵向堆（子控件宽度有限，硬拆列反而更难读）。
 walk(children, x, w, y, ops);
                 }
-                Widget::ModalForm {
-                    title,
-                    fields,
-                    open,
-                    ..
-                } => {
-                    if *open {
-                        ops.push(POp::Heading {
-                            rect: rect(x, *y, w, 24.0),
-                            text: format!("弹窗：{title}"),
-                        });
-                        *y += 30.0;
-                        for f in fields {
-                            ops.push(POp::Kv {
-                                rect: rect(x, *y, w, 20.0),
-                                key: f.label.clone(),
-                                value: f.value.clone(),
-                            });
-                            *y += 22.0;
-                        }
-                    }
+                Widget::ModalForm { .. } => {
+                    // 弹窗不再按普通控件排在正文里：`draw_plugin_modal` 把它画成整屏遮罩上
+                    // 的一张卡片（点在按钮上会设 `pv_modal`，插件自己 `open=true` 的直接开）。
+                    // 留出 0 高度，正文不会因为它多一块空白。
                 }
             }
         }
@@ -4847,6 +5064,33 @@ fn draw_plugin_view(
                     &p.br.fg,
                 );
             }
+            POp::Select {
+                rect: r,
+                label,
+                value,
+                ..
+            } => {
+                p.text(
+                    label,
+                    rect(r.left, r.top + 4.0, 140.0, 18.0),
+                    &p.fmt.small,
+                    &p.br.muted,
+                );
+                let vb = select_value_rect(*r);
+                p.round(vb, 6.0, &p.br.card, Some(&p.br.accent));
+                p.text(
+                    value,
+                    rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 28.0, 18.0),
+                    &p.fmt.small,
+                    &p.br.fg,
+                );
+                p.text(
+                    "▾",
+                    rect(vb.right - 20.0, vb.top + 3.0, 16.0, 18.0),
+                    &p.fmt.center_small,
+                    &p.br.muted,
+                );
+            }
             POp::Button {
                 rect: r,
                 text,
@@ -4912,7 +5156,327 @@ fn draw_plugin_view(
     back
 }
 
-// ===== 插件�?=====
+/// 下拉值框：视图里 `POp::Select` 与模态里的 select 字段共用同一份几何。
+fn select_value_rect(r: D2D_RECT_F) -> D2D_RECT_F {
+    rect(r.left + 146.0, r.top, 260.0, 24.0)
+}
+
+const SELECT_ITEM_H: f32 = 24.0;
+const SELECT_MAX_VISIBLE: usize = 10;
+
+/// 下拉菜单的位置与每一项的矩形（画和命中都用这一份）。
+///
+/// 返回 `(菜单, 可见项矩形, 起始下标)`：选项多于 [`SELECT_MAX_VISIBLE`] 时只画一屏，
+/// `scroll` 决定从第几项开始；下面放不下就翻到值框上面。
+fn select_menu_geom(
+    anchor: D2D_RECT_F,
+    n: usize,
+    scroll: usize,
+    w: f32,
+    h: f32,
+) -> (D2D_RECT_F, Vec<D2D_RECT_F>, usize) {
+    let mw = (anchor.right - anchor.left).max(200.0);
+    let visible = n.clamp(1, SELECT_MAX_VISIBLE);
+    let mh = visible as f32 * SELECT_ITEM_H + 8.0;
+    let mut x = anchor.left;
+    if x + mw > w - 8.0 {
+        x = (w - 8.0 - mw).max(8.0);
+    }
+    let mut y = anchor.bottom + 2.0;
+    if y + mh > h - 8.0 {
+        y = (anchor.top - 2.0 - mh).max(8.0);
+    }
+    let menu = rect(x, y, mw, mh);
+    let start = scroll.min(n.saturating_sub(visible));
+    let mut items = Vec::new();
+    for i in 0..visible {
+        if start + i >= n {
+            break;
+        }
+        items.push(rect(
+            menu.left + 4.0,
+            menu.top + 4.0 + i as f32 * SELECT_ITEM_H,
+            mw - 8.0,
+            SELECT_ITEM_H,
+        ));
+    }
+    (menu, items, start)
+}
+
+fn draw_select_menu(p: &P<'_>, w: f32, h: f32, sel: &PvSelect) {
+    let (menu, items, start) = select_menu_geom(sel.anchor, sel.options.len(), sel.scroll, w, h);
+    p.round(menu, 6.0, &p.br.modal, Some(&p.br.border));
+    for (i, ir) in items.iter().enumerate() {
+        let Some((val, label)) = sel.options.get(start + i) else {
+            break;
+        };
+        if *val == sel.value {
+            p.fill(*ir, &p.br.accent_soft);
+        }
+        p.text(
+            label,
+            rect(ir.left + 6.0, ir.top + 3.0, ir.right - ir.left - 12.0, 18.0),
+            &p.fmt.small,
+            &p.br.fg,
+        );
+    }
+    if start > 0 {
+        p.text(
+            "▲",
+            rect(menu.right - 18.0, menu.top + 2.0, 14.0, 12.0),
+            &p.fmt.center_tiny,
+            &p.br.muted,
+        );
+    }
+    if start + items.len() < sel.options.len() {
+        p.text(
+            "▼",
+            rect(menu.right - 18.0, menu.bottom - 14.0, 14.0, 12.0),
+            &p.fmt.center_tiny,
+            &p.br.muted,
+        );
+    }
+}
+
+/// 一个 `modal_form` 的只读视图（借用插件视图里的字段，不复制）。
+struct ModalRef<'a> {
+    id: &'a str,
+    title: &'a str,
+    submit: &'a str,
+    submit_text: &'a str,
+    cancel: &'a str,
+    content: &'a str,
+    open: bool,
+    fields: &'a [focusflow_core::plugins::FormField],
+    buttons: &'a [(String, String)],
+}
+
+fn modal_from_widget(w: &focusflow_core::plugins::Widget) -> Option<ModalRef<'_>> {
+    use focusflow_core::plugins::Widget;
+    match w {
+        Widget::ModalForm {
+            id,
+            title,
+            submit,
+            submit_text,
+            cancel,
+            content,
+            open,
+            fields,
+            buttons,
+            ..
+        } => Some(ModalRef {
+            id,
+            title,
+            submit,
+            submit_text,
+            cancel,
+            content,
+            open: *open,
+            fields,
+            buttons,
+        }),
+        _ => None,
+    }
+}
+
+/// 当前该显示哪个弹窗：本地点开的优先，其次插件自己 `open=true` 的第一个。
+fn find_modal<'a>(
+    view: &'a focusflow_core::plugins::PluginView,
+    local: Option<&str>,
+) -> Option<ModalRef<'a>> {
+    let mut first_open = None;
+    for w in &view.widgets {
+        let Some(m) = modal_from_widget(w) else { continue };
+        if local == Some(m.id) {
+            return Some(m);
+        }
+        if m.open && first_open.is_none() {
+            first_open = Some(m);
+        }
+    }
+    first_open
+}
+
+struct ModalGeom {
+    dialog: D2D_RECT_F,
+    close: D2D_RECT_F,
+    content: Option<D2D_RECT_F>,
+    /// 每个字段一行（label 在左，值框用 [`modal_field_box`]）。
+    fields: Vec<D2D_RECT_F>,
+    /// 底部自定义按钮：(矩形, 文字)。
+    buttons: Vec<(D2D_RECT_F, String)>,
+    submit: D2D_RECT_F,
+    cancel: D2D_RECT_F,
+}
+
+fn modal_field_box(row: D2D_RECT_F) -> D2D_RECT_F {
+    let width = (row.right - row.left - 146.0).min(300.0);
+    rect(row.left + 146.0, row.top + 3.0, width, 26.0)
+}
+
+fn modal_geom(m: &ModalRef<'_>, w: f32, h: f32) -> ModalGeom {
+    let pad = 20.0;
+    let dw = (w - 64.0).clamp(380.0, 560.0);
+    let lines = if m.content.is_empty() {
+        0
+    } else {
+        m.content.lines().count().min(8)
+    };
+    let content_h = if lines == 0 {
+        0.0
+    } else {
+        lines as f32 * 18.0 + 10.0
+    };
+    let fields_h = m.fields.len() as f32 * 38.0;
+    let buttons_h = if m.buttons.is_empty() { 0.0 } else { 36.0 };
+    let dh = (58.0 + content_h + fields_h + buttons_h + 52.0).min(h - 60.0);
+    let left = (w - dw) / 2.0;
+    let top = ((h - dh) / 2.0).max(30.0);
+    let dialog = rect(left, top, dw, dh);
+    let close = rect(dialog.right - pad - 24.0, dialog.top + 14.0, 24.0, 24.0);
+    let content = if lines == 0 {
+        None
+    } else {
+        Some(rect(
+            dialog.left + pad,
+            dialog.top + 52.0,
+            dw - pad * 2.0,
+            lines as f32 * 18.0,
+        ))
+    };
+    let mut y = dialog.top + 52.0 + content_h;
+    let mut fields = Vec::new();
+    for _ in m.fields {
+        fields.push(rect(dialog.left + pad, y, dw - pad * 2.0, 32.0));
+        y += 38.0;
+    }
+    let mut buttons = Vec::new();
+    let mut bx = dialog.left + pad;
+    for (_, label) in m.buttons {
+        let bw = (label.chars().count() as f32 * 14.0 + 20.0).max(64.0);
+        buttons.push((rect(bx, dialog.bottom - 48.0, bw, 28.0), label.clone()));
+        bx += bw + 8.0;
+    }
+    let submit = rect(dialog.right - pad - 88.0, dialog.bottom - 48.0, 88.0, 28.0);
+    let cancel = rect(submit.left - 8.0 - 72.0, dialog.bottom - 48.0, 72.0, 28.0);
+    ModalGeom {
+        dialog,
+        close,
+        content,
+        fields,
+        buttons,
+        submit,
+        cancel,
+    }
+}
+
+enum ModalHit {
+    Close,
+    Submit,
+    Cancel,
+    Field(usize),
+    Button(usize),
+}
+
+fn modal_hit(m: &ModalRef<'_>, g: &ModalGeom, x: f32, y: f32) -> Option<ModalHit> {
+    if hit(g.close, x, y) {
+        return Some(ModalHit::Close);
+    }
+    if hit(g.submit, x, y) {
+        return Some(ModalHit::Submit);
+    }
+    if !m.cancel.is_empty() && hit(g.cancel, x, y) {
+        return Some(ModalHit::Cancel);
+    }
+    for (i, (br, _)) in g.buttons.iter().enumerate() {
+        if hit(*br, x, y) {
+            return Some(ModalHit::Button(i));
+        }
+    }
+    for (i, row) in g.fields.iter().enumerate() {
+        if hit(modal_field_box(*row), x, y) {
+            return Some(ModalHit::Field(i));
+        }
+    }
+    None
+}
+
+fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
+    p.fill(rect(0.0, 0.0, w, h), &p.br.overlay);
+    let g = modal_geom(m, w, h);
+    p.round(g.dialog, 16.0, &p.br.modal, Some(&p.br.border));
+    p.text(
+        m.title,
+        rect(
+            g.dialog.left + 20.0,
+            g.dialog.top + 16.0,
+            g.dialog.right - g.dialog.left - 72.0,
+            22.0,
+        ),
+        &p.fmt.body,
+        &p.br.fg,
+    );
+    p.round(g.close, 6.0, &p.br.header, None);
+    p.text("✕", g.close, &p.fmt.center_small, &p.br.muted);
+
+    if let Some(cr) = g.content {
+        p.text(m.content, cr, &p.fmt.small, &p.br.muted);
+    }
+
+    for (i, f) in m.fields.iter().enumerate() {
+        let Some(row) = g.fields.get(i) else { break };
+        p.text(
+            &f.label,
+            rect(row.left, row.top + 7.0, 136.0, 18.0),
+            &p.fmt.small,
+            &p.br.muted,
+        );
+        let vb = modal_field_box(*row);
+        p.round(vb, 6.0, &p.br.card, Some(&p.br.border));
+        p.text(
+            &f.value,
+            rect(
+                vb.left + 8.0,
+                vb.top + 3.0,
+                vb.right - vb.left - 28.0,
+                18.0,
+            ),
+            &p.fmt.small,
+            &p.br.fg,
+        );
+        if f.kind == "select" {
+            p.text(
+                "▾",
+                rect(vb.right - 20.0, vb.top + 3.0, 16.0, 18.0),
+                &p.fmt.center_small,
+                &p.br.muted,
+            );
+        }
+    }
+
+    for (br, label) in &g.buttons {
+        p.round(*br, 6.0, &p.br.header, Some(&p.br.border));
+        p.text(label, *br, &p.fmt.center_small, &p.br.fg);
+    }
+    if !m.cancel.is_empty() {
+        p.round(g.cancel, 6.0, &p.br.header, Some(&p.br.border));
+        p.text("取消", g.cancel, &p.fmt.center_small, &p.br.fg);
+    }
+    p.round(g.submit, 6.0, &p.br.accent, None);
+    p.text(
+        if m.submit_text.is_empty() {
+            "确定"
+        } else {
+            m.submit_text
+        },
+        g.submit,
+        &p.fmt.center_small,
+        &p.br.white,
+    );
+}
+
+// ===== 插件 =====
 
 fn plugin_geom(_w: f32, h: f32) -> (f32, f32, usize) {
     let list_top = 208.0 + 44.0;
@@ -6320,6 +6884,23 @@ if app.detail.is_some() || (app.view > 2 && app.view != 5 && app.view != 4) {
                 if app.edit_target.is_some() {
                     app.finish_edit(hwnd, true);
                 }
+                // 下拉开着时滚轮是滚选项，不是滚正文。
+                if app.pv_select.is_some() {
+                    if let Some(sel) = app.pv_select.as_mut() {
+                        let visible = sel.options.len().min(SELECT_MAX_VISIBLE);
+                        let max = sel.options.len().saturating_sub(visible);
+                        let step = if delta > 0 { -1 } else { 1 };
+                        let next =
+                            (sel.scroll as i32 + step).clamp(0, max as i32) as usize;
+                        if next != sel.scroll {
+                            sel.scroll = next;
+                            unsafe {
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        }
+                    }
+                    return LRESULT(0);
+                }
                 // 插件视图：滚的是视图内容，不是插件清单
                 if app.view == 4 {
                     if let Some(name) = app.plugin_open.clone() {
@@ -6330,6 +6911,10 @@ if app.detail.is_some() || (app.view > 2 && app.view != 5 && app.view != 4) {
                                 .cloned()
                         });
                         if let Some(view) = view {
+                            // 弹窗开着：滚轮不滚正文（弹窗自己没内容可滚）。
+                            if find_modal(&view, app.pv_modal.as_deref()).is_some() {
+                                return LRESULT(0);
+                            }
                             let area = rect(16.0, 208.0 + 40.0, cw - 32.0, ch - 208.0 - 16.0);
                             let content = plugin_content_height(&view, area);
                             let visible = (ch - 208.0 - 16.0 - 42.0).max(1.0);
@@ -6387,10 +6972,31 @@ if w.0 == 0x1B {
                 if let Some(app) = unsafe { app_ptr(hwnd) } {
                     if app.detail.is_some() {
                         app.close_detail(hwnd);
-                    } else if app.plugin_open.take().is_some() {
-                        app.pv_scroll = 0;
+                    } else if app.pv_select.take().is_some() {
                         unsafe {
                             let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    } else if let Some(name) = app.plugin_open.clone() {
+                        let view = app.pm.as_ref().and_then(|pm| {
+                            pm.get_plugin(&name)
+                                .and_then(|p| p.view.as_ref())
+                                .cloned()
+                        });
+                        let mut handled = false;
+                        if let Some(v) = view.as_ref() {
+                            if let Some(m) = find_modal(v, app.pv_modal.as_deref()) {
+                                app.close_plugin_modal(hwnd, &name, &m);
+                                handled = true;
+                            }
+                        }
+                        if !handled {
+                            app.plugin_open = None;
+                            app.pv_scroll = 0;
+                            app.pv_select = None;
+                            app.pv_modal = None;
+                            unsafe {
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
                         }
                     } else if app.edit_target.is_none() {
                         unsafe {
