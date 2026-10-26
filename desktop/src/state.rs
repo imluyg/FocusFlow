@@ -382,14 +382,15 @@ fn make_floating_tool_window(win: &tauri::WebviewWindow) {
     }
 }
 
-/// 悬浮窗目标尺寸（逻辑像素）。
+/// 悬浮窗目标尺寸。
 /// 注意：WebView2 在创建控制器时会把窗口强制拉宽到至少 120px，
 /// 导致 tauri.conf.json 里小于 120 的宽度被静默放大、右侧出现大片空白；
 /// 这里在窗口+WebView 构建完成后主动 set_size 缩回目标尺寸。
-/// 尺寸可在 config.ini 的 [floating] 段用 width/height 覆盖（免重编译）。
+/// 宽可在 config.ini 的 [floating] 段用 width/height 覆盖（免重编译），
+/// 而**高是按内容算出来的下限值**（`floating::webview_pill_size`，与原生那一条同一份公式）——
+/// 写死配置值的话，`metric=both` 与久坐提醒横带多出来的那一行会被窗口下边缘裁掉。
 fn enforce_floating_size(win: &tauri::WebviewWindow, config: &FocusFlowConfig) {
-    let w = config.get_float("floating", "width", 90.0);
-    let h = config.get_float("floating", "height", 46.0);
+    let (w, h) = crate::floating::webview_pill_size(config, rest_notice_now().is_some());
     let _ = win.set_size(tauri::LogicalSize::new(w, h));
     // WebView2 控制器是异步创建的，若放大发生在 setup 之后需要兜底；
     // 启动后 4 秒内每秒重申一次（窗口不可手动缩放，不会与用户冲突）。
@@ -518,6 +519,10 @@ pub(crate) fn finish_floating_setup(win: &tauri::WebviewWindow, config: &FocusFl
         let (cx, cy) = match win.current_monitor() {
             Ok(Some(mon)) => {
                 let scale = win.scale_factor().unwrap_or(1.0);
+                // 卡片矩形问的是那份公式而不是裸配置：`metric=both` 时实际高 64，
+                // 按 46 夹就会把"看得见"判成一个其实被裁掉一行的高度。
+                let (pill_w, pill_h) =
+                    crate::floating::webview_pill_size(config, rest_notice_now().is_some());
                 clamp_floating_into_screen(
                     x,
                     y,
@@ -526,8 +531,8 @@ pub(crate) fn finish_floating_setup(win: &tauri::WebviewWindow, config: &FocusFl
                         top: mon.position().y as f64 / scale,
                         screen_w: mon.size().width as f64 / scale,
                         screen_h: mon.size().height as f64 / scale,
-                        win_w: config.get_float("floating", "width", 90.0),
-                        win_h: config.get_float("floating", "height", 46.0),
+                        win_w: pill_w,
+                        win_h: pill_h,
                     },
                 )
             }
@@ -1668,6 +1673,9 @@ fn spawn_stats_worker(
             // 上一拍的两个可见性：只用来算上升沿（呼出那一刻补推一拍并做一次重聚合）
             let mut prev_main_visible = false;
             let mut prev_floating_visible = false;
+            // 提醒横带在不在：它的出现与收起都要改悬浮窗的高度（那一行是往下的），
+            // 所以这一格和上面两个一样只看边沿，不每拍动手。
+            let mut prev_notice_live = false;
             // 上次重聚合时的今日计数：空闲且数据未变时跳过重聚合，避免无谓的整库查询
             let mut last_heavy_today: i64 = -1;
             // 各周期最高单日缓存：period -> (次数, 日期)；重聚合播种，今日破纪录时快节奏即时更新
@@ -2107,6 +2115,15 @@ fn spawn_stats_worker(
                             tracing::warn!("久坐提醒没能送到悬浮窗：{e}（托盘那一句还会说）");
                         }
                     }
+                }
+                // 横带的边沿：出现要多一行高，收掉要把那一行还回去。问 façade 而不是自己摸窗口 ——
+                // 原生那一支读同一份公式自己长，WebView2 那一支才需要改窗口尺寸（`floating::notice_changed`）。
+                // 用 `rest_notice_now()` 而不是"这条提醒刚发出去"：过期判据与托盘读的是同一格，
+                // 卡片多高的那段时间和条上那句还剩的那段时间因此是同一个数。
+                let notice_live = rest_notice_now().is_some();
+                if notice_live != prev_notice_live {
+                    prev_notice_live = notice_live;
+                    crate::floating::notice_changed(&app, notice_live);
                 }
 
                 if today_count != prev_logged_today {

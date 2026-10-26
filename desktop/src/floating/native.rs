@@ -265,12 +265,16 @@ unsafe fn repaint(hwnd: HWND) -> bool {
     let content = current_content();
 
     let cfg_w = cfg.get_float("floating", "width", 90.0).max(40.0) as i32;
-    let cfg_h = cfg.get_float("floating", "height", 46.0).max(24.0) as i32;
-    let need_h = render::content_height(content.rows.len(), content.notice.is_some());
     // 高度取"配置值与内容需要值"的大者：`metric=both` 或通知带出现时多一行，
-    // 而分层窗口没有滚动条 —— 画不下就是看不见。
+    // 而分层窗口没有滚动条 —— 画不下就是看不见。这条公式与 WebView2 那一条是同一份
+    // （`render::pill_height`），两边不再各抄一遍。
+    let h_logical = render::pill_height(
+        cfg.get_float("floating", "height", 46.0),
+        content.rows.len(),
+        content.notice.is_some(),
+    );
     let w = render::px(cfg_w, scale).max(1);
-    let h = render::px(cfg_h, scale).max(render::px(need_h, scale));
+    let h = render::px(h_logical, scale);
 
     let fp = fingerprint(&content, dark, w, h);
     let unchanged = *LAST_FP.lock().unwrap_or_else(|e| e.into_inner()) == fp;
@@ -511,13 +515,21 @@ fn initial_position(scale: f64) -> (i32, i32, i32) {
             render::px(x.round() as i32, scale),
             render::px(y.round() as i32, scale),
         );
+        // 夹取用的卡片矩形问那份共用的公式，不是裸配置：`metric=both` 实际高 64，
+        // 按 46 判"看得见"就会放过一个其实被裁掉一行的高度。
+        let metric = metric_from(&cfg.get("gui", "floating_metric"));
+        let win_h = render::pill_height(
+            cfg.get_float("floating", "height", 46.0),
+            render::row_count(metric),
+            false,
+        ) as f64;
         landed_position(
             x,
             y,
             scale,
             mon,
-            cfg.get_float("floating", "width", 90.0),
-            cfg.get_float("floating", "height", 46.0),
+            cfg.get_float("floating", "width", 90.0).max(40.0),
+            win_h,
         )
     }
 }
@@ -559,19 +571,16 @@ fn landed_position(
 
 /// 内容长高之后，这张卡片的 top 该落在哪（物理像素）。
 ///
-/// 卡片高度由内容决定：`metric=both` 多一行、久坐提醒那条横带也多一行，而长出来的部分是往
-/// **下**长的。贴在屏幕底边放好的卡片（`pos_y = 1031` 在 1080 高的屏上就是贴着底边摆的）
-/// 于是每来一次提醒就被下边缘切掉最后一行 —— 用户只看见"速度那一行没了"，绝不会想到是
-/// 卡片刚刚长高。所以越界就整张往上让，横带消失后再回到锚点。
-///
-/// ⚠ 锚点必须是"用户放的那一个 top"而不是当前窗口矩形：按当前矩形算，提醒一收卡片就少 15
-/// 像素，下一次提醒再往上爬一截 —— 那就是"悬浮窗自己跑位"。
+/// 规则只有一份，在 `render::fit_top`：WebView2 那条路算的是逻辑像素，两处共用同一把尺子。
+/// 这里只做单位换算 —— 锚点是逻辑像素（与 `[floating] pos_y` 同口径），高度与屏幕矩形是物理像素。
+/// 病症与"为什么锚点必须是用户放的那一个、而不是当前窗口矩形"都写在 [`render::fit_top`] 上。
 fn grown_top(anchor: i32, scale: f64, height: i32, mon: MonitorRect) -> i32 {
-    let want = render::px(anchor, scale);
-    let bottom = mon.y + mon.height as i32;
-    // 往上让到刚好全部露出；屏幕比卡片还矮时停在屏幕顶（往下长的老毛病留给那种极端几何，
-    // 但至少上半截永远看得见）。不需要让的时候一个字都不动。
-    want.min(bottom - height).max(mon.y)
+    render::fit_top(
+        render::px(anchor, scale) as f64,
+        height as f64,
+        mon.y as f64,
+        (mon.y + mon.height as i32) as f64,
+    ) as i32
 }
 
 /// 离这个物理坐标最近的那块屏。`MONITOR_DEFAULTTONEAREST` 对屏幕外的点也回一块，
@@ -933,12 +942,19 @@ unsafe fn run_thread(class: Vec<u16>, caption: Vec<u16>, tx: &SyncSender<Result<
 
     let scale = scale_of(hwnd);
     let cfg = focusflow_core::config::instance();
+    let metric = metric_from(&cfg.get("gui", "floating_metric"));
     let w = render::px(
         cfg.get_float("floating", "width", 90.0).max(40.0) as i32,
         scale,
     );
+    // 建窗这一刻就按内容定高：提醒横带这会儿基本不会亮，所以 has_notice 交 false，
+    // 真亮了由下一拍 `repaint` 用同一个公式长高并按 `grown_top` 安放。
     let h = render::px(
-        cfg.get_float("floating", "height", 46.0).max(24.0) as i32,
+        render::pill_height(
+            cfg.get_float("floating", "height", 46.0),
+            render::row_count(metric),
+            false,
+        ),
         scale,
     );
     let (x, y, anchor) = initial_position(scale);

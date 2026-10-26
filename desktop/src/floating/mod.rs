@@ -159,8 +159,7 @@ fn build_webview_pill(app: &AppHandle, cfg: &focusflow_core::config::FocusFlowCo
     if app.get_webview_window(FLOATING_LABEL).is_some() {
         return; // 已经建过：重复建同名 label 只会报错，报的还是"窗口已存在"这种莫名话
     }
-    let w = cfg.get_float("floating", "width", 90.0).max(40.0);
-    let h = cfg.get_float("floating", "height", 46.0).max(24.0);
+    let (w, h) = webview_pill_size(cfg, false);
     let built = tauri::WebviewWindowBuilder::new(
         app,
         FLOATING_LABEL,
@@ -332,6 +331,77 @@ pub fn refresh(app: &AppHandle) {
 /// 500ms 置顶轮询还要不要跑：原生窗口在 `WM_WINDOWPOSCHANGING` 里当场答 topmost。
 pub fn needs_topmost_poll() -> bool {
     matches!(active_renderer(), Renderer::Webview)
+}
+
+/// WebView2 那张卡片该摆成多大（逻辑像素）：宽照配置，**高跟内容**。
+///
+/// 高过去直接取 `[floating] height`（默认 46），而卡片本身是 `overflow:hidden` 的：
+/// `metric=both` 多一行、久坐提醒横带也多一行，多出来的那一行就落在窗口下边缘之外。
+/// 原生那一支用的是同一条公式（`render::pill_height`）—— 尺寸这一件事不许有第二把尺子。
+pub(crate) fn webview_pill_size(
+    cfg: &focusflow_core::config::FocusFlowConfig,
+    notice_live: bool,
+) -> (f64, f64) {
+    let metric = render::metric_from(&cfg.get("gui", "floating_metric"));
+    (
+        cfg.get_float("floating", "width", 90.0).max(40.0),
+        render::pill_height(
+            cfg.get_float("floating", "height", 46.0),
+            render::row_count(metric),
+            notice_live,
+        ) as f64,
+    )
+}
+
+/// 提醒横带出现/收起时通知这里：卡片要多一行高，而且长出来的那一行必须留在屏幕里。
+///
+/// 原生那一支下一拍自己按同一份公式长高并安放，所以只要催一次重画；WebView2 那一支的
+/// 窗口不会跟着内容长，必须在这里改尺寸 —— 顺带把位置也管了：那一行是往**下**长的，
+/// 卡片贴在屏幕底边放好时，改完尺寸的最后一行正好被下边缘切掉。
+pub fn notice_changed(app: &AppHandle, live: bool) {
+    match active_renderer() {
+        Renderer::Native => native::refresh(),
+        Renderer::Webview => {
+            if !resize_webview_pill(app, live) {
+                tracing::warn!("悬浮窗跟着提醒改尺寸没做成 (notice={live})");
+            }
+        }
+    }
+}
+
+fn resize_webview_pill(app: &AppHandle, notice_live: bool) -> bool {
+    let Some(win) = app.get_webview_window(FLOATING_LABEL) else {
+        return false;
+    };
+    let cfg = focusflow_core::config::instance();
+    let (w, h) = webview_pill_size(cfg, notice_live);
+    if win.set_size(tauri::LogicalSize::new(w, h)).is_err() {
+        return false;
+    }
+    // 拿不到屏幕信息就只改尺寸：瞎搬一次可能把一个好位置弄坏（与建窗那条同一口径）。
+    let Ok(Some(mon)) = win.current_monitor() else {
+        return true;
+    };
+    let Ok(pos) = win.outer_position() else {
+        return true;
+    };
+    let scale = win.scale_factor().unwrap_or(1.0).max(0.1);
+    let cur_top = pos.y as f64 / scale;
+    // 锚点读的是 `[floating] pos_y`（用户放下的那一个），不是当前矩形：按矩形算就是
+    // 让上去之后再没人把它放回来，每来一次提醒往上爬一截（`render::fit_top` 记着这笔账）。
+    // 没存过位置就以现在这一刻当锚点。
+    let stored = cfg.get_float("floating", "pos_y", f64::NAN);
+    let mon_top = mon.position().y as f64 / scale;
+    let top = render::fit_top(
+        if stored.is_finite() { stored } else { cur_top },
+        h,
+        mon_top,
+        mon_top + mon.size().height as f64 / scale,
+    );
+    if (top - cur_top).abs() > 0.5 {
+        let _ = win.set_position(tauri::LogicalPosition::new(pos.x as f64 / scale, top));
+    }
+    true
 }
 
 /// 退出程序时收掉卡片。
@@ -557,6 +627,73 @@ mod tests {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect()
+    }
+
+    fn state_src() -> String {
+        std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/state.rs"),
+        )
+        .expect("读不到 state.rs")
+    }
+
+    /// WebView2 那一支的尺寸必须由那份共用的公式给出，一处都不许再自己读裸配置。
+    ///
+    /// 这条守卫盯着的是这一族最难查的坏法：卡片照内容长、窗口不跟，多出来的那一行
+    /// 落在窗口下边缘之外 —— 症状是"提醒一出现最后一行就没了"，而日志一个字没有。
+    #[test]
+    fn the_webview_pill_asks_the_shared_formula_for_every_size_it_sets() {
+        let flat = prod_flat(&state_src());
+        for at in [
+            "let(w,h)=crate::floating::webview_pill_size(config,",
+            "let(pill_w,pill_h)=crate::floating::webview_pill_size(config,",
+        ] {
+            assert!(flat.contains(at), "这一处没走那份公式：{at}");
+        }
+        assert!(
+            flat.contains("win_h:pill_h"),
+            "建窗时的夹取又回去按裸配置高判「看得见」了：metric=both 的卡片实际是 64 高"
+        );
+        // 反向腿：那条修正尺寸的四秒轮询不能自己另算一份高度。
+        let at = flat
+            .find("fnenforce_floating_size")
+            .expect("尺寸那一步的形状变了，判据要跟着改");
+        let body = &flat[at..at + 700];
+        assert_eq!(
+            body.match_indices("set_size(tauri::LogicalSize::new(w,h))")
+                .count(),
+            2,
+            "建窗与四秒兜底那两处应当都用同一个 (w,h)（就是那份公式出来的那两个数）"
+        );
+    }
+
+    /// 提醒横带的出现与收起都要改卡片高度，而且只在边沿上动手。
+    ///
+    /// 只盯"发出去那条事件"是不够的：横带 20 秒后自己收，卡片那一行也必须还回去，
+    /// 否则多出来的 18 像素一直空在那儿。两条都归 `notice_changed`，因为它知道
+    /// 现在是哪一种渲染器（原生读同一份公式自己长，只要催一拍；WebView2 要改窗口）。
+    #[test]
+    fn the_notice_edge_is_answered_on_both_renderers() {
+        let flat = prod_flat(&state_src());
+        assert!(
+            flat.contains("letnotice_live=rest_notice_now().is_some()"),
+            "横带在不在读的是托盘那同一格，不是「这条提醒刚发出去」"
+        );
+        assert!(
+            flat.contains("ifnotice_live!=prev_notice_live{")
+                && flat.contains("crate::floating::notice_changed(&app,notice_live)"),
+            "提醒的边沿没人接手：卡片要么一直缺一行，要么一直多一行"
+        );
+        let src = include_str!("mod.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let flat2: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat2.contains("Renderer::Native=>native::refresh()"),
+            "原生那一支被漏掉了：它下一拍会按同一份公式长高，只需要催一拍重画"
+        );
+        assert!(
+            flat2.contains("Renderer::Webview=>{if!resize_webview_pill(app,live)"),
+            "WebView2 那一支没去改窗口尺寸：光催重画没用，它的窗口不会跟着内容长"
+        );
     }
 
     /// 置顶轮询是 WebView2 那一条路的补丁（每 500ms 一次 `SetWindowPos`）。

@@ -209,7 +209,7 @@ pub const FONT_PX: i32 = 13;
 pub const NOTICE_FONT_PX: i32 = 11;
 pub const BADGE_FONT_PX: i32 = 9;
 
-/// 内容需要的最小高度（逻辑像素）：通知带在时多占一行，行数随行数变。
+/// 内容需要的最小高度（逻辑像素）：通知横带在时多占一行，行数随行数变。
 ///
 /// 为什么不能像 WebView2 那样"内容溢出去好了"：分层窗口没有滚动条，画不下就是**看不见**，
 /// 而 `metric=both` 或提醒出现时行数会变。所以尺寸由内容决定，再与配置值取大。
@@ -217,6 +217,45 @@ pub fn content_height(rows: usize, has_notice: bool) -> i32 {
     let body = rows as i32 * ROW_H + 2 * PAD_Y + 2 * BORDER;
     let notice = if has_notice { ROW_H } else { 0 };
     body + notice
+}
+
+/// 卡片有几行。`metric` 决定上面那一到两行，「速度」那一行永远在。
+///
+/// 单独一个函数是为了让"窗口该多高"这件事不必先把内容拼一遍才知道行数 ——
+/// WebView2 那条路的尺寸在 Rust 侧，而它拿得到配置、拿不到页面已经画完的版面。
+pub fn row_count(metric: Metric) -> usize {
+    match metric {
+        Metric::Both => 3,
+        Metric::Times | Metric::Duration => 2,
+    }
+}
+
+/// 悬浮窗该有多高（逻辑像素）：配置值是**下限**，内容多一行就要多一行。
+///
+/// 这一条过去只有原生那一侧在做（`repaint` 里 `max(配置高, content_height)`）。
+/// WebView2 那一侧照配置值写死 46，于是 `metric=both` 的第三行与久坐提醒横带出现时，
+/// 多出来的那一行被窗口自己的下边缘裁掉 —— 而那正是原生这条要避免的症状
+/// （`ui/floating.html` 的 `overflow:hidden` 与分层窗口一样，画不下就是看不见）。
+/// 两边都问这里，尺寸这一件事才只有一把尺子。
+///
+/// `rows` 由调用方给：原生那一侧拿的是已经拼好的内容（`content.rows.len()`），
+/// WebView2 那一侧只拿得到配置，于是走 [`row_count`]。两条都汇到 [`content_height`]。
+pub fn pill_height(cfg_height: f64, rows: usize, has_notice: bool) -> i32 {
+    let floor = cfg_height.max(24.0).round() as i32;
+    floor.max(content_height(rows, has_notice))
+}
+
+/// 卡片长高之后 top 该落在哪（同一单位内的纯几何，i32/f64 由各条路径自己换算）。
+///
+/// 长出来的那一行是往**下**长的：贴在屏幕底边放好的卡片（`pos_y = 1031` 在 1080 高的屏上
+/// 就是按底边摆的）每来一次提醒就被下边缘切掉最后一行，而用户只会看见"那一行没了"。
+/// 所以下边缘不够就把整张往上让，横带消失后再回到锚点。
+///
+/// ⚠ `anchor` 必须是"用户放下的那一个 top"，不是当前窗口矩形里的 top：按矩形算就是
+/// 让上去之后再也没人把它放回来 —— 每来一次提醒往上爬一截，那就是"悬浮窗自己跑位"。
+/// 屏幕比卡片还矮时钉在 `mon_top`（把切掉的部分留给下边缘，但至少上半截全看得见）。
+pub fn fit_top(anchor: f64, height: f64, mon_top: f64, mon_bottom: f64) -> f64 {
+    anchor.min(mon_bottom - height).max(mon_top)
 }
 
 /// 一块矩形（左开右开，像素坐标，y 自上而下）。
@@ -496,6 +535,102 @@ mod tests {
         assert_eq!(content_height(2, false), 46);
         assert_eq!(content_height(3, false), 64, "metric=both 多一行");
         assert_eq!(content_height(2, true), 64, "久坐横带多占一行");
+    }
+
+    /// 窗口高度这一件事只有一处算法，两条渲染器都问它：配置值是**下限**，
+    /// 内容多一行就多一行。写死配置值的那一半（WebView2）就是把第三行与提醒横带裁掉。
+    #[test]
+    fn the_window_height_is_a_floor_that_content_can_raise() {
+        assert_eq!(row_count(Metric::Times), 2);
+        assert_eq!(row_count(Metric::Duration), 2, "换口径不该多出一行");
+        assert_eq!(row_count(Metric::Both), 3);
+
+        assert_eq!(pill_height(46.0, 2, false), 46, "默认配置正好容下两行");
+        assert_eq!(pill_height(46.0, 3, false), 64, "both 的第三行");
+        assert_eq!(pill_height(46.0, 2, true), 64, "提醒横带的那一行");
+        assert_eq!(pill_height(46.0, 3, true), 82, "两件事同时发生");
+        assert_eq!(
+            pill_height(200.0, 2, false),
+            200,
+            "人把卡片调大时就照他的，不许被内容顶回去"
+        );
+        assert_eq!(
+            pill_height(f64::NAN, 2, false),
+            46,
+            "配置读不出来也要有个能看见的高度（max(24) 之后取内容值）"
+        );
+    }
+
+    /// 长高之后卡片该待在哪：往下够就不动，不够就整张往上让，收回来时回到**锚点**。
+    ///
+    /// 第三条腿是这条规则的全部难点：让上去之后再按当前矩形算，卡片就每来一次提醒
+    /// 往上爬一截 —— 那是"悬浮窗自己跑位"。单位由调用方决定（原生交物理像素、
+    /// WebView2 交逻辑像素），所以这里只用抽象数。
+    #[test]
+    fn a_taller_card_moves_up_only_when_the_bottom_edge_is_in_the_way() {
+        let (top, bottom) = (0.0, 1080.0);
+        assert_eq!(
+            fit_top(60.0, 64.0, top, bottom),
+            60.0,
+            "下方有空间就一个字都不动"
+        );
+        assert_eq!(
+            fit_top(1031.0, 46.0, top, bottom),
+            1031.0,
+            "贴着底边放好的位置是用户放的"
+        );
+        assert_eq!(
+            fit_top(1031.0, 64.0, top, bottom),
+            1016.0,
+            "1031+64=1095 越过 1080 ⇒ 往上让 15"
+        );
+        assert_eq!(
+            fit_top(1031.0, 46.0, top, bottom),
+            1031.0,
+            "提醒收掉必须回到锚点，不是停在让过的那一个矩形"
+        );
+        assert_eq!(
+            fit_top(30.0, 64.0, 0.0, 48.0),
+            0.0,
+            "屏幕只有 48 高而卡片要 64：钉在屏幕顶，不许把卡片推到屏幕之上"
+        );
+        // 上面那块屏（负原点）按它自己的边界算：它的下边缘就是 y = 0。
+        assert_eq!(
+            fit_top(-1070.0, 64.0, -1080.0, 0.0),
+            -1070.0,
+            "-1070+64=-1006 还在那块屏里，不动"
+        );
+        assert_eq!(
+            fit_top(-20.0, 64.0, -1080.0, 0.0),
+            -64.0,
+            "越过那块屏自己的下边缘 0 ⇒ 让到 0-64，而不是让到主屏的 1080"
+        );
+    }
+
+    /// 提醒条在页面里占的那一行高，必须与这里加的那一行高是同一个数。
+    ///
+    /// 两边的尺子一旦分家（CSS 改成 20 而 ROW_H 还是 18），Rust 加的高度就不够，
+    /// 症状照旧是"最后一行被裁"，而这次连日志都没有 —— 所以回头读那两个文件对拍。
+    #[test]
+    fn the_notice_row_in_the_page_is_exactly_one_row_tall() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let js = std::fs::read_to_string(root.join("ui/floating.js"))
+            .expect("读不到 ui/floating.js：判据的路径或文件名变了");
+        let want = format!("height:{ROW_H}px;line-height:{ROW_H}px");
+        assert!(
+            js.contains(&want),
+            "提醒条那一行的行高与 ROW_H({ROW_H}) 对不上，实得片段：{}",
+            js.split("cssText")
+                .nth(1)
+                .unwrap_or("(页面里没有 cssText)")
+                .chars()
+                .take(220)
+                .collect::<String>()
+        );
+        assert!(
+            !js.contains("position:fixed;left:0;right:0;top:0"),
+            "提醒条又变回压在数据上的覆盖层了：卡片是 overflow:hidden，盖住就是看不见"
+        );
     }
 
     #[test]

@@ -147,10 +147,18 @@ function apply(s) {
         el = document.createElement("div");
         el.id = "rest-notice";
         el.setAttribute("role", "status");
+        // 版面里的一行，不是覆盖层。过去这条是 position:fixed;top:0，直接压在「活跃」那一行上
+        // （真浏览器现量：与那一行重叠 17.55px，也就是整个 20 秒里主数字被盖住）。卡片本身是
+        // overflow:hidden 且铺满窗口，既压不住也挤不下去 ⇒ 它只能占自己的一行，
+        // 由 Rust 那边按同一份公式把窗口加长（floating::webview_pill_size）。
+        // ⚠ height 这一个数必须与 desktop/src/floating/render.rs 的 ROW_H 一致，
+        //   有一条判据回头读这两个文件对拍；改这里不改那边，多出来的那一行就还是被裁。
         el.style.cssText =
-          "position:fixed;left:0;right:0;top:0;padding:3px 6px;font-size:11px;" +
-          "text-align:center;background:rgba(220,120,30,.92);color:#fff;border-radius:6px;";
-        document.body.appendChild(el);
+          "flex:none;height:18px;line-height:18px;font-size:11px;margin:0 -8px;" +
+          "text-align:center;overflow:hidden;white-space:nowrap;" +
+          "background:rgba(220,120,30,.92);color:#fff;border-radius:6px;";
+        const card = document.querySelector(".card");
+        card.insertBefore(el, card.firstChild);
       }
       el.textContent = `久坐提醒：已连用 ${Number(n.window_minutes) || 0} 分钟，起来活动 ${Number(n.rest_seconds) || 0} 秒`;
       el.style.display = "";
