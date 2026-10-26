@@ -52,10 +52,9 @@ const CLASS_NAME: &str = "FocusFlowFloatingPill";
 
 /// `[floating] width` 的默认值（逻辑像素）。
 ///
-/// 2026-10-27 定成 132×48：高度对齐任务栏（100% 缩放下 48px），宽度只比旧 WebView 的 90
-/// 宽一点 —— 13px 的字号下「14,114」和「45/分」都留得下，又不会再像 148 那样显得空。
-/// 配置里存着旧默认 104 的按 [`fr::MIN_W`] 抬起。
-const DEFAULT_W: f64 = 132.0;
+/// 2026-10-27 定稿回旧 WebView 的 90（后来定 104）宽度：标签和值紧挨着、值左对齐，
+/// 132 右边那一大截空白就不需要了。104 让「14,114」和「41/分」都留得下边距。
+const DEFAULT_W: f64 = 104.0;
 /// `[floating] height` 的默认值（逻辑像素）；运行时还会被任务栏高度抬到"至少一样高"。
 const DEFAULT_H: f64 = 48.0;
 
@@ -207,7 +206,15 @@ fn current_content() -> fr::PillContent {
     )
 }
 
-/// 一段要画的文字：内容、矩形、颜色、字号、字体、是否右对齐。
+/// 值后面的小字单位（速度行的 `/分`）：位置要等数字量完宽度才知道。
+struct Suffix {
+    text: String,
+    color: Color,
+    font_px: i32,
+    face: &'static str,
+}
+
+/// 一段要画的文字：内容、矩形、颜色、字号、字体、是否右对齐，以及可选的小字单位。
 struct Run {
     text: String,
     rc: Rect,
@@ -216,6 +223,7 @@ struct Run {
     face: &'static str,
     weight: i32,
     right: bool,
+    suffix: Option<Suffix>,
 }
 
 /// 值用哪种字体：纯 ASCII（数字/`h m`/`%`/`—`）用 Segoe UI，中文（如「暂停」）用雅黑。
@@ -242,53 +250,28 @@ fn text_runs(c: &fr::PillContent, w: i32, scale: f64, pal: Palette) -> Vec<Run> 
             face: "Microsoft YaHei UI",
             weight: 400,
             right: false,
+            suffix: None,
         });
-        let value_color = if row.accent { pal.accent } else { pal.fg };
-        if row.suffix.is_empty() {
-            out.push(Run {
-                text: row.value.clone(),
-                rc: lay.value,
-                color: value_color,
-                font_px: fr::VALUE_PX,
-                face: value_face(&row.value),
-                weight: 400,
-                right: true,
-            });
-        } else {
-            // 数字用 Segoe UI、单位 `/分` 用雅黑小一号 —— 与旧 WebView 的
-            // `<span class="cpm">45</span><span class="slash">/</span>分` 同一个层次。
-            let sw = fr::px(fr::SUFFIX_W, scale);
-            let num = Rect {
-                x: lay.value.x,
-                y: lay.value.y,
-                w: (lay.value.w - sw).max(0),
-                h: lay.value.h,
-            };
-            let suf = Rect {
-                x: lay.value.x + lay.value.w - sw,
-                y: lay.value.y,
-                w: sw,
-                h: lay.value.h,
-            };
-            out.push(Run {
-                text: row.value.clone(),
-                rc: num,
-                color: value_color,
-                font_px: fr::VALUE_PX,
-                face: "Segoe UI",
-                weight: 400,
-                right: true,
-            });
-            out.push(Run {
-                text: row.suffix.to_string(),
-                rc: suf,
-                color: pal.muted,
-                font_px: fr::LABEL_PX - 2,
-                face: "Microsoft YaHei UI",
-                weight: 400,
-                right: true,
-            });
-        }
+        out.push(Run {
+            text: row.value.clone(),
+            rc: lay.value,
+            color: if row.accent { pal.accent } else { pal.fg },
+            font_px: fr::VALUE_PX,
+            face: value_face(&row.value),
+            weight: 400,
+            right: false,
+            suffix: if row.suffix.is_empty() {
+                None
+            } else {
+                // `41` 用 13px Segoe + 强调色，`/分` 用 11px 雅黑 muted。
+                Some(Suffix {
+                    text: row.suffix.to_string(),
+                    color: pal.muted,
+                    font_px: fr::LABEL_PX - 2,
+                    face: "Microsoft YaHei UI",
+                })
+            },
+        });
     }
     out
 }
@@ -414,37 +397,75 @@ unsafe fn repaint(hwnd: HWND) -> bool {
         //    （会得到一堆 alpha=0 的像素）。改成每段先画进"白字黑底"的蒙版，R 通道即覆盖度，
         //    再按覆盖度叠成目标色 —— 代价是抗锯齿只能用灰度。
         for run in text_runs(&content, w, scale, pal) {
-            mask.buf().fill(0);
             let Some(font) = make_font(run.font_px, scale, run.face, run.weight) else {
                 crate::tracing_note(&format!("悬浮窗建字体失败，这一段没画出来: {}", run.text));
                 continue;
             };
-            let prev_font = g::SelectObject(hdc, g::HGDIOBJ(font.0));
-            // BACKGROUND_MODE(1) = wingdi.h 的 TRANSPARENT：不填背景，蒙版上没字的地方
-            // 保持黑色（覆盖度 0）。留成 OPAQUE 会把整个矩形涂白，整行都变成"字"。
-            let _ = g::SetBkMode(hdc, g::BACKGROUND_MODE(1));
-            let _ = g::SetTextColor(hdc, COLORREF(0x00FF_FFFF));
-            let mut rc = RECT {
-                left: run.rc.x,
-                top: run.rc.y,
-                right: run.rc.x + run.rc.w,
-                bottom: run.rc.y + run.rc.h,
+            let adv = {
+                mask.buf().fill(0);
+                let prev_font = g::SelectObject(hdc, g::HGDIOBJ(font.0));
+                // BACKGROUND_MODE(1) = wingdi.h 的 TRANSPARENT：不填背景，蒙版上没字的地方
+                // 保持黑色（覆盖度 0）。留成 OPAQUE 会把整个矩形涂白，整行都变成"字"。
+                let _ = g::SetBkMode(hdc, g::BACKGROUND_MODE(1));
+                let _ = g::SetTextColor(hdc, COLORREF(0x00FF_FFFF));
+                let mut rc = RECT {
+                    left: run.rc.x,
+                    top: run.rc.y,
+                    right: run.rc.x + run.rc.w,
+                    bottom: run.rc.y + run.rc.h,
+                };
+                // 注意：这里的文本**不能**带结尾 NUL。`DrawTextW` 按切片长度认字符数，
+                // 多送一个 0 就是多一个字符 —— 它会占掉一个字形宽度，把本来刚好放得下的
+                // 「活跃」「14,114」挤成「活…」「14,11…」，还在末尾画出一个方框。
+                let mut text: Vec<u16> = run.text.encode_utf16().collect();
+                // 量一下实际宽度：速度单位 `/分` 要紧接着数字画，不能按固定宽度猜。
+                let mut adv = SIZE::default();
+                let _ = g::GetTextExtentPoint32W(hdc, &text, &mut adv);
+                let mut flags = g::DT_SINGLELINE.0
+                    | g::DT_VCENTER.0
+                    | g::DT_NOPREFIX.0
+                    | g::DT_END_ELLIPSIS.0;
+                if run.right {
+                    flags |= g::DT_RIGHT.0;
+                }
+                let _ = g::DrawTextW(hdc, &mut text, &raw mut rc, g::DRAW_TEXT_FORMAT(flags));
+                let _ = g::SelectObject(hdc, prev_font);
+                adv.cx
             };
-            // 注意：这里的文本**不能**带结尾 NUL。`DrawTextW` 按切片长度认字符数，
-            // 多送一个 0 就是多一个字符 —— 它会占掉一个字形宽度，把本来刚好放得下的
-            // 「活跃」「14,114」挤成「活…」「14,11…」，还在末尾画出一个方框。
-            let mut text: Vec<u16> = run.text.encode_utf16().collect();
-            let mut flags = g::DT_SINGLELINE.0
-                | g::DT_VCENTER.0
-                | g::DT_NOPREFIX.0
-                | g::DT_END_ELLIPSIS.0;
-            if run.right {
-                flags |= g::DT_RIGHT.0;
-            }
-            let _ = g::DrawTextW(hdc, &mut text, &raw mut rc, g::DRAW_TEXT_FORMAT(flags));
-            let _ = g::SelectObject(hdc, prev_font);
             let _ = g::DeleteObject(g::HGDIOBJ(font.0));
             fr::overlay_text_coverage(card.buf(), mask.buf(), run.color);
+
+            if let Some(sfx) = &run.suffix {
+                let Some(sfont) = make_font(sfx.font_px, scale, sfx.face, 400) else {
+                    continue;
+                };
+                mask.buf().fill(0);
+                let prev = g::SelectObject(hdc, g::HGDIOBJ(sfont.0));
+                let _ = g::SetBkMode(hdc, g::BACKGROUND_MODE(1));
+                let _ = g::SetTextColor(hdc, COLORREF(0x00FF_FFFF));
+                let sx = (run.rc.x + adv + fr::px(1, scale)).min(run.rc.x + run.rc.w);
+                let mut rc = RECT {
+                    left: sx,
+                    top: run.rc.y,
+                    right: run.rc.x + run.rc.w,
+                    bottom: run.rc.y + run.rc.h,
+                };
+                let mut text: Vec<u16> = sfx.text.encode_utf16().collect();
+                let _ = g::DrawTextW(
+                    hdc,
+                    &mut text,
+                    &raw mut rc,
+                    g::DRAW_TEXT_FORMAT(
+                        g::DT_SINGLELINE.0
+                            | g::DT_VCENTER.0
+                            | g::DT_NOPREFIX.0
+                            | g::DT_END_ELLIPSIS.0,
+                    ),
+                );
+                let _ = g::SelectObject(hdc, prev);
+                let _ = g::DeleteObject(g::HGDIOBJ(sfont.0));
+                fr::overlay_text_coverage(card.buf(), mask.buf(), sfx.color);
+            }
         }
 
         // 交出去之前必须把卡片选回 DC：上面那段文字循环把蒙版选了上去，而蒙版的 alpha 全是 0。

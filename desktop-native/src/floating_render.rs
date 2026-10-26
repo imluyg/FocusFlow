@@ -190,23 +190,22 @@ pub fn build_content(
 
 // ===== 版面 =====
 
-// 2026-10-27 第二次排版：照旧 WebView 版的字号（13px、行高 18）与任务栏高度（48）。
-// 标签与值之间留 6px（旧版 2px 贴在一起），值右对齐；卡片 132×48，`metric=both` 66。
-pub const PAD_X: i32 = 10;
+// 2026-10-27 定稿：照旧 WebView 的 `floating.html` —— 8px 边距、标签列 26px、2px 间距、
+// 13px 字号、行高 18；标签与值**紧挨着**（值左对齐），不再把值推到右边。
+// 高度仍由任务栏兜底（100% 下 48），所以上下各留 5px。
+pub const PAD_X: i32 = 8;
 pub const PAD_Y: i32 = 5;
 pub const ROW_H: i32 = 18;
-pub const LABEL_W: i32 = 28;
-pub const GAP: i32 = 6;
+pub const LABEL_W: i32 = 26;
+pub const GAP: i32 = 2;
 pub const RADIUS: i32 = 8;
 pub const BORDER: i32 = 1;
 /// 标签字号（Microsoft YaHei UI）：与旧 WebView 的 13px 一致。
 pub const LABEL_PX: i32 = 13;
 /// 值字号（Segoe UI）：旧版 `.val` / `.cpm` 都是 13px，不做加粗。
 pub const VALUE_PX: i32 = 13;
-/// 速度单位 `/分` 预留的宽度（逻辑像素，按 11px 小字量）。
-pub const SUFFIX_W: i32 = 22;
-/// 卡片再窄就放不下「标签 + 五位数」。旧配置里存着 104 的按这个下限抬。
-pub const MIN_W: i32 = 112;
+/// 卡片再窄就放不下「标签 + 五位数」。旧 WebView 默认 90，这里给它当下限。
+pub const MIN_W: i32 = 90;
 
 /// 内容需要的最小高度（逻辑像素）。
 ///
@@ -526,36 +525,36 @@ mod tests {
 
     #[test]
     fn rows_stack_from_the_top_padding() {
-        let r = layout_rows(132, 1.0, 2);
+        let r = layout_rows(104, 1.0, 2);
         assert_eq!(
             r[0].label,
             Rect {
-                x: 10,
+                x: 8,
                 y: 5,
-                w: 28,
+                w: 26,
                 h: 18
             }
         );
         assert_eq!(r[1].label.y, 23);
-        assert_eq!(r[0].value.x, 44);
-        assert_eq!(r[0].value.w, 78, "132 - 44 - 10");
+        assert_eq!(r[0].value.x, 36, "8 + 26 + 2");
+        assert_eq!(r[0].value.w, 60, "104 - 36 - 8");
 
-        let scaled = layout_rows(198, 1.5, 2);
-        assert_eq!(scaled[0].label.x, 15, "10 × 1.5");
+        let scaled = layout_rows(156, 1.5, 2);
+        assert_eq!(scaled[0].label.x, 12, "8 × 1.5");
         assert_eq!(scaled[0].label.h, 27, "18 × 1.5");
     }
 
     #[test]
     fn corners_are_transparent_and_the_middle_is_solid() {
-        let a = |x, y| card_alpha_at(x, y, 132, 48, 8, 184);
+        let a = |x, y| card_alpha_at(x, y, 104, 48, 8, 184);
         assert_eq!(a(0, 0), 0, "左上角在圆外");
         assert_eq!(a(1, 1), 0, "贴着角的像素也要真透明");
-        assert_eq!(a(66, 24), 184, "正中");
+        assert_eq!(a(52, 24), 184, "正中");
         assert_eq!(a(4, 4), 184, "半径之内");
-        assert_eq!(a(131, 47), 0, "右下角同样");
-        assert_eq!(a(66, 0), 184, "上边正中不受圆角影响");
+        assert_eq!(a(103, 47), 0, "右下角同样");
+        assert_eq!(a(52, 0), 184, "上边正中不受圆角影响");
         assert_eq!(a(-1, 5), 0, "窗口外");
-        assert_eq!(card_alpha_at(0, 0, 132, 48, 0, 184), 184, "半径 0 = 直角");
+        assert_eq!(card_alpha_at(0, 0, 104, 48, 0, 184), 184, "半径 0 = 直角");
     }
 
     /// 角上的过渡像素必须是**部分** alpha：0/满两档就是旧版的 1px 台阶。
@@ -563,12 +562,12 @@ mod tests {
     fn rounded_corners_have_partial_coverage_instead_of_a_hard_step() {
         let partial = (0..12)
             .flat_map(|y| (0..12).map(move |x| (x, y)))
-            .map(|(x, y)| rounded_rect_coverage(x, y, 132, 48, 8))
+            .map(|(x, y)| rounded_rect_coverage(x, y, 104, 48, 8))
             .filter(|c| *c > 0 && *c < 255)
             .count();
         assert!(partial >= 4, "角上至少要有一圈部分覆盖的像素，实得 {partial}");
-        assert_eq!(rounded_rect_coverage(66, 24, 132, 48, 8), 255);
-        assert_eq!(rounded_rect_coverage(0, 0, 132, 48, 8), 0);
+        assert_eq!(rounded_rect_coverage(52, 24, 104, 48, 8), 255);
+        assert_eq!(rounded_rect_coverage(0, 0, 104, 48, 8), 0);
     }
 
     #[test]
