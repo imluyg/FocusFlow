@@ -102,8 +102,11 @@ fn load_settings() -> Vec<SettingRow> {
 pub struct Snapshot {
     /// 当前周期（-1 今日 / 0 全部 / n 近 n 天）。
     pub period: i64,
-    /// 今天（不受周期影响）。
+    /// 今日次数（不受周期影响）。
     pub today: i64,
+    /// 今日前台应用总时长（秒）。悬浮窗的「时长」那一格用（`[gui] floating_metric`
+    /// 取 `duration` / `both` 时），与读数卡片的「今日活跃」是同一份快照。
+    pub today_app_seconds: i64,
     /// 当前周期的键鼠总数。
     pub period_total: i64,
     /// 当前周期的日均（按窗口天数算）。
@@ -200,9 +203,14 @@ pub fn load(period: i64) -> Snapshot {
     let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
     let goal = Some(goal_status(goal_cfg, &goal_rows, &today_str, 0));
 
+    let today = queries::get_today_count(None);
+    // 今日前台时长：与下面应用排行同一个口径，只是窗口固定成 1 天（悬浮窗要的是"今天"）。
+    let today_app_seconds = queries::get_app_stats(Some(1), None).0;
+
     Snapshot {
         period,
-        today: queries::get_today_count(None),
+        today,
+        today_app_seconds,
         period_total: stats.total,
         avg,
         max_day: all.max_day,

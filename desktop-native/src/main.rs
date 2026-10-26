@@ -5,6 +5,8 @@
 //! 不引入任�?UI 框架：窗�?`CreateWindowExW`、界�?D3D11/D2D、文�?DirectWrite�?//! 托盘 `tray-icon`、热�?`global-hotkey`；行内改名用**原生 EDIT 子窗�?*�?//!
 //! 还没做（�?`docs/webview-removal-plan.md`）：滚动容器、其余五个视图、截图覆盖层�?
 mod data;
+mod floating;
+mod floating_render;
 
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
@@ -77,6 +79,8 @@ const WM_EDIT_DONE: u32 = WM_APP + 3;
 const WM_OP_DONE: u32 = WM_APP + 4;
 /// 让主线程去开截图遮罩（窗口必须建在有消息循环的线程上，否则收不到任何消息）。
 const WM_SNIP_START: u32 = WM_APP + 6;
+/// 悬浮窗上双击：把主窗口叫出来（不受验收开关约束，这是产品行为）。
+const WM_SHOW_MAIN: u32 = WM_APP + 7;
 const TIMER_EVENTS: usize = 1;
 /// EDIT 。
 const EM_SETSEL: u32 = 0x00B1;
@@ -505,7 +509,9 @@ impl App {
 let _ = focusflow_core::config::instance();
         let db = focusflow_core::db::Database::init_readonly();
         let period = Arc::new(AtomicI64::new(-1));
-        let snap = Arc::new(Mutex::new(data::load(-1)));
+        let first = data::load(-1);
+        publish_floating(&first);
+        let snap = Arc::new(Mutex::new(first));
 
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
@@ -524,6 +530,20 @@ let _ = focusflow_core::config::instance();
 
             let tray = make_tray(&snap);
             let (hotkeys, hotkey_hk, snip_hk) = make_hotkeys();
+
+            // 悬浮窗：独立线程 + 独立分层窗口，主窗口收起时也常驻。
+            // 起不来只记一句 —— 主界面不该因为"小卡片起不来"而失败。
+            if focusflow_core::config::instance().get_bool("floating", "enabled", true) {
+                match floating::spawn(hwnd) {
+                    Ok(()) => {
+                        floating::set_visible(true);
+                        tracing_note("悬浮窗已启动");
+                    }
+                    Err(e) => tracing_note(&format!("悬浮窗启动失败：{e}")),
+                }
+            } else {
+                tracing_note("悬浮窗未启动（[floating] enabled = false）");
+            }
 
             // 原生 EDIT 的字体与底色：EDIT 不认 D2D 主题，只能单独喂。
 let dpi = GetDpiForWindow(hwnd) as f32;
@@ -554,6 +574,8 @@ let dpi = GetDpiForWindow(hwnd) as f32;
                 .spawn(move || loop {
                     std::thread::sleep(Duration::from_secs(2));
                     let next = data::load(p.load(std::sync::atomic::Ordering::Relaxed));
+                    // 悬浮窗读的是这几格，先推过去再让主界面拿新快照。
+                    publish_floating(&next);
                     if let Ok(mut g) = s.lock() {
                         *g = next;
                     }
@@ -688,6 +710,7 @@ let clear = if self.glass {
                 editing: self.edit_row,
                 heat_hover: self.heat_hover,
                 hotkey_on: self.hotkey_hk.is_some(),
+                floating_on: floating::is_visible(),
             };
             let pv = self.plugin_open.as_ref().and_then(|name| {
                 self.pm
@@ -1042,6 +1065,12 @@ let y0 = g.list_top + vis as f32 * g.row_h;
                         SItem::Action(a) => self.run_action(hwnd, a),
                         SItem::Basic(Basic::Autostart) => self.toggle_autostart(hwnd),
                         SItem::Basic(Basic::Hotkey) => self.toggle_hotkey(hwnd),
+                        SItem::Basic(Basic::Floating) => {
+                            toggle_floating(hwnd, None);
+                            unsafe {
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        }
                         SItem::Basic(Basic::DataDir) => self.open_data_dir(),
                         SItem::Setting(i) => {
                             let kind = self
@@ -1844,6 +1873,9 @@ let numeric_ok = match kind {
 
     fn refresh_now(&mut self) {
         let next = data::load(self.period.load(std::sync::atomic::Ordering::Relaxed));
+        publish_floating(&next);
+        // 数据变了（或刚改了设置），让卡片马上重画一帧，不用等它那一秒。
+        floating::refresh();
         if let Ok(mut g) = self.snap.lock() {
             *g = next;
         }
@@ -1970,6 +2002,7 @@ enum SItem {
 enum Basic {
     Autostart,
     Hotkey,
+    Floating,
     DataDir,
 }
 
@@ -1977,6 +2010,7 @@ fn basic_label(b: Basic) -> &'static str {
     match b {
         Basic::Autostart => "开机自启",
         Basic::Hotkey => "全局热键",
+        Basic::Floating => "悬浮窗",
         Basic::DataDir => "数据目录",
     }
 }
@@ -1985,7 +2019,12 @@ fn basic_label(b: Basic) -> &'static str {
 fn settings_items(snap: &Snapshot, filter: &str) -> Vec<SItem> {
     let f = filter.trim().to_lowercase();
     let mut out = Vec::new();
-    for b in [Basic::Autostart, Basic::Hotkey, Basic::DataDir] {
+    for b in [
+        Basic::Autostart,
+        Basic::Hotkey,
+        Basic::Floating,
+        Basic::DataDir,
+    ] {
         if f.is_empty() || basic_label(b).contains(&f) {
             out.push(SItem::Basic(b));
         }
@@ -2174,6 +2213,22 @@ let sbox = search_box_rect(w);
                         );
                         p.text(
                             "Ctrl + Shift + F（global-hotkey 注册状态，不是配置键）",
+                            rect(vb.right + 12.0, y + 5.0, 420.0, 18.0),
+                            &p.fmt.small,
+                            &p.br.muted,
+                        );
+                    }
+                    Basic::Floating => {
+                        let on = vs.floating_on;
+                        p.round(vb, 6.0, if on { &p.br.success } else { &p.br.grid }, None);
+                        p.text(
+                            if on { "显示" } else { "隐藏" },
+                            vb,
+                            &p.fmt.center_small,
+                            if on { &p.br.white } else { &p.br.muted },
+                        );
+                        p.text(
+                            "拖到哪记哪；双击卡片叫回主窗口（[floating] 段）",
                             rect(vb.right + 12.0, y + 5.0, 420.0, 18.0),
                             &p.fmt.small,
                             &p.br.muted,
@@ -2446,6 +2501,9 @@ struct ViewState {
     heat_hover: Option<usize>,
     /// 全局热键此刻是否真的注册着（不是配置键，是运行时状态）。
 hotkey_on: bool,
+    /// 悬浮窗此刻是否真的显示着（同上：读运行时状态，不读配置键 ——
+    /// 手改 `[floating] enabled` 并不会让卡片出现或消失）。
+    floating_on: bool,
 }
 
 /// 左表格卡片的矩形：画图与命中测试共用。
@@ -5302,9 +5360,10 @@ fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> Option<TrayIcon> {
     let menu = Menu::new();
     let show = MenuItem::with_id("show", "显示主窗口", true, None);
     let snip = MenuItem::with_id("snip", "截图（选区）", true, None);
+    let floating_item = MenuItem::with_id("floating", "悬浮窗", true, None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
     let sep = PredefinedMenuItem::separator();
-    if let Err(e) = menu.append_items(&[&show, &snip, &sep, &quit]) {
+    if let Err(e) = menu.append_items(&[&show, &snip, &floating_item, &sep, &quit]) {
         tracing_note(&format!("托盘菜单构建失败：{e}"));
         return None;
     }
@@ -5470,6 +5529,45 @@ fn thousands(n: u64) -> String {
     out
 }
 
+// ===== 悬浮窗接线 =====
+
+/// 把快照里"悬浮窗要看的那三格"推给卡片线程。
+///
+/// 百分比在这里算一次：卡片每秒重画，不该每秒重算一遍目标。
+fn publish_floating(snap: &Snapshot) {
+    let goal_pct = snap.goal.as_ref().and_then(|g| {
+        (g.goal > 0).then(|| ((g.today as f64) * 100.0 / g.goal as f64).round() as i64)
+    });
+    floating::publish(floating::Live {
+        today: snap.today,
+        duration_sec: snap.today_app_seconds,
+        goal_pct,
+    });
+}
+
+/// 显示/隐藏悬浮窗 —— 托盘菜单与设置页那一行共用的**唯一**入口。
+///
+/// 写的是 `[floating] enabled`，所以"关掉"能跨重启记住；但**不要求重启**：
+/// 开关这一下就把卡片显示/藏起来（与旧版同一个口径）。
+fn toggle_floating(main: HWND, want: Option<bool>) -> bool {
+    let want = want.unwrap_or(!floating::is_visible());
+    let cfg = focusflow_core::config::instance();
+    if let Err(e) = cfg.set("floating", "enabled", if want { "true" } else { "false" }) {
+        tracing_note(&format!("悬浮窗开关写配置失败：{e}"));
+    }
+    if want && !floating::is_alive() {
+        // 线程第一次就没起来（或已经关掉）时，再点一次要真的能起回来。
+        if let Err(e) = floating::spawn(main) {
+            tracing_note(&format!("悬浮窗重启失败：{e}"));
+            return false;
+        }
+    }
+    let _ = floating::set_visible(want);
+    let visible = floating::is_visible();
+    tracing_note(if want { "悬浮窗：显示" } else { "悬浮窗：隐藏" });
+    visible
+}
+
 /// GUI 程序没有控制台，出错时留一份文件，别静默消失。
 fn tracing_note(msg: &str) {
     use std::io::Write;
@@ -5586,7 +5684,15 @@ while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
                 match ev.id.as_ref() {
                     "show" => unsafe { bring_to_front(hwnd) },
                     "snip" => start_snip(hwnd),
+                    "floating" => {
+                        toggle_floating(hwnd, None);
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
                     "quit" => unsafe {
+                        // 卡片是独立窗口：先让它自己收，再销毁主窗口（否则消息循环还挂在那儿）。
+                        floating::shutdown();
                         let _ = DestroyWindow(hwnd);
                     },
                     _ => {}
@@ -5853,6 +5959,12 @@ unsafe {
         }
         WM_ACCEPTANCE_SHOW if ACCEPTANCE.load(std::sync::atomic::Ordering::Relaxed) => {
             tracing_note("验收消息：唤出窗口");
+            unsafe { bring_to_front(hwnd) };
+            LRESULT(0)
+        }
+        WM_SHOW_MAIN => {
+            // 悬浮窗上双击。产品行为，不受验收开关约束。
+            tracing_note("悬浮窗双击：唤出主窗口");
             unsafe { bring_to_front(hwnd) };
             LRESULT(0)
         }
