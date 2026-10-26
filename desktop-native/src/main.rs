@@ -6482,17 +6482,11 @@ fn thousands(n: u64) -> String {
 
 // ===== 悬浮窗接线 =====
 
-/// 把快照里"悬浮窗要看的那三格"推给卡片线程。
-///
-/// 百分比在这里算一次：卡片每秒重画，不该每秒重算一遍目标。
+/// 把快照里"悬浮窗要看的那两格"推给卡片线程；速度由卡片自己读 `collect::cpm()`。
 fn publish_floating(snap: &Snapshot) {
-    let goal_pct = snap.goal.as_ref().and_then(|g| {
-        (g.goal > 0).then(|| ((g.today as f64) * 100.0 / g.goal as f64).round() as i64)
-    });
     floating::publish(floating::Live {
         today: snap.today,
         duration_sec: snap.today_app_seconds,
-        goal_pct,
     });
 }
 

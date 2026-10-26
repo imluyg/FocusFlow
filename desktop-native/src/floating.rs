@@ -52,12 +52,12 @@ const CLASS_NAME: &str = "FocusFlowFloatingPill";
 
 /// `[floating] width` 的默认值（逻辑像素）。
 ///
-/// 2026-10-27 从 104 加到 148：104 是照旧版「活跃 1,234 / 速度 45/分」量的，标签与值之间
-/// 没有空隙；换成 16px 值 + 11px 标签之后，148 才让「14,114」和「3h 30m」都留得下边距。
-/// 配置里存着旧默认 104 的，按 [`fr::MIN_W`] 抬到 136，不被省略号切掉。
-const DEFAULT_W: f64 = 148.0;
-/// `[floating] height` 的默认值（逻辑像素）。两行 60 是内容需要的高度，见 `content_height`。
-const DEFAULT_H: f64 = 60.0;
+/// 2026-10-27 定成 132×48：高度对齐任务栏（100% 缩放下 48px），宽度只比旧 WebView 的 90
+/// 宽一点 —— 13px 的字号下「14,114」和「45/分」都留得下，又不会再像 148 那样显得空。
+/// 配置里存着旧默认 104 的按 [`fr::MIN_W`] 抬起。
+const DEFAULT_W: f64 = 132.0;
+/// `[floating] height` 的默认值（逻辑像素）；运行时还会被任务栏高度抬到"至少一样高"。
+const DEFAULT_H: f64 = 48.0;
 
 /// 卡片要显示的三格数。由主窗口读库后推过来（[`publish`]）。
 ///
@@ -67,14 +67,11 @@ const DEFAULT_H: f64 = 60.0;
 pub struct Live {
     pub today: i64,
     pub duration_sec: i64,
-    /// 今日目标完成百分比；`None` = 没设目标或没算出来（卡片上画「—」）。
-    pub goal_pct: Option<i64>,
 }
 
 static LIVE: Mutex<Live> = Mutex::new(Live {
     today: 0,
     duration_sec: 0,
-    goal_pct: None,
 });
 
 /// 主窗口每次刷新后调一次。第一条快照到之前卡片显示 0 / —（不画空白）。
@@ -94,6 +91,32 @@ fn wide(s: &str) -> Vec<u16> {
 
 fn scale_of(hwnd: HWND) -> f64 {
     unsafe { (GetDpiForWindow(hwnd).max(96)) as f64 / 96.0 }
+}
+
+/// 任务栏的逻辑高度（左右停靠时取厚度）。取不到就按 48（100% 缩放的默认高度）。
+///
+/// 卡片至少要和它一样高 —— 用户的原话是"至少和任务栏高度差不多"。用系统给的
+/// `ABM_GETTASKBARPOS` 而不是写死 48：125%/150% 或"大任务栏"时也能对齐。
+fn taskbar_height_logical(scale: f64) -> i32 {
+    use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA, ABM_GETTASKBARPOS};
+    unsafe {
+        let mut data = APPBARDATA {
+            cbSize: core::mem::size_of::<APPBARDATA>() as u32,
+            ..Default::default()
+        };
+        if SHAppBarMessage(ABM_GETTASKBARPOS, &mut data) != 0 {
+            // ABE_LEFT = 0、ABE_RIGHT = 2：竖着停靠时"厚度"是宽。
+            let thickness = match data.uEdge {
+                0 | 2 => data.rc.right - data.rc.left,
+                _ => data.rc.bottom - data.rc.top,
+            };
+            let logical = (thickness as f64 / scale).round() as i32;
+            if (24..=160).contains(&logical) {
+                return logical;
+            }
+        }
+    }
+    48
 }
 
 fn hwnd() -> Option<HWND> {
@@ -169,12 +192,19 @@ fn palette_now() -> Palette {
     fr::palette_for(&theme)
 }
 
-/// 把三格数拼成卡片内容。
+/// 把三格数拼成卡片内容（活跃 / 时长 / 速度）。
 fn current_content() -> fr::PillContent {
     let cfg = focusflow_core::config::instance();
     let metric = fr::metric_from(&cfg.get("gui", "floating_metric"));
     let live = live_now();
-    fr::build_content(metric, live.today, live.duration_sec, live.goal_pct)
+    fr::build_content(
+        metric,
+        live.today,
+        live.duration_sec,
+        crate::collect::is_started(),
+        crate::collect::is_paused(),
+        crate::collect::cpm(),
+    )
 }
 
 /// 一段要画的文字：内容、矩形、颜色、字号、字体、是否右对齐。
@@ -188,12 +218,22 @@ struct Run {
     right: bool,
 }
 
+/// 值用哪种字体：纯 ASCII（数字/`h m`/`%`/`—`）用 Segoe UI，中文（如「暂停」）用雅黑。
+/// GDI 的字体链接在 13px 下不一定可靠，显式选一下更稳。
+fn value_face(s: &str) -> &'static str {
+    if s.is_ascii() {
+        "Segoe UI"
+    } else {
+        "Microsoft YaHei UI"
+    }
+}
+
 fn text_runs(c: &fr::PillContent, w: i32, scale: f64, pal: Palette) -> Vec<Run> {
     let mut out = Vec::new();
     let rows = fr::layout_rows(w, scale, c.rows.len());
     for (row, lay) in c.rows.iter().zip(rows.iter()) {
-        // 标签用雅黑（中文），值用 Segoe UI Semibold（数字/单位）—— 一格里两种字，
-        // 中文标签小、数字大且右对齐，扫一眼先看到数字。
+        // 标签用雅黑（中文），值用 Segoe UI —— 与旧 WebView 的
+        // `--font: "Segoe UI", "Microsoft YaHei"` 同一套回退顺序，字号同为 13px。
         out.push(Run {
             text: row.label.to_string(),
             rc: lay.label,
@@ -208,8 +248,8 @@ fn text_runs(c: &fr::PillContent, w: i32, scale: f64, pal: Palette) -> Vec<Run> 
             rc: lay.value,
             color: if row.accent { pal.accent } else { pal.fg },
             font_px: fr::VALUE_PX,
-            face: "Segoe UI",
-            weight: 600,
+            face: value_face(&row.value),
+            weight: 400,
             right: true,
         });
     }
@@ -254,7 +294,9 @@ unsafe fn repaint(hwnd: HWND) -> bool {
             .max(fr::MIN_W as f64) as i32;
         // 高度取「配置值」与「内容需要值」的大者：`metric=both` 多一行，
         // 而分层窗口没有滚动条 —— 画不下就是看不见。
-        let h_logical = fr::pill_height(cfg.get_float("floating", "height", DEFAULT_H), content.rows.len());
+        let h_logical = fr::pill_height(cfg.get_float("floating", "height", DEFAULT_H), content.rows.len())
+            // 至少和任务栏一样高：两行内容 48 正好对齐 100% 下的任务栏。
+            .max(taskbar_height_logical(scale));
         let w = fr::px(cfg_w, scale).max(1);
         let h = fr::px(h_logical, scale).max(1);
 

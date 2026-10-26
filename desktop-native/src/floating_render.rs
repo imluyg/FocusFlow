@@ -3,10 +3,13 @@
 //! 为什么单独拆一个模块：`floating.rs` 全是 Win32 调用，没有真窗口什么也验不了；
 //! 而卡片上那几个字、它们的透明度、落点该夹到哪，全是能在 `cargo test` 里钉住的纯函数。
 //!
-//! 这一份是从 P7 删掉的 `desktop/src/floating/render.rs` 搬过来的，删掉原生端没有的三样：
+//! 这一份是从 P7 删掉的 `desktop/src/floating/render.rs` 搬过来的，删掉原生端当时没有的三样：
 //! **久坐提醒横带**（没有采集进程，谈不上连用多久）、**暂停角标**（同样，没地方暂停）、
-//! 以及「速度 /分」那一行 —— 原生端至今没有监听，速度无处可读；取而代之的是
-//! **今日目标**那一行（`Snapshot.goal`，分析页顶部目标条读的是同一个量）。
+//! 以及「速度 /分」那一行 —— 原生端当时没有监听，速度无处可读。2026-10-27 采集接上之后，
+//! 卡片恢复成旧 WebView 版的「活跃 / 时长（可选）/ 速度」三格；目标百分比回到主窗口。
+//!
+//! 颜色与字体口径也回到旧版：`tokens.css` 的 `--font: "Segoe UI", "Microsoft YaHei"`，
+//! 标签与值同为 13px、行高 18、卡片 48（任务栏高度），只有层级靠颜色和右侧对齐。
 //!
 //! 颜色仍是深色/浅色两套：`[gui] theme` 说哪套就用哪套，这样 §8 第 3 项（浅色主题）
 //! 落地时不用再回来改这里。
@@ -125,14 +128,17 @@ pub struct PillContent {
 
 /// 拼出卡片内容。
 ///
-/// - `metric` 决定「活跃」那格是次数还是时长，`both` 时两行都要；
-/// - 最后一格恒为**今日目标**：`goal_pct` 是完成百分比，`None` = 没设目标/读不到，
-///   这时画一个「—」而不是悄悄少一行（行数变了卡片会跳高）。
+/// 与旧 WebView 版同一口径（`floating.html`）：**活跃 / 时长（可选） / 速度**。
+/// 采集没开时速度画「—」、暂停时画「暂停」，这一格永远在 —— 行数变了卡片会跳高。
+/// 旧版在原生端刚接上时没有采集进程，才用「目标」顶了这一格；现在 `collect::cpm()`
+/// 有了，目标回到主窗口，卡片恢复"打字速度"这件事。
 pub fn build_content(
     metric: Metric,
     today_count: i64,
     active_seconds: i64,
-    goal_pct: Option<i64>,
+    collector_on: bool,
+    paused: bool,
+    cpm: i64,
 ) -> PillContent {
     let duration = fmt_duration(active_seconds);
     let mut rows = Vec::with_capacity(3);
@@ -160,36 +166,38 @@ pub fn build_content(
             });
         }
     }
+    let (speed, accent) = if !collector_on {
+        ("—".to_string(), false)
+    } else if paused {
+        ("暂停".to_string(), false)
+    } else {
+        (format!("{}/分", cpm.max(0)), true)
+    };
     rows.push(Row {
-        label: "目标",
-        value: match goal_pct {
-            Some(p) => format!("{}%", p.clamp(0, 9999)),
-            None => "—".to_string(),
-        },
-        accent: true,
+        label: "速度",
+        value: speed,
+        accent,
     });
     PillContent { rows }
 }
 
 // ===== 版面 =====
 
-// 2026-10-27 重新排版：原来的 104×46 是照旧版「活跃 1,234 / 速度 45/分」量的，标签列只有
-// 26px、行高 18、字号 13，标签与值之间没有空隙 —— 四个汉字 + 五位数挤在一起，角落还是
-// 1bit 台阶。现在按「标签小、值大、右对齐」重排：字号 11/16、行高 21、左右各 14。
-pub const PAD_X: i32 = 14;
-pub const PAD_Y: i32 = 8;
-pub const ROW_H: i32 = 21;
-pub const LABEL_W: i32 = 30;
-pub const GAP: i32 = 8;
-pub const RADIUS: i32 = 12;
+// 2026-10-27 第二次排版：照旧 WebView 版的字号（13px、行高 18）与任务栏高度（48）。
+// 标签与值之间留 6px（旧版 2px 贴在一起），值右对齐；卡片 132×48，`metric=both` 66。
+pub const PAD_X: i32 = 10;
+pub const PAD_Y: i32 = 5;
+pub const ROW_H: i32 = 18;
+pub const LABEL_W: i32 = 28;
+pub const GAP: i32 = 6;
+pub const RADIUS: i32 = 8;
 pub const BORDER: i32 = 1;
-/// 标签字号（Microsoft YaHei UI）。
-pub const LABEL_PX: i32 = 11;
-/// 值字号（Segoe UI Semibold）：数字与 `3h 30m` 都按这个口径。
-pub const VALUE_PX: i32 = 16;
-/// 卡片再窄就放不下「标签 + 五位数 + 两侧边距」。旧配置里存着 104 的按这个下限抬，
-/// 否则新字号下值会被省略号切掉。
-pub const MIN_W: i32 = 136;
+/// 标签字号（Microsoft YaHei UI）：与旧 WebView 的 13px 一致。
+pub const LABEL_PX: i32 = 13;
+/// 值字号（Segoe UI）：旧版 `.val` / `.cpm` 都是 13px，不做加粗。
+pub const VALUE_PX: i32 = 13;
+/// 卡片再窄就放不下「标签 + 五位数」。旧配置里存着 104 的按这个下限抬。
+pub const MIN_W: i32 = 112;
 
 /// 内容需要的最小高度（逻辑像素）。
 ///
@@ -210,7 +218,7 @@ pub fn row_count(metric: Metric) -> usize {
 /// 悬浮窗该有多高（逻辑像素）：配置值是**下限**，内容多一行就要多一行。
 pub fn pill_height(cfg_height: f64, rows: usize) -> i32 {
     let floor = if cfg_height.is_nan() {
-        46
+        48
     } else {
         cfg_height.max(24.0).round() as i32
     };
@@ -435,39 +443,45 @@ mod tests {
     }
 
     /// `metric=duration` 时「活跃」那一格换成长度，但**不会**多出第三行；
-    /// 只有 both 才三行。行数直接决定卡片高度，画错是"卡片变高/数字被裁"。
+    /// 只有 both 才三行。最后一格恒为「速度」。
     #[test]
-    fn metric_decides_which_rows_exist_and_goal_is_always_last() {
-        let t = build_content(Metric::Times, 1234, 3700, Some(62));
+    fn metric_decides_which_rows_exist_and_speed_is_always_last() {
+        let t = build_content(Metric::Times, 1234, 3700, true, false, 45);
         assert_eq!(t.rows.len(), 2);
         assert_eq!(t.rows[0].value, "1,234");
-        assert_eq!(t.rows[1].label, "目标");
-        assert_eq!(t.rows[1].value, "62%");
+        assert_eq!(t.rows[1].label, "速度");
+        assert_eq!(t.rows[1].value, "45/分");
         assert!(t.rows[1].accent);
 
-        let d = build_content(Metric::Duration, 1234, 3700, Some(62));
+        let d = build_content(Metric::Duration, 1234, 3700, true, false, 45);
         assert_eq!(d.rows.len(), 2);
         assert_eq!(d.rows[0].value, "1h 1m");
+        assert_eq!(d.rows[1].label, "速度");
 
-        let b = build_content(Metric::Both, 1234, 3700, Some(62));
+        let b = build_content(Metric::Both, 1234, 3700, true, false, 45);
         assert_eq!(b.rows.len(), 3);
         assert_eq!(b.rows[1].label, "时长");
-        assert_eq!(b.rows[2].label, "目标");
+        assert_eq!(b.rows[2].label, "速度");
     }
 
-    /// 没设目标时那一格是「—」而不是少一行：行数一变卡片就跳高。
+    /// 采集没开 / 暂停时速度那一格仍在，只是写「—」/「暂停」并且不再用强调色。
     #[test]
-    fn a_missing_goal_still_occupies_its_row() {
-        let c = build_content(Metric::Times, 10, 0, None);
-        assert_eq!(c.rows.len(), 2);
-        assert_eq!(c.rows[1].value, "—");
+    fn a_silent_collector_still_occupies_the_speed_row() {
+        let off = build_content(Metric::Times, 10, 0, false, false, 0);
+        assert_eq!(off.rows.len(), 2);
+        assert_eq!(off.rows[1].value, "—");
+        assert!(!off.rows[1].accent);
+
+        let paused = build_content(Metric::Times, 10, 0, true, true, 0);
+        assert_eq!(paused.rows[1].value, "暂停");
+        assert!(!paused.rows[1].accent);
     }
 
-    /// 卡片默认 148×60 —— 两行版面的高度必须**正好**等于配置默认值。
+    /// 卡片默认 132×48（两行）—— 高度正好是任务栏高度。
     #[test]
     fn two_row_layout_is_exactly_the_shipped_pill_height() {
-        assert_eq!(content_height(2), 60);
-        assert_eq!(content_height(3), 81, "metric=both 多一行");
+        assert_eq!(content_height(2), 48);
+        assert_eq!(content_height(3), 66, "metric=both 多一行");
     }
 
     #[test]
@@ -476,11 +490,11 @@ mod tests {
         assert_eq!(row_count(Metric::Duration), 2, "换口径不该多出一行");
         assert_eq!(row_count(Metric::Both), 3);
 
-        assert_eq!(pill_height(46.0, 2), 60, "旧的 46 现在低于内容需要值");
-        assert_eq!(pill_height(60.0, 2), 60, "默认配置正好容下两行");
-        assert_eq!(pill_height(60.0, 3), 81, "both 的第三行");
+        assert_eq!(pill_height(46.0, 2), 48, "旧的 46 低于内容需要值");
+        assert_eq!(pill_height(48.0, 2), 48, "默认配置正好容下两行");
+        assert_eq!(pill_height(48.0, 3), 66, "both 的第三行");
         assert_eq!(pill_height(200.0, 2), 200, "人把卡片调大时就照他的");
-        assert_eq!(pill_height(f64::NAN, 2), 60, "配置读不出来也要有能看见的高度");
+        assert_eq!(pill_height(f64::NAN, 2), 48, "配置读不出来也要有能看见的高度");
     }
 
     /// 长高之后卡片该待在哪：往下够就不动，不够就整张往上让，收回来时回到**锚点**。
@@ -500,36 +514,36 @@ mod tests {
 
     #[test]
     fn rows_stack_from_the_top_padding() {
-        let r = layout_rows(148, 1.0, 2);
+        let r = layout_rows(132, 1.0, 2);
         assert_eq!(
             r[0].label,
             Rect {
-                x: 14,
-                y: 8,
-                w: 30,
-                h: 21
+                x: 10,
+                y: 5,
+                w: 28,
+                h: 18
             }
         );
-        assert_eq!(r[1].label.y, 29);
-        assert_eq!(r[0].value.x, 52);
-        assert_eq!(r[0].value.w, 82, "148 - 52 - 14");
+        assert_eq!(r[1].label.y, 23);
+        assert_eq!(r[0].value.x, 44);
+        assert_eq!(r[0].value.w, 78, "132 - 44 - 10");
 
-        let scaled = layout_rows(222, 1.5, 2);
-        assert_eq!(scaled[0].label.x, 21, "14 × 1.5");
-        assert_eq!(scaled[0].label.h, 32, "21 × 1.5 四舍五入");
+        let scaled = layout_rows(198, 1.5, 2);
+        assert_eq!(scaled[0].label.x, 15, "10 × 1.5");
+        assert_eq!(scaled[0].label.h, 27, "18 × 1.5");
     }
 
     #[test]
     fn corners_are_transparent_and_the_middle_is_solid() {
-        let a = |x, y| card_alpha_at(x, y, 148, 60, 12, 184);
+        let a = |x, y| card_alpha_at(x, y, 132, 48, 8, 184);
         assert_eq!(a(0, 0), 0, "左上角在圆外");
         assert_eq!(a(1, 1), 0, "贴着角的像素也要真透明");
-        assert_eq!(a(74, 30), 184, "正中");
-        assert_eq!(a(5, 5), 184, "半径之内");
-        assert_eq!(a(147, 59), 0, "右下角同样");
-        assert_eq!(a(74, 0), 184, "上边正中不受圆角影响");
+        assert_eq!(a(66, 24), 184, "正中");
+        assert_eq!(a(4, 4), 184, "半径之内");
+        assert_eq!(a(131, 47), 0, "右下角同样");
+        assert_eq!(a(66, 0), 184, "上边正中不受圆角影响");
         assert_eq!(a(-1, 5), 0, "窗口外");
-        assert_eq!(card_alpha_at(0, 0, 148, 60, 0, 184), 184, "半径 0 = 直角");
+        assert_eq!(card_alpha_at(0, 0, 132, 48, 0, 184), 184, "半径 0 = 直角");
     }
 
     /// 角上的过渡像素必须是**部分** alpha：0/满两档就是旧版的 1px 台阶。
@@ -537,12 +551,12 @@ mod tests {
     fn rounded_corners_have_partial_coverage_instead_of_a_hard_step() {
         let partial = (0..12)
             .flat_map(|y| (0..12).map(move |x| (x, y)))
-            .map(|(x, y)| rounded_rect_coverage(x, y, 148, 60, 12))
+            .map(|(x, y)| rounded_rect_coverage(x, y, 132, 48, 8))
             .filter(|c| *c > 0 && *c < 255)
             .count();
         assert!(partial >= 4, "角上至少要有一圈部分覆盖的像素，实得 {partial}");
-        assert_eq!(rounded_rect_coverage(74, 30, 148, 60, 12), 255);
-        assert_eq!(rounded_rect_coverage(0, 0, 148, 60, 12), 0);
+        assert_eq!(rounded_rect_coverage(66, 24, 132, 48, 8), 255);
+        assert_eq!(rounded_rect_coverage(0, 0, 132, 48, 8), 0);
     }
 
     #[test]
