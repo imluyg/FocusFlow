@@ -48,7 +48,8 @@ pub struct SettingRow {
 const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
     ("goal", "daily_keys", 1, "改完立即生效", "每日目标", "目标 · 今天的活跃次数目标，主界面目标条用它"),
     ("hotkey", "toggle_window", 3, "改完立即生效", "唤出窗口热键", "热键 · 按下它把主窗口带到前台，如 ctrl+shift+f；留空 = 恢复默认"),
-    ("hotkey", "snip", 3, "改完立即生效", "区域截图热键", "热键 · 按下它开始区域截图，如 shift+f1；两条热键不能相同"),
+    ("hotkey", "snip", 3, "改完立即生效", "区域截图热键", "热键 · 按下它框选后松手即存（PNG + 剪贴板），如 shift+f1；两条热键不能相同"),
+    ("hotkey", "snip_annotate", 3, "改完立即生效", "标注截图热键", "热键 · 按下它框选后进标注窗（方框/箭头/文字），如 shift+f2"),
     ("listener", "ignore_modifier_keys", 0, "改完立即生效", "忽略修饰键", "键鼠 · Ctrl/Shift/Alt/Win 本身不计入统计"),
     ("listener", "ignore_function_keys", 0, "改完立即生效", "忽略功能键", "键鼠 · F1–F12、Insert 等功能键不计入"),
     ("listener", "ignore_key_repeat", 0, "改完立即生效", "过滤长按重复", "键鼠 · 按住不放只算第一次"),

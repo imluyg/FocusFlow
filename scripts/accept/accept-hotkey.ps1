@@ -53,12 +53,14 @@ Stop-App
 # ---------- round 1: both combos come from config ----------
 $toggle1 = 'ctrl+alt+7'
 $snip1 = 'ctrl+alt+8'
+$annotate1 = 'ctrl+alt+9'
 New-AppDir $app @('[collector]', 'enabled = false')
 Set-ConfigLine $app 'hotkey' 'toggle_window' $toggle1
 Set-ConfigLine $app 'hotkey' 'snip' $snip1
+Set-ConfigLine $app 'hotkey' 'snip_annotate' $annotate1
 Remove-Item $logPath -ErrorAction SilentlyContinue
 "exe : $Exe"
-"app : $app  (toggle=$toggle1 snip=$snip1)"
+"app : $app  (toggle=$toggle1 snip=$snip1 annotate=$annotate1)"
 
 $p = Start-App $Exe $app $WorkDir
 $h = Wait-Window $p.Id
@@ -70,7 +72,8 @@ Start-Sleep -Milliseconds 2000
 $log = @(Get-HotLog)
 Check 'log registers the configured toggle combo' (@($log | Where-Object { $_ -like "*toggle_window = $toggle1*" }).Count -gt 0)
 Check 'log registers the configured snip combo' (@($log | Where-Object { $_ -like "*snip = $snip1*" }).Count -gt 0)
-Check 'neither combo failed' ([bool](Test-NoComboFailure $log @($toggle1, $snip1)))
+Check 'log registers the configured annotate combo' (@($log | Where-Object { $_ -like "*snip_annotate = $annotate1*" }).Count -gt 0)
+Check 'neither combo failed' ([bool](Test-NoComboFailure $log @($toggle1, $snip1, $annotate1)))
 
 # Nothing rewrote what we asked for (the settings page shows these two strings).
 $cfgToggle = Get-ConfigValue $app 'hotkey' 'toggle_window'

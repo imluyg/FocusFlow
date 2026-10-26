@@ -262,9 +262,31 @@ function Read-AppLog([string]$WorkDir) {
 function Click-PeriodPill([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 109 + $Index * 60, 61, 1); Start-Sleep -Milliseconds 500 }
 function Click-ViewTab([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 56 + $Index * 84, 183, 1); Start-Sleep -Milliseconds 400 }
 function Click-ATab([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 48 + $Index * 68, 270, 1); Start-Sleep -Milliseconds 400 }
-# Basic rows in the "常规" category (current order): 0 autostart, 1 collector, 2 pause,
-# 3 theme -- 44 px apart starting at y=260 (row centre 282).
+# Basic rows in the first ("regular") category (current order): 0 autostart, 1 collector,
+# 2 pause, 3 theme -- 44 px apart starting at y=260 (row centre 282).
 function Click-BasicRow([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 320, 282 + $Index * 44, 1); Start-Sleep -Milliseconds 450 }
+
+# Real mouse drag at absolute screen coordinates (LEFTDOWN / moves / LEFTUP).
+# Used by the snip overlay, which is a full-virtual-screen window: at 100% DPI with the
+# primary screen at the origin, screen coords are also its client coords. Injected *mouse*
+# events do reach the app (injected keyboard events do not -- see README pitfall 1).
+function Drag-Screen([int]$X1, [int]$Y1, [int]$X2, [int]$Y2) {
+    [void][FF]::SetCursorPos($X1, $Y1)
+    Start-Sleep -Milliseconds 150
+    [FF]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)     # MOUSEEVENTF_LEFTDOWN
+    Start-Sleep -Milliseconds 150
+    # Two intermediate stops: WM_MOUSEMOVE has to see a drag, not a jump.
+    foreach ($t in 35, 70) {
+        $x = $X1 + [int](($X2 - $X1) * $t / 100)
+        $y = $Y1 + [int](($Y2 - $Y1) * $t / 100)
+        [void][FF]::SetCursorPos($x, $y)
+        Start-Sleep -Milliseconds 90
+    }
+    [void][FF]::SetCursorPos($X2, $Y2)
+    Start-Sleep -Milliseconds 150
+    [FF]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)     # MOUSEEVENTF_LEFTUP
+    Start-Sleep -Milliseconds 500
+}
 function Get-ThemeName([string]$AppDir) {
     $line = (Select-String -Path (Join-Path $AppDir 'config.ini') -Pattern '^theme' -Encoding UTF8 | ForEach-Object { $_.Line })
     ($line -join '')

@@ -621,6 +621,8 @@ hotkeys: Option<GlobalHotKeyManager>,
     hotkey_hk: Option<HotKey>,
     /// 截图热键（`[hotkey] snip`）。与唤出窗口的那个分开记，才能按事件 id 分流。
     snip_hk: Option<HotKey>,
+    /// 标注截图热键（`[hotkey] snip_annotate`）：选区后进标注窗，而 `snip` 是松手即存。
+    snip_annotate_hk: Option<HotKey>,
     /// 系统材质贴上了（Win11 Mica）。
 mica: bool,
     /// 现在真的走合成路径（透明/玻璃）。只�?`mica` 且合成成功才�?true。
@@ -749,7 +751,7 @@ impl App {
             };
 
             let (tray, pause_item) = make_tray(&snap);
-            let (hotkeys, hotkey_hk, snip_hk) = make_hotkeys();
+            let (hotkeys, hotkey_hk, snip_hk, snip_annotate_hk) = make_hotkeys();
 
             // 启动时这条状态行只放一句话，按"要紧的先说"排：
             // 搬迁没成 > 双计提醒 > 刚搬完告知搬到了哪。
@@ -845,6 +847,7 @@ let dpi = GetDpiForWindow(hwnd) as f32;
             hotkeys_on: hotkey_hk.is_some() || snip_hk.is_some(),
             hotkey_hk,
             snip_hk,
+            snip_annotate_hk,
                 mica,
                 glass: false,
                 _db: db,
@@ -1537,7 +1540,7 @@ let y0 = g.list_top + vis as f32 * g.row_h;
                         SItem::Action(a) => self.run_action(hwnd, a),
                         SItem::Basic(Basic::Autostart) => self.toggle_autostart(hwnd),
                         SItem::Basic(Basic::Hotkey) => self.toggle_hotkey(hwnd),
-                        SItem::Basic(Basic::Snip) => start_snip(hwnd),
+                        SItem::Basic(Basic::Snip) => start_snip(hwnd, true),
                         SItem::Basic(Basic::WeeklyReport) => self.make_weekly_report(hwnd),
                         SItem::Basic(Basic::Floating) => {
                             toggle_floating(hwnd, None);
@@ -1859,20 +1862,27 @@ fn toggle_autostart(&mut self, hwnd: HWND) {
     /// 让「真正注册的键」重新等于 `[hotkey]` 里那两行：先注销此刻注册着的，
     /// 再按总开关与配置重注册。返回一行给状态栏。
     fn reload_hotkeys(&mut self) -> String {
-        unregister_combos(self.hotkeys.as_ref(), [self.hotkey_hk, self.snip_hk]);
+        unregister_combos(
+            self.hotkeys.as_ref(),
+            [self.hotkey_hk, self.snip_hk, self.snip_annotate_hk],
+        );
         self.hotkey_hk = None;
         self.snip_hk = None;
+        self.snip_annotate_hk = None;
         if !self.hotkeys_on {
-            return "全局热键已关闭：两条组合都不注册".to_string();
+            return "全局热键已关闭：三条组合都不注册".to_string();
         }
         let toggle = register_combo(self.hotkeys.as_ref(), "toggle_window");
         self.hotkey_hk = toggle;
         let snip = register_combo(self.hotkeys.as_ref(), "snip");
         self.snip_hk = snip;
-        match (toggle, snip) {
-            (Some(_), Some(_)) => "两条热键已按配置注册".to_string(),
-            (None, None) => "热键没能注册上（组合无效或被别的程序占用，详见日志）".to_string(),
-            _ => "只注册上一半热键（哪一条失败写在日志里）".to_string(),
+        let annotate = register_combo(self.hotkeys.as_ref(), "snip_annotate");
+        self.snip_annotate_hk = annotate;
+        let ok = [toggle, snip, annotate].into_iter().flatten().count();
+        match ok {
+            3 => "三条热键已按配置注册".to_string(),
+            0 => "热键没能注册上（组合无效或被别的程序占用，详见日志）".to_string(),
+            n => format!("只注册上 {n} 条热键（哪一条失败写在日志里）"),
         }
     }
 
@@ -2502,7 +2512,7 @@ let numeric_ok = match kind {
                             // 热键组合同样先验：写进去解析不了的值会让界面显示的和注册的各说各话。
                             // 空串是既有的"恢复默认"手势，默认值本身一定可用，不用验。
                             let hotkey_err = if section == "hotkey"
-                                && matches!(key, "toggle_window" | "snip")
+                                && HOTKEY_KEYS.contains(&key)
                                 && !value.is_empty()
                             {
                                 combo_reject_reason(key, &value)
@@ -3128,11 +3138,12 @@ let sbox = search_box_rect(w);
                         );
                         let toggle = snap_setting(snap, "hotkey", "toggle_window");
                         let snip = snap_setting(snap, "hotkey", "snip");
+                        let annotate = snap_setting(snap, "hotkey", "snip_annotate");
                         p.text(
                             &format!(
-                                "总开关：开 = 注册下面两行（{toggle} / {snip}）；关 = 一条都不占用"
+                                "总开关：开 = 注册下面三行（{toggle} / {snip} / {annotate}）；关 = 一条都不占用"
                             ),
-                            rect(r.left + 12.0, y + 21.0, 520.0, 18.0),
+                            rect(r.left + 12.0, y + 21.0, 560.0, 18.0),
                             &p.fmt.small,
                             &p.br.muted,
                         );
@@ -3141,11 +3152,12 @@ let sbox = search_box_rect(w);
                         p.round(vb, 6.0, &p.br.accent, None);
                         p.text("截图…", vb, &p.fmt.center_small, &p.br.white);
                         let snip = snap_setting(snap, "hotkey", "snip");
+                        let annotate = snap_setting(snap, "hotkey", "snip_annotate");
                         p.text(
                             &format!(
-                                "也可按「区域截图热键」（{snip}）；PNG 存到 data/screenshots 并复制到剪贴板"
+                                "这颗按钮 = 标注版；按 {snip} 松手即存、按 {annotate} 进标注窗；PNG 存 data/screenshots 并复制到剪贴板"
                             ),
-                            rect(r.left + 12.0, y + 21.0, 600.0, 15.0),
+                            rect(r.left + 12.0, y + 21.0, 640.0, 15.0),
                             &p.fmt.small,
                             &p.br.muted,
                         );
@@ -4361,6 +4373,8 @@ struct SnipState {
     active: bool,
     start: (i32, i32),
     cur: (i32, i32),
+    /// 这一次选区松手后要不要进标注窗：false = 松手即存（`[hotkey] snip` 那条路）。
+    annotate: bool,
     /// 编辑阶段：冻结下来的那一块画面（BGRA，自上而下）与尺寸。
     editing: bool,
     img: Vec<u8>,
@@ -4384,6 +4398,7 @@ static SNIP: Mutex<SnipState> = Mutex::new(SnipState {
     active: false,
     start: (0, 0),
     cur: (0, 0),
+    annotate: false,
     editing: false,
     img: Vec::new(),
     img_w: 0,
@@ -4462,8 +4477,14 @@ unsafe extern "system" fn snip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     s.drag = None;
                     s.text_edit = 0;
                 }
-                            // 编辑窗口贴在选区原位，底下露出的就是刚截的那块
-                            open_snip_editor(vx + rx, vy + ry, rw, rh);
+                            // 标注版：编辑窗口贴在选区原位，底下露出的就是刚截的那块。
+                            // 快速版（松手即存）：marks 是空的，save 走的就是"原样那一张"。
+                            if SNIP.lock().map(|s| s.annotate).unwrap_or(true) {
+                                open_snip_editor(vx + rx, vy + ry, rw, rh);
+                            } else {
+                                tracing_note("截图 snip-quick：松手即存，不进标注窗");
+                                save_snip_edit();
+                            }
                         }
                         Err(e) => {
                             if let Ok(mut s) = SNIP.lock() {
@@ -5066,12 +5087,16 @@ fn open_snip_editor(x: i32, y: i32, w: i32, h: i32) {
     }
 }
 
-/// 打开全屏截图覆盖层（托盘菜单/热键触发）。
-fn start_snip(owner: HWND) {
+/// 打开全屏截图覆盖层（托盘菜单/设置页按钮/两条截图热键触发）。
+/// `annotate` = 松手后进标注窗；`false` = 松手即存（PNG + 剪贴板），与旧版两条热键的分工一致。
+fn start_snip(owner: HWND, annotate: bool) {
     if let Ok(s) = SNIP.lock() {
         if s.active {
             return;
         }
+    }
+    if let Ok(mut s) = SNIP.lock() {
+        s.annotate = annotate;
     }
     unsafe {
         let hinst = GetModuleHandleW(None).map(|m| m.into()).unwrap_or_default();
@@ -7006,24 +7031,31 @@ fn parse_combo(raw: &str) -> Option<HotKey> {
 }
 
 /// 这一条组合能不能用。`None` = 能用；`Some(原因)` = 拒写并解释。
-/// `other_raw` 是同段里另一条热键的当前值：两条撞在一起时第二条必然注册失败，
-/// 那会让界面显示"已经设上了"、实际却按不出来，所以在这里就拒掉。
-fn combo_check(key: &str, raw: &str, other_raw: &str) -> Option<String> {
+/// `others` 是同段里**其余**每条热键的 `(中文名, 当前值)`：两条撞在一起时后注册的那条
+/// 必然失败，那会让界面显示"已经设上了"、实际却按不出来，所以在这里就拒掉。
+/// 判据与注册同源（都走 `parse_combo`），所以"设置页显示的组合"就是"注册的那把"。
+fn combo_check(raw: &str, others: &[(&str, &str)]) -> Option<String> {
     let value = raw.trim();
     let Some(hk) = parse_combo(value) else {
         return Some(format!(
             "{value:?} 不成一个组合；要写成一个修饰键加一个主键，如 ctrl+shift+f"
         ));
     };
-    let other_label = if key == "toggle_window" {
-        "区域截图热键"
-    } else {
-        "唤出窗口热键"
-    };
-    if parse_combo(other_raw) == Some(hk) {
-        return Some(format!("{value} 已经被「{other_label}」占用，两条热键要分开"));
+    for (label, other_raw) in others {
+        if parse_combo(other_raw) == Some(hk) {
+            return Some(format!("{value} 已经被「{label}」占用，两条热键要分开"));
+        }
     }
     None
+}
+
+/// `[hotkey]` 某个键的中文名（与设置页那一行的标签同一份）——撞车时要点名是哪一条。
+fn hotkey_label(key: &str) -> &'static str {
+    match key {
+        "toggle_window" => "唤出窗口热键",
+        "snip" => "区域截图热键",
+        _ => "标注截图热键",
+    }
 }
 
 /// `[hotkey]` 里这一条组合当前配置的原串（文件里没有或写着空 → 核心默认值）。
@@ -7038,14 +7070,15 @@ fn hotkey_config_raw(key: &str) -> String {
     focusflow_core::config::instance().get_or("hotkey", key, &def)
 }
 
-/// 拿配置里的另一条热键做重复检查（`combo_check` 的那份判据）。
+/// 拿配置里其余几条热键做重复检查（还是 `combo_check` 那一份判据）。
 fn combo_reject_reason(key: &str, raw: &str) -> Option<String> {
-    let other = if key == "toggle_window" {
-        "snip"
-    } else {
-        "toggle_window"
-    };
-    combo_check(key, raw, &hotkey_config_raw(other))
+    let others: Vec<(&'static str, String)> = HOTKEY_KEYS
+        .iter()
+        .filter(|k| **k != key)
+        .map(|k| (hotkey_label(k), hotkey_config_raw(k)))
+        .collect();
+    let refs: Vec<(&str, &str)> = others.iter().map(|(l, v)| (*l, v.as_str())).collect();
+    combo_check(raw, &refs)
 }
 
 /// 读 `[hotkey] <key>` 并注册它；成功返回组合，失败返回 `None`（这一条不占用全局键）。
@@ -7073,13 +7106,17 @@ fn register_combo(manager: Option<&GlobalHotKeyManager>, key: &str) -> Option<Ho
 }
 
 /// 注销此刻真正注册着的组合（总开关关掉、或改完要重注册时先走这一步）。
-fn unregister_combos(manager: Option<&GlobalHotKeyManager>, list: [Option<HotKey>; 2]) {
+fn unregister_combos(manager: Option<&GlobalHotKeyManager>, list: [Option<HotKey>; 3]) {
     let Some(manager) = manager else { return };
     let all: Vec<HotKey> = list.into_iter().flatten().collect();
     if !all.is_empty() {
         let _ = manager.unregister_all(&all);
     }
 }
+
+/// 设置页里能改、启动时要注册的那几条热键（`[hotkey]` 段的键名）。
+/// 这份清单只写一次：写入前的校验与改完重注册都读它，加一条不用改第二处。
+const HOTKEY_KEYS: [&str; 3] = ["toggle_window", "snip", "snip_annotate"];
 
 /// 「更改数据文件夹」要落的那两行，以及它们的**顺序**：先写待搬运标记，再改 `data_home`。
 /// 反过来说明中间崩掉会留下哪种半态：目录已改、标记没写 ⇒ 新进程按空的
@@ -7188,6 +7225,7 @@ fn make_hotkeys() -> (
     Option<GlobalHotKeyManager>,
     Option<HotKey>,
     Option<HotKey>,
+    Option<HotKey>,
 ) {
     let manager = match GlobalHotKeyManager::new() {
         Ok(m) => Some(m),
@@ -7198,7 +7236,8 @@ fn make_hotkeys() -> (
     };
     let toggle = register_combo(manager.as_ref(), "toggle_window");
     let snip = register_combo(manager.as_ref(), "snip");
-    (manager, toggle, snip)
+    let annotate = register_combo(manager.as_ref(), "snip_annotate");
+    (manager, toggle, snip, annotate)
 }
 
 /// 托盘图标：一个蓝色圆点。真实版本换。
@@ -7497,7 +7536,7 @@ while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
             while let Ok(ev) = MenuEvent::receiver().try_recv() {
                 match ev.id.as_ref() {
                     "show" => unsafe { bring_to_front(hwnd) },
-                    "snip" => start_snip(hwnd),
+                    "snip" => start_snip(hwnd, true),
                     "floating" => {
                         toggle_floating(hwnd, None);
                         unsafe {
@@ -7514,11 +7553,16 @@ while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
                 }
             }
             while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
-                // 两个热键共用一个通道：按 id 分流，否则截图的键会把窗口唤出来。
-                // 组合键现在能被用户改掉，所以只响应"此刻真正注册着的那两个 id"，
+                // 三条热键共用一个通道：按 id 分流，否则截图的键会把窗口唤出来。
+                // 组合键现在能被用户改掉，所以只响应"此刻真正注册着的那三个 id"，
                 // 刚注销/换掉的旧 id 投过来的事件一律不认。
                 let role = unsafe { app_ptr(hwnd) }.and_then(|app| {
-                    if app.snip_hk.map(|h| h.id() == ev.id).unwrap_or(false) {
+                    if app.snip_annotate_hk
+                        .map(|h| h.id() == ev.id)
+                        .unwrap_or(false)
+                    {
+                        Some("snip-annotate")
+                    } else if app.snip_hk.map(|h| h.id() == ev.id).unwrap_or(false) {
                         Some("snip")
                     } else if app.hotkey_hk.map(|h| h.id() == ev.id).unwrap_or(false) {
                         Some("toggle")
@@ -7527,9 +7571,13 @@ while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
                     }
                 });
                 match role {
+                    Some("snip-annotate") => {
+                        tracing_note("收到标注截图热键：选区后进标注窗");
+                        start_snip(hwnd, true);
+                    }
                     Some("snip") => {
-                        tracing_note("收到截图热键");
-                        start_snip(hwnd);
+                        tracing_note("收到截图热键：松手即存");
+                        start_snip(hwnd, false);
                     }
                     Some("toggle") => {
                         tracing_note("收到热键事件，唤出窗口");
@@ -7653,7 +7701,8 @@ let mut tme = TRACKMOUSEEVENT {
             LRESULT(0)
         }
         WM_SNIP_START => {
-            start_snip(hwnd);
+            // WPARAM: 0 = 松手即存（`[hotkey] snip` 那条路），非 0 = 选区后进标注窗。
+            start_snip(hwnd, w.0 != 0);
             LRESULT(0)
         }
         WM_SEL_TEST => {
@@ -8088,13 +8137,22 @@ if let Ok(spec) = std::env::var("FOCUSFLOW_SNIP_TEST") {
             }
         });
     }
-    if std::env::var("FOCUSFLOW_SNIP_OVERLAY").is_ok() {
+    if let Ok(mode) = std::env::var("FOCUSFLOW_SNIP_OVERLAY") {
         let raw = hwnd.0 as isize;
+        // 值写成 annotate 才走标注那条路；其它值（含 1）都是"松手即存"那条。
+        let annotate = mode.trim().eq_ignore_ascii_case("annotate");
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(1500));
             // 窗口必须建在跑消息循环的线程上，所以这里只投一条消息过去。
             let target = HWND(raw as *mut core::ffi::c_void);
-            let _ = unsafe { PostMessageW(Some(target), WM_SNIP_START, WPARAM(0), LPARAM(0)) };
+            let _ = unsafe {
+                PostMessageW(
+                    Some(target),
+                    WM_SNIP_START,
+                    WPARAM(annotate as usize),
+                    LPARAM(0),
+                )
+            };
         });
     }
     if std::env::var("FOCUSFLOW_PLUGIN_SEL").is_ok() {
@@ -8144,15 +8202,31 @@ mod hotkey_tests {
             parse_combo("control + shift + f"),
             "ctrl 与 control 应当算同一个修饰键"
         );
-        let why = combo_check("snip", "control+shift+f", "ctrl+shift+f").expect("换写法躲不掉判重");
+        let why = combo_check(
+            "control+shift+f",
+            &[("唤出窗口热键", "ctrl+shift+f"), ("标注截图热键", "shift+f2")],
+        )
+        .expect("换写法躲不掉判重");
         assert!(why.contains("占用"), "要说清被谁占用：{why}");
         assert!(why.contains("唤出窗口热键"), "要点名另一条的中文名：{why}");
     }
 
     #[test]
     fn two_different_combos_are_accepted() {
-        assert_eq!(combo_check("snip", "shift+f2", "shift+f1"), None);
-        assert_eq!(combo_check("toggle_window", "ctrl+alt+9", "shift+f1"), None);
+        assert_eq!(
+            combo_check(
+                "shift+f2",
+                &[("唤出窗口热键", "ctrl+shift+f"), ("区域截图热键", "shift+f1")]
+            ),
+            None
+        );
+        assert_eq!(
+            combo_check(
+                "ctrl+alt+9",
+                &[("唤出窗口热键", "ctrl+shift+f"), ("区域截图热键", "shift+f1")]
+            ),
+            None
+        );
         // 三个修饰键也算一个合法组合，别把它当坏值拒了。
         assert!(parse_combo("ctrl+shift+alt+f").is_some());
     }
@@ -8162,7 +8236,7 @@ mod hotkey_tests {
     fn a_bare_key_is_refused_and_explained() {
         assert_eq!(parse_combo("f1"), None, "裸键 f1 不该当成可用的全局热键");
         for bad in ["", "   ", "f1", "ctrl+shift", "ctrl++f", "shift+f1+f2", "乱码"] {
-            let why = combo_check("toggle_window", bad, "shift+f1")
+            let why = combo_check(bad, &[("区域截图热键", "shift+f1")])
                 .unwrap_or_else(|| panic!("{bad:?} 应该被拒"));
             assert!(why.contains("修饰键"), "{bad:?} 的说明要给能照写的格式：{why}");
         }
