@@ -112,12 +112,14 @@ pub fn fmt_duration(sec: i64) -> String {
     }
 }
 
-/// 一条要画在卡片上的行：标签 + 值。`accent` 决定值用强调色还是正文色。
+/// 一条要画在卡片上的行：标签 + 值。`accent` 决定值用强调色还是正文色；
+/// `suffix` 是跟在值后面的小字单位（速度那一行是 `/分`），旧 WebView 里它比数字小一号。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Row {
     pub label: &'static str,
     pub value: String,
     pub accent: bool,
+    pub suffix: &'static str,
 }
 
 /// 卡片当前要说什么。每一拍由 `floating.rs` 从**已发布的那三格**拼出来。
@@ -147,36 +149,41 @@ pub fn build_content(
             label: "活跃",
             value: fmt_count(today_count),
             accent: false,
+            suffix: "",
         }),
         Metric::Duration => rows.push(Row {
             label: "活跃",
             value: duration,
             accent: false,
+            suffix: "",
         }),
         Metric::Both => {
             rows.push(Row {
                 label: "活跃",
                 value: fmt_count(today_count),
                 accent: false,
+                suffix: "",
             });
             rows.push(Row {
                 label: "时长",
                 value: duration,
                 accent: false,
+                suffix: "",
             });
         }
     }
-    let (speed, accent) = if !collector_on {
-        ("—".to_string(), false)
+    let (speed, accent, suffix) = if !collector_on {
+        ("—".to_string(), false, "")
     } else if paused {
-        ("暂停".to_string(), false)
+        ("暂停".to_string(), false, "")
     } else {
-        (format!("{}/分", cpm.max(0)), true)
+        (cpm.max(0).to_string(), true, "/分")
     };
     rows.push(Row {
         label: "速度",
         value: speed,
         accent,
+        suffix,
     });
     PillContent { rows }
 }
@@ -196,6 +203,8 @@ pub const BORDER: i32 = 1;
 pub const LABEL_PX: i32 = 13;
 /// 值字号（Segoe UI）：旧版 `.val` / `.cpm` 都是 13px，不做加粗。
 pub const VALUE_PX: i32 = 13;
+/// 速度单位 `/分` 预留的宽度（逻辑像素，按 11px 小字量）。
+pub const SUFFIX_W: i32 = 22;
 /// 卡片再窄就放不下「标签 + 五位数」。旧配置里存着 104 的按这个下限抬。
 pub const MIN_W: i32 = 112;
 
@@ -450,7 +459,8 @@ mod tests {
         assert_eq!(t.rows.len(), 2);
         assert_eq!(t.rows[0].value, "1,234");
         assert_eq!(t.rows[1].label, "速度");
-        assert_eq!(t.rows[1].value, "45/分");
+        assert_eq!(t.rows[1].value, "45");
+        assert_eq!(t.rows[1].suffix, "/分");
         assert!(t.rows[1].accent);
 
         let d = build_content(Metric::Duration, 1234, 3700, true, false, 45);
@@ -470,10 +480,12 @@ mod tests {
         let off = build_content(Metric::Times, 10, 0, false, false, 0);
         assert_eq!(off.rows.len(), 2);
         assert_eq!(off.rows[1].value, "—");
+        assert_eq!(off.rows[1].suffix, "");
         assert!(!off.rows[1].accent);
 
         let paused = build_content(Metric::Times, 10, 0, true, true, 0);
         assert_eq!(paused.rows[1].value, "暂停");
+        assert_eq!(paused.rows[1].suffix, "");
         assert!(!paused.rows[1].accent);
     }
 

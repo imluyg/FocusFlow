@@ -243,15 +243,52 @@ fn text_runs(c: &fr::PillContent, w: i32, scale: f64, pal: Palette) -> Vec<Run> 
             weight: 400,
             right: false,
         });
-        out.push(Run {
-            text: row.value.clone(),
-            rc: lay.value,
-            color: if row.accent { pal.accent } else { pal.fg },
-            font_px: fr::VALUE_PX,
-            face: value_face(&row.value),
-            weight: 400,
-            right: true,
-        });
+        let value_color = if row.accent { pal.accent } else { pal.fg };
+        if row.suffix.is_empty() {
+            out.push(Run {
+                text: row.value.clone(),
+                rc: lay.value,
+                color: value_color,
+                font_px: fr::VALUE_PX,
+                face: value_face(&row.value),
+                weight: 400,
+                right: true,
+            });
+        } else {
+            // 数字用 Segoe UI、单位 `/分` 用雅黑小一号 —— 与旧 WebView 的
+            // `<span class="cpm">45</span><span class="slash">/</span>分` 同一个层次。
+            let sw = fr::px(fr::SUFFIX_W, scale);
+            let num = Rect {
+                x: lay.value.x,
+                y: lay.value.y,
+                w: (lay.value.w - sw).max(0),
+                h: lay.value.h,
+            };
+            let suf = Rect {
+                x: lay.value.x + lay.value.w - sw,
+                y: lay.value.y,
+                w: sw,
+                h: lay.value.h,
+            };
+            out.push(Run {
+                text: row.value.clone(),
+                rc: num,
+                color: value_color,
+                font_px: fr::VALUE_PX,
+                face: "Segoe UI",
+                weight: 400,
+                right: true,
+            });
+            out.push(Run {
+                text: row.suffix.to_string(),
+                rc: suf,
+                color: pal.muted,
+                font_px: fr::LABEL_PX - 2,
+                face: "Microsoft YaHei UI",
+                weight: 400,
+                right: true,
+            });
+        }
     }
     out
 }
