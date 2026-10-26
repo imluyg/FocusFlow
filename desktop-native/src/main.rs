@@ -5316,6 +5316,20 @@ fn open_pin(img: Vec<u8>, w: i32, h: i32, x: i32, y: i32) -> Option<HWND> {
     }
 }
 
+/// 滚轮一格把缩放档乘/除 10%，夹在 [`PIN_MIN_SCALE`]..=[`PIN_MAX_SCALE`]。
+/// 抽出来是因为"往上滚是变大"这件事最容易写反，而窗口尺寸与像素比例都跟着它。
+fn pin_next_scale(current: f32, notches: f32) -> f32 {
+    (current * (1.0 + 0.1 * notches)).clamp(PIN_MIN_SCALE, PIN_MAX_SCALE)
+}
+
+/// 某档缩放下的窗口尺寸（像素）。至少 1×1，否则窗口建不出来、图也画不出。
+fn pin_scaled_size(w: i32, h: i32, scale: f32) -> (i32, i32) {
+    (
+        ((w as f32 * scale).round() as i32).max(1),
+        ((h as f32 * scale).round() as i32).max(1),
+    )
+}
+
 fn pin_set_scale(hwnd: HWND, scale: f32) {
     let Some(p) = pin_find(hwnd.0 as isize) else {
         return;
@@ -5325,8 +5339,7 @@ fn pin_set_scale(hwnd: HWND, scale: f32) {
             item.scale = scale;
         }
     }
-    let w = ((p.w as f32 * scale).round() as i32).max(1);
-    let h = ((p.h as f32 * scale).round() as i32).max(1);
+    let (w, h) = pin_scaled_size(p.w, p.h, scale);
     unsafe {
         let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -5455,8 +5468,7 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             WM_MOUSEWHEEL => {
                 let notches = (w.0 >> 16) as i16 as f32 / 120.0;
                 let base = pin_find(hwnd.0 as isize).map(|p| p.scale).unwrap_or(1.0);
-                let next = (base * (1.0 + 0.1 * notches)).clamp(PIN_MIN_SCALE, PIN_MAX_SCALE);
-                pin_set_scale(hwnd, next);
+                pin_set_scale(hwnd, pin_next_scale(base, notches));
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
@@ -8744,5 +8756,47 @@ mod plugin_sel_tests {
         assert!(why.contains("只改一条"), "{why}");
         let one = map(&[("", &["42"])]);
         assert_eq!(sel_action_id("edit_", "", &one).unwrap(), "edit_42");
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    /// 往上滚一格必须变大、往下滚一格必须变小：写反了症状是"想放大结果糊成一条线"。
+    #[test]
+    fn wheel_up_grows_and_wheel_down_shrinks() {
+        assert!(pin_next_scale(1.0, 1.0) > 1.0, "向上滚要变大");
+        assert!(pin_next_scale(1.0, -1.0) < 1.0, "向下滚要变小");
+        assert!((pin_next_scale(1.0, 1.0) - 1.1).abs() < 1e-6);
+        assert!((pin_next_scale(1.1, -1.0) - 0.99).abs() < 1e-6);
+    }
+
+    /// 连续滚不会滚成 0（窗口塌掉）也不会滚成天文数字（StretchDIBits 画不动）。
+    #[test]
+    fn the_scale_stays_inside_its_bounds() {
+        let mut up = 1.0;
+        for _ in 0..80 {
+            up = pin_next_scale(up, 1.0);
+        }
+        assert_eq!(up, PIN_MAX_SCALE, "连滚 80 格要停在上限");
+        let mut down = 1.0;
+        for _ in 0..80 {
+            down = pin_next_scale(down, -1.0);
+        }
+        assert_eq!(down, PIN_MIN_SCALE, "连滚 80 格要停在下限");
+        // 已经在上/下限外面（手改配置、浮点误差）也要被夹回来。
+        assert_eq!(pin_next_scale(99.0, 1.0), PIN_MAX_SCALE);
+        assert_eq!(pin_next_scale(0.001, -1.0), PIN_MIN_SCALE);
+    }
+
+    /// 窗口尺寸 = 原图 × 档；四舍五入后至少 1×1，否则窗口建不出来。
+    #[test]
+    fn the_window_size_follows_the_scale_and_never_collapses() {
+        assert_eq!(pin_scaled_size(120, 80, 1.0), (120, 80));
+        assert_eq!(pin_scaled_size(120, 80, 0.5), (60, 40));
+        assert_eq!(pin_scaled_size(120, 80, 4.0), (480, 320));
+        assert_eq!(pin_scaled_size(1, 1, PIN_MIN_SCALE), (1, 1), "1×1 不能滚成 0×0");
+        assert_eq!(pin_scaled_size(3, 2, 0.25), (1, 1), "半像素要进到 1，不是截成 0");
     }
 }
