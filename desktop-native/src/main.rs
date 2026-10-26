@@ -955,6 +955,15 @@ if let Some(name) = self.plugin_open.clone() {
                                 return;
                             }
                         }
+                        // 表格行内操作按钮
+                        if let POp::Table { buttons, .. } = op {
+                            for (br, id, _) in buttons {
+                                if hit(*br, x, y) {
+                                    self.run_plugin_action(hwnd, &n, id);
+                                    return;
+                                }
+                            }
+                        }
                         // 输入框：点值那一格 → 开同一个行内 EDIT，回车回写给插件
                         if let POp::Field {
                             rect: r,
@@ -4046,6 +4055,10 @@ enum POp {
         rect: D2D_RECT_F,
         headers: Vec<String>,
         rows: Vec<Vec<String>>,
+        /// 行内操作按钮：(矩形, 动作 id, 按钮文字)
+        buttons: Vec<(D2D_RECT_F, String, String)>,
+        /// 数据列可用宽度（右侧留给操作按钮）
+        column_w: f32,
     },
 }
 
@@ -4059,8 +4072,7 @@ impl POp {
             | POp::Body { rect, .. }
             | POp::Field { rect, .. }
             | POp::Button { rect, .. }
-            | POp::Table { rect, .. } => *rect,
-        }
+            | POp::Table { rect, .. } => *rect,        }
     }
 }
 
@@ -4169,32 +4181,43 @@ fn plugin_view_ops(
                 Widget::Table {
                     headers,
                     rows,
+                    ids,
                     actions,
                     ..
                 } => {
                     let shown: Vec<Vec<String>> = rows.iter().take(6).cloned().collect();
                     let h = 24.0 + shown.len() as f32 * 20.0;
+                    // 有行内操作时，右侧留出按钮列，数据列相应收窄
+                    let mut buttons: Vec<(D2D_RECT_F, String, String)> = Vec::new();
+                    let mut reserve = 0.0f32;
+                    if !actions.is_empty() {
+                        let bw = actions
+                            .iter()
+                            .map(|(_, l)| (l.chars().count() as f32 * 14.0 + 16.0).max(44.0))
+                            .sum::<f32>()
+                            + (actions.len() as f32 - 1.0) * 6.0
+                            + 12.0;
+                        reserve = bw;
+                        for (ri, _) in shown.iter().enumerate() {
+                            let rid = ids.get(ri).cloned().unwrap_or_default();
+                            let mut bx = x + w - 6.0;
+                            for (prefix, label) in actions.iter().rev() {
+                                let bw = (label.chars().count() as f32 * 14.0 + 16.0).max(44.0);
+                                bx -= bw;
+                                let by = *y + 24.0 + ri as f32 * 20.0 + 1.0;
+                                buttons.push((rect(bx, by, bw, 18.0), format!("{prefix}{rid}"), label.clone()));
+                                bx -= 6.0;
+                            }
+                        }
+                    }
                     ops.push(POp::Table {
                         rect: rect(x, *y, w, h),
                         headers: headers.clone(),
                         rows: shown,
+                        buttons,
+                        column_w: w - reserve,
                     });
                     *y += h + 6.0;
-                    if !actions.is_empty() {
-                        ops.push(POp::Label {
-                            rect: rect(x, *y, w, 18.0),
-                            text: format!(
-                                "行内操作：{}（共 {} 行）",
-                                actions
-                                    .iter()
-                                    .map(|(_, l)| l.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(" / "),
-                                rows.len()
-                            ),
-                        });
-                        *y += 22.0;
-                    }
                 }
                 Widget::Pager {
                     page,
@@ -4364,10 +4387,12 @@ fn draw_plugin_view(
                 rect: r,
                 headers,
                 rows,
+                buttons,
+                column_w,
             } => {
                 p.fill(rect(r.left, r.top, r.right - r.left, 24.0), &p.br.header);
                 let cols = headers.len().max(1);
-                let cw = (r.right - r.left) / cols as f32;
+                let cw = (*column_w).max(40.0) / cols as f32;
                 for (i, htxt) in headers.iter().enumerate() {
                     p.text(
                         htxt,
@@ -4386,6 +4411,11 @@ fn draw_plugin_view(
                             &p.br.fg,
                         );
                     }
+                }
+                // 行内操作按钮
+                for (br, _, label) in buttons {
+                    p.round(*br, 4.0, &p.br.accent, None);
+                    p.text(label, *br, &p.fmt.center_small, &p.br.white);
                 }
             }
         }
