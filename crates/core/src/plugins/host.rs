@@ -126,6 +126,20 @@ pub fn scheduler_state_for_test() -> Option<usize> {
     slot.runner.as_ref().map(|_| slot.users.len())
 }
 
+/// 测试用：某个 owner（插件文件名 stem）此刻还占着调度线程吗。
+///
+/// 只问 owner、不问"线程还在不在"：调度槽是**进程全局**的，并行跑的别的用例也会各占
+/// 一个用户，拿 `users.len()` 或 `runner.is_some()` 当判据会互相踩。这条缺陷的判据本来就
+/// 是「我这个插件的登记没了没有」，所以按名字问。
+#[cfg(any(test, feature = "test-utils"))]
+pub fn scheduler_has_owner_for_test(owner: &str) -> bool {
+    SCHEDULER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .users
+        .contains(owner)
+}
+
 /// 注册宿主 API 到 Lua 全局表 `focusflow`，返回该表。
 ///
 /// `owner` 是调用方的插件文件名（stem）：调度线程按持有者计数，

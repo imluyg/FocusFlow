@@ -779,9 +779,10 @@ impl PluginManager {
     pub fn unload_plugin(&mut self, name: &str) -> bool {
         let cfg = self.config;
         if let Some(mut info) = self.plugins.remove(name) {
+            let stem = Self::stem_of(&info.file_path);
             // 卸载 = 用户不要它了（停用/删除/重启前的一次回收），旧的加载失败原因
             // 不该继续挂在插件页上。
-            self.load_errors.remove(&Self::stem_of(&info.file_path));
+            self.load_errors.remove(&stem);
             if let Some(lua) = &mut info.lua {
                 match Self::take_hook(lua, "cleanup") {
                     Ok(Some(cleanup)) => {
@@ -798,6 +799,13 @@ impl PluginManager {
             }
             info.loaded = false;
             info.lua = None;
+            // 兜底归还调度线程：这条路径上原本**只有** Lua 侧 `scheduler_shutdown()` 一个
+            // 出口，而 `cleanup` 是插件自愿写的（没写是合法形态），于是"用了日程 API 却没写
+            // cleanup"的整类插件停用之后 owner 永留 —— 线程为它续命、它登记的定时任务照旧
+            // 到点启动程序，而那一刻 Lua 状态已经跟着上面那行没了，本进程再没有第二条归还路。
+            // 与 `mark_plugin_error` 补掉的是同一类，那条管超限停用，这条管正常停用。
+            // 只摘自己那个 stem：`users` 是集合，插件自己已经归还过也不会有第二次效果。
+            host::release_scheduler(&stem);
             tracing::info!("插件已卸载: {name}");
             true
         } else {
@@ -1997,6 +2005,67 @@ end
             host::scheduler_state_for_test(),
             None,
             "对一个已停用条目再卸载不该 panic，也不该把 owner 留下"
+        );
+    }
+
+    /// 停用一条**从没打算归还**的插件，owner 也得从调度线程表里摘掉。
+    ///
+    /// `unload_plugin` 里归还动作一个都没有：它只跑 Lua 的 `cleanup()`，而 `cleanup` 是
+    /// 插件自愿写的（`Ok(None)`＝没写，是合法形态，`host.rs` 的注释还专门叮嘱不许为此出声）。
+    /// 于是"用日程 API 但没写 cleanup"这一整类插件停用之后，owner 永远留在
+    /// `SCHEDULER.users` 里：线程为它续命、它登记的定时任务照旧到点启动程序，而插件页
+    /// 写着已停用 —— Lua 侧那个归还入口跟着 `info.lua = None` 一起消失了，本进程再没有
+    /// 第二条路。这与**超限停用**那条是同一类（`mark_plugin_error` 已经补过它那一份），
+    /// 漏的是正常停用这一条。
+    ///
+    /// 反向腿钉住"兜底"两字的边界：只摘自己那个 stem，别家的用户不许被一起带走
+    /// （`host.rs` 顶部写的就是无条件 `scheduler_shutdown` 会把内置定时任务压掉的旧事故），
+    /// 而已经自己归还过一次的插件，第二次归还必须是空操作（`users` 是集合）。
+    #[test]
+    fn unloading_a_plugin_that_never_releases_still_gives_the_scheduler_back() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("unload_owner");
+        let plugins = tmp.path().join("plugins");
+        write_lua(
+            &plugins,
+            "quiet",
+            "PLUGIN_NAME = \"不归还\"\nfunction init() focusflow.scheduler_tasks() end\n",
+        );
+        write_lua(
+            &plugins,
+            "polite",
+            "PLUGIN_NAME = \"自己归还\"\nfunction init() focusflow.scheduler_tasks() end\n\
+             function cleanup() focusflow.scheduler_shutdown() end\n",
+        );
+        let mut pm = manager_in(tmp.path());
+        pm.load_all();
+
+        assert!(
+            host::scheduler_has_owner_for_test("quiet"),
+            "前提：init 里那句 scheduler_tasks 该把 quiet 登记进去"
+        );
+        assert!(
+            host::scheduler_has_owner_for_test("polite"),
+            "前提：同一条路上 polite 也登记了"
+        );
+
+        // 先卸会自己归还的那个：它的第二次归还（兜底那行）必须是空操作，
+        // 且不许顺手把邻居的 owner 带走。
+        assert!(pm.unload_plugin("自己归还"), "卸载应当成功");
+        assert!(
+            !host::scheduler_has_owner_for_test("polite"),
+            "自己归还过的插件，卸载后 owner 该没了"
+        );
+        assert!(
+            host::scheduler_has_owner_for_test("quiet"),
+            "兜底归还只摘自己那个 stem：邻居的用户数不许被动到（动了就是旧事故的镜像）"
+        );
+
+        // 正题：没写 cleanup 的那一条，卸载必须替它把 owner 摘掉。
+        assert!(pm.unload_plugin("不归还"), "卸载应当成功");
+        assert!(
+            !host::scheduler_has_owner_for_test("quiet"),
+            "插件都不在表里了，owner 却还占着调度线程 ⇒ 定时任务照旧触发，且再无归还入口"
         );
     }
 
