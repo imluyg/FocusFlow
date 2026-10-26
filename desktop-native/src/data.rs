@@ -148,6 +148,11 @@ fn window_days(period: i64) -> Option<i64> {
 
 pub fn load(period: i64) -> Snapshot {
     let days = window_days(period);
+    // 采集开着时，写线程内存里那批**还没落库**的按键也要算进来：`queries::*` 读的是
+    // 已落库的部分，不加这一步「今日」会比输入慢一个 `flush_interval`（默认 10 秒）。
+    // `today_pending_count()` 在落库之后自己会减，所以 库值 + 增量 不会重复计。
+    // 采集没开时它恒为 0（没有写线程）。
+    let pending = crate::collect::pending_today();
     // 按周期查：键鼠排行、应用时长、设备次数都跟同一把尺子。
     let stats = queries::stats_totals(days, None);
     let all = queries::get_alltime_summary();
@@ -173,7 +178,7 @@ pub fn load(period: i64) -> Snapshot {
         Some(d) => d.max(1),
         None => daily.iter().map(|(_, v)| *v).filter(|v| *v > 0).count().max(1) as i64,
     };
-    let avg = stats.total / avg_days;
+    let avg = (stats.total + pending) / avg_days;
 
     let mut hours = hourly;
     hours.resize(24, 0);
@@ -203,7 +208,9 @@ pub fn load(period: i64) -> Snapshot {
     let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
     let goal = Some(goal_status(goal_cfg, &goal_rows, &today_str, 0));
 
-    let today = queries::get_today_count(None);
+    // 采集开着时，写线程内存里那批**还没落库**的按键也要算进来：`queries::*` 读的是
+    // 已落库的部分。见 `load` 开头对 `pending` 的说明。
+    let today = queries::get_today_count(None) + pending;
     // 今日前台时长：与下面应用排行同一个口径，只是窗口固定成 1 天（悬浮窗要的是"今天"）。
     let today_app_seconds = queries::get_app_stats(Some(1), None).0;
 
@@ -211,7 +218,7 @@ pub fn load(period: i64) -> Snapshot {
         period,
         today,
         today_app_seconds,
-        period_total: stats.total,
+        period_total: stats.total + pending,
         avg,
         max_day: all.max_day,
         rank,

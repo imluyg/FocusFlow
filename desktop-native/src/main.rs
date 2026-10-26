@@ -4,6 +4,7 @@
 //! FocusFlow 原生主界�?—�?原型（P0 平台 + P1a 合成渲染 + P1b 表格交互）�?//!
 //! 不引入任�?UI 框架：窗�?`CreateWindowExW`、界�?D3D11/D2D、文�?DirectWrite�?//! 托盘 `tray-icon`、热�?`global-hotkey`；行内改名用**原生 EDIT 子窗�?*�?//!
 //! 还没做（�?`docs/webview-removal-plan.md`）：滚动容器、其余五个视图、截图覆盖层�?
+mod collect;
 mod data;
 mod floating;
 mod floating_render;
@@ -19,7 +20,7 @@ use focusflow_core::plugins::manager::PluginManager;
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
-use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -82,6 +83,11 @@ const WM_OP_DONE: u32 = WM_APP + 4;
 const WM_SNIP_START: u32 = WM_APP + 6;
 /// 悬浮窗上双击：把主窗口叫出来（不受验收开关约束，这是产品行为）。
 const WM_SHOW_MAIN: u32 = WM_APP + 7;
+/// 自动化验收用：切一次「暂停采集」。采集是全局钩子，脚本没法点托盘菜单，
+/// 而设置页那一行要靠坐标点，够不到"暂停期间一个键都不记"这种断言。
+const WM_ACCEPTANCE_PAUSE: u32 = WM_APP + 8;
+/// 自动化验收用：走一遍「退出」（= 托盘菜单的退出），用来验"退出前 flush + 退出备份"。
+const WM_ACCEPTANCE_QUIT: u32 = WM_APP + 9;
 const TIMER_EVENTS: usize = 1;
 /// EDIT 。
 const EM_SETSEL: u32 = 0x00B1;
@@ -646,12 +652,27 @@ edit: Option<HWND>,
     /// EDIT 的文字色与底色（`WM_CTLCOLOREDIT` 用）。跟着主题走，与 `edit_bg` 同一份。
     edit_fg: COLORREF,
     edit_bg_color: COLORREF,
+    /// 托盘里的「暂停采集」勾选项：状态变化时要把勾一起改掉。
+    pause_item: Option<CheckMenuItem>,
+    /// 上一次画出来的「次/分」：100ms 心跳里对一次，变了才重画。
+    last_cpm: i64,
 }
 
 impl App {
     fn new(hwnd: HWND, mica: bool) -> windows::core::Result<Self> {
         // 配置单例：读 `config.ini`（没有就落一份默认值）。原型只用来定位数据目录。
-let _ = focusflow_core::config::instance();
+        let cfg = focusflow_core::config::instance();
+        // 采集默认关（`[collector] enabled = false`）：它一起来就是全局键鼠钩子，
+        // 要用户明确打开。打开时这里先起采集，再读第一份快照 —— 这样「今日」从第一帧
+        // 就带着未落库增量（否则首帧会少一截）。
+        if collect::enabled_in_config(cfg) {
+            match collect::start(cfg) {
+                Ok(()) => tracing_note("采集已启用（[collector] enabled = true）"),
+                Err(e) => tracing_note(&format!("采集没起来：{e}")),
+            }
+        } else {
+            tracing_note("采集未启用（[collector] enabled = false，可在设置页开启）");
+        }
         let db = focusflow_core::db::Database::init_readonly();
         let period = Arc::new(AtomicI64::new(-1));
         let first = data::load(-1);
@@ -673,8 +694,15 @@ let _ = focusflow_core::config::instance();
                 tab: center_format(&dwrite, 12.5)?,
             };
 
-            let tray = make_tray(&snap);
+            let (tray, pause_item) = make_tray(&snap);
             let (hotkeys, hotkey_hk, snip_hk) = make_hotkeys();
+
+            // 采集开着 + 旧版也在跑 = 双计。启动就把这句话摆到设置页底部，别只留在日志里。
+            let boot_status = if collect::is_started() && collect::legacy_running() {
+                Some("注意：检测到旧版 FocusFlow.exe 在跑，两处采集会让数字翻倍；建议只留一个".to_string())
+            } else {
+                None
+            };
 
             // 悬浮窗：独立线程 + 独立分层窗口，主窗口收起时也常驻。
             // 起不来只记一句 —— 主界面不该因为"小卡片起不来"而失败。
@@ -758,7 +786,7 @@ let dpi = GetDpiForWindow(hwnd) as f32;
                 period,
                 detail: None,
                 heat_hover: None,
-                status: None,
+                status: boot_status,
                 busy: false,
                 search: String::new(),
                 search_edit: None,
@@ -779,6 +807,8 @@ let dpi = GetDpiForWindow(hwnd) as f32;
                 edit_bg,
                 edit_fg,
                 edit_bg_color,
+                pause_item,
+                last_cpm: -1,
             })
         }
     }
@@ -901,6 +931,9 @@ fn ensure_target(&mut self, hwnd: HWND) {
                 hotkey_on: self.hotkey_hk.is_some(),
                 floating_on: floating::is_visible(),
                 dark: tokens.dark,
+                collector_on: collect::is_started(),
+                collector_paused: collect::is_paused(),
+                cpm: collect::cpm(),
             };
             let pv = self.plugin_open.as_ref().and_then(|name| {
                 self.pm
@@ -1261,6 +1294,8 @@ let y0 = g.list_top + vis as f32 * g.row_h;
                                 let _ = InvalidateRect(Some(hwnd), None, false);
                             }
                         }
+                        SItem::Basic(Basic::Collector) => self.toggle_collector(hwnd),
+                        SItem::Basic(Basic::Pause) => self.toggle_pause(hwnd),
                         SItem::Basic(Basic::Theme) => toggle_theme(hwnd),
                         SItem::Basic(Basic::DataDir) => self.open_data_dir(),
                         SItem::Setting(i) => {
@@ -1575,6 +1610,57 @@ self.hotkey_hk = Some(hk);
         self.status = Some(msg);
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    /// 开/关采集。开是立即生效的；关的未来是「现在停止计数 + 下次启动不再初始化」——
+    /// 写线程/应用采样/设备侧信道是 `Database::init` 起的一次性线程，core 没有对外停止接口
+    /// （而且本轮不动 core），所以彻底退出要重启。
+    fn toggle_collector(&mut self, hwnd: HWND) {
+        let cfg = focusflow_core::config::instance();
+        let msg = if collect::is_started() {
+            let _ = cfg.set("collector", "enabled", "false");
+            collect::stop_listening();
+            "采集已停用：键鼠与设备计数已停，重启后彻底退出".to_string()
+        } else {
+            match collect::start(cfg) {
+                Ok(()) => {
+                    let _ = cfg.set("collector", "enabled", "true");
+                    "采集已启用：开始记录键鼠（全局，仅本机）".to_string()
+                }
+                Err(e) => format!("采集没起来：{e}"),
+            }
+        };
+        // 暂停勾选项要跟着新状态走（托盘与设置页共用同一份运行时）。
+        self.sync_pause_item();
+        tracing_note(&msg);
+        self.status = Some(msg);
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    /// 暂停/继续采集（运行时开关，不写配置）。
+    fn toggle_pause(&mut self, hwnd: HWND) {
+        let msg = if !collect::is_started() {
+            "采集未启用，先在上面那一行打开采集".to_string()
+        } else if collect::toggle_pause() {
+            "采集已暂停：键鼠与设备计数都停了".to_string()
+        } else {
+            "采集已继续".to_string()
+        };
+        self.sync_pause_item();
+        tracing_note(&msg);
+        self.status = Some(msg);
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    /// 托盘里的勾与真实暂停位对齐。
+    fn sync_pause_item(&self) {
+        if let Some(it) = &self.pause_item {
+            let _ = it.set_checked(collect::is_paused());
         }
     }
 
@@ -2199,6 +2285,8 @@ enum SItem {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Basic {
     Autostart,
+    Collector,
+    Pause,
     Hotkey,
     Floating,
     Theme,
@@ -2208,6 +2296,8 @@ enum Basic {
 fn basic_label(b: Basic) -> &'static str {
     match b {
         Basic::Autostart => "开机自启",
+        Basic::Collector => "采集",
+        Basic::Pause => "暂停采集",
         Basic::Hotkey => "全局热键",
         Basic::Floating => "悬浮窗",
         Basic::Theme => "主题",
@@ -2221,6 +2311,8 @@ fn settings_items(snap: &Snapshot, filter: &str) -> Vec<SItem> {
     let mut out = Vec::new();
     for b in [
         Basic::Autostart,
+        Basic::Collector,
+        Basic::Pause,
         Basic::Hotkey,
         Basic::Floating,
         Basic::Theme,
@@ -2403,6 +2495,55 @@ let sbox = search_box_rect(w);
                             &p.br.muted,
                         );
                     }
+                    // 采集：默认关；打开就是全局键鼠监听（设置页那一行是唯一的入口）。
+                    Basic::Collector => {
+                        let on = vs.collector_on;
+                        let legacy = on && collect::legacy_running();
+                        p.round(vb, 6.0, if on { &p.br.success } else { &p.br.grid }, None);
+                        p.text(
+                            if on { "已启用" } else { "未启用" },
+                            vb,
+                            &p.fmt.center_small,
+                            if on { &p.br.white } else { &p.br.muted },
+                        );
+                        p.text(
+                            if legacy {
+                                // 双计是"数字会悄悄翻倍"的那种错，必须钉在这一行上；
+                                // 底部状态行会被别的操作覆盖掉。
+                                "检测到旧版 FocusFlow.exe 也在采集：两处相加会让数字翻倍，只留一个"
+                            } else if on {
+                                "全局键鼠监听已开；停用后要重启才彻底退出（[collector] enabled）"
+                            } else {
+                                "默认关闭；点一下开始采集（全局键鼠，只存本机）"
+                            },
+                            rect(vb.right + 12.0, y + 5.0, 520.0, 18.0),
+                            &p.fmt.small,
+                            if legacy { &p.br.danger } else { &p.br.muted },
+                        );
+                    }
+                    Basic::Pause => {
+                        let (label, bg, fg) = if !vs.collector_on {
+                            ("—", &p.br.grid, &p.br.muted)
+                        } else if vs.collector_paused {
+                            ("已暂停", &p.br.accent, &p.br.white)
+                        } else {
+                            ("采集中", &p.br.success, &p.br.white)
+                        };
+                        p.round(vb, 6.0, bg, None);
+                        p.text(label, vb, &p.fmt.center_small, fg);
+                        p.text(
+                            if !vs.collector_on {
+                                "采集没启用，暂停无从谈起"
+                            } else if vs.collector_paused {
+                                "已暂停；点一下继续（键鼠与设备计数一起恢复）"
+                            } else {
+                                "点一下暂停：键鼠与设备计数一起停，不写配置、重启即恢复"
+                            },
+                            rect(vb.right + 12.0, y + 5.0, 520.0, 18.0),
+                            &p.fmt.small,
+                            &p.br.muted,
+                        );
+                    }
                     Basic::Hotkey => {
                         let on = vs.hotkey_on;
                         p.round(vb, 6.0, if on { &p.br.success } else { &p.br.grid }, None);
@@ -2498,11 +2639,13 @@ let (label, desc) = ACTIONS[a];
 
     // 状态行
     if let Some(line) = status {
+        // 「注意：…」是双计/采集异常这类要人处理的事，用危险色；其余是普通状态行。
+        let warn = line.starts_with("注意");
         p.text(
             line,
             rect(card.left + 16.0, card.bottom - 26.0, card.right - card.left - 32.0, 18.0),
             &p.fmt.small,
-            &p.br.muted,
+            if warn { &p.br.danger } else { &p.br.muted },
         );
     }
 
@@ -2723,6 +2866,10 @@ hotkey_on: bool,
     floating_on: bool,
     /// 当前主题是不是深色（设置页那一行显示"深色/浅色"）。
     dark: bool,
+    /// 采集真的起来了没有 / 是不是暂停着 / 最近 60 秒的次数。
+    collector_on: bool,
+    collector_paused: bool,
+    cpm: i64,
 }
 
 /// 左表格卡片的矩形：画图与命中测试共用。
@@ -2803,15 +2950,22 @@ fn draw_screen(
         .max_day
         .clone()
         .unwrap_or_else(|| ("—".to_string(), 0));
+    // 「当前速度」有三种状态：没开采集（只读）、开着但暂停、正在采集。
+    // 没数据时不写内部代号，也不留一个看起来只是暂时没数的空位。
+    let (speed_value, speed_sub) = if !vs.collector_on {
+        ("—".to_string(), "本端只读 · 未接采集".to_string())
+    } else if vs.collector_paused {
+        ("—".to_string(), "采集已暂停".to_string())
+    } else {
+        (thousands(vs.cpm.max(0) as u64), "次/分 · 近 60 秒".to_string())
+    };
     let cards: Vec<(String, String, String)> = vec![
         (
             "今日活跃".into(),
             thousands(snap.today as u64),
             format!("共 {} 个键位", snap.rank.len()),
         ),
-        // 采集没接（见 docs/webview-removal-plan.md §10n）：这一格给「—」并说清是"只读"，
-        // 不写内部代号，也不留一个看起来只是暂时没数据的空缺。
-        ("当前速度".into(), "—".into(), "本端只读 · 未接采集".into()),
+        ("当前速度".into(), speed_value, speed_sub),
         (
             "总计".into(),
             thousands(snap.period_total.max(0) as u64),
@@ -5252,13 +5406,22 @@ let scroll = vs.scroll.min(count.saturating_sub(g.max_rows));
     }
 
     if count == 0 {
+        // 采集开着时列表会先空一段：排行读的是**已落库**的聚合表，而写线程按
+        // `[database] flush_interval`（默认 10 秒）才落一次。这不是"没记上"，
+        // 所以这里要说清楚还差哪一步 —— 不然"今日 5 次 + 空列表"看着像 bug。
+        let pending = collect::pending_today();
         let empty = match tab {
-            1 => "今日还没有应用时长（[app_stats] enabled 关着？）",
-            2 => "今日还没有设备计数（[device_stats] enabled 关着？）",
-            _ => "今日还没有记录（数据目录见左下角）",
+            1 => "今日还没有应用时长（[app_stats] enabled 关着？）".to_string(),
+            2 => "今日还没有设备计数（[device_stats] enabled 关着？）".to_string(),
+            _ if pending > 0 => format!(
+                "已记录 {} 条，还没落库（写线程每 {} 秒写一次，落库后就出现在这里）",
+                thousands(pending as u64),
+                focusflow_core::config::instance().get_int("database", "flush_interval", 10).max(1)
+            ),
+            _ => "今日还没有记录（数据目录见左下角）".to_string(),
         };
         p.text(
-            empty,
+            &empty,
             rect(
                 r.left + g.pad + 10.0,
                 g.list_top + 8.0,
@@ -5561,41 +5724,59 @@ fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
 
 // ===== 托盘 / 热键 / 单实�?=====
 
-fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> Option<TrayIcon> {
+fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenuItem>) {
     let today = snap.lock().map(|s| s.today).unwrap_or(0);
     let menu = Menu::new();
     let show = MenuItem::with_id("show", "显示主窗口", true, None);
     let snip = MenuItem::with_id("snip", "截图（选区）", true, None);
     let floating_item = MenuItem::with_id("floating", "悬浮窗", true, None);
+    // 暂停是运行时开关（不写配置）：它只停"计数"，不改变"是否启用采集"这件事。
+    let pause = CheckMenuItem::with_id("pause", "暂停采集", true, collect::is_paused(), None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
     let sep = PredefinedMenuItem::separator();
-    if let Err(e) = menu.append_items(&[&show, &snip, &floating_item, &sep, &quit]) {
+    if let Err(e) = menu.append_items(&[&show, &snip, &floating_item, &pause, &sep, &quit]) {
         tracing_note(&format!("托盘菜单构建失败：{e}"));
-        return None;
+        return (None, None);
     }
 
     let icon = match Icon::from_rgba(tray_icon_rgba(32), 32, 32) {
         Ok(i) => i,
         Err(e) => {
             tracing_note(&format!("托盘图标构建失败：{e}"));
-            return None;
+            return (None, None);
         }
     };
     match TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_icon(icon)
-        .with_tooltip(format!("FocusFlow · 今日 {}", thousands(today as u64)))
+        .with_tooltip(tray_tooltip(today))
         .build()
     {
         Ok(t) => {
             tracing_note("托盘已创建");
-            Some(t)
+            (Some(t), Some(pause))
         }
         Err(e) => {
             tracing_note(&format!("托盘创建失败：{e}"));
-            None
+            (None, None)
         }
     }
+}
+
+/// 托盘 tooltip：今日次数 + 采集状态（采集开着时才有后半截）。
+fn tray_tooltip(today: i64) -> String {
+    let mut tip = format!("FocusFlow · 今日 {}", thousands(today as u64));
+    if collect::is_started() {
+        tip.push_str(if collect::is_paused() {
+            " · 已暂停"
+        } else {
+            " · 采集中"
+        });
+        if collect::legacy_running() {
+            tip.push_str(" · 旧版在跑");
+        }
+    }
+    tip
 }
 
 fn make_hotkeys() -> (
@@ -5795,6 +5976,16 @@ fn toggle_theme(hwnd: HWND) {
     }
 }
 
+/// 退出：托盘菜单与验收消息共用这一条。顺序有讲究 —— 先收卡片，再停采集并落库
+/// （`collect::shutdown` 里是 flush → stop writer → backup_on_exit），最后才销毁主窗口。
+fn quit_app(hwnd: HWND) {
+    floating::shutdown();
+    collect::shutdown(focusflow_core::config::instance());
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
 /// GUI 程序没有控制台，出错时留一份文件，别静默消失。
 fn tracing_note(msg: &str) {
     use std::io::Write;
@@ -5917,11 +6108,12 @@ while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
-                    "quit" => unsafe {
-                        // 卡片是独立窗口：先让它自己收，再销毁主窗口（否则消息循环还挂在那儿）。
-                        floating::shutdown();
-                        let _ = DestroyWindow(hwnd);
-                    },
+                    "pause" => {
+                        if let Some(app) = unsafe { app_ptr(hwnd) } {
+                            app.toggle_pause(hwnd);
+                        }
+                    }
+                    "quit" => quit_app(hwnd),
                     _ => {}
                 }
             }
@@ -5957,13 +6149,28 @@ if let Some(app) = unsafe { app_ptr(hwnd) } {
                     }
                 }
             }
+            // 「当前速度」跟这 100ms 一拍走：数值变了才重画（否则等于 10Hz 全窗重绘）。
+            let cpm_now = if collect::is_started() && !collect::is_paused() {
+                collect::cpm()
+            } else {
+                0
+            };
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                if app.last_cpm != cpm_now {
+                    app.last_cpm = cpm_now;
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+            }
             LRESULT(0)
         }
         WM_REFRESH => {
             if let Some(app) = unsafe { app_ptr(hwnd) } {
                 let n = app.snap.lock().map(|s| s.today).unwrap_or(0);
                 if let Some(t) = &app.tray {
-                    let _ = t.set_tooltip(Some(format!("FocusFlow · 今日 {}", thousands(n as u64))));
+                    // tooltip 里带上采集状态：暂停时界面上看得出来。
+                    let _ = t.set_tooltip(Some(tray_tooltip(n)));
                 }
             }
             unsafe {
@@ -6194,6 +6401,18 @@ unsafe {
             // 悬浮窗上双击。产品行为，不受验收开关约束。
             tracing_note("悬浮窗双击：唤出主窗口");
             unsafe { bring_to_front(hwnd) };
+            LRESULT(0)
+        }
+        WM_ACCEPTANCE_PAUSE if ACCEPTANCE.load(std::sync::atomic::Ordering::Relaxed) => {
+            tracing_note("验收消息：切换暂停采集");
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                app.toggle_pause(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_ACCEPTANCE_QUIT if ACCEPTANCE.load(std::sync::atomic::Ordering::Relaxed) => {
+            tracing_note("验收消息：退出（走与托盘菜单同一条路）");
+            quit_app(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
