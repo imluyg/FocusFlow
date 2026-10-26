@@ -82,6 +82,14 @@ impl AliasTable {
                     }
                     // 同型号已有不同别名 → 标记歧义
                     Some(Some(existing)) if *existing != alias => {
+                        // 精确层那一条冲突有 warn（上面"保留…忽略…"），这一半过去是静默的：
+                        // 症状是"换过 USB 口的设备从此退回自动名"，而原因只是文件里两行起了
+                        // 两个名字 —— 不说出来，这一刻只有用户在猜是不是软件不认他的设备。
+                        tracing::warn!(
+                            "别名回退键 {model_key} 歧义：两个不同别名（「{existing}」与「{alias}」），\
+                             这个型号不再参与回退：实例路径变过的设备会退回自动名，\
+                             精确别名照旧生效",
+                        );
                         model.insert(model_key, None);
                     }
                     Some(_) => {}
@@ -538,6 +546,68 @@ mod tests {
         let out = f();
         invalidate_cache();
         out
+    }
+
+    /// 型号回退被判成"歧义"那一刻要出声 —— 它是这条链路上唯一会让别名**失效**的降级，
+    /// 而原因躺在用户可以直接手改的文件里两行。
+    ///
+    /// 精确层的冲突有 warn（`from_map` 里"保留…忽略…"那条），型号层这一半过去是静默的：
+    /// 同一型号+接口下出现两个**不同**别名，该回退键被标成 `None`，此后换过 USB 口的设备
+    /// 从此退回自动名。用户看到的症状是"我明明起过名字，怎么不认了"，日志一个字没有；
+    /// 而跨形态漂移（`#` 三段式与反斜杠那一种）正是手改/半迁移最常见的形状。
+    ///
+    /// 反向腿钉住两种**不该**喊的：两个别名相同（同型号两台起同一个名字，回退照用），
+    /// 以及精确层落败的那一条（它压根不参与展示，拿它判歧义会白打掉一个好端端的回退）。
+    #[test]
+    fn a_model_fallback_lost_to_ambiguity_says_so() {
+        // 一个既不在这两条精确键里、又同型号同接口的新实例路径：只有回退能认它。
+        let fresh = r"HID\VID_24AE&PID_1464&MI_00\x&y&z";
+        let shape_a = r"HID#VID_24AE&PID_1464&MI_00#7&1a2b&0&0000";
+        let shape_b = r"HID\VID_24AE&PID_1464&MI_00\a&b&c";
+
+        let mut map = BTreeMap::new();
+        map.insert(shape_a.to_string(), "办公鼠标".to_string());
+        map.insert(shape_b.to_string(), "家里鼠标".to_string());
+        let (table, logs) = crate::logger::capture_logs(|| AliasTable::from_map(&map));
+
+        assert!(
+            table.resolve(fresh).is_none(),
+            "夹具前提：这一型号已经判歧义，回退不该再给出名字"
+        );
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("歧义") && l.contains("24AE")),
+            "回退被打掉必须点名是哪个型号键，否则这一刻只有用户在猜，实得日志：{logs:?}"
+        );
+
+        // 反向腿①：两条别名一模一样 ⇒ 回退照用，且不许喊。
+        let mut same = BTreeMap::new();
+        same.insert(shape_a.to_string(), "办公鼠标".to_string());
+        same.insert(shape_b.to_string(), "办公鼠标".to_string());
+        let (table, logs) = crate::logger::capture_logs(|| AliasTable::from_map(&same));
+        assert_eq!(
+            table.resolve(fresh),
+            Some("办公鼠标"),
+            "同型号同接口起同一个名字，正是回退该顶上的场合"
+        );
+        assert!(
+            !logs.iter().any(|l| l.contains("歧义")),
+            "没有分歧就不许报歧义，实得日志：{logs:?}"
+        );
+
+        // 反向腿②：精确层落败的那一条不参与展示，不该被拉来判歧义（原有口径，别弱化）。
+        let mut loser = BTreeMap::new();
+        loser.insert(shape_a.to_string(), "办公鼠标".to_string());
+        loser.insert(
+            r"HID#VID_24AE&PID_1464&MI_00#7&1a2b&0&0001".to_string(),
+            "别的名字".to_string(),
+        );
+        let (table, _logs) = crate::logger::capture_logs(|| AliasTable::from_map(&loser));
+        assert_eq!(
+            table.resolve(fresh),
+            Some("办公鼠标"),
+            "同一个身份键的另一种写法被忽略之后，剩下那条仍然要能用回退顶上"
+        );
     }
 
     /// 三态换算表钉死：只有 `NotFound` 算"确认没有"，其余一律是"问不出"。
