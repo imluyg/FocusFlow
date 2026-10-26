@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/cli",
-    "desktop",
+    "desktop-native",
 ]
 
 [workspace.package]

@@ -1,0 +1,66 @@
+[package]
+name = "focusflow-native"
+version = "0.5.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[dependencies]
+# 不加任何 UI 框架：窗口、控件、文字、图表全部走 Windows 自己的绘制栈。
+# `windows` 本来就在 desktop 的依赖里（原生悬浮窗/贴图在用），这里只是多开几个 feature。
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Foundation_Numerics",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    # P1a：D3D11 + 合成交换链 + DirectComposition —— Mica 透出的前提。
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    # 剪贴板（截图后直接能粘贴）：OpenClipboard/SetClipboardData + GlobalAlloc。
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    # MARGINS 在 UI::Controls 下，DwmExtendFrameIntoClientArea 的参数要它。
+    "Win32_UI_Controls",
+    # 行内编辑要子类化 EDIT（SetWindowSubclass 在 Shell 模块下）；
+    # 悬停要 TrackMouseEvent 拿 WM_MOUSELEAVE。
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Direct2D 的 DrawLine 收 `windows-numerics` 的 Vector2；windows 0.61 用的是 0.2。
+windows-numerics = "0.2"
+
+# 托盘 / 菜单 / 热键：tauri 用的就是这三个底层 crate（同一批版本已在 cargo 缓存里），
+# 换成自建消息循环之后它们照样能用。
+tray-icon = "0.24"
+muda = "0.19"
+global-hotkey = "0.8"
+
+# 只读数据：读库与统计口径全部复用 core，不在原生端另写一份 SQL。
+focusflow-core = { path = "../crates/core" }
+
+# 系统窗口材质（Mica）。它收 `raw_window_handle::HasWindowHandle`，
+# 原生窗口只有 HWND，所以下面还要一个 wrapper（见 main.rs 的 HwndWrap）。
+window-vibrancy = "0.6"
+raw-window-handle = "0.6"
+
+# 目标条的「今天」要用本地日期字符串（与按日序列的键同一格式）。
+chrono = "0.4"
+
+# 文件保存对话框（导出 CSV 用）。版本与 desktop 里那个一致，已在 cargo 缓存里。
+rfd = "0.15"
+
+# 截图落盘：只用一个最小 PNG 编码器（工作区锁文件里已有 0.17，缓存里有源码）。
+png = "0.17"

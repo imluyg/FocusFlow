@@ -44,28 +44,28 @@ FocusFlow 是一款 Windows 键鼠活跃度统计与效率分析工具：实时�
 crates/
   core/      核心库：数据库、键鼠监听、设备统计（Raw Input）、统计、配置、Lua 插件宿主
   cli/       命令行工具：统计查询 / 导出 / 清空
-desktop/     Tauri v2 桌面应用（当前主版本）
-  src/       Rust 后端：命令、状态、托盘、热键、插件交互、截图会话、导出
-  ui/        前端（HTML/CSS/JS ES module，无构建步骤）
-  capabilities/   Tauri 能力配置（ACL 权限）
-  tauri.conf.json 窗口/打包配置
-dist/       打包输出（绿色版 + NSIS 安装包，不入库）
+desktop-native/  桌面应用（当前主版本，Win32 + Direct2D 全原生，无 WebView）
+  src/       Rust 源码：自建消息循环、D2D/DWrite 渲染、托盘/热键、六个视图、截图覆盖层
+dist/       打包输出（绿色版 + 安装包，不入库）
 ```
+
+> 旧版 Tauri/WebView2 桌面端已删除（P7）。源码快照在 `desktop-tauri-backup.zip`，
+> 仅作对照，不再参与构建。
 
 ## 构建
 
-要求：Rust 1.80+、Node.js（仅 Tauri CLI 用 npx）、MSVC Build Tools、Windows 10/11。
+要求：Rust 1.80+、MSVC Build Tools、Windows 10/11（不再需要 Node.js / WebView2 Runtime）。
 
 ```bash
-# 绿色版（dist\FocusFlow\FocusFlow.exe）
-build_tauri.bat
+# 全 workspace（core + cli + desktop-native）
+cargo build --release
 
-# NSIS 安装包（desktop/target/release/bundle/nsis/ 下）
-desktop\build_nsis.bat
+# 只构建桌面端 → target/release/focusflow-native.exe
+cargo build --release -p focusflow-native
 ```
 
-运行：直接双击 `dist\FocusFlow\FocusFlow.exe`，或安装 NSIS 安装包。
-程序目录（exe 所在目录）放程序本体：`config.ini`、`window_state.ini`、`plugins/`、`logs/`；
+运行：直接双击 `focusflow-native.exe`。程序目录（exe 所在目录）放程序本体：
+`config.ini`、`window_state.ini`、`plugins/`、`logs/`；
 数据放 `data/`（键鼠记录与各附属库）和 `backup/`，默认也在程序目录里 ——
 拷走整个文件夹即迁移。要把数据放到别处：设置页「数据目录 → 更改数据文件夹…」，
 它把 `data/` 与 `backup/` **复制**过去（原目录完整留着当备份）并自动重启生效，
@@ -77,8 +77,8 @@ desktop\build_nsis.bat
 
 - 后端：`cargo build` / `cargo test --workspace` / `cargo clippy --workspace`；
   格式与 lint 在 CI（`.github/workflows/ci.yml`）强制执行。
-- 前端：`desktop/ui/` 纯原生 ES module（无构建步骤）——`js/main.js` 为入口，
-  主题变量唯一来源为 `tokens.css`。
+- 界面：`desktop-native/`（Win32 + Direct2D/DirectWrite 全原生，自绘 + 少量原生 EDIT 子窗口）。
+  主题色令牌集中在 `src/main.rs` 顶部（对齐旧版 `tokens.css`）。
 - 插件：`crates/core/plugins/` 为源码，构建时复制到运行目录 `plugins/`（热重载）。
 
 ## 常见问题

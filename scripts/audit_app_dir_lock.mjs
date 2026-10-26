@@ -30,7 +30,7 @@ import path from "node:path";
 const roots = process.argv.slice(2);
 const dirs = roots.length
   ? roots
-  : ["crates/core/src", "crates/core/tests", "crates/cli/src", "desktop/src"];
+  : ["crates/core/src", "crates/core/tests", "crates/cli/src", "desktop-native/src"];
 const files = [];
 (function walk(dir) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {

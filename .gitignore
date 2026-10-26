@@ -21,10 +21,8 @@
 # 它下次打包还会写回来，见交接文档 §八·3）
 /pkg.txt
 
-# Tauri 构建产物与打包目录（含用户数据，不入库）
-/dist-tauri/
-/desktop/gen/
-/desktop/target/
+# 旧版 Tauri 桌面端的源码备份（P7 删除时打的包，只作对照，不入库）
+/desktop-tauri-backup.zip
 
 # AI 助手 / 编辑器的工作目录与说明文件：属个人环境，不入库
 .scratch/

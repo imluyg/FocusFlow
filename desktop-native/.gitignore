@@ -1,0 +1,6 @@
+# 原型期的本地产物：测试数据、截图、日志、构建输出。
+# 这个 crate 将来会进 workspace（P7），但这些东西永远不该进库。
+/probe/
+/target/
+/*.png
+focusflow-native.log
