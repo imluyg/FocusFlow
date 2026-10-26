@@ -48,6 +48,21 @@ function flushPosition() {
 document.addEventListener("mousemove", (e) => {
   if (!isDown) return;
   if (!drag) return;
+  // 事件自己带着"现在还按没按住"，以它为准：卡片只有 90×46，拖快一点或拖到屏幕边上，
+  // 指针就跑到窗口外面去了，而 `mouseup` 只在指针还在窗口里时才发到这里 ——
+  // 于是 `isDown` 一直留着。下一次鼠标只是**滑过**这张卡片（一个键都没按），
+  // 下面那段照旧算位移、照旧 setPosition：症状是"悬浮窗自己跳走了"。
+  // 上面那条 `blur`/`visibilitychange` 的复位盖不住这一种（松手在别处不等于本窗失焦）。
+  if (!(e.buttons & 1)) {
+    isDown = false;
+    // 已经在飞的 rAF 让它落地，然后收尾存位置：这一次拖动确实结束了，
+    // 不存就等于"拖到哪儿算哪儿，重开又回到旧位置"。
+    requestAnimationFrame(() => {
+      flushPosition();
+      persistPosition();
+    });
+    return;
+  }
   // 逻辑像素位移 → 物理像素位移
   const dx = e.screenX - drag.startX;
   const dy = e.screenY - drag.startY;

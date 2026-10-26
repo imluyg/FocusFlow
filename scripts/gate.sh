@@ -114,6 +114,7 @@ HARNESSES="
 .scratch/run_export_period_harness.sh|EXPORT_PERIOD_HARNESS_OK
 .scratch/run_mem_harness.sh|MEM_SNAPSHOT_OK
 .scratch/run_floating_notice_harness.sh|FLOATING_NOTICE_HARNESS_OK
+.scratch/run_floating_drag_harness.sh|FLOATING_DRAG_HARNESS_OK
 "
 harness_ran=0
 for entry in $HARNESSES; do
