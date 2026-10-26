@@ -20,6 +20,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-floati
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-theme.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-collect.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-plugins.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-hotkey.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-datadir.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-installer.ps1
 ```
 
@@ -35,6 +37,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 | `accept-collect.ps1` | 点 5 下 → 今日 +5、速度 >0 / 暂停后不再涨、速度归 0 / 继续再 +5 / 退出 flush + 退出备份 / core 日志「数据库已关闭」 | 14 项 |
 | `accept-plugins.ps1` | 插件视图：`button.modal` 开弹窗、弹窗与正文的 Select 写回、提交/关闭触发插件动作、Esc 关弹窗 | 11 项 |
 | `accept-hotkey.ps1` | 两轮启动：配置里的两条组合按原样注册（日志逐字对）/ 一条写成裸键时程序照样起、日志点名被拒的那条、另一条照样注册 | 9 项 |
+| `accept-datadir.ps1` | 两轮启动：`[paths]` 里那条待搬运标记由启动早期兑现（data/ 与 backup/ 真到了新根、旧根清空、标记归空、日志点名新根）/ 新根建不出来时数据原地不动、标记留着下次重试 | 13 项 |
 | `accept-installer.ps1` | 静默装 → 目录/卸载器/快捷方式/注册表/版本号/exe 图标 → 装出来的 exe 默认在采集 → 静默卸 → 全部清干净 | 17 项 |
 
 `accept-plugins.ps1` 断言的是应用日志里的 **ASCII 片段**（字段名 `d_type`/`f_cat`、动作 id

@@ -688,8 +688,30 @@ impl App {
     fn new(hwnd: HWND, mica: bool) -> windows::core::Result<Self> {
         // 配置单例：读 `config.ini`（没有就落一份默认值）。原型只用来定位数据目录。
         let cfg = focusflow_core::config::instance();
-        // 采集默认关（`[collector] enabled = false`）：它一起来就是全局键鼠钩子，
-        // 要用户明确打开。打开时这里先起采集，再读第一份快照 —— 这样「今日」从第一帧
+        // 「更改数据文件夹」是上一回按下的：标记留在 `[paths] data_migrate_from`，
+        // 由**这个**进程在启动早期兑现 —— 早于采集与任何读库，否则旧进程还会往旧目录
+        // 落增量，搬过去就少一截。搬不成时 core 会把数据根钉回旧目录并留一条启动说明。
+        let moved = focusflow_core::data_location::run_pending_migration();
+        let move_notice = focusflow_core::data_location::take_startup_notice();
+        if let Some(r) = &moved {
+            tracing_note(&format!(
+                "数据目录已搬运：{} → {}（{} 个文件 / {} 字节，{}）",
+                r.from.display(),
+                r.to.display(),
+                r.summary.copied,
+                r.summary.bytes,
+                if r.leftover_in_source > 0 {
+                    format!("旧目录还剩 {} 项删不掉", r.leftover_in_source)
+                } else {
+                    "旧目录已清空".to_string()
+                }
+            ));
+        }
+        if let Some(n) = &move_notice {
+            tracing_note(&format!("数据目录迁移：{}：{}", n.step, n.detail));
+        }
+        // 采集按 `[collector] enabled`（默认开）：它一起来就是全局键鼠钩子。
+        // 打开时这里先起采集，再读第一份快照 —— 这样「今日」从第一帧
         // 就带着未落库增量（否则首帧会少一截）。
         if collect::enabled_in_config(cfg) {
             match collect::start(cfg) {
@@ -723,12 +745,25 @@ impl App {
             let (tray, pause_item) = make_tray(&snap);
             let (hotkeys, hotkey_hk, snip_hk) = make_hotkeys();
 
-            // 采集开着 + 旧版也在跑 = 双计。启动就把这句话摆到设置页底部，别只留在日志里。
-            let boot_status = if collect::is_started() && collect::legacy_running() {
-                Some("注意：检测到旧版 FocusFlow.exe 在跑，两处采集会让数字翻倍；建议只留一个".to_string())
-            } else {
-                None
-            };
+            // 启动时这条状态行只放一句话，按"要紧的先说"排：
+            // 搬迁没成 > 双计提醒 > 刚搬完告知搬到了哪。
+            let boot_status = move_notice
+                .as_ref()
+                .map(|n| format!("注意：{}（{}）", n.detail, n.step))
+                .or_else(|| {
+                    if collect::is_started() && collect::legacy_running() {
+                        Some("注意：检测到旧版 FocusFlow.exe 在跑，两处采集会让数字翻倍；建议只留一个".to_string())
+                    } else {
+                        moved.as_ref().map(|r| {
+                            format!(
+                                "数据目录已搬到 {}（{} 个文件 / 旧目录剩 {} 项）",
+                                r.to.display(),
+                                r.summary.copied,
+                                r.leftover_in_source
+                            )
+                        })
+                    }
+                });
 
             // 悬浮窗：独立线程 + 独立分层窗口，主窗口收起时也常驻。
             // 起不来只记一句 —— 主界面不该因为"小卡片起不来"而失败。
@@ -1724,6 +1759,35 @@ let snap_data = if which >= 3 {
                         }
                         line
                     }
+                    7 => {
+                        let src = focusflow_core::data_location::current_data_home();
+                        let dst = match std::env::var("FOCUSFLOW_DATA_HOME_PICK") {
+                            // 测试钩子：给了目录就不弹框，验收才能重复跑
+                            Ok(p) => std::path::PathBuf::from(p),
+                            Err(_) => {
+                                let picked = rfd::FileDialog::new()
+                                    .set_title("选择新的数据根目录（data/ 与 backup/ 会搬进去）")
+                                    .pick_folder();
+                                match picked {
+                                    Some(p) => p,
+                                    None => {
+                                        if let Ok(mut q) = ops.lock() {
+                                            q.push("已取消".to_string());
+                                        }
+                                        let target = HWND(hwnd_val as *mut core::ffi::c_void);
+                                        let _ = unsafe {
+                                            PostMessageW(Some(target), WM_OP_DONE, WPARAM(0), LPARAM(0))
+                                        };
+                                        return;
+                                    }
+                                }
+                            }
+                        };
+                        match arrange_data_move(&src, &dst) {
+                            Ok(line) => line,
+                            Err(e) => format!("没能安排搬迁：{e}"),
+                        }
+                    }
                     _ => "未知操作".to_string(),
                 };
                 if let Ok(mut q) = ops.lock() {
@@ -2053,8 +2117,10 @@ fn run_plugin_action(&mut self, hwnd: HWND, name: &str, action: &str) {
     }
 
     /// 数据目录：交给资源管理器打开（不自己实现文件浏览）。
+    /// 打开的是**当前生效**的数据根，不是程序目录 —— 两者一旦分开（用户改过数据文件夹），
+    /// 按程序目录打开会让人以为数据没搬过去。
 fn open_data_dir(&self) {
-        let dir = focusflow_core::paths::app_dir();
+        let dir = focusflow_core::data_location::current_data_home();
         match std::process::Command::new("explorer").arg(&dir).spawn() {
             Ok(_) => tracing_note(&format!("打开数据目录：{}", dir.display())),
             Err(e) => tracing_note(&format!("打不开数据目录：{e}")),
@@ -2708,7 +2774,7 @@ fn settings_geom(_w: f32, h: f32) -> SettingsGeom {
 }
 
 /// 设置页底部的数据操作（后台线程跑，结果回投 `WM_OP_DONE`）。
-const ACTIONS: [(&str, &str); 7] = [
+const ACTIONS: [(&str, &str); 8] = [
     ("立即备份", "把年度库各快照一份到 backup/"),
     ("压缩数据库", "重建年度库，回收空闲页"),
     ("清理 30 天前", "删掉 30 天以前的明细（不可撤销）"),
@@ -2716,6 +2782,7 @@ const ACTIONS: [(&str, &str); 7] = [
     ("导出 HTML", "写成一份可直接打开的网页报告"),
     ("导出 JSON", "写成结构化数据（脚本可读）"),
     ("导入旧数据…", "从旧版数据目录合并进来（先留档再覆盖）"),
+    ("更改数据文件夹…", "把 data/ 与 backup/ 搬到新目录；重启后执行"),
 ];
 
 /// 设置页右上角那个搜索框（底框；真正的输入是叠上去的原。
@@ -3053,9 +3120,18 @@ let sbox = search_box_rect(w);
                             &p.fmt.center_small,
                             &p.br.fg,
                         );
+                        let dir_line = if snap.pending_move.is_empty() {
+                            format!("{}（改目录要用下面的「更改数据文件夹」，重启后生效）", snap.data_home)
+                        } else {
+                            // 安排过但还没重启：这句话就是"为什么现在还在旧目录"的读数。
+                            format!(
+                                "现在：{}｜已安排搬到：{}（重启后执行，重启前请留着旧目录）",
+                                snap.data_home, snap.pending_move
+                            )
+                        };
                         p.text(
-                            &snap.app_dir,
-                            rect(r.left + 12.0, y + 21.0, 420.0, 18.0),
+                            &dir_line,
+                            rect(r.left + 12.0, y + 21.0, 560.0, 18.0),
                             &p.fmt.small,
                             &p.br.muted,
                         );
@@ -6557,7 +6633,7 @@ if count > g.max_rows {
         String::new()
     };
     p.text(
-        &format!("数据源：{}{gap_note}", snap.app_dir),
+        &format!("数据源：{}{gap_note}", snap.data_home),
         rect(r.left + g.pad, foot_y, r.right - r.left - g.pad * 2.0, 16.0),
         &p.fmt.small,
         &p.br.muted,
@@ -6826,6 +6902,42 @@ fn unregister_combos(manager: Option<&GlobalHotKeyManager>, list: [Option<HotKey
     if !all.is_empty() {
         let _ = manager.unregister_all(&all);
     }
+}
+
+/// 「更改数据文件夹」要落的那两行，以及它们的**顺序**：先写待搬运标记，再改 `data_home`。
+/// 反过来说明中间崩掉会留下哪种半态：目录已改、标记没写 ⇒ 新进程按空的
+/// 新目录起步，旧历史永远不会再被搬；而标记已写、目录还没改是安全的 —— core 的
+/// `plan_migration` 认得这一种，清掉标记就行（旧目录里的数据一个都没动过）。
+/// 抽成纯函数就是为了让这条顺序能被单测钉住。
+fn data_move_writes(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> [(&'static str, &'static str, String); 2] {
+    [
+        ("paths", "data_migrate_from", src.display().to_string()),
+        ("paths", "data_home", dst.display().to_string()),
+    ]
+}
+
+/// 安排一次数据目录搬迁：先用 core 的同一把尺子校验目标，再把那两行按顺序写下并**当场落盘**。
+/// 本进程不动任何数据文件，仍然照旧往旧目录写满；搬运由下一个进程在启动早期兑现。
+/// （返回类型写全：`Result` 这个名字在本文件里是 windows-result 的那一个。）
+fn arrange_data_move(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::result::Result<String, String> {
+    focusflow_core::data_location::validate_new_data_home(src, dst)?;
+    let cfg = focusflow_core::config::instance();
+    for (section, key, value) in data_move_writes(src, dst) {
+        cfg.set(section, key, &value).map_err(|e| e.to_string())?;
+    }
+    // 去抖那 300 毫秒不一定赶得上：用户点完可能马上就退出，标记得先在磁盘上。
+    cfg.save().map_err(|e| e.to_string())?;
+    Ok(format!(
+        "已安排：重启后把 data/ 与 backup/ 从 {} 搬到 {}",
+        src.display(),
+        dst.display()
+    ))
 }
 
 fn make_hotkeys() -> (
@@ -7798,5 +7910,27 @@ mod hotkey_tests {
                 .unwrap_or_else(|| panic!("{bad:?} 应该被拒"));
             assert!(why.contains("修饰键"), "{bad:?} 的说明要给能照写的格式：{why}");
         }
+    }
+}
+
+#[cfg(test)]
+mod data_move_tests {
+    use super::*;
+
+    /// 那两行的顺序是"先待搬运标记、后新数据根"。反过来的半态是"目录已改、标记没写"：
+    /// 新进程按空的新目录起步，旧历史永远不会再被搬 —— 这一条不可逆，所以钉住顺序。
+    #[test]
+    fn the_marker_is_written_before_the_new_home() {
+        let writes = data_move_writes(
+            std::path::Path::new("E:/ff/old"),
+            std::path::Path::new("E:/ff/new"),
+        );
+        for (section, _, _) in writes.iter() {
+            assert_eq!(section, &"paths", "两行都写在 [paths] 段");
+        }
+        assert_eq!(writes[0].1, "data_migrate_from", "第一行必须是待搬运标记");
+        assert_eq!(writes[0].2, "E:/ff/old", "标记记的是搬走的来源");
+        assert_eq!(writes[1].1, "data_home", "第二行才是新的数据根");
+        assert_eq!(writes[1].2, "E:/ff/new");
     }
 }

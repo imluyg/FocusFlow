@@ -142,9 +142,14 @@ pub struct Snapshot {
     /// 开机自启：**现读**启动文件夹，不读配置键（用户在资源管理器里删掉它时，
     /// 配置里还写着开）。正式版每次进设置页读一次，探针跟着 2 秒刷新读。
     pub autostart: bool,
+    /// 当前**生效**的数据根目录（`[paths] data_home`，建不出来时 core 会回落到程序目录）。
+    /// 设置页「数据目录」那一行显示的就是它；`app_dir` 是程序目录，两者不是一回事。
+    pub data_home: String,
+    /// `[paths] data_migrate_from` 的原文：非空 = 已经安排了一次搬迁，重启时兑现。
+    /// 显示出来，免得用户以为改完就已经搬走了。
+    pub pending_move: String,
     /// 这一轮没读上来的年度库条数（非 0 = 上面那些数是**下界**）。
     pub gaps: usize,
-    pub app_dir: String,
 }
 
 /// 周期 → 查询窗口天数：`None` = 全部历史。
@@ -246,6 +251,12 @@ pub fn load(period: i64) -> Snapshot {
         settings: load_settings(),
         autostart: focusflow_core::autostart::is_autostart_enabled(),
         gaps: stats.unreadable.len() + all.unreadable.len(),
-        app_dir: focusflow_core::paths::app_dir().display().to_string(),
+        data_home: focusflow_core::data_location::current_data_home()
+            .display()
+            .to_string(),
+        pending_move: focusflow_core::config::instance()
+            .get("paths", "data_migrate_from")
+            .trim()
+            .to_string(),
     }
 }
