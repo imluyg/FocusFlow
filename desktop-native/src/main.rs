@@ -2809,7 +2809,9 @@ fn draw_screen(
             thousands(snap.today as u64),
             format!("共 {} 个键位", snap.rank.len()),
         ),
-        ("当前速度".into(), "—".into(), "P1 未接监听".into()),
+        // 采集没接（见 docs/webview-removal-plan.md §10n）：这一格给「—」并说清是"只读"，
+        // 不写内部代号，也不留一个看起来只是暂时没数据的空缺。
+        ("当前速度".into(), "—".into(), "本端只读 · 未接采集".into()),
         (
             "总计".into(),
             thousands(snap.period_total.max(0) as u64),
