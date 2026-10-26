@@ -23,6 +23,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-plugin
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-hotkey.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-datadir.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-plugsel.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-snip.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-report.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-installer.ps1
 ```
 
@@ -40,6 +42,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 | `accept-hotkey.ps1` | 两轮启动：配置里的两条组合按原样注册（日志逐字对）/ 一条写成裸键时程序照样起、日志点名被拒的那条、另一条照样注册 | 9 项 |
 | `accept-datadir.ps1` | 两轮启动：`[paths]` 里那条待搬运标记由启动早期兑现（data/ 与 backup/ 真到了新根、旧根清空、标记归空、日志点名新根）/ 新根建不出来时数据原地不动、标记留着下次重试 | 13 项 |
 | `accept-plugsel.ps1` | 自带一份 ASCII 小插件（分组表格 + `onselect` + `sel` 按钮）：Lua 里的 ids/group/onselect 真的走到宿主、选中写了声明的那个字段、`sel` 按钮拼出 `<按钮 id><记录 id>` | 10 项 |
+| `accept-snip.ps1` | 用真注入的鼠标拖框跑两条截图收尾：快速版落了 PNG 且没开标注窗 / 标注版开了窗、还没落盘、Esc 关掉且什么都没存 | 10 项 |
+| `accept-report.ps1` | 两轮启动：缺的那份上周周报由启动补上（文件名 `weekly-<上周一>.md`、有内容）/ 第二次启动看见已有文件就不动（时间戳不变） | 10 项 |
 | `accept-installer.ps1` | 静默装 → 目录/卸载器/快捷方式/注册表/版本号/exe 图标 → 装出来的 exe 默认在采集 → 静默卸 → 全部清干净 | 17 项 |
 
 `accept-plugins.ps1` 断言的是应用日志里的 **ASCII 片段**（字段名 `d_type`/`f_cat`、动作 id

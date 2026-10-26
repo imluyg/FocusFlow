@@ -90,6 +90,8 @@ const WM_ACCEPTANCE_PAUSE: u32 = WM_APP + 8;
 const WM_ACCEPTANCE_QUIT: u32 = WM_APP + 9;
 /// 测试钩子 `FOCUSFLOW_PLUGIN_SEL`：按记录 id 走一遍"点表格一行 + 按一颗 sel 按钮"。
 const WM_SEL_TEST: u32 = WM_APP + 10;
+/// 启动几秒后补一份上周周报（与设置页那颗「上周周报」同一条生成路）。
+const WM_WEEKLY_REPORT: u32 = WM_APP + 11;
 const TIMER_EVENTS: usize = 1;
 /// EDIT 。
 const EM_SETSEL: u32 = 0x00B1;
@@ -3198,7 +3200,7 @@ let sbox = search_box_rect(w);
                         p.round(vb, 6.0, &p.br.accent, None);
                         p.text("生成", vb, &p.fmt.center_small, &p.br.white);
                         p.text(
-                            "汇总上周一~周日，写到 data/reports/weekly-YYYY-MM-DD.md（只存本机）",
+                            "汇总上周一~周日，写到 data/reports/weekly-YYYY-MM-DD.md（只存本机）；启动时缺这一份会自动补",
                             rect(r.left + 12.0, y + 21.0, 600.0, 15.0),
                             &p.fmt.small,
                             &p.br.muted,
@@ -6221,14 +6223,44 @@ fn restore_button(g: &TableGeom, y: f32) -> D2D_RECT_F {
 /// 应用时长：秒 。
 /// 生成「上周」周报（周一~周日），返回 Markdown 路径。旧 WebView 版在每周一自动生成，
 /// 原生端先做成设置页「目标 → 上周周报」里的一颗手动按钮，内容口径与旧版一致。
+/// 上一个完整周的周一（周报覆盖它到 +6 天）。
+fn last_week_start(today: chrono::NaiveDate) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    let since_monday = today.weekday().num_days_from_monday() as i64;
+    today - chrono::Duration::days(since_monday + 7)
+}
+
+/// 上周那份周报该落在哪：`<data>/reports/weekly-<上周一>.md`。
+/// 手动生成与"启动后要不要补一份"都读这一个地址，日期算法只有一份。
+fn weekly_report_path(today: chrono::NaiveDate) -> std::path::PathBuf {
+    focusflow_core::paths::data_dir()
+        .join("reports")
+        .join(format!("weekly-{}.md", last_week_start(today).format("%Y-%m-%d")))
+}
+
+/// 启动后补一份上周周报（旧版口径：每周一 / 启动时生成上一个完整周）。
+/// 判据只有"该在的那一份在不在"：在就一个字都不动，缺才生成，且生成走的是设置页
+/// 那颗按钮同一条路。日志里的 `weekly-report` 是 ASCII 标记，给验收脚本用。
+fn ensure_weekly_report() {
+    let today = chrono::Local::now().date_naive();
+    let path = weekly_report_path(today);
+    if path.exists() {
+        tracing_note(&format!("weekly-report exists {}", path.display()));
+        return;
+    }
+    match generate_weekly_report() {
+        Ok(p) => tracing_note(&format!("weekly-report auto {}", p.display())),
+        Err(e) => tracing_note(&format!("weekly-report failed：{e}")),
+    }
+}
+
 fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
-    use chrono::{Datelike, Duration, Local};
+    use chrono::{Duration, Local};
     use focusflow_core::db::queries;
     use std::fmt::Write as _;
 
     let today = Local::now().date_naive();
-    let since_monday = today.weekday().num_days_from_monday() as i64;
-    let start = today - Duration::days(since_monday + 7);
+    let start = last_week_start(today);
     let end = start + Duration::days(6);
     let goal = focusflow_core::config::instance().get_int("goal", "daily_keys", 20000);
 
@@ -6353,9 +6385,11 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
         Local::now().format("%Y-%m-%d %H:%M:%S")
     );
 
-    let dir = focusflow_core::paths::data_dir().join("reports");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("建报告目录失败：{e}"))?;
-    let file = dir.join(format!("weekly-{}.md", start.format("%Y-%m-%d")));
+    let file = weekly_report_path(today);
+    match file.parent() {
+        Some(dir) => std::fs::create_dir_all(dir).map_err(|e| format!("建报告目录失败：{e}"))?,
+        None => return Err("周报路径没有父目录".to_string()),
+    }
     std::fs::write(&file, out).map_err(|e| format!("写周报失败：{e}"))?;
     Ok(file)
 }
@@ -7709,6 +7743,10 @@ let mut tme = TRACKMOUSEEVENT {
             run_plugin_sel_test(hwnd);
             LRESULT(0)
         }
+        WM_WEEKLY_REPORT => {
+            ensure_weekly_report();
+            LRESULT(0)
+        }
         WM_OP_DONE => {            if let Some(app) = unsafe { app_ptr(hwnd) } {
                 let lines: Vec<String> = app
                     .ops
@@ -8163,6 +8201,16 @@ if let Ok(spec) = std::env::var("FOCUSFLOW_SNIP_TEST") {
             let _ = unsafe { PostMessageW(Some(target), WM_SEL_TEST, WPARAM(0), LPARAM(0)) };
         });
     }
+    // 上周周报：旧版是"每周一 / 启动时"生成上一个完整周。这里在消息循环起来几秒后补一次，
+    // 该在的那份已经在就什么都不做（生成走设置页那颗按钮同一条路）。
+    {
+        let raw = hwnd.0 as isize;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(4000));
+            let target = HWND(raw as *mut core::ffi::c_void);
+            let _ = unsafe { PostMessageW(Some(target), WM_WEEKLY_REPORT, WPARAM(0), LPARAM(0)) };
+        });
+    }
 
     unsafe {
         let mut msg = MSG::default();
@@ -8240,6 +8288,38 @@ mod hotkey_tests {
                 .unwrap_or_else(|| panic!("{bad:?} 应该被拒"));
             assert!(why.contains("修饰键"), "{bad:?} 的说明要给能照写的格式：{why}");
         }
+    }
+}
+
+#[cfg(test)]
+mod weekly_report_tests {
+    use super::*;
+
+    fn d(y: i32, m: u32, day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    /// 周一边界最容易判错：周一当天要的是"刚过去的那一周"（上周一），不是今天。
+    #[test]
+    fn last_week_starts_on_monday_of_the_previous_week() {
+        let cases = [
+            (d(2026, 10, 26), d(2026, 10, 19)), // 周一 → 上周一
+            (d(2026, 10, 27), d(2026, 10, 19)), // 周二
+            (d(2026, 11, 1), d(2026, 10, 19)),  // 周日（本周还没过完）
+            (d(2026, 11, 2), d(2026, 10, 26)),  // 跨月的下一个周一
+            (d(2027, 1, 1), d(2026, 12, 21)),   // 跨年
+        ];
+        for (today, want) in cases {
+            assert_eq!(last_week_start(today), want, "{today} 的上周一算错");
+        }
+    }
+
+    /// 文件名里的日期就是上周一：手动生成与"要不要自动生成"共用这一份算法。
+    #[test]
+    fn the_report_file_name_carries_the_week_start_date() {
+        let path = weekly_report_path(d(2026, 10, 26));
+        assert!(path.ends_with("weekly-2026-10-19.md"), "实际：{}", path.display());
+        assert!(path.to_string_lossy().contains("reports"));
     }
 }
 
