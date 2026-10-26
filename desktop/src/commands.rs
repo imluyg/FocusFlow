@@ -336,6 +336,17 @@ pub fn hide_floating(state: State<'_, Arc<AppState>>, app: AppHandle) {
     crate::state::set_floating_visible(&app, false);
 }
 
+/// 悬浮窗页面量出来的卡片高度（CSS 像素），换回真正用上的高度。
+///
+/// 为什么要问页面：WebView2 那一侧的排版是浏览器定的，Rust 按"一行 18 像素"算必然算少——
+/// 现量 `metric=both` 时「时长」那个值在 90 宽里折成两行，内容要 94 而公式给 82，
+/// 最后那一行就被窗口下边缘裁掉。返回算出来的那个数，是为了让页面能发现自己被上限拦了下来，
+/// 而不是"报了、什么也没发生"。
+#[tauri::command]
+pub fn report_floating_height(app: AppHandle, height: f64) -> f64 {
+    crate::floating::content_height_reported(&app, height)
+}
+
 /// 立即 flush 数据库（写线程排空队列）。
 #[tauri::command]
 pub fn flush_db(state: State<'_, Arc<AppState>>) {

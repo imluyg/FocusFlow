@@ -18,7 +18,7 @@
 mod native;
 pub(crate) mod render;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use tauri::{AppHandle, Emitter, Manager};
@@ -333,11 +333,41 @@ pub fn needs_topmost_poll() -> bool {
     matches!(active_renderer(), Renderer::Webview)
 }
 
+/// 页面报上来的卡片高度下限（CSS 像素）。`0` = 这个进程里还没量过。
+///
+/// 为什么页面要说话：`render::pill_height` 那把尺子按"一行 18 像素"算，可 WebView2 那一侧
+/// 的真实版面是浏览器定的 —— 现量 `metric=both` 时「时长」那个值在 90 宽里**折成两行**，
+/// 内容实际需要 94 而公式只给 82，于是最后那一行照样被窗口下边缘裁掉。改宽度或改文案
+/// 都是产品口径（等他点），而"窗口要容得下它自己的内容"不需要等：让排版唯一的知情者报数。
+/// 存的是页面给的原值，**只在这一条路径上取值**（[`measured_floor`]）—— 两处夹就会有两处的口径。
+static MEASURED_H: AtomicI32 = AtomicI32::new(0);
+
+/// 一个报上来的高度只在这个范围里才当下限用。
+///
+/// 上限不是摆设：这是一条来自页面的输入，一个坏掉的排版（字体拿不到、某行被拉成一屏高）
+/// 不该把用户的桌面整块占掉 —— 那比裁掉一行严重得多。
+const MEASURED_MIN: i32 = 24;
+const MEASURED_MAX: i32 = 400;
+
+/// 把页面报的原值收成能用的下限（`0` 或负数 = 没量过/报坏了 ⇒ 不设下限）。
+pub(crate) fn measured_floor(raw: i32) -> i32 {
+    if raw <= 0 {
+        return 0;
+    }
+    raw.clamp(MEASURED_MIN, MEASURED_MAX)
+}
+
+/// 窗口最后该有多高：公式与页面量出来的取大。
+pub(crate) fn pill_height_with_floor(formula: i32, measured_raw: i32) -> i32 {
+    formula.max(measured_floor(measured_raw))
+}
+
 /// WebView2 那张卡片该摆成多大（逻辑像素）：宽照配置，**高跟内容**。
 ///
 /// 高过去直接取 `[floating] height`（默认 46），而卡片本身是 `overflow:hidden` 的：
 /// `metric=both` 多一行、久坐提醒横带也多一行，多出来的那一行就落在窗口下边缘之外。
-/// 原生那一支用的是同一条公式（`render::pill_height`）—— 尺寸这一件事不许有第二把尺子。
+/// 原生那一支用的是同一条公式（`render::pill_height`）—— 尺寸这一件事不许有第二把尺子；
+/// 这里再取页面量出来的那个下限，是因为浏览器的排版只有它自己知道（见 [`MEASURED_H`]）。
 pub(crate) fn webview_pill_size(
     cfg: &focusflow_core::config::FocusFlowConfig,
     notice_live: bool,
@@ -345,12 +375,33 @@ pub(crate) fn webview_pill_size(
     let metric = render::metric_from(&cfg.get("gui", "floating_metric"));
     (
         cfg.get_float("floating", "width", 90.0).max(40.0),
-        render::pill_height(
-            cfg.get_float("floating", "height", 46.0),
-            render::row_count(metric),
-            notice_live,
+        pill_height_with_floor(
+            render::pill_height(
+                cfg.get_float("floating", "height", 46.0),
+                render::row_count(metric),
+                notice_live,
+            ),
+            MEASURED_H.load(Ordering::SeqCst),
         ) as f64,
     )
+}
+
+/// 页面量完自己的排版之后报到这里：记下这个下限，并立刻把窗口改成该有的大小。
+///
+/// 返回真正用上的是哪一个数 —— 页面拿它跟自己量的比一次，就知道有没有被上限拦下来，
+/// 而不是"报了、什么也没发生"。
+pub fn content_height_reported(app: &AppHandle, height: f64) -> f64 {
+    let raw = if height.is_finite() {
+        height.ceil() as i32
+    } else {
+        0
+    };
+    MEASURED_H.store(raw, Ordering::SeqCst);
+    let live = rest_notice_text().is_some();
+    if !resize_webview_pill(app, live) {
+        tracing::warn!("悬浮窗按页面量出来的高度改尺寸没做成 (height={height})");
+    }
+    webview_pill_size(focusflow_core::config::instance(), live).1
 }
 
 /// 提醒横带出现/收起时通知这里：卡片要多一行高，而且长出来的那一行必须留在屏幕里。
@@ -693,6 +744,66 @@ mod tests {
         assert!(
             flat2.contains("Renderer::Webview=>{if!resize_webview_pill(app,live)"),
             "WebView2 那一支没去改窗口尺寸：光催重画没用，它的窗口不会跟着内容长"
+        );
+    }
+
+    /// 页面报上来的高度是一个**输入**，先夹住才能用。
+    ///
+    /// 两条边界各管一头：矮到不像卡片（比如页面还没排完就量到 10）抬到下限，
+    /// 而排版坏掉（一行被拉成一屏高）不许把用户的桌面整块占掉 —— 那比裁掉一行严重得多。
+    #[test]
+    fn a_reported_height_is_only_a_floor_within_sane_bounds() {
+        assert_eq!(measured_floor(0), 0, "没量过就不设下限");
+        assert_eq!(measured_floor(-5), 0, "报坏了当没量过");
+        assert_eq!(measured_floor(30), 30);
+        assert_eq!(
+            measured_floor(10),
+            MEASURED_MIN,
+            "矮得不像一张卡片时抬到下限"
+        );
+        assert_eq!(
+            measured_floor(999_999),
+            MEASURED_MAX,
+            "排版崩了也不许把桌面占掉"
+        );
+
+        assert_eq!(pill_height_with_floor(46, 0), 46, "没报过就照公式");
+        assert_eq!(
+            pill_height_with_floor(46, 94),
+            94,
+            "公式按 18/行算少了一行折行 —— 页面上的真实版面说话（这条就是现量到的那个数）"
+        );
+        assert_eq!(
+            pill_height_with_floor(120, 60),
+            120,
+            "人把卡片调高了，不许被内容顶回去"
+        );
+        assert_eq!(pill_height_with_floor(46, 999_999), MEASURED_MAX);
+    }
+
+    /// 取值只许有一处：那条路径必须经过这两条纯函数，别在调用点各夹一遍。
+    #[test]
+    fn the_reported_floor_is_applied_in_exactly_one_place() {
+        let src = include_str!("mod.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        assert_eq!(
+            prod.match_indices("measured_floor(").count(),
+            2,
+            "一次是定义、一次是 pill_height_with_floor 里取值；多出来的就是第二处口径"
+        );
+        assert_eq!(
+            prod.match_indices("MEASURED_H.load(").count(),
+            1,
+            "那份原值只在窗口尺寸这一条路上被读一次"
+        );
+        assert!(
+            prod.contains("pill_height_with_floor(")
+                && prod.contains("MEASURED_H.store(raw, Ordering::SeqCst)"),
+            "报上来的原值要先存、再由那一条路取值（存的时候先夹就会有两处口径）"
+        );
+        assert!(
+            prod.contains("height.ceil() as i32"),
+            "小数高度要往上取整：往下取就会把最后一行切掉半像素"
         );
     }
 

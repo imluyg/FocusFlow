@@ -125,6 +125,28 @@ function apply(s) {
   document.getElementById("cpm").textContent = String(s.cpm || 0);
 }
 
+// ===== 卡片量自己的排版，把高度交给 Rust =====
+// 为什么不让 Rust 自己算完：WebView2 这一侧的版面是浏览器定的。现量 `metric=both` 时
+// 「时长」那个值在 90 宽里折成两行，真实需要 94 而 Rust 那把"一行 18 像素"的尺子只给 82，
+// 最后那一行照样被窗口下边缘裁掉。报的是**卡片内容的高度** —— 卡片自己是 height:auto，
+// 与窗口多高无关，所以"改完尺寸再量一次"不会来回弹。
+let lastReportedH = 0;
+async function syncCardHeight() {
+  const card = document.querySelector(".card");
+  if (!card) return 0;
+  const h = Math.ceil(card.getBoundingClientRect().height);
+  if (h === lastReportedH) return h;
+  lastReportedH = h;
+  try {
+    return await invoke("report_floating_height", { height: h });
+  } catch (e) {
+    // IPC 没成本次就没长高（与这条存在之前的样子一样）。把去重的那格清掉，
+    // 下一次版面变化还会再报 —— 留着它反而永远不会再试。
+    lastReportedH = 0;
+    return 0;
+  }
+}
+
 (async () => {
   try {
     const m = await invoke("get_config", { section: "gui", key: "floating_metric" });
@@ -162,6 +184,8 @@ function apply(s) {
       }
       el.textContent = `久坐提醒：已连用 ${Number(n.window_minutes) || 0} 分钟，起来活动 ${Number(n.rest_seconds) || 0} 秒`;
       el.style.display = "";
+      // 横带占的是版面里的一行 ⇒ 卡片高了 18 像素，立刻报一次让窗口跟上
+      syncCardHeight();
       clearTimeout(el._hide);
       // 存活时长由 core 那一格说一遍（`RestNotice.shown_seconds` = 建议时长，带可读下限）：
       // 原先这里写死 20 秒，于是 `[rest] rest_seconds = 60` 时条上念着"活动 60 秒"、
@@ -169,6 +193,8 @@ function apply(s) {
       const shown = Number(n.shown_seconds) > 0 ? Number(n.shown_seconds) : 20;
       el._hide = setTimeout(() => {
         el.style.display = "none";
+        // 那一行还回去了 ⇒ 也要报一次，否则窗口停在长高后的尺寸空一截
+        syncCardHeight();
       }, shown * 1000);
     });
   } catch (e) {}
@@ -190,4 +216,6 @@ function apply(s) {
   try {
     apply(await invoke("get_live"));
   } catch (e) {}
+  // 版面定下来之后报一次（`metric=both` 的第三行与折行在这一刻才量得准）
+  await syncCardHeight();
 })();

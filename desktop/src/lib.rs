@@ -239,6 +239,7 @@ pub fn run() {
             commands::hide_main,
             commands::show_floating,
             commands::hide_floating,
+            commands::report_floating_height,
             commands::flush_db,
             commands::vacuum_db,
             commands::quit,
