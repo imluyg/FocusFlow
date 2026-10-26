@@ -54,15 +54,16 @@ Check 'installed exe carries an icon resource' ($ico.Width -gt 0) "$($ico.Width)
 $ico.Dispose()
 
 # Run the INSTALLED exe, but point it at a probe copy so the install dir stays pristine.
+# No [collector] override here: this checks the real default (on, 2026-10-27).
 $app = Join-Path $WorkDir 'app'
-New-AppDir $app @('[collector]', 'enabled = false')
+New-AppDir $app
 Remove-Item (Join-Path $WorkDir 'focusflow.log') -ErrorAction SilentlyContinue
 $p = Start-App (Join-Path $inst 'FocusFlow.exe') $app $WorkDir
 $h = Wait-Window $p.Id
 Check 'installed exe starts' ($h -ne [IntPtr]::Zero)
 Start-Sleep -Milliseconds 3000
 $st = Wait-Status $WorkDir
-Check 'collector stays off by default' ($null -ne $st -and $st.Collector -eq 'off') "collector=$($st.Collector)"
+Check 'collector is on by default' ($null -ne $st -and $st.Collector -eq 'on') "collector=$($st.Collector)"
 $mem = Get-Memory $p
 "memory: $($mem.WsMb) MB WS / $($mem.PrivateMb) MB private / $($mem.Threads) threads"
 Save-WindowShot $h (Join-Path $WorkDir 'installed-run.png') | Out-Null

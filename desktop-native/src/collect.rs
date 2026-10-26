@@ -79,9 +79,9 @@ pub fn cpm() -> i64 {
     0
 }
 
-/// 配置里允不允许采集（`[collector] enabled`，默认 **false**）。
+/// 配置里允不允许采集（`[collector] enabled`，默认 **true** —— 2026-10-27 用户要求默认开）。
 pub fn enabled_in_config(cfg: &FocusFlowConfig) -> bool {
-    cfg.get_bool("collector", "enabled", false)
+    cfg.get_bool("collector", "enabled", true)
 }
 
 /// 采集真的起来了没有（配置说开 ≠ 起来了：起失败时这里是 false）。
