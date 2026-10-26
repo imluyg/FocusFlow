@@ -6087,6 +6087,20 @@ static TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::n
             if n % 50 == 0 {
                 tracing_note(&format!("timer tick {n}"));
             }
+            // 验收模式（FOCUSFLOW_ACCEPTANCE=1）下每秒写一行机器可读的状态：
+            // 脚本不用 OCR 就能断言「今日涨了几个」「暂停期间有没有停」。
+            // 键名用 ASCII，值也只有数字/on-off，解析起来不用管编码。
+            if n % 10 == 0 && ACCEPTANCE.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(app) = unsafe { app_ptr(hwnd) } {
+                    let today = app.snap.lock().map(|s| s.today).unwrap_or(0);
+                    tracing_note(&format!(
+                        "验收状态 today={today} cpm={} collector={} paused={}",
+                        collect::cpm(),
+                        if collect::is_started() { "on" } else { "off" },
+                        if collect::is_paused() { "true" } else { "false" }
+                    ));
+                }
+            }
             // 托盘点击 / 菜单 / 热键只在事件通道里，靠这 100ms 一拍取出来。
 while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
                 if let TrayIconEvent::Click {
@@ -6166,6 +6180,9 @@ if let Some(app) = unsafe { app_ptr(hwnd) } {
             LRESULT(0)
         }
         WM_REFRESH => {
+            // 设置页里改的 `[listener] *` 要真的生效：listener 读的是原子快照，
+            // 不重拍就得重启（而界面上写着"改完立即生效"）。
+            collect::refresh_config();
             if let Some(app) = unsafe { app_ptr(hwnd) } {
                 let n = app.snap.lock().map(|s| s.today).unwrap_or(0);
                 if let Some(t) = &app.tray {

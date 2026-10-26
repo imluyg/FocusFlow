@@ -236,6 +236,19 @@ pub fn stop_listening() {
     crate::tracing_note("采集已停用：键鼠与设备计数已停（前台应用时长要重启后才停）");
 }
 
+/// 让 listener 重新读一遍 `[listener] *`。
+///
+/// 设置页那几行写的是配置文件，而 listener 的热路径读的是启动时拍下的原子快照
+/// （`refresh_config()` 才会重拍）。主窗口每 2 秒的快照刷新顺带调一次，界面上
+/// "改完立即生效"这句话才是真的；采集没开时这里是空操作。
+pub fn refresh_config() {
+    let guard = slot().lock();
+    let Ok(g) = guard else { return };
+    if let Some(rt) = g.as_ref() {
+        rt.listener.refresh_config();
+    }
+}
+
 /// 退出：停监听 + 落库 + 备份。`shutdown` 会 flush(true) → stop() → backup_on_exit。
 pub fn shutdown(cfg: &'static FocusFlowConfig) {
     let guard = slot().lock();
