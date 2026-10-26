@@ -24,12 +24,17 @@ pub struct DevRow {
 
 /// 高级设置里的一行。`kind` 是控件类型（0 开关 / 1 整数 / 2 小数 / 3 文本），
 /// 由这一侧说出，界面不许自己猜"这个键是不是布尔"。
+///
+/// `label` / `help` 是给人看的：界面上不再直接摆 `listener.ignore_function_keys`
+/// 这种只有作者才懂的键名（2026-10-27 用户反馈"这些都是什么，看不懂"）。
 #[derive(Clone, Debug)]
 pub struct SettingRow {
     pub section: &'static str,
     pub key: &'static str,
     pub kind: u8,
     pub live: &'static str,
+    pub label: &'static str,
+    pub help: &'static str,
     pub value: String,
     pub default: String,
 }
@@ -37,34 +42,34 @@ pub struct SettingRow {
 /// 「高级设置」这一页的唯一清单（与 `desktop/src/commands.rs` 的 `EXPOSED_SETTINGS`
 /// 同一份口径：段、键、类型、什么时候生效）。
 ///
-/// P7 之后这张表会搬进 `focusflow-core`，让两套界面（旧 Tauri / 新原生）读同一份；
-/// 现在原生端先照抄一遍，逐项与那条清单对齐。
-const SETTINGS: &[(&str, &str, u8, &str)] = &[
-    ("goal", "daily_keys", 1, "改完立即生效"),
-    ("listener", "ignore_modifier_keys", 0, "改完立即生效"),
-    ("listener", "ignore_function_keys", 0, "改完立即生效"),
-    ("listener", "ignore_key_repeat", 0, "改完立即生效"),
-    ("listener", "key_repeat_stale_seconds", 2, "改完立即生效"),
-    ("listener", "mouse_enabled", 0, "改完立即生效"),
-    ("listener", "scroll_burst_window", 2, "改完立即生效"),
-    ("rest", "enabled", 0, "改完立即生效"),
-    ("rest", "window_minutes", 1, "改完立即生效"),
-    ("rest", "key_threshold", 1, "改完立即生效"),
-    ("rest", "cooldown_minutes", 1, "改完立即生效"),
-    ("rest", "rest_seconds", 1, "改完立即生效"),
-    ("rest", "check_interval", 1, "改完立即生效"),
-    ("gui", "active_refresh_interval", 1, "改完立即生效"),
-    ("gui", "full_refresh_interval", 1, "改完立即生效"),
-    ("database", "max_backups", 1, "改完立即生效"),
-    ("database", "backup_disabled_plugins", 0, "改完立即生效"),
-    ("app_stats", "enabled", 0, "改完立即生效"),
-    ("app_stats", "exclude", 3, "改完立即生效"),
-    ("gui", "unload_hidden", 0, "下一次隐藏主窗口起效"),
-    ("gui", "unload_hidden_delay", 1, "下一次隐藏主窗口起效"),
-    ("gui", "start_to_tray", 0, "重启程序后生效"),
-    ("gui", "floating_renderer", 3, "重启程序后生效"),
-    ("database", "auto_vacuum_days", 1, "重启程序后生效"),
-    ("device_stats", "enabled", 0, "重启程序后生效"),
+/// 元组：段、键、类型、生效时机、中文名、一句话说明（说明以「分组 ·」开头，替掉原来
+/// 每行都一样的"改完立即生效"）。`gui.floating_renderer` 这类原生端根本不读的旧键
+/// 不再暴露。
+const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
+    ("goal", "daily_keys", 1, "改完立即生效", "每日目标", "目标 · 今天的活跃次数目标，主界面目标条用它"),
+    ("listener", "ignore_modifier_keys", 0, "改完立即生效", "忽略修饰键", "键鼠 · Ctrl/Shift/Alt/Win 本身不计入统计"),
+    ("listener", "ignore_function_keys", 0, "改完立即生效", "忽略功能键", "键鼠 · F1–F12、Insert 等功能键不计入"),
+    ("listener", "ignore_key_repeat", 0, "改完立即生效", "过滤长按重复", "键鼠 · 按住不放只算第一次"),
+    ("listener", "key_repeat_stale_seconds", 2, "改完立即生效", "重复判定（秒）", "键鼠 · 同一键多久没抬起就当新的一次"),
+    ("listener", "mouse_enabled", 0, "改完立即生效", "统计鼠标", "键鼠 · 鼠标点击与滚轮也计入活跃"),
+    ("listener", "scroll_burst_window", 2, "改完立即生效", "滚轮合并（秒）", "键鼠 · 连续滚动只记一批，防止一滚刷几百次"),
+    ("rest", "enabled", 0, "改完立即生效", "休息提醒", "休息 · 连续用键鼠太久时提醒你歇一会儿"),
+    ("rest", "window_minutes", 1, "改完立即生效", "提醒窗口（分钟）", "休息 · 在多长时间内累计输入量"),
+    ("rest", "key_threshold", 1, "改完立即生效", "触发阈值（次）", "休息 · 窗口内输入超过这个次数就提醒"),
+    ("rest", "cooldown_minutes", 1, "改完立即生效", "提醒间隔（分钟）", "休息 · 两次提醒之间至少隔多久"),
+    ("rest", "rest_seconds", 1, "改完立即生效", "建议休息（秒）", "休息 · 提醒后建议离开屏幕的时间"),
+    ("rest", "check_interval", 1, "改完立即生效", "检查间隔（分钟）", "休息 · 多久检查一次要不要提醒"),
+    ("gui", "active_refresh_interval", 1, "改完立即生效", "活跃刷新（秒）", "界面 · 今日/速度卡片多久刷新一次"),
+    ("gui", "full_refresh_interval", 1, "改完立即生效", "全量刷新（秒）", "界面 · 排行与图表多久重新读库"),
+    ("database", "max_backups", 1, "改完立即生效", "备份保留份数", "数据 · 自动备份最多保留几个"),
+    ("database", "backup_disabled_plugins", 0, "改完立即生效", "备份插件数据", "数据 · 把插件数据库也一起备份"),
+    ("app_stats", "enabled", 0, "改完立即生效", "应用时长统计", "应用 · 记录前台应用的使用时长"),
+    ("app_stats", "exclude", 3, "改完立即生效", "不统计的应用", "应用 · 进程名逗号分隔，如 chrome.exe,code.exe"),
+    ("gui", "unload_hidden", 0, "下一次隐藏主窗口起效", "隐藏后释放内存", "界面 · 收起一段时间后卸载界面缓存"),
+    ("gui", "unload_hidden_delay", 1, "下一次隐藏主窗口起效", "释放延迟（秒）", "界面 · 收起后多久释放"),
+    ("gui", "start_to_tray", 0, "重启程序后生效", "启动即进托盘", "界面 · 开机启动不弹窗，只留托盘图标"),
+    ("database", "auto_vacuum_days", 1, "重启程序后生效", "自动压缩（天）", "数据 · 每隔几天重建数据库回收空间"),
+    ("device_stats", "enabled", 0, "重启程序后生效", "设备分别统计", "设备 · 按键盘/鼠标设备分别计数（Raw Input）"),
 ];
 
 fn load_settings() -> Vec<SettingRow> {
@@ -72,7 +77,7 @@ fn load_settings() -> Vec<SettingRow> {
     let defaults = focusflow_core::config::default_config();
     SETTINGS
         .iter()
-        .map(|&(section, key, kind, live)| {
+        .map(|&(section, key, kind, live, label, help)| {
             let d = defaults
                 .get(section)
                 .and_then(|s| s.get(key))
@@ -91,6 +96,8 @@ fn load_settings() -> Vec<SettingRow> {
                 key,
                 kind,
                 live,
+                label,
+                help,
                 value,
                 default: d,
             }

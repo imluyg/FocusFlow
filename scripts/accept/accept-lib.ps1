@@ -264,7 +264,7 @@ function Click-ViewTab([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 56
 function Click-ATab([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 48 + $Index * 68, 270, 1); Start-Sleep -Milliseconds 400 }
 # Basic rows (current order): 0 autostart, 1 collector, 2 pause, 3 hotkey, 4 floating,
 # 5 theme, 6 data dir -- 28 px apart starting at y=260+13.
-function Click-BasicRow([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 200, 273 + $Index * 28, 1); Start-Sleep -Milliseconds 450 }
+function Click-BasicRow([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 200, 282 + $Index * 44, 1); Start-Sleep -Milliseconds 450 }
 function Get-ThemeName([string]$AppDir) {
     $line = (Select-String -Path (Join-Path $AppDir 'config.ini') -Pattern '^theme' -Encoding UTF8 | ForEach-Object { $_.Line })
     ($line -join '')

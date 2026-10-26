@@ -1439,6 +1439,7 @@ let y0 = g.list_top + vis as f32 * g.row_h;
                 if hit(row_rect, x, y) {
                     self.sel = Some(idx);
                     match items[idx] {
+                        SItem::Header(_) => {}
                         SItem::Action(a) => self.run_action(hwnd, a),
                         SItem::Basic(Basic::Autostart) => self.toggle_autostart(hwnd),
                         SItem::Basic(Basic::Hotkey) => self.toggle_hotkey(hwnd),
@@ -1463,7 +1464,7 @@ let y0 = g.list_top + vis as f32 * g.row_h;
                             if kind == 0 {
                                 self.toggle_setting(hwnd, i);
                             } else {
-                                self.start_edit_setting(hwnd, i);
+                                self.start_edit_setting(hwnd, i, idx);
                             }
                             unsafe {
                                 let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2200,12 +2201,12 @@ fn ensure_edit(&mut self, parent: HWND) -> HWND {
     }
 
     /// 设置页的一行：开关直接翻，其它类型开一个原。
-fn start_edit_setting(&mut self, hwnd: HWND, idx: usize) {
+fn start_edit_setting(&mut self, hwnd: HWND, snapshot_idx: usize, item_idx: usize) {
         let row = self
             .snap
             .lock()
             .ok()
-            .and_then(|s| s.settings.get(idx).map(|r| (r.value.clone(), r.kind)));
+            .and_then(|s| s.settings.get(snapshot_idx).map(|r| (r.value.clone(), r.kind)));
         let Some((value, kind)) = row else { return };
         if kind == 0 {
             return;
@@ -2213,13 +2214,14 @@ fn start_edit_setting(&mut self, hwnd: HWND, idx: usize) {
         let (w, h) = self.client_dip(hwnd);
         let s = self.scale(hwnd);
         let g = settings_geom(w, h);
-        let vis = idx.saturating_sub(self.scroll);
+        // 屏幕行号用列表下标（含分组标题），不是 `settings` 数组下标。
+        let vis = item_idx.saturating_sub(self.scroll);
         if vis >= g.max_rows {
             return;
         }
         let edit = self.ensure_edit(hwnd);
         let y = g.list_top + vis as f32 * g.row_h;
-        let cell = rect(g.value_x - 4.0, y + 2.0, g.value_w + 8.0, g.row_h - 6.0);
+        let cell = rect(g.value_x - 4.0, y + 8.0, g.value_w + 8.0, 28.0);
         unsafe {
             let _ = SetWindowTextW(edit, &HSTRING::from(value));
             let _ = SetWindowPos(
@@ -2234,8 +2236,8 @@ fn start_edit_setting(&mut self, hwnd: HWND, idx: usize) {
             let _ = SetFocus(Some(edit));
             SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
         }
-        self.edit_target = Some(EditTarget::Setting(idx));
-        self.edit_row = Some(idx);
+        self.edit_target = Some(EditTarget::Setting(snapshot_idx));
+        self.edit_row = Some(item_idx);
     }
 
     /// 开关类设置：读当前。
@@ -2473,6 +2475,7 @@ struct SettingsGeom {
     list_top: f32,
     row_h: f32,
     max_rows: usize,
+    /// 高级项的值框（两行排版，左边留给中文名与说明）。
     value_x: f32,
     value_w: f32,
 }
@@ -2480,6 +2483,8 @@ struct SettingsGeom {
 /// 设置页里的一行是什么。
 #[derive(Clone, Copy)]
 enum SItem {
+    /// 分组小标题（不可点）：基础 / 高级设置 / 数据操作。
+    Header(&'static str),
     Basic(Basic),
     Setting(usize),
     Action(usize),
@@ -2525,16 +2530,27 @@ fn settings_items(snap: &Snapshot, filter: &str) -> Vec<SItem> {
             out.push(SItem::Basic(b));
         }
     }
+    let mut settings = Vec::new();
     for (i, row) in snap.settings.iter().enumerate() {
-        let key = format!("{}.{}", row.section, row.key).to_lowercase();
-        if f.is_empty() || key.contains(&f) {
-            out.push(SItem::Setting(i));
+        let hay = format!(
+            "{} {} {}.{} {}",
+            row.label, row.help, row.section, row.key, row.value
+        )
+        .to_lowercase();
+        if f.is_empty() || hay.contains(&f) {
+            settings.push(SItem::Setting(i));
         }
     }
     if f.is_empty() {
+        out.push(SItem::Header("高级设置（写进 config.ini）"));
+        out.extend(settings);
+        out.push(SItem::Header("数据操作"));
         for i in 0..ACTIONS.len() {
             out.push(SItem::Action(i));
         }
+    } else {
+        // 搜索时只要命中的行，不夹分组标题（省地方）。
+        out.extend(settings);
     }
     out
 }
@@ -2542,15 +2558,15 @@ fn settings_items(snap: &Snapshot, filter: &str) -> Vec<SItem> {
 fn settings_geom(_w: f32, h: f32) -> SettingsGeom {
     let card_top = 208.0;
     let list_top = card_top + 52.0;
-    let row_h = 28.0;
-    // 底部。
-let max_rows = (((h - 32.0 - 30.0 - list_top) / row_h).floor() as usize).max(1);
+    // 高级项两行：中文名 + 一句话说明；基础行/操作也跟着这个行高，整页不再挤成一列键名。
+    let row_h = 44.0;
+    let max_rows = (((h - 32.0 - 30.0 - list_top) / row_h).floor() as usize).max(1);
     SettingsGeom {
         list_top,
         row_h,
         max_rows,
-        value_x: 32.0 + 300.0,
-        value_w: 130.0,
+        value_x: 720.0,
+        value_w: 150.0,
     }
 }
 
@@ -2589,8 +2605,8 @@ fn draw_settings(
         &p.br.fg,
     );
     p.text(
-        "高级项改动会写进 config.ini；每行后面标的是生效时机",
-        rect(card.left + 66.0, card.top + 15.0, 420.0, 18.0),
+        "中文名 + 一句话说明；改动写进 config.ini，标「重启」的项要重启程序",
+        rect(card.left + 66.0, card.top + 15.0, 560.0, 18.0),
         &p.fmt.small,
         &p.br.muted,
     );
@@ -2600,7 +2616,7 @@ let sbox = search_box_rect(w);
     p.round(sbox, 7.0, &p.br.header, Some(&p.br.border));
     if filter.is_empty() {
         p.text(
-            "搜索段.键…",
+            "搜索设置（名称或段.键）…",
             rect(sbox.left + 10.0, sbox.top + 4.0, sbox.right - sbox.left - 20.0, 18.0),
             &p.fmt.small,
             &p.br.muted,
@@ -2627,14 +2643,26 @@ let sbox = search_box_rect(w);
         match items[idx] {
             SItem::Setting(i) => {
                 let row = &snap.settings[i];
+                // 第一行中文名，第二行一句话说明（说明以「分组 ·」开头）。
                 p.text(
-                    &format!("{}.{}", row.section, row.key),
-                    rect(r.left + 8.0, y + 5.0, 280.0, 18.0),
-                    &p.fmt.small,
+                    row.label,
+                    rect(r.left + 12.0, y + 3.0, 420.0, 18.0),
+                    &p.fmt.body,
                     &p.br.fg,
                 );
+                p.text(
+                    row.help,
+                    rect(
+                        r.left + 12.0,
+                        y + 21.0,
+                        (g.value_x - r.left - 30.0).max(120.0),
+                        15.0,
+                    ),
+                    &p.fmt.small,
+                    &p.br.muted,
+                );
 
-                let vb = rect(g.value_x, y + 3.0, g.value_w, g.row_h - 8.0);
+                let vb = rect(g.value_x, y + 9.0, g.value_w, 26.0);
                 if row.kind == 0 {
                     let on = row.value == "true";
                     p.round(vb, 6.0, if on { &p.br.success } else { &p.br.grid }, None);
@@ -2666,21 +2694,40 @@ let sbox = search_box_rect(w);
                         );
                     }
                 }
+                // 只有"要重启/下次隐藏"这种例外才写在行上；绝大多数立即生效，不再每行重复。
+                if row.live != "改完立即生效" {
+                    p.text(
+                        row.live,
+                        rect(vb.right + 14.0, y + 13.0, 220.0, 16.0),
+                        &p.fmt.small,
+                        &p.br.muted,
+                    );
+                }
+            }
+            SItem::Header(title) => {
                 p.text(
-                    row.live,
-                    rect(vb.right + 12.0, y + 5.0, 240.0, 18.0),
+                    title,
+                    rect(r.left + 12.0, y + 12.0, 360.0, 18.0),
                     &p.fmt.small,
                     &p.br.muted,
+                );
+                p.line(
+                    r.left + 12.0,
+                    y + g.row_h - 1.0,
+                    r.right - 12.0,
+                    y + g.row_h - 1.0,
+                    &p.br.grid,
+                    1.0,
                 );
             }
             SItem::Basic(b) => {
                 p.text(
                     basic_label(b),
-                    rect(r.left + 8.0, y + 5.0, 200.0, 18.0),
-                    &p.fmt.small,
+                    rect(r.left + 12.0, y + 3.0, 240.0, 18.0),
+                    &p.fmt.body,
                     &p.br.fg,
                 );
-                let vb = rect(g.value_x, y + 3.0, 70.0, g.row_h - 8.0);
+                let vb = rect(g.value_x, y + 9.0, 80.0, 26.0);
                 match b {
                     Basic::Autostart => {
                         let on = snap.autostart;
@@ -2693,7 +2740,7 @@ let sbox = search_box_rect(w);
                         );
                         p.text(
                             "改完立即生效（现读启动文件夹）",
-                            rect(vb.right + 12.0, y + 5.0, 300.0, 18.0),
+                            rect(r.left + 12.0, y + 21.0, 300.0, 18.0),
                             &p.fmt.small,
                             &p.br.muted,
                         );
@@ -2717,9 +2764,9 @@ let sbox = search_box_rect(w);
                             } else if on {
                                 "全局键鼠监听已开；停用后要重启才彻底退出（[collector] enabled）"
                             } else {
-                                "默认关闭；点一下开始采集（全局键鼠，只存本机）"
+                                "已关闭；点一下开始采集（全局键鼠，只存本机）"
                             },
-                            rect(vb.right + 12.0, y + 5.0, 520.0, 18.0),
+                            rect(r.left + 12.0, y + 21.0, 520.0, 18.0),
                             &p.fmt.small,
                             if legacy { &p.br.danger } else { &p.br.muted },
                         );
@@ -2742,7 +2789,7 @@ let sbox = search_box_rect(w);
                             } else {
                                 "点一下暂停：键鼠与设备计数一起停，不写配置、重启即恢复"
                             },
-                            rect(vb.right + 12.0, y + 5.0, 520.0, 18.0),
+                            rect(r.left + 12.0, y + 21.0, 520.0, 18.0),
                             &p.fmt.small,
                             &p.br.muted,
                         );
@@ -2758,7 +2805,7 @@ let sbox = search_box_rect(w);
                         );
                         p.text(
                             "Ctrl + Shift + F（global-hotkey 注册状态，不是配置键）",
-                            rect(vb.right + 12.0, y + 5.0, 420.0, 18.0),
+                            rect(r.left + 12.0, y + 21.0, 420.0, 18.0),
                             &p.fmt.small,
                             &p.br.muted,
                         );
@@ -2774,7 +2821,7 @@ let sbox = search_box_rect(w);
                         );
                         p.text(
                             "拖到哪记哪；双击卡片叫回主窗口（[floating] 段）",
-                            rect(vb.right + 12.0, y + 5.0, 420.0, 18.0),
+                            rect(r.left + 12.0, y + 21.0, 420.0, 18.0),
                             &p.fmt.small,
                             &p.br.muted,
                         );
@@ -2790,7 +2837,7 @@ let sbox = search_box_rect(w);
                         );
                         p.text(
                             "点一下切换；配色照 tokens.css 的两套令牌（[gui] theme）",
-                            rect(vb.right + 12.0, y + 5.0, 420.0, 18.0),
+                            rect(r.left + 12.0, y + 21.0, 420.0, 18.0),
                             &p.fmt.small,
                             &p.br.muted,
                         );
@@ -2805,7 +2852,7 @@ let sbox = search_box_rect(w);
                         );
                         p.text(
                             &snap.app_dir,
-                            rect(vb.right + 12.0, y + 5.0, 420.0, 18.0),
+                            rect(r.left + 12.0, y + 21.0, 420.0, 18.0),
                             &p.fmt.small,
                             &p.br.muted,
                         );
@@ -2817,11 +2864,11 @@ let sbox = search_box_rect(w);
 let (label, desc) = ACTIONS[a];
                 p.text(
                     label,
-                    rect(r.left + 8.0, y + 5.0, 200.0, 18.0),
-                    &p.fmt.small,
+                    rect(r.left + 12.0, y + 3.0, 240.0, 18.0),
+                    &p.fmt.body,
                     &p.br.fg,
                 );
-                let vb = rect(g.value_x, y + 3.0, 70.0, g.row_h - 8.0);
+                let vb = rect(g.value_x, y + 9.0, 80.0, 26.0);
                 let enabled = !busy;
                 p.round(vb, 6.0, if enabled { &p.br.accent } else { &p.br.grid }, None);
                 p.text(
@@ -2832,7 +2879,7 @@ let (label, desc) = ACTIONS[a];
                 );
                 p.text(
                     desc,
-                    rect(vb.right + 12.0, y + 5.0, 360.0, 18.0),
+                    rect(r.left + 12.0, y + 21.0, 360.0, 18.0),
                     &p.fmt.small,
                     &p.br.muted,
                 );
