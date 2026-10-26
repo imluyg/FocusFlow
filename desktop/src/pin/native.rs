@@ -356,10 +356,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let mut rc = RECT::default();
                         let _ = wm::GetWindowRect(hwnd, &mut rc);
                         // 先改窗口尺寸再重画：反过来的话有一帧是"新图配旧框"
+                        //
+                        // ✕ 钉在这张图的右上角，而放大是以左上角为锚往右下长的 ⇒ 长过头时
+                        // 那个唯一看得见的关闭按钮就走出屏幕了。同一条规则与 WebView2 那一份
+                        // （`super::close_reachable_left`）：参照边界**先取包含 ✕ 的那块屏**，
+                        // 都不包含才退到最近那块 ⇒ 本来够得着的位置一个像素都不会被挪。
+                        let close_x = rc.left + w as i32 - 1;
+                        let mon = crate::floating::monitor_containing(close_x, rc.top)
+                            .unwrap_or_else(|| crate::floating::nearest_monitor(close_x, rc.top));
+                        let reference_right = Some(mon.x + mon.width as i32);
+                        let x = super::close_reachable_left(rc.left, w as i32, reference_right);
                         let _ = wm::SetWindowPos(
                             hwnd,
                             None,
-                            rc.left,
+                            x,
                             rc.top,
                             w as i32,
                             h as i32,

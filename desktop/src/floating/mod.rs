@@ -21,7 +21,10 @@ pub(crate) mod render;
 /// 「卡片还在屏幕里吗，不在就搬回来」——判据与落点都是启动那一条，两条渲染器共用。
 /// WebView2 那一支由 `state::keep_floating_on_top` 那个线程顺手跑，原生那一支在
 /// `WM_DISPLAYCHANGE` 上跑（见 `native::ensure_visible_on_screen` 为什么要分开）。
-pub(crate) use native::ensure_visible_on_screen;
+///
+/// `nearest_monitor`/`monitor_containing` 一并放出来：贴图换档时也要问"✕ 落在哪块屏"，
+/// 而"哪块屏"这件事全仓只许有一份实现（`native` 这个模块本身是私有的）。
+pub(crate) use native::{ensure_visible_on_screen, monitor_containing, nearest_monitor};
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::Mutex;

@@ -588,25 +588,37 @@ fn grown_top(anchor: i32, scale: f64, height: i32, mon: MonitorRect) -> i32 {
 ///
 /// 拿不到就退回主屏尺寸（与"没存过坐标"那条用的是同一块屏）：那也比**不夹**强 ——
 /// 卡片至少会被拉回看得见的地方。
-fn nearest_monitor(px_x: i32, px_y: i32) -> MonitorRect {
-    unsafe {
-        let hmon = g::MonitorFromPoint(POINT { x: px_x, y: px_y }, g::MONITOR_DEFAULTTONEAREST);
-        // MONITORINFO 靠 cbSize 自报版本，没有可用的 Default，先清零。
-        let mut mi: g::MONITORINFO = std::mem::zeroed();
-        mi.cbSize = core::mem::size_of::<g::MONITORINFO>() as u32;
-        if !hmon.is_invalid() && g::GetMonitorInfoW(hmon, &raw mut mi).as_bool() {
-            let wide = MonitorRect::new(
-                mi.rcMonitor.left,
-                mi.rcMonitor.top,
-                (mi.rcMonitor.right - mi.rcMonitor.left).max(0) as u32,
-                (mi.rcMonitor.bottom - mi.rcMonitor.top).max(0) as u32,
-            );
-            if let Ok(m) = wide {
-                return m;
-            }
-        }
-        primary_monitor()
+///
+/// `pin::native` 换档时也用这里，所以"哪块屏"这个问题全仓只有一份实现。
+pub(crate) fn nearest_monitor(px_x: i32, px_y: i32) -> MonitorRect {
+    let found = unsafe { monitor_at(px_x, px_y, g::MONITOR_DEFAULTTONEAREST) };
+    found.unwrap_or_else(primary_monitor)
+}
+
+/// 这一块矩形**里**有没有屏：`MONITOR_DEFAULTTONULL` 对不在任何一块屏上的点回空句柄。
+///
+/// 贴图换档那条要问的就是这个（"✕ 那一点还落在屏里吗"），用
+/// `MONITOR_DEFAULTTONEAREST` 问不出"在不在" —— 它总给一块屏回来。
+/// 与 [`nearest_monitor`] 共用同一次查询，"哪块屏"这件事全仓一份实现。
+pub(crate) fn monitor_containing(px_x: i32, px_y: i32) -> Option<MonitorRect> {
+    unsafe { monitor_at(px_x, px_y, g::MONITOR_DEFAULTTONULL) }
+}
+
+unsafe fn monitor_at(px_x: i32, px_y: i32, flags: g::MONITOR_FROM_FLAGS) -> Option<MonitorRect> {
+    let hmon = g::MonitorFromPoint(POINT { x: px_x, y: px_y }, flags);
+    // MONITORINFO 靠 cbSize 自报版本，没有可用的 Default，先清零。
+    let mut mi: g::MONITORINFO = std::mem::zeroed();
+    mi.cbSize = core::mem::size_of::<g::MONITORINFO>() as u32;
+    if hmon.is_invalid() || !g::GetMonitorInfoW(hmon, &raw mut mi).as_bool() {
+        return None;
     }
+    MonitorRect::new(
+        mi.rcMonitor.left,
+        mi.rcMonitor.top,
+        (mi.rcMonitor.right - mi.rcMonitor.left).max(0) as u32,
+        (mi.rcMonitor.bottom - mi.rcMonitor.top).max(0) as u32,
+    )
+    .ok()
 }
 
 /// 卡片现在这个位置还看得见吗？看不见（或只剩一条边）就整张搬回最近那块屏。

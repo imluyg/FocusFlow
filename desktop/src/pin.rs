@@ -271,31 +271,96 @@ fn apply_pin_size(win: &WebviewWindow, width: u32, height: u32) -> Result<(), St
         tracing::warn!("贴图窗口设尺寸失败：{e}");
         return Err(format!("贴图窗口设尺寸失败：{e}"));
     }
-    let got = match win.inner_size() {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::warn!("读不到贴图窗口客户区尺寸：{e}");
-            return Ok(());
+    // 客户区的**实际**尺寸可能与请求不同（WebView2 有 120px 的窗口宽度地板），
+    // 而 ✕ 是钉在窗口右上角的 ⇒ 往回让时要按真实宽度算，不是按想要的那个。
+    let mut actual_w = width;
+    match win.inner_size() {
+        Ok(got) => {
+            actual_w = got.width;
+            if got.width != width || got.height != height {
+                if got.width < width || got.height < height {
+                    tracing::warn!(
+                        "贴图窗口客户区 {}x{} 比请求的 {width}x{height} 小，图会被切一块",
+                        got.width,
+                        got.height
+                    );
+                } else {
+                    tracing::debug!(
+                        "贴图窗口客户区 {}x{} 比请求的 {width}x{height} 宽（WebView2 的窗口最小宽度地板），\
+                         多出来的是底色边，图仍按原尺寸画",
+                        got.width,
+                        got.height
+                    );
+                }
+            }
         }
-    };
-    if got.width == width && got.height == height {
-        return Ok(());
+        Err(e) => tracing::warn!("读不到贴图窗口客户区尺寸：{e}"),
     }
-    if got.width < width || got.height < height {
-        tracing::warn!(
-            "贴图窗口客户区 {}x{} 比请求的 {width}x{height} 小，图会被切一块",
-            got.width,
-            got.height
-        );
-    } else {
-        tracing::debug!(
-            "贴图窗口客户区 {}x{} 比请求的 {width}x{height} 宽（WebView2 的窗口最小宽度地板），\
-             多出来的是底色边，图仍按原尺寸画",
-            got.width,
-            got.height
-        );
-    }
+    keep_close_button_reachable(win, actual_w);
     Ok(())
+}
+
+/// 换档（或第一次按图像尺寸定形）之后，把窗口往回让一点，让 ✕ 还在这块屏里。
+///
+/// ✕ 是 `ui/pin.html` 里 `position:fixed;right:4px;top:4px` 的那一枚 —— 它钉在**窗口**的右上角，
+/// 而 `set_size` 以左上角为锚 ⇒ 放大时右边长出屏幕，那个唯一看得见的关闭按钮就点不到了
+/// （跨屏那张大图第一次定形时同理：3840 宽钉在 1920 的屏上，✕ 一开就在屏幕外）。
+/// 纵向不用管：✕ 在上边，而 `set_size` 不动 `top`。
+fn keep_close_button_reachable(win: &WebviewWindow, width: u32) {
+    let Ok(pos) = win.outer_position() else {
+        return;
+    };
+    let Ok(monitors) = win.available_monitors() else {
+        return;
+    };
+    // 问的是 ✕ 那一点，不是窗口中心：一张横跨 A|B 的图，✕ 落在 B 上就是够得着的。
+    let edges: Vec<(i32, i32)> = monitors
+        .iter()
+        .map(|m| {
+            let l = m.position().x;
+            (l, l + m.size().width as i32)
+        })
+        .collect();
+    let want = close_reachable_left(
+        pos.x,
+        width as i32,
+        reference_right_edge(&edges, pos.x + width as i32 - 1),
+    );
+    if want != pos.x {
+        if let Err(e) = win.set_position(PhysicalPosition::new(want, pos.y)) {
+            tracing::warn!("贴图换档后把 ✕ 搬回屏幕内失败：{e}");
+        }
+    }
+}
+
+/// 该拿哪块屏的右边界作参照：**包含 ✕ 那一点的那块**；都不包含时才是中心最近的那块。
+///
+/// 顺序不能反 —— 反过来就可能挑到一块"右边界比 ✕ 还靠左"的屏（窄屏挨着宽屏、✕ 刚好压在
+/// 窄屏左缘那一种），把一个本来够得着的 ✕ 往回拽几个像素。按包含优先，参照边界必然
+/// ≥ `point + 1 = left + width`，于是 [`close_reachable_left`] 对"本来够得着"的位置天然
+/// 算不出移动 ⇒ 不需要额外的 `inside` 短路，也不需要一条为它单独开的腿。
+///
+/// ⚠ 也别用 `win.current_monitor()`：它底层是 `MonitorFromWindow(..., DEFAULTTOPRIMARY)`，
+/// 一张摆在副屏上的贴图会被答成主屏，于是这条修正会把整张图拽到另一块屏上。
+fn reference_right_edge(edges: &[(i32, i32)], point: i32) -> Option<i32> {
+    if let Some(&(_, r)) = edges.iter().find(|(l, r)| *l <= point && point < *r) {
+        return Some(r);
+    }
+    edges
+        .iter()
+        .min_by_key(|(l, r)| ((l + r) / 2 - point).abs())
+        .map(|&(_, r)| r)
+}
+
+/// 让窗口的右边缘不超过参照边界，其余一律不动。
+///
+/// 图比屏还宽时左边溢出是**刻意的**：看不见图的左边不要紧，看不见 ✕ 就是这张图关不掉。
+/// `None` = 一块屏都问不到（热插拔那一瞬）⇒ 宁可不搬，也不把图丢到未知的位置。
+pub(crate) fn close_reachable_left(left: i32, width: i32, reference_right: Option<i32>) -> i32 {
+    match reference_right {
+        Some(right) => left.min(right - width),
+        None => left,
+    }
 }
 
 /// 在主线程建出贴图窗口。**只能由 `open()` 经 `run_on_main_thread` 调进来。**
@@ -694,6 +759,92 @@ mod tests {
 
     /// 副屏负原点：绝对落点必须加过那块屏的原点。
     /// 忘了加的症状是「在副屏截的图贴出来跑到主屏左上角」，而截图本身是对的。
+    /// ✕ 钉在窗口右上角，而 `set_size` 以左上角为锚往右下长 ⇒ 放大过头时那个唯一看得见
+    /// 的关闭按钮会走出屏幕（跨屏那张大图第一次定形时同理）。规则只有一句：
+    /// **够得着就不动，够不着才往回让到参照屏的右边缘。**
+    #[test]
+    fn the_close_button_is_moved_only_when_it_is_out_of_every_screen() {
+        let one = [(0, 1920)];
+        assert_eq!(reference_right_edge(&one, 1000), Some(1920));
+        assert_eq!(
+            close_reachable_left(100, 900, reference_right_edge(&one, 999)),
+            100,
+            "✕ 在屏里 ⇒ 一个字都不动"
+        );
+        // 横跨 A|B 的那张图：✕ 落在 B 上就以 B 为参照。
+        let two = [(0, 1920), (1920, 3840)];
+        assert_eq!(reference_right_edge(&two, 2700), Some(3840));
+        assert_eq!(
+            close_reachable_left(1500, 1200, reference_right_edge(&two, 2699)),
+            1500,
+            "图的左边超出 A 无所谓，✕ 在 B 里就是够得着"
+        );
+        // 都不包含时取中心最近那块，往回让到它的右边缘。
+        assert_eq!(reference_right_edge(&two, 5000), Some(3840));
+        assert_eq!(close_reachable_left(4500, 1200, Some(3840)), 2640);
+        // 图比屏还宽：左边溢出是刻意的 —— 看不见图的左边不要紧，看不见 ✕ 就是关不掉。
+        assert_eq!(close_reachable_left(0, 3840, Some(1920)), -1920);
+        // 一块屏都问不到（热插拔那一瞬）：宁可不搬。
+        assert_eq!(reference_right_edge(&[], 100), None);
+        assert_eq!(close_reachable_left(700, 500, None), 700);
+    }
+
+    /// 包含优先必须排在"中心最近"之前 —— 反过来的话，本来够得着的 ✕ 会被回拽几个像素。
+    ///
+    /// 这条是变异逼出来的：第一版用一个 `inside` 短路做同一件事，而那种写法在判据里
+    /// 区分不出来（摘掉短路，所有用例照绿）。换成"先按包含选参照屏"之后，保证变成
+    /// 可从函数本身量出来的性质，于是有了下面这两个数。
+    #[test]
+    fn the_containing_screen_wins_over_the_nearest_center() {
+        // 窄屏 A(0..100) 挨着宽屏 B(100..1000)；✕ 恰好在 100 这一点上 —— 它在 B 里，
+        // 而按中心最近会挑到 A（中心 50 距 50，B 的中心 550 距 450）。
+        let edges = [(0, 100), (100, 1000)];
+        assert_eq!(
+            reference_right_edge(&edges, 100),
+            Some(1000),
+            "包含优先：该拿 B 的右边缘"
+        );
+        assert_eq!(
+            close_reachable_left(-899, 1000, reference_right_edge(&edges, 100)),
+            -899,
+            "以 B 为参照：-899+1000=101 ≤ 1000，本来就够得着 ⇒ 不许动（按中心最近会算出 -900）"
+        );
+    }
+
+    /// 规则对了两条渲染器各自没调用 = 病症照旧：`apply_pin_size` 尾部与原生换档那一步。
+    #[test]
+    fn both_pin_renderers_apply_the_close_button_rule() {
+        let no_comments = code_only(include_str!("pin.rs"));
+        let prod = &no_comments[..no_comments
+            .find("#[cfg(test)]")
+            .expect("测试模块的起点找不到了")];
+        let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        let at = flat
+            .find("fnapply_pin_size")
+            .expect("尺寸那一步的形状变了，判据要跟着改");
+        let body = &flat[at..at + 900];
+        let size = body
+            .find("set_size(PhysicalSize::new(width,height))")
+            .expect("设尺寸那一步不见了");
+        let fix = body
+            .find("keep_close_button_reachable(win,actual_w)")
+            .expect("设完尺寸没人检查 ✕ 够不够得着");
+        assert!(
+            fix > size,
+            "往回让排在了设尺寸之前：那时窗口还是旧宽度，算出来的落点不对"
+        );
+
+        let native_nc = code_only(include_str!("pin/native.rs"));
+        let native = &native_nc[..native_nc
+            .find("#[cfg(test)]")
+            .expect("测试模块的起点找不到了")];
+        let native_flat: String = native.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            native_flat.contains("super::close_reachable_left("),
+            "原生贴图换档那条没有走这条规则：放大后 ✕ 照样长出屏幕"
+        );
+    }
+
     #[test]
     fn origin_adds_the_monitor_corner() {
         assert_eq!(pin_origin(&mon(0, 0), 120, 240), (120, 240));
