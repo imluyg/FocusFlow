@@ -88,6 +88,8 @@ const WM_SHOW_MAIN: u32 = WM_APP + 7;
 const WM_ACCEPTANCE_PAUSE: u32 = WM_APP + 8;
 /// 自动化验收用：走一遍「退出」（= 托盘菜单的退出），用来验"退出前 flush + 退出备份"。
 const WM_ACCEPTANCE_QUIT: u32 = WM_APP + 9;
+/// 测试钩子 `FOCUSFLOW_PLUGIN_SEL`：按记录 id 走一遍"点表格一行 + 按一颗 sel 按钮"。
+const WM_SEL_TEST: u32 = WM_APP + 10;
 const TIMER_EVENTS: usize = 1;
 /// EDIT 。
 const EM_SETSEL: u32 = 0x00B1;
@@ -665,6 +667,10 @@ plugin_open: Option<String>,
     pv_select: Option<PvSelect>,
     /// 本地打开的 `modal_form` id（插件自己 `open=true` 的弹窗不走这里）。
     pv_modal: Option<String>,
+    /// 插件表格的选中行：键是分组名（不分组用空串），值是记录 id，按点击顺序。
+    /// `sel` 按钮拼的动作 id 与行高亮都读这一份；开/关视图时清掉（旧版前端口径：
+    /// 关掉面板就不留选中），切换分组互不影响。
+    plugin_sel: HashMap<String, Vec<String>>,
     /// 上一次重算插件视图的时间�? 秒一次就够，别跟着 100ms 心跳跑）。
 last_pv_refresh: Option<std::time::Instant>,
     hover: Option<usize>,
@@ -862,6 +868,7 @@ let dpi = GetDpiForWindow(hwnd) as f32;
                 pv_scroll: 0,
                 pv_select: None,
                 pv_modal: None,
+                plugin_sel: HashMap::new(),
                 last_pv_refresh: None,
                 hover: None,
                 sel: None,
@@ -1023,6 +1030,7 @@ fn ensure_target(&mut self, hwnd: HWND) {
                 self.pv_scroll,
                 self.pv_select.as_ref(),
                 self.pv_modal.as_deref(),
+                &self.plugin_sel,
             );
         }
         let ok = unsafe { t.rt.EndDraw(None, None).is_ok() } && t.present();
@@ -1243,9 +1251,7 @@ for (i, tab) in view_tabs().iter().enumerate() {
                     let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
                     if hit(back, x, y) {
                         self.plugin_open = None;
-                        self.pv_scroll = 0;
-                        self.pv_select = None;
-                        self.pv_modal = None;
+                        self.reset_plugin_view_state();
                         unsafe {
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
@@ -1335,15 +1341,14 @@ for (i, tab) in view_tabs().iter().enumerate() {
                 let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
                 if hit(back, x, y) {
                     self.plugin_open = None;
-                    self.pv_scroll = 0;
-                    self.pv_select = None;
-                    self.pv_modal = None;
+                    self.reset_plugin_view_state();
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     return;
                 }
                 // 4) 正文控件
+                let sel_map = self.plugin_sel.clone();
                 let ops = plugin_view_ops(
                     &view,
                     rect(
@@ -1353,15 +1358,18 @@ for (i, tab) in view_tabs().iter().enumerate() {
                         card.bottom - card.top,
                     ),
                     self.pv_scroll as f32,
+                    &sel_map,
                 );
                 for op in &ops {
                     match op {
                         POp::Button {
                             rect: r,
+                            text: _,
                             id,
                             disabled,
                             modal,
-                            ..
+                            sel,
+                            group,
                         } => {
                             if !*disabled && hit(*r, x, y) {
                                 if let Some(mid) = modal {
@@ -1371,20 +1379,38 @@ for (i, tab) in view_tabs().iter().enumerate() {
                                     unsafe {
                                         let _ = InvalidateRect(Some(hwnd), None, false);
                                     }
+                                } else if *sel {
+                                    self.press_sel_button(hwnd, &n, id, group);
                                 } else {
                                     self.run_plugin_action(hwnd, &n, id);
                                 }
                                 return;
                             }
                         }
-                        // 表格行内操作按钮
-                        POp::Table { buttons, .. } => {
+                        // 表格：先认行内操作按钮，再认"点了哪一行"（选中/取消）。
+                        POp::Table {
+                            rect: r,
+                            buttons,
+                            ids,
+                            group,
+                            onselect,
+                            ..
+                        } => {
                             for (br, id, _) in buttons {
                                 if hit(*br, x, y) {
                                     self.run_plugin_action(hwnd, &n, id);
                                     return;
                                 }
                             }
+                            if ids.is_empty() {
+                                return;
+                            }
+                            let Some(i) = (0..ids.len()).find(|i| hit(pv_table_row_rect(r, *i), x, y))
+                            else {
+                                return;
+                            };
+                            self.select_plugin_row(hwnd, &n, group, onselect, &ids[i]);
+                            return;
                         }
                         POp::Select {
                             rect: r,
@@ -2004,9 +2030,7 @@ fn open_plugin_view(&mut self, hwnd: HWND, name: &str) {
             }
         }
         self.plugin_open = Some(name.to_string());
-        self.pv_scroll = 0;
-        self.pv_select = None;
-        self.pv_modal = None;
+        self.reset_plugin_view_state();
         tracing_note(&format!("打开插件视图：{name}"));
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2093,6 +2117,53 @@ fn open_plugin_view(&mut self, hwnd: HWND, name: &str) {
         }
     }
 
+    /// 点了一行：更新这一组的选中集，再按 `onselect` 联动写字段。
+    /// 真点击与测试钩子都走这一个方法，所以钩子验过的就是点出来的那条路径。
+    /// 日志里带 ASCII 的 `sel-row`，验收脚本按它核对（中文日志在 ASCII 脚本里不好匹配）。
+    fn select_plugin_row(
+        &mut self,
+        hwnd: HWND,
+        plugin: &str,
+        group: &str,
+        onselect: &str,
+        id: &str,
+    ) {
+        let cur: Vec<String> = self.plugin_sel.get(group).cloned().unwrap_or_default();
+        let next = apply_row_select(group, &cur, id);
+        if next.is_empty() {
+            self.plugin_sel.remove(group);
+        } else {
+            self.plugin_sel.insert(group.to_string(), next);
+        }
+        let count = self.plugin_sel.get(group).map(|v| v.len()).unwrap_or(0);
+        tracing_note(&format!(
+            "插件表格点行 sel-row group={group:?} id={id:?} 选中数={count}"
+        ));
+        if onselect.is_empty() {
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        } else {
+            self.set_plugin_field(hwnd, plugin, onselect, id);
+        }
+    }
+
+    /// 按一颗 `button.sel`：动作 id = 按钮 id 拼上该分组的选中行 id，再交给插件。
+    /// 没选中、或"一次只吃一条"的按钮选多了 ⇒ 不发，把原因摆到状态行：
+    /// 让 `"1,2"` 进 `tonumber` 的结局就是"点了没反应"。
+    fn press_sel_button(&mut self, hwnd: HWND, plugin: &str, button_id: &str, group: &str) {
+        match sel_action_id(button_id, group, &self.plugin_sel) {
+            Ok(action) => self.run_plugin_action(hwnd, plugin, &action),
+            Err(why) => {
+                tracing_note(&format!("插件按钮 {button_id} 没发送 sel-skip：{why}"));
+                self.status = Some(why);
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+        }
+    }
+
     /// 插件视图里的按钮：把动作 id 交给插件，再把视图重算一遍。
 fn run_plugin_action(&mut self, hwnd: HWND, name: &str, action: &str) {
         let res = match self.pm.as_mut() {
@@ -2114,6 +2185,15 @@ fn run_plugin_action(&mut self, hwnd: HWND, name: &str, action: &str) {
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
+    }
+
+    /// 换视图看 / 关掉视图时，把视图里的临时状态清干净：滚动、下拉、弹窗、表格选中行。
+    /// 选中态不跨视图留存（与旧版前端一致：关掉面板就不留选中），分组之间也一次全清。
+    fn reset_plugin_view_state(&mut self) {
+        self.pv_scroll = 0;
+        self.pv_select = None;
+        self.pv_modal = None;
+        self.plugin_sel.clear();
     }
 
     /// 数据目录：交给资源管理器打开（不自己实现文件浏览）。
@@ -3437,6 +3517,8 @@ fn draw_screen(
     pv_scroll: i32,
     pv_select: Option<&PvSelect>,
     pv_modal: Option<&str>,
+    // 插件表格各分组当前选中的记录 id（选中行高亮与 `sel` 按钮都读它）。
+    plugin_sel: &HashMap<String, Vec<String>>,
 ) {
     let m = 16.0;
 
@@ -3574,7 +3656,7 @@ fn draw_screen(
         3 => draw_analytics(p, w, h, snap, vs),
         4 => match plugin_view {
             Some((name, view)) => {
-                draw_plugin_view(p, w, h, name, view, pv_scroll);
+                draw_plugin_view(p, w, h, name, view, pv_scroll, plugin_sel);
             }
             None => draw_plugins(p, w, h, plugins, plugin_err, vs),
         },
@@ -5081,6 +5163,10 @@ enum POp {
         disabled: bool,
         /// 非空 = 点它只打开这个 `modal_form`，不触发插件动作（与 Web 端 `button.modal` 同义）。
         modal: Option<String>,
+        /// `button.sel`：动作 id = 本按钮 id 直接拼上该分组选中行的记录 id（无分隔符）。
+        sel: bool,
+        /// `sel` 按钮读哪个分组的选中行；空 = 读不分组的表（旧版前端的 `__main` 一格）。
+        group: String,
     },
     Table {
         rect: D2D_RECT_F,
@@ -5090,6 +5176,14 @@ enum POp {
         buttons: Vec<(D2D_RECT_F, String, String)>,
         /// 数据列可用宽度（右侧留给操作按钮）
         column_w: f32,
+        /// 与 `rows` 平行的记录 id；非空 = 这一行可点选。
+        ids: Vec<String>,
+        /// 分组名：非空 = 单选，且选中集只属于这一组；空 = 多选自成一格。
+        group: String,
+        /// 行选中时要写回的插件字段名（空 = 不写）。
+        onselect: String,
+        /// 当前选中的记录 id（画图用的那一份高亮）。
+        sel: Vec<String>,
     },
 }
 
@@ -5113,7 +5207,7 @@ fn plugin_content_height(
     view: &focusflow_core::plugins::PluginView,
     area: D2D_RECT_F,
 ) -> f32 {
-    let ops = plugin_view_ops(view, area, 0.0);
+    let ops = plugin_view_ops(view, area, 0.0, &HashMap::new());
     let bottom = ops
         .iter()
         .map(|op| op.bounds().bottom)
@@ -5121,11 +5215,64 @@ fn plugin_content_height(
     (bottom - area.top).max(0.0)
 }
 
+/// 插件表格的行几何：表头与行高是画、命中、行内按钮三处共用的同一把尺子。
+const PV_TABLE_HEAD_H: f32 = 24.0;
+const PV_TABLE_ROW_H: f32 = 20.0;
+
+/// 第 `i` 行的整行矩形（画图高亮与点击命中都从这里算，别各写一遍）。
+fn pv_table_row_rect(r: &D2D_RECT_F, i: usize) -> D2D_RECT_F {
+    rect(
+        r.left,
+        r.top + PV_TABLE_HEAD_H + i as f32 * PV_TABLE_ROW_H,
+        r.right - r.left,
+        PV_TABLE_ROW_H,
+    )
+}
+
+/// 点一行之后这一组的选中 id。分组表格（`group` 非空）是单选：点谁就只留谁，
+/// 再点同一行还是它；不分组的表是多选：再点同一行取消。顺序按点击先后 ——
+/// `sel` 按钮拼 id 时要按这个顺序逗号连接。
+fn apply_row_select(group: &str, current: &[String], id: &str) -> Vec<String> {
+    if !group.is_empty() {
+        return vec![id.to_string()];
+    }
+    let mut out: Vec<String> = current.to_vec();
+    match out.iter().position(|x| x == id) {
+        Some(i) => {
+            out.remove(i);
+        }
+        None => out.push(id.to_string()),
+    }
+    out
+}
+
+/// `button.sel` 要点火的动作 id：按钮 id 直接拼上该分组选中的记录 id（无分隔符，
+/// 多个用逗号 —— 这是插件侧 `on_action` 的契约，记账本 `del_42,43` 就是这么吃的）。
+/// 没选中、或"一次只吃一条"的按钮选多了 ⇒ `Err(说明)`：宁可不发也不让插件把
+/// `"1,2"` 念成空，那是"点了没反应"的老症状。
+fn sel_action_id(
+    button_id: &str,
+    group: &str,
+    plugin_sel: &HashMap<String, Vec<String>>,
+) -> std::result::Result<String, String> {
+    let ids = plugin_sel.get(group).cloned().unwrap_or_default();
+    if ids.is_empty() {
+        return Err("先在表格里点选一行，再按这颗按钮".to_string());
+    }
+    if ids.len() > 1 && button_id == "edit_" {
+        return Err("「修改」一次只改一条：请先只选中一行".to_string());
+    }
+    Ok(format!("{button_id}{}", ids.join(",")))
+}
+
 /// 把声明式视图排成一条条操作（内容区宽度，纵向堆叠）。
+/// `sel` 是各分组当前的选中行 id（只用来把选中态带到画法上；布局与它无关，
+/// 所以量内容高度时传空表就行）。
 fn plugin_view_ops(
     view: &focusflow_core::plugins::PluginView,
     area: D2D_RECT_F,
     offset: f32,
+    plugin_sel: &HashMap<String, Vec<String>>,
 ) -> Vec<POp> {
     use focusflow_core::plugins::Widget;
     let mut ops = Vec::new();
@@ -5133,7 +5280,14 @@ fn plugin_view_ops(
     let w = (area.right - area.left) - 32.0;
     let mut y = area.top + 12.0 - offset;
 
-    fn walk(widgets: &[Widget], x: f32, w: f32, y: &mut f32, ops: &mut Vec<POp>) {
+    fn walk(
+        widgets: &[Widget],
+        x: f32,
+        w: f32,
+        y: &mut f32,
+        ops: &mut Vec<POp>,
+        plugin_sel: &HashMap<String, Vec<String>>,
+    ) {
         for widget in widgets {
             match widget {
                 Widget::Heading(t) => {
@@ -5206,7 +5360,8 @@ fn plugin_view_ops(
                     text,
                     disabled,
                     modal,
-                    ..
+                    sel,
+                    group,
                 } => {
                     let bw = ((text.chars().count() as f32) * 15.0 + 28.0).max(96.0);
                     ops.push(POp::Button {
@@ -5215,6 +5370,8 @@ fn plugin_view_ops(
                         id: id.clone(),
                         disabled: *disabled,
                         modal: modal.clone(),
+                        sel: *sel,
+                        group: group.clone(),
                     });
                     *y += 38.0;
                 }
@@ -5223,10 +5380,12 @@ fn plugin_view_ops(
                     rows,
                     ids,
                     actions,
+                    group,
+                    onselect,
                     ..
                 } => {
                     let shown: Vec<Vec<String>> = rows.iter().take(6).cloned().collect();
-                    let h = 24.0 + shown.len() as f32 * 20.0;
+                    let h = PV_TABLE_HEAD_H + shown.len() as f32 * PV_TABLE_ROW_H;
                     // 有行内操作时，右侧留出按钮列，数据列相应收窄
                     let mut buttons: Vec<(D2D_RECT_F, String, String)> = Vec::new();
                     let mut reserve = 0.0f32;
@@ -5244,7 +5403,7 @@ fn plugin_view_ops(
                             for (prefix, label) in actions.iter().rev() {
                                 let bw = (label.chars().count() as f32 * 14.0 + 16.0).max(44.0);
                                 bx -= bw;
-                                let by = *y + 24.0 + ri as f32 * 20.0 + 1.0;
+                                let by = *y + PV_TABLE_HEAD_H + ri as f32 * PV_TABLE_ROW_H + 1.0;
                                 buttons.push((rect(bx, by, bw, 18.0), format!("{prefix}{rid}"), label.clone()));
                                 bx -= 6.0;
                             }
@@ -5256,6 +5415,10 @@ fn plugin_view_ops(
                         rows: shown,
                         buttons,
                         column_w: w - reserve,
+                        ids: ids.clone(),
+                        group: group.clone(),
+                        onselect: onselect.clone(),
+                        sel: plugin_sel.get(group.as_str()).cloned().unwrap_or_default(),
                     });
                     *y += h + 6.0;
                 }
@@ -5273,7 +5436,7 @@ fn plugin_view_ops(
                 }
                 Widget::Row { children } => {
                     // 横向容器先按纵向堆（子控件宽度有限，硬拆列反而更难读）。
-walk(children, x, w, y, ops);
+                    walk(children, x, w, y, ops, plugin_sel);
                 }
                 Widget::ModalForm { .. } => {
                     // 弹窗不再按普通控件排在正文里：`draw_plugin_modal` 把它画成整屏遮罩上
@@ -5284,7 +5447,7 @@ walk(children, x, w, y, ops);
         }
     }
 
-    walk(&view.widgets, x, w, &mut y, &mut ops);
+    walk(&view.widgets, x, w, &mut y, &mut ops, plugin_sel);
     ops
 }
 
@@ -5296,6 +5459,7 @@ fn draw_plugin_view(
     name: &str,
     view: &focusflow_core::plugins::PluginView,
     scroll: i32,
+    plugin_sel: &HashMap<String, Vec<String>>,
 ) -> D2D_RECT_F {
     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
     p.round(card, 14.0, &p.br.card, Some(&p.br.border));
@@ -5334,6 +5498,7 @@ fn draw_plugin_view(
             card.bottom - card.top,
         ),
         scroll as f32,
+        plugin_sel,
     );
     for op in &ops {
         match op {
@@ -5439,8 +5604,11 @@ fn draw_plugin_view(
                 rows,
                 buttons,
                 column_w,
+                ids,
+                sel: chosen,
+                ..
             } => {
-                p.fill(rect(r.left, r.top, r.right - r.left, 24.0), &p.br.header);
+                p.fill(rect(r.left, r.top, r.right - r.left, PV_TABLE_HEAD_H), &p.br.header);
                 let cols = headers.len().max(1);
                 let cw = (*column_w).max(40.0) / cols as f32;
                 for (i, htxt) in headers.iter().enumerate() {
@@ -5452,13 +5620,22 @@ fn draw_plugin_view(
                     );
                 }
                 for (ri, row) in rows.iter().enumerate() {
-                    let ry = r.top + 24.0 + ri as f32 * 20.0;
+                    let rr = pv_table_row_rect(r, ri);
+                    // 选中行整条压主色底（不另开勾选列：布局与内容高度都不该因选中而变）。
+                    let picked = ids
+                        .get(ri)
+                        .map(|id| chosen.iter().any(|c| c == id))
+                        .unwrap_or(false);
+                    if picked {
+                        p.round(rr, 3.0, &p.br.accent, None);
+                    }
+                    let ink = if picked { &p.br.white } else { &p.br.fg };
                     for (ci, cell) in row.iter().enumerate().take(cols) {
                         p.text(
                             cell,
-                            rect(r.left + 6.0 + ci as f32 * cw, ry + 2.0, cw - 12.0, 16.0),
+                            rect(rr.left + 6.0 + ci as f32 * cw, rr.top + 2.0, cw - 12.0, 16.0),
                             &p.fmt.small,
-                            &p.br.fg,
+                            ink,
                         );
                     }
                 }
@@ -6940,6 +7117,73 @@ fn arrange_data_move(
     ))
 }
 
+/// 测试钩子 `FOCUSFLOW_PLUGIN_SEL="<插件名>|<行 id 或 first>|<sel 按钮 id 可空>"`：
+/// 按记录 id 选中插件表格里的一行，再按一颗 `sel` 按钮 —— 调的就是点击那条路径上的
+/// 同两个方法（`select_plugin_row` / `press_sel_button`）。
+/// 为什么按 id 不按坐标：注入的点击要算像素，而表格行的位置随插件视图与滚动变化；
+/// 这里要验的是"Lua 表里的 ids/group/onselect 有没有真的走到"，坐标那一段仍归眼验。
+fn run_plugin_sel_test(hwnd: HWND) {
+    let Ok(spec) = std::env::var("FOCUSFLOW_PLUGIN_SEL") else {
+        return;
+    };
+    let mut it = spec.split('|');
+    let plugin = it.next().unwrap_or("").to_string();
+    let want = it.next().unwrap_or("first").to_string();
+    let button = it.next().unwrap_or("").to_string();
+    if plugin.is_empty() {
+        tracing_note("sel-test bad-spec");
+        return;
+    }
+    let Some(app) = (unsafe { app_ptr(hwnd) }) else { return };
+    // 插件是切到「插件管理」那一页才加载的；钩子直接来就得自己先把那一步补上，
+    // 否则 `get_plugin` 拿到的是空清单。
+    app.reload_plugins();
+    if app.plugin_open.as_deref() != Some(plugin.as_str()) {
+        app.open_plugin_view(hwnd, &plugin);
+    }
+    let Some(view) = app
+        .pm
+        .as_ref()
+        .and_then(|pm| pm.get_plugin(&plugin))
+        .and_then(|p| p.view.clone())
+    else {
+        tracing_note(&format!("sel-test no-view {plugin}"));
+        return;
+    };
+    let (w, h) = app.client_dip(hwnd);
+    let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
+    let area = rect(
+        card.left,
+        card.top + 40.0,
+        card.right - card.left,
+        card.bottom - card.top,
+    );
+    let sel_map = app.plugin_sel.clone();
+    let ops = plugin_view_ops(&view, area, 0.0, &sel_map);
+    let Some((ids, group, onselect)) = ops.iter().find_map(|op| match op {
+        POp::Table { ids, group, onselect, .. } if !ids.is_empty() => {
+            Some((ids.clone(), group.clone(), onselect.clone()))
+        }
+        _ => None,
+    }) else {
+        tracing_note(&format!("sel-test no-table {plugin}"));
+        return;
+    };
+    let picked = if want == "first" {
+        ids[0].clone()
+    } else {
+        want.clone()
+    };
+    if !ids.iter().any(|x| *x == picked) {
+        tracing_note(&format!("sel-test missing id {picked}"));
+        return;
+    }
+    app.select_plugin_row(hwnd, &plugin, &group, &onselect, &picked);
+    if !button.is_empty() {
+        app.press_sel_button(hwnd, &plugin, &button, &group);
+    }
+}
+
 fn make_hotkeys() -> (
     Option<GlobalHotKeyManager>,
     Option<HotKey>,
@@ -7412,6 +7656,10 @@ let mut tme = TRACKMOUSEEVENT {
             start_snip(hwnd);
             LRESULT(0)
         }
+        WM_SEL_TEST => {
+            run_plugin_sel_test(hwnd);
+            LRESULT(0)
+        }
         WM_OP_DONE => {            if let Some(app) = unsafe { app_ptr(hwnd) } {
                 let lines: Vec<String> = app
                     .ops
@@ -7849,6 +8097,14 @@ if let Ok(spec) = std::env::var("FOCUSFLOW_SNIP_TEST") {
             let _ = unsafe { PostMessageW(Some(target), WM_SNIP_START, WPARAM(0), LPARAM(0)) };
         });
     }
+    if std::env::var("FOCUSFLOW_PLUGIN_SEL").is_ok() {
+        let raw = hwnd.0 as isize;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            let target = HWND(raw as *mut core::ffi::c_void);
+            let _ = unsafe { PostMessageW(Some(target), WM_SEL_TEST, WPARAM(0), LPARAM(0)) };
+        });
+    }
 
     unsafe {
         let mut msg = MSG::default();
@@ -7932,5 +8188,64 @@ mod data_move_tests {
         assert_eq!(writes[0].2, "E:/ff/old", "标记记的是搬走的来源");
         assert_eq!(writes[1].1, "data_home", "第二行才是新的数据根");
         assert_eq!(writes[1].2, "E:/ff/new");
+    }
+}
+
+#[cfg(test)]
+mod plugin_sel_tests {
+    use super::*;
+
+    fn map(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(g, ids)| {
+                (
+                    g.to_string(),
+                    ids.iter().map(|s| s.to_string()).collect::<Vec<String>>(),
+                )
+            })
+            .collect()
+    }
+
+    /// 不分组 = 多选（点第二行留两行、再点第一行取消一行），分组 = 单选（只留最后点的）。
+    #[test]
+    fn ungrouped_toggles_and_grouped_replaces() {
+        assert_eq!(apply_row_select("", &[], "1"), ["1"].to_vec());
+        let two = apply_row_select("", &["1".to_string()], "2");
+        assert_eq!(two, ["1", "2"].to_vec(), "多选按点击顺序留着，拼 id 要用这个顺序");
+        assert_eq!(
+            apply_row_select("", &two, "1"),
+            ["2"].to_vec(),
+            "再点已选中的行是取消"
+        );
+        assert_eq!(
+            apply_row_select("mcat", &["a".to_string(), "b".to_string()], "c"),
+            ["c"].to_vec(),
+            "分组表格是单选"
+        );
+    }
+
+    /// 选中集只属于自己那一组：另一组的 id 不该混进拼出来的动作 id。
+    #[test]
+    fn each_group_reads_only_its_own_selection() {
+        let sel = map(&[("mcat", &["食品饮料"]), ("msub", &["零食"])]);
+        assert_eq!(sel_action_id("m_edit_cat_sel", "mcat", &sel).unwrap(), "m_edit_cat_sel食品饮料");
+        assert_eq!(sel_action_id("m_del_sub_sel", "msub", &sel).unwrap(), "m_del_sub_sel零食");
+        // 不分组那一格（旧版前端的 __main）现在是空的 ⇒ 不许发按钮
+        let err = sel_action_id("del_", "", &sel).unwrap_err();
+        assert!(err.contains("点选一行"), "要说清下一步做什么：{err}");
+    }
+
+    /// 多选拼逗号（插件按 `gmatch("([^,]+)")` 拆）；只吃一条的按钮选多了要拦下来，
+    /// 不能把 "1,2" 发给 `tonumber` —— 那是"点了没反应"的老症状。
+    #[test]
+    fn multi_ids_join_with_commas_and_single_only_buttons_are_blocked() {
+        let sel = map(&[("", &["42", "43"])]);
+        assert_eq!(sel_action_id("del_", "", &sel).unwrap(), "del_42,43");
+        assert_eq!(sel_action_id("days_", "", &sel).unwrap(), "days_42,43");
+        let why = sel_action_id("edit_", "", &sel).unwrap_err();
+        assert!(why.contains("只改一条"), "{why}");
+        let one = map(&[("", &["42"])]);
+        assert_eq!(sel_action_id("edit_", "", &one).unwrap(), "edit_42");
     }
 }

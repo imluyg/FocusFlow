@@ -22,6 +22,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-collec
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-plugins.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-hotkey.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-datadir.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-plugsel.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-installer.ps1
 ```
 
@@ -38,6 +39,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 | `accept-plugins.ps1` | 插件视图：`button.modal` 开弹窗、弹窗与正文的 Select 写回、提交/关闭触发插件动作、Esc 关弹窗 | 11 项 |
 | `accept-hotkey.ps1` | 两轮启动：配置里的两条组合按原样注册（日志逐字对）/ 一条写成裸键时程序照样起、日志点名被拒的那条、另一条照样注册 | 9 项 |
 | `accept-datadir.ps1` | 两轮启动：`[paths]` 里那条待搬运标记由启动早期兑现（data/ 与 backup/ 真到了新根、旧根清空、标记归空、日志点名新根）/ 新根建不出来时数据原地不动、标记留着下次重试 | 13 项 |
+| `accept-plugsel.ps1` | 自带一份 ASCII 小插件（分组表格 + `onselect` + `sel` 按钮）：Lua 里的 ids/group/onselect 真的走到宿主、选中写了声明的那个字段、`sel` 按钮拼出 `<按钮 id><记录 id>` | 10 项 |
 | `accept-installer.ps1` | 静默装 → 目录/卸载器/快捷方式/注册表/版本号/exe 图标 → 装出来的 exe 默认在采集 → 静默卸 → 全部清干净 | 17 项 |
 
 `accept-plugins.ps1` 断言的是应用日志里的 **ASCII 片段**（字段名 `d_type`/`f_cat`、动作 id
@@ -47,6 +49,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 `accept-hotkey.ps1` 断言的也是日志里的 ASCII 片段（`toggle_window = ctrl+alt+7` 这类）：
 注入的键盘到不了低级钩子（下面坑 1），按不出热键，所以它验的是「真正注册的那把 ==
 配置与设置页显示的那把」，不是按下之后的效果。按下效果（含在设置页里改一格）要眼验。
+
+`accept-plugsel.ps1` 不依赖任何记账数据：它自己往探针副本的 `plugins/` 里写一个小插件
+（表格带 `ids`/`group`/`onselect`，外加一颗 `sel` 按钮），再用应用的
+`FOCUSFLOW_PLUGIN_SEL` 钩子按**记录 id** 走一遍"点一行 + 按一颗 sel 按钮"——那条路径调的
+就是真点击调的同两个方法。表格行的**像素坐标**随视图与滚动变化，注入点击不好算，所以坐标
+那一段仍归眼验。
 
 ## 共享库
 
