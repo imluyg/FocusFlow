@@ -5874,6 +5874,43 @@ let dark: u32 = 1;
     true
 }
 
+/// 应用图标：优先用程序目录下的 `assets/focusflow.ico`（打包时随 exe 一起放），
+/// 没有就退回系统的默认图标——不因为缺一个图标就起不来。
+fn load_app_icon() -> HICON {
+    unsafe {
+        let candidates = [
+            focusflow_core::paths::app_dir()
+                .join("assets")
+                .join("focusflow.ico"),
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|d| d.join("assets").join("focusflow.ico")))
+                .unwrap_or_default(),
+        ];
+        for p in candidates {
+            if !p.exists() {
+                continue;
+            }
+            let wide: Vec<u16> = p
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            if let Ok(h) = LoadImageW(
+                None,
+                PCWSTR(wide.as_ptr()),
+                IMAGE_ICON,
+                0,
+                0,
+                LR_LOADFROMFILE | LR_DEFAULTSIZE,
+            ) {
+                return HICON(h.0);
+            }
+        }
+        LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
+    }
+}
+
 fn main() -> windows::core::Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -5890,11 +5927,13 @@ let Some(_mutex) = already_running() else {
     );
 
     let hinstance = unsafe { GetModuleHandleW(None)? };
+    let app_icon = load_app_icon();
     let wc = WNDCLASSW {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(wndproc),
         hInstance: hinstance.into(),
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
+        hIcon: app_icon,
         lpszClassName: CLASS_NAME,
         ..Default::default()
     };
