@@ -640,6 +640,8 @@ status: Option<String>,
 busy: bool,
     /// 设置页的搜索词（搜索框里的文字，过滤清单用）。
 search: String,
+    /// 设置页左侧当前分类（0=常规…，见 [`SETTINGS_CATS`]）。
+    settings_cat: usize,
     /// 设置页里那个常驻的搜索框（与行内编辑�?EDIT 不是同一个）。
 search_edit: Option<HWND>,
     /// 后台操作把结果行塞这里，再投 `WM_OP_DONE` 让界面来取。
@@ -810,6 +812,7 @@ let dpi = GetDpiForWindow(hwnd) as f32;
                 status: boot_status,
                 busy: false,
                 search: String::new(),
+                settings_cat: 0,
                 search_edit: None,
                 ops: Arc::new(Mutex::new(Vec::new())),
                 pm: None,
@@ -957,6 +960,7 @@ fn ensure_target(&mut self, hwnd: HWND) {
                 collector_on: collect::is_started(),
                 collector_paused: collect::is_paused(),
                 cpm: collect::cpm(),
+                settings_cat: self.settings_cat,
             };
             let pv = self.plugin_open.as_ref().and_then(|name| {
                 self.pm
@@ -1069,7 +1073,7 @@ if self.detail.is_some() || (self.view == 3 && self.atab != 3) {
             let count = self
                 .snap
                 .lock()
-                .map(|s| settings_items(&s, &self.search).len())
+                .map(|s| settings_items(&s, &self.search, self.settings_cat).len())
                 .unwrap_or(0);
             self.scroll = self.scroll.min(count.saturating_sub(g.max_rows));
             let mut row = None;
@@ -1419,11 +1423,31 @@ for (i, tab) in view_tabs().iter().enumerate() {
         }
         if self.view == 5 {
             let g = settings_geom(w, h);
+            // 左侧分类：点标题切分类，滚动回到顶部。
+            for (i, _) in SETTINGS_CATS.iter().enumerate() {
+                let nr = rect(
+                    g.nav_x,
+                    g.nav_y + i as f32 * g.cat_h,
+                    g.nav_w,
+                    g.cat_h - 4.0,
+                );
+                if hit(nr, x, y) {
+                    if self.settings_cat != i {
+                        self.settings_cat = i;
+                        self.scroll = 0;
+                        self.sel = None;
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+                    return;
+                }
+            }
             let items = self
                 .snap
                 .lock()
                 .ok()
-                .map(|s| settings_items(&s, &self.search))
+                .map(|s| settings_items(&s, &self.search, self.settings_cat))
                 .unwrap_or_default();
             let count = items.len();
             let scroll = self.scroll.min(count.saturating_sub(g.max_rows));
@@ -1435,7 +1459,12 @@ for (i, tab) in view_tabs().iter().enumerate() {
                 }
                 // 注意变量名：这里的行顶端不能。
 let y0 = g.list_top + vis as f32 * g.row_h;
-                let row_rect = rect(32.0, y0, w - 64.0, g.row_h - 2.0);
+                let row_rect = rect(
+                    g.body_left,
+                    y0,
+                    w - 32.0 - g.body_left,
+                    g.row_h - 2.0,
+                );
                 if hit(row_rect, x, y) {
                     self.sel = Some(idx);
                     match items[idx] {
@@ -1443,6 +1472,7 @@ let y0 = g.list_top + vis as f32 * g.row_h;
                         SItem::Action(a) => self.run_action(hwnd, a),
                         SItem::Basic(Basic::Autostart) => self.toggle_autostart(hwnd),
                         SItem::Basic(Basic::Hotkey) => self.toggle_hotkey(hwnd),
+                        SItem::Basic(Basic::Snip) => start_snip(hwnd),
                         SItem::Basic(Basic::Floating) => {
                             toggle_floating(hwnd, None);
                             unsafe {
@@ -2478,6 +2508,12 @@ struct SettingsGeom {
     /// 高级项的值框（两行排版，左边留给中文名与说明）。
     value_x: f32,
     value_w: f32,
+    /// 左侧分类导航与右侧内容区的分界。
+    nav_x: f32,
+    nav_y: f32,
+    nav_w: f32,
+    cat_h: f32,
+    body_left: f32,
 }
 
 /// 设置页里的一行是什么。
@@ -2496,6 +2532,7 @@ enum Basic {
     Collector,
     Pause,
     Hotkey,
+    Snip,
     Floating,
     Theme,
     DataDir,
@@ -2507,50 +2544,94 @@ fn basic_label(b: Basic) -> &'static str {
         Basic::Collector => "采集",
         Basic::Pause => "暂停采集",
         Basic::Hotkey => "全局热键",
+        Basic::Snip => "区域截图",
         Basic::Floating => "悬浮窗",
         Basic::Theme => "主题",
         Basic::DataDir => "数据目录",
     }
 }
 
-/// 当前搜索词下要显示的行：基础。
-fn settings_items(snap: &Snapshot, filter: &str) -> Vec<SItem> {
+/// 设置页左侧分类（与旧 WebView 的侧栏同一组语义，按原生端现有的项收敛成 6 类）。
+const SETTINGS_CATS: [(&str, &str); 6] = [
+    ("常规", "启动、采集、主题"),
+    ("热键与截图", "呼出窗口、区域截图"),
+    ("悬浮窗", "桌面上的小卡片"),
+    ("目标", "每日目标次数"),
+    ("数据", "目录、备份、导入导出"),
+    ("高级", "键鼠、休息、刷新、应用与设备"),
+];
+
+fn basic_cat(b: Basic) -> usize {
+    match b {
+        Basic::Autostart | Basic::Collector | Basic::Pause | Basic::Theme => 0,
+        Basic::Hotkey | Basic::Snip => 1,
+        Basic::Floating => 2,
+        Basic::DataDir => 4,
+    }
+}
+
+fn setting_cat(section: &str) -> usize {
+    match section {
+        "goal" => 3,
+        "database" => 4,
+        _ => 5,
+    }
+}
+
+/// 当前分类 / 搜索词下要显示的行。
+fn settings_items(snap: &Snapshot, filter: &str, cat: usize) -> Vec<SItem> {
     let f = filter.trim().to_lowercase();
+    let searching = !f.is_empty();
     let mut out = Vec::new();
     for b in [
         Basic::Autostart,
         Basic::Collector,
         Basic::Pause,
-        Basic::Hotkey,
-        Basic::Floating,
         Basic::Theme,
+        Basic::Hotkey,
+        Basic::Snip,
+        Basic::Floating,
         Basic::DataDir,
     ] {
-        if f.is_empty() || basic_label(b).contains(&f) {
+        if !searching && basic_cat(b) != cat {
+            continue;
+        }
+        if f.is_empty() || basic_label(b).to_lowercase().contains(&f) {
             out.push(SItem::Basic(b));
         }
     }
-    let mut settings = Vec::new();
     for (i, row) in snap.settings.iter().enumerate() {
+        if !searching && setting_cat(row.section) != cat {
+            continue;
+        }
         let hay = format!(
             "{} {} {}.{} {}",
             row.label, row.help, row.section, row.key, row.value
         )
         .to_lowercase();
         if f.is_empty() || hay.contains(&f) {
-            settings.push(SItem::Setting(i));
+            out.push(SItem::Setting(i));
         }
     }
-    if f.is_empty() {
-        out.push(SItem::Header("高级设置（写进 config.ini）"));
-        out.extend(settings);
-        out.push(SItem::Header("数据操作"));
-        for i in 0..ACTIONS.len() {
+    let actions: Vec<usize> = (0..ACTIONS.len())
+        .filter(|&i| {
+            if !searching && cat != 4 {
+                return false;
+            }
+            if f.is_empty() {
+                return true;
+            }
+            let (label, desc) = ACTIONS[i];
+            label.to_lowercase().contains(&f) || desc.to_lowercase().contains(&f)
+        })
+        .collect();
+    if !actions.is_empty() {
+        if !searching {
+            out.push(SItem::Header("数据操作"));
+        }
+        for i in actions {
             out.push(SItem::Action(i));
         }
-    } else {
-        // 搜索时只要命中的行，不夹分组标题（省地方）。
-        out.extend(settings);
     }
     out
 }
@@ -2567,6 +2648,11 @@ fn settings_geom(_w: f32, h: f32) -> SettingsGeom {
         max_rows,
         value_x: 720.0,
         value_w: 150.0,
+        nav_x: 28.0,
+        nav_y: list_top,
+        nav_w: 190.0,
+        cat_h: 44.0,
+        body_left: 240.0,
     }
 }
 
@@ -2605,7 +2691,7 @@ fn draw_settings(
         &p.br.fg,
     );
     p.text(
-        "中文名 + 一句话说明；改动写进 config.ini，标「重启」的项要重启程序",
+        "左侧分类；改动写进 config.ini，标「重启」的项要重启程序",
         rect(card.left + 66.0, card.top + 15.0, 560.0, 18.0),
         &p.fmt.small,
         &p.br.muted,
@@ -2624,9 +2710,43 @@ let sbox = search_box_rect(w);
     }
 
     let g = settings_geom(w, h);
-    let items = settings_items(snap, filter);
+    let items = settings_items(snap, filter, vs.settings_cat);
     let count = items.len();
     let scroll = vs.scroll.min(count.saturating_sub(g.max_rows));
+
+    // 左侧分类导航。
+    for (i, (label, desc)) in SETTINGS_CATS.iter().enumerate() {
+        let nr = rect(
+            g.nav_x,
+            g.nav_y + i as f32 * g.cat_h,
+            g.nav_w,
+            g.cat_h - 4.0,
+        );
+        let active = i == vs.settings_cat;
+        if active {
+            p.round(nr, 8.0, &p.br.accent_soft, None);
+        }
+        p.text(
+            label,
+            rect(nr.left + 12.0, nr.top + 4.0, nr.right - nr.left - 20.0, 18.0),
+            &p.fmt.body,
+            if active { &p.br.accent } else { &p.br.fg },
+        );
+        p.text(
+            desc,
+            rect(nr.left + 12.0, nr.top + 22.0, nr.right - nr.left - 20.0, 14.0),
+            &p.fmt.small,
+            &p.br.muted,
+        );
+    }
+    p.line(
+        g.body_left - 14.0,
+        g.list_top,
+        g.body_left - 14.0,
+        card.bottom - 40.0,
+        &p.br.grid,
+        1.0,
+    );
 
     for vis in 0..g.max_rows {
         let idx = scroll + vis;
@@ -2634,7 +2754,12 @@ let sbox = search_box_rect(w);
             break;
         }
         let y = g.list_top + vis as f32 * g.row_h;
-        let r = rect(card.left + 16.0, y, card.right - card.left - 32.0, g.row_h - 2.0);
+        let r = rect(
+            g.body_left,
+            y,
+            card.right - 16.0 - g.body_left,
+            g.row_h - 2.0,
+        );
         if vs.sel == Some(idx) {
             p.round(r, 6.0, &p.br.accent_soft, None);
         } else if vs.hover == Some(idx) {
@@ -2806,6 +2931,16 @@ let sbox = search_box_rect(w);
                         p.text(
                             "Ctrl + Shift + F（global-hotkey 注册状态，不是配置键）",
                             rect(r.left + 12.0, y + 21.0, 420.0, 18.0),
+                            &p.fmt.small,
+                            &p.br.muted,
+                        );
+                    }
+                    Basic::Snip => {
+                        p.round(vb, 6.0, &p.br.accent, None);
+                        p.text("截图…", vb, &p.fmt.center_small, &p.br.white);
+                        p.text(
+                            "Ctrl+Shift+A 或托盘「截图」；PNG 存到 data/screenshots 并复制到剪贴板",
+                            rect(r.left + 12.0, y + 21.0, 600.0, 15.0),
                             &p.fmt.small,
                             &p.br.muted,
                         );
@@ -3120,6 +3255,8 @@ hotkey_on: bool,
     collector_on: bool,
     collector_paused: bool,
     cpm: i64,
+    /// 设置页左侧选中的分类。
+    settings_cat: usize,
 }
 
 /// 左表格卡片的矩形：画图与命中测试共用。
@@ -6984,7 +7121,7 @@ if app.detail.is_some() || (app.view > 2 && app.view != 5 && app.view != 4) {
                     .lock()
                     .map(|snap| match app.view {
                         4 => app.plugin_rows.len(),
-                        5 => settings_items(&snap, &app.search).len(),
+                        5 => settings_items(&snap, &app.search, app.settings_cat).len(),
                         1 => snap.apps.len(),
                         2 => snap.devices.len(),
                         _ => snap.rank.len(),

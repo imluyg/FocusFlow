@@ -44,7 +44,7 @@ Check 'dark screenshots written' ((Get-ChildItem $WorkDir -Filter 'dark-*.png').
 # --- flip to light from the settings row (index 5 = theme) ------------------------
 Click-ViewTab $h 5
 $before = Get-ThemeName $app
-Click-BasicRow $h 5
+Click-BasicRow $h 3
 Start-Sleep -Milliseconds 700
 $after = Get-ThemeName $app
 Check 'theme flips through the settings row' (($before -match 'dark') -and ($after -match 'light')) "$before -> $after"
@@ -72,7 +72,7 @@ if ($edit -ne [IntPtr]::Zero) {
 }
 
 Click-ViewTab $h 5
-Click-BasicRow $h 5
+Click-BasicRow $h 3
 Start-Sleep -Milliseconds 600
 $back = Get-ThemeName $app
 Check 'theme flips back to dark' ($back -match 'dark') $back

@@ -262,9 +262,9 @@ function Read-AppLog([string]$WorkDir) {
 function Click-PeriodPill([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 109 + $Index * 60, 61, 1); Start-Sleep -Milliseconds 500 }
 function Click-ViewTab([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 56 + $Index * 84, 183, 1); Start-Sleep -Milliseconds 400 }
 function Click-ATab([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 48 + $Index * 68, 270, 1); Start-Sleep -Milliseconds 400 }
-# Basic rows (current order): 0 autostart, 1 collector, 2 pause, 3 hotkey, 4 floating,
-# 5 theme, 6 data dir -- 28 px apart starting at y=260+13.
-function Click-BasicRow([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 200, 282 + $Index * 44, 1); Start-Sleep -Milliseconds 450 }
+# Basic rows in the "常规" category (current order): 0 autostart, 1 collector, 2 pause,
+# 3 theme -- 44 px apart starting at y=260 (row centre 282).
+function Click-BasicRow([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 320, 282 + $Index * 44, 1); Start-Sleep -Milliseconds 450 }
 function Get-ThemeName([string]$AppDir) {
     $line = (Select-String -Path (Join-Path $AppDir 'config.ini') -Pattern '^theme' -Encoding UTF8 | ForEach-Object { $_.Line })
     ($line -join '')
