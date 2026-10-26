@@ -634,6 +634,11 @@ impl PluginManager {
         if meta.has_init {
             let init: mlua::Function = lua.globals().get("init").map_err(|e| e.to_string())?;
             let _: () = init.call(()).map_err(|e| format!("init() 失败: {e}"))?;
+        } else if let Err(e) = Self::take_hook(&lua, "init") {
+            // has_init 来自 read_meta 里**另一个** Lua 实例，它把「没写」和「写了但不是
+            // 函数」捏成同一个 false —— 于是 init = "setup" 的插件加载"成功"、初始化一次
+            // 没跑、一个字都不留。前者是正常形态（Ok(None)），只有后者该出声。
+            tracing::warn!("插件 {stem} 的 {e}：初始化没有执行");
         }
 
         let view = if meta.has_view {
@@ -661,6 +666,9 @@ impl PluginManager {
                 }
             }
         } else {
+            if let Err(e) = Self::take_hook(&lua, "get_view") {
+                tracing::error!("插件 {stem} 的 {e}：本次没有视图，界面上不会出卡片");
+            }
             None
         };
 
@@ -775,9 +783,17 @@ impl PluginManager {
             // 不该继续挂在插件页上。
             self.load_errors.remove(&Self::stem_of(&info.file_path));
             if let Some(lua) = &mut info.lua {
-                if let Ok(cleanup) = lua.globals().get::<mlua::Function>("cleanup") {
-                    Self::arm_instruction_budget(lua, cfg);
-                    let _: mlua::Result<()> = cleanup.call(());
+                match Self::take_hook(lua, "cleanup") {
+                    Ok(Some(cleanup)) => {
+                        Self::arm_instruction_budget(lua, cfg);
+                        let _: mlua::Result<()> = cleanup.call(());
+                    }
+                    // 这条卸载路径上归还调度线程的动作**只有** Lua 侧那句
+                    // `scheduler_shutdown()`：Rust 侧两处 `release_scheduler` 分别在
+                    // `mark_plugin_error` 与加载失败回滚里，都到不了这里。这一句没跑
+                    // 就是线程不还、定时任务照旧触发，所以"写了名字但不是函数"必须出声。
+                    Err(e) => tracing::warn!("插件 {name} 的 {e}：卸载时没跑 cleanup"),
+                    Ok(None) => {}
                 }
             }
             info.loaded = false;
@@ -1008,6 +1024,29 @@ impl PluginManager {
         Ok(ret)
     }
 
+    /// 取一个全局钩子，把「没写」「写成了函数」「写了名字但不是函数」分开交回。
+    ///
+    /// `on_action = "handle_click"`（把函数名当字符串赋给钩子，或 `on_action = handler`
+    /// 写在 `local handler` 之前）是这一族最常见的作者笔误，而
+    /// `globals().get::<mlua::Function>(key)` 对 nil 和对一张表报的是同一个错，
+    /// 于是每一处都把它念成「插件未定义 on_action」—— 作者照那句话去找一个他明明写了的东西。
+    /// `record_key` 那一处已经分开（见 `plugin_key_event`），这条补齐同一族剩下的入口。
+    ///
+    /// `Ok(None)` = 真没写，是多数插件的正常形态，调用方不许为它出声。
+    fn take_hook(lua: &Lua, key: &str) -> Result<Option<mlua::Function>, String> {
+        let value = match lua.globals().get::<mlua::Value>(key) {
+            Ok(v) => v,
+            Err(e) => return Err(format!("读取 {key} 失败: {e}")),
+        };
+        match value {
+            mlua::Value::Function(f) => Ok(Some(f)),
+            mlua::Value::Nil => Ok(None),
+            _ => Err(format!(
+                "插件的 {key} 有值但不是函数（钩子要写函数本体，别写函数名的字符串）"
+            )),
+        }
+    }
+
     /// 重新执行 get_view() 并更新视图缓存。
     /// 动作/输入回写会改变插件状态，前端拿到的视图必须是新鲜的，
     /// 否则会出现"点了没反应"（如分页不切换）。
@@ -1021,8 +1060,9 @@ impl PluginManager {
             .lua
             .as_ref()
             .ok_or_else(|| format!("插件未加载: {name}"))?;
-        // 无 get_view 的插件没有视图，跳过
-        if lua.globals().get::<mlua::Function>("get_view").is_err() {
+        // 无 get_view 的插件没有视图，跳过；写了名字却不是函数的那一种要报错，
+        // 不能捏成「这插件没有面板」—— 界面上只会少一张卡片，而原因在他自己写的文件里。
+        if Self::take_hook(lua, "get_view")?.is_none() {
             return Ok(());
         }
         Self::arm_instruction_budget(lua, cfg);
@@ -1058,22 +1098,24 @@ impl PluginManager {
             .lua
             .as_ref()
             .ok_or_else(|| format!("插件未加载: {name}"))?;
-        // 先检查是否有 on_action
-        if let Ok(on_action) = lua.globals().get::<mlua::Function>("on_action") {
-            Self::arm_instruction_budget(lua, cfg);
-            if let Err(e) = on_action.call::<()>(action_id) {
-                let msg = format!("on_action 失败: {e}");
-                if is_limit_error(&e) {
-                    self.mark_plugin_error(name, msg.clone());
+        // 「没写」与「写了但不是函数」分开：后一种过去也念成"未定义"。
+        match Self::take_hook(lua, "on_action")? {
+            Some(on_action) => {
+                Self::arm_instruction_budget(lua, cfg);
+                if let Err(e) = on_action.call::<()>(action_id) {
+                    let msg = format!("on_action 失败: {e}");
+                    if is_limit_error(&e) {
+                        self.mark_plugin_error(name, msg.clone());
+                    }
+                    return Err(msg);
                 }
-                return Err(msg);
+                if let Err(e) = self.refresh_view(name) {
+                    tracing::warn!("插件 {name} 动作已执行，但视图刷新失败: {e}");
+                }
+                Ok(())
             }
-            if let Err(e) = self.refresh_view(name) {
-                tracing::warn!("插件 {name} 动作已执行，但视图刷新失败: {e}");
-            }
-            return Ok(());
+            None => Err("插件未定义 on_action".to_string()),
         }
-        Err("插件未定义 on_action".to_string())
     }
 
     /// 向插件投递按键事件（番茄钟联动等）。
@@ -1150,21 +1192,24 @@ impl PluginManager {
             .lua
             .as_ref()
             .ok_or_else(|| format!("插件未加载: {name}"))?;
-        if let Ok(set_field) = lua.globals().get::<mlua::Function>("set_field") {
-            Self::arm_instruction_budget(lua, cfg);
-            if let Err(e) = set_field.call::<()>((field, value)) {
-                let msg = format!("set_field 失败: {e}");
-                if is_limit_error(&e) {
-                    self.mark_plugin_error(name, msg.clone());
+        // 与 on_action 同一族：写了名字、但写的不是函数。
+        match Self::take_hook(lua, "set_field")? {
+            Some(set_field) => {
+                Self::arm_instruction_budget(lua, cfg);
+                if let Err(e) = set_field.call::<()>((field, value)) {
+                    let msg = format!("set_field 失败: {e}");
+                    if is_limit_error(&e) {
+                        self.mark_plugin_error(name, msg.clone());
+                    }
+                    return Err(msg);
                 }
-                return Err(msg);
+                if let Err(e) = self.refresh_view(name) {
+                    tracing::warn!("插件 {name} 输入已写入，但视图刷新失败: {e}");
+                }
+                Ok(())
             }
-            if let Err(e) = self.refresh_view(name) {
-                tracing::warn!("插件 {name} 输入已写入，但视图刷新失败: {e}");
-            }
-            return Ok(());
+            None => Err("插件未定义 set_field".to_string()),
         }
-        Err("插件未定义 set_field".to_string())
     }
 }
 
@@ -2635,6 +2680,126 @@ end
             ids(&pm),
             first,
             "id 每轮渲染都变 ⇒ 推送一来，正在填的弹窗就没了"
+        );
+    }
+
+    /// 钩子写了名字、偏偏不是函数：三处入口都要说「不是函数」，不许说「没定义」。
+    ///
+    /// `on_action = "handle_click"`（把函数名写成了字符串）与 `get_view = { ... }`
+    /// 都是作者笔误，而旧写法一律走 `get::<mlua::Function>` 的失败分支，把两种完全不同的
+    /// 事捏成一句「插件未定义 on_action」：作者照着这句话去查「我哪里没写」，
+    /// 可他明明写了。`record_key` 那一条已经分开（见 `plugin_key_event` 的
+    /// 「有值但不是函数」），这里是同一族剩下的三处。
+    ///
+    /// 反向腿一并钉死：真的没写钩子时那句「未定义」必须还在说「未定义」，
+    /// 没定义 get_view 的插件继续算正常（多数插件没有面板），否则这条闸只是换了个瞎法。
+    #[test]
+    fn a_hook_written_as_a_non_function_is_not_reported_as_missing() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("hook_not_a_function");
+        let file = write_lua(
+            &tmp.path().join("plugins"),
+            "mistyped",
+            r###"
+PLUGIN_NAME = "写错钩子"
+on_action = "handle_click"
+set_field = 42
+get_view = { title = "这是一张表" }
+"###,
+        );
+        let mut pm = manager_in(tmp.path());
+        let name = pm.load_plugin(&file).expect("钩子写错类型不该挡住加载");
+
+        let checks: [(Result<(), String>, &str); 3] = [
+            (pm.plugin_action(&name, "start"), "on_action"),
+            (pm.plugin_set_field(&name, "d_work", "9"), "set_field"),
+            (pm.refresh_view(&name), "get_view"),
+        ];
+        for (got, hook) in checks {
+            let Err(err) = got else {
+                panic!("{hook} 不是函数，这条入口必须报错");
+            };
+            assert!(
+                err.contains(hook) && err.contains("不是函数"),
+                "{hook} 要指名是哪个钩子、错在哪一类，实得：{err}"
+            );
+            assert!(
+                !err.contains("未定义"),
+                "{hook} 明明写了名字，不许报成没定义，实得：{err}"
+            );
+        }
+
+        // 反向腿：真没写钩子的插件，话必须说回「未定义」。
+        let plain = write_lua(
+            &tmp.path().join("plugins"),
+            "plain",
+            "PLUGIN_NAME = \"没写钩子\"\nfunction get_view() \
+             return { title = \"v\", widgets = { {type=\"label\", text=\"v\"} } } end\n",
+        );
+        let name2 = pm.load_plugin(&plain).expect("无钩子插件应装得上");
+        let err = pm
+            .plugin_action(&name2, "start")
+            .expect_err("没写 on_action 要报错");
+        assert!(
+            err.contains("未定义"),
+            "没写的场合要说「未定义」，实得：{err}"
+        );
+        assert!(
+            pm.refresh_view(&name2).is_ok(),
+            "没定义 get_view 是正常形态，不许变成失败"
+        );
+    }
+
+    /// `init` 与 `cleanup` 被写成别的东西时必须出声，不能安静地不跑。
+    ///
+    /// 这两处连报错的出口都没有：加载那步吃 `has_fn("init")`（不是函数就当没写），
+    /// 卸载那步是 `if let Ok(cleanup) = ...`。于是 `cleanup = "shutdown"` 的插件
+    /// 停用之后一个字的痕迹都不留，而这条卸载路径上归还调度线程的动作**只有** cleanup 里那句
+    /// （见 `host.rs` 的 owner 表）—— 没跑就是不还，本进程再也回收不掉。
+    ///
+    /// 反向腿：真没写 init/cleanup 的插件不许被这两条误伤（那是绝大多数插件）。
+    #[test]
+    fn init_and_cleanup_written_as_a_non_function_say_so() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("hook_init_cleanup");
+        let bad = write_lua(
+            &tmp.path().join("plugins"),
+            "badinit",
+            r###"
+PLUGIN_NAME = "钩子写错"
+init = "setup"
+cleanup = "shutdown"
+"###,
+        );
+        let mut pm = manager_in(tmp.path());
+        let (name, logs) = crate::logger::capture_logs(|| pm.load_plugin(&bad).expect("该装得上"));
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("init") && l.contains("不是函数")),
+            "init 不是函数却没跑，要有一条话指着它，实得日志：{logs:?}"
+        );
+        let (_, logs) = crate::logger::capture_logs(|| {
+            pm.unload_plugin(&name);
+        });
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("cleanup") && l.contains("不是函数")),
+            "cleanup 没跑等于没归还调度线程，必须出声，实得日志：{logs:?}"
+        );
+
+        // 反向腿：两个钩子都没写的插件，这两条一句话都不该说。
+        let none = write_lua(
+            &tmp.path().join("plugins"),
+            "nohooks",
+            "PLUGIN_NAME = \"什么都没有\"\n",
+        );
+        let (_, logs) = crate::logger::capture_logs(|| {
+            let n = pm.load_plugin(&none).expect("该装得上");
+            pm.unload_plugin(&n);
+        });
+        assert!(
+            !logs.iter().any(|l| l.contains("不是函数")),
+            "没写钩子是正常形态，不许喊：{logs:?}"
         );
     }
 
