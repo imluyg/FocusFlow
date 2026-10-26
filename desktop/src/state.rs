@@ -1452,6 +1452,11 @@ fn keep_floating_on_top(app: &App) {
                             0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                         );
+                        // 这一轮既然已经拿到 HWND 了，顺手问一句"这张卡片还在屏幕里吗"：
+                        // 运行期拔掉那块屏，它就停在旧坐标上，而按 label 找回来这条路
+                        // 对悬浮窗是不成立的（界面上没有任何入口能召回 —— 见 clamp 那条的注释）。
+                        // 判据与落点用的都是启动那一条，且差不到 2 像素就不动 ⇒ 不会慢慢挪位置。
+                        let _ = crate::floating::ensure_visible_on_screen(hwnd);
                     }
                 }
                 std::thread::sleep(Duration::from_millis(sleep_ms));

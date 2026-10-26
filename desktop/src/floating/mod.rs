@@ -18,6 +18,11 @@
 mod native;
 pub(crate) mod render;
 
+/// 「卡片还在屏幕里吗，不在就搬回来」——判据与落点都是启动那一条，两条渲染器共用。
+/// WebView2 那一支由 `state::keep_floating_on_top` 那个线程顺手跑，原生那一支在
+/// `WM_DISPLAYCHANGE` 上跑（见 `native::ensure_visible_on_screen` 为什么要分开）。
+pub(crate) use native::ensure_visible_on_screen;
+
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::Mutex;
 

@@ -609,6 +609,78 @@ fn nearest_monitor(px_x: i32, px_y: i32) -> MonitorRect {
     }
 }
 
+/// 卡片现在这个位置还看得见吗？看不见（或只剩一条边）就整张搬回最近那块屏。
+///
+/// 启动时那一次夹取只保得住启动那一刻：运行期拔掉那块屏，卡片停在旧坐标上，
+/// 而这两条路都没有召回入口 —— 原生那张压根不在 Tauri 的窗口集合里（按 label 找是 None），
+/// WebView2 那张"隐藏再显示"也照旧回到同一个坐标。界面上能做的只有再拖一次，
+/// 而一块看不见的卡片是拖不到的（`state::clamp_floating_into_screen` 的注释记过这句）。
+///
+/// 判据与落点全部复用启动那一条（[`landed_position`] → `state::clamp_floating_into_screen`）：
+/// 已经是"看得见"的位置原样返回，所以这条可以每拍都跑，不会把用户放好的位置慢慢挪走。
+/// 返回 true = 真的搬了。
+///
+/// # Safety
+/// 必须在拥有 `hwnd` 的那个线程上调用（与 `repaint` 同一约束）。
+pub(crate) unsafe fn ensure_visible_on_screen(hwnd: HWND) -> bool {
+    let mut rc = RECT::default();
+    if !get_rect(hwnd, &mut rc) {
+        return false;
+    }
+    let scale = scale_of(hwnd);
+    let w = rc.right - rc.left;
+    let h = rc.bottom - rc.top;
+    let mon = nearest_monitor(rc.left, rc.top);
+    let (x, y, _) = landed_position(
+        rc.left as f64 / scale,
+        rc.top as f64 / scale,
+        scale,
+        mon,
+        w as f64 / scale,
+        h as f64 / scale,
+    );
+    let (x, y) = pulled_position(rc.left, rc.top, x, y);
+    if x == rc.left && y == rc.top {
+        return false;
+    }
+    let _ = wm::SetWindowPos(
+        hwnd,
+        None,
+        x,
+        y,
+        0,
+        0,
+        wm::SWP_NOSIZE | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
+    );
+    tracing::info!(
+        "悬浮窗原本整个在屏幕之外（{}x{}），已搬回 ({},{})",
+        rc.left,
+        rc.top,
+        x,
+        y
+    );
+    true
+}
+
+/// 算出来的落点与现在这一刻差多少才算"真的需要搬"。
+///
+/// 落点要经过一次「物理→逻辑→取整→物理」的往返，倍数不是 1.0 时来回不一定严格相等
+/// （1.25 倍下 106→84.8→85→106.25→106，这条恰好能回来；换一个数就未必）。
+/// 差一个像素就搬，等于每拍挪一像素的慢速漂移 —— 那正是本仓记过账的"卡片自己跑位"。
+/// 真的被拔屏 stranded 时差的是几百到一千多像素，2 像素这条线拦不住它。
+fn needs_pull_back(cur_x: i32, cur_y: i32, want_x: i32, want_y: i32) -> bool {
+    (want_x - cur_x).abs() >= 2 || (want_y - cur_y).abs() >= 2
+}
+
+/// 这一拍真正要搬去的坐标：没到"该搬"的门槛就原地不动。
+fn pulled_position(cur_x: i32, cur_y: i32, want_x: i32, want_y: i32) -> (i32, i32) {
+    if needs_pull_back(cur_x, cur_y, want_x, want_y) {
+        (want_x, want_y)
+    } else {
+        (cur_x, cur_y)
+    }
+}
+
 /// 主屏整块矩形（不是工作区：判据用整屏是刻意的，理由写在 `state::clamp_floating_into_screen`）。
 fn primary_monitor() -> MonitorRect {
     unsafe {
@@ -794,6 +866,73 @@ mod placement {
             "48 高的屏放不下 64：锚到屏幕顶，上半截至少全看得见"
         );
     }
+
+    /// 运行期把这套落点判据当"每拍都跑"的自检用，前提是它是**不动点**：
+    /// 一个本来就看得见的位置，跑一遍不许动；跑两遍也不许一点点积累成漂移。
+    ///
+    /// 落点要经过一次「物理→逻辑→取整→物理」的往返，1.25/1.75 这类倍数下不保证严格相等，
+    /// 所以这里量的就是"到底差多少"：小于 [`needs_pull_back`] 那道门槛 ⇒ 永远搬不动 ⇒ 无漂移。
+    /// 这条判据盯着的是"每 500ms 跑一次的自检会不会慢慢把卡片挪走"，
+    /// 那正是本仓记过账的"悬浮窗自己跑位"。
+    #[test]
+    fn the_self_check_is_a_fixed_point_at_every_scale() {
+        let w = 90.0;
+        let h = 46.0;
+        for scale in [1.0, 1.25, 1.5, 1.75] {
+            let screen = mon(0, 0, (1920.0 * scale) as u32, (1080.0 * scale) as u32);
+            // 从"用户放在逻辑 84,300 的位置"出发，换成这块屏上的物理坐标。
+            let cur = (render::px(84, scale), render::px(300, scale));
+            let one = |cx: i32, cy: i32| {
+                let (wx, wy, _) =
+                    landed_position(cx as f64 / scale, cy as f64 / scale, scale, screen, w, h);
+                pulled_position(cx, cy, wx, wy)
+            };
+            let first = one(cur.0, cur.1);
+            assert_eq!(
+                first, cur,
+                "scale={scale}：本来就看得见的位置不该被搬，一次物理→逻辑→物理的往返也没把它抖走\
+                 （抖不动才谈得上'每拍跑一次也不会慢慢挪位置'，门槛本身由 \
+                 the_pull_back_gate_separates_jitter_from_a_lost_card 钉）"
+            );
+        }
+    }
+
+    /// 真的被 stranded 时：一步就收敛，第二步一个字都不动（不许每拍挪一点）。
+    #[test]
+    fn a_stranded_card_converges_in_one_step_and_stays() {
+        let scale = 1.0;
+        let screen = mon(0, 0, 1920, 1080);
+        let one = |cx: i32, cy: i32| {
+            let (wx, wy, _) = landed_position(
+                cx as f64 / scale,
+                cy as f64 / scale,
+                scale,
+                screen,
+                90.0,
+                46.0,
+            );
+            pulled_position(cx, cy, wx, wy)
+        };
+        // 那块 4K 副屏拔掉之后，卡片停在 4000 那个 x 上（屏幕上什么都没有）。
+        let first = one(4000, 300);
+        assert_eq!(
+            first,
+            (1900, 300),
+            "一步就回到露出 20 像素的那一侧（旧行为是每拍都在但一次都不搬）"
+        );
+        assert_eq!(one(first.0, first.1), first, "第二步必须认账：已经到位了");
+    }
+
+    /// 门槛本身：一像素的往返抖动不许当成"需要搬"，几百像素的 stranded 不许被放过。
+    #[test]
+    fn the_pull_back_gate_separates_jitter_from_a_lost_card() {
+        assert!(!needs_pull_back(100, 100, 101, 100), "一个像素是取整抖动");
+        assert!(!needs_pull_back(100, 100, 100, 101));
+        assert!(needs_pull_back(100, 100, 102, 100));
+        assert!(needs_pull_back(4000, 300, 1900, 300), "整张在屏幕之外");
+        assert_eq!(pulled_position(100, 100, 101, 99), (100, 100));
+        assert_eq!(pulled_position(4000, 300, 1900, 300), (1900, 300));
+    }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -832,6 +971,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 wp.hwndInsertAfter = wm::HWND_TOPMOST;
                 wp.flags |= wm::SWP_NOACTIVATE;
             }
+            LRESULT(0)
+        }
+        // 屏幕拓扑变了（拔副屏、改分辨率、扩展桌面）：卡片停在旧坐标上就可能整张在屏幕之外，
+        // 而这张窗口不在 Tauri 的窗口集合里、界面上没有任何入口能把它召回来 —— 只有手改
+        // config.ini 那一条路。所以在这个广播到达的这一刻自己 checks 一遍（判据与启动那一条同一个）。
+        wm::WM_DISPLAYCHANGE => {
+            let _ = ensure_visible_on_screen(hwnd);
+            let _ = repaint(hwnd);
             LRESULT(0)
         }
         wm::WM_DPICHANGED => {
@@ -1121,5 +1268,51 @@ mod wiring {
             .find("\n}\n")
             .unwrap_or_else(|| panic!("{head} 没有顶格收尾"));
         rest[..end].to_string()
+    }
+
+    /// 运行期"卡片还在屏幕里吗"这一问必须真的有人问，而且是**那两条路各自问**。
+    ///
+    /// 症状是"拔掉副屏之后悬浮窗就没了，而没有任何入口能找回来"（`clamp_floating_into_screen`
+    /// 的注释把这条后果写得很清楚），而启动那一次夹取救不了运行期。抽出来的判据再对，
+    /// 没有触发点就等于没有 —— 所以这两条腿各钉一个触发点：
+    /// 原生在 `WM_DISPLAYCHANGE` 上问（它没有 500ms 轮询线程），
+    /// WebView2 在置顶轮询里顺手问（它收不到那个广播的线程处理）。
+    #[test]
+    fn both_renderers_actually_ask_whether_the_card_is_still_on_screen() {
+        let src = include_str!("native.rs");
+        let wm = format!("{}{}", "wm::WM_DISPLAYCHANGE", " => {");
+        let ask = format!("{}{}", "ensure_visible_on_screen(", "hwnd)");
+        let wndproc = fn_body(src, "unsafe extern \"system\" fn wndproc");
+        assert!(
+            wndproc.contains(&wm) && wndproc.contains(&ask),
+            "原生那条路没有在广播到达时检查落点：拔屏之后卡片停在屏幕外，而它不在 Tauri 的窗口集合里"
+        );
+
+        let state = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/state.rs"),
+        )
+        .expect("读不到 state.rs");
+        let flat: String = state
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let call = format!(
+            "{}{}",
+            "crate::floating::ensure_visible_on_screen(", "hwnd)"
+        );
+        let at = flat
+            .find(&call)
+            .expect("WebView2 那条路的轮询没有检查落点：卡片跑到屏幕外就再没有入口能找回");
+        let visible = flat
+            .find("letvisible=IsWindowVisible(hwnd).as_bool()")
+            .expect("置顶轮询的形状变了，判据要跟着改");
+        assert!(
+            at > visible,
+            "检查排在可见性问句之前：藏起来的卡片不需要每 3 秒搬一次，而这一支整个块都在 visible 里"
+        );
     }
 }
