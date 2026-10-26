@@ -25,6 +25,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-datadi
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-plugsel.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-snip.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-report.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-pin.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-installer.ps1
 ```
 
@@ -44,6 +45,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 | `accept-plugsel.ps1` | 自带一份 ASCII 小插件（分组表格 + `onselect` + `sel` 按钮）：Lua 里的 ids/group/onselect 真的走到宿主、选中写了声明的那个字段、`sel` 按钮拼出 `<按钮 id><记录 id>` | 10 项 |
 | `accept-snip.ps1` | 用真注入的鼠标拖框跑两条截图收尾：快速版落了 PNG 且没开标注窗 / 标注版开了窗、还没落盘、Esc 关掉且什么都没存 | 10 项 |
 | `accept-report.ps1` | 两轮启动：缺的那份上周周报由启动补上（文件名 `weekly-<上周一>.md`、有内容）/ 第二次启动看见已有文件就不动（时间戳不变） | 10 项 |
+| `accept-pin.ps1` | 两条验收消息开/收贴图（`WM_APP+12` 开 N 张、`WM_APP+13` 全关）：数得到窗口与尺寸、Esc 关单张、全关后归零，**贴图全程不多落一个 PNG** | 10 项（本机还没跑绿，见下） |
+
+> **跑之前先看有没有别的原生实例在跑**：`already_running()` 抢的是
+> `Global\FocusFlow.Native.P0` 这个互斥体，抢不到就把已有窗口叫出来自己退出 ——
+> 症状是每个脚本第一条 `main window appears` 就 FAIL、`focusflow.log` 一个字都没有。
+> 查一眼：`powershell -NoProfile -Command "Get-Process -Name FocusFlow | ForEach-Object { $_.Path }"`。
+> 有就请先关掉那个实例（**别按名字杀**，旧版 WebView 也叫 `FocusFlow.exe`；
+> 用 `Stop-App` 或按路径确认后再停）。
 | `accept-installer.ps1` | 静默装 → 目录/卸载器/快捷方式/注册表/版本号/exe 图标 → 装出来的 exe 默认在采集 → 静默卸 → 全部清干净 | 17 项 |
 
 `accept-plugins.ps1` 断言的是应用日志里的 **ASCII 片段**（字段名 `d_type`/`f_cat`、动作 id

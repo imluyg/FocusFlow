@@ -46,7 +46,8 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, GetDC, GetDIBits, GetStockObject,
     InvalidateRect, LineTo, MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkColor, SetBkMode,
-    SetDIBits, SetDIBitsToDevice, SetTextColor, TextOutW, UpdateWindow, BI_RGB, BITMAPINFO,
+    SetDIBits, SetDIBitsToDevice, SetTextColor, StretchDIBits, TextOutW, UpdateWindow, BI_RGB,
+    BITMAPINFO,
     BITMAPINFOHEADER, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
     DIB_RGB_COLORS, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, NULL_BRUSH, OUT_DEFAULT_PRECIS,
     PAINTSTRUCT,
@@ -92,6 +93,10 @@ const WM_ACCEPTANCE_QUIT: u32 = WM_APP + 9;
 const WM_SEL_TEST: u32 = WM_APP + 10;
 /// 启动几秒后补一份上周周报（与设置页那颗「上周周报」同一条生成路）。
 const WM_WEEKLY_REPORT: u32 = WM_APP + 11;
+/// 验收钩子：开 N 张合成贴图（LPARAM = N）。
+const WM_PIN_TEST: u32 = WM_APP + 12;
+/// 验收钩子：关掉所有贴图（与设置页那一行同一条路）。
+const WM_PIN_CLOSE_ALL: u32 = WM_APP + 13;
 const TIMER_EVENTS: usize = 1;
 /// EDIT 。
 const EM_SETSEL: u32 = 0x00B1;
@@ -1007,6 +1012,7 @@ fn ensure_target(&mut self, hwnd: HWND) {
                 heat_hover: self.heat_hover,
                 hotkey_on: self.hotkey_hk.is_some() || self.snip_hk.is_some(),
                 floating_on: floating::is_visible(),
+                pin_count: PINS.lock().map(|v| v.len()).unwrap_or(0),
                 dark: tokens.dark,
                 collector_on: collect::is_started(),
                 collector_paused: collect::is_paused(),
@@ -1543,6 +1549,7 @@ let y0 = g.list_top + vis as f32 * g.row_h;
                         SItem::Basic(Basic::Autostart) => self.toggle_autostart(hwnd),
                         SItem::Basic(Basic::Hotkey) => self.toggle_hotkey(hwnd),
                         SItem::Basic(Basic::Snip) => start_snip(hwnd, true),
+                        SItem::Basic(Basic::ClosePins) => self.close_pins(hwnd),
                         SItem::Basic(Basic::WeeklyReport) => self.make_weekly_report(hwnd),
                         SItem::Basic(Basic::Floating) => {
                             toggle_floating(hwnd, None);
@@ -2208,6 +2215,20 @@ fn run_plugin_action(&mut self, hwnd: HWND, name: &str, action: &str) {
         self.plugin_sel.clear();
     }
 
+    /// 设置页「关掉所有贴图」：一次收掉桌面上开着的贴图。已存的 PNG 一个字都不动。
+    fn close_pins(&mut self, hwnd: HWND) {
+        let n = close_all_pins();
+        self.status = Some(if n == 0 {
+            "桌面上没有开着的贴图".to_string()
+        } else {
+            format!("已关掉 {n} 张贴图（截图文件都还在 data/screenshots）")
+        });
+        tracing_note(self.status.as_deref().unwrap_or(""));
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
     /// 数据目录：交给资源管理器打开（不自己实现文件浏览）。
     /// 打开的是**当前生效**的数据根，不是程序目录 —— 两者一旦分开（用户改过数据文件夹），
     /// 按程序目录打开会让人以为数据没搬过去。
@@ -2727,6 +2748,7 @@ enum Basic {
     Pause,
     Hotkey,
     Snip,
+    ClosePins,
     Floating,
     Theme,
     DataDir,
@@ -2740,6 +2762,7 @@ fn basic_label(b: Basic) -> &'static str {
         Basic::Pause => "暂停采集",
         Basic::Hotkey => "全局热键",
         Basic::Snip => "区域截图",
+        Basic::ClosePins => "关掉所有贴图",
         Basic::Floating => "悬浮窗",
         Basic::Theme => "主题",
         Basic::DataDir => "数据目录",
@@ -2760,7 +2783,7 @@ const SETTINGS_CATS: [(&str, &str); 6] = [
 fn basic_cat(b: Basic) -> usize {
     match b {
         Basic::Autostart | Basic::Collector | Basic::Pause | Basic::Theme => 0,
-        Basic::Hotkey | Basic::Snip => 1,
+        Basic::Hotkey | Basic::Snip | Basic::ClosePins => 1,
         Basic::Floating => 2,
         Basic::WeeklyReport => 3,
         Basic::DataDir => 4,
@@ -2798,6 +2821,7 @@ fn settings_items(snap: &Snapshot, filter: &str, cat: usize) -> Vec<SItem> {
         Basic::Theme,
         Basic::Hotkey,
         Basic::Snip,
+        Basic::ClosePins,
         Basic::Floating,
         Basic::DataDir,
         Basic::WeeklyReport,
@@ -3164,6 +3188,29 @@ let sbox = search_box_rect(w);
                             &p.br.muted,
                         );
                     }
+                    Basic::ClosePins => {
+                        let n = vs.pin_count;
+                        p.round(
+                            vb,
+                            6.0,
+                            if n == 0 { &p.br.grid } else { &p.br.accent },
+                            None,
+                        );
+                        p.text(
+                            if n == 0 { "没有贴图" } else { "关掉" },
+                            vb,
+                            &p.fmt.center_small,
+                            if n == 0 { &p.br.muted } else { &p.br.white },
+                        );
+                        p.text(
+                            &format!(
+                                "现在开着 {n} 张；按住拖动、滚轮缩放、Esc 或右键关掉单张。贴图只在内存里，截图文件仍留在 data/screenshots"
+                            ),
+                            rect(r.left + 12.0, y + 21.0, 640.0, 15.0),
+                            &p.fmt.small,
+                            &p.br.muted,
+                        );
+                    }
                     Basic::Floating => {
                         let on = vs.floating_on;
                         p.round(vb, 6.0, if on { &p.br.success } else { &p.br.grid }, None);
@@ -3487,6 +3534,8 @@ hotkey_on: bool,
     /// 悬浮窗此刻是否真的显示着（同上：读运行时状态，不读配置键 ——
     /// 手改 `[floating] enabled` 并不会让卡片出现或消失）。
     floating_on: bool,
+    /// 桌面上现在开着几张贴图（设置页那一行显示的就是这个数）。
+    pin_count: usize,
     /// 当前主题是不是深色（设置页那一行显示"深色/浅色"）。
     dark: bool,
     /// 采集真的起来了没有 / 是不是暂停着 / 最近 60 秒的次数。
@@ -4552,7 +4601,7 @@ fn snip_buttons(client_w: i32, client_h: i32) -> Vec<(&'static str, (i32, i32, i
         out.push((*label, (8 + i as i32 * 72, y, bw, bh)));
     }
     let mut x = client_w - 8 - bw;
-    for label in ["取消", "保存", "撤销"] {
+    for label in ["取消", "贴图", "保存", "撤销"] {
         out.push((label, (x, y, bw, bh)));
         x -= bw + 8;
     }
@@ -4668,13 +4717,15 @@ fn render_marks(img: &[u8], w: i32, h: i32, marks: &[SnipMark]) -> Vec<u8> {
 }
 
 /// 保存当前编辑结果（标注烤进图）→ PNG + 剪贴板，然后关窗。
-fn save_snip_edit() {
-    let (img, w, h, marks, editor) = match SNIP.lock() {
-        Ok(s) => (s.img.clone(), s.img_w, s.img_h, s.marks.clone(), s.editor),
-        Err(_) => return,
+/// 把选区里标好注的那一份**落盘 + 进剪贴板**，返回烤好后的像素（贴图要用）。
+/// 「保存」与「贴图」两条出口共用这一份，所以贴图不会多出一次写盘，也不会漏掉剪贴板。
+fn commit_snip() -> Option<(Vec<u8>, i32, i32)> {
+    let (img, w, h, marks) = match SNIP.lock() {
+        Ok(s) => (s.img.clone(), s.img_w, s.img_h, s.marks.clone()),
+        Err(_) => return None,
     };
     if img.is_empty() {
-        return;
+        return None;
     }
     let buf = render_marks(&img, w, h, &marks);
     let dir = focusflow_core::paths::screenshots_dir();
@@ -4692,9 +4743,31 @@ fn save_snip_edit() {
         Ok(()) => tracing_note("截图已进剪贴板"),
         Err(e) => tracing_note(&format!("剪贴板没写进去：{e}")),
     }
+    Some((buf, w, h))
+}
+
+fn save_snip_edit() {
+    let editor = SNIP.lock().map(|s| s.editor).unwrap_or(0);
+    commit_snip();
     if editor != 0 {
         let _ = unsafe { DestroyWindow(HWND(editor as *mut core::ffi::c_void)) };
     }
+}
+
+/// 标注窗里的「贴图」：先按「保存」那条路走一遍（存盘 + 剪贴板），再把刚编好的那一份
+/// 摆到选区原位上。贴图本身不再落盘，也不解码 PNG —— 用的就是内存里这一份。
+fn pin_snip_from_editor(editor: HWND) {
+    let Some((buf, w, h)) = commit_snip() else {
+        tracing_note("贴图 pin-skip 没有可贴的画面");
+        return;
+    };
+    let mut rc = RECT::default();
+    let (x, y) = unsafe {
+        let _ = GetWindowRect(editor, &mut rc);
+        (rc.left, rc.top)
+    };
+    open_pin(buf, w, h, x, y);
+    let _ = unsafe { DestroyWindow(editor) };
 }
 
 /// 在编辑窗口里开一个文字输入框（原生 EDIT，自带中文输入法）。
@@ -4870,7 +4943,7 @@ unsafe extern "system" fn snip_edit_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPA
                         hdc,
                         12,
                         ih + 12,
-                        &"拖出方框做标注 · Ctrl+S 保存 · Esc 取消"
+                        &"拖出方框做标注 · Ctrl+S 保存 · P 贴图 · Esc 取消"
                             .encode_utf16()
                             .collect::<Vec<u16>>(),
                     );
@@ -4880,7 +4953,7 @@ unsafe extern "system" fn snip_edit_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPA
                     let is_tool = (label == "方框" && cur_tool == 0)
                         || (label == "箭头" && cur_tool == 1)
                         || (label == "文字" && cur_tool == 2);
-                    let bg = if label == "保存" || is_tool {
+                    let bg = if label == "保存" || label == "贴图" || is_tool {
                         COLORREF(0x00F7_9C_5B)
                     } else {
                         COLORREF(0x0035_2E_2E)
@@ -4892,7 +4965,7 @@ unsafe extern "system" fn snip_edit_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPA
                     let _ = DeleteObject(bmp.into());
                     let _ = SetTextColor(
                         hdc,
-                        if label == "保存" || is_tool {
+                        if label == "保存" || label == "贴图" || is_tool {
                             COLORREF(0x00FF_FF_FF)
                         } else {
                             COLORREF(0x00F0_F0_F0)
@@ -4932,6 +5005,7 @@ unsafe extern "system" fn snip_edit_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPA
                                 let _ = InvalidateRect(Some(hwnd), None, false);
                             }
                             "保存" => save_snip_edit(),
+                            "贴图" => pin_snip_from_editor(hwnd),
                             "撤销" => {
                                 if let Ok(mut s) = SNIP.lock() {
                                     s.marks.pop();
@@ -5027,6 +5101,11 @@ unsafe extern "system" fn snip_edit_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPA
             }
             WM_KEYDOWN if w.0 == 0x53 && (GetKeyState(0x11) as u16 & 0x8000) != 0 => {
                 save_snip_edit();
+                LRESULT(0)
+            }
+            WM_KEYDOWN if w.0 == 0x50 => {
+                // P = 贴图：与工具条那颗同一条路（先存盘 + 进剪贴板，再把那一份摆到桌面上）。
+                pin_snip_from_editor(hwnd);
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -5140,6 +5219,262 @@ fn start_snip(owner: HWND, annotate: bool) {
                 tracing_note("截图覆盖层已打开（拖选区域，右键/Esc 取消）");
             }
             Err(_) => tracing_note("截图覆盖层创建失败"),
+        }
+    }
+}
+
+// ===== 贴图（pin） =====
+
+/// 一张贴图：内存里那份烤好的 BGRA。贴图自己不落盘、也不回头解码 PNG ——
+/// 截图那一步已经存过一次，这里只是把同一份像素再摆到桌面上。
+#[derive(Clone)]
+struct PinImage {
+    hwnd: isize,
+    img: Vec<u8>,
+    w: i32,
+    h: i32,
+    /// 缩放档：滚轮按 10% 调，夹在 [`PIN_MIN_SCALE`]..=[`PIN_MAX_SCALE`]。
+    scale: f32,
+}
+
+/// 正在被拖的那一张：窗口、按下时的窗口左上角、按下时的光标坐标。
+#[derive(Clone, Copy)]
+struct PinDrag {
+    hwnd: isize,
+    origin: (i32, i32),
+    cursor: (i32, i32),
+}
+
+/// 桌面上开着的贴图。用 `Vec` 而不是 `HashMap`：`Mutex::new(Vec::new())` 才进得了 static。
+static PINS: Mutex<Vec<PinImage>> = Mutex::new(Vec::new());
+static PIN_DRAG: Mutex<Option<PinDrag>> = Mutex::new(None);
+
+const PIN_MIN_SCALE: f32 = 0.25;
+const PIN_MAX_SCALE: f32 = 4.0;
+/// 同时最多几张：每张都是一份完整像素，拍个上限免得贴满桌面后吃光内存。
+const PIN_MAX_COUNT: usize = 12;
+
+fn pin_find(hwnd: isize) -> Option<PinImage> {
+    PINS.lock()
+        .ok()
+        .and_then(|v| v.iter().find(|p| p.hwnd == hwnd).cloned())
+}
+
+/// 开一张贴图：置顶、不进任务栏（toolwindow）、按住拖动、滚轮缩放、Esc / 右键关掉这一张。
+fn open_pin(img: Vec<u8>, w: i32, h: i32, x: i32, y: i32) -> Option<HWND> {
+    unsafe {
+        if PINS.lock().map(|v| v.len()).unwrap_or(0) >= PIN_MAX_COUNT {
+            tracing_note(&format!("贴图 pin-skip 已到上限 {PIN_MAX_COUNT} 张"));
+            return None;
+        }
+        let hinst = GetModuleHandleW(None).map(|m| m.into()).unwrap_or_default();
+        let cls = HSTRING::from("FocusFlowPin");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(pin_proc),
+            hInstance: hinst,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            lpszClassName: PCWSTR(cls.as_ptr()),
+            ..Default::default()
+        };
+        let _ = RegisterClassExW(&wc);
+        let created = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            &cls,
+            &HSTRING::from("FocusFlow 贴图"),
+            WINDOW_STYLE(WS_POPUP.0 | WS_VISIBLE.0),
+            x,
+            y,
+            w,
+            h,
+            None,
+            None,
+            Some(hinst),
+            None,
+        );
+        match created {
+            Ok(pin_hwnd) => {
+                if let Ok(mut v) = PINS.lock() {
+                    v.push(PinImage {
+                        hwnd: pin_hwnd.0 as isize,
+                        img,
+                        w,
+                        h,
+                        scale: 1.0,
+                    });
+                }
+                let _ = SetFocus(Some(pin_hwnd));
+                tracing_note(&format!("贴图 pin-open {w}x{h} at {x},{y}"));
+                Some(pin_hwnd)
+            }
+            Err(e) => {
+                tracing_note(&format!("贴图 pin-fail 建窗失败：{e}"));
+                None
+            }
+        }
+    }
+}
+
+fn pin_set_scale(hwnd: HWND, scale: f32) {
+    let Some(p) = pin_find(hwnd.0 as isize) else {
+        return;
+    };
+    if let Ok(mut v) = PINS.lock() {
+        if let Some(item) = v.iter_mut().find(|x| x.hwnd == hwnd.0 as isize) {
+            item.scale = scale;
+        }
+    }
+    let w = ((p.w as f32 * scale).round() as i32).max(1);
+    let h = ((p.h as f32 * scale).round() as i32).max(1);
+    unsafe {
+        let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
+/// 验收钩子：开 N 张合成贴图（棋盘格）。数窗口、验「关掉所有贴图」与「贴图不落盘」用它，
+/// 不需要真去拖一次框。
+fn open_test_pins(count: usize) {
+    let (w, h) = (120i32, 80i32);
+    for i in 0..count {
+        let mut img = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let on = ((x / 12) + (y / 12) + i as i32) % 2 == 0;
+                let px: [u8; 4] = if on {
+                    [0x5B, 0x9C, 0xF7, 0xFF]
+                } else {
+                    [0x1F, 0x28, 0x3B, 0xFF]
+                };
+                let o = ((y * w + x) * 4) as usize;
+                img[o..o + 4].copy_from_slice(&px);
+            }
+        }
+        open_pin(img, w, h, 420 + (i as i32) * 40, 320 + (i as i32) * 30);
+    }
+}
+
+/// 关掉所有贴图（设置页那一行 / 验收钩子）。已存的 PNG 一个字都不动。
+fn close_all_pins() -> usize {
+    let list: Vec<isize> = PINS
+        .lock()
+        .map(|v| v.iter().map(|p| p.hwnd).collect())
+        .unwrap_or_default();
+    let n = list.len();
+    for raw in list {
+        unsafe {
+            let _ = DestroyWindow(HWND(raw as *mut core::ffi::c_void));
+        }
+    }
+    tracing_note(&format!("贴图 pin-close-all {n}"));
+    n
+}
+
+unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                if let Some(p) = pin_find(hwnd.0 as isize) {
+                    let mut rc = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rc);
+                    let mut info = BITMAPINFO::default();
+                    info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+                    info.bmiHeader.biWidth = p.w;
+                    info.bmiHeader.biHeight = -p.h;
+                    info.bmiHeader.biPlanes = 1;
+                    info.bmiHeader.biBitCount = 32;
+                    info.bmiHeader.biCompression = BI_RGB.0;
+                    // 画满客户区：窗口尺寸就是"原图 × 缩放档"，所以这里不需要再乘一遍。
+                    let _ = StretchDIBits(
+                        hdc,
+                        0,
+                        0,
+                        rc.right - rc.left,
+                        rc.bottom - rc.top,
+                        0,
+                        0,
+                        p.w,
+                        p.h,
+                        Some(p.img.as_ptr() as *const _),
+                        &info,
+                        DIB_RGB_COLORS,
+                        SRCCOPY,
+                    );
+                }
+                let _ = EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                let _ = SetFocus(Some(hwnd));
+                let _ = SetCapture(hwnd);
+                let cur = (
+                    (l.0 & 0xFFFF) as i16 as i32,
+                    ((l.0 >> 16) & 0xFFFF) as i16 as i32,
+                );
+                let mut rc = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut rc);
+                if let Ok(mut d) = PIN_DRAG.lock() {
+                    *d = Some(PinDrag {
+                        hwnd: hwnd.0 as isize,
+                        origin: (rc.left, rc.top),
+                        cursor: cur,
+                    });
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                let Some(drag) = PIN_DRAG.lock().ok().and_then(|d| *d) else {
+                    return LRESULT(0);
+                };
+                if drag.hwnd != hwnd.0 as isize {
+                    return LRESULT(0);
+                }
+                let cx = (l.0 & 0xFFFF) as i16 as i32;
+                let cy = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    drag.origin.0 + (cx - drag.cursor.0),
+                    drag.origin.1 + (cy - drag.cursor.1),
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER,
+                );
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let _ = ReleaseCapture();
+                if let Ok(mut d) = PIN_DRAG.lock() {
+                    *d = None;
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                let notches = (w.0 >> 16) as i16 as f32 / 120.0;
+                let base = pin_find(hwnd.0 as isize).map(|p| p.scale).unwrap_or(1.0);
+                let next = (base * (1.0 + 0.1 * notches)).clamp(PIN_MIN_SCALE, PIN_MAX_SCALE);
+                pin_set_scale(hwnd, next);
+                LRESULT(0)
+            }
+            WM_RBUTTONUP => {
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_KEYDOWN if w.0 == 0x1B => {
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                if let Ok(mut v) = PINS.lock() {
+                    v.retain(|p| p.hwnd != hwnd.0 as isize);
+                }
+                tracing_note("贴图 pin-close");
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
         }
     }
 }
@@ -7245,7 +7580,7 @@ fn run_plugin_sel_test(hwnd: HWND) {
     } else {
         want.clone()
     };
-    if !ids.iter().any(|x| *x == picked) {
+    if !ids.contains(&picked) {
         tracing_note(&format!("sel-test missing id {picked}"));
         return;
     }
@@ -7745,6 +8080,14 @@ let mut tme = TRACKMOUSEEVENT {
         }
         WM_WEEKLY_REPORT => {
             ensure_weekly_report();
+            LRESULT(0)
+        }
+        WM_PIN_TEST => {
+            open_test_pins(l.0.max(0) as usize);
+            LRESULT(0)
+        }
+        WM_PIN_CLOSE_ALL => {
+            close_all_pins();
             LRESULT(0)
         }
         WM_OP_DONE => {            if let Some(app) = unsafe { app_ptr(hwnd) } {
