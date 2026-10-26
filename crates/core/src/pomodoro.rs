@@ -395,10 +395,14 @@ impl PomodoroTimer {
     /// 用 `[pomodoro]` 三键覆盖时长与自动休息。
     ///
     /// 这三个键以前是**摆设**：`config.rs` 把它们写进每个人的 config.ini（镜像 Python 版），
-    /// 而计时器只用 `TimerState::default()` 的 25/5/true，`set_durations` 与
-    /// `set_auto_break` 全仓零调用方（宿主注册了 `pomodoro_set_durations`，
-    /// 但没有任何内置 `.lua` 调它）。表现：他把 `work_minutes` 改成 45，
+    /// 而计时器只用 `TimerState::default()` 的 25/5/true。表现：他把 `work_minutes` 改成 45，
     /// 倒计时照旧 25:00，自动休息也关不掉。
+    ///
+    /// 现在这两个数的口径已经不一样了，别说成一回事：
+    /// `set_durations` 有调用方了（内置插件面板上的「应用时长」按钮，
+    /// `plugins/pomodoro_plugin.lua` 走宿主的 `pomodoro_set_durations`）；
+    /// `set_auto_break` 到写下这一行时仍然**零调用方**，宿主也没给它注册对应 API
+    /// ⇒ 自动休息只能靠 `[pomodoro] auto_break` 这一条道，面板上换不掉它。
     ///
     /// 只在计时器创建时读一次：改完配置要停用/再启用番茄钟插件（或重启）才生效。
     pub fn apply_config(&self, config: &crate::config::FocusFlowConfig) {
