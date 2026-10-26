@@ -208,9 +208,12 @@ pub fn load(period: i64) -> Snapshot {
     let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
     let goal = Some(goal_status(goal_cfg, &goal_rows, &today_str, 0));
 
-    // 采集开着时，写线程内存里那批**还没落库**的按键也要算进来：`queries::*` 读的是
-    // 已落库的部分。见 `load` 开头对 `pending` 的说明。
-    let today = queries::get_today_count(None) + pending;
+    // 采集开着时，今日直接用写线程缓存：它含未落库与在途增量，落库前后都不跳
+    // （用「库值 + pending」会在 flush 取走批次、尚未提交的那一瞬读到 0）。
+    let today = match crate::collect::today_total() {
+        Some(n) => n,
+        None => queries::get_today_count(None),
+    };
     // 今日前台时长：与下面应用排行同一个口径，只是窗口固定成 1 天（悬浮窗要的是"今天"）。
     let today_app_seconds = queries::get_app_stats(Some(1), None).0;
 

@@ -109,6 +109,21 @@ pub fn pending_today() -> i64 {
         .unwrap_or(0)
 }
 
+/// 今日总数的**权威值**：写线程缓存（含未落库与正在落库的那批，且跨午夜自己归零）。
+///
+/// 为什么不再用「库值 + pending」：`flush_pending` 会把一批增量从 `agg` 取走、再在锁外
+/// 写 SQLite；这中间 `agg` 与库两边都没有它，状态行就会瞬降一次（实测 `today=5 → 0 → 5`）。
+/// 写线程的 `today_count` 是按事件累加的、落库前后都不动，正好没有这个空窗。
+/// 采集没开时返回 `None`，调用方退回只读库。
+pub fn today_total() -> Option<i64> {
+    slot().lock().ok().and_then(|g| {
+        g.as_ref().and_then(|r| {
+            r.db.writer()
+                .map(|w| w.today_count_for_display().min(i64::MAX as u64) as i64)
+        })
+    })
+}
+
 /// `FOCUSFLOW_LOG_KEYS=1`：把每个按键写一行日志。
 ///
 /// 给验收用：注入键（`keybd_event`/`SendInput`）与真键在钩子这一层长得一样，
