@@ -62,6 +62,8 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
     ("gui", "active_refresh_interval", 1, "改完立即生效", "活跃刷新（秒）", "界面 · 今日/速度卡片多久刷新一次"),
     ("gui", "full_refresh_interval", 1, "改完立即生效", "全量刷新（秒）", "界面 · 排行与图表多久重新读库"),
     ("database", "max_backups", 1, "改完立即生效", "备份保留份数", "数据 · 自动备份最多保留几个"),
+    ("database", "backup_on_exit", 0, "改完立即生效", "退出时自动备份", "数据 · 每次正常退出前给各类库各存一份快照"),
+    ("database", "online_backup_interval_hours", 1, "改完立即生效", "定时备份间隔（小时）", "数据 · 运行中每隔几小时备份一次；0 = 关闭"),
     ("database", "backup_disabled_plugins", 0, "改完立即生效", "备份插件数据", "数据 · 把插件数据库也一起备份"),
     ("app_stats", "enabled", 0, "改完立即生效", "应用时长统计", "应用 · 记录前台应用的使用时长"),
     ("app_stats", "exclude", 3, "改完立即生效", "不统计的应用", "应用 · 进程名逗号分隔，如 chrome.exe,code.exe"),

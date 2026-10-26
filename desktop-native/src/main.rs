@@ -1473,6 +1473,7 @@ let y0 = g.list_top + vis as f32 * g.row_h;
                         SItem::Basic(Basic::Autostart) => self.toggle_autostart(hwnd),
                         SItem::Basic(Basic::Hotkey) => self.toggle_hotkey(hwnd),
                         SItem::Basic(Basic::Snip) => start_snip(hwnd),
+                        SItem::Basic(Basic::WeeklyReport) => self.make_weekly_report(hwnd),
                         SItem::Basic(Basic::Floating) => {
                             toggle_floating(hwnd, None);
                             unsafe {
@@ -2270,6 +2271,20 @@ fn start_edit_setting(&mut self, hwnd: HWND, snapshot_idx: usize, item_idx: usiz
         self.edit_row = Some(item_idx);
     }
 
+    /// 设置页「上周周报」：把上一个完整周（周一~周日）汇总成 Markdown。
+    fn make_weekly_report(&mut self, hwnd: HWND) {
+        match generate_weekly_report() {
+            Ok(path) => self.status = Some(format!("周报已生成：{}", path.display())),
+            Err(e) => self.status = Some(format!("周报生成失败：{e}")),
+        }
+        if let Some(s) = &self.status {
+            tracing_note(s);
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
     /// 开关类设置：读当前。
 fn toggle_setting(&mut self, hwnd: HWND, idx: usize) {
         let row = self
@@ -2536,6 +2551,7 @@ enum Basic {
     Floating,
     Theme,
     DataDir,
+    WeeklyReport,
 }
 
 fn basic_label(b: Basic) -> &'static str {
@@ -2548,6 +2564,7 @@ fn basic_label(b: Basic) -> &'static str {
         Basic::Floating => "悬浮窗",
         Basic::Theme => "主题",
         Basic::DataDir => "数据目录",
+        Basic::WeeklyReport => "上周周报",
     }
 }
 
@@ -2566,6 +2583,7 @@ fn basic_cat(b: Basic) -> usize {
         Basic::Autostart | Basic::Collector | Basic::Pause | Basic::Theme => 0,
         Basic::Hotkey | Basic::Snip => 1,
         Basic::Floating => 2,
+        Basic::WeeklyReport => 3,
         Basic::DataDir => 4,
     }
 }
@@ -2592,6 +2610,7 @@ fn settings_items(snap: &Snapshot, filter: &str, cat: usize) -> Vec<SItem> {
         Basic::Snip,
         Basic::Floating,
         Basic::DataDir,
+        Basic::WeeklyReport,
     ] {
         if !searching && basic_cat(b) != cat {
             continue;
@@ -2973,6 +2992,16 @@ let sbox = search_box_rect(w);
                         p.text(
                             "点一下切换；配色照 tokens.css 的两套令牌（[gui] theme）",
                             rect(r.left + 12.0, y + 21.0, 420.0, 18.0),
+                            &p.fmt.small,
+                            &p.br.muted,
+                        );
+                    }
+                    Basic::WeeklyReport => {
+                        p.round(vb, 6.0, &p.br.accent, None);
+                        p.text("生成", vb, &p.fmt.center_small, &p.br.white);
+                        p.text(
+                            "汇总上周一~周日，写到 data/reports/weekly-YYYY-MM-DD.md（只存本机）",
+                            rect(r.left + 12.0, y + 21.0, 600.0, 15.0),
                             &p.fmt.small,
                             &p.br.muted,
                         );
@@ -5873,6 +5902,147 @@ fn restore_button(g: &TableGeom, y: f32) -> D2D_RECT_F {
 }
 
 /// 应用时长：秒 。
+/// 生成「上周」周报（周一~周日），返回 Markdown 路径。旧 WebView 版在每周一自动生成，
+/// 原生端先做成设置页「目标 → 上周周报」里的一颗手动按钮，内容口径与旧版一致。
+fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
+    use chrono::{Datelike, Duration, Local};
+    use focusflow_core::db::queries;
+    use std::fmt::Write as _;
+
+    let today = Local::now().date_naive();
+    let since_monday = today.weekday().num_days_from_monday() as i64;
+    let start = today - Duration::days(since_monday + 7);
+    let end = start + Duration::days(6);
+    let goal = focusflow_core::config::instance().get_int("goal", "daily_keys", 20000);
+
+    let mut by_day: Vec<(chrono::NaiveDate, i64)> = Vec::new();
+    let mut keys: HashMap<String, i64> = HashMap::new();
+    let mut apps: HashMap<String, i64> = HashMap::new();
+    let mut devices: HashMap<String, i64> = HashMap::new();
+    let mut gaps: Vec<String> = Vec::new();
+    let mut total = 0i64;
+
+    for i in 0..7 {
+        let d = start + Duration::days(i);
+        let t = queries::stats_totals_on(d);
+        total += t.total;
+        by_day.push((d, t.total));
+        gaps.extend(t.unreadable);
+        for (k, v) in t.rows {
+            *keys.entry(k).or_insert(0) += v;
+        }
+        let a = queries::app_stats_totals_on(d);
+        gaps.extend(a.unreadable);
+        for (k, v) in a.rows {
+            *apps.entry(k).or_insert(0) += v;
+        }
+        let dev = queries::device_totals_on(d);
+        gaps.extend(dev.unreadable);
+        for dstat in dev.devices {
+            *devices.entry(dstat.name).or_insert(0) += dstat.count;
+        }
+    }
+    gaps.sort();
+    gaps.dedup();
+
+    let mut keys: Vec<(String, i64)> = keys.into_iter().collect();
+    keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    keys.truncate(10);
+    let mut apps: Vec<(String, i64)> = apps.into_iter().collect();
+    apps.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    apps.truncate(10);
+    let mut devices: Vec<(String, i64)> = devices.into_iter().collect();
+    devices.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    devices.truncate(10);
+
+    let max_day = by_day
+        .iter()
+        .max_by_key(|(_, v)| *v)
+        .map(|(d, v)| (d.format("%m-%d").to_string(), *v))
+        .unwrap_or_else(|| ("—".to_string(), 0));
+    let hit = by_day.iter().filter(|(_, v)| *v >= goal).count();
+    let device_total: i64 = devices.iter().map(|(_, v)| *v).sum();
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# FocusFlow 周报 · {} ~ {}\n",
+        start.format("%Y-%m-%d"),
+        end.format("%Y-%m-%d")
+    );
+    let _ = writeln!(out, "- 总活跃：{} 次", thousands(total.max(0) as u64));
+    let _ = writeln!(out, "- 日均：{} 次", thousands((total / 7).max(0) as u64));
+    let _ = writeln!(
+        out,
+        "- 最高单日：{} 次（{}）",
+        thousands(max_day.1.max(0) as u64),
+        max_day.0
+    );
+    let _ = writeln!(
+        out,
+        "- 达标天数：{} / 7（每日目标 {} 次）",
+        hit,
+        thousands(goal.max(0) as u64)
+    );
+    if device_total > 0 {
+        let _ = writeln!(
+            out,
+            "- 设备输入合计：{} 次（独立口径，和上面的键鼠次数不直接相加）",
+            thousands(device_total.max(0) as u64)
+        );
+    }
+    if !gaps.is_empty() {
+        let _ = writeln!(out, "\n> 有 {} 个年度库没读全：{}", gaps.len(), gaps.join("；"));
+    }
+
+    let _ = writeln!(out, "\n## 每日活跃\n\n| 日期 | 次数 |\n|---|---:|");
+    for (d, n) in &by_day {
+        let mark = if *n >= goal { " ✅" } else { "" };
+        let _ = writeln!(
+            out,
+            "| {} | {} |",
+            d.format("%Y-%m-%d"),
+            format!("{}{}", thousands((*n).max(0) as u64), mark)
+        );
+    }
+
+    let _ = writeln!(out, "\n## 键鼠 TOP 10\n\n| 键 | 次数 |\n|---|---:|");
+    for (k, n) in &keys {
+        let _ = writeln!(out, "| {} | {} |", k, thousands((*n).max(0) as u64));
+    }
+    if keys.is_empty() {
+        let _ = writeln!(out, "| （这一周没有记录） | 0 |");
+    }
+
+    let _ = writeln!(out, "\n## 应用 TOP 10（前台时长）\n\n| 应用 | 时长 |\n|---|---:|");
+    for (name, secs) in &apps {
+        let _ = writeln!(out, "| {} | {} |", name, duration_text(*secs));
+    }
+    if apps.is_empty() {
+        let _ = writeln!(out, "| （这一周没有记录） | 0s |");
+    }
+
+    let _ = writeln!(out, "\n## 设备 TOP 10\n\n| 设备 | 次数 |\n|---|---:|");
+    for (name, n) in &devices {
+        let _ = writeln!(out, "| {} | {} |", name, thousands((*n).max(0) as u64));
+    }
+    if devices.is_empty() {
+        let _ = writeln!(out, "| （这一周没有记录） | 0 |");
+    }
+
+    let _ = writeln!(
+        out,
+        "\n---\n\n生成时间：{} · 数据只来自本机，未上传。\n",
+        Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+
+    let dir = focusflow_core::paths::data_dir().join("reports");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("建报告目录失败：{e}"))?;
+    let file = dir.join(format!("weekly-{}.md", start.format("%Y-%m-%d")));
+    std::fs::write(&file, out).map_err(|e| format!("写周报失败：{e}"))?;
+    Ok(file)
+}
+
 fn duration_text(secs: i64) -> String {
     let s = secs.max(0);
     if s >= 3600 {
