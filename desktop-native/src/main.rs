@@ -6437,8 +6437,12 @@ fn text_format(
     weight: DWRITE_FONT_WEIGHT,
 ) -> windows::core::Result<IDWriteTextFormat> {
     unsafe {
+        // 与旧 WebView 的 `--font: "Segoe UI", "Microsoft YaHei", "微软雅黑", sans-serif`
+        // 同一顺序：拉丁字母与数字用 Segoe UI，中文由 DirectWrite 的字体回退落到雅黑。
+        // 原来这里直接写 "Microsoft YaHei UI"，把数字也交给了雅黑 —— 主界面的 14,114、
+        // 图表刻度、表格数字全比旧版粗一档，就是"字体看着不对"的来源。
         let f = dw.CreateTextFormat(
-            w!("Microsoft YaHei UI"),
+            w!("Segoe UI"),
             None,
             weight,
             DWRITE_FONT_STYLE_NORMAL,
