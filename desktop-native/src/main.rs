@@ -1151,7 +1151,7 @@ fn run_action(&mut self, hwnd: HWND, which: usize) {
         let ops = Arc::clone(&self.ops);
         let hwnd_val = hwnd.0 as isize;
         // 导出要在后台线程里拼文件，先把这一份快照拷出来。
-let snap_data = if which == 3 {
+let snap_data = if which >= 3 {
             self.snap.lock().ok().map(|s| s.clone())
         } else {
             None
@@ -1182,21 +1182,26 @@ let snap_data = if which == 3 {
                         }
                     }
                     1 => vacuum_line(&vacuum_all()),
-                    3 => {
+                    3..=5 => {
                         let Some(s) = snap_data else {
                             return;
                         };
+                        let (ext, filter) = match which {
+                            3 => ("csv", "CSV"),
+                            4 => ("html", "HTML"),
+                            _ => ("json", "JSON"),
+                        };
                         let path = match std::env::var("FOCUSFLOW_EXPORT_PATH") {
-                            // 测试钩子：给定了路径就不弹框，直接写那儿。
-Ok(p) => std::path::PathBuf::from(p),
+                            // 测试钩子：给定了路径就不弹框；按格式换后缀，三种格式互不覆盖
+                            Ok(base) => std::path::PathBuf::from(base).with_extension(ext),
                             Err(_) => {
                                 let file = rfd::FileDialog::new()
                                     .set_title("导出统计报告")
                                     .set_file_name(format!(
-                                        "focusflow_export_{}.csv",
+                                        "focusflow_export_{}.{ext}",
                                         chrono::Local::now().format("%Y%m%d")
                                     ))
-                                    .add_filter("CSV", &["csv"])
+                                    .add_filter(filter, &[ext])
                                     .save_file();
                                 match file {
                                     Some(p) => p,
@@ -1213,7 +1218,12 @@ Ok(p) => std::path::PathBuf::from(p),
                                 }
                             }
                         };
-                        match std::fs::write(&path, export_csv_text(&s)) {
+                        let body = match ext {
+                            "csv" => export_csv_text(&s),
+                            "html" => export_html_text(&s),
+                            _ => export_json_text(&s),
+                        };
+                        match std::fs::write(&path, body) {
                             Ok(()) => format!("已导出：{}", path.display()),
                             Err(e) => format!("导出失败：{e}"),
                         }
@@ -1968,12 +1978,14 @@ let max_rows = (((h - 32.0 - 30.0 - list_top) / row_h).floor() as usize).max(1);
     }
 }
 
-/// 设置页底部的数据操作（后台线程跑，结果回。
-const ACTIONS: [(&str, &str); 4] = [
+/// 设置页底部的数据操作（后台线程跑，结果回投 `WM_OP_DONE`）。
+const ACTIONS: [(&str, &str); 6] = [
     ("立即备份", "把年度库各快照一份到 backup/"),
     ("压缩数据库", "重建年度库，回收空闲页"),
     ("清理 30 天前", "删掉 30 天以前的明细（不可撤销）"),
     ("导出 CSV", "把当前周期的数据写成表格"),
+    ("导出 HTML", "写成一份可直接打开的网页报告"),
+    ("导出 JSON", "写成结构化数据（脚本可读）"),
 ];
 
 /// 设置页右上角那个搜索框（底框；真正的输入是叠上去的原。
@@ -4675,6 +4687,142 @@ fn csv_field(s: &str) -> String {
 
 /// 把当前快照写成一�?CSV（概�?+ 四个排行 + 每日/每小时）�?///
 /// 注：这是原生。
+/// HTML 报告里要转义：键名/应用名可能带 `<`、`&`。
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// 自包含的 HTML 报告：暗色、无外部依赖，双击就能看。
+fn export_html_text(s: &Snapshot) -> String {
+    let mut out = String::new();
+    out.push_str("<!doctype html><meta charset=\"utf-8\"><title>FocusFlow 导出</title>\n");
+    out.push_str("<style>body{font:14px/1.6 \"Microsoft YaHei UI\",sans-serif;background:#0f1219;color:#e8ecf4;padding:24px;max-width:900px;margin:0 auto}h1{font-size:20px}h2{font-size:15px;margin-top:26px;color:#9aa4b8}table{border-collapse:collapse;width:100%;margin-top:8px}th,td{border-bottom:1px solid #2e3548;padding:6px 8px;text-align:left;font-size:13px}th{color:#9aa4b8;font-weight:500}td.num{text-align:right}</style>\n");
+    out.push_str(&format!(
+        "<h1>FocusFlow 导出</h1><p>生成时间 {} · 统计周期 {}</p>\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        html_escape(&period_text(s.period))
+    ));
+    out.push_str("<table><tr><th>今日</th><th>周期总计</th><th>日均</th></tr>");
+    out.push_str(&format!(
+        "<tr><td>{}</td><td>{}</td><td>{}</td></tr></table>\n",
+        s.today, s.period_total, s.avg
+    ));
+
+    out.push_str("<h2>键鼠排行</h2><table><tr><th>排名</th><th>键名</th><th>次数</th><th>占比</th></tr>");
+    for (i, (k, v)) in s.rank.iter().enumerate() {
+        let share = if s.period_total > 0 {
+            *v as f32 * 100.0 / s.period_total as f32
+        } else {
+            0.0
+        };
+        out.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{share:.1}%</td></tr>",
+            i + 1,
+            html_escape(k),
+            v
+        ));
+    }
+    out.push_str("</table>\n");
+
+    out.push_str("<h2>应用排行</h2><table><tr><th>排名</th><th>应用</th><th>时长</th></tr>");
+    for (i, (k, v)) in s.apps.iter().enumerate() {
+        out.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+            i + 1,
+            html_escape(k),
+            duration_text(*v)
+        ));
+    }
+    out.push_str("</table>\n");
+
+    out.push_str("<h2>设备排行</h2><table><tr><th>排名</th><th>设备</th><th>类型</th><th>次数</th></tr>");
+    for (i, d) in s.devices.iter().enumerate() {
+        out.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td></tr>",
+            i + 1,
+            html_escape(&d.name),
+            html_escape(&d.kind),
+            d.count
+        ));
+    }
+    out.push_str("</table>\n");
+
+    out.push_str("<h2>每日次数（近 30 天）</h2><table><tr><th>日期</th><th>次数</th></tr>");
+    let today = chrono::Local::now().date_naive();
+    let n = s.daily.len();
+    for (i, v) in s.daily.iter().enumerate() {
+        let d = today - chrono::Duration::days(n.saturating_sub(1 + i) as i64);
+        out.push_str(&format!(
+            "<tr><td>{}</td><td class=\"num\">{v}</td></tr>",
+            d.format("%Y-%m-%d")
+        ));
+    }
+    out.push_str("</table>\n");
+
+    out.push_str("<h2>每小时合计</h2><table><tr><th>小时</th><th>次数</th></tr>");
+    for (h, v) in s.hourly.iter().enumerate() {
+        out.push_str(&format!("<tr><td>{h}:00</td><td class=\"num\">{v}</td></tr>"));
+    }
+    out.push_str("</table>\n");
+    out
+}
+
+/// 结构化 JSON：脚本/其它工具可直接读。
+fn export_json_text(s: &Snapshot) -> String {
+    use serde_json::json;
+    let rank: Vec<serde_json::Value> = s
+        .rank
+        .iter()
+        .enumerate()
+        .map(|(i, (k, v))| json!({"rank": i + 1, "key": k, "count": v}))
+        .collect();
+    let apps: Vec<serde_json::Value> = s
+        .apps
+        .iter()
+        .enumerate()
+        .map(|(i, (k, v))| json!({"rank": i + 1, "app": k, "seconds": v}))
+        .collect();
+    let devices: Vec<serde_json::Value> = s
+        .devices
+        .iter()
+        .enumerate()
+        .map(|(i, d)| json!({"rank": i + 1, "name": d.name, "kind": d.kind, "count": d.count}))
+        .collect();
+    let today = chrono::Local::now().date_naive();
+    let n = s.daily.len();
+    let daily: Vec<serde_json::Value> = s
+        .daily
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let d = today - chrono::Duration::days(n.saturating_sub(1 + i) as i64);
+            json!({"date": d.format("%Y-%m-%d").to_string(), "count": v})
+        })
+        .collect();
+    let hourly: Vec<serde_json::Value> = s
+        .hourly
+        .iter()
+        .enumerate()
+        .map(|(h, v)| json!({"hour": h, "count": v}))
+        .collect();
+    let doc = json!({
+        "generated_at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        "period": period_text(s.period),
+        "today": s.today,
+        "period_total": s.period_total,
+        "avg": s.avg,
+        "rank": rank,
+        "apps": apps,
+        "devices": devices,
+        "daily": daily,
+        "hourly": hourly,
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
+}
+
 fn export_csv_text(s: &Snapshot) -> String {
     let mut out = String::new();
     out.push_str("FocusFlow 导出\r\n");

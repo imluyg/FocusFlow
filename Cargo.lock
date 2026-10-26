@@ -722,6 +722,7 @@ dependencies = [
  "png 0.17.16",
  "raw-window-handle",
  "rfd",
+ "serde_json",
  "tray-icon",
  "window-vibrancy",
  "windows",
