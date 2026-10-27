@@ -1292,7 +1292,12 @@ pub enum Verdict {
 
 /// 一次出图：合成 → 落盘 → 进剪贴板（CF_DIB 与 `PNG` 两份，编码只做一次）。
 /// `pin` = 顺手把这一张钉在桌面上（不再多落一个文件）。
-fn commit(pin: bool) -> Verdict {
+///
+/// 去向由调用方给：产品传真实的 `screenshots_dir()` 且 `clipboard = true`；
+/// 屏上探针传一个临时目录且 `clipboard = false`——那条路不许往用户目录里写，
+/// 也不许盖掉用户的剪贴板（这两件事只能在独立进程的验收套件里判）。
+/// `clipboard = false` 时那一路当作成功，判的就只是"落盘成不成"这一半。
+fn commit_into(dir: &std::path::Path, clipboard: bool, pin: bool) -> Verdict {
     let (origin, sel) = SNIP
         .lock()
         .map(|s| (s.origin, s.sel))
@@ -1308,8 +1313,7 @@ fn commit(pin: bool) -> Verdict {
         }
     };
 
-    let dir = focusflow_core::paths::screenshots_dir();
-    let save = match write_png_named(&dir, &png, w, h) {
+    let save = match write_png_named(dir, &png, w, h) {
         Ok(path) => {
             tracing_note(&format!("截图已保存：{} ({w}x{h})", path.display()));
             Ok(())
@@ -1319,16 +1323,19 @@ fn commit(pin: bool) -> Verdict {
             Err(e)
         }
     };
-    let clip = match focusflow_core::capture::win::write_image_to_clipboard(
-        &buf, w as u32, h as u32, &png,
-    ) {
-        Ok(()) => {
-            tracing_note(&format!("截图已进剪贴板：{w}x{h} CF_DIB+PNG"));
-            Ok(())
-        }
-        Err(e) => {
-            tracing_note(&format!("截图进剪贴板失败：{e}"));
-            Err(e)
+    let clip = if !clipboard {
+        Ok(())
+    } else {
+        match focusflow_core::capture::win::write_image_to_clipboard(&buf, w as u32, h as u32, &png)
+        {
+            Ok(()) => {
+                tracing_note(&format!("截图已进剪贴板：{w}x{h} CF_DIB+PNG"));
+                Ok(())
+            }
+            Err(e) => {
+                tracing_note(&format!("截图进剪贴板失败：{e}"));
+                Err(e)
+            }
         }
     };
     if pin {
@@ -1341,8 +1348,17 @@ fn commit(pin: bool) -> Verdict {
 }
 
 /// 出图并据此收场：成则关窗，败则把原因写在屏上、覆盖层留着等第二次 Enter。
+/// 五个调用点（工具条"保存"与"贴图"、松手即存、Enter/Ctrl+S、P）都走这条，去向都是真实的。
 unsafe fn commit_and_close(hwnd: HWND, pin: bool) {
-    match commit(pin) {
+    let dir = focusflow_core::paths::screenshots_dir();
+    commit_and_close_into(hwnd, pin, &dir, true);
+}
+
+/// 上面那条的实现体，只把"落到哪个目录、要不要动剪贴板"留给调用方。
+/// 屏上探针要靠它端到端判"写盘失败不退、写成就退"这两条，而真实去向会往用户的
+/// `data/screenshots` 落一张、还会盖掉他的剪贴板——那两件事只能在独立进程的验收套件里做。
+unsafe fn commit_and_close_into(hwnd: HWND, pin: bool, dir: &std::path::Path, clipboard: bool) {
+    match commit_into(dir, clipboard, pin) {
         Verdict::Done => {
             let _ = DestroyWindow(hwnd);
         }
@@ -3540,6 +3556,67 @@ mod render_probe {
                 0,
                 "没有原因那一片却还红着：上面的判据不是这句字画出来的"
             );
+
+            // 出图的"去向"能注进来之后，这一对才是本轮新行为真正的端到端证据：
+            // 写盘失败 ⇒ 覆盖层不退并且把原因留下；写盘成功 ⇒ 落一张 PNG 并且自己退。
+            // 目录指着真实路径会往用户 `data/screenshots` 写、还会盖掉他的剪贴板，
+            // 所以这里走临时目录且 `clipboard = false`。
+            let ctmp = std::env::temp_dir().join(format!("ff_snip_commit_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&ctmp);
+            std::fs::create_dir_all(&ctmp).expect("临时目录建不出来，后面两条判据就是空的");
+            let (bw, bh) = SNIP
+                .lock()
+                .map(|s| (s.sel.2 - s.sel.0, s.sel.3 - s.sel.1))
+                .unwrap();
+            let n_before = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
+            // 拿一个**普通文件**占住"目录"那个位置 ⇒ `create_dir_all` 必失败 ⇒ 这一趟落盘必失败
+            let blocked = ctmp.join("不是一个目录");
+            std::fs::write(&blocked, b"x").expect("占位文件写不出去");
+            commit_and_close_into(ov, false, &blocked, false);
+            pump(250);
+            assert!(
+                IsWindow(Some(ov)).as_bool(),
+                "写盘失败却把覆盖层关了：那张图连一次重试的机会都没有"
+            );
+            let why = SNIP.lock().map(|s| s.notice.clone()).unwrap_or(None);
+            let why = why.unwrap_or_default();
+            assert!(why.contains("没存盘"), "屏上那句没说到点上：{why:?}");
+            assert_eq!(
+                SNIP.lock().map(|s| s.marks.len()).unwrap_or(0),
+                n_before,
+                "出图失败还把已经画好的标注吞了"
+            );
+
+            // 换成能写的目录 ⇒ 同一份会话必须正好落一张、文件名带宽高、尺寸对得上，并且覆盖层自己退
+            let out = ctmp.join("out");
+            std::fs::create_dir_all(&out).expect("可写目录建不出来");
+            commit_and_close_into(ov, false, &out, false);
+            pump(250);
+            assert!(!IsWindow(Some(ov)).as_bool(), "出图成功了覆盖层却没退");
+            let files: Vec<String> = std::fs::read_dir(&out)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(files.len(), 1, "临时目录里该正好落一张：{files:?}");
+            let nm = &files[0];
+            assert!(
+                nm.starts_with("snip_") && nm.contains(&format!("{bw}x{bh}")),
+                "文件名没带上选区宽高：{nm}"
+            );
+            let raw = std::fs::read(out.join(nm)).expect("那张 PNG 读不回来");
+            let (rgba, dw, dh) = focusflow_core::capture::decode_png_rgba(&raw).unwrap();
+            assert_eq!((dw as i32, dh as i32), (bw, bh), "落盘那张的尺寸不等于选区");
+            // 走产品自己这条出路落的那张里，已经画好的标注也得在：
+            // 整幅中至少有一个"色块那种红"的像素（PNG 解回来是 RGBA 顺序）
+            assert!(
+                rgba.chunks_exact(4)
+                    .any(|p| p[0] == 255 && p[1] == 45 && p[2] == 45),
+                "落盘那张里没有已画的标注"
+            );
+            let _ = std::fs::remove_dir_all(&ctmp);
 
             let _ = DestroyWindow(ov);
             pump(200);
