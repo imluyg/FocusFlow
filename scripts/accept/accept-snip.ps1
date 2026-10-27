@@ -93,11 +93,32 @@ function Wait-Log([string]$Pattern, [int]$TimeoutMs = 4000) {
     $false
 }
 
+# Count the log lines matching a pattern, waiting until at least $Want of them have landed.
+# The overlay's own log lines reach the file after the window exists, so a count taken right
+# after Wait-Window is a race -- and a re-press writes its line *before* the fresh overlay is
+# built. Poll for the number instead of sleeping a guessed amount.
+function Wait-LogCount([string]$Pattern, [int]$Want, [int]$TimeoutMs = 5000) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalMilliseconds -lt $TimeoutMs) {
+        if (@(Get-SnipLog | Where-Object { $_ -match $Pattern }).Count -ge $Want) { return $true }
+        Start-Sleep -Milliseconds 200
+    }
+    $false
+}
+
+function Count-Log([string]$Pattern) {
+    @(Get-SnipLog | Where-Object { $_ -match $Pattern }).Count
+}
+
 # One toolbar button as the overlay reported it: 'snip-btn <id> <x> <y> <w> <h>'
+# Take the LAST group, not the first: the overlay re-publishes the geometry whenever the
+# selection changes (corner-handle drag, arrow-key nudge), so the first group is the layout
+# the bar had *before* that change. Aiming a click at a stale rect lands inside the selection
+# and reads as "the commit button did nothing" -- which is exactly how round 3b first failed.
 function Get-BarBtn([string]$Id) {
     $line = @(Get-SnipLog | Where-Object { $_ -match "snip-btn $Id (-?\d+) (-?\d+) (\d+) (\d+)" })
     if ($line.Count -eq 0) { return $null }
-    $m = [regex]::Match($line[0], "snip-btn $Id (-?\d+) (-?\d+) (\d+) (\d+)")
+    $m = [regex]::Match($line[$line.Count - 1], "snip-btn $Id (-?\d+) (-?\d+) (\d+) (\d+)")
     if (-not $m.Success) { return $null }
     [pscustomobject]@{
         X = [int]$m.Groups[1].Value
@@ -286,14 +307,41 @@ if ($bBlock) {
 # (the product logs 'snip-repress'); re-pressing the *quick* hotkey must not interrupt --
 # that path logs 'snip-busy' and keeps the current selection. The count of 'snip-arm-timeout'
 # lines is the observable that a second overlay really came up.
-$armedBefore = @(Get-SnipLog | Where-Object { $_ -match 'snip-arm-timeout' }).Count
+#
+# The precondition is the whole point of this block, and the first version of it got it wrong:
+# round 2 above COMMITS, so by here nothing is in flight. One post from there correctly answers
+# "Open" (there is nothing to abandon) -- so the abandon line can only ever appear on a post made
+# while an overlay is actually up. Measured on the shipped bytes: one post => arm lines and zero
+# 'snip-repress'; two posts => exactly one.
+$armBase = Count-Log 'snip-arm-timeout'
 [void][FF]::PostMessage($h2, 0x8006, [IntPtr]1, [IntPtr]::Zero)     # WM_SNIP_START (annotate)
-Start-Sleep -Milliseconds 1500
+$ovRe = Wait-Window $p2.Id 'FocusFlowSnipOverlay' 5000
+Check 'the first post opens an overlay that can be abandoned' ($ovRe -ne [IntPtr]::Zero)
+Check 'the first post arms its own timeout' `
+    (Wait-LogCount 'snip-arm-timeout' ($armBase + 1)) `
+    ("base=$armBase now=$(Count-Log 'snip-arm-timeout')")
+[void][FF]::PostMessage($h2, 0x8006, [IntPtr]1, [IntPtr]::Zero)     # re-press while in flight
 Check 'the log says the re-press abandoned the in-flight snip' (Wait-Log 'snip-repress')
+# Wait for the *replacement* overlay to arm before counting. The product writes 'snip-repress'
+# first and builds the new window after, so reading the count right after that log line races
+# the build -- which is how the first version of this block lost the two legs below.
 Check 'the re-pressed annotate hotkey brings the overlay back' `
-    ((@(Get-SnipLog | Where-Object { $_ -match 'snip-arm-timeout' }).Count) -gt $armedBefore)
+    (Wait-LogCount 'snip-arm-timeout' ($armBase + 2)) `
+    ("now=$(Count-Log 'snip-arm-timeout') want>=$($armBase + 2)")
 Check 'the overlay after the re-press belongs to this process' `
     ([FF]::ByClass([uint32]$p2.Id, 'FocusFlowSnipOverlay') -ne [IntPtr]::Zero)
+# The other half of the same ruling, which the header comment promised and no leg checked:
+# the quick key pressed into a live annotate overlay must leave it alone. Without this, the
+# "do not interrupt" branch has no witness -- from the log both answers look like "a snip is up".
+$armedBusy = Count-Log 'snip-arm-timeout'
+[void][FF]::PostMessage($h2, 0x8006, [IntPtr]::Zero, [IntPtr]::Zero)  # WM_SNIP_START (quick)
+Start-Sleep -Milliseconds 1200
+$busyLines = Count-Log 'snip-busy'
+$armedAfterBusy = Count-Log 'snip-arm-timeout'
+Check 'the quick key says busy instead of restarting the annotate overlay' `
+    ($busyLines -gt 0 -and $armedAfterBusy -eq $armedBusy -and `
+     [FF]::ByClass([uint32]$p2.Id, 'FocusFlowSnipOverlay') -ne [IntPtr]::Zero) `
+    ("busy=$busyLines arm $armedBusy -> $armedAfterBusy")
 Stop-Round $h2 $p2
 
 # ---------- round 2b: Backspace must undo the mark ----------
@@ -379,9 +427,9 @@ $h3c = Wait-Window $p3c.Id
 $ov3c = Wait-Window $p3c.Id 'FocusFlowSnipOverlay' 6000
 Check 'the resize round opens the overlay' ($ov3c -ne [IntPtr]::Zero)
 Drag-Screen 300 260 600 440
-$bSave3 = Get-BarBtn 'save'
-Check 'the resize round found the toolbar' ($bSave3 -ne $null)
-if ($bSave3) {
+$bBefore3 = Get-BarBtn 'save'
+Check 'the resize round found the toolbar' ($bBefore3 -ne $null)
+if ($bBefore3) {
     # bottom-right handle of the 300,260 - 600,440 selection = (600,440) in client coords;
     # drag it +40/+40, then press the toolbar's own commit button.
     Post-Mouse $ov3c $FF_MOVE 600 440
@@ -391,6 +439,12 @@ if ($bSave3) {
     Start-Sleep -Milliseconds 100
     Post-Mouse $ov3c $FF_UP 640 480
     Start-Sleep -Milliseconds 250
+    # Re-aim at the geometry the overlay published *after* the resize: the bar moves with the
+    # selection (it sits under it), so the pre-drag rect is no longer where the button is.
+    $bSave3 = Get-BarBtn 'save'
+    Check 'the toolbar moved with the resized selection' `
+        ($bSave3 -and ($bSave3.Y -ne $bBefore3.Y -or $bSave3.X -ne $bBefore3.X)) `
+        ("before=$($bBefore3.X),$($bBefore3.Y) after=$($bSave3.X),$($bSave3.Y)")
     Click-BarBtn $ov3c $bSave3
     $ok3b = Wait-Png $before3b 8000
     Check 'the resized selection saved a PNG' $ok3b "png $before3b -> $(Count-Png)"
@@ -405,7 +459,14 @@ if ($bSave3) {
 }
 # Esc on a fresh overlay gives up without writing anything (the annotate stage's own Esc is
 # covered by the undo round's outcome shape).
-[void][FF]::PostMessage($h3c, 0x8006, [IntPtr]::Zero, [IntPtr]::Zero)
+#
+# This one must open in the ANNOTATE mode on purpose: on the quick key, a mouse-up after a
+# >=4px drag commits by design, so "nothing was saved" would be describing the wrong gesture.
+# The leg used to post the quick key and still passed -- only because the round before it had
+# failed to commit, leaving a live annotate overlay, so this post was answered 'snip-busy' and
+# the drag drew into a leftover window. That is a green the harness got from another round's
+# wreckage, not from the product.
+[void][FF]::PostMessage($h3c, 0x8006, [IntPtr]1, [IntPtr]::Zero)    # WM_SNIP_START (annotate)
 $ov3d = Wait-Window $p3c.Id 'FocusFlowSnipOverlay' 4000
 if ($ov3d -ne [IntPtr]::Zero) {
     $pngBeforeEsc = Count-Png
@@ -415,6 +476,11 @@ if ($ov3d -ne [IntPtr]::Zero) {
     Check 'Esc after the selection saved nothing' ((Count-Png) -eq $pngBeforeEsc) "png=$(Count-Png)"
     Check 'Esc closed the overlay' `
         ([FF]::ByClass([uint32]$p3c.Id, 'FocusFlowSnipOverlay') -eq [IntPtr]::Zero)
+} else {
+    # No overlay means these two gestures never happened -- record that as a failure, not as
+    # two checks that quietly disappeared from the run's total.
+    Check 'Esc after the selection saved nothing' $false 'overlay never opened, gesture not made'
+    Check 'Esc closed the overlay' $false 'overlay never opened, gesture not made'
 }
 Stop-Round $h3c $p3c
 $fx.Close()

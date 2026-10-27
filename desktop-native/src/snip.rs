@@ -211,6 +211,13 @@ pub struct SnipState {
     base_h: i32,
     /// 选区（覆盖层客户区坐标，与 base 的像素 1:1）。
     sel: (i32, i32, i32, i32),
+    /// 上一次把工具条落点亮进日志时的那份选区（`None` = 这一场还没亮过）。
+    ///
+    /// 工具条贴在选区下面，选区一改它的落点就跟着改。日志是验收脚本唯一的瞄准依据
+    /// （脚本注释写着"不自己抄一遍排版"），所以几何必须跟着选区一起更新：
+    /// 原来只在选区确认那一次打，拖过角、按过方向键之后屏上的按钮已经换了地方，
+    /// 而日志里还是旧的那一份 —— 按旧落点提交点到选区里，症状长得像"改完尺寸出不了图"。
+    geom_sel: Option<(i32, i32, i32, i32)>,
     /// 正在拖：拖法 + 起点；`cur` 是当前点，`pen_pts` 是画笔已走过的点（选区本地坐标）。
     drag: Option<(Drag, i32, i32)>,
     cur: (i32, i32),
@@ -262,6 +269,7 @@ const fn default_state() -> SnipState {
         base_w: 0,
         base_h: 0,
         sel: (0, 0, 0, 0),
+        geom_sel: None,
         drag: None,
         cur: (0, 0),
         pen_pts: Vec::new(),
@@ -1158,6 +1166,27 @@ unsafe fn draw_bar(hdc: HDC, sel: (i32, i32, i32, i32), screen_w: i32, screen_h:
             .map(|s| (s.tool, s.color, s.width, s.font))
             .unwrap_or((0, PALETTE[0].0, WIDTHS[0].0, FONTS[1].0));
         let (btns, bar) = bar_rects(sel, screen_w, screen_h);
+        // 选区一改，工具条就跟着换地方。日志里那份几何是验收脚本唯一的瞄准依据，
+        // 所以改过之后要重新亮一次；只在真的变了时打，每帧都打会把日志刷满。
+        let republish = SNIP
+            .lock()
+            .map(|mut s| {
+                if s.geom_sel == Some(sel) {
+                    false
+                } else {
+                    s.geom_sel = Some(sel);
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if republish {
+            for b in &btns {
+                tracing_note(&format!(
+                    "snip-btn {} {} {} {} {}",
+                    b.id, b.x, b.y, b.w, b.h
+                ));
+            }
+        }
         let bg = CreateSolidBrush(COLORREF(BAR_BG));
         let old = SelectObject(hdc, bg.into());
         let _ = Rectangle(hdc, bar.0, bar.1, bar.0 + bar.2, bar.1 + bar.3);
@@ -2057,7 +2086,8 @@ unsafe fn finish_selection(hwnd: HWND, annotate: bool) {
         s.selected = None;
     }
     // 把工具条每颗按钮的落点亮进日志：验收脚本据此点按钮，而不是自己抄一遍排版。
-    if let Ok(s) = SNIP.lock() {
+    // 这一句只覆盖"刚进标注"那一刻；之后选区每改一次，`draw_bar` 再补一份新的落点。
+    if let Ok(mut s) = SNIP.lock() {
         let (btns, bar) = bar_rects(s.sel, s.base_w, s.base_h);
         tracing_note(&format!(
             "截图 snip-annotate 进标注：选区 {}x{} 工具条 {}x{} at {},{}",
@@ -2074,6 +2104,7 @@ unsafe fn finish_selection(hwnd: HWND, annotate: bool) {
                 b.id, b.x, b.y, b.w, b.h
             ));
         }
+        s.geom_sel = Some(s.sel);
     }
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
@@ -2784,6 +2815,7 @@ pub fn start(owner: HWND, annotate: bool) {
                     s.base_w = vw;
                     s.base_h = vh;
                     s.sel = (0, 0, 0, 0);
+                    s.geom_sel = None;
                     s.drag = None;
                     s.cur = (0, 0);
                     s.pen_pts.clear();
