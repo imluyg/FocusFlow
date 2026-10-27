@@ -77,6 +77,34 @@ Start-Sleep -Milliseconds 900
 $r = Get-Rect $pill
 Check 'off-screen position is clamped to 20 px visible' ($r.X -eq 1900) "$($r.X),$($r.Y)"
 
+# A position that puts the WHOLE card inside the docked-bar band must be lifted out at startup.
+# Reported live 2026-10-27: 1920x1080 with a 48 px bottom taskbar (work bottom 1032) and
+# pos_y = 1033, so the card sat entirely behind the taskbar -- the bar is topmost too and higher,
+# and "at least 20 px visible" measured against the FULL screen cannot save that case.
+# The ruler here is therefore the WORK AREA, and its bottom edge is read from the system rather
+# than typed in (hard rule: measure the geometry a leg depends on, don't hardcode it).
+Add-Type -AssemblyName System.Windows.Forms
+$work = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+$bnd = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+Stop-App
+Set-ConfigLine $app 'floating' 'pos_x' '82'
+Set-ConfigLine $app 'floating' 'pos_y' ($work.Bottom + 1)
+$p = Start-App $Exe $app $WorkDir
+$h = Wait-Window $p.Id
+$pill = Wait-Window $p.Id 'FocusFlowFloatingPill' 8000
+Start-Sleep -Milliseconds 900
+$rt = Get-Rect $pill
+Check 'a card saved inside the taskbar band is lifted above it' ($rt.Y + $rt.H -le $work.Bottom) `
+    "bottom=$($rt.Y + $rt.H) work_bottom=$($work.Bottom) screen_bottom=$($bnd.Bottom)"
+# Put the pill back where the rest of this suite expects it.
+Stop-App
+Set-ConfigLine $app 'floating' 'pos_x' '1300'
+Set-ConfigLine $app 'floating' 'pos_y' '300'
+$p = Start-App $Exe $app $WorkDir
+$h = Wait-Window $p.Id
+$pill = Wait-Window $p.Id 'FocusFlowFloatingPill' 8000
+Start-Sleep -Milliseconds 900
+
 # Double-click on the card must bring the main window back after it was hidden to tray.
 [void][FF]::PostMessage($h, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)   # WM_CLOSE -> hide
 Start-Sleep -Milliseconds 600

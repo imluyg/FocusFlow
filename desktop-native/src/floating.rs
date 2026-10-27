@@ -790,7 +790,12 @@ unsafe fn get_rect(hwnd: HWND) -> Option<RECT> {
     unsafe { wm::GetWindowRect(hwnd, &mut rc).is_ok() }.then_some(rc)
 }
 
-/// 一块屏幕的整块矩形（不是工作区：判据用整屏，理由在 `clamp_into_screen` 上）。
+/// 一块屏幕的**工作区**矩形（`MONITORINFO.rcWork` = 整屏扣掉任务栏/停靠条那一条），物理像素。
+///
+/// 为什么是工作区而不是整屏：落点判据要问的是"这块区域能不能被看见"。悬浮窗虽然 topmost，
+/// 但任务栏同为 topmost 且层级更高 —— 卡片整条落进任务栏那 48 像素里时屏幕上一点都看不见
+/// （2026-10-27 现场报的：`pos_y = 1033`、屏 1080、工作区底边 1032）。
+/// 没有停靠条的那块屏 `rcWork == rcMonitor`，所以这次改口径对多屏的其它屏是**行为不变**。
 #[derive(Clone, Copy)]
 struct Mon {
     x: i32,
@@ -809,15 +814,19 @@ unsafe fn monitor_at(px_x: i32, px_y: i32, flags: g::MONITOR_FROM_FLAGS) -> Opti
             return None;
         }
         Some(Mon {
-            x: mi.rcMonitor.left,
-            y: mi.rcMonitor.top,
-            w: (mi.rcMonitor.right - mi.rcMonitor.left).max(1),
-            h: (mi.rcMonitor.bottom - mi.rcMonitor.top).max(1),
+            x: mi.rcWork.left,
+            y: mi.rcWork.top,
+            w: (mi.rcWork.right - mi.rcWork.left).max(1),
+            h: (mi.rcWork.bottom - mi.rcWork.top).max(1),
         })
     }
 }
 
-/// 离这个物理坐标最近的那块屏；拿不到就退回主屏尺寸。
+/// 离这个物理坐标最近的那块屏的工作区；拿不到就退回主屏尺寸。
+///
+/// 退回那条拿不到 `rcWork`（只有 `SM_CXSCREEN`/`SM_CYSCREEN`，是整屏），所以那一刻可能少扣一条
+/// 任务栏。这条路只在 `MonitorFromPoint` 失败时走 —— 真到的话宁可先按整屏摆出来，
+/// 别让卡片干脆不显示；下一拍或下次启动就会用回工作区矩形。
 fn nearest_monitor(px_x: i32, px_y: i32) -> Mon {
     unsafe { monitor_at(px_x, px_y, g::MONITOR_DEFAULTTONEAREST) }.unwrap_or_else(|| unsafe {
         Mon {

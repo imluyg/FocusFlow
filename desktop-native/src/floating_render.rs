@@ -314,13 +314,18 @@ pub struct Bounds {
 /// 要防的是那一件事：换显示器/拔副屏之后坐标落在屏幕之外，窗口照样显示
 /// —— 表现是"设置里开着悬浮窗却看不见"，而卡片看不见就拖不到。
 ///
-/// 判据不能用**工作区**：悬浮窗是 top-most 工具窗，压在任务栏上照样看得见；
-/// 拿工作区夹会把人故意放在屏幕底边的位置每次启动往上拽一截（旧版实测过）。
+/// 上/左/右三条边按"露出 `FLOATING_MIN_VISIBLE` 像素就算看得见"，那是**抢救**用的下限。
+/// 底边不一样：**整张卡片都不许落进取进来的矩形之外**（`max_y = top + screen_h - win_h`）。
+/// 2026-10-27 现场报的：任务栏占底部 48 像素、卡片高也 48，`pos_y = 1033` 落在任务栏带里，
+/// 而任务栏同为 topmost 且层级更高 ⇒ 整张被盖住，屏幕上一点都看不见。按"露出 20 像素"夹
+/// 只把它抬到 1012（还是只露一条边），所以这一格必须按卡片高度算。
+/// 传进来的矩形因此是**工作区**（`MONITORINFO.rcWork`）而不是整屏 ——
+/// 没有任务栏/侧边栏那块屏，两者本来就相等，行为不变。
 pub fn clamp_into_screen(x: f64, y: f64, b: &Bounds) -> (f64, f64) {
     let min_x = b.left - b.win_w + FLOATING_MIN_VISIBLE;
     let max_x = b.left + b.screen_w - FLOATING_MIN_VISIBLE;
     let min_y = b.top - b.win_h + FLOATING_MIN_VISIBLE;
-    let max_y = b.top + b.screen_h - FLOATING_MIN_VISIBLE;
+    let max_y = b.top + b.screen_h - b.win_h;
     // max 可能小于 min（屏幕比卡片还小）→ 夹成单点而不是 panic
     (
         x.clamp(min_x, max_x.max(min_x)),
@@ -658,6 +663,32 @@ mod tests {
         assert_eq!(
             clamp_into_screen(-1900.0, 100.0, &screen(-1920, 0, 1920, 1080)),
             (-1900.0, 100.0)
+        );
+    }
+
+    /// 底边那一格要跟另外三条边不一样： handed-in 矩形是**工作区**时，卡片不许整条压到任务栏带里。
+    /// 任务是 2026-10-27 现场报的：1920x1080、任务栏占底部 48（工作区底边 1032），
+    /// 卡片高 48、`pos_y = 1033` ⇒ 整条落在 1033..1081，而任务栏同为 topmost 且层级更高 ⇒
+    /// 屏幕上什么都看不见，"露出 20 像素"那套算的是整屏，救不了这种情况。
+    /// 上/左/右三条边仍按"露出 20 像素就算看得见"——那里的 20 像素是**真在屏幕里**的。
+    #[test]
+    fn a_card_fully_inside_the_taskbar_band_is_lifted_out() {
+        // 工作区矩形（底边 1032），卡片 90x46。
+        let work = screen(0, 0, 1920, 1032);
+        assert_eq!(
+            clamp_into_screen(82.0, 1033.0, &work),
+            (82.0, 986.0),
+            "整条在任务栏带里 ⇒ 底边贴到工作区下沿（1032-46），只动 y 这一个轴"
+        );
+        assert_eq!(
+            clamp_into_screen(82.0, 986.0, &work),
+            (82.0, 986.0),
+            "正好贴在工作区下沿是合法落点，不许再动"
+        );
+        assert_eq!(
+            clamp_into_screen(82.0, 1000.0, &work),
+            (82.0, 986.0),
+            "半条压在任务栏上同样抬出来：卡片要么整条可见，要么按上/左/右那套露 20 像素"
         );
     }
 }
