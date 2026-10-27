@@ -1011,37 +1011,51 @@ unsafe fn draw_bar(hdc: HDC, sel: (i32, i32, i32, i32), screen_w: i32, screen_h:
 
 // ===== 出图 =====
 
-/// 一次出图：从冻结缓冲裁出选区 → 烤标注 → 落盘 + 进剪贴板（CF_DIB 与 `PNG` 两份）。
-/// `pin` = 顺手把这一张钉在桌面上（不再多落一个文件）。
-fn commit(pin: bool) {
-    let (base, base_w, origin, sel, marks) = match SNIP.lock() {
-        Ok(s) => (s.base.clone(), s.base_w, s.origin, s.sel, s.marks.clone()),
-        Err(_) => return,
+/// 把当前会话的选区与标注合成出最终像素（屏上预览与出图共用这一条合成路）。
+/// 返回烤好的 BGRA（自上而下）与宽高；没有有效选区、或选区越出冻结画面都回 `None`。
+///
+/// 单独成一段是为了"所见即所得"能被机器判：屏上探针拿这一刻的像素写进**临时目录**再解回来对，
+/// 不必碰真实的 `data/screenshots`，也不必覆盖用户的剪贴板（那两条只能在独立进程里跑）。
+fn baked_selection() -> Option<(Vec<u8>, i32, i32)> {
+    let (base, base_w, sel, marks) = match SNIP.lock() {
+        Ok(s) => (s.base.clone(), s.base_w, s.sel, s.marks.clone()),
+        Err(_) => return None,
     };
     let (l, t, r, b) = sel;
     let (w, h) = (r - l, b - t);
     if w < MIN_SEL || h < MIN_SEL || base.is_empty() {
         tracing_note("截图取消：没有有效选区");
-        return;
+        return None;
     }
-    let Some(img) = crop_rect(&base, base_w, l, t, w, h) else {
-        tracing_note("截图失败：选区越出冻结画面");
-        return;
-    };
-    let buf = render_marks(&img, w, h, &marks);
-    let mut rgba = buf.clone();
-    focusflow_core::capture::bgra_to_rgba(&mut rgba);
-    let png = match focusflow_core::capture::encode_png(&rgba, w as u32, h as u32) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing_note(&format!("截图编码失败：{e}"));
-            return;
+    match crop_rect(&base, base_w, l, t, w, h) {
+        Some(img) => Some((render_marks(&img, w, h, &marks), w, h)),
+        None => {
+            tracing_note("截图失败：选区越出冻结画面");
+            None
         }
-    };
+    }
+}
 
-    let dir = focusflow_core::paths::screenshots_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let listing: Vec<String> = std::fs::read_dir(&dir)
+/// BGRA → PNG 字节（走 core 那一份：alpha 钉成 255，否则写出来是一张全透明的图）。
+fn png_bytes(buf: &[u8], w: i32, h: i32) -> std::result::Result<Vec<u8>, String> {
+    let mut rgba = buf.to_vec();
+    focusflow_core::capture::bgra_to_rgba(&mut rgba);
+    focusflow_core::capture::encode_png(&rgba, w as u32, h as u32)
+}
+
+/// 把已编好的 PNG 落进 `dir`，返回写出去的路径。
+///
+/// 目录由调用方给：产品用 `screenshots_dir()`，屏上探针用临时目录。
+/// 文件名带宽高（`snip_<时间戳>_<宽>x<高>.png`），同秒连按靠 `_2` 区分 ——
+/// 只到秒的旧命名会让两张同名互相覆盖，连按两次只剩一张。
+fn write_png_named(
+    dir: &std::path::Path,
+    png: &[u8],
+    w: i32,
+    h: i32,
+) -> std::result::Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("建目录失败：{e}"))?;
+    let listing: Vec<String> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
                 .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
@@ -1051,8 +1065,31 @@ fn commit(pin: bool) {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
     let name = out_name(&ts, w as u32, h as u32, &listing);
     let path = dir.join(&name);
-    match std::fs::write(&path, &png) {
-        Ok(()) => tracing_note(&format!("截图已保存：{} ({w}x{h})", path.display())),
+    std::fs::write(&path, png).map_err(|e| format!("写盘失败：{e}"))?;
+    Ok(path)
+}
+
+/// 一次出图：合成 → 落盘 → 进剪贴板（CF_DIB 与 `PNG` 两份，编码只做一次）。
+/// `pin` = 顺手把这一张钉在桌面上（不再多落一个文件）。
+fn commit(pin: bool) {
+    let (origin, sel) = SNIP
+        .lock()
+        .map(|s| (s.origin, s.sel))
+        .unwrap_or(((0, 0), (0, 0, 0, 0)));
+    let Some((buf, w, h)) = baked_selection() else {
+        return;
+    };
+    let png = match png_bytes(&buf, w, h) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing_note(&format!("截图编码失败：{e}"));
+            return;
+        }
+    };
+
+    let dir = focusflow_core::paths::screenshots_dir();
+    match write_png_named(&dir, &png, w, h) {
+        Ok(path) => tracing_note(&format!("截图已保存：{} ({w}x{h})", path.display())),
         Err(e) => tracing_note(&format!("截图写盘失败：{e}")),
     }
     match focusflow_core::capture::win::write_image_to_clipboard(&buf, w as u32, h as u32, &png) {
@@ -1060,7 +1097,7 @@ fn commit(pin: bool) {
         Err(e) => tracing_note(&format!("截图进剪贴板失败：{e}")),
     }
     if pin {
-        open_pin(buf, w, h, origin.0 + l, origin.1 + t);
+        open_pin(buf, w, h, origin.0 + sel.0, origin.1 + sel.1);
     }
 }
 
@@ -2286,6 +2323,52 @@ mod render_probe {
         [shot[i], shot[i + 1], shot[i + 2]]
     }
 
+    /// 点工具条上的一颗：落点仍由产品自己算（`bar_rects`），测试不抄第二把尺子。
+    unsafe fn click_bar(ov: HWND, id: &str) {
+        let (btns, _) = SNIP
+            .lock()
+            .map(|s| bar_rects(s.sel, s.base_w, s.base_h))
+            .ok()
+            .unwrap_or_default();
+        let b = btns.iter().find(|x| x.id == id).expect("工具条缺按钮");
+        post_mouse(ov, WM_MOUSEMOVE, b.x + b.w / 2, b.y + b.h / 2);
+        post_mouse(ov, WM_LBUTTONDOWN, b.x + b.w / 2, b.y + b.h / 2);
+        post_mouse(ov, WM_LBUTTONUP, b.x + b.w / 2, b.y + b.h / 2);
+    }
+
+    /// 逐像素唯一的合成画面（BGRA）。随便往哪个方向错开一格，颜色就对不上。
+    fn synth(w: i32, h: i32) -> Vec<u8> {
+        let mut v = vec![0u8; (w.max(0) * h.max(0)) as usize * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y as usize) * w as usize + x as usize) * 4;
+                v[i] = ((x as u32 * 3 + y as u32 * 5) % 251) as u8;
+                v[i + 1] = ((x as u32 * 7 + y as u32) % 249) as u8;
+                v[i + 2] = ((x as u32 + y as u32 * 11) % 253) as u8;
+                v[i + 3] = 255;
+            }
+        }
+        v
+    }
+
+    fn pixel3(buf: &[u8], stride: i32, x: i32, y: i32) -> [u8; 3] {
+        let i = ((y as usize) * stride as usize + x as usize) * 4;
+        [buf[i], buf[i + 1], buf[i + 2]]
+    }
+
+    /// 合成结果里 (x,y)（选区局部坐标）是否还等于冻结缓冲的同一点。
+    fn same_as_base(
+        baked: &[u8],
+        stride: i32,
+        base: &[u8],
+        base_w: i32,
+        sel: (i32, i32, i32, i32),
+        x: i32,
+        y: i32,
+    ) -> bool {
+        pixel3(baked, stride, x, y) == pixel3(base, base_w, sel.0 + x, sel.1 + y)
+    }
+
     /// 覆盖层**真的画出来了**吗：选区里的像素要等于手里那份冻结图，选区外要等于压暗的那份，
     /// 八个手柄与选区边框、工具条底色都要在它们该在的位置上。
     ///
@@ -2302,19 +2385,27 @@ mod render_probe {
             let owner = HWND(std::ptr::null_mut());
             start(owner, true);
             pump(400);
-            let (ov, base, dim, base_w) = SNIP
+            let ov = SNIP
                 .lock()
-                .map(|s| {
-                    (
-                        HWND(s.overlay as *mut core::ffi::c_void),
-                        s.base.clone(),
-                        s.dim.clone(),
-                        s.base_w,
-                    )
-                })
+                .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
                 .expect("SNIP 取不到");
             assert_ne!(ov.0, std::ptr::null_mut(), "覆盖层没建出来");
-            assert!(!base.is_empty(), "冻结缓冲是空的：start 就没抓到屏");
+            let (base_w, base_h) = SNIP.lock().map(|s| (s.base_w, s.base_h)).unwrap();
+            assert!(
+                base_w > 700 && base_h > 520,
+                "这块屏容不下这条判据：{base_w}x{base_h}"
+            );
+            // 拿真实桌面当对照会被"纯色区域"喂成假绿：那种地方像素本来就处处相同，
+            // 裁错 8 格也照样相等（实测把 crop 整体偏移 +8,+1 时这条探针没反应）。
+            // 所以先把冻结缓冲换成**逐像素唯一**的合成图案，任何偏移都会改变判据。
+            let base = synth(base_w, base_h);
+            let dim = dim_bgra(&base);
+            if let Ok(mut s) = SNIP.lock() {
+                s.base = base.clone();
+                s.dim = dim.clone();
+            }
+            let _ = InvalidateRect(Some(ov), None, false);
+            pump(200);
 
             // 拖一个选区（客户区坐标 = 虚拟屏坐标 - 虚拟屏原点）
             post_mouse(ov, WM_LBUTTONDOWN, 240, 200);
@@ -2453,6 +2544,99 @@ mod render_probe {
                 [base[i], base[i + 1], base[i + 2]],
                 "色块外的像素被改了"
             );
+
+            // 所见即所得的另一半：把这一刻的选区+标注合成、编码、落盘（写进**临时目录**，
+            // 不碰真实 data/screenshots，也不碰用户剪贴板），再把 PNG 解回来对像素。
+            // 这条盯的是"文件里那张 == 屏上那一批像素"：色块那块必须红，块外必须还是原图。
+            let (baked, outw, outh) = baked_selection().expect("没有可出的图");
+            assert_eq!(
+                (outw, outh),
+                (sel.2 - sel.0, sel.3 - sel.1),
+                "出图尺寸不等于选区"
+            );
+            let png = png_bytes(&baked, outw, outh).expect("编码失败");
+            let tmp = std::env::temp_dir().join(format!("ff_snip_probe_{}_1", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            let path = write_png_named(&tmp, &png, outw, outh).expect("写盘失败");
+            let nm = path.file_name().unwrap().to_string_lossy().to_string();
+            assert!(
+                nm.starts_with("snip_") && nm.contains(&format!("{outw}x{outh}")),
+                "文件名要带宽高：{nm}"
+            );
+            let (rgba, dw, dh) = focusflow_core::capture::decode_png_rgba(&png).unwrap();
+            assert_eq!((dw as i32, dh as i32), (outw, outh));
+            let px = |x: i32, y: i32| {
+                let i = ((y as usize) * dw as usize + x as usize) * 4;
+                [rgba[i], rgba[i + 1], rgba[i + 2]]
+            };
+            assert_eq!(px(60, 60), [255, 45, 45], "色块那块没进文件");
+            assert_eq!(px(100, 100), [255, 45, 45], "色块那块没进文件");
+            // 块外（局部 300,200）必须等于冻结缓冲里同一屏幕坐标那一个像素：
+            // 对不上就是"裁的位置不对"或"标注画到别处去了"。
+            let gx = (sel.0 + 300) as usize;
+            let gy = (sel.1 + 200) as usize;
+            let i = (gy * base_w as usize + gx) * 4;
+            assert_eq!(
+                px(300, 200),
+                [base[i + 2], base[i + 1], base[i]],
+                "块外的像素被改了，或裁的坐标算错了一格"
+            );
+            let _ = std::fs::remove_dir_all(&tmp);
+
+            // 八向手柄端到端：拖右下角 +40/+40，出图尺寸必须跟着长。
+            post_mouse(ov, WM_MOUSEMOVE, sel.2, sel.3);
+            post_mouse(ov, WM_LBUTTONDOWN, sel.2, sel.3);
+            pump(150);
+            post_mouse(ov, WM_MOUSEMOVE, sel.2 + 40, sel.3 + 40);
+            post_mouse(ov, WM_LBUTTONUP, sel.2 + 40, sel.3 + 40);
+            pump(300);
+            let (grown, gw, gh) = baked_selection().expect("改完大小就没有图了");
+            assert_eq!(
+                (gw, gh),
+                ((sel.2 - sel.0) + 40, (sel.3 - sel.1) + 40),
+                "手柄没把选区改大：出图还是旧尺寸"
+            );
+            let _ = grown;
+
+            // 马赛克：格内处处相等，且那个值等于**测试自己**从冻结缓冲按格算出的平均
+            // （不复用产品的 mosaic_block，否则是自我循环论证）。
+            click_bar(ov, "mosaic");
+            post_mouse(ov, WM_LBUTTONDOWN, sel.0 + 150, sel.1 + 30);
+            post_mouse(ov, WM_MOUSEMOVE, sel.0 + 250, sel.1 + 110);
+            post_mouse(ov, WM_LBUTTONUP, sel.0 + 250, sel.1 + 110);
+            pump(250);
+            let (mos, mw, _) = baked_selection().expect("打了马赛克就没图了");
+            let first = pixel3(&mos, mw, 150, 30);
+            for (x, y) in [(159, 30), (150, 39), (159, 39)] {
+                assert_eq!(pixel3(&mos, mw, x, y), first, "格子 ({x},{y}) 与格头不一致");
+            }
+            let mut acc = [0u64; 3];
+            for dy in 0..MOSAIC_CELL {
+                for dx in 0..MOSAIC_CELL {
+                    let j = (((sel.1 + 30 + dy) as usize) * base_w as usize
+                        + (sel.0 + 150 + dx) as usize)
+                        * 4;
+                    for k in 0..3 {
+                        acc[k] += base[j + k] as u64;
+                    }
+                }
+            }
+            let n = (MOSAIC_CELL * MOSAIC_CELL) as u64;
+            let want = [(acc[0] / n) as u8, (acc[1] / n) as u8, (acc[2] / n) as u8];
+            assert_eq!(first, want, "马赛克取的不是那块原图的平均");
+
+            // 撤销 / 重做也在合成结果的像素上判（不落盘、不碰剪贴板）
+            click_bar(ov, "undo");
+            pump(200);
+            let (und, uw, _) = baked_selection().expect("撤销后没图了");
+            assert!(
+                same_as_base(&und, uw, &base, base_w, sel, 150, 30),
+                "撤销没把那一笔拿掉"
+            );
+            click_bar(ov, "redo");
+            pump(200);
+            let (red, rw, _) = baked_selection().expect("重做后没图了");
+            assert_eq!(pixel3(&red, rw, 150, 30), want, "重做没把那一笔放回来");
 
             let _ = DestroyWindow(ov);
             pump(200);
