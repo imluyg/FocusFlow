@@ -8,15 +8,26 @@
   so nothing depends on ledger data existing and nothing touches real data.
 
   The app hook FOCUSFLOW_PLUGIN_SEL="<plugin>|<row id|first>|<sel button id>" calls the very
-  same two methods a real click calls (select_plugin_row / press_sel_button). Row pixel
-  coordinates move with the plugin layout and the scroll offset, so the harness selects by
-  id; the click geometry itself stays an eye-check (docs/handoff-20261027-parity.md).
+  same two methods a real click calls (select_plugin_row / press_sel_button). Table-row pixel
+  coordinates move with the plugin layout and the scroll offset, so the harness selects a row
+  by id and that one gesture stays an eye-check; plain buttons and the pager row, which stack
+  from a known top, ARE clicked at real pixel coordinates below.
 
   Asserts on ASCII fragments in the app log:
     "sel-row group="fgroup" id="r1""  -- the selection happened with the fixture's own
                                          group name and record id
     "f_pick = "                        -- onselect wrote the declared plugin field
     "/ touch_r1"                       -- the sel button composed <button id><record id>
+    "/ pg_probe" and "/ pg_after"      -- a real pixel click reached the opened view
+
+  It also opens the fixture view with real pixel clicks and reads the pager bar back:
+  Widget::Pager currently renders as one inert label row (the renderer drops the
+  declared prev/next ids), so clicking across that row must fire nothing. That readout
+  is a BASELINE for the day the Pager gets its buttons -- it is supposed to fail then,
+  and to be rewritten to assert the new shape. Three controls stand in front of it
+  (the window client size the hardcoded rows assume, and the two plain buttons directly
+  above and below the pager row): with any of them red the readout reports NOT MEASURED
+  instead of passing for the wrong reason.
   ASCII-only, like every file in this folder.
 
 .EXAMPLE
@@ -53,6 +64,12 @@ function get_view()
     return {
         title = "sel fixture",
         widgets = {
+            -- Rows 1-3 are the pager readout below; keep their order (the click rows
+            -- are laid out top-down: plain button, pager, plain button).
+            { type = "button", id = "pg_probe", text = "probe" },
+            { type = "pager", page = 1, pages = 3, total = 12,
+              prev = "pg_prev", next = "pg_next" },
+            { type = "button", id = "pg_after", text = "after" },
             { type = "heading", text = "rows" },
             {
                 type = "table",
@@ -107,8 +124,46 @@ Check 'the record id came from the Lua table' (@($log | Where-Object { $_ -match
 Check 'the group name came from the Lua table' (@($log | Where-Object { $_ -match 'sel-row group="fgroup"' }).Count -gt 0)
 Check 'onselect wrote the declared plugin field' (@($log | Where-Object { $_ -match 'f_pick = ' }).Count -gt 0)
 Check 'the sel button composed <button id><record id>' (@($log | Where-Object { $_ -like '*/ touch_r1*' }).Count -gt 0)
-Check 'nothing was skipped for want of a selection' (-not (@($log | Where-Object { $_ -match 'sel-skip' }))) ''
-Check 'no error lines in the app log' (-not (@($log) -match "(?i)error|$(Get-FailWord)")) ''
+
+# ---- pager readout -------------------------------------------------------
+# Today Widget::Pager becomes ONE inert POp::Label: the renderer never reads the
+# pager's prev/next ids (desktop-native/src/main.rs:5937-5947), so the bar shows
+# "page x / y" and nothing in that row can be clicked. The old WebView bar had two
+# buttons. These three checks pin that shape on purpose: wiring the Pager must turn
+# the row click into a real action and this readout red, then be rewritten to assert
+# the new behaviour. Coordinates are the client rows of the opened fixture view at
+# 100% DPI (content starts at y=260; a plain button row is 38 tall, the label row 22).
+Click-ViewTab $h 4
+[FF]::ClickWindow($h, 200, 270, 1)          # the only plugin row = SelFixture: open its view
+Start-Sleep -Milliseconds 600
+$cl = Get-Client $h
+$sizeOk = ($cl.W -eq 1184 -and $cl.H -eq 821)
+Check 'the click coordinates address the rows they name' ([bool]$sizeOk) ("client=" + $cl.W + "x" + $cl.H)
+[FF]::ClickWindow($h, 90, 275, 1)           # row 1: a plain button, must fire
+$probeLive = Wait-FixLog '/ pg_probe'
+Check 'the opened view takes a pixel click on a button' ([bool]$probeLive) ''
+[FF]::ClickWindow($h, 90, 335, 1)           # row 3: lands right below the pager row
+$afterLive = Wait-FixLog '/ pg_after'
+Check 'the pager row takes one label row of height' ([bool]$afterLive) ''
+foreach ($px in 45, 600, 1150) {            # across the whole pager row band
+    [FF]::ClickWindow($h, $px, 307, 1)
+}
+Start-Sleep -Milliseconds 1200
+$afterPager = @(Get-FixLog)
+$inert = -not (@($afterPager | Where-Object { $_ -match '/ pg_prev|/ pg_next' }))
+# This readout only means something while the three controls above hold: a row where
+# nothing is clickable and a window whose coordinates never landed both read as "no action".
+if (-not ($sizeOk -and $probeLive -and $afterLive)) {
+    $pagerDetail = 'NOT MEASURED: a click control above was red, so nothing reached this view'
+} elseif ($inert) {
+    $pagerDetail = '3 clicks across the row: no action reached the plugin'
+} else {
+    $pagerDetail = 'the pager row fired an action: the Pager has buttons now, rewrite this baseline'
+}
+Check 'the pager row fires no prev/next action yet' ([bool]($sizeOk -and $probeLive -and $afterLive -and $inert)) $pagerDetail
+
+Check 'nothing was skipped for want of a selection' (-not (@($afterPager | Where-Object { $_ -match 'sel-skip' }))) ''
+Check 'no error lines in the app log' (-not (@($afterPager) -match "(?i)error|$(Get-FailWord)")) ''
 
 [void][FF]::PostMessage($h, 0x8009, [IntPtr]::Zero, [IntPtr]::Zero)
 $sw = [Diagnostics.Stopwatch]::StartNew()
