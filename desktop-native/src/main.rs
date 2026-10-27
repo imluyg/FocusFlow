@@ -1746,7 +1746,7 @@ let snap_data = if which >= 3 {
                             "html" => export_html_text(&s),
                             _ => export_json_text(&s),
                         };
-                        match std::fs::write(&path, body) {
+                        match write_user_text(&path, &body) {
                             Ok(()) => format!("已导出：{}", path.display()),
                             Err(e) => format!("导出失败：{e}"),
                         }
@@ -6875,8 +6875,16 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
         Some(dir) => std::fs::create_dir_all(dir).map_err(|e| format!("建报告目录失败：{e}"))?,
         None => return Err("周报路径没有父目录".to_string()),
     }
-    std::fs::write(&file, out).map_err(|e| format!("写周报失败：{e}"))?;
+    write_user_text(&file, &out).map_err(|e| format!("写周报失败：{e}"))?;
     Ok(file)
+}
+
+/// 把一份文本落到**用户挑的路径**上：走 core 那份原子替换（同目录临时文件 + rename），
+/// 所以目标上原来那一份要么整份被换掉、要么原样留着 —— 直接写会先把旧内容截断，
+/// 中途失败（盘满、权限变了）就只剩一个半截文件，而旧的已经没了。
+/// 重写成原生的时候这两条路掉回了直接写，`user_file_write_tests` 把它钉住。
+fn write_user_text(path: &std::path::Path, body: &str) -> std::result::Result<(), String> {
+    focusflow_core::config::atomic_write(path, body).map_err(|e| format!("{e}"))
 }
 
 fn duration_text(secs: i64) -> String {
@@ -8981,6 +8989,65 @@ mod snip_pick_tests {
     fn nothing_is_picked_when_no_candidate_covers_the_point() {
         let list = [cand(7, true, (100, 100, 200, 200))];
         assert_eq!(snip_window_hit(&list, 1, SCREEN, 900, 900), None);
+    }
+}
+
+/// 写「用户挑的路径」那两条路（导出 CSV/HTML/JSON、生成周报）必须走原子替换。
+/// 回归场景正是 `atomic_write` 头上那段说的：目标上已经躺着上一周的报告，直接写会先把
+/// 旧的截断，中途失败就只剩半截文件而旧的也没了 —— 重写成原生时这两处掉回了直接写。
+#[cfg(test)]
+mod user_file_write_tests {
+    use super::write_user_text;
+
+    fn sandbox(name: &str) -> std::path::PathBuf {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("ff_user_write_{name}"));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// 覆盖一份已有的用户文件：写完只剩目标本身，不许留下 `.tmp-*` 那种半成品。
+    #[test]
+    fn overwriting_a_user_file_leaves_no_stray_temp() {
+        let dir = sandbox("clean");
+        let target = dir.join("weekly.md");
+        write_user_text(&target, "上一周的那一份").unwrap();
+        write_user_text(&target, "这一周的新内容").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "这一周的新内容",
+            "覆盖写要交出新的整份内容"
+        );
+        let strays: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "weekly.md")
+            .collect();
+        assert!(strays.is_empty(), "原子替换之后不该再有临时文件: {strays:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 接线腿：这两条路不许哪天又直接落盘。只扫 `#[cfg(test)]` 之前的生产代码，
+    /// 否则这条用例自己的字面量会被它正在查的样式数进去（`listener.rs` 同一手）。
+    #[test]
+    fn the_user_file_paths_go_through_the_atomic_writer() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        let direct = ["std::fs::write", "("].concat();
+        assert!(
+            !prod.contains(direct.as_str()),
+            "main.rs 的生产代码里出现了直接落盘：写用户文件要走 write_user_text"
+        );
+        let wired = ["write_user_text", "("].concat();
+        assert_eq!(
+            prod.matches(wired.as_str()).count(),
+            3,
+            "两处调用（导出、周报）加一处定义，数量变了说明接线动过"
+        );
     }
 }
 
