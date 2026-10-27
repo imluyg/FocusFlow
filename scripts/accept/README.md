@@ -45,7 +45,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 | `accept-plugsel.ps1` | 自带一份 ASCII 小插件（分组表格 + `onselect` + `sel` 按钮）：Lua 里的 ids/group/onselect 真的走到宿主、选中写了声明的那个字段、`sel` 按钮拼出 `<按钮 id><记录 id>` | 10 项 |
 | `accept-snip.ps1` | 用真注入的鼠标拖框跑两条截图收尾：快速版落了 PNG 且没开标注窗 / 标注版开了窗、还没落盘、Esc 关掉且什么都没存 | 10 项 |
 | `accept-report.ps1` | 两轮启动：缺的那份上周周报由启动补上（文件名 `weekly-<上周一>.md`、有内容）/ 第二次启动看见已有文件就不动（时间戳不变） | 10 项 |
-| `accept-pin.ps1` | 两条验收消息开/收贴图（`WM_APP+12` 开 N 张、`WM_APP+13` 全关）：数得到窗口与尺寸、Esc 关单张、全关后归零，**贴图全程不多落一个 PNG** | 10 项（本机还没跑绿，见下） |
+| `accept-pin.ps1` | 两条验收消息开/收贴图（`0x8000+12` 开 N 张、`0x8000+13` 全关）：数得到窗口与尺寸、Esc 关单张、全关后归零，**贴图全程不多落一个 PNG** | 11 项 |
 | `accept-installer.ps1` | 静默装 → 目录/卸载器/快捷方式/注册表/版本号/exe 图标 → 装出来的 exe 默认在采集 → 静默卸 → 全部清干净 | 17 项 |
 
 > **跑之前先看有没有别的原生实例在跑**：`already_running()` 抢的是
@@ -82,7 +82,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 `Click-ViewTab` / `Click-ATab` / `Click-BasicRow` / `Click-PeriodPill`、`Get-InstalledDir`、
 `Invoke-Setup`。
 
-## 四个坑（都踩过）
+## 五个坑（都踩过）
 
 1. **注入的键盘到不了低级键盘钩子**：`keybd_event`（带真实扫描码）与 `SendInput` 都试过，
    采集里一条都收不到；同一批注入的**鼠标**事件正常。所以采集脚本用点击计数，
@@ -95,3 +95,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 4. **窗口出现 ≠ 悬浮窗就绪**：`FocusFlowNativeD2D` 在 `App::new` 之前就建好了，而悬浮窗是
    `App::new` 里才起的线程。所以找 pill 一定用 `Wait-Window ... 6000`，别用一次性的
    `ByClass`（会偶发 FAIL）。
+5. **`WM_APP` 是 `0x8000`，`0x400` 是 `WM_USER`**：`accept-pin.ps1` 头一版按 `0x400+12` 投钩子，
+   消息落进没人认领的号段，产品一声不响 ⇒ 五条红点看着像"贴图功能没做"，实际是量具投错了号。
+   这类红要先问"消息到底有没有人接"，判据写在产品侧就照产品侧那个基数写（其它脚本用的
+   `0x8008` / `0x8009` 是对的）。
