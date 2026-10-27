@@ -2407,6 +2407,38 @@ mod render_probe {
             let _ = InvalidateRect(Some(ov), None, false);
             pump(200);
 
+            // 悬停预览：塞一条"别人进程"的候选进去，鼠标移到它身上就该亮。
+            // 走的是产品自己的 `hover_at`（不是直接把亮区写进状态），所以命中/换算/夹边都被判到。
+            let origin = SNIP.lock().map(|s| s.origin).unwrap();
+            let hot = (300, 250, 700, 450);
+            if let Ok(mut s) = SNIP.lock() {
+                s.hits = vec![Candidate {
+                    pid: 999_999,
+                    visible: true,
+                    rect: (
+                        origin.0 + hot.0,
+                        origin.1 + hot.1,
+                        origin.0 + hot.2,
+                        origin.1 + hot.3,
+                    ),
+                }];
+            }
+            post_mouse(ov, WM_MOUSEMOVE, 500, 350);
+            pump(200);
+            let hov = SNIP.lock().map(|s| s.hover).unwrap();
+            assert_eq!(hov, Some(hot), "悬停没命中那条候选");
+            let shot0 = print_window(ov).expect("悬停态截图没拿到");
+            assert_eq!(
+                pixel3(&shot0.0, shot0.1, 500, 350),
+                pixel3(&base, base_w, 500, 350),
+                "悬停命中的那块没亮"
+            );
+            assert_eq!(
+                pixel3(&shot0.0, shot0.1, 100, 100),
+                pixel3(&dim, base_w, 100, 100),
+                "悬停时选区外也该是压暗的那一份"
+            );
+
             // 拖一个选区（客户区坐标 = 虚拟屏坐标 - 虚拟屏原点）
             post_mouse(ov, WM_LBUTTONDOWN, 240, 200);
             post_mouse(ov, WM_MOUSEMOVE, 640, 460);
@@ -2637,6 +2669,59 @@ mod render_probe {
             pump(200);
             let (red, rw, _) = baked_selection().expect("重做后没图了");
             assert_eq!(pixel3(&red, rw, 150, 30), want, "重做没把那一笔放回来");
+
+            // 文字那一笔也要真进合成：点"文字"、在选区里点一下（开原生 EDIT），把字塞进去
+            // 再投"编辑完成"那条消息 —— 这条判的是文字工具落进了 marks 并被烤出像素。
+            click_bar(ov, "text");
+            post_mouse(ov, WM_LBUTTONDOWN, sel.0 + 200, sel.1 + 150);
+            post_mouse(ov, WM_LBUTTONUP, sel.0 + 200, sel.1 + 150);
+            pump(250);
+            let ed = SNIP.lock().map(|s| s.text_edit).unwrap_or(0);
+            assert_ne!(ed, 0, "文字工具没开出输入框");
+            let edh = HWND(ed as *mut core::ffi::c_void);
+            let txt: Vec<u16> = "测试".encode_utf16().chain(std::iter::once(0)).collect();
+            let _ = SetWindowTextW(edh, PCWSTR(txt.as_ptr()));
+            let _ = PostMessageW(Some(ov), WM_EDIT_DONE, WPARAM(1), LPARAM(0));
+            pump(250);
+            let (tex, tw, _) = baked_selection().expect("打完字就没图了");
+            let mut differs = false;
+            for y in 0..24 {
+                for x in 0..80 {
+                    if !same_as_base(&tex, tw, &base, base_w, sel, 200 + x, 150 + y) {
+                        differs = true;
+                    }
+                }
+            }
+            assert!(differs, "那一行文字没烤进图");
+
+            // 方向键挪选区（旧 Webview 版没有这条）：整块搬 3 像素，尺寸不许变，
+            // 而"局部同一点"必须开始对应另一个屏幕像素 —— 两头一起判才挡得住"没搬"和"搬错"。
+            let before = SNIP.lock().map(|s| s.sel).unwrap();
+            for _ in 0..3 {
+                let _ = PostMessageW(Some(ov), WM_KEYDOWN, WPARAM(0x27), LPARAM(0));
+                // VK_RIGHT
+            }
+            pump(250);
+            let now = SNIP.lock().map(|s| s.sel).unwrap();
+            assert_eq!(
+                now,
+                (before.0 + 3, before.1, before.2 + 3, before.3),
+                "方向键没把选区挪 3 像素"
+            );
+            let (moved, mw2, mh2) = baked_selection().expect("挪完就没图了");
+            assert_eq!(
+                (mw2, mh2),
+                (before.2 - before.0, before.3 - before.1),
+                "搬选区不该改尺寸"
+            );
+            assert!(
+                same_as_base(&moved, mw2, &base, base_w, now, 300, 200),
+                "搬过之后局部同一点该对应新的屏幕像素"
+            );
+            assert!(
+                !same_as_base(&moved, mw2, &base, base_w, before, 300, 200),
+                "还在按旧位置裁就是错的"
+            );
 
             let _ = DestroyWindow(ov);
             pump(200);
