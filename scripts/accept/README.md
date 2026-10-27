@@ -40,20 +40,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 | `accept-theme.ps1` | 深色 16 张 + 浅色 16 张逐视图截图 / 设置页「主题」行当场切换 / 行内 `EDIT` 背景色随主题（取主色，浅色 246,249,255、深色 31,40,59） | 10 项 |
 | `accept-collect.ps1` | 点 5 下 → 今日 +5、速度 >0 / 暂停后不再涨、速度归 0 / 继续再 +5 / 退出 flush + 退出备份 / core 日志「数据库已关闭」 | 14 项 |
 | `accept-plugins.ps1` | 插件视图：`button.modal` 开弹窗、弹窗与正文的 Select 写回、提交/关闭触发插件动作、Esc 关弹窗 | 11 项 |
-| `accept-hotkey.ps1` | 两轮启动：配置里的两条组合按原样注册（日志逐字对）/ 一条写成裸键时程序照样起、日志点名被拒的那条、另一条照样注册 | 9 项 |
+| `accept-hotkey.ps1` | 两轮启动：配置里的三条组合按原样注册（日志逐字对）/ 一条写成裸键时程序照样起、日志点名被拒的那条、没被拒的那条照样注册 | 10 项 |
 | `accept-datadir.ps1` | 两轮启动：`[paths]` 里那条待搬运标记由启动早期兑现（data/ 与 backup/ 真到了新根、旧根清空、标记归空、日志点名新根）/ 新根建不出来时数据原地不动、标记留着下次重试 | 13 项 |
 | `accept-plugsel.ps1` | 自带一份 ASCII 小插件（分组表格 + `onselect` + `sel` 按钮）：Lua 里的 ids/group/onselect 真的走到宿主、选中写了声明的那个字段、`sel` 按钮拼出 `<按钮 id><记录 id>` | 10 项 |
 | `accept-snip.ps1` | 用真注入的鼠标拖框跑两条截图收尾：快速版落了 PNG 且没开标注窗 / 标注版开了窗、还没落盘、Esc 关掉且什么都没存 | 10 项 |
 | `accept-report.ps1` | 两轮启动：缺的那份上周周报由启动补上（文件名 `weekly-<上周一>.md`、有内容）/ 第二次启动看见已有文件就不动（时间戳不变） | 10 项 |
 | `accept-pin.ps1` | 两条验收消息开/收贴图（`WM_APP+12` 开 N 张、`WM_APP+13` 全关）：数得到窗口与尺寸、Esc 关单张、全关后归零，**贴图全程不多落一个 PNG** | 10 项（本机还没跑绿，见下） |
+| `accept-installer.ps1` | 静默装 → 目录/卸载器/快捷方式/注册表/版本号/exe 图标 → 装出来的 exe 默认在采集 → 静默卸 → 全部清干净 | 17 项 |
 
 > **跑之前先看有没有别的原生实例在跑**：`already_running()` 抢的是
 > `Global\FocusFlow.Native.P0` 这个互斥体，抢不到就把已有窗口叫出来自己退出 ——
 > 症状是每个脚本第一条 `main window appears` 就 FAIL、`focusflow.log` 一个字都没有。
-> 查一眼：`powershell -NoProfile -Command "Get-Process -Name FocusFlow | ForEach-Object { $_.Path }"`。
+> 现在这条不再需要人查：窗口等不到时脚本会先打一行
+> `BLOCKER another instance holds the single-instance mutex: pid=… exe=…`，把占着的进程点名。
 > 有就请先关掉那个实例（**别按名字杀**，旧版 WebView 也叫 `FocusFlow.exe`；
 > 用 `Stop-App` 或按路径确认后再停）。
-| `accept-installer.ps1` | 静默装 → 目录/卸载器/快捷方式/注册表/版本号/exe 图标 → 装出来的 exe 默认在采集 → 静默卸 → 全部清干净 | 17 项 |
+>
+> 还有一条同源的坑：新版默认在采集，占着的实例会把脚本注入的点击记进**它自己的库**。
+> 所以 GUI 套件要跑在"这台机器只有一个实例"的前提下 —— 这是产品行为，不是量具的毛病。
 
 `accept-plugins.ps1` 断言的是应用日志里的 **ASCII 片段**（字段名 `d_type`/`f_cat`、动作 id
 `add_modal`/`add_record`/`monthly_detail`/`clear_result`），不 OCR 截图；它把 `plugins/*.lua`

@@ -183,6 +183,7 @@ function New-AppDir([string]$Dest, [string[]]$ConfigAppend = @()) {
 
 function Start-App([string]$Exe, [string]$AppDir, [string]$WorkDir, [hashtable]$Env = @{}) {
     if (-not (Test-Path $Exe)) { throw "exe not found: $Exe" }
+    $script:LastExe = $Exe
     New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
@@ -194,6 +195,20 @@ function Start-App([string]$Exe, [string]$AppDir, [string]$WorkDir, [hashtable]$
     [Diagnostics.Process]::Start($psi)
 }
 
+# When the main window never appears the usual cause is not a crash: another instance of the
+# app (most often the user's own) holds the single-instance mutex, so our process raises the
+# existing window and exits without writing a log line. Name that instance instead of leaving
+# the suite with a silent one-check FAIL.
+# Console output on purpose: Write-Output would land in the caller's $h = Wait-Window result.
+function Get-Blocker([string]$Exe) {
+    if (-not $Exe) { return '' }
+    $full = [IO.Path]::GetFullPath($Exe)
+    $others = @(Get-Process -Name FocusFlow,focusflow-native -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -ne $full) })
+    if ($others.Count -eq 0) { return '' }
+    ($others | ForEach-Object { 'pid=' + $_.Id + ' exe=' + $_.Path }) -join '; '
+}
+
 function Wait-Window([int]$ProcessId, [string]$Class = 'FocusFlowNativeD2D', [int]$TimeoutMs = 15000) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while ($sw.Elapsed.TotalMilliseconds -lt $TimeoutMs) {
@@ -201,6 +216,8 @@ function Wait-Window([int]$ProcessId, [string]$Class = 'FocusFlowNativeD2D', [in
         if ($h -ne [IntPtr]::Zero) { return $h }
         Start-Sleep -Milliseconds 100
     }
+    $b = Get-Blocker $script:LastExe
+    if ($b) { [Console]::Out.WriteLine('BLOCKER another instance holds the single-instance mutex: ' + $b) }
     [IntPtr]::Zero
 }
 
