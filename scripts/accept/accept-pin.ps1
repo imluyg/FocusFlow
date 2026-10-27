@@ -21,6 +21,16 @@
   process (printed as an info line, not asserted -- the number belongs in the handoff doc).
   It also pushes one past the cap and requires the refusal to be said out loud.
 
+  Round 1 drives every way out of a pin that a machine can drive, because the migration left
+  the old list changed: the WebView build closed a pin with the title-bar X, Esc or Alt+F4,
+  and a borderless popup has no X at all -- so the right click is the exit that replaced it,
+  and both halves are checked (the style bits say there is no caption, the injected click says
+  the replacement works). The wheel legs are the "which way does it grow" check: one notch up
+  must be 132x88 for a 120x80 pin, and twenty notches down must stop at a quarter. An injected
+  wheel travels to the foreground window's thread rather than to the window under the cursor,
+  so those legs take the foreground first and refuse to score the gesture when the control
+  says the pin did not get it -- see README pitfall 8.
+
   ASCII-only, like every file in this folder.
 
 .EXAMPLE
@@ -91,14 +101,90 @@ Check 'each pin has a real size' (@($pins | Where-Object { $_ -match '120x80' })
 $log = @(Get-PinLog)
 Check 'the log counts each pin open' (@($log | Where-Object { $_ -match 'pin-open' }).Count -ge 3)
 
+# The trade the migration doc calls out: a pin is a tool window, so it stays out of Alt+Tab
+# (the WebView build put them in it). And because the window is a borderless popup, the old
+# title-bar X is not an exit any more -- the next two checks pin both halves of that choice.
+$somePin = [FF]::ByClass([uint32]$p.Id, 'FocusFlowPin')
+$ex = [FF]::ExStyle($somePin)
+Check 'the pin is a tool window, so Alt+Tab never lists it' `
+    ((($ex -band 0x80) -ne 0) -and (($ex -band 0x20000) -eq 0)) ("exstyle=0x{0:X}" -f $ex)
+$st = [FF]::Style($somePin)
+Check 'the pin has no title bar, so the old X exit is gone on purpose' `
+    ((($st -band 0x00C00000) -eq 0) -and (($st -band 0x80) -eq 0)) ("style=0x{0:X}" -f $st)
+
+# The wheel legs go first, on a pin nothing has disturbed yet. An injected wheel is delivered
+# to the foreground window's thread -- NOT to the window under the cursor, the way a real
+# wheel is (three-arm probe on this box: a fresh pin zooms; the same pin after another window
+# takes the foreground does not; a survivor whose focused sibling closed does). So the pin is
+# put in the foreground on purpose and that precondition is checked before the gesture is
+# credited, otherwise a red would read as "the zoom is broken".
+$wheelPin = [FF]::ByClass([uint32]$p.Id, 'FocusFlowPin')
+[void][FF]::SetForegroundWindow($wheelPin)
+Start-Sleep -Milliseconds 400
+$wheelFg = ([FF]::GetForegroundWindow() -eq $wheelPin)
+Check 'the wheel starts on a pin that holds the foreground' $wheelFg
+if ($wheelFg) {
+    $wr = Get-Rect $wheelPin
+    [FF]::Wheel($wr.X + [int]($wr.W / 2), $wr.Y + [int]($wr.H / 2), 1)
+    Start-Sleep -Milliseconds 600
+    $w1 = Get-Rect $wheelPin
+    # up = bigger is the easiest thing in this file to write backwards: 120x80 -> 132x88.
+    Check 'one notch up grows the pin by ten percent' ($w1.W -eq 132 -and $w1.H -eq 88) "now $($w1.W)x$($w1.H)"
+    # Shrinking keeps pulling the picture away from a fixed pointer (the window grows from
+    # its top-left), and a wheel over the desktop is not a wheel over the pin, so each notch
+    # re-aims at where the centre is now.
+    for ($i = 0; $i -lt 20; $i++) {
+        $wc = Get-Rect $wheelPin
+        [FF]::Wheel($wc.X + [int]($wc.W / 2), $wc.Y + [int]($wc.H / 2), -1)
+        Start-Sleep -Milliseconds 90
+    }
+    Start-Sleep -Milliseconds 600
+    $w2 = Get-Rect $wheelPin
+    Check 'twenty notches down stop at a quarter, never at zero' ($w2.W -eq 30 -and $w2.H -eq 20) "now $($w2.W)x$($w2.H)"
+} else {
+    # A leg that could not run is not a pass: the chord and the wheel would land elsewhere.
+    Check 'one notch up grows the pin by ten percent' $false 'skipped: no pin held the foreground'
+    Check 'twenty notches down stop at a quarter, never at zero' $false 'skipped: no pin held the foreground'
+}
+
 # The rule that matters: opening a pin must not save anything again.
 Check 'pins wrote no extra file' ((Count-Png) -eq $pngBefore) "png $pngBefore -> $(Count-Png)"
 
-# Close one with Esc (the same message the pin window handles).
+# Exit 1: Esc closes this one pin.
 $firstHwnd = [FF]::ByClass([uint32]$p.Id, 'FocusFlowPin')
 [void][FF]::PostMessage($firstHwnd, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)   # WM_KEYDOWN ESC
 Start-Sleep -Milliseconds 800
 Check 'Esc closes a single pin' ((Count-Pins $p.Id).Count -eq 2) "count=$((Count-Pins $p.Id).Count)"
+
+# Exit 2: a real right click on the picture -- this is what replaced the title-bar X, so the
+# gesture itself has to be injected, not the message behind it.
+$topHwnd = [FF]::ByClass([uint32]$p.Id, 'FocusFlowPin')
+$tr = Get-Rect $topHwnd
+[FF]::RightClick($tr.X + [int]($tr.W / 2), $tr.Y + [int]($tr.H / 2))
+Start-Sleep -Milliseconds 900
+Check 'a right click closes a single pin' ((Count-Pins $p.Id).Count -eq 1) "count=$((Count-Pins $p.Id).Count)"
+
+# Exit 3: Alt+F4 as a chord. The foreground control first -- a red here means either the
+# chord does nothing or the keystrokes went somewhere else, and only the control tells them apart.
+$lastPin = [FF]::ByClass([uint32]$p.Id, 'FocusFlowPin')
+[void][FF]::SetForegroundWindow($lastPin)
+Start-Sleep -Milliseconds 400
+$fgOk = ([FF]::GetForegroundWindow() -eq $lastPin)
+Check 'the pin can hold the foreground' $fgOk
+if ($fgOk) {
+    [FF]::PressAltF4()
+    Start-Sleep -Milliseconds 1200
+    Check 'Alt+F4 closes a pin' ((Count-Pins $p.Id).Count -eq 0) "count=$((Count-Pins $p.Id).Count)"
+} else {
+    # Never send the chord blind: whatever really holds the foreground on this desktop is
+    # somebody else's program, and Alt+F4 would close it. Record the leg as red, with the reason.
+    Check 'Alt+F4 closes a pin' $false 'skipped: the pin did not take the foreground'
+}
+
+# Re-open two so the settings-row path closes a known number.
+[void][FF]::PostMessage($h, $WM_PIN_TEST, [IntPtr]::Zero, [IntPtr]2)
+Start-Sleep -Milliseconds 1200
+Check 'the desktop is back to two pins' ((Count-Pins $p.Id).Count -eq 2) "count=$((Count-Pins $p.Id).Count)"
 
 # Close the rest through the same path the settings row uses.
 [void][FF]::PostMessage($h, $WM_PIN_CLOSE_ALL, [IntPtr]::Zero, [IntPtr]::Zero)

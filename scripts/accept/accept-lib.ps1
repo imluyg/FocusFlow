@@ -104,6 +104,50 @@ public class FF {
       System.Threading.Thread.Sleep(120);
     }
   }
+  // A real right click over a point: the pin window's "close this one" gesture.
+  // RIGHTDOWN is 0x0008 and RIGHTUP 0x0010 -- not the left flags plus one.
+  public static void RightClick(int x, int y) {
+    SetCursorPos(x, y);
+    System.Threading.Thread.Sleep(120);
+    mouse_event(0x0008, 0, 0, 0, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(60);
+    mouse_event(0x0010, 0, 0, 0, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(200);
+  }
+  // N real wheel notches over a point, positive = up = zoom in. mouse_data carries the
+  // delta as a signed value, so -120 must reach it as unchecked(uint) or the driver sees
+  // a huge positive turn.
+  public static void Wheel(int x, int y, int notches) {
+    SetCursorPos(x, y);
+    System.Threading.Thread.Sleep(120);
+    uint d = unchecked((uint)(notches > 0 ? 120 : -120));
+    for (int i = 0; i < Math.Abs(notches); i++) {
+      mouse_event(0x0800, 0, 0, d, UIntPtr.Zero);
+      System.Threading.Thread.Sleep(70);
+    }
+    System.Threading.Thread.Sleep(200);
+  }
+  // GWL_EXSTYLE: how a window advertises itself (topmost 0x8, toolwindow 0x80, appwindow 0x20000).
+  public static long ExStyle(IntPtr h) { return GetWindowLongPtr(h, -20).ToInt64(); }
+  // GWL_STYLE: WS_CAPTION 0x00C00000 and WS_SYSMENU 0x80 decide whether a title-bar close
+  // button exists at all -- a WS_POPUP pin has neither, so "click the X" is not an exit here.
+  public static long Style(IntPtr h) { return GetWindowLongPtr(h, -16).ToInt64(); }
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  // The real Alt+F4 chord, for the exit a keyboard gives a borderless window. Written as one
+  // call so the scan codes and the alt flag cannot be half-remembered by the harness.
+  public static void PressAltF4() {
+    byte alt = 0x12, f4 = 0x73;
+    byte altScan = (byte)MapVirtualKeyW(alt, 0);
+    byte f4Scan = (byte)MapVirtualKeyW(f4, 0);
+    keybd_event(alt, altScan, 0, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(30);
+    keybd_event(f4, f4Scan, 0, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(30);
+    keybd_event(f4, f4Scan, 2, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(30);
+    keybd_event(alt, altScan, 2, UIntPtr.Zero);
+  }
   // Letters with real scan codes: rdev maps by VK but a zero scan code still shows up
   // as Unknown on other paths, so set both.
   public static void Letters(string letters) {
