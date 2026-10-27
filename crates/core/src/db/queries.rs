@@ -1577,7 +1577,7 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
             }
         })
         .collect();
-    stats.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    stats.sort_by(|a, b| crate::format::cmp_rank_desc(&a.name, &a.count, &b.name, &b.count));
     // 显示名去重：两只同型号设备（VID/PID 相同、实例不同）加序号区分。
     //
     // **只对自动名计数**，别名不改写、但要占位 —— 这才是上面那句注释
@@ -1992,7 +1992,7 @@ fn device_key_rows(identity: &str, period: i64) -> (Vec<(String, i64)>, Vec<Stri
         }
     }
     let mut list: Vec<(String, i64)> = merged.into_iter().collect();
-    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    list.sort_by(|a, b| crate::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
     (list, gaps)
 }
 
@@ -5405,6 +5405,32 @@ mod tests {
             wide[10], 21,
             "近 60 天要含上 40 天前那笔，实得 {}",
             wide[10]
+        );
+    }
+
+    /// 排名尺子只许有一份：本文件那两处榜必须走 `crate::format::cmp_rank_desc`，
+    /// 不许再各自手写"次数降序、同分按名字升序"。
+    ///
+    /// 为什么值得钉：`cmp_rank_desc` 抽出来防的正是"同一把尺子抄两处就会分叉"，而分叉的
+    /// 症状是**谁进榜**都变（榜的输入是 HashMap，排序只比次数时稳定排序把随机原样留下，
+    /// 后面紧跟着 `truncate`）。少一份手抄，就少一处没人认领的分叉。
+    #[test]
+    fn the_core_boards_use_the_one_comparator() {
+        let src = include_str!("queries.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        // 针要拼出来，否则这条用例自己的字面量会被它正在查的样式数进去。
+        let hand_tuple = [".cmp(&a.", "1).then_with"].concat();
+        let hand_struct = [".cmp(&a.count)", ".then_with"].concat();
+        let wired = ["cmp_rank_desc", "("].concat();
+        assert!(
+            !prod.contains(hand_tuple.as_str()) && !prod.contains(hand_struct.as_str()),
+            "core 里又手写了一遍排名尺子 ⇒ 它与 cmp_rank_desc 分叉时没有任何用例会红"
+        );
+        assert_eq!(
+            prod.matches(wired.as_str()).count(),
+            2,
+            "设备榜那一列与设备详情那一列都要走那一份尺子，数量变了说明接线动过"
         );
     }
 }

@@ -187,7 +187,7 @@ pub fn load(period: i64) -> Snapshot {
 
     let mut rank: Vec<(String, i64)> = stats.rows.into_iter().collect();
     // 次数降序；次数相同按名字升序，保证两次刷新之间不会自己换位。
-    rank.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rank.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
     rank.truncate(100);
 
     // 日均的分母：窗口天数；"全部"按有数据的天数（与卡片上的"日均"同口径）。
@@ -215,7 +215,7 @@ pub fn load(period: i64) -> Snapshot {
 
     let (app_total, app_map) = queries::get_app_stats(days, None);
     let mut apps: Vec<(String, i64)> = app_map.into_iter().collect();
-    apps.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    apps.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
     apps.truncate(100);
 
     // 每日目标与连续打卡：要扫近 370 天按日序列。正式版按 60 秒节流，
@@ -259,5 +259,45 @@ pub fn load(period: i64) -> Snapshot {
             .get("paths", "data_migrate_from")
             .trim()
             .to_string(),
+    }
+}
+
+/// 排名尺子只许有一份：这一屏的两份榜（以及 `main.rs` 周报那三处）必须走
+/// `focusflow_core::format::cmp_rank_desc`，不许再各自手写"次数降序、同分按名字升序"。
+#[cfg(test)]
+mod rank_ruler_tests {
+    /// 生产文本 = 本文件 `#[cfg(test)]` 之前的部分。判据用的针要拼出来，否则这条用例
+    /// 自己的字面量会被它正在查的样式数进去（`main.rs` 里同一手）。
+    fn prod(self_file: bool) -> String {
+        let src = if self_file {
+            include_str!("data.rs")
+        } else {
+            include_str!("main.rs")
+        };
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        src[..cut].to_string()
+    }
+
+    #[test]
+    fn the_rank_boards_use_the_one_comparator() {
+        let hand = [".cmp(&a.1)", ".then_with"].concat();
+        let wired = ["cmp_rank_desc", "("].concat();
+        for what in [("data.rs", prod(true)), ("main.rs", prod(false))] {
+            assert!(
+                !what.1.contains(hand.as_str()),
+                "{} 里又手写了一遍排名尺子 ⇒ 与 cmp_rank_desc 分叉时没有任何用例会红",
+                what.0
+            );
+        }
+        assert_eq!(
+            prod(true).matches(wired.as_str()).count(),
+            2,
+            "键鼠榜与应用榜这两处都要走那一份尺子"
+        );
+        assert_eq!(
+            prod(false).matches(wired.as_str()).count(),
+            3,
+            "周报的键、应用、设备三个 Top 榜都要走那一份尺子"
+        );
     }
 }

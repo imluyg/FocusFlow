@@ -6780,13 +6780,13 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
     gaps.dedup();
 
     let mut keys: Vec<(String, i64)> = keys.into_iter().collect();
-    keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    keys.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
     keys.truncate(10);
     let mut apps: Vec<(String, i64)> = apps.into_iter().collect();
-    apps.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    apps.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
     apps.truncate(10);
     let mut devices: Vec<(String, i64)> = devices.into_iter().collect();
-    devices.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    devices.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
     devices.truncate(10);
 
     let max_day = by_day
