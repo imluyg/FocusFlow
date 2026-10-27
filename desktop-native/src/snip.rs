@@ -2382,6 +2382,7 @@ mod render_probe {
     #[ignore = "会真的在屏幕上盖一层全屏覆盖层"]
     fn the_overlay_paints_the_frozen_pixels_inside_and_the_veil_outside() {
         unsafe {
+            let _serial = crate::probe_guard();
             let owner = HWND(std::ptr::null_mut());
             start(owner, true);
             pump(400);

@@ -4359,6 +4359,13 @@ struct PinDrag {
 
 /// 桌面上开着的贴图。用 `Vec` 而不是 `HashMap`：`Mutex::new(Vec::new())` 才进得了 static。
 static PINS: Mutex<Vec<PinImage>> = Mutex::new(Vec::new());
+/// 屏上探针共用的串行锁：两条都会动**真实光标**、都往桌面上盖真窗口。
+/// 并行跑时那条全屏覆盖层会把贴图挡在后面 —— 悬停判据于是假红（实测过）。
+pub(crate) static SCREEN_PROBE: Mutex<()> = Mutex::new(());
+/// 取探针锁：前一位可能 panic 过，中毒不该把这一位也判死。
+pub(crate) fn probe_guard() -> std::sync::MutexGuard<'static, ()> {
+    SCREEN_PROBE.lock().unwrap_or_else(|e| e.into_inner())
+}
 static PIN_DRAG: Mutex<Option<PinDrag>> = Mutex::new(None);
 
 /// 悬停在哪张贴图上：只有它显示 ✕（旧 Webview 版同一口径 —— 不悬停时不拿关闭按钮抢画面）。
@@ -8269,6 +8276,118 @@ mod user_file_write_tests {
 #[cfg(test)]
 mod pin_tests {
     use super::*;
+
+    /// 贴图窗口的主人是本线程，所以测试线程自己把消息跑掉一段**有界**时间。
+    unsafe fn pump(ms: u64) {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < until {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn lp(x: i32, y: i32) -> LPARAM {
+        LPARAM((((y & 0xFFFF) as isize) << 16) | ((x & 0xFFFF) as isize))
+    }
+
+    fn post(h: HWND, msg: u32, wp: usize, l: LPARAM) {
+        unsafe {
+            let _ = PostMessageW(Some(h), msg, WPARAM(wp), l);
+        }
+    }
+
+    /// 屏上判据之外，贴图这一族也要有机器证据：✕ 只在悬停时出现也只在悬停时咬人、
+    /// 点它只关那一张、滚轮放大同时把角标开起来、`close_all_pins` 收得干净。
+    /// 会真的在桌面上摆出贴图窗口，所以默认不跑：
+    /// `cargo test -p focusflow-native --bins -- --ignored a_pin_shows`
+    #[test]
+    #[ignore = "会真的在桌面上摆出贴图窗口"]
+    fn a_pin_shows_its_cross_on_hover_and_closes_only_itself() {
+        unsafe {
+            let _serial = probe_guard();
+            open_test_pins(3);
+            pump(400);
+            let list = PINS
+                .lock()
+                .map(|v| v.iter().map(|p| p.hwnd).collect::<Vec<_>>())
+                .unwrap();
+            assert_eq!(list.len(), 3, "三张贴图没都开出来");
+            let h0 = HWND(list[0] as *mut core::ffi::c_void);
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(h0, &mut rc);
+            let (bx, by, bs, _) = pin_close_box(rc.right - rc.left, rc.bottom - rc.top);
+            let (cx, cy) = (bx + bs / 2, by + bs / 2);
+
+            // 悬停必须用**真实光标**驱动：只投合成的 WM_MOUSEMOVE 时，`TrackMouseEvent`
+            // 会立刻补一个 WM_MOUSELEAVE（真光标本来不在窗上），刚点亮的悬停马上又被清掉。
+            let mut home = POINT::default();
+            let _ = GetCursorPos(&mut home);
+            let (sx, sy) = (rc.left + cx, rc.top + cy);
+            let _ = SetCursorPos(sx, sy);
+            pump(400);
+            let hov_now = PIN_HOVER.lock().map(|x| *x).unwrap_or(None);
+            assert_eq!(hov_now, Some(list[0]), "光标压在 ✕ 上却没点亮悬停");
+            post(h0, WM_LBUTTONDOWN, 0, lp(cx, cy));
+            pump(120);
+            post(h0, WM_LBUTTONUP, 0, lp(cx, cy));
+            pump(400);
+            let left = PINS
+                .lock()
+                .map(|v| v.iter().map(|p| p.hwnd).collect::<Vec<_>>())
+                .unwrap();
+            assert_eq!(left.len(), 2, "点 ✕ 没关掉这一张（或关多了）");
+            assert!(!left.contains(&list[0]), "关掉的不是被点的那一张");
+
+            // 没悬停的那一张：✕ 根本没画出来，点那个位置也不许关（不存在的按钮不许咬人）
+            let _ = SetCursorPos(4, 4);
+            pump(300);
+            assert_eq!(
+                PIN_HOVER.lock().map(|x| *x).unwrap_or(Some(0)),
+                None,
+                "光标离开后悬停标记没清"
+            );
+            let h1 = HWND(left[0] as *mut core::ffi::c_void);
+            let _ = GetWindowRect(h1, &mut rc);
+            let (bx2, by2, bs2, _) = pin_close_box(rc.right - rc.left, rc.bottom - rc.top);
+            post(h1, WM_LBUTTONDOWN, 0, lp(bx2 + bs2 / 2, by2 + bs2 / 2));
+            pump(120);
+            post(h1, WM_LBUTTONUP, 0, lp(bx2 + bs2 / 2, by2 + bs2 / 2));
+            pump(300);
+            assert_eq!(
+                PINS.lock().map(|v| v.len()).unwrap_or(0),
+                2,
+                "没悬停时点 ✕ 的位置居然关掉了贴图"
+            );
+
+            // 滚轮往上：窗口变大，同时角标开起来（那个数与屏上角标同源）
+            let _ = GetWindowRect(h1, &mut rc);
+            let before = rc.right - rc.left;
+            post(h1, WM_MOUSEWHEEL, (120usize) << 16, lp(0, 0));
+            pump(300);
+            let _ = GetWindowRect(h1, &mut rc);
+            assert!(rc.right - rc.left > before, "滚轮往上没放大");
+            assert!(
+                PINS.lock()
+                    .map(|v| v.iter().any(|p| p.badge.is_some()))
+                    .unwrap_or(false),
+                "缩放后角标没开"
+            );
+
+            let n = close_all_pins();
+            assert_eq!(n, 2, "收尾时该只剩两张");
+            pump(200);
+            assert_eq!(
+                PINS.lock().map(|v| v.len()).unwrap_or(0),
+                0,
+                "关掉所有贴图没清干净"
+            );
+            let _ = SetCursorPos(home.x, home.y);
+        }
+    }
 
     /// ✕ 的落点：常规尺寸贴右上角；图缩到放不下也必须还在窗内。
     #[test]
