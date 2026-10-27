@@ -9092,3 +9092,37 @@ mod pin_tests {
         assert_eq!(pin_scaled_size(3, 2, 0.25), (1, 1), "半像素要进到 1，不是截成 0");
     }
 }
+
+#[cfg(test)]
+mod pager_shape_tests {
+    use super::*;
+    use focusflow_core::plugins::{PluginView, Widget};
+
+    /// 分页条的**现状读数**：协议带着 `prev_id` / `next_id`，而 `plugin_view_ops` 把整个
+    /// `Pager` 折成一条 `POp::Label`。标签不在 `on_click` 认的那四条臂（Button / Table /
+    /// Select / Field）里，所以这一行结构上就点不动 —— 旧 WebView 那对「上一页/下一页」没了。
+    /// 接上 Pager 的那天这条要**先红**，红了之后把它改成"点下一页真的换页"的判据。
+    #[test]
+    fn the_pager_bar_is_one_label_row_and_nothing_clickable() {
+        let view = PluginView {
+            title: "shape".to_string(),
+            widgets: vec![Widget::Pager {
+                page: 2,
+                pages: 3,
+                total: 12,
+                prev_id: "pg_prev".to_string(),
+                next_id: "pg_next".to_string(),
+            }],
+        };
+        let ops = plugin_view_ops(&view, rect(0.0, 0.0, 800.0, 600.0), 0.0, &HashMap::new());
+        assert_eq!(ops.len(), 1, "分页条今天只产出一条控件");
+        match &ops[0] {
+            POp::Label { text, .. } => {
+                assert!(text.contains("2 / 3"), "页码要在这一行里：{text}");
+                assert!(text.contains("12"), "总条数要在这一行里：{text}");
+            }
+            // 标签之外的任何一种都能被 `on_click` 命中：说明 Pager 接上了。
+            _ => panic!("分页条不再是纯标签，这条读数该改成新判据"),
+        }
+    }
+}
