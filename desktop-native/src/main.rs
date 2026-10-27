@@ -6815,6 +6815,9 @@ fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenu
     let menu = Menu::new();
     let show = MenuItem::with_id("show", "显示主窗口", true, None);
     let snip = MenuItem::with_id("snip", "截图（选区）", true, None);
+    // 旧 Webview 版在设置页上有两颗：立即截图 / 立即标注截图。换原生时只留了标注那颗，
+    // "松手即存"这条就只剩热键一个入口了——他日志里用得最多的偏偏是这一条。
+    let snip_quick = MenuItem::with_id("snip_quick", "截图（松手即存）", true, None);
     // 直达最近那张：截图之后不用专门去文件夹里挑（旧 Webview 版有这一项，换原生时丢了）。
     let snip_folder = MenuItem::with_id("snip_folder", "打开截图文件夹", true, None);
     let floating_item = MenuItem::with_id("floating", "悬浮窗", true, None);
@@ -6825,6 +6828,7 @@ fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenu
     if let Err(e) = menu.append_items(&[
         &show,
         &snip,
+        &snip_quick,
         &snip_folder,
         &floating_item,
         &pause,
@@ -7493,6 +7497,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 match ev.id.as_ref() {
                     "show" => unsafe { bring_to_front(hwnd) },
                     "snip" => snip::start(hwnd, true),
+                    // 松手即存：与快速那条热键同一个入口（`wparam = 0` 的 `WM_SNIP_START` 走的就是它）
+                    "snip_quick" => snip::start(hwnd, false),
                     "snip_folder" => {
                         // 成与败都写日志：托盘点下去"没反应"是这条功能唯一的故障形态，
                         // 不吭声就等于把失败吞掉（旧 Webview 版同一条口径）。
@@ -8755,5 +8761,60 @@ mod hotkey_line_tests {
         ]);
         assert!(line.contains("没注册上"), "{line}");
         assert!(!line.contains("其余"), "三条都没成却还说其余：{line}");
+    }
+}
+
+/// 托盘上每一条菜单项都得有人接。加了一项却忘了在 `ev.id` 那个 `match` 里写臂，症状恰好是
+/// 这条功能登记过的唯一故障形态："点下去什么反应都没有"——屏上没痕迹、日志也不出声。
+/// 刚加"截图（松手即存）"这一项时最容易犯的就是这个，所以留一条扫源码的守卫。
+#[cfg(test)]
+mod tray_menu_tests {
+    #[test]
+    fn every_tray_menu_id_has_a_handler() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        // 只扫托盘那一段：别的控件也有 id，扫全文会连这条用例自己的源码一起读进来
+        // （那句 needle 的字面量本身就长得像一次声明）。
+        let from = match src.find("fn make_tray") {
+            Some(i) => i,
+            None => panic!("托盘构造函数改名了，这条守卫要跟着改"),
+        };
+        let body = &src[from..];
+        let body = match body.find("\nfn ") {
+            Some(end) => &body[..end],
+            None => body,
+        };
+        let head = "with_id";
+        let head = format!("{head}(");
+        let mut ids: Vec<String> = Vec::new();
+        let mut at = 0usize;
+        while let Some(i) = body[at..].find(head.as_str()) {
+            let start = at + i + head.len();
+            if !body[start..].starts_with('"') {
+                at = start;
+                continue;
+            }
+            let start = start + 1;
+            match body[start..].find('"') {
+                Some(k) => {
+                    let id = &body[start..start + k];
+                    if !id.is_empty() && !ids.iter().any(|x| x == id) {
+                        ids.push(id.to_string());
+                    }
+                    at = start + k;
+                }
+                None => break,
+            }
+        }
+        assert!(
+            ids.len() >= 6,
+            "托盘项只扫到 {ids:?}：源码形状变了，这条守卫要改"
+        );
+        for id in &ids {
+            let arm = format!("\"{id}\" =>");
+            assert!(
+                src.contains(&arm),
+                "托盘项 {id} 没有接它的那条臂（点下去不会有任何反应）"
+            );
+        }
     }
 }
