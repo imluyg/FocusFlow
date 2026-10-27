@@ -780,6 +780,12 @@ unsafe fn repaint(hwnd: HWND) -> bool {
                 );
                 APPLIED_TOP.store(top, Ordering::SeqCst);
             }
+            // 卡片与停靠条那一条重叠 ⇒ 每拍抢一次层级，**不碰坐标**。
+            // 只答 `WM_WINDOWPOSCHANGING` 不够：没被问到的那一刻没人替我们答，而任务栏同为
+            // topmost，它在我们的锚点之后被按过一次就会把我们盖在下面（21:00 现场报的那一种）。
+            if top + h > mon.bar_bottom {
+                keep_above_bar(hwnd);
+            }
         }
         true
     }
@@ -790,18 +796,24 @@ unsafe fn get_rect(hwnd: HWND) -> Option<RECT> {
     unsafe { wm::GetWindowRect(hwnd, &mut rc).is_ok() }.then_some(rc)
 }
 
-/// 一块屏幕的**工作区**矩形（`MONITORINFO.rcWork` = 整屏扣掉任务栏/停靠条那一条），物理像素。
+/// 一块屏幕的**整屏**矩形（`MONITORINFO.rcMonitor`），物理像素，另带停靠条那一条的下边界。
 ///
-/// 为什么是工作区而不是整屏：落点判据要问的是"这块区域能不能被看见"。悬浮窗虽然 topmost，
-/// 但任务栏同为 topmost 且层级更高 —— 卡片整条落进任务栏那 48 像素里时屏幕上一点都看不见
-/// （2026-10-27 现场报的：`pos_y = 1033`、屏 1080、工作区底边 1032）。
-/// 没有停靠条的那块屏 `rcWork == rcMonitor`，所以这次改口径对多屏的其它屏是**行为不变**。
+/// 落点与"长高让位"都按整屏问；`bar_bottom` 只用来判断"这张卡片压没压在任务栏那一条上"，
+/// 压着就改层级、不改坐标。
+///
+/// ⚠ 口径变更（2026-10-27 深夜他实测报的）：把卡片放到任务栏那一条上，它自己跑了 ⇒
+/// "别乱动我放的位置"优先，"被任务栏盖住"那一格由 [`keep_above_bar`] 用层级解决。
+/// 上一版把尺子换成工作区（`30aa624`）确实让卡片不再落进带里，代价是用户放好的位置会被
+/// 启动与长高两条路悄悄抬走 —— 按现量撤回。没有停靠条的那块屏 `rcWork == rcMonitor`，
+/// 所以 `bar_bottom` 那一格在那儿永远不会判成"压在栏上"。
 #[derive(Clone, Copy)]
 struct Mon {
     x: i32,
     y: i32,
     w: i32,
     h: i32,
+    /// 工作区底边（物理像素）：停靠条占掉的那一条的下沿。
+    bar_bottom: i32,
 }
 
 unsafe fn monitor_at(px_x: i32, px_y: i32, flags: g::MONITOR_FROM_FLAGS) -> Option<Mon> {
@@ -814,26 +826,28 @@ unsafe fn monitor_at(px_x: i32, px_y: i32, flags: g::MONITOR_FROM_FLAGS) -> Opti
             return None;
         }
         Some(Mon {
-            x: mi.rcWork.left,
-            y: mi.rcWork.top,
-            w: (mi.rcWork.right - mi.rcWork.left).max(1),
-            h: (mi.rcWork.bottom - mi.rcWork.top).max(1),
+            x: mi.rcMonitor.left,
+            y: mi.rcMonitor.top,
+            w: (mi.rcMonitor.right - mi.rcMonitor.left).max(1),
+            h: (mi.rcMonitor.bottom - mi.rcMonitor.top).max(1),
+            bar_bottom: mi.rcWork.bottom,
         })
     }
 }
 
-/// 离这个物理坐标最近的那块屏的工作区；拿不到就退回主屏尺寸。
+/// 离这个物理坐标最近的那块屏的整屏矩形；拿不到就退回主屏尺寸。
 ///
-/// 退回那条拿不到 `rcWork`（只有 `SM_CXSCREEN`/`SM_CYSCREEN`，是整屏），所以那一刻可能少扣一条
-/// 任务栏。这条路只在 `MonitorFromPoint` 失败时走 —— 真到的话宁可先按整屏摆出来，
-/// 别让卡片干脆不显示；下一拍或下次启动就会用回工作区矩形。
+/// 退回那条只有 `SM_CXSCREEN`/`SM_CYSCREEN`（都是整屏），拿不到工作区，于是 `bar_bottom`
+/// 只能填成整屏底边 ⇒ 那一刻不会去抢层级，但**也不会搬坐标**——宁可少压一层，不要乱动位置。
 fn nearest_monitor(px_x: i32, px_y: i32) -> Mon {
     unsafe { monitor_at(px_x, px_y, g::MONITOR_DEFAULTTONEAREST) }.unwrap_or_else(|| unsafe {
+        let h = wm::GetSystemMetrics(wm::SM_CYSCREEN).max(1);
         Mon {
             x: 0,
             y: 0,
             w: wm::GetSystemMetrics(wm::SM_CXSCREEN).max(1),
-            h: wm::GetSystemMetrics(wm::SM_CYSCREEN).max(1),
+            h,
+            bar_bottom: h,
         }
     })
 }
@@ -974,6 +988,27 @@ unsafe fn ensure_visible_on_screen(hwnd: HWND) -> bool {
         // 这一搬也是自己搬的：不登记的话，下一拍会把"拔屏找回"当成用户搬动而重设锚点。
         APPLIED_TOP.store(y, Ordering::SeqCst);
         true
+    }
+}
+
+/// 把自己重新按到 topmost 队列的最前面：**不碰坐标、不碰大小、不抢焦点**。
+///
+/// 为什么每拍都要问一次：任务栏同为 topmost，谁后被按过谁就在上面 —— 只在 `WM_WINDOWPOSCHANGING`
+/// 里答一次，等于赌"系统还会再问我们"，而卡片停在带里不动时它不再问。
+///
+/// # Safety
+/// 必须在拥有 `hwnd` 的那个线程上调用。
+unsafe fn keep_above_bar(hwnd: HWND) {
+    unsafe {
+        let _ = wm::SetWindowPos(
+            hwnd,
+            Some(wm::HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            wm::SWP_NOMOVE | wm::SWP_NOSIZE | wm::SWP_NOACTIVATE,
+        );
     }
 }
 

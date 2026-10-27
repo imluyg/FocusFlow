@@ -77,6 +77,24 @@ public class FF {
     }, IntPtr.Zero);
     return list;
   }
+  // z-order rank of the first VISIBLE top-level window of that class: EnumWindows walks top ->
+  // bottom, so a SMALLER number means "painted above". Returns -1 when nothing matched (premise
+  // failure -- callers must gate on >= 0 before comparing). pid=0 matches any process, which is
+  // what the shell's own windows need (Shell_TrayWnd belongs to explorer, not to the app).
+  public static int ZOrder(string cls, uint pid) {
+    int idx = 0;
+    int found = -1;
+    EnumWindows((h, l) => {
+      idx++;
+      var sb = new StringBuilder(256); GetClassName(h, sb, 256);
+      if (sb.ToString() == cls && IsWindowVisible(h)) {
+        uint p; GetWindowThreadProcessId(h, out p);
+        if (pid == 0 || p == pid) { found = idx; return false; }
+      }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
   // WM_NCHITTEST on the pill must answer HTCAPTION (2): the whole card is a drag handle.
   public static long HitTest(uint pid, string cls) {
     IntPtr h = ByClass(pid, cls);

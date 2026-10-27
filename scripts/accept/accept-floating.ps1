@@ -83,12 +83,15 @@ Start-Sleep -Milliseconds 900
 $r = Get-Rect $pill
 Check 'off-screen position is clamped to 20 px visible' ($r.X -eq 1900) "$($r.X),$($r.Y)"
 
-# A position that puts the WHOLE card inside the docked-bar band must be lifted out at startup.
-# Reported live 2026-10-27: 1920x1080 with a 48 px bottom taskbar (work bottom 1032) and
-# pos_y = 1033, so the card sat entirely behind the taskbar -- the bar is topmost too and higher,
-# and "at least 20 px visible" measured against the FULL screen cannot save that case.
-# The ruler here is therefore the WORK AREA, and its bottom edge is read from the system rather
-# than typed in (hard rule: measure the geometry a leg depends on, don't hardcode it).
+# A position that puts the WHOLE card inside the docked-bar band must be LEFT ALONE -- the ruler for
+# "can the user see it" is z-order, not the work area.
+# Live, twice, on 2026-10-27: first he reported the card hidden behind the bar (pos_y = 1033 with a
+# 48 px bottom bar), which we "fixed" by lifting it above the work area (`30aa624`); he then
+# reported THAT as the bug: he wants the card to sit ON the bar, left alone -- no auto-move, and no
+# being hidden by the bar either.
+# So: startup must not move a placement that is on screen (the bottom edge is the SCREEN's bottom),
+# and being covered by the bar is answered by putting the pill above Shell_TrayWnd in z-order.
+# Geometry comes from the system, never typed in (hard rule: measure what a leg depends on).
 Add-Type -AssemblyName System.Windows.Forms
 $work = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $bnd = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
@@ -98,19 +101,35 @@ Set-ConfigLine $app 'floating' 'pos_y' ($work.Bottom + 1)
 $p = Start-App $Exe $app $WorkDir
 $h = Wait-Window $p.Id
 $pill = Wait-Window $p.Id 'FocusFlowFloatingPill' 8000
-Start-Sleep -Milliseconds 900
+Start-Sleep -Milliseconds 1300   # give the tick a chance to push the card up, the way it used to
 $rt = Get-Rect $pill
-# Gate on the window actually being there: with no pill, the rect is 0,0,0,0 and "bottom <= work
-# bottom" would be TRUE for the wrong reason. Measured 2026-10-27: a run whose first instance
-# never died (see the -Exe note in this file's header) produced (0,0) here and this leg PASSED --
-# a false green on a premise that was red. Absence-shaped legs must AND their own premise in.
+# Gate on the window actually being there: with no pill the rect is 0,0,0,0 and both rulers below
+# would be TRUE for the wrong reason. Measured 2026-10-27: a run whose first instance never died
+# (see the -Exe note in this file's header) produced (0,0) here and the old leg PASSED -- a false
+# green on a red premise. Absence-shaped legs must AND their own premise in.
 $have = ($pill -ne [IntPtr]::Zero) -and ($rt.H -gt 0) -and ($rt.W -gt 0)
 $detail = if ($have) {
     'bottom=' + ($rt.Y + $rt.H) + ' work_bottom=' + $work.Bottom + ' screen_bottom=' + $bnd.Bottom
 } else {
     'NOT MEASURED: no pill window to place (that restart did not come up -- premise, not the ruler)'
 }
-Check 'a card saved inside the taskbar band is lifted above it' ($have -and (($rt.Y + $rt.H) -le $work.Bottom)) $detail
+# Flushed to the screen bottom is the most this leg allows to move. The overlap itself is judged on
+# the card's BOTTOM edge, not its top: a 48 px card landing at top=1032 sits exactly ON the work-area
+# line, so "top > work bottom" would call a card that covers the whole bar band "not overlapping".
+$stays = $have -and (($rt.Y + $rt.H) -eq $bnd.Bottom) -and (($rt.Y + $rt.H) -gt $work.Bottom)
+Check 'a card placed on the taskbar band is not lifted out of it' $stays $detail
+# The other half of his requirement: it must not be HIDDEN by the bar either. Smaller ZOrder = higher.
+# The ruler gets its own control leg first: the bar must rank above the desktop window (Progman).
+# Without that, "pill < bar" could be satisfied by a ruler that simply does not see either window.
+$zPill = if ($have) { [FF]::ZOrder('FocusFlowFloatingPill', [uint32]$p.Id) } else { -1 }
+$zBar = [FF]::ZOrder('Shell_TrayWnd', 0)
+$zDesk = [FF]::ZOrder('Progman', 0)
+$zCtl = ($zBar -gt 0) -and ($zDesk -gt 0) -and ($zBar -lt $zDesk)
+$zCtlDetail = if ($zCtl) { 'bar_rank=' + $zBar + ' desktop_rank=' + $zDesk } else { 'NOT MEASURED: bar=' + $zBar + ' desktop=' + $zDesk + ' (the ruler could not rank both windows)' }
+Check 'the z-order ruler ranks the taskbar above the desktop' $zCtl $zCtlDetail
+$zHave = ($zPill -gt 0) -and ($zBar -gt 0)
+$zDetail = if ($zHave) { 'pill_rank=' + $zPill + ' bar_rank=' + $zBar } else { 'NOT MEASURED: pill=' + $zPill + ' bar=' + $zBar + ' (a window the ruler needs was not enumerated)' }
+Check 'a card on the band paints above the taskbar' ($zHave -and $zCtl -and ($zPill -lt $zBar)) $zDetail
 # Put the pill back where the rest of this suite expects it.
 Stop-App
 Set-ConfigLine $app 'floating' 'pos_x' '1300'
