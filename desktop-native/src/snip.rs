@@ -2591,6 +2591,17 @@ pub enum SnipTick {
     Absolute,
 }
 
+/// 这一次会话的**绝对上限**给多少毫秒：标注模式 10 分钟、松手即存 60 秒。
+/// 写成一个小函数是因为这两个数与闲置闸 180 秒的关系是硬的：
+/// 标注的上限必须比闲置大（否则"续表"没意义），快速的必须比闲置小（否则第一枪不是它）。
+pub fn snip_ceiling_ms(annotate: bool) -> u64 {
+    if annotate {
+        SNIP_CEILING_ANNOTATE_MS
+    } else {
+        SNIP_CEILING_QUICK_MS
+    }
+}
+
 /// 打开截图覆盖层（托盘菜单/设置页按钮/两条截图热键/测试钩子都走这里）。
 ///
 /// `annotate` = 松手后就地标注；`false` = 松手即存（PNG + 剪贴板），与旧版两条热键的分工一致。
@@ -2706,11 +2717,7 @@ pub fn start(owner: HWND, annotate: bool) {
                     let now = Instant::now();
                     s.started_at = Some(now);
                     s.last_input = Some(now);
-                    s.ceiling_ms = if annotate {
-                        SNIP_CEILING_ANNOTATE_MS
-                    } else {
-                        SNIP_CEILING_QUICK_MS
-                    };
+                    s.ceiling_ms = snip_ceiling_ms(annotate);
                 }
                 // 一开层就把光标下面那块屏的窗口亮出来：旧版是移一下鼠标才亮，
                 // 但"按下热键时光标已经指在他要截的东西上"才是最常见的形状。
@@ -2949,6 +2956,13 @@ mod render_probe {
             assert!(
                 base_w > 700 && base_h > 520,
                 "这块屏容不下这条判据：{base_w}x{base_h}"
+            );
+            // 这条会话是标注版：绝对上限得真挂成 600 秒。`snip-arm-ceiling` 那句报的就是它，
+            // 而验收套件超时那一轮正是按这个数字挑的 annotate 模式。
+            assert_eq!(
+                SNIP.lock().map(|s| s.ceiling_ms).unwrap_or(0),
+                600_000,
+                "标注会话的上限没按 600 秒挂"
             );
             // 拿真实桌面当对照会被"纯色区域"喂成假绿：那种地方像素本来就处处相同，
             // 裁错 8 格也照样相等（实测把 crop 整体偏移 +8,+1 时这条探针没反应）。
@@ -4118,6 +4132,17 @@ mod tests {
         assert_eq!(snip_tick(-1, -1), SnipTick::Absolute);
         // 负数但绝对还早 ⇒ 闲置到点
         assert_eq!(snip_tick(-5, 30_000), SnipTick::Idle);
+    }
+
+    #[test]
+    fn the_two_clocks_keep_their_documented_relationship() {
+        // 与旧 Webview 版同一对数：标注最多 10 分钟、松手即存最多 60 秒
+        assert_eq!(snip_ceiling_ms(true), 600_000);
+        assert_eq!(snip_ceiling_ms(false), 60_000);
+        // 标注的上限必须比闲置闸大：否则"动一下续表"根本没有意义，绝对闸先落下就等于没有续表
+        assert!(snip_ceiling_ms(true) > SNIP_TIMEOUT_MS as u64);
+        // 快速那条必须比闲置小 ⇒ 第一枪就该是它（start() 挂的是两者里更近的那段）
+        assert!(snip_ceiling_ms(false) < SNIP_TIMEOUT_MS as u64);
     }
 
     #[test]
