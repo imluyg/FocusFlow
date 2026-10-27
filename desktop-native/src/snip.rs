@@ -3873,6 +3873,38 @@ mod render_probe {
             assert_eq!(got.1, Phase::Adjust, "点选之后没进标注那一格");
             assert!(got.2, "标注版点选完却把覆盖层关了");
 
+            // 贴底那一格：选区下沿离屏幕底放不下整条工具条时，工具条必须翻到选区**上方**。
+            // `bar_placement` 有纯函数判据，但"翻上去之后画在哪、画没画"在屏上一次没证过；
+            // 而这条腿先把"选区真的贴到底"当前提量出来，否则翻不翻都无从谈起。
+            let bh3 = SNIP.lock().map(|s| s.base_h).unwrap_or(0);
+            post_mouse(ov3, WM_LBUTTONDOWN, 200, bh3 - 60);
+            post_mouse(ov3, WM_MOUSEMOVE, 620, bh3 - 14);
+            post_mouse(ov3, WM_LBUTTONUP, 620, bh3 - 14);
+            pump(250);
+            let (sel3, bar3) = SNIP
+                .lock()
+                .map(|s| (s.sel, bar_rects(s.sel, s.base_w, s.base_h).1))
+                .unwrap_or(((0, 0, 0, 0), (0, 0, 0, 0)));
+            assert!(
+                sel3.3 > bh3 - 120 && sel3.3 <= bh3,
+                "前提不成立：选区没贴到屏幕底 sel={sel3:?} base_h={bh3}"
+            );
+            assert!(
+                bar3.1 + bar3.3 <= sel3.1 + 1,
+                "选区贴底时工具条没翻到上方：bar={bar3:?} sel={sel3:?}"
+            );
+            let shot3 = print_window(ov3).expect("贴底那一格没拍到");
+            let want3 = [
+                ((BAR_BG >> 16) & 0xFF) as u8,
+                ((BAR_BG >> 8) & 0xFF) as u8,
+                (BAR_BG & 0xFF) as u8,
+            ];
+            assert_eq!(
+                pixel3(&shot3.0, shot3.1, bar3.0 + 1, bar3.1 + 1),
+                want3,
+                "翻上去的工具条没画出来：bar={bar3:?}"
+            );
+
             // 工具按钮的高亮必须跟着当前工具走——"我现在拿的是哪支笔"这件事得看得见。
             // 比的是两支点来点去之后两颗粒子**互换**，静态的一片橙色喂不饱这条判据。
             click_bar(ov3, "rect");
