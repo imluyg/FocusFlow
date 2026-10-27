@@ -2942,6 +2942,17 @@ mod render_probe {
         post_mouse(ov, WM_LBUTTONUP, b.x + b.w / 2, b.y + b.h / 2);
     }
 
+    /// 某颗按钮此刻的**底色**：取左上角往里 3 像素那一点，避开标签的墨迹。
+    /// 落点仍由产品自己算（`bar_rects`），测试不抄第二把尺子。
+    unsafe fn btn_fill(shot: &[u8], sw: i32, id: &str) -> [u8; 3] {
+        let (btns, _) = SNIP
+            .lock()
+            .map(|s| bar_rects(s.sel, s.base_w, s.base_h))
+            .unwrap_or_default();
+        let b = btns.iter().find(|x| x.id == id).expect("工具条缺按钮");
+        pixel3(shot, sw, b.x + 3, b.y + 3)
+    }
+
     /// 逐像素唯一的合成画面（BGRA）。随便往哪个方向错开一格，颜色就对不上。
     fn synth(w: i32, h: i32) -> Vec<u8> {
         let mut v = vec![0u8; (w.max(0) * h.max(0)) as usize * 4];
@@ -3777,6 +3788,45 @@ mod render_probe {
             assert_eq!(got.0, far, "随手一按没把那个窗口收成选区");
             assert_eq!(got.1, Phase::Adjust, "点选之后没进标注那一格");
             assert!(got.2, "标注版点选完却把覆盖层关了");
+
+            // 工具按钮的高亮必须跟着当前工具走——"我现在拿的是哪支笔"这件事得看得见。
+            // 比的是两支点来点去之后两颗粒子**互换**，静态的一片橙色喂不饱这条判据。
+            click_bar(ov3, "rect");
+            pump(200);
+            let s1 = print_window(ov3).expect("rect 高亮那张没拿到");
+            let rect1 = btn_fill(&s1.0, s1.1, "rect");
+            let block1 = btn_fill(&s1.0, s1.1, "block");
+            click_bar(ov3, "block");
+            pump(200);
+            let s2 = print_window(ov3).expect("block 高亮那张没拿到");
+            let rect2 = btn_fill(&s2.0, s2.1, "rect");
+            let block2 = btn_fill(&s2.0, s2.1, "block");
+            fn is_accent(p: [u8; 3]) -> bool {
+                p[2] > 200 && p[1] > 120 && p[0] < 140
+            }
+            assert!(
+                is_accent(rect1) && !is_accent(block1),
+                "选着方框时高亮不在方框那颗上：{rect1:?} {block1:?}"
+            );
+            assert!(
+                is_accent(block2) && !is_accent(rect2),
+                "换到色块之后高亮没跟过去：{rect2:?} {block2:?}"
+            );
+
+            // Esc 是标注阶段唯一的退路（右键被刻意让开了）：必须真把这一场收掉，
+            // 而且屏上那句红字、标注、整屏缓冲都得跟着归零——留着下一次热键会接着看见旧东西。
+            let _ = PostMessageW(Some(ov3), WM_KEYDOWN, WPARAM(0x1B), LPARAM(0));
+            pump(250);
+            assert!(!IsWindow(Some(ov3)).as_bool(), "Esc 没关掉标注阶段的覆盖层");
+            let cleared = SNIP
+                .lock()
+                .map(|s| (s.active, s.marks.len(), s.base.len(), s.notice.is_some()))
+                .unwrap_or((true, 1, 1, true));
+            assert_eq!(
+                cleared,
+                (false, 0, 0, false),
+                "Esc 之后状态没清干净（在飞标志／标注／整屏缓冲／那句红字都得归零）"
+            );
             let _ = DestroyWindow(ov3);
             pump(200);
 
