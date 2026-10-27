@@ -213,11 +213,14 @@ $ov2 = Wait-Window $p2.Id 'FocusFlowSnipOverlay' 6000
 Check 'the second round opens the overlay' ($ov2 -ne [IntPtr]::Zero)
 
 Drag-Screen 300 260 700 500
-$ed2 = Wait-Window $p2.Id 'FocusFlowSnipEditor' 6000
-Check 'the drag opened the editor' ($ed2 -ne [IntPtr]::Zero)
+# The annotate stage is not a second window any more: the overlay stays alive and draws its
+# own toolbar on the frozen screen, so the observable is "the same overlay is still there".
+$alive = Wait-Window $p2.Id 'FocusFlowSnipOverlay' 2000
+Check 'the drag left the overlay in the annotate stage' ($alive -ne [IntPtr]::Zero)
+Start-Sleep -Milliseconds 600
 
-# P = pin this selection: the same exit as the toolbar button.
-[void][FF]::PostMessage($ed2, 0x0100, [IntPtr]0x50, [IntPtr]::Zero)   # WM_KEYDOWN VK_P
+# P = pin this selection: the same exit as the toolbar's own button.
+[void][FF]::PostMessage($alive, 0x0100, [IntPtr]0x50, [IntPtr]::Zero)   # WM_KEYDOWN VK_P
 Start-Sleep -Milliseconds 1500
 $pinH = [FF]::ByClass([uint32]$p2.Id, 'FocusFlowPin')
 Check 'P put the selection on the desktop' ($pinH -ne [IntPtr]::Zero)

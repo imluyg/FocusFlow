@@ -11,6 +11,7 @@ mod collect;
 mod data;
 mod floating;
 mod floating_render;
+mod snip;
 
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
@@ -41,34 +42,24 @@ use windows::Win32::Graphics::DirectComposition::{
 };
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute,
-    DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, GetDC, GetDIBits, GetStockObject,
-    InvalidateRect, LineTo, MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkColor, SetBkMode,
-    SetDIBits, SetDIBitsToDevice, SetTextColor, StretchDIBits, TextOutW, UpdateWindow, BI_RGB,
-    BITMAPINFO,
-    BITMAPINFOHEADER, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DIB_RGB_COLORS, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, NULL_BRUSH, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT,
-    PS_SOLID, SRCCOPY, TRANSPARENT,
-};
-use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, InvalidateRect, SetBkColor,
+    SetTextColor, StretchDIBits, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
+    FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -310,10 +301,10 @@ struct Brushes {
     grid: ID2D1SolidColorBrush,
     white: ID2D1SolidColorBrush,
     /// 达标/周末用的绿色。
-success: ID2D1SolidColorBrush,
+    success: ID2D1SolidColorBrush,
     /// 弹窗底色**始终不透明**。玻璃模式下 `card` 是半透明的，
     /// 拿它当弹窗底会把下面的表格文字透出来（旧版 tokens.css 的 --modal-bg 就是为这个单开的）。
-modal: ID2D1SolidColorBrush,
+    modal: ID2D1SolidColorBrush,
     /// 危险/失败用的红色（插件加载失败、开机自启没生效）。
     danger: ID2D1SolidColorBrush,
     /// 模态遮罩：压在整屏上的半透明层。
@@ -350,7 +341,7 @@ struct Formats {
     right: IDWriteTextFormat,
     center_small: IDWriteTextFormat,
     /// 键帽上那种小一号的字（窄键放不下 11px）。
-center_tiny: IDWriteTextFormat,
+    center_tiny: IDWriteTextFormat,
     tab: IDWriteTextFormat,
 }
 
@@ -373,9 +364,9 @@ struct Comp {
     swap: IDXGISwapChain1,
     ctx: ID2D1DeviceContext,
     /// 必须先放掉它再重建：后台缓冲还被它引用时 `ResizeBuffers` 会返回 INVALID_CALL。
-bitmap: Option<ID2D1Bitmap1>,
+    bitmap: Option<ID2D1Bitmap1>,
     /// 这三个必须活着：visual 挂着 swapchain，target 挂着 visual。
-_dcomp: IDCompositionDevice,
+    _dcomp: IDCompositionDevice,
     _dcomp_target: IDCompositionTarget,
     _visual: IDCompositionVisual,
     size: (u32, u32),
@@ -385,7 +376,7 @@ impl Drop for Comp {
     fn drop(&mut self) {
         // 视觉树上的根要显式摘掉：`SetRoot` 持有引用，只 drop 本地指针
         // 旧画面还会被合进窗口（缩放过一次就会看到两层错位）。
-unsafe {
+        unsafe {
             let _ = self.ctx.SetTarget(None);
             let _ = self._dcomp_target.SetRoot(None);
             let _ = self._dcomp.Commit();
@@ -518,10 +509,10 @@ impl Target {
                 unsafe {
                     c.ctx.SetTarget(None);
                     // 先放掉位图：它持有对后台缓冲的引用，不放掉 ResizeBuffers 必失败。
-c.bitmap = None;
-                    let r = c
-                        .swap
-                        .ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0));
+                    c.bitmap = None;
+                    let r =
+                        c.swap
+                            .ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0));
                     if r.is_err() {
                         tracing_note(&format!("ResizeBuffers({w}x{h}) 失败：{r:?}，下一帧重试"));
                         return;
@@ -531,7 +522,7 @@ c.bitmap = None;
                         c.bitmap = Some(bmp);
                         c.size = (w, h);
                         // 合成树也得重提一次：ResizeBuffers 换了后台缓冲。
-let _ = c._visual.SetContent(&c.swap);
+                        let _ = c._visual.SetContent(&c.swap);
                         let _ = c._dcomp.Commit();
                     }
                 }
@@ -578,7 +569,7 @@ struct PluginRow {
     version: String,
     author: String,
     /// 文件名（不含扩展名）：启用状态的持久化标识。
-stem: String,
+    stem: String,
     enabled: bool,
     loaded: bool,
     error: Option<String>,
@@ -613,7 +604,7 @@ struct PvSelect {
 struct App {
     d2d: ID2D1Factory,
     /// 只为持有生命周期：文本格式对象各自持有自己的引用，但工厂得活着。
-#[allow(dead_code)]
+    #[allow(dead_code)]
     dwrite: IDWriteFactory,
     target: Option<Target>,
     br: Option<Brushes>,
@@ -623,9 +614,9 @@ struct App {
     snap: Arc<Mutex<Snapshot>>,
     tray: Option<TrayIcon>,
     /// 必须持有，否则注册的热键会在 drop 时被撤销。
-#[allow(dead_code)]
+    #[allow(dead_code)]
     /// 全局热键管理器与当前注册的组合键（None = 没注册）。
-hotkeys: Option<GlobalHotKeyManager>,
+    hotkeys: Option<GlobalHotKeyManager>,
     /// 总开关：开 = 按 `[hotkey]` 里两行注册，关 = 一条都不占用全局键。
     /// 它是运行时状态（设置页那一行显示的就是它），改组合也走它这道闸。
     hotkeys_on: bool,
@@ -635,45 +626,45 @@ hotkeys: Option<GlobalHotKeyManager>,
     /// 标注截图热键（`[hotkey] snip_annotate`）：选区后进标注窗，而 `snip` 是松手即存。
     snip_annotate_hk: Option<HotKey>,
     /// 系统材质贴上了（Win11 Mica）。
-mica: bool,
+    mica: bool,
     /// 现在真的走合成路径（透明/玻璃）。只有 `mica` 且合成成功才为 true。
-glass: bool,
+    glass: bool,
     /// 只读库句柄：`init_readonly` 的副作用是全局年度缓存。
-_db: Arc<focusflow_core::db::Database>,
+    _db: Arc<focusflow_core::db::Database>,
     /// 顶部视图：0=键鼠排行 1=应用排行 2=设备排行 3=活跃分析 4=插件 5=设置。
-view: usize,
+    view: usize,
     /// 活跃分析页内的子页签：0=趋势 1=小时 2=星期 3=热力。
-atab: usize,
+    atab: usize,
     /// 列表滚动到第几行（0 = 顶部）。
-scroll: usize,
+    scroll: usize,
     /// 当前统计周期；后台刷新线程也要读，所以放在原子量里。
-period: Arc<AtomicI64>,
+    period: Arc<AtomicI64>,
     /// 设备详情弹窗（None = 没开）。打开时是模态：点击/滚动都被它接走。
-detail: Option<DeviceDetail>,
+    detail: Option<DeviceDetail>,
     /// 热力页上光标下的键（`heat_keys()` 的下标）。
-heat_hover: Option<usize>,
+    heat_hover: Option<usize>,
     /// 设置页底部那条状态：上一次数据操作的结果 / "正在…"。
-status: Option<String>,
+    status: Option<String>,
     /// 有后台操作在跑（按钮置灰，避免连点）。
-busy: bool,
+    busy: bool,
     /// 设置页的搜索词（搜索框里的文字，过滤清单用）。
-search: String,
+    search: String,
     /// 设置页左侧当前分类（0=常规…，见 [`SETTINGS_CATS`]）。
     settings_cat: usize,
     /// 设置页里那个常驻的搜索框（与行内编辑用的那个 EDIT 不是同一个）。
-search_edit: Option<HWND>,
+    search_edit: Option<HWND>,
     /// 后台操作把结果行塞这里，再投 `WM_OP_DONE` 让界面来取。
-ops: Arc<Mutex<Vec<String>>>,
+    ops: Arc<Mutex<Vec<String>>>,
     /// 插件管理器（Lua 不是 Send，只能待在 UI 线程）。
-pm: Option<PluginManager>,
+    pm: Option<PluginManager>,
     /// 插件列表（从 plugins/ 目录扫出来的）。
-plugin_rows: Vec<PluginRow>,
+    plugin_rows: Vec<PluginRow>,
     /// 扫描插件目录失败的原因。
-plugin_err: Option<String>,
+    plugin_err: Option<String>,
     /// 这一轮进程里有没有把启用的插件真正加载过（加载才会出错，插件页要给原因）。
-plugins_loaded: bool,
+    plugins_loaded: bool,
     /// 正在看哪个插件的视图（None = 插件清单）。
-plugin_open: Option<String>,
+    plugin_open: Option<String>,
     /// 插件视图的纵向滚动（像素）。
     pv_scroll: i32,
     /// 插件视图里打开的下拉（None = 没开）。
@@ -685,11 +676,11 @@ plugin_open: Option<String>,
     /// 关掉面板就不留选中），切换分组互不影响。
     plugin_sel: HashMap<String, Vec<String>>,
     /// 上一次重算插件视图的时间戳（1 秒一次就够，别跟着 100ms 心跳跑）。
-last_pv_refresh: Option<std::time::Instant>,
+    last_pv_refresh: Option<std::time::Instant>,
     hover: Option<usize>,
     sel: Option<usize>,
     /// 行内编辑用的原生 EDIT 子窗口（懒创建，一直复用）。
-edit: Option<HWND>,
+    edit: Option<HWND>,
     edit_target: Option<EditTarget>,
     edit_row: Option<usize>,
     ui_font: HFONT,
@@ -799,7 +790,7 @@ impl App {
             }
 
             // 原生 EDIT 的字体与底色：EDIT 不认 D2D 主题，只能单独喂。
-let dpi = GetDpiForWindow(hwnd) as f32;
+            let dpi = GetDpiForWindow(hwnd) as f32;
             let dpi = if dpi <= 0.0 { 96.0 } else { dpi };
             let ui_font = CreateFontW(
                 -((13.0 * dpi / 96.0).round() as i32),
@@ -855,10 +846,10 @@ let dpi = GetDpiForWindow(hwnd) as f32;
                 snap,
                 tray,
                 hotkeys,
-            hotkeys_on: hotkey_hk.is_some() || snip_hk.is_some(),
-            hotkey_hk,
-            snip_hk,
-            snip_annotate_hk,
+                hotkeys_on: hotkey_hk.is_some() || snip_hk.is_some(),
+                hotkey_hk,
+                snip_hk,
+                snip_annotate_hk,
                 mica,
                 glass: false,
                 _db: db,
@@ -900,7 +891,7 @@ let dpi = GetDpiForWindow(hwnd) as f32;
     }
 
     /// 目标不存在就建（先试合成路径，失败退。
-fn ensure_target(&mut self, hwnd: HWND) {
+    fn ensure_target(&mut self, hwnd: HWND) {
         let mut rc = RECT::default();
         unsafe {
             let _ = GetClientRect(hwnd, &mut rc);
@@ -951,7 +942,9 @@ fn ensure_target(&mut self, hwnd: HWND) {
         if !stale {
             return;
         }
-        let Some(t) = self.target.as_ref() else { return };
+        let Some(t) = self.target.as_ref() else {
+            return;
+        };
         let tokens = tokens_for(name);
         let pal = tokens.pick(self.glass);
         match Brushes::new(&t.rt, pal) {
@@ -987,7 +980,9 @@ fn ensure_target(&mut self, hwnd: HWND) {
         self.ensure_brushes(&name);
         let tokens = tokens_for(&name);
         let pal = tokens.pick(self.glass);
-        let Some(t) = self.target.as_ref() else { return };
+        let Some(t) = self.target.as_ref() else {
+            return;
+        };
         let Some(br) = self.br.as_ref() else { return };
         let snap = self.snap.lock().map(|s| s.clone()).unwrap_or_default();
 
@@ -1064,7 +1059,7 @@ fn ensure_target(&mut self, hwnd: HWND) {
     }
 
     /// 客户区尺寸，换算。
-fn client_dip(&self, hwnd: HWND) -> (f32, f32) {
+    fn client_dip(&self, hwnd: HWND) -> (f32, f32) {
         let mut rc = RECT::default();
         unsafe {
             let _ = GetClientRect(hwnd, &mut rc);
@@ -1077,10 +1072,10 @@ fn client_dip(&self, hwnd: HWND) -> (f32, f32) {
     }
 
     /// 鼠标移动：排行页更新悬停行，热力页更新悬停键；返回是否需要重画。
-fn on_move(&mut self, hwnd: HWND, px: f32, py: f32) -> bool {
+    fn on_move(&mut self, hwnd: HWND, px: f32, py: f32) -> bool {
         let mut changed = false;
         // 弹窗、插。
-if self.detail.is_some() || (self.view == 3 && self.atab != 3) {
+        if self.detail.is_some() || (self.view == 3 && self.atab != 3) {
             changed |= self.hover.take().is_some();
             changed |= self.heat_hover.take().is_some();
             return changed;
@@ -1192,7 +1187,7 @@ if self.detail.is_some() || (self.view == 3 && self.atab != 3) {
 
     fn on_click(&mut self, hwnd: HWND, px: f32, py: f32) {
         // 点到编辑框外面：先把这一笔提交掉（与网页版一致，失焦即保存）。
-if self.edit_target.is_some() {
+        if self.edit_target.is_some() {
             self.finish_edit(hwnd, true);
         }
         let (w, h) = self.client_dip(hwnd);
@@ -1200,7 +1195,7 @@ if self.edit_target.is_some() {
         let (x, y) = (px / s, py / s);
 
         // 模态优先：点关闭按钮或遮罩都算关，点对话框内部不穿透。
-if self.detail.is_some() {
+        if self.detail.is_some() {
             let (dialog, close) = detail_rects(w, h);
             if hit(close, x, y) || !hit(dialog, x, y) {
                 self.close_detail(hwnd);
@@ -1215,7 +1210,7 @@ if self.detail.is_some() {
         }
 
         // 顶部视图页签。
-for (i, tab) in view_tabs().iter().enumerate() {
+        for (i, tab) in view_tabs().iter().enumerate() {
             if hit(*tab, x, y) {
                 tracing_note(&format!("点击视图 {i} at ({x:.0},{y:.0})"));
                 self.view = i;
@@ -1421,7 +1416,8 @@ for (i, tab) in view_tabs().iter().enumerate() {
                             if ids.is_empty() {
                                 return;
                             }
-                            let Some(i) = (0..ids.len()).find(|i| hit(pv_table_row_rect(r, *i), x, y))
+                            let Some(i) =
+                                (0..ids.len()).find(|i| hit(pv_table_row_rect(r, *i), x, y))
                             else {
                                 return;
                             };
@@ -1539,13 +1535,8 @@ for (i, tab) in view_tabs().iter().enumerate() {
                     break;
                 }
                 // 注意变量名：这里的行顶端不能。
-let y0 = g.list_top + vis as f32 * g.row_h;
-                let row_rect = rect(
-                    g.body_left,
-                    y0,
-                    w - 32.0 - g.body_left,
-                    g.row_h - 2.0,
-                );
+                let y0 = g.list_top + vis as f32 * g.row_h;
+                let row_rect = rect(g.body_left, y0, w - 32.0 - g.body_left, g.row_h - 2.0);
                 if hit(row_rect, x, y) {
                     self.sel = Some(idx);
                     match items[idx] {
@@ -1553,7 +1544,7 @@ let y0 = g.list_top + vis as f32 * g.row_h;
                         SItem::Action(a) => self.run_action(hwnd, a),
                         SItem::Basic(Basic::Autostart) => self.toggle_autostart(hwnd),
                         SItem::Basic(Basic::Hotkey) => self.toggle_hotkey(hwnd),
-                        SItem::Basic(Basic::Snip) => start_snip(hwnd, true),
+                        SItem::Basic(Basic::Snip) => snip::start(hwnd, true),
                         SItem::Basic(Basic::ClosePins) => self.close_pins(hwnd),
                         SItem::Basic(Basic::WeeklyReport) => self.make_weekly_report(hwnd),
                         SItem::Basic(Basic::Floating) => {
@@ -1643,7 +1634,7 @@ let y0 = g.list_top + vis as f32 * g.row_h;
                         return;
                     }
                     // 点行本身（不在按钮上）= 看详情。
-self.open_detail(hwnd, idx);
+                    self.open_detail(hwnd, idx);
                     return;
                 }
             }
@@ -1655,7 +1646,7 @@ self.open_detail(hwnd, idx);
     }
 
     /// 设置页底部那三颗「执行」：备份 / 压缩 / 清理，都在后台线程跑。
-fn run_action(&mut self, hwnd: HWND, which: usize) {
+    fn run_action(&mut self, hwnd: HWND, which: usize) {
         if self.busy {
             return;
         }
@@ -1674,7 +1665,7 @@ fn run_action(&mut self, hwnd: HWND, which: usize) {
         let ops = Arc::clone(&self.ops);
         let hwnd_val = hwnd.0 as isize;
         // 导出要在后台线程里拼文件，先把这一份快照拷出来。
-let snap_data = if which >= 3 {
+        let snap_data = if which >= 3 {
             self.snap.lock().ok().map(|s| s.clone())
         } else {
             None
@@ -1687,8 +1678,11 @@ let snap_data = if which >= 3 {
                 };
                 let line = match which {
                     0 => {
-                        let max = focusflow_core::config::instance()
-                            .get_int("database", "max_backups", 5);
+                        let max = focusflow_core::config::instance().get_int(
+                            "database",
+                            "max_backups",
+                            5,
+                        );
                         match backup_database(max) {
                             BackupOutcome::Done { count, failed, .. } => {
                                 if failed.is_empty() {
@@ -1701,7 +1695,9 @@ let snap_data = if which >= 3 {
                                 }
                             }
                             BackupOutcome::Failed { reason } => format!("备份失败：{reason}"),
-                            BackupOutcome::NothingToDo => "没有可备份的库（还没有数据）".to_string(),
+                            BackupOutcome::NothingToDo => {
+                                "没有可备份的库（还没有数据）".to_string()
+                            }
                         }
                     }
                     1 => vacuum_line(&vacuum_all()),
@@ -1734,7 +1730,12 @@ let snap_data = if which >= 3 {
                                         }
                                         let target = HWND(hwnd_val as *mut core::ffi::c_void);
                                         let _ = unsafe {
-                                            PostMessageW(Some(target), WM_OP_DONE, WPARAM(0), LPARAM(0))
+                                            PostMessageW(
+                                                Some(target),
+                                                WM_OP_DONE,
+                                                WPARAM(0),
+                                                LPARAM(0),
+                                            )
                                         };
                                         return;
                                     }
@@ -1768,7 +1769,9 @@ let snap_data = if which >= 3 {
                             Ok(p) => std::path::PathBuf::from(p),
                             Err(_) => {
                                 let picked = rfd::FileDialog::new()
-                                    .set_title("选择旧版数据目录（含 focusflow_YYYY.db 的那个 data 目录）")
+                                    .set_title(
+                                        "选择旧版数据目录（含 focusflow_YYYY.db 的那个 data 目录）",
+                                    )
                                     .pick_folder();
                                 match picked {
                                     Some(p) => p,
@@ -1778,7 +1781,12 @@ let snap_data = if which >= 3 {
                                         }
                                         let target = HWND(hwnd_val as *mut core::ffi::c_void);
                                         let _ = unsafe {
-                                            PostMessageW(Some(target), WM_OP_DONE, WPARAM(0), LPARAM(0))
+                                            PostMessageW(
+                                                Some(target),
+                                                WM_OP_DONE,
+                                                WPARAM(0),
+                                                LPARAM(0),
+                                            )
                                         };
                                         return;
                                     }
@@ -1819,7 +1827,12 @@ let snap_data = if which >= 3 {
                                         }
                                         let target = HWND(hwnd_val as *mut core::ffi::c_void);
                                         let _ = unsafe {
-                                            PostMessageW(Some(target), WM_OP_DONE, WPARAM(0), LPARAM(0))
+                                            PostMessageW(
+                                                Some(target),
+                                                WM_OP_DONE,
+                                                WPARAM(0),
+                                                LPARAM(0),
+                                            )
                                         };
                                         return;
                                     }
@@ -1846,7 +1859,7 @@ let snap_data = if which >= 3 {
     }
 
     /// 开机自启：改完必须**现读**回来对得上才算成功（与旧。
-fn toggle_autostart(&mut self, hwnd: HWND) {
+    fn toggle_autostart(&mut self, hwnd: HWND) {
         let want = !self.snap.lock().map(|s| s.autostart).unwrap_or(false);
         let (ok, msg) = if want {
             focusflow_core::autostart::enable_autostart()
@@ -1861,10 +1874,7 @@ fn toggle_autostart(&mut self, hwnd: HWND) {
                     .to_string(),
             );
         } else {
-            self.status = Some(format!(
-                "开机自启已{}",
-                if want { "打开" } else { "关闭" }
-            ));
+            self.status = Some(format!("开机自启已{}", if want { "打开" } else { "关闭" }));
         }
         tracing_note(self.status.as_deref().unwrap_or(""));
         self.refresh_now();
@@ -1903,7 +1913,7 @@ fn toggle_autostart(&mut self, hwnd: HWND) {
     /// 全局热键总开关：三条绑定（唤出 / 截图 / 截图进标注）一起注册或一起取消，
     /// 配置键 `hotkey.enabled` 跟着写一份，但**启动时没有读它的人** ⇒ "关掉热键"过不了一次
     /// 重启（要不要跨重启生效、以及随包模板里那行默认值，都是待用户点的口径）。
-fn toggle_hotkey(&mut self, hwnd: HWND) {
+    fn toggle_hotkey(&mut self, hwnd: HWND) {
         self.hotkeys_on = !self.hotkeys_on;
         let msg = self.reload_hotkeys();
         let _ = focusflow_core::config::instance().set(
@@ -1970,7 +1980,7 @@ fn toggle_hotkey(&mut self, hwnd: HWND) {
     }
 
     /// 插件管理器懒创建：Lua 不是 Send，只能挂。
-fn ensure_plugin_manager(&mut self) {
+    fn ensure_plugin_manager(&mut self) {
         if self.pm.is_none() {
             let cfg = focusflow_core::config::instance();
             self.pm = Some(PluginManager::new(cfg, Arc::clone(&self._db)));
@@ -1978,10 +1988,10 @@ fn ensure_plugin_manager(&mut self) {
     }
 
     /// 重扫插件目录（进插件页、切换开关之后各来一次）。
-fn reload_plugins(&mut self) {
+    fn reload_plugins(&mut self) {
         self.ensure_plugin_manager();
         // 第一次进来先把「启用中的插件」真的加载一遍：只有加载才会产出错误。
-if !self.plugins_loaded {
+        if !self.plugins_loaded {
             if let Some(pm) = self.pm.as_mut() {
                 pm.load_all();
                 self.plugins_loaded = true;
@@ -2015,7 +2025,7 @@ if !self.plugins_loaded {
     }
 
     /// 插件启用/停用：写。
-fn toggle_plugin(&mut self, hwnd: HWND, idx: usize) {
+    fn toggle_plugin(&mut self, hwnd: HWND, idx: usize) {
         let Some(row) = self.plugin_rows.get(idx).cloned() else {
             return;
         };
@@ -2046,7 +2056,7 @@ fn toggle_plugin(&mut self, hwnd: HWND, idx: usize) {
     }
 
     /// 打开某个插件的视图：先让插件重算 get_view，再读缓存。
-fn open_plugin_view(&mut self, hwnd: HWND, name: &str) {
+    fn open_plugin_view(&mut self, hwnd: HWND, name: &str) {
         self.ensure_plugin_manager();
         if let Some(pm) = self.pm.as_mut() {
             if let Err(e) = pm.refresh_view(name) {
@@ -2106,9 +2116,7 @@ fn open_plugin_view(&mut self, hwnd: HWND, name: &str) {
                 if let Some(pm) = self.pm.as_mut() {
                     let _ = pm.refresh_view(plugin);
                 }
-                tracing_note(&format!(
-                    "插件字段已回写：{plugin} / {field} = {value:?}"
-                ));
+                tracing_note(&format!("插件字段已回写：{plugin} / {field} = {value:?}"));
             }
             Err(e) => {
                 self.status = Some(format!("插件字段回写失败：{e}"));
@@ -2121,12 +2129,7 @@ fn open_plugin_view(&mut self, hwnd: HWND, name: &str) {
     }
 
     /// 关掉插件弹窗：有取消动作就先交给插件（它要清编辑状态），本地打开的直接收起。
-    fn close_plugin_modal(
-        &mut self,
-        hwnd: HWND,
-        plugin: &str,
-        m: &ModalRef<'_>,
-    ) {
+    fn close_plugin_modal(&mut self, hwnd: HWND, plugin: &str, m: &ModalRef<'_>) {
         if self.edit_target.is_some() {
             self.finish_edit(hwnd, false);
         }
@@ -2190,7 +2193,7 @@ fn open_plugin_view(&mut self, hwnd: HWND, name: &str) {
     }
 
     /// 插件视图里的按钮：把动作 id 交给插件，再把视图重算一遍。
-fn run_plugin_action(&mut self, hwnd: HWND, name: &str, action: &str) {
+    fn run_plugin_action(&mut self, hwnd: HWND, name: &str, action: &str) {
         let res = match self.pm.as_mut() {
             Some(pm) => pm.plugin_action(name, action),
             None => Err("没有插件管理器".to_string()),
@@ -2238,7 +2241,7 @@ fn run_plugin_action(&mut self, hwnd: HWND, name: &str, action: &str) {
     /// 数据目录：交给资源管理器打开（不自己实现文件浏览）。
     /// 打开的是**当前生效**的数据根，不是程序目录 —— 两者一旦分开（用户改过数据文件夹），
     /// 按程序目录打开会让人以为数据没搬过去。
-fn open_data_dir(&self) {
+    fn open_data_dir(&self) {
         let dir = focusflow_core::data_location::current_data_home();
         match std::process::Command::new("explorer").arg(&dir).spawn() {
             Ok(_) => tracing_note(&format!("打开数据目录：{}", dir.display())),
@@ -2247,7 +2250,7 @@ fn open_data_dir(&self) {
     }
 
     /// 设置页里那个常驻的搜索框：整个进程只建一次。
-fn ensure_search_edit(&mut self, parent: HWND) -> HWND {
+    fn ensure_search_edit(&mut self, parent: HWND) -> HWND {
         if let Some(e) = self.search_edit {
             return e;
         }
@@ -2281,14 +2284,14 @@ fn ensure_search_edit(&mut self, parent: HWND) -> HWND {
             );
             // 复用同一个子类过程：只为了拿到深色底与字色（Enter/Esc 在这里没有意义，
             // `finish_edit` 看到 edit_target 为空会直接返回）。
-let _ = SetWindowSubclass(h, Some(edit_proc), 2, 0);
+            let _ = SetWindowSubclass(h, Some(edit_proc), 2, 0);
         }
         self.search_edit = Some(h);
         h
     }
 
     /// 把搜索框摆到设置页右上角那块底框里（只在设置页可见）。
-fn place_search_edit(&mut self, hwnd: HWND) {
+    fn place_search_edit(&mut self, hwnd: HWND) {
         if self.view != 5 {
             return;
         }
@@ -2322,7 +2325,7 @@ fn place_search_edit(&mut self, hwnd: HWND) {
     }
 
     /// 还原设备名：清别。
-fn restore_device(&mut self, hwnd: HWND, idx: usize) {
+    fn restore_device(&mut self, hwnd: HWND, idx: usize) {
         let key = self
             .snap
             .lock()
@@ -2344,7 +2347,7 @@ fn restore_device(&mut self, hwnd: HWND, idx: usize) {
     }
 
     /// 懒创建那个原。
-fn ensure_edit(&mut self, parent: HWND) -> HWND {
+    fn ensure_edit(&mut self, parent: HWND) -> HWND {
         if let Some(h) = self.edit {
             return h;
         }
@@ -2421,12 +2424,12 @@ fn ensure_edit(&mut self, parent: HWND) -> HWND {
     }
 
     /// 设置页的一行：开关直接翻，其它类型开一个原。
-fn start_edit_setting(&mut self, hwnd: HWND, snapshot_idx: usize, item_idx: usize) {
-        let row = self
-            .snap
-            .lock()
-            .ok()
-            .and_then(|s| s.settings.get(snapshot_idx).map(|r| (r.value.clone(), r.kind)));
+    fn start_edit_setting(&mut self, hwnd: HWND, snapshot_idx: usize, item_idx: usize) {
+        let row = self.snap.lock().ok().and_then(|s| {
+            s.settings
+                .get(snapshot_idx)
+                .map(|r| (r.value.clone(), r.kind))
+        });
         let Some((value, kind)) = row else { return };
         if kind == 0 {
             return;
@@ -2475,12 +2478,12 @@ fn start_edit_setting(&mut self, hwnd: HWND, snapshot_idx: usize, item_idx: usiz
     }
 
     /// 开关类设置：读当前。
-fn toggle_setting(&mut self, hwnd: HWND, idx: usize) {
-        let row = self
-            .snap
-            .lock()
-            .ok()
-            .and_then(|s| s.settings.get(idx).map(|r| (r.section, r.key, r.value.clone())));
+    fn toggle_setting(&mut self, hwnd: HWND, idx: usize) {
+        let row = self.snap.lock().ok().and_then(|s| {
+            s.settings
+                .get(idx)
+                .map(|r| (r.section, r.key, r.value.clone()))
+        });
         if let Some((section, key, cur)) = row {
             let next = if cur == "true" { "false" } else { "true" };
             match focusflow_core::config::instance().set(section, key, next) {
@@ -2497,11 +2500,13 @@ fn toggle_setting(&mut self, hwnd: HWND, idx: usize) {
     }
 
     fn finish_edit(&mut self, hwnd: HWND, commit: bool) {
-        let Some(target) = self.edit_target.take() else { return };
+        let Some(target) = self.edit_target.take() else {
+            return;
+        };
         if let Some(e) = self.edit {
             // 先藏起来：藏窗口会触发 WM_KILLFOCUS，它又会投一次"提交"。
             // 而 `edit_target` 已经取空，把这一次挡掉。
-unsafe {
+            unsafe {
                 let _ = ShowWindow(e, SW_HIDE);
             }
             if commit {
@@ -2534,7 +2539,7 @@ unsafe {
                         if let Some((section, key, kind, default)) = row {
                             let value = text.trim().to_string();
                             // 数字格子先验一遍再写：写进。
-let numeric_ok = match kind {
+                            let numeric_ok = match kind {
                                 1 => value.parse::<i64>().is_ok(),
                                 2 => value.parse::<f64>().is_ok(),
                                 _ => true,
@@ -2567,9 +2572,9 @@ let numeric_ok = match kind {
                                         self.refresh_now();
                                         tracing_note(&format!("设置已写入 {section}.{key}={v:?}"));
                                     }
-                                    Err(err) => {
-                                        tracing_note(&format!("设置写入失败 {section}.{key}: {err}"))
-                                    }
+                                    Err(err) => tracing_note(&format!(
+                                        "设置写入失败 {section}.{key}: {err}"
+                                    )),
                                 }
                             }
                         }
@@ -2636,7 +2641,7 @@ let numeric_ok = match kind {
         let Some(key) = key else { return };
         let period = self.period.load(std::sync::atomic::Ordering::Relaxed);
         // 注：这条查询在 UI 线程上跑（探针库很小）。正式版要挪到后台线程再投消息回来。
-self.detail = Some(focusflow_core::db::get_device_detail(&key, period));
+        self.detail = Some(focusflow_core::db::get_device_detail(&key, period));
         tracing_note(&format!("打开设备详情 key={key:?} period={period}"));
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2905,7 +2910,10 @@ const ACTIONS: [(&str, &str); 8] = [
     ("导出 HTML", "写成一份可直接打开的网页报告"),
     ("导出 JSON", "写成结构化数据（脚本可读）"),
     ("导入旧数据…", "从旧版数据目录合并进来（先留档再覆盖）"),
-    ("更改数据文件夹…", "把 data/ 与 backup/ 搬到新目录；重启后执行"),
+    (
+        "更改数据文件夹…",
+        "把 data/ 与 backup/ 搬到新目录；重启后执行",
+    ),
 ];
 
 /// 设置页右上角那个搜索框（底框；真正的输入是叠上去的原。
@@ -2939,12 +2947,17 @@ fn draw_settings(
     );
 
     // 搜索框：底框画在这里，真正的输入是叠在上面的原生 EDIT（见 place_search_edit）。
-let sbox = search_box_rect(w);
+    let sbox = search_box_rect(w);
     p.round(sbox, 7.0, &p.br.header, Some(&p.br.border));
     if filter.is_empty() {
         p.text(
             "搜索设置（名称或段.键）…",
-            rect(sbox.left + 10.0, sbox.top + 4.0, sbox.right - sbox.left - 20.0, 18.0),
+            rect(
+                sbox.left + 10.0,
+                sbox.top + 4.0,
+                sbox.right - sbox.left - 20.0,
+                18.0,
+            ),
             &p.fmt.small,
             &p.br.muted,
         );
@@ -2969,13 +2982,23 @@ let sbox = search_box_rect(w);
         }
         p.text(
             label,
-            rect(nr.left + 12.0, nr.top + 4.0, nr.right - nr.left - 20.0, 18.0),
+            rect(
+                nr.left + 12.0,
+                nr.top + 4.0,
+                nr.right - nr.left - 20.0,
+                18.0,
+            ),
             &p.fmt.body,
             if active { &p.br.accent } else { &p.br.fg },
         );
         p.text(
             desc,
-            rect(nr.left + 12.0, nr.top + 22.0, nr.right - nr.left - 20.0, 14.0),
+            rect(
+                nr.left + 12.0,
+                nr.top + 22.0,
+                nr.right - nr.left - 20.0,
+                14.0,
+            ),
             &p.fmt.small,
             &p.br.muted,
         );
@@ -3236,7 +3259,12 @@ let sbox = search_box_rect(w);
                     }
                     Basic::Theme => {
                         let dark = vs.dark;
-                        p.round(vb, 6.0, if dark { &p.br.header } else { &p.br.accent }, Some(&p.br.border));
+                        p.round(
+                            vb,
+                            6.0,
+                            if dark { &p.br.header } else { &p.br.accent },
+                            Some(&p.br.border),
+                        );
                         p.text(
                             if dark { "深色" } else { "浅色" },
                             vb,
@@ -3262,14 +3290,12 @@ let sbox = search_box_rect(w);
                     }
                     Basic::DataDir => {
                         p.round(vb, 6.0, &p.br.header, Some(&p.br.border));
-                        p.text(
-                            "打开",
-                            vb,
-                            &p.fmt.center_small,
-                            &p.br.fg,
-                        );
+                        p.text("打开", vb, &p.fmt.center_small, &p.br.fg);
                         let dir_line = if snap.pending_move.is_empty() {
-                            format!("{}（改目录要用下面的「更改数据文件夹」，重启后生效）", snap.data_home)
+                            format!(
+                                "{}（改目录要用下面的「更改数据文件夹」，重启后生效）",
+                                snap.data_home
+                            )
                         } else {
                             // 安排过但还没重启：这句话就是"为什么现在还在旧目录"的读数。
                             format!(
@@ -3288,7 +3314,7 @@ let sbox = search_box_rect(w);
             }
             SItem::Action(a) => {
                 // 数据操作行：左边是名字，右边一颗「执行」按钮，再右边一句后果说明。
-let (label, desc) = ACTIONS[a];
+                let (label, desc) = ACTIONS[a];
                 p.text(
                     label,
                     rect(r.left + 12.0, y + 3.0, 240.0, 18.0),
@@ -3297,7 +3323,12 @@ let (label, desc) = ACTIONS[a];
                 );
                 let vb = rect(g.value_x, y + 9.0, 80.0, 26.0);
                 let enabled = !busy;
-                p.round(vb, 6.0, if enabled { &p.br.accent } else { &p.br.grid }, None);
+                p.round(
+                    vb,
+                    6.0,
+                    if enabled { &p.br.accent } else { &p.br.grid },
+                    None,
+                );
                 p.text(
                     if busy { "…" } else { "执行" },
                     vb,
@@ -3320,7 +3351,12 @@ let (label, desc) = ACTIONS[a];
         let warn = line.starts_with("注意");
         p.text(
             line,
-            rect(card.left + 16.0, card.bottom - 26.0, card.right - card.left - 32.0, 18.0),
+            rect(
+                card.left + 16.0,
+                card.bottom - 26.0,
+                card.right - card.left - 32.0,
+                18.0,
+            ),
             &p.fmt.small,
             if warn { &p.br.danger } else { &p.br.muted },
         );
@@ -3368,7 +3404,7 @@ fn period_text(period: i64) -> String {
 
 fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
     // 遮罩：整屏压暗，点击它等于关闭。
-p.fill(rect(0.0, 0.0, w, h), &p.br.overlay);
+    p.fill(rect(0.0, 0.0, w, h), &p.br.overlay);
     let (dialog, close) = detail_rects(w, h);
     p.round(dialog, 16.0, &p.br.modal, Some(&p.br.border));
 
@@ -3409,12 +3445,7 @@ p.fill(rect(0.0, 0.0, w, h), &p.br.overlay);
 
     let col2 = x + (dialog.right - dialog.left) * 0.52;
     let row = |label: &str, value: &str, cx: f32, yy: f32| {
-        p.text(
-            label,
-            rect(cx, yy, 76.0, 18.0),
-            &p.fmt.small,
-            &p.br.muted,
-        );
+        p.text(label, rect(cx, yy, 76.0, 18.0), &p.fmt.small, &p.br.muted);
         p.text(
             value,
             rect(cx + 82.0, yy, dialog.right - cx - 100.0, 18.0),
@@ -3432,7 +3463,12 @@ p.fill(rect(0.0, 0.0, w, h), &p.br.overlay);
     };
     row("今日", &thousands(d.today.max(0) as u64), x, y0);
     row("近 7 天", &thousands(d.week.max(0) as u64), x, y0 + step);
-    row("近 30 天", &thousands(d.month.max(0) as u64), x, y0 + step * 2.0);
+    row(
+        "近 30 天",
+        &thousands(d.month.max(0) as u64),
+        x,
+        y0 + step * 2.0,
+    );
     row("全部", &thousands(d.all.max(0) as u64), x, y0 + step * 3.0);
 
     row(
@@ -3477,19 +3513,27 @@ p.fill(rect(0.0, 0.0, w, h), &p.br.overlay);
     );
     row(
         "首次使用",
-        if d.first_date.is_empty() { "—" } else { &d.first_date },
+        if d.first_date.is_empty() {
+            "—"
+        } else {
+            &d.first_date
+        },
         x,
         y0 + step * 5.0,
     );
     row(
         "最近使用",
-        if d.last_date.is_empty() { "—" } else { &d.last_date },
+        if d.last_date.is_empty() {
+            "—"
+        } else {
+            &d.last_date
+        },
         col2,
         y0 + step * 5.0,
     );
 
     // 。
-let ty = dialog.bottom - 74.0;
+    let ty = dialog.bottom - 74.0;
     p.text(
         "近 30 天分布",
         rect(x, ty - 20.0, 160.0, 16.0),
@@ -3537,7 +3581,7 @@ struct ViewState {
     editing: Option<usize>,
     heat_hover: Option<usize>,
     /// 全局热键此刻是否真的注册着（不是配置键，是运行时状态）。
-hotkey_on: bool,
+    hotkey_on: bool,
     /// 悬浮窗此刻是否真的显示着（同上：读运行时状态，不读配置键 ——
     /// 手改 `[floating] enabled` 并不会让卡片出现或消失）。
     floating_on: bool,
@@ -3631,10 +3675,7 @@ fn draw_screen(
     }
 
     // --- 五张统计卡（真数据）---
-    let max_day = snap
-        .max_day
-        .clone()
-        .unwrap_or_else(|| ("—".to_string(), 0));
+    let max_day = snap.max_day.clone().unwrap_or_else(|| ("—".to_string(), 0));
     // 「当前速度」有三种状态：没开采集（只读）、开着但暂停、正在采集。
     // 没数据时不写内部代号，也不留一个看起来只是暂时没数的空位。
     let (speed_value, speed_sub) = if !vs.collector_on {
@@ -3642,7 +3683,10 @@ fn draw_screen(
     } else if vs.collector_paused {
         ("—".to_string(), "采集已暂停".to_string())
     } else {
-        (thousands(vs.cpm.max(0) as u64), "次/分 · 近 60 秒".to_string())
+        (
+            thousands(vs.cpm.max(0) as u64),
+            "次/分 · 近 60 秒".to_string(),
+        )
     };
     let cards: Vec<(String, String, String)> = vec![
         (
@@ -3745,7 +3789,7 @@ fn draw_screen(
     }
 
     // 模态最后画：它压在所有东西上面。
-if let Some(d) = detail {
+    if let Some(d) = detail {
         draw_detail(p, w, h, d);
     }
 }
@@ -3820,7 +3864,12 @@ fn draw_goal_strip(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     let Some(g) = &snap.goal else {
         p.text(
             "每日目标读不出来（这一轮统计没答上来）",
-            rect(r.left + pad, r.top + 14.0, r.right - r.left - pad * 2.0, 18.0),
+            rect(
+                r.left + pad,
+                r.top + 14.0,
+                r.right - r.left - pad * 2.0,
+                18.0,
+            ),
             &p.fmt.small,
             &p.br.muted,
         );
@@ -3845,12 +3894,7 @@ fn draw_goal_strip(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     let dots_x = r.right - pad - dots_w;
     let bar_x = r.left + pad + 158.0;
     // 右边留给「连续打。
-let bar = rect(
-        bar_x,
-        r.top + 19.0,
-        (dots_x - bar_x - 214.0).max(40.0),
-        8.0,
-    );
+    let bar = rect(bar_x, r.top + 19.0, (dots_x - bar_x - 214.0).max(40.0), 8.0);
     p.round(bar, 4.0, &p.br.grid, None);
     let pct = (today as f32 / goal as f32).clamp(0.0, 1.0);
     if pct > 0.0 {
@@ -3904,15 +3948,30 @@ fn draw_analytics(p: &P<'_>, w: f32, h: f32, snap: &Snapshot, vs: ViewState) {
     match vs.atab {
         0 => {
             // 趋势图：复用排行页那张，只是给它整块宽度。
-let plot = rect(content.left, content.top, content.right - content.left, 300.0);
+            let plot = rect(
+                content.left,
+                content.top,
+                content.right - content.left,
+                300.0,
+            );
             draw_line_chart(p, plot, snap);
         }
         1 => {
-            let plot = rect(content.left, content.top, content.right - content.left, 300.0);
+            let plot = rect(
+                content.left,
+                content.top,
+                content.right - content.left,
+                300.0,
+            );
             draw_hourly(p, plot, snap);
         }
         2 => {
-            let plot = rect(content.left, content.top, content.right - content.left, 300.0);
+            let plot = rect(
+                content.left,
+                content.top,
+                content.right - content.left,
+                300.0,
+            );
             draw_weekday(p, plot, snap);
         }
         _ => {
@@ -4169,7 +4228,7 @@ fn draw_heat(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
     );
 
     // 次数：AltGr 与「右Alt」是同一个物理键，合并（charts.js 里的 KH_ALIASES）。
-let mut counts: HashMap<&str, i64> = HashMap::new();
+    let mut counts: HashMap<&str, i64> = HashMap::new();
     for (k, v) in &snap.rank {
         let name: &str = if k == "AltGr" { "右Alt" } else { k.as_str() };
         *counts.entry(name).or_insert(0) += *v;
@@ -4198,7 +4257,7 @@ let mut counts: HashMap<&str, i64> = HashMap::new();
             p.round(base, 3.0, &p.br.card, Some(&p.br.accent));
         }
         // 键帽窄（鼠标簇、方向键）就换小一号字。
-let fmt = if base.right - base.left < 34.0 {
+        let fmt = if base.right - base.left < 34.0 {
             &p.fmt.center_tiny
         } else {
             &p.fmt.center_small
@@ -4238,7 +4297,7 @@ let fmt = if base.right - base.left < 34.0 {
     );
 
     // 板上没摆的键（输入法标点、合成键名）汇总成一句，不静默丢数据。
-let board: std::collections::HashSet<&str> = keys.iter().map(|k| k.name).collect();
+    let board: std::collections::HashSet<&str> = keys.iter().map(|k| k.name).collect();
     let (mut other_n, mut other_c) = (0usize, 0i64);
     for (k, v) in &snap.rank {
         let name: &str = if k == "AltGr" { "右Alt" } else { k.as_str() };
@@ -4248,1117 +4307,25 @@ let board: std::collections::HashSet<&str> = keys.iter().map(|k| k.name).collect
         }
     }
     let line = hover
-        .and_then(|i| keys.get(i).map(|k| (k, counts.get(k.name).copied().unwrap_or(0))))
+        .and_then(|i| {
+            keys.get(i)
+                .map(|k| (k, counts.get(k.name).copied().unwrap_or(0)))
+        })
         .map(|(k, c)| {
             let pct = if total > 0 {
                 c as f32 * 100.0 / total as f32
             } else {
                 0.0
             };
-            format!(
-                "{} · {} 次 · {pct:.1}%",
-                k.name,
-                thousands(c.max(0) as u64)
-            )
+            format!("{} · {} 次 · {pct:.1}%", k.name, thousands(c.max(0) as u64))
         })
-        .unwrap_or_else(|| {
-            format!("其它按键：{other_n} 个 · {other_c} 次（板上没摆的键）")
-        });
+        .unwrap_or_else(|| format!("其它按键：{other_n} 个 · {other_c} 次（板上没摆的键）"));
     p.text(
         &line,
         rect(r.left + 170.0, ly + 4.0, r.right - r.left - 194.0, 16.0),
         &p.fmt.small,
         &p.br.muted,
     );
-}
-
-
-// ===== 截图（选区 → PNG）=====
-
-/// 屏幕区域截图的缓冲（BGRA、自上而下）。
-fn capture_rect(x: i32, y: i32, w: i32, h: i32) -> std::result::Result<Vec<u8>, String> {
-    if w <= 0 || h <= 0 {
-        return Err(format!("选区太小：{w}×{h}"));
-    }
-    unsafe {
-        let screen = GetDC(None);
-        if screen.0.is_null() {
-            return Err("拿不到屏幕 DC".into());
-        }
-        let mem = CreateCompatibleDC(Some(screen));
-        let bmp = CreateCompatibleBitmap(screen, w, h);
-        let old = SelectObject(mem, bmp.into());
-        let ok = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY).is_ok();
-
-        let mut info = BITMAPINFO::default();
-        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        info.bmiHeader.biWidth = w;
-        // 负高度 = 自上而下，省一次翻转。
-info.bmiHeader.biHeight = -h;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB.0;
-        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
-        let lines = GetDIBits(
-            mem,
-            bmp,
-            0,
-            h as u32,
-            Some(buf.as_mut_ptr() as *mut _),
-            &mut info,
-            DIB_RGB_COLORS,
-        );
-
-        SelectObject(mem, old);
-        let _ = DeleteObject(bmp.into());
-        let _ = DeleteDC(mem);
-        ReleaseDC(None, screen);
-
-        if !ok || lines == 0 {
-            return Err("BitBlt/GetDIBits 没成功".into());
-        }
-        Ok(buf)
-    }
-}
-
-/// BGRA 。
-fn save_png(path: &std::path::Path, w: u32, h: u32, bgra: &[u8]) -> std::result::Result<(), String> {
-    let file = std::fs::File::create(path).map_err(|e| format!("建文件失败：{e}"))?;
-    let writer = std::io::BufWriter::new(file);
-    let mut enc = png::Encoder::new(writer, w, h);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut png_writer = enc.write_header().map_err(|e| format!("PNG 头失败：{e}"))?;
-    let mut rgba = Vec::with_capacity(bgra.len());
-    for px in bgra.chunks_exact(4) {
-        rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
-    }
-    png_writer
-        .write_image_data(&rgba)
-        .map_err(|e| format!("PNG 数据失败：{e}"))?;
-    Ok(())
-}
-
-/// 把一张 BGRA（自上而下）塞进剪贴板，格式 CF_DIB（自下而上，Windows 位图的老规矩）。
-fn copy_bgra_to_clipboard(bgra: &[u8], w: i32, h: i32) -> std::result::Result<(), String> {
-    const CF_DIB: u32 = 8;
-    unsafe {
-        if OpenClipboard(None).is_err() {
-            return Err("剪贴板被别的程序占着".into());
-        }
-        let _ = EmptyClipboard();
-        let header = std::mem::size_of::<BITMAPINFOHEADER>();
-        let image = (w as usize) * (h as usize) * 4;
-        let total = header + image;
-        let hmem = match GlobalAlloc(GMEM_MOVEABLE, total) {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = CloseClipboard();
-                return Err(format!("GlobalAlloc 失败：{e}"));
-            }
-        };
-        let ptr = GlobalLock(hmem) as *mut u8;
-        if ptr.is_null() {
-            let _ = CloseClipboard();
-            return Err("GlobalLock 失败".into());
-        }
-        let bi = BITMAPINFOHEADER {
-            biSize: header as u32,
-            biWidth: w,
-            biHeight: h,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        };
-        std::ptr::copy_nonoverlapping(&bi as *const _ as *const u8, ptr, header);
-        // CF_DIB 是自下而上的：逐行倒着拷
-        let dst = ptr.add(header);
-        for row in 0..h as usize {
-            let src_row = h as usize - 1 - row;
-            std::ptr::copy_nonoverlapping(
-                bgra.as_ptr().add(src_row * w as usize * 4),
-                dst.add(row * w as usize * 4),
-                w as usize * 4,
-            );
-        }
-        let _ = GlobalUnlock(hmem);
-        if SetClipboardData(CF_DIB, Some(HANDLE(hmem.0))).is_err() {
-            let _ = CloseClipboard();
-            return Err("SetClipboardData 失败".into());
-        }
-        let _ = CloseClipboard();
-    }
-    Ok(())
-}
-
-/// 截一块屏幕并落盘（顺带进剪贴板），返回文件路径。
-///
-/// 现在的主流程是「选区 → 编辑窗口 → 保存」，这一条留给"不想编辑、直接截"的
-/// 快捷路径（P6 收尾时接到 `[hotkey] snip_direct`）。
-#[allow(dead_code)]
-fn snip_region_to_file(x: i32, y: i32, w: i32, h: i32) -> std::result::Result<std::path::PathBuf, String> {
-    let buf = capture_rect(x, y, w, h)?;
-    let dir = focusflow_core::paths::screenshots_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("建截图目录失败：{e}"))?;
-    let name = format!(
-        "screenshot_{}.png",
-        chrono::Local::now().format("%Y%m%d_%H%M%S")
-    );
-    let path = dir.join(name);
-    save_png(&path, w as u32, h as u32, &buf)?;
-    // 剪贴板失败不算截图失败：文件已经在盘上了。
-    match copy_bgra_to_clipboard(&buf, w, h) {
-        Ok(()) => tracing_note("截图已进剪贴板"),
-        Err(e) => tracing_note(&format!("截图进了文件，但剪贴板没写进去：{e}")),
-    }
-    Ok(path)
-}
-
-/// 一条标注。坐标都是图像本地坐标。
-#[derive(Clone, Debug)]
-enum SnipMark {
-    /// 方框：(x, y, w, h)
-    Rect(i32, i32, i32, i32),
-    /// 箭头：(x0, y0, x1, y1)
-    Arrow(i32, i32, i32, i32),
-    /// 文字：(x, y, 文本)
-    Text(i32, i32, String),
-}
-
-/// 截图覆盖层的拖选状态（同一时刻只允许一个）。
-struct SnipState {
-    active: bool,
-    start: (i32, i32),
-    cur: (i32, i32),
-    /// 这一次选区松手后要不要进标注窗：false = 松手即存（`[hotkey] snip` 那条路）。
-    annotate: bool,
-    /// 编辑阶段：冻结下来的那一块画面（BGRA，自上而下）与尺寸。
-    editing: bool,
-    img: Vec<u8>,
-    img_w: i32,
-    img_h: i32,
-    /// 已画的标注（图像本地坐标）。
-    marks: Vec<SnipMark>,
-    /// 当前工具：0 方框 / 1 箭头 / 2 文字。
-    tool: u8,
-    /// 正在拖的那一笔的起点。
-    drag: Option<(i32, i32)>,
-    /// 编辑窗口句柄（存 isize：静态量要 Send）。
-    editor: isize,
-    /// 文字标注用的那个原生 EDIT（编辑窗口的子窗口）。
-    text_edit: isize,
-    /// 文字落点（点下去那一刻记下）。
-    text_at: (i32, i32),
-}
-
-static SNIP: Mutex<SnipState> = Mutex::new(SnipState {
-    active: false,
-    start: (0, 0),
-    cur: (0, 0),
-    annotate: false,
-    editing: false,
-    img: Vec::new(),
-    img_w: 0,
-    img_h: 0,
-    marks: Vec::new(),
-    tool: 0,
-    drag: None,
-    editor: 0,
-    text_edit: 0,
-    text_at: (0, 0),
-});
-
-/// 编辑窗口底部工具条的高度。
-const SNIP_BAR_H: i32 = 40;
-
-fn virtual_screen_origin() -> (i32, i32) {
-    unsafe {
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-        )
-    }
-}
-
-/// 覆盖层挂满三分钟就自己退：截图是"顺手按一次"的工具，鼠标忘了它，整张桌面会一直被蒙版压着。
-const SNIP_TIMEOUT_MS: u32 = 180_000;
-/// 那个定时器 id（`0x534E` = 'SN'）。验收脚本按同一个数投一条 WM_TIMER 过来催它响。
-const SNIP_TIMEOUT_TIMER: usize = 0x534E;
-
-/// 覆盖层上"单击选窗口"看到的一条候选：Z 序里的一个顶层窗口，只带判得动的那三件事。
-/// 谁家的、可见吗、矩形——枚举与取边界留在 Win32 那一侧，裁决全在这里。
-#[derive(Clone, Copy, Debug)]
-struct SnipCandidate {
-    pid: u32,
-    visible: bool,
-    /// left, top, right, bottom（屏幕坐标）
-    rect: (i32, i32, i32, i32),
-}
-
-/// 按 Z 序（`EnumWindows` 的枚举顺序就是从最上面往下）收候选，装进 [`SNIP_HITS`]。
-/// 回调不能带环境，所以结果落在静态里，收完再拷出来。
-fn snip_candidates() -> Vec<SnipCandidate> {
-    if let Ok(mut v) = SNIP_HITS.lock() {
-        v.clear();
-    }
-    unsafe {
-        let _ = EnumWindows(Some(snip_collect_hit), LPARAM(0));
-    }
-    SNIP_HITS.lock().map(|v| v.clone()).unwrap_or_default()
-}
-
-static SNIP_HITS: Mutex<Vec<SnipCandidate>> = Mutex::new(Vec::new());
-
-unsafe extern "system" fn snip_collect_hit(hwnd: HWND, _l: LPARAM) -> BOOL {
-    let mut pid = 0u32;
-    unsafe {
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-    }
-    let mut rc = RECT::default();
-    unsafe {
-        // DWM 那份边界才是"看见的那块"：GetWindowRect 还带着一圈透明的可调边框，
-        // 照它截会在窗口外面多带一截桌面。拿不到（非合成窗口）才退回窗口矩形。
-        if DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_EXTENDED_FRAME_BOUNDS,
-            &mut rc as *mut RECT as *mut core::ffi::c_void,
-            std::mem::size_of::<RECT>() as u32,
-        )
-        .is_err()
-        {
-            let _ = GetWindowRect(hwnd, &mut rc);
-        }
-    }
-    if let Ok(mut v) = SNIP_HITS.lock() {
-        v.push(SnipCandidate {
-            pid,
-            visible: unsafe { IsWindowVisible(hwnd) }.as_bool(),
-            rect: (rc.left, rc.top, rc.right, rc.bottom),
-        });
-    }
-    TRUE
-}
-
-/// 从候选里挑第一个"别人进程的、可见的、还有面积的、罩住光标"的窗口矩形，并夹回虚拟屏幕。
-///
-/// 排掉自己进程是这条手势的关键：覆盖层自己就是全屏、就在最上面，不排掉它每次都挑中蒙版本身。
-/// 夹回虚拟屏幕是因为窗口可以探出屏幕外（负原点的副屏、被拖出界的窗口），探出去的那部分
-/// 屏幕上根本没有像素可截。夹完没有面积可截就接着往下找。
-fn snip_window_hit(
-    candidates: &[SnipCandidate],
-    self_pid: u32,
-    screen: (i32, i32, i32, i32),
-    x: i32,
-    y: i32,
-) -> Option<(i32, i32, i32, i32)> {
-    for c in candidates {
-        if c.pid == self_pid || !c.visible {
-            continue;
-        }
-        let (l, t, r, b) = c.rect;
-        if r - l < 2 || b - t < 2 {
-            continue;
-        }
-        if x < l || x >= r || y < t || y >= b {
-            continue;
-        }
-        let l = l.max(screen.0);
-        let t = t.max(screen.1);
-        let r = r.min(screen.2);
-        let b = b.min(screen.3);
-        if r - l < 2 || b - t < 2 {
-            continue;
-        }
-        return Some((l, t, r, b));
-    }
-    None
-}
-
-/// 覆盖层客户坐标 -> 光标底下"别人的那个窗口"在屏幕上的矩形；没选中就 None。
-/// 客户坐标要换成屏幕坐标再比，因为候选矩形是屏幕坐标，而覆盖层起点是虚拟屏幕左上角。
-fn snip_pick_screen(x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
-    let (vx, vy) = virtual_screen_origin();
-    let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-    let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-    snip_window_hit(
-        &snip_candidates(),
-        std::process::id(),
-        (vx, vy, vx + vw, vy + vh),
-        vx + x,
-        vy + y,
-    )
-}
-
-/// 选区定了之后的唯一收尾：抓屏 -> 把画面塞进 [`SNIP`] -> 按这一次的开关走标注窗或直接存。
-/// 拖框与"单击选窗口"两条手势都到这里，所以它们看到的是同一张图、同一套落盘规则。
-fn snip_take(x: i32, y: i32, w: i32, h: i32) {
-    match capture_rect(x, y, w, h) {
-        Ok(buf) => {
-            if let Ok(mut s) = SNIP.lock() {
-                s.img = buf;
-                s.img_w = w;
-                s.img_h = h;
-                s.marks.clear();
-                s.tool = 0;
-                s.drag = None;
-                s.text_edit = 0;
-            }
-            // 标注版：编辑窗口贴在选区原位，底下露出的就是刚截的那块。
-            // 快速版（松手即存）：marks 是空的，save 走的就是"原样那一张"。
-            if SNIP.lock().map(|s| s.annotate).unwrap_or(true) {
-                open_snip_editor(x, y, w, h);
-            } else {
-                tracing_note("截图 snip-quick：松手即存，不进标注窗");
-                save_snip_edit();
-            }
-        }
-        Err(e) => tracing_note(&format!("截图失败：{e}")),
-    }
-}
-
-unsafe extern "system" fn snip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    unsafe {
-        match msg {
-            WM_LBUTTONDOWN => {
-                let x = (l.0 & 0xFFFF) as i16 as i32;
-                let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
-                if let Ok(mut s) = SNIP.lock() {
-                    s.active = true;
-                    s.start = (x, y);
-                    s.cur = (x, y);
-                }
-                let _ = SetCapture(hwnd);
-                let _ = InvalidateRect(Some(hwnd), None, false);
-                LRESULT(0)
-            }
-            WM_MOUSEMOVE => {
-                let x = (l.0 & 0xFFFF) as i16 as i32;
-                let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
-                let mut changed = false;
-                if let Ok(mut s) = SNIP.lock() {
-                    if s.active && s.cur != (x, y) {
-                        s.cur = (x, y);
-                        changed = true;
-                    }
-                }
-                if changed {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-                LRESULT(0)
-            }
-            WM_LBUTTONUP => {
-                let x = (l.0 & 0xFFFF) as i16 as i32;
-                let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
-                let (sx, sy) = SNIP.lock().map(|s| s.start).unwrap_or((0, 0));
-                let _ = ReleaseCapture();
-                let rw = (sx - x).abs();
-                let rh = (sy - y).abs();
-                // 覆盖层起点是虚拟屏幕左上角，转成屏幕坐标再截
-                let (vx, vy) = virtual_screen_origin();
-                // 先关覆盖层再抓屏：蒙版还挂着的话，截到的是被压暗的那一份。
-                let _ = DestroyWindow(hwnd);
-                if rw >= 4 && rh >= 4 {
-                    snip_take(vx + sx.min(x), vy + sy.min(y), rw, rh);
-                } else if let Some((pl, pt, pr, pb)) = snip_pick_screen(x, y) {
-                    // 没拖出区域就是旧版那条手势：单击选中光标下面那个窗口。
-                    let (pw, ph) = (pr - pl, pb - pt);
-                    tracing_note(&format!("截图 snip-pick {pw}x{ph} at {pl},{pt}"));
-                    snip_take(pl, pt, pw, ph);
-                } else {
-                    tracing_note("截图取消：这一笔既没框出区域，也没点到别的窗口");
-                }
-                LRESULT(0)
-            }
-            WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
-                let _ = DestroyWindow(hwnd);
-                LRESULT(0)
-            }
-            WM_KEYDOWN if w.0 == 0x1B => {
-                let _ = DestroyWindow(hwnd);
-                LRESULT(0)
-            }
-            WM_TIMER => {
-                // 覆盖层只挂了一个定时器，但 id 照样要对上：别的 WM_TIMER 不该被当成超时。
-                if w.0 == SNIP_TIMEOUT_TIMER {
-                    tracing_note("截图 snip-timeout 三分钟没动，覆盖层自己退");
-                    let _ = DestroyWindow(hwnd);
-                }
-                LRESULT(0)
-            }
-            WM_PAINT => {
-                // 只画选区边框：底色是整窗统一。
-let mut ps = PAINTSTRUCT::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                if let Ok(s) = SNIP.lock() {
-                    if s.active {
-                        let pen = CreatePen(PS_SOLID, 2, COLORREF(0x00F7_9C_5B));
-                        let old = SelectObject(hdc, pen.into());
-                        let null = GetStockObject(NULL_BRUSH);
-                        let oldb = SelectObject(hdc, null);
-                        let _ = Rectangle(
-                            hdc,
-                            s.start.0.min(s.cur.0),
-                            s.start.1.min(s.cur.1),
-                            s.start.0.max(s.cur.0),
-                            s.start.1.max(s.cur.1),
-                        );
-                        SelectObject(hdc, oldb);
-                        SelectObject(hdc, old);
-                        let _ = DeleteObject(pen.into());
-                    }
-                }
-                let _ = EndPaint(hwnd, &ps);
-                LRESULT(0)
-            }
-            WM_DESTROY => {
-                // 覆盖层没了 = "这一次正在选区"结束了，标志位必须跟着复位。
-                // 以前只有两条失败分支复位它，于是成功截完一次之后标志一直挂着，
-                // 下一次热键被 start_snip 的早退吃掉：第二次截图按不出来，直到重启。
-                if let Ok(mut s) = SNIP.lock() {
-                    s.active = false;
-                }
-                LRESULT(0)
-            }
-            _ => DefWindowProcW(hwnd, msg, w, l),
-        }
-    }
-}
-
-/// 编辑窗口底部按钮：左边三个工具（方框/箭头/文字），右边三个动作（撤销/保存/取消）。
-fn snip_buttons(client_w: i32, client_h: i32) -> Vec<(&'static str, (i32, i32, i32, i32))> {
-    let bw = 64;
-    let bh = 26;
-    let y = client_h - SNIP_BAR_H + 7;
-    let mut out = Vec::new();
-    for (i, label) in ["方框", "箭头", "文字"].iter().enumerate() {
-        out.push((*label, (8 + i as i32 * 72, y, bw, bh)));
-    }
-    let mut x = client_w - 8 - bw;
-    for label in ["取消", "贴图", "保存", "撤销"] {
-        out.push((label, (x, y, bw, bh)));
-        x -= bw + 8;
-    }
-    out
-}
-
-fn hit_box(b: (i32, i32, i32, i32), x: i32, y: i32) -> bool {
-    x >= b.0 && x < b.0 + b.2 && y >= b.1 && y < b.1 + b.3
-}
-
-/// 画一个箭头（线 + 两条 25° 的头）。
-fn draw_arrow(hdc: HDC, x0: i32, y0: i32, x1: i32, y1: i32) {
-    unsafe {
-        let _ = MoveToEx(hdc, x0, y0, None);
-        let _ = LineTo(hdc, x1, y1);
-        let dx = (x1 - x0) as f32;
-        let dy = (y1 - y0) as f32;
-        let len = (dx * dx + dy * dy).sqrt().max(1.0);
-        let (ux, uy) = (-dx / len, -dy / len);
-        let a = 25f32.to_radians();
-        for s in [1.0f32, -1.0] {
-            let (c, sn) = (a.cos(), a.sin() * s);
-            let rx = ux * c - uy * sn;
-            let ry = ux * sn + uy * c;
-            let _ = MoveToEx(hdc, x1, y1, None);
-            let _ = LineTo(hdc, (x1 as f32 + rx * 14.0) as i32, (y1 as f32 + ry * 14.0) as i32);
-        }
-    }
-}
-
-/// 把标注烤进像素：内存 DC 贴图 → 画标注 → 读回。
-fn render_marks(img: &[u8], w: i32, h: i32, marks: &[SnipMark]) -> Vec<u8> {
-    let mut out = img.to_vec();
-    if marks.is_empty() || w <= 0 || h <= 0 {
-        return out;
-    }
-    unsafe {
-        let screen = GetDC(None);
-        let mem = CreateCompatibleDC(Some(screen));
-        let bmp = CreateCompatibleBitmap(screen, w, h);
-        let old = SelectObject(mem, bmp.into());
-        let mut info = BITMAPINFO::default();
-        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        info.bmiHeader.biWidth = w;
-        info.bmiHeader.biHeight = -h;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB.0;
-        SetDIBits(
-            Some(mem),
-            bmp,
-            0,
-            h as u32,
-            img.as_ptr() as *const _,
-            &info,
-            DIB_RGB_COLORS,
-        );
-
-        let pen = CreatePen(PS_SOLID, 2, COLORREF(0x00F7_9C_5B));
-        let oldp = SelectObject(mem, pen.into());
-        let null = GetStockObject(NULL_BRUSH);
-        let oldb = SelectObject(mem, null);
-        let font = CreateFontW(
-            20,
-            0,
-            0,
-            0,
-            FW_NORMAL.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            DEFAULT_PITCH.0 as u32,
-            w!("Microsoft YaHei UI"),
-        );
-        let oldf = SelectObject(mem, font.into());
-        let _ = SetTextColor(mem, COLORREF(0x00F7_9C_5B));
-        let _ = SetBkMode(mem, TRANSPARENT);
-        for m in marks {
-            match m {
-                SnipMark::Rect(x, y, rw, rh) => {
-                    let _ = Rectangle(mem, *x, *y, x + rw, y + rh);
-                }
-                SnipMark::Arrow(x0, y0, x1, y1) => draw_arrow(mem, *x0, *y0, *x1, *y1),
-                SnipMark::Text(x, y, s) => {
-                    let _ = TextOutW(mem, *x, *y, &s.encode_utf16().collect::<Vec<u16>>());
-                }
-            }
-        }
-        SelectObject(mem, oldf);
-        SelectObject(mem, oldb);
-        SelectObject(mem, oldp);
-        let _ = DeleteObject(font.into());
-        let _ = DeleteObject(pen.into());
-        GetDIBits(
-            mem,
-            bmp,
-            0,
-            h as u32,
-            Some(out.as_mut_ptr() as *mut _),
-            &mut info,
-            DIB_RGB_COLORS,
-        );
-        SelectObject(mem, old);
-        let _ = DeleteObject(bmp.into());
-        let _ = DeleteDC(mem);
-        ReleaseDC(None, screen);
-    }
-    out
-}
-
-/// 保存当前编辑结果（标注烤进图）→ PNG + 剪贴板，然后关窗。
-/// 把选区里标好注的那一份**落盘 + 进剪贴板**，返回烤好后的像素（贴图要用）。
-/// 「保存」与「贴图」两条出口共用这一份，所以贴图不会多出一次写盘，也不会漏掉剪贴板。
-fn commit_snip() -> Option<(Vec<u8>, i32, i32)> {
-    let (img, w, h, marks) = match SNIP.lock() {
-        Ok(s) => (s.img.clone(), s.img_w, s.img_h, s.marks.clone()),
-        Err(_) => return None,
-    };
-    if img.is_empty() {
-        return None;
-    }
-    let buf = render_marks(&img, w, h, &marks);
-    let dir = focusflow_core::paths::screenshots_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let name = format!(
-        "screenshot_{}.png",
-        chrono::Local::now().format("%Y%m%d_%H%M%S")
-    );
-    let path = dir.join(name);
-    match save_png(&path, w as u32, h as u32, &buf) {
-        Ok(()) => tracing_note(&format!("截图已保存：{}", path.display())),
-        Err(e) => tracing_note(&format!("截图保存失败：{e}")),
-    }
-    match copy_bgra_to_clipboard(&buf, w, h) {
-        Ok(()) => tracing_note("截图已进剪贴板"),
-        Err(e) => tracing_note(&format!("剪贴板没写进去：{e}")),
-    }
-    Some((buf, w, h))
-}
-
-fn save_snip_edit() {
-    let editor = SNIP.lock().map(|s| s.editor).unwrap_or(0);
-    commit_snip();
-    if editor != 0 {
-        let _ = unsafe { DestroyWindow(HWND(editor as *mut core::ffi::c_void)) };
-    }
-}
-
-/// 标注窗里的「贴图」：先按「保存」那条路走一遍（存盘 + 剪贴板），再把刚编好的那一份
-/// 摆到选区原位上。贴图本身不再落盘，也不解码 PNG —— 用的就是内存里这一份。
-fn pin_snip_from_editor(editor: HWND) {
-    let Some((buf, w, h)) = commit_snip() else {
-        tracing_note("贴图 pin-skip 没有可贴的画面");
-        return;
-    };
-    let mut rc = RECT::default();
-    let (x, y) = unsafe {
-        let _ = GetWindowRect(editor, &mut rc);
-        (rc.left, rc.top)
-    };
-    open_pin(buf, w, h, x, y);
-    let _ = unsafe { DestroyWindow(editor) };
-}
-
-/// 在编辑窗口里开一个文字输入框（原生 EDIT，自带中文输入法）。
-fn open_text_edit(editor: HWND, x: i32, y: i32) {
-    unsafe {
-        let old = SNIP.lock().map(|s| s.text_edit).unwrap_or(0);
-        if old != 0 {
-            let _ = DestroyWindow(HWND(old as *mut core::ffi::c_void));
-        }
-        let cls = HSTRING::from("EDIT");
-        let empty = HSTRING::from("");
-        let created = CreateWindowExW(
-            WS_EX_NOPARENTNOTIFY,
-            &cls,
-            &empty,
-            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0x0080), // WS_CHILD | VISIBLE | ES_AUTOHSCROLL
-            x,
-            y,
-            240,
-            28,
-            Some(editor),
-            None,
-            None,
-            None,
-        );
-        if let Ok(h) = created {
-            let font = CreateFontW(
-                20,
-                0,
-                0,
-                0,
-                FW_NORMAL.0 as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                DEFAULT_PITCH.0 as u32,
-                w!("Microsoft YaHei UI"),
-            );
-            SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
-            let _ = SetWindowSubclass(h, Some(edit_proc), 3, 0);
-            let _ = SetFocus(Some(h));
-            if let Ok(mut s) = SNIP.lock() {
-                s.text_edit = h.0 as isize;
-                s.text_at = (x, y);
-            }
-        }
-    }
-}
-
-unsafe extern "system" fn snip_edit_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    unsafe {
-        match msg {
-            WM_PAINT => {
-                let mut ps = PAINTSTRUCT::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                let (img, iw, ih, marks, drag) = match SNIP.lock() {
-                    Ok(s) => (s.img.clone(), s.img_w, s.img_h, s.marks.clone(), s.drag),
-                    Err(_) => (Vec::new(), 0, 0, Vec::new(), None),
-                };
-                if !img.is_empty() {
-                    let mut info = BITMAPINFO::default();
-                    info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-                    info.bmiHeader.biWidth = iw;
-                    info.bmiHeader.biHeight = -ih;
-                    info.bmiHeader.biPlanes = 1;
-                    info.bmiHeader.biBitCount = 32;
-                    info.bmiHeader.biCompression = BI_RGB.0;
-                    let _ = SetDIBitsToDevice(
-                        hdc,
-                        0,
-                        0,
-                        iw as u32,
-                        ih as u32,
-                        0,
-                        0,
-                        0,
-                        ih as u32,
-                        img.as_ptr() as *const _,
-                        &info,
-                        DIB_RGB_COLORS,
-                    );
-                }
-                // 工具条
-                let brush = CreateSolidBrush(COLORREF(0x0024_1814));
-                let oldb = SelectObject(hdc, brush.into());
-                let _ = Rectangle(hdc, 0, ih, iw + 2, ih + SNIP_BAR_H);
-                SelectObject(hdc, oldb);
-                let _ = DeleteObject(brush.into());
-
-                // 已画的标注 + 正在拖的那一笔
-                let pen = CreatePen(PS_SOLID, 2, COLORREF(0x00F7_9C_5B));
-                let oldp = SelectObject(hdc, pen.into());
-                let null = GetStockObject(NULL_BRUSH);
-                let oldnull = SelectObject(hdc, null);
-                let mark_font = CreateFontW(
-                    20,
-                    0,
-                    0,
-                    0,
-                    FW_NORMAL.0 as i32,
-                    0,
-                    0,
-                    0,
-                    DEFAULT_CHARSET,
-                    OUT_DEFAULT_PRECIS,
-                    CLIP_DEFAULT_PRECIS,
-                    CLEARTYPE_QUALITY,
-                    DEFAULT_PITCH.0 as u32,
-                    w!("Microsoft YaHei UI"),
-                );
-                let oldmf = SelectObject(hdc, mark_font.into());
-                let _ = SetTextColor(hdc, COLORREF(0x00F7_9C_5B));
-                for m in &marks {
-                    match m {
-                        SnipMark::Rect(mx, my, mw, mh) => {
-                            let _ = Rectangle(hdc, *mx, *my, mx + mw, my + mh);
-                        }
-                        SnipMark::Arrow(x0, y0, x1, y1) => draw_arrow(hdc, *x0, *y0, *x1, *y1),
-                        SnipMark::Text(tx, ty, s) => {
-                            let _ = TextOutW(
-                                hdc,
-                                *tx,
-                                *ty,
-                                &s.encode_utf16().collect::<Vec<u16>>(),
-                            );
-                        }
-                    }
-                }
-                if let Some((dx, dy)) = drag {
-                    let (cx, cy, tool) = match SNIP.lock() {
-                        Ok(s) => (s.cur.0, s.cur.1, s.tool),
-                        Err(_) => (dx, dy, 0),
-                    };
-                    if tool == 1 {
-                        draw_arrow(hdc, dx, dy, cx, cy);
-                    } else {
-                        let _ = Rectangle(hdc, dx.min(cx), dy.min(cy), dx.max(cx), dy.max(cy));
-                    }
-                }
-                SelectObject(hdc, oldmf);
-                let _ = DeleteObject(mark_font.into());
-                SelectObject(hdc, oldnull);
-                SelectObject(hdc, oldp);
-                let _ = DeleteObject(pen.into());
-
-                // 按钮
-                let font = CreateFontW(
-                    13,
-                    0,
-                    0,
-                    0,
-                    FW_NORMAL.0 as i32,
-                    0,
-                    0,
-                    0,
-                    DEFAULT_CHARSET,
-                    OUT_DEFAULT_PRECIS,
-                    CLIP_DEFAULT_PRECIS,
-                    CLEARTYPE_QUALITY,
-                    DEFAULT_PITCH.0 as u32,
-                    w!("Microsoft YaHei UI"),
-                );
-                let oldf = SelectObject(hdc, font.into());
-                let _ = SetTextColor(hdc, COLORREF(0x00F0_F0_F0));
-                let _ = SetBkMode(hdc, TRANSPARENT);
-                // 窄窗口不画提示，否则会压在「撤销」按钮上
-                if iw > 560 {
-                    let _ = TextOutW(
-                        hdc,
-                        12,
-                        ih + 12,
-                        &"拖出方框做标注 · Ctrl+S 保存 · P 贴图 · Esc 取消"
-                            .encode_utf16()
-                            .collect::<Vec<u16>>(),
-                    );
-                }
-                let cur_tool = SNIP.lock().map(|s| s.tool).unwrap_or(0);
-                for (label, b) in snip_buttons(iw, ih + SNIP_BAR_H) {
-                    let is_tool = (label == "方框" && cur_tool == 0)
-                        || (label == "箭头" && cur_tool == 1)
-                        || (label == "文字" && cur_tool == 2);
-                    let bg = if label == "保存" || label == "贴图" || is_tool {
-                        COLORREF(0x00F7_9C_5B)
-                    } else {
-                        COLORREF(0x0035_2E_2E)
-                    };
-                    let bmp = CreateSolidBrush(bg);
-                    let old = SelectObject(hdc, bmp.into());
-                    let _ = Rectangle(hdc, b.0, b.1, b.0 + b.2, b.1 + b.3);
-                    SelectObject(hdc, old);
-                    let _ = DeleteObject(bmp.into());
-                    let _ = SetTextColor(
-                        hdc,
-                        if label == "保存" || label == "贴图" || is_tool {
-                            COLORREF(0x00FF_FF_FF)
-                        } else {
-                            COLORREF(0x00F0_F0_F0)
-                        },
-                    );
-                    let _ = TextOutW(
-                        hdc,
-                        b.0 + 18,
-                        b.1 + 6,
-                        &label.encode_utf16().collect::<Vec<u16>>(),
-                    );
-                }
-                SelectObject(hdc, oldf);
-                let _ = DeleteObject(font.into());
-                let _ = EndPaint(hwnd, &mut ps);
-                LRESULT(0)
-            }
-            WM_LBUTTONDOWN => {
-                let x = (l.0 & 0xFFFF) as i16 as i32;
-                let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
-                let (iw, ih) = match SNIP.lock() {
-                    Ok(s) => (s.img_w, s.img_h),
-                    Err(_) => (0, 0),
-                };
-                for (label, b) in snip_buttons(iw, ih + SNIP_BAR_H) {
-                    if hit_box(b, x, y) {
-                        match label {
-                            "方框" | "箭头" | "文字" => {
-                                let tool = match label {
-                                    "方框" => 0,
-                                    "箭头" => 1,
-                                    _ => 2,
-                                };
-                                if let Ok(mut s) = SNIP.lock() {
-                                    s.tool = tool;
-                                }
-                                let _ = InvalidateRect(Some(hwnd), None, false);
-                            }
-                            "保存" => save_snip_edit(),
-                            "贴图" => pin_snip_from_editor(hwnd),
-                            "撤销" => {
-                                if let Ok(mut s) = SNIP.lock() {
-                                    s.marks.pop();
-                                }
-                                let _ = InvalidateRect(Some(hwnd), None, false);
-                            }
-                            _ => {
-                                let _ = DestroyWindow(hwnd);
-                            }
-                        }
-                        return LRESULT(0);
-                    }
-                }
-                if y < ih {
-                    let tool = SNIP.lock().map(|s| s.tool).unwrap_or(0);
-                    if tool == 2 {
-                        open_text_edit(hwnd, x, y);
-                    } else {
-                        if let Ok(mut s) = SNIP.lock() {
-                            s.drag = Some((x, y));
-                            s.cur = (x, y);
-                        }
-                        let _ = SetCapture(hwnd);
-                    }
-                }
-                LRESULT(0)
-            }
-            WM_MOUSEMOVE => {
-                let x = (l.0 & 0xFFFF) as i16 as i32;
-                let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
-                let mut changed = false;
-                if let Ok(mut s) = SNIP.lock() {
-                    if s.drag.is_some() && s.cur != (x, y) {
-                        s.cur = (x, y);
-                        changed = true;
-                    }
-                }
-                if changed {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-                LRESULT(0)
-            }
-            WM_LBUTTONUP => {
-                let x = (l.0 & 0xFFFF) as i16 as i32;
-                let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
-                let _ = ReleaseCapture();
-                if let Ok(mut s) = SNIP.lock() {
-                    if let Some((dx, dy)) = s.drag.take() {
-                        let rw = (x - dx).abs();
-                        let rh = (y - dy).abs();
-                        if rw >= 4 && rh >= 4 {
-                            let mark = if s.tool == 1 {
-                                SnipMark::Arrow(dx, dy, x, y)
-                            } else {
-                                SnipMark::Rect(dx.min(x), dy.min(y), rw, rh)
-                            };
-                            s.marks.push(mark);
-                        }
-                    }
-                }
-                let _ = InvalidateRect(Some(hwnd), None, false);
-                LRESULT(0)
-            }
-            WM_EDIT_DONE => {
-                // 文字标注：EDIT 回车/失焦后由 edit_proc 投过来
-                let (te, at) = SNIP
-                    .lock()
-                    .map(|s| (s.text_edit, s.text_at))
-                    .unwrap_or((0, (0, 0)));
-                if te != 0 {
-                    let h = HWND(te as *mut core::ffi::c_void);
-                    if w.0 == 1 {
-                        let mut buf = [0u16; 256];
-                        let n = GetWindowTextW(h, &mut buf).max(0) as usize;
-                        let text = String::from_utf16_lossy(&buf[..n]);
-                        if !text.trim().is_empty() {
-                            if let Ok(mut s) = SNIP.lock() {
-                                s.marks.push(SnipMark::Text(at.0, at.1, text));
-                            }
-                        }
-                    }
-                    let _ = DestroyWindow(h);
-                    if let Ok(mut s) = SNIP.lock() {
-                        s.text_edit = 0;
-                    }
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-                LRESULT(0)
-            }
-            WM_KEYDOWN if w.0 == 0x1B => {
-                let _ = DestroyWindow(hwnd);
-                LRESULT(0)
-            }
-            WM_KEYDOWN if w.0 == 0x53 && (GetKeyState(0x11) as u16 & 0x8000) != 0 => {
-                save_snip_edit();
-                LRESULT(0)
-            }
-            WM_KEYDOWN if w.0 == 0x50 => {
-                // P = 贴图：与工具条那颗同一条路（先存盘 + 进剪贴板，再把那一份摆到桌面上）。
-                pin_snip_from_editor(hwnd);
-                LRESULT(0)
-            }
-            WM_DESTROY => {
-                if let Ok(mut s) = SNIP.lock() {
-                    s.editing = false;
-                    s.editor = 0;
-                    s.drag = None;
-                }
-                LRESULT(0)
-            }
-            _ => DefWindowProcW(hwnd, msg, w, l),
-        }
-    }
-}
-
-/// 打开标注窗口：贴在选区原位，底部一条工具条。
-fn open_snip_editor(x: i32, y: i32, w: i32, h: i32) {
-    unsafe {
-        let hinst = GetModuleHandleW(None).map(|m| m.into()).unwrap_or_default();
-        let cls = HSTRING::from("FocusFlowSnipEditor");
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(snip_edit_proc),
-            hInstance: hinst,
-            hCursor: LoadCursorW(None, IDC_CROSS).unwrap_or_default(),
-            lpszClassName: PCWSTR(cls.as_ptr()),
-            ..Default::default()
-        };
-        let _ = RegisterClassExW(&wc);
-        let created = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-            &cls,
-            &HSTRING::from("FocusFlow 标注"),
-            WINDOW_STYLE(WS_POPUP.0 | WS_VISIBLE.0),
-            x,
-            y,
-            w,
-            h + SNIP_BAR_H,
-            None,
-            None,
-            Some(hinst),
-            None,
-        );
-        match created {
-            Ok(ed) => {
-                if let Ok(mut s) = SNIP.lock() {
-                    s.editor = ed.0 as isize;
-                }
-                let _ = SetForegroundWindow(ed);
-                let _ = SetFocus(Some(ed));
-                tracing_note("截图编辑窗口已打开（拖方框标注，按钮保存/撤销/取消）");
-            }
-            Err(_) => {
-                // 开不出来就退回「选完直接存」
-                tracing_note("编辑窗口创建失败，直接保存");
-                save_snip_edit();
-            }
-        }
-    }
-}
-
-/// 打开全屏截图覆盖层（托盘菜单/设置页按钮/两条截图热键触发）。
-/// `annotate` = 松手后进标注窗；`false` = 松手即存（PNG + 剪贴板），与旧版两条热键的分工一致。
-fn start_snip(owner: HWND, annotate: bool) {
-    if let Ok(s) = SNIP.lock() {
-        if s.active {
-            return;
-        }
-    }
-    if let Ok(mut s) = SNIP.lock() {
-        s.annotate = annotate;
-    }
-    unsafe {
-        let hinst = GetModuleHandleW(None).map(|m| m.into()).unwrap_or_default();
-        let cls = HSTRING::from("FocusFlowSnipOverlay");
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(snip_proc),
-            hInstance: hinst,
-            hCursor: LoadCursorW(None, IDC_CROSS).unwrap_or_default(),
-            lpszClassName: PCWSTR(cls.as_ptr()),
-            ..Default::default()
-        };
-        let _ = RegisterClassExW(&wc);
-
-        let (vx, vy) = virtual_screen_origin();
-        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        let created = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-            &cls,
-            &HSTRING::from("FocusFlow 截图"),
-            WINDOW_STYLE(WS_POPUP.0 | WS_VISIBLE.0),
-            vx,
-            vy,
-            vw,
-            vh,
-            Some(owner),
-            None,
-            Some(hinst),
-            None,
-        );
-        match created {
-            Ok(ov) => {
-                let _ = SetLayeredWindowAttributes(ov, COLORREF(0), 110, LWA_ALPHA);
-                let _ = ShowWindow(ov, SW_SHOW);
-                let _ = SetForegroundWindow(ov);
-                let _ = SetFocus(Some(ov));
-                // 超时自己退：这个蒙版压着整张桌面，忘了它就会一直挡在那儿。
-                // 验收脚本按同一个 id 投一条 WM_TIMER 来催它响，所以这里把数字写进日志。
-                let _ = SetTimer(Some(ov), SNIP_TIMEOUT_TIMER, SNIP_TIMEOUT_MS, None);
-                tracing_note(&format!("截图 snip-arm-timeout {SNIP_TIMEOUT_MS}"));
-                tracing_note("截图覆盖层已打开（拖选区域或单击选窗口，右键/Esc 取消）");
-            }
-            Err(_) => tracing_note("截图覆盖层创建失败"),
-        }
-    }
 }
 
 // ===== 贴图（pin） =====
@@ -5710,15 +4677,13 @@ impl POp {
             | POp::Field { rect, .. }
             | POp::Select { rect, .. }
             | POp::Button { rect, .. }
-            | POp::Table { rect, .. } => *rect,        }
+            | POp::Table { rect, .. } => *rect,
+        }
     }
 }
 
 /// 插件视图内容有多高（用于把滚动位置夹在合法范围内）。
-fn plugin_content_height(
-    view: &focusflow_core::plugins::PluginView,
-    area: D2D_RECT_F,
-) -> f32 {
+fn plugin_content_height(view: &focusflow_core::plugins::PluginView, area: D2D_RECT_F) -> f32 {
     let ops = plugin_view_ops(view, area, 0.0, &HashMap::new());
     let bottom = ops
         .iter()
@@ -5916,7 +4881,11 @@ fn plugin_view_ops(
                                 let bw = (label.chars().count() as f32 * 14.0 + 16.0).max(44.0);
                                 bx -= bw;
                                 let by = *y + PV_TABLE_HEAD_H + ri as f32 * PV_TABLE_ROW_H + 1.0;
-                                buttons.push((rect(bx, by, bw, 18.0), format!("{prefix}{rid}"), label.clone()));
+                                buttons.push((
+                                    rect(bx, by, bw, 18.0),
+                                    format!("{prefix}{rid}"),
+                                    label.clone(),
+                                ));
                                 bx -= 6.0;
                             }
                         }
@@ -5935,10 +4904,7 @@ fn plugin_view_ops(
                     *y += h + 6.0;
                 }
                 Widget::Pager {
-                    page,
-                    pages,
-                    total,
-                    ..
+                    page, pages, total, ..
                 } => {
                     ops.push(POp::Label {
                         rect: rect(x, *y, w, 18.0),
@@ -5999,7 +4965,9 @@ fn draw_plugin_view(
         card.right - card.left - 2.0,
         card.bottom - card.top - 42.0,
     );
-    let _ = unsafe { p.rt.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE) };
+    let _ = unsafe {
+        p.rt.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE)
+    };
 
     let ops = plugin_view_ops(
         view,
@@ -6120,7 +5088,10 @@ fn draw_plugin_view(
                 sel: chosen,
                 ..
             } => {
-                p.fill(rect(r.left, r.top, r.right - r.left, PV_TABLE_HEAD_H), &p.br.header);
+                p.fill(
+                    rect(r.left, r.top, r.right - r.left, PV_TABLE_HEAD_H),
+                    &p.br.header,
+                );
                 let cols = headers.len().max(1);
                 let cw = (*column_w).max(40.0) / cols as f32;
                 for (i, htxt) in headers.iter().enumerate() {
@@ -6145,7 +5116,12 @@ fn draw_plugin_view(
                     for (ci, cell) in row.iter().enumerate().take(cols) {
                         p.text(
                             cell,
-                            rect(rr.left + 6.0 + ci as f32 * cw, rr.top + 2.0, cw - 12.0, 16.0),
+                            rect(
+                                rr.left + 6.0 + ci as f32 * cw,
+                                rr.top + 2.0,
+                                cw - 12.0,
+                                16.0,
+                            ),
                             &p.fmt.small,
                             ink,
                         );
@@ -6304,7 +5280,9 @@ fn find_modal<'a>(
 ) -> Option<ModalRef<'a>> {
     let mut first_open = None;
     for w in &view.widgets {
-        let Some(m) = modal_from_widget(w) else { continue };
+        let Some(m) = modal_from_widget(w) else {
+            continue;
+        };
         if local == Some(m.id) {
             return Some(m);
         }
@@ -6453,12 +5431,7 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
         p.round(vb, 6.0, &p.br.card, Some(&p.br.border));
         p.text(
             &f.value,
-            rect(
-                vb.left + 8.0,
-                vb.top + 3.0,
-                vb.right - vb.left - 28.0,
-                18.0,
-            ),
+            rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 28.0, 18.0),
             &p.fmt.small,
             &p.br.fg,
         );
@@ -6512,14 +5485,7 @@ fn one_line(s: &str, max: usize) -> String {
     out
 }
 
-fn draw_plugins(
-    p: &P<'_>,
-    w: f32,
-    h: f32,
-    rows: &[PluginRow],
-    err: Option<&str>,
-    vs: ViewState,
-) {
+fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>, vs: ViewState) {
     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
     p.round(card, 14.0, &p.br.card, Some(&p.br.border));
     p.text(
@@ -6609,7 +5575,7 @@ fn draw_plugins(
             },
         );
         // 第二行：加载失败说失败原因，否则说它是什。
-match &row.error {
+        match &row.error {
             Some(e) => {
                 p.text(
                     &format!("加载失败：{}", one_line(e, 72)),
@@ -6620,7 +5586,7 @@ match &row.error {
             }
             None => {
                 // 启用了却没加载上（还没轮到、或加载被静默跳过）要说出来。
-let text = if row.enabled && !row.loaded {
+                let text = if row.enabled && !row.loaded {
                     format!("{}（已启用，尚未加载）", row.desc)
                 } else {
                     row.desc.clone()
@@ -6720,7 +5686,10 @@ fn last_week_start(today: chrono::NaiveDate) -> chrono::NaiveDate {
 fn weekly_report_path(today: chrono::NaiveDate) -> std::path::PathBuf {
     focusflow_core::paths::data_dir()
         .join("reports")
-        .join(format!("weekly-{}.md", last_week_start(today).format("%Y-%m-%d")))
+        .join(format!(
+            "weekly-{}.md",
+            last_week_start(today).format("%Y-%m-%d")
+        ))
 }
 
 /// 启动后补一份上周周报（旧版口径：每周一 / 启动时生成上一个完整周）。
@@ -6826,7 +5795,12 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
         );
     }
     if !gaps.is_empty() {
-        let _ = writeln!(out, "\n> 有 {} 个年度库没读全：{}", gaps.len(), gaps.join("；"));
+        let _ = writeln!(
+            out,
+            "\n> 有 {} 个年度库没读全：{}",
+            gaps.len(),
+            gaps.join("；")
+        );
     }
 
     let _ = writeln!(out, "\n## 每日活跃\n\n| 日期 | 次数 |\n|---|---:|");
@@ -6848,7 +5822,10 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
         let _ = writeln!(out, "| （这一周没有记录） | 0 |");
     }
 
-    let _ = writeln!(out, "\n## 应用 TOP 10（前台时长）\n\n| 应用 | 时长 |\n|---|---:|");
+    let _ = writeln!(
+        out,
+        "\n## 应用 TOP 10（前台时长）\n\n| 应用 | 时长 |\n|---|---:|"
+    );
     for (name, secs) in &apps {
         let _ = writeln!(out, "| {} | {} |", name, duration_text(*secs));
     }
@@ -6933,7 +5910,9 @@ fn export_html_text(s: &Snapshot) -> String {
         s.today, s.period_total, s.avg
     ));
 
-    out.push_str("<h2>键鼠排行</h2><table><tr><th>排名</th><th>键名</th><th>次数</th><th>占比</th></tr>");
+    out.push_str(
+        "<h2>键鼠排行</h2><table><tr><th>排名</th><th>键名</th><th>次数</th><th>占比</th></tr>",
+    );
     for (i, (k, v)) in s.rank.iter().enumerate() {
         let share = if s.period_total > 0 {
             *v as f32 * 100.0 / s.period_total as f32
@@ -6960,7 +5939,9 @@ fn export_html_text(s: &Snapshot) -> String {
     }
     out.push_str("</table>\n");
 
-    out.push_str("<h2>设备排行</h2><table><tr><th>排名</th><th>设备</th><th>类型</th><th>次数</th></tr>");
+    out.push_str(
+        "<h2>设备排行</h2><table><tr><th>排名</th><th>设备</th><th>类型</th><th>次数</th></tr>",
+    );
     for (i, d) in s.devices.iter().enumerate() {
         out.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td></tr>",
@@ -6986,7 +5967,9 @@ fn export_html_text(s: &Snapshot) -> String {
 
     out.push_str("<h2>每小时合计</h2><table><tr><th>小时</th><th>次数</th></tr>");
     for (h, v) in s.hourly.iter().enumerate() {
-        out.push_str(&format!("<tr><td>{h}:00</td><td class=\"num\">{v}</td></tr>"));
+        out.push_str(&format!(
+            "<tr><td>{h}:00</td><td class=\"num\">{v}</td></tr>"
+        ));
     }
     out.push_str("</table>\n");
     out
@@ -7065,12 +6048,7 @@ fn export_csv_text(s: &Snapshot) -> String {
         } else {
             0.0
         };
-        out.push_str(&format!(
-            "{},{},{},{share:.1}%\r\n",
-            i + 1,
-            csv_field(k),
-            v
-        ));
+        out.push_str(&format!("{},{},{},{share:.1}%\r\n", i + 1, csv_field(k), v));
     }
 
     out.push_str("\r\n[应用排行]\r\n排名,应用,时长(秒),时长\r\n");
@@ -7129,7 +6107,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         _ => ("键鼠排行", snap.period_total, snap.rank.len()),
     };
     // 滚动位置按当前页签的行数夹一次：数据变少时别停在空白处。
-let scroll = vs.scroll.min(count.saturating_sub(g.max_rows));
+    let scroll = vs.scroll.min(count.saturating_sub(g.max_rows));
 
     p.text(
         title,
@@ -7150,7 +6128,12 @@ let scroll = vs.scroll.min(count.saturating_sub(g.max_rows));
 
     // 表头
     p.fill(
-        rect(r.left + g.pad, g.head_y, r.right - r.left - g.pad * 2.0, 22.0),
+        rect(
+            r.left + g.pad,
+            g.head_y,
+            r.right - r.left - g.pad * 2.0,
+            22.0,
+        ),
         &p.br.header,
     );
     let heads = match tab {
@@ -7179,7 +6162,9 @@ let scroll = vs.scroll.min(count.saturating_sub(g.max_rows));
             _ if pending > 0 => format!(
                 "已记录 {} 条，还没落库（写线程每 {} 秒写一次，落库后就出现在这里）",
                 thousands(pending as u64),
-                focusflow_core::config::instance().get_int("database", "flush_interval", 10).max(1)
+                focusflow_core::config::instance()
+                    .get_int("database", "flush_interval", 10)
+                    .max(1)
             ),
             _ => "今日还没有记录（数据目录见左下角）".to_string(),
         };
@@ -7202,7 +6187,12 @@ let scroll = vs.scroll.min(count.saturating_sub(g.max_rows));
             break;
         }
         let y = g.list_top + vis as f32 * g.row_h;
-        let row = rect(r.left + g.pad, y, r.right - r.left - g.pad * 2.0, g.row_h - 1.0);
+        let row = rect(
+            r.left + g.pad,
+            y,
+            r.right - r.left - g.pad * 2.0,
+            g.row_h - 1.0,
+        );
         if vs.sel == Some(idx) {
             p.round(row, 4.0, &p.br.accent_soft, None);
         } else if vs.hover == Some(idx) || vis % 2 == 1 {
@@ -7220,7 +6210,7 @@ let scroll = vs.scroll.min(count.saturating_sub(g.max_rows));
                 let d = &snap.devices[idx];
                 if vs.editing == Some(idx) {
                     // 编辑中：这一格由原生 EDIT 盖着，这里只画一圈边框。
-p.round(
+                    p.round(
                         rect(
                             g.x_name - 4.0,
                             y + 1.0,
@@ -7333,7 +6323,7 @@ p.round(
     }
 
     // 滚动条：只有装不下时才画。拖动没做，滚轮与点击空白处先够用。
-if count > g.max_rows {
+    if count > g.max_rows {
         let track = rect(r.right - 9.0, g.list_top, 4.0, g.max_rows as f32 * g.row_h);
         p.round(track, 2.0, &p.br.header, None);
         let frac = g.max_rows as f32 / count as f32;
@@ -7415,7 +6405,7 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         }
     }
     // 纵轴：从上往下是「峰。
-for i in 0..=4 {
+    for i in 0..=4 {
         let frac = 1.0 - i as f32 / 4.0;
         let y = plot.top + plot_height(plot) * (1.0 - frac);
         p.text(
@@ -7699,7 +6689,9 @@ fn run_plugin_sel_test(hwnd: HWND) {
         tracing_note("sel-test bad-spec");
         return;
     }
-    let Some(app) = (unsafe { app_ptr(hwnd) }) else { return };
+    let Some(app) = (unsafe { app_ptr(hwnd) }) else {
+        return;
+    };
     // 插件是切到「插件管理」那一页才加载的；钩子直接来就得自己先把那一步补上，
     // 否则 `get_plugin` 拿到的是空清单。
     app.reload_plugins();
@@ -7726,9 +6718,12 @@ fn run_plugin_sel_test(hwnd: HWND) {
     let sel_map = app.plugin_sel.clone();
     let ops = plugin_view_ops(&view, area, 0.0, &sel_map);
     let Some((ids, group, onselect)) = ops.iter().find_map(|op| match op {
-        POp::Table { ids, group, onselect, .. } if !ids.is_empty() => {
-            Some((ids.clone(), group.clone(), onselect.clone()))
-        }
+        POp::Table {
+            ids,
+            group,
+            onselect,
+            ..
+        } if !ids.is_empty() => Some((ids.clone(), group.clone(), onselect.clone())),
         _ => None,
     }) else {
         tracing_note(&format!("sel-test no-table {plugin}"));
@@ -7798,7 +6793,7 @@ unsafe fn bring_to_front(hwnd: HWND) {
 fn already_running() -> Option<HANDLE> {
     let handle = unsafe { CreateMutexW(None, true, w!("Global\\FocusFlow.Native.P0")) }.ok()?;
     // GetLastError 必须紧跟着读：中间任何一。
-if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         if let Ok(existing) = unsafe { FindWindowW(CLASS_NAME, None) } {
             if !existing.is_invalid() {
                 unsafe { bring_to_front(existing) };
@@ -7900,7 +6895,11 @@ fn toggle_floating(main: HWND, want: Option<bool>) -> bool {
     }
     let _ = floating::set_visible(want);
     let visible = floating::is_visible();
-    tracing_note(if want { "悬浮窗：显示" } else { "悬浮窗：隐藏" });
+    tracing_note(if want {
+        "悬浮窗：显示"
+    } else {
+        "悬浮窗：隐藏"
+    });
     visible
 }
 
@@ -7974,19 +6973,19 @@ unsafe extern "system" fn edit_proc(
     const VK_ESCAPE: usize = 0x1B;
     unsafe {
         match msg {
-        WM_KEYDOWN if w.0 == VK_RETURN || w.0 == VK_ESCAPE => {
-            let code = if w.0 == VK_RETURN { 1 } else { 2 };
-            if let Ok(parent) = GetParent(hwnd) {
-                let _ = PostMessageW(Some(parent), WM_EDIT_DONE, WPARAM(code), LPARAM(0));
+            WM_KEYDOWN if w.0 == VK_RETURN || w.0 == VK_ESCAPE => {
+                let code = if w.0 == VK_RETURN { 1 } else { 2 };
+                if let Ok(parent) = GetParent(hwnd) {
+                    let _ = PostMessageW(Some(parent), WM_EDIT_DONE, WPARAM(code), LPARAM(0));
+                }
+                LRESULT(0)
             }
-            LRESULT(0)
+            WM_CHAR if w.0 == VK_RETURN || w.0 == VK_ESCAPE => LRESULT(0),
+            // 不在这里做"失焦即提交"：窗口不是前台时 `SetFocus` 不会真正生效，
+            // 而 EDIT 刚建出来就会收到一次假的 WM_KILLFOCUS，提交的会是预填的旧名字
+            // （2026-10-26 实测）。提交由 Enter/Esc 和"点编辑框外面"两条路负责。
+            _ => DefSubclassProc(hwnd, msg, w, l),
         }
-        WM_CHAR if w.0 == VK_RETURN || w.0 == VK_ESCAPE => LRESULT(0),
-        // 不在这里做"失焦即提交"：窗口不是前台时 `SetFocus` 不会真正生效，
-        // 而 EDIT 刚建出来就会收到一次假的 WM_KILLFOCUS，提交的会是预填的旧名字
-        // （2026-10-26 实测）。提交由 Enter/Esc 和"点编辑框外面"两条路负责。
-        _ => DefSubclassProc(hwnd, msg, w, l),
-    }
     }
 }
 
@@ -8012,7 +7011,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
         WM_DPICHANGED => {
             // 换屏/改缩放：渲染目标里钉着。
-if let Some(app) = unsafe { app_ptr(hwnd) } {
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
                 app.drop_target();
             }
             let suggested = unsafe { &*(l.0 as *const RECT) };
@@ -8032,7 +7031,7 @@ if let Some(app) = unsafe { app_ptr(hwnd) } {
         }
         WM_TIMER if w.0 == TIMER_EVENTS => {
             // 心跳：只留证据，不刷屏（。
-static TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            static TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let n = TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n % 50 == 0 {
                 tracing_note(&format!("timer tick {n}"));
@@ -8047,12 +7046,16 @@ static TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::n
                         "验收状态 today={today} cpm={} collector={} paused={}",
                         collect::cpm(),
                         if collect::is_started() { "on" } else { "off" },
-                        if collect::is_paused() { "true" } else { "false" }
+                        if collect::is_paused() {
+                            "true"
+                        } else {
+                            "false"
+                        }
                     ));
                 }
             }
             // 托盘点击 / 菜单 / 热键只在事件通道里，靠这 100ms 一拍取出来。
-while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+            while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
                 if let TrayIconEvent::Click {
                     button: tray_icon::MouseButton::Left,
                     button_state: tray_icon::MouseButtonState::Up,
@@ -8065,7 +7068,7 @@ while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
             while let Ok(ev) = MenuEvent::receiver().try_recv() {
                 match ev.id.as_ref() {
                     "show" => unsafe { bring_to_front(hwnd) },
-                    "snip" => start_snip(hwnd, true),
+                    "snip" => snip::start(hwnd, true),
                     "floating" => {
                         toggle_floating(hwnd, None);
                         unsafe {
@@ -8086,7 +7089,8 @@ while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
                 // 组合键现在能被用户改掉，所以只响应"此刻真正注册着的那三个 id"，
                 // 刚注销/换掉的旧 id 投过来的事件一律不认。
                 let role = unsafe { app_ptr(hwnd) }.and_then(|app| {
-                    if app.snip_annotate_hk
+                    if app
+                        .snip_annotate_hk
                         .map(|h| h.id() == ev.id)
                         .unwrap_or(false)
                     {
@@ -8102,11 +7106,11 @@ while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
                 match role {
                     Some("snip-annotate") => {
                         tracing_note("收到标注截图热键：选区后进标注窗");
-                        start_snip(hwnd, true);
+                        snip::start(hwnd, true);
                     }
                     Some("snip") => {
                         tracing_note("收到截图热键：松手即存");
-                        start_snip(hwnd, false);
+                        snip::start(hwnd, false);
                     }
                     Some("toggle") => {
                         tracing_note("收到热键事件，唤出窗口");
@@ -8117,7 +7121,7 @@ while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
             }
             // 插件视图要按 1 秒重算一次：番茄钟的倒计时、键鼠计数都是插件自己在
             // get_view() 里算出来的，不重算就停在那儿。
-if let Some(app) = unsafe { app_ptr(hwnd) } {
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
                 if let Some(name) = app.plugin_open.clone() {
                     let due = app
                         .last_pv_refresh
@@ -8179,7 +7183,7 @@ if let Some(app) = unsafe { app_ptr(hwnd) } {
                 }
             }
             // 没有这一条就收不。
-let mut tme = TRACKMOUSEEVENT {
+            let mut tme = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                 dwFlags: TME_LEAVE,
                 hwndTrack: hwnd,
@@ -8231,7 +7235,7 @@ let mut tme = TRACKMOUSEEVENT {
         }
         WM_SNIP_START => {
             // WPARAM: 0 = 松手即存（`[hotkey] snip` 那条路），非 0 = 选区后进标注窗。
-            start_snip(hwnd, w.0 != 0);
+            snip::start(hwnd, w.0 != 0);
             LRESULT(0)
         }
         WM_SEL_TEST => {
@@ -8250,7 +7254,8 @@ let mut tme = TRACKMOUSEEVENT {
             close_all_pins();
             LRESULT(0)
         }
-        WM_OP_DONE => {            if let Some(app) = unsafe { app_ptr(hwnd) } {
+        WM_OP_DONE => {
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
                 let lines: Vec<String> = app
                     .ops
                     .lock()
@@ -8263,7 +7268,7 @@ let mut tme = TRACKMOUSEEVENT {
                 app.busy = false;
                 tracing_note(&format!("OP_DONE 前 scroll={}", app.scroll));
                 // 备份/压缩/清理都可能改了库，重读一遍快照。
-app.refresh_now();
+                app.refresh_now();
                 tracing_note(&format!("OP_DONE 后 scroll={}", app.scroll));
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -8273,7 +7278,7 @@ app.refresh_now();
         }
         WM_COMMAND => {
             // 搜索框的 EN_CHANGE：过滤清单。EN_CHANGE = 0x0300。
-let code = (w.0 >> 16) as u16;
+            let code = (w.0 >> 16) as u16;
             if code == 0x0300 {
                 if let Some(app) = unsafe { app_ptr(hwnd) } {
                     let from_search = app
@@ -8298,11 +7303,11 @@ let code = (w.0 >> 16) as u16;
         }
         WM_MOUSEWHEEL => {
             // delta 。
-let delta = ((w.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+            let delta = ((w.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
             if let Some(app) = unsafe { app_ptr(hwnd) } {
                 // 弹窗打开时滚动归弹窗（它自己没内容可滚，直接吞掉）；
                 // 分析/插件的图表页没有可滚动的列表。
-if app.detail.is_some() || (app.view > 2 && app.view != 5 && app.view != 4) {
+                if app.detail.is_some() || (app.view > 2 && app.view != 5 && app.view != 4) {
                     return LRESULT(0);
                 }
                 if app.edit_target.is_some() {
@@ -8314,8 +7319,7 @@ if app.detail.is_some() || (app.view > 2 && app.view != 5 && app.view != 4) {
                         let visible = sel.options.len().min(SELECT_MAX_VISIBLE);
                         let max = sel.options.len().saturating_sub(visible);
                         let step = if delta > 0 { -1 } else { 1 };
-                        let next =
-                            (sel.scroll as i32 + step).clamp(0, max as i32) as usize;
+                        let next = (sel.scroll as i32 + step).clamp(0, max as i32) as usize;
                         if next != sel.scroll {
                             sel.scroll = next;
                             unsafe {
@@ -8330,9 +7334,7 @@ if app.detail.is_some() || (app.view > 2 && app.view != 5 && app.view != 4) {
                     if let Some(name) = app.plugin_open.clone() {
                         let (cw, ch) = app.client_dip(hwnd);
                         let view = app.pm.as_ref().and_then(|pm| {
-                            pm.get_plugin(&name)
-                                .and_then(|p| p.view.as_ref())
-                                .cloned()
+                            pm.get_plugin(&name).and_then(|p| p.view.as_ref()).cloned()
                         });
                         if let Some(view) = view {
                             // 弹窗开着：滚轮不滚正文（弹窗自己没内容可滚）。
@@ -8392,7 +7394,7 @@ if app.detail.is_some() || (app.view > 2 && app.view != 5 && app.view != 4) {
         }
         WM_KEYDOWN => {
             // Esc：先关弹层；没有弹层就收进托盘（与现有版本同一口径）。
-if w.0 == 0x1B {
+            if w.0 == 0x1B {
                 if let Some(app) = unsafe { app_ptr(hwnd) } {
                     if app.detail.is_some() {
                         app.close_detail(hwnd);
@@ -8402,9 +7404,7 @@ if w.0 == 0x1B {
                         }
                     } else if let Some(name) = app.plugin_open.clone() {
                         let view = app.pm.as_ref().and_then(|pm| {
-                            pm.get_plugin(&name)
-                                .and_then(|p| p.view.as_ref())
-                                .cloned()
+                            pm.get_plugin(&name).and_then(|p| p.view.as_ref()).cloned()
                         });
                         let mut handled = false;
                         if let Some(v) = view.as_ref() {
@@ -8434,7 +7434,7 @@ if w.0 == 0x1B {
         }
         WM_CLOSE => {
             // 关窗口 = 收进托盘（真正退出走托盘菜单），与旧版同一口径。
-unsafe {
+            unsafe {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
             LRESULT(0)
@@ -8582,7 +7582,7 @@ fn main() -> windows::core::Result<()> {
     }
 
     // 单实例：互斥体活到进程结束（句柄 drop 即关闭，退出时自然释放）。
-let Some(_mutex) = already_running() else {
+    let Some(_mutex) = already_running() else {
         return Ok(());
     };
 
@@ -8632,7 +7632,7 @@ let Some(_mutex) = already_running() else {
         // 材质必须在**显示之后**贴：窗口还没显示时 DWM 会把深色属性/背板丢掉。
         (*app).mica = apply_glass(hwnd);
         // 原型期置顶：自动化截图时窗口会被浏览器盖住。产品窗口不置顶（P1 删）。
-let _ = SetWindowPos(
+        let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
             0,
@@ -8646,7 +7646,7 @@ let _ = SetWindowPos(
     }
 
     // 截图的两条测试钩子：一条直接截固定区域落盘，一条把覆盖层打开等外部截图。
-if let Ok(spec) = std::env::var("FOCUSFLOW_SNIP_TEST") {
+    if let Ok(spec) = std::env::var("FOCUSFLOW_SNIP_TEST") {
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(1500));
             let mut parts = spec.split(';');
@@ -8657,26 +7657,13 @@ if let Ok(spec) = std::env::var("FOCUSFLOW_SNIP_TEST") {
                 .unwrap_or_else(|| std::env::temp_dir().join("focusflow_snip_test.png"));
             let nums: Vec<i32> = rect_part
                 .split(',')
-                .filter_map(|s| s.trim().parse().ok())
+                .filter_map(|v| v.trim().parse().ok())
                 .collect();
             if nums.len() != 4 {
                 tracing_note("截图测试：参数要写成 x,y,w,h;out.png");
                 return;
             }
-            match capture_rect(nums[0], nums[1], nums[2], nums[3]) {
-                Ok(buf) => {
-                    match save_png(&out, nums[2] as u32, nums[3] as u32, &buf) {
-                        Ok(()) => tracing_note(&format!("截图测试：已写 {}", out.display())),
-                        Err(e) => tracing_note(&format!("截图测试写盘失败：{e}")),
-                    }
-                    // 走同一条剪贴板路径，验收才能一起看
-                    match copy_bgra_to_clipboard(&buf, nums[2], nums[3]) {
-                        Ok(()) => tracing_note("截图测试：已进剪贴板"),
-                        Err(e) => tracing_note(&format!("截图测试：剪贴板失败 {e}")),
-                    }
-                }
-                Err(e) => tracing_note(&format!("截图测试失败：{e}")),
-            }
+            snip::test_capture_to((nums[0], nums[1], nums[2], nums[3]), &out);
         });
     }
     if let Ok(mode) = std::env::var("FOCUSFLOW_SNIP_OVERLAY") {
@@ -8738,7 +7725,9 @@ mod hotkey_tests {
         let defaults = focusflow_core::config::default_config();
         let hotkey = defaults.get("hotkey").expect("核心默认里有 [hotkey] 段");
         for key in ["toggle_window", "snip", "snip_annotate"] {
-            let raw = hotkey.get(key).unwrap_or_else(|| panic!("[hotkey] 默认缺 {key}"));
+            let raw = hotkey
+                .get(key)
+                .unwrap_or_else(|| panic!("[hotkey] 默认缺 {key}"));
             assert!(
                 parse_combo(raw).is_some(),
                 "默认组合 {key} = {raw:?} 解析不了，设置页显示的值和注册的键会分叉"
@@ -8756,7 +7745,10 @@ mod hotkey_tests {
         );
         let why = combo_check(
             "control+shift+f",
-            &[("唤出窗口热键", "ctrl+shift+f"), ("标注截图热键", "shift+f2")],
+            &[
+                ("唤出窗口热键", "ctrl+shift+f"),
+                ("标注截图热键", "shift+f2"),
+            ],
         )
         .expect("换写法躲不掉判重");
         assert!(why.contains("占用"), "要说清被谁占用：{why}");
@@ -8768,14 +7760,20 @@ mod hotkey_tests {
         assert_eq!(
             combo_check(
                 "shift+f2",
-                &[("唤出窗口热键", "ctrl+shift+f"), ("区域截图热键", "shift+f1")]
+                &[
+                    ("唤出窗口热键", "ctrl+shift+f"),
+                    ("区域截图热键", "shift+f1")
+                ]
             ),
             None
         );
         assert_eq!(
             combo_check(
                 "ctrl+alt+9",
-                &[("唤出窗口热键", "ctrl+shift+f"), ("区域截图热键", "shift+f1")]
+                &[
+                    ("唤出窗口热键", "ctrl+shift+f"),
+                    ("区域截图热键", "shift+f1")
+                ]
             ),
             None
         );
@@ -8787,10 +7785,21 @@ mod hotkey_tests {
     #[test]
     fn a_bare_key_is_refused_and_explained() {
         assert_eq!(parse_combo("f1"), None, "裸键 f1 不该当成可用的全局热键");
-        for bad in ["", "   ", "f1", "ctrl+shift", "ctrl++f", "shift+f1+f2", "乱码"] {
+        for bad in [
+            "",
+            "   ",
+            "f1",
+            "ctrl+shift",
+            "ctrl++f",
+            "shift+f1+f2",
+            "乱码",
+        ] {
             let why = combo_check(bad, &[("区域截图热键", "shift+f1")])
                 .unwrap_or_else(|| panic!("{bad:?} 应该被拒"));
-            assert!(why.contains("修饰键"), "{bad:?} 的说明要给能照写的格式：{why}");
+            assert!(
+                why.contains("修饰键"),
+                "{bad:?} 的说明要给能照写的格式：{why}"
+            );
         }
     }
 }
@@ -8822,7 +7831,11 @@ mod weekly_report_tests {
     #[test]
     fn the_report_file_name_carries_the_week_start_date() {
         let path = weekly_report_path(d(2026, 10, 26));
-        assert!(path.ends_with("weekly-2026-10-19.md"), "实际：{}", path.display());
+        assert!(
+            path.ends_with("weekly-2026-10-19.md"),
+            "实际：{}",
+            path.display()
+        );
         assert!(path.to_string_lossy().contains("reports"));
     }
 }
@@ -8870,7 +7883,11 @@ mod plugin_sel_tests {
     fn ungrouped_toggles_and_grouped_replaces() {
         assert_eq!(apply_row_select("", &[], "1"), ["1"].to_vec());
         let two = apply_row_select("", &["1".to_string()], "2");
-        assert_eq!(two, ["1", "2"].to_vec(), "多选按点击顺序留着，拼 id 要用这个顺序");
+        assert_eq!(
+            two,
+            ["1", "2"].to_vec(),
+            "多选按点击顺序留着，拼 id 要用这个顺序"
+        );
         assert_eq!(
             apply_row_select("", &two, "1"),
             ["2"].to_vec(),
@@ -8887,8 +7904,14 @@ mod plugin_sel_tests {
     #[test]
     fn each_group_reads_only_its_own_selection() {
         let sel = map(&[("mcat", &["食品饮料"]), ("msub", &["零食"])]);
-        assert_eq!(sel_action_id("m_edit_cat_sel", "mcat", &sel).unwrap(), "m_edit_cat_sel食品饮料");
-        assert_eq!(sel_action_id("m_del_sub_sel", "msub", &sel).unwrap(), "m_del_sub_sel零食");
+        assert_eq!(
+            sel_action_id("m_edit_cat_sel", "mcat", &sel).unwrap(),
+            "m_edit_cat_sel食品饮料"
+        );
+        assert_eq!(
+            sel_action_id("m_del_sub_sel", "msub", &sel).unwrap(),
+            "m_del_sub_sel零食"
+        );
         // 不分组那一格（旧版前端的 __main）现在是空的 ⇒ 不许发按钮
         let err = sel_action_id("del_", "", &sel).unwrap_err();
         assert!(err.contains("点选一行"), "要说清下一步做什么：{err}");
@@ -8905,90 +7928,6 @@ mod plugin_sel_tests {
         assert!(why.contains("只改一条"), "{why}");
         let one = map(&[("", &["42"])]);
         assert_eq!(sel_action_id("edit_", "", &one).unwrap(), "edit_42");
-    }
-}
-
-#[cfg(test)]
-mod snip_pick_tests {
-    use super::*;
-
-    fn cand(pid: u32, visible: bool, rect: (i32, i32, i32, i32)) -> SnipCandidate {
-        SnipCandidate { pid, visible, rect }
-    }
-
-    const SCREEN: (i32, i32, i32, i32) = (0, 0, 1920, 1080);
-
-    /// 光标同时压着两层时取 Z 序里靠前的那个（`EnumWindows` 就是从最上面往下枚举）。
-    #[test]
-    fn takes_the_topmost_candidate_covering_the_point() {
-        let list = [
-            cand(7, true, (100, 100, 300, 260)),
-            cand(8, true, (50, 50, 600, 600)),
-        ];
-        assert_eq!(
-            snip_window_hit(&list, 1, SCREEN, 150, 150),
-            Some((100, 100, 300, 260))
-        );
-    }
-
-    /// 自己进程必须排掉：覆盖层自己就是全屏、就在最上面，不排掉它每次都挑中那层蒙版。
-    #[test]
-    fn skips_our_own_process_even_when_it_is_the_topmost() {
-        let list = [
-            cand(1, true, (0, 0, 1920, 1080)),
-            cand(9, true, (400, 400, 700, 500)),
-        ];
-        assert_eq!(
-            snip_window_hit(&list, 1, SCREEN, 450, 450),
-            Some((400, 400, 700, 500))
-        );
-    }
-
-    /// 不可见的候选排掉：最小化或隐藏的窗口标志位还挂在那儿，截它只会截到一张旧画面。
-    /// 两层都要罩住光标，否则"跳过不可见"这条根本没被走到——点在第二层外面时连排掉都不必发生。
-    #[test]
-    fn skips_invisible_candidates() {
-        let list = [
-            cand(2, false, (0, 0, 1920, 1080)),
-            cand(3, true, (10, 10, 20, 20)),
-        ];
-        assert_eq!(snip_window_hit(&list, 1, SCREEN, 15, 15), Some((10, 10, 20, 20)));
-    }
-
-    /// 退化矩形（宽或高不足 2 像素）不算一层，接着往下找；全是退化的就什么都没选中。
-    #[test]
-    fn skips_degenerate_rects() {
-        let list = [cand(4, true, (0, 0, 1, 900)), cand(5, true, (0, 0, 30, 30))];
-        assert_eq!(snip_window_hit(&list, 1, SCREEN, 5, 5), Some((0, 0, 30, 30)));
-        assert_eq!(snip_window_hit(&[cand(4, true, (0, 0, 1, 900))], 1, SCREEN, 0, 0), None);
-    }
-
-    /// 探出虚拟屏幕的那一圈根本没有像素可截，要夹回屏幕；夹完仍有面积才算选中。
-    #[test]
-    fn clamps_a_window_sticking_out_of_the_virtual_screen() {
-        let list = [cand(6, true, (1900, 1060, 2400, 1400))];
-        assert_eq!(
-            snip_window_hit(&list, 1, SCREEN, 1905, 1070),
-            Some((1900, 1060, 1920, 1080))
-        );
-    }
-
-    /// 副屏常在负原点：夹的左边是虚拟屏幕那条负边，不是 0。
-    #[test]
-    fn clamps_against_a_negative_screen_origin() {
-        let wide = (-1280, 0, 1280, 1024);
-        let list = [cand(6, true, (-1300, 100, -1000, 400))];
-        assert_eq!(
-            snip_window_hit(&list, 1, wide, -1200, 200),
-            Some((-1280, 100, -1000, 400))
-        );
-    }
-
-    /// 点在空白处（没有一层罩住它）返回 None：覆盖层就此取消，什么都不截、什么都不存。
-    #[test]
-    fn nothing_is_picked_when_no_candidate_covers_the_point() {
-        let list = [cand(7, true, (100, 100, 200, 200))];
-        assert_eq!(snip_window_hit(&list, 1, SCREEN, 900, 900), None);
     }
 }
 
@@ -9026,7 +7965,10 @@ mod user_file_write_tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n != "weekly.md")
             .collect();
-        assert!(strays.is_empty(), "原子替换之后不该再有临时文件: {strays:?}");
+        assert!(
+            strays.is_empty(),
+            "原子替换之后不该再有临时文件: {strays:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9088,8 +8030,16 @@ mod pin_tests {
         assert_eq!(pin_scaled_size(120, 80, 1.0), (120, 80));
         assert_eq!(pin_scaled_size(120, 80, 0.5), (60, 40));
         assert_eq!(pin_scaled_size(120, 80, 4.0), (480, 320));
-        assert_eq!(pin_scaled_size(1, 1, PIN_MIN_SCALE), (1, 1), "1×1 不能滚成 0×0");
-        assert_eq!(pin_scaled_size(3, 2, 0.25), (1, 1), "半像素要进到 1，不是截成 0");
+        assert_eq!(
+            pin_scaled_size(1, 1, PIN_MIN_SCALE),
+            (1, 1),
+            "1×1 不能滚成 0×0"
+        );
+        assert_eq!(
+            pin_scaled_size(3, 2, 0.25),
+            (1, 1),
+            "半像素要进到 1，不是截成 0"
+        );
     }
 }
 

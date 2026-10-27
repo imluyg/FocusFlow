@@ -1,25 +1,41 @@
 <#
 .SYNOPSIS
-  The two snip paths: the snip hotkey saves on mouse-up, the snip_annotate hotkey opens the
-  annotation window instead -- and only the first one writes a file immediately.
+  The snip flow on the frozen-screen overlay: the snip hotkey saves on mouse-up, the
+  snip_annotate hotkey keeps the overlay alive so the selection can be adjusted and
+  annotated in place -- and only the first one writes a file immediately.
 
 .DESCRIPTION
   Runs against a fresh COPY of desktop-native\probe (nothing touches real data).
 
   The app hook FOCUSFLOW_SNIP_OVERLAY opens the full-screen selection overlay 1.5 s after
-  start: any value = the quick path (save on mouse-up), the value "annotate" = open the
-  annotation editor after the selection. Injected *mouse* events do reach the app, so the
-  harness really drags a rubber band and then looks at what changed on disk / which window
-  exists. That makes this the end-to-end check for the selection -> save branch.
+  start: any value = the quick path (save on mouse-up), the value "annotate" = stay on the
+  overlay with the toolbar after the selection. Injected *mouse* events do reach the app, so
+  the harness really drags a rubber band and then looks at what changed on disk.
 
-  Screenshots land in <app>\data\screenshots, so the PNG count is the observable.
+  What the overlay shows now: the whole virtual screen is frozen at hotkey time, everything
+  outside the selection is dimmed, and the saved pixels are cropped out of that frozen buffer.
+  So the PNG is checked for the exact dragged size -- a live re-capture after the overlay was
+  destroyed would no longer be the same picture the user selected.
 
-  Round 3 adds the third gesture: a single click (down and up without moving) picks the
-  window under the cursor. The fixture is a top-level window of *this PowerShell process* --
-  the app has to skip its own process, and a wrong pick shows up immediately as a PNG whose
-  size is the app window (1200x860) or the whole screen instead of the fixture's 320x200.
-  The same round then asks for a second overlay from the same process: the state flag that
-  says "an overlay is open" must be free again once one finished.
+  Round 2 drives the toolbar the way a user clicks it: the overlay logs every button as
+  "snip-btn <id> <x> <y> <w> <h>" when the selection is confirmed, and the harness posts
+  mouse messages to those coordinates. That is what makes the annotation chain
+  (tool -> mark -> bake -> PNG) machine-verifiable instead of eye-verified: with the block
+  tool covering the whole selection, the saved PNG has to be that color everywhere.
+  Each leg ANDs its own precondition (the button line must be in the log) so a missing
+  toolbar reads as a failure, not as a skip.
+
+  Round 2b repeats the same gesture with Backspace before the commit: the undo must really
+  remove the mark, so the PNG must NOT be that color. A leg that only checks "a file appeared"
+  would pass both times.
+
+  Round 3: a single click (down and up without moving) picks the window under the cursor. The
+  fixture is a top-level window of *this PowerShell process* -- the app has to skip its own
+  process, and a wrong pick shows up immediately as a PNG whose size is the app window
+  (1200x860) or the whole screen instead of the fixture's 320x200.
+
+  Round 3b: a corner handle drag resizes the confirmed selection; the PNG has to grow by the
+  same number of pixels the handle was moved.
 
   Round 4 covers the give-up-on-timeout branch: the overlay logs the three-minute timer it
   arms, and it must then close itself without writing anything -- which means this round
@@ -27,9 +43,6 @@
   loop (measured), so there is no way to fast-forward it from the harness.
 
   ASCII-only, like every file in this folder.
-
-.EXAMPLE
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-snip.ps1
 #>
 param(
     [string]$Exe = '',
@@ -80,6 +93,87 @@ function Wait-Log([string]$Pattern, [int]$TimeoutMs = 4000) {
     $false
 }
 
+# One toolbar button as the overlay reported it: 'snip-btn <id> <x> <y> <w> <h>'
+function Get-BarBtn([string]$Id) {
+    $line = @(Get-SnipLog | Where-Object { $_ -match "snip-btn $Id (-?\d+) (-?\d+) (\d+) (\d+)" })
+    if ($line.Count -eq 0) { return $null }
+    $m = [regex]::Match($line[0], "snip-btn $Id (-?\d+) (-?\d+) (\d+) (\d+)")
+    if (-not $m.Success) { return $null }
+    [pscustomobject]@{
+        X = [int]$m.Groups[1].Value
+        Y = [int]$m.Groups[2].Value
+        W = [int]$m.Groups[3].Value
+        H = [int]$m.Groups[4].Value
+        CX = ([int]$m.Groups[1].Value + [int]$m.Groups[3].Value / 2)
+        CY = ([int]$m.Groups[2].Value + [int]$m.Groups[4].Value / 2)
+    }
+}
+
+function Post-Mouse([IntPtr]$H, [uint32]$Msg, [int]$X, [int]$Y) {
+    $lp = (($Y -band 0xFFFF) * 65536) + ($X -band 0xFFFF)
+    [void][FF]::PostMessage($H, $Msg, [IntPtr]1, [IntPtr]$lp)
+}
+
+# Message ids, spelled out because mixing two of them up silently changes the gesture:
+# 0x0200 WM_MOUSEMOVE, 0x0201 WM_LBUTTONDOWN, 0x0202 WM_LBUTTONUP, 0x0204 WM_RBUTTONDOWN (= cancel).
+$FF_MOVE = 0x0200
+$FF_DOWN = 0x0201
+$FF_UP = 0x0202
+
+function Post-Key([IntPtr]$H, [int]$Vk) {
+    # WM_KEYDOWN: lParam bit 30 = not previously pressed; the app's handler reads only the vk.
+    [void][FF]::PostMessage($H, 0x0100, [IntPtr]$Vk, [IntPtr]0)
+}
+
+# Click a toolbar button: move, then down + up on its center (client coordinates).
+function Click-BarBtn([IntPtr]$H, $Btn) {
+    $x = [int]$Btn.CX
+    $y = [int]$Btn.CY
+    Post-Mouse $H $FF_MOVE $x $y
+    Post-Mouse $H $FF_DOWN $x $y
+    Start-Sleep -Milliseconds 120
+    Post-Mouse $H $FF_UP $x $y
+    Start-Sleep -Milliseconds 200
+}
+
+# Press inside the image, move, release: one stroke of the current tool.
+function Drag-Mark([IntPtr]$H, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1) {
+    Post-Mouse $H $FF_MOVE $X0 $Y0
+    Post-Mouse $H $FF_DOWN $X0 $Y0
+    Start-Sleep -Milliseconds 120
+    Post-Mouse $H $FF_MOVE $X1 $Y1
+    Start-Sleep -Milliseconds 120
+    Post-Mouse $H $FF_MOVE (($X0 + $X1) / 2) (($Y0 + $Y1) / 2)
+    Post-Mouse $H $FF_UP $X1 $Y1
+    Start-Sleep -Milliseconds 250
+}
+
+# Sample the saved PNG on a grid and count red pixels (the annotate default is 255,45,45)
+# inside the block that was dragged and in everything outside it. Both numbers are the point:
+# "inside is red" proves the mark was baked, "outside is not red" proves nothing bled or moved.
+function Measure-BlockHit([string]$Path, [int]$Bx0, [int]$By0, [int]$Bx1, [int]$By1) {
+    if (-not $Path -or -not (Test-Path $Path)) { return $null }
+    $bmp = [System.Drawing.Bitmap]::new($Path)
+    $inHit = 0; $inTot = 0; $outHit = 0; $outTot = 0
+    for ($yy = 3; $yy -lt $bmp.Height - 3; $yy += 5) {
+        for ($xx = 3; $xx -lt $bmp.Width - 3; $xx += 5) {
+            $c = $bmp.GetPixel($xx, $yy)
+            $isRed = ($c.R -ge 250 -and $c.G -le 50 -and $c.B -le 50)
+            $inBlock = ($xx -ge $Bx0 -and $xx -lt $Bx1 -and $yy -ge $By0 -and $yy -lt $By1)
+            if ($inBlock) { $inTot++; if ($isRed) { $inHit++ } }
+            else { $outTot++; if ($isRed) { $outHit++ } }
+        }
+    }
+    $bmp.Dispose()
+    if ($inTot -eq 0 -or $outTot -eq 0) { return $null }
+    [pscustomobject]@{
+        In = [int](100 * $inHit / $inTot)
+        Out = [int](100 * $outHit / $outTot)
+        InTot = $inTot
+        OutTot = $outTot
+    }
+}
+
 function Stop-Round([IntPtr]$Hwnd, $Proc) {
     if ($Hwnd -ne [IntPtr]::Zero) {
         [void][FF]::PostMessage($Hwnd, 0x8009, [IntPtr]::Zero, [IntPtr]::Zero)
@@ -110,22 +204,32 @@ Drag-Screen 240 200 640 470
 Check 'the quick path saved a PNG' (Wait-Png $before) "png $before -> $(Count-Png)"
 $quickHits = @(Get-SnipLog | Where-Object { $_ -match 'snip-quick' })
 Check 'the log names the quick path' ($quickHits.Count -gt 0)
-$ed = [FF]::ByClass([uint32]$p.Id, 'FocusFlowSnipEditor')
-Check 'the quick path does not open the editor' ($ed -eq [IntPtr]::Zero)
+
+# The one product promise of the quick hotkey: mouse-up commits and nothing else opens.
+# The old assertion looked for an editor window class that no longer exists at all, which
+# passes even when the whole annotate stage is gone -- so the observable is the overlay.
+Check 'the quick commit closes the overlay itself' `
+    ([FF]::ByClass([uint32]$p.Id, 'FocusFlowSnipOverlay') -eq [IntPtr]::Zero)
+$new1 = Get-NewestPng
+Check 'the file is named with the size it saved' `
+    ((Split-Path $new1 -Leaf) -match '^snip_\d{8}_\d{6}_\d+x\d+\.png$') (Split-Path $new1 -Leaf)
+$s1 = Get-PngSize $new1
+Check 'the saved pixels are the dragged rect' ($s1 -and $s1.Width -eq 400 -and $s1.Height -eq 270) `
+    ("got=$($s1.Width)x$($s1.Height)")
 
 # After a snip that really succeeded the overlay state must be free again: the flag that
-# says "an overlay is open" is what start_snip checks, and if nothing clears it on the
+# says "an overlay is open" is what start() checks, and if nothing clears it on the
 # success path the very next hotkey press does nothing until the app is restarted.
 [void][FF]::PostMessage($h, 0x8006, [IntPtr]::Zero, [IntPtr]::Zero)   # WM_SNIP_START (quick)
 $ov1b = Wait-Window $p.Id 'FocusFlowSnipOverlay' 4000
 Check 'a second snip opens the overlay again' ($ov1b -ne [IntPtr]::Zero)
 if ($ov1b -ne [IntPtr]::Zero) {
-    [void][FF]::PostMessage($ov1b, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)   # Esc = give up
+    Post-Key $ov1b 0x1B
     Start-Sleep -Milliseconds 600
 }
 Stop-Round $h $p
 
-# ---------- round 2: annotate path (the snip_annotate hotkey) ----------
+# ---------- round 2: annotate path, all four tools of the frozen overlay ----------
 $before2 = Count-Png
 Remove-Item $logPath -ErrorAction SilentlyContinue
 $p2 = Start-App $Exe $app $WorkDir @{ FOCUSFLOW_SNIP_OVERLAY = 'annotate' }
@@ -135,19 +239,62 @@ $ov2 = Wait-Window $p2.Id 'FocusFlowSnipOverlay' 6000
 Check 'the annotate round opens the overlay too' ($ov2 -ne [IntPtr]::Zero)
 
 Drag-Screen 260 220 660 490
-$ed2 = Wait-Window $p2.Id 'FocusFlowSnipEditor' 6000
-Check 'the annotate path opens the editor window' ($ed2 -ne [IntPtr]::Zero)
-Check 'the annotate path has not written a file yet' ((Count-Png) -eq $before2) "png=$(Count-Png)"
+# The overlay must stay (it is the annotate stage now, not a second window) and nothing
+# must be on disk yet.
+Check 'the annotate stage keeps the overlay alive' `
+    ([FF]::ByClass([uint32]$p2.Id, 'FocusFlowSnipOverlay') -ne [IntPtr]::Zero)
+Check 'the annotate stage logs itself' (Wait-Log 'snip-annotate')
+Check 'the annotate stage has not written a file yet' ((Count-Png) -eq $before2) "png=$(Count-Png)"
+$bBlock = Get-BarBtn 'block'
+$bSave = Get-BarBtn 'save'
+Check 'the toolbar reports the block and save buttons' ($bBlock -and $bSave) `
+    ("block-null=$([bool](-not $bBlock)) save-null=$([bool](-not $bSave))")
 
-# Esc inside the editor = give up; nothing should be saved by that.
-if ($ed2 -ne [IntPtr]::Zero) {
-    [void][FF]::PostMessage($ed2, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)   # WM_KEYDOWN VK_ESCAPE
-    Start-Sleep -Milliseconds 800
-    $still = [FF]::ByClass([uint32]$p2.Id, 'FocusFlowSnipEditor')
-    Check 'Esc closes the editor' ($still -eq [IntPtr]::Zero)
-    Check 'giving up saved nothing' ((Count-Png) -eq $before2) "png=$(Count-Png)"
+if ($bBlock) {
+    # Cover part of the selection with the block tool, then commit with Enter (the toolbar's
+    # own 'save' button is exercised the same way in round 3b's sibling). The saved PNG has to
+    # be that color exactly where the stroke was dragged -- the first machine check of
+    # tool -> mark -> bake -> file, and of the fact that nothing outside the stroke changed.
+    Click-BarBtn $ov2 $bBlock
+    Drag-Mark $ov2 280 250 640 470
+    Post-Key $ov2 0x0D
+    $ok2 = Wait-Png $before2 8000
+    Check 'the annotated snip saved a PNG' $ok2 "png $before2 -> $(Count-Png)"
+    $hit2 = Measure-BlockHit (Get-NewestPng) 20 30 380 250
+    Check 'the block landed where it was dragged' `
+        ($hit2 -and $hit2.In -ge 98 -and $hit2.Out -le 2) ($hit2 | Out-String -Compress)
+    Check 'the annotate overlay closed on commit' `
+        ([FF]::ByClass([uint32]$p2.Id, 'FocusFlowSnipOverlay') -eq [IntPtr]::Zero)
+} else {
+    Check 'the annotate round drove the toolbar' $false 'no snip-btn block in the log'
 }
 Stop-Round $h2 $p2
+
+# ---------- round 2b: Backspace must undo the mark ----------
+$before2b = Count-Png
+Remove-Item $logPath -ErrorAction SilentlyContinue
+$p2b = Start-App $Exe $app $WorkDir @{ FOCUSFLOW_SNIP_OVERLAY = 'annotate' }
+$h2b = Wait-Window $p2b.Id
+$ov2b = Wait-Window $p2b.Id 'FocusFlowSnipOverlay' 6000
+Check 'the undo round opens the overlay' ($ov2b -ne [IntPtr]::Zero)
+Drag-Screen 280 240 680 500
+$bBlock2 = Get-BarBtn 'block'
+$bUndo = Get-BarBtn 'undo'
+if ($bBlock2 -and $bUndo -and $ov2b -ne [IntPtr]::Zero) {
+    Click-BarBtn $ov2b $bBlock2
+    Drag-Mark $ov2b 300 270 660 480
+    Post-Key $ov2b 0x08          # Backspace = undo the only mark
+    Start-Sleep -Milliseconds 300
+    Post-Key $ov2b 0x0D          # Enter = commit
+    $ok2b = Wait-Png $before2b 8000
+    Check 'the undone snip still saved a PNG' $ok2b "png $before2b -> $(Count-Png)"
+    $hit2b = Measure-BlockHit (Get-NewestPng) 20 30 380 240
+    Check 'undo took the mark out of the saved pixels' ($hit2b -and $hit2b.In -le 5) `
+        ($hit2b | Out-String -Compress)
+} else {
+    Check 'the undo round found the toolbar' ($bBlock2 -and $bUndo) 'block or undo button missing'
+}
+Stop-Round $h2b $p2b
 
 # ---------- round 3: a single click picks the window under the cursor ----------
 # A foreign top-level window (this PowerShell process, not the app) is the fixture: the app
@@ -193,10 +340,57 @@ Check 'the log names the window pick' (@(Get-SnipLog | Where-Object { $_ -match 
 $ov3b = Wait-Window $p3.Id 'FocusFlowSnipOverlay' 4000
 Check 'a second snip opens the overlay again' ($ov3b -ne [IntPtr]::Zero)
 if ($ov3b -ne [IntPtr]::Zero) {
-    [void][FF]::PostMessage($ov3b, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)   # Esc = give up
+    Post-Key $ov3b 0x1B
     Start-Sleep -Milliseconds 600
 }
 Stop-Round $h3 $p3
+
+# ---------- round 3b: the corner handle resizes the confirmed selection ----------
+$before3b = Count-Png
+Remove-Item $logPath -ErrorAction SilentlyContinue
+$p3c = Start-App $Exe $app $WorkDir @{ FOCUSFLOW_SNIP_OVERLAY = 'annotate' }
+$h3c = Wait-Window $p3c.Id
+$ov3c = Wait-Window $p3c.Id 'FocusFlowSnipOverlay' 6000
+Check 'the resize round opens the overlay' ($ov3c -ne [IntPtr]::Zero)
+Drag-Screen 300 260 600 440
+$bSave3 = Get-BarBtn 'save'
+Check 'the resize round found the toolbar' ($bSave3 -ne $null)
+if ($bSave3) {
+    # bottom-right handle of the 300,260 - 600,440 selection = (600,440) in client coords;
+    # drag it +40/+40, then press the toolbar's own commit button.
+    Post-Mouse $ov3c $FF_MOVE 600 440
+    Post-Mouse $ov3c $FF_DOWN 600 440
+    Start-Sleep -Milliseconds 100
+    Post-Mouse $ov3c $FF_MOVE 640 480
+    Start-Sleep -Milliseconds 100
+    Post-Mouse $ov3c $FF_UP 640 480
+    Start-Sleep -Milliseconds 250
+    Click-BarBtn $ov3c $bSave3
+    $ok3b = Wait-Png $before3b 8000
+    Check 'the resized selection saved a PNG' $ok3b "png $before3b -> $(Count-Png)"
+    $s3b = Get-PngSize (Get-NewestPng)
+    Check 'the saved size grew with the handle' `
+        ($s3b -and $s3b.Width -ge 330 -and $s3b.Width -le 344 -and $s3b.Height -ge 210 -and $s3b.Height -le 224) `
+        ("png=$($s3b.Width)x$($s3b.Height) want=340x220")
+} else {
+    Stop-Round $h3c $p3c
+    $fx.Close(); $fx.Dispose()
+    Show-Summary
+}
+# Esc on a fresh overlay gives up without writing anything (the annotate stage's own Esc is
+# covered by the undo round's outcome shape).
+[void][FF]::PostMessage($h3c, 0x8006, [IntPtr]::Zero, [IntPtr]::Zero)
+$ov3d = Wait-Window $p3c.Id 'FocusFlowSnipOverlay' 4000
+if ($ov3d -ne [IntPtr]::Zero) {
+    $pngBeforeEsc = Count-Png
+    Drag-Screen 320 280 520 380
+    Post-Key $ov3d 0x1B
+    Start-Sleep -Milliseconds 800
+    Check 'Esc after the selection saved nothing' ((Count-Png) -eq $pngBeforeEsc) "png=$(Count-Png)"
+    Check 'Esc closed the overlay' `
+        ([FF]::ByClass([uint32]$p3c.Id, 'FocusFlowSnipOverlay') -eq [IntPtr]::Zero)
+}
+Stop-Round $h3c $p3c
 $fx.Close()
 $fx.Dispose()
 
