@@ -43,7 +43,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 | `accept-hotkey.ps1` | 两轮启动：配置里的三条组合按原样注册（日志逐字对）/ 一条写成裸键时程序照样起、日志点名被拒的那条、没被拒的那条照样注册 | 10 项 |
 | `accept-datadir.ps1` | 两轮启动：`[paths]` 里那条待搬运标记由启动早期兑现（data/ 与 backup/ 真到了新根、旧根清空、标记归空、日志点名新根）/ 新根建不出来时数据原地不动、标记留着下次重试 | 13 项 |
 | `accept-plugsel.ps1` | 自带一份 ASCII 小插件（分组表格 + `onselect` + `sel` 按钮）：Lua 里的 ids/group/onselect 真的走到宿主、选中写了声明的那个字段、`sel` 按钮拼出 `<按钮 id><记录 id>` | 10 项 |
-| `accept-snip.ps1` | 用真注入的鼠标拖框跑两条截图收尾：快速版落了 PNG 且没开标注窗 / 标注版开了窗、还没落盘、Esc 关掉且什么都没存 | 10 项 |
+| `accept-snip.ps1` | 用真注入的鼠标跑三条截图手势：拖框后快速版落 PNG / 标注版开窗不落盘、Esc 关掉；**单击选中光标下那个别人的窗口**（夹具是本脚本自己的一个 Form，产品必须排掉自己进程，选错了 PNG 尺寸就对不上）；**覆盖层挂满三分钟自己退**（这一条真等，见坑 7） | 21 项（含一条 180 秒的等待） |
 | `accept-report.ps1` | 两轮启动：缺的那份上周周报由启动补上（文件名 `weekly-<上周一>.md`、有内容）/ 第二次启动看见已有文件就不动（时间戳不变） | 10 项 |
 | `accept-pin.ps1` | 两条验收消息开/收贴图（`0x8000+12` 开 N 张、`0x8000+13` 全关）：数得到窗口与尺寸、Esc 关单张、全关后归零，**贴图全程不多落一个 PNG** | 11 项 |
 | `accept-installer.ps1` | 静默装 → 目录/卸载器/快捷方式/注册表/版本号/exe 图标 → 装出来的 exe 默认在采集 → 静默卸 → 全部清干净 | 17 项 |
@@ -82,7 +82,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 `Click-ViewTab` / `Click-ATab` / `Click-BasicRow` / `Click-PeriodPill`、`Get-InstalledDir`、
 `Invoke-Setup`。
 
-## 五个坑（都踩过）
+## 七个坑（都踩过）
 
 1. **注入的键盘到不了低级键盘钩子**：`keybd_event`（带真实扫描码）与 `SendInput` 都试过，
    采集里一条都收不到；同一批注入的**鼠标**事件正常。所以采集脚本用点击计数，
@@ -99,3 +99,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
    消息落进没人认领的号段，产品一声不响 ⇒ 五条红点看着像"贴图功能没做"，实际是量具投错了号。
    这类红要先问"消息到底有没有人接"，判据写在产品侧就照产品侧那个基数写（其它脚本用的
    `0x8008` / `0x8009` 是对的）。
+6. **PowerShell 的 `-shl` 保持左操作数的类型**：对 `[byte]` 做 `1 -shl 8` 得到的是 0（在 8 位里绕回去），
+   于是 `Get-PngSize` 把 306 宽的截图读成 50，红点看着像"截图截错了区域"。读大端整数要先
+   `([uint32]$b[16] -shl 24)`——同一句里 `-bor` 而不是 `+`，避免进位串位。
+7. **别处的 `WM_TIMER` 投不进这个循环**：实测给覆盖层投 `WM_TIMER`（wParam 用产品自己那个定时器 id，
+   也试了 0）都没反应，而给同一个窗口投 `WM_KEYDOWN`/VK_ESCAPE 立刻关掉。所以"三分钟自动放弃"
+   这类按时钟走的行为只能**真等**——`accept-snip.ps1` 那条就是等满 180 秒的，跑这套要多留三分钟内别抢鼠标。

@@ -41,7 +41,8 @@ use windows::Win32::Graphics::DirectComposition::{
 };
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -4479,6 +4480,142 @@ fn virtual_screen_origin() -> (i32, i32) {
     }
 }
 
+/// 覆盖层挂满三分钟就自己退：截图是"顺手按一次"的工具，鼠标忘了它，整张桌面会一直被蒙版压着。
+const SNIP_TIMEOUT_MS: u32 = 180_000;
+/// 那个定时器 id（`0x534E` = 'SN'）。验收脚本按同一个数投一条 WM_TIMER 过来催它响。
+const SNIP_TIMEOUT_TIMER: usize = 0x534E;
+
+/// 覆盖层上"单击选窗口"看到的一条候选：Z 序里的一个顶层窗口，只带判得动的那三件事。
+/// 谁家的、可见吗、矩形——枚举与取边界留在 Win32 那一侧，裁决全在这里。
+#[derive(Clone, Copy, Debug)]
+struct SnipCandidate {
+    pid: u32,
+    visible: bool,
+    /// left, top, right, bottom（屏幕坐标）
+    rect: (i32, i32, i32, i32),
+}
+
+/// 按 Z 序（`EnumWindows` 的枚举顺序就是从最上面往下）收候选，装进 [`SNIP_HITS`]。
+/// 回调不能带环境，所以结果落在静态里，收完再拷出来。
+fn snip_candidates() -> Vec<SnipCandidate> {
+    if let Ok(mut v) = SNIP_HITS.lock() {
+        v.clear();
+    }
+    unsafe {
+        let _ = EnumWindows(Some(snip_collect_hit), LPARAM(0));
+    }
+    SNIP_HITS.lock().map(|v| v.clone()).unwrap_or_default()
+}
+
+static SNIP_HITS: Mutex<Vec<SnipCandidate>> = Mutex::new(Vec::new());
+
+unsafe extern "system" fn snip_collect_hit(hwnd: HWND, _l: LPARAM) -> BOOL {
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    let mut rc = RECT::default();
+    unsafe {
+        // DWM 那份边界才是"看见的那块"：GetWindowRect 还带着一圈透明的可调边框，
+        // 照它截会在窗口外面多带一截桌面。拿不到（非合成窗口）才退回窗口矩形。
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rc as *mut RECT as *mut core::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .is_err()
+        {
+            let _ = GetWindowRect(hwnd, &mut rc);
+        }
+    }
+    if let Ok(mut v) = SNIP_HITS.lock() {
+        v.push(SnipCandidate {
+            pid,
+            visible: unsafe { IsWindowVisible(hwnd) }.as_bool(),
+            rect: (rc.left, rc.top, rc.right, rc.bottom),
+        });
+    }
+    TRUE
+}
+
+/// 从候选里挑第一个"别人进程的、可见的、还有面积的、罩住光标"的窗口矩形，并夹回虚拟屏幕。
+///
+/// 排掉自己进程是这条手势的关键：覆盖层自己就是全屏、就在最上面，不排掉它每次都挑中蒙版本身。
+/// 夹回虚拟屏幕是因为窗口可以探出屏幕外（负原点的副屏、被拖出界的窗口），探出去的那部分
+/// 屏幕上根本没有像素可截。夹完没有面积可截就接着往下找。
+fn snip_window_hit(
+    candidates: &[SnipCandidate],
+    self_pid: u32,
+    screen: (i32, i32, i32, i32),
+    x: i32,
+    y: i32,
+) -> Option<(i32, i32, i32, i32)> {
+    for c in candidates {
+        if c.pid == self_pid || !c.visible {
+            continue;
+        }
+        let (l, t, r, b) = c.rect;
+        if r - l < 2 || b - t < 2 {
+            continue;
+        }
+        if x < l || x >= r || y < t || y >= b {
+            continue;
+        }
+        let l = l.max(screen.0);
+        let t = t.max(screen.1);
+        let r = r.min(screen.2);
+        let b = b.min(screen.3);
+        if r - l < 2 || b - t < 2 {
+            continue;
+        }
+        return Some((l, t, r, b));
+    }
+    None
+}
+
+/// 覆盖层客户坐标 -> 光标底下"别人的那个窗口"在屏幕上的矩形；没选中就 None。
+/// 客户坐标要换成屏幕坐标再比，因为候选矩形是屏幕坐标，而覆盖层起点是虚拟屏幕左上角。
+fn snip_pick_screen(x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
+    let (vx, vy) = virtual_screen_origin();
+    let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    snip_window_hit(
+        &snip_candidates(),
+        std::process::id(),
+        (vx, vy, vx + vw, vy + vh),
+        vx + x,
+        vy + y,
+    )
+}
+
+/// 选区定了之后的唯一收尾：抓屏 -> 把画面塞进 [`SNIP`] -> 按这一次的开关走标注窗或直接存。
+/// 拖框与"单击选窗口"两条手势都到这里，所以它们看到的是同一张图、同一套落盘规则。
+fn snip_take(x: i32, y: i32, w: i32, h: i32) {
+    match capture_rect(x, y, w, h) {
+        Ok(buf) => {
+            if let Ok(mut s) = SNIP.lock() {
+                s.img = buf;
+                s.img_w = w;
+                s.img_h = h;
+                s.marks.clear();
+                s.tool = 0;
+                s.drag = None;
+                s.text_edit = 0;
+            }
+            // 标注版：编辑窗口贴在选区原位，底下露出的就是刚截的那块。
+            // 快速版（松手即存）：marks 是空的，save 走的就是"原样那一张"。
+            if SNIP.lock().map(|s| s.annotate).unwrap_or(true) {
+                open_snip_editor(x, y, w, h);
+            } else {
+                tracing_note("截图 snip-quick：松手即存，不进标注窗");
+                save_snip_edit();
+            }
+        }
+        Err(e) => tracing_note(&format!("截图失败：{e}")),
+    }
+}
+
 unsafe extern "system" fn snip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
         match msg {
@@ -4514,46 +4651,21 @@ unsafe extern "system" fn snip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
                 let (sx, sy) = SNIP.lock().map(|s| s.start).unwrap_or((0, 0));
                 let _ = ReleaseCapture();
-                let rx = sx.min(x);
-                let ry = sy.min(y);
                 let rw = (sx - x).abs();
                 let rh = (sy - y).abs();
                 // 覆盖层起点是虚拟屏幕左上角，转成屏幕坐标再截
                 let (vx, vy) = virtual_screen_origin();
+                // 先关覆盖层再抓屏：蒙版还挂着的话，截到的是被压暗的那一份。
                 let _ = DestroyWindow(hwnd);
                 if rw >= 4 && rh >= 4 {
-                    match capture_rect(vx + rx, vy + ry, rw, rh) {
-                        Ok(buf) => {
-                            if let Ok(mut s) = SNIP.lock() {
-                    s.img = buf;
-                    s.img_w = rw;
-                    s.img_h = rh;
-                    s.marks.clear();
-                    s.tool = 0;
-                    s.drag = None;
-                    s.text_edit = 0;
-                }
-                            // 标注版：编辑窗口贴在选区原位，底下露出的就是刚截的那块。
-                            // 快速版（松手即存）：marks 是空的，save 走的就是"原样那一张"。
-                            if SNIP.lock().map(|s| s.annotate).unwrap_or(true) {
-                                open_snip_editor(vx + rx, vy + ry, rw, rh);
-                            } else {
-                                tracing_note("截图 snip-quick：松手即存，不进标注窗");
-                                save_snip_edit();
-                            }
-                        }
-                        Err(e) => {
-                            if let Ok(mut s) = SNIP.lock() {
-                                s.active = false;
-                            }
-                            tracing_note(&format!("截图失败：{e}"));
-                        }
-                    }
+                    snip_take(vx + sx.min(x), vy + sy.min(y), rw, rh);
+                } else if let Some((pl, pt, pr, pb)) = snip_pick_screen(x, y) {
+                    // 没拖出区域就是旧版那条手势：单击选中光标下面那个窗口。
+                    let (pw, ph) = (pr - pl, pb - pt);
+                    tracing_note(&format!("截图 snip-pick {pw}x{ph} at {pl},{pt}"));
+                    snip_take(pl, pt, pw, ph);
                 } else {
-                    if let Ok(mut s) = SNIP.lock() {
-                        s.active = false;
-                    }
-                    tracing_note("截图取消：选区太小");
+                    tracing_note("截图取消：这一笔既没框出区域，也没点到别的窗口");
                 }
                 LRESULT(0)
             }
@@ -4563,6 +4675,14 @@ unsafe extern "system" fn snip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             }
             WM_KEYDOWN if w.0 == 0x1B => {
                 let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_TIMER => {
+                // 覆盖层只挂了一个定时器，但 id 照样要对上：别的 WM_TIMER 不该被当成超时。
+                if w.0 == SNIP_TIMEOUT_TIMER {
+                    tracing_note("截图 snip-timeout 三分钟没动，覆盖层自己退");
+                    let _ = DestroyWindow(hwnd);
+                }
                 LRESULT(0)
             }
             WM_PAINT => {
@@ -4590,7 +4710,15 @@ let mut ps = PAINTSTRUCT::default();
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
             }
-            WM_DESTROY => LRESULT(0),
+            WM_DESTROY => {
+                // 覆盖层没了 = "这一次正在选区"结束了，标志位必须跟着复位。
+                // 以前只有两条失败分支复位它，于是成功截完一次之后标志一直挂着，
+                // 下一次热键被 start_snip 的早退吃掉：第二次截图按不出来，直到重启。
+                if let Ok(mut s) = SNIP.lock() {
+                    s.active = false;
+                }
+                LRESULT(0)
+            }
             _ => DefWindowProcW(hwnd, msg, w, l),
         }
     }
@@ -5221,7 +5349,11 @@ fn start_snip(owner: HWND, annotate: bool) {
                 let _ = ShowWindow(ov, SW_SHOW);
                 let _ = SetForegroundWindow(ov);
                 let _ = SetFocus(Some(ov));
-                tracing_note("截图覆盖层已打开（拖选区域，右键/Esc 取消）");
+                // 超时自己退：这个蒙版压着整张桌面，忘了它就会一直挡在那儿。
+                // 验收脚本按同一个 id 投一条 WM_TIMER 来催它响，所以这里把数字写进日志。
+                let _ = SetTimer(Some(ov), SNIP_TIMEOUT_TIMER, SNIP_TIMEOUT_MS, None);
+                tracing_note(&format!("截图 snip-arm-timeout {SNIP_TIMEOUT_MS}"));
+                tracing_note("截图覆盖层已打开（拖选区域或单击选窗口，右键/Esc 取消）");
             }
             Err(_) => tracing_note("截图覆盖层创建失败"),
         }
@@ -8764,6 +8896,90 @@ mod plugin_sel_tests {
         assert!(why.contains("只改一条"), "{why}");
         let one = map(&[("", &["42"])]);
         assert_eq!(sel_action_id("edit_", "", &one).unwrap(), "edit_42");
+    }
+}
+
+#[cfg(test)]
+mod snip_pick_tests {
+    use super::*;
+
+    fn cand(pid: u32, visible: bool, rect: (i32, i32, i32, i32)) -> SnipCandidate {
+        SnipCandidate { pid, visible, rect }
+    }
+
+    const SCREEN: (i32, i32, i32, i32) = (0, 0, 1920, 1080);
+
+    /// 光标同时压着两层时取 Z 序里靠前的那个（`EnumWindows` 就是从最上面往下枚举）。
+    #[test]
+    fn takes_the_topmost_candidate_covering_the_point() {
+        let list = [
+            cand(7, true, (100, 100, 300, 260)),
+            cand(8, true, (50, 50, 600, 600)),
+        ];
+        assert_eq!(
+            snip_window_hit(&list, 1, SCREEN, 150, 150),
+            Some((100, 100, 300, 260))
+        );
+    }
+
+    /// 自己进程必须排掉：覆盖层自己就是全屏、就在最上面，不排掉它每次都挑中那层蒙版。
+    #[test]
+    fn skips_our_own_process_even_when_it_is_the_topmost() {
+        let list = [
+            cand(1, true, (0, 0, 1920, 1080)),
+            cand(9, true, (400, 400, 700, 500)),
+        ];
+        assert_eq!(
+            snip_window_hit(&list, 1, SCREEN, 450, 450),
+            Some((400, 400, 700, 500))
+        );
+    }
+
+    /// 不可见的候选排掉：最小化或隐藏的窗口标志位还挂在那儿，截它只会截到一张旧画面。
+    /// 两层都要罩住光标，否则"跳过不可见"这条根本没被走到——点在第二层外面时连排掉都不必发生。
+    #[test]
+    fn skips_invisible_candidates() {
+        let list = [
+            cand(2, false, (0, 0, 1920, 1080)),
+            cand(3, true, (10, 10, 20, 20)),
+        ];
+        assert_eq!(snip_window_hit(&list, 1, SCREEN, 15, 15), Some((10, 10, 20, 20)));
+    }
+
+    /// 退化矩形（宽或高不足 2 像素）不算一层，接着往下找；全是退化的就什么都没选中。
+    #[test]
+    fn skips_degenerate_rects() {
+        let list = [cand(4, true, (0, 0, 1, 900)), cand(5, true, (0, 0, 30, 30))];
+        assert_eq!(snip_window_hit(&list, 1, SCREEN, 5, 5), Some((0, 0, 30, 30)));
+        assert_eq!(snip_window_hit(&[cand(4, true, (0, 0, 1, 900))], 1, SCREEN, 0, 0), None);
+    }
+
+    /// 探出虚拟屏幕的那一圈根本没有像素可截，要夹回屏幕；夹完仍有面积才算选中。
+    #[test]
+    fn clamps_a_window_sticking_out_of_the_virtual_screen() {
+        let list = [cand(6, true, (1900, 1060, 2400, 1400))];
+        assert_eq!(
+            snip_window_hit(&list, 1, SCREEN, 1905, 1070),
+            Some((1900, 1060, 1920, 1080))
+        );
+    }
+
+    /// 副屏常在负原点：夹的左边是虚拟屏幕那条负边，不是 0。
+    #[test]
+    fn clamps_against_a_negative_screen_origin() {
+        let wide = (-1280, 0, 1280, 1024);
+        let list = [cand(6, true, (-1300, 100, -1000, 400))];
+        assert_eq!(
+            snip_window_hit(&list, 1, wide, -1200, 200),
+            Some((-1280, 100, -1000, 400))
+        );
+    }
+
+    /// 点在空白处（没有一层罩住它）返回 None：覆盖层就此取消，什么都不截、什么都不存。
+    #[test]
+    fn nothing_is_picked_when_no_candidate_covers_the_point() {
+        let list = [cand(7, true, (100, 100, 200, 200))];
+        assert_eq!(snip_window_hit(&list, 1, SCREEN, 900, 900), None);
     }
 }
 

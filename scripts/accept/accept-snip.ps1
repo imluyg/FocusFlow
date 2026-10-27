@@ -14,6 +14,18 @@
 
   Screenshots land in <app>\data\screenshots, so the PNG count is the observable.
 
+  Round 3 adds the third gesture: a single click (down and up without moving) picks the
+  window under the cursor. The fixture is a top-level window of *this PowerShell process* --
+  the app has to skip its own process, and a wrong pick shows up immediately as a PNG whose
+  size is the app window (1200x860) or the whole screen instead of the fixture's 320x200.
+  The same round then asks for a second overlay from the same process: the state flag that
+  says "an overlay is open" must be free again once one finished.
+
+  Round 4 covers the give-up-on-timeout branch: the overlay logs the three-minute timer it
+  arms, and it must then close itself without writing anything -- which means this round
+  really waits three minutes. A WM_TIMER posted from outside does not reach the app's message
+  loop (measured), so there is no way to fast-forward it from the harness.
+
   ASCII-only, like every file in this folder.
 
 .EXAMPLE
@@ -38,6 +50,12 @@ function Count-Png {
     @(Get-ChildItem $sdir -Filter '*.png' -File -ErrorAction SilentlyContinue).Count
 }
 
+function Get-NewestPng {
+    if (-not (Test-Path $sdir)) { return '' }
+    $f = @(Get-ChildItem $sdir -Filter '*.png' -File | Sort-Object LastWriteTime -Descending)
+    if ($f.Count -gt 0) { $f[0].FullName } else { '' }
+}
+
 function Wait-Png([int]$Before, [int]$TimeoutMs = 6000) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while ($sw.Elapsed.TotalMilliseconds -lt $TimeoutMs) {
@@ -49,6 +67,17 @@ function Wait-Png([int]$Before, [int]$TimeoutMs = 6000) {
 
 function Get-SnipLog {
     if (Test-Path $logPath) { Get-Content $logPath -Encoding UTF8 } else { @() }
+}
+
+# Poll the log for a line: the overlay window exists before the lines it logs reach the file,
+# so reading once right after Wait-Window is a race the harness used to lose.
+function Wait-Log([string]$Pattern, [int]$TimeoutMs = 4000) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalMilliseconds -lt $TimeoutMs) {
+        if (@(Get-SnipLog | Where-Object { $_ -match $Pattern }).Count -gt 0) { return $true }
+        Start-Sleep -Milliseconds 200
+    }
+    $false
 }
 
 function Stop-Round([IntPtr]$Hwnd, $Proc) {
@@ -83,6 +112,17 @@ $quickHits = @(Get-SnipLog | Where-Object { $_ -match 'snip-quick' })
 Check 'the log names the quick path' ($quickHits.Count -gt 0)
 $ed = [FF]::ByClass([uint32]$p.Id, 'FocusFlowSnipEditor')
 Check 'the quick path does not open the editor' ($ed -eq [IntPtr]::Zero)
+
+# After a snip that really succeeded the overlay state must be free again: the flag that
+# says "an overlay is open" is what start_snip checks, and if nothing clears it on the
+# success path the very next hotkey press does nothing until the app is restarted.
+[void][FF]::PostMessage($h, 0x8006, [IntPtr]::Zero, [IntPtr]::Zero)   # WM_SNIP_START (quick)
+$ov1b = Wait-Window $p.Id 'FocusFlowSnipOverlay' 4000
+Check 'a second snip opens the overlay again' ($ov1b -ne [IntPtr]::Zero)
+if ($ov1b -ne [IntPtr]::Zero) {
+    [void][FF]::PostMessage($ov1b, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)   # Esc = give up
+    Start-Sleep -Milliseconds 600
+}
 Stop-Round $h $p
 
 # ---------- round 2: annotate path (the snip_annotate hotkey) ----------
@@ -108,5 +148,82 @@ if ($ed2 -ne [IntPtr]::Zero) {
     Check 'giving up saved nothing' ((Count-Png) -eq $before2) "png=$(Count-Png)"
 }
 Stop-Round $h2 $p2
+
+# ---------- round 3: a single click picks the window under the cursor ----------
+# A foreign top-level window (this PowerShell process, not the app) is the fixture: the app
+# must skip its OWN process, so if the exclusion broke the PNG would come out 1200x860 (the
+# app window) or full screen -- both are far off this rect.
+Add-Type -AssemblyName System.Windows.Forms
+$fx = New-Object System.Windows.Forms.Form
+$fx.Text = 'FFixtureWindow'
+$fx.FormBorderStyle = 'FixedDialog'
+$fx.MaximizeBox = $false
+$fx.MinimizeBox = $false
+$fx.StartPosition = 'Manual'
+$fx.Location = New-Object System.Drawing.Point(900, 300)
+$fx.Size = New-Object System.Drawing.Size(320, 200)
+$fx.TopMost = $true
+$fx.Show()
+[void]$fx.Activate()
+[System.Windows.Forms.Application]::DoEvents()
+$fxRect = Get-Rect $fx.Handle
+
+$before3 = Count-Png
+Remove-Item $logPath -ErrorAction SilentlyContinue
+$p3 = Start-App $Exe $app $WorkDir @{ FOCUSFLOW_SNIP_OVERLAY = '1' }
+$h3 = Wait-Window $p3.Id
+if ($h3 -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
+$ov3 = Wait-Window $p3.Id 'FocusFlowSnipOverlay' 6000
+Check 'the click round opens the overlay' ($ov3 -ne [IntPtr]::Zero)
+
+$cx = $fxRect.X + [int]($fxRect.W / 2)
+$cy = $fxRect.Y + [int]($fxRect.H / 2)
+Click-Screen $cx $cy
+Check 'the single click saved a PNG' (Wait-Png $before3) "png $before3 -> $(Count-Png)"
+$s3 = Get-PngSize (Get-NewestPng)
+$okSize = $s3 -and $s3.Width -le $fxRect.W -and $s3.Width -ge ($fxRect.W - 24) `
+    -and $s3.Height -le $fxRect.H -and $s3.Height -ge ($fxRect.H - 24)
+Check 'the picked rect is that window, not the screen or our own' ([bool]$okSize) `
+    ("png=$($s3.Width)x$($s3.Height) fixture=$($fxRect.W)x$($fxRect.H)")
+Check 'the log names the window pick' (@(Get-SnipLog | Where-Object { $_ -match 'snip-pick' }).Count -gt 0)
+
+# Same process, second gesture: the first snip succeeded, so the overlay state must be free
+# again. Before this branch existed the run-once flag stayed set and the hotkey did nothing.
+[void][FF]::PostMessage($h3, 0x8006, [IntPtr]::Zero, [IntPtr]::Zero)   # WM_SNIP_START (quick)
+$ov3b = Wait-Window $p3.Id 'FocusFlowSnipOverlay' 4000
+Check 'a second snip opens the overlay again' ($ov3b -ne [IntPtr]::Zero)
+if ($ov3b -ne [IntPtr]::Zero) {
+    [void][FF]::PostMessage($ov3b, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)   # Esc = give up
+    Start-Sleep -Milliseconds 600
+}
+Stop-Round $h3 $p3
+$fx.Close()
+$fx.Dispose()
+
+# ---------- round 4: the overlay gives up on its own ----------
+$before4 = Count-Png
+Remove-Item $logPath -ErrorAction SilentlyContinue
+$p4 = Start-App $Exe $app $WorkDir @{ FOCUSFLOW_SNIP_OVERLAY = '1' }
+$h4 = Wait-Window $p4.Id
+if ($h4 -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
+$ov4 = Wait-Window $p4.Id 'FocusFlowSnipOverlay' 6000
+Check 'the timeout round opens the overlay' ($ov4 -ne [IntPtr]::Zero)
+Check 'the overlay arms a three-minute timeout' (Wait-Log 'snip-arm-timeout 180000')
+
+# Waited out, not faked: a WM_TIMER posted from another process never reaches this message
+# loop (measured -- posting WM_KEYDOWN/VK_ESCAPE to the same overlay closes it at once, while
+# posting WM_TIMER with the product's own timer id does nothing). So the only honest check of
+# "gives up after three minutes" is the real three minutes. This round is slow on purpose.
+$gone = $false
+$sw4 = [Diagnostics.Stopwatch]::StartNew()
+while ($sw4.Elapsed.TotalSeconds -lt 210) {
+    if ([FF]::ByClass([uint32]$p4.Id, 'FocusFlowSnipOverlay') -eq [IntPtr]::Zero) { $gone = $true; break }
+    Start-Sleep -Milliseconds 1000
+}
+$waited = [int]$sw4.Elapsed.TotalSeconds
+Check 'the overlay gives up by itself after three minutes' $gone "waited $waited s"
+Check 'the log names the timeout' (Wait-Log 'snip-timeout' 2000)
+Check 'the timeout saved nothing' ((Count-Png) -eq $before4) "png=$(Count-Png)"
+Stop-Round $h4 $p4
 
 Show-Summary

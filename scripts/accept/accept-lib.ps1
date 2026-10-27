@@ -326,6 +326,31 @@ function Drag-Screen([int]$X1, [int]$Y1, [int]$X2, [int]$Y2) {
     [FF]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)     # MOUSEEVENTF_LEFTUP
     Start-Sleep -Milliseconds 500
 }
+
+# One real left click at absolute screen coordinates, down and up without moving.
+# The snip overlay reads that as "pick the window under the cursor" (the old gesture).
+function Click-Screen([int]$X, [int]$Y) {
+    [void][FF]::SetCursorPos($X, $Y)
+    Start-Sleep -Milliseconds 150
+    [FF]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)     # MOUSEEVENTF_LEFTDOWN
+    Start-Sleep -Milliseconds 120
+    [FF]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)     # MOUSEEVENTF_LEFTUP
+    Start-Sleep -Milliseconds 500
+}
+
+# PNG width/height straight out of IHDR (offset 16, two big-endian uint32s).
+# The snip harness uses it to tell "captured that window" from "captured the screen".
+# The casts matter: PowerShell keeps the left operand's type through -shl, so shifting a
+# [byte] by 8 wraps back inside 8 bits and silently reports 306 as 50.
+function Get-PngSize([string]$Path) {
+    if (-not $Path) { return $null }
+    $b = [System.IO.File]::ReadAllBytes($Path)
+    if ($b.Length -lt 24) { return $null }
+    $w = ([uint32]$b[16] -shl 24) -bor ([uint32]$b[17] -shl 16) -bor ([uint32]$b[18] -shl 8) -bor [uint32]$b[19]
+    $h = ([uint32]$b[20] -shl 24) -bor ([uint32]$b[21] -shl 16) -bor ([uint32]$b[22] -shl 8) -bor [uint32]$b[23]
+    [pscustomobject]@{ Width = $w; Height = $h; Path = $Path }
+}
+
 function Get-ThemeName([string]$AppDir) {
     $line = (Select-String -Path (Join-Path $AppDir 'config.ini') -Pattern '^theme' -Encoding UTF8 | ForEach-Object { $_.Line })
     ($line -join '')
