@@ -56,6 +56,12 @@ static MAIN_RAW: AtomicIsize = AtomicIsize::new(0);
 /// 用户放下的那一个 top，**逻辑像素**。卡片按内容长高时窗口矩形里的 top 会被往上让
 /// （[`grown_top`]），收缩回去必须照这一格回，不能照当前矩形回。
 static ANCHOR_TOP: AtomicI32 = AtomicI32::new(60);
+/// 最近一次**我们自己**摆出去的 top，物理像素（取 `i32::MIN` 表示"还没摆过"）。
+///
+/// 只有它才能把"矩形里的 top 与锚点差一格"分成两件事：差成这一格 ⇒ 是长高让位，下一拍要照锚点回；
+/// 差成别的任何一格 ⇒ 是别人搬的（用户拖拽、别的程序搬窗、DPI 换算给的矩形）—— 那种时候跟它较劲，
+/// 用户看见的就是"卡片拖到一半自己跳回原高度"。
+static APPLIED_TOP: AtomicI32 = AtomicI32::new(i32::MIN);
 
 /// 重画节拍。"瞟一眼"用的数字，1 秒够；主窗口那边是 2 秒一拍读库。
 const TICK_MS: u32 = 1000;
@@ -751,8 +757,15 @@ unsafe fn repaint(hwnd: HWND) -> bool {
         // 尺寸由内容决定（配置值只是下限），长高/缩回时窗口要跟着改，而且**改的这一刻就要安放**。
         if let Some(rc) = get_rect(hwnd) {
             let anchor = ANCHOR_TOP.load(Ordering::SeqCst);
+            // 判断本身在 `anchor_now` 里（那几格有单元测试盯着），这里只负责把它落到全局上。
+            let chosen = anchor_now(rc.top, anchor, APPLIED_TOP.load(Ordering::SeqCst), scale);
+            if chosen != anchor {
+                ANCHOR_TOP.store(chosen, Ordering::SeqCst);
+            }
+            let anchor = chosen;
             // 按**锚点**那一行问屏幕，不按当前矩形：搬一次之后再读回矩形，等于让上一次的结果
-            // 决定下一次的输入。锚点只由建窗与拖完写，所以同一份内容 + 同一个锚点永远算出同一个 top。
+            // 决定下一次的输入。锚点由建窗、拖完与"别人搬过"写，所以同一份内容 + 同一个锚点
+            // 永远算出同一个 top。
             let mon = nearest_monitor(rc.left, fr::px(anchor, scale));
             let top = grown_top(anchor, scale, h, &mon);
             if (rc.bottom - rc.top) != h || rc.right - rc.left != w || rc.top != top {
@@ -765,6 +778,7 @@ unsafe fn repaint(hwnd: HWND) -> bool {
                     h,
                     wm::SWP_NOACTIVATE | wm::SWP_NOZORDER,
                 );
+                APPLIED_TOP.store(top, Ordering::SeqCst);
             }
         }
         true
@@ -842,6 +856,32 @@ fn grown_top(anchor: i32, scale: f64, height: i32, mon: &Mon) -> i32 {
         mon.y as f64,
         (mon.y + mon.h) as f64,
     ) as i32
+}
+
+/// 这一拍该用哪一个锚点（**逻辑像素**）。把判断从 `repaint` 里提出来，好让这几格有用例盯着。
+///
+/// - **别人搬走了**：矩形里的 top 既不是锚点那一行、也不是我们自己上一拍摆出去的那一格
+///   ⇒ 认它，锚点跟着人走。不认的后果就是第十场量到的"拖到一半卡片自己跳回原高度"。
+/// - **长高让位**：那一格正是我们自己摆的（`applied`）⇒ 别认，否则缩回时回不到用户放的那一行 ——
+///   这是 [`ANCHOR_TOP`] 存在的理由，也是这条判断唯一不能顺手放宽的地方。
+/// - **差不到 2 像素**：物理→逻辑→物理来回取整的误差，不是搬动（与 `pulled_position` 同一口径，
+///   放宽到 1 像素就等于承认每拍挪一格的慢速漂移）。
+/// - `applied == i32::MIN`（还没摆过）⇒ 不认：分不清是谁动的，宁可照锚点。
+fn anchor_now(cur_top: i32, anchor: i32, applied: i32, scale: f64) -> i32 {
+    // 哨兵先挡掉：`cur_top - i32::MIN` 在 debug 里直接 panic、在 release 里**静默绕回**，
+    // 绕回来的那个数看着像"差得很远"，于是这条判断就变成看运气的了。
+    if applied == i32::MIN {
+        return anchor;
+    }
+    // 差值按 i64 算：`cur_top` 与锚点/已摆值都来自外部（配置里的坐标、别的程序搬窗），
+    // 两端相减可以超出 i32 —— 这里宁可算对，不要绕回。
+    let d_anchor = cur_top as i64 - fr::px(anchor, scale) as i64;
+    let d_applied = cur_top as i64 - applied as i64;
+    if d_anchor.abs() >= 2 && d_applied.abs() >= 2 {
+        (cur_top as f64 / scale).round() as i32
+    } else {
+        anchor
+    }
 }
 
 /// 初始位置：配置里的逻辑坐标；没存过就落右上角附近。
@@ -922,6 +962,8 @@ unsafe fn ensure_visible_on_screen(hwnd: HWND) -> bool {
             "悬浮窗原本整个在屏幕之外（{}x{}），已搬回 ({},{})",
             rc.left, rc.top, x, y
         ));
+        // 这一搬也是自己搬的：不登记的话，下一拍会把"拔屏找回"当成用户搬动而重设锚点。
+        APPLIED_TOP.store(y, Ordering::SeqCst);
         true
     }
 }
@@ -1010,6 +1052,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         rc.bottom - rc.top,
                         wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
                     );
+                    // 系统给的矩形就是"我们自己照新缩放比摆的"，登记它，别让它被下一拍
+                    // 当成用户搬动。锚点这一格照旧不动：动它就是改 DPI 那条链路的行为，
+                    // 而那台 125%/150% 的机器本场量不到（见 README 的 DPI 未回归），不该顺手改。
+                    APPLIED_TOP.store(rc.top, Ordering::SeqCst);
                 }
                 let _ = repaint(hwnd);
                 LRESULT(0)
@@ -1109,6 +1155,8 @@ unsafe fn run_thread(tx: &std::sync::mpsc::SyncSender<Result<(), String>>) {
         ANCHOR_TOP.store(anchor, Ordering::SeqCst);
         // 位置与尺寸在第一帧之前摆好：否则用户会先看见它在左上角闪一下。
         let _ = wm::SetWindowPos(hwnd, Some(wm::HWND_TOPMOST), x, y, 1, 1, wm::SWP_NOACTIVATE);
+        // 建窗这一格也是"我们自己摆的"，不登记的话第一拍会把它当成用户搬动。
+        APPLIED_TOP.store(y, Ordering::SeqCst);
         let _ = wm::SetTimer(Some(hwnd), TIMER_ID, TICK_MS, None);
         let painted = repaint(hwnd);
         if !painted {
@@ -1169,5 +1217,78 @@ pub fn shutdown() {
     let Some(h) = hwnd() else { return };
     unsafe {
         let _ = wm::PostMessageW(Some(h), wm::WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::anchor_now;
+
+    /// 用户在拖：这一格既不是锚点、也不是我们自己摆出去的 ⇒ 锚点认它。
+    /// 不认就是第十场量到的那个缺陷：竖向被下一拍拽回旧锚点、横向留着。
+    #[test]
+    fn an_external_move_becomes_the_anchor() {
+        assert_eq!(
+            anchor_now(500, 140, 140, 1.0),
+            500,
+            "还没落定的竖向搬动必须在下一拍站住"
+        );
+    }
+
+    /// 长高让位：那一格正是我们自己上一拍摆出去的 ⇒ 不能认，否则缩回时回不到用户放的那一行。
+    /// 这是整个改动唯一不能放宽的地方（也是 `ANCHOR_TOP` 存在的理由）。
+    #[test]
+    fn our_own_clamped_top_is_not_a_user_move() {
+        assert_eq!(
+            anchor_now(1014, 1031, 1014, 1.0),
+            1031,
+            "让位那一格是自己摆的，缩回要照锚点回"
+        );
+    }
+
+    /// 阈值口径与 `pulled_position` 一致：来回取整差一格不算，差两格才算搬动。
+    #[test]
+    fn the_threshold_matches_the_drift_guard() {
+        assert_eq!(
+            anchor_now(1030, 1031, 1014, 1.0),
+            1031,
+            "差一格是物理→逻辑→物理取整的误差，认它等于承认每挪一格的慢速漂移"
+        );
+        assert_eq!(
+            anchor_now(1029, 1031, 1014, 1.0),
+            1029,
+            "差两格就是真搬动，锚点要跟上去"
+        );
+    }
+
+    #[test]
+    fn an_unapplied_sentinel_never_overwrites_the_anchor() {
+        assert_eq!(
+            anchor_now(500, 140, i32::MIN, 1.0),
+            140,
+            "还没摆过时分不清是谁动的，宁可照锚点"
+        );
+    }
+
+    /// 两端相减超出 i32 的那一档：`cur_top` 与锚点都可能来自外部（配置里的坐标、别的程序搬窗）。
+    /// 用 i32 相减，`MAX - MIN` 绕回成 `-1`，绝对值 1 便"不算搬动"—— 一次真实的搬动被吞掉；
+    /// 按 i64 算才是它本来的样子。
+    #[test]
+    fn extreme_rects_do_not_wrap_the_difference() {
+        assert_eq!(
+            anchor_now(i32::MAX, i32::MIN, 0, 1.0),
+            i32::MAX,
+            "相减超出 i32 也要按真差值判，不能绕回成没搬动"
+        );
+    }
+
+    #[test]
+    fn the_adopted_anchor_is_logical_pixels() {
+        // 150% 下物理 900 = 逻辑 600：锚点存逻辑那一格（与 persist_position 同一口径）。
+        assert_eq!(
+            anchor_now(900, 140, 210, 1.5),
+            600,
+            "认下来的锚点要按缩放比折回逻辑像素"
+        );
     }
 }

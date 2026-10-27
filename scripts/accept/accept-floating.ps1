@@ -41,8 +41,18 @@ Check 'pill uses the 104x48 content default' ($r.W -eq 104 -and $r.H -eq 48) "$(
 Check 'WM_NCHITTEST answers HTCAPTION (2)' ([FF]::HitTest([uint32]$p.Id, 'FocusFlowFloatingPill') -eq 2)
 
 # A drag ends with WM_EXITSIZEMOVE; the pill then writes pos_x/pos_y back to config.
+#
+# The old shape waited 200 ms before posting the drag-end message. The pill repaints on a
+# 1000 ms timer (floating.rs TICK_MS) and that tick positions the card from ANCHOR_TOP, which
+# only persist_position() refreshes -- so whether a tick happened to land inside those 200 ms
+# decided the reading (measured: one session 11/0, the next session 2 reds on the same bytes).
+# These two legs wait THROUGH a tick on purpose instead of leaving it to luck: a move that has
+# not reached drag-end yet must still survive the tick, because a card that jumps back at the
+# user mid-drag is exactly what this suite is supposed to catch.
 Move-Window $pill 1300 300
-Start-Sleep -Milliseconds 200
+Start-Sleep -Milliseconds 1300
+$rm = Get-Rect $pill
+Check 'an unpersisted vertical move survives a repaint tick' ($rm.X -eq 1300 -and $rm.Y -eq 300) "$($rm.X),$($rm.Y)"
 [void][FF]::PostMessage($pill, $WM_EXITSIZEMOVE, [IntPtr]::Zero, [IntPtr]::Zero)
 Start-Sleep -Milliseconds 1000
 $px = Get-ConfigValue $app 'floating' 'pos_x'
