@@ -2281,6 +2281,14 @@ unsafe extern "system" fn text_edit_proc(
                 LRESULT(0)
             }
             WM_CHAR if w.0 == 0x0D || w.0 == 0x1B => LRESULT(0),
+            // 敲字也算"人还在"：这些键落在子窗口身上，覆盖层自己一条 WM_KEYDOWN 都收不到。
+            // 不补这一下，认真打一行标题超过 180 秒的人会被闲置闸连框带字一起掐掉。
+            WM_KEYDOWN | WM_CHAR => {
+                if let Ok(mut s) = SNIP.lock() {
+                    s.last_input = Some(Instant::now());
+                }
+                DefSubclassProc(hwnd, msg, w, l)
+            }
             _ => DefSubclassProc(hwnd, msg, w, l),
         }
     }
@@ -3495,6 +3503,31 @@ mod render_probe {
             pump(200);
             let empty_edit = SNIP.lock().map(|s| s.text_edit).unwrap_or(0);
             assert_ne!(empty_edit, 0, "第二个输入框没开出来");
+            // 敲字也要续上闲置那把表：先把表拨回 100 秒前，投一个字符，表必须回到"刚刚"。
+            // 这些键落在子窗口身上，覆盖层自己一条 WM_KEYDOWN 都收不到 ⇒ 漏掉这一路的话，
+            // 认真打一行标题超过 180 秒的人会被连框带字一起掐掉。
+            if let Ok(mut s) = SNIP.lock() {
+                s.last_input = Some(Instant::now() - std::time::Duration::from_secs(100));
+            }
+            let _ = PostMessageW(
+                Some(HWND(empty_edit as *mut core::ffi::c_void)),
+                WM_CHAR,
+                WPARAM(0x41),
+                LPARAM(0),
+            );
+            pump(200);
+            let aged = SNIP
+                .lock()
+                .map(|s| s.last_input.map(|t| t.elapsed().as_secs()).unwrap_or(9_999))
+                .unwrap_or(9_999);
+            assert!(aged < 60, "打字没续上闲置那把表（表上还记着 {aged} 秒）");
+            // 把刚投进去那个字符抹掉：下半段判的还得是"空框"
+            let blank = [0u16; 1];
+            let _ = SetWindowTextW(
+                HWND(empty_edit as *mut core::ffi::c_void),
+                PCWSTR(blank.as_ptr()),
+            );
+            pump(120);
             let _ = SetFocus(Some(ov));
             pump(250);
             assert!(
