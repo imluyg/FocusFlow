@@ -236,6 +236,8 @@ pub struct SnipState {
     text_at: (i32, i32),
     /// 当前覆盖层的句柄数值（静态量要 Send）：再按一次标注热键要靠它放弃在飞的这一次。
     overlay: isize,
+    /// 出图没成时写在屏上的那句原因（覆盖层为此**不退**，Enter 再试、Esc 放弃）。
+    notice: Option<String>,
     /// 冻结时把悬浮窗藏了：退出时要按原样还回去。
     pill_was: bool,
     /// 自退时限的两把表：`started_at` 只对绝对上限，`last_input` 只对闲置闸。
@@ -272,6 +274,7 @@ const fn default_state() -> SnipState {
         text_edit: 0,
         text_at: (0, 0),
         overlay: 0,
+        notice: None,
         pill_was: false,
         started_at: None,
         last_input: None,
@@ -1083,7 +1086,7 @@ pub fn render_marks(img: &[u8], w: i32, h: i32, marks: &[Mark]) -> Vec<u8> {
     out
 }
 
-unsafe fn draw_chip(hdc: HDC, x: i32, y: i32, text: &str) {
+unsafe fn draw_chip(hdc: HDC, x: i32, y: i32, text: &str, fg: u32) {
     unsafe {
         let font = yaihe(20, false);
         let oldf = SelectObject(hdc, font.into());
@@ -1095,7 +1098,7 @@ unsafe fn draw_chip(hdc: HDC, x: i32, y: i32, text: &str) {
         let _ = Rectangle(hdc, x, y, x + sz.cx + 12, y + sz.cy + 6);
         SelectObject(hdc, old);
         let _ = DeleteObject(brush.into());
-        let _ = SetTextColor(hdc, COLORREF(0x00FF_FFFF));
+        let _ = SetTextColor(hdc, COLORREF(fg));
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = TextOutW(hdc, x + 6, y + 3, &wide);
         SelectObject(hdc, oldf);
@@ -1259,35 +1262,98 @@ fn write_png_named(
     Ok(path)
 }
 
+/// 一次出图之后覆盖层留不留，只看这两件事的成败。
+///
+/// 病状是"失败了却不吭声，还顺手把唯一一次重试机会关掉"：原来无论成败都 `DestroyWindow`，
+/// 写盘失败只在日志里留一行，屏上什么都没了——人只知道"没截到"，不知道为什麼，也无法再按一次。
+/// 落盘失败 ⇒ 这张图真的没留下，必须留在覆盖层上让他再试；只丢剪贴板 ⇒ 文件已在，
+/// 但"以为复制上了"会让他粘到别处才发现是空的，所以也要说出来。
+pub fn commit_verdict(
+    save: std::result::Result<(), String>,
+    clip: std::result::Result<(), String>,
+) -> Verdict {
+    match (save, clip) {
+        (Ok(()), Ok(())) => Verdict::Done,
+        (Err(e), _) => Verdict::Stay(format!("没存盘：{e} —— 改好了再按 Enter，Esc 放弃")),
+        (Ok(()), Err(e)) => Verdict::Stay(format!("已存盘，但剪贴板没进去：{e} —— Enter 再试")),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Verdict {
+    /// 两件事都成：覆盖层可以退了
+    Done,
+    /// 有一件没成：覆盖层留着，把这句原因写在屏上
+    Stay(String),
+}
+
 /// 一次出图：合成 → 落盘 → 进剪贴板（CF_DIB 与 `PNG` 两份，编码只做一次）。
 /// `pin` = 顺手把这一张钉在桌面上（不再多落一个文件）。
-fn commit(pin: bool) {
+fn commit(pin: bool) -> Verdict {
     let (origin, sel) = SNIP
         .lock()
         .map(|s| (s.origin, s.sel))
         .unwrap_or(((0, 0), (0, 0, 0, 0)));
     let Some((buf, w, h)) = baked_selection() else {
-        return;
+        return Verdict::Stay("没有可出的图：先框一个区域，再按 Enter".to_string());
     };
     let png = match png_bytes(&buf, w, h) {
         Ok(p) => p,
         Err(e) => {
             tracing_note(&format!("截图编码失败：{e}"));
-            return;
+            return Verdict::Stay(format!("图没编出来：{e}"));
         }
     };
 
     let dir = focusflow_core::paths::screenshots_dir();
-    match write_png_named(&dir, &png, w, h) {
-        Ok(path) => tracing_note(&format!("截图已保存：{} ({w}x{h})", path.display())),
-        Err(e) => tracing_note(&format!("截图写盘失败：{e}")),
-    }
-    match focusflow_core::capture::win::write_image_to_clipboard(&buf, w as u32, h as u32, &png) {
-        Ok(()) => tracing_note(&format!("截图已进剪贴板：{w}x{h} CF_DIB+PNG")),
-        Err(e) => tracing_note(&format!("截图进剪贴板失败：{e}")),
-    }
+    let save = match write_png_named(&dir, &png, w, h) {
+        Ok(path) => {
+            tracing_note(&format!("截图已保存：{} ({w}x{h})", path.display()));
+            Ok(())
+        }
+        Err(e) => {
+            tracing_note(&format!("截图写盘失败：{e}"));
+            Err(e)
+        }
+    };
+    let clip = match focusflow_core::capture::win::write_image_to_clipboard(
+        &buf, w as u32, h as u32, &png,
+    ) {
+        Ok(()) => {
+            tracing_note(&format!("截图已进剪贴板：{w}x{h} CF_DIB+PNG"));
+            Ok(())
+        }
+        Err(e) => {
+            tracing_note(&format!("截图进剪贴板失败：{e}"));
+            Err(e)
+        }
+    };
     if pin {
+        // 贴图这条以"钉上了"为成交：文件/剪贴板没成都已在日志里出声，
+        // 而钉好的那张还在桌上可以右键再处理，不该把覆盖层压着不放。
         open_pin(buf, w, h, origin.0 + sel.0, origin.1 + sel.1);
+        return Verdict::Done;
+    }
+    commit_verdict(save, clip)
+}
+
+/// 出图并据此收场：成则关窗，败则把原因写在屏上、覆盖层留着等第二次 Enter。
+unsafe fn commit_and_close(hwnd: HWND, pin: bool) {
+    match commit(pin) {
+        Verdict::Done => {
+            let _ = DestroyWindow(hwnd);
+        }
+        Verdict::Stay(msg) => {
+            tracing_note(&format!("截图没出图：{msg}"));
+            if let Ok(mut s) = SNIP.lock() {
+                s.notice = Some(msg);
+                // 快速那条本来"松手即存"就完事：正因为没存上才把它留在标注阶段，
+                // 否则屏上没有一个"再试一次"的落点，等于把这句原因也一起吞了。
+                s.phase = Phase::Adjust;
+                s.drag = None;
+            }
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
     }
 }
 
@@ -1821,6 +1887,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     s.hits.clear();
                     s.text_edit = 0;
                     s.overlay = 0;
+                    s.notice = None;
                     s.base = Vec::new();
                     s.dim = Vec::new();
                     s.base_w = 0;
@@ -1874,14 +1941,8 @@ unsafe fn bar_action(id: &'static str, hwnd: HWND) {
         }
         "undo" => undo(),
         "redo" => redo_mark(),
-        "save" => {
-            commit(false);
-            let _ = DestroyWindow(hwnd);
-        }
-        "pin" => {
-            commit(true);
-            let _ = DestroyWindow(hwnd);
-        }
+        "save" => commit_and_close(hwnd, false),
+        "pin" => commit_and_close(hwnd, true),
         "cancel" => {
             tracing_note("截图取消：点了取消");
             let _ = DestroyWindow(hwnd);
@@ -1895,8 +1956,7 @@ unsafe fn bar_action(id: &'static str, hwnd: HWND) {
 unsafe fn finish_selection(hwnd: HWND, annotate: bool) {
     if !annotate {
         tracing_note("截图 snip-quick：松手即存，不进标注窗");
-        commit(false);
-        let _ = DestroyWindow(hwnd);
+        commit_and_close(hwnd, false);
         return;
     }
     if let Ok(mut s) = SNIP.lock() {
@@ -1991,12 +2051,10 @@ unsafe fn on_key(hwnd: HWND, vk: usize) {
             let _ = DestroyWindow(hwnd);
         }
         KeyAct::Commit => {
-            commit(false);
-            let _ = DestroyWindow(hwnd);
+            commit_and_close(hwnd, false);
         }
         KeyAct::Pin => {
-            commit(true);
-            let _ = DestroyWindow(hwnd);
+            commit_and_close(hwnd, true);
         }
         KeyAct::Undo => undo(),
         KeyAct::Redo => redo_mark(),
@@ -2345,6 +2403,7 @@ unsafe fn paint(hwnd: HWND) {
                 rc.0,
                 rc.1 - 24,
                 &format!("{} × {}", rc.2 - rc.0, rc.3 - rc.1),
+                0x00FF_FFFF,
             );
             let pen = CreatePen(PS_SOLID, 2, COLORREF(ACCENT));
             let oldp = SelectObject(hdc, pen.into());
@@ -2376,6 +2435,17 @@ unsafe fn paint(hwnd: HWND) {
         }
         if phase == Phase::Adjust {
             draw_bar(hdc, sel, bw, bh);
+        }
+        // 出图没成的那句写在选区上沿外面（贴到屏幕顶就改画在选区里侧）：这一句是给人看的，
+        // 只在日志里出声等于没出声——覆盖层正是为它才不退的。
+        let notice = SNIP.lock().ok().and_then(|s| s.notice.clone());
+        if let Some(msg) = notice {
+            let ny = if sel.1 - 48 >= 0 {
+                sel.1 - 48
+            } else {
+                sel.1 + 26
+            };
+            draw_chip(hdc, sel.0, ny, &msg, rgb(255, 60, 60));
         }
         let _ = EndPaint(hwnd, &ps);
     }
@@ -3292,6 +3362,42 @@ mod render_probe {
             let edit_after = SNIP.lock().map(|s| s.text_edit).unwrap_or(-1);
             assert_eq!(edit_after, 0, "落完字之后输入框还挂在状态里");
 
+            // 出图没成的那句必须**真画在屏上**：覆盖层为它不退，只在日志里出声等于没出声。
+            // 这条是"病状腿 + 对照腿"一对——把原因抹掉之后那一片必须不红，
+            // 否则上面那条数到的红可能是橙框/红字标注顶的。
+            if let Ok(mut s) = SNIP.lock() {
+                s.notice = Some("没存盘：夹具造的那条原因".to_string());
+            }
+            let _ = InvalidateRect(Some(ov), None, false);
+            pump(220);
+            let sel_now = SNIP.lock().map(|s| s.sel).unwrap();
+            let band = |shot: &[u8], sw: i32| -> i32 {
+                let mut n = 0;
+                for y in (sel_now.1 - 46)..(sel_now.1 - 27) {
+                    for x in (sel_now.0 + 4)..(sel_now.0 + 140) {
+                        let p = pixel3(shot, sw, x, y);
+                        if p[2] > 150 && p[0] < 110 && p[1] < 110 {
+                            n += 1;
+                        }
+                    }
+                }
+                n
+            };
+            let shot_n = print_window(ov).expect("带着原因的屏没拿到");
+            let reds = band(&shot_n.0, shot_n.1);
+            assert!(reds > 20, "那句原因没画到屏上（红色像素只有 {reds}）");
+            if let Ok(mut s) = SNIP.lock() {
+                s.notice = None;
+            }
+            let _ = InvalidateRect(Some(ov), None, false);
+            pump(220);
+            let shot_c = print_window(ov).expect("对照那一张没拿到");
+            assert_eq!(
+                band(&shot_c.0, shot_c.1),
+                0,
+                "没有原因那一片却还红着：上面的判据不是这句字画出来的"
+            );
+
             let _ = DestroyWindow(ov);
             pump(200);
             // 会话结束必须把整屏那两份缓冲交出去：1920x1080 一份就是 8 MB，
@@ -3883,6 +3989,35 @@ mod tests {
         assert_eq!(snip_tick(-1, -1), SnipTick::Absolute);
         // 负数但绝对还早 ⇒ 闲置到点
         assert_eq!(snip_tick(-5, 30_000), SnipTick::Idle);
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_overlay_and_says_why() {
+        let disk = Err("磁盘满了".to_string());
+        let clip = Err("打开剪贴板失败".to_string());
+        assert_eq!(commit_verdict(Ok(()), Ok(())), Verdict::Done);
+        // 没存上 ⇒ 覆盖层必须留着，而且原因不许被话术吞掉（原来这里成败都关窗）
+        match commit_verdict(disk, Ok(())) {
+            Verdict::Stay(m) => {
+                assert!(m.contains("磁盘满了"), "原因没写进屏上那句：{m}");
+                assert!(m.contains("Enter"), "要告诉他怎么再试：{m}");
+            }
+            Verdict::Done => panic!("没存盘却判定可以关窗：这张图就真没了"),
+        }
+        // 两件都没成 ⇒ 说的是"没存盘"那一半，它才决定这张图到底留下没有
+        match commit_verdict(Err("磁盘满了".to_string()), clip) {
+            Verdict::Stay(m) => {
+                assert!(m.contains("没存盘") && m.contains("磁盘满了"), "{m}");
+            }
+            Verdict::Done => panic!("两个都没成还判 Done"),
+        }
+        // 只丢剪贴板 ⇒ 文件已在，话要说成"已存盘但…"，否则他会以为整张没截上而重按
+        match commit_verdict(Ok(()), Err("打开剪贴板失败".to_string())) {
+            Verdict::Stay(m) => {
+                assert!(m.contains("已存盘") && m.contains("打开剪贴板失败"), "{m}");
+            }
+            Verdict::Done => panic!("剪贴板没成却一声不吭"),
+        }
     }
 
     #[test]
