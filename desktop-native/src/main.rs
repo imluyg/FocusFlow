@@ -1900,8 +1900,9 @@ fn toggle_autostart(&mut self, hwnd: HWND) {
         }
     }
 
-    /// 全局热键总开关：两条绑定（唤出 / 截图）一起注册或一起取消，
-    /// 配置键跟着写一份留给读它的人（启动时是否照它注册是另一回事，见交接文档）。
+    /// 全局热键总开关：三条绑定（唤出 / 截图 / 截图进标注）一起注册或一起取消，
+    /// 配置键 `hotkey.enabled` 跟着写一份，但**启动时没有读它的人** ⇒ "关掉热键"过不了一次
+    /// 重启（要不要跨重启生效、以及随包模板里那行默认值，都是待用户点的口径）。
 fn toggle_hotkey(&mut self, hwnd: HWND) {
         self.hotkeys_on = !self.hotkeys_on;
         let msg = self.reload_hotkeys();
