@@ -1290,6 +1290,32 @@ pub enum Verdict {
     Stay(String),
 }
 
+/// 松手那一下的三种结局（旧 Webview 版同一口径）：**拖够了就出图**、**没拖够但压着别的窗口
+/// 就截那个窗口**、**两边都不成才算这次取消**。
+///
+/// 写成纯函数是因为这两条边界都容易在改动里被写反：差一个像素就不算"框住"，
+/// 而"随手一按"绝不该等于"取消"——那正是用户想要的"截这个窗口"。拖够时优先出图，
+/// 否则人拖完框手一抖压到别的窗口，选区会被换掉。
+pub fn release_outcome(sel: (i32, i32, i32, i32), hit: Option<(i32, i32, i32, i32)>) -> Release {
+    if sel.2 - sel.0 >= MIN_DRAG && sel.3 - sel.1 >= MIN_DRAG {
+        Release::Commit
+    } else if let Some(rc) = hit {
+        Release::PickWindow(rc)
+    } else {
+        Release::Cancel
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Release {
+    /// 拖出来的区域够大：按现在这套去向出图
+    Commit,
+    /// 没拖出区域但压着一个窗口：把它当选区
+    PickWindow((i32, i32, i32, i32)),
+    /// 两边都不成：这次截图取消
+    Cancel,
+}
+
 /// 一次出图：合成 → 落盘 → 进剪贴板（CF_DIB 与 `PNG` 两份，编码只做一次）。
 /// `pin` = 顺手把这一张钉在桌面上（不再多落一个文件）。
 ///
@@ -1697,17 +1723,12 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                 let drag = SNIP.lock().map(|s| s.drag).unwrap_or(None);
                 match drag {
                     Some((Drag::New, _, _)) => {
-                        let (sel, annotate) = SNIP
+                        let (sel, annotate, hit) = SNIP
                             .lock()
-                            .map(|s| (s.sel, s.annotate))
-                            .unwrap_or(((0, 0, 0, 0), true));
-                        if sel.2 - sel.0 >= MIN_DRAG && sel.3 - sel.1 >= MIN_DRAG {
-                            finish_selection(hwnd, annotate);
-                        } else {
-                            // 没拖出区域就是旧版那条手势：单击选中光标下面那个窗口
-                            let hv = SNIP
-                                .lock()
-                                .map(|s| {
+                            .map(|s| {
+                                (
+                                    s.sel,
+                                    s.annotate,
                                     hover_at(
                                         &s.hits,
                                         GetCurrentProcessId(),
@@ -1716,31 +1737,31 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                                         s.base_h,
                                         x,
                                         y,
-                                    )
-                                })
-                                .ok()
-                                .flatten();
-                            match hv {
-                                Some(rc) => {
-                                    let origin = s_origin(hwnd);
-                                    // 日志里报的是屏幕坐标（与旧版同一口径），客户区坐标只有画的时候用得上
-                                    tracing_note(&format!(
-                                        "截图 snip-pick {}x{} at {},{}",
-                                        rc.2 - rc.0,
-                                        rc.3 - rc.1,
-                                        origin.0 + rc.0,
-                                        origin.1 + rc.1
-                                    ));
-                                    if let Ok(mut s) = SNIP.lock() {
-                                        s.sel = rc;
-                                        s.drag = None;
-                                    }
-                                    finish_selection(hwnd, annotate);
+                                    ),
+                                )
+                            })
+                            .unwrap_or(((0, 0, 0, 0), true, None));
+                        match release_outcome(sel, hit) {
+                            Release::Commit => finish_selection(hwnd, annotate),
+                            Release::PickWindow(rc) => {
+                                let origin = s_origin(hwnd);
+                                // 日志里报的是屏幕坐标（与旧版同一口径），客户区坐标只有画的时候用得上
+                                tracing_note(&format!(
+                                    "截图 snip-pick {}x{} at {},{}",
+                                    rc.2 - rc.0,
+                                    rc.3 - rc.1,
+                                    origin.0 + rc.0,
+                                    origin.1 + rc.1
+                                ));
+                                if let Ok(mut s) = SNIP.lock() {
+                                    s.sel = rc;
+                                    s.drag = None;
                                 }
-                                None => {
-                                    tracing_note("截图取消：这一笔既没框出区域，也没点到别的窗口");
-                                    let _ = DestroyWindow(hwnd);
-                                }
+                                finish_selection(hwnd, annotate);
+                            }
+                            Release::Cancel => {
+                                tracing_note("截图取消：这一笔既没框出区域，也没点到别的窗口");
+                                let _ = DestroyWindow(hwnd);
                             }
                         }
                     }
@@ -3720,6 +3741,45 @@ mod render_probe {
 
             let _ = std::fs::remove_dir_all(&ctmp);
 
+            // "随手一按 = 截光标下那个窗口"这条手势到底接上没有（纯函数改了 wndproc 不会跟着红）。
+            // 起一个全新的标注会话（上一段刚把覆盖层出图关掉），塞一条离工具条很远的候选，
+            // 在它身上按一下就松手：选区必须换成那条候选、必须进标注那一格、覆盖层必须还在。
+            start(HWND(std::ptr::null_mut()), true);
+            pump(400);
+            let ov3 = SNIP
+                .lock()
+                .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
+                .unwrap_or(HWND(std::ptr::null_mut()));
+            assert!(IsWindow(Some(ov3)).as_bool(), "随手一按那段没建出覆盖层");
+            let org3 = SNIP.lock().map(|s| s.origin).unwrap_or((0, 0));
+            let far = (650, 250, 900, 400);
+            if let Ok(mut s) = SNIP.lock() {
+                s.hits = vec![Candidate {
+                    pid: 999_998,
+                    visible: true,
+                    rect: (
+                        org3.0 + far.0,
+                        org3.1 + far.1,
+                        org3.0 + far.2,
+                        org3.1 + far.3,
+                    ),
+                }];
+                s.hover = None;
+            }
+            pump(120);
+            post_mouse(ov3, WM_LBUTTONDOWN, 700, 300);
+            post_mouse(ov3, WM_LBUTTONUP, 700, 300);
+            pump(250);
+            let got = SNIP
+                .lock()
+                .map(|s| (s.sel, s.phase, IsWindow(Some(ov3)).as_bool()))
+                .unwrap_or(((0, 0, 0, 0), Phase::Select, false));
+            assert_eq!(got.0, far, "随手一按没把那个窗口收成选区");
+            assert_eq!(got.1, Phase::Adjust, "点选之后没进标注那一格");
+            assert!(got.2, "标注版点选完却把覆盖层关了");
+            let _ = DestroyWindow(ov3);
+            pump(200);
+
             // 快速那条（松手即存）被失败留下来之后，这一场实际就是标注场：绝对上限得跟着变成 10 分钟。
             // 不跟着改的话，它自己那 60 秒那一档会在用户还在读那句原因、还在腾磁盘时把覆盖层收走。
             // 这一段全程不投"松手"——松手会走产品那条真实去向（往用户目录写一张、盖掉他的剪贴板），
@@ -4391,6 +4451,34 @@ mod tests {
             }
             Verdict::Done => panic!("剪贴板没成却一声不吭"),
         }
+    }
+
+    #[test]
+    fn a_release_decides_between_commit_window_pick_and_cancel() {
+        // 两边都刚好 `MIN_DRAG`：算框住了
+        assert_eq!(
+            release_outcome((0, 0, MIN_DRAG, MIN_DRAG), None),
+            Release::Commit
+        );
+        // 差一个像素就不算：这时"随手一按"要走点选那一条，而不是取消
+        assert_eq!(
+            release_outcome((0, 0, MIN_DRAG - 1, 900), None),
+            Release::Cancel
+        );
+        assert_eq!(
+            release_outcome((0, 0, 900, MIN_DRAG - 1), None),
+            Release::Cancel
+        );
+        // 没拖够但压着一个窗口 ⇒ 截那个窗口（旧版同一手势语义）
+        assert_eq!(
+            release_outcome((5, 5, 6, 6), Some((10, 10, 200, 150))),
+            Release::PickWindow((10, 10, 200, 150))
+        );
+        // 拖够了就不再看点：出图优先。否则人拖完框手一抖压到别的窗口，选区会被换掉
+        assert_eq!(
+            release_outcome((0, 0, 400, 300), Some((10, 10, 200, 150))),
+            Release::Commit
+        );
     }
 
     #[test]
