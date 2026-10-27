@@ -1,9 +1,12 @@
 // 产品形态是 GUI：不要控制台窗口。
 #![windows_subsystem = "windows"]
 
-//! FocusFlow 原生主界�?—�?原型（P0 平台 + P1a 合成渲染 + P1b 表格交互）�?//!
-//! 不引入任�?UI 框架：窗�?`CreateWindowExW`、界�?D3D11/D2D、文�?DirectWrite�?//! 托盘 `tray-icon`、热�?`global-hotkey`；行内改名用**原生 EDIT 子窗�?*�?//!
-//! 还没做（�?`docs/webview-removal-plan.md`）：滚动容器、其余五个视图、截图覆盖层�?
+//! FocusFlow 原生主界面 —— 原型（P0 平台 + P1a 合成渲染 + P1b 表格交互）
+//! 不引入任何 UI 框架：窗口用 `CreateWindowExW`、界面 D3D11/D2D、文字 DirectWrite。
+//! 托盘用 `tray-icon`、热键用 `global-hotkey`；行内改名用**原生 EDIT 子窗口**。
+//!
+//! 滚动容器、六个视图、截图覆盖层与贴图都已做完；剩下的缺口清单在
+//! `docs/handoff-native-migration.md`。
 mod collect;
 mod data;
 mod floating;
@@ -114,7 +117,7 @@ const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 
 static ACCEPTANCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-// ===== 主题令牌（对�?desktop/ui/tokens.css �?dark 档）=====
+// ===== 主题令牌（对照旧 WebView 那份 ui/tokens.css 的 dark 档）=====
 
 fn color(r: u8, g: u8, b: u8) -> D2D1_COLOR_F {
     D2D1_COLOR_F {
@@ -307,8 +310,8 @@ struct Brushes {
     white: ID2D1SolidColorBrush,
     /// 达标/周末用的绿色。
 success: ID2D1SolidColorBrush,
-    /// 弹窗底色�?*始终不透明**。玻璃模式下 `card` 是半透明的，
-    /// 拿它当弹窗底会把下面的表格文字透出来（tokens.css �?--modal-bg 就是为这个单开的）。
+    /// 弹窗底色**始终不透明**。玻璃模式下 `card` 是半透明的，
+    /// 拿它当弹窗底会把下面的表格文字透出来（旧版 tokens.css 的 --modal-bg 就是为这个单开的）。
 modal: ID2D1SolidColorBrush,
     /// 危险/失败用的红色（插件加载失败、开机自启没生效）。
     danger: ID2D1SolidColorBrush,
@@ -345,7 +348,7 @@ struct Formats {
     small: IDWriteTextFormat,
     right: IDWriteTextFormat,
     center_small: IDWriteTextFormat,
-    /// 键帽上那种小一号的字（窄键放不�?11px）。
+    /// 键帽上那种小一号的字（窄键放不下 11px）。
 center_tiny: IDWriteTextFormat,
     tab: IDWriteTextFormat,
 }
@@ -368,7 +371,7 @@ enum Kind {
 struct Comp {
     swap: IDXGISwapChain1,
     ctx: ID2D1DeviceContext,
-    /// 必须�?先放�?：后台缓冲还被它引用�?`ResizeBuffers` 会返�?INVALID_CALL。
+    /// 必须先放掉它再重建：后台缓冲还被它引用时 `ResizeBuffers` 会返回 INVALID_CALL。
 bitmap: Option<ID2D1Bitmap1>,
     /// 这三个必须活着：visual 挂着 swapchain，target 挂着 visual。
 _dcomp: IDCompositionDevice,
@@ -513,7 +516,7 @@ impl Target {
                 }
                 unsafe {
                     c.ctx.SetTarget(None);
-                    // 先放掉位图：它持有对后台缓冲的引用，不放�?ResizeBuffers 必失败。
+                    // 先放掉位图：它持有对后台缓冲的引用，不放掉 ResizeBuffers 必失败。
 c.bitmap = None;
                     let r = c
                         .swap
@@ -564,7 +567,7 @@ fn target_bitmap(
     }
 }
 
-// ===== 应用状�?=====
+// ===== 应用状态 =====
 
 /// 插件页的一行。
 #[derive(Clone, Debug)]
@@ -632,15 +635,15 @@ hotkeys: Option<GlobalHotKeyManager>,
     snip_annotate_hk: Option<HotKey>,
     /// 系统材质贴上了（Win11 Mica）。
 mica: bool,
-    /// 现在真的走合成路径（透明/玻璃）。只�?`mica` 且合成成功才�?true。
+    /// 现在真的走合成路径（透明/玻璃）。只有 `mica` 且合成成功才为 true。
 glass: bool,
     /// 只读库句柄：`init_readonly` 的副作用是全局年度缓存。
 _db: Arc<focusflow_core::db::Database>,
-    /// 顶部视图�?=键鼠排行 1=应用排行 2=设备排行 3=活跃分析 4=插件 5=设置。
+    /// 顶部视图：0=键鼠排行 1=应用排行 2=设备排行 3=活跃分析 4=插件 5=设置。
 view: usize,
-    /// 活跃分析页内的子页签�?=趋势 1=小时 2=星期 3=热力。
+    /// 活跃分析页内的子页签：0=趋势 1=小时 2=星期 3=热力。
 atab: usize,
-    /// 列表滚动到第几行�? = 顶部）。
+    /// 列表滚动到第几行（0 = 顶部）。
 scroll: usize,
     /// 当前统计周期；后台刷新线程也要读，所以放在原子量里。
 period: Arc<AtomicI64>,
@@ -648,7 +651,7 @@ period: Arc<AtomicI64>,
 detail: Option<DeviceDetail>,
     /// 热力页上光标下的键（`heat_keys()` 的下标）。
 heat_hover: Option<usize>,
-    /// 设置页底部那条状态：上一次数据操作的结果 / "正在�?。
+    /// 设置页底部那条状态：上一次数据操作的结果 / "正在…"。
 status: Option<String>,
     /// 有后台操作在跑（按钮置灰，避免连点）。
 busy: bool,
@@ -656,11 +659,11 @@ busy: bool,
 search: String,
     /// 设置页左侧当前分类（0=常规…，见 [`SETTINGS_CATS`]）。
     settings_cat: usize,
-    /// 设置页里那个常驻的搜索框（与行内编辑�?EDIT 不是同一个）。
+    /// 设置页里那个常驻的搜索框（与行内编辑用的那个 EDIT 不是同一个）。
 search_edit: Option<HWND>,
     /// 后台操作把结果行塞这里，再投 `WM_OP_DONE` 让界面来取。
 ops: Arc<Mutex<Vec<String>>>,
-    /// 插件管理器（Lua 不是 Send，只能待�?UI 线程）。
+    /// 插件管理器（Lua 不是 Send，只能待在 UI 线程）。
 pm: Option<PluginManager>,
     /// 插件列表（从 plugins/ 目录扫出来的）。
 plugin_rows: Vec<PluginRow>,
@@ -680,7 +683,7 @@ plugin_open: Option<String>,
     /// `sel` 按钮拼的动作 id 与行高亮都读这一份；开/关视图时清掉（旧版前端口径：
     /// 关掉面板就不留选中），切换分组互不影响。
     plugin_sel: HashMap<String, Vec<String>>,
-    /// 上一次重算插件视图的时间�? 秒一次就够，别跟着 100ms 心跳跑）。
+    /// 上一次重算插件视图的时间戳（1 秒一次就够，别跟着 100ms 心跳跑）。
 last_pv_refresh: Option<std::time::Instant>,
     hover: Option<usize>,
     sel: Option<usize>,
@@ -1638,7 +1641,7 @@ let y0 = g.list_top + vis as f32 * g.row_h;
                         self.start_edit(hwnd, idx);
                         return;
                     }
-                    // 点行本身（不在按钮上�? 看详情。
+                    // 点行本身（不在按钮上）= 看详情。
 self.open_detail(hwnd, idx);
                     return;
                 }
@@ -2494,7 +2497,8 @@ fn toggle_setting(&mut self, hwnd: HWND, idx: usize) {
     fn finish_edit(&mut self, hwnd: HWND, commit: bool) {
         let Some(target) = self.edit_target.take() else { return };
         if let Some(e) = self.edit {
-            // 先藏起来：藏窗口会触�?WM_KILLFOCUS，它又会投一�?提交"�?            // �?`edit_target` 已经取空把这一次挡掉。
+            // 先藏起来：藏窗口会触发 WM_KILLFOCUS，它又会投一次"提交"。
+            // 而 `edit_target` 已经取空，把这一次挡掉。
 unsafe {
                 let _ = ShowWindow(e, SW_HIDE);
             }
@@ -2629,7 +2633,7 @@ let numeric_ok = match kind {
             .and_then(|s| s.devices.get(idx).map(|d| d.key.clone()));
         let Some(key) = key else { return };
         let period = self.period.load(std::sync::atomic::Ordering::Relaxed);
-        // 注：这条查询�?UI 线程上跑（探针库很小）。正式版要挪到后台线程再投消息回来。
+        // 注：这条查询在 UI 线程上跑（探针库很小）。正式版要挪到后台线程再投消息回来。
 self.detail = Some(focusflow_core::db::get_device_detail(&key, period));
         tracing_note(&format!("打开设备详情 key={key:?} period={period}"));
         unsafe {
@@ -2715,7 +2719,7 @@ impl P<'_> {
     }
 }
 
-// ===== 设置�?=====
+// ===== 设置页 =====
 
 struct SettingsGeom {
     list_top: f32,
@@ -3517,7 +3521,7 @@ let ty = dialog.bottom - 74.0;
     }
 }
 
-// ===== 一屏内�?=====
+// ===== 一屏内容 =====
 
 /// 一屏里会变的交互状态。画图和命中测试必须读同一份。
 #[derive(Clone, Copy, Default)]
@@ -3969,7 +3973,7 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     }
 }
 
-// ===== 键盘热力（物理键位，移植�?desktop/ui/js/charts.js�?=====
+// ===== 键盘热力（物理键位，移植自旧 WebView 的 ui/js/charts.js）=====
 
 struct HeatKey {
     name: &'static str,
@@ -4267,7 +4271,7 @@ let board: std::collections::HashSet<&str> = keys.iter().map(|k| k.name).collect
 }
 
 
-// ===== 截图（选区 �?PNG�?=====
+// ===== 截图（选区 → PNG）=====
 
 /// 屏幕区域截图的缓冲（BGRA、自上而下）。
 fn capture_rect(x: i32, y: i32, w: i32, h: i32) -> std::result::Result<Vec<u8>, String> {
@@ -4287,7 +4291,7 @@ fn capture_rect(x: i32, y: i32, w: i32, h: i32) -> std::result::Result<Vec<u8>, 
         let mut info = BITMAPINFO::default();
         info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
         info.bmiHeader.biWidth = w;
-        // 负高�?= 自上而下，省一次翻。
+        // 负高度 = 自上而下，省一次翻转。
 info.bmiHeader.biHeight = -h;
         info.bmiHeader.biPlanes = 1;
         info.bmiHeader.biBitCount = 32;
@@ -6762,8 +6766,8 @@ fn csv_field(s: &str) -> String {
     }
 }
 
-/// 把当前快照写成一�?CSV（概�?+ 四个排行 + 每日/每小时）�?///
-/// 注：这是原生。
+/// 转义 HTML 文本。
+/// 注：CSV 侧的转义是另一套规则，见 `csv_field`。
 /// HTML 报告里要转义：键名/应用名可能带 `<`、`&`。
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -6900,6 +6904,7 @@ fn export_json_text(s: &Snapshot) -> String {
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// 把当前快照写成一份 CSV（概览 + 四个排行 + 每日/每小时）。
 fn export_csv_text(s: &Snapshot) -> String {
     let mut out = String::new();
     out.push_str("FocusFlow 导出\r\n");
@@ -7339,7 +7344,7 @@ fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     }
 }
 
-// ===== 托盘 / 热键 / 单实�?=====
+// ===== 托盘 / 热键 / 单实例 =====
 
 fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenuItem>) {
     let today = snap.lock().map(|s| s.today).unwrap_or(0);
@@ -7663,7 +7668,7 @@ if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
     Some(handle)
 }
 
-// ===== 小工�?=====
+// ===== 小工具 =====
 
 fn plot_width(r: D2D_RECT_F) -> f32 {
     r.right - r.left
@@ -7814,7 +7819,7 @@ unsafe fn app_ptr(hwnd: HWND) -> Option<&'static mut App> {
 
 /// EDIT 的子类过程：Enter 提交、Esc 取消、失焦提交。
 ///
-/// 为什么用子类化而不是在父窗口里�?`WM_COMMAND`：单�?EDIT �?Enter 不会变成
+/// 为什么用子类化而不是在父窗口里接 `WM_COMMAND`：单个 EDIT 的 Enter 不会变成
 /// `EN_*` 通知，Esc 更不会；这两个键只能靠自己截。
 unsafe extern "system" fn edit_proc(
     hwnd: HWND,
@@ -7836,8 +7841,9 @@ unsafe extern "system" fn edit_proc(
             LRESULT(0)
         }
         WM_CHAR if w.0 == VK_RETURN || w.0 == VK_ESCAPE => LRESULT(0),
-        // 不在这里�?失焦即提�?：窗口不是前台时 `SetFocus` 不会真正生效�?        // EDIT 刚建出来就会收到一次假�?WM_KILLFOCUS，提交的会是预填的旧名字
-        // �?026-10-26 实测）。提交由 Enter/Esc �?点编辑框外面"两条路负责。
+        // 不在这里做"失焦即提交"：窗口不是前台时 `SetFocus` 不会真正生效，
+        // 而 EDIT 刚建出来就会收到一次假的 WM_KILLFOCUS，提交的会是预填的旧名字
+        // （2026-10-26 实测）。提交由 Enter/Esc 和"点编辑框外面"两条路负责。
         _ => DefSubclassProc(hwnd, msg, w, l),
     }
     }
@@ -8286,7 +8292,7 @@ if w.0 == 0x1B {
             unsafe { DefWindowProcW(hwnd, msg, w, l) }
         }
         WM_CLOSE => {
-            // 关窗�?= 收进托盘（真正退出走托盘菜单），与现有版本同一口径。
+            // 关窗口 = 收进托盘（真正退出走托盘菜单），与旧版同一口径。
 unsafe {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
@@ -8343,9 +8349,10 @@ impl raw_window_handle::HasWindowHandle for HwndWrap {
     }
 }
 
-/// 贴系统材质：成功就整窗透明 + 卡片半透明；失败（Win10/远程桌面/透明效果关闭。
-/// 就保持不透明深色 —�?与现�?Tauri �?`apply_window_vibrancy` 同一口径�?///
-/// 注意：透明只是"贴上了材。
+/// 贴系统材质：成功就整窗透明 + 卡片半透明；失败（Win10 / 远程桌面 / 关了透明效果）
+/// 就保持不透明深色 —— 与旧 Tauri 版的 `apply_window_vibrancy` 同一口径。
+///
+/// 注意：让整窗透明只是手段，材质真透得出来才算成功（返回值说的就是这件事）。
 fn apply_glass(hwnd: HWND) -> bool {
     // 测试钩子：Win10 / 远程桌面 / 关掉透明效果时拿不到 Mica，走的是不透明那一档。
     // 有了它，自动化才能把那条路也跑一遍 —— 否则"退回档也能看"永远只是一句话。
