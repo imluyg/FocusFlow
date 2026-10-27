@@ -4343,7 +4343,7 @@ struct PinImage {
     img: Vec<u8>,
     w: i32,
     h: i32,
-    /// 缩放档：滚轮按 10% 调，夹在 [`PIN_MIN_SCALE`]..=[`PIN_MAX_SCALE`]。
+    /// 缩放档：滚轮按 [`PIN_ZOOM_STEPS`] 走档（不是连乘），夹在 [`PIN_MIN_SCALE`]..=[`PIN_MAX_SCALE`]。
     scale: f32,
     /// 缩放角标的显示起点：`None` = 不显示。滚轮每按一下重开一秒二。
     badge: Option<std::time::Instant>,
@@ -4455,8 +4455,10 @@ fn pin_work_area(hwnd: HWND) -> (i32, i32, i32, i32) {
     }
 }
 
-const PIN_MIN_SCALE: f32 = 0.25;
-const PIN_MAX_SCALE: f32 = 4.0;
+/// 缩放的两个界**由档表首末导出**（[`PIN_ZOOM_STEPS`]）：写成两个字面量迟早会和档表漂开，
+/// 漂开之后的症状是"滚到顶了，可界还没到"。
+const PIN_MIN_SCALE: f32 = PIN_ZOOM_STEPS[0];
+const PIN_MAX_SCALE: f32 = PIN_ZOOM_STEPS[PIN_ZOOM_STEPS.len() - 1];
 /// 同时最多几张：每张都是一份完整像素，拍个上限免得贴满桌面后吃光内存。
 const PIN_MAX_COUNT: usize = 12;
 
@@ -4528,10 +4530,39 @@ fn open_pin(img: Vec<u8>, w: i32, h: i32, x: i32, y: i32) -> Option<HWND> {
     }
 }
 
-/// 滚轮一格把缩放档乘/除 10%，夹在 [`PIN_MIN_SCALE`]..=[`PIN_MAX_SCALE`]。
-/// 抽出来是因为"往上滚是变大"这件事最容易写反，而窗口尺寸与像素比例都跟着它。
+/// 滚轮走的是**档位**，不是"当前档 ×1.1"：连乘会让 100% 越走越回不去
+/// （1.0 → 1.1 → 退一格是 0.99），而"图上一行像素＝屏上一行像素"这一档恰恰是最该能落准的。
+/// 旧 Webview 版给的就是一串含 1.0 的离散档，这里按同一口径搬回来。
+const PIN_ZOOM_STEPS: [f32; 13] = [
+    0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0, 4.0,
+];
+
+/// 从 `current` 往上/下走 `notches` 格，一格＝**该方向上相邻的那一档**。
+/// 值不在档上时（旧档位留下的、手改配置的、浮点误差的）先走到它前面的那一档，而不跨过——
+/// 所以从 0.99 往上一格是 1.0，"退一格回到 100%"这句话现在是真的。
+/// 首末两档就是 [`PIN_MIN_SCALE`] 与 [`PIN_MAX_SCALE`]，滚到头上停住。
 fn pin_next_scale(current: f32, notches: f32) -> f32 {
-    (current * (1.0 + 0.1 * notches)).clamp(PIN_MIN_SCALE, PIN_MAX_SCALE)
+    let steps = notches.abs().round().max(1.0) as usize;
+    let top = PIN_MAX_SCALE;
+    let bottom = PIN_MIN_SCALE;
+    let mut v = current;
+    for _ in 0..steps {
+        v = if notches >= 0.0 {
+            PIN_ZOOM_STEPS
+                .iter()
+                .copied()
+                .find(|s| *s > v + 1e-6)
+                .unwrap_or(top)
+        } else {
+            PIN_ZOOM_STEPS
+                .iter()
+                .copied()
+                .rev()
+                .find(|s| *s < v - 1e-6)
+                .unwrap_or(bottom)
+        };
+    }
+    v
 }
 
 /// 某档缩放下的窗口尺寸（像素）。至少 1×1，否则窗口建不出来、图也画不出。
@@ -8442,7 +8473,26 @@ mod pin_tests {
         assert!(pin_next_scale(1.0, 1.0) > 1.0, "向上滚要变大");
         assert!(pin_next_scale(1.0, -1.0) < 1.0, "向下滚要变小");
         assert!((pin_next_scale(1.0, 1.0) - 1.1).abs() < 1e-6);
-        assert!((pin_next_scale(1.1, -1.0) - 0.99).abs() < 1e-6);
+        // 退回来必须**正好**落在 1.0 上：旧写法连乘会停在 0.99，
+        // 于是"图上一行＝屏上一行"这一档再也滚不回去（角标显示 99%）。
+        assert_eq!(pin_next_scale(1.1, -1.0), 1.0);
+    }
+
+    /// 一整圈滚上去再滚回来，必须一格不差地回到 100%（离散档的意义就在这儿）。
+    #[test]
+    fn a_full_zoom_round_trip_lands_back_on_exactly_one() {
+        let mut s = 1.0f32;
+        for _ in 0..4 {
+            s = pin_next_scale(s, 1.0);
+        }
+        assert_eq!(s, 2.0, "往上四格该走到 200%");
+        for _ in 0..4 {
+            s = pin_next_scale(s, -1.0);
+        }
+        assert_eq!(s, 1.0, "滚回来该正好是 100%，不是 0.99 那种");
+        // 不在档上的值先吸到最近档：0.99 往上一格是 1.0，往下一格是 0.9
+        assert_eq!(pin_next_scale(0.99, 1.0), 1.0);
+        assert_eq!(pin_next_scale(0.99, -1.0), 0.9);
     }
 
     /// 连续滚不会滚成 0（窗口塌掉）也不会滚成天文数字（StretchDIBits 画不动）。
@@ -8461,6 +8511,8 @@ mod pin_tests {
         // 已经在上/下限外面（手改配置、浮点误差）也要被夹回来。
         assert_eq!(pin_next_scale(99.0, 1.0), PIN_MAX_SCALE);
         assert_eq!(pin_next_scale(0.001, -1.0), PIN_MIN_SCALE);
+        // 档表里必须有 1.0 这一档：整圈滚回来的判据靠它，删掉之后"回到原样"就只是句好听的话
+        assert!(PIN_ZOOM_STEPS.contains(&1.0), "档表里丢了 100% 这一档");
     }
 
     /// 窗口尺寸 = 原图 × 档；四舍五入后至少 1×1，否则窗口建不出来。
