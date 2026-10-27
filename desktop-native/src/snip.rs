@@ -12,6 +12,7 @@
 //! 脱离窗口就能被用例断言。
 
 use std::sync::Mutex;
+use std::time::Instant;
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -50,8 +51,13 @@ const BAR_ROW_H: i32 = 26;
 const BAR_GAP: i32 = 6;
 const BAR_GROUP_GAP: i32 = 14;
 const BAR_PAD: i32 = 6;
-/// 覆盖层挂满这么多毫秒就自己退（截图是"顺手按一次"的工具，忘了它整张桌面会一直被压住）。
+/// 覆盖层**闲置**这么多毫秒就自己退（截图是"顺手按一次"的工具，忘了它整张桌面会一直被压住）。
+/// 这是闲置闸：鼠标动一下、键按一下就重新计时，所以正在画的人不会被它掐掉。
 const SNIP_TIMEOUT_MS: u32 = 180_000;
+/// 绝对上限：标注这一条最多挂 10 分钟，松手即存那条最多 60 秒（旧 Webview 版同一对数）。
+/// 有闲置闸就必须还有这一条，否则"手一直放着鼠标动"能把覆盖层挂一下午。
+const SNIP_CEILING_ANNOTATE_MS: u64 = 600_000;
+const SNIP_CEILING_QUICK_MS: u64 = 60_000;
 /// 那个定时器 id（`0x534E` = 'SN'）。验收脚本按同一个数投一条 WM_TIMER 过来催它响。
 const SNIP_TIMEOUT_TIMER: usize = 0x534E;
 /// 覆盖层的窗口类名：验收夹具按它等窗口，改名要连着改脚本。
@@ -232,6 +238,11 @@ pub struct SnipState {
     overlay: isize,
     /// 冻结时把悬浮窗藏了：退出时要按原样还回去。
     pill_was: bool,
+    /// 自退时限的两把表：`started_at` 只对绝对上限，`last_input` 只对闲置闸。
+    /// 定时器按 [`snip_tick`] 算出的间隔反复重挂，所以动一下鼠标就把闲置那一头续上。
+    started_at: Option<Instant>,
+    last_input: Option<Instant>,
+    ceiling_ms: u64,
 }
 
 const fn default_state() -> SnipState {
@@ -262,6 +273,9 @@ const fn default_state() -> SnipState {
         text_at: (0, 0),
         overlay: 0,
         pill_was: false,
+        started_at: None,
+        last_input: None,
+        ceiling_ms: SNIP_CEILING_QUICK_MS,
     }
 }
 
@@ -1400,6 +1414,9 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
             WM_LBUTTONDOWN => {
                 let x = (l.0 & 0xFFFF) as i16 as i32;
                 let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
+                if let Ok(mut s) = SNIP.lock() {
+                    s.last_input = Some(Instant::now());
+                }
                 let press = SNIP
                     .lock()
                     .map(|s| {
@@ -1503,6 +1520,8 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                 let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
                 let mut changed = false;
                 if let Ok(mut s) = SNIP.lock() {
+                    // 动过鼠标就算"人还在"：闲置那把表从这一刻重新数（绝对上限不受影响）
+                    s.last_input = Some(Instant::now());
                     match s.drag {
                         Some((Drag::New, sx, sy)) => {
                             let nr = clamp_rect(norm_rect(sx, sy, x, y), s.base_w, s.base_h);
@@ -1709,41 +1728,39 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                 LRESULT(1)
             }
             WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
-                tracing_note("截图取消：右键");
-                let _ = DestroyWindow(hwnd);
+                // 选区还没定：右键＝放弃这一次（旧口径）。选区已定、正在标注：右键不许把已经
+                // 画好的这一整堆丢掉——旧 Webview 版在 annotating 时直接 return，这里同一口径；
+                // 要退有 Esc 和工具条上那颗取消。
+                let adjusting = SNIP
+                    .lock()
+                    .map(|s| s.phase == Phase::Adjust)
+                    .unwrap_or(false);
+                if adjusting {
+                    tracing_note("截图右键在标注阶段不打断（要退用 Esc 或工具条的取消）");
+                } else {
+                    tracing_note("截图取消：右键");
+                    let _ = DestroyWindow(hwnd);
+                }
                 LRESULT(0)
             }
             WM_KEYDOWN => {
+                if let Ok(mut s) = SNIP.lock() {
+                    s.last_input = Some(Instant::now());
+                }
                 on_key(hwnd, w.0);
                 LRESULT(0)
             }
             WM_EDIT_DONE => {
+                // `lParam` 带的是"哪一个输入框"，只有还是当前那一个才处理：
+                // 旧框在 open_text_edit 里已经同步收掉并落好了字，它那条 WM_KILLFOCUS 事后才投到这里，
+                // 而此刻 `text_edit` 已经是新框 —— 不认句柄就会把刚开出来的输入框当成旧的销毁掉。
                 let (te, at) = SNIP
                     .lock()
                     .map(|s| (s.text_edit, s.text_at))
                     .unwrap_or((0, (0, 0)));
-                if te != 0 {
-                    let h = HWND(te as *mut core::ffi::c_void);
-                    if w.0 == 1 {
-                        let mut buf = [0u16; 256];
-                        let n = GetWindowTextW(h, &mut buf).max(0) as usize;
-                        let text = String::from_utf16_lossy(&buf[..n]);
-                        if !text.trim().is_empty() {
-                            if let Ok(mut s) = SNIP.lock() {
-                                let st = Style {
-                                    rgb: s.color,
-                                    w: s.width,
-                                    font: s.font,
-                                };
-                                push_undo(&mut s);
-                                s.marks.push(Mark {
-                                    shape: Shape::Text(at.0, at.1, text),
-                                    style: st,
-                                });
-                            }
-                        }
-                    }
-                    let _ = DestroyWindow(h);
+                let h = HWND(l.0 as *mut core::ffi::c_void);
+                if te != 0 && h.0 as isize == te {
+                    finish_text_edit(h, at, w.0 == 1);
                     if let Ok(mut s) = SNIP.lock() {
                         s.text_edit = 0;
                     }
@@ -1755,8 +1772,31 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
             WM_TIMER => {
                 // 覆盖层只挂了一个定时器，但 id 照样要对上：别的 WM_TIMER 不该被当成超时。
                 if w.0 == SNIP_TIMEOUT_TIMER {
-                    tracing_note("截图 snip-timeout 三分钟没动，覆盖层自己退");
-                    let _ = DestroyWindow(hwnd);
+                    let next = SNIP
+                        .lock()
+                        .map(|s| match (s.started_at, s.last_input) {
+                            (Some(opened), Some(act)) => Some(snip_tick(
+                                SNIP_TIMEOUT_MS as i64 - act.elapsed().as_millis() as i64,
+                                s.ceiling_ms as i64 - opened.elapsed().as_millis() as i64,
+                            )),
+                            // 表没上过（覆盖层不是 start() 建的）：按闲置到点退掉，别让它长挂
+                            _ => None,
+                        })
+                        .unwrap_or(None);
+                    match next {
+                        Some(SnipTick::Wait(ms)) => {
+                            // 重挂同一把表：闲置那一路由此从当下重新数，正在画的人不会被掐掉
+                            let _ = SetTimer(Some(hwnd), SNIP_TIMEOUT_TIMER, ms, None);
+                        }
+                        Some(SnipTick::Absolute) => {
+                            tracing_note("截图 snip-timeout 挂到绝对上限了，覆盖层自己退");
+                            let _ = DestroyWindow(hwnd);
+                        }
+                        _ => {
+                            tracing_note("截图 snip-timeout 三分钟没动，覆盖层自己退");
+                            let _ = DestroyWindow(hwnd);
+                        }
+                    }
                 }
                 LRESULT(0)
             }
@@ -2020,12 +2060,44 @@ fn redo_mark() {
     }
 }
 
+/// 把输入框里的字落成一笔标注（`keep=false` 只丢不留，对应 Esc），然后收掉那个框。
+/// 调用时不许持着 `SNIP` 的锁：既要用 `GetWindowTextW` 问那个框，也要改 `marks`。
+unsafe fn finish_text_edit(h: HWND, at: (i32, i32), keep: bool) {
+    unsafe {
+        if keep {
+            let mut buf = [0u16; 256];
+            let n = GetWindowTextW(h, &mut buf).max(0) as usize;
+            let text = String::from_utf16_lossy(&buf[..n]);
+            if !text.trim().is_empty() {
+                if let Ok(mut s) = SNIP.lock() {
+                    let st = Style {
+                        rgb: s.color,
+                        w: s.width,
+                        font: s.font,
+                    };
+                    push_undo(&mut s);
+                    s.marks.push(Mark {
+                        shape: Shape::Text(at.0, at.1, text),
+                        style: st,
+                    });
+                }
+            }
+        }
+        let _ = DestroyWindow(h);
+    }
+}
+
 /// 在覆盖层上开一个文字输入框（原生 EDIT，自带中文输入法）。落点存的是选区本地坐标。
 unsafe fn open_text_edit(overlay: HWND, x: i32, y: i32) {
     unsafe {
-        let old = SNIP.lock().map(|s| s.text_edit).unwrap_or(0);
-        if old != 0 {
-            let _ = DestroyWindow(HWND(old as *mut core::ffi::c_void));
+        let old = SNIP
+            .lock()
+            .map(|s| (s.text_edit, s.text_at))
+            .unwrap_or((0, (0, 0)));
+        if old.0 != 0 {
+            // 上一个框还挂着：先把它打好的字落下来再收（旧版靠 blur 提交，直接 DestroyWindow
+            // 会把已经打进去的那行字吃掉——点在画布上本来是"换个地方再写一条"的意思）
+            finish_text_edit(HWND(old.0 as *mut core::ffi::c_void), old.1, true);
         }
         let font = SNIP.lock().map(|s| s.font).unwrap_or(30);
         let (sl, st) = SNIP.lock().map(|s| (s.sel.0, s.sel.1)).unwrap_or((0, 0));
@@ -2073,7 +2145,7 @@ unsafe fn open_text_edit(overlay: HWND, x: i32, y: i32) {
     }
 }
 
-/// EDIT 的子类过程：Enter 提交、Esc 只丢这一条文字。
+/// EDIT 的子类过程：Enter 提交、Esc 只丢这一条文字、失焦按提交算（旧版 blur 就落字）。
 unsafe extern "system" fn text_edit_proc(
     hwnd: HWND,
     msg: u32,
@@ -2087,7 +2159,23 @@ unsafe extern "system" fn text_edit_proc(
             WM_KEYDOWN if w.0 == 0x0D || w.0 == 0x1B => {
                 let code = if w.0 == 0x0D { 1 } else { 2 };
                 if let Ok(parent) = GetParent(hwnd) {
-                    let _ = PostMessageW(Some(parent), WM_EDIT_DONE, WPARAM(code), LPARAM(0));
+                    let _ = PostMessageW(
+                        Some(parent),
+                        WM_EDIT_DONE,
+                        WPARAM(code),
+                        LPARAM(hwnd.0 as isize),
+                    );
+                }
+                LRESULT(0)
+            }
+            WM_KILLFOCUS => {
+                if let Ok(parent) = GetParent(hwnd) {
+                    let _ = PostMessageW(
+                        Some(parent),
+                        WM_EDIT_DONE,
+                        WPARAM(1),
+                        LPARAM(hwnd.0 as isize),
+                    );
                 }
                 LRESULT(0)
             }
@@ -2370,6 +2458,31 @@ pub enum Repress {
     Busy,
 }
 
+/// 覆盖层那把自退表怎么读：**闲置**与**绝对**两条一起判（旧 Webview 版就是这个双闸）。
+///
+/// 只有闲置闸，一个不时动一下鼠标的人能把覆盖层挂一整天；只有绝对闸，认真标注的人会被
+/// 三分钟那一刀掐掉。两个都还剩 ⇒ 取更近的那一段重挂定时器，于是绝对那一条能按点落地，
+/// 而闲置那一条每被续一次就从当下重新数。
+pub fn snip_tick(idle_left: i64, absolute_left: i64) -> SnipTick {
+    if absolute_left <= 0 {
+        SnipTick::Absolute
+    } else if idle_left <= 0 {
+        SnipTick::Idle
+    } else {
+        SnipTick::Wait(idle_left.min(absolute_left) as u32)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SnipTick {
+    /// 还早，这么多毫秒之后再看一次
+    Wait(u32),
+    /// 闲置到点：没人碰它，自己退
+    Idle,
+    /// 绝对上限到点：哪怕正在动也要退
+    Absolute,
+}
+
 /// 打开截图覆盖层（托盘菜单/设置页按钮/两条截图热键/测试钩子都走这里）。
 ///
 /// `annotate` = 松手后就地标注；`false` = 松手即存（PNG + 剪贴板），与旧版两条热键的分工一致。
@@ -2481,6 +2594,14 @@ pub fn start(owner: HWND, annotate: bool) {
                     s.base = base;
                     s.dim = dim;
                     s.pill_was = pill_was;
+                    let now = Instant::now();
+                    s.started_at = Some(now);
+                    s.last_input = Some(now);
+                    s.ceiling_ms = if annotate {
+                        SNIP_CEILING_ANNOTATE_MS
+                    } else {
+                        SNIP_CEILING_QUICK_MS
+                    };
                 }
                 // 一开层就把光标下面那块屏的窗口亮出来：旧版是移一下鼠标才亮，
                 // 但"按下热键时光标已经指在他要截的东西上"才是最常见的形状。
@@ -2508,8 +2629,12 @@ pub fn start(owner: HWND, annotate: bool) {
                 let _ = ShowWindow(ov, SW_SHOW);
                 let _ = SetForegroundWindow(ov);
                 let _ = SetFocus(Some(ov));
-                let _ = SetTimer(Some(ov), SNIP_TIMEOUT_TIMER, SNIP_TIMEOUT_MS, None);
+                // 第一枪取两把表里更近的那一段：快速那条 60 秒就到顶，不该等到 180 秒才发现。
+                let ceiling = SNIP.lock().map(|s| s.ceiling_ms).unwrap_or(0);
+                let first = SNIP_TIMEOUT_MS.min(ceiling as u32);
+                let _ = SetTimer(Some(ov), SNIP_TIMEOUT_TIMER, first, None);
                 tracing_note(&format!("截图 snip-arm-timeout {SNIP_TIMEOUT_MS}"));
+                tracing_note(&format!("截图 snip-arm-ceiling {ceiling} first {first}"));
                 tracing_note("截图覆盖层已打开（拖选区域或单击选窗口，右键/Esc 取消）");
             }
             Err(_) => {
@@ -3002,7 +3127,7 @@ mod render_probe {
             let edh = HWND(ed as *mut core::ffi::c_void);
             let txt: Vec<u16> = "测试".encode_utf16().chain(std::iter::once(0)).collect();
             let _ = SetWindowTextW(edh, PCWSTR(txt.as_ptr()));
-            let _ = PostMessageW(Some(ov), WM_EDIT_DONE, WPARAM(1), LPARAM(0));
+            let _ = PostMessageW(Some(ov), WM_EDIT_DONE, WPARAM(1), LPARAM(ed));
             pump(250);
             let (tex, tw, _) = baked_selection().expect("打完字就没图了");
             let mut differs = false;
@@ -3132,8 +3257,54 @@ mod render_probe {
                 "改形改到别的地方去了"
             );
 
+            // 标注阶段的一记右键不该把已经画好的这一整堆丢掉（旧版在 annotating 时直接 return）
+            let n_before_rc = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
+            post_mouse(ov, WM_RBUTTONDOWN, cur.0 + 40, cur.1 + 40);
+            post_mouse(ov, WM_RBUTTONUP, cur.0 + 40, cur.1 + 40);
+            pump(200);
+            assert!(
+                IsWindow(Some(ov)).as_bool(),
+                "标注阶段一记右键就把覆盖层删了"
+            );
+            let n_after_rc = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
+            assert_eq!(n_after_rc, n_before_rc, "右键把已经画好的标注丢了");
+
+            // 文字：打完之后焦点走开就该把这一行落下来（旧版 blur 提交；原来是直接销毁输入框，
+            // 已经打进去的字一个字都不留）
+            click_bar(ov, "text");
+            post_mouse(ov, WM_LBUTTONDOWN, cur.0 + 60, cur.1 + 60);
+            pump(200);
+            let edit = SNIP.lock().map(|s| s.text_edit).unwrap_or(0);
+            assert_ne!(edit, 0, "按文字工具没开出输入框");
+            let phrase = HSTRING::from("失焦落的字");
+            let _ = SetWindowTextW(HWND(edit as *mut core::ffi::c_void), &phrase);
+            let _ = SetFocus(Some(ov));
+            pump(250);
+            let committed = SNIP
+                .lock()
+                .map(|s| {
+                    s.marks
+                        .iter()
+                        .any(|m| matches!(&m.shape, Shape::Text(_, _, t) if t == "失焦落的字"))
+                })
+                .unwrap_or(false);
+            assert!(committed, "输入框失焦没把那一行字落成一笔");
+            let edit_after = SNIP.lock().map(|s| s.text_edit).unwrap_or(-1);
+            assert_eq!(edit_after, 0, "落完字之后输入框还挂在状态里");
+
             let _ = DestroyWindow(ov);
             pump(200);
+            // 会话结束必须把整屏那两份缓冲交出去：1920x1080 一份就是 8 MB，
+            // 挂在静态里等于每次截图之后常驻翻倍（这一族仓里记过两次账）。
+            let (still_base, still_dim, still_active) = SNIP
+                .lock()
+                .map(|s| (s.base.len(), s.dim.len(), s.active))
+                .unwrap_or((0, 0, true));
+            assert_eq!(
+                (still_base, still_dim, still_active),
+                (0, 0, false),
+                "覆盖层关了却没把冻结缓冲放掉"
+            );
             let _ = SetCursorPos(home.x, home.y);
         }
     }
@@ -3695,6 +3866,23 @@ mod tests {
             endpoint_points(&mk(Shape::Text(1, 1, "字".to_string()), 3)),
             None
         );
+    }
+
+    #[test]
+    fn the_overlay_waits_for_the_nearer_of_the_two_clocks() {
+        // 两条都还剩：等更近的那一段。只按闲置算的话，"绝对上限"那条腿会一直看不见，
+        // 手一直放着鼠标动的人就能把覆盖层挂下去。
+        assert_eq!(snip_tick(179_000, 599_000), SnipTick::Wait(179_000));
+        assert_eq!(snip_tick(120_000, 60_000), SnipTick::Wait(60_000));
+        // 闲置到点但绝对上限还没到：退（这才是"没人碰它"那一条）
+        assert_eq!(snip_tick(0, 400_000), SnipTick::Idle);
+        // 人一直在动（闲置还剩很多）但绝对上限到点：照样退，而且要按 Absolute 报，
+        // 日志里那句"三分钟没动"在这种情况下就是假话。
+        assert_eq!(snip_tick(170_000, 0), SnipTick::Absolute);
+        // 两条同时到点：按绝对算，别把"挂到顶了"念成"没动"
+        assert_eq!(snip_tick(-1, -1), SnipTick::Absolute);
+        // 负数但绝对还早 ⇒ 闲置到点
+        assert_eq!(snip_tick(-5, 30_000), SnipTick::Idle);
     }
 
     #[test]

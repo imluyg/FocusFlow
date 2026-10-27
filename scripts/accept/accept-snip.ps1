@@ -115,7 +115,10 @@ function Post-Mouse([IntPtr]$H, [uint32]$Msg, [int]$X, [int]$Y) {
 }
 
 # Message ids, spelled out because mixing two of them up silently changes the gesture:
-# 0x0200 WM_MOUSEMOVE, 0x0201 WM_LBUTTONDOWN, 0x0202 WM_LBUTTONUP, 0x0204 WM_RBUTTONDOWN (= cancel).
+# 0x0200 WM_MOUSEMOVE, 0x0201 WM_LBUTTONDOWN, 0x0202 WM_LBUTTONUP,
+# 0x0204 WM_RBUTTONDOWN = cancel -- but only while the selection is still being drawn:
+# once the annotation stage starts the product deliberately ignores it (Esc is the way out),
+# so a right-click posted into an annotating overlay must NOT close it.
 $FF_MOVE = 0x0200
 $FF_DOWN = 0x0201
 $FF_UP = 0x0202
@@ -408,14 +411,19 @@ $fx.Close()
 $fx.Dispose()
 
 # ---------- round 4: the overlay gives up on its own ----------
+# This round has to run the ANNOTATE path. The overlay now carries two clocks: an idle one
+# (180 s, renewed by any mouse move or key) and an absolute ceiling -- 600 s while annotating
+# but only 60 s for the quick "release to save" path. Waiting 170 s on the quick path would
+# measure the ceiling, not the idle clock, so 'annotate' is what makes this leg mean its name.
 $before4 = Count-Png
 Remove-Item $logPath -ErrorAction SilentlyContinue
-$p4 = Start-App $Exe $app $WorkDir @{ FOCUSFLOW_SNIP_OVERLAY = '1' }
+$p4 = Start-App $Exe $app $WorkDir @{ FOCUSFLOW_SNIP_OVERLAY = 'annotate' }
 $h4 = Wait-Window $p4.Id
 if ($h4 -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
 $ov4 = Wait-Window $p4.Id 'FocusFlowSnipOverlay' 6000
 Check 'the timeout round opens the overlay' ($ov4 -ne [IntPtr]::Zero)
-Check 'the overlay arms a three-minute timeout' (Wait-Log 'snip-arm-timeout 180000')
+Check 'the overlay arms a three-minute idle timeout' (Wait-Log 'snip-arm-timeout 180000')
+Check 'the annotate round arms its ten-minute ceiling' (Wait-Log 'snip-arm-ceiling 600000')
 
 # Waited out, not faked: a WM_TIMER posted from another process never reaches this message
 # loop (measured -- posting WM_KEYDOWN/VK_ESCAPE to the same overlay closes it at once, while

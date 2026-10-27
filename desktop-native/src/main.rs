@@ -76,7 +76,7 @@ const CLASS_NAME: PCWSTR = w!("FocusFlowNativeD2D");
 const WM_REFRESH: u32 = WM_APP + 1;
 /// 自动化验收用：等价于托盘「显示主窗口。
 const WM_ACCEPTANCE_SHOW: u32 = WM_APP + 2;
-/// 行内编辑结束：`wparam` 1=提交。
+/// 行内编辑结束：`wparam` 1=提交、2=丢弃；`lparam` 只有截图那条读，带的是输入框自己的句柄。
 const WM_EDIT_DONE: u32 = WM_APP + 3;
 /// 数据操作（备。
 const WM_OP_DONE: u32 = WM_APP + 4;
