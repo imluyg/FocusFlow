@@ -758,10 +758,16 @@ impl App {
             };
 
             let (tray, pause_item) = make_tray(&snap);
-            let (hotkeys, hotkey_hk, snip_hk, snip_annotate_hk) = make_hotkeys();
+            let HotkeysAtBoot {
+                manager: hotkeys,
+                toggle: hotkey_hk,
+                snip: snip_hk,
+                annotate: snip_annotate_hk,
+                warning: hotkey_warning,
+            } = make_hotkeys();
 
             // 启动时这条状态行只放一句话，按"要紧的先说"排：
-            // 搬迁没成 > 双计提醒 > 刚搬完告知搬到了哪。
+            // 搬迁没成 > 双计提醒 > 刚搬完告知搬到了哪 > 热键没注册上。
             let boot_status = move_notice
                 .as_ref()
                 .map(|n| format!("注意：{}（{}）", n.detail, n.step))
@@ -778,7 +784,10 @@ impl App {
                             )
                         })
                     }
-                });
+                })
+                // 热键有一条没注册上就要在屏上点名：启动时"按了没反应"最难猜的就是
+                // "到底注册上没有"，原来这一句只在日志里。
+                .or_else(|| hotkey_warning.clone());
 
             // 悬浮窗：独立线程 + 独立分层窗口，主窗口收起时也常驻。
             // 起不来只记一句 —— 主界面不该因为"小卡片起不来"而失败。
@@ -1902,17 +1911,17 @@ impl App {
             return "全局热键已关闭：三条组合都不注册".to_string();
         }
         let toggle = register_combo(self.hotkeys.as_ref(), "toggle_window");
-        self.hotkey_hk = toggle;
+        self.hotkey_hk = toggle.hk;
         let snip = register_combo(self.hotkeys.as_ref(), "snip");
-        self.snip_hk = snip;
+        self.snip_hk = snip.hk;
         let annotate = register_combo(self.hotkeys.as_ref(), "snip_annotate");
-        self.snip_annotate_hk = annotate;
-        let ok = [toggle, snip, annotate].into_iter().flatten().count();
-        match ok {
-            3 => "三条热键已按配置注册".to_string(),
-            0 => "热键没能注册上（组合无效或被别的程序占用，详见日志）".to_string(),
-            n => format!("只注册上 {n} 条热键（哪一条失败写在日志里）"),
-        }
+        self.snip_annotate_hk = annotate.hk;
+        // 标签走 `hotkey_label` 那一份，不在这里抄第二遍中文
+        hotkey_status_line(&[
+            toggle.part(hotkey_label("toggle_window")),
+            snip.part(hotkey_label("snip")),
+            annotate.part(hotkey_label("snip_annotate")),
+        ])
     }
 
     /// 全局热键总开关：三条绑定（唤出 / 截图 / 截图进标注）一起注册或一起取消，
@@ -6908,28 +6917,91 @@ fn combo_reject_reason(key: &str, raw: &str) -> Option<String> {
     combo_check(raw, &refs)
 }
 
-/// 读 `[hotkey] <key>` 并注册它；成功返回组合，失败返回 `None`（这一条不占用全局键）。
+/// 一条热键绑定的注册结局。
+struct Combo {
+    /// 注册上的组合（没注册上是 None）——注销时要按它原样撤回
+    hk: Option<HotKey>,
+    /// 配置里的原串：状态栏要念给用户看他配的到底是哪一串
+    raw: String,
+    /// 失败原因；成功时是 None
+    why: Option<String>,
+}
+
+impl Combo {
+    /// 转成 `hotkey_status_line` 用的三元组（中文标签在调用处按 `hotkey_label` 给）。
+    fn part<'a>(&self, label: &'a str) -> (&'a str, String, Option<String>) {
+        (label, self.raw.clone(), self.why.clone())
+    }
+}
+
+/// 读 `[hotkey] <key>` 并注册它。成功返回组合，失败返回原因（这一条不占用全局键）。
 /// 日志里带 `key = 原串` 这段 ASCII，验收脚本据此核对"配置写的"和"注册的"是不是同一个。
-fn register_combo(manager: Option<&GlobalHotKeyManager>, key: &str) -> Option<HotKey> {
-    let manager = manager?;
+fn register_combo(manager: Option<&GlobalHotKeyManager>, key: &str) -> Combo {
+    let manager = match manager {
+        Some(m) => m,
+        None => {
+            return Combo {
+                hk: None,
+                raw: hotkey_config_raw(key),
+                why: Some("拿不到热键管理器".to_string()),
+            }
+        }
+    };
     let raw = hotkey_config_raw(key);
     let hk = match parse_combo(&raw) {
         Some(hk) => hk,
         None => {
             tracing_note(&format!("热键 {key} = {raw:?} 解析失败：这一条没有注册"));
-            return None;
+            return Combo {
+                hk: None,
+                raw,
+                why: Some("这串组合解析不出来".to_string()),
+            };
         }
     };
     match manager.register(hk) {
         Ok(()) => {
             tracing_note(&format!("热键已注册 {key} = {raw}"));
-            Some(hk)
+            Combo {
+                hk: Some(hk),
+                raw,
+                why: None,
+            }
         }
         Err(e) => {
             tracing_note(&format!("热键注册失败 {key} = {raw}：{e}"));
-            None
+            Combo {
+                hk: None,
+                raw,
+                why: Some(format!("系统拒了：{e}")),
+            }
         }
     }
+}
+
+/// 三条绑定的注册结局拼成状态栏那一行。**点名到哪一条**是这条读数的全部意义：
+/// "截图的热键被别的程序占了"和"唤出的热键写错了"是两件完全不同的事，用户要改的东西不一样，
+/// 而只报"注册上 N 条（详见日志）"等于让人去翻日志。全成都把三条当前组合念出来。
+fn hotkey_status_line(items: &[(&str, String, Option<String>)]) -> String {
+    let mut failed: Vec<String> = Vec::new();
+    for (label, raw, why) in items {
+        if let Some(why) = why {
+            failed.push(format!("{label} {raw}：{why}"));
+        }
+    }
+    if failed.is_empty() {
+        let live: Vec<String> = items
+            .iter()
+            .map(|(l, raw, _)| format!("{l} {raw}"))
+            .collect();
+        return format!("三条热键已按配置注册：{}", live.join(" · "));
+    }
+    let ok = items.len() - failed.len();
+    let mut line = format!("没注册上：{}", failed.join("；"));
+    if ok > 0 {
+        line.push_str(&format!("；其余 {ok} 条已注册"));
+    }
+    line
 }
 
 /// 注销此刻真正注册着的组合（总开关关掉、或改完要重注册时先走这一步）。
@@ -7053,12 +7125,18 @@ fn run_plugin_sel_test(hwnd: HWND) {
     }
 }
 
-fn make_hotkeys() -> (
-    Option<GlobalHotKeyManager>,
-    Option<HotKey>,
-    Option<HotKey>,
-    Option<HotKey>,
-) {
+/// 开机注册三条热键的结局。写成结构体而不是五元组：调用处按名字取值，
+/// 也不用为了多带一句状态把返回类型越拧越复杂。
+struct HotkeysAtBoot {
+    manager: Option<GlobalHotKeyManager>,
+    toggle: Option<HotKey>,
+    snip: Option<HotKey>,
+    annotate: Option<HotKey>,
+    /// 有条没注册上时给状态栏的那句话（全成都成功是 None）
+    warning: Option<String>,
+}
+
+fn make_hotkeys() -> HotkeysAtBoot {
     let manager = match GlobalHotKeyManager::new() {
         Ok(m) => Some(m),
         Err(e) => {
@@ -7069,7 +7147,19 @@ fn make_hotkeys() -> (
     let toggle = register_combo(manager.as_ref(), "toggle_window");
     let snip = register_combo(manager.as_ref(), "snip");
     let annotate = register_combo(manager.as_ref(), "snip_annotate");
-    (manager, toggle, snip, annotate)
+    let any_failed = toggle.why.is_some() || snip.why.is_some() || annotate.why.is_some();
+    let line = hotkey_status_line(&[
+        toggle.part(hotkey_label("toggle_window")),
+        snip.part(hotkey_label("snip")),
+        annotate.part(hotkey_label("snip_annotate")),
+    ]);
+    HotkeysAtBoot {
+        manager,
+        toggle: toggle.hk,
+        snip: snip.hk,
+        annotate: annotate.hk,
+        warning: any_failed.then_some(line),
+    }
 }
 
 /// 托盘图标：一个蓝色圆点。真实版本换。
@@ -8565,5 +8655,66 @@ mod pager_shape_tests {
             // 标签之外的任何一种都能被 `on_click` 命中：说明 Pager 接上了。
             _ => panic!("分页条不再是纯标签，这条读数该改成新判据"),
         }
+    }
+}
+
+/// 热键状态行那条读数。截图的两条键就在这三条里，"按了没反应"时用户要先知道是哪一条没了。
+#[cfg(test)]
+mod hotkey_line_tests {
+    use super::hotkey_status_line;
+
+    fn item(
+        label: &'static str,
+        raw: &str,
+        why: Option<&str>,
+    ) -> (&'static str, String, Option<String>) {
+        (label, raw.to_string(), why.map(|w| w.to_string()))
+    }
+
+    #[test]
+    fn all_three_registered_reads_back_what_is_live() {
+        let line = hotkey_status_line(&[
+            item("唤出窗口热键", "ctrl+f12", None),
+            item("区域截图热键", "ctrl+f1", None),
+            item("标注截图热键", "ctrl+f2", None),
+        ]);
+        assert!(line.contains("已按配置注册"), "{line}");
+        // 三条当前组合都要念出来：屏幕上能看见"现在按 ctrl+f1 是截图"才是这条读数的用处
+        for raw in ["ctrl+f12", "ctrl+f1", "ctrl+f2"] {
+            assert!(line.contains(raw), "少了 {raw}：{line}");
+        }
+    }
+
+    #[test]
+    fn one_failed_combo_is_named_with_its_own_reason() {
+        let line = hotkey_status_line(&[
+            item("唤出窗口热键", "ctrl+f12", None),
+            item(
+                "区域截图热键",
+                "ctrl+f1",
+                Some("系统拒了：另一个程序已占用"),
+            ),
+            item("标注截图热键", "ctrl+f2", None),
+        ]);
+        assert!(line.contains("区域截图热键"), "没点名是哪一条：{line}");
+        assert!(line.contains("ctrl+f1"), "没说他配的是哪一串：{line}");
+        // 原因不许被聚合话术吞掉——旧写法只剩"只注册上 2 条（详见日志）"
+        assert!(line.contains("另一个程序已占用"), "原因被吞了：{line}");
+        assert!(line.contains("其余 2 条已注册"), "{line}");
+        assert!(
+            !line.contains("标注截图热键"),
+            "没失败的那条别一起报：{line}"
+        );
+    }
+
+    #[test]
+    fn all_failed_says_so_without_counting_the_rest() {
+        let line = hotkey_status_line(&[
+            item("唤出窗口热键", "", Some("这串组合解析不出来")),
+            item("区域截图热键", "", Some("拿不到热键管理器")),
+            item("标注截图热键", "", Some("拿不到热键管理器")),
+        ]);
+        assert!(line.contains("没注册上"), "{line}");
+        assert!(!line.contains("其余"), "三条都没成却还说其余：{line}");
     }
 }
