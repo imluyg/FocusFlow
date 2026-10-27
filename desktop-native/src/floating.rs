@@ -29,9 +29,9 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
-    D2D1_RENDER_TARGET_USAGE_NONE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
@@ -121,7 +121,7 @@ fn scale_of(hwnd: HWND) -> f64 {
 /// 卡片至少要和它一样高 —— 用户的原话是"至少和任务栏高度差不多"。用系统给的
 /// `ABM_GETTASKBARPOS` 而不是写死 48：125%/150% 或"大任务栏"时也能对齐。
 fn taskbar_height_logical(scale: f64) -> i32 {
-    use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA, ABM_GETTASKBARPOS};
+    use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
     unsafe {
         let mut data = APPBARDATA {
             cbSize: core::mem::size_of::<APPBARDATA>() as u32,
@@ -185,8 +185,15 @@ impl Surface {
             ..Default::default()
         };
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let bmp = g::CreateDIBSection(Some(hdc), &raw const info, g::DIB_RGB_COLORS, &mut bits, None, 0)
-            .ok()?;
+        let bmp = g::CreateDIBSection(
+            Some(hdc),
+            &raw const info,
+            g::DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        )
+        .ok()?;
         if bits.is_null() {
             return None;
         }
@@ -326,8 +333,7 @@ unsafe fn ensure_text_ctx() -> bool {
         }
         TEXT_TRIED.with(|t| t.set(true));
         let made = (|| -> windows::core::Result<TextCtx> {
-            let factory: ID2D1Factory =
-                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let props = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 pixelFormat: D2D1_PIXEL_FORMAT {
@@ -356,7 +362,8 @@ unsafe fn ensure_text_ctx() -> bool {
                 brush,
                 _factory: factory,
             })
-        })().ok();
+        })()
+        .ok();
         let ok = made.is_some();
         TEXT.with(|c| *c.borrow_mut() = made);
         crate::tracing_note(if ok {
@@ -399,15 +406,18 @@ unsafe fn dw_line(
             .ok()?;
         let family = wide(face);
         let locale = wide("zh-cn");
-        let fmt: IDWriteTextFormat = ctx.dwrite.CreateTextFormat(
-            windows::core::PCWSTR(family.as_ptr()),
-            None,
-            DWRITE_FONT_WEIGHT(400),
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            font_px as f32,
-            windows::core::PCWSTR(locale.as_ptr()),
-        ).ok()?;
+        let fmt: IDWriteTextFormat = ctx
+            .dwrite
+            .CreateTextFormat(
+                windows::core::PCWSTR(family.as_ptr()),
+                None,
+                DWRITE_FONT_WEIGHT(400),
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                font_px as f32,
+                windows::core::PCWSTR(locale.as_ptr()),
+            )
+            .ok()?;
         let _ = fmt.SetTextAlignment(if right {
             DWRITE_TEXT_ALIGNMENT_TRAILING
         } else {
@@ -481,8 +491,8 @@ unsafe fn draw_text_dw(
             };
             fr::overlay_text_coverage(card.buf(), mask.buf(), run.color);
             if let Some(sfx) = &run.suffix {
-                let sx = (run.rc.x + adv.round() as i32 + fr::px(1, scale))
-                    .min(run.rc.x + run.rc.w);
+                let sx =
+                    (run.rc.x + adv.round() as i32 + fr::px(1, scale)).min(run.rc.x + run.rc.w);
                 let srect = Rect {
                     x: sx,
                     y: run.rc.y,
@@ -545,10 +555,8 @@ unsafe fn draw_text_gdi(
             let mut text: Vec<u16> = run.text.encode_utf16().collect();
             let mut adv = SIZE::default();
             let _ = g::GetTextExtentPoint32W(hdc, &text, &mut adv);
-            let mut flags = g::DT_SINGLELINE.0
-                | g::DT_VCENTER.0
-                | g::DT_NOPREFIX.0
-                | g::DT_END_ELLIPSIS.0;
+            let mut flags =
+                g::DT_SINGLELINE.0 | g::DT_VCENTER.0 | g::DT_NOPREFIX.0 | g::DT_END_ELLIPSIS.0;
             if run.right {
                 flags |= g::DT_RIGHT.0;
             }
@@ -580,10 +588,7 @@ unsafe fn draw_text_gdi(
                 &mut text,
                 &raw mut rc,
                 g::DRAW_TEXT_FORMAT(
-                    g::DT_SINGLELINE.0
-                        | g::DT_VCENTER.0
-                        | g::DT_NOPREFIX.0
-                        | g::DT_END_ELLIPSIS.0,
+                    g::DT_SINGLELINE.0 | g::DT_VCENTER.0 | g::DT_NOPREFIX.0 | g::DT_END_ELLIPSIS.0,
                 ),
             );
             let _ = g::SelectObject(hdc, prev);
@@ -593,12 +598,7 @@ unsafe fn draw_text_gdi(
     }
 }
 
-unsafe fn make_font(
-    logical_px: i32,
-    scale: f64,
-    face: &str,
-    weight: i32,
-) -> Option<g::HFONT> {
+unsafe fn make_font(logical_px: i32, scale: f64, face: &str, weight: i32) -> Option<g::HFONT> {
     unsafe {
         let mut lf: g::LOGFONTW = std::mem::zeroed();
         // 负高度 = 按字符高度（不含内部 Leading），与 CSS font-size 同口径
@@ -631,9 +631,12 @@ unsafe fn repaint(hwnd: HWND) -> bool {
             .max(fr::MIN_W as f64) as i32;
         // 高度取「配置值」与「内容需要值」的大者：`metric=both` 多一行，
         // 而分层窗口没有滚动条 —— 画不下就是看不见。
-        let h_logical = fr::pill_height(cfg.get_float("floating", "height", DEFAULT_H), content.rows.len())
-            // 至少和任务栏一样高：两行内容 48 正好对齐 100% 下的任务栏。
-            .max(taskbar_height_logical(scale));
+        let h_logical = fr::pill_height(
+            cfg.get_float("floating", "height", DEFAULT_H),
+            content.rows.len(),
+        )
+        // 至少和任务栏一样高：两行内容 48 正好对齐 100% 下的任务栏。
+        .max(taskbar_height_logical(scale));
         let w = fr::px(cfg_w, scale).max(1);
         let h = fr::px(h_logical, scale).max(1);
 
@@ -853,7 +856,14 @@ fn nearest_monitor(px_x: i32, px_y: i32) -> Mon {
 }
 
 /// 存过的坐标该落在哪：物理落点 `(x, y)` 与逻辑锚点 top。
-fn landed_position(x: f64, y: f64, scale: f64, mon: &Mon, win_w: f64, win_h: f64) -> (i32, i32, i32) {
+fn landed_position(
+    x: f64,
+    y: f64,
+    scale: f64,
+    mon: &Mon,
+    win_w: f64,
+    win_h: f64,
+) -> (i32, i32, i32) {
     let (cx, cy) = fr::clamp_into_screen(
         x,
         y,
@@ -868,7 +878,11 @@ fn landed_position(x: f64, y: f64, scale: f64, mon: &Mon, win_w: f64, win_h: f64
     );
     // 逻辑像素取整再乘倍数：`x as i32` 那种截断会让 1.5 倍屏上的落点比夹取值少半像素。
     let anchor = cy.round() as i32;
-    (fr::px(cx.round() as i32, scale), fr::px(anchor, scale), anchor)
+    (
+        fr::px(cx.round() as i32, scale),
+        fr::px(anchor, scale),
+        anchor,
+    )
 }
 
 /// 内容长高之后，这张卡片的 top 该落在哪（物理像素）。
@@ -915,21 +929,23 @@ fn initial_position(scale: f64) -> (i32, i32, i32) {
     if x.is_nan() || y.is_nan() {
         let sw = unsafe { wm::GetSystemMetrics(wm::SM_CXSCREEN) }.max(1) as f64;
         (
-            fr::px(
-                (sw / scale - (DEFAULT_W + 16.0)).max(0.0) as i32,
-                scale,
-            ),
+            fr::px((sw / scale - (DEFAULT_W + 16.0)).max(0.0) as i32, scale),
             fr::px(60, scale),
             60,
         )
     } else {
         // 存过的坐标必须过一遍夹取：拔掉副屏再启动时那对数字可能整张落在屏幕之外，
         // 而卡片看不见就拖不到，界面上没有别的入口能把它召回来。
-        let mon = nearest_monitor(fr::px(x.round() as i32, scale), fr::px(y.round() as i32, scale));
+        let mon = nearest_monitor(
+            fr::px(x.round() as i32, scale),
+            fr::px(y.round() as i32, scale),
+        );
         let metric = fr::metric_from(&cfg.get("gui", "floating_metric"));
         let win_w = cfg.get_float("floating", "width", DEFAULT_W).max(40.0);
-        let win_h =
-            fr::pill_height(cfg.get_float("floating", "height", DEFAULT_H), fr::row_count(metric)) as f64;
+        let win_h = fr::pill_height(
+            cfg.get_float("floating", "height", DEFAULT_H),
+            fr::row_count(metric),
+        ) as f64;
         landed_position(x, y, scale, &mon, win_w, win_h)
     }
 }
@@ -955,7 +971,9 @@ fn pulled_position(cur_x: i32, cur_y: i32, want_x: i32, want_y: i32) -> (i32, i3
 /// 必须在拥有 `hwnd` 的那个线程上调用。
 unsafe fn ensure_visible_on_screen(hwnd: HWND) -> bool {
     unsafe {
-        let Some(rc) = get_rect(hwnd) else { return false };
+        let Some(rc) = get_rect(hwnd) else {
+            return false;
+        };
         let scale = scale_of(hwnd);
         let w = rc.right - rc.left;
         let h = rc.bottom - rc.top;
@@ -1066,7 +1084,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let main = MAIN_RAW.load(Ordering::SeqCst);
                 if main != 0 {
                     let target = HWND(main as *mut core::ffi::c_void);
-                    let _ = wm::PostMessageW(Some(target), crate::WM_SHOW_MAIN, WPARAM(0), LPARAM(0));
+                    let _ =
+                        wm::PostMessageW(Some(target), crate::WM_SHOW_MAIN, WPARAM(0), LPARAM(0));
                 }
                 LRESULT(0)
             }

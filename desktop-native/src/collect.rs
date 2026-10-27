@@ -198,9 +198,7 @@ pub fn start(cfg: &'static FocusFlowConfig) -> Result<(), String> {
     crate::tracing_note("采集已启动（键鼠监听 + 写线程 + 应用采样 + 设备侧信道）");
     if legacy_collector_running() {
         LEGACY.store(true, Ordering::Relaxed);
-        crate::tracing_note(
-            "注意：检测到旧版 FocusFlow.exe 还在跑，两个采集器同时写会让数字翻倍",
-        );
+        crate::tracing_note("注意：检测到旧版 FocusFlow.exe 还在跑，两个采集器同时写会让数字翻倍");
     }
     Ok(())
 }

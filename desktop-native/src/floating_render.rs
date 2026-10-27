@@ -49,11 +49,11 @@ pub const LIGHT: Palette = Palette {
 };
 
 pub const DARK: Palette = Palette {
-    card: Color::rgba(30, 35, 49, 232),      // rgba(30,35,49,.91)
-    border: Color::rgba(43, 50, 70, 242),    // rgba(43,50,70,.95)
-    fg: Color::rgba(232, 234, 238, 255),     // --fg #E8EAEE
-    muted: Color::rgba(138, 146, 166, 255),  // --muted #8A92A6
-    accent: Color::rgba(91, 156, 247, 255),  // --accent #5B9CF7
+    card: Color::rgba(30, 35, 49, 232),     // rgba(30,35,49,.91)
+    border: Color::rgba(43, 50, 70, 242),   // rgba(43,50,70,.95)
+    fg: Color::rgba(232, 234, 238, 255),    // --fg #E8EAEE
+    muted: Color::rgba(138, 146, 166, 255), // --muted #8A92A6
+    accent: Color::rgba(91, 156, 247, 255), // --accent #5B9CF7
 };
 
 pub fn palette_for(theme: &str) -> Palette {
@@ -508,7 +508,11 @@ mod tests {
         assert_eq!(pill_height(48.0, 2), 48, "默认配置正好容下两行");
         assert_eq!(pill_height(48.0, 3), 66, "both 的第三行");
         assert_eq!(pill_height(200.0, 2), 200, "人把卡片调大时就照他的");
-        assert_eq!(pill_height(f64::NAN, 2), 48, "配置读不出来也要有能看见的高度");
+        assert_eq!(
+            pill_height(f64::NAN, 2),
+            48,
+            "配置读不出来也要有能看见的高度"
+        );
     }
 
     /// 长高之后卡片该待在哪：往下够就不动，不够就整张往上让，收回来时回到**锚点**。
@@ -516,14 +520,26 @@ mod tests {
     fn a_taller_card_moves_up_only_when_the_bottom_edge_is_in_the_way() {
         let (top, bottom) = (0.0, 1080.0);
         assert_eq!(fit_top(60.0, 64.0, top, bottom), 60.0, "下方有空间就不动");
-        assert_eq!(fit_top(1031.0, 46.0, top, bottom), 1031.0, "贴底边放的是用户放的");
-        assert_eq!(fit_top(1031.0, 64.0, top, bottom), 1016.0, "越过底边 ⇒ 往上让 15");
+        assert_eq!(
+            fit_top(1031.0, 46.0, top, bottom),
+            1031.0,
+            "贴底边放的是用户放的"
+        );
+        assert_eq!(
+            fit_top(1031.0, 64.0, top, bottom),
+            1016.0,
+            "越过底边 ⇒ 往上让 15"
+        );
         assert_eq!(
             fit_top(1031.0, 46.0, top, bottom),
             1031.0,
             "收掉那一行必须回到锚点，不是停在让过的矩形上"
         );
-        assert_eq!(fit_top(30.0, 64.0, 0.0, 48.0), 0.0, "屏幕比卡片还矮就钉在顶上");
+        assert_eq!(
+            fit_top(30.0, 64.0, 0.0, 48.0),
+            0.0,
+            "屏幕比卡片还矮就钉在顶上"
+        );
     }
 
     #[test]
@@ -568,7 +584,10 @@ mod tests {
             .map(|(x, y)| rounded_rect_coverage(x, y, 104, 48, 8))
             .filter(|c| *c > 0 && *c < 255)
             .count();
-        assert!(partial >= 4, "角上至少要有一圈部分覆盖的像素，实得 {partial}");
+        assert!(
+            partial >= 4,
+            "角上至少要有一圈部分覆盖的像素，实得 {partial}"
+        );
         assert_eq!(rounded_rect_coverage(52, 24, 104, 48, 8), 255);
         assert_eq!(rounded_rect_coverage(0, 0, 104, 48, 8), 0);
     }

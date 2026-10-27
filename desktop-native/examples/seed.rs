@@ -61,9 +61,24 @@ fn main() {
     // 设备维度：P1b 的行内改名要有设备行可点。
     if let Some(w) = db.writer() {
         let devices: [(&str, &str, &str, u32); 3] = [
-            ("HID\\VID_046D&PID_C52B&MI_00", "罗技 G304 鼠标", "mouse", 320),
-            ("HID\\VID_046D&PID_C31C&MI_00", "HID Keyboard Device", "keyboard", 260),
-            ("HID\\VID_1532&PID_0266&MI_00", "雷蛇黑寡妇", "keyboard", 140),
+            (
+                "HID\\VID_046D&PID_C52B&MI_00",
+                "罗技 G304 鼠标",
+                "mouse",
+                320,
+            ),
+            (
+                "HID\\VID_046D&PID_C31C&MI_00",
+                "HID Keyboard Device",
+                "keyboard",
+                260,
+            ),
+            (
+                "HID\\VID_1532&PID_0266&MI_00",
+                "雷蛇黑寡妇",
+                "keyboard",
+                140,
+            ),
         ];
         for (key, name, kind, n) in devices {
             for _ in 0..n {

@@ -10,7 +10,7 @@
 //! - 图标：定这条路时这台机器**确实没装 Windows SDK**（找不到 `rc.exe`），而 `winres` /
 //!   `embed-resource` 都要靠 `rc.exe`/`windres`，于是照规范手写一份 .res（每条资源 = 两个 DWORD
 //!   + 头部 + 原始数据），直接喂给 `link.exe`。现在 SDK 装了（见下面 `find_rc_exe`），但这 40 行
-//!   实测可用，没有为"统一走法"去重写它的理由。
+//!     实测可用，没有为"统一走法"去重写它的理由。
 //! - 版本信息：先按图标那条老路子手写过一份，字节布局跟**能读出来的**金标准逐字节对上了
 //!   `GetFileVersionInfo` 仍返回空（差的是资源树的形状）⇒ 改让 `rc.exe` 生成。
 
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 /// 规范里 HeaderSize **包含**最前面那两个 DWORD（DataSize / HeaderSize 自己）：
 /// DataSize 4 + HeaderSize 4 + type 4 + name 4 + DataVersion 4 + MemoryFlags 2
 /// + LanguageId 2 + Version 4 + Characteristics 4 = 32。
-/// 写 24（只算后半段）时 link.exe 报 LNK1136: invalid or corrupt file。
+///   写 24（只算后半段）时 link.exe 报 LNK1136: invalid or corrupt file。
 const RES_HEADER_SIZE: u32 = 32;
 const RT_ICON: u16 = 3;
 const RT_GROUP_ICON: u16 = 14;
@@ -39,7 +39,7 @@ fn push_resource(out: &mut Vec<u8>, ty: u16, id: u16, data: &[u8], memory_flags:
     out.extend_from_slice(&0u32.to_le_bytes()); // Version
     out.extend_from_slice(&0u32.to_le_bytes()); // Characteristics
     out.extend_from_slice(data);
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }
@@ -193,9 +193,10 @@ fn embed_version(manifest_dir: &Path, version_text: &str) -> Vec<u8> {
     let rc_path = out_dir.join("focusflow_version.rc");
     let res_path = out_dir.join("focusflow_version.res");
     let exe_name = format!("{}.exe", bin_name(manifest_dir));
-    if let Err(e) =
-        std::fs::write(&rc_path, version_rc(version_text, &exe_name, version_parts(version_text)))
-    {
+    if let Err(e) = std::fs::write(
+        &rc_path,
+        version_rc(version_text, &exe_name, version_parts(version_text)),
+    ) {
         println!("cargo:warning=写 {} 失败：{e}", rc_path.display());
         return Vec::new();
     }
@@ -224,7 +225,11 @@ fn embed_version(manifest_dir: &Path, version_text: &str) -> Vec<u8> {
     };
     // rc.exe 也照惯例以一条 32 字节的"空记录"开头 —— 我们那份已经有了，重复一条留给链接器判断没意义。
     if built.len() <= 32 {
-        println!("cargo:warning={} 短得不像一份 .res（{} 字节）", res_path.display(), built.len());
+        println!(
+            "cargo:warning={} 短得不像一份 .res（{} 字节）",
+            res_path.display(),
+            built.len()
+        );
         return Vec::new();
     }
     built[32..].to_vec()
