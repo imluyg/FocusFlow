@@ -2227,13 +2227,19 @@ unsafe extern "system" fn text_edit_proc(
                 LRESULT(0)
             }
             WM_KILLFOCUS => {
-                if let Ok(parent) = GetParent(hwnd) {
-                    let _ = PostMessageW(
-                        Some(parent),
-                        WM_EDIT_DONE,
-                        WPARAM(1),
-                        LPARAM(hwnd.0 as isize),
-                    );
+                // 只有**打过字**的失焦才当提交。空框的失焦不提交也不销毁：
+                // 隔壁那颗行内重命名的 EDIT 实测过"刚建出来就收到一次假 WM_KILLFOCUS"
+                // （main.rs 里那条注释，2026-10-26），照这里无条件收就会把刚点开的输入框
+                // 当场毁掉——症状是"文字工具点了没框"。真要把空框丢掉，用 Esc。
+                if GetWindowTextLengthW(hwnd) > 0 {
+                    if let Ok(parent) = GetParent(hwnd) {
+                        let _ = PostMessageW(
+                            Some(parent),
+                            WM_EDIT_DONE,
+                            WPARAM(1),
+                            LPARAM(hwnd.0 as isize),
+                        );
+                    }
                 }
                 LRESULT(0)
             }
@@ -3407,6 +3413,39 @@ mod render_probe {
             assert!(committed, "输入框失焦没把那一行字落成一笔");
             let edit_after = SNIP.lock().map(|s| s.text_edit).unwrap_or(-1);
             assert_eq!(edit_after, 0, "落完字之后输入框还挂在状态里");
+
+            // 空框的失焦不许把它毁掉（隔壁那颗行内编辑实测过"刚建好就收到一次假 KILLFOCUS"）：
+            // 再点开一个不写字，把焦点挪走，框必须还在、也不许多出一笔。
+            let n_before_empty = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
+            post_mouse(ov, WM_LBUTTONDOWN, cur.0 + 150, cur.1 + 150);
+            pump(200);
+            let empty_edit = SNIP.lock().map(|s| s.text_edit).unwrap_or(0);
+            assert_ne!(empty_edit, 0, "第二个输入框没开出来");
+            let _ = SetFocus(Some(ov));
+            pump(250);
+            assert!(
+                SNIP.lock().map(|s| s.text_edit).unwrap_or(0) != 0,
+                "空输入框被一次失焦毁掉了（症状＝文字工具点了没框）"
+            );
+            assert_eq!(
+                SNIP.lock().map(|s| s.marks.len()).unwrap_or(0),
+                n_before_empty,
+                "空框失焦却多落了一笔"
+            );
+            // 收尾：Esc 把这一个空框丢掉，别把框留到后面的判据里
+            let esc = SNIP.lock().map(|s| s.text_edit).unwrap_or(0);
+            let _ = PostMessageW(
+                Some(HWND(esc as *mut core::ffi::c_void)),
+                WM_KEYDOWN,
+                WPARAM(0x1B),
+                LPARAM(0),
+            );
+            pump(200);
+            assert_eq!(
+                SNIP.lock().map(|s| s.text_edit).unwrap_or(-1),
+                0,
+                "Esc 没丢掉那个空框"
+            );
 
             // 出图没成的那句必须**真画在屏上**：覆盖层为它不退，只在日志里出声等于没出声。
             // 这条是"病状腿 + 对照腿"一对——把原因抹掉之后那一片必须不红，
