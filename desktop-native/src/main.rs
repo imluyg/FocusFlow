@@ -1561,7 +1561,11 @@ impl App {
                         SItem::Action(a) => self.run_action(hwnd, a),
                         SItem::Basic(Basic::Autostart) => self.toggle_autostart(hwnd),
                         SItem::Basic(Basic::Hotkey) => self.toggle_hotkey(hwnd),
-                        SItem::Basic(Basic::Snip) => snip::start(hwnd, true),
+                        SItem::Basic(b @ (Basic::Snip | Basic::SnipQuick)) => {
+                            if let Some(annotate) = snip_mode_of(b) {
+                                snip::start(hwnd, annotate);
+                            }
+                        }
                         SItem::Basic(Basic::ClosePins) => self.close_pins(hwnd),
                         SItem::Basic(Basic::WeeklyReport) => self.make_weekly_report(hwnd),
                         SItem::Basic(Basic::Floating) => {
@@ -2777,6 +2781,7 @@ enum Basic {
     Pause,
     Hotkey,
     Snip,
+    SnipQuick,
     ClosePins,
     Floating,
     Theme,
@@ -2790,7 +2795,8 @@ fn basic_label(b: Basic) -> &'static str {
         Basic::Collector => "采集",
         Basic::Pause => "暂停采集",
         Basic::Hotkey => "全局热键",
-        Basic::Snip => "区域截图",
+        Basic::Snip => "区域截图（进标注）",
+        Basic::SnipQuick => "区域截图（松手即存）",
         Basic::ClosePins => "关掉所有贴图",
         Basic::Floating => "悬浮窗",
         Basic::Theme => "主题",
@@ -2812,12 +2818,40 @@ const SETTINGS_CATS: [(&str, &str); 6] = [
 fn basic_cat(b: Basic) -> usize {
     match b {
         Basic::Autostart | Basic::Collector | Basic::Pause | Basic::Theme => 0,
-        Basic::Hotkey | Basic::Snip | Basic::ClosePins => 1,
+        Basic::Hotkey | Basic::Snip | Basic::SnipQuick | Basic::ClosePins => 1,
         Basic::Floating => 2,
         Basic::WeeklyReport => 3,
         Basic::DataDir => 4,
     }
 }
+
+/// 设置页里哪几行是截图入口、各开哪一档（真 = 选区后进标注窗，假 = 松手即存）。
+/// 旧 Webview 版这两颗都在页上，换原生时只剩标注那颗。点下去的分支读这张表，
+/// 为的是"哪一行开哪一档"有用例可判——写在 wndproc 里时，把两颗都改成同一档，
+/// 现有腿一条都不会红。
+fn snip_mode_of(b: Basic) -> Option<bool> {
+    match b {
+        Basic::Snip => Some(true),
+        Basic::SnipQuick => Some(false),
+        _ => None,
+    }
+}
+
+/// 设置页上"按钮型"的行，按显示顺序。漏在这一张表里的变体不会出现在屏上，
+/// 而画它的分支、点它的分支照旧编得过——所以这两张表各由一条用例钉着。
+const BASIC_ROWS: [Basic; 11] = [
+    Basic::Autostart,
+    Basic::Collector,
+    Basic::Pause,
+    Basic::Theme,
+    Basic::Hotkey,
+    Basic::Snip,
+    Basic::SnipQuick,
+    Basic::ClosePins,
+    Basic::Floating,
+    Basic::DataDir,
+    Basic::WeeklyReport,
+];
 
 fn setting_cat(section: &str) -> usize {
     match section {
@@ -2843,18 +2877,7 @@ fn settings_items(snap: &Snapshot, filter: &str, cat: usize) -> Vec<SItem> {
     let f = filter.trim().to_lowercase();
     let searching = !f.is_empty();
     let mut out = Vec::new();
-    for b in [
-        Basic::Autostart,
-        Basic::Collector,
-        Basic::Pause,
-        Basic::Theme,
-        Basic::Hotkey,
-        Basic::Snip,
-        Basic::ClosePins,
-        Basic::Floating,
-        Basic::DataDir,
-        Basic::WeeklyReport,
-    ] {
+    for b in BASIC_ROWS {
         if !searching && basic_cat(b) != cat {
             continue;
         }
@@ -3223,12 +3246,22 @@ fn draw_settings(
                     }
                     Basic::Snip => {
                         p.round(vb, 6.0, &p.br.accent, None);
-                        p.text("截图…", vb, &p.fmt.center_small, &p.br.white);
-                        let snip = snap_setting(snap, "hotkey", "snip");
+                        p.text("进标注", vb, &p.fmt.center_small, &p.br.white);
                         let annotate = snap_setting(snap, "hotkey", "snip_annotate");
                         p.text(
+                            &format!("这颗按钮立刻开标注场，等价于按热键 {annotate}；框好之后 Enter 或 Ctrl+S 出图"),
+                            rect(r.left + 12.0, y + 21.0, 640.0, 15.0),
+                            &p.fmt.small,
+                            &p.br.muted,
+                        );
+                    }
+                    Basic::SnipQuick => {
+                        p.round(vb, 6.0, &p.br.accent, None);
+                        p.text("松手即存", vb, &p.fmt.center_small, &p.br.white);
+                        let snip = snap_setting(snap, "hotkey", "snip");
+                        p.text(
                             &format!(
-                                "这颗按钮 = 标注版；按 {snip} 松手即存、按 {annotate} 进标注窗；PNG 存 data/screenshots 并复制到剪贴板"
+                                "这颗按钮不进标注，等价于按热键 {snip}；PNG 存 data/screenshots 并复制到剪贴板"
                             ),
                             rect(r.left + 12.0, y + 21.0, 640.0, 15.0),
                             &p.fmt.small,
@@ -8802,6 +8835,65 @@ mod hotkey_line_tests {
         assert!(!status_is_warning(
             "数据目录已搬到 E 盘（12 个文件 / 旧目录剩 0 项）"
         ));
+    }
+}
+
+/// 设置页上"区域截图"的两颗入口。旧 Webview 版有"立即截图 / 立即标注截图"两颗，
+/// 换原生时只剩标注那颗。这两条用例判的是"行在不在屏上、各开哪一档"。
+#[cfg(test)]
+mod snip_entry_tests {
+    use super::{basic_cat, basic_label, snip_mode_of, Basic, BASIC_ROWS, SETTINGS_CATS};
+
+    /// 两颗各开一档，且只有这两颗是截图入口。
+    #[test]
+    fn two_snip_entries_open_different_modes() {
+        assert_eq!(
+            snip_mode_of(Basic::Snip),
+            Some(true),
+            "标注那颗开成了松手即存"
+        );
+        assert_eq!(
+            snip_mode_of(Basic::SnipQuick),
+            Some(false),
+            "松手那颗开成了标注"
+        );
+        // 别的行都不许是截图入口：否则一颗普通开关点下去会把全屏覆盖层弹出来。
+        for b in BASIC_ROWS {
+            if matches!(b, Basic::Snip | Basic::SnipQuick) {
+                continue;
+            }
+            assert_eq!(snip_mode_of(b), None, "{} 不该是截图入口", basic_label(b));
+        }
+    }
+
+    /// 加了变体、画它的分支和点它的分支都写了，唯独没排进 `BASIC_ROWS`——屏上就没有这颗按钮，
+    /// 而编译器一声不吭。这一条把"屏上的行"与"截图入口"对齐。
+    #[test]
+    fn both_snip_entries_are_rows_on_the_settings_page() {
+        for b in [Basic::Snip, Basic::SnipQuick] {
+            assert!(
+                BASIC_ROWS.contains(&b),
+                "{} 没排进设置页的行表",
+                basic_label(b)
+            );
+            let cat = basic_cat(b);
+            assert_eq!(cat, basic_cat(Basic::Hotkey), "两颗入口不在同一分类");
+            assert!(
+                SETTINGS_CATS[cat].0.contains("截图"),
+                "它们挂在「{}」这一类，用户不会去那儿找截图",
+                SETTINGS_CATS[cat].0
+            );
+            assert!(
+                basic_label(b).contains("截图"),
+                "搜索框按「截图」找不到：{}",
+                basic_label(b)
+            );
+        }
+        assert_ne!(
+            basic_label(Basic::Snip),
+            basic_label(Basic::SnipQuick),
+            "两行长得一模一样，屏上分不出点哪颗"
+        );
     }
 }
 
