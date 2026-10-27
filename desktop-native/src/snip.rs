@@ -2447,6 +2447,17 @@ unsafe fn paint(hwnd: HWND) {
             };
             draw_chip(hdc, sel.0, ny, &msg, rgb(255, 60, 60));
         }
+        // 还没拖、也还没定选区时把这一场的用法写在屏上（旧 Webview 版有这么一行，重写时丢了）：
+        // 覆盖层吃掉整个屏幕，人要的是"接下来能干什么"，不是去翻日志。
+        if phase == Phase::Select && drag.is_none() {
+            draw_chip(
+                hdc,
+                24,
+                12,
+                "拖框选区 · 单击选窗口 · 右键或 Esc 取消 · 定下后可用方向键挪 1 像素",
+                0x00FF_FFFF,
+            );
+        }
         let _ = EndPaint(hwnd, &ps);
     }
 }
@@ -2919,9 +2930,44 @@ mod render_probe {
             if let Ok(mut s) = SNIP.lock() {
                 s.base = base.clone();
                 s.dim = dim.clone();
+                // 那条提示腿要靠"背景是压暗的一份"才数得出白字：start() 已经按真实光标算出
+                // 一个 hover（常常就是整块屏那层窗口），亮区盖住哪里，哪里就不再是压暗值。
+                // 悬停那一条下面会自己把候选与 hover 重新设回来。
+                s.hits.clear();
+                s.hover = None;
             }
             let _ = InvalidateRect(Some(ov), None, false);
             pump(200);
+
+            // 屏上那行用法提示（旧版有、重写时丢过一次）：Select 阶段左上角那条带里必须有白字。
+            // 数像素而不是数颜色种类——压暗层本来就是一片接近黑的深色。
+            let shot_hint = print_window(ov).expect("带提示的那一张没拿到");
+            let mut hint_px = 0;
+            for y in 14..34 {
+                for x in 26..360 {
+                    let p = pixel3(&shot_hint.0, shot_hint.1, x, y);
+                    if p[0] > 170 && p[1] > 170 && p[2] > 170 {
+                        hint_px += 1;
+                    }
+                }
+            }
+            // 对照腿：屏幕右上角同一高度那条带里必须一个白字都没有。
+            // 没有这一头，"数到白像素"可能数的根本不是提示——实测 hover 没清干净时
+            // 整块屏都走亮区，白像素 226 个照样"通过"，就是这条对照腿把它揭出来的。
+            let mut control_px = 0;
+            for y in 14..34 {
+                for x in (shot_hint.1 - 340)..(shot_hint.1 - 40) {
+                    let p = pixel3(&shot_hint.0, shot_hint.1, x, y);
+                    if p[0] > 170 && p[1] > 170 && p[2] > 170 {
+                        control_px += 1;
+                    }
+                }
+            }
+            assert_eq!(control_px, 0, "右上角那条带不该有白字：亮区没被选区夹住");
+            assert!(
+                hint_px > 20,
+                "左上角那行用法提示没画出来（白像素 {hint_px}）"
+            );
 
             // 悬停预览：塞一条"别人进程"的候选进去，鼠标移到它身上就该亮。
             // 走的是产品自己的 `hover_at`（不是直接把亮区写进状态），所以命中/换算/夹边都被判到。
