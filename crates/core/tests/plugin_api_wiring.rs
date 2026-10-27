@@ -1,6 +1,7 @@
 //! 接线审计：内置插件写的每一个 `focusflow.xxx`，宿主必须真的注册着。
 //!
-//! 家族同 `desktop/src/lib.rs` 里的窗口 / capabilities / 事件名审计：名字改一处，
+//! 家族同旧桌面端入口里那份"窗口 / capabilities / 事件名"对齐审计（那棵树已随 WebView 删了，
+//! 现在这条审计是这一族仅剩的一份）：名字改一处，
 //! 另一处不会红，表现是"按钮点下去没反应""面板空白"—— mlua 报
 //! `attempt to call a nil value`，而 manager 只在 `init()` / `get_view()` 真跑到那句时
 //! 才出声（宿主 API 名散在 5 个 `.lua` 与 `host.rs` 两处，人手对齐迟早会漏）。

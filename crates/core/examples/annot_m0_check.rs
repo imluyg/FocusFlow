@@ -163,7 +163,7 @@ fn main() {
         exit(1);
     }
 
-    // 3) 合成到裁剪后的 BGRA 上（等价于 snip.rs:612 之后、617 之前那一步）
+    // 3) 合成到裁剪后的 BGRA 上（旧覆盖层里"取到画面之后、落盘之前"那一步）
     let shot = Shot::new(mon, noise_bgra(mon.width, mon.height)).unwrap();
     let cropped = shot
         .crop(sp.x as u32, sp.y as u32, sp.width, sp.height)
@@ -174,7 +174,8 @@ fn main() {
         println!("RESULT::M0_DONE fails=1");
         exit(1);
     }
-    // 落盘那张：与 snip.rs 完全同一步（clone → bgra_to_rgba → encode_png）
+    // 落盘那张：与 core 这份等价步骤同一条（clone → bgra_to_rgba → encode_png）；
+    // 原生端落盘走自己的 save_png，交出的字节同样是 RGBA 8bit
     let mut encoded = dst.clone();
     capture::bgra_to_rgba(&mut encoded);
     let out_png = capture::encode_png(&encoded, sp.width, sp.height).unwrap();

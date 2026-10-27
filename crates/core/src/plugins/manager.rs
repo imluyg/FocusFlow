@@ -4,6 +4,10 @@
 //! 同一线程（GUI 主线程）执行。`PluginManager` 不跨线程共享，直接在
 //! GUI 线程持有。热重载检测线程只扫描文件并发送"重载请求"到 channel，
 //! 由 GUI 线程调用 `poll_reload_requests()` 实际执行重载。
+//!
+//! ⚠ 这半条链今天**没人在生产里跑**：调用方原是旧桌面端的那条热重载，它随 WebView 一起
+//! 删了，原生端没有接（`desktop-native/src/main.rs` 只在面板刷新时重扫目录）。后果是改
+//! `.lua` 要重启才生效、删掉 `.lua` 也要重启才停 —— 现在只有 core 的用例在跑这条路径。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -495,8 +499,8 @@ impl PluginManager {
     /// 空清单从此只有一种含义：这个目录读全了、里面确实没有 .lua。以前是
     /// `.unwrap_or_default()`：`plugins` 被建成同名文件、整份放在断线的网盘上、或替换目录
     /// 的那一刻，插件页显示「暂无插件」而 5 个插件都还在盘上，日志里一个字都没有；
-    /// 点启用还会得到一句假原因「插件文件不存在」。桌面侧那份扫描早就区分了这两件事
-    /// （见 desktop/src/plugins.rs 的读失败处理），这一头只补了一行日志、结论照样是空的
+    /// 点启用还会得到一句假原因「插件文件不存在」。旧桌面端那份扫描早就区分了这两件事
+    /// （那一侧随 WebView 删了），这一头只补了一行日志、结论照样是空的
     /// —— 注释声称"已经分开"，实际没有。
     pub fn discover(&self) -> Result<Vec<PathBuf>, String> {
         let dir = self.plugins_dir();
@@ -515,7 +519,8 @@ impl PluginManager {
     ///
     /// **判据必须与 `read_meta` 的实际口径一致**（扫出来的名字 = 加载后的名字），
     /// 否则插件管理页会拿一个假名字当键用：那页的「打开」按钮传的就是列表里的
-    /// `p.name`（见 `desktop/ui/js/plugins.js` 的 `open-plugin`），名字对不上
+    /// `p.name`（原生端同一条路：`desktop-native/src/main.rs` 拿这一行的名字点
+    /// `open_plugin_view`），名字对不上
     /// 就是点一次报一次「插件未提供视图」。所以要挡掉两类假命中：
     /// `--[[ ]]` 块注释里被注释掉的旧值、函数体里缩进的同名局部赋值。
     /// 规则写在 [`top_level_string_assign`] 与 [`strip_lua_non_code`] 里：
@@ -841,8 +846,9 @@ impl PluginManager {
     /// 现在失败路径**一个字都不动**旧实例：重载失败 = 什么都没发生（插件页多一条
     /// 加载失败原因，见 `try_load`），下一次存盘成功再换上来。
     pub fn reload_plugin(&mut self, key: &str) -> bool {
-        // 先按文件名（stem）、再按展示名。生产里唯一的调用方是热重载
-        // （`desktop/src/plugins.rs::reload_plugin_by_key`，它发的是"改了的那个文件名"），
+        // 先按文件名（stem）、再按展示名。它原先生产里唯一的调用方是旧桌面端的热重载
+        // （`reload_plugin_by_key`，发的是"改了的那个文件名"；那一侧随 WebView 删了，
+        // 原生端到今天还没接这条线 ⇒ 现在只有测试在调它），
         // 而表是以展示名为键的 ⇒ 旧顺序先查展示名会在重名时把**另一个**插件顶上来：
         // 文件 `beta.lua` 变更 → key="beta"，若 `alpha.lua` 的 PLUGIN_NAME 正好叫「beta」，
         // 命中的是 alpha：没改过的被重载、改过的继续跑旧代码，而日志写着"插件已热重载: beta"，
@@ -976,8 +982,8 @@ impl PluginManager {
     ///
     /// 删除这条在 core 这边原先是**检测到也没人处理**的：`reload_plugin` 按名字找不
     /// 到实例就返回 false，于是"删掉 .lua"要等下次重启才生效，而删除表达的恰恰是
-    /// 「别再跑它了」（它的 cleanup 也就一直不执行）。桌面侧早就按这个口径做了，
-    /// 见 `desktop/src/plugins.rs` 的 `reload_plugin_by_key`。
+    /// 「别再跑它了」（它的 cleanup 也就一直不执行）。旧桌面端早就按这个口径做了
+    /// （那条 `reload_plugin_by_key` 随 WebView 一起删了；原生端到今天还没接这条线）。
     pub fn poll_reload_requests(&mut self) -> Vec<String> {
         let mut reloaded = Vec::new();
         let dir = self.plugins_dir();
@@ -1247,7 +1253,7 @@ fn is_limit_error(e: &mlua::Error) -> bool {
 /// 热重载检测循环：扫描插件目录 mtime，变更时发送重载请求。
 /// 不执行 Lua（Lua 非 Send，只能在 GUI 线程）。
 ///
-/// 三条保护是照桌面侧那份（`desktop/src/plugins.rs::start_hot_reload`）补的 ——
+/// 三条保护是照旧桌面端那份热重载（`start_hot_reload`，已随 WebView 删掉）补的 ——
 /// 那三条都是那边先踩过、写过注释才定下来的：
 /// 1. 目录整体没读出来时**既不比对、也不清基线**（见 [`scan_plugin_mtimes`]）；
 /// 2. **文件消失**也要发请求（见 [`reload_requests`]），否则删掉的插件要重启才停；
@@ -2075,7 +2081,8 @@ end
     /// 顶层长字符串里的那一行，都不许赢过真声明。
     ///
     /// 扫错的代价写在 `scan_meta` 上：插件管理页的「打开」按钮传的就是这里扫出来的
-    /// 名字（`desktop/ui/js/plugins.js` 的 `open-plugin`），名字对不上就是点一次
+    /// 名字（原生端同样是这一份名字，见 `desktop-native/src/main.rs` 的 `open_plugin_view`），
+    /// 名字对不上就是点一次
     /// 报一次「插件未提供视图」；旧实现"取第一条匹配行"，只要注释那行带缩进就先命中。
     #[test]
     fn scan_meta_only_takes_top_level_assignments() {

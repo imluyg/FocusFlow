@@ -28,9 +28,9 @@ static YEARS_CACHE: std::sync::OnceLock<YearsCache> = std::sync::OnceLock::new()
 
 /// 查询天数上限（约 100 年）。
 ///
-/// 所有进入日期运算的天数都必须先经过 [`clamp_query_days`]：周期值来自
-/// 配置（`gui.default_period`，用户可手改）、IPC（`set_period`）与 Lua 插件
-/// （`focusflow.stats`），不设上界时 `NaiveDate - Days` 越界会 panic。
+/// 所有进入日期运算的天数都必须先经过 [`clamp_query_days`]：周期值是外部输入，今天从界面
+/// 自己那几档与 Lua 插件（`focusflow.stats`）两处交进来（旧前端的 `set_period` 与
+/// `gui.default_period` 现在都没有读点了），不设上界时 `NaiveDate - Days` 越界会 panic。
 pub const MAX_QUERY_DAYS: i64 = 36_500;
 
 /// 把外部传入的天数收敛到可安全参与日期运算的区间 `1..=MAX_QUERY_DAYS`。
@@ -42,14 +42,15 @@ pub fn clamp_query_days(days: i64) -> i64 {
 ///
 /// 一句 gap 长这样：`{哪一年} 年库{域名}读不出来: {原因}`。四个读数出口各自填自己的域名
 /// （三个榜走 `gather_rank_totals`、设备走 `gather_device_totals`、时间窗口走
-/// `read_window_years`、单日小时走 `hourly_stats_totals`），消费侧再按域名把那句挑到
-/// 对应的栏位：面板是 `desktop/ui/js/views.js` 的 `gapNote(s, "域名")`，周报是
-/// `desktop/src/export.rs` 逐日那四趟。
+/// `read_window_years`、单日小时走 `hourly_stats_totals`）。消费侧今天这么用它：周报把攒到的
+/// gap 逐条列进正文（`desktop-native/src/main.rs` 的 `generate_weekly_report`），主窗口只在
+/// 页脚报"有 N 个年度库没读上"，**不按域名分栏**。
 ///
-/// 域名只许从这里取：`desktop/src/state.rs` 的
-/// `the_domain_list_is_the_single_source_for_every_side` 按这份清单逐条比三处
-/// （core 生产半边不许再抄一份字面量、清单上每个名字都要有人点、面板与周报都不许自创名字）。
-/// 加一栏时只改一处的后果就是界面那一栏对着空榜说"暂无数据"，而这正是这一族最初的症状。
+/// 旧 WebView 前端是按域名挑栏位的（那句 `gapNote(s, "域名")`），而且当时有一条跨文件判据
+/// `the_domain_list_is_the_single_source_for_every_side` 按这份清单逐条比三处（core 生产半边
+/// 不许再抄一份字面量、清单上每个名字都要有人点、面板与周报都不许自创名字）。那一屏与那条
+/// 判据都随前端一起删了 ⇒ 现在加域名不会红，只会多出一句没人认领的 gap。当年那条判据要防
+/// 的症状仍然成立：加一栏时只改一处，界面那一栏就对着空榜说"暂无数据"。
 pub const DOMAIN_KEYS: &str = "按键统计";
 /// 前台应用时长榜。
 pub const DOMAIN_APPS: &str = "应用时长";
@@ -62,10 +63,10 @@ pub const DOMAIN_HOURLY: &str = "每小时分布";
 /// 某一天的 24 格（周报的时段直方图那一问，与上面那把窗口尺子是两件事）。
 pub const DOMAIN_DAY_HOURS: &str = "当日小时分布";
 
-/// 上面六条的一份清单，跨文件判据按它逐条走。
+/// 上面六条的一份清单，跨文件判据本该按它逐条走。
 ///
-/// 新增域名时必须同时登记到这里 —— 漏了登记，判据会红在"core 里多出一个没人认领的
-/// `pub const DOMAIN_*`"那一句。
+/// 新增域名时要让它被认出来，就得同时登记到这里 —— 这条**目前没有判据守着**（那条比对随
+/// 旧前端一起删了）：漏登记不会红，只会让这个域名永远没人念。
 pub const READ_DOMAINS: &[&str] = &[
     DOMAIN_KEYS,
     DOMAIN_APPS,
@@ -75,10 +76,11 @@ pub const READ_DOMAINS: &[&str] = &[
     DOMAIN_DAY_HOURS,
 ];
 
-/// 其中面板真的有一栏来接的那几条（`gapNote` 逐条要有对应的调用）。
+/// 旧面板"真有一栏来接"的那几条（当年 `gapNote` 逐条都有对应的调用）。
 ///
-/// 不在这一份里的域名（当日小时分布）只有周报会念：面板上没有"某一天几点"那一栏，
-/// 硬要求它也有个 gap 牌子就会造出一个永远为真的空位。
+/// 原生面板只报条数、不按域名分栏 ⇒ 这份子清单**暂时没有读点**，留着是因为接回那一栏时，
+/// "该接哪几栏"的答案在这里。不在这一份里的域名（当日小时分布）只有周报会念：面板上本来
+/// 就没有"某一天几点"那一栏，硬要求它也有个 gap 牌子就会造出一个永远为真的空位。
 pub const PANEL_READ_DOMAINS: &[&str] = &[
     DOMAIN_KEYS,
     DOMAIN_APPS,
@@ -89,7 +91,7 @@ pub const PANEL_READ_DOMAINS: &[&str] = &[
 
 /// 统计周期取值是否合法：-1=今日 / 0=总计 / 1..=MAX_QUERY_DAYS 天。
 ///
-/// 周期值来自前端 IPC 与 `gui.default_period`（用户可手改），必须在入口拦截：
+/// 周期值必须在入口拦截，今天真走这条校验的是 CLI 的周期参数（`crates/cli/src/main.rs`）：
 /// 此前任意负值（如 -2）会在 `NaiveDate - Days` 处 panic，release 下
 /// `panic = "abort"`，且默认周期每次启动都会重聚合 —— 应用会永久无法启动。
 pub fn is_valid_period(period: i64) -> bool {
@@ -230,10 +232,10 @@ fn unopenable_years(years: &[i32]) -> Vec<i32> {
 ///
 /// 这把尺子原先只有 CLI 有（`crates/cli/src/main.rs`），而 `available_years()` 把
 /// `read_dir` 失败折成空列表、`stats_multi_year` 把打不开的那一年**静默跳过**，
-/// 所以"读不到"在两个读侧函数里都不会留下任何痕迹。桌面端的导出是第三个读点，
+/// 所以"读不到"在两个读侧函数里都不会留下任何痕迹。旧桌面端的导出是第三个读点，
 /// 它原先直接 `get_stats(None, None)` 就写文件 —— 移动盘没插、或某年的库被同步盘
 /// 换成占位文件时，用户拿到一份"总活跃次数 0"或明显偏小的报告，界面还报绿色成功
-/// （`desktop/src/export.rs` 的模块头当时写着"逻辑与 CLI 版一致"，那正是没对上的地方）。
+/// （那份导出的模块头当时写着"逻辑与 CLI 版一致"，那正是没对上的地方）。
 ///
 /// 返回值里的 `Vec<i32>` 就是 `try_available_years()` 那份列表，调用方可以省一次枚举。
 pub fn check_years_readable() -> anyhow::Result<Vec<i32>> {
@@ -3844,7 +3846,8 @@ mod tests {
     /// 仍在 i64 范围内，那个说法在这条 i64 键运算上不成立，收回）。真正的问题是
     /// 那一档等于"没有下界"：不夹的写法会把 1900 年的行也算进"近 N 天"。
     ///
-    /// `period` 是外部输入：`desktop/src/commands.rs::get_device_detail` 这一条
+    /// `period` 是外部输入：现在把它交下来的是原生端的设备详情弹窗
+    /// （`desktop-native/src/main.rs` 直接点 `get_device_detail`），这一条
     /// 不过 `is_valid_period`（对比同一个文件里的统计视图那条）。
     ///
     /// 已有的 `device_detail_period_cannot_underflow` 只测纯函数那一份，
@@ -4240,7 +4243,8 @@ mod tests {
             gap.contains(&year.to_string()),
             "gap 要带年份，不然用户不知道该拿哪个库怎么办，实得 {gap}"
         );
-        // 前端按域名过滤这三个串（views.js `gapNote`），应用时长那一栏走同一条合并路径
+        // 这三串都要能被消费侧认出域名（旧前端按域名挑栏位，现在周报把它们逐条列进正文），
+        // 应用时长那一栏走同一条合并路径
         let apps_broken = app_stats_totals(None, Some(year));
         assert!(
             apps_broken

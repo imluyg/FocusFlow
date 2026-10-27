@@ -1005,8 +1005,9 @@ fn parse_hhmm(s: &str) -> Option<i64> {
 /// `"-0:00"` 一路通过校验、存进库、被判成 00:00 —— 而 daily 的判据是
 /// `now_min >= target_min`，"非法时间"就又变成"任何时刻都该跑"，任务落库后
 /// 30 秒内启动目标程序（`parse_hhmm` 头那段防的是同一件事，只是从符号这个门进来）。
-/// 面板那个时刻输入框是把 `el.value` 原样交下来的（`desktop/ui/js/main.js`），
-/// 手抖多带一个 `-` 就进得来。
+/// 那句"原样交下来"说的是旧 WebView 面板的时刻输入框（`el.value` 直接交下来，手抖多带一个
+/// `-` 就进得来）；那一屏随前端删了之后，今天走到这条校验的是插件那边（`host.rs` 点
+/// `validate_schedule`）与 core 自己的 add_task / update_task。
 fn digits_only(s: &str) -> Option<i64> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -2291,8 +2292,8 @@ mod tests {
     /// `"-0".parse::<i64>()` 是 `Ok(0)`、`"+9"` 是 `Ok(9)`，于是 `"-0:00"` 一路通过
     /// 校验、存进库、被判成 00:00 —— daily 的判据是 `now_min >= target_min`，
     /// "非法时间"就又等于"任何时刻都该跑"（`unparseable_daily_time_never_fires` 防的
-    /// 是同一件事，只是从符号这个门进来）。面板那个输入框是把 `el.value` 原样交下来的
-    /// （`desktop/ui/js/main.js`），手抖多带一个 `-` 就进得来。
+    /// 是同一件事，只是从符号这个门进来）。那个把 `el.value` 原样交下来的时刻输入框属于
+    /// 旧 WebView 面板（已随前端删掉），今天这条路从插件与 core 自己的写入函数走进来。
     ///
     /// 第二条腿是给我自己新加的判据兜底的：`07:00-23:00|120`（每 2 小时）与 `|1440`
     /// 都是正当写法，收紧时钟位时把它们一起夹掉就是修一个洞开一个洞。

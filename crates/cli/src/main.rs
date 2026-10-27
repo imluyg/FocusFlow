@@ -393,9 +393,11 @@ fn parse_period(arg: &str) -> Result<Period, String> {
 /// 这里补的是留下来的那半边 —— 一个分不清"没有数据"与"读不到数据"的诊断工具，
 /// 是这仓库目前产出最高的一类 bug。
 ///
-/// 判据本体在 `focusflow_core::db::queries::check_years_readable`：桌面端的导出也要
-/// 问同一句话，一把尺子抄两处就会分叉（这个分叉真发生过，见 `desktop/src/export.rs`
-/// 的模块头那句"逻辑与 CLI 版一致"）。这里只把错误换成 CLI 用的 String。
+/// 判据本体在 `focusflow_core::db::queries::check_years_readable`：这句注释以前还写着
+/// "桌面端的导出也要问同一句话"，那个读者随 WebView 删了 —— 原生端的导出与周报读的是各
+/// 读数自己交回的 `unreadable`，所以现在问这一句的只剩 CLI。当年那个分叉真发生过（旧那份
+/// 导出的模块头写着"逻辑与 CLI 版一致"，照着它写的实现偏偏不一致）。
+/// 这里只把错误换成 CLI 用的 String。
 fn check_years_readable() -> Result<Vec<i32>, String> {
     db::queries::check_years_readable().map_err(|e| e.to_string())
 }
@@ -1183,9 +1185,10 @@ fn cleanup_outcome(days: i64, report: &db::maintenance::MaintenanceReport) -> (S
 /// "成功份数"，5 个库里只成 1 个也算 `Done`。旧写法先把「备份完成」打到 stdout，
 /// 再往 stderr 补一句不完整 ⇒ 挂在计划任务上的那份日志读起来是成功。
 ///
-/// "到底兜住了没有"不在这里重写：判据用 core 的 `BackupOutcome::is_complete()`，
-/// 设置页那句结论（`desktop/src/commands.rs` 的 `backup_message`）用的是同一个函数。
-/// 这个判据先前在两个界面各抄了一遍 `failed.is_empty()`，桌面那一份抄成了 `Ok`
+/// "到底兜住了没有"不在这里重写：判据用 core 的 `BackupOutcome::is_complete()`。
+/// 旧设置页那句结论（`backup_message`）调的也是这一个函数；原生设置页没有调它，它按
+/// `BackupOutcome` 三个臂各自成句，Done 臂的判据同样是 `failed` 为空 —— 同形，但是第二份。
+/// 这个判据先前就在两个界面各抄了一遍 `failed.is_empty()`，桌面那一份抄成了 `Ok`
 /// ⇒ 部分失败在设置页上照样是一片绿字。三句话（完成 / 不完整 / 无事可做）都在这里挑。
 /// `--vacuum` 的结局：话由 core 的 `vacuum_line` 说**一遍**（设置页的「立即压缩」用的是
 /// 同一句），这里只加"原因见日志"与退出码。

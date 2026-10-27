@@ -1,10 +1,10 @@
 //! 屏幕截取：把「鼠标所在的那块屏」冻结成一份内存里的位图，并按选区裁出 PNG。
 //!
 //! 职责边界：这里**只负责取像素和算坐标** —— 不开窗口、不写盘、不驱动剪贴板。
-//! 覆盖层窗口与会话状态在 `desktop/src/snip.rs`。
+//! 覆盖层窗口与会话状态在桌面端那一侧：原生 `desktop-native/src/main.rs` 的截图那一段。
 //!
-//! 为什么放 core 不放 desktop：`windows` 依赖的 `Win32_Graphics_Gdi` 特性只在 core 开着，
-//! 而且这样纯函数（裁剪、换算、命名）能脱离 Tauri 上下文被单测覆盖。
+//! 为什么放 core 不放桌面端：`windows` 依赖的 `Win32_Graphics_Gdi` 特性只在 core 开着，
+//! 而且这样纯函数（裁剪、换算、命名）能脱离窗口与消息循环被单测覆盖。
 //!
 //! 一条贯穿本模块的取值约定：**缓冲区的原点是那块屏自己的左上角**，不是虚拟屏幕原点。
 //! 副屏的 `x` 是负数（显示器排在主屏左边时），把它带进 buffer 偏移里就会裁出空白；
@@ -498,8 +498,9 @@ pub mod win {
     ///
     /// ⚠ **不要拿它去否决截图。** 这句注释以前写的是"两者不一致就必须停下来"，而真机上
     /// 照它写的硬守卫把整条功能全挡死过（日志里六次截图六次被拒，而代价只是"可能糊一点"）——
-    /// 现在 `snip.rs` 的 `run_capture` 只记日志等级。它留在树上的用处是让 Windows 侧的探针
-    /// 能把「抓到的尺寸」与「显示器声称的尺寸」摆在同一行里，不是当闸用。
+    /// 当年覆盖层那边只把它记进日志等级。现在连这个读者也没有了：生产代码里零调用方，
+    /// 读它的只剩本模块的自测与 `crates/core/tests/dpi_probe.rs` 那份探针 —— 用处还是把
+    /// 「抓到的尺寸」与「显示器声称的尺寸」摆在同一行里，不是当闸用。
     pub fn desktop_caps_size() -> (i32, i32) {
         unsafe {
             let hdc = GetDC(None);
@@ -538,8 +539,8 @@ pub mod win {
         }
     }
 
-    /// 是否处于 Per-Monitor V2 感知。**只用来决定日志等级**，不用来否决截图，理由写在
-    /// `desktop/src/snip.rs` 的调用处。
+    /// 是否处于 Per-Monitor V2 感知。当年只用来决定日志等级、从不否决截图（理由见上面
+    /// `desktop_caps_size` 那一段）；今天生产代码里同样零调用方，读它的是 `dpi_probe`。
     pub fn is_per_monitor_v2() -> bool {
         dpi_awareness_text() == "per-monitor-v2"
     }
@@ -1593,7 +1594,8 @@ mod tests {
 
             let mut dst = cropped.bgra.clone();
             composite_over(&mut dst, &layer, sel_phys.width, sel_phys.height).unwrap();
-            // 落盘那一步（snip.rs 里就是这么编的）
+            // 落盘那一步的形状：转 RGBA、alpha 钉 255 再编码 —— 桌面端落盘走的是
+            // `desktop-native/src/main.rs` 的 `save_png`，那一份编出来的字节同一口径
             let mut encoded = dst.clone();
             bgra_to_rgba(&mut encoded);
             let png = encode_png(&encoded, sel_phys.width, sel_phys.height).unwrap();

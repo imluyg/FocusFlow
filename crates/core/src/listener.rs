@@ -30,7 +30,8 @@ use crate::db::Database;
 /// 暂停是"别再采集了"的全局指令，而设备侧信道（`device_stats`，Raw Input）的线程
 /// 结构上只持有 `Arc<DbWriter>`、拿不到 `InputListener`。各存一份的结果就是本轮修的
 /// 那个 bug：托盘/设置点暂停后继续敲键盘，「今日计数」冻住了而「设备排行」还在涨，
-/// 看起来正是"暂停失效"。所以标志位在组合根（`desktop/src/state.rs`）建一次，
+/// 看起来正是"暂停失效"。所以标志位在组合根（原生端：`desktop-native/src/collect.rs` 起
+/// 采集时 `new_pause_flag()` 那一次）建一次，
 /// 同时喂给 `InputListener::new` 与 `Database::init`（后者转交设备线程）。
 pub type PauseFlag = Arc<AtomicBool>;
 
@@ -54,7 +55,8 @@ pub(crate) fn is_paused_now(flag: &PauseFlag) -> bool {
 /// `MetaLeft, 91` 一条 —— 92(VK_RWIN)/93(VK_APPS) 都没有臂，`key_from_code` 对它们落到
 /// `_ => Key::Unknown(code)`。而本仓在三个地方已经把「右Win」当一等公民登记：
 /// 本文件的名字表（`Key::MetaRight => "右Win"`）、`format::classify_key` 的修饰键分组、
-/// 热力板 `charts.js` 的「右Win」那一格；设备侧信道 `device_stats.rs` 更是直接按 0x5C 计数。
+/// 热力板「右Win」那一格（原生端在 `desktop-native/src/main.rs` 的键位表里）；设备侧信道
+/// `device_stats.rs` 更是直接按 0x5C 计数。
 /// 结果就是同一个物理键两处各说各的：设备详情里它在涨，而主链路的排行/分组/热力板那一格
 /// 永远是空的 —— 更糟的是它连"未知键"都进不去（下面 `Key::Unknown(_) → return` 按口径丢弃）。
 ///

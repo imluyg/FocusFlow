@@ -352,8 +352,9 @@ pub fn data_dir() -> PathBuf {
 
 /// `logs/` 日志目录，不存在则创建。
 ///
-/// 跟着**程序目录**走而不是数据目录：`init_logging()` 在任何命令行参数解析之前就要跑
-/// （见 desktop/src/lib.rs），让它依赖配置文件等于把日志系统架在配置能否读上来的赌注上。
+/// 跟着**程序目录**走而不是数据目录：`init_logging()` 在配置能否读上来之前就得装好
+/// （今天两个入口都这样：CLI 一进来先调，原生端在 `desktop-native/src/collect.rs`
+/// 起采集时调），让它依赖配置文件等于把日志系统架在配置能否读上来的赌注上。
 pub fn log_dir() -> PathBuf {
     ensure_dir(app_dir().join("logs"))
 }

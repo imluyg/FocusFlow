@@ -50,8 +50,8 @@ pub fn current_data_home() -> PathBuf {
 ///
 /// 校验一次"更改数据目录"的目标是否可用。`src` 是**当前**数据根，由调用方交进来。
 ///
-/// `src` 以前是这里自己现读 `paths::data_home()`：那是第二个读点。调用方
-/// （`commands.rs` 的 `change_data_dir`）前一行刚用 `current_data_home()` 算出要搬走的
+/// `src` 以前是这里自己现读 `paths::data_home()`：那是第二个读点。当年的调用方（旧桌面端
+/// 那条 `change_data_dir`）前一行刚用 `current_data_home()` 算出要搬走的
 /// 源目录，转天校验时读的却是另一个时刻解析出来的值 —— 两次解析中间只要有人
 /// `force_data_home`/换过 app_dir，校验的就是一个根本不会被搬运的目录。现在两边
 /// 用的是同一个串，一把尺子。
@@ -363,8 +363,8 @@ fn keep_aside(dst: &Path) -> anyhow::Result<Option<PathBuf>> {
 /// `metadata()` 报回来的错里，只有「确实没有这个东西」才算 No-op。
 ///
 /// `Path::exists()` / `is_dir()` 把「查不动」（移动盘刚唤醒、杀软首扫、同步盘占位、
-/// 只读句柄挡着）折成「没有」，而这一步之后是**截断覆盖**。口径与
-/// `desktop/src/plugins.rs` 的 `FileState`、本仓库 `Presence` 那一条一致：三种结局分开。
+/// 只读句柄挡着）折成「没有」，而这一步之后是**截断覆盖**。口径与本仓库 `Presence`
+/// 那一条一致（旧桌面端那个 `FileState` 是同一形状，那份随前端一起删了）：三种结局分开。
 ///
 /// `pub(crate)` 之后本 crate 里问"在不在"的地方都共用这一句判据
 /// （`db::queries::classify_stat`、`edge_history::remove_temp_copy` 与

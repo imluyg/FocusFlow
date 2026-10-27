@@ -39,8 +39,8 @@ pub struct SettingRow {
     pub default: String,
 }
 
-/// 「高级设置」这一页的唯一清单（与 `desktop/src/commands.rs` 的 `EXPOSED_SETTINGS`
-/// 同一份口径：段、键、类型、什么时候生效）。
+/// 「高级设置」这一页的唯一清单：段、键、类型、什么时候生效全在这里。旧桌面端另有一份
+/// `EXPOSED_SETTINGS`，两边靠人手对齐；那一页随 WebView 删了，所以现在只剩这一份。
 ///
 /// 元组：段、键、类型、生效时机、中文名、一句话说明（说明以「分组 ·」开头，替掉原来
 /// 每行都一样的"改完立即生效"）。`gui.floating_renderer` 这类原生端根本不读的旧键

@@ -85,7 +85,9 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
         "gui",
         &[
             // 图表刷新节奏：打字时每 active_refresh_interval 秒、空闲时每
-            // full_refresh_interval 秒（两个都有读点，见 desktop/src/state.rs）
+            // full_refresh_interval 秒。这句注释以前写"两个都有读点"，那是旧 WebView 端
+            // 的事：现在原生端的刷新节奏写在它自己那一侧、不读这两个键，只剩高级设置页
+            // （`desktop-native/src/data.rs`）还把它们当两行展示给人改 ⇒ 要不要接上待用户点。
             ("active_refresh_interval", "2"),
             ("full_refresh_interval", "10"),
             ("theme", "light"),
@@ -95,18 +97,19 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             ("unload_hidden_delay", "60"),
             // 按住（隐藏）一个窗口时要不要连 `TrySuspend` 一起按 —— 让那条渲染进程真的停下。
             // 默认关：这个 API 全仓从未用过、一个数都没有，所以对拍出局之前它不许改任何行为。
-            // 读点：`desktop/src/state.rs` 的 `suspend_hidden_enabled`。
+            // 读点：已经没有了 —— 那间会 TrySuspend 的 WebView 窗口随前端一起删掉，
+            // 这个键如今全仓零读点，连设置页都没列它。
             ("suspend_hidden", "false"),
-            // 悬浮窗显示口径：times / duration / both（desktop/ui/floating.js 读）
+            // 悬浮窗显示口径：times / duration / both（原生端有读点：`desktop-native/src/floating.rs`
+            // 取出来交给 `floating_render::metric_from`，别的值一律当 times）
             ("floating_metric", "times"),
-            // 悬浮窗用哪套绘制：webview（WebView2，一直以来的样子）/ native（原生分层窗口）。
-            // 默认 webview —— 原生化第一版不把它设成默认，改动要能在设置页一句话退回。
-            // 只在启动时读一次（`desktop/src/floating/renderer_of`），改了要重启。
+            // 悬浮窗用哪套绘制：webview（WebView2，旧前端的样子）/ native（原生分层窗口）。
+            // 这一档随 WebView 一起退场了：原生端只有一套绘制 ⇒ 现在没有读点，也不在
+            // 设置页暴露，留在默认值里只是旧用户 config.ini 里还认得它。
             ("floating_renderer", "webview"),
-            // 启动时选中的统计周期（-1 = 今日）：前端每次切换都写回它，
-            // 用来"记住上次退出前看的周期"（desktop/src/state.rs 读，非法值在入口拦掉）。
-            // 和 floating_metric 同一类：代码一直在读、默认值里却没有，
-            // 等于只有会手改 config.ini 的人知道有这么个开关。
+            // 启动时选中的统计周期（-1 = 今日）：旧前端每次切换都写回它，用来"记住上次
+            // 退出前看的周期"。原生端的周期存在进程里的一个原子量上（切换只 store、
+            // 退出不写回），所以这一键现在既没有读点也没有写它的地方 ⇒ 待用户点。
             ("default_period", "-1"),
         ],
     );
@@ -115,10 +118,13 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
         &[
             ("enabled", "false"),
             ("toggle_window", "ctrl+shift+f"),
-            // 区域截图（desktop/src/snip.rs）。默认值刻意避开三类撞车：
+            // 区域截图（原生端：`desktop-native/src/main.rs` 的覆盖层，按 `[hotkey] snip` 起）。
+            // 默认值刻意避开三类撞车：
             // Win+Shift+S 被系统截图工具占着、裸 PrintScreen 被系统的"使用 Print
             // Screen 按钮"无障碍钩子抢、Ctrl+Alt+A 是微信的默认截图键。
-            // `enabled` 是总开关，两条绑定共用：关掉开关时不占用任何全局快捷键。
+            // `enabled` 是总开关，三条绑定共用：关掉开关时不占用任何全局快捷键。
+            // 但它只有"当场生效"这半边 —— 启动时没有读它的人 ⇒ "关掉热键"过不了一次重启，
+            // 而这张默认表里它就是 `false`（新装用户按不出热键的另一半）⇒ 口径待用户点。
             ("snip", "shift+f1"),
             // 标注版截图：框完松手不立刻提交，而是进标注态（Enter 才提交、Esc 放弃）。
             // 默认键沿用上面那三类避让；不复用 shift+f1 而另起一键，是为了让"松手即提交"
@@ -127,8 +133,8 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
         ],
     );
     s("floating", &[("enabled", "true")]);
-    // 贴图用哪套绘制：webview（默认）/ native（原生分层窗口，一张图一个窗口而不是一整个
-    // 浏览器进程）。只在开窗时读一次（`desktop/src/pin.rs::renderer_is_native`），改了要重新贴图。
+    // 贴图用哪套绘制：webview（旧前端，一张图一个浏览器页面）/ native（原生分层窗口，
+    // 一张图一个窗口）。原生端只有一套 ⇒ 这个键现在没有读点，留着只为读得通旧档。
     s("pin", &[("renderer", "webview")]);
     s(
         "pomodoro",
@@ -1589,7 +1595,7 @@ work_minutes = 45
                 "{section}.{key} 已无读点，必须被清掉"
             );
         }
-        // 同前缀的活键不能被顺手带走：full_refresh_interval 有读点，
+        // 同前缀的活键不能被顺手带走：full_refresh_interval 是高级设置页明面上的一行，
         // work_minutes 是番茄钟真正生效的时长
         assert_eq!(cfg.get_int("gui", "full_refresh_interval", 0), 10);
         assert_eq!(cfg.get_int("pomodoro", "work_minutes", 0), 45);
