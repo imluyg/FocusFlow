@@ -8,6 +8,10 @@ UTF-8 中文会把后面的 ASCII 字符吃掉，直接语法错误 —— 见�
 
 - 已构建 release：`cargo build --release -p focusflow-native`（产物在**根** `target\release\`）；
 - 跑安装包那条（`accept-installer.ps1`）还要先 `cmd /c build_native.bat`（`dist\*-setup.exe`）；
+- ⚠ **想要"十二套读的是同一份字节"，就先 `build_native.bat` 再跑那十一套 GUI**：`build_native.bat` 第一步
+  会重跑一遍 `cargo build --release`，实测它把 `target\release\FocusFlow.exe` 换成**另一份字节**
+  （第十场：GUI 那十一套跑的是 `518D…`，打包之后变成 `F4DD…`，`setup.exe` 是 `CE8C…`）——
+  源码一行没动也是两份产物，别说成"同一份"。
 - 都需要 `desktop-native\probe\` 里的探针数据。
 - 每个脚本都用 probe 的**副本**当 app 目录，不会碰真实数据。
 
@@ -82,7 +86,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 `Click-ViewTab` / `Click-ATab` / `Click-BasicRow` / `Click-PeriodPill`、`Get-InstalledDir`、
 `Invoke-Setup`。
 
-## 八个坑（都踩过）
+## 十个坑（都踩过）
 
 1. **注入的键盘到不了低级键盘钩子**：`keybd_event`（带真实扫描码）与 `SendInput` 都试过，
    采集里一条都收不到；同一批注入的**鼠标**事件正常。所以采集脚本用点击计数，
@@ -118,3 +122,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
    的滚轮腿先把那张贴图拿到前台、并先断言前台确实是它，控制点不成立时两条腿记红并写明"没跑成"而不是记绿。
    真实鼠标悬停滚动仍归眼验。另一个连带坑：贴图是**从左上角缩放**的，缩小时光标会被图"让出去"，
    所以要每滚一格重新量一次中心再投，一次投 20 格只会走到一半（实测停在 `63×42`）。
+9. **"闸干净"不等于"这台机器空闲"**（第十场实测：`mutex=free`、`Get-Process` 数到 0，十一套连跑照样红八条，
+   因为鼠标和前台在别人手里）。两种物证形状，红点自己会交代：
+   ① 覆盖层那三分钟里**多落一张 PNG，尺寸就是身份证**——实测多出来的是 `194x117`（光标底下那个第三方窗），
+   夹具那张选中是 `306x193`，全屏那张才是屏幕尺寸；它同时把"超时自己退"那三条腿打成红
+   （`gone=True waited 19 s`、`snip-timeout` 那行不写）。这条腿在第八场从"窗口没了"收紧成
+   "没了**且**等满约 180 秒"，就是为这一刻准备的：旧形状这次照样会绿。
+   ② 注入 5 次点击读回 `today 0 -> 7`，而同一套里第二次注入精确 `7 -> 12` ⇒ 多出来的是别人的两下，
+   不是"鼠标按下没去重"。
+   `accept-pin` 的滚轮腿同理但**可复现**：这台机器 `HKCU\Control Panel\Desktop\ForegroundLockTimeout=200000`
+   ⇒ 前台归别人时，后台进程的 `SetForegroundWindow` 被系统挡（单跑也一样），控制点不成立那三条就是
+   "没测到"，不是缩放坏。⇒ **开跑前再量一行 `GetForegroundWindow()` 的 class/pid/proc**；
+   不属于本工装（不是 `FocusFlow*` 类名、也不是自己的控制台）就别开跑，或开跑了也只许写"没测到"。
+10. **复跑会把上一跑的物证抹掉**：十二套各有默认 WorkDir，`New-AppDir` 一开场就清空 `app\`，
+    所以"为了归因红点而单跑复跑"会当场删掉上一跑的那张多落 PNG 与 `focusflow.log`（第十场就这么丢过一次
+    —— 尺寸已在台账里，但工件不可再核）。
+    ⇒ 复跑前先把 `<WorkDir>\focusflow.log`、`<WorkDir>\app\logs\` 和截图清单（**带像素尺寸**）抄走，
+    或者给复跑传 `-WorkDir` 指一个新目录（十二套都有这个参数）。
