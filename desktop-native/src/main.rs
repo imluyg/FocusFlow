@@ -702,6 +702,30 @@ struct App {
     last_cpm: i64,
 }
 
+/// 启动时主窗口那一格状态行说的话：六句候选里只留最要紧的一句（`None` = 一切正常，留空）。
+///
+/// 顺序就是优先级，写在这里是为了能用例盯着 —— 原先这串 `or_else` 直接长在建窗代码里，
+/// 一次证据都没有。排法的道理：
+/// 搬迁没成（数据可能一分为二，最贵的后果）> 配置整份没读出来（本次跑的全是默认值，
+/// 连热键都是关的）> 数据目录回落（真历史在原地没人用，界面看着就是"数字全没了"）>
+/// 双计提醒 > 刚搬完告知搬到哪 > 某条热键没注册上。
+/// 后两条原先就在，前三条里新增的那两句此前**只有日志一行**，屏上零信号。
+fn boot_notice(
+    move_failure: Option<String>,
+    config_corrupt: Option<String>,
+    data_home_fallback: Option<String>,
+    legacy_double_count: Option<String>,
+    moved_ok: Option<String>,
+    hotkey_warning: Option<String>,
+) -> Option<String> {
+    move_failure
+        .or(config_corrupt)
+        .or(data_home_fallback)
+        .or(legacy_double_count)
+        .or(moved_ok)
+        .or(hotkey_warning)
+}
+
 impl App {
     fn new(hwnd: HWND, mica: bool) -> windows::core::Result<Self> {
         // 配置单例：读 `config.ini`（没有就落一份默认值）。原型只用来定位数据目录。
@@ -769,28 +793,38 @@ impl App {
                 warning: hotkey_warning,
             } = make_hotkeys();
 
-            // 启动时这条状态行只放一句话，按"要紧的先说"排：
-            // 搬迁没成 > 双计提醒 > 刚搬完告知搬到了哪 > 热键没注册上。
-            let boot_status = move_notice
-                .as_ref()
-                .map(|n| format!("注意：{}（{}）", n.detail, n.step))
-                .or_else(|| {
-                    if collect::is_started() && collect::legacy_running() {
-                        Some("注意：检测到旧版 FocusFlow.exe 在跑，两处采集会让数字翻倍；建议只留一个".to_string())
-                    } else {
-                        moved.as_ref().map(|r| {
-                            format!(
-                                "数据目录已搬到 {}（{} 个文件 / 旧目录剩 {} 项）",
-                                r.to.display(),
-                                r.summary.copied,
-                                r.leftover_in_source
-                            )
-                        })
-                    }
-                })
-                // 热键有一条没注册上就要在屏上点名：启动时"按了没反应"最难猜的就是
-                // "到底注册上没有"，原来这一句只在日志里。
-                .or_else(|| hotkey_warning.clone());
+            // 启动时这条状态行只放一句话，按"要紧的先说"排（见 `boot_notice`）。
+            // 这两条降级原先只有一行日志，而它们的症状恰好都是"程序看着正常、数字/热键不对"：
+            // 配置整份没读出来 ⇒ 本次跑的全是默认值（含默认关掉的热键）；
+            // 配置的数据目录用不了 ⇒ 本次在一个新建的空库里记账，真历史在原地没人用。
+            // 这两句直接写在参数上、不先落局部变量：接线守卫钉的就是"调用形态"，
+            // 换成变量名之后它就看不见这两句是从哪儿来的了。
+            let legacy_running = if collect::is_started() && collect::legacy_running() {
+                Some(
+                    "注意：检测到旧版 FocusFlow.exe 在跑，两处采集会让数字翻倍；建议只留一个"
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            let moved_note = moved.as_ref().map(|r| {
+                format!(
+                    "数据目录已搬到 {}（{} 个文件 / 旧目录剩 {} 项）",
+                    r.to.display(),
+                    r.summary.copied,
+                    r.leftover_in_source
+                )
+            });
+            let boot_status = boot_notice(
+                move_notice
+                    .as_ref()
+                    .map(|n| format!("注意：{}（{}）", n.detail, n.step)),
+                cfg.corrupt_note(),
+                focusflow_core::paths::data_home_fallback_notice(),
+                legacy_running,
+                moved_note,
+                hotkey_warning,
+            );
 
             // 悬浮窗：独立线程 + 独立分层窗口，主窗口收起时也常驻。
             // 起不来只记一句 —— 主界面不该因为"小卡片起不来"而失败。
@@ -8297,6 +8331,90 @@ mod hotkey_tests {
             assert!(
                 why.contains("修饰键"),
                 "{bad:?} 的说明要给能照写的格式：{why}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod boot_notice_tests {
+    use super::*;
+
+    fn say(tag: &str) -> Option<String> {
+        Some(tag.to_string())
+    }
+
+    /// 优先级整条逐格走一遍：每一句都要能在"上面都没话"时顶上，也要能在"上面有话"时让位。
+    /// 只断言头尾两格的写法照不出中间换位（把两个参数对调，它照样绿）。
+    #[test]
+    fn the_boot_line_says_only_the_most_urgent_thing() {
+        let all = || {
+            (
+                say("搬不成"),
+                say("配置没读出来"),
+                say("数据目录回落"),
+                say("两处采集"),
+                say("搬完了"),
+                say("热键没注册上"),
+            )
+        };
+        let (a, b, c, d, e, f) = all();
+        assert_eq!(
+            boot_notice(
+                a.clone(),
+                b.clone(),
+                c.clone(),
+                d.clone(),
+                e.clone(),
+                f.clone()
+            ),
+            a
+        );
+        assert_eq!(
+            boot_notice(None, b.clone(), c.clone(), d.clone(), e.clone(), f.clone()),
+            b
+        );
+        assert_eq!(
+            boot_notice(None, None, c.clone(), d.clone(), e.clone(), f.clone()),
+            c
+        );
+        assert_eq!(
+            boot_notice(None, None, None, d.clone(), e.clone(), f.clone()),
+            d
+        );
+        assert_eq!(boot_notice(None, None, None, None, e.clone(), f.clone()), e);
+        assert_eq!(boot_notice(None, None, None, None, None, f.clone()), f);
+        assert_eq!(
+            boot_notice(None, None, None, None, None, None),
+            None,
+            "一切正常时这一格该是空的"
+        );
+    }
+
+    /// 接线腿：那两句降级得真的走进这一格。纯函数排好位而调用方不喂，屏上依旧零信号 ——
+    /// 这条缺陷的形状正是"日志里说了，屏上没说"，所以钉的是调用形态而不是函数名。
+    #[test]
+    fn the_boot_line_is_fed_both_silent_degradations() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        // 钉"调用形态"而不是函数名：光找 `boot_notice(` 会先撞上那句 `fn boot_notice(`
+        // 的定义，把定义自身的参数表当成调用点读一遍（假红）。
+        let call = ["= ", "boot_notice", "("].concat();
+        let at = prod
+            .find(call.as_str())
+            .expect("生产代码里没有启动状态行的调用点");
+        // 只看这一处调用的参数区：整文件 contains 会让别处同名的词顶班。
+        // 按字符取窗口，不按字节 —— 这一段里全是中文，`&prod[at..at + 900]` 会切进
+        // 一个汉字的中间直接 panic（本机第一次跑就这样红在自己身上）。
+        let args: String = prod[at..].chars().take(1200).collect();
+        for needle in [
+            ["corrupt_note", "()"].concat(),
+            ["data_home_fallback_notice", "()"].concat(),
+        ] {
+            assert!(
+                args.contains(needle.as_str()),
+                "启动状态行没把这句降级喂进去（缺 {needle}）"
             );
         }
     }

@@ -36,12 +36,22 @@ static APP_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 /// 进程级数据目录解析结果缓存（详见 [`data_home`]：一次运行只认一个数据目录）。
 static DATA_HOME: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
+/// 本次进程里「配置的数据目录用不了、已经回落到程序目录」这句话（`None` = 没回落）。
+///
+/// 它跟着 [`DATA_HOME`] 一起作废：那件事实就是那一次解析留下的，换了 app_dir 或改口
+/// 钉死数据目录之后，旧的那句就不再描述本进程正在用的目录了。
+static DATA_HOME_FALLBACK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
 fn app_dir_override() -> &'static Mutex<Option<PathBuf>> {
     APP_DIR_OVERRIDE.get_or_init(|| Mutex::new(None))
 }
 
 fn data_home_cache() -> &'static Mutex<Option<PathBuf>> {
     DATA_HOME.get_or_init(|| Mutex::new(None))
+}
+
+fn data_home_fallback_slot() -> &'static Mutex<Option<String>> {
+    DATA_HOME_FALLBACK.get_or_init(|| Mutex::new(None))
 }
 
 /// 显式设置程序目录（测试隔离用；也可在打包版指向 exe 目录）。
@@ -52,6 +62,10 @@ pub fn set_app_dir(dir: impl Into<PathBuf>) {
     // 指着上一个用例已经删掉的临时目录 —— 孤儿写入落进下一个用例刚建好的目录，正是本文件
     // 到处设哨兵、`TestAppDir::drop` 反复清理要防的那个形状。
     *data_home_cache().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // 那句"回落到程序目录"是上一次解析留下的，换了 app_dir 就不该再被界面念出来。
+    *data_home_fallback_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 测试专用：切换全局 app_dir 的测试必须持有此锁跑完全程。
@@ -286,6 +300,10 @@ pub fn data_home() -> PathBuf {
 /// 而不是让后续解析再去看配置文件，否则常驻线程会在运行中改口、新旧目录一起被写。
 pub fn force_data_home(dir: impl Into<PathBuf>) {
     *data_home_cache().lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.into());
+    // 钉死之后生效的就是这一枚目录，"回落到程序目录"那句不再描述本进程。
+    *data_home_fallback_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 解析一次 [`data_home`]：读程序目录下的 config.ini，取 `[paths] data_home`。
@@ -319,14 +337,31 @@ fn resolve_data_home() -> PathBuf {
             // 配置指向的目录用不了（移动盘没插、OneDrive 占位、权限不足、同名普通文件）
             // 时不硬失败，回落程序目录继续跑：按键统计必须有个能写的地方，而"双击没反应、
             // 也没有任何报错"是 logger.rs 里已经避过一次的坑。回落的事实记进日志。
-            tracing::error!(
+            let note = format!(
                 "配置的数据目录不可用（{}）: {e}；本次回落到程序目录 {}",
                 candidate.display(),
                 app.display()
             );
+            tracing::error!("{note}");
+            // 光有日志那一行，用户看到的是"我的历史没了"而不知道库换到了哪。
+            // 这句同时交给启动时那条状态行（`desktop-native` 的 boot 状态）显示。
+            *data_home_fallback_slot()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(note);
             app
         }
     }
+}
+
+/// 本次进程有没有发生「配置的数据目录不可用、回落到程序目录」；有就说清换到了哪、为什么。
+///
+/// 与 [`data_home`] 同一个口径：一次解析、一次运行只认一个数据目录，所以这条事实也是
+/// 进程级的，并且跟着那枚缓存一起作废（`None` = 当前生效的目录不是回落来的）。
+pub fn data_home_fallback_notice() -> Option<String> {
+    data_home_fallback_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// 建目录；失败时把路径与原因说出来。
@@ -471,6 +506,103 @@ mod tests {
         assert!(
             logs.iter().all(|l| !l.contains("目录建不出来")),
             "成功不该报警: {logs:?}"
+        );
+    }
+
+    /// `[paths] data_home` 用不了 ⇒ 本次回落到程序目录继续记账。这件事原先只有
+    /// `tracing::error!` 一行，而它的用户侧症状是"我的历史没了"：真库在原地不被使用，
+    /// 安装目录里另起一套空库，读数全报 0 而退出码 0。这里钉的是**屏上拿得到那句**
+    /// （`desktop-native` 的启动状态行读 [`data_home_fallback_notice`]）。
+    #[test]
+    fn the_data_home_fallback_leaves_a_notice_the_screen_can_read() {
+        let _lock = test_app_dir_lock();
+        let app = test_app_dir("home_fallback");
+        set_app_dir(app.path());
+        // 夹具取"被同名普通文件占住"这一形（移动盘没插、OneDrive 占位是同一支）
+        let blocked = app.path().join("elsewhere_home");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        std::fs::write(
+            app.path().join("config.ini"),
+            format!("[paths]\ndata_home = {}\n", blocked.display()),
+        )
+        .unwrap();
+        assert!(
+            data_home_fallback_notice().is_none(),
+            "还没解析过，不该挂着上一轮的句子"
+        );
+
+        let home = data_home();
+        assert_eq!(home, app.path(), "该回落到程序目录");
+        let note = data_home_fallback_notice().expect("回落这件事要留下一句能上屏的话");
+        assert!(
+            note.contains(&blocked.display().to_string()),
+            "要点名是哪个目录用不了: {note}"
+        );
+        assert!(note.contains("回落到程序目录"), "要说清现在记在哪: {note}");
+
+        // 那句描述的是"这一次解析"的结果：换了 app_dir 就等于换了一份配置，
+        // 留着它会让下一个进程状态读到一句不属于它的话。
+        set_app_dir(app.path().join("second_home"));
+        assert!(
+            data_home_fallback_notice().is_none(),
+            "换目录之后旧的那句必须作废"
+        );
+    }
+
+    /// 目录修好之后，下一次解析要真的用回配置里那一枚，而不是停在回落后的程序目录。
+    /// 那句降级也跟着换目录一起作废（`set_app_dir` 那一步），所以屏上不会念一句过期的话。
+    #[test]
+    fn a_working_data_home_clears_the_fallback_notice() {
+        let _lock = test_app_dir_lock();
+        let app = test_app_dir("home_recovered");
+        set_app_dir(app.path());
+        let blocked = app.path().join("recoverable_home");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let cfg = app.path().join("config.ini");
+        std::fs::write(
+            &cfg,
+            format!("[paths]\ndata_home = {}\n", blocked.display()),
+        )
+        .unwrap();
+        assert_eq!(data_home(), app.path());
+        assert!(data_home_fallback_notice().is_some(), "先让它回落一次");
+
+        std::fs::remove_file(&blocked).unwrap();
+        set_app_dir(app.path());
+        assert_eq!(data_home(), blocked, "现在该用配置里那一枚");
+        assert!(
+            data_home_fallback_notice().is_none(),
+            "重新解析过一轮，那句回落该跟着作废"
+        );
+    }
+
+    /// 迁移失败时 core 会把数据根**钉回**旧目录（[`force_data_home`]）。钉死之后生效的
+    /// 就是那一枚，之前那句"回落到程序目录"不再描述本进程 —— 屏上念一句过期的降级，
+    /// 比念不出降级更容易把人引到错的目录上去找库。
+    #[test]
+    fn pinning_the_data_home_retires_the_fallback_notice() {
+        let _lock = test_app_dir_lock();
+        let app = test_app_dir("home_pinned");
+        set_app_dir(app.path());
+        let blocked = app.path().join("pinnable_home");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        std::fs::write(
+            app.path().join("config.ini"),
+            format!("[paths]\ndata_home = {}\n", blocked.display()),
+        )
+        .unwrap();
+        assert_eq!(data_home(), app.path(), "先让它回落到程序目录");
+        assert!(
+            data_home_fallback_notice().is_some(),
+            "回落得先留下一句，这条才有东西可作废"
+        );
+
+        let pinned = app.path().join("old_home");
+        force_data_home(&pinned);
+        assert_eq!(data_home(), pinned, "钉死的那一枚要生效");
+        assert!(
+            data_home_fallback_notice().is_none(),
+            "钉死之后不许再念那句回落"
         );
     }
 }

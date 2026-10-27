@@ -534,6 +534,14 @@ pub struct FocusFlowConfig {
     /// 不是证据，而失败以前只有 `tracing::error!` 一行：用户改完一切看着都对，重启后
     /// 全部回到旧值。读侧那一族"读不出来必须说话"已经修过好几处，这是剩下的写侧一半。
     last_save_error: Mutex<Option<String>>,
+    /// 本次启动遇到「配置文件在，但整份读不出来」时，给人看的那一句（`None` = 没发生）。
+    ///
+    /// 记在实例上的理由与 [`Self::last_save_error`] 同一条：进程级静态会被几十个各自
+    /// `init` 一次的用例污染。这条降级原先只有 `tracing::error!` 一行，而它换来的是一
+    /// **整份设置都回到默认值**的进程——其中 `[hotkey] enabled` 默认是关的，于是用户
+    /// 看到的全部症状就是"截图热键按了没反应"，而他既不知道自己那份配置没生效，
+    /// 也不知道原文件被保留成了什么名字。
+    corrupt_note: Mutex<Option<String>>,
 }
 
 /// `load()` 结尾那次回写失败时，本次运行手里到底拿的是哪一份值。
@@ -587,6 +595,7 @@ impl FocusFlowConfig {
 
         let file_exists = path.exists();
         let mut read_ok = false;
+        let mut corrupt_note: Option<String> = None;
         if file_exists {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
@@ -609,12 +618,23 @@ impl FocusFlowConfig {
                     name.push(format!(".corrupt-{ts}"));
                     let backup = path.with_file_name(name);
                     match std::fs::rename(&path, &backup) {
-                        Ok(_) => tracing::error!(
-                            "配置文件读取失败（{e}），原文件已备份到 {}，本次使用默认值",
-                            backup.display()
-                        ),
-                        Err(_) => {
-                            tracing::error!("配置文件读取失败（{e}）且备份失败，本次使用默认值")
+                        Ok(_) => {
+                            tracing::error!(
+                                "配置文件读取失败（{e}），原文件已备份到 {}，本次使用默认值",
+                                backup.display()
+                            );
+                            corrupt_note = Some(format!(
+                                "配置没读出来，本次按默认值跑；原文件保留在 {}",
+                                backup.display()
+                            ));
+                        }
+                        Err(backup_err) => {
+                            tracing::error!("配置文件读取失败（{e}）且备份失败，本次使用默认值");
+                            // 备份没成 ⇒ 下一次落盘会把那份读不出来的文件盖掉，
+                            // 这一句要说清"没能留住"，不能只说"用了默认值"。
+                            corrupt_note = Some(format!(
+                                "配置没读出来，本次按默认值跑，而原文件没能改名保留（{backup_err}）"
+                            ));
                         }
                     }
                 }
@@ -637,6 +657,7 @@ impl FocusFlowConfig {
             path,
             pending_writes: Mutex::new(HashSet::new()),
             last_save_error: Mutex::new(None),
+            corrupt_note: Mutex::new(corrupt_note),
         };
         // 结尾这次回写只是把"补齐的默认键"落到盘上，它失败**不能**推翻已经读出来、
         // 已经 reconcile 好的那一份。原来的 `cfg.save()?` 会让整个 `load()` 报错，
@@ -692,6 +713,14 @@ impl FocusFlowConfig {
     /// 最近一次落盘失败的原因（`None` = 上一次落盘成功 / 从没失败）。
     pub fn last_save_error(&self) -> Option<String> {
         self.last_save_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 本次启动「配置整份没读出来」那句人话（`None` = 配置正常读出来了）。
+    pub fn corrupt_note(&self) -> Option<String> {
+        self.corrupt_note
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -894,6 +923,8 @@ impl FocusFlowConfig {
             path,
             pending_writes: Mutex::new(HashSet::new()),
             last_save_error: Mutex::new(None),
+            // 这条兜底没有读过那份文件，所以它不能声称"原文件保留在哪里"。
+            corrupt_note: Mutex::new(None),
         }
     }
 
@@ -1362,6 +1393,48 @@ mod tests {
             std::fs::read_to_string(&bak).unwrap(),
             "[gui]\ntheme = dark\n",
             "只留第一份：第二次保存不许把原貌盖成中间态"
+        );
+    }
+
+    /// 整份配置读不出来 ⇒ 本次跑默认值，而这份降级必须留一句**能上屏**的话。
+    ///
+    /// 旧形状里这条路径只有 `tracing::error!` 一行，屏上零信号；而默认值里
+    /// `[hotkey] enabled` 是关的，用户看到的全部症状就是"截图热键按了没反应"，
+    /// 既不知道自己的配置没生效，也不知道原文件被保留成了什么名字。
+    /// 探针：把 `corrupt_note = Some(...)` 那两行摘掉 ⇒ 这条红在"要留下那句能上屏的话"。
+    #[test]
+    fn a_config_that_cannot_be_read_leaves_a_notice_the_screen_can_read() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_corrupt_note");
+        let path = app.path().join("config.ini");
+        // 非 UTF-8 的四个字节：`read_to_string` 在这一份上直接失败（编码损坏同形）
+        std::fs::write(&path, [0xFFu8, 0xFE, 0xFF, 0xC0]).unwrap();
+
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+        let note = cfg
+            .corrupt_note()
+            .expect("读不出配置这件事不能只留在日志里");
+        assert!(note.contains("默认值"), "要说清本次按什么跑: {note}");
+        let kept = std::fs::read_dir(app.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.starts_with("config.ini.corrupt-"))
+            .expect("原文件该被改名保留下来");
+        assert!(
+            note.contains(&kept),
+            "那句要指向保留下来的文件名: {note} 里没有 {kept}"
+        );
+
+        // 读得出来那一种不许挂着这句：否则屏上永远念着一句不属于本次的降级。
+        let good = app.path().join("good.ini");
+        std::fs::write(&good, "[gui]\ntheme = dark\n").unwrap();
+        assert!(
+            FocusFlowConfig::load(&good)
+                .unwrap()
+                .corrupt_note()
+                .is_none(),
+            "配置正常读出来时不该有那句"
         );
     }
 
