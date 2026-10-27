@@ -115,6 +115,8 @@ enum Drag {
     Handle(u8),
     /// 标注工具正在画
     Mark,
+    /// 搬第 N 笔（按下时已把当前状态压进撤销栈，所以一次拖动 = 一步撤销）
+    Pick(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -148,6 +150,7 @@ pub struct BarBtn {
 
 /// 工具条定义（顺序 = 屏上顺序）。第四项 `true` = 与上一组之间多留一段间隔。
 const BAR_SPECS: &[(&str, &str, i32, bool)] = &[
+    ("pick", "选", 36, true),
     ("rect", "方框", 44, true),
     ("arrow", "箭头", 44, false),
     ("pen", "画笔", 44, false),
@@ -182,7 +185,7 @@ const WIDTHS: [(i32, &str); 2] = [(3, "w1"), (7, "w2")];
 /// 字号三档（物理像素高）。
 const FONTS: [(i32, &str); 3] = [(18, "f1"), (30, "f2"), (48, "f3")];
 /// 工具 id -> `tool` 编号。
-const TOOLS: [&str; 6] = ["rect", "arrow", "pen", "mosaic", "block", "text"];
+const TOOLS: [&str; 7] = ["rect", "arrow", "pen", "mosaic", "block", "text", "pick"];
 
 /// 一次截图的全部状态（同一时刻只允许一个覆盖层，所以是一个静态量）。
 pub struct SnipState {
@@ -209,7 +212,12 @@ pub struct SnipState {
     /// 冻结那一刻的窗口清单（Z 序顶→底）。一次成图，鼠标移动不再 EnumWindows。
     hits: Vec<Candidate>,
     marks: Vec<Mark>,
-    redo: Vec<Mark>,
+    /// 撤销/重做按**快照**存：加一笔、搬一笔、删一笔都先压一份当前状态，
+    /// 于是三条改动路共用同一个"退回去"的定义（原来只存"最后一笔"，搬/删没法撤销）。
+    undo_stack: Vec<Vec<Mark>>,
+    redo_stack: Vec<Vec<Mark>>,
+    /// 被选中的那一笔（下标，只在"选择"工具下有意义）。
+    selected: Option<usize>,
     /// 当前工具（[`TOOLS`] 下标）。
     tool: u8,
     color: u32,
@@ -241,7 +249,9 @@ const fn default_state() -> SnipState {
         hover: None,
         hits: Vec::new(),
         marks: Vec::new(),
-        redo: Vec::new(),
+        undo_stack: Vec::new(),
+        redo_stack: Vec::new(),
+        selected: None,
         tool: 0,
         color: PALETTE[0].0,
         width: WIDTHS[0].0,
@@ -601,6 +611,95 @@ pub fn out_name(ts: &str, w: u32, h: u32, listing: &[String]) -> String {
     focusflow_core::capture::unique_name(&base, "png", listing)
 }
 
+/// 这一笔的包围盒（选区本地坐标）。文字按"字号 × 字数"估一个框：够让人点着它就行。
+pub fn mark_bbox(m: &Mark) -> Option<(i32, i32, i32, i32)> {
+    match &m.shape {
+        Shape::Rect(x, y, w, h) | Shape::Block(x, y, w, h) | Shape::Mosaic(x, y, w, h) => {
+            Some((*x, *y, *x + *w, *y + *h))
+        }
+        Shape::Arrow(x0, y0, x1, y1) => Some((
+            (*x0).min(*x1),
+            (*y0).min(*y1),
+            (*x0).max(*x1),
+            (*y0).max(*y1),
+        )),
+        Shape::Pen(pts) => {
+            let (mut l, mut t, mut r, mut b) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+            for (x, y) in pts {
+                l = l.min(*x);
+                t = t.min(*y);
+                r = r.max(*x);
+                b = b.max(*y);
+            }
+            if pts.is_empty() {
+                None
+            } else {
+                Some((l, t, r, b))
+            }
+        }
+        Shape::Text(x, y, s) => {
+            // 至少占一个字号宽：空串也不许缩成一个点，否则选中它得像素级准
+            let f = m.style.font.max(1);
+            let w = (s.chars().count() as i32 * f).max(f);
+            Some((*x, *y, x + w, y + f))
+        }
+    }
+}
+
+/// 这一点压在这一笔上了吗。空心形状按"包围盒 + 容差"：粗笔本来就该宽松点得到。
+pub fn mark_hit(m: &Mark, x: i32, y: i32) -> bool {
+    let tol = (m.style.w / 2).max(4);
+    match &m.shape {
+        Shape::Rect(..) | Shape::Arrow(..) | Shape::Pen(..) => match mark_bbox(m) {
+            Some((l, t, r, b)) => x >= l - tol && x <= r + tol && y >= t - tol && y <= b + tol,
+            None => false,
+        },
+        Shape::Block(l, t, w, h) | Shape::Mosaic(l, t, w, h) => {
+            x >= *l && x < *l + *w && y >= *t && y < *t + *h
+        }
+        Shape::Text(..) => match mark_bbox(m) {
+            Some((l, t, r, b)) => x >= l && x <= r && y >= t && y <= b,
+            None => false,
+        },
+    }
+}
+
+/// 从最上面那笔往下找：后画的盖在前面那笔上，取消时也该先被拿到。
+pub fn topmost_hit(marks: &[Mark], x: i32, y: i32) -> Option<usize> {
+    marks
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| mark_hit(m, x, y))
+        .map(|(i, _)| i)
+}
+
+/// 把一笔整体搬 (dx,dy)。坐标都是选区局部 ⇒ 搬完直接就是最终位置，落盘不必再换算。
+pub fn move_mark(m: &mut Mark, dx: i32, dy: i32) {
+    match &mut m.shape {
+        Shape::Rect(x, y, ..) | Shape::Block(x, y, ..) | Shape::Mosaic(x, y, ..) => {
+            *x += dx;
+            *y += dy;
+        }
+        Shape::Arrow(x0, y0, x1, y1) => {
+            *x0 += dx;
+            *y0 += dy;
+            *x1 += dx;
+            *y1 += dy;
+        }
+        Shape::Pen(pts) => {
+            for p in pts.iter_mut() {
+                p.0 += dx;
+                p.1 += dy;
+            }
+        }
+        Shape::Text(x, y, _) => {
+            *x += dx;
+            *y += dy;
+        }
+    }
+}
+
 /// 拖笔的起点/当前点折成选区本地坐标里的一笔；太小（或太近）返回 `None` 不落 mark。
 pub fn shape_from_drag(
     tool: u8,
@@ -944,6 +1043,7 @@ pub fn btn_active(id: &str, tool: u8, color: u32, width: i32, font: i32) -> bool
         "mosaic" => tool == 3,
         "block" => tool == 4,
         "text" => tool == 5,
+        "pick" => tool == 6,
         c => {
             PALETTE.iter().any(|(v, id2)| *id2 == c && *v == color)
                 || WIDTHS.iter().any(|(v, id2)| *id2 == c && *v == width)
@@ -1205,6 +1305,8 @@ fn hover_at(
 enum Press {
     Bar(&'static str),
     Handle(u8),
+    /// 搬第 N 笔
+    Pick(usize),
     /// 在选区里落一笔（文字工具走 `Text`）
     Mark,
     /// 开文字框：客户区落点
@@ -1232,6 +1334,12 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                                 return Press::Handle(idx);
                             }
                             if inside_rect(s.sel, x, y) {
+                                if s.tool == 6 {
+                                    if let Some(i) = topmost_hit(&s.marks, x - s.sel.0, y - s.sel.1)
+                                    {
+                                        return Press::Pick(i);
+                                    }
+                                }
                                 return if s.tool == 5 {
                                     Press::Text(x, y)
                                 } else {
@@ -1250,9 +1358,22 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                         }
                         let _ = SetCapture(hwnd);
                     }
+                    Press::Pick(i) => {
+                        if let Ok(mut s) = SNIP.lock() {
+                            push_undo(&mut s);
+                            s.selected = Some(i);
+                            s.drag = Some((Drag::Pick(i), x, y));
+                            s.cur = (x, y);
+                        }
+                        let _ = SetCapture(hwnd);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
                     Press::Mark => {
                         let _ = SetCapture(hwnd);
                         if let Ok(mut s) = SNIP.lock() {
+                            if s.tool == 6 {
+                                s.selected = None;
+                            }
                             s.drag = Some((Drag::Mark, x, y));
                             s.cur = (x, y);
                             s.pen_pts = if s.tool == 2 {
@@ -1296,6 +1417,16 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                             if nr != s.sel {
                                 s.sel = nr;
                                 changed = true;
+                            }
+                        }
+                        Some((Drag::Pick(i), _, _)) => {
+                            if s.cur != (x, y) {
+                                let (dx, dy) = (x - s.cur.0, y - s.cur.1);
+                                s.cur = (x, y);
+                                if i < s.marks.len() {
+                                    move_mark(&mut s.marks[i], dx, dy);
+                                    changed = true;
+                                }
                             }
                         }
                         Some((Drag::Mark, sx, sy)) => {
@@ -1390,7 +1521,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                             }
                         }
                     }
-                    Some((Drag::Handle(_), _, _)) => {
+                    Some((Drag::Handle(_), _, _)) | Some((Drag::Pick(_), _, _)) => {
                         if let Ok(mut s) = SNIP.lock() {
                             s.drag = None;
                         }
@@ -1415,7 +1546,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                             .flatten();
                         if let Some(m) = mark {
                             if let Ok(mut s) = SNIP.lock() {
-                                s.redo.clear();
+                                push_undo(&mut s);
                                 s.marks.push(m);
                             }
                         }
@@ -1490,7 +1621,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                                     w: s.width,
                                     font: s.font,
                                 };
-                                s.redo.clear();
+                                push_undo(&mut s);
                                 s.marks.push(Mark {
                                     shape: Shape::Text(at.0, at.1, text),
                                     style: st,
@@ -1530,7 +1661,9 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     s.hover = None;
                     s.sel = (0, 0, 0, 0);
                     s.marks.clear();
-                    s.redo.clear();
+                    s.undo_stack.clear();
+                    s.redo_stack.clear();
+                    s.selected = None;
                     s.hits.clear();
                     s.text_edit = 0;
                     s.overlay = 0;
@@ -1557,7 +1690,7 @@ fn s_origin(_hwnd: HWND) -> (i32, i32) {
 /// 工具条某一颗按钮的落地动作。调用时**不许持着 `SNIP` 的锁**。
 unsafe fn bar_action(id: &'static str, hwnd: HWND) {
     match id {
-        t @ ("rect" | "arrow" | "pen" | "mosaic" | "block" | "text") => {
+        t @ ("rect" | "arrow" | "pen" | "mosaic" | "block" | "text" | "pick") => {
             if let Some(i) = TOOLS.iter().position(|x| *x == t) {
                 if let Ok(mut s) = SNIP.lock() {
                     s.tool = i as u8;
@@ -1585,20 +1718,8 @@ unsafe fn bar_action(id: &'static str, hwnd: HWND) {
                 }
             }
         }
-        "undo" => {
-            if let Ok(mut s) = SNIP.lock() {
-                if let Some(m) = s.marks.pop() {
-                    s.redo.push(m);
-                }
-            }
-        }
-        "redo" => {
-            if let Ok(mut s) = SNIP.lock() {
-                if let Some(m) = s.redo.pop() {
-                    s.marks.push(m);
-                }
-            }
-        }
+        "undo" => undo(),
+        "redo" => redo_mark(),
         "save" => {
             commit(false);
             let _ = DestroyWindow(hwnd);
@@ -1630,7 +1751,9 @@ unsafe fn finish_selection(hwnd: HWND, annotate: bool) {
         s.phase = Phase::Adjust;
         s.hover = None;
         s.marks.clear();
-        s.redo.clear();
+        s.undo_stack.clear();
+        s.redo_stack.clear();
+        s.selected = None;
     }
     // 把工具条每颗按钮的落点亮进日志：验收脚本据此点按钮，而不是自己抄一遍排版。
     if let Ok(s) = SNIP.lock() {
@@ -1665,6 +1788,8 @@ pub enum KeyAct {
     Pin,
     Undo,
     Redo,
+    /// 删掉当前选中的那一笔（没选中就等于没这个动作）
+    DeleteSelected,
     /// 选区偏移（搬 / 改大小由 shift 决定）
     Nudge(i32, i32, bool),
 }
@@ -1690,6 +1815,7 @@ pub fn key_action(vk: usize, ctrl: bool, shift: bool, in_adjust: bool) -> KeyAct
         0x08 if !ctrl => KeyAct::Undo,
         0x5A if ctrl && !shift => KeyAct::Undo,
         0x59 if ctrl => KeyAct::Redo,
+        0x2E => KeyAct::DeleteSelected,
         0x0D if in_adjust => KeyAct::Commit,
         0x53 if in_adjust && ctrl => KeyAct::Commit,
         0x50 if in_adjust => KeyAct::Pin,
@@ -1720,6 +1846,23 @@ unsafe fn on_key(hwnd: HWND, vk: usize) {
         }
         KeyAct::Undo => undo(),
         KeyAct::Redo => redo_mark(),
+        KeyAct::DeleteSelected => {
+            let mut del = false;
+            if let Ok(mut s) = SNIP.lock() {
+                if let Some(i) = s.selected {
+                    if i < s.marks.len() {
+                        push_undo(&mut s);
+                        s.marks.remove(i);
+                        del = true;
+                    }
+                }
+                s.selected = None;
+            }
+            if del {
+                tracing_note("截图标注 delete 删掉选中的那一笔");
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
         KeyAct::Nudge(dx, dy, by_size) => {
             if let Ok(mut s) = SNIP.lock() {
                 let (w, h) = (s.base_w, s.base_h);
@@ -1734,18 +1877,31 @@ unsafe fn on_key(hwnd: HWND, vk: usize) {
     }
 }
 
+/// 改动任何一笔之前先压一份当前状态：一次加笔、一次拖动、一次删除都恰好是一步撤销。
+fn push_undo(s: &mut SnipState) {
+    s.undo_stack.push(s.marks.clone());
+    s.redo_stack.clear();
+    s.selected = None;
+}
+
 fn undo() {
     if let Ok(mut s) = SNIP.lock() {
-        if let Some(m) = s.marks.pop() {
-            s.redo.push(m);
+        if let Some(prev) = s.undo_stack.pop() {
+            let cur = s.marks.clone();
+            s.redo_stack.push(cur);
+            s.marks = prev;
+            s.selected = None;
         }
     }
 }
 
 fn redo_mark() {
     if let Ok(mut s) = SNIP.lock() {
-        if let Some(m) = s.redo.pop() {
-            s.marks.push(m);
+        if let Some(next) = s.redo_stack.pop() {
+            let cur = s.marks.clone();
+            s.undo_stack.push(cur);
+            s.marks = next;
+            s.selected = None;
         }
     }
 }
@@ -1886,9 +2042,10 @@ unsafe fn paint(hwnd: HWND) {
         blit_bgra(hdc, &dim, bw, bh, 0, 0);
         // 2) 亮区：拖框中或选区已定用选区，Select 阶段用悬停命中的窗口
         let bright = match drag {
-            Some((Drag::New, _, _)) | Some((Drag::Handle(_), _, _)) | Some((Drag::Mark, _, _)) => {
-                Some(sel)
-            }
+            Some((Drag::New, _, _))
+            | Some((Drag::Handle(_), _, _))
+            | Some((Drag::Mark, _, _))
+            | Some((Drag::Pick(_), _, _)) => Some(sel),
             None => {
                 if phase == Phase::Adjust {
                     Some(sel)
@@ -1904,6 +2061,22 @@ unsafe fn paint(hwnd: HWND) {
             // 已画的标注：与烤图同一条路（色块/马赛克按像素算，其余走 GDI）
             for m in &marks {
                 draw_live(hdc, &base, bw, bh, rc, m);
+            }
+            // 选中的那一笔套一个白框：只在屏上画，不进合成结果
+            if let Some(i) = SNIP.lock().ok().and_then(|s| s.selected) {
+                if let Some(m) = marks.get(i) {
+                    if let Some((l, t, r, b)) = mark_bbox(m) {
+                        let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00FF_FFFF));
+                        let oldp = SelectObject(hdc, pen.into());
+                        let null = GetStockObject(NULL_BRUSH);
+                        let oldb = SelectObject(hdc, null);
+                        let _ =
+                            Rectangle(hdc, rc.0 + l - 3, rc.1 + t - 3, rc.0 + r + 3, rc.1 + b + 3);
+                        SelectObject(hdc, oldb);
+                        SelectObject(hdc, oldp);
+                        let _ = DeleteObject(pen.into());
+                    }
+                }
             }
             // 正在拖的那一笔
             if let Some((Drag::Mark, sx, sy)) = drag {
@@ -2166,7 +2339,9 @@ pub fn start(owner: HWND, annotate: bool) {
                     s.pen_pts.clear();
                     s.hover = None;
                     s.marks.clear();
-                    s.redo.clear();
+                    s.undo_stack.clear();
+                    s.redo_stack.clear();
+                    s.selected = None;
                     s.hits = hits;
                     s.overlay = ov.0 as isize;
                     s.text_edit = 0;
@@ -2724,6 +2899,57 @@ mod render_probe {
                 "还在按旧位置裁就是错的"
             );
 
+            // 选中并搬动某一笔（旧 Webview 版做不到）：切"选择"工具、压住色块拖 +30/+30。
+            // 之后的判据都用**当前**选区换算：前面那两条腿改过大小也挪过位置。
+            let cur = SNIP.lock().map(|s| s.sel).unwrap();
+            click_bar(ov, "pick");
+            let (px0, py0) = (cur.0 + 60, cur.1 + 60);
+            post_mouse(ov, WM_MOUSEMOVE, px0, py0);
+            post_mouse(ov, WM_LBUTTONDOWN, px0, py0);
+            pump(120);
+            post_mouse(ov, WM_MOUSEMOVE, px0 + 30, py0 + 30);
+            post_mouse(ov, WM_LBUTTONUP, px0 + 30, py0 + 30);
+            pump(250);
+            let (mv, mw3, _) = baked_selection().expect("搬完就没图了");
+            assert!(
+                same_as_base(&mv, mw3, &base, base_w, cur, 25, 25),
+                "搬走之后旧位置没让开"
+            );
+            assert_eq!(
+                pixel3(&mv, mw3, 140, 140),
+                [45, 45, 255],
+                "新落点没染上色块"
+            );
+
+            // Delete 删掉选中的那一笔，撤销再把它退回来（撤销按快照，删与搬共用同一条路）
+            let _ = PostMessageW(Some(ov), WM_KEYDOWN, WPARAM(0x2E), LPARAM(0)); // VK_DELETE
+            pump(250);
+            let (del, dw3, _) = baked_selection().expect("删完就没图了");
+            assert!(
+                same_as_base(&del, dw3, &base, base_w, cur, 140, 140),
+                "Delete 没删掉选中的那一笔"
+            );
+            click_bar(ov, "undo");
+            pump(250);
+            let (re, rw3, _) = baked_selection().expect("撤销删除后没图了");
+            assert_eq!(
+                pixel3(&re, rw3, 140, 140),
+                [45, 45, 255],
+                "撤销没把删除退回去"
+            );
+            click_bar(ov, "undo");
+            pump(250);
+            let (re2, rw4, _) = baked_selection().expect("第二次撤销后没图了");
+            assert!(
+                same_as_base(&re2, rw4, &base, base_w, cur, 140, 140),
+                "第二次撤销该把搬动也退掉"
+            );
+            assert_eq!(
+                pixel3(&re2, rw4, 25, 25),
+                [45, 45, 255],
+                "搬动退掉后原位置该重新红起来"
+            );
+
             let _ = DestroyWindow(ov);
             pump(200);
         }
@@ -3197,6 +3423,64 @@ mod tests {
         assert_eq!(repress_action(true, false), Repress::Busy);
     }
 
+    fn mk(shape: Shape, w: i32) -> Mark {
+        Mark {
+            shape,
+            style: Style {
+                rgb: rgb(255, 45, 45),
+                w,
+                font: 30,
+            },
+        }
+    }
+
+    #[test]
+    fn a_mark_is_grabbable_where_a_user_would_aim() {
+        // 实心块：块内算、块外不算，右边界是开区间（与画出来的像素一致）
+        let block = mk(Shape::Block(20, 20, 100, 80), 3);
+        assert!(mark_hit(&block, 60, 60));
+        assert!(!mark_hit(&block, 120, 60), "右边界不该算块内");
+        assert!(mark_hit(&block, 119, 99));
+        // 空心框：整框包围盒都认（挑那条边太难），粗笔再放宽容差
+        let rect = mk(Shape::Rect(0, 0, 50, 50), 7);
+        assert!(mark_hit(&rect, 3, 25));
+        assert!(mark_hit(&rect, 25, 25), "框内也认：这样才搬得动");
+        // 箭头与画笔：按走过点的包围盒
+        let arrow = mk(Shape::Arrow(10, 10, 90, 50), 3);
+        assert!(mark_hit(&arrow, 12, 12));
+        assert!(!mark_hit(&arrow, 200, 200));
+        let pen = mk(Shape::Pen(vec![(5, 5), (50, 40)]), 3);
+        assert!(mark_hit(&pen, 5, 5) && mark_hit(&pen, 50, 40) && !mark_hit(&pen, 300, 300));
+        assert!(
+            !mark_hit(&mk(Shape::Pen(vec![]), 3), 0, 0),
+            "空折线不该被选中"
+        );
+        // 文字：空串也要占一个字号宽，否则永远选不中
+        assert!(mark_hit(&mk(Shape::Text(10, 10, String::new()), 3), 20, 20));
+        let txt = mk(Shape::Text(10, 10, "四个字".to_string()), 3);
+        assert_eq!(mark_bbox(&txt), Some((10, 10, 100, 40)));
+        assert!(!mark_hit(&txt, 200, 20));
+    }
+
+    #[test]
+    fn the_topmost_mark_wins_and_move_shifts_every_point() {
+        let marks = vec![
+            mk(Shape::Block(0, 0, 100, 100), 3),
+            mk(Shape::Block(20, 20, 40, 40), 3),
+        ];
+        // 后画的盖在上面 ⇒ 压着小块时该选中后者；小块之外仍归大块
+        assert_eq!(topmost_hit(&marks, 30, 30), Some(1));
+        assert_eq!(topmost_hit(&marks, 5, 5), Some(0));
+        assert_eq!(topmost_hit(&marks, 500, 500), None);
+
+        let mut pen = mk(Shape::Pen(vec![(1, 2), (3, 4)]), 3);
+        move_mark(&mut pen, 10, -2);
+        assert_eq!(mark_bbox(&pen), Some((11, 0, 13, 2)));
+        let mut txt = mk(Shape::Text(5, 5, "x".to_string()), 3);
+        move_mark(&mut txt, 2, 3);
+        assert_eq!(mark_bbox(&txt), Some((7, 8, 37, 38)));
+    }
+
     #[test]
     fn keys_are_decided_before_any_window_work() {
         // 未定选区：只有 Esc 有用，其它键不许"提交一个空选区"
@@ -3215,6 +3499,8 @@ mod tests {
         assert_eq!(key_action(0x5A, true, false, true), KeyAct::Undo);
         assert_eq!(key_action(0x5A, false, false, true), KeyAct::Nothing);
         assert_eq!(key_action(0x59, true, false, true), KeyAct::Redo);
+        // Delete = 删选中的那一笔（没选中时 on_key 自己不动作）
+        assert_eq!(key_action(0x2E, false, false, true), KeyAct::DeleteSelected);
         // 方向键：搬 1 像素，Shift 改大小
         assert_eq!(
             key_action(0x25, false, false, true),

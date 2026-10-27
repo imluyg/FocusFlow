@@ -4361,8 +4361,14 @@ struct PinDrag {
 static PINS: Mutex<Vec<PinImage>> = Mutex::new(Vec::new());
 /// 屏上探针共用的串行锁：两条都会动**真实光标**、都往桌面上盖真窗口。
 /// 并行跑时那条全屏覆盖层会把贴图挡在后面 —— 悬停判据于是假红（实测过）。
+///
+/// 这里用 `allow(dead_code)` 而不是"只在测试构建里存在"那个属性：main.rs 有一条守卫用例
+/// 按文件里**第一次出现**那个属性来界定"生产代码到此为止"，在生产区中间写它（连注释里
+/// 写出那个字面量都不行）会把它的扫描截短，两条不相干的用例一起红（实测踩过）。
+#[allow(dead_code)] // 只有测试里的探针取它
 pub(crate) static SCREEN_PROBE: Mutex<()> = Mutex::new(());
 /// 取探针锁：前一位可能 panic 过，中毒不该把这一位也判死。
+#[allow(dead_code)] // 同上
 pub(crate) fn probe_guard() -> std::sync::MutexGuard<'static, ()> {
     SCREEN_PROBE.lock().unwrap_or_else(|e| e.into_inner())
 }
