@@ -218,6 +218,8 @@ pub struct SnipState {
     /// 文字标注的原生 EDIT 子窗口（存 isize：静态量要 Send）与落点（选区本地坐标）。
     text_edit: isize,
     text_at: (i32, i32),
+    /// 当前覆盖层的句柄数值（静态量要 Send）：再按一次标注热键要靠它放弃在飞的这一次。
+    overlay: isize,
     /// 冻结时把悬浮窗藏了：退出时要按原样还回去。
     pill_was: bool,
 }
@@ -246,6 +248,7 @@ const fn default_state() -> SnipState {
         font: FONTS[1].0,
         text_edit: 0,
         text_at: (0, 0),
+        overlay: 0,
         pill_was: false,
     }
 }
@@ -1493,6 +1496,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     s.redo.clear();
                     s.hits.clear();
                     s.text_edit = 0;
+                    s.overlay = 0;
                     s.base = Vec::new();
                     s.dim = Vec::new();
                     s.base_w = 0;
@@ -1997,6 +2001,31 @@ fn virtual_origin() -> (i32, i32) {
 
 // ===== 对外入口 =====
 
+/// 覆盖层已经开着的时候又按了一次热键，该怎么办。
+///
+/// 旧 Webview 版的口径：**再按一次标注热键 = 放弃在飞的这一次**（重开一次新的），
+/// 而另一条热键（松手即存）重按只出声不重开 —— 它的语义是"我要立刻出一张"，
+/// 在飞的选区被吃掉反而更糟。写成纯函数是因为"哪条键能打断"最容易写反。
+pub fn repress_action(active: bool, pressed_annotate: bool) -> Repress {
+    if !active {
+        Repress::Open
+    } else if pressed_annotate {
+        Repress::AbandonAndOpen
+    } else {
+        Repress::Busy
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Repress {
+    /// 没有在飞的会话，正常开
+    Open,
+    /// 有在飞的会话，但按的是标注键：先放弃它再开新的
+    AbandonAndOpen,
+    /// 有在飞的会话且不该打断
+    Busy,
+}
+
 /// 打开截图覆盖层（托盘菜单/设置页按钮/两条截图热键/测试钩子都走这里）。
 ///
 /// `annotate` = 松手后就地标注；`false` = 松手即存（PNG + 剪贴板），与旧版两条热键的分工一致。
@@ -2004,9 +2033,23 @@ fn virtual_origin() -> (i32, i32) {
 /// 顺序是这条路的要害：先藏悬浮窗 → 冻结整块虚拟屏 → 再建覆盖层。
 /// 反过来做的话覆盖层自己会进冻结图（它是全屏 topmost），而卡片会留在截图里。
 pub fn start(owner: HWND, annotate: bool) {
-    if let Ok(s) = SNIP.lock() {
-        if s.active {
+    let (active, inflight) = SNIP
+        .lock()
+        .map(|s| (s.active, s.overlay))
+        .unwrap_or((false, 0));
+    match repress_action(active, annotate) {
+        Repress::Open => {}
+        Repress::Busy => {
+            tracing_note("截图 snip-busy 已有一张在进行中");
             return;
+        }
+        Repress::AbandonAndOpen => {
+            tracing_note("截图 snip-repress 再按一次标注热键：放弃在飞的这一次，重开");
+            if inflight != 0 {
+                unsafe {
+                    let _ = DestroyWindow(HWND(inflight as *mut core::ffi::c_void));
+                }
+            }
         }
     }
     let (vx, vy) = virtual_origin();
@@ -2087,6 +2130,7 @@ pub fn start(owner: HWND, annotate: bool) {
                     s.marks.clear();
                     s.redo.clear();
                     s.hits = hits;
+                    s.overlay = ov.0 as isize;
                     s.text_edit = 0;
                     s.base = base;
                     s.dim = dim;
@@ -2621,6 +2665,16 @@ mod tests {
         // 快速版（没画任何东西）必须与原图逐字节相同：这条挡住"烤图顺手改了没标注的图"
         let img: Vec<u8> = (0..4 * 4 * 4).map(|i| i as u8).collect();
         assert_eq!(render_marks(&img, 4, 4, &[]), img);
+    }
+
+    #[test]
+    fn repressing_the_annotate_key_abandons_but_the_quick_key_does_not() {
+        // 没有在飞的会话：两条键都正常开
+        assert_eq!(repress_action(false, true), Repress::Open);
+        assert_eq!(repress_action(false, false), Repress::Open);
+        // 在飞：标注键打断并重来，快速键不打断（它的语义是"立刻出一张"，吃掉选区更糟）
+        assert_eq!(repress_action(true, true), Repress::AbandonAndOpen);
+        assert_eq!(repress_action(true, false), Repress::Busy);
     }
 
     #[test]

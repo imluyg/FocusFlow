@@ -268,6 +268,19 @@ if ($bBlock) {
 } else {
     Check 'the annotate round drove the toolbar' $false 'no snip-btn block in the log'
 }
+
+# Re-pressing the annotate hotkey abandons the in-flight selection and opens a fresh overlay
+# (the product logs 'snip-repress'); re-pressing the *quick* hotkey must not interrupt --
+# that path logs 'snip-busy' and keeps the current selection. The count of 'snip-arm-timeout'
+# lines is the observable that a second overlay really came up.
+$armedBefore = @(Get-SnipLog | Where-Object { $_ -match 'snip-arm-timeout' }).Count
+[void][FF]::PostMessage($h2, 0x8006, [IntPtr]1, [IntPtr]::Zero)     # WM_SNIP_START (annotate)
+Start-Sleep -Milliseconds 1500
+Check 'the log says the re-press abandoned the in-flight snip' (Wait-Log 'snip-repress')
+Check 'the re-pressed annotate hotkey brings the overlay back' `
+    ((@(Get-SnipLog | Where-Object { $_ -match 'snip-arm-timeout' }).Count) -gt $armedBefore)
+Check 'the overlay after the re-press belongs to this process' `
+    ([FF]::ByClass([uint32]$p2.Id, 'FocusFlowSnipOverlay') -ne [IntPtr]::Zero)
 Stop-Round $h2 $p2
 
 # ---------- round 2b: Backspace must undo the mark ----------
