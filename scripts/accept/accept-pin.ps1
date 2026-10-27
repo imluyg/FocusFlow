@@ -30,8 +30,9 @@ param(
 if (-not $Exe) { $Exe = Get-DefaultExe }
 if (-not $WorkDir) { $WorkDir = Join-Path (Get-RepoRoot) 'target\accept\pin' }
 
-$WM_PIN_TEST = 0x400 + 12
-$WM_PIN_CLOSE_ALL = 0x400 + 13
+# WM_APP is 0x8000 (0x400 is WM_USER) -- see main.rs const WM_PIN_TEST: u32 = WM_APP + 12.
+$WM_PIN_TEST = 0x8000 + 12
+$WM_PIN_CLOSE_ALL = 0x8000 + 13
 
 $app = Join-Path $WorkDir 'app'
 $logPath = Join-Path $WorkDir 'focusflow.log'
