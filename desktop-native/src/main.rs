@@ -47,14 +47,19 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, InvalidateRect, SetBkColor,
-    SetTextColor, StretchDIBits, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
-    FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, GetMonitorInfoW,
+    GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, Rectangle, SelectObject,
+    SetBkColor, SetBkMode, SetTextColor, StretchDIBits, TextOutW, UpdateWindow, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DIB_RGB_COLORS, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, SRCCOPY,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::Controls::MARGINS;
+// WM_MOUSELEAVE 在 UI::Controls 下（不在 WindowsAndMessaging）：写成裸名字会被当成
+// 匹配任意值的绑定，把后面的滚轮/右键/Esc/关窗分支全变成不可达。
+use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -4340,6 +4345,8 @@ struct PinImage {
     h: i32,
     /// 缩放档：滚轮按 10% 调，夹在 [`PIN_MIN_SCALE`]..=[`PIN_MAX_SCALE`]。
     scale: f32,
+    /// 缩放角标的显示起点：`None` = 不显示。滚轮每按一下重开一秒二。
+    badge: Option<std::time::Instant>,
 }
 
 /// 正在被拖的那一张：窗口、按下时的窗口左上角、按下时的光标坐标。
@@ -4353,6 +4360,87 @@ struct PinDrag {
 /// 桌面上开着的贴图。用 `Vec` 而不是 `HashMap`：`Mutex::new(Vec::new())` 才进得了 static。
 static PINS: Mutex<Vec<PinImage>> = Mutex::new(Vec::new());
 static PIN_DRAG: Mutex<Option<PinDrag>> = Mutex::new(None);
+
+/// 悬停在哪张贴图上：只有它显示 ✕（旧 Webview 版同一口径 —— 不悬停时不拿关闭按钮抢画面）。
+static PIN_HOVER: Mutex<Option<isize>> = Mutex::new(None);
+
+/// ✕ 的边长，以及它离右上角的内缩。
+const PIN_CLOSE_SIZE: i32 = 24;
+const PIN_CLOSE_INSET: i32 = 2;
+/// 缩放角标显示多久（毫秒）：旧 Webview 版是 1.2 秒，跟着它。
+const PIN_BADGE_MS: u32 = 1200;
+/// 那个一次性定时器 id（`0x5042` = 'PB'）：时间到就重画一次，把角标抹掉。
+const PIN_BADGE_TIMER: usize = 0x5042;
+
+/// ✕ 的落点（客户区左上角 + 边长）。图太小放不下就缩着贴，缩到 1 像素也仍在右上角，
+/// 不许算出负坐标 —— 负坐标的按钮永远点不到，等于把这条退路偷偷关掉。
+fn pin_close_box(w: i32, h: i32) -> (i32, i32, i32, i32) {
+    let side = PIN_CLOSE_SIZE
+        .min((w / 3).max(1))
+        .min((h / 3).max(1))
+        .max(1);
+    let inset = PIN_CLOSE_INSET
+        .min((w - side).max(0))
+        .min((h - side).max(0));
+    (w - side - inset, inset, side, side)
+}
+
+/// 角标上的字：`125%`（四舍五入到整百分点）。
+fn pin_badge_text(scale: f32) -> String {
+    format!("{}%", (scale * 100.0).round() as i32)
+}
+
+/// 放大之后把窗口拉回工作区，让右上角那颗 ✕ 还够得着。
+///
+/// 只夹"够得着"这一件事：贴住边就停，不强行整窗可见 —— 一张比屏还高的贴图本来就该
+/// 能贴着上沿放，把整窗硬塞进来会让用户以为贴图跑掉了。
+fn pin_keep_close_visible(
+    pos: (i32, i32),
+    size: (i32, i32),
+    work: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let mut x = pos.0;
+    let mut y = pos.1;
+    if x + size.0 > work.2 {
+        x = work.2 - size.0;
+    }
+    if x < work.0 {
+        x = work.0;
+    }
+    if y + size.1 > work.3 {
+        y = work.3 - size.1;
+    }
+    if y < work.1 {
+        y = work.1;
+    }
+    (x, y)
+}
+
+/// 这张贴图所在显示器的**工作区**（已经扣掉任务栏那一条）。
+fn pin_work_area(hwnd: HWND) -> (i32, i32, i32, i32) {
+    unsafe {
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mut mi = mi;
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return (
+                mi.rcWork.left,
+                mi.rcWork.top,
+                mi.rcWork.right,
+                mi.rcWork.bottom,
+            );
+        }
+        (
+            0,
+            0,
+            GetSystemMetrics(SM_CXSCREEN),
+            GetSystemMetrics(SM_CYSCREEN),
+        )
+    }
+}
 
 const PIN_MIN_SCALE: f32 = 0.25;
 const PIN_MAX_SCALE: f32 = 4.0;
@@ -4407,10 +4495,16 @@ fn open_pin(img: Vec<u8>, w: i32, h: i32, x: i32, y: i32) -> Option<HWND> {
                         w,
                         h,
                         scale: 1.0,
+                        badge: None,
                     });
                 }
                 let _ = SetFocus(Some(pin_hwnd));
                 tracing_note(&format!("贴图 pin-open {w}x{h} at {x},{y}"));
+                // 把 ✕ 的尺寸与角标时长告诉外面：验收脚本按这一行找那颗按钮，
+                // 不自己抄第二把尺子（这仓里"同一个常量写两遍"栽过不止一次）。
+                tracing_note(&format!(
+                    "贴图 pin-chrome close_size={PIN_CLOSE_SIZE} close_inset={PIN_CLOSE_INSET} badge_ms={PIN_BADGE_MS}"
+                ));
                 Some(pin_hwnd)
             }
             Err(e) => {
@@ -4447,6 +4541,14 @@ fn pin_set_scale(hwnd: HWND, scale: f32) {
     let (w, h) = pin_scaled_size(p.w, p.h, scale);
     unsafe {
         let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+        // 放大后右上角的 ✕ 可能顶到屏幕外：把窗口拉回工作区，让那颗按钮还够得着。
+        let mut rc = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut rc);
+        let (nx, ny) = pin_keep_close_visible((rc.left, rc.top), (w, h), pin_work_area(hwnd));
+        if nx != rc.left || ny != rc.top {
+            let _ = SetWindowPos(hwnd, None, nx, ny, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+            tracing_note(&format!("贴图 pin-move 为保证 ✕ 可见挪到 {nx},{ny}"));
+        }
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
@@ -4521,17 +4623,96 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                         DIB_RGB_COLORS,
                         SRCCOPY,
                     );
+                    let cw = rc.right - rc.left;
+                    let ch = rc.bottom - rc.top;
+                    // 悬停才显示 ✕：贴图常常一排贴在桌面角落，常驻的关闭按钮会挡住图本身。
+                    let hovered = PIN_HOVER
+                        .lock()
+                        .map(|h| *h == Some(hwnd.0 as isize))
+                        .unwrap_or(false);
+                    if hovered {
+                        let (bx, by, bs, _) = pin_close_box(cw, ch);
+                        let bg = CreateSolidBrush(COLORREF(0x0020_2020));
+                        let oldb = SelectObject(hdc, bg.into());
+                        let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00E0_E0E0));
+                        let oldp = SelectObject(hdc, pen.into());
+                        let _ = Rectangle(hdc, bx, by, bx + bs, by + bs);
+                        let pad = (bs / 4).max(2);
+                        let _ = MoveToEx(hdc, bx + pad, by + pad, None);
+                        let _ = LineTo(hdc, bx + bs - pad, by + bs - pad);
+                        let _ = MoveToEx(hdc, bx + bs - pad, by + pad, None);
+                        let _ = LineTo(hdc, bx + pad, by + bs - pad);
+                        SelectObject(hdc, oldp);
+                        SelectObject(hdc, oldb);
+                        let _ = DeleteObject(pen.into());
+                        let _ = DeleteObject(bg.into());
+                    }
+                    // 缩放角标：只在滚轮之后的一秒二里出现（旧版同款，量完就自己抹掉）。
+                    let show_badge = p
+                        .badge
+                        .map(|t| {
+                            t.elapsed() < std::time::Duration::from_millis(PIN_BADGE_MS as u64)
+                        })
+                        .unwrap_or(false);
+                    if show_badge {
+                        let font = CreateFontW(
+                            16,
+                            0,
+                            0,
+                            0,
+                            FW_NORMAL.0 as i32,
+                            0,
+                            0,
+                            0,
+                            DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS,
+                            CLIP_DEFAULT_PRECIS,
+                            CLEARTYPE_QUALITY,
+                            DEFAULT_PITCH.0 as u32,
+                            w!("Microsoft YaHei UI"),
+                        );
+                        let oldf = SelectObject(hdc, font.into());
+                        let bg = CreateSolidBrush(COLORREF(0x0020_2020));
+                        let oldb = SelectObject(hdc, bg.into());
+                        let _ = Rectangle(hdc, 4, ch - 26, 74, ch - 4);
+                        let null = GetStockObject(NULL_BRUSH);
+                        let _ = SelectObject(hdc, null);
+                        let _ = SetTextColor(hdc, COLORREF(0x00FF_FFFF));
+                        let _ = SetBkMode(hdc, TRANSPARENT);
+                        let text = pin_badge_text(p.scale);
+                        let wide: Vec<u16> = text.encode_utf16().collect();
+                        let _ = TextOutW(hdc, 10, ch - 22, &wide);
+                        SelectObject(hdc, oldb);
+                        SelectObject(hdc, oldf);
+                        let _ = DeleteObject(bg.into());
+                        let _ = DeleteObject(font.into());
+                    }
                 }
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
                 let _ = SetFocus(Some(hwnd));
-                let _ = SetCapture(hwnd);
                 let cur = (
                     (l.0 & 0xFFFF) as i16 as i32,
                     ((l.0 >> 16) & 0xFFFF) as i16 as i32,
                 );
+                let mut cr = RECT::default();
+                let _ = GetClientRect(hwnd, &mut cr);
+                let (bx, by, bs, _) = pin_close_box(cr.right - cr.left, cr.bottom - cr.top);
+                let hovered = PIN_HOVER
+                    .lock()
+                    .map(|h| *h == Some(hwnd.0 as isize))
+                    .unwrap_or(false);
+                if hovered && cur.0 >= bx && cur.0 < bx + bs && cur.1 >= by && cur.1 < by + bs {
+                    // 点 ✕ = 关掉这一张：与右键、Esc 是同一条退路，只多了一个看得见的入口。
+                    // 只有按钮**画出来了**的那一张才认这一下 —— 否则用户想拖贴图、
+                    // 按在右上角就把它关掉了，那是不存在的按钮咬人。
+                    tracing_note("贴图 pin-close-btn 点了 ✕");
+                    let _ = DestroyWindow(hwnd);
+                    return LRESULT(0);
+                }
+                let _ = SetCapture(hwnd);
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rc);
                 if let Ok(mut d) = PIN_DRAG.lock() {
@@ -4544,23 +4725,77 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
-                let Some(drag) = PIN_DRAG.lock().ok().and_then(|d| *d) else {
-                    return LRESULT(0);
-                };
-                if drag.hwnd != hwnd.0 as isize {
-                    return LRESULT(0);
-                }
                 let cx = (l.0 & 0xFFFF) as i16 as i32;
                 let cy = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    drag.origin.0 + (cx - drag.cursor.0),
-                    drag.origin.1 + (cy - drag.cursor.1),
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER,
-                );
+                let drag = PIN_DRAG.lock().ok().and_then(|d| *d);
+                if let Some(d) = drag.filter(|d| d.hwnd == hwnd.0 as isize) {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        d.origin.0 + (cx - d.cursor.0),
+                        d.origin.1 + (cy - d.cursor.1),
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER,
+                    );
+                    return LRESULT(0);
+                }
+                // 不在拖动：这一趟只判"光标是不是压在 ✕ 上"，压着才把按钮画出来。
+                if pin_find(hwnd.0 as isize).is_none() {
+                    return LRESULT(0);
+                }
+                let mut cr = RECT::default();
+                let _ = GetClientRect(hwnd, &mut cr);
+                let (bx, by, bs, _) = pin_close_box(cr.right - cr.left, cr.bottom - cr.top);
+                let over = cx >= bx && cx < bx + bs && cy >= by && cy < by + bs;
+                let changed = PIN_HOVER
+                    .lock()
+                    .map(|mut h| {
+                        let prev = *h;
+                        *h = if over {
+                            Some(hwnd.0 as isize)
+                        } else if prev == Some(hwnd.0 as isize) {
+                            None
+                        } else {
+                            prev
+                        };
+                        prev != *h
+                    })
+                    .unwrap_or(false);
+                let _ = TrackMouseEvent(&mut TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                });
+                if changed {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSELEAVE => {
+                let changed = PIN_HOVER
+                    .lock()
+                    .map(|mut h| {
+                        if *h == Some(hwnd.0 as isize) {
+                            *h = None;
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if changed {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                LRESULT(0)
+            }
+            WM_TIMER => {
+                // 只挂了一个定时器（角标到期重画），id 照样要对上：别的 WM_TIMER 不该被当成它。
+                if w.0 == PIN_BADGE_TIMER {
+                    let _ = KillTimer(Some(hwnd), PIN_BADGE_TIMER);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
@@ -4573,7 +4808,19 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             WM_MOUSEWHEEL => {
                 let notches = (w.0 >> 16) as i16 as f32 / 120.0;
                 let base = pin_find(hwnd.0 as isize).map(|p| p.scale).unwrap_or(1.0);
-                pin_set_scale(hwnd, pin_next_scale(base, notches));
+                let next = pin_next_scale(base, notches);
+                pin_set_scale(hwnd, next);
+                // 角标开一秒二：缩放档只有配着数字才知道现在是多少。
+                if let Ok(mut v) = PINS.lock() {
+                    if let Some(item) = v.iter_mut().find(|x| x.hwnd == hwnd.0 as isize) {
+                        item.badge = Some(std::time::Instant::now());
+                    }
+                }
+                let _ = SetTimer(Some(hwnd), PIN_BADGE_TIMER, PIN_BADGE_MS, None);
+                tracing_note(&format!(
+                    "贴图 pin-scale {}%",
+                    (next * 100.0).round() as i32
+                ));
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
@@ -4588,6 +4835,14 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 if let Ok(mut v) = PINS.lock() {
                     v.retain(|p| p.hwnd != hwnd.0 as isize);
                 }
+                // 悬停标记必须跟着清：句柄数值会被系统复用，留着它会让**下一张**贴图
+                // 一开出来就顶着 ✕（而这张贴图还没被碰过）。
+                if let Ok(mut h) = PIN_HOVER.lock() {
+                    if *h == Some(hwnd.0 as isize) {
+                        *h = None;
+                    }
+                }
+                let _ = KillTimer(Some(hwnd), PIN_BADGE_TIMER);
                 tracing_note("贴图 pin-close");
                 LRESULT(0)
             }
@@ -8014,6 +8269,47 @@ mod user_file_write_tests {
 #[cfg(test)]
 mod pin_tests {
     use super::*;
+
+    /// ✕ 的落点：常规尺寸贴右上角；图缩到放不下也必须还在窗内。
+    #[test]
+    fn the_close_box_stays_inside_even_a_tiny_pin() {
+        assert_eq!(pin_close_box(120, 80), (94, 2, 24, 24));
+        assert_eq!(pin_close_box(30, 20), (22, 2, 6, 6));
+        let (x, y, s, _) = pin_close_box(1, 1);
+        assert!(s >= 1 && x >= 0 && y >= 0 && x + s <= 1 && y + s <= 1);
+    }
+
+    #[test]
+    fn the_badge_reads_the_scale_as_whole_percent() {
+        assert_eq!(pin_badge_text(1.0), "100%");
+        assert_eq!(pin_badge_text(1.1), "110%");
+        assert_eq!(pin_badge_text(0.25), "25%");
+        assert_eq!(pin_badge_text(4.0), "400%");
+    }
+
+    /// 放大后把窗口拉回工作区，为的是右上角那颗 ✕ 还够得着。
+    #[test]
+    fn a_zoomed_pin_is_pulled_back_so_the_close_button_reaches() {
+        let work = (0, 0, 1920, 1040);
+        assert_eq!(
+            pin_keep_close_visible((1700, 100), (400, 300), work),
+            (1520, 100)
+        );
+        assert_eq!(
+            pin_keep_close_visible((100, 900), (200, 300), work),
+            (100, 740)
+        );
+        // 比工作区还宽：贴住左边，不许跟着越界跑
+        assert_eq!(
+            pin_keep_close_visible((100, 100), (2400, 300), work),
+            (0, 100)
+        );
+        // 本来就在里面：一动不动
+        assert_eq!(
+            pin_keep_close_visible((100, 100), (200, 200), work),
+            (100, 100)
+        );
+    }
 
     /// 往上滚一格必须变大、往下滚一格必须变小：写反了症状是"想放大结果糊成一条线"。
     #[test]

@@ -249,6 +249,46 @@ $memAfter = Get-Memory $p2
 ("info: memory after 12 pins ws={0:N1} MB private={1:N1} MB (was ws={2:N1} MB private={3:N1} MB)" -f `
     $memAfter.WsMb, $memAfter.PrivateMb, $memBefore.WsMb, $memBefore.PrivateMb)
 
+# ---------- the hover-revealed close box, and the percent the zoom reports ----------
+# The product says where its own button is ('pin-chrome'), so the harness does not carry a
+# second copy of the ruler. Twelve pins are on the desktop at this point: the click has to
+# take exactly one away, which is also what separates a close-one path from close-all.
+$chrome = @(Get-PinLog | Where-Object { $_ -match 'pin-chrome close_size=(\d+) close_inset=(\d+)' })
+Check 'the pin reports its own close-button geometry' ($chrome.Count -gt 0)
+if ($chrome.Count -gt 0) {
+    $m = [regex]::Match($chrome[0], 'close_size=(\d+) close_inset=(\d+)')
+    $cs = [int]$m.Groups[1].Value
+    $ci = [int]$m.Groups[2].Value
+    $one = [FF]::ByClass([uint32]$p2.Id, 'FocusFlowPin')
+    $r = Get-Rect $one
+    $hx = $r.X + $r.W - $ci - [int]($cs / 2)
+    $hy = $r.Y + $ci + [int]($cs / 2)
+    $beforeBtn = (Count-Pins $p2.Id).Count
+    # The pointer has to actually be on that pin: the cross only appears -- and only answers --
+    # while it is hovered, otherwise dragging a pin by its top-right corner would close it.
+    [void][FF]::SetCursorPos($hx, $hy)
+    Start-Sleep -Milliseconds 400
+    Click-Screen $hx $hy
+    Start-Sleep -Milliseconds 1200
+    $afterBtn = (Count-Pins $p2.Id).Count
+    Check 'clicking the close box shuts exactly that one pin' ($afterBtn -eq ($beforeBtn - 1)) `
+        "pins $beforeBtn -> $afterBtn"
+    Check 'the log names the button path' (@(Get-PinLog | Where-Object { $_ -match 'pin-close-btn' }).Count -gt 0)
+}
+
+# The badge itself has no machine-readable text; what is measurable is that every wheel step
+# reports the same percentage the badge shows.
+$wheelBefore = @(Get-PinLog | Where-Object { $_ -match 'pin-scale' }).Count
+$zPin = [FF]::ByClass([uint32]$p2.Id, 'FocusFlowPin')
+if ($zPin -ne [IntPtr]::Zero) {
+    [void][FF]::PostMessage($zPin, 0x020A, [IntPtr](120 -shl 16), [IntPtr]0)   # WM_MOUSEWHEEL up one notch
+    Start-Sleep -Milliseconds 800
+    Check 'the wheel step reports its percent' `
+        ((@(Get-PinLog | Where-Object { $_ -match 'pin-scale' }).Count) -gt $wheelBefore)
+} else {
+    Check 'the wheel step found a pin to zoom' $false 'no pin window left'
+}
+
 Quit-Round $h2 $p2
 
 Show-Summary
