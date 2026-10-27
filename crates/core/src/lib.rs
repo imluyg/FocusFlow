@@ -20,6 +20,7 @@ pub mod migration;
 pub mod paths;
 pub mod plugins;
 pub mod pomodoro;
+pub mod reveal;
 pub mod scheduler;
 pub mod startup;
 pub mod stats;

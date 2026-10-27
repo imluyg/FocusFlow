@@ -6482,12 +6482,22 @@ fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenu
     let menu = Menu::new();
     let show = MenuItem::with_id("show", "显示主窗口", true, None);
     let snip = MenuItem::with_id("snip", "截图（选区）", true, None);
+    // 直达最近那张：截图之后不用专门去文件夹里挑（旧 Webview 版有这一项，换原生时丢了）。
+    let snip_folder = MenuItem::with_id("snip_folder", "打开截图文件夹", true, None);
     let floating_item = MenuItem::with_id("floating", "悬浮窗", true, None);
     // 暂停是运行时开关（不写配置）：它只停"计数"，不改变"是否启用采集"这件事。
     let pause = CheckMenuItem::with_id("pause", "暂停采集", true, collect::is_paused(), None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
     let sep = PredefinedMenuItem::separator();
-    if let Err(e) = menu.append_items(&[&show, &snip, &floating_item, &pause, &sep, &quit]) {
+    if let Err(e) = menu.append_items(&[
+        &show,
+        &snip,
+        &snip_folder,
+        &floating_item,
+        &pause,
+        &sep,
+        &quit,
+    ]) {
         tracing_note(&format!("托盘菜单构建失败：{e}"));
         return (None, None);
     }
@@ -7069,6 +7079,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 match ev.id.as_ref() {
                     "show" => unsafe { bring_to_front(hwnd) },
                     "snip" => snip::start(hwnd, true),
+                    "snip_folder" => {
+                        // 成与败都写日志：托盘点下去"没反应"是这条功能唯一的故障形态，
+                        // 不吭声就等于把失败吞掉（旧 Webview 版同一条口径）。
+                        match focusflow_core::reveal::reveal_last_screenshot() {
+                            Ok(msg) => tracing_note(&format!("截图目录：{msg}")),
+                            Err(e) => tracing_note(&format!("截图目录打不开：{e}")),
+                        }
+                    }
                     "floating" => {
                         toggle_floating(hwnd, None);
                         unsafe {
