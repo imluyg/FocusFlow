@@ -1370,6 +1370,9 @@ unsafe fn commit_and_close_into(hwnd: HWND, pin: bool, dir: &std::path::Path, cl
                 // 否则屏上没有一个"再试一次"的落点，等于把这句原因也一起吞了。
                 s.phase = Phase::Adjust;
                 s.drag = None;
+                // 这一场事实上已经变成标注场：绝对上限得跟着改。快速那条只有 60 秒，
+                // 不跟着改的话，用户还在读那句原因、还在腾磁盘，第一记定时器就把覆盖层收走了。
+                s.ceiling_ms = snip_ceiling_ms(true);
             }
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
@@ -3650,6 +3653,46 @@ mod render_probe {
                 "落盘那张里没有已画的标注"
             );
             let _ = std::fs::remove_dir_all(&ctmp);
+
+            // 快速那条（松手即存）被失败留下来之后，这一场实际就是标注场：绝对上限得跟着变成 10 分钟。
+            // 不跟着改的话，它自己那 60 秒那一档会在用户还在读那句原因、还在腾磁盘时把覆盖层收走。
+            // 这一段全程不投"松手"——松手会走产品那条真实去向（往用户目录写一张、盖掉他的剪贴板），
+            // 只把选区拖出来，然后直接调注入版出图。
+            start(HWND(std::ptr::null_mut()), false);
+            pump(400);
+            let ov2 = SNIP
+                .lock()
+                .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
+                .unwrap_or(HWND(std::ptr::null_mut()));
+            assert!(IsWindow(Some(ov2)).as_bool(), "快速那条会话没建出覆盖层");
+            assert_eq!(
+                SNIP.lock().map(|s| s.ceiling_ms).unwrap_or(0),
+                60_000,
+                "快速会话一开始该顶着 60 秒那档"
+            );
+            post_mouse(ov2, WM_LBUTTONDOWN, 40, 40);
+            post_mouse(ov2, WM_MOUSEMOVE, 240, 200);
+            pump(150);
+            let ctmp2 = std::env::temp_dir().join(format!("ff_snip_quick_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&ctmp2);
+            std::fs::create_dir_all(&ctmp2).expect("第二个临时目录建不出来");
+            let blocked2 = ctmp2.join("不是一个目录");
+            std::fs::write(&blocked2, b"x").expect("占位文件写不出去");
+            commit_and_close_into(ov2, false, &blocked2, false);
+            pump(250);
+            let after = SNIP
+                .lock()
+                .map(|s| (s.phase, s.ceiling_ms, IsWindow(Some(ov2)).as_bool()))
+                .unwrap_or((Phase::Select, 0, false));
+            assert!(after.2, "快速那条失败也没留下覆盖层");
+            assert_eq!(after.0, Phase::Adjust, "失败之后没进可以重试的那一格");
+            assert_eq!(
+                after.1, 600_000,
+                "留下来的会话还顶着快速那 60 秒的上限：读句子的时候会被收走"
+            );
+            let _ = DestroyWindow(ov2);
+            pump(200);
+            let _ = std::fs::remove_dir_all(&ctmp2);
 
             let _ = DestroyWindow(ov);
             pump(200);
