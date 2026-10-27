@@ -18,12 +18,12 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRectRgn,
-    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, ExtCreatePen, GetClipRgn, GetDC,
-    GetStockObject, GetTextExtentPoint32W, InvalidateRect, LineTo, MoveToEx, Rectangle, ReleaseDC,
-    SelectClipRgn, SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, TextOutW, BITMAPINFO,
-    BS_SOLID, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DIB_RGB_COLORS, FW_NORMAL, HDC, HPEN, LOGBRUSH, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-    PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, TRANSPARENT,
+    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, ExtCreatePen, GetDC, GetStockObject,
+    GetTextExtentPoint32W, InvalidateRect, LineTo, MoveToEx, Rectangle, ReleaseDC, SelectClipRgn,
+    SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, TextOutW, BITMAPINFO, BS_SOLID,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
+    FW_NORMAL, HDC, HPEN, LOGBRUSH, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_ENDCAP_ROUND,
+    PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -1860,8 +1860,6 @@ unsafe fn paint(hwnd: HWND) {
                 }
             }
         };
-        let clip_saved = CreateRectRgn(0, 0, 0, 0);
-        let _ = GetClipRgn(hdc, clip_saved);
         if let Some(rc) = bright {
             let rg = CreateRectRgn(rc.0, rc.1, rc.2, rc.3);
             let _ = SelectClipRgn(hdc, Some(rg));
@@ -1903,7 +1901,20 @@ unsafe fn paint(hwnd: HWND) {
                     );
                 }
             }
-            // 选区外框 + 手柄
+            // 选区外框 + 手柄：**先退出裁剪区**再画。
+            // `SelectClipRgn(hdc, None)` 才是"回到可见区域"；别拿 `GetClipRgn` 复制出来的那份去
+            // 恢复 —— BeginPaint 的 DC 上它常返回 0 且区域是**空的**，选回去等于把边框、手柄、
+            // 尺寸读数与整条工具条全部裁掉（这条由屏上探针逮到：整幅里一个橙/白像素都没有）。
+            let _ = SelectClipRgn(hdc, None);
+            let _ = DeleteObject(rg.into());
+            // 尺寸读数先画：它的深色底盒会从选区上沿往下压几个像素，后画的话会把左上角
+            // 那颗手柄糊掉（屏上探针量到那颗是 [0,0,0]）。
+            draw_chip(
+                hdc,
+                rc.0,
+                rc.1 - 24,
+                &format!("{} × {}", rc.2 - rc.0, rc.3 - rc.1),
+            );
             let pen = CreatePen(PS_SOLID, 2, COLORREF(ACCENT));
             let oldp = SelectObject(hdc, pen.into());
             let null = GetStockObject(NULL_BRUSH);
@@ -1931,20 +1942,10 @@ unsafe fn paint(hwnd: HWND) {
                     let _ = DeleteObject(brush.into());
                 }
             }
-            let _ = SelectClipRgn(hdc, Some(clip_saved));
-            let _ = DeleteObject(rg.into());
-            // 3) 尺寸读数（选区左上角上方 22 像素，物理像素计数）—— 不夹在选区里
-            draw_chip(
-                hdc,
-                rc.0,
-                rc.1 - 24,
-                &format!("{} × {}", rc.2 - rc.0, rc.3 - rc.1),
-            );
         }
         if phase == Phase::Adjust {
             draw_bar(hdc, sel, bw, bh);
         }
-        let _ = DeleteObject(clip_saved.into());
         let _ = EndPaint(hwnd, &ps);
     }
 }
@@ -2207,6 +2208,255 @@ pub fn test_capture_to(rect: (i32, i32, i32, i32), out: &std::path::Path) {
             }
         }
         Err(e) => tracing_note(&format!("截图测试失败：{e}")),
+    }
+}
+
+#[cfg(test)]
+mod render_probe {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::{BitBlt, CreateCompatibleBitmap, GetDIBits, SRCCOPY};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+
+    /// 把消息跑掉一段**有界**时间：测试不许因为一条没来的消息挂在那儿。
+    unsafe fn pump(ms: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
+        while std::time::Instant::now() < deadline {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    unsafe fn post_mouse(hwnd: HWND, msg: u32, x: i32, y: i32) {
+        let lp = (((y & 0xFFFF) as isize) << 16) | ((x & 0xFFFF) as isize);
+        let _ = PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(lp));
+    }
+
+    /// 窗口自己长什么样：从窗口 DC 直接 BitBlt 一块 32bpp 位图读回像素。
+    ///
+    /// 用 `PrintWindow` 反而拿不到：那条 API 在 windows-rs 0.61 挂在 `Storage::Xps` 下，
+    /// 而覆盖层是普通 GDI 窗口（不是分层/合成窗口），窗口 DC 里就是它画上去的那些像素。
+    unsafe fn print_window(hwnd: HWND) -> Option<(Vec<u8>, i32, i32)> {
+        let mut rc = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut rc);
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(Some(screen));
+        let bmp = CreateCompatibleBitmap(screen, w, h);
+        let old = SelectObject(mem, bmp.into());
+        let wd = GetDC(Some(hwnd));
+        let ok = BitBlt(mem, 0, 0, w, h, Some(wd), 0, 0, SRCCOPY).is_ok();
+        ReleaseDC(Some(hwnd), wd);
+        let mut info = BITMAPINFO {
+            bmiHeader: focusflow_core::capture::win::dib_header(w as u32, h as u32),
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        let lines = GetDIBits(
+            mem,
+            bmp,
+            0,
+            h as u32,
+            Some(buf.as_mut_ptr() as *mut _),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        SelectObject(mem, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+        if !ok || lines == 0 {
+            return None;
+        }
+        Some((buf, w, h))
+    }
+
+    /// 客户区坐标 -> 截图里的偏移（截图含窗口边框；这个窗口是 WS_POPUP 无边框，
+    /// 但 DWM 给的位置与客户区原点仍可能差一截 —— 所以偏移由**调用处实测**得到）。
+    fn at(shot: &[u8], sw: i32, x: i32, y: i32) -> [u8; 3] {
+        let i = ((y as usize) * sw as usize + x as usize) * 4;
+        [shot[i], shot[i + 1], shot[i + 2]]
+    }
+
+    /// 覆盖层**真的画出来了**吗：选区里的像素要等于手里那份冻结图，选区外要等于压暗的那份，
+    /// 八个手柄与选区边框、工具条底色都要在它们该在的位置上。
+    ///
+    /// 为什么要这条：GUI 验收套件要起第二个进程，而那份进程抢不到单实例互斥体就会直接退 ——
+    /// 用户自己的 app 在跑的时候，那是唯一还能看见屏上形状的办法。
+    /// 它同时钉住"裁的位置对不对"这一族（旧账：覆盖层带 caption 时整图偏左上 8×1）。
+    ///
+    /// 会在全屏盖一层 topmost 窗口约一秒，所以默认不跑：
+    /// `cargo test -p focusflow-native --bins -- --ignored the_overlay`
+    #[test]
+    #[ignore = "会真的在屏幕上盖一层全屏覆盖层"]
+    fn the_overlay_paints_the_frozen_pixels_inside_and_the_veil_outside() {
+        unsafe {
+            let owner = HWND(std::ptr::null_mut());
+            start(owner, true);
+            pump(400);
+            let (ov, base, dim, base_w) = SNIP
+                .lock()
+                .map(|s| {
+                    (
+                        HWND(s.overlay as *mut core::ffi::c_void),
+                        s.base.clone(),
+                        s.dim.clone(),
+                        s.base_w,
+                    )
+                })
+                .expect("SNIP 取不到");
+            assert_ne!(ov.0, std::ptr::null_mut(), "覆盖层没建出来");
+            assert!(!base.is_empty(), "冻结缓冲是空的：start 就没抓到屏");
+
+            // 拖一个选区（客户区坐标 = 虚拟屏坐标 - 虚拟屏原点）
+            post_mouse(ov, WM_LBUTTONDOWN, 240, 200);
+            post_mouse(ov, WM_MOUSEMOVE, 640, 460);
+            post_mouse(ov, WM_LBUTTONUP, 640, 460);
+            pump(500);
+
+            let (sel, phase) = SNIP.lock().map(|s| (s.sel, s.phase)).unwrap();
+            assert_eq!(phase, Phase::Adjust, "松手后没进标注阶段");
+            let shot = print_window(ov).expect("PrintWindow 没拿到像素");
+            let (sh, sw, sh_h) = shot;
+            assert!(sw > 0 && sh_h > 0);
+            // 这个窗口是 WS_POPUP 无边框，PrintWindow 拿到的就是客户区本身 ⇒ 不需要偏移换算；
+            // 真要出现偏移，下面那条 assert 的报错里会直接指出差多少（旧账是整图偏左上 8×1）。
+            let inside = at(&sh, sw, (sel.0 + sel.2) / 2, (sel.1 + sel.3) / 2);
+            let want_in = {
+                let x = (sel.0 + sel.2) / 2;
+                let y = (sel.1 + sel.3) / 2;
+                let i = ((y as usize) * base_w as usize + x as usize) * 4;
+                [base[i], base[i + 1], base[i + 2]]
+            };
+            assert_eq!(inside, want_in, "选区里画的不该是原图还是什么？");
+            let outside = at(&sh, sw, 12, 12);
+            let want_out = {
+                let i = (12usize * base_w as usize + 12usize) * 4;
+                [dim[i], dim[i + 1], dim[i + 2]]
+            };
+            assert_eq!(outside, want_out, "选区外画的是压暗后的那一份");
+            // 手柄：八个中心都该是实心白
+            let mut bright = 0;
+            let mut seen = Vec::new();
+            let mut whites = 0i32;
+            let mut oranges = 0i32;
+            for yy in (sel.1 - 30)..(sel.3 + 30) {
+                for xx in (sel.0 - 30)..(sel.2 + 30) {
+                    if xx < 0 || yy < 0 || xx >= sw || yy >= sh_h {
+                        continue;
+                    }
+                    let p = at(&sh, sw, xx, yy);
+                    if p == [255, 255, 255] {
+                        whites += 1;
+                    }
+                    if (p[0] as i32 - 91).abs() <= 6
+                        && (p[1] as i32 - 156).abs() <= 6
+                        && (p[2] as i32 - 247).abs() <= 6
+                    {
+                        oranges += 1;
+                    }
+                }
+            }
+            for (hx, hy) in handle_points(sel) {
+                let p = at(&sh, sw, hx, hy);
+                if p.iter().all(|v| *v > 150) {
+                    bright += 1;
+                }
+                seen.push(format!("({hx},{hy})={p:?}"));
+            }
+            assert_eq!(bright, 8, "八个手柄没全画出来（只看到 {bright} 个）: {seen:?} sel={sel:?} 整幅里白色={whites:?} 橙色={oranges:?}");
+            // 四条框都要真画出来：右边与下边最容易整条丢掉（它们落在被裁掉的那一半上）
+            let want_edge = [
+                ((ACCENT >> 16) & 0xFF) as u8,
+                ((ACCENT >> 8) & 0xFF) as u8,
+                (ACCENT & 0xFF) as u8,
+            ];
+            for (x, y, label) in [
+                (sel.0, sel.1 + 20, "左"),
+                (sel.2 - 1, sel.1 + 20, "右"),
+                (sel.0 + 20, sel.1, "上"),
+                (sel.0 + 20, sel.3 - 1, "下"),
+            ] {
+                let p = at(&sh, sw, x, y);
+                let near = (p[0] as i32 - want_edge[0] as i32).abs() <= 8
+                    && (p[1] as i32 - want_edge[1] as i32).abs() <= 8
+                    && (p[2] as i32 - want_edge[2] as i32).abs() <= 8;
+                assert!(near, "选区的{label}边没画出来：{p:?} 应为 {want_edge:?}");
+            }
+            // 工具条：整条底色在它该在的地方（选区下方放不下就翻上方）
+            let (btns, bar) = bar_rects(sel, base_w, SNIP.lock().map(|s| s.base_h).unwrap_or(0));
+            let p = at(&sh, sw, bar.0 + 1, bar.1 + 1);
+            let want = [
+                ((BAR_BG >> 16) & 0xFF) as u8,
+                ((BAR_BG >> 8) & 0xFF) as u8,
+                (BAR_BG & 0xFF) as u8,
+            ];
+            assert_eq!(p, want, "工具条没画在 ({},{})", bar.0, bar.1);
+            // 按钮本身有内容：中心不许还是条底色
+            let b = &btns[0];
+            let q = at(&sh, sw, b.x + b.w / 2, b.y + b.h / 2);
+            assert_ne!(q, want, "按钮区还是工具条底色：一颗都没画");
+            // 实时预览这一路（draw_live）也要看得见：按工具条上的"色块"，在选区里拖一笔，
+            // 屏上那一块就必须是色块的颜色 —— 与落盘后的像素判据互补（一个证屏上，一个证文件）。
+            let (btns2, _) = bar_rects(sel, base_w, SNIP.lock().map(|s| s.base_h).unwrap_or(0));
+            let block = btns2
+                .iter()
+                .find(|b| b.id == "block")
+                .expect("工具条没有色块按钮");
+            post_mouse(
+                ov,
+                WM_MOUSEMOVE,
+                block.x + block.w / 2,
+                block.y + block.h / 2,
+            );
+            post_mouse(
+                ov,
+                WM_LBUTTONDOWN,
+                block.x + block.w / 2,
+                block.y + block.h / 2,
+            );
+            post_mouse(
+                ov,
+                WM_LBUTTONUP,
+                block.x + block.w / 2,
+                block.y + block.h / 2,
+            );
+            pump(200);
+            post_mouse(ov, WM_LBUTTONDOWN, sel.0 + 20, sel.1 + 20);
+            post_mouse(ov, WM_MOUSEMOVE, sel.0 + 120, sel.1 + 120);
+            post_mouse(ov, WM_LBUTTONUP, sel.0 + 120, sel.1 + 120);
+            pump(300);
+            let shot2 = print_window(ov).expect("第二张截图没拿到");
+            let (sh2, sw2, _) = shot2;
+            let red = [
+                ((PALETTE[0].0 >> 16) & 0xFF) as u8,
+                ((PALETTE[0].0 >> 8) & 0xFF) as u8,
+                (PALETTE[0].0 & 0xFF) as u8,
+            ];
+            for (x, y) in [(sel.0 + 60, sel.1 + 60), (sel.0 + 100, sel.1 + 100)] {
+                let p = at(&sh2, sw2, x, y);
+                assert_eq!(p, red, "拖出来的色块没实时显示在 ({x},{y})");
+            }
+            // 一笔都没落的地方仍然是原图：预览不许糊满整块选区
+            let keep = at(&sh2, sw2, sel.0 + 300, sel.1 + 200);
+            let i = (((sel.1 + 200) as usize) * base_w as usize + (sel.0 + 300) as usize) * 4;
+            assert_eq!(
+                keep,
+                [base[i], base[i + 1], base[i + 2]],
+                "色块外的像素被改了"
+            );
+
+            let _ = DestroyWindow(ov);
+            pump(200);
+        }
     }
 }
 
