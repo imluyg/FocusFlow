@@ -3673,7 +3673,47 @@ mod render_probe {
                 "落盘的名字不都带 snip_ 前缀：{files2:?}"
             );
 
-            // 最后才判"成则关窗"：上面那两次提交都故意留着窗口，为的是同一份会话能连出两张
+            // 贴图那一条（P / 工具条"贴图"）是出图的第二个去向，以前一次都没被判过：
+            // 钉上来的位置必须**逐边等于选区在屏幕上的那一块**、尺寸等于选区。
+            // 这一族错过（覆盖层带 caption 时整图偏左上 8×1），所以判矩形而不是判"有没有窗口"。
+            let (org2, sel2) = SNIP
+                .lock()
+                .map(|s| (s.origin, s.sel))
+                .unwrap_or(((0, 0), (0, 0, 0, 0)));
+            // 前提腿：桌面上原本一张贴图都没有，后面 `FindWindowW` 找到的才是这一笔钉出来的。
+            // 没有这条，别处（比如另一份实例）留着的贴图会把下面的矩形判据顶得莫名其妙。
+            assert!(
+                FindWindowW(w!("FocusFlowPin"), PCWSTR::null()).is_err(),
+                "前提不成立：桌面上已经有一张贴图，这条要在干净桌面上跑"
+            );
+            let pinned = commit_into(&out, false, true);
+            assert!(
+                matches!(pinned, Verdict::Done),
+                "贴图这条没成交：{pinned:?}"
+            );
+            pump(250);
+            let pin = FindWindowW(w!("FocusFlowPin"), PCWSTR::null()).unwrap_or_default();
+            assert!(!pin.0.is_null(), "贴图窗口没建出来");
+            let mut prc = RECT::default();
+            let _ = GetWindowRect(pin, &mut prc);
+            assert_eq!(
+                (prc.left, prc.top),
+                (org2.0 + sel2.0, org2.1 + sel2.1),
+                "贴图没钉在选区那一块上（屏幕坐标）"
+            );
+            assert_eq!(
+                (prc.right - prc.left, prc.bottom - prc.top),
+                (bw, bh),
+                "贴图的尺寸不等于选区"
+            );
+            let _ = DestroyWindow(pin);
+            pump(150);
+            assert!(
+                FindWindowW(w!("FocusFlowPin"), PCWSTR::null()).is_err(),
+                "贴图没收尾干净"
+            );
+
+            // 最后才判"成则关窗"：上面那几次提交都故意留着窗口，为的是同一份会话能连出多张
             commit_and_close_into(ov, false, &out, false);
             pump(250);
             assert!(!IsWindow(Some(ov)).as_bool(), "出图成功了覆盖层却没退");
