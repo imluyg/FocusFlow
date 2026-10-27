@@ -238,6 +238,8 @@ pub struct SnipState {
     text_at: (i32, i32),
     /// 当前覆盖层的句柄数值（静态量要 Send）：再按一次标注热键要靠它放弃在飞的这一次。
     overlay: isize,
+    /// 拉起这次截图的主窗口（各处传进来的都是它）：出图结果那句话说给它挂进状态读数。
+    owner: isize,
     /// 出图没成时写在屏上的那句原因（覆盖层为此**不退**，Enter 再试、Esc 放弃）。
     notice: Option<String>,
     /// 冻结时把悬浮窗藏了：退出时要按原样还回去。
@@ -277,6 +279,7 @@ const fn default_state() -> SnipState {
         text_edit: 0,
         text_at: (0, 0),
         overlay: 0,
+        owner: 0,
         notice: None,
         pill_was: false,
         started_at: None,
@@ -1316,6 +1319,18 @@ pub enum Release {
     Cancel,
 }
 
+/// 出图成了之后给状态读数那一行的话：文件名、尺寸、第二个去处。
+///
+/// 旧 Webview 版是主窗口一个 toast 说同一件事（`snip-done`），原生没有 toast——用它已有那条
+/// 状态读数，"周报已生成 / 备份失败：…" 已经显示在那儿。写成纯函数是因为这句话要能被断言：
+/// 只写在日志里的话，用户永远得自己去翻。
+pub fn snip_receipt(file: &str, w: i32, h: i32, pinned: bool) -> String {
+    // 走到这句话时"落盘 + 进剪贴板"两件都已确认成了（`pin` 那条还多钉了一张），
+    // 所以话里的每一样都得说，也别多出没做的那样。
+    let tail = if pinned { "，并钉在桌面上" } else { "" };
+    format!("截图已存 {file}（{w}x{h}），同时复制到剪贴板{tail}")
+}
+
 /// 一次出图：合成 → 落盘 → 进剪贴板（CF_DIB 与 `PNG` 两份，编码只做一次）。
 /// `pin` = 顺手把这一张钉在桌面上（不再多落一个文件）。
 ///
@@ -1324,10 +1339,10 @@ pub enum Release {
 /// 也不许盖掉用户的剪贴板（这两件事只能在独立进程的验收套件里判）。
 /// `clipboard = false` 时那一路当作成功，判的就只是"落盘成不成"这一半。
 fn commit_into(dir: &std::path::Path, clipboard: bool, pin: bool) -> Verdict {
-    let (origin, sel) = SNIP
-        .lock()
-        .map(|s| (s.origin, s.sel))
-        .unwrap_or(((0, 0), (0, 0, 0, 0)));
+    let (origin, sel, owner) =
+        SNIP.lock()
+            .map(|s| (s.origin, s.sel, s.owner))
+            .unwrap_or(((0, 0), (0, 0, 0, 0), 0));
     let Some((buf, w, h)) = baked_selection() else {
         return Verdict::Stay("没有可出的图：先框一个区域，再按 Enter".to_string());
     };
@@ -1339,9 +1354,12 @@ fn commit_into(dir: &std::path::Path, clipboard: bool, pin: bool) -> Verdict {
         }
     };
 
+    // 落成的文件名要带给状态读数那句，所以先把它接住
+    let mut saved: Option<String> = None;
     let save = match write_png_named(dir, &png, w, h) {
         Ok(path) => {
             tracing_note(&format!("截图已保存：{} ({w}x{h})", path.display()));
+            saved = path.file_name().map(|n| n.to_string_lossy().to_string());
             Ok(())
         }
         Err(e) => {
@@ -1368,9 +1386,23 @@ fn commit_into(dir: &std::path::Path, clipboard: bool, pin: bool) -> Verdict {
         // 贴图这条以"钉上了"为成交：文件/剪贴板没成都已在日志里出声，
         // 而钉好的那张还在桌上可以右键再处理，不该把覆盖层压着不放。
         open_pin(buf, w, h, origin.0 + sel.0, origin.1 + sel.1);
+        if let Some(name) = &saved {
+            crate::note_snip_result(
+                HWND(owner as *mut core::ffi::c_void),
+                snip_receipt(name, w, h, true),
+            );
+        }
         return Verdict::Done;
     }
-    commit_verdict(save, clip)
+    let v = commit_verdict(save, clip);
+    // 成了才出声；没成走的是 `Stay` 那一路——那句原因由调用点在屏上写给用户看
+    if let (Verdict::Done, Some(name)) = (&v, &saved) {
+        crate::note_snip_result(
+            HWND(owner as *mut core::ffi::c_void),
+            snip_receipt(name, w, h, false),
+        );
+    }
+    v
 }
 
 /// 出图并据此收场：成则关窗，败则把原因写在屏上、覆盖层留着等第二次 Enter。
@@ -1390,8 +1422,9 @@ unsafe fn commit_and_close_into(hwnd: HWND, pin: bool, dir: &std::path::Path, cl
         }
         Verdict::Stay(msg) => {
             tracing_note(&format!("截图没出图：{msg}"));
+            let mut owner = 0isize;
             if let Ok(mut s) = SNIP.lock() {
-                s.notice = Some(msg);
+                s.notice = Some(msg.clone());
                 // 快速那条本来"松手即存"就完事：正因为没存上才把它留在标注阶段，
                 // 否则屏上没有一个"再试一次"的落点，等于把这句原因也一起吞了。
                 s.phase = Phase::Adjust;
@@ -1399,7 +1432,10 @@ unsafe fn commit_and_close_into(hwnd: HWND, pin: bool, dir: &std::path::Path, cl
                 // 这一场事实上已经变成标注场：绝对上限得跟着改。快速那条只有 60 秒，
                 // 不跟着改的话，用户还在读那句原因、还在腾磁盘，第一记定时器就把覆盖层收走了。
                 s.ceiling_ms = snip_ceiling_ms(true);
+                owner = s.owner;
             }
+            // 同一句话也递给主窗口那条状态读数：覆盖层早晚要退，原因得留个影子
+            crate::note_snip_result(HWND(owner as *mut core::ffi::c_void), msg);
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
@@ -1937,6 +1973,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     s.hits.clear();
                     s.text_edit = 0;
                     s.overlay = 0;
+                    s.owner = 0;
                     s.notice = None;
                     s.base = Vec::new();
                     s.dim = Vec::new();
@@ -2758,6 +2795,7 @@ pub fn start(owner: HWND, annotate: bool) {
                     s.undo_pending = false;
                     s.hits = hits;
                     s.overlay = ov.0 as isize;
+                    s.owner = owner.0 as isize;
                     s.text_edit = 0;
                     s.base = base;
                     s.dim = dim;
@@ -2951,6 +2989,52 @@ mod render_probe {
             .unwrap_or_default();
         let b = btns.iter().find(|x| x.id == id).expect("工具条缺按钮");
         pixel3(shot, sw, b.x + 3, b.y + 3)
+    }
+
+    /// 出图那句结果到底投递了没有：拿一个 1x1、开在屏幕外的顶层窗口当"拉起截图的那个窗口"，
+    /// 数它收到几条 `WM_SNIP_NOTE`。owner 传 null（探针里那些独立会话）时产品按设计不出声，
+    /// 所以这条只能这么判——光看函数返回值证不到"话送出去了"。
+    static NOTE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "system" fn note_sink_proc(
+        hwnd: HWND,
+        msg: u32,
+        w: WPARAM,
+        l: LPARAM,
+    ) -> LRESULT {
+        if msg == crate::WM_SNIP_NOTE {
+            NOTE_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return LRESULT(0);
+        }
+        DefWindowProcW(hwnd, msg, w, l)
+    }
+
+    unsafe fn new_note_sink() -> HWND {
+        let hinst = GetModuleHandleW(None).map(|m| m.into()).unwrap_or_default();
+        let cls = HSTRING::from("FocusFlowSnipNoteSink");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(note_sink_proc),
+            hInstance: hinst,
+            lpszClassName: PCWSTR(cls.as_ptr()),
+            ..Default::default()
+        };
+        let _ = RegisterClassExW(&wc);
+        CreateWindowExW(
+            Default::default(),
+            &cls,
+            &HSTRING::from("snip note sink"),
+            WINDOW_STYLE(WS_POPUP.0),
+            -32000,
+            -32000,
+            1,
+            1,
+            None,
+            None,
+            Some(hinst),
+            None,
+        )
+        .unwrap_or(HWND(std::ptr::null_mut()))
     }
 
     /// 逐像素唯一的合成画面（BGRA）。随便往哪个方向错开一格，颜色就对不上。
@@ -3834,7 +3918,11 @@ mod render_probe {
             // 不跟着改的话，它自己那 60 秒那一档会在用户还在读那句原因、还在腾磁盘时把覆盖层收走。
             // 这一段全程不投"松手"——松手会走产品那条真实去向（往用户目录写一张、盖掉他的剪贴板），
             // 只把选区拖出来，然后直接调注入版出图。
-            start(HWND(std::ptr::null_mut()), false);
+            // owner 给一个真实的（1x1、开在屏幕外的）顶层窗口：这一段的会话不是 null owner，
+            // 于是"成/败那句话该投递给拉起截图的窗口"这条也顺带被数到了（见 NOTE_HITS）。
+            let sink = new_note_sink();
+            let hits0 = NOTE_HITS.load(std::sync::atomic::Ordering::SeqCst);
+            start(sink, false);
             pump(400);
             let ov2 = SNIP
                 .lock()
@@ -3856,6 +3944,12 @@ mod render_probe {
             std::fs::write(&blocked2, b"x").expect("占位文件写不出去");
             commit_and_close_into(ov2, false, &blocked2, false);
             pump(250);
+            // 没成那句也得递出去（覆盖层上写一份、主窗口的状态读数再留一份影子）
+            assert_eq!(
+                NOTE_HITS.load(std::sync::atomic::Ordering::SeqCst),
+                hits0 + 1,
+                "出图失败那句话没投递给拉起截图的窗口"
+            );
             let after = SNIP
                 .lock()
                 .map(|s| (s.phase, s.ceiling_ms, IsWindow(Some(ov2)).as_bool()))
@@ -3866,8 +3960,20 @@ mod render_probe {
                 after.1, 600_000,
                 "留下来的会话还顶着快速那 60 秒的上限：读句子的时候会被收走"
             );
+            // 成了那句要一样递出去：这一张写进临时目录（不动用户目录，也不碰剪贴板）
+            let ok2 = ctmp2.join("out2");
+            std::fs::create_dir_all(&ok2).expect("第三个临时目录建不出来");
+            let v2 = commit_into(&ok2, false, false);
+            assert!(matches!(v2, Verdict::Done), "补的这张没成：{v2:?}");
+            pump(250);
+            assert_eq!(
+                NOTE_HITS.load(std::sync::atomic::Ordering::SeqCst),
+                hits0 + 2,
+                "出图成功那句话没投递给拉起截图的窗口"
+            );
             let _ = DestroyWindow(ov2);
             pump(200);
+            let _ = DestroyWindow(sink);
             let _ = std::fs::remove_dir_all(&ctmp2);
 
             let _ = DestroyWindow(ov);
@@ -4529,6 +4635,22 @@ mod tests {
             release_outcome((0, 0, 400, 300), Some((10, 10, 200, 150))),
             Release::Commit
         );
+    }
+
+    #[test]
+    fn the_receipt_names_the_file_the_size_and_every_destination() {
+        let plain = snip_receipt("snip_20261028_120000_300x200.png", 300, 200, false);
+        assert!(
+            plain.contains("snip_20261028_120000_300x200.png"),
+            "文件名得原样在里面：{plain}"
+        );
+        assert!(plain.contains("300x200"), "尺寸得说出来：{plain}");
+        assert!(plain.contains("剪贴板"), "进了剪贴板这件事要说：{plain}");
+        assert!(!plain.contains("钉"), "没钉就别声称钉了：{plain}");
+        let pin = snip_receipt("snip_a.png", 10, 20, true);
+        assert!(pin.contains("钉在桌面"), "贴图那条要说全：{pin}");
+        assert!(pin.contains("剪贴板"), "贴图这条其实也上了剪贴板：{pin}");
+        assert_ne!(plain, pin, "两句一模一样，等于没说");
     }
 
     #[test]

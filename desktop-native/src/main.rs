@@ -97,6 +97,9 @@ const WM_WEEKLY_REPORT: u32 = WM_APP + 11;
 const WM_PIN_TEST: u32 = WM_APP + 12;
 /// 验收钩子：关掉所有贴图（与设置页那一行同一条路）。
 const WM_PIN_CLOSE_ALL: u32 = WM_APP + 13;
+/// 截图出图的结果（成与败都说一句）：由 `snip` 填进 `SNIP_NOTE`，投这条让主窗口取走。
+/// `pub(crate)` 是因为屏上探针要拿这条消息的 id 数一数量"话到底投递了没有"。
+pub(crate) const WM_SNIP_NOTE: u32 = WM_APP + 14;
 const TIMER_EVENTS: usize = 1;
 /// EDIT 。
 const EM_SETSEL: u32 = 0x00B1;
@@ -4366,6 +4369,28 @@ struct PinDrag {
     cursor: (i32, i32),
 }
 
+/// 截图出图那一句（成与败都出一句）：`snip` 把它填在这里，`WM_SNIP_NOTE` 让主窗口的 wndproc
+/// 取走挂进状态读数那一行。旧 Webview 版是主窗口一个 toast 说同样的事——同一处地方已经在显示
+/// "周报已生成 / 备份失败：…"，他要问"刚才那张去哪了"也是在那儿看。
+static SNIP_NOTE: Mutex<Option<String>> = Mutex::new(None);
+
+/// 把一句话递给主窗口的状态读数。`target` 是主窗口：截图覆盖层各处都是被它拉起来的
+/// （`snip::start(hwnd, ..)` 传进来的就是它）。句柄为空（测试里那条独立会话）就什么都不做。
+///
+/// 走"填一格 + 投一条"而不是直接改 `App`：覆盖层的 wndproc 与主窗口跑在同一条线程上，
+/// 正在处理自己消息的时候去改别人的状态就是重入——这套代码里已经吃过一次锁重入的亏。
+pub(crate) fn note_snip_result(target: HWND, line: String) {
+    unsafe {
+        if target.0.is_null() {
+            return;
+        }
+        if let Ok(mut q) = SNIP_NOTE.lock() {
+            *q = Some(line);
+        }
+        let _ = PostMessageW(Some(target), WM_SNIP_NOTE, WPARAM(0), LPARAM(0));
+    }
+}
+
 /// 桌面上开着的贴图。用 `Vec` 而不是 `HashMap`：`Mutex::new(Vec::new())` 才进得了 static。
 static PINS: Mutex<Vec<PinImage>> = Mutex::new(Vec::new());
 /// 屏上探针共用的串行锁：两条都会动**真实光标**、都往桌面上盖真窗口。
@@ -7659,6 +7684,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
         WM_PIN_CLOSE_ALL => {
             close_all_pins();
+            LRESULT(0)
+        }
+        WM_SNIP_NOTE => {
+            // 截图刚出完一张（或没出成）：把那一句话说给状态读数。这里不改快照、不重画数据——
+            // 截图跟库里的数字无关，动一下反而会把用户正在看的那页刷掉。
+            if let Some(line) = SNIP_NOTE.lock().ok().and_then(|mut q| q.take()) {
+                // `snip-note` 是给验收脚本找的 ASCII 探针：状态读数那行是 D2D 画的，脚本读不到字，
+                // 但"有没有把这句话递给主窗口"这件事必须能在独立进程里判。
+                tracing_note(&format!("snip-note {line}"));
+                if let Some(app) = unsafe { app_ptr(hwnd) } {
+                    app.status = Some(line);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
             LRESULT(0)
         }
         WM_OP_DONE => {

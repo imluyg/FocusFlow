@@ -220,6 +220,16 @@ $s1 = Get-PngSize $new1
 Check 'the saved pixels are the dragged rect' ($s1 -and $s1.Width -eq 400 -and $s1.Height -eq 270) `
     ("got=$($s1.Width)x$($s1.Height)")
 
+# The receipt. The old WebView build told the user in the main window where the picture went
+# (a toast on 'snip-done'); native has no toast, so the same sentence has to reach the main
+# window's status readout. The status line is D2D-painted and unreadable from outside, so the
+# observable is the 'snip-note' line the handler writes when it drains that note - which also
+# proves the post actually arrived at the main window rather than being dropped.
+Check 'the result line reaches the main window' (Wait-Log 'snip-note' 3000)
+$notes = @(Get-SnipLog | Where-Object { $_ -match 'snip-note' })
+Check 'the receipt names the file it saved' `
+    (($notes.Count -gt 0) -and $notes[-1].Contains((Split-Path $new1 -Leaf))) ($notes -join ' | ')
+
 # After a snip that really succeeded the overlay state must be free again: the flag that
 # says "an overlay is open" is what start() checks, and if nothing clears it on the
 # success path the very next hotkey press does nothing until the app is restarted.
