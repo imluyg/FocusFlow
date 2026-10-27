@@ -117,6 +117,8 @@ enum Drag {
     Mark,
     /// 搬第 N 笔（按下时已把当前状态压进撤销栈，所以一次拖动 = 一步撤销）
     Pick(usize),
+    /// 拖第 N 笔的某个角手柄（0=左上 1=右上 2=右下 3=左下）改它的大小
+    Endpoint(usize, u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -697,6 +699,80 @@ pub fn move_mark(m: &mut Mark, dx: i32, dy: i32) {
             *x += dx;
             *y += dy;
         }
+    }
+}
+
+/// 选中那一笔的四个角手柄（选区本地坐标）。文字没有角：它跟着字号走。
+pub fn endpoint_points(m: &Mark) -> Option<[(i32, i32); 4]> {
+    match m.shape {
+        Shape::Text(..) => None,
+        _ => mark_bbox(m).map(|(l, t, r, b)| [(l, t), (r, t), (r, b), (l, b)]),
+    }
+}
+
+/// 压中了选中那一笔的哪个角（与选区手柄同一套 8 像素命中框）。
+pub fn hit_endpoint(m: &Mark, x: i32, y: i32) -> Option<u8> {
+    let half = HANDLE_PX / 2;
+    for (i, (hx, hy)) in endpoint_points(m)?.iter().enumerate() {
+        if x >= hx - half && x <= hx + half && y >= hy - half && y <= hy + half {
+            return Some(i as u8);
+        }
+    }
+    None
+}
+
+/// 把选中那一笔的某个角拖到 (x,y)。按形状的语义改：块/框/马赛克改包围盒（不许翻面，
+/// 最小留 1 像素），箭头按左右两侧改起点或终点，画笔改首/尾那个点，文字不动。
+pub fn resize_mark(m: &mut Mark, idx: u8, x: i32, y: i32) {
+    match &mut m.shape {
+        Shape::Rect(l, t, w, h) | Shape::Block(l, t, w, h) | Shape::Mosaic(l, t, w, h) => {
+            let (r0, b0) = (*l + *w, *t + *h);
+            let (mut nl, mut nt, mut nr, mut nb) = (*l, *t, r0, b0);
+            match idx {
+                0 => {
+                    nl = x;
+                    nt = y;
+                }
+                1 => {
+                    nr = x;
+                    nt = y;
+                }
+                2 => {
+                    nr = x;
+                    nb = y;
+                }
+                _ => {
+                    nl = x;
+                    nb = y;
+                }
+            }
+            *l = nl.min(nr);
+            *t = nt.min(nb);
+            *w = (nr.max(nl) - *l).max(1);
+            *h = (nb.max(nt) - *t).max(1);
+        }
+        Shape::Arrow(x0, y0, x1, y1) => match idx {
+            0 | 3 => {
+                *x0 = x;
+                *y0 = y;
+            }
+            _ => {
+                *x1 = x;
+                *y1 = y;
+            }
+        },
+        Shape::Pen(pts) => {
+            let target = if idx < 2 {
+                pts.first_mut()
+            } else {
+                pts.last_mut()
+            };
+            if let Some(p) = target {
+                p.0 = x;
+                p.1 = y;
+            }
+        }
+        Shape::Text(..) => {}
     }
 }
 
@@ -1307,6 +1383,8 @@ enum Press {
     Handle(u8),
     /// 搬第 N 笔
     Pick(usize),
+    /// 改第 N 笔的某个角
+    Endpoint(usize, u8),
     /// 在选区里落一笔（文字工具走 `Text`）
     Mark,
     /// 开文字框：客户区落点
@@ -1335,6 +1413,16 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                             }
                             if inside_rect(s.sel, x, y) {
                                 if s.tool == 6 {
+                                    // 先判选中那一笔的角（改形状），再判压住了哪一笔（搬它）
+                                    if let Some(i) = s.selected {
+                                        if let Some(mk) = s.marks.get(i) {
+                                            if let Some(e) =
+                                                hit_endpoint(mk, x - s.sel.0, y - s.sel.1)
+                                            {
+                                                return Press::Endpoint(i, e);
+                                            }
+                                        }
+                                    }
                                     if let Some(i) = topmost_hit(&s.marks, x - s.sel.0, y - s.sel.1)
                                     {
                                         return Press::Pick(i);
@@ -1363,6 +1451,17 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                             push_undo(&mut s);
                             s.selected = Some(i);
                             s.drag = Some((Drag::Pick(i), x, y));
+                            s.cur = (x, y);
+                        }
+                        let _ = SetCapture(hwnd);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    Press::Endpoint(i, e) => {
+                        if let Ok(mut s) = SNIP.lock() {
+                            push_undo(&mut s);
+                            // push_undo 会把选中清掉，那四个角也就跟着不见了；改形这一笔要续着选中
+                            s.selected = Some(i);
+                            s.drag = Some((Drag::Endpoint(i, e), x, y));
                             s.cur = (x, y);
                         }
                         let _ = SetCapture(hwnd);
@@ -1417,6 +1516,19 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                             if nr != s.sel {
                                 s.sel = nr;
                                 changed = true;
+                            }
+                        }
+                        Some((Drag::Endpoint(i, e), _, _)) => {
+                            if s.cur != (x, y) {
+                                s.cur = (x, y);
+                                // 拖不出选区：局部坐标夹进 [0, 宽高]，越界只会停在边上
+                                let (sw, sh) = (s.sel.2 - s.sel.0, s.sel.3 - s.sel.1);
+                                let lx = (x - s.sel.0).clamp(0, sw);
+                                let ly = (y - s.sel.1).clamp(0, sh);
+                                if i < s.marks.len() {
+                                    resize_mark(&mut s.marks[i], e, lx, ly);
+                                    changed = true;
+                                }
                             }
                         }
                         Some((Drag::Pick(i), _, _)) => {
@@ -1521,7 +1633,9 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                             }
                         }
                     }
-                    Some((Drag::Handle(_), _, _)) | Some((Drag::Pick(_), _, _)) => {
+                    Some((Drag::Handle(_), _, _))
+                    | Some((Drag::Pick(_), _, _))
+                    | Some((Drag::Endpoint(_, _), _, _)) => {
                         if let Ok(mut s) = SNIP.lock() {
                             s.drag = None;
                         }
@@ -2045,7 +2159,8 @@ unsafe fn paint(hwnd: HWND) {
             Some((Drag::New, _, _))
             | Some((Drag::Handle(_), _, _))
             | Some((Drag::Mark, _, _))
-            | Some((Drag::Pick(_), _, _)) => Some(sel),
+            | Some((Drag::Pick(_), _, _))
+            | Some((Drag::Endpoint(_, _), _, _)) => Some(sel),
             None => {
                 if phase == Phase::Adjust {
                     Some(sel)
@@ -2075,6 +2190,24 @@ unsafe fn paint(hwnd: HWND) {
                         SelectObject(hdc, oldb);
                         SelectObject(hdc, oldp);
                         let _ = DeleteObject(pen.into());
+                        // 角上有四个小白块：不看也知道能拖哪里（与选区手柄同一形状，小一档）
+                        for (hx, hy) in endpoint_points(m).unwrap_or([(0, 0); 4]) {
+                            let brush = CreateSolidBrush(COLORREF(0x00FF_FFFF));
+                            let old = SelectObject(hdc, brush.into());
+                            let hp = CreatePen(PS_SOLID, 1, COLORREF(ACCENT));
+                            let oldpen = SelectObject(hdc, hp.into());
+                            let _ = Rectangle(
+                                hdc,
+                                rc.0 + hx - 3,
+                                rc.1 + hy - 3,
+                                rc.0 + hx + 3,
+                                rc.1 + hy + 3,
+                            );
+                            SelectObject(hdc, oldpen);
+                            SelectObject(hdc, old);
+                            let _ = DeleteObject(hp.into());
+                            let _ = DeleteObject(brush.into());
+                        }
                     }
                 }
             }
@@ -2444,7 +2577,16 @@ mod render_probe {
         }
     }
 
+    /// 投一条合成鼠标消息，同时把**真实光标**也停在同一个点上。
+    ///
+    /// 覆盖层铺满整块虚拟屏，机器上任何一次真实光标移动（别的程序、隔壁测试收尾时
+    /// `SetCursorPos` 归位那一下）都会变成一条真 `WM_MOUSEMOVE` 打进这个线程的队列，
+    /// 把刚设好的 hover 或刚起步的拖动增量改掉——探针就这样无规律跳红（实测连跑三次红三次，
+    /// 单独跑则全绿）。让真光标始终跟着合成手势走，多出来的那条消息坐标相同，
+    /// 对拖动来说是 `s.cur == (x,y)` 的幂等，对悬停来说是同一个候选，就不再改状态。
     unsafe fn post_mouse(hwnd: HWND, msg: u32, x: i32, y: i32) {
+        let origin = SNIP.lock().map(|s| s.origin).unwrap_or((0, 0));
+        let _ = SetCursorPos(origin.0 + x, origin.1 + y);
         let lp = (((y & 0xFFFF) as isize) << 16) | ((x & 0xFFFF) as isize);
         let _ = PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(lp));
     }
@@ -2558,6 +2700,9 @@ mod render_probe {
     fn the_overlay_paints_the_frozen_pixels_inside_and_the_veil_outside() {
         unsafe {
             let _serial = crate::probe_guard();
+            // 这条探针会替用户搬光标（见 post_mouse 为什么要对齐真实坐标），收尾搬回去
+            let mut home = POINT::default();
+            let _ = GetCursorPos(&mut home);
             let owner = HWND(std::ptr::null_mut());
             start(owner, true);
             pump(400);
@@ -2950,8 +3095,46 @@ mod render_probe {
                 "搬动退掉后原位置该重新红起来"
             );
 
+            // 选中之后还能改形状：再点住色块把它选中，然后拖它的右下角 +50/+50
+            click_bar(ov, "pick");
+            post_mouse(ov, WM_MOUSEMOVE, cur.0 + 60, cur.1 + 60);
+            post_mouse(ov, WM_LBUTTONDOWN, cur.0 + 60, cur.1 + 60);
+            pump(120);
+            post_mouse(ov, WM_LBUTTONUP, cur.0 + 60, cur.1 + 60);
+            pump(200);
+            post_mouse(ov, WM_MOUSEMOVE, cur.0 + 120, cur.1 + 120);
+            pump(120);
+            let n_marks = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
+            post_mouse(ov, WM_LBUTTONDOWN, cur.0 + 120, cur.1 + 120);
+            pump(120);
+            post_mouse(ov, WM_MOUSEMOVE, cur.0 + 170, cur.1 + 170);
+            post_mouse(ov, WM_LBUTTONUP, cur.0 + 170, cur.1 + 170);
+            pump(250);
+            // 改形不许变成"又画了一笔"：角没接住时这一拖会落下一个新的色块，
+            // 上面那三条像素判据全都照样绿，只有笔数会露馅。
+            let n_after = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
+            assert_eq!(n_after, n_marks, "拖角变成了新画一笔");
+            let (rs, rsw, _) = baked_selection().expect("改形后就没图了");
+            assert_eq!(
+                pixel3(&rs, rsw, 140, 140),
+                [45, 45, 255],
+                "拖角没把这块扩进来"
+            );
+            // 左上角那块必须还红着：这一条把"改形"和"整块被搬走"分开——
+            // 拖角若退化成了搬动，140,140 照样会红，只有这一头能露馅。
+            assert_eq!(
+                pixel3(&rs, rsw, 25, 25),
+                [45, 45, 255],
+                "拖角把色块搬走了，不是扩它"
+            );
+            assert!(
+                same_as_base(&rs, rsw, &base, base_w, cur, 300, 200),
+                "改形改到别的地方去了"
+            );
+
             let _ = DestroyWindow(ov);
             pump(200);
+            let _ = SetCursorPos(home.x, home.y);
         }
     }
 }
@@ -3479,6 +3662,39 @@ mod tests {
         let mut txt = mk(Shape::Text(5, 5, "x".to_string()), 3);
         move_mark(&mut txt, 2, 3);
         assert_eq!(mark_bbox(&txt), Some((7, 8, 37, 38)));
+    }
+
+    #[test]
+    fn a_selected_mark_can_be_reshaped_from_its_four_corners() {
+        let mut m = mk(Shape::Block(20, 20, 100, 100), 3);
+        assert_eq!(
+            endpoint_points(&m),
+            Some([(20, 20), (120, 20), (120, 120), (20, 120)])
+        );
+        assert_eq!(hit_endpoint(&m, 120, 120), Some(2));
+        assert_eq!(hit_endpoint(&m, 21, 21), Some(0));
+        assert_eq!(hit_endpoint(&m, 70, 70), None, "块中间不是角：那里是搬动");
+        // 右下角拖出去
+        resize_mark(&mut m, 2, 160, 140);
+        assert_eq!(mark_bbox(&m), Some((20, 20, 160, 140)));
+        // 左上角拖过右下角 ⇒ 折回来：宽高不许变负（负宽高就是裁出 0 像素那一类错）
+        resize_mark(&mut m, 0, 300, 300);
+        assert_eq!(mark_bbox(&m), Some((160, 140, 300, 300)));
+        // 箭头：左半改起点、右半改终点
+        let mut a = mk(Shape::Arrow(10, 10, 90, 90), 3);
+        resize_mark(&mut a, 0, 5, 6);
+        resize_mark(&mut a, 2, 7, 8);
+        assert_eq!(mark_bbox(&a), Some((5, 6, 7, 8)));
+        // 画笔改首尾点（中间的点不动：拖角改折线本来就该是两头）
+        let mut p = mk(Shape::Pen(vec![(1, 1), (5, 5), (9, 9)]), 3);
+        resize_mark(&mut p, 0, 0, 3);
+        resize_mark(&mut p, 3, 12, 12);
+        assert_eq!(mark_bbox(&p), Some((0, 3, 12, 12)));
+        // 文字没有角：它跟字号走
+        assert_eq!(
+            endpoint_points(&mk(Shape::Text(1, 1, "字".to_string()), 3)),
+            None
+        );
     }
 
     #[test]
