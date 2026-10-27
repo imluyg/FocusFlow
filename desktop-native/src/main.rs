@@ -1153,7 +1153,8 @@ if self.detail.is_some() || (self.view == 3 && self.atab != 3) {
             return changed;
         }
 
-        // 排行�?        changed |= self.heat_hover.take().is_some();
+        // 排行页：这条分支不在热力图上，残留的键位高亮在这里撤掉。
+        changed |= self.heat_hover.take().is_some();
         let g = table_geom(left_card(w, h));
         let count = self
             .snap
