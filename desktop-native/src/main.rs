@@ -3364,8 +3364,8 @@ fn draw_settings(
 
     // 状态行
     if let Some(line) = status {
-        // 「注意：…」是双计/采集异常这类要人处理的事，用危险色；其余是普通状态行。
-        let warn = line.starts_with("注意");
+        // 哪些行算"要人处理"只写在 `status_is_warning` 一处，这里不抄第二份判据
+        let warn = status_is_warning(line);
         p.text(
             line,
             rect(
@@ -7008,6 +7008,19 @@ fn register_combo(manager: Option<&GlobalHotKeyManager>, key: &str) -> Combo {
     }
 }
 
+/// 状态行里哪些该用危险色画。"注意…" 是历史形状（双计提醒、搬迁没成那一类），
+/// 另外这几类也必须算：一条热键没注册上、以及截图那句"没存盘 / 图没编出来 / 剪贴板没进去"。
+/// 这些都要人去做点什么，用灰字画出来会被当成普通回执掠过去——旧 Webview 版给热键失败
+/// 就是红色的那一档。
+fn status_is_warning(line: &str) -> bool {
+    line.starts_with("注意")
+        || line.starts_with("没注册上：")
+        || line.starts_with("没存盘：")
+        || line.starts_with("图没编出来：")
+        || line.starts_with("没有可出的图：")
+        || line.contains("剪贴板没进去")
+}
+
 /// 三条绑定的注册结局拼成状态栏那一行。**点名到哪一条**是这条读数的全部意义：
 /// "截图的热键被别的程序占了"和"唤出的热键写错了"是两件完全不同的事，用户要改的东西不一样，
 /// 而只报"注册上 N 条（详见日志）"等于让人去翻日志。全成都把三条当前组合念出来。
@@ -8706,7 +8719,7 @@ mod pager_shape_tests {
 /// 热键状态行那条读数。截图的两条键就在这三条里，"按了没反应"时用户要先知道是哪一条没了。
 #[cfg(test)]
 mod hotkey_line_tests {
-    use super::hotkey_status_line;
+    use super::{hotkey_status_line, status_is_warning};
 
     fn item(
         label: &'static str,
@@ -8761,6 +8774,34 @@ mod hotkey_line_tests {
         ]);
         assert!(line.contains("没注册上"), "{line}");
         assert!(!line.contains("其余"), "三条都没成却还说其余：{line}");
+    }
+
+    #[test]
+    fn only_the_lines_that_need_action_are_painted_red() {
+        // 要人做点什么的才用危险色：历史形状"注意…"（双计、搬迁没成那一类）、
+        // 热键一条没注册上、以及截图那句"没存盘 / 图没编出来 / 剪贴板没进去 / 先框一个区域"。
+        assert!(status_is_warning("注意：检测到旧版 FocusFlow.exe 在跑"));
+        assert!(status_is_warning(
+            "没注册上：区域截图热键 ctrl+f1：系统拒了：占用"
+        ));
+        assert!(status_is_warning(
+            "没存盘：建目录失败：os error 5 —— 改好了再按 Enter"
+        ));
+        assert!(status_is_warning(
+            "已存盘，但剪贴板没进去：打开剪贴板失败 —— Enter 再试"
+        ));
+        assert!(status_is_warning("图没编出来：png 编码失败"));
+        assert!(status_is_warning("没有可出的图：先框一个区域，再按 Enter"));
+        // 回执与"一切正常"不能红：满屏红等于没有红，而且会让人以为截图丢了
+        assert!(!status_is_warning(
+            "截图已存 snip_a.png（300x200），同时复制到剪贴板"
+        ));
+        assert!(!status_is_warning(
+            "三条热键已按配置注册：唤出窗口热键 ctrl+f12 · 区域截图热键 ctrl+f1"
+        ));
+        assert!(!status_is_warning(
+            "数据目录已搬到 E 盘（12 个文件 / 旧目录剩 0 项）"
+        ));
     }
 }
 
