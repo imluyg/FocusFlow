@@ -53,6 +53,19 @@ $ico = [System.Drawing.Icon]::ExtractAssociatedIcon((Join-Path $inst 'FocusFlow.
 Check 'installed exe carries an icon resource' ($ico.Width -gt 0) "$($ico.Width)x$($ico.Height)"
 $ico.Dispose()
 
+# The exe's own VERSIONINFO resource. NSIS stamps a version onto setup.exe (VIAddVersionKey) and
+# writes DisplayVersion into the uninstall key, but the exe ITSELF had no version resource at all
+# once the frontend went native: right-click -> Details is blank and anything auditing by file
+# version gets nothing (measured 2026-10-27, both via .VersionInfo and
+# [Diagnostics.FileVersionInfo]::GetVersionInfo, so it is not a reader quirk).
+# The expected number comes from setup.exe, not a second hardcoded copy of the version.
+$viSetup = [Diagnostics.FileVersionInfo]::GetVersionInfo($Setup)
+$viExe = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $inst 'FocusFlow.exe'))
+$exeVer = "$($viExe.FileVersion)"
+$setupVer = "$($viSetup.FileVersion)"
+Check 'installed exe carries a version resource' ($exeVer.Length -gt 0) "exe=[$exeVer] setup=[$setupVer]"
+Check 'installed exe version matches the installer' ($exeVer -eq $setupVer -and $exeVer.Length -gt 0) "exe=[$exeVer] setup=[$setupVer]"
+
 # Run the INSTALLED exe, but point it at a probe copy so the install dir stays pristine.
 # No [collector] override here: this checks the real default (on, 2026-10-27).
 $app = Join-Path $WorkDir 'app'
