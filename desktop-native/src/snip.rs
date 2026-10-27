@@ -226,6 +226,8 @@ pub struct SnipState {
     redo_stack: Vec<Vec<Mark>>,
     /// 被选中的那一笔（下标，只在"选择"工具下有意义）。
     selected: Option<usize>,
+    /// 按下"搬/改角"时先记着这一笔，**真改到东西才存进撤销栈**（空点击不吃撤销步）。
+    undo_pending: bool,
     /// 当前工具（[`TOOLS`] 下标）。
     tool: u8,
     color: u32,
@@ -267,6 +269,7 @@ const fn default_state() -> SnipState {
         undo_stack: Vec::new(),
         redo_stack: Vec::new(),
         selected: None,
+        undo_pending: false,
         tool: 0,
         color: PALETTE[0].0,
         width: WIDTHS[0].0,
@@ -1531,7 +1534,9 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     }
                     Press::Pick(i) => {
                         if let Ok(mut s) = SNIP.lock() {
-                            push_undo(&mut s);
+                            // 快照要等**真拖动了**再存：点在色块上又原样松开（想看看它选中没）
+                            // 不该吃掉一步撤销。
+                            s.undo_pending = true;
                             s.selected = Some(i);
                             s.drag = Some((Drag::Pick(i), x, y));
                             s.cur = (x, y);
@@ -1541,8 +1546,8 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     }
                     Press::Endpoint(i, e) => {
                         if let Ok(mut s) = SNIP.lock() {
-                            push_undo(&mut s);
-                            // push_undo 会把选中清掉，那四个角也就跟着不见了；改形这一笔要续着选中
+                            s.undo_pending = true;
+                            // 按住角就等于还选中着它：push_undo 会把选中清掉，那四个角会跟着不见
                             s.selected = Some(i);
                             s.drag = Some((Drag::Endpoint(i, e), x, y));
                             s.cur = (x, y);
@@ -1611,6 +1616,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                                 let lx = (x - s.sel.0).clamp(0, sw);
                                 let ly = (y - s.sel.1).clamp(0, sh);
                                 if i < s.marks.len() {
+                                    push_undo_if_pending(&mut s);
                                     resize_mark(&mut s.marks[i], e, lx, ly);
                                     changed = true;
                                 }
@@ -1621,6 +1627,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                                 let (dx, dy) = (x - s.cur.0, y - s.cur.1);
                                 s.cur = (x, y);
                                 if i < s.marks.len() {
+                                    push_undo_if_pending(&mut s);
                                     move_mark(&mut s.marks[i], dx, dy);
                                     changed = true;
                                 }
@@ -1723,6 +1730,8 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     | Some((Drag::Endpoint(_, _), _, _)) => {
                         if let Ok(mut s) = SNIP.lock() {
                             s.drag = None;
+                            // 一路没动过就把那个"待存"的快照机会收掉：一次空点击不算一步撤销
+                            s.undo_pending = false;
                         }
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -1884,6 +1893,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     s.undo_stack.clear();
                     s.redo_stack.clear();
                     s.selected = None;
+                    s.undo_pending = false;
                     s.hits.clear();
                     s.text_edit = 0;
                     s.overlay = 0;
@@ -2094,6 +2104,17 @@ fn push_undo(s: &mut SnipState) {
     s.undo_stack.push(s.marks.clone());
     s.redo_stack.clear();
     s.selected = None;
+}
+
+/// "按下手等拖动"这一族（搬一笔、拖一个角）的快照闩：第一次真的改到东西才存撤销快照。
+/// 原样松开就吃掉一步撤销是不对的——用户按了一下只想看它选中没有，
+/// 撤销栈里却多了一层"和现在一模一样"的状态，下一次撤销按下去屏幕什么都不变。
+fn push_undo_if_pending(s: &mut SnipState) {
+    if s.undo_pending {
+        s.undo_pending = false;
+        s.undo_stack.push(s.marks.clone());
+        s.redo_stack.clear();
+    }
 }
 
 fn undo() {
@@ -2675,6 +2696,7 @@ pub fn start(owner: HWND, annotate: bool) {
                     s.undo_stack.clear();
                     s.redo_stack.clear();
                     s.selected = None;
+                    s.undo_pending = false;
                     s.hits = hits;
                     s.overlay = ov.0 as isize;
                     s.text_edit = 0;
@@ -3377,6 +3399,28 @@ mod render_probe {
             assert!(
                 same_as_base(&rs, rsw, &base, base_w, cur, 300, 200),
                 "改形改到别的地方去了"
+            );
+
+            // 空点击不许吃掉一步撤销：真落一笔 → 原样点它一下松开 → 按一次撤销就该把那一笔退掉。
+            // 旧写法按下就存快照，那一次空点击在栈里留下一层"和现在一模一样"，
+            // 用户按撤销时屏幕什么都不变，要按第二次才见效。
+            click_bar(ov, "block");
+            post_mouse(ov, WM_LBUTTONDOWN, cur.0 + 300, cur.1 + 30);
+            post_mouse(ov, WM_MOUSEMOVE, cur.0 + 340, cur.1 + 70);
+            post_mouse(ov, WM_LBUTTONUP, cur.0 + 340, cur.1 + 70);
+            pump(200);
+            let n_drawn = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
+            assert!(n_drawn > 0, "那一笔没落下来，后面的判据就是空的");
+            click_bar(ov, "pick");
+            post_mouse(ov, WM_LBUTTONDOWN, cur.0 + 320, cur.1 + 50);
+            post_mouse(ov, WM_LBUTTONUP, cur.0 + 320, cur.1 + 50);
+            pump(200);
+            click_bar(ov, "undo");
+            pump(250);
+            assert_eq!(
+                SNIP.lock().map(|s| s.marks.len()).unwrap_or(0),
+                n_drawn - 1,
+                "一次撤销没退掉刚画的那一笔：空点击把撤销步吃掉了"
             );
 
             // 标注阶段的一记右键不该把已经画好的这一整堆丢掉（旧版在 annotating 时直接 return）
@@ -4103,6 +4147,31 @@ mod tests {
             }
             Verdict::Done => panic!("剪贴板没成却一声不吭"),
         }
+    }
+
+    #[test]
+    fn an_empty_click_on_a_mark_does_not_consume_an_undo_step() {
+        let mut s = default_state();
+        s.marks.push(mk(Shape::Block(20, 20, 40, 40), 3));
+        // 按下"搬这一笔"：此刻还什么都不该存
+        s.undo_pending = true;
+        s.selected = Some(0);
+        assert!(s.undo_stack.is_empty(), "按下就把撤销栈推了一层");
+        // 原样松开
+        s.undo_pending = false;
+        s.drag = None;
+        assert!(s.undo_stack.is_empty(), "一次空点击吃掉了一步撤销");
+        // 再按一次并真拖动：第一次改动才存，之后同一次拖动不再存
+        s.undo_pending = true;
+        push_undo_if_pending(&mut s);
+        assert_eq!(s.undo_stack.len(), 1, "真改动了却没存快照");
+        push_undo_if_pending(&mut s);
+        push_undo_if_pending(&mut s);
+        assert_eq!(
+            s.undo_stack.len(),
+            1,
+            "一次拖动该是一步撤销，不是每像素一步"
+        );
     }
 
     #[test]
