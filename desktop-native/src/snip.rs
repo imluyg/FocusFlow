@@ -3623,12 +3623,12 @@ mod render_probe {
                 "出图失败还把已经画好的标注吞了"
             );
 
-            // 换成能写的目录 ⇒ 同一份会话必须正好落一张、文件名带宽高、尺寸对得上，并且覆盖层自己退
+            // 换成能写的目录 ⇒ 同一份会话必须落一张、文件名带宽高、尺寸对得上。
+            // 这里先不关窗：关窗会把整屏缓冲交出去，后面"同秒连按"那条判据就读不到同一份会话了。
             let out = ctmp.join("out");
             std::fs::create_dir_all(&out).expect("可写目录建不出来");
-            commit_and_close_into(ov, false, &out, false);
-            pump(250);
-            assert!(!IsWindow(Some(ov)).as_bool(), "出图成功了覆盖层却没退");
+            let first = commit_into(&out, false, false);
+            assert!(matches!(first, Verdict::Done), "第一张没成：{first:?}");
             let files: Vec<String> = std::fs::read_dir(&out)
                 .map(|rd| {
                     rd.filter_map(|e| e.ok())
@@ -3652,6 +3652,32 @@ mod render_probe {
                     .any(|p| p[0] == 255 && p[1] == 45 && p[2] == 45),
                 "落盘那张里没有已画的标注"
             );
+
+            // 同秒连按不许互相覆盖：他自己日志里就有两次"截图已保存"写着同一个文件名，
+            // 目录里只剩一张 —— 旧命名只到秒，那一张是真丢了。
+            let again = commit_into(&out, false, false);
+            assert!(matches!(again, Verdict::Done), "第二张没成：{again:?}");
+            let files2: Vec<String> = std::fs::read_dir(&out)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(files2.len(), 2, "同秒两张该是两个文件：{files2:?}");
+            // 判"两个名字互不相同"而不是硬要 `_2` 后缀：跨到下一秒时两个名字本来就不一样，
+            // 那也算对——这条要防的只是"名字撞在一起把前一张盖掉"。
+            assert_ne!(files2[0], files2[1], "两张撞了同一个名字：{files2:?}");
+            assert!(
+                files2.iter().all(|n| n.starts_with("snip_")),
+                "落盘的名字不都带 snip_ 前缀：{files2:?}"
+            );
+
+            // 最后才判"成则关窗"：上面那两次提交都故意留着窗口，为的是同一份会话能连出两张
+            commit_and_close_into(ov, false, &out, false);
+            pump(250);
+            assert!(!IsWindow(Some(ov)).as_bool(), "出图成功了覆盖层却没退");
+
             let _ = std::fs::remove_dir_all(&ctmp);
 
             // 快速那条（松手即存）被失败留下来之后，这一场实际就是标注场：绝对上限得跟着变成 10 分钟。
