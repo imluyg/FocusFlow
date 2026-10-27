@@ -275,7 +275,7 @@ if ($bBlock) {
     Check 'the annotated snip saved a PNG' $ok2 "png $before2 -> $(Count-Png)"
     $hit2 = Measure-BlockHit (Get-NewestPng) 20 30 380 250
     Check 'the block landed where it was dragged' `
-        ($hit2 -and $hit2.In -ge 98 -and $hit2.Out -le 2) ($hit2 | Out-String -Compress)
+        ($hit2 -and $hit2.In -ge 98 -and $hit2.Out -le 2) "In=$($hit2.In) Out=$($hit2.Out)"
     Check 'the annotate overlay closed on commit' `
         ([FF]::ByClass([uint32]$p2.Id, 'FocusFlowSnipOverlay') -eq [IntPtr]::Zero)
 } else {
@@ -316,7 +316,7 @@ if ($bBlock2 -and $bUndo -and $ov2b -ne [IntPtr]::Zero) {
     Check 'the undone snip still saved a PNG' $ok2b "png $before2b -> $(Count-Png)"
     $hit2b = Measure-BlockHit (Get-NewestPng) 20 30 380 240
     Check 'undo took the mark out of the saved pixels' ($hit2b -and $hit2b.In -le 5) `
-        ($hit2b | Out-String -Compress)
+        "In=$($hit2b.In) Out=$($hit2b.Out)"
 } else {
     Check 'the undo round found the toolbar' ($bBlock2 -and $bUndo) 'block or undo button missing'
 }
