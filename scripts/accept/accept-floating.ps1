@@ -5,6 +5,12 @@
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-floating.ps1
+
+  Note on -Exe: the suite's Stop-App calls match the DEFAULT exe path (target\release\...), so
+  pointing -Exe at a copy elsewhere leaves the first instance alive; it then holds the
+  single-instance mutex and every later restart in this file reads a missing pill (measured
+  2026-10-27: two such runs, both red on the restart legs for that reason alone).
+  Use the default path, or a mutation probe on the product, when you need a before/after pair.
 #>
 param(
     [string]$Exe = '',
@@ -94,8 +100,17 @@ $h = Wait-Window $p.Id
 $pill = Wait-Window $p.Id 'FocusFlowFloatingPill' 8000
 Start-Sleep -Milliseconds 900
 $rt = Get-Rect $pill
-Check 'a card saved inside the taskbar band is lifted above it' ($rt.Y + $rt.H -le $work.Bottom) `
-    "bottom=$($rt.Y + $rt.H) work_bottom=$($work.Bottom) screen_bottom=$($bnd.Bottom)"
+# Gate on the window actually being there: with no pill, the rect is 0,0,0,0 and "bottom <= work
+# bottom" would be TRUE for the wrong reason. Measured 2026-10-27: a run whose first instance
+# never died (see the -Exe note in this file's header) produced (0,0) here and this leg PASSED --
+# a false green on a premise that was red. Absence-shaped legs must AND their own premise in.
+$have = ($pill -ne [IntPtr]::Zero) -and ($rt.H -gt 0) -and ($rt.W -gt 0)
+$detail = if ($have) {
+    'bottom=' + ($rt.Y + $rt.H) + ' work_bottom=' + $work.Bottom + ' screen_bottom=' + $bnd.Bottom
+} else {
+    'NOT MEASURED: no pill window to place (that restart did not come up -- premise, not the ruler)'
+}
+Check 'a card saved inside the taskbar band is lifted above it' ($have -and (($rt.Y + $rt.H) -le $work.Bottom)) $detail
 # Put the pill back where the rest of this suite expects it.
 Stop-App
 Set-ConfigLine $app 'floating' 'pos_x' '1300'
