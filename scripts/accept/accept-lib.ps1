@@ -116,6 +116,21 @@ public class FF {
       System.Threading.Thread.Sleep(35);
     }
   }
+  // The app's single-instance guard is a named mutex, so "is somebody else holding it" is
+  // measurable instead of guessed: opening the name returns ERROR_ALREADY_EXISTS (183) when
+  // the object exists, and a fresh handle we immediately close when it does not.
+  // Marshal.GetLastWin32Error must be read on the line right after the call.
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  static extern IntPtr CreateMutexW(IntPtr sa, bool owner, string name);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool CloseHandle(IntPtr h);
+  public static string MutexState(string name) {
+    IntPtr h = CreateMutexW(IntPtr.Zero, false, name);
+    uint err = (uint)Marshal.GetLastWin32Error();
+    if (h == IntPtr.Zero) { return "invalid(winerror=" + err + ")"; }
+    CloseHandle(h);
+    return err == 183 ? "taken" : "free";
+  }
 }
 "@
 
@@ -197,16 +212,24 @@ function Start-App([string]$Exe, [string]$AppDir, [string]$WorkDir, [hashtable]$
 
 # When the main window never appears the usual cause is not a crash: another instance of the
 # app (most often the user's own) holds the single-instance mutex, so our process raises the
-# existing window and exits without writing a log line. Name that instance instead of leaving
-# the suite with a silent one-check FAIL.
+# existing window and exits without writing a log line. Measure the mutex itself -- the
+# process list is only a hint about who holds it, and an empty list with a taken mutex is a
+# different story than a free mutex.
 # Console output on purpose: Write-Output would land in the caller's $h = Wait-Window result.
-function Get-Blocker([string]$Exe) {
-    if (-not $Exe) { return '' }
-    $full = [IO.Path]::GetFullPath($Exe)
+$script:InstanceMutex = 'Global\FocusFlow.Native.P0'
+
+function Get-Blocker() {
+    $state = [FF]::MutexState($script:InstanceMutex)
+    if ($state -ne 'taken') {
+        return 'mutex=' + $state + ' (nothing else holds it, so the app exited for another reason)'
+    }
+    $full = ''
+    if ($script:LastExe) { $full = [IO.Path]::GetFullPath($script:LastExe) }
     $others = @(Get-Process -Name FocusFlow,focusflow-native -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -ne $full) })
-    if ($others.Count -eq 0) { return '' }
-    ($others | ForEach-Object { 'pid=' + $_.Id + ' exe=' + $_.Path }) -join '; '
+        Where-Object { $_.Path -and (-not $full -or [IO.Path]::GetFullPath($_.Path) -ne $full) })
+    $who = ($others | ForEach-Object { 'pid=' + $_.Id + ' exe=' + $_.Path }) -join '; '
+    if (-not $who) { $who = 'no FocusFlow process readable by this user (elevated? another session?)' }
+    return 'mutex=taken; likely holder: ' + $who
 }
 
 function Wait-Window([int]$ProcessId, [string]$Class = 'FocusFlowNativeD2D', [int]$TimeoutMs = 15000) {
@@ -216,8 +239,7 @@ function Wait-Window([int]$ProcessId, [string]$Class = 'FocusFlowNativeD2D', [in
         if ($h -ne [IntPtr]::Zero) { return $h }
         Start-Sleep -Milliseconds 100
     }
-    $b = Get-Blocker $script:LastExe
-    if ($b) { [Console]::Out.WriteLine('BLOCKER another instance holds the single-instance mutex: ' + $b) }
+    [Console]::Out.WriteLine('BLOCKER ' + (Get-Blocker))
     [IntPtr]::Zero
 }
 
