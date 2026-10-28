@@ -939,6 +939,18 @@ impl FocusFlowConfig {
             .unwrap_or_default()
     }
 
+    /// 这一键在配置里**存在**吗？存在但写着空也算存在。
+    ///
+    /// 为什么要有这条：`get_raw`/`get_or` 把"文件里没这一行"和"这一行被清空了"捏成同一个
+    /// 空串，而热键那一格要分开这两种 —— 没有这一行 ⇒ 用默认组合注册（全新安装就是这一态）；
+    /// 有这一行但值是空 ⇒ 用户刚点了那颗叉，这条**就是不注册**，不能悄悄退回默认值。
+    pub fn has_key(&self, section: &str, key: &str) -> bool {
+        let values = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        values
+            .get(section)
+            .is_some_and(|s| s.keys().any(|k| k == key))
+    }
+
     /// 读取字符串值，缺省返回空串。
     pub fn get(&self, section: &str, key: &str) -> String {
         self.get_raw(section, key)
@@ -1839,6 +1851,51 @@ work_minutes = 45
             after.contains("ignore_function_keys"),
             "快照里有、文件里没有的键要追加到节尾（证明确实重写过）:\n{after}"
         );
+    }
+
+    /// 点叉清空一条热键，要能**跨重启**还是空的。
+    ///
+    /// 这条不是顺手加的：`get_or` 把"没这一行"与"这行是空的"捏成同一个默认值，所以落盘
+    /// 或读回里只要有一环把空值丢了，症状就是"重启之后那条热键又活了"——而屏上那行明明
+    /// 写着未启用。三环一起钉：内存里存在且为空、写出去还是那一行、重新 load 之后仍然
+    /// 存在且为空。
+    #[test]
+    fn an_emptied_key_stays_present_and_empty_through_a_save_and_reload() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let dir = crate::paths::test_app_dir("cfg_emptied_key");
+        let path = dir.path().join("config.ini");
+        std::fs::write(
+            &path,
+            concat!(
+                "[hotkey]\n",
+                "enabled = true\n",
+                "toggle_window = ctrl+shift+f\n"
+            ),
+        )
+        .unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+        assert!(
+            !cfg.has_key("hotkey", "no_such_key"),
+            "夹具里没这一行，它不许算存在"
+        );
+        cfg.set_local("hotkey", "toggle_window", "");
+        assert!(
+            cfg.has_key("hotkey", "toggle_window"),
+            "清空之后这一行还得在（这就是'不注册'与'没配过'的分别）"
+        );
+        assert_eq!(cfg.get("hotkey", "toggle_window"), "");
+        cfg.save().unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("toggle_window =") && !after.contains("toggle_window = ctrl"),
+            "空值要原样写出去，不能退回默认串:\n{after}"
+        );
+        let back = FocusFlowConfig::load(&path).unwrap();
+        assert!(
+            back.has_key("hotkey", "toggle_window"),
+            "重启后这一行还在 ⇒ 还是'不注册'"
+        );
+        assert_eq!(back.get("hotkey", "toggle_window"), "");
     }
 
     /// 回归：`load()` 结尾那次"补齐默认键"的回写失败，原来会把**已经读好的**配置

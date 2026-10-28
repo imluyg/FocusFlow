@@ -1121,7 +1121,17 @@ impl App {
                 sel: self.sel,
                 editing: self.edit_row,
                 heat_hover: self.heat_hover,
-                hotkey_on: self.hotkey_hk.is_some() || self.snip_hk.is_some(),
+                // 三条绑定此刻**真的**注册着哪几条（顺序同 `COMBO_KEYS`）：设置页那三行
+                // 右边那句"没注册上"读的就是它。只报总开关会把"被别的程序占了"和
+                // "他自己清空了"都糊成"开"。
+                hotkey_live: [
+                    self.hotkey_hk.is_some(),
+                    self.snip_hk.is_some(),
+                    self.snip_annotate_hk.is_some(),
+                ],
+                hotkey_on: self.hotkey_hk.is_some()
+                    || self.snip_hk.is_some()
+                    || self.snip_annotate_hk.is_some(),
                 floating_on: floating::is_visible(),
                 pin_count: PINS.lock().map(|v| v.len()).unwrap_or(0),
                 dark: tokens.dark,
@@ -1674,6 +1684,46 @@ impl App {
                         SItem::Basic(Basic::Theme) => toggle_theme(hwnd),
                         SItem::Basic(Basic::DataDir) => self.open_data_dir(),
                         SItem::Setting(i) => {
+                            // 先问值框右沿那颗小钮：点它不该顺手把值框打开。
+                            let hk = self.snap.lock().ok().and_then(|s| {
+                                s.settings
+                                    .get(i)
+                                    .map(|r| (r.section, r.key, r.default.clone(), r.value.clone()))
+                            });
+                            let vb = rect(g.value_x, y0 + 9.0, g.value_w, 26.0);
+                            if let Some((section, key, default, value)) = hk {
+                                if hotkey_slot(section, key).is_some()
+                                    && hit(hotkey_btn_rect(vb), x, y)
+                                {
+                                    // 有值 → 清空（这条从此不注册）；空着 → 写回默认组合。
+                                    let v = if value.trim().is_empty() {
+                                        default
+                                    } else {
+                                        String::new()
+                                    };
+                                    match focusflow_core::config::instance().set(section, key, &v) {
+                                        Ok(()) => {
+                                            let msg = self.reload_hotkeys();
+                                            // 这句留着 `key = 值` 那个 ASCII 形状（与
+                                            // `register_combo` 同一形状）：验收脚本只能匹配
+                                            // ASCII，中文夹在中间它就逮不到。
+                                            tracing_note(&format!(
+                                                "热键 {key} = {v:?} 由值框右边那颗钮改过：{msg}"
+                                            ));
+                                            self.status = Some(msg);
+                                        }
+                                        Err(e) => {
+                                            tracing_note(&format!("热键 {key} 写入失败：{e}"));
+                                            self.status = Some(format!("热键没改：{e}"));
+                                        }
+                                    }
+                                    self.refresh_now();
+                                    unsafe {
+                                        let _ = InvalidateRect(Some(hwnd), None, false);
+                                    }
+                                    return;
+                                }
+                            }
                             let kind = self
                                 .snap
                                 .lock()
@@ -2013,7 +2063,12 @@ impl App {
         // 抄漏一条的症状是"开关关掉之后还剩一条热键在占键"。
         let mut slots: [Option<HotKey>; 3] = [None, None, None];
         let mut parts: Vec<(&'static str, String, Option<String>)> = Vec::new();
+        let mut offs: Vec<&'static str> = Vec::new();
         for (i, key) in combo_keys(true).iter().enumerate() {
+            if hotkey_is_off(key) {
+                offs.push(hotkey_label(key));
+                continue;
+            }
             let combo = register_combo(self.hotkeys.as_ref(), key);
             parts.push(combo.part(hotkey_label(key)));
             slots[i] = combo.hk;
@@ -2021,7 +2076,7 @@ impl App {
         self.hotkey_hk = slots[0];
         self.snip_hk = slots[1];
         self.snip_annotate_hk = slots[2];
-        hotkey_status_line(&parts)
+        hotkey_status_line(&parts, &offs)
     }
 
     /// 全局热键总开关：三条绑定（唤出 / 截图 / 截图进标注）一起注册或一起取消，
@@ -2660,7 +2715,8 @@ impl App {
                                 _ => true,
                             };
                             // 热键组合同样先验：写进去解析不了的值会让界面显示的和注册的各说各话。
-                            // 空串是既有的"恢复默认"手势，默认值本身一定可用，不用验。
+                            // 空串只有热键那几行是合法值（＝这条不注册），其余项的空串仍是
+                            // "恢复默认"那个既有的手势。
                             let hotkey_err = if section == "hotkey"
                                 && HOTKEY_KEYS.contains(&key)
                                 && !value.is_empty()
@@ -2677,7 +2733,13 @@ impl App {
                                 self.status = Some(format!("热键没有改：{why}"));
                                 tracing_note(&format!("热键 {key} 未写入：{why}"));
                             } else {
-                                let v = if value.is_empty() { default } else { value };
+                                // 热键那几行的空串是**他要的状态**（点了叉＝这条不注册），
+                                // 退回默认串就等于把那一叉吞掉；其余设置项保持既有手势：清空＝恢复默认。
+                                let v = match (value.is_empty(), section) {
+                                    (true, "hotkey") => String::new(),
+                                    (true, _) => default,
+                                    (false, _) => value,
+                                };
                                 match focusflow_core::config::instance().set(section, key, &v) {
                                     Ok(()) => {
                                         if section == "hotkey" {
@@ -3211,22 +3273,53 @@ fn draw_settings(
                         &p.br.card,
                         Some(if editing { &p.br.accent } else { &p.br.border }),
                     );
+                    // 热键那三行在值框右沿挂一颗小钮：有值时是「✕」（清空＝这条不注册），
+                    // 空着时是「默认」（把默认组合写回去）。一颗钮两种样子，是因为这两个
+                    // 动作永远不会同时需要。
+                    let btn = hotkey_slot(row.section, row.key).map(|_| hotkey_btn_rect(vb));
+                    let off = row.value.trim().is_empty();
                     if !editing {
+                        let shown: &str = if off { "（未启用）" } else { &row.value };
                         p.text(
-                            &row.value,
+                            shown,
                             rect(
                                 vb.left + 8.0,
                                 vb.top,
-                                vb.right - vb.left - 16.0,
+                                vb.right - vb.left - if btn.is_some() { 54.0 } else { 16.0 },
                                 vb.bottom - vb.top,
                             ),
                             &p.fmt.text13,
-                            &p.br.fg,
+                            if off { &p.br.muted } else { &p.br.fg },
+                        );
+                    }
+                    if let Some(b) = btn {
+                        p.round(
+                            b,
+                            4.0,
+                            if off { &p.br.accent } else { &p.br.header },
+                            Some(&p.br.border),
+                        );
+                        p.text(
+                            if off { "默认" } else { "✕" },
+                            b,
+                            &p.fmt.center13,
+                            if off { &p.br.white } else { &p.br.fg },
                         );
                     }
                 }
-                // 只有"要重启/下次隐藏"这种例外才写在行上；绝大多数立即生效，不再每行重复。
-                if row.live != "改完立即生效" {
+                // 热键那行还要说清"配了但没挂上"：值框里只有他配的那一串，看不出被谁占了。
+                let hk_note = hotkey_slot(row.section, row.key)
+                    .filter(|slot| !row.value.trim().is_empty() && !vs.hotkey_live[*slot])
+                    .map(|_| "这条没注册上");
+                if let Some(note) = hk_note {
+                    p.text(
+                        note,
+                        rect(vb.right + 14.0, y + 13.0, 220.0, 16.0),
+                        &p.fmt.small,
+                        &p.br.danger,
+                    );
+                } else if row.live != "改完立即生效" {
+                    // 只有"要重启/下次隐藏"这种例外才写在行上；绝大多数立即生效，不再每行重复。
                     p.text(
                         row.live,
                         rect(vb.right + 14.0, y + 13.0, 220.0, 16.0),
@@ -3742,6 +3835,8 @@ struct ViewState {
     heat_hover: Option<usize>,
     /// 全局热键此刻是否真的注册着（不是配置键，是运行时状态）。
     hotkey_on: bool,
+    /// 三条绑定各自注册上了没有，顺序同 `COMBO_KEYS`（0 唤出 / 1 松手即存 / 2 进标注）。
+    hotkey_live: [bool; 3],
     /// 悬浮窗此刻是否真的显示着（同上：读运行时状态，不读配置键 ——
     /// 手改 `[floating] enabled` 并不会让卡片出现或消失）。
     floating_on: bool,
@@ -7061,6 +7156,22 @@ fn combo_check(raw: &str, others: &[(&str, &str)]) -> Option<String> {
     None
 }
 
+/// 这一行是不是三条热键绑定之一；是的话返回它在 `COMBO_KEYS` 里的下标
+/// （0＝唤出、1＝松手即存、2＝进标注）。画、命中、读数三处都问这一个函数，
+/// 免得"哪几行有小钮"这件事在三个地方各写一遍名单。
+fn hotkey_slot(section: &str, key: &str) -> Option<usize> {
+    if section != "hotkey" {
+        return None;
+    }
+    COMBO_KEYS.iter().position(|k| *k == key)
+}
+
+/// 值框右沿那颗小钮的位置。**画与命中共用这一份**：两处各算一遍迟早漂开，
+/// 而漂开的症状是"看得见却点不到"或"点 A 改的是 B"。
+fn hotkey_btn_rect(vb: D2D_RECT_F) -> D2D_RECT_F {
+    rect(vb.right - 40.0, vb.top + 4.0, 34.0, 18.0)
+}
+
 /// `[hotkey]` 某个键的中文名（与设置页那一行的标签同一份）——撞车时要点名是哪一条。
 fn hotkey_label(key: &str) -> &'static str {
     match key {
@@ -7072,7 +7183,12 @@ fn hotkey_label(key: &str) -> &'static str {
 
 /// `[hotkey]` 里这一条组合当前配置的原串（文件里没有或写着空 → 核心默认值）。
 /// 设置页显示的就是它，注册的键是它解析出来的，所以两边不会分叉。
+/// 清空过的那一条返回**空串**而不是默认值：否则"它现在不绑定"这件事在重复检查里
+/// 会被算成"它绑着默认那一串"，另一条想用默认组合就会被无故拒掉。
 fn hotkey_config_raw(key: &str) -> String {
+    if hotkey_is_off(key) {
+        return String::new();
+    }
     let defaults = focusflow_core::config::default_config();
     let def = defaults
         .get("hotkey")
@@ -7080,6 +7196,24 @@ fn hotkey_config_raw(key: &str) -> String {
         .cloned()
         .unwrap_or_default();
     focusflow_core::config::instance().get_or("hotkey", key, &def)
+}
+
+/// 这一条热键是不是被**清空了**（设置页那颗叉）。
+///
+/// 与"文件里没这一行"不是一回事：没这一行 ⇒ 按默认组合注册（全新安装就是这一态）；
+/// 有这一行但值是空 ⇒ 他刚说"这条我不想用"，那就**不注册**，绝不能悄悄退回默认值。
+/// 空值能不能跨重启留住，由 core 的 `an_emptied_key_stays_present_and_empty_through_a_save_and_reload`
+/// 钉着（`get_or` 本来会把这两种捏成一个）。
+fn hotkey_is_off(key: &str) -> bool {
+    let cfg = focusflow_core::config::instance();
+    hotkey_off_of(cfg.has_key("hotkey", key), &cfg.get("hotkey", key))
+}
+
+/// 「这一条算不算被他停用了」的唯一判据：**文件里有这一行**，且**值是空**。
+/// 少了前半个条件，"没配过"（该按默认组合注册）就会被念成"不注册"——
+/// 那是全新安装的症状，不是他点过叉。
+fn hotkey_off_of(present: bool, raw: &str) -> bool {
+    present && raw.trim().is_empty()
 }
 
 /// 拿配置里其余几条热键做重复检查（还是 `combo_check` 那一份判据）。
@@ -7171,25 +7305,37 @@ fn status_is_warning(line: &str) -> bool {
 /// 三条绑定的注册结局拼成状态栏那一行。**点名到哪一条**是这条读数的全部意义：
 /// "截图的热键被别的程序占了"和"唤出的热键写错了"是两件完全不同的事，用户要改的东西不一样，
 /// 而只报"注册上 N 条（详见日志）"等于让人去翻日志。全成都把三条当前组合念出来。
-fn hotkey_status_line(items: &[(&str, String, Option<String>)]) -> String {
+///
+/// `offs` 是他**主动清空**的那几条（值还在文件里，只是空的）：那不算失败，用红色喊出来
+/// 就是骗他去做点什么；但也不能不提——不然"三条热键已注册"这句话本身就是假的。
+fn hotkey_status_line(items: &[(&str, String, Option<String>)], offs: &[&str]) -> String {
     let mut failed: Vec<String> = Vec::new();
     for (label, raw, why) in items {
         if let Some(why) = why {
             failed.push(format!("{label} {raw}：{why}"));
         }
     }
+    let off_tail = if offs.is_empty() {
+        String::new()
+    } else {
+        format!("；未启用 {} 条（{}）", offs.len(), offs.join("、"))
+    };
     if failed.is_empty() {
         let live: Vec<String> = items
             .iter()
             .map(|(l, raw, _)| format!("{l} {raw}"))
             .collect();
-        return format!("三条热键已按配置注册：{}", live.join(" · "));
+        if live.is_empty() {
+            return format!("三条热键都没挂上{off_tail}");
+        }
+        return format!("已按配置注册：{}", live.join(" · ")) + &off_tail;
     }
     let ok = items.len() - failed.len();
     let mut line = format!("没注册上：{}", failed.join("；"));
     if ok > 0 {
         line.push_str(&format!("；其余 {ok} 条已注册"));
     }
+    line.push_str(&off_tail);
     line
 }
 
@@ -7353,7 +7499,12 @@ fn make_hotkeys() -> HotkeysAtBoot {
     let enabled = focusflow_core::config::instance().get_bool("hotkey", "enabled", true);
     let mut slots: [Option<HotKey>; 3] = [None, None, None];
     let mut parts: Vec<(&'static str, String, Option<String>)> = Vec::new();
+    let mut offs: Vec<&'static str> = Vec::new();
     for (i, key) in combo_keys(enabled).iter().enumerate() {
+        if hotkey_is_off(key) {
+            offs.push(hotkey_label(key));
+            continue;
+        }
         let combo = register_combo(manager.as_ref(), key);
         parts.push(combo.part(hotkey_label(key)));
         slots[i] = combo.hk;
@@ -7362,7 +7513,7 @@ fn make_hotkeys() -> HotkeysAtBoot {
         tracing_note("热键未注册（[hotkey] enabled = false）：本次不占用任何全局键");
         Some("全局热键没开（[hotkey] enabled = false）：三条组合都不注册".to_string())
     } else if parts.iter().any(|(_, _, why)| why.is_some()) {
-        Some(hotkey_status_line(&parts))
+        Some(hotkey_status_line(&parts, &offs))
     } else {
         None
     };
@@ -8520,6 +8671,48 @@ mod settings_type_tests {
 mod hotkey_tests {
     use super::*;
 
+    /// 「他点过叉」与「这台机器没配过这一条」必须是两件事。
+    /// 混起来的症状很难看：全新安装里 `[hotkey]` 一行都没写，若按"值是空＝不注册"读，
+    /// 三条热键一条都不会挂上，而屏上连"未启用"都显示不出来（他没做过任何操作）。
+    #[test]
+    fn an_emptied_line_is_not_the_same_as_a_missing_one() {
+        assert!(hotkey_off_of(true, ""), "有这一行且空 ⇒ 不注册");
+        assert!(hotkey_off_of(true, "   "), "只有空白也算空");
+        assert!(!hotkey_off_of(true, "ctrl+shift+f"), "有值 ⇒ 照值注册");
+        assert!(
+            !hotkey_off_of(false, ""),
+            "文件里没这一行 ⇒ 用默认值，不是停用"
+        );
+    }
+
+    /// 小钮只该挂在那三条绑定上：其它热键段的键（`enabled`）与别的段的行都不许有。
+    /// 挂错行的症状是"点了叉把某条不相干的配置清空了"。
+    #[test]
+    fn only_the_three_bindings_get_the_button() {
+        assert_eq!(hotkey_slot("hotkey", "toggle_window"), Some(0));
+        assert_eq!(hotkey_slot("hotkey", "snip"), Some(1));
+        assert_eq!(hotkey_slot("hotkey", "snip_annotate"), Some(2));
+        assert_eq!(hotkey_slot("hotkey", "enabled"), None, "总开关不是绑定");
+        assert_eq!(hotkey_slot("gui", "toggle_window"), None, "别的段不算");
+    }
+
+    /// 那颗钮必须还在值框**里面**：画与命中虽然共用一个函数，但函数本身写错
+    /// （比如跑到框外）时两处会一起错，只有几何断言能逮住。
+    #[test]
+    fn the_button_stays_inside_its_value_box() {
+        let vb = rect(720.0, 100.0, 150.0, 26.0);
+        let b = hotkey_btn_rect(vb);
+        assert!(
+            b.left >= vb.left && b.right <= vb.right,
+            "小钮跑出值框了：{b:?}"
+        );
+        assert!(
+            b.top >= vb.top && b.bottom <= vb.bottom,
+            "小钮跑出值框了：{b:?}"
+        );
+        assert!(b.left - vb.left >= 60.0, "小钮不许压住框里那几个字");
+    }
+
     /// 那一格跟着**注册结果**走：三条里有一条真在占全局键，显示就该是"开"。
     /// 以前它只数了唤出与截图两条 —— 只有标注那条注册上时屏上写"关"，而那颗键确实在被占用。
     #[test]
@@ -9237,11 +9430,14 @@ mod hotkey_line_tests {
 
     #[test]
     fn all_three_registered_reads_back_what_is_live() {
-        let line = hotkey_status_line(&[
-            item("唤出窗口热键", "ctrl+f12", None),
-            item("区域截图热键", "ctrl+f1", None),
-            item("标注截图热键", "ctrl+f2", None),
-        ]);
+        let line = hotkey_status_line(
+            &[
+                item("唤出窗口热键", "ctrl+f12", None),
+                item("区域截图热键", "ctrl+f1", None),
+                item("标注截图热键", "ctrl+f2", None),
+            ],
+            &[],
+        );
         assert!(line.contains("已按配置注册"), "{line}");
         // 三条当前组合都要念出来：屏幕上能看见"现在按 ctrl+f1 是截图"才是这条读数的用处
         for raw in ["ctrl+f12", "ctrl+f1", "ctrl+f2"] {
@@ -9251,15 +9447,18 @@ mod hotkey_line_tests {
 
     #[test]
     fn one_failed_combo_is_named_with_its_own_reason() {
-        let line = hotkey_status_line(&[
-            item("唤出窗口热键", "ctrl+f12", None),
-            item(
-                "区域截图热键",
-                "ctrl+f1",
-                Some("系统拒了：另一个程序已占用"),
-            ),
-            item("标注截图热键", "ctrl+f2", None),
-        ]);
+        let line = hotkey_status_line(
+            &[
+                item("唤出窗口热键", "ctrl+f12", None),
+                item(
+                    "区域截图热键",
+                    "ctrl+f1",
+                    Some("系统拒了：另一个程序已占用"),
+                ),
+                item("标注截图热键", "ctrl+f2", None),
+            ],
+            &[],
+        );
         assert!(line.contains("区域截图热键"), "没点名是哪一条：{line}");
         assert!(line.contains("ctrl+f1"), "没说他配的是哪一串：{line}");
         // 原因不许被聚合话术吞掉——旧写法只剩"只注册上 2 条（详见日志）"
@@ -9273,13 +9472,42 @@ mod hotkey_line_tests {
 
     #[test]
     fn all_failed_says_so_without_counting_the_rest() {
-        let line = hotkey_status_line(&[
-            item("唤出窗口热键", "", Some("这串组合解析不出来")),
-            item("区域截图热键", "", Some("拿不到热键管理器")),
-            item("标注截图热键", "", Some("拿不到热键管理器")),
-        ]);
+        let line = hotkey_status_line(
+            &[
+                item("唤出窗口热键", "", Some("这串组合解析不出来")),
+                item("区域截图热键", "", Some("拿不到热键管理器")),
+                item("标注截图热键", "", Some("拿不到热键管理器")),
+            ],
+            &[],
+        );
         assert!(line.contains("没注册上"), "{line}");
         assert!(!line.contains("其余"), "三条都没成却还说其余：{line}");
+    }
+
+    /// 他主动清空的那一条：要说出来（不然"已注册"那句就成了假话），但不许走
+    /// "没注册上"那一档 —— 那一档是要人去做点什么的，而这一条正是他刚做完的样子。
+    #[test]
+    fn an_emptied_binding_is_reported_as_off_not_as_a_failure() {
+        let line = hotkey_status_line(
+            &[
+                item("唤出窗口热键", "ctrl+f12", None),
+                item("区域截图热键", "ctrl+f1", None),
+            ],
+            &["标注截图热键"],
+        );
+        assert!(line.contains("未启用 1 条（标注截图热键）"), "{line}");
+        assert!(!line.contains("没注册上"), "主动停用被念成了失败：{line}");
+        assert!(!status_is_warning(&line), "主动停用不该用红色喊：{line}");
+    }
+
+    /// 三条都清空 ⇒ 不许还说"已按配置注册"。全挂着的时候那句是真话，一条都不挂还说
+    /// 就是凭空给一个"热键都在"的印象。
+    #[test]
+    fn all_three_off_says_nothing_is_bound() {
+        let line = hotkey_status_line(&[], &["唤出窗口热键", "区域截图热键", "标注截图热键"]);
+        assert!(line.contains("三条热键都没挂上"), "{line}");
+        assert!(line.contains("未启用 3 条"), "{line}");
+        assert!(!line.contains("已按配置注册"), "{line}");
     }
 
     #[test]

@@ -60,7 +60,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         3,
         "改完立即生效",
         "唤出窗口热键",
-        "热键 · 按下它把主窗口带到前台，如 ctrl+shift+f；留空 = 恢复默认",
+        "热键 · 按下它把主窗口带到前台，如 ctrl+shift+f；点值框右边的叉＝这条不注册",
     ),
     (
         "hotkey",
@@ -272,6 +272,13 @@ fn load_settings() -> Vec<SettingRow> {
             let value = if kind == 0 {
                 c.get_bool(section, key, d.parse::<bool>().unwrap_or(false))
                     .to_string()
+            } else if section == "hotkey"
+                && crate::hotkey_off_of(c.has_key(section, key), &c.get(section, key))
+            {
+                // 他清空过的那一条：这一格要显示"未启用"而不是默认那一串。
+                // `get_or` 会把"有这行但空"与"没这行"捏成同一个默认值，照它读就会出现
+                // "屏上写着 ctrl+shift+f、而这条根本没挂上"——正是这一族最难查的形状。
+                String::new()
             } else {
                 c.get_or(section, key, &d)
             };

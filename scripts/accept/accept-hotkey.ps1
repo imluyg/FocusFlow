@@ -143,4 +143,72 @@ $sw3 = [Diagnostics.Stopwatch]::StartNew()
 while (-not $p3.HasExited -and $sw3.Elapsed.TotalMilliseconds -lt 8000) { Start-Sleep -Milliseconds 150 }
 if (-not $p3.HasExited) { Stop-App }
 
+# ---------- round 4: the clear button next to a binding ----------
+# The cross inside the value box is the "keep the line, do not arm it" gesture. Two things
+# have to hold: the file gets an EMPTY value (not the default string -- restoring the default
+# would silently re-arm the combo on the next start), and the next start really skips it.
+#
+# Coordinates are CLIENT pixels (the click helper posts WM_LBUTTONDOWN in client space):
+# settings list_top=260, row_h=44, the first binding row is the 5th item of this category,
+# and the button is 18 tall starting 13 px into the row -> y = 260 + 4*44 + 22 = 458.
+# x = 847 is the centre of the 34 px button that ends 6 px inside a 150 px box at x=720.
+Set-ConfigLine $app 'hotkey' 'enabled' 'true'
+Set-ConfigLine $app 'hotkey' 'toggle_window' 'ctrl+alt+3'
+Remove-Item $logPath -ErrorAction SilentlyContinue
+
+$p4 = Start-App $Exe $app $WorkDir
+$h4 = Wait-Window $p4.Id
+Check 'the app starts for the clear-button round' ($h4 -ne [IntPtr]::Zero)
+if ($h4 -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
+
+Click-ViewTab $h4 5
+Start-Sleep -Milliseconds 400
+# The page opens on category 0; the three bindings live in category 1 (client y = 260 + 44*i + 20).
+[FF]::ClickWindow($h4, 123, 324, 1)
+Start-Sleep -Milliseconds 500
+[FF]::ClickWindow($h4, 847, 458, 1)
+Start-Sleep -Milliseconds 1500
+
+$cfg4 = Get-ConfigValue $app 'hotkey' 'toggle_window'
+Check 'the cross left an empty value, not the default combo' ($cfg4 -eq '') "got [$cfg4]"
+$log4 = @(Get-HotLog)
+Check 'the button path logged the empty value' `
+    (@($log4 | Where-Object { $_ -like '*toggle_window = ""*' }).Count -gt 0)
+# The boot line for ctrl+alt+3 is already in this log (the app started with that combo), so
+# "not registered" cannot be read as "no line mentions toggle_window". What must never appear
+# is the DEFAULT combo: that is what a reader collapsing "empty" into "absent" would arm.
+$rearmed = @($log4 | Where-Object { $_ -like '*toggle_window = ctrl+shift+f*' })
+Check 'clearing did not re-arm the default combo' ($rearmed.Count -eq 0) "lines=$($rearmed.Count)"
+# A clear button that eats its neighbours is the bug to fear: the other two must stay intact.
+Check 'the other binding still registers' `
+    (@($log4 | Where-Object { $_ -like '*snip = ctrl+alt+8*' }).Count -gt 0)
+$cfgSnip = Get-ConfigValue $app 'hotkey' 'snip'
+Check 'the other binding is untouched in the file' ($cfgSnip -eq 'ctrl+alt+8') "got [$cfgSnip]"
+
+[void][FF]::PostMessage($h4, 0x8009, [IntPtr]::Zero, [IntPtr]::Zero)
+$sw4 = [Diagnostics.Stopwatch]::StartNew()
+while (-not $p4.HasExited -and $sw4.Elapsed.TotalMilliseconds -lt 8000) { Start-Sleep -Milliseconds 150 }
+if (-not $p4.HasExited) { Stop-App }
+
+# ---------- round 5: an emptied binding stays emptied across a restart ----------
+# This is the whole point of the gesture: if any reader collapses "line present but empty"
+# into "no line", the default combo comes back on the next start -- while the screen has
+# already told him that binding is off.
+Remove-Item $logPath -ErrorAction SilentlyContinue
+$p5 = Start-App $Exe $app $WorkDir
+$h5 = Wait-Window $p5.Id
+Check 'the app starts with one binding cleared' ($h5 -ne [IntPtr]::Zero)
+if ($h5 -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
+Start-Sleep -Milliseconds 2000
+$log5 = @(Get-HotLog)
+$back = @($log5 | Where-Object { $_ -like '*toggle_window*' })
+Check 'the cleared binding did not come back on restart' ($back.Count -eq 0) "lines=$($back.Count)"
+Check 'the untouched binding still registers after restart' `
+    (@($log5 | Where-Object { $_ -like '*snip = ctrl+alt+8*' }).Count -gt 0)
+
+[void][FF]::PostMessage($h5, 0x8009, [IntPtr]::Zero, [IntPtr]::Zero)
+$sw5 = [Diagnostics.Stopwatch]::StartNew()
+while (-not $p5.HasExited -and $sw5.Elapsed.TotalMilliseconds -lt 8000) { Start-Sleep -Milliseconds 150 }
+if (-not $p5.HasExited) { Stop-App }
+
 Show-Summary
