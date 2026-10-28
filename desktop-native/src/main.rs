@@ -3917,7 +3917,8 @@ fn period_text(period: i64) -> String {
 }
 
 /// 三份导出共用的那一句"这一轮没读全"：文件里没这句，拿到导出的人就把下界当成了实测上限。
-/// 屏上那句写在页脚、指的是"上面那些数"，措辞不同但同一个判据（`snap.gaps` 是否非空）。
+/// 这里**念全句**（哪一年、哪一栏、为什么），屏上那几格只念到年份 —— 文件没有宽度上限，
+/// 而屏幕上是一行不换行的字。同一个判据（`snap.gaps` 是否非空）在两处说两种长度。
 fn gap_line(gaps: &[String]) -> String {
     if gaps.is_empty() {
         return String::new();
@@ -3929,11 +3930,17 @@ fn gap_line(gaps: &[String]) -> String {
     )
 }
 
-/// 某一栏自己那句"这一轮没读全"：core 交回的每条长这样 —— 「2025 年库每日趋势读不出来: …」
-/// ⇒ 按域名认领属于自己那一条，屏上每一栏说的就只是它自己缺的那一块。
-/// 域名不在这里写第二遍：那份清单在 core（`db::queries` 里的 `READ_DOMAINS` 与
-/// `PANEL_READ_DOMAINS`），下面那条用例钉着"面板只许认领清单上、且该由面板接的那几栏"。
-fn gap_note(gaps: &[String], domain: &str) -> String {
+/// 屏上那一格最多念几个缺读的年份，多出来的折成"等 N 年"。
+const GAP_NOTE_YEARS: usize = 3;
+
+/// 这一栏缺读的那几个年份，只取屏上念得下的那一小截。
+///
+/// core 交回的每条长这样 ——「2025 年库每日趋势读不出来: {原因}」（那个形状是它自己的文档
+/// 写下的）。冒号后面那截原因不上屏：屏上这几格都是一行，而每一档字体都是 `NO_WRAP`、
+/// `DrawText` 又不按传入的矩形裁切（试过给它设 `DWRITE_TRIMMING`，实测仍然照画过去），
+/// 于是照抄原因的那句会一路画到隔壁卡上、甚至画出窗口外。原因本身在 error 日志里有。
+/// 年份最多念三个，多出来的折成"等 N 年" —— 这句话因此有个上界。
+fn gap_years(gaps: &[String], domain: &str) -> String {
     let mine: Vec<&str> = gaps
         .iter()
         .map(String::as_str)
@@ -3942,7 +3949,52 @@ fn gap_note(gaps: &[String], domain: &str) -> String {
     if mine.is_empty() {
         return String::new();
     }
-    format!(" · {}", mine.join("；"))
+    let named: Vec<String> = mine
+        .iter()
+        .take(GAP_NOTE_YEARS)
+        .map(|g| {
+            let head = g.split(" 年库").next().unwrap_or(g);
+            if head.is_empty() || !head.chars().all(|c| c.is_ascii_digit()) {
+                // 形状对不上（core 改了那句话而没改这里）：念它的前半截，别把这一条吞掉。
+                return head.to_string();
+            }
+            format!("{head} 年")
+        })
+        .collect();
+    let mut s = named.join("、");
+    if mine.len() > GAP_NOTE_YEARS {
+        s.push_str(&format!(" 等 {} 年", mine.len()));
+    }
+    s
+}
+
+/// 念不全的那一句，供三张图自己那格用：年份由 [`gap_years`] 挑，域名不写第二遍
+/// （那一格本身就是那一栏）。
+fn gap_note(gaps: &[String], domain: &str) -> String {
+    let years = gap_years(gaps, domain);
+    if years.is_empty() {
+        return String::new();
+    }
+    format!(" · {years}没读全")
+}
+
+/// 左表那一屏的页脚。三件事按"越要紧的越靠前"排：这一栏缺哪几年 → 整屏数字只是下界
+/// → 数据源路径。那一格只有一行、装不下时被截掉的是句尾，所以路径必须排在最后 ——
+/// 它设置在页与日志里都还有，而前面那句警告没有第二个地方会念。
+fn footer_line(data_home: &str, gaps: &[String], lane: &str) -> String {
+    if gaps.is_empty() {
+        return format!("数据源：{data_home}");
+    }
+    let lane_years = gap_years(gaps, lane);
+    let mine = if lane_years.is_empty() {
+        String::new()
+    } else {
+        format!("本栏{lane_years}没读全 · ")
+    };
+    format!(
+        "{mine}{} 条读数没读全（上面那些数字是下界） · 数据源：{data_home}",
+        gaps.len()
+    )
 }
 
 fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
@@ -6519,7 +6571,9 @@ struct TableGeom {
 /// 照的是 `view_tabs` / `atab_tabs` 那个做法。
 fn rank_pills(card: D2D_RECT_F) -> [D2D_RECT_F; 5] {
     let y = card.top + 8.0;
-    let x0 = card.left + 306.0;
+    // 322 而不是 306：标题行左边那句摘要（共 N 次 · 其中 鼠标 … · 键盘 …）画到 card.left+306 为止，
+    // 胶囊原来正好贴在其右沿上，看着像同一串字。留出 16px 才分得开"读数"与"按钮"。
+    let x0 = card.left + 322.0;
     let xs = [32.0, 90.0, 188.0, 246.0, 304.0];
     let mut out = [rect(0.0, 0.0, 0.0, 0.0); 5];
     for (i, dx) in xs.iter().enumerate() {
@@ -6531,7 +6585,7 @@ fn rank_pills(card: D2D_RECT_F) -> [D2D_RECT_F; 5] {
 /// 两排胶囊前那两句小字（视图 / 筛选），原点与 `rank_pills` 同一份。
 fn rank_pill_captions(card: D2D_RECT_F) -> (D2D_RECT_F, D2D_RECT_F) {
     let y = card.top + 11.0;
-    let x0 = card.left + 306.0;
+    let x0 = card.left + 322.0;
     (rect(x0, y, 30.0, 16.0), rect(x0 + 148.0, y, 30.0, 16.0))
 }
 
@@ -7067,7 +7121,8 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
             thousands(snap.keyboard_total.max(0) as u64)
         ));
     }
-    summary.push_str(&gap_note(&snap.gaps, lane));
+    // 本栏那句"没读全"不写在这里：标题行这一格只有 220px，一条年度库的缺读理由就把它撑满，
+    // 挤掉的是刚补的鼠标/键盘两个数。挪到同一张卡底下那条页脚去说（它宽得多，而且句子短了）。
     p.text(
         &summary,
         rect(r.left + g.pad + 74.0, r.top + 12.0, 220.0, 18.0),
@@ -7365,13 +7420,8 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         &p.br.border,
         1.0,
     );
-    let gap_tail = if snap.gaps.is_empty() {
-        String::new()
-    } else {
-        format!(" · {} 条读数没读全（上面那些数字是下界）", snap.gaps.len())
-    };
     p.text(
-        &format!("数据源：{}{gap_tail}", snap.data_home),
+        &footer_line(&snap.data_home, &snap.gaps, lane),
         rect(r.left + g.pad, foot_y, r.right - r.left - g.pad * 2.0, 16.0),
         &p.fmt.small,
         &p.br.muted,
@@ -7660,9 +7710,17 @@ fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) 
         if let Some(b) = p.brush(p.pal.accent) {
             p.round(bar, 2.0, &b, None);
         }
-        // 压住的那一根：与热力板同一套画法（底色重画一遍 + 强调色描边）。
+        // 压住的那一根：**只描一圈，不重填**。以前照抄热力板那套"填卡片底色 + 描边"，
+        // 键帽本来就是空的所以没事，柱状图里这一填就比邻柱更淡，一眼像"这一小时没数据"。
         if hover == Some(i) {
-            p.round(bar, 2.0, &p.br.card, Some(&p.br.accent));
+            if let Some(ghost) = p.brush(with_alpha(p.pal.accent, 0.0)) {
+                p.round(
+                    rect(x - 2.0, plot.bottom - hp - 2.0, bw + 4.0, hp + 4.0),
+                    4.0,
+                    &ghost,
+                    Some(&p.br.accent),
+                );
+            }
         }
     }
     if let Some(i) = hover {
@@ -9502,7 +9560,7 @@ mod gap_note_tests {
         ];
         assert_eq!(
             gap_note(&gaps, queries::DOMAIN_DAILY),
-            " · 2025 年库每日趋势读不出来: 库被占用",
+            " · 2025 年没读全",
             "每日那一栏只该说自己那一条，别的栏位的话不许顶到它这儿来"
         );
         assert_eq!(
@@ -9515,14 +9573,59 @@ mod gap_note_tests {
             "",
             "读全了就没有后面那一截"
         );
-        // 同一栏缺了两个年度库 ⇒ 两句都要说出来，不是只报第一条。
+        // 同一栏缺了两个年度库 ⇒ 两个年份都要念出来，不是只报第一个。
         let two = vec![
             "2024 年库每日趋势读不出来: a".to_string(),
             "2025 年库每日趋势读不出来: b".to_string(),
         ];
         assert_eq!(
             gap_note(&two, queries::DOMAIN_DAILY),
-            " · 2024 年库每日趋势读不出来: a；2025 年库每日趋势读不出来: b"
+            " · 2024 年、2025 年没读全"
+        );
+    }
+
+    /// 那句"没读全"必须有个长度上界：屏上这几格都是一行，`NO_WRAP` 的字体装不下就会
+    /// 画到隔壁卡上去 —— 这一条钉的就是"缺多少年都不会把句子拉长"。
+    #[test]
+    fn the_note_stays_short_however_many_years_are_missing() {
+        let many: Vec<String> = (2000..2030)
+            .map(|y| format!("{y} 年库每日趋势读不出来: 原因"))
+            .collect();
+        let note = gap_note(&many, queries::DOMAIN_DAILY);
+        assert_eq!(
+            note, " · 2000 年、2001 年、2002 年 等 30 年没读全",
+            "念前三个、把总数折成一句，才既说得清又有上界"
+        );
+        assert!(
+            note.chars().count() <= 40,
+            "这句长度没有上界，早晚会画出自己那格：{note}"
+        );
+        // 形状对不上（core 改了那句话）时宁可念原样，也不许把这一条悄悄吞掉。
+        let odd = vec!["一整句没有年份形状的话".to_string()];
+        assert_eq!(
+            gap_note(&odd, "没有的域名"),
+            "",
+            "按域名认领这一步先于形状：不认领就不出声"
+        );
+        let odd2 = vec!["2025 年库每日趋势读不出来".to_string()];
+        assert_eq!(
+            gap_note(&odd2, queries::DOMAIN_DAILY),
+            " · 2025 年没读全",
+            "没有冒号后面那截原因，也照样念得出年份"
+        );
+        // 认领这一步用的是"这句话里点过这一栏"，所以域名写在原因位置也一样认得出来。
+        let tail = vec!["2025 年库读不出来: 每日趋势这一栏断了".to_string()];
+        assert_eq!(
+            gap_note(&tail, queries::DOMAIN_DAILY),
+            " · 2025 年没读全",
+            "认领只看这句话点没点这一栏，压缩只看年份那一段的形状"
+        );
+        // 年份位置不是数字（core 改了那句话）时念原样的前半截 —— 宁可啰嗦，不许吞掉这一条。
+        let odd3 = vec!["前年 年库每日趋势读不出来: x".to_string()];
+        assert_eq!(
+            gap_note(&odd3, queries::DOMAIN_DAILY),
+            " · 前年没读全",
+            "形状对不上也要出声，只是说不出是哪一年"
         );
     }
 
@@ -9598,7 +9701,7 @@ mod gap_note_tests {
         // 写死成 KEYS）当场证明它骗人。所以这里钉的是**调用形态**。
         for (form, want, why) in [
             (
-                ["gap_note(&snap.gaps, lane"].concat(),
+                ["footer_line(&snap.data_home, &snap.gaps, lane"].concat(),
                 1usize,
                 "左表那一屏按榜分栏说",
             ),
@@ -9631,6 +9734,46 @@ mod gap_note_tests {
                 "`lane` 里少了 {arm}：三个榜说的是同一栏的话，另外两栏的提示永远不出现"
             );
         }
+        // 页脚那句现在是一个真函数（`footer_line`），它的排法由下面那组用例直接钉；
+        // 这里只保证画的那一处仍然调它 —— 换回手写格式串，用例就再也看不见屏上那句。
+        assert!(
+            prod.contains("&footer_line("),
+            "页脚不再走 footer_line：那句的排法没人算了，用例也就成了摆设"
+        );
+    }
+
+    /// 页脚那句的排法：装不下时被截掉的是句尾，所以路径必须在最后、警告必须在最前。
+    #[test]
+    fn the_footer_puts_the_warning_before_the_path() {
+        let path = "E:\\somewhere\\FocusFlow";
+        assert_eq!(
+            footer_line(path, &[], "按键统计"),
+            format!("数据源：{path}"),
+            "读全了就只报数据源，一个字都不多加"
+        );
+        let gaps = vec![
+            "2025 年库按键统计读不出来: 打不开".to_string(),
+            "2024 年库应用排行读不出来: 打不开".to_string(),
+        ];
+        let mine = footer_line(path, &gaps, queries::DOMAIN_KEYS);
+        assert_eq!(
+            mine,
+            format!("本栏2025 年没读全 · 2 条读数没读全（上面那些数字是下界） · 数据源：{path}")
+        );
+        // 别的栏缺了、本栏没缺：只说整屏那句，不许冒认一个年份。
+        let other = footer_line(path, &gaps, queries::DOMAIN_APPS);
+        assert!(
+            other.starts_with("2 条读数没读全"),
+            "本栏没缺读时它不该抢那句：{other}"
+        );
+        // 三段的先后顺序就是这条用例的全部意思。
+        let at_note = mine.find("本栏").expect("本栏那句不见了");
+        let at_bound = mine.find("下界").expect("下界那句不见了");
+        let at_path = mine.find("数据源：").expect("数据源不见了");
+        assert!(
+            at_note < at_bound && at_bound < at_path,
+            "页脚排成了：{mine}"
+        );
     }
 }
 
