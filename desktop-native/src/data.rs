@@ -316,8 +316,10 @@ pub struct Snapshot {
     pub apps: Vec<(String, i64)>,
     pub app_total: i64,
     pub devices: Vec<DevRow>,
-    /// 近 30 天每日次数（固定窗口，画趋势用）。
-    pub daily: Vec<i64>,
+    /// 每日次数，窗口 = core 的 `chart_window_days(period)`（今日 1 天、总计按 30 天）。
+    /// 每项是 `(YYYY-MM-DD, 次数)`：窗口内每天都有格子（当天没数据的是 0），图上刻度与
+    /// 导出那一栏念的就是这里交回来的日期，不由调用方按下标反推。
+    pub daily: Vec<(String, i64)>,
     /// 当前周期内每小时的合计（今日 = 今天 24 小时）。
     pub hourly: Vec<i64>,
     /// 星期分布（0=周一 … 6=周日），跟随周期窗口。
@@ -327,7 +329,9 @@ pub struct Snapshot {
     /// 高级设置的行（值 + 类型 + 生效时机）。
     pub settings: Vec<SettingRow>,
     /// 开机自启：**现读**启动文件夹，不读配置键（用户在资源管理器里删掉它时，
-    /// 配置里还写着开）。正式版每次进设置页读一次，探针跟着 2 秒刷新读。
+    /// 配置里还写着开）。现在它跟着每一拍刷新一起读一次 —— 这条不是成本中心
+    /// （`perf_probe` 量的是 31µs/次，同一拍里那些查询是 8~50ms），所以不为此另设一条
+    /// "只在进设置页时读"的路：那条一改，屏上这一格就会在别人改快捷方式后停在旧值。
     pub autostart: bool,
     /// 当前**生效**的数据根目录（`[paths] data_home`，建不出来时 core 会回落到程序目录）。
     /// 设置页「数据目录」那一行显示的就是它；`app_dir` 是程序目录，两者不是一回事。
@@ -335,8 +339,9 @@ pub struct Snapshot {
     /// `[paths] data_migrate_from` 的原文：非空 = 已经安排了一次搬迁，重启时兑现。
     /// 显示出来，免得用户以为改完就已经搬走了。
     pub pending_move: String,
-    /// 这一轮没读上来的年度库条数（非 0 = 上面那些数是**下界**）。
-    pub gaps: usize,
+    /// 这一轮没答上来的每一栏读数，每项形如「N 年库<域名>读不出来: 原因」；非空 =
+    /// 上面那些数是**下界**。界面按 `queries::DOMAIN_*` 那几个域名过滤到各自那一栏去说。
+    pub gaps: Vec<String>,
 }
 
 /// 周期 → 查询窗口天数：`None` = 全部历史。
@@ -346,6 +351,21 @@ fn window_days(period: i64) -> Option<i64> {
         -1 => Some(1),
         n if n > 0 => Some(n),
         _ => Some(7),
+    }
+}
+
+/// 三条时间切面（趋势 / 小时 / 星期）当前数的是哪一段：图上那行小字与导出里那一栏的
+/// 标题都念它。窗口本身来自 core 的 `chart_window_days`，所以这句话永远不会与取数错位。
+///
+/// 为什么不复用界面那份 `period_text`：那一份是排行榜与卡片用的，它对「总计」的说法是
+/// 「全部」—— 按到这里就把一个 30 天的窗口夸成了全部历史（旧前端的 `windowText()`
+/// 特意分开的就是这两句）。
+pub fn window_text(period: i64) -> String {
+    let days = queries::chart_window_days(period);
+    if days == 1 {
+        "今日".to_string()
+    } else {
+        format!("近 {days} 天")
     }
 }
 
@@ -359,13 +379,21 @@ pub fn load(period: i64) -> Snapshot {
     // 按周期查：键鼠排行、应用时长、设备次数都跟同一把尺子。
     let stats = queries::stats_totals(days, None);
     let all = queries::get_alltime_summary();
-    // 趋势图固定近 30 天（今日只有 1 个点，画不出形状）。
-    let daily = queries::get_daily_counts(30, None);
-    // 小时图跟周期：今日就是今天 24 根；一周就是这周每天的同一小时合计。
-    let hourly = queries::get_hourly_totals(days.unwrap_or(30), None);
-    // 星期分布同样跟周期；"全部"按近 30 天（与小时图同一口径）。
+    // 三条时间切面（趋势 / 小时 / 星期）与三份导出里那栏"每日次数"共用 core 那把
+    // `chart_window_days`：今日 1 天、总计按 30 天（与卡片那句「日均(近30天)」同一个分母），
+    // 其余就是周期本身。`crates/cli/src/main.rs` 的周期参数也读这一把 —— 界面自写一个
+    // 固定 30 天，"今日"那一档就会画出 30 个与所选周期无关的点。
+    let chart_days = queries::chart_window_days(period);
+    // 每日序列连日期一起交回：图上的刻度与导出里那一栏念的是同一串日期，
+    // 不由调用方按下标往回推。
+    let daily_read = queries::daily_counts_totals(chart_days, None);
+    let daily = daily_read.series;
+    // 小时图同样问"带原因的那份读数"：读不全时要能点名是哪一年没答上来。
+    let hourly_read = queries::hourly_window_totals(chart_days, None);
+    // 星期分布是每日序列的聚合（core 的 `aggregate_weekday` 就是为复用这一份留的口子），
+    // 不再为同一个窗口扫第二遍库；"哪一年没读上"也就继承上面每日趋势那一句。
     let mut weekday = [0i64; 7];
-    for (k, v) in queries::get_weekday_stats(days.unwrap_or(30)) {
+    for (k, v) in queries::aggregate_weekday(&daily) {
         if (0..7).contains(&k) {
             weekday[k as usize] = v;
         }
@@ -388,11 +416,12 @@ pub fn load(period: i64) -> Snapshot {
     };
     let avg = (stats.total + pending) / avg_days;
 
-    let mut hours = hourly;
+    let mut hours = hourly_read.hours;
     hours.resize(24, 0);
 
-    let (_, device_list) = queries::get_device_stats(days, None);
-    let devices: Vec<DevRow> = device_list
+    let device_read = queries::device_totals(days, None);
+    let devices: Vec<DevRow> = device_read
+        .devices
         .into_iter()
         .map(|d| DevRow {
             key: d.key,
@@ -404,8 +433,8 @@ pub fn load(period: i64) -> Snapshot {
         })
         .collect();
 
-    let (app_total, app_map) = queries::get_app_stats(days, None);
-    let mut apps: Vec<(String, i64)> = app_map.into_iter().collect();
+    let app_read = queries::app_stats_totals(days, None);
+    let mut apps: Vec<(String, i64)> = app_read.rows.into_iter().collect();
     apps.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
     apps.truncate(100);
 
@@ -428,6 +457,17 @@ pub fn load(period: i64) -> Snapshot {
     // 今日前台时长：与下面应用排行同一个口径，只是窗口固定成 1 天（悬浮窗要的是"今天"）。
     let today_app_seconds = queries::get_app_stats(Some(1), None).0;
 
+    // 每一栏"这一轮有没有读全"合成一串，界面按域名分栏去念（该接哪几栏，
+    // `queries::PANEL_READ_DOMAINS` 里已经写好答案）。全历史汇总那几条的形状是
+    // 「年份: 原因」、不带域名 ⇒ 它只进页脚那一句总数，不对应屏上任何一栏。
+    let mut gaps: Vec<String> = Vec::new();
+    gaps.extend(stats.unreadable);
+    gaps.extend(app_read.unreadable);
+    gaps.extend(device_read.unreadable);
+    gaps.extend(daily_read.unreadable);
+    gaps.extend(hourly_read.unreadable);
+    gaps.extend(all.unreadable);
+
     Snapshot {
         period,
         today,
@@ -437,15 +477,15 @@ pub fn load(period: i64) -> Snapshot {
         max_day: all.max_day,
         rank,
         apps,
-        app_total,
+        app_total: app_read.total,
         devices,
-        daily: daily.into_iter().map(|(_, v)| v).collect(),
+        daily,
         hourly: hours,
         weekday,
         goal,
         settings: load_settings(),
         autostart: focusflow_core::autostart::is_autostart_enabled(),
-        gaps: stats.unreadable.len() + all.unreadable.len(),
+        gaps,
         data_home: focusflow_core::data_location::current_data_home()
             .display()
             .to_string(),
@@ -493,5 +533,84 @@ mod rank_ruler_tests {
             3,
             "周报的键、应用、设备三个 Top 榜都要走那一份尺子"
         );
+    }
+}
+
+/// 三条时间切面（趋势 / 小时 / 星期）的窗口与图上那行小字。
+///
+/// 两件事分开钉：一是"标题说的是不是真窗口"（旧前端把 `period_text` 与 `windowText`
+/// 分成两句，就是因为「总计」在排行榜里念「全部」、在图里其实只数 30 天）；
+/// 二是"窗口这把握尺子不许有第二份"（写死 30 天、或为星期分布扫第二遍库，都算分叉）。
+#[cfg(test)]
+mod chart_window_tests {
+    use super::window_text;
+
+    /// 生产文本 = 本文件 `#[cfg(test)]` 之前的部分，并且**去掉整行注释**：
+    /// 接线守卫数的是调用点，注释里提一次函数名（带括号的写法很自然）不该把计数抬起来。
+    /// 针脚仍旧拼出来，免得用例自己的字面量被它正在查的样式数进去。
+    fn prod() -> String {
+        let src = include_str!("data.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 六颗周期胶囊各自数到哪一段，图上就怎么说。
+    #[test]
+    fn the_window_says_what_the_chart_actually_counts() {
+        assert_eq!(window_text(-1), "今日", "今日那一档就一天");
+        assert_eq!(window_text(7), "近 7 天");
+        assert_eq!(window_text(15), "近 15 天");
+        assert_eq!(window_text(30), "近 30 天");
+        assert_eq!(window_text(365), "近 365 天");
+        // 「总计」那一格数的是近 30 天（与卡片那句「日均(近30天)」同一个分母）。
+        // 跟着排行榜那句写成「全部」，图就对着 30 根柱子夸口自己是全部历史。
+        assert_eq!(window_text(0), "近 30 天");
+        assert_ne!(window_text(0), "全部", "这一栏不许借排行榜那句「全部」");
+    }
+
+    /// 接线腿：钉的是调用形态，不是函数名 —— 只数名字的话，"尺子调了、取数仍旧写死
+    /// 30 天"这一种接法能整个蒙过去。
+    #[test]
+    fn the_charts_read_the_one_window_ruler() {
+        let prod = prod();
+        let ruler = ["chart_window_days", "("].concat();
+        assert_eq!(
+            prod.matches(ruler.as_str()).count(),
+            2,
+            "两处：取数那一头与图上那行小字，必须问同一个入口"
+        );
+        let hard_30 = ["get_daily_counts", "(30"].concat();
+        assert_eq!(
+            prod.matches(hard_30.as_str()).count(),
+            0,
+            "写死 30 天那一档不许回来：它会让「今日」画出 30 个与所选周期无关的点"
+        );
+        let second_scan = ["get_weekday_stats", "("].concat();
+        assert_eq!(
+            prod.matches(second_scan.as_str()).count(),
+            0,
+            "星期分布不再为同一个窗口扫第二遍库"
+        );
+        let reuse = ["aggregate_weekday", "("].concat();
+        assert_eq!(
+            prod.matches(reuse.as_str()).count(),
+            1,
+            "复用上面那串已查得的每日序列（core 那份文档就是为这个留的口子）"
+        );
+        for needle in [
+            ["daily_counts_totals", "("].concat(),
+            ["hourly_window_totals", "("].concat(),
+            ["app_stats_totals", "("].concat(),
+            ["device_totals", "("].concat(),
+        ] {
+            assert!(
+                prod.contains(needle.as_str()),
+                "少了 {needle} 这一问：那一栏就说不出「这一轮有没有读全」"
+            );
+        }
     }
 }

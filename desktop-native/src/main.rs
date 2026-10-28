@@ -19,6 +19,7 @@ use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use focusflow_core::db::queries;
 use focusflow_core::db::queries::DeviceDetail;
 use focusflow_core::plugins::manager::PluginManager;
 
@@ -3848,6 +3849,35 @@ fn period_text(period: i64) -> String {
     }
 }
 
+/// 三份导出共用的那一句"这一轮没读全"：文件里没这句，拿到导出的人就把下界当成了实测上限。
+/// 屏上那句写在页脚、指的是"上面那些数"，措辞不同但同一个判据（`snap.gaps` 是否非空）。
+fn gap_line(gaps: &[String]) -> String {
+    if gaps.is_empty() {
+        return String::new();
+    }
+    format!(
+        "注意：{} 条读数没读全，这些数字是下界（{}）",
+        gaps.len(),
+        gaps.join("；")
+    )
+}
+
+/// 某一栏自己那句"这一轮没读全"：core 交回的每条长这样 —— 「2025 年库每日趋势读不出来: …」
+/// ⇒ 按域名认领属于自己那一条，屏上每一栏说的就只是它自己缺的那一块。
+/// 域名不在这里写第二遍：那份清单在 core（`db::queries` 里的 `READ_DOMAINS` 与
+/// `PANEL_READ_DOMAINS`），下面那条用例钉着"面板只许认领清单上、且该由面板接的那几栏"。
+fn gap_note(gaps: &[String], domain: &str) -> String {
+    let mine: Vec<&str> = gaps
+        .iter()
+        .map(String::as_str)
+        .filter(|g| g.contains(domain))
+        .collect();
+    if mine.is_empty() {
+        return String::new();
+    }
+    format!(" · {}", mine.join("；"))
+}
+
 fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
     // 遮罩：整屏压暗，点击它等于关闭。
     p.fill(rect(0.0, 0.0, w, h), &p.br.overlay);
@@ -4398,32 +4428,14 @@ fn draw_analytics(p: &P<'_>, w: f32, h: f32, snap: &Snapshot, vs: ViewState) {
     let content = analytics_content(w, h);
     match vs.atab {
         0 => {
-            // 趋势图：复用排行页那张，只是给它整块宽度。
-            let plot = rect(
-                content.left,
-                content.top,
-                content.right - content.left,
-                300.0,
-            );
-            draw_line_chart(p, plot, snap);
+            // 趋势图：与排行页右侧那张同一个画函数，这里只是给它整块宽度。
+            draw_line_chart(p, chart_card(content), snap);
         }
         1 => {
-            let plot = rect(
-                content.left,
-                content.top,
-                content.right - content.left,
-                300.0,
-            );
-            draw_hourly(p, plot, snap);
+            draw_hourly(p, chart_card(content), snap);
         }
         2 => {
-            let plot = rect(
-                content.left,
-                content.top,
-                content.right - content.left,
-                300.0,
-            );
-            draw_weekday(p, plot, snap);
+            draw_weekday(p, chart_card(content), snap);
         }
         _ => {
             draw_heat(p, content, snap, vs.heat_hover);
@@ -4443,11 +4455,26 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         &p.br.fg,
     );
     p.text(
-        &format!("按{}统计", period_text(snap.period)),
-        rect(r.right - pad - 120.0, r.top + 16.0, 120.0, 18.0),
+        &format!("按{}统计", data::window_text(snap.period)),
+        rect(r.right - pad - 140.0, r.top + 16.0, 140.0, 18.0),
         &p.fmt.right,
         &p.br.muted,
     );
+    // 星期分布是从每日序列聚合出来的 ⇒ 它认领的是每日趋势那一句。
+    let weekday_gaps = gap_note(&snap.gaps, queries::DOMAIN_DAILY);
+    if !weekday_gaps.is_empty() {
+        p.text(
+            &weekday_gaps,
+            rect(
+                r.left + pad,
+                r.top + 36.0,
+                (r.right - r.left) - pad * 2.0,
+                14.0,
+            ),
+            &p.fmt.small,
+            &p.br.muted,
+        );
+    }
 
     let plot = rect(
         r.left + pad,
@@ -6670,10 +6697,15 @@ fn export_html_text(s: &Snapshot) -> String {
     out.push_str("<!doctype html><meta charset=\"utf-8\"><title>FocusFlow 导出</title>\n");
     out.push_str("<style>body{font:14px/1.6 \"Microsoft YaHei UI\",sans-serif;background:#0f1219;color:#e8ecf4;padding:24px;max-width:900px;margin:0 auto}h1{font-size:20px}h2{font-size:15px;margin-top:26px;color:#9aa4b8}table{border-collapse:collapse;width:100%;margin-top:8px}th,td{border-bottom:1px solid #2e3548;padding:6px 8px;text-align:left;font-size:13px}th{color:#9aa4b8;font-weight:500}td.num{text-align:right}</style>\n");
     out.push_str(&format!(
-        "<h1>FocusFlow 导出</h1><p>生成时间 {} · 统计周期 {}</p>\n",
+        "<h1>FocusFlow 导出</h1><p>生成时间 {} · 统计周期 {} · 时间切面 {}</p>\n",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-        html_escape(&period_text(s.period))
+        html_escape(&period_text(s.period)),
+        html_escape(&data::window_text(s.period))
     ));
+    let gap_say = gap_line(&s.gaps);
+    if !gap_say.is_empty() {
+        out.push_str(&format!("<p>{}</p>\n", html_escape(&gap_say)));
+    }
     out.push_str("<table><tr><th>今日</th><th>周期总计</th><th>日均</th></tr>");
     out.push_str(&format!(
         "<tr><td>{}</td><td>{}</td><td>{}</td></tr></table>\n",
@@ -6723,14 +6755,14 @@ fn export_html_text(s: &Snapshot) -> String {
     }
     out.push_str("</table>\n");
 
-    out.push_str("<h2>每日次数（近 30 天）</h2><table><tr><th>日期</th><th>次数</th></tr>");
-    let today = chrono::Local::now().date_naive();
-    let n = s.daily.len();
-    for (i, v) in s.daily.iter().enumerate() {
-        let d = today - chrono::Duration::days(n.saturating_sub(1 + i) as i64);
+    out.push_str(&format!(
+        "<h2>每日次数（{}）</h2><table><tr><th>日期</th><th>次数</th></tr>",
+        data::window_text(s.period)
+    ));
+    for (d, v) in &s.daily {
         out.push_str(&format!(
             "<tr><td>{}</td><td class=\"num\">{v}</td></tr>",
-            d.format("%Y-%m-%d")
+            html_escape(d)
         ));
     }
     out.push_str("</table>\n");
@@ -6766,16 +6798,10 @@ fn export_json_text(s: &Snapshot) -> String {
         .enumerate()
         .map(|(i, d)| json!({"rank": i + 1, "name": d.name, "kind": d.kind, "count": d.count}))
         .collect();
-    let today = chrono::Local::now().date_naive();
-    let n = s.daily.len();
     let daily: Vec<serde_json::Value> = s
         .daily
         .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let d = today - chrono::Duration::days(n.saturating_sub(1 + i) as i64);
-            json!({"date": d.format("%Y-%m-%d").to_string(), "count": v})
-        })
+        .map(|(d, v)| json!({"date": d, "count": v}))
         .collect();
     let hourly: Vec<serde_json::Value> = s
         .hourly
@@ -6786,6 +6812,12 @@ fn export_json_text(s: &Snapshot) -> String {
     let doc = json!({
         "generated_at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         "period": period_text(s.period),
+        // `daily` 与 `hourly` 数的是哪一段：与屏上三张图同一句（`period` 那一项对"总计"
+        // 说的是「全部」，按到这里会把 30 天的窗口夸成全部历史）。
+        "chart_window": data::window_text(s.period),
+        // 交回的总数在下界这一件事必须跟着文件走：读的人拿不到"哪一年没答上来"，
+        // 就会把一份残缺的榜当成"那一年真的一个键都没按"。
+        "read_gaps": s.gaps,
         "today": s.today,
         "period_total": s.period_total,
         "avg": s.avg,
@@ -6807,6 +6839,11 @@ fn export_csv_text(s: &Snapshot) -> String {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
     ));
     out.push_str(&format!("统计周期,{}\r\n", period_text(s.period)));
+    out.push_str(&format!("时间切面,{}\r\n", data::window_text(s.period)));
+    let gap_say = gap_line(&s.gaps);
+    if !gap_say.is_empty() {
+        out.push_str(&format!("读数完整性,{}\r\n", csv_field(&gap_say)));
+    }
     out.push_str(&format!("今日次数,{}\r\n", s.today));
     out.push_str(&format!("周期总计,{}\r\n", s.period_total));
     out.push_str(&format!("日均,{}\r\n", s.avg));
@@ -6848,12 +6885,12 @@ fn export_csv_text(s: &Snapshot) -> String {
         ));
     }
 
-    out.push_str("\r\n[每日次数(近30天)]\r\n日期,次数\r\n");
-    let today = chrono::Local::now().date_naive();
-    let n = s.daily.len();
-    for (i, v) in s.daily.iter().enumerate() {
-        let d = today - chrono::Duration::days((n.saturating_sub(1 + i)) as i64);
-        out.push_str(&format!("{},{}\r\n", d.format("%Y-%m-%d"), v));
+    out.push_str(&format!(
+        "\r\n[每日次数({})]\r\n日期,次数\r\n",
+        data::window_text(s.period)
+    ));
+    for (d, v) in &s.daily {
+        out.push_str(&format!("{},{}\r\n", d, v));
     }
 
     out.push_str("\r\n[每小时合计]\r\n小时,次数\r\n");
@@ -7117,17 +7154,65 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         &p.br.border,
         1.0,
     );
-    let gap_note = if snap.gaps > 0 {
-        format!(" · {} 个年度库没读上（上述数字是下界）", snap.gaps)
-    } else {
+    let gap_tail = if snap.gaps.is_empty() {
         String::new()
+    } else {
+        format!(" · {} 条读数没读全（上面那些数字是下界）", snap.gaps.len())
     };
     p.text(
-        &format!("数据源：{}{gap_note}", snap.data_home),
+        &format!("数据源：{}{gap_tail}", snap.data_home),
         rect(r.left + g.pad, foot_y, r.right - r.left - g.pad * 2.0, 16.0),
         &p.fmt.small,
         &p.br.muted,
     );
+}
+
+/// 分析页那张图卡：画图与命中测试算的是同一个矩形，两边不许各摆一份数字。
+fn chart_card(content: D2D_RECT_F) -> D2D_RECT_F {
+    rect(
+        content.left,
+        content.top,
+        content.right - content.left,
+        300.0,
+    )
+}
+
+/// 趋势图的绘图区：卡片之内、标题与坐标字之外。
+fn line_plot(card: D2D_RECT_F) -> D2D_RECT_F {
+    rect(
+        card.left + 46.0,
+        card.top + 46.0,
+        (card.right - card.left) - 62.0,
+        (card.bottom - card.top) - 74.0,
+    )
+}
+
+/// 趋势图第 `i` 个点的横坐标。只有一个点时落在绘图区正中 —— 除零之外没有第二种口径，
+/// 画线的除法、命中测试的除法与那条"最近点"的取整共用这一个函数。
+fn line_point_x(plot: D2D_RECT_F, n: usize, i: usize) -> f32 {
+    if n < 2 {
+        return plot.left + plot_width(plot) / 2.0;
+    }
+    plot.left + (i as f32 / (n - 1) as f32) * plot_width(plot)
+}
+
+/// 小时图的绘图区。
+fn hourly_plot(card: D2D_RECT_F) -> D2D_RECT_F {
+    let pad = 12.0;
+    rect(
+        card.left + pad,
+        card.top + 42.0,
+        (card.right - card.left) - pad * 2.0,
+        (card.bottom - card.top) - 62.0,
+    )
+}
+
+/// 小时图第 `i` 根柱的 `(x, 宽)`：柱宽由根数与间距导出，画柱与命中测试走同一句除法。
+fn hourly_bar_slot(plot: D2D_RECT_F, n: usize, i: usize) -> (f32, f32) {
+    let gap = 3.0;
+    let n = n.max(1);
+    let bw = ((plot_width(plot) - gap * (n as f32 - 1.0)) / n as f32).max(1.0);
+    (plot.left + i as f32 * (bw + gap), bw)
 }
 
 fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
@@ -7140,30 +7225,39 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         &p.br.fg,
     );
     p.text(
-        "近 30 天",
-        rect(r.right - pad - 70.0, r.top + pad + 2.0, 70.0, 18.0),
+        &data::window_text(snap.period),
+        rect(r.right - pad - 90.0, r.top + pad + 2.0, 90.0, 18.0),
         &p.fmt.right,
         &p.br.muted,
     );
+    let daily_gaps = gap_note(&snap.gaps, queries::DOMAIN_DAILY);
+    if !daily_gaps.is_empty() {
+        p.text(
+            &daily_gaps,
+            rect(
+                r.left + pad,
+                r.top + 32.0,
+                (r.right - r.left) - pad * 2.0,
+                14.0,
+            ),
+            &p.fmt.small,
+            &p.br.muted,
+        );
+    }
 
-    let plot = rect(
-        r.left + 46.0,
-        r.top + 46.0,
-        (r.right - r.left) - 62.0,
-        (r.bottom - r.top) - 74.0,
-    );
+    let plot = line_plot(r);
     for i in 0..=4 {
         let y = plot.top + plot_height(plot) * i as f32 / 4.0;
         p.line(plot.left, y, plot.right, y, &p.br.grid, 1.0);
     }
 
-    let values = &snap.daily;
-    let peak = values.iter().cloned().max().unwrap_or(0).max(1) as f64;
+    let series = &snap.daily;
+    let peak = series.iter().map(|(_, v)| *v).max().unwrap_or(0).max(1) as f64;
     let max = peak * 1.12;
-    let n = values.len().max(2);
+    let n = series.len();
     let pt = |i: usize| {
-        let v = values.get(i).cloned().unwrap_or(0) as f64;
-        let x = plot.left + (i as f32 / (n - 1) as f32) * plot_width(plot);
+        let v = series.get(i).map(|(_, v)| *v).unwrap_or(0) as f64;
+        let x = line_point_x(plot, n, i);
         let y = plot.bottom - (v / max) as f32 * plot_height(plot);
         Vector2 { X: x, Y: y }
     };
@@ -7173,6 +7267,17 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         unsafe {
             p.rt.DrawLine(a, b, &p.br.accent, 2.0, None);
         }
+    }
+    // 「今日」那一档窗口只有一天：线画不出来，点必须画 —— 否则这一档整张图是空的，
+    // 看着像"没数据"而不是"一天看不出趋势"。
+    if n == 1 {
+        let c = pt(0);
+        p.round(
+            rect(c.X - 4.0, c.Y - 4.0, 8.0, 8.0),
+            4.0,
+            &p.br.accent,
+            None,
+        );
     }
     // 纵轴：从上往下是「峰。
     for i in 0..=4 {
@@ -7185,12 +7290,16 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
             &p.br.muted,
         );
     }
-    p.text(
-        "30 天前",
-        rect(plot.left, plot.bottom + 4.0, 60.0, 14.0),
-        &p.fmt.small,
-        &p.br.muted,
-    );
+    if let Some((first, _)) = series.first() {
+        // 窗口起点就是序列第一项交回的那串日期，不在这儿按长度反推。
+        let left = first.chars().skip(5).collect::<String>();
+        p.text(
+            &left,
+            rect(plot.left, plot.bottom + 4.0, 60.0, 14.0),
+            &p.fmt.small,
+            &p.br.muted,
+        );
+    }
     p.text(
         "今天",
         rect(plot.right - 30.0, plot.bottom + 4.0, 30.0, 14.0),
@@ -7209,36 +7318,43 @@ fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         &p.br.fg,
     );
     p.text(
-        &period_text(snap.period),
-        rect(r.right - pad - 60.0, r.top + pad + 2.0, 60.0, 18.0),
+        &data::window_text(snap.period),
+        rect(r.right - pad - 90.0, r.top + pad + 2.0, 90.0, 18.0),
         &p.fmt.right,
         &p.br.muted,
     );
+    let hourly_gaps = gap_note(&snap.gaps, queries::DOMAIN_HOURLY);
+    if !hourly_gaps.is_empty() {
+        p.text(
+            &hourly_gaps,
+            rect(
+                r.left + pad,
+                r.top + 30.0,
+                (r.right - r.left) - pad * 2.0,
+                14.0,
+            ),
+            &p.fmt.small,
+            &p.br.muted,
+        );
+    }
 
-    let plot = rect(
-        r.left + pad,
-        r.top + 42.0,
-        (r.right - r.left) - pad * 2.0,
-        (r.bottom - r.top) - 62.0,
-    );
+    let plot = hourly_plot(r);
     let values = &snap.hourly;
     let max = values.iter().cloned().fold(0_i64, i64::max).max(1) as f32;
     let n = values.len().max(1);
-    let gap = 3.0;
-    let bw = ((plot_width(plot) - gap * (n as f32 - 1.0)) / n as f32).max(1.0);
     for (i, v) in values.iter().enumerate() {
         let hp = (*v as f32 / max) * plot_height(plot);
-        let x = plot.left + i as f32 * (bw + gap);
+        let (x, bw) = hourly_bar_slot(plot, n, i);
         let bar = rect(x, plot.bottom - hp, bw, hp);
         if let Some(b) = p.brush(p.pal.accent) {
             p.round(bar, 2.0, &b, None);
         }
     }
     for i in (0..n).step_by(4) {
-        let x = plot.left + i as f32 * (bw + gap) + bw / 2.0;
+        let (x, bw) = hourly_bar_slot(plot, n, i);
         p.text(
             &format!("{i}"),
-            rect(x - 12.0, plot.bottom + 2.0, 24.0, 14.0),
+            rect(x + bw / 2.0 - 12.0, plot.bottom + 2.0, 24.0, 14.0),
             &p.fmt.center_small,
             &p.br.muted,
         );
@@ -8929,6 +9045,115 @@ mod cleanup_readout_tests {
             1,
             "只许有那一处调用（按钮），数量变了说明接线动过"
         );
+    }
+}
+
+/// 「这一轮没读全」在屏上怎么说：每一栏只认领自己那个域名。
+#[cfg(test)]
+mod gap_note_tests {
+    use super::*;
+
+    #[test]
+    fn each_chart_claims_only_its_own_domain() {
+        let gaps = vec![
+            "2025 年库每日趋势读不出来: 库被占用".to_string(),
+            "2026 年库每小时分布读不出来: 打不开".to_string(),
+        ];
+        assert_eq!(
+            gap_note(&gaps, queries::DOMAIN_DAILY),
+            " · 2025 年库每日趋势读不出来: 库被占用",
+            "每日那一栏只该说自己那一条，别的栏位的话不许顶到它这儿来"
+        );
+        assert_eq!(
+            gap_note(&gaps, queries::DOMAIN_KEYS),
+            "",
+            "没轮到它的栏位，一个字都不许出声"
+        );
+        assert_eq!(
+            gap_note(&[], queries::DOMAIN_HOURLY),
+            "",
+            "读全了就没有后面那一截"
+        );
+        // 同一栏缺了两个年度库 ⇒ 两句都要说出来，不是只报第一条。
+        let two = vec![
+            "2024 年库每日趋势读不出来: a".to_string(),
+            "2025 年库每日趋势读不出来: b".to_string(),
+        ];
+        assert_eq!(
+            gap_note(&two, queries::DOMAIN_DAILY),
+            " · 2024 年库每日趋势读不出来: a；2025 年库每日趋势读不出来: b"
+        );
+    }
+
+    /// 面板认领的域名必须都在 core 那份清单上，而且必须是"该由面板接"的那几栏。
+    /// 新增一条域名而这里没接，红在缺登记那一句；面板自创一个名字，红在第一句。
+    #[test]
+    fn the_panel_claims_only_registered_domains() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        // 整行注释先滤掉：这条数的是"代码里真的点了一栏"，文档里提一句函数名不算认领。
+        let prod = src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 域名常量名与它那个值的对照：core 加一条而这里没登记 ⇒ 下面按名字查表时会红。
+        let table = [
+            ("DOMAIN_KEYS", queries::DOMAIN_KEYS),
+            ("DOMAIN_APPS", queries::DOMAIN_APPS),
+            ("DOMAIN_DEVICES", queries::DOMAIN_DEVICES),
+            ("DOMAIN_DAILY", queries::DOMAIN_DAILY),
+            ("DOMAIN_HOURLY", queries::DOMAIN_HOURLY),
+            ("DOMAIN_DAY_HOURS", queries::DOMAIN_DAY_HOURS),
+        ];
+        let prefix = ["queries::", "DOMAIN_"].concat();
+        let mut claimed: Vec<&str> = Vec::new();
+        let mut from = 0usize;
+        while let Some(i) = prod[from..].find(prefix.as_str()) {
+            let after = from + i + prefix.len();
+            let mut end = after;
+            for (k, b) in prod.as_bytes()[after..].iter().enumerate() {
+                if b.is_ascii_alphanumeric() || *b == b'_' {
+                    end = after + k + 1;
+                } else {
+                    break;
+                }
+            }
+            if end == after {
+                // 前缀后面接的不是标识符（比如写了个通配），那一次不算认领。
+                from = end + 1;
+                continue;
+            }
+            // 名字要连着 `DOMAIN_` 一起取：对照表用的就是常量全名。
+            let name = &prod[after - "DOMAIN_".len()..end];
+            if !claimed.contains(&name) {
+                claimed.push(name);
+            }
+            from = end;
+        }
+        assert!(
+            !claimed.is_empty(),
+            "生产代码里一处域名都没点：这条判据就变成永远绿的空转"
+        );
+        // 反向的一半：这一屏已经接上的那两栏，谁哪天把那句提示删了，这里要红 ——
+        // 只查"点的都在清单上"是拦不住"整段没调用"的。
+        // ⚠ 清单上剩下的三栏（按键统计 / 应用时长 / 设备统计）现在还没人点，等排行页
+        // 那一屏接筛选与分组时把它们一起补进这一句，这条才升到"每一栏都必须有人点"。
+        for want in ["DOMAIN_DAILY", "DOMAIN_HOURLY"] {
+            assert!(
+                claimed.contains(&want),
+                "「{want}」这一栏的\"没读全\"提示没人点了：它是这一屏接回来的，不许悄悄摘掉"
+            );
+        }
+        for name in claimed {
+            let Some((_, value)) = table.iter().find(|(n, _)| *n == name) else {
+                panic!("面板点了 {name}，可 core 那份清单上查不到它 ⇒ 域名分叉了");
+            };
+            assert!(
+                queries::PANEL_READ_DOMAINS.contains(value),
+                "面板认领了「{value}」，但它不在该由面板接的那一栏清单上"
+            );
+        }
     }
 }
 
