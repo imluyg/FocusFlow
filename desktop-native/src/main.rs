@@ -353,7 +353,9 @@ struct Formats {
     tab: IDWriteTextFormat,
     /// 设置页专用的一整套，尺寸逐项照旧 WebView `desktop/ui/styles.css`：
     /// `.ff-h2` 15/700、`.ff-name` 14/600（继承 body 14）、`.ff-desc`/`.ff-foot` 12/400、
-    /// `.ff-nav button` 13/400 且 `.on` 600、`.ff-search` 与 `.ff-item .btn`/`input` 13/400。
+    /// `.ff-nav button` 13/400 且 `.on` 600、`.ff-search` 与 `.ff-item .btn`/`input` 13。
+    /// 三处比旧版再重一档（他 2026-10-28 点的）：按钮那颗章 13/600、页内分组小标题
+    /// 与"要人处理"的状态行 12/600 —— 白字压在饱和底色上时 400 看着比实际细。
     ///
     /// 为什么单开一档而不是改 `body`/`small`：那两档主界面、表格、图表刻度都在用，
     /// 动它们等于把每个版面一起推挤（那些地方是固定矩形，字一大就裁切）。而设置页
@@ -363,6 +365,7 @@ struct Formats {
     text13: IDWriteTextFormat,
     text13_em: IDWriteTextFormat,
     text12: IDWriteTextFormat,
+    text12_em: IDWriteTextFormat,
     center13: IDWriteTextFormat,
 }
 
@@ -825,7 +828,8 @@ impl App {
                 text13: text_format(&dwrite, 13.0, DWRITE_FONT_WEIGHT_NORMAL)?,
                 text13_em: text_format(&dwrite, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
                 text12: text_format(&dwrite, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
-                center13: center_format(&dwrite, 13.0)?,
+                text12_em: text_format(&dwrite, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+                center13: center_format_w(&dwrite, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
             };
 
             let (tray, pause_item) = make_tray(&snap);
@@ -932,6 +936,10 @@ impl App {
                     let next = data::load(p.load(std::sync::atomic::Ordering::Relaxed));
                     // 悬浮窗读的是这几格，先推过去再让主界面拿新快照。
                     publish_floating(&next);
+                    // 推完要**催**一下：主界面这一拍是靠下面那条 `WM_REFRESH` 立刻重画的，
+                    // 而卡片只有一个每秒自走的 `SetTimer` —— 不催就是"直接看的那个反而最慢"，
+                    // 数字平均要多等半秒到一秒（`set_visible` 当年为同样的理由投这条消息）。
+                    floating::refresh();
                     if let Ok(mut g) = s.lock() {
                         *g = next;
                     }
@@ -3228,10 +3236,12 @@ fn draw_settings(
                 }
             }
             SItem::Header(title) => {
+                // 分组小标题：以前借 11/400 的灰字，跟它下面那些行的说明几乎分不出来，
+                // 扫一眼看不出这里是分组的起点。
                 p.text(
                     title,
                     rect(r.left + 12.0, y + 12.0, 360.0, 18.0),
-                    &p.fmt.small,
+                    &p.fmt.text12_em,
                     &p.br.muted,
                 );
                 p.line(
@@ -3501,7 +3511,13 @@ fn draw_settings(
                 card.right - card.left - 32.0,
                 18.0,
             ),
-            &p.fmt.text12,
+            // "要人处理"那一句除了换颜色，还加一档字重：底部这一行平时是背景信息，
+            // 红字加粗才是"现在就得看一眼"。
+            if warn {
+                &p.fmt.text12_em
+            } else {
+                &p.fmt.text12
+            },
             if warn { &p.br.danger } else { &p.br.muted },
         );
     }
@@ -7442,7 +7458,19 @@ fn right_format(dw: &IDWriteFactory, size: f32) -> windows::core::Result<IDWrite
 }
 
 fn center_format(dw: &IDWriteFactory, size: f32) -> windows::core::Result<IDWriteTextFormat> {
-    let f = text_format(dw, size, DWRITE_FONT_WEIGHT_NORMAL)?;
+    center_format_w(dw, size, DWRITE_FONT_WEIGHT_NORMAL)
+}
+
+/// 居中且带字重的一档：设置页那些章（「开」「执行」「没有贴图」）是白字压在饱和底色上，
+/// 400 那一档在这种底色上看着比实际细。
+/// ⚠ 汉字这一侧要留意：雅黑只有 400/700 两档，600 会被就近挑到 700，
+/// 所以"稍微粗一点"只对拉丁字母与数字成立。
+fn center_format_w(
+    dw: &IDWriteFactory,
+    size: f32,
+    weight: DWRITE_FONT_WEIGHT,
+) -> windows::core::Result<IDWriteTextFormat> {
+    let f = text_format(dw, size, weight)?;
     unsafe {
         let _ = f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         let _ = f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -8402,6 +8430,35 @@ mod snapshot_rate_tests {
             prod.matches(call.as_str()).count(),
             2,
             "一处定义 + 循环里一处调用，数量变了说明接线动过"
+        );
+    }
+
+    /// 卡片那一拍不能只等它自己的每秒定时器：推完数据要**投一条重画消息**。
+    /// 摘掉这一句的症状是"数字平均慢半秒到一秒"，而它在任何单元测试里都看不出来
+    /// （缓存照样被写），所以钉的是接线形状：每一处推快照，紧跟一次催画。
+    #[test]
+    fn every_snapshot_push_nudges_the_pill_to_repaint() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        let push = ["publish_floating(&", "next"].concat();
+        let nudge = ["floating::refresh", "("].concat();
+        let mut at = 0;
+        let mut sites = 0;
+        while let Some(i) = prod[at..].find(push.as_str()) {
+            sites += 1;
+            let from = at + i + push.len();
+            // 按字符取窗口：按字节切可能正好落在一个汉字的中间，那会直接 panic。
+            let window: String = prod[from..].chars().take(900).collect();
+            assert!(
+                window.contains(nudge.as_str()),
+                "第 {sites} 处推完快照没有催卡片重画：卡片会等到自己那一秒，数字看着就是慢"
+            );
+            at = from;
+        }
+        assert_eq!(
+            sites, 2,
+            "推快照的落点应是「快照线程那一拍」与「refresh_now」两处，数量变了要来看这条"
         );
     }
 }
