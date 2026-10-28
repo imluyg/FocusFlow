@@ -41,6 +41,10 @@ public class FF {
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
 
   public struct RECT { public int Left, Top, Right, Bottom; }
+  // Win32 POINT, named so it cannot be confused with the RECT above.
+  public struct WINPOINT { public int X; public int Y; }
+  [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(WINPOINT p);
+  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
 
   public static IntPtr ByClass(uint pid, string cls) {
     IntPtr found = IntPtr.Zero;
@@ -315,6 +319,23 @@ function Get-Client([IntPtr]$Hwnd) {
     $r = New-Object FF+RECT
     [void][FF]::GetClientRect($Hwnd, [ref]$r)
     [pscustomobject]@{ W = $r.Right; H = $r.Bottom }
+}
+
+# Is this screen point actually ours? Save-RectShot reads *screen* pixels, so any window
+# sitting over the target makes the reading meaningless -- and a colour leg then measures
+# somebody else's surface. Measured 2026-10-28: the dark-theme EDIT leg went red at
+# rgb=201,232,221, which is neither palette (light edit_bg = 255,255,255, dark = 30,35,49)
+# -- the chat window of the agent itself was covering it while the run stayed "input idle".
+# WindowFromPoint gives the top-level window at that point; GetAncestor(GA_ROOT=2) maps a
+# child (the inline EDIT) back to our main window.
+function Test-PointIsOurs([IntPtr]$Top, [int]$X, [int]$Y) {
+    $p = New-Object FF+WINPOINT
+    $p.X = $X
+    $p.Y = $Y
+    $hit = [FF]::WindowFromPoint($p)
+    if ($hit -eq [IntPtr]::Zero) { return $false }
+    if ($hit -eq $Top) { return $true }
+    return ([FF]::GetAncestor($hit, 2) -eq $Top)
 }
 
 function Save-WindowShot([IntPtr]$Hwnd, [string]$Path) {
