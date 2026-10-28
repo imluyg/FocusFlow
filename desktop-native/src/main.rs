@@ -668,6 +668,8 @@ struct App {
     detail: Option<DeviceDetail>,
     /// 热力页上光标下的键（`heat_keys()` 的下标）。
     heat_hover: Option<usize>,
+    /// 分析页趋势/小时图上光标下的那一格（下标跟着子页签换序列）。
+    chart_hover: Option<usize>,
     /// 设置页底部那条状态：上一次数据操作的结果 / "正在…"。
     status: Option<String>,
     /// 有后台操作在跑（按钮置灰，避免连点）。
@@ -1051,6 +1053,7 @@ impl App {
                 period,
                 detail: None,
                 heat_hover: None,
+                chart_hover: None,
                 status: boot_status,
                 busy: false,
                 search: String::new(),
@@ -1203,6 +1206,7 @@ impl App {
                 editing: self.edit_row,
                 capturing: self.capturing,
                 heat_hover: self.heat_hover,
+                chart_hover: self.chart_hover,
                 // 三条绑定此刻**真的**注册着哪几条（顺序同 `COMBO_KEYS`）：设置页那三行
                 // 右边那句"没注册上"读的就是它。只报总开关会把"被别的程序占了"和
                 // "他自己清空了"都糊成"开"。
@@ -1275,13 +1279,14 @@ impl App {
         )
     }
 
-    /// 鼠标移动：排行页更新悬停行，热力页更新悬停键；返回是否需要重画。
+    /// 鼠标移动：排行页更新悬停行，分析页更新悬停键 / 悬停那一格；返回是否需要重画。
     fn on_move(&mut self, hwnd: HWND, px: f32, py: f32) -> bool {
         let mut changed = false;
-        // 弹窗、插。
-        if self.detail.is_some() || (self.view == 3 && self.atab != 3) {
+        // 设备详情弹窗开着 = 模态：这一屏什么都不许亮着。
+        if self.detail.is_some() {
             changed |= self.hover.take().is_some();
             changed |= self.heat_hover.take().is_some();
+            changed |= self.chart_hover.take().is_some();
             return changed;
         }
         let (w, h) = self.client_dip(hwnd);
@@ -1291,21 +1296,44 @@ impl App {
         if self.view == 3 {
             changed |= self.hover.take().is_some();
             let content = analytics_content(w, h);
-            let (u, ox, oy) = heat_geom(content);
-            let idx = heat_keys().iter().position(|k| {
-                let kx = ox + k.x * u;
-                let ky = oy + k.y * u;
-                x >= kx && x <= kx + k.w * u - 2.0 && y >= ky && y <= ky + k.h * u - 2.0
-            });
-            if idx != self.heat_hover {
-                self.heat_hover = idx;
-                changed = true;
+            if self.atab == 3 {
+                changed |= self.chart_hover.take().is_some();
+                let (u, ox, oy) = heat_geom(content);
+                let idx = heat_keys().iter().position(|k| {
+                    let kx = ox + k.x * u;
+                    let ky = oy + k.y * u;
+                    x >= kx && x <= kx + k.w * u - 2.0 && y >= ky && y <= ky + k.h * u - 2.0
+                });
+                if idx != self.heat_hover {
+                    self.heat_hover = idx;
+                    changed = true;
+                }
+            } else {
+                changed |= self.heat_hover.take().is_some();
+                let card = chart_card(content);
+                let idx = match self.atab {
+                    0 => {
+                        let n = self.snap.lock().map(|g| g.daily.len()).unwrap_or(0);
+                        line_nearest(line_plot(card), n, x, y)
+                    }
+                    1 => {
+                        let n = self.snap.lock().map(|g| g.hourly.len()).unwrap_or(0);
+                        slot_nearest(hourly_plot(card), n, HOURLY_GAP, x, y)
+                    }
+                    // 星期那一屏不接悬停：那七根的数本来就在柱顶上。
+                    _ => None,
+                };
+                if idx != self.chart_hover {
+                    self.chart_hover = idx;
+                    changed = true;
+                }
             }
             return changed;
         }
 
         if self.view == 4 {
             changed |= self.heat_hover.take().is_some();
+            changed |= self.chart_hover.take().is_some();
             let (list_top, row_h, max_rows) = plugin_geom(w, h);
             let count = self.plugin_rows.len();
             self.scroll = self.scroll.min(count.saturating_sub(max_rows));
@@ -1330,6 +1358,7 @@ impl App {
 
         if self.view == 5 {
             changed |= self.heat_hover.take().is_some();
+            changed |= self.chart_hover.take().is_some();
             let g = settings_geom(w, h);
             let count = self
                 .snap
@@ -1356,8 +1385,9 @@ impl App {
             return changed;
         }
 
-        // 排行页：这条分支不在热力图上，残留的键位高亮在这里撤掉。
+        // 排行页：这条分支既不在热力图上、也不在分析页那两张图上，残留的高亮在这里撤掉。
         changed |= self.heat_hover.take().is_some();
+        changed |= self.chart_hover.take().is_some();
         let g = table_geom(left_card(w, h));
         let count = self
             .snap
@@ -1422,6 +1452,7 @@ impl App {
                 self.sel = None;
                 self.hover = None;
                 self.heat_hover = None;
+                self.chart_hover = None;
                 self.pv_select = None;
                 self.pv_modal = None;
                 if i == 5 {
@@ -1444,6 +1475,7 @@ impl App {
                 if hit(*tab, x, y) {
                     self.atab = i;
                     self.heat_hover = None;
+                    self.chart_hover = None;
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -2980,6 +3012,9 @@ impl App {
         self.scroll = 0;
         self.sel = None;
         self.hover = None;
+        // 换周期就是换窗口：趋势图那个下标原本指哪天，现在指别的日子了 ⇒ 当场撤掉，
+        // 不然光标没动、读数会跟着周期自己换内容。
+        self.chart_hover = None;
         self.refresh_now();
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -4058,6 +4093,7 @@ struct ViewState {
     /// 按下录入开着的那条热键（`settings` 下标）；那一行的值框要改成"请按下组合…"。
     capturing: Option<usize>,
     heat_hover: Option<usize>,
+    chart_hover: Option<usize>,
     /// 全局热键此刻是否真的注册着（不是配置键，是运行时状态）。
     hotkey_on: bool,
     /// 三条绑定各自注册上了没有，顺序同 `COMBO_KEYS`（0 唤出 / 1 松手即存 / 2 进标注）。
@@ -4315,7 +4351,9 @@ fn draw_dashboard(p: &P<'_>, w: f32, h: f32, snap: &Snapshot, vs: ViewState) {
     draw_table(p, left, snap, vs);
 
     let chart_h = (body_h - 12.0) * 0.55;
-    draw_line_chart(p, rect(right_x, left.top, right_w, chart_h), snap);
+    // 排行页右侧那两张小图不接悬停：这一屏的"光标下是什么"归左边那张表（分析页才读
+    // `vs.chart_hover`），两处同时亮会给不出"我压的是哪一行"。
+    draw_line_chart(p, rect(right_x, left.top, right_w, chart_h), snap, None);
     draw_hourly(
         p,
         rect(
@@ -4325,6 +4363,7 @@ fn draw_dashboard(p: &P<'_>, w: f32, h: f32, snap: &Snapshot, vs: ViewState) {
             body_h - chart_h - 12.0,
         ),
         snap,
+        None,
     );
 }
 
@@ -4429,12 +4468,14 @@ fn draw_analytics(p: &P<'_>, w: f32, h: f32, snap: &Snapshot, vs: ViewState) {
     match vs.atab {
         0 => {
             // 趋势图：与排行页右侧那张同一个画函数，这里只是给它整块宽度。
-            draw_line_chart(p, chart_card(content), snap);
+            draw_line_chart(p, chart_card(content), snap, vs.chart_hover);
         }
         1 => {
-            draw_hourly(p, chart_card(content), snap);
+            draw_hourly(p, chart_card(content), snap, vs.chart_hover);
         }
         2 => {
+            // 星期分布不接悬停：那七根的数本来就已经印在每根柱顶上了，压上去再读一遍
+            // 是装饰，不是读数。
             draw_weekday(p, chart_card(content), snap);
         }
         _ => {
@@ -7207,15 +7248,69 @@ fn hourly_plot(card: D2D_RECT_F) -> D2D_RECT_F {
     )
 }
 
-/// 小时图第 `i` 根柱的 `(x, 宽)`：柱宽由根数与间距导出，画柱与命中测试走同一句除法。
-fn hourly_bar_slot(plot: D2D_RECT_F, n: usize, i: usize) -> (f32, f32) {
-    let gap = 3.0;
+/// 小时图柱与柱之间的空档（逻辑像素）：画柱与命中测试都读这一份，不许两边各写一个数。
+const HOURLY_GAP: f32 = 3.0;
+
+/// 等宽柱排的柱位：第 `i` 根的 `(x, 宽)`，柱宽由根数与空档导出 ——
+/// 画柱与命中测试走的是同一句除法。
+fn bar_slot(plot: D2D_RECT_F, n: usize, i: usize, gap: f32) -> (f32, f32) {
     let n = n.max(1);
     let bw = ((plot_width(plot) - gap * (n as f32 - 1.0)) / n as f32).max(1.0);
     (plot.left + i as f32 * (bw + gap), bw)
 }
 
-fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
+/// 小时图的柱位（那一排 24 根）。
+fn hourly_bar_slot(plot: D2D_RECT_F, n: usize, i: usize) -> (f32, f32) {
+    bar_slot(plot, n, i, HOURLY_GAP)
+}
+
+/// 光标落在绘图区里时命中的那一根柱；**柱与柱之间的空档算没命中** ——
+/// 只按取整反推下标的话，空档会被并进左边那根，"未命中"这一半就再也测不出来了。
+fn slot_nearest(plot: D2D_RECT_F, n: usize, gap: f32, x: f32, y: f32) -> Option<usize> {
+    if n == 0 || y < plot.top || y > plot.bottom || x < plot.left || x > plot.right {
+        return None;
+    }
+    let i = ((x - plot.left) / (bar_slot(plot, n, 0, gap).1 + gap)).floor();
+    if i < 0.0 || i as usize >= n {
+        return None;
+    }
+    let (x0, bw) = bar_slot(plot, n, i as usize, gap);
+    if x > x0 + bw {
+        return None;
+    }
+    Some(i as usize)
+}
+
+/// 光标落在绘图区里时，横坐标最近的那个点；区外不算命中。
+fn line_nearest(plot: D2D_RECT_F, n: usize, x: f32, y: f32) -> Option<usize> {
+    if n == 0 || y < plot.top || y > plot.bottom || x < plot.left || x > plot.right {
+        return None;
+    }
+    if n < 2 {
+        return Some(0);
+    }
+    let t = (x - plot.left) / plot_width(plot);
+    let i = (t * (n - 1) as f32).round();
+    Some(i.clamp(0.0, (n - 1) as f32) as usize)
+}
+
+/// 图上那枚读数小条：贴着命中的那个点或那根柱的顶画，出界就往里收。
+/// 三张图共用这一个画法，免得长出"趋势有、小时没有"这种半边货。
+fn chart_tip(p: &P<'_>, card: D2D_RECT_F, at: Vector2, text: &str) {
+    let w = (150.0f32).min((card.right - card.left) - 16.0).max(60.0);
+    let lo = card.left + 8.0;
+    let x = (at.X + 10.0).clamp(lo, (card.right - w - 8.0).max(lo));
+    let y = (at.Y - 26.0).clamp(card.top + 4.0, (card.bottom - 20.0).max(card.top + 4.0));
+    p.round(rect(x, y, w, 18.0), 5.0, &p.br.header, None);
+    p.text(
+        text,
+        rect(x + 6.0, y + 1.0, w - 12.0, 16.0),
+        &p.fmt.small,
+        &p.br.fg,
+    );
+}
+
+fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
     p.round(r, 14.0, &p.br.card, Some(&p.br.border));
     let pad = 12.0;
     p.text(
@@ -7306,9 +7401,28 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         &p.fmt.right,
         &p.br.muted,
     );
+    // 光标压在哪一天：把那一点圈出来，读数贴着它画（旧 WebView 三张图都有这枚 tip，
+    // 换原生时只留了热力板那一处）。
+    if let Some(i) = hover {
+        if let Some((d, v)) = series.get(i) {
+            let c = pt(i);
+            p.round(
+                rect(c.X - 5.0, c.Y - 5.0, 10.0, 10.0),
+                5.0,
+                &p.br.accent,
+                None,
+            );
+            chart_tip(
+                p,
+                r,
+                c,
+                &format!("{} · {} 次", d, thousands((*v).max(0) as u64)),
+            );
+        }
+    }
 }
 
-fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
+fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
     p.round(r, 14.0, &p.br.card, Some(&p.br.border));
     let pad = 12.0;
     p.text(
@@ -7348,6 +7462,25 @@ fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         let bar = rect(x, plot.bottom - hp, bw, hp);
         if let Some(b) = p.brush(p.pal.accent) {
             p.round(bar, 2.0, &b, None);
+        }
+        // 压住的那一根：与热力板同一套画法（底色重画一遍 + 强调色描边）。
+        if hover == Some(i) {
+            p.round(bar, 2.0, &p.br.card, Some(&p.br.accent));
+        }
+    }
+    if let Some(i) = hover {
+        if let Some(v) = values.get(i) {
+            let (x, bw) = hourly_bar_slot(plot, n, i);
+            let hp = (*v as f32 / max) * plot_height(plot);
+            chart_tip(
+                p,
+                r,
+                Vector2 {
+                    X: x + bw / 2.0,
+                    Y: plot.bottom - hp,
+                },
+                &format!("{i}时 · {} 次", thousands((*v).max(0) as u64)),
+            );
         }
     }
     for i in (0..n).step_by(4) {
@@ -9154,6 +9287,102 @@ mod gap_note_tests {
                 "面板认领了「{value}」，但它不在该由面板接的那一栏清单上"
             );
         }
+    }
+}
+
+/// 三张图上那枚悬停读数的命中判据：画图与命中测试必须算同一份几何。
+///
+/// 两条腿都在 —— 命中的下标，与**没命中**（区外、柱与柱之间那段空档）。只断"命中"的话，
+/// "整屏什么时候都算命中"那种写法照样能蒙过去。
+#[cfg(test)]
+mod chart_hover_tests {
+    use super::*;
+
+    fn plot() -> D2D_RECT_F {
+        rect(0.0, 0.0, 100.0, 50.0)
+    }
+
+    #[test]
+    fn the_line_picks_the_nearest_point_and_nothing_outside() {
+        let p = plot();
+        // 三个点落在 0 / 50 / 100：这条除法与画线用的是同一个函数。
+        assert_eq!(line_point_x(p, 3, 1), 50.0);
+        assert_eq!(line_nearest(p, 3, 0.0, 25.0), Some(0));
+        assert_eq!(
+            line_nearest(p, 3, 49.0, 25.0),
+            Some(1),
+            "差一点就该归最近那一个"
+        );
+        assert_eq!(line_nearest(p, 3, 100.0, 25.0), Some(2));
+        assert_eq!(line_nearest(p, 3, 50.0, -1.0), None, "绘图区上面不接");
+        assert_eq!(line_nearest(p, 3, 50.0, 51.0), None, "绘图区下面不接");
+        assert_eq!(line_nearest(p, 3, 101.0, 25.0), None, "右边轴外不接");
+        assert_eq!(
+            line_nearest(p, 0, 50.0, 25.0),
+            None,
+            "序列是空的，什么都不能命中"
+        );
+        // 「今日」那一档只有一个点：落在正中，左右都算它。
+        assert_eq!(line_point_x(p, 1, 0), 50.0);
+        assert_eq!(line_nearest(p, 1, 10.0, 25.0), Some(0));
+    }
+
+    #[test]
+    fn the_hourly_bars_answer_and_the_gap_between_them_does_not() {
+        let p = plot();
+        // 四根柱、空档 3 ⇒ 柱宽 (100 - 3×3) / 4 = 22.75（这一批数都是精确的二进制值）。
+        assert_eq!(bar_slot(p, 4, 1, HOURLY_GAP), (25.75, 22.75));
+        assert_eq!(slot_nearest(p, 4, HOURLY_GAP, 10.0, 25.0), Some(0));
+        assert_eq!(slot_nearest(p, 4, HOURLY_GAP, 30.0, 25.0), Some(1));
+        assert_eq!(slot_nearest(p, 4, HOURLY_GAP, 99.0, 25.0), Some(3));
+        assert_eq!(
+            slot_nearest(p, 4, HOURLY_GAP, 24.0, 25.0),
+            None,
+            "柱画到 22.75 就停了，24 落在空档里：不许并进左边那根"
+        );
+        assert_eq!(
+            slot_nearest(p, 4, HOURLY_GAP, 50.0, 60.0),
+            None,
+            "轴下方不接"
+        );
+        assert_eq!(slot_nearest(p, 0, HOURLY_GAP, 10.0, 25.0), None);
+    }
+
+    /// 接线腿：这个下标真的走到了画图那两处，而且每一处"这一屏没有图"的分支都撤了它。
+    /// 漏撤的那一屏会亮着一格谁都没指的读数 —— 那比没有读数更糟。
+    #[test]
+    fn the_hover_state_reaches_the_draw_and_is_reset_wherever_it_cannot_apply() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let to_draw = ["vs.", "chart_hover"].concat();
+        assert_eq!(
+            prod.matches(to_draw.as_str()).count(),
+            2,
+            "趋势与小时两处画图都读这个下标，少一处就是那张图接不上"
+        );
+        assert_eq!(
+            prod.matches(["self.chart_hover = idx"].concat().as_str())
+                .count(),
+            1,
+            "只有一个地方写它（鼠标那一问）"
+        );
+        assert_eq!(
+            prod.matches(["self.chart_hover.", "take()"].concat().as_str())
+                .count(),
+            5,
+            "弹窗 / 热力 / 插件 / 设置 / 排行这五处早退各撤一次：新增一屏时要跟着补"
+        );
+        assert_eq!(
+            prod.matches(["self.chart_hover = None"].concat().as_str())
+                .count(),
+            3,
+            "换视图、换子页签、换周期这三处必须当场清掉"
+        );
     }
 }
 
