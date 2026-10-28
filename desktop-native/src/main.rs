@@ -7480,6 +7480,30 @@ fn chart_tip(p: &P<'_>, card: D2D_RECT_F, at: Vector2, text: &str) {
     );
 }
 
+/// 纵轴的顶格：**点高与刻度共用这一个分母**（旧前端 `charts.js` 里 `axisTop` 那条规则搬过来）。
+/// 取 4 的倍数、不小于最大值、最多只让出 3 —— 五条等距网格线才每一档都念得出整数、
+/// 而且步长相等。分母要是分两处（点高一个、刻度一个），刻度就整体比实际低一截。
+fn axis_top(max: i64) -> i64 {
+    let m = max.max(1);
+    (m.saturating_add(3) / 4 * 4).max(4)
+}
+
+/// 第 `i` 条网格线对应的次数（0 = 顶格，往下四等分）。顶格是 4 的倍数 ⇒ 每档都是整数。
+fn line_tick_value(top: i64, i: usize) -> i64 {
+    top - top / 4 * i as i64
+}
+
+/// 网格线（与贴在它上面的刻度）的纵坐标：两处必须走这一个函数，
+/// 否则"刻度贴在自己的网格线上"这件事只靠两边各写一遍同样的算式碰巧一致。
+fn line_grid_y(plot: D2D_RECT_F, i: usize) -> f32 {
+    plot.top + plot_height(plot) * i as f32 / 4.0
+}
+
+/// 某个次数在绘图区里的纵坐标：与刻度共用 `top` 做分母，从高度反推才回得到原值。
+fn line_point_y(plot: D2D_RECT_F, top: i64, value: i64) -> f32 {
+    plot.bottom - (value as f64 / top as f64) as f32 * plot_height(plot)
+}
+
 fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
     p.round(r, 14.0, &p.br.card, Some(&p.br.border));
     let pad = 12.0;
@@ -7512,19 +7536,23 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
 
     let plot = line_plot(r);
     for i in 0..=4 {
-        let y = plot.top + plot_height(plot) * i as f32 / 4.0;
+        let y = line_grid_y(plot, i);
         p.line(plot.left, y, plot.right, y, &p.br.grid, 1.0);
     }
 
     let series = &snap.daily;
-    let peak = series.iter().map(|(_, v)| *v).max().unwrap_or(0).max(1) as f64;
-    let max = peak * 1.12;
+    let peak = series.iter().map(|(_, v)| *v).max().unwrap_or(0).max(1);
+    // 点高与纵轴刻度共用这一个顶格：以前点高按 `峰 × 1.12`、刻度按 `峰 × 分数` 念，
+    // 于是顶格那条线写着峰值、实际对应的是 1.12 倍 —— 整条纵轴每一档都少报约 12%，
+    // 而"峰刚好贴着顶格"看着像对的，只有拿刻度反推高度才看得出来。
+    let top = axis_top(peak);
     let n = series.len();
     let pt = |i: usize| {
-        let v = series.get(i).map(|(_, v)| *v).unwrap_or(0) as f64;
-        let x = line_point_x(plot, n, i);
-        let y = plot.bottom - (v / max) as f32 * plot_height(plot);
-        Vector2 { X: x, Y: y }
+        let v = series.get(i).map(|(_, v)| *v).unwrap_or(0);
+        Vector2 {
+            X: line_point_x(plot, n, i),
+            Y: line_point_y(plot, top, v),
+        }
     };
     for i in 1..n {
         let a = pt(i - 1);
@@ -7544,12 +7572,11 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
             None,
         );
     }
-    // 纵轴：从上往下是「峰。
+    // 纵轴：从上往下是顶格 → 0，四等分。刻度与网格线走同一个 `line_grid_y`。
     for i in 0..=4 {
-        let frac = 1.0 - i as f32 / 4.0;
-        let y = plot.top + plot_height(plot) * (1.0 - frac);
+        let y = line_grid_y(plot, i);
         p.text(
-            &thousands((peak * frac as f64) as u64),
+            &thousands(line_tick_value(top, i).max(0) as u64),
             rect(plot.left - 48.0, y - 7.0, 44.0, 14.0),
             &p.fmt.right,
             &p.br.muted,
@@ -9324,6 +9351,117 @@ fn main() -> windows::core::Result<()> {
         drop(Box::from_raw(app));
     }
     Ok(())
+}
+
+/// 纵轴刻度与点高是不是同一把尺子。这四条是从旧前端那条真浏览器镜像腿（`chart-axis-harness`）
+/// 搬进仓内的：那条腿断言的是**已删前端的副本**，产品改坏了它不会红；这几条抓得到产品。
+/// 逐条对得上那条镜像腿自己的判据名：整数刻度、步长相等、顶格不小于最大值、
+/// 顶格不整格整格地空让、最高点按刻度反推等于真实最大值、刻度贴在自己的网格线上。
+#[cfg(test)]
+mod chart_axis_mirror_tests {
+    use super::*;
+
+    #[test]
+    fn the_axis_top_rounds_up_without_wasting_a_whole_step() {
+        assert_eq!(axis_top(0), 4, "一天都没记也不许顶格是 0（反推要除它）");
+        assert_eq!(axis_top(1), 4);
+        assert_eq!(axis_top(5), 8);
+        assert_eq!(axis_top(7), 8);
+        assert_eq!(axis_top(100), 100);
+        assert_eq!(axis_top(101), 104);
+        for max in [1i64, 2, 6, 7, 9, 40, 999, 12_345] {
+            let top = axis_top(max);
+            assert!(top >= max, "顶格不能低于最大值：max={max} top={top}");
+            assert!(top - max < 4, "顶格不许整格整格地空让：max={max} top={top}");
+            assert_eq!(
+                top % 4,
+                0,
+                "顶格必须是 4 的倍数，四等分才每档都是整数：top={top}"
+            );
+        }
+        // 天文数字不许绕回：症状是顶格变成负数、整条轴翻过来画。
+        assert!(axis_top(i64::MAX) > 0);
+    }
+
+    #[test]
+    fn the_five_ticks_are_integers_with_an_equal_step() {
+        for max in [1i64, 7, 8, 100, 1001] {
+            let top = axis_top(max);
+            let vals: Vec<i64> = (0..=4).map(|i| line_tick_value(top, i)).collect();
+            assert_eq!(vals[0], top, "顶格那条线念的就是顶格");
+            assert_eq!(vals[4], 0, "最底那条是 0");
+            let steps: Vec<i64> = vals.windows(2).map(|w| w[0] - w[1]).collect();
+            assert!(
+                steps.iter().all(|s| *s == steps[0]) && steps[0] > 0,
+                "等距网格线必须等值：{vals:?}"
+            );
+            assert_eq!(steps[0], top / 4, "步长就是顶格的四等分：{vals:?}");
+        }
+    }
+
+    /// 这条镜像腿最有牙的一条：把最高点的高度**按刻度反推**回次数，必须等于真实最大值。
+    /// 点高与刻度一旦分家（历史症状：点高按 `峰×1.12`、刻度按 `峰×分数`），这条立刻红。
+    #[test]
+    fn the_peak_point_reads_back_as_the_peak_count_through_the_ticks() {
+        let plot = rect(0.0, 0.0, 300.0, 200.0);
+        for max in [1i64, 7, 33, 500, 9_999] {
+            let top = axis_top(max);
+            let y = line_point_y(plot, top, max);
+            let implied = (plot.bottom - y) as f64 / plot_height(plot) as f64 * top as f64;
+            // 容差按 f32 往返来定（高度是 f32，反推回来的相对误差在 1e-7 量级），
+            // 而这条要抓的是"分母分了两处"那种 12% 级别的分家 —— 相对 1e-5 既不误报，
+            // 也留着四个数量级的牙齿。
+            assert!(
+                (implied - max as f64).abs() <= max as f64 * 1e-5,
+                "最高点按刻度反推是 {implied}，真实最大值是 {max} ⇒ 分母分在了两处"
+            );
+            let top_y = line_grid_y(plot, 0);
+            let value_at_top = (plot.bottom - top_y) as f64 / plot_height(plot) as f64 * top as f64;
+            assert!(
+                (value_at_top - line_tick_value(top, 0) as f64).abs() < 1e-6,
+                "顶格那条刻度写着 {}，可那条线对应的是 {value_at_top}",
+                line_tick_value(top, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn each_tick_label_sits_on_its_own_grid_line() {
+        let plot = rect(10.0, 20.0, 200.0, 160.0);
+        for i in 0..=4 {
+            // 期望值独立写一遍：两边以前各抄一次同一条算式，抄歪一次就飘。
+            let want = plot.top + plot_height(plot) * i as f32 / 4.0;
+            assert_eq!(
+                line_grid_y(plot, i),
+                want,
+                "第 {i} 条网格线不在自己的位置上"
+            );
+        }
+        assert_eq!(line_grid_y(plot, 4), plot.bottom, "第四条线就是绘图区下沿");
+    }
+
+    /// 生产文本的边界：`include_str!` 那批接线守卫都按"第一个 `#[cfg(test)]` 之前"取生产码。
+    /// 测试模块一旦插到文件中段，边界就往前挪，后面那些守卫扫到的"生产码"凭空少一截 ——
+    /// 症状不是红，而是**少数了几处调用还照样绿**（这一条就是被 such 一次插错位置逼出来的）。
+    #[test]
+    fn the_prod_scan_boundary_stays_below_the_production_code() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("找不到测试模块的起点了");
+        let prod = &src[..cut];
+        for what in [
+            "fn draw_table",
+            "fn draw_line_chart",
+            "fn left_rows",
+            "fn gap_note",
+            "fn axis_top",
+        ] {
+            assert!(
+                prod.contains(what),
+                "{what} 落到了第一个 #[cfg(test)] 后面：有测试模块插在中段，\
+                 接线守卫会开始少扫生产码（少扫不会红，只会假绿）"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
