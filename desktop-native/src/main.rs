@@ -351,6 +351,19 @@ struct Formats {
     /// 键帽上那种小一号的字（窄键放不下 11px）。
     center_tiny: IDWriteTextFormat,
     tab: IDWriteTextFormat,
+    /// 设置页专用的一整套，尺寸逐项照旧 WebView `desktop/ui/styles.css`：
+    /// `.ff-h2` 15/700、`.ff-name` 14/600（继承 body 14）、`.ff-desc`/`.ff-foot` 12/400、
+    /// `.ff-nav button` 13/400 且 `.on` 600、`.ff-search` 与 `.ff-item .btn`/`input` 13/400。
+    ///
+    /// 为什么单开一档而不是改 `body`/`small`：那两档主界面、表格、图表刻度都在用，
+    /// 动它们等于把每个版面一起推挤（那些地方是固定矩形，字一大就裁切）。而设置页
+    /// 以前整页借的是 12.5/400 与 11/400 —— 比旧版小一号又细一号，就是"字体还有差距"。
+    settings_h: IDWriteTextFormat,
+    row_name: IDWriteTextFormat,
+    text13: IDWriteTextFormat,
+    text13_em: IDWriteTextFormat,
+    text12: IDWriteTextFormat,
+    center13: IDWriteTextFormat,
 }
 
 // ===== 渲染目标 =====
@@ -807,6 +820,12 @@ impl App {
                 center_small: center_format(&dwrite, 11.0)?,
                 center_tiny: center_format(&dwrite, 8.5)?,
                 tab: center_format(&dwrite, 12.5)?,
+                settings_h: text_format(&dwrite, 15.0, DWRITE_FONT_WEIGHT_BOLD)?,
+                row_name: text_format(&dwrite, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+                text13: text_format(&dwrite, 13.0, DWRITE_FONT_WEIGHT_NORMAL)?,
+                text13_em: text_format(&dwrite, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+                text12: text_format(&dwrite, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
+                center13: center_format(&dwrite, 13.0)?,
             };
 
             let (tray, pause_item) = make_tray(&snap);
@@ -882,7 +901,9 @@ impl App {
                 CLIP_DEFAULT_PRECIS,
                 CLEARTYPE_QUALITY,
                 DEFAULT_PITCH.0 as u32,
-                w!("Microsoft YaHei UI"),
+                // 和 D2D 那几档同一个开头（见 `text_format`）：原来这里直接写雅黑，
+                // 搜索框与值框里敲进去的数字、拉丁字母比框外的同档字粗一号。
+                w!("Segoe UI"),
             );
             // EDIT 的字体与颜色：EDIT 不认 D2D 主题，只能单独喂。
             // 颜色取当前主题的那一档（主题在设置页里一改，`ensure_brushes` 会重建这把刷子）。
@@ -3041,14 +3062,15 @@ fn draw_settings(
     p.round(card, 14.0, &p.br.card, Some(&p.br.border));
     p.text(
         "设置",
-        rect(card.left + 16.0, card.top + 12.0, 120.0, 22.0),
-        &p.fmt.body,
+        rect(card.left + 16.0, card.top + 10.0, 160.0, 24.0),
+        &p.fmt.settings_h,
         &p.br.fg,
     );
+    // 这句是标题旁边的说明：顶边比 15/700 的标题低 3 像素，两行才在同一条基线上。
     p.text(
         "左侧分类；改动写进 config.ini，标「重启」的项要重启程序",
-        rect(card.left + 66.0, card.top + 15.0, 560.0, 18.0),
-        &p.fmt.small,
+        rect(card.left + 66.0, card.top + 13.0, 620.0, 18.0),
+        &p.fmt.text12,
         &p.br.muted,
     );
 
@@ -3064,7 +3086,7 @@ fn draw_settings(
                 sbox.right - sbox.left - 20.0,
                 18.0,
             ),
-            &p.fmt.small,
+            &p.fmt.text13,
             &p.br.muted,
         );
     }
@@ -3094,16 +3116,22 @@ fn draw_settings(
                 nr.right - nr.left - 20.0,
                 18.0,
             ),
-            &p.fmt.body,
+            // 选中的分类加一档字重（旧版 `.ff-nav button.on { font-weight: 600 }`），
+            // 未选中的与正文同档 13/400 —— 以前两者都是 12.5/400，只能靠底色区分。
+            if active {
+                &p.fmt.text13_em
+            } else {
+                &p.fmt.text13
+            },
             if active { &p.br.accent } else { &p.br.fg },
         );
         p.text(
             desc,
             rect(
                 nr.left + 12.0,
-                nr.top + 22.0,
+                nr.top + 23.0,
                 nr.right - nr.left - 20.0,
-                14.0,
+                15.0,
             ),
             &p.fmt.small,
             &p.br.muted,
@@ -3141,19 +3169,19 @@ fn draw_settings(
                 // 第一行中文名，第二行一句话说明（说明以「分组 ·」开头）。
                 p.text(
                     row.label,
-                    rect(r.left + 12.0, y + 3.0, 420.0, 18.0),
-                    &p.fmt.body,
+                    rect(r.left + 12.0, y + 2.0, 460.0, 20.0),
+                    &p.fmt.row_name,
                     &p.br.fg,
                 );
                 p.text(
                     row.help,
                     rect(
                         r.left + 12.0,
-                        y + 21.0,
+                        y + 23.0,
                         (g.value_x - r.left - 30.0).max(120.0),
-                        15.0,
+                        17.0,
                     ),
-                    &p.fmt.small,
+                    &p.fmt.text12,
                     &p.br.muted,
                 );
 
@@ -3164,7 +3192,7 @@ fn draw_settings(
                     p.text(
                         if on { "开" } else { "关" },
                         vb,
-                        &p.fmt.center_small,
+                        &p.fmt.center13,
                         if on { &p.br.white } else { &p.br.muted },
                     );
                 } else {
@@ -3184,7 +3212,7 @@ fn draw_settings(
                                 vb.right - vb.left - 16.0,
                                 vb.bottom - vb.top,
                             ),
-                            &p.fmt.small,
+                            &p.fmt.text13,
                             &p.br.fg,
                         );
                     }
@@ -3218,8 +3246,8 @@ fn draw_settings(
             SItem::Basic(b) => {
                 p.text(
                     basic_label(b),
-                    rect(r.left + 12.0, y + 3.0, 240.0, 18.0),
-                    &p.fmt.body,
+                    rect(r.left + 12.0, y + 2.0, 240.0, 20.0),
+                    &p.fmt.row_name,
                     &p.br.fg,
                 );
                 let vb = rect(g.value_x, y + 9.0, 80.0, 26.0);
@@ -3230,13 +3258,13 @@ fn draw_settings(
                         p.text(
                             if on { "开" } else { "关" },
                             vb,
-                            &p.fmt.center_small,
+                            &p.fmt.center13,
                             if on { &p.br.white } else { &p.br.muted },
                         );
                         p.text(
                             "改完立即生效（现读启动文件夹）",
-                            rect(r.left + 12.0, y + 21.0, 300.0, 18.0),
-                            &p.fmt.small,
+                            rect(r.left + 12.0, y + 23.0, 300.0, 17.0),
+                            &p.fmt.text12,
                             &p.br.muted,
                         );
                     }
@@ -3248,7 +3276,7 @@ fn draw_settings(
                         p.text(
                             if on { "已启用" } else { "未启用" },
                             vb,
-                            &p.fmt.center_small,
+                            &p.fmt.center13,
                             if on { &p.br.white } else { &p.br.muted },
                         );
                         p.text(
@@ -3261,8 +3289,8 @@ fn draw_settings(
                             } else {
                                 "已关闭；点一下开始采集（全局键鼠，只存本机）"
                             },
-                            rect(r.left + 12.0, y + 21.0, 520.0, 18.0),
-                            &p.fmt.small,
+                            rect(r.left + 12.0, y + 23.0, 520.0, 17.0),
+                            &p.fmt.text12,
                             if legacy { &p.br.danger } else { &p.br.muted },
                         );
                     }
@@ -3275,7 +3303,7 @@ fn draw_settings(
                             ("采集中", &p.br.success, &p.br.white)
                         };
                         p.round(vb, 6.0, bg, None);
-                        p.text(label, vb, &p.fmt.center_small, fg);
+                        p.text(label, vb, &p.fmt.center13, fg);
                         p.text(
                             if !vs.collector_on {
                                 "采集没启用，暂停无从谈起"
@@ -3284,8 +3312,8 @@ fn draw_settings(
                             } else {
                                 "点一下暂停：键鼠与设备计数一起停，不写配置、重启即恢复"
                             },
-                            rect(r.left + 12.0, y + 21.0, 520.0, 18.0),
-                            &p.fmt.small,
+                            rect(r.left + 12.0, y + 23.0, 520.0, 17.0),
+                            &p.fmt.text12,
                             &p.br.muted,
                         );
                     }
@@ -3295,7 +3323,7 @@ fn draw_settings(
                         p.text(
                             if on { "开" } else { "关" },
                             vb,
-                            &p.fmt.center_small,
+                            &p.fmt.center13,
                             if on { &p.br.white } else { &p.br.muted },
                         );
                         let toggle = snap_setting(snap, "hotkey", "toggle_window");
@@ -3305,32 +3333,32 @@ fn draw_settings(
                             &format!(
                                 "总开关：开 = 注册下面三行（{toggle} / {snip} / {annotate}）；关 = 一条都不占用"
                             ),
-                            rect(r.left + 12.0, y + 21.0, 560.0, 18.0),
-                            &p.fmt.small,
+                            rect(r.left + 12.0, y + 23.0, 560.0, 17.0),
+                            &p.fmt.text12,
                             &p.br.muted,
                         );
                     }
                     Basic::Snip => {
                         p.round(vb, 6.0, &p.br.accent, None);
-                        p.text("进标注", vb, &p.fmt.center_small, &p.br.white);
+                        p.text("进标注", vb, &p.fmt.center13, &p.br.white);
                         let annotate = snap_setting(snap, "hotkey", "snip_annotate");
                         p.text(
                             &format!("这颗按钮立刻开标注场，等价于按热键 {annotate}；框好之后 Enter 或 Ctrl+S 出图"),
-                            rect(r.left + 12.0, y + 21.0, 640.0, 15.0),
-                            &p.fmt.small,
+                            rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
+                            &p.fmt.text12,
                             &p.br.muted,
                         );
                     }
                     Basic::SnipQuick => {
                         p.round(vb, 6.0, &p.br.accent, None);
-                        p.text("松手即存", vb, &p.fmt.center_small, &p.br.white);
+                        p.text("松手即存", vb, &p.fmt.center13, &p.br.white);
                         let snip = snap_setting(snap, "hotkey", "snip");
                         p.text(
                             &format!(
                                 "这颗按钮不进标注，等价于按热键 {snip}；PNG 存 data/screenshots 并复制到剪贴板"
                             ),
-                            rect(r.left + 12.0, y + 21.0, 640.0, 15.0),
-                            &p.fmt.small,
+                            rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
+                            &p.fmt.text12,
                             &p.br.muted,
                         );
                     }
@@ -3345,15 +3373,15 @@ fn draw_settings(
                         p.text(
                             if n == 0 { "没有贴图" } else { "关掉" },
                             vb,
-                            &p.fmt.center_small,
+                            &p.fmt.center13,
                             if n == 0 { &p.br.muted } else { &p.br.white },
                         );
                         p.text(
                             &format!(
                                 "现在开着 {n} 张；按住拖动、滚轮缩放、Esc 或右键关掉单张。贴图只在内存里，截图文件仍留在 data/screenshots"
                             ),
-                            rect(r.left + 12.0, y + 21.0, 640.0, 15.0),
-                            &p.fmt.small,
+                            rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
+                            &p.fmt.text12,
                             &p.br.muted,
                         );
                     }
@@ -3363,13 +3391,13 @@ fn draw_settings(
                         p.text(
                             if on { "显示" } else { "隐藏" },
                             vb,
-                            &p.fmt.center_small,
+                            &p.fmt.center13,
                             if on { &p.br.white } else { &p.br.muted },
                         );
                         p.text(
                             "拖到哪记哪；双击卡片叫回主窗口（[floating] 段）",
-                            rect(r.left + 12.0, y + 21.0, 420.0, 18.0),
-                            &p.fmt.small,
+                            rect(r.left + 12.0, y + 23.0, 420.0, 17.0),
+                            &p.fmt.text12,
                             &p.br.muted,
                         );
                     }
@@ -3384,29 +3412,29 @@ fn draw_settings(
                         p.text(
                             if dark { "深色" } else { "浅色" },
                             vb,
-                            &p.fmt.center_small,
+                            &p.fmt.center13,
                             &p.br.fg,
                         );
                         p.text(
                             "点一下切换；配色照 tokens.css 的两套令牌（[gui] theme）",
-                            rect(r.left + 12.0, y + 21.0, 420.0, 18.0),
-                            &p.fmt.small,
+                            rect(r.left + 12.0, y + 23.0, 420.0, 17.0),
+                            &p.fmt.text12,
                             &p.br.muted,
                         );
                     }
                     Basic::WeeklyReport => {
                         p.round(vb, 6.0, &p.br.accent, None);
-                        p.text("生成", vb, &p.fmt.center_small, &p.br.white);
+                        p.text("生成", vb, &p.fmt.center13, &p.br.white);
                         p.text(
                             "汇总上周一~周日，写到 data/reports/weekly-YYYY-MM-DD.md（只存本机）；启动时缺这一份会自动补",
-                            rect(r.left + 12.0, y + 21.0, 600.0, 15.0),
-                            &p.fmt.small,
+                            rect(r.left + 12.0, y + 23.0, 600.0, 17.0),
+                            &p.fmt.text12,
                             &p.br.muted,
                         );
                     }
                     Basic::DataDir => {
                         p.round(vb, 6.0, &p.br.header, Some(&p.br.border));
-                        p.text("打开", vb, &p.fmt.center_small, &p.br.fg);
+                        p.text("打开", vb, &p.fmt.center13, &p.br.fg);
                         let dir_line = if snap.pending_move.is_empty() {
                             format!(
                                 "{}（改目录要用下面的「更改数据文件夹」，重启后生效）",
@@ -3421,8 +3449,8 @@ fn draw_settings(
                         };
                         p.text(
                             &dir_line,
-                            rect(r.left + 12.0, y + 21.0, 560.0, 18.0),
-                            &p.fmt.small,
+                            rect(r.left + 12.0, y + 23.0, 560.0, 17.0),
+                            &p.fmt.text12,
                             &p.br.muted,
                         );
                     }
@@ -3433,8 +3461,8 @@ fn draw_settings(
                 let (label, desc) = ACTIONS[a];
                 p.text(
                     label,
-                    rect(r.left + 12.0, y + 3.0, 240.0, 18.0),
-                    &p.fmt.body,
+                    rect(r.left + 12.0, y + 2.0, 240.0, 20.0),
+                    &p.fmt.row_name,
                     &p.br.fg,
                 );
                 let vb = rect(g.value_x, y + 9.0, 80.0, 26.0);
@@ -3448,13 +3476,13 @@ fn draw_settings(
                 p.text(
                     if busy { "…" } else { "执行" },
                     vb,
-                    &p.fmt.center_small,
+                    &p.fmt.center13,
                     if enabled { &p.br.white } else { &p.br.muted },
                 );
                 p.text(
                     desc,
-                    rect(r.left + 12.0, y + 21.0, 360.0, 18.0),
-                    &p.fmt.small,
+                    rect(r.left + 12.0, y + 23.0, 360.0, 17.0),
+                    &p.fmt.text12,
                     &p.br.muted,
                 );
             }
@@ -3473,7 +3501,7 @@ fn draw_settings(
                 card.right - card.left - 32.0,
                 18.0,
             ),
-            &p.fmt.small,
+            &p.fmt.text12,
             if warn { &p.br.danger } else { &p.br.muted },
         );
     }
@@ -8374,6 +8402,59 @@ mod snapshot_rate_tests {
             prod.matches(call.as_str()).count(),
             2,
             "一处定义 + 循环里一处调用，数量变了说明接线动过"
+        );
+    }
+}
+
+#[cfg(test)]
+mod settings_type_tests {
+    /// 设置页这一整套字号是照旧 WebView `desktop/ui/styles.css` 逐项量出来的（见 `Formats`
+    /// 上那段注释）。这里守的不是像素，而是"别再借全局那两档"：以前整页画的是 `body`
+    /// 12.5/400 与 `small` 11/400，比旧版小一号又细一号——借档在源码里不留任何痕迹，
+    /// 只在屏上看得见，所以拿源码范围钉住。
+    #[test]
+    fn the_settings_page_draws_with_its_own_scale() {
+        let src = include_str!("main.rs");
+        let from = src
+            .find("fn draw_settings(")
+            .expect("设置页的绘制入口找不到了");
+        let rest = &src[from..];
+        let to = from
+            + rest
+                .find("\nfn draw_detail(")
+                .expect("设置页的终点（下一个函数）找不到了");
+        let page = &src[from..to];
+        for slot in ["settings_h", "row_name", "text12", "text13_em", "center13"] {
+            let wired = ["&p.fmt.", slot].concat();
+            assert!(page.contains(wired.as_str()), "这一档没接上：{wired}");
+        }
+        for borrowed in ["&p.fmt.body", "&p.fmt.center_small"] {
+            assert!(
+                !page.contains(borrowed),
+                "设置页又借了全局那一档 {borrowed}：那一档比旧版小一号，主界面也在用，不该跟着动"
+            );
+        }
+    }
+
+    /// 同一个字体栈要两处一起改。D2D 那几档打头是 Segoe UI（中文由 DirectWrite 回退到雅黑），
+    /// 而叠在设置页上的原生 EDIT（搜索框、值框）走的是 GDI，得单独喂一把 HFONT：
+    /// 它原先直接写雅黑，于是同一行里框外的数字与框里敲进去的数字是两种字重。
+    #[test]
+    fn the_edit_font_shares_the_directwrite_family() {
+        let src = include_str!("main.rs");
+        let from = src
+            .find("let ui_font = CreateFontW(")
+            .expect("主窗口那把 EDIT 字体的构造点找不到了");
+        let rest = &src[from..];
+        let to = rest.find(");").expect("那把字体的构造没收尾");
+        let block = &rest[..to];
+        assert!(
+            block.contains("Segoe UI"),
+            "EDIT 要用与 D2D 同一开头的字体栈"
+        );
+        assert!(
+            !block.contains("Microsoft YaHei UI"),
+            "EDIT 又退回整段雅黑了：数字与拉丁字母会比框外的同档字粗一号"
         );
     }
 }
