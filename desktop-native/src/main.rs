@@ -64,7 +64,7 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -707,6 +707,9 @@ struct App {
     edit: Option<HWND>,
     edit_target: Option<EditTarget>,
     edit_row: Option<usize>,
+    /// 按下录入：正在录哪一条热键（`settings` 数组下标）。开着的时候主窗口必须握着焦点，
+    /// 否则下一键会跑到别的应用那里去，而屏上还写着"请按下组合"。
+    capturing: Option<usize>,
     ui_font: HFONT,
     edit_bg: HBRUSH,
     /// EDIT 的文字色与底色（`WM_CTLCOLOREDIT` 用）。跟着主题走，与 `edit_bg` 同一份。
@@ -992,6 +995,7 @@ impl App {
                 edit: None,
                 edit_target: None,
                 edit_row: None,
+                capturing: None,
                 ui_font,
                 edit_bg,
                 edit_fg,
@@ -1120,6 +1124,7 @@ impl App {
                 hover: self.hover,
                 sel: self.sel,
                 editing: self.edit_row,
+                capturing: self.capturing,
                 heat_hover: self.heat_hover,
                 // 三条绑定此刻**真的**注册着哪几条（顺序同 `COMBO_KEYS`）：设置页那三行
                 // 右边那句"没注册上"读的就是它。只报总开关会把"被别的程序占了"和
@@ -1692,36 +1697,54 @@ impl App {
                             });
                             let vb = rect(g.value_x, y0 + 9.0, g.value_w, 26.0);
                             if let Some((section, key, default, value)) = hk {
-                                if hotkey_slot(section, key).is_some()
-                                    && hit(hotkey_btn_rect(vb), x, y)
-                                {
-                                    // 有值 → 清空（这条从此不注册）；空着 → 写回默认组合。
-                                    let v = if value.trim().is_empty() {
-                                        default
-                                    } else {
-                                        String::new()
-                                    };
-                                    match focusflow_core::config::instance().set(section, key, &v) {
-                                        Ok(()) => {
-                                            let msg = self.reload_hotkeys();
-                                            // 这句留着 `key = 值` 那个 ASCII 形状（与
-                                            // `register_combo` 同一形状）：验收脚本只能匹配
-                                            // ASCII，中文夹在中间它就逮不到。
-                                            tracing_note(&format!(
-                                                "热键 {key} = {v:?} 由值框右边那颗钮改过：{msg}"
-                                            ));
-                                            self.status = Some(msg);
+                                if hotkey_slot(section, key).is_some() {
+                                    if hit(hotkey_btn_rect(vb), x, y) {
+                                        // 点那颗钮先把录入态收掉：不然他刚清空的那一条，
+                                        // 会被下一键随手又绑回去。
+                                        self.capturing = None;
+                                        // 有值 → 清空（这条从此不注册）；空着 → 写回默认组合。
+                                        let v = if value.trim().is_empty() {
+                                            default
+                                        } else {
+                                            String::new()
+                                        };
+                                        match focusflow_core::config::instance()
+                                            .set(section, key, &v)
+                                        {
+                                            Ok(()) => {
+                                                let msg = self.reload_hotkeys();
+                                                // 这句留着 `key = 值` 那个 ASCII 形状（与
+                                                // `register_combo` 同一形状）：验收脚本只能匹配
+                                                // ASCII，中文夹在中间它就逮不到。
+                                                tracing_note(&format!(
+                                                    "热键 {key} = {v:?} 由值框右边那颗钮改过：{msg}"
+                                                ));
+                                                self.status = Some(msg);
+                                            }
+                                            Err(e) => {
+                                                tracing_note(&format!("热键 {key} 写入失败：{e}"));
+                                                self.status = Some(format!("热键没改：{e}"));
+                                            }
                                         }
-                                        Err(e) => {
-                                            tracing_note(&format!("热键 {key} 写入失败：{e}"));
-                                            self.status = Some(format!("热键没改：{e}"));
+                                        self.refresh_now();
+                                        unsafe {
+                                            let _ = InvalidateRect(Some(hwnd), None, false);
                                         }
+                                        return;
                                     }
-                                    self.refresh_now();
-                                    unsafe {
-                                        let _ = InvalidateRect(Some(hwnd), None, false);
+                                    if hit(vb, x, y) {
+                                        // 值框里点一下＝开始录入。这里**不再**开文本框：
+                                        // 他要的正是"别让我手打字母"，而两种入口同时开着，
+                                        // 屏上就没法说清这一格现在等按键还是等文字。
+                                        self.capturing = Some(i);
+                                        self.edit_row = None;
+                                        unsafe {
+                                            // 录入靠主窗口自己收键；焦点不在这里就是收不到。
+                                            let _ = SetFocus(Some(hwnd));
+                                            let _ = InvalidateRect(Some(hwnd), None, false);
+                                        }
+                                        return;
                                     }
-                                    return;
                                 }
                             }
                             let kind = self
@@ -2096,6 +2119,81 @@ impl App {
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
+    }
+
+    /// 录入态收到的一击：`true` = 这条按键已经被吃掉，别再走正常流程（否则 Esc 会顺手
+    /// 把主窗口收进托盘——那是 `WM_KEYDOWN` 原本的去处）。
+    ///
+    /// 修饰键走 `GetKeyState`（同步态），所以只有**真按键**或 `keybd_event`/`SendInput`
+    /// 那种进输入队列的注入能录出带修饰的组合；从别的进程 `PostMessage` 一条
+    /// `WM_KEYDOWN` 是录不出 `ctrl+…` 的——写验收腿时别拿它当夹具。
+    fn capture_key(&mut self, hwnd: HWND, vk: usize) -> bool {
+        let Some(setting_idx) = self.capturing else {
+            return false;
+        };
+        const ESC: usize = 0x1B;
+        if vk == ESC {
+            self.capturing = None;
+            self.status = Some("录入已取消：这条热键没改".to_string());
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return true;
+        }
+        let combo = unsafe {
+            combo_from_key(
+                vk as u32,
+                GetKeyState(0x11) < 0,                          // VK_CONTROL
+                GetKeyState(0x12) < 0,                          // VK_MENU
+                GetKeyState(0x10) < 0,                          // VK_SHIFT
+                GetKeyState(0x5B) < 0 || GetKeyState(0x5C) < 0, // VK_LWIN / VK_RWIN
+            )
+        };
+        let Some(combo) = combo else {
+            // 只按了修饰键 ⇒ 继续等；不支持的键 ⇒ 说清为什么没录上。
+            if let Some(why) = capture_refusal(vk as u32) {
+                self.status = Some(why.to_string());
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            return true;
+        };
+        self.capturing = None;
+        let row = self
+            .snap
+            .lock()
+            .ok()
+            .and_then(|s| s.settings.get(setting_idx).map(|r| (r.section, r.key)));
+        let Some((section, key)) = row else {
+            return true;
+        };
+        // 生成的串先过同一道校验（含"两条撞在一起"那一条）：`key_name` 那张表是手写的，
+        // 万一某个名字解析器不认，症状会是"存进去一个注册不上的串"——正是要防的那族。
+        if let Some(why) = combo_reject_reason(key, &combo) {
+            self.status = Some(format!("热键没有改：{why}"));
+            tracing_note(&format!("热键 {key} = {combo:?} 录入被拒：{why}"));
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return true;
+        }
+        match focusflow_core::config::instance().set(section, key, &combo) {
+            Ok(()) => {
+                let msg = self.reload_hotkeys();
+                tracing_note(&format!("热键 {key} = {combo:?} 由按下录入写入：{msg}"));
+                self.status = Some(msg);
+                self.refresh_now();
+            }
+            Err(e) => {
+                tracing_note(&format!("热键 {key} 录入写入失败：{e}"));
+                self.status = Some(format!("热键没改：{e}"));
+            }
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        true
     }
 
     /// 开/关采集。开是立即生效的；关的未来是「现在停止计数 + 下次启动不再初始化」——
@@ -2631,6 +2729,8 @@ impl App {
         }
         self.edit_target = Some(EditTarget::Setting(snapshot_idx));
         self.edit_row = Some(item_idx);
+        // 同一时刻只有一种输入态：开了文本框就不可能还在等按键。
+        self.capturing = None;
     }
 
     /// 设置页「上周周报」：把上一个完整周（周一~周日）汇总成 Markdown。
@@ -3267,11 +3367,16 @@ fn draw_settings(
                     );
                 } else {
                     let editing = vs.editing == Some(idx);
+                    let capturing = vs.capturing == Some(i);
                     p.round(
                         vb,
                         6.0,
                         &p.br.card,
-                        Some(if editing { &p.br.accent } else { &p.br.border }),
+                        Some(if editing || capturing {
+                            &p.br.accent
+                        } else {
+                            &p.br.border
+                        }),
                     );
                     // 热键那三行在值框右沿挂一颗小钮：有值时是「✕」（清空＝这条不注册），
                     // 空着时是「默认」（把默认组合写回去）。一颗钮两种样子，是因为这两个
@@ -3279,7 +3384,13 @@ fn draw_settings(
                     let btn = hotkey_slot(row.section, row.key).map(|_| hotkey_btn_rect(vb));
                     let off = row.value.trim().is_empty();
                     if !editing {
-                        let shown: &str = if off { "（未启用）" } else { &row.value };
+                        let shown: &str = if capturing {
+                            "请按下组合…"
+                        } else if off {
+                            "（未启用）"
+                        } else {
+                            &row.value
+                        };
                         p.text(
                             shown,
                             rect(
@@ -3289,7 +3400,13 @@ fn draw_settings(
                                 vb.bottom - vb.top,
                             ),
                             &p.fmt.text13,
-                            if off { &p.br.muted } else { &p.br.fg },
+                            if capturing {
+                                &p.br.accent
+                            } else if off {
+                                &p.br.muted
+                            } else {
+                                &p.br.fg
+                            },
                         );
                     }
                     if let Some(b) = btn {
@@ -3832,6 +3949,8 @@ struct ViewState {
     hover: Option<usize>,
     sel: Option<usize>,
     editing: Option<usize>,
+    /// 按下录入开着的那条热键（`settings` 下标）；那一行的值框要改成"请按下组合…"。
+    capturing: Option<usize>,
     heat_hover: Option<usize>,
     /// 全局热键此刻是否真的注册着（不是配置键，是运行时状态）。
     hotkey_on: bool,
@@ -7244,6 +7363,140 @@ impl Combo {
     }
 }
 
+/// 一个虚拟键码在配置里该写成什么名字（`parse_combo` 那一侧认得的写法）。
+///
+/// 只覆盖"能当主键"的那些键；修饰键本身走 `combo_from_key` 的四个布尔位。
+/// 认不得的键返回 `None` ⇒ 录入侧原样回一句"这一键还不支持"，而不是写进去一个
+/// 注册不上的串（那正是"界面显示的和注册的各说各话"那一族）。
+fn key_name(vk: u32) -> Option<&'static str> {
+    let name = match vk {
+        0x08 => "backspace",
+        0x09 => "tab",
+        0x0D => "enter",
+        0x10 => "shift",
+        0x11 => "ctrl",
+        0x12 => "alt",
+        0x13 => "pause",
+        0x14 => "capslock",
+        0x1B => "esc",
+        0x20 => "space",
+        0x21 => "pageup",
+        0x22 => "pagedown",
+        0x23 => "end",
+        0x24 => "home",
+        0x25 => "left",
+        0x26 => "up",
+        0x27 => "right",
+        0x28 => "down",
+        0x2A => "printscreen",
+        0x2C => "printscreen",
+        0x2D => "insert",
+        0x2E => "delete",
+        // 0x2F VK_HELP 不在表里：解析器不认 "help" 这个名字（枚举用例逮到的），
+        // 而这个键在现成键盘上基本不存在 ⇒ 宁可不录，也不写一个注册不上的串。
+        0x44 => "numlock",
+        0x45 => "scrolllock",
+        0x60..=0x69 => {
+            return Some(
+                [
+                    "numpad0", "numpad1", "numpad2", "numpad3", "numpad4", "numpad5", "numpad6",
+                    "numpad7", "numpad8", "numpad9",
+                ][(vk - 0x60) as usize],
+            );
+        }
+        // 小键盘的运算符（* + - . /）不在表里：解析器不认 "numpad*" 这一类写法（枚举用例
+        // 一次把它们全念出来了），而拿不准它到底要什么名字就不该写进配置——
+        // "存进去一个注册不上的串"正是这套录入要防的那件事。数字键 0-9 是认的。
+        0x70..=0x79 => {
+            // F1..F10：`vk - 0x6F` 是 1..10，拼进这张表而不是算字符串——算出来的
+            // "f{}" 与 `parse_combo` 认的名字大小写无关，但字面量表一眼能核对。
+            return Some(
+                ["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10"][(vk - 0x70) as usize],
+            );
+        }
+        0x7A..=0x7B => {
+            return Some(["f11", "f12"][(vk - 0x7A) as usize]);
+        }
+        0xBA => ";",
+        0xBB => "=",
+        0xBC => ",",
+        0xBD => "-",
+        0xBE => ".",
+        0xBF => "/",
+        0xC0 => "`",
+        0xDB => "[",
+        0xDC => "\\",
+        0xDD => "]",
+        0xDE => "'",
+        0xE4..=0xE8 => return None, // 未分配/ OEM 具体键：不猜
+        // 字母与主键盘数字：VK_A..VK_Z / VK_0..VK_9 就是它们自己。
+        _ if (0x41..=0x5A).contains(&vk) => {
+            return Some(
+                [
+                    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p",
+                    "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+                ][(vk - 0x41) as usize],
+            );
+        }
+        _ if (0x30..=0x39).contains(&vk) => {
+            return Some(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"][(vk - 0x30) as usize]);
+        }
+        _ => return None,
+    };
+    Some(name)
+}
+
+/// 按下录入的那一击 → 配置里的那一串。`None` = 这一键不能当主键（含只按修饰键）。
+///
+/// 顺序照 `parse_combo` 认的样子：`ctrl+alt+shift+win+主键`。为什么固定这个次序而不是
+/// 按按下先后——先后次序会因手而生出 `shift+ctrl+f` 与 `ctrl+shift+f` 两种写法，
+/// 屏上、文件里、日志里就得跟着多出一把对不齐的账。
+///
+/// `esc` 一律不当主键：它是"取消录入"那个手势（也是截图覆盖层的退出键），
+/// 让它能被绑上就等于让取消动作自己变成一个可绑项。
+fn combo_from_key(vk: u32, ctrl: bool, alt: bool, shift: bool, win: bool) -> Option<String> {
+    if vk == 0x1B {
+        return None;
+    }
+    // 修饰键自己不算主键：只按 Ctrl 时屏上该继续等，而不是写一个注册不上的 "ctrl"。
+    if matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C) {
+        return None;
+    }
+    let key = key_name(vk)?;
+    let mut parts: Vec<&str> = Vec::with_capacity(5);
+    if ctrl {
+        parts.push("ctrl");
+    }
+    if alt {
+        parts.push("alt");
+    }
+    if shift {
+        parts.push("shift");
+    }
+    if win {
+        // 解析器认的是 `super`/`cmd`/`command`，**不认** `win` —— 写成 "win+f" 会存进一个
+        // 注册不上的串（这条是枚举用例逮到的：`生成的串解析不回来：win+backspace`）。
+        parts.push("super");
+    }
+    // 与 `parse_combo` 同一条闸：裸键当全局热键等于把这个键在整个系统里吞掉。
+    if parts.is_empty() {
+        return None;
+    }
+    parts.push(key);
+    Some(parts.join("+"))
+}
+
+/// 录入那一拍现在屏上该说什么。`None` = 这一击可以走正常流程（不吞键）。
+/// 抽出来是因为"为什么没录上"这句话必须和判据同源，不然它又是一句许愿。
+fn capture_refusal(vk: u32) -> Option<&'static str> {
+    match vk {
+        0x10 | 0x11 | 0x12 | 0x5B | 0x5C => Some("只按修饰键不算一个组合"),
+        0x1B => None, // Esc 是取消，不算拒绝
+        _ if key_name(vk).is_none() => Some("这一键还不支持，改用手输或换一键"),
+        _ => None,
+    }
+}
+
 /// 读 `[hotkey] <key>` 并注册它。成功返回组合，失败返回原因（这一条不占用全局键）。
 /// 日志里带 `key = 原串` 这段 ASCII，验收脚本据此核对"配置写的"和"注册的"是不是同一个。
 fn register_combo(manager: Option<&GlobalHotKeyManager>, key: &str) -> Combo {
@@ -8191,7 +8444,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             }
             LRESULT(0)
         }
-        WM_KEYDOWN => {
+        // 录入态下焦点被抢走 ⇒ 当场取消。屏上写着"请按下组合"而键打到别的应用，
+        // 是这一族里最容易让人以为"程序吃了我一下键"的形状。
+        WM_KILLFOCUS => {
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                if app.capturing.take().is_some() {
+                    app.status = Some("录入已取消：窗口失去了焦点".to_string());
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
+        }
+        // 录入态要接住 Alt 组合：带 Alt 的那一击系统发的是 `WM_SYSKEYDOWN`，
+        // 只接 `WM_KEYDOWN` 的话"ctrl+alt+f1"永远录不出来（而且 Alt 还会顺手叫出菜单）。
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let handled = unsafe {
+                match app_ptr(hwnd) {
+                    Some(app) => app.capture_key(hwnd, w.0),
+                    None => false,
+                }
+            };
+            if handled {
+                return LRESULT(0);
+            }
             // Esc：先关弹层；没有弹层就收进托盘（与现有版本同一口径）。
             if w.0 == 0x1B {
                 if let Some(app) = unsafe { app_ptr(hwnd) } {
@@ -8711,6 +8988,74 @@ mod hotkey_tests {
             "小钮跑出值框了：{b:?}"
         );
         assert!(b.left - vb.left >= 60.0, "小钮不许压住框里那几个字");
+    }
+
+    /// 录入侧生成的每一种串，都必须能被注册侧那台解析器认回来。
+    /// `key_name` 那张表是手抄的，抄错一个名字的症状是"录进去一个注册不上的串"，
+    /// 而那只有在他按下那一键之后才看得见 ⇒ 拿全量枚举钉，不挑几个样本。
+    #[test]
+    fn every_generated_combo_parses_back() {
+        let mut n = 0;
+        let mut bad: Vec<String> = Vec::new();
+        // 修饰位固定按 ctrl：要验的是**主键名字**抄得对不对，16 种修饰组合只会把同一处
+        // 错报 16 遍。修饰那四个写法由 `combo_from_key` 那条次序断言看着。
+        for vk in 0x08..=0xDEu32 {
+            let Some(s) = combo_from_key(vk, true, false, false, false) else {
+                continue;
+            };
+            n += 1;
+            if parse_combo(&s).is_none() {
+                bad.push(s);
+            }
+            // 加上 alt/shift/super 那一圈也要能解析（名字表里 ctrl 与它们拼出来的串不同形）。
+            for mods in 1..16u8 {
+                if let Some(t) = combo_from_key(
+                    vk,
+                    mods & 1 != 0,
+                    mods & 2 != 0,
+                    mods & 4 != 0,
+                    mods & 8 != 0,
+                ) {
+                    if parse_combo(&t).is_none() {
+                        bad.push(t);
+                    }
+                }
+            }
+        }
+        // 一次跑完把**所有**对不上的名字念出来：逐条 assert 只露出第一个，而手抄那张表与
+        // 解析器名字表之间的差异是一批，不是一个。
+        bad.sort();
+        bad.dedup();
+        assert!(bad.is_empty(), "这些生成的串解析不回来：{bad:?}");
+        assert!(
+            n > 60,
+            "只枚举到 {n} 个可录主键，像是 key_name 那张表没被走到"
+        );
+    }
+
+    /// 三种"不该录上"的形态：裸键（会把那个键在整个系统里吞掉）、只按修饰键（还在等）、
+    /// Esc（它是取消录入那个手势）。外加一条正向锚：顺序必须是 ctrl+alt+shift+win+主键。
+    #[test]
+    fn capture_refuses_bare_keys_modifiers_and_esc() {
+        assert!(
+            combo_from_key(0x41, false, false, false, false).is_none(),
+            "裸 A 不许当全局热键"
+        );
+        assert!(
+            combo_from_key(0x11, true, false, false, false).is_none(),
+            "只按 Ctrl 不算一击（哪怕同时按下了 Ctrl 自己）"
+        );
+        assert!(
+            combo_from_key(0x1B, true, true, true, true).is_none(),
+            "Esc 永远不当主键"
+        );
+        assert_eq!(
+            combo_from_key(0x70, true, true, true, false).as_deref(),
+            Some("ctrl+alt+shift+f1"),
+            "次序漂了屏上、文件里、日志里就要多出一把对不齐的账"
+        );
+        assert_eq!(capture_refusal(0x11), Some("只按修饰键不算一个组合"));
+        assert_eq!(capture_refusal(0x1B), None, "Esc 是取消，不是拒绝");
     }
 
     /// 那一格跟着**注册结果**走：三条里有一条真在占全局键，显示就该是"开"。

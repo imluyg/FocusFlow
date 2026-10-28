@@ -211,4 +211,47 @@ $sw5 = [Diagnostics.Stopwatch]::StartNew()
 while (-not $p5.HasExited -and $sw5.Elapsed.TotalMilliseconds -lt 8000) { Start-Sleep -Milliseconds 150 }
 if (-not $p5.HasExited) { Stop-App }
 
+# ---------- round 6: press the combination instead of typing it ----------
+# Clicking the value box opens a capture; the next real chord becomes the stored combo.
+# Two harness facts shape this leg:
+#   * the capture reads GetKeyState, so modifiers only register for input that went through
+#     the system queue -- hence PressChord (keybd_event), not a posted WM_KEYDOWN;
+#   * SetFocus does not take while the window is not foreground, so a real caption click
+#     activates it first. Without that the app would never see the chord at all.
+Set-ConfigLine $app 'hotkey' 'toggle_window' 'ctrl+alt+3'
+Remove-Item $logPath -ErrorAction SilentlyContinue
+
+$p6 = Start-App $Exe $app $WorkDir
+$h6 = Wait-Window $p6.Id
+Check 'the app starts for the capture round' ($h6 -ne [IntPtr]::Zero)
+if ($h6 -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
+
+Click-ViewTab $h6 5
+Start-Sleep -Milliseconds 400
+[FF]::ClickWindow($h6, 123, 324, 1)      # category: hotkeys
+Start-Sleep -Milliseconds 300
+[FF]::ClickScreen($h6, 600, 15, 1)       # real click on the caption -> foreground
+Start-Sleep -Milliseconds 400
+[FF]::ClickWindow($h6, 770, 458, 1)      # the value box -> capture mode
+Start-Sleep -Milliseconds 400
+[FF]::PressChord([byte[]](0x11, 0x12), 0x76)   # ctrl + alt + F7
+Start-Sleep -Milliseconds 1500
+
+$cfg6 = Get-ConfigValue $app 'hotkey' 'toggle_window'
+Check 'the pressed chord became the stored combo' ($cfg6 -eq 'ctrl+alt+f7') "got [$cfg6]"
+$log6 = @(Get-HotLog)
+# Two shapes carry that string: the write line quotes it (`= "ctrl+alt+f7"`, from the capture
+# path) and the registration line leaves it bare (`= ctrl+alt+f7`, from register_combo).
+# So exactly ONE bare-form line may exist -- and it must, or "shown != armed".
+$writeLines = @($log6 | Where-Object { $_ -like '*toggle_window = "ctrl+alt+f7"*' })
+$armLines = @($log6 | Where-Object { $_ -like '*toggle_window = ctrl+alt+f7*' })
+Check 'the capture wrote it through the same log shape' ($writeLines.Count -gt 0)
+Check 'the new chord is what registers now' ($armLines.Count -eq 1) "lines=$($armLines.Count)"
+Check 'the old combo is gone from the file' ((Get-ConfigValue $app 'hotkey' 'snip') -eq 'ctrl+alt+8')
+
+[void][FF]::PostMessage($h6, 0x8009, [IntPtr]::Zero, [IntPtr]::Zero)
+$sw6 = [Diagnostics.Stopwatch]::StartNew()
+while (-not $p6.HasExited -and $sw6.Elapsed.TotalMilliseconds -lt 8000) { Start-Sleep -Milliseconds 150 }
+if (-not $p6.HasExited) { Stop-App }
+
 Show-Summary

@@ -182,6 +182,25 @@ public class FF {
       System.Threading.Thread.Sleep(35);
     }
   }
+  // One chord, in the order a hand does it: modifiers down, main key down/up, modifiers up.
+  // This is the only way to drive the settings-page capture box: it reads GetKeyState, and
+  // that reports modifiers only for input that went through the system queue -- a posted
+  // WM_KEYDOWN from another process leaves every modifier up.
+  public static void PressChord(byte[] modifiers, byte key) {
+    foreach (byte m in modifiers) {
+      keybd_event(m, (byte)MapVirtualKeyW(m, 0), 0, UIntPtr.Zero);
+      System.Threading.Thread.Sleep(30);
+    }
+    keybd_event(key, (byte)MapVirtualKeyW(key, 0), 0, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(30);
+    keybd_event(key, (byte)MapVirtualKeyW(key, 0), 2, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(30);
+    for (int i = modifiers.Length - 1; i >= 0; i--) {
+      byte m = modifiers[i];
+      keybd_event(m, (byte)MapVirtualKeyW(m, 0), 2, UIntPtr.Zero);
+      System.Threading.Thread.Sleep(30);
+    }
+  }
   // The app's single-instance guard is a named mutex, so "is somebody else holding it" is
   // measurable instead of guessed: opening the name returns ERROR_ALREADY_EXISTS (183) when
   // the object exists, and a fresh handle we immediately close when it does not.
