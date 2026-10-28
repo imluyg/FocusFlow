@@ -98,34 +98,66 @@ else
     mark LOCK_AUDIT 1
 fi
 
-# ---- 5) 真浏览器夹具与本机探针（存在即跑，跑了即致命）------------------------------------
-# 表：脚本|成功标记。成功标记留空 ⇒ 用 RESULT::PASS/FAIL 计数判（PASS 必须 >0，防"整段没跑"）。
+# ---- 5) 夹具引用完整性：路径写错要在跑之前叫出来，不许混进"判据没拿到" --------------------
+# 判据在 scripts/check_harness_refs.mjs：把每份夹具里的 import / fetch / 标签引用按
+# "服务器根 = 仓根、相对按夹具所在目录"解析成磁盘路径，逐个查在不在；不带 ./ 的写法
+# 在模块图里是裸标识符，单独点出来。2026-10-29 那轮 14 条腿整片红就是这一族，
+# 而当时唯一的读数是一句不区分成因的"一个判据都没拿到"。
+if command -v node >/dev/null 2>&1; then
+    node scripts/check_harness_refs.mjs > "$OUT/harness-refs.txt" 2>&1
+    mark HARNESS_REFS $?
+    say "HARNESS_REFS_DETAIL=$(grep -a '^HARNESS_REFS ' "$OUT/harness-refs.txt")"
+    grep -a '^MISS \|^BARE ' "$OUT/harness-refs.txt" | tee -a "$LOG"
+else
+    say "HARNESS_REFS=node 不可用：这条查的是夹具纪律，不是环境，不许跳过"
+    mark HARNESS_REFS 1
+fi
+
+# ---- 6) 真浏览器夹具与本机探针（存在即跑，跑了即致命）------------------------------------
+# 表：脚本|成功标记|这一条证明什么。成功标记留空 ⇒ 用 RESULT::PASS/FAIL 计数判（PASS 必须 >0，
+# 防"整段没跑"）。第三字段是 2026-10-29 补的口径：那 14 条里有 12 条断言的是**已删前端的归档
+# 副本**（`.scratch/wv-ref/`），那份代码不会再变 ⇒ 它们红=副本坏/浏览器环境变，**不等于产品坏**；
+# 只有 annot_mode 把 DOM 结果交给 cargo example 与 Rust 链路**对拍**，mem 那条量的是真产物。
+# 绿的时候日志上就写着它属于哪一类，免得"14/14 OK"被读成"产品有 14 条浏览器覆盖"。
 HARNESSES="
-.scratch/run_tools_probe.sh|
-.scratch/run_annot_mode_harness.sh|ANNOT_M1_OK
-.scratch/run_pin_harness.sh|PIN_HARNESS_OK
-.scratch/run_device_rename_harness.sh|DEVICE_RENAME_HARNESS_OK
-.scratch/run_backup_hours_harness.sh|BACKUP_HOURS_HARNESS_OK
-.scratch/run_modal_harness.sh|MODAL_HARNESS_OK
-.scratch/run_chart_axis_harness.sh|CHART_AXIS_HARNESS_OK
-.scratch/run_cleanup_harness.sh|CLEANUP_HARNESS_OK
-.scratch/run_analysis_window_harness.sh|ANALYSIS_WINDOW_HARNESS_OK
-.scratch/run_advanced_settings_harness.sh|ADVANCED_SETTINGS_HARNESS_OK
-.scratch/run_export_period_harness.sh|EXPORT_PERIOD_HARNESS_OK
-.scratch/run_mem_harness.sh|MEM_SNAPSHOT_OK
-.scratch/run_floating_notice_harness.sh|FLOATING_NOTICE_HARNESS_OK
-.scratch/run_floating_drag_harness.sh|FLOATING_DRAG_HARNESS_OK
+.scratch/run_tools_probe.sh||镜像(归档前端自证)
+.scratch/run_annot_mode_harness.sh|ANNOT_M1_OK|对拍(JS↔cargo example)
+.scratch/run_pin_harness.sh|PIN_HARNESS_OK|镜像(归档前端自证)
+.scratch/run_device_rename_harness.sh|DEVICE_RENAME_HARNESS_OK|镜像(归档前端自证)
+.scratch/run_backup_hours_harness.sh|BACKUP_HOURS_HARNESS_OK|镜像(归档前端自证)
+.scratch/run_modal_harness.sh|MODAL_HARNESS_OK|镜像(归档前端自证)
+.scratch/run_chart_axis_harness.sh|CHART_AXIS_HARNESS_OK|镜像(归档前端自证)
+.scratch/run_cleanup_harness.sh|CLEANUP_HARNESS_OK|镜像(归档前端自证)
+.scratch/run_analysis_window_harness.sh|ANALYSIS_WINDOW_HARNESS_OK|镜像(归档前端自证)
+.scratch/run_advanced_settings_harness.sh|ADVANCED_SETTINGS_HARNESS_OK|镜像(归档前端自证)
+.scratch/run_export_period_harness.sh|EXPORT_PERIOD_HARNESS_OK|镜像(归档前端自证)
+.scratch/run_mem_harness.sh|MEM_SNAPSHOT_OK|本机(量真产物)
+.scratch/run_floating_notice_harness.sh|FLOATING_NOTICE_HARNESS_OK|镜像(归档前端自证)
+.scratch/run_floating_drag_harness.sh|FLOATING_DRAG_HARNESS_OK|镜像(归档前端自证)
 "
 harness_ran=0
+harness_oracle_ok=0
+harness_oracle_all=0
+harness_local_ok=0
+harness_local_all=0
+harness_mirror_ok=0
+harness_mirror_all=0
 for entry in $HARNESSES; do
     script=${entry%%|*}
-    token=${entry##*|}
+    rest=${entry#*|}
+    token=${rest%%|*}
+    kind=${rest##*|}
     [ -f "$script" ] || { say "HARNESS_SKIP=$script"; continue; }
     name=$(basename "$script" .sh)
     log="$OUT/harness-$name.txt"
     sh "$script" > "$log" 2>&1
     code=$?
     harness_ran=$((harness_ran + 1))
+    case $kind in
+        对拍*) harness_oracle_all=$((harness_oracle_all + 1)) ;;
+        本机*) harness_local_all=$((harness_local_all + 1)) ;;
+        *)     harness_mirror_all=$((harness_mirror_all + 1)) ;;
+    esac
     if [ -n "$token" ]; then
         # 判据是"日志最后一行恰好等于成功标记"，不是"标记出现了几次"：
         # runner 自己的 ABORT 文案里就带着这个 token（pin 那份日志里出现了 4 次），
@@ -133,7 +165,7 @@ for entry in $HARNESSES; do
         last=$(tail -n 1 "$log" | tr -d '\r\n')
         verdict=1
         [ "$code" = 0 ] && [ "$last" = "$token" ] && verdict=0
-        say "HARNESS_$name=$([ "$verdict" = 0 ] && echo OK || echo RED)"
+        say "HARNESS_$name=$([ "$verdict" = 0 ] && echo OK || echo RED) [$kind]"
         [ "$verdict" != 0 ] && [ -z "$FIRST_FAILED" ] && FIRST_FAILED="HARNESS_$name"
         say "HARNESS_${name}_DETAIL=exit=$code last=[$last] 需要[$token]"
         mark "HARNESS_$name" "$verdict"
@@ -141,15 +173,24 @@ for entry in $HARNESSES; do
         pass=$(grep -ac 'RESULT::PASS' "$log")
         fail=$(grep -ac 'RESULT::FAIL' "$log")
         verdict=$([ "$code" = 0 ] && [ "$fail" = 0 ] && [ "$pass" -gt 0 ] && echo 0 || echo 1)
-        say "HARNESS_$name=$([ "$verdict" = 0 ] && echo OK || echo RED)"
+        say "HARNESS_$name=$([ "$verdict" = 0 ] && echo OK || echo RED) [$kind]"
         [ "$verdict" != 0 ] && [ -z "$FIRST_FAILED" ] && FIRST_FAILED="HARNESS_$name"
         say "HARNESS_${name}_DETAIL=exit=$code pass=$pass fail=$fail(要求 exit=0 fail=0 pass>0)"
         mark "HARNESS_$name" "$verdict"
     fi
+    if [ "$verdict" = 0 ]; then
+        case $kind in
+            对拍*) harness_oracle_ok=$((harness_oracle_ok + 1)) ;;
+            本机*) harness_local_ok=$((harness_local_ok + 1)) ;;
+            *)     harness_mirror_ok=$((harness_mirror_ok + 1)) ;;
+        esac
+    fi
 done
 say "HARNESSES_RAN=$harness_ran"
+# 分类合计：产品口径只有"对拍 + 本机"这两类，其余是归档副本的规格镜像。
+say "HARNESS_ORACLE_OK=$harness_oracle_ok/$harness_oracle_all (对拍)  HARNESS_LOCAL_OK=$harness_local_ok/$harness_local_all (本机)  HARNESS_MIRROR_OK=$harness_mirror_ok/$harness_mirror_all (镜像,不覆盖产品)"
 
-# ---- 6) tests/ui 转正后的浏览器套件（W4-3）------------------------------------------------
+# ---- 7) tests/ui 转正后的浏览器套件（W4-3）------------------------------------------------
 if [ -f tests/ui/run_all.mjs ]; then
     node tests/ui/run_all.mjs > "$OUT/ui.txt" 2>&1
     mark UI $?
@@ -158,7 +199,7 @@ else
     say "UI_STEP=SKIP(tests/ui/run_all.mjs 不存在)"
 fi
 
-# ---- 7) 临时目录泄漏：跑完必须回到跑前状态 -------------------------------------------------
+# ---- 8) 临时目录泄漏：跑完必须回到跑前状态 -------------------------------------------------
 temp_snap > "$OUT/temp-after.txt"
 say "TEMP_AFTER_DIRS=$(temp_total)"
 if diff "$OUT/temp-before.txt" "$OUT/temp-after.txt" > "$OUT/temp-diff.txt" 2>&1; then
