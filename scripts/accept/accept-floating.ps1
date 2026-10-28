@@ -49,7 +49,7 @@ Check 'WM_NCHITTEST answers HTCAPTION (2)' ([FF]::HitTest([uint32]$p.Id, 'FocusF
 # A drag ends with WM_EXITSIZEMOVE; the pill then writes pos_x/pos_y back to config.
 #
 # The old shape waited 200 ms before posting the drag-end message. The pill repaints on a
-# 1000 ms timer (floating.rs TICK_MS) and that tick positions the card from ANCHOR_TOP, which
+# timer (floating.rs TICK_MS) and that tick positions the card from ANCHOR_TOP, which
 # only persist_position() refreshes -- so whether a tick happened to land inside those 200 ms
 # decided the reading (measured: one session 11/0, the next session 2 reds on the same bytes).
 # These two legs wait THROUGH a tick on purpose instead of leaving it to luck: a move that has

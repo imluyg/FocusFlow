@@ -63,8 +63,15 @@ static ANCHOR_TOP: AtomicI32 = AtomicI32::new(60);
 /// 用户看见的就是"卡片拖到一半自己跳回原高度"。
 static APPLIED_TOP: AtomicI32 = AtomicI32::new(i32::MIN);
 
-/// 重画节拍。"瞟一眼"用的数字，1 秒够；主窗口那边是 2 秒一拍读库。
-const TICK_MS: u32 = 1000;
+/// 重画节拍。以前写 1 秒的理由是"瞟一眼用的数字，1 秒够"，但那是在今日那一格还跟着
+/// 快照线程每 2 秒读库的时候量的：现在那一格当场问原子计数，这个定时器就是**唯一**的
+/// 延迟来源，于是它成了全部（0–1 秒，平均半秒）。收到 500ms 的代价是每半秒一次
+/// 小位图提交（约 200×48），换来的是"我打了字，卡片立刻动"。
+///
+/// ⚠ 这里**没有**"内容没变就跳过提交"那道闸：`repaint` 的尾段还要按当前尺寸重锚窗口
+/// （拔屏/换缩放后把卡片找回来的那 2 像素门槛），跳过一拍就是跳过那次纠正。
+/// 省下来的只是那点提交，赔进去的是"卡片跑位"那一族最难复现的缺陷。
+const TICK_MS: u32 = 500;
 const TIMER_ID: usize = 0xF0F1;
 /// 让卡片线程立刻重画一次（改了配置之后用）。
 ///
@@ -227,9 +234,13 @@ fn current_content() -> fr::PillContent {
     let cfg = focusflow_core::config::instance();
     let metric = fr::metric_from(&cfg.get("gui", "floating_metric"));
     let live = live_now();
+    // 今日这一格直接问采集侧那个原子计数：`LIVE` 里那份是快照线程每 2 秒推过来的缓存，
+    // 而卡片是他**当场盯着看**的东西 —— 走缓存等于在 2 秒之外再叠一层延迟。
+    // 采集没起来时（`None`）退回那份缓存，与主界面同一个口径，不另起一把尺子。
+    let today = crate::collect::today_total().unwrap_or(live.today);
     fr::build_content(
         metric,
-        live.today,
+        today,
         live.duration_sec,
         crate::collect::is_started(),
         crate::collect::is_paused(),
