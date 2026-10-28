@@ -84,10 +84,12 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     s(
         "gui",
         &[
-            // 主界面快照的刷新节奏（秒）。读点在 `desktop-native/src/main.rs` 的 snapshot
-            // 线程：每一拍重新读一次 ⇒ 设置页那句"改完立即生效"这次是真的。这一节里以前
-            // 挂着四行都写同一句话而原生端一个都不读，那几行已按现量收掉（见 DEPRECATED_CONFIG）。
-            ("active_refresh_interval", "2"),
+            // 主界面快照的**短档**基准（秒）。读点在 `desktop-native/src/main.rs` 的 snapshot
+            // 线程：每一拍重新读一次 ⇒ 设置页那句"改完立即生效"这次是真的。跨一整年及以上
+            // 的两档（"1 年"与"总计"）在它上乘 3 —— 一拍查询面实测今日 7.1ms、总计 50.8ms。
+            // 这一节里以前挂着四行都写同一句话而原生端一个都不读，那几行已按现量收掉
+            // （见 DEPRECATED_CONFIG）。
+            ("active_refresh_interval", "1"),
             ("theme", "light"),
             // ⚠ 这一行屏上点得到，但原生端没有行为读点（旧 WebView 端那半截接线随前端一起
             // 删了）：接上它等于"启动后主窗口不出现、只在托盘"，会改到验收套件的等窗口前提，
@@ -1687,7 +1689,7 @@ work_minutes = 45
         // 同前缀的活键不能被顺手带走：active_refresh_interval 是快照线程真的在读的那一行（设置页
         // 明面上也有它），work_minutes 是番茄钟真正生效的时长
         assert_eq!(cfg.get_int("pomodoro", "work_minutes", 0), 45);
-        assert_eq!(cfg.get_int("gui", "active_refresh_interval", 0), 2);
+        assert_eq!(cfg.get_int("gui", "active_refresh_interval", 0), 1);
 
         // 而且不能只清内存：load() 结尾无条件 save()，文件里也不该再留着它们
         let on_disk = std::fs::read_to_string(&path).unwrap();

@@ -780,10 +780,10 @@ fn watching_now(hwnd: HWND) -> bool {
     }
 }
 
-/// 快照线程每一拍睡多少秒。取 `[gui] active_refresh_interval`（设置页那一行的说法是
-/// "改完立即生效"，所以每一拍重新读一次，不在启动时读死）。
+/// 短档基准那一拍睡多少**秒**，取 `[gui] active_refresh_interval`（设置页那一行的说法是
+/// "改完立即生效"，所以每一拍重新读一次，不在启动时读死）。倍率见 `snapshot_tick_ms`。
 ///
-/// 笔误不许把界面打死：0、负数、超过 600 秒（有人写 999999）一律退回默认 2 秒。
+/// 笔误不许把界面打死：0、负数、超过 600 秒（有人写 999999）一律退回默认 1 秒。
 /// 放任大数的症状是"数字再也不动"，比按默认值刷新更糟，而且看起来像程序坏了而不是配置坏了。
 fn snapshot_sleep_secs(raw: i64) -> u64 {
     if (1..=600).contains(&raw) {
@@ -793,8 +793,25 @@ fn snapshot_sleep_secs(raw: i64) -> u64 {
     }
 }
 
-/// 原生端历来的一拍。
-const DEFAULT_SNAPSHOT_SECS: u64 = 2;
+/// 快照线程这一拍实际睡多少**毫秒**：短档＝基准，长档＝基准 × `LONG_PERIOD_TICKS`。
+///
+/// 为什么要分档：一拍 `load()` 的查询面由"选了哪个周期"决定，实测今日 7.1ms、总计 50.8ms
+/// （`crates/core/tests/perf_probe.rs`，"他机器量级"那份夹具）。一个数顾不住两头 —— 给总计
+/// 1 秒是为一格不会自己变的数常驻 5% CPU；给今日 3 秒又成了"直接看的那个反而最慢"。
+///
+/// 周期按 `PERIODS` 的取值口径算（`-1` 今日 / `7` / `15` / `30` / `365` 一年 / `0` 总计），
+/// 不是界面上那六颗胶囊的顺序。
+fn snapshot_tick_ms(raw: i64, period: i64) -> u64 {
+    let long = period == 0 || period >= 365;
+    snapshot_sleep_secs(raw) * if long { LONG_PERIOD_TICKS } else { 1 } * 1000
+}
+
+/// 长档相对短档的倍率。今日 7.1ms/拍 ⇒ 1 秒基准占 0.7%；总计 50.8ms/拍 ⇒ 3 秒占 1.7%，
+/// 而按 1 秒要 5%。
+const LONG_PERIOD_TICKS: u64 = 3;
+
+/// 原生端短档基准的兜底值（`[gui] active_refresh_interval` 写错时用这个）。
+const DEFAULT_SNAPSHOT_SECS: u64 = 1;
 
 impl App {
     fn new(hwnd: HWND, mica: bool) -> windows::core::Result<Self> {
@@ -961,11 +978,15 @@ impl App {
                         let hwnd = HWND(hwnd_val as *mut core::ffi::c_void);
                         // 一拍睡多久，每一拍重新问一次配置（`[gui] active_refresh_interval`）：
                         // 设置页那一行写着"改完立即生效"，读死在启动时就成了一句许愿。
-                        let secs = snapshot_sleep_secs(focusflow_core::config::instance().get_int(
-                            "gui",
-                            "active_refresh_interval",
-                            DEFAULT_SNAPSHOT_SECS as i64,
-                        ));
+                        // 基准之上再按周期分档 —— 选了"总计"那一格，就不该和"今日"一样勤。
+                        let tick_ms = snapshot_tick_ms(
+                            focusflow_core::config::instance().get_int(
+                                "gui",
+                                "active_refresh_interval",
+                                DEFAULT_SNAPSHOT_SECS as i64,
+                            ),
+                            p.load(std::sync::atomic::Ordering::Relaxed),
+                        );
                         if !watching_now(hwnd) {
                             // 没人看 ⇒ 整批聚合查询一拍都不跑，只按小片睡等有人回来。
                             if !idle {
@@ -985,7 +1006,7 @@ impl App {
                             tracing_note("快照线程 idle=off：有读者了，当场查一次并恢复按拍刷新");
                             idle = false;
                         } else {
-                            std::thread::sleep(Duration::from_secs(secs));
+                            std::thread::sleep(Duration::from_millis(tick_ms));
                             if !watching_now(hwnd) {
                                 // 睡这一拍期间窗口又被藏起来了：整批查询省掉。
                                 continue;
@@ -8935,10 +8956,43 @@ mod snapshot_rate_tests {
         );
     }
 
-    /// 接线腿：那一拍真的去读这个键。只在纯函数里算而循环不读 ⇒ 设置页那句"改完立即生效"
-    /// 依旧是许愿，所以钉的是读点存在，而不是函数写得对不对。
+    /// 分档：短档（今日 / 7 / 15 / 30 天）按基准，长档（1 年 / 总计）按基准 × 3。
+    ///
+    /// ⚠ 这一条钉的是 `PERIODS` **现有六格**各自落在哪一档；新增一格会走短档那一支而这条
+    /// 不会红 —— 所以同一条里另钉了格子数，多一颗胶囊时必须回来点一次档。
     #[test]
-    fn the_snapshot_loop_reads_the_interval() {
+    fn the_long_periods_tick_three_times_slower() {
+        assert_eq!(
+            PERIODS.len(),
+            6,
+            "周期胶囊多了一格：这条用例里的分档期望要跟着补一行"
+        );
+        for (period, label) in PERIODS.iter() {
+            let long = *period == 0 || *period >= 365;
+            let want = if long { 3_000 } else { 1_000 };
+            assert_eq!(
+                snapshot_tick_ms(1, *period),
+                want,
+                "「{label}」这一档（period={period}）的节拍归错了"
+            );
+        }
+        // 基准仍然是用户写的那一行，倍率是乘在它上面而不是把它吃掉
+        assert_eq!(snapshot_tick_ms(2, -1), 2_000);
+        assert_eq!(snapshot_tick_ms(2, 0), 6_000);
+        // 笔误那一支：基准退回默认，倍率照乘（"写错一个数"不该变成"再也不刷新"）
+        assert_eq!(
+            snapshot_tick_ms(0, 0),
+            DEFAULT_SNAPSHOT_SECS * LONG_PERIOD_TICKS * 1000,
+            "写 0 是笔误，退回默认基准再按长档乘"
+        );
+        assert_eq!(snapshot_tick_ms(-3, -1), DEFAULT_SNAPSHOT_SECS * 1000);
+    }
+
+    /// 接线腿：那一拍真的睡在**分档之后**的毫秒上。钉的是调用形态而不是函数名 ——
+    /// 只数 `snapshot_sleep_secs(` 出现几次的话，"函数写了、循环仍旧按老的秒数睡"这种
+    /// 接法照样能蒙过去。
+    #[test]
+    fn the_snapshot_loop_sleeps_on_the_tiered_tick() {
         let src = include_str!("main.rs");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
@@ -8948,11 +9002,28 @@ mod snapshot_rate_tests {
             1,
             "生产代码里读这一键的位置应当只有快照线程那一处"
         );
-        let call = ["snapshot_sleep_secs", "("].concat();
+        let tick = ["snapshot_tick_ms", "("].concat();
         assert_eq!(
-            prod.matches(call.as_str()).count(),
+            prod.matches(tick.as_str()).count(),
             2,
             "一处定义 + 循环里一处调用，数量变了说明接线动过"
+        );
+        let sleeps_on = ["Duration::from_millis(", "tick_ms", ")"].concat();
+        assert_eq!(
+            prod.matches(sleeps_on.as_str()).count(),
+            1,
+            "那一拍必须睡在分档出来的毫秒上"
+        );
+        let stale = ["Duration::from_secs(", "secs", ")"].concat();
+        assert!(
+            !prod.contains(stale.as_str()),
+            "循环里还留着按秒睡的那一句，说明分档没真的接上"
+        );
+        let base = ["snapshot_sleep_secs", "("].concat();
+        assert_eq!(
+            prod.matches(base.as_str()).count(),
+            2,
+            "一处定义 + 分档函数里一处调用（循环不再直接用它）"
         );
     }
 
