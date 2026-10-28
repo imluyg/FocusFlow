@@ -242,6 +242,32 @@ fn perf_probe_full_pass() {
         let _ = db::get_hourly_stats(None);
     });
 
+    // 快照线程那一拍**真正跑的东西**（`desktop-native/src/data.rs::load` 的查询面）。
+    // 这一条决定两件事："可见时能不能从 2 秒收到 1 秒甚至更快"，以及
+    // "看不见时停不停得有意义" —— 两个都要看数，不猜。
+    bench_avg("一拍 load() 的查询面（今日）", 5, || {
+        let days: Option<i64> = Some(1);
+        let _ = db::stats_totals(days, None);
+        let _ = db::get_alltime_summary();
+        let _ = db::get_daily_counts(30, None);
+        let _ = queries::get_hourly_totals(1, None);
+        let _ = db::get_weekday_stats(1);
+        let _ = db::get_device_stats(days, None);
+        let _ = db::get_app_stats(days, None);
+        let _ = db::get_daily_counts(370, None);
+    });
+    bench_avg("一拍 load() 的查询面（总计）", 5, || {
+        let days: Option<i64> = None;
+        let _ = db::stats_totals(days, None);
+        let _ = db::get_alltime_summary();
+        let _ = db::get_daily_counts(30, None);
+        let _ = queries::get_hourly_totals(30, None);
+        let _ = db::get_weekday_stats(30);
+        let _ = db::get_device_stats(days, None);
+        let _ = db::get_app_stats(days, None);
+        let _ = db::get_daily_counts(370, None);
+    });
+
     println!("\n== 退出成本（backup_on_exit 那条路） ==");
     bench(
         "backup_database(5) 第一次（复制+校验+轮转）",

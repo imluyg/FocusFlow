@@ -409,8 +409,11 @@ pub fn load(period: i64) -> Snapshot {
     apps.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
     apps.truncate(100);
 
-    // 每日目标与连续打卡：要扫近 370 天按日序列。正式版按 60 秒节流，
-    // 原型跟着 2 秒刷新一起算（探针库小，先不拆）。
+    // 每日目标与连续打卡：要扫近 370 天按日序列。
+    // ⚠ 这里原来写着"正式版按 60 秒节流，原型跟着 2 秒刷新一起算（探针库小，先不拆）"——
+    // 那半句推测已被现量推翻：在"他机器量级"的库上这一条查询是 **1.3ms**（`perf_probe`，
+    // 两份年度库各 365 天、150 键/天），不是成本中心，所以不节流。真正贵的是
+    // "总计"那一档的整批查询（一拍 50.8ms），那条由快照线程的可见性闸去管。
     let goal_cfg = focusflow_core::config::instance().get_int("goal", "daily_keys", 20000);
     let goal_rows = queries::get_daily_counts(GOAL_LOOKBACK_DAYS, None);
     let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();

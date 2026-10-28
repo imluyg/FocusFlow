@@ -754,6 +754,32 @@ fn hotkeys_on_after_boot(registered: [&Option<HotKey>; 3]) -> bool {
     registered.iter().any(|hk| hk.is_some())
 }
 
+/// 有没有人在看这些数。读者只有三个：主窗口（可见且没最小化）、桌面那张卡片，
+/// 以及托盘 tooltip 上那句"今日 N 次"——它只在鼠标悬停那一刻被读到，所以由
+/// `TrayIconEvent::Enter` 现问，不需要轮询养着。
+///
+/// 三者都不成立 ⇒ 快照线程那一整批聚合查询一拍都不该跑。以前这里**没有任何**可见性
+/// 判断（`IsWindowVisible`/`IsIconic` 全文零命中）：程序收进托盘、卡片也关着，
+/// 仍然每 2 秒查一轮。实测那一拍在"他机器量级"的库上是今日 7.1ms、总计 50.8ms。
+fn watching(main_visible: bool, main_iconic: bool, pill_visible: bool) -> bool {
+    (main_visible && !main_iconic) || pill_visible
+}
+
+/// 没人看时用来等"有人回来"的那一小片：250ms 是"点开窗口到第一帧新数"的最坏等待，
+/// 空转时的代价只是一次 `IsWindowVisible`。
+const IDLE_WAKE_MS: u64 = 250;
+
+/// 现问一次"有没有人在看"。判据在 `watching`（那条有单元测试），这里只取三个读数。
+fn watching_now(hwnd: HWND) -> bool {
+    unsafe {
+        watching(
+            IsWindowVisible(hwnd).as_bool(),
+            IsIconic(hwnd).as_bool(),
+            floating::is_visible(),
+        )
+    }
+}
+
 /// 快照线程每一拍睡多少秒。取 `[gui] active_refresh_interval`（设置页那一行的说法是
 /// "改完立即生效"，所以每一拍重新读一次，不在启动时读死）。
 ///
@@ -927,27 +953,56 @@ impl App {
             let hwnd_val = hwnd.0 as isize;
             std::thread::Builder::new()
                 .name("snapshot".into())
-                .spawn(move || loop {
-                    // 一拍睡多久，每一拍重新问一次配置（`[gui] active_refresh_interval`）：
-                    // 设置页那一行写着"改完立即生效"，读死在启动时就成了一句许愿。
-                    let secs = snapshot_sleep_secs(focusflow_core::config::instance().get_int(
-                        "gui",
-                        "active_refresh_interval",
-                        DEFAULT_SNAPSHOT_SECS as i64,
-                    ));
-                    std::thread::sleep(Duration::from_secs(secs));
-                    let next = data::load(p.load(std::sync::atomic::Ordering::Relaxed));
-                    // 悬浮窗读的是这几格，先推过去再让主界面拿新快照。
-                    publish_floating(&next);
-                    // 推完要**催**一下：主界面这一拍是靠下面那条 `WM_REFRESH` 立刻重画的，
-                    // 而卡片只有一个每秒自走的 `SetTimer` —— 不催就是"直接看的那个反而最慢"，
-                    // 数字平均要多等半秒到一秒（`set_visible` 当年为同样的理由投这条消息）。
-                    floating::refresh();
-                    if let Ok(mut g) = s.lock() {
-                        *g = next;
+                .spawn(move || {
+                    let mut idle = false;
+                    loop {
+                        // `HWND` 不是 `Send`（里面是裸指针），所以线程只带 `hwnd_val`，
+                        // 每一拍就地包一个句柄出来问可见性。
+                        let hwnd = HWND(hwnd_val as *mut core::ffi::c_void);
+                        // 一拍睡多久，每一拍重新问一次配置（`[gui] active_refresh_interval`）：
+                        // 设置页那一行写着"改完立即生效"，读死在启动时就成了一句许愿。
+                        let secs = snapshot_sleep_secs(focusflow_core::config::instance().get_int(
+                            "gui",
+                            "active_refresh_interval",
+                            DEFAULT_SNAPSHOT_SECS as i64,
+                        ));
+                        if !watching_now(hwnd) {
+                            // 没人看 ⇒ 整批聚合查询一拍都不跑，只按小片睡等有人回来。
+                            if !idle {
+                                // 只在**跨过边界**那一次出声：这条既是给他看的"程序没在空转"，
+                                // 也是验收腿唯一的观察量（每拍都写就成了刷屏）。
+                                tracing_note(
+                                    "快照线程 idle=on：没有读者（窗口隐藏/最小化且卡片未显示），暂停查询",
+                                );
+                            }
+                            idle = true;
+                            std::thread::sleep(Duration::from_millis(IDLE_WAKE_MS));
+                            continue;
+                        }
+                        if idle {
+                            // 刚有人看：当场查一次。让他先看到上一次留下的旧数，正是这次
+                            // 要修的那个症状换了个方向回来。
+                            tracing_note("快照线程 idle=off：有读者了，当场查一次并恢复按拍刷新");
+                            idle = false;
+                        } else {
+                            std::thread::sleep(Duration::from_secs(secs));
+                            if !watching_now(hwnd) {
+                                // 睡这一拍期间窗口又被藏起来了：整批查询省掉。
+                                continue;
+                            }
+                        }
+                        let next = data::load(p.load(std::sync::atomic::Ordering::Relaxed));
+                        // 悬浮窗读的是这几格，先推过去再让主界面拿新快照。
+                        publish_floating(&next);
+                        // 推完要**催**一下：主界面这一拍是靠下面那条 `WM_REFRESH` 立刻重画的，
+                        // 而卡片只有一个每秒自走的 `SetTimer` —— 不催就是"直接看的那个反而最慢"，
+                        // 数字平均要多等半秒到一秒（`set_visible` 当年为同样的理由投这条消息）。
+                        floating::refresh();
+                        if let Ok(mut g) = s.lock() {
+                            *g = next;
+                        }
+                        let _ = PostMessageW(Some(hwnd), WM_REFRESH, WPARAM(0), LPARAM(0));
                     }
-                    let target = HWND(hwnd_val as *mut core::ffi::c_void);
-                    let _ = PostMessageW(Some(target), WM_REFRESH, WPARAM(0), LPARAM(0));
                 })
                 .ok();
 
@@ -8094,6 +8149,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             }
             // 托盘点击 / 菜单 / 热键只在事件通道里，靠这 100ms 一拍取出来。
             while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+                // 悬停那一刻现问一次"今日"。隐藏期间快照线程不查（见 `watching`），
+                // tooltip 会停在最后一次显示时的数；而他读到那句话的时机正是鼠标压上去
+                // 这一瞬 ⇒ 用采集侧那个原子计数当场补一次（一条原子读，不碰 SQL）。
+                // 采集没开着就沿用最后一次快照的值——那时今日这一格本来也不会再动。
+                if matches!(ev, TrayIconEvent::Enter { .. }) {
+                    if let Some(app) = unsafe { app_ptr(hwnd) } {
+                        let today = match collect::today_total() {
+                            Some(n) => n,
+                            None => app.snap.lock().map(|s| s.today).unwrap_or(0),
+                        };
+                        if let Some(t) = app.tray.as_ref() {
+                            let _ = t.set_tooltip(Some(tray_tooltip(today)));
+                        }
+                    }
+                }
                 if let TrayIconEvent::Click {
                     button: tray_icon::MouseButton::Left,
                     button_state: tray_icon::MouseButtonState::Up,
@@ -8883,6 +8953,36 @@ mod snapshot_rate_tests {
             prod.matches(call.as_str()).count(),
             2,
             "一处定义 + 循环里一处调用，数量变了说明接线动过"
+        );
+    }
+
+    /// 三个读者都不在 ⇒ 那一拍不查。这条判据写歪的两种症状方向相反、都不好抓：
+    /// 多认一个"看得见"⇒ 收进托盘还在空转（省不下任何东西）；少认一个 ⇒ 卡片开着却不更新
+    /// （数字冻住，比慢更糟）。所以五种组合逐个钉。
+    #[test]
+    fn polling_stops_only_when_nobody_is_watching() {
+        assert!(watching(true, false, false), "主窗口开着就要查");
+        assert!(watching(true, false, true), "窗口与卡片都开着");
+        assert!(
+            watching(false, false, true),
+            "主窗口收进托盘、卡片还开着 ⇒ 仍然要查（卡片是直接看的那个）"
+        );
+        assert!(!watching(true, true, false), "最小化＝没人看");
+        assert!(!watching(false, false, false), "隐藏且卡片关着＝一拍都不查");
+    }
+
+    /// 接线腿：那把判据真的被快照线程用上了，而且**睡完还要再问一次**（睡这一拍的期间
+    /// 窗口可能又被藏起来，那就该把这批查询省掉）。只在纯函数里算而循环不读 ⇒ 等于没做。
+    #[test]
+    fn the_snapshot_loop_asks_whether_anyone_is_watching() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        let call = ["watching_now", "("].concat();
+        assert_eq!(
+            prod.matches(call.as_str()).count(),
+            3,
+            "一处定义 + 循环里两处（睡前、睡完）——数量变了说明接线动过"
         );
     }
 
