@@ -204,10 +204,28 @@ mod tests {
         let _ = db::maintenance::cleanup_old_data(11);
         assert_eq!(days_with_data(), 2, "保留 11 天（含今天）刚好覆盖 10 天前");
 
+        let cleaned = db::maintenance::cleanup_old_data(10);
+        assert!(cleaned.deleted > 0, "保留 10 天应清掉 10 天前那天");
+        // 读数里那个"删到哪天"必须由这一轮的 DELETE 交出来，而不是拼句子的地方自己再算一次：
+        // 边界就是今天往前数 9 天（保留 10 天含今天）。写成断言是为了让"第二把尺子"红给人看。
+        assert!(cleaned.cutoff_key != 0, "报告里要带这一轮真正用的日期边界");
         assert!(
-            db::maintenance::cleanup_old_data(10).deleted > 0,
-            "保留 10 天应清掉 10 天前那天"
+            !cleaned.deleted_years.is_empty(),
+            "删了东西就得说清动了哪几个年度库: {:?}",
+            cleaned.deleted_years
         );
+        let boundary = chrono::Local::now()
+            .date_naive()
+            .checked_sub_days(chrono::Days::new(9))
+            .expect("往前 9 天一定解得开")
+            .format("%Y-%m-%d")
+            .to_string();
+        let said = db::maintenance::cleanup_line(10, &cleaned);
+        assert!(
+            said.contains(&boundary),
+            "那句要念出边界 {boundary}: {said}"
+        );
+        assert!(said.contains("不等于活动次数"), "单位必须点破: {said}");
         assert_eq!(days_with_data(), 1, "含今天共 10 天不含第 11 天");
         assert_eq!(
             db::get_daily_counts(11, None)

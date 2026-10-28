@@ -751,6 +751,17 @@ fn combo_key_mapping(old: &str) -> Option<String> {
 pub struct MaintenanceReport {
     /// 真正删掉的行数（提交成功的年份才计入）
     pub deleted: i64,
+    /// 这一轮**真的删掉了东西**的年份（提交成功且删了 >0 行）。
+    ///
+    /// 读数要说"涉及哪几个年度库"：`deleted` 的单位是"每天每键一行"，只报一个数
+    /// 让人判断不了后果（实测 2026-10-26：删掉 1,166,643 次活动只说"5,782 条"）。
+    pub deleted_years: Vec<i32>,
+    /// 这一轮 DELETE 实际用的日期边界（`day_key` 序号；0 = 这轮没算过）。
+    ///
+    /// 为什么要由删的那一处交出来、而不是读数自己按"今天减 N 天"再算一次：那是第二把尺子，
+    /// 跨月/跨年时两句会说的是不同的那一天（`--cleanup` 天天挂在计划任务上，"删到哪天"
+    /// 正是它每天要回答的问题）。
+    pub cutoff_key: i64,
     /// 没能处理完的年份：空 = 全程顺利
     pub failed_years: Vec<i32>,
     /// 连"有哪些年份"都没问出来（数据目录读不出来）。
@@ -821,6 +832,8 @@ pub fn cleanup_old_data(keep_days: i64) -> CleanupReport {
         return report;
     }
     let cutoff_dk = queries::day_key_of_date(Local::now().date_naive()) - (keep_days - 1);
+    // 读数要说"删到哪天"，那一天就是这里算出来的这一枚序号：把它交给报告，别让读的那处再算一遍
+    report.cutoff_key = cutoff_dk;
     // 快照只在「确实有过期行要删」的那一年、且在本轮任何 DELETE 之前做一次：
     // backup_database 本来就覆盖全部年度库与附属库，所以这一次快照足以兜住
     // 之后所有年份的删除。反过来，先抢在循环外无条件备份会让「其实没什么可删」
@@ -922,6 +935,7 @@ pub fn cleanup_old_data(keep_days: i64) -> CleanupReport {
             }
             tracing::info!("已清理 {year} 年 {cutoff_dk} 前的数据");
             report.deleted += year_deleted;
+            report.deleted_years.push(year);
         }
     }
     if report.deleted > 0 {
@@ -1070,6 +1084,15 @@ pub fn parse_keep_days(raw: &str) -> Result<i64, String> {
 ///
 /// 与 `vacuum_line` 同一族做法：话在 core 说一遍，两个入口各自只决定"怎么说、什么颜色"。
 pub fn cleanup_line(days: i64, report: &MaintenanceReport) -> String {
+    // 边界那一天由删的那一处交出来（report.cutoff_key），这里只负责说出来；
+    // 没有（比如压根没枚举到年份）就退回"按保留天数描述"，不编一个日期。
+    let cutoff = if report.cutoff_key == 0 {
+        format!("{days} 天前")
+    } else {
+        queries::day_key_to_date(report.cutoff_key)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| format!("day_key {}", report.cutoff_key))
+    };
     if report.incomplete() {
         // 「未完成」不是一个整体结论：清理是**逐年各自 COMMIT** 的，所以"有些年份已经删掉、
         // 只有失败那些年被回滚"是一个真存在的结局。只说"未完成"会被读成"什么都没动"，
@@ -1077,19 +1100,35 @@ pub fn cleanup_line(days: i64, report: &MaintenanceReport) -> String {
         // 两头都要说，且已删的那一半要说清是"已提交"，不许与回滚那些年混成一句。
         let done = if report.deleted > 0 {
             format!(
-                "已经删掉 {} 条（那几年已提交，不会再来第二次）；",
+                "已经删掉 {} 行（那几年已提交，不会再来第二次）；",
                 crate::format::fmt_thousands(report.deleted)
             )
         } else {
             "一个字节都没删；".to_string()
         };
         format!(
-            "清理未完成：{done}{}（已回滚的年份未删的行还在；原因见日志）",
+            "清理未完成（边界 {cutoff}）：{done}{}（已回滚的年份未删的行还在；原因见日志）",
             report.why_incomplete()
         )
+    } else if report.deleted == 0 {
+        // 这条命令天天挂在计划任务上：每天都看到「已删除 30 天前的记录 0 条」的人会以为
+        // 清理坏了，而真实情况是"没有到期待删的东西"。两句得分开说。
+        format!("没有 {cutoff}（含）之前的记录可删（保留 {days} 天）")
     } else {
+        // 单位必须点破：`deleted` 数的是「每天每键/每应用/每设备」那一行的合计，
+        // 不是活动次数。2026-10-26 实测删掉 1,166,643 次活动，旧句子只说"5,782 条"，
+        // 用户没法据此判断后果（到底少了多少历史，看得见的数字差两个数量级）。
+        let mut years = report.deleted_years.clone();
+        years.sort_unstable();
+        let years: Vec<String> = years.iter().map(|y| format!("{y}")).collect();
+        // 没有具体年份时这一句干脆不提它（凑一个"未记到"只会让人以为丢了数据）
+        let where_clause = if years.is_empty() {
+            String::new()
+        } else {
+            format!("，涉及年度库 {}", years.join("、"))
+        };
         format!(
-            "已删除 {days} 天前的记录 {} 条",
+            "已删除 {cutoff}（含）之前的记录 {} 行{where_clause}；一行是「某天某键」的合计，不等于活动次数（保留 {days} 天）",
             crate::format::fmt_thousands(report.deleted)
         )
     }
@@ -6800,5 +6839,78 @@ mod tests {
         // 文案要能分清是哪一种：会连今天一起删，与"笔误"是两件事
         assert!(parse_keep_days("0").unwrap_err().contains(">= 1"));
         assert!(parse_keep_days("999999").unwrap_err().contains("--reset"));
+    }
+
+    /// `--cleanup` 的成功读数要让人判断得了后果：删到哪天、单位是什么、动了哪几个年度库。
+    /// 旧句子只有「已删除 30 天前的记录 5,782 条」，而 2026-10-26 实测那是 **1,166,643 次活动**
+    /// ——`deleted` 数的是"每天每键一行"。这条命令又天天挂在计划任务上，"删到哪天"正是它
+    /// 每天要回答的那一句。
+    #[test]
+    fn the_cleanup_success_line_names_the_boundary_the_unit_and_years() {
+        let cutoff = chrono::Local::now()
+            .date_naive()
+            .checked_sub_days(chrono::Days::new(29))
+            .expect("往前 29 天一定解得开");
+        let r = MaintenanceReport {
+            deleted: 5782,
+            deleted_years: vec![2026, 2024, 2025],
+            cutoff_key: queries::day_key_of_date(cutoff),
+            ..MaintenanceReport::default()
+        };
+        let line = cleanup_line(30, &r);
+        let day = cutoff.format("%Y-%m-%d").to_string();
+        assert!(line.contains(&day), "要说清删到哪天（{day}）: {line}");
+        assert!(line.contains("不等于活动次数"), "要点破单位: {line}");
+        assert!(line.contains("5,782 行"), "行数与单位要连着说: {line}");
+        // 顺序稳定：报告里列的年度不许跟着目录序/HashMap 变
+        assert!(
+            line.contains("2024、2025、2026"),
+            "涉及哪几个年度库: {line}"
+        );
+    }
+
+    /// 「0 行」要说成"没有到期的东西"，不许写成"删除了 0 条"：这条天天跑，
+    /// 每天看到「已删除 …… 0 条」的人会以为清理坏了（与 `--backup` 的 NothingToDo 同一口径）。
+    #[test]
+    fn nothing_to_clean_says_so_instead_of_deleting_zero_rows() {
+        let r = MaintenanceReport {
+            cutoff_key: queries::day_key_of_date(chrono::Local::now().date_naive()),
+            ..MaintenanceReport::default()
+        };
+        let line = cleanup_line(30, &r);
+        assert!(line.contains("没有"), "{line}");
+        assert!(line.contains("可删"), "{line}");
+        assert!(
+            !line.contains("已删除"),
+            "无事可做不许写成删了 0 条: {line}"
+        );
+    }
+
+    /// 未完成那一支原来说的话一个字不许丢（哪些年回滚、已提交的那一半算过没有），
+    /// 现在再加上同一条边界日期。
+    #[test]
+    fn the_incomplete_line_keeps_the_rollback_detail_and_names_the_boundary() {
+        let r = MaintenanceReport {
+            deleted: 10,
+            failed_years: vec![2023],
+            cutoff_key: queries::day_key_of_date(chrono::Local::now().date_naive()),
+            ..MaintenanceReport::default()
+        };
+        let line = cleanup_line(30, &r);
+        assert!(line.starts_with("清理未完成"), "{line}");
+        assert!(
+            line.contains("已经删掉 10 行"),
+            "已提交的那一半要说清: {line}"
+        );
+        assert!(line.contains("2023"), "要点名回滚的年份: {line}");
+    }
+
+    /// 边界日期只能由删的那一处交出来。`cutoff_key` 为 0（这一轮根本没算过，
+    /// 例如连年份都没枚举到）时退回"按保留天数说"，不许自己拿今天减一个数**编**出一个日期。
+    #[test]
+    fn a_missing_boundary_falls_back_to_the_keep_days_wording() {
+        let r = MaintenanceReport::default();
+        let line = cleanup_line(30, &r);
+        assert!(line.contains("30 天前"), "{line}");
     }
 }

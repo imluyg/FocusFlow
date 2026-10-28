@@ -1526,6 +1526,8 @@ mod tests {
     fn cleanup_says_success_only_when_nothing_failed() {
         let ok = MaintenanceReport {
             deleted: 12,
+            deleted_years: vec![],
+            cutoff_key: 0,
             failed_years: vec![],
             dir_error: None,
             snapshot_warning: None,
@@ -1541,6 +1543,8 @@ mod tests {
         // 部分失败：这一句绝不能出现
         let partial = MaintenanceReport {
             deleted: 0,
+            deleted_years: vec![],
+            cutoff_key: 0,
             failed_years: vec![2025],
             dir_error: None,
             snapshot_warning: None,
@@ -1560,6 +1564,8 @@ mod tests {
         // 连目录都列不出来：一套库都没碰
         let nodir = MaintenanceReport {
             deleted: 0,
+            deleted_years: vec![],
+            cutoff_key: 0,
             failed_years: vec![],
             dir_error: Some("读取数据目录失败".to_string()),
             snapshot_warning: None,

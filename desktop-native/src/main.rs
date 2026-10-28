@@ -1761,7 +1761,8 @@ impl App {
             .name("data-op".into())
             .spawn(move || {
                 use focusflow_core::db::maintenance::{
-                    backup_database, cleanup_old_data, vacuum_all, vacuum_line, BackupOutcome,
+                    backup_database, cleanup_line, cleanup_old_data, vacuum_all, vacuum_line,
+                    BackupOutcome,
                 };
                 let line = match which {
                     0 => {
@@ -1840,15 +1841,11 @@ impl App {
                         }
                     }
                     2 => {
+                        // 这句话由 core 说一遍（`cleanup_line`，与 CLI 的 `--cleanup` 同一出处）。
+                        // 以前这里自己拼「已清理 N 条（保留 30 天）」，于是同一次清理在命令行说
+                        // 「清理未完成」、在按钮上说的是「已清理」，而单位（每天每键一行）谁都没讲。
                         let r = cleanup_old_data(30);
-                        let mut s = format!("已清理 {} 条（保留 30 天）", r.deleted);
-                        if !r.failed_years.is_empty() {
-                            s.push_str(&format!("；未处理的年份：{:?}", r.failed_years));
-                        }
-                        if let Some(e) = &r.dir_error {
-                            s.push_str(&format!("；{e}"));
-                        }
-                        s
+                        cleanup_line(30, &r)
                     }
                     6 => {
                         let dir = match std::env::var("FOCUSFLOW_IMPORT_DIR") {
@@ -8308,6 +8305,31 @@ fn main() -> windows::core::Result<()> {
         drop(Box::from_raw(app));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cleanup_readout_tests {
+    /// 「按日期清理」这颗按钮不许自己拼结论。同一次清理在命令行说「清理未完成」、
+    /// 在按钮上说「已清理 N 条」，就是两把尺子的形状；而那句还漏了单位
+    /// （`deleted` 数的是"每天每键一行"，2026-10-26 实测对应 1,166,643 次活动）。
+    /// 查的是**调用形态**：句子由 core 的 `cleanup_line` 说一遍，这里只许调用。
+    #[test]
+    fn the_cleanup_button_defers_to_the_core_sentence() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        let local = ["format!(\"", "已清理"].concat();
+        assert!(
+            !prod.contains(local.as_str()),
+            "生产代码里又出现本地拼的那句清理结论了：要走 cleanup_line"
+        );
+        let call = ["cleanup_line", "("].concat();
+        assert_eq!(
+            prod.matches(call.as_str()).count(),
+            1,
+            "只许有那一处调用（按钮），数量变了说明接线动过"
+        );
+    }
 }
 
 #[cfg(test)]
