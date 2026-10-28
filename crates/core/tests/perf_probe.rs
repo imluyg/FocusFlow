@@ -12,6 +12,8 @@
 //! - 退出成本（`shutdown` = flush + stop + backup_on_exit 的备份与校验）
 //! - 备份单项（backup_database 热身后的稳态）
 //! - B14-2 迁移扫描（迁完之后每次启动的剩余成本）与配置整读整写
+//! - 一拍里**不查库**的那两项（默认表整份重建、开机自启探测）与 `migrate_v2` 在同一进程里
+//!   重复跑的那一趟 —— 摘不摘、加不加闸，都按这两行的数定，不凭"看着像浪费"
 //!
 //! 数字出来后对照两条人感线：100 ms（可感知）与 16 ms（一帧）。
 
@@ -142,6 +144,27 @@ fn bench_avg(name: &str, runs: usize, mut f: impl FnMut()) {
     );
 }
 
+/// 亚毫秒那批用的读数档：`{:.1} ms` 会把 60 µs 印成 `0.0 ms`，那是"量不出"不是"没有"。
+/// `black_box` 挡的是编译器把整次调用直接省掉。
+fn bench_avg_us<T>(name: &str, runs: usize, mut f: impl FnMut() -> T) {
+    let mut total = 0.0;
+    let mut min = f64::MAX;
+    for _ in 0..runs {
+        let t = Instant::now();
+        std::hint::black_box(f());
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        total += us;
+        min = min.min(us);
+    }
+    println!(
+        "  {:<46} {:>9.1} µs（{} 次平均，min {:.1}）",
+        name,
+        total / runs as f64,
+        runs,
+        min
+    );
+}
+
 #[test]
 #[ignore = "perf 探针：cargo test -p focusflow-core --test perf_probe -- --ignored --nocapture"]
 fn perf_probe_full_pass() {
@@ -242,9 +265,49 @@ fn perf_probe_full_pass() {
         let _ = db::get_hourly_stats(None);
     });
 
+    // 一拍里那些**不查库**的活：要不要把它们从 `load()` 摘出去，看的是这两行的数 ——
+    // 用 µs 档是因为 `{:.1} ms` 会把它们全印成 `0.0 ms`，那既不是"零成本"也定不了级。
+    // 两条都是纯读（默认表只装不写盘，自启探测只看快捷方式与 HKCU Run），
+    // 不改这台机器的任何状态。
+    println!("\n== 一拍里不查库的那两项（每拍都跑） ==");
+    bench_avg_us(
+        "config::default_config()（整份默认表重建）",
+        20,
+        focusflow_core::config::default_config,
+    );
+    bench_avg_us(
+        "autostart::is_autostart_enabled()（快捷方式 + 注册表）",
+        20,
+        focusflow_core::autostart::is_autostart_enabled,
+    );
+
+    // "星期分布"这一档现在是**再扫一遍每日计数**（`get_weekday_stats` = `get_daily_counts`
+    // + `aggregate_weekday`），而同一拍上面已经把同一窗口的每日序列查过了。
+    // 这两行的差就是"复用已查得的那份"能省下的 —— 量出来再决定省不省，不猜。
+    println!("\n== 星期分布那一趟（复用能省多少） ==");
+    bench_avg("get_daily_counts(30)（每日序列本体）", 5, || {
+        let _ = queries::get_daily_counts(30, None);
+    });
+    bench_avg(
+        "get_weekday_stats(30)（再扫一遍 + 聚合）",
+        5,
+        || {
+            let _ = queries::get_weekday_stats(30);
+        },
+    );
+    {
+        let daily = queries::get_daily_counts(30, None);
+        bench_avg_us(
+            "aggregate_weekday(已查得的 30 天)（纯聚合）",
+            20,
+            || queries::aggregate_weekday(&daily),
+        );
+    }
+
     // 快照线程那一拍**真正跑的东西**（`desktop-native/src/data.rs::load` 的查询面）。
     // 这一条决定两件事："可见时能不能从 2 秒收到 1 秒甚至更快"，以及
     // "看不见时停不停得有意义" —— 两个都要看数，不猜。
+    println!("\n== 一拍 load() 的查询面 ==");
     bench_avg("一拍 load() 的查询面（今日）", 5, || {
         let days: Option<i64> = Some(1);
         let _ = db::stats_totals(days, None);
@@ -289,6 +352,12 @@ fn perf_probe_full_pass() {
     );
 
     println!("\n== 启动杂项 ==");
+    // 同一个进程里 `migrate_v2` 现在跑两趟（`Database::init` 与 `init_readonly` 各一次）。
+    // 要算"加进程级闸能省多少"，量的是**第二趟**：第一趟是迁移本体，省不掉。
+    bench(
+        "migrate_v2 第二次（= 同进程里重复的那一趟）",
+        maintenance::migrate_v2,
+    );
     bench(
         "B14-2 迁移扫描（迁完后的每次启动成本）",
         || {
@@ -298,6 +367,47 @@ fn perf_probe_full_pass() {
     bench("FocusFlowConfig::load（含整份 save 重写）", || {
         FocusFlowConfig::load(_dir.path().join("config.ini")).expect("配置加载");
     });
+
+    // 启动那 500 多毫秒到底花在哪：把 `Database::init` 里逐步骤**再走一遍**（都幂等），
+    // 减出来的和与上面那条整序列的差，就是"这一段还没被解释"的余量。
+    // ⚠ 一条口径：本探针的库是**直接种进聚合表**的，`migrate_v2` 第一趟在这儿没活干
+    // ⇒ 这一组数只覆盖"已经是新格式、每次启动重扫"的那种启动，不含旧库首启那一次。
+    println!("\n== 启动分解（init 里逐步骤再走一遍，幂等） ==");
+    for y in YEARS {
+        bench(
+            &format!("ensure_schema({y})（建表/索引那趟）"),
+            || {
+                let conn = connection::open_rw(&paths::year_db_path(y)).expect("开库");
+                connection::ensure_schema(&conn, y).expect("建表")
+            },
+        );
+    }
+    bench(
+        "heal_daily_consistency（每日计数与键数对账自愈）",
+        maintenance::heal_daily_consistency,
+    );
+    bench("check_yearly_archive(true)（归档检查）", || {
+        maintenance::check_yearly_archive(true)
+    });
+    bench("sweep_stale_sidecars（backup/ 残留扫描）", || {
+        std::hint::black_box(maintenance::sweep_stale_sidecars())
+    });
+    bench("device_alias::migrate_exact_keys_to_identity", || {
+        focusflow_core::device_alias::migrate_exact_keys_to_identity()
+    });
+
+    // ⚠ 上面那条 `Database::init` 是**这一份数据的第一次**：探针的库是直接种进聚合表的，
+    // 所以那一趟里 B14-2 归组键转换与一致性自愈都要**真改数据**（各自第二趟只扫不改，
+    // 分别在"启动杂项"和"启动分解"里）。他每次开机付的是**第二次**那一趟 —— 下面这条
+    // 才是启动体感的尺子，也是"某一步要不要挪出关键路径"唯一的裁决依据。
+    println!("\n== 稳态启动（同一份数据再走一遍 init = 他每次开机付的那一趟） ==");
+    let paused2 = focusflow_core::listener::new_pause_flag();
+    let (db2, _) = bench("Database::init 第二次（稳态启动）", || {
+        Database::init(&cfg, paused2).ok()
+    });
+    if let Some(d) = db2.as_ref() {
+        d.shutdown(&cfg);
+    }
     println!("\n== 人感参照：>100ms 可感知；>16ms 掉一帧；热路径 >300µs 才值得看 ==");
     drop(db);
     queries::invalidate_years_cache();
