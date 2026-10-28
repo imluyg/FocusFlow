@@ -3796,7 +3796,9 @@ mod render_probe {
             // 走产品自己这条出路落的那张里，已经画好的标注也得在：
             // 整幅中至少有一个"色块那种红"的像素（PNG 解回来是 RGBA 顺序）
             assert!(
-                rgba.chunks_exact(4)
+                rgba.as_chunks::<4>()
+                    .0
+                    .iter()
                     .any(|p| p[0] == 255 && p[1] == 45 && p[2] == 45),
                 "落盘那张里没有已画的标注"
             );

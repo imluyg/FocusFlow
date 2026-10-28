@@ -378,6 +378,7 @@ unsafe fn ensure_text_ctx() -> bool {
 /// 用 DirectWrite 把一行白字画进蒙版（黑底），返回行宽（物理像素）。
 ///
 /// 字号与坐标都按物理像素传：渲染目标固定 96 dpi，1 DIP = 1 px。
+#[allow(clippy::too_many_arguments)] // 目标尺寸 + 矩形 + 字号 + 字体 + 对齐：一行字的输入就是这些
 unsafe fn dw_line(
     ctx: &TextCtx,
     hdc: g::HDC,
@@ -457,6 +458,7 @@ unsafe fn dw_line(
 }
 
 /// DirectWrite 版本的整卡文字。返回 false 表示这一拍根本没画（上下文起不来）。
+#[allow(clippy::too_many_arguments)] // 目标尺寸 + 蒙版 + 卡片 + 内容 + 缩放 + 调色板：一次整卡文字的输入
 unsafe fn draw_text_dw(
     hdc: g::HDC,
     mask: &mut Surface,
@@ -522,6 +524,7 @@ unsafe fn draw_text_dw(
 
 /// GDI 兜底：DirectWrite 上下文起不来时才走（老机器/极端权限）。
 /// 画的仍是"白字黑底"蒙版，之后按 R 通道叠色 —— 抗锯齿只有灰度。
+#[allow(clippy::too_many_arguments)] // 与 draw_text_dw 同一份输入（它不看不用高度，只为对称留着）
 unsafe fn draw_text_gdi(
     hdc: g::HDC,
     mask: &mut Surface,

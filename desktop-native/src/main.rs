@@ -385,7 +385,7 @@ impl Drop for Comp {
         // 视觉树上的根要显式摘掉：`SetRoot` 持有引用，只 drop 本地指针
         // 旧画面还会被合进窗口（缩放过一次就会看到两层错位）。
         unsafe {
-            let _ = self.ctx.SetTarget(None);
+            self.ctx.SetTarget(None);
             let _ = self._dcomp_target.SetRoot(None);
             let _ = self._dcomp.Commit();
         }
@@ -2030,7 +2030,7 @@ impl App {
     /// 托盘里的勾与真实暂停位对齐。
     fn sync_pause_item(&self) {
         if let Some(it) = &self.pause_item {
-            let _ = it.set_checked(collect::is_paused());
+            it.set_checked(collect::is_paused());
         }
     }
 
@@ -2725,7 +2725,7 @@ struct P<'a> {
 impl P<'_> {
     fn fill(&self, r: D2D_RECT_F, b: &ID2D1SolidColorBrush) {
         unsafe {
-            let _ = self.rt.FillRectangle(&r, b);
+            self.rt.FillRectangle(&r, b);
         }
     }
 
@@ -2747,16 +2747,16 @@ impl P<'_> {
             radiusY: radius,
         };
         unsafe {
-            let _ = self.rt.FillRoundedRectangle(&rr, fill);
+            self.rt.FillRoundedRectangle(&rr, fill);
             if let Some(bd) = border {
-                let _ = self.rt.DrawRoundedRectangle(&rr, bd, 1.0, None);
+                self.rt.DrawRoundedRectangle(&rr, bd, 1.0, None);
             }
         }
     }
 
     fn line(&self, x0: f32, y0: f32, x1: f32, y1: f32, b: &ID2D1SolidColorBrush, w: f32) {
         unsafe {
-            let _ = self.rt.DrawLine(
+            self.rt.DrawLine(
                 Vector2 { X: x0, Y: y0 },
                 Vector2 { X: x1, Y: y1 },
                 b,
@@ -2769,7 +2769,7 @@ impl P<'_> {
     fn text(&self, s: &str, r: D2D_RECT_F, f: &IDWriteTextFormat, b: &ID2D1SolidColorBrush) {
         let u: Vec<u16> = s.encode_utf16().collect();
         unsafe {
-            let _ = self.rt.DrawText(
+            self.rt.DrawText(
                 &u,
                 f,
                 &r,
@@ -2990,11 +2990,12 @@ const ACTIONS: [(&str, &str); 8] = [
     ),
 ];
 
-/// 设置页右上角那个搜索框（底框；真正的输入是叠上去的原。
+/// 设置页右上角那个搜索框的底框（真正的输入是叠在它上面的原生 EDIT，见 `ensure_search_edit`）。
 fn search_box_rect(w: f32) -> D2D_RECT_F {
     rect(w - 16.0 - 16.0 - 260.0, 218.0, 260.0, 26.0)
 }
 
+#[allow(clippy::too_many_arguments)] // 一屏要画的东西就是这些参数；打包成结构体只会让调用点多抄一遍
 fn draw_settings(
     p: &P<'_>,
     w: f32,
@@ -3699,6 +3700,7 @@ fn period_pills() -> [(i64, D2D_RECT_F); 6] {
     out
 }
 
+#[allow(clippy::too_many_arguments)] // 主区各视图共用这一个入口：拆开传会在每个调用点重排一遍同样的参数
 fn draw_screen(
     p: &P<'_>,
     w: f32,
@@ -4093,8 +4095,8 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     let gap = 12.0;
     let bw = ((plot_width(plot) - gap * (n as f32 - 1.0)) / n as f32).max(1.0);
     let labels = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
-    for i in 0..n {
-        let v = snap.weekday[i] as f32;
+    for (i, (&label, &count)) in labels.iter().zip(snap.weekday.iter()).enumerate() {
+        let v = count as f32;
         let hh = (v / max) * plot_height(plot);
         let x = plot.left + i as f32 * (bw + gap);
         let bar = rect(x, plot.bottom - hh, bw, hh);
@@ -4104,13 +4106,13 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
             p.round(bar, 4.0, &b, None);
         }
         p.text(
-            labels[i],
+            label,
             rect(x, plot.bottom + 6.0, bw, 16.0),
             &p.fmt.center_small,
             &p.br.muted,
         );
         p.text(
-            &thousands(snap.weekday[i].max(0) as u64),
+            &thousands(count.max(0) as u64),
             rect(x, plot.bottom - hh - 18.0, bw, 16.0),
             &p.fmt.center_small,
             &p.br.muted,
@@ -4129,8 +4131,10 @@ struct HeatKey {
     label: &'static str,
 }
 
-/// 主区 6 行：[。
-const HEAT_MAIN: &[(f32, &[(&str, f32, f32)])] = &[
+/// 主区一行：（这一行的 y 偏移，行内键位清单）。
+type HeatRow = (f32, &'static [(&'static str, f32, f32)]);
+
+const HEAT_MAIN: &[HeatRow] = &[
     (
         0.0,
         &[
@@ -5365,9 +5369,9 @@ fn draw_plugin_view(
         card.right - card.left - 2.0,
         card.bottom - card.top - 42.0,
     );
-    let _ = unsafe {
-        p.rt.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE)
-    };
+    unsafe {
+        p.rt.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    }
 
     let ops = plugin_view_ops(
         view,
@@ -5536,7 +5540,7 @@ fn draw_plugin_view(
         }
     }
 
-    let _ = unsafe { p.rt.PopAxisAlignedClip() };
+    unsafe { p.rt.PopAxisAlignedClip() };
 
     if ops.is_empty() {
         p.text(
@@ -6208,9 +6212,10 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
         let mark = if *n >= goal { " ✅" } else { "" };
         let _ = writeln!(
             out,
-            "| {} | {} |",
+            "| {} | {}{} |",
             d.format("%Y-%m-%d"),
-            format!("{}{}", thousands((*n).max(0) as u64), mark)
+            thousands((*n).max(0) as u64),
+            mark
         );
     }
 
@@ -6801,7 +6806,7 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         let a = pt(i - 1);
         let b = pt(i);
         unsafe {
-            let _ = p.rt.DrawLine(a, b, &p.br.accent, 2.0, None);
+            p.rt.DrawLine(a, b, &p.br.accent, 2.0, None);
         }
     }
     // 纵轴：从上往下是「峰。
@@ -7366,7 +7371,7 @@ fn thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -7541,13 +7546,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             // 心跳：只留证据，不刷屏（。
             static TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let n = TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n % 50 == 0 {
+            if n.is_multiple_of(50) {
                 tracing_note(&format!("timer tick {n}"));
             }
             // 验收模式（FOCUSFLOW_ACCEPTANCE=1）下每秒写一行机器可读的状态：
             // 脚本不用 OCR 就能断言「今日涨了几个」「暂停期间有没有停」。
             // 键名用 ASCII，值也只有数字/on-off，解析起来不用管编码。
-            if n % 10 == 0 && ACCEPTANCE.load(std::sync::atomic::Ordering::Relaxed) {
+            if n.is_multiple_of(10) && ACCEPTANCE.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(app) = unsafe { app_ptr(hwnd) } {
                     let today = app.snap.lock().map(|s| s.today).unwrap_or(0);
                     tracing_note(&format!(
