@@ -884,6 +884,105 @@ unsafe fn poke_pixels(
     }
 }
 
+/// 放大镜一格看几个源像素（奇数，光标那一格正好在正中）。
+pub const LOUPE_SPAN: i32 = 11;
+/// 一个源像素画成几个屏幕像素。
+pub const LOUPE_SCALE: i32 = 8;
+/// 读数那一行的高度（画在方块下面）。
+pub const LOUPE_TEXT_H: i32 = 18;
+/// 光标与方块之间的间距。
+pub const LOUPE_GAP: i32 = 18;
+
+/// 放大镜的落点：默认在光标右下，那一侧放不下就翻到另一侧（横竖各判一次）。
+///
+/// 返回 `None` = 这块屏小到连方块加间距都放不下 —— 宁可不画，也不要压在光标底下
+/// 挡住人正在对的那几个像素。
+pub fn loupe_rect(cx: i32, cy: i32, w: i32, h: i32) -> Option<(i32, i32, i32, i32)> {
+    let side = LOUPE_SPAN * LOUPE_SCALE;
+    if w <= 0 || h <= 0 || side + LOUPE_GAP * 2 >= w || side + LOUPE_TEXT_H + LOUPE_GAP * 2 >= h {
+        return None;
+    }
+    let mut x = cx + LOUPE_GAP;
+    if x + side > w {
+        x = cx - LOUPE_GAP - side;
+    }
+    let mut y = cy + LOUPE_GAP;
+    if y + side + LOUPE_TEXT_H > h {
+        y = cy - LOUPE_GAP - side - LOUPE_TEXT_H;
+    }
+    Some((x.max(0), y.max(0), side, side))
+}
+
+/// 放大镜要看的那一片源像素（左上角 + 边长），钳在冻结图内。
+///
+/// 钳边是必须的：光标贴在最右列时不钳就会把窗口外的字节放大出来，症状是"放大镜里
+/// 有几条彩边"，而人正是信这个读数才去对齐的。
+pub fn loupe_source(cx: i32, cy: i32, w: i32, h: i32) -> (i32, i32, i32) {
+    let half = LOUPE_SPAN / 2;
+    let x = (cx - half).clamp(0, (w - LOUPE_SPAN).max(0));
+    let y = (cy - half).clamp(0, (h - LOUPE_SPAN).max(0));
+    (x, y, LOUPE_SPAN)
+}
+
+/// 把 `src` 那一片按 [`LOUPE_SCALE`] 倍放大，盖上网格并把光标所在那一格描边，
+/// 产出一块可以直接 blit 的 BGRA。
+///
+/// 网格与描边都是**像素写**，不走 GDI 的 `Rectangle`：内存位图段上那条路只落一个点。
+/// 字节不足时交出全零缓冲而不 panic —— 冻结图短一截是别处已经出声的异常，
+/// 不该在这里再炸掉一次截图。
+pub fn loupe_pixels(base: &[u8], bw: i32, src: (i32, i32, i32)) -> Vec<u8> {
+    let (sx, sy, span) = src;
+    let side = (span * LOUPE_SCALE).max(0);
+    let mut out = vec![0u8; (side as usize) * (side as usize) * 4];
+    if span <= 0 || bw <= 0 || side <= 0 {
+        return out;
+    }
+    let half = span / 2;
+    for dy in 0..side {
+        for dx in 0..side {
+            let sxp = sx + dx / LOUPE_SCALE;
+            let syp = sy + dy / LOUPE_SCALE;
+            let si = ((syp as usize) * (bw as usize) + (sxp as usize)) * 4;
+            if si + 3 >= base.len() {
+                continue;
+            }
+            let di = ((dy as usize) * (side as usize) + dx as usize) * 4;
+            let grid = dx % LOUPE_SCALE == 0 || dy % LOUPE_SCALE == 0;
+            let center_cell = dx / LOUPE_SCALE == half && dy / LOUPE_SCALE == half;
+            let edge = center_cell
+                && (dx % LOUPE_SCALE == 0
+                    || dx % LOUPE_SCALE == LOUPE_SCALE - 1
+                    || dy % LOUPE_SCALE == 0
+                    || dy % LOUPE_SCALE == LOUPE_SCALE - 1);
+            for k in 0..3 {
+                let v = base[si + k] as i32;
+                out[di + k] = if edge {
+                    0xFF
+                } else if grid {
+                    (v - 48).max(0) as u8
+                } else {
+                    v as u8
+                };
+            }
+            out[di + 3] = 255;
+        }
+    }
+    out
+}
+
+/// 读数那一行说的话：光标在**屏幕上**的位置（客户区坐标 + 冻结那一刻的原点）
+/// 与这一块放大前是多大。
+pub fn loupe_text(src: (i32, i32, i32), origin: (i32, i32)) -> String {
+    format!(
+        "屏幕 {},{} · 取 {}×{} 放大 {} 倍",
+        origin.0 + src.0 + src.2 / 2,
+        origin.1 + src.1 + src.2 / 2,
+        src.2,
+        src.2,
+        LOUPE_SCALE
+    )
+}
+
 unsafe fn blit_bgra(hdc: HDC, buf: &[u8], w: i32, h: i32, dx: i32, dy: i32) {
     if buf.is_empty() || w <= 0 || h <= 0 {
         return;
@@ -2418,6 +2517,7 @@ unsafe fn paint(hwnd: HWND) {
                 s.marks.clone(),
                 s.drag,
                 s.cur,
+                s.origin,
                 s.pen_pts.clone(),
                 s.tool,
                 s.color,
@@ -2437,6 +2537,7 @@ unsafe fn paint(hwnd: HWND) {
             marks,
             drag,
             cur,
+            origin,
             pen_pts,
             tool,
             color,
@@ -2616,6 +2717,24 @@ unsafe fn paint(hwnd: HWND) {
                 "拖框选区 · 单击选窗口 · 右键或 Esc 取消 · 定下后可用方向键挪 1 像素",
                 0x00FF_FFFF,
             );
+        }
+        // 放大镜（像素级取框）：最后画，压在一切之上。**只在选区还没定那一段**显示 ——
+        // 人要的是"这一列到底到边了没有"；选区定下之后要看的是选区本身与工具条，
+        // 一块跟着光标走的方块那时候只会挡住画面（屏上探针第一条就跑出了这件事）。
+        let loupe_src = loupe_source(cur.0, cur.1, bw, bh);
+        if phase == Phase::Select {
+            if let Some((lx, ly, ls, lsz)) = loupe_rect(cur.0, cur.1, bw, bh) {
+                let box_bytes = loupe_pixels(&base, bw, loupe_src);
+                blit_bgra(hdc, &box_bytes, ls, lsz, lx, ly);
+                let ty = (ly + lsz + 1).clamp(0, (bh - LOUPE_TEXT_H - 2).max(0));
+                draw_chip(
+                    hdc,
+                    lx,
+                    ty,
+                    &loupe_text(loupe_src, origin),
+                    rgb(120, 255, 224),
+                );
+            }
         }
         let _ = EndPaint(hwnd, &ps);
     }
@@ -3201,6 +3320,44 @@ mod render_probe {
             assert!(
                 hint_px > 20,
                 "左上角那行用法提示没画出来（白像素 {hint_px}）"
+            );
+
+            // 放大镜（像素级取框）：光标那一格必须被放大成 LOUPE_SCALE 倍画在屏上。
+            // 对照物还是那张逐像素唯一的合成图案 —— 任何错位（取错源、忘了钳边、倍率算反）
+            // 都会改变结果，拿真实桌面当对照时纯色区域会把这条判据喂成假绿。
+            let (cx, cy) = (500i32, 300i32);
+            if let Ok(mut s) = SNIP.lock() {
+                s.cur = (cx, cy);
+                s.hover = None;
+                s.hits.clear();
+            }
+            let _ = InvalidateRect(Some(ov), None, false);
+            pump(200);
+            let (lx, ly, _, _) = loupe_rect(cx, cy, base_w, base_h).expect("这块屏容不下放大镜");
+            // 期望值必须**独立**算：直接取光标那一格的源像素。
+            // 第一版这里写的是 `loupe_source(..) + half`，等于拿被测函数给自己出题 ——
+            // 把 `loupe_source` 挪开一格，这条判据照样绿（实测过），所以它量的是"自洽"，不是"对"。
+            let want = pixel3(&base, base_w, cx, cy);
+            assert_ne!(
+                want,
+                pixel3(&base, base_w, cx + 1, cy),
+                "夹具图案要逐像素唯一，否则这条判据没有观察量"
+            );
+            let shot_l = print_window(ov).expect("放大镜那一张没拿到");
+            // 取方块中心那一格的内部（避开描边与网格线）
+            let got = pixel3(
+                &shot_l.0,
+                shot_l.1,
+                lx + (LOUPE_SPAN / 2) * LOUPE_SCALE + LOUPE_SCALE / 2,
+                ly + (LOUPE_SPAN / 2) * LOUPE_SCALE + LOUPE_SCALE / 2,
+            );
+            assert_eq!(got, want, "放大镜没把光标那一格放大画到屏上");
+            // 对照带：方块左边 40 像素那一格仍是压暗的一份 —— 别把整片都刷亮
+            let band_x = (lx - 40).max(0);
+            assert_eq!(
+                pixel3(&shot_l.0, shot_l.1, band_x, ly + 8),
+                pixel3(&dim, base_w, band_x, ly + 8),
+                "放大镜外面那一格也被刷亮了：方块没夹在 loupe_rect 的落点里"
             );
 
             // 悬停预览：塞一条"别人进程"的候选进去，鼠标移到它身上就该亮。
@@ -4813,5 +4970,137 @@ mod tests {
         assert!(btn_active("w2", 0, PALETTE[0].0, 7, 30));
         assert!(btn_active("f1", 0, PALETTE[0].0, 3, 18));
         assert!(!btn_active("undo", 0, PALETTE[0].0, 3, 18));
+    }
+}
+
+#[cfg(test)]
+mod loupe_tests {
+    use super::*;
+
+    /// 构造一块 `w`x`h` 的 BGRA 冻结图，每格颜色由 `f` 决定（B,G,R）。
+    fn make_base(w: i32, h: i32, f: impl Fn(i32, i32) -> (u8, u8, u8)) -> Vec<u8> {
+        let mut v = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let (b, g, r) = f(x, y);
+                let i = ((y * w + x) * 4) as usize;
+                v[i] = b;
+                v[i + 1] = g;
+                v[i + 2] = r;
+                v[i + 3] = 255;
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn the_loupe_sits_bottom_right_and_flips_when_it_would_leave_the_screen() {
+        let side = LOUPE_SPAN * LOUPE_SCALE;
+        let w = 1000;
+        let h = 800;
+        // 一般位置：右下，离光标一格间距
+        assert_eq!(
+            loupe_rect(100, 100, w, h),
+            Some((100 + LOUPE_GAP, 100 + LOUPE_GAP, side, side))
+        );
+        // 贴右边：翻到左侧，仍然整个在屏内
+        let r = loupe_rect(w - 4, 100, w, h).expect("贴边也该放得下");
+        assert!(r.0 + side <= w, "翻边后不许超出右沿: {r:?}");
+        assert!(r.0 < w - 4, "翻边就是要在光标的另一侧");
+        // 贴底边：往上翻，读数那一行也要留出来
+        let b = loupe_rect(100, h - 4, w, h).expect("贴底也该放得下");
+        assert!(
+            b.1 + side + LOUPE_TEXT_H <= h,
+            "往上翻后要容得下方块与读数行: {b:?}"
+        );
+        // 小到放不下：宁可不画，也不挡在光标底下
+        assert_eq!(loupe_rect(50, 50, 40, 40), None);
+        assert_eq!(loupe_rect(50, 50, 0, 1080), None);
+    }
+
+    #[test]
+    fn the_sampled_block_is_always_inside_the_frozen_image() {
+        let w = 640;
+        let h = 480;
+        let (x, y, span) = loupe_source(0, 0, w, h);
+        assert_eq!((x, y, span), (0, 0, LOUPE_SPAN), "左上角不外越界");
+        let (x2, y2, _) = loupe_source(w - 1, h - 1, w, h);
+        assert_eq!(x2 + span, w, "光标贴最右列时要夹住，不许放大窗口外的字节");
+        assert_eq!(y2 + span, h, "光标贴最下行时同上");
+        // 中间位置：光标那一格正好在正中
+        let (mx, my, _) = loupe_source(300, 200, w, h);
+        assert_eq!((mx, my), (300 - LOUPE_SPAN / 2, 200 - LOUPE_SPAN / 2));
+    }
+
+    /// 放大后的样子：一个源像素变成一格，网格压暗，光标那一格描白边。
+    /// 断言按 **BGRA** 的字节序写（B,G,R,A）—— 这一族本轮错过三次。
+    #[test]
+    fn the_magnified_block_shows_every_source_pixel_as_one_cell() {
+        // 中间一格纯绿，其余纯黑：绿只可能来自放大镜，不会别处撞上来
+        let base = make_base(64, 64, |x, y| {
+            if x == 32 && y == 32 {
+                (0, 200, 0)
+            } else {
+                (0, 0, 0)
+            }
+        });
+        let src = loupe_source(32, 32, 64, 64);
+        assert_eq!((src.0, src.1), (27, 27), "光标那一格要在正中");
+        let big = loupe_pixels(&base, 64, src);
+        let side = (LOUPE_SPAN * LOUPE_SCALE) as usize;
+        assert_eq!(big.len(), side * side * 4, "字节数＝边长平方 × BGRA");
+        let px = |dx: usize, dy: usize| {
+            let i = (dy * side + dx) * 4;
+            (big[i], big[i + 1], big[i + 2])
+        };
+        // 第 5 格（0 基）就是源 (32,32)：整格都是绿的字节，除了描边那一圈
+        let cell = LOUPE_SCALE as usize;
+        let inner = px(5 * cell + cell / 2, 5 * cell + cell / 2);
+        assert_eq!(inner, (0, 200, 0), "光标那一格中心必须是源像素本来的字节");
+        assert_eq!(
+            px(5 * cell, 5 * cell),
+            (255, 255, 255),
+            "描边那一格要看得清"
+        );
+        // 旁边那格是黑的，但网格线压暗后仍是黑（减到底不绕回）
+        assert_eq!(px(cell / 2, cell / 2), (0, 0, 0));
+        // 非网格位置保持原字节：整格除了边线都该是同一个颜色
+        let mut same = 0;
+        for dy in 0..cell {
+            for dx in 0..cell {
+                if px(5 * cell + dx, 5 * cell + dy) == (0, 200, 0) {
+                    same += 1;
+                }
+            }
+        }
+        assert!(
+            same >= 30,
+            "一格 {} 个像素里只有 {} 个是源色（描边吃掉多少要看得懂）",
+            cell * cell,
+            same
+        );
+    }
+
+    #[test]
+    fn a_short_buffer_yields_zeros_instead_of_panicking() {
+        // 冻结图短一截（别处已经出声的异常）：这里只交出"没有颜色"的缓冲，不读到图外
+        let big = loupe_pixels(&[0u8; 8], 2, (0, 0, LOUPE_SPAN));
+        assert_eq!(
+            big.chunks(4).filter(|p| p[..3] != [0, 0, 0]).count(),
+            0,
+            "字节不足时不许把图外的字节放大出来"
+        );
+        assert!(loupe_pixels(&[], 0, (0, 0, 0)).is_empty());
+    }
+
+    /// 读数说的是**屏幕上**的位置（客户区坐标 + 冻结那一刻的原点）—— 副屏原点是负的，
+    /// 只报客户区坐标会让人以为对准了而其实差着一块屏。
+    #[test]
+    fn the_readout_names_the_screen_point_not_the_client_one() {
+        let t = loupe_text((27, 27, LOUPE_SPAN), (-1920, 0));
+        // 那一块的中心：-1920 + 27 + 5 与 0 + 27 + 5
+        assert!(t.contains("-1888,32"), "要说屏幕上那一格在哪: {t}");
+        assert!(t.contains("11×11"), "取的是多大一块: {t}");
+        assert!(t.contains("8 倍"), "倍率要写在同一句里: {t}");
     }
 }
