@@ -660,6 +660,10 @@ struct App {
     view: usize,
     /// 活跃分析页内的子页签：0=趋势 1=小时 2=星期 3=热力。
     atab: usize,
+    /// 键鼠榜那一屏的页内视图：0=排行 1=分组（旧 WebView 版的两颗 tab，同源同周期）。
+    rank_tab: usize,
+    /// 排行那一屏的筛选：0=全部 1=键盘 2=鼠标。
+    rank_filter: usize,
     /// 列表滚动到第几行（0 = 顶部）。
     scroll: usize,
     /// 当前统计周期；后台刷新线程也要读，所以放在原子量里。
@@ -1049,6 +1053,8 @@ impl App {
                 _db: db,
                 view: 0,
                 atab: 0,
+                rank_tab: 0,
+                rank_filter: 0,
                 scroll: 0,
                 period,
                 detail: None,
@@ -1199,6 +1205,8 @@ impl App {
             let vs = ViewState {
                 view: self.view,
                 atab: self.atab,
+                rank_tab: self.rank_tab,
+                rank_filter: self.rank_filter,
                 scroll: self.scroll,
                 period: self.period.load(std::sync::atomic::Ordering::Relaxed),
                 hover: self.hover,
@@ -1392,11 +1400,7 @@ impl App {
         let count = self
             .snap
             .lock()
-            .map(|snap| match self.view {
-                1 => snap.apps.len(),
-                2 => snap.devices.len(),
-                _ => snap.rank.len(),
-            })
+            .map(|snap| left_rows(&snap, self.view, self.rank_tab, self.rank_filter).len())
             .unwrap_or(0);
         self.scroll = self.scroll.min(count.saturating_sub(g.max_rows));
 
@@ -1886,16 +1890,44 @@ impl App {
             return;
         }
 
+        // 排行页那两排胶囊先接：它们与表行共用这张卡片，位置在标题那一行里。
+        if self.view == 0 {
+            let pills = rank_pills(left_card(w, h));
+            for (i, pill) in pills.iter().take(2).enumerate() {
+                if self.rank_tab != i && hit(*pill, x, y) {
+                    self.rank_tab = i;
+                    self.scroll = 0;
+                    self.sel = None;
+                    self.hover = None;
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+            }
+            // 后三格是筛选：分组那一屏不读它（旧版也是整个不画），所以那时不接这一笔。
+            if self.rank_tab == 0 {
+                for (i, pill) in pills.iter().skip(2).enumerate() {
+                    if self.rank_filter != i && hit(*pill, x, y) {
+                        self.rank_filter = i;
+                        self.scroll = 0;
+                        self.sel = None;
+                        self.hover = None;
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
         let r = left_card(w, h);
         let g = table_geom(r);
         let count = self
             .snap
             .lock()
-            .map(|snap| match self.view {
-                1 => snap.apps.len(),
-                2 => snap.devices.len(),
-                _ => snap.rank.len(),
-            })
+            .map(|snap| left_rows(&snap, self.view, self.rank_tab, self.rank_filter).len())
             .unwrap_or(0);
         self.scroll = self.scroll.min(count.saturating_sub(g.max_rows));
 
@@ -4085,6 +4117,8 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
 struct ViewState {
     view: usize,
     atab: usize,
+    rank_tab: usize,
+    rank_filter: usize,
     scroll: usize,
     period: i64,
     hover: Option<usize>,
@@ -6480,6 +6514,55 @@ struct TableGeom {
     x_last: f32,
 }
 
+/// 排行页标题行里那两排胶囊。下标 0..1 = 视图（排行 / 分组），2..4 = 筛选（全部 / 键盘 / 鼠标）。
+/// 「分组」那一屏不读筛选，那时后面三格既不画也不接 —— 与画图共用这一份位置，
+/// 照的是 `view_tabs` / `atab_tabs` 那个做法。
+fn rank_pills(card: D2D_RECT_F) -> [D2D_RECT_F; 5] {
+    let y = card.top + 8.0;
+    let x0 = card.left + 306.0;
+    let xs = [32.0, 90.0, 188.0, 246.0, 304.0];
+    let mut out = [rect(0.0, 0.0, 0.0, 0.0); 5];
+    for (i, dx) in xs.iter().enumerate() {
+        out[i] = rect(x0 + dx, y, 56.0, 22.0);
+    }
+    out
+}
+
+/// 两排胶囊前那两句小字（视图 / 筛选），原点与 `rank_pills` 同一份。
+fn rank_pill_captions(card: D2D_RECT_F) -> (D2D_RECT_F, D2D_RECT_F) {
+    let y = card.top + 11.0;
+    let x0 = card.left + 306.0;
+    (rect(x0, y, 30.0, 16.0), rect(x0 + 148.0, y, 30.0, 16.0))
+}
+
+/// 左表这一屏该显示哪几行，交回的是 `snap` 里那份榜的下标。
+///
+/// 屏上行号 → 榜里下标只许有这一条路：画图、悬停、点击三处都读它。两边各筛一遍就会
+/// 出现"点第 3 行、选中第 5 条"。应用榜与设备榜没有筛选，交回恒等下标。
+fn left_rows(snap: &Snapshot, view: usize, rank_tab: usize, rank_filter: usize) -> Vec<usize> {
+    if view != 0 {
+        let n = match view {
+            1 => snap.apps.len(),
+            2 => snap.devices.len(),
+            _ => 0,
+        };
+        return (0..n).collect();
+    }
+    if rank_tab == 1 {
+        return (0..snap.group.len()).collect();
+    }
+    snap.rank
+        .iter()
+        .enumerate()
+        .filter(|(_, (k, _))| match rank_filter {
+            1 => !data::rank_is_mouse(k),
+            2 => data::rank_is_mouse(k),
+            _ => true,
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 fn table_geom(r: D2D_RECT_F) -> TableGeom {
     let pad = 12.0;
     let row_h = 24.0;
@@ -6945,14 +7028,16 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     p.round(r, 14.0, &p.br.card, Some(&p.br.border));
     let g = table_geom(r);
     let tab = vs.view.min(2);
+    // 这一屏该显示哪几行（键鼠那一屏会随「分组」与筛选换内容），命中测试读的是同一份。
+    let rows = left_rows(snap, tab, vs.rank_tab, vs.rank_filter);
     let (title, total, count) = match tab {
-        1 => ("应用排行", snap.app_total, snap.apps.len()),
+        1 => ("应用排行", snap.app_total, rows.len()),
         2 => (
             "设备排行",
             snap.devices.iter().map(|d| d.count).sum(),
-            snap.devices.len(),
+            rows.len(),
         ),
-        _ => ("键鼠排行", snap.period_total, snap.rank.len()),
+        _ => ("键鼠排行", snap.period_total, rows.len()),
     };
     // 滚动位置按当前页签的行数夹一次：数据变少时别停在空白处。
     let scroll = vs.scroll.min(count.saturating_sub(g.max_rows));
@@ -6963,16 +7048,71 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         &p.fmt.body,
         &p.br.fg,
     );
+    let lane = match tab {
+        1 => queries::DOMAIN_APPS,
+        2 => queries::DOMAIN_DEVICES,
+        _ => queries::DOMAIN_KEYS,
+    };
+    let mut summary = if tab == 1 {
+        format!("共 {}", duration_text(total))
+    } else {
+        format!("共 {} 次", thousands(total.max(0) as u64))
+    };
+    // 键鼠那一屏多两个数：鼠标侧与键盘侧。写「其中」而不是把它们并成总数 ——
+    // 未落库的那截（`pending`）还没归到任何一侧，折进键盘侧就是把没证的数报成实测。
+    if tab == 0 && !snap.rank.is_empty() {
+        summary.push_str(&format!(
+            " · 其中 鼠标 {} · 键盘 {}",
+            thousands(snap.mouse_total.max(0) as u64),
+            thousands(snap.keyboard_total.max(0) as u64)
+        ));
+    }
+    summary.push_str(&gap_note(&snap.gaps, lane));
     p.text(
-        &if tab == 1 {
-            format!("共 {}", duration_text(total))
-        } else {
-            format!("共 {} 次", thousands(total.max(0) as u64))
-        },
-        rect(r.left + g.pad + 74.0, r.top + 12.0, 200.0, 18.0),
+        &summary,
+        rect(r.left + g.pad + 74.0, r.top + 12.0, 220.0, 18.0),
         &p.fmt.small,
         &p.br.muted,
     );
+    if tab == 0 {
+        let pills = rank_pills(r);
+        let (cap1, cap2) = rank_pill_captions(r);
+        p.text("视图", cap1, &p.fmt.small, &p.br.muted);
+        for (i, label) in ["排行", "分组"].iter().enumerate() {
+            let active = vs.rank_tab == i;
+            p.round(
+                pills[i],
+                6.0,
+                if active { &p.br.accent } else { &p.br.card },
+                if active { None } else { Some(&p.br.border) },
+            );
+            p.text(
+                label,
+                pills[i],
+                &p.fmt.center_small,
+                if active { &p.br.white } else { &p.br.muted },
+            );
+        }
+        // 分组那一屏读的是整份分组榜，筛选对它没有意义 ⇒ 连格子一起撤掉（旧版同做法）。
+        if vs.rank_tab == 0 {
+            p.text("筛选", cap2, &p.fmt.small, &p.br.muted);
+            for (i, label) in ["全部", "键盘", "鼠标"].iter().enumerate() {
+                let active = vs.rank_filter == i;
+                p.round(
+                    pills[i + 2],
+                    6.0,
+                    if active { &p.br.accent } else { &p.br.card },
+                    if active { None } else { Some(&p.br.border) },
+                );
+                p.text(
+                    label,
+                    pills[i + 2],
+                    &p.fmt.center_small,
+                    if active { &p.br.white } else { &p.br.muted },
+                );
+            }
+        }
+    }
 
     // 表头
     p.fill(
@@ -6984,9 +7124,10 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         ),
         &p.br.header,
     );
-    let heads = match tab {
-        1 => ["排名", "应用", "时长", "占比"],
-        2 => ["排名", "设备名", "次数", "操作"],
+    let heads: [&str; 4] = match (tab, vs.rank_tab) {
+        (1, _) => ["排名", "应用", "时长", "占比"],
+        (2, _) => ["排名", "设备名", "次数", "操作"],
+        (0, 1) => ["序", "分组", "次数", "占比"],
         _ => ["排名", "键名", "次数", "占比"],
     };
     let xs = [g.x_rank, g.x_name, g.x_count, g.x_last];
@@ -7030,10 +7171,12 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     }
 
     for vis in 0..g.max_rows {
-        let idx = scroll + vis;
-        if idx >= count {
+        let shown = scroll + vis;
+        if shown >= count {
             break;
         }
+        // `shown` 是屏上行号（选中、悬停、序号都按它），`idx` 是榜里的下标（筛选会跳过几条）。
+        let idx = rows[shown];
         let y = g.list_top + vis as f32 * g.row_h;
         let row = rect(
             r.left + g.pad,
@@ -7041,16 +7184,16 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
             r.right - r.left - g.pad * 2.0,
             g.row_h - 1.0,
         );
-        if vs.sel == Some(idx) {
+        if vs.sel == Some(shown) {
             p.round(row, 4.0, &p.br.accent_soft, None);
-        } else if vs.hover == Some(idx) || vis % 2 == 1 {
+        } else if vs.hover == Some(shown) || vis % 2 == 1 {
             p.fill(row, &p.br.header);
         }
         p.text(
-            &format!("{}", idx + 1),
+            &format!("{}", shown + 1),
             rect(g.x_rank, y + 4.0, 40.0, 18.0),
             &p.fmt.small,
-            if idx < 3 { &p.br.accent } else { &p.br.muted },
+            if shown < 3 { &p.br.accent } else { &p.br.muted },
         );
 
         match tab {
@@ -7130,6 +7273,33 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 );
                 p.text(
                     &duration_text(*secs),
+                    rect(g.x_count, y + 4.0, 80.0, 18.0),
+                    &p.fmt.small,
+                    &p.br.fg,
+                );
+                p.text(
+                    &format!("{share:.1}%"),
+                    rect(g.x_last, y + 4.0, 60.0, 18.0),
+                    &p.fmt.small,
+                    &p.br.muted,
+                );
+            }
+            _ if vs.rank_tab == 1 => {
+                // 「分组」那一屏：八组的固定顺序，占比按这一轮的总数。
+                let (name, n) = &snap.group[idx];
+                let share = if snap.period_total > 0 {
+                    *n as f32 * 100.0 / snap.period_total as f32
+                } else {
+                    0.0
+                };
+                p.text(
+                    name,
+                    rect(g.x_name, y + 3.0, 300.0, 18.0),
+                    &p.fmt.body,
+                    &p.br.fg,
+                );
+                p.text(
+                    &thousands(*n as u64),
                     rect(g.x_count, y + 4.0, 80.0, 18.0),
                     &p.fmt.small,
                     &p.br.fg,
@@ -9268,23 +9438,59 @@ mod gap_note_tests {
             !claimed.is_empty(),
             "生产代码里一处域名都没点：这条判据就变成永远绿的空转"
         );
-        // 反向的一半：这一屏已经接上的那两栏，谁哪天把那句提示删了，这里要红 ——
-        // 只查"点的都在清单上"是拦不住"整段没调用"的。
-        // ⚠ 清单上剩下的三栏（按键统计 / 应用时长 / 设备统计）现在还没人点，等排行页
-        // 那一屏接筛选与分组时把它们一起补进这一句，这条才升到"每一栏都必须有人点"。
-        for want in ["DOMAIN_DAILY", "DOMAIN_HOURLY"] {
-            assert!(
-                claimed.contains(&want),
-                "「{want}」这一栏的\"没读全\"提示没人点了：它是这一屏接回来的，不许悄悄摘掉"
-            );
-        }
-        for name in claimed {
-            let Some((_, value)) = table.iter().find(|(n, _)| *n == name) else {
-                panic!("面板点了 {name}，可 core 那份清单上查不到它 ⇒ 域名分叉了");
-            };
+        // 名字 → 值：查不到就是界面点了一个 core 清单上没有的名字（域名分叉）。
+        let claimed_values: Vec<&str> = claimed
+            .iter()
+            .map(|name| {
+                let (_, value) = table
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .unwrap_or_else(|| panic!("面板点了 {name}，可 core 那份清单上查不到它"));
+                *value
+            })
+            .collect();
+        for value in claimed_values.iter() {
             assert!(
                 queries::PANEL_READ_DOMAINS.contains(value),
                 "面板认领了「{value}」，但它不在该由面板接的那一栏清单上"
+            );
+        }
+        // 反向的那一半不许数"域名名字出现过"：`lane` 那个 match 里三个榜的域名本来就在，
+        // 就算提示从没照它调过一次，名字也照样全 —— 这条最初就是这么写的，变异跑（把调用
+        // 写死成 KEYS）当场证明它骗人。所以这里钉的是**调用形态**。
+        for (form, want, why) in [
+            (
+                ["gap_note(&snap.gaps, lane"].concat(),
+                1usize,
+                "左表那一屏按榜分栏说",
+            ),
+            (
+                ["gap_note(&snap.gaps, queries::DOMAIN_DAILY"].concat(),
+                2,
+                "趋势图 + 星期分布（后者从每日序列聚合，继承同一句）",
+            ),
+            (
+                ["gap_note(&snap.gaps, queries::DOMAIN_HOURLY"].concat(),
+                1,
+                "小时图那一栏",
+            ),
+        ] {
+            assert_eq!(
+                prod.matches(form.as_str()).count(),
+                want,
+                "{why}：这个形态少一处，就是有一栏的\"没读全\"再没人调用"
+            );
+        }
+        // 光有 `gap_note(..., lane)` 一句还不够：`lane` 三个分支要是都指同一个域名，
+        // 上面那条照样绿，另外两栏却永远不会出声。
+        for arm in [
+            "1 => queries::DOMAIN_APPS,",
+            "2 => queries::DOMAIN_DEVICES,",
+            "_ => queries::DOMAIN_KEYS,",
+        ] {
+            assert!(
+                prod.contains(arm),
+                "`lane` 里少了 {arm}：三个榜说的是同一栏的话，另外两栏的提示永远不出现"
             );
         }
     }

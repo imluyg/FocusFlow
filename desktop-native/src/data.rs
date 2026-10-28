@@ -6,6 +6,8 @@
 //! 读库走 `Database::init_readonly()`（CLI 用的那条），所以**不会**启动写入线程、
 //! 不会碰正在运行的采集进程的写队列；`FOCUSFLOW_APP_DIR` 指向哪就读哪。
 
+use std::collections::HashMap;
+
 use focusflow_core::db::queries;
 use focusflow_core::stats::{goal_status, GoalStatus, GOAL_LOOKBACK_DAYS};
 
@@ -312,6 +314,12 @@ pub struct Snapshot {
     /// 全历史最高单日。
     pub max_day: Option<(String, i64)>,
     pub rank: Vec<(String, i64)>,
+    /// 键名分组榜（`format::KEY_GROUPS` 那八组的固定顺序），排行页「分组」那一屏的行。
+    pub group: Vec<(String, i64)>,
+    /// 这一轮里鼠标那一侧的总次数（`MOUSE_GROUPS` 两组之和）。
+    pub mouse_total: i64,
+    /// 键盘那一侧 = 周期总数减鼠标：两条加起来就是标题上那个总数。
+    pub keyboard_total: i64,
     /// 前台应用时长（当前周期），按秒数降序。
     pub apps: Vec<(String, i64)>,
     pub app_total: i64,
@@ -369,6 +377,49 @@ pub fn window_text(period: i64) -> String {
     }
 }
 
+/// 键鼠榜那一屏的"鼠标侧"判据。
+///
+/// 用 core 的分组尺子（`classify_key` → `MOUSE_GROUPS`），不搬旧前端那句
+/// "看键名是不是以『鼠标』『滚轮』开头"：同一件事有两份答案时，`classify_key` 一改产出名，
+/// 鼠标那一路会静默拿到 0、键盘拿到总数 —— 数字看着完全正常，没有任何用例会红。
+pub fn rank_is_mouse(key: &str) -> bool {
+    focusflow_core::format::MOUSE_GROUPS.contains(&focusflow_core::format::classify_key(key))
+}
+
+/// 键名分组榜 + 键/鼠两侧总次数：一次算出，「分组」那一屏与标题行那两个数读同一份。
+#[derive(Clone, Debug, Default)]
+pub struct RankBreak {
+    /// 按 `KEY_GROUPS` 的固定顺序排好的分组行（空组不出行，与旧版一致）。
+    pub groups: Vec<(String, i64)>,
+    pub mouse_total: i64,
+    /// `total - mouse_total`：两条加起来永远等于这一屏的总数，不留"两边各算一遍"的口子。
+    pub keyboard_total: i64,
+}
+
+/// 分组与总次数必须在**截断之前**算：`RankTotals.rows` 交回的是未截断的整榜
+/// （降序与截断由调用方负责），截完再算会把 100 名以后的那些次数静默丢掉。
+pub fn rank_break(rows: &HashMap<String, i64>, total: i64) -> RankBreak {
+    let mut by_group: HashMap<&'static str, i64> = HashMap::new();
+    for (k, v) in rows {
+        *by_group
+            .entry(focusflow_core::format::classify_key(k))
+            .or_insert(0) += v;
+    }
+    let groups: Vec<(String, i64)> = focusflow_core::format::KEY_GROUPS
+        .iter()
+        .filter_map(|g| by_group.get(*g).map(|c| (g.to_string(), *c)))
+        .collect();
+    let mouse_total: i64 = focusflow_core::format::MOUSE_GROUPS
+        .iter()
+        .map(|g| by_group.get(*g).copied().unwrap_or(0))
+        .sum();
+    RankBreak {
+        groups,
+        mouse_total,
+        keyboard_total: total - mouse_total,
+    }
+}
+
 pub fn load(period: i64) -> Snapshot {
     let days = window_days(period);
     // 采集开着时，写线程内存里那批**还没落库**的按键也要算进来：`queries::*` 读的是
@@ -399,6 +450,8 @@ pub fn load(period: i64) -> Snapshot {
         }
     }
 
+    // 分组榜与键/鼠总次数：必须吃**未截断**的整榜，所以走在 `truncate` 之前。
+    let br = rank_break(&stats.rows, stats.total);
     let mut rank: Vec<(String, i64)> = stats.rows.into_iter().collect();
     // 次数降序；次数相同按名字升序，保证两次刷新之间不会自己换位。
     rank.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
@@ -476,6 +529,9 @@ pub fn load(period: i64) -> Snapshot {
         avg,
         max_day: all.max_day,
         rank,
+        group: br.groups,
+        mouse_total: br.mouse_total,
+        keyboard_total: br.keyboard_total,
         apps,
         app_total: app_read.total,
         devices,
@@ -532,6 +588,114 @@ mod rank_ruler_tests {
             prod(false).matches(wired.as_str()).count(),
             3,
             "周报的键、应用、设备三个 Top 榜都要走那一份尺子"
+        );
+    }
+}
+
+/// 键名分组榜与键/鼠总次数：尺子在 core，这边只管"在截断之前用它"。
+#[cfg(test)]
+mod rank_break_tests {
+    use super::*;
+
+    /// 生产文本（连整行注释一起滤掉，判据数的是代码）：本文件 `#[cfg(test)]` 之前的部分。
+    fn prod() -> String {
+        let src = include_str!("data.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn rows() -> HashMap<String, i64> {
+        [
+            ("a", 10i64),
+            ("1", 5),
+            ("F1", 7),
+            ("Shift", 3),
+            ("空格", 2),
+            ("鼠标左键", 20),
+            ("滚轮上滑", 8),
+            ("某输入法标点", 1),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    #[test]
+    fn the_groups_follow_the_core_order_not_the_counts() {
+        let br = rank_break(&rows(), 56);
+        let names: Vec<&str> = br.groups.iter().map(|(g, _)| g.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "字母键",
+                "数字键",
+                "功能键",
+                "修饰键",
+                "编辑键",
+                "鼠标点击",
+                "滚轮",
+                "其他"
+            ],
+            "行序必须是 KEY_GROUPS 那一份固定顺序，不是按次数重排"
+        );
+        assert_eq!(br.groups[5].1, 20);
+        assert_eq!(br.groups[6].1, 8);
+    }
+
+    #[test]
+    fn an_empty_group_takes_no_row_and_the_two_sides_add_up() {
+        let only_keys: HashMap<String, i64> = [("a", 4i64)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let br = rank_break(&only_keys, 4);
+        assert_eq!(br.groups.len(), 1, "没按过的组不许占一行（与旧版一致）");
+        assert_eq!(br.groups[0].0, "字母键");
+        assert_eq!(br.mouse_total, 0);
+        assert_eq!(br.keyboard_total, 4);
+
+        let br = rank_break(&rows(), 56);
+        assert_eq!(br.mouse_total, 28, "鼠标点击 20 + 滚轮 8");
+        // 这条钉的是"两边加起来就是总数"这个不变量，不是"两个数都非零"：
+        // 鼠标那一路静默拿到 0 时，一个 0 一个 56 看着完全不像坏了。
+        assert_eq!(br.mouse_total + br.keyboard_total, 56);
+    }
+
+    #[test]
+    fn the_mouse_side_is_the_group_ruler_not_a_name_prefix() {
+        assert!(rank_is_mouse("鼠标左键"));
+        assert!(rank_is_mouse("滚轮上滑"));
+        assert!(!rank_is_mouse("a"));
+        assert!(!rank_is_mouse("Shift"));
+        // 尺子只许有一份：这边再出现"看键名前缀"的写法，就是与 `classify_key` 分叉的第二把。
+        let hand = ["starts_with(", "\"鼠标\"", ")"].concat();
+        assert!(
+            !prod().contains(hand.as_str()),
+            "界面这边自己按前缀认鼠标键了 ⇒ `classify_key` 改产出名时它会静默失灵"
+        );
+    }
+
+    /// 分组必须在**截断之前**算。挪到 `truncate` 之后，100 名开外的次数会静默丢掉：
+    /// 榜看着一切正常，分组那一屏与标题上那两个数却比总数小，没有用例红。
+    #[test]
+    fn the_groups_are_made_before_the_board_is_truncated() {
+        let prod = prod();
+        let made_at = ["rank_break", "(&stats.rows"].concat();
+        let cut_at = ["truncate", "(100"].concat();
+        let made = prod.find(made_at.as_str()).expect("分组这一问不见了");
+        let cut = prod.find(cut_at.as_str()).expect("截断那一句不见了");
+        assert!(
+            made < cut,
+            "分组算在截断之后了：100 名开外的次数会静默从分组榜与键鼠总次数里消失"
+        );
+        assert_eq!(
+            prod.matches(["rank_break", "("].concat().as_str()).count(),
+            2,
+            "一处定义 + 一处调用，数量变了说明接线动过"
         );
     }
 }

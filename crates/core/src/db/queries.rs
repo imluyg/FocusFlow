@@ -42,15 +42,13 @@ pub fn clamp_query_days(days: i64) -> i64 {
 ///
 /// 一句 gap 长这样：`{哪一年} 年库{域名}读不出来: {原因}`。四个读数出口各自填自己的域名
 /// （三个榜走 `gather_rank_totals`、设备走 `gather_device_totals`、时间窗口走
-/// `read_window_years`、单日小时走 `hourly_stats_totals`）。消费侧今天这么用它：周报把攒到的
-/// gap 逐条列进正文（`desktop-native/src/main.rs` 的 `generate_weekly_report`），主窗口只在
-/// 页脚报"有 N 个年度库没读上"，**不按域名分栏**。
+/// `read_window_years`、单日小时走 `hourly_stats_totals`）。消费侧今天这么用它：主窗口
+/// 按域名分栏（`desktop-native/src/main.rs` 的 `gap_note`，一屏几栏各说各的），页脚再报一次
+/// 总数；周报把攒到的 gap 逐条列进正文（`generate_weekly_report`）。
 ///
-/// 旧 WebView 前端是按域名挑栏位的（那句 `gapNote(s, "域名")`），而且当时有一条跨文件判据
-/// `the_domain_list_is_the_single_source_for_every_side` 按这份清单逐条比三处（core 生产半边
-/// 不许再抄一份字面量、清单上每个名字都要有人点、面板与周报都不许自创名字）。那一屏与那条
-/// 判据都随前端一起删了 ⇒ 现在加域名不会红，只会多出一句没人认领的 gap。当年那条判据要防
-/// 的症状仍然成立：加一栏时只改一处，界面那一栏就对着空榜说"暂无数据"。
+/// 面板那一侧有两条腿守着（`the_panel_claims_only_registered_domains`）：界面点的域名必须
+/// 在这份清单上，清单上"该由面板接"的每一栏也必须真有人点。当年那条判据要防的症状就在这儿：
+/// 加一栏时只改一处，界面那一栏就对着空榜说"暂无数据"。
 pub const DOMAIN_KEYS: &str = "按键统计";
 /// 前台应用时长榜。
 pub const DOMAIN_APPS: &str = "应用时长";
@@ -76,11 +74,12 @@ pub const READ_DOMAINS: &[&str] = &[
     DOMAIN_DAY_HOURS,
 ];
 
-/// 旧面板"真有一栏来接"的那几条（当年 `gapNote` 逐条都有对应的调用）。
+/// 面板"真有一栏来接"的那几条（每条在屏上都有自己那句提示）。
 ///
-/// 原生面板只报条数、不按域名分栏 ⇒ 这份子清单**暂时没有读点**，留着是因为接回那一栏时，
-/// "该接哪几栏"的答案在这里。不在这一份里的域名（当日小时分布）只有周报会念：面板上本来
-/// 就没有"某一天几点"那一栏，硬要求它也有个 gap 牌子就会造出一个永远为真的空位。
+/// 桌面端按域名分栏说"这一轮没读全"，`desktop-native` 那条 `the_panel_claims_only_registered
+/// _domains` 两头都查：面板点的名字必须在这份清单上，这份清单上该由面板接的每一栏也必须
+/// 真有人点。不在这一份里的域名（当日小时分布）只有周报会念：面板上本来就没有"某一天几点"
+/// 那一栏，硬要求它也有个牌子就是造一个永远为真的空位。
 pub const PANEL_READ_DOMAINS: &[&str] = &[
     DOMAIN_KEYS,
     DOMAIN_APPS,
