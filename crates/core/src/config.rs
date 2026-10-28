@@ -84,47 +84,33 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     s(
         "gui",
         &[
-            // 图表刷新节奏：打字时每 active_refresh_interval 秒、空闲时每
-            // full_refresh_interval 秒。这句注释以前写"两个都有读点"，那是旧 WebView 端
-            // 的事：现在原生端的刷新节奏写在它自己那一侧、不读这两个键，只剩高级设置页
-            // （`desktop-native/src/data.rs`）还把它们当两行展示给人改 ⇒ 要不要接上待用户点。
+            // 主界面快照的刷新节奏（秒）。读点在 `desktop-native/src/main.rs` 的 snapshot
+            // 线程：每一拍重新读一次 ⇒ 设置页那句"改完立即生效"这次是真的。这一节里以前
+            // 挂着四行都写同一句话而原生端一个都不读，那几行已按现量收掉（见 DEPRECATED_CONFIG）。
             ("active_refresh_interval", "2"),
-            ("full_refresh_interval", "10"),
             ("theme", "light"),
+            // ⚠ 这一行屏上点得到，但原生端没有行为读点（旧 WebView 端那半截接线随前端一起
+            // 删了）：接上它等于"启动后主窗口不出现、只在托盘"，会改到验收套件的等窗口前提，
+            // 所以留待用户点，不跟其它几行一起悄悄摘。
             ("start_to_tray", "true"),
-            // 主窗口隐藏够久就卸载渲染进程（省几百 MB；false = 一直留着）
-            ("unload_hidden", "true"),
-            ("unload_hidden_delay", "60"),
-            // 按住（隐藏）一个窗口时要不要连 `TrySuspend` 一起按 —— 让那条渲染进程真的停下。
-            // 默认关：这个 API 全仓从未用过、一个数都没有，所以对拍出局之前它不许改任何行为。
-            // 读点：已经没有了 —— 那间会 TrySuspend 的 WebView 窗口随前端一起删掉，
-            // 这个键如今全仓零读点，连设置页都没列它。
-            ("suspend_hidden", "false"),
             // 悬浮窗显示口径：times / duration / both（原生端有读点：`desktop-native/src/floating.rs`
             // 取出来交给 `floating_render::metric_from`，别的值一律当 times）
             ("floating_metric", "times"),
-            // 悬浮窗用哪套绘制：webview（WebView2，旧前端的样子）/ native（原生分层窗口）。
-            // 这一档随 WebView 一起退场了：原生端只有一套绘制 ⇒ 现在没有读点，也不在
-            // 设置页暴露，留在默认值里只是旧用户 config.ini 里还认得它。
-            ("floating_renderer", "webview"),
-            // 启动时选中的统计周期（-1 = 今日）：旧前端每次切换都写回它，用来"记住上次
-            // 退出前看的周期"。原生端的周期存在进程里的一个原子量上（切换只 store、
-            // 退出不写回），所以这一键现在既没有读点也没有写它的地方 ⇒ 待用户点。
-            ("default_period", "-1"),
         ],
     );
     s(
         "hotkey",
         &[
-            ("enabled", "false"),
+            // 全局热键总开关，三条绑定共用。默认**开**：关掉的语义是"这个程序别占全局键"，
+            // 而刚装好的人期待的是"按 shift+f1 就截图"——默认关等于新装用户按不出热键。
+            // 读点在 `desktop-native/src/main.rs` 的 `make_hotkeys`（走 `combo_keys`），
+            // 关掉之后重启还是关的：这条以前只有"当场生效"那半边。
+            ("enabled", "true"),
             ("toggle_window", "ctrl+shift+f"),
             // 区域截图（原生端：`desktop-native/src/main.rs` 的覆盖层，按 `[hotkey] snip` 起）。
             // 默认值刻意避开三类撞车：
             // Win+Shift+S 被系统截图工具占着、裸 PrintScreen 被系统的"使用 Print
             // Screen 按钮"无障碍钩子抢、Ctrl+Alt+A 是微信的默认截图键。
-            // `enabled` 是总开关，三条绑定共用：关掉开关时不占用任何全局快捷键。
-            // 但它只有"当场生效"这半边 —— 启动时没有读它的人 ⇒ "关掉热键"过不了一次重启，
-            // 而这张默认表里它就是 `false`（新装用户按不出热键的另一半）⇒ 口径待用户点。
             ("snip", "shift+f1"),
             // 标注版截图：框完松手不立刻提交，而是进标注态（Enter 才提交、Esc 放弃）。
             // 默认键沿用上面那三类避让；不复用 shift+f1 而另起一键，是为了让"松手即提交"
@@ -177,6 +163,20 @@ const DEPRECATED_CONFIG: &[(&str, &[&str])] = &[
             "show_trend_chart",
             "show_key_groups",
             "font",
+            // 2026-10-28 按现量收掉的四行「屏上点得到、原生端没人读」（前两行还挂在高级设置页
+            // 上写着"改完立即生效"）：full_refresh_interval 是旧 WebView 端那套"打字/空闲两档
+            // 刷新"的第二档，原生端只有一个快照循环、没有第二档可分；unload_hidden 与
+            // unload_hidden_delay 管的是隐藏主窗口后卸载 WebView2 渲染进程，那间窗口随前端删了；
+            // 同一族的 suspend_hidden（TrySuspend 实测无收益、已撤回）也一并清掉。
+            "full_refresh_interval",
+            "unload_hidden",
+            "unload_hidden_delay",
+            "suspend_hidden",
+            // 两套绘制器（WebView2 / 原生分层窗口）只剩一套 ⇒ 这一档既没人读也没人能改
+            "floating_renderer",
+            // 原生端当前周期是进程里的一个原子量（切换只 store、退出不写回），
+            // 这个键既没有读点也没有写它的地方
+            "default_period",
         ],
     ),
     ("floating", &["opacity"]),
@@ -1268,13 +1268,10 @@ mod tests {
         // 真开关，藏在 config.ini 里不可发现就是文档缺失（floating_metric 之前
         // 就是这种状态，UI 里那个口径切换只有会改文件的人才用得到）。
         assert_eq!(cfg.get("gui", "floating_metric"), "times");
-        assert_eq!(cfg.get_int("gui", "default_period", 99), -1);
         // 插件沙箱上限与"停用插件要不要一起备份"也都要在文件里看得见
         assert_eq!(cfg.get_int("plugins", "memory_limit_mb", 0), 16);
         assert_eq!(cfg.get_int("plugins", "instruction_limit", 0), 10_000_000);
         assert!(!cfg.get_bool("database", "backup_disabled_plugins", true));
-        assert!(cfg.get_bool("gui", "unload_hidden", false));
-        assert_eq!(cfg.get_int("gui", "unload_hidden_delay", 0), 60);
         assert!(cfg.get_bool("device_stats", "enabled", false));
 
         let _ = Arc::new(());
@@ -1662,15 +1659,21 @@ work_minutes = 45
             ("gui", "font"),
             ("tray", "tooltip_interval"),
             ("pomodoro", "enabled"),
+            // 2026-10-28 收掉的那几行「屏上点得到、原生端没人读」：读不到，也不许被默认值回填
+            ("gui", "full_refresh_interval"),
+            ("gui", "unload_hidden"),
+            ("gui", "unload_hidden_delay"),
+            ("gui", "suspend_hidden"),
+            ("gui", "floating_renderer"),
+            ("gui", "default_period"),
         ] {
             assert!(
                 cfg.get(section, key).is_empty(),
                 "{section}.{key} 已无读点，必须被清掉"
             );
         }
-        // 同前缀的活键不能被顺手带走：full_refresh_interval 是高级设置页明面上的一行，
-        // work_minutes 是番茄钟真正生效的时长
-        assert_eq!(cfg.get_int("gui", "full_refresh_interval", 0), 10);
+        // 同前缀的活键不能被顺手带走：active_refresh_interval 是快照线程真的在读的那一行（设置页
+        // 明面上也有它），work_minutes 是番茄钟真正生效的时长
         assert_eq!(cfg.get_int("pomodoro", "work_minutes", 0), 45);
         assert_eq!(cfg.get_int("gui", "active_refresh_interval", 0), 2);
 

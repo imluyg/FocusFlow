@@ -13,15 +13,9 @@ database/yearly_archive
 device_stats/enabled
 floating/enabled
 gui/active_refresh_interval
-gui/default_period
 gui/floating_metric
-gui/floating_renderer
-gui/full_refresh_interval
 gui/start_to_tray
-gui/suspend_hidden
 gui/theme
-gui/unload_hidden
-gui/unload_hidden_delay
 hotkey/enabled
 hotkey/snip
 hotkey/snip_annotate

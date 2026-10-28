@@ -726,6 +726,31 @@ fn boot_notice(
         .or(hotkey_warning)
 }
 
+/// 开机之后「全局热键」那一格显示开还是关：跟着**真正注册上的组合**走，不跟着配置键走。
+///
+/// 两个理由：① 配置说开而三条一条都没注册上（全被别的程序占了），屏上写"开"就是假话；
+/// ② 这一格以前只看了唤出与截图两条，**漏了标注那条** —— 只注册上标注键时它显示"关"，
+/// 而那颗键确实在占用全局快捷键。清单与 `COMBO_KEYS` 同一枚，不再手写第二遍。
+fn hotkeys_on_after_boot(registered: [&Option<HotKey>; 3]) -> bool {
+    registered.iter().any(|hk| hk.is_some())
+}
+
+/// 快照线程每一拍睡多少秒。取 `[gui] active_refresh_interval`（设置页那一行的说法是
+/// "改完立即生效"，所以每一拍重新读一次，不在启动时读死）。
+///
+/// 笔误不许把界面打死：0、负数、超过 600 秒（有人写 999999）一律退回默认 2 秒。
+/// 放任大数的症状是"数字再也不动"，比按默认值刷新更糟，而且看起来像程序坏了而不是配置坏了。
+fn snapshot_sleep_secs(raw: i64) -> u64 {
+    if (1..=600).contains(&raw) {
+        raw as u64
+    } else {
+        DEFAULT_SNAPSHOT_SECS
+    }
+}
+
+/// 原生端历来的一拍。
+const DEFAULT_SNAPSHOT_SECS: u64 = 2;
+
 impl App {
     fn new(hwnd: HWND, mica: bool) -> windows::core::Result<Self> {
         // 配置单例：读 `config.ini`（没有就落一份默认值）。原型只用来定位数据目录。
@@ -875,7 +900,14 @@ impl App {
             std::thread::Builder::new()
                 .name("snapshot".into())
                 .spawn(move || loop {
-                    std::thread::sleep(Duration::from_secs(2));
+                    // 一拍睡多久，每一拍重新问一次配置（`[gui] active_refresh_interval`）：
+                    // 设置页那一行写着"改完立即生效"，读死在启动时就成了一句许愿。
+                    let secs = snapshot_sleep_secs(focusflow_core::config::instance().get_int(
+                        "gui",
+                        "active_refresh_interval",
+                        DEFAULT_SNAPSHOT_SECS as i64,
+                    ));
+                    std::thread::sleep(Duration::from_secs(secs));
                     let next = data::load(p.load(std::sync::atomic::Ordering::Relaxed));
                     // 悬浮窗读的是这几格，先推过去再让主界面拿新快照。
                     publish_floating(&next);
@@ -897,7 +929,7 @@ impl App {
                 snap,
                 tray,
                 hotkeys,
-                hotkeys_on: hotkey_hk.is_some() || snip_hk.is_some(),
+                hotkeys_on: hotkeys_on_after_boot([&hotkey_hk, &snip_hk, &snip_annotate_hk]),
                 hotkey_hk,
                 snip_hk,
                 snip_annotate_hk,
@@ -1951,23 +1983,25 @@ impl App {
         if !self.hotkeys_on {
             return "全局热键已关闭：三条组合都不注册".to_string();
         }
-        let toggle = register_combo(self.hotkeys.as_ref(), "toggle_window");
-        self.hotkey_hk = toggle.hk;
-        let snip = register_combo(self.hotkeys.as_ref(), "snip");
-        self.snip_hk = snip.hk;
-        let annotate = register_combo(self.hotkeys.as_ref(), "snip_annotate");
-        self.snip_annotate_hk = annotate.hk;
-        // 标签走 `hotkey_label` 那一份，不在这里抄第二遍中文
-        hotkey_status_line(&[
-            toggle.part(hotkey_label("toggle_window")),
-            snip.part(hotkey_label("snip")),
-            annotate.part(hotkey_label("snip_annotate")),
-        ])
+        // 清单走 `COMBO_KEYS` 那一份（开机那条路读同一枚表），这里不抄第二遍：
+        // 抄漏一条的症状是"开关关掉之后还剩一条热键在占键"。
+        let mut slots: [Option<HotKey>; 3] = [None, None, None];
+        let mut parts: Vec<(&'static str, String, Option<String>)> = Vec::new();
+        for (i, key) in combo_keys(true).iter().enumerate() {
+            let combo = register_combo(self.hotkeys.as_ref(), key);
+            parts.push(combo.part(hotkey_label(key)));
+            slots[i] = combo.hk;
+        }
+        self.hotkey_hk = slots[0];
+        self.snip_hk = slots[1];
+        self.snip_annotate_hk = slots[2];
+        hotkey_status_line(&parts)
     }
 
     /// 全局热键总开关：三条绑定（唤出 / 截图 / 截图进标注）一起注册或一起取消，
-    /// 配置键 `hotkey.enabled` 跟着写一份，但**启动时没有读它的人** ⇒ "关掉热键"过不了一次
-    /// 重启（要不要跨重启生效、以及随包模板里那行默认值，都是待用户点的口径）。
+    /// 配置键 `hotkey.enabled` 跟着写一份，**启动时也读它**（见 `make_hotkeys` 与
+    /// `combo_keys`）⇒ 这一格关掉的，重启之后还是关的；设置页那一行的显示状态取自
+    /// "真正注册上的组合"，所以屏上说的与按键实际会发生的是同一件事。
     fn toggle_hotkey(&mut self, hwnd: HWND) {
         self.hotkeys_on = !self.hotkeys_on;
         let msg = self.reload_hotkeys();
@@ -7239,6 +7273,23 @@ fn run_plugin_sel_test(hwnd: HWND) {
     }
 }
 
+/// 三条组合的键名，**顺序就是它们各自落进哪个字段 / 状态行点名的顺序**：
+/// 0＝`toggle_window`（唤出主窗口）、1＝`snip`（松手即存）、2＝`snip_annotate`（进标注）。
+const COMBO_KEYS: [&str; 3] = ["toggle_window", "snip", "snip_annotate"];
+
+/// 这一次启动要挂哪几条组合：总开关 `[hotkey] enabled` 关掉 ⇒ 空表，三条一起不占用全局键。
+///
+/// 以前这条只有运行中那颗开关做得到：`toggle_hotkey` 会注销并把 `hotkey.enabled` 写进配置，
+/// 可启动侧没人读它 ⇒ 重启后 `make_hotkeys` 照配置全注册回去，而屏上那一行显示的还是"开"。
+/// 抽成纯函数是因为"关掉之后还剩几条在占键"这种形状编译器与现有腿都不响。
+fn combo_keys(enabled: bool) -> &'static [&'static str] {
+    if enabled {
+        &COMBO_KEYS
+    } else {
+        &[]
+    }
+}
+
 /// 开机注册三条热键的结局。写成结构体而不是五元组：调用处按名字取值，
 /// 也不用为了多带一句状态把返回类型越拧越复杂。
 struct HotkeysAtBoot {
@@ -7258,21 +7309,28 @@ fn make_hotkeys() -> HotkeysAtBoot {
             None
         }
     };
-    let toggle = register_combo(manager.as_ref(), "toggle_window");
-    let snip = register_combo(manager.as_ref(), "snip");
-    let annotate = register_combo(manager.as_ref(), "snip_annotate");
-    let any_failed = toggle.why.is_some() || snip.why.is_some() || annotate.why.is_some();
-    let line = hotkey_status_line(&[
-        toggle.part(hotkey_label("toggle_window")),
-        snip.part(hotkey_label("snip")),
-        annotate.part(hotkey_label("snip_annotate")),
-    ]);
+    let enabled = focusflow_core::config::instance().get_bool("hotkey", "enabled", true);
+    let mut slots: [Option<HotKey>; 3] = [None, None, None];
+    let mut parts: Vec<(&'static str, String, Option<String>)> = Vec::new();
+    for (i, key) in combo_keys(enabled).iter().enumerate() {
+        let combo = register_combo(manager.as_ref(), key);
+        parts.push(combo.part(hotkey_label(key)));
+        slots[i] = combo.hk;
+    }
+    let warning = if !enabled {
+        tracing_note("热键未注册（[hotkey] enabled = false）：本次不占用任何全局键");
+        Some("全局热键没开（[hotkey] enabled = false）：三条组合都不注册".to_string())
+    } else if parts.iter().any(|(_, _, why)| why.is_some()) {
+        Some(hotkey_status_line(&parts))
+    } else {
+        None
+    };
     HotkeysAtBoot {
         manager,
-        toggle: toggle.hk,
-        snip: snip.hk,
-        annotate: annotate.hk,
-        warning: any_failed.then_some(line),
+        toggle: slots[0],
+        snip: slots[1],
+        annotate: slots[2],
+        warning,
     }
 }
 
@@ -8253,8 +8311,140 @@ fn main() -> windows::core::Result<()> {
 }
 
 #[cfg(test)]
+mod snapshot_rate_tests {
+    use super::*;
+
+    /// 刷新间隔的取值：正常值原样用；笔误那一支退回默认。放任 0 是"每秒狂转"，
+    /// 放任天文数字是"数字再也不动"——两种都比按默认值刷新更糟，而且看着像程序坏了。
+    #[test]
+    fn the_refresh_interval_clamps_instead_of_freezing_the_ui() {
+        assert_eq!(snapshot_sleep_secs(7), 7);
+        assert_eq!(snapshot_sleep_secs(1), 1);
+        assert_eq!(snapshot_sleep_secs(600), 600);
+        assert_eq!(
+            snapshot_sleep_secs(0),
+            DEFAULT_SNAPSHOT_SECS,
+            "写 0 是笔误，不是「每秒都不停」"
+        );
+        assert_eq!(snapshot_sleep_secs(-3), DEFAULT_SNAPSHOT_SECS);
+        assert_eq!(
+            snapshot_sleep_secs(999_999),
+            DEFAULT_SNAPSHOT_SECS,
+            "写天文数字的症状是数字再也不动"
+        );
+    }
+
+    /// 接线腿：那一拍真的去读这个键。只在纯函数里算而循环不读 ⇒ 设置页那句"改完立即生效"
+    /// 依旧是许愿，所以钉的是读点存在，而不是函数写得对不对。
+    #[test]
+    fn the_snapshot_loop_reads_the_interval() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        let key = ["\"", "active_refresh_interval", "\""].concat();
+        assert_eq!(
+            prod.matches(key.as_str()).count(),
+            1,
+            "生产代码里读这一键的位置应当只有快照线程那一处"
+        );
+        let call = ["snapshot_sleep_secs", "("].concat();
+        assert_eq!(
+            prod.matches(call.as_str()).count(),
+            2,
+            "一处定义 + 循环里一处调用，数量变了说明接线动过"
+        );
+    }
+}
+
+#[cfg(test)]
 mod hotkey_tests {
     use super::*;
+
+    /// 那一格跟着**注册结果**走：三条里有一条真在占全局键，显示就该是"开"。
+    /// 以前它只数了唤出与截图两条 —— 只有标注那条注册上时屏上写"关"，而那颗键确实在被占用。
+    #[test]
+    fn the_row_follows_what_actually_registered() {
+        let one = parse_combo("shift+f1");
+        assert!(one.is_some(), "夹具那串组合要能解析");
+        assert!(
+            !hotkeys_on_after_boot([&None, &None, &None]),
+            "一条都没注册上就该显示关"
+        );
+        assert!(
+            hotkeys_on_after_boot([&None, &None, &one]),
+            "只有标注那条注册上也得显示开：这一格以前漏算了第三条"
+        );
+        assert!(hotkeys_on_after_boot([&one, &None, &None]));
+        assert!(hotkeys_on_after_boot([&None, &one, &None]));
+    }
+
+    /// 总开关决定开机挂哪几条：关掉 ⇒ 一条都不占全局键；打开 ⇒ 三条，而且顺序就是
+    /// `make_hotkeys` 里落进 toggle / snip / annotate 三个字段的顺序（下标对应，错一位的
+    /// 症状是"按截图键把主窗口唤出来了"）。
+    #[test]
+    fn the_switch_decides_which_combos_boot() {
+        assert!(combo_keys(false).is_empty(), "开关关掉就该一条都不注册");
+        assert_eq!(
+            combo_keys(true),
+            &COMBO_KEYS[..],
+            "开机清单与顺序：0=唤出、1=松手即存、2=进标注"
+        );
+    }
+
+    /// 总开关的默认值必须是"开"。这条以前写的是 `false`，而那时启动侧没人读它，
+    /// 所以谁都没察觉；现在它被读了，默认值就直接决定新装的人按不按得出热键。
+    #[test]
+    fn the_hotkey_switch_defaults_to_on() {
+        let defaults = focusflow_core::config::default_config();
+        let enabled = defaults
+            .get("hotkey")
+            .and_then(|h| h.get("enabled"))
+            .map(|s| s.as_str());
+        assert_eq!(
+            enabled,
+            Some("true"),
+            "[hotkey] enabled 的默认值不是开 ⇒ 随包配置里没有这一行的人一装好就没有热键"
+        );
+    }
+
+    /// 接线腿：开机与运行中重注册两条路必须共用 `combo_keys` 那一枚清单，不许再在调用处
+    /// 把键名写成字面量——抄漏一条的症状是"开关明明关掉了，还剩一条键在占全局"。
+    #[test]
+    fn both_hotkey_paths_share_one_combo_list() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        let call = ["combo_keys", "("].concat();
+        assert_eq!(
+            prod.matches(call.as_str()).count(),
+            3,
+            "一处定义 + 开机与重注册两处调用，数量变了说明接线动过"
+        );
+        // 调用形态这一半查的是"每一处注册调用都从清单里取 key"：写字面量的形状＝某一条
+        // 不受总开关管，而编译器与上面的数量判据都不会响（第一版按"整个生产段里
+        // `snip_annotate` 只许出现一次"来查，量到 4 次——设置页那几行也在按名字读配置，
+        // 那条判据根本不是它要防的东西，改成逐行看调用）。
+        let reg = ["register_combo", "("].concat();
+        let mut calls = 0;
+        for line in prod.lines() {
+            let t = line.trim_start();
+            if !t.contains(reg.as_str()) {
+                continue;
+            }
+            if t.starts_with("fn ") {
+                continue; // 定义那一行不算调用
+            }
+            calls += 1;
+            assert!(
+                t.contains("key") && !t.contains('"'),
+                "注册调用必须递进清单里的那枚 key，不许写死名字：{t}"
+            );
+        }
+        assert_eq!(
+            calls, 2,
+            "开机与运行中重注册各一处调用，数量变了说明接线动过"
+        );
+    }
 
     /// 设置页里显示的就是核心默认值，注册时解析的也是它：默认值解析不了 = 一开机就分叉。
     #[test]

@@ -4,7 +4,7 @@
   therefore the settings page) shows, and an unusable value must not take the app down.
 
 .DESCRIPTION
-  Two launches against a fresh COPY of desktop-native\probe.
+  Three launches against a fresh COPY of desktop-native\probe.
 
   Round 1 writes two custom combos into [hotkey] and expects the app log to say it
   registered exactly those two strings -- that log line and the settings page read the
@@ -104,5 +104,43 @@ Check 'the other combo still registers' (@($log2 | Where-Object { $_ -like "*sni
 $sw2 = [Diagnostics.Stopwatch]::StartNew()
 while (-not $p2.HasExited -and $sw2.Elapsed.TotalMilliseconds -lt 8000) { Start-Sleep -Milliseconds 150 }
 if (-not $p2.HasExited) { Stop-App }
+
+# ---------- round 3: the master switch survives a restart ----------
+# The switch used to only take effect in the running process: it unregistered the combos and
+# wrote [hotkey] enabled, but nothing read that key at boot, so the next start registered all
+# three again -- while the settings row still showed whatever the last click had said.
+#
+# Absence here is backed by a presence control inside the same file: rounds 1-2 write exactly
+# these 'key = combo' lines when the switch is on, so "not one of them in this log" can only
+# come from the switch. A crashed start would also give an empty log, which is why the
+# main-window leg below is a real check rather than a skip.
+Set-ConfigLine $app 'hotkey' 'enabled' 'false'
+Remove-Item $logPath -ErrorAction SilentlyContinue
+
+$p3 = Start-App $Exe $app $WorkDir
+$h3 = Wait-Window $p3.Id
+Check 'the app starts with the switch off' ($h3 -ne [IntPtr]::Zero)
+if ($h3 -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
+
+Start-Sleep -Milliseconds 2000
+$log3 = @(Get-HotLog)
+# The off sentence carries the ASCII '[hotkey] enabled = false'. Match it with -match:
+# -like would read those brackets as a character set and silently never hit.
+Check 'the log says the switch is what stopped registration' `
+    (@($log3 | Where-Object { $_ -match '\[hotkey\] enabled = false' }).Count -gt 0)
+$regLines = @($log3 | Where-Object {
+        $_ -like "*toggle_window = $toggle1*" -or `
+        $_ -like "*snip = $snip1*" -or `
+        $_ -like "*snip_annotate = $annotate1*"
+    })
+Check 'no combo is registered while the switch is off' ($regLines.Count -eq 0) ("lines=$($regLines.Count)")
+# Turning the switch off must not eat the bindings: it is a switch, not a delete.
+$cfgAfter = Get-ConfigValue $app 'hotkey' 'snip'
+Check 'the configured combo is still in the file' ($cfgAfter -eq $snip1) "$cfgAfter"
+
+[void][FF]::PostMessage($h3, 0x8009, [IntPtr]::Zero, [IntPtr]::Zero)
+$sw3 = [Diagnostics.Stopwatch]::StartNew()
+while (-not $p3.HasExited -and $sw3.Elapsed.TotalMilliseconds -lt 8000) { Start-Sleep -Milliseconds 150 }
+if (-not $p3.HasExited) { Stop-App }
 
 Show-Summary
