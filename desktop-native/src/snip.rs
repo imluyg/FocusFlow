@@ -1383,12 +1383,14 @@ fn commit_into(dir: &std::path::Path, clipboard: bool, pin: bool) -> Verdict {
         }
     };
 
-    // 落成的文件名要带给状态读数那句，所以先把它接住
+    // 落成的文件名要带给状态读数那句，所以先把它接住；绝对路径另外接一份给 CF_HDROP
     let mut saved: Option<String> = None;
+    let mut saved_abs: Option<std::path::PathBuf> = None;
     let save = match write_png_named(dir, &png, w, h) {
         Ok(path) => {
             tracing_note(&format!("截图已保存：{} ({w}x{h})", path.display()));
             saved = path.file_name().map(|n| n.to_string_lossy().to_string());
+            saved_abs = Some(path);
             Ok(())
         }
         Err(e) => {
@@ -1399,10 +1401,24 @@ fn commit_into(dir: &std::path::Path, clipboard: bool, pin: bool) -> Verdict {
     let clip = if !clipboard {
         Ok(())
     } else {
-        match focusflow_core::capture::win::write_image_to_clipboard(&buf, w as u32, h as u32, &png)
-        {
-            Ok(()) => {
-                tracing_note(&format!("截图已进剪贴板：{w}x{h} CF_DIB+PNG"));
+        match focusflow_core::capture::win::write_image_to_clipboard(
+            &buf,
+            w as u32,
+            h as u32,
+            &png,
+            saved_abs.as_deref(),
+        ) {
+            Ok(formats) => {
+                // 报的是**实际进去的那几种**：CF_HDROP 进不去时症状是"往文件夹里粘不出文件"，
+                // 这一句要能看出它没进去。
+                tracing_note(&format!(
+                    "截图已进剪贴板：{w}x{h} {}",
+                    if formats.is_empty() {
+                        "（一种都没写进去）".to_string()
+                    } else {
+                        formats.join("+")
+                    }
+                ));
                 Ok(())
             }
             Err(e) => {
@@ -2906,8 +2922,9 @@ pub fn test_capture_to(rect: (i32, i32, i32, i32), out: &std::path::Path) {
                 w as u32,
                 h as u32,
                 &[],
+                None,
             ) {
-                Ok(()) => tracing_note("截图测试：已进剪贴板"),
+                Ok(_) => tracing_note("截图测试：已进剪贴板"),
                 Err(e) => tracing_note(&format!("截图测试：剪贴板失败 {e}")),
             }
         }

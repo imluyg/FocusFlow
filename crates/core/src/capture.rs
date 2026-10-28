@@ -448,6 +448,52 @@ pub mod win {
     /// 公开是为了让用例能盯同一个格式号 —— 别再在测试里抄一遍 8（这仓里栽过同一个常量写两遍的账）。
     pub const CF_DIB: u32 = 8;
 
+    /// CF_HDROP 的格式编号（WinUser.h：`#define CF_HDROP 15`）。
+    /// 资源管理器"往文件夹里 Ctrl+V 贴出一个 .png"读的就是这一格式 —— 只交 CF_DIB/PNG 时
+    /// 粘进桌面什么都不发生，因为那两个格式里没有文件路径。
+    pub const CF_HDROP: u32 = 15;
+
+    /// 拼 CF_HDROP 的负载：`DROPFILES` 头 + UTF-16LE 的路径表，整张表以**双 null** 收尾。
+    ///
+    /// 头是 20 字节：`pFiles`（路径表相对负载起点的偏移）、`pt.x`、`pt.y`、`fNC`、`fWide`
+    /// （1 = 宽字符）。这里刻意不碰剪贴板，只做字节布局：布局错了的症状是"粘出来是空的"
+    /// 或资源管理器直接报错，而那只有真机才看得见 ⇒ 先把布局在用例里逐字节钉住。
+    pub fn hdrop_payload(paths: &[std::path::PathBuf]) -> Vec<u8> {
+        /// `DROPFILES` 的大小：四个 DWORD 加一个 POINT = 20 字节（Win32 与 Win64 同）。
+        const HEADER: usize = 20;
+        let mut out = Vec::with_capacity(HEADER);
+        out.extend_from_slice(&(HEADER as u32).to_le_bytes()); // pFiles
+        out.extend_from_slice(&0i32.to_le_bytes()); // pt.x
+        out.extend_from_slice(&0i32.to_le_bytes()); // pt.y
+        out.extend_from_slice(&0i32.to_le_bytes()); // fNC
+        out.extend_from_slice(&1i32.to_le_bytes()); // fWide = 宽字符
+        for p in paths {
+            for unit in p.to_string_lossy().encode_utf16() {
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+            out.extend_from_slice(&0u16.to_le_bytes()); // 每条各自 null 结尾
+        }
+        out.extend_from_slice(&0u16.to_le_bytes()); // 整张表再补一个 null = 双 null 收尾
+        out
+    }
+
+    /// 这一次要往剪贴板交哪几种格式（顺序＝写入次序），以及为什么有的不交。
+    ///
+    /// CF_HDROP 只在"文件已经落成、且是绝对路径"时加：这一格式交的是**路径**，
+    /// 路径不对时资源管理器粘出来的是一个不存在的文件，比没有这一格式更糟。
+    /// 空 `png` = 编码没成功（调用方只在有成图时才传字节），那一种只交 CF_DIB。
+    pub fn clipboard_formats(png: &[u8], file: Option<&std::path::Path>) -> Vec<&'static str> {
+        let mut out = vec!["CF_DIB"];
+        if !png.is_empty() {
+            out.push("PNG");
+        }
+        let drops = file.is_some_and(|p| p.is_absolute() && p.exists());
+        if drops {
+            out.push("CF_HDROP");
+        }
+        out
+    }
+
     /// 鼠标所在屏的矩形。副屏 `x` 为负是正确结果，不是异常。
     pub fn monitor_at_cursor() -> Result<MonitorRect, String> {
         unsafe {
@@ -828,7 +874,12 @@ pub mod win {
         }
     }
 
-    /// 把截图放进剪贴板：CF_DIB（bottom-up）+ `PNG`（`png` 非空时）。
+    /// 把截图放进剪贴板：CF_DIB（bottom-up）+ `PNG`（`png` 非空时）+ `CF_HDROP`
+    /// （`file` 是已落成的绝对路径时，于是往文件夹里 Ctrl+V 能贴出那张 .png）。
+    ///
+    /// 返回**真的写进去了哪几种**（顺序＝写入次序）：调用方要把这件事说给人看，
+    /// 而"CF_DIB+PNG+CF_HDROP"是拼出来的话还是实际结果，取决于系统收不收 ——
+    /// 报告与实际同源才有意义。
     ///
     /// 线程亲和：`Open → Empty → Set… → Close` 必须整段在同一个线程里跑完，所以这里不拆成三个
     /// 公开函数；调用方把整个调用放进一个 `spawn_blocking` 闭包就是对的。
@@ -837,17 +888,25 @@ pub mod win {
         width: u32,
         height: u32,
         png: &[u8],
-    ) -> Result<(), String> {
+        file: Option<&std::path::Path>,
+    ) -> Result<Vec<&'static str>, String> {
         // 先备料再开窗：校验失败时必须原样留下用户剪贴板里的东西。
         let payload = dib_payload_bottom_up(bgra, width, height)?;
         let png_fmt = if png.is_empty() { None } else { png_format() };
+        // 路径那一格的负载也属于"备料"：它失败同样不许动用户的剪贴板。
+        let drops = clipboard_formats(png, file).contains(&"CF_HDROP");
+        let file_bytes: Option<Vec<u8>> = drops.then(|| {
+            hdrop_payload(&[file.expect("CF_HDROP 只在拿到绝对路径时才加").to_path_buf()])
+        });
 
         let owner = clip_owner_hwnd()?;
         let mut last = String::from("未尝试");
         for attempt in 1..=5u32 {
             match unsafe { OpenClipboard(Some(owner)) } {
                 Ok(()) => {
-                    let result = unsafe { write_formats(&payload, png_fmt.zip(Some(png))) };
+                    let result = unsafe {
+                        write_formats(&payload, png_fmt.zip(Some(png)), file_bytes.as_deref())
+                    };
                     // 无论成败都要关：不关的话其它程序从此读不到剪贴板，症状比本次失败严重得多。
                     if let Err(e) = unsafe { CloseClipboard() } {
                         tracing::warn!("关闭剪贴板失败（本次结果仍按 {result:?} 上报）：{e}");
@@ -886,7 +945,11 @@ pub mod win {
     }
 
     /// 已持有剪贴板时的写入段。调用方负责 `CloseClipboard`。
-    unsafe fn write_formats(dib: &[u8], png: Option<(u32, &[u8])>) -> Result<(), String> {
+    unsafe fn write_formats(
+        dib: &[u8],
+        png: Option<(u32, &[u8])>,
+        hdrop: Option<&[u8]>,
+    ) -> Result<Vec<&'static str>, String> {
         // 顺序刻意是「先把内存备料完成，最后才 EmptyClipboard」：备料任何一步失败都不该动用户
         // 已有的剪贴板内容。旧写法先 Empty 再备料，失败就留下一个**空剪贴板** —— 症状比"没复制上"
         // 更糟，是把他原本要粘的东西擦掉了。
@@ -901,12 +964,29 @@ pub mod win {
             },
             None => None,
         };
+        // CF_HDROP 的负载也属于"备料"：它失败同样不许动用户已有的剪贴板内容。
+        let h_files = match hdrop {
+            Some(bytes) => match prep_global(bytes) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    if let Some((_, hp)) = h_png {
+                        let _ = GlobalFree(Some(hp));
+                    }
+                    let _ = GlobalFree(Some(h_dib));
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
 
-        // 清空失败 ⇒ 用户的剪贴板还原样在、这两块内存仍是我们自己的：必须释放。
+        // 清空失败 ⇒ 用户的剪贴板还原样在、这几块内存仍是我们自己的：必须释放。
         // （`SetClipboardData` 只有**成功**才接手所有权 —— 这一族 bug 的固定结局是双释放。）
         if let Err(e) = EmptyClipboard() {
             if let Some((_, hp)) = h_png {
                 let _ = GlobalFree(Some(hp));
+            }
+            if let Some(hf) = h_files {
+                let _ = GlobalFree(Some(hf));
             }
             let _ = GlobalFree(Some(h_dib));
             return Err(format!("清空剪贴板失败：{e}"));
@@ -919,20 +999,36 @@ pub mod win {
             if let Some((_, hp)) = h_png {
                 let _ = GlobalFree(Some(hp));
             }
+            if let Some(hf) = h_files {
+                let _ = GlobalFree(Some(hf));
+            }
             let _ = GlobalFree(Some(h_dib));
             tracing::error!(
                 "剪贴板已清空却什么都没写进去（用户原来的内容没了，这次截图也没复制上）：{e}"
             );
             return Err(format!("写入剪贴板失败：{e}"));
         }
+        let mut written = vec!["CF_DIB"];
         // PNG 是加分项：它失败不该让整次截图算失败（CF_DIB 已经进了剪贴板）。
         if let Some((fmt, hp)) = h_png {
             if let Err(e) = SetClipboardData(fmt, Some(HANDLE(hp.0))) {
                 tracing::warn!("CF_DIB 已进剪贴板，但 PNG 没放进去：{e}");
                 let _ = GlobalFree(Some(hp));
+            } else {
+                written.push("PNG");
             }
         }
-        Ok(())
+        // CF_HDROP 也是加分项：它进不去的后果是"往文件夹里粘不出文件"，
+        // 而图已经在剪贴板里了 —— 不该因此把整次截图判成失败。
+        if let Some(hf) = h_files {
+            if let Err(e) = SetClipboardData(CF_HDROP, Some(HANDLE(hf.0))) {
+                tracing::warn!("CF_DIB/PNG 已进剪贴板，但 CF_HDROP 没放进去：{e}");
+                let _ = GlobalFree(Some(hf));
+            } else {
+                written.push("CF_HDROP");
+            }
+        }
+        Ok(written)
     }
 
     /// 一个窗口能被枚举到的全部事实。纯数据 ⇒ 过滤规则能脱离真实桌面窗口被断言：
@@ -1956,13 +2052,89 @@ mod tests {
                 (&[][..], 0u32, 0u32),
                 (&[0u8; 8][..], 2u32, 2u32),
             ] {
-                assert!(win::write_image_to_clipboard(buf, w, h, &[]).is_err());
+                assert!(win::write_image_to_clipboard(buf, w, h, &[], None).is_err());
             }
             assert_eq!(
                 clip_has_dib().expect("调用后又读不到剪贴板了"),
                 before,
                 "校验失败却动了用户的剪贴板"
             );
+        }
+
+        /// CF_HDROP 的负载布局：`DROPFILES` 头 20 字节、`pFiles` 指向头之后的路径表、
+        /// `fWide = 1`、每条路径 UTF-16LE 且各自 null 结尾、整张表再以 null 收尾（双 null）。
+        ///
+        /// 布局错了的症状只有真机才看得见（粘出来是空的、或资源管理器直接报错），
+        /// 所以先在这里逐字节钉住，别让"眼睛验过一次性场景"当成它对了。
+        #[test]
+        fn the_hdrop_blob_is_a_dropfiles_header_plus_a_double_null_terminated_wide_list() {
+            let a = std::path::PathBuf::from("D:\\数据\\snip_1.png");
+            let b = std::path::PathBuf::from("D:\\snip 2.png");
+            let blob = win::hdrop_payload(&[a.clone(), b.clone()]);
+            assert_eq!(blob.len() % 2, 0, "宽字符表必须按字节成双");
+            assert_eq!(
+                u32::from_le_bytes(blob[0..4].try_into().unwrap()),
+                20,
+                "pFiles 必须指向头之后的第一格路径"
+            );
+            assert_eq!(
+                i32::from_le_bytes(blob[16..20].try_into().unwrap()),
+                1,
+                "fWide=1：后面是 UTF-16LE，Explorer 才认这条路径"
+            );
+            // 表体逐字节等于"两条绝对路径各带一个 null，再补一个总结尾 null"
+            let mut want: Vec<u8> = Vec::new();
+            for p in [&a, &b] {
+                let s = p.to_string_lossy().into_owned();
+                assert!(s.starts_with("D:"), "夹具路径要能原样进表: {s}");
+                for unit in s.encode_utf16() {
+                    want.extend_from_slice(&unit.to_le_bytes());
+                }
+                want.extend_from_slice(&0u16.to_le_bytes());
+            }
+            want.extend_from_slice(&0u16.to_le_bytes());
+            assert_eq!(&blob[20..], &want[..], "路径表的字节不对");
+
+            // 空表：头 20 字节 + 一个总结尾 null（= "列表到此为止"），调用方不该传这种，
+            // 这里只保证它写出的是一个自洽的字节串而不是崩掉的 20 字节
+            assert_eq!(win::hdrop_payload(&[]).len(), 22);
+        }
+
+        /// 哪几种格式该交：图必须交，PNG 只在有字节时交，CF_HDROP **只在文件真落成
+        /// 且是绝对路径时**交 —— 这一格式交的是路径，路径不对时资源管理器粘出来的是一个
+        /// 不存在的文件，那比没有它更糟。
+        #[test]
+        fn only_a_real_absolute_file_earns_the_hdrop_format() {
+            let png = vec![0x89u8, b'P', b'N', b'G'];
+            let none = win::clipboard_formats(&png, None);
+            assert_eq!(none, vec!["CF_DIB", "PNG"], "没有文件就不许交 CF_HDROP");
+            assert_eq!(
+                win::clipboard_formats(&[], None),
+                vec!["CF_DIB"],
+                "没编出 PNG 时只交位图"
+            );
+
+            let dir = std::env::temp_dir().join("ff_hdrop_formats");
+            std::fs::create_dir_all(&dir).expect("建得出临时目录");
+            let file = dir.join("there.png");
+            std::fs::write(&file, b"x").expect("落得下文件");
+            assert!(
+                win::clipboard_formats(&png, Some(&file)).contains(&"CF_HDROP"),
+                "落成文件在，就该带上文件列表"
+            );
+
+            // 相对路径与"已经没了的文件"都不许交
+            let rel = std::path::PathBuf::from("data/screenshots/gone.png");
+            assert!(
+                !win::clipboard_formats(&png, Some(&rel)).contains(&"CF_HDROP"),
+                "相对路径交出去，Explorer 粘的是它自己 cwd 下那个不存在的文件"
+            );
+            let missing = dir.join("missing.png");
+            assert!(
+                !win::clipboard_formats(&png, Some(&missing)).contains(&"CF_HDROP"),
+                "文件不在了还交这一格式＝粘出一个不存在的文件"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// 成功路径真的落到剪贴板上：写一张 1x1 的 CF_DIB，再问"现在有没有 CF_DIB"。
@@ -1980,9 +2152,22 @@ mod tests {
             let bgra = [12u8, 40, 66, 255]; // 1x1 不透明
                                             // 这一层不校验 PNG 内容（编码在 encode_png 那层已经保证），所以给一段假字节即可
             let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-            if let Err(e) = win::write_image_to_clipboard(&bgra, 1, 1, &png) {
-                panic!("1x1 的图应该写得进剪贴板，却报：{e}");
-            }
+            // CF_HDROP 交的是路径 ⇒ 这一路要有一张真落成的文件（绝对路径）
+            let dir = std::env::temp_dir().join("ff_hdrop_clipboard_probe");
+            std::fs::create_dir_all(&dir).expect("建得出临时目录");
+            let file = dir.join("snip_probe.png");
+            std::fs::write(&file, &png).expect("落得下那张假 png");
+            let written = match win::write_image_to_clipboard(&bgra, 1, 1, &png, Some(&file)) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    panic!("1x1 的图应该写得进剪贴板，却报：{e}");
+                }
+            };
+            assert!(
+                written.contains(&"CF_HDROP"),
+                "报告说这一次没把文件列表交上去：{written:?}"
+            );
             assert!(
                 clip_has_dib().expect("写完读不到剪贴板，这条用例就没有观察量了"),
                 "写入返回成功，剪贴板里却没有 CF_DIB"
@@ -1996,6 +2181,13 @@ mod tests {
                 clip_has_fmt(png_fmt).expect("读不到剪贴板"),
                 "CF_DIB 进去了但 PNG 没进去：浏览器/网页编辑器只认 PNG，症状照样是\"粘不出图\""
             );
+            // 第三层：往文件夹/桌面里 Ctrl+V 要能贴出那张 .png，读的是 CF_HDROP。
+            // 前两格都过而没有这一格时的症状是"图片粘得进、文件粘不出"——只有真机看得见。
+            assert!(
+                clip_has_fmt(win::CF_HDROP).expect("读不到剪贴板"),
+                "剪贴板里没有 CF_HDROP：往文件夹里粘贴不出文件"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// 剪贴板所有者窗口建得起来，且同一线程第二次调用走缓存拿到同一个窗口。

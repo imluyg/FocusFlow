@@ -229,6 +229,17 @@ Check 'the quick path saved a PNG' (Wait-Png $before) "png $before -> $(Count-Pn
 $quickHits = @(Get-SnipLog | Where-Object { $_ -match 'snip-quick' })
 Check 'the log names the quick path' ($quickHits.Count -gt 0)
 
+# The product reports which clipboard formats it actually handed over. CF_HDROP is the one
+# that makes "Ctrl+V into a folder" produce a .png, and it only goes in when the saved file's
+# absolute path is passed along -- so this is the machine-readable witness that the snip path
+# really passes it (the byte layout of the blob is pinned in core's own tests, and pasting
+# into Explorer stays eye-verified).
+# Matched as an ASCII token on purpose: this folder's scripts are ASCII-only, and the
+# failure wording that also mentions CF_HDROP uses "CF_DIB/PNG", not this exact string.
+Check 'the clipboard got a file list too (CF_HDROP)' `
+    (@(Get-SnipLog | Where-Object { $_ -match 'CF_DIB\+PNG\+CF_HDROP' }).Count -gt 0) `
+    ("clipLines=$( @(Get-SnipLog | Where-Object { $_ -match 'CF_DIB' }).Count )")
+
 # The one product promise of the quick hotkey: mouse-up commits and nothing else opens.
 # The old assertion looked for an editor window class that no longer exists at all, which
 # passes even when the whole annotate stage is gone -- so the observable is the overlay.
