@@ -7200,11 +7200,19 @@ fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenu
         return (None, None);
     }
 
-    let icon = match Icon::from_rgba(tray_icon_rgba(32), 32, 32) {
+    // 以前这里直接用的是代码画的那颗蓝色圆点（函数上还挂着"真实版本换"），于是托盘那颗
+    // 和我们自己的标题栏/任务栏图标都不是一件事。现在两处同一份文件，读不到才退回圆点。
+    let icon = match tray_icon_image() {
         Ok(i) => i,
-        Err(e) => {
-            tracing_note(&format!("托盘图标构建失败：{e}"));
-            return (None, None);
+        Err(why) => {
+            tracing_note(&format!("托盘图标没读成（{why}）：这一格退回画的那颗圆点"));
+            match Icon::from_rgba(tray_icon_rgba(32), 32, 32) {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing_note(&format!("托盘图标构建失败：{e}"));
+                    return (None, None);
+                }
+            }
         }
     };
     match TrayIconBuilder::new()
@@ -7779,7 +7787,9 @@ fn make_hotkeys() -> HotkeysAtBoot {
     }
 }
 
-/// 托盘图标：一个蓝色圆点。真实版本换。
+/// 代码画的那颗蓝色圆点：**只当兜底**（`assets/focusflow.ico` 读不到时才用它，见 `make_tray`）。
+/// 正常形态下托盘那颗是 `.ico` 里的真图——留在这里是因为"缺一个图标"不该让整个托盘起不来，
+/// 但屏上必须看得出来那是退路（它跟别的图标明显不一样）。
 fn tray_icon_rgba(size: u32) -> Vec<u8> {
     let mut px = vec![0u8; (size * size * 4) as usize];
     let c = (size as f32 - 1.0) / 2.0;
@@ -8615,23 +8625,28 @@ fn apply_title_theme(hwnd: HWND) {
     }
 }
 
+/// 我们那份图标文件在哪。打包脚本把 `assets/focusflow.ico` 随 exe 一起放；开发期直接跑
+/// `target/...` 时 `app_dir()` 也指得回仓库 ⇒ 两个落点都认，但**只写这一遍**：
+/// 标题栏、任务栏与托盘要的是同一颗图，路径各解一遍迟早出现"托盘和标题栏不一样"。
+fn app_icon_file() -> Option<std::path::PathBuf> {
+    [
+        focusflow_core::paths::app_dir()
+            .join("assets")
+            .join("focusflow.ico"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("assets").join("focusflow.ico")))
+            .unwrap_or_default(),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
 /// 应用图标：优先用程序目录下的 `assets/focusflow.ico`（打包时随 exe 一起放），
 /// 没有就退回系统的默认图标——不因为缺一个图标就起不来。
 fn load_app_icon() -> HICON {
     unsafe {
-        let candidates = [
-            focusflow_core::paths::app_dir()
-                .join("assets")
-                .join("focusflow.ico"),
-            std::env::current_exe()
-                .ok()
-                .and_then(|e| e.parent().map(|d| d.join("assets").join("focusflow.ico")))
-                .unwrap_or_default(),
-        ];
-        for p in candidates {
-            if !p.exists() {
-                continue;
-            }
+        if let Some(p) = app_icon_file() {
             let wide: Vec<u16> = p
                 .to_string_lossy()
                 .encode_utf16()
@@ -8650,6 +8665,16 @@ fn load_app_icon() -> HICON {
         }
         LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
     }
+}
+
+/// 托盘那颗图：读的是与标题栏同一份 `.ico`，按系统的"小图标"尺寸取档
+/// （100% 缩放下 16 像素，而那份 `.ico` 里正好有 16 那一档 ⇒ 不是把 32 硬压小）。
+/// 读不到才退回代码画的那颗圆点：缺一个图标不该让托盘整个起不来。
+fn tray_icon_image() -> std::result::Result<Icon, String> {
+    let path = app_icon_file().ok_or_else(|| "找不到 assets/focusflow.ico".to_string())?;
+    let px = unsafe { GetSystemMetrics(SM_CXSMICON) };
+    let side = if px > 0 { px as u32 } else { 16 };
+    Icon::from_path(path, Some((side, side))).map_err(|e| format!("{e}"))
 }
 
 fn main() -> windows::core::Result<()> {
@@ -9948,6 +9973,27 @@ mod snip_entry_tests {
 /// 刚加"截图（松手即存）"这一项时最容易犯的就是这个，所以留一条扫源码的守卫。
 #[cfg(test)]
 mod tray_menu_tests {
+    /// 托盘那颗读的是随包的 `assets/focusflow.ico`。这条用例不测渲染，测的是那个文件
+    /// **真的是个图标容器**：把 PNG 改名成 `.ico` 会让 `Icon::from_path` 静默失败，
+    /// 屏上退回代码画的那颗圆点，而日志里只有一行——正是"图标看着不对"最难查的那条路。
+    #[test]
+    fn the_shipped_icon_file_is_a_real_icon_container() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/focusflow.ico");
+        let bytes = std::fs::read(path).expect("随包的图标文件读不出来");
+        assert!(bytes.len() > 64, "图标文件只有 {} 字节", bytes.len());
+        assert_eq!(
+            &bytes[0..4],
+            &[0x00, 0x00, 0x01, 0x00],
+            "这不是 ICO 容器（前 4 字节应是 00 00 01 00）：托盘会静默退回那颗圆点"
+        );
+        let entries = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        assert!(entries >= 2, "ICO 里只有 {entries} 档尺寸");
+        // 托盘按系统"小图标"那一档取（100% 缩放下 16 像素）。没有 16 这一档就是拿大档硬压，
+        // 症状正是"图标糊"——所以这一条也算判据，不是顺手数个数。
+        let has_16 = (0..entries).any(|i| bytes[6 + i * 16] == 16);
+        assert!(has_16, "这份 ICO 里没有 16 像素那一档，托盘只能靠缩放");
+    }
+
     #[test]
     fn every_tray_menu_id_has_a_handler() {
         let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
