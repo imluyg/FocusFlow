@@ -8576,9 +8576,15 @@ fn toggle_theme(hwnd: HWND) {
 
 /// 退出：托盘菜单与验收消息共用这一条。顺序有讲究 —— 先收卡片，再停采集并落库
 /// （`collect::shutdown` 里是 flush → stop writer → backup_on_exit），最后才销毁主窗口。
+///
+/// 收尾还要显式 `logger::shutdown()`：日志走的是 non_blocking 通道，那个 `WorkerGuard`
+/// 躺在 static 里不会自己析构，**退出前最后那几条（数据库已关闭、退出备份成没成）
+/// 过去每次都留在缓冲区里没了**。CLI 那条路早就显式收（`crates/cli/src/main.rs` 里
+/// 写着同样的理由），原生端当时漏了 —— 而排查崩溃与"退出没退干净"靠的正是日志的尾巴。
 fn quit_app(hwnd: HWND) {
     floating::shutdown();
     collect::shutdown(focusflow_core::config::instance());
+    focusflow_core::logger::shutdown();
     unsafe {
         let _ = DestroyWindow(hwnd);
     }
@@ -11435,5 +11441,53 @@ mod share_base_tests {
             "同一行、两份文件：JSON 重算得 {from_json}，CSV 那一行却是「{csv_row}」"
         );
         assert!(wrong.is_empty(), "JSON 分母判据红:\n{}", wrong.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod exit_flush_tests {
+    /// 生产文本：第一个 `#[cfg(test)]` 之前，剥掉整行注释，并把 CRLF 先归一。
+    /// 归一这步不是洁癖 —— 这台机器 `core.autocrlf=true`，一份刚检出的工作树是 CRLF，
+    /// 跨行针脚在干净检出上会红在"起点找不到了"那种与真相无关的话上（本仓踩过两次）。
+    fn prod() -> String {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 接线腿：GUI 退出这条路上必须显式收一次日志，而且要排在停采集**之后**。
+    ///
+    /// 摘掉这一句的症状不在屏上、在排查现场：日志走 non_blocking 通道，`WorkerGuard`
+    /// 躺在 static 里不会自己析构，于是「数据库已关闭」「退出备份成/没成」这几条
+    /// 每次退出都留在缓冲区里没了 —— 而查崩溃与"退不干净"靠的正是日志的尾巴。
+    /// CLI 那条路早就显式收了，原生端当时漏下。
+    #[test]
+    fn quitting_the_gui_flushes_the_log_after_the_writer_stops() {
+        let prod = prod();
+        let fn_at = prod
+            .find("fn quit_app(hwnd: HWND)")
+            .expect("quit_app 不见了（改名或换了写法，这条守卫的锚要跟着改）");
+        let rest = &prod[fn_at..];
+        let end = rest.find("\n}\n").expect("quit_app 的函数体切不出来");
+        let body = &rest[..end];
+        let need = ["focusflow_core::logger", "::shutdown();"].concat();
+        assert_eq!(
+            body.matches(need.as_str()).count(),
+            1,
+            "退出这条路上要且只有一处显式收日志"
+        );
+        let collect_at = body
+            .find("collect::shutdown(")
+            .expect("停采集那一步不见了（它没了这条次序判据就没意义）");
+        let logger_at = body.find(need.as_str()).expect("收日志那一步不见了");
+        assert!(
+            logger_at > collect_at,
+            "收日志必须排在停采集之后，否则「数据库已关闭」那几条根本没写进来：\
+             collect={collect_at} logger={logger_at}"
+        );
     }
 }

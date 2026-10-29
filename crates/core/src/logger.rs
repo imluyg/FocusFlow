@@ -62,15 +62,32 @@ pub fn shutdown() {
     drop(guard);
 }
 
+/// 从 panic payload 里取出**人能看懂的那句原因**。
+///
+/// 立它的理由是先量了一次本机工具链交回的负载类型（不是猜的）：`panic!("字面量")` 与
+/// `panic!("打不开 {x}")` 交回的都是 `&str`（带格式化那一种也是），而**索引越界**（`v[7]`）
+/// 与 `.expect(&format!("…{r}"))` 交回的是 `String`。
+///
+/// 旧写法只 `downcast_ref::<&str>()`，于是后面这两类 —— 恰恰是"数组越界"与"按算出来的
+/// 原因 expect 失败"这两个最常见的死法 —— 一律念 `unknown panic`。而 release 是
+/// `panic = "abort"`，这一行**就是那次崩溃留下的唯一线索**：本仓那条窗口崩溃的记录
+/// 已经付过学费（日志里只剩 `unknown panic @ …/window.rs:59`，原因是人按行号去翻
+/// 第三方源码翻出来的）。两种负载都认，最后才落到占位句。
+pub(crate) fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "unknown panic".to_string()
+}
+
 /// 安装全局 panic hook：未捕获的 panic 记录为 critical 日志，
 /// 并在进程终止前把未落库增量写入恢复文件（下次启动回放，见 db::writer）。
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
-        let payload = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .unwrap_or("unknown panic");
+        let payload = panic_payload_text(info.payload());
         let location = info
             .location()
             .map(|l| format!("{}:{}", l.file(), l.line()))
@@ -371,5 +388,55 @@ mod tests {
             "文件日志层的结局没被记下来（缺: {}）—— 切片没盖住函数体也会红在这里",
             wrong.join("、")
         );
+    }
+
+    /// panic 的原因必须原样进日志：绝大多数真实死因带的是 `String` 而不是 `&'static str`。
+    ///
+    /// 旧写法只 `downcast_ref::<&str>()`，于是 `.expect(&format!("打开 {p} 失败: {e}"))`、
+    /// `panic!("…{x}")`、索引越界（std 交回的就是 `String`）全部念成 `unknown panic` ——
+    /// 而 release 是 `panic = "abort"`，这一行**就是那次崩溃唯一的线索**。本仓那条窗口
+    /// 崩溃的记录已经付过学费：日志里只剩 `unknown panic @ …/window.rs:59`，原因是靠人
+    /// 按行号去翻第三方源码翻出来的。
+    #[test]
+    fn a_string_payload_keeps_its_own_words() {
+        // 真造一次**索引越界**：本机现量它交回的是 `String` 负载。
+        // `black_box` 不是装饰 —— 数组与下标都写成常量时，编译器会在编译期直接判死
+        // （`unconditional_panic` / clippy 的 `out_of_bounds_indexing`），那条路根本走不到运行时。
+        let v = std::hint::black_box(vec![1i64, 2, 3]);
+        let idx = std::hint::black_box(7usize);
+        let oob = std::panic::catch_unwind(move || {
+            let _ = v[idx];
+        });
+        let said = super::panic_payload_text(&*oob.expect_err("夹具：这里必须真的越界 panic"));
+        assert!(
+            said.contains("index out of bounds") && said.contains("7"),
+            "越界的原因（含那三个数）要整句留住，实得: {said}"
+        );
+
+        // `.expect(&format!(…))` 那一类：把算出来的原因交回（这里用 panic_any(String) 走同一条
+        // 负载形状，避开 clippy 对 expect 的两条告警 —— 要测的是钩子怎么读负载，不是 expect 本身）
+        let exp = std::panic::catch_unwind(|| {
+            std::panic::panic_any(format!(
+                "打开 focusflow_2026.db 失败：{}",
+                "库被别的进程握着"
+            ));
+        });
+        let said2 = super::panic_payload_text(&*exp.expect_err("夹具：这里必须真的 panic"));
+        assert!(
+            said2.contains("focusflow_2026.db") && said2.contains("库被别的进程握着"),
+            "带变量的 expect 原因要整句留住，实得: {said2}"
+        );
+
+        // `&'static str` 那一类（`panic!("…")` 与 `panic!("…{x}")` 本机现量都是它）照原样交回
+        let lit = std::panic::catch_unwind(|| panic!("字面量原因"));
+        let lit_payload = lit.expect_err("夹具：这里必须真的 panic");
+        assert_eq!(super::panic_payload_text(&*lit_payload), "字面量原因");
+
+        // 反向腿：两种都不是才落到占位句 —— 占位句不许把真话也吞了
+        let odd = std::panic::catch_unwind(|| {
+            std::panic::panic_any(7u32);
+        });
+        let odd_payload = odd.expect_err("夹具：这里必须真的 panic");
+        assert_eq!(super::panic_payload_text(&*odd_payload), "unknown panic");
     }
 }
