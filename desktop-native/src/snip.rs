@@ -5213,6 +5213,17 @@ mod render_probe {
                 vh
             );
             assert_eq!(paints, 1, "覆盖层建出来了却一次都没重画");
+            // 第一帧交出之后抓一格，只当读数：旧写法带 WS_VISIBLE 建窗，创建那一下先画的
+            // 是"还没冻住时那块兜底的深色"（0x141414）。**这条抓不到那一次闪** ——
+            // 等这一刻去抓，正确的第二帧早就画上去了；能把回归钉住的是
+            // `overlay_is_created_hidden_and_populated_first` 那条接线守卫。
+            // 也不比"该等于蒙版那一份"：从预抓屏到这一刻之间桌面上那一格本来就可以自己变。
+            let dim_at = pixel3(&veiled, vw, 40, 40);
+            let got = grab_rect(vx + 40, vy + 40, 1, 1).expect("抓一格没成");
+            println!(
+                "OPEN_FIRST_FRAME 抓到的 RGB=[{}, {}, {}] 预抓屏压暗后 RGB={:?}",
+                got[0], got[1], got[2], dim_at
+            );
             let ov = SNIP
                 .lock()
                 .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
@@ -5343,6 +5354,49 @@ mod tests {
             chip_band(12, w, h).3 < h - 100,
             "范围无理由吃掉底边：{}",
             chip_band(12, w, h).3
+        );
+    }
+
+    /// 开层那一下不闪黑，靠的是两条**顺序**：先建不可见的窗、先把整屏缓冲填进状态、
+    /// 再上屏；以及冻结之后不提前把悬浮窗还回去（还了就等于让用户看见一次真实桌面）。
+    ///
+    /// 为什么只能钉源码顺序：症状是一帧的瞬变，等测试去抓屏时正确的第二帧早画上去了，
+    /// "抓第一帧"那条读数对回归是瞎的 ⇒ 断言必须比的是调用的先后与形态。
+    #[test]
+    fn overlay_is_created_hidden_and_populated_first() {
+        let src = include_str!("snip.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            flat.matches("WS_POPUP.0|WS_VISIBLE.0").count(),
+            0,
+            "覆盖层又带着 WS_VISIBLE 建了：创建那一下先画的是没冻住时的兜底深色"
+        );
+        assert_eq!(
+            flat.matches("WINDOW_STYLE(WS_POPUP.0|WS_CLIPCHILDREN.0)")
+                .count(),
+            1,
+            "覆盖层的建窗样式不再是『不可见的弹出窗』"
+        );
+        let filled = flat
+            .find("s.base=base;")
+            .expect("start() 里那份整屏缓冲的赋值不见了");
+        let shown = flat
+            .find("ShowWindow(ov,SW_SHOW)")
+            .expect("覆盖层不再显式上屏了");
+        assert!(
+            filled < shown,
+            "上屏排在了填整屏缓冲前面：第一帧会画成那块兜底深色"
+        );
+        let listed = flat
+            .find("lethits=collect_candidates();")
+            .expect("冻结之后的窗口清单那一步不见了");
+        let created = flat
+            .find("RegisterClassExW(&wc)")
+            .expect("覆盖层的类注册不见了");
+        assert!(
+            !flat[listed..created].contains("set_visible(true)"),
+            "冻结之后、建窗之前又把悬浮窗还回去了：中间会看见一次真实桌面"
         );
     }
 
