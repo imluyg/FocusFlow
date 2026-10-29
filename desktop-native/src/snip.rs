@@ -5535,6 +5535,82 @@ mod render_probe {
             pump(200);
         }
     }
+    /// **这块屏之外的尺寸下，一帧到底多少钱**：改前 vs 改后，用同一批零件现量，
+    /// 不再拿 1080p 的读数按比例外推。
+    ///
+    /// 旧写法每帧付三样：整屏两份缓冲各抄一遍（clone）、压暗的整屏推一次、亮区再把整屏
+    /// 推一次（两次全屏 `SetDIBitsToDevice`）。新写法付两样：区域合成 + 区域交出。
+    /// 推送落在一块同尺寸的内存 DC 上量（真实目标是窗口 DC，两者同为 DWM 侧重定向表面，
+    /// 量级可信但不会一分不差）；clone 与合成就在同样的字节量上跑。
+    /// 只做读数：`cargo test -p focusflow-native --bins --release -- --ignored frame_cost_at_sizes --nocapture`
+    #[test]
+    #[ignore = "要一次分配 4K 尺寸的三份 31 MB 缓冲"]
+    fn frame_cost_at_sizes_other_than_this_screen() {
+        for (w, h) in [(3840i32, 2160i32), (5120i32, 1440i32)] {
+            unsafe {
+                let need = (w as usize) * (h as usize) * 4;
+                let base = vec![7u8; need];
+                let dim = vec![3u8; need];
+                let sel = (200, 160, 200 + 640, 160 + 360);
+                let region = pad_rect(sel, 12);
+                let n = 10i32;
+                // 改前零件一：整屏两份缓冲各抄一遍
+                let t = Instant::now();
+                for _ in 0..n {
+                    let a = base.clone();
+                    let b = dim.clone();
+                    std::hint::black_box((&a, &b));
+                }
+                let clone = t.elapsed().as_micros() as f64 / 1000.0 / n as f64;
+                // 改前零件二/三 + 改后：同一块同尺寸内存 DC 上的推送与区域交出
+                let screen = GetDC(None);
+                let mem = CreateCompatibleDC(Some(screen));
+                let info = BITMAPINFO {
+                    bmiHeader: focusflow_core::capture::win::dib_header(w as u32, h as u32),
+                    ..Default::default()
+                };
+                let mut pv: *mut core::ffi::c_void = std::ptr::null_mut();
+                let dib = CreateDIBSection(Some(screen), &info, DIB_RGB_COLORS, &mut pv, None, 0)
+                    .expect("建对照用的 DIB 段没成");
+                let old = SelectObject(mem, dib.into());
+                let mut dst = vec![0u8; need];
+                let t = Instant::now();
+                for _ in 0..n {
+                    blit_bgra(mem, &dim, w, h, 0, 0);
+                    blit_bgra(mem, &base, w, h, 0, 0);
+                }
+                let push2 = t.elapsed().as_micros() as f64 / 1000.0 / n as f64;
+                let t = Instant::now();
+                for _ in 0..n {
+                    let _ = compose_into_region(&mut dst, &base, &dim, Some(sel), region, w, h);
+                    let _ = BitBlt(
+                        mem,
+                        region.0,
+                        region.1,
+                        region.2 - region.0,
+                        region.3 - region.1,
+                        Some(mem),
+                        region.0,
+                        region.1,
+                        SRCCOPY,
+                    );
+                }
+                let now = t.elapsed().as_micros() as f64 / 1000.0 / n as f64;
+                SelectObject(mem, old);
+                let _ = DeleteObject(dib.into());
+                let _ = DeleteDC(mem);
+                ReleaseDC(None, screen);
+                println!(
+                "FRAME_COST {w}x{h}（一屏 {} MB）：改前={} ms（抄屏 {:.2} + 两次整屏推 {:.2}），改后={:.2} ms",
+                need / (1024 * 1024),
+                clone + push2,
+                clone,
+                push2,
+                now
+            );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
