@@ -6723,6 +6723,20 @@ fn ensure_weekly_report() {
     }
 }
 
+/// 周报数「达标」用的那把尺子。
+///
+/// 必须与面板/连续打卡是同一份：`stats::goal_status` 走的都是 `effective_goal`，而这里
+/// 原来直接拿原始配置值比 ⇒ 同一个人把 `goal.daily_keys` 设成 0（或负数）时，报告里
+/// 「达标天数 7 / 7」按 0 算（连零活动那天都算达标、每日活跃那栏还画 ✅），设置页里
+/// 「连续 N 天」按 1 算。0 次不是"没有目标"，`effective_goal` 把它兜成 1，这条注释里
+/// 说的两把尺子就是它存在的理由。
+///
+/// 单独成函数是为了让这两把尺子的相等性能被一条用例钉住（拿 `generate_weekly_report`
+/// 整个函数没法在无头环境里跑：它要读库、要落文件）。
+fn weekly_goal_met(count: i64, raw_goal: i64) -> bool {
+    count >= focusflow_core::stats::effective_goal(raw_goal)
+}
+
 fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
     use chrono::{Duration, Local};
     use focusflow_core::db::queries;
@@ -6731,6 +6745,8 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
     let today = Local::now().date_naive();
     let start = last_week_start(today);
     let end = start + Duration::days(6);
+    // ⚠ 这是**原始**配置值：判达标只许过 `weekly_goal_met`，显示目标那一句只许过
+    // `effective_goal`（两者是同一个兜法）。直接拿它比就是"报告与面板两把尺子"。
     let goal = focusflow_core::config::instance().get_int("goal", "daily_keys", 20000);
 
     let mut by_day: Vec<(chrono::NaiveDate, i64)> = Vec::new();
@@ -6782,7 +6798,10 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
         .max_by_key(|(_, v)| *v)
         .map(|(d, v)| (d.format("%m-%d").to_string(), *v))
         .unwrap_or_else(|| ("—".to_string(), 0));
-    let hit = by_day.iter().filter(|(_, v)| *v >= goal).count();
+    let hit = by_day
+        .iter()
+        .filter(|(_, v)| weekly_goal_met(*v, goal))
+        .count();
 
     let mut out = String::new();
     let _ = writeln!(
@@ -6803,7 +6822,7 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
         out,
         "- 达标天数：{} / 7（每日目标 {} 次）",
         hit,
-        thousands(goal.max(0) as u64)
+        thousands(focusflow_core::stats::effective_goal(goal).max(0) as u64)
     );
     if device_total > 0 {
         let _ = writeln!(
@@ -6823,7 +6842,11 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
 
     let _ = writeln!(out, "\n## 每日活跃\n\n| 日期 | 次数 |\n|---|---:|");
     for (d, n) in &by_day {
-        let mark = if *n >= goal { " ✅" } else { "" };
+        let mark = if weekly_goal_met(*n, goal) {
+            " ✅"
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
             "| {} | {}{} |",
@@ -11667,5 +11690,50 @@ mod clip_tests {
             "预算与矩形不是同一个宽度了：
 {win}",
         );
+    }
+
+    /// 周报数「达标」的那把尺子必须与面板/连续打卡那一份同值。
+    ///
+    /// 现量症状（`goal.daily_keys = 0`）：周报里「达标天数 7 / 7（每日目标 0 次）」连零活动
+    /// 那天都算达标、每日活跃那栏还画 ✅，而设置页的「连续 N 天」按 `effective_goal` 兜成 1
+    /// 之后判成 0 天。这条对拍拿的是同一天、同一份原始目标 ⇒ 任何一边换掉尺子都会红。
+    #[test]
+    fn the_weekly_report_and_the_panel_count_goal_the_same_way() {
+        use focusflow_core::stats::goal_status;
+        let today = chrono::Local::now().date_naive();
+        let day_key = |i: i64| {
+            (today - chrono::Duration::days(i))
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        // 近 7 天（旧→新）：两个零活动日就是被"0 目标"念成达标的那两天
+        let counts: [i64; 7] = [3, 0, 7, 0, 12, 1, 5];
+        for raw_goal in [0i64, -5, 1, 5, 20000] {
+            let rows: Vec<(String, i64)> = counts
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (day_key(6 - i as i64), *c))
+                .collect();
+            let st = goal_status(raw_goal, &rows, &day_key(0), 0);
+            assert_eq!(st.days.len(), counts.len(), "夹具前提：近 7 天每天都有判定");
+            for (i, (_, _, met)) in st.days.iter().enumerate() {
+                assert_eq!(
+                    weekly_goal_met(counts[i], raw_goal),
+                    *met,
+                    "原始目标 {raw_goal} 下第 {i} 天（{} 次）两把尺子判得不一样",
+                    counts[i]
+                );
+            }
+            if raw_goal <= 0 {
+                assert!(
+                    !weekly_goal_met(0, raw_goal),
+                    "目标兜住之后，零活动那天不该算达标（原始值 {raw_goal}）"
+                );
+                assert!(
+                    weekly_goal_met(1, raw_goal),
+                    "兜成 1 就该按 1 判（原始值 {raw_goal}）"
+                );
+            }
+        }
     }
 }
