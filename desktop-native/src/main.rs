@@ -2137,6 +2137,17 @@ impl App {
                             }
                         };
                         let s = focusflow_core::migration::import_legacy_data(&dir);
+                        // 导入是往库里写行、不产生任何键鼠事件，而屏上「今日」与「今日活跃」
+                        // 读的是写线程那份内存缓存（`today_count_for_display` 只认缓存，
+                        // 不把库值加回来）⇒ 不重锚就是"回执说了、屏上没改"，
+                        // 今日那个数一直到下次重启才对上。
+                        // 这句必须待在 data-op 这条后台线程上：它要给写线程投消息并最多等 3 秒，
+                        // 挪进窗口过程就是把整扇主窗冻在那 3 秒里。
+                        if collect::reanchor_today_after_external_write() {
+                            tracing_note(
+                                "导入后今日已按库值重锚（采集开着时屏上那个今日读的是写线程缓存）",
+                            );
+                        }
                         let mut line = format!("导入完成：{} 个年度库", s.year_dbs.len());
                         if !s.records_by_year.is_empty() {
                             let total: i64 = s.records_by_year.iter().map(|(_, n)| *n).sum();
@@ -10011,6 +10022,51 @@ mod snapshot_rate_tests {
             prod.matches(call.as_str()).count(),
             3,
             "一处定义 + 循环里两处（睡前、睡完）——数量变了说明接线动过"
+        );
+    }
+
+    /// 接线腿：导入那一支真的在写完库之后重锚了「今日」。
+    ///
+    /// 摘掉这一句的症状不是红、是屏上一个数字停在导入前的值：写线程那份内存缓存不会
+    /// 因为库里多了几行就自己动，而回执那句「导入完成：共 N 条」照样说得出口 ——
+    /// "说了、没改"是这一族最难自查的形状，所以它得被钉在**文本形状**上。
+    ///
+    /// ⚠ 钉的是调用形态与次序，不是函数名：只数 `reanchor_today_after_external_write`
+    /// 会出现"注释里提一次就够数"的假绿。这里要的是「导入那一句之后、回执拼出来之前」
+    /// 有且只有一处带括号的调用 —— 挪到别的按钮上、或漏在某个早退分支后面，都算红。
+    ///
+    /// **这条自己就假绿过一次，不是我预防到的**：本场把生产里那句调用整块注释掉来验区分性，
+    /// 判据照样绿 —— 因为它在整份 `prod` 上找字，而那三行注释里那句话与针脚逐字相同。
+    /// 所以这里先按行剥掉 `//` 之后的部分再数（同 `data.rs` 那批守卫的做法）；
+    /// 剥完再跑同一次变异才第一次看到它红。
+    #[test]
+    fn the_import_branch_reanchors_today_right_after_writing_the_db() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod: String = src[..cut]
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(i) => &line[..i],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let call = ["collect::reanchor_today_after_external_write", "()"].concat();
+        assert_eq!(
+            prod.matches(call.as_str()).count(),
+            1,
+            "导入那一支要有且只有一处重锚调用（数量变了说明接线动过；注释里提一句不算调用）"
+        );
+        let imported_at = prod
+            .find("import_legacy_data(&dir)")
+            .expect("导入那一支不见了（改名或换了写法，判据的锚要跟着改）");
+        let receipt_at = prod
+            .find("导入完成")
+            .expect("回执那句不见了（它是这条腿的次序右边界）");
+        let call_at = prod.find(call.as_str()).expect("重锚调用不见了");
+        assert!(
+            call_at > imported_at && call_at < receipt_at,
+            "重锚必须夹在「导入返回」与「拼回执」之间：导入={imported_at} 重锚={call_at} 回执={receipt_at}"
         );
     }
 

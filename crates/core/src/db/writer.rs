@@ -596,14 +596,18 @@ impl DbWriter {
 
     /// 重新统计「今日按键数 + 今日活跃时长」这两个内存缓存。
     ///
-    /// ⚠ **生产侧今天零调用方**（2026-10-29 现量：全仓只有本文件里三条用例在调它，
-    /// 导入／按日期删除／外部写库那几条路一条都没接）。这里的描述因此是"它会做什么"，
-    /// 不是"谁在做"：显示侧读的是那两个内存缓存（`today_count_for_display`，它只认缓存、
-    /// 不把库值加回来），而缓存只在 `start()` 建一次基准、`record()` 往上加、
-    /// 写线程自己那一次跨午夜重锚（本文件下面的 `reanchor_today`）时动 —— 换句话说，
-    /// 运行中途从外部往库里加今日的行，屏上那个「今日」不会跟着变，直到下次启动。
-    /// 要不要把这一句接到导入／删除之后、以及那算不算缺陷，是一句口径题，已登记待点；
-    /// 这一版**只改口、不改行为**（函数与它的三条用例都留着，语义本身是对的，缺的是调用方）。
+    /// ⚠ 这一句**曾经**是许愿（2026-10-29 上午现量：全仓只有本文件里三条用例在调它，
+    /// 文档却写着"导入或外部写库之后调用"）。当天补上了第一个真调用方：原生端设置页那颗
+    /// 「导入旧版库」在 `data-op` 后台线程上走 `collect::reanchor_today_after_external_write()`
+    /// 转进来。理由就在这条链上：显示侧读的是那两个内存缓存（`today_count_for_display`
+    /// **只认缓存、不把库值加回来**），而缓存只在 `start()` 建一次基准、`record()` 往上加、
+    /// 写线程自己那一次跨午夜重锚（本文件下面的 `reanchor_today`）时动 —— 而导入是往库里写行、
+    /// 一条事件都不产生，所以不重锚的症状是"回执说导入 N 条、屏上那个今日还是导入前的数"，
+    /// 一直到下次重启才对上。
+    ///
+    /// ⚠ 别把上面读成"所有外部写入口都会重锚"：**按日期删除、`--reset`、归档今天仍然没有**
+    /// 调它（前两者是另一条命令的进程，进程一退缓存就无所谓；跨午夜那一次由 `reanchor_today` 管）。
+    /// 要不要给原生端的删除/清空按钮也接上，仍是一句口径题，等点。
     ///
     /// 两个都得刷：落库是 `seconds = seconds + excluded.seconds` 的增量式，所以
     /// 导入进来的时长不会丢，但内存里那个基准还是旧的 —— 界面上的「今日活跃时长」
@@ -1015,8 +1019,8 @@ fn neutralize_recovery_file() {
 /// 且没有任何一行日志说它少算了。调用方拿到 `None` 时必须"保持原样"，不是"按 0 重锚"。
 ///
 /// 这条 SQL 只许有一份：`start()`（启动时的今日基准）、`recompute_today_totals`
-/// （先 flush 再读；⚠ 它今天**没有生产调用方**，见那个函数的文档）与 [`reanchor_today`]
-/// （写线程自己调，不等 flush）算的是同一个量，
+/// （先 flush 再读；调用方目前只有原生端「导入旧版库」那一条，见它自己的文档）与
+/// [`reanchor_today`]（写线程自己调，不等 flush）算的是同一个量，
 /// 两处各写一遍就是本仓那个"一把尺子抄多处、改一漏一"的老形状 —— 而抄的那两份还各自
 /// 开一次连接、各折一次 0，于是"一半读不到"会锚出半对半错的今日。
 fn today_landed_totals(today_dk: i64) -> Option<(i64, i64)> {
@@ -1815,7 +1819,12 @@ mod tests {
     /// 同一天。守卫按字面数出现次数——再抄一份（哪怕只是改了空格写法）当场红。
     #[test]
     fn the_today_totals_sql_has_exactly_one_copy() {
-        let src = include_str!("writer.rs");
+        // 行尾先归一。这台机器 `core.autocrlf=true` ⇒ **干净检出的工作树是 CRLF**，
+        // 而下面的针脚跨行（`#[cfg(test)]\nmod tests`）：不归一的话，一份刚检出的树会以
+        // "测试模块的起点找不到了"红掉，代码其实好好的。本场就是这么红的 —— 我自己一次
+        // `git stash` 往返把文件 checkout 成 CRLF，两条守卫立刻红，**在干净 HEAD 上同样红**
+        // （那就是"与改动无关"的现量证据）。
+        let src = include_str!("writer.rs").replace("\r\n", "\n");
         let prod = &src[..src
             .find("#[cfg(test)]\nmod tests")
             .expect("测试模块的起点找不到了")];
@@ -2003,7 +2012,9 @@ mod tests {
     /// `recompute_today_totals` 一直是键在前（这条把它当尺子），漏的是写线程自己那一半。
     #[test]
     fn both_reanchors_set_the_day_key_before_the_baselines() {
-        let src = include_str!("writer.rs");
+        // 行尾归一（理由同 `the_today_totals_sql_has_exactly_one_copy` 里那段）：
+        // 下面的 `stop` 是 `"\n}\n"` 与 `"\n    }\n"`，两个都跨行，CRLF 的树上一条都对不上。
+        let src = include_str!("writer.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         for (head, stop) in [
             ("fn reanchor_today(", "\n}\n"),

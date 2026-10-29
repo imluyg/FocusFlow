@@ -124,6 +124,36 @@ pub fn today_total() -> Option<i64> {
     })
 }
 
+/// 外部往库里写了「今日」那些行之后（设置页那颗「导入旧版库」按钮），把写线程的今日基准
+/// 按库里的真值重锚一次。返回**这次到底重锚了没有**。
+///
+/// 为什么非得有人调它：屏上「今日」与「今日活跃」读的是写线程的内存缓存
+/// （[`today_total`] 走 `today_count_for_display`，它**只认缓存、不把库值加回来**），
+/// 而那份缓存只在三处动 —— 启动时写线程建一次基准、每条键鼠事件往上加、
+/// 写线程自己那一次跨午夜重锚。导入是往库里写行、不产生任何事件，所以导入进来的
+/// 今日那些行**不会自己上屏**：症状是回执写着「导入完成：共 N 条」，屏上那个今日
+/// 还是导入前的数，一直到下次重启才对上。
+///
+/// 采集没开着（只读模式，或起采集失败）时回 `false` 且什么都不做：那一档下
+/// `data.rs` 本来就退回查库（`today_total()` 回 `None` 才走 `get_today_count`），
+/// 屏上已经是真值，这里多此一举只会白付一次 flush 的等待。
+///
+/// ⚠ 它会走 `flush_confirmed(true)`：给写线程投一条消息并**最多等 3 秒**。
+/// 所以只许在后台线程上调（`main.rs` 的 `data-op` 那一支就是为此存在的），
+/// 不许从窗口过程里调 —— 那会把整扇主窗冻在那 3 秒里，而且屏上看不出为什么。
+pub fn reanchor_today_after_external_write() -> bool {
+    slot()
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref().and_then(|r| r.db.writer()).map(|w| {
+                w.recompute_today_totals();
+                true
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// `FOCUSFLOW_LOG_KEYS=1`：把每个按键写一行日志。
 ///
 /// 给验收用：注入键（`keybd_event`/`SendInput`）与真键在钩子这一层长得一样，
@@ -353,5 +383,29 @@ mod tests {
         // 系统时间被拨回去：saturating_sub 之后是负数，不该 panic 也不该误删
         prune(&mut q, 10);
         assert_eq!(q.len(), 1);
+    }
+
+    /// 采集没起来时，那句"外部写完库之后重锚今日"必须报**什么都没做**。
+    ///
+    /// 为什么单独钉这一臂：`reanchor_today_after_external_write()` 内部走
+    /// `flush_confirmed(true)` —— 给写线程投一条消息并**最多等 3 秒**。只读模式（采集没开、
+    /// 或起采集失败）那一档下屏上本来就现查库、数是对的，白等一次不是"无害"：它把 3 秒
+    /// 压在后台线程上，还会把"已重锚"这句假话说给日志听。
+    ///
+    /// ⚠ 前提是**量出来的**，不是假设：单元测试这个二进制里没有任何用例调过 `collect::start`
+    /// （那两个调用点都在 `main.rs` 的生产路径上），所以静态槽恒为空。哪天有人加了一条
+    /// 会起采集的用例，第一句断言会先叫住，而不是让这条腿悄悄退化成恒真。
+    #[test]
+    fn reanchoring_without_a_collector_reports_that_it_did_nothing() {
+        assert!(
+            !is_started(),
+            "夹具前提：这条腿要的是「采集没起来」那一臂，槽里已经有运行时了"
+        );
+        assert!(
+            !reanchor_today_after_external_write(),
+            "采集没开着时要报 false —— 屏上本来就查库，不该白等一次 flush，更不该装作重锚过"
+        );
+        // 同一条链上的读数也必须是 `None`：那正是 `data.rs` 退回 `get_today_count` 的条件
+        assert_eq!(today_total(), None, "采集没起来时「今日」没有权威值");
     }
 }

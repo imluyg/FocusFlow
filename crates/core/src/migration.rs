@@ -949,6 +949,84 @@ mod tests {
         );
     }
 
+    /// 导入把新的一年搬进来之后，**同一拍**就要能看见那一年 —— 不许等 30 秒 TTL 自己到。
+    ///
+    /// 这条**不是缺陷登记，是接线腿**：负责兑现它的不是导入本身，而是
+    /// `import_year_db` 两条分支（整库复制那一支与合并那一支）末尾都调的
+    /// `maintenance::migrate_v2()` —— 失效写在它的尾部（`maintenance.rs` 里那句
+    /// `queries::invalidate_years_cache()`）。我把这条腿立起来的直接原因很实在：
+    /// 我先按"导入链路一条失效都没调"下了缺陷判断，只在 `migration.rs` 里 grep 了一次；
+    /// 结果这条判据在**摘掉我自己加的那句失效**之后照样绿 —— 是间接链早就把它办了。
+    /// 所以这条钉的是"谁真的在负责"：哪天有人把 `migrate_v2` 从导入里摘出去、或把那句
+    /// 失效挪走，这里立刻红，而不是留下"回执说了、屏上没改"那半分钟的假账。
+    ///
+    /// 前置条件是**造**出来的、不是碰巧：先用一次 `available_years()` 把"只有今年"那份
+    /// 名单灌进缓存（用例全程在 30 秒内跑完），再导入，再问一次。少了第一步，TTL 可能
+    /// 早就过期、这条腿不修也会绿。
+    #[test]
+    fn an_imported_year_is_visible_without_waiting_for_the_ttl() {
+        use chrono::Datelike;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("import_year_visible");
+        let this_year = chrono::Local::now().year();
+        let prev = this_year - 1;
+        // 旧目录里那一份"上一年"的库：照 schema 建出来并放进行数据，
+        // 否则 `available_years()` 会把它当空壳滤掉，判据就红不到 TTL 这一层上。
+        let src_dir = crate::paths::app_dir().join("import_src");
+        std::fs::create_dir_all(&src_dir).expect("建源目录");
+        let src_db = src_dir.join(format!("focusflow_{prev}.db"));
+        {
+            let conn = crate::db::connection::open_rw(&src_db).expect("造旧库");
+            crate::db::connection::ensure_schema(&conn, prev).expect("建旧库结构");
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 40, 60)",
+                [crate::db::queries::day_key_of_date(
+                    chrono::NaiveDate::from_ymd_opt(prev, 6, 1).unwrap(),
+                )],
+            )
+            .expect("放一行数据");
+        }
+        // 当前年也要有一份带数据的库，好让"预热"那一步读出来的是【只含今年】的名单
+        {
+            let conn = crate::db::connection::open_rw(&crate::paths::year_db_path(this_year))
+                .expect("建今年");
+            crate::db::connection::ensure_schema(&conn, this_year).expect("建今年结构");
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 7, 10)",
+                [crate::db::queries::day_key_of_date(
+                    chrono::Local::now().date_naive(),
+                )],
+            )
+            .expect("今年放一行");
+        }
+        assert!(
+            !crate::paths::year_db_path(prev).exists(),
+            "夹具前提：上一年在导入前根本不存在（走的是整库 `fs::copy` 那一支）"
+        );
+        // 预热：把"只有今年"这份名单灌进 30 秒缓存
+        crate::db::queries::invalidate_years_cache();
+        let before = crate::db::queries::available_years();
+        assert_eq!(
+            before,
+            vec![this_year],
+            "夹具前提：预热读到的必须是【只有今年】，否则这条判据测不到失效"
+        );
+
+        let summary = import_legacy_data(&src_dir);
+        assert!(
+            summary.year_dbs.contains(&prev),
+            "导入回执说有上一年，实得 {:?}（错误：{:?}）",
+            summary.year_dbs,
+            summary.errors
+        );
+
+        let after = crate::db::queries::available_years();
+        assert!(
+            after.contains(&prev),
+            "新的一年要在**同一次运行里**立刻可见（现在还在 TTL 里 ⇒ 屏上继续只念 {before:?}），实得 {after:?}"
+        );
+    }
+
     /// 源 `-wal` **问不出在不在**时不许静默跳过：年度库这一支随后要写导入标记，
     /// 缺的那段尾巴就永久拿不回来了（与"搬不动"那一支汇成同一个出口）。
     #[cfg(windows)]
