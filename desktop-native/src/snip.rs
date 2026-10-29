@@ -3119,41 +3119,50 @@ unsafe fn paint(hwnd: HWND) {
 }
 
 /// 抓一块屏幕（BGRA、自上而下）。冻结整块虚拟屏与调试钩子共用这一份。
+///
+/// 走的是"位图直接落进 DIB 段"那一条：旧写法是 BitBlt 到兼容位图、再 `GetDIBits` 搬第二遍，
+/// 而 `GetDIBits` 那一步是带着格式转换过的复制 —— 实测 1920x1080 整屏要 28.4 毫秒，
+/// 是"按下热键到画面出来"这一段的头一号开销。现在是一次 BitBlt + 一次 memcpy。
+/// 换法的正确性不由我口头保证：`grab_path_matches_the_old_getdibits_route` 那条屏上探针
+/// 拿旧写法当对照，**逐字节比过两份抓屏结果**才敢这么写。
 pub fn grab_rect(x: i32, y: i32, w: i32, h: i32) -> std::result::Result<Vec<u8>, String> {
     if w <= 0 || h <= 0 {
         return Err(format!("选区太小：{w}×{h}"));
     }
     unsafe {
-        use windows::Win32::Graphics::Gdi::{BitBlt, CreateCompatibleBitmap, GetDIBits, SRCCOPY};
         let screen = GetDC(None);
         if screen.0.is_null() {
             return Err("拿不到屏幕 DC".into());
         }
-        let mem = CreateCompatibleDC(Some(screen));
-        let bmp = CreateCompatibleBitmap(screen, w, h);
-        let old = SelectObject(mem, bmp.into());
-        let ok = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY).is_ok();
-        // 负高度 = 自上而下：读回来的行序与屏幕一致，后面所有换算都按这一条走。
-        let mut info = BITMAPINFO {
+        let info = BITMAPINFO {
+            // 负高度 = 自上而下：读回来的行序与屏幕一致，后面所有换算都按这一条走。
             bmiHeader: focusflow_core::capture::win::dib_header(w as u32, h as u32),
             ..Default::default()
         };
-        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
-        let lines = GetDIBits(
-            mem,
-            bmp,
-            0,
-            h as u32,
-            Some(buf.as_mut_ptr() as *mut _),
-            &mut info,
-            DIB_RGB_COLORS,
-        );
+        let mut pv: *mut core::ffi::c_void = std::ptr::null_mut();
+        let dib = match CreateDIBSection(Some(screen), &info, DIB_RGB_COLORS, &mut pv, None, 0) {
+            Ok(d) => d,
+            Err(_) => {
+                ReleaseDC(None, screen);
+                return Err("建 DIB 段没成".into());
+            }
+        };
+        if pv.is_null() {
+            let _ = DeleteObject(dib.into());
+            ReleaseDC(None, screen);
+            return Err("DIB 段没给像素指针".into());
+        }
+        let mem = CreateCompatibleDC(Some(screen));
+        let old = SelectObject(mem, dib.into());
+        let ok = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY).is_ok();
+        let need = (w as usize) * (h as usize) * 4;
+        let buf = std::slice::from_raw_parts(pv as *const u8, need).to_vec();
         SelectObject(mem, old);
-        let _ = DeleteObject(bmp.into());
+        let _ = DeleteObject(dib.into());
         let _ = DeleteDC(mem);
         ReleaseDC(None, screen);
-        if !ok || lines == 0 {
-            return Err("BitBlt/GetDIBits 没成功".into());
+        if !ok {
+            return Err("BitBlt 没成功".into());
         }
         Ok(buf)
     }
@@ -5278,6 +5287,136 @@ mod render_probe {
                 let _ = DestroyWindow(ov);
             }
             pump(200);
+        }
+    }
+    /// 抓屏换成了"DIB 段落位"这条走法，旧的 `BitBlt + GetDIBits` 在这里当**对照实现**：
+    /// 两份结果必须逐字节相同，才允许换。
+    ///
+    /// 比的对象不是"整块桌面"（那玩意儿会在两次抓取之间自己变，判据就成了看运气），
+    /// 而是**自己建的一扇纯色窗**：内容静止由我自己保证，两次抓取比的才是两条代码路径本身。
+    /// 另有一条"不能两份都是全黑"的对照腿，免得读到一个空缓冲还当通过。
+    /// 最后把整屏两把的时间打出来给人看这一刀值不值 —— 时间不做判据（噪声 ±1.5 ms）。
+    #[test]
+    #[ignore = "要真的建一扇 topmost 窗并抓屏三遍"]
+    fn grab_path_matches_the_old_getdibits_route() {
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{CreateCompatibleBitmap, GetDIBits};
+            let _serial = crate::probe_guard();
+            unsafe extern "system" fn oracle_proc(
+                h: HWND,
+                msg: u32,
+                wp: WPARAM,
+                lp: LPARAM,
+            ) -> windows::Win32::Foundation::LRESULT {
+                if msg == WM_PAINT {
+                    let mut ps = PAINTSTRUCT::default();
+                    let dc = BeginPaint(h, &mut ps);
+                    let brush = CreateSolidBrush(COLORREF(0x0000_FF00));
+                    let old = SelectObject(dc, brush.into());
+                    let _ = Rectangle(dc, 0, 0, 200, 120);
+                    SelectObject(dc, old);
+                    let _ = DeleteObject(brush.into());
+                    let _ = EndPaint(h, &ps);
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(h, msg, wp, lp)
+                }
+            }
+            let name = w!("FocusFlowGrabOracle");
+            let hinst = GetModuleHandleW(None).map(|m| m.into()).unwrap_or_default();
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(oracle_proc),
+                hInstance: hinst,
+                lpszClassName: PCWSTR(name.as_ptr()),
+                ..Default::default()
+            };
+            let _ = RegisterClassExW(&wc);
+            let (vx, vy) = virtual_origin();
+            let h = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                name,
+                name,
+                WINDOW_STYLE(WS_POPUP.0 | WS_VISIBLE.0),
+                vx + 300,
+                vy + 200,
+                200,
+                120,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .expect("对照用的纯色窗建不出来");
+            pump(300);
+
+            // 旧写法（对照实现）：BitBlt 到兼容位图，再 GetDIBits 搬第二遍
+            let old_way = |x: i32, y: i32, w: i32, hh: i32| -> Vec<u8> {
+                let screen = GetDC(None);
+                let mem = CreateCompatibleDC(Some(screen));
+                let bmp = CreateCompatibleBitmap(screen, w, hh);
+                let old = SelectObject(mem, bmp.into());
+                let _ = BitBlt(mem, 0, 0, w, hh, Some(screen), x, y, SRCCOPY);
+                let mut info = BITMAPINFO {
+                    bmiHeader: focusflow_core::capture::win::dib_header(w as u32, hh as u32),
+                    ..Default::default()
+                };
+                let mut buf = vec![0u8; (w as usize) * (hh as usize) * 4];
+                GetDIBits(
+                    mem,
+                    bmp,
+                    0,
+                    hh as u32,
+                    Some(buf.as_mut_ptr() as *mut _),
+                    &mut info,
+                    DIB_RGB_COLORS,
+                );
+                SelectObject(mem, old);
+                let _ = DeleteObject(bmp.into());
+                let _ = DeleteDC(mem);
+                ReleaseDC(None, screen);
+                buf
+            };
+            let a = old_way(vx + 300, vy + 200, 200, 120);
+            let b = grab_rect(vx + 300, vy + 200, 200, 120).expect("新走法抓屏没成");
+            let i = a.iter().zip(b.iter()).position(|(p, q)| p != q);
+            // 对照腿：两条路都得真读到那扇绿窗，否则"两份一样"可以是两份全黑
+            assert_ne!(
+                pixel3(&a, 200, 100, 60),
+                [0, 0, 0],
+                "旧写法那一份中心是黑的：根本没读到屏幕内容"
+            );
+            assert_eq!(
+                pixel3(&b, 200, 100, 60),
+                pixel3(&a, 200, 100, 60),
+                "新写法读到的中心与旧写法不一样"
+            );
+            match i {
+                Some(k) => panic!(
+                    "两份抓屏从第 {} 字节起不一样：旧 {:02x} 新 {:02x}",
+                    k, a[k], b[k]
+                ),
+                None => assert_eq!(a, b),
+            }
+            let _ = DestroyWindow(h);
+            // 整屏那一把的时间：只报数，不当判据
+            let (vw, vh) = (
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            );
+            let t = Instant::now();
+            let _ = old_way(vx, vy, vw, vh);
+            let t_old = t.elapsed();
+            let t = Instant::now();
+            let _ = grab_rect(vx, vy, vw, vh).expect("整屏抓屏没成");
+            let t_new = t.elapsed();
+            println!(
+                "GRAB_PATH 逐字节相同（对照 200x120 纯色窗）；整屏 {}x{}：旧={:.1} ms 新={:.1} ms",
+                vw,
+                vh,
+                t_old.as_micros() as f64 / 1000.0,
+                t_new.as_micros() as f64 / 1000.0
+            );
         }
     }
 }
