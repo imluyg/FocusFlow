@@ -9354,10 +9354,21 @@ fn app_icon_file() -> Option<std::path::PathBuf> {
     .find(|p| p.is_file())
 }
 
-/// 应用图标：优先用程序目录下的 `assets/focusflow.ico`（打包时随 exe 一起放），
-/// 没有就退回系统的默认图标——不因为缺一个图标就起不来。
+/// 应用图标：先问**自己的镜像**，再问随包的散文件，最后才退系统默认图标。
+///
+/// `build.rs` 早就把 `assets/focusflow.ico` 编成了 `RT_GROUP_ICON`（资源管理器、快捷方式
+/// 里那颗就是它），但这里以前只认散文件 —— 于是"只拷 exe、不拷 `assets\`"这种换版本的
+/// 装法上，文件图标是对的、托盘与标题栏却是另一颗，看着就像程序自己画错了。
+/// ⚠ `PCWSTR(1usize as *const u16)` 就是 `MAKEINTRESOURCEW(1)`：低位是资源 id、不是地址，
+/// 这是 Win32 的约定而非笔误，所以按 lint 说的换成 `std::ptr::dangling` 反而会拿不到资源。
+#[allow(clippy::manual_dangling_ptr)]
 fn load_app_icon() -> HICON {
     unsafe {
+        let hinst = GetModuleHandleW(None).map(Into::into).unwrap_or_default();
+        // MAKEINTRESOURCEW(1)：资源表里那条 `RT_GROUP_ICON` 的 id 就是 1（见 build.rs）。
+        if let Ok(h) = LoadIconW(Some(hinst), PCWSTR(1usize as *const u16)) {
+            return h;
+        }
         if let Some(p) = app_icon_file() {
             let wide: Vec<u16> = p
                 .to_string_lossy()
@@ -9379,13 +9390,24 @@ fn load_app_icon() -> HICON {
     }
 }
 
-/// 托盘那颗图：读的是与标题栏同一份 `.ico`，按系统的"小图标"尺寸取档
-/// （100% 缩放下 16 像素，而那份 `.ico` 里正好有 16 那一档 ⇒ 不是把 32 硬压小）。
-/// 读不到才退回代码画的那颗圆点：缺一个图标不该让托盘整个起不来。
+/// 托盘那颗图：先取 exe 自己资源表里那份（`build.rs` 把 `assets/focusflow.ico` 编成了
+/// `RT_GROUP_ICON`，id 就是 1），再退随包的散文件，两处都没有才退代码画的那颗圆点。
+///
+/// 现场起因：他把新 exe 单独拷进安装目录、没带 `assets\` —— 资源管理器里是蓝底白 F，
+/// 托盘里却是另一颗，而同一颗图一直就在这个镜像里，只是运行时没人读它（"同一颗图两条
+/// 取法，少接的那一条恰好是屏上走的那一条"）。
+///
+/// 按系统的"小图标"尺寸取档（100% 缩放下 16 像素，那份 `.ico` 里正好有 16 那一档 ⇒
+/// 不是把 32 硬压小）。`from_resource` 与 `from_path` 用的是同一个解码器 ⇒ 颜色与 alpha
+/// 不经过第二把尺子（贴图过曝那次事故的原因就是多了一道转换）。
 fn tray_icon_image() -> std::result::Result<Icon, String> {
-    let path = app_icon_file().ok_or_else(|| "找不到 assets/focusflow.ico".to_string())?;
     let px = unsafe { GetSystemMetrics(SM_CXSMICON) };
     let side = if px > 0 { px as u32 } else { 16 };
+    if let Ok(icon) = Icon::from_resource(1, Some((side, side))) {
+        return Ok(icon);
+    }
+    let path =
+        app_icon_file().ok_or_else(|| "镜像资源与 assets/focusflow.ico 都没读到".to_string())?;
     Icon::from_path(path, Some((side, side))).map_err(|e| format!("{e}"))
 }
 
@@ -9526,6 +9548,55 @@ fn main() -> windows::core::Result<()> {
         drop(Box::from_raw(app));
     }
     Ok(())
+}
+
+/// 托盘那颗图能不能只靠 exe 自己的资源表。
+///
+/// 现场起因：他把新 exe 单独拷进安装目录（没带 `assets\`），于是资源管理器里是蓝底白 F、
+/// 托盘里却是代码画的那颗圆点 —— 同一颗图就在镜像里，只是那条链没接。
+#[cfg(test)]
+mod icon_resource_tests {
+    use super::*;
+
+    /// 把资源表那份拼回 `.ico` 后，必须与随包的原始文件**逐字节相同**。
+    ///
+    /// 这条是"托盘可以不再依赖散文件"的地基：字节相同 ⇒ 走的是 `Icon::from_path`
+    /// 那条已经验证过的解码路径，颜色与 alpha 不经过第二把尺子（贴图过曝那次就是
+    /// 多了一道转换）。
+    /// 真的从**这个可执行文件自己的资源表**里取出那颗图。
+    ///
+    /// 前两条钉的是形状与顺序，这条把整条链跑完一遍：`build.rs` 写进镜像的
+    /// `RT_GROUP_ICON`（id 1）能被 `Icon::from_resource` 解出来 ⇒ 托盘不再需要
+    /// `assets\` 那个散文件也在。拿不到就是资源根本没链进镜像，那时这条要先红。
+    #[test]
+    fn the_tray_icon_resolves_from_this_executables_resource_table() {
+        Icon::from_resource(1, Some((16, 16)))
+            .unwrap_or_else(|e| panic!("镜像里那颗图取不出来：{e}"));
+    }
+
+    /// 取图顺序按调用形状钉：先镜像资源，再散文件，圆点只当最后的退路。
+    /// 这条盯的是"少接一份"那一族：`build.rs` 那份资源一直在，只是运行时没人读它。
+    #[test]
+    fn the_tray_and_the_title_bar_both_ask_the_module_first() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn tray_icon_image")
+            .expect("托盘取图函数的起点找不到了");
+        let tray = &prod[at..prod[at..]
+            .find("\nfn ")
+            .map(|e| at + e)
+            .unwrap_or(prod.len())];
+        let m = tray
+            .find("Icon::from_resource(1, Some((side, side)))")
+            .expect("托盘要先问镜像里的 RT_GROUP_ICON");
+        let f = tray.find("app_icon_file()").expect("散文件仍是第二顺位");
+        assert!(m < f, "顺序反了：镜像资源该在散文件之前");
+        assert!(
+            prod.contains("LoadIconW(Some(hinst), PCWSTR(1usize as *const u16))"),
+            "标题栏/任务栏那颗也要先取镜像里的 RT_GROUP_ICON"
+        );
+    }
 }
 
 /// 纵轴刻度与点高是不是同一把尺子。这四条是从旧前端那条真浏览器镜像腿（`chart-axis-harness`）
