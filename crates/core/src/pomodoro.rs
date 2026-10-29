@@ -626,10 +626,12 @@ fn build_session(s: &TimerState) -> Option<Session> {
 /// `None` = 无需落库（空闲、还没计时、或计划时长无效）。
 ///
 /// 为什么不在这里写库：`save_session` 走 `open_local()`，那是 `busy_timeout=15s` 的
-/// SQLite 写操作。而 `record_key()` 每个按键都要抢同一把 `state` 锁（rdev 钩子线程
-/// 同步调用），锁里等库 = 整个界面跟着卡住，Windows 还会在 LowLevelHooksTimeout 之后
-/// 干脆不再回调钩子 —— 表现是"统计悄悄不涨了"。计时线程的阶段完成早就是这么改的
-/// （见 `tick_loop`），这四条路径当时漏下了。
+/// SQLite 写操作。而 `record_key()` 每个按键都要抢同一把 `state` 锁 —— 它的调用方是插件的
+/// Lua 桥（`focusflow.pomodoro_record_key`），那条桥今天在生产端还没人派发（见
+/// `plugins::manager::plugin_key_event` 的文档），但接上之后落点
+/// 多半还是按键链路，所以锁里等库这条红线不动：锁里等库 = 整个界面跟着卡住，Windows 还会
+/// 在 LowLevelHooksTimeout 之后干脆不再回调钩子 —— 表现是"统计悄悄不涨了"。计时线程的阶段
+/// 完成早就是这么改的（见 `tick_loop`），这四条路径当时漏下了。
 fn take_current(s: &mut TimerState) -> Option<Session> {
     let session = build_session(s)?;
     // 零秒会话不入库也不计数：`today_summary` 是按 work 行数算番茄数的，
