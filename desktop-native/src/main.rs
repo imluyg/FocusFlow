@@ -767,7 +767,8 @@ fn hotkeys_on_after_boot(registered: [&Option<HotKey>; 3]) -> bool {
 ///
 /// 三者都不成立 ⇒ 快照线程那一整批聚合查询一拍都不该跑。以前这里**没有任何**可见性
 /// 判断（`IsWindowVisible`/`IsIconic` 全文零命中）：程序收进托盘、卡片也关着，
-/// 仍然每 2 秒查一轮。实测那一拍在"他机器量级"的库上是今日 7.1ms、总计 50.8ms。
+/// 仍然每 2 秒查一轮。那一拍值多少毫秒、多少条语句，只在下面 `LONG_PERIOD_TICKS`
+/// 那一段写一处（数出自 `crates/core/tests/perf_probe.rs`），这里不抄第二份。
 fn watching(main_visible: bool, main_iconic: bool, pill_visible: bool) -> bool {
     (main_visible && !main_iconic) || pill_visible
 }
@@ -802,9 +803,16 @@ fn snapshot_sleep_secs(raw: i64) -> u64 {
 
 /// 快照线程这一拍实际睡多少**毫秒**：短档＝基准，长档＝基准 × `LONG_PERIOD_TICKS`。
 ///
-/// 为什么要分档：一拍 `load()` 的查询面由"选了哪个周期"决定，实测今日 7.1ms、总计 50.8ms
-/// （`crates/core/tests/perf_probe.rs`，"他机器量级"那份夹具）。一个数顾不住两头 —— 给总计
-/// 1 秒是为一格不会自己变的数常驻 5% CPU；给今日 3 秒又成了"直接看的那个反而最慢"。
+/// 为什么要分档：一拍 `load()` 的查询面由"选了哪个周期"决定 —— 今日那一档只数今天，
+/// 总计那一档要跨全部年度库。一个数顾不住两头：给总计 1 秒是为一格不会自己变的数常驻
+/// 5% CPU；给今日 3 秒又成了"直接看的那个反而最慢"。
+/// 两档各值多少毫秒、多少条语句，写在下面 `LONG_PERIOD_TICKS` 那一处（别在这里抄第二份）。
+///
+/// ⚠ 这一带以前引用的是「今日 7.1ms、总计 50.8ms」，那两个数出自探针里那份**已经漂开的**
+/// 复刻清单（它还在调 `get_weekday_stats`、缺 `get_app_stats(Some(1))`）。本轮把复刻清单
+/// 钉回 `data::load()`（`tick_replica_matches_the_production_load_body` 守着）之后，在同
+/// 一份夹具上重量的是今日 8.0ms／总计 49.8ms（本轮四刀动手之前的数）—— 与旧账差一成上下，
+/// 说明漂的是"哪几臂"而不是"一共多少"，**分档结论不变**；引用它的措辞换成量得准的那一份。
 ///
 /// 周期按 `PERIODS` 的取值口径算（`-1` 今日 / `7` / `15` / `30` / `365` 一年 / `0` 总计），
 /// 不是界面上那六颗胶囊的顺序。
@@ -813,8 +821,16 @@ fn snapshot_tick_ms(raw: i64, period: i64) -> u64 {
     snapshot_sleep_secs(raw) * if long { LONG_PERIOD_TICKS } else { 1 } * 1000
 }
 
-/// 长档相对短档的倍率。今日 7.1ms/拍 ⇒ 1 秒基准占 0.7%；总计 50.8ms/拍 ⇒ 3 秒占 1.7%，
-/// 而按 1 秒要 5%。
+/// 长档相对短档的倍率。**这两个数在本仓只写这一处**（`snapshot_tick_ms` 讲为什么分档，
+/// `watching` 与 core 的 `[gui]` 默认表都指向这里，不再各自抄一份数字）。
+///
+/// 量法：`cargo test -p focusflow-core --test perf_probe -- --ignored --nocapture`，
+/// 夹具是"他机器量级"那两份年度库（各 365 天、150 键/天、5 设备 × 40 键/天），
+/// 复刻体 `tick_arms` 与生产 `data::load()` 的查询臂清单由一条源文本判据钉成同一份，
+/// 条数由挂在 `open_ro` 上的 `connection::stmt_meter` 现量（不是手算）。
+///
+/// 读数（2026-10-29，本轮四刀之后）：今日 6.5ms／10 条语句，总计 48.8ms／17 条语句。
+/// ⇒ 今日 1 秒基准占 0.65% CPU；总计按 3 秒占 1.6%，而按 1 秒要 4.9%。
 const LONG_PERIOD_TICKS: u64 = 3;
 
 /// 原生端短档基准的兜底值（`[gui] active_refresh_interval` 写错时用这个）。

@@ -86,7 +86,9 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
         &[
             // 主界面快照的**短档**基准（秒）。读点在 `desktop-native/src/main.rs` 的 snapshot
             // 线程：每一拍重新读一次 ⇒ 设置页那句"改完立即生效"这次是真的。跨一整年及以上
-            // 的两档（"1 年"与"总计"）在它上乘 3 —— 一拍查询面实测今日 7.1ms、总计 50.8ms。
+            // 的两档（"1 年"与"总计"）在它上乘 3 —— 为什么是 3、一拍量出多少，只写在
+            // `desktop-native/src/main.rs` 的 `LONG_PERIOD_TICKS` 那一段一处（数出自
+            // `crates/core/tests/perf_probe.rs`）；这里不再抄一份，抄一次就多一处会漂。
             // 这一节里以前挂着四行都写同一句话而原生端一个都不读，那几行已按现量收掉
             // （见 DEPRECATED_CONFIG）。
             ("active_refresh_interval", "1"),

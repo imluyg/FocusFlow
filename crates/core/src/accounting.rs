@@ -1083,7 +1083,8 @@ pub fn category_type(name: &str) -> CategoryType {
         Err(rusqlite::Error::QueryReturnedNoRows) => CategoryType::Absent,
         Err(e) => {
             // 「没有 categories 这张表」是真没有数据（全新库、或还没跑过建表），
-            // 与"这张表读不动"是两种结局 —— 口径同全历史汇总那条（读不出来的那一年不许当零）。
+            // 与"这张表读不动"是两种结局 —— 口径同全历史「最高单日」那条（读不出来的那一年
+            // 不许当成"那一年没纪录"，见 `db::queries::year_max_day_in_conn` 的三臂）。
             if e.to_string().contains("no such table") {
                 return CategoryType::Absent;
             }
