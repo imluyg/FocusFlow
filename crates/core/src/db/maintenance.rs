@@ -1502,8 +1502,21 @@ fn remove_backup(db: &Path) -> Result<(), String> {
 /// **问不出**时整条跳过 —— 既不按孤儿处理也不按"还在"处理（尺子在 `data_location::probe_open`）。
 pub fn sweep_stale_sidecars() -> usize {
     let dir = paths::backup_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return 0;
+    // 目录**本身**列不出来时也得分"问得出是空的"与"问不出"：每一格的判据早就三态了
+    // （主库问不出就跳过并 warn），剩下这一格还是 `else { return 0 }`，于是"根本没开始扫"
+    // 与"扫过了、没有残留"交回同一个 0，而唯一的读者只在 >0 时出声 ⇒ 孤儿 sidecar 一年年
+    // 堆在 backup/ 里，屏上与日志一个字都没有。首次备份之前目录还不存在，那是正常态。
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    "备份清扫没开始：读不出备份目录（{}）：{e} —— 这一轮一个残留都不删，下次再试",
+                    dir.display()
+                );
+            }
+            return 0;
+        }
     };
     let mut removed = 0;
     for entry in entries.flatten() {
@@ -4980,6 +4993,41 @@ mod tests {
 
     /// 主库那一格**问不出**（被别的程序挡着读）时，清扫不许把它的 sidecar 当孤儿删掉。
     ///
+    /// 备份目录**本身**列不出来时必须出声：那与"扫过了、没有残留"交回同一个 0，而唯一的
+    /// 读者只在 >0 时出声 ⇒ 孤儿 sidecar 一年年堆着，屏上与日志一个字都没有。
+    #[test]
+    fn an_unreadable_backup_dir_says_it_never_started() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("sweep_dir_unreadable");
+        let dir = paths::backup_dir();
+        // 对照带①：目录在、里面没残留 ⇒ 问得出、答案是零，一行都不该喊
+        std::fs::create_dir_all(&dir).expect("先建出备份目录");
+        let (n0, logs0) = crate::logger::capture_logs(sweep_stale_sidecars);
+        assert_eq!(n0, 0);
+        assert!(
+            !logs0.iter().any(|l| l.contains("备份清扫没开始")),
+            "目录扫得动就不该说没开始，实得 {logs0:?}"
+        );
+        // 同一个位置被一个普通文件占住（同步盘/手工挪动是真会发生的形状）⇒ read_dir 失败，
+        // 而且失败种类不是"目录还不存在"
+        std::fs::remove_dir_all(&dir).expect("腾出位置");
+        std::fs::write(&dir, "这不是目录").expect("占住备份目录的位置");
+        let (n, logs) = crate::logger::capture_logs(sweep_stale_sidecars);
+        assert_eq!(n, 0, "列不出来时一个残留都不许删");
+        assert!(
+            logs.iter().any(|l| l.contains("备份清扫没开始")),
+            "「根本没开始扫」要留下一行，实得 {logs:?}"
+        );
+        // 对照带②：路径上谁都没有（首次备份之前）是正常态，同样不许喊
+        std::fs::remove_file(&dir).expect("撤掉占位");
+        let (n2, logs2) = crate::logger::capture_logs(sweep_stale_sidecars);
+        assert_eq!(n2, 0);
+        assert!(
+            !logs2.iter().any(|l| l.contains("备份清扫没开始")),
+            "目录还没建出来不算失败，实得 {logs2:?}"
+        );
+    }
+
     /// 旧写法 `dir.join(base).exists()` 在这种场合回 `false` ⇒ `!db_exists` 短路掉
     /// `wal_can_be_dropped` ⇒ 那份**非空** `-wal` 被删：只写在 WAL 里的几笔从这份备份里永久
     /// 消失，而源库指纹已经盖上，那一年之后的备份都会被跳过。三档各留一条腿：问不出 /
