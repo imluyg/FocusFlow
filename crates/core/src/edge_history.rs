@@ -60,6 +60,26 @@ fn datetime_to_chrome(dt: &chrono::DateTime<Local>) -> i64 {
         .unwrap_or(0)
 }
 
+/// 该不该跳过复制，以及要念给人听的那句话。
+///
+/// `None`（大小问不出来）**按超大处理**：这道护栏存在的唯一目的就是"复制几百 MB 会卡顿"，
+/// 而旧写法是 `metadata(...).unwrap_or(0)` —— 问不出大小被读成"0 字节 ⇒ 很小 ⇒ 尽管复制"，
+/// 正好在最没把握的那一刻做它禁止做的事，最后念给调用方的还是「三轮复制快照都没读到」
+/// 那句错的原因。
+fn copy_should_skip(size: Option<u64>) -> Option<String> {
+    match size {
+        Some(n) if n > EDGE_COPY_MAX_BYTES => Some(format!(
+            "Edge 历史库过大（{}MB），这次不复制快照去读",
+            n / (1024 * 1024)
+        )),
+        None => Some(
+            "问不出 Edge 历史库的大小，这次不复制快照去读（这道护栏防的就是复制超大库卡顿）"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 /// 打开 Edge History（只读优先，锁定则复制）。
 /// 复制前大小保护阈值：Edge 历史库超过该大小（字节）时不再复制
 /// （复制几百 MB 会卡顿，直接返回错误提示）。
@@ -302,17 +322,12 @@ fn with_edge_snapshot<T>(f: impl Fn(&Connection) -> Option<T>) -> Snapshot<T> {
         }
     }
 
-    // 2) 复制兜底：先检查大小，超大库跳过复制避免卡顿
-    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    if size > EDGE_COPY_MAX_BYTES {
-        tracing::warn!(
-            "Edge 历史库过大（{}MB），跳过复制（只读直连被锁定）",
-            size / (1024 * 1024)
-        );
-        return Snapshot::Unreadable(format!(
-            "Edge 历史库过大（{}MB），这次不复制快照去读",
-            size / (1024 * 1024)
-        ));
+    // 2) 复制兜底：先问大小 —— 超大库，以及**问不出大小**的那一次，都跳过复制（见
+    // `copy_should_skip`：这道护栏防的就是"复制几百 MB 卡顿"）。
+    let size = std::fs::metadata(&path).map(|m| m.len()).ok();
+    if let Some(why) = copy_should_skip(size) {
+        tracing::warn!("{why}（只读直连没能拿到可用快照）");
+        return Snapshot::Unreadable(why);
     }
     let temp = temp_copy_path();
     for attempt in 0..3 {
@@ -2119,6 +2134,62 @@ mod tests {
         assert!(
             stale_days_before(today, 30).is_empty(),
             "判据读不出来时本轮不该补档 —— 那要留给下一轮"
+        );
+    }
+
+    /// 大小这道护栏只认问得出的数：**问不出大小按超大处理**，不折成 0 字节。
+    #[test]
+    fn an_unanswerable_size_skips_the_copy() {
+        assert!(
+            copy_should_skip(None).is_some(),
+            "这道护栏防的就是复制超大库卡顿；问不出大小的那一刻最没把握，不能去做它禁止的事"
+        );
+        assert!(
+            copy_should_skip(Some(EDGE_COPY_MAX_BYTES)).is_none(),
+            "等于上限不算超"
+        );
+        assert!(copy_should_skip(Some(EDGE_COPY_MAX_BYTES + 1)).is_some());
+        assert!(copy_should_skip(Some(0)).is_none(), "真的空文件不必跳");
+        // 两句要念的话各自点名自己的原因，不许拿一句顶另一句
+        let too_big = copy_should_skip(Some(300 * 1024 * 1024)).expect("300MB 该跳");
+        assert!(
+            too_big.contains("过大") && too_big.contains("300MB"),
+            "该念出具体大小: {too_big}"
+        );
+        let unknown = copy_should_skip(None).expect("问不出也该跳");
+        assert!(
+            unknown.contains("问不出"),
+            "原因要念的是问不出大小: {unknown}"
+        );
+    }
+
+    /// 接线守卫：复制兜底那一支必须把"问不出"交给上面那把尺子，而不是自己折成 0。
+    ///
+    /// 切片按本文件既有约定：切在 `mod tests {` 之前并先摘掉注释行 —— 我的 needle 就写在
+    /// 这个测试模里，不摘干净的话守卫会被自己那串字面量命中（永远绿）。
+    #[test]
+    fn the_copy_branch_asks_the_guard_instead_of_guessing_zero() {
+        let src = include_str!("edge_history.rs");
+        let prod = &src[..src.find("\nmod tests {").expect("测试模块的起点找不到了")];
+        let flat: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("letsize=std::fs::metadata(&path).map(|m|m.len()).ok();"),
+            "大小那一读又折回 unwrap_or(0) 了"
+        );
+        assert!(
+            flat.contains("ifletSome(why)=copy_should_skip(size)"),
+            "复制兜底那一支不再问这道护栏"
+        );
+        assert!(
+            !flat.contains("size>EDGE_COPY_MAX_BYTES"),
+            "旧的比较形状（把问不出当 0 字节那一条）回来了"
         );
     }
 }
