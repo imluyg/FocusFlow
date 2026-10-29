@@ -5419,6 +5419,122 @@ mod render_probe {
             );
         }
     }
+    /// 同一把尺子伸到**标注阶段**：那一阶段每帧要把已有的十几笔全部重画一遍，
+    /// 是最可能"画到一半被取走"的场合 —— 闪烁的判据之前只量过拖框那一段，不够。
+    ///
+    /// 40 拍里画笔的落点在选择区内走，每拍画完之后抓一格（选区内、避开所有笔画与工具条）：
+    /// 读到压暗那一份就是一帧"只有蒙版"。顺带把每帧实际搬运的字节峰值报出来。
+    #[test]
+    #[ignore = "会真的在屏幕上盖一层全屏覆盖层并连续抓屏"]
+    fn annotating_many_marks_never_presents_a_veil_only_frame() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let owner = HWND(std::ptr::null_mut());
+            start(owner, true);
+            pump(400);
+            let ov = SNIP
+                .lock()
+                .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
+                .expect("SNIP 取不到");
+            assert_ne!(ov.0, std::ptr::null_mut(), "覆盖层没建出来");
+            let (bw, bh, origin) = SNIP.lock().map(|s| (s.base_w, s.base_h, s.origin)).unwrap();
+            assert!(bw > 900 && bh > 800, "这块屏容不下这条判据：{bw}x{bh}");
+            let mut base = synth(bw, bh);
+            for px in base.as_chunks_mut::<4>().0 {
+                px[3] = 0;
+            }
+            let dim = dim_bgra(&base);
+            let sel = (100, 100, 800, 600);
+            // 十二笔都挤在选区左上，采样点留在右下那一角，免得把"被笔画盖住"当成异常
+            let marks: Vec<Mark> = (0..12)
+                .map(|i| {
+                    let y = 20 + i * 24;
+                    Mark {
+                        shape: Shape::Rect(10, y, 230, 14),
+                        style: Style {
+                            rgb: rgb(255, 40, 40),
+                            w: 4,
+                            font: 30,
+                        },
+                    }
+                })
+                .collect();
+            let (px, py) = (740i32, 560i32);
+            if let Ok(mut s) = SNIP.lock() {
+                s.base = base.clone();
+                s.dim = dim.clone();
+                s.presented_all = false;
+                s.phase = Phase::Adjust;
+                s.sel = sel;
+                s.drag = None;
+                s.hover = None;
+                s.hits.clear();
+                s.marks = marks;
+                s.cur = (px, py);
+                s.tool = 2;
+            }
+            let mut veil = 0u32;
+            let mut other = 0u32;
+            let mut paints = 0u32;
+            let mut moved_max = 0usize;
+            for i in 0..40i32 {
+                let (cx, cy) = (620 + i * 3, 420 + i * 2);
+                if let Ok(mut s) = SNIP.lock() {
+                    s.drag = Some((Drag::Mark, 600, 400));
+                    s.cur = (cx, cy);
+                    let p = (cx - sel.0, cy - sel.1);
+                    if s.pen_pts.last() != Some(&p) {
+                        s.pen_pts.push(p);
+                    }
+                }
+                let _ = InvalidateRect(Some(ov), None, false);
+                let mut spins = 0u32;
+                let mut empty = 0u32;
+                while empty < 3 && spins < 2000 {
+                    spins += 1;
+                    let mut got_msg = false;
+                    let mut msg = MSG::default();
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        got_msg = true;
+                        if msg.message == WM_PAINT && msg.hwnd == ov {
+                            paints += 1;
+                        }
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    empty = if got_msg { 0 } else { empty + 1 };
+                }
+                if i > 1 {
+                    let mv = SNIP.lock().map(|s| s.last_moved).unwrap_or(0);
+                    if mv > moved_max {
+                        moved_max = mv;
+                    }
+                }
+                let shot = grab_rect(origin.0 + px, origin.1 + py, 1, 1).expect("抓一格没成");
+                let got = [shot[0], shot[1], shot[2]];
+                if got == pixel3(&dim, bw, px, py) {
+                    veil += 1;
+                } else if got != pixel3(&base, bw, px, py) {
+                    other += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+            println!(
+                "ANNOT_DRAG 拍数=40 画={paints} 只有蒙版的一帧={veil} 既非蒙版也非原图={other} 每帧字节峰值={} KB",
+                moved_max / 1024
+            );
+            assert_eq!(
+                veil, 0,
+                "标注阶段屏幕上被交出 {veil} 次「只有蒙版」的一帧：十几笔重画时被取走"
+            );
+            assert_eq!(
+                other, 0,
+                "有 {other} 拍那一格既不是原图也不是蒙版：采样点被画到的东西挡住了，判据要挪位置"
+            );
+            let _ = DestroyWindow(ov);
+            pump(200);
+        }
+    }
 }
 
 #[cfg(test)]
