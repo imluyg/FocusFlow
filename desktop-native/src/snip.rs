@@ -4986,6 +4986,115 @@ mod render_probe {
             pump(200);
         }
     }
+
+    /// 拖框的每一拍，屏幕上是不是**一直**有亮区：数"只有蒙版的一帧"。
+    ///
+    /// 「一直在闪烁」是能数的东西：旧写法每帧把整屏推两遍（先蒙版、后亮区），
+    /// 合成器在两遍之间取走的那一屏就只有蒙版。这一把按 8 毫秒一拍（= 125Hz 鼠标）
+    /// 拖 60 拍，每拍等它真画完再从显示器抓回**选区中心那一格**：
+    /// 抓到蒙版那一份 = 一帧闪；同时数画的次数，画的比拍少就是丢帧（"像 PPT"那一半）。
+    /// 采样点取在上一拍与这一拍两块亮区的交叠里，这样"抓到的是上一帧"不会算成闪。
+    ///
+    /// 默认不跑（真会盖一层全屏并连续抓屏）：
+    /// `cargo test -p focusflow-native --bins --release -- --ignored paced_drag --nocapture`
+    #[test]
+    #[ignore = "会真的在屏幕上盖一层全屏覆盖层并连续抓屏"]
+    fn paced_drag_never_presents_a_veil_only_frame() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let mut home = POINT::default();
+            let _ = GetCursorPos(&mut home);
+            let owner = HWND(std::ptr::null_mut());
+            start(owner, false);
+            pump(400);
+            let ov = SNIP
+                .lock()
+                .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
+                .expect("SNIP 取不到");
+            assert_ne!(ov.0, std::ptr::null_mut(), "覆盖层没建出来");
+            let (bw, bh, origin) = SNIP.lock().map(|s| (s.base_w, s.base_h, s.origin)).unwrap();
+            assert!(bw > 900 && bh > 700, "这块屏容不下这条判据：{bw}x{bh}");
+            let mut base = synth(bw, bh);
+            for px in base.as_chunks_mut::<4>().0 {
+                px[3] = 0;
+            }
+            let dim = dim_bgra(&base);
+            if let Ok(mut s) = SNIP.lock() {
+                s.base = base.clone();
+                s.dim = dim.clone();
+                // 换了缓冲就得整屏重交一次（`start()` 对新的一场也是这么挂的）
+                s.presented_all = false;
+                s.phase = Phase::Select;
+                s.hover = None;
+                s.hits.clear();
+                s.marks.clear();
+            }
+            let moves = 60u32;
+            let mut paints = 0u32;
+            let mut veil = 0u32;
+            let mut other = 0u32;
+            let mut miss = 0u32;
+            for i in 0..(moves as i32) {
+                let (x, y) = (200 + i * 8, 120 + i * 6);
+                if x + 300 > bw || y + 200 > bh {
+                    miss += 1;
+                    continue;
+                }
+                if let Ok(mut s) = SNIP.lock() {
+                    s.drag = Some((Drag::New, x, y));
+                    s.sel = (x, y, x + 300, y + 200);
+                    s.cur = (x, y);
+                }
+                let _ = InvalidateRect(Some(ov), None, false);
+                loop {
+                    let mut msg = MSG::default();
+                    let mut got = false;
+                    for _ in 0..200 {
+                        if PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                            got = true;
+                            if msg.message == WM_PAINT && msg.hwnd == ov {
+                                paints += 1;
+                            }
+                            let _ = TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        } else {
+                            break;
+                        }
+                    }
+                    if !got {
+                        break;
+                    }
+                }
+                // 选区中心那一格：它同时在上一拍与这一拍的亮区里
+                let (sx, sy) = (x + 150, y + 100);
+                let shot = grab_rect(origin.0 + sx, origin.1 + sy, 1, 1).expect("抓一格没成");
+                let got = [shot[0], shot[1], shot[2]];
+                if got == pixel3(&dim, bw, sx, sy) {
+                    veil += 1;
+                } else if got != pixel3(&base, bw, sx, sy) {
+                    other += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+            println!(
+                "PACED_DRAG 拍数={} 画={} 只有蒙版的一帧={veil} 既非蒙版也非原图={other} 容不下={miss}",
+                moves - miss,
+                paints
+            );
+            assert_eq!(
+                veil, 0,
+                "拖框途中屏幕被交出去 {veil} 次「只有蒙版、没有亮区」的一帧 = 用户看到的闪"
+            );
+            assert!(
+                paints >= moves - miss,
+                "每拍都该有一次重画：画了 {paints} 次 / {} 拍（画的少就是丢帧）",
+                moves - miss
+            );
+            let _ = DestroyWindow(ov);
+            pump(200);
+            let _ = SetCursorPos(home.x, home.y);
+        }
+    }
 }
 
 #[cfg(test)]
