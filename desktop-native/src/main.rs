@@ -7041,6 +7041,13 @@ fn export_json_text(s: &Snapshot) -> String {
         "read_gaps": s.gaps,
         "today": s.today,
         "period_total": s.period_total,
+        // 三份导出要能互相核对：CSV 与 HTML 那两份由我们自己算好每栏的占比，分母各是
+        // 下面这三个数（不是含未落库增量的 `period_total`）。JSON 过去只交出 `period_total`
+        // ⇒ 拿 JSON 重算占比的人除出来的一定与同一次点击导出的 CSV 不一样：同一个问题、
+        // 两个答案，而两份文件并排放着看不出谁对。
+        "rank_total": s.rank_share_base(),
+        "app_total": s.app_total,
+        "device_total": s.device_total,
         "avg": s.avg,
         "rank": rank,
         "apps": apps,
@@ -11388,5 +11395,45 @@ mod share_base_tests {
             ));
         }
         assert!(wrong.is_empty(), "占比接线判据红:\n{}", wrong.join("\n"));
+    }
+
+    /// 三份导出必须互相核对得上：拿 JSON 交回的数重算占比，要得到与 CSV 同一个字符串。
+    ///
+    /// CSV 与 HTML 那两份由应用自己算好每栏的占比（分母各是 `rank_total` / `app_total` /
+    /// `device_total`，都不是含未落库增量的 `period_total`）。JSON 过去只交出 `period_total`
+    /// ⇒ 谁拿 JSON 重算，算出来的一定与同一次点击导出的那两份不一样：同一个问题两个答案，
+    /// 三份文件并排放着还看不出谁对。
+    #[test]
+    fn the_json_export_hands_back_the_same_bases_the_csv_used() {
+        let s = snap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&export_json_text(&s)).expect("JSON 导出该是个能解析的对象");
+        let mut wrong: Vec<String> = Vec::new();
+        for (field, want) in [
+            ("rank_total", 100i64),
+            ("app_total", 50i64),
+            ("device_total", 40i64),
+        ] {
+            let got = doc[field].as_i64();
+            if got != Some(want) {
+                wrong.push(format!(
+                    "JSON 里 {field} 该是 {want}（与 CSV 用的同一个分母），实得 {got:?}"
+                ));
+            }
+        }
+        let csv = export_csv_text(&s);
+        let csv_row = csv
+            .lines()
+            .find(|l| l.starts_with("1,a,70,"))
+            .unwrap_or_default();
+        let from_json = share_text(
+            doc["rank"][0]["count"].as_i64().unwrap_or(-1),
+            doc["rank_total"].as_i64().unwrap_or(-1),
+        );
+        assert!(
+            csv_row.ends_with(from_json.as_str()),
+            "同一行、两份文件：JSON 重算得 {from_json}，CSV 那一行却是「{csv_row}」"
+        );
+        assert!(wrong.is_empty(), "JSON 分母判据红:\n{}", wrong.join("\n"));
     }
 }
