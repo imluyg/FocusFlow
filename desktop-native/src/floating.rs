@@ -640,17 +640,13 @@ unsafe fn repaint(hwnd: HWND) -> bool {
         let pal = palette_now();
         let content = current_content();
 
-        let cfg_w = cfg
-            .get_float("floating", "width", DEFAULT_W)
-            .max(fr::MIN_W as f64) as i32;
-        // 高度取「配置值」与「内容需要值」的大者：`metric=both` 多一行，
-        // 而分层窗口没有滚动条 —— 画不下就是看不见。
-        let h_logical = fr::pill_height(
+        // 尺寸只有一份式子：启动那一次钳位走同一个 `card_logical_size`。
+        let (cfg_w, h_logical) = card_logical_size(
+            cfg.get_float("floating", "width", DEFAULT_W),
             cfg.get_float("floating", "height", DEFAULT_H),
             content.rows.len(),
-        )
-        // 至少和任务栏一样高：两行内容 48 正好对齐 100% 下的任务栏。
-        .max(taskbar_height_logical(scale));
+            taskbar_height_logical(scale),
+        );
         let w = fr::px(cfg_w, scale).max(1);
         let h = fr::px(h_logical, scale).max(1);
 
@@ -713,7 +709,7 @@ unsafe fn repaint(hwnd: HWND) -> bool {
                     }
                     let ring = cov_out.saturating_sub(cov_in);
                     if ring > 0 {
-                        let a = (ring as u16 * pal.border.a as u16 / 255) as u16;
+                        let a = ring as u16 * pal.border.a as u16 / 255;
                         fr::over(
                             buf,
                             idx,
@@ -935,6 +931,22 @@ fn anchor_now(cur_top: i32, anchor: i32, applied: i32, scale: f64) -> i32 {
     }
 }
 
+/// 卡片的**逻辑**尺寸：重画那一拍与启动那一次钳位必须算同一个式子。
+///
+/// 两条路以前各写一遍自己的：宽的下限一边是 `MIN_W`（90）、一边是手写的 `40.0`；高的
+/// 那一维一边抬到"至少和任务栏一样高"、一边根本没抬。后果是启动那次拿**较短**的高度去
+/// 夹位置——大任务栏/缩放下卡片真高 64 而夹取按 48 算，存过的 `pos_y` 落在屏底以下，
+/// 第一拍画出一截在屏外、下一拍真高度算出来才自己跳回去（正是「卡片自己跑位」那一族
+/// 的形状），而手改 `width = 50` 的人每次启动都被按 40 而不是 90 夹。
+fn card_logical_size(width_cfg: f64, height_cfg: f64, rows: usize, taskbar_h: i32) -> (i32, i32) {
+    (
+        width_cfg.max(fr::MIN_W as f64) as i32,
+        // 高度取「配置值」与「内容需要值」的大者，再至少和任务栏一样高：两行内容 48
+        // 正好对齐 100% 缩放下的任务栏，而分层窗口没有滚动条 —— 画不下就是看不见。
+        fr::pill_height(height_cfg, rows).max(taskbar_h),
+    )
+}
+
 /// 初始位置：配置里的逻辑坐标；没存过就落右上角附近。
 fn initial_position(scale: f64) -> (i32, i32, i32) {
     let cfg = focusflow_core::config::instance();
@@ -955,12 +967,15 @@ fn initial_position(scale: f64) -> (i32, i32, i32) {
             fr::px(y.round() as i32, scale),
         );
         let metric = fr::metric_from(&cfg.get("gui", "floating_metric"));
-        let win_w = cfg.get_float("floating", "width", DEFAULT_W).max(40.0);
-        let win_h = fr::pill_height(
+        // 与重画那一拍**同一个式子**（见 `card_logical_size`）：以前这里自己写 `.max(40.0)`
+        // 也不抬任务栏高度，于是启动那次夹的是比真卡片短的一截。
+        let (win_w, win_h) = card_logical_size(
+            cfg.get_float("floating", "width", DEFAULT_W),
             cfg.get_float("floating", "height", DEFAULT_H),
             fr::row_count(metric),
-        ) as f64;
-        landed_position(x, y, scale, &mon, win_w, win_h)
+            taskbar_height_logical(scale),
+        );
+        landed_position(x, y, scale, &mon, win_w as f64, win_h as f64)
     }
 }
 
@@ -1299,7 +1314,9 @@ pub fn shutdown() {
 
 #[cfg(test)]
 mod anchor_tests {
-    use super::anchor_now;
+    // 本测试模是选择性导入（不是 `use super::*`）：新用例引用生产项要在这里补名字。
+    use super::{anchor_now, card_logical_size};
+    use crate::floating_render as fr;
 
     /// 用户在拖：这一格既不是锚点、也不是我们自己摆出去的 ⇒ 锚点认它。
     /// 不认就是第十场量到的那个缺陷：竖向被下一拍拽回旧锚点、横向留着。
@@ -1366,6 +1383,48 @@ mod anchor_tests {
             anchor_now(900, 140, 210, 1.5),
             600,
             "认下来的锚点要按缩放比折回逻辑像素"
+        );
+    }
+
+    /// 卡片尺寸那把尺子的形状：宽的下限是 `MIN_W`，高至少到任务栏。
+    #[test]
+    fn the_card_size_floors_at_min_width_and_the_taskbar() {
+        // 手改 `[floating] width = 50`：卡片真宽是 90，夹位置也得按 90 算
+        // （旧的那条路自己写了一个更小的下限，于是每次启动位置都被多推一截）
+        assert_eq!(card_logical_size(50.0, 40.0, 2, 48).0, fr::MIN_W);
+        // 大任务栏（物理 64 @100%）：两行内容算出来 48，卡片必须是 64 高
+        // （旧的那条路根本没抬，启动那次按 48 夹 ⇒ 第一拍有一截落在屏外）
+        assert_eq!(card_logical_size(280.0, 40.0, 2, 64).1, 64);
+        // 内容比任务栏高时听内容的（`metric=both` 三行）
+        assert!(
+            card_logical_size(280.0, 40.0, 3, 48).1 > 48,
+            "三行内容的高度不该被任务栏那一段压住"
+        );
+        // 配置值高于两者时原样保住用户要的
+        assert_eq!(card_logical_size(400.0, 120.0, 2, 48), (400, 120));
+    }
+
+    /// 接线守卫：重画那一拍与启动那一次钳位**都得**问这同一把尺子。
+    ///
+    /// 上面那条只证明函数自己算得对；这两处调用点不接进来，两条缺陷照样会复发。
+    #[test]
+    fn both_floating_paths_ask_the_same_card_size() {
+        let src = include_str!("floating.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            flat.matches("card_logical_size(").count(),
+            3,
+            "该是一处定义加两处调用（重画、启动钳位），实际 {}",
+            flat.matches("card_logical_size(").count()
+        );
+        assert!(
+            flat.contains("let(cfg_w,h_logical)=card_logical_size("),
+            "重画那一拍不再问这把尺子了"
+        );
+        assert!(
+            flat.contains("let(win_w,win_h)=card_logical_size("),
+            "启动那次钳位不再问这把尺子了"
         );
     }
 }
