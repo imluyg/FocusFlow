@@ -300,6 +300,10 @@ pub struct SnipState {
     /// 窗口表面有没有被完整交过一次。第一次上屏（或双缓冲换过一块）之前，表面里
     /// 是还没写过的东西，那一帧必须整屏交，不能只交一角。
     presented_all: bool,
+    /// 上一帧合成时**实际搬了多少字节**（[`compose_into_region`] 的返回值）。
+    /// 毫秒在这台机器上有 ±1.5 ms 的噪声，字节数没有：拖框探针逐拍读它，
+    /// 于是"每帧只碰动过的那一块"在真实绘制路径上也是可判的，不只是纯函数可判。
+    last_moved: usize,
 }
 
 const fn default_state() -> SnipState {
@@ -340,6 +344,7 @@ const fn default_state() -> SnipState {
         back: BackBuffer::empty(),
         frame_dirty: (0, 0, 0, 0),
         presented_all: false,
+        last_moved: 0,
     }
 }
 
@@ -511,6 +516,9 @@ pub fn dim_bgra(src: &[u8]) -> Vec<u8> {
 ///   否则"选区里"就变成"选区里透出个黑块"。
 ///
 /// 三份缓冲长度都必须够一屏；不够就整帧不动笔（宁可这一帧没更新，也不要写脏别人的内存）。
+///
+/// 返回这一帧**搬了多少字节**：字节数是可以判的，毫秒在这台机器上有 ±1.5 ms 的噪声。
+/// 于是"每帧只碰动过的那一块"这句话有了不靠计时的判据 —— 区域退化回整屏时，用例就叫。
 pub fn compose_into_region(
     dst: &mut [u8],
     base: &[u8],
@@ -519,31 +527,33 @@ pub fn compose_into_region(
     clip: (i32, i32, i32, i32),
     w: i32,
     h: i32,
-) {
+) -> usize {
     if w <= 0 || h <= 0 {
-        return;
+        return 0;
     }
     let need = (w as usize) * (h as usize) * 4;
     if dst.len() < need || base.len() < need || dim.len() < need {
-        return;
+        return 0;
     }
     let (cl, ct, cr, cb) = clamp_rect(clip, w, h);
     let band = (cr - cl) as usize * 4;
     if band == 0 {
-        return;
+        return 0;
     }
+    let mut moved = 0usize;
     for y in ct..cb {
         let i = (y as usize * w as usize + cl as usize) * 4;
         dst[i..i + band].copy_from_slice(&dim[i..i + band]);
+        moved += band;
     }
     let Some((bl, bt, br, bb)) = bright else {
-        return;
+        return moved;
     };
     let (l, t) = (bl.max(cl).max(0), bt.max(ct));
     let (r, b) = (br.min(cr), bb.min(cb));
     let row = (r - l).max(0) as usize * 4;
     if row == 0 {
-        return;
+        return moved;
     }
     for y in t..b {
         let i = (y as usize * w as usize + l as usize) * 4;
@@ -551,7 +561,9 @@ pub fn compose_into_region(
         for px in dst[i..i + row].as_chunks_mut::<4>().0 {
             px[3] = 255;
         }
+        moved += row;
     }
+    moved
 }
 
 /// 两个矩形的最小外包；空的那一侧直接交出另一侧。
@@ -2888,15 +2900,18 @@ unsafe fn paint(hwnd: HWND) {
             None => window_dc,
         };
         match back {
-            Some((_, bits)) => compose_into_region(
-                std::slice::from_raw_parts_mut(bits, (bw as usize) * (bh as usize) * 4),
-                &snip.base,
-                &snip.dim,
-                bright,
-                region,
-                bw,
-                bh,
-            ),
+            Some((_, bits)) => {
+                let moved = compose_into_region(
+                    std::slice::from_raw_parts_mut(bits, (bw as usize) * (bh as usize) * 4),
+                    &snip.base,
+                    &snip.dim,
+                    bright,
+                    region,
+                    bw,
+                    bh,
+                );
+                snip.last_moved = moved;
+            }
             None => blit_bgra(hdc, &snip.dim, bw, bh, 0, 0),
         }
         let composed = back.is_some();
@@ -5047,6 +5062,7 @@ mod render_probe {
             let mut paints = 0u32;
             let mut veil = 0u32;
             let mut other = 0u32;
+            let mut moved_max = 0usize;
             let mut miss = 0u32;
             for i in 0..(moves as i32) {
                 let (x, y) = (200 + i * 8, 120 + i * 6);
@@ -5079,6 +5095,15 @@ mod render_probe {
                         break;
                     }
                 }
+                // 这一帧实际搬了多少字节（paint 里记下的）：判的是真实绘制路径，
+                // 不只是纯函数——区域一旦退化回整屏，这里就叫。
+                // 第一帧按设计就是整屏（新的一场表面里还没东西），不参与这个最大值。
+                if i > 1 {
+                    let mv = SNIP.lock().map(|s| s.last_moved).unwrap_or(0);
+                    if mv > moved_max {
+                        moved_max = mv;
+                    }
+                }
                 // 选区中心那一格：它同时在上一拍与这一拍的亮区里
                 let (sx, sy) = (x + 150, y + 100);
                 let shot = grab_rect(origin.0 + sx, origin.1 + sy, 1, 1).expect("抓一格没成");
@@ -5094,6 +5119,17 @@ mod render_probe {
                 "PACED_DRAG 拍数={} 画={} 只有蒙版的一帧={veil} 既非蒙版也非原图={other} 容不下={miss}",
                 moves - miss,
                 paints
+            );
+            let screen = (bw as usize) * (bh as usize) * 4;
+            println!(
+                "DRAG_BYTES 拖框中某一帧最多搬 {} KB / 一整屏 {} KB",
+                moved_max / 1024,
+                screen / 1024
+            );
+            assert!(
+                moved_max < screen,
+                "拖框途中有一帧搬的字节不少于一整屏（{} KB）：区域退化回全屏搬运",
+                screen / 1024
             );
             assert_eq!(
                 veil, 0,
@@ -5513,6 +5549,94 @@ mod tests {
         }
     }
 
+    /// 一帧搬多少字节：**判字节数，不判毫秒**（这台机器上计时有 ±1.5 ms 的噪声）。
+    ///
+    /// 为什么盯多屏那种尺寸：5120x1440 一屏就是 28 MB，"每帧把整屏推两遍"在那个尺寸上
+    /// 才是真的会把拖框拖成幻灯片；区域版必须只搬亮区与读数那一圈。区域哪天退化回整屏，
+    /// 这条就叫，不需要靠肉眼去看流畅不流畅。
+    #[test]
+    fn a_frame_moves_the_region_bytes_not_the_whole_screen() {
+        let (w, h) = (5120i32, 1440i32);
+        let need = (w as usize) * (h as usize) * 4;
+        let base = vec![7u8; need];
+        let dim = vec![3u8; need];
+        let mut dst = vec![0u8; need];
+        let sel = (200, 160, 200 + 640, 160 + 360);
+        let moved = compose_into_region(&mut dst, &base, &dim, Some(sel), pad_rect(sel, 12), w, h);
+        assert!(
+            moved * 8 <= need,
+            "一屏 {} MB，这一帧却搬了 {} KB ⇒ 区域退化回整屏",
+            need / (1024 * 1024),
+            moved / 1024
+        );
+        // 对照腿：新的一场第一帧（整屏那一把）就该搬整屏 + 亮区，这条闩不能是恒真
+        let full = compose_into_region(&mut dst, &base, &dim, Some(sel), (0, 0, w, h), w, h);
+        assert_eq!(
+            full,
+            need + (sel.2 - sel.0) as usize * (sel.3 - sel.1) as usize * 4,
+            "整屏那一把搬的字节不对"
+        );
+    }
+
+    /// 范围越出屏外（多屏时选区贴着虚拟屏边角、读数被夹回屏内）：夹进屏内，
+    /// 范围外的一个字节都不许动 —— 那里放的是上一帧已经交出去的画面。
+    #[test]
+    fn an_off_screen_clip_is_clamped_and_writes_nothing_outside() {
+        let (w, h) = (8i32, 8i32);
+        let base = tiny_screen(w, h);
+        let dim = dim_bgra(&base);
+        let before = base.clone();
+        let mut dst = base.clone();
+        let moved = compose_into_region(&mut dst, &base, &dim, None, (-6, -6, 2, 3), w, h);
+        assert!(moved > 0, "夹完就没动了：这一条没有观察量");
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y as usize) * (w as usize) + x as usize) * 4;
+                if x < 2 && y < 3 {
+                    assert_eq!(
+                        &dst[i..i + 3],
+                        &dim[i..i + 3],
+                        "夹完的范围内 ({x},{y}) 没铺上"
+                    );
+                } else {
+                    assert_eq!(&dst[i..i + 3], &before[i..i + 3], "范围外 ({x},{y}) 被写了");
+                }
+            }
+        }
+    }
+
+    /// 多屏/4K 尺寸下一帧搬字节要多久（只做读数，别当判据）：整屏那一把 vs 区域那一把。
+    /// `cargo test -p focusflow-native --bins --release -- --ignored compose_bench --nocapture`
+    #[test]
+    #[ignore = "一次要分配三份 28 MB 缓冲"]
+    fn compose_bench_at_multi_monitor_sizes() {
+        for (w, h) in [(1920i32, 1080i32), (3840i32, 2160i32), (5120i32, 1440i32)] {
+            let need = (w as usize) * (h as usize) * 4;
+            let base = vec![7u8; need];
+            let dim = vec![3u8; need];
+            let mut dst = vec![0u8; need];
+            let sel = (200, 160, 200 + 640, 160 + 360);
+            let region = pad_rect(sel, 12);
+            let _ = compose_into_region(&mut dst, &base, &dim, Some(sel), region, w, h);
+            let t = Instant::now();
+            for _ in 0..20 {
+                let _ = compose_into_region(&mut dst, &base, &dim, Some(sel), region, w, h);
+            }
+            let reg = t.elapsed().as_micros() as f64 / 1000.0 / 20.0;
+            let t = Instant::now();
+            for _ in 0..20 {
+                let _ = compose_into_region(&mut dst, &base, &dim, Some(sel), (0, 0, w, h), w, h);
+            }
+            let all = t.elapsed().as_micros() as f64 / 1000.0 / 20.0;
+            println!(
+                "COMPOSE_BENCH {w}x{h} 一屏 {} MB 整屏={:.2} ms 区域={:.2} ms",
+                need / (1024 * 1024),
+                all,
+                reg
+            );
+        }
+    }
+
     const SCREEN: (i32, i32, i32, i32) = (0, 0, 1920, 1080);
 
     /// 一块通道值都在 5..255 的小屏：任何一格压暗后都与原值不同，
@@ -5646,10 +5770,10 @@ mod tests {
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
-            flat.matches("=>compose_into_region(").count(),
+            flat.matches("=compose_into_region(").count(),
             1,
             "paint 该有一次合成，实际 {} 次",
-            flat.matches("=>compose_into_region(").count()
+            flat.matches("=compose_into_region(").count()
         );
         assert_eq!(
             flat.matches("BitBlt(window_dc,").count(),
