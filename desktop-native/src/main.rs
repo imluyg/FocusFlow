@@ -3850,7 +3850,7 @@ fn draw_settings(
                             )
                         };
                         p.text(
-                            &dir_line,
+                            &clip_middle(&dir_line, char_budget(560.0)),
                             rect(r.left + 12.0, y + 23.0, 560.0, 17.0),
                             &p.fmt.text12,
                             &p.br.muted,
@@ -3895,14 +3895,13 @@ fn draw_settings(
     if let Some(line) = status {
         // 哪些行算"要人处理"只写在 `status_is_warning` 一处，这里不抄第二份判据
         let warn = status_is_warning(line);
+        // 预算按**这一格有多宽**算：搬迁没成那一句里有两个完整路径，实测能一路画到窗口
+        // 外面（DrawText 不按矩形裁切），而句尾恰恰是"搬到哪"这件事本身。
+        let status_w = card.right - card.left - 32.0;
+        let line = clip_middle(line, char_budget(status_w));
         p.text(
-            line,
-            rect(
-                card.left + 16.0,
-                card.bottom - 26.0,
-                card.right - card.left - 32.0,
-                18.0,
-            ),
+            &line,
+            rect(card.left + 16.0, card.bottom - 26.0, status_w, 18.0),
             // "要人处理"那一句除了换颜色，还加一档字重：底部这一行平时是背景信息，
             // 红字加粗才是"现在就得看一眼"。
             if warn {
@@ -8173,6 +8172,42 @@ fn register_combo(manager: Option<&GlobalHotKeyManager>, key: &str) -> Combo {
     }
 }
 
+/// 这一格宽度**最多**能念多少个字符（按字符，不按字节）。
+///
+/// 为什么要有这一句：这个 UI 没有"装不下"这回事 —— 每一档字体都是 `NO_WRAP`，而 `DrawText`
+/// 不按传进来的矩形裁切。现量在案：把数据根与"已安排搬到"两个路径都换成 114 / 91 个字符，
+/// 底部那句「注意：没能搬到 …」一路画到窗口右边界之外，用户看到的是括号都没闭合的半句。
+///
+/// 12.0 是**最窄那一档**：本仓最小的字档是 12px，全中文时一个字就吃掉约 12px；路径与英文
+/// 约 6.5px/字，所以按 12 算出来的预算是保守的 —— 宁可少念几个字，也不会画到隔壁卡上。
+/// 预算跟着矩形宽度走（不是写死的常数）：窗口能拖窄，写死的数在窄窗口里照样顶出去。
+fn char_budget(rect_w: f32) -> usize {
+    let per_char = 12.0_f32;
+    ((rect_w / per_char).floor() as usize).max(8)
+}
+
+/// 中间省略：留头留尾，中间换成一个 `…`。
+///
+/// 为什么不砍尾巴：这一行里最要紧的两样是"在说什么事"（句首）与"哪个目录/哪个文件"
+/// （路径的**末段**）。砍尾等于把 `…\迁移测试\data` 换成一个看不懂的省略号，而中间那段
+/// `E:\mydata\agentdata\code\FocusFlow\.scratch\ab_longpath\Program Files (x86)\` 恰恰是
+/// 信息量最低的一截。按字符走，不按字节 —— 中文在 UTF-8 里是三字节，按字节切会切坏字，
+/// 而 release 是 `panic = "abort"`。
+fn clip_middle(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    // 省略号占一格，剩下的按 6:4 分给头与尾（句首比句尾更需要认得出来）
+    let keep = max_chars.saturating_sub(1);
+    let head = keep * 6 / 10;
+    let tail = keep - head;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(chars[chars.len() - tail..].iter());
+    out
+}
+
 /// 状态行里哪些该用危险色画。"注意…" 是历史形状（双计提醒、搬迁没成那一类），
 /// 另外这几类也必须算：一条热键没注册上、以及截图那句"没存盘 / 图没编出来 / 剪贴板没进去"。
 /// 这些都要人去做点什么，用灰字画出来会被当成普通回执掠过去——旧 Webview 版给热键失败
@@ -11532,6 +11567,103 @@ mod exit_flush_tests {
             logger_at > collect_at,
             "收日志必须排在停采集之后，否则「数据库已关闭」那几条根本没写进来：\
              collect={collect_at} logger={logger_at}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    /// 现量那条症状：两个 114 / 91 字符的路径拼进底部那一格，句子画到窗口外面，
+    /// 用户看到的是一句括号都没闭合的半句。夹过之后必须**两头都在**。
+    #[test]
+    fn a_long_status_line_keeps_its_head_and_its_tail() {
+        let home = r"E:mydataagentdatacodeFocusFlow.scratchab_longpathProgram Files (x86)FocusFlow 便携版数据目录 2026-10-29 迁移测试data";
+        let target = r"E:mydataagentdatacodeFocusFlow.scratchab_longpath新位置 OneDrive 同步中 请等它跑完再关 2026-10-29";
+        let line = format!("注意：没能搬到 {home} ({target}（搬家没成，仍记在旧目录）");
+        assert!(
+            line.chars().count() > 120,
+            "夹具前提：这句本来就该长到顶出窗口"
+        );
+
+        let clipped = clip_middle(&line, char_budget(1136.0));
+        let n = clipped.chars().count();
+        assert!(
+            n <= char_budget(1136.0),
+            "夹完必须落在预算内：{n} > {}",
+            char_budget(1136.0)
+        );
+        assert!(
+            clipped.starts_with("注意：没能搬到"),
+            "句首要认得出在说什么事"
+        );
+        assert!(
+            clipped.ends_with("仍记在旧目录）"),
+            "句尾（要做的那一步）不许被砍掉：{clipped}"
+        );
+        assert!(clipped.contains('…'), "中间那段要标成省略，实得: {clipped}");
+    }
+
+    /// 短的那句一个字都不许动 —— 否则这条夹取本身就成了新的信息损失。
+    #[test]
+    fn a_line_that_fits_is_left_alone() {
+        for s in ["备份完成：3 份", "已取消", ""] {
+            assert_eq!(clip_middle(s, 90), s, "不该动的被动了: {s}");
+        }
+        // 恰好等于预算：不动；多一个字才动
+        let exact = "字".repeat(90);
+        assert_eq!(clip_middle(&exact, 90), exact);
+        let over = "字".repeat(91);
+        assert_ne!(clip_middle(&over, 90), over);
+    }
+
+    /// 预算跟着格子走，并且永远给得出一个能画的数。
+    #[test]
+    fn the_budget_follows_the_box_and_never_collapses() {
+        assert_eq!(char_budget(560.0), 46);
+        assert!(char_budget(1136.0) > char_budget(560.0), "宽格子该念更多");
+        // 窗口拖到极窄（甚至矩形算出负数）时也不许回 0：那样这一格一个字都不念，
+        // 用户连"有事发生"都看不见。
+        assert!(char_budget(0.0) >= 8);
+        assert!(char_budget(-40.0) >= 8);
+    }
+
+    /// 接线腿：两处画长文本的地方都必须过这一道夹取，且状态行那处的预算与它画进去的
+    /// 矩形是**同一个宽度**（写死一个常数的话，窗口拖窄就又顶出去了）。
+    #[test]
+    fn the_two_long_text_rows_are_clipped_to_their_own_box() {
+        let src = include_str!("main.rs").replace(
+            "
+", "
+",
+        );
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod: String = src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        for needle in [
+            "clip_middle(&dir_line, char_budget(560.0))",
+            "clip_middle(line, char_budget(status_w))",
+        ] {
+            assert_eq!(
+                prod.matches(needle).count(),
+                1,
+                "这一处夹取不见了或被改写成两份：{needle}",
+            );
+        }
+        // 状态行那格：预算用的宽度必须就是画它的那个矩形的宽度
+        let at = prod.find("let status_w = ").expect("status_w 不见了");
+        let win: String = prod[at..].chars().take(420).collect();
+        assert!(
+            win.contains("status_w,") && win.contains("clip_middle(line, char_budget(status_w))"),
+            "预算与矩形不是同一个宽度了：
+{win}",
         );
     }
 }
