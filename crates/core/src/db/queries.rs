@@ -822,7 +822,24 @@ pub fn get_alltime_max_day() -> AlltimeMaxDay {
     let mut best: Option<(i64, i64)> = None; // (date_key, count)
     let mut active_days: i64 = 0;
     let mut unreadable: Vec<String> = Vec::new();
-    for year in available_years() {
+    // 名单**本身**问不出来的时候不能折成"库里没历史"：`available_years()` 在 `read_dir`
+    // 失败时交回空列表 ⇒ 下面这个循环一次都不跑 ⇒ `unreadable` 是空的，而本函数的文档写的
+    // 正是「`unreadable` 非空才是结果不完整的信号」。于是屏上「最高单日」念「—」、「日均」
+    // 的分母念 0，与"这台机器从没记过东西"长得一模一样 —— 同一个形状在自愈
+    // (`heal_daily_consistency`) 与三个破坏性命令里都已经改成走 `try_available_years()`。
+    let years = match try_available_years() {
+        Ok(years) => years,
+        Err(e) => {
+            let why = format!("年度库列不出来: {e}");
+            tracing::error!("全历史最高单日这一趟没能开始：{why}");
+            return AlltimeMaxDay {
+                max_day: None,
+                active_days: 0,
+                unreadable: vec![why],
+            };
+        }
+    };
+    for year in years {
         let path = paths::year_db_path(year);
         // `with_ro_conn` 返回 `None` 只可能是「连接没拿到」（打开失败已在连接层记过 error），
         // 拿到连接之后的结局由下面那个每库读手自己分臂 —— 两者原先被同一个
@@ -4219,6 +4236,39 @@ mod tests {
     /// （屏上「总计」念的是 `stats_totals(...).total + pending`），已随那一刀摘掉。
     /// "跨库遍历不许漏年份"这条口径并没有失去归宿：它由 [`stats_totals`]／[`get_stats`]
     /// 在 `aggregation_test.rs` 与 `real_data.rs` 里继续守着 —— 那两条是有真读者的尺子。
+    /// 年度库**名单本身**问不出来时，这一趟要交出「不完整」，不许念成"这台机器没记过东西"。
+    ///
+    /// 旧形状：循环吃的是 `available_years()`（`read_dir` 失败 ⇒ 空名单），于是一行都不跑、
+    /// `unreadable` 也是空的 ⇒ 屏上「最高单日 —」与「日均分母 0」和真的零历史长得一模一样。
+    #[test]
+    fn the_alltime_read_speaks_up_when_the_year_list_cannot_be_read() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_alltime_list_fail");
+        let data = paths::data_dir();
+        // 夹具：把数据目录的位置占成一个普通文件 ⇒ `read_dir` 必失败（自愈那笔用的是同款）
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::write(&data, "这不是目录").expect("占住数据目录的位置");
+        invalidate_years_cache();
+        let got = get_alltime_max_day();
+        assert!(
+            got.unreadable.iter().any(|u| u.contains("年度库列不出来")),
+            "名单读不出来这件事要留在 unreadable 里，实际: {:?}",
+            got.unreadable
+        );
+        assert!(got.max_day.is_none(), "名单都没读出来，不许报出一个纪录");
+        assert_eq!(got.active_days, 0, "一天都不该被数进分母");
+        // 对照带：目录正常、只是库里没东西 ⇒ 那是"问得出、答案是零"，不许有怨言
+        std::fs::remove_file(&data).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        invalidate_years_cache();
+        let empty = get_alltime_max_day();
+        assert!(
+            empty.unreadable.is_empty(),
+            "空目录是答得出来的零，不该混进同一句抱怨: {:?}",
+            empty.unreadable
+        );
+    }
+
     #[test]
     fn an_unreadable_year_is_not_read_as_no_record_in_the_alltime_max_day() {
         let _lock = crate::paths::test_app_dir_lock();
