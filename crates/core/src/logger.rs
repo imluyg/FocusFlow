@@ -33,8 +33,7 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// 文件层一旦没建成，**本进程一辈子都没有文件日志** —— 而 `logs/` 是本仓每个故障
 /// 的默认下一步（"去日志里查原因"）。原先这件事只往 stderr 印一句，而桌面端是
 /// windows 子系统、没有控制台，等于完全无声：用户按提示去翻 `logs/`，翻到的是空目录，
-/// 谁也不知道少了一层。现在把它存下来，由启动报告带出来（`is_initialized()` 说的
-/// 是"subscriber 装过"，不代表文件日志可用 —— 这两件事别再混）。
+/// 谁也不知道少了一层。现在把它存下来，由启动那一行带出来。
 static FILE_LOG_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 /// 记录一次文件层的结局：成功清掉旧原因，失败留下原因。
@@ -177,8 +176,8 @@ pub fn init_logging() {
         }
         Err(e) => {
             // 同一句话两个去处：stderr 给 CLI（它的结论分流本来就靠这条），
-            // 而桌面端没有控制台 ⇒ 只能靠 `file_log_failure()` 让启动报告说得出这件事
-            // （见 desktop 的 `AppState::init`）。
+            // 而桌面端是 windows 子系统、没有控制台 ⇒ 只能靠 [`file_log_failure()`]
+            // 让启动那一行说得出这件事（读者：`desktop-native/src/main.rs` 的 `boot_notice` 调用点）。
             let why = format!(
                 "日志文件建不出来（目录 {}）：本次运行只有控制台输出、不落盘文件。原因: {e}",
                 crate::paths::log_dir().display()
@@ -214,12 +213,6 @@ pub fn init_logging() {
     install_panic_hook();
     // 记录目录而不是文件名：按天轮转后名字由 tracing-appender 决定（logs/<日期>）
     tracing::info!("日志系统已初始化: {}", crate::paths::log_dir().display());
-}
-
-/// 判断日志系统是否已初始化（`shutdown` 之后仍为 true：它表示「装过 subscriber」，
-/// 而 tracing 的全局 subscriber 撤不下来）。
-pub fn is_initialized() -> bool {
-    INITIALIZED.load(Ordering::SeqCst)
 }
 
 /// 抓**当前线程**产生的 tracing 消息（`with_default` 是线程本地的作用域）：

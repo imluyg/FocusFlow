@@ -743,13 +743,19 @@ fn boot_notice(
     legacy_double_count: Option<String>,
     moved_ok: Option<String>,
     hotkey_warning: Option<String>,
+    file_log_failure: Option<String>,
 ) -> Option<String> {
+    // 排在这条链上的是"这一刻屏上只能念一句"的先后：数据类的成败第一，热键其次，
+    // **文件日志层没建成放最后** —— 它不改变程序行为（照常记录、照常退出），改变的是
+    // "去哪里查原因"：`logs/` 是本仓每个故障的默认下一步，空目录会让人以为什么都没发生。
+    // 所以它该说，但不该挤掉更要紧的那句。
     move_failure
         .or(config_corrupt)
         .or(data_home_fallback)
         .or(legacy_double_count)
         .or(moved_ok)
         .or(hotkey_warning)
+        .or(file_log_failure)
 }
 
 /// 开机之后「全局热键」那一格显示开还是关：跟着**真正注册上的组合**走，不跟着配置键走。
@@ -941,6 +947,11 @@ impl App {
                 legacy_running,
                 moved_note,
                 hotkey_warning,
+                // 文件日志那一层没建成 ⇒ 屏上必须说出来：`logs/` 是本仓每个故障的默认
+                // 下一步，而这一层一旦没装上，本进程一辈子都不会往里写（core 里那一格
+                // 存的就是这件事，之前全仓零读点 —— 注释写着"由启动报告带出来"，那个
+                // 读点随旧前端一起删了，只剩 `eprintln!`，而桌面端没有控制台）。
+                focusflow_core::logger::file_log_failure(),
             );
 
             // 悬浮窗：独立线程 + 独立分层窗口，主窗口收起时也常驻。
@@ -10469,9 +10480,10 @@ mod boot_notice_tests {
                 say("两处采集"),
                 say("搬完了"),
                 say("热键没注册上"),
+                say("日志文件建不出来"),
             )
         };
-        let (a, b, c, d, e, f) = all();
+        let (a, b, c, d, e, f, g) = all();
         assert_eq!(
             boot_notice(
                 a.clone(),
@@ -10479,26 +10491,55 @@ mod boot_notice_tests {
                 c.clone(),
                 d.clone(),
                 e.clone(),
-                f.clone()
+                f.clone(),
+                g.clone()
             ),
             a
         );
         assert_eq!(
-            boot_notice(None, b.clone(), c.clone(), d.clone(), e.clone(), f.clone()),
+            boot_notice(
+                None,
+                b.clone(),
+                c.clone(),
+                d.clone(),
+                e.clone(),
+                f.clone(),
+                g.clone()
+            ),
             b
         );
         assert_eq!(
-            boot_notice(None, None, c.clone(), d.clone(), e.clone(), f.clone()),
+            boot_notice(
+                None,
+                None,
+                c.clone(),
+                d.clone(),
+                e.clone(),
+                f.clone(),
+                g.clone()
+            ),
             c
         );
         assert_eq!(
-            boot_notice(None, None, None, d.clone(), e.clone(), f.clone()),
+            boot_notice(None, None, None, d.clone(), e.clone(), f.clone(), g.clone()),
             d
         );
-        assert_eq!(boot_notice(None, None, None, None, e.clone(), f.clone()), e);
-        assert_eq!(boot_notice(None, None, None, None, None, f.clone()), f);
         assert_eq!(
-            boot_notice(None, None, None, None, None, None),
+            boot_notice(None, None, None, None, e.clone(), f.clone(), g.clone()),
+            e
+        );
+        assert_eq!(
+            boot_notice(None, None, None, None, None, f.clone(), g.clone()),
+            f,
+            "前面都没话时说得出「热键没注册上」，也不许被最后那格挤掉"
+        );
+        assert_eq!(
+            boot_notice(None, None, None, None, None, None, g.clone()),
+            g,
+            "文件日志那一层没建成必须被念出来：之前 core 存了这件事、全仓却一个读点都没有"
+        );
+        assert_eq!(
+            boot_notice(None, None, None, None, None, None, None),
             None,
             "一切正常时这一格该是空的"
         );
@@ -10524,6 +10565,9 @@ mod boot_notice_tests {
         for needle in [
             ["corrupt_note", "()"].concat(),
             ["data_home_fallback_notice", "()"].concat(),
+            // 文件日志那一层没建成：core 存了这件事，读点以前随旧前端一起删了（注释还写着
+            // "由启动报告带出来"，屏上却一个字不说）。这条针钉的是**调用点真把它喂进来**。
+            ["logger", "::file_log_failure()"].concat(),
         ] {
             assert!(
                 args.contains(needle.as_str()),
