@@ -22,8 +22,8 @@ use windows::Win32::Graphics::Gdi::{
     CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, ExtCreatePen, GetClipBox,
     GetDC, GetStockObject, GetTextExtentPoint32W, InvalidateRect, LineTo, MoveToEx, Rectangle,
     ReleaseDC, SelectClipRgn, SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, TextOutW,
-    BITMAPINFO, BS_SOLID, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DIB_RGB_COLORS, FW_NORMAL, HBITMAP, HDC, HGDIOBJ, HPEN, LOGBRUSH, NULL_BRUSH,
+    UpdateWindow, BITMAPINFO, BS_SOLID, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DIB_RGB_COLORS, FW_NORMAL, HBITMAP, HDC, HGDIOBJ, HPEN, LOGBRUSH, NULL_BRUSH,
     OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID,
     SRCCOPY, TRANSPARENT,
 };
@@ -3091,8 +3091,13 @@ unsafe fn paint(hwnd: HWND) {
             let (rw, rh) = (pr.2 - pr.0, pr.3 - pr.1);
             if rw > 0 && rh > 0 {
                 let _ = BitBlt(window_dc, pr.0, pr.1, rw, rh, Some(m), pr.0, pr.1, SRCCOPY);
+                // 只有**整扇窗口都被交过**，才可以说"范围外那些格子表面上的像素是可信的"：
+                // 隐藏态预画那一把 `BeginPaint` 可能给一个空区域，那一把什么都没交出去，
+                // 就把闩挂上等于把没画过的表面当成画过了（窗口出现时看见的就是那种表面）。
+                if rw >= bw && rh >= bh {
+                    snip.presented_all = true;
+                }
             }
-            snip.presented_all = true;
         }
         let _ = EndPaint(hwnd, &ps);
     }
@@ -5403,6 +5408,106 @@ mod tests {
             !flat[listed..created].contains("set_visible(true)"),
             "冻结之后、建窗之前又把悬浮窗还回去了：中间会看见一次真实桌面"
         );
+    }
+
+    /// 特征判据：**隐藏态预画在本机落不到窗口表面上**，所以别用「先画满、再出现」这套做法。
+    ///
+    /// 为什么会留这条：我一度以为覆盖层与贴图窗出现时"黑一下"可以用"隐藏时先 `InvalidateRect
+    /// + UpdateWindow` 画满、再 `ShowWindow`"消掉。实测建一扇 40x30 的隐藏窗、WM_PAINT 里涂满
+    /// 纯红、预画之后从窗口 DC 读回中心那一格 —— 读回来的**不是**那抹红（本机是黑的），
+    /// 说明这次绘制没落在人将会看见的那块表面上 ⇒ 预画是空转，两处调用已退回。
+    /// 真正管用的是**顺序**：状态填齐了再 `ShowWindow`，让第一帧就是完整的那一份
+    ///（这条由 `overlay_is_created_hidden_and_populated_first` 钉住）。
+    /// 哪天 Windows 改了行为、这一格真读回红了，这条会红 ⇒ 那时"预画"才值得重新考虑。
+    #[test]
+    fn painting_a_hidden_window_does_not_fill_the_surface_seen_when_shown() {
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{
+                CreateCompatibleBitmap, CreateCompatibleDC, GetDIBits, SelectObject as SelObj,
+            };
+            unsafe extern "system" fn proc(
+                h: HWND,
+                msg: u32,
+                wp: WPARAM,
+                lp: LPARAM,
+            ) -> windows::Win32::Foundation::LRESULT {
+                if msg == WM_PAINT {
+                    let mut ps = PAINTSTRUCT::default();
+                    let dc = BeginPaint(h, &mut ps);
+                    let brush = CreateSolidBrush(COLORREF(0x0000_00FF));
+                    let old = SelectObject(dc, brush.into());
+                    let _ = Rectangle(dc, 0, 0, 40, 30);
+                    SelectObject(dc, old);
+                    let _ = DeleteObject(brush.into());
+                    let _ = EndPaint(h, &ps);
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(h, msg, wp, lp)
+                }
+            }
+            let name = w!("FocusFlowHiddenPaintTest");
+            let hinst = GetModuleHandleW(None).map(|m| m.into()).unwrap_or_default();
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(proc),
+                hInstance: hinst,
+                lpszClassName: PCWSTR(name.as_ptr()),
+                ..Default::default()
+            };
+            let _ = RegisterClassExW(&wc);
+            let h = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                name,
+                name,
+                WINDOW_STYLE(WS_POPUP.0),
+                0,
+                0,
+                40,
+                30,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .expect("隐藏测试窗建不出来");
+            let _ = InvalidateRect(Some(h), None, false);
+            let _ = UpdateWindow(h);
+            let dc = GetDC(Some(h));
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, 1, 1);
+            let old = SelObj(mem, bmp.into());
+            // 先从那扇隐藏窗的 DC 把中心那一格搬进内存位图，再读回来
+            let copied = BitBlt(mem, 0, 0, 1, 1, Some(dc), 20, 15, SRCCOPY).is_ok();
+            let mut info = BITMAPINFO {
+                bmiHeader: focusflow_core::capture::win::dib_header(1, 1),
+                ..Default::default()
+            };
+            let mut buf = [0u8; 4];
+            let lines = GetDIBits(
+                mem,
+                bmp,
+                0,
+                1,
+                Some(buf.as_mut_ptr() as *mut _),
+                &mut info,
+                DIB_RGB_COLORS,
+            );
+            let _ = SelObj(mem, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(Some(h), dc);
+            ReleaseDC(None, screen);
+            let _ = DestroyWindow(h);
+            assert!(copied, "从那扇隐藏窗的 DC 搬一格都没成");
+            assert_eq!(lines, 1, "读回表面没成");
+            assert_ne!(
+                (buf[0], buf[1], buf[2]),
+                (255, 0, 0),
+                "隐藏态预画竟然落上了表面（读回来正是那抹红）⇒ 「先画满再出现」值得重新采用，\
+                 请把覆盖层与贴图窗那两处预画加回来"
+            );
+        }
     }
 
     const SCREEN: (i32, i32, i32, i32) = (0, 0, 1920, 1080);
