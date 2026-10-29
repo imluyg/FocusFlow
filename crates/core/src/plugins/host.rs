@@ -84,6 +84,42 @@ fn ensure_pomodoro_db() {
     }
 }
 
+/// 番茄钟的持有者（插件文件名，与 `claim_scheduler` 同一个口径）。
+///
+/// 为什么只记"是谁在用"而不计数：一个 `PomodoroTimer` 就是一个「当前番茄会话」的状态，
+/// 两个插件同时计时本就无意义（见 `shutdown_pomodoro` 的注释）。但**记名字**是必需的：
+/// 出错回收时如果不分主人就拆，调度插件自己超限会把用户正在跑的番茄钟一起打断——
+/// 那比"线程留在原地跑"更糟。
+static POMODORO_OWNER: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
+fn claim_pomodoro(owner: &str) {
+    *POMODORO_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = Some(owner.to_string());
+}
+
+/// 出错兜底：只有当这个插件确实是番茄钟的主人时才回收计时线程，交回有没有动手。
+pub fn shutdown_pomodoro_if_owned_by(owner: &str) -> bool {
+    {
+        let mut slot = POMODORO_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_deref() != Some(owner) {
+            return false;
+        }
+        *slot = None;
+    }
+    shutdown_pomodoro();
+    true
+}
+
+/// 测试/诊断用：番茄钟此刻登记在谁名下。
+///
+/// 与调度线程那条同理由：全局槽会被并行用例踩，判据只问"我这个名字还在不在登记上"。
+#[cfg(any(test, feature = "test-utils"))]
+pub fn pomodoro_owner_for_test() -> Option<String> {
+    POMODORO_OWNER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// 回收番茄钟：落盘进行中的阶段并结束计时线程（重新启用插件会再起）。
 ///
 /// 由番茄钟插件在自己的 `cleanup()` 里调用 —— 谁用资源谁负责释放，
@@ -93,6 +129,7 @@ fn ensure_pomodoro_db() {
 /// 「当前番茄会话」的状态，两个插件同时计时本就无意义，所以它是单持有者资源，
 /// 拆掉就是拆掉。多个插件共用、且拆错会无声改变行为的是调度线程，见下面 `SchedulerSlot`。
 pub fn shutdown_pomodoro() {
+    *POMODORO_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let timer = POMODORO.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(t) = timer {
         t.shutdown();
@@ -251,22 +288,24 @@ pub fn register_host_api(
     })?;
     host.set("pomodoro_state", pomo_state_fn)?;
 
+    let work_owner = owner.clone();
     host.set(
         "pomodoro_start_work",
-        lua.create_function(|_, ()| {
-            pomodoro_timer()
-                .start_work()
-                .map_err(mlua::Error::RuntimeError)?;
+        lua.create_function(move |_, ()| {
+            let t = pomodoro_timer();
+            t.start_work().map_err(mlua::Error::RuntimeError)?;
+            claim_pomodoro(&work_owner);
             Ok(())
         })?,
     )?;
 
+    let break_owner = owner.clone();
     host.set(
         "pomodoro_start_break",
-        lua.create_function(|_, ()| {
-            pomodoro_timer()
-                .start_break()
-                .map_err(mlua::Error::RuntimeError)?;
+        lua.create_function(move |_, ()| {
+            let t = pomodoro_timer();
+            t.start_break().map_err(mlua::Error::RuntimeError)?;
+            claim_pomodoro(&break_owner);
             Ok(())
         })?,
     )?;
@@ -1032,6 +1071,30 @@ mod tests {
         assert!(
             !crate::accounting::db_path().exists(),
             "记账库必须等记账 API 被调用才建"
+        );
+    }
+
+    /// 番茄钟按**主人**归还：不是主人的那个插件出错，不许把别人正在跑的会话拆掉；
+    /// 是主人就拆，并且登记要一起清掉（否则下次同名出错时第二次"拆"会假报成动过手）。
+    #[test]
+    fn the_pomodoro_is_returned_only_to_its_owner() {
+        use super::{claim_pomodoro, pomodoro_owner_for_test, shutdown_pomodoro_if_owned_by};
+        claim_pomodoro("甲");
+        assert_eq!(pomodoro_owner_for_test().as_deref(), Some("甲"));
+        assert!(
+            !shutdown_pomodoro_if_owned_by("乙"),
+            "乙 不是主人，不该动手"
+        );
+        assert_eq!(
+            pomodoro_owner_for_test().as_deref(),
+            Some("甲"),
+            "乙 出错不能把主人的登记抹掉"
+        );
+        assert!(shutdown_pomodoro_if_owned_by("甲"), "甲 是自己会话的主人");
+        assert_eq!(pomodoro_owner_for_test(), None, "归还后登记要清掉");
+        assert!(
+            !shutdown_pomodoro_if_owned_by("甲"),
+            "没持有归还第二次是无操作，不能假报动过手"
         );
     }
 }

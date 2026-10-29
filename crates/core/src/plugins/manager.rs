@@ -317,6 +317,14 @@ impl PluginManager {
         }
         if !owner.is_empty() {
             host::release_scheduler(&owner);
+            // 番茄钟也要按主人归还：Lua 侧唯一的回收入口是 `cleanup()` 里的
+            // `pomodoro_shutdown()`，而它跟着 `info.lua = None` 一起消失了。不还的后果与
+            // 调度线程同族——插件页写着「已停用」，计时线程却还在倒数、还在往库里写会话行、
+            // 还在加今日完成，而界面上已经没有地方能停它。按名字还而不是无条件拆：
+            // 调度插件自己超限不该把用户正在跑的番茄钟一起打断。
+            if host::shutdown_pomodoro_if_owned_by(&owner) {
+                tracing::warn!("番茄钟随插件 {name} 一起回收（进行中那一段已落库）");
+            }
         }
         tracing::error!("插件已停用: {name}: {msg}");
     }
@@ -3126,6 +3134,39 @@ end
         assert!(
             flat.contains("record_key失败:"),
             "停用的那句原因还是要点名 record_key"
+        );
+    }
+
+    /// 出错回收这条路上，调度线程与番茄钟**都要**归还：只还一个就是"插件页说停了、
+    /// 计时线程还在跑还在写会话行"。番茄钟那条按主人还，见
+    /// `host::shutdown_pomodoro_if_owned_by`。
+    #[test]
+    fn the_error_path_returns_both_plugin_resources() {
+        let src = include_str!("manager.rs");
+        let at = src
+            .find("fn mark_plugin_error")
+            .expect("mark_plugin_error 不见了");
+        let rest = &src[at..];
+        let cut = ["\n    fn ", "\n    pub fn "]
+            .iter()
+            .filter_map(|p| rest[2..].find(p).map(|i| i + 2))
+            .min()
+            .unwrap_or(rest.len());
+        let flat: String = rest[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("host::release_scheduler(&owner)"),
+            "出错那条路上调度线程的归还被摘掉了"
+        );
+        assert!(
+            flat.contains("host::shutdown_pomodoro_if_owned_by(&owner)"),
+            "出错那条路上没归还番茄钟：计时线程会在插件停用后继续跑、继续写会话行"
         );
     }
 }
