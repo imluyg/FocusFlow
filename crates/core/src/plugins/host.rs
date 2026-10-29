@@ -569,32 +569,40 @@ pub fn register_host_api(
             String,
         )| {
             ensure_accounting_db();
-            Ok(accounting::add_expense(
-                &rtype,
-                &item,
-                if store.is_empty() {
-                    None
-                } else {
-                    Some(store.as_str())
+            // 交回 (新行 id 或 -1, 为什么没写进去)：面板以前对 `-1` 只会念「库正被占用或
+            // 打不开」，而日期不认、类型不合法也走同一个码 —— 填了 `2026-13-01` 的人
+            // 被告知去查数据库。
+            Ok(
+                match accounting::add_expense_outcome(
+                    &rtype,
+                    &item,
+                    if store.is_empty() {
+                        None
+                    } else {
+                        Some(store.as_str())
+                    },
+                    &date,
+                    amount,
+                    if cat.is_empty() {
+                        None
+                    } else {
+                        Some(cat.as_str())
+                    },
+                    if sub.is_empty() {
+                        None
+                    } else {
+                        Some(sub.as_str())
+                    },
+                    if note.is_empty() {
+                        None
+                    } else {
+                        Some(note.as_str())
+                    },
+                ) {
+                    Ok(id) => (id, String::new()),
+                    Err(why) => (-1i64, why),
                 },
-                &date,
-                amount,
-                if cat.is_empty() {
-                    None
-                } else {
-                    Some(cat.as_str())
-                },
-                if sub.is_empty() {
-                    None
-                } else {
-                    Some(sub.as_str())
-                },
-                if note.is_empty() {
-                    None
-                } else {
-                    Some(note.as_str())
-                },
-            ))
+            )
         },
     )?;
     host.set("accounting_add", acc_add)?;

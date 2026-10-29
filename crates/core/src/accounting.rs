@@ -441,19 +441,48 @@ pub fn add_expense(
     subcategory: Option<&str>,
     note: Option<&str>,
 ) -> i64 {
+    add_expense_outcome(
+        rtype,
+        item_name,
+        store,
+        purchase_date,
+        amount,
+        category,
+        subcategory,
+        note,
+    )
+    .unwrap_or(-1)
+}
+
+/// 与 [`add_expense`] 同一条写入路，但把**为什么没写进去**原样交回调用方。
+///
+/// `-1` 以前有四个来源（库打不开 / 类型不在允许值 / 日期不认 / INSERT 失败），而面板对
+/// 它只会念「记账库写入失败（库正被占用或打不开）」——用户填了 `2026-13-01` 被告知去查
+/// 数据库，是把人往错的方向支使。宿主内部本来就分开记日志，只是没交给调用方。
+#[allow(clippy::too_many_arguments)]
+pub fn add_expense_outcome(
+    rtype: &str,
+    item_name: &str,
+    store: Option<&str>,
+    purchase_date: &str,
+    amount: f64,
+    category: Option<&str>,
+    subcategory: Option<&str>,
+    note: Option<&str>,
+) -> Result<i64, String> {
     let conn = match open() {
         Ok(c) => c,
         // 面板那一头对 -1 说的是「记账库没打开或写入失败」，而宿主对"为什么不写"
         // 原先一个字都不留（与 `add_category` 那处同形）
         Err(e) => {
             tracing::error!("添加记账记录「{item_name}」失败：记账库打不开: {e}");
-            return -1;
+            return Err(format!("记账库打不开：{e}"));
         }
     };
     let rtype = rtype.trim();
     if !EXPENSE_TYPES.contains(&rtype) {
         tracing::warn!("记账类型「{rtype}」不在允许值里（支出/收入），这条没写进去");
-        return -1;
+        return Err(format!("记账类型「{rtype}」不在允许值里（支出/收入）"));
     }
     // 日期尺子与读侧同一把（见 `normalize_date_filter`）。**空串也拒**：原先空值
     // 原样落库（`purchase_date TEXT NOT NULL` 容得下 `""`），因为**面板**自己会在
@@ -466,7 +495,9 @@ pub fn add_expense(
             tracing::warn!(
                 "记账日期「{purchase_date}」不是可识别的日期（空值也算不可识别），这条没写进去"
             );
-            return -1;
+            return Err(format!(
+                "日期「{purchase_date}」不是可识别的日期（要 2026-09-01 这种，或 20260901）"
+            ));
         }
     };
     let record_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -487,10 +518,10 @@ pub fn add_expense(
         ],
     );
     match r {
-        Ok(_) => conn.last_insert_rowid(),
+        Ok(_) => Ok(conn.last_insert_rowid()),
         Err(e) => {
             tracing::error!("添加记账失败: {e}");
-            -1
+            Err(format!("写入记账库失败：{e}"))
         }
     }
 }
@@ -3014,6 +3045,39 @@ mod tests {
             bad.push("id 改为按这一次插入的结果给，不再事后回读猜".to_string());
         }
         assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    /// 写入被拒时，原因要分得开：日期不认、类型不合法、库打不开是三种不同的下一步。
+    ///
+    /// 旧形状是几个出口全折成 `-1`，而面板对 `-1` 只会念「记账库写入失败（库正被占用或
+    /// 打不开）」——填了 `2026-13-01` 的人被告知去查数据库，方向是错的。
+    #[test]
+    fn a_rejected_expense_names_which_rule_rejected_it() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_add_reasons");
+        init_db().expect("建库失败");
+        let ok = add_expense_outcome("支出", "午饭", None, "2026-09-05", 12.5, None, None, None);
+        assert!(matches!(ok, Ok(id) if id > 0), "正常一条要写得进: {ok:?}");
+        let why =
+            match add_expense_outcome("支出", "午饭", None, "2026-13-01", 12.5, None, None, None)
+            {
+                Err(w) => w,
+                Ok(_) => panic!("不存在的日子不该写得进"),
+            };
+        assert!(why.contains("2026-13-01"), "要原样念出那个值: {why}");
+        assert!(
+            !why.contains("打不开") && !why.contains("占用"),
+            "日期不认不该说库坏了: {why}"
+        );
+        let bad_type =
+            add_expense_outcome("转账", "午饭", None, "2026-09-05", 12.5, None, None, None)
+                .expect_err("类型不在允许值里要交回原因");
+        assert!(bad_type.contains("转账"), "要点名是哪个类型: {bad_type}");
+        // 对外那条 `add_expense` 的语义不变：失败还是 -1（CLI 与既有用例照旧）
+        assert_eq!(
+            add_expense("转账", "午饭", None, "2026-09-05", 12.5, None, None, None),
+            -1
+        );
     }
 
     /// 删除一条记录有三种结局，不许折成一个 bool 还不留日志。
