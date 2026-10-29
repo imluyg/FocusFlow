@@ -18,13 +18,14 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRectRgn,
-    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, ExtCreatePen, GetClipBox, GetDC,
-    GetStockObject, GetTextExtentPoint32W, InvalidateRect, LineTo, MoveToEx, Rectangle, ReleaseDC,
-    SelectClipRgn, SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, TextOutW, BITMAPINFO,
-    BS_SOLID, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DIB_RGB_COLORS, FW_NORMAL, HDC, HPEN, LOGBRUSH, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-    PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
+    CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, ExtCreatePen, GetClipBox,
+    GetDC, GetStockObject, GetTextExtentPoint32W, InvalidateRect, LineTo, MoveToEx, Rectangle,
+    ReleaseDC, SelectClipRgn, SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, TextOutW,
+    BITMAPINFO, BS_SOLID, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
+    DIB_RGB_COLORS, FW_NORMAL, HBITMAP, HDC, HGDIOBJ, HPEN, LOGBRUSH, NULL_BRUSH,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID,
+    SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -195,6 +196,40 @@ const FONTS: [(i32, &str); 3] = [(18, "f1"), (30, "f2"), (48, "f3")];
 /// 工具 id -> `tool` 编号。
 const TOOLS: [&str; 7] = ["rect", "arrow", "pen", "mosaic", "block", "text", "pick"];
 
+/// 覆盖层的双缓冲：一块整屏尺寸的 32bpp DIB 段 + 只把它的位图选进去的内存 DC。
+///
+/// 为什么要它：以前每一帧先把压暗的整屏推上窗口、再把选区那份原图推第二遍，两遍都是
+/// 全屏 `SetDIBitsToDevice`。第一遍画完到第二遍画完之间，那块屏在合成器眼里就是"暗的一帧"，
+/// 拖框时人看到的正是这个闪；而每帧几毫秒的搬运又让选区跟不上手，看起来像放幻灯片。
+/// 合成进内存、最后**一把** `BitBlt` 交给窗口：窗口每帧只被碰一次，且只画该变的那块。
+/// 句柄与像素指针存整数：静态量要 `Send`（和本文件里 `overlay` / `text_edit` 同一个理由）。
+#[derive(Clone, Copy)]
+struct BackBuffer {
+    mem: isize,
+    dib: isize,
+    old: isize,
+    bits: usize,
+    w: i32,
+    h: i32,
+}
+
+impl BackBuffer {
+    const fn empty() -> Self {
+        BackBuffer {
+            mem: 0,
+            dib: 0,
+            old: 0,
+            bits: 0,
+            w: 0,
+            h: 0,
+        }
+    }
+    /// 是不是这一块屏（拔屏/改分辨率后虚拟屏尺寸会变，旧的那块必须还掉重开）。
+    fn fits(&self, w: i32, h: i32) -> bool {
+        self.bits != 0 && self.w == w && self.h == h
+    }
+}
+
 /// 一次截图的全部状态（同一时刻只允许一个覆盖层，所以是一个静态量）。
 pub struct SnipState {
     /// 覆盖层在不在：`start` 用它挡住"热键连按"，`WM_DESTROY` 负责复位。
@@ -256,6 +291,15 @@ pub struct SnipState {
     started_at: Option<Instant>,
     last_input: Option<Instant>,
     ceiling_ms: u64,
+    /// 这一帧的双缓冲（见 [`BackBuffer`]）：建在第一次绘制，覆盖层关掉就还。
+    back: BackBuffer,
+    /// 上一帧画在蒙版**之上**的那一块（见 [`frame_content`]）。下一帧先把这一块恢复成
+    /// 纯蒙版、再画新的这一帧碰过的块，于是每帧只搬这一小块像素，屏幕上也才不会
+    /// 把上一帧的选区边框留在原地。
+    frame_dirty: (i32, i32, i32, i32),
+    /// 窗口表面有没有被完整交过一次。第一次上屏（或双缓冲换过一块）之前，表面里
+    /// 是还没写过的东西，那一帧必须整屏交，不能只交一角。
+    presented_all: bool,
 }
 
 const fn default_state() -> SnipState {
@@ -293,6 +337,9 @@ const fn default_state() -> SnipState {
         started_at: None,
         last_input: None,
         ceiling_ms: SNIP_CEILING_QUICK_MS,
+        back: BackBuffer::empty(),
+        frame_dirty: (0, 0, 0, 0),
+        presented_all: false,
     }
 }
 
@@ -438,16 +485,178 @@ pub fn grow_rect(
 /// 蒙版：整幅 BGRA 每通道乘 [`VEIL_MUL`]，alpha 钉成 255。
 ///
 /// 单独写成纯函数是因为"选区里外看到的是不是同一张图"这件事只能在这里判：
-/// 压暗的一份铺满全屏，亮区再把原图 clip 出来，两处用的是同一批像素。
+/// 压暗的一份铺满全屏，亮区由 [`compose_into_region`] 从同一批像素里抄回来。
 pub fn dim_bgra(src: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(src.len());
-    for px in src.as_chunks::<4>().0 {
-        out.push((px[0] as u32 * VEIL_MUL / 255) as u8);
-        out.push((px[1] as u32 * VEIL_MUL / 255) as u8);
-        out.push((px[2] as u32 * VEIL_MUL / 255) as u8);
-        out.push(255);
+    let (pixels, _) = src.as_chunks::<4>();
+    // 先把目的地按像素数开好、再逐格写。旧写法是一像素四次 `push`（整屏就是七百多万次
+    // 调用），开层那一下的压暗耗时几乎全在这里；原地写能让编译器把四个通道并成一次存取。
+    let mut out = vec![0u8; pixels.len() * 4];
+    for (o, px) in out.as_chunks_mut::<4>().0.iter_mut().zip(pixels) {
+        o[0] = (px[0] as u32 * VEIL_MUL / 255) as u8;
+        o[1] = (px[1] as u32 * VEIL_MUL / 255) as u8;
+        o[2] = (px[2] as u32 * VEIL_MUL / 255) as u8;
+        o[3] = 255;
     }
     out
+}
+
+/// 铺一帧的底：`clip` 之内先写压暗的那份，再把亮区（选区或悬停命中的窗口）那几行从原图抄回来。
+///
+/// 这是"每帧搬多少字节"的唯一裁决点，也是屏上与出图同源的那一处：
+/// * 目标就是双缓冲那块内存位图的像素，写完再交给窗口，窗口整帧只被碰一次；
+/// * 只动 `clip` 这一块，其余像素保持缓冲里已有的那份 —— 拖框时屏幕真正在变的只有选区、
+///   放大镜与几条读数带，而整屏搬运在 1920x1080 上实测 1.5 毫秒，一帧的地板几乎全是它；
+/// * 抓屏回来的 alpha 那一字节是 0（GDI 的 BGRA 不填它）。走内存位图 + `BitBlt` 时它会
+///   原样落到窗口表面，压暗那份本来就是 255，所以这里把亮区也钉成 255 ——
+///   否则"选区里"就变成"选区里透出个黑块"。
+///
+/// 三份缓冲长度都必须够一屏；不够就整帧不动笔（宁可这一帧没更新，也不要写脏别人的内存）。
+pub fn compose_into_region(
+    dst: &mut [u8],
+    base: &[u8],
+    dim: &[u8],
+    bright: Option<(i32, i32, i32, i32)>,
+    clip: (i32, i32, i32, i32),
+    w: i32,
+    h: i32,
+) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let need = (w as usize) * (h as usize) * 4;
+    if dst.len() < need || base.len() < need || dim.len() < need {
+        return;
+    }
+    let (cl, ct, cr, cb) = clamp_rect(clip, w, h);
+    let band = (cr - cl) as usize * 4;
+    if band == 0 {
+        return;
+    }
+    for y in ct..cb {
+        let i = (y as usize * w as usize + cl as usize) * 4;
+        dst[i..i + band].copy_from_slice(&dim[i..i + band]);
+    }
+    let Some((bl, bt, br, bb)) = bright else {
+        return;
+    };
+    let (l, t) = (bl.max(cl).max(0), bt.max(ct));
+    let (r, b) = (br.min(cr), bb.min(cb));
+    let row = (r - l).max(0) as usize * 4;
+    if row == 0 {
+        return;
+    }
+    for y in t..b {
+        let i = (y as usize * w as usize + l as usize) * 4;
+        dst[i..i + row].copy_from_slice(&base[i..i + row]);
+        for px in dst[i..i + row].as_chunks_mut::<4>().0 {
+            px[3] = 255;
+        }
+    }
+}
+
+/// 两个矩形的最小外包；空的那一侧直接交出另一侧。
+///
+/// 为什么不能省这一步：`(0,0,0,0)` 也参与 min/max 的话，并集会被那个原点吃掉，
+/// 于是"上一帧碰过哪里"永远算不出来。
+pub fn union_rect(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    if rect_empty(a) {
+        return b;
+    }
+    if rect_empty(b) {
+        return a;
+    }
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+}
+
+fn rect_empty(r: (i32, i32, i32, i32)) -> bool {
+    r.2 <= r.0 || r.3 <= r.1
+}
+
+fn pad_rect(r: (i32, i32, i32, i32), pad: i32) -> (i32, i32, i32, i32) {
+    (r.0 - pad, r.1 - pad, r.2 + pad, r.3 + pad)
+}
+
+/// 一整条横带（左右都到屏边）。
+///
+/// 读数那种底盒为什么按带走：`chip_origin` 会把超出可见区的盒子**向左/向上**夹回屏内，
+/// 同一句读数在不同落点下占的列不一样。整条宽度只有 30 来像素高，比整屏便宜两个数量级，
+/// 又保证不会把夹回去的那一格漏在范围外。
+fn band(y0: i32, y1: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
+    clamp_rect((0, y0, w, y1), w, h)
+}
+
+/// 一处读数底盒的最坏范围。
+///
+/// `draw_chip` 会把超出可见区的盒子**向左/向上**夹回屏内（走的是 `chip_origin`），于是同一句
+/// 读数有两种落点：贴着锚点那一行，和被挤到屏幕底边那一行。两条都得算进来 —— 少算一条，
+/// 屏幕上就把上一帧那句读数留在原地。横向按整条带走：夹回之后落在哪一列不必预知。
+fn chip_band(y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
+    let mut r = band(y - 6, y + CHIP_MAX_H + 6, w, h);
+    if y < 0 {
+        // 锚点在屏幕上方（选区贴着第一行）：盒子被夹到屏幕顶那一格才是真落点
+        r = union_rect(r, band(0, CHIP_MAX_H + 6, w, h));
+    }
+    if y + CHIP_MAX_H > h {
+        // 这一刻才可能挤回屏内，落点只能更靠上：把屏幕底边那一条一起算进来
+        r = union_rect(r, band(h - CHIP_MAX_H - 6, h, w, h));
+    }
+    r
+}
+
+/// 亮区落在哪一块：拖框中或选区已定用选区，Select 阶段用悬停命中的窗口。
+///
+/// 绘制与 [`frame_content`] 共用这一份判据 —— 两处各写一遍的话，范围算窄了会留残影。
+pub fn bright_rect(s: &SnipState) -> Option<(i32, i32, i32, i32)> {
+    match s.drag {
+        Some((Drag::New, _, _))
+        | Some((Drag::Handle(_), _, _))
+        | Some((Drag::Mark, _, _))
+        | Some((Drag::Pick(_), _, _))
+        | Some((Drag::Endpoint(_, _), _, _)) => Some(s.sel),
+        None => {
+            if s.phase == Phase::Adjust {
+                Some(s.sel)
+            } else {
+                s.hover
+            }
+        }
+    }
+}
+
+/// 读数底盒的最坏高度：行高 + 内边距，再放一档给字形的外溢。
+const CHIP_MAX_H: i32 = CHIP_FONT_H + CHIP_PAD_V + 12;
+
+/// 这一帧会画在蒙版**之上**的所有块（不含上一帧那一份）。
+///
+/// 这块范围是"帧与帧之间怎么接力"的唯一裁决点：绘制先把它恢复成纯蒙版再画新的，
+/// 交出去也只交这一块。少算一像素，屏幕上就把上一帧的残影留在原地，
+/// 所以每一块都往外多留几像素（描边 2、手柄 8、读数的落点还会被夹回屏内）。
+pub fn frame_content(s: &SnipState) -> (i32, i32, i32, i32) {
+    let (w, h) = (s.base_w, s.base_h);
+    let mut r = (0, 0, 0, 0);
+    if let Some(b) = bright_rect(s) {
+        r = union_rect(r, pad_rect(b, 12));
+        r = union_rect(r, chip_band(b.1 - 24, w, h));
+    }
+    if s.phase == Phase::Adjust {
+        let (_, bar) = bar_rects(s.sel, w, h);
+        r = union_rect(r, pad_rect((bar.0, bar.1, bar.0 + bar.2, bar.1 + bar.3), 4));
+    }
+    if s.phase == Phase::Select {
+        if let Some((lx, ly, ls, lsz)) = loupe_rect(s.cur.0, s.cur.1, w, h) {
+            r = union_rect(r, pad_rect((lx, ly, lx + ls, ly + lsz), 4));
+            r = union_rect(r, chip_band(ly + lsz + 1, w, h));
+        }
+        if s.drag.is_none() {
+            r = union_rect(r, chip_band(12, w, h));
+        }
+    }
+    if s.notice.is_some() {
+        // 贴到屏幕顶时那句改画在选区里侧：两种落点都算进来
+        r = union_rect(r, chip_band(s.sel.1 - 48, w, h));
+        r = union_rect(r, chip_band(s.sel.1 + 26, w, h));
+    }
+    clamp_rect(r, w, h)
 }
 
 /// 把 src 里 (x,y,w,h) 这一块按**绝对**格网做格子平均，返回 w*h*4 的 BGRA（越界填 0）。
@@ -1040,6 +1249,69 @@ unsafe fn blit_bgra(hdc: HDC, buf: &[u8], w: i32, h: i32, dx: i32, dy: i32) {
     );
 }
 
+/// 保证有一块 `w`×`h` 的双缓冲在位，返回它的 DC 与像素首地址。
+///
+/// 尺寸没变（绝大多数帧）就直接复用；拔屏/换分辨率后旧的还掉重开。
+/// 建不出来时回 `None`：调用方改回"直接画窗口"那条老路 —— 少一次缓冲只是可能闪一下，
+/// 而为一块没批下来的内存把整屏画成黑的，比原来的毛病更糟。
+unsafe fn back_acquire(bb: &mut BackBuffer, w: i32, h: i32) -> Option<(HDC, *mut u8)> {
+    unsafe {
+        if bb.fits(w, h) {
+            return Some((HDC(bb.mem as *mut core::ffi::c_void), bb.bits as *mut u8));
+        }
+        back_release(bb);
+        let info = BITMAPINFO {
+            bmiHeader: focusflow_core::capture::win::dib_header(w as u32, h as u32),
+            ..Default::default()
+        };
+        let screen = GetDC(None);
+        let mut pv: *mut core::ffi::c_void = std::ptr::null_mut();
+        let dib = match CreateDIBSection(Some(screen), &info, DIB_RGB_COLORS, &mut pv, None, 0) {
+            Ok(d) => d,
+            Err(_) => {
+                ReleaseDC(None, screen);
+                return None;
+            }
+        };
+        if pv.is_null() {
+            let _ = DeleteObject(dib.into());
+            ReleaseDC(None, screen);
+            return None;
+        }
+        let mem = CreateCompatibleDC(Some(screen));
+        ReleaseDC(None, screen);
+        if mem.0.is_null() {
+            let _ = DeleteObject(dib.into());
+            return None;
+        }
+        let old = SelectObject(mem, dib.into());
+        bb.mem = mem.0 as isize;
+        bb.dib = dib.0 as isize;
+        bb.old = old.0 as isize;
+        bb.bits = pv as usize;
+        bb.w = w;
+        bb.h = h;
+        Some((mem, pv as *mut u8))
+    }
+}
+
+/// 还掉双缓冲：覆盖层关掉、或虚拟屏尺寸变了都走这一条（一屏就是八 MB 以上，挂着不放等于泄漏）。
+unsafe fn back_release(bb: &mut BackBuffer) {
+    unsafe {
+        if bb.mem != 0 {
+            let mem = HDC(bb.mem as *mut core::ffi::c_void);
+            if bb.old != 0 {
+                let _ = SelectObject(mem, HGDIOBJ(bb.old as *mut core::ffi::c_void));
+            }
+            let _ = DeleteDC(mem);
+        }
+        if bb.dib != 0 {
+            let _ = DeleteObject(HBITMAP(bb.dib as *mut core::ffi::c_void).into());
+        }
+        *bb = BackBuffer::empty();
+    }
+}
+
 /// 粗线用几何笔（圆头圆角），细线用普通实线笔。
 ///
 /// 为什么分两支：GDI 的 cosmetic 笔**无视宽度**，`CreatePen(PS_SOLID, 7, ..)` 画出来还是 1 像素，
@@ -1133,24 +1405,7 @@ fn text_font_height(font: i32) -> i32 {
 /// 标注文字那一笔的字体：烤图与就地输入框**两处共用这一份**（原来两边各写一遍
 /// 十八个参数的 `CreateFontW`，只有第一个参数不一样，就是这么写漏出来的）。
 unsafe fn mark_text_font(font: i32) -> windows::Win32::Graphics::Gdi::HFONT {
-    unsafe {
-        CreateFontW(
-            text_font_height(font),
-            0,
-            0,
-            0,
-            FW_NORMAL.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            DEFAULT_PITCH.0 as u32,
-            w!("Microsoft YaHei UI"),
-        )
-    }
+    unsafe { font_of(text_font_height(font), false) }
 }
 
 /// 在 hdc 上画一笔（马赛克除外）。`ox/oy` 把选区本地坐标搬到目标原点。
@@ -1187,7 +1442,6 @@ unsafe fn draw_shape(hdc: HDC, shape: &Shape, st: Style, ox: i32, oy: i32) {
                 let wide: Vec<u16> = s.encode_utf16().collect();
                 let _ = TextOutW(hdc, ox + *x, oy + *y, &wide);
                 SelectObject(hdc, oldf);
-                let _ = DeleteObject(font.into());
             }
             // 马赛克是像素运算，不走 DC：预览与烤图两处各自调 mosaic_block
             Shape::Mosaic(..) => {}
@@ -1290,13 +1544,30 @@ unsafe fn draw_chip(hdc: HDC, x: i32, y: i32, text: &str, fg: u32) {
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = TextOutW(hdc, x + 6, y + 3, &wide);
         SelectObject(hdc, oldf);
-        let _ = DeleteObject(font.into());
     }
 }
 
 unsafe fn yaihe(height: i32, bold: bool) -> windows::Win32::Graphics::Gdi::HFONT {
+    unsafe { font_of(height, bold) }
+}
+
+/// 同一档字体只建一次（键 = 高度 + 粗体）。
+///
+/// 为什么值得缓存：`CreateFontW` 每次都要走一遍字体匹配，而覆盖层每一帧至少有
+/// 「尺寸读数 + 放大镜读数」两处、标注阶段再加一条工具条与每笔文字标注要用它 ——
+/// 实测一帧 5.3 毫秒里，除了搬像素，剩下的几乎全耗在建字体上。
+/// 这张表的上界就是本文件写死的那几档（读数、放大镜、工具条、`FONTS` 三档标注字号），
+/// 不随截图次数涨；换来的句柄活到进程结束，所以调用方**不许再 DeleteObject**。
+static YAIHE_CACHE: Mutex<Vec<(i32, bool, isize)>> = Mutex::new(Vec::new());
+
+unsafe fn font_of(height: i32, bold: bool) -> windows::Win32::Graphics::Gdi::HFONT {
     unsafe {
-        CreateFontW(
+        if let Ok(c) = YAIHE_CACHE.lock() {
+            if let Some(item) = c.iter().find(|(h, b, _)| *h == height && *b == bold) {
+                return windows::Win32::Graphics::Gdi::HFONT(item.2 as *mut core::ffi::c_void);
+            }
+        }
+        let f = CreateFontW(
             height,
             0,
             0,
@@ -1311,7 +1582,11 @@ unsafe fn yaihe(height: i32, bold: bool) -> windows::Win32::Graphics::Gdi::HFONT
             CLEARTYPE_QUALITY,
             DEFAULT_PITCH.0 as u32,
             w!("Microsoft YaHei UI"),
-        )
+        );
+        if let Ok(mut c) = YAIHE_CACHE.lock() {
+            c.push((height, bold, f.0 as isize));
+        }
+        f
     }
 }
 
@@ -1333,33 +1608,37 @@ pub fn btn_active(id: &str, tool: u8, color: u32, width: i32, font: i32) -> bool
     }
 }
 
-unsafe fn draw_bar(hdc: HDC, sel: (i32, i32, i32, i32), screen_w: i32, screen_h: i32) {
+unsafe fn draw_bar(
+    hdc: HDC,
+    sel: (i32, i32, i32, i32),
+    screen_w: i32,
+    screen_h: i32,
+    now: (u8, u32, i32, i32),
+    geom: &mut Option<(i32, i32, i32, i32)>,
+) {
     unsafe {
-        let (tool, color, width, font) = SNIP
-            .lock()
-            .map(|s| (s.tool, s.color, s.width, s.font))
-            .unwrap_or((0, PALETTE[0].0, WIDTHS[0].0, FONTS[1].0));
+        let (tool, color, width, font) = now;
         let (btns, bar) = bar_rects(sel, screen_w, screen_h);
         // 选区一改，工具条就跟着换地方。日志里那份几何是验收脚本唯一的瞄准依据，
         // 所以改过之后要重新亮一次；只在真的变了时打，每帧都打会把日志刷满。
-        let republish = SNIP
-            .lock()
-            .map(|mut s| {
-                if s.geom_sel == Some(sel) {
-                    false
-                } else {
-                    s.geom_sel = Some(sel);
-                    true
-                }
-            })
-            .unwrap_or(false);
+        let republish = if *geom == Some(sel) {
+            false
+        } else {
+            *geom = Some(sel);
+            true
+        };
         if republish {
+            // 二十行按钮几何**一次写出**：拖角与方向键那一段每帧选区都变，逐行调用就是
+            // 每帧二十次文件开合（实测把一帧从 5.6 ms 抬到 9.7 ms）。
+            // 行内容一字没改，验收脚本照旧按 `snip-btn <id> <x> <y> <w> <h>` 逐行匹配。
+            let mut block = String::new();
             for b in &btns {
-                tracing_note(&format!(
-                    "snip-btn {} {} {} {} {}",
+                block.push_str(&format!(
+                    "snip-btn {} {} {} {} {}\n",
                     b.id, b.x, b.y, b.w, b.h
                 ));
             }
+            tracing_note(block.trim_end());
         }
         let bg = CreateSolidBrush(COLORREF(BAR_BG));
         let old = SelectObject(hdc, bg.into());
@@ -1407,7 +1686,6 @@ unsafe fn draw_bar(hdc: HDC, sel: (i32, i32, i32, i32), screen_w: i32, screen_h:
             let _ = TextOutW(hdc, b.x + (b.w - sz.cx) / 2, b.y + (b.h - sz.cy) / 2, &wide);
         }
         SelectObject(hdc, oldf);
-        let _ = DeleteObject(hfont.into());
     }
 }
 
@@ -2194,6 +2472,10 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     s.overlay = 0;
                     s.owner = 0;
                     s.notice = None;
+                    // 双缓冲那块也是一整屏的字节，和两份全屏缓冲同一个道理：还在这里还。
+                    back_release(&mut s.back);
+                    s.frame_dirty = (0, 0, 0, 0);
+                    s.presented_all = false;
                     s.base = Vec::new();
                     s.dim = Vec::new();
                     s.base_w = 0;
@@ -2564,87 +2846,80 @@ unsafe extern "system" fn text_edit_proc(
 unsafe fn paint(hwnd: HWND) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        let snap = match SNIP.lock() {
-            Ok(s) => Some((
-                s.base.clone(),
-                s.dim.clone(),
-                s.base_w,
-                s.base_h,
-                s.sel,
-                s.phase,
-                s.hover,
-                s.marks.clone(),
-                s.drag,
-                s.cur,
-                s.origin,
-                s.pen_pts.clone(),
-                s.tool,
-                s.color,
-                s.width,
-                s.font,
-            )),
-            Err(_) => None,
+        let window_dc = BeginPaint(hwnd, &mut ps);
+        // 一帧只取一次锁。以前这里先把整屏那两份缓冲各抄一遍再画，实测那一步独占
+        // 3.5 毫秒（1920x1080 一帧就是 8 MB × 2），是"选区跟不上手"的主项；而覆盖层的
+        // 消息与改状态的消息在同一条线程上，画完就放锁，不存在举着锁跨线程等谁。
+        let mut guard = match SNIP.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = EndPaint(hwnd, &ps);
+                return;
+            }
         };
-        let Some((
-            base,
-            dim,
-            bw,
-            bh,
-            sel,
-            phase,
-            hover,
-            marks,
-            drag,
-            cur,
-            origin,
-            pen_pts,
-            tool,
-            color,
-            width,
-            font,
-        )) = snap
-        else {
-            let _ = EndPaint(hwnd, &ps);
-            return;
-        };
-        if base.is_empty() || bw <= 0 || bh <= 0 {
+        let snip = &mut *guard;
+        let (bw, bh) = (snip.base_w, snip.base_h);
+        if snip.base.is_empty() || bw <= 0 || bh <= 0 {
             // 冻结失败也要出声：一片深色比"看起来没反应"好判断
             let brush = CreateSolidBrush(COLORREF(0x0014_1414));
-            let old = SelectObject(hdc, brush.into());
-            let _ = Rectangle(hdc, 0, 0, bw.max(1), bh.max(1));
-            SelectObject(hdc, old);
+            let old = SelectObject(window_dc, brush.into());
+            let _ = Rectangle(window_dc, 0, 0, bw.max(1), bh.max(1));
+            SelectObject(window_dc, old);
             let _ = DeleteObject(brush.into());
             let _ = EndPaint(hwnd, &ps);
             return;
         }
-        // 1) 压暗的那一份铺满全屏
-        blit_bgra(hdc, &dim, bw, bh, 0, 0);
-        // 2) 亮区：拖框中或选区已定用选区，Select 阶段用悬停命中的窗口
-        let bright = match drag {
-            Some((Drag::New, _, _))
-            | Some((Drag::Handle(_), _, _))
-            | Some((Drag::Mark, _, _))
-            | Some((Drag::Pick(_), _, _))
-            | Some((Drag::Endpoint(_, _), _, _)) => Some(sel),
-            None => {
-                if phase == Phase::Adjust {
-                    Some(sel)
-                } else {
-                    hover
-                }
-            }
+        // 亮区：拖框中或选区已定用选区，Select 阶段用悬停命中的窗口
+        let bright = bright_rect(&*snip);
+        let content = frame_content(&*snip);
+        let fresh = !snip.back.fits(bw, bh);
+        let region = if snip.presented_all && !fresh {
+            clamp_rect(union_rect(snip.frame_dirty, content), bw, bh)
+        } else {
+            (0, 0, bw, bh)
         };
+        snip.frame_dirty = content;
+        // 双缓冲：先合成进内存位图，最后一把 `BitBlt` 交给窗口 —— 窗口每帧只被碰一次，
+        // 合成器就不会在"压暗画完、亮区还没画"那一瞬把屏幕取走（旧写法每帧两次全屏推送，
+        // 那中间的一帧就是用户看到的闪）。建不出来才退回直接画窗口。
+        let back = back_acquire(&mut snip.back, bw, bh);
+        let hdc = match back {
+            Some((m, _)) => m,
+            None => window_dc,
+        };
+        match back {
+            Some((_, bits)) => compose_into_region(
+                std::slice::from_raw_parts_mut(bits, (bw as usize) * (bh as usize) * 4),
+                &snip.base,
+                &snip.dim,
+                bright,
+                region,
+                bw,
+                bh,
+            ),
+            None => blit_bgra(hdc, &snip.dim, bw, bh, 0, 0),
+        }
+        let composed = back.is_some();
+        let base: &[u8] = &snip.base;
+        let marks = &snip.marks;
+        let pen_pts = &snip.pen_pts;
+        let (sel, phase, drag, cur, origin) =
+            (snip.sel, snip.phase, snip.drag, snip.cur, snip.origin);
+        let (tool, color, width, font, selected) =
+            (snip.tool, snip.color, snip.width, snip.font, snip.selected);
+        let notice = snip.notice.as_deref();
         if let Some(rc) = bright {
             let rg = CreateRectRgn(rc.0, rc.1, rc.2, rc.3);
             let _ = SelectClipRgn(hdc, Some(rg));
-            blit_bgra(hdc, &base, bw, bh, 0, 0);
+            if !composed {
+                blit_bgra(hdc, base, bw, bh, 0, 0);
+            }
             // 已画的标注：与烤图同一条路（色块/马赛克按像素算，其余走 GDI）
-            for m in &marks {
-                draw_live(hdc, &base, bw, bh, rc, m);
+            for m in marks {
+                draw_live(hdc, base, bw, bh, rc, m);
             }
             // 选中的那一笔套一个白框：只在屏上画，不进合成结果
-            if let Some(i) = SNIP.lock().ok().and_then(|s| s.selected) {
+            if let Some(i) = selected {
                 if let Some(m) = marks.get(i) {
                     if let Some((l, t, r, b)) = mark_bbox(m) {
                         let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00FF_FFFF));
@@ -2696,10 +2971,10 @@ unsafe fn paint(hwnd: HWND) {
                     SelectObject(hdc, oldb);
                     SelectObject(hdc, oldp);
                     let _ = DeleteObject(p.into());
-                } else if let Some(sh) = shape_from_drag(tool, (sx, sy), cur, &pen_pts, rc) {
+                } else if let Some(sh) = shape_from_drag(tool, (sx, sy), cur, pen_pts, rc) {
                     draw_live(
                         hdc,
-                        &base,
+                        base,
                         bw,
                         bh,
                         rc,
@@ -2754,18 +3029,24 @@ unsafe fn paint(hwnd: HWND) {
             }
         }
         if phase == Phase::Adjust {
-            draw_bar(hdc, sel, bw, bh);
+            draw_bar(
+                hdc,
+                sel,
+                bw,
+                bh,
+                (tool, color, width, font),
+                &mut snip.geom_sel,
+            );
         }
         // 出图没成的那句写在选区上沿外面（贴到屏幕顶就改画在选区里侧）：这一句是给人看的，
         // 只在日志里出声等于没出声——覆盖层正是为它才不退的。
-        let notice = SNIP.lock().ok().and_then(|s| s.notice.clone());
         if let Some(msg) = notice {
             let ny = if sel.1 - 48 >= 0 {
                 sel.1 - 48
             } else {
                 sel.1 + 26
             };
-            draw_chip(hdc, sel.0, ny, &msg, rgb(255, 60, 60));
+            draw_chip(hdc, sel.0, ny, msg, rgb(255, 60, 60));
         }
         // 还没拖、也还没定选区时把这一场的用法写在屏上（旧 Webview 版有这么一行，重写时丢了）：
         // 覆盖层吃掉整个屏幕，人要的是"接下来能干什么"，不是去翻日志。
@@ -2784,7 +3065,7 @@ unsafe fn paint(hwnd: HWND) {
         let loupe_src = loupe_source(cur.0, cur.1, bw, bh);
         if phase == Phase::Select {
             if let Some((lx, ly, ls, lsz)) = loupe_rect(cur.0, cur.1, bw, bh) {
-                let box_bytes = loupe_pixels(&base, bw, loupe_src);
+                let box_bytes = loupe_pixels(base, bw, loupe_src);
                 blit_bgra(hdc, &box_bytes, ls, lsz, lx, ly);
                 let ty = (ly + lsz + 1).clamp(0, (bh - LOUPE_TEXT_H - 2).max(0));
                 draw_chip(
@@ -2795,6 +3076,23 @@ unsafe fn paint(hwnd: HWND) {
                     rgb(120, 255, 224),
                 );
             }
+        }
+        // 整帧一次交出去：只把窗口真正要重画的那块从内存位图搬上窗口。
+        // 这一把之前窗口上还是上一帧的完整画面 —— 不存在"暗的一帧"或"半张图的一帧"。
+        if let Some((m, _)) = back {
+            // 只交「这一帧真的动过」的那一块与窗口要重画的那一块的交集：
+            // 窗口其余部分表面上的像素还是上一帧交出去的那一份，而那些地方这一帧没改。
+            let pr = (
+                ps.rcPaint.left.max(region.0),
+                ps.rcPaint.top.max(region.1),
+                ps.rcPaint.right.min(region.2),
+                ps.rcPaint.bottom.min(region.3),
+            );
+            let (rw, rh) = (pr.2 - pr.0, pr.3 - pr.1);
+            if rw > 0 && rh > 0 {
+                let _ = BitBlt(window_dc, pr.0, pr.1, rw, rh, Some(m), pr.0, pr.1, SRCCOPY);
+            }
+            snip.presented_all = true;
         }
         let _ = EndPaint(hwnd, &ps);
     }
@@ -2968,10 +3266,9 @@ pub fn start(owner: HWND, annotate: bool) {
     };
     let dim = dim_bgra(&base);
     let hits = collect_candidates();
-    if pill_was {
-        crate::floating::set_visible(true);
-    }
-
+    // 这一刻**不**把悬浮窗还回去：还了就等于在"冻结好的画面"与"覆盖层上屏"之间让用户
+    // 看见一次真实桌面（那颗卡片跟着闪一下，而它根本不在冻结的那张图里）。
+    // 它由 `WM_DESTROY` 按 `pill_was` 原样还，创建失败那条路自己也还。
     unsafe {
         let hinst = GetModuleHandleW(None).map(|m| m.into()).unwrap_or_default();
         let cls = HSTRING::from(OVERLAY_CLASS);
@@ -2990,7 +3287,10 @@ pub fn start(owner: HWND, annotate: bool) {
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             &cls,
             &HSTRING::from("FocusFlow 截图"),
-            WINDOW_STYLE(WS_POPUP.0 | WS_VISIBLE.0 | WS_CLIPCHILDREN.0),
+            // 先建**不可见**的窗：带着 WS_VISIBLE 建，创建那一下就会收到一次 WM_PAINT，
+            // 而那会儿整屏缓冲还没交进状态里 —— 屏上先是一整块深色，下一帧才是冻结的画面
+            // （用户看到的"按下去闪一下黑"就是这一帧）。等状态填好再由下面的 ShowWindow 上屏。
+            WINDOW_STYLE(WS_POPUP.0 | WS_CLIPCHILDREN.0),
             vx,
             vy,
             vw,
@@ -3031,6 +3331,10 @@ pub fn start(owner: HWND, annotate: bool) {
                     s.started_at = Some(now);
                     s.last_input = Some(now);
                     s.ceiling_ms = snip_ceiling_ms(annotate);
+                    // 新的一场：表面里还是上一场的画面（或干脆没写过），第一帧必须整屏交；
+                    // 上一帧碰过哪里也不能沿用上一场的账。
+                    s.frame_dirty = (0, 0, 0, 0);
+                    s.presented_all = false;
                 }
                 // 一开层就把光标下面那块屏的窗口亮出来：旧版是移一下鼠标才亮，
                 // 但"按下热键时光标已经指在他要截的东西上"才是最常见的形状。
@@ -3298,6 +3602,73 @@ mod render_probe {
         pixel3(baked, stride, x, y) == pixel3(base, base_w, sel.0 + x, sel.1 + y)
     }
 
+    /// 屏幕上**真的**呈现了这一帧吗：再从显示器抓一次整屏回来对，而不是只读窗口自己的表面。
+    ///
+    /// 为什么要多这一把：双缓冲是把像素交给窗口的合成表面，`alpha` 那一字节要是还留着
+    /// 抓屏时的那个 0，从窗口 DC 读回来照样"对"，屏幕上却可能是块黑 ——
+    /// 只有再抓一次屏才看得见这件事。所以夹具特意把 alpha 抹成 0（真实抓屏就是如此），
+    /// 把"补成不透明"这一步留给产品自己做。
+    #[test]
+    #[ignore = "会真的在屏幕上盖一层全屏覆盖层"]
+    fn the_overlay_presents_those_pixels_on_the_screen() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let owner = HWND(std::ptr::null_mut());
+            start(owner, false);
+            pump(400);
+            let ov = SNIP
+                .lock()
+                .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
+                .expect("SNIP 取不到");
+            assert_ne!(ov.0, std::ptr::null_mut(), "覆盖层没建出来");
+            let (bw, bh, origin) = SNIP.lock().map(|s| (s.base_w, s.base_h, s.origin)).unwrap();
+            assert!(bw > 700 && bh > 520, "这块屏容不下这条判据：{bw}x{bh}");
+            let mut base = synth(bw, bh);
+            for px in base.as_chunks_mut::<4>().0 {
+                px[3] = 0;
+            }
+            let dim = dim_bgra(&base);
+            if let Ok(mut s) = SNIP.lock() {
+                s.base = base.clone();
+                s.dim = dim.clone();
+                // 夹具把两份缓冲换掉了：产品的契约是"换新缓冲的那一场第一帧必须整屏交"
+                // （`start()` 就是这么挂的），这里照同一条契约挂，否则范围外那些格子的表面
+                // 里还是上一场抓到的真桌面，判据量的就不是这一帧合成的那一份。
+                s.presented_all = false;
+                s.phase = Phase::Select;
+                s.drag = Some((Drag::New, 200, 160));
+                s.sel = (200, 160, 600, 400);
+                s.hover = None;
+                s.hits.clear();
+                s.cur = (10, 10);
+                s.marks.clear();
+            }
+            let _ = InvalidateRect(Some(ov), None, false);
+            pump(300);
+            let shot = grab_rect(origin.0, origin.1, bw, bh).expect("整屏抓回来没成");
+            assert_eq!(shot.len(), base.len(), "抓回来的不是同一块屏");
+            let want_in = pixel3(&base, bw, 400, 300);
+            assert_ne!(
+                want_in,
+                [0, 0, 0],
+                "夹具这一格本来就是黑的，这条判据没有观察量"
+            );
+            assert_eq!(
+                pixel3(&shot, bw, 400, 300),
+                want_in,
+                "选区里屏幕上不是原图那一份（一片黑 = 交出去时 alpha 没补上）"
+            );
+            let want_out = pixel3(&dim, bw, bw - 30, bh - 30);
+            assert_eq!(
+                pixel3(&shot, bw, bw - 30, bh - 30),
+                want_out,
+                "选区外屏幕上不是蒙版那一份"
+            );
+            let _ = DestroyWindow(ov);
+            pump(200);
+        }
+    }
+
     /// 覆盖层**真的画出来了**吗：选区里的像素要等于手里那份冻结图，选区外要等于压暗的那份，
     /// 八个手柄与选区边框、工具条底色都要在它们该在的位置上。
     ///
@@ -3343,6 +3714,9 @@ mod render_probe {
             if let Ok(mut s) = SNIP.lock() {
                 s.base = base.clone();
                 s.dim = dim.clone();
+                // 换了缓冲就得整屏重交一次（`start()` 对新的一场也是这么挂的）：
+                // 范围外那些格子的表面里此刻还是上一场抓到的真桌面。
+                s.presented_all = false;
                 // 那条提示腿要靠"背景是压暗的一份"才数得出白字：start() 已经按真实光标算出
                 // 一个 hover（常常就是整块屏那层窗口），亮区盖住哪里，哪里就不再是压暗值。
                 // 悬停那一条下面会自己把候选与 hover 重新设回来。
@@ -4280,16 +4654,336 @@ mod render_probe {
             pump(200);
             // 会话结束必须把整屏那两份缓冲交出去：1920x1080 一份就是 8 MB，
             // 挂在静态里等于每次截图之后常驻翻倍（这一族仓里记过两次账）。
-            let (still_base, still_dim, still_active) = SNIP
+            let (still_base, still_dim, still_back, still_active) = SNIP
                 .lock()
-                .map(|s| (s.base.len(), s.dim.len(), s.active))
-                .unwrap_or((0, 0, true));
+                .map(|s| (s.base.len(), s.dim.len(), s.back.bits, s.active))
+                .unwrap_or((0, 0, 1, true));
             assert_eq!(
-                (still_base, still_dim, still_active),
-                (0, 0, false),
-                "覆盖层关了却没把冻结缓冲放掉"
+                (still_base, still_dim, still_back, still_active),
+                (0, 0, 0, false),
+                "覆盖层关了却没把冻结缓冲与双缓冲放掉（一屏 8 MB 以上，挂着就是每次截图翻一倍）"
             );
             let _ = SetCursorPos(home.x, home.y);
+        }
+    }
+
+    /// 一帧多少毫秒：「截图时像 PPT」那把尺子，只做读数不改判据。
+    ///
+    /// 每帧前把整窗标脏 —— `paint` 画的是 `BeginPaint` 交下来的裁剪区，不标脏就等于
+    /// 量在空区域上（改前改后都会假快）。分两个场景：拖框中的那一帧、拖完后带工具条的那一帧；
+    /// 再单列一项「快照把整屏两份缓冲抄一遍」占多少。
+    /// 默认不跑（真会盖一层全屏）：
+    /// `cargo test -p focusflow-native --bins --release -- --ignored paint_cost --nocapture`
+    #[test]
+    #[ignore = "会真的在屏幕上盖一层全屏覆盖层"]
+    fn paint_cost_per_frame_is_printed() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let mut home = POINT::default();
+            let _ = GetCursorPos(&mut home);
+            let owner = HWND(std::ptr::null_mut());
+            start(owner, true);
+            pump(400);
+            let ov = SNIP
+                .lock()
+                .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
+                .expect("SNIP 取不到");
+            assert_ne!(ov.0, std::ptr::null_mut(), "覆盖层没建出来");
+            let (bw, bh) = SNIP.lock().map(|s| (s.base_w, s.base_h)).unwrap();
+            let base = synth(bw, bh);
+            let dim = dim_bgra(&base);
+            let n = 20i32;
+            let frame = |adjust: bool, republish: bool, tag: &str| {
+                if let Ok(mut s) = SNIP.lock() {
+                    s.base = base.clone();
+                    s.dim = dim.clone();
+                    s.phase = if adjust { Phase::Adjust } else { Phase::Select };
+                    s.drag = if adjust {
+                        None
+                    } else {
+                        Some((Drag::New, 200, 160))
+                    };
+                    s.sel = (200, 160, 200 + 640, 160 + 360);
+                    s.hover = None;
+                    s.hits.clear();
+                    s.cur = (500, 300);
+                    s.marks.clear();
+                    // 拖角/方向键每帧选区都变，工具条几何就每帧重新亮一次（那是二十行日志）
+                    if republish {
+                        s.geom_sel = None;
+                    }
+                }
+                let _ = InvalidateRect(Some(ov), None, false);
+                paint(ov);
+                let t0 = std::time::Instant::now();
+                for _ in 0..n {
+                    if republish {
+                        if let Ok(mut s) = SNIP.lock() {
+                            s.geom_sel = None;
+                        }
+                    }
+                    let _ = InvalidateRect(Some(ov), None, false);
+                    paint(ov);
+                }
+                println!(
+                    "PAINT_MS {tag} = {:.2} (screen {bw}x{bh})",
+                    t0.elapsed().as_micros() as f64 / 1000.0 / n as f64
+                );
+            };
+            frame(false, false, "select-drag");
+            frame(true, false, "adjust-bar");
+            frame(true, true, "adjust-bar-republish");
+            if let Ok(mut s) = SNIP.lock() {
+                s.base = base.clone();
+                s.dim = dim.clone();
+            }
+            let t1 = std::time::Instant::now();
+            for _ in 0..n {
+                if let Ok(s) = SNIP.lock() {
+                    let keep = (s.base.clone(), s.dim.clone());
+                    std::hint::black_box(&keep);
+                }
+            }
+            println!(
+                "SNAPSHOT_CLONE_MS = {:.2}",
+                t1.elapsed().as_micros() as f64 / 1000.0 / n as f64
+            );
+            // 端到端：把 40 次"移动 + 重画"投进真消息循环，跑到队列空且没有待画区域。
+            // 这一把量的是拖框时人真正等到的那个数（画一帧之外还有派发与合成）。
+            if let Ok(mut s) = SNIP.lock() {
+                s.phase = Phase::Select;
+                s.drag = Some((Drag::New, 300, 200));
+                s.sel = (300, 200, 301, 201);
+                s.hits.clear();
+                s.hover = None;
+            }
+            let t2 = std::time::Instant::now();
+            for i in 0..40i32 {
+                let (x, y) = (300 + i * 4, 200 + i * 2);
+                let lp = (((y & 0xFFFF) as isize) << 16) | ((x & 0xFFFF) as isize);
+                let _ = PostMessageW(Some(ov), WM_MOUSEMOVE, WPARAM(0), LPARAM(lp));
+            }
+            // 跑到"连着三次抽不出消息"才算完：`PeekMessageW` 只在更新区非空时才交出
+            // WM_PAINT，所以队列空 = 最后一次移动真的画完了（`GetUpdateRect` 在本 crate
+            // 开的那组 windows feature 里没有，不为一把尺子去加 feature）。
+            let mut spins = 0u32;
+            let mut empty = 0u32;
+            let mut paints = 0u32;
+            loop {
+                spins += 1;
+                let mut got = false;
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    got = true;
+                    if msg.message == WM_PAINT && msg.hwnd == ov {
+                        paints += 1;
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                empty = if got { 0 } else { empty + 1 };
+                if empty >= 3 || spins > 3000 {
+                    break;
+                }
+            }
+            let ms = t2.elapsed().as_micros() as f64 / 1000.0;
+            println!(
+                "DRAG_40_MOVES_MS = {ms:.1} 每次移动 {:.2} ms 覆盖层实际重画 {paints} 次",
+                ms / 40.0
+            );
+            // 拆开一帧：合成（整屏 memcpy + 选区那几行）与交出（整屏 BitBlt）各占多少，
+            // 剩下的才是工具条/放大镜/读数这些 GDI 零碎。下一刀该砍谁，看这两个数。
+            let sel_leg = (200i32, 160i32, 200 + 640, 160 + 360);
+            let (mem, bits) = SNIP
+                .lock()
+                .map(|s| (HDC(s.back.mem as *mut core::ffi::c_void), s.back.bits))
+                .unwrap_or((HDC(std::ptr::null_mut()), 0usize));
+            assert_ne!(bits, 0, "双缓冲没建出来，这两把表量不到东西");
+            let len = (bw as usize) * (bh as usize) * 4;
+            let t3 = std::time::Instant::now();
+            for _ in 0..n {
+                compose_into_region(
+                    std::slice::from_raw_parts_mut(bits as *mut u8, len),
+                    &base,
+                    &dim,
+                    Some(sel_leg),
+                    (0, 0, bw, bh),
+                    bw,
+                    bh,
+                );
+            }
+            println!(
+                "COMPOSE_FULL_MS = {:.2} 整屏 {} MB",
+                t3.elapsed().as_micros() as f64 / 1000.0 / n as f64,
+                len / (1024 * 1024)
+            );
+            let region_leg = pad_rect(sel_leg, 12);
+            let t5 = std::time::Instant::now();
+            for _ in 0..n {
+                compose_into_region(
+                    std::slice::from_raw_parts_mut(bits as *mut u8, len),
+                    &base,
+                    &dim,
+                    Some(sel_leg),
+                    region_leg,
+                    bw,
+                    bh,
+                );
+            }
+            println!(
+                "COMPOSE_REGION_MS = {:.2} 只碰选区那一块 {}x{}",
+                t5.elapsed().as_micros() as f64 / 1000.0 / n as f64,
+                region_leg.2 - region_leg.0,
+                region_leg.3 - region_leg.1
+            );
+            let wd = GetDC(Some(ov));
+            let t4 = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = BitBlt(wd, 0, 0, bw, bh, Some(mem), 0, 0, SRCCOPY);
+            }
+            println!(
+                "PRESENT_FULL_MS = {:.2} 整屏交给窗口",
+                t4.elapsed().as_micros() as f64 / 1000.0 / n as f64
+            );
+            let t6 = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = BitBlt(
+                    wd,
+                    region_leg.0,
+                    region_leg.1,
+                    region_leg.2 - region_leg.0,
+                    region_leg.3 - region_leg.1,
+                    Some(mem),
+                    region_leg.0,
+                    region_leg.1,
+                    SRCCOPY,
+                );
+            }
+            println!(
+                "PRESENT_REGION_MS = {:.2} 只交那一块",
+                t6.elapsed().as_micros() as f64 / 1000.0 / n as f64
+            );
+            ReleaseDC(Some(ov), wd);
+            // 剩下的三把零碎：一条读数、一条工具条、放大镜那一块；再加一把"什么都不画"的
+            // 空帧（只走 invalidate→BeginPaint→EndPaint），它量的是这套机器本身要多少钱。
+            let leg = |ms: std::time::Duration| ms.as_micros() as f64 / 1000.0 / n as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                draw_chip(
+                    mem,
+                    300,
+                    300,
+                    "屏幕 1920,1080 · 取 11×11 放大 8 倍",
+                    rgb(120, 255, 224),
+                );
+            }
+            println!("CHIP_MS = {:.2} 一次读数", leg(t.elapsed()));
+            let mut geom: Option<(i32, i32, i32, i32)> = Some(sel_leg);
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                draw_bar(
+                    mem,
+                    sel_leg,
+                    bw,
+                    bh,
+                    (0, PALETTE[0].0, WIDTHS[0].0, FONTS[1].0),
+                    &mut geom,
+                );
+            }
+            println!("BAR_MS = {:.2} 一条工具条", leg(t.elapsed()));
+            let lsrc = loupe_source(500, 300, bw, bh);
+            let (lx, ly, ls, lsz) = loupe_rect(500, 300, bw, bh).expect("这块屏容不下放大镜");
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let box_bytes = loupe_pixels(&base, bw, lsrc);
+                blit_bgra(mem, &box_bytes, ls, lsz, lx, ly);
+            }
+            println!("LOUPE_MS = {:.2} 放大镜那一块", leg(t.elapsed()));
+            let mut ps2 = PAINTSTRUCT::default();
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = InvalidateRect(Some(ov), None, false);
+                let hdc2 = BeginPaint(ov, &mut ps2);
+                let _ = EndPaint(ov, &ps2);
+                std::hint::black_box(hdc2);
+            }
+            println!(
+                "EMPTY_FRAME_MS = {:.2} 空帧（只走 invalidate/begin/end）",
+                leg(t.elapsed())
+            );
+            let _ = DestroyWindow(ov);
+            pump(200);
+            let _ = SetCursorPos(home.x, home.y);
+        }
+    }
+
+    /// 选区搬走之后，屏幕上**不许**留着它原来那一份亮区。
+    ///
+    /// 这一条是"帧与帧之间怎么接力"的验收：每帧只搬动过的那一块，于是"上一帧碰过哪里"
+    /// 算少一像素，症状就是把上一帧的选区留在原地发亮（比慢更难发现，因为它是残影不是卡顿）。
+    /// 光标那一处的放大镜两帧落在同一个点上，所以它自己那块不会变成误判。
+    #[test]
+    #[ignore = "会真的在屏幕上盖一层全屏覆盖层"]
+    fn the_overlay_leaves_no_trace_where_the_selection_was() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let owner = HWND(std::ptr::null_mut());
+            start(owner, false);
+            pump(400);
+            let ov = SNIP
+                .lock()
+                .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
+                .expect("SNIP 取不到");
+            assert_ne!(ov.0, std::ptr::null_mut(), "覆盖层没建出来");
+            let (bw, bh, origin) = SNIP.lock().map(|s| (s.base_w, s.base_h, s.origin)).unwrap();
+            assert!(bw > 900 && bh > 800, "这块屏容不下这条判据：{bw}x{bh}");
+            let mut base = synth(bw, bh);
+            for px in base.as_chunks_mut::<4>().0 {
+                px[3] = 0;
+            }
+            let dim = dim_bgra(&base);
+            let old_sel = (60, 60, 360, 260);
+            let new_sel = (bw - 360, bh - 360, bw - 60, bh - 60);
+            let set_sel = |r: (i32, i32, i32, i32)| {
+                if let Ok(mut s) = SNIP.lock() {
+                    s.base = base.clone();
+                    s.dim = dim.clone();
+                    s.phase = Phase::Select;
+                    s.drag = Some((Drag::New, r.0, r.1));
+                    s.sel = r;
+                    s.hover = None;
+                    s.hits.clear();
+                    s.cur = (400, 400);
+                    s.marks.clear();
+                }
+                let _ = InvalidateRect(Some(ov), None, false);
+                pump(300);
+            };
+            set_sel(old_sel);
+            set_sel(new_sel);
+            let shot = grab_rect(origin.0, origin.1, bw, bh).expect("整屏抓回来没成");
+            // 老选区的内侧：这一格在两次选区之外，也不在放大镜那条带上
+            for (x, y) in [(100, 150), (200, 200), (300, 100)] {
+                assert_eq!(
+                    pixel3(&shot, bw, x, y),
+                    pixel3(&dim, bw, x, y),
+                    "老选区 ({x},{y}) 还留着上一帧的亮区：接力范围算小了"
+                );
+            }
+            // 新选区的内侧仍是原图，且不是黑的
+            let want = pixel3(&base, bw, new_sel.0 + 80, new_sel.1 + 80);
+            assert_ne!(
+                want,
+                [0, 0, 0],
+                "夹具这一格本来就是黑的，这条判据没有观察量"
+            );
+            assert_eq!(
+                pixel3(&shot, bw, new_sel.0 + 80, new_sel.1 + 80),
+                want,
+                "新选区内侧不是原图那一份"
+            );
+            let _ = DestroyWindow(ov);
+            pump(200);
         }
     }
 }
@@ -4302,7 +4996,275 @@ mod tests {
         Candidate { pid, visible, rect }
     }
 
+    /// 范围版合成：`clip` 之外的像素一个都不许动（那是上一帧已经交出去、这一帧没改的部分）。
+    #[test]
+    fn compose_into_region_touches_only_the_requested_band() {
+        let (w, h) = (4i32, 4i32);
+        let base = tiny_screen(w, h);
+        let dim = dim_bgra(&base);
+        // 目的地先填成"上一帧"的样子：整幅都是原图那一份
+        let mut dst = base.clone();
+        compose_into_region(&mut dst, &base, &dim, None, (0, 1, 4, 3), w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y as usize) * (w as usize) + x as usize) * 4;
+                if !(1..3).contains(&y) {
+                    assert_eq!(&dst[i..i + 3], &base[i..i + 3], "范围外 ({x},{y}) 被动了");
+                } else {
+                    assert_eq!(&dst[i..i + 3], &dim[i..i + 3], "范围内 ({x},{y}) 没铺蒙版");
+                }
+            }
+        }
+        // clip 与亮区不相交时，亮区一格都不抄（这一帧那块根本没变）
+        let mut dst2 = dim.clone();
+        dst2[..4].copy_from_slice(&[9u8, 9, 9, 9]);
+        compose_into_region(
+            &mut dst2,
+            &base,
+            &dim,
+            Some((0, 0, 1, 1)),
+            (2, 2, 4, 4),
+            w,
+            h,
+        );
+        assert_eq!(&dst2[..4], &[9u8, 9, 9, 9], "亮区在范围外也抄了");
+    }
+
+    /// 并集不能被那个 `(0,0,0,0)` 吃掉，否则"上一帧碰过哪里"永远算不出来。
+    #[test]
+    fn union_rect_hands_the_result_to_the_non_empty_side() {
+        assert_eq!(union_rect((0, 0, 0, 0), (5, 6, 7, 8)), (5, 6, 7, 8));
+        assert_eq!(union_rect((5, 6, 7, 8), (0, 0, 0, 0)), (5, 6, 7, 8));
+        assert_eq!(union_rect((0, 0, 4, 4), (2, 2, 9, 9)), (0, 0, 9, 9));
+        // 夹到屏内：负到屏幕外等于范围算不到那几格
+        assert_eq!(clamp_rect((-6, -2, 3, 9), 4, 4), (0, 0, 3, 4));
+    }
+
+    /// 帧接力的范围必须盖得住绘制真正会碰的每一块：少一块就是屏幕上的一格残影。
+    #[test]
+    fn frame_content_covers_everything_the_overlay_draws_on_top_of_the_veil() {
+        let mut s = default_state();
+        s.base_w = 1920;
+        s.base_h = 1080;
+        s.phase = Phase::Adjust;
+        s.sel = (300, 300, 900, 700);
+        s.cur = (1000, 900);
+        let r = frame_content(&s);
+        assert!(
+            (r.0..r.2).contains(&300) && (r.1..r.3).contains(&300) && r.2 >= 900 && r.3 >= 700,
+            "选区本体没被盖住：{r:?}"
+        );
+        // 尺寸读数那一行贴在选区上沿外面
+        assert!(r.1 <= 300 - 24, "尺寸读数那一行不在范围内：{r:?}");
+        let (_, bar) = bar_rects(s.sel, s.base_w, s.base_h);
+        assert!(
+            r.0 <= bar.0 && r.1 <= bar.1 && r.2 >= bar.0 + bar.2 && r.3 >= bar.1 + bar.3,
+            "工具条不在范围内：{r:?} vs {bar:?}"
+        );
+        // 还没定选区那一段：放大镜那一块 + 用法提示那一行
+        s.phase = Phase::Select;
+        s.drag = None;
+        let r2 = frame_content(&s);
+        let (lx, ly, ls, lsz) = loupe_rect(s.cur.0, s.cur.1, s.base_w, s.base_h).unwrap();
+        assert!(
+            r2.0 <= lx && r2.1 <= ly && r2.2 >= lx + ls && r2.3 >= ly + lsz,
+            "放大镜不在范围内：{r2:?}"
+        );
+        assert!(
+            r2.1 <= 12 && r2.3 >= 12 + CHIP_MAX_H,
+            "用法提示那一行不在范围内：{r2:?}"
+        );
+        // 出图没成那句：贴顶与画在里侧两种落点都要盖住
+        s.notice = Some("满了".to_string());
+        let r3 = frame_content(&s);
+        assert!(
+            r3.1 <= s.sel.1 - 48 && r3.3 >= s.sel.1 + 26,
+            "那句原因没被盖住：{r3:?}"
+        );
+    }
+
+    /// 帧接力给读数留的范围，必须盖得住 `chip_origin` 把盒子挤回屏内之后的**真正落点**。
+    ///
+    /// 扫锚点 × 盒高，而不是只挑一格：这一族的症状是"光标/选区挪开之后屏幕上留着上一帧
+    /// 那句读数"，而它只在锚点越过 `可见高 - 盒高` 那一格之后才出现，点验容易漏。
+    #[test]
+    fn chip_band_covers_every_place_chip_origin_can_land_a_chip() {
+        let (w, h) = (1920i32, 1080i32);
+        for ch in [10i32, CHIP_FONT_H + CHIP_PAD_V, CHIP_MAX_H] {
+            for y in (-30..h + 60).step_by(7) {
+                let (_, ty) = chip_origin(0, y, 20, ch, (w, h));
+                let r = chip_band(y, w, h);
+                assert!(
+                    r.1 <= ty && r.3 >= ty + ch,
+                    "锚点 {y}、盒高 {ch} 的落点 {ty}..{} 没被盖住：{r:?}",
+                    ty + ch
+                );
+            }
+        }
+        // 对照组：锚点在屏幕中间时不许无理由把屏幕底边也圈进来（那等于每帧多搬一条全宽横带）
+        assert!(
+            chip_band(12, w, h).3 < h - 100,
+            "范围无理由吃掉底边：{}",
+            chip_band(12, w, h).3
+        );
+    }
+
     const SCREEN: (i32, i32, i32, i32) = (0, 0, 1920, 1080);
+
+    /// 一块通道值都在 5..255 的小屏：任何一格压暗后都与原值不同，
+    /// 于是"抄错区域/抄错行"一定改变判据，不会被纯色区域喂成假绿。
+    fn tiny_screen(w: i32, h: i32) -> Vec<u8> {
+        let mut v = vec![0u8; (w * h) as usize * 4];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = if i % 4 == 3 {
+                0
+            } else {
+                ((i * 5) % 251 + 5) as u8
+            };
+        }
+        v
+    }
+
+    /// 双缓冲那一帧的底：选区里是原图那一份、选区外是压暗那一份，两处同一批像素。
+    #[test]
+    fn compose_into_lays_the_veil_outside_and_the_original_inside() {
+        let (w, h) = (4i32, 2i32);
+        let base = tiny_screen(w, h);
+        let dim = dim_bgra(&base);
+        let mut dst = vec![0u8; base.len()];
+        compose_into_region(
+            &mut dst,
+            &base,
+            &dim,
+            Some((1, 0, 3, 2)),
+            (0, 0, w, h),
+            w,
+            h,
+        );
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y as usize) * (w as usize) + x as usize) * 4;
+                let inside = (1..3).contains(&x) && (0..2).contains(&y);
+                if inside {
+                    assert_eq!(
+                        &dst[i..i + 3],
+                        &base[i..i + 3],
+                        "选区里 ({x},{y}) 不是原图那一份"
+                    );
+                    assert_eq!(
+                        dst[i + 3],
+                        255,
+                        "选区里 ({x},{y}) 的 alpha 没钉住：屏幕上会透出黑"
+                    );
+                    assert_ne!(&dst[i..i + 3], &dim[i..i + 3], "夹具退化：亮区与蒙版同值");
+                } else {
+                    assert_eq!(
+                        &dst[i..i + 4],
+                        &dim[i..i + 4],
+                        "选区外 ({x},{y}) 不是压暗那一份"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 还没定选区（只有悬停命中，甚至什么都没有）时，整帧就是压暗那一份。
+    #[test]
+    fn compose_into_without_a_bright_rect_is_the_plain_veil() {
+        let (w, h) = (3i32, 3i32);
+        let base = tiny_screen(w, h);
+        let dim = dim_bgra(&base);
+        let mut dst = vec![0u8; base.len()];
+        compose_into_region(&mut dst, &base, &dim, None, (0, 0, w, h), w, h);
+        assert_eq!(dst, dim);
+        let mut dst2 = vec![0u8; base.len()];
+        compose_into_region(
+            &mut dst2,
+            &base,
+            &dim,
+            Some((0, 0, 0, 5)),
+            (0, 0, w, h),
+            w,
+            h,
+        );
+        assert_eq!(dst2, dim, "零宽零高的亮区不该动笔");
+    }
+
+    /// 亮区越出屏幕（拖到边缘、或悬浮在虚拟屏之外）：只抄在界内的那几行，不许越界写。
+    #[test]
+    fn compose_into_clamps_a_selection_that_runs_off_the_frozen_screen() {
+        let (w, h) = (4i32, 4i32);
+        let base = tiny_screen(w, h);
+        let dim = dim_bgra(&base);
+        let mut dst = dim.clone();
+        compose_into_region(
+            &mut dst,
+            &base,
+            &dim,
+            Some((-6, -2, 3, 9)),
+            (0, 0, w, h),
+            w,
+            h,
+        );
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y as usize) * (w as usize) + x as usize) * 4;
+                let inside = (0..3).contains(&x) && (0..4).contains(&y);
+                let want = if inside {
+                    &base[i..i + 3]
+                } else {
+                    &dim[i..i + 3]
+                };
+                assert_eq!(&dst[i..i + 3], want, "越界选区在 ({x},{y}) 抄错");
+            }
+        }
+        // 目的地不够一屏时整帧不动笔：半途写脏别人的内存比这一帧没更新糟得多
+        let mut short = vec![0u8; base.len() - 1];
+        compose_into_region(
+            &mut short,
+            &base,
+            &dim,
+            Some((0, 0, 4, 4)),
+            (0, 0, w, h),
+            w,
+            h,
+        );
+        assert!(short.iter().all(|b| *b == 0), "缓冲不够还动了笔");
+    }
+
+    /// 接线：这一帧的底必须由 `compose_into` 合成进双缓冲、窗口每帧只被 `BitBlt` 交一次。
+    ///
+    /// 纯函数判得再对，绘制路径不走它等于没修（旧写法是每帧两次全屏 `SetDIBitsToDevice`
+    /// 直接把窗口刷成"先暗后亮"的两帧）。判据按调用形态比，不比函数名。
+    #[test]
+    fn paint_composites_into_the_backbuffer_and_presents_once() {
+        let src = include_str!("snip.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            flat.matches("=>compose_into_region(").count(),
+            1,
+            "paint 该有一次合成，实际 {} 次",
+            flat.matches("=>compose_into_region(").count()
+        );
+        assert_eq!(
+            flat.matches("BitBlt(window_dc,").count(),
+            1,
+            "交给窗口的整帧只该有一次，实际 {} 次",
+            flat.matches("BitBlt(window_dc,").count()
+        );
+        // 双缓冲两头都要接上：paint 里拿，覆盖层销毁时还（一屏就是八 MB 以上）
+        assert_eq!(
+            flat.matches("back_acquire(&mutsnip.back,bw,bh)").count(),
+            1,
+            "paint 不再从状态里拿双缓冲了"
+        );
+        assert_eq!(
+            flat.matches("back_release(&muts.back)").count(),
+            1,
+            "WM_DESTROY 不再还双缓冲了"
+        );
+    }
 
     /// 光标同时压着两层时取 Z 序里靠前的那个（`EnumWindows` 就是从最上面往下枚举）。
     #[test]
@@ -4615,7 +5577,6 @@ mod tests {
             let mut sz = SIZE { cx: 0, cy: 0 };
             let _ = GetTextExtentPoint32W(hdc, &wide, &mut sz);
             SelectObject(hdc, old);
-            let _ = DeleteObject(font.into());
             ReleaseDC(None, hdc);
             assert!(
                 sz.cy + CHIP_PAD_V <= LOUPE_TEXT_H,
