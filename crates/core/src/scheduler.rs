@@ -943,21 +943,76 @@ pub fn get_all_tasks() -> Vec<ScheduledTask> {
     out
 }
 
-/// 解析 interval 格式 'HH:MM-HH:MM|N'，返回 (start_min, end_min, interval)。
-fn parse_interval(s: &str) -> Option<(i64, i64, i64)> {
-    let (time_part, n_part) = s.split_once('|')?;
-    let (start_str, end_str) = time_part.split_once('-')?;
+/// [`parse_interval_checked`] 解不开时的分别，与 [`ClockErr`] 同一口径：
+/// 屏上那句要能指出败在哪一步，而不是把所有败法都念成「格式应为 …」。
+#[derive(Debug, PartialEq, Eq)]
+enum IntervalErr {
+    /// 不是「HH:MM-HH:MM|分钟数」这个形状（缺 `|`、缺 `-`、某一段多了截）
+    NotShape,
+    /// 形状对，但开始时刻那一段不是合法时钟
+    StartClock(ClockErr),
+    /// 形状对，但结束时刻那一段不是合法时钟
+    EndClock(ClockErr),
+    /// 形状对，但结束时刻早于开始时刻：这一档不认跨午夜的窗口
+    EndBeforeStart,
+    /// 形状对，但竖线后面不是纯十进制数字
+    NotMinutes,
+    /// 数字解得出来，但不是正数
+    MinutesNotPositive,
+}
+
+/// 一个时钟位错法的说法，daily 与 interval 两个臂共用（同一条规则只写一遍）。
+///
+/// `subject` 说的是"哪一段时钟"：daily 传「每日定时」，interval 传「间隔执行的开始
+/// 时刻」这一类。形状不对的那句不带"超出范围"字样，免得用户去改一个根本不成立的数字。
+fn clock_err_hint(subject: &str, e: ClockErr) -> String {
+    match e {
+        ClockErr::NotClock => format!("{subject}格式应为 HH:MM"),
+        ClockErr::HourOut => format!("{subject}的小时要在 00~23 之间"),
+        ClockErr::MinuteOut => format!("{subject}的分钟要在 00~59 之间"),
+    }
+}
+
+/// [`IntervalErr`] 的一句话说法，给面板与日志共用。
+fn interval_err_hint(e: IntervalErr) -> String {
+    match e {
+        IntervalErr::NotShape => {
+            "间隔执行格式应为 HH:MM-HH:MM|分钟数（开始、结束各一段，竖线后是分钟）".into()
+        }
+        IntervalErr::StartClock(c) => clock_err_hint("间隔执行的开始时刻", c),
+        IntervalErr::EndClock(c) => clock_err_hint("间隔执行的结束时刻", c),
+        IntervalErr::EndBeforeStart => {
+            "间隔执行的结束时刻早于开始时刻，这一档不认跨午夜的窗口（要拆成两段写）".into()
+        }
+        IntervalErr::NotMinutes => "间隔执行竖线后面的分钟数得是纯数字".into(),
+        IntervalErr::MinutesNotPositive => "间隔执行的分钟数要大于 0".into(),
+    }
+}
+
+/// 解析 interval 格式 'HH:MM-HH:MM|N'，返回 (start_min, end_min, interval)；
+/// 失败时说明败在哪一步（见 [`IntervalErr`]）。
+fn parse_interval_checked(s: &str) -> Result<(i64, i64, i64), IntervalErr> {
+    let (time_part, n_part) = s.split_once('|').ok_or(IntervalErr::NotShape)?;
+    let (start_str, end_str) = time_part.split_once('-').ok_or(IntervalErr::NotShape)?;
     // 两个时刻走的是与 daily 同一个解析器。原来这里另写了一份闭包，而且那份
-    // **不 trim**（外层 `parse_hhmm` trim 了）：于是 `validate_schedule` 先 trim 后判
+    // **不 trim**（外层 `parse_hhmm_checked` trim 了）：于是 `validate_schedule` 先 trim 后判
     // 通过、入库的却是带空格的 `" 07:00-23:00|30"`，这里解析成 None ⇒
     // `should_run` 永远 false —— 一条看着合法、实际永不执行、也一行日志都没有的任务。
-    let start = parse_hhmm(start_str)?;
-    let end = parse_hhmm(end_str)?;
-    let interval = digits_only(n_part.trim())?;
-    if interval <= 0 || end < start {
-        return None;
+    let start = parse_hhmm_checked(start_str.trim()).map_err(IntervalErr::StartClock)?;
+    let end = parse_hhmm_checked(end_str.trim()).map_err(IntervalErr::EndClock)?;
+    if end < start {
+        return Err(IntervalErr::EndBeforeStart);
     }
-    Some((start, end, interval))
+    let interval = digits_only(n_part.trim()).ok_or(IntervalErr::NotMinutes)?;
+    if interval <= 0 {
+        return Err(IntervalErr::MinutesNotPositive);
+    }
+    Ok((start, end, interval))
+}
+
+/// 只要结论、不要说法的调用点（退避窗口、既有判据）用的那层包装。
+fn parse_interval(s: &str) -> Option<(i64, i64, i64)> {
+    parse_interval_checked(s).ok()
 }
 
 /// [`parse_hhmm_checked`] 解不开时的三种分别，让校验侧能说清败在哪一步。
@@ -971,12 +1026,14 @@ enum ClockErr {
     MinuteOut,
 }
 
-/// 校验侧用的解析：与 [`parse_hhmm`] 共用同一条尺子，失败时说明败在哪一步。
+/// 解析 'HH:MM' 为「当日第几分钟」，失败时说明败在哪一步。
 ///
-/// 原先 `validate_schedule` 的 daily 臂自己数了一遍冒号，把"形状不对"与"数字超出范围"
-/// 分给两份代码，而后一半只是一句顺手写下的「时间超出范围」—— 它从来没比较过任何数字。
-/// 于是 `"abc:00"` 在面板上被报成「调度配置无效（时间超出范围）」，
-/// 用户去把一个根本不成立的问题改小。
+/// 刻意不写成 `parse().unwrap_or(0)`：那种写法下 `"abc:xyz"` 等于 00:00，而
+/// daily 的判定是 `now_min >= target_min`，于是"非法时间"实际含义是"任何时刻都该跑"，
+/// 任务一入库就立刻启动目标程序。`"25:00"` 反过来永远跑不了。两种都比拒绝更糟。
+///
+/// 原先校验侧（`validate_schedule` 的 daily 臂）自己另数了一遍冒号，与这里不是同一把
+/// 尺子：`"abc:00"` 在面板上被报成「时间超出范围」，用户去改一个根本不成立的数字。
 fn parse_hhmm_checked(s: &str) -> Result<i64, ClockErr> {
     let (h, m) = s.split_once(':').ok_or(ClockErr::NotClock)?;
     let h = parse_clock_number(h.trim()).ok_or(ClockErr::NotClock)?;
@@ -990,21 +1047,12 @@ fn parse_hhmm_checked(s: &str) -> Result<i64, ClockErr> {
     Ok(h * 60 + m)
 }
 
-/// 解析 'HH:MM' 为「当日第几分钟」；格式或范围不符一律 None。
-///
-/// 刻意不写成 `parse().unwrap_or(0)`：那种写法下 `"abc:xyz"` 等于 00:00，而
-/// daily 的判定是 `now_min >= target_min`，于是"非法时间"实际含义是"任何时刻都该跑"，
-/// 任务一入库就立刻启动目标程序。`"25:00"` 反过来永远跑不了。两种都比拒绝更糟。
-fn parse_hhmm(s: &str) -> Option<i64> {
-    parse_hhmm_checked(s).ok()
-}
-
 /// 只认纯十进制（`+9`、`-0`、空白、任何非数字字符都是 None），溢出也 None。
 ///
 /// 加这一层是因为 `"-0".parse::<i64>()` 是 `Ok(0)`、`"+9"` 是 `Ok(9)`：于是
 /// `"-0:00"` 一路通过校验、存进库、被判成 00:00 —— 而 daily 的判据是
 /// `now_min >= target_min`，"非法时间"就又变成"任何时刻都该跑"，任务落库后
-/// 30 秒内启动目标程序（`parse_hhmm` 头那段防的是同一件事，只是从符号这个门进来）。
+/// 30 秒内启动目标程序（`parse_hhmm_checked` 头那段防的是同一件事，只是从符号这个门进来）。
 /// 那句"原样交下来"说的是旧 WebView 面板的时刻输入框（`el.value` 直接交下来，手抖多带一个
 /// `-` 就进得来）；那一屏随前端删了之后，今天走到这条校验的是插件那边（`host.rs` 点
 /// `validate_schedule`）与 core 自己的 add_task / update_task。
@@ -1048,12 +1096,13 @@ fn run_check(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> RunDecision {
     match t.schedule_type.as_str() {
         "daily" => {
             // 格式 HH:MM
-            let target_min = match parse_hhmm(&t.schedule_time) {
-                Some(v) => v,
-                None => {
+            let target_min = match parse_hhmm_checked(&t.schedule_time) {
+                Ok(v) => v,
+                Err(e) => {
                     return RunDecision::BadConfig(format!(
-                        "daily 的时刻「{}」不是 HH:MM",
-                        t.schedule_time
+                        "daily 的时刻「{}」读不出：{}",
+                        t.schedule_time,
+                        clock_err_hint("该时刻", e)
                     ))
                 }
             };
@@ -1116,12 +1165,13 @@ fn run_check(t: &ScheduledTask, now: &chrono::DateTime<Local>) -> RunDecision {
             }
         }
         "interval" => {
-            let (start_min, end_min, interval) = match parse_interval(&t.schedule_time) {
-                Some(v) => v,
-                None => {
+            let (start_min, end_min, interval) = match parse_interval_checked(&t.schedule_time) {
+                Ok(v) => v,
+                Err(e) => {
                     return RunDecision::BadConfig(format!(
-                        "interval 的时刻「{}」不是 HH:MM-HH:MM|分钟数",
-                        t.schedule_time
+                        "interval 的时刻「{}」读不出：{}",
+                        t.schedule_time,
+                        interval_err_hint(e)
                     ))
                 }
             };
@@ -1553,8 +1603,8 @@ pub fn describe_schedule(schedule_type: &str, schedule_time: &str) -> String {
     match schedule_type {
         "daily" => format!("每日 {schedule_time}"),
         "once" => format!("一次性 {schedule_time}"),
-        "interval" => match parse_interval(schedule_time) {
-            Some((s, e, n)) => {
+        "interval" => match parse_interval_checked(schedule_time) {
+            Ok((s, e, n)) => {
                 format!(
                     "每 {n} 分钟 ({:02}:{:02} ~ {:02}:{:02})",
                     s / 60,
@@ -1563,7 +1613,10 @@ pub fn describe_schedule(schedule_type: &str, schedule_time: &str) -> String {
                     e % 60
                 )
             }
-            None => format!("间隔执行（格式错误：{schedule_time}）"),
+            Err(err) => format!(
+                "间隔执行（{schedule_time} 读不出：{}）",
+                interval_err_hint(err)
+            ),
         },
         _ => format!("{schedule_type} {schedule_time}"),
     }
@@ -1578,9 +1631,7 @@ pub fn validate_schedule(schedule_type: &str, schedule_time: &str) -> (bool, Str
     match schedule_type {
         "daily" => match parse_hhmm_checked(t) {
             Ok(_) => (true, String::new()),
-            Err(ClockErr::NotClock) => (false, "每日定时格式应为 HH:MM".into()),
-            Err(ClockErr::HourOut) => (false, "每日定时的小时要在 00~23 之间".into()),
-            Err(ClockErr::MinuteOut) => (false, "每日定时的分钟要在 00~59 之间".into()),
+            Err(e) => (false, clock_err_hint("每日定时", e)),
         },
         "once" => {
             if NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M").is_ok() {
@@ -1589,13 +1640,10 @@ pub fn validate_schedule(schedule_type: &str, schedule_time: &str) -> (bool, Str
                 (false, "一次性格式应为 YYYY-MM-DD HH:MM".into())
             }
         }
-        "interval" => {
-            if parse_interval(t).is_some() {
-                (true, String::new())
-            } else {
-                (false, "间隔执行格式应为 HH:MM-HH:MM|分钟数".into())
-            }
-        }
+        "interval" => match parse_interval_checked(t) {
+            Ok(_) => (true, String::new()),
+            Err(e) => (false, interval_err_hint(e)),
+        },
         _ => (false, format!("未知调度类型: {schedule_type}")),
     }
 }
@@ -2300,12 +2348,15 @@ mod tests {
     #[test]
     fn signed_clock_fields_are_rejected_without_breaking_long_intervals() {
         for bad in ["-0:00", "+9:00", "-1:30", "09:0 0", "9999:00"] {
-            assert!(parse_hhmm(bad).is_none(), "{bad:?} 不该被当成合法时刻");
+            assert!(
+                parse_hhmm_checked(bad).is_err(),
+                "{bad:?} 不该被当成合法时刻"
+            );
         }
         for good in ["09:00", "9:05", "0:00", "23:59", " 09:00 "] {
             // 首尾空格是合法写法：`validate_schedule` 判的是 trim 后的值，写侧现在也存
             // trim 后的串，这一层再 trim 一次只是把同一把尺子用到最后一处。
-            assert!(parse_hhmm(good).is_some(), "{good:?} 是合法写法");
+            assert!(parse_hhmm_checked(good).is_ok(), "{good:?} 是合法写法");
         }
         assert_eq!(
             parse_interval("07:00-23:00|120"),
@@ -3521,6 +3572,132 @@ mod tests {
             prod.match_indices("const ALLOW_EXTRA_HINT").count(),
             1,
             "这句话只许有一份"
+        );
+    }
+
+    /// 「间隔执行」被拒的六种败法各说各的话。
+    ///
+    /// 改前六个出口折成同一句「间隔执行格式应为 HH:MM-HH:MM|分钟数」，而
+    /// `22:00-06:00|30` 写的恰恰就是那个格式（败因是本档不认跨午夜的窗口）：面板让用户
+    /// 照着提示把同一个串再敲一遍。`07:00-23:00|0` 同理，格式对、分钟数不是正数。
+    #[test]
+    fn each_interval_rejection_names_which_rule_rejected_it() {
+        let cases = [
+            ("22:00-06:00|30", "结束时刻早于开始时刻"),
+            ("07:00-23:00|0", "分钟数要大于 0"),
+            ("07:00-23:00|abc", "纯数字"),
+            ("25:00-23:00|30", "小时要在 00~23 之间"),
+            ("07:00-23:60|30", "分钟要在 00~59 之间"),
+            ("07:00|30", "应为 HH:MM-HH:MM|分钟数"),
+        ];
+        let mut said: Vec<String> = Vec::new();
+        for (input, want) in cases {
+            let (ok, msg) = validate_schedule("interval", input);
+            assert!(!ok, "{input:?} 不该通过校验");
+            assert!(
+                msg.contains(want),
+                "「{input}」的拒绝要说出「{want}」，实得：{msg}"
+            );
+            said.push(msg);
+        }
+        // 挡住「所有臂返回同一句」这种修法：六条必须互不相同。
+        let mut uniq = said.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), said.len(), "每条规则得有自己的说法：{said:?}");
+    }
+
+    /// 收紧说法不能顺手收紧判据：正当写法照旧通过，且 daily 与 interval 对同一处
+    /// 时钟错误给同一句后半。
+    ///
+    /// 后半句只许有一份（[`clock_err_hint`]）。daily 的三个臂原本把三条规则手抄在
+    /// `validate_schedule` 里，interval 再接一遍就是第四份抄本。
+    #[test]
+    fn a_valid_interval_still_passes_and_both_arms_share_the_clock_ruler() {
+        assert!(
+            validate_schedule("interval", "07:00-23:00|120").0,
+            "三位数间隔是正当写法，不该被时钟位的「最多两位」误伤"
+        );
+        assert!(
+            validate_schedule("interval", "09:00-09:00|5").0,
+            "起止同刻是一个一分钟的窗口，不是错"
+        );
+        let (_, daily_msg) = validate_schedule("daily", "25:00");
+        let (_, interval_msg) = validate_schedule("interval", "25:00-23:00|30");
+        let clause = "小时要在 00~23 之间";
+        assert!(
+            daily_msg.contains(clause) && interval_msg.contains(clause),
+            "同一处时钟错误在两个臂该给同一句后半，实得 daily={daily_msg}／interval={interval_msg}"
+        );
+    }
+
+    /// 任务列表那一行与调度日志也说得出拒因，不再只留一句「格式错误」。
+    #[test]
+    fn an_unreadable_interval_says_why_on_both_the_panel_and_the_log() {
+        let described = describe_schedule("interval", "22:00-06:00|30");
+        assert!(
+            described.contains("结束时刻早于开始时刻"),
+            "面板的任务行要带上拒因，实得：{described}"
+        );
+        assert!(
+            !described.contains("每 30 分钟"),
+            "读不出的配置不该伪装成一条正常描述：{described}"
+        );
+
+        let task = ScheduledTask {
+            schedule_type: "interval".into(),
+            schedule_time: "22:00-06:00|30".into(),
+            ..daily_task("09:00")
+        };
+        let noon = Local.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap();
+        assert!(
+            matches!(run_check(&task, &noon), RunDecision::BadConfig(w) if w.contains("结束时刻早于开始时刻")),
+            "日志里也要看出是窗口方向被拒，实得 {:?}",
+            run_check(&task, &noon)
+        );
+    }
+
+    /// 三个读法（校验、描述、调度判定）都从同一份带说法的解析器取结论。
+    ///
+    /// 按调用形状钉，不按函数名：`validate_schedule` 只要改回 `parse_interval(..).is_some()`
+    /// 就又只剩一句「格式应为」，而那种写法对行为用例的另一半（判据本身）完全无害。
+    #[test]
+    fn all_three_readers_of_a_schedule_use_the_checked_parser() {
+        let src = include_str!("scheduler.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn validate_schedule")
+            .expect("校验函数的起点找不到了");
+        let entry = &prod[at..];
+        assert_eq!(
+            entry.match_indices("parse_interval(t)").count(),
+            0,
+            "校验侧不许再碰只要结论、不要说法的那层包装"
+        );
+        assert!(
+            entry.contains("parse_interval_checked(t)"),
+            "校验侧要走带说法的解析器"
+        );
+        assert!(
+            entry.contains(r#"clock_err_hint("每日定时", e)"#),
+            "daily 的时钟说法要取自共用的那一份"
+        );
+        assert!(
+            entry.contains("interval_err_hint(e)"),
+            "间隔执行的说法要取自带说法的解析器"
+        );
+        assert_eq!(
+            prod.match_indices("fn interval_err_hint(").count(),
+            1,
+            "这套说法只许有一份"
+        );
+        assert!(
+            prod.contains("parse_interval_checked(&t.schedule_time)"),
+            "调度判定那一步也要拿带说法的解析器"
+        );
+        assert!(
+            prod.contains("parse_interval_checked(schedule_time)"),
+            "任务列表那一行同样"
         );
     }
 }
