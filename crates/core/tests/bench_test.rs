@@ -246,7 +246,7 @@ mod tests {
                 let _ = db::queries::get_hourly_stats(None);
                 let _ = db::get_app_stats(Some(30), None);
                 let _ = db::get_device_stats(Some(30), None);
-                let _ = db::get_alltime_summary();
+                let _ = db::get_alltime_max_day();
             }
             let per = t.elapsed().as_secs_f64() * 1000.0 / 10.0;
             report.push_str(&format!("  {n} 个年度库：每轮聚合 {per:.2}ms\n"));
@@ -330,7 +330,7 @@ mod tests {
             let _ = db::queries::get_hourly_stats(None);
             let _ = db::get_app_stats(Some(30), None);
             let _ = db::get_device_stats(Some(30), None);
-            let _ = db::get_alltime_summary();
+            let _ = db::get_alltime_max_day();
         }
         let per = t.elapsed().as_secs_f64() * 1000.0 / 10.0;
         // 7 个文件里只有 off 0..=3 这 4 个年库有数据，另外 3 个是空壳

@@ -101,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn alltime_summary_totals_all_days_and_picks_max_day() {
+    fn alltime_max_day_picks_the_historical_maximum() {
         let _g = guard();
         let _app = paths::test_app_dir("alltime");
         let dir = _app.path().to_path_buf();
@@ -129,16 +129,16 @@ mod tests {
             .date_naive()
             .format("%Y-%m-%d")
             .to_string();
-        let summary = db::get_alltime_summary();
+        let summary = db::get_alltime_max_day();
         assert!(
             summary.unreadable.is_empty(),
             "夹具里这几年都该读得出来，实得 {:?}",
             summary.unreadable
         );
-        assert_eq!(
-            summary.total, 10,
-            "总计应为全部日期之和（回归：只统计今日）"
-        );
+        // 「最高单日」只看已读那几年的最大值。旧形状在这里还顺手算一个全历史总次数，
+        // 而那个 `total` 生产侧没人读（屏上「总计」走 `stats_totals`）—— 已摘掉，
+        // "总计 = 全部日期之和（回归：只统计今日）"这条口径的归宿是下面那句
+        // `get_stats(None, None)`，它一直在被界面与导出读着。
         assert_eq!(
             summary.max_day,
             Some((today, 7)),

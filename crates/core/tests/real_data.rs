@@ -254,19 +254,23 @@ mod tests {
                 );
                 assert!(ranks.values().all(|v| *v > 0), "{year} 年榜单里有非正计数");
 
-                // 全历史汇总（跨库遍历）不得小于单年
-                let summary = queries::get_alltime_summary();
-                if summary.unreadable.is_empty() {
+                // 跨库遍历不得漏年份：全历史总次数不得小于单年。
+                // 这一条原来挂在 `get_alltime_summary().total` 上，而那个字段生产侧
+                // 一个读者都没有（屏上「总计」念的是 `stats_totals`）⇒ 换到有真读者的
+                // 那把尺子上来，判据本身一个字没松。
+                let all_rank = queries::stats_totals(None, None);
+                if all_rank.unreadable.is_empty() {
                     assert!(
-                        summary.total >= total,
-                        "总计({})比单年({total})还少，跨库遍历漏了年份",
-                        summary.total
+                        all_rank.total >= total,
+                        "全历史({})比单年({total})还少，跨库遍历漏了年份",
+                        all_rank.total
                     );
                 } else {
-                    // 有年度库这次没读出来：那份总计只是下界，跟单年比没有意义
-                    println!("  跳过跨库对比，这些年没读出来: {:?}", summary.unreadable);
+                    // 有年度库这次没读出来：那份全历史只是下界，跟单年比没有意义
+                    println!("  跳过跨库对比，这些年没读出来: {:?}", all_rank.unreadable);
                 }
-                if let Some((day, cnt)) = summary.max_day {
+                let max_day = queries::get_alltime_max_day();
+                if let Some((day, cnt)) = max_day.max_day {
                     assert!(cnt > 0, "「最高单日」报出非正计数：{day} = {cnt}");
                 }
 

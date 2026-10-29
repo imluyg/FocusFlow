@@ -26,6 +26,17 @@ thread_local! {
         RefCell::new(HashMap::new());
     /// 本线程上次清池时对应的全局代次；与 `RO_GEN` 不一致就说明别的线程做过失效
     static RO_GEN_SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// 本线程**确认过「这个库里有这张表」**的名单，键 = 库文件名（`Connection::path()`）。
+    ///
+    /// 归键用文件名而不是句柄本身，是因为它必须与只读池同生共死：池按代次整片作废，
+    /// 这份名单也跟着整片作废（见 [`with_ro_conn_why`] 与 [`clear_ro_cache`]）。
+    ///
+    /// 大小有上界：条目数 ≤ 本线程查过的年度库数，每格 ≤ 那个库里被查过的表名数
+    /// （schema 一共八张），所以它不会像"按字符串建一个全局池"那样无界长。连接被 LRU
+    /// 挤掉时这一格不跟着掉 —— 多留的只是一个"这个文件里有这张表"的判断，而文件被
+    /// 换掉时整片名单随代次作废，旧结论留不住。
+    static PRESENCE_MEMO: RefCell<HashMap<String, std::collections::HashSet<String>>> =
+        RefCell::new(HashMap::new());
 }
 
 /// 只读连接池的**全局**代次。
@@ -77,6 +88,9 @@ pub fn with_ro_conn_why<T>(path: &Path, f: impl FnOnce(&Connection) -> T) -> Res
             // 别的线程调用过 clear_ro_cache()：本线程的陈旧句柄全部作废
             pool.clear();
             RO_GEN_SEEN.set(gen);
+            // 存在性名单与句柄同一条命：文件可能被整个换掉，那句"这库里有这张表"
+            // 也就不能再作数（不一起丢，读侧会永远以为表还在）
+            PRESENCE_MEMO.with(|m| m.borrow_mut().clear());
         }
         if !pool.contains_key(path) {
             // LRU 淘汰最久未用条目（此前整体 clear 会造成缓存抖动）
@@ -119,6 +133,8 @@ pub fn clear_ro_cache() {
     // 先推进全局代次（别的线程下次取连接时自愈），再清掉本线程这一份
     RO_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     RO_POOL.with(|pool| pool.borrow_mut().clear());
+    // 存在性名单跟着句柄一起作废（理由同 `with_ro_conn_why` 里那一句）
+    PRESENCE_MEMO.with(|m| m.borrow_mut().clear());
     RO_GEN_SEEN.with(|g| g.set(RO_GEN.load(std::sync::atomic::Ordering::Acquire)));
 }
 
@@ -132,12 +148,74 @@ pub fn open_rw(path: &Path) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+/// 每拍语句计数（只在 `test-utils` 特征下编译，发布构建里这一整块不存在）。
+///
+/// 为什么要它：`desktop-native` 快照线程一拍到底跑多少条 SQL，此前只能按调用点手算，
+/// 而手算那份清单（`crates/core/tests/perf_probe.rs` 的「一拍 load() 的查询面」）已经
+/// 跟生产 `data::load()` 漂开四臂 —— 由它推出来的刷新档位因此站在一份过期副本上。
+/// 这条腿数的是**执行条数**，不是估算。
+///
+/// ⚠ 这把尺子的边界写在这里，是为了不让「没数到」被读成「没执行」：
+/// `rusqlite::Connection::trace` 走 SQLite 的 `sqlite3_trace`，一条语句要**跑到结束**
+/// 才出声，而且钩子只挂在 [`open_ro`] 开出来的那些连接上 ⇒ 这里数的是
+/// 「只读连接上跑完的语句」。写连接（[`open_rw`]）与写线程每批那几组 UPSERT
+/// 一律不在这一格里；`column_presence` 那种把 `pragma_table_info` 写进 `SELECT`
+/// 里的形态落在「数据」档，不在「PRAGMA」档。
+#[cfg(feature = "test-utils")]
+pub mod stmt_meter {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// `sqlite_master` 那一类存在性探针（每库、每个聚合函数各问一次的那条）
+    static PRESENCE: AtomicU64 = AtomicU64::new(0);
+    /// `PRAGMA ...` 开头：一条 ≈ 一次**新打开**的只读连接（`open_ro` 里那句 cache_size）。
+    /// 池子命中时不再开连接、也就不再出这一条 ⇒ 这一档就是「这一轮重开了几条连接」。
+    static PRAGMA: AtomicU64 = AtomicU64::new(0);
+    /// 其余：真正取数据的那批
+    static DATA: AtomicU64 = AtomicU64::new(0);
+
+    /// 挂上去的回调必须是裸 `fn`（rusqlite 的签名不允许捕获环境），所以只能写全局。
+    pub(super) fn on_sql(sql: &str) {
+        if sql.contains("sqlite_master") {
+            PRESENCE.fetch_add(1, Ordering::Relaxed);
+        } else if sql.starts_with("PRAGMA") || sql.starts_with("pragma") {
+            PRAGMA.fetch_add(1, Ordering::Relaxed);
+        } else {
+            DATA.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 三档读数 `(存在性, PRAGMA, 数据)`。
+    pub fn read() -> (u64, u64, u64) {
+        (
+            PRESENCE.load(Ordering::Relaxed),
+            PRAGMA.load(Ordering::Relaxed),
+            DATA.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 归零。⚠ 它是**进程级**的，不是线程级：复位到读之间若别的线程也在查只读库，
+    /// 那些语句会一并数进来。探针的用法是「复位 → 单线程跑完一拍 → 读」，
+    /// 别把它当并发量具用。（与 `logger::capture_logs` 那个进程级采集串台是同一族。）
+    pub fn reset() {
+        PRESENCE.store(0, Ordering::Relaxed);
+        PRAGMA.store(0, Ordering::Relaxed);
+        DATA.store(0, Ordering::Relaxed);
+    }
+}
+
 /// 打开一个只读连接（并发读安全，不产生 WAL 副作用）。
 pub fn open_ro(path: &Path) -> anyhow::Result<Connection> {
-    let conn = Connection::open_with_flags(
+    // `mut` 只为 `test-utils` 下那一次挂钩；不开特征时这个连接全程只读。
+    #[cfg_attr(not(feature = "test-utils"), allow(unused_mut))]
+    let mut conn = Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    // 钩子必须**趁连接还是本地可变值**时挂：读侧从池里拿到的是 `&Connection`，事后挂不上。
+    // 摆在 `cache_size` 那句之前 ⇒ 那条 PRAGMA 被数进来，「PRAGMA」这一档就成了
+    // 「这一轮新开了几条只读连接」的读数（池命中时不开连接、不出 PRAGMA）。
+    #[cfg(feature = "test-utils")]
+    conn.trace(Some(stmt_meter::on_sql));
     conn.busy_timeout(std::time::Duration::from_secs(15))?;
     // 只读连接用较小的页缓存（默认约 2MB，聚合表查询无需大缓存）
     conn.pragma_update(None, "cache_size", -1024)?; // 1MB
@@ -192,6 +270,46 @@ pub fn table_presence(conn: &Connection, table: &str) -> Presence {
         Err(rusqlite::Error::QueryReturnedNoRows) => Presence::No,
         Err(e) => Presence::Unreadable(format!("查 {table} 这张表时读不出来: {e}")),
     }
+}
+
+/// 同一把三态尺子，但把**确认有**记在本线程的名单上 —— 给只读连接那一片调用方用。
+///
+/// 为什么要这一句：`queries` 里每个聚合函数、每个年度库都先问一次"这张表在不在"，
+/// 一拍就是约 9 个函数 × N 个库条 `sqlite_master` 查询。现量在
+/// `crates/core/tests/perf_probe.rs` 的「每一臂自己几条语句」：今日档 10 条、
+/// 总计档 13 条**全部**是这一问。聚合表不会在一拍之内凭空出现或消失，这一问每拍
+/// 重复几十次是白问。
+///
+/// ⚠ 只记 `Yes`，`No` 与 `Unreadable` 每次都照问 —— 这不是保守，是判据：
+/// 表会被**后来**建出来（导入补建 `key_log`、按日期删空后重建、归档换成别的文件），
+/// 把「没有」记下来就等于让本线程再也看不见它，而那恰好是屏上"读不全要出声"要防的事。
+/// 钉它的用例是 `a_table_created_after_the_first_asking_is_still_seen`。
+///
+/// 失效跟着只读池同一条链：`clear_ro_cache()` 推进 `RO_GEN` ⇒ 本线程下次取连接时
+/// 连这份名单一起丢。内存库（`Connection::path()` 回 `None`）**不进名单**：
+/// SQLite 对 `:memory:` 不报文件名，若按空串归键，两个各自独立的内存连接会互认
+/// "这张表我有"，而本仓多条三态用例正是拿 `open_in_memory` 各开各的库在跑的。
+pub fn table_presence_cached(conn: &Connection, table: &str) -> Presence {
+    let db = conn.path();
+    if let Some(db) = db {
+        let seen = PRESENCE_MEMO.with(|m| {
+            m.borrow()
+                .get(db)
+                .is_some_and(|tables| tables.contains(table))
+        });
+        if seen {
+            return Presence::Yes;
+        }
+    }
+    let verdict = table_presence(conn, table);
+    if let (Some(db), Presence::Yes) = (db, &verdict) {
+        let table = table.to_string();
+        let db = db.to_string();
+        PRESENCE_MEMO.with(|m| {
+            m.borrow_mut().entry(db).or_default().insert(table);
+        });
+    }
+    verdict
 }
 
 /// 表里有没有指定列，分得清"没有这一列"与"读不出来"。

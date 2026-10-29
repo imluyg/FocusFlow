@@ -514,7 +514,7 @@ pub fn get_stats_by_date(target_date: chrono::NaiveDate) -> (i64, HashMap<String
     (totals.total, totals.rows)
 }
 
-/// 一个年度库在这一趟读数里的结局。口径同 [`YearTotals`]：
+/// 一个年度库在这一趟读数里的结局。口径同 `YearMaxDay`（本文件上面那个每库读手）：
 /// "打不开/查询失败"、"库里没这张表"、"读到了"是三件事，折成两件就会说谎。
 enum YearRead<T> {
     /// 读到了（`T` 由各域决定形状）
@@ -527,7 +527,7 @@ enum YearRead<T> {
 
 /// 一个窗口内的排行读数（总次数/总秒数 + 榜单）连同**这次有没有读全**。
 ///
-/// 立它的形状照 [`AlltimeTotals`]：`unreadable` 非空就是"结果不完整"的信号，
+/// 立它的形状照 [`AlltimeMaxDay`]：`unreadable` 非空就是"结果不完整"的信号，
 /// 面板与导出必须把它说出来，而不是把一份下界念成"今日 0 次、排行榜为空"。
 #[derive(Debug, Clone, Default)]
 pub struct RankTotals {
@@ -663,7 +663,7 @@ fn query_stats_in_conn(
     param: Option<i64>,
     group: bool,
 ) -> YearRead<(i64, HashMap<String, i64>)> {
-    match connection::table_presence(conn, "daily_counts") {
+    match connection::table_presence_cached(conn, "daily_counts") {
         connection::Presence::No => return YearRead::NoTable,
         connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
         connection::Presence::Yes => {}
@@ -727,53 +727,55 @@ fn query_stats_in_conn(
     YearRead::Read((total, map))
 }
 
-/// 全历史汇总（跨年度库）连同**这次有没有读全**。
+/// 全历史「最高单日」（跨年度库）连同**这次有没有读全**。
+///
+/// 这里刻意**不**算全历史总次数：屏上那一格「总计」念的是当前周期的
+/// `stats_totals(...).total + pending`（`desktop-native/src/data.rs:528`），
+/// 与这一趟无关。旧形状每拍多带一条 `SELECT SUM(count) FROM daily_counts` 走全部年度库，
+/// 而它交回的 `total` 生产侧一个读者都没有（只有三条用例读它）——
+/// 现量见 `crates/core/tests/perf_probe.rs` 的「每一臂自己几条语句」：那一趟每拍占
+/// 「每库 1 条」，今日档 2 条、总计档 2 条，都是白算的。
+/// 全历史次数这条口径仍由 [`get_stats`]／[`stats_totals`]（`days = None`）守着，
+/// `aggregation_test.rs` 与 `real_data.rs` 都还在比它。
 #[derive(Debug, Clone)]
-pub struct AlltimeTotals {
-    /// 读到的那些年度库的次数之和。`unreadable` 非空时它只是**下界**。
-    pub total: i64,
+pub struct AlltimeMaxDay {
     /// 读到的那些年度库里的最高单日（`YYYY-MM-DD`, 次数）。
+    ///
+    /// `unreadable` 非空时它只是**已读那几年的最大值**：某一年没答上来，它可能正握着
+    /// 真正的那一天 —— 调用方据此不能把"少了一年"念成"纪录就是这个"。
     pub max_day: Option<(String, i64)>,
     /// 这一次没能读出来的年度库，每项形如「年份: 原因」。
     ///
-    /// 非空就是"结果不完整"的信号：调用方（统计线程）据此**不拿这份残缺值去覆盖上一份
-    /// 基线**，否则一次文件锁就会把"全历史总计"永久改低。
+    /// 非空就是"结果不完整"的信号：调用方（快照线程）要么把它念到屏上，
+    /// 要么就别拿这份残缺值去覆盖上一份。
     pub unreadable: Vec<String>,
 }
 
-/// 单个年度库在这一趟汇总里的结局。
+/// 单个年度库在这一趟「最高单日」遍历里的结局。
 ///
 /// 旧写法把三件事折成同一个 `None`／`0`：打不开、没有 `daily_counts` 这张表、表在但
-/// 查询失败 —— 于是「有一年完全读不出来」与「那一年本来就没数据」在总数里长得一模一样，
-/// 而 `SUM` 与「最高单日」各自 `unwrap_or` 之后还能拼出自相矛盾的卡片（总数少了那一年、
-/// 纪录却来自别的年）。
+/// 查询失败 —— 于是「有一年完全读不出来」与「那一年本来就没数据」在结果里长得一模一样，
+/// 而「最高单日」`unwrap_or` 之后还能与别的卡片拼出自相矛盾的一屏。
 #[derive(Debug)]
-enum YearTotals {
-    /// 这一年读到了：`sum` 是全年次数，`top` 是本年最高单日（表里没行时是 `None`）。
-    Read { sum: i64, top: Option<(i64, i64)> },
-    /// 这个库里没有 `daily_counts` 表：真的没有可汇总的数据，算 0 是对的。
+enum YearMaxDay {
+    /// 这一年读到了：`top` 是本年最高单日（表里没行时是 `None`）。
+    Read { top: Option<(i64, i64)> },
+    /// 这个库里没有 `daily_counts` 表：真的没有可汇总的数据，算"没有纪录"是对的。
     NoTable,
-    /// 这一年**没有答案**（表在，但查询失败）：不能当成 0。
+    /// 这一年**没有答案**（表在，但查询失败）：不能当成"这一年没纪录"。
     Unreadable(String),
 }
 
-/// 在一个年度库连接上取回这一年的 (总次数, 最高单日)，读不出来就说读不出来。
-fn year_totals_in_conn(conn: &Connection) -> YearTotals {
-    match connection::table_presence(conn, "daily_counts") {
-        connection::Presence::No => return YearTotals::NoTable,
-        connection::Presence::Unreadable(why) => return YearTotals::Unreadable(why),
+/// 在一个年度库连接上取回这一年的最高单日，读不出来就说读不出来。
+fn year_max_day_in_conn(conn: &Connection) -> YearMaxDay {
+    match connection::table_presence_cached(conn, "daily_counts") {
+        connection::Presence::No => return YearMaxDay::NoTable,
+        connection::Presence::Unreadable(why) => return YearMaxDay::Unreadable(why),
         connection::Presence::Yes => {}
     }
-    let sum = match conn.query_row(
-        "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
-        [],
-        |r| r.get::<_, i64>(0),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            return YearTotals::Unreadable(format!("汇总这一年的次数时读不出来: {e}"));
-        }
-    };
+    // 只这一条：排 (count DESC, date_key ASC) 两个键，`daily_counts` 一年 365 行，
+    // 全表扫比给 count 单列建索引划算（那条索引已实测无收益并移除，见
+    // `connection::ensure_schema` 里的论证）。
     let top = match conn.query_row(
         "SELECT date_key, count FROM daily_counts ORDER BY count DESC, date_key ASC LIMIT 1",
         [],
@@ -782,55 +784,57 @@ fn year_totals_in_conn(conn: &Connection) -> YearTotals {
         Ok(v) => Some(v),
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
         Err(e) => {
-            return YearTotals::Unreadable(format!("找这一年的最高单日时读不出来: {e}"));
+            return YearMaxDay::Unreadable(format!("找这一年的最高单日时读不出来: {e}"));
         }
     };
-    YearTotals::Read { sum, top }
+    YearMaxDay::Read { top }
 }
 
-/// 全历史汇总（跨年度库）：总计与最高单日。
+/// 全历史「最高单日」（跨年度库）。
 ///
-/// 「总计」卡片与「最高单日」卡片共用同一份失效条件（强制刷新 / 跨天 /
-/// 今日新增达阈值），因此两者在同一次跨库遍历里一起取出：`daily_counts`
-/// 每天一行，SUM 与 ORDER BY 都是小表扫描，多取一个总数不增加连接开销。
+/// ⚠ 这里**没有**缓存，也**没有**注释曾经承诺的那份失效条件：本函数每次调用都无条件
+/// 重扫一遍全部年度库（`available_years()` 那份 30 秒缓存只缓存"有哪几年"，不缓存结果）。
+/// 旧注释写的「与「总计」卡片共用同一份失效条件（强制刷新 / 跨天 / 今日新增达阈值）」
+/// 「这一趟的产出会被统计线程当作全历史基线缓存」在本仓都不成立 ——
+/// 快照线程每拍调它（`desktop-native/src/data.rs` 的 `load()`），一句也没有兑现过。
+/// 要不要真上一份缓存是另一件事：那要先把"今日恰好破纪录的那一拍必须跟上"钉成判据，
+/// 已登记待用户点，不在本轮。
 ///
-/// 返回里带 `unreadable`：某一年打不开或读不出来时，那份总数只是**下界**，
-/// 必须让调用方看得见 —— 静默按 0 计入会让"总计"少掉整整一年还显得一切正常。
-pub fn get_alltime_summary() -> AlltimeTotals {
-    let mut total: i64 = 0;
+/// 返回里带 `unreadable`：某一年打不开或读不出来时，那个"最大值"只是**已读那几年的**
+/// 最大值，必须让调用方看得见 —— 静默按"这一年没纪录"计入，屏上念的就不可能是真纪录。
+pub fn get_alltime_max_day() -> AlltimeMaxDay {
     let mut best: Option<(i64, i64)> = None; // (date_key, count)
     let mut unreadable: Vec<String> = Vec::new();
     for year in available_years() {
         let path = paths::year_db_path(year);
         // `with_ro_conn` 返回 `None` 只可能是「连接没拿到」（打开失败已在连接层记过 error），
-        // 拿到连接之后的结局由 `year_totals_in_conn` 自己分臂 —— 两者原先被同一个
+        // 拿到连接之后的结局由下面那个每库读手自己分臂 —— 两者原先被同一个
         // `.flatten()` 折成"这一年没数据"。
-        let arm = connection::with_ro_conn(&path, year_totals_in_conn);
+        let arm = connection::with_ro_conn(&path, year_max_day_in_conn);
         match arm {
-            Some(YearTotals::Read { sum, top }) => {
-                total += sum;
+            Some(YearMaxDay::Read { top }) => {
                 if let Some((dk, c)) = top {
                     if best.is_none_or(|(_, bc)| c > bc) {
                         best = Some((dk, c));
                     }
                 }
             }
-            Some(YearTotals::NoTable) => {}
-            Some(YearTotals::Unreadable(why)) => unreadable.push(format!("{year}: {why}")),
+            Some(YearMaxDay::NoTable) => {}
+            Some(YearMaxDay::Unreadable(why)) => unreadable.push(format!("{year}: {why}")),
             None => unreadable.push(format!("{year}: 只读连接打不开（原因见上一行 error 日志）")),
         }
     }
     if !unreadable.is_empty() {
         tracing::warn!(
-            "全历史汇总不完整：{} 个年度库这次没读出来（{}），下面的总数只是已读部分: 总计 {total} 次",
+            "全历史「最高单日」不完整：{} 个年度库这次没读出来（{}），已读部分里的最大值: {:?}",
             unreadable.len(),
-            unreadable.join("；")
+            unreadable.join("；"),
+            best
         );
     }
     let max_day =
         best.and_then(|(dk, c)| day_key_to_date(dk).map(|d| (d.format("%Y-%m-%d").to_string(), c)));
-    AlltimeTotals {
-        total,
+    AlltimeMaxDay {
         max_day,
         unreadable,
     }
@@ -885,7 +889,7 @@ fn query_daily_window_in_conn(
     start_dk: i64,
     end_dk: i64,
 ) -> YearRead<Vec<(i64, i64)>> {
-    match connection::table_presence(conn, "daily_counts") {
+    match connection::table_presence_cached(conn, "daily_counts") {
         connection::Presence::No => return YearRead::NoTable,
         connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
         connection::Presence::Yes => {}
@@ -905,7 +909,7 @@ fn query_hourly_window_in_conn(
     start_dk: i64,
     end_dk: i64,
 ) -> YearRead<Vec<(i64, i64)>> {
-    match connection::table_presence(conn, "hourly_counts") {
+    match connection::table_presence_cached(conn, "hourly_counts") {
         connection::Presence::No => return YearRead::NoTable,
         connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
         connection::Presence::Yes => {}
@@ -920,21 +924,34 @@ fn query_hourly_window_in_conn(
     )
 }
 
+/// 一趟窗口读回来的行：`(date_key, 次数)` 序列。
+type WindowRows = Vec<(i64, i64)>;
+/// 一趟窗口读回来的缺读：`(哪一年, 那句点名的话)`。
+///
+/// 年份这一格不是装饰：[`read_daily_pair`] 要把一趟宽窗口的读数分给两段窗口，
+/// 分头的依据就是"这一年属不属于那一段"。若交回来的只是一串句子，它就得回头去切
+/// `{年} 年库…` 那个前缀 —— 同一件事第二把尺子（面板那边已经切过一次了）。
+type WindowGaps = Vec<(i32, String)>;
+
 /// 逐年度库把窗口内的行读回来。`label` 只用于把 gap 说到"是哪个域的哪一年"。
 ///
 /// 这一支以前有四道各自为政的折：`year_db_presence` 说不出在不在只留一行日志、
 /// `with_ro_conn` 把"打不开"折成 `None`（连那句日志都不给调用方）、`table_exists` 把
 /// "问不出有没有这张表"折成"没有"、`rows.flatten()` 把"读到一半坏页"折成"到这儿为止"。
 /// 四道现在都落到 `unreadable`，交回的行只是**已读部分**。
+///
+/// ⚠ 交回的缺读带**年份整数**，不只带那句拼好的话：调用方里有一位要把一段宽窗口的
+/// 缺读分给两个窄窗口（[`read_daily_pair`]），那必须按"哪一年"筛。若让它回头去切
+/// `{年} 年库…` 那句字符串，同一件事就又有第二把尺子（面板那边已经切过一次了）。
 fn read_window_years(
     label: &str,
     years: &[i32],
     start_dk: i64,
     end_dk: i64,
     query: impl Fn(&Connection, i64, i64) -> YearRead<Vec<(i64, i64)>>,
-) -> (Vec<(i64, i64)>, Vec<String>) {
-    let mut pairs: Vec<(i64, i64)> = Vec::new();
-    let mut gaps: Vec<String> = Vec::new();
+) -> (WindowRows, WindowGaps) {
+    let mut pairs: WindowRows = Vec::new();
+    let mut gaps: WindowGaps = Vec::new();
     for y in years.iter().copied() {
         let path = paths::year_db_path(y);
         match gate_year(y, &path, label) {
@@ -942,14 +959,16 @@ fn read_window_years(
             // 那些天留在初始化好的 0 上。
             YearGate::SkipAbsent => continue,
             YearGate::CannotTell(why) => {
-                gaps.push(format!("{y} 年库{label}读不出来: {why}"));
+                gaps.push((y, format!("{y} 年库{label}读不出来: {why}")));
                 continue;
             }
             YearGate::Read => {}
         }
         match connection::with_ro_conn_why(&path, |conn| query(conn, start_dk, end_dk)) {
-            Err(why) => gaps.push(format!("{y} 年库{label}读不出来: {why}")),
-            Ok(YearRead::Unreadable(why)) => gaps.push(format!("{y} 年库{label}读不出来: {why}")),
+            Err(why) => gaps.push((y, format!("{y} 年库{label}读不出来: {why}"))),
+            Ok(YearRead::Unreadable(why)) => {
+                gaps.push((y, format!("{y} 年库{label}读不出来: {why}")))
+            }
             // 没有这张表 = 这一年确实没有可汇总的数据；安静按 0 计
             Ok(YearRead::NoTable) => {}
             Ok(YearRead::Read(v)) => pairs.extend(v),
@@ -958,25 +977,37 @@ fn read_window_years(
     (pairs, gaps)
 }
 
-/// 查询最近 N 天每日按键数：[(YYYY-MM-DD, 次数)]，含"这一轮没读全"。
-pub fn daily_counts_totals(days: i64, year: Option<i32>) -> DailyTotals {
-    let now = Local::now();
-    let today = now.date_naive();
-    // 含当天共 N 天：起点为 today-(N-1)；天数先收敛，越界会让日期运算 panic。
-    // 起点与「读哪几个年份」都走 `window_start_and_years` —— 上面那道可读性闸问的就是
-    // 同一批库，两处不再各算一套。
-    let days = clamp_query_days(days);
-    let (start, years_to_query) = window_start_and_years(today, days, year);
+/// 一次库上的读，交出**两段**每日序列：窄的那段与宽的那段（宽 ⊇ 窄）。
+///
+/// 为什么是一段读两段用：快照线程那一拍原来为每日趋势与"打卡条"各扫一遍
+/// `daily_counts` —— 一道 `chart_window_days`（最多 30 天）、一道 `GOAL_LOOKBACK_DAYS`
+/// （370 天）。宽的那段把窄的整个盖住，同一天在两段里必然同值，问两遍就是白问。
+///
+/// ⚠ 缺读按**各自窗口的年份清单**分头交回，不许把宽窗口点到的坏年份原样塞给窄的那段：
+/// 图上只画了 2026 年那些天，面板却说"2025 年库每日趋势读不出来"，那是把不相干的一年
+/// 算在这张图头上 —— 数字没错，指控错了人。两份年份清单都出自
+/// [`window_start_and_years`] 同一把尺子，所以"窄窗口的年份 ⊆ 宽窗口的年份"是构造保证的，
+/// 不是从切出来的日期反推的。
+fn read_daily_pair(
+    small_days: i64,
+    wide_days: i64,
+    year: Option<i32>,
+) -> (DailyTotals, DailyTotals) {
+    let today = Local::now().date_naive();
+    let small_days = clamp_query_days(small_days);
+    // 宽的一段至少要把窄的盖住，否则"从一趟里切两段"这个前提就不成立了
+    let wide_days = clamp_query_days(wide_days).max(small_days);
+    let (start, years_to_query) = window_start_and_years(today, wide_days, year);
     let start_dk = day_key_of_date(start);
     let end_dk = day_key_of_date(today);
 
-    // 初始化所有日期为 0
+    // 初始化宽窗口里所有日期为 0（`day_key` 是连续的"历元第几天"，所以 +i 就是 +i 天）
     let mut daily_map: HashMap<i64, i64> = HashMap::new();
-    for i in 0..days.max(1) {
+    for i in 0..wide_days {
         daily_map.insert(start_dk + i, 0);
     }
 
-    let (pairs, unreadable) = read_window_years(
+    let (pairs, gaps) = read_window_years(
         DOMAIN_DAILY,
         &years_to_query,
         start_dk,
@@ -989,14 +1020,53 @@ pub fn daily_counts_totals(days: i64, year: Option<i32>) -> DailyTotals {
         }
     }
 
-    let mut series: Vec<(String, i64)> = Vec::with_capacity(daily_map.len());
+    let small_start_dk = end_dk - small_days + 1;
+    let small_years: std::collections::HashSet<i32> =
+        window_start_and_years(today, small_days, year)
+            .1
+            .into_iter()
+            .collect();
+    let mut small_series: Vec<(String, i64)> = Vec::with_capacity(small_days as usize);
+    let mut wide_series: Vec<(String, i64)> = Vec::with_capacity(daily_map.len());
     for (dk, c) in daily_map {
         if let Some(d) = day_key_to_date(dk) {
-            series.push((d.format("%Y-%m-%d").to_string(), c));
+            let row = (d.format("%Y-%m-%d").to_string(), c);
+            if dk >= small_start_dk {
+                small_series.push(row.clone());
+            }
+            wide_series.push(row);
         }
     }
-    series.sort();
-    DailyTotals { series, unreadable }
+    small_series.sort();
+    wide_series.sort();
+    (
+        DailyTotals {
+            series: small_series,
+            unreadable: gaps
+                .iter()
+                .filter(|(y, _)| small_years.contains(y))
+                .map(|(_, s)| s.clone())
+                .collect(),
+        },
+        DailyTotals {
+            series: wide_series,
+            unreadable: gaps.into_iter().map(|(_, s)| s).collect(),
+        },
+    )
+}
+
+/// 查询最近 N 天每日按键数：[(YYYY-MM-DD, 次数)]，含"这一轮没读全"。
+pub fn daily_counts_totals(days: i64, year: Option<i32>) -> DailyTotals {
+    // 单窗口出口 = 两段同宽。窗口算术、补零、缺读点名都住在 `read_daily_pair`，
+    // 这里不再自己走一遍（那正是"同一件事两份答案"当年长出来的地方）。
+    read_daily_pair(days, days, year).0
+}
+
+/// 一趟查回快照线程那一拍要的两段每日序列：给图的 `chart_days`，与给打卡条的
+/// `lookback_days`（打卡那条要用宽的那段；它的缺读**不进**图的那句点名，理由见
+/// 本文件上面的 `read_daily_pair`）。
+pub fn daily_counts_windows(chart_days: i64, lookback_days: i64) -> (DailyTotals, DailyTotals) {
+    read_daily_pair(chart_days, lookback_days, None)
 }
 
 /// 查询最近 N 天每日按键数：返回 [(YYYY-MM-DD, 次数)]。
@@ -1059,7 +1129,7 @@ pub fn hourly_stats_totals(target_date: Option<chrono::NaiveDate>) -> HourlyTota
         YearGate::Read => {}
     }
     let got = connection::with_ro_conn_why(&path, |conn| -> YearRead<Vec<(i64, i64)>> {
-        match connection::table_presence(conn, "hourly_counts") {
+        match connection::table_presence_cached(conn, "hourly_counts") {
             connection::Presence::No => return YearRead::NoTable,
             connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
             connection::Presence::Yes => {}
@@ -1121,7 +1191,7 @@ pub fn hourly_window_totals(days: i64, year: Option<i32>) -> HourlyTotals {
     let start_dk = day_key_of_date(start);
     let end_dk = day_key_of_date(today);
     let mut hours = vec![0i64; 24];
-    let (pairs, unreadable) = read_window_years(
+    let (pairs, gaps) = read_window_years(
         DOMAIN_HOURLY,
         &years_to_query,
         start_dk,
@@ -1134,7 +1204,11 @@ pub fn hourly_window_totals(days: i64, year: Option<i32>) -> HourlyTotals {
             hours[h as usize] += c;
         }
     }
-    HourlyTotals { hours, unreadable }
+    // 每小时图只有一段窗口，用不着按年份分头交回 ⇒ 把年份这一格就地抹掉
+    HourlyTotals {
+        hours,
+        unreadable: gaps.into_iter().map(|(_, s)| s).collect(),
+    }
 }
 
 /// 查询所选窗口内每小时的合计键数（返回长度 24 的列表）。
@@ -1152,7 +1226,7 @@ fn query_apps_in_conn(
     cond: &str,
     param: Option<i64>,
 ) -> YearRead<(i64, HashMap<String, i64>)> {
-    match connection::table_presence(conn, "app_usage") {
+    match connection::table_presence_cached(conn, "app_usage") {
         connection::Presence::No => return YearRead::NoTable,
         connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
         connection::Presence::Yes => {}
@@ -1428,7 +1502,7 @@ fn query_devices_in_conn(
     param: Option<i64>,
     year: i32,
 ) -> YearRead<Vec<DeviceRow>> {
-    match connection::table_presence(conn, "device_counts") {
+    match connection::table_presence_cached(conn, "device_counts") {
         connection::Presence::No => return YearRead::NoTable,
         connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
         connection::Presence::Yes => {}
@@ -1613,7 +1687,7 @@ fn merge_device_rows(rows: Vec<DeviceRow>) -> (i64, Vec<DeviceStat>) {
 
 /// 设备维度的一次读数（总次数 + 展示行）连同**这次有没有读全**。
 ///
-/// 形状照 [`AlltimeTotals`]：`unreadable` 非空时 `total`/`devices` 都只是**下界**，
+/// 形状照 [`AlltimeMaxDay`]：`unreadable` 非空时 `total`/`devices` 都只是**下界**，
 /// 面板不能把一次"有一年库没打开"念成"这一年没插设备"。
 #[derive(Debug, Clone, Default)]
 pub struct DeviceTotals {
@@ -1861,7 +1935,7 @@ fn device_has_key_detail(identity: &str) -> DetailVerdict {
     for year in query_years(None, None) {
         let path = paths::year_db_path(year);
         let verdict = connection::with_ro_conn(&path, |conn| {
-            match connection::table_presence(conn, "device_key_counts") {
+            match connection::table_presence_cached(conn, "device_key_counts") {
                 // 这一年还没有这张表（键名明细是后来才加的功能）：这是**一个答案**
                 connection::Presence::No => DetailVerdict::Absent,
                 connection::Presence::Unreadable(why) => {
@@ -1930,7 +2004,7 @@ fn device_key_rows(identity: &str, period: i64) -> (Vec<(String, i64)>, Vec<Stri
         let path = paths::year_db_path(year);
         let gap_of = |why: String| format!("{year} 年库键名明细读不出来: {why}");
         let got = connection::with_ro_conn_why(&path, |conn| -> YearRead<Vec<(String, i64)>> {
-            match connection::table_presence(conn, "device_key_counts") {
+            match connection::table_presence_cached(conn, "device_key_counts") {
                 connection::Presence::No => return YearRead::NoTable,
                 connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
                 connection::Presence::Yes => {}
@@ -2011,7 +2085,7 @@ fn device_date_series(identity: &str) -> (Vec<(i64, i64)>, Vec<String>) {
         let path = paths::year_db_path(year);
         let gap_of = |why: String| format!("{year} 年库按天序列读不出来: {why}");
         let got = connection::with_ro_conn_why(&path, |conn| -> YearRead<Vec<(i64, i64)>> {
-            match connection::table_presence(conn, "device_counts") {
+            match connection::table_presence_cached(conn, "device_counts") {
                 connection::Presence::No => return YearRead::NoTable,
                 connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
                 connection::Presence::Yes => {}
@@ -2230,7 +2304,7 @@ fn registered_kind(identity: &str) -> (Option<String>, Vec<String>) {
     for year in query_years(None, None) {
         let path = paths::year_db_path(year);
         let got = connection::with_ro_conn_why(&path, |conn| -> YearRead<String> {
-            match connection::table_presence(conn, "devices") {
+            match connection::table_presence_cached(conn, "devices") {
                 // 没有这张表＝这个库压根没登记过设备：安静（那是答案，不是问不出）
                 connection::Presence::No => return YearRead::NoTable,
                 connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
@@ -4102,14 +4176,18 @@ mod tests {
         assert_eq!(device_has_key_detail(identity), DetailVerdict::Absent);
     }
 
-    /// 「某一年读不出来」不许在「总计」里等于「那一年 0 次」。
+    /// 「某一年读不出来」不许在「最高单日」里等于「那一年没纪录」。
     ///
-    /// 这一次跨库遍历的产出会被统计线程当作全历史基线缓存，界面上念出来的是"你一共按下过
-    /// 多少键"。原先打不开、没有 `daily_counts` 表、表在但查询失败三件事都折成同一个 0：
-    /// 一次瞬时的文件锁（别的实例握着库、移动盘还没醒、同步盘放的是占位）就把总数**永久**改低，
-    /// 而缓存要到跨天或今日增量达阈值才重建 —— 用户看到的是"我在掉历史"。
+    /// 原先打不开、没有 `daily_counts` 表、表在但查询失败三件事都折成同一个"没有"：
+    /// 一次瞬时的文件锁（别的实例握着库、移动盘还没醒、同步盘放的是占位）就把屏上那句
+    /// "最高单日"念小，而一个字不吭。
+    ///
+    /// ⚠ 这一趟原来还算一个全历史总次数并交回 `total`，而生产侧一个读者都没有
+    /// （屏上「总计」念的是 `stats_totals(...).total + pending`），已随那一刀摘掉。
+    /// "跨库遍历不许漏年份"这条口径并没有失去归宿：它由 [`stats_totals`]／[`get_stats`]
+    /// 在 `aggregation_test.rs` 与 `real_data.rs` 里继续守着 —— 那两条是有真读者的尺子。
     #[test]
-    fn an_unreadable_year_is_not_counted_as_zero_in_the_alltime_total() {
+    fn an_unreadable_year_is_not_read_as_no_record_in_the_alltime_max_day() {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("q_alltime_totals");
         let day_a = day_key_of_date(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
@@ -4130,21 +4208,22 @@ mod tests {
         }
         invalidate_years_cache();
         connection::clear_ro_cache();
-        let clean = get_alltime_summary();
+        let clean = get_alltime_max_day();
         assert!(
             clean.unreadable.is_empty(),
             "夹具前提：这里只有一个能读的库，实得 {:?}",
             clean.unreadable
         );
-        assert_eq!(clean.total, 8, "两个交易日之和");
         assert_eq!(clean.max_day, Some(("2026-01-02".to_string(), 5)));
 
         // 一整年变成一个不是 SQLite 的文件 ⇒ 那一年**没有答案**
         let broken = 2031;
         std::fs::write(paths::year_db_path(broken), b"not a sqlite file at all").unwrap();
-        // 另一年表在、列却不全（旧库里手工拼出来的形状）：总数还算得出、纪录查不动。
-        // 旧写法会把这一年算进总数却不给它纪录 —— 两张卡片来自同一个遍历时，
-        // 这种"半条答案"比整条没有更难查。
+        // 另一年表在、列却不全（旧库里手工拼出来的形状）：那一行 `count = 7` 比已读的
+        // 纪录 5 还大，可这一年**查不动**（`date_key` 那一列不存在）。
+        // 于是它既不许被念成纪录（7 上不了屏），也不许被念成"那一年没纪录"——
+        // 只能点名说它没答上来。旧形状里这一年是"算进总数、不给纪录"的半条答案，
+        // 两张卡片来自同一个遍历时那种形态比整条没有更难查。
         let half_baked = 2030;
         {
             let conn = connection::open_rw(&paths::year_db_path(half_baked)).unwrap();
@@ -4155,9 +4234,13 @@ mod tests {
         }
         invalidate_years_cache();
         connection::clear_ro_cache();
-        let partial = get_alltime_summary();
-        assert_eq!(partial.total, 8, "读不出来的那些年，一秒也不许计入总数");
-        assert_eq!(partial.max_day, Some(("2026-01-02".to_string(), 5)));
+        let partial = get_alltime_max_day();
+        assert_eq!(
+            partial.max_day,
+            Some(("2026-01-02".to_string(), 5)),
+            "读不出来的那些年一律不许参与最大值：7 那个假纪录不能上屏，\
+             而把这一年折成「没纪录」就等于屏上念小了还一个字不吭"
+        );
         let said = partial.unreadable.join("；");
         assert!(
             said.contains(&broken.to_string()),
@@ -4168,16 +4251,16 @@ mod tests {
             "半拉子那一年要按年份＋卡在哪一步说清，实得 {said}"
         );
 
-        // 反向腿：两份坏文件都拿走 ⇒ 同一次汇总回到「读全了」，上面几条不是恒真
+        // 反向腿：两份坏文件都拿走 ⇒ 同一次遍历回到「读全了」，上面几条不是恒真
         // 先放掉只读池里的句柄：半拉子那一年是**能打开**的，连接还握在这个线程的池里，
         // Windows 上握着句柄就删不掉文件。
         connection::clear_ro_cache();
         std::fs::remove_file(paths::year_db_path(broken)).unwrap();
         std::fs::remove_file(paths::year_db_path(half_baked)).unwrap();
         invalidate_years_cache();
-        let back = get_alltime_summary();
+        let back = get_alltime_max_day();
         assert!(back.unreadable.is_empty(), "实得 {:?}", back.unreadable);
-        assert_eq!(back.total, 8);
+        assert_eq!(back.max_day, Some(("2026-01-02".to_string(), 5)));
     }
 
     /// 「没有这张表」是真答案，「有表但查询失败」不是。
@@ -4185,20 +4268,173 @@ mod tests {
     fn a_missing_aggregate_table_is_an_answer_but_a_failed_query_is_not() {
         let conn = Connection::open_in_memory().unwrap();
         assert!(
-            matches!(year_totals_in_conn(&conn), YearTotals::NoTable),
-            "库里压根没有 daily_counts：这就是「没有可汇总的数据」，算 0 是对的"
+            matches!(year_max_day_in_conn(&conn), YearMaxDay::NoTable),
+            "库里压根没有 daily_counts：这就是「没有可汇总的数据」，按「没有纪录」算是对的"
         );
 
         conn.execute("CREATE TABLE daily_counts (count INTEGER)", [])
             .unwrap();
         conn.execute("INSERT INTO daily_counts(count) VALUES (7)", [])
             .unwrap();
-        match year_totals_in_conn(&conn) {
-            YearTotals::Unreadable(why) => {
+        match year_max_day_in_conn(&conn) {
+            YearMaxDay::Unreadable(why) => {
                 assert!(why.contains("最高单日"), "要说清卡在哪一步，实得 {why}")
             }
             other => panic!("缺列的表要落成「读不出来」，实得 {other:?}"),
         }
+    }
+
+    /// 第一次问出「没有」之后别人把那张表建出来了 ⇒ 第二次问必须看得见。
+    ///
+    /// 这条钉的是 `connection::table_presence_cached` **只记「有」、不记「没有」**那一半。
+    /// 加记忆本身是有实测依据的：读侧每拍为每个库重复问一次存在性，现量今日档 10 条、
+    /// 总计档 13 条全是这一问（`crates/core/tests/perf_probe.rs`「每一臂自己几条语句」）。
+    /// 但一旦顺手把「没有」也记下来，症状不是红、是**安静**：导入补建的 `key_log`、
+    /// 按日期删空后重建的表，本线程再也看不见，屏上永远念"这一栏没有数据"——
+    /// 而省掉的那 10 条查询不会让任何用例因为"少查了一次"而响。
+    /// 所以这条腿必须自己把顺序摆出来：先问出没有 → 不清池地补建 → 再问。
+    /// 中间那句「不清池」是全部区分性所在：清了池就等于把记忆绕过去，用例恒绿。
+    #[test]
+    fn a_table_created_after_the_first_asking_is_still_seen() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_presence_memo_sees_late_tables");
+        let year = Local::now().year();
+        let path = paths::year_db_path(year);
+        let today_dk = day_key_of_date(Local::now().date_naive());
+        // 只建 `daily_counts` 并放一行（`available_years` 要认这一年），**故意不建 app_usage**
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE daily_counts (
+                    date_key INTEGER PRIMARY KEY,
+                    count INTEGER NOT NULL,
+                    seconds INTEGER NOT NULL DEFAULT 0);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 4)",
+                [today_dk],
+            )
+            .unwrap();
+        }
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+
+        // 第一趟：这张表确确实实没有 ⇒ 空榜，而且**不许**被说成"读不出来"
+        let first = app_stats_totals(None, None);
+        assert!(
+            first.unreadable.is_empty(),
+            "夹具前提：这是「没有这张表」这个真答案，实得 {:?}",
+            first.unreadable
+        );
+        assert_eq!(first.total, 0, "没有 app_usage 这张表时总时长就是 0");
+        assert!(first.rows.is_empty(), "空榜，实得 {:?}", first.rows);
+
+        // 补建：**不清池、不失效代次** —— 上面那次查询已经把只读连接留在这个线程的池里，
+        // 这一条测的就是"池还是那张池"的时候，新表看不看得见。
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE app_usage (
+                    date_key INTEGER NOT NULL,
+                    app_name TEXT NOT NULL,
+                    seconds INTEGER NOT NULL,
+                    PRIMARY KEY (date_key, app_name)) WITHOUT ROWID;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO app_usage (date_key, app_name, seconds) VALUES (?1, 'note.exe', 90)",
+                [today_dk],
+            )
+            .unwrap();
+        }
+        let second = app_stats_totals(None, None);
+        assert_eq!(
+            second.total, 90,
+            "把「没有」记下来 ⇒ 本线程永远看不见这张后建出来的表，这里会是 0"
+        );
+        assert_eq!(second.rows.get("note.exe").copied(), Some(90));
+
+        // 反向控制带（两条，各挡一种写法）：同一张**始终没建过**的表，
+        // ①第一次问要回「没有」—— 名单不许把它当成"这张我有"；
+        // ②**连着第二次问仍要回「没有」**—— 上面那条主腿只走得到"先没有、后建出来"，
+        //    挡不住"把『没有』也塞进名单、下次直接答复『有』"那种写法（主腿照样会绿，
+        //    因为那时表真的在了）。这条是那条的对照带，不是重复。
+        let never = connection::open_ro(&path).unwrap();
+        assert_eq!(
+            connection::table_presence_cached(&never, "device_key_counts"),
+            connection::Presence::No,
+            "没建过的表要答得出「没有」"
+        );
+        assert_eq!(
+            connection::table_presence_cached(&never, "device_key_counts"),
+            connection::Presence::No,
+            "第二次问不许因为名单里躺着一个「没有」就改口答「有」"
+        );
+    }
+
+    /// 打卡条那一趟扫到的坏年份，不许算到"只画今天那一格"的图头上。
+    ///
+    /// 每日序列现在**一趟查两段**（`read_daily_pair`）：窄的给趋势图、宽的给打卡条。
+    /// 合并带来一个必须当场处理的后果 —— 宽窗口够得着的那一年如果读不出来，它的点名
+    /// 会跟着这一趟一起回来；而面板是按域名分栏念的，「每日趋势」那一栏于是会指控一张
+    /// 根本没画那一年的图。**数字没错，指控错了人**，所以"按各自窗口的年份清单分头交回"
+    /// 这一条得钉住。
+    ///
+    /// 夹具的两个前提都是构造出来的、不靠今天的日期：窄段取 1 天（年份集必然只有今年），
+    /// 宽段取 `GOAL_LOOKBACK_DAYS` = 370 天（任一起点往回数 370 天必然跨进上一年）。
+    /// 反向腿在下一段：宽段自己必须**点名得到**那一年 —— 少了它，上面那条
+    /// 「图里不许有」会被"整串都丢了"这种更坏的写法满足掉。
+    #[test]
+    fn the_daily_trend_only_blames_the_years_it_actually_draws() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_daily_pair_gaps");
+        let today = Local::now().date_naive();
+        let this_year = today.year();
+        let prev = this_year - 1;
+        {
+            let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+            connection::ensure_schema(&conn, this_year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 11)",
+                [day_key_of_date(today)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 5)",
+                [day_key_of_date(today - chrono::Duration::days(200))],
+            )
+            .unwrap();
+        }
+        // 上一年变成一个不是 SQLite 的文件 ⇒ 这一年**答不上来**。它同时留在
+        // `available_years()` 里（打不开的文件保守地算"有数据"），所以宽窗口够得着它。
+        std::fs::write(paths::year_db_path(prev), b"not a sqlite file at all").unwrap();
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+
+        let (chart, goal) = daily_counts_windows(1, crate::stats::GOAL_LOOKBACK_DAYS);
+        assert_eq!(chart.series.len(), 1, "窄段就今天一格");
+        assert!(
+            chart
+                .unreadable
+                .iter()
+                .all(|g| !g.contains(&prev.to_string())),
+            "只画今天那一格的图，不许指控去年：{:?}",
+            chart.unreadable
+        );
+        // 反向腿：宽段确实够着去年，那句点名要留在它自己那份里（丢了就是上面那条恒真）
+        assert_eq!(
+            goal.series.len(),
+            crate::stats::GOAL_LOOKBACK_DAYS as usize,
+            "宽段还是 370 格，合并没把窗口自己改小"
+        );
+        assert!(
+            goal.unreadable
+                .iter()
+                .any(|g| g.contains(&prev.to_string())),
+            "去年那一年要在宽段点名，实得 {:?}",
+            goal.unreadable
+        );
     }
 
     /// 「这一年读不出来」与「这一年没数据」必须是两件事：前者要在 `unreadable` 里点名，
@@ -4481,8 +4717,13 @@ mod tests {
                 "{header} 又用 bool 那把尺子问表 —— 「问不出」会被折成「没有这张表」"
             );
             assert!(
-                body.contains("connection::table_presence(conn,"),
-                "{header} 必须问三态那把尺子"
+                body.contains("connection::table_presence_cached(conn,"),
+                "{header} 必须问三态那把尺子（读侧走带记忆的那一条）"
+            );
+            assert!(
+                !body.contains("connection::table_presence(conn,"),
+                "{header} 回到了不记忆的那一条 ⇒ 每拍为同一个库重复问同一张表\
+                 （现量：今日档 10 条、总计档 13 条全是这一问）"
             );
             assert!(
                 body.contains("Presence::Unreadable(why) => return YearRead::Unreadable(why)"),
@@ -4542,8 +4783,12 @@ mod tests {
                 "{header} 必须带走打开失败的原因"
             );
             assert!(
-                body.contains("connection::table_presence(conn,"),
-                "{header} 问表要走三态那把尺子，不是 bool"
+                body.contains("connection::table_presence_cached(conn,"),
+                "{header} 问表要走三态那把尺子（读侧走带记忆的那一条），不是 bool"
+            );
+            assert!(
+                !body.contains("connection::table_presence(conn,"),
+                "{header} 回到了不记忆的那一条 ⇒ 同一趟里为同一个库重复问同一张表"
             );
             assert!(
                 body.contains("Presence::Unreadable(why) => return YearRead::Unreadable(why)"),

@@ -429,7 +429,9 @@ pub fn load(period: i64) -> Snapshot {
     let pending = crate::collect::pending_today();
     // 按周期查：键鼠排行、应用时长、设备次数都跟同一把尺子。
     let stats = queries::stats_totals(days, None);
-    let all = queries::get_alltime_summary();
+    // 「最高单日」这一趟只问最大值：它交回的全历史总次数此前一个读者都没有
+    // （屏上那个「总计」念的是上面 `stats.total + pending`），每拍多算一条每库的 SUM。
+    let all = queries::get_alltime_max_day();
     // 三条时间切面（趋势 / 小时 / 星期）与三份导出里那栏"每日次数"共用 core 那把
     // `chart_window_days`：今日 1 天、总计按 30 天（与卡片那句「日均(近30天)」同一个分母），
     // 其余就是周期本身。`crates/cli/src/main.rs` 的周期参数也读这一把 —— 界面自写一个
@@ -437,7 +439,11 @@ pub fn load(period: i64) -> Snapshot {
     let chart_days = queries::chart_window_days(period);
     // 每日序列连日期一起交回：图上的刻度与导出里那一栏念的是同一串日期，
     // 不由调用方按下标往回推。
-    let daily_read = queries::daily_counts_totals(chart_days, None);
+    // 一趟查回**两段**：给图的这段（`chart_days`）与给打卡条的那段（`GOAL_LOOKBACK_DAYS`）。
+    // 旧形状各扫一遍 `daily_counts`，而宽的那段把窄的整个盖住 ⇒ 同一天问了两遍。
+    // 两段的"哪一年没读上"在 core 里按各自窗口的年份清单分头交回（`read_daily_pair`），
+    // 所以下面 `gaps` 接的是**窄的那一段**，不会把打卡条扫到的坏年份算在这张图头上。
+    let (daily_read, goal_read) = queries::daily_counts_windows(chart_days, GOAL_LOOKBACK_DAYS);
     let daily = daily_read.series;
     // 小时图同样问"带原因的那份读数"：读不全时要能点名是哪一年没答上来。
     let hourly_read = queries::hourly_window_totals(chart_days, None);
@@ -491,13 +497,14 @@ pub fn load(period: i64) -> Snapshot {
     apps.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
     apps.truncate(100);
 
-    // 每日目标与连续打卡：要扫近 370 天按日序列。
-    // ⚠ 这里原来写着"正式版按 60 秒节流，原型跟着 2 秒刷新一起算（探针库小，先不拆）"——
-    // 那半句推测已被现量推翻：在"他机器量级"的库上这一条查询是 **1.3ms**（`perf_probe`，
-    // 两份年度库各 365 天、150 键/天），不是成本中心，所以不节流。真正贵的是
-    // "总计"那一档的整批查询（一拍 50.8ms），那条由快照线程的可见性闸去管。
+    // 每日目标与连续打卡：要扫近 370 天按日序列 —— 这一趟**已经为图查过了**，
+    // 上面 `daily_counts_windows` 交回的就是它的宽段，这里只取那一段的行。
+    // ⚠ 宽段自己的"哪一年没读上"**不进**下面那个 `gaps`：面板是按域名把缺读分栏念的，
+    // 而「每日趋势」那一栏只画窄窗口那些天，把打卡条扫到的坏年份念进去就是指控错了人。
+    // 打卡条今天没有自己的缺读栏（`get_daily_counts` 那个二元组口子本来也交不回原因），
+    // 要不要给它接上是一句口径题，已登记待点。
     let goal_cfg = focusflow_core::config::instance().get_int("goal", "daily_keys", 20000);
-    let goal_rows = queries::get_daily_counts(GOAL_LOOKBACK_DAYS, None);
+    let goal_rows = goal_read.series;
     let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
     let goal = Some(goal_status(goal_cfg, &goal_rows, &today_str, 0));
 
@@ -507,12 +514,22 @@ pub fn load(period: i64) -> Snapshot {
         Some(n) => n,
         None => queries::get_today_count(None),
     };
-    // 今日前台时长：与下面应用排行同一个口径，只是窗口固定成 1 天（悬浮窗要的是"今天"）。
-    let today_app_seconds = queries::get_app_stats(Some(1), None).0;
+    // 今日前台时长：与上面应用排行同一个口径，只是窗口固定成 1 天（悬浮窗要的是"今天"）。
+    // 周期本来就是「今日」时两者是**同一个窗口**（`get_app_stats` 就是 `app_stats_totals`
+    // 的二元组包装，两个数本来同一把尺子），直接取上面那一趟的结果，不再为同一张
+    // `app_usage` 扫第二遍 —— 现量那一臂每拍自己占 3 条语句（`perf_probe`「每一臂自己几条语句」）。
+    // ⚠ 这条 dedup 只在"窗口恰好相等"时成立：`days` 是 7/15/30/总计 时，今日那一格
+    // 仍是独立的一问，不许顺手把它也省了（屏上「时长」会变成整个周期的秒数）。
+    let today_app_seconds = if days == Some(1) {
+        app_read.total
+    } else {
+        queries::get_app_stats(Some(1), None).0
+    };
 
     // 每一栏"这一轮有没有读全"合成一串，界面按域名分栏去念（该接哪几栏，
-    // `queries::PANEL_READ_DOMAINS` 里已经写好答案）。全历史汇总那几条的形状是
-    // 「年份: 原因」、不带域名 ⇒ 它只进页脚那一句总数，不对应屏上任何一栏。
+    // `queries::PANEL_READ_DOMAINS` 里已经写好答案）。全历史「最高单日」那几条的形状是
+    // 「年份: 原因」、不带域名 ⇒ 屏上按域名过滤的那几格接不到它（`main.rs::gap_years`
+    // 是按域名字样挑的），它只进导出里那句全句（`main.rs::gap_line` 念整串）。
     let mut gaps: Vec<String> = Vec::new();
     gaps.extend(stats.unreadable);
     gaps.extend(app_read.unreadable);
@@ -766,7 +783,10 @@ mod chart_window_tests {
             "复用上面那串已查得的每日序列（core 那份文档就是为这个留的口子）"
         );
         for needle in [
-            ["daily_counts_totals", "("].concat(),
+            // 每日序列现在是**一趟查两段**（图 + 打卡条），入口改名 `daily_counts_windows`：
+            // 旧的 `daily_counts_totals(chart_days)` 与 `get_daily_counts(370)` 两问合成一问，
+            // 宽的那段把窄的整个盖住，同一天不该问两遍（core 里 `read_daily_pair`）。
+            ["daily_counts_windows", "("].concat(),
             ["hourly_window_totals", "("].concat(),
             ["app_stats_totals", "("].concat(),
             ["device_totals", "("].concat(),
@@ -776,5 +796,35 @@ mod chart_window_tests {
                 "少了 {needle} 这一问：那一栏就说不出「这一轮有没有读全」"
             );
         }
+    }
+
+    /// 周期选「今日」时不许把同一张 `app_usage` 为同一个窗口扫两遍。
+    ///
+    /// 悬浮窗那一格要的是"今天的前台秒数"，排行那一屏要的是"本周期的秒数" —— 周期就是
+    /// 今日时这两个窗口**是同一个**，旧形状每拍各问一次（现量：多出来的那一臂每拍 3 条
+    /// 语句，`crates/core/tests/perf_probe.rs`「每一臂自己几条语句」）。
+    ///
+    /// ⚠ 这一刀的判据钉的是"这一问还待在它该待的分支里"，不钉快慢：整拍毫秒实测没降
+    /// （SQLite 的这几问本来就不是时间瓶颈），省下的是一趟重复读。
+    /// 而分支被摘掉的症状不是红、是**数字错** —— 悬浮窗会把整个周期的秒数当"今日"念，
+    /// 屏上没有任何东西会因此响一声。
+    #[test]
+    fn the_today_app_seconds_reuses_the_rank_read_when_the_window_is_the_same() {
+        let prod = prod();
+        let today_entry = ["get_app_stats", "(Some(1)"].concat();
+        assert_eq!(
+            prod.matches(today_entry.as_str()).count(),
+            1,
+            "今日那一问的入口只许一处；出现第二处就是又扫了一遍同一个窗口"
+        );
+        assert!(
+            prod.contains(
+                ["today_app_seconds = if days == Some(1)", " {"]
+                    .concat()
+                    .as_str()
+            ),
+            "「窗口相同就不另问」那道分支不见了 —— 剩下那一问会变成无条件重复扫。\
+             （另一半不用钉：`else` 那支要是被删，`today_app_seconds` 就没定义，编不过）"
+        );
     }
 }
