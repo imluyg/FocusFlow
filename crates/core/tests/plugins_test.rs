@@ -2356,4 +2356,30 @@ mod tests {
             "拒因要上屏，不能只进日志"
         );
     }
+
+    /// 「改一笔」这一支也接上拒因，并且宿主那头的接线形状要钉住。
+    ///
+    /// 面板与宿主是两条各自的回归面：宿主改成只回一个值时，面板收 `why` 会拿到 nil，
+    /// 于是屏上又只剩那句兜底 —— 所以这里同时钉宿主的调用形状。
+    #[test]
+    fn a_rejected_edit_reports_which_rule_rejected_it() {
+        let panel = include_str!("../plugins/accounting_plugin.lua");
+        assert!(
+            panel.contains(r"local ok, why = focusflow.accounting_update("),
+            "改那一笔得把宿主的第二个返回值（哪条规则拒的）收下来"
+        );
+        assert!(
+            panel.contains(r#"local reason = why ~= "" and why or "写入失败"#),
+            "只有宿主没说原因时才允许落到那句兜底"
+        );
+        assert!(
+            panel.contains(r#"list_msg = "没更新 #" .. tostring(editing_id) .. "：" .. reason"#),
+            "拒因要上屏，不能只进日志"
+        );
+        let host = include_str!("../src/plugins/host.rs");
+        assert!(
+            host.contains("accounting::update_expense_outcome(id, &e)"),
+            "宿主那层要走交出原因的函数，不是只要结论的 update_expense"
+        );
+    }
 }

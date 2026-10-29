@@ -526,21 +526,26 @@ pub fn add_expense_outcome(
     }
 }
 
-/// 更新记账记录。
-pub fn update_expense(id: i64, e: &Expense) -> bool {
+/// 更新记账记录，失败时交出**可直接显示的原因**。
+///
+/// 与 [`add_expense_outcome`] 同一口径：四个败法（库打不开／类型不在允许值／日期不可
+/// 识别／那句写没写成）加上「这一条已经不在了」各自一句话。原来这里只回 `bool`，
+/// 原因一律只进日志，而面板把五种情况念成同一句「没改成」——用户改的是日期里的一个
+/// 字，屏上却让他去查谁占着库。
+pub fn update_expense_outcome(id: i64, e: &Expense) -> Result<(), String> {
     let conn = match open() {
         Ok(c) => c,
         // 原先是 `Err(_) => return false`，一行日志都不留：面板显示"更新失败"，
         // 而到底是那句 UPDATE 没写成、还是库压根没打开，事后无从查证
-        Err(e) => {
-            tracing::error!("更新记账记录 #{id} 失败：记账库打不开: {e}");
-            return false;
+        Err(err) => {
+            tracing::error!("更新记账记录 #{id} 失败：记账库打不开: {err}");
+            return Err(format!("记账库打不开：{err}"));
         }
     };
     let rtype = e.rtype.trim();
     if !EXPENSE_TYPES.contains(&rtype) {
         tracing::warn!("记账类型「{rtype}」不在允许值里（支出/收入），#{id} 没改");
-        return false;
+        return Err(format!("记账类型「{rtype}」不在允许值里（支出/收入）"));
     }
     // 老库里一条日期没补零的记录，用户改个名字顺手就被修成补零形态（而不是被拒）；
     // 认不出来或空值才报错（空值被拒的理由见 `add_expense`）。
@@ -551,7 +556,10 @@ pub fn update_expense(id: i64, e: &Expense) -> bool {
                 "记账日期「{}」不是可识别的日期，#{id} 没改",
                 e.purchase_date
             );
-            return false;
+            return Err(format!(
+                "日期「{}」不是可识别的日期（要 2026-09-01 这种，或 20260901）",
+                e.purchase_date
+            ));
         }
     };
     // 三种结局分开：这一条本来就不在（别的窗口删过 / 传进来的 id 是旧的）与
@@ -572,18 +580,25 @@ pub fn update_expense(id: i64, e: &Expense) -> bool {
             id
         ],
     ) {
-        Ok(n) if n > 0 => true,
+        Ok(n) if n > 0 => Ok(()),
         Ok(_) => {
             tracing::warn!(
                 "更新记账记录 #{id}：这一条已经不在了（大概另一个窗口刚删掉），没有任何改动"
             );
-            false
+            Err(format!(
+                "记录 #{id} 已经不在了（大概另一个窗口刚删过），这次没有任何改动"
+            ))
         }
         Err(err) => {
             tracing::error!("更新记账记录 #{id} 没写成: {err}");
-            false
+            Err(format!("写入记账库失败：{err}"))
         }
     }
+}
+
+/// 只要"改成了没有"的那层包装（老调用方的形状不变）。
+pub fn update_expense(id: i64, e: &Expense) -> bool {
+    update_expense_outcome(id, e).is_ok()
 }
 
 /// 删除记账记录。
@@ -3077,6 +3092,64 @@ mod tests {
         assert_eq!(
             add_expense("转账", "午饭", None, "2026-09-05", 12.5, None, None, None),
             -1
+        );
+    }
+
+    /// 改一笔被拒时同样分得开：日期不认、类型不合法、那条已经不在了是三种下一步。
+    ///
+    /// 旧形状只回 `bool`，五种败法在面板上都念成「没更新 #id：写入失败（库被占用或记录
+    /// 已被删除）」——而最常见的一种是日期框里少打两个零，那句把人支去看一个根本不存在的
+    /// 库占用。与上面 `add` 那条同族，尺子也共用同一份措辞。
+    #[test]
+    fn a_rejected_update_names_which_rule_rejected_it() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_upd_reasons");
+        init_db().expect("建库失败");
+        let id = add_expense("支出", "午饭", None, "2026-09-05", 12.5, None, None, None);
+        assert!(id > 0, "夹具：先建一条");
+        let with = |date: &str, rtype: &str| Expense {
+            id,
+            rtype: rtype.to_string(),
+            item_name: "午饭".to_string(),
+            store: None,
+            purchase_date: date.to_string(),
+            amount: 12.5,
+            category: None,
+            subcategory: None,
+            delivery_date: None,
+            record_time: String::new(),
+            note: None,
+        };
+        assert!(
+            update_expense_outcome(id, &with("2026-09-06", "支出")).is_ok(),
+            "正常的一改该改得动"
+        );
+        let date_why = update_expense_outcome(id, &with("2026-13-01", "支出"))
+            .expect_err("不存在的日子不该写得进");
+        assert!(
+            date_why.contains("2026-13-01"),
+            "要原样念出那个值: {date_why}"
+        );
+        assert!(
+            !date_why.contains("打不开") && !date_why.contains("占用"),
+            "日期不认不该说库坏了: {date_why}"
+        );
+        let type_why = update_expense_outcome(id, &with("2026-09-06", "转账"))
+            .expect_err("类型不在允许值里要交回原因");
+        assert!(type_why.contains("转账"), "要点名是哪个类型: {type_why}");
+        let gone = update_expense_outcome(id + 999_999, &with("2026-09-06", "支出"))
+            .expect_err("那一行不在要单独说");
+        assert!(
+            gone.contains("不在了"),
+            "「这一条已经不在了」不许混进写入失败: {gone}"
+        );
+        // 三条说法互不相同（挡住「所有臂返回同一句」的修法）
+        assert_ne!(date_why, type_why, "日期与类型是两种改法: {date_why}");
+        assert_ne!(type_why, gone, "类型与「那条不在」是两种改法: {gone}");
+        // 对外那条 `update_expense` 的语义不变：失败还是 false（既有调用方照旧）
+        assert!(
+            !update_expense(id + 999_999, &with("2026-09-06", "支出")),
+            "老包装不许变成 true"
         );
     }
 

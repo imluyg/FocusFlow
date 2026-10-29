@@ -837,7 +837,13 @@ pub fn register_host_api(
                 record_time: String::new(),
                 note: if note.is_empty() { None } else { Some(note) },
             };
-            Ok(accounting::update_expense(id, &e))
+            // 与 `accounting_add` 同形状：第二个返回值是「哪条规则拒的」，空串才算改成
+            // 了。只回一个 bool 时面板把「日期不认」「类型不合法」「这条已经不在」
+            // 「库打不开」念成同一句，而第一种是用户自己改一个字就能好的。
+            Ok(match accounting::update_expense_outcome(id, &e) {
+                Ok(()) => (true, String::new()),
+                Err(why) => (false, why),
+            })
         },
     )?;
     host.set("accounting_update", acc_update)?;

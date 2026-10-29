@@ -287,7 +287,7 @@ function on_action(id)
             focusflow.log("请填写名称和有效金额")
             return
         end
-        local ok = focusflow.accounting_update(
+        local ok, why = focusflow.accounting_update(
             editing_id, draft.type, draft.item, draft.store,
             draft.date == "" and _today() or draft.date, amount,
             draft.category, draft.subcategory, draft.note
@@ -318,7 +318,13 @@ function on_action(id)
                     .. "（按当前筛选或日期排序，它已不在这一页，已回到第 1 页；找不到就用日期或关键词筛选）"
             end
         else
-            list_msg = "没更新 #" .. tostring(editing_id) .. "：写入失败（库被占用或记录已被删除）"
+            -- 宿主的第二个返回值说清是哪条规则拒的（日期不认／类型不合法／这条已经不
+            -- 在／库打不开）。以前四种念成同一句「写入失败（库被占用或记录已被删除）」，
+            -- 而最常见的一种是日期框里少打两个零 —— 那句提示把人支去看一个根本不存在的
+            -- 库占用。宿主没说原因（旧宿主／nil）时才退回那句。
+            local reason = why ~= "" and why or "写入失败（库被占用或记录已被删除）"
+            list_msg = "没更新 #" .. tostring(editing_id) .. "：" .. reason
+            focusflow.log("记账没更新 #" .. tostring(editing_id) .. "：" .. reason)
         end
     elseif id:match("^edit_") then
         local rid = tonumber(id:sub(6))
