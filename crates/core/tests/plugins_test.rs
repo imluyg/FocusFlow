@@ -2334,4 +2334,26 @@ mod tests {
         assert_eq!(pick(&kv, "近30天峰值"), "读不出来");
         drop(tmp);
     }
+
+    /// 随包那份记账面板要接住宿主交回的拒因，不再自己写死一句「库被占用」。
+    ///
+    /// 钉的是**随包副本**：`build_native.bat` 往包里抄的是 `crates/core/plugins/`，
+    /// 上面这些用例加载的也是这一份。仓库根另有一个同名的 `plugins/`，它不在 git 里、
+    /// 其中三份停在两周前 —— 改那一份等于改给一个永不上线的副本，屏上不会有任何变化。
+    #[test]
+    fn the_packaged_accounting_panel_shows_the_host_rejection_reason() {
+        let src = include_str!("../plugins/accounting_plugin.lua");
+        assert!(
+            src.contains(r"local new_id, why = focusflow.accounting_add("),
+            "保存那一笔得把宿主的第二个返回值（哪条规则拒的）收下来"
+        );
+        assert!(
+            src.contains(r#"local reason = why ~= "" and why or"#),
+            "只有宿主没说原因时才允许落到「库被占用」那句兜底"
+        );
+        assert!(
+            src.contains(r#"list_msg = "没保存：" .. reason .. "，没有生成记录""#),
+            "拒因要上屏，不能只进日志"
+        );
+    }
 }

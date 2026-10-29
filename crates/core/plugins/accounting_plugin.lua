@@ -250,7 +250,7 @@ function on_action(id)
             local nd = norm_date(draft.date)
             backdated = nd ~= nil and nd < _today()
         end
-        local new_id = focusflow.accounting_add(
+        local new_id, why = focusflow.accounting_add(
             draft.type, draft.item, draft.store, draft.date, amount,
             draft.category, draft.subcategory, draft.note
         )
@@ -270,7 +270,13 @@ function on_action(id)
                 list_msg = list_msg .. "（记在 " .. saved_date .. "，按日期排在后面页，用日期筛选能找到）"
             end
         else
-            list_msg = "没保存：记账库写入失败（库正被占用或打不开），没有生成记录"
+            -- 宿主的 `accounting_add` 现在把「哪条规则拒的」一起交回来（打不开库／
+            -- 类型不在允许值／日期不可识别／写入本身失败是四件事）。原先四个败法在
+            -- 这里都只显示同一句「库正被占用或打不开」，而当天最常见的一档其实是日期
+            -- 档位：用户照着提示去关占用他的库，改完再点一次还是同一句。
+            local reason = why ~= "" and why or "记账库写入失败（库正被占用或打不开）"
+            list_msg = "没保存：" .. reason .. "，没有生成记录"
+            focusflow.log("记账没保存：" .. reason)
         end
     elseif id == "save_edit" then
         if editing_id == nil then return end
