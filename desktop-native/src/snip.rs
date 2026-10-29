@@ -1106,6 +1106,38 @@ unsafe fn draw_arrow(hdc: HDC, x0: i32, y0: i32, x1: i32, y1: i32) {
     }
 }
 
+/// 标注字号 → `CreateFontW` 的高度参数：取**负**（字符高度 em），不取正（单元格高度）。
+///
+/// 同一个数字，正值那一边比负值小一成以上，而 `mark_bbox` 把 `font` 同时当行高和
+/// 一个全角字的步进用（全角 advance 恰为 1 em ⇒ 规格站在 em 这一侧）。旧写法里烤图走
+/// 负、就地输入框走正，于是"框里打的字"比"烤进图的那行"小一圈 —— 所见非所得。
+fn text_font_height(font: i32) -> i32 {
+    -font.max(1)
+}
+
+/// 标注文字那一笔的字体：烤图与就地输入框**两处共用这一份**（原来两边各写一遍
+/// 十八个参数的 `CreateFontW`，只有第一个参数不一样，就是这么写漏出来的）。
+unsafe fn mark_text_font(font: i32) -> windows::Win32::Graphics::Gdi::HFONT {
+    unsafe {
+        CreateFontW(
+            text_font_height(font),
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            DEFAULT_PITCH.0 as u32,
+            w!("Microsoft YaHei UI"),
+        )
+    }
+}
+
 /// 在 hdc 上画一笔（马赛克除外）。`ox/oy` 把选区本地坐标搬到目标原点。
 unsafe fn draw_shape(hdc: HDC, shape: &Shape, st: Style, ox: i32, oy: i32) {
     unsafe {
@@ -1133,22 +1165,7 @@ unsafe fn draw_shape(hdc: HDC, shape: &Shape, st: Style, ox: i32, oy: i32) {
                 // 纯色填充走像素路径（见 fill_block），这一支只负责描边以外的形状
             }
             Shape::Text(x, y, s) => {
-                let font = CreateFontW(
-                    -st.font.max(1),
-                    0,
-                    0,
-                    0,
-                    FW_NORMAL.0 as i32,
-                    0,
-                    0,
-                    0,
-                    DEFAULT_CHARSET,
-                    OUT_DEFAULT_PRECIS,
-                    CLIP_DEFAULT_PRECIS,
-                    CLEARTYPE_QUALITY,
-                    DEFAULT_PITCH.0 as u32,
-                    w!("Microsoft YaHei UI"),
-                );
+                let font = mark_text_font(st.font);
                 let oldf = SelectObject(hdc, font.into());
                 let _ = SetTextColor(hdc, COLORREF(st.rgb));
                 let _ = SetBkMode(hdc, TRANSPARENT);
@@ -2447,22 +2464,7 @@ unsafe fn open_text_edit(overlay: HWND, x: i32, y: i32) {
             None,
         );
         if let Ok(h) = created {
-            let f = CreateFontW(
-                font,
-                0,
-                0,
-                0,
-                FW_NORMAL.0 as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                DEFAULT_PITCH.0 as u32,
-                w!("Microsoft YaHei UI"),
-            );
+            let f = mark_text_font(font);
             SendMessageW(h, WM_SETFONT, Some(WPARAM(f.0 as usize)), Some(LPARAM(1)));
             let _ = SetWindowSubclass(h, Some(text_edit_proc), 7, 0);
             let _ = SetFocus(Some(h));
@@ -4724,6 +4726,45 @@ mod tests {
     /// 现量形状（旧写法）：`poke_pixels` 只挡 `dy < 0`、连图像高度都没收到，而
     /// `Drag::Pick` 走的 `move_mark` 加增量不夹界 ⇒ 下标落到 `w*h*4` 那块 DIB 之外，
     /// release(`panic = "abort"`) 里越界写一声不响。
+    /// 字号这把尺子只有一把：画出来的全角步进必须等于 `mark_bbox` 拿去当步进的那个数。
+    ///
+    /// 旧写法烤图用 `-font`（字符高 em）而就地输入框用 `font`（单元格高），同一个 30 差
+    /// 一成以上 ⇒ 框里写的字比落图的那行小一圈（所见非所得）。这条直接问 GDI。
+    #[test]
+    fn the_mark_text_font_measures_the_way_the_hit_box_measures() {
+        unsafe {
+            let hdc = GetDC(None);
+            let f = mark_text_font(30);
+            let old = SelectObject(hdc, f.into());
+            let _ = SetBkMode(hdc, TRANSPARENT);
+            let wide: Vec<u16> = "中中中".encode_utf16().collect();
+            let mut sz = SIZE { cx: 0, cy: 0 };
+            let _ = GetTextExtentPoint32W(hdc, &wide, &mut sz);
+            SelectObject(hdc, old);
+            let _ = DeleteObject(f.into());
+            ReleaseDC(None, hdc);
+            assert!(sz.cx > 0, "字体没造出来就别判了");
+            assert!(
+                (sz.cx - 3 * 30).abs() <= 6,
+                "命中框按每字 30 算步进，画出来三个全角字宽 {} —— 字号与命中框不同一把尺子",
+                sz.cx
+            );
+            assert!(
+                sz.cy >= 30,
+                "em=30 的行高不该小于 30（只有正值那侧才正好等于 30）：{}",
+                sz.cy
+            );
+        }
+    }
+
+    /// 符号约定本身（上面那条 GDI 判据的形状前提）。
+    #[test]
+    fn the_mark_text_height_is_signed_as_em() {
+        assert_eq!(text_font_height(30), -30);
+        assert_eq!(text_font_height(0), -1, "0 号不许原样交给 CreateFontW");
+        assert_eq!(text_font_height(-8), -1, "负数同样兜住");
+    }
+
     #[test]
     fn a_mark_dragged_out_of_the_image_writes_nothing() {
         let img = vec![10u8; 4 * 4 * 4];
