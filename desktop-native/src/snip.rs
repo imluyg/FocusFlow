@@ -852,9 +852,32 @@ pub fn shape_from_drag(
 
 /// 把一块 BGRA 写进 DIB 段的内存：越出图像的部分丢掉，绝不许写花相邻的行。
 /// `bytes` 的长度必须是 w*h*4（`mosaic_block` 与 `fill_block` 都按这个承诺返回）。
+/// 烤图那块缓冲的尺寸：宽与高**成对**传。
+///
+/// 为什么不拆成两个平行参数：`poke_pixels` 的旧签名里只有 `img_w`，图像高度根本没进来，
+/// 于是"图外不落笔"只判得到左、右、上三边。成对传之后，漏掉高度这一件事在签名上就不成立。
+#[derive(Clone, Copy)]
+struct DibSize {
+    w: i32,
+    h: i32,
+}
+
+/// 目标像素在那块缓冲里的字节下标：**四个边都判**，越出图像就不落笔。
+///
+/// 为什么要单独有这一层：旧写法只挡 `dy < 0`，所以把「色块 / 马赛克」那一笔往选区底边
+/// 外面一拖，算出来的下标就落到 `w*h*4` 那块 DIB 之外。拖角那条（`Drag::Endpoint`）把
+/// 局部坐标夹进 `[0, 宽高]`，而 `Drag::Pick` 走的 `move_mark` 只加增量、不夹界 ⇒ 拖得出
+/// 界是真的会发生。release 是 `panic = "abort"`，越界写连一句报错都不会留在屏上。
+fn poke_dst_index(size: DibSize, x: i32, y: i32) -> Option<usize> {
+    if x < 0 || y < 0 || x >= size.w || y >= size.h {
+        return None;
+    }
+    Some((y as usize * size.w as usize + x as usize) * 4)
+}
+
 unsafe fn poke_pixels(
     pv: *mut core::ffi::c_void,
-    img_w: i32,
+    size: DibSize,
     x: i32,
     y: i32,
     w: i32,
@@ -865,19 +888,15 @@ unsafe fn poke_pixels(
         let dst = pv as *mut u8;
         for row in 0..h.max(0) {
             let dy = y + row;
-            if dy < 0 {
-                continue;
-            }
             for col in 0..w.max(0) {
                 let dx = x + col;
-                if dx < 0 || dx >= img_w {
+                let Some(di) = poke_dst_index(size, dx, dy) else {
                     continue;
-                }
+                };
                 let si = ((row * w.max(0)) + col) as usize * 4;
                 if si + 3 >= bytes.len() {
                     continue;
                 }
-                let di = (dy as usize * img_w as usize + dx as usize) * 4;
                 std::ptr::copy_nonoverlapping(bytes.as_ptr().add(si), dst.add(di), 4);
             }
         }
@@ -1182,10 +1201,18 @@ pub fn render_marks(img: &[u8], w: i32, h: i32, marks: &[Mark]) -> Vec<u8> {
             match &m.shape {
                 Shape::Mosaic(x, y, mw, mh) => {
                     let block = mosaic_block(img, w, h, *x, *y, *mw, *mh, MOSAIC_CELL);
-                    poke_pixels(pv, w, *x, *y, *mw, *mh, &block);
+                    poke_pixels(pv, DibSize { w, h }, *x, *y, *mw, *mh, &block);
                 }
                 Shape::Block(x, y, mw, mh) => {
-                    poke_pixels(pv, w, *x, *y, *mw, *mh, &fill_block(*mw, *mh, m.style.rgb));
+                    poke_pixels(
+                        pv,
+                        DibSize { w, h },
+                        *x,
+                        *y,
+                        *mw,
+                        *mh,
+                        &fill_block(*mw, *mh, m.style.rgb),
+                    );
                 }
                 other => draw_shape(mem, other, m.style, 0, 0),
             }
@@ -4689,6 +4716,74 @@ mod tests {
         // 快速版（没画任何东西）必须与原图逐字节相同：这条挡住"烤图顺手改了没标注的图"
         let img: Vec<u8> = (0..4 * 4 * 4).map(|i| i as u8).collect();
         assert_eq!(render_marks(&img, 4, 4, &[]), img);
+    }
+
+    /// 图外不落笔：那一笔被拖出选区边界以外时，烤图一个字节都不许写；跨出边界的另一半
+    /// 照旧只盖它压到的那些像素。
+    ///
+    /// 现量形状（旧写法）：`poke_pixels` 只挡 `dy < 0`、连图像高度都没收到，而
+    /// `Drag::Pick` 走的 `move_mark` 加增量不夹界 ⇒ 下标落到 `w*h*4` 那块 DIB 之外，
+    /// release(`panic = "abort"`) 里越界写一声不响。
+    #[test]
+    fn a_mark_dragged_out_of_the_image_writes_nothing() {
+        let img = vec![10u8; 4 * 4 * 4];
+        let red = rgb(255, 45, 45);
+        let block = |x: i32, y: i32, bw: i32, bh: i32| {
+            vec![Mark {
+                shape: Shape::Block(x, y, bw, bh),
+                style: Style {
+                    rgb: red,
+                    w: 3,
+                    font: 30,
+                },
+            }]
+        };
+        // 整块在底边之外（图只有 4 行，块从第 4 行开始）
+        assert_eq!(
+            render_marks(&img, 4, 4, &block(1, 4, 2, 2)),
+            img,
+            "拖出底边那一笔不该改任何像素"
+        );
+        // 整块在右边之外
+        assert_eq!(render_marks(&img, 4, 4, &block(4, 1, 2, 2)), img);
+        // 整块在上方之外（旧写法这一支本来就被 `dy < 0` 挡住了）
+        assert_eq!(render_marks(&img, 4, 4, &block(1, -3, 2, 2)), img);
+
+        // 跨出底边的那一块：图内那行照写，图外那行照不写
+        let out = render_marks(&img, 4, 4, &block(1, 3, 2, 2));
+        let at = |x: i32, y: i32| {
+            let i = ((y * 4 + x) as usize) * 4;
+            [out[i], out[i + 1], out[i + 2]]
+        };
+        let want = [
+            ((red >> 16) & 0xFF) as u8,
+            ((red >> 8) & 0xFF) as u8,
+            (red & 0xFF) as u8,
+        ];
+        assert_eq!(at(1, 3), want, "图内那一行要照写");
+        assert_eq!(at(1, 2), [10, 10, 10], "块没压到的像素不许动");
+
+        // 下标函数自己：四条边各有答案
+        assert_eq!(
+            poke_dst_index(DibSize { w: 4, h: 4 }, 3, 3),
+            Some((3 * 4 + 3) * 4)
+        );
+        assert_eq!(poke_dst_index(DibSize { w: 4, h: 4 }, 4, 0), None, "右边外");
+        assert_eq!(
+            poke_dst_index(DibSize { w: 4, h: 4 }, 0, 4),
+            None,
+            "底边外（旧写法在这里回一个图外的下标）"
+        );
+        assert_eq!(
+            poke_dst_index(DibSize { w: 4, h: 4 }, -1, 0),
+            None,
+            "左边外"
+        );
+        assert_eq!(
+            poke_dst_index(DibSize { w: 4, h: 4 }, 0, -1),
+            None,
+            "上边外"
+        );
     }
 
     #[test]
