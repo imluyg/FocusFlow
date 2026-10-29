@@ -22,8 +22,8 @@ use windows::Win32::Graphics::Gdi::{
     CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, ExtCreatePen, GetClipBox,
     GetDC, GetStockObject, GetTextExtentPoint32W, InvalidateRect, LineTo, MoveToEx, Rectangle,
     ReleaseDC, SelectClipRgn, SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, TextOutW,
-    UpdateWindow, BITMAPINFO, BS_SOLID, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DIB_RGB_COLORS, FW_NORMAL, HBITMAP, HDC, HGDIOBJ, HPEN, LOGBRUSH, NULL_BRUSH,
+    BITMAPINFO, BS_SOLID, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
+    DIB_RGB_COLORS, FW_NORMAL, HBITMAP, HDC, HGDIOBJ, HPEN, LOGBRUSH, NULL_BRUSH,
     OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID,
     SRCCOPY, TRANSPARENT,
 };
@@ -5412,18 +5412,21 @@ mod tests {
 
     /// 特征判据：**隐藏态预画在本机落不到窗口表面上**，所以别用「先画满、再出现」这套做法。
     ///
-    /// 为什么会留这条：我一度以为覆盖层与贴图窗出现时"黑一下"可以用"隐藏时先 `InvalidateRect
-    /// + UpdateWindow` 画满、再 `ShowWindow`"消掉。实测建一扇 40x30 的隐藏窗、WM_PAINT 里涂满
-    /// 纯红、预画之后从窗口 DC 读回中心那一格 —— 读回来的**不是**那抹红（本机是黑的），
-    /// 说明这次绘制没落在人将会看见的那块表面上 ⇒ 预画是空转，两处调用已退回。
-    /// 真正管用的是**顺序**：状态填齐了再 `ShowWindow`，让第一帧就是完整的那一份
-    ///（这条由 `overlay_is_created_hidden_and_populated_first` 钉住）。
-    /// 哪天 Windows 改了行为、这一格真读回红了，这条会红 ⇒ 那时"预画"才值得重新考虑。
+    /// 为什么会留这条：我一度以为覆盖层与贴图窗出现时"黑一下"可以先消掉 —— 隐藏时先
+    /// `InvalidateRect` 再 `UpdateWindow` 画满、之后才 `ShowWindow`。实测建一扇 40x30 的
+    /// 隐藏窗，WM_PAINT 里涂满纯红，预画之后从窗口 DC 读回中心那一格，读回来的**不是**那抹红
+    ///（本机是黑的），说明这次绘制没落在人将会看见的那块表面上，预画是空转，那两处调用已退回。
+    ///
+    /// 真正管用的是顺序：状态填齐了再 ShowWindow，让第一帧就是完整的那一份。
+    /// 这一条由 `overlay_is_created_hidden_and_populated_first` 钉住。
+    ///
+    /// 哪天 Windows 改了行为、这一格真读回红了，这条会红，那时"预画"才值得重新考虑。
     #[test]
     fn painting_a_hidden_window_does_not_fill_the_surface_seen_when_shown() {
         unsafe {
             use windows::Win32::Graphics::Gdi::{
                 CreateCompatibleBitmap, CreateCompatibleDC, GetDIBits, SelectObject as SelObj,
+                UpdateWindow,
             };
             unsafe extern "system" fn proc(
                 h: HWND,
