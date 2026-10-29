@@ -2383,20 +2383,36 @@ impl App {
     /// 开/关采集。开是立即生效的；关的未来是「现在停止计数 + 下次启动不再初始化」——
     /// 写线程/应用采样/设备侧信道是 `Database::init` 起的一次性线程，core 没有对外停止接口
     /// （而且本轮不动 core），所以彻底退出要重启。
+    ///
+    /// ⚠ 「关掉再打开」以前在同一场里根本回不来：分支判的是 `is_started()`，而
+    /// `stop_listening` 不清那个槽 ⇒ 每点一次都只走停用分支。现在按三态走
+    /// （`collect::collector_toggle_action`），回来那一条只解暂停、不再起第二个钩子。
     fn toggle_collector(&mut self, hwnd: HWND) {
         let cfg = focusflow_core::config::instance();
-        let msg = if collect::is_started() {
-            let _ = cfg.set("collector", "enabled", "false");
-            collect::stop_listening();
-            "采集已停用：键鼠与设备计数已停，重启后彻底退出".to_string()
-        } else {
-            match collect::start(cfg) {
+        const ON_MSG: &str = "采集已启用：开始记录键鼠（全局，仅本机）";
+        let msg = match collect::collector_toggle_action(
+            collect::is_listening(),
+            collect::is_started(),
+        ) {
+            collect::CollectorAction::Stop => {
+                let _ = cfg.set("collector", "enabled", "false");
+                collect::stop_listening();
+                "采集已停用：键鼠与设备计数已停，重启后彻底退出".to_string()
+            }
+            collect::CollectorAction::StartFresh => match collect::start(cfg) {
                 Ok(()) => {
                     let _ = cfg.set("collector", "enabled", "true");
-                    "采集已启用：开始记录键鼠（全局，仅本机）".to_string()
+                    ON_MSG.to_string()
                 }
                 Err(e) => format!("采集没起来：{e}"),
-            }
+            },
+            collect::CollectorAction::Resume => match collect::resume_listening() {
+                Ok(()) => {
+                    let _ = cfg.set("collector", "enabled", "true");
+                    ON_MSG.to_string()
+                }
+                Err(e) => format!("采集没起来：{e}"),
+            },
         };
         // 暂停勾选项要跟着新状态走（托盘与设置页共用同一份运行时）。
         self.sync_pause_item();

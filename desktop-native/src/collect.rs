@@ -19,7 +19,7 @@
 //! 而它拿不到 `App`。这里的内容一次进程只初始化一次，静态是最小共享面。
 
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use focusflow_core::config::FocusFlowConfig;
@@ -31,6 +31,11 @@ struct Runtime {
     db: Arc<Database>,
     listener: Arc<InputListener>,
     paused: PauseFlag,
+    /// 这一场里采集还开着吗。`stop_listening` 置 false、`resume_listening` 置回 true。
+    /// 与 [`is_started`] 不是一回事：那个槽不会被清空（写线程与应用采样是
+    /// `Database::init` 起的一次性线程，core 没有对外停止接口），所以关掉之后
+    /// `is_started()` 一直是 true —— 拿它判"要不要开"就成了单向开关。
+    listening: AtomicBool,
 }
 
 static RUNTIME: OnceLock<Mutex<Option<Runtime>>> = OnceLock::new();
@@ -87,6 +92,54 @@ pub fn enabled_in_config(cfg: &FocusFlowConfig) -> bool {
 /// 采集真的起来了没有（配置说开 ≠ 起来了：起失败时这里是 false）。
 pub fn is_started() -> bool {
     slot().lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
+/// 采集现在**在计**吗（起来过、且没被「关采集」停掉）。
+pub fn is_listening() -> bool {
+    slot()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|r| r.listening.load(Ordering::SeqCst)))
+        .unwrap_or(false)
+}
+
+/// 开关那一下该走哪条路（纯判据，便于把"关过一次就再也开不回来"钉住）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CollectorAction {
+    /// 正在计 ⇒ 停
+    Stop,
+    /// 从没起来过 ⇒ 整条链起一次
+    StartFresh,
+    /// 起来过但被关掉 ⇒ 只解暂停（见 [`resume_listening`]：不能再起一个监听线程）
+    Resume,
+}
+
+pub fn collector_toggle_action(listening: bool, started: bool) -> CollectorAction {
+    match (listening, started) {
+        (true, _) => CollectorAction::Stop,
+        (false, false) => CollectorAction::StartFresh,
+        (false, true) => CollectorAction::Resume,
+    }
+}
+
+/// 把关掉的采集重新开起来：**只解暂停，绝不再起一个监听线程**。
+///
+/// 为什么不走 `listener.start()`：`stop()` 只是把 `alive` 置 false，而 rdev 那个线程还挂在
+/// 钩子消息泵里（本仓记着"rdev 钩子没有 Unhook 的口子"这条账）—— 回调其实照旧在跑。
+/// 这时候再 start 就是**第二个钩子**，而 `alive` 与 `PauseFlag` 都是共享的那一枚 ⇒
+/// 每次按键被记两遍。计数的闸只有一枚（`PauseFlag`），所以回来走的也是这一枚。
+pub fn resume_listening() -> Result<(), String> {
+    let guard = slot().lock();
+    let Ok(g) = guard else {
+        return Err("采集状态锁被别处占住，这一拍没恢复成".to_string());
+    };
+    let Some(rt) = g.as_ref() else {
+        return Err("采集从没起来过，这条不该走".to_string());
+    };
+    rt.listener.set_paused(false);
+    rt.listening.store(true, Ordering::SeqCst);
+    crate::tracing_note("采集已恢复：键鼠与设备计数重新开跑（没有重开监听线程，所以不会双记）");
+    Ok(())
 }
 
 pub fn is_paused() -> bool {
@@ -223,6 +276,7 @@ pub fn start(cfg: &'static FocusFlowConfig) -> Result<(), String> {
             db,
             listener,
             paused,
+            listening: AtomicBool::new(true),
         });
     }
     crate::tracing_note("采集已启动（键鼠监听 + 写线程 + 应用采样 + 设备侧信道）");
@@ -273,6 +327,7 @@ pub fn stop_listening() {
     let Some(rt) = g.as_ref() else { return };
     rt.listener.stop();
     rt.listener.set_paused(true);
+    rt.listening.store(false, Ordering::SeqCst);
     if let Ok(mut q) = KEY_TICKS.lock() {
         q.clear();
     }
@@ -345,6 +400,76 @@ fn legacy_collector_running() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 三态开关：「起来过但被关掉」那一态必须走"再打开"，不许再说一遍"已停用"。
+    ///
+    /// 旧形状：分支判的是 `is_started()`，而 `stop_listening` 不清那个槽 ⇒ 关过一次之后
+    /// 每次点击都走停用分支，这一场里再也开不回来（只能重启）。
+    #[test]
+    fn a_stopped_collector_toggles_back_on_instead_of_off_again() {
+        assert_eq!(
+            collector_toggle_action(false, false),
+            CollectorAction::StartFresh
+        );
+        assert_eq!(collector_toggle_action(true, true), CollectorAction::Stop);
+        assert_eq!(
+            collector_toggle_action(false, true),
+            CollectorAction::Resume,
+            "关过一次的采集要能再打开，而不是原地再说一遍已停用"
+        );
+        // 不该出现的组合也得有答案，别一路 fallthrough 到停用
+        assert_eq!(collector_toggle_action(true, false), CollectorAction::Stop);
+    }
+
+    /// 接线守卫：「再打开」那一条**绝不再起一个监听线程** —— rdev 的钩子没有 Unhook 的口子，
+    /// 老线程还挂在消息泵里，再 start 就是第二个钩子，而 `alive` 与 `PauseFlag` 是共享的 ⇒
+    /// 每次按键被记两遍。回来走的门只有暂停那一枚。
+    #[test]
+    fn resuming_never_starts_a_second_listener() {
+        let src = include_str!("collect.rs");
+        // 先摘注释行再比：本文件的文档里就写着「不走 `listener.start()`」这类反例，
+        // 不摘干净的话守卫会被自己的说明文字命中（这仓里为这一条栽过两次）。
+        let flat = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let at = src
+            .find("fn resume_listening")
+            .expect("resume_listening 不见了");
+        // 段边界用「下一个函数」切，不拿字节窗口：`&src[a..a+1400]` 会切进中文字符里，
+        // 直接 panic（本文件通篇是中文注释）。
+        let seg = |from: usize| -> String {
+            let rest = &src[from..];
+            let cut = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+                .iter()
+                .filter_map(|p| rest.find(p))
+                .min()
+                .unwrap_or(rest.len());
+            flat(&rest[..cut])
+        };
+        let body = seg(at);
+        assert!(
+            !body.contains("listener.start("),
+            "恢复那条路又去起监听线程了：那是第二个钩子，会双记"
+        );
+        assert!(
+            body.contains("rt.listener.set_paused(false)"),
+            "恢复那条路没解暂停，等于什么都没做"
+        );
+        let stop_at = src
+            .find("pub fn stop_listening")
+            .expect("stop_listening 不见了");
+        let stop = seg(stop_at);
+        assert!(
+            stop.contains("listening.store(false,"),
+            "关掉采集没翻状态位，开关就还是单向的"
+        );
+    }
 
     #[test]
     fn the_sliding_window_drops_ticks_older_than_a_minute() {
