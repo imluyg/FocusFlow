@@ -452,9 +452,14 @@ pub fn dim_bgra(src: &[u8]) -> Vec<u8> {
 
 /// 把 src 里 (x,y,w,h) 这一块按**绝对**格网做格子平均，返回 w*h*4 的 BGRA（越界填 0）。
 ///
-/// 格子锚在图像原点而不是这一块的左上角：两块马赛克挨着时缝不能错位，
-/// 而"块起点不整格"是唯一能测出锚点的形状。
-#[allow(clippy::too_many_arguments)] // 源图 + 源尺寸 + 矩形 + 格宽：拆开传反而要在调用点各抄一遍
+/// 格子锚在**保存下来的那张图**的原点，而不是这一块的左上角：两块马赛克挨着时缝不能
+/// 错位，而"块起点不整格"是唯一能测出锚点的形状。
+///
+/// `anchor` 就是那张图的原点在 `src` 坐标系里的位置：烤图时 `src` 本身就是那张图 ⇒
+/// `(0, 0)`；预览时 `src` 是整屏的冻结图 ⇒ 是选区的左上角。原来这一维根本没进参数，
+/// 预览的格网于是锚在屏幕上、文件里的锚在选区上，选区起点不整格时两处把像素分成
+/// 不同的组 ⇒ 屏幕上看到的马赛克不是存下来的那个（所见非所得）。
+#[allow(clippy::too_many_arguments)] // 源图 + 源尺寸 + 矩形 + 格宽 + 锚点：拆开传反而要在调用点各抄一遍
 pub fn mosaic_block(
     src: &[u8],
     src_w: i32,
@@ -464,14 +469,15 @@ pub fn mosaic_block(
     w: i32,
     h: i32,
     cell: i32,
+    anchor: (i32, i32),
 ) -> Vec<u8> {
     let mut out = vec![0u8; (w.max(0) as usize) * (h.max(0) as usize) * 4];
     if w <= 0 || h <= 0 || cell <= 0 || src_w <= 0 || src_h <= 0 || out.is_empty() {
         return out;
     }
-    let mut cy = (y.max(0) / cell) * cell;
+    let mut cy = anchor.1 + ((y.max(0) - anchor.1).div_euclid(cell) * cell);
     while cy < y + h {
-        let mut cx = (x.max(0) / cell) * cell;
+        let mut cx = anchor.0 + ((x.max(0) - anchor.0).div_euclid(cell) * cell);
         while cx < x + w {
             let (gx0, gy0) = (cx.max(x).max(0), cy.max(y).max(0));
             let (gx1, gy1) = (
@@ -1051,6 +1057,7 @@ unsafe fn draw_live(
                     *mw,
                     *mh,
                     MOSAIC_CELL,
+                    (rc.0, rc.1),
                 );
                 blit_bgra(hdc, &block, *mw, *mh, rc.0 + *x, rc.1 + *y);
             }
@@ -1217,7 +1224,7 @@ pub fn render_marks(img: &[u8], w: i32, h: i32, marks: &[Mark]) -> Vec<u8> {
         for m in marks {
             match &m.shape {
                 Shape::Mosaic(x, y, mw, mh) => {
-                    let block = mosaic_block(img, w, h, *x, *y, *mw, *mh, MOSAIC_CELL);
+                    let block = mosaic_block(img, w, h, *x, *y, *mw, *mh, MOSAIC_CELL, (0, 0));
                     poke_pixels(pv, DibSize { w, h }, *x, *y, *mw, *mh, &block);
                 }
                 Shape::Block(x, y, mw, mh) => {
@@ -4481,7 +4488,7 @@ mod tests {
     fn mosaic_averages_each_cell_over_the_whole_cell() {
         // 4x1 图，两格（cell=2）：第一格 (0,1)=(10,30)、第二格 (50,70)
         let src: Vec<u8> = vec![10, 10, 10, 0, 30, 30, 30, 0, 50, 50, 50, 0, 70, 70, 70, 0];
-        let out = mosaic_block(&src, 4, 1, 0, 0, 4, 1, 2);
+        let out = mosaic_block(&src, 4, 1, 0, 0, 4, 1, 2, (0, 0));
         assert_eq!(&out[0..4], &[20, 20, 20, 255]);
         assert_eq!(&out[0..4], &out[4..8]);
         assert_eq!(&out[8..12], &[60, 60, 60, 255]);
@@ -4494,15 +4501,64 @@ mod tests {
         // 块里第一列只摊到图上的 x=1（值 30），第二列只摊到 x=2（值 50）。
         // 若格子改成"从块头重新数"，第一列会变成 (30+50)/2=40 —— 两块的接缝就会对不齐。
         let src: Vec<u8> = vec![10, 10, 10, 0, 30, 30, 30, 0, 50, 50, 50, 0, 70, 70, 70, 0];
-        let out = mosaic_block(&src, 4, 1, 1, 0, 2, 1, 2);
+        let out = mosaic_block(&src, 4, 1, 1, 0, 2, 1, 2, (0, 0));
         assert_eq!(&out[0..4], &[30, 30, 30, 255]);
         assert_eq!(&out[4..8], &[50, 50, 50, 255]);
+    }
+
+    /// 预览与落盘必须是同一份马赛克：格网只认「保存下来那张图」的原点。
+    ///
+    /// 现量形状（旧写法）：预览把整屏冻结图当源，格网于是锚在屏幕上，而文件里锚在选区上。
+    /// 选区起点 (4,3) 在 cell=3 下不整格 ⇒ 两处把同一批像素分成不同的组，屏幕上看到的
+    /// 马赛克不是存下来那个（打码这种"要看清遮住了什么"的动作尤其吃这一条）。
+    #[test]
+    fn the_preview_mosaic_and_the_baked_mosaic_are_the_same_pixels() {
+        let (bw, bh, cell) = (10, 10, 3);
+        let base: Vec<u8> = (0..(bw * bh))
+            .flat_map(|v| [v as u8, v as u8, v as u8, 255])
+            .collect();
+        // 选区左上角就是「保存下来那张图」的原点
+        let (sl, st, sw, sh) = (4, 3, 6, 6);
+        let crop = crop_rect(&base, bw, sl, st, sw, sh).expect("裁出选区");
+        let baked = mosaic_block(&crop, sw, sh, 0, 0, sw, sh, cell, (0, 0));
+        let previewed = mosaic_block(&base, bw, bh, sl, st, sw, sh, cell, (sl, st));
+        assert_eq!(
+            previewed, baked,
+            "选区起点不整格时预览与文件分组不同 ⇒ 所见非所得"
+        );
+        // 夹具前提：这个形状要分辨得出锚点（拿屏幕原点当锚必须给出一份不同的图）
+        let anchored_to_screen = mosaic_block(&base, bw, bh, sl, st, sw, sh, cell, (0, 0));
+        assert_ne!(
+            anchored_to_screen, baked,
+            "夹具无区分性：换锚点也看不出差别，那条相等断言就成了恒绿"
+        );
+    }
+
+    /// 接线守卫：上面那条只证明 `mosaic_block` 认锚，这一条证明**两个调用点各交了什么锚**：
+    #[test]
+    fn both_mosaic_paths_pass_their_own_image_origin() {
+        // 预览交选区左上角（它的源是整屏），烤图交自己的原点（它的源就是那张图）。
+        // 判据按"调用形态"比，不比函数名；先把空白归一化，fmt 怎么重排都顶得住。
+        let src = include_str!("snip.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            flat.matches("=mosaic_block(").count(),
+            2,
+            "生产段该有且只有两处马赛克调用，实际 {} —— 新调用点没被这条钉住",
+            flat.matches("=mosaic_block(").count()
+        );
+        let preview =
+            "mosaic_block(base,base_w,base_h,rc.0+*x,rc.1+*y,*mw,*mh,MOSAIC_CELL,(rc.0,rc.1)";
+        let baked = "mosaic_block(img,w,h,*x,*y,*mw,*mh,MOSAIC_CELL,(0,0)";
+        assert!(flat.contains(preview), "预览那处不再把锚点交回选区左上角");
+        assert!(flat.contains(baked), "烤图那处不再把源图自己的原点当锚点");
     }
 
     #[test]
     fn mosaic_clamps_to_the_image_and_fills_the_rest_with_zero() {
         let src: Vec<u8> = vec![10, 10, 10, 0, 30, 30, 30, 0];
-        let out = mosaic_block(&src, 2, 1, 1, 0, 3, 1, 2);
+        let out = mosaic_block(&src, 2, 1, 1, 0, 3, 1, 2, (0, 0));
         // 块里第一列还在图里（取到 x=1），后两列图里根本没有 => 留 0，不许拿越界字节平均
         assert_eq!(&out[0..4], &[30, 30, 30, 255]);
         assert_eq!(&out[4..8], &[0, 0, 0, 0]);
