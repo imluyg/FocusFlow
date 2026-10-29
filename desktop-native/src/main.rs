@@ -2440,8 +2440,10 @@ impl App {
         // 第一次进来先把「启用中的插件」真的加载一遍：只有加载才会产出错误。
         if !self.plugins_loaded {
             if let Some(pm) = self.pm.as_mut() {
-                pm.load_all();
-                self.plugins_loaded = true;
+                // 闩只认「这一轮清单真的拿到了」：`load_all` 在目录读不动时一个插件都没试，
+                // 那时抬起闩等于把整个会话的加载机会一起关掉 —— 之后每次进页只重扫清单，
+                // 行上写着「已启用，尚未加载」而不说原因，唯一出路是把每个插件关一下再开。
+                self.plugins_loaded = pm.load_all();
             }
         }
         let Some(pm) = self.pm.as_ref() else { return };

@@ -892,13 +892,19 @@ impl PluginManager {
     /// 目录读不出来时必须出声并直接收手：这里过去吃的是一个被折成空的 `discover()`，
     /// 于是"5 个插件一个都没加载"与"本来就没装插件"在启动路径上是同一段安静 ——
     /// 插件页要等用户点开才发现全是空的，而那一刻目录可能早已能读了。
-    pub fn load_all(&mut self) {
+    /// 扫一遍插件目录，把没加载过的都试一遍。
+    ///
+    /// 返回值是「这一轮清单到底拿到没有」：`false` = `discover()` 失败，一个插件都没试。
+    /// 调用方那个「已经加载过一遍」的闩只许在 `true` 时抬起 —— 一次读不动（杀软首扫、
+    /// 网盘同步、构建脚本换目录）不该把整个会话的加载机会一起关掉：闩抬了之后
+    /// 再进插件页也只是重扫清单，屏上永远是「已启用，尚未加载」，而那一刻目录早读得出来了。
+    pub fn load_all(&mut self) -> bool {
         let disabled = self.disabled_list();
         let files = match self.discover() {
             Ok(files) => files,
             Err(e) => {
                 tracing::error!("{e}：本次一个插件也不加载");
-                return;
+                return false;
             }
         };
         for path in files {
@@ -917,6 +923,7 @@ impl PluginManager {
             }
             let _ = self.try_load(&path);
         }
+        true
     }
 
     /// 获取插件列表。
@@ -2559,6 +2566,57 @@ end
         assert!(
             !logs.iter().any(|l| l.contains("不加载")),
             "读得动就别喊，否则每启动一次都假警: {logs:?}"
+        );
+    }
+
+    /// 同一份现场量第二样东西：`load_all` 的**返回值**。桌面端那个「已经加载过一遍」的闩
+    /// 现在只由它决定 —— 读不动 ⇒ `false`（闩不抬，下次进页再试一次）。
+    ///
+    /// 与上一条分开写：那条盯的是"有没有出声"，这条盯的是"调用方能不能知道该不该重试"。
+    #[test]
+    fn load_all_reports_whether_the_directory_was_readable() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("load_all_latch");
+        let plugins = tmp.path().join("plugins");
+        std::fs::write(&plugins, "占位：这是一个文件\n").unwrap();
+        let mut pm = manager_in(tmp.path());
+        assert!(
+            !pm.load_all(),
+            "清单没拿到就是「一个都没试」，闩不许抬，否则整个会话不再加载"
+        );
+        assert!(
+            pm.get_all_plugins().is_empty(),
+            "读不动时不该有插件被记成已加载"
+        );
+
+        // 对照组：目录读得动（哪怕里面一个插件都没有）⇒ 这一轮是问得出答案的，闩该抬。
+        // 「确认没有插件」与「这一刻问不出」必须是两个值，否则每次进页都要重扫一遍目录。
+        std::fs::remove_file(&plugins).unwrap();
+        std::fs::create_dir_all(&plugins).unwrap();
+        assert!(pm.load_all(), "空目录是「问得出、答案是零个」，不是问不出");
+    }
+
+    /// 闩必须接在那一句返回值上 —— 这条盯的是桌面端的**调用形态**，不是函数名。
+    ///
+    /// 撤掉修复的写法是 `pm.load_all(); self.plugins_loaded = true;`：它照样调用
+    /// `load_all`，所以"这个名字还在不在"那种判据对它无效（本仓那条教训）。
+    #[test]
+    fn the_native_latch_is_driven_by_the_load_result() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../desktop-native/src/main.rs");
+        let src = std::fs::read_to_string(&path).expect("桌面端源码读不出来（路径变了？）");
+        // 生产段：第一个 `#[cfg(test)]` 之前
+        let prod = &src[..src
+            .find("#[cfg(test)]")
+            .expect("桌面端测试模块的起点找不到了")];
+        let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("self.plugins_loaded=pm.load_all()"),
+            "那个闩不再认这一轮的加载结果了"
+        );
+        assert!(
+            !flat.contains("pm.load_all();self.plugins_loaded=true"),
+            "读不动时不许无条件抬闩"
         );
     }
 
