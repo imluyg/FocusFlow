@@ -5099,6 +5099,130 @@ mod render_probe {
             let _ = SetCursorPos(home.x, home.y);
         }
     }
+
+    /// 松手到出图那一段要在 UI 线程上挂多久：整块屏那么大的一张，合成 → 编码 → 落盘。
+    /// 这段时间里覆盖层还压着屏幕，所以它就是"松手之后卡的那一下"。
+    /// 只做读数：`cargo test -p focusflow-native --bins --release -- --ignored commit_path --nocapture`
+    #[test]
+    #[ignore = "要真的往临时目录写一张整屏大的 PNG"]
+    fn the_commit_path_holds_the_overlay_for_this_long() {
+        {
+            let _serial = crate::probe_guard();
+            let (bw, bh) = (1920i32, 1080i32);
+            let base = synth(bw, bh);
+            let dim = dim_bgra(&base);
+            let dir = std::env::temp_dir().join(format!("ff-commit-{:x}", std::process::id()));
+            if let Ok(mut s) = SNIP.lock() {
+                s.base = base;
+                s.dim = dim;
+                s.active = true;
+                s.base_w = bw;
+                s.base_h = bh;
+                s.origin = (0, 0);
+                s.sel = (0, 0, bw, bh);
+                s.marks.clear();
+            }
+            let t0 = Instant::now();
+            let (buf, w, h) = baked_selection().expect("整屏选区该能出图");
+            let bake = t0.elapsed();
+            let t1 = Instant::now();
+            let png = png_bytes(&buf, w, h).expect("编码没成");
+            let enc = t1.elapsed();
+            let t2 = Instant::now();
+            let path = write_png_named(&dir, &png, w, h).expect("落盘没成");
+            let write = t2.elapsed();
+            assert!(path.is_file(), "文件没真的落下：{}", path.display());
+            println!(
+                "COMMIT_MS 合成={:.1} 编码={:.1} 落盘={:.1} 合计={:.1}（PNG {} KB，{}x{}）",
+                bake.as_micros() as f64 / 1000.0,
+                enc.as_micros() as f64 / 1000.0,
+                write.as_micros() as f64 / 1000.0,
+                (bake + enc + write).as_micros() as f64 / 1000.0,
+                png.len() / 1024,
+                w,
+                h
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            // 这条读数腿改了静态状态，退回去别把"有一场在飞"留给下一条探针
+            if let Ok(mut s) = SNIP.lock() {
+                s.active = false;
+                s.sel = (0, 0, 0, 0);
+                s.base = Vec::new();
+                s.dim = Vec::new();
+                s.base_w = 0;
+                s.base_h = 0;
+            }
+        }
+    }
+
+    /// 按下热键到那一帧真的上屏要等多久（"按下去到画面出来"那一段）。
+    ///
+    /// 分两段报：`start()` 本身（藏卡片、抓屏、压暗、窗口清单、建窗）与**第一帧画完并交出**
+    /// —— 覆盖层是在第一把 `BitBlt` 之后才把屏幕换掉的，所以第二段才是人等到的那个数。
+    /// 再把 `start()` 里那三件重活单独量出来，看该往哪儿动。
+    /// 只做读数：`cargo test -p focusflow-native --bins --release -- --ignored the_overlay_takes --nocapture`
+    #[test]
+    #[ignore = "会真的在屏幕上盖一层全屏覆盖层"]
+    fn the_overlay_takes_this_long_to_appear() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let (vx, vy) = (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+            );
+            let (vw, vh) = (
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            );
+            let t = Instant::now();
+            let grabbed = grab_rect(vx, vy, vw, vh).expect("抓屏没成");
+            let grab = t.elapsed();
+            let t = Instant::now();
+            let veiled = dim_bgra(&grabbed);
+            assert_eq!(veiled.len(), grabbed.len(), "压暗那份少了一截");
+            let dim = t.elapsed();
+            let t = Instant::now();
+            let hits = collect_candidates();
+            let listed = t.elapsed();
+            let owner = HWND(std::ptr::null_mut());
+            let t0 = Instant::now();
+            start(owner, false);
+            let armed = t0.elapsed();
+            let mut paints = 0u32;
+            let mut spins = 0u32;
+            while paints < 1 && spins < 3000 {
+                spins += 1;
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_PAINT {
+                        paints += 1;
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            println!(
+                "OPEN_MS 抓屏={:.1} 压暗={:.1} 窗口清单={:.1}（{} 条） start()={:.1} 到第一帧交出={:.1}（画 {paints} 次，{}x{}）",
+                grab.as_micros() as f64 / 1000.0,
+                dim.as_micros() as f64 / 1000.0,
+                listed.as_micros() as f64 / 1000.0,
+                hits.len(),
+                armed.as_micros() as f64 / 1000.0,
+                t0.elapsed().as_micros() as f64 / 1000.0,
+                vw,
+                vh
+            );
+            assert_eq!(paints, 1, "覆盖层建出来了却一次都没重画");
+            let ov = SNIP
+                .lock()
+                .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
+                .unwrap_or(HWND(std::ptr::null_mut()));
+            if !ov.0.is_null() {
+                let _ = DestroyWindow(ov);
+            }
+            pump(200);
+        }
+    }
 }
 
 #[cfg(test)]
