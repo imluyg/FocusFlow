@@ -530,7 +530,10 @@ pub mod win {
             let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
             let width = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(0) as u32;
             let height = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(0) as u32;
-            // 取不到桌面时（无会话/服务态）这些会是 0，调用方按 Err 处理，不返回一个假矩形。
+            // 取不到桌面时（无会话/服务态）这些会是 0 ⇒ `MonitorRect::new` 挡下零尺寸，
+            // 这里退成一枚 0×0 交出去：本函数不回 Result，调用方拿不到"问不出"这一档。
+            // 现量（2026-10-29）生产端零调用方（只有两个 WebView 时代留下的 examples），
+            // 所以这枚矩形暂时没人拿去做算术；要接进截图链路，得先把它改成回 Err。
             MonitorRect::new(x, y, width, height).unwrap_or(MonitorRect {
                 x: 0,
                 y: 0,

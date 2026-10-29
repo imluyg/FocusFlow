@@ -502,7 +502,8 @@ fn cutoff_day_key(days: Option<i64>) -> Option<i64> {
 ///
 /// ⚠ 这条二元组口子**分不出**"读不出来"与"没有数据"（它把 `unreadable` 丢掉了）：
 /// 面板与导出请走 [`stats_totals`] / [`app_stats_totals`] / [`device_totals`]。
-/// 留着它是因为宿主 API 与 CLI 那三十来处调用者都按 `(总数, 榜)` 用。
+/// 留着它是因为 Lua 宿主那一格统计按 `(总数, 榜)` 用：现量（2026-10-29）生产端只有
+/// `plugins/host.rs` 的"0 与非 0"两臂，CLI 早改走 [`stats_totals`]。
 pub fn get_stats(days: Option<i64>, year: Option<i32>) -> (i64, HashMap<String, i64>) {
     let totals = stats_totals(days, year);
     (totals.total, totals.rows)
@@ -1120,7 +1121,11 @@ pub fn chart_window_days(period: i64) -> i64 {
 /// 指定日期每小时按键数（长度 24），含"这一轮没读全"。
 ///
 /// 与 [`hourly_window_totals`] 是两件事：那一问跟着顶部周期把窗口内每天加总，这一问只看
-/// 某一天几点多几点少（周报的时段直方图要的就是它）。
+/// 某一天几点多几点少。
+///
+/// ⚠ 现量（2026-10-29）：这一问在**生产端一个读者都没有**——唯一的引用是下面那个交数组的
+/// 薄包装 [`get_hourly_stats`]，而那个包装也只剩测试与再导出在点名；周报正文里根本没有
+/// 时段那一节（只有每日活跃／键鼠榜／应用／设备榜四节），Lua 宿主也没有 hourly 入口。
 ///
 /// 这一支以前四道各自折：`with_ro_conn` 把打不开折成 `None`、`table_exists` 把问不出
 /// 折成"没这张表"、`prepare`/`query_map` 的错误只写日志、取行用 `rows.flatten()`
@@ -1192,7 +1197,10 @@ pub fn hourly_stats_totals(target_date: Option<chrono::NaiveDate>) -> HourlyTota
 /// 查询指定日期每小时按键数（返回长度 24 的列表）。
 ///
 /// ⚠ 同 [`get_daily_counts`]：24 个 0 说不出"那一天没记录"还是"这一年读不动"。
-/// 周报已改走 [`hourly_stats_totals`]；留给只用数组的旧调用方。
+///
+/// ⚠ 现量（2026-10-29）：生产端**没有调用方**——"只用数组的旧调用方"随旧前端一起删了，
+/// 剩下的命中只有测试与 `db` 的再导出。要问每小时请走 [`hourly_window_totals`]（它交得回
+/// "这一轮有没有读全"）。
 pub fn get_hourly_stats(target_date: Option<chrono::NaiveDate>) -> Vec<i64> {
     hourly_stats_totals(target_date).hours
 }
@@ -1202,8 +1210,10 @@ pub fn get_hourly_stats(target_date: Option<chrono::NaiveDate>) -> Vec<i64> {
 /// 与 [`get_hourly_stats`]（只看某一天）不是一件事，两个都留着：周报的时段直方图问的就是
 /// "那一天几点"，而分析页的每小时分布要跟顶部周期走 —— 把一头硬套成另一头，就会有一头
 /// 说错话（旧写法是整页写死今日，顶部选了「近 1 年」图上的标题却还写着"今日"）。
-/// ⚠ 那一天那一问（`get_hourly_stats`）现在只是它的薄包装：二元组交不回"这一轮有没有读全"，
-/// 所以面板与周报都问这一条，那条只留给 Lua 宿主与 CLI 那类保持二元组口径的出口。
+/// ⚠ 那一天那一问（`get_hourly_stats`）现在只是它的薄包装：二元组交不回"这一轮有没有读全"。
+/// 现量（2026-10-29）问这一条的只有两处——面板（`desktop-native/src/data.rs`）与 CLI
+/// （`--hours`）；周报没有时段那一节，Lua 宿主也没有 hourly 入口，所以那一天那一问连同
+/// 它的数组包装在生产端一个读者都没有。
 ///
 /// 跨年份那套口径照 [`daily_counts_totals`]：某一年的库**问不出在不在**时跳过它并点名是哪一年、
 /// 为什么，绝不折成"那一年每小时都是 0"。
