@@ -178,15 +178,19 @@ fn run(args: &[String]) -> i32 {
             reset(&db)
         }
         "--vacuum" => {
-            // 破坏性/改写型命令一律先把**目标目录**说出来：`FOCUSFLOW_APP_DIR` 是
+            // 破坏性/改写型命令一律要把**目标目录**说出来：`FOCUSFLOW_APP_DIR` 是
             // app_dir 的第一优先级，测试里临时设过之后再忘，就会把真实数据目录当成
             // 草稿目录处理掉（旧代码从头到尾不提它在动哪套库）。
-            println!(
+            // 但"说出来"不等于"没做成也说出来"：这句以前无条件进 stdout，而这条命令是
+            // 挂在计划任务上的 —— 目录读不出来的那一轮一行库都没压缩，只收 stdout 的
+            // 任务里看到的仍是"像开工了"的一行。它跟结论句走同一个按退出码分流的出口。
+            let header = format!(
                 "压缩全部年度库（数据目录 {}）",
                 focusflow_core::paths::data_dir().display()
             );
             let report = db::maintenance::vacuum_all();
             let (line, code) = vacuum_outcome(&report);
+            emit_line(&header, code);
             emit_line(&line, code);
             code
         }
@@ -224,7 +228,8 @@ fn run(args: &[String]) -> i32 {
                     1
                 }
                 Ok(days) => {
-                    println!(
+                    // 同 `--vacuum`：这句要说，但只在做成的那一轮走 stdout。
+                    let header = format!(
                         "清理 {days} 天前的记录（数据目录 {}）",
                         focusflow_core::paths::data_dir().display()
                     );
@@ -236,11 +241,9 @@ fn run(args: &[String]) -> i32 {
                     }
                     let (line, code) = cleanup_outcome(days, &report);
                     // 成功那句话只属于成功：走 stdout；未完成走 stderr（这条是给计划任务用的）
-                    if code == 0 {
-                        println!("{line}");
-                    } else {
-                        eprintln!("{line}");
-                    }
+                    // 出口只有 `emit_line` 一个：这里原来自己写了一遍 `code == 0` 的分支。
+                    emit_line(&header, code);
+                    emit_line(&line, code);
                     code
                 }
             }
@@ -2293,5 +2296,35 @@ mod tests {
             !vflat.contains("println!(\"压缩完成"),
             "--vacuum 不许再自己写一句「压缩完成」"
         );
+    }
+
+    /// `--vacuum` 与 `--cleanup` 两条臂里不许有无条件走 stdout 的一句。
+    ///
+    /// 同一条规则上一轮只落到了 `--backup` 那一臂的「  目录: …」，这两个同族臂留着想当年
+    /// 那条未改的形状：「压缩全部年度库（数据目录 …）」／「清理 30 天前的记录（数据目录 …）」
+    /// 在动作**之前** `println!`，于是一行库都没压缩、一条记录都没删的那一轮，
+    /// 只收 stdout 的计划任务里仍然躺着一行像开工了的话。这两条命令是挂在计划任务上的，
+    /// 收 stdout 就是它们的唯一读者。
+    #[test]
+    fn the_write_arms_route_every_stdout_line_through_the_exit_code() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        // (`eprintln!` 的文本里含着 `println!`，所以按"总次数减 e 前缀次数"数裸的那一个)
+        for (arm, next) in [
+            ("\"--vacuum\" => {", "\"--backup\" => {"),
+            ("\"--cleanup\" => {", "\"--import-legacy\" => {"),
+        ] {
+            let at = prod.find(arm).expect("这条分派臂不见了");
+            let rest = &prod[at + arm.len()..];
+            let end = rest.find(next).expect("下一条臂不见了");
+            let flat: String = rest[..end].chars().filter(|c| !c.is_whitespace()).collect();
+            let bare = flat.matches("println!(").count() - flat.matches("eprintln!(").count();
+            assert_eq!(bare, 0, "{arm} 里不许有直接进 stdout 的一句: {flat}");
+            assert_eq!(
+                flat.matches("emit_line(").count(),
+                2,
+                "{arm} 要说两句（目标目录 + 结论），两句都得走那个按退出码分流的出口"
+            );
+        }
     }
 }
