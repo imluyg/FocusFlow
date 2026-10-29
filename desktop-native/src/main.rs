@@ -22,6 +22,11 @@ use std::time::Duration;
 use focusflow_core::db::queries;
 use focusflow_core::db::queries::DeviceDetail;
 use focusflow_core::plugins::manager::PluginManager;
+// 导出的三条规则各只有一份：CSV 字段转义（core 那份带 Excel 公式注入的前缀防护）、HTML
+// 转义、紧凑时长（悬浮窗那一列的形状）。原生侧以前各抄了一份，其中 CSV 那份**漏了**
+// 公式防护，而屏上「导出 CSV」那颗按钮走的就是漏掉的那一份。
+use crate::floating_render::fmt_duration as duration_text;
+use focusflow_core::format::{csv_field, html_escape};
 
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
@@ -6923,17 +6928,6 @@ fn write_user_text(path: &std::path::Path, body: &str) -> std::result::Result<()
     focusflow_core::config::atomic_write(path, body).map_err(|e| format!("{e}"))
 }
 
-fn duration_text(secs: i64) -> String {
-    let s = secs.max(0);
-    if s >= 3600 {
-        format!("{}h {}m", s / 3600, (s % 3600) / 60)
-    } else if s >= 60 {
-        format!("{}m", s / 60)
-    } else {
-        format!("{s}s")
-    }
-}
-
 /// 一栏「占比」的唯一出处：分子那一行除以**与它同一次读回来的**总数，念成 `NN.N%`。
 ///
 /// 分母由调用方给，而且只许给同源的数：屏上六处占比过去各写各的 `if total > 0 {}`，
@@ -6947,25 +6941,6 @@ fn share_text(count: i64, total: i64) -> String {
     }
     let pct = count.max(0) as f32 * 100.0 / total as f32;
     format!("{pct:.1}%")
-}
-
-/// CSV 字段转义：逗号/引号/换行都用标准双引号包法。
-fn csv_field(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
-}
-
-/// 转义 HTML 文本。
-/// 注：CSV 侧的转义是另一套规则，见 `csv_field`。
-/// HTML 报告里要转义：键名/应用名可能带 `<`、`&`。
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 /// 自包含的 HTML 报告：暗色、无外部依赖，双击就能看。
@@ -11609,6 +11584,80 @@ mod exit_flush_tests {
             logger_at > collect_at,
             "收日志必须排在停采集之后，否则「数据库已关闭」那几条根本没写进来：\
              collect={collect_at} logger={logger_at}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod export_ruler_tests {
+    use super::*;
+
+    /// 键名/应用名/设备名各挑一个会咬人的形状。
+    fn evil_snap() -> data::Snapshot {
+        data::Snapshot {
+            period: -1,
+            period_total: 10,
+            rank: vec![("-2+3".to_string(), 6i64), ("=1+1".to_string(), 4i64)],
+            apps: vec![("@evil.exe".to_string(), 3661i64)],
+            devices: vec![data::DevRow {
+                key: "k".to_string(),
+                name: "A&B<x>'q".to_string(),
+                auto_name: "A&B<x>'q".to_string(),
+                has_alias: false,
+                kind: "mouse".to_string(),
+                count: 10,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 屏上「导出 CSV」那颗按钮写的必须是 core 那一份转义：本地那份抄漏了公式前缀
+    /// 防护，而减号键的名字就以 `-` 开头（core 的注释里写明了这一点），Excel 会求值。
+    #[test]
+    fn the_native_csv_export_blocks_formula_injection() {
+        let csv = export_csv_text(&evil_snap());
+        assert!(csv.contains("'-2+3"), "以 - 开头的键名要被挡住:\n{csv}");
+        assert!(csv.contains("'=1+1"), "以 = 开头的键名要被挡住:\n{csv}");
+        assert!(
+            csv.contains("'@evil.exe"),
+            "以 @ 开头的文件名要被挡住:\n{csv}"
+        );
+        // 紧凑时长也只剩一份实现（悬浮窗那一列同一个形状）
+        assert!(csv.contains("1h 1m"), "3661 秒该念成紧凑式:\n{csv}");
+    }
+
+    /// HTML 导出同理：core 那一份连单引号一起转，本地那份不转。
+    #[test]
+    fn the_native_html_export_escapes_every_context() {
+        let html = export_html_text(&evil_snap());
+        assert!(
+            html.contains("A&amp;B&lt;x&gt;&#39;q"),
+            "设备名里的 & < > 与单引号都得转:\n{html}"
+        );
+        assert!(!html.contains("<x>"), "不许把名字当标记解析:\n{html}");
+    }
+
+    /// 这三条规则在原生侧都不许再长出第二份手抄。
+    #[test]
+    fn the_export_rules_have_one_owner() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("找不到测试模块的起点了");
+        let prod: String = src[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        for banned in ["fncsv_field(", "fnhtml_escape(", "fnduration_text("] {
+            assert!(!flat.contains(banned), "原生侧又长出第二份实现：{banned}");
+        }
+        assert!(
+            flat.contains("usecrate::floating_render::fmt_durationasduration_text;"),
+            "紧凑时长不再从悬浮窗那一份借用实现"
+        );
+        assert!(
+            flat.contains("usefocusflow_core::format::{csv_field,html_escape};"),
+            "CSV/HTML 转义不再从 core 那一份借用实现"
         );
     }
 }
