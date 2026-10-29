@@ -4609,6 +4609,23 @@ fn draw_analytics(p: &P<'_>, w: f32, h: f32, snap: &Snapshot, vs: ViewState) {
     let _ = m;
 }
 
+/// 柱顶那个数字要占的那一条带头（与下面画数字的 `- 18.0` 同一份）。
+const WEEKDAY_VALUE_HEADROOM: f32 = 18.0;
+
+/// 星期分布那一根柱的高度：给柱顶那个数字留出带头。
+///
+/// 为什么要有这一层：`plot` 从卡片 `r.top + 54` 起，而柱顶的数字画在 `bar.top - 18`。
+/// 不留出带头时最高的那一根顶到 `plot.top`，数字就落在 `r.top + 36` —— 那正是
+/// 「本栏…没读全 · 数据源：…」那一行的格子（只在有年份读不动时出现），而这个 UI
+/// 没有"装不下"这回事：`p.text` 不带裁切，两句直接叠在一起。
+/// `max <= 0` / `plot_h <= 0` 交出 0：没有可画的高度就是没有高度，不返回负数。
+fn weekday_bar_height(v: f32, max: f32, plot_h: f32) -> f32 {
+    if max <= 0.0 || plot_h <= WEEKDAY_VALUE_HEADROOM {
+        return 0.0;
+    }
+    (v / max) * (plot_h - WEEKDAY_VALUE_HEADROOM)
+}
+
 /// 星期分布。
 fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     p.round(r, 14.0, &p.br.card, Some(&p.br.border));
@@ -4654,7 +4671,7 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     let labels = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
     for (i, (&label, &count)) in labels.iter().zip(snap.weekday.iter()).enumerate() {
         let v = count as f32;
-        let hh = (v / max) * plot_height(plot);
+        let hh = weekday_bar_height(v, max, plot_height(plot));
         let x = plot.left + i as f32 * (bw + gap);
         let bar = rect(x, plot.bottom - hh, bw, hh);
         // 周末用绿色、工作日用强调色 —— 两套主题里都是这两个令牌。
@@ -4670,7 +4687,7 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         );
         p.text(
             &thousands(count.max(0) as u64),
-            rect(x, plot.bottom - hh - 18.0, bw, 16.0),
+            rect(x, plot.bottom - hh - WEEKDAY_VALUE_HEADROOM, bw, 16.0),
             &p.fmt.center_small,
             &p.br.muted,
         );
@@ -11592,6 +11609,59 @@ mod exit_flush_tests {
             logger_at > collect_at,
             "收日志必须排在停采集之后，否则「数据库已关闭」那几条根本没写进来：\
              collect={collect_at} logger={logger_at}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod weekday_label_tests {
+    use super::*;
+
+    /// 柱顶那个数字必须留在绘图区里：最高的那一根也得给它留出带头。
+    ///
+    /// 改前的形状：`hh = (v / max) * plot_height(plot)` ⇒ 最高的柱顶到 `plot.top`，数字画在
+    /// `bar.top - 18` 就落到 `r.top + 36`，而那正是「本栏…没读全 · 数据源：…」那一行的格子
+    /// （`p.text` 不带裁切 ⇒ 两句直接叠在一起，屏幕上是糊的）。
+    #[test]
+    fn the_tallest_weekday_bar_leaves_room_for_its_number() {
+        // 现量的绘图区高：卡片 300 − 上边带 54 − 下边带 42
+        let plot_h = 204.0;
+        assert_eq!(
+            weekday_bar_height(plot_h, plot_h, plot_h),
+            plot_h - WEEKDAY_VALUE_HEADROOM,
+            "最高的那一根必须把带头让出来"
+        );
+        let hh = weekday_bar_height(1200.0, 1200.0, plot_h);
+        assert!(
+            plot_h - hh - WEEKDAY_VALUE_HEADROOM >= 0.0,
+            "数字的上沿跑到绘图区外面了"
+        );
+        assert!(
+            weekday_bar_height(600.0, 1200.0, plot_h) < hh,
+            "柱高该跟着数走"
+        );
+        assert_eq!(weekday_bar_height(0.0, 1200.0, plot_h), 0.0);
+        assert_eq!(weekday_bar_height(5.0, 0.0, plot_h), 0.0, "max 为 0 不许除");
+        assert_eq!(
+            weekday_bar_height(5.0, 10.0, 18.0),
+            0.0,
+            "绘图区连带头都不够就不画柱"
+        );
+    }
+
+    /// 接线守卫：画柱与画数字**两处**都问同一把尺子——少一处就是叠字复发的形状。
+    #[test]
+    fn the_weekday_bar_and_its_number_share_one_headroom() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("找不到测试模块的起点了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("lethh=weekday_bar_height(v,max,plot_height(plot));"),
+            "星期分布的柱高不再问这把尺子了"
+        );
+        assert!(
+            flat.contains("rect(x,plot.bottom-hh-WEEKDAY_VALUE_HEADROOM,bw,16.0)"),
+            "柱顶数字的偏移不再与带头同一份"
         );
     }
 }
