@@ -1114,16 +1114,20 @@ fn reset(_db: &db::Database) -> i32 {
     use std::io::BufRead;
     let mut line = String::new();
     let stdin = std::io::stdin();
-    if let Err(e) = stdin.lock().read_line(&mut line) {
-        // 读不到回答与"回答不是 yes"是两件事：前者要说清是没读到（管道坏了、
-        // stdin 被计划任务关掉），否则界面上只剩一个退出码 1，用户分不清自己到底
-        // 是没批准还是批准了却没执行。这里一条数据都没动，把这句说明白就够了。
-        eprintln!("读不到确认输入，已取消（没有改动任何数据）: {e}");
-        return 1;
-    }
-    if line.trim().to_lowercase() != "yes" {
-        println!("已取消");
-        return 0;
+    // 三种结局分开：读到 yes / 读到了别的回答（用户自己不改口）/ 根本没读到（管道断了、
+    // 计划任务把 stdin 关掉 ⇒ `read_line` 回 `Ok(0)`，一个字节也没有）。
+    // 第三种从前落在第二种里：屏上是一句「已取消」、退出码 0 —— 对只认退出码的调度器
+    // 这就是"这一轮跑完了"，而它连问都没问到；注释原本承诺过要分清这两件事。
+    match classify_confirmation(stdin.lock().read_line(&mut line), &line) {
+        ConfirmRead::Unreadable(why) => {
+            eprintln!("读不到确认输入，已取消（没有改动任何数据）: {why}");
+            return 1;
+        }
+        ConfirmRead::Declined => {
+            println!("已取消");
+            return 0;
+        }
+        ConfirmRead::Approved => {}
     }
     let report = db::maintenance::reset_all_data();
     // 快照没兜住 ⇒ 在说"已清空"之前先把这句说出口（stderr，退出码不变：
@@ -1215,6 +1219,36 @@ fn emit_line(line: &str, code: i32) {
         println!("{line}");
     } else {
         eprintln!("{line}");
+    }
+}
+
+/// `--reset` 那句确认读到的三种结局。
+///
+/// 「批准」「自己不改口」「没问到」必须是三个值：只认退出码的调度器把第三种读成第二种时，
+/// 它看到的是"这一轮跑完了、用户自己说不清"，而真实情况是这道确认**根本没被回答过**。
+#[derive(Debug, PartialEq, Eq)]
+enum ConfirmRead {
+    Approved,
+    Declined,
+    /// `Ok(0)`（EOF，一个字节都没读到）或管道报错。带着能说出口的原因。
+    Unreadable(String),
+}
+
+/// 把「读这一次确认」的结果分成上面那三种。与真读输入的调用点分开写，是为了让
+/// EOF 那一支能被直接钉住 —— 手工喂一个关掉的 stdin 给整条命令不是判据，是眼验。
+fn classify_confirmation(read: std::io::Result<usize>, line: &str) -> ConfirmRead {
+    match read {
+        Err(e) => ConfirmRead::Unreadable(format!("读输入失败: {e}")),
+        Ok(0) => ConfirmRead::Unreadable(
+            "输入在读到任何一个字节之前就结束了（stdin 是空的或被关掉了）".to_string(),
+        ),
+        Ok(_) => {
+            if line.trim().eq_ignore_ascii_case("yes") {
+                ConfirmRead::Approved
+            } else {
+                ConfirmRead::Declined
+            }
+        }
     }
 }
 
@@ -2295,6 +2329,47 @@ mod tests {
         assert!(
             !vflat.contains("println!(\"压缩完成"),
             "--vacuum 不许再自己写一句「压缩完成」"
+        );
+    }
+
+    /// `--reset` 讨确认那一步的三种结局必须是三个值。
+    ///
+    /// 旧形状只有两支：`Err` 走「读不到」，其它一律按"回答不是 yes" ⇒ 屏上一句「已取消」、
+    /// 退出码 0。可计划任务把 stdin 关掉时 `read_line` 回的是 `Ok(0)` —— 一个字节都没读到，
+    /// 那是"没问到"，不是"用户说不清"；只认退出码的调度器读到 0 就认为这一轮正常跑完了。
+    /// 函数自己上面那段注释早就写了"读不到回答与回答不是 yes 是两件事"，今天才真的分开。
+    #[test]
+    fn an_unattended_reset_is_not_read_as_a_decline() {
+        use super::{classify_confirmation, ConfirmRead};
+        let broken = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(matches!(
+            classify_confirmation(Err(broken), ""),
+            ConfirmRead::Unreadable(_)
+        ));
+        match classify_confirmation(Ok(0), "") {
+            ConfirmRead::Unreadable(why) => assert!(
+                !why.is_empty(),
+                "没读到也要说得出为什么，不能只留一个退出码"
+            ),
+            other => panic!("stdin 被关掉不该读成批准或驳回: {other:?}"),
+        }
+        // 真的答了话的那两支保持原样：空回车是用户自己不改口，退 0 说得通。
+        assert_eq!(classify_confirmation(Ok(1), "\n"), ConfirmRead::Declined);
+        assert_eq!(classify_confirmation(Ok(6), "no\n"), ConfirmRead::Declined);
+        assert_eq!(classify_confirmation(Ok(4), "yes"), ConfirmRead::Approved);
+        assert_eq!(classify_confirmation(Ok(5), "YES\n"), ConfirmRead::Approved);
+
+        // 调用形态也得钉住：读一次、把结果交给分类器，三分支各自去哪。
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("classify_confirmation(stdin.lock().read_line(&mutline),&line)"),
+            "确认那一步不再走分类器"
+        );
+        assert!(
+            flat.contains("ConfirmRead::Unreadable(why)=>{eprintln!"),
+            "「没问到」那一支必须走 stderr，成功那句话才只属于成功"
         );
     }
 
