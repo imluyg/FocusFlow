@@ -744,6 +744,12 @@ pub struct AlltimeMaxDay {
     /// `unreadable` 非空时它只是**已读那几年的最大值**：某一年没答上来，它可能正握着
     /// 真正的那一天 —— 调用方据此不能把"少了一年"念成"纪录就是这个"。
     pub max_day: Option<(String, i64)>,
+    /// 读到的那些年度库里 `daily_counts` **记到过次数**（count > 0）的天数，
+    /// 也就是「总计」那一档「日均」的分母。
+    ///
+    /// 与 `max_day` 同一趟、同一个每库读手交回来，所以分子（全历史次数）与这个分母点到的
+    /// 库是同一批；`unreadable` 非空时它同样是下界（少一年就少那一年那些天）。
+    pub active_days: i64,
     /// 这一次没能读出来的年度库，每项形如「年份: 原因」。
     ///
     /// 非空就是"结果不完整"的信号：调用方（快照线程）要么把它念到屏上，
@@ -758,8 +764,8 @@ pub struct AlltimeMaxDay {
 /// 而「最高单日」`unwrap_or` 之后还能与别的卡片拼出自相矛盾的一屏。
 #[derive(Debug)]
 enum YearMaxDay {
-    /// 这一年读到了：`top` 是本年最高单日（表里没行时是 `None`）。
-    Read { top: Option<(i64, i64)> },
+    /// 这一年读到了：`top` 是本年最高单日（表里没行时是 `None`），`days` 是本年有行的天数。
+    Read { top: Option<(i64, i64)>, days: i64 },
     /// 这个库里没有 `daily_counts` 表：真的没有可汇总的数据，算"没有纪录"是对的。
     NoTable,
     /// 这一年**没有答案**（表在，但查询失败）：不能当成"这一年没纪录"。
@@ -776,10 +782,19 @@ fn year_max_day_in_conn(conn: &Connection) -> YearMaxDay {
     // 只这一条：排 (count DESC, date_key ASC) 两个键，`daily_counts` 一年 365 行，
     // 全表扫比给 count 单列建索引划算（那条索引已实测无收益并移除，见
     // `connection::ensure_schema` 里的论证）。
+    // 第三列那个标量子查询顺手把"这一年有几天记过事"带回来（「总计」那一档「日均」的
+    // 分母）：它跟着同一趟、同一个库，所以每库仍然只有**一条**语句，不为多要一个数
+    // 再排一次队。表里没行时 `query_row` 先拿到 `QueryReturnedNoRows`，`days` 留在 0 ——
+    // 那一年确实一天都没有，按 0 计是对的。
+    let mut days = 0i64;
     let top = match conn.query_row(
-        "SELECT date_key, count FROM daily_counts ORDER BY count DESC, date_key ASC LIMIT 1",
+        "SELECT date_key, count, (SELECT COUNT(*) FROM daily_counts WHERE count > 0) \
+         FROM daily_counts ORDER BY count DESC, date_key ASC LIMIT 1",
         [],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        |r| {
+            days = r.get::<_, i64>(2)?;
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        },
     ) {
         Ok(v) => Some(v),
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
@@ -787,7 +802,7 @@ fn year_max_day_in_conn(conn: &Connection) -> YearMaxDay {
             return YearMaxDay::Unreadable(format!("找这一年的最高单日时读不出来: {e}"));
         }
     };
-    YearMaxDay::Read { top }
+    YearMaxDay::Read { top, days }
 }
 
 /// 全历史「最高单日」（跨年度库）。
@@ -804,6 +819,7 @@ fn year_max_day_in_conn(conn: &Connection) -> YearMaxDay {
 /// 最大值，必须让调用方看得见 —— 静默按"这一年没纪录"计入，屏上念的就不可能是真纪录。
 pub fn get_alltime_max_day() -> AlltimeMaxDay {
     let mut best: Option<(i64, i64)> = None; // (date_key, count)
+    let mut active_days: i64 = 0;
     let mut unreadable: Vec<String> = Vec::new();
     for year in available_years() {
         let path = paths::year_db_path(year);
@@ -812,7 +828,8 @@ pub fn get_alltime_max_day() -> AlltimeMaxDay {
         // `.flatten()` 折成"这一年没数据"。
         let arm = connection::with_ro_conn(&path, year_max_day_in_conn);
         match arm {
-            Some(YearMaxDay::Read { top }) => {
+            Some(YearMaxDay::Read { top, days }) => {
+                active_days += days.max(0);
                 if let Some((dk, c)) = top {
                     if best.is_none_or(|(_, bc)| c > bc) {
                         best = Some((dk, c));
@@ -836,6 +853,7 @@ pub fn get_alltime_max_day() -> AlltimeMaxDay {
         best.and_then(|(dk, c)| day_key_to_date(dk).map(|d| (d.format("%Y-%m-%d").to_string(), c)));
     AlltimeMaxDay {
         max_day,
+        active_days,
         unreadable,
     }
 }
@@ -1083,8 +1101,13 @@ pub fn get_daily_counts(days: i64, year: Option<i32>) -> Vec<(String, i64)> {
 /// 三段"时间切面"、以及 `focusflow-cli --hours`。各写一份就会出现"同一份库、
 /// 屏幕上说是近 30 天、命令行里说是全部历史"。
 ///
-/// `0`（「总计」）刻意是 30 而不是 `MAX_QUERY_DAYS`：卡片那句「日均(近30天)」用的
-/// 就是这把尺子，图横跨全部历史就会与同一页的均值对不上。
+/// `0`（「总计」）刻意是 30 而不是 `MAX_QUERY_DAYS`：图横跨全部历史就画不成（一天一根柱，
+/// 几年下来几百根挤在一张卡上），而这三张切面各自数的是哪一段由调用方在屏上自己念出来
+/// （`desktop-native/src/data.rs` 的 `window_text`，「总计」那一档念「近 30 天」）。
+/// ⚠ 这一把尺子**不再**是卡片那句「日均」的分母：那一格在「总计」档吃的是全历史里记到过
+/// 次数的天数（[`get_alltime_max_day`] 的 `active_days`）。旧注释写的"与卡片同一个分母"
+/// 在 2026-10-29 那一笔之后就不成立了 —— 分子是整个周期，分母却按图上这一段数，
+/// 「总计」那一档的日均因此被抬了十几倍，那才是先要修的地方。
 pub fn chart_window_days(period: i64) -> i64 {
     match period {
         -1 => 1,
@@ -4261,6 +4284,56 @@ mod tests {
         let back = get_alltime_max_day();
         assert!(back.unreadable.is_empty(), "实得 {:?}", back.unreadable);
         assert_eq!(back.max_day, Some(("2026-01-02".to_string(), 5)));
+    }
+
+    /// 同一趟交回的「有记录的天数」：跨年度库相加，且次数为 0 的那天不算有记录。
+    ///
+    /// 它是原生端「总计」那一档「日均」的分母（`desktop-native/src/data.rs` 的 `avg_of`）。
+    /// 立这条的理由是那一档过去拿的是**图上那 30 天**里有行的天数去除全部历史的次数，
+    /// 所以这一趟必须真能交出"全历史干了事的那几天"，分母才有的可换。
+    /// 每库仍然只有原来那一条语句（天数挂在同一句的标量子查询里），没有为它多排一次队。
+    #[test]
+    fn the_alltime_day_count_adds_up_across_years_and_skips_zero_days() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_alltime_days");
+        let y_now = chrono::Local::now().year();
+        // 本年：两天记到过次数（3 与 5），另有一天是 0 —— 那天没干过事，不该进分母
+        {
+            let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+            connection::ensure_schema(&conn, y_now).unwrap();
+            conn.execute_batch(
+                "INSERT INTO daily_counts(date_key, count) VALUES
+                 (1, 3), (2, 5), (3, 0)",
+            )
+            .unwrap();
+        }
+        // 上一年只有一天有记录：跨库要相加
+        let y_prev = y_now - 1;
+        {
+            let conn = connection::open_rw(&paths::year_db_path(y_prev)).unwrap();
+            connection::ensure_schema(&conn, y_prev).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts(date_key, count) VALUES (10, 4)",
+                rusqlite::params![],
+            )
+            .unwrap();
+        }
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+
+        let got = get_alltime_max_day();
+        assert!(
+            got.unreadable.is_empty(),
+            "夹具前提：两个库都读得动，实得 {:?}",
+            got.unreadable
+        );
+        assert_eq!(
+            got.active_days, 3,
+            "本年两天 + 上一年一天，次数为 0 的那天不算（实得 {}）",
+            got.active_days
+        );
+        // 反向对照：最大值仍来自同一次遍历，两个数不是各查各的
+        assert_eq!(got.max_day.map(|(_, c)| c), Some(5));
     }
 
     /// 「没有这张表」是真答案，「有表但查询失败」不是。

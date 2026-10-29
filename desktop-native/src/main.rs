@@ -4078,11 +4078,10 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
 
     let y0 = dialog.top + 96.0;
     let step = 26.0;
-    let share = if d.period_total > 0 {
-        d.period_count as f32 * 100.0 / d.period_total as f32
-    } else {
-        0.0
-    };
+    // 分母是 core 在这一趟一起交回的设备侧周期总数（`period_total`），与分子 `period_count`
+    // 同一把尺子 —— 它不是屏上那张卡片用的键鼠总数，两回事（见 `data::Snapshot::device_total`
+    // 头上那句为什么）。
+    let share = share_text(d.period_count, d.period_total);
     row("今日", &thousands(d.today.max(0) as u64), x, y0);
     row("近 7 天", &thousands(d.week.max(0) as u64), x, y0 + step);
     row(
@@ -4099,7 +4098,7 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
         col2,
         y0,
     );
-    row("占比", &format!("{share:.1}%"), col2, y0 + step);
+    row("占比", &share, col2, y0 + step);
     row(
         "排名",
         &if d.rank > 0 {
@@ -4875,7 +4874,10 @@ fn draw_heat(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
         .unwrap_or(0)
         .max(1) as f32;
     let (u, ox, oy) = heat_geom(r);
-    let total = snap.period_total.max(0);
+    // 悬停那格的占比分母：与板上这些格子同一个出处（`snap.rank` 那一趟读回来的键鼠总数）。
+    // 卡片那个 `period_total` 里还含着没落库的增量，而榜里的行不含 —— 拿它当分母，
+    // 每个键帽的占比都按那批增量的比例偏小，且屏上不会说为什么。
+    let total = snap.rank_share_base().max(0);
 
     for (i, k) in keys.iter().enumerate() {
         let count = counts.get(k.name).copied().unwrap_or(0);
@@ -4946,12 +4948,12 @@ fn draw_heat(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
                 .map(|k| (k, counts.get(k.name).copied().unwrap_or(0)))
         })
         .map(|(k, c)| {
-            let pct = if total > 0 {
-                c as f32 * 100.0 / total as f32
-            } else {
-                0.0
-            };
-            format!("{} · {} 次 · {pct:.1}%", k.name, thousands(c.max(0) as u64))
+            format!(
+                "{} · {} 次 · {}",
+                k.name,
+                thousands(c.max(0) as u64),
+                share_text(c, total)
+            )
         })
         .unwrap_or_else(|| format!("其它按键：{other_n} 个 · {other_c} 次（板上没摆的键）"));
     p.text(
@@ -6757,6 +6759,10 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
     apps.truncate(10);
     let mut devices: Vec<(String, i64)> = devices.into_iter().collect();
     devices.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
+    // 「设备输入合计」那一句念的是**整份**设备榜，不是排完序切下来那 10 行 ——
+    // 所以求和必须排在 `truncate` 之前。顺序换过来的症状是那句安静地少报：
+    // 一周里只用过十几次的设备被排到 10 名开外，报告照出、行数照少、没有一处对不上。
+    let device_total: i64 = devices.iter().map(|(_, v)| *v).sum();
     devices.truncate(10);
 
     let max_day = by_day
@@ -6765,7 +6771,6 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
         .map(|(d, v)| (d.format("%m-%d").to_string(), *v))
         .unwrap_or_else(|| ("—".to_string(), 0));
     let hit = by_day.iter().filter(|(_, v)| *v >= goal).count();
-    let device_total: i64 = devices.iter().map(|(_, v)| *v).sum();
 
     let mut out = String::new();
     let _ = writeln!(
@@ -6877,6 +6882,21 @@ fn duration_text(secs: i64) -> String {
     }
 }
 
+/// 一栏「占比」的唯一出处：分子那一行除以**与它同一次读回来的**总数，念成 `NN.N%`。
+///
+/// 分母由调用方给，而且只许给同源的数：屏上六处占比过去各写各的 `if total > 0 {}`，
+/// 于是"分母该用哪一个"这件事在六处各答了一次 —— 其中四处（键名榜、分组榜、两份导出的
+/// 键名列、热力板悬停那格）拿的是卡片那个含未落库增量的 `period_total`，而分子是已落库的
+/// 榜行。这里把写法收成一处，分母选哪一把尺子就变成每个调用点上明摆着要回答的问题。
+/// `total <= 0` 时念 `0.0%`：一个数都没有，就没有"占了百分之几"这回事。
+fn share_text(count: i64, total: i64) -> String {
+    if total <= 0 {
+        return "0.0%".to_string();
+    }
+    let pct = count.max(0) as f32 * 100.0 / total as f32;
+    format!("{pct:.1}%")
+}
+
 /// CSV 字段转义：逗号/引号/换行都用标准双引号包法。
 fn csv_field(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) {
@@ -6921,13 +6941,9 @@ fn export_html_text(s: &Snapshot) -> String {
         "<h2>键鼠排行</h2><table><tr><th>排名</th><th>键名</th><th>次数</th><th>占比</th></tr>",
     );
     for (i, (k, v)) in s.rank.iter().enumerate() {
-        let share = if s.period_total > 0 {
-            *v as f32 * 100.0 / s.period_total as f32
-        } else {
-            0.0
-        };
+        let share = share_text(*v, s.rank_share_base());
         out.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{share:.1}%</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{share}</td></tr>",
             i + 1,
             html_escape(k),
             v
@@ -7055,12 +7071,8 @@ fn export_csv_text(s: &Snapshot) -> String {
 
     out.push_str("\r\n[键鼠排行]\r\n排名,键名,次数,占比\r\n");
     for (i, (k, v)) in s.rank.iter().enumerate() {
-        let share = if s.period_total > 0 {
-            *v as f32 * 100.0 / s.period_total as f32
-        } else {
-            0.0
-        };
-        out.push_str(&format!("{},{},{},{share:.1}%\r\n", i + 1, csv_field(k), v));
+        let share = share_text(*v, s.rank_share_base());
+        out.push_str(&format!("{},{},{},{share}\r\n", i + 1, csv_field(k), v));
     }
 
     out.push_str("\r\n[应用排行]\r\n排名,应用,时长(秒),时长\r\n");
@@ -7076,13 +7088,13 @@ fn export_csv_text(s: &Snapshot) -> String {
 
     out.push_str("\r\n[设备排行]\r\n排名,设备,类型,次数,占比\r\n");
     for (i, d) in s.devices.iter().enumerate() {
-        let share = if s.period_total > 0 {
-            d.count as f32 * 100.0 / s.period_total as f32
-        } else {
-            0.0
-        };
+        // 分母是设备侧这一趟读回来的总数（`device_total`），不是卡片那个键鼠总数：
+        // 设备计数走 Raw Input 侧信道，与主链路本来就两套口径（合成的键盘事件不计数、
+        // 鼠标事件计），拿主链路的数去除，除出来的是两把尺子的商——同一份导出里
+        // 「键鼠排行」那栏按自己的总数除到 100%，这一栏却只到九成出头。
+        let share = share_text(d.count, s.device_total);
         out.push_str(&format!(
-            "{},{},{},{},{share:.1}%\r\n",
+            "{},{},{},{},{share}\r\n",
             i + 1,
             csv_field(&d.name),
             csv_field(&d.kind),
@@ -7113,11 +7125,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     let rows = left_rows(snap, tab, vs.rank_tab, vs.rank_filter);
     let (title, total, count) = match tab {
         1 => ("应用排行", snap.app_total, rows.len()),
-        2 => (
-            "设备排行",
-            snap.devices.iter().map(|d| d.count).sum(),
-            rows.len(),
-        ),
+        2 => ("设备排行", snap.device_total, rows.len()),
         _ => ("键鼠排行", snap.period_total, rows.len()),
     };
     // 滚动位置按当前页签的行数夹一次：数据变少时别停在空白处。
@@ -7342,11 +7350,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
             }
             1 => {
                 let (app, secs) = &snap.apps[idx];
-                let share = if snap.app_total > 0 {
-                    *secs as f32 * 100.0 / snap.app_total as f32
-                } else {
-                    0.0
-                };
+                let share = share_text(*secs, snap.app_total);
                 p.text(
                     app,
                     rect(g.x_name, y + 3.0, g.x_count - g.x_name - 12.0, 18.0),
@@ -7360,20 +7364,18 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                     &p.br.fg,
                 );
                 p.text(
-                    &format!("{share:.1}%"),
+                    &share,
                     rect(g.x_last, y + 4.0, 60.0, 18.0),
                     &p.fmt.small,
                     &p.br.muted,
                 );
             }
             _ if vs.rank_tab == 1 => {
-                // 「分组」那一屏：八组的固定顺序，占比按这一轮的总数。
+                // 「分组」那一屏：八组的固定顺序，占比按**这一轮读回来的键鼠总数**
+                // （榜里那些行的同一个出处）。这八组盖住全部键名，所以它们加起来正好 100%；
+                // 分母一旦换成卡片那个含未落库增量的数，八组就只到 97% 而没人说得清为什么。
                 let (name, n) = &snap.group[idx];
-                let share = if snap.period_total > 0 {
-                    *n as f32 * 100.0 / snap.period_total as f32
-                } else {
-                    0.0
-                };
+                let share = share_text(*n, snap.rank_share_base());
                 p.text(
                     name,
                     rect(g.x_name, y + 3.0, 300.0, 18.0),
@@ -7387,7 +7389,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                     &p.br.fg,
                 );
                 p.text(
-                    &format!("{share:.1}%"),
+                    &share,
                     rect(g.x_last, y + 4.0, 60.0, 18.0),
                     &p.fmt.small,
                     &p.br.muted,
@@ -7395,11 +7397,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
             }
             _ => {
                 let (key, n) = &snap.rank[idx];
-                let share = if snap.period_total > 0 {
-                    *n as f32 * 100.0 / snap.period_total as f32
-                } else {
-                    0.0
-                };
+                let share = share_text(*n, snap.rank_share_base());
                 p.text(
                     key,
                     rect(g.x_name, y + 3.0, 300.0, 18.0),
@@ -7413,7 +7411,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                     &p.br.fg,
                 );
                 p.text(
-                    &format!("{share:.1}%"),
+                    &share,
                     rect(g.x_last, y + 4.0, 60.0, 18.0),
                     &p.fmt.small,
                     &p.br.muted,
@@ -10545,6 +10543,33 @@ mod weekly_report_tests {
         }
     }
 
+    /// 接线腿：「设备输入合计」那一句必须求和**在截断之前**。
+    ///
+    /// 换到之后求和的症状不是红、是那句安静地少报：一周里只用过十几次的设备被排到 10 名
+    /// 开外，报告照出、TOP 10 那张表照少，两个数各看各的都"像对的"。周报要真跑（读库、写文件、
+    /// 按自然周取窗口）无头造不出来，所以钉的是同一份源码里的先后次序。
+    #[test]
+    fn the_weekly_report_sums_devices_before_it_cuts_the_list() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod: String = src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sum_at = prod
+            .find("let device_total: i64 = devices.iter().map(|(_, v)| *v).sum()")
+            .expect("设备那一句「合计」的求和不见了（改名或换了写法，这条守卫的锚要跟着改）");
+        let trunc_at = prod
+            .find("devices.truncate(10)")
+            .expect("TOP 10 那一刀不见了（它没了这条判据就没意义，要一起改）");
+        assert!(
+            sum_at < trunc_at,
+            "求和必须排在截断之前：合计={sum_at} 截断={trunc_at} —— \
+             先切 10 行再求和，那句「设备输入合计」就只念前 10 名"
+        );
+    }
+
     /// 文件名里的日期就是上周一：手动生成与"要不要自动生成"共用这一份算法。
     #[test]
     fn the_report_file_name_carries_the_week_start_date() {
@@ -11225,5 +11250,143 @@ mod tray_menu_tests {
                 "托盘项 {id} 没有接它的那条臂（点下去不会有任何反应）"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod share_base_tests {
+    use super::*;
+
+    /// 生产文本（整行注释与 `///` 一并滤掉：这条守卫曾被"把调用整块注释掉"假绿过一次，
+    /// 注释里那句话与针脚可以逐字相同）。
+    fn prod() -> String {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 夹具：榜里这一轮读回来 100 次（字母 70 + 鼠标 30），另有 50 次还没落库；
+    /// 设备那一趟是侧信道，只读回来 40 次；应用那趟 50 秒。
+    fn snap() -> data::Snapshot {
+        data::Snapshot {
+            period: -1,
+            period_total: 150,
+            rank: vec![("a".to_string(), 70i64), ("b".to_string(), 30i64)],
+            group: vec![
+                ("字母键".to_string(), 70i64),
+                ("鼠标点击".to_string(), 30i64),
+            ],
+            mouse_total: 30,
+            keyboard_total: 70,
+            device_total: 40,
+            devices: vec![data::DevRow {
+                key: "k1".to_string(),
+                name: "鼠标".to_string(),
+                auto_name: "鼠标".to_string(),
+                has_alias: false,
+                kind: "mouse".to_string(),
+                count: 40,
+            }],
+            app_total: 50,
+            apps: vec![("x".to_string(), 25i64)],
+            ..Default::default()
+        }
+    }
+
+    /// 纯算式那一条：给什么数除什么数，分母没答案就念 `0.0%`。
+    #[test]
+    fn share_text_divides_by_what_it_is_handed() {
+        assert_eq!(share_text(30, 60), "50.0%");
+        assert_eq!(share_text(1, 3), "33.3%");
+        assert_eq!(
+            share_text(5, 0),
+            "0.0%",
+            "一个数都没有，就没有「占了百分之几」这回事"
+        );
+        assert_eq!(share_text(5, -2), "0.0%", "分母是坏值也不许除出负占比");
+        assert_eq!(share_text(-5, 100), "0.0%", "分子是历史坏行不许念成负占比");
+    }
+
+    /// 导出里每一栏的「占比」按**自己那一趟**除：键鼠那栏按榜的总数，设备那栏按设备那趟。
+    ///
+    /// 旧的形状是六处各写各的除法，其中四处（含这两栏）拿的是卡片那个含未落库增量的
+    /// `period_total`：同一份 CSV 里「键鼠排行」按 150 除到 46.7%，而那一栏自己加起来
+    /// 根本到不了 100%；设备那栏更绕，分子是 Raw Input 侧信道、分母是主链路总数，
+    /// 除出来的是两把尺子的商。
+    #[test]
+    fn each_exported_column_divides_by_its_own_read() {
+        let s = snap();
+        let csv = export_csv_text(&s);
+        let mut wrong: Vec<String> = Vec::new();
+        for want in [
+            "1,a,70,70.0%\r\n",
+            "2,b,30,30.0%\r\n",
+            "1,鼠标,mouse,40,100.0%\r\n",
+        ] {
+            if !csv.contains(want) {
+                wrong.push(format!(
+                    "导出里该有这一行（占比按自己那一趟的总数除）：{want}"
+                ));
+            }
+        }
+        // 反向：按卡片那个含增量的总数（150）除出来的三个数，一个字都不许再出现
+        for never in ["46.7%", "20.0%", "26.7%"] {
+            if csv.contains(never) {
+                wrong.push(format!("导出里又出现按卡片总数除出来的 {never}"));
+            }
+        }
+        assert!(wrong.is_empty(), "导出占比判据红:\n{}", wrong.join("\n"));
+
+        let html = export_html_text(&s);
+        assert!(
+            html.contains("<td class=\"num\">70.0%</td>"),
+            "HTML 那一份的键鼠占比也要按榜的总数除，实得:\n{html}"
+        );
+    }
+
+    /// 接线腿：屏上那几处占比各自点名分母，谁都不许再碰卡片那个含增量的数。
+    ///
+    /// `draw_table` 与热力板那几处要 D2D 上下文，无头跑不了，所以钉的是调用形态；
+    /// 真正会被算错的那几个数由上面那条导出用例端到端盯着。
+    #[test]
+    fn the_share_columns_each_name_their_own_base() {
+        let prod = prod();
+        let mut wrong: Vec<String> = Vec::new();
+        for (needle, want, what) in [
+            (
+                "share_text(*n, snap.rank_share_base())",
+                2,
+                "键名榜与「分组」那一屏",
+            ),
+            (
+                "share_text(*v, s.rank_share_base())",
+                2,
+                "两份导出的键鼠那栏",
+            ),
+            ("share_text(c, total)", 1, "键盘热力板悬停那一格"),
+            ("share_text(d.count, s.device_total)", 1, "导出的设备那栏"),
+            ("share_text(*secs, snap.app_total)", 1, "应用那一屏的占比"),
+        ] {
+            let got = prod.matches(needle).count();
+            if got != want {
+                wrong.push(format!(
+                    "{what}的调用形态实得 {got} 处、应为 {want}：{needle}"
+                ));
+            }
+        }
+        if prod.contains(["period_total", " as f32"].concat().as_str()) {
+            wrong.push("卡片那个含未落库增量的总数又回到除法里了".to_string());
+        }
+        let n = prod.matches(["100", ".0 /"].concat().as_str()).count();
+        if n != 1 {
+            wrong.push(format!(
+                "「占比」的算式只许在 share_text 里写一次，实得 {n} 处"
+            ));
+        }
+        assert!(wrong.is_empty(), "占比接线判据红:\n{}", wrong.join("\n"));
     }
 }

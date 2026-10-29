@@ -309,7 +309,8 @@ pub struct Snapshot {
     pub today_app_seconds: i64,
     /// 当前周期的键鼠总数。
     pub period_total: i64,
-    /// 当前周期的日均（按窗口天数算）。
+    /// 当前周期的日均（有限窗口按窗口含几天算；「总计」按全历史记到过次数的天数算，
+    /// 见 [`avg_of`]）。
     pub avg: i64,
     /// 全历史最高单日。
     pub max_day: Option<(String, i64)>,
@@ -318,12 +319,22 @@ pub struct Snapshot {
     pub group: Vec<(String, i64)>,
     /// 这一轮里鼠标那一侧的总次数（`MOUSE_GROUPS` 两组之和）。
     pub mouse_total: i64,
-    /// 键盘那一侧 = 周期总数减鼠标：两条加起来就是标题上那个总数。
+    /// 键盘那一侧 = 榜单总数减鼠标：这两条加起来是**这一轮读回来的键鼠总次数**
+    /// （[`Snapshot::rank_share_base`]），也就是榜里那些行的分母。
+    /// 它比卡片那个「总计」（`period_total`）少一截 —— 少的是还没落库的那批增量，
+    /// 它们还没归到键盘或鼠标任何一侧（`main.rs` 标题行写「其中」就是这个理由）。
     pub keyboard_total: i64,
     /// 前台应用时长（当前周期），按秒数降序。
     pub apps: Vec<(String, i64)>,
     pub app_total: i64,
     pub devices: Vec<DevRow>,
+    /// 设备侧这一轮读回来的总次数 —— `devices` 那些行的分母。
+    ///
+    /// ⚠ 它**不是** `period_total` 的另一种写法：设备计数走 Raw Input 那条侧信道，与主链路
+    /// 的口径本来就差一截（合成的键盘事件不计数、鼠标事件计），所以拿主链路的总数去除
+    /// 设备那一栏的次数，除出来的是两把尺子的商，而不是"这台设备占了多少"。
+    /// 与 `app_total` 同一个地位：每一屏的占比只认自己那一趟读回来的总数。
+    pub device_total: i64,
     /// 每日次数，窗口 = core 的 `chart_window_days(period)`（今日 1 天、总计按 30 天）。
     /// 每项是 `(YYYY-MM-DD, 次数)`：窗口内每天都有格子（当天没数据的是 0），图上刻度与
     /// 导出那一栏念的就是这里交回来的日期，不由调用方按下标反推。
@@ -350,6 +361,20 @@ pub struct Snapshot {
     /// 这一轮没答上来的每一栏读数，每项形如「N 年库<域名>读不出来: 原因」；非空 =
     /// 上面那些数是**下界**。界面按 `queries::DOMAIN_*` 那几个域名过滤到各自那一栏去说。
     pub gaps: Vec<String>,
+}
+
+impl Snapshot {
+    /// 键名/分组那些「占比」的分母：与榜里那些行**同一次读回来**的键鼠总次数。
+    ///
+    /// 为什么不用 `period_total`：那一个是卡片上要念的周期总数，含写线程内存里还没落库的
+    /// 增量（`pending`），而榜里那些行读的是已落库的聚合表。拿含增量的数当分母、分子却是
+    /// 不含增量的行，每一行的占比都按 `pending/(总数)` 这一档偏小 ——「分组」那一屏最明显：
+    /// 八组本来就盖住全部键名，加起来本该正好 100%，这样除完只到 97% 甚至更少，而屏上没有
+    /// 任何一句话解释为什么。两条相加就是这一份（`rank_break` 里 `keyboard_total` 是
+    /// `total - mouse_total`），所以这里不另存一个数，免得同一件事有两份答案。
+    pub fn rank_share_base(&self) -> i64 {
+        self.mouse_total.max(0) + self.keyboard_total.max(0)
+    }
 }
 
 /// 周期 → 查询窗口天数：`None` = 全部历史。
@@ -386,13 +411,29 @@ pub fn rank_is_mouse(key: &str) -> bool {
     focusflow_core::format::MOUSE_GROUPS.contains(&focusflow_core::format::classify_key(key))
 }
 
+/// 「日均」这一格：分子是这一轮的总次数（含还没落库的增量），分母按周期分两档 ——
+/// 有限窗口就是窗口本身含几天，「总计」则是全历史里记到过次数的那几天。
+///
+/// 收成一条纯函数是因为分母的两档过去混在一个内联 `match` 里，而其中一档取错了源：
+/// 拿"图上那 30 天里干了事的天数"去除"全部历史的次数"。这样写，两档各吃什么数在签名上就摊开了。
+/// 分母至少 1：一个数都没有时不许除出个 `inf` 或 panic。
+pub(crate) fn avg_of(total: i64, window_days: Option<i64>, active_days: i64) -> i64 {
+    let days = match window_days {
+        Some(d) => d.max(1),
+        None => active_days.max(1),
+    };
+    total / days
+}
+
 /// 键名分组榜 + 键/鼠两侧总次数：一次算出，「分组」那一屏与标题行那两个数读同一份。
 #[derive(Clone, Debug, Default)]
 pub struct RankBreak {
     /// 按 `KEY_GROUPS` 的固定顺序排好的分组行（空组不出行，与旧版一致）。
     pub groups: Vec<(String, i64)>,
     pub mouse_total: i64,
-    /// `total - mouse_total`：两条加起来永远等于这一屏的总数，不留"两边各算一遍"的口子。
+    /// `total - mouse_total`：两条加起来正好等于传进来的那一份 `total`（这一轮读回来的
+    /// 键鼠总次数），不留"两边各算一遍"的口子。⚠ 它**不是**卡片那个含未落库增量的
+    /// `period_total` —— 差的就是那批还没归到任何一侧的增量。
     pub keyboard_total: i64,
 }
 
@@ -433,8 +474,10 @@ pub fn load(period: i64) -> Snapshot {
     // （屏上那个「总计」念的是上面 `stats.total + pending`），每拍多算一条每库的 SUM。
     let all = queries::get_alltime_max_day();
     // 三条时间切面（趋势 / 小时 / 星期）与三份导出里那栏"每日次数"共用 core 那把
-    // `chart_window_days`：今日 1 天、总计按 30 天（与卡片那句「日均(近30天)」同一个分母），
-    // 其余就是周期本身。`crates/cli/src/main.rs` 的周期参数也读这一把 —— 界面自写一个
+    // `chart_window_days`：今日 1 天、总计按 30 天，其余就是周期本身。
+    // ⚠ 「总计」那一档图上数的是近 30 天，而卡片那句「日均」数的是全历史里记到过次数的
+    // 天数（下面 `avg_of` 的第三个入参）—— 两个不是一把尺子，各自在屏上念各自的窗口。
+    // `crates/cli/src/main.rs` 的周期参数也读这一把 —— 界面自写一个
     // 固定 30 天，"今日"那一档就会画出 30 个与所选周期无关的点。
     let chart_days = queries::chart_window_days(period);
     // 每日序列连日期一起交回：图上的刻度与导出里那一栏念的是同一串日期，
@@ -463,17 +506,14 @@ pub fn load(period: i64) -> Snapshot {
     rank.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
     rank.truncate(100);
 
-    // 日均的分母：窗口天数；"全部"按有数据的天数（与卡片上的"日均"同口径）。
-    let avg_days = match days {
-        Some(d) => d.max(1),
-        None => daily
-            .iter()
-            .map(|(_, v)| *v)
-            .filter(|v| *v > 0)
-            .count()
-            .max(1) as i64,
-    };
-    let avg = (stats.total + pending) / avg_days;
+    // 日均的分母：窗口天数；"全部"按**全历史记到过次数的天数**。
+    // ⚠ 这一档的分母过去取的是 `daily`（窄窗口那一段，「总计」只有 30 天）里有行的天数，
+    // 而分子是整个周期的总数 ——「总计」那一档的周期就是全部历史：于是每拍都在拿
+    // "全部历史的次数"除以"最近 30 天里干了事的那几天"，两年历史能把这一格抬到真实值的
+    // 二十几倍，而卡片下面那句写的却是"按周期窗口"。现在分子与分母同一段：`active_days`
+    // 与全历史次数点的是同一批年度库（core 的 `get_alltime_max_day` 那一趟，每库仍一条
+    // 语句，没为多要一个数再排一次队）。
+    let avg = avg_of(stats.total + pending, days, all.active_days);
 
     let mut hours = hourly_read.hours;
     hours.resize(24, 0);
@@ -506,7 +546,12 @@ pub fn load(period: i64) -> Snapshot {
     let goal_cfg = focusflow_core::config::instance().get_int("goal", "daily_keys", 20000);
     let goal_rows = goal_read.series;
     let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let goal = Some(goal_status(goal_cfg, &goal_rows, &today_str, 0));
+    // ⚠ 第四个参数必须是上面那份 `pending`，不许图省事填 `0`：core 的那份文档
+    // (`stats::goal_status`) 明说判定要读"库值 + 未落库增量"这同一张 map，否则同一页会出现
+    // 「进度条已过线、连续打卡还少一天」。症状（现量在屏上）：达标后的那最多 10 秒里，
+    // 「今日 20,050 / 20,000」与那条绿进度条读的是写线程缓存（含增量），而「连续打卡 N 天」
+    // 和最近七天那七个点读的是已落库的聚合表 —— 今天那一格还灰着。
+    let goal = Some(goal_status(goal_cfg, &goal_rows, &today_str, pending));
 
     // 采集开着时，今日直接用写线程缓存：它含未落库与在途增量，落库前后都不跳
     // （用「库值 + pending」会在 flush 取走批次、尚未提交的那一瞬读到 0）。
@@ -552,6 +597,7 @@ pub fn load(period: i64) -> Snapshot {
         apps,
         app_total: app_read.total,
         devices,
+        device_total: device_read.total,
         daily,
         hourly: hours,
         weekday,
@@ -566,6 +612,119 @@ pub fn load(period: i64) -> Snapshot {
             .get("paths", "data_migrate_from")
             .trim()
             .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod readout_rulers_tests {
+    use super::*;
+
+    /// 生产文本（整行注释与 `///` 一并滤掉，判据数的是代码）。
+    fn prod() -> String {
+        let src = include_str!("data.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 「日均」那两档的分母各吃什么数。
+    ///
+    /// 换掉之前症状是一格数字：「总计」那一档的周期是全部历史，分子也是全部历史，
+    /// 而分母数的是**图上那 30 天**里干了事的那几天 —— 两年历史能把这一格抬到真实值的
+    /// 十几二十倍，卡片下面那句"按周期窗口"却没有第二个地方会响一声。
+    #[test]
+    fn the_average_uses_the_window_or_the_whole_history() {
+        // 有限窗口：1000 次摊到窗口含的那 30 天
+        assert_eq!(avg_of(1000, Some(30), 400), 33);
+        // 「总计」：分母换成全部历史里记到过次数的那 400 天
+        assert_eq!(avg_of(1000, None, 400), 2);
+        assert_ne!(
+            avg_of(1000, None, 400),
+            avg_of(1000, Some(30), 400),
+            "两档若吃同一个分母，这条纯函数就白分了 —— 说明有一档接错了入参"
+        );
+        // 一个数都没有也只是除不动，不许除出荒唐值（分母至少 1）
+        assert_eq!(avg_of(1000, None, 0), 1000);
+        assert_eq!(avg_of(1000, Some(0), 5), 1000);
+    }
+
+    /// 占比的分母 = 这一轮读回来的键鼠总数，不含还没落库的那批增量。
+    #[test]
+    fn the_share_base_is_the_landed_total_not_the_card_number() {
+        // 卡片那个「总计」念的是 100（已落库）+ 50（还没落库）= 150
+        let rank = vec![
+            ("字母键".to_string(), 70i64),
+            ("鼠标点击".to_string(), 30i64),
+        ];
+        let s = Snapshot {
+            period_total: 150,
+            mouse_total: 30,
+            keyboard_total: 70,
+            group: rank.clone(),
+            rank,
+            ..Default::default()
+        };
+        assert_eq!(
+            s.rank_share_base(),
+            100,
+            "分母要和榜里那些行同一个出处，不能含没落库的增量"
+        );
+        assert_ne!(
+            s.rank_share_base(),
+            s.period_total,
+            "卡片那个数含增量，不是分母"
+        );
+
+        // 「分组」那一屏的判据：八组盖住全部键名，按这个分母除，占比加起来正好 100%。
+        // 旧的分母（150）除出来是 66.7% —— 而屏上没有任何一句话解释为什么不满一百。
+        let sum: f64 = s
+            .group
+            .iter()
+            .map(|(_, n)| *n as f64 * 100.0 / s.rank_share_base() as f64)
+            .sum();
+        assert!(
+            (sum - 100.0).abs() < 0.001,
+            "八组加起来该正好 100%，实得 {sum:.3}%"
+        );
+    }
+
+    /// 接线腿：「日均」现在吃的是全历史那份天数，不是图上那一段。
+    #[test]
+    fn the_average_is_fed_the_alltime_day_count() {
+        let prod = prod();
+        let call = "avg_of(stats.total + pending, days, all.active_days)";
+        assert_eq!(
+            prod.matches(call).count(),
+            1,
+            "「日均」的分子、窗口与全历史天数要按这三个入参交进去，实得:\n{prod}"
+        );
+        assert!(
+            !prod.contains(".filter(|v| *v > 0)"),
+            "分母又回到拿图上那一段数天数了 —— 那正是「总计」那一档抬起来的原因"
+        );
+    }
+
+    /// 接线腿：打卡条那一问要把未落库的增量并进去。
+    ///
+    /// 填 `0` 的症状在同一页上：「今日 20,050 / 20,000」与那条绿进度条读的是写线程缓存
+    /// （含增量），而「连续打卡 N 天」和最近七天那七个点读的是已落库的聚合表 ——
+    /// core 那份文档（`stats::goal_status`）写的就是"不并上它这半边就停在上次落库为止"。
+    #[test]
+    fn the_goal_strip_is_fed_the_unflushed_delta() {
+        let prod = prod();
+        let call = "goal_status(goal_cfg, &goal_rows, &today_str, pending)";
+        assert_eq!(
+            prod.matches(call).count(),
+            1,
+            "打卡条要吃到那份未落库增量（第四个参数是 pending），实得形状不对"
+        );
+        assert!(
+            !prod.contains("goal_status(goal_cfg, &goal_rows, &today_str, 0)"),
+            "又填回 0 了：同一页就会出现「进度条已过线、连续打卡还少一天」"
+        );
     }
 }
 
@@ -747,8 +906,9 @@ mod chart_window_tests {
         assert_eq!(window_text(15), "近 15 天");
         assert_eq!(window_text(30), "近 30 天");
         assert_eq!(window_text(365), "近 365 天");
-        // 「总计」那一格数的是近 30 天（与卡片那句「日均(近30天)」同一个分母）。
+        // 「总计」那一格数的是近 30 天（图上画的就是这 30 根柱子）。
         // 跟着排行榜那句写成「全部」，图就对着 30 根柱子夸口自己是全部历史。
+        // ⚠ 卡片那句「日均」在这一档不吃这把尺子：它的分母是全历史里记到过次数的天数。
         assert_eq!(window_text(0), "近 30 天");
         assert_ne!(window_text(0), "全部", "这一栏不许借排行榜那句「全部」");
     }
