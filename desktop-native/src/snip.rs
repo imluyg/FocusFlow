@@ -19,12 +19,12 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRectRgn,
-    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, ExtCreatePen, GetDC, GetStockObject,
-    GetTextExtentPoint32W, InvalidateRect, LineTo, MoveToEx, Rectangle, ReleaseDC, SelectClipRgn,
-    SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, TextOutW, BITMAPINFO, BS_SOLID,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
-    FW_NORMAL, HDC, HPEN, LOGBRUSH, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_ENDCAP_ROUND,
-    PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, TRANSPARENT,
+    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, ExtCreatePen, GetClipBox, GetDC,
+    GetStockObject, GetTextExtentPoint32W, InvalidateRect, LineTo, MoveToEx, Rectangle, ReleaseDC,
+    SelectClipRgn, SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, TextOutW, BITMAPINFO,
+    BS_SOLID, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
+    DIB_RGB_COLORS, FW_NORMAL, HDC, HPEN, LOGBRUSH, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+    PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -913,8 +913,16 @@ unsafe fn poke_pixels(
 pub const LOUPE_SPAN: i32 = 11;
 /// 一个源像素画成几个屏幕像素。
 pub const LOUPE_SCALE: i32 = 8;
-/// 读数那一行的高度（画在方块下面）。
-pub const LOUPE_TEXT_H: i32 = 18;
+/// 读数条用的字号：`draw_chip` 的 `yaihe` 就用这一个数。
+pub const CHIP_FONT_H: i32 = 20;
+/// 读数条的上下内边距：底盒比文字高这么多（画的那一侧与预留的那一侧共用这一份）。
+pub const CHIP_PAD_V: i32 = 6;
+/// 读数那一行**连底盒**要占的高度（画在放大镜方块下面）。
+///
+/// 原来这里手抄了一个 18，而 `draw_chip` 画的是「实测行高 + 6」——于是放大镜贴到屏幕
+/// 底边时读数下半截出屏。这一枚常量必须由用例量过（`the_reserved_readout_height_covers_the_chip_that_is_drawn`），
+/// 不许再拿一个大约的数顶上去。
+pub const LOUPE_TEXT_H: i32 = CHIP_FONT_H + CHIP_PAD_V;
 /// 光标与方块之间的间距。
 pub const LOUPE_GAP: i32 = 18;
 
@@ -1250,16 +1258,32 @@ pub fn render_marks(img: &[u8], w: i32, h: i32, marks: &[Mark]) -> Vec<u8> {
     out
 }
 
+/// 读数条的左上角该落在哪：**整条盒子**都必须留在 DC 的可见区里。
+///
+/// 为什么要单独成函数：读数条本来就只在边缘用——放大镜跟着光标走到屏幕右/下沿、尺寸
+/// 读数贴着选区上沿。旧写法按文本长度直接往右下伸，长读数在右沿被切掉、贴底边时下半截
+/// 出屏，而"读数字"的东西读不到数字是最不该发生的一种坏。
+pub fn chip_origin(x: i32, y: i32, w: i32, h: i32, vis: (i32, i32)) -> (i32, i32) {
+    (
+        x.min((vis.0 - w).max(0)).max(0),
+        y.min((vis.1 - h).max(0)).max(0),
+    )
+}
+
 unsafe fn draw_chip(hdc: HDC, x: i32, y: i32, text: &str, fg: u32) {
     unsafe {
-        let font = yaihe(20, false);
+        let font = yaihe(CHIP_FONT_H, false);
         let oldf = SelectObject(hdc, font.into());
         let wide: Vec<u16> = text.encode_utf16().collect();
         let mut sz = SIZE { cx: 0, cy: 0 };
         let _ = GetTextExtentPoint32W(hdc, &wide, &mut sz);
+        let (cw, ch) = (sz.cx + 12, sz.cy + CHIP_PAD_V);
+        let mut vis = RECT::default();
+        let _ = GetClipBox(hdc, &mut vis);
+        let (x, y) = chip_origin(x, y, cw, ch, (vis.right, vis.bottom));
         let brush = CreateSolidBrush(COLORREF(0x0014_1414));
         let old = SelectObject(hdc, brush.into());
-        let _ = Rectangle(hdc, x, y, x + sz.cx + 12, y + sz.cy + 6);
+        let _ = Rectangle(hdc, x, y, x + cw, y + ch);
         SelectObject(hdc, old);
         let _ = DeleteObject(brush.into());
         let _ = SetTextColor(hdc, COLORREF(fg));
@@ -4553,6 +4577,55 @@ mod tests {
         let baked = "mosaic_block(img,w,h,*x,*y,*mw,*mh,MOSAIC_CELL,(0,0)";
         assert!(flat.contains(preview), "预览那处不再把锚点交回选区左上角");
         assert!(flat.contains(baked), "烤图那处不再把源图自己的原点当锚点");
+    }
+
+    /// 读数条整条盒子必须留在可见区里（右沿与底沿各夹一次）。
+    #[test]
+    fn a_chip_is_kept_inside_the_visible_box() {
+        assert_eq!(chip_origin(100, 100, 50, 20, (1000, 800)), (100, 100));
+        // 右沿：盒子宽 300 而可见区只有 320 ⇒ 左上角最多到 20
+        assert_eq!(chip_origin(200, 10, 300, 20, (320, 200)), (20, 10));
+        // 底沿：盒子高 30 而窗口只有 40 ⇒ 顶边最多到 10（旧写法画到 35+30 出屏）
+        assert_eq!(chip_origin(5, 35, 100, 30, (400, 40)), (5, 10));
+        // 盒子两个方向都比可见区大时停在原点：负到屏幕外等于整条读不到
+        assert_eq!(chip_origin(50, 50, 900, 400, (400, 300)), (0, 0));
+        // 接线：`draw_chip` 必须真的把量出来的盒子尺寸与可见区交给这把夹子——
+        // 纯函数判得再对，没人调它等于没修。
+        let src = include_str!("snip.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("let(x,y)=chip_origin(x,y,cw,ch,(vis.right,vis.bottom))"),
+            "draw_chip 不再走这把夹子了"
+        );
+    }
+
+    /// 放大镜下面预留的那一行，必须盖得住 `draw_chip` 真画出来的底盒。
+    ///
+    /// 现量症状：预留手抄成 18，而画的是「实测行高 + 内边距」，YaHei 在 20 号下的行高
+    /// 本来就不止 20 ⇒ 光标贴屏幕底边时读数下半截出屏。
+    #[test]
+    fn the_reserved_readout_height_covers_the_chip_that_is_drawn() {
+        unsafe {
+            let hdc = GetDC(None);
+            let font = yaihe(CHIP_FONT_H, false);
+            let old = SelectObject(hdc, font.into());
+            let text = loupe_text((10, 10, LOUPE_SPAN), (0, 0));
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let mut sz = SIZE { cx: 0, cy: 0 };
+            let _ = GetTextExtentPoint32W(hdc, &wide, &mut sz);
+            SelectObject(hdc, old);
+            let _ = DeleteObject(font.into());
+            ReleaseDC(None, hdc);
+            assert!(
+                sz.cy + CHIP_PAD_V <= LOUPE_TEXT_H,
+                "放大镜下面只预留 {LOUPE_TEXT_H}，而读数条实际要画 {}（实测行高 {}、内边距 {CHIP_PAD_V}）",
+                sz.cy + CHIP_PAD_V,
+                sz.cy
+            );
+            // 顺手量出这一句有多宽：右沿那格夹的就是这个数
+            assert!(sz.cx > 0, "读数一个字都没量到就别判了：{}", sz.cx);
+        }
     }
 
     #[test]
