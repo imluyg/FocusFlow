@@ -116,6 +116,33 @@ fn strangers_verdict(
 /// 一遍，白白搬一年数据）；大小不同说明目标那份是**别的东西**（用户选了个装着
 /// 旧版 FocusFlow 的目录是很常见的），先把它改名留档再写，绝不静默覆盖 ——
 /// 源目录本来就一字不动地留着，但目标里原有的那份没有第二份副本。
+/// `data/` 与 `backup/` 这两棵「在不在、是不是目录」的三态。
+///
+/// 立它的原因：两处过去都写 `!dir.is_dir() ⇒ continue`，而 `Path::is_dir()` 对**任何**一次
+/// 失败都回 `false` —— 包括那个自指/成环的目录 junction（本机现量 os error 1921）、
+/// 移动盘休眠、同步盘正握着。于是"这一棵问不出"与"旧目录本来没有这一棵"在两条链上
+/// 都长成同一个"跳过"：复制那一步交回 `copied: 0` 且零错误，核对那一步压根没往那棵里看，
+/// `remove_source_trees` 就把用户的全部历史删掉，回执念的却是「迁移完成」。
+/// 只有 `NotFound` 才算确认没有 —— 与 `is_confirmed_absent`、`queries::year_db_presence`
+/// 同一把尺子。
+enum Subtree {
+    /// 是目录，往里走
+    Dir,
+    /// 确认这一棵没有（或那儿是个普通文件，本来不该当子树搬）
+    Absent,
+    /// 这一刻问不出，原因带回去
+    Unknown(String),
+}
+
+fn subtree_of(dir: &Path) -> Subtree {
+    match std::fs::metadata(dir) {
+        Ok(m) if m.is_dir() => Subtree::Dir,
+        Ok(_) => Subtree::Absent,
+        Err(e) if is_confirmed_absent(&e) => Subtree::Absent,
+        Err(e) => Subtree::Unknown(format!("{} 问不出是不是目录: {e}", dir.display())),
+    }
+}
+
 pub fn copy_data_tree(src_root: &Path, dst_root: &Path) -> CopySummary {
     let mut summary = CopySummary::default();
 
@@ -127,8 +154,16 @@ pub fn copy_data_tree(src_root: &Path, dst_root: &Path) -> CopySummary {
 
     for sub in ["data", "backup"] {
         let src = src_root.join(sub);
-        if !src.is_dir() {
-            continue;
+        match subtree_of(&src) {
+            Subtree::Absent => continue,
+            Subtree::Unknown(why) => {
+                // 说得出"这一棵没搬"，调用方那句回执就不会把它念成搬完了
+                summary
+                    .errors
+                    .push(format!("{why}；这一棵（{sub}）一个文件都没复制"));
+                continue;
+            }
+            Subtree::Dir => {}
         }
         let dst = dst_root.join(sub);
         // 兜底，且**每个子树只判一次**：只有目标子树落进正在被复制的那棵源子树里
@@ -165,7 +200,23 @@ pub fn copy_data_tree(src_root: &Path, dst_root: &Path) -> CopySummary {
                     .push(format!("{} 创建失败: {e}", d.display()));
                 continue;
             }
-            for entry in entries.flatten() {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // 枚举到一半读不出来（网络盘/USB 断了会话、同步盘正握着目录）：
+                        // 这一层**后面的条目一个都没被复制**。旧写法是 `entries.flatten()`，
+                        // 把这条 Err 与"这里没有更多文件"折成同一个结局，而核对那一步同样
+                        // 是 flatten ⇒ 两边都没看见这批文件，`verify_copy` 照样交回
+                        // "每个源文件都有 counterpart"，删源那道闸就这么开着过去了。
+                        // 记进 errors 之后调用方既不清标记也不删源，下次启动原地重来。
+                        summary.errors.push(format!(
+                            "{} 枚举到一半读不出来，这一层后面的条目没被复制: {e}",
+                            s.display()
+                        ));
+                        continue;
+                    }
+                };
                 let from = entry.path();
                 let to = d.join(entry.file_name());
                 let ft = match entry.file_type() {
@@ -689,16 +740,44 @@ fn join_errors(summary: &CopySummary) -> String {
 fn verify_copy(src_root: &Path, dst_root: &Path) -> Result<(), String> {
     for sub in ["data", "backup"] {
         let base = src_root.join(sub);
-        if !base.is_dir() {
-            continue;
+        match subtree_of(&base) {
+            // 确认没有这一棵：没什么要核对的
+            Subtree::Absent => continue,
+            // 问不出：这一棵里的文件一个都没核对过，删源这道闸不许开
+            Subtree::Unknown(why) => {
+                return Err(format!("{why}：这一棵（{sub}）没能核对，不敢删源"));
+            }
+            Subtree::Dir => {}
         }
         let mut stack = vec![base.clone()];
         while let Some(dir) = stack.pop() {
             let entries = std::fs::read_dir(&dir)
                 .map_err(|e| format!("{} 读取失败，无法核对: {e}", dir.display()))?;
-            for entry in entries.flatten() {
-                let Ok(ft) = entry.file_type() else { continue };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    // 这一问的关键不对称：核对阶段"看不见某一条"绝不等于"那条不存在"。
+                    // 旧写法 `entries.flatten()` 加 `let Ok(ft) = … else { continue }`
+                    // 把两种"问不出"都当成"这一条不用核对"，于是复制阶段没搬走的文件
+                    // 在核对阶段也一起消失，`Ok(())` 交出去、旧目录被删 —— 与本模块头
+                    // 那句"删源只发生在复制成功且逐文件核对通过之后"正好相反。
+                    Err(e) => {
+                        return Err(format!(
+                            "{} 枚举到一半读不出来（{e}）：这一层没能核对完，不敢删源",
+                            dir.display()
+                        ));
+                    }
+                };
                 let from = entry.path();
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(e) => {
+                        return Err(format!(
+                            "{} 的类型问不出（{e}）：这一条没能核对，不敢删源",
+                            from.display()
+                        ));
+                    }
+                };
                 if ft.is_dir() {
                     stack.push(from);
                     continue;
@@ -1659,5 +1738,68 @@ mod migration_plan_tests {
         // 配置里根本没写 data_home（便携包的默认布局）时也照旧走原来的两条分支
         let plan2 = plan_migration(&app.path().to_string_lossy(), "", app.path(), app.path());
         assert!(matches!(plan2, MigrationPlan::ClearMarker), "{plan2:?}");
+    }
+}
+
+#[cfg(test)]
+mod delete_gate_tests {
+    use super::*;
+
+    /// 本 mod 自己的写文件小助手（`write_file` 住在 `tests` mod 里，跨 mod 够不着）。
+    fn fs_write(p: &Path, content: &str) {
+        std::fs::write(p, content).unwrap();
+    }
+    /// 「这一棵问不出」与「这一棵本来没有」不许共用一个跳过。
+    ///
+    /// 症状是**数据没了还念成功**：复制那一步 `!src.is_dir() ⇒ continue`、核对那一步同一个写法，
+    /// 于是那整棵（用户的全部历史都在 `data/` 里）一个文件都没搬、一个文件都没核对，
+    /// `Ok(())` 交出去，`remove_source_trees` 把旧目录删掉，回执念的是「迁移完成」。
+    /// 触发形状本机造得出来：自指 junction 让 `metadata` 报 os error 1921（`FilesystemLoop`），
+    /// 而 `Path::is_dir()` 对任何一次失败都回 `false` —— 与本仓 `year_db_presence`、
+    /// `is_confirmed_absent` 立过两次的规矩是同一件事。
+    #[test]
+    fn an_unanswerable_subtree_never_opens_the_delete_gate() {
+        let _lock = paths::test_app_dir_lock();
+        let app = paths::test_app_dir("dl_unanswerable");
+
+        // 控制带①：一切都答得出来的搬运，两道闸都该放行（否则下面的断言是恒真）
+        let ok_src = app.path().join("ok_src");
+        let ok_dst = app.path().join("ok_dst");
+        std::fs::create_dir_all(ok_src.join("data")).unwrap();
+        fs_write(&ok_src.join("data").join("focusflow_2026.db"), "一行历史");
+        let s = copy_data_tree(&ok_src, &ok_dst);
+        assert!(
+            s.errors.is_empty(),
+            "夹具前提：正常那棵不该报错，实得 {:?}",
+            s.errors
+        );
+        assert_eq!(s.copied, 1, "夹具前提：真的要搬到一个文件");
+        verify_copy(&ok_src, &ok_dst).expect("复制过且核对得上的那棵该放行");
+
+        // 观察带：`data` 这一棵换成一个读不出真身的自指 junction
+        let bad_src = app.path().join("bad_src");
+        let bad_dst = app.path().join("bad_dst");
+        std::fs::create_dir_all(&bad_src).unwrap();
+        if !paths::test_self_loop_junction(&bad_src.join("data")) {
+            eprintln!("这台机器建不出自指 junction ⇒ 这一条没测过，只是跳过了");
+            return;
+        }
+        let s2 = copy_data_tree(&bad_src, &bad_dst);
+        let text2 = s2.errors.join("\n");
+        assert!(
+            !s2.errors.is_empty(),
+            "问不出「这一棵在不在」必须报错，不许与「本来没有」共用一个跳过"
+        );
+        assert!(
+            text2.contains("问不出") && text2.contains("一个文件都没复制"),
+            "错误要点名是哪一棵、这次搬了几个，实得: {text2}"
+        );
+        assert_eq!(s2.copied, 0, "夹具前提：这一棵一个都没搬成");
+        let why =
+            verify_copy(&bad_src, &bad_dst).expect_err("没核对过这一棵就不许说「敢删源」，实得 Ok");
+        assert!(
+            why.to_string().contains("不敢删源"),
+            "要说清是「没能核对所以不许删源」，实得: {why}"
+        );
     }
 }

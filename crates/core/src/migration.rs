@@ -56,7 +56,12 @@ pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
     let mut summary = ImportSummary::default();
 
     // 1) 年度键鼠库
-    let src_year_dbs = list_year_dbs(src_dir);
+    let (src_year_dbs, listed) = list_year_dbs(src_dir);
+    if let Some(why) = listed {
+        summary.errors.push(format!(
+            "旧目录里的年度库没列全（{why}）—— 下面这些年是**已列出**的那些，没列出的那一年不会被导入"
+        ));
+    }
     for year in src_year_dbs {
         match import_year_db(src_dir, year, &mut summary) {
             Ok(imported) => {
@@ -239,18 +244,51 @@ fn backup_before_overwrite(dst: &Path) -> anyhow::Result<Option<std::path::PathB
     Ok(Some(kept))
 }
 
-/// 列出数据目录下的年度库（focusflow_YYYY.db）。
-fn list_year_dbs(dir: &Path) -> Vec<i32> {
+/// 列出数据目录下的年度库（focusflow_YYYY.db），并把**这一问办不办得到**交回调用方。
+///
+/// ⚠ 旧写法是 `if let Ok(entries) = read_dir(dir)` 里套 `entries.flatten()`：目录读不动
+/// （OneDrive/杀软正握着、ACL 不给列举、移动盘刚休眠、单个条目_stat 失败）与"这个旧目录里
+/// 就是没有年度库"交回同一个空 Vec，于是回执照样念「导入完成：0 个年度库」、CLI 退 0，
+/// 而用户接下来就把旧目录清掉 —— 与本文件上面附属库那一支（`probe_open` 三态）当初修的
+/// 是同一个形状，这一半当时漏下了。
+fn list_year_dbs(dir: &Path) -> (Vec<i32>, Option<String>) {
     let mut years = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Some(y) = paths::is_year_db_file(&entry.path()) {
-                years.push(y);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(e) => {
+            return (years, Some(format!("{} 列不出来（{e}）", dir.display())));
+        }
+    };
+    let mut unreadable = 0usize;
+    let mut first_err: Option<String> = None;
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                if let Some(y) = paths::is_year_db_file(&entry.path()) {
+                    years.push(y);
+                }
+            }
+            Err(e) => {
+                unreadable += 1;
+                if first_err.is_none() {
+                    first_err = Some(e.to_string());
+                }
             }
         }
     }
     years.sort_unstable();
-    years
+    // 少列出的那几年按"这次没敢说是全的"处理：年份列表交回去，同时把缺口点名，
+    // 让调用方在回执里带上 —— 一条都没多看见的一年，等于整年历史安静消失。
+    let why = if unreadable > 0 {
+        Some(format!(
+            "{} 里有 {unreadable} 个条目列不出来（第一个原因：{}）",
+            dir.display(),
+            first_err.unwrap_or_else(|| "(没带上原因)".to_string())
+        ))
+    } else {
+        None
+    };
+    (years, why)
 }
 
 /// 回滚刚整体复制过来的半套年度库，返回删不掉的残留（路径 + 原因）。
@@ -1956,5 +1994,47 @@ mod tests {
             "正名上删不掉的东西必须点名，实得: {text}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 旧目录列不出来时，回执不许念成「这里没有旧数据」。
+    ///
+    /// `list_year_dbs` 原先写 `if let Ok(entries) = read_dir(dir)` 里套 `flatten()`：
+    /// 目录读不动（OneDrive/杀软正握着、ACL 不给列举、移动盘刚休眠、指向一个普通文件）
+    /// 与"这个旧目录里就是没有年度库"交回同一个空列表，于是界面念「导入完成：0 个年度库」、
+    /// CLI 打「未发现可导入的数据」并退 0 —— 而用户接下来就按这句话去清旧目录，
+    /// 每一年的库都在那一句"完成"里没了。附属库那一支当初已经改成走三态 `probe_open`
+    /// （见上面那段注释），年度库这一半当时漏下了。
+    #[test]
+    fn an_unlistable_legacy_dir_is_not_reported_as_having_nothing() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("mig_unlistable");
+
+        // 夹具：指向一个**普通文件**，`read_dir` 必然失败（本机现量是"目录名无效"那一类）
+        let not_a_dir = crate::paths::data_dir().join("legacy_is_a_file");
+        std::fs::write(&not_a_dir, "这不是目录").unwrap();
+        let s = import_legacy_data(&not_a_dir);
+        let text = s.errors.join("\n");
+        assert!(
+            !s.errors.is_empty(),
+            "列不出来必须出声：回执不能只说 0 个年度库，实得 {s:?}"
+        );
+        assert!(
+            text.contains("列不出来"),
+            "要说清是「旧目录列不出来」，实得: {text}"
+        );
+        assert!(
+            s.year_dbs.is_empty(),
+            "夹具前提：这一年都没列出来，年表该是空的"
+        );
+
+        // 反向对照：一个真的空目录才算「没有可导入的」——那句话对它才是对的
+        let empty_dir = crate::paths::data_dir().join("legacy_is_empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let ok = import_legacy_data(&empty_dir);
+        assert!(
+            ok.errors.iter().all(|e| !e.contains("列不出来")),
+            "空目录不该被说成读不动，实得 {:?}",
+            ok.errors
+        );
     }
 }
