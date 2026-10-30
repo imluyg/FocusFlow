@@ -112,6 +112,29 @@ $st = [FF]::Style($somePin)
 Check 'the pin has no title bar, so the old X exit is gone on purpose' `
     ((($st -band 0x00C00000) -eq 0) -and (($st -band 0x80) -eq 0)) ("style=0x{0:X}" -f $st)
 
+# Dragging is the gesture a "the pin flickers while I move it" report is about. The window
+# used to be moved from a CLIENT-space reference that travels with the window itself, so every
+# other mouse message landed back near where the drag started -- the picture shakes instead of
+# following. Screen space is the one reference that stays put, and the check is the plainest
+# one available: a 120x60 drag has to end 120x60 away, not half of it.
+$dragPin = [FF]::ByClass([uint32]$p.Id, 'FocusFlowPin')
+$d0 = Get-Rect $dragPin
+$grabX = $d0.X + [int]($d0.W / 2)
+$grabY = $d0.Y + [int]($d0.H / 2)
+$onPin = Test-PointIsOurs $dragPin $grabX $grabY
+Check 'the drag starts on the pin itself' $onPin
+if ($onPin) {
+    Drag-Screen $grabX $grabY ($grabX + 120) ($grabY + 60)
+    $d1 = Get-Rect $dragPin
+    Check 'a 120x60 drag lands the pin 120x60 away' `
+        ($d1.X -eq $d0.X + 120 -and $d1.Y -eq $d0.Y + 60) `
+        ("was $($d0.X),$($d0.Y) now $($d1.X),$($d1.Y)")
+} else {
+    # A red, not a skip: the point was taken by somebody else's window, so the gesture went
+    # there and this leg measured nothing about the pin.
+    Check 'a 120x60 drag lands the pin 120x60 away' $false 'skipped: the grab point is not the pin'
+}
+
 # The wheel legs go first, on a pin nothing has disturbed yet. An injected wheel is delivered
 # to the foreground window's thread -- NOT to the window under the cursor, the way a real
 # wheel is (three-arm probe on this box: a fresh pin zooms; the same pin after another window

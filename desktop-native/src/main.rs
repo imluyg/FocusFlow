@@ -5031,11 +5031,18 @@ struct PinImage {
 }
 
 /// 正在被拖的那一张：窗口、按下时的窗口左上角、按下时的光标坐标。
+///
+/// 三格**全是屏幕坐标**。光标那一格不能记客户区坐标：窗口跟着光标走，客户区原点也在走，
+/// 拿它当基准等于每挪一次就换一次坐标系 —— 窗口会在"该在的位置"与"按下时那一格"之间
+/// 来回跳，屏上看到的就是拖动时一直在抖/闪（量法见 `dragging_a_pin_follows...` 那条探针）。
 #[derive(Clone, Copy)]
 struct PinDrag {
     hwnd: isize,
     origin: (i32, i32),
-    cursor: (i32, i32),
+    press: (i32, i32),
+    /// 上一次已经摆到的窗口左上角：高回报率鼠标在同一像素上会连着来好几条，
+    /// 目标没变就不必再 `SetWindowPos` 一次。
+    last: (i32, i32),
 }
 
 /// 截图出图那一句（成与败都出一句）：`snip` 把它填在这里，`WM_SNIP_NOTE` 让主窗口的 wndproc
@@ -5462,11 +5469,16 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 let _ = SetCapture(hwnd);
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rc);
+                // 基准取**屏幕坐标**：客户区坐标会跟着窗口自己漂（见 `PinDrag` 那段）。
+                let mut screen = POINT::default();
+                let _ = GetCursorPos(&mut screen);
+                let origin = (rc.left, rc.top);
                 if let Ok(mut d) = PIN_DRAG.lock() {
                     *d = Some(PinDrag {
                         hwnd: hwnd.0 as isize,
-                        origin: (rc.left, rc.top),
-                        cursor: cur,
+                        origin,
+                        press: (screen.x, screen.y),
+                        last: origin,
                     });
                 }
                 LRESULT(0)
@@ -5474,17 +5486,38 @@ unsafe extern "system" fn pin_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             WM_MOUSEMOVE => {
                 let cx = (l.0 & 0xFFFF) as i16 as i32;
                 let cy = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
-                let drag = PIN_DRAG.lock().ok().and_then(|d| *d);
-                if let Some(d) = drag.filter(|d| d.hwnd == hwnd.0 as isize) {
-                    let _ = SetWindowPos(
-                        hwnd,
-                        None,
-                        d.origin.0 + (cx - d.cursor.0),
-                        d.origin.1 + (cy - d.cursor.1),
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOZORDER,
-                    );
+                // 在拖：目标位置每一步都按**当前真实光标**重算，不用这条消息里的客户区坐标
+                // —— 那两格是相对窗口当时的左上角算的，而窗口自己正被这条消息挪走。
+                let mut dragging = false;
+                let mut drag_to = None;
+                if let Ok(mut g) = PIN_DRAG.lock() {
+                    if let Some(d) = g.as_mut().filter(|d| d.hwnd == hwnd.0 as isize) {
+                        dragging = true;
+                        let mut screen = POINT::default();
+                        if GetCursorPos(&mut screen).is_ok() {
+                            let t = (
+                                d.origin.0 + (screen.x - d.press.0),
+                                d.origin.1 + (screen.y - d.press.1),
+                            );
+                            if t != d.last {
+                                d.last = t;
+                                drag_to = Some(t);
+                            }
+                        }
+                    }
+                }
+                if dragging {
+                    if let Some((x, y)) = drag_to {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            x,
+                            y,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
                     return LRESULT(0);
                 }
                 // 不在拖动：这一趟只判"光标是不是压在 ✕ 上"，压着才把按钮画出来。
@@ -11153,6 +11186,77 @@ mod pin_tests {
             (1, 1),
             "半像素要进到 1，不是截成 0"
         );
+    }
+
+    /// 拖动贴图必须 1:1 跟着光标走，一步一步都不许落后。
+    ///
+    /// 这一条是量出来的：按下时如果记的是**客户区**坐标，之后又拿客户区坐标去减它，
+    /// 那这个基准会跟着窗口自己走 —— 每挪一次窗口就换一次坐标系，窗口于是在"该在的位置"
+    /// 与"按下时那一格"之间来回跳（屏上就是抖/闪）。
+    /// 这里按操作系统的规矩把每条 WM_MOUSEMOVE 的 lParam 算成"那一刻光标在当前客户区里的
+    /// 坐标"（窗口每步都会挪，所以这个值不是累计位移），再要求窗口落在 origin + 累计位移上。
+    ///
+    /// 会真的在桌面上摆出贴图窗口、还会挪真实光标，所以默认不跑：
+    /// `cargo test -p focusflow-native --bins -- --ignored dragging_a_pin`
+    #[test]
+    #[ignore = "会真的在桌面上摆出贴图窗口并挪动真实光标"]
+    fn dragging_a_pin_follows_the_cursor_one_to_one() {
+        unsafe {
+            let _serial = probe_guard();
+            open_test_pins(1);
+            pump(400);
+            let hwnd = PINS
+                .lock()
+                .ok()
+                .and_then(|v| v.first().map(|p| p.hwnd))
+                .map(|h| HWND(h as *mut core::ffi::c_void))
+                .expect("贴图没开出来");
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rc);
+            let origin = (rc.left, rc.top);
+            let mut home = POINT::default();
+            let _ = GetCursorPos(&mut home);
+            let press = (origin.0 + 10, origin.1 + 10);
+            let _ = SetCursorPos(press.0, press.1);
+            pump(150);
+            post(hwnd, WM_LBUTTONDOWN, 0, lp(10, 10));
+            pump(120);
+            assert!(
+                PIN_DRAG.lock().map(|d| d.is_some()).unwrap_or(false),
+                "按下之后没进拖动状态：这条判据连控制点都没立起来"
+            );
+
+            let steps = 12;
+            for i in 1..=steps {
+                let target = (press.0 + 10 * i, press.1 + 6 * i);
+                let _ = SetCursorPos(target.0, target.1);
+                let mut cur = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut cur);
+                // 操作系统算 lParam 的口径：光标这一刻在窗口客户区里的坐标。
+                post(
+                    hwnd,
+                    WM_MOUSEMOVE,
+                    0,
+                    lp(target.0 - cur.left, target.1 - cur.top),
+                );
+                pump(60);
+                let _ = GetWindowRect(hwnd, &mut rc);
+                assert_eq!(
+                    (rc.left, rc.top),
+                    (origin.0 + 10 * i, origin.1 + 6 * i),
+                    "第 {i} 步没跟上：该在 origin + ({}, {})，实际 ({}, {})",
+                    10 * i,
+                    6 * i,
+                    rc.left - origin.0,
+                    rc.top - origin.1
+                );
+            }
+
+            post(hwnd, WM_LBUTTONUP, 0, lp(0, 0));
+            pump(120);
+            assert_eq!(close_all_pins(), 1, "收尾时该只有这一张");
+            let _ = SetCursorPos(home.x, home.y);
+        }
     }
 }
 
