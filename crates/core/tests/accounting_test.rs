@@ -215,6 +215,63 @@ fn legacy_db_migration() {
     assert_eq!(cnt, 0, "旧 subcategories 表应被移除");
 }
 
+/// 重并不许盖掉两次之间用户自己加的子分类。
+///
+/// 这条迁移的常规路径就是"再来一次"：旧 `subcategories` 表收不掉（别的连接握着它）
+/// ⇒ 下一次启动又并一遍。旧写法把旧表那一串**整串覆盖**进 `subs`，于是第一次并完
+/// 之后用户自己加的那一项在第二次开机时凭空消失，日志还写着合并成功。
+/// 判据要能看见重跑：夹具本身就是"第二次开机"那个状态（旧表还在、列里已有用户项），
+/// 长度与顺序一起钉 —— 只钉"有没有"就看不见多出来的那一份。
+#[test]
+fn a_second_merge_keeps_what_the_user_added_in_between() {
+    let _g = guard();
+    let dir = paths::test_app_dir("acc_rerun");
+    let db = dir.path().join("data").join("focusflow_accounting.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                type TEXT NOT NULL DEFAULT 'both',
+                subs TEXT NOT NULL DEFAULT '[]',
+                sort_order INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE subcategories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category_id INTEGER NOT NULL,
+                sort_order INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO categories (name, type, subs, created_at) VALUES ('游戏','both','充值,自己加的','2026-01-01');
+            INSERT INTO subcategories (name, category_id, created_at) VALUES ('梦幻西游',1,'2026-01-01');
+            INSERT INTO subcategories (name, category_id, created_at) VALUES ('充值',1,'2026-01-01');",
+        )
+        .unwrap();
+    }
+
+    accounting::init_db().unwrap();
+    let cats = accounting::get_all_categories().0;
+    let game = cats.iter().find(|c| c.name == "游戏").unwrap();
+    assert_eq!(
+        game.subs,
+        vec!["充值", "自己加的", "梦幻西游"],
+        "重并应当保住用户那一份、只并进缺的那一份，且顺序稳定"
+    );
+
+    // 第三次开机：旧表已被第一次的收尾删掉 ⇒ 并的那一步不再执行，清单不该再动。
+    accounting::init_db().unwrap();
+    let after = accounting::get_all_categories().0;
+    let game2 = after.iter().find(|c| c.name == "游戏").unwrap();
+    assert_eq!(
+        game2.subs,
+        vec!["充值", "自己加的", "梦幻西游"],
+        "旧表删掉之后再来一次，清单却变了"
+    );
+}
+
 #[test]
 fn category_management_crud() {
     // 分类管理 API：添加/重命名/删除分类、子分类增删改 + 历史记录同步

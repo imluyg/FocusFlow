@@ -190,7 +190,8 @@ pub fn init_db() -> anyhow::Result<()> {
                     );
                 }
                 // 只有合并真的走完才收掉旧表；收不掉不算失败：下一次还会重并一次，
-                // 而 `UPDATE categories SET subs=` 是按整串覆盖写的，不会越写越多。
+                // 而合并走的是"并进去"（见 `merge_legacy_subcategories`）⇒ 重并既不会
+                // 多出重复项，也不会盖掉两次之间用户自己加的那几个子分类。
                 if let Err(e) = conn.execute("DROP TABLE IF EXISTS subcategories", []) {
                     tracing::warn!("旧 subcategories 表没能删掉（{e}）：下一次启动会再并一次");
                 }
@@ -294,9 +295,23 @@ fn merge_legacy_subcategories(conn: &Connection) -> Result<usize, String> {
         }
     }
     for (cat, subs) in &cat_subs {
+        // **并**，不覆盖。重并不是罕见边角：旧表收不掉（别的连接握着它）就是下一次启动
+        // 再来一次，而两次之间用户完全可以自己加过子分类 —— 整串覆盖会把那些抹掉，
+        // 还回一句"合并完成"。读不动时更不能拿旧表那一串去盖：与 `add_subcategory`
+        // 同一把尺子（`read_subs` 的三态），这一轮失败、旧表原样留着，下次重来。
+        let mut all: Vec<String> = match read_subs(conn, cat) {
+            SubsRead::Present(v) => v,
+            SubsRead::MissingCategory => continue,
+            SubsRead::Unreadable(why) => return Err(why),
+        };
+        for s in subs {
+            if !all.iter().any(|x| x == s) {
+                all.push(s.clone());
+            }
+        }
         conn.execute(
             "UPDATE categories SET subs=?1 WHERE name=?2",
-            rusqlite::params![subs.join(","), cat],
+            rusqlite::params![all.join(","), cat],
         )
         .map_err(|e| format!("分类 [{cat}] 的 subs 写不进去: {e}"))?;
     }
