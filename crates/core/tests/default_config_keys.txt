@@ -29,7 +29,6 @@ listener/mouse_enabled
 listener/scroll_burst_window
 paths/data_home
 paths/data_migrate_from
-pin/renderer
 plugins/instruction_limit
 plugins/memory_limit_mb
 pomodoro/auto_break

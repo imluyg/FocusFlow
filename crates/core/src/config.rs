@@ -131,9 +131,9 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     // true = 整场截图都不显示；false = 冻结画面一抓完就还回去（旧观感，覆盖层上屏前会
     // 闪一下真实桌面）。默认 true —— 冻结图里没有卡片，中途再让它冒出来只会多一次闪。
     s("snip", &[("hide_floating", "true")]);
-    // 贴图用哪套绘制：webview（旧前端，一张图一个浏览器页面）/ native（原生分层窗口，
-    // 一张图一个窗口）。原生端只有一套 ⇒ 这个键现在没有读点，留着只为读得通旧档。
-    s("pin", &[("renderer", "webview")]);
+    // 注：`[pin] renderer` 这一档不再写默认值 —— 它与下面 DEPRECATED_CONFIG 里那几行
+    // 同一族（旧前端"一张图一个浏览器页面"的选择，原生端只有一套绘制），
+    // 全仓零读点却天天落盘，用户改了没反应。老文件里的那一行在 load 时清掉。
     s(
         "pomodoro",
         &[
@@ -196,6 +196,10 @@ const DEPRECATED_CONFIG: &[(&str, &[&str])] = &[
     // 番茄钟真正的开关是 `[plugins] disabled`（整节插件停用），这个键从来没被读过
     ("pomodoro", &["enabled"]),
     ("database", &["batch_size"]),
+    // 贴图那两套绘制器的同族一行：旧前端"一张图一个浏览器页面"随前端删了，原生端只有一套。
+    // 它此前还天天写进新装的 config.ini，值就是那个已经不存在的 `webview` ——
+    // 2026-10-30 按"每次落盘、全仓零读点"这把尺子收掉（与上面 gui 那几行同一族）。
+    ("pin", &["renderer"]),
 ];
 
 /// 解析 INI：兼容 Python configparser 的 `#`/`;` 注释与 `key = value` 语法。
@@ -1665,6 +1669,8 @@ tooltip_interval = 5
              [pomodoro]
 enabled = false
 work_minutes = 45
+             [pin]
+renderer = webview
 ",
         )
         .unwrap();
@@ -1694,6 +1700,9 @@ work_minutes = 45
             ("gui", "suspend_hidden"),
             ("gui", "floating_renderer"),
             ("gui", "default_period"),
+            // 贴图那套"用哪个绘制器"的同族：旧前端删了，原生端只有一套，
+            // 而它此前还天天写进新装的文件（值 = 已经不存在的 webview）
+            ("pin", "renderer"),
         ] {
             assert!(
                 cfg.get(section, key).is_empty(),
@@ -1718,6 +1727,7 @@ work_minutes = 45
                     "show_key_groups",
                     "font",
                     "today_count_cache_ttl",
+                    "renderer",
                 ]
                 .iter()
                 .any(|k| l.starts_with(k))
@@ -1731,6 +1741,10 @@ work_minutes = 45
         assert!(
             !on_disk.contains("[tray]"),
             "清空之后的 [tray] 节不该被回写"
+        );
+        assert!(
+            !on_disk.contains("[pin]"),
+            "清空之后的 [pin] 节不该被回写（贴图只剩一套绘制器）: {on_disk}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
