@@ -38,7 +38,9 @@ mkdir "%DIST%\data"
 mkdir "%DIST%\assets"
 copy /y "%ROOT%target\release\FocusFlow.exe" "%DIST%\FocusFlow.exe" >nul
 if exist "%ROOT%desktop-native\assets\*" copy /y "%ROOT%desktop-native\assets\*" "%DIST%\assets\" >nul
-if exist "%ROOT%config.ini" copy /y "%ROOT%config.ini" "%DIST%\config.ini" >nul
+REM No config.ini in the package: the repo-root one is gitignored and is the developer's
+REM local file, so it drifts from default_config() (e.g. scroll_burst_window 0.8 vs 0.25).
+REM The app writes the code defaults on first run, which is what a fresh install should get.
 copy /y "%ROOT%crates\core\plugins\*.lua" "%DIST%\plugins\" >nul
 
 echo [3/5] Packing portable zip...
