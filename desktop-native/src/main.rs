@@ -54,9 +54,9 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, GetMonitorInfoW,
-    GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, Rectangle, SelectObject,
-    SetBkColor, SetBkMode, SetTextColor, StretchDIBits, TextOutW, UpdateWindow, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, Rectangle, ScreenToClient,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, StretchDIBits, TextOutW, UpdateWindow,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
     DEFAULT_PITCH, DIB_RGB_COLORS, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ,
     MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID,
     SRCCOPY, TRANSPARENT,
@@ -187,6 +187,17 @@ pub struct Theme {
     pub overlay: D2D1_COLOR_F,
     /// 页面底色（清屏色）。
     pub page: D2D1_COLOR_F,
+    /// 卡片/浮层的落影底色（逐环 alpha 见 [`SHADOW_RINGS`]）。alpha 为 0 = 这个主题不画阴影。
+    pub shadow: D2D1_COLOR_F,
+    /// 卡片/浮层顶部那条 1px 高光。alpha 为 0 = 不画（浅色实心档）。
+    pub highlight: D2D1_COLOR_F,
+    /// 表格斑马纹。**单开一格**：以前斑马纹、表头、悬停共用 `header`，
+    /// 奇数行悬停时颜色一点不变，看着像"这一行点了没反应"。
+    pub zebra: D2D1_COLOR_F,
+    /// 行悬停底色（压在斑马纹之上，表格/设置/插件三处共用）。
+    pub row_hover: D2D1_COLOR_F,
+    /// 控件悬停叠加层：盖在按钮/药丸自己的底色上，白底与主色底上都成立。
+    pub hover: D2D1_COLOR_F,
     /// 原生 EDIT 的底色与文字色：EDIT 不认 D2D，只能单独喂给 `WM_CTLCOLOREDIT`。
     pub edit_bg: (u8, u8, u8),
     pub edit_fg: (u8, u8, u8),
@@ -209,17 +220,30 @@ impl Tokens {
     }
 }
 
+/// 投影 = 6 圈同心圆角矩形，外→内 alpha 递增，叠出来是一条软边。
+///
+/// 不用 `ID2D1Effect`（那是另一套设备资源，Mica 合成路径上拿不到，本仓也没有
+/// effect 资源管线）；6 次 `FillRoundedRectangle` 每帧不到 100 次，不值得引新管线。
+const SHADOW_RINGS: [(f32, f32); 6] = [
+    (1.0, 0.030),
+    (2.0, 0.024),
+    (4.0, 0.018),
+    (6.0, 0.013),
+    (8.0, 0.009),
+    (10.0, 0.006),
+];
+
 fn light_theme(glass: bool) -> Theme {
     let (page, card, header, border) = if glass {
         (
-            color_a(0xF7, 0xFA, 0xFE, 0.86),
+            color_a(0xF2, 0xF6, 0xFC, 0.86),
             color_a(0xFF, 0xFF, 0xFF, 0.62),
             color_a(0xF1, 0xF5, 0xFB, 0.72),
             color(0xE5, 0xEC, 0xF8),
         )
     } else {
         (
-            color(0xF7, 0xFA, 0xFE),
+            color(0xF2, 0xF6, 0xFC),
             color(0xFF, 0xFF, 0xFF),
             color(0xF1, 0xF5, 0xFB),
             color(0xE5, 0xEC, 0xF8),
@@ -230,7 +254,7 @@ fn light_theme(glass: bool) -> Theme {
         header,
         border,
         fg: color(0x1A, 0x1A, 0x2E),
-        muted: color(0x4A, 0x4A, 0x6A),
+        muted: color(0x59, 0x60, 0x74),
         accent: color(0x4D, 0x8C, 0xF7),
         accent_soft: color(0xE8, 0xF0, 0xFE),
         grid: color(0xE3, 0xEA, 0xF6),
@@ -240,6 +264,17 @@ fn light_theme(glass: bool) -> Theme {
         modal: color(0xFF, 0xFF, 0xFF),
         overlay: color_a(0x18, 0x28, 0x50, 0.35),
         page,
+        // 带一点蓝的深色：纯黑落在淡蓝页面上像脏污。
+        shadow: color(0x1B, 0x2A, 0x4A),
+        // 玻璃档的卡片是半透明的，阴影会从卡片里面透出来 ⇒ 只留顶部一条高光。
+        highlight: if glass {
+            color_a(0xFF, 0xFF, 0xFF, 0.30)
+        } else {
+            color_a(0xFF, 0xFF, 0xFF, 0.0)
+        },
+        zebra: color_a(0x4D, 0x8C, 0xF7, 0.045),
+        row_hover: color_a(0x4D, 0x8C, 0xF7, 0.10),
+        hover: color_a(0x0F, 0x17, 0x2A, if glass { 0.06 } else { 0.05 }),
         edit_bg: (0xFF, 0xFF, 0xFF),
         edit_fg: (0x1A, 0x1A, 0x2E),
     }
@@ -250,15 +285,15 @@ fn dark_theme(glass: bool) -> Theme {
         (
             // 深色玻璃这一档沿用 §10b 调过的 0.86：壁纸只淡淡透出，界面仍是深色。
             color_a(0x10, 0x13, 0x1C, 0.86),
-            color_a(0x1E, 0x23, 0x31, 0.55),
-            color_a(0x23, 0x2A, 0x3C, 0.70),
+            color_a(0x21, 0x27, 0x36, 0.55),
+            color_a(0x28, 0x30, 0x44, 0.70),
             color_a(0x2A, 0x30, 0x42, 0.90),
         )
     } else {
         (
             color(0x10, 0x13, 0x1C),
-            color(0x1E, 0x23, 0x31),
-            color(0x23, 0x2A, 0x3C),
+            color(0x21, 0x27, 0x36),
+            color(0x28, 0x30, 0x44),
             color(0x2A, 0x30, 0x42),
         )
     };
@@ -267,17 +302,23 @@ fn dark_theme(glass: bool) -> Theme {
         header,
         border,
         fg: color(0xE8, 0xEA, 0xEE),
-        muted: color(0x8A, 0x92, 0xA6),
+        muted: color(0x98, 0xA1, 0xB5),
         accent: color(0x5B, 0x9C, 0xF7),
         accent_soft: color_a(0x22, 0x30, 0x4A, 0.95),
         grid: color(0x2E, 0x35, 0x48),
         white: color(0xFF, 0xFF, 0xFF),
         success: color(0x34, 0xD3, 0x99),
         danger: color(0xF8, 0x71, 0x71),
-        modal: color(0x1E, 0x23, 0x31),
+        modal: color(0x24, 0x2A, 0x3B),
         overlay: color_a(0x05, 0x07, 0x0B, 0.55),
         page,
-        edit_bg: (0x1E, 0x23, 0x31),
+        // 深色页面上黑影看不见，只会把卡片边缘糊掉 ⇒ 不画阴影，改顶部高光。
+        shadow: color_a(0x00, 0x00, 0x00, 0.0),
+        highlight: color_a(0xFF, 0xFF, 0xFF, if glass { 0.10 } else { 0.055 }),
+        zebra: color_a(0xFF, 0xFF, 0xFF, 0.03),
+        row_hover: color_a(0x5B, 0x9C, 0xF7, 0.14),
+        hover: color_a(0xFF, 0xFF, 0xFF, if glass { 0.08 } else { 0.07 }),
+        edit_bg: (0x21, 0x27, 0x36),
         edit_fg: (0xE8, 0xEA, 0xEE),
     }
 }
@@ -323,11 +364,29 @@ struct Brushes {
     danger: ID2D1SolidColorBrush,
     /// 模态遮罩：压在整屏上的半透明层。
     overlay: ID2D1SolidColorBrush,
+    /// 卡片落影（按 [`SHADOW_RINGS`] 从内到外各一把）与浮层用的加强版。
+    shadow: Vec<ID2D1SolidColorBrush>,
+    shadow_strong: Vec<ID2D1SolidColorBrush>,
+    highlight: ID2D1SolidColorBrush,
+    zebra: ID2D1SolidColorBrush,
+    row_hover: ID2D1SolidColorBrush,
+    hover: ID2D1SolidColorBrush,
 }
 
 impl Brushes {
     fn new(rt: &ID2D1RenderTarget, t: &Theme) -> windows::core::Result<Self> {
         let mk = |c: D2D1_COLOR_F| unsafe { rt.CreateSolidColorBrush(&c, None) };
+        let rings = |k: f32| -> windows::core::Result<Vec<ID2D1SolidColorBrush>> {
+            SHADOW_RINGS
+                .iter()
+                .map(|(_, a)| {
+                    mk(D2D1_COLOR_F {
+                        a: (t.shadow.a * a * k).min(1.0),
+                        ..t.shadow
+                    })
+                })
+                .collect()
+        };
         Ok(Self {
             card: mk(t.card)?,
             header: mk(t.header)?,
@@ -342,6 +401,12 @@ impl Brushes {
             danger: mk(t.danger)?,
             modal: mk(t.modal)?,
             overlay: mk(t.overlay)?,
+            shadow: rings(1.0)?,
+            shadow_strong: rings(1.8)?,
+            highlight: mk(t.highlight)?,
+            zebra: mk(t.zebra)?,
+            row_hover: mk(t.row_hover)?,
+            hover: mk(t.hover)?,
         })
     }
 }
@@ -644,6 +709,20 @@ struct PvSelect {
     scroll: usize,
 }
 
+/// 指针此刻压在哪个"稳定控件"上（手型光标与悬停底色共用）。
+///
+/// 只覆盖画图与命中测试读同一份几何的那几组：周期药丸、视图页签、分析子页签、
+/// 排行页药丸、设置页导航。弹窗 / 下拉 / 插件视图那棵点击树不复刻到这里 ——
+/// 宁可那几处保持箭头，也不要出现"手型指着一个点不动的区域"。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ctl {
+    Period(u8),
+    ViewTab(u8),
+    ATab(u8),
+    RankPill(u8),
+    SetNav(u8),
+}
+
 struct App {
     d2d: ID2D1Factory,
     /// 只为持有生命周期：文本格式对象各自持有自己的引用，但工厂得活着。
@@ -727,6 +806,8 @@ struct App {
     /// 上一次重算插件视图的时间戳（1 秒一次就够，别跟着 100ms 心跳跑）。
     last_pv_refresh: Option<std::time::Instant>,
     hover: Option<usize>,
+    /// 指针下的控件（药丸/页签/导航）：只影响底色与光标形状，不参与点击判定。
+    ctl: Option<Ctl>,
     sel: Option<usize>,
     /// 行内编辑用的原生 EDIT 子窗口（懒创建，一直复用）。
     edit: Option<HWND>,
@@ -1107,6 +1188,7 @@ impl App {
                 plugin_sel: HashMap::new(),
                 last_pv_refresh: None,
                 hover: None,
+                ctl: None,
                 sel: None,
                 edit: None,
                 edit_target: None,
@@ -1231,6 +1313,7 @@ impl App {
                 br,
                 fmt: &self.fmt,
                 pal,
+                dw: &self.dwrite,
             };
             let vs = ViewState {
                 view: self.view,
@@ -1240,6 +1323,7 @@ impl App {
                 scroll: self.scroll,
                 period: self.period.load(std::sync::atomic::Ordering::Relaxed),
                 hover: self.hover,
+                ctl: self.ctl,
                 sel: self.sel,
                 editing: self.edit_row,
                 capturing: self.capturing,
@@ -1317,6 +1401,61 @@ impl App {
         )
     }
 
+    /// 指针落在哪个稳定控件上。顺序与 `on_click` 一致（药丸 → 页签 → 子页签 → 排行药丸 →
+    /// 设置导航），几何全部读画图用的那一份；弹窗与插件视图不在这里复刻（见 [`Ctl`]）。
+    fn control_at(&self, w: f32, h: f32, x: f32, y: f32) -> Option<Ctl> {
+        if self.detail.is_some() || self.plugin_open.is_some() {
+            return None;
+        }
+        for (i, (_, r)) in period_pills().iter().enumerate() {
+            if hit(*r, x, y) {
+                return Some(Ctl::Period(i as u8));
+            }
+        }
+        for (i, r) in view_tabs().iter().enumerate() {
+            if hit(*r, x, y) {
+                return Some(Ctl::ViewTab(i as u8));
+            }
+        }
+        match self.view {
+            0 => {
+                let pills = rank_pills(left_card(w, h));
+                for (i, r) in pills.iter().enumerate() {
+                    // 「分组」那一屏不画筛选三格（`draw_table` 同样只画前两颗）。
+                    if self.rank_tab == 1 && i >= 2 {
+                        break;
+                    }
+                    if hit(*r, x, y) {
+                        return Some(Ctl::RankPill(i as u8));
+                    }
+                }
+            }
+            3 => {
+                for (i, r) in atab_tabs().iter().enumerate() {
+                    if hit(*r, x, y) {
+                        return Some(Ctl::ATab(i as u8));
+                    }
+                }
+            }
+            5 => {
+                let g = settings_geom(w, h);
+                for i in 0..SETTINGS_CATS.len() {
+                    let nr = rect(
+                        g.nav_x,
+                        g.nav_y + i as f32 * g.cat_h,
+                        g.nav_w,
+                        g.cat_h - 4.0,
+                    );
+                    if hit(nr, x, y) {
+                        return Some(Ctl::SetNav(i as u8));
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// 鼠标移动：排行页更新悬停行，分析页更新悬停键 / 悬停那一格；返回是否需要重画。
     fn on_move(&mut self, hwnd: HWND, px: f32, py: f32) -> bool {
         let mut changed = false;
@@ -1325,11 +1464,17 @@ impl App {
             changed |= self.hover.take().is_some();
             changed |= self.heat_hover.take().is_some();
             changed |= self.chart_hover.take().is_some();
+            changed |= self.ctl.take().is_some();
             return changed;
         }
         let (w, h) = self.client_dip(hwnd);
         let s = self.scale(hwnd);
         let (x, y) = (px / s, py / s);
+        // 控件悬停只影响底色与光标，不参与点击判定；每一条早退分支之前算完，
+        // 免得"在分析页上药丸不亮"。
+        let ctl = self.control_at(w, h, x, y);
+        changed |= ctl != self.ctl;
+        self.ctl = ctl;
 
         if self.view == 3 {
             changed |= self.hover.take().is_some();
@@ -3145,6 +3290,8 @@ struct P<'a> {
     fmt: &'a Formats,
     /// 当前主题的原始颜色：图表柱/热力块要按强度现调 alpha，画笔里没有这一档。
     pal: &'a Theme,
+    /// 量文字宽度用（页签下划线跟着文字走，见 `measure_text`）。
+    dw: &'a IDWriteFactory,
 }
 
 impl P<'_> {
@@ -3166,6 +3313,11 @@ impl P<'_> {
         fill: &ID2D1SolidColorBrush,
         border: Option<&ID2D1SolidColorBrush>,
     ) {
+        // 四档圆角是"观感档位"，不是"像素值"：8px 的圆点上 R_CONTROL 会变成方块套圆角，
+        // 所以按短边的一半夹一刀 —— 小元素自动变成胶囊/圆点，调用点不用再单独挑档。
+        let radius = radius
+            .min((r.right - r.left).min(r.bottom - r.top) / 2.0)
+            .max(0.0);
         let rr = D2D1_ROUNDED_RECT {
             rect: r,
             radiusX: radius,
@@ -3188,6 +3340,107 @@ impl P<'_> {
                 w,
                 None,
             );
+        }
+    }
+
+    /// 卡片落影：按 [`SHADOW_RINGS`] 从外到内叠 6 圈，每圈半径跟着外扩量一起长，
+    /// 这样四角仍是同心弧、不会露出直角。
+    ///
+    /// **半透明卡片下面不画阴影**：玻璃档卡片 alpha < 1，阴影会从卡片里透出来，
+    /// 整张卡看着像蒙了一层灰。深色主题 `shadow.a == 0`，同样不画。
+    fn shadow(&self, r: D2D_RECT_F, radius: f32, strong: bool, dy: f32) {
+        if self.pal.card.a < 0.99 || self.pal.shadow.a <= 0.0 {
+            return;
+        }
+        let brushes = if strong {
+            &self.br.shadow_strong
+        } else {
+            &self.br.shadow
+        };
+        for (i, (spread, _)) in SHADOW_RINGS.iter().enumerate().rev() {
+            let Some(b) = brushes.get(i) else { continue };
+            let rr = rect(
+                r.left - spread,
+                r.top - spread + dy,
+                (r.right - r.left) + spread * 2.0,
+                (r.bottom - r.top) + spread * 2.0,
+            );
+            self.round(rr, radius + spread, b, None);
+        }
+    }
+
+    /// 卡片顶边那条 1px 高光：深色/玻璃档没有阴影，靠它把卡片从页面里"抬"起来。
+    fn top_highlight(&self, r: D2D_RECT_F, radius: f32) {
+        if self.pal.highlight.a <= 0.0 {
+            return;
+        }
+        self.line(
+            r.left + radius,
+            r.top + 0.5,
+            r.right - radius,
+            r.top + 0.5,
+            &self.br.highlight,
+            1.0,
+        );
+    }
+
+    /// 普通卡片：落影 + 卡底色 + 1px 边框 + 顶部高光。
+    fn card(&self, r: D2D_RECT_F, radius: f32) {
+        self.shadow(r, radius, false, 1.5);
+        self.round(r, radius, &self.br.card, Some(&self.br.border));
+        self.top_highlight(r, radius);
+    }
+
+    /// 浮层（弹窗 / 下拉）：阴影更重、底色用**不透明**的 `modal` —— 玻璃档拿半透明
+    /// `card` 当弹窗底，下面的表格字会透上来。
+    fn overlay_card(&self, r: D2D_RECT_F, radius: f32) {
+        self.shadow(r, radius, true, 6.0);
+        self.round(r, radius, &self.br.modal, Some(&self.br.border));
+        self.top_highlight(r, radius);
+    }
+
+    /// 某串文字在给定档位下的宽度（DIP）。`P::text` 走的是 DrawText，拿不到度量，
+    /// 所以单独建一次 layout —— 只在页签下划线那处用，一次重画最多问一次。
+    fn measure(&self, s: &str, f: &IDWriteTextFormat) -> Option<f32> {
+        measure_text(self.dw, s, f)
+    }
+
+    /// 折线下面的淡色面积：一条 2px 线孤零零挂在网格上，图卡看着就是个空框。
+    /// 建几何失败就跳过（与 `P::brush` 同一策略：画不出就不画，不 panic）。
+    fn area(&self, pts: &[Vector2], plot: D2D_RECT_F) {
+        if pts.len() < 2 {
+            return;
+        }
+        let Ok(factory) = (unsafe { self.rt.GetFactory() }) else {
+            return;
+        };
+        let Ok(path) = (unsafe { factory.CreatePathGeometry() }) else {
+            return;
+        };
+        let Ok(sink) = (unsafe { path.Open() }) else {
+            return;
+        };
+        let last = pts[pts.len() - 1];
+        unsafe {
+            sink.BeginFigure(pts[0], D2D1_FIGURE_BEGIN_FILLED);
+            for pt in &pts[1..] {
+                sink.AddLine(*pt);
+            }
+            sink.AddLine(Vector2 {
+                X: last.X,
+                Y: plot.bottom,
+            });
+            sink.AddLine(Vector2 {
+                X: pts[0].X,
+                Y: plot.bottom,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            let _ = sink.Close();
+        }
+        if let Some(b) = self.brush(with_alpha(self.pal.accent, 0.10)) {
+            unsafe {
+                self.rt.FillGeometry(&path, &b, None);
+            }
         }
     }
 
@@ -3432,7 +3685,7 @@ fn draw_settings(
     filter: &str,
 ) {
     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
-    p.round(card, 14.0, &p.br.card, Some(&p.br.border));
+    p.card(card, R_CARD);
     p.text(
         "设置",
         rect(card.left + 16.0, card.top + 10.0, 160.0, 24.0),
@@ -3449,7 +3702,7 @@ fn draw_settings(
 
     // 搜索框：底框画在这里，真正的输入是叠在上面的原生 EDIT（见 place_search_edit）。
     let sbox = search_box_rect(w);
-    p.round(sbox, 7.0, &p.br.header, Some(&p.br.border));
+    p.round(sbox, R_CONTROL, &p.br.header, Some(&p.br.border));
     if filter.is_empty() {
         p.text(
             "搜索设置（名称或段.键）…",
@@ -3479,7 +3732,9 @@ fn draw_settings(
         );
         let active = i == vs.settings_cat;
         if active {
-            p.round(nr, 8.0, &p.br.accent_soft, None);
+            p.round(nr, R_CONTROL, &p.br.accent_soft, None);
+        } else if vs.ctl == Some(Ctl::SetNav(i as u8)) {
+            p.round(nr, R_CONTROL, &p.br.row_hover, None);
         }
         p.text(
             label,
@@ -3532,9 +3787,9 @@ fn draw_settings(
             g.row_h - 2.0,
         );
         if vs.sel == Some(idx) {
-            p.round(r, 6.0, &p.br.accent_soft, None);
+            p.round(r, R_CONTROL, &p.br.accent_soft, None);
         } else if vs.hover == Some(idx) {
-            p.fill(r, &p.br.header);
+            p.fill(r, &p.br.row_hover);
         }
         match items[idx] {
             SItem::Setting(i) => {
@@ -3561,7 +3816,12 @@ fn draw_settings(
                 let vb = rect(g.value_x, y + 9.0, g.value_w, 26.0);
                 if row.kind == 0 {
                     let on = row.value == "true";
-                    p.round(vb, 6.0, if on { &p.br.success } else { &p.br.grid }, None);
+                    p.round(
+                        vb,
+                        R_CONTROL,
+                        if on { &p.br.success } else { &p.br.grid },
+                        None,
+                    );
                     p.text(
                         if on { "开" } else { "关" },
                         vb,
@@ -3573,7 +3833,7 @@ fn draw_settings(
                     let capturing = vs.capturing == Some(i);
                     p.round(
                         vb,
-                        6.0,
+                        R_CONTROL,
                         &p.br.card,
                         Some(if editing || capturing {
                             &p.br.accent
@@ -3615,7 +3875,7 @@ fn draw_settings(
                     if let Some(b) = btn {
                         p.round(
                             b,
-                            4.0,
+                            R_MICRO,
                             if off { &p.br.accent } else { &p.br.header },
                             Some(&p.br.border),
                         );
@@ -3677,7 +3937,12 @@ fn draw_settings(
                 match b {
                     Basic::Autostart => {
                         let on = snap.autostart;
-                        p.round(vb, 6.0, if on { &p.br.success } else { &p.br.grid }, None);
+                        p.round(
+                            vb,
+                            R_CONTROL,
+                            if on { &p.br.success } else { &p.br.grid },
+                            None,
+                        );
                         p.text(
                             if on { "开" } else { "关" },
                             vb,
@@ -3695,7 +3960,12 @@ fn draw_settings(
                     Basic::Collector => {
                         let on = vs.collector_on;
                         let legacy = on && collect::legacy_running();
-                        p.round(vb, 6.0, if on { &p.br.success } else { &p.br.grid }, None);
+                        p.round(
+                            vb,
+                            R_CONTROL,
+                            if on { &p.br.success } else { &p.br.grid },
+                            None,
+                        );
                         p.text(
                             if on { "已启用" } else { "未启用" },
                             vb,
@@ -3725,7 +3995,7 @@ fn draw_settings(
                         } else {
                             ("采集中", &p.br.success, &p.br.white)
                         };
-                        p.round(vb, 6.0, bg, None);
+                        p.round(vb, R_CONTROL, bg, None);
                         p.text(label, vb, &p.fmt.center13, fg);
                         p.text(
                             if !vs.collector_on {
@@ -3742,7 +4012,12 @@ fn draw_settings(
                     }
                     Basic::Hotkey => {
                         let on = vs.hotkey_on;
-                        p.round(vb, 6.0, if on { &p.br.success } else { &p.br.grid }, None);
+                        p.round(
+                            vb,
+                            R_CONTROL,
+                            if on { &p.br.success } else { &p.br.grid },
+                            None,
+                        );
                         p.text(
                             if on { "开" } else { "关" },
                             vb,
@@ -3759,7 +4034,7 @@ fn draw_settings(
                         );
                     }
                     Basic::Snip => {
-                        p.round(vb, 6.0, &p.br.accent, None);
+                        p.round(vb, R_CONTROL, &p.br.accent, None);
                         p.text("进标注", vb, &p.fmt.center13, &p.br.white);
                         let annotate = snap_setting(snap, "hotkey", "snip_annotate");
                         p.text(
@@ -3770,7 +4045,7 @@ fn draw_settings(
                         );
                     }
                     Basic::SnipQuick => {
-                        p.round(vb, 6.0, &p.br.accent, None);
+                        p.round(vb, R_CONTROL, &p.br.accent, None);
                         p.text("松手即存", vb, &p.fmt.center13, &p.br.white);
                         let snip = snap_setting(snap, "hotkey", "snip");
                         p.text(
@@ -3786,7 +4061,7 @@ fn draw_settings(
                         let n = vs.pin_count;
                         p.round(
                             vb,
-                            6.0,
+                            R_CONTROL,
                             if n == 0 { &p.br.grid } else { &p.br.accent },
                             None,
                         );
@@ -3807,7 +4082,12 @@ fn draw_settings(
                     }
                     Basic::Floating => {
                         let on = vs.floating_on;
-                        p.round(vb, 6.0, if on { &p.br.success } else { &p.br.grid }, None);
+                        p.round(
+                            vb,
+                            R_CONTROL,
+                            if on { &p.br.success } else { &p.br.grid },
+                            None,
+                        );
                         p.text(
                             if on { "显示" } else { "隐藏" },
                             vb,
@@ -3825,7 +4105,7 @@ fn draw_settings(
                         let dark = vs.dark;
                         p.round(
                             vb,
-                            6.0,
+                            R_CONTROL,
                             if dark { &p.br.header } else { &p.br.accent },
                             Some(&p.br.border),
                         );
@@ -3843,7 +4123,7 @@ fn draw_settings(
                         );
                     }
                     Basic::WeeklyReport => {
-                        p.round(vb, 6.0, &p.br.accent, None);
+                        p.round(vb, R_CONTROL, &p.br.accent, None);
                         p.text("生成", vb, &p.fmt.center13, &p.br.white);
                         p.text(
                             "汇总上周一~周日写到 data/reports/weekly-YYYY-MM-DD.md，缺了启动时补",
@@ -3853,7 +4133,7 @@ fn draw_settings(
                         );
                     }
                     Basic::DataDir => {
-                        p.round(vb, 6.0, &p.br.header, Some(&p.br.border));
+                        p.round(vb, R_CONTROL, &p.br.header, Some(&p.br.border));
                         p.text("打开", vb, &p.fmt.center13, &p.br.fg);
                         let dir_line = if snap.pending_move.is_empty() {
                             format!(
@@ -3938,7 +4218,7 @@ fn draw_settings(
             4.0,
             g.max_rows as f32 * g.row_h,
         );
-        p.round(track, 2.0, &p.br.header, None);
+        p.round(track, R_MICRO, &p.br.header, None);
         let frac = g.max_rows as f32 / count as f32;
         let thumb_h = ((track.bottom - track.top) * frac).max(16.0);
         let max_scroll = (count - g.max_rows) as f32;
@@ -3948,7 +4228,12 @@ fn draw_settings(
             0.0
         };
         let y = track.top + ((track.bottom - track.top) - thumb_h) * t;
-        p.round(rect(track.left, y, 4.0, thumb_h), 2.0, &p.br.accent, None);
+        p.round(
+            rect(track.left, y, 4.0, thumb_h),
+            R_MICRO,
+            &p.br.accent,
+            None,
+        );
     }
 }
 
@@ -4056,7 +4341,7 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
     // 遮罩：整屏压暗，点击它等于关闭。
     p.fill(rect(0.0, 0.0, w, h), &p.br.overlay);
     let (dialog, close) = detail_rects(w, h);
-    p.round(dialog, 16.0, &p.br.modal, Some(&p.br.border));
+    p.overlay_card(dialog, R_MODAL);
 
     let x = dialog.left + 20.0;
     p.text(
@@ -4065,7 +4350,7 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
         &p.fmt.body,
         &p.br.fg,
     );
-    p.round(close, 6.0, &p.br.header, None);
+    p.round(close, R_CONTROL, &p.br.header, None);
     p.text("✕", close, &p.fmt.center_small, &p.br.muted);
 
     p.text(
@@ -4197,7 +4482,7 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
         let hh = (*v as f32 / max) * plot_height(plot);
         let bx = plot.left + i as f32 * (bw + 2.0);
         if let Some(b) = p.brush(p.pal.accent) {
-            p.round(rect(bx, plot.bottom - hh, bw, hh), 1.0, &b, None);
+            p.round(rect(bx, plot.bottom - hh, bw, hh), R_MICRO, &b, None);
         }
     }
 
@@ -4228,6 +4513,8 @@ struct ViewState {
     scroll: usize,
     period: i64,
     hover: Option<usize>,
+    /// 指针下的控件（悬停底色读它；与 `App::ctl` 同一份）。
+    ctl: Option<Ctl>,
     sel: Option<usize>,
     editing: Option<usize>,
     /// 按下录入开着的那条热键（`settings` 下标）；那一行的值框要改成"请按下组合…"。
@@ -4302,7 +4589,7 @@ fn draw_screen(
         &p.br.muted,
     );
     p.text(
-        "v0.5.0 · Direct2D",
+        "v0.5.0",
         rect(w - m - 220.0, 18.0, 220.0, 20.0),
         &p.fmt.caption_right,
         &p.br.muted,
@@ -4319,9 +4606,13 @@ fn draw_screen(
         let active = vs.period == *period;
         let r = period_pills()[i].1;
         if active {
-            p.round(r, 7.0, &p.br.accent, None);
+            p.round(r, R_CONTROL, &p.br.accent, None);
         } else {
-            p.round(r, 7.0, &p.br.card, Some(&p.br.border));
+            p.round(r, R_CONTROL, &p.br.card, Some(&p.br.border));
+            // 悬停只叠一层淡色：白底、卡片底、主色底上都成立，所以三组药丸共用一个画法。
+            if vs.ctl == Some(Ctl::Period(i as u8)) {
+                p.round(r, R_CONTROL, &p.br.hover, None);
+            }
         }
         p.text(
             label,
@@ -4377,7 +4668,7 @@ fn draw_screen(
     for (i, (label, value, sub)) in cards.iter().enumerate() {
         let cx = m + i as f32 * (cw + gap);
         let r = rect(cx, 84.0, cw, 78.0);
-        p.round(r, 12.0, &p.br.card, Some(&p.br.border));
+        p.card(r, R_CARD);
         p.text(
             label,
             rect(cx + 12.0, 94.0, cw - 24.0, 16.0),
@@ -4404,20 +4695,25 @@ fn draw_screen(
     for (i, label) in VIEWS.iter().enumerate() {
         let r = view_tabs()[i];
         let active = vs.view == i;
+        let hot = vs.ctl == Some(Ctl::ViewTab(i as u8));
         p.text(
             label,
             rect(r.left, r.top, r.right - r.left, r.bottom - r.top),
             &p.fmt.body,
-            if active { &p.br.fg } else { &p.br.muted },
+            if active || hot { &p.br.fg } else { &p.br.muted },
         );
-        if active {
-            p.line(
-                r.left,
-                r.bottom + 2.0,
-                r.left + 52.0,
-                r.bottom + 2.0,
-                &p.br.accent,
-                2.0,
+        if active || hot {
+            // 下划线跟着文字走：固定 52px 时，"设置"（两个字）和"键鼠排行"（四个字）
+            // 下面挂的是同一条线，看着像随手画的。量不出来就退回旧值。
+            let tw = p
+                .measure(label, &p.fmt.body)
+                .unwrap_or(52.0)
+                .clamp(24.0, r.right - r.left);
+            p.round(
+                rect(r.left, r.bottom + 2.0, tw, 2.0),
+                R_MICRO,
+                if active { &p.br.accent } else { &p.br.grid },
+                None,
             );
         }
     }
@@ -4519,7 +4815,7 @@ fn goal_strip_rect(w: f32) -> D2D_RECT_F {
 
 /// 每日目标条：今日进度 / 连续打卡 / 。
 fn draw_goal_strip(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
-    p.round(r, 12.0, &p.br.card, Some(&p.br.border));
+    p.card(r, R_CARD);
     let pad = 14.0;
     let Some(g) = &snap.goal else {
         p.text(
@@ -4555,12 +4851,12 @@ fn draw_goal_strip(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     let bar_x = r.left + pad + 158.0;
     // 右边留给「连续打。
     let bar = rect(bar_x, r.top + 19.0, (dots_x - bar_x - 214.0).max(40.0), 8.0);
-    p.round(bar, 4.0, &p.br.grid, None);
+    p.round(bar, R_MICRO, &p.br.grid, None);
     let pct = (today as f32 / goal as f32).clamp(0.0, 1.0);
     if pct > 0.0 {
         p.round(
             rect(bar.left, bar.top, (bar.right - bar.left) * pct, 8.0),
-            4.0,
+            R_MICRO,
             if met { &p.br.success } else { &p.br.accent },
             None,
         );
@@ -4577,7 +4873,7 @@ fn draw_goal_strip(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         let dot = rect(dots_x + i as f32 * 17.0, r.top + 16.0, 14.0, 14.0);
         p.round(
             dot,
-            3.0,
+            R_MICRO,
             if *dmet { &p.br.success } else { &p.br.grid },
             None,
         );
@@ -4592,9 +4888,12 @@ fn draw_analytics(p: &P<'_>, w: f32, h: f32, snap: &Snapshot, vs: ViewState) {
         let r = atab_tabs()[i];
         let active = vs.atab == i;
         if active {
-            p.round(r, 7.0, &p.br.accent, None);
+            p.round(r, R_CONTROL, &p.br.accent, None);
         } else {
-            p.round(r, 7.0, &p.br.card, Some(&p.br.border));
+            p.round(r, R_CONTROL, &p.br.card, Some(&p.br.border));
+            if vs.ctl == Some(Ctl::ATab(i as u8)) {
+                p.round(r, R_CONTROL, &p.br.hover, None);
+            }
         }
         p.text(
             label,
@@ -4644,7 +4943,7 @@ fn weekday_bar_height(v: f32, max: f32, plot_h: f32) -> f32 {
 
 /// 星期分布。
 fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
-    p.round(r, 14.0, &p.br.card, Some(&p.br.border));
+    p.card(r, R_CARD);
     let pad = 16.0;
     p.text(
         "星期分布",
@@ -4693,7 +4992,7 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         // 周末用绿色、工作日用强调色 —— 两套主题里都是这两个令牌。
         let base_c = if i >= 5 { p.pal.success } else { p.pal.accent };
         if let Some(b) = p.brush(with_alpha(base_c, 0.85)) {
-            p.round(bar, 4.0, &b, None);
+            p.round(bar, R_MICRO, &b, None);
         }
         p.text(
             label,
@@ -4891,7 +5190,7 @@ fn heat_geom(r: D2D_RECT_F) -> (f32, f32, f32) {
 }
 
 fn draw_heat(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
-    p.round(r, 14.0, &p.br.card, Some(&p.br.border));
+    p.card(r, R_CARD);
     p.text(
         "键盘热力",
         rect(r.left + 16.0, r.top + 14.0, 160.0, 20.0),
@@ -4927,15 +5226,15 @@ fn draw_heat(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
     for (i, k) in keys.iter().enumerate() {
         let count = counts.get(k.name).copied().unwrap_or(0);
         let base = rect(ox + k.x * u, oy + k.y * u, k.w * u - 2.0, k.h * u - 2.0);
-        p.round(base, 3.0, &p.br.card, Some(&p.br.grid));
+        p.round(base, R_MICRO, &p.br.card, Some(&p.br.grid));
         if count > 0 {
             let heat = 0.06 + 0.8 * (count as f32 / max).min(1.0);
             if let Some(b) = p.brush(with_alpha(p.pal.accent, heat)) {
-                p.round(base, 3.0, &b, None);
+                p.round(base, R_MICRO, &b, None);
             }
         }
         if hover == Some(i) {
-            p.round(base, 3.0, &p.br.card, Some(&p.br.accent));
+            p.round(base, R_MICRO, &p.br.card, Some(&p.br.accent));
         }
         // 键帽窄（鼠标簇、方向键）就换小一号字。
         let fmt = if base.right - base.left < 34.0 {
@@ -4964,7 +5263,7 @@ fn draw_heat(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
         if let Some(b) = p.brush(with_alpha(p.pal.accent, 0.06 + 0.8 * t)) {
             p.round(
                 rect(r.left + 54.0 + i as f32 * 18.0, ly + 4.0, 14.0, 14.0),
-                3.0,
+                R_MICRO,
                 &b,
                 None,
             );
@@ -5970,10 +6269,10 @@ fn draw_plugin_view(
     plugin_sel: &HashMap<String, Vec<String>>,
 ) -> D2D_RECT_F {
     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
-    p.round(card, 14.0, &p.br.card, Some(&p.br.border));
+    p.card(card, R_CARD);
 
     let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
-    p.round(back, 6.0, &p.br.header, Some(&p.br.border));
+    p.round(back, R_CONTROL, &p.br.header, Some(&p.br.border));
     p.text("← 返回", back, &p.fmt.center_small, &p.br.fg);
 
     let title = if view.title.is_empty() || view.title == name {
@@ -6059,7 +6358,7 @@ fn draw_plugin_view(
                 } else {
                     &p.br.accent
                 };
-                p.round(vb, 6.0, &p.br.card, Some(border));
+                p.round(vb, R_CONTROL, &p.br.card, Some(border));
                 p.text(
                     value,
                     rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 16.0, 18.0),
@@ -6080,7 +6379,7 @@ fn draw_plugin_view(
                     &p.br.muted,
                 );
                 let vb = select_value_rect(*r);
-                p.round(vb, 6.0, &p.br.card, Some(&p.br.accent));
+                p.round(vb, R_CONTROL, &p.br.card, Some(&p.br.accent));
                 p.text(
                     value,
                     rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 28.0, 18.0),
@@ -6101,10 +6400,10 @@ fn draw_plugin_view(
                 ..
             } => {
                 if *disabled {
-                    p.round(*r, 6.0, &p.br.grid, None);
+                    p.round(*r, R_CONTROL, &p.br.grid, None);
                     p.text(text, *r, &p.fmt.center_small, &p.br.muted);
                 } else {
-                    p.round(*r, 6.0, &p.br.accent, None);
+                    p.round(*r, R_CONTROL, &p.br.accent, None);
                     p.text(text, *r, &p.fmt.center_small, &p.br.white);
                 }
             }
@@ -6140,9 +6439,11 @@ fn draw_plugin_view(
                         .map(|id| chosen.iter().any(|c| c == id))
                         .unwrap_or(false);
                     if picked {
-                        p.round(rr, 3.0, &p.br.accent, None);
+                        // 选中行用"主色淡底 + 主色描边"，与表格/设置页的选中行同一套语言：
+                        // 实心主色只留给"当前分段"和主操作，不在一屏里出现第三种含义。
+                        p.round(rr, R_MICRO, &p.br.accent_soft, Some(&p.br.accent));
                     }
-                    let ink = if picked { &p.br.white } else { &p.br.fg };
+                    let ink = &p.br.fg;
                     for (ci, cell) in row.iter().enumerate().take(cols) {
                         p.text(
                             cell,
@@ -6159,7 +6460,7 @@ fn draw_plugin_view(
                 }
                 // 行内操作按钮
                 for (br, _, label) in buttons {
-                    p.round(*br, 4.0, &p.br.accent, None);
+                    p.round(*br, R_MICRO, &p.br.accent, None);
                     p.text(label, *br, &p.fmt.center_small, &p.br.white);
                 }
             }
@@ -6228,7 +6529,7 @@ fn select_menu_geom(
 
 fn draw_select_menu(p: &P<'_>, w: f32, h: f32, sel: &PvSelect) {
     let (menu, items, start) = select_menu_geom(sel.anchor, sel.options.len(), sel.scroll, w, h);
-    p.round(menu, 6.0, &p.br.modal, Some(&p.br.border));
+    p.overlay_card(menu, R_CONTROL);
     for (i, ir) in items.iter().enumerate() {
         let Some((val, label)) = sel.options.get(start + i) else {
             break;
@@ -6430,7 +6731,7 @@ fn modal_hit(m: &ModalRef<'_>, g: &ModalGeom, x: f32, y: f32) -> Option<ModalHit
 fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
     p.fill(rect(0.0, 0.0, w, h), &p.br.overlay);
     let g = modal_geom(m, w, h);
-    p.round(g.dialog, 16.0, &p.br.modal, Some(&p.br.border));
+    p.overlay_card(g.dialog, R_MODAL);
     p.text(
         m.title,
         rect(
@@ -6442,7 +6743,7 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
         &p.fmt.body,
         &p.br.fg,
     );
-    p.round(g.close, 6.0, &p.br.header, None);
+    p.round(g.close, R_CONTROL, &p.br.header, None);
     p.text("✕", g.close, &p.fmt.center_small, &p.br.muted);
 
     if let Some(cr) = g.content {
@@ -6458,7 +6759,7 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
             &p.br.muted,
         );
         let vb = modal_field_box(*row);
-        p.round(vb, 6.0, &p.br.card, Some(&p.br.border));
+        p.round(vb, R_CONTROL, &p.br.card, Some(&p.br.border));
         p.text(
             &f.value,
             rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 28.0, 18.0),
@@ -6476,14 +6777,14 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
     }
 
     for (br, label) in &g.buttons {
-        p.round(*br, 6.0, &p.br.header, Some(&p.br.border));
+        p.round(*br, R_CONTROL, &p.br.header, Some(&p.br.border));
         p.text(label, *br, &p.fmt.center_small, &p.br.fg);
     }
     if !m.cancel.is_empty() {
-        p.round(g.cancel, 6.0, &p.br.header, Some(&p.br.border));
+        p.round(g.cancel, R_CONTROL, &p.br.header, Some(&p.br.border));
         p.text("取消", g.cancel, &p.fmt.center_small, &p.br.fg);
     }
-    p.round(g.submit, 6.0, &p.br.accent, None);
+    p.round(g.submit, R_CONTROL, &p.br.accent, None);
     p.text(
         if m.submit_text.is_empty() {
             "确定"
@@ -6517,7 +6818,7 @@ fn one_line(s: &str, max: usize) -> String {
 
 fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>, vs: ViewState) {
     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
-    p.round(card, 14.0, &p.br.card, Some(&p.br.border));
+    p.card(card, R_CARD);
     p.text(
         "插件",
         rect(card.left + 16.0, card.top + 12.0, 80.0, 22.0),
@@ -6565,10 +6866,10 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             card.right - card.left - 32.0,
             row_h - 4.0,
         );
-        if vs.hover == Some(idx) {
-            p.fill(r, &p.br.header);
-        } else if vs.sel == Some(idx) {
-            p.round(r, 6.0, &p.br.accent_soft, None);
+        if vs.sel == Some(idx) {
+            p.round(r, R_CONTROL, &p.br.accent_soft, None);
+        } else if vs.hover == Some(idx) {
+            p.fill(r, &p.br.row_hover);
         }
         p.text(
             &row.name,
@@ -6586,7 +6887,7 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
         let vb = rect(r.right - 76.0, y + 9.0, 60.0, 22.0);
         p.round(
             vb,
-            6.0,
+            R_CONTROL,
             if row.enabled {
                 &p.br.success
             } else {
@@ -6651,7 +6952,7 @@ fn draw_placeholder(p: &P<'_>, w: f32, h: f32, view: usize) {
 }
 
 fn draw_placeholder_card(p: &P<'_>, r: D2D_RECT_F, text: &str) {
-    p.round(r, 14.0, &p.br.card, Some(&p.br.border));
+    p.card(r, R_CARD);
     p.text(
         text,
         rect(r.left, r.top + 120.0, r.right - r.left, 24.0),
@@ -6683,6 +6984,15 @@ struct TableGeom {
     /// 但这一列更窄（[`SHARE_COL_W`]），省下的宽度给名字列。
     x_share_left: f32,
 }
+
+/// 全套界面的圆角只有四档：卡片 / 浮层 / 控件 / 微元素。
+///
+/// 以前散着 11 种（1/2/3/4/5/6/7/8/12/14/16），同一个"按钮"在不同页面圆得不一样。
+/// `P::round` 会按矩形短边再夹一刀，所以小元素（8px 圆点、4px 滚动条）照样是圆的。
+const R_CARD: f32 = 14.0;
+const R_MODAL: f32 = 16.0;
+const R_CONTROL: f32 = 8.0;
+const R_MICRO: f32 = 4.0;
 
 /// 数字列（次数 / 占比）的宽度。七个数字加两个千分位逗号在 11 号字下约 55 px：
 /// 次数 72 留得下，占比「100.0%」约 40 px、52 够。两列原来分别是 96 / 58，
@@ -7233,7 +7543,7 @@ fn export_csv_text(s: &Snapshot) -> String {
 }
 
 fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
-    p.round(r, 14.0, &p.br.card, Some(&p.br.border));
+    p.card(r, R_CARD);
     let g = table_geom(r);
     let tab = vs.view.min(2);
     // 这一屏该显示哪几行（键鼠那一屏会随「分组」与筛选换内容），命中测试读的是同一份。
@@ -7306,10 +7616,13 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
             let active = vs.rank_tab == i;
             p.round(
                 pills[i],
-                6.0,
+                R_CONTROL,
                 if active { &p.br.accent } else { &p.br.card },
                 if active { None } else { Some(&p.br.border) },
             );
+            if !active && vs.ctl == Some(Ctl::RankPill(i as u8)) {
+                p.round(pills[i], R_CONTROL, &p.br.hover, None);
+            }
             p.text(
                 label,
                 pills[i],
@@ -7324,10 +7637,13 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 let active = vs.rank_filter == i;
                 p.round(
                     pills[i + 2],
-                    6.0,
+                    R_CONTROL,
                     if active { &p.br.accent } else { &p.br.card },
                     if active { None } else { Some(&p.br.border) },
                 );
+                if !active && vs.ctl == Some(Ctl::RankPill((i + 2) as u8)) {
+                    p.round(pills[i + 2], R_CONTROL, &p.br.hover, None);
+                }
                 p.text(
                     label,
                     pills[i + 2],
@@ -7347,6 +7663,16 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
             22.0,
         ),
         &p.br.header,
+    );
+    // 表头下面补一条分隔线：表头与斑马纹改用两个色之后，光靠底色已经分得开，
+    // 但列表一长、眼睛从中间进来时，这条线才是"上面是表头"的那个锚。
+    p.line(
+        r.left + g.pad,
+        g.head_y + 22.0,
+        r.right - g.pad,
+        g.head_y + 22.0,
+        &p.br.border,
+        1.0,
     );
     let heads: [&str; 4] = match (tab, vs.rank_tab) {
         (1, _) => ["排名", "应用", "时长", "占比"],
@@ -7445,9 +7771,12 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
             g.row_h - 1.0,
         );
         if vs.sel == Some(shown) {
-            p.round(row, 4.0, &p.br.accent_soft, None);
-        } else if vs.hover == Some(shown) || vis % 2 == 1 {
-            p.fill(row, &p.br.header);
+            p.round(row, R_MICRO, &p.br.accent_soft, None);
+        } else if vs.hover == Some(shown) {
+            // 悬停与斑马纹分开：以前两者共用 `header`，奇数行悬停时一点变化都看不出来。
+            p.fill(row, &p.br.row_hover);
+        } else if vis % 2 == 1 {
+            p.fill(row, &p.br.zebra);
         }
         p.text(
             &format!("{}", shown + 1),
@@ -7471,7 +7800,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                             device_name_width(&g) + 4.0,
                             g.row_h - 3.0,
                         ),
-                        4.0,
+                        R_MICRO,
                         &p.br.card,
                         Some(&p.br.accent),
                     );
@@ -7503,14 +7832,14 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 );
                 if d.has_alias {
                     let rb = restore_button(&g, y);
-                    p.round(rb, 4.0, &p.br.accent_soft, None);
+                    p.round(rb, R_MICRO, &p.br.accent_soft, None);
                     p.text("还原", rb, &p.fmt.center_small, &p.br.muted);
                 }
                 let btn = rename_button(&g, y);
                 let hot = vs.hover == Some(idx) || vs.sel == Some(idx);
                 p.round(
                     btn,
-                    4.0,
+                    R_MICRO,
                     if hot { &p.br.accent } else { &p.br.accent_soft },
                     None,
                 );
@@ -7596,7 +7925,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     // 滚动条：只有装不下时才画。拖动没做，滚轮与点击空白处先够用。
     if count > g.max_rows {
         let track = rect(r.right - 9.0, g.list_top, 4.0, g.max_rows as f32 * g.row_h);
-        p.round(track, 2.0, &p.br.header, None);
+        p.round(track, R_MICRO, &p.br.header, None);
         let frac = g.max_rows as f32 / count as f32;
         let thumb_h = ((track.bottom - track.top) * frac).max(16.0);
         let max_scroll = (count - g.max_rows) as f32;
@@ -7606,7 +7935,12 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
             0.0
         };
         let y = track.top + ((track.bottom - track.top) - thumb_h) * t;
-        p.round(rect(track.left, y, 4.0, thumb_h), 2.0, &p.br.accent, None);
+        p.round(
+            rect(track.left, y, 4.0, thumb_h),
+            R_MICRO,
+            &p.br.accent,
+            None,
+        );
     }
 
     let foot_y = r.bottom - 26.0 + 4.0;
@@ -7719,7 +8053,7 @@ fn chart_tip(p: &P<'_>, card: D2D_RECT_F, at: Vector2, text: &str) {
     let lo = card.left + 8.0;
     let x = (at.X + 10.0).clamp(lo, (card.right - w - 8.0).max(lo));
     let y = (at.Y - 26.0).clamp(card.top + 4.0, (card.bottom - 20.0).max(card.top + 4.0));
-    p.round(rect(x, y, w, 18.0), 5.0, &p.br.header, None);
+    p.round(rect(x, y, w, 18.0), R_CONTROL, &p.br.header, None);
     p.text(
         text,
         rect(x + 6.0, y + 1.0, w - 12.0, 16.0),
@@ -7753,7 +8087,7 @@ fn line_point_y(plot: D2D_RECT_F, top: i64, value: i64) -> f32 {
 }
 
 fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
-    p.round(r, 14.0, &p.br.card, Some(&p.br.border));
+    p.card(r, R_CARD);
     let pad = 12.0;
     p.text(
         "每日活跃趋势",
@@ -7783,9 +8117,13 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
     }
 
     let plot = line_plot(r);
+    // 网格压到 55% 透明：四条同样的线一起抢，折线反而不显眼。
+    let grid_weak = p.brush(with_alpha(p.pal.grid, 0.55));
     for i in 0..=4 {
         let y = line_grid_y(plot, i);
-        p.line(plot.left, y, plot.right, y, &p.br.grid, 1.0);
+        if let Some(g) = &grid_weak {
+            p.line(plot.left, y, plot.right, y, g, 1.0);
+        }
     }
 
     let series = &snap.daily;
@@ -7802,6 +8140,8 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
             Y: line_point_y(plot, top, v),
         }
     };
+    let pts: Vec<Vector2> = (0..n).map(pt).collect();
+    p.area(&pts, plot);
     for i in 1..n {
         let a = pt(i - 1);
         let b = pt(i);
@@ -7815,7 +8155,7 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
         let c = pt(0);
         p.round(
             rect(c.X - 4.0, c.Y - 4.0, 8.0, 8.0),
-            4.0,
+            R_MICRO,
             &p.br.accent,
             None,
         );
@@ -7853,7 +8193,7 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
             let c = pt(i);
             p.round(
                 rect(c.X - 5.0, c.Y - 5.0, 10.0, 10.0),
-                5.0,
+                R_MICRO,
                 &p.br.accent,
                 None,
             );
@@ -7868,7 +8208,7 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
 }
 
 fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
-    p.round(r, 14.0, &p.br.card, Some(&p.br.border));
+    p.card(r, R_CARD);
     let pad = 12.0;
     p.text(
         "小时分布",
@@ -7906,7 +8246,7 @@ fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) 
         let (x, bw) = hourly_bar_slot(plot, n, i);
         let bar = rect(x, plot.bottom - hp, bw, hp);
         if let Some(b) = p.brush(p.pal.accent) {
-            p.round(bar, 2.0, &b, None);
+            p.round(bar, R_MICRO, &b, None);
         }
         // 压住的那一根：**只描一圈，不重填**。以前照抄热力板那套"填卡片底色 + 描边"，
         // 键帽本来就是空的所以没事，柱状图里这一填就比邻柱更淡，一眼像"这一小时没数据"。
@@ -7914,7 +8254,7 @@ fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) 
             if let Some(ghost) = p.brush(with_alpha(p.pal.accent, 0.0)) {
                 p.round(
                     rect(x - 2.0, plot.bottom - hp - 2.0, bw + 4.0, hp + 4.0),
-                    4.0,
+                    R_MICRO,
                     &ghost,
                     Some(&p.br.accent),
                 );
@@ -8682,6 +9022,16 @@ fn build_formats(dw: &IDWriteFactory) -> windows::core::Result<Formats> {
     })
 }
 
+/// 量一行文字的实际宽度（DIP）。`P::text` 走 `DrawText`，拿不到度量，所以单独建一次
+/// layout；只给页签下划线用，一次重画最多问一次。建不出来就交回 `None`（退回旧宽度）。
+fn measure_text(dw: &IDWriteFactory, s: &str, f: &IDWriteTextFormat) -> Option<f32> {
+    let u: Vec<u16> = s.encode_utf16().collect();
+    let layout = unsafe { dw.CreateTextLayout(&u, f, f32::MAX, f32::MAX).ok()? };
+    let mut m = DWRITE_TEXT_METRICS::default();
+    unsafe { layout.GetMetrics(&mut m).ok()? };
+    Some(m.widthIncludingTrailingWhitespace)
+}
+
 fn text_format(
     dw: &IDWriteFactory,
     size: f32,
@@ -9140,14 +9490,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
         WM_MOUSELEAVE_MSG => {
             if let Some(app) = unsafe { app_ptr(hwnd) } {
-                if app.hover.is_some() {
-                    app.hover = None;
+                if app.hover.take().is_some() | app.ctl.take().is_some() {
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
             }
             LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            // 标题栏/边框交给系统（缩放、移动那几种光标不能抢）；只接管客户区。
+            if ((l.0 & 0xFFFF) as u32) != HTCLIENT {
+                return unsafe { DefWindowProcW(hwnd, msg, w, l) };
+            }
+            let mut hand = false;
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                let mut pt = POINT::default();
+                if unsafe { GetCursorPos(&mut pt) }.is_ok() {
+                    let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
+                    let s = app.scale(hwnd);
+                    let (cw, ch) = app.client_dip(hwnd);
+                    hand = app
+                        .control_at(cw, ch, pt.x as f32 / s, pt.y as f32 / s)
+                        .is_some();
+                }
+            }
+            let cur = if hand { IDC_HAND } else { IDC_ARROW };
+            let _ = unsafe { SetCursor(Some(LoadCursorW(None, cur).unwrap_or_default())) };
+            LRESULT(1)
         }
         WM_LBUTTONDOWN => {
             let x = (l.0 & 0xFFFF) as u16 as i16 as f32;
@@ -12309,11 +12679,7 @@ mod theme_drift_tests {
         ] {
             let t = tokens_for(name).solid;
             for (field, got, want) in [
-                (
-                    "card",
-                    (pal.card.r, pal.card.g, pal.card.b),
-                    rgb(t.card),
-                ),
+                ("card", (pal.card.r, pal.card.g, pal.card.b), rgb(t.card)),
                 (
                     "border",
                     (pal.border.r, pal.border.g, pal.border.b),
@@ -12331,10 +12697,7 @@ mod theme_drift_tests {
                     rgb(t.accent),
                 ),
             ] {
-                assert_eq!(
-                    got, want,
-                    "{name} 的悬浮窗 {field} 与主窗口不是同一个颜色"
-                );
+                assert_eq!(got, want, "{name} 的悬浮窗 {field} 与主窗口不是同一个颜色");
             }
         }
     }
@@ -12400,5 +12763,109 @@ mod text_tier_tests {
         assert_eq!(size(&f.caption_center), 12.5);
         assert_eq!(size(&f.nav_item), SETTINGS_TEXT_PT);
         assert_eq!(size(&f.text12), SETTINGS_HELP_PT);
+    }
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    /// WCAG 的相对亮度。
+    fn lum(c: D2D1_COLOR_F) -> f32 {
+        let ch = |v: f32| {
+            let v = v.clamp(0.0, 1.0);
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b)
+    }
+
+    fn ratio(a: D2D1_COLOR_F, b: D2D1_COLOR_F) -> f32 {
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// 半透明层压在底色上之后的实际颜色（只算 RGB，够用来比对比度）。
+    fn over(fg: D2D1_COLOR_F, bg: D2D1_COLOR_F) -> D2D1_COLOR_F {
+        let a = fg.a;
+        D2D1_COLOR_F {
+            r: fg.r * a + bg.r * (1.0 - a),
+            g: fg.g * a + bg.g * (1.0 - a),
+            b: fg.b * a + bg.b * (1.0 - a),
+            a: 1.0,
+        }
+    }
+
+    /// 两套主题、两个玻璃档：正文 ≥7:1、次要文字 ≥4.5:1、强调色 ≥3:1。
+    ///
+    /// 这一轮把 `muted` 调亮/调深、又给卡片加了半透明阴影，最容易出的事故是
+    /// "看着更雅了，但说明行读不清"。对比度是能把这件事变成数字的那把尺子。
+    #[test]
+    fn text_colours_stay_readable_on_their_surfaces() {
+        for glass in [false, true] {
+            for (name, t) in [("light", light_theme(glass)), ("dark", dark_theme(glass))] {
+                // 玻璃档卡片半透明：拿页面底当最坏背衬比。
+                let card = if glass { t.page } else { t.card };
+                let fg = ratio(t.fg, card);
+                let muted = ratio(t.muted, card);
+                let accent = ratio(t.accent, card);
+                assert!(fg >= 7.0, "{name} glass={glass} 正文对比度只有 {fg:.2}:1");
+                assert!(
+                    muted >= 4.5,
+                    "{name} glass={glass} 次要文字对比度只有 {muted:.2}:1"
+                );
+                assert!(
+                    accent >= 3.0,
+                    "{name} glass={glass} 强调色对比度只有 {accent:.2}:1"
+                );
+            }
+        }
+    }
+
+    /// 斑马纹要看得见，悬停必须比斑马纹更明显 —— 这两条同时成立，"奇数行悬停没反应"
+    /// 那个 bug 才算真的修掉（以前两者是同一个颜色）。
+    #[test]
+    fn zebra_is_visible_and_hover_is_stronger() {
+        for glass in [false, true] {
+            for (name, t) in [("light", light_theme(glass)), ("dark", dark_theme(glass))] {
+                let card = if glass { t.page } else { t.card };
+                let zebra = ratio(over(t.zebra, card), card);
+                let hover = ratio(over(t.row_hover, card), card);
+                assert!(
+                    zebra > 1.02,
+                    "{name} glass={glass} 斑马纹看不见（{zebra:.3}）"
+                );
+                assert!(
+                    hover > zebra,
+                    "{name} glass={glass} 悬停 {hover:.3} 不比斑马纹 {zebra:.3} 明显"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod underline_tests {
+    /// 页签下划线必须按文字实测的宽度画；固定 52px 时两个字和四个字挂同一条线。
+    #[test]
+    fn the_tab_underline_is_measured_not_fixed() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !prod.contains("r.left + 52.0"),
+            "下划线又回到了固定 52px —— 它应该跟着文字宽度走"
+        );
+        assert!(
+            prod.contains(".measure(label, &p.fmt.body)"),
+            "下划线没有量文字宽度：`P::measure` 那一处调用不见了"
+        );
     }
 }
