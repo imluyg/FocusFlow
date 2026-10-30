@@ -2382,4 +2382,69 @@ mod tests {
             "宿主那层要走交出原因的函数，不是只要结论的 update_expense"
         );
     }
+
+    /// 仓库根那份 `plugins/` 不许与随包副本静默分叉。
+    ///
+    /// 它既不参与打包（`build_native.bat` 从 `crates/core/plugins/` 抄）、也不被运行期加载
+    /// （运行时读的是 app_dir 下那一份），留着只有一个作用：**误导**。
+    /// 2026-10-30 现量四个文件不一样，而且方向是随包那份更新 —— 根目录那份还停在
+    /// 「停止按钮把一秒都没落库也说成算进今日完成」「Edge 缓存把读不出来画成 —」
+    /// 「分类读不全时据残缺清单清零用户草稿」这些旧写法上。谁照根目录那份改插件，
+    /// 改的就是一份没人执行的文件，而且看不出没生效。
+    ///
+    /// 判据取"要么逐字节相同，要么根目录那份不存在"：真把这一份删掉是更彻底的合规，
+    /// 那条路也得走得通，不许被这条用例逼着维护两份。
+    #[test]
+    fn the_repo_root_plugin_copy_never_diverges_from_the_shipped_one() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let shipped = manifest.join("plugins");
+        let root = manifest.join("../../plugins");
+        if !root.is_dir() {
+            return;
+        }
+        let lua_files = |dir: &std::path::Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|e| {
+                            let p = e.path();
+                            (p.extension().and_then(|s| s.to_str()) == Some("lua"))
+                                .then(|| p.file_name().unwrap().to_string_lossy().into_owned())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            v.sort();
+            v
+        };
+        let want = lua_files(&shipped);
+        let got = lua_files(&root);
+        let mut bad: Vec<String> = Vec::new();
+        if want != got {
+            bad.push(format!(
+                "两份的文件清单就不一样：随包 {want:?} / 根目录 {got:?}"
+            ));
+        }
+        for name in want.iter().filter(|n| got.contains(n)) {
+            let a = std::fs::read(shipped.join(name));
+            let b = std::fs::read(root.join(name));
+            match (a, b) {
+                (Ok(x), Ok(y)) if x == y => {}
+                (Ok(x), Ok(y)) => bad.push(format!(
+                    "{name}: 字节不同（随包 {} B / 根目录 {} B）",
+                    x.len(),
+                    y.len()
+                )),
+                (Ok(_), Err(e)) => bad.push(format!("{name}: 根目录那份读不出来 {e}")),
+                (Err(e), Ok(_)) => bad.push(format!("{name}: 随包副本读不出来 {e}")),
+                (Err(_), Err(_)) => {}
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "仓库根 plugins/ 与随包副本分叉了：\n{}",
+            bad.join("\n")
+        );
+    }
 }
