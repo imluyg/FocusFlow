@@ -271,11 +271,17 @@ function New-AppDir([string]$Dest, [string[]]$ConfigAppend = @()) {
     New-Item -ItemType Directory -Force -Path $Dest | Out-Null
     Copy-Item (Join-Path $probe 'data') $Dest -Recurse
     Copy-Item (Join-Path $probe 'config.ini') (Join-Path $Dest 'config.ini')
-    if ($ConfigAppend.Count -gt 0) {
+    # Every suite's premise is "the main window shows up". Silent start ([gui] start_to_tray,
+    # wired on 2026-10-30) breaks that premise for the whole lane at once, so the guard belongs
+    # here rather than in twelve suites. The probe fixture deliberately keeps the key ON: that
+    # way every green suite run is also proof this line works. A caller that wants the hidden
+    # path passes its own [gui] block -- the parser lets the LAST section win, so it overrides us.
+    $lines_add = @('[gui]', 'start_to_tray = false') + $ConfigAppend
+    if ($lines_add.Count -gt 0) {
         $cfg = Join-Path $Dest 'config.ini'
         $lines = [System.Collections.Generic.List[string]](Get-Content $cfg -Encoding UTF8)
         $lines.Add('')
-        foreach ($l in $ConfigAppend) { $lines.Add($l) }
+        foreach ($l in $lines_add) { $lines.Add($l) }
         # UTF-8 without BOM: the core config parser reads BOM-less UTF-8.
         [System.IO.File]::WriteAllLines($cfg, $lines, (New-Object System.Text.UTF8Encoding $false))
     }

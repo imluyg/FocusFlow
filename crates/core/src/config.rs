@@ -97,10 +97,14 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             // （见 DEPRECATED_CONFIG）。
             ("active_refresh_interval", "1"),
             ("theme", "light"),
-            // ⚠ 这一行屏上点得到，但原生端没有行为读点（旧 WebView 端那半截接线随前端一起
-            // 删了）：接上它等于"启动后主窗口不出现、只在托盘"，会改到验收套件的等窗口前提，
-            // 所以留待用户点，不跟其它几行一起悄悄摘。
-            ("start_to_tray", "true"),
+            // 启动即进托盘：原生端有读点（`desktop-native/src/main.rs` 的 `start_to_tray_cfg`）。
+            // 它和开机自启那条快捷方式带的 `--hidden` 是同一个意图的两条入口 —— 改之前两条
+            // 都没人读：参数全仓没有解析点，配置键只有设置页那一行（点了、存了、什么都不发生）。
+            // 默认**关**：接线之前 true 是个死值，接上之后还留 true 就等于让每个新装用户第一次
+            // 打开只看得见托盘图标、找不到程序窗口。
+            // ⚠ 验收套件的等窗前提由 `scripts/accept/accept-lib.ps1` 的 `New-AppDir` 兜住：
+            // 它给每份夹具都追加一行 `start_to_tray = false`（后写的节赢），翻这个默认值不用改十二套。
+            ("start_to_tray", "false"),
             // 悬浮窗显示口径：times / duration / both（原生端有读点：`desktop-native/src/floating.rs`
             // 取出来交给 `floating_render::metric_from`，别的值一律当 times）
             ("floating_metric", "times"),

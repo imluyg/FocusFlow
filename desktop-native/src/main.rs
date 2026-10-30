@@ -9210,10 +9210,41 @@ fn tray_icon_rgba(size: u32) -> Vec<u8> {
     px
 }
 
+/// 静默启动那一趟欠一次材质：DWM 在窗口从没显示过之前会把深色属性/背板丢掉，所以
+/// `main()` 里不贴，等第一次真的唤出时补。只在这一条路上是 true。
+static GLASS_ON_FIRST_SHOW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 开机静默进托盘这个意图，今天有两个入口：开机自启那条快捷方式带的 `--hidden`
+/// （`crates/core/src/autostart.rs` 写进 `.lnk` 的参数），和设置页那行 `[gui] start_to_tray`
+/// （持久版）。两条在改之前都没人读 —— 参数全仓没有解析点，配置键只有界面那一行。
+const HIDDEN_ARG: &str = "--hidden";
+
+/// 命令行参数优先于配置：带 `--hidden` 的那一次一定静默，不管配置里写着什么。
+fn hidden_at_startup(args: &[String], start_to_tray: bool) -> bool {
+    args.iter().any(|a| a == HIDDEN_ARG) || start_to_tray
+}
+
+/// `[gui] start_to_tray` 的现量读点。默认**关**：接线之前 true 是个死值，接上之后还留 true
+/// 就等于"每个新装用户第一次打开只看得见托盘图标、找不到程序窗口"。
+fn start_to_tray_cfg() -> bool {
+    focusflow_core::config::instance().get_bool("gui", "start_to_tray", false)
+}
+
 unsafe fn bring_to_front(hwnd: HWND) {
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = ShowWindow(hwnd, SW_RESTORE);
     let _ = SetForegroundWindow(hwnd);
+    if GLASS_ON_FIRST_SHOW.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        // 补贴材质要把 `mica` 一起改：只改 DWM 不改那一位，界面会按不透明档画、底下却是
+        // Mica，两层深色叠在一起。放在唤窗之后、消息返回之前 —— 首帧的 WM_PAINT 还在队列里。
+        if let Some(app) = app_ptr(hwnd) {
+            if let Some(app) = (app as *const App as *mut App).as_mut() {
+                app.mica = apply_glass(hwnd);
+            }
+        }
+        fix_backdrop(hwnd);
+    }
 }
 
 /// 一个实例只留一个：抢不到互斥体就把已有窗口叫出来，自己退出。
@@ -10433,12 +10464,23 @@ fn main() -> windows::core::Result<()> {
         }
     }
 
+    // 静默启动必须在**建窗之前**定下来：带着 WS_VISIBLE 建，创建那一下就已经画出来了。
+    let hidden = hidden_at_startup(
+        &std::env::args().skip(1).collect::<Vec<_>>(),
+        start_to_tray_cfg(),
+    );
+    GLASS_ON_FIRST_SHOW.store(hidden, std::sync::atomic::Ordering::Relaxed);
+    let style = if hidden {
+        WS_OVERLAPPEDWINDOW
+    } else {
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE
+    };
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             CLASS_NAME,
             w!("FocusFlow"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            style,
             40,
             40,
             1200,
@@ -10467,9 +10509,15 @@ fn main() -> windows::core::Result<()> {
     let app = Box::into_raw(Box::new(App::new(hwnd, false)?));
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        // 材质必须在**显示之后**贴：窗口还没显示时 DWM 会把深色属性/背板丢掉。
-        (*app).mica = apply_glass(hwnd);
+        if hidden {
+            // 静默那一趟不唤窗、也不贴材质（贴了白贴，见 `GLASS_ON_FIRST_SHOW`），欠的这一次
+            // 由 `bring_to_front` 在第一次真的唤出时补。托盘照旧在 —— 它是这扇窗唯一的入口。
+            tracing_note("静默启动：只进托盘（命令行 --hidden 或 [gui] start_to_tray）");
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            // 材质必须在**显示之后**贴：窗口还没显示时 DWM 会把深色属性/背板丢掉。
+            (*app).mica = apply_glass(hwnd);
+        }
         // 主窗口**不置顶**：置顶留给悬浮窗（它要压在任务栏上）。原型期这里挂过
         // `HWND_TOPMOST`，理由是"自动化截图时会被浏览器盖住"——那是测试的麻烦，
         // 代价却是用户切到别的窗口时这块界面永远压在上面（他 2026-10-30 点的）。
@@ -12545,6 +12593,100 @@ mod always_on_top_tests {
         assert!(
             floating[..fcut].contains("wm::WS_EX_TOPMOST.0"),
             "悬浮窗不再置顶：任务栏会把它盖住"
+        );
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 静默启动的两条入口必须各自成立，且**参数赢**：带 `--hidden` 的那一次不管配置写什么都静默
+    /// （开机自启要的就是这个），配置那条是持久版。
+    #[test]
+    fn either_entry_hides_the_window_and_the_argument_wins() {
+        assert!(
+            hidden_at_startup(&args(&["--hidden"]), false),
+            "参数那条没接上"
+        );
+        assert!(hidden_at_startup(&args(&[]), true), "配置那条没接上");
+        assert!(
+            hidden_at_startup(&args(&["--hidden"]), true),
+            "两条都开更该静默"
+        );
+        assert!(
+            !hidden_at_startup(&args(&[]), false),
+            "两条都没开还静默：新装用户第一次打开就找不到窗口"
+        );
+        // argv[0] 是 exe 自己，不算参数（调用方在那里 skip(1)，这一条盯的是别把路径当成参数）
+        assert!(!hidden_at_startup(&args(&["C:\\x\\FocusFlow.exe"]), false));
+        // 只认这一个写法：`--hidden=true` / `-/hidden` 都不算，别给自己造第二条口径
+        assert!(!hidden_at_startup(&args(&["--hidden=true"]), false));
+    }
+
+    /// 开机自启写进 `.lnk` 的那个参数，必须与原生端解析的是同一个字符串。
+    ///
+    /// 这条是本次缺陷的正身：`.lnk` 一直带 `--hidden`，而全仓没有解析点 —— 两边各写一份、
+    /// 谁都没核对过，所以"开机静默进托盘"这个意图今天没有任何一条路能达成。抄错的形状就是
+    /// 症状本身，所以钉的是字面量相等，不是"两边都出现过 hidden"。
+    #[test]
+    fn the_autostart_shortcut_and_the_parser_use_one_spelling() {
+        let src = include_str!("../../crates/core/src/autostart.rs").replace("\r\n", "\n");
+        let at = src
+            .find("$s.Arguments = '")
+            .expect("开机自启那条快捷方式的参数不见了");
+        let rest = &src[at + "$s.Arguments = '".len()..];
+        let written = &rest[..rest.find('\'').expect("参数没有收尾引号")];
+        assert_eq!(
+            written, HIDDEN_ARG,
+            "开机自启带的参数与原生端解析的那一个不是同一个字符串"
+        );
+    }
+
+    /// 默认值必须是关。接线之前 `true` 是个死值（屏上那行点了存了什么都不发生），接上之后
+    /// 再留 `true` 就等于让每个新装用户第一次打开只看得见托盘图标。
+    #[test]
+    fn a_new_install_shows_the_window() {
+        let cfg = include_str!("../../crates/core/src/config.rs").replace("\r\n", "\n");
+        assert!(
+            cfg.contains(r#"("start_to_tray", "false")"#),
+            "默认值又翻回 true 了：新装用户第一次打开只看得见托盘"
+        );
+        assert!(
+            !cfg.contains(r#"("start_to_tray", "true")"#),
+            "默认表里出现了第二份 start_to_tray"
+        );
+        // 读点也得在（只改默认值不改读点，就是这次缺陷的另一半）
+        let prod = {
+            let src = include_str!("main.rs").replace("\r\n", "\n");
+            let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+            src[..cut]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(
+            prod.matches("get_bool(\"gui\", \"start_to_tray\"").count(),
+            1,
+            "配置键的读点不见了或抄了两份"
+        );
+        assert_eq!(
+            prod.matches("hidden_at_startup(").count(),
+            2,
+            "一份定义 + 一份调用；调用不见了就是又成了死键"
+        );
+        assert!(
+            prod.contains("WS_OVERLAPPEDWINDOW | WS_VISIBLE"),
+            "唤窗那条路整个不见了"
+        );
+        assert!(
+            prod.contains("if hidden {"),
+            "静默那条分支不见了：参数与配置都白读"
         );
     }
 }
