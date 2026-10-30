@@ -661,10 +661,15 @@ mod readout_rulers_tests {
     /// 改后约 350 px 正好收在框左）。开关行没有别的遮挡物，所以只有这一族的长度要钉。
     #[test]
     fn a_toggle_rows_help_fits_before_its_value_box() {
-        // 近似字宽：中日韩全角 12 px，ASCII 6 px（与 12 号字量出来的行宽同量级）。
-        let width = |s: &str| -> usize {
+        // 列宽从设置页自己的几何算（`settings_geom` 与画那一行用的是同一份），字号读
+        // `SETTINGS_HELP_PT` —— 字号一改，这条判据跟着改，不会按旧字号放行。
+        let g = crate::settings_geom(1200.0, 860.0);
+        let col = (g.value_x - g.body_left - 30.0).max(120.0);
+        let pt = crate::SETTINGS_HELP_PT;
+        // 近似字宽：中日韩全角 pt，ASCII pt/2。
+        let width = |s: &str| -> f32 {
             s.chars()
-                .map(|c| if (c as u32) < 0x2E80 { 6 } else { 12 })
+                .map(|c| if (c as u32) < 0x2E80 { pt / 2.0 } else { pt })
                 .sum()
         };
         for (section, key, kind, _, _, help) in SETTINGS {
@@ -672,8 +677,8 @@ mod readout_rulers_tests {
                 continue;
             }
             assert!(
-                width(help) <= 368,
-                "开关行 {section}.{key} 的说明宽约 {} px，会画到值框上：{help}",
+                width(help) <= col,
+                "开关行 {section}.{key} 的说明宽约 {:.0} px，会画到值框上（列宽 {col} px）：{help}",
                 width(help)
             );
         }

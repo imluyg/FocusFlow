@@ -899,23 +899,23 @@ impl App {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let fmt = Formats {
-                h1: text_format(&dwrite, 20.0, UI_WEIGHT_EM)?,
-                value: text_format(&dwrite, 23.0, DWRITE_FONT_WEIGHT_BOLD)?,
-                label: text_format(&dwrite, 11.5, UI_WEIGHT)?,
-                body: text_format(&dwrite, 12.5, UI_WEIGHT)?,
-                small: text_format(&dwrite, 11.0, UI_WEIGHT)?,
-                right: right_format(&dwrite, 11.0)?,
-                center_small: center_format(&dwrite, 11.0)?,
-                center_tiny: center_format(&dwrite, 8.5)?,
-                tab: center_format(&dwrite, 12.5)?,
-                settings_h: text_format(&dwrite, 15.0, DWRITE_FONT_WEIGHT_BOLD)?,
-                row_name: text_format(&dwrite, 14.0, UI_WEIGHT)?,
-                table_name: text_format(&dwrite, 12.5, UI_WEIGHT)?,
-                text13: text_format(&dwrite, 13.0, UI_WEIGHT)?,
-                text13_em: text_format(&dwrite, 13.0, UI_WEIGHT_EM)?,
-                text12: text_format(&dwrite, 12.0, UI_WEIGHT)?,
-                text12_em: text_format(&dwrite, 12.0, UI_WEIGHT_EM)?,
-                center13: center_format_w(&dwrite, 13.0, UI_WEIGHT)?,
+                h1: text_format(&dwrite, 22.0, UI_WEIGHT_EM)?,
+                value: text_format(&dwrite, 25.0, DWRITE_FONT_WEIGHT_BOLD)?,
+                label: text_format(&dwrite, 12.5, UI_WEIGHT)?,
+                body: text_format(&dwrite, 13.5, UI_WEIGHT)?,
+                small: text_format(&dwrite, 12.0, UI_WEIGHT)?,
+                right: right_format(&dwrite, 12.0)?,
+                center_small: center_format(&dwrite, 12.0)?,
+                center_tiny: center_format(&dwrite, 9.0)?,
+                tab: center_format(&dwrite, 13.5)?,
+                settings_h: text_format(&dwrite, 16.0, DWRITE_FONT_WEIGHT_BOLD)?,
+                row_name: text_format(&dwrite, 15.0, UI_WEIGHT)?,
+                table_name: text_format(&dwrite, 13.5, UI_WEIGHT)?,
+                text13: text_format(&dwrite, SETTINGS_TEXT_PT, UI_WEIGHT)?,
+                text13_em: text_format(&dwrite, SETTINGS_TEXT_PT, UI_WEIGHT_EM)?,
+                text12: text_format(&dwrite, SETTINGS_HELP_PT, UI_WEIGHT)?,
+                text12_em: text_format(&dwrite, SETTINGS_HELP_PT, UI_WEIGHT_EM)?,
+                center13: center_format_w(&dwrite, SETTINGS_TEXT_PT, UI_WEIGHT)?,
             };
 
             let (tray, pause_item) = make_tray(&snap);
@@ -983,7 +983,8 @@ impl App {
             let dpi = GetDpiForWindow(hwnd) as f32;
             let dpi = if dpi <= 0.0 { 96.0 } else { dpi };
             let ui_font = CreateFontW(
-                -((13.0 * dpi / 96.0).round() as i32),
+                // 与设置页正文同一档（`SETTINGS_TEXT_PT`）：框里敲的字要和框外念的字一样大。
+                -((SETTINGS_TEXT_PT * dpi / 96.0).round() as i32),
                 0,
                 0,
                 0,
@@ -3758,13 +3759,10 @@ fn draw_settings(
                             &p.fmt.center13,
                             if on { &p.br.white } else { &p.br.muted },
                         );
-                        let toggle = snap_setting(snap, "hotkey", "toggle_window");
-                        let snip = snap_setting(snap, "hotkey", "snip");
-                        let annotate = snap_setting(snap, "hotkey", "snip_annotate");
+                        // 三个组合名不在这儿再摆一遍：下面三行就是它们，字号变大后这条
+                        // 会顶到右边那颗「开」按钮上。
                         p.text(
-                            &format!(
-                                "总开关：开 = 注册下面三行（{toggle} / {snip} / {annotate}）；关 = 一条都不占用"
-                            ),
+                            "总开关：开 = 注册下面三行；关 = 一条都不占用",
                             rect(r.left + 12.0, y + 23.0, 560.0, 17.0),
                             &p.fmt.text12,
                             &p.br.muted,
@@ -3775,7 +3773,7 @@ fn draw_settings(
                         p.text("进标注", vb, &p.fmt.center13, &p.br.white);
                         let annotate = snap_setting(snap, "hotkey", "snip_annotate");
                         p.text(
-                            &format!("这颗按钮立刻开标注场，等价于按热键 {annotate}；框好之后 Enter 或 Ctrl+S 出图"),
+                            &format!("等于按热键 {annotate}；框好之后 Enter 或 Ctrl+S 出图"),
                             rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
                             &p.fmt.text12,
                             &p.br.muted,
@@ -3787,7 +3785,7 @@ fn draw_settings(
                         let snip = snap_setting(snap, "hotkey", "snip");
                         p.text(
                             &format!(
-                                "这颗按钮不进标注，等价于按热键 {snip}；PNG 存 data/screenshots 并复制到剪贴板"
+                                "等于按热键 {snip}；PNG 存 data/screenshots，同时复制到剪贴板"
                             ),
                             rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
                             &p.fmt.text12,
@@ -3810,7 +3808,7 @@ fn draw_settings(
                         );
                         p.text(
                             &format!(
-                                "现在开着 {n} 张；按住拖动、滚轮缩放、Esc 或右键关掉单张。贴图只在内存里，截图文件仍留在 data/screenshots"
+                                "现在开着 {n} 张；拖动挪位、滚轮缩放、Esc/右键关单张（不另存）"
                             ),
                             rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
                             &p.fmt.text12,
@@ -3858,7 +3856,7 @@ fn draw_settings(
                         p.round(vb, 6.0, &p.br.accent, None);
                         p.text("生成", vb, &p.fmt.center13, &p.br.white);
                         p.text(
-                            "汇总上周一~周日，写到 data/reports/weekly-YYYY-MM-DD.md（只存本机）；启动时缺这一份会自动补",
+                            "汇总上周一~周日写到 data/reports/weekly-YYYY-MM-DD.md，缺了启动时补",
                             rect(r.left + 12.0, y + 23.0, 600.0, 17.0),
                             &p.fmt.text12,
                             &p.br.muted,
@@ -8350,7 +8348,9 @@ fn register_combo(manager: Option<&GlobalHotKeyManager>, key: &str) -> Combo {
 /// 约 6.5px/字，所以按 12 算出来的预算是保守的 —— 宁可少念几个字，也不会画到隔壁卡上。
 /// 预算跟着矩形宽度走（不是写死的常数）：窗口能拖窄，写死的数在窄窗口里照样顶出去。
 fn char_budget(rect_w: f32) -> usize {
-    let per_char = 12.0_f32;
+    // 一个全角字占多少像素 = 说明行那一档的字号（`SETTINGS_HELP_PT`）。写成字面量的话，
+    // 字号一调大，预算还按旧字号算，句子就会按"装得下"放行、屏上却画出去。
+    let per_char = SETTINGS_HELP_PT;
     ((rect_w / per_char).floor() as usize).max(8)
 }
 
@@ -8696,6 +8696,15 @@ fn text_format(
 const UI_WEIGHT: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_SEMI_BOLD;
 /// 强调档：比基准再重一级。拉丁字母上看得见差别；汉字两边都是 700，只能靠字号或颜色分。
 const UI_WEIGHT_EM: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_BOLD;
+
+/// 设置页值框与正文那一档的字号（`text13` / `center13`），以及说明行那一档（`text12`）。
+///
+/// 单列成常量是因为**说明行的宽度守卫**（`data.rs` 的
+/// `a_toggle_rows_help_fits_before_its_value_box`）要按同一档字号换算可用宽度：
+/// 这两个数各写一处的话，改字号时那条守卫就会按旧字号放行，屏上却画到值框上 ——
+/// 这块 UI 不按矩形裁切（`NO_WRAP`、不设 `DWRITE_TRIMMING`），超出去的字照画。
+pub(crate) const SETTINGS_TEXT_PT: f32 = 14.0;
+pub(crate) const SETTINGS_HELP_PT: f32 = 13.0;
 
 fn right_format(dw: &IDWriteFactory, size: f32) -> windows::core::Result<IDWriteTextFormat> {
     let f = text_format(dw, size, UI_WEIGHT)?;
@@ -12137,9 +12146,22 @@ mod clip_tests {
     }
 
     /// 预算跟着格子走，并且永远给得出一个能画的数。
+    ///
+    /// 不写死"560 → 46"：那个数跟着说明行的字号走（`SETTINGS_HELP_PT`），字号一调大
+    /// 就成了"改字号还要回来改用例"。这里钉的是关系 —— 预算个字**装得下**，再多一个
+    /// 就装不下（两边各留一条，右边那条防的是"预算保守到白少念好几个字"）。
     #[test]
     fn the_budget_follows_the_box_and_never_collapses() {
-        assert_eq!(char_budget(560.0), 46);
+        let budget = char_budget(560.0);
+        assert!(
+            budget as f32 * SETTINGS_HELP_PT <= 560.0,
+            "预算 {budget} 个字按 {SETTINGS_HELP_PT} px 一行要 {} px，比格子还宽",
+            budget as f32 * SETTINGS_HELP_PT
+        );
+        assert!(
+            (budget + 1) as f32 * SETTINGS_HELP_PT > 560.0,
+            "预算太保守：还能再念一个字"
+        );
         assert!(char_budget(1136.0) > char_budget(560.0), "宽格子该念更多");
         // 窗口拖到极窄（甚至矩形算出负数）时也不许回 0：那样这一格一个字都不念，
         // 用户连"有事发生"都看不见。
