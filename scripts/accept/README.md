@@ -22,6 +22,7 @@ cd <repo>
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-smoke.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-floating.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-theme.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-ui.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-collect.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-plugins.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-hotkey.ps1
@@ -42,6 +43,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 | `accept-smoke.ps1` | 主窗出现 / 悬浮窗在 / `WM_NCHITTEST`=HTCAPTION / 窗口 1200×860 / 内存 ≤120 MB / PrintWindow 抓得到 / 验收状态行 / 无 error / 8 秒内退出 | 10 项；`-Collector` 时多验"采集开着" |
 | `accept-floating.ps1` | 落点=配置 / 默认 104×48 / **搬动没落定时也要扛得住那一拍**（等过 1 秒重画周期再投 `WM_EXITSIZEMOVE`，两条腿：矩形还在 1300,300、配置也写回 1300,300）/ 重启位置还在 / 存 4000 被夹回 1900 / **放在任务栏那一条上的位置不许被抬走**（底边按整屏算，卡片贴到屏幕最底）/ **压在任务栏之上**（z-order 现量，另带一条"尺子自己得排得对"的对照：任务栏要在地面之上）/ 双击唤回收起的主窗 | 15 项 |
 | `accept-theme.ps1` | 深色 16 张 + 浅色 16 张逐视图截图 / 设置页「主题」行当场切换 / 行内 `EDIT` 背景色随主题（取主色，浅色 246,249,255、深色 31,40,59） | 10 项 |
+| `accept-ui.ps1` | 不透明档卡片有落影、卡内没被染灰 / 深色不画阴影但有顶部高光 / 空闲药丸悬停变色 / 药丸与页签是手型、空白是箭头 / 下划线宽度跟文字（四字页签 53 px vs 两字 26 px） | 15 项 |
 | `accept-collect.ps1` | 点 5 下 → 今日 +5、速度 >0 / 暂停后不再涨、速度归 0 / 继续再 +5 / 退出 flush + 退出备份 / core 日志「数据库已关闭」 | 14 项 |
 | `accept-plugins.ps1` | 插件视图：`button.modal` 开弹窗、弹窗与正文的 Select 写回、提交/关闭触发插件动作、Esc 关弹窗 | 11 项 |
 | `accept-hotkey.ps1` | 两轮启动：配置里的三条组合按原样注册（日志逐字对）/ 一条写成裸键时程序照样起、日志点名被拒的那条、没被拒的那条照样注册 | 10 项 |
