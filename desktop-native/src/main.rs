@@ -12252,3 +12252,58 @@ mod clip_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod theme_drift_tests {
+    use super::*;
+
+    fn rgb(c: D2D1_COLOR_F) -> (u8, u8, u8) {
+        (
+            (c.r * 255.0).round() as u8,
+            (c.g * 255.0).round() as u8,
+            (c.b * 255.0).round() as u8,
+        )
+    }
+
+    /// 悬浮窗那份调色板是独立副本（`floating_render` 刻意不引 Win32 类型），所以它必须与
+    /// 主窗口**同主题的 solid 档**逐值相等。漂了的症状不是报错，是同一个程序里两张卡
+    /// 差半个色号 —— 边框已经分别漂过一次（悬停/斑马同色那个 bug 旁边就是它）。
+    /// alpha 不比：悬浮卡片压在壁纸上是半透明的，主窗口 solid 档是不透明的。
+    #[test]
+    fn the_floating_card_uses_the_same_base_colours_as_the_main_window() {
+        for (name, pal) in [
+            ("light", floating_render::LIGHT),
+            ("dark", floating_render::DARK),
+        ] {
+            let t = tokens_for(name).solid;
+            for (field, got, want) in [
+                (
+                    "card",
+                    (pal.card.r, pal.card.g, pal.card.b),
+                    rgb(t.card),
+                ),
+                (
+                    "border",
+                    (pal.border.r, pal.border.g, pal.border.b),
+                    rgb(t.border),
+                ),
+                ("fg", (pal.fg.r, pal.fg.g, pal.fg.b), rgb(t.fg)),
+                (
+                    "muted",
+                    (pal.muted.r, pal.muted.g, pal.muted.b),
+                    rgb(t.muted),
+                ),
+                (
+                    "accent",
+                    (pal.accent.r, pal.accent.g, pal.accent.b),
+                    rgb(t.accent),
+                ),
+            ] {
+                assert_eq!(
+                    got, want,
+                    "{name} 的悬浮窗 {field} 与主窗口不是同一个颜色"
+                );
+            }
+        }
+    }
+}

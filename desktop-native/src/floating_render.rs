@@ -40,9 +40,11 @@ pub struct Palette {
     pub accent: Color,
 }
 
+// RGB 必须与主窗口同主题的 solid 档逐值相等（`theme_drift_tests` 钉着）；只有 alpha
+// 是悬浮卡片自己的 —— 它压在壁纸上是半透明的，主窗口的 solid 档是不透明的。
 pub const LIGHT: Palette = Palette {
     card: Color::rgba(255, 255, 255, 232), // rgba(255,255,255,.91)
-    border: Color::rgba(224, 233, 248, 242), // rgba(224,233,248,.95)
+    border: Color::rgba(229, 236, 248, 242), // rgba(229,236,248,.95)
     fg: Color::rgba(26, 26, 46, 255),      // --fg #1A1A2E
     muted: Color::rgba(74, 74, 106, 255),  // --muted #4A4A6A
     accent: Color::rgba(77, 140, 247, 255), // --accent #4D8CF7
@@ -50,7 +52,7 @@ pub const LIGHT: Palette = Palette {
 
 pub const DARK: Palette = Palette {
     card: Color::rgba(30, 35, 49, 232),     // rgba(30,35,49,.91)
-    border: Color::rgba(43, 50, 70, 242),   // rgba(43,50,70,.95)
+    border: Color::rgba(42, 48, 66, 242),   // rgba(42,48,66,.95)
     fg: Color::rgba(232, 234, 238, 255),    // --fg #E8EAEE
     muted: Color::rgba(138, 146, 166, 255), // --muted #8A92A6
     accent: Color::rgba(91, 156, 247, 255), // --accent #5B9CF7
