@@ -1112,8 +1112,12 @@ pub fn cleanup_line(days: i64, report: &MaintenanceReport) -> String {
         )
     } else if report.deleted == 0 {
         // 这条命令天天挂在计划任务上：每天都看到「已删除 30 天前的记录 0 条」的人会以为
-        // 清理坏了，而真实情况是"没有到期待删的东西"。两句得分开说。
-        format!("没有 {cutoff}（含）之前的记录可删（保留 {days} 天）")
+        // 清理坏了，而真实情况是"没有到期的东西可删"。两句得分开说。
+        //
+        // 边界那一天是**保留的起点**，不是"删到这一天"：DELETE 写的是 `date_key < cutoff`
+        //（2026-10-30 在他真实数据的副本上量过：`--cleanup 30` 之后 10-01 那 23,157 次还在，
+        // 而旧句子说「2026-10-01（含）之前」已删）。所以这里只说"之前"，并把起点写在保留天数里。
+        format!("没有 {cutoff} 之前的记录可删（保留 {days} 天，从 {cutoff} 起）")
     } else {
         // 单位必须点破：`deleted` 数的是「每天每键/每应用/每设备」那一行的合计，
         // 不是活动次数。2026-10-26 实测删掉 1,166,643 次活动，旧句子只说"5,782 条"，
@@ -1128,7 +1132,7 @@ pub fn cleanup_line(days: i64, report: &MaintenanceReport) -> String {
             format!("，涉及年度库 {}", years.join("、"))
         };
         format!(
-            "已删除 {cutoff}（含）之前的记录 {} 行{where_clause}；一行是「某天某键」的合计，不等于活动次数（保留 {days} 天）",
+            "已删除 {cutoff} 之前的记录 {} 行{where_clause}；一行是「某天某键」的合计，不等于活动次数（保留 {days} 天，从 {cutoff} 起）",
             crate::format::fmt_thousands(report.deleted)
         )
     }
@@ -6908,12 +6912,48 @@ mod tests {
         let line = cleanup_line(30, &r);
         let day = cutoff.format("%Y-%m-%d").to_string();
         assert!(line.contains(&day), "要说清删到哪天（{day}）: {line}");
+        assert!(
+            line.contains(&format!("从 {day} 起")),
+            "那一天是**保留的起点**，句子里要这么标: {line}"
+        );
+        assert!(
+            !line.contains("（含）"),
+            "边界那天不许写成\"连这一天一起删掉\": {line}"
+        );
         assert!(line.contains("不等于活动次数"), "要点破单位: {line}");
         assert!(line.contains("5,782 行"), "行数与单位要连着说: {line}");
         // 顺序稳定：报告里列的年度不许跟着目录序/HashMap 变
         assert!(
             line.contains("2024、2025、2026"),
             "涉及哪几个年度库: {line}"
+        );
+    }
+
+    /// 读数里那个日期只能与 DELETE 用的那一把尺子同义：`date_key < 边界` ⇒ 边界那天**保留**。
+    ///
+    /// 为什么钉源码：这两处隔着一整个文件（DELETE 在 `cleanup_old_data`，句子在 `cleanup_line`），
+    /// 一旦各说各话，用户读到的就是"删掉了其实还在的那一天"。2026-10-30 在他真实数据的副本上
+    /// 量到一次：`--cleanup 30` 之后 10-01 那 23,157 次仍然算得出来，而那句写的是
+    /// 「2026-10-01（含）之前的记录已删除」。
+    #[test]
+    fn the_receipt_agrees_with_the_delete_operator_it_reports() {
+        let src = include_str!("maintenance.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod: String = src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            prod.contains("&format!(\"DELETEFROM{table}WHEREdate_key<?1\"),[cutoff_dk]"),
+            "DELETE 不再是「严格早于边界」这一把尺子（或边界参数不再是 cutoff_dk）：读数那句得跟着改"
+        );
+        assert!(
+            !prod.contains("（含）之前"),
+            "边界那天又被写成\"连这一天一起删掉\"——DELETE 用的是 <，那一天其实保留"
         );
     }
 
