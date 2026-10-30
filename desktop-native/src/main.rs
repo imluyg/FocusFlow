@@ -349,7 +349,15 @@ impl Brushes {
 struct Formats {
     h1: IDWriteTextFormat,
     value: IDWriteTextFormat,
-    label: IDWriteTextFormat,
+    /// 次要信息的常规档（说明行、表头、脚注、图例、坐标刻度）。三档字重的分工见
+    /// [`UI_WEIGHT_REG`] 那段：这一档是"第二眼才读"的字，与正文拉开的就是粗细本身。
+    caption: IDWriteTextFormat,
+    /// 同上，右对齐（坐标刻度 / 占比列 / 版本号）。
+    caption_right: IDWriteTextFormat,
+    /// 同上，居中（星期标签）。
+    caption_center: IDWriteTextFormat,
+    /// 设置页左侧未选中的分类：与选中项同字号，只差字重与颜色。
+    nav_item: IDWriteTextFormat,
     body: IDWriteTextFormat,
     small: IDWriteTextFormat,
     right: IDWriteTextFormat,
@@ -898,25 +906,7 @@ impl App {
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let fmt = Formats {
-                h1: text_format(&dwrite, 22.0, UI_WEIGHT_EM)?,
-                value: text_format(&dwrite, 25.0, DWRITE_FONT_WEIGHT_BOLD)?,
-                label: text_format(&dwrite, 12.5, UI_WEIGHT)?,
-                body: text_format(&dwrite, 13.5, UI_WEIGHT)?,
-                small: text_format(&dwrite, 12.0, UI_WEIGHT)?,
-                right: right_format(&dwrite, 12.0)?,
-                center_small: center_format(&dwrite, 12.0)?,
-                center_tiny: center_format(&dwrite, 9.0)?,
-                tab: center_format(&dwrite, 13.5)?,
-                settings_h: text_format(&dwrite, 16.0, DWRITE_FONT_WEIGHT_BOLD)?,
-                row_name: text_format(&dwrite, 15.0, UI_WEIGHT)?,
-                table_name: text_format(&dwrite, 13.5, UI_WEIGHT)?,
-                text13: text_format(&dwrite, SETTINGS_TEXT_PT, UI_WEIGHT)?,
-                text13_em: text_format(&dwrite, SETTINGS_TEXT_PT, UI_WEIGHT_EM)?,
-                text12: text_format(&dwrite, SETTINGS_HELP_PT, UI_WEIGHT)?,
-                text12_em: text_format(&dwrite, SETTINGS_HELP_PT, UI_WEIGHT_EM)?,
-                center13: center_format_w(&dwrite, SETTINGS_TEXT_PT, UI_WEIGHT)?,
-            };
+            let fmt = build_formats(&dwrite)?;
 
             let (tray, pause_item) = make_tray(&snap);
             let HotkeysAtBoot {
@@ -3504,7 +3494,7 @@ fn draw_settings(
             if active {
                 &p.fmt.text13_em
             } else {
-                &p.fmt.text13
+                &p.fmt.nav_item
             },
             if active { &p.br.accent } else { &p.br.fg },
         );
@@ -3516,7 +3506,7 @@ fn draw_settings(
                 nr.right - nr.left - 20.0,
                 15.0,
             ),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.muted,
         );
     }
@@ -3645,7 +3635,7 @@ fn draw_settings(
                     p.text(
                         note,
                         rect(vb.right + 14.0, y + 13.0, 220.0, 16.0),
-                        &p.fmt.small,
+                        &p.fmt.caption,
                         &p.br.danger,
                     );
                 } else if row.live != "改完立即生效" {
@@ -3653,7 +3643,7 @@ fn draw_settings(
                     p.text(
                         row.live,
                         rect(vb.right + 14.0, y + 13.0, 220.0, 16.0),
-                        &p.fmt.small,
+                        &p.fmt.caption,
                         &p.br.muted,
                     );
                 }
@@ -4099,13 +4089,13 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
     p.text(
         &sub,
         rect(x, dialog.top + 62.0, dialog.right - x - 20.0, 18.0),
-        &p.fmt.small,
+        &p.fmt.caption,
         &p.br.muted,
     );
 
     let col2 = x + (dialog.right - dialog.left) * 0.52;
     let row = |label: &str, value: &str, cx: f32, yy: f32| {
-        p.text(label, rect(cx, yy, 76.0, 18.0), &p.fmt.small, &p.br.muted);
+        p.text(label, rect(cx, yy, 76.0, 18.0), &p.fmt.caption, &p.br.muted);
         p.text(
             value,
             rect(cx + 82.0, yy, dialog.right - cx - 100.0, 18.0),
@@ -4196,7 +4186,7 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
     p.text(
         "近 30 天分布",
         rect(x, ty - 20.0, 160.0, 16.0),
-        &p.fmt.small,
+        &p.fmt.caption,
         &p.br.muted,
     );
     let plot = rect(x, ty, dialog.right - dialog.left - 40.0, 54.0);
@@ -4220,7 +4210,7 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
                 dialog.right - dialog.left - 186.0,
                 16.0,
             ),
-            &p.fmt.right,
+            &p.fmt.caption_right,
             &p.br.muted,
         );
     }
@@ -4308,13 +4298,13 @@ fn draw_screen(
     p.text(
         "效率追踪器",
         rect(m + 112.0, 18.0, 120.0, 20.0),
-        &p.fmt.small,
+        &p.fmt.caption,
         &p.br.muted,
     );
     p.text(
         "v0.5.0 · Direct2D",
         rect(w - m - 220.0, 18.0, 220.0, 20.0),
-        &p.fmt.right,
+        &p.fmt.caption_right,
         &p.br.muted,
     );
 
@@ -4322,7 +4312,7 @@ fn draw_screen(
     p.text(
         "统计周期",
         rect(m, 50.0, 60.0, 24.0),
-        &p.fmt.small,
+        &p.fmt.caption,
         &p.br.muted,
     );
     for (i, (period, label)) in PERIODS.iter().enumerate() {
@@ -4391,7 +4381,7 @@ fn draw_screen(
         p.text(
             label,
             rect(cx + 12.0, 94.0, cw - 24.0, 16.0),
-            &p.fmt.label,
+            &p.fmt.caption,
             &p.br.muted,
         );
         p.text(
@@ -4404,7 +4394,7 @@ fn draw_screen(
             p.text(
                 sub,
                 rect(cx + 12.0, 142.0, cw - 24.0, 16.0),
-                &p.fmt.small,
+                &p.fmt.caption,
                 &p.br.muted,
             );
         }
@@ -4540,7 +4530,7 @@ fn draw_goal_strip(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
                 r.right - r.left - pad * 2.0,
                 18.0,
             ),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.muted,
         );
         return;
@@ -4579,7 +4569,7 @@ fn draw_goal_strip(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     p.text(
         &format!("连续打卡 {} 天 · 近一年最长 {} 天", g.streak, g.best),
         rect(dots_x - 206.0, r.top + 14.0, 198.0, 18.0),
-        &p.fmt.right,
+        &p.fmt.caption_right,
         &p.br.muted,
     );
 
@@ -4665,7 +4655,7 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     p.text(
         &format!("按{}统计", data::window_text(snap.period)),
         rect(r.right - pad - 140.0, r.top + 16.0, 140.0, 18.0),
-        &p.fmt.right,
+        &p.fmt.caption_right,
         &p.br.muted,
     );
     // 星期分布是从每日序列聚合出来的 ⇒ 它认领的是每日趋势那一句。
@@ -4679,7 +4669,7 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
                 (r.right - r.left) - pad * 2.0,
                 14.0,
             ),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.muted,
         );
     }
@@ -4708,7 +4698,7 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         p.text(
             label,
             rect(x, plot.bottom + 6.0, bw, 16.0),
-            &p.fmt.center_small,
+            &p.fmt.caption_center,
             &p.br.muted,
         );
         p.text(
@@ -4911,7 +4901,7 @@ fn draw_heat(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
     p.text(
         &format!("按{}统计 · 前 100 键", period_text(snap.period)),
         rect(r.right - 16.0 - 260.0, r.top + 16.0, 260.0, 18.0),
-        &p.fmt.right,
+        &p.fmt.caption_right,
         &p.br.muted,
     );
 
@@ -4966,7 +4956,7 @@ fn draw_heat(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
     p.text(
         "次数",
         rect(r.left + 16.0, ly + 4.0, 34.0, 16.0),
-        &p.fmt.small,
+        &p.fmt.caption,
         &p.br.muted,
     );
     for i in 0..5 {
@@ -4983,7 +4973,7 @@ fn draw_heat(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
     p.text(
         "少",
         rect(r.left + 54.0 + 5.0 * 18.0 + 2.0, ly + 4.0, 20.0, 14.0),
-        &p.fmt.small,
+        &p.fmt.caption,
         &p.br.muted,
     );
 
@@ -6026,7 +6016,7 @@ fn draw_plugin_view(
                 p.text(text, *r, &p.fmt.body, &p.br.fg);
             }
             POp::Label { rect: r, text } => {
-                p.text(text, *r, &p.fmt.small, &p.br.muted);
+                p.text(text, *r, &p.fmt.caption, &p.br.muted);
             }
             POp::Kv {
                 rect: r,
@@ -6036,7 +6026,7 @@ fn draw_plugin_view(
                 p.text(
                     key,
                     rect(r.left, r.top, 140.0, 18.0),
-                    &p.fmt.small,
+                    &p.fmt.caption,
                     &p.br.muted,
                 );
                 p.text(
@@ -6048,7 +6038,7 @@ fn draw_plugin_view(
             }
             POp::Sep { rect: r } => p.fill(*r, &p.br.grid),
             POp::Body { rect: r, text } => {
-                p.text(text, *r, &p.fmt.small, &p.br.muted);
+                p.text(text, *r, &p.fmt.caption, &p.br.muted);
             }
             POp::Field {
                 rect: r,
@@ -6059,7 +6049,7 @@ fn draw_plugin_view(
                 p.text(
                     label,
                     rect(r.left, r.top + 4.0, 140.0, 18.0),
-                    &p.fmt.small,
+                    &p.fmt.caption,
                     &p.br.muted,
                 );
                 let vb = rect(r.left + 146.0, r.top, 260.0, 24.0);
@@ -6073,7 +6063,7 @@ fn draw_plugin_view(
                 p.text(
                     value,
                     rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 16.0, 18.0),
-                    &p.fmt.small,
+                    &p.fmt.caption,
                     &p.br.fg,
                 );
             }
@@ -6086,7 +6076,7 @@ fn draw_plugin_view(
                 p.text(
                     label,
                     rect(r.left, r.top + 4.0, 140.0, 18.0),
-                    &p.fmt.small,
+                    &p.fmt.caption,
                     &p.br.muted,
                 );
                 let vb = select_value_rect(*r);
@@ -6094,7 +6084,7 @@ fn draw_plugin_view(
                 p.text(
                     value,
                     rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 28.0, 18.0),
-                    &p.fmt.small,
+                    &p.fmt.caption,
                     &p.br.fg,
                 );
                 p.text(
@@ -6138,7 +6128,7 @@ fn draw_plugin_view(
                     p.text(
                         htxt,
                         rect(r.left + 6.0 + i as f32 * cw, r.top + 4.0, cw - 12.0, 16.0),
-                        &p.fmt.small,
+                        &p.fmt.caption,
                         &p.br.muted,
                     );
                 }
@@ -6249,7 +6239,7 @@ fn draw_select_menu(p: &P<'_>, w: f32, h: f32, sel: &PvSelect) {
         p.text(
             label,
             rect(ir.left + 6.0, ir.top + 3.0, ir.right - ir.left - 12.0, 18.0),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.fg,
         );
     }
@@ -6456,7 +6446,7 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
     p.text("✕", g.close, &p.fmt.center_small, &p.br.muted);
 
     if let Some(cr) = g.content {
-        p.text(m.content, cr, &p.fmt.small, &p.br.muted);
+        p.text(m.content, cr, &p.fmt.caption, &p.br.muted);
     }
 
     for (i, f) in m.fields.iter().enumerate() {
@@ -6464,7 +6454,7 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
         p.text(
             &f.label,
             rect(row.left, row.top + 7.0, 136.0, 18.0),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.muted,
         );
         let vb = modal_field_box(*row);
@@ -6472,7 +6462,7 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
         p.text(
             &f.value,
             rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 28.0, 18.0),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.fg,
         );
         if f.kind == "select" {
@@ -6541,7 +6531,7 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             focusflow_core::paths::plugins_dir().display()
         ),
         rect(card.left + 58.0, card.top + 15.0, 520.0, 18.0),
-        &p.fmt.small,
+        &p.fmt.caption,
         &p.br.muted,
     );
 
@@ -6554,7 +6544,7 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
                 card.right - card.left - 32.0,
                 18.0,
             ),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.danger,
         );
         return;
@@ -6589,7 +6579,7 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
         p.text(
             &format!("v{} · {}", row.version, row.author),
             rect(r.left + 250.0, y + 7.0, 260.0, 16.0),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.muted,
         );
         // 启用开关（只画；命中在 on_click 里用同一份几何）
@@ -6620,7 +6610,7 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
                 p.text(
                     &format!("加载失败：{}", one_line(e, 72)),
                     rect(r.left + 8.0, y + 23.0, r.right - r.left - 92.0, 16.0),
-                    &p.fmt.small,
+                    &p.fmt.caption,
                     &p.br.danger,
                 );
             }
@@ -6634,7 +6624,7 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
                 p.text(
                     &text,
                     rect(r.left + 8.0, y + 23.0, r.right - r.left - 92.0, 16.0),
-                    &p.fmt.small,
+                    &p.fmt.caption,
                     &p.br.muted,
                 );
             }
@@ -7292,7 +7282,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     p.text(
         &summary,
         rect(r.left + g.pad + 74.0, r.top + 10.0, 220.0, 18.0),
-        &p.fmt.small,
+        &p.fmt.caption,
         &p.br.muted,
     );
     if !split.is_empty() {
@@ -7304,14 +7294,14 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 r.right - r.left - g.pad * 2.0,
                 14.0,
             ),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.muted,
         );
     }
     if tab == 0 {
         let pills = rank_pills(r);
         let (cap1, cap2) = rank_pill_captions(r);
-        p.text("视图", cap1, &p.fmt.small, &p.br.muted);
+        p.text("视图", cap1, &p.fmt.caption, &p.br.muted);
         for (i, label) in ["排行", "分组"].iter().enumerate() {
             let active = vs.rank_tab == i;
             p.round(
@@ -7329,7 +7319,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         }
         // 分组那一屏读的是整份分组榜，筛选对它没有意义 ⇒ 连格子一起撤掉（旧版同做法）。
         if vs.rank_tab == 0 {
-            p.text("筛选", cap2, &p.fmt.small, &p.br.muted);
+            p.text("筛选", cap2, &p.fmt.caption, &p.br.muted);
             for (i, label) in ["全部", "键盘", "鼠标"].iter().enumerate() {
                 let active = vs.rank_filter == i;
                 p.round(
@@ -7373,7 +7363,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     p.text(
         heads[0],
         rect(g.x_rank, g.head_y + 3.0, 40.0, 18.0),
-        &p.fmt.small,
+        &p.fmt.caption,
         &p.br.muted,
     );
     p.text(
@@ -7384,13 +7374,13 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
             count_right - NUM_COL_W - g.x_name,
             18.0,
         ),
-        &p.fmt.small,
+        &p.fmt.caption,
         &p.br.muted,
     );
     p.text(
         heads[2],
         rect(count_right - NUM_COL_W, g.head_y + 3.0, NUM_COL_W, 18.0),
-        &p.fmt.right,
+        &p.fmt.caption_right,
         &p.br.muted,
     );
     if tab == 2 {
@@ -7405,7 +7395,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         p.text(
             heads[3],
             rect(g.x_share_left, g.head_y + 3.0, SHARE_COL_W, 18.0),
-            &p.fmt.right,
+            &p.fmt.caption_right,
             &p.br.muted,
         );
     }
@@ -7435,7 +7425,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 r.right - r.left - g.pad * 2.0,
                 20.0,
             ),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.muted,
         );
     }
@@ -7462,7 +7452,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         p.text(
             &format!("{}", shown + 1),
             rect(g.x_rank, y + 4.0, 40.0, 18.0),
-            &p.fmt.small,
+            &p.fmt.caption,
             if shown < 3 { &p.br.accent } else { &p.br.muted },
         );
 
@@ -7502,7 +7492,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 p.text(
                     kind,
                     rect(kind_x, y + 5.0, 48.0, 16.0),
-                    &p.fmt.right,
+                    &p.fmt.caption_right,
                     &p.br.muted,
                 );
                 p.text(
@@ -7549,7 +7539,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 p.text(
                     &share,
                     rect(g.x_share_left, y + 4.0, SHARE_COL_W, 18.0),
-                    &p.fmt.right,
+                    &p.fmt.caption_right,
                     &p.br.muted,
                 );
             }
@@ -7574,7 +7564,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 p.text(
                     &share,
                     rect(g.x_share_left, y + 4.0, SHARE_COL_W, 18.0),
-                    &p.fmt.right,
+                    &p.fmt.caption_right,
                     &p.br.muted,
                 );
             }
@@ -7596,7 +7586,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 p.text(
                     &share,
                     rect(g.x_share_left, y + 4.0, SHARE_COL_W, 18.0),
-                    &p.fmt.right,
+                    &p.fmt.caption_right,
                     &p.br.muted,
                 );
             }
@@ -7631,7 +7621,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     p.text(
         &footer_line(&snap.data_home, &snap.gaps, lane),
         rect(r.left + g.pad, foot_y, r.right - r.left - g.pad * 2.0, 16.0),
-        &p.fmt.small,
+        &p.fmt.caption,
         &p.br.muted,
     );
 }
@@ -7774,7 +7764,7 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
     p.text(
         &data::window_text(snap.period),
         rect(r.right - pad - 90.0, r.top + pad + 2.0, 90.0, 18.0),
-        &p.fmt.right,
+        &p.fmt.caption_right,
         &p.br.muted,
     );
     let daily_gaps = gap_note(&snap.gaps, queries::DOMAIN_DAILY);
@@ -7787,7 +7777,7 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
                 (r.right - r.left) - pad * 2.0,
                 14.0,
             ),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.muted,
         );
     }
@@ -7836,7 +7826,7 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
         p.text(
             &thousands(line_tick_value(top, i).max(0) as u64),
             rect(plot.left - 48.0, y - 7.0, 44.0, 14.0),
-            &p.fmt.right,
+            &p.fmt.caption_right,
             &p.br.muted,
         );
     }
@@ -7846,14 +7836,14 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
         p.text(
             &left,
             rect(plot.left, plot.bottom + 4.0, 60.0, 14.0),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.muted,
         );
     }
     p.text(
         "今天",
         rect(plot.right - 30.0, plot.bottom + 4.0, 30.0, 14.0),
-        &p.fmt.right,
+        &p.fmt.caption_right,
         &p.br.muted,
     );
     // 光标压在哪一天：把那一点圈出来，读数贴着它画（旧 WebView 三张图都有这枚 tip，
@@ -7889,7 +7879,7 @@ fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) 
     p.text(
         &data::window_text(snap.period),
         rect(r.right - pad - 90.0, r.top + pad + 2.0, 90.0, 18.0),
-        &p.fmt.right,
+        &p.fmt.caption_right,
         &p.br.muted,
     );
     let hourly_gaps = gap_note(&snap.gaps, queries::DOMAIN_HOURLY);
@@ -7902,7 +7892,7 @@ fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) 
                 (r.right - r.left) - pad * 2.0,
                 14.0,
             ),
-            &p.fmt.small,
+            &p.fmt.caption,
             &p.br.muted,
         );
     }
@@ -8665,6 +8655,33 @@ fn plot_height(r: D2D_RECT_F) -> f32 {
     r.bottom - r.top
 }
 
+/// 主窗口那一套字号/字重。单列出来是为了让 `text_tier_tests` 能建一份真的来问
+/// `GetFontWeight()` —— 三档字重是本轮观感的骨架，光靠源码里看起来对不对不算数。
+fn build_formats(dw: &IDWriteFactory) -> windows::core::Result<Formats> {
+    Ok(Formats {
+        h1: text_format(dw, 22.0, UI_WEIGHT_EM)?,
+        value: text_format(dw, 25.0, DWRITE_FONT_WEIGHT_BOLD)?,
+        caption: text_format(dw, 12.5, UI_WEIGHT_REG)?,
+        caption_right: right_format_w(dw, 12.5, UI_WEIGHT_REG)?,
+        caption_center: center_format_w(dw, 12.5, UI_WEIGHT_REG)?,
+        nav_item: text_format(dw, SETTINGS_TEXT_PT, UI_WEIGHT_REG)?,
+        body: text_format(dw, 13.5, UI_WEIGHT)?,
+        small: text_format(dw, 12.0, UI_WEIGHT)?,
+        right: right_format(dw, 12.0)?,
+        center_small: center_format(dw, 12.0)?,
+        center_tiny: center_format(dw, 9.0)?,
+        tab: center_format(dw, 13.5)?,
+        settings_h: text_format(dw, 16.0, DWRITE_FONT_WEIGHT_BOLD)?,
+        row_name: text_format(dw, 15.0, UI_WEIGHT)?,
+        table_name: text_format(dw, 13.5, UI_WEIGHT)?,
+        text13: text_format(dw, SETTINGS_TEXT_PT, UI_WEIGHT)?,
+        text13_em: text_format(dw, SETTINGS_TEXT_PT, UI_WEIGHT_EM)?,
+        text12: text_format(dw, SETTINGS_HELP_PT, UI_WEIGHT_REG)?,
+        text12_em: text_format(dw, SETTINGS_HELP_PT, UI_WEIGHT_EM)?,
+        center13: center_format_w(dw, SETTINGS_TEXT_PT, UI_WEIGHT)?,
+    })
+}
+
 fn text_format(
     dw: &IDWriteFactory,
     size: f32,
@@ -8696,6 +8713,13 @@ fn text_format(
 const UI_WEIGHT: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_SEMI_BOLD;
 /// 强调档：比基准再重一级。拉丁字母上看得见差别；汉字两边都是 700，只能靠字号或颜色分。
 const UI_WEIGHT_EM: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_BOLD;
+/// 次要信息的常规档。三档字重是本轮观感的骨架：
+/// 展示 700（`h1` / `value` / `settings_h`）→ 强档 600（正文、名字、要扫的数字）
+/// → 常规 400（说明、表头、刻度、脚注）。
+///
+/// ⚠ 雅黑只有 400/700 两档：600 的汉字会落到 700，所以"600 与 700"在中文上没有区别，
+/// 层级只能靠 **regular↔strong 这一跳 + 颜色**。次要文字若一律写 600，整屏就是一片同重的粗字。
+const UI_WEIGHT_REG: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_NORMAL;
 
 /// 设置页值框与正文那一档的字号（`text13` / `center13`），以及说明行那一档（`text12`）。
 ///
@@ -8707,7 +8731,15 @@ pub(crate) const SETTINGS_TEXT_PT: f32 = 14.0;
 pub(crate) const SETTINGS_HELP_PT: f32 = 13.0;
 
 fn right_format(dw: &IDWriteFactory, size: f32) -> windows::core::Result<IDWriteTextFormat> {
-    let f = text_format(dw, size, UI_WEIGHT)?;
+    right_format_w(dw, size, UI_WEIGHT)
+}
+
+fn right_format_w(
+    dw: &IDWriteFactory,
+    size: f32,
+    weight: DWRITE_FONT_WEIGHT,
+) -> windows::core::Result<IDWriteTextFormat> {
+    let f = text_format(dw, size, weight)?;
     unsafe {
         let _ = f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
@@ -12305,5 +12337,68 @@ mod theme_drift_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod text_tier_tests {
+    use super::*;
+
+    fn dw() -> IDWriteFactory {
+        unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).expect("DWrite 工厂") }
+    }
+
+    fn weight(f: &IDWriteTextFormat) -> DWRITE_FONT_WEIGHT {
+        unsafe { f.GetFontWeight() }
+    }
+
+    fn size(f: &IDWriteTextFormat) -> f32 {
+        unsafe { f.GetFontSize() }
+    }
+
+    /// 三档字重必须真的落在各自的槽位上：这条问的是 DWrite 交回来的值，不是源码里
+    /// 写了什么。汉字在 600/700 上同形（雅黑只有两档），所以"次要文字回 400"是
+    /// 整屏层级唯一看得见的那一跳；哪天有人把某一档改回 600，这条要红。
+    #[test]
+    fn the_three_weights_are_wired_to_the_right_slots() {
+        let f = build_formats(&dw()).expect("Formats");
+        for (slot, got) in [
+            ("caption", weight(&f.caption)),
+            ("caption_right", weight(&f.caption_right)),
+            ("caption_center", weight(&f.caption_center)),
+            ("nav_item", weight(&f.nav_item)),
+            ("text12", weight(&f.text12)),
+        ] {
+            assert_eq!(got, UI_WEIGHT_REG, "{slot} 该是常规档（次要信息）");
+        }
+        for (slot, got) in [
+            ("body", weight(&f.body)),
+            ("table_name", weight(&f.table_name)),
+            ("small", weight(&f.small)),
+            ("right", weight(&f.right)),
+            ("center_small", weight(&f.center_small)),
+            ("tab", weight(&f.tab)),
+        ] {
+            assert_eq!(got, UI_WEIGHT, "{slot} 该是强档（要扫的字）");
+        }
+        for (slot, got) in [
+            ("h1", weight(&f.h1)),
+            ("value", weight(&f.value)),
+            ("settings_h", weight(&f.settings_h)),
+        ] {
+            assert_eq!(got, UI_WEIGHT_EM, "{slot} 该是展示档（标题/大数）");
+        }
+    }
+
+    /// 次要档只掉字重、不掉字号：12.5 是上一轮"全套字号放大一档"之后的值，
+    /// 掉回 12 就是又变小了；`text12` / `nav_item` 仍跟设置页那两格同字号。
+    #[test]
+    fn the_caption_tier_keeps_its_sizes() {
+        let f = build_formats(&dw()).expect("Formats");
+        assert_eq!(size(&f.caption), 12.5);
+        assert_eq!(size(&f.caption_right), 12.5);
+        assert_eq!(size(&f.caption_center), 12.5);
+        assert_eq!(size(&f.nav_item), SETTINGS_TEXT_PT);
+        assert_eq!(size(&f.text12), SETTINGS_HELP_PT);
     }
 }
