@@ -1427,12 +1427,11 @@ impl App {
     /// 指针落在哪个稳定控件上。顺序与 `on_click` 一致（药丸 → 页签 → 子页签 → 排行药丸 →
     /// 设置导航），几何全部读画图用的那一份；弹窗与插件视图不在这里复刻（见 [`Ctl`]）。
     fn control_at(&self, w: f32, h: f32, x: f32, y: f32) -> Option<Ctl> {
-        if self.detail.is_some() {
-            return None;
-        }
-        // 窗口按钮在插件视图里也要亮：它不归页面，归窗口。
-        if let Some(i) = win_button_at(w, x, y) {
-            return Some(Ctl::WinBtn(i));
+        // 窗口按钮在插件视图与详情弹窗里也要亮：它不归页面，归窗口。
+        match top_owner(self.detail.is_some(), w, x, y) {
+            TopOwner::WinBtn(i) => return Some(Ctl::WinBtn(i)),
+            TopOwner::DetailModal => return None,
+            TopOwner::Page => {}
         }
         if self.plugin_open.is_some() {
             return None;
@@ -1489,17 +1488,19 @@ impl App {
     /// 鼠标移动：排行页更新悬停行，分析页更新悬停键 / 悬停那一格；返回是否需要重画。
     fn on_move(&mut self, hwnd: HWND, px: f32, py: f32) -> bool {
         let mut changed = false;
-        // 设备详情弹窗开着 = 模态：这一屏什么都不许亮着。
-        if self.detail.is_some() {
-            changed |= self.hover.take().is_some();
-            changed |= self.heat_hover.take().is_some();
-            changed |= self.chart_hover.take().is_some();
-            changed |= self.ctl.take().is_some();
-            return changed;
-        }
         let (w, h) = self.client_dip(hwnd);
         let s = self.scale(hwnd);
         let (x, y) = (px / s, py / s);
+        // 设备详情弹窗开着 = 页面模态：这一屏除了右上角三颗什么都不许亮着。
+        if self.detail.is_some() {
+            let ctl = self.control_at(w, h, x, y);
+            changed |= self.hover.take().is_some();
+            changed |= self.heat_hover.take().is_some();
+            changed |= self.chart_hover.take().is_some();
+            changed |= ctl != self.ctl;
+            self.ctl = ctl;
+            return changed;
+        }
         // 控件悬停只影响底色与光标，不参与点击判定；每一条早退分支之前算完，
         // 免得"在分析页上药丸不亮"。
         let ctl = self.control_at(w, h, x, y);
@@ -1628,6 +1629,25 @@ impl App {
         changed
     }
 
+    /// 右上角三颗：最小化 / 最大化-还原 / 关闭。
+    /// 关闭走 `WM_CLOSE`——退出前的 flush 与备份那条路只在那一处。
+    fn press_window_button(&mut self, hwnd: HWND, i: u8) {
+        match i {
+            0 => unsafe {
+                let _ = ShowWindow(hwnd, SW_MINIMIZE);
+            },
+            1 => {
+                let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
+                unsafe {
+                    let _ = ShowWindow(hwnd, if zoomed { SW_RESTORE } else { SW_MAXIMIZE });
+                }
+            }
+            _ => {
+                let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            }
+        }
+    }
+
     fn on_click(&mut self, hwnd: HWND, px: f32, py: f32) {
         // 点到编辑框外面：先把这一笔提交掉（与网页版一致，失焦即保存）。
         if self.edit_target.is_some() {
@@ -1637,32 +1657,20 @@ impl App {
         let s = self.scale(hwnd);
         let (x, y) = (px / s, py / s);
 
-        // 模态优先：点关闭按钮或遮罩都算关，点对话框内部不穿透。
-        if self.detail.is_some() {
-            let (dialog, close) = detail_rects(w, h);
-            if hit(close, x, y) || !hit(dialog, x, y) {
-                self.close_detail(hwnd);
+        // 最上面一层：窗口按钮 → 详情弹窗（点框外或点关闭都算关）→ 页面。
+        match top_owner(self.detail.is_some(), w, x, y) {
+            TopOwner::WinBtn(i) => {
+                self.press_window_button(hwnd, i);
+                return;
             }
-            return;
-        }
-        // 自绘标题栏的三颗按钮（原生标题条已经拆掉，这一屏只有它们是窗口级动作）。
-        if let Some(i) = win_button_at(w, x, y) {
-            match i {
-                0 => unsafe {
-                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
-                },
-                1 => {
-                    let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
-                    unsafe {
-                        let _ = ShowWindow(hwnd, if zoomed { SW_RESTORE } else { SW_MAXIMIZE });
-                    }
+            TopOwner::DetailModal => {
+                let (dialog, close) = detail_rects(w, h);
+                if hit(close, x, y) || !hit(dialog, x, y) {
+                    self.close_detail(hwnd);
                 }
-                _ => {
-                    // 走 WM_CLOSE：退出前的 flush / 备份那条路只在那一处。
-                    let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
-                }
+                return;
             }
-            return;
+            TopOwner::Page => {}
         }
         for (period, pill) in period_pills() {
             if hit(pill, x, y) {
@@ -4627,6 +4635,63 @@ fn win_button_at(w: f32, x: f32, y: f32) -> Option<u8> {
         .iter()
         .position(|r| hit(*r, x, y))
         .map(|i| i as u8)
+}
+
+/// 客户区最上面一层归谁。
+///
+/// 原生标题条拆掉之后，"窗口级动作"也搬到客户区里来了，它必须排在页面模态之前：
+/// 设备详情弹窗把整屏吞掉时，右上角三颗照样要点得动（拆条之前它们本来就在窗口外）。
+/// 顺序写在这个函数里，画图、悬停、点击三条路读同一份判断。
+#[derive(Debug, PartialEq, Eq)]
+enum TopOwner {
+    WinBtn(u8),
+    DetailModal,
+    Page,
+}
+
+fn top_owner(detail_open: bool, w: f32, x: f32, y: f32) -> TopOwner {
+    if let Some(i) = win_button_at(w, x, y) {
+        return TopOwner::WinBtn(i);
+    }
+    if detail_open {
+        return TopOwner::DetailModal;
+    }
+    TopOwner::Page
+}
+
+/// 非客户区命中：边框带 → 窗口按钮 → 标题带 → 客户区，返回 `HT*` 码。
+///
+/// 边框带排在按钮之前：三颗按钮画到窗口右沿，右上角那一格本来归缩放与贴角，
+/// 让按钮先吃就等于把角弄死（看得见却拖不动，原生标题条时代是系统给的优先级）。
+/// 顺序写在这一个纯函数里，屏上能不能拖动能在单测里算出来。
+fn nc_hit_code(zoomed: bool, cw: f32, ch: f32, bx: f32, by: f32, x: f32, y: f32) -> u32 {
+    if !zoomed {
+        let (left, right) = (x < bx, x >= cw - bx);
+        let (top, bottom) = (y < by, y >= ch - by);
+        let code = match (left, right, top, bottom) {
+            (true, _, true, _) => HTTOPLEFT,
+            (_, true, true, _) => HTTOPRIGHT,
+            (true, _, _, true) => HTBOTTOMLEFT,
+            (_, true, _, true) => HTBOTTOMRIGHT,
+            (true, _, _, _) => HTLEFT,
+            (_, true, _, _) => HTRIGHT,
+            (_, _, true, _) => HTTOP,
+            (_, _, _, true) => HTBOTTOM,
+            _ => HTCLIENT,
+        };
+        if code != HTCLIENT {
+            return code;
+        }
+    }
+    // 三颗窗口按钮必须回 HTCLIENT 才收得到 WM_LBUTTONDOWN（悬停底色与点击都在客户区那套里）。
+    if win_button_at(cw, x, y).is_some() {
+        return HTCLIENT;
+    }
+    // 标题带 = 拖窗、双击最大化、贴边分屏，全交给系统的非客户区逻辑。
+    if y < TITLEBAR_H {
+        return HTCAPTION;
+    }
+    HTCLIENT
 }
 
 /// 周期药丸的位置：画图与命中测试共用。
@@ -9461,35 +9526,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             let s = if dpi <= 0.0 { 1.0 } else { dpi / 96.0 };
             let (cw, ch) = client_dip_of(hwnd);
             let (x, y) = (pt.x as f32 / s, pt.y as f32 / s);
-            // 三颗窗口按钮最先：它们占着右上角，必须回 HTCLIENT 才收得到 WM_LBUTTONDOWN
-            // （悬停底色与点击都在客户区这套代码里）。
-            if win_button_at(cw, x, y).is_some() {
-                return LRESULT(HTCLIENT as isize);
-            }
-            if !unsafe { IsZoomed(hwnd) }.as_bool() {
-                let (bx, by) = frame_thickness(hwnd);
-                let (left, right) = (x < bx, x >= cw - bx);
-                let (top, bottom) = (y < by, y >= ch - by);
-                let code = match (left, right, top, bottom) {
-                    (true, _, true, _) => HTTOPLEFT,
-                    (_, true, true, _) => HTTOPRIGHT,
-                    (true, _, _, true) => HTBOTTOMLEFT,
-                    (_, true, _, true) => HTBOTTOMRIGHT,
-                    (true, _, _, _) => HTLEFT,
-                    (_, true, _, _) => HTRIGHT,
-                    (_, _, true, _) => HTTOP,
-                    (_, _, _, true) => HTBOTTOM,
-                    _ => HTCLIENT,
-                };
-                if code != HTCLIENT {
-                    return LRESULT(code as isize);
-                }
-            }
-            // 标题带 = 拖窗、双击最大化、贴边分屏，全交给系统的非客户区逻辑。
-            if y < TITLEBAR_H {
-                return LRESULT(HTCAPTION as isize);
-            }
-            LRESULT(HTCLIENT as isize)
+            let (bx, by) = frame_thickness(hwnd);
+            let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
+            LRESULT(nc_hit_code(zoomed, cw, ch, bx, by, x, y) as isize)
         }
         WM_NCACTIVATE => {
             // 没有非客户区要画；返回 TRUE 告诉系统"边框已更新"，顺手重画一次。
@@ -13232,6 +13271,133 @@ mod window_chrome_tests {
         assert_eq!(win_button_at(w, w - 110.0, 10.0), Some(0));
         assert_eq!(win_button_at(w, 300.0, 20.0), None);
         assert_eq!(win_button_at(w, w - 20.0, 60.0), None);
+    }
+
+    /// 设备详情弹窗是页面模态，不是窗口模态：右上角三颗必须照常归窗口。
+    ///
+    /// 拆掉原生标题条之前那三颗在窗口外面，弹窗再大也压不到它们；搬进客户区之后
+    /// "谁在最上面"只剩这一段代码说了算，而当时弹窗分支排在了按钮之前——症状是弹窗
+    /// 开着时点最小化/最大化/关闭只关掉弹窗，要关程序得点两下。
+    #[test]
+    fn the_detail_modal_does_not_swallow_the_window_buttons() {
+        let w = 1200.0;
+        // 三颗各自的中点，弹窗开着也照样点名到按钮。
+        for (i, dx) in [(0u8, 115.0f32), (1, 69.0), (2, 23.0)] {
+            assert_eq!(
+                top_owner(true, w, w - dx, 20.0),
+                TopOwner::WinBtn(i),
+                "弹窗开着时第 {i} 颗按钮被吞掉了"
+            );
+        }
+        // 弹窗仍然吃得到页面那一片：只有按钮那一格例外。
+        assert_eq!(top_owner(true, w, 600.0, 400.0), TopOwner::DetailModal);
+        assert_eq!(top_owner(true, w, 300.0, 20.0), TopOwner::DetailModal);
+        // 弹窗没开时同一格是页面。
+        assert_eq!(top_owner(false, w, 600.0, 400.0), TopOwner::Page);
+        assert_eq!(top_owner(false, w, w - 23.0, 20.0), TopOwner::WinBtn(2));
+        // 按钮带之外的标题带（y>=40）不算按钮：它要交回系统当拖动带。
+        assert_eq!(top_owner(true, w, w - 23.0, 42.0), TopOwner::DetailModal);
+    }
+
+    /// 接线腿：这一层只许由 `top_owner` 一处决定，画图/悬停/点击三条路读同一份。
+    /// 上面那条行为判据盯得住 `top_owner` 自己排序，盯不到"某条路绕过它又抄了一遍
+    /// 弹窗判据"——那条只能钉调用形态。
+    #[test]
+    fn only_one_place_decides_who_is_on_top() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 一份定义 + 两处调用：`top_owner` 决定归谁，`WM_NCHITTEST` 只问"这颗按钮要不要
+        // 交回客户区"。多出来的一眼就是有人绕过 top_owner 自己排了一遍弹窗。
+        assert_eq!(
+            prod.matches("win_button_at(").count(),
+            3,
+            "`win_button_at` 的生产调用点不再是 top_owner + WM_NCHITTEST 这两处了"
+        );
+        assert_eq!(
+            prod.matches("top_owner(self.detail.is_some(), w, x, y)")
+                .count(),
+            2,
+            "悬停与点击两条路里有一条不再问 top_owner 谁在最上面了"
+        );
+        // 点击那条路必须先在 top_owner 之后才碰弹窗矩形。
+        let click = &prod[prod.find("fn on_click(").expect("on_click 不见了")..];
+        let owner = click
+            .find("top_owner(")
+            .expect("on_click 不再问谁在最上面这一层");
+        let rects = click
+            .find("detail_rects(w, h)")
+            .expect("on_click 里弹窗那一段不见了");
+        assert!(
+            owner < rects,
+            "弹窗那一段又排回窗口按钮之前（top_owner 在 {owner}，detail_rects 在 {rects}）"
+        );
+    }
+
+    /// 右上角那一格归缩放，不归按钮。
+    ///
+    /// 三颗按钮一直画到窗口右沿，而可拖动的边框带也是那 8 DIP：按钮先吃的话
+    /// "右上角拖不动、顶边在按钮那一段也拖不动"，原生标题条时代这条优先级是系统给的。
+    #[test]
+    fn the_frame_band_grabs_the_corner_before_the_caption_buttons() {
+        let (w, h) = (1200.0f32, 860.0f32);
+        let (bx, by) = (8.0f32, 8.0f32);
+        // 右沿 8 DIP 从上到下都是缩放带，压在关闭按钮那一段也一样。
+        assert_eq!(nc_hit_code(false, w, h, bx, by, w - 4.0, 20.0), HTRIGHT);
+        assert_eq!(nc_hit_code(false, w, h, bx, by, w - 4.0, 4.0), HTTOPRIGHT);
+        // 顶边 8 DIP 压在最大化和最小化那两颗上：给 HTTOP（系统才有拖动/双击的入口）。
+        assert_eq!(nc_hit_code(false, w, h, bx, by, w - 69.0, 3.0), HTTOP);
+        assert_eq!(nc_hit_code(false, w, h, bx, by, w - 115.0, 3.0), HTTOP);
+        // 按钮内侧照旧是客户区——验收脚本点的就是这几格。
+        for dx in [20.0f32, 69.0, 115.0] {
+            assert_eq!(
+                nc_hit_code(false, w, h, bx, by, w - dx, 20.0),
+                HTCLIENT,
+                "离右沿 {dx} DIP 那点不再归按钮了"
+            );
+        }
+        // 最大化时没有边框带：右沿那一格还给按钮。
+        assert_eq!(nc_hit_code(true, w, h, bx, by, w - 4.0, 20.0), HTCLIENT);
+        assert_eq!(nc_hit_code(true, w, h, bx, by, 4.0, 300.0), HTCLIENT);
+        // 标题带与页面本体。
+        assert_eq!(nc_hit_code(false, w, h, bx, by, 300.0, 20.0), HTCAPTION);
+        assert_eq!(nc_hit_code(false, w, h, bx, by, 300.0, 300.0), HTCLIENT);
+        assert_eq!(nc_hit_code(false, w, h, bx, by, 4.0, 300.0), HTLEFT);
+        assert_eq!(nc_hit_code(false, w, h, bx, by, 300.0, h - 3.0), HTBOTTOM);
+    }
+
+    /// 接线腿：窗口过程只许问 `nc_hit_code` 这一份顺序（钉调用形态，不是钉函数名出现过）。
+    #[test]
+    fn the_window_procedure_asks_the_same_hit_order() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            prod.matches("nc_hit_code(zoomed, cw, ch, bx, by, x, y)")
+                .count(),
+            1,
+            "窗口过程不再把命中顺序交给 nc_hit_code 了（或在别处又复刻了一遍）"
+        );
+        let ht = &prod[prod.find("WM_NCHITTEST => {").expect("WM_NCHITTEST 不见了")..];
+        let ht = &ht[..ht
+            .find("WM_NCACTIVATE =>")
+            .expect("WM_NCHITTEST 的尾巴不见了")];
+        assert!(
+            !ht.contains("win_button_at(") && !ht.contains("HTTOPLEFT"),
+            "窗口过程里又复刻了一遍命中顺序（按钮尺子或八向判断），nc_hit_code 不再是唯一那一份"
+        );
+        assert!(
+            ht.contains("let zoomed = ") && ht.contains("frame_thickness(hwnd)"),
+            "WM_NCHITTEST 没把\"最大化\"与边框厚度交给 nc_hit_code"
+        );
     }
 }
 

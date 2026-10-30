@@ -177,6 +177,17 @@ Check 'the close button answers HTCLIENT' ($htClose -eq 1) "ht=$htClose"
 Check 'the left edge answers HTLEFT' ($htLeft -eq 10) "ht=$htLeft"
 Check 'the body answers HTCLIENT' ($htBody -eq 1) "ht=$htBody"
 
+# The three buttons are painted all the way to the window edge, so the resize band has to
+# win over them there -- otherwise the top-right corner is drawn but cannot be grabbed.
+$htCorner = HitTest $h ($cl.W - 4) 4
+$htRight = HitTest $h ($cl.W - 4) 20
+$htTopOnBtn = HitTest $h ($cl.W - 69) 3
+$htInner = HitTest $h ($cl.W - 20) 20
+Check 'the top-right corner answers HTTOPRIGHT' ($htCorner -eq 14) "ht=$htCorner"
+Check 'the edge under the close button answers HTRIGHT' ($htRight -eq 11) "ht=$htRight"
+Check 'the top band over a button answers HTTOP' ($htTopOnBtn -eq 12) "ht=$htTopOnBtn"
+Check 'the inside of the close button is still HTCLIENT' ($htInner -eq 1) "ht=$htInner"
+
 # Window buttons keep the arrow cursor (only page controls get the hand).
 $kindClose = Cursor-Kind $h ($cl.W - 20) 20
 Check 'window buttons keep the arrow' ($kindClose -eq 'arrow') "cursor=$kindClose"
@@ -215,6 +226,49 @@ Check 'minimize sends the window down' ([bool]$mini) ''
 [void][FFUI]::ShowWindow($h, 9)   # SW_RESTORE
 Start-Sleep -Milliseconds 700
 Check 'restore brings it back' (-not [FFUI]::IsIconic($h)) ''
+
+# The device-detail dialog is a page modal (it dims the whole client). Since the buttons
+# moved into the client area they used to be swallowed by it: with the dialog open, clicking
+# minimize only dismissed the dialog. Window-level actions must survive a page modal.
+$cl2 = Get-Client $h
+Click-ViewTab $h 2
+Click-PeriodPill $h 5              # 总计: today has no device rows in a fresh copy
+Start-Sleep -Milliseconds 800
+$plainShot = Join-Path $WorkDir 'ui-modal-1.png'
+Save-WindowShot $h $plainShot | Out-Null
+$b1 = [System.Drawing.Bitmap]::FromFile($plainShot)
+$pxPlain = Shot-Pixel $b1 (60 + $ox) (400 + $oy)
+$b1.Dispose()
+[FF]::ClickWindow($h, 200, 284, 1)          # device row 0, off the buttons = open detail
+Start-Sleep -Milliseconds 800
+$dimShot = Join-Path $WorkDir 'ui-modal-2.png'
+Save-WindowShot $h $dimShot | Out-Null
+$b2 = [System.Drawing.Bitmap]::FromFile($dimShot)
+$pxDim = Shot-Pixel $b2 (60 + $ox) (400 + $oy)
+$b2.Dispose()
+$dimDelta = [Math]::Abs($pxDim.R - $pxPlain.R) + [Math]::Abs($pxDim.G - $pxPlain.G) + [Math]::Abs($pxDim.B - $pxPlain.B)
+Check 'opening the device detail dims the page' ($dimDelta -ge 8) "plain=$($pxPlain.R),$($pxPlain.G),$($pxPlain.B) dim=$($pxDim.R),$($pxDim.G),$($pxDim.B) delta=$dimDelta"
+[FF]::ClickWindow($h, ($cl2.W - 115), 20, 1)  # minimize button, dialog still open
+Start-Sleep -Milliseconds 800
+Check 'the minimize button works above the detail dialog' ([bool][FFUI]::IsIconic($h)) ''
+[void][FFUI]::ShowWindow($h, 9)
+Start-Sleep -Milliseconds 700
+$backShot = Join-Path $WorkDir 'ui-modal-3.png'
+Save-WindowShot $h $backShot | Out-Null
+$b3 = [System.Drawing.Bitmap]::FromFile($backShot)
+$pxBack = Shot-Pixel $b3 (60 + $ox) (400 + $oy)
+$b3.Dispose()
+$kept = [Math]::Abs($pxBack.R - $pxDim.R) + [Math]::Abs($pxBack.G - $pxDim.G) + [Math]::Abs($pxBack.B - $pxDim.B)
+Check 'the detail dialog survived minimize and restore' ($kept -le 3) "delta_from_dim=$kept"
+[FF]::ClickWindow($h, 200, 284, 1)          # click outside the dialog = dismiss it
+Start-Sleep -Milliseconds 700
+$outShot = Join-Path $WorkDir 'ui-modal-4.png'
+Save-WindowShot $h $outShot | Out-Null
+$b4 = [System.Drawing.Bitmap]::FromFile($outShot)
+$pxOut = Shot-Pixel $b4 (60 + $ox) (400 + $oy)
+$b4.Dispose()
+$gone = [Math]::Abs($pxOut.R - $pxPlain.R) + [Math]::Abs($pxOut.G - $pxPlain.G) + [Math]::Abs($pxOut.B - $pxPlain.B)
+Check 'a click outside the dialog still dismisses it' ($gone -le 3) "delta_to_plain=$gone"
 
 # ---- dark, opaque: no shadow, top highlight instead -----------------------------------
 [void][FF]::PostMessage($h, 0x8009, [IntPtr]::Zero, [IntPtr]::Zero)
