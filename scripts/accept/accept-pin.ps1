@@ -122,7 +122,7 @@ $d0 = Get-Rect $dragPin
 $grabX = $d0.X + [int]($d0.W / 2)
 $grabY = $d0.Y + [int]($d0.H / 2)
 $onPin = Test-PointIsOurs $dragPin $grabX $grabY
-Check 'the drag starts on the pin itself' $onPin
+Check 'the drag starts on the pin itself' $onPin ("on top: " + (Describe-Point $grabX $grabY))
 if ($onPin) {
     Drag-Screen $grabX $grabY ($grabX + 120) ($grabY + 60)
     $d1 = Get-Rect $dragPin
@@ -132,7 +132,8 @@ if ($onPin) {
 } else {
     # A red, not a skip: the point was taken by somebody else's window, so the gesture went
     # there and this leg measured nothing about the pin.
-    Check 'a 120x60 drag lands the pin 120x60 away' $false 'skipped: the grab point is not the pin'
+    Check 'a 120x60 drag lands the pin 120x60 away' $false `
+        ('skipped: the grab point is not the pin (' + (Describe-Point $grabX $grabY) + ')')
 }
 
 # The wheel legs go first, on a pin nothing has disturbed yet. An injected wheel is delivered
@@ -145,7 +146,8 @@ $wheelPin = [FF]::ByClass([uint32]$p.Id, 'FocusFlowPin')
 [void][FF]::SetForegroundWindow($wheelPin)
 Start-Sleep -Milliseconds 400
 $wheelFg = ([FF]::GetForegroundWindow() -eq $wheelPin)
-Check 'the wheel starts on a pin that holds the foreground' $wheelFg
+Check 'the wheel starts on a pin that holds the foreground' $wheelFg `
+    ('foreground: ' + (Describe-Window ([FF]::GetForegroundWindow())))
 if ($wheelFg) {
     $wr = Get-Rect $wheelPin
     [FF]::Wheel($wr.X + [int]($wr.W / 2), $wr.Y + [int]($wr.H / 2), 1)

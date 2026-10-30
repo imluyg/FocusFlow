@@ -357,6 +357,31 @@ function Test-PointIsOurs([IntPtr]$Top, [int]$X, [int]$Y) {
     return ([FF]::GetAncestor($hit, 2) -eq $Top)
 }
 
+# Who owns this window / this screen point? A control point that fails because ANOTHER program
+# is on top (or holds the foreground) currently reports only "not the pin", which does not say
+# who took it -- measured twice on 2026-10-30, both times right after a fresh exe was written,
+# and by the time the suite was re-run the intruder was gone. These two make the next red
+# self-explaining.
+function Describe-Window([IntPtr]$Hwnd) {
+    if ($Hwnd -eq [IntPtr]::Zero) { return 'none' }
+    $sb = New-Object System.Text.StringBuilder 256
+    [void][FF]::GetClassName($Hwnd, $sb, 256)
+    $wpid = [uint32]0
+    [void][FF]::GetWindowThreadProcessId($Hwnd, [ref]$wpid)
+    $name = '?'
+    try { $name = (Get-Process -Id $wpid -ErrorAction Stop).ProcessName } catch { }
+    "class=$($sb.ToString()) pid=$wpid proc=$name"
+}
+
+function Describe-Point([int]$X, [int]$Y) {
+    $p = New-Object FF+WINPOINT
+    $p.X = $X
+    $p.Y = $Y
+    $hit = [FF]::WindowFromPoint($p)
+    if ($hit -eq [IntPtr]::Zero) { return 'nothing' }
+    Describe-Window $hit
+}
+
 function Save-WindowShot([IntPtr]$Hwnd, [string]$Path) {
     $c = Get-Client $Hwnd
     $w = [Math]::Max($c.W, 1)
