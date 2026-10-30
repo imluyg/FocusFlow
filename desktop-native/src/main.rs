@@ -3316,7 +3316,7 @@ const BASIC_ROWS: [Basic; 11] = [
 
 fn setting_cat(section: &str) -> usize {
     match section {
-        "hotkey" => 1,
+        "hotkey" | "snip" => 1,
         "goal" => 3,
         "database" => 4,
         _ => 5,

@@ -41,6 +41,10 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
         ],
     );
     s("stats", &[("cpm_window", "60")]);
+    // 每日目标次数：设置页「每日目标」那一行的值框、主界面目标条、悬浮窗的百分比都读它。
+    // 两个读者一直各自写着 20000 的兜底，而默认值表里没有这一键 ⇒ 值框空着、config.ini
+    // 里也看不见（设置清单与默认值表对齐的那条用例就是这么发现它的）。
+    s("goal", &[("daily_keys", "20000")]);
     // 数据目录（`data/` 与 `backup/` 挂在哪里）。留空 = 跟程序目录走，即"拷走整个
     // 文件夹即迁移"的默认形态；填一个绝对路径就把数据挪到那儿，改完由程序自己
     // 拷贝已有数据并重启生效（读者：paths::data_home）。日志/插件/配置仍留在程序目录。
@@ -123,6 +127,10 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
         ],
     );
     s("floating", &[("enabled", "true")]);
+    // 截图期间悬浮窗藏多久（`desktop-native/src/snip.rs` 的 `start` 读它）：
+    // true = 整场截图都不显示；false = 冻结画面一抓完就还回去（旧观感，覆盖层上屏前会
+    // 闪一下真实桌面）。默认 true —— 冻结图里没有卡片，中途再让它冒出来只会多一次闪。
+    s("snip", &[("hide_floating", "true")]);
     // 贴图用哪套绘制：webview（旧前端，一张图一个浏览器页面）/ native（原生分层窗口，
     // 一张图一个窗口）。原生端只有一套 ⇒ 这个键现在没有读点，留着只为读得通旧档。
     s("pin", &[("renderer", "webview")]);
@@ -268,13 +276,15 @@ pub(crate) fn parse_ini(text: &str) -> HashMap<String, HashMap<String, String>> 
 /// 直接按 `HashMap` 迭代序排 ⇒ 实测同一份默认配置，重建路给
 /// `app_stats, plugins, device_stats`、逐行重写路给 `app_stats, device_stats, plugins`，
 /// 每跑一次进程都可能换个样子。现在两边都是"清单位置 → 同名兜底"。
-const SECTION_ORDER: [&str; 13] = [
+const SECTION_ORDER: [&str; 15] = [
     "database",
     "stats",
     "paths",
     "listener",
     "gui",
+    "goal",
     "hotkey",
+    "snip",
     "floating",
     "pin",
     "pomodoro",
@@ -1289,6 +1299,8 @@ mod tests {
         assert_eq!(cfg.get_int("plugins", "instruction_limit", 0), 10_000_000);
         assert!(!cfg.get_bool("database", "backup_disabled_plugins", true));
         assert!(cfg.get_bool("device_stats", "enabled", false));
+        // 截图期间藏满悬浮窗是默认口径（关掉它才回到旧观感），这一行必须在文件里看得见
+        assert!(cfg.get_bool("snip", "hide_floating", false));
 
         let _ = Arc::new(());
         std::fs::remove_dir_all(&dir).ok();

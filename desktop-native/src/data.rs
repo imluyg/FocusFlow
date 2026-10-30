@@ -81,6 +81,14 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         "热键 · 按下它框选后进标注窗（方框/箭头/文字），如 shift+f2",
     ),
     (
+        "snip",
+        "hide_floating",
+        0,
+        "改完立即生效",
+        "截图时隐藏悬浮窗",
+        "截图 · 开＝整场都不显示；关＝冻结后立刻放回（会闪一下桌面）",
+    ),
+    (
         "listener",
         "ignore_modifier_keys",
         0,
@@ -628,6 +636,47 @@ mod readout_rulers_tests {
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// 设置清单上的每一行都必须在 `default_config()` 里真有默认值。
+    ///
+    /// 段名/键名写错一个字母时，屏上照样画出这一行（值走 `unwrap_or_default()` 显示成空，
+    /// 开关类就画成「关」），点一下又会往 config.ini 里写一个**新键** —— 而真正那个开关
+    /// 从头到尾没人碰过。这条用例把清单与默认值表对齐。
+    #[test]
+    fn every_settings_row_has_a_default_in_the_shipped_config() {
+        let defaults = focusflow_core::config::default_config();
+        for (section, key, ..) in SETTINGS {
+            assert!(
+                defaults.get(*section).is_some_and(|s| s.contains_key(*key)),
+                "设置行 {section}.{key} 在 default_config() 里没有默认值"
+            );
+        }
+    }
+
+    /// 开关行的说明文字必须装得进它那一列：值框从 x=720 起画，说明从 ~334 起、列宽
+    /// `(720 - r.left - 30) ≈ 368 px`。这块 UI **不按矩形裁切**（`NO_WRAP`、不设
+    /// `DWRITE_TRIMMING`），超出去的字照画 —— 2026-10-30 新加的那一行就是这么把
+    /// "（旧观感，中途会闪一下桌面）"画到「开」按钮右边的（截图量过，改前 48 字、
+    /// 改后约 350 px 正好收在框左）。开关行没有别的遮挡物，所以只有这一族的长度要钉。
+    #[test]
+    fn a_toggle_rows_help_fits_before_its_value_box() {
+        // 近似字宽：中日韩全角 12 px，ASCII 6 px（与 12 号字量出来的行宽同量级）。
+        let width = |s: &str| -> usize {
+            s.chars()
+                .map(|c| if (c as u32) < 0x2E80 { 6 } else { 12 })
+                .sum()
+        };
+        for (section, key, kind, _, _, help) in SETTINGS {
+            if *kind != 0 {
+                continue;
+            }
+            assert!(
+                width(help) <= 368,
+                "开关行 {section}.{key} 的说明宽约 {} px，会画到值框上：{help}",
+                width(help)
+            );
+        }
     }
 
     /// 「日均」那两档的分母各吃什么数。

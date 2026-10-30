@@ -12,6 +12,7 @@ database/online_backup_interval_hours
 database/yearly_archive
 device_stats/enabled
 floating/enabled
+goal/daily_keys
 gui/active_refresh_interval
 gui/floating_metric
 gui/start_to_tray
@@ -40,4 +41,5 @@ rest/enabled
 rest/key_threshold
 rest/rest_seconds
 rest/window_minutes
+snip/hide_floating
 stats/cpm_window

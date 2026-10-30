@@ -3277,6 +3277,9 @@ pub fn start(owner: HWND, annotate: bool) {
         tracing_note("截图失败：拿不到虚拟屏尺寸");
         return;
     }
+    // 截图期间悬浮窗藏多久：默认整场都藏满（冻结图里本来就没有它，中途再让它冒出来
+    // 只会多一次"真实桌面"的闪）。关掉 `[snip] hide_floating` = 回到旧观感。
+    let keep_hidden = focusflow_core::config::instance().get_bool("snip", "hide_floating", true);
     let pill_was = floating::is_visible();
     if pill_was {
         crate::floating::set_visible(false);
@@ -3295,7 +3298,14 @@ pub fn start(owner: HWND, annotate: bool) {
     };
     let dim = dim_bgra(&base);
     let hits = collect_candidates();
-    // 这一刻**不**把悬浮窗还回去：还了就等于在"冻结好的画面"与"覆盖层上屏"之间让用户
+    // 关掉 `hide_floating` 时按旧观感走：冻结的这一帧已经抓稳，此刻就把卡片放回去。
+    // 代价写在设置页那一行里 —— 覆盖层上屏那一瞬会闪一下真实桌面，所以默认不这么干。
+    let mut restored_early = false;
+    if pill_was && !keep_hidden {
+        crate::floating::set_visible(true);
+        restored_early = true;
+    }
+    // 默认那条路**不**把悬浮窗还回去：还了就等于在"冻结好的画面"与"覆盖层上屏"之间让用户
     // 看见一次真实桌面（那颗卡片跟着闪一下，而它根本不在冻结的那张图里）。
     // 它由 `WM_DESTROY` 按 `pill_was` 原样还，创建失败那条路自己也还。
     unsafe {
@@ -3355,7 +3365,8 @@ pub fn start(owner: HWND, annotate: bool) {
                     s.text_edit = 0;
                     s.base = base;
                     s.dim = dim;
-                    s.pill_was = pill_was;
+                    // 已经提前还回去的那一场不必再由退出路径还第二次。
+                    s.pill_was = pill_was && !restored_early;
                     let now = Instant::now();
                     s.started_at = Some(now);
                     s.last_input = Some(now);
@@ -5735,7 +5746,9 @@ mod tests {
     }
 
     /// 开层那一下不闪黑，靠的是两条**顺序**：先建不可见的窗、先把整屏缓冲填进状态、
-    /// 再上屏；以及冻结之后不提前把悬浮窗还回去（还了就等于让用户看见一次真实桌面）。
+    /// 再上屏；以及冻结之后不**无条件**把悬浮窗还回去（默认口径 = 整场都藏，还了就等于
+    /// 让用户看见一次真实桌面）。设置页那一行 `[snip] hide_floating` 关掉时才按旧观感提前还，
+    /// 这条用例钉的就是"提前还只许走那个开关"。
     ///
     /// 为什么只能钉源码顺序：症状是一帧的瞬变，等测试去抓屏时正确的第二帧早画上去了，
     /// "抓第一帧"那条读数对回归是瞎的 ⇒ 断言必须比的是调用的先后与形态。
@@ -5771,9 +5784,24 @@ mod tests {
         let created = flat
             .find("RegisterClassExW(&wc)")
             .expect("覆盖层的类注册不见了");
+        // 冻结之后、建窗之前只许有**按设置**的那一次还原：`[snip] hide_floating` 关掉时
+        // 才还（那是用户点名要的旧观感）；无条件还就是上一轮修掉的那一次闪。
+        assert_eq!(
+            flat[listed..created]
+                .matches("floating::set_visible(true)")
+                .count(),
+            1,
+            "冻结之后、建窗之前还原悬浮窗的分支数量变了"
+        );
         assert!(
-            !flat[listed..created].contains("set_visible(true)"),
-            "冻结之后、建窗之前又把悬浮窗还回去了：中间会看见一次真实桌面"
+            flat[listed..created].contains(
+                "ifpill_was&&!keep_hidden{crate::floating::set_visible(true);restored_early=true;}"
+            ),
+            "冻结之后那次还原必须挂在 `hide_floating` 开关上，不许无条件还回去"
+        );
+        assert!(
+            flat.contains("get_bool(\"snip\",\"hide_floating\",true)"),
+            "`hide_floating` 没在开层这一路读出来（或默认值漂了）"
         );
     }
 

@@ -42,6 +42,11 @@
   really waits three minutes. A WM_TIMER posted from outside does not reach the app's message
   loop (measured), so there is no way to fast-forward it from the harness.
 
+  Round 5 drives [snip] hide_floating both ways: the floating card must stay hidden for the
+  whole capture with the key on (the default), and be put back as soon as the frame is frozen
+  with it off. Visibility is read from the window itself, and each arm proves the card was
+  visible before the snip -- otherwise "still hidden" would describe a card that never existed.
+
   ASCII-only, like every file in this folder.
 #>
 param(
@@ -531,5 +536,47 @@ Check 'the overlay gives up by itself after three minutes' ($gone -and ($waited 
 Check 'the log names the timeout' (Wait-Log 'snip-timeout' 2000)
 Check 'the timeout saved nothing' ((Count-Png) -eq $before4) "png=$(Count-Png)"
 Stop-Round $h4 $p4
+
+# ---------- round 5: the floating pill during a snip ----------
+# One config key, two arms. [snip] hide_floating = true (the default) keeps the card off the
+# screen for the WHOLE capture; false puts it back the moment the frame is frozen -- the old
+# behaviour, which costs one flash of the real desktop while the overlay comes up.
+#
+# Visibility is read off the window (IsWindowVisible), and each arm first proves the pill was
+# visible BEFORE the snip: "still hidden" after a card that never existed would prove nothing.
+foreach ($arm in @(
+        @{ Tag = 'hide=on'; Value = 'true'; Shown = $false },
+        @{ Tag = 'hide=off'; Value = 'false'; Shown = $true })) {
+    Set-ConfigLine $app 'snip' 'hide_floating' $arm.Value
+    Remove-Item $logPath -ErrorAction SilentlyContinue
+    $p5 = Start-App $Exe $app $WorkDir
+    $h5 = Wait-Window $p5.Id
+    if ($h5 -eq [IntPtr]::Zero) { Stop-App; break }
+    $pill5 = Wait-Window $p5.Id 'FocusFlowFloatingPill' 8000
+    Check "(pill $($arm.Tag)) the card is on the desktop before the snip" ($pill5 -ne [IntPtr]::Zero)
+    # The window class shows up before the card is put on screen (it is created hidden and
+    # shown by its own thread), so reading visibility once right here races startup -- that
+    # is how this control point first went red. Wait for the card to become visible instead.
+    $shownBefore = $false
+    $swp = [Diagnostics.Stopwatch]::StartNew()
+    while ($swp.Elapsed.TotalMilliseconds -lt 4000) {
+        if ([FF]::IsWindowVisible($pill5)) { $shownBefore = $true; break }
+        Start-Sleep -Milliseconds 100
+    }
+    Check "(pill $($arm.Tag)) the card is visible before the snip" $shownBefore
+
+    [void][FF]::PostMessage($h5, 0x8006, [IntPtr]1, [IntPtr]::Zero)   # WM_SNIP_START (annotate)
+    $ov5 = Wait-Window $p5.Id 'FocusFlowSnipOverlay' 6000
+    Check "(pill $($arm.Tag)) the snip overlay opens" ($ov5 -ne [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 800
+    $shown = [FF]::IsWindowVisible($pill5)
+    Check "(pill $($arm.Tag)) the card during the snip follows hide_floating" `
+        ($shown -eq $arm.Shown) "visible=$shown want=$($arm.Shown)"
+
+    if ($ov5 -ne [IntPtr]::Zero) { Post-Key $ov5 0x1B }
+    Start-Sleep -Milliseconds 900
+    Check "(pill $($arm.Tag)) the card is back after the snip" ([FF]::IsWindowVisible($pill5))
+    Stop-Round $h5 $p5
+}
 
 Show-Summary
