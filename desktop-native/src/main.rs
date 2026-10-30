@@ -57,9 +57,9 @@ use windows::Win32::Graphics::Gdi::{
     GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, Rectangle, SelectObject,
     SetBkColor, SetBkMode, SetTextColor, StretchDIBits, TextOutW, UpdateWindow, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DIB_RGB_COLORS, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, SRCCOPY,
-    TRANSPARENT,
+    DEFAULT_PITCH, DIB_RGB_COLORS, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID,
+    SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
@@ -899,23 +899,23 @@ impl App {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let fmt = Formats {
-                h1: text_format(&dwrite, 20.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+                h1: text_format(&dwrite, 20.0, UI_WEIGHT_EM)?,
                 value: text_format(&dwrite, 23.0, DWRITE_FONT_WEIGHT_BOLD)?,
-                label: text_format(&dwrite, 11.5, DWRITE_FONT_WEIGHT_NORMAL)?,
-                body: text_format(&dwrite, 12.5, DWRITE_FONT_WEIGHT_NORMAL)?,
-                small: text_format(&dwrite, 11.0, DWRITE_FONT_WEIGHT_NORMAL)?,
+                label: text_format(&dwrite, 11.5, UI_WEIGHT)?,
+                body: text_format(&dwrite, 12.5, UI_WEIGHT)?,
+                small: text_format(&dwrite, 11.0, UI_WEIGHT)?,
                 right: right_format(&dwrite, 11.0)?,
                 center_small: center_format(&dwrite, 11.0)?,
                 center_tiny: center_format(&dwrite, 8.5)?,
                 tab: center_format(&dwrite, 12.5)?,
                 settings_h: text_format(&dwrite, 15.0, DWRITE_FONT_WEIGHT_BOLD)?,
-                row_name: text_format(&dwrite, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
-                table_name: text_format(&dwrite, 12.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
-                text13: text_format(&dwrite, 13.0, DWRITE_FONT_WEIGHT_NORMAL)?,
-                text13_em: text_format(&dwrite, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
-                text12: text_format(&dwrite, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
-                text12_em: text_format(&dwrite, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
-                center13: center_format_w(&dwrite, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+                row_name: text_format(&dwrite, 14.0, UI_WEIGHT)?,
+                table_name: text_format(&dwrite, 12.5, UI_WEIGHT)?,
+                text13: text_format(&dwrite, 13.0, UI_WEIGHT)?,
+                text13_em: text_format(&dwrite, 13.0, UI_WEIGHT_EM)?,
+                text12: text_format(&dwrite, 12.0, UI_WEIGHT)?,
+                text12_em: text_format(&dwrite, 12.0, UI_WEIGHT_EM)?,
+                center13: center_format_w(&dwrite, 13.0, UI_WEIGHT)?,
             };
 
             let (tray, pause_item) = make_tray(&snap);
@@ -987,7 +987,8 @@ impl App {
                 0,
                 0,
                 0,
-                FW_NORMAL.0 as i32,
+                // 与 D2D 那一套同一个基准字重（`UI_WEIGHT`）：框里敲进去的字不该比框外的细一档。
+                FW_SEMIBOLD.0 as i32,
                 0,
                 0,
                 0,
@@ -8688,8 +8689,16 @@ fn text_format(
     }
 }
 
+/// 主窗口所有文字的基准字重。他 2026-10-30 先点了"名字加粗"，看过之后又要**整体**加粗 ⇒
+/// 常规那一档抬到 600。⚠ 雅黑只有 400/700 两档，汉字在 600 上会落到 700（真的粗），
+/// 拉丁字母与数字落在 Segoe UI Semibold 上 —— 两边的"粗"程度本来就不同，这是字体本身的
+/// 限制，不是两种尺子。
+const UI_WEIGHT: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_SEMI_BOLD;
+/// 强调档：比基准再重一级。拉丁字母上看得见差别；汉字两边都是 700，只能靠字号或颜色分。
+const UI_WEIGHT_EM: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_BOLD;
+
 fn right_format(dw: &IDWriteFactory, size: f32) -> windows::core::Result<IDWriteTextFormat> {
-    let f = text_format(dw, size, DWRITE_FONT_WEIGHT_NORMAL)?;
+    let f = text_format(dw, size, UI_WEIGHT)?;
     unsafe {
         let _ = f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
@@ -8697,7 +8706,7 @@ fn right_format(dw: &IDWriteFactory, size: f32) -> windows::core::Result<IDWrite
 }
 
 fn center_format(dw: &IDWriteFactory, size: f32) -> windows::core::Result<IDWriteTextFormat> {
-    center_format_w(dw, size, DWRITE_FONT_WEIGHT_NORMAL)
+    center_format_w(dw, size, UI_WEIGHT)
 }
 
 /// 居中且带字重的一档：设置页那些章（「开」「执行」「没有贴图」）是白字压在饱和底色上，
