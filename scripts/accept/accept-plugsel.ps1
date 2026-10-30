@@ -133,11 +133,13 @@ Check 'the sel button composed <button id><record id>' (@($log | Where-Object { 
 # the row click into a real action and this readout red, then be rewritten to assert
 # the new behaviour. Coordinates are the client rows of the opened fixture view at
 # 100% DPI (content starts at y=260; a plain button row is 38 tall, the label row 22).
+# Since the native caption was removed the client area is the whole 1200x860 window;
+# top-anchored coordinates below are unchanged, only the bottom edge moved down.
 Click-ViewTab $h 4
 [FF]::ClickWindow($h, 200, 270, 1)          # the only plugin row = SelFixture: open its view
 Start-Sleep -Milliseconds 600
 $cl = Get-Client $h
-$sizeOk = ($cl.W -eq 1184 -and $cl.H -eq 821)
+$sizeOk = ($cl.W -eq 1200 -and $cl.H -eq 860)
 Check 'the click coordinates address the rows they name' ([bool]$sizeOk) ("client=" + $cl.W + "x" + $cl.H)
 [FF]::ClickWindow($h, 90, 275, 1)           # row 1: a plain button, must fire
 $probeLive = Wait-FixLog '/ pg_probe'

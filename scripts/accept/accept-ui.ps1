@@ -30,6 +30,8 @@ public class FFUI {
   [DllImport("user32.dll")] public static extern IntPtr LoadCursor(IntPtr h, int name);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
 }
 "@
 
@@ -44,7 +46,9 @@ function Shot-Pixel($Bmp, [int]$X, [int]$Y) { return $Bmp.GetPixel($X, $Y) }
 # the top -- scanning from the corner would land inside the arc and report a shifted origin.
 function Find-CardOrigin($Bmp, [int]$WantR, [int]$WantG, [int]$WantB, [int]$Tol) {
     $oy = -1
-    for ($y = 100; $y -lt 320; $y++) {
+    # Start above the card top: with the native caption gone the captured bitmap can begin
+    # at client y=0, so starting at 100 would miss the top edge and report a false offset.
+    for ($y = 60; $y -lt 320; $y++) {
         # x=60 is inside card 1 but left of the period pills (they start at x=82): the idle
         # pills are card-fill coloured and would win the scan for the card top.
         $c = $Bmp.GetPixel(60, $y)
@@ -154,6 +158,63 @@ $w5 = Count-Accent $bs $yUnd (436 + $ox) (516 + $ox)
 Check 'the underline width follows the label (2 chars vs 4)' (($w0 - $w5) -ge 8) "four_chars=$w0 two_chars=$w5"
 $bs.Dispose()
 $bl.Dispose()
+
+# ---- custom title bar: drag band, buttons, resize edges -------------------------------
+function HitTest([IntPtr]$Hwnd, [int]$X, [int]$Y) {
+    $pt = New-Object FFUI+POINT
+    $pt.X = $X; $pt.Y = $Y
+    [void][FFUI]::ClientToScreen($Hwnd, [ref]$pt)
+    $lp = [IntPtr](($pt.Y -shl 16) -bor ($pt.X -band 0xFFFF))
+    return [int][FF]::SendMessage($Hwnd, 0x0084, [IntPtr]::Zero, $lp)
+}
+$cl = Get-Client $h
+$htTitle = HitTest $h 300 20
+$htClose = HitTest $h ($cl.W - 20) 20
+$htLeft = HitTest $h 2 300
+$htBody = HitTest $h 300 300
+Check 'the title band answers HTCAPTION' ($htTitle -eq 2) "ht=$htTitle"
+Check 'the close button answers HTCLIENT' ($htClose -eq 1) "ht=$htClose"
+Check 'the left edge answers HTLEFT' ($htLeft -eq 10) "ht=$htLeft"
+Check 'the body answers HTCLIENT' ($htBody -eq 1) "ht=$htBody"
+
+# Window buttons keep the arrow cursor (only page controls get the hand).
+$kindClose = Cursor-Kind $h ($cl.W - 20) 20
+Check 'window buttons keep the arrow' ($kindClose -eq 'arrow') "cursor=$kindClose"
+Move-CursorAway $h
+Start-Sleep -Milliseconds 350
+$titleBase = Join-Path $WorkDir 'ui-title-base.png'
+Save-WindowShot $h $titleBase | Out-Null
+$bt = [System.Drawing.Bitmap]::FromFile($titleBase)
+$basePx = Shot-Pixel $bt ($cl.W - 40) 8
+$bt.Dispose()
+[void](Cursor-Kind $h ($cl.W - 20) 20)
+Start-Sleep -Milliseconds 400
+$titleHover = Join-Path $WorkDir 'ui-title-hover.png'
+Save-WindowShot $h $titleHover | Out-Null
+$th = [System.Drawing.Bitmap]::FromFile($titleHover)
+$hotPx = Shot-Pixel $th ($cl.W - 40) 8
+$th.Dispose()
+$cd = [Math]::Abs($hotPx.R - $basePx.R) + [Math]::Abs($hotPx.G - $basePx.G) + [Math]::Abs($hotPx.B - $basePx.B)
+Check 'the close button turns red on hover' ($cd -ge 40) "base=$($basePx.R),$($basePx.G),$($basePx.B) hot=$($hotPx.R),$($hotPx.G),$($hotPx.B)"
+
+# Maximize / restore through the middle button.
+[FF]::ClickWindow($h, $cl.W - 69, 20, 1)
+Start-Sleep -Milliseconds 700
+$max = Get-Client $h
+Check 'maximize grows the client area' ($max.W -gt $cl.W -and $max.H -gt $cl.H) "before=$($cl.W)x$($cl.H) after=$($max.W)x$($max.H)"
+[FF]::ClickWindow($h, $max.W - 69, 20, 1)
+Start-Sleep -Milliseconds 700
+$rest = Get-Client $h
+Check 'restore returns the 1200x860 client' ($rest.W -eq 1200 -and $rest.H -eq 860) "client=$($rest.W)x$($rest.H)"
+
+# Minimize / restore through the left button.
+[FF]::ClickWindow($h, $rest.W - 115, 20, 1)
+Start-Sleep -Milliseconds 700
+$mini = [FFUI]::IsIconic($h)
+Check 'minimize sends the window down' ([bool]$mini) ''
+[void][FFUI]::ShowWindow($h, 9)   # SW_RESTORE
+Start-Sleep -Milliseconds 700
+Check 'restore brings it back' (-not [FFUI]::IsIconic($h)) ''
 
 # ---- dark, opaque: no shadow, top highlight instead -----------------------------------
 [void][FF]::PostMessage($h, 0x8009, [IntPtr]::Zero, [IntPtr]::Zero)

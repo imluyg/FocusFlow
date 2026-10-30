@@ -55,15 +55,22 @@ Start-Sleep -Milliseconds 600
 $shot = Join-Path $WorkDir 'plugin-view.png'
 Check 'plugin view renders' (Save-WindowShot $h $shot) $shot
 
+# Modal dialogs are centred on the client; the native caption is gone, so the client is
+# 1200x860 instead of 1184x821. Modal-internal clicks below were measured on the old
+# client, so shift them by half the client delta (modal size itself is fixed).
+$cl = Get-Client $h
+$mx = [int](($cl.W - 1184) / 2)
+$my = [int](($cl.H - 821) / 2)
+
 [FF]::ClickWindow($h, 60, 275, 1)      # + add record: button carries modal="add_modal"
 Check 'button.modal opens the modal form' (Wait-Log 'add_modal') ''
 
-[FF]::ClickWindow($h, 520, 270, 1)     # the type select inside the modal
+[FF]::ClickWindow($h, (520 + $mx), (270 + $my), 1)     # the type select inside the modal
 Start-Sleep -Milliseconds 300
-[FF]::ClickWindow($h, 520, 325, 1)     # second option
+[FF]::ClickWindow($h, (520 + $mx), (325 + $my), 1)     # second option
 Check 'select inside the modal writes the field' (Wait-Log 'd_type = ') ''
 
-[FF]::ClickWindow($h, 816, 583, 1)     # save
+[FF]::ClickWindow($h, (816 + $mx), (583 + $my), 1)     # save
 Check 'modal submit runs the plugin action' (Wait-Log 'add_record') ''
 
 # View-level filter select (category value box sits at x 185..445).
@@ -76,7 +83,7 @@ Check 'view-level select writes the field' (Wait-Log 'f_cat = ') ''
 # TextInput inside a modal still uses the inline EDIT.
 [FF]::ClickWindow($h, 60, 275, 1)
 Start-Sleep -Milliseconds 500
-[FF]::ClickWindow($h, 520, 301, 1)
+[FF]::ClickWindow($h, (520 + $mx), (301 + $my), 1)
 Check 'modal text field opens the inline editor' (Wait-Log 'd_item') ''
 [void][FF]::PostMessage($h, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)   # Esc = cancel
 Start-Sleep -Milliseconds 400
@@ -84,7 +91,7 @@ Start-Sleep -Milliseconds 400
 # A content-only modal (monthly summary), opened by the plugin itself (open=true).
 [FF]::ClickWindow($h, 60, 427, 1)
 Check 'plugin can open a content modal' (Wait-Log 'monthly_detail') ''
-[FF]::ClickWindow($h, 816, 500, 1)     # close
+[FF]::ClickWindow($h, (816 + $mx), (500 + $my), 1)     # close
 Check 'content modal close runs its action' (Wait-Log 'clear_result') ''
 
 $log = Read-AppLog $WorkDir
