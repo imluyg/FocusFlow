@@ -2394,6 +2394,11 @@ mod tests {
     ///
     /// 判据取"要么逐字节相同，要么根目录那份不存在"：真把这一份删掉是更彻底的合规，
     /// 那条路也得走得通，不许被这条用例逼着维护两份。
+    ///
+    /// 2026-10-30 他点名走的就是**删掉**这一条：仓库根现在没有 `plugins/`（.gitignore 里那行
+    /// `/plugins/` 留着，防它哪天被重新加进版本库）。代价只有一条 —— debug 构建的 `app_dir()`
+    /// 回落到当前工作目录，所以在仓库根直接 `cargo run` 的人不再有插件面板；
+    /// 想要就自己 `cp -r crates/core/plugins plugins`，那条路本用例照样盯着不许分叉。
     #[test]
     fn the_repo_root_plugin_copy_never_diverges_from_the_shipped_one() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
