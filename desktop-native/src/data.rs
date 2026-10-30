@@ -89,6 +89,14 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         "截图 · 开＝整场都不显示；关＝冻结后立刻放回（会闪一下桌面）",
     ),
     (
+        "snip",
+        "loupe",
+        0,
+        "改完立即生效",
+        "像素放大镜",
+        "截图 · 关＝选区定下前也不画那台跟光标的方块",
+    ),
+    (
         "listener",
         "ignore_modifier_keys",
         0,

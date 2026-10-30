@@ -134,7 +134,13 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     // 截图期间悬浮窗藏多久（`desktop-native/src/snip.rs` 的 `start` 读它）：
     // true = 整场截图都不显示；false = 冻结画面一抓完就还回去（旧观感，覆盖层上屏前会
     // 闪一下真实桌面）。默认 true —— 冻结图里没有卡片，中途再让它冒出来只会多一次闪。
-    s("snip", &[("hide_floating", "true")]);
+    // 截图那台像素放大镜开不开（读点在 `desktop-native/src/snip.rs` 的 `start`，每开一场
+    // 读一次）：它按设计压在光标右下 18 像素，对边靠它，但正在看屏幕本身的人会被它挡住，
+    // 所以留一条能关的口子。默认开 —— 关掉的人是自己来关的。
+    //
+    // ⚠ 这一节的两个键必须写在同一次 `s()` 里：那个 helper 是 `map.insert`，
+    // 同一个节名调两次 = 后一次把前一次整节顶掉（`hide_floating` 会当场消失）。
+    s("snip", &[("hide_floating", "true"), ("loupe", "true")]);
     // 注：`[pin] renderer` 这一档不再写默认值 —— 它与下面 DEPRECATED_CONFIG 里那几行
     // 同一族（旧前端"一张图一个浏览器页面"的选择，原生端只有一套绘制），
     // 全仓零读点却天天落盘，用户改了没反应。老文件里的那一行在 load 时清掉。

@@ -41,4 +41,5 @@ rest/key_threshold
 rest/rest_seconds
 rest/window_minutes
 snip/hide_floating
+snip/loupe
 stats/cpm_window

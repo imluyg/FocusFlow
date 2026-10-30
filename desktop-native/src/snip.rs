@@ -259,6 +259,9 @@ pub struct SnipState {
     pen_pts: Vec<(i32, i32)>,
     /// 悬停命中的窗口矩形（Select 阶段的亮区预览）。
     hover: Option<(i32, i32, i32, i32)>,
+    /// 这一场开不开像素放大镜（`[snip] loupe`，`start` 里读一次）。关掉的那台屏幕上
+    /// 方块与它下面那行读数都不画，左上角那行用法提示照旧。
+    loupe: bool,
     /// 冻结那一刻的窗口清单（Z 序顶→底）。一次成图，鼠标移动不再 EnumWindows。
     hits: Vec<Candidate>,
     marks: Vec<Mark>,
@@ -322,6 +325,7 @@ const fn default_state() -> SnipState {
         cur: (0, 0),
         pen_pts: Vec::new(),
         hover: None,
+        loupe: true,
         hits: Vec::new(),
         marks: Vec::new(),
         undo_stack: Vec::new(),
@@ -1165,6 +1169,20 @@ pub fn loupe_rect(cx: i32, cy: i32, w: i32, h: i32) -> Option<(i32, i32, i32, i3
         y = cy - LOUPE_GAP - side - LOUPE_TEXT_H;
     }
     Some((x.max(0), y.max(0), side, side))
+}
+
+/// 覆盖层**打开那一刻**放大镜的锚点：真实光标是虚拟屏的物理坐标，这里换算成本层坐标
+/// 并钳进这一屏。
+///
+/// 为什么单独成函数：`start()` 以前把锚点写成 `(0,0)` 就等第一次 `WM_MOUSEMOVE`，于是
+/// "按下热键、手还没动"那一段里放大镜停在屏幕左上角、读数报「屏幕 5,5」，挡住的是左上角
+/// 那块画面，而它本该放大光标底下那几点。换算与钳位各自都能错一次：多屏时忘了减虚拟屏
+/// 原点，放大镜整块跑到隔壁屏；光标贴边时不钳，读数会报一个屏外坐标。
+pub fn loupe_anchor(pt_x: i32, pt_y: i32, vx: i32, vy: i32, w: i32, h: i32) -> (i32, i32) {
+    (
+        (pt_x - vx).clamp(0, (w - 1).max(0)),
+        (pt_y - vy).clamp(0, (h - 1).max(0)),
+    )
 }
 
 /// 放大镜要看的那一片源像素（左上角 + 边长），钳在冻结图内。
@@ -2922,8 +2940,14 @@ unsafe fn paint(hwnd: HWND) {
         let base: &[u8] = &snip.base;
         let marks = &snip.marks;
         let pen_pts = &snip.pen_pts;
-        let (sel, phase, drag, cur, origin) =
-            (snip.sel, snip.phase, snip.drag, snip.cur, snip.origin);
+        let (sel, phase, drag, cur, origin, loupe_on) = (
+            snip.sel,
+            snip.phase,
+            snip.drag,
+            snip.cur,
+            snip.origin,
+            snip.loupe,
+        );
         let (tool, color, width, font, selected) =
             (snip.tool, snip.color, snip.width, snip.font, snip.selected);
         let notice = snip.notice.as_deref();
@@ -3081,8 +3105,9 @@ unsafe fn paint(hwnd: HWND) {
         // 放大镜（像素级取框）：最后画，压在一切之上。**只在选区还没定那一段**显示 ——
         // 人要的是"这一列到底到边了没有"；选区定下之后要看的是选区本身与工具条，
         // 一块跟着光标走的方块那时候只会挡住画面（屏上探针第一条就跑出了这件事）。
-        let loupe_src = loupe_source(cur.0, cur.1, bw, bh);
-        if phase == Phase::Select {
+        // 同一台方块在 Select 段也允许整场关掉（`[snip] loupe`）：有人要看的正是屏幕本身。
+        if phase == Phase::Select && loupe_on {
+            let loupe_src = loupe_source(cur.0, cur.1, bw, bh);
             if let Some((lx, ly, ls, lsz)) = loupe_rect(cur.0, cur.1, bw, bh) {
                 let box_bytes = loupe_pixels(base, bw, loupe_src);
                 blit_bgra(hdc, &box_bytes, ls, lsz, lx, ly);
@@ -3345,6 +3370,9 @@ pub fn start(owner: HWND, annotate: bool) {
         );
         match created {
             Ok(ov) => {
+                // 放大镜开不开：每开一场读一次，所以设置页那句"改完立即生效"对**下一场**成立，
+                // 而正在飞的这一场不会因为半路改配置少掉一块画面。
+                let loupe_on = focusflow_core::config::instance().get_bool("snip", "loupe", true);
                 if let Ok(mut s) = SNIP.lock() {
                     s.active = true;
                     s.annotate = annotate;
@@ -3358,6 +3386,7 @@ pub fn start(owner: HWND, annotate: bool) {
                     s.cur = (0, 0);
                     s.pen_pts.clear();
                     s.hover = None;
+                    s.loupe = loupe_on;
                     s.marks.clear();
                     s.undo_stack.clear();
                     s.redo_stack.clear();
@@ -3382,8 +3411,11 @@ pub fn start(owner: HWND, annotate: bool) {
                 }
                 // 一开层就把光标下面那块屏的窗口亮出来：旧版是移一下鼠标才亮，
                 // 但"按下热键时光标已经指在他要截的东西上"才是最常见的形状。
+                // 同一次取点也交给放大镜当锚点 —— 以前只喂了 hover，于是手不动的那一段里
+                // 方块停在屏幕左上角，挡的是左上角那块画面（2026-10-30 用户实拍）。
                 let mut pt = POINT::default();
                 if GetCursorPos(&mut pt).is_ok() {
+                    let anchor = loupe_anchor(pt.x, pt.y, vx, vy, vw, vh);
                     let hv = SNIP
                         .lock()
                         .map(|s| {
@@ -3401,6 +3433,7 @@ pub fn start(owner: HWND, annotate: bool) {
                         .flatten();
                     if let Ok(mut s) = SNIP.lock() {
                         s.hover = hv;
+                        s.cur = anchor;
                     }
                 }
                 let _ = ShowWindow(ov, SW_SHOW);
@@ -3735,6 +3768,13 @@ mod render_probe {
             // 这条探针会替用户搬光标（见 post_mouse 为什么要对齐真实坐标），收尾搬回去
             let mut home = POINT::default();
             let _ = GetCursorPos(&mut home);
+            // 先把真光标放到一个**已知**的虚拟屏格子上：放大镜的锚点得从开层那一刻就指着它，
+            // 而不是停在左上角等人来挪一下鼠标（2026-10-30 那张实拍的症状）。
+            let (vxo, vyo) = (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+            );
+            let _ = SetCursorPos(vxo + 400, vyo + 250);
             let owner = HWND(std::ptr::null_mut());
             start(owner, true);
             pump(400);
@@ -3747,6 +3787,15 @@ mod render_probe {
             assert!(
                 base_w > 700 && base_h > 520,
                 "这块屏容不下这条判据：{base_w}x{base_h}"
+            );
+            // 开层那一刻放大镜就落在光标底下：期望值是这里自己按「已知物理点 − 这一场原点」
+            // 算出来的 (400,250)，不调 `loupe_anchor` —— 拿被测函数出题就照不出「忘了减原点」。
+            let anchor = SNIP.lock().map(|s| s.cur).unwrap();
+            assert_eq!(
+                anchor,
+                (400, 250),
+                "放大镜没在开层时落到光标底下（锚点 {anchor:?}，屏 {base_w}x{base_h}）：\
+                 手不动的那一段里它会停在屏幕左上角挡画面"
             );
             // 这条会话是标注版：绝对上限得真挂成 600 秒。`snip-arm-ceiling` 那句报的就是它，
             // 而验收套件超时那一轮正是按这个数字挑的 annotate 模式。
@@ -3842,6 +3891,27 @@ mod render_probe {
                 pixel3(&dim, base_w, band_x, ly + 8),
                 "放大镜外面那一格也被刷亮了：方块没夹在 loupe_rect 的落点里"
             );
+            // 开关的另一半：同一场里把它关掉（`s.loupe` 就是 `start()` 从 `[snip] loupe`
+            // 抄进来的那一份），方块那一片必须退回压暗的值。只测"开着会画"是半个判据 ——
+            // 把闸门整块摘掉，那一腿照样绿。
+            if let Ok(mut s) = SNIP.lock() {
+                s.loupe = false;
+            }
+            let _ = InvalidateRect(Some(ov), None, false);
+            pump(200);
+            let shot_off = print_window(ov).expect("关掉放大镜那一张没拿到");
+            let (bx, by) = (
+                lx + (LOUPE_SPAN / 2) * LOUPE_SCALE + LOUPE_SCALE / 2,
+                ly + (LOUPE_SPAN / 2) * LOUPE_SCALE + LOUPE_SCALE / 2,
+            );
+            assert_eq!(
+                pixel3(&shot_off.0, shot_off.1, bx, by),
+                pixel3(&dim, base_w, bx, by),
+                "开关关掉之后那台方块还画在屏上"
+            );
+            if let Ok(mut s) = SNIP.lock() {
+                s.loupe = true;
+            }
 
             // 悬停预览：塞一条"别人进程"的候选进去，鼠标移到它身上就该亮。
             // 走的是产品自己的 `hover_at`（不是直接把亮区写进状态），所以命中/换算/夹边都被判到。
@@ -5814,6 +5884,37 @@ mod tests {
         );
     }
 
+    /// 放大镜的两条接线：开层时锚点来自**那一次** `GetCursorPos`，画不画看这一场的
+    /// `[snip] loupe`。
+    ///
+    /// 为什么钉调用形态：锚点那一半在屏上是可见的（`the_overlay_paints_…` 里有一条真探针
+    /// 腿守着），但"把 hover 那一次取点顺手交给放大镜"这件事一旦改回 `(0,0)`，无头侧只有
+    /// 源码看得见；开关那一半更没打法——覆盖层没开的时候屏上本来就没有方块。两条都按
+    /// "参数是谁"来钉，不钉函数名：换成 `loupe_anchor(0,0,0,0,0,0)` 也编得过，而症状照旧。
+    #[test]
+    fn the_loupe_is_seeded_at_open_and_gated_by_its_switch() {
+        let src = include_str!("snip.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            flat.matches("loupe_anchor(pt.x,pt.y,vx,vy,vw,vh)").count(),
+            1,
+            "开层时不再按这一次取点与这一屏的原点/尺寸算放大镜锚点"
+        );
+        assert!(
+            flat.contains("s.cur=anchor;"),
+            "算出来的锚点没交进状态：hover 落了位而放大镜还停在 (0,0)"
+        );
+        assert!(
+            flat.contains("s.loupe=loupe_on;"),
+            "`[snip] loupe` 没被写进这一场的状态：开关读到了也没人看"
+        );
+        assert!(
+            flat.contains("ifphase==Phase::Select&&loupe_on{"),
+            "方块画不画不再看这一场的开关"
+        );
+    }
+
     /// 建窗失败那条退路要按**这一场**的局部变量还悬浮窗，不许读静态状态里的 `pill_was`。
     ///
     /// 症状：按下截图热键、覆盖层没建起来，那颗卡片就再也不出现——要等下一次开关或重启。
@@ -7146,6 +7247,25 @@ mod loupe_tests {
             }
         }
         v
+    }
+
+    /// 开层那一刻放大镜落在哪儿：真实光标（虚拟屏物理坐标）换算成本层坐标，钳在这一屏里。
+    ///
+    /// 症状是 2026-10-30 那张实拍：按下热键、手还没动，方块停在屏幕左上角、读数报「屏幕 5,5」，
+    /// 挡住的是左上角那块画面。期望值全部手算，不调 `loupe_anchor` —— 否则等于拿被测函数出题。
+    #[test]
+    fn the_loupe_anchor_follows_the_real_cursor_at_open() {
+        // 单屏：物理坐标就是本层坐标
+        assert_eq!(loupe_anchor(640, 420, 0, 0, 1920, 1080), (640, 420));
+        // 副屏挂在左边（虚拟屏原点 -1920）：光标在物理 -1000 ⇒ 本层 920。
+        // 少减一次原点会交出 -1000，钳完变成 (0,300) —— 症状是放大镜整块跑到隔壁屏去。
+        assert_eq!(loupe_anchor(-1000, 300, -1920, 0, 1920, 1080), (920, 300));
+        // 光标贴出右下：钳在最后一格，而不是报一个屏外坐标
+        assert_eq!(loupe_anchor(2400, 1600, 0, 0, 1920, 1080), (1919, 1079));
+        // 光标在本层原点之外（多屏最左上那块之外）：钳回 (0,0)
+        assert_eq!(loupe_anchor(-5, -5, 0, 0, 1920, 1080), (0, 0));
+        // 零尺寸那块屏不许绕成负数下标
+        assert_eq!(loupe_anchor(10, 10, 0, 0, 0, 0), (0, 0));
     }
 
     #[test]
