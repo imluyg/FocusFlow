@@ -3416,10 +3416,15 @@ pub fn start(owner: HWND, annotate: bool) {
                     s.base = Vec::new();
                     s.dim = Vec::new();
                     s.active = false;
-                    if s.pill_was {
-                        s.pill_was = false;
-                        crate::floating::set_visible(true);
-                    }
+                    // 这一场没有活着覆盖层了：这个字段只许在"覆盖层还开着"期间为真，
+                    // 否则下一场的退路会读到上一场留下的值。
+                    s.pill_was = false;
+                }
+                // 还不还、还哪一颗，全部以**这一场**的局部变量为准。读 `s.pill_was` 等于
+                // 拿上一场的账判这一场：正常退场时它已经清成 false，于是建窗失败之后
+                // 悬浮窗永远不回来（设置页那句"显示"还开着，屏上却没有卡片）。
+                if pill_was && !restored_early {
+                    crate::floating::set_visible(true);
                 }
             }
         }
@@ -5802,6 +5807,39 @@ mod tests {
         assert!(
             flat.contains("get_bool(\"snip\",\"hide_floating\",true)"),
             "`hide_floating` 没在开层这一路读出来（或默认值漂了）"
+        );
+    }
+
+    /// 建窗失败那条退路要按**这一场**的局部变量还悬浮窗，不许读静态状态里的 `pill_was`。
+    ///
+    /// 症状：按下截图热键、覆盖层没建起来，那颗卡片就再也不出现——要等下一次开关或重启。
+    /// 当时写的是 `if s.pill_was { … }`，而 `s.pill_was` 是上一场留下的值（正常退场时
+    /// 已经清成 false），于是"这一场把卡片藏过"在退路上被念成"这一场没藏过"。
+    /// 旁边那句注释（"创建失败那条路自己也还"）说的是想要的行为，不是当时的代码。
+    ///
+    /// 为什么钉源码而不是造一条验收腿：`CreateWindowExW` 从外面没有稳定的失败打法
+    /// （拿它当控制点要的是"建不出来"，而机器上它建得出来）⇒ 只能钉调用形态。
+    #[test]
+    fn a_failed_overlay_gives_the_floating_card_back() {
+        let src = include_str!("snip.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        let arm = flat
+            .find("Err(_)=>{tracing_note(\"截图覆盖层创建失败\")")
+            .expect("建窗失败那条退路不见了");
+        let body: String = flat[arm..].chars().take(400).collect();
+        assert!(
+            body.contains("ifpill_was&&!restored_early{crate::floating::set_visible(true);"),
+            "建窗失败之后还原悬浮窗不再按这一场的局部变量了"
+        );
+        assert!(
+            !body.contains("if s.pill_was{") && !body.contains("ifs.pill_was{"),
+            "退路又拿静态状态里上一场留下的 s.pill_was 决定要不要还卡片"
+        );
+        // 覆盖层活着时的那条退路读 s.pill_was 是对的（这一场自己写进去的），别一起改掉。
+        assert!(
+            flat.contains("s.pill_was=false;let_=floating::set_visible(true);"),
+            "覆盖层退场那一条还原不见了：建窗失败这条修完，别把对的那条也搬走"
         );
     }
 
