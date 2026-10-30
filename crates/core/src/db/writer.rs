@@ -475,6 +475,12 @@ impl DbWriter {
     }
 
     /// 见 [`Self::today_count_for_display`]：同一把尺子，活跃秒数也按日对一次。
+    ///
+    /// ⚠ 今天**没有生产调用方**（2026-10-30 按现量收口：全仓零引用，界面上那个「今日活跃时长」
+    /// 走的是查库那条路 `data.rs` 的 `today_app_seconds`，天然按日；插件侧只暴露 `today_count`）。
+    /// 留着是因为它是那把尺子的另一半：**谁哪天改成显示内存缓存里的活跃秒数**（为了少一次查库），
+    /// 就必须走这里而不是 `today_active_seconds()` —— 后者跨午夜、今天还没输入时会交回昨天的整段。
+    /// 与 `manager.rs` 里"原生端到今天还没接这条线"同一族：写清楚没接线，别让人以为保护已经生效。
     pub fn today_active_for_display(&self) -> u64 {
         today_cache_for_display(
             self.today_day_key(),
