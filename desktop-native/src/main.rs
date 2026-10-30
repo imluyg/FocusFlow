@@ -368,6 +368,11 @@ struct Formats {
     /// 以前整页借的是 12.5/400 与 11/400 —— 比旧版小一号又细一号，就是"字体还有差距"。
     settings_h: IDWriteTextFormat,
     row_name: IDWriteTextFormat,
+    /// 表格里名字那一列（键名 / 应用名 / 设备名 / 分组名）。比正文重一档：他 2026-10-30
+    /// 点的"窗口界面字体都加粗，像键鼠排行的键鼠名、应用排行的应用名"。
+    /// ⚠ 雅黑只有 400/700 两档，SEMI_BOLD(600) 在汉字上会落到 700 —— 这不是 bug，
+    /// 想要"稍微粗一点"只能靠字号或颜色，见 `row_name` 那段注释。
+    table_name: IDWriteTextFormat,
     text13: IDWriteTextFormat,
     text13_em: IDWriteTextFormat,
     text12: IDWriteTextFormat,
@@ -905,6 +910,7 @@ impl App {
                 tab: center_format(&dwrite, 12.5)?,
                 settings_h: text_format(&dwrite, 15.0, DWRITE_FONT_WEIGHT_BOLD)?,
                 row_name: text_format(&dwrite, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
+                table_name: text_format(&dwrite, 12.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
                 text13: text_format(&dwrite, 13.0, DWRITE_FONT_WEIGHT_NORMAL)?,
                 text13_em: text_format(&dwrite, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
                 text12: text_format(&dwrite, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
@@ -6682,15 +6688,20 @@ struct TableGeom {
     x_count_right: f32,
     /// 设备页的次数列右沿：右边是「还原」那一整颗按钮，要再多让出 64 px。
     x_count_right_ops: f32,
-    /// 最后一列的左沿（占比列 / 「改名」按钮）。
+    /// 「改名」按钮的左沿（也是设备页最后一列的左沿）。
     x_last: f32,
-    /// 最后一列的右沿（占比）—— 与「改名」按钮的右沿同一格，四张榜看过去是一条线。
-    x_last_right: f32,
+    /// 「占比」这一列的左沿。它的右沿与「改名」按钮的右沿同一条线（`x_last + 58`），
+    /// 但这一列更窄（[`SHARE_COL_W`]），省下的宽度给名字列。
+    x_share_left: f32,
 }
 
-/// 数字列（次数 / 占比）的宽度。七个数字 + 两个千分位逗号在 11 号字下约 60 px，
-/// 96 留足了余量；更重要的是它让"列能装下多少"变成常量，不再随卡片宽度缩。
-const NUM_COL_W: f32 = 96.0;
+/// 数字列（次数 / 占比）的宽度。七个数字加两个千分位逗号在 11 号字下约 55 px：
+/// 次数 72 留得下，占比「100.0%」约 40 px、52 够。两列原来分别是 96 / 58，
+/// 他 2026-10-30 说"占比太多、匀一点给名称"，就从这两格各收一刀 —— 收出来的宽度
+/// 全进了名字列（`name_col_width`），数字列仍不许顶到下一列（那条用例还在）。
+const NUM_COL_W: f32 = 72.0;
+/// 占比列宽度（右沿与「改名」按钮的右沿对齐，见 `table_geom`）。
+const SHARE_COL_W: f32 = 52.0;
 
 /// 设备页「设备名」那一列的宽度：右边依次是类型 48 + 12、次数 `NUM_COL_W`、8、
 /// 还原 58、6、改名 58。行文字、编辑中那圈框、原生 EDIT 的落点三处都读它。
@@ -6764,6 +6775,8 @@ fn table_geom(r: D2D_RECT_F) -> TableGeom {
     let foot_h = 26.0;
     let max_rows = (((r.bottom - foot_h - list_top) / row_h).floor() as usize).max(1);
     let x_last = r.right - pad - 78.0;
+    // 占比列的右沿与「改名」按钮的右沿对齐（按钮 58 宽，`rename_button` 用同一个 58）。
+    let x_share_left = x_last + 58.0 - SHARE_COL_W;
     TableGeom {
         pad,
         head_y,
@@ -6772,10 +6785,10 @@ fn table_geom(r: D2D_RECT_F) -> TableGeom {
         max_rows,
         x_rank: r.left + pad + 10.0,
         x_name: r.left + pad + 56.0,
-        x_count_right: x_last - 12.0,
+        x_count_right: x_share_left - 8.0,
         x_count_right_ops: x_last - 64.0 - 8.0,
         x_last,
-        x_last_right: x_last + 58.0,
+        x_share_left,
     }
 }
 
@@ -7392,7 +7405,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     } else {
         p.text(
             heads[3],
-            rect(g.x_last, g.head_y + 3.0, g.x_last_right - g.x_last, 18.0),
+            rect(g.x_share_left, g.head_y + 3.0, SHARE_COL_W, 18.0),
             &p.fmt.right,
             &p.br.muted,
         );
@@ -7477,7 +7490,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                     p.text(
                         &d.name,
                         rect(g.x_name, y + 3.0, device_name_width(&g), 18.0),
-                        &p.fmt.body,
+                        &p.fmt.table_name,
                         &p.br.fg,
                     );
                 }
@@ -7525,7 +7538,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 p.text(
                     app,
                     rect(g.x_name, y + 3.0, name_col_width(&g), 18.0),
-                    &p.fmt.body,
+                    &p.fmt.table_name,
                     &p.br.fg,
                 );
                 p.text(
@@ -7536,7 +7549,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 );
                 p.text(
                     &share,
-                    rect(g.x_last, y + 4.0, g.x_last_right - g.x_last, 18.0),
+                    rect(g.x_share_left, y + 4.0, SHARE_COL_W, 18.0),
                     &p.fmt.right,
                     &p.br.muted,
                 );
@@ -7550,7 +7563,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 p.text(
                     name,
                     rect(g.x_name, y + 3.0, name_col_width(&g), 18.0),
-                    &p.fmt.body,
+                    &p.fmt.table_name,
                     &p.br.fg,
                 );
                 p.text(
@@ -7561,7 +7574,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 );
                 p.text(
                     &share,
-                    rect(g.x_last, y + 4.0, g.x_last_right - g.x_last, 18.0),
+                    rect(g.x_share_left, y + 4.0, SHARE_COL_W, 18.0),
                     &p.fmt.right,
                     &p.br.muted,
                 );
@@ -7572,7 +7585,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 p.text(
                     key,
                     rect(g.x_name, y + 3.0, name_col_width(&g), 18.0),
-                    &p.fmt.body,
+                    &p.fmt.table_name,
                     &p.br.fg,
                 );
                 p.text(
@@ -7583,7 +7596,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 );
                 p.text(
                     &share,
-                    rect(g.x_last, y + 4.0, g.x_last_right - g.x_last, 18.0),
+                    rect(g.x_share_left, y + 4.0, SHARE_COL_W, 18.0),
                     &p.fmt.right,
                     &p.br.muted,
                 );
@@ -9587,16 +9600,10 @@ fn main() -> windows::core::Result<()> {
         let _ = ShowWindow(hwnd, SW_SHOW);
         // 材质必须在**显示之后**贴：窗口还没显示时 DWM 会把深色属性/背板丢掉。
         (*app).mica = apply_glass(hwnd);
-        // 原型期置顶：自动化截图时窗口会被浏览器盖住。产品窗口不置顶（P1 删）。
-        let _ = SetWindowPos(
-            hwnd,
-            Some(HWND_TOPMOST),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-        );
+        // 主窗口**不置顶**：置顶留给悬浮窗（它要压在任务栏上）。原型期这里挂过
+        // `HWND_TOPMOST`，理由是"自动化截图时会被浏览器盖住"——那是测试的麻烦，
+        // 代价却是用户切到别的窗口时这块界面永远压在上面（他 2026-10-30 点的）。
+        // 验收套件的截图走 `PrintWindow`、点击走 `PostMessage`，不依赖窗口在最上层。
         let _ = SetTimer(Some(hwnd), TIMER_EVENTS, 100, None);
         let _ = UpdateWindow(hwnd);
     }
@@ -11642,6 +11649,37 @@ mod tray_menu_tests {
 }
 
 #[cfg(test)]
+mod always_on_top_tests {
+    /// 主窗口不置顶、悬浮窗与贴图仍置顶 —— 两半各钉一条。
+    ///
+    /// 主窗口那句 `SetWindowPos(hwnd, Some(HWND_TOPMOST), …)` 是原型期为了让自动化截图
+    /// 不被浏览器盖住留下的，代价是用户切到别的窗口时这块界面永远压在上面（他 2026-10-30
+    /// 点掉的）。而"悬浮窗压在任务栏上面"是另一条产品口径，不能跟着一起删。
+    #[test]
+    fn the_main_window_is_normal_and_the_card_still_floats_on_top() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        assert!(
+            !prod.contains("Some(HWND_TOPMOST)"),
+            "主窗口又被置顶了：切到别的窗口时它会一直压在人家上面"
+        );
+        let pins = prod
+            .find("WS_EX_TOPMOST | WS_EX_TOOLWINDOW")
+            .expect("贴图窗的置顶样式不见了");
+        assert!(pins > 0, "贴图窗仍要置顶");
+        let floating = include_str!("floating.rs");
+        let fcut = floating
+            .find("#[cfg(test)]")
+            .expect("悬浮窗的测试模块找不到了");
+        assert!(
+            floating[..fcut].contains("wm::WS_EX_TOPMOST.0"),
+            "悬浮窗不再置顶：任务栏会把它盖住"
+        );
+    }
+}
+
+#[cfg(test)]
 mod table_layout_tests {
     use super::*;
 
@@ -11670,9 +11708,9 @@ mod table_layout_tests {
                 g.x_last
             );
             assert!(
-                g.x_last_right <= card.right - g.pad,
-                "w={w}: 最后一列的右沿 {} 越过了卡片右边距",
-                g.x_last_right
+                g.x_share_left + SHARE_COL_W <= card.right - g.pad,
+                "w={w}: 占比列右沿 {} 越过了卡片右边距",
+                g.x_share_left + SHARE_COL_W
             );
             // 名字列先被挤扁：窗口窄到它装不下一个设备名时，该改的是窗口下限而不是继续缩。
             assert!(
