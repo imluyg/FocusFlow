@@ -28,7 +28,9 @@ New-AppDir $app @('[collector]', 'enabled = false')
 # The probe copy only carries its own plugins; add the shipped ones so accounting_plugin is there.
 $dst = Join-Path $app 'plugins'
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
-Copy-Item (Join-Path (Get-RepoRoot) 'plugins\*.lua') $dst -Force
+# The shipped copy lives with the core crate; the repo-root plugins/ twin was deleted by name
+# on 2026-10-30, so pointing here is the only path that exists on a fresh clone.
+Copy-Item (Join-Path (Get-RepoRoot) 'crates\core\plugins\*.lua') $dst -Force
 Copy-Item (Join-Path (Get-RepoRoot) 'desktop-native\probe\plugins\*.lua') $dst -Force
 Remove-Item (Join-Path $WorkDir 'focusflow.log') -ErrorAction SilentlyContinue
 "exe : $Exe"

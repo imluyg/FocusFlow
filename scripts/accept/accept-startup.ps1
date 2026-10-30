@@ -33,6 +33,7 @@ public class FFStartup {
     public delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     static uint wantPid; static string wantCls; static IntPtr hit;
     public static IntPtr ByClassAnyState(uint pid, string cls) {
         wantPid = pid; wantCls = cls; hit = IntPtr.Zero;
@@ -83,51 +84,73 @@ if (Test-Path $probeCfg) {
 }
 $p1 = Start-AppArgs $Exe $app1 (Join-Path $WorkDir 'w1') ''
 $h1 = Wait-Window $p1.Id
-Check '夹具兜底：默认那份 app 目录仍能等到主窗口' ($h1 -ne [IntPtr]::Zero) (
+Check 'fixture guard: the default app dir still yields a window to wait for' ($h1 -ne [IntPtr]::Zero) (
     'probe=' + $probeSays + ' ' + (Get-Blocker))
 Stop-App
 Start-Sleep -Seconds 1
 
 # ---- leg 2: key ON, no argument -> no window, but the process is alive and holds the mutex.
+#
+# NOTE about the measuring stick: accept-lib's Wait-Window -> [FF]::ByClass matches by class and
+# pid but NOT by visibility, so "Wait-Window returned Zero" is not the same statement as "no
+# window is on screen". This family is about visibility, so every leg below reads
+# IsWindowVisible on the window it found by pid. (First version of this suite asserted on
+# Wait-Window and reported two false reds.)
 $app2 = Join-Path $WorkDir 'app-key'
 New-AppDir $app2 @('[gui]', 'start_to_tray = true')
 $p2 = Start-AppArgs $Exe $app2 (Join-Path $WorkDir 'w2') ''
-$h2 = Wait-Window $p2.Id 'FocusFlowNativeD2D' 6000
+$found2 = [IntPtr]::Zero
+for ($i = 0; $i -lt 40 -and $found2 -eq [IntPtr]::Zero; $i++) {
+    $found2 = [FFStartup]::ByClassAnyState([uint32]$p2.Id, 'FocusFlowNativeD2D')
+    if ($found2 -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 300 }
+}
+$vis2 = ($found2 -ne [IntPtr]::Zero) -and [FFStartup]::IsWindowVisible($found2)
 $p2.Refresh()
 $alive = -not $p2.HasExited
-Check '键为 true 且不带参数：等不到主窗口' ($h2 -eq [IntPtr]::Zero) (
-    'hwnd=' + $h2 + ' alive=' + $alive + ' ' + (Get-Blocker))
-Check '但进程活着（不是根本没建窗，也不是崩了）' $alive (
+Check 'key ON, no argument: nothing on screen (IsWindowVisible=false)' (-not $vis2) (
+    'hwnd=' + $found2 + ' visible=' + $vis2 + ' alive=' + $alive + ' ' + (Get-Blocker))
+Check 'but the process is alive (nothing crashed, the window was built)' $alive (
     'exit=' + $(if ($p2.HasExited) { $p2.ExitCode } else { 'running' }) + ' ' + (Get-Blocker))
 
 # ---- leg 3: the control point -- WM_SHOW_MAIN raises it, so the window really exists hidden.
 if ($alive) {
-    $target = [FFStartup]::ByClassAnyState([uint32]$p2.Id, 'FocusFlowNativeD2D')
+    $target = $found2
     $hiddenExists = $target -ne [IntPtr]::Zero
-    Check '藏着的那一扇确实建了（按 pid 枚举得到，不看可见性）' $hiddenExists (
+    Check 'the hidden window really exists (enumerated by pid, visibility ignored)' $hiddenExists (
         'hwnd=' + $target + ' ' + (Get-Blocker))
     $posted = $false
     if ($hiddenExists) {
         $posted = [FF]::PostMessage($target, $WM_SHOW_MAIN, [IntPtr]::Zero, [IntPtr]::Zero)
     }
-    $h3 = Wait-Window $p2.Id
-    Check '发 WM_SHOW_MAIN 后窗口出现（证明它只是藏着，不是没建）' ($h3 -ne [IntPtr]::Zero) (
-        'target=' + $target + ' posted=' + $posted + ' hwnd=' + $h3 + ' ' + (Get-Blocker))
+    $vis3 = $false
+    for ($i = 0; $i -lt 20 -and -not $vis3; $i++) {
+        $vis3 = ($target -ne [IntPtr]::Zero) -and [FFStartup]::IsWindowVisible($target)
+        if (-not $vis3) { Start-Sleep -Milliseconds 300 }
+    }
+    Check 'WM_SHOW_MAIN puts it on screen (it was hidden, never un-built)' $vis3 (
+        'target=' + $target + ' posted=' + $posted + ' ' + (Get-Blocker))
 } else {
-    Check '藏着的那一扇确实建了（按 pid 枚举得到，不看可见性）' $false '进程已退出，无从枚举'
-    Check '发 WM_SHOW_MAIN 后窗口出现（证明它只是藏着，不是没建）' $false '进程已退出，无法唤出'
+    Check 'the hidden window really exists (enumerated by pid, visibility ignored)' $false 'process already exited, nothing to enumerate'
+    Check 'WM_SHOW_MAIN puts it on screen (it was hidden, never un-built)' $false 'process already exited, nothing to raise'
 }
 Stop-App
 Start-Sleep -Seconds 1
 
-# ---- leg 4: key OFF but the argument is present -> still no window (the argument wins).
+# ---- leg 4: key OFF but the argument is present -> still nothing on screen (the argument wins).
 $app4 = Join-Path $WorkDir 'app-arg'
 New-AppDir $app4 @('[gui]', 'start_to_tray = false')
 $p4 = Start-AppArgs $Exe $app4 (Join-Path $WorkDir 'w4') '--hidden'
-$h4 = Wait-Window $p4.Id 'FocusFlowNativeD2D' 6000
+$found4 = [IntPtr]::Zero
+for ($i = 0; $i -lt 40 -and $found4 -eq [IntPtr]::Zero; $i++) {
+    $found4 = [FFStartup]::ByClassAnyState([uint32]$p4.Id, 'FocusFlowNativeD2D')
+    if ($found4 -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 300 }
+}
+$vis4 = ($found4 -ne [IntPtr]::Zero) -and [FFStartup]::IsWindowVisible($found4)
 $p4.Refresh()
-Check '键为 false 但带 --hidden：参数赢，仍不出窗' ($h4 -eq [IntPtr]::Zero) (
-    'hwnd=' + $h4 + ' alive=' + (-not $p4.HasExited) + ' ' + (Get-Blocker))
+Check 'key OFF with --hidden: the argument wins, still nothing on screen' (-not $vis4) (
+    'hwnd=' + $found4 + ' visible=' + $vis4 + ' alive=' + (-not $p4.HasExited) + ' ' + (Get-Blocker))
+Check 'and with --hidden the window exists but stays hidden' (($found4 -ne [IntPtr]::Zero) -and (-not $vis4)) (
+    'hwnd=' + $found4)
 Stop-App
 
 Show-Summary
