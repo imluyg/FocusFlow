@@ -7213,18 +7213,39 @@ fn name_col_width(g: &TableGeom) -> f32 {
     g.x_count_right - NUM_COL_W - 12.0 - g.x_name
 }
 
-/// 排行页标题行里那两排胶囊。下标 0..1 = 视图（排行 / 分组），2..4 = 筛选（全部 / 键盘 / 鼠标）。
+/// 胶囊的宽与横向步进（都相对组原点 `x0`）。最后一颗的右沿 = `x0 + rank_pill_group_w()`。
+const PILL_W: f32 = 56.0;
+const PILL_DX: [f32; 5] = [32.0, 90.0, 188.0, 246.0, 304.0];
+/// 胶囊组右沿到卡片右边距的距离。
+const PILL_RIGHT_GAP: f32 = 12.0;
+/// 摘要格右沿到胶囊组原点之间留的缝：把"读数"和"按钮"分开，不许贴着脸。
+const SUMMARY_PILL_GAP: f32 = 8.0;
+
+/// 胶囊组相对原点的总宽度，由 `PILL_DX` 最后一档导出。
+/// 写成表达式而不是第二个手抄常数：加一颗胶囊时这里跟着变，倒推出来的原点才不会又顶出去。
+fn rank_pill_group_w() -> f32 {
+    PILL_DX[PILL_DX.len() - 1] + PILL_W
+}
+
+/// 胶囊组原点：从**卡片右沿倒推**，画图与命中测试都读这一个表达式。
+///
+/// 原来这里写的是 `card.left + 322`，那颗数是按 1200px 窗口量出来的：窗口一窄，最后一颗就
+/// 越出卡片右沿（960px 超 132px）。这块 UI 不按矩形裁切（`NO_WRAP`），越出去的字照画，症状是
+/// 胶囊画到右边那张卡上、点还点不中。现量：1200px 下改成右对齐只挪 0.4px（698 → 697.6），
+/// 默认宽度的验收坐标因此不动 —— 这是它优于"抬高窗口下限"的理由。
+fn rank_pills_x0(card: D2D_RECT_F) -> f32 {
+    card.right - PILL_RIGHT_GAP - rank_pill_group_w()
+}
+
+/// 排行页标题行里那排胶囊。下标 0..1 = 视图（排行 / 分组），2..4 = 筛选（全部 / 键盘 / 鼠标）。
 /// 「分组」那一屏不读筛选，那时后面三格既不画也不接 —— 与画图共用这一份位置，
 /// 照的是 `view_tabs` / `atab_tabs` 那个做法。
 fn rank_pills(card: D2D_RECT_F) -> [D2D_RECT_F; 5] {
     let y = card.top + 8.0;
-    // 322 而不是 306：标题行左边那句摘要（共 N 次 · 其中 鼠标 … · 键盘 …）画到 card.left+306 为止，
-    // 胶囊原来正好贴在其右沿上，看着像同一串字。留出 16px 才分得开"读数"与"按钮"。
-    let x0 = card.left + 322.0;
-    let xs = [32.0, 90.0, 188.0, 246.0, 304.0];
+    let x0 = rank_pills_x0(card);
     let mut out = [rect(0.0, 0.0, 0.0, 0.0); 5];
-    for (i, dx) in xs.iter().enumerate() {
-        out[i] = rect(x0 + dx, y, 56.0, 22.0);
+    for (i, dx) in PILL_DX.iter().enumerate() {
+        out[i] = rect(x0 + dx, y, PILL_W, 22.0);
     }
     out
 }
@@ -7232,8 +7253,18 @@ fn rank_pills(card: D2D_RECT_F) -> [D2D_RECT_F; 5] {
 /// 两排胶囊前那两句小字（视图 / 筛选），原点与 `rank_pills` 同一份。
 fn rank_pill_captions(card: D2D_RECT_F) -> (D2D_RECT_F, D2D_RECT_F) {
     let y = card.top + 11.0;
-    let x0 = card.left + 322.0;
+    let x0 = rank_pills_x0(card);
     (rect(x0, y, 30.0, 16.0), rect(x0 + 148.0, y, 30.0, 16.0))
+}
+
+/// 标题行里那句摘要（共 N 次 / 共 时长）的矩形：右边界由胶囊组原点决定。
+///
+/// 宽度以前写死 220：窗口拖窄时胶囊往左走，这一格却不动，右沿就压到「视图」那两个字底下。
+/// 抽成函数是因为判据盯的是这个矩形，而画图那一处没法单测。
+fn rank_summary_box(card: D2D_RECT_F, pad: f32) -> D2D_RECT_F {
+    let left = card.left + pad + 74.0;
+    let w = (rank_pills_x0(card) - SUMMARY_PILL_GAP - left).max(0.0);
+    rect(left, card.top + 10.0, w, 18.0)
 }
 
 /// 左表这一屏该显示哪几行，交回的是 `snap` 里那份榜的下标。
@@ -7776,8 +7807,8 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     // 键鼠那一屏多两个数：鼠标侧与键盘侧。写「其中」而不是把它们并成总数 ——
     // 未落库的那截（`pending`）还没归到任何一侧，折进键盘侧就是把没证的数报成实测。
     //
-    // 这一句**单独一行**摆：三个七位数塞进标题行那 220 px 里会顶到右边的胶囊上，而这块
-    // UI 不按矩形裁切 —— 超出去的字照画，胶囊后画就把「键盘 1,478,603」盖成「键盘 1,478,6」。
+    // 这一句**单独一行**摆：它是三个数，比上面那句长得多，而下面那条判据说的是"摘要这一格
+    // 按胶囊原点收窄" —— 把「其中」也塞进同一格，窄窗口里它才是先顶出去的那个。
     let split = if tab == 0 && !snap.rank.is_empty() {
         format!(
             "其中 鼠标 {} · 键盘 {}",
@@ -7787,14 +7818,14 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     } else {
         String::new()
     };
-    // 本栏那句"没读全"不写在这里：标题行这一格只有 220px，一条年度库的缺读理由就把它撑满，
+    // 本栏那句"没读全"不写在这里：这一格窄窗口下只剩几十像素，一条年度库的缺读理由就把它撑满，
     // 挤掉的是刚补的鼠标/键盘两个数。挪到同一张卡底下那条页脚去说（它宽得多，而且句子短了）。
-    p.text(
-        &summary,
-        rect(r.left + g.pad + 74.0, r.top + 10.0, 220.0, 18.0),
-        &p.fmt.caption,
-        &p.br.muted,
-    );
+    //
+    // 预算按**这一格实际用的那档字**（`p.fmt.caption`）取，不是设置页说明行那一档：拿错档位
+    // 时算出来的字数与屏上像素不是一把尺子，窄窗口下放行、照样画到胶囊底下。
+    let sb = rank_summary_box(r, g.pad);
+    let summary_text = clip_middle(&summary, char_budget_at(sb.right - sb.left, CAPTION_PT));
+    p.text(&summary_text, sb, &p.fmt.caption, &p.br.muted);
     if !split.is_empty() {
         p.text(
             &split,
@@ -8880,8 +8911,22 @@ fn register_combo(manager: Option<&GlobalHotKeyManager>, key: &str) -> Combo {
 fn char_budget(rect_w: f32) -> usize {
     // 一个全角字占多少像素 = 说明行那一档的字号（`SETTINGS_HELP_PT`）。写成字面量的话，
     // 字号一调大，预算还按旧字号算，句子就会按"装得下"放行、屏上却画出去。
-    let per_char = SETTINGS_HELP_PT;
-    ((rect_w / per_char).floor() as usize).max(8)
+    //
+    // 下限 8 只对**宽格子**成立（状态行、560px 那行）：极窄时宁可只念一个省略号，也比
+    // 放行八个字压到隔壁卡上强 —— 那是 `char_budget_at` 负责的那一格。
+    char_budget_at(rect_w, SETTINGS_HELP_PT).max(8)
+}
+
+/// 同 `char_budget`，但按**这一格真正用的那一档字号**换算，下限是 1。
+///
+/// 为什么下限不能兜到 8：排行页摘要那一格在 960px 窗口下只剩约 84px，8 个全角字要 100px ——
+/// 兜底就成了"预算说装得下、屏上画到胶囊底下"。字号也不能借隔壁那档：两档不相等时
+/// 这把尺子量的不是这一格。
+fn char_budget_at(rect_w: f32, per_char: f32) -> usize {
+    if !rect_w.is_finite() || !per_char.is_finite() || rect_w <= 0.0 || per_char <= 0.0 {
+        return 1;
+    }
+    ((rect_w / per_char).floor() as usize).max(1)
 }
 
 /// 中间省略：留头留尾，中间换成一个 `…`。
@@ -9201,9 +9246,9 @@ fn build_formats(dw: &IDWriteFactory) -> windows::core::Result<Formats> {
     Ok(Formats {
         h1: text_format(dw, 22.0, UI_WEIGHT_EM)?,
         value: text_format(dw, 25.0, DWRITE_FONT_WEIGHT_BOLD)?,
-        caption: text_format(dw, 12.5, UI_WEIGHT_REG)?,
-        caption_right: right_format_w(dw, 12.5, UI_WEIGHT_REG)?,
-        caption_center: center_format_w(dw, 12.5, UI_WEIGHT_REG)?,
+        caption: text_format(dw, CAPTION_PT, UI_WEIGHT_REG)?,
+        caption_right: right_format_w(dw, CAPTION_PT, UI_WEIGHT_REG)?,
+        caption_center: center_format_w(dw, CAPTION_PT, UI_WEIGHT_REG)?,
         nav_item: text_format(dw, SETTINGS_TEXT_PT, UI_WEIGHT_REG)?,
         body: text_format(dw, 13.5, UI_WEIGHT)?,
         small: text_format(dw, 12.0, UI_WEIGHT)?,
@@ -9279,6 +9324,12 @@ const UI_WEIGHT_REG: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_NORMAL;
 /// 这块 UI 不按矩形裁切（`NO_WRAP`、不设 `DWRITE_TRIMMING`），超出去的字照画。
 pub(crate) const SETTINGS_TEXT_PT: f32 = 14.0;
 pub(crate) const SETTINGS_HELP_PT: f32 = 13.0;
+/// 次要信息那一档（`caption` / `caption_right` / `caption_center`）的字号。
+///
+/// 列出来是因为排行页摘要那一格的**字符预算**要按它换算。以前那格直接借了
+/// `char_budget`（按 `SETTINGS_HELP_PT` 算）：两档字号不相等，预算与屏上像素就不是
+/// 一把尺子 —— 窄窗口下按"装得下"放行、字照画到胶囊底下。
+const CAPTION_PT: f32 = 12.5;
 
 fn right_format(dw: &IDWriteFactory, size: f32) -> windows::core::Result<IDWriteTextFormat> {
     right_format_w(dw, size, UI_WEIGHT)
@@ -12544,6 +12595,135 @@ mod table_layout_tests {
             );
         }
     }
+
+    /// 胶囊组与它左边那句读数都不许越出左卡。这块 UI 不按矩形裁切（`NO_WRAP`），越出去的字
+    /// 照画到右边那张卡上，点还点不中。
+    ///
+    /// 改前原点写死 `card.left + 322` ⇒ 最后一颗右沿 = `card.left + 682`，装得下要 w ≥ 约 1177：
+    /// 1000px 超 108px、960px 超 132px ⇒ 这条对 w<1177 必红，就是它的区分性。1200px（默认宽度）
+    /// 改前改后只差 0.4px（698 → 697.6），默认宽度的验收坐标不动。
+    #[test]
+    fn the_pill_group_and_its_summary_stop_at_the_card_edge() {
+        for w in [960.0f32, 1000.0, 1100.0, 1177.0, 1200.0, 1400.0] {
+            let card = left_card(w, 860.0);
+            let pills = rank_pills(card);
+            let x0 = rank_pills_x0(card);
+            assert!(
+                pills[4].right <= card.right - 8.0,
+                "w={w}: 胶囊组右沿 {} 越过了卡片右沿减 8（{}）",
+                pills[4].right,
+                card.right - 8.0
+            );
+            let sb = rank_summary_box(card, table_geom(card).pad);
+            assert!(
+                sb.right <= x0,
+                "w={w}: 摘要框右沿 {} 顶到了胶囊组原点 {x0}",
+                sb.right
+            );
+            assert!(
+                x0 - sb.right >= SUMMARY_PILL_GAP - 0.001,
+                "w={w}: 读数与胶囊贴着脸（缝 {} 小于 {SUMMARY_PILL_GAP}）",
+                x0 - sb.right
+            );
+            // 预算与这一格同宽：按预算换算出来的像素不许超过格子，再多一个字就该装不下。
+            let box_w = sb.right - sb.left;
+            let budget = char_budget_at(box_w, CAPTION_PT);
+            assert!(
+                budget as f32 * CAPTION_PT <= box_w + 0.001,
+                "w={w}: 预算 {budget} 个字按 {CAPTION_PT}px 要 {} px，格子只有 {box_w} px",
+                budget as f32 * CAPTION_PT
+            );
+            assert!(
+                (budget + 1) as f32 * CAPTION_PT > box_w,
+                "w={w}: 预算保守到白少念一个字"
+            );
+        }
+    }
+
+    /// 组宽度由胶囊表导出，原点只许有一份表达式。
+    ///
+    /// 钉的是**调用形态**而不是函数名：以前 `rank_pills` 与 `rank_pill_captions` 各写一遍
+    /// `card.left + 322`，改一处忘一处 ⇒ 点中的是胶囊、画的是另一处。有人再手抄一份时这条要红。
+    #[test]
+    fn the_pill_group_origin_and_width_have_one_source_each() {
+        assert_eq!(PILL_DX.len(), 5);
+        assert_eq!(
+            rank_pill_group_w(),
+            PILL_DX[4] + PILL_W,
+            "组宽度该由最后一颗的右沿导出，别写第二个常数"
+        );
+        let card = left_card(1200.0, 860.0);
+        assert!(
+            (rank_pills(card)[4].right - (rank_pills_x0(card) + rank_pill_group_w())).abs() < 0.001,
+            "最后一颗右沿与 x0 + 组宽度不是同一个数"
+        );
+        assert!(
+            (rank_pill_captions(card).0.left - rank_pills_x0(card)).abs() < 0.001,
+            "两句小字的原点不是胶囊组那一份"
+        );
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod: String = src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            prod.matches("fn rank_pills_x0(").count(),
+            1,
+            "倒推原点的表达式被人抄了第二份"
+        );
+        for f in [
+            "fn rank_pills(",
+            "fn rank_pill_captions(",
+            "fn rank_summary_box(",
+        ] {
+            let at = prod.find(f).unwrap_or_else(|| panic!("{f} 不见了"));
+            let body: String = prod[at..].chars().take(320).collect();
+            assert!(
+                body.contains("rank_pills_x0(card)"),
+                "{f} 不再读那份倒推的原点：
+{body}"
+            );
+        }
+        assert!(
+            !prod.contains("card.left + 322"),
+            "又出现写死的胶囊原点：窄窗口下它会顶出卡片"
+        );
+    }
+
+    /// 窄窗口下那句长读数**当场被夹**，而且夹完还在格子内；默认宽度下短句子一个字不动。
+    ///
+    /// 只把格子收窄不等于屏上不再顶出去 —— 判据要看见那串字确实变短。这条同时钉住字号取的
+    /// 是 `caption` 那一档：借隔壁那档时，换算出来的字数与屏上像素不是一把尺子。
+    #[test]
+    fn a_long_summary_is_clipped_inside_the_narrow_box() {
+        let card = left_card(960.0, 860.0);
+        let sb = rank_summary_box(card, table_geom(card).pad);
+        let box_w = sb.right - sb.left;
+        let long = "共 1,478,603 次";
+        assert!(
+            long.chars().count() > char_budget_at(box_w, CAPTION_PT),
+            "夹具前提：这句在窄窗口下本来就该长到装不下（格子 {box_w}px）"
+        );
+        let clipped = clip_middle(long, char_budget_at(box_w, CAPTION_PT));
+        assert_ne!(clipped, long, "窄窗口下这句一个字都没被夹 = 夹取没接上");
+        assert!(
+            clipped.chars().count() <= char_budget_at(box_w, CAPTION_PT),
+            "夹完还在预算外：{clipped}"
+        );
+        assert!(clipped.contains('…'), "中间那段要标成省略：{clipped}");
+        // 默认宽度那一格：短句子不许被这条夹取误伤。
+        let wide = rank_summary_box(
+            left_card(1200.0, 860.0),
+            table_geom(left_card(1200.0, 860.0)).pad,
+        );
+        assert_eq!(
+            clip_middle(long, char_budget_at(wide.right - wide.left, CAPTION_PT)),
+            long,
+            "默认宽度下不该动字"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -13158,6 +13338,13 @@ mod text_tier_tests {
     fn the_caption_tier_keeps_its_sizes() {
         let f = build_formats(&dw()).expect("Formats");
         assert_eq!(size(&f.caption), 12.5);
+        // 摘要那一格的字符预算按 `CAPTION_PT` 换算：它和这一格真实字号分家时，预算量的不是
+        // 屏上那串像素，窄窗口下照样顶到胶囊底下 —— 上面那条钉住 12.5，这条钉住"同一个数"。
+        assert_eq!(
+            CAPTION_PT,
+            size(&f.caption),
+            "摘要预算的字号档与 caption 那一档分家了"
+        );
         assert_eq!(size(&f.caption_right), 12.5);
         assert_eq!(size(&f.caption_center), 12.5);
         assert_eq!(size(&f.nav_item), SETTINGS_TEXT_PT);
