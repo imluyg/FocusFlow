@@ -2446,6 +2446,10 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     match next {
                         Some(SnipTick::Wait(ms)) => {
                             // 重挂同一把表：闲置那一路由此从当下重新数，正在画的人不会被掐掉
+                            //
+                            // 这一条出声是给"它没自己退"那类红准备的：屏上看不出是谁在续表，
+                            // 没有这行就只能记"没测到"。间隔与次数都在里面，下一次红能说出话。
+                            tracing_note(&format!("截图 snip-tick 闲置表被续到 {ms}ms"));
                             let _ = SetTimer(Some(hwnd), SNIP_TIMEOUT_TIMER, ms, None);
                         }
                         Some(SnipTick::Absolute) => {

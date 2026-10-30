@@ -528,12 +528,17 @@ while ($sw4.Elapsed.TotalSeconds -lt 210) {
     Start-Sleep -Milliseconds 1000
 }
 $waited = [int]$sw4.Elapsed.TotalSeconds
+# When this goes red the two possible stories look identical on screen: nobody pumped the
+# clock (product) versus somebody kept renewing it (this machine moved the cursor). The
+# product now logs every re-arm, so the reading goes into the failure message -- a red run
+# says how many times the idle clock was pushed back instead of just "gone=False".
+$renews = @(Get-SnipLog | Where-Object { $_ -match 'snip-tick' }).Count
 # "the window is gone" is not what this leg's name promises. The overlay is full-screen, so a
 # click that lands on it destroys it through the product's own save path -- and the old shape
 # read that as a pass (measured: overlay gone at 69 s, one extra PNG, no snip-timeout line,
 # while this leg stayed green). The leg now has to match its own claim: it took the minutes.
-Check 'the overlay gives up by itself after three minutes' ($gone -and ($waited -ge 170)) "gone=$gone waited $waited s"
-Check 'the log names the timeout' (Wait-Log 'snip-timeout' 2000)
+Check 'the overlay gives up by itself after three minutes' ($gone -and ($waited -ge 170)) "gone=$gone waited $waited s renews=$renews"
+Check 'the log names the timeout' (Wait-Log 'snip-timeout' 2000) "renews=$renews"
 Check 'the timeout saved nothing' ((Count-Png) -eq $before4) "png=$(Count-Png)"
 Stop-Round $h4 $p4
 
