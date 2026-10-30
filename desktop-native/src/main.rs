@@ -67,7 +67,8 @@ use windows::Win32::System::Threading::CreateMutexW;
 // 匹配任意值的绑定，把后面的滚轮/右键/Esc/关窗分支全变成不可达。
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{
-    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
@@ -122,6 +123,8 @@ const PERIODS: [(i64, &str); 6] = [
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 
 static ACCEPTANCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 背板修复里那次 hide/show 会再发一轮 WM_SIZE：这个闩防止递归。
+static BACKDROP_FIX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ===== 主题令牌（对照旧 WebView 那份 ui/tokens.css 的 dark 档）=====
 
@@ -716,6 +719,7 @@ struct PvSelect {
 /// 宁可那几处保持箭头，也不要出现"手型指着一个点不动的区域"。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ctl {
+    WinBtn(u8),
     Period(u8),
     ViewTab(u8),
     ATab(u8),
@@ -751,6 +755,14 @@ struct App {
     mica: bool,
     /// 现在真的走合成路径（透明/玻璃）。只有 `mica` 且合成成功才为 true。
     glass: bool,
+    /// 正在拖拽缩放：这期间页面底色临时变不透明（DWM 背板不跟尺寸，见 `draw`）。
+    resizing: bool,
+    /// 正在系统的移动/缩放循环里（进入/退出各一条消息）。
+    in_size_move: bool,
+    /// 进入那个循环时的客户区尺寸：退出时据此判断"这一趟到底改没改大小"。
+    size_at_enter: (f32, f32),
+    /// 上一次尺寸变化后是不是最大化（用来只在"最大化/还原"那一刻修背板）。
+    was_maximized: bool,
     /// 只读库句柄：`init_readonly` 的副作用是全局年度缓存。
     _db: Arc<focusflow_core::db::Database>,
     /// 顶部视图：0=键鼠排行 1=应用排行 2=设备排行 3=活跃分析 4=插件 5=设置。
@@ -1161,6 +1173,10 @@ impl App {
                 snip_annotate_hk,
                 mica,
                 glass: false,
+                resizing: false,
+                in_size_move: false,
+                size_at_enter: (0.0, 0.0),
+                was_maximized: false,
                 _db: db,
                 view: 0,
                 atab: 0,
@@ -1302,7 +1318,13 @@ impl App {
 
         let size = unsafe { t.rt.GetSize() };
         // 页面底就是主题里的 `--page-bottom`：玻璃档带 alpha，让 Mica 的壁纸透出来。
-        let clear = pal.page;
+        // 拖拽缩放时临时把它变不透明：DWM 的背板不跟尺寸走，半透明页会露出旧背板的
+        // 边界（屏上像"页面只铺到旧窗口右边"）。卡片本来就画在页面之上，所以只改这一处，
+        // 主题、字色、卡片透明度都不动。
+        let mut clear = pal.page;
+        if self.resizing {
+            clear.a = 1.0;
+        }
         unsafe {
             t.rt.BeginDraw();
             t.rt.Clear(Some(&clear));
@@ -1343,6 +1365,7 @@ impl App {
                 floating_on: floating::is_visible(),
                 pin_count: PINS.lock().map(|v| v.len()).unwrap_or(0),
                 dark: tokens.dark,
+                zoomed: unsafe { IsZoomed(hwnd) }.as_bool(),
                 collector_on: collect::is_started(),
                 collector_paused: collect::is_paused(),
                 cpm: collect::cpm(),
@@ -1404,7 +1427,14 @@ impl App {
     /// 指针落在哪个稳定控件上。顺序与 `on_click` 一致（药丸 → 页签 → 子页签 → 排行药丸 →
     /// 设置导航），几何全部读画图用的那一份；弹窗与插件视图不在这里复刻（见 [`Ctl`]）。
     fn control_at(&self, w: f32, h: f32, x: f32, y: f32) -> Option<Ctl> {
-        if self.detail.is_some() || self.plugin_open.is_some() {
+        if self.detail.is_some() {
+            return None;
+        }
+        // 窗口按钮在插件视图里也要亮：它不归页面，归窗口。
+        if let Some(i) = win_button_at(w, x, y) {
+            return Some(Ctl::WinBtn(i));
+        }
+        if self.plugin_open.is_some() {
             return None;
         }
         for (i, (_, r)) in period_pills().iter().enumerate() {
@@ -1612,6 +1642,25 @@ impl App {
             let (dialog, close) = detail_rects(w, h);
             if hit(close, x, y) || !hit(dialog, x, y) {
                 self.close_detail(hwnd);
+            }
+            return;
+        }
+        // 自绘标题栏的三颗按钮（原生标题条已经拆掉，这一屏只有它们是窗口级动作）。
+        if let Some(i) = win_button_at(w, x, y) {
+            match i {
+                0 => unsafe {
+                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                },
+                1 => {
+                    let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
+                    unsafe {
+                        let _ = ShowWindow(hwnd, if zoomed { SW_RESTORE } else { SW_MAXIMIZE });
+                    }
+                }
+                _ => {
+                    // 走 WM_CLOSE：退出前的 flush / 备份那条路只在那一处。
+                    let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                }
             }
             return;
         }
@@ -4532,6 +4581,8 @@ struct ViewState {
     pin_count: usize,
     /// 当前主题是不是深色（设置页那一行显示"深色/浅色"）。
     dark: bool,
+    /// 窗口现在是不是最大化（右上角那颗按钮画"最大化"还是"还原"）。
+    zoomed: bool,
     /// 采集真的起来了没有 / 是不是暂停着 / 最近 60 秒的次数。
     collector_on: bool,
     collector_paused: bool,
@@ -4547,6 +4598,35 @@ fn left_card(w: f32, h: f32) -> D2D_RECT_F {
     let body_h = h - top - m;
     let left_w = (w - m * 2.0 - 12.0) * 0.6;
     rect(m, top, left_w, body_h)
+}
+
+/// 自绘标题栏的高度 = 现有顶栏那一条（应用名 + 右侧三颗窗口按钮）。
+///
+/// 为什么不在内容区上面另起一条：原生标题条一拆，客户区就从窗口顶边开始。
+/// 把现有顶栏当标题栏用，所有版面（统计卡 y=84、页签 y=172…）与验收脚本的客户区坐标
+/// 一个都不用动 —— 代价是"标题栏"比系统那条高，视觉上更像一个应用头部。
+const TITLEBAR_H: f32 = 44.0;
+/// 窗口按钮的宽高（DIP）。46 是 Windows 11 标题栏按钮的常见宽度。
+const WIN_BTN_W: f32 = 46.0;
+const WIN_BTN_H: f32 = 40.0;
+
+/// 右上角三颗窗口按钮：最小化 / 最大化-还原 / 关闭。画图、命中、点击读同一份，
+/// `Ctl::WinBtn(i)` 的下标就是这个顺序。
+fn win_buttons(w: f32) -> [D2D_RECT_F; 3] {
+    let x = w - WIN_BTN_W * 3.0;
+    [
+        rect(x, 0.0, WIN_BTN_W, WIN_BTN_H),
+        rect(x + WIN_BTN_W, 0.0, WIN_BTN_W, WIN_BTN_H),
+        rect(x + WIN_BTN_W * 2.0, 0.0, WIN_BTN_W, WIN_BTN_H),
+    ]
+}
+
+/// 这一点压在哪个窗口按钮上（客户区 DIP）。
+fn win_button_at(w: f32, x: f32, y: f32) -> Option<u8> {
+    win_buttons(w)
+        .iter()
+        .position(|r| hit(*r, x, y))
+        .map(|i| i as u8)
 }
 
 /// 周期药丸的位置：画图与命中测试共用。
@@ -4588,12 +4668,8 @@ fn draw_screen(
         &p.fmt.caption,
         &p.br.muted,
     );
-    p.text(
-        "v0.5.0",
-        rect(w - m - 220.0, 18.0, 220.0, 20.0),
-        &p.fmt.caption_right,
-        &p.br.muted,
-    );
+    // 右上角三颗窗口按钮（标题栏就是这一条：原生标题条已经拆掉了）。
+    draw_window_buttons(p, w, vs);
 
     // --- 周期页签 ---
     p.text(
@@ -4744,6 +4820,56 @@ fn draw_screen(
     // 模态最后画：它压在所有东西上面。
     if let Some(d) = detail {
         draw_detail(p, w, h, d);
+    }
+}
+
+/// 1px 方框（最大化/还原图标用）。四边各画一条线，比 `DrawRectangle` 更好控粗细。
+fn stroke_rect(p: &P<'_>, r: D2D_RECT_F, b: &ID2D1SolidColorBrush) {
+    p.line(r.left, r.top, r.right, r.top, b, 1.0);
+    p.line(r.left, r.bottom, r.right, r.bottom, b, 1.0);
+    p.line(r.left, r.top, r.left, r.bottom, b, 1.0);
+    p.line(r.right, r.top, r.right, r.bottom, b, 1.0);
+}
+
+/// 右上角三颗窗口按钮：最小化 / 最大化-还原 / 关闭。
+///
+/// 关闭键悬停压主色红（Windows 的约定），另外两颗只叠一层淡色；字形一律用细线，
+/// 与系统标题栏的笔画粗细接近。最大化时第二颗画"还原"（两个错开的方框）。
+fn draw_window_buttons(p: &P<'_>, w: f32, vs: ViewState) {
+    for (i, r) in win_buttons(w).iter().enumerate() {
+        let hot = vs.ctl == Some(Ctl::WinBtn(i as u8));
+        if hot {
+            p.fill(
+                *r,
+                if i == 2 {
+                    &p.br.danger
+                } else {
+                    &p.br.row_hover
+                },
+            );
+        }
+        let ink = if hot && i == 2 {
+            &p.br.white
+        } else {
+            &p.br.muted
+        };
+        let cx = r.left + WIN_BTN_W / 2.0;
+        let cy = r.top + WIN_BTN_H / 2.0;
+        match i {
+            0 => p.line(cx - 5.0, cy, cx + 5.0, cy, ink, 1.0),
+            1 => {
+                if vs.zoomed {
+                    stroke_rect(p, rect(cx - 2.0, cy - 6.0, 8.0, 8.0), ink);
+                    stroke_rect(p, rect(cx - 6.0, cy - 2.0, 8.0, 8.0), ink);
+                } else {
+                    stroke_rect(p, rect(cx - 5.0, cy - 5.0, 10.0, 10.0), ink);
+                }
+            }
+            _ => {
+                p.line(cx - 5.0, cy - 5.0, cx + 5.0, cy + 5.0, ink, 1.0);
+                p.line(cx + 5.0, cy - 5.0, cx - 5.0, cy + 5.0, ink, 1.0);
+            }
+        }
     }
 }
 
@@ -9258,6 +9384,34 @@ unsafe extern "system" fn edit_proc(
     }
 }
 
+/// 客户区尺寸（DIP）。窗口边框那几条消息里没有 `App`，画图那边走 `App::client_dip`。
+fn client_dip_of(hwnd: HWND) -> (f32, f32) {
+    let mut rc = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rc);
+    }
+    let dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
+    let s = if dpi <= 0.0 { 1.0 } else { dpi / 96.0 };
+    (
+        (rc.right - rc.left) as f32 / s,
+        (rc.bottom - rc.top) as f32 / s,
+    )
+}
+
+/// 可缩放边框的厚度（DIP）：与系统同一个口径（`SM_CXSIZEFRAME + SM_CXPADDEDBORDER`），
+/// 否则高 DPI 下手指按在边上却拖不动。
+fn frame_thickness(hwnd: HWND) -> (f32, f32) {
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let s = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+    let fx = unsafe {
+        GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    };
+    let fy = unsafe {
+        GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    };
+    (fx as f32 / s, fy as f32 / s)
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
@@ -9272,9 +9426,145 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
-        WM_SIZE => {
+        WM_NCCALCSIZE => {
+            // wParam=0 是"问窗口矩形"，照系统默认；TRUE 才是"算客户区"。
+            if w.0 == 0 {
+                return unsafe { DefWindowProcW(hwnd, msg, w, l) };
+            }
+            // 客户区 = 整个窗口：原生标题条与可见边框一起让出来，顶栏自己当标题栏。
+            // 最大化时窗口矩形比工作区大出一圈看不见的边框，不削掉就会把内容裁掉。
+            if unsafe { IsZoomed(hwnd) }.as_bool() {
+                let dpi = unsafe { GetDpiForWindow(hwnd) };
+                let fx = unsafe {
+                    GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi)
+                        + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+                };
+                let fy = unsafe {
+                    GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi)
+                        + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+                };
+                let params = unsafe { &mut *(l.0 as *mut NCCALCSIZE_PARAMS) };
+                params.rgrc[0].left += fx;
+                params.rgrc[0].right -= fx;
+                params.rgrc[0].top += fy;
+                params.rgrc[0].bottom -= fy;
+            }
+            LRESULT(0)
+        }
+        WM_NCHITTEST => {
+            let mut pt = POINT {
+                x: (l.0 & 0xFFFF) as u16 as i16 as i32,
+                y: ((l.0 >> 16) & 0xFFFF) as u16 as i16 as i32,
+            };
+            let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
+            let dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
+            let s = if dpi <= 0.0 { 1.0 } else { dpi / 96.0 };
+            let (cw, ch) = client_dip_of(hwnd);
+            let (x, y) = (pt.x as f32 / s, pt.y as f32 / s);
+            // 三颗窗口按钮最先：它们占着右上角，必须回 HTCLIENT 才收得到 WM_LBUTTONDOWN
+            // （悬停底色与点击都在客户区这套代码里）。
+            if win_button_at(cw, x, y).is_some() {
+                return LRESULT(HTCLIENT as isize);
+            }
+            if !unsafe { IsZoomed(hwnd) }.as_bool() {
+                let (bx, by) = frame_thickness(hwnd);
+                let (left, right) = (x < bx, x >= cw - bx);
+                let (top, bottom) = (y < by, y >= ch - by);
+                let code = match (left, right, top, bottom) {
+                    (true, _, true, _) => HTTOPLEFT,
+                    (_, true, true, _) => HTTOPRIGHT,
+                    (true, _, _, true) => HTBOTTOMLEFT,
+                    (_, true, _, true) => HTBOTTOMRIGHT,
+                    (true, _, _, _) => HTLEFT,
+                    (_, true, _, _) => HTRIGHT,
+                    (_, _, true, _) => HTTOP,
+                    (_, _, _, true) => HTBOTTOM,
+                    _ => HTCLIENT,
+                };
+                if code != HTCLIENT {
+                    return LRESULT(code as isize);
+                }
+            }
+            // 标题带 = 拖窗、双击最大化、贴边分屏，全交给系统的非客户区逻辑。
+            if y < TITLEBAR_H {
+                return LRESULT(HTCAPTION as isize);
+            }
+            LRESULT(HTCLIENT as isize)
+        }
+        WM_NCACTIVATE => {
+            // 没有非客户区要画；返回 TRUE 告诉系统"边框已更新"，顺手重画一次。
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(1)
+        }
+        WM_NCMOUSEMOVE => {
+            // 从按钮（客户区）移到标题带（非客户区）不会再来 WM_MOUSEMOVE：
+            // 悬停状态要在这里撤掉，否则按钮会一直亮着。
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                if app.ctl.take().is_some() {
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
+        }
+        WM_SIZE => {
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                // 拖拽循环里先不动：那会把用户正在进行的拖拽打断，等 `WM_EXITSIZEMOVE`。
+                if !app.in_size_move {
+                    let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
+                    if app.mica && zoomed != app.was_maximized {
+                        app.was_maximized = zoomed;
+                        fix_backdrop(hwnd);
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+        WM_ENTERSIZEMOVE => {
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                app.in_size_move = true;
+                app.size_at_enter = client_dip_of(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_SIZING => {
+            // 拖拽缩放开始：临时回不透明档（DWM 背板不跟尺寸，半透明页会露旧边界）。
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                if !app.resizing {
+                    app.resizing = true;
+                    tracing_note("拖拽缩放：临时切不透明档");
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
+        }
+        WM_EXITSIZEMOVE => {
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                app.in_size_move = false;
+                let sized = app.resizing;
+                if sized {
+                    app.resizing = false;
+                    tracing_note("拖拽结束：贴回玻璃并重算背板");
+                }
+                // 纯移动（没改大小）不重算背板：那会白闪一下。
+                let now = client_dip_of(hwnd);
+                let resized = sized || now != app.size_at_enter;
+                if app.mica && resized {
+                    fix_backdrop(hwnd);
+                }
+                if resized {
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -9296,7 +9586,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 );
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                if app.mica {
+                    // 换屏同时换了尺寸：背板同样要按新矩形重算。
+                    fix_backdrop(hwnd);
+                }
+            }
             LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            // 先让系统填一遍（最大化尺寸/位置就在里面），再只补一条下限：
+            // 窗口再窄下去，固定矩形版面会开始互相压字。
+            let r = unsafe { DefWindowProcW(hwnd, msg, w, l) };
+            let dpi = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
+            let mmi = unsafe { &mut *(l.0 as *mut MINMAXINFO) };
+            mmi.ptMinTrackSize.x = (960.0 * dpi) as i32;
+            mmi.ptMinTrackSize.y = (640.0 * dpi) as i32;
+            r
         }
         WM_TIMER if w.0 == TIMER_EVENTS => {
             // 心跳：只留证据，不刷屏（。
@@ -9512,7 +9818,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     let (cw, ch) = app.client_dip(hwnd);
                     hand = app
                         .control_at(cw, ch, pt.x as f32 / s, pt.y as f32 / s)
-                        .is_some();
+                        // 窗口按钮保持箭头：系统标题栏上那三颗也不是手型。
+                        .is_some_and(|c| !matches!(c, Ctl::WinBtn(_)));
                 }
             }
             let cur = if hand { IDC_HAND } else { IDC_ARROW };
@@ -9861,6 +10168,15 @@ fn apply_glass(hwnd: HWND) -> bool {
     }
     // 标题栏深浅跟着 `[gui] theme` 走 —— 浅色界面顶着一条深色标题栏是最扎眼的不一致。
     apply_title_theme(hwnd);
+    extend_frame(hwnd);
+    tracing_note("Mica 已启用");
+    true
+}
+
+/// 把 DWM 的玻璃区域铺满整个窗口。拆掉原生标题条之后这件事要**在尺寸变化后重做**：
+/// 背板只按上一次调用时的窗口矩形铺，最大化/拉伸后旧背板会留在原地，屏上就是
+/// "页面底色只铺到旧窗口右边、其余一片黑"。
+fn extend_frame(hwnd: HWND) {
     let margins = MARGINS {
         cxLeftWidth: -1,
         cxRightWidth: -1,
@@ -9870,8 +10186,29 @@ fn apply_glass(hwnd: HWND) -> bool {
     unsafe {
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
     }
-    tracing_note("Mica 已启用");
-    true
+}
+
+/// 逼 DWM 按**当前**窗口矩形重算 Mica 背板。
+///
+/// 实测：拆掉原生标题条之后，重设 `SYSTEMBACKDROP_TYPE`、重贴扩展边框、cloak、
+/// `SWP_FRAMECHANGED`、重建交换链都不会让背板跟着新尺寸走；只有窗口重新"显示"一次
+/// 才会重算。所以藏一下再显示（同一个消息里，通常不会真的闪一帧），再把前台还给它 ——
+/// `ShowWindow(SW_SHOW)` 本身不激活窗口。
+fn fix_backdrop(hwnd: HWND) {
+    if BACKDROP_FIX.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let was_fg = unsafe { GetForegroundWindow() } == hwnd;
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+    }
+    if was_fg {
+        unsafe {
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+    BACKDROP_FIX.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 标题栏深浅（DWM 的 immersive dark mode）。
@@ -10013,6 +10350,20 @@ fn main() -> windows::core::Result<()> {
             None,
         )?
     };
+
+    // 创建窗口时那条 WM_NCCALCSIZE 的 wParam 是 FALSE（系统按"带标题条"给出的建议值），
+    // 强制重算一次框架，才会走 TRUE 那条把客户区撑满整窗 —— 拆原生标题条的标准触发点。
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
 
     let app = Box::into_raw(Box::new(App::new(hwnd, false)?));
     unsafe {
@@ -12844,6 +13195,43 @@ mod contrast_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod window_chrome_tests {
+    use super::*;
+
+    /// 三颗按钮必须贴在右上角、彼此不重叠、整条高度落在标题带里（不伸进内容区），
+    /// 也不许压到周期药丸那一行（y=48 起）。
+    #[test]
+    fn the_three_caption_buttons_sit_at_the_top_right_without_overlapping() {
+        let w = 1200.0;
+        let b = win_buttons(w);
+        assert_eq!(b[0].left, w - WIN_BTN_W * 3.0);
+        assert_eq!(b[2].right, w);
+        for (i, r) in b.iter().enumerate() {
+            assert_eq!(r.top, 0.0);
+            assert_eq!(r.bottom, WIN_BTN_H);
+            assert_eq!(r.right - r.left, WIN_BTN_W);
+            if i > 0 {
+                assert_eq!(b[i - 1].right, r.left, "第 {i} 颗按钮与左边那颗重叠了");
+            }
+        }
+        assert!(b[0].bottom <= TITLEBAR_H, "按钮比标题带还高");
+        assert!(b[0].bottom <= 48.0, "按钮伸进了周期药丸那一行");
+    }
+
+    /// 命中按按钮自己的矩形来：右到左依次是关闭 / 最大化 / 最小化，
+    /// 标题带左侧与按钮下方都不算按钮（否则拖窗会被按钮吃掉）。
+    #[test]
+    fn the_caption_buttons_answer_on_their_own_rects() {
+        let w = 1200.0;
+        assert_eq!(win_button_at(w, w - 20.0, 10.0), Some(2));
+        assert_eq!(win_button_at(w, w - 60.0, 10.0), Some(1));
+        assert_eq!(win_button_at(w, w - 110.0, 10.0), Some(0));
+        assert_eq!(win_button_at(w, 300.0, 20.0), None);
+        assert_eq!(win_button_at(w, w - 20.0, 60.0), None);
     }
 }
 
