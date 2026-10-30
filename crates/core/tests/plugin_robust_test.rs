@@ -82,8 +82,8 @@ mod tests {
 
         // 向番茄钟插件投递按键（无 record_key 的插件应安全忽略）
         for i in 0..100 {
-            manager.plugin_key_event("番茄工作法", &format!("K{i}"));
-            manager.plugin_key_event("统计速览", "A"); // 无 record_key，应忽略
+            manager.plugin_key_event("番茄工作法", &format!("K{i}"), 1);
+            manager.plugin_key_event("统计速览", "A", 1); // 无 record_key，应忽略
         }
 
         // 动作调用（番茄钟按钮）

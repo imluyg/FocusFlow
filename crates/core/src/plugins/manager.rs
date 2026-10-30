@@ -23,6 +23,33 @@ use crate::paths;
 use crate::plugins::host;
 use crate::plugins::PluginView;
 
+/// 按键增量的取件口：写线程（或任何不能碰 Lua 的线程）只管往里并，GUI 线程一拍取一次。
+///
+/// 为什么要有这么一格：`Lua` 不是 Send，插件的 VM 只能在 GUI 线程上跑（模块顶部那条约束）。
+/// 攒批那一头要"出锁再进 Lua"，唯一诚实的做法就是它只交出批，进 VM 的那一跳留在取件侧。
+/// 尺寸上界是"这段时间里出现过几种键名"（同名相加），不是按键次数 —— 它不会随打字速度长。
+static KEY_BATCH_QUEUE: std::sync::Mutex<Vec<(String, i64)>> = std::sync::Mutex::new(Vec::new());
+
+/// 把一批按键增量并进取件口（同名相加，非正数的增量不算）。
+pub fn queue_key_batch(pairs: Vec<(String, i64)>) {
+    let mut q = KEY_BATCH_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    for (name, n) in pairs {
+        if n <= 0 {
+            continue;
+        }
+        match q.iter_mut().find(|(k, _)| *k == name) {
+            Some((_, have)) => *have += n,
+            None => q.push((name, n)),
+        }
+    }
+}
+
+/// 取件：一次拿走全部。调用方（GUI 线程）负责在没人收的时候放回去。
+pub fn take_key_batches() -> Vec<(String, i64)> {
+    let mut q = KEY_BATCH_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *q)
+}
+
 /// 插件信息。
 pub struct PluginInfo {
     pub name: String,
@@ -1147,20 +1174,18 @@ impl PluginManager {
         }
     }
 
-    /// 向插件投递按键事件（番茄钟联动等）。
+    /// 向插件投递**一批**按键：`key` 是键名，`count` 是这一批里它的增量。
     ///
-    /// ⚠ **今天生产端没有调用方**：原生重写之前，按键是前端里一条独立的分发线程批量送到
-    /// 主线程再进这里的；`desktop-native` 的按键链只写库和 CPM，没有这一跳。全仓现量：
-    /// 调用点只有本模块的判据（`crates/core/tests/*` 里那几条集成用例也算），
-    /// 随包发布的番茄钟插件在屏上那两格「本阶段键鼠／今日键鼠」因此一直是 0。
-    /// 要不要把它接回来不是纯接线：接上就得让插件在启动时就加载（现在只有进插件页才建
-    /// 管理器、才 `load_all`），并把每键一次 Lua 调用压回按键路径 —— 等裁决，别顺手接。
+    /// 为什么按批而不是逐键：mlua 的 `Lua` 不是 Send，插件的 VM 只能由 GUI 线程碰（模块顶部
+    /// 那条设计约束），所以写线程那一侧只把增量并进取件口，真正进 Lua 的是取件的那一跳。
+    /// 调用次数因此与"这 10 秒里出现过几种键"成正比，而不是按键次数 —— 逐键进 VM 等于把插件
+    /// 钩子死循环这一族事故请回按键热路径（它炸过一次启动）。
     ///
     /// 这条是唯一一个**调用方看不见失败**的 Lua 入口：`on_action` 与 `set_field` 把原因
     /// `return Err` 给点的那个人，而这条的返回值是 `()`。
     /// 所以非限额的报错过去整包丢掉 —— 插件的 `record_key` 一抛错，按键数从这一次起
     /// 再也不涨，插件页却仍写着已加载、没有一行原因。
-    pub fn plugin_key_event(&mut self, name: &str, key: &str) {
+    pub fn plugin_key_event(&mut self, name: &str, key: &str, count: i64) {
         let cfg = self.config;
         let info = match self.plugins.get(name) {
             Some(i) => i,
@@ -1186,7 +1211,8 @@ impl PluginManager {
             }
         };
         Self::arm_instruction_budget(lua, cfg);
-        if let Err(e) = hook.call::<()>(key) {
+        // 两个参数：键名 + 这一批的增量。只声明一个形参的旧插件照旧能收（多给的参数被丢掉）。
+        if let Err(e) = hook.call::<()>((key, count.max(1))) {
             if is_limit_error(&e) {
                 // 跑飞了：这一类必须停用整个插件（原有口径，不许被下面那条弱化）
                 self.mark_plugin_error(name, format!("record_key 失败: {e}"));
@@ -1194,6 +1220,15 @@ impl PluginManager {
                 self.note_key_hook_failure(name, format!("record_key 抛错，按键数不再累计: {e}"));
             }
         }
+    }
+
+    /// 已加载（拿得出 VM）的插件名。攒批分发先问这一份，别每个键名都撞一遍全表。
+    pub fn loaded_plugin_names(&self) -> Vec<String> {
+        self.plugins
+            .iter()
+            .filter(|(_, info)| info.lua.is_some())
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// 按键钩子出问题时"挂个原因"，但**不停用插件**、也**不每次按键都喊**。
@@ -2976,7 +3011,7 @@ end
         let mut pm = manager_in(tmp.path());
         let name = pm.load_plugin(&file).expect("插件本身该装得上");
 
-        let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A"));
+        let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A", 1));
         let info = pm.get_plugin(&name).expect("插件应还在表里");
         assert!(info.loaded, "一次表达式写错不该没收整个面板");
         let reason = info
@@ -2996,7 +3031,7 @@ end
         // 观察量：这条是每个按键调一次，已经挂过原因就不许再刷日志
         let (_, logs) = crate::logger::capture_logs(|| {
             for i in 0..50 {
-                pm.plugin_key_event(&name, &format!("K{i}"));
+                pm.plugin_key_event(&name, &format!("K{i}"), 1);
             }
         });
         assert_eq!(
@@ -3038,7 +3073,7 @@ end
         let mut pm = manager_in(tmp.path());
         let name = pm.load_plugin(&file).expect("插件本身该装得上");
 
-        let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A"));
+        let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A", 1));
         let info = pm.get_plugin(&name).expect("插件应还在表里");
         assert!(
             !info.loaded,
@@ -3068,7 +3103,7 @@ end
         let mut pm = manager_in(tmp.path());
         let name = pm.load_plugin(&file).expect("插件该装得上");
 
-        let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A"));
+        let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A", 1));
         let info = pm.get_plugin(&name).expect("插件应还在表里");
         assert!(
             info.error.is_none(),
@@ -3098,7 +3133,7 @@ end
         let mut pm = manager_in(tmp.path());
         let name = pm.load_plugin(&file).expect("插件该装得上");
 
-        let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A"));
+        let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A", 1));
         let info = pm.get_plugin(&name).expect("插件应还在表里");
         let reason = info.error.clone().expect("非函数的钩子要有原因");
         assert!(reason.contains("不是函数"), "{reason}");

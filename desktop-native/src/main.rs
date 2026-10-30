@@ -2694,6 +2694,40 @@ impl App {
         }
     }
 
+    /// 取一次攒批的按键增量，投给已加载的插件（钩子没声明的那個会在分发器里自己安静下来）。
+    ///
+    /// 这一跳必须留在 GUI 线程：`Lua` 不是 Send，插件的 VM 不能被别的线程碰。写线程那一侧
+    /// 只把 `(键名, 这一批的增量)` 并进取件口，所以每 10 秒一批、每批每个键只进一次 VM ——
+    /// 逐键进 VM 等于把"插件钩子死循环炸启动"那一族事故请回按键热路径。
+    fn pump_plugin_key_batches(&mut self) {
+        let batches = focusflow_core::plugins::manager::take_key_batches();
+        if batches.is_empty() {
+            return;
+        }
+        let Some(pm) = self.pm.as_mut() else {
+            // 管理器没建起来：放回去，别把这批数悄悄吃掉
+            focusflow_core::plugins::manager::queue_key_batch(batches);
+            return;
+        };
+        let names = pm.loaded_plugin_names();
+        for (key, count) in &batches {
+            for name in &names {
+                pm.plugin_key_event(name, key, *count);
+            }
+        }
+    }
+
+    /// 启动即加载插件。以前管理器只在进插件页时才建，于是「本阶段键鼠」这一栏在没人
+    /// 打开过插件页时永远是 0 —— 攒批的分发也就没有收件方。
+    fn load_plugins_at_startup(&mut self) {
+        self.ensure_plugin_manager();
+        if !self.plugins_loaded {
+            if let Some(pm) = self.pm.as_mut() {
+                self.plugins_loaded = pm.load_all();
+            }
+        }
+    }
+
     /// 插件启用/停用：写。
     fn toggle_plugin(&mut self, hwnd: HWND, idx: usize) {
         let Some(row) = self.plugin_rows.get(idx).cloned() else {
@@ -9759,6 +9793,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     ));
                 }
             }
+            // 攒批的按键增量交给插件：写线程只出件，进 Lua 留在 GUI 线程这一侧（`Lua` 不是 Send）。
+            // 件口多数时候是空的 —— 一拍一次互斥体取空向量，不换回每键一次 VM 的代价。
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                app.pump_plugin_key_batches();
+            }
             // 托盘点击 / 菜单 / 热键只在事件通道里，靠这 100ms 一拍取出来。
             while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
                 // 悬停那一刻现问一次"今日"。隐藏期间快照线程不查（见 `watching`），
@@ -10522,6 +10561,8 @@ fn main() -> windows::core::Result<()> {
         // `HWND_TOPMOST`，理由是"自动化截图时会被浏览器盖住"——那是测试的麻烦，
         // 代价却是用户切到别的窗口时这块界面永远压在上面（他 2026-10-30 点的）。
         // 验收套件的截图走 `PrintWindow`、点击走 `PostMessage`，不依赖窗口在最上层。
+        // 攒批的按键增量得有收件方：插件在启动这一趟就加载，不再等第一次进插件页。
+        (*app).load_plugins_at_startup();
         let _ = SetTimer(Some(hwnd), TIMER_EVENTS, 100, None);
         let _ = UpdateWindow(hwnd);
     }
@@ -12603,6 +12644,59 @@ mod startup_tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 按键分发的接线形状：生产端得有调用方，而且**不许**站在每键热路径上。
+    ///
+    /// 逐键进 Lua 是这次刻意躲开的代价（插件钩子死循环炸过一次启动），所以这条钉的是位置：
+    /// 分发只在 GUI 那一拍的取件里；`listener.rs` 的按键路径一行都不许沾它；写线程那一侧
+    /// 只许有一个"出锁交件"的点。摘掉任一处，这条要红 —— 病状是"功能没坏、数不涨了"。
+    #[test]
+    fn the_key_dispatch_sits_on_the_batch_side_not_the_per_key_path() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod: String = src[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            prod.matches("pm.plugin_key_event(").count(),
+            1,
+            "攒批分发的调用点不是一份（两份就会重复投）"
+        );
+        // 钉**调用形态**：光找 pump_plugin_key_batches 会先撞上那句 `fn pump_...` 的定义，
+        // 摘掉心跳里的调用照样绿（本场自己踩到的一次假绿，探针验出来的）。
+        assert_eq!(
+            prod.matches("app.pump_plugin_key_batches();").count(),
+            1,
+            "心跳里那一拍取件的调用不见了：件口没人收，键鼠栏照旧是 0"
+        );
+        assert!(
+            prod.contains("take_key_batches()"),
+            "GUI 线程取件那一跳不见了：件口没人收，键鼠栏照旧是 0"
+        );
+        assert!(
+            prod.contains("load_plugins_at_startup()"),
+            "启动即加载退回了进插件页才建管理器"
+        );
+        let listener = include_str!("../../crates/core/src/listener.rs").replace("\r\n", "\n");
+        let lcut = listener.find("#[cfg(test)]").unwrap_or(listener.len());
+        assert!(
+            !listener[..lcut].contains("plugin_key_event"),
+            "每键热路径上又出现了一次 Lua 分发"
+        );
+        let writer = include_str!("../../crates/core/src/db/writer.rs").replace("\r\n", "\n");
+        let wcut = writer.find("#[cfg(test)]").unwrap_or(writer.len());
+        assert_eq!(
+            writer[..wcut].matches("queue_key_batch(").count(),
+            1,
+            "出锁交件的调用点该只有一份"
+        );
+        assert!(
+            writer[..wcut].contains("merged_key_deltas()"),
+            "按键增量没按键名合并就交了出去"
+        );
     }
 
     /// 静默启动的两条入口必须各自成立，且**参数赢**：带 `--hidden` 的那一次不管配置写什么都静默

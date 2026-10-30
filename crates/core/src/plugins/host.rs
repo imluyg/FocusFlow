@@ -384,8 +384,9 @@ pub fn register_host_api(
     // 番茄钟按键联动（监听器回调调用）
     host.set(
         "pomodoro_record_key",
-        lua.create_function(|_, key: String| {
-            pomodoro_timer().record_key(&key);
+        // 第二个形参是这一批的增量：宿主按批投，不逐键投。只传键名的旧写法按一次算。
+        lua.create_function(|_, (key, count): (String, Option<i64>)| {
+            pomodoro_timer().record_key(&key, count.unwrap_or(1));
             Ok(())
         })?,
     )?;

@@ -98,13 +98,13 @@ mod tests {
         assert!(info["planned"] >= 60);
 
         // 按键计数
-        timer.record_key("A");
-        timer.record_key("B");
+        timer.record_key("A", 1);
+        timer.record_key("B", 1);
         assert_eq!(timer.get_state_info()["key_count"], 2);
 
         // 暂停/继续
         assert!(timer.toggle_pause());
-        timer.record_key("C"); // 暂停时不计数
+        timer.record_key("C", 1); // 暂停时不计数
         assert_eq!(timer.get_state_info()["key_count"], 2);
         assert!(!timer.toggle_pause());
 

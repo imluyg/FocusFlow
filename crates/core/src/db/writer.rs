@@ -167,6 +167,23 @@ impl AggDeltas {
         }
     }
 
+    /// 把这一批按键增量按键名合并（跨年库/跨天的同一键并成一个数）。
+    ///
+    /// 这一格是"分发次数"与"按键次数"脱钩的地方：交出去的是 `(键名, 增量)`，所以插件钩子
+    /// 每批每个键只被叫一次。写成方法是为了能单测 —— 不碰 SQL、不起线程。
+    fn merged_key_deltas(&self) -> Vec<(String, i64)> {
+        let mut merged: HashMap<String, i64> = HashMap::new();
+        for key_map in self.keys.values() {
+            for (name, n) in key_map {
+                *merged.entry(name.clone()).or_insert(0) += *n;
+            }
+        }
+        // 排序只为可测：件口的内容进断言时不该依赖 HashMap 的随机序
+        let mut out: Vec<(String, i64)> = merged.into_iter().collect();
+        out.sort();
+        out
+    }
+
     /// 按年份库切分增量。
     ///
     /// 年度库是 `focusflow_<年>.db`，而增量里的 date_key 来自事件发生时刻。
@@ -1372,6 +1389,14 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
             Ok(()) => {
                 wrote_any = true;
                 state.flush_seq.fetch_add(1, Ordering::Relaxed);
+                // 这一份落成了，才把按键增量交给插件的取件口。放在这里有两个理由：
+                // 一是此刻 `agg` 锁早就放了（上面那个块结束就放），二是写失败的年份会重试，
+                // 提前交就等于让同一个键的增量被插件数两遍。
+                // 写线程不进 Lua —— `Lua` 不是 Send，VM 只能在 GUI 线程碰（plugins/manager.rs 顶部）。
+                let merged = part.merged_key_deltas();
+                if !merged.is_empty() {
+                    crate::plugins::manager::queue_key_batch(merged);
+                }
             }
             Err(e) => {
                 tracing::error!("聚合落库最终失败（{year} 年）: {e}");
@@ -1810,6 +1835,47 @@ fn flush_partition(
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    /// 一批按键增量交给插件时按**键名**合并：两个键各按 N 次，交出去的是两条 `(键名, 增量)`，
+    /// 不是 2N 条。这一格是"每个物理按键都进一次 Lua"没有请回按键热路径的唯一保证。
+    ///
+    /// 跨年/跨天的同一键也并进来（`keys` 的第一层是 date_key，插件要的是这一批的总数）。
+    #[test]
+    fn a_batch_of_two_keys_leaves_as_two_entries_not_twenty() {
+        let mut d = AggDeltas::default();
+        for _ in 0..10 {
+            *d.keys
+                .entry(20260101)
+                .or_default()
+                .entry("A".to_string())
+                .or_insert(0) += 1;
+            *d.keys
+                .entry(20260102)
+                .or_default()
+                .entry("B".to_string())
+                .or_insert(0) += 1;
+        }
+        let merged = d.merged_key_deltas();
+        assert_eq!(merged.len(), 2, "两个键该交两条，实得 {merged:?}");
+        assert_eq!(
+            merged,
+            vec![("A".to_string(), 10), ("B".to_string(), 10)],
+            "增量该按键名相加（跨天的同一键也算在一起）"
+        );
+        // 件口同样按键名相加，且取件一次取空
+        crate::plugins::manager::queue_key_batch(merged.clone());
+        crate::plugins::manager::queue_key_batch(merged);
+        let q = crate::plugins::manager::take_key_batches();
+        assert_eq!(
+            q,
+            vec![("A".to_string(), 20), ("B".to_string(), 20)],
+            "两批同名键该并成一个数，不是排成四条"
+        );
+        assert!(
+            crate::plugins::manager::take_key_batches().is_empty(),
+            "取件必须一次取空，否则下一拍会重复投"
+        );
+    }
 
     /// 年份库打不开时，错误里必须留下**原因**而不是光一句"无可用连接"。
     ///

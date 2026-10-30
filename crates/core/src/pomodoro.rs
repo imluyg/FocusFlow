@@ -561,10 +561,13 @@ impl PomodoroTimer {
     }
 
     /// 按键回调：仅在工作中计数。
-    pub fn record_key(&self, _key_name: &str) {
+    ///
+    /// `count` 是**这一批**的增量 —— 宿主按批投（见 `plugins::manager::plugin_key_event`），
+    /// 不逐键投，所以这里加的是增量而不是一。
+    pub fn record_key(&self, _key_name: &str, count: i64) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.state == STATE_WORK && !s.paused {
-            s.key_count += 1;
+            s.key_count += count.max(1);
         }
     }
 
