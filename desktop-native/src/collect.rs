@@ -265,6 +265,9 @@ pub fn start(cfg: &'static FocusFlowConfig) -> Result<(), String> {
             crate::tracing_note(&format!("按键：{key}"));
         }
         record_key_at(now_secs());
+        // 催快照线程一拍：一次原子位存储，不是 IO，也不在这儿查库——查由对面按
+        // `POKE_MIN_GAP_MS` 节流，所以打字高峰是 4 拍/秒而不是每键 10 条语句。
+        crate::poke_snapshot();
     }));
     if let Err(e) = listener.start(Arc::clone(&db)) {
         // 监听起不来 = 一条都不记：把刚起的写线程也停掉，状态回未启动。

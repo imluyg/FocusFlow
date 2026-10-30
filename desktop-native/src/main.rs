@@ -905,6 +905,45 @@ fn watching_now(hwnd: HWND) -> bool {
     }
 }
 
+/// 催一拍的那一位：谁改了"该看的东西"（把窗口唤到眼前、按一下键）就把它按下去，
+/// 正在睡的快照线程因此提前醒一次，而不是把整段节拍熬完。
+///
+/// 为什么只留一位而不是当场查库：按的人在监听线程上，而一拍是 10 条语句／7.6ms
+/// （数出自 `crates/core/tests/perf_probe.rs`）——每键都查会把 1 拍/秒抬成打字高峰的
+/// 10 拍/秒（约 650ms/秒 CPU）。查这件事留在快照线程，催的人只负责把位按下去。
+static SNAP_POKE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 睡这一拍时多久看一眼"有没有人催"：50ms 是唤窗到第一帧新数的最坏等待。
+/// 没人催的时候这些片一次都不会真醒，空转代价仍只是每 250ms 一次 `IsWindowVisible`。
+const POKE_SLICE_MS: u64 = 50;
+
+/// 被催醒之后离上一次真拍至少要隔这么多毫秒才许再拍一次（节流）。
+/// 10 键/秒因此合成 4 拍/秒，而不是每键一拍。
+const POKE_MIN_GAP_MS: u64 = 250;
+
+pub(crate) fn poke_snapshot() {
+    SNAP_POKE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 还要补睡多少毫秒才许再拍一次：0 = 立刻拍。
+fn poke_backlog_ms(since_query_ms: u64, min_gap_ms: u64) -> u64 {
+    min_gap_ms.saturating_sub(since_query_ms)
+}
+
+/// 睡这么多毫秒，期间只要有人催过就立刻醒并把那位清掉。回话是"有没有被催"。
+fn sleep_or_poke(ms: u64) -> bool {
+    let mut left = ms;
+    while left > 0 {
+        let slice = POKE_SLICE_MS.min(left);
+        std::thread::sleep(Duration::from_millis(slice));
+        left -= slice;
+        if SNAP_POKE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+    }
+    false
+}
+
 /// 短档基准那一拍睡多少**秒**，取 `[gui] active_refresh_interval`（设置页那一行的说法是
 /// "改完立即生效"，所以每一拍重新读一次，不在启动时读死）。倍率见 `snapshot_tick_ms`。
 ///
@@ -1102,6 +1141,8 @@ impl App {
                 .name("snapshot".into())
                 .spawn(move || {
                     let mut idle = false;
+                    // 上一次真拍是什么时候：被催醒的那一拍按 `POKE_MIN_GAP_MS` 节流就靠它。
+                    let mut last_query = std::time::Instant::now();
                     loop {
                         // `HWND` 不是 `Send`（里面是裸指针），所以线程只带 `hwnd_val`，
                         // 每一拍就地包一个句柄出来问可见性。
@@ -1127,7 +1168,9 @@ impl App {
                                 );
                             }
                             idle = true;
-                            std::thread::sleep(Duration::from_millis(IDLE_WAKE_MS));
+                            // 小片地睡：唤窗那一下会催这一位，于是"点开窗口到第一帧新数"
+                            // 从最坏 250ms 压到最坏一片 50ms；没人催还是每 250ms 问一次。
+                            sleep_or_poke(IDLE_WAKE_MS);
                             continue;
                         }
                         if idle {
@@ -1136,13 +1179,25 @@ impl App {
                             tracing_note("快照线程 idle=off：有读者了，当场查一次并恢复按拍刷新");
                             idle = false;
                         } else {
-                            std::thread::sleep(Duration::from_millis(tick_ms));
+                            // 睡满这一拍；期间有人按键或唤窗就提前醒。被催醒**不等于**立刻再拍：
+                            // 离上一次真拍不足 `POKE_MIN_GAP_MS` 就只补睡剩下的那一段，
+                            // 于是打字高峰合成 4 拍/秒，而不是每键 10 条语句。
+                            if sleep_or_poke(tick_ms) {
+                                let left = poke_backlog_ms(
+                                    last_query.elapsed().as_millis() as u64,
+                                    POKE_MIN_GAP_MS,
+                                );
+                                if left > 0 {
+                                    std::thread::sleep(Duration::from_millis(left));
+                                }
+                            }
                             if !watching_now(hwnd) {
                                 // 睡这一拍期间窗口又被藏起来了：整批查询省掉。
                                 continue;
                             }
                         }
                         let next = data::load(p.load(std::sync::atomic::Ordering::Relaxed));
+                        last_query = std::time::Instant::now();
                         // 悬浮窗读的是这几格，先推过去再让主界面拿新快照。
                         publish_floating(&next);
                         // 推完要**催**一下：主界面这一拍是靠下面那条 `WM_REFRESH` 立刻重画的，
@@ -9287,6 +9342,9 @@ fn start_to_tray_cfg() -> bool {
 unsafe fn bring_to_front(hwnd: HWND) {
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = ShowWindow(hwnd, SW_RESTORE);
+    // 上屏**之后**才催：反过来线程可能先醒一次、问到的还是"没人看"，那一催就白花了，
+    // 症状照旧是点开窗口先看见上一份旧数。
+    poke_snapshot();
     let _ = SetForegroundWindow(hwnd);
     if GLASS_ON_FIRST_SHOW.swap(false, std::sync::atomic::Ordering::Relaxed) {
         // 补贴材质要把 `mica` 一起改：只改 DWM 不改那一位，界面会按不透明档画、底下却是
@@ -11243,11 +11301,18 @@ mod snapshot_rate_tests {
             2,
             "一处定义 + 循环里一处调用，数量变了说明接线动过"
         );
-        let sleeps_on = ["Duration::from_millis(", "tick_ms", ")"].concat();
+        // 2026-10-30 起那一拍睡的是"可被催醒的小片"，所以针脚换成催醒包装那一句：
+        // 要钉的还是"分档出来的毫秒真的交给了睡眠"，换形状不等于换判据。
+        let sleeps_on = ["sleep_or_poke(", "tick_ms", ")"].concat();
         assert_eq!(
             prod.matches(sleeps_on.as_str()).count(),
             1,
-            "那一拍必须睡在分档出来的毫秒上"
+            "那一拍必须睡在分档出来的毫秒上（由 sleep_or_poke 代睡，见 POKE_SLICE_MS）"
+        );
+        let slice_sleep = ["Duration::from_millis(", "slice", ")"].concat();
+        assert!(
+            prod.contains(slice_sleep.as_str()),
+            "催醒包装里没有真的睡那一片：tick_ms 交进去也没人等"
         );
         let stale = ["Duration::from_secs(", "secs", ")"].concat();
         assert!(
@@ -13901,6 +13966,125 @@ mod open_dir_tests {
         assert!(
             !body.contains("Command::new(\"explorer\")"),
             "这里又自己起了一次 Explorer：斜杠与引号的规矩从此有两份"
+        );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_poke_tests {
+    use super::*;
+
+    /// 催醒那两半都要读到：位被按下去 ⇒ 第一片就醒并把位清掉；没人催 ⇒ 睡满并回"没被催"。
+    ///
+    /// 只测"能醒"那一半的话，把 `swap` 写成 `load`（醒过来但不清位）照样绿 —— 于是下一拍
+    /// 又白醒一次，而这条判据看不见。
+    #[test]
+    fn a_poke_wakes_the_sleep_and_an_unpoked_sleep_runs_its_full_length() {
+        poke_snapshot();
+        let t = std::time::Instant::now();
+        assert!(sleep_or_poke(4_000), "按过催位却没醒");
+        assert!(
+            t.elapsed().as_millis() < 1_000,
+            "醒了却把整段睡完了：{:?}",
+            t.elapsed()
+        );
+        let t2 = std::time::Instant::now();
+        assert!(
+            !sleep_or_poke(120),
+            "没人催却回来说被催醒了：那一位没清干净"
+        );
+        assert!(
+            t2.elapsed().as_millis() >= 100,
+            "没被催也提前醒了：{:?}",
+            t2.elapsed()
+        );
+    }
+
+    /// 被催醒的那一拍要等满节流才许再查：等得不够就补睡剩下的那一段。
+    ///
+    /// 方向写反（`since - min_gap`）与不减（永远 0）在这里都会红：前者让刚查完的那一拍
+    /// 立刻再查一次，后者等于没有节流——打字高峰就变回每键 10 条语句。
+    #[test]
+    fn a_poked_tick_waits_out_the_throttle_before_querying_again() {
+        assert_eq!(
+            poke_backlog_ms(0, POKE_MIN_GAP_MS),
+            250,
+            "刚查完就该补满这一档"
+        );
+        assert_eq!(poke_backlog_ms(249, POKE_MIN_GAP_MS), 1);
+        assert_eq!(
+            poke_backlog_ms(250, POKE_MIN_GAP_MS),
+            0,
+            "等满了还不许立刻拍"
+        );
+        assert_eq!(
+            poke_backlog_ms(9_000, POKE_MIN_GAP_MS),
+            0,
+            "等超了不许减成负数"
+        );
+        assert_eq!(poke_backlog_ms(1_000, 0), 0);
+    }
+
+    /// 催拍真的接在两个"该看的东西变了"的现场，而且唤窗那一下接在**上屏之后**。
+    ///
+    /// 为什么钉源码而不是造一条验收腿：这条路的观察量是"第一帧新数比上一帧晚多少毫秒"，
+    /// 无头侧量不到（快照线程不在测试进程里跑），而 GUI 套件要的是屏上形状不是节拍。
+    /// 顺序那一半是硬的：先催后上屏，线程会醒在"还没人看"那一刻并把那一位花掉，
+    /// 症状照旧是点开窗口先看见旧数。
+    #[test]
+    fn the_poke_is_wired_after_the_show_and_on_the_key_callback() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("sleep_or_poke(IDLE_WAKE_MS)"),
+            "空转那一段还在整片睡：唤窗催不动它"
+        );
+        assert!(
+            flat.contains("sleep_or_poke(tick_ms)"),
+            "按拍那一段还在整片睡：按键催不动它"
+        );
+        assert!(
+            flat.contains("poke_backlog_ms(last_query.elapsed().as_millis()asu64,POKE_MIN_GAP_MS"),
+            "被催醒那一拍不再节流（或节流用的是别的钟）"
+        );
+        let shown = flat
+            .find("let_=ShowWindow(hwnd,SW_RESTORE)")
+            .expect("唤窗那一步不见了");
+        let poked = flat
+            .find("poke_snapshot();")
+            .expect("唤窗之后不再催拍：点开窗口还是先看见旧数");
+        assert!(shown < poked, "催拍排在上屏之前：线程会醒在还没人看那一刻");
+        // 针脚要挑**这一处**的调用形状：`refresh_now()` 里也有一句 `let next = data::load(`，
+        // 只写前半会先撞上它，那条顺序断言就成了比两句话的先后而不是比这一拍。
+        let loaded = flat
+            .find("letnext=data::load(p.load(")
+            .expect("快照线程不再查库");
+        let stamped = flat
+            .find(";last_query=std::time::Instant::now();")
+            .expect("查完不再记这一拍的时刻：节流没有参照");
+        assert!(
+            loaded < stamped,
+            "时刻记在查库之前：那一拍的耗时会被算进节流"
+        );
+
+        let csrc = include_str!("collect.rs");
+        let cflat: String = csrc.chars().filter(|c| !c.is_whitespace()).collect();
+        // 那两句之间夹着注释，所以比的是先后而不是拼成一串：整串匹配会被注释挡掉（红过一次）。
+        let rec = cflat
+            .find("record_key_at(now_secs());")
+            .expect("键回调里不再记账");
+        let poked = cflat
+            .find("crate::poke_snapshot();")
+            .expect("键回调不再催这一拍");
+        assert!(
+            rec < poked,
+            "催拍排在记账之前：数字还没进账就催，那一拍量到的是旧数"
+        );
+        assert_eq!(
+            cflat.matches("crate::poke_snapshot();").count(),
+            1,
+            "collect.rs 里催拍的位置应当只有键回调那一处"
         );
     }
 }
