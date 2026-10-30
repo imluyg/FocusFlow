@@ -3326,7 +3326,12 @@ impl App {
             .and_then(|s| s.devices.get(idx).map(|d| d.key.clone()));
         let Some(key) = key else { return };
         let period = self.period.load(std::sync::atomic::Ordering::Relaxed);
-        // 注：这条查询在 UI 线程上跑（探针库很小）。正式版要挪到后台线程再投消息回来。
+        // 这条查询在 UI 线程上跑，2026-10-30 按现量收口（旧注释写的是"正式版要挪到后台线程"，
+        // 一句没量过的许愿）：他真实数据的副本上最贵的一档 1.8ms；`perf_probe` 那组合成数据
+        // （比他真实库更密：365 天 × 150 键/天 × 5 设备 × 40 键/天）里
+        // 「总计」32.8ms、「近 30 天」6.4ms、「今日」4.6ms。
+        // 参照线是 >16ms 掉一帧、>100ms 可感知 ⇒ 眼下这一档只是点下去少几帧，
+        // 真到要挪的那天得由 `perf_probe` 的数说话，不凭"看起来在 UI 线程上"动手。
         self.detail = Some(focusflow_core::db::get_device_detail(&key, period));
         tracing_note(&format!("打开设备详情 key={key:?} period={period}"));
         unsafe {
