@@ -2987,6 +2987,66 @@ cleanup = "shutdown"
         );
     }
 
+    /// 攒批交来的两条增量，进 VM 只该有两次，而且每次都带着这一批的总数。
+    ///
+    /// 这条盯的是"面板那一栏不再是 0"的实质：钩子真的收到 `(键名, 增量)` —— 不是逐键一次
+    /// （那等于把每键进 VM 的代价请回按键热路径），也不是只收到键名（那数会少报成"出现过几种键"）。
+    #[test]
+    fn a_batch_of_two_keys_reaches_the_hook_twice_with_its_counts() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("key_batch_counts");
+        let file = write_lua(
+            &tmp.path().join("plugins"),
+            "kb_batch",
+            r###"
+PLUGIN_NAME = "按键攒批"
+function record_key(key, count)
+  focusflow.log("kb-line key=" .. tostring(key) .. " count=" .. tostring(count))
+end
+"###,
+        );
+        let mut pm = manager_in(tmp.path());
+        pm.load_plugin(&file).expect("夹具该加载得动");
+        let names = pm.loaded_plugin_names();
+        assert!(
+            names.iter().any(|n| n == "按键攒批"),
+            "已加载名单里没有它: {names:?}"
+        );
+        // 攒批那一头交过来的形状：两个键各按了若干次。这里直接摆出来，不绕件口 ——
+        // 件口是进程全局的，同一个二进制里别的用例一落库就往里投，拿它当被测对象会互相污染
+        // （完整跑里红过一次：捞到别人留下的 ("A", 8)）。件口自己的相加与取空由
+        // `db::writer` 那侧的用例钉。
+        let batches = vec![("A".to_string(), 10i64), ("B".to_string(), 7i64)];
+        let name = "按键攒批".to_string();
+        let (_, logs) = crate::logger::capture_logs(|| {
+            for (k, c) in &batches {
+                pm.plugin_key_event(&name, k, *c);
+            }
+        });
+        let hits: Vec<&String> = logs.iter().filter(|l| l.contains("kb-line key=")).collect();
+        assert_eq!(
+            hits.len(),
+            2,
+            "两个键该只有两次钩子（不是 17 次），实得 {hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .any(|l| l.contains("key=A") && l.contains("count=10")),
+            "A 这一批的增量没带过去: {hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .any(|l| l.contains("key=B") && l.contains("count=7")),
+            "B 这一批的增量没带过去: {hits:?}"
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|l| l.contains("收按键失败") || l.contains("record_key 抛错")),
+            "钩子跑通了却还在出声: {logs:?}"
+        );
+    }
+
     /// 插件的 `record_key` 抛错时，按键停摆必须看得见。
     ///
     /// 同一族里 `on_action` 与 `set_field` 都把原因 `return Err` 给点按钮的那个人，

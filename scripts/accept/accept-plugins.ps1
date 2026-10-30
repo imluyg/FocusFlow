@@ -105,4 +105,56 @@ while (-not $p.HasExited -and $sw.Elapsed.TotalMilliseconds -lt 8000) { Start-Sl
 Check 'quits within 8 s' $p.HasExited "$([int]$sw.Elapsed.TotalMilliseconds) ms"
 if (-not $p.HasExited) { Stop-App }
 
+# ---- phase 2: the batched key/mouse dispatch must reach a loaded plugin in a real process.
+#
+# What this covers and what it does not: the panel's number is drawn text with no machine
+# readable readout, so "a human sees a non-zero count there" is still an eye-check. What is
+# asserted here are the two things that were missing before the wiring -- plugins are loaded at
+# startup (nobody has to open the page first), and after real injected input plus one writer
+# flush the host hands the batch over to that many loaded plugins. The Lua round trip itself
+# (one call per key name, carrying the aggregated count) is pinned headlessly by core's
+# a_batch_of_two_keys_reaches_the_hook_twice_with_its_counts.
+#
+# The two readouts are matched by their ASCII tails: PowerShell 5.1 reads a BOM-less UTF-8 .ps1
+# as ANSI, so a Chinese regex in this file would break the matcher itself.
+# Section name WITHOUT brackets: Set-ConfigLine writes "<section> = value" under a
+# "[<section>]" header, so passing '[collector]' produced "[[collector]]" -- a header the parser
+# reads as a section literally named "[collector", leaving the collector OFF and this phase
+# measuring nothing. That is how it first presented: "no batch was ever dispatched".
+Set-ConfigLine $app 'collector' 'enabled' 'true'
+Remove-Item (Join-Path $WorkDir 'focusflow.log') -ErrorAction SilentlyContinue
+$p2 = Start-App $Exe $app $WorkDir
+$h2 = Wait-Window $p2.Id
+Check 'phase 2: window appears' ($h2 -ne [IntPtr]::Zero)
+# Poll: the file logger is not guaranteed to have written the startup line by the time the
+# window exists, and a single read here raced (the line was there in the log afterwards).
+$loaded = @()
+$deadline = (Get-Date).AddSeconds(20)
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 1
+    $loaded = @(Read-AppLog $WorkDir | Where-Object { $_ -match 'plugins_loaded=[1-9]' })
+    if ($loaded.Count -ge 1) { break }
+}
+Check 'plugins load at startup (no page visit needed)' ($loaded.Count -ge 1) ($loaded -join ' | ')
+$st = @(Read-AppLog $WorkDir | Where-Object { $_ -match 'collector=' } | Select-Object -Last 1)
+# -match on an array is a *filter* (returns the array), and Check takes [bool] -- bind it out.
+$on = @($st | Where-Object { $_ -match 'collector=on' }).Count -ge 1
+Check 'phase 2: the collector really is on' $on ($st -join '')
+if ($h2 -ne [IntPtr]::Zero) {
+    [FF]::ClickScreen($h2, 1150, 700, 10)
+}
+$batch = @()
+$deadline = (Get-Date).AddSeconds(80)
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 3
+    $batch = @(Read-AppLog $WorkDir | Where-Object { $_ -match 'keybatch_lines=' })
+    if ($batch.Count -ge 1) { break }
+}
+$first = ($batch | Select-Object -First 1)
+Check 'one real flush handed its batch over and it was dispatched' ($batch.Count -ge 1) $first
+$noRecipient = @($batch | Where-Object { $_ -match 'plugins=0' })
+Check 'the dispatch had a recipient (plugins=0 would be a silent no-op)' (
+    ($batch.Count -ge 1) -and ($noRecipient.Count -eq 0)) $first
+Stop-App
+
 Show-Summary

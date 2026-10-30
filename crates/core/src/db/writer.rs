@@ -1847,33 +1847,48 @@ mod tests {
             *d.keys
                 .entry(20260101)
                 .or_default()
-                .entry("A".to_string())
+                .entry("wk1".to_string())
                 .or_insert(0) += 1;
             *d.keys
                 .entry(20260102)
                 .or_default()
-                .entry("B".to_string())
+                .entry("wk2".to_string())
                 .or_insert(0) += 1;
         }
         let merged = d.merged_key_deltas();
         assert_eq!(merged.len(), 2, "两个键该交两条，实得 {merged:?}");
         assert_eq!(
             merged,
-            vec![("A".to_string(), 10), ("B".to_string(), 10)],
+            vec![("wk1".to_string(), 10), ("wk2".to_string(), 10)],
             "增量该按键名相加（跨天的同一键也算在一起）"
         );
-        // 件口同样按键名相加，且取件一次取空
-        crate::plugins::manager::queue_key_batch(merged.clone());
-        crate::plugins::manager::queue_key_batch(merged);
-        let q = crate::plugins::manager::take_key_batches();
+    }
+
+    /// 件口按键名相加、取件一次取空。
+    ///
+    /// 只认自己那批（唯一前缀）：件口是**进程全局**的，同一个测试二进制里别的用例一落库
+    /// 就会往里投（现量：并行跑时捞到过别人留下的 `("A", 8)`）。断言全局内容等于自己那两个
+    /// 键，量的就不是自己的行为了。
+    #[test]
+    fn the_queue_merges_by_key_name_and_drains_once() {
+        let tag = "uniq_merge_7341";
+        let a = format!("{tag}a");
+        let b = format!("{tag}b");
+        crate::plugins::manager::queue_key_batch(vec![(a.clone(), 3i64), (b.clone(), 5i64)]);
+        crate::plugins::manager::queue_key_batch(vec![(a.clone(), 4i64)]);
+        let mine: Vec<(String, i64)> = crate::plugins::manager::take_key_batches()
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(tag))
+            .collect();
         assert_eq!(
-            q,
-            vec![("A".to_string(), 20), ("B".to_string(), 20)],
-            "两批同名键该并成一个数，不是排成四条"
+            mine,
+            vec![(a.clone(), 7), (b.clone(), 5)],
+            "同名键该并成一个数（3+4），而不是排成三条"
         );
+        let again = crate::plugins::manager::take_key_batches();
         assert!(
-            crate::plugins::manager::take_key_batches().is_empty(),
-            "取件必须一次取空，否则下一拍会重复投"
+            !again.iter().any(|(k, _)| k.starts_with(tag)),
+            "取件没把自己那批清空，下一拍会重复投: {again:?}"
         );
     }
 

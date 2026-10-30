@@ -2710,6 +2710,16 @@ impl App {
             return;
         };
         let names = pm.loaded_plugin_names();
+        // 这一行只在真的有批的时候出声（一拍一次、每十秒最多一条），它把"件口有货"与
+        // "有收件方"这两件事一次量清：缺了它，屏上那一栏是 0 时只能靠猜。
+        // ASCII 尾巴同上：验收脚本靠 `keybatch_lines=` 匹配。
+        tracing_note(&format!(
+            "攒批投递：{} 条增量 × {} 个已加载插件 keybatch_lines={} plugins={}",
+            batches.len(),
+            names.len(),
+            batches.len(),
+            names.len()
+        ));
         for (key, count) in &batches {
             for name in &names {
                 pm.plugin_key_event(name, key, *count);
@@ -2726,6 +2736,15 @@ impl App {
                 self.plugins_loaded = pm.load_all();
             }
         }
+        // 这一行是给"面板那栏为什么还是 0"留的读数：攒批有没有收件方，全看这里加载了几个。
+        // ASCII 尾巴 `plugins_loaded=` 是给验收脚本匹配的（PowerShell 5.1 读无 BOM 的 UTF-8
+        // .ps1 当 ANSI，脚本里放中文正则会把匹配本身读坏）。
+        let n = self
+            .pm
+            .as_ref()
+            .map(|pm| pm.loaded_plugin_names().len())
+            .unwrap_or(0);
+        tracing_note(&format!("启动加载插件：{n} 个 plugins_loaded={n}"));
     }
 
     /// 插件启用/停用：写。
