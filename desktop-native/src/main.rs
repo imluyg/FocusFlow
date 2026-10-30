@@ -2870,7 +2870,7 @@ impl App {
         let cell = rect(
             g.x_name - 4.0,
             y + 1.0,
-            g.x_count - g.x_name - 52.0,
+            device_name_width(&g) + 4.0,
             g.row_h - 3.0,
         );
         unsafe {
@@ -6666,6 +6666,10 @@ fn draw_placeholder_card(p: &P<'_>, r: D2D_RECT_F, text: &str) {
 }
 
 /// 左表的几何：画图与命中测试共用同一份，避免两处各算一套坐标。
+///
+/// 数字列一律给**右沿**、按右对齐画：这块 UI 不按矩形裁切（`NO_WRAP` 且不设
+/// `DWRITE_TRIMMING`），数一长就照画到下一列上。设备那一页「596,600」被「还原」
+/// 按钮盖住、屏上只剩「596,6」，就是列宽按左沿安排的结果。
 struct TableGeom {
     pad: f32,
     head_y: f32,
@@ -6674,8 +6678,29 @@ struct TableGeom {
     max_rows: usize,
     x_rank: f32,
     x_name: f32,
-    x_count: f32,
+    /// 次数列的右沿（键鼠 / 应用 / 分组三张榜）：右边 12 px 之外是占比列。
+    x_count_right: f32,
+    /// 设备页的次数列右沿：右边是「还原」那一整颗按钮，要再多让出 64 px。
+    x_count_right_ops: f32,
+    /// 最后一列的左沿（占比列 / 「改名」按钮）。
     x_last: f32,
+    /// 最后一列的右沿（占比）—— 与「改名」按钮的右沿同一格，四张榜看过去是一条线。
+    x_last_right: f32,
+}
+
+/// 数字列（次数 / 占比）的宽度。七个数字 + 两个千分位逗号在 11 号字下约 60 px，
+/// 96 留足了余量；更重要的是它让"列能装下多少"变成常量，不再随卡片宽度缩。
+const NUM_COL_W: f32 = 96.0;
+
+/// 设备页「设备名」那一列的宽度：右边依次是类型 48 + 12、次数 `NUM_COL_W`、8、
+/// 还原 58、6、改名 58。行文字、编辑中那圈框、原生 EDIT 的落点三处都读它。
+fn device_name_width(g: &TableGeom) -> f32 {
+    g.x_count_right_ops - NUM_COL_W - 12.0 - 48.0 - 12.0 - g.x_name
+}
+
+/// 键鼠 / 应用 / 分组三张榜的名字列宽度（次数列左边留 12 px）。
+fn name_col_width(g: &TableGeom) -> f32 {
+    g.x_count_right - NUM_COL_W - 12.0 - g.x_name
 }
 
 /// 排行页标题行里那两排胶囊。下标 0..1 = 视图（排行 / 分组），2..4 = 筛选（全部 / 键盘 / 鼠标）。
@@ -6732,10 +6757,13 @@ fn left_rows(snap: &Snapshot, view: usize, rank_tab: usize, rank_filter: usize) 
 fn table_geom(r: D2D_RECT_F) -> TableGeom {
     let pad = 12.0;
     let row_h = 24.0;
-    let head_y = r.top + 42.0;
+    // 标题行下面还有一行「其中 鼠标 … · 键盘 …」（见 `draw_dashboard` 那段），所以表头
+    // 比标题行内只有一句摘要时低 2 px，给那一行留出位置。
+    let head_y = r.top + 44.0;
     let list_top = head_y + 22.0;
     let foot_h = 26.0;
     let max_rows = (((r.bottom - foot_h - list_top) / row_h).floor() as usize).max(1);
+    let x_last = r.right - pad - 78.0;
     TableGeom {
         pad,
         head_y,
@@ -6744,8 +6772,10 @@ fn table_geom(r: D2D_RECT_F) -> TableGeom {
         max_rows,
         x_rank: r.left + pad + 10.0,
         x_name: r.left + pad + 56.0,
-        x_count: r.right - pad - 168.0,
-        x_last: r.right - pad - 78.0,
+        x_count_right: x_last - 12.0,
+        x_count_right_ops: x_last - 64.0 - 8.0,
+        x_last,
+        x_last_right: x_last + 58.0,
     }
 }
 
@@ -7214,9 +7244,10 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     // 滚动位置按当前页签的行数夹一次：数据变少时别停在空白处。
     let scroll = vs.scroll.min(count.saturating_sub(g.max_rows));
 
+    // 标题行比原来高 2px 起步：它下面还有一行鼠标/键盘（见下），那一行要落在表头上面。
     p.text(
         title,
-        rect(r.left + g.pad, r.top + 10.0, 120.0, 20.0),
+        rect(r.left + g.pad, r.top + 8.0, 120.0, 20.0),
         &p.fmt.body,
         &p.br.fg,
     );
@@ -7225,28 +7256,46 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         2 => queries::DOMAIN_DEVICES,
         _ => queries::DOMAIN_KEYS,
     };
-    let mut summary = if tab == 1 {
+    let summary = if tab == 1 {
         format!("共 {}", duration_text(total))
     } else {
         format!("共 {} 次", thousands(total.max(0) as u64))
     };
     // 键鼠那一屏多两个数：鼠标侧与键盘侧。写「其中」而不是把它们并成总数 ——
     // 未落库的那截（`pending`）还没归到任何一侧，折进键盘侧就是把没证的数报成实测。
-    if tab == 0 && !snap.rank.is_empty() {
-        summary.push_str(&format!(
-            " · 其中 鼠标 {} · 键盘 {}",
+    //
+    // 这一句**单独一行**摆：三个七位数塞进标题行那 220 px 里会顶到右边的胶囊上，而这块
+    // UI 不按矩形裁切 —— 超出去的字照画，胶囊后画就把「键盘 1,478,603」盖成「键盘 1,478,6」。
+    let split = if tab == 0 && !snap.rank.is_empty() {
+        format!(
+            "其中 鼠标 {} · 键盘 {}",
             thousands(snap.mouse_total.max(0) as u64),
             thousands(snap.keyboard_total.max(0) as u64)
-        ));
-    }
+        )
+    } else {
+        String::new()
+    };
     // 本栏那句"没读全"不写在这里：标题行这一格只有 220px，一条年度库的缺读理由就把它撑满，
     // 挤掉的是刚补的鼠标/键盘两个数。挪到同一张卡底下那条页脚去说（它宽得多，而且句子短了）。
     p.text(
         &summary,
-        rect(r.left + g.pad + 74.0, r.top + 12.0, 220.0, 18.0),
+        rect(r.left + g.pad + 74.0, r.top + 10.0, 220.0, 18.0),
         &p.fmt.small,
         &p.br.muted,
     );
+    if !split.is_empty() {
+        p.text(
+            &split,
+            rect(
+                r.left + g.pad,
+                r.top + 28.0,
+                r.right - r.left - g.pad * 2.0,
+                14.0,
+            ),
+            &p.fmt.small,
+            &p.br.muted,
+        );
+    }
     if tab == 0 {
         let pills = rank_pills(r);
         let (cap1, cap2) = rank_pill_captions(r);
@@ -7303,12 +7352,48 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         (0, 1) => ["序", "分组", "次数", "占比"],
         _ => ["排名", "键名", "次数", "占比"],
     };
-    let xs = [g.x_rank, g.x_name, g.x_count, g.x_last];
-    for (i, t) in heads.iter().enumerate() {
+    // 表头跟着数字那一列**右对齐**：列宽是定数，表头还从左沿摆的话会离自己那列远一截。
+    let count_right = if tab == 2 {
+        g.x_count_right_ops
+    } else {
+        g.x_count_right
+    };
+    p.text(
+        heads[0],
+        rect(g.x_rank, g.head_y + 3.0, 40.0, 18.0),
+        &p.fmt.small,
+        &p.br.muted,
+    );
+    p.text(
+        heads[1],
+        rect(
+            g.x_name,
+            g.head_y + 3.0,
+            count_right - NUM_COL_W - g.x_name,
+            18.0,
+        ),
+        &p.fmt.small,
+        &p.br.muted,
+    );
+    p.text(
+        heads[2],
+        rect(count_right - NUM_COL_W, g.head_y + 3.0, NUM_COL_W, 18.0),
+        &p.fmt.right,
+        &p.br.muted,
+    );
+    if tab == 2 {
+        // 「操作」盖住那两颗按钮（还原 + 改名），而不是只盖住「改名」那一格。
         p.text(
-            t,
-            rect(xs[i], g.head_y + 3.0, 90.0, 18.0),
-            &p.fmt.small,
+            heads[3],
+            rect(g.x_last - 64.0, g.head_y + 3.0, 58.0 + 6.0 + 58.0, 18.0),
+            &p.fmt.center_small,
+            &p.br.muted,
+        );
+    } else {
+        p.text(
+            heads[3],
+            rect(g.x_last, g.head_y + 3.0, g.x_last_right - g.x_last, 18.0),
+            &p.fmt.right,
             &p.br.muted,
         );
     }
@@ -7372,13 +7457,16 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         match tab {
             2 => {
                 let d = &snap.devices[idx];
+                // 类型与次数两格都从「次数列右沿」往回推，免得名字列一改宽、这两格还按旧数摆。
+                let count_x = g.x_count_right_ops - NUM_COL_W;
+                let kind_x = count_x - 12.0 - 48.0;
                 if vs.editing == Some(idx) {
                     // 编辑中：这一格由原生 EDIT 盖着，这里只画一圈边框。
                     p.round(
                         rect(
                             g.x_name - 4.0,
                             y + 1.0,
-                            g.x_count - g.x_name - 52.0,
+                            device_name_width(&g) + 4.0,
                             g.row_h - 3.0,
                         ),
                         4.0,
@@ -7388,7 +7476,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 } else {
                     p.text(
                         &d.name,
-                        rect(g.x_name, y + 3.0, g.x_count - g.x_name - 60.0, 18.0),
+                        rect(g.x_name, y + 3.0, device_name_width(&g), 18.0),
                         &p.fmt.body,
                         &p.br.fg,
                     );
@@ -7401,14 +7489,14 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 };
                 p.text(
                     kind,
-                    rect(g.x_count - 54.0, y + 5.0, 48.0, 16.0),
-                    &p.fmt.small,
+                    rect(kind_x, y + 5.0, 48.0, 16.0),
+                    &p.fmt.right,
                     &p.br.muted,
                 );
                 p.text(
                     &thousands(d.count.max(0) as u64),
-                    rect(g.x_count, y + 4.0, 70.0, 18.0),
-                    &p.fmt.small,
+                    rect(count_x, y + 4.0, NUM_COL_W, 18.0),
+                    &p.fmt.right,
                     &p.br.fg,
                 );
                 if d.has_alias {
@@ -7436,20 +7524,20 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 let share = share_text(*secs, snap.app_total);
                 p.text(
                     app,
-                    rect(g.x_name, y + 3.0, g.x_count - g.x_name - 12.0, 18.0),
+                    rect(g.x_name, y + 3.0, name_col_width(&g), 18.0),
                     &p.fmt.body,
                     &p.br.fg,
                 );
                 p.text(
                     &duration_text(*secs),
-                    rect(g.x_count, y + 4.0, 80.0, 18.0),
-                    &p.fmt.small,
+                    rect(g.x_count_right - NUM_COL_W, y + 4.0, NUM_COL_W, 18.0),
+                    &p.fmt.right,
                     &p.br.fg,
                 );
                 p.text(
                     &share,
-                    rect(g.x_last, y + 4.0, 60.0, 18.0),
-                    &p.fmt.small,
+                    rect(g.x_last, y + 4.0, g.x_last_right - g.x_last, 18.0),
+                    &p.fmt.right,
                     &p.br.muted,
                 );
             }
@@ -7461,20 +7549,20 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 let share = share_text(*n, snap.rank_share_base());
                 p.text(
                     name,
-                    rect(g.x_name, y + 3.0, 300.0, 18.0),
+                    rect(g.x_name, y + 3.0, name_col_width(&g), 18.0),
                     &p.fmt.body,
                     &p.br.fg,
                 );
                 p.text(
                     &thousands(*n as u64),
-                    rect(g.x_count, y + 4.0, 80.0, 18.0),
-                    &p.fmt.small,
+                    rect(g.x_count_right - NUM_COL_W, y + 4.0, NUM_COL_W, 18.0),
+                    &p.fmt.right,
                     &p.br.fg,
                 );
                 p.text(
                     &share,
-                    rect(g.x_last, y + 4.0, 60.0, 18.0),
-                    &p.fmt.small,
+                    rect(g.x_last, y + 4.0, g.x_last_right - g.x_last, 18.0),
+                    &p.fmt.right,
                     &p.br.muted,
                 );
             }
@@ -7483,20 +7571,20 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 let share = share_text(*n, snap.rank_share_base());
                 p.text(
                     key,
-                    rect(g.x_name, y + 3.0, 300.0, 18.0),
+                    rect(g.x_name, y + 3.0, name_col_width(&g), 18.0),
                     &p.fmt.body,
                     &p.br.fg,
                 );
                 p.text(
                     &thousands(*n as u64),
-                    rect(g.x_count, y + 4.0, 80.0, 18.0),
-                    &p.fmt.small,
+                    rect(g.x_count_right - NUM_COL_W, y + 4.0, NUM_COL_W, 18.0),
+                    &p.fmt.right,
                     &p.br.fg,
                 );
                 p.text(
                     &share,
-                    rect(g.x_last, y + 4.0, 60.0, 18.0),
-                    &p.fmt.small,
+                    rect(g.x_last, y + 4.0, g.x_last_right - g.x_last, 18.0),
+                    &p.fmt.right,
                     &p.br.muted,
                 );
             }
@@ -11548,6 +11636,54 @@ mod tray_menu_tests {
             assert!(
                 src.contains(&arm),
                 "托盘项 {id} 没有接它的那条臂（点下去不会有任何反应）"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod table_layout_tests {
+    use super::*;
+
+    /// 数字列（次数 / 占比）必须停在下一列的左沿之前，整张表也不许越过卡片右边距。
+    ///
+    /// 这块 UI 不按矩形裁切（`NO_WRAP`、不设 `DWRITE_TRIMMING`），列一旦比盒子宽，数字就
+    /// 直接画到下一列上 —— 设备那一页「596,600」被「还原」按钮盖住、屏上只剩「596,6」，
+    /// 就是他 2026-10-30 报的「直接被挡住了」。列宽改了却没人看这条时，症状只会是屏上那
+    /// 几个数缺一半，日志一个字都没有。
+    #[test]
+    fn the_numeric_columns_stop_before_the_next_one() {
+        for w in [1000.0f32, 1200.0, 1600.0] {
+            let card = left_card(w, 860.0);
+            let g = table_geom(card);
+            let restore = restore_button(&g, 0.0);
+            assert!(
+                g.x_count_right_ops < restore.left,
+                "w={w}: 次数列右沿 {} 顶到了「还原」{}",
+                g.x_count_right_ops,
+                restore.left
+            );
+            assert!(
+                g.x_count_right < g.x_last,
+                "w={w}: 次数列右沿 {} 顶到了占比列 {}",
+                g.x_count_right,
+                g.x_last
+            );
+            assert!(
+                g.x_last_right <= card.right - g.pad,
+                "w={w}: 最后一列的右沿 {} 越过了卡片右边距",
+                g.x_last_right
+            );
+            // 名字列先被挤扁：窗口窄到它装不下一个设备名时，该改的是窗口下限而不是继续缩。
+            assert!(
+                device_name_width(&g) >= 100.0,
+                "w={w}: 设备名那一列只剩 {} px",
+                device_name_width(&g)
+            );
+            assert!(
+                name_col_width(&g) >= 100.0,
+                "w={w}: 名字列只剩 {} px",
+                name_col_width(&g)
             );
         }
     }
