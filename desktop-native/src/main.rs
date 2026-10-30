@@ -2911,9 +2911,13 @@ impl App {
     /// 数据目录：交给资源管理器打开（不自己实现文件浏览）。
     /// 打开的是**当前生效**的数据根，不是程序目录 —— 两者一旦分开（用户改过数据文件夹），
     /// 按程序目录打开会让人以为数据没搬过去。
+    ///
+    /// 走 `reveal::open_dir` 而不是在这里自己起 Explorer：`data_home` 是允许手写成正斜杠
+    /// 形式的，而本机实测 `explorer C:/…`（含给它整串加引号那一版）开出来的是「文档」——
+    /// 不报错也不提示，屏上只多一个看错地方的窗口。斜杠那把尺子 core 里已经有一份。
     fn open_data_dir(&self) {
         let dir = focusflow_core::data_location::current_data_home();
-        match std::process::Command::new("explorer").arg(&dir).spawn() {
+        match focusflow_core::reveal::open_dir(&dir) {
             Ok(_) => tracing_note(&format!("打开数据目录：{}", dir.display())),
             Err(e) => tracing_note(&format!("打不开数据目录：{e}")),
         }
@@ -13420,6 +13424,36 @@ mod underline_tests {
         assert!(
             prod.contains(".measure(label, &p.fmt.body)"),
             "下划线没有量文字宽度：`P::measure` 那一处调用不见了"
+        );
+    }
+}
+
+#[cfg(test)]
+mod open_dir_tests {
+    /// 「打开数据目录」这个按钮不许自己起 Explorer。
+    ///
+    /// 症状只在 `data_home` 写成正斜杠形式时露出来（README 里就那么写着，core 也一路容忍）：
+    /// `explorer C:/…` 开出来的是「文档」，不报错、不提示，日志还写着「打开数据目录：C:/…」，
+    /// 于是用户以为数据在文档里。本机 2026-10-30 实测三种写法，只有反斜杠那一版开到目标。
+    /// 斜杠与引号那把尺子在 `focusflow_core::reveal` 里已经有一份了，这里只许调用。
+    #[test]
+    fn the_data_dir_button_reuses_the_explorer_ruler() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        let body = &prod[prod
+            .find("fn open_data_dir(")
+            .expect("open_data_dir 不见了")..];
+        let body = &body[..body
+            .find("\n    }")
+            .expect("open_data_dir 的函数体结束不见了")];
+        assert!(
+            body.contains("reveal::open_dir("),
+            "「打开数据目录」不再走 core 那把斜杠尺子: {body}"
+        );
+        assert!(
+            !body.contains("Command::new(\"explorer\")"),
+            "这里又自己起了一次 Explorer：斜杠与引号的规矩从此有两份"
         );
     }
 }

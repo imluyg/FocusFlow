@@ -52,21 +52,59 @@ pub fn scan_png(dir: &Path) -> Result<Option<PathBuf>, String> {
 
 /// 组装 `explorer.exe` 的参数：有文件就"打开所在目录并选中它"，没有就只开目录。
 ///
+/// 交回来的**就是 Explorer 将要看到的整串**，所以调用方必须 `raw_arg`，不许 `arg`
+/// （见 `reveal_last_screenshot`）—— std 会把里面的引号再转义一遍，那就回到下面这条事故。
+/// 原样传参不带来注入口子：Windows 的文件名里根本不允许出现 `"`，
+/// 所以这一串里除了我们自己加的那对引号不会有别的引号。
+///
 /// 两个会把失败**藏起来**的写法在这里一次做对：
 /// - 必须是反斜杠绝对路径。`E:/a/b.png` 这种正斜杠形式 Explorer 不认，
 ///   它会静默退化成"打开文档文件夹"，既不报错也不弹提示。
-/// - 引号只许包在整串外面，不许只包住路径（`/select,"E:\a b\c.png"` 走 CreateProcess
-///   时那对引号会留在参数里）。交给 `Command` 正常传参即可：std 在遇到空格时正是把
-///   **整个 token** 引起来。
+/// - 带空格时引号只许包住**路径本身**、留在 `/select,` 后面。本机 Win11 实测三种写法：
+///   `"/select,C:\ff reveal probe\...\snip_probe.png"`（整串被引起来，= `Command::arg` 的产物）
+///   ⇒ 开出来的是「文档」；`/select,"C:\ff reveal probe\...\snip_probe.png"` ⇒ 开到位；
+///   同一路径换成不带空格的目录则两种写法都对 —— 所以这一条只在带空格的路径上露出来，
+///   而 `data_home` 是允许手写的。
 pub fn explorer_args(dir: &Path, target: Option<&Path>) -> Vec<String> {
     // 两条分支都要过这把尺子。目录那一支不是次要路径：截图目录为空时走的就是它，
     // 而 `data_home` 是允许手写的（README 里就写着可以把 `[paths] data_home` 改成
     // `E:/…`）—— 只修文件那一支的话，"空目录 + 正斜杠配置"仍然是打开「文档」。
     let shown = |p: &Path| p.display().to_string().replace('/', "\\");
     match target {
-        Some(file) => vec![format!("/select,{}", shown(file))],
-        None => vec![shown(dir)],
+        Some(file) => vec![format!("/select,\"{}\"", shown(file))],
+        None => vec![format!("\"{}\"", shown(dir))],
     }
+}
+
+/// 把拼好的那几串**原样**交给 Explorer。
+fn spawn_explorer(args: &[String]) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("explorer");
+    for a in args {
+        // 原样交出去：`arg()` 会再把整串里的引号转义成 `\"`，而 Explorer 自己解析命令行、
+        // 不认那种写法 —— 那正是"路径带空格就打开文档"的那条事故（见 `explorer_args` 的实测）。
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.raw_arg(a);
+        }
+        #[cfg(not(windows))]
+        cmd.arg(a);
+    }
+    // Explorer 成功了也常返回非零（甚至 1），所以只看"能不能起进程"，
+    // 不等它、也不拿退出码当判据 —— 拿退出码判会把每次成功都记成失败。
+    let _child = cmd
+        .spawn()
+        .map_err(|e| format!("启动 explorer 失败：{e}（目标 {}）", args.join(" ")))?;
+    Ok(())
+}
+
+/// 在资源管理器里打开一个目录 —— 设置页「打开数据目录」与"最近截图"没有文件那一支共用。
+///
+/// 斜杠必须换：`data_home` 是允许手写成正斜杠形式的，而本机实测
+/// `explorer C:/…/ff-slash-probe`（以及给它整串加引号的那一版）开出来的是「文档」，
+/// 只有反斜杠那一版开到了目标目录。不报错、不提示，屏上只多一个**看错地方**的窗口。
+pub fn open_dir(dir: &Path) -> Result<(), String> {
+    spawn_explorer(&explorer_args(dir, None))
 }
 
 /// 直达最近一张截图。**返回值是给人看的落点描述**，调用方必须写进日志：
@@ -78,16 +116,7 @@ pub fn reveal_last_screenshot() -> Result<String, String> {
     let target = scan_png(&dir)
         .map_err(|why| format!("截图目录读不出来（{why}），本次没有打开资源管理器"))?;
     let args = explorer_args(&dir, target.as_deref());
-
-    let mut cmd = std::process::Command::new("explorer");
-    for a in &args {
-        cmd.arg(a);
-    }
-    // Explorer 成功了也常返回非零（甚至 1），所以只看"能不能起进程"，
-    // 不等它、也不拿退出码当判据 —— 拿退出码判会把每次成功都记成失败。
-    let _child = cmd
-        .spawn()
-        .map_err(|e| format!("启动 explorer 失败：{e}（目标 {}）", args.join(" ")))?;
+    spawn_explorer(&args)?;
     Ok(match target {
         Some(file) => format!("已在资源管理器里选中 {}", file.display()),
         None => format!("截图目录是空的，已打开 {}", dir.display()),
@@ -176,23 +205,49 @@ mod tests {
         );
     }
 
+    /// 带空格的路径：引号必须包住**路径本身**、留在 `/select,` 后面。
+    ///
+    /// 本机 Win11 实测（三种写法各开一次资源管理器，读新窗口的标题）：整串被引起来那种
+    /// ——也就是 `Command::arg` 遇到空格时的产物——开出来的是「文档」；引号在逗号后面那种
+    /// 才开到 `screenshots`。不带空格的目录两种都对，所以这条只在路径带空格时露出来。
     #[test]
-    fn explorer_args_use_backslashes_and_never_quote_the_path_only() {
-        let dir = Path::new(r"E:\data\screenshots");
-        let file = Path::new(r"E:/data/screenshots/snip_a.png");
-        assert_eq!(
-            explorer_args(dir, Some(file)),
-            vec![r"/select,E:\data\screenshots\snip_a.png".to_string()],
-            "正斜杠必须换成反斜杠：给 Explorer 正斜杠它会静默打开「文档」"
-        );
-        // 带空格的路径：我们只交出一个 token，引号由 std 在转义时包在整串外面
+    fn the_select_argument_quotes_the_path_after_the_comma() {
         let spaced = Path::new(r"E:\my data\screenshots\snip a.png");
-        let args = explorer_args(dir, Some(spaced));
-        assert_eq!(args.len(), 1);
-        assert!(args[0].starts_with("/select,"), "参数形状不该变");
+        assert_eq!(
+            explorer_args(Path::new(r"E:\data\screenshots"), Some(spaced)),
+            vec![r#"/select,"E:\my data\screenshots\snip a.png""#.to_string()],
+            "形状变了就等于回到\"打开文档\"那条事故"
+        );
+        // 正斜杠那一路也要过同一把尺子（`data_home` 允许手写成正斜杠）
+        assert_eq!(
+            explorer_args(
+                Path::new(r"E:\data\screenshots"),
+                Some(Path::new("E:/my data/screenshots/snip a.png"))
+            ),
+            vec![r#"/select,"E:\my data\screenshots\snip a.png""#.to_string()]
+        );
+    }
+
+    /// 接线腿：拼好的整串必须**原样**交给 Explorer。
+    /// 用回 `arg()` 的话 std 会把里面的引号转义成 `\"`，上面那条实测过的正确形状当场失效，
+    /// 而单元用例盯不到（它只看得见字符串，看不见最终那条命令行）。
+    #[test]
+    fn the_command_line_is_passed_verbatim_to_explorer() {
+        let src = include_str!("reveal.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        let body = &prod[prod
+            .find("fn spawn_explorer(")
+            .expect("spawn_explorer 不见了：两条路又各自起一次 Explorer 了")..];
         assert!(
-            !args[0].contains('"'),
-            "自己不许塞引号（塞在逗号后面是错的写法）"
+            body.contains("cmd.raw_arg(a)"),
+            "整串不再原样交出去了：std 会把里面的引号二次转义"
+        );
+        // 起 Explorer 的那一处只许有一个：两条路（选中文件 / 只开目录）共用同一把斜杠尺子。
+        assert_eq!(
+            prod.matches("Command::new(\"explorer\")").count(),
+            1,
+            "又出现第二处自己起 Explorer 的地方了"
         );
     }
 
@@ -201,20 +256,20 @@ mod tests {
         let dir = Path::new(r"E:\data\screenshots");
         assert_eq!(
             explorer_args(dir, None),
-            vec![r"E:\data\screenshots".to_string()]
+            vec![r#""E:\data\screenshots""#.to_string()]
         );
         // 目录那一支也要换斜杠：截图目录为空时走的就是这一支，而 `data_home` 允许手写
         // 成正斜杠形式（README 里就这么写着）。
         let slashed = Path::new("E:/data/screenshots");
         assert_eq!(
             explorer_args(slashed, None),
-            vec![r"E:\data\screenshots".to_string()],
+            vec![r#""E:\data\screenshots""#.to_string()],
             "正斜杠的目录也要换成反斜杠"
         );
         // 混合形式也不能漏（`E:/a\b` 这种真会出现：一半来自配置、一半来自 join）
         assert_eq!(
             explorer_args(Path::new("E:/data\\shots"), None),
-            vec![r"E:\data\shots".to_string()]
+            vec![r#""E:\data\shots""#.to_string()]
         );
     }
 }
