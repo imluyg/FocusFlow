@@ -17,7 +17,7 @@ if not defined CARGO_HOME (
 set PATH=%CARGO_HOME%\bin;%PATH%
 
 REM Version comes from desktop-native/Cargo.toml so there is only one place to bump.
-REM line looks like: version = "0.5.0" -> token 3 is the quoted version
+REM line looks like: version = "0.5.1" -> token 3 is the quoted version
 for /f "tokens=3 delims= " %%a in ('findstr /b "version" "%ROOT%desktop-native\Cargo.toml"') do (
     set VERSION=%%~a
 )

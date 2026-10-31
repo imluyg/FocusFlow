@@ -17,7 +17,7 @@ Unicode true
 ; 版本号：命令行 -DVERSION=… 优先（build_native.bat 传的是 Cargo.toml 里的真值），
 ; 这里的默认值只是让人能手工单独编译一次。
 !ifndef VERSION
-  !define VERSION "0.5.0"
+  !define VERSION "0.5.1"
 !endif
 !ifndef PUBLISHER
   !define PUBLISHER "FocusFlow"
