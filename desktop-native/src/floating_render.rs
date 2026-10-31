@@ -4,9 +4,11 @@
 //! 而卡片上那几个字、它们的透明度、落点该夹到哪，全是能在 `cargo test` 里钉住的纯函数。
 //!
 //! 这一份是从 P7 删掉的 `desktop/src/floating/render.rs` 搬过来的，删掉原生端当时没有的三样：
-//! **久坐提醒横带**（没有采集进程，谈不上连用多久）、**暂停角标**（同样，没地方暂停）、
+//! **久坐提醒横带**（当时没有采集进程，谈不上连用多久）、**暂停角标**（当时没地方暂停）、
 //! 以及「速度 /分」那一行 —— 原生端当时没有监听，速度无处可读。2026-10-27 采集接上之后，
 //! 卡片恢复成旧 WebView 版的「活跃 / 时长（可选）/ 速度」三格；目标百分比回到主窗口。
+//! ⚠ 三样里只有**久坐横带至今没有回来**（2026-10-31 现量：全仓没有读 `[rest]` 的生产代码），
+//! 暂停则改成画在速度那一格里（「暂停」两个字 + 去掉强调色），不是独立角标。
 //!
 //! 颜色与字体口径也回到旧版：`tokens.css` 的 `--font: "Segoe UI", "Microsoft YaHei"`，
 //! 标签与值同为 13px、行高 18、卡片 48（任务栏高度），只有层级靠颜色和右侧对齐。
@@ -420,6 +422,54 @@ pub fn overlay_text_coverage(buf: &mut [u8], text: &[u8], fg: Color) {
     }
 }
 
+/// 把"白字黑底"蒙版里**一块矩形**的覆盖度按 `fg` 叠到卡片上。
+///
+/// 为什么要有矩形版：一帧里所有文字现在**一次**画进同一张蒙版（`BeginDraw/EndDraw` 每帧一对
+/// 而不是每段一对 —— 现量每段一对约 1 ms、一帧约 6 对，是 `text` 段里最厚的一块），
+/// 于是蒙版里同时有好几段的字，各自颜色不同。拿整帧 + 单一颜色去叠，会把别人的字也涂了。
+///
+/// `rc` 是那一段字自己的矩形（`x/y` 起、`w/h` 尺寸，像素）；`stride_px` = 一行的像素数
+/// （整卡宽度）：它必须由调用方给 —— 蒙版与卡片都是整卡尺寸，而 `(长度/4)` 只是像素总数，
+/// 把它当行宽用会退化成"把整块缓冲当一行扫"，那种写法既不报错也没有意义
+/// （本场第一版就是这么写的）。
+pub fn overlay_text_coverage_rect(
+    buf: &mut [u8],
+    text: &[u8],
+    fg: Color,
+    stride_px: usize,
+    rc: Rect,
+) {
+    if buf.len() != text.len() || stride_px == 0 || rc.w <= 0 || rc.h <= 0 {
+        return;
+    }
+    let rows = buf.len() / (stride_px * 4);
+    if rows == 0 {
+        return;
+    }
+    let (xa, xb) = (
+        rc.x.clamp(0, stride_px as i32),
+        (rc.x + rc.w).clamp(0, stride_px as i32),
+    );
+    let (ya, yb) = (
+        rc.y.clamp(0, rows as i32),
+        (rc.y + rc.h).clamp(0, rows as i32),
+    );
+    for y in ya..yb {
+        let row_base = (y as usize) * stride_px;
+        for x in xa..xb {
+            let i = row_base + x as usize;
+            let cov = text[i * 4 + 2] as u16; // 白字黑底：R 通道即覆盖度
+            if cov == 0 {
+                continue;
+            }
+            let sr = (fg.r as u16 * cov) / 255;
+            let sg = (fg.g as u16 * cov) / 255;
+            let sb = (fg.b as u16 * cov) / 255;
+            over(buf, i, sr, sg, sb, cov);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +672,174 @@ mod tests {
         assert_eq!(buf[3], 232, "没字的地方仍是卡片的 .91");
         assert_eq!(buf[7], 255, "满覆盖的字完全不透明");
         assert_eq!(buf[6], 26, "字色 r=26 预乘 255 不变");
+    }
+
+    /// 矩形版只动自己那块：其它像素上明明有覆盖度，也不许被这个 run 的颜色涂到。
+    ///
+    /// 这是"一帧一次画完、再按矩形分别叠色"整套写法的承重墙 —— 蒙版里同时有好几段字，
+    /// 叠色一旦越出自己的矩形，症状是"小字单位 `/分` 的颜色跑到数字上"这种没人会报的错。
+    #[test]
+    fn rect_overlay_touches_only_its_own_box() {
+        let stride = 2usize;
+        let mut buf = vec![0u8; stride * 2 * 4];
+        let mut mask = vec![0u8; buf.len()];
+        for i in 0..4 {
+            mask[i * 4 + 2] = 255; // 四个像素全都满覆盖
+        }
+        // 先给卡片铺一层底色，才看得出"没被动过"
+        for i in 0..4 {
+            put_premultiplied(&mut buf, i, LIGHT.card, LIGHT.card.a);
+        }
+        let before = buf.clone();
+        overlay_text_coverage_rect(
+            &mut buf,
+            &mask,
+            LIGHT.fg,
+            stride,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+        );
+        assert_ne!(buf[0..4], before[0..4], "矩形里的像素要变色");
+        for i in 1..4 {
+            assert_eq!(
+                &buf[i * 4..i * 4 + 4],
+                &before[i * 4..i * 4 + 4],
+                "矩形外的像素 {i} 被涂了：叠色的边界不成立"
+            );
+        }
+    }
+
+    /// 整块矩形 == 整帧那一版：换写法不该换结果（同色同覆盖度下逐字节相同）。
+    #[test]
+    fn a_full_box_rect_matches_the_whole_frame_overlay() {
+        let stride = 3usize;
+        let rows = 2usize;
+        let mut a = vec![0u8; stride * rows * 4];
+        let mut b = a.clone();
+        let mut mask = vec![0u8; a.len()];
+        for i in 0..(stride * rows) {
+            mask[i * 4 + 2] = (i * 37 % 256) as u8; // 参差不齐的覆盖度
+            put_premultiplied(&mut a, i, LIGHT.card, LIGHT.card.a);
+        }
+        b.clone_from(&a);
+        overlay_text_coverage(&mut a, &mask, LIGHT.accent);
+        overlay_text_coverage_rect(
+            &mut b,
+            &mask,
+            LIGHT.accent,
+            stride,
+            Rect {
+                x: 0,
+                y: 0,
+                w: stride as i32,
+                h: rows as i32,
+            },
+        );
+        assert_eq!(a, b, "矩形版与整帧版在同一段覆盖度上必须逐字节相同");
+    }
+
+    /// 退化矩形、越界夹住、步长与缓冲不匹配、两块长度不等 —— 每一路都**什么都不动**，也不 panic。
+    #[test]
+    fn degenerate_boxes_and_bad_strides_are_no_ops() {
+        let stride = 2usize;
+        let base = {
+            let mut v = vec![0u8; stride * 2 * 4];
+            for i in 0..4 {
+                put_premultiplied(&mut v, i, LIGHT.card, LIGHT.card.a);
+            }
+            v
+        };
+        let mask = vec![255u8; base.len()];
+        let cases: Vec<(&str, Rect, usize)> = vec![
+            (
+                "负宽度",
+                Rect {
+                    x: 1,
+                    y: 0,
+                    w: -1,
+                    h: 9,
+                },
+                stride,
+            ),
+            (
+                "零宽",
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 9,
+                },
+                stride,
+            ),
+            (
+                "零高",
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 2,
+                    h: 0,
+                },
+                stride,
+            ),
+            (
+                "全在画面外",
+                Rect {
+                    x: -5,
+                    y: -3,
+                    w: 4,
+                    h: 2,
+                },
+                stride,
+            ),
+            (
+                "步长大到行数归零",
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 2,
+                    h: 2,
+                },
+                stride * 99,
+            ),
+        ];
+        for (tag, rc, st) in cases {
+            let mut buf = base.clone();
+            overlay_text_coverage_rect(&mut buf, &mask, LIGHT.fg, st, rc);
+            assert_eq!(buf, base, "{tag} 这一路不该动任何像素");
+        }
+        let mut short = base.clone();
+        overlay_text_coverage_rect(
+            &mut short,
+            &mask[..8],
+            LIGHT.fg,
+            stride,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+        );
+        assert_eq!(short, base, "两块缓冲长度不等时宁可什么都不做");
+        // 越界但画面内还剩一格：夹住之后那一格仍然该被叠上（不许整块放弃）
+        let mut clipped = base.clone();
+        overlay_text_coverage_rect(
+            &mut clipped,
+            &mask,
+            LIGHT.fg,
+            stride,
+            Rect {
+                x: -1,
+                y: -1,
+                w: 2,
+                h: 2,
+            },
+        );
+        assert_ne!(clipped, base, "夹住后画面内那一格应该被叠上");
     }
 
     #[test]
