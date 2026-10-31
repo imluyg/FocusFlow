@@ -276,7 +276,7 @@ function New-AppDir([string]$Dest, [string[]]$ConfigAppend = @()) {
     # here rather than in twelve suites. The probe fixture deliberately keeps the key ON: that
     # way every green suite run is also proof this line works. A caller that wants the hidden
     # path passes its own [gui] block -- the parser lets the LAST section win, so it overrides us.
-    $lines_add = @('[gui]', 'start_to_tray = false') + $ConfigAppend
+    $lines_add = @('[gui]', 'start_to_tray = false', 'trace_log = true') + $ConfigAppend
     if ($lines_add.Count -gt 0) {
         $cfg = Join-Path $Dest 'config.ini'
         $lines = [System.Collections.Generic.List[string]](Get-Content $cfg -Encoding UTF8)

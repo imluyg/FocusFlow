@@ -9615,16 +9615,72 @@ fn quit_app(hwnd: HWND) {
     }
 }
 
-/// GUI 程序没有控制台，出错时留一份文件，别静默消失。
+/// GUI 的诊断日志（没有控制台时的"留一份现场"）。
+///
+/// 它不是结构性日志：那份按天滚在 `logs/` 下、带时间戳与级别（`logger::init_logging`，
+/// 保留最近 4 个文件）。这一份落在**进程当前目录**（快捷方式起始位置正常时就是程序目录），
+/// 内容是心跳、点击、截图事件这类原始流水，给现场排查用。
+///
+/// **默认关**，开关是设置页「高级 → 诊断日志」（`[gui] trace_log`）：读点就是这里，
+/// 改完下一行立刻生效。关着时一行都不写 —— 它是排查用的，不是产品功能。
+///
+/// 体积有上限：超过 `MAX_LOG_BYTES` 就把当前内容挪成 `focusflow.log.1`（覆盖上一份），
+/// 再从空文件写起 —— 总量最多两倍。没有这道闸时它是纯追加的：心跳每 5 秒一行、插件攒批
+/// 最多每 10 秒一行，一台常开的机器一天一二百 KB，几个月就是几 MB，而且没人会去删。
 fn tracing_note(msg: &str) {
     use std::io::Write;
+    if !focusflow_core::config::instance().get_bool("gui", "trace_log", false) {
+        return;
+    }
+    /// 单文件上限：512 KiB 装得下约一天半的心跳与事件（心跳约 13 KB/小时）。
+    const MAX_LOG_BYTES: u64 = 512 * 1024;
+    // 多个线程都会写（UI / 截图 / 悬浮窗 / 采集）：轮转期间必须互斥，否则一个线程刚把
+    // 文件改名，另一个还拿着旧句柄往"已经挪走"的那份里写 —— 新文件反而少了这一段。
+    static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = std::path::Path::new("focusflow.log");
+    rotate_log_if_oversized(path, std::path::Path::new("focusflow.log.1"), MAX_LOG_BYTES);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("focusflow.log")
+        .open(path)
     {
         let _ = writeln!(f, "{msg}");
     }
+}
+
+/// 超过上限就把 `path` 挪成 `rotated`（覆盖旧的）；挪不动就原地截断。
+/// 两种结局都保证下一行从空文件写起，不再无限长。返回是否真的轮转过（测试用）。
+fn rotate_log_if_oversized(
+    path: &std::path::Path,
+    rotated: &std::path::Path,
+    max_bytes: u64,
+) -> bool {
+    let oversized = std::fs::metadata(path)
+        .map(|m| m.len() >= max_bytes)
+        .unwrap_or(false);
+    if !oversized {
+        return false;
+    }
+    match std::fs::remove_file(rotated) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            // 旧备份删不掉（被占用/是个目录）：这次改不了名，先原地截断。
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path);
+            return true;
+        }
+    }
+    if std::fs::rename(path, rotated).is_err() {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path);
+    }
+    true
 }
 
 // ===== 窗口过程 =====
@@ -14369,5 +14425,52 @@ mod main_window_state_tests {
             flat.contains("ifunsafe{IsIconic(hwnd)}.as_bool(){let_=ShowWindow(hwnd,SW_RESTORE);}"),
             "唤窗又变成无条件 SW_RESTORE 了：最大化好的窗口会被压回普通尺寸"
         );
+    }
+}
+
+#[cfg(test)]
+mod log_rotation_tests {
+    use super::*;
+
+    /// 这份诊断日志是纯追加的（心跳每 5 秒一行），不设上限就会一直长。
+    /// 轮转只有两种结局：改名成功（旧内容整份进 `.1`）或原地截断；第三种"什么都不做、
+    /// 继续往后写"就是缺陷本身。第二条判据盯的是一次只留一份备份 —— 绝不越堆越多。
+    #[test]
+    fn an_oversized_note_log_is_rotated_and_keeps_a_single_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "ff_logrot_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("focusflow.log");
+        let rotated = dir.join("focusflow.log.1");
+
+        std::fs::write(&path, vec![b'x'; 2048]).unwrap();
+        assert!(
+            !rotate_log_if_oversized(&path, &rotated, 4096),
+            "没到上限不许动"
+        );
+
+        assert!(rotate_log_if_oversized(&path, &rotated, 1024));
+        let rotated_len = std::fs::metadata(&rotated).unwrap().len();
+        assert_eq!(rotated_len, 2048, "旧内容要整份进 .1");
+        assert!(
+            !path.exists() || std::fs::metadata(&path).unwrap().len() == 0,
+            "轮转后主文件要重新开始，不能留着旧内容继续长"
+        );
+
+        // 再来一轮：旧备份被覆盖，而不是又长出 .2/.3。
+        std::fs::write(&path, vec![b'y'; 2048]).unwrap();
+        assert!(rotate_log_if_oversized(&path, &rotated, 1024));
+        let again = std::fs::read(&rotated).unwrap();
+        assert_eq!(again.len(), 2048);
+        assert_eq!(again[0], b'y', "备份里应当是最近一轮的内容");
+        assert!(!dir.join("focusflow.log.2").exists(), "只留一份备份");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

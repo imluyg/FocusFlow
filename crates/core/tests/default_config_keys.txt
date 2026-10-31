@@ -17,6 +17,7 @@ gui/active_refresh_interval
 gui/floating_metric
 gui/start_to_tray
 gui/theme
+gui/trace_log
 hotkey/enabled
 hotkey/snip
 hotkey/snip_annotate

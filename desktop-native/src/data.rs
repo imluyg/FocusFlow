@@ -272,6 +272,14 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         "设备分别统计",
         "设备 · 按键盘/鼠标设备分别计数（Raw Input）",
     ),
+    (
+        "gui",
+        "trace_log",
+        0,
+        "改完立即生效",
+        "诊断日志",
+        "调试 · 开＝把界面事件与心跳写进 focusflow.log（超 512 KiB 轮转）",
+    ),
 ];
 
 fn load_settings() -> Vec<SettingRow> {

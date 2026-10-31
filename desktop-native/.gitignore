@@ -4,6 +4,7 @@
 /target/
 /*.png
 focusflow.log
+focusflow.log.1
 
 # 验收跑批的临时 app 目录（数据 + 截图）
 /accept/

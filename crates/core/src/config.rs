@@ -108,6 +108,12 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             // 悬浮窗显示口径：times / duration / both（原生端有读点：`desktop-native/src/floating.rs`
             // 取出来交给 `floating_render::metric_from`，别的值一律当 times）
             ("floating_metric", "times"),
+            // 诊断流水（GUI 侧的 `tracing_note`，落程序目录的 focusflow.log）总开关。
+            // 默认**关**：那份文件是给排查用的原始事件流（心跳、点击、截图），不是产品功能；
+            // 常开就会在程序目录里攒出一个没人读的文件。设置页「高级」那一行能打开它，
+            // 打开/关掉都是下一行立刻生效（读点是 `tracing_note` 自己）。
+            // 验收套件的夹具在 `accept-lib.ps1` 的 New-AppDir 里显式追加 `trace_log = true`。
+            ("trace_log", "false"),
         ],
     );
     s(
