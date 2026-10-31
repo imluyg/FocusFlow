@@ -46,7 +46,10 @@ Check 'desktop shortcut created' (Test-Path $desktopLnk) ''
 Check 'start menu folder created' (Test-Path $startMenu) ''
 Check 'HKCU uninstall key created' (Test-Path $uninstallKey) ''
 $ver = if (Test-Path $uninstallKey) { (Get-ItemProperty $uninstallKey).DisplayVersion } else { '' }
-Check 'uninstall key carries the version' ($ver -eq '0.5.0') "DisplayVersion=$ver"
+# Expected number comes from the setup we just built, not a second hardcoded copy: pinning it
+# here made the first release after the pin go red with a perfectly correct installer.
+$setupVer = "$(([Diagnostics.FileVersionInfo]::GetVersionInfo($Setup)).FileVersion)"
+Check 'uninstall key carries the version' ($ver -eq $setupVer -and $ver.Length -gt 0) "DisplayVersion=$ver setup=[$setupVer]"
 
 Add-Type -AssemblyName System.Drawing
 $ico = [System.Drawing.Icon]::ExtractAssociatedIcon((Join-Path $inst 'FocusFlow.exe'))
@@ -62,7 +65,6 @@ $ico.Dispose()
 $viSetup = [Diagnostics.FileVersionInfo]::GetVersionInfo($Setup)
 $viExe = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $inst 'FocusFlow.exe'))
 $exeVer = "$($viExe.FileVersion)"
-$setupVer = "$($viSetup.FileVersion)"
 Check 'installed exe carries a version resource' ($exeVer.Length -gt 0) "exe=[$exeVer] setup=[$setupVer]"
 Check 'installed exe version matches the installer' ($exeVer -eq $setupVer -and $exeVer.Length -gt 0) "exe=[$exeVer] setup=[$setupVer]"
 
