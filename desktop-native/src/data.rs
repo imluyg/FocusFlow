@@ -144,11 +144,15 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         "滚轮合并（秒）",
         "键鼠 · 连续滚动只记一批，防止一滚刷几百次",
     ),
+    // ⚠ 这六格写"没这条功能，改了不生效"而不是"改完立即生效"：原生重写之后没有任何生产
+    // 代码读 `[rest]`（久坐横带没实现，2026-10-31 又把 `core::stats::RestMonitor` 那份零调用方
+    // 的判定一起摘掉了）。本文件上面的文档写着本页的原则是"原生端根本不读的旧键不再暴露"，
+    // 而删掉这六格与把它接回来是两句产品口径，等用户点；这里先停止在屏上许诺一个不存在的功能。
     (
         "rest",
         "enabled",
         0,
-        "改完立即生效",
+        "没这条功能，改了不生效",
         "休息提醒",
         "休息 · 连续用键鼠太久时提醒你歇一会儿",
     ),
@@ -156,7 +160,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         "rest",
         "window_minutes",
         1,
-        "改完立即生效",
+        "没这条功能，改了不生效",
         "提醒窗口（分钟）",
         "休息 · 在多长时间内累计输入量",
     ),
@@ -164,7 +168,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         "rest",
         "key_threshold",
         1,
-        "改完立即生效",
+        "没这条功能，改了不生效",
         "触发阈值（次）",
         "休息 · 窗口内输入超过这个次数就提醒",
     ),
@@ -172,7 +176,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         "rest",
         "cooldown_minutes",
         1,
-        "改完立即生效",
+        "没这条功能，改了不生效",
         "提醒间隔（分钟）",
         "休息 · 两次提醒之间至少隔多久",
     ),
@@ -180,7 +184,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         "rest",
         "rest_seconds",
         1,
-        "改完立即生效",
+        "没这条功能，改了不生效",
         "建议休息（秒）",
         "休息 · 提醒后建议离开屏幕的时间",
     ),
@@ -188,7 +192,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         "rest",
         "check_interval",
         1,
-        "改完立即生效",
+        "没这条功能，改了不生效",
         "检查间隔（分钟）",
         "休息 · 多久检查一次要不要提醒",
     ),
@@ -482,6 +486,31 @@ pub fn rank_break(rows: &HashMap<String, i64>, total: i64) -> RankBreak {
         groups,
         mouse_total,
         keyboard_total: total - mouse_total,
+    }
+}
+
+/// 只有悬浮窗一个读者时那一拍该问的东西 —— 与 [`load`] 差在查询面，不差在口径。
+///
+/// 卡片那三格的出处是现量过的：「活跃」当场问 `collect::today_total()`（内存原子，
+/// 采集没开着才退到库里那一问），「速度」问 `collect::cpm()`（同一份 60 秒滑窗），
+/// 只有「时长」需要一条 SQL。所以这里就只跑那一问：现量 0.4 ms／2 条，
+/// 而 [`load`] 的今日档是 6.3 ms／10 条、总计档 49.5 ms／17 条
+/// （`crates/core/tests/perf_probe.rs` 的 `pill_arms` 与 `tick_arms`，条数由
+/// `connection::stmt_meter` 现量，不是手算）。
+///
+/// ⚠ 交回的是**半成品**：除 `today` 与 `today_app_seconds` 之外全是默认值。
+/// 调用方只许把它推给卡片；整份替掉面板那份快照就是把"没查"念成"是 0"，
+/// 那一族的反面（给了薄数据却念成全量）正是本仓一直在挡的形状。
+pub fn load_card_only() -> Snapshot {
+    let today = match crate::collect::today_total() {
+        Some(n) => n,
+        None => queries::get_today_count(None),
+    };
+    Snapshot {
+        period: -1,
+        today,
+        today_app_seconds: queries::get_app_stats(Some(1), None).0,
+        ..Default::default()
     }
 }
 
@@ -1041,11 +1070,25 @@ mod chart_window_tests {
     #[test]
     fn the_today_app_seconds_reuses_the_rank_read_when_the_window_is_the_same() {
         let prod = prod();
+        // 数的是**面板那一拍内部**的入口。整篇只许一处是旧写法：2026-10-31 加了
+        // `load_card_only()`（只有卡片一个读者时那一拍）之后，全篇确实有了第二处，
+        // 而那一支根本不跑排行 —— 同一次读数里并不存在"同一窗口扫两遍"。
+        // 所以判据挪到它真正管的范围：`load()` 自己那一身。摘掉去重分支照样红。
+        let at = prod
+            .find("pub fn load(period: i64) -> Snapshot {")
+            .expect("面板那一拍的入口不见了");
+        let load_body = &prod[at..at + prod[at..].find("\n}").expect("load 的函数体没收尾")];
         let today_entry = ["get_app_stats", "(Some(1)"].concat();
         assert_eq!(
-            prod.matches(today_entry.as_str()).count(),
+            load_body.matches(today_entry.as_str()).count(),
             1,
-            "今日那一问的入口只许一处；出现第二处就是又扫了一遍同一个窗口"
+            "今日那一问在 `load()` 里出现了第二处：同一个窗口又被扫了两遍"
+        );
+        assert_eq!(
+            prod.matches(today_entry.as_str()).count(),
+            2,
+            "全篇该有两处：面板那一拍与卡片那一拍各一处 —— 少一处说明薄臂不再问时长，\
+             多一处说明有人往 `load()` 里加了第二遍"
         );
         assert!(
             prod.contains(
@@ -1055,6 +1098,43 @@ mod chart_window_tests {
             ),
             "「窗口相同就不另问」那道分支不见了 —— 剩下那一问会变成无条件重复扫。\
              （另一半不用钉：`else` 那支要是被删，`today_app_seconds` 就没定义，编不过）"
+        );
+    }
+
+    /// 卡片那一拍只许问它那两问 —— 与 `main.rs::readers` 那三档是同一件事的两面。
+    ///
+    /// 为什么这条值得钉：`load_card_only()` 里要是哪天混进面板那一臂（排行、三份切面、
+    /// 设备榜、应用榜、打卡条、设置清单），**屏幕上什么都看不出来** —— 卡片照样是对的，
+    /// 只是用户全天挂着卡片时又回到整批的账上。那两个数都是现量的：
+    /// 卡片 0.4 ms／2 条 vs 今日档 6.3 ms／10 条、总计档 49.5 ms／17 条
+    /// （`crates/core/tests/perf_probe.rs` 的 `pill_arms` / `tick_arms`）。
+    #[test]
+    fn the_card_only_tick_asks_only_the_card_question() {
+        let src = include_str!("data.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let at = prod
+            .find("pub fn load_card_only() -> Snapshot {")
+            .expect("卡片那一问的入口不见了");
+        let body = &prod[at..at + prod[at..].find("\n}").expect("函数体没收尾")];
+        for banned in [
+            "stats_totals(",
+            "get_alltime_max_day(",
+            "daily_counts_windows(",
+            "hourly_window_totals(",
+            "device_totals(",
+            "app_stats_totals(",
+            "load_settings(",
+            "goal_status(",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "卡片那一拍里出现了面板那一臂 {banned}：整批查询又被带回常驻态"
+            );
+        }
+        assert!(
+            body.contains("get_app_stats(Some(1), None)") && body.contains("get_today_count(None)"),
+            "卡片那一拍不再问它该问的那两格（今日前台时长 / 采集没开时的今日退路）"
         );
     }
 }

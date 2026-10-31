@@ -877,6 +877,24 @@ fn boot_notice(
         .or(file_log_failure)
 }
 
+/// 收进托盘：藏窗口，**并且**放掉渲染目标。
+///
+/// 为什么这一步要跟着隐藏走（2026-10-31 分臂现量）：面板被画过一次之后再收进托盘，
+/// 静置 60 秒仍是 `WS 49.8 / 私有 57.7 / 57 线程`，与"正显示着"那一读数一字不差；
+/// 而"面板从未画过"那一臂是 `39.8 / 41.5 / 21~23`。也就是说两张整窗 BGRA 背板、
+/// 二十来支 D2D 画刷和三十几条图形栈线程会全天陪着进程，只因为用户开过一次面板 ——
+/// 常驻私有提交因此多 **16.2 MB**，正是"开过一次就回不到起点"在原生版里剩下的那一份。
+///
+/// 显示那一边不用补什么：`ensure_target` 本来就按 `target.is_none()` 重建（与
+/// `WM_DPICHANGED` 走同一条路），代价是唤回面板时重建一次渲染目标，那一下的毫秒数
+/// 由屏证与读数说话，不在这里猜。
+fn hide_to_tray(app: &mut App, hwnd: HWND) {
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    app.drop_target();
+}
+
 /// 开机之后「全局热键」那一格显示开还是关：跟着**真正注册上的组合**走，不跟着配置键走。
 ///
 /// 两个理由：① 配置说开而三条一条都没注册上（全被别的程序占了），屏上写"开"就是假话；
@@ -886,24 +904,42 @@ fn hotkeys_on_after_boot(registered: [&Option<HotKey>; 3]) -> bool {
     registered.iter().any(|hk| hk.is_some())
 }
 
-/// 有没有人在看这些数。读者只有三个：主窗口（可见且没最小化）、桌面那张卡片，
-/// 以及托盘 tooltip 上那句"今日 N 次"——它只在鼠标悬停那一刻被读到，所以由
-/// `TrayIconEvent::Enter` 现问，不需要轮询养着。
+/// 谁在看这些数：面板（可见且没最小化）、只有卡片，或者没人。
 ///
-/// 三者都不成立 ⇒ 快照线程那一整批聚合查询一拍都不该跑。以前这里**没有任何**可见性
-/// 判断（`IsWindowVisible`/`IsIconic` 全文零命中）：程序收进托盘、卡片也关着，
-/// 仍然每 2 秒查一轮。那一拍值多少毫秒、多少条语句，只在下面 `LONG_PERIOD_TICKS`
-/// 那一段写一处（数出自 `crates/core/tests/perf_probe.rs`），这里不抄第二份。
-fn watching(main_visible: bool, main_iconic: bool, pill_visible: bool) -> bool {
-    (main_visible && !main_iconic) || pill_visible
+/// 托盘 tooltip 上那句"今日 N 次"不算读者——它只在鼠标悬停那一刻被读到，由
+/// `TrayIconEvent::Enter` 现问采集侧那个原子计数，不需要轮询养着。
+///
+/// 为什么把"有人看"再分成两档：现量（`crates/core/tests/perf_probe.rs` 的 `pill_arms`）
+/// 说卡片只要两个数，而它们里外都不查库或只查一问 —— 「活跃」当场问
+/// `collect::today_total()`、「速度」问 `collect::cpm()`，只有「时长」需要
+/// `get_app_stats(Some(1))`（0.4 ms／2 条）。而 `data::load()` 那一拍是为面板画的：
+/// 两份排行、三份时间切面、设备榜、应用榜、打卡条、29 行设置清单
+/// （今日档 6.3 ms／10 条、总计档 49.5 ms／17 条，唯一一份数字写在下面
+/// `LONG_PERIOD_TICKS` 那一段，这里不抄第二份）。用户的常驻态恰好就是"只有卡片"，
+/// 所以旧的那两档形状让整批面板查询全天在跑。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Readers {
+    None,
+    Card,
+    Panel,
+}
+
+fn watching(main_visible: bool, main_iconic: bool, pill_visible: bool) -> Readers {
+    if main_visible && !main_iconic {
+        Readers::Panel
+    } else if pill_visible {
+        Readers::Card
+    } else {
+        Readers::None
+    }
 }
 
 /// 没人看时用来等"有人回来"的那一小片：250ms 是"点开窗口到第一帧新数"的最坏等待，
 /// 空转时的代价只是一次 `IsWindowVisible`。
 const IDLE_WAKE_MS: u64 = 250;
 
-/// 现问一次"有没有人在看"。判据在 `watching`（那条有单元测试），这里只取三个读数。
-fn watching_now(hwnd: HWND) -> bool {
+/// 现问一次"谁在看"。判据在 `watching`（那条有单元测试），这里只取三个读数。
+fn watching_now(hwnd: HWND) -> Readers {
     unsafe {
         watching(
             IsWindowVisible(hwnd).as_bool(),
@@ -1166,7 +1202,8 @@ impl App {
                             ),
                             p.load(std::sync::atomic::Ordering::Relaxed),
                         );
-                        if !watching_now(hwnd) {
+                        let mut r = watching_now(hwnd);
+                        if r == Readers::None {
                             // 没人看 ⇒ 整批聚合查询一拍都不跑，只按小片睡等有人回来。
                             if !idle {
                                 // 只在**跨过边界**那一次出声：这条既是给他看的"程序没在空转"，
@@ -1199,10 +1236,27 @@ impl App {
                                     std::thread::sleep(Duration::from_millis(left));
                                 }
                             }
-                            if !watching_now(hwnd) {
+                            r = watching_now(hwnd);
+                            if r == Readers::None {
                                 // 睡这一拍期间窗口又被藏起来了：整批查询省掉。
                                 continue;
                             }
+                        }
+                        // 只有卡片一个读者 ⇒ 只问它那一问（现量 0.4 ms／2 条，而面板那一拍
+                        // 今日 6.3 ms／10 条、总计 49.5 ms／17 条）。共享快照里只就地补写
+                        // 卡片之外还有人读的那两格（托盘 tooltip 的退路、验收状态行、
+                        // 启动那次 make_tray），其余一律不动 —— 那是面板现身那一拍的账，
+                        // 而唤窗那一下会 `poke_snapshot()`，所以下一拍当场就是整批。
+                        if r == Readers::Card {
+                            let thin = data::load_card_only();
+                            last_query = std::time::Instant::now();
+                            publish_floating(&thin);
+                            floating::refresh();
+                            if let Ok(mut g) = s.lock() {
+                                g.today = thin.today;
+                                g.today_app_seconds = thin.today_app_seconds;
+                            }
+                            continue;
                         }
                         let next = data::load(p.load(std::sync::atomic::Ordering::Relaxed));
                         last_query = std::time::Instant::now();
@@ -9349,6 +9403,24 @@ fn start_to_tray_cfg() -> bool {
 }
 
 unsafe fn bring_to_front(hwnd: HWND) {
+    // 显示**之前**先把渲染目标建好并画完整一帧。
+    //
+    // 为什么必须有这一步：收进托盘时 `hide_to_tray` 把目标放掉了，此刻 DWM 手里没有旧内容
+    // 可以显示。先显示再等 `WM_PAINT` 的话，屏上会出现一小段"只有底色、没有内容"的面板 ——
+    // 2026-10-31 连拍现量到 9 帧、t=19 ms 起约 110 ms（`.scratch/hide_show_first_frame.ps1`；
+    // 同一块屏幕位置在窗口还藏着时 diff_vs_reference=0.449，证明那不是桌面透出来，
+    // 而是一块画了底、没画内容的表面）。
+    //
+    // 代价由这一侧付：建目标 + 画一帧落在"按下唤出"与"窗口出现"之间，用户看到的是打开略慢，
+    // 而不是一眼能看见的白面板 —— 这正是接这条改动时定下的取舍。
+    //
+    // `app_ptr` 交回的是共享引用，换写法与下面 `apply_glass` 那一处一致（同一时刻只有这条
+    // 路径在改 App，且消息循环单线程）。
+    if let Some(app) = app_ptr(hwnd) {
+        if let Some(app) = (app as *const App as *mut App).as_mut() {
+            app.draw(hwnd);
+        }
+    }
     let _ = ShowWindow(hwnd, SW_SHOW);
     // 只在**真的最小化**时还原：`SW_RESTORE` 对最大化的窗口是"还原成普通尺寸"，
     // 无条件调用会把用户最大化好的窗口在唤出时压回普通档。
@@ -10509,9 +10581,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                             }
                         }
                     } else if app.edit_target.is_none() {
-                        unsafe {
-                            let _ = ShowWindow(hwnd, SW_HIDE);
-                        }
+                        hide_to_tray(app, hwnd);
                     }
                 }
                 return LRESULT(0);
@@ -10520,8 +10590,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
         WM_CLOSE => {
             // 关窗口 = 收进托盘（真正退出走托盘菜单），与旧版同一口径。
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+            // 收起来顺手放掉渲染目标：见 `hide_to_tray` 那一段现量（开过一次面板就全天
+            // 多占 16.2 MB 私有提交 + 三十几条图形栈线程）。
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                hide_to_tray(app, hwnd);
+            } else {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
             }
             LRESULT(0)
         }
@@ -11557,16 +11633,33 @@ mod snapshot_rate_tests {
     /// 三个读者都不在 ⇒ 那一拍不查。这条判据写歪的两种症状方向相反、都不好抓：
     /// 多认一个"看得见"⇒ 收进托盘还在空转（省不下任何东西）；少认一个 ⇒ 卡片开着却不更新
     /// （数字冻住，比慢更糟）。所以五种组合逐个钉。
+    ///
+    /// 2026-10-31 起它不再回 bool 而是回 `Readers`：卡片一个人挂着时**必须**是 `Card`
+    /// 而不是 `Panel` —— 判成 `Panel` 的症状是"整批面板查询全天在跑"（现量今日档 10 条
+    /// 语句，而卡片只要 2 条），反过来判成 `None` 的症状是卡片数字冻住。
     #[test]
     fn polling_stops_only_when_nobody_is_watching() {
-        assert!(watching(true, false, false), "主窗口开着就要查");
-        assert!(watching(true, false, true), "窗口与卡片都开着");
-        assert!(
-            watching(false, false, true),
-            "主窗口收进托盘、卡片还开着 ⇒ 仍然要查（卡片是直接看的那个）"
+        assert_eq!(
+            watching(true, false, false),
+            Readers::Panel,
+            "主窗口开着就要查整批"
         );
-        assert!(!watching(true, true, false), "最小化＝没人看");
-        assert!(!watching(false, false, false), "隐藏且卡片关着＝一拍都不查");
+        assert_eq!(
+            watching(true, false, true),
+            Readers::Panel,
+            "窗口与卡片都开着 ⇒ 按最宽的那个读者算"
+        );
+        assert_eq!(
+            watching(false, false, true),
+            Readers::Card,
+            "主窗口收进托盘、卡片还开着 ⇒ 只查卡片那一问（卡片是直接看的那个）"
+        );
+        assert_eq!(watching(true, true, false), Readers::None, "最小化＝没人看");
+        assert_eq!(
+            watching(false, false, false),
+            Readers::None,
+            "隐藏且卡片关着＝一拍都不查"
+        );
     }
 
     /// 接线腿：那把判据真的被快照线程用上了，而且**睡完还要再问一次**（睡这一拍的期间
@@ -11581,6 +11674,26 @@ mod snapshot_rate_tests {
             prod.matches(call.as_str()).count(),
             3,
             "一处定义 + 循环里两处（睡前、睡完）——数量变了说明接线动过"
+        );
+        // 三档真的各有出口：`Card` 那一支必须把整批 `data::load` 换掉并当场 continue，
+        // 少了那次 continue，卡片那一拍查完之后还是会跑整批 —— 数照旧、白加一问。
+        let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("ifr==Readers::Card{")
+                && flat.contains("letthin=data::load_card_only();"),
+            "卡片单独在看时那一拍不再走薄臂了（`Readers::Card` 分支或那一问不见了）"
+        );
+        let card_at = flat.find("ifr==Readers::Card{").expect("Card 那一支不见了");
+        let branch = &flat[card_at..card_at + 900.min(flat.len() - card_at)];
+        assert!(
+            branch.contains("continue;"),
+            "Card 那一支没有当场收尾：整批查询还是会跟着跑"
+        );
+        // 就地补写那两格：托盘 tooltip 与验收状态行读的就是它们，漏了会念出启动时那份旧数
+        assert!(
+            branch.contains("g.today=thin.today;")
+                && branch.contains("g.today_app_seconds=thin.today_app_seconds;"),
+            "只有卡片那一拍不再把今日/时长写回共享快照：托盘与验收读数会停在旧值"
         );
     }
 
@@ -12950,6 +13063,49 @@ mod always_on_top_tests {
 }
 
 #[cfg(test)]
+mod hide_to_tray_tests {
+    /// 收进托盘必须连渲染目标一起放掉。
+    ///
+    /// 依据是现量（`.scratch/cpu_arms.ps1` 的 A7 臂）：面板被画过一次之后，隐藏 60 秒仍是
+    /// `私有 57.7 MB / 57 线程`，与"正显示着"那一读数一字不差；接上这一步之后同一臂是
+    /// `45.1 MB / 23 线程`。也就是说这两张 BGRA 背板与整条图形栈会全天陪着进程，只因为
+    /// 用户开过一次面板。
+    ///
+    /// 判据钉**调用形态**而不是函数名：两条隐藏出口都得出现 `hide_to_tray(app, hwnd)`；
+    /// 而 `fix_backdrop` 那种"藏一下马上显示"的抖动补丁不许跟着学（它一藏一显在同一消息里，
+    /// 照做等于把图形栈白拆一次）。
+    #[test]
+    fn every_tray_hide_releases_the_render_target() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        let call = "hide_to_tray(app,hwnd)";
+        let n = prod.matches(call).count();
+        assert_eq!(
+            n, 2,
+            "Esc 与 WM_CLOSE 两条收进托盘的路径都要放掉渲染目标，实际 {n} 处"
+        );
+        // 函数体必须**收口**再比：本仓另有两处 `drop_target()`（掉设备重建、
+        // `WM_DPICHANGED`），从定义处往后切一段无界文本的话，摘掉隐藏那一步的
+        // `drop_target()` 照样绿 —— 2026-10-31 变异跑就是这么把这条假守卫抓出来的。
+        let raw_at = src
+            .find("fn hide_to_tray(app: &mut App, hwnd: HWND)")
+            .expect("hide_to_tray 的定义不见了");
+        let body = &src[raw_at..raw_at + src[raw_at..].find("\n}").expect("函数体没收尾")];
+        assert!(
+            body.contains("app.drop_target()"),
+            "hide_to_tray 只剩个名字，不再放掉渲染目标了"
+        );
+        let bd_at = prod.find("fnfix_backdrop(").expect("fix_backdrop 不见了");
+        let bd: String = prod[bd_at..].chars().take(1200).collect();
+        assert!(
+            !bd.contains(call),
+            "fix_backdrop 不该放掉渲染目标：它只是闪一下就要还原回去"
+        );
+    }
+}
+
+#[cfg(test)]
 mod startup_tests {
     use super::*;
 
@@ -14282,17 +14438,45 @@ mod snapshot_poke_tests {
             .find("poke_snapshot();")
             .expect("唤窗之后不再催拍：点开窗口还是先看见旧数");
         assert!(shown < poked, "催拍排在上屏之前：线程会醒在还没人看那一刻");
+        // 隐藏时放掉了渲染目标 ⇒ 唤回必须先画好再显示，否则屏上是一段"有底色没内容"的面板
+        // （现量 9 帧 / 约 110 ms，`.scratch/hide_show_first_frame.ps1` 的连拍腿）。
+        // 次序在这里是唯一有意义的判据：反过来写照样编译、照样跑绿，症状只在人眼里。
+        // ⚠ 必须收在 `bring_to_front` 那一身之内比：`app.draw(hwnd);` 在 `WM_PAINT` 那支也有，
+        // 全文 `find` 会先撞上别人，那条顺序断言就变成比两句无关文本的先后 —— 空判据。
+        let bf_at = prod
+            .find("unsafe fn bring_to_front(hwnd: HWND)")
+            .expect("bring_to_front 不见了");
+        let bf = &prod[bf_at..bf_at + prod[bf_at..].find("\n}").expect("函数体没收尾")];
+        let draw_at = bf
+            .find("app.draw(hwnd);")
+            .expect("唤回前不再先画一帧：那一步是连拍腿抓出来的");
+        let show_at = bf
+            .find("ShowWindow(hwnd, SW_SHOW)")
+            .expect("唤窗的显示那一步不见了");
+        assert!(
+            draw_at < show_at,
+            "画帧排到显示之后了：打开面板会先闪一块只有底色的表面，再等首帧内容"
+        );
         // 针脚要挑**这一处**的调用形状：`refresh_now()` 里也有一句 `let next = data::load(`，
         // 只写前半会先撞上它，那条顺序断言就成了比两句话的先后而不是比这一拍。
-        let loaded = flat
-            .find("letnext=data::load(p.load(")
-            .expect("快照线程不再查库");
-        let stamped = flat
-            .find(";last_query=std::time::Instant::now();")
-            .expect("查完不再记这一拍的时刻：节流没有参照");
+        // 时刻要记在查库**之后**（否则那一拍自己的耗时被算进节流参照）。
+        // 这里从前比的是两处文本的先后（`loaded < stamped`），2026-10-31 起它抓错了对象：
+        // 卡片那一支的 `last_query` 在文件里更靠前，`find` 先撞上它，于是面板那条顺序
+        // 变成"面板的查库 vs 卡片的记时刻"——一次假红。改成把**次序钉进相邻**的形状：
+        // 两支各自"查完立刻记"，换不得也借得了别的分支才算红。（把 `find` 改成从
+        // `loaded` 往后找会让这条永远成立 —— 那是把判据做成空的，不走。）
         assert!(
-            loaded < stamped,
-            "时刻记在查库之前：那一拍的耗时会被算进节流"
+            flat.contains(
+                "letnext=data::load(p.load(std::sync::atomic::Ordering::Relaxed));\
+                 last_query=std::time::Instant::now();"
+                    .replace([' ', '\n', '\r'], "")
+                    .as_str()
+            ),
+            "面板那一拍不再「查完就记时刻」：节流没有参照，或时刻被记到查库之前"
+        );
+        assert!(
+            flat.contains("letthin=data::load_card_only();last_query=std::time::Instant::now();"),
+            "卡片那一拍不再「查完就记时刻」：被催醒的那一拍会照旧立刻再问一次"
         );
 
         let csrc = include_str!("collect.rs");
