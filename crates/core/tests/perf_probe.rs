@@ -7,13 +7,15 @@
 //! 在隔离 app_dir 里种出**他机器量级**的两份年度库（各 365 天：key_counts 150 键/天、
 //! device_key_counts 5 设备 × 40 键/天、hourly 24/天），然后逐项量：
 //! - 启动 DB 侧成本（`Database::init` 在这些数据上的全序列）
-//! - 打字热路径：**两条数** —— 只 `record_key` 那一臂，与"主链路 + CPM + 设备两条"的合起来
+//! - 打字热路径：**两条数** —— 只 `record_key` 那一臂，与"主链路 + 设备两条"的合起来
 //!   （台账里那句 2.3µs 历来指前者，它低估）+ 一次 flush 的落库成本
 //! - 查询面：设备详情（点一次的真实成本）/ 排行 / 导出全史 / 目标窗口 / 小时分布
 //! - **一拍 `load()` 的查询面**：耗时 + 语句条数（条数由 `connection::stmt_meter` 挂在
 //!   `open_ro` 上现量，不再手算），并逐臂列出「这一臂自己几条」—— 第 1 步那几刀的
 //!   优先级只由这张表定。复刻清单与生产 `data::load()` 的一致性由
 //!   `tick_replica_matches_the_production_load_body` 钉
+//! - **只有悬浮窗一个读者时那一拍**（`pill_arms()`）：卡片只要「时长」那一问，与上面整拍
+//!   放在同一把尺子上读差值 —— 「卡片一个人挂着却付面板那一拍」这条账的唯一量具
 //! - 退出成本（`shutdown` = flush + stop + backup_on_exit 的备份与校验）
 //! - 备份单项（backup_database 热身后的稳态）
 //! - B14-2 迁移扫描（迁完之后每次启动的剩余成本）与配置整读整写
@@ -267,6 +269,42 @@ fn tick_replica(period: i64, collector_on: bool) {
     }
 }
 
+/// 只有悬浮窗一个读者时，那一拍**本该**跑的东西。
+///
+/// 卡片的三格来自 `desktop-native/src/floating.rs::current_content()`：今日走
+/// `collect::today_total()`（采集开着时是内存原子，根本不查库）、速度走
+/// `collect::cpm()`（同一份内存滑窗），只有「时长」是 `publish_floating()` 从快照
+/// 推过去的 `today_app_seconds` —— 它出自 `data.rs` 里那一问
+/// `get_app_stats(Some(1), None)`。所以卡片一个人挂着时的查询面本应只有一臂
+/// （采集没开时再加一臂 `get_today_count`）。
+///
+/// 这一条不是为了改代码，是为了把「生产现在跑的整拍」与「卡片其实需要的这一拍」
+/// 放在同一把尺子上读出来：差多少毫秒、差多少条语句。
+fn pill_arms(collector_on: bool) -> Vec<TickArm> {
+    let mut arms: Vec<TickArm> = Vec::new();
+    arms.push((
+        "get_app_stats(Some(1)) 卡片时长",
+        Box::new(|| {
+            let _ = queries::get_app_stats(Some(1), None);
+        }),
+    ));
+    if !collector_on {
+        arms.push((
+            "get_today_count",
+            Box::new(|| {
+                let _ = queries::get_today_count(None);
+            }),
+        ));
+    }
+    arms
+}
+
+fn pill_replica(collector_on: bool) {
+    for (_name, mut arm) in pill_arms(collector_on) {
+        arm();
+    }
+}
+
 #[test]
 #[ignore = "perf 探针：cargo test -p focusflow-core --test perf_probe -- --ignored --nocapture"]
 fn perf_probe_full_pass() {
@@ -320,12 +358,12 @@ fn perf_probe_full_pass() {
         1e6 / per_event_us / 1e4
     );
     // ⚠ 上面那个数只是**一条臂**。它从前被引用成"打字热路径的全部成本"，而一次真实按下
-    // 在 core 侧还要跑：CPM 那把滑窗（`stats.rs:64`，一次 `Mutex` + 一次 `Duration` 换算）
-    // 与设备侧信道的两条累加（`writer.rs:529`／`:560`，各一次 `agg` 锁 + 每事件 1~2 次
-    // `to_string()`；`device_stats.rs:583` 缓存命中那一路还要再 clone 一个 `(String, String)`）。
-    // 台账里那句「record_key 2.3µs/事件」因此是**低估**，引用它之前要说清它没覆盖什么。
+    // 在 core 侧还要跑：设备侧信道的两条累加（`writer.rs:529`／`:560`，各一次 `agg` 锁 +
+    // 每事件 1~2 次 `to_string()`；`device_stats.rs:583` 缓存命中那一路还要再 clone 一个
+    // `(String, String)`）。台账里那句「record_key 2.3µs/事件」因此是**低估**，引用它之前
+    // 要说清它没覆盖什么。（这里从前还带一条 CPM 滑窗：那条 2026-10-31 按"每事件写、
+    // 没人读"摘掉了，屏幕上的「次/分」出自 `desktop-native/src/collect.rs` 另一份滑窗。）
     let writer = db.writer().expect("探针的写线程没起来").clone();
-    let cpm = focusflow_core::stats::CpmCalculator::new(60.0);
     let devs = [
         ("VID_046D&PID_C52B&MI_00", "键盘 1", "keyboard"),
         ("VID_1532&PID_0094&MI_00", "鼠标 1", "mouse"),
@@ -334,14 +372,13 @@ fn perf_probe_full_pass() {
     for i in 0..n {
         let k = &keys[i % KEYS_PER_DAY];
         db.record_key(k, now);
-        cpm.record();
         let (dk, name, kind) = devs[i % devs.len()];
         writer.record_device(dk, name, kind, now);
         writer.record_device_key(dk, k, now);
     }
     let full_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
     println!(
-        "  一次按下（主链路 + CPM + 设备两条）× {n}：每事件 {full_us:.2} µs ⇒ record_key 那一臂占 {:.0}%",
+        "  一次按下（主链路 + 设备两条）× {n}：每事件 {full_us:.2} µs ⇒ record_key 那一臂占 {:.0}%",
         per_event_us * 100.0 / full_us
     );
     // 这把尺子仍然**没覆盖**的部分，写在这里免得被当成全链路上界：
@@ -486,6 +523,23 @@ fn perf_probe_full_pass() {
             }
         );
     }
+
+    // 卡片一个人挂着时付的是哪一拍：与上面整拍同一把尺子、同一个连接池状态。
+    println!("\n== 只有悬浮窗一个读者时那一拍（卡片真正需要的） ==");
+    pill_replica(true); // 先热一轮，理由与上面相同
+    connection::stmt_meter::reset();
+    let runs = 5usize;
+    let t = Instant::now();
+    for _ in 0..runs {
+        pill_replica(true);
+    }
+    let pill_ms = t.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+    let (pp, pq, pd) = connection::stmt_meter::read();
+    let (pp1, pp2, pp3) = (pp / runs as u64, pq / runs as u64, pd / runs as u64);
+    println!(
+        "  卡片这一拍：每拍 {pill_ms:>6.1} ms｜{} 条／拍 = 存在性 {pp1} + PRAGMA {pp2} + 数据 {pp3}",
+        pp1 + pp2 + pp3
+    );
 
     // 逐臂占比：第 1 步那几刀谁先动、能省几条，只看这张表。
     // 每臂复位后单跑，所以数的是「这一臂自己几条」；两档各自相加应对上上面那一拍的总数

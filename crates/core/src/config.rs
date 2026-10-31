@@ -40,6 +40,13 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             ("backup_disabled_plugins", "false"),
         ],
     );
+    // ⚠ `[stats] cpm_window` 现在**没有任何读者**：唯一的读者是 `stats::CpmCalculator`，
+    // 而那条环 2026-10-31 按"每事件写、没人读"摘掉了（屏幕上「次/分」的窗口长度出自
+    // `desktop-native/src/collect.rs` 自己那份写死 60 秒的滑窗，从来不读这个键 ——
+    // 见 `docs/handoff-20261027-parity.md` 那条）。默认值与"手改的那一行不许被落盘盖掉"
+    // 那两条用例都保留（下面 `adopt_external_changes` 的清单还拿它当例子），所以删掉这一行
+    // 会让那两条用例失去夹具；要不要连默认值一起清（像 `[pin] renderer` 那样在 load 时删），
+    // 与久坐那六格同一句口径，等用户点。
     s("stats", &[("cpm_window", "60")]);
     // 每日目标次数：设置页「每日目标」那一行的值框、主界面目标条、悬浮窗的百分比都读它。
     // 两个读者一直各自写着 20000 的兜底，而默认值表里没有这一键 ⇒ 值框空着、config.ini
@@ -158,9 +165,12 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             ("auto_break", "true"),
         ],
     );
-    // 久坐提醒：六个键全部有读点（core::stats::RestMonitor，判定在统计线程里跑，
-    // 改完不必重启）。番茄钟的"休息"是工作周期的一部分，这里是**没开番茄钟时**
-    // 也会催你一下的那一条。
+    // 久坐提醒：⚠ 这六个键**眼下没有任何实现读它们**。从前那份判定在 `core::stats::RestMonitor`
+    // 里，而原生重写之后它就没有生产端调用方了（`desktop-native/src/floating.rs` 的头注释自己
+    // 写着"没有了……久坐提醒"），2026-10-31 连那份没人调的判定一起摘掉。
+    // 所以现在改了这六行：屏幕上设置页那六格点得到、值也落盘，但**不会有任何行为变化** ——
+    // 与上面 `[pin] renderer` 那句"全仓零读点却天天落盘，用户改了没反应"是同一族。
+    // 要不要删掉这六格、还是把久坐真接回原生卡片，是产品口径题，等用户点，本轮不动 UI。
     s(
         "rest",
         &[

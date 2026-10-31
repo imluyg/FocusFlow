@@ -548,9 +548,7 @@ impl InputListener {
         };
         tracing::debug!("record_event: {key_name} ts={ts}");
         db.record_key(key_name, ts);
-        // 记录 CPM（当前速度统计）
-        crate::stats::cpm(self.config).record();
-        // 通知回调（番茄钟 / 护眼提醒）：先 clone 出回调列表再放锁执行，
+        // 通知回调（番茄钟）：先 clone 出回调列表再放锁执行，
         // 避免持锁调用外部代码（回调可能耗时或重入）
         let callbacks: Vec<_> = self
             .key_callbacks
