@@ -1,8 +1,9 @@
 //! 往 exe 的资源表里塞两样东西：**图标**（手写 .res）与**版本信息**（`rc.exe` 编 .rc）。
 //!
-//! 为什么都需要：窗口图标是运行时从 `assets/focusflow.ico` 加载的（`GetClassLongPtr(GCLP_HICON)`
-//! 非 0），但 **exe 文件本身**没有图标资源 —— 资源管理器、快捷方式、任务栏固定都只看 PE 里的
-//! `RT_GROUP_ICON`，于是装出来的程序显示的是 Windows 的空白程序图标。版本信息同理：没有那条
+//! 为什么都需要：图标在运行时先从镜像的 `RT_GROUP_ICON` 取（读不到才回退散文件
+//! `assets/focusflow.ico`），而 **exe 文件本身**没有图标资源 —— 资源管理器、快捷方式、任务栏
+//! 固定都只看 PE 里的 `RT_GROUP_ICON`，于是装出来的程序显示的是 Windows 的空白程序图标。
+//! 版本信息同理：没有那条
 //! `RT_VERSION` 记录，右键属性→详细信息 一片空白、按文件版本审计拿不到数（`installer.nsi` 的
 //! `VIAddVersionKey` 只给 setup.exe 盖章，帮不上 exe 自己）。
 //!

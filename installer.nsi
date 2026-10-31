@@ -9,7 +9,7 @@
 ; 安装位置：当前用户的 LocalAppData，不需要管理员权限（RequestExecutionLevel user）。
 ; 数据目录跟着程序目录走：卸载会连同 data/ 一起删。想保留数据，把 Uninstall 段里的
 ;   RMDir /r "$INSTDIR"
-; 换成逐目录删除（只删 exe/assets/plugins/config.ini，留下 data/）。
+; 换成逐目录删除（只删 exe/plugins/config.ini，留下 data/）。
 
 Unicode true
 !define APPNAME "FocusFlow"
