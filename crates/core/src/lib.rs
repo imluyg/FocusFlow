@@ -24,6 +24,7 @@ pub mod reveal;
 pub mod scheduler;
 pub mod startup;
 pub mod stats;
+pub mod window_state;
 
 pub use config::FocusFlowConfig;
 pub use logger::init_logging;

@@ -22,6 +22,7 @@ use std::time::Duration;
 use focusflow_core::db::queries;
 use focusflow_core::db::queries::DeviceDetail;
 use focusflow_core::plugins::manager::PluginManager;
+use focusflow_core::window_state::MainWindowState;
 // 导出的三条规则各只有一份：CSV 字段转义（core 那份带 Excel 公式注入的前缀防护）、HTML
 // 转义、紧凑时长（悬浮窗那一列的形状）。原生侧以前各抄了一份，其中 CSV 那份**漏了**
 // 公式防护，而屏上「导出 CSV」那颗按钮走的就是漏掉的那一份。
@@ -125,6 +126,13 @@ const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 static ACCEPTANCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 背板修复里那次 hide/show 会再发一轮 WM_SIZE：这个闩防止递归。
 static BACKDROP_FIX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 主窗口这一趟的"最大化"意图：启动时从 `window_state.ini` 恢复，用户在屏上最大化/还原
+/// 时跟着变。`WM_SIZE` 拿它判"是不是真的换了一档"，只在换档那一拍写一次存档。
+static MAIN_MAXIMIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 静默启动那一趟：存档说"上次是最大化"，但窗口建出来是隐藏的 —— 真正最大化要等第一次
+/// 唤出时补（`ShowWindow(SW_MAXIMIZE)` 会连显示一起做，不能在建窗那一下调）。
+static MAIN_MAXIMIZE_ON_SHOW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // ===== 主题令牌（对照旧 WebView 那份 ui/tokens.css 的 dark 档）=====
 
@@ -5741,8 +5749,8 @@ fn pin_keep_close_visible(
     (x, y)
 }
 
-/// 这张贴图所在显示器的**工作区**（已经扣掉任务栏那一条）。
-fn pin_work_area(hwnd: HWND) -> (i32, i32, i32, i32) {
+/// 窗口所在显示器的**工作区**（已经扣掉任务栏那一条）。贴图夹取与主窗口几何还原共用。
+fn work_area_near_window(hwnd: HWND) -> (i32, i32, i32, i32) {
     unsafe {
         let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mi = MONITORINFO {
@@ -5900,7 +5908,8 @@ fn pin_set_scale(hwnd: HWND, scale: f32) {
         // 放大后右上角的 ✕ 可能顶到屏幕外：把窗口拉回工作区，让那颗按钮还够得着。
         let mut rc = RECT::default();
         let _ = GetWindowRect(hwnd, &mut rc);
-        let (nx, ny) = pin_keep_close_visible((rc.left, rc.top), (w, h), pin_work_area(hwnd));
+        let (nx, ny) =
+            pin_keep_close_visible((rc.left, rc.top), (w, h), work_area_near_window(hwnd));
         if nx != rc.left || ny != rc.top {
             let _ = SetWindowPos(hwnd, None, nx, ny, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
             tracing_note(&format!("贴图 pin-move 为保证 ✕ 可见挪到 {nx},{ny}"));
@@ -9341,7 +9350,15 @@ fn start_to_tray_cfg() -> bool {
 
 unsafe fn bring_to_front(hwnd: HWND) {
     let _ = ShowWindow(hwnd, SW_SHOW);
-    let _ = ShowWindow(hwnd, SW_RESTORE);
+    // 只在**真的最小化**时还原：`SW_RESTORE` 对最大化的窗口是"还原成普通尺寸"，
+    // 无条件调用会把用户最大化好的窗口在唤出时压回普通档。
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+    }
+    // 静默启动时存档说"上次是最大化"：窗口一直藏着，最大化留到这一刻补。
+    if MAIN_MAXIMIZE_ON_SHOW.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+    }
     // 上屏**之后**才催：反过来线程可能先醒一次、问到的还是"没人看"，那一催就白花了，
     // 症状照旧是点开窗口先看见上一份旧数。
     poke_snapshot();
@@ -9588,6 +9605,8 @@ fn toggle_theme(hwnd: HWND) {
 /// 过去每次都留在缓冲区里没了**。CLI 那条路早就显式收（`crates/cli/src/main.rs` 里
 /// 写着同样的理由），原生端当时漏了 —— 而排查崩溃与"退出没退干净"靠的正是日志的尾巴。
 fn quit_app(hwnd: HWND) {
+    // 最后补一次几何：拖完最后一下马上退出、最大化之后直接退出，都不经过 `WM_EXITSIZEMOVE`。
+    save_main_geometry(hwnd);
     floating::shutdown();
     collect::shutdown(focusflow_core::config::instance());
     focusflow_core::logger::shutdown();
@@ -9663,6 +9682,100 @@ fn client_dip_of(hwnd: HWND) -> (f32, f32) {
         (rc.right - rc.left) as f32 / s,
         (rc.bottom - rc.top) as f32 / s,
     )
+}
+
+/// DPI → 缩放倍数。0（取不到）按 100% 算，别让一次失败的查询把窗口缩成一条缝。
+fn dpi_scale_from(dpi: u32) -> f64 {
+    if dpi == 0 {
+        1.0
+    } else {
+        dpi as f64 / 96.0
+    }
+}
+
+/// 窗口所在显示器当前的缩放倍数（PMv2：每块屏可以不同）。
+fn dpi_scale_of(hwnd: HWND) -> f64 {
+    dpi_scale_from(unsafe { GetDpiForWindow(hwnd) })
+}
+
+/// 存档（逻辑像素 + 存盘时那块屏的缩放）→ 物理像素矩形。
+///
+/// 缩放取自存档而不是"建完窗再问"：多屏缩放不同时，逻辑坐标可能先落在另一块屏上，
+/// 那时问到的 DPI 是另一块的，窗口会还原到错误的屏、错误的尺寸。
+fn physical_rect_of(st: &MainWindowState) -> (i32, i32, i32, i32) {
+    let s = if st.scale.is_finite() && st.scale > 0.0 {
+        st.scale
+    } else {
+        1.0
+    };
+    (
+        (st.left * s).round() as i32,
+        (st.top * s).round() as i32,
+        (st.width * s).round() as i32,
+        (st.height * s).round() as i32,
+    )
+}
+
+/// 把窗口矩形夹进工作区：**先**让尺寸不超过工作区，**再**把左上角收进来。
+///
+/// 次序不能反：先夹坐标再夹尺寸的话，"存档比屏幕还宽"那种窗口会把左边顶到屏外。
+/// 拆成纯函数是为了能测 —— 换分辨率、拔掉副屏、把窗口拖到只剩一条边这些情形，
+/// 靠的全是这一条规则（窗口一旦整个落在屏幕外就再也拖不回来）。
+fn clamp_main_rect(work: (i32, i32, i32, i32), rect: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    const MIN_W: i32 = 480;
+    const MIN_H: i32 = 360;
+    let (wl, wt, wr, wb) = work;
+    let work_w = (wr - wl).max(1);
+    let work_h = (wb - wt).max(1);
+    let w = rect.2.clamp(MIN_W.min(work_w), work_w);
+    let h = rect.3.clamp(MIN_H.min(work_h), work_h);
+    let x = rect.0.clamp(wl, wr - w);
+    let y = rect.1.clamp(wt, wb - h);
+    (x, y, w, h)
+}
+
+/// 主窗口上一次的矩形与最大化状态，按逻辑像素写回 `window_state.ini`。
+///
+/// 连"量这组坐标时那块屏的缩放"一起存（与悬浮窗 `[floating] pos_x/pos_y` 同为逻辑像素）：
+/// 还原按存档里那个倍数换回物理像素，不依赖"建完窗问到的 DPI" —— 多屏缩放不同时那一问
+/// 会问到错误的屏。
+///
+/// 最小化时不写：那一拍的 `GetWindowRect` 是 (-32000, -32000) 那一套，存下去下次启动
+/// 窗口就在屏幕外（而且没有入口能把它拖回来）。
+fn save_main_geometry(hwnd: HWND) {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            return;
+        }
+        let zoomed = IsZoomed(hwnd).as_bool();
+        // 存档与"这一趟的最大化意图"在这一处对齐：拖到屏幕顶自动最大化那种收尾只走
+        // `WM_EXITSIZEMOVE`，`WM_SIZE` 那一拍在拖拽循环里被跳过了，不在这记一笔，
+        // 下一次还原就会拿着旧档位判断"没换档"而不写。
+        MAIN_MAXIMIZED.store(zoomed, std::sync::atomic::Ordering::Relaxed);
+        // 最大化时 `GetWindowRect` 给的是最大化矩形，正常位置沿用上一次存档里那份。
+        let mut st = focusflow_core::window_state::load().unwrap_or_else(MainWindowState::defaults);
+        if !zoomed {
+            let mut rc = RECT::default();
+            if GetWindowRect(hwnd, &mut rc).is_err() {
+                tracing_note("主窗口几何读不出来，这次没有写回 window_state.ini");
+                return;
+            }
+            let scale = dpi_scale_of(hwnd);
+            st.left = (rc.left as f64 / scale).round();
+            st.top = (rc.top as f64 / scale).round();
+            st.width = ((rc.right - rc.left) as f64 / scale).round();
+            st.height = ((rc.bottom - rc.top) as f64 / scale).round();
+            // 这组逻辑坐标是在"这块屏这个缩放"下量的；还原时按同一个倍数换回物理像素。
+            st.scale = scale;
+        }
+        st.maximized = zoomed;
+        if let Err(e) = focusflow_core::window_state::save(&st) {
+            // 写失败就是"下次启动跳回上一次的位置"——用户会以为是软件不稳。
+            tracing_note(&format!(
+                "主窗口位置没能写回 window_state.ini（{e}）：下次启动会回到上一次存下的位置"
+            ));
+        }
+    }
 }
 
 /// 可缩放边框的厚度（DIP）：与系统同一个口径（`SM_CXSIZEFRAME + SM_CXPADDEDBORDER`），
@@ -9756,6 +9869,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 // 拖拽循环里先不动：那会把用户正在进行的拖拽打断，等 `WM_EXITSIZEMOVE`。
                 if !app.in_size_move {
                     let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
+                    // 最大化/还原有两类来源不经过 `WM_EXITSIZEMOVE`：标题栏双击、标题栏那两颗
+                    // 按钮，以及静默启动后第一次唤出。这一拍不记下来，下次启动就不知道上次
+                    // 是最大化的。最小化那一拍跳过（见 `save_main_geometry`）。
+                    if !unsafe { IsIconic(hwnd) }.as_bool()
+                        && zoomed != MAIN_MAXIMIZED.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        MAIN_MAXIMIZED.store(zoomed, std::sync::atomic::Ordering::Relaxed);
+                        save_main_geometry(hwnd);
+                    }
                     if app.mica && zoomed != app.was_maximized {
                         app.was_maximized = zoomed;
                         fix_backdrop(hwnd);
@@ -9807,6 +9929,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     }
                 }
             }
+            // 拖完（移动或缩放）就把矩形记下来：重启与退出都从这一份恢复。
+            // 放在 `if let` 外面 —— 拿不到 `App` 时几何照样该记。
+            save_main_geometry(hwnd);
             LRESULT(0)
         }
         WM_DPICHANGED => {
@@ -10586,6 +10711,23 @@ fn main() -> windows::core::Result<()> {
         start_to_tray_cfg(),
     );
     GLASS_ON_FIRST_SHOW.store(hidden, std::sync::atomic::Ordering::Relaxed);
+    // 上一次的窗口矩形（逻辑像素）。没有文件 / 存档坏了就回默认那一组：新装用户看到的
+    // 仍是接这根线之前的那副样子。
+    let saved_window = focusflow_core::window_state::load();
+    let start_maximized = saved_window.as_ref().is_some_and(|s| s.maximized);
+    MAIN_MAXIMIZED.store(start_maximized, std::sync::atomic::Ordering::Relaxed);
+    // 静默启动时窗口建出来是隐藏的：最大化不能在建窗这一下做（那会直接把窗口亮出来），
+    // 欠的这一次由 `bring_to_front` 在第一次唤出时补。
+    MAIN_MAXIMIZE_ON_SHOW.store(
+        hidden && start_maximized,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // 存档里带着"量这组坐标时那块屏的缩放"，直接换成物理像素建窗；
+    // 建完只需要把可能落在屏幕外的矩形夹回来。
+    let (init_x, init_y, init_w, init_h) = match &saved_window {
+        Some(st) => physical_rect_of(st),
+        None => physical_rect_of(&MainWindowState::defaults()),
+    };
     let style = if hidden {
         WS_OVERLAPPEDWINDOW
     } else {
@@ -10597,10 +10739,10 @@ fn main() -> windows::core::Result<()> {
             CLASS_NAME,
             w!("FocusFlow"),
             style,
-            40,
-            40,
-            1200,
-            860,
+            init_x,
+            init_y,
+            init_w,
+            init_h,
             None,
             None,
             Some(hinstance.into()),
@@ -10622,6 +10764,23 @@ fn main() -> windows::core::Result<()> {
         );
     }
 
+    // 存档里的逻辑像素 → 这块屏上的物理像素，再夹进工作区：换分辨率、拔掉副屏之后，
+    // 上次那组坐标可能整块落在屏幕外面，不夹回来窗口就再也点不到。
+    if let Some(st) = &saved_window {
+        let target = clamp_main_rect(work_area_near_window(hwnd), physical_rect_of(st));
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                target.0,
+                target.1,
+                target.2,
+                target.3,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
     let app = Box::into_raw(Box::new(App::new(hwnd, false)?));
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
@@ -10630,7 +10789,16 @@ fn main() -> windows::core::Result<()> {
             // 由 `bring_to_front` 在第一次真的唤出时补。托盘照旧在 —— 它是这扇窗唯一的入口。
             tracing_note("静默启动：只进托盘（命令行 --hidden 或 [gui] start_to_tray）");
         } else {
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            // 存档说上次是最大化：`SW_SHOWMAXIMIZED` 连显示一起做，别先显示再最大化（会闪一下
+            // 普通尺寸的版面）。
+            let _ = ShowWindow(
+                hwnd,
+                if start_maximized {
+                    SW_SHOWMAXIMIZED
+                } else {
+                    SW_SHOW
+                },
+            );
             // 材质必须在**显示之后**贴：窗口还没显示时 DWM 会把深色属性/背板丢掉。
             (*app).mica = apply_glass(hwnd);
         }
@@ -14085,6 +14253,121 @@ mod snapshot_poke_tests {
             cflat.matches("crate::poke_snapshot();").count(),
             1,
             "collect.rs 里催拍的位置应当只有键回调那一处"
+        );
+    }
+}
+
+#[cfg(test)]
+mod main_window_state_tests {
+    use super::*;
+
+    fn prod() -> String {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 还原那一步只有这条规则兜底：存下的矩形可能在屏幕外（拔了副屏、换了分辨率）。
+    /// 夹的次序也是判据 —— 先夹坐标再夹尺寸，"比屏幕还宽"的存档会把左边顶出屏外。
+    #[test]
+    fn a_saved_rect_is_clamped_back_into_the_work_area() {
+        let work = (0, 0, 1920, 1040);
+        assert_eq!(
+            clamp_main_rect(work, (300, 150, 1200, 860)),
+            (300, 150, 1200, 860),
+            "本来就完整可见的窗口不许被挪"
+        );
+        assert_eq!(
+            clamp_main_rect(work, (5000, 5000, 1200, 860)),
+            (720, 180, 1200, 860),
+            "右下角之外的窗口要推回来，且右下边贴住工作区"
+        );
+        assert_eq!(
+            clamp_main_rect(work, (-500, -400, 1200, 860)),
+            (0, 0, 1200, 860),
+            "拔掉左边那块屏之后，负坐标要被收回来"
+        );
+        assert_eq!(
+            clamp_main_rect(work, (100, 100, 3000, 2000)),
+            (0, 0, 1920, 1040),
+            "比屏幕还大的存档要先缩到工作区、再贴左上角"
+        );
+        assert_eq!(
+            clamp_main_rect(work, (100, 100, 10, 10)),
+            (100, 100, 480, 360),
+            "小到抓不住的尺寸要抬到下限"
+        );
+        let left_monitor = (-1920, 0, 0, 1040);
+        assert_eq!(
+            clamp_main_rect(left_monitor, (-2000, 100, 1200, 860)),
+            (-1920, 100, 1200, 860),
+            "副屏在主屏左边时负的原点是合法工作区"
+        );
+    }
+
+    /// 存档是逻辑像素 + 存盘时的缩放：还原按存档里那个倍数换回物理像素，
+    /// 不能拿建完窗问到的 DPI 去猜（多屏缩放不同时会猜错屏）。
+    #[test]
+    fn the_saved_scale_is_used_to_restore_physical_pixels() {
+        let st = MainWindowState {
+            left: 100.0,
+            top: 50.0,
+            width: 1000.0,
+            height: 700.0,
+            scale: 1.0,
+            maximized: false,
+        };
+        assert_eq!(physical_rect_of(&st), (100, 50, 1000, 700));
+        assert_eq!(
+            physical_rect_of(&MainWindowState { scale: 1.5, ..st }),
+            (150, 75, 1500, 1050)
+        );
+        assert_eq!(
+            physical_rect_of(&MainWindowState { scale: 0.0, ..st }),
+            (100, 50, 1000, 700),
+            "缩放坏掉时按 100% 算，别把窗口缩成一条缝"
+        );
+    }
+
+    /// 接线腿：启动要读存档、三条保存路径都要在，"退出前保存"还得排在销毁窗口之前。
+    #[test]
+    fn the_geometry_is_restored_at_startup_and_written_on_every_exit_path() {
+        let prod = prod();
+        assert_eq!(
+            prod.matches("let saved_window = focusflow_core::window_state::load();")
+                .count(),
+            1,
+            "启动读存档应当只有一处（另一处是保存时用来补正常位置的读）"
+        );
+        assert_eq!(
+            prod.matches("save_main_geometry(hwnd);").count(),
+            3,
+            "保存点应当是「拖完 / 最大化换档 / 退出」各一处"
+        );
+        let at = prod
+            .find("fn quit_app(hwnd: HWND)")
+            .expect("quit_app 不见了");
+        let rest = &prod[at..];
+        let body = &rest[..rest.find("\n}\n").expect("quit_app 的函数体切不出来")];
+        let saved = body
+            .find("save_main_geometry(hwnd);")
+            .expect("退出前不保存几何：拖完最后一下马上退出就白拖了");
+        let destroyed = body
+            .find("DestroyWindow(hwnd)")
+            .expect("退出路径里没有 DestroyWindow（这条判据的锚变了）");
+        assert!(
+            saved < destroyed,
+            "几何写在销毁窗口之后：那一次已经读不到矩形"
+        );
+        // 唤窗不再无条件 `SW_RESTORE`：那会把最大化好的窗口压回普通尺寸。
+        let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("ifunsafe{IsIconic(hwnd)}.as_bool(){let_=ShowWindow(hwnd,SW_RESTORE);}"),
+            "唤窗又变成无条件 SW_RESTORE 了：最大化好的窗口会被压回普通尺寸"
         );
     }
 }
