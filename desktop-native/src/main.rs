@@ -4324,7 +4324,12 @@ fn draw_settings(
                         p.text("进标注", vb, &p.fmt.center13, &p.br.white);
                         let annotate = snap_setting(snap, "hotkey", "snip_annotate");
                         p.text(
-                            &format!("等于按热键 {annotate}；框好之后 Enter 或 Ctrl+S 出图"),
+                            // 组合键是 config.ini 里那一行的原文（手改成什么样都收），
+                            // 而这一句的尾巴"框好之后 Enter 或 Ctrl+S 出图"才是要点。
+                            &clip_middle(
+                                &format!("等于按热键 {annotate}；框好之后 Enter 或 Ctrl+S 出图"),
+                                char_budget_at(640.0, SETTINGS_HELP_PT),
+                            ),
                             rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
                             &p.fmt.text12,
                             &p.br.muted,
@@ -4335,8 +4340,11 @@ fn draw_settings(
                         p.text("松手即存", vb, &p.fmt.center13, &p.br.white);
                         let snip = snap_setting(snap, "hotkey", "snip");
                         p.text(
-                            &format!(
-                                "等于按热键 {snip}；PNG 存 data/screenshots，同时复制到剪贴板"
+                            &clip_middle(
+                                &format!(
+                                    "等于按热键 {snip}；PNG 存 data/screenshots，同时复制到剪贴板"
+                                ),
+                                char_budget_at(640.0, SETTINGS_HELP_PT),
                             ),
                             rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
                             &p.fmt.text12,
@@ -4678,9 +4686,15 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
 
     let col2 = x + (dialog.right - dialog.left) * 0.52;
     let row = |label: &str, value: &str, cx: f32, yy: f32| {
-        p.text(label, rect(cx, yy, 76.0, 18.0), &p.fmt.caption, &p.br.muted);
+        // 标签格 76 px、值格吃到弹窗右边减 100 —— 两格只差 6 px，标签一长就压住值。
         p.text(
-            value,
+            &clip_middle(label, char_budget_at(76.0, CAPTION_PT)),
+            rect(cx, yy, 76.0, 18.0),
+            &p.fmt.caption,
+            &p.br.muted,
+        );
+        p.text(
+            &clip_middle(value, char_budget_at(dialog.right - cx - 100.0, BODY_PT)),
             rect(cx + 82.0, yy, dialog.right - cx - 100.0, 18.0),
             &p.fmt.body,
             &p.br.fg,
@@ -5307,7 +5321,11 @@ fn draw_goal_strip(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     }
 
     p.text(
-        &format!("连续打卡 {} 天 · 近一年最长 {} 天", g.streak, g.best),
+        // 右对齐 ⇒ 越界是往左跑，而左边 8 px 就是进度条：五位数打卡 + 五位数最长就顶到条上。
+        &clip_middle(
+            &format!("连续打卡 {} 天 · 近一年最长 {} 天", g.streak, g.best),
+            char_budget_at(198.0, CAPTION_PT),
+        ),
         rect(dots_x - 206.0, r.top + 14.0, 198.0, 18.0),
         &p.fmt.caption_right,
         &p.br.muted,
@@ -5445,7 +5463,11 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
             &p.br.muted,
         );
         p.text(
-            &thousands(count.max(0) as u64),
+            // 居中的一档越界是两头都跑，七位数字在窄窗口就会与邻柱的数字叠在一起。
+            &clip_middle(
+                &thousands(count.max(0) as u64),
+                char_budget_at(bw, SMALL_PT),
+            ),
             rect(x, plot.bottom - hh - WEEKDAY_VALUE_HEADROOM, bw, 16.0),
             &p.fmt.center_small,
             &p.br.muted,
@@ -8715,7 +8737,9 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
         // 窗口起点就是序列第一项交回的那串日期，不在这儿按长度反推。
         let left = first.chars().skip(5).collect::<String>();
         p.text(
-            &left,
+            // 这一格只有 60 px，而串是库里交回的那一项日期：不是 `YYYY-MM-DD` 形状时
+            // （导入的旧库、带时间的日期）整串会画进第一根柱子里。
+            &clip_middle(&left, char_budget_at(60.0, CAPTION_PT)),
             rect(plot.left, plot.bottom + 4.0, 60.0, 14.0),
             &p.fmt.caption,
             &p.br.muted,
@@ -14097,7 +14121,8 @@ mod clip_tests {
     }
 
     /// 又一批定宽格子接上同一道夹取：设备名、左表页脚那句、插件名 / 版本作者 / 第二行 /
-    /// 头部目录 / 目录读不动那句、设置页的值框、设备详情弹窗那两行、图上悬停读数、目标条那句。
+    /// 头部目录 / 目录读不动那句、设置页的值框、设备详情弹窗那两行、图上悬停读数、目标条那句、
+    /// 热键那两行说明、趋势图横轴起点、星期分布柱顶数字、目标条右边那句连续打卡。
     ///
     /// 这块 UI 的文本是 `NO_WRAP` 且不设 `DWRITE_TRIMMING` —— 越界不是"被截断"，是照画到
     /// 邻居身上（设备那一列窄窗口只有 ~200 px，而别名上限 24 个汉字、兜底名截到 40 字符，
@@ -14158,6 +14183,17 @@ mod clip_tests {
             ("clip_middle(&f.label,char_budget_at(136.0,CAPTION_PT)),rect(row.left,row.top+7.0,136.0,18.0)", 1),
             ("clip_middle(&f.value,char_budget_at(vb.right-vb.left-28.0,CAPTION_PT)),rect(vb.left+8.0,vb.top+3.0,vb.right-vb.left-28.0,18.0)", 1),
             ("clip_middle(m.title,char_budget_at(g.dialog.right-g.dialog.left-72.0,BODY_PT))", 1),
+            // 热键那两行：组合键是 config.ini 的原文，两句同一格 ⇒ 两处
+            ("char_budget_at(640.0,SETTINGS_HELP_PT)", 2),
+            // 趋势图横轴起点：60 px 那一格吃的是库里的日期串
+            ("clip_middle(&left,char_budget_at(60.0,CAPTION_PT)),rect(plot.left,plot.bottom+4.0,60.0,14.0)", 1),
+            // 星期分布柱顶数字：居中，越界两头都跑
+            ("clip_middle(&thousands(count.max(0)asu64),char_budget_at(bw,SMALL_PT)),rect(x,plot.bottom-hh-WEEKDAY_VALUE_HEADROOM,bw,16.0)", 1),
+            // 目标条右边那句：右对齐，左边 8 px 就是进度条
+            ("char_budget_at(198.0,CAPTION_PT)", 1),
+            // 设备详情弹窗那一叠行：标签 76、值吃到弹窗右边减 100
+            ("clip_middle(label,char_budget_at(76.0,CAPTION_PT)),rect(cx,yy,76.0,18.0)", 1),
+            ("clip_middle(value,char_budget_at(dialog.right-cx-100.0,BODY_PT)),rect(cx+82.0,yy,dialog.right-cx-100.0,18.0)", 1),
         ] {
             assert_eq!(
                 flat.matches(needle).count(),
