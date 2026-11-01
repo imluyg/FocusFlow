@@ -7,9 +7,9 @@
 ; 读才不变成乱码。NSIS 默认按系统 ANSI 代码页读脚本，同一份文件会编译出乱码快捷方式。
 ;
 ; 安装位置：当前用户的 LocalAppData，不需要管理员权限（RequestExecutionLevel user）。
-; 数据目录跟着程序目录走：卸载会连同 data/ 一起删。想保留数据，把 Uninstall 段里的
-;   RMDir /r "$INSTDIR"
-; 换成逐目录删除（只删 exe/plugins/config.ini，留下 data/）。
+; 卸载口径：统计资料（$INSTDIR\data 里的库、截图、日志）默认保留 —— 静默卸载（/S）不弹问、
+; 直接保留，图形卸载问一次且默认按钮是「否」；只有一条明确答「是」的路径会带 /r 整目录删掉。
+; 理由：卸载程序不等于删掉几年的记录，而那次删除没有第二次机会（详见 Uninstall 段的注释）。
 
 Unicode true
 !define APPNAME "FocusFlow"
@@ -81,8 +81,37 @@ SectionEnd
 Section "Uninstall"
   Delete "$DESKTOP\FocusFlow.lnk"
   RMDir /r "$SMPROGRAMS\FocusFlow"
-  ; 连同 data/ 一起删（纯绿色应用：数据跟着程序目录走）。
-  RMDir /r "$INSTDIR"
-  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FocusFlow"
-  DeleteRegKey HKCU "Software\FocusFlow"
+
+  ; 统计资料默认保留。库与截图在 $INSTDIR\data、可回滚的快照在 $INSTDIR\backup，而"卸载程序"
+  ; 这个动作从来不代表"删掉我这两年记下的东西"—— 旧版一条 RMDir /r 把它们一起抹了，
+  ; 且没有第二次机会。静默卸载（/S，含脚本与「程序和功能」里的自动卸载）不弹问、直接保留：
+  ; 没人能回答的对话框只会让卸载挂在那里等。图形卸载问一次，默认按钮是「否」。
+  IfSilent keepdata
+  MessageBox MB_YESNO|MB_ICONEXCLAMATION|MB_DEFBUTTON2 \
+    "要把统计资料一起删掉吗？$\r$\n$\r$\n数据库、截图和日志都在：$\r$\n$INSTDIR\data$\r$\n$\r$\n选「否」：只删程序，资料留着，重新安装后接着能用。$\r$\n选「是」：整个文件夹一起删掉，删完找不回来。" \
+    IDYES deldata
+  Goto keepdata
+
+  deldata:
+    ; 用户明确答了「是」才走到这里（带 /r 的整目录删除只有这一条入口）。
+    RMDir /r "$INSTDIR"
+    Goto regkeys
+
+  keepdata:
+    ; 只删 Install 段自己放下去的东西。data\ 与用户往这个目录里塞的任何文件都留着，
+    ; 所以最后那条 RMDir 不带 /r —— 目录非空就删不动，这正是"留着资料"该有的样子。
+    ; （装完没跑过、目录里确实没攒下东西时，这一条会把空壳一起收掉。）
+    Delete "$INSTDIR\FocusFlow.exe"
+    Delete "$INSTDIR\config.ini"
+    Delete "$INSTDIR\window_state.ini"
+    Delete "$INSTDIR\focusflow.log"
+    Delete "$INSTDIR\focusflow.log.1"
+    Delete "$INSTDIR\uninstall.exe"
+    RMDir /r "$INSTDIR\plugins"
+    RMDir /r "$INSTDIR\logs"
+    RMDir "$INSTDIR"
+
+  regkeys:
+    DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FocusFlow"
+    DeleteRegKey HKCU "Software\FocusFlow"
 SectionEnd
