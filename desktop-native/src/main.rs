@@ -5011,8 +5011,12 @@ fn draw_screen(
             &p.br.fg,
         );
         if !sub.is_empty() {
+            // 卡片下面那一行同样是 `NO_WRAP` 的 DrawText：窗口拖窄时它不会自己省略，
+            // 而是照画到卡外（本仓那句"动态文本必须自己带长度上界"）。预算与画它的
+            // 矩形取同一个宽度表达式 `cw - 24.0`，两处不许各写各的数。
+            let sub = clip_middle(sub, char_budget_at(cw - 24.0, CAPTION_PT));
             p.text(
-                sub,
+                &sub,
                 rect(cx + 12.0, 142.0, cw - 24.0, 16.0),
                 &p.fmt.caption,
                 &p.br.muted,
@@ -13925,6 +13929,29 @@ mod clip_tests {
             win.contains("status_w,") && win.contains("clip_middle(line, char_budget(status_w))"),
             "预算与矩形不是同一个宽度了：
 {win}",
+        );
+    }
+
+    /// 接线腿：五张卡的副行也要过同一道夹取，且预算与画它的那个矩形用同一个宽度表达式。
+    ///
+    /// 现量的形状是卡片副行顶出格子：那句改成种数之后最长可到「本周期 1234 个键位」，
+    /// 而窄窗口下一张卡只剩几十像素宽 —— `NO_WRAP` 的 DrawText 不会自己省略，
+    /// 多出来的字照画到隔壁那张卡上（本仓已为路径行与状态行立过同一把尺子）。
+    #[test]
+    fn the_card_sub_lines_are_clipped_to_the_card_width() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            flat.matches("clip_middle(sub,char_budget_at(cw-24.0,CAPTION_PT))")
+                .count(),
+            1,
+            "卡片副行那道夹取不见了，或被改写成两份"
+        );
+        assert_eq!(
+            flat.matches("rect(cx+12.0,142.0,cw-24.0,16.0)").count(),
+            1,
+            "预算与矩形不再是同一个宽度表达式（cw-24.0 那一档）"
         );
     }
 
