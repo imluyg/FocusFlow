@@ -4492,6 +4492,15 @@ fn period_text(period: i64) -> String {
     }
 }
 
+/// 「今日活跃」那张卡下面的一行：念的是这一轮里出现过的键名**种数**。
+///
+/// 为什么单独立一个函数：这里从前用的是榜的长度，而榜只为面板列行截到上限
+/// （data.rs 那个 RANK_DISPLAY_MAX）—— 键名一多，屏上那句就永远念成上限那个数，
+/// 而 CLI 同一件事念的是未截断的种数，两边对着骂架。两份读数的出处见 data.rs 的 rank_split。
+fn kinds_sub(snap: &Snapshot) -> String {
+    format!("本周期 {} 个键位", snap.rank_kinds)
+}
+
 /// 三份导出共用的那一句"这一轮没读全"：文件里没这句，拿到导出的人就把下界当成了实测上限。
 /// 这里**念全句**（哪一年、哪一栏、为什么），屏上那几格只念到年份 —— 文件没有宽度上限，
 /// 而屏幕上是一行不换行的字。同一个判据（`snap.gaps` 是否非空）在两处说两种长度。
@@ -4960,7 +4969,7 @@ fn draw_screen(
         (
             "今日活跃".into(),
             thousands(snap.today as u64),
-            format!("共 {} 个键位", snap.rank.len()),
+            kinds_sub(snap),
         ),
         ("当前速度".into(), speed_value, speed_sub),
         (
@@ -5568,7 +5577,11 @@ fn draw_heat(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
         &p.br.fg,
     );
     p.text(
-        &format!("按{}统计 · 前 100 键", period_text(snap.period)),
+        &format!(
+            "按{}统计 · 前 {} 键",
+            period_text(snap.period),
+            data::RANK_DISPLAY_MAX
+        ),
         rect(r.right - 16.0 - 260.0, r.top + 16.0, 260.0, 18.0),
         &p.fmt.caption_right,
         &p.br.muted,
@@ -5646,7 +5659,9 @@ fn draw_heat(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
         &p.br.muted,
     );
 
-    // 板上没摆的键（输入法标点、合成键名）汇总成一句，不静默丢数据。
+    // 板上没摆的键汇总成一句：这一句的范围是**榜上那些行**（面板标题写的"前 N 键"就是它），
+    // 榜外那些种类不在这里 —— 它们既进不了板上的格子，也不进这一句的个数与次数。
+    // 原先这句注释写的是"不静默丢数据"，那是许愿：拿截断后的榜算"其它按键"本身就是丢。
     let board: std::collections::HashSet<&str> = keys.iter().map(|k| k.name).collect();
     let (mut other_n, mut other_c) = (0usize, 0i64);
     for (k, v) in &snap.rank {
@@ -13564,6 +13579,28 @@ mod share_base_tests {
             ));
         }
         assert!(wrong.is_empty(), "占比接线判据红:\n{}", wrong.join("\n"));
+    }
+
+    /// 卡片下面那一行念的是键名**种数**：榜只为面板列行截到显示上限，那一格的字不许跟着
+    /// 截断走。旧写法用 `snap.rank.len()`，键名一多就永远念成上限那个数，
+    /// 而 CLI 同一件事念的是未截断的种数 —— 两个屏对着骂架。
+    #[test]
+    fn the_card_sub_line_reads_the_kind_count_not_the_list_length() {
+        let mut s = snap();
+        s.rank = (0..data::RANK_DISPLAY_MAX)
+            .map(|i| (format!("键 {i}"), 1i64))
+            .collect();
+        s.rank_kinds = data::RANK_DISPLAY_MAX + 37;
+        let line = kinds_sub(&s);
+        assert!(line.contains("137"), "种数没被念出来，实得一句「{line}」");
+        assert!(
+            !line.contains("100 个键位"),
+            "那一格念的还是榜的行数（显示上限）：{line}"
+        );
+        // 没到上限时两种读法本来就该一致，这条不许被一起改坏
+        let mut small = snap();
+        small.rank_kinds = small.rank.len();
+        assert_eq!(kinds_sub(&small), "本周期 2 个键位");
     }
 
     /// 三份导出必须互相核对得上：拿 JSON 交回的数重算占比，要得到与 CSV 同一个字符串。

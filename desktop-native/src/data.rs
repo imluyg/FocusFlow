@@ -343,6 +343,9 @@ pub struct Snapshot {
     /// 全历史最高单日。
     pub max_day: Option<(String, i64)>,
     pub rank: Vec<(String, i64)>,
+    /// 这一轮里出现过的键名**种数**（未截断）。上面那个榜只列
+    /// [`RANK_DISPLAY_MAX`] 行，所以"共多少个"不能拿榜的行数去念 —— 切分处见 data.rs 的 rank_split。
+    pub rank_kinds: usize,
     /// 键名分组榜（`format::KEY_GROUPS` 那八组的固定顺序），排行页「分组」那一屏的行。
     pub group: Vec<(String, i64)>,
     /// 这一轮里鼠标那一侧的总次数（`MOUSE_GROUPS` 两组之和）。
@@ -465,6 +468,23 @@ pub struct RankBreak {
     pub keyboard_total: i64,
 }
 
+/// 榜在面板上列多少行：面板那句"前 N 键"与下面切成两份的读数共用这一个上限，
+/// 免得屏上写的和实际列的不是一个数。
+pub const RANK_DISPLAY_MAX: usize = 100;
+
+/// 把排好序的整榜切成「显示那一段」与「一共多少种」两份读数。
+///
+/// 为什么不能只交回截断那一段：屏上「共 N 个键位」念的是**种数**，
+/// 拿截断后的行数去念，窗口里键名一多就永远念成上限那个数（CLI 同一件事念的是
+/// 未截断的 `stats.len()`，两边对不上）。切这一刀的地方只有一处，
+/// 于是两份读数来自同一次读，不会各查各的。
+pub(crate) fn rank_split(rank: Vec<(String, i64)>) -> (Vec<(String, i64)>, usize) {
+    let kinds = rank.len();
+    let mut shown = rank;
+    shown.truncate(RANK_DISPLAY_MAX);
+    (shown, kinds)
+}
+
 /// 分组与总次数必须在**截断之前**算：`RankTotals.rows` 交回的是未截断的整榜
 /// （降序与截断由调用方负责），截完再算会把 100 名以后的那些次数静默丢掉。
 pub fn rank_break(rows: &HashMap<String, i64>, total: i64) -> RankBreak {
@@ -557,7 +577,9 @@ pub fn load(period: i64) -> Snapshot {
     let mut rank: Vec<(String, i64)> = stats.rows.into_iter().collect();
     // 次数降序；次数相同按名字升序，保证两次刷新之间不会自己换位。
     rank.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
-    rank.truncate(100);
+    // 显示那一段与"这一轮一共多少种键名"两份读数从同一次切分里拿（见 `rank_split`）：
+    // 截断是给面板列行用的，念"共 N 个"的那一格不许跟着它一起被压到上限。
+    let (rank, rank_kinds) = rank_split(rank);
 
     // 日均的分母：窗口天数；"全部"按**全历史记到过次数的天数**。
     // ⚠ 这一档的分母过去取的是 `daily`（窄窗口那一段，「总计」只有 30 天）里有行的天数，
@@ -644,6 +666,7 @@ pub fn load(period: i64) -> Snapshot {
         avg,
         max_day: all.max_day,
         rank,
+        rank_kinds,
         group: br.groups,
         mouse_total: br.mouse_total,
         keyboard_total: br.keyboard_total,
@@ -787,6 +810,45 @@ mod readout_rulers_tests {
         assert!(
             (sum - 100.0).abs() < 0.001,
             "八组加起来该正好 100%，实得 {sum:.3}%"
+        );
+    }
+
+    /// 榜列多少行与窗口里有多少种键名是两件事：前者是显示上限，后者是屏上那句「共多少个」。
+    ///
+    /// 旧写法只交回截断那一段，于是卡片拿 `rank.len()` 念种数 —— 键名一多就永远念成上限，
+    /// 而 CLI 同一件事念的是未截断的那份（`stats.len()`），两屏数字对不上。
+    #[test]
+    fn the_display_cap_and_the_kind_count_are_read_apart() {
+        let rows: Vec<(String, i64)> = (0..(RANK_DISPLAY_MAX + 37))
+            .map(|i| (format!("键 {i}"), i as i64))
+            .collect();
+        let (shown, kinds) = rank_split(rows);
+        assert_eq!(shown.len(), RANK_DISPLAY_MAX, "面板那一段照旧按上限截");
+        assert_eq!(
+            kinds,
+            RANK_DISPLAY_MAX + 37,
+            "种数被显示上限压住，就是屏上那句念错"
+        );
+        // 没到上限时两者相等：不许出现「截出 2 行、种数念成上限」
+        let (shown, kinds) = rank_split(vec![("A".into(), 1), ("B".into(), 2)]);
+        assert_eq!((shown.len(), kinds), (2, 2));
+        // 切这一刀不许动顺序：同一份榜在两次刷新之间不能自己换位
+        let (shown, _) = rank_split(vec![("甲".into(), 9), ("乙".into(), 5)]);
+        assert_eq!(shown[0].0, "甲");
+    }
+
+    /// 接线腿：种数与截断必须由同一次切分交回，并一起进快照。
+    /// 纯函数绿不代表 `load()` 真的用了它 —— 那样屏上念的还是榜的行数。
+    #[test]
+    fn the_load_path_hands_both_halves_of_the_split_to_the_snapshot() {
+        let flat: String = prod().chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("let(rank,rank_kinds)=rank_split(rank);"),
+            "榜的截断与种数又分成两处算了"
+        );
+        assert!(
+            flat.contains("rank,rank_kinds,"),
+            "切出来的种数没进快照：卡片那一格只能拿到榜的行数"
         );
     }
 
