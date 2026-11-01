@@ -6763,24 +6763,36 @@ fn draw_plugin_view(
     for op in &ops {
         match op {
             POp::Heading { rect: r, text } => {
-                p.text(text, *r, &p.fmt.body, &p.br.fg);
+                // 插件给的字符串长度是作者说了算，而这块 UI 不裁切 ⇒ 一律按自己那一格夹。
+                p.text(
+                    &clip_middle(text, char_budget_at(r.right - r.left, BODY_PT)),
+                    *r,
+                    &p.fmt.body,
+                    &p.br.fg,
+                );
             }
             POp::Label { rect: r, text } => {
-                p.text(text, *r, &p.fmt.caption, &p.br.muted);
+                p.text(
+                    &clip_middle(text, char_budget_at(r.right - r.left, CAPTION_PT)),
+                    *r,
+                    &p.fmt.caption,
+                    &p.br.muted,
+                );
             }
             POp::Kv {
                 rect: r,
                 key,
                 value,
             } => {
+                // 键那一格定宽 140，值从 +146 起画：不夹就是两句互相叠上去。
                 p.text(
-                    key,
+                    &clip_middle(key, char_budget_at(140.0, CAPTION_PT)),
                     rect(r.left, r.top, 140.0, 18.0),
                     &p.fmt.caption,
                     &p.br.muted,
                 );
                 p.text(
-                    value,
+                    &clip_middle(value, char_budget_at(r.right - r.left - 146.0, SMALL_PT)),
                     rect(r.left + 146.0, r.top, r.right - r.left - 146.0, 18.0),
                     &p.fmt.small,
                     &p.br.fg,
@@ -6788,7 +6800,12 @@ fn draw_plugin_view(
             }
             POp::Sep { rect: r } => p.fill(*r, &p.br.grid),
             POp::Body { rect: r, text } => {
-                p.text(text, *r, &p.fmt.caption, &p.br.muted);
+                p.text(
+                    &clip_middle(text, char_budget_at(r.right - r.left, CAPTION_PT)),
+                    *r,
+                    &p.fmt.caption,
+                    &p.br.muted,
+                );
             }
             POp::Field {
                 rect: r,
@@ -6797,7 +6814,7 @@ fn draw_plugin_view(
                 field,
             } => {
                 p.text(
-                    label,
+                    &clip_middle(label, char_budget_at(140.0, CAPTION_PT)),
                     rect(r.left, r.top + 4.0, 140.0, 18.0),
                     &p.fmt.caption,
                     &p.br.muted,
@@ -6811,7 +6828,7 @@ fn draw_plugin_view(
                 };
                 p.round(vb, R_CONTROL, &p.br.card, Some(border));
                 p.text(
-                    value,
+                    &clip_middle(value, char_budget_at(vb.right - vb.left - 16.0, CAPTION_PT)),
                     rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 16.0, 18.0),
                     &p.fmt.caption,
                     &p.br.fg,
@@ -6824,15 +6841,16 @@ fn draw_plugin_view(
                 ..
             } => {
                 p.text(
-                    label,
+                    &clip_middle(label, char_budget_at(140.0, CAPTION_PT)),
                     rect(r.left, r.top + 4.0, 140.0, 18.0),
                     &p.fmt.caption,
                     &p.br.muted,
                 );
                 let vb = select_value_rect(*r);
                 p.round(vb, R_CONTROL, &p.br.card, Some(&p.br.accent));
+                // 选中的那一项是插件给的记录名，右边 20 px 还要留给那个下拉箭头。
                 p.text(
-                    value,
+                    &clip_middle(value, char_budget_at(vb.right - vb.left - 28.0, CAPTION_PT)),
                     rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 28.0, 18.0),
                     &p.fmt.caption,
                     &p.br.fg,
@@ -6874,9 +6892,12 @@ fn draw_plugin_view(
                 );
                 let cols = headers.len().max(1);
                 let cw = (*column_w).max(40.0) / cols as f32;
+                // 表头与数据格都是插件给的字符串，列宽又是"插件给的总宽 ÷ 列数"——
+                // 五列时一格只剩 ~220 px，而一条记录名可以远超它。卡片那层
+                // PushAxisAlignedClip 只在卡片边切一刀（没有省略号），中间各列照叠。
                 for (i, htxt) in headers.iter().enumerate() {
                     p.text(
-                        htxt,
+                        &clip_middle(htxt, char_budget_at(cw - 12.0, CAPTION_PT)),
                         rect(r.left + 6.0 + i as f32 * cw, r.top + 4.0, cw - 12.0, 16.0),
                         &p.fmt.caption,
                         &p.br.muted,
@@ -6897,7 +6918,7 @@ fn draw_plugin_view(
                     let ink = &p.br.fg;
                     for (ci, cell) in row.iter().enumerate().take(cols) {
                         p.text(
-                            cell,
+                            &clip_middle(cell, char_budget_at(cw - 12.0, SMALL_PT)),
                             rect(
                                 rr.left + 6.0 + ci as f32 * cw,
                                 rr.top + 2.0,
@@ -7184,7 +7205,11 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
     let g = modal_geom(m, w, h);
     p.overlay_card(g.dialog, R_MODAL);
     p.text(
-        m.title,
+        // 标题是插件写的，弹窗宽夹在 380..560 之间 —— 长标题会一路画到右上角那颗「✕」上。
+        &clip_middle(
+            m.title,
+            char_budget_at(g.dialog.right - g.dialog.left - 72.0, BODY_PT),
+        ),
         rect(
             g.dialog.left + 20.0,
             g.dialog.top + 16.0,
@@ -7204,7 +7229,8 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
     for (i, f) in m.fields.iter().enumerate() {
         let Some(row) = g.fields.get(i) else { break };
         p.text(
-            &f.label,
+            // 弹窗里这两格也是插件给的字符串：标签 136 px，值框右边还要留给下拉箭头。
+            &clip_middle(&f.label, char_budget_at(136.0, CAPTION_PT)),
             rect(row.left, row.top + 7.0, 136.0, 18.0),
             &p.fmt.caption,
             &p.br.muted,
@@ -7212,7 +7238,10 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
         let vb = modal_field_box(*row);
         p.round(vb, R_CONTROL, &p.br.card, Some(&p.br.border));
         p.text(
-            &f.value,
+            &clip_middle(
+                &f.value,
+                char_budget_at(vb.right - vb.left - 28.0, CAPTION_PT),
+            ),
             rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 28.0, 18.0),
             &p.fmt.caption,
             &p.br.fg,
@@ -14091,31 +14120,49 @@ mod clip_tests {
             .filter(|c| !c.is_whitespace())
             .collect::<String>()
             .replace(",)", ")");
-        for needle in [
+        for (needle, want) in [
             // 设备名：预算与画它的那一格都用 device_name_width(&g)
-            "clip_middle(&d.name,char_budget_at(device_name_width(&g),BODY_PT)),rect(g.x_name,y+3.0,device_name_width(&g),18.0)",
+            ("clip_middle(&d.name,char_budget_at(device_name_width(&g),BODY_PT)),rect(g.x_name,y+3.0,device_name_width(&g),18.0)", 1),
             // 页脚那句：同一个 r.right-r.left-g.pad*2.0
-            "clip_middle(&footer_line(&snap.data_home,&snap.gaps,lane),char_budget_at(r.right-r.left-g.pad*2.0,CAPTION_PT)),rect(r.left+g.pad,foot_y,r.right-r.left-g.pad*2.0,16.0)",
+            ("clip_middle(&footer_line(&snap.data_home,&snap.gaps,lane),char_budget_at(r.right-r.left-g.pad*2.0,CAPTION_PT)),rect(r.left+g.pad,foot_y,r.right-r.left-g.pad*2.0,16.0)", 1),
             // 插件名那一格是定宽 240，后面 10 px 就是"版本 · 作者"
-            "clip_middle(&row.name,char_budget_at(240.0,BODY_PT)),rect(r.left+8.0,y+5.0,240.0,18.0)",
-            // 插件第二行：两个分支共用 desc_w
-            "clip_middle(&text,char_budget_at(desc_w,CAPTION_PT)),rect(r.left+8.0,y+23.0,desc_w,16.0)",
-            "char_budget_at(520.0,CAPTION_PT)",
-            "char_budget_at(card.right-card.left-32.0,CAPTION_PT)",
+            ("clip_middle(&row.name,char_budget_at(240.0,BODY_PT)),rect(r.left+8.0,y+5.0,240.0,18.0)", 1),
+            // ⚠ 压平空白也会压掉**字符串字面量里面**的空格，所以这一针里的 `v{}·{}`
+            // 与源码里的 `v{} · {}` 是同一个东西 —— 别照着源码补空格。
+            ("clip_middle(&format!(\"v{}·{}\",row.version,row.author),char_budget_at(260.0,CAPTION_PT)),rect(r.left+250.0,y+7.0,260.0,16.0)", 1),
+            // 插件第二行：两个分支共用 desc_w（所以这一针本来就是两处）
+            ("clip_middle(&text,char_budget_at(desc_w,CAPTION_PT)),rect(r.left+8.0,y+23.0,desc_w,16.0)", 1),
+            ("char_budget_at(desc_w,CAPTION_PT)", 2),
+            ("char_budget_at(520.0,CAPTION_PT)", 1),
+            ("char_budget_at(card.right-card.left-32.0,CAPTION_PT)", 1),
             // 值框：预算与画它的矩形共用 val_w（那一格还要给右边的按钮让位）
-            "clip_middle(shown,char_budget_at(val_w,SETTINGS_TEXT_PT)),rect(vb.left+8.0,vb.top,val_w,vb.bottom-vb.top)",
+            ("clip_middle(shown,char_budget_at(val_w,SETTINGS_TEXT_PT)),rect(vb.left+8.0,vb.top,val_w,vb.bottom-vb.top)", 1),
             // 设备详情弹窗：名字与副行同一个 detail_w
-            "clip_middle(&d.name,char_budget_at(detail_w,BODY_PT)),rect(x,dialog.top+40.0,detail_w,20.0)",
-            "clip_middle(&sub,char_budget_at(detail_w,CAPTION_PT)),rect(x,dialog.top+62.0,detail_w,18.0)",
+            ("clip_middle(&d.name,char_budget_at(detail_w,BODY_PT)),rect(x,dialog.top+40.0,detail_w,20.0)", 1),
+            ("clip_middle(&sub,char_budget_at(detail_w,CAPTION_PT)),rect(x,dialog.top+62.0,detail_w,18.0)", 1),
             // 图上悬停读数：夹的是气泡里面那一条
-            "clip_middle(text,char_budget_at(w-12.0,SMALL_PT)),rect(x+6.0,y+1.0,w-12.0,16.0)",
+            ("clip_middle(text,char_budget_at(w-12.0,SMALL_PT)),rect(x+6.0,y+1.0,w-12.0,16.0)", 1),
             // 目标条那句"今日 N / M"：150 之后 8 px 就是进度条
-            "char_budget_at(150.0,BODY_PT)",
+            ("char_budget_at(150.0,BODY_PT)", 1),
+            // 插件面板一族：作者给的字符串，宽度全是插件自己挑的
+            ("clip_middle(text,char_budget_at(r.right-r.left,BODY_PT)),*r,&p.fmt.body,&p.br.fg", 1),
+            ("clip_middle(text,char_budget_at(r.right-r.left,CAPTION_PT)),*r,&p.fmt.caption,&p.br.muted", 2),
+            ("clip_middle(key,char_budget_at(140.0,CAPTION_PT)),rect(r.left,r.top,140.0,18.0)", 1),
+            ("clip_middle(value,char_budget_at(r.right-r.left-146.0,SMALL_PT)),rect(r.left+146.0,r.top,r.right-r.left-146.0,18.0)", 1),
+            // Field 与 Select 的标签同一格同一定宽 ⇒ 两处
+            ("clip_middle(label,char_budget_at(140.0,CAPTION_PT)),rect(r.left,r.top+4.0,140.0,18.0)", 2),
+            ("clip_middle(value,char_budget_at(vb.right-vb.left-16.0,CAPTION_PT))", 1),
+            ("clip_middle(value,char_budget_at(vb.right-vb.left-28.0,CAPTION_PT))", 1),
+            ("clip_middle(htxt,char_budget_at(cw-12.0,CAPTION_PT)),rect(r.left+6.0+iasf32*cw,r.top+4.0,cw-12.0,16.0)", 1),
+            ("clip_middle(cell,char_budget_at(cw-12.0,SMALL_PT)),rect(rr.left+6.0+ciasf32*cw,rr.top+2.0,cw-12.0,16.0)", 1),
+            ("clip_middle(&f.label,char_budget_at(136.0,CAPTION_PT)),rect(row.left,row.top+7.0,136.0,18.0)", 1),
+            ("clip_middle(&f.value,char_budget_at(vb.right-vb.left-28.0,CAPTION_PT)),rect(vb.left+8.0,vb.top+3.0,vb.right-vb.left-28.0,18.0)", 1),
+            ("clip_middle(m.title,char_budget_at(g.dialog.right-g.dialog.left-72.0,BODY_PT))", 1),
         ] {
             assert_eq!(
                 flat.matches(needle).count(),
-                1,
-                "这一处夹取不见了、或被改写成两份、或预算与矩形分了家：{needle}"
+                want,
+                "这一处夹取不见了、被改写成两份、或预算与矩形分了家：{needle}（期望 {want} 处）"
             );
         }
     }
