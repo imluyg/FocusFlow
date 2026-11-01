@@ -108,6 +108,9 @@ const WM_PIN_CLOSE_ALL: u32 = WM_APP + 13;
 /// 截图出图的结果（成与败都说一句）：由 `snip` 填进 `SNIP_NOTE`，投这条让主窗口取走。
 /// `pub(crate)` 是因为屏上探针要拿这条消息的 id 数一数量"话到底投递了没有"。
 pub(crate) const WM_SNIP_NOTE: u32 = WM_APP + 14;
+/// 搜索框那个原生 EDIT 的焦点变化：`WPARAM` 1=拿到焦点、0=交出去。
+/// 父窗要靠它决定"这一帧该不该在框里写提示文案"——控件有焦点时那块矩形归控件画。
+const WM_SEARCH_FOCUS: u32 = WM_APP + 15;
 const TIMER_EVENTS: usize = 1;
 /// EDIT 。
 const EM_SETSEL: u32 = 0x00B1;
@@ -801,6 +804,9 @@ struct App {
     settings_cat: usize,
     /// 设置页里那个常驻的搜索框（与行内编辑用的那个 EDIT 不是同一个）。
     search_edit: Option<HWND>,
+    /// 那个搜索框此刻有没有焦点（由 `edit_proc` 在 WM_SETFOCUS / WM_KILLFOCUS 上递回来）。
+    /// 提示文案只在它为 `false` 时由父窗画。
+    search_focused: bool,
     /// 后台操作把结果行塞这里，再投 `WM_OP_DONE` 让界面来取。
     ops: Arc<Mutex<Vec<String>>>,
     /// 插件管理器（Lua 不是 Send，只能待在 UI 线程）。
@@ -1309,6 +1315,7 @@ impl App {
                 search: String::new(),
                 settings_cat: 0,
                 search_edit: None,
+                search_focused: false,
                 ops: Arc::new(Mutex::new(Vec::new())),
                 pm: None,
                 plugin_rows: Vec::new(),
@@ -1483,6 +1490,7 @@ impl App {
                 pin_count: PINS.lock().map(|v| v.len()).unwrap_or(0),
                 dark: tokens.dark,
                 zoomed: unsafe { IsZoomed(hwnd) }.as_bool(),
+                search_focused: self.search_focused,
                 collector_on: collect::is_started(),
                 collector_paused: collect::is_paused(),
                 cpm: collect::cpm(),
@@ -3126,6 +3134,12 @@ impl App {
                 Some(WPARAM(self.ui_font.0 as usize)),
                 Some(LPARAM(1)),
             );
+            // 提示文案不交给控件：`EM_SETCUEBANNER` 要 comctl32 v6 的激活上下文，这个 exe
+            // 没带那份 manifest —— 现量（2026-11-01）发完这条消息之后空框里什么都不画。
+            // 所以提示由父窗画，但**只在控件没拿到焦点时画**：那块矩形属于子窗口，
+            // 焦点一进框，父窗再写同样的字就是两块表面抢同一批像素（看得见提示、
+            // 看不见光标，重绘交替时就是他报的那句"没有用户输入的字时字体闪烁"）。
+            // 焦点状态由 `edit_proc` 在 WM_SETFOCUS / WM_KILLFOCUS 上递回来。
             // 复用同一个子类过程：为的是 Enter/Esc 也走 WM_EDIT_DONE 那条回执（搜索框这一路
             // `finish_edit` 看到 edit_target 为空会直接返回，不动任何一行）。
             // 深色底与字色不是它给的 —— 那是父窗口接 `WM_CTLCOLOREDIT` 喂的刷子。
@@ -3903,6 +3917,10 @@ fn search_box_rect(w: f32) -> D2D_RECT_F {
     rect(w - 16.0 - 16.0 - 260.0, 218.0, 260.0, 26.0)
 }
 
+/// 搜索框的提示文案。由父窗画，但只在控件**没有**焦点时画（见 `draw_settings` 那一处与
+/// `edit_proc` 递回来的焦点位）：那块矩形属于子窗口，两块表面同时往上写就是闪烁。
+const SEARCH_CUE: &str = "搜索设置（名称或段.键）…";
+
 /// 叠在底框里的原生 EDIT 的位置与尺寸（物理像素）：底框内缩 8/3，两边各再留 8、上下各留 3。
 ///
 /// 抽成独立函数是为了让"输入框必须跟着自己那块底框走"这条能被用例钉住 —— 底框是按
@@ -3944,12 +3962,16 @@ fn draw_settings(
         &p.br.muted,
     );
 
-    // 搜索框：底框画在这里，真正的输入是叠在上面的原生 EDIT（见 place_search_edit）。
+    // 搜索框：底框由这里画，输入由叠在上面的原生 EDIT 负责。提示文案只在**框里没字、
+    // 且控件没拿到焦点**时写：那块矩形归子窗口，焦点一进框，父窗再往上写字就是两块表面
+    // 抢同一批像素 —— 看得见提示、看不见光标，重绘交替时正是"没有用户输入的字时字体闪烁"
+    // 那条报告（2026-11-01 现量：空框连拍 200 帧只有一种画面，打了字之后同一处出现两种，
+    // 说明有焦点时那一层该让给控件）。
     let sbox = search_box_rect(w);
     p.round(sbox, R_CONTROL, &p.br.header, Some(&p.br.border));
-    if filter.is_empty() {
+    if filter.is_empty() && !vs.search_focused {
         p.text(
-            "搜索设置（名称或段.键）…",
+            SEARCH_CUE,
             rect(
                 sbox.left + 10.0,
                 sbox.top + 4.0,
@@ -4787,6 +4809,9 @@ struct ViewState {
     dark: bool,
     /// 窗口现在是不是最大化（右上角那颗按钮画"最大化"还是"还原"）。
     zoomed: bool,
+    /// 设置页那个搜索框（原生 EDIT）此刻有没有焦点。父窗只在它**没有**焦点时往框里写提示
+    /// 文案 —— 有焦点时那块矩形归控件画，两边同时写就是"字体闪烁"（见 `SEARCH_CUE`）。
+    search_focused: bool,
     /// 采集真的起来了没有 / 是不是暂停着 / 最近 60 秒的次数。
     collector_on: bool,
     collector_paused: bool,
@@ -9817,6 +9842,15 @@ unsafe extern "system" fn edit_proc(
                 LRESULT(0)
             }
             WM_CHAR if w.0 == VK_RETURN || w.0 == VK_ESCAPE => LRESULT(0),
+            // 搜索框（子类 id 就是这里的 `_data`）的焦点变化递回父窗：提示文案由父窗画，
+            // 但只有控件没拿到焦点时才能画在那块矩形上（见 `SEARCH_CUE` 与 `ensure_search_edit`）。
+            WM_SETFOCUS | WM_KILLFOCUS if _data == 2 => {
+                let on = if msg == WM_SETFOCUS { 1usize } else { 0 };
+                if let Ok(parent) = GetParent(hwnd) {
+                    let _ = PostMessageW(Some(parent), WM_SEARCH_FOCUS, WPARAM(on), LPARAM(0));
+                }
+                DefSubclassProc(hwnd, msg, w, l)
+            }
             // 不在这里做"失焦即提交"：窗口不是前台时 `SetFocus` 不会真正生效，
             // 而 EDIT 刚建出来就会收到一次假的 WM_KILLFOCUS，提交的会是预填的旧名字
             // （2026-10-26 实测）。提交由 Enter/Esc 和"点编辑框外面"两条路负责。
@@ -10380,6 +10414,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     SetBkColor(hdc, app.edit_bg_color);
                 }
                 return LRESULT(app.edit_bg.0 as isize);
+            }
+            LRESULT(0)
+        }
+        WM_SEARCH_FOCUS => {
+            // 焦点进/出搜索框：重画一帧，让提示文案跟着让位或回来。
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                if app.search_focused != (w.0 != 0) {
+                    app.search_focused = w.0 != 0;
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
             }
             LRESULT(0)
         }
@@ -14022,6 +14066,30 @@ mod clip_tests {
             prod.matches("place_search_edit(hwnd)").count(),
             3,
             "搜索框的摆位调用点数变了"
+        );
+    }
+
+    /// 接线腿：提示文案只在控件**没有**焦点时由父窗写，焦点变化必须从子类过程递回来。
+    ///
+    /// 这条缺陷的形状不是"算错了"，是两块表面往同一批像素上写字：那块矩形属于叠在底框上的
+    /// 原生 EDIT，父窗有焦点时照样往那儿画提示，就出现"看得见提示、看不见光标、字在闪"。
+    /// 屏上的交替抓不稳（连拍只量得到自己那档间隔），所以钉这三处形态。
+    #[test]
+    fn the_hint_yields_the_box_to_the_control_that_owns_it() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("iffilter.is_empty()&&!vs.search_focused"),
+            "父窗又无条件把提示字画进控件的矩形里了：有焦点时就是闪烁"
+        );
+        assert!(
+            flat.contains("WM_SETFOCUS|WM_KILLFOCUSif_data==2"),
+            "搜索框的焦点变化没递回父窗，父窗无从知道该不该让位"
+        );
+        assert!(
+            flat.contains("app.search_focused=w.0!=0"),
+            "收回来的焦点位没落到 App 上"
         );
     }
 
