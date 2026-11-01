@@ -7270,10 +7270,15 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
         &p.br.fg,
     );
     p.text(
-        &format!(
-            "{} 个 · 目录 {}",
-            rows.len(),
-            focusflow_core::paths::plugins_dir().display()
+        // 目录路径的尾巴才是"到底在哪儿"，所以夹中间、两头都留（520 px 那格在长 profile
+        // 路径下会整句越界，而这块 UI 不裁切）。
+        &clip_middle(
+            &format!(
+                "{} 个 · 目录 {}",
+                rows.len(),
+                focusflow_core::paths::plugins_dir().display()
+            ),
+            char_budget_at(520.0, CAPTION_PT),
         ),
         rect(card.left + 58.0, card.top + 15.0, 520.0, 18.0),
         &p.fmt.caption,
@@ -7282,7 +7287,10 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
 
     if let Some(e) = err {
         p.text(
-            &format!("插件目录读不出来：{e}"),
+            &clip_middle(
+                &format!("插件目录读不出来：{e}"),
+                char_budget_at(card.right - card.left - 32.0, CAPTION_PT),
+            ),
             rect(
                 card.left + 16.0,
                 card.top + 36.0,
@@ -7316,13 +7324,18 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             p.fill(r, &p.br.row_hover);
         }
         p.text(
-            &row.name,
+            // 名字与"版本 · 作者"都是插件自己写的，两格又都定宽（240 / 260），
+            // 后一格从 r.left + 250 起画 ⇒ 不夹就是两句叠成一片乱码。
+            &clip_middle(&row.name, char_budget_at(240.0, BODY_PT)),
             rect(r.left + 8.0, y + 5.0, 240.0, 18.0),
             &p.fmt.body,
             &p.br.fg,
         );
         p.text(
-            &format!("v{} · {}", row.version, row.author),
+            &clip_middle(
+                &format!("v{} · {}", row.version, row.author),
+                char_budget_at(260.0, CAPTION_PT),
+            ),
             rect(r.left + 250.0, y + 7.0, 260.0, 16.0),
             &p.fmt.caption,
             &p.br.muted,
@@ -7350,11 +7363,17 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             },
         );
         // 第二行：加载失败说失败原因，否则说它是什。
+        // 两分支同一格（卡片内宽减 92），所以夹取按这一格的宽度算 —— `one_line` 那个 72
+        // 是"多少个字符"，不是"这一格装得下多少"：72 个汉字约 900 px，比格子宽一倍。
+        let desc_w = r.right - r.left - 92.0;
         match &row.error {
             Some(e) => {
                 p.text(
-                    &format!("加载失败：{}", one_line(e, 72)),
-                    rect(r.left + 8.0, y + 23.0, r.right - r.left - 92.0, 16.0),
+                    &clip_middle(
+                        &format!("加载失败：{}", one_line(e, 72)),
+                        char_budget_at(desc_w, CAPTION_PT),
+                    ),
+                    rect(r.left + 8.0, y + 23.0, desc_w, 16.0),
                     &p.fmt.caption,
                     &p.br.danger,
                 );
@@ -7367,8 +7386,8 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
                     row.desc.clone()
                 };
                 p.text(
-                    &text,
-                    rect(r.left + 8.0, y + 23.0, r.right - r.left - 92.0, 16.0),
+                    &clip_middle(&text, char_budget_at(desc_w, CAPTION_PT)),
+                    rect(r.left + 8.0, y + 23.0, desc_w, 16.0),
                     &p.fmt.caption,
                     &p.br.muted,
                 );
@@ -8281,7 +8300,11 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                     );
                 } else {
                     p.text(
-                        &d.name,
+                        // 这一列窄窗口只有 ~200 px，而两路名字都能到 24~41 个字符：
+                        // 用户别名上限 `MAX_ALIAS_CHARS = 24`（汉字 24 个 ≈ 324 px），
+                        // 没别名时 `fallback_device_name` 把长机器串截到 40 字符 + "…"。
+                        // 这块 UI 不按矩形裁切 ⇒ 不夹就一路画过「类型」「次数」和两颗按钮。
+                        &clip_middle(&d.name, char_budget_at(device_name_width(&g), BODY_PT)),
                         rect(g.x_name, y + 3.0, device_name_width(&g), 18.0),
                         &p.fmt.table_name,
                         &p.br.fg,
@@ -8428,7 +8451,12 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         1.0,
     );
     p.text(
-        &footer_line(&snap.data_home, &snap.gaps, lane),
+        // 同一句 `data_home` 在设置页那格是夹过的，这一格从前没有：警告那半句本身就吃掉
+        // 大半行，路径一长就越过卡片边、压到右边那张趋势卡上。夹取留头也留尾 —— 尾巴是路径。
+        &clip_middle(
+            &footer_line(&snap.data_home, &snap.gaps, lane),
+            char_budget_at(r.right - r.left - g.pad * 2.0, CAPTION_PT),
+        ),
         rect(r.left + g.pad, foot_y, r.right - r.left - g.pad * 2.0, 16.0),
         &p.fmt.caption,
         &p.br.muted,
@@ -9554,15 +9582,15 @@ fn build_formats(dw: &IDWriteFactory) -> windows::core::Result<Formats> {
         caption_right: right_format_w(dw, CAPTION_PT, UI_WEIGHT_REG)?,
         caption_center: center_format_w(dw, CAPTION_PT, UI_WEIGHT_REG)?,
         nav_item: text_format(dw, SETTINGS_TEXT_PT, UI_WEIGHT_REG)?,
-        body: text_format(dw, 13.5, UI_WEIGHT)?,
+        body: text_format(dw, BODY_PT, UI_WEIGHT)?,
         small: text_format(dw, 12.0, UI_WEIGHT)?,
         right: right_format(dw, 12.0)?,
         center_small: center_format(dw, 12.0)?,
         center_tiny: center_format(dw, 9.0)?,
-        tab: center_format(dw, 13.5)?,
+        tab: center_format(dw, BODY_PT)?,
         settings_h: text_format(dw, 16.0, DWRITE_FONT_WEIGHT_BOLD)?,
         row_name: text_format(dw, 15.0, UI_WEIGHT)?,
-        table_name: text_format(dw, 13.5, UI_WEIGHT)?,
+        table_name: text_format(dw, BODY_PT, UI_WEIGHT)?,
         text13: text_format(dw, SETTINGS_TEXT_PT, UI_WEIGHT)?,
         text13_em: text_format(dw, SETTINGS_TEXT_PT, UI_WEIGHT_EM)?,
         text12: text_format(dw, SETTINGS_HELP_PT, UI_WEIGHT_REG)?,
@@ -9634,6 +9662,11 @@ pub(crate) const SETTINGS_HELP_PT: f32 = 13.0;
 /// `char_budget`（按 `SETTINGS_HELP_PT` 算）：两档字号不相等，预算与屏上像素就不是
 /// 一把尺子 —— 窄窗口下按"装得下"放行、字照画到胶囊底下。
 const CAPTION_PT: f32 = 12.5;
+/// 正文那一档（`body` / `tab` / `table_name`）的字号。
+///
+/// 与前两档同一个理由：设备名、插件名这类**画在定宽格子里的动态文本**要按这一档算字符
+/// 预算，字号写两遍就等于两把尺子（这块 UI 不按矩形裁切，超出去的字照画）。
+const BODY_PT: f32 = 13.5;
 
 fn right_format(dw: &IDWriteFactory, size: f32) -> windows::core::Result<IDWriteTextFormat> {
     right_format_w(dw, size, UI_WEIGHT)
@@ -14020,6 +14053,49 @@ mod clip_tests {
             "预算与矩形不是同一个宽度了：
 {win}",
         );
+    }
+
+    /// 又四处定宽格子接上同一道夹取：设备名、左表页脚那句、插件名、插件第二行说明。
+    ///
+    /// 这块 UI 的文本是 `NO_WRAP` 且不设 `DWRITE_TRIMMING` —— 越界不是"被截断"，是照画到
+    /// 邻居身上（设备那一列窄窗口只有 ~200 px，而别名上限 24 个汉字、兜底名截到 40 字符，
+    /// 两路都能越过去；插件那两格吃的是作者自己写的字符串）。每条针都同时钉"夹了"与
+    /// "预算与矩形是同一个宽度表达式"，因为分家正是这一族的复发形状。比的是压平空白之后的
+    /// 文本：rustfmt 会把长参数列表折行，按行比会把"修复还在、只是被排版拆开"误判成夹取不见了。
+    #[test]
+    fn four_more_fixed_width_cells_clip_their_own_text() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod: String = src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // rustfmt 会在多行参数列表末尾留一个逗号 —— 压平之后它会让 "f(a,b,)" 与 "f(a,b)"
+        // 变成两种写法，这里统一掉，免得判据红在排版上。
+        let flat: String = prod
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .replace(",)", ")");
+        for needle in [
+            // 设备名：预算与画它的那一格都用 device_name_width(&g)
+            "clip_middle(&d.name,char_budget_at(device_name_width(&g),BODY_PT)),rect(g.x_name,y+3.0,device_name_width(&g),18.0)",
+            // 页脚那句：同一个 r.right-r.left-g.pad*2.0
+            "clip_middle(&footer_line(&snap.data_home,&snap.gaps,lane),char_budget_at(r.right-r.left-g.pad*2.0,CAPTION_PT)),rect(r.left+g.pad,foot_y,r.right-r.left-g.pad*2.0,16.0)",
+            // 插件名那一格是定宽 240，后面 10 px 就是"版本 · 作者"
+            "clip_middle(&row.name,char_budget_at(240.0,BODY_PT)),rect(r.left+8.0,y+5.0,240.0,18.0)",
+            // 插件第二行：两个分支共用 desc_w
+            "clip_middle(&text,char_budget_at(desc_w,CAPTION_PT)),rect(r.left+8.0,y+23.0,desc_w,16.0)",
+            "char_budget_at(520.0,CAPTION_PT)",
+            "char_budget_at(card.right-card.left-32.0,CAPTION_PT)",
+        ] {
+            assert_eq!(
+                flat.matches(needle).count(),
+                1,
+                "这一处夹取不见了、或被改写成两份、或预算与矩形分了家：{needle}"
+            );
+        }
     }
 
     /// 接线腿：五张卡的副行也要过同一道夹取，且预算与画它的那个矩形用同一个宽度表达式。
