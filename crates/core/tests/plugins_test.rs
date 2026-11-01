@@ -382,6 +382,112 @@ mod tests {
         assert!(info.contains("FocusFlow"));
     }
 
+    /// 宿主 `stats` 的第四个返回值：这一轮没读全的年份与原因（空串 = 读全了）。
+    ///
+    /// 旧契约走 `get_stats*` 那两条二元组口子，它们把 `unreadable` 丢掉（`queries.rs` 的
+    /// ⚠ 注释就写着这件事）⇒ 移动盘没醒、`-wal` 被杀软握着那一轮，「统计速览」面板念出来
+    /// 的今日数长得像一份完整答案，而屏上没有任何一句话交代它是下界。
+    #[test]
+    fn host_stats_hands_back_the_unreadable_year() {
+        let _guard = guard();
+        let app = crate::common::isolated_app_dir("host_stats_gap");
+        let dir = app.path();
+        let lua = mlua::Lua::new();
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
+        ));
+        let database = db::Database::init_readonly();
+        focusflow_core::plugins::host::register_host_api(&lua, config, database, "host_stats_gap")
+            .unwrap();
+        let read_gap = |lua: &mlua::Lua| -> String {
+            lua.load("local _, _, _, g = focusflow.stats(0) return g")
+                .eval()
+                .expect("stats 的第四个返回值必须是字符串（空串 = 读全了）")
+        };
+
+        // 一档：什么都没坏 ⇒ 不许有无中生有的原因
+        assert_eq!(read_gap(&lua), "", "库里没有坏年份时该交回空串");
+
+        // 二档：列得出来、但根本不是库的那一年（同步盘占位 / 半截复制那一类形态）
+        let bad_year = chrono::Datelike::year(&chrono::Local::now()) - 2;
+        let bad = paths::year_db_path(bad_year);
+        std::fs::create_dir_all(bad.parent().expect("年度库必须在某个目录下")).unwrap();
+        std::fs::write(&bad, b"not a database at all").unwrap();
+        db::invalidate_years_cache();
+        db::connection::clear_ro_cache();
+        let gap = read_gap(&lua);
+        assert!(
+            gap.contains(&bad_year.to_string()),
+            "必须点名是哪一年没答上来，实得「{gap}」"
+        );
+
+        // 反向腿（这条判据不是恒真）：把那个文件拿走，同一个调用就回到空串
+        std::fs::remove_file(&bad).unwrap();
+        db::invalidate_years_cache();
+        db::connection::clear_ro_cache();
+        assert_eq!(read_gap(&lua), "", "坏文件拿走之后不许还挂着原因");
+    }
+
+    /// 端到端：坏那一年时，「统计速览」面板上必须多出那句"这次没读全"。
+    ///
+    /// 上面那条只证明宿主交回了原因；症状长在最后一环 —— 面板不接住它，屏上念的
+    /// 还是把下界当完整答案的那三个数（这个面板问的是今日，所以要弄坏的是**今年**那份库）。
+    #[test]
+    fn the_overview_panel_says_when_the_read_is_incomplete() {
+        let _guard = guard();
+        let app = crate::common::isolated_app_dir("overview_gap");
+        let dir = app.path();
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
+        ));
+        let mut manager = PluginManager::new(config, db::Database::init_readonly());
+        let file = manager
+            .discover()
+            .expect("内置插件目录该读得动")
+            .into_iter()
+            .find(|f| f.ends_with("stats_overview.lua"))
+            .expect("应发现 stats_overview.lua");
+        let name = manager.load_plugin(&file).expect("加载插件失败");
+        let gap_line = |manager: &mut PluginManager| -> Option<String> {
+            manager.refresh_view(&name).ok()?;
+            manager
+                .get_plugin(&name)
+                .and_then(|p| p.view.as_ref())
+                .and_then(|v| {
+                    v.widgets.iter().find_map(|w| match w {
+                        Widget::Label(t) if t.contains("没读全") => Some(t.clone()),
+                        _ => None,
+                    })
+                })
+        };
+
+        // 一档：库都读得动时一个字都不许多说
+        assert_eq!(
+            gap_line(&mut manager),
+            None,
+            "没有坏年份不该有「没读全」那句"
+        );
+
+        // 二档：今年这份根本不是库（同步盘占位 / 半截复制那一类形态）
+        let this_year = chrono::Datelike::year(&chrono::Local::now());
+        let bad = paths::year_db_path(this_year);
+        std::fs::create_dir_all(bad.parent().expect("年度库必须在某个目录下")).unwrap();
+        std::fs::write(&bad, b"not a database at all").unwrap();
+        db::invalidate_years_cache();
+        db::connection::clear_ro_cache();
+        let line = gap_line(&mut manager).expect("读不出那一年必须在面板上说出口");
+        assert!(
+            line.contains(&this_year.to_string()),
+            "那句要点名是哪一年，实得「{line}」"
+        );
+
+        // 反向腿：坏文件拿走，那句要跟着消失（否则它就成了常驻噪音）
+        std::fs::remove_file(&bad).unwrap();
+        db::invalidate_years_cache();
+        db::connection::clear_ro_cache();
+        assert_eq!(gap_line(&mut manager), None, "读全之后那句残留就是永久噪音");
+    }
+
     /// 临时根目录：panic 也要回收。
     ///
     /// `/tmp/ff_*` 是门禁基线盯的那一项，泄漏一个就报不出 `TEMP_FLAT`；

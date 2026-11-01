@@ -191,7 +191,7 @@ pub fn register_host_api(
     let owner = owner.to_string();
 
     // 统计查询：period = -1 今日, 0 总计, N 天数。
-    // 返回 (total, **按次数降序**的 `{name=,count=}` 数组, 键鼠种类数)。
+    // 返回 (total, **按次数降序**的 `{name=,count=}` 数组, 键鼠种类数, 这次没读全的原因)。
     //
     // 为什么由 Rust 排序、且返回数组而不是"名字->次数"的表：`get_stats` 里是
     // `HashMap`，SQL 那句 `ORDER BY cnt DESC` 在返回之前就被抹平了，而插件用
@@ -199,11 +199,20 @@ pub fn register_host_api(
     // （他机器上不同键名有一百多个，空格这种高频键可能整周都不上榜）。
     // 第三个返回值是真实种类数：以前插件把"榜单行数"当种类数，永远显示 10。
     let stats_fn = lua.create_function(move |lua, period: i64| {
-        let (total, key_stats) = match period {
-            -1 => db::get_stats_by_date(chrono::Local::now().date_naive()),
-            0 => db::get_stats(None, None),
-            n => db::get_stats(Some(n), None),
+        // 读的是带 `unreadable` 的那一份：从前走 `get_stats*` 那两条二元组口子，
+        // 它们把"哪一年没答上来"丢掉了（`queries.rs` 的 ⚠ 就写着这件事），于是移动盘没醒、
+        // `-wal` 被握着那一轮，面板把**下界**念成完整答案 —— 而界面那一头早有
+        // 「这次没读全」的分栏可以说这句话（`Snapshot::gaps`）。
+        // 第四个返回值形状照本文件 `accounting_categories` 的 `(清单, 原因)`：
+        // 空串 = 读全了；多一个返回值对旧脚本无害（Lua 取不到就多 `nil`）。
+        let totals = match period {
+            -1 => db::stats_totals_on(chrono::Local::now().date_naive()),
+            0 => db::stats_totals(None, None),
+            n => db::stats_totals(Some(n), None),
         };
+        let total = totals.total;
+        let gap = totals.unreadable.join("；");
+        let key_stats = totals.rows;
         let distinct = key_stats.len();
         let mut ordered: Vec<(&String, &i64)> = key_stats.iter().collect();
         ordered.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
@@ -214,7 +223,7 @@ pub fn register_host_api(
             row.set("count", **count)?;
             rows.set(idx + 1, row)?;
         }
-        Ok((total, rows, distinct))
+        Ok((total, rows, distinct, gap))
     })?;
     host.set("stats", stats_fn)?;
 
@@ -236,17 +245,18 @@ pub fn register_host_api(
     })?;
     host.set("log", log_fn)?;
 
-    // 每日统计（趋势）
+    // 每日统计（趋势）：第二个返回值是"这次没读全"的原因（空串 = 读全了），
+    // 与上面 `stats` 同一形状 —— `get_daily_counts` 那条二元组口子同样丢掉了 `unreadable`。
     let daily_fn = lua.create_function(|lua, days: i64| {
-        let daily = db::get_daily_counts(days.max(1), None);
+        let read = db::daily_counts_totals(days.max(1), None);
         let t = lua.create_table()?;
-        for (i, (date, count)) in daily.iter().enumerate() {
+        for (i, (date, count)) in read.series.iter().enumerate() {
             let row = lua.create_table()?;
             row.set("date", date.as_str())?;
             row.set("count", *count)?;
             t.set(i + 1, row)?;
         }
-        Ok(t)
+        Ok((t, read.unreadable.join("；")))
     })?;
     host.set("daily_counts", daily_fn)?;
 
