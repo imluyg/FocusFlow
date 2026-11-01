@@ -35,12 +35,6 @@ plugins/memory_limit_mb
 pomodoro/auto_break
 pomodoro/break_minutes
 pomodoro/work_minutes
-rest/check_interval
-rest/cooldown_minutes
-rest/enabled
-rest/key_threshold
-rest/rest_seconds
-rest/window_minutes
 snip/hide_floating
 snip/loupe
 stats/cpm_window

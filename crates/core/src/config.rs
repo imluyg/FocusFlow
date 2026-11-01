@@ -165,23 +165,12 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             ("auto_break", "true"),
         ],
     );
-    // 久坐提醒：⚠ 这六个键**眼下没有任何实现读它们**。从前那份判定在 `core::stats::RestMonitor`
-    // 里，而原生重写之后它就没有生产端调用方了（`desktop-native/src/floating.rs` 的头注释自己
-    // 写着"没有了……久坐提醒"），2026-10-31 连那份没人调的判定一起摘掉。
-    // 所以现在改了这六行：屏幕上设置页那六格点得到、值也落盘，但**不会有任何行为变化** ——
-    // 与上面 `[pin] renderer` 那句"全仓零读点却天天落盘，用户改了没反应"是同一族。
-    // 要不要删掉这六格、还是把久坐真接回原生卡片，是产品口径题，等用户点，本轮不动 UI。
-    s(
-        "rest",
-        &[
-            ("enabled", "true"),
-            ("window_minutes", "30"),
-            ("key_threshold", "10000"),
-            ("cooldown_minutes", "10"),
-            ("rest_seconds", "20"),
-            ("check_interval", "10"),
-        ],
-    );
+    // 注：`[rest]` 那六行不再写默认值 —— 久坐提醒在原生重写后没有任何生产代码读它
+    // （`desktop-native/src/floating.rs` 的头注释、`floating_render.rs` 的同一段都记着这条横带
+    // 没回来，2026-10-31 连 `core::stats::RestMonitor` 那份零调用方的判定一起摘掉了）。
+    // 与上面 `[pin] renderer` 那句"全仓零读点却天天落盘，用户改了没反应"是同一族：
+    // 此前那六行屏上点得到、值也落盘，却不改变任何行为。老文件里的这六行在 load 时清掉
+    // （见 DEPRECATED_CONFIG），设置页那六格也一并摘掉了。
     map
 }
 
@@ -226,6 +215,21 @@ const DEPRECATED_CONFIG: &[(&str, &[&str])] = &[
     // 它此前还天天写进新装的 config.ini，值就是那个已经不存在的 `webview` ——
     // 2026-10-30 按"每次落盘、全仓零读点"这把尺子收掉（与上面 gui 那几行同一族）。
     ("pin", &["renderer"]),
+    // 久坐提醒那六行：原生重写后全仓零读点（判定那份已于 2026-10-31 摘掉），设置页也不再
+    // 暴露这六格。它们此前天天落盘、用户改了没反应，与上面 `pin.renderer` 同一族。
+    // 整节的键都在这份名单里 ⇒ 用户老文件里那一段会被 `flush_section` 当作空节整块收掉，
+    // 不会留下一行光秃秃的 `[rest]`。
+    (
+        "rest",
+        &[
+            "enabled",
+            "window_minutes",
+            "key_threshold",
+            "cooldown_minutes",
+            "rest_seconds",
+            "check_interval",
+        ],
+    ),
 ];
 
 /// 解析 INI：兼容 Python configparser 的 `#`/`;` 注释与 `key = value` 语法。
@@ -301,12 +305,12 @@ pub(crate) fn parse_ini(text: &str) -> HashMap<String, HashMap<String, String>> 
 /// 因"原文件读不读得到"给出两种节序 —— 而走到整份重建那一条的时机恰恰是文件被
 /// 别的句柄握着（杀软首扫、OneDrive 占位），用户看到的就是"config.ini 的节顺序自己变了"。
 ///
-/// 前九个与 Python 版一致（便于阅读与 diff），末尾三个是后来加的节。**清单必须盖住
+/// 前九个与 Python 版一致（便于阅读与 diff），其余是后来加的节。**清单必须盖住
 /// `default_config()` 的每一节**：清单外的节在整份重建那条路上过去连名字兜底都没有，
 /// 直接按 `HashMap` 迭代序排 ⇒ 实测同一份默认配置，重建路给
 /// `app_stats, plugins, device_stats`、逐行重写路给 `app_stats, device_stats, plugins`，
 /// 每跑一次进程都可能换个样子。现在两边都是"清单位置 → 同名兜底"。
-const SECTION_ORDER: [&str; 15] = [
+const SECTION_ORDER: [&str; 14] = [
     "database",
     "stats",
     "paths",
@@ -318,7 +322,6 @@ const SECTION_ORDER: [&str; 15] = [
     "floating",
     "pin",
     "pomodoro",
-    "rest",
     "app_stats",
     "device_stats",
     "plugins",
@@ -862,8 +865,9 @@ impl FocusFlowConfig {
     /// `[stats] cpm_window`、`[database] flush_interval`、`[plugins] memory_limit_mb` /
     /// `instruction_limit`、`[gui] floating_metric`、`[pomodoro] *` 这些键仍然没有界面入口，
     /// 手改 config.ini 是唯一的写法，而程序常驻后台 ⇒ 用户永远是在"程序运行中"改的。
-    /// （`[rest] *`、`[app_stats] exclude`、`[device_stats] enabled` 从前也在这份名单里，
-    /// 现在「设置 → 高级」那一页能改了 —— 但这一句话对剩下这些键一直成立。）
+    /// （`[app_stats] exclude`、`[device_stats] enabled` 从前也在这份名单里，现在「设置 →
+    /// 高级」那一页能改了；`[rest] *` 也从名单里出去了，但它走的是另一条——那六行全仓零读点，
+    /// 已按 `DEPRECATED_CONFIG` 在 load 时清掉。这一句话对上面这些键一直成立。）
     /// 旧写法里 `serialize_preserving_structure` 对"文件与内存都有这个键"一律写内存值
     /// （那是启动时读进来的快照），于是退出前那次强制 save 把他刚改的那一行盖回旧值，
     /// 一行日志都没有 —— `app_stats.rs` 与 `stats.rs` 注释里"改文件立刻生效"那句
@@ -1319,7 +1323,7 @@ mod tests {
         // 默认值补齐
         assert!(cfg.get_bool("listener", "ignore_key_repeat", false));
         assert_eq!(cfg.get("hotkey", "toggle_window"), "ctrl+shift+f");
-        assert_eq!(cfg.get_int("rest", "key_threshold", 0), 10000);
+        assert_eq!(cfg.get_int("pomodoro", "work_minutes", 0), 25);
         // 「代码在读、但默认值里没有」的键必须也能在这里看到：它们在界面上是
         // 真开关，藏在 config.ini 里不可发现就是文档缺失（floating_metric 之前
         // 就是这种状态，UI 里那个口径切换只有会改文件的人才用得到）。
@@ -1344,8 +1348,9 @@ mod tests {
     /// ⇒ 他永远是在"运行中"改的。旧写法对"文件与内存都有这个键"一律写内存值（启动时
     /// 那份快照），退出前的强制 save 就把那一行还原了，一行日志都没有 ——
     /// `app_stats.rs`/`stats.rs` 注释里"改文件立刻生效"因此从来没成立过。
-    /// （`[rest] *`、`[app_stats] exclude`、`[device_stats] enabled` 这几个从前也在名单里，
-    /// 现在设置页能改了；这条用例保护的仍然是"任何手改的行都不许被盖掉"。）
+    /// （`[app_stats] exclude`、`[device_stats] enabled` 这几个从前也在名单里，现在设置页能改了；
+    /// `[rest] *` 则整个不进这份名单了——那六行零读点，按 `DEPRECATED_CONFIG` 清掉，
+    /// 见下面那条「废弃键不采纳」的用例。这条用例保护的仍然是"任何手改的行都不许被盖掉"。）
     #[test]
     fn an_external_edit_survives_the_next_save() {
         let _lock = crate::paths::test_app_dir_lock();
@@ -1666,6 +1671,42 @@ mod tests {
             !text.contains("today_count_cache_ttl"),
             "废弃键被采纳回内存又写回文件了: {text}"
         );
+    }
+
+    /// 整节都进废弃名单时，老文件里那一段要**连节头一起**消失。
+    ///
+    /// 这条是「`[rest]` 那六格删掉之后不再在盘上继续假装成一个开关」的验收：只清键会留下
+    /// 一句光秃秃的 `[rest]`，而用户照着节名去设置页找那六格就找不到 —— 唯一出口是
+    /// `flush_section` 那句"节头之外还有内容才保留整节"。
+    /// 别的节不许被牵连（同一份文件里 `[gui]` 那行必须还在）。
+    #[test]
+    fn a_whole_deprecated_section_leaves_the_file_with_its_header() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_rest_section_pruned");
+        let path = app.path().join("config.ini");
+        std::fs::write(
+            &path,
+            "[rest]\nenabled = false\nwindow_minutes = 5\nkey_threshold = 20\ncooldown_minutes = 1\nrest_seconds = 30\ncheck_interval = 5\n[gui]\ntheme = dark\n",
+        )
+        .unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+        cfg.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(cfg.get("gui", "theme"), "dark", "别的节不许被牵连");
+        assert!(
+            !parse_ini(&text).contains_key("rest"),
+            "「rest」这一节读回来还在内存里: {text}"
+        );
+        assert!(!text.contains("[rest]"), "节头留下了: {text}");
+        for key in [
+            "window_minutes",
+            "key_threshold",
+            "cooldown_minutes",
+            "rest_seconds",
+            "check_interval",
+        ] {
+            assert!(!text.contains(key), "这一行没被清掉: {key} 在\n{text}");
+        }
     }
 
     #[test]

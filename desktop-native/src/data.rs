@@ -144,58 +144,9 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         "滚轮合并（秒）",
         "键鼠 · 连续滚动只记一批，防止一滚刷几百次",
     ),
-    // ⚠ 这六格写"没这条功能，改了不生效"而不是"改完立即生效"：原生重写之后没有任何生产
-    // 代码读 `[rest]`（久坐横带没实现，2026-10-31 又把 `core::stats::RestMonitor` 那份零调用方
-    // 的判定一起摘掉了）。本文件上面的文档写着本页的原则是"原生端根本不读的旧键不再暴露"，
-    // 而删掉这六格与把它接回来是两句产品口径，等用户点；这里先停止在屏上许诺一个不存在的功能。
-    (
-        "rest",
-        "enabled",
-        0,
-        "没这条功能，改了不生效",
-        "休息提醒",
-        "休息 · 连续用键鼠太久时提醒你歇一会儿",
-    ),
-    (
-        "rest",
-        "window_minutes",
-        1,
-        "没这条功能，改了不生效",
-        "提醒窗口（分钟）",
-        "休息 · 在多长时间内累计输入量",
-    ),
-    (
-        "rest",
-        "key_threshold",
-        1,
-        "没这条功能，改了不生效",
-        "触发阈值（次）",
-        "休息 · 窗口内输入超过这个次数就提醒",
-    ),
-    (
-        "rest",
-        "cooldown_minutes",
-        1,
-        "没这条功能，改了不生效",
-        "提醒间隔（分钟）",
-        "休息 · 两次提醒之间至少隔多久",
-    ),
-    (
-        "rest",
-        "rest_seconds",
-        1,
-        "没这条功能，改了不生效",
-        "建议休息（秒）",
-        "休息 · 提醒后建议离开屏幕的时间",
-    ),
-    (
-        "rest",
-        "check_interval",
-        1,
-        "没这条功能，改了不生效",
-        "检查间隔（分钟）",
-        "休息 · 多久检查一次要不要提醒",
-    ),
+    // 注：这里不再有 `[rest]` 那六格。久坐提醒在原生重写后没有任何生产代码读它，
+    // 屏上那六行等于替一个不存在的功能许诺（2026-10-31 把 `core::stats::RestMonitor`
+    // 那份零调用方的判定一起摘掉了）；键本身按 `config::DEPRECATED_CONFIG` 在 load 时清掉。
     (
         "gui",
         "active_refresh_interval",
@@ -720,6 +671,71 @@ mod readout_rulers_tests {
                 "设置行 {section}.{key} 在 default_config() 里没有默认值"
             );
         }
+    }
+
+    /// 「高级」那一页左侧那句话说的是这一页有哪几组。行加一组（或删空一组）却忘了改那句，
+    /// 屏上就多一句许诺 —— `[rest]` 那六格被摘掉时，「键鼠、休息、…」这句就是残留的半句。
+    /// 两个方向都钉：页面上每一组的前缀都要在那句话里出现；那句话里每一段都要对上页面上的一组。
+    /// 只钉「高级」这一页，因为只有这一页的行按「分组 · 说明」写，别的分类描述的是按钮行。
+    #[test]
+    fn the_advanced_nav_line_names_exactly_the_groups_on_the_page() {
+        let desc = crate::SETTINGS_CATS[5].1;
+        let mut prefixes: Vec<&str> = SETTINGS
+            .iter()
+            .filter(|(section, ..)| crate::setting_cat(section) == 5)
+            .map(|(_, _, _, _, _, help)| help.split(" · ").next().unwrap_or(help).trim())
+            .collect();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        assert!(
+            prefixes.len() >= 2,
+            "夹具前提：这一页只抠出一组，上面两条比较是空转: {prefixes:?}"
+        );
+        for p in &prefixes {
+            assert!(
+                desc.contains(p),
+                "页面上有「{p}」这一组，左侧那句没提: {desc}"
+            );
+        }
+        for seg in desc.split('、') {
+            assert!(
+                prefixes.iter().any(|p| seg.contains(p)),
+                "左侧那句里的「{seg}」对不上页面上任何一组: {prefixes:?}"
+            );
+        }
+    }
+
+    /// 每一行都得能经得住一次真正的 `load()`：值写在文件里、读回来还在。
+    ///
+    /// 这条盯的是「屏上给改、加载时又抹掉」这一族 —— `DEPRECATED_CONFIG` 里那几行正是被
+    /// 抹掉的一半，而清单与那份名单分属两个 crate，谁都不会红。`[rest]` 那六格从前就卡在
+    /// 中间：加载不清它（所以不是废弃键），可全仓零读点（所以不该出现在这一页）。
+    #[test]
+    fn every_exposed_row_survives_a_real_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "ff_settings_survive_{}_{}",
+            std::process::id(),
+            "exposed_rows"
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("config.ini");
+        let mut text = String::new();
+        for (section, key, ..) in SETTINGS {
+            text.push_str(&format!("[{section}]\n{key} = keepme\n"));
+        }
+        std::fs::write(&path, text).unwrap();
+        let cfg = focusflow_core::config::FocusFlowConfig::load(&path).unwrap();
+        let mut wiped: Vec<String> = Vec::new();
+        for (section, key, ..) in SETTINGS {
+            if cfg.get(section, key) != "keepme" {
+                wiped.push(format!("{section}.{key}"));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            wiped.is_empty(),
+            "这些行在设置页上改得到，但加载时被当作废弃键抹掉了（清单与 DEPRECATED_CONFIG 撞车）: {wiped:?}"
+        );
     }
 
     /// 开关行的说明文字必须装得进它那一列：值框从 x=720 起画，说明从 ~334 起、列宽
