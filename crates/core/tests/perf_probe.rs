@@ -359,7 +359,7 @@ fn perf_probe_full_pass() {
     );
     // ⚠ 上面那个数只是**一条臂**。它从前被引用成"打字热路径的全部成本"，而一次真实按下
     // 在 core 侧还要跑：设备侧信道的两条累加（`writer.rs:529`／`:560`，各一次 `agg` 锁 +
-    // 每事件 1~2 次 `to_string()`；`device_stats.rs:583` 缓存命中那一路还要再 clone 一个
+    // 每事件 1~2 次 `to_string()`；`device_stats.rs` 缓存命中那一路还要再 clone 一个
     // `(String, String)`）。台账里那句「record_key 2.3µs/事件」因此是**低估**，引用它之前
     // 要说清它没覆盖什么。（这里从前还带一条 CPM 滑窗：那条 2026-10-31 按"每事件写、
     // 没人读"摘掉了，屏幕上的「次/分」出自 `desktop-native/src/collect.rs` 另一份滑窗。）

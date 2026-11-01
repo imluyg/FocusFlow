@@ -18,7 +18,9 @@
 //!   执行一次，结果缓存在线程本地 HashMap，此后每事件只查内存
 //! - 鼠标移动等非计数事件走快速出口（读标志位后立即返回）
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::db::DbWriter;
 use crate::listener::{is_paused_now, PauseFlag};
@@ -328,6 +330,73 @@ fn reg_retry_allowed(seconds_since_last_failure: Option<u64>) -> bool {
     }
 }
 
+/// 一条句柄登记过了这么久没再见面就作废（见 `HandleCache`）。
+const DEVICE_CACHE_GRACE_SECS: u64 = 600;
+
+/// 一条登记是否已过宽限期。`now` 早于 `seen`（同一进程内不会，但用例给的是手搓的时刻）
+/// 时按 0 秒算，不许下溢 panic。
+fn cache_entry_expired(seen: Instant, now: Instant, grace_secs: u64) -> bool {
+    now.saturating_duration_since(seen).as_secs() >= grace_secs
+}
+
+/// 按 (句柄数值, 事件类型) 记账、**带宽限期**的缓存。
+///
+/// 为什么要宽限期：句柄数值是系统发的，拔掉设备就回收、之后可能再发给另一台。
+/// 原先两张表只插不删，长跑（托盘挂着几天）的形态是两条：
+/// - 账本单调涨：每次拔插/睡眠唤醒都新领一批数值，旧条目再也没有事件来认领；
+/// - 旧数值被**同类型**设备复用时，缓存把新设备记在旧设备名下 —— 不重解析路径就发现不了，
+///   而重解析正是这层缓存要省掉的开销。久没见面的条目丢掉，下一次事件自然重新登记一次，
+///   两条一起收：错认的窗口从"整个进程寿命"缩到 `DEVICE_CACHE_GRACE_SECS`，
+///   正在用的设备每个事件都刷新时刻，不会被误伤。
+///
+/// 清理只在缓存没命中的那一支跑（每个新句柄一次），不在每事件的热路径上。
+#[cfg_attr(not(windows), allow(dead_code))] // 非 Windows 下调用方（mod win）不存在
+struct HandleCache<V> {
+    grace_secs: u64,
+    items: HashMap<(isize, &'static str), (V, Instant)>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl<V: Clone> HandleCache<V> {
+    fn new(grace_secs: u64) -> Self {
+        Self {
+            grace_secs,
+            items: HashMap::new(),
+        }
+    }
+
+    /// 命中就把时刻刷成 `now` 并返回值；没登记过、或已过宽限期（顺手删掉）返回 `None`。
+    fn see(&mut self, key: (isize, &'static str), now: Instant) -> Option<V> {
+        let grace = self.grace_secs;
+        let expired = match self.items.get(&key) {
+            Some((_, seen)) => cache_entry_expired(*seen, now, grace),
+            None => false,
+        };
+        if expired {
+            self.items.remove(&key);
+            return None;
+        }
+        let (value, seen) = self.items.get_mut(&key)?;
+        *seen = now;
+        Some(value.clone())
+    }
+
+    /// 记下一次登记，并把所有已过宽限期的条目一起丢掉。
+    fn record(&mut self, key: (isize, &'static str), value: V, now: Instant) {
+        let grace = self.grace_secs;
+        self.items
+            .retain(|_, (_, seen)| !cache_entry_expired(*seen, now, grace));
+        self.items.insert(key, (value, now));
+    }
+
+    /// 距离上一次记下这个键多少秒；没有记录（含已被丢掉的）返回 `None`。
+    fn age_secs(&self, key: (isize, &'static str), now: Instant) -> Option<u64> {
+        self.items
+            .get(&key)
+            .map(|(_, seen)| now.saturating_duration_since(*seen).as_secs())
+    }
+}
+
 /// 记一次设备输入（次数 + 键名明细），返回是否真的记了。
 ///
 /// 暂停闸就在这里、且只在这里判一次：读的是与 rdev 主链路 `record_event` **同一份**
@@ -359,7 +428,6 @@ pub(crate) fn record_device_event(
 #[cfg(windows)]
 mod win {
     use std::cell::RefCell;
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use windows::core::w;
@@ -377,7 +445,7 @@ mod win {
     };
 
     use super::classify;
-    use super::{display_name, record_device_event, strip_device_prefix, PauseFlag};
+    use super::{display_name, record_device_event, strip_device_prefix, HandleCache, PauseFlag};
     use crate::db::DbWriter;
 
     /// WndProc 与消息循环同线程，状态走线程本地。
@@ -385,17 +453,20 @@ mod win {
         writer: Arc<DbWriter>,
         /// 与 rdev 主链路共享的暂停位（同一份 `Arc`，见 `listener::PauseFlag`）
         paused: PauseFlag,
-        /// (hDevice 指针值, 事件类型) -> (device_key, 显示名)：设备首个事件登记一次，此后只读。
+        /// (hDevice 指针值, 事件类型) -> (device_key, 显示名)：设备首个事件登记一次，
+        /// 此后每个事件只刷新时刻；久没见面（`DEVICE_CACHE_GRACE_SECS`）的条目作废，
+        /// 该句柄的下一次事件重新解析一次路径。
         /// 拔插后系统会分配新句柄，新句柄重新登记一次（路径相同 → device_key 不变，计数连续）。
         ///
         /// key 必须带上事件类型：句柄数值会被回收复用 —— Windows 关闭移除设备的句柄后，
         /// 同一数值可能发给另一台设备。只按数值缓存时，鼠标句柄的旧值被键盘复用就会把
         /// 键盘事件整段记到那只鼠标名下。按 (数值, 类型) 缓存零成本挡掉这类跨类型串号；
-        /// 同类型复用仍挡不住（识别它要先解析路径，而那正是这层缓存省掉的开销）。
-        devices: HashMap<(isize, &'static str), (String, String)>,
-        /// 路径解析不出来的句柄 -> 上次尝试的时刻。只为节流存在（见 `reg_retry_allowed`）：
-        /// 不记就变成"每个事件重跑一遍注册表查询"，记成永久失败又不给恢复的机会。
-        failed_probe: HashMap<(isize, &'static str), std::time::Instant>,
+        /// 同类型复用只能靠宽限期挡（识别它要先解析路径，而那正是这层缓存省掉的开销）。
+        devices: HandleCache<(String, String)>,
+        /// 路径解析不出来的句柄：值没用，只记"上次试过的时刻"给节流读（见 `reg_retry_allowed`）。
+        /// 不记就变成"每个事件重跑一遍注册表查询"，记成永久失败又不给恢复的机会，
+        /// 所以这张表同样带宽限期 —— 设备真的不在了就不要再替它记账。
+        failed_probe: HandleCache<()>,
     }
 
     thread_local! {
@@ -485,8 +556,8 @@ mod win {
                 *s.borrow_mut() = Some(Sink {
                     writer,
                     paused,
-                    devices: HashMap::new(),
-                    failed_probe: HashMap::new(),
+                    devices: HandleCache::new(super::DEVICE_CACHE_GRACE_SECS),
+                    failed_probe: HandleCache::new(super::DEVICE_CACHE_GRACE_SECS),
                 })
             });
             tracing::info!("设备统计已启动（Raw Input，鼠标+键盘）");
@@ -577,14 +648,16 @@ mod win {
             if !counts {
                 return;
             }
-            // 设备登记：首个事件查一次（路径 + 注册表名），此后全部缓存命中
+            // 设备登记：首个事件查一次（路径 + 注册表名），此后只把时刻刷成"刚见过"；
+            // 久没见面的句柄作废，它下一次事件重新解析一次（见 `HandleCache` 为什么要宽限期）
             let cache_key = (header.hDevice.0 as isize, kind);
-            let entry = match self.devices.get(&cache_key) {
-                Some(e) => e.clone(),
+            let now = std::time::Instant::now();
+            let entry = match self.devices.see(cache_key, now) {
+                Some(e) => e,
                 None => match register_device(header.hDevice) {
                     Some(e) => {
                         tracing::info!("设备统计：登记新设备 {}", e.0);
-                        self.devices.insert(cache_key, e.clone());
+                        self.devices.record(cache_key, e.clone(), now);
                         e
                     }
                     None => {
@@ -593,13 +666,9 @@ mod win {
                         // Raw Input 的消息循环线程上，而模块头承诺的是"首个事件查一次"。
                         // 现在按句柄节流，并且**出声一次**：这台设备不会出现在排行里，
                         // 一声不响就没人知道它为什么不见。
-                        let now = std::time::Instant::now();
-                        let since = self
-                            .failed_probe
-                            .get(&cache_key)
-                            .map(|t| t.elapsed().as_secs());
+                        let since = self.failed_probe.age_secs(cache_key, now);
                         if super::reg_retry_allowed(since) {
-                            self.failed_probe.insert(cache_key, now);
+                            self.failed_probe.record(cache_key, (), now);
                             tracing::warn!(
                                 "设备统计：设备句柄 {:#x}（{}）的实例路径解析不出来，本次不计；\
                                  每 {} 秒再试一次（拔插进行中或注册表正被占用时就是这个形态）",
@@ -1064,5 +1133,132 @@ mod tests {
                 println!("{kind:9} | {name}\n            {key}");
             }
         }
+    }
+
+    /// 句柄数值会被系统回收复用，拔插与睡眠唤醒各造一批新数值 —— 登记缓存必须有宽限期。
+    ///
+    /// 旧写法是两张只插不删的 HashMap：长跑（托盘挂着几天）一是把拔插历史全留在账里，
+    /// 二是被同类型设备复用的旧数值会一直顶着旧设备的名字记数。这里钉的是
+    /// "命中刷新时刻 / 到点既不给值也真的删掉"。
+    #[test]
+    fn an_absent_device_handle_loses_its_cache_entry_after_the_grace() {
+        let t0 = Instant::now();
+        let later = |secs: u64| t0 + std::time::Duration::from_secs(secs);
+        let key = (0x1234isize, "mouse");
+        let value = ("k1".to_string(), "HID 鼠标 · 24AE/1464".to_string());
+        let mut cache: HandleCache<(String, String)> = HandleCache::new(DEVICE_CACHE_GRACE_SECS);
+        cache.record(key, value.clone(), t0);
+
+        // 宽限期内命中：值照给
+        assert_eq!(
+            cache.see(key, later(DEVICE_CACHE_GRACE_SECS - 1)),
+            Some(value.clone()),
+            "没到点就把设备丢掉，等于每个事件重跑一遍注册表查询"
+        );
+        // 命中把时刻刷成了 t0+599，所以 t0+1198 仍然只隔了 599 秒 —— 正在用的设备不许被误伤
+        assert_eq!(
+            cache.see(key, later(2 * DEVICE_CACHE_GRACE_SECS - 2)),
+            Some(value.clone()),
+            "一直在发事件的设备不该因为「总时长」过宽限期而掉出排行"
+        );
+        // 真过了宽限期：不给值，而且要真的从表里删掉（只"不给值"照样是单调涨）。
+        // 时刻已刷到 t0+1198，所以到点的那一刻是 t0+1198+600。
+        assert_eq!(
+            cache.see(key, later(3 * DEVICE_CACHE_GRACE_SECS - 2)),
+            None,
+            "久没见面的句柄不能再顶着旧设备的登记"
+        );
+        assert_eq!(cache.items.len(), 0, "过期条目要真的丢掉，不是留着占位");
+    }
+
+    /// 每来一个新句柄就把旧账一起清掉 —— 这条才是"只插不删"那处增长的判据。
+    #[test]
+    fn a_new_device_handle_also_sweeps_the_dead_ones() {
+        let t0 = Instant::now();
+        let mut cache: HandleCache<u32> = HandleCache::new(DEVICE_CACHE_GRACE_SECS);
+        // 模拟 200 次拔插：每次都留下一个再也不会出现的句柄数值
+        for i in 0..200u32 {
+            cache.record((i as isize, "keyboard"), i, t0);
+        }
+        assert_eq!(cache.items.len(), 200, "都还在宽限期内时不许误伤");
+        cache.record(
+            (999, "keyboard"),
+            999,
+            t0 + std::time::Duration::from_secs(DEVICE_CACHE_GRACE_SECS + 1),
+        );
+        assert_eq!(
+            cache.items.len(),
+            1,
+            "新登记一次就是清理的机会：长跑不许把拔插历史全留着"
+        );
+    }
+
+    /// 宽限期算式的边界：`now` 早于 `seen` 时不许下溢 panic，`grace = 0` 是立刻作废。
+    #[test]
+    fn the_grace_math_does_not_underflow() {
+        let t0 = Instant::now();
+        assert!(
+            !cache_entry_expired(t0 + std::time::Duration::from_secs(10), t0, 1),
+            "拿到的 now 比登记时刻还早时要按 0 秒算，不能让减法 panic"
+        );
+        assert!(cache_entry_expired(
+            t0,
+            t0 + std::time::Duration::from_secs(1),
+            1
+        ));
+        assert!(
+            cache_entry_expired(t0, t0, 0),
+            "宽限期为 0 就是每次都重解析，不许判成「还没到点」"
+        );
+    }
+
+    /// 解析不出路径的那张节流账本同理：它也得随宽限期一起瘦，但到点要给下一次机会。
+    #[test]
+    fn the_failed_probe_ledger_gives_a_retry_then_forgets_the_dead_handle() {
+        let t0 = Instant::now();
+        let later = |secs: u64| t0 + std::time::Duration::from_secs(secs);
+        let dead = (0x777isize, "mouse");
+        let mut probes: HandleCache<()> = HandleCache::new(DEVICE_CACHE_GRACE_SECS);
+        probes.record(dead, (), t0);
+
+        assert_eq!(probes.age_secs(dead, later(59)), Some(59));
+        assert!(
+            !reg_retry_allowed(probes.age_secs(dead, later(59))),
+            "60 秒之内不许再跑一遍注册表查询"
+        );
+        assert!(reg_retry_allowed(probes.age_secs(dead, later(61))));
+
+        // 此后这只句柄再也不出现：宽限期一到，别的登记就把它的账一起清掉
+        probes.record(
+            (0x888, "keyboard"),
+            (),
+            later(DEVICE_CACHE_GRACE_SECS + 100),
+        );
+        assert_eq!(probes.items.len(), 1, "拔走的句柄不留在账里替它记账");
+        assert_eq!(probes.age_secs(dead, t0), None);
+    }
+
+    /// 接线守卫：热路径必须真的走带宽限期那张缓存 —— 上面几条纯函数绿不代表调用方读了它。
+    #[test]
+    fn on_input_uses_the_expiring_cache_on_both_maps() {
+        let src = include_str!("device_stats.rs");
+        let start = src.find("fn on_input(").expect("Sink::on_input 不见了");
+        let end = src[start..]
+            .find("fn register_device(")
+            .map(|n| n + start)
+            .expect("register_device 不见了");
+        let body = &src[start..end];
+        assert!(
+            body.contains("self.devices.see(cache_key, now)"),
+            "命中那一路又回到只插不删的 get/clone"
+        );
+        assert!(
+            body.contains("self.devices.record(cache_key, e.clone(), now)"),
+            "登记那一路没走带清理的写入"
+        );
+        assert!(
+            body.contains("self.failed_probe.age_secs(cache_key, now)"),
+            "节流还在读旧的第二张表 ⇒ 那张表一样没人清"
+        );
     }
 }
