@@ -111,6 +111,26 @@ pub(crate) const WM_SNIP_NOTE: u32 = WM_APP + 14;
 /// 搜索框那个原生 EDIT 的焦点变化：`WPARAM` 1=拿到焦点、0=交出去。
 /// 父窗要靠它决定"这一帧该不该在框里写提示文案"——控件有焦点时那块矩形归控件画。
 const WM_SEARCH_FOCUS: u32 = WM_APP + 15;
+/// 两个 EDIT 各用哪一个子类 id。子类过程收到的第 5 个参数就是这个 id，
+/// 第 6 个参数是 `SetWindowSubclass` 的 `dwRefData`（两处都传 0，**不能拿它分角色**——
+/// 从前拿它比 2，于是搜索框的焦点永远递不回来，提示文案照旧压在控件上，2026-11-01 屏上量到）。
+const RENAME_EDIT_SUBCLASS: usize = 1;
+const SEARCH_EDIT_SUBCLASS: usize = 2;
+
+/// 哪一条消息要把焦点变化递回父窗：只有搜索框那个 EDIT。
+///
+/// 抽成纯函数是因为这条缺陷的形状是"参数拿错"——`edit_proc` 里比错一位，屏上只是"提示没让位"，
+/// 编译、lint、现有腿全都不会红。id 与消息的对应关系放在这里就能被用例钉住。
+fn search_focus_signal(id: usize, msg: u32) -> Option<bool> {
+    if id != SEARCH_EDIT_SUBCLASS {
+        return None;
+    }
+    match msg {
+        WM_SETFOCUS => Some(true),
+        WM_KILLFOCUS => Some(false),
+        _ => None,
+    }
+}
 const TIMER_EVENTS: usize = 1;
 /// EDIT 。
 const EM_SETSEL: u32 = 0x00B1;
@@ -3139,11 +3159,12 @@ impl App {
             // 所以提示由父窗画，但**只在控件没拿到焦点时画**：那块矩形属于子窗口，
             // 焦点一进框，父窗再写同样的字就是两块表面抢同一批像素（看得见提示、
             // 看不见光标，重绘交替时就是他报的那句"没有用户输入的字时字体闪烁"）。
-            // 焦点状态由 `edit_proc` 在 WM_SETFOCUS / WM_KILLFOCUS 上递回来。
+            // 焦点状态由 `edit_proc` 在 WM_SETFOCUS / WM_KILLFOCUS 上递回来，
+            // 靠的是这里传的子类 id（`SEARCH_EDIT_SUBCLASS`）——不是最后那个 dwRefData。
             // 复用同一个子类过程：为的是 Enter/Esc 也走 WM_EDIT_DONE 那条回执（搜索框这一路
             // `finish_edit` 看到 edit_target 为空会直接返回，不动任何一行）。
             // 深色底与字色不是它给的 —— 那是父窗口接 `WM_CTLCOLOREDIT` 喂的刷子。
-            let _ = SetWindowSubclass(h, Some(edit_proc), 2, 0);
+            let _ = SetWindowSubclass(h, Some(edit_proc), SEARCH_EDIT_SUBCLASS, 0);
         }
         self.search_edit = Some(h);
         h
@@ -3227,7 +3248,7 @@ impl App {
                 Some(WPARAM(self.ui_font.0 as usize)),
                 Some(LPARAM(1)),
             );
-            let _ = SetWindowSubclass(h, Some(edit_proc), 1, 0);
+            let _ = SetWindowSubclass(h, Some(edit_proc), RENAME_EDIT_SUBCLASS, 0);
         }
         self.edit = Some(h);
         h
@@ -9827,7 +9848,7 @@ unsafe extern "system" fn edit_proc(
     msg: u32,
     w: WPARAM,
     l: LPARAM,
-    _id: usize,
+    id: usize,
     _data: usize,
 ) -> LRESULT {
     const VK_RETURN: usize = 0x0D;
@@ -9842,12 +9863,19 @@ unsafe extern "system" fn edit_proc(
                 LRESULT(0)
             }
             WM_CHAR if w.0 == VK_RETURN || w.0 == VK_ESCAPE => LRESULT(0),
-            // 搜索框（子类 id 就是这里的 `_data`）的焦点变化递回父窗：提示文案由父窗画，
-            // 但只有控件没拿到焦点时才能画在那块矩形上（见 `SEARCH_CUE` 与 `ensure_search_edit`）。
-            WM_SETFOCUS | WM_KILLFOCUS if _data == 2 => {
-                let on = if msg == WM_SETFOCUS { 1usize } else { 0 };
-                if let Ok(parent) = GetParent(hwnd) {
-                    let _ = PostMessageW(Some(parent), WM_SEARCH_FOCUS, WPARAM(on), LPARAM(0));
+            // 焦点变化递回父窗：提示文案由父窗画，但只有控件没拿到焦点时才能画在那块矩形上
+            // （见 `SEARCH_CUE` 与 `ensure_search_edit`）。哪个 EDIT 该递、哪条消息算"拿到"，
+            // 全在 `search_focus_signal` 那一份判据里。
+            WM_SETFOCUS | WM_KILLFOCUS => {
+                if let Some(on) = search_focus_signal(id, msg) {
+                    if let Ok(parent) = GetParent(hwnd) {
+                        let _ = PostMessageW(
+                            Some(parent),
+                            WM_SEARCH_FOCUS,
+                            WPARAM(on as usize),
+                            LPARAM(0),
+                        );
+                    }
                 }
                 DefSubclassProc(hwnd, msg, w, l)
             }
@@ -14073,7 +14101,10 @@ mod clip_tests {
     ///
     /// 这条缺陷的形状不是"算错了"，是两块表面往同一批像素上写字：那块矩形属于叠在底框上的
     /// 原生 EDIT，父窗有焦点时照样往那儿画提示，就出现"看得见提示、看不见光标、字在闪"。
-    /// 屏上的交替抓不稳（连拍只量得到自己那档间隔），所以钉这三处形态。
+    /// ⚠ 上一版这条腿把 `WM_SETFOCUS|WM_KILLFOCUSif_data==2` 原样钉了进来 —— **守卫把缺陷钉成了
+    /// 规格**：子类过程的第 5 个参数才是子类 id，第 6 个是两处都传 0 的 `dwRefData`，那一支
+    /// 永远不成立，于是修复上线后屏上仍是"焦点在 EDIT 上而提示照旧在画"
+    /// （2026-11-01 用 `search_geom_probe.ps1` + 连拍抓屏现量）。所以这里钉的是**角色从哪儿取**。
     #[test]
     fn the_hint_yields_the_box_to_the_control_that_owns_it() {
         let src = include_str!("main.rs").replace("\r\n", "\n");
@@ -14084,12 +14115,70 @@ mod clip_tests {
             "父窗又无条件把提示字画进控件的矩形里了：有焦点时就是闪烁"
         );
         assert!(
-            flat.contains("WM_SETFOCUS|WM_KILLFOCUSif_data==2"),
-            "搜索框的焦点变化没递回父窗，父窗无从知道该不该让位"
+            flat.contains("search_focus_signal(id,msg)"),
+            "子类过程不按第 5 个参数（子类 id）认角色了：焦点递不回来，提示永远压在控件上"
+        );
+        assert!(
+            !flat.contains("if_data=="),
+            "又拿 `dwRefData` 当子类 id 用了 —— 两处 SetWindowSubclass 传的都是 0"
         );
         assert!(
             flat.contains("app.search_focused=w.0!=0"),
             "收回来的焦点位没落到 App 上"
+        );
+        // 两个 EDIT 各占一个 id，且这两个 id 必须真的不同：相同就没有这条角色轴可言。
+        assert_ne!(SEARCH_EDIT_SUBCLASS, RENAME_EDIT_SUBCLASS);
+        for (call, name) in [
+            (
+                "SetWindowSubclass(h,Some(edit_proc),SEARCH_EDIT_SUBCLASS,0)",
+                "搜索框",
+            ),
+            (
+                "SetWindowSubclass(h,Some(edit_proc),RENAME_EDIT_SUBCLASS,0)",
+                "改名框",
+            ),
+        ] {
+            assert!(
+                flat.contains(call),
+                "{name}那一支子类化没按 id 注册了：父窗分不出是谁在递焦点"
+            );
+        }
+    }
+
+    /// 焦点信号只属于搜索框那一支，两条消息的方向也不能反。
+    ///
+    /// 抽成纯函数就是为了这一条：`edit_proc` 是 `extern "system"`，无头造不出"子类过程收到一条
+    /// WM_SETFOCUS"，而它偏偏是本场唯一在屏上量到过的缺陷。剩下的接线由上面那条腿钉。
+    #[test]
+    fn only_the_search_edit_reports_focus() {
+        assert_eq!(
+            search_focus_signal(SEARCH_EDIT_SUBCLASS, WM_SETFOCUS),
+            Some(true),
+            "焦点进框没递回'该让位'"
+        );
+        assert_eq!(
+            search_focus_signal(SEARCH_EDIT_SUBCLASS, WM_KILLFOCUS),
+            Some(false),
+            "焦点出框没递回'该把提示画回来'"
+        );
+        assert_eq!(
+            search_focus_signal(RENAME_EDIT_SUBCLASS, WM_SETFOCUS),
+            None,
+            "改名框开始递焦点了"
+        );
+        assert_eq!(
+            search_focus_signal(RENAME_EDIT_SUBCLASS, WM_KILLFOCUS),
+            None
+        );
+        assert_eq!(
+            search_focus_signal(SEARCH_EDIT_SUBCLASS, WM_CHAR),
+            None,
+            "打字被当成焦点变化"
+        );
+        assert_eq!(
+            search_focus_signal(0, WM_SETFOCUS),
+            None,
+            "没带 id 的调用被当成搜索框"
         );
     }
 
