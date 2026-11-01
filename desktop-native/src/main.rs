@@ -3126,8 +3126,9 @@ impl App {
                 Some(WPARAM(self.ui_font.0 as usize)),
                 Some(LPARAM(1)),
             );
-            // 复用同一个子类过程：只为了拿到深色底与字色（Enter/Esc 在这里没有意义，
-            // `finish_edit` 看到 edit_target 为空会直接返回）。
+            // 复用同一个子类过程：为的是 Enter/Esc 也走 WM_EDIT_DONE 那条回执（搜索框这一路
+            // `finish_edit` 看到 edit_target 为空会直接返回，不动任何一行）。
+            // 深色底与字色不是它给的 —— 那是父窗口接 `WM_CTLCOLOREDIT` 喂的刷子。
             let _ = SetWindowSubclass(h, Some(edit_proc), 2, 0);
         }
         self.search_edit = Some(h);
@@ -3147,15 +3148,8 @@ impl App {
             return;
         }
         unsafe {
-            let _ = SetWindowPos(
-                edit,
-                None,
-                ((sb.left + 8.0) * s) as i32,
-                ((sb.top + 3.0) * s) as i32,
-                ((sb.right - sb.left - 16.0) * s) as i32,
-                ((sb.bottom - sb.top - 6.0) * s) as i32,
-                SWP_NOZORDER,
-            );
+            let (ex, ey, ew, eh) = search_edit_px(sb, s);
+            let _ = SetWindowPos(edit, None, ex, ey, ew, eh, SWP_NOZORDER);
             let _ = ShowWindow(edit, SW_SHOW);
         }
     }
@@ -3904,9 +3898,23 @@ const ACTIONS: [(&str, &str); 8] = [
     ),
 ];
 
-/// 设置页右上角那个搜索框的底框（真正的输入是叠在它上面的原生 EDIT，见 `ensure_search_edit`）。
+/// 搜索框那块底框（真正的输入是叠在它上面的原生 EDIT，见 `ensure_search_edit`）。
 fn search_box_rect(w: f32) -> D2D_RECT_F {
     rect(w - 16.0 - 16.0 - 260.0, 218.0, 260.0, 26.0)
+}
+
+/// 叠在底框里的原生 EDIT 的位置与尺寸（物理像素）：底框内缩 8/3，两边各再留 8、上下各留 3。
+///
+/// 抽成独立函数是为了让"输入框必须跟着自己那块底框走"这条能被用例钉住 —— 底框是按
+/// **客户区宽度右边**定位的，窗口一改尺寸它就挪，输入框不跟着重算就与底框分家
+/// （屏上剩一个点不动的空框，占位文案还在原地跟着每一拍重绘闪）。
+fn search_edit_px(sb: D2D_RECT_F, s: f32) -> (i32, i32, i32, i32) {
+    (
+        ((sb.left + 8.0) * s) as i32,
+        ((sb.top + 3.0) * s) as i32,
+        ((sb.right - sb.left - 16.0) * s) as i32,
+        ((sb.bottom - sb.top - 6.0) * s) as i32,
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // 一屏要画的东西就是这些参数；打包成结构体只会让调用点多抄一遍
@@ -10029,6 +10037,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         app.was_maximized = zoomed;
                         fix_backdrop(hwnd);
                     }
+                    // 搜索框那块底框是按客户区宽度**右边**定位的（`search_box_rect`），
+                    // 而叠在上面的原生 EDIT 从前只在点「设置」页签那一下摆位：窗口一改变
+                    // 尺寸（拖大、最大化、换缩放）两者就分家 —— 屏上剩一个没有输入窗口的
+                    // 底框，点下去没反应，占位文案留在原地跟每一拍重绘一起闪。
+                    // 摆位不能挪到画图那条路上（在 WM_PAINT 里动窗位会重入）。
+                    app.place_search_edit(hwnd);
                 }
             }
             unsafe {
@@ -10071,6 +10085,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     fix_backdrop(hwnd);
                 }
                 if resized {
+                    // 拖拽期间 WM_SIZE 那一条被 `in_size_move` 挡下了，摆位要在这一拍补：
+                    // 不然用户拖着边框把窗口改宽，设置页那个搜索框的输入窗口还留在老位置，
+                    // 底框与输入框分家之后的症状与「点搜索框没反应」是同一条。
+                    app.place_search_edit(hwnd);
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -13952,6 +13970,58 @@ mod clip_tests {
             flat.matches("rect(cx+12.0,142.0,cw-24.0,16.0)").count(),
             1,
             "预算与矩形不再是同一个宽度表达式（cw-24.0 那一档）"
+        );
+    }
+
+    /// 搜索框里那个原生 EDIT 的矩形必须是自己那块底框内缩而来，并跟着底框一起走。
+    ///
+    /// 底框按客户区宽度**右边**定位，所以窗口一改尺寸它就挪；输入框不跟着重算就分家 ——
+    /// 屏上剩一个点下去没反应的空框，占位文案留在原地跟着每一拍重绘闪（他报的那两条症状
+    /// 是同一条的两个面）。
+    #[test]
+    fn the_search_edit_rect_follows_its_own_box() {
+        let box_at_1200 = search_box_rect(1200.0);
+        let (x, y, ew, eh) = search_edit_px(box_at_1200, 1.0);
+        assert_eq!((x, y), (916, 221), "底框内缩 8/3 那道边没了：{x},{y}");
+        assert_eq!((ew, eh), (244, 20), "输入框的尺寸不再等于底框减去两边");
+        // 窗口加宽 400：右边定位的底框整块往右挪 400，输入框必须一起挪
+        let box_at_1600 = search_box_rect(1600.0);
+        assert_eq!(
+            search_edit_px(box_at_1600, 1.0).0 - x,
+            400,
+            "输入框没跟着自己的底框走"
+        );
+        // 缩放档位要一起进算式（150% 时交回的是物理像素）
+        assert_eq!(search_edit_px(box_at_1200, 1.5).0, (916.0 * 1.5) as i32);
+    }
+
+    /// 接线腿：窗口几何变的那两条消息都必须重摆输入框。
+    /// 上面那条纯函数只证明"算得对"，摆位没人调它照样分家。
+    #[test]
+    fn the_geometry_messages_replace_the_search_edit() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        for (name, until) in [
+            ("WM_SIZE =>", "WM_ENTERSIZEMOVE =>"),
+            ("WM_EXITSIZEMOVE =>", "WM_DPICHANGED =>"),
+        ] {
+            let at = prod.find(name).unwrap_or_else(|| panic!("{name} 不见了"));
+            let end = prod[at..]
+                .find(until)
+                .map(|n| n + at)
+                .unwrap_or_else(|| panic!("{until} 不见了"));
+            let body = &prod[at..end];
+            assert!(
+                body.contains("app.place_search_edit(hwnd)"),
+                "{name} 这一拍没有重摆搜索框的输入窗口：拖大窗口或最大化之后点它没反应"
+            );
+        }
+        // 摆位一共三处：进设置页那一下、WM_SIZE、拖拽结束。多一处少一处都要红。
+        assert_eq!(
+            prod.matches("place_search_edit(hwnd)").count(),
+            3,
+            "搜索框的摆位调用点数变了"
         );
     }
 
