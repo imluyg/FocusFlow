@@ -2713,9 +2713,26 @@ unsafe fn on_key(hwnd: HWND, vk: usize) {
     }
 }
 
+/// 撤销与重做各存多少步。每一步存的是"当前所有标注整份克隆"（搬一笔、删一笔都要能
+/// 原样退回去），而一场里画多少笔没有上界，画笔每走过一个点还多一个坐标 ⇒ 不设上限
+/// 就是二次方增长：一场画三百笔要留三百份越来越大的快照，常驻到这一场结束。
+const UNDO_STEPS_MAX: usize = 50;
+
+/// 压一份快照，并把栈钳在上限内：从栈底挤，也就是最早的那几步先没。
+///
+/// 抽成独立函数有两个原因：这一钳位四路共用（撤销压重做、重做压撤销各一次），
+/// 以及 `SNIP` 那份全局状态要真窗口才起得来，钳位本身得能单测。
+fn push_history_snapshot(stack: &mut Vec<Vec<Mark>>, snapshot: Vec<Mark>) {
+    stack.push(snapshot);
+    if stack.len() > UNDO_STEPS_MAX {
+        let overflow = stack.len() - UNDO_STEPS_MAX;
+        stack.drain(..overflow);
+    }
+}
+
 /// 改动任何一笔之前先压一份当前状态：一次加笔、一次拖动、一次删除都恰好是一步撤销。
 fn push_undo(s: &mut SnipState) {
-    s.undo_stack.push(s.marks.clone());
+    push_history_snapshot(&mut s.undo_stack, s.marks.clone());
     s.redo_stack.clear();
     s.selected = None;
 }
@@ -2726,7 +2743,7 @@ fn push_undo(s: &mut SnipState) {
 fn push_undo_if_pending(s: &mut SnipState) {
     if s.undo_pending {
         s.undo_pending = false;
-        s.undo_stack.push(s.marks.clone());
+        push_history_snapshot(&mut s.undo_stack, s.marks.clone());
         s.redo_stack.clear();
     }
 }
@@ -2735,7 +2752,7 @@ fn undo() {
     if let Ok(mut s) = SNIP.lock() {
         if let Some(prev) = s.undo_stack.pop() {
             let cur = s.marks.clone();
-            s.redo_stack.push(cur);
+            push_history_snapshot(&mut s.redo_stack, cur);
             s.marks = prev;
             s.selected = None;
         }
@@ -2746,7 +2763,7 @@ fn redo_mark() {
     if let Ok(mut s) = SNIP.lock() {
         if let Some(next) = s.redo_stack.pop() {
             let cur = s.marks.clone();
-            s.undo_stack.push(cur);
+            push_history_snapshot(&mut s.undo_stack, cur);
             s.marks = next;
             s.selected = None;
         }
@@ -7171,6 +7188,49 @@ mod tests {
             s.undo_stack.len(),
             1,
             "一次拖动该是一步撤销，不是每像素一步"
+        );
+    }
+
+    /// 撤销/重做的每一步都是一整场标注的克隆，而一场画多少笔没有上界 ⇒ 步数必须有上限，
+    /// 且钳掉的是**最早**那几步：用户能撤销的是刚才这一段，不是开场那一笔。
+    #[test]
+    fn the_undo_history_keeps_the_recent_steps_and_drops_the_oldest() {
+        let mut stack: Vec<Vec<Mark>> = Vec::new();
+        // 第 i 步的快照里有 i 笔：拿笔数当身份证，才看得出留下的到底是哪几步
+        for i in 0..(UNDO_STEPS_MAX + 10) {
+            push_history_snapshot(&mut stack, vec![mk(Shape::Block(0, 0, 8, 8), 3); i]);
+        }
+        assert_eq!(
+            stack.len(),
+            UNDO_STEPS_MAX,
+            "钳不住就是每笔多一份越来越大的快照，常驻到这一场结束"
+        );
+        assert_eq!(
+            stack.first().map(|m| m.len()),
+            Some(10),
+            "该从栈底挤：先没的是最早的那十步"
+        );
+        assert_eq!(
+            stack.last().map(|m| m.len()),
+            Some(UNDO_STEPS_MAX + 9),
+            "最近这一步必须在"
+        );
+    }
+
+    /// 接线守卫：四处写历史的地方都得走这把钳子（纯函数绿不代表调用方用了它）。
+    #[test]
+    fn every_history_write_goes_through_the_clamp() {
+        let src = include_str!("snip.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        let n = flat.matches("push_history_snapshot(&mut").count();
+        assert_eq!(
+            n, 4,
+            "撤销/重做一共四处写入要钳步数（两处压撤销、一处压重做、一处压回撤销），实际 {n}"
+        );
+        assert!(
+            !flat.contains("s.undo_stack.push(") && !flat.contains("s.redo_stack.push("),
+            "还有一处直接 push 绕过了上限"
         );
     }
 
