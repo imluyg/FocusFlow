@@ -4141,14 +4141,13 @@ fn draw_settings(
                         } else {
                             &row.value
                         };
+                        // 值框是定宽（150 DIP 再减按钮那一颗），而里面吃的是 config.ini 里
+                        // 那一行的原文：`[app_stats] exclude` 就是"进程名逗号分隔"，五个进程
+                        // 名 ~380 px 压进 ~96-134 px 的格子，越出去的字直接盖到右边那句说明上。
+                        let val_w = vb.right - vb.left - if btn.is_some() { 54.0 } else { 16.0 };
                         p.text(
-                            shown,
-                            rect(
-                                vb.left + 8.0,
-                                vb.top,
-                                vb.right - vb.left - if btn.is_some() { 54.0 } else { 16.0 },
-                                vb.bottom - vb.top,
-                            ),
+                            &clip_middle(shown, char_budget_at(val_w, SETTINGS_TEXT_PT)),
+                            rect(vb.left + 8.0, vb.top, val_w, vb.bottom - vb.top),
                             &p.fmt.text13,
                             if capturing {
                                 &p.br.accent
@@ -4649,9 +4648,12 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
     p.round(close, R_CONTROL, &p.br.header, None);
     p.text("✕", close, &p.fmt.center_small, &p.br.muted);
 
+    // 弹窗里名字与副行共用同一个宽度：别名可到 24 个汉字，兜底名截到 40 字符，
+    // 而"原名"那一行是把两者拼在一起说的 —— 不夹就越出卡片边、画到那层深色遮罩上。
+    let detail_w = dialog.right - x - 20.0;
     p.text(
-        &d.name,
-        rect(x, dialog.top + 40.0, dialog.right - x - 20.0, 20.0),
+        &clip_middle(&d.name, char_budget_at(detail_w, BODY_PT)),
+        rect(x, dialog.top + 40.0, detail_w, 20.0),
         &p.fmt.body,
         &p.br.fg,
     );
@@ -4668,8 +4670,8 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
         kind.to_string()
     };
     p.text(
-        &sub,
-        rect(x, dialog.top + 62.0, dialog.right - x - 20.0, 18.0),
+        &clip_middle(&sub, char_budget_at(detail_w, CAPTION_PT)),
+        rect(x, dialog.top + 62.0, detail_w, 18.0),
         &p.fmt.caption,
         &p.br.muted,
     );
@@ -5273,10 +5275,15 @@ fn draw_goal_strip(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     let met = today >= goal;
 
     p.text(
-        &format!(
-            "今日 {} / {}",
-            thousands(today as u64),
-            thousands(goal as u64)
+        // 这一句只给 150 DIP，进度条从 r.left + pad + 158 起画 —— 七位今日 + 七位目标
+        // 就 ~170 px，数字会压在条子上。夹取留头也留尾，尾巴是那个目标值。
+        &clip_middle(
+            &format!(
+                "今日 {} / {}",
+                thousands(today as u64),
+                thousands(goal as u64)
+            ),
+            char_budget_at(150.0, BODY_PT),
         ),
         rect(r.left + pad, r.top + 14.0, 150.0, 18.0),
         &p.fmt.body,
@@ -8558,7 +8565,9 @@ fn chart_tip(p: &P<'_>, card: D2D_RECT_F, at: Vector2, text: &str) {
     let y = (at.Y - 26.0).clamp(card.top + 4.0, (card.bottom - 20.0).max(card.top + 4.0));
     p.round(rect(x, y, w, 18.0), R_CONTROL, &p.br.header, None);
     p.text(
-        text,
+        // 气泡是定宽那颗（150 与卡片宽取小），而句子里吃的是库里的日期串与千分位数字：
+        // "2026-11-01 · 1,234,567 次" 就到 ~165 px。不夹就是字越出圆角框自己的边。
+        &clip_middle(text, char_budget_at(w - 12.0, SMALL_PT)),
         rect(x + 6.0, y + 1.0, w - 12.0, 16.0),
         &p.fmt.small,
         &p.br.fg,
@@ -9583,9 +9592,9 @@ fn build_formats(dw: &IDWriteFactory) -> windows::core::Result<Formats> {
         caption_center: center_format_w(dw, CAPTION_PT, UI_WEIGHT_REG)?,
         nav_item: text_format(dw, SETTINGS_TEXT_PT, UI_WEIGHT_REG)?,
         body: text_format(dw, BODY_PT, UI_WEIGHT)?,
-        small: text_format(dw, 12.0, UI_WEIGHT)?,
-        right: right_format(dw, 12.0)?,
-        center_small: center_format(dw, 12.0)?,
+        small: text_format(dw, SMALL_PT, UI_WEIGHT)?,
+        right: right_format(dw, SMALL_PT)?,
+        center_small: center_format(dw, SMALL_PT)?,
         center_tiny: center_format(dw, 9.0)?,
         tab: center_format(dw, BODY_PT)?,
         settings_h: text_format(dw, 16.0, DWRITE_FONT_WEIGHT_BOLD)?,
@@ -9667,6 +9676,9 @@ const CAPTION_PT: f32 = 12.5;
 /// 与前两档同一个理由：设备名、插件名这类**画在定宽格子里的动态文本**要按这一档算字符
 /// 预算，字号写两遍就等于两把尺子（这块 UI 不按矩形裁切，超出去的字照画）。
 const BODY_PT: f32 = 13.5;
+/// 最小的一档（`small` / `right` / `center_small`）：图上悬停读数吃的是它，
+/// 而那颗气泡只有 150 DIP 宽 —— 预算与字号同样得是同一把尺子。
+const SMALL_PT: f32 = 12.0;
 
 fn right_format(dw: &IDWriteFactory, size: f32) -> windows::core::Result<IDWriteTextFormat> {
     right_format_w(dw, size, UI_WEIGHT)
@@ -14055,7 +14067,8 @@ mod clip_tests {
         );
     }
 
-    /// 又四处定宽格子接上同一道夹取：设备名、左表页脚那句、插件名、插件第二行说明。
+    /// 又一批定宽格子接上同一道夹取：设备名、左表页脚那句、插件名 / 版本作者 / 第二行 /
+    /// 头部目录 / 目录读不动那句、设置页的值框、设备详情弹窗那两行、图上悬停读数、目标条那句。
     ///
     /// 这块 UI 的文本是 `NO_WRAP` 且不设 `DWRITE_TRIMMING` —— 越界不是"被截断"，是照画到
     /// 邻居身上（设备那一列窄窗口只有 ~200 px，而别名上限 24 个汉字、兜底名截到 40 字符，
@@ -14089,6 +14102,15 @@ mod clip_tests {
             "clip_middle(&text,char_budget_at(desc_w,CAPTION_PT)),rect(r.left+8.0,y+23.0,desc_w,16.0)",
             "char_budget_at(520.0,CAPTION_PT)",
             "char_budget_at(card.right-card.left-32.0,CAPTION_PT)",
+            // 值框：预算与画它的矩形共用 val_w（那一格还要给右边的按钮让位）
+            "clip_middle(shown,char_budget_at(val_w,SETTINGS_TEXT_PT)),rect(vb.left+8.0,vb.top,val_w,vb.bottom-vb.top)",
+            // 设备详情弹窗：名字与副行同一个 detail_w
+            "clip_middle(&d.name,char_budget_at(detail_w,BODY_PT)),rect(x,dialog.top+40.0,detail_w,20.0)",
+            "clip_middle(&sub,char_budget_at(detail_w,CAPTION_PT)),rect(x,dialog.top+62.0,detail_w,18.0)",
+            // 图上悬停读数：夹的是气泡里面那一条
+            "clip_middle(text,char_budget_at(w-12.0,SMALL_PT)),rect(x+6.0,y+1.0,w-12.0,16.0)",
+            // 目标条那句"今日 N / M"：150 之后 8 px 就是进度条
+            "char_budget_at(150.0,BODY_PT)",
         ] {
             assert_eq!(
                 flat.matches(needle).count(),
