@@ -778,15 +778,17 @@ pub fn register_host_api(
     })?;
     host.set("accounting_subcategory_delete", acc_sub_del)?;
 
-    // 子分类列表
+    // 子分类列表：`(名字数组, 这一轮没答上来的原因)`，与上面 accounting_categories 同形状。
+    // 第二个值必须交出去：面板的下拉框与「分类管理」右侧那张表只有这一份清单可看，
+    // 读不动的那一轮交回的是**残缺**清单，据它印"这个分类没有子分类"就是假读数。
     let acc_subs = lua.create_function(|lua, cat: String| {
         ensure_accounting_db();
-        let subs = accounting::get_subcategories(&cat);
+        let (subs, why) = accounting::subcategories_readout(&cat);
         let t = lua.create_table()?;
         for (i, s) in subs.iter().enumerate() {
             t.set(i + 1, s.as_str())?;
         }
-        Ok(t)
+        Ok((t, why))
     })?;
     host.set("accounting_subcategories", acc_subs)?;
 

@@ -126,9 +126,13 @@ local function cats()
     return list or {}, why or ""
 end
 
+-- 子分类清单 + 这一轮没答上来的原因（空串 = 答上了）。宿主从前只交回清单，
+-- 于是"这一次读不动"与"这个分类没有子分类"是同一张空表 —— 见宿主
+-- `subcategories_readout` 的注释与下面那句「暂无子分类」。
 local function subs(cat)
-    if cat == nil or cat == "" or cat == "全部" then return {} end
-    return focusflow.accounting_subcategories(cat)
+    if cat == nil or cat == "" or cat == "全部" then return {}, "" end
+    local list, why = focusflow.accounting_subcategories(cat)
+    return list or {}, why or ""
 end
 
 -- 查询当前页，返回 (records, total)。日期在这里再规范一次：认不出来的写法
@@ -180,7 +184,15 @@ local function reset_stale_filters()
     for _, c in ipairs(all) do
         valid[c] = true
         local set = {}
-        for _, x in ipairs(subs(c)) do
+        local list, sub_why = subs(c)
+        if sub_why ~= "" then
+            -- 这一类的子分类没读全 ⇒ 整个校正一个字都不做。下面判「筛选条件还在不在」
+            -- 用的就是这份残缺清单：一次瞬时读不动就会把用户手选的子分类清零、
+            -- 列表当场从"只看这一类"变成"整类都显示"，而屏上没有一句说为什么。
+            -- 从前这里只管了分类那一半（上面那句 return），子分类这一半漏了。
+            return
+        end
+        for _, x in ipairs(list) do
             set[x] = true
         end
         sub_of[c] = set
@@ -665,7 +677,8 @@ end
 
 local function sub_opts_with(extra_label, extra_value, cat)
     local opts = { { value = extra_value, label = extra_label } }
-    for _, s in ipairs(subs(cat)) do
+    local list = subs(cat)
+    for _, s in ipairs(list) do
         opts[#opts + 1] = { value = s, label = s }
     end
     return opts
@@ -843,7 +856,7 @@ function get_view()
     -- ===== 分类管理子页面（对标主流记账 App：左分类列表 + 右子分类列表）=====
     if manage_open then
         local all_cats = cats()
-        local all_subs = subs(m_cat)
+        local all_subs, sub_gap = subs(m_cat)
 
         -- 分类表格（点击行选中，单选高亮）
         local cat_rows = {}
@@ -907,7 +920,12 @@ function get_view()
             ids = sub_ids,
             group = "msub",
         })
-        if #all_subs == 0 and m_cat ~= "" then
+        if sub_gap ~= "" then
+            -- 读不动的那一轮交回的是空清单：这一句要是照旧印「暂无子分类」，屏上就把
+            -- 「没读到」说成了「这个分类没有」，而用户会照着这个假读数去重新一遍子分类。
+            add({ type = "label", text = "（子分类这一栏这次没读全：" .. sub_gap
+                .. "。表里缺的项不代表已被删除）" })
+        elseif #all_subs == 0 and m_cat ~= "" then
             add({ type = "label", text = "（分类 [" .. m_cat .. "] 暂无子分类，点上方 ＋ 添加子分类）" })
         end
 

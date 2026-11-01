@@ -1258,40 +1258,90 @@ pub fn get_expense_by_id(id: i64) -> Option<Expense> {
 }
 
 /// 分类下的子分类列表（分类表中声明的 + 记录中出现过的，去重合并）。
+///
+/// 只要清单的调用方用它；面板那一条走 [`subcategories_readout`]（多交回"这次哪一栏
+/// 没答上来"）。这里把读不全折成空清单是可以的：读的人只拿它去并集/校验，
+/// 而**屏上把"没读到"印成"没有"**才是这族缺陷的形状。
 pub fn get_subcategories(category: &str) -> Vec<String> {
+    subcategories_readout(category).0
+}
+
+/// 同一份清单，另交回"这一轮哪一栏没答上来"（空串 = 两栏都答上了）。
+///
+/// 为什么要有这一条：记账面板的下拉框与「分类管理」右侧那张表只有这一份清单可看，
+/// 从前两处查询读不动都直接折进"这个分类没有子分类" —— 与真的没有长得一模一样，
+/// 而用户会照着这个假读数以为自己没存过、或者去删那条其实还好好的筛选条件。
+/// 口径与 `get_all_categories` 一致（清单 + 原因两个值），界面那边已有先例
+/// （`accounting_plugin.lua` 的「分类清单这次没读全：…」那一行）。
+pub fn subcategories_readout(category: &str) -> (Vec<String>, String) {
     let conn = match open() {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            let why = format!("记账库打不开: {e}");
+            tracing::error!("读取子分类失败（分类「{category}」）：{why}");
+            return (Vec::new(), why);
+        }
     };
     let mut out: Vec<String> = Vec::new();
+    let mut misses: Vec<String> = Vec::new();
     // 分类表中声明的子分类
-    if let Ok(mut stmt) = conn.prepare("SELECT subs FROM categories WHERE name=?1") {
-        if let Ok(mut rows) = stmt.query([category]) {
-            if let Ok(Some(row)) = rows.next() {
-                let subs_raw: String = row.get(0).unwrap_or_default();
-                for s in parse_subs(&subs_raw) {
-                    if !out.contains(&s) {
-                        out.push(s);
-                    }
-                }
-            }
-        }
+    match declared_subs(&conn, category) {
+        Ok(declared) => merge_subs(&mut out, declared),
+        Err(e) => misses.push(format!("声明的那一栏读不出来: {e}")),
     }
     // 记录中出现过的子分类
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT DISTINCT subcategory FROM expenses WHERE category=?1 AND subcategory IS NOT NULL AND subcategory != '' ORDER BY subcategory",
-    ) {
-        if let Ok(mut rows) = stmt.query([category]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let Ok(s) = row.get::<_, String>(0) {
-                    if !out.contains(&s) {
-                        out.push(s);
-                    }
-                }
-            }
+    match subs_in_records(&conn, category) {
+        Ok(seen) => merge_subs(&mut out, seen),
+        Err(e) => misses.push(format!("记录里出现过的那一栏读不出来: {e}")),
+    }
+    if misses.is_empty() {
+        return (out, String::new());
+    }
+    let why = format!(
+        "只读回一部分（{}）—— 少了的项是没读到，不是这个分类没有",
+        misses.join("；")
+    );
+    tracing::error!("读取子分类失败（分类「{category}」）：{why}");
+    (out, why)
+}
+
+/// 并进来去重，顺序按"声明的在前"（与这两问原本的先后一致）。
+fn merge_subs(into: &mut Vec<String>, items: Vec<String>) {
+    for s in items {
+        if !into.contains(&s) {
+            into.push(s);
         }
     }
-    out
+}
+
+/// 第一问：这个分类在 `categories` 里声明了哪几个子分类。
+/// 一个分类名最多一行（`name` 上有 UNIQUE），但这里按行读，多出来的行也并进来。
+fn declared_subs(conn: &Connection, category: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT subs FROM categories WHERE name=?1")?;
+    let mut rows = stmt.query([category])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        // NULL 按"这一栏没声明"处理，不判成整栏读不出来：schema 是
+        // `NOT NULL DEFAULT '[]'`，手改出来的 NULL 不该让这一问连"没有"都说不上。
+        let raw: Option<String> = row.get(0)?;
+        merge_subs(&mut out, parse_subs(raw.as_deref().unwrap_or("")));
+    }
+    Ok(out)
+}
+
+/// 第二问：这个分类的记录里出现过哪些子分类（删了声明但留着的旧数据也算）。
+fn subs_in_records(conn: &Connection, category: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT subcategory FROM expenses WHERE category=?1 AND subcategory IS NOT NULL AND subcategory != '' ORDER BY subcategory",
+    )?;
+    let mut out = Vec::new();
+    for s in stmt.query_map([category], |r| r.get::<_, String>(0))? {
+        let s = s?;
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    Ok(out)
 }
 
 /// 把"人手写出来的日期"规范成 `YYYY-MM-DD`：`2026-9-1`、`2026/09/01`、`2026.9.1`、
@@ -2141,6 +2191,106 @@ mod tests {
         assert!(
             sub_names.contains(&"零食"),
             "有名字的子分类照常成行: {sub_names:?}"
+        );
+    }
+
+    /// 「这个分类没有子分类」与「这一次没读到」必须是两个答案。
+    ///
+    /// 旧写法两处查询读不动都直接折进空清单，而「分类管理」右侧那张表只有这一份清单可看
+    /// —— 屏上照样印「暂无子分类」，用户读到的是一句关于他数据的假话（本文件
+    /// `get_all_categories` 与界面那句「分类清单这次没读全」已经是同一口径）。
+    #[test]
+    fn the_declared_column_names_itself_when_it_cannot_be_read() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_subs_gap_cat");
+        init_db().expect("建库失败");
+        assert!(add_category("读不动", "both", &["零食".to_string()]) > 0);
+        let ((subs, why), logs) = crate::logger::capture_logs(|| subcategories_readout("读不动"));
+        assert_eq!(subs, vec!["零食".to_string()], "夹具没建好，后面都无意义");
+        assert!(why.is_empty(), "两栏都答上了不该有原因: {why}");
+        assert!(
+            !logs.iter().any(|l| l.contains("读取子分类")),
+            "读全了不许出声（这一问每开一次面板就跑一遍）: {logs:?}"
+        );
+        // 声明那一栏整个读不动（表没了）：原因必须点名是哪一栏，不许只交回一张空表
+        {
+            let conn = open().expect("库该打得开");
+            conn.execute("DROP TABLE categories", []).unwrap();
+        }
+        let ((subs, why), logs) = crate::logger::capture_logs(|| subcategories_readout("读不动"));
+        assert!(subs.is_empty(), "表没了不该凭空多出项: {subs:?}");
+        assert!(
+            why.contains("声明的那一栏"),
+            "读不出来必须说是哪一栏，实得「{why}」"
+        );
+        assert!(
+            logs.iter().any(|l| l.contains("读取子分类")),
+            "读不动要留下一行日志，否则界面那句「没读全」没人能核对: {logs:?}"
+        );
+    }
+
+    /// 第二问读不动时，第一问读到的那些照常交回，并另说一句是哪一栏没答上。
+    #[test]
+    fn the_records_column_does_not_void_what_the_declared_one_read() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_subs_gap_rec");
+        init_db().expect("建库失败");
+        assert!(add_category("食品", "both", &["零食".to_string()]) > 0);
+        assert!(
+            add_expense(
+                "支出",
+                "糖果",
+                None,
+                "2026-09-05",
+                12.0,
+                Some("食品"),
+                Some("饮料"),
+                None,
+            ) > 0,
+            "记录没写进去，后面的断言都没有意义"
+        );
+        let ((subs, why), _) = crate::logger::capture_logs(|| subcategories_readout("食品"));
+        assert_eq!(why, "", "夹具该两栏都答得上: {why}");
+        assert_eq!(subs, vec!["零食".to_string(), "饮料".to_string()]);
+        {
+            let conn = open().expect("库该打得开");
+            conn.execute("DROP TABLE expenses", []).unwrap();
+        }
+        let ((subs, why), logs) = crate::logger::capture_logs(|| subcategories_readout("食品"));
+        assert_eq!(
+            subs,
+            vec!["零食".to_string()],
+            "记录那一栏读不动，不能把声明读到的也一起吞掉: {subs:?}"
+        );
+        assert!(
+            why.contains("记录里出现过的那一栏"),
+            "要说是哪一栏没答上，实得「{why}」"
+        );
+        assert!(
+            logs.iter().any(|l| l.contains("读取子分类")),
+            "读不动要留下一行日志: {logs:?}"
+        );
+    }
+
+    /// 接线守卫：这个"原因"必须一路走到那句印在屏上的话。
+    ///
+    /// 宿主只交清单、或插件接不住，Rust 侧上面那两条照样全绿，而面板继续把
+    /// "没读到"印成"暂无子分类" —— 这一族的病状从来都在最后一环，不在判据里。
+    #[test]
+    fn the_gap_reaches_the_panel_that_prints_the_claim() {
+        let wired = include_str!("plugins/host.rs");
+        assert!(
+            wired.contains("accounting::subcategories_readout(&cat)"),
+            "插件那一路又回到只拿清单、丢掉原因的 get_subcategories"
+        );
+        let lua = include_str!("../plugins/accounting_plugin.lua");
+        assert!(
+            lua.contains("local all_subs, sub_gap = subs(m_cat)"),
+            "「分类管理」那一页没接住原因"
+        );
+        assert!(
+            lua.contains(r#"if sub_gap ~= "" then"#),
+            "没读全时那句「暂无子分类」又照印不误"
         );
     }
 
