@@ -10838,10 +10838,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                             }
                         }
                         if !handled {
+                            // 与「返回」那颗钮走同一份清理：`plugin_sel` 里躺着的是这一场
+                            // 点过的记录 id，只清 pv_scroll/pv_select/pv_modal 会把选中集留下 ——
+                            // 下一次开面板时它读回自己那一组，高亮的是用户这次没点过的行，
+                            // 而一颗 `sel` 按钮会把那串陈旧 id 直接拼进动作 id 交给插件。
                             app.plugin_open = None;
-                            app.pv_scroll = 0;
-                            app.pv_select = None;
-                            app.pv_modal = None;
+                            app.reset_plugin_view_state();
                             unsafe {
                                 let _ = InvalidateRect(Some(hwnd), None, false);
                             }
@@ -12608,6 +12610,40 @@ mod data_move_tests {
 #[cfg(test)]
 mod plugin_sel_tests {
     use super::*;
+
+    /// 接线腿：按 Esc 关面板必须调用与「返回」那颗钮同一份清理，不许自己手抄一半。
+    ///
+    /// 三条腿各钉一件事 —— ①这一支确实过 `reset_plugin_view_state`（按调用形态比，
+    /// 不是数函数名出现几次）；②生产段里那种"手抄三个字段"的写法不许再出现，因为它正是
+    /// 漏掉 `plugin_sel` 的形状；③两份清理不能只有一份存在（返回那颗钮那一支也得在）。
+    #[test]
+    fn esc_and_the_back_button_share_one_plugin_view_cleanup() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            flat.matches("plugin_open=None;").count(),
+            3,
+            "关面板的入口数目变了（返回两颗 + 按 Esc 一颗），这份清理要跟着一起来核对"
+        );
+        assert_eq!(
+            flat.matches("reset_plugin_view_state()").count(),
+            4,
+            "清理要么被手抄成几份、要么少了一处：实得 {}",
+            flat.matches("reset_plugin_view_state()").count()
+        );
+        assert_eq!(
+            flat.matches("app.pv_scroll=0;app.pv_select=None;app.pv_modal=None;")
+                .count(),
+            0,
+            "按 Esc 那一支又回到手抄三个字段：这样会留下 plugin_sel 里的陈旧 id"
+        );
+    }
 
     fn map(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
         pairs
