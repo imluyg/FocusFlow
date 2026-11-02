@@ -208,7 +208,19 @@ pub fn register_host_api(
         let totals = match period {
             -1 => db::stats_totals_on(chrono::Local::now().date_naive()),
             0 => db::stats_totals(None, None),
-            n => db::stats_totals(Some(n), None),
+            n if crate::db::queries::is_valid_period(n) => db::stats_totals(Some(n), None),
+            // 不合法的周期不许折成"一天"：CLI 那条入口早就用 `is_valid_period` 拦过，
+            // 而这里从前是 `-1 / 0 / 其余` 三分 —— `-2` 掉进 `Some(-2)`，`clamp_query_days`
+            // 把它抬成 1 ⇒ 面板拿到的是一个**看起来干净**的一日数，`gap` 还是空串。
+            n => {
+                let gap = format!(
+                    "focusflow.stats 收到不合法的周期 {n}（可用：-1 今日 / 0 总计 / 正整数天数）：\
+                     这次没有查库"
+                );
+                tracing::warn!("{gap}");
+                let rows = lua.create_table()?;
+                return Ok((0i64, rows, 0usize, gap));
+            }
         };
         let total = totals.total;
         let gap = totals.unreadable.join("；");
@@ -1055,6 +1067,57 @@ pub fn register_host_api(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 不合法的周期必须在入口被拒绝，不许折成"一天"。
+    ///
+    /// `queries::is_valid_period` 的注释写着"周期值必须在入口拦截"，而 CLI 之外还有插件
+    /// 这一道：`stats` 的 match 从前只有 `-1 / 0 / 其余` 三支，`-2` 掉进 `Some(-2)`，
+    /// `clamp_query_days` 把它抬成 1 ⇒ 面板交回的是一份**看起来干净**的一日数，第四个
+    /// 返回值（"这次没读全"）还是空串 —— 数字错了却没有一处会响。
+    ///
+    /// 三条读数都按插件自己看到的样子问（多返回值取第 N 个），不在 Rust 侧复刻一把尺子。
+    #[test]
+    fn an_invalid_period_is_refused_instead_of_becoming_one_day() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("host_period");
+        let lua = Lua::new();
+        let database = db::Database::init_readonly();
+        register_host_api(&lua, crate::config::instance(), database, "period_test")
+            .expect("注册宿主 API");
+
+        let total: i64 = lua
+            .load("local t = focusflow.stats(-2) return t")
+            .eval()
+            .expect("stats(-2) 要能调动");
+        assert_eq!(total, 0, "被拒绝的这一问不许交出任何数字");
+        let rows: i64 = lua
+            .load("local _, r = focusflow.stats(-2) return #r")
+            .eval()
+            .expect("stats(-2) 的榜单要能读");
+        assert_eq!(rows, 0, "被拒绝的这一问不许交出榜单");
+        let gap: String = lua
+            .load("local _, _, _, g = focusflow.stats(-2) return g")
+            .eval()
+            .expect("stats(-2) 的原因要能读");
+        assert!(
+            gap.contains("不合法的周期") && gap.contains("-2"),
+            "拒绝要说清是哪一问（空原因＝把错数字念成完整答案），实得: {gap}"
+        );
+
+        // 反向腿：合法那三支不许一起被拒（把守卫写成恒真就红在这儿）。
+        for period in ["-1", "0", "30"] {
+            let gap: String = lua
+                .load(format!(
+                    "local _, _, _, g = focusflow.stats({period}) return g"
+                ))
+                .eval()
+                .unwrap_or_else(|e| panic!("周期 {period} 调不动: {e}"));
+            assert!(
+                !gap.contains("不合法的周期"),
+                "合法周期 {period} 被当成不合法拒了，实得: {gap}"
+            );
+        }
+    }
 
     /// 注册宿主 API 必须**无副作用**：三个附属库都要等到首次调用才建。
     ///
