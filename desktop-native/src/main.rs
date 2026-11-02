@@ -3670,6 +3670,12 @@ impl P<'_> {
         measure_text(self.dw, s, f)
     }
 
+    /// 把 `text` 夹到 `rect_w` 这一格真能画下的长度，量的是画它的那档字体 `f` 本身。
+    /// 判据与退回档见 [`clip_to_cell`]。
+    fn clip(&self, text: &str, f: &IDWriteTextFormat, rect_w: f32) -> String {
+        clip_to_cell(self.dw, text, f, rect_w)
+    }
+
     /// 折线下面的淡色面积：一条 2px 线孤零零挂在网格上，图卡看着就是个空框。
     /// 建几何失败就跳过（与 `P::brush` 同一策略：画不出就不画，不 panic）。
     fn area(&self, pts: &[Vector2], plot: D2D_RECT_F) {
@@ -4146,7 +4152,7 @@ fn draw_settings(
                         // 名 ~380 px 压进 ~96-134 px 的格子，越出去的字直接盖到右边那句说明上。
                         let val_w = vb.right - vb.left - if btn.is_some() { 54.0 } else { 16.0 };
                         p.text(
-                            &clip_middle(shown, char_budget_at(val_w, SETTINGS_TEXT_PT)),
+                            &p.clip(shown, &p.fmt.text13, val_w),
                             rect(vb.left + 8.0, vb.top, val_w, vb.bottom - vb.top),
                             &p.fmt.text13,
                             if capturing {
@@ -4326,9 +4332,10 @@ fn draw_settings(
                         p.text(
                             // 组合键是 config.ini 里那一行的原文（手改成什么样都收），
                             // 而这一句的尾巴"框好之后 Enter 或 Ctrl+S 出图"才是要点。
-                            &clip_middle(
+                            &p.clip(
                                 &format!("等于按热键 {annotate}；框好之后 Enter 或 Ctrl+S 出图"),
-                                char_budget_at(640.0, SETTINGS_HELP_PT),
+                                &p.fmt.text12,
+                                640.0,
                             ),
                             rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
                             &p.fmt.text12,
@@ -4340,11 +4347,12 @@ fn draw_settings(
                         p.text("松手即存", vb, &p.fmt.center13, &p.br.white);
                         let snip = snap_setting(snap, "hotkey", "snip");
                         p.text(
-                            &clip_middle(
+                            &p.clip(
                                 &format!(
                                     "等于按热键 {snip}；PNG 存 data/screenshots，同时复制到剪贴板"
                                 ),
-                                char_budget_at(640.0, SETTINGS_HELP_PT),
+                                &p.fmt.text12,
+                                640.0,
                             ),
                             rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
                             &p.fmt.text12,
@@ -4442,7 +4450,7 @@ fn draw_settings(
                             )
                         };
                         p.text(
-                            &clip_middle(&dir_line, char_budget(560.0)),
+                            &p.clip(&dir_line, &p.fmt.text12, 560.0),
                             rect(r.left + 12.0, y + 23.0, 560.0, 17.0),
                             &p.fmt.text12,
                             &p.br.muted,
@@ -4490,17 +4498,19 @@ fn draw_settings(
         // 预算按**这一格有多宽**算：搬迁没成那一句里有两个完整路径，实测能一路画到窗口
         // 外面（DrawText 不按矩形裁切），而句尾恰恰是"搬到哪"这件事本身。
         let status_w = card.right - card.left - 32.0;
-        let line = clip_middle(line, char_budget(status_w));
+        // "要人处理"那一句除了换颜色，还加一档字重：底部这一行平时是背景信息，
+        // 红字加粗才是"现在就得看一眼"。夹取问的也是这一档自己：加粗比常规宽，
+        // 按常规档量会放行屏上真装不下的字。
+        let status_fmt = if warn {
+            &p.fmt.text12_em
+        } else {
+            &p.fmt.text12
+        };
+        let line = p.clip(line, status_fmt, status_w);
         p.text(
             &line,
             rect(card.left + 16.0, card.bottom - 26.0, status_w, 18.0),
-            // "要人处理"那一句除了换颜色，还加一档字重：底部这一行平时是背景信息，
-            // 红字加粗才是"现在就得看一眼"。
-            if warn {
-                &p.fmt.text12_em
-            } else {
-                &p.fmt.text12
-            },
+            status_fmt,
             if warn { &p.br.danger } else { &p.br.muted },
         );
     }
@@ -4660,7 +4670,7 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
     // 而"原名"那一行是把两者拼在一起说的 —— 不夹就越出卡片边、画到那层深色遮罩上。
     let detail_w = dialog.right - x - 20.0;
     p.text(
-        &clip_middle(&d.name, char_budget_at(detail_w, BODY_PT)),
+        &p.clip(&d.name, &p.fmt.body, detail_w),
         rect(x, dialog.top + 40.0, detail_w, 20.0),
         &p.fmt.body,
         &p.br.fg,
@@ -4678,7 +4688,7 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
         kind.to_string()
     };
     p.text(
-        &clip_middle(&sub, char_budget_at(detail_w, CAPTION_PT)),
+        &p.clip(&sub, &p.fmt.caption, detail_w),
         rect(x, dialog.top + 62.0, detail_w, 18.0),
         &p.fmt.caption,
         &p.br.muted,
@@ -4688,13 +4698,13 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
     let row = |label: &str, value: &str, cx: f32, yy: f32| {
         // 标签格 76 px、值格吃到弹窗右边减 100 —— 两格只差 6 px，标签一长就压住值。
         p.text(
-            &clip_middle(label, char_budget_at(76.0, CAPTION_PT)),
+            &p.clip(label, &p.fmt.caption, 76.0),
             rect(cx, yy, 76.0, 18.0),
             &p.fmt.caption,
             &p.br.muted,
         );
         p.text(
-            &clip_middle(value, char_budget_at(dialog.right - cx - 100.0, BODY_PT)),
+            &p.clip(value, &p.fmt.body, dialog.right - cx - 100.0),
             rect(cx + 82.0, yy, dialog.right - cx - 100.0, 18.0),
             &p.fmt.body,
             &p.br.fg,
@@ -5084,7 +5094,7 @@ fn draw_screen(
             // 卡片下面那一行同样是 `NO_WRAP` 的 DrawText：窗口拖窄时它不会自己省略，
             // 而是照画到卡外（本仓那句"动态文本必须自己带长度上界"）。预算与画它的
             // 矩形取同一个宽度表达式 `cw - 24.0`，两处不许各写各的数。
-            let sub = clip_middle(sub, char_budget_at(cw - 24.0, CAPTION_PT));
+            let sub = p.clip(sub, &p.fmt.caption, cw - 24.0);
             p.text(
                 &sub,
                 rect(cx + 12.0, 142.0, cw - 24.0, 16.0),
@@ -5291,13 +5301,14 @@ fn draw_goal_strip(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
     p.text(
         // 这一句只给 150 DIP，进度条从 r.left + pad + 158 起画 —— 七位今日 + 七位目标
         // 就 ~170 px，数字会压在条子上。夹取留头也留尾，尾巴是那个目标值。
-        &clip_middle(
+        &p.clip(
             &format!(
                 "今日 {} / {}",
                 thousands(today as u64),
                 thousands(goal as u64)
             ),
-            char_budget_at(150.0, BODY_PT),
+            &p.fmt.body,
+            150.0,
         ),
         rect(r.left + pad, r.top + 14.0, 150.0, 18.0),
         &p.fmt.body,
@@ -5322,9 +5333,10 @@ fn draw_goal_strip(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
 
     p.text(
         // 右对齐 ⇒ 越界是往左跑，而左边 8 px 就是进度条：五位数打卡 + 五位数最长就顶到条上。
-        &clip_middle(
+        &p.clip(
             &format!("连续打卡 {} 天 · 近一年最长 {} 天", g.streak, g.best),
-            char_budget_at(198.0, CAPTION_PT),
+            &p.fmt.caption_right,
+            198.0,
         ),
         rect(dots_x - 206.0, r.top + 14.0, 198.0, 18.0),
         &p.fmt.caption_right,
@@ -5464,10 +5476,7 @@ fn draw_weekday(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         );
         p.text(
             // 居中的一档越界是两头都跑，七位数字在窄窗口就会与邻柱的数字叠在一起。
-            &clip_middle(
-                &thousands(count.max(0) as u64),
-                char_budget_at(bw, SMALL_PT),
-            ),
+            &p.clip(&thousands(count.max(0) as u64), &p.fmt.center_small, bw),
             rect(x, plot.bottom - hh - WEEKDAY_VALUE_HEADROOM, bw, 16.0),
             &p.fmt.center_small,
             &p.br.muted,
@@ -6787,7 +6796,7 @@ fn draw_plugin_view(
             POp::Heading { rect: r, text } => {
                 // 插件给的字符串长度是作者说了算，而这块 UI 不裁切 ⇒ 一律按自己那一格夹。
                 p.text(
-                    &clip_middle(text, char_budget_at(r.right - r.left, BODY_PT)),
+                    &p.clip(text, &p.fmt.body, r.right - r.left),
                     *r,
                     &p.fmt.body,
                     &p.br.fg,
@@ -6795,7 +6804,7 @@ fn draw_plugin_view(
             }
             POp::Label { rect: r, text } => {
                 p.text(
-                    &clip_middle(text, char_budget_at(r.right - r.left, CAPTION_PT)),
+                    &p.clip(text, &p.fmt.caption, r.right - r.left),
                     *r,
                     &p.fmt.caption,
                     &p.br.muted,
@@ -6808,13 +6817,13 @@ fn draw_plugin_view(
             } => {
                 // 键那一格定宽 140，值从 +146 起画：不夹就是两句互相叠上去。
                 p.text(
-                    &clip_middle(key, char_budget_at(140.0, CAPTION_PT)),
+                    &p.clip(key, &p.fmt.caption, 140.0),
                     rect(r.left, r.top, 140.0, 18.0),
                     &p.fmt.caption,
                     &p.br.muted,
                 );
                 p.text(
-                    &clip_middle(value, char_budget_at(r.right - r.left - 146.0, SMALL_PT)),
+                    &p.clip(value, &p.fmt.small, r.right - r.left - 146.0),
                     rect(r.left + 146.0, r.top, r.right - r.left - 146.0, 18.0),
                     &p.fmt.small,
                     &p.br.fg,
@@ -6823,7 +6832,7 @@ fn draw_plugin_view(
             POp::Sep { rect: r } => p.fill(*r, &p.br.grid),
             POp::Body { rect: r, text } => {
                 p.text(
-                    &clip_middle(text, char_budget_at(r.right - r.left, CAPTION_PT)),
+                    &p.clip(text, &p.fmt.caption, r.right - r.left),
                     *r,
                     &p.fmt.caption,
                     &p.br.muted,
@@ -6836,7 +6845,7 @@ fn draw_plugin_view(
                 field,
             } => {
                 p.text(
-                    &clip_middle(label, char_budget_at(140.0, CAPTION_PT)),
+                    &p.clip(label, &p.fmt.caption, 140.0),
                     rect(r.left, r.top + 4.0, 140.0, 18.0),
                     &p.fmt.caption,
                     &p.br.muted,
@@ -6850,7 +6859,7 @@ fn draw_plugin_view(
                 };
                 p.round(vb, R_CONTROL, &p.br.card, Some(border));
                 p.text(
-                    &clip_middle(value, char_budget_at(vb.right - vb.left - 16.0, CAPTION_PT)),
+                    &p.clip(value, &p.fmt.caption, vb.right - vb.left - 16.0),
                     rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 16.0, 18.0),
                     &p.fmt.caption,
                     &p.br.fg,
@@ -6863,7 +6872,7 @@ fn draw_plugin_view(
                 ..
             } => {
                 p.text(
-                    &clip_middle(label, char_budget_at(140.0, CAPTION_PT)),
+                    &p.clip(label, &p.fmt.caption, 140.0),
                     rect(r.left, r.top + 4.0, 140.0, 18.0),
                     &p.fmt.caption,
                     &p.br.muted,
@@ -6872,7 +6881,7 @@ fn draw_plugin_view(
                 p.round(vb, R_CONTROL, &p.br.card, Some(&p.br.accent));
                 // 选中的那一项是插件给的记录名，右边 20 px 还要留给那个下拉箭头。
                 p.text(
-                    &clip_middle(value, char_budget_at(vb.right - vb.left - 28.0, CAPTION_PT)),
+                    &p.clip(value, &p.fmt.caption, vb.right - vb.left - 28.0),
                     rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 28.0, 18.0),
                     &p.fmt.caption,
                     &p.br.fg,
@@ -6919,7 +6928,7 @@ fn draw_plugin_view(
                 // PushAxisAlignedClip 只在卡片边切一刀（没有省略号），中间各列照叠。
                 for (i, htxt) in headers.iter().enumerate() {
                     p.text(
-                        &clip_middle(htxt, char_budget_at(cw - 12.0, CAPTION_PT)),
+                        &p.clip(htxt, &p.fmt.caption, cw - 12.0),
                         rect(r.left + 6.0 + i as f32 * cw, r.top + 4.0, cw - 12.0, 16.0),
                         &p.fmt.caption,
                         &p.br.muted,
@@ -6940,7 +6949,7 @@ fn draw_plugin_view(
                     let ink = &p.br.fg;
                     for (ci, cell) in row.iter().enumerate().take(cols) {
                         p.text(
-                            &clip_middle(cell, char_budget_at(cw - 12.0, SMALL_PT)),
+                            &p.clip(cell, &p.fmt.small, cw - 12.0),
                             rect(
                                 rr.left + 6.0 + ci as f32 * cw,
                                 rr.top + 2.0,
@@ -7228,10 +7237,7 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
     p.overlay_card(g.dialog, R_MODAL);
     p.text(
         // 标题是插件写的，弹窗宽夹在 380..560 之间 —— 长标题会一路画到右上角那颗「✕」上。
-        &clip_middle(
-            m.title,
-            char_budget_at(g.dialog.right - g.dialog.left - 72.0, BODY_PT),
-        ),
+        &p.clip(m.title, &p.fmt.body, g.dialog.right - g.dialog.left - 72.0),
         rect(
             g.dialog.left + 20.0,
             g.dialog.top + 16.0,
@@ -7252,7 +7258,7 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
         let Some(row) = g.fields.get(i) else { break };
         p.text(
             // 弹窗里这两格也是插件给的字符串：标签 136 px，值框右边还要留给下拉箭头。
-            &clip_middle(&f.label, char_budget_at(136.0, CAPTION_PT)),
+            &p.clip(&f.label, &p.fmt.caption, 136.0),
             rect(row.left, row.top + 7.0, 136.0, 18.0),
             &p.fmt.caption,
             &p.br.muted,
@@ -7260,10 +7266,7 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
         let vb = modal_field_box(*row);
         p.round(vb, R_CONTROL, &p.br.card, Some(&p.br.border));
         p.text(
-            &clip_middle(
-                &f.value,
-                char_budget_at(vb.right - vb.left - 28.0, CAPTION_PT),
-            ),
+            &p.clip(&f.value, &p.fmt.caption, vb.right - vb.left - 28.0),
             rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 28.0, 18.0),
             &p.fmt.caption,
             &p.br.fg,
@@ -7330,13 +7333,14 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
     p.text(
         // 目录路径的尾巴才是"到底在哪儿"，所以夹中间、两头都留（520 px 那格在长 profile
         // 路径下会整句越界，而这块 UI 不裁切）。
-        &clip_middle(
+        &p.clip(
             &format!(
                 "{} 个 · 目录 {}",
                 rows.len(),
                 focusflow_core::paths::plugins_dir().display()
             ),
-            char_budget_at(520.0, CAPTION_PT),
+            &p.fmt.caption,
+            520.0,
         ),
         rect(card.left + 58.0, card.top + 15.0, 520.0, 18.0),
         &p.fmt.caption,
@@ -7345,9 +7349,10 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
 
     if let Some(e) = err {
         p.text(
-            &clip_middle(
+            &p.clip(
                 &format!("插件目录读不出来：{e}"),
-                char_budget_at(card.right - card.left - 32.0, CAPTION_PT),
+                &p.fmt.caption,
+                card.right - card.left - 32.0,
             ),
             rect(
                 card.left + 16.0,
@@ -7384,15 +7389,16 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
         p.text(
             // 名字与"版本 · 作者"都是插件自己写的，两格又都定宽（240 / 260），
             // 后一格从 r.left + 250 起画 ⇒ 不夹就是两句叠成一片乱码。
-            &clip_middle(&row.name, char_budget_at(240.0, BODY_PT)),
+            &p.clip(&row.name, &p.fmt.body, 240.0),
             rect(r.left + 8.0, y + 5.0, 240.0, 18.0),
             &p.fmt.body,
             &p.br.fg,
         );
         p.text(
-            &clip_middle(
+            &p.clip(
                 &format!("v{} · {}", row.version, row.author),
-                char_budget_at(260.0, CAPTION_PT),
+                &p.fmt.caption,
+                260.0,
             ),
             rect(r.left + 250.0, y + 7.0, 260.0, 16.0),
             &p.fmt.caption,
@@ -7427,9 +7433,10 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
         match &row.error {
             Some(e) => {
                 p.text(
-                    &clip_middle(
+                    &p.clip(
                         &format!("加载失败：{}", one_line(e, 72)),
-                        char_budget_at(desc_w, CAPTION_PT),
+                        &p.fmt.caption,
+                        desc_w,
                     ),
                     rect(r.left + 8.0, y + 23.0, desc_w, 16.0),
                     &p.fmt.caption,
@@ -7444,7 +7451,7 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
                     row.desc.clone()
                 };
                 p.text(
-                    &clip_middle(&text, char_budget_at(desc_w, CAPTION_PT)),
+                    &p.clip(&text, &p.fmt.caption, desc_w),
                     rect(r.left + 8.0, y + 23.0, desc_w, 16.0),
                     &p.fmt.caption,
                     &p.br.muted,
@@ -8145,7 +8152,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     // 预算按**这一格实际用的那档字**（`p.fmt.caption`）取，不是设置页说明行那一档：拿错档位
     // 时算出来的字数与屏上像素不是一把尺子，窄窗口下放行、照样画到胶囊底下。
     let sb = rank_summary_box(r, g.pad);
-    let summary_text = clip_middle(&summary, char_budget_at(sb.right - sb.left, CAPTION_PT));
+    let summary_text = p.clip(&summary, &p.fmt.caption, sb.right - sb.left);
     p.text(&summary_text, sb, &p.fmt.caption, &p.br.muted);
     if !split.is_empty() {
         p.text(
@@ -8362,7 +8369,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                         // 用户别名上限 `MAX_ALIAS_CHARS = 24`（汉字 24 个 ≈ 324 px），
                         // 没别名时 `fallback_device_name` 把长机器串截到 40 字符 + "…"。
                         // 这块 UI 不按矩形裁切 ⇒ 不夹就一路画过「类型」「次数」和两颗按钮。
-                        &clip_middle(&d.name, char_budget_at(device_name_width(&g), BODY_PT)),
+                        &p.clip(&d.name, &p.fmt.table_name, device_name_width(&g)),
                         rect(g.x_name, y + 3.0, device_name_width(&g), 18.0),
                         &p.fmt.table_name,
                         &p.br.fg,
@@ -8511,9 +8518,10 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
     p.text(
         // 同一句 `data_home` 在设置页那格是夹过的，这一格从前没有：警告那半句本身就吃掉
         // 大半行，路径一长就越过卡片边、压到右边那张趋势卡上。夹取留头也留尾 —— 尾巴是路径。
-        &clip_middle(
+        &p.clip(
             &footer_line(&snap.data_home, &snap.gaps, lane),
-            char_budget_at(r.right - r.left - g.pad * 2.0, CAPTION_PT),
+            &p.fmt.caption,
+            r.right - r.left - g.pad * 2.0,
         ),
         rect(r.left + g.pad, foot_y, r.right - r.left - g.pad * 2.0, 16.0),
         &p.fmt.caption,
@@ -8618,7 +8626,7 @@ fn chart_tip(p: &P<'_>, card: D2D_RECT_F, at: Vector2, text: &str) {
     p.text(
         // 气泡是定宽那颗（150 与卡片宽取小），而句子里吃的是库里的日期串与千分位数字：
         // "2026-11-01 · 1,234,567 次" 就到 ~165 px。不夹就是字越出圆角框自己的边。
-        &clip_middle(text, char_budget_at(w - 12.0, SMALL_PT)),
+        &p.clip(text, &p.fmt.small, w - 12.0),
         rect(x + 6.0, y + 1.0, w - 12.0, 16.0),
         &p.fmt.small,
         &p.br.fg,
@@ -8739,7 +8747,7 @@ fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usiz
         p.text(
             // 这一格只有 60 px，而串是库里交回的那一项日期：不是 `YYYY-MM-DD` 形状时
             // （导入的旧库、带时间的日期）整串会画进第一根柱子里。
-            &clip_middle(&left, char_budget_at(60.0, CAPTION_PT)),
+            &p.clip(&left, &p.fmt.caption, 60.0),
             rect(plot.left, plot.bottom + 4.0, 60.0, 14.0),
             &p.fmt.caption,
             &p.br.muted,
@@ -9233,29 +9241,23 @@ fn register_combo(manager: Option<&GlobalHotKeyManager>, key: &str) -> Combo {
     }
 }
 
-/// 这一格宽度**最多**能念多少个字符（按字符，不按字节）。
+/// 这一格宽度**最多**能念多少个字符（按字符，不按字节），按**这一格真正用的那一档字号**
+/// 换算，下限是 1。
 ///
 /// 为什么要有这一句：这个 UI 没有"装不下"这回事 —— 每一档字体都是 `NO_WRAP`，而 `DrawText`
 /// 不按传进来的矩形裁切。现量在案：把数据根与"已安排搬到"两个路径都换成 114 / 91 个字符，
 /// 底部那句「注意：没能搬到 …」一路画到窗口右边界之外，用户看到的是括号都没闭合的半句。
 ///
-/// 12.0 是**最窄那一档**：本仓最小的字档是 12px，全中文时一个字就吃掉约 12px；路径与英文
-/// 约 6.5px/字，所以按 12 算出来的预算是保守的 —— 宁可少念几个字，也不会画到隔壁卡上。
-/// 预算跟着矩形宽度走（不是写死的常数）：窗口能拖窄，写死的数在窄窗口里照样顶出去。
-fn char_budget(rect_w: f32) -> usize {
-    // 一个全角字占多少像素 = 说明行那一档的字号（`SETTINGS_HELP_PT`）。写成字面量的话，
-    // 字号一调大，预算还按旧字号算，句子就会按"装得下"放行、屏上却画出去。
-    //
-    // 下限 8 只对**宽格子**成立（状态行、560px 那行）：极窄时宁可只念一个省略号，也比
-    // 放行八个字压到隔壁卡上强 —— 那是 `char_budget_at` 负责的那一格。
-    char_budget_at(rect_w, SETTINGS_HELP_PT).max(8)
-}
-
-/// 同 `char_budget`，但按**这一格真正用的那一档字号**换算，下限是 1。
+/// 一个全角字占多少像素 = 这一档的字号：全中文时一个字吃掉约一个字号宽，路径与英文更窄，
+/// 所以按它算出来的预算是保守的 —— 宁可少念几个字，也不会画到隔壁卡上。预算跟着矩形宽度走
+/// （不是写死的常数）：窗口能拖窄，写死的数在窄窗口里照样顶出去。
 ///
 /// 为什么下限不能兜到 8：排行页摘要那一格在 960px 窗口下只剩约 84px，8 个全角字要 100px ——
 /// 兜底就成了"预算说装得下、屏上画到胶囊底下"。字号也不能借隔壁那档：两档不相等时
 /// 这把尺子量的不是这一格。
+///
+/// ⚠ 这一句只按**字符数**折算，是"全角那一档"的上界：数字与拉丁字母实际只有约半个全角宽，
+/// 光靠它会把屏上明明画得下的句子夹成省略号。屏上真装不装得下由 [`clip_to_cell`] 实测复核。
 fn char_budget_at(rect_w: f32, per_char: f32) -> usize {
     if !rect_w.is_finite() || !per_char.is_finite() || rect_w <= 0.0 || per_char <= 0.0 {
         return 1;
@@ -9283,6 +9285,46 @@ fn clip_middle(text: &str, max_chars: usize) -> String {
     out.push('…');
     out.extend(chars[chars.len() - tail..].iter());
     out
+}
+
+/// 量宽度用的那一档：与 `f` **同字号同字重**的左起档。
+///
+/// 为什么不能直接拿 `f` 量：右对齐与居中那两档在 `maxWidth = ∞` 的布局里，交回来的
+/// `widthIncludingTrailingWhitespace` 是 **0** —— 字是按盒子的右边／中线摆的，"宽度"这个
+/// 字段整个塌掉。现量：同一句 21 个字用 `caption_right` 量回 0.0、用 `caption` 量是 181.0；
+/// 星期分布柱顶那档 `center_small` 同样量回 0.0。拿 0 当"装得下"等于给这一族格子摘掉了夹取，
+/// 症状不是报错，是字照画到邻居身上。
+///
+/// 副本走 `text_format`（本仓每一档都是它建的：同一个族名、同一个 locale、同一句 `NO_WRAP`），
+/// 所以同字号同字重就是它自己，只差对齐。字号与字重都从 `f` 现取，不在这里重写常数。
+fn measure_format(dw: &IDWriteFactory, f: &IDWriteTextFormat) -> Option<IDWriteTextFormat> {
+    let (size, weight) = unsafe { (f.GetFontSize(), f.GetFontWeight()) };
+    text_format(dw, size, weight).ok()
+}
+
+/// 夹到这一格**真能画下**：先问全角尺子，尺子说装得下就直接放行（一次 COM 都不问）；
+/// 尺子说装不下时再用 DirectWrite 量一次实际宽度复核。
+///
+/// 为什么要复核：`char_budget_at` 按"每个字都占满一个字号"折算，那是**全角**那一档。
+/// 而这一族格子里大半的句子是数字与日期 —— 拉丁字母、数字、逗号只有约半个全角宽，
+/// 于是屏上明明画得下的句子也被夹出省略号（现量：「今日 9,618 / 20,000」实测 115.7 DIP，
+/// 格子 150 DIP，旧尺子按 11 个字算，画出来是「今日 9,6…000」）。
+///
+/// 复核后确实装不下才夹，且仍夹到尺子那一档：这块 UI 每一档都是 `NO_WRAP` 且不设
+/// `DWRITE_TRIMMING`，越界不是"被截断"而是照画到邻居身上，宁可少念也不放行。
+/// 量不出来（工厂或布局建不起来）同样退回尺子。
+///
+/// 字号取**画这一格的那档字体自己**（`GetFontSize`），不在调用点重写常数：写两遍就是两把尺子。
+/// 量的那一档是它的左起副本，见 [`measure_format`] —— 右对齐与居中直接量回来的是 0。
+fn clip_to_cell(dw: &IDWriteFactory, text: &str, f: &IDWriteTextFormat, rect_w: f32) -> String {
+    let budget = char_budget_at(rect_w, unsafe { f.GetFontSize() });
+    if text.chars().count() <= budget {
+        return text.to_string();
+    }
+    match measure_format(dw, f).and_then(|m| measure_text(dw, text, &m)) {
+        Some(w) if w <= rect_w => text.to_string(),
+        _ => clip_middle(text, budget),
+    }
 }
 
 /// 状态行里哪些该用危险色画。"注意…" 是历史形状（双计提醒、搬迁没成那一类），
@@ -14015,8 +14057,15 @@ mod weekday_label_tests {
 mod clip_tests {
     use super::*;
 
+    fn dw() -> IDWriteFactory {
+        unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).expect("DWrite 工厂") }
+    }
+
     /// 现量那条症状：两个 114 / 91 字符的路径拼进底部那一格，句子画到窗口外面，
     /// 用户看到的是一句括号都没闭合的半句。夹过之后必须**两头都在**。
+    ///
+    /// 走的是产品那一道（`clip_to_cell` + 真的 `text12` 档），不是自己复刻一把尺子：
+    /// 复刻的尺子测不到"接线的是这一道"。
     #[test]
     fn a_long_status_line_keeps_its_head_and_its_tail() {
         let home = r"E:mydataagentdatacodeFocusFlow.scratchab_longpathProgram Files (x86)FocusFlow 便携版数据目录 2026-10-29 迁移测试data";
@@ -14027,12 +14076,16 @@ mod clip_tests {
             "夹具前提：这句本来就该长到顶出窗口"
         );
 
-        let clipped = clip_middle(&line, char_budget(1136.0));
+        let dw = dw();
+        let f = build_formats(&dw).expect("Formats");
+        // 1136 = 默认宽度那一格；这一句实测远超它，所以复核后仍按全角尺子夹
+        let budget = char_budget_at(1136.0, unsafe { f.text12.GetFontSize() });
+        let clipped = clip_to_cell(&dw, &line, &f.text12, 1136.0);
         let n = clipped.chars().count();
+        assert!(n <= budget, "夹完必须落在预算内：{n} > {budget}");
         assert!(
-            n <= char_budget(1136.0),
-            "夹完必须落在预算内：{n} > {}",
-            char_budget(1136.0)
+            measure_text(&dw, &clipped, &f.text12).unwrap_or(f32::MAX) <= 1136.0,
+            "夹完还是画到窗口外面：{clipped}"
         );
         assert!(
             clipped.starts_with("注意：没能搬到"),
@@ -14043,6 +14096,49 @@ mod clip_tests {
             "句尾（要做的那一步）不许被砍掉：{clipped}"
         );
         assert!(clipped.contains('…'), "中间那段要标成省略，实得: {clipped}");
+    }
+
+    /// 右对齐与居中那两档要按**真实宽度**复核，不许把 DirectWrite 在 `maxWidth = ∞` 下交回来的
+    /// 0 当成"装得下"。
+    ///
+    /// 现量的坑：同一句 21 个字用 `caption` 量是 181 DIP、用 `caption_right` 量是 **0**；
+    /// 星期分布柱顶那档 `center_small` 同样是 0。少了 `measure_format` 那个左起副本，症状不是
+    /// 报错，是这两族格子的夹取被整个摘掉 —— 目标条右边那句压到进度条上、邻柱的数字叠在一起。
+    /// 这条同时钉两半：真装不下的必须夹（摘掉副本就红），确实装得下的不许夹（改过头就红）。
+    #[test]
+    fn the_right_aligned_and_centered_tiers_measure_their_real_width() {
+        let dw = dw();
+        let f = build_formats(&dw).expect("Formats");
+        let over = "连续打卡 123 天 · 近一年最长 365 天";
+        assert!(
+            measure_text(&dw, over, &f.caption).unwrap_or(0.0) > 198.0,
+            "夹具前提：这句在 198 DIP 这一格里真装不下"
+        );
+        assert!(
+            measure_text(&dw, over, &f.caption_right).unwrap_or(1.0).abs() < 0.001,
+            "右起档量回来的不再是 0 —— DirectWrite 这一族布局变了，`measure_format` 的左起副本该重新评估"
+        );
+        assert_ne!(
+            clip_to_cell(&dw, over, &f.caption_right, 198.0),
+            over,
+            "右起档把 0 读成装得下：这句会压到进度条上"
+        );
+        let fits = "连续打卡 0 天 · 近一年最长 17 天";
+        assert_eq!(
+            clip_to_cell(&dw, fits, &f.caption_right, 198.0),
+            fits,
+            "右起档里真装得下的那句被白夹了"
+        );
+        assert_eq!(
+            clip_to_cell(&dw, "9,618", &f.center_small, 40.0),
+            "9,618",
+            "居中档里真装得下的数字被白夹了"
+        );
+        assert_ne!(
+            clip_to_cell(&dw, "12,345,678", &f.center_small, 40.0),
+            "12,345,678",
+            "居中档的长数字越出去会叠到邻柱"
+        );
     }
 
     /// 短的那句一个字都不许动 —— 否则这条夹取本身就成了新的信息损失。
@@ -14058,6 +14154,77 @@ mod clip_tests {
         assert_ne!(clip_middle(&over, 90), over);
     }
 
+    /// 屏上那三处省略号的现量症状：句子按全角尺子算"装不下"，DirectWrite 量出来却装得下。
+    ///
+    /// 每条都先钉住"旧尺子本来会把它夹掉"（夹具前提），再钉"实测复核之后一个字都没动"。
+    /// 少了前一条，这条就退化成"函数没被改坏"的空话 —— 拿本来就装得下的句子来测，
+    /// 摘掉复核照样绿。宽度用的是画它的那一格的真宽度。
+    #[test]
+    fn a_number_heavy_line_that_fits_is_not_clipped() {
+        let f = build_formats(&dw()).expect("Formats");
+        let dw = dw();
+        for (text, fmt, rect_w) in [
+            // 活跃分析页顶部：今日 N / M 那一格 150 DIP
+            ("今日 9,618 / 20,000", &f.body, 150.0),
+            // 同一格右边：连续打卡那句 198 DIP
+            ("连续打卡 0 天 · 近一年最长 17 天", &f.caption_right, 198.0),
+            // 趋势图横轴起点：库里交回的那一项去掉 `YYYY-`
+            ("10-02", &f.caption, 60.0),
+            // 图上那枚读数气泡（150 减左右各 6）
+            ("2026-11-01 · 9,618 次", &f.small, 138.0),
+            // 排行页摘要那一格（960px 窗口下实测只剩 ~100 DIP）
+            ("共 1,478,603 次", &f.caption, 100.0),
+        ] {
+            // 尺子按**画这一格的那档字体自己**换算，与 clip_to_cell 同一份：
+            // 借隔壁那档时这条前提量的就不是屏上那一格。
+            let budget = char_budget_at(rect_w, unsafe { fmt.GetFontSize() });
+            assert!(
+                text.chars().count() > budget,
+                "夹具前提：「{text}」按全角尺子在 {rect_w} DIP 这一格里本来就装不下\
+                 （预算 {budget} 个字）——换成装得下的句子来测，摘掉实测复核这条照样绿"
+            );
+            assert_eq!(
+                clip_to_cell(&dw, text, fmt, rect_w),
+                text,
+                "DirectWrite 量着装得下，却被全角尺子夹掉了：{text}"
+            );
+        }
+    }
+
+    /// 复核不许变成"永不夹取"：真装不下的句子仍要夹，且夹完量一次确实进了格子。
+    #[test]
+    fn a_line_that_really_overflows_is_still_clipped() {
+        let dw = dw();
+        let f = build_formats(&dw).expect("Formats");
+        let long = "字".repeat(40);
+        assert!(
+            measure_text(&dw, &long, &f.body).unwrap() > 150.0,
+            "夹具前提：这串全角字在 150 DIP 这一格里真装不下"
+        );
+        let clipped = clip_to_cell(&dw, &long, &f.body, 150.0);
+        assert_ne!(
+            clipped, long,
+            "越界的那句一个字都没被夹 = 复核把夹取整个吃掉了"
+        );
+        assert!(
+            measure_text(&dw, &clipped, &f.body).unwrap() <= 150.0,
+            "夹完还是画到邻居身上：{clipped}"
+        );
+    }
+
+    /// 格子算出负数时（窄窗口下 `r.right - r.left - 92.0` 真能到负）不许整串放行，
+    /// 也不许回 0 个字：念一个省略号，比画到邻居身上和"这一格空着"都强。
+    #[test]
+    fn a_negative_box_still_says_something() {
+        let dw = dw();
+        let f = build_formats(&dw).expect("Formats");
+        assert_eq!(
+            clip_to_cell(&dw, &"字".repeat(9), &f.body, -40.0),
+            "…",
+            "极窄格子里的出口不是整串放行"
+        );
+    }
+
     /// 预算跟着格子走，并且永远给得出一个能画的数。
     ///
     /// 不写死"560 → 46"：那个数跟着说明行的字号走（`SETTINGS_HELP_PT`），字号一调大
@@ -14065,7 +14232,7 @@ mod clip_tests {
     /// 就装不下（两边各留一条，右边那条防的是"预算保守到白少念好几个字"）。
     #[test]
     fn the_budget_follows_the_box_and_never_collapses() {
-        let budget = char_budget(560.0);
+        let budget = char_budget_at(560.0, SETTINGS_HELP_PT);
         assert!(
             budget as f32 * SETTINGS_HELP_PT <= 560.0,
             "预算 {budget} 个字按 {SETTINGS_HELP_PT} px 一行要 {} px，比格子还宽",
@@ -14075,48 +14242,56 @@ mod clip_tests {
             (budget + 1) as f32 * SETTINGS_HELP_PT > 560.0,
             "预算太保守：还能再念一个字"
         );
-        assert!(char_budget(1136.0) > char_budget(560.0), "宽格子该念更多");
+        assert!(
+            char_budget_at(1136.0, SETTINGS_HELP_PT) > char_budget_at(560.0, SETTINGS_HELP_PT),
+            "宽格子该念更多"
+        );
         // 窗口拖到极窄（甚至矩形算出负数）时也不许回 0：那样这一格一个字都不念，
         // 用户连"有事发生"都看不见。
-        assert!(char_budget(0.0) >= 8);
-        assert!(char_budget(-40.0) >= 8);
+        assert_eq!(char_budget_at(0.0, SETTINGS_HELP_PT), 1);
+        assert_eq!(char_budget_at(-40.0, SETTINGS_HELP_PT), 1);
     }
 
-    /// 接线腿：两处画长文本的地方都必须过这一道夹取，且状态行那处的预算与它画进去的
+    /// 接线腿：两处画长文本的地方都必须过实测复核那一道夹取，且状态行那处的预算与它画进去的
     /// 矩形是**同一个宽度**（写死一个常数的话，窗口拖窄就又顶出去了）。
     #[test]
     fn the_two_long_text_rows_are_clipped_to_their_own_box() {
-        let src = include_str!("main.rs").replace(
-            "
-", "
-",
-        );
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod: String = src[..cut]
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
-            .join(
-                "
-",
-            );
+            .join("\n");
+        // 压平空白 + 去掉 rustfmt 在多行参数列表尾上留的那个逗号：
+        // 按行比会把"修复还在、只是被排版拆开"误判成夹取不见了。
+        let flat: String = prod
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .replace(",)", ")");
         for needle in [
-            "clip_middle(&dir_line, char_budget(560.0))",
-            "clip_middle(line, char_budget(status_w))",
+            "p.clip(&dir_line,&p.fmt.text12,560.0)",
+            "p.clip(line,status_fmt,status_w)",
         ] {
             assert_eq!(
-                prod.matches(needle).count(),
+                flat.matches(needle).count(),
                 1,
                 "这一处夹取不见了或被改写成两份：{needle}",
             );
         }
-        // 状态行那格：预算用的宽度必须就是画它的那个矩形的宽度
-        let at = prod.find("let status_w = ").expect("status_w 不见了");
-        let win: String = prod[at..].chars().take(420).collect();
+        // 状态行那格：夹取吃的宽度必须就是画它的那个矩形的宽度（写死常数就又不跟窗口走）
+        let at = flat.find("letstatus_w=").expect("status_w 不见了");
+        let win: String = flat[at..].chars().take(300).collect();
         assert!(
-            win.contains("status_w,") && win.contains("clip_middle(line, char_budget(status_w))"),
+            win.contains("status_w,") && win.contains("p.clip(line,status_fmt,status_w)"),
             "预算与矩形不是同一个宽度了：
 {win}",
+        );
+        assert!(
+            win.contains("letstatus_fmt=ifwarn"),
+            "状态行的夹取不再问画它那一档字体自己（加粗那档比常规宽）：
+{win}"
         );
     }
 
@@ -14126,8 +14301,8 @@ mod clip_tests {
     ///
     /// 这块 UI 的文本是 `NO_WRAP` 且不设 `DWRITE_TRIMMING` —— 越界不是"被截断"，是照画到
     /// 邻居身上（设备那一列窄窗口只有 ~200 px，而别名上限 24 个汉字、兜底名截到 40 字符，
-    /// 两路都能越过去；插件那两格吃的是作者自己写的字符串）。每条针都同时钉"夹了"与
-    /// "预算与矩形是同一个宽度表达式"，因为分家正是这一族的复发形状。比的是压平空白之后的
+    /// 两路都能越过去；插件那两格吃的是作者自己写的字符串）。每条针都同时钉"过的是实测复核
+    /// 那一道"与"夹取与矩形是同一个宽度表达式"，因为分家正是这一族的复发形状。比的是压平空白之后的
     /// 文本：rustfmt 会把长参数列表折行，按行比会把"修复还在、只是被排版拆开"误判成夹取不见了。
     #[test]
     fn four_more_fixed_width_cells_clip_their_own_text() {
@@ -14146,61 +14321,97 @@ mod clip_tests {
             .collect::<String>()
             .replace(",)", ")");
         for (needle, want) in [
-            // 设备名：预算与画它的那一格都用 device_name_width(&g)
-            ("clip_middle(&d.name,char_budget_at(device_name_width(&g),BODY_PT)),rect(g.x_name,y+3.0,device_name_width(&g),18.0)", 1),
+            // 设备名：夹取与画它的那一格都用 device_name_width(&g)
+            ("p.clip(&d.name,&p.fmt.table_name,device_name_width(&g)),rect(g.x_name,y+3.0,device_name_width(&g),18.0)", 1),
             // 页脚那句：同一个 r.right-r.left-g.pad*2.0
-            ("clip_middle(&footer_line(&snap.data_home,&snap.gaps,lane),char_budget_at(r.right-r.left-g.pad*2.0,CAPTION_PT)),rect(r.left+g.pad,foot_y,r.right-r.left-g.pad*2.0,16.0)", 1),
+            ("p.clip(&footer_line(&snap.data_home,&snap.gaps,lane),&p.fmt.caption,r.right-r.left-g.pad*2.0),rect(r.left+g.pad,foot_y,r.right-r.left-g.pad*2.0,16.0)", 1),
             // 插件名那一格是定宽 240，后面 10 px 就是"版本 · 作者"
-            ("clip_middle(&row.name,char_budget_at(240.0,BODY_PT)),rect(r.left+8.0,y+5.0,240.0,18.0)", 1),
+            ("p.clip(&row.name,&p.fmt.body,240.0),rect(r.left+8.0,y+5.0,240.0,18.0)", 1),
             // ⚠ 压平空白也会压掉**字符串字面量里面**的空格，所以这一针里的 `v{}·{}`
             // 与源码里的 `v{} · {}` 是同一个东西 —— 别照着源码补空格。
-            ("clip_middle(&format!(\"v{}·{}\",row.version,row.author),char_budget_at(260.0,CAPTION_PT)),rect(r.left+250.0,y+7.0,260.0,16.0)", 1),
+            ("p.clip(&format!(\"v{}·{}\",row.version,row.author),&p.fmt.caption,260.0),rect(r.left+250.0,y+7.0,260.0,16.0)", 1),
             // 插件第二行：两个分支共用 desc_w（所以这一针本来就是两处）
-            ("clip_middle(&text,char_budget_at(desc_w,CAPTION_PT)),rect(r.left+8.0,y+23.0,desc_w,16.0)", 1),
-            ("char_budget_at(desc_w,CAPTION_PT)", 2),
-            ("char_budget_at(520.0,CAPTION_PT)", 1),
-            ("char_budget_at(card.right-card.left-32.0,CAPTION_PT)", 1),
-            // 值框：预算与画它的矩形共用 val_w（那一格还要给右边的按钮让位）
-            ("clip_middle(shown,char_budget_at(val_w,SETTINGS_TEXT_PT)),rect(vb.left+8.0,vb.top,val_w,vb.bottom-vb.top)", 1),
+            ("p.clip(&text,&p.fmt.caption,desc_w),rect(r.left+8.0,y+23.0,desc_w,16.0)", 1),
+            ("&p.fmt.caption,desc_w)", 2),
+            ("p.clip(&format!(\"{}个·目录{}\",rows.len(),focusflow_core::paths::plugins_dir().display()),&p.fmt.caption,520.0)", 1),
+            ("p.clip(&format!(\"插件目录读不出来：{e}\"),&p.fmt.caption,card.right-card.left-32.0)", 1),
+            // 值框：夹取与画它的矩形共用 val_w（那一格还要给右边的按钮让位）
+            ("p.clip(shown,&p.fmt.text13,val_w),rect(vb.left+8.0,vb.top,val_w,vb.bottom-vb.top)", 1),
             // 设备详情弹窗：名字与副行同一个 detail_w
-            ("clip_middle(&d.name,char_budget_at(detail_w,BODY_PT)),rect(x,dialog.top+40.0,detail_w,20.0)", 1),
-            ("clip_middle(&sub,char_budget_at(detail_w,CAPTION_PT)),rect(x,dialog.top+62.0,detail_w,18.0)", 1),
+            ("p.clip(&d.name,&p.fmt.body,detail_w),rect(x,dialog.top+40.0,detail_w,20.0)", 1),
+            ("p.clip(&sub,&p.fmt.caption,detail_w),rect(x,dialog.top+62.0,detail_w,18.0)", 1),
             // 图上悬停读数：夹的是气泡里面那一条
-            ("clip_middle(text,char_budget_at(w-12.0,SMALL_PT)),rect(x+6.0,y+1.0,w-12.0,16.0)", 1),
+            ("p.clip(text,&p.fmt.small,w-12.0),rect(x+6.0,y+1.0,w-12.0,16.0)", 1),
             // 目标条那句"今日 N / M"：150 之后 8 px 就是进度条
-            ("char_budget_at(150.0,BODY_PT)", 1),
+            ("p.clip(&format!(\"今日{}/{}\",thousands(todayasu64),thousands(goalasu64)),&p.fmt.body,150.0),rect(r.left+pad,r.top+14.0,150.0,18.0)", 1),
             // 插件面板一族：作者给的字符串，宽度全是插件自己挑的
-            ("clip_middle(text,char_budget_at(r.right-r.left,BODY_PT)),*r,&p.fmt.body,&p.br.fg", 1),
-            ("clip_middle(text,char_budget_at(r.right-r.left,CAPTION_PT)),*r,&p.fmt.caption,&p.br.muted", 2),
-            ("clip_middle(key,char_budget_at(140.0,CAPTION_PT)),rect(r.left,r.top,140.0,18.0)", 1),
-            ("clip_middle(value,char_budget_at(r.right-r.left-146.0,SMALL_PT)),rect(r.left+146.0,r.top,r.right-r.left-146.0,18.0)", 1),
+            ("p.clip(text,&p.fmt.body,r.right-r.left),*r,&p.fmt.body,&p.br.fg", 1),
+            ("p.clip(text,&p.fmt.caption,r.right-r.left),*r,&p.fmt.caption,&p.br.muted", 2),
+            ("p.clip(key,&p.fmt.caption,140.0),rect(r.left,r.top,140.0,18.0)", 1),
+            ("p.clip(value,&p.fmt.small,r.right-r.left-146.0),rect(r.left+146.0,r.top,r.right-r.left-146.0,18.0)", 1),
             // Field 与 Select 的标签同一格同一定宽 ⇒ 两处
-            ("clip_middle(label,char_budget_at(140.0,CAPTION_PT)),rect(r.left,r.top+4.0,140.0,18.0)", 2),
-            ("clip_middle(value,char_budget_at(vb.right-vb.left-16.0,CAPTION_PT))", 1),
-            ("clip_middle(value,char_budget_at(vb.right-vb.left-28.0,CAPTION_PT))", 1),
-            ("clip_middle(htxt,char_budget_at(cw-12.0,CAPTION_PT)),rect(r.left+6.0+iasf32*cw,r.top+4.0,cw-12.0,16.0)", 1),
-            ("clip_middle(cell,char_budget_at(cw-12.0,SMALL_PT)),rect(rr.left+6.0+ciasf32*cw,rr.top+2.0,cw-12.0,16.0)", 1),
-            ("clip_middle(&f.label,char_budget_at(136.0,CAPTION_PT)),rect(row.left,row.top+7.0,136.0,18.0)", 1),
-            ("clip_middle(&f.value,char_budget_at(vb.right-vb.left-28.0,CAPTION_PT)),rect(vb.left+8.0,vb.top+3.0,vb.right-vb.left-28.0,18.0)", 1),
-            ("clip_middle(m.title,char_budget_at(g.dialog.right-g.dialog.left-72.0,BODY_PT))", 1),
+            ("p.clip(label,&p.fmt.caption,140.0),rect(r.left,r.top+4.0,140.0,18.0)", 2),
+            ("p.clip(value,&p.fmt.caption,vb.right-vb.left-16.0)", 1),
+            ("p.clip(value,&p.fmt.caption,vb.right-vb.left-28.0)", 1),
+            ("p.clip(htxt,&p.fmt.caption,cw-12.0),rect(r.left+6.0+iasf32*cw,r.top+4.0,cw-12.0,16.0)", 1),
+            ("p.clip(cell,&p.fmt.small,cw-12.0),rect(rr.left+6.0+ciasf32*cw,rr.top+2.0,cw-12.0,16.0)", 1),
+            ("p.clip(&f.label,&p.fmt.caption,136.0),rect(row.left,row.top+7.0,136.0,18.0)", 1),
+            ("p.clip(&f.value,&p.fmt.caption,vb.right-vb.left-28.0),rect(vb.left+8.0,vb.top+3.0,vb.right-vb.left-28.0,18.0)", 1),
+            ("p.clip(m.title,&p.fmt.body,g.dialog.right-g.dialog.left-72.0)", 1),
             // 热键那两行：组合键是 config.ini 的原文，两句同一格 ⇒ 两处
-            ("char_budget_at(640.0,SETTINGS_HELP_PT)", 2),
+            ("&p.fmt.text12,640.0)", 2),
             // 趋势图横轴起点：60 px 那一格吃的是库里的日期串
-            ("clip_middle(&left,char_budget_at(60.0,CAPTION_PT)),rect(plot.left,plot.bottom+4.0,60.0,14.0)", 1),
+            ("p.clip(&left,&p.fmt.caption,60.0),rect(plot.left,plot.bottom+4.0,60.0,14.0)", 1),
             // 星期分布柱顶数字：居中，越界两头都跑
-            ("clip_middle(&thousands(count.max(0)asu64),char_budget_at(bw,SMALL_PT)),rect(x,plot.bottom-hh-WEEKDAY_VALUE_HEADROOM,bw,16.0)", 1),
+            ("p.clip(&thousands(count.max(0)asu64),&p.fmt.center_small,bw),rect(x,plot.bottom-hh-WEEKDAY_VALUE_HEADROOM,bw,16.0)", 1),
             // 目标条右边那句：右对齐，左边 8 px 就是进度条
-            ("char_budget_at(198.0,CAPTION_PT)", 1),
+            ("p.clip(&format!(\"连续打卡{}天·近一年最长{}天\",g.streak,g.best),&p.fmt.caption_right,198.0),rect(dots_x-206.0,r.top+14.0,198.0,18.0)", 1),
             // 设备详情弹窗那一叠行：标签 76、值吃到弹窗右边减 100
-            ("clip_middle(label,char_budget_at(76.0,CAPTION_PT)),rect(cx,yy,76.0,18.0)", 1),
-            ("clip_middle(value,char_budget_at(dialog.right-cx-100.0,BODY_PT)),rect(cx+82.0,yy,dialog.right-cx-100.0,18.0)", 1),
+            ("p.clip(label,&p.fmt.caption,76.0),rect(cx,yy,76.0,18.0)", 1),
+            ("p.clip(value,&p.fmt.body,dialog.right-cx-100.0),rect(cx+82.0,yy,dialog.right-cx-100.0,18.0)", 1),
         ] {
             assert_eq!(
                 flat.matches(needle).count(),
                 want,
-                "这一处夹取不见了、被改写成两份、或预算与矩形分了家：{needle}（期望 {want} 处）"
+                "这一处夹取不见了、被改写成两份、或夹取与矩形分了家：{needle}（期望 {want} 处）"
             );
         }
+    }
+
+    /// 这一族的**中央**接线腿：生产段里只许有两处按字符折算的地方 ——
+    /// `clip_middle` 的定义与 `clip_to_cell` 里那一次退回。
+    ///
+    /// 为什么钉这个：把"全角尺子"直接抄进新的格子，症状不是报错，是屏上明明画得下的句子
+    /// 长出省略号（这一轮那三处就是这么来的）。新格子必须过 `p.clip`，让 DirectWrite
+    /// 复核一次；`char_budget_at` 只留给 `clip_to_cell` 自己当退回档。
+    #[test]
+    fn no_new_cell_may_clip_by_the_full_width_ruler_alone() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod: String = src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        // `fn clip_middle(` 与 `clip_to_cell` 里 `_=>clip_middle(text,budget)` 各一处
+        assert_eq!(
+            flat.matches("clip_middle(").count(),
+            2,
+            "生产段里按字符折算的入口多了：除定义与 clip_to_cell 那一次退回之外，\
+             新格子要走 p.clip（实测复核），不要手抄全角尺子"
+        );
+        // `fn char_budget_at(` 与 `clip_to_cell` 里那一处 `letbudget=`
+        assert_eq!(
+            flat.matches("char_budget_at(").count(),
+            2,
+            "全角尺子被抄到了 clip_to_cell 外面"
+        );
+        assert_eq!(
+            flat.matches("fnclip_to_cell(").count() + flat.matches("pubfnclip_to_cell(").count(),
+            1,
+            "实测复核那一道不见了"
+        );
     }
 
     /// 接线腿：五张卡的副行也要过同一道夹取，且预算与画它的那个矩形用同一个宽度表达式。
@@ -14214,8 +14425,7 @@ mod clip_tests {
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
-            flat.matches("clip_middle(sub,char_budget_at(cw-24.0,CAPTION_PT))")
-                .count(),
+            flat.matches("p.clip(sub,&p.fmt.caption,cw-24.0)").count(),
             1,
             "卡片副行那道夹取不见了，或被改写成两份"
         );
@@ -14513,8 +14723,8 @@ mod text_tier_tests {
     fn the_caption_tier_keeps_its_sizes() {
         let f = build_formats(&dw()).expect("Formats");
         assert_eq!(size(&f.caption), 12.5);
-        // 摘要那一格的字符预算按 `CAPTION_PT` 换算：它和这一格真实字号分家时，预算量的不是
-        // 屏上那串像素，窄窗口下照样顶到胶囊底下 —— 上面那条钉住 12.5，这条钉住"同一个数"。
+        // 夹取那一道现在直接问 `GetFontSize()`，但排行摘要那几条判据仍按 `CAPTION_PT` 折算：
+        // 两边分家时判据量的就不是屏上那一格 —— 上面那条钉住 12.5，这条钉住"同一个数"。
         assert_eq!(
             CAPTION_PT,
             size(&f.caption),
