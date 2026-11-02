@@ -1857,18 +1857,15 @@ pub struct DeviceDetail {
     pub last_date: String,
     /// 近 30 天每日次数（含无输入的 0，日期升序）
     pub trend: Vec<(String, i64)>,
-    /// 周期内键名排行（次数降序）：`(键名, 次数)`。
-    /// 空表示该库还没有键名明细数据（功能上线前的历史，或采集侧未记录）。
-    pub keys: Vec<(String, i64)>,
-    /// 周期内键名明细的总次数（占比分母；与 period_count 可能略有出入：
-    /// 旧版本只记了次数没记键名的部分不会有明细）
-    pub key_total: i64,
-    /// 该设备**任何时候**有没有键名明细（区分「从没记过」与「本周期没有」）。
-    /// 周期内有没有数据看 `keys` 是否为空，不要拿这个字段代替。
-    pub has_key_detail: bool,
-    /// 这一轮没答上来的那些问（详情按年份库要问四趟：按天序列、键名明细、
-    /// 明细标记、排行）。**非空时上面这一页所有数字都只是下界**，界面必须说出来，
+    /// 这一轮没答上来的那些问（详情按年份库要问三趟：按天序列、排行、类型）。
+    /// **非空时上面这一页所有数字都只是下界**，界面必须说出来，
     /// 否则"这一年读不动"会穿成"这台设备最近没怎么用"。空 = 读全了。
+    ///
+    /// ⚠ 从前这里还交回「该设备在本周期的键名明细」（`keys` / `key_total` /
+    /// `has_key_detail`），为此每次打开详情都要跨所有年度库多问两趟。原生弹窗不画那张表、
+    /// 命令行也没有出口 —— 现量（2026-11-02）全仓零读者，故把查询撤掉。
+    /// **写入侧照旧**：`device_key_counts` 仍按设备 × 键名积累（`db::writer` 那条批处理），
+    /// 哪天要在界面上补那张表，历史数据不会缺。
     pub unreadable: Vec<String>,
 }
 
@@ -1957,177 +1954,12 @@ fn id_params(ids: &[i64]) -> Vec<&dyn rusqlite::ToSql> {
     ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect()
 }
 
-/// 「这台设备有没有键名明细」的三种结局。
-///
-/// 立三态的理由：`false` 会被界面念成一句关于**用户历史**的断言 ——
-/// 「键名明细从该功能上线后开始积累，此前的历史数据无法回溯」。
-/// 而原先每一条读不动的年份库（移动盘休眠、同步盘占位、库被别的连接握着）都会折进
-/// 那句"没有"：某一年打不开 ⇒ 那一年不算数 ⇒ 只要别处也没查到就报"没有"。
-/// 保守方向与本文件 `year_has_aggregates` 一致：**读不了就按"有"处理**，
-/// 宁可那一格显示成"有明细、这次没列出来"，也不替用户编一段历史。
-#[derive(Debug, PartialEq, Eq)]
-enum DetailVerdict {
-    /// 某一年库里确实查到过一条
-    Has,
-    /// 每一个能读的库都读完了，都说没有 —— 这才许界面念那句"无法回溯"
-    Absent,
-    /// 有年份库没答上来，原因都收在字符串里
-    Unknown(String),
-}
-
-/// 该设备在任何年份库里有没有一条键名明细。
-///
-/// 与「本周期内有没有」是两件事，混起来会对着设备说谎：点「今日」看一台
-/// 上周还在用、今天没按过的鼠标，界面说的是"键名明细从该功能上线后开始积累，
-/// 此前的历史数据无法回溯"，而那台鼠标库里其实有几十条明细。
-fn device_has_key_detail(identity: &str) -> DetailVerdict {
-    let mut unknown: Vec<String> = Vec::new();
-    for year in query_years(None, None) {
-        let path = paths::year_db_path(year);
-        let verdict = connection::with_ro_conn(&path, |conn| {
-            match connection::table_presence_cached(conn, "device_key_counts") {
-                // 这一年还没有这张表（键名明细是后来才加的功能）：这是**一个答案**
-                connection::Presence::No => DetailVerdict::Absent,
-                connection::Presence::Unreadable(why) => {
-                    DetailVerdict::Unknown(format!("{year} 年：{why}"))
-                }
-                connection::Presence::Yes => {
-                    match device_ids_of_identity_checked(conn, identity, year) {
-                        // 这台设备在这一年没登记过：也是一个答案
-                        Ok(ids) if ids.is_empty() => DetailVerdict::Absent,
-                        Err(why) => DetailVerdict::Unknown(format!("{year} 年：{why}")),
-                        Ok(ids) => {
-                            let sql = format!(
-                                "SELECT 1 FROM device_key_counts k \
-                                 WHERE k.device_id IN ({}) LIMIT 1",
-                                in_placeholders(ids.len())
-                            );
-                            let pv = id_params(&ids);
-                            // 两处失败原先都折成 `false`（`ok()?` 与 `unwrap_or(false)`）
-                            match conn.prepare(&sql).and_then(|mut s| s.exists(pv.as_slice())) {
-                                Ok(true) => DetailVerdict::Has,
-                                Ok(false) => DetailVerdict::Absent,
-                                Err(e) => DetailVerdict::Unknown(format!("{year} 年查不动: {e}")),
-                            }
-                        }
-                    }
-                }
-            }
-        })
-        // 库根本打不开：`with_ro_conn` 自己已经记了 error，这里把它记成"没答案"
-        .unwrap_or_else(|| DetailVerdict::Unknown(format!("{year} 年的库打不开")));
-        match verdict {
-            DetailVerdict::Has => return DetailVerdict::Has,
-            DetailVerdict::Unknown(why) => unknown.push(why),
-            DetailVerdict::Absent => {}
-        }
-    }
-    if unknown.is_empty() {
-        DetailVerdict::Absent
-    } else {
-        DetailVerdict::Unknown(unknown.join("；"))
-    }
-}
-
-/// 单设备在周期内的键名排行（跨年度库合并，次数降序），连同"这一轮没答上来的那些问"。
-///
-/// 表不存在（旧库）时安静交回空 —— 键名明细从该功能上线后开始积累，历史无法回溯。
-/// ⚠ 但"读不出来"不是"没有"：这一支以前有四道折（`with_ro_conn` 把打不开折成 `None`、
-/// `table_exists` 把问不出折成"没这张表"、`prepare(..).ok()` 与 `rows.flatten()` 把坏页
-/// 折成"明细就这些"），四道最后都穿成一句"这台设备的键名明细短了一截"。
-/// 现在四道都进 `unreadable`，交回的榜只是**已读部分**。
-fn device_key_rows(identity: &str, period: i64) -> (Vec<(String, i64)>, Vec<String>) {
-    let today_key = day_key_of_date(Local::now().date_naive());
-    let start_key = match period {
-        -1 => Some(today_key),
-        0 => None,
-        // 周期起点统一走 `period_start_key`：同一个公式只留一份实现，
-        // 而且它夹到 `MAX_QUERY_DAYS`（就地写 `n.max(1) - 1` 那份不夹）。
-        // 说清差别在哪：`today_key - (i64::MAX - 1)` **不会**下溢（结果约 −9.22e18，
-        // 仍在 i64 范围内，注回旧写法实测没 panic），但它等于"没有任何下界"
-        // ⇒ 极端周期从"近 100 年"变成"全表"，与 `period_start_key` 那一路不同口径。
-        n => Some(period_start_key(today_key, n)),
-    };
-    let mut merged: HashMap<String, i64> = HashMap::new();
-    let mut gaps: Vec<String> = Vec::new();
-    for year in query_years(None, None) {
-        let path = paths::year_db_path(year);
-        let gap_of = |why: String| format!("{year} 年库键名明细读不出来: {why}");
-        let got = connection::with_ro_conn_why(&path, |conn| -> YearRead<Vec<(String, i64)>> {
-            match connection::table_presence_cached(conn, "device_key_counts") {
-                connection::Presence::No => return YearRead::NoTable,
-                connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
-                connection::Presence::Yes => {}
-            }
-            // 这台设备在本库的 id 问不出 ⇒ 这一年的明细一条都没核对过，不能算"没有"
-            let ids = match device_ids_of_identity_checked(conn, identity, year) {
-                Ok(ids) => ids,
-                Err(why) => return YearRead::Unreadable(why),
-            };
-            if ids.is_empty() {
-                return YearRead::Read(Vec::new());
-            }
-            let ph = in_placeholders(ids.len());
-            // GROUP BY key_name 在这台设备的**所有 id** 上做：同一台设备在同库里
-            // 可能占两行（两种键形态的历史登记），明细必须加到一起。
-            let (sql, tail) = match start_key {
-                Some(sk) => (
-                    format!(
-                        "SELECT k.key_name, SUM(k.count) FROM device_key_counts k \
-                         WHERE k.device_id IN ({ph}) AND k.date_key >= ?{} \
-                         GROUP BY k.key_name",
-                        ids.len() + 1
-                    ),
-                    Some(sk),
-                ),
-                None => (
-                    format!(
-                        "SELECT k.key_name, SUM(k.count) FROM device_key_counts k \
-                         WHERE k.device_id IN ({ph}) GROUP BY k.key_name"
-                    ),
-                    None,
-                ),
-            };
-            let mut pv = id_params(&ids);
-            if let Some(ref sk) = tail {
-                pv.push(sk as &dyn rusqlite::ToSql);
-            }
-            let rows = match conn.prepare(&sql) {
-                Ok(mut stmt) => stmt
-                    .query_map(pv.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))
-                    .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
-                Err(e) => Err(e),
-            };
-            match rows {
-                Ok(list) => YearRead::Read(list),
-                Err(e) => {
-                    tracing::error!("device_key_counts 查询失败（{year} 年库，{sql}）: {e}");
-                    YearRead::Unreadable(format!("键名明细读不出来: {e}"))
-                }
-            }
-        });
-        match got {
-            Err(why) => gaps.push(gap_of(why)),
-            Ok(YearRead::Unreadable(why)) => gaps.push(gap_of(why)),
-            // 没有这张表 = 这一年还没开始记键名明细；安静按空计
-            Ok(YearRead::NoTable) => {}
-            Ok(YearRead::Read(list)) => {
-                for (name, c) in list {
-                    *merged.entry(name).or_insert(0) += c;
-                }
-            }
-        }
-    }
-    let mut list: Vec<(String, i64)> = merged.into_iter().collect();
-    list.sort_by(|a, b| crate::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
-    (list, gaps)
-}
-
 /// 单设备按天次数序列（跨年度库合并，date_key 升序），连同"这一轮没答上来的那些问"。
 ///
 /// 设备维度按年份分库存储，查询必须跨库合并 —— 与 `get_device_stats` 同理。
-/// 四道折的收口理由同 [`device_key_rows`]：这一栏读不全时界面念的是
-/// "活跃 N 天 / 首次与最近使用日期"，那都是关于**用户历史**的断言。
+/// 四道折都收进 `gaps`（原先 `with_ro_conn` 把打不开折成 `None`、`table_exists` 把问不出
+/// 折成"没这张表"、`prepare(..).ok()` 与 `rows.flatten()` 把坏页折成"就这些"）：这一栏读不
+/// 全时界面念的是"活跃 N 天 / 首次与最近使用日期"，那都是关于**用户历史**的断言。
 fn device_date_series(identity: &str) -> (Vec<(i64, i64)>, Vec<String>) {
     let mut merged: HashMap<i64, i64> = HashMap::new();
     let mut gaps: Vec<String> = Vec::new();
@@ -2263,11 +2095,6 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
         .map(|i| i as i64 + 1)
         .unwrap_or(0);
 
-    // 周期内键名排行（设备 × 键名明细；旧库无该表时为空）
-    let (key_rows, key_gaps) = device_key_rows(&device_key, period);
-    gaps.extend(key_gaps);
-    let key_total: i64 = key_rows.iter().map(|(_, c)| *c).sum();
-
     // 近 30 天分布（缺数据补 0，便于前端直接画柱）
     let date_str = |dk: i64| {
         day_key_to_date(dk)
@@ -2289,15 +2116,6 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
         })
         .collect();
 
-    // 只有"每一个能读的库都说没有"才报 false：那一格界面文案讲的是用户的历史，
-    // 拿一次读不动当证据就等于替用户编一段历史。读不动时按 true 走
-    // （那一格会显示成"有明细、这次没列出来"），原因除了留日志还进 `unreadable`，
-    // 让界面把它说给人听。
-    let detail_verdict = device_has_key_detail(&device_key);
-    if let DetailVerdict::Unknown(why) = &detail_verdict {
-        tracing::warn!("设备 {device_key} 有没有键名明细查不出来（{why}）：本次不断言「没有」");
-        gaps.push(format!("这台设备有没有键名明细问不出来: {why}"));
-    }
     DeviceDetail {
         key: device_key.clone(),
         name,
@@ -2330,9 +2148,6 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
             .map(|(dk, _)| date_str(*dk))
             .unwrap_or_default(),
         trend,
-        keys: key_rows,
-        key_total,
-        has_key_detail: !matches!(detail_verdict, DetailVerdict::Absent),
         unreadable: gaps,
     }
 }
@@ -3461,81 +3276,6 @@ mod tests {
         assert_eq!(key2, key, "重跑 ensure_schema 不该再改写占位键");
     }
 
-    /// `has_key_detail` 问的是"这台设备记过键名明细吗"，不是"本周期里有吗"。
-    ///
-    /// 两者混起来时，点「今日」看一台只在上周按过的鼠标，界面会说
-    /// "键名明细从该功能上线后开始积累，此前的历史数据无法回溯" —— 而库里
-    /// 其实有它的明细（他机器上就有这种设备：明细全落在 09-22 那一天）。
-    #[test]
-    fn device_key_detail_flag_is_not_period_scoped() {
-        let _lock = crate::paths::test_app_dir_lock();
-        let _tmp = crate::paths::test_app_dir("devflag");
-
-        let today = Local::now().date_naive();
-        let dk = day_key_of_date(today);
-        let old = "HID#VID_046D&PID_C52B&MI_00#old";
-        // 必须换**型号**才算另一台设备：B14-2 之后换实例号（原来这里是 `#never`）
-        // 是同一台设备的另一种键形态，明细当然归它 —— 拿那种写法造"从没记过明细"
-        // 的设备，造出来的只是同一台设备的第二个别名键。
-        let never = "HID#VID_1111&PID_2222#never";
-        {
-            let path = paths::year_db_path(today.year());
-            let conn = crate::db::connection::open_rw(&path).unwrap();
-            crate::db::connection::ensure_schema(&conn, today.year()).unwrap();
-            for (key, kind) in [(old, "mouse"), (never, "mouse")] {
-                conn.execute(
-                    "INSERT INTO devices (device_key, name, kind) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![key, format!("HID 鼠标 · {kind}"), kind],
-                )
-                .unwrap();
-            }
-            let dev_id = |key: &str| -> i64 {
-                crate::db::connection::device_id_of(&conn, key).expect("设备 id")
-            };
-            // 两台设备今天都有按键次数（否则压根进不了详情入口）
-            for key in [old, never] {
-                conn.execute(
-                    "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![dk, dev_id(key), 7],
-                )
-                .unwrap();
-            }
-            // 但只有 `old` 记过键名明细，而且记在 5 天前
-            conn.execute(
-                "INSERT INTO device_key_counts (date_key, device_id, key_name, count) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![dk - 5, dev_id(old), "空格", 30],
-            )
-            .unwrap();
-        }
-        crate::device_alias::invalidate_cache();
-
-        let today_view = get_device_detail(old, -1);
-        assert!(
-            today_view.keys.is_empty(),
-            "今日确实没有明细（这条前提要成立，下面的断言才有意义）"
-        );
-        assert!(
-            today_view.has_key_detail,
-            "「本周期没有明细」不等于「这台设备没记过明细」"
-        );
-        let all_view = get_device_detail(old, 0);
-        assert!(all_view.has_key_detail);
-        assert_eq!(
-            all_view
-                .keys
-                .iter()
-                .find(|(k, _)| k == "空格")
-                .map(|(_, c)| *c),
-            Some(30),
-            "换成长周期就该看到那条明细"
-        );
-        assert!(
-            !get_device_detail(never, -1).has_key_detail,
-            "从没记过明细的设备仍然要报 false，否则新文案就没意义了"
-        );
-    }
-
     /// 登记名被写成裸设备路径时（历史脏登记）不计为真名，一律走回退。
     ///
     /// 有三个来源都把 device_key 当 name 写进 devices 表：
@@ -3685,20 +3425,6 @@ mod tests {
         let d = get_device_detail(a, 2);
         assert_eq!(d.period_count, 150);
         assert_eq!(d.period_total, 160);
-
-        // 键名明细：按设备隔离、按次数降序，且跟随所选周期
-        let today_detail = get_device_detail(a, -1);
-        assert!(today_detail.has_key_detail);
-        assert_eq!(today_detail.keys.len(), 2, "今日只有左键与滚轮");
-        assert_eq!(today_detail.keys[0], ("鼠标左键".to_string(), 60));
-        assert_eq!(today_detail.keys[1], ("滚轮上滑".to_string(), 40));
-        assert_eq!(today_detail.key_total, 100);
-        let all_detail = get_device_detail(a, 0);
-        assert_eq!(all_detail.key_total, 250, "含昨天的 150 次左键");
-        assert_eq!(all_detail.keys[0].1, 210, "左键累计 60 + 150");
-        let other = get_device_detail(b, -1);
-        assert_eq!(other.keys.len(), 1, "另一台设备的明细互不混入");
-        assert_eq!(other.keys[0], ("空格".to_string(), 10));
 
         crate::device_alias::invalidate_cache();
     }
@@ -3964,102 +3690,6 @@ mod tests {
         );
     }
 
-    /// 回归（`period_start_key` 那一族的另一半）：`device_key_rows` 自己写了一遍
-    /// 周期起点公式 `today_key - (n.max(1) - 1)`，而 `period_start_key` 那份夹到
-    /// `MAX_QUERY_DAYS` —— 同一个公式两份实现。
-    ///
-    /// 差别的形状要说清（我第一版按 `period_start_key` 注释里那句"会下溢"写成了
-    /// **崩溃级**，注回旧写法实测**不 panic** —— `n = i64::MAX` 时结果约 −9.22e18，
-    /// 仍在 i64 范围内，那个说法在这条 i64 键运算上不成立，收回）。真正的问题是
-    /// 那一档等于"没有下界"：不夹的写法会把 1900 年的行也算进"近 N 天"。
-    ///
-    /// `period` 是外部输入：现在把它交下来的是原生端的设备详情弹窗
-    /// （`desktop-native/src/main.rs` 直接点 `get_device_detail`），这一条
-    /// 不过 `is_valid_period`（对比同一个文件里的统计视图那条）。
-    ///
-    /// 已有的 `device_detail_period_cannot_underflow` 只测纯函数那一份，
-    /// 照不到第二处实现 —— 这条直接点 `device_key_rows` 本体。
-    ///
-    /// （第一版只从入口喂极端值 + 断言"空库返回空"，注入取证 INJ-39 注回旧写法后
-    /// 仍然绿 —— 那等于什么都没测。第二版改成"种一条 1900 年的设备行"：
-    /// 它在窗口之外、在全表之内，两种写法的答案不一样。）
-    #[test]
-    fn device_key_rows_extreme_period_is_clamped_not_unbounded() {
-        use chrono::Datelike;
-        let _lock = crate::paths::test_app_dir_lock();
-        let _tmp = crate::paths::test_app_dir("dev_keys_clamp");
-        invalidate_years_cache();
-        let key = "HID#VID_1234&PID_5678#0";
-        let old_year = 1900i32;
-        let old_dk =
-            day_key_of_date(chrono::NaiveDate::from_ymd_opt(old_year, 6, 1).expect("date"));
-        let today_key = day_key_of_date(Local::now().date_naive());
-        {
-            let conn = connection::open_rw(&paths::year_db_path(old_year)).unwrap();
-            connection::ensure_schema(&conn, old_year).unwrap();
-            conn.execute(
-                "INSERT OR IGNORE INTO devices (id, device_key, name, kind) VALUES (7, ?1, '老键鼠', 'mouse')",
-                [key],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO device_key_counts (date_key, device_id, key_name, count) VALUES (?1, 7, 'A', 5)",
-                [old_dk],
-            )
-            .unwrap();
-            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
-        }
-        invalidate_years_cache();
-        // 前提：这条行必须真的落在窗口之外，否则整条用例在测"查不到东西"
-        assert!(
-            today_key - old_dk > MAX_QUERY_DAYS,
-            "夹具不对：1900 年那条行距今天只有 {} 天，窗口 {MAX_QUERY_DAYS} 天测不出来",
-            today_key - old_dk
-        );
-        // 全表那一档必须看得见它
-        let all = device_key_rows(key, 0).0;
-        assert_eq!(
-            all,
-            vec![("A".to_string(), 5)],
-            "period=0 是全表，实得 {all:?}"
-        );
-        // 极端周期：夹住 ⇒ 1900 年那行不计进来（注回旧写法会算进来 ⇒ 这条红）
-        let huge = device_key_rows(key, i64::MAX).0;
-        assert!(
-            huge.is_empty(),
-            "i64::MAX 要夹到 {MAX_QUERY_DAYS} 天，不能等于「没有下界」，实得 {huge:?}"
-        );
-        // 反向腿：窗口内的行照常计入，且那一档与 MAX_QUERY_DAYS 完全一致
-        let cur = Local::now().year();
-        {
-            let conn = connection::open_rw(&paths::year_db_path(cur)).unwrap();
-            connection::ensure_schema(&conn, cur).unwrap();
-            conn.execute(
-                "INSERT OR IGNORE INTO devices (id, device_key, name, kind) VALUES (7, ?1, '键鼠', 'mouse')",
-                [key],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO device_key_counts (date_key, device_id, key_name, count) VALUES (?1, 7, 'B', 3)",
-                [today_key],
-            )
-            .unwrap();
-            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
-        }
-        invalidate_years_cache();
-        let got = device_key_rows(key, i64::MAX).0;
-        assert_eq!(
-            got,
-            vec![("B".to_string(), 3)],
-            "窗口内的行要照常计入、窗口外的不计（实得 {got:?}）"
-        );
-        assert_eq!(
-            device_key_rows(key, MAX_QUERY_DAYS).0,
-            got,
-            "i64::MAX 与 MAX_QUERY_DAYS 必须是同一档，不能一份回绕一份夹住"
-        );
-    }
-
     /// 某一年打不开时必须**报出是哪一年**，而不是让调用方拿着少一年的总数当结论。
     ///
     /// 夹具形态就是真机会遇到的那一种：文件名是年度库，内容却不是 SQLite 库（同步盘
@@ -4184,46 +3814,6 @@ mod tests {
             kept[0].auto_name, "书房那只鼠标",
             "归一后不等于身份段的真名必须原样保留"
         );
-    }
-
-    /// 「这台设备没有键名明细」只许在**每一个能读的库都说没有**的时候说。
-    ///
-    /// 这个布尔在界面上念出来的是「键名明细从该功能上线后开始积累，此前的历史数据
-    /// 无法回溯」—— 一句关于用户历史的话。原先某一年库打不开（移动盘还没醒、
-    /// 同步盘放的是占位、库被别的连接握着）也走同一句话，而且零日志。
-    #[test]
-    fn an_unreadable_year_is_not_reported_as_no_detail() {
-        let _lock = crate::paths::test_app_dir_lock();
-        let _tmp = crate::paths::test_app_dir("q_device_detail");
-        let identity = "HID#VID_046D&PID_C52B&MI_00#夹具";
-        let broken = 2031;
-        {
-            let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
-            connection::ensure_schema(&conn, chrono::Local::now().year()).unwrap();
-        }
-        invalidate_years_cache();
-        connection::clear_ro_cache();
-        assert_eq!(
-            device_has_key_detail(identity),
-            DetailVerdict::Absent,
-            "有这张表、而这台设备一行明细都没有：这才是「没有明细」"
-        );
-
-        // 另一年变成一个不是 SQLite 的文件 ⇒ 那一年**答不上来**，不能算"没有"
-        std::fs::write(paths::year_db_path(broken), b"not a sqlite file at all").unwrap();
-        invalidate_years_cache();
-        connection::clear_ro_cache();
-        let verdict = device_has_key_detail(identity);
-        assert!(
-            matches!(&verdict, DetailVerdict::Unknown(why) if why.contains(&broken.to_string())),
-            "要说清是哪一年答不上来，实得 {verdict:?}"
-        );
-
-        // 反向腿：坏文件拿走之后同一个问题回到 Absent —— 上面那条不是恒真
-        std::fs::remove_file(paths::year_db_path(broken)).unwrap();
-        invalidate_years_cache();
-        connection::clear_ro_cache();
-        assert_eq!(device_has_key_detail(identity), DetailVerdict::Absent);
     }
 
     /// 「某一年读不出来」不许在「最高单日」里等于「那一年没纪录」。
@@ -4799,7 +4389,6 @@ mod tests {
             "fn read_pairs(",
             "fn hourly_stats_totals(",
             "fn device_ids_of_identity_checked(",
-            "fn device_key_rows(",
             "fn device_date_series(",
         ] {
             let at = prod
@@ -4881,11 +4470,7 @@ mod tests {
     fn the_device_detail_readers_ask_the_three_state_rulers() {
         let src = include_str!("queries.rs");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
-        for header in [
-            "fn device_key_rows(",
-            "fn device_date_series(",
-            "fn registered_kind(",
-        ] {
+        for header in ["fn device_date_series(", "fn registered_kind("] {
             let at = prod
                 .find(header)
                 .unwrap_or_else(|| panic!("{header} 找不到了"));
@@ -4932,8 +4517,11 @@ mod tests {
 
     /// 设备详情那一页必须说得出"这一轮哪几问没答上来"。
     ///
-    /// 详情按年份库要跑四趟（按天序列、键名明细、明细标记、排行），这四问以前各折各的：
+    /// 详情按年份库要跑几趟（按天序列、排行，外加类型那一问），这些问以前各折各的：
     /// 读不动时界面交出的是一句关于用户历史的假话，而不是"这次没读全"。
+    /// ⚠ 从前这里还多两问（键名明细本体、"这台设备记过明细吗"的标记），随 `keys` 那三个
+    /// 字段一起撤了 —— 原生弹窗不画那张表、命令行也没有出口，全仓零读者（2026-11-02 现量）。
+    /// 剩下每一问仍要能点名。
     #[test]
     fn the_device_detail_says_which_readings_are_incomplete() {
         let _lock = crate::paths::test_app_dir_lock();
@@ -4972,13 +4560,8 @@ mod tests {
             healthy.unreadable
         );
         assert_eq!(
-            healthy.keys,
-            vec![("左键".to_string(), 25)],
-            "夹具得真被读进来，否则下面那些断言测的是空集"
-        );
-        assert_eq!(
             healthy.all, 40,
-            "按天那份同样要真读进来，实得 {}",
+            "夹具得真被读进来，否则下面那些断言测的是空集（按天那一栏），实得 {}",
             healthy.all
         );
 
@@ -4992,20 +4575,13 @@ mod tests {
         invalidate_years_cache();
         connection::clear_ro_cache();
         let detail = get_device_detail(key, 0);
-        for domain in ["键名明细", "按天序列"] {
-            assert!(
-                detail
-                    .unreadable
-                    .iter()
-                    .any(|g| g.contains(domain) && g.contains(&broken.to_string())),
-                "{domain} 那一年读不出来必须点名，实得 {:?}",
-                detail.unreadable
-            );
-        }
-        assert_eq!(
-            detail.keys,
-            vec![("左键".to_string(), 25)],
-            "坏掉那一年不该把已读到的明细一起吃掉"
+        assert!(
+            detail
+                .unreadable
+                .iter()
+                .any(|g| g.contains("按天序列") && g.contains(&broken.to_string())),
+            "按天序列那一年读不出来必须点名，实得 {:?}",
+            detail.unreadable
         );
 
         // **库头合法、明细那几页坏**：取行撞上就是 `Err`，不许折成"这台设备的明细就这些"
@@ -5071,8 +4647,9 @@ mod tests {
             .filter(|g| g.contains(&tail.to_string()))
             .collect();
         assert!(
-            named.len() >= 2,
-            "{tail} 这一年两栏都该点名（明细标记那一问也算一问），实得 {:?}",
+            !named.is_empty(),
+            "{tail} 这一年读不出来必须点名（现量：这一趟只剩按天序列一问会撞坏页——\
+             键名明细那两问随 `keys` 一起撤了），实得 {:?}",
             half.unreadable
         );
         for g in &named {
@@ -5810,8 +5387,9 @@ mod tests {
         );
         assert_eq!(
             prod.matches(wired.as_str()).count(),
-            2,
-            "设备榜那一列与设备详情那一列都要走那一份尺子，数量变了说明接线动过"
+            1,
+            "排名尺子的接线数变了：设备详情那一列（键名明细）随 `keys` 一起撤掉后，\
+             core 里只剩设备榜这一列走它 —— 再少一处或有人开始手抄都要红"
         );
     }
 }

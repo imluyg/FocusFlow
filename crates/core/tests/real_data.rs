@@ -427,9 +427,12 @@ mod tests {
 
     /// 设备详情与各周期窗口在真实数据上必须自洽。
     ///
-    /// 详情页一次给出 今日/近7/近30/全部 + 排名 + 键名明细，这些数字来自好几条
-    /// 独立查询；它们之间的矛盾（窗口大的反而小、有次数却排名 0、明细比总次数还多）
-    /// 在 fixture 上要手写出来很费劲，真库里天然就有。
+    /// 详情页一次给出 今日/近7/近30/全部 + 排名，这些数字来自好几条独立查询；
+    /// 它们之间的矛盾（窗口大的反而小、有次数却排名 0）在 fixture 上要手写出来很费劲，
+    /// 真库里天然就有。
+    /// ⚠ 从前这里还对拍过「键名明细之和 == 明细总次数 <= 该周期次数、且降序」——
+    /// 那份数据（`DeviceDetail.keys` / `key_total`）随"每次打开详情多问两趟、生产侧零读者"
+    /// 一起撤掉了（2026-11-02），写入侧 `device_key_counts` 照旧积累。
     #[test]
     fn real_data_device_detail_and_windows_are_self_consistent() {
         let outcome = on_real_data_copy("realdata_detail", || {
@@ -477,23 +480,6 @@ mod tests {
                             d.kind_rank,
                             d.kind_count
                         );
-                    }
-                    let key_sum: i64 = d.keys.iter().map(|(_, c)| *c).sum();
-                    assert_eq!(key_sum, d.key_total, "{tag}: 键名明细与明细总次数不等");
-                    assert!(
-                        d.key_total <= d.period_count,
-                        "{tag}: 键名明细({}) 比该周期的输入次数({}) 还多",
-                        d.key_total,
-                        d.period_count
-                    );
-                    assert!(
-                        d.keys.iter().all(|(_, c)| *c > 0),
-                        "{tag}: 键名排行里出现非正次数"
-                    );
-                    let mut prev = i64::MAX;
-                    for (_, c) in &d.keys {
-                        assert!(*c <= prev, "{tag}: 键名排行不是降序（前端直接取前 20）");
-                        prev = *c;
                     }
                     assert_eq!(
                         d.active_days == 0,
