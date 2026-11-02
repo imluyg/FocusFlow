@@ -62,7 +62,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         3,
         "改完立即生效",
         "唤出窗口热键",
-        "热键 · 按下它把主窗口带到前台，如 ctrl+shift+f；点值框右边的叉＝这条不注册",
+        "热键 · 按下它把主窗口带到前台，如 ctrl+shift+f；右边的叉＝这条不注册",
     ),
     (
         "hotkey",
@@ -70,7 +70,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         3,
         "改完立即生效",
         "区域截图热键",
-        "热键 · 按下它框选后松手即存（PNG + 剪贴板），如 shift+f1；两条热键不能相同",
+        "热键 · 框选后松手即存（PNG + 剪贴板），如 shift+f1；两条热键不能相同",
     ),
     (
         "hotkey",
@@ -738,34 +738,42 @@ mod readout_rulers_tests {
         );
     }
 
-    /// 开关行的说明文字必须装得进它那一列：值框从 x=720 起画，说明从 ~334 起、列宽
-    /// `(720 - r.left - 30) ≈ 368 px`。这块 UI **不按矩形裁切**（`NO_WRAP`、不设
-    /// `DWRITE_TRIMMING`），超出去的字照画 —— 2026-10-30 新加的那一行就是这么把
-    /// "（旧观感，中途会闪一下桌面）"画到「开」按钮右边的（截图量过，改前 48 字、
-    /// 改后约 350 px 正好收在框左）。开关行没有别的遮挡物，所以只有这一族的长度要钉。
+    /// 每一行的说明都必须装得进它那一列：值框从 x=720 起画，说明从 `body_left + 12` 起、
+    /// 列宽 `(value_x - body_left - 30)`。这块 UI **不按矩形裁切**（`NO_WRAP`、不设
+    /// `DWRITE_TRIMMING`），超出去的字照画；而值框在说明**之后**画，越出去那截于是藏进
+    /// 框底，用户看到的是半句。
+    ///
+    /// 两条改口都是现量逼出来的：
+    /// - 从前只查 `kind == 0`（开关行），可热键那几行吃的是同一个格子、说明还更长 ——
+    ///   "清单行是静态文字所以自带上界"这句话的破口就在这儿。
+    /// - 尺子换成产品自己那一把（`measure_text` + 画那一行的 `text12` 档）。原来的近似
+    ///   "全角一个字号、半角半个"在拉丁串上偏保守、在混合串上偏乐观，两把尺子迟早分家。
     #[test]
-    fn a_toggle_rows_help_fits_before_its_value_box() {
-        // 列宽从设置页自己的几何算（`settings_geom` 与画那一行用的是同一份），字号读
-        // `SETTINGS_HELP_PT` —— 字号一改，这条判据跟着改，不会按旧字号放行。
+    fn every_help_row_fits_before_its_value_box() {
+        use windows::Win32::Graphics::DirectWrite::{
+            DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED,
+        };
+        // 列宽从设置页自己的几何算（`settings_geom` 与画那一行用的是同一份），字号取自
+        // 画那一行的那一档 —— 字号一改，这条判据跟着改，不会按旧字号放行。
         let g = crate::settings_geom(1200.0, 860.0);
         let col = (g.value_x - g.body_left - 30.0).max(120.0);
-        let pt = crate::SETTINGS_HELP_PT;
-        // 近似字宽：中日韩全角 pt，ASCII pt/2。
-        let width = |s: &str| -> f32 {
-            s.chars()
-                .map(|c| if (c as u32) < 0x2E80 { pt / 2.0 } else { pt })
-                .sum()
-        };
-        for (section, key, kind, _, _, help) in SETTINGS {
-            if *kind != 0 {
-                continue;
+        let dw: IDWriteFactory =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.expect("DWrite 工厂");
+        let f = crate::build_formats(&dw).expect("Formats");
+        let mut over: Vec<String> = Vec::new();
+        for (section, key, _, _, _, help) in SETTINGS {
+            let w = crate::measure_text(&dw, help, &f.text12).expect("量不出来");
+            if w > col {
+                over.push(format!(
+                    "{section}.{key} 的说明实测 {w:.1} px > 列宽 {col:.1} px：{help}"
+                ));
             }
-            assert!(
-                width(help) <= col,
-                "开关行 {section}.{key} 的说明宽约 {:.0} px，会画到值框上（列宽 {col} px）：{help}",
-                width(help)
-            );
         }
+        assert!(
+            over.is_empty(),
+            "这些设置行的说明越到值框后面（值框在它之后画，越出去那截藏进框底）：\n{}",
+            over.join("\n")
+        );
     }
 
     /// 「日均」那两档的分母各吃什么数。

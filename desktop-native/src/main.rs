@@ -1836,6 +1836,10 @@ impl App {
                 self.chart_hover = None;
                 self.pv_select = None;
                 self.pv_modal = None;
+                // 录入态也一起清：热键录入吃掉 WM_KEYDOWN（连 Esc 都不再收窗），而它的
+                // 提示画在设置页那一格里 —— 换页之后提示看不见、按键照旧被吞，
+                // 用户只会觉得"这个键怎么没反应了"。
+                self.capturing = None;
                 if i == 5 {
                     self.place_search_edit(hwnd);
                 } else {
@@ -6506,6 +6510,12 @@ fn plugin_content_height(view: &focusflow_core::plugins::PluginView, area: D2D_R
 /// 插件表格的行几何：表头与行高是画、命中、行内按钮三处共用的同一把尺子。
 const PV_TABLE_HEAD_H: f32 = 24.0;
 const PV_TABLE_ROW_H: f32 = 20.0;
+/// 一张表最多画几行（面板没有表格内滚动，其余行这次就不出现）。
+///
+/// 单列成常量是因为 `rows` 与 `ids` 必须**一起**截：命中测试按 `ids.len()` 排行矩形，
+/// 只截 `rows` 等于给画不出来的行留出一块点击区（见
+/// `a_table_with_more_rows_than_drawn_has_no_invisible_hit_rows`）。
+const PV_TABLE_MAX_ROWS: usize = 6;
 
 /// 第 `i` 行的整行矩形（画图高亮与点击命中都从这里算，别各写一遍）。
 fn pv_table_row_rect(r: &D2D_RECT_F, i: usize) -> D2D_RECT_F {
@@ -6672,7 +6682,14 @@ fn plugin_view_ops(
                     onselect,
                     ..
                 } => {
-                    let shown: Vec<Vec<String>> = rows.iter().take(6).cloned().collect();
+                    let shown: Vec<Vec<String>> =
+                        rows.iter().take(PV_TABLE_MAX_ROWS).cloned().collect();
+                    // `ids` 的契约是"与 rows 平行"（见 `POp::Table` 那一句），而命中测试按
+                    // `ids.len()` 一路往下摆行矩形 ⇒ 从前只截 rows、ids 整份交回，表格下方
+                    // 那片空白和排在后面的按钮就被读成"选了第 7、8… 行"：写回一个屏上没有的
+                    // id（`onselect` 还会让插件按它刷新），并把那次点击吞掉。
+                    let shown_ids: Vec<String> =
+                        ids.iter().take(PV_TABLE_MAX_ROWS).cloned().collect();
                     let h = PV_TABLE_HEAD_H + shown.len() as f32 * PV_TABLE_ROW_H;
                     // 有行内操作时，右侧留出按钮列，数据列相应收窄
                     let mut buttons: Vec<(D2D_RECT_F, String, String)> = Vec::new();
@@ -6686,7 +6703,7 @@ fn plugin_view_ops(
                             + 12.0;
                         reserve = bw;
                         for (ri, _) in shown.iter().enumerate() {
-                            let rid = ids.get(ri).cloned().unwrap_or_default();
+                            let rid = shown_ids.get(ri).cloned().unwrap_or_default();
                             let mut bx = x + w - 6.0;
                             for (prefix, label) in actions.iter().rev() {
                                 let bw = (label.chars().count() as f32 * 14.0 + 16.0).max(44.0);
@@ -6707,7 +6724,7 @@ fn plugin_view_ops(
                         rows: shown,
                         buttons,
                         column_w: w - reserve,
-                        ids: ids.clone(),
+                        ids: shown_ids,
                         group: group.clone(),
                         onselect: onselect.clone(),
                         sel: plugin_sel.get(group.as_str()).cloned().unwrap_or_default(),
@@ -9754,10 +9771,10 @@ const UI_WEIGHT_REG: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_NORMAL;
 
 /// 设置页值框与正文那一档的字号（`text13` / `center13`），以及说明行那一档（`text12`）。
 ///
-/// 单列成常量是因为**说明行的宽度守卫**（`data.rs` 的
-/// `a_toggle_rows_help_fits_before_its_value_box`）要按同一档字号换算可用宽度：
-/// 这两个数各写一处的话，改字号时那条守卫就会按旧字号放行，屏上却画到值框上 ——
-/// 这块 UI 不按矩形裁切（`NO_WRAP`、不设 `DWRITE_TRIMMING`），超出去的字照画。
+/// 说明行的宽度守卫（`data.rs` 的 `every_help_row_fits_before_its_value_box`）现在不再自己
+/// 按字号换算：它拿 `build_formats` 交回的 `text12` 那一档实测宽度，所以字号一改判据跟着改。
+/// 两档还是要单列成常量 —— 这块 UI 不按矩形裁切（`NO_WRAP`、不设 `DWRITE_TRIMMING`），
+/// 说明越宽就照画进右边那颗值框，宽度只许有一把尺子。
 pub(crate) const SETTINGS_TEXT_PT: f32 = 14.0;
 pub(crate) const SETTINGS_HELP_PT: f32 = 13.0;
 /// 次要信息那一档（`caption` / `caption_right` / `caption_center`）的字号。
@@ -12078,6 +12095,33 @@ mod settings_type_tests {
 mod hotkey_tests {
     use super::*;
 
+    /// 接线腿：换视图那一支必须把热键录入态一起清掉。
+    ///
+    /// 钉的是"与那一串状态清理同批"，不是"文件里出现过这句"——`capturing` 在 Esc、
+    /// 那颗 ✕、`start_edit_setting` 里也清，光数出现次数盯不到换页这一支。
+    /// 症状：录入提示画在设置页那一格里，换到别的页之后提示看不见、按键照旧被吞
+    /// （连 Esc 都不再收窗），用户只觉得"这个键怎么没反应了"。
+    #[test]
+    fn switching_view_clears_the_hotkey_capture_latch() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let needle = "self.view=i;self.scroll=0;self.sel=None;self.hover=None;\
+             self.heat_hover=None;self.chart_hover=None;self.pv_select=None;\
+             self.pv_modal=None;self.capturing=None;"
+            .replace(" ", "");
+        assert_eq!(
+            flat.matches(needle.as_str()).count(),
+            1,
+            "换视图那一支不再顺手清录入态（或被改写成两份）"
+        );
+    }
+
     /// 「他点过叉」与「这台机器没配过这一条」必须是两件事。
     /// 混起来的症状很难看：全新安装里 `[hotkey]` 一行都没写，若按"值是空＝不注册"读，
     /// 三条热键一条都不会挂上，而屏上连"未启用"都显示不出来（他没做过任何操作）。
@@ -12575,6 +12619,46 @@ mod plugin_sel_tests {
                 )
             })
             .collect()
+    }
+
+    /// `POp::Table` 上那句"与 `rows` 平行的记录 id"是契约，而点击命中按 `ids.len()` 排行
+    /// 矩形 ⇒ 视图只画前 `PV_TABLE_MAX_ROWS` 行、ids 却整份交回时，**画不出来的行仍有点击区**：
+    /// 表格下面那片空白、以及排在它后面的那颗按钮，会被读成"选了第 N 行"——写回一个用户
+    /// 从没看见的 id（`onselect` 还会让插件按它刷新），同时把那次点击吞掉，按钮不再响应。
+    #[test]
+    fn a_table_with_more_rows_than_drawn_has_no_invisible_hit_rows() {
+        let view = focusflow_core::plugins::PluginView {
+            title: "夹具".to_string(),
+            widgets: vec![focusflow_core::plugins::Widget::Table {
+                headers: vec!["名".to_string()],
+                rows: (0..9).map(|i| vec![format!("行{i}")]).collect(),
+                ids: (0..9).map(|i| format!("id{i}")).collect(),
+                actions: vec![],
+                group: "g".to_string(),
+                onselect: "picked".to_string(),
+            }],
+        };
+        let ops = plugin_view_ops(&view, rect(0.0, 0.0, 600.0, 400.0), 0.0, &HashMap::new());
+        let Some(POp::Table {
+            rect: r, rows, ids, ..
+        }) = ops.first()
+        else {
+            panic!("夹具那张表没走到 POp::Table，实得 {} 项", ops.len());
+        };
+        assert_eq!(
+            ids.len(),
+            rows.len(),
+            "ids 与画出来的行分家：多出来那些行没有像素，却有点击区"
+        );
+        for i in 0..ids.len() {
+            let row = pv_table_row_rect(r, i);
+            assert!(
+                row.bottom <= r.bottom + 0.001,
+                "第 {i} 行的命中矩形掉到表格外面：{} > {}",
+                row.bottom,
+                r.bottom
+            );
+        }
     }
 
     /// 不分组 = 多选（点第二行留两行、再点第一行取消一行），分组 = 单选（只留最后点的）。
