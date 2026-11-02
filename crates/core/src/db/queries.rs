@@ -4297,6 +4297,8 @@ mod tests {
             let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
         }
         connection::clear_ro_cache();
+        // 刷坏页之前必须让边车先走：见 [`strip_db_sidecars`]。
+        strip_db_sidecars(&tail_path);
         let mut bytes = std::fs::read(&tail_path).unwrap();
         assert!(
             bytes.len() > 4096 * 40,
@@ -4378,6 +4380,27 @@ mod tests {
     /// `the_device_detail_readers_ask_the_three_state_rulers` 一起守。留在**这条**判据之外的
     /// 只剩 `get_hourly_stats`：它是 `hourly_stats_totals` 的薄包装，自己不再有取行可折，
     /// 归另一条"三个二元组口子必须是薄包装"的判据管。
+    /// 把一份年度库的 WAL 边车（`-wal` / `-shm`）清干净。
+    ///
+    /// 为什么这几条"刷坏页"的夹具都要它：生产场景是**拷来的一份 `.db`**，本来就没有边车；
+    /// 而夹具是先用真连接写完再刷字节的，那份 `-wal` 还躺在旁边。留着它，"库头合法、读到
+    /// 一半坏页"与"整份不是数据库"这两臂到底走哪一条，就由开库时 WAL 回不回得来决定 ——
+    /// 同一份字节上偶发换臂。现量：整道门禁第一跑红的正是这条用例换到了后者
+    /// （`… focusflow_2027.db 打不开: file is not a database`），而单跑与整包重跑都不复现。
+    /// 只在"问出来确实是本来就没有"时放过，别的结局直接红 —— 这条腿不许替夹具圆场。
+    fn strip_db_sidecars(path: &std::path::Path) {
+        for suffix in ["-wal", "-shm"] {
+            let p = format!("{}{}", path.display(), suffix);
+            match std::fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) => assert!(
+                    crate::data_location::is_confirmed_absent(&e),
+                    "边车问不出在不在（不是「本来就没有」）: {p} {e}"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn the_rank_readings_do_not_fold_a_broken_page_into_a_short_list() {
         let src = include_str!("queries.rs");
@@ -4587,6 +4610,8 @@ mod tests {
         // **库头合法、明细那几页坏**：取行撞上就是 `Err`，不许折成"这台设备的明细就这些"
         let tail = this + 2;
         let tail_path = paths::year_db_path(tail);
+        // 边车先清一遍（第二遍在刷坏页之前）：见 [`strip_db_sidecars`]。
+        strip_db_sidecars(&tail_path);
         if let Err(e) = std::fs::remove_file(&tail_path) {
             assert!(
                 crate::data_location::is_confirmed_absent(&e),
@@ -4627,6 +4652,8 @@ mod tests {
             let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
         }
         connection::clear_ro_cache();
+        // 刷坏页之前必须让边车先走：见 [`strip_db_sidecars`]。
+        strip_db_sidecars(&tail_path);
         let mut bytes = std::fs::read(&tail_path).unwrap();
         assert!(
             bytes.len() > 4096 * 40,
@@ -4780,6 +4807,8 @@ mod tests {
             let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
         }
         connection::clear_ro_cache();
+        // 刷坏页之前必须让边车先走：见 [`strip_db_sidecars`]。
+        strip_db_sidecars(&tail_path);
         let mut bytes = std::fs::read(&tail_path).unwrap();
         assert!(
             bytes.len() > 4096 * 40,
