@@ -2415,6 +2415,17 @@ impl App {
                     1 => vacuum_line(&vacuum_all()),
                     3..=5 => {
                         let Some(s) = snap_data else {
+                            // 快照那份锁读不动（只有别的线程正持着它 panic 过才会这样）。
+                            // 这一支从前是一条光秃秃的 `return`：既没往 `ops` 里留一句回执，
+                            // 也没投 `WM_OP_DONE`，而界面的 `busy` 只有那条消息会清 ⇒ 三颗
+                            // 「执行」从此永远灰着，非重启不活。旁边的早退分支都做两件事，照做。
+                            let target = HWND(hwnd_val as *mut core::ffi::c_void);
+                            if let Ok(mut q) = ops.lock() {
+                                q.push("导出没开始：这一轮的快照读不动".to_string());
+                            }
+                            let _ = unsafe {
+                                PostMessageW(Some(target), WM_OP_DONE, WPARAM(0), LPARAM(0))
+                            };
                             return;
                         };
                         let (ext, filter) = match which {
@@ -2641,12 +2652,17 @@ impl App {
     /// "真正注册上的组合"，所以屏上说的与按键实际会发生的是同一件事。
     fn toggle_hotkey(&mut self, hwnd: HWND) {
         self.hotkeys_on = !self.hotkeys_on;
-        let msg = self.reload_hotkeys();
-        let _ = focusflow_core::config::instance().set(
-            "hotkey",
-            "enabled",
-            if self.hotkeys_on { "true" } else { "false" },
-        );
+        let mut msg = self.reload_hotkeys();
+        msg.push_str(&config_write_note(
+            "全局热键总开关",
+            focusflow_core::config::instance()
+                .set(
+                    "hotkey",
+                    "enabled",
+                    if self.hotkeys_on { "true" } else { "false" },
+                )
+                .map_err(|e| e.to_string()),
+        ));
         tracing_note(&msg);
         self.status = Some(msg);
         unsafe {
@@ -2744,21 +2760,33 @@ impl App {
             collect::is_started(),
         ) {
             collect::CollectorAction::Stop => {
-                let _ = cfg.set("collector", "enabled", "false");
+                let note = config_write_note(
+                    "采集开关",
+                    cfg.set("collector", "enabled", "false")
+                        .map_err(|e| e.to_string()),
+                );
                 collect::stop_listening();
-                "采集已停用：键鼠与设备计数已停，重启后彻底退出".to_string()
+                format!("采集已停用：键鼠与设备计数已停，重启后彻底退出{note}")
             }
             collect::CollectorAction::StartFresh => match collect::start(cfg) {
                 Ok(()) => {
-                    let _ = cfg.set("collector", "enabled", "true");
-                    ON_MSG.to_string()
+                    let note = config_write_note(
+                        "采集开关",
+                        cfg.set("collector", "enabled", "true")
+                            .map_err(|e| e.to_string()),
+                    );
+                    format!("{ON_MSG}{note}")
                 }
                 Err(e) => format!("采集没起来：{e}"),
             },
             collect::CollectorAction::Resume => match collect::resume_listening() {
                 Ok(()) => {
-                    let _ = cfg.set("collector", "enabled", "true");
-                    ON_MSG.to_string()
+                    let note = config_write_note(
+                        "采集开关",
+                        cfg.set("collector", "enabled", "true")
+                            .map_err(|e| e.to_string()),
+                    );
+                    format!("{ON_MSG}{note}")
                 }
                 Err(e) => format!("采集没起来：{e}"),
             },
@@ -9215,6 +9243,20 @@ fn capture_refusal(vk: u32) -> Option<&'static str> {
 
 /// 读 `[hotkey] <key>` 并注册它。成功返回组合，失败返回原因（这一条不占用全局键）。
 /// 日志里带 `key = 原串` 这段 ASCII，验收脚本据此核对"配置写的"和"注册的"是不是同一个。
+/// 配置写不进持久化队列时要补的那半句（空串 = 写进去了，什么都别说）。
+///
+/// `config::set` 只是把改动投给去抖线程，真正的写盘在另一头：那条线程死了（spawn 失败／
+/// 通道断）交回来的 `Err` 意思是"本次会话之后所有改动都不会落盘"。屏上那一格读的是运行时
+/// 状态，看着一切正常，下一次开机才露出来 —— 折进 `let _ =` 就等于替代码许一句没人兑现的诺。
+fn config_write_note(what: &str, r: std::result::Result<(), String>) -> String {
+    match r {
+        Ok(()) => String::new(),
+        Err(e) => format!(
+            "（{what}没写进 config.ini：{e}。这一次改动只到本次运行，重启会回到文件里那一档）"
+        ),
+    }
+}
+
 fn register_combo(manager: Option<&GlobalHotKeyManager>, key: &str) -> Combo {
     let manager = match manager {
         Some(m) => m,
@@ -12097,6 +12139,49 @@ mod settings_type_tests {
 mod hotkey_tests {
     use super::*;
 
+    /// 配置写不进持久化队列那句"这次没落盘"必须带到状态行上。
+    ///
+    /// 两半各钉一条：①纯函数那一半钉**空串那一支也要**（写进去了就多一个字都不许说），
+    /// 只钉"出现过 `没写进` 三个字"的判据盯不到把 `Ok` 也念成出错的改法；
+    /// ②接线那一半钉落点：`config::set` 的结局不许再折进 `let _ =` —— 这一族的病状是
+    /// 屏上那一格读运行时、`config.ini` 读的是老一档，两边分家要到下一次开机才露出来。
+    #[test]
+    fn a_config_write_that_failed_is_said_out_loud() {
+        assert_eq!(config_write_note("全局热键总开关", Ok(())), "");
+        let said = config_write_note("全局热键总开关", Err("保存线程没了".to_string()));
+        assert!(
+            said.contains("全局热键总开关") && said.contains("保存线程没了"),
+            "要说清是哪一样、为什么没落盘，实得: {said}"
+        );
+        assert!(
+            said.contains("重启"),
+            "还要说清这一句只到本次运行，否则用户以为改完了：{said}"
+        );
+
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for forbidden in ["let_=cfg.set(", "let_=focusflow_core::config::instance()"] {
+            assert_eq!(
+                flat.matches(forbidden).count(),
+                0,
+                "又一处把写盘结局折掉了：{forbidden}"
+            );
+        }
+        // 定义那一行也算一次命中：总开关一颗 + 采集三条 + 定义 = 五处。
+        assert_eq!(
+            flat.matches("config_write_note(").count(),
+            5,
+            "落点数目变了，实得 {}",
+            flat.matches("config_write_note(").count()
+        );
+    }
+
     /// 接线腿：换视图那一支必须把热键录入态一起清掉。
     ///
     /// 钉的是"与那一串状态清理同批"，不是"文件里出现过这句"——`capturing` 在 Esc、
@@ -14049,6 +14134,27 @@ mod exit_flush_tests {
 #[cfg(test)]
 mod export_ruler_tests {
     use super::*;
+
+    /// 接线腿：导出这一支的早退必须与旁边的早退分支做同样两件事。
+    ///
+    /// 快照那份锁读不动时（只有别的线程正持着它 panic 过才会这样）这一支从前是一条光秃秃的
+    /// `return`：既不往 `ops` 里留一句回执，也不投 `WM_OP_DONE`，而界面的 `busy` 只有那条
+    /// 消息会清 ⇒ 三颗「执行」从此永远灰着，非重启不活。判据比的是**这一支里两件事都在**
+    /// 的形状（`ops.lock()` 与 `WM_OP_DONE` 都要在这个 else 块里出现），不是数函数名。
+    #[test]
+    fn the_export_arm_that_gives_up_still_reports_done() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let at = src
+            .find("let Some(s) = snap_data else")
+            .expect("导出那一支的快照早退不见了");
+        let block: String = src[at..].chars().take(900).collect();
+        let end = block.find("};").expect("这一支的 else 块没收尾");
+        let body = &block[..end];
+        assert!(
+            body.contains("ops.lock()") && body.contains("WM_OP_DONE"),
+            "这一支早退时既不留回执也不投 done，`busy` 会闩到重启：{body}"
+        );
+    }
 
     /// 键名/应用名/设备名各挑一个会咬人的形状。
     fn evil_snap() -> data::Snapshot {
