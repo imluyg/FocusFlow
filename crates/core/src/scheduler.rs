@@ -881,6 +881,17 @@ pub fn toggle_task(id: i64, enabled: bool) -> anyhow::Result<bool> {
     .map_err(|e| anyhow::anyhow!("更新任务 #{id} 的启用状态失败: {e}"))
 }
 
+/// 读任务时要点名的列，**顺序就是 [`get_all_tasks`] 里 `r.get(0..9)` 的顺序**。
+///
+/// 原先这里写 `SELECT *` 再按下标取 ⇒ 列序由建表时决定，而那份库可能是 Python 时代
+/// 整份复制进来的（见 `migration.rs` 的 `AUX_DBS`，建表是 `CREATE TABLE IF NOT EXISTS`，
+/// 老表原样留着）。同族的 `accounting::EXPENSE_COLS` 与 `pomodoro::SESSION_COLS` 已经
+/// 因为同一个理由点过名，症状与修法一字不差：列序一错位，类型对不上的整行被丢掉
+/// （任务凭空消失），类型碰巧能读的则把时间读成路径（永久拒绝启动）。
+/// 写侧本来就点名这九列，所以点名不引入新的失败形态。
+const TASK_COLS: &str = "id, name, target_path, args, schedule_type, schedule_time, \
+                         enabled, last_run, created_at";
+
 /// 获取所有任务。
 ///
 /// 读不出来时**必须留日志**：返回空列表与"他一条任务都没建过"在界面上长得一样，
@@ -893,7 +904,9 @@ pub fn get_all_tasks() -> Vec<ScheduledTask> {
             return Vec::new();
         }
     };
-    let mut stmt = match conn.prepare("SELECT * FROM scheduled_tasks ORDER BY id") {
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT {TASK_COLS} FROM scheduled_tasks ORDER BY id"
+    )) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("定时任务读不出来（查询准备失败），本次按空列表处理: {e}");
@@ -1685,6 +1698,92 @@ mod tests {
         // 任何"成功入库"的写法都会撞上 no such table。
         let _ = init_db();
         Isolated { dir, _lock: lock }
+    }
+
+    /// 老库的列序不许参与读取。
+    ///
+    /// 为什么不是假想敌：`migration.rs` 的 `AUX_DBS` 把 Python 时代的
+    /// `focusflow_scheduler.db` **整份文件复制**进 data/，而这里的建表是
+    /// `CREATE TABLE IF NOT EXISTS` ⇒ 那张表的列序由当年建表决定，本仓无从保证。
+    /// 按下标取列在这种库上不是"读错一点"：`name` 那一格落到 INTEGER 列 ⇒ 每行解码
+    /// 失败被丢掉 ⇒ 任务从列表上安静消失；类型碰巧能读的（`target_path` 吃进一个时间串）
+    /// 更狠 —— `approved_launch_target` 判成**永久**拒绝，这条任务再也不试第二次。
+    /// 同族的两处（`accounting.rs` 的 `EXPENSE_COLS`、`pomodoro.rs` 的 `SESSION_COLS`）
+    /// 已经按同一把尺子改成点名列，这是最后一处 `SELECT *`。
+    #[test]
+    fn a_legacy_column_order_does_not_shift_which_field_is_which() {
+        let _g = isolate_app_dir("legacy_col_order");
+        {
+            // 夹具只负责把"老库长什么样"摆出来：同一批列名、另一种列序。
+            // "按名字读"是产品的事，摘掉点名列清单这条判据就必须红。
+            let conn = Connection::open(db_path()).expect("打开调度库");
+            conn.execute_batch(
+                "DROP TABLE scheduled_tasks;
+                 CREATE TABLE scheduled_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    schedule_time TEXT NOT NULL,
+                    target_path TEXT NOT NULL,
+                    schedule_type TEXT NOT NULL DEFAULT 'daily',
+                    last_run TEXT,
+                    args TEXT
+                 );
+                 INSERT INTO scheduled_tasks
+                    (id, enabled, created_at, name, schedule_time, target_path, schedule_type, last_run, args)
+                    VALUES (7, 1, '2026-01-01 00:00:00', '早间记事本', '08:30',
+                            'C:\\Windows\\notepad.exe', 'daily', NULL, '-n');",
+            )
+            .expect("写入老列序的夹具库");
+        }
+        let tasks = get_all_tasks();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "老列序的库里这一行没被读出来（按下标取列 ⇒ 整行解码失败被丢掉）"
+        );
+        let t = &tasks[0];
+        assert_eq!(t.id, 7);
+        assert_eq!(
+            t.name, "早间记事本",
+            "id 之后那一列是 enabled，按位置读会把数字读成名字"
+        );
+        assert_eq!(t.target_path, r"C:\Windows\notepad.exe");
+        assert_eq!(t.args, "-n");
+        assert_eq!(t.schedule_type, "daily");
+        assert_eq!(t.schedule_time, "08:30");
+        assert!(t.enabled);
+        assert_eq!(t.last_run, None);
+        assert_eq!(t.created_at, "2026-01-01 00:00:00");
+    }
+
+    /// 接线守卫：那条读路必须走点名列清单。
+    ///
+    /// 上面那条用例钉的是"读出来的值对不对"，它盯不到有人把 SQL 改回 `SELECT *` ——
+    /// 只要本机这张表恰好是本仓建的那份（列序对得上），用例照样绿，而用户那份复制
+    /// 进来的老库又开始错位。所以按 `pomodoro.rs` 同一把尺子再钉一条字面判据。
+    #[test]
+    fn the_task_read_names_its_columns() {
+        let src = include_str!("scheduler.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod: String = src[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            prod.matches("SELECT*FROMscheduled_tasks").count(),
+            0,
+            "又有查询用 SELECT * 猜列的位置（老库列序由建表决定）"
+        );
+        assert_eq!(
+            prod.matches("SELECT{TASK_COLS}FROMscheduled_tasksORDERBYid")
+                .count(),
+            1,
+            "这一条读路不见了、或被改写成两份（列清单与下标顺序必须一对一）"
+        );
     }
 
     /// 回归：插件可通过 `scheduler_add` 启动任意程序，绕过 io/os 沙箱。
