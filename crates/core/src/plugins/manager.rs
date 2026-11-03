@@ -26,6 +26,8 @@ use crate::config::FocusFlowConfig;
 use crate::db;
 use crate::paths;
 use crate::plugins::host;
+use crate::plugins::permissions;
+use crate::plugins::plugin_timers;
 use crate::plugins::PluginView;
 
 /// 按键增量的取件口：写线程（或任何不能碰 Lua 的线程）只管往里并，GUI 线程一拍取一次。
@@ -72,10 +74,15 @@ pub struct PluginInfo {
     pub error: Option<String>,
     /// 这一条出自哪一处目录 = 它的身份，决定它看见哪一组宿主 API（3.4）。
     ///
-    /// 也是热重载的必需项：重载走的是「按已加载的那份文件重读一遍」，手上只有展示名/文件名，
+    /// 也是热重载的必需项：重载走的是"按已加载的那份文件重读一遍"，手上只有展示名/文件名，
     /// 若不在这里留住来源，重载一次就把内置专属 API 还给用户插件 —— 屏上什么都正常，
     /// 而边界只在下一次重载之前有效。
     pub source: PluginSource,
+    /// 授权这一头的结论（插件页念这一句，方案 3.7「未授权不是拒绝加载，而是照常加载」）
+    pub authorization: permissions::Authorization,
+    /// 运行时那道闸（免授权的那一档也有一份，只是恒放行）：
+    /// 用户点「授权」要能**当场翻开**这一份，而不是要求重新加载一次插件。
+    pub gate: Arc<permissions::Gate>,
     /// 插件 Lua 环境（仅 GUI 线程访问）
     pub lua: Option<Lua>,
     /// 插件声明的视图（get_view() 结果缓存）
@@ -294,6 +301,12 @@ pub struct DiscoveredPlugin {
     /// 今天的读者有两个：启动那一行日志（`load_all`）与插件页的两栏分组；
     /// [`Self::lifecycle`] 也按它决定内置要不要强制常驻。
     pub source: PluginSource,
+    /// 授权这一头的结论（页面念这一句，并按它决定给不给「授权」那颗按钮）。
+    ///
+    /// 已加载的那一条取加载时算好的那一份，未加载的按同一份规则现读一次文件算 ——
+    /// 两处必须同一句话，否则同一份文件在页面上会有两张脸（本仓为 `PLUGIN_NAME`
+    /// 那件事钉过同一条判据）。
+    pub authorization: permissions::Authorization,
 }
 
 impl DiscoveredPlugin {
@@ -766,6 +779,9 @@ impl PluginManager {
             if host::shutdown_pomodoro_if_owned_by(&owner) {
                 tracing::warn!("番茄钟随插件 {name} 一起回收（进行中那一段已落库）");
             }
+            // 出错停用同样要销定时器：那条 Lua 已经不在了，而排程表是进程级的 ——
+            // 不销就是每一拍还在为一个跑不了的回调排队（方案 3.6「卸载/出错 ⇒ 自动全部取消」）。
+            plugin_timers::forget(&owner);
         }
         tracing::error!("插件已停用: {name}: {msg}");
     }
@@ -933,6 +949,7 @@ impl PluginManager {
                         enabled,
                         loaded: info.loaded,
                         source,
+                        authorization: info.authorization.clone(),
                         error: if reasons.is_empty() {
                             None
                         } else {
@@ -941,15 +958,22 @@ impl PluginManager {
                     };
                 }
                 match Self::scan_meta(&path) {
-                    Ok(manifest) => DiscoveredPlugin {
-                        manifest,
-                        file: stem.clone(),
-                        enabled,
-                        loaded: false,
-                        source,
-                        // 没加载、但加载失败过：原因得显示出来，不能只剩"未加载"
-                        error: self.load_errors.get(&stem).cloned(),
-                    },
+                    Ok(manifest) => {
+                        // 未加载的那一条也要念得出这一句，且与加载那一条同一个规则：
+                        // 插件页上「需要授权」与「已授权」的区别就是用户点不点那一颗按钮，
+                        // 两处算得不一样会先看到一句假话、再看到一次被拒。
+                        let authorization = Self::authorization_at(source, &manifest, &path);
+                        DiscoveredPlugin {
+                            manifest,
+                            file: stem.clone(),
+                            enabled,
+                            loaded: false,
+                            source,
+                            authorization,
+                            // 没加载、但加载失败过：原因得显示出来，不能只剩"未加载"
+                            error: self.load_errors.get(&stem).cloned(),
+                        }
+                    }
                     Err(e) => DiscoveredPlugin {
                         // 读不出来时名字仍回退成文件名，但那几个字段一律留空、不当"1.0"报出去：
                         // 插件页这一行说的是"这份文件我没能读全"，不是"它自述版本是 1.0"。
@@ -964,6 +988,13 @@ impl PluginManager {
                         enabled,
                         loaded: false,
                         source,
+                        // 清单问不出，授权就也问不出：这一格不许折成"没授权过"，
+                        // 否则用户会去点一颗本来就不该出现的「授权」按钮。
+                        authorization: if source == PluginSource::User {
+                            permissions::Authorization::Undetermined(format!("清单读不出来（{e}）"))
+                        } else {
+                            permissions::Authorization::Exempt
+                        },
                         error: Some(e),
                     },
                 }
@@ -1189,6 +1220,128 @@ impl PluginManager {
         })
     }
 
+    /// 这一次加载在授权这一头的结论，以及要不要走那道闸。
+    ///
+    /// 三档免拦，其余一律拦：
+    /// · 内置与 `[plugins] legacy_layout` 那一档 —— 位置就是身份，内置模块免授权（3.7）；
+    /// · `PLUGIN_API <= 1` 的老脚本 —— 方案 5 那张迁移表定的是"行为不变，不弹授权"，
+    ///   而今天满盘的脚本都没写这一项，一上线就拦等于把所有存量插件一次停掉；
+    /// · 声明为空也不是"放行"：它的意思是"这份插件不该用任何要权限的能力"，
+    ///   所以照样拦，只是页面上没有东西可授（[`permissions::Authorization::NothingToGrant`]）。
+    ///
+    /// `granted` 只从"哈希对得上"那两档来（`Granted` 与 `ContentChanged`）：
+    /// 权限集合没变、只改过代码 ⇒ 授权保留（3.3 那条取舍），而这一份**不要求重新加载**。
+    fn authorization_for(
+        source: PluginSource,
+        api: u32,
+        declared: &[String],
+        stem: &str,
+        bytes: &[u8],
+    ) -> (permissions::Authorization, permissions::GateMode) {
+        use permissions::Authorization as A;
+        if source != PluginSource::User {
+            return (A::Exempt, permissions::GateMode::Free);
+        }
+        if api <= 1 {
+            return (A::LegacyApi, permissions::GateMode::Free);
+        }
+        let ph = permissions::permission_hash(declared);
+        let ch = permissions::content_hash(bytes);
+        let read = permissions::read_grants(stem);
+        let authorization = permissions::authorize(None, declared, &ph, &ch, &read);
+        let granted = matches!(authorization, A::Granted | A::ContentChanged);
+        (authorization, permissions::GateMode::Enforce { granted })
+    }
+
+    /// 用户当场点「同意」：落一份 `grants.json`，并把这一份插件的闸翻开。
+    ///
+    /// 为什么要求插件已加载：授权绑的是**这份文件此刻**的权限集合与内容哈希，
+    /// 从盘上另扫一遍拿到的可能是改了半截的另一版（作者正在编辑），那样落下去的记录
+    /// 与插件实际跑的字节不是同一份，而"已授权"这句话就成了对着一份不存在的代码说的。
+    ///
+    /// 交回的是页面上那一句话（授权之后插件页要当场改口，而不是等下一次重扫）。
+    pub fn grant_plugin(&mut self, stem: &str) -> Result<String, String> {
+        let found = self
+            .plugins
+            .values()
+            .find(|p| Self::stem_of(&p.file_path) == stem)
+            .map(|p| {
+                (
+                    p.manifest.permissions.clone(),
+                    p.file_path.clone(),
+                    Arc::clone(&p.gate),
+                )
+            });
+        let Some((declared, path, gate)) = found else {
+            return Err(format!(
+                "「{stem}」现在没加载，先启用它再授权（授权要绑这一份文件的字节）"
+            ));
+        };
+        let bytes = std::fs::read(&path).map_err(|e| {
+            format!("读不出 {stem} 这一份文件（{e}）：授权绑的是它的字节，读不出就不落盘")
+        })?;
+        if declared.is_empty() {
+            return Err(format!(
+                "「{stem}」没在 PLUGIN_PERMISSIONS 里声明任何权限：没有要授权的东西"
+            ));
+        }
+        let record = permissions::Grants {
+            permission_hash: permissions::permission_hash(&declared),
+            content_hash: permissions::content_hash(&bytes),
+            granted: declared.clone(),
+        };
+        permissions::write_grants(stem, &record)
+            .map_err(|e| format!("「{stem}」的授权没落盘（{e}）：屏上不说已授权"))?;
+        gate.set_granted(true);
+        Ok("已授权".to_string())
+    }
+
+    /// 撤销授权：删记录 + 把闸合上。与「停用插件」是两件事（停用不碰授权与数据）。
+    pub fn revoke_plugin(&mut self, stem: &str) -> Result<String, String> {
+        permissions::revoke_grants(stem)
+            .map_err(|e| format!("「{stem}」的授权没撤销（{e}）：屏上不说已撤销"))?;
+        if let Some(p) = self
+            .plugins
+            .values()
+            .find(|p| Self::stem_of(&p.file_path) == stem)
+        {
+            p.gate.set_granted(false);
+        }
+        Ok(permissions::Authorization::NotGranted.note())
+    }
+
+    /// 没加载的那一条也念同一句话：规则共用 [`Self::authorization_for`]，差别只是这里现读一次文件。
+    ///
+    /// 为什么值得为未加载的那条也算：停用的插件页面上要写清它要哪些权限、授没授过，
+    /// 用户重新启用时才知道自己点的是什么；两处各算一遍就会分家（本仓为 `PLUGIN_NAME`
+    /// 那件事钉过同一条判据）。
+    fn authorization_at(
+        source: PluginSource,
+        manifest: &PluginManifest,
+        path: &Path,
+    ) -> permissions::Authorization {
+        use permissions::Authorization as A;
+        if source != PluginSource::User {
+            return A::Exempt;
+        }
+        if manifest.api <= 1 {
+            return A::LegacyApi;
+        }
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                Self::authorization_for(
+                    source,
+                    manifest.api,
+                    &manifest.permissions,
+                    &Self::stem_of(path),
+                    &bytes,
+                )
+                .0
+            }
+            Err(e) => A::Undetermined(format!("这一份文件读不出来（{e}）")),
+        }
+    }
+
     /// 加载单个插件文件。
     ///
     /// `source` 是这一条**出自哪一处目录**，由 [`Self::discover`] 给出、由 [`Self::load_all`]
@@ -1220,6 +1373,9 @@ impl PluginManager {
             ));
         }
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        // 先读文件字节：`content_hash` 吃的就是这一份（方案 3.3 那两个哈希的范围写死了
+        // "文件原始字节"，不做换行归一），而下面执行 Lua 用的也是它。
+        let script = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
 
         let lua = Self::create_sandboxed_lua().map_err(|e| e.to_string())?;
         self.apply_lua_limits(&lua);
@@ -1239,7 +1395,53 @@ impl PluginManager {
                 hidden.len()
             );
         }
-        let script = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        // 通用那一组再叠一道权限闸（方案 3.7）：未声明/未授权的调用抛 `DENIED:` 那句话，
+        // 而**照常加载** —— 拒绝加载的结局是插件页只剩一行错误，用户不知道它要什么权限。
+        // 定时与事件先装（`every` / `on` 那几个名字要在收口之后、权限闸之前进表，
+        // 闸才会把它们一起包进去）。
+        // 每次（重）加载都从**空表**开始：回调函数住在上一份 Lua 里，那份已经跟着旧条目没了，
+        // 留着旧句柄就是让排程去查一个再也不存在的回调。
+        // 与调度线程那一份 owner 记账不同 —— 那条刻意不在重载时销（见 `reload_plugin`），
+        // 因为线程还在为别的插件跑；这里销的是"这个实例自己的待办清单"，重载语义就是换一份。
+        // 顺序不能反：先销旧格、再装入口，装的那一步取到的是这一份新表。
+        plugin_timers::forget(&stem);
+        host::install_timer_api(&lua, &api, &stem).map_err(|e| format!("定时器入口装不上: {e}"))?;
+        let declared = meta.manifest.permissions.clone();
+        let unknown = permissions::unknown_permissions(&declared);
+        if !unknown.is_empty() {
+            // 认不得的声明不许"当成没声明"就过去：作者写了 `PLUGIN_PERMISSIONS = {"stor.write"}`
+            // 少一个 s，症状是每次调用都被拒而屏上只说"没声明"，看不出是拼错。
+            tracing::warn!(
+                "插件 {stem} 声明了认不得的权限（{}）：这些项按不生效处理，能用的权限只有 {}",
+                unknown.join("、"),
+                permissions::KNOWN_PERMISSIONS.join("、")
+            );
+        }
+        let (authorization, mode) = Self::authorization_for(
+            source,
+            meta.manifest.api,
+            &declared,
+            &stem,
+            script.as_bytes(),
+        );
+        let gate = Arc::new(permissions::Gate::new(mode, &declared));
+        if let permissions::GateMode::Enforce { .. } = gate.mode() {
+            let wrapped = host::install_permission_guard(
+                &lua,
+                &api,
+                Arc::clone(&gate),
+                &permissions::guarded_api_names(),
+                &permissions::store_verb_names(),
+            )
+            .map_err(|e| format!("权限闸装不上: {e}"))?;
+            if wrapped.is_empty() {
+                // 一格都没装上 = 闸是空的，而页面上会写着"已授权"这种让人信的话
+                tracing::error!(
+                    "插件 {stem} 的权限闸没装上任何一格（声明 {declared:?}）：\
+                     这一份插件本次按无闸运行，请报告"
+                );
+            }
+        }
         lua.load(&script)
             .set_name(&meta.manifest.name)
             .exec()
@@ -1293,6 +1495,8 @@ impl PluginManager {
             loaded: true,
             error: None,
             source,
+            authorization,
+            gate,
             lua: Some(lua),
             view,
         };
@@ -1357,6 +1561,81 @@ impl PluginManager {
         }
     }
 
+    /// 跑一遍到期的定时器与事件回调（GUI 那一拍调用，方案 3.6 的实现要点）。
+    ///
+    /// 与按键攒批同一个模型：排程表是进程级的（后台线程也能投请求），但进 Lua 的这一跳
+    /// 必须留在调用它的那一根线程上 —— `Lua` 不是 `Send`。回调函数从插件自己那一格
+    /// `_ff_timers[句柄]` 取，所以插件被卸载或被停用之后这里必然取不到东西（那张表跟着
+    /// VM 一起没了），而排程那一格也在 `unload_plugin` / `mark_plugin_error` 里销掉了。
+    ///
+    /// 交回「插件名 → 这一拍跑了几格」是一份**可观察量**：只说"函数跑过了"盯不住
+    /// 验收 4 那句「停用后回调次数不再增长」—— 那条要有数得出来才能比。
+    pub fn pump_timers(&mut self) -> Vec<(String, usize)> {
+        let cfg = self.config;
+        let (minute_key, day_key) = plugin_timers::wall_buckets(&chrono::Local::now());
+        let now = std::time::Instant::now();
+        let mut ran: Vec<(String, usize)> = Vec::new();
+        // 先把名字取出来：跑回调会要 `&mut self`（超限那条会停用插件）
+        let loaded: Vec<(String, String)> = self
+            .plugins
+            .values()
+            .filter(|p| p.lua.is_some())
+            .map(|p| (p.manifest.name.clone(), Self::stem_of(&p.file_path)))
+            .collect();
+        for (name, stem) in loaded {
+            let board = plugin_timers::board_for(&stem);
+            let due = {
+                let mut guard = board.lock().unwrap_or_else(|e| e.into_inner());
+                guard.collect_due(now, minute_key, day_key)
+            };
+            if due.is_empty() {
+                continue;
+            }
+            let mut fired = 0usize;
+            for handle in due {
+                let outcome = {
+                    let Some(info) = self.plugins.get(&name) else {
+                        break;
+                    };
+                    let Some(lua) = info.lua.as_ref() else {
+                        break;
+                    };
+                    let cb: Option<mlua::Function> = lua
+                        .globals()
+                        .get::<mlua::Table>("_ff_timers")
+                        .ok()
+                        .and_then(|t| t.get(handle).ok());
+                    match cb {
+                        Some(f) => {
+                            Self::arm_instruction_budget(lua, cfg);
+                            plugin_timers::note_fire_thread(&stem);
+                            f.call::<()>(())
+                        }
+                        None => Err(mlua::Error::RuntimeError(format!(
+                            "句柄 {handle} 在 _ff_timers 里没有对应的函数"
+                        ))),
+                    }
+                };
+                match outcome {
+                    Ok(()) => fired += 1,
+                    Err(e) => {
+                        let msg = format!("定时器回调（句柄 {handle}）失败: {e}");
+                        tracing::error!("插件 {name} {msg}");
+                        if is_limit_error(&e) {
+                            // 死循环的那一类交给既有的熔断：停用、销表、插件页留原因
+                            self.mark_plugin_error(&name, msg);
+                            break;
+                        }
+                    }
+                }
+            }
+            if fired > 0 {
+                ran.push((name, fired));
+            }
+        }
+        ran
+    }
+
     /// 从插件 Lua 环境读取 get_view() 返回值（声明式 UI 表）。
     fn read_view(lua: &Lua) -> mlua::Result<PluginView> {
         let get_view: mlua::Function = lua.globals().get("get_view")?;
@@ -1418,6 +1697,12 @@ impl PluginManager {
             // 与 `mark_plugin_error` 补掉的是同一类，那条管超限停用，这条管正常停用。
             // 只摘自己那个 stem：`users` 是集合，插件自己已经归还过也不会有第二次效果。
             host::release_scheduler(&stem);
+            // 卸载 = 定时器全取消，**不依赖插件写 cleanup**（方案 3.6 那句）。
+            // 与上面那条归还同一个理由：那份 Lua 已经没了，插件侧再没有第二个取消入口。
+            let cancelled = plugin_timers::forget(&stem);
+            if cancelled > 0 {
+                tracing::info!("插件 {name} 卸载时取消了 {cancelled} 格定时器");
+            }
             tracing::info!("插件已卸载: {name}");
             true
         } else {

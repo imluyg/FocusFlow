@@ -725,6 +725,13 @@ struct PluginRow {
     /// `PLUGIN_MIN_APP`，以及这一份 `state.json` 的占用与最近一次写不进去的原因。
     api: u32,
     permissions: usize,
+    /// 声明的那几项权限的名字（要点授权的插件必须让用户**看得见要点什么**，
+    /// 只报"权限 2 项"等于让人闭着眼睛点同意）。
+    permission_names: Vec<String>,
+    /// 授权那一头的结论，core 算好的那一份（页面不许自己再判一次）。
+    grant_note: String,
+    /// 需不需要用户点一颗「授权」：只有「没授权过」与「权限变了」这两档给按钮。
+    needs_grant: bool,
     refresh_ms: u64,
     min_app: String,
     store_bytes: Option<usize>,
@@ -777,6 +784,16 @@ impl PluginRow {
             (format!("加载失败：{}", one_line(e, 72)), true)
         } else if let Some(w) = &self.store_error {
             (format!("存储写不进去：{}", one_line(w, 72)), true)
+        } else if self.needs_grant {
+            // 授权这一格排在"已启用尚未加载"之前：那是用户下一步能做的事，
+            // 而它必须带着**要点同意的到底是哪几项**（方案 3.7 那句"页面提示需要授权"，
+            // 只说「需要授权」等于让人闭着眼睛点）。
+            let names = if self.permission_names.is_empty() {
+                self.grant_note.clone()
+            } else {
+                format!("{}：{}", self.grant_note, self.permission_names.join("、"))
+            };
+            (format!("{}（{names}）", self.desc), true)
         } else if self.enabled && !self.loaded {
             (format!("{}（已启用，尚未加载）", self.desc), false)
         } else {
@@ -2283,8 +2300,17 @@ impl App {
                 if hit(row_rect, x, y) {
                     self.sel = Some(idx);
                     let vb = rect(row_rect.right - 76.0, y0 + 9.0, 60.0, 22.0);
+                    // 命中条件与画它的条件同一个（`needs_grant`）：只画一颗不点不动的按钮、
+                    // 或留一块看着能点其实点到"打开视图"的空格，都是这一页说假话的方式
+                    let grantable = self
+                        .plugin_rows
+                        .get(idx)
+                        .map(|r| r.needs_grant)
+                        .unwrap_or(false);
                     if hit(vb, x, y) {
                         self.toggle_plugin(hwnd, idx);
+                    } else if grantable && hit(plugin_grant_rect(row_rect.right, y0), x, y) {
+                        self.grant_plugin(hwnd, idx);
                     } else if let Some(name) = self.plugin_rows.get(idx).map(|r| r.name.clone()) {
                         // 点行本身 = 看这个插件的视图
                         self.open_plugin_view(hwnd, &name);
@@ -3050,6 +3076,9 @@ impl App {
                         let stem = p.file.clone();
                         let store_bytes = focusflow_core::plugins::plugin_store::used_bytes(&stem);
                         let store_error = focusflow_core::plugins::plugin_store::last_error(&stem);
+                        // 授权那一句读 core 算好的那份，页面不自己判"哈希对不对"
+                        let grant_note = p.authorization.note();
+                        let needs_grant = p.authorization.needs_action();
                         let focusflow_core::plugins::PluginManifest {
                             name,
                             desc,
@@ -3073,7 +3102,10 @@ impl App {
                             builtin,
                             resident,
                             api,
+                            permission_names: permissions.clone(),
                             permissions: permissions.len(),
+                            grant_note,
+                            needs_grant,
                             refresh_ms,
                             min_app,
                             // 存储那一格按**文件名**问（键从来进不了路径，见 plugin_store）
@@ -3098,6 +3130,26 @@ impl App {
     /// 这一跳必须留在 GUI 线程：`Lua` 不是 Send，插件的 VM 不能被别的线程碰。写线程那一侧
     /// 只把 `(键名, 这一批的增量)` 并进取件口，所以每 10 秒一批、每批每个键只进一次 VM ——
     /// 逐键进 VM 等于把"插件钩子死循环炸启动"那一族事故请回按键热路径。
+    /// 到期定时器与事件回调：在这一拍跑（方案 3.6「GUI 线程 tick 到期回调」）。
+    ///
+    /// 放在按键攒批旁边是刻意的：两条都是"后台只投请求、进 Lua 的那一跳在 GUI 线程"，
+    /// 同一拍里跑完，插件事件就不会与按键投递抢同一份 VM。
+    /// 这一句只在真的有到期时出声，空表不占日志（一拍一次，一秒十条）。
+    fn pump_plugin_timers(&mut self) {
+        let Some(pm) = self.pm.as_mut() else {
+            return;
+        };
+        let ran = pm.pump_timers();
+        if ran.is_empty() {
+            return;
+        }
+        let total: usize = ran.iter().map(|(_, n)| *n).sum();
+        tracing_note(&format!(
+            "定时器：{} 个插件跑了 {total} 格 timers_fired={total}",
+            ran.len()
+        ));
+    }
+
     fn pump_plugin_key_batches(&mut self) {
         let batches = focusflow_core::plugins::manager::take_key_batches();
         if batches.is_empty() {
@@ -3172,6 +3224,33 @@ impl App {
                 tracing_note(self.status.as_deref().unwrap_or(""));
             }
         }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    /// 插件授权：落一份 `grants.json`，并把这一份插件的闸**当场**翻开。
+    ///
+    /// 与「启用/停用」分家是有意的：那颗按钮改的是"这个插件参不参与"，这一颗改的是
+    /// "它能不能用它声明的那几项能力"，而停用不动授权与数据（方案 3.1 那句"停用了数据还在"）。
+    /// 落不下去必须说出来：屏上写着「已授权」而文件里没有，下一次启动又回到没授权那一档，
+    /// 与 `toggle_plugin` 那条"落不了盘就不许回 Ok"是同一族缺陷。
+    fn grant_plugin(&mut self, hwnd: HWND, idx: usize) {
+        let Some(row) = self.plugin_rows.get(idx).cloned() else {
+            return;
+        };
+        self.ensure_plugin_manager();
+        let res = match self.pm.as_mut() {
+            Some(pm) => pm.grant_plugin(&row.stem),
+            None => Err("没有插件管理器".to_string()),
+        };
+        self.status = Some(match res {
+            Ok(note) => format!("插件 {}：{note}", row.name),
+            Err(e) => format!("插件授权失败：{e}"),
+        });
+        tracing_note(self.status.as_deref().unwrap_or(""));
+        // 重扫一遍清单：这一行的「需要授权」那句要当场改掉，而不是等下一次进这一页
+        self.reload_plugins();
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
@@ -7767,6 +7846,15 @@ fn one_line(s: &str, max: usize) -> String {
     out
 }
 
+/// 「授权」那颗按钮的位置：画它的这一头与点它的（`on_click` 里的命中）那一头共用这一个表达式。
+///
+/// 两处各写一遍是本仓反复出现过的那类缺陷：画在 A、命中在 B ⇒ 屏上有一颗看得见的按钮
+/// 点下去没反应，而没有任何一条用例说得清它为什么不动。摆在启用开关**左边**，
+/// 同一行同一高度，用户视线不用跳。
+fn plugin_grant_rect(row_right: f32, y: f32) -> D2D_RECT_F {
+    rect(row_right - 76.0 - 66.0, y + 9.0, 58.0, 22.0)
+}
+
 fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>, vs: ViewState) {
     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
     p.card(card, R_CARD);
@@ -7911,6 +7999,13 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
                 &p.br.muted
             },
         );
+        // 「授权」那颗只在真需要点的那两档出现（没授权过 / 权限变了）：给内置模块或
+        // 已经授权过的插件画一颗点了没用的按钮，是这一页最容易让人怀疑"是不是坏了"的东西。
+        if row.needs_grant {
+            let gb = plugin_grant_rect(r.right, y);
+            p.round(gb, R_CONTROL, &p.br.danger, None);
+            p.text("授权", gb, &p.fmt.center_small, &p.br.white);
+        }
         // 第二行：坏消息说坏消息，否则说它是什么。
         // 分支收在 [`PluginRow::second_line`] 里（这一格与画它的矩形取同一个宽度表达式）——
         // `one_line` 那个 72 是"多少个字符"，不是"这一格装得下多少"：72 个汉字约 900 px，
@@ -11291,6 +11386,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             // 件口多数时候是空的 —— 一拍一次互斥体取空向量，不换回每键一次 VM 的代价。
             if let Some(app) = unsafe { app_ptr(hwnd) } {
                 app.pump_plugin_key_batches();
+                // 到期的定时器与事件也在这一拍跑：core 那侧的排程表是进程级的，
+                // 少了这一行就是"排得进去、永远没人跑"，而插件页什么都看不出来。
+                app.pump_plugin_timers();
                 // 热重载的通道也在这一拍取空：检测线程只发请求，进 Lua 的那一跳必须在 GUI 线程。
                 // 少了这两行，那条线程整晚在扫目录而没人处理它的话，屏上照旧是"改了要重启"。
                 let on_plugin_page = app.view == 4;
@@ -17002,11 +17100,98 @@ mod plugin_page_tests {
             resident: false,
             api: 1,
             permissions: 0,
+            permission_names: Vec::new(),
+            grant_note: "已授权".to_string(),
+            needs_grant: false,
             refresh_ms: 0,
             min_app: String::new(),
             store_bytes: None,
             store_error: None,
         }
+    }
+
+    /// 「需要授权」那句必须点名**要点同意的到底是哪几项**，而且排在"已启用尚未加载"之前。
+    ///
+    /// 三条臂：新增权限那一句要看得见新增了什么；更硬的消息（加载失败）仍然排最前；
+    /// 已授权的插件那一格不许冒出这句（否则每一行都写着要授权，用户就会一路点同意 ——
+    /// 方案 3.3 写的正是这个下场）。
+    #[test]
+    fn a_row_needing_a_grant_names_the_permissions_before_anything_less_actionable() {
+        let mut r = row("my_tool", false);
+        r.needs_grant = true;
+        r.grant_note = "权限变了，需要重新授权（新增了 storage.write）".to_string();
+        r.permission_names = vec!["stats.read".to_string(), "storage.write".to_string()];
+        let (line, bad) = r.second_line();
+        assert!(bad, "需要授权是坏消息，得画 danger");
+        assert!(
+            line.contains("stats.read") && line.contains("storage.write"),
+            "要点同意的哪几项必须看得见: {line}"
+        );
+        assert!(line.contains("新增"), "新增了哪一项要在句子里: {line}");
+        // 更硬的一条消息仍然在前
+        r.error = Some("语法错".to_string());
+        let (worse, _) = r.second_line();
+        assert!(worse.starts_with("加载失败"), "{worse}");
+        // 已经授权过的不许插进来
+        let ok = row("quiet_tool", false);
+        let (quiet, quiet_bad) = ok.second_line();
+        assert!(
+            !quiet_bad && quiet == "简介",
+            "已授权那一档不该自称坏消息: {quiet}"
+        );
+    }
+
+    /// 按钮的几何只有一份：画它的这一头与点它的那一头共用同一个函数（命中条件也是同一句）。
+    #[test]
+    fn the_grant_button_geometry_is_not_copied() {
+        let code = include_str!("../src/main.rs");
+        let at = code
+            .find("mod plugin_page_tests {")
+            .expect("插件页那一套用例的模块起点找不到了");
+        let prod = &code[..at];
+        assert_eq!(
+            prod.matches("fn plugin_grant_rect(").count(),
+            1,
+            "那颗按钮的几何函数应当只有一个定义"
+        );
+        assert_eq!(
+            prod.matches("plugin_grant_rect(").count(),
+            3,
+            "定义一处 + 画一处 + 命中一处，多出来的一处就是手抄了第二遍坐标"
+        );
+        assert!(
+            prod.contains("grantable && hit(plugin_grant_rect"),
+            "命中的条件必须与画它的条件同一句（needs_grant），否则会出现点不动的按钮"
+        );
+    }
+
+    /// 定时器这一条链两头都在生产里：core 那侧排得进程序，GUI 那一拍真的去取。
+    ///
+    /// 少了投递那一行，症状是"插件排了定时器、页面什么都不说、也永远不跑" —— 与热重载
+    /// 那条链同形（检测线程整晚在扫而没人处理），所以照同一把尺子钉。
+    #[test]
+    fn the_timer_chain_has_both_ends_in_production() {
+        let code = include_str!("../src/main.rs");
+        assert!(
+            code.contains("fn pump_plugin_timers(&mut self)"),
+            "投递那一步没写成方法"
+        );
+        let at = code
+            .find("WM_TIMER if w.0 == TIMER_EVENTS")
+            .expect("100ms 那一拍的起点找不到了");
+        // 按**字符**取窗口：按字节切会在中文注释的多字节边界上 panic（本条用例第一版就是这么红的）
+        let window: String = code[at..].chars().take(4_000).collect();
+        // 注释掉的调用不算接线：留着 `// app.pump_plugin_timers();` 也过，等于给"改回不投递"
+        // 留了一条无声的路（同一族缺陷在 manager 那道闸上被抓过一次）
+        let prod: String = window
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            prod.contains("app.pump_plugin_timers();"),
+            "那一拍里没有真的调用（被注释掉与从来没写都算没接上）= 排程永远没人跑"
+        );
     }
 
     /// 两栏分组的格子表：表头在前、行在后，`Row` 里的下标仍是 `rows` 的行号。

@@ -306,6 +306,9 @@ fn view_names(dir: &Path, owner: &str, extension: bool) -> (Vec<String>, Lua) {
     let lua = Lua::new();
     let api = host::register_host_api(&lua, config, db::Database::init_readonly(), owner)
         .expect("注册宿主 API 失败");
+    // 定时器与事件那一组是**装完表之后**由管理器补装的第二批（`load_plugin` 同一条顺序）：
+    // 审计读的是插件实际看到的那张表，漏装这一批就会把六个名字算成"没人注册"。
+    host::install_timer_api(&lua, &api, owner).expect("定时器入口装不上");
     if extension {
         host::hide_builtin_only_api(&api).expect("收口失败");
     }

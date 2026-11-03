@@ -17,7 +17,9 @@
 
 pub mod host;
 pub mod manager;
+pub mod permissions;
 pub mod plugin_store;
+pub mod plugin_timers;
 
 pub use manager::{
     Discovered, DiscoveredPlugin, PluginInfo, PluginLifecycle, PluginManager, PluginManifest,

@@ -193,14 +193,20 @@ pub const BUILTIN_ONLY_API_PREFIXES: &[&str] = &["pomodoro_", "accounting_", "sc
 /// 两边不一致（例如新加一个既不带内置前缀、又不该给扩展用的 API）由
 /// `the_extension_view_leaves_only_the_general_apis` 逮住，而不是靠读代码的人记得。
 pub const EXTENSION_API_NAMES: &[&str] = &[
+    "after",
     "app_info",
     "available_years",
+    "cancel",
     "config_get",
     "daily_counts",
+    "every",
     "log",
     "now",
+    "off",
+    "on",
     "stats",
     "store",
+    "timers",
     "today_count",
 ];
 
@@ -235,6 +241,178 @@ pub fn hide_builtin_only_api(host: &Table) -> mlua::Result<Vec<String>> {
         host.set(name.as_str(), mlua::Value::Nil)?;
     }
     Ok(doomed)
+}
+
+/// 给这一张 `focusflow` 装上权限闸（方案 3.7 的"用必声明 + 授权绑权限哈希"落到注册表上）。
+///
+/// 做法是给每个**需要权限的**名字换一层 Lua 壳：壳先问 Rust 那头的 `Gate`，被拒就 `error()`
+/// 把原因原样抛出去（方案 9.1 定的就是"API 失败时抛错"，而抛出来的这句会走既有的
+/// 「插件报了什么」那条路进插件页 —— 不新增一种沉默），放行才 `return f(...)`。
+///
+/// 为什么壳写在 Lua 而不是 Rust：`...` 的**转发**在 Rust 侧要么逐个已知元数、要么把返回值
+/// 重新拼一遍，两种都会改变插件看到的形状（本仓为"多一个返回值"专门写过注释）。
+/// 判定逻辑一行都不留在 Lua —— 那里只剩"问一次、转一次"，`permissions.rs` 因此不出现
+/// 任何 mlua 类型（方案 3.4 那条判据在权限这一族的照法，`guard_ships_the_decision_not_the_wording`
+/// 钉着）。
+///
+/// 交回装了壳的名字清单：调用方与用例都要能核对"该拦的真的拦了"，而不是只信函数跑完了。
+///
+/// **前提**：必须在 [`register_host_api`] 之后调用，且 `host` 就是它返回的那张表 ——
+/// 那段 Lua 读的是全局 `focusflow`，而全局与这张表是同一个对象（注册那一步末尾设的）。
+pub fn install_permission_guard(
+    lua: &Lua,
+    host: &Table,
+    gate: Arc<crate::plugins::permissions::Gate>,
+    names: &[&'static str],
+    store_verbs: &[&'static str],
+) -> mlua::Result<Vec<String>> {
+    let check = lua.create_function(move |_lua, (api, verb): (String, Option<String>)| {
+        let perm = crate::plugins::permissions::required_for(&api, verb.as_deref());
+        let verdict = match perm {
+            // 名单里登记了、这里读不出权限 = 两份清单分家了，宁可放行也不许把话说到别处去
+            None => (true, String::new()),
+            Some(p) => match gate.check(&api, p) {
+                Ok(()) => (true, String::new()),
+                Err(why) => (false, why),
+            },
+        };
+        if !verdict.0 {
+            tracing::warn!("{}", verdict.1);
+        }
+        Ok(verdict)
+    })?;
+    // 这个名字只在装壳这一段里活着，装完摘掉：留着就是给插件一个能自己问闸的口子
+    host.set("__permission_guard", check)?;
+
+    // 名单由调用方给（Rust 侧那份 `EXTENSION_API_NAMES` 与权限表同源），Lua 这段只认它交给的名字
+    let mut name_array = Vec::new();
+    for n in names {
+        name_array.push((*n).to_string());
+    }
+    let mut verb_array = Vec::new();
+    for v in store_verbs {
+        verb_array.push((*v).to_string());
+    }
+    host.set("__guard_names", name_array)?;
+    host.set("__guard_verbs", verb_array)?;
+    let wrapped: Vec<String> = lua
+        .load(
+            r#"
+            local guard = focusflow.__permission_guard
+            local names = focusflow.__guard_names
+            local verbs = focusflow.__guard_verbs
+            focusflow.__permission_guard, focusflow.__guard_names, focusflow.__guard_verbs = nil, nil, nil
+            local out = {}
+            local function wrap(box, key, label)
+              local f = box[key]
+              if type(f) ~= "function" then return end
+              box[key] = function(...)
+                local ok, why = guard(label.name, label.verb)
+                if not ok then error(why, 0) end
+                return f(...)
+              end
+              out[#out + 1] = (label.verb and (label.name .. "." .. label.verb)) or label.name
+            end
+            for _, n in ipairs(names) do wrap(focusflow, n, { name = n }) end
+            if type(focusflow.store) == "table" then
+              for _, v in ipairs(verbs) do wrap(focusflow.store, v, { name = "store", verb = v }) end
+            end
+            return out
+            "#,
+        )
+        .eval()?;
+    Ok(wrapped)
+}
+
+/// 把 `focusflow.every` / `after` / `cancel` / `on` / `off` 装进这张表（方案 3.6）。
+///
+/// Rust 这一头只管**排程**（`__ff_arm` / `__ff_cancel`，两个内部名字装完就摘掉），
+/// 回调函数留在插件自己 Lua 里那一格 `_ff_timers[handle]` —— `mlua::Function` 不是 `Send`，
+/// 而排程表要活在进程级那一份登记里（`plugin_timers`），两边只能这么分。
+///
+/// 类型检查放在 Lua 那一层是有意的：`every(5, "print")` 这种写法要被拒 in place，
+/// 并指着**那一个参数**说话；交给 Rust 只能报"第二参数读不出函数"。
+pub fn install_timer_api(lua: &Lua, host: &Table, owner: &str) -> mlua::Result<()> {
+    use crate::plugins::plugin_timers::{self, Kind};
+    let board = plugin_timers::board_for(owner);
+    let for_arm = Arc::clone(&board);
+    let arm = lua.create_function(move |_lua, (kind, secs): (String, i64)| {
+        let kind = match kind.as_str() {
+            "every" => Kind::Every,
+            "after" => Kind::After,
+            "tick" => Kind::Tick,
+            "day_change" => Kind::DayChange,
+            other => {
+                return Ok((
+                    0u64,
+                    Some(format!(
+                        "认不得的定时器类型「{other}」：可写 every / after / tick / day_change"
+                    )),
+                ))
+            }
+        };
+        if secs < 0 {
+            return Ok((0u64, Some(format!("定时器的秒数不许是负数（收到 {secs}）"))));
+        }
+        let mut guard = for_arm.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.arm(kind, secs as u64, std::time::Instant::now()) {
+            Ok(handle) => Ok((handle, None)),
+            Err(why) => Ok((0u64, Some(why))),
+        }
+    })?;
+    let for_cancel = Arc::clone(&board);
+    let cancel = lua.create_function(move |_lua, handle: u64| {
+        let mut guard = for_cancel.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(guard.cancel(handle))
+    })?;
+    host.set("__ff_arm", arm)?;
+    host.set("__ff_cancel", cancel)?;
+    // 计数那一格给插件页与用例读：`focusflow.timers()` 说"我还挂着几格"
+    let for_count = Arc::clone(&board);
+    let count = lua.create_function(move |_lua, ()| {
+        Ok(for_count.lock().unwrap_or_else(|e| e.into_inner()).len())
+    })?;
+    host.set("timers", count)?;
+
+    lua.load(
+        r#"
+        local arm = focusflow.__ff_arm
+        local cancel = focusflow.__ff_cancel
+        _ff_timers = {}
+        local function one(kind, secs, fn, verb)
+          if type(fn) ~= "function" then
+            error(verb .. " 的第二参数要写函数（这里收到的是 " .. type(fn) .. "）", 0)
+          end
+          local h, why = arm(kind, secs)
+          if why then error(verb .. " 没排上：" .. why, 0) end
+          _ff_timers[h] = fn
+          return h
+        end
+        focusflow.every = function(sec, fn) return one("every", sec, fn, "focusflow.every(sec, fn)") end
+        focusflow.after = function(sec, fn) return one("after", sec, fn, "focusflow.after(sec, fn)") end
+        focusflow.on = function(name, fn)
+          local kind = (name == "tick" and "tick") or (name == "day_change" and "day_change")
+          if not kind then
+            error("focusflow.on 这一版只认 tick / day_change（收到「" .. tostring(name) .. "」）", 0)
+          end
+          return one(kind, 0, fn, "focusflow.on(event, fn)")
+        end
+        local function drop(h)
+          if type(h) ~= "number" then
+            error("取消要交回排期时拿到的那个句柄（收到 " .. type(h) .. "）", 0)
+          end
+          local ok = cancel(h)
+          _ff_timers[h] = nil
+          return ok
+        end
+        focusflow.cancel = drop
+        focusflow.off = drop
+        focusflow.__ff_arm, focusflow.__ff_cancel = nil, nil
+        "#,
+    )
+    .set_name("focusflow-timers")
+    .exec()?;
+    Ok(())
 }
 
 /// 注册宿主 API 到 Lua 全局表 `focusflow`，返回该表。

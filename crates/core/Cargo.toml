@@ -39,6 +39,7 @@ mlua = { version = "0.10", features = ["lua54", "vendored"] }
 # 截图的 PNG 编码。只用编码器，不引 image 那种全家桶。
 # 版本已在依赖图里（经 tray-icon/muda 传递），加直接依赖不引入新的 crate 集合。
 png = "0.18"
+sha2 = "0.10.9"
 
 # 前台应用统计（仅用窗口 API + 进程快照，不对其他进程开句柄）
 # 设备维度统计用 Raw Input（Win32_UI_Input_KeyboardAndMouse）
