@@ -2353,20 +2353,15 @@ impl App {
         }
     }
 
-    /// 设置页底部那三颗「执行」：备份 / 压缩 / 清理，都在后台线程跑。
+    /// 设置页底部那八颗「执行」：备份 / 压缩 / 清理 / 三种导出 / 导入 / 换数据文件夹，
+    /// 都在后台线程跑。点下去那句"正在…"取自 `ACTIONS` 的第三栏（一颗钮一句，
+    /// 借不得别人的话 —— 「正在清理」那句在屏上等同于"我正在删不可撤销的明细"）。
     fn run_action(&mut self, hwnd: HWND, which: usize) {
         if self.busy {
             return;
         }
         self.busy = true;
-        self.status = Some(
-            match which {
-                0 => "正在备份…",
-                1 => "正在压缩数据库…",
-                _ => "正在清理 30 天前的数据…",
-            }
-            .to_string(),
-        );
+        self.status = Some(action_busy_line(which).to_string());
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
@@ -2382,8 +2377,7 @@ impl App {
             .name("data-op".into())
             .spawn(move || {
                 use focusflow_core::db::maintenance::{
-                    backup_database, cleanup_line, cleanup_old_data, vacuum_all, vacuum_line,
-                    BackupOutcome,
+                    backup_database, cleanup_old_data, vacuum_all, vacuum_line, BackupOutcome,
                 };
                 let line = match which {
                     0 => {
@@ -2472,8 +2466,9 @@ impl App {
                         // 这句话由 core 说一遍（`cleanup_line`，与 CLI 的 `--cleanup` 同一出处）。
                         // 以前这里自己拼「已清理 N 条（保留 30 天）」，于是同一次清理在命令行说
                         // 「清理未完成」、在按钮上说的是「已清理」，而单位（每天每键一行）谁都没讲。
+                        // 执行前快照没兜住那半句同样不许在这里掉（见 `cleanup_status_line`）。
                         let r = cleanup_old_data(30);
-                        cleanup_line(30, &r)
+                        cleanup_status_line(30, &r)
                     }
                     6 => {
                         let dir = match std::env::var("FOCUSFLOW_IMPORT_DIR") {
@@ -3912,7 +3907,7 @@ fn settings_items(snap: &Snapshot, filter: &str, cat: usize) -> Vec<SItem> {
             if f.is_empty() {
                 return true;
             }
-            let (label, desc) = ACTIONS[i];
+            let (label, desc, _) = ACTIONS[i];
             label.to_lowercase().contains(&f) || desc.to_lowercase().contains(&f)
         })
         .collect();
@@ -3948,19 +3943,67 @@ fn settings_geom(_w: f32, h: f32) -> SettingsGeom {
 }
 
 /// 设置页底部的数据操作（后台线程跑，结果回投 `WM_OP_DONE`）。
-const ACTIONS: [(&str, &str); 8] = [
-    ("立即备份", "把年度库各快照一份到 backup/"),
-    ("压缩数据库", "重建年度库，回收空闲页"),
-    ("清理 30 天前", "删掉 30 天以前的明细（不可撤销）"),
-    ("导出 CSV", "把当前周期的数据写成表格"),
-    ("导出 HTML", "写成一份可直接打开的网页报告"),
-    ("导出 JSON", "写成结构化数据（脚本可读）"),
-    ("导入旧数据…", "从旧版数据目录合并进来（先留档再覆盖）"),
+/// 设置页底部那八颗「执行」：标题 / 说明 / **点下去之后状态行那句"正在…"**。
+///
+/// 第三栏必须住在这张表里：从前它只有两栏，`run_action` 自己再 match 一遍 `which`，
+/// 而那 match 只写了 `0`/`1` 两支、其余全落进 `_ => "正在清理 30 天前的数据…"`。
+/// 于是点「导出 CSV」的人屏上看到的是"正在删 30 天以前的明细"——那正是这张表里唯一
+/// 标着「不可撤销」那一档才会说的话；同时三颗钮被 `busy` 灰掉、存盘对话框还开在后台线程，
+/// 人就在这时候强关软件。加一栏 ⇒ 少写一栏编译就不过，话不会再借到别的动作上。
+const ACTIONS: [(&str, &str, &str); 8] = [
+    ("立即备份", "把年度库各快照一份到 backup/", "正在备份…"),
+    ("压缩数据库", "重建年度库，回收空闲页", "正在压缩数据库…"),
+    (
+        "清理 30 天前",
+        "删掉 30 天以前的明细（不可撤销）",
+        "正在清理 30 天前的数据…",
+    ),
+    ("导出 CSV", "把当前周期的数据写成表格", "正在导出 CSV…"),
+    (
+        "导出 HTML",
+        "写成一份可直接打开的网页报告",
+        "正在导出 HTML…",
+    ),
+    ("导出 JSON", "写成结构化数据（脚本可读）", "正在导出 JSON…"),
+    (
+        "导入旧数据…",
+        "从旧版数据目录合并进来（先留档再覆盖）",
+        "正在导入旧数据…",
+    ),
     (
         "更改数据文件夹…",
         "把 data/ 与 backup/ 搬到新目录；重启后执行",
+        "正在安排更换数据文件夹…",
     ),
 ];
+
+/// 这一颗「执行」交回状态行的那句清理结论 = core 那一句话 + 执行前快照没兜住的那半句。
+///
+/// `snapshot_warning` 这一格在 core 里刻意**不进 `incomplete()`**（操作本身做完了，退码不该
+/// 因为"退路没备好"而变），它的注释还写着"绝不能只进日志"。CLI 那两头都单独把它喊出去
+/// （`crates/cli/src/main.rs` 里读 `report.snapshot_warning` 的两处），而屏上这一支从前只念
+/// `cleanup_line` ⇒ 刚删掉的明细**没有回滚用的快照**这件事在界面上一字不留 ——
+/// 而「不可撤销」正是这颗钮自己说明栏里写着的那两个字。
+fn cleanup_status_line(
+    days: i64,
+    report: &focusflow_core::db::maintenance::MaintenanceReport,
+) -> String {
+    let mut line = focusflow_core::db::maintenance::cleanup_line(days, report);
+    if let Some(w) = report.snapshot_warning.as_deref() {
+        line.push('；');
+        line.push_str(w);
+    }
+    line
+}
+
+/// 这一颗钮按下去，状态行该说的那一句。越界一支不冒充任何具体动作
+/// （它只可能来自新加的调用方，而「正在清理」那种话借不得）。
+fn action_busy_line(which: usize) -> &'static str {
+    match ACTIONS.get(which) {
+        Some((_, _, busy)) => busy,
+        None => "正在执行…",
+    }
+}
 
 /// 搜索框那块底框（真正的输入是叠在它上面的原生 EDIT，见 `ensure_search_edit`）。
 fn search_box_rect(w: f32) -> D2D_RECT_F {
@@ -4483,7 +4526,7 @@ fn draw_settings(
             }
             SItem::Action(a) => {
                 // 数据操作行：左边是名字，右边一颗「执行」按钮，再右边一句后果说明。
-                let (label, desc) = ACTIONS[a];
+                let (label, desc, _) = ACTIONS[a];
                 p.text(
                     label,
                     rect(r.left + 12.0, y + 2.0, 240.0, 20.0),
@@ -12112,6 +12155,98 @@ mod snapshot_rate_tests {
 
 #[cfg(test)]
 mod settings_type_tests {
+    /// 清理那一句要把"执行前快照没兜住"一起带上屏（那是删完才发现没有退路的那一半）。
+    ///
+    /// 三条腿：①`snapshot_warning` 为空 ⇒ 屏上就是 core 那一句话，一个字都不许多
+    /// （把那句写死成"总在"就红在这儿）；②有 ⇒ core 的原话仍在前面、快照那半句跟着到场；
+    /// ③生产段确实走这条出口 —— 旧的 `cleanup_line(30, &r)` 那种把快照结局丢掉的写法必须为零。
+    #[test]
+    fn the_cleanup_line_on_screen_carries_the_missing_safety_net() {
+        use super::cleanup_status_line;
+        use focusflow_core::db::maintenance::{cleanup_line, MaintenanceReport};
+        let clean = MaintenanceReport::default();
+        let base = cleanup_status_line(30, &clean);
+        assert_eq!(
+            base,
+            cleanup_line(30, &clean),
+            "快照兜住了就不许多说一个字: {base}"
+        );
+
+        let r = MaintenanceReport {
+            snapshot_warning: Some("执行前快照只兜住了 1 份".to_string()),
+            ..MaintenanceReport::default()
+        };
+        let said = cleanup_status_line(30, &r);
+        assert!(
+            said.starts_with(base.as_str()) && said.contains("只兜住了 1 份"),
+            "core 的原话在前、快照那半句也要到场: {said}"
+        );
+
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            flat.matches("cleanup_line(30,&r)").count(),
+            0,
+            "又一处把执行前快照的结局丢掉：清理那一句要走带快照的那条出口"
+        );
+        assert_eq!(
+            flat.matches("cleanup_status_line(").count(),
+            2,
+            "定义一颗 + 那颗钮一处，实得 {}",
+            flat.matches("cleanup_status_line(").count()
+        );
+    }
+
+    /// 八颗「执行」每颗要有自己那句"正在…"，不许借「正在清理」那句话。
+    ///
+    /// 病状在屏上：从前 `run_action` 自己 match `which`，只写了 `0`/`1` 两支，其余六支
+    /// （清理、三种导出、导入、换数据文件夹）全落进 `_ => "正在清理 30 天前的数据…"`。
+    /// 点「导出 CSV」的人于是看到"正在删 30 天以前的明细"——这张表里唯一标着「不可撤销」
+    /// 那一档的话；同时三颗钮被 busy 灰掉、存盘对话框还开在后台线程上，人就在这时候强关。
+    ///
+    /// 三条腿：①每颗钮交回的就是表里自己那一栏（把 busy 话收回 match 里就红）；
+    /// ②除「清理」那一支以外，任何一颗都不许说"清理"（这一条是缺陷的正身）；
+    /// ③表里每栏都得写成"正在…"起头且非空（新加一颗却漏写第三栏 ⇒ 编译先不过，
+    ///   这条腿钉的是"第三栏不许是空串"那种绕过）。
+    #[test]
+    fn each_action_button_names_its_own_busy_line() {
+        use super::{action_busy_line, ACTIONS};
+        assert_eq!(ACTIONS.len(), 8, "动作表的本场现量是八颗");
+        for (i, (title, _, busy)) in ACTIONS.iter().enumerate() {
+            let line = action_busy_line(i);
+            assert_eq!(
+                line, *busy,
+                "第 {i} 颗（{title}）交回的不是表里那一栏: {line}"
+            );
+            assert!(
+                line.starts_with("正在") && line.chars().count() > 3,
+                "忙时那句要按这一族的写法说清在做什么，不许是空串或一个词: {title} → {line}"
+            );
+            if i != 2 {
+                assert!(
+                    !line.contains("清理"),
+                    "「{title}」点下去不许说成在删明细（那是不可撤销那一档的话）: {line}"
+                );
+            }
+        }
+        assert!(
+            ACTIONS[2].0.contains("清理"),
+            "第 2 颗必须还是那颗清理钮，否则上面那条判据就成了恒真: {}",
+            ACTIONS[2].0
+        );
+        assert_eq!(
+            action_busy_line(ACTIONS.len()),
+            "正在执行…",
+            "越界那一支不许冒充任何一个具体动作"
+        );
+    }
+
     /// 设置页这一整套字号是照旧 WebView `desktop/ui/styles.css` 逐项量出来的（见 `Formats`
     /// 上那段注释）。这里守的不是像素，而是"别再借全局那两档"：以前整页画的是 `body`
     /// 12.5/400 与 `small` 11/400，比旧版小一号又细一号——借档在源码里不留任何痕迹，
