@@ -327,7 +327,25 @@ pub fn install_permission_guard(
               end
               out[#out + 1] = (label.verb and (label.name .. "." .. label.verb)) or label.name
             end
-            for _, n in ipairs(names) do wrap(focusflow, n, { name = n }) end
+            -- on 这一格特殊：权限按**事件名**分（app_change 要 events.app，tick / day_change
+            -- 要 timer），所以不能按"整格一个名字"包，得把第一个参数一起交给闸去判。
+            local function wrap_event(key, need_verb)
+              local f = focusflow[key]
+              if type(f) ~= "function" then return end
+              focusflow[key] = function(name, ...)
+                local ok, why = guard(key, tostring(name))
+                if not ok then error(why, 0) end
+                return f(name, ...)
+              end
+              out[#out + 1] = need_verb
+            end
+            for _, n in ipairs(names) do
+              if n == "on" then
+                wrap_event("on", "on(event)")
+              else
+                wrap(focusflow, n, { name = n })
+              end
+            end
             if type(focusflow.store) == "table" then
               for _, v in ipairs(verbs) do wrap(focusflow.store, v, { name = "store", verb = v }) end
             end
@@ -356,11 +374,12 @@ pub fn install_timer_api(lua: &Lua, host: &Table, owner: &str) -> mlua::Result<(
             "after" => Kind::After,
             "tick" => Kind::Tick,
             "day_change" => Kind::DayChange,
+            "app_change" => Kind::AppChange,
             other => {
                 return Ok((
                     0u64,
                     Some(format!(
-                        "认不得的定时器类型「{other}」：可写 every / after / tick / day_change"
+                        "认不得的定时器类型「{other}」：可写 every / after / tick / day_change / app_change"
                     )),
                 ))
             }
@@ -405,9 +424,11 @@ pub fn install_timer_api(lua: &Lua, host: &Table, owner: &str) -> mlua::Result<(
         focusflow.every = function(sec, fn) return one("every", sec, fn, "focusflow.every(sec, fn)") end
         focusflow.after = function(sec, fn) return one("after", sec, fn, "focusflow.after(sec, fn)") end
         focusflow.on = function(name, fn)
-          local kind = (name == "tick" and "tick") or (name == "day_change" and "day_change")
+          local kind = (name == "tick" and "tick")
+            or (name == "day_change" and "day_change")
+            or (name == "app_change" and "app_change")
           if not kind then
-            error("focusflow.on 这一版只认 tick / day_change（收到「" .. tostring(name) .. "」）", 0)
+            error("focusflow.on 这一版只认 tick / day_change / app_change（收到「" .. tostring(name) .. "」）", 0)
           end
           return one(kind, 0, fn, "focusflow.on(event, fn)")
         end

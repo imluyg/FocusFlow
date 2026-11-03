@@ -41,6 +41,12 @@ pub enum Kind {
     Tick,
     /// 日期变了那一次（`on("day_change", fn)`）
     DayChange,
+    /// 前台应用换了名字那一次（`on("app_change", fn)`）。
+    ///
+    /// 与 `Tick` / `DayChange` 不同，它**不由墙钟决定**：触发它的是采样线程投进件口的那个
+    /// 名字，所以 [`Board::collect_due`] 对它一律不回（那一拍没有新名字就是没变化），
+    /// 取走它的载荷走 [`Board::collect_app_change`] 那一条路。
+    AppChange,
 }
 
 /// 一格定时器。
@@ -55,6 +61,8 @@ struct Entry {
     /// 上一次跑的时候的分钟桶 / 日桶（事件类用它判"这一分钟、这一天已经跑过了"）
     last_minute: Option<i64>,
     last_day: Option<i64>,
+    /// AppChange 用来判"这个名字已经给过这一格了"
+    last_app: Option<String>,
 }
 
 /// 一个插件的定时器表。
@@ -75,7 +83,9 @@ impl Board {
     /// 排一格定时器，交回句柄。三种拒绝各有各的话，不许折成同一个 `Err`：
     /// 作者看到的是"我写的哪一个字错了"，而不是"定时器没起来"。
     pub fn arm(&mut self, kind: Kind, secs: u64, now: std::time::Instant) -> Result<u64, String> {
-        if !matches!(kind, Kind::Tick | Kind::DayChange) && secs < MIN_INTERVAL_SECS {
+        if !matches!(kind, Kind::Tick | Kind::DayChange | Kind::AppChange)
+            && secs < MIN_INTERVAL_SECS
+        {
             return Err(format!(
                 "定时器最短 {MIN_INTERVAL_SECS} 秒（收到 {secs}）：要更密的刷新请走 PLUGIN_REFRESH_MS"
             ));
@@ -91,7 +101,7 @@ impl Board {
         let due = match kind {
             Kind::Every => Some(now + std::time::Duration::from_secs(secs)),
             Kind::After => Some(now + std::time::Duration::from_secs(secs)),
-            Kind::Tick | Kind::DayChange => None,
+            Kind::Tick | Kind::DayChange | Kind::AppChange => None,
         };
         self.entries.insert(
             handle,
@@ -102,6 +112,7 @@ impl Board {
                 due,
                 last_minute: None,
                 last_day: None,
+                last_app: None,
             },
         );
         Ok(handle)
@@ -128,6 +139,8 @@ impl Board {
                 Kind::Every | Kind::After => e.due.map(|d| d <= now).unwrap_or(false),
                 Kind::Tick => e.last_minute != Some(minute_key),
                 Kind::DayChange => e.last_day != Some(day_key),
+                // 不是墙钟决定的：载荷没来就是这一拍什么都没变（见 collect_app_change）
+                Kind::AppChange => false,
             })
             .map(|e| e.handle)
             .collect();
@@ -148,12 +161,33 @@ impl Board {
                 }
                 Kind::Tick => entry.last_minute = Some(minute_key),
                 Kind::DayChange => entry.last_day = Some(day_key),
+                Kind::AppChange => {}
             }
         }
         self.fired += due.len() as u64;
         due
     }
 
+    /// 前台应用换了名字这一拍该跑的句柄：**只回没见过这个名字的那几格**。
+    ///
+    /// 去重按格而不是按件口：两个插件都订了 app_change 时，件口那边只投得下一次
+    /// （同名不再投），而这里要保证**每一格都拿到那一次** —— 所以记的是"这一格见过谁"。
+    pub fn collect_app_change(&mut self, app: &str) -> Vec<u64> {
+        let mut due: Vec<u64> = self
+            .entries
+            .values()
+            .filter(|e| e.kind == Kind::AppChange && e.last_app.as_deref() != Some(app))
+            .map(|e| e.handle)
+            .collect();
+        due.sort_unstable();
+        for handle in &due {
+            if let Some(entry) = self.entries.get_mut(handle) {
+                entry.last_app = Some(app.to_string());
+            }
+        }
+        self.fired += due.len() as u64;
+        due
+    }
     /// 本次运行跑过多少个回调（观察量，见 `Board::fired` 那段）。
     pub fn fired(&self) -> u64 {
         self.fired

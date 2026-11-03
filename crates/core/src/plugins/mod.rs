@@ -18,6 +18,7 @@
 pub mod host;
 pub mod manager;
 pub mod permissions;
+pub mod plugin_events;
 pub mod plugin_refresh;
 pub mod plugin_store;
 pub mod plugin_timers;

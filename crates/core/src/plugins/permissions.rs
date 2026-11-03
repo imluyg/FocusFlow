@@ -46,6 +46,12 @@ pub fn required_for(api: &str, verb: Option<&str>) -> Option<&'static str> {
             ("store", "set") | ("store", "delete") | ("store", "clear") | ("store", "flush") => {
                 Some("storage.write")
             }
+            // `on` 按**事件名**分权限（3.6 第三条事件接上时留下的那一句，今天落了）：
+            // `on("app_change")` 要的是 `events.app`，`on("tick")` / `on("day_change")` 仍是
+            // `timer`。认不得的事件名在这一头算 `timer` 也无所谓 —— 脚本那一层的 `on`
+            // 先把它拒掉（"这一版只认 …"），轮不到闸说话。
+            ("on", "app_change") => Some("events.app"),
+            ("on", _) => Some("timer"),
             _ => None,
         };
     }
@@ -55,9 +61,9 @@ pub fn required_for(api: &str, verb: Option<&str>) -> Option<&'static str> {
         }
         "store" => None,
         "every" | "after" | "cancel" | "on" | "off" => Some("timer"),
-        // `on` 目前只有 `tick` / `day_change` 两个事件，都是**按时间**的，所以归 `timer`。
-        // 等 3.6 那第三条 `app_change`（前台应用切换）接上来，它才需要 `events.app` ——
-        // 到那时是按事件名分权限、不是按 API 名，这一格的映射要跟着拆（写在用例里盯着）。
+        // `on` / `off` 走到这里都是"没给事件名"的那一类（闸的壳在 `on` 上会把事件名一起交
+        // 进来，见 `host::install_permission_guard`）。这一格保持"不要事件名时也拦得住"，
+        // 是因为清单来自 `EXTENSION_API_NAMES`：漏了 verb 不会变成放行，只会变成按 timer 拦。
         "notify" => Some("notify"),
         _ => None,
     }

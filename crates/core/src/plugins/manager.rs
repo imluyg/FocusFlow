@@ -27,6 +27,7 @@ use crate::db;
 use crate::paths;
 use crate::plugins::host;
 use crate::plugins::permissions;
+use crate::plugins::plugin_events;
 use crate::plugins::plugin_refresh;
 use crate::plugins::plugin_timers;
 use crate::plugins::resources;
@@ -1695,17 +1696,31 @@ impl PluginManager {
             .filter(|p| p.lua.is_some())
             .map(|p| (p.manifest.name.clone(), Self::stem_of(&p.file_path)))
             .collect();
+        // app_change 的载荷从件口取**一次**就够：它是"此刻前台是谁"这一个事实，
+        // 每个插件的每一格订阅者拿同一份，而"这一格见过谁"记在各自的排程表上。
+        let app = plugin_events::take_app_change();
         for (name, stem) in loaded {
             let board = plugin_timers::board_for(&stem);
             let due = {
                 let mut guard = board.lock().unwrap_or_else(|e| e.into_inner());
                 guard.collect_due(now, minute_key, day_key)
             };
-            if due.is_empty() {
+            let event_due: Vec<u64> = match app.as_deref() {
+                Some(a) => {
+                    let mut guard = board.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.collect_app_change(a)
+                }
+                None => Vec::new(),
+            };
+            if due.is_empty() && event_due.is_empty() {
                 continue;
             }
+            // 墙钟那一轮先跑、事件那一轮后跑：顺序固定，插件挂多格时"这一拍先跑谁"可预期
+            let mut queue: Vec<(u64, Option<String>, &'static str)> = Vec::new();
+            queue.extend(due.into_iter().map(|h| (h, None, "定时器")));
+            queue.extend(event_due.into_iter().map(|h| (h, app.clone(), "事件")));
             let mut fired = 0usize;
-            for handle in due {
+            for (handle, payload, which) in queue {
                 let outcome = {
                     let Some(info) = self.plugins.get(&name) else {
                         break;
@@ -1713,26 +1728,12 @@ impl PluginManager {
                     let Some(lua) = info.lua.as_ref() else {
                         break;
                     };
-                    let cb: Option<mlua::Function> = lua
-                        .globals()
-                        .get::<mlua::Table>("_ff_timers")
-                        .ok()
-                        .and_then(|t| t.get(handle).ok());
-                    match cb {
-                        Some(f) => {
-                            Self::arm_instruction_budget(lua, cfg);
-                            plugin_timers::note_fire_thread(&stem);
-                            f.call::<()>(())
-                        }
-                        None => Err(mlua::Error::RuntimeError(format!(
-                            "句柄 {handle} 在 _ff_timers 里没有对应的函数"
-                        ))),
-                    }
+                    Self::fire_hook(lua, cfg, &stem, handle, payload.as_deref())
                 };
                 match outcome {
                     Ok(()) => fired += 1,
                     Err(e) => {
-                        let msg = format!("定时器回调（句柄 {handle}）失败: {e}");
+                        let msg = format!("{}回调（句柄 {handle}）失败: {e}", which);
                         tracing::error!("插件 {name} {msg}");
                         if is_limit_error(&e) {
                             // 死循环的那一类交给既有的熔断：停用、销表、插件页留原因
@@ -1747,6 +1748,41 @@ impl PluginManager {
             }
         }
         ran
+    }
+
+    /// 从插件那一格 Lua 里取出回调跑一次。
+    ///
+    /// 载荷那一格只有事件那一路用得上（app_change 要把应用名字交回给插件），定时器传
+    /// None = 一个参数都不带 —— 这两条不许折成一条：给定时器回调多塞一个参数，插件里
+    /// 写 function() ... end 的那些人看不见任何异常，但 select 数参数那类写法会开始数出东西来。
+    ///
+    /// 指令预算在**每一次调用之前**重新上：它是"这一格回调最多烧多少"的闸，共用一次
+    /// 上过的预算会让第二格跑完也无人拦。
+    fn fire_hook(
+        lua: &Lua,
+        cfg: &'static FocusFlowConfig,
+        stem: &str,
+        handle: u64,
+        payload: Option<&str>,
+    ) -> Result<(), mlua::Error> {
+        let cb: Option<mlua::Function> = lua
+            .globals()
+            .get::<mlua::Table>("_ff_timers")
+            .ok()
+            .and_then(|t| t.get(handle).ok());
+        match cb {
+            Some(f) => {
+                Self::arm_instruction_budget(lua, cfg);
+                plugin_timers::note_fire_thread(stem);
+                match payload {
+                    Some(name) => f.call::<()>(name.to_string()),
+                    None => f.call::<()>(()),
+                }
+            }
+            None => Err(mlua::Error::RuntimeError(format!(
+                "句柄 {handle} 在 _ff_timers 里没有对应的函数"
+            ))),
+        }
     }
 
     /// 打开着的那一页现在该不该重算（方案 3.9 的节奏，判断全在 `plugin_refresh`）。

@@ -92,7 +92,8 @@ fn a_permission_outside_the_frozen_list_names_the_known_ones() {
         "要把认得的那几项念出来: {}",
         f.message
     );
-    // 反向腿：`events.app` 在清单里（虽然还没有格子用它），不该被念成"没有这一项"
+    // 反向腿：`events.app` 在清单里（2026-11-04 起 `on("app_change")` 真的用它），
+    // 所以它不该被念成"宿主没有这一项权限"
     let listed = report(
         "PLUGIN_API = 2\nPLUGIN_PERMISSIONS = { \"events.app\" }\nfunction get_view()\n  return { type = \"text\", text = \"x\" }\nend\n",
         PluginSource::User,
@@ -292,6 +293,61 @@ fn the_five_shipped_scripts_have_nothing_to_complain_about() {
     assert!(
         checked >= 5,
         "只扫到 {checked} 份随包脚本 —— 目录变了？这一条就白跑了"
+    );
+}
+
+/// 校验器认得 `on` 这一格按**事件名**分的权限（与运行时那把尺子同源）。
+///
+/// 这一条盯的是两处分家：运行时的闸把事件名一起交给 `required_for`，而校验器的静态扫
+/// 只认 `focusflow.<格>` 的话，`on("app_change")` 会被读成"用了 timer 那一格"——
+/// 于是声明了 `events.app` 的插件被念成"多要的一份权限"，而只声明 timer 的那一份
+/// 反而一切正常，直到运行时被 DENIED。
+#[test]
+fn the_lint_splits_the_on_api_by_event_name() {
+    // 声明 events.app 且真的用它：两条都不该说
+    let good = report(
+        "PLUGIN_API = 2\nPLUGIN_PERMISSIONS = { \"events.app\" }\nfunction init()\n  focusflow.on(\"app_change\", function(name) end)\nend\n",
+        PluginSource::User,
+    );
+    assert!(
+        good.findings.is_empty(),
+        "声明与用法对得上还说话: {:?}",
+        good.findings
+    );
+
+    // 只声明 timer 却订 app_change：提前一行说清运行时会吃 DENIED
+    let missing = report(
+        "PLUGIN_API = 2\nPLUGIN_PERMISSIONS = { \"timer\" }\nfunction init()\n  focusflow.on(\"app_change\", function(name) end)\nend\n",
+        PluginSource::User,
+    );
+    let f = saying(&missing, "events.app").expect("按事件名要的权限，校验器也要按事件名报");
+    assert_eq!(f.level, Level::Error);
+    assert_eq!(
+        f.line,
+        Some(5),
+        "要说的是那一行订阅（1 名字 / 2 版本 / 3 声明 / 4 init 头）"
+    );
+
+    // 反向：只声明 events.app 却订 tick —— 那一格要的是 timer
+    let other = report(
+        "PLUGIN_API = 2\nPLUGIN_PERMISSIONS = { \"events.app\" }\nfunction init()\n  focusflow.on(\"tick\", function() end)\nend\n",
+        PluginSource::User,
+    );
+    let f = saying(&other, "timer").expect("tick 要的是 timer，不能因为都是 on 就混过去");
+    assert_eq!(f.level, Level::Error);
+
+    // 事件名不是字面量的那一类：静态读不出来，就闭嘴（漏报比误报代价低）
+    let dynamic = report(
+        "PLUGIN_API = 2\nPLUGIN_PERMISSIONS = { \"timer\" }\nfunction init()\n  local which = \"app_change\"\n  focusflow.on(which, function(name) end)\nend\n",
+        PluginSource::User,
+    );
+    assert!(
+        !dynamic
+            .findings
+            .iter()
+            .any(|x| x.message.contains("events.app") && x.level == Level::Error),
+        "拼出来的事件名读不出来，不许编一个权限出来念: {:?}",
+        dynamic.findings
     );
 }
 

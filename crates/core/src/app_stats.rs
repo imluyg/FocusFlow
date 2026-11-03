@@ -196,6 +196,9 @@ pub fn start_sampler(writer: Arc<DbWriter>) -> crate::startup::CheckResult {
                 if !enabled_now {
                     // 停用的当下就清掉归属，否则这段时长会记到上一个应用头上
                     writer.set_current_app(None);
+                    // 件口里那份是「此刻前台是谁」这个事实；关掉之后没有这个事实了，
+                    // 不把上一次的名字留给插件（GUI 那一拍可能还没取走）
+                    crate::plugins::plugin_events::reset_app_change();
                     continue;
                 }
                 match collect::foreground_app(last_hwnd) {
@@ -206,6 +209,12 @@ pub fn start_sampler(writer: Arc<DbWriter>) -> crate::startup::CheckResult {
                         last_hwnd = hwnd;
                         if is_recordable(&n, &exclude) {
                             writer.set_current_app(Some(&n));
+                            // 3.6 的第三条事件：投给插件「前台换成谁了」。同名不再投（件口自己按
+                            // 上一次投出去的那个去重），而 exclude 命中那一支连名字都不投 ——
+                            // 「完全不记录」这句话对插件这一侧同样成立
+                            if crate::plugins::plugin_events::post_app_change(&n) {
+                                tracing::debug!("前台应用切换已投给插件：{n}");
+                            }
                         } else {
                             // exclude 命中：按其语义「完全不记录」，
                             // 同时清空归属，避免这段时长被记到上一个应用头上
