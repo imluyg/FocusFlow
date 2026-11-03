@@ -153,7 +153,7 @@ impl PluginLifecycle {
     }
 
     /// 只认 `panel` / `always` 这两个词，拼错的折回缺省档并由调用方出声。
-    fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw {
             "panel" => Some(Self::Panel),
             "always" => Some(Self::Always),
@@ -164,6 +164,13 @@ impl PluginLifecycle {
 
 /// 清单里那几个字段的缺省值（方案 3.3：v1 老插件什么都不写也是这套）。
 const DEFAULT_PLUGIN_API: u32 = 1;
+
+/// 本宿主认得上去的最高能力版本（方案 3.10：宿主支持 `1..=2`）。
+///
+/// 今天只有校验器（[`super::validate`]）拿它说话：加载侧"太新就拒绝并提示升级插件"那一支
+/// 还没接（3.10 的另一半），所以高版本的插件现在照样加载。把这个数写在一处，等那一支落地
+/// 时两处念同一句话。
+pub const MAX_SUPPORTED_PLUGIN_API: u32 = 2;
 
 /// 同时加载的常驻插件上限（方案 3.11 那张表：128 MB 总账 ÷ 16 MB 单插件上限 = 8）。
 ///
@@ -234,19 +241,54 @@ impl Default for PluginManifest {
 /// 两侧各自的"原始声明读数"：取法不同（文本扫描 / Lua 全局），折叠前必须长得一样。
 ///
 /// `None` = 脚本没声明这一项（折成缺省值），不是"声明了但读坏了"。
-struct DeclaredFields {
+///
+/// 这份原始读数对校验器（[`super::validate`]）也是输入：它要说的正是"写了但会被折掉"
+/// 那一类，折叠之后就问不出来了。
+#[derive(Debug, Clone)]
+pub(crate) struct DeclaredFields {
     /// 展示名已经带上各自的缺省（文件名），因为两处缺省来源相同、不必再折一次
-    name: String,
-    desc: Option<String>,
-    version: Option<String>,
-    author: Option<String>,
-    api: Option<i64>,
-    permissions: Option<Vec<String>>,
-    refresh_ms: Option<i64>,
-    lifecycle: Option<String>,
-    min_app: Option<String>,
+    pub(crate) name: String,
+    pub(crate) desc: Option<String>,
+    pub(crate) version: Option<String>,
+    pub(crate) author: Option<String>,
+    pub(crate) api: Option<i64>,
+    pub(crate) permissions: Option<Vec<String>>,
+    pub(crate) refresh_ms: Option<i64>,
+    pub(crate) lifecycle: Option<String>,
+    pub(crate) min_app: Option<String>,
     /// 出声时自报家门的那一句（「扫描 x.lua」/「加载 x.lua」），一条规则两处报
-    where_: String,
+    pub(crate) where_: String,
+}
+
+/// 文本侧的原始声明读数：`scan_meta_source` 与校验器（[`super::validate`]）共用这一份取法。
+///
+/// 立它的原因是"复用同一套解析器"这句要求本身：校验器若自己再抄一遍"`KEY = 值` 怎么算
+/// 顶层赋值"，两侧就会对同一份文件给出不同的读数 —— 作者按校验器的话改完，加载侧照旧折。
+/// 抹注释、只认第 0 列、`local` 不算全局这些规矩全在 [`strip_lua_non_code`] 与
+/// [`top_level_string_assign`] / [`top_level_int_assign`] / [`top_level_table_strings`] 里，
+/// 这里只负责把它们按九个字段各调一次。
+pub(crate) fn declared_fields(text: &str, stem: &str, where_: &str) -> DeclaredFields {
+    let code = strip_lua_non_code(text);
+    let field = |key: &str| -> Option<String> {
+        code.lines()
+            .find_map(|line| top_level_string_assign(line, key))
+    };
+    let number = |key: &str| -> Option<i64> {
+        code.lines()
+            .find_map(|line| top_level_int_assign(line, key))
+    };
+    DeclaredFields {
+        name: field("PLUGIN_NAME").unwrap_or_else(|| stem.to_string()),
+        desc: field("PLUGIN_DESC"),
+        version: field("PLUGIN_VERSION"),
+        author: field("PLUGIN_AUTHOR"),
+        api: number("PLUGIN_API"),
+        permissions: top_level_table_strings(&code, "PLUGIN_PERMISSIONS"),
+        refresh_ms: number("PLUGIN_REFRESH_MS"),
+        lifecycle: field("PLUGIN_LIFECYCLE"),
+        min_app: field("PLUGIN_MIN_APP"),
+        where_: where_.to_string(),
+    }
 }
 
 /// 把原始声明折成一份清单：缺省值与非法值的折叠**只有这一份**。
@@ -254,7 +296,7 @@ struct DeclaredFields {
 /// 非法值（`PLUGIN_API = 0`、`PLUGIN_REFRESH_MS = -5`、`PLUGIN_LIFECYCLE = "Always"`）
 /// 一律折回缺省档并出声一次：静默折叠的症状是"作者写了却像没写"，而这一族缺陷
 /// 在本仓已经修过两次（把"读不出来"印成"没有"）。
-fn build_manifest(raw: DeclaredFields) -> PluginManifest {
+pub(crate) fn build_manifest(raw: DeclaredFields) -> PluginManifest {
     let where_ = raw.where_.as_str();
     let api = match raw.api {
         Some(n) if (1..=u32::MAX as i64).contains(&n) => n as u32,
@@ -848,7 +890,7 @@ impl PluginManager {
 
     /// 文件名（不含扩展名）：启用/停用配置的键。
     /// 用文件名而非 PLUGIN_NAME——后者插件作者可随时改，改了配置就失配。
-    fn stem_of(path: &Path) -> String {
+    pub(crate) fn stem_of(path: &Path) -> String {
         path.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("plugin")
@@ -1178,27 +1220,8 @@ impl PluginManager {
 
     /// `scan_meta` 的全部判定（读文件之外的那部分，单独拿出来才测得动）。
     fn scan_meta_source(text: &str, path: &Path) -> PluginManifest {
-        let code = strip_lua_non_code(text);
-        let field = |key: &str| -> Option<String> {
-            code.lines()
-                .find_map(|line| top_level_string_assign(line, key))
-        };
-        let number = |key: &str| -> Option<i64> {
-            code.lines()
-                .find_map(|line| top_level_int_assign(line, key))
-        };
-        build_manifest(DeclaredFields {
-            name: field("PLUGIN_NAME").unwrap_or_else(|| Self::stem_of(path)),
-            desc: field("PLUGIN_DESC"),
-            version: field("PLUGIN_VERSION"),
-            author: field("PLUGIN_AUTHOR"),
-            api: number("PLUGIN_API"),
-            permissions: top_level_table_strings(&code, "PLUGIN_PERMISSIONS"),
-            refresh_ms: number("PLUGIN_REFRESH_MS"),
-            lifecycle: field("PLUGIN_LIFECYCLE"),
-            min_app: field("PLUGIN_MIN_APP"),
-            where_: format!("扫描 {}", Self::stem_of(path)),
-        })
+        let stem = Self::stem_of(path);
+        build_manifest(declared_fields(text, &stem, &format!("扫描 {stem}")))
     }
 
     /// 从 Lua 脚本读取元数据（不执行 init）。
@@ -2623,7 +2646,7 @@ fn reload_requests(
 /// 引号内的 `--` 不当注释（`PLUGIN_DESC = "a -- b"` 整值被抹掉就是假阴性）；
 /// 单行字符串到行尾还没闭合时后半段原样保留（半截文件本来就语法错，别再把手上
 /// 唯一一处真名字也吃掉）。所有切片走 `.get()`：读的是外部文件，release 是 abort。
-fn strip_lua_non_code(src: &str) -> String {
+pub(crate) fn strip_lua_non_code(src: &str) -> String {
     let b = src.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -2748,7 +2771,7 @@ fn newline_from(b: &[u8], i: usize) -> Option<usize> {
 /// - **不 trim 行首空白**：带缩进说明它写在某个块里，函数体里的
 ///   `PLUGIN_NAME = "…"` 只是个局部变量，加载后 `read_meta` 从 globals 里取不到它；
 /// - **不接受 `local KEY = …`**：`local` 的同样不会成为全局变量。
-fn top_level_string_assign(line: &str, key: &str) -> Option<String> {
+pub(crate) fn top_level_string_assign(line: &str, key: &str) -> Option<String> {
     let after_key = line.strip_prefix(key)?.trim_start();
     let value = after_key.strip_prefix('=')?.trim_start();
     let quote = *value.as_bytes().first()?;
@@ -2770,7 +2793,7 @@ fn top_level_string_assign(line: &str, key: &str) -> Option<String> {
 /// 负号**要认**：`PLUGIN_REFRESH_MS = -5` 是"写了但写坏了"，扫出来才谈得上出声一句；
 /// 当成没声明的话，症状恰恰是作者最难受的那种（改了文件，屏上毫无反应）。
 /// 折叠规则本身（负数 ⇒ 缺省 0）在 [`build_manifest`]，两侧共用。
-fn top_level_int_assign(line: &str, key: &str) -> Option<i64> {
+pub(crate) fn top_level_int_assign(line: &str, key: &str) -> Option<i64> {
     let after_key = line.strip_prefix(key)?.trim_start();
     let value = after_key.strip_prefix('=')?.trim_start();
     let digits = value.strip_prefix('-').unwrap_or(value);
@@ -2830,17 +2853,33 @@ fn quoted_strings_in(seg: &str) -> Vec<String> {
 /// 表可以跨行（作者们真会把它写成多行），但起始那一行仍受顶层纪律约束：从第 0 列起正好是
 /// `KEY = {`，`local` 与缩进都不算。只在这一处开始往后读，读到配平的 `}` 为止；
 /// 读不到 `}`（文件被写坏）当"没声明"，交缺省值 —— 加载侧遇到同样的半截表也拿不到东西。
-fn top_level_table_strings(code: &str, key: &str) -> Option<Vec<String>> {
+/// 这一行是不是顶层的 `KEY = {`：是就交出花括号之后剩下的那段。
+pub(crate) fn table_opened_at(line: &str, key: &str) -> Option<String> {
+    let after_key = line.strip_prefix(key)?.trim_start();
+    let value = after_key.strip_prefix('=')?.trim_start();
+    value.strip_prefix('{').map(|s| s.to_string())
+}
+
+/// 某个声明字段落在**原文件**的第几行（1 起）。
+///
+/// 传进来的必须是 [`strip_lua_non_code`] 之后的那一份：它把注释与长字符串整段抹成空格，
+/// 但**逐字保住换行**（`blank_non_code` 只把非代码段里的 `\n` 原样吐回去），所以行号与
+/// 原文件一一对应。判据用上面那三个顶层赋值谓词，与加载侧同一份规则 —— 校验器报的行号
+/// 若与加载侧认的赋值不是同一行，作者就会照着错的那一行改。
+pub(crate) fn field_line(code: &str, key: &str) -> Option<usize> {
+    code.lines().enumerate().find_map(|(i, line)| {
+        (top_level_string_assign(line, key).is_some()
+            || top_level_int_assign(line, key).is_some()
+            || table_opened_at(line, key).is_some())
+        .then_some(i + 1)
+    })
+}
+
+pub(crate) fn top_level_table_strings(code: &str, key: &str) -> Option<Vec<String>> {
     let lines: Vec<&str> = code.lines().collect();
-    /// 这一行是不是顶层的 `KEY = {`：是就交出花括号之后剩下的那段。
-    fn opened_at(line: &str, key: &str) -> Option<String> {
-        let after_key = line.strip_prefix(key)?.trim_start();
-        let value = after_key.strip_prefix('=')?.trim_start();
-        value.strip_prefix('{').map(|s| s.to_string())
-    }
     let mut i = 0;
     while i < lines.len() {
-        let Some(mut buf) = opened_at(lines[i], key) else {
+        let Some(mut buf) = table_opened_at(lines[i], key) else {
             i += 1;
             continue;
         };
