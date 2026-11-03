@@ -24,6 +24,7 @@ pub mod plugin_store;
 pub mod plugin_timers;
 pub mod resources;
 pub mod validate;
+pub mod view_json;
 
 pub use manager::{
     Discovered, DiscoveredPlugin, PluginInfo, PluginLifecycle, PluginManager, PluginManifest,

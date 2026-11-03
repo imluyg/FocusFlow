@@ -11,8 +11,16 @@
 //! · **`new` 生成的那份要能被真加载器装起来**，不是只被这里的尺子说通过 ——
 //!   脚手架自己写坏了，每个照着它写的插件都跟着坏。
 
-use focusflow_core::plugins;
+use focusflow_core::config;
+use focusflow_core::plugins::{self, permissions, PluginSource};
+use focusflow_core::{db, paths};
 use std::path::{Path, PathBuf};
+
+/// `run` 不带 `--data` 时用的那份草稿程序目录。
+///
+/// 放在临时目录而不是当前数据目录，是因为这一条命令要**按声明落一份真授权**：
+/// 那玩意儿落在用户正在用的 `plugins/state/<stem>/grants.json` 里，等于工具替用户点了「同意」。
+const SCRATCH_DIR_NAME: &str = "focusflow-plugin-run";
 
 /// `new <目录>` 时落的那个文件名。stem 决定 `plugins/state/<stem>/` 那一格，
 /// 所以默认名要像一个标识符：小写、下划线、不带空格。
@@ -24,10 +32,15 @@ focusflow-plugin —— 脚本插件作者的工具链
   new <目录|路径.lua>   生成一份脚本插件脚手架（不覆盖已有文件）
   validate <路径.lua>   检查清单：字段会不会被折掉、声明的权限与代码真用到对不对得上
   hash <路径.lua>       打印这份插件的两个哈希（授权绑 permission_hash 那一个）
-  run <路径.lua>        用事件夹具跑一遍插件并输出 JSON —— 还没接
+  run <路径.lua>          用一拍事件夹具把插件跑一遍，把宿主读出来的视图打成 JSON
+      --event <view|timer|app_change|action>   跑哪一拍（缺省 view = 只 init + get_view）
+      --app <应用名>                            app_change 那一拍投出去的就是这个名字
+      --action <动作 id>                        action 那一拍点的按钮
+      --data <程序目录>                          用哪一份程序目录（缺省 = 临时目录，不碰正在用的那份）
 
 退出码：0 = 这件事成了；1 = 有问题、读不出来或命令写错。
-话一律走 stdout，只有「根本没问到」走 stderr —— 挂在上头上的脚本只收 stdout。
+validate / hash 的话一律走 stdout，只有「根本没问到」走 stderr；
+run 反过来 —— JSON 单独占 stdout（要能直接管道给 jq），其余话全走 stderr。
 ";
 
 /// 每条命令最多接受几个位置参数（不含命令本身）。
@@ -109,10 +122,22 @@ fn run(args: &[String]) -> i32 {
             }
         },
         "new" => scaffold(args.get(1).map(String::as_str)),
-        "run" => {
-            eprintln!("run 还没接上（方案 P2 第 18 步：事件夹具 → JSON）");
-            1
-        }
+        "run" => match parse_run(&args[1..]) {
+            Err(why) => {
+                eprintln!("{why}");
+                1
+            }
+            Ok(req) => match run_fixture(&req) {
+                Err(why) => {
+                    eprintln!("{why}");
+                    1
+                }
+                Ok(json) => {
+                    println!("{json}");
+                    0
+                }
+            },
+        },
         other => {
             eprintln!("未知命令：{other}");
             eprint!("{USAGE}");
@@ -231,6 +256,189 @@ function get_view()
 end
 "#
     )
+}
+
+/// 一次夹具跑的全部输入（解析与执行分家：判据要能只问"这串参数读成了什么"）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunReq {
+    file: PathBuf,
+    data: Option<PathBuf>,
+    event: Fixture,
+    app: String,
+    action: String,
+}
+
+/// 跑哪一拍。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fixture {
+    /// 只走加载（`init()`）与取视图
+    View,
+    /// 走一拍 `pump_timers`：到点的定时器与墙钟那两个事件（`tick` / `day_change`）**在同一拍一起到**
+    Timer,
+    /// 先投一个前台应用名，再走同一拍
+    AppChange,
+    /// 点一个按钮动作，然后照常取视图
+    Action,
+}
+
+const EVENT_HINT: &str = "view | timer | app_change | action";
+
+/// 读 `run` 的那串参数。
+///
+/// 少给一个"这条命令问不出答案"的参数就要退非 0：`app_change` 不给名字、`action` 不给 id，
+/// 跑起来都是"插件什么都没干"，而那与"夹具跑了、确实什么都没干"是两件事。
+fn parse_run(args: &[String]) -> Result<RunReq, String> {
+    let mut req = RunReq {
+        file: PathBuf::new(),
+        data: None,
+        event: Fixture::View,
+        app: String::new(),
+        action: String::new(),
+    };
+    let mut i = 0;
+    while i < args.len() {
+        // 取值的那一口要能推进游标，所以写成闭包时把 `i` 的所有权问题留在原地：
+        // 这里手动推进，不用闭包（闭包要同时改 `i` 与读 `args`，两处借用会打架）。
+        let flag = args[i].as_str().to_string();
+        let mut value = |what: &str| -> Result<String, String> {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| format!("{what} 后面要跟一个值（这一问根本没问到）"))
+        };
+        match flag.as_str() {
+            "--data" => req.data = Some(PathBuf::from(value("--data")?)),
+            "--event" => {
+                let v = value("--event")?;
+                req.event = match v.as_str() {
+                    "view" => Fixture::View,
+                    "timer" => Fixture::Timer,
+                    "app_change" => Fixture::AppChange,
+                    "action" => Fixture::Action,
+                    other => {
+                        return Err(format!(
+                            "--event 认不出 {other}（只有 {EVENT_HINT}：名字按 Lua 里 `on(...)` 写的那一套，不是 Rust 侧的钩子名）"
+                        ))
+                    }
+                };
+            }
+            "--app" => req.app = value("--app")?,
+            "--action" => req.action = value("--action")?,
+            other if other.starts_with('-') => {
+                return Err(format!("认不出选项 {other}（-h 看用法）"))
+            }
+            other => {
+                if !req.file.as_os_str().is_empty() {
+                    return Err(format!(
+                        "run 只接一份插件路径，多出来的那一个不会执行：{other}"
+                    ));
+                }
+                req.file = PathBuf::from(other);
+            }
+        }
+        i += 1;
+    }
+    if req.file.as_os_str().is_empty() {
+        return Err("用法: focusflow-plugin run <插件的 .lua 路径> [--event ...]".to_string());
+    }
+    if req.event == Fixture::AppChange && req.app.is_empty() {
+        return Err("app_change 这一拍要给 --app <应用名>：夹具投出去的就是那一个名字".to_string());
+    }
+    if req.event == Fixture::Action && req.action.is_empty() {
+        return Err("action 这一拍要给 --action <动作 id>：点的是控件上那一个 id".to_string());
+    }
+    Ok(req)
+}
+
+/// 把插件真跑一遍，返回宿主读出来的那一份视图 JSON。
+///
+/// 三件事决定了这条命令的价值，都写在实现里而不是文档里：
+/// · **闸是开着的**：授权走产品那一条 `write_grants`、按声明落，落点默认在临时程序目录；
+///   未声明的调用会被当场拒掉，`get_view` 就红在这里 —— 与插件页上看到的是同一件事；
+/// · **身份按位置定**：这份文件会被拷进 `<数据目录>/plugins/` 再以用户插件加载，
+///   所以作者拿到的 API 视图与真装上时一致（拷进内置目录那条路不是这条命令走的）；
+/// · **一拍就是一拍**：`timer` 与 `app_change` 都靠 `pump_timers` 那一拍投递，墙钟那两个
+///   事件在同一拍一起到 —— 工具不假装能单独选中其中一个。
+fn run_fixture(req: &RunReq) -> Result<String, String> {
+    let report = plugins::validate::validate_path(&req.file)
+        .map_err(|e| format!("{e} —— 清单都读不出来，夹具没开始跑"))?;
+    let stem = plugins::manager::PluginManager::stem_of(&req.file);
+
+    let dir = match &req.data {
+        Some(d) => d.clone(),
+        None => std::env::temp_dir().join(SCRATCH_DIR_NAME),
+    };
+    // 顺序要紧：配置那份 OnceLock 是从"当前 app_dir 下的 config.ini"初始化出来的，
+    // 先 instance() 再 set_app_dir() 会让这一跑读的还是上一个目录。
+    paths::set_app_dir(&dir);
+    eprintln!("夹具：程序目录 {}", dir.display());
+
+    let installed = paths::plugins_user_dir().join(format!("{stem}.lua"));
+    std::fs::copy(&req.file, &installed)
+        .map_err(|e| format!("{} 装不进 {}: {e}", req.file.display(), installed.display()))?;
+
+    let declared = report.manifest.permissions.clone();
+    if !declared.is_empty() {
+        let grants = permissions::Grants {
+            permission_hash: permissions::permission_hash(&declared),
+            content_hash: permissions::content_hash(
+                std::fs::read(&installed)
+                    .map_err(|e| format!("{} 的字节读不出来: {e}", installed.display()))?
+                    .as_slice(),
+            ),
+            granted: declared.clone(),
+        };
+        permissions::write_grants(&stem, &grants)
+            .map_err(|e| format!("按声明落授权失败了: {e}"))?;
+        eprintln!(
+            "夹具：已按声明（{}）落了一份授权，位置在 {} 那一格的 grants.json；运行时那道闸照常生效",
+            declared.join(" / "),
+            dir.display()
+        );
+    }
+
+    let config: &'static config::FocusFlowConfig = config::instance();
+    let mut pm = plugins::manager::PluginManager::new(config, db::Database::init_readonly());
+    let name = pm
+        .load_plugin(&installed, PluginSource::User)
+        .map_err(|e| format!("{stem} 装不起来：{e}"))?;
+
+    match req.event {
+        Fixture::View => {}
+        Fixture::Timer => {
+            let ran = pm.pump_timers();
+            eprintln!("夹具：这一拍跑了 {} 格回调", ran.len());
+        }
+        Fixture::AppChange => {
+            // 件口是进程全局的：先清一次，否则上一次跑剩的名字会替这一份"答"出来。
+            plugins::plugin_events::reset_app_change();
+            let posted = plugins::plugin_events::post_app_change(&req.app);
+            let ran = pm.pump_timers();
+            eprintln!(
+                "夹具：投了 \"{}\"（{}），这一拍跑了 {} 格回调",
+                req.app,
+                if posted {
+                    "算是新的一份"
+                } else {
+                    "与件口里那一个同名，没再投"
+                },
+                ran.len()
+            );
+        }
+        Fixture::Action => {
+            pm.plugin_action(&name, &req.action)
+                .map_err(|e| format!("动作 {} 没跑成：{e}", req.action))?;
+            eprintln!("夹具：点了动作 {}", req.action);
+        }
+    }
+
+    pm.refresh_view(&name)
+        .map_err(|e| format!("{stem} 的 get_view 跑不出来：{e}"))?;
+    let view = pm
+        .get_plugin(&name)
+        .and_then(|p| p.view.clone())
+        .ok_or_else(|| format!("{stem} 加载起来了却没有视图（get_view 没返回那一份表？）"))?;
+    Ok(plugins::view_json::view_to_json_string(&view))
 }
 
 #[cfg(test)]
@@ -503,6 +711,208 @@ mod tests {
             "说了不覆盖却改了字节"
         );
         assert_eq!(run(&["new".into()]), 1, "没给路径这一问根本没发生");
+    }
+
+    /// `run` 的参数解析：问不出答案的那几种写法各有出口。
+    ///
+    /// `--event app_change` 不给名字、`--event action` 不给 id 若照样跑，屏上会是一句
+    /// "插件什么都没干"，而那与"夹具跑了、确实什么都没干"是两件事。
+    #[test]
+    fn run_option_parsing_names_what_it_cannot_answer() {
+        let p = |args: &[&str]| -> Vec<String> { args.iter().map(|s| s.to_string()).collect() };
+        assert!(parse_run(&p(&[])).is_err(), "没给路径这一问根本没发生");
+        assert!(
+            parse_run(&p(&["a.lua", "b.lua"])).is_err(),
+            "第二份路径不该被当没看见"
+        );
+        assert!(
+            parse_run(&p(&["a.lua", "--nope"])).is_err(),
+            "认不出的选项要说成认不出"
+        );
+        assert!(
+            parse_run(&p(&["a.lua", "--data"])).is_err(),
+            "--data 后面那个值没给"
+        );
+        let bad_event = parse_run(&p(&["a.lua", "--event", "weekly"])).unwrap_err();
+        assert!(
+            bad_event.contains("view") && bad_event.contains("app_change"),
+            "拒绝那一问要把认得出的那几个名字说出来：{bad_event}"
+        );
+        assert!(
+            parse_run(&p(&["a.lua", "--event", "app_change"])).is_err(),
+            "没给 --app"
+        );
+        assert!(
+            parse_run(&p(&["a.lua", "--event", "action"])).is_err(),
+            "没给 --action"
+        );
+        assert!(parse_run(&p(&[
+            "a.lua",
+            "--event",
+            "app_change",
+            "--app",
+            "记事本.exe"
+        ]))
+        .is_ok());
+        let plain = parse_run(&p(&["a.lua"])).expect("只给路径该读得动");
+        assert_eq!(
+            plain.event,
+            Fixture::View,
+            "缺省那一拍是「只 init + 取视图」"
+        );
+        assert!(plain.data.is_none(), "缺省不该指向某个真目录");
+    }
+
+    /// 夹具那一拍要真的动了手：`--event timer` 之后视图里读的数比 `--event view` 之后大。
+    ///
+    /// 两条腿一起写才算数 —— 只测"跑了 timer 那一拍然后屏上有东西"，摘掉 pump 也一样绿
+    /// （init 里那次写就把数落下了）。这里缺省那一拍核的是"没跑回调时它是 0"。
+    #[test]
+    fn the_timer_beat_actually_runs_the_callback_the_view_beat_does_not() {
+        let _g = guard();
+        let lua = "\
+PLUGIN_NAME = \"beat\"
+PLUGIN_API = 2
+PLUGIN_PERMISSIONS = { \"timer\", \"storage.read\", \"storage.write\" }
+function init()
+  if focusflow.store.get(\"n\") == nil then
+    focusflow.store.set(\"n\", \"0\")
+    focusflow.store.flush()
+  end
+  focusflow.on(\"tick\", function()
+    local cur = tonumber(focusflow.store.get(\"n\")) or 0
+    focusflow.store.set(\"n\", tostring(cur + 1))
+    focusflow.store.flush()
+  end)
+end
+function get_view()
+  return { title = \"beat\", widgets = { { type = \"label\", text = \"n=\" .. tostring(focusflow.store.get(\"n\")) } } }
+end
+";
+        let beat = |event: &str| -> String {
+            // 每一拍都换一份新的草稿目录：状态留在上一份里就分不出是谁写的。
+            // 作者那份源码要放在 plugins/ 之外 —— `run` 会把手上这份拷进数据目录的
+            // plugins/ 里再加载，同源同路径那种写法在 Windows 上直接是一个错。
+            let app = focusflow_core::paths::test_app_dir("run_beat");
+            let author = app.path().join("author");
+            std::fs::create_dir_all(&author).expect("作者目录");
+            let file = author.join("beat.lua");
+            std::fs::write(&file, lua).expect("写夹具");
+            let mut args = vec![
+                file.display().to_string(),
+                "--data".to_string(),
+                app.path().display().to_string(),
+            ];
+            if !event.is_empty() {
+                args.push("--event".to_string());
+                args.push(event.to_string());
+            }
+            let req = parse_run(&args).expect("参数读得动");
+            run_fixture(&req).expect("夹具该跑得动")
+        };
+        let view_only = beat("");
+        assert!(
+            view_only.contains("n=0"),
+            "只取视图那一拍不该跑回调（init 只把计数落成 0）：{view_only}"
+        );
+        let pumped = beat("timer");
+        assert!(
+            pumped.contains("n=1"),
+            "跑了那一拍之后计数该是 1（回调真被执行）：{pumped}"
+        );
+    }
+
+    /// 印出来的是**宿主读出来的那一份**：作者写 95 个点，解析侧夹到上限，工具就该印 90 个。
+    ///
+    /// 这一条是 `run` 存在的理由之一：作者以为画了 95 天，页面上只有最近 90 天。
+    #[test]
+    fn the_json_prints_the_clipped_chart_not_the_written_one() {
+        let _g = guard();
+        let app = focusflow_core::paths::test_app_dir("run_chart");
+        let author = app.path().join("author");
+        std::fs::create_dir_all(&author).expect("作者目录");
+        let file = author.join("clip.lua");
+        std::fs::write(
+            &file,
+            "\
+PLUGIN_NAME = \"clip\"
+PLUGIN_API = 2
+function get_view()
+  local labels = {}
+  local points = {}
+  for i = 0, 94 do
+    labels[i + 1] = \"L\" .. i
+    points[i + 1] = i
+  end
+  return { title = \"clip\", widgets = { { type = \"chart\", kind = \"line\", labels = labels, points = points } } }
+end
+",
+        )
+        .expect("写夹具");
+        let req = parse_run(&[
+            file.display().to_string(),
+            "--data".to_string(),
+            app.path().display().to_string(),
+        ])
+        .expect("参数读得动");
+        let json = run_fixture(&req).expect("夹具该跑得动");
+        let points_at = json.find("\"points\"").expect("JSON 里没有 points");
+        // 切片坐标要落在同一个起点上：`json[at..].find(..)` 给的是**从那一位之后**的偏移，
+        // 直接拿去当 `json` 的结尾用就是越界（这条先是把自己切反了，不是产品的问题）。
+        let tail = &json[points_at..];
+        let block = &tail[..tail.find(']').expect("points 数组没闭合") + 1];
+        let printed = block
+            .lines()
+            .filter(|l| l.contains(|c: char| c.is_ascii_digit()))
+            .count();
+        assert_eq!(
+            printed,
+            focusflow_core::plugins::MAX_CHART_POINTS,
+            "印出来的点数不是解析侧夹过的那一份"
+        );
+        let numbers: Vec<i64> = block
+            .lines()
+            .filter_map(|l| l.trim().trim_end_matches(',').parse::<i64>().ok())
+            .collect();
+        assert_eq!(
+            numbers.first().copied(),
+            Some(5),
+            "夹的是开头那五个点，印出来的第一个数该是 5；不是就说明夹了尾部（最新那段被藏起来了）"
+        );
+        assert_eq!(
+            numbers.last().copied(),
+            Some(94),
+            "最新那一个点（94）必须还在：作者写 95 个点，页面上画的是最近 90 个"
+        );
+        assert!(
+            json.contains("\"title\": \"clip\"") && json.contains("\"type\": \"chart\""),
+            "顶层形状不对：{json}"
+        );
+    }
+
+    /// 视图的词汇表只有一份出处：JSON 必须由 core 那把序列化尺子出，工具不自己排版。
+    #[test]
+    fn the_json_comes_from_core_not_from_a_second_printer() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn run_fixture(req: &RunReq)")
+            .expect("run_fixture 的实现不见了");
+        let rest = &prod[at..];
+        let body = &rest[..rest.find("\n#[cfg(test)]").unwrap_or(rest.len())];
+        assert!(
+            body.contains("plugins::view_json::view_to_json_string("),
+            "视图没走 core 那把序列化尺子（新加一档控件时工具会静悄悄少印一档）"
+        );
+        assert!(
+            body.contains("permissions::write_grants(")
+                && body.contains("load_plugin(&installed, PluginSource::User)"),
+            "夹具要么没落真授权、要么没按用户插件那一格的身份加载 —— 两种都是在关掉闸跑这一条"
+        );
+        assert!(
+            !prod.contains("serde_json"),
+            "工具自己排了一份 JSON（两处排版会分家，而 jq 读的是工具这一份）"
+        );
     }
 
     /// 多出来的参数不能被静悄悄丢掉：`hash a.lua b.lua` 只算 a 而退 0，
