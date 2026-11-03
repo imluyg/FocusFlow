@@ -259,8 +259,23 @@ pub fn register_host_api(
 
     // 每日统计（趋势）：第二个返回值是"这次没读全"的原因（空串 = 读全了），
     // 与上面 `stats` 同一形状 —— `get_daily_counts` 那条二元组口子同样丢掉了 `unreadable`。
+    //
+    // 天数也走 `stats` 那道入口闸：`days.max(1)` 只管下界，`0`（插件作者从 `stats`
+    // 那边抄来的「总计」写法）与 `-5` 都会被抬成一天，交回一段**看起来干净**的稠密序列、
+    // 原因还是空串。上限在这里也不是"炸不了"就算过关 —— 传 40 000 会被悄悄折成
+    // `MAX_QUERY_DAYS`，趋势图上那一段到底覆盖了几天，插件自己说不上来。
     let daily_fn = lua.create_function(|lua, days: i64| {
-        let read = db::daily_counts_totals(days.max(1), None);
+        if !(1..=crate::db::queries::MAX_QUERY_DAYS).contains(&days) {
+            let gap = format!(
+                "focusflow.daily_counts 收到不合法的天数 {days}（可用：1..{} 的整数；\
+                 本接口没有「今日/总计」这两档，要今日请传 1）：这次没有查库",
+                crate::db::queries::MAX_QUERY_DAYS
+            );
+            tracing::warn!("{gap}");
+            let rows = lua.create_table()?;
+            return Ok((rows, gap));
+        }
+        let read = db::daily_counts_totals(days, None);
         let t = lua.create_table()?;
         for (i, (date, count)) in read.series.iter().enumerate() {
             let row = lua.create_table()?;
@@ -1116,6 +1131,59 @@ mod tests {
                 !gap.contains("不合法的周期"),
                 "合法周期 {period} 被当成不合法拒了，实得: {gap}"
             );
+        }
+    }
+
+    /// `daily_counts` 的天数是同一道闸：不合法的那一支不许被 `max(1)` 抬成"一天"。
+    ///
+    /// 上一笔只把 `stats` 的三分 match 设了闸，而这条绑定的写法是 `days.max(1)` ——
+    /// 它守得住下界（`-5`）与上限（`read_daily_pair` 里还有一道 `clamp_query_days`），
+    /// 守不住的是"传进来几天就交回几天"：`0`（插件作者从 `stats` 抄来的「总计」写法）、
+    /// `-5`、`40 000` 都会换回一段**看起来干净**的稠密序列，第二个返回值还是空串。
+    ///
+    /// 三条腿各自盯一件事：被拒的那几问行数必须为 0（光有原因没坏处不算修好）、
+    /// 原因要点名收到的是哪个数、合法那支的行数必须**正好等于问的天数**
+    /// （把守卫写成恒真就红在最后这条，只查"没说不合法"盯不住它）。
+    #[test]
+    fn daily_counts_refuses_a_window_it_cannot_honour() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("host_daily_period");
+        let lua = Lua::new();
+        let database = db::Database::init_readonly();
+        register_host_api(&lua, crate::config::instance(), database, "daily_test")
+            .expect("注册宿主 API");
+
+        for raw in ["-5", "0", "40000"] {
+            let rows: i64 = lua
+                .load(format!("local t = focusflow.daily_counts({raw}) return #t"))
+                .eval()
+                .unwrap_or_else(|e| panic!("daily_counts({raw}) 调不动: {e}"));
+            assert_eq!(rows, 0, "daily_counts({raw}) 被拒了这一问不许交出序列");
+            let gap: String = lua
+                .load(format!(
+                    "local _, g = focusflow.daily_counts({raw}) return g"
+                ))
+                .eval()
+                .unwrap_or_else(|e| panic!("daily_counts({raw}) 的原因要能读: {e}"));
+            assert!(
+                gap.contains("不合法的天数") && gap.contains(raw),
+                "拒绝要说清收到的是哪个数（空原因＝把一段折出来的序列念成完整答案），实得: {gap}"
+            );
+        }
+
+        // 反向腿：合法窗口按问的天数交回，一段不多一段不少。
+        for (raw, want) in [("1", 1i64), ("3", 3), ("36500", 36500)] {
+            let (rows, gap): (i64, String) = lua
+                .load(format!(
+                    "local t, g = focusflow.daily_counts({raw}) return #t, g or ''"
+                ))
+                .eval()
+                .unwrap_or_else(|e| panic!("daily_counts({raw}) 调不动: {e}"));
+            assert!(
+                !gap.contains("不合法的天数"),
+                "合法天数 {raw} 被当成不合法拒了，实得: {gap}"
+            );
+            assert_eq!(rows, want, "问 {want} 天就该交回 {want} 行，实得 {rows} 行");
         }
     }
 
