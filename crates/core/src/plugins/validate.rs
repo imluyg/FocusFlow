@@ -189,6 +189,12 @@ fn used_apis(code: &str) -> Vec<Use> {
                 verb = Some(v);
                 j = k;
             }
+        } else if name == "on" {
+            // `on` 这一格的事件名是**第一个参数**（不是链上的字段）：权限按事件名分
+            // （`app_change` 要 `events.app`，`tick` / `day_change` 要 `timer`），
+            // 所以这里也要把那个字面量读出来，否则"用了没声明"会按整格去判 ——
+            // 作者声明了 events.app 也会被念成"多要的一份权限"。
+            verb = first_string_arg_at(code, j);
         }
         // 行号按命中之前那一段数出来（`strip_lua_non_code` 保住换行 ⇒ 与原文件同一行）。
         // `lines()` 会把这一段末尾那半行也算一行，所以这里不能再 +1。
@@ -219,6 +225,21 @@ fn ident_at(code: &str, i: &mut usize) -> String {
     let s = code.get(*i..j).unwrap_or_default().to_string();
     *i = j;
     s
+}
+
+/// 读 `focusflow.on(` 之后那**一个字符串字面量**的内容（事件名）。
+///
+/// 不是字面量就交回 `None`（按整格判权限）：`on(var)` 这种写法静态读不出来，
+/// 而这一族的判据是"漏报比误报代价低" —— 猜一个事件名会把好插件判成"声明多了"。
+fn first_string_arg_at(code: &str, from: usize) -> Option<String> {
+    let after_paren = code.get(from..)?.trim_start().strip_prefix('(')?;
+    let q = *after_paren.as_bytes().first()?;
+    if q != b'"' && q != b'\'' {
+        return None;
+    }
+    let inner = after_paren.get(1..)?;
+    let end = inner.find(q as char)?;
+    Some(inner.get(..end)?.to_string())
 }
 
 /// 字段本身写坏了的那些：值会被折回缺省的，都是"作者写了却像没写"。
