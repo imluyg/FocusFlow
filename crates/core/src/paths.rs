@@ -410,9 +410,61 @@ pub fn backup_dir() -> PathBuf {
     ensure_dir(data_home().join("backup"))
 }
 
-/// `plugins/` 插件目录，不存在则创建。
+/// `plugins/` 程序目录那一侧的根。**取插件清单别用它**，用 [`plugins_builtin_dir`]
+/// 与 [`plugins_user_dir`] 这两处。
+///
+/// 它还活着的理由只有一个：旧版本把内置与用户插件都平铺在这里，升级时这一批是
+/// 迁移的**源**（`manager.rs` 的 `migrate_legacy_plugins`），并且
+/// `[plugins] legacy_layout = true` 时它仍然是唯一被扫的那一处（回滚）。
+///
+/// 刻意**不建目录**：这两条路都不需要它存在（读不到就是"旧目录里没有插件"），而安装版
+/// 落在 Program Files 时这里写不进去 —— 这些函数会被每秒的插件清单扫描调到，
+/// 建不出来的那句 warn 会变成刷不完的日志。旧版那种"扫之前先建"留在
+/// `manager.rs` 的回滚分支里，只有真要用它的人才建它。
 pub fn plugins_dir() -> PathBuf {
-    ensure_dir(app_dir().join("plugins"))
+    app_dir().join("plugins")
+}
+
+/// `plugins/builtin/`：随包发布的内置模块。程序的一部分，重装即可恢复，因此**只读、不进备份**。
+///
+/// 与 [`plugins_user_dir`] 分开是整套目录分离的地基：安装版落在 Program Files 时这一处
+/// 用户写不进去（也不该写），而备份扫程序目录会把随包脚本当成用户数据一起轮转。
+/// 插件的身份（内置还是用户装的）由**它出自哪一处目录**决定，不由脚本自己写的常量决定。
+pub fn plugins_builtin_dir() -> PathBuf {
+    app_dir().join("plugins").join("builtin")
+}
+
+/// 数据目录那一侧的插件根 `data/plugins/`：用户自己装的脚本插件，可写、跟着数据目录迁移与备份走。
+///
+/// 放在 `data_home()/data/` **里面**而不是 `data_home` 根下，跟 [`screenshots_dir`] 同一个理由：
+/// 搬家逻辑（`data_location.rs`）只走 `data` 与 `backup` 两棵子树，而目标目录根下出现别的
+/// 条目会被当成"陌生人"拒绝切换。
+///
+/// 它的子目录 `state/` 是插件运行时数据（[`plugin_state_dir`]），与插件包分居两处，
+/// 所以算内容哈希时天然扫不到运行时文件。
+pub fn plugins_user_dir() -> PathBuf {
+    ensure_dir(data_dir().join("plugins"))
+}
+
+/// 某个插件的私有运行时数据目录 `data/plugins/state/<stem>/`。
+///
+/// `stem` 必须是**插件文件名**（来自目录扫描，不是插件自己起的展示名，也不是 store 的键）：
+/// 停用列表、授权、状态文件全按文件名走，插件改名不影响这些数据。
+///
+/// 这里对 `stem` 做分隔符检查，是因为它是这条路径上唯一可能被外部字符串喂到的一格：
+/// store 落地之后，插件给的键、config.ini 里被人手改过的 `disabled` 项都会往这儿流。
+/// 一个 `../grants` 就能把"插件私有"变成"碰别人的授权文件"。越界的名字不落盘、只出声。
+pub fn plugin_state_dir(stem: &str) -> PathBuf {
+    let safe = !stem.is_empty() && !stem.contains('/') && !stem.contains('\\') && stem != "..";
+    if !safe {
+        tracing::error!(
+            "插件状态目录的名字不合法（{stem}）：只认插件文件名，不许带路径分隔或 .. —— \
+             本次不落盘，别去 {} 底下找它",
+            data_dir().join("plugins").join("state").display()
+        );
+        return data_dir().join("plugins").join("state");
+    }
+    ensure_dir(data_dir().join("plugins").join("state").join(stem))
 }
 
 /// `config.ini` 配置文件路径。
@@ -423,6 +475,18 @@ pub fn config_path() -> PathBuf {
 /// `window_state.ini` 窗口状态文件路径（易变状态独立存放，与 Python 版一致）。
 pub fn window_state_path() -> PathBuf {
     app_dir().join("window_state.ini")
+}
+
+/// 这一轮**真正该被扫的**插件目录，顺序即身份顺序（内置在前，同名的以随包那份为准）。
+///
+/// 只有这一处说清"扫哪几处"：管理器取清单用它，插件页那一行「目录」也用它。
+/// 抄两份的后果是"清单来自 A、屏上写着 B" —— 用户照屏上那个目录放插件，放下去不加载。
+pub fn plugin_scan_dirs(legacy_layout: bool) -> Vec<PathBuf> {
+    if legacy_layout {
+        vec![plugins_dir()]
+    } else {
+        vec![plugins_builtin_dir(), plugins_user_dir()]
+    }
 }
 
 /// 指定年份的数据库文件路径：`data/focusflow_YYYY.db`。
@@ -604,5 +668,112 @@ mod tests {
             data_home_fallback_notice().is_none(),
             "钉死之后不许再念那句回落"
         );
+    }
+
+    /// 两处插件目录的归属：内置跟程序目录，用户装的跟数据目录，运行时数据在数据目录的 `state/` 下。
+    ///
+    /// 这不是审美问题，是三条后果：
+    /// · 用户插件落在程序目录 ⇒ 安装版写 Program Files 要管理员权限、升级会清掉它、备份扫不到；
+    /// · 内置模块落在数据目录 ⇒ 重装程序不会恢复它，而它是程序的一部分；
+    /// · 用户插件必须在 `data_home()/data/` **里面** ⇒ 搬家逻辑只走 `data` 与 `backup` 两棵子树，
+    ///   放在 `data_home` 根下要么被落在旧目录，要么直接把「更改数据文件夹」挡死
+    ///   （与 [`screenshots_dir`] 同一条理由，那条已有用例钉着）。
+    /// 换数据目录时内置不跟着走：那一处仍是程序目录下面的 `plugins/builtin/`。
+    #[test]
+    fn builtin_plugins_follow_the_app_dir_while_user_plugins_follow_the_data_dir() {
+        let _lock = test_app_dir_lock();
+        let app = test_app_dir("plugin_dirs");
+        set_app_dir(app.path());
+        assert_eq!(
+            plugins_builtin_dir(),
+            app.path().join("plugins").join("builtin")
+        );
+        assert_eq!(
+            plugins_user_dir(),
+            app.path().join("data").join("plugins"),
+            "用户插件必须在 data/ 里面，否则「更改数据文件夹」扫不到它"
+        );
+        assert_eq!(plugins_dir(), app.path().join("plugins"));
+        // 「扫哪几处」只在这一处说：管理器取清单、插件页那一行「目录」都读它
+        assert_eq!(
+            plugin_scan_dirs(false),
+            vec![plugins_builtin_dir(), plugins_user_dir()],
+            "新布局扫两处，且内置在前（同名的以随包那份为准）"
+        );
+        assert_eq!(
+            plugin_scan_dirs(true),
+            vec![plugins_dir()],
+            "回滚开关打开时只扫旧目录、忽略数据目录"
+        );
+        assert!(
+            !plugins_dir().exists(),
+            "旧目录不再被顺手建出来：它只在回滚分支里被创建（见 manager.rs 的 discover_with_source）"
+        );
+        assert!(
+            !plugins_builtin_dir().exists(),
+            "内置目录也不在建目录的手上：安装版落在 Program Files 时这里写不进去，\
+             而插件清单每秒扫一次，建不出的那句 warn 会变成刷不完的日志"
+        );
+
+        // 数据目录换走之后，内置留在程序目录、用户插件跟着搬
+        let elsewhere = app.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(
+            app.path().join("config.ini"),
+            format!("[paths]\ndata_home = {}\n", elsewhere.display()),
+        )
+        .unwrap();
+        set_app_dir(app.path());
+        assert_eq!(
+            plugins_builtin_dir(),
+            app.path().join("plugins").join("builtin"),
+            "内置是程序的一部分，不跟着数据目录搬"
+        );
+        assert_eq!(
+            plugins_user_dir(),
+            elsewhere.join("data").join("plugins"),
+            "用户插件是用户数据，跟着 data_home 走"
+        );
+        assert!(
+            plugins_user_dir().is_dir(),
+            "取用时该已经把目录建好（用户往里放 .lua 才有地方）"
+        );
+    }
+
+    /// 插件的私有数据目录：一处一个子目录，名字不合法时不许跑到别处去。
+    ///
+    /// `state/` 与插件包（`plugins/`）分居两处是刻意的：内容哈希只扫包，运行时文件不会被
+    /// 算进去，卸载插件也不会顺手删掉数据。
+    /// 名字那一格是这条路径上唯一可能被外部字符串喂到的地方（store 的键、config.ini 里
+    /// 手改过的 `disabled` 项都会往这儿流），一个 `../` 就能从"自己的目录"走到"别人的授权"。
+    #[test]
+    fn the_plugin_state_dir_is_one_per_stem_and_cannot_walk_out() {
+        let _lock = test_app_dir_lock();
+        let app = test_app_dir("state_dir");
+        set_app_dir(app.path());
+        let root = data_dir().join("plugins").join("state");
+
+        let mine = plugin_state_dir("mytool");
+        assert_eq!(mine, root.join("mytool"));
+        assert!(mine.is_dir(), "取用时该已经把目录建好");
+        assert_eq!(
+            plugin_state_dir("mytool"),
+            mine,
+            "同一个名字每次算出来是同一处"
+        );
+        assert_ne!(plugin_state_dir("other"), mine, "两个插件不共享一个目录");
+
+        // 越界的名字不落盘、只出声，交回去的路径就是 state/ 那一格本身（不是某个插件的目录）
+        for evil in ["../grants", "..\\x", "a/b", "..", ""] {
+            let (got, logs) = crate::logger::capture_logs(|| plugin_state_dir(evil));
+            assert_eq!(
+                got, root,
+                "越界的名字 {evil} 不该给出一个像样插件目录的路径"
+            );
+            assert!(
+                logs.iter().any(|l| l.contains("不合法") && l.contains(evil)),
+                "越界的名字要点名是哪个、并出声（静默给一个能用的路径等于让它下次真写进去）: {logs:?}"
+            );
+        }
     }
 }

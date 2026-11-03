@@ -49,7 +49,8 @@ $logPath = Join-Path $WorkDir 'focusflow.log'
 "exe : $Exe"
 Stop-App
 New-AppDir $app @('[collector]', 'enabled = false')
-$dst = Join-Path $app 'plugins'
+# 用户自己装的脚本插件从数据目录那一处进清单（data\plugins\），这份夹具就走那一条路。
+$dst = Join-Path $app 'data\plugins'
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 
 # The fixture: a grouped table (single select) with onselect, plus one sel button.

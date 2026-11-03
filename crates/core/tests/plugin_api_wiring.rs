@@ -146,7 +146,7 @@ fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
 #[test]
 fn bundled_plugins_only_call_registered_host_apis() {
     let _g = round7::guard();
-    // 夹具必须活到本用例结束：`paths::plugins_dir()` 读的是进程级 app_dir，
+    // 夹具必须活到本用例结束：`paths::plugins_builtin_dir()` 读的是进程级 app_dir，
     // 而注册表也是在同一个目录里建起来的。
     let app = common::isolated_app_dir("wiring_audit");
     let registered = registered_names(app.path());
@@ -163,7 +163,7 @@ fn bundled_plugins_only_call_registered_host_apis() {
         );
     }
 
-    let dir = paths::plugins_dir();
+    let dir = paths::plugins_builtin_dir();
     let files: Vec<_> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("插件目录读不出来（{}）: {e}", dir.display()))
         .flatten()

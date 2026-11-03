@@ -7,7 +7,7 @@ mod tests {
     use focusflow_core::config::FocusFlowConfig;
     use focusflow_core::db;
     use focusflow_core::paths;
-    use focusflow_core::plugins::manager::PluginManager;
+    use focusflow_core::plugins::manager::{PluginManager, PluginSource};
     use focusflow_core::plugins::Widget;
 
     /// 串行锁（app_dir 全局状态），容忍 poison（测试失败后不阻塞其他）
@@ -34,7 +34,7 @@ mod tests {
         let mut manager = PluginManager::new(config, database);
 
         // 发现插件
-        let files = manager.discover().expect("内置插件目录该读得动");
+        let files = manager.discover_paths().expect("内置插件目录该读得动");
         assert!(
             files.iter().any(|f| f.ends_with("stats_overview.lua")),
             "应发现 stats_overview.lua, got {files:?}"
@@ -88,7 +88,7 @@ mod tests {
         let database = db::Database::init_readonly();
         let mut manager = PluginManager::new(config, database);
 
-        let files = manager.discover().expect("内置插件目录该读得动");
+        let files = manager.discover_paths().expect("内置插件目录该读得动");
         assert!(
             files.len() >= 4,
             "内置插件目录应有至少 4 个插件，实际 {files:?}"
@@ -143,7 +143,7 @@ mod tests {
         let database = db::Database::init_readonly();
         let mut manager = PluginManager::new(config, database);
 
-        let files = manager.discover().expect("内置插件目录该读得动");
+        let files = manager.discover_paths().expect("内置插件目录该读得动");
         let file = files
             .iter()
             .find(|f| f.ends_with("accounting_plugin.lua"))
@@ -246,7 +246,7 @@ mod tests {
         let database = db::Database::init_readonly();
         let mut manager = PluginManager::new(config, database);
 
-        let files = manager.discover().expect("内置插件目录该读得动");
+        let files = manager.discover_paths().expect("内置插件目录该读得动");
         let file = files
             .iter()
             .find(|f| f.ends_with("accounting_plugin.lua"))
@@ -442,7 +442,7 @@ mod tests {
         ));
         let mut manager = PluginManager::new(config, db::Database::init_readonly());
         let file = manager
-            .discover()
+            .discover_paths()
             .expect("内置插件目录该读得动")
             .into_iter()
             .find(|f| f.ends_with("stats_overview.lua"))
@@ -523,11 +523,17 @@ mod tests {
         // ② 它和其它并行用例抢同一块地盘（同一份源文件既被读又被写）。
         // 现在整份搬进临时目录，改的是自己的副本，仓库字节全程不动。
         let root = std::env::temp_dir().join(format!("ff_hotreload_{}", std::process::id()));
-        std::fs::create_dir_all(root.join("plugins")).unwrap();
+        // 落点是 `plugins/builtin/`：随包脚本从内置目录进清单，而热重载线程 watch 的正是
+        // 清单来自的那几处。写进旧的平铺 `plugins/` 也能被加载（走迁移复制那一条路），但
+        // 那会改到"迁移目标"那一份，用例改原件的 mtime 没人看得见。
+        std::fs::create_dir_all(root.join("plugins").join("builtin")).unwrap();
         let shipped = std::env::current_dir()
             .unwrap()
             .join("plugins/stats_overview.lua");
-        let copy = root.join("plugins/stats_overview.lua");
+        let copy = root
+            .join("plugins")
+            .join("builtin")
+            .join("stats_overview.lua");
         std::fs::copy(&shipped, &copy).unwrap();
         let _root = TempRoot(root.clone());
 
@@ -542,7 +548,7 @@ mod tests {
 
         // 加载
         let file = manager
-            .discover()
+            .discover_paths()
             .expect("内置插件目录该读得动")
             .into_iter()
             .find(|f| f.ends_with("stats_overview.lua"))
@@ -612,7 +618,7 @@ mod tests {
         let database = db::Database::init_readonly();
         let mut manager = PluginManager::new(config, database);
         let file = manager
-            .discover()
+            .discover_paths()
             .expect("内置插件目录该读得动")
             .into_iter()
             .find(|f| f.ends_with("scheduler_plugin.lua"))
@@ -691,7 +697,7 @@ mod tests {
         let database = db::Database::init_readonly();
         let mut manager = PluginManager::new(config, database);
         let file = manager
-            .discover()
+            .discover_paths()
             .expect("内置插件目录该读得动")
             .into_iter()
             .find(|f| f.ends_with("accounting_plugin.lua"))
@@ -757,7 +763,7 @@ mod tests {
         ));
         let mut manager = PluginManager::new(config, db::Database::init_readonly());
         let file = manager
-            .discover()
+            .discover_paths()
             .expect("内置插件目录该读得动")
             .into_iter()
             .find(|f| f.ends_with("accounting_plugin.lua"))
@@ -2558,5 +2564,98 @@ mod tests {
             "仓库根 plugins/ 与随包副本分叉了：\n{}",
             bad.join("\n")
         );
+    }
+
+    /// 目录分离这两步的验收：**现有五个随包脚本一个字没改**，从内置目录全部加载得出视图。
+    ///
+    /// 三条腿各盯一件事，缺一条都会留下假绿：
+    /// ① 五个都在清单里、来源全标内置 —— 少了就是"随包脚本从此加载不上"（最糟的回归形状：
+    ///    打包脚本没跟着改，`plugins/builtin/` 是空的，而插件页只说"暂无插件"）；
+    /// ② 每一个都能 load_plugin 出视图 —— 清单里有不等于跑得起；
+    /// ③ 夹具里那五份字节与 `crates/core/plugins/` 逐字节相同、且不含 `PLUGIN_API`
+    ///    这类新manifest字段 —— 这两步只改宿主读哪里，不改脚本；一旦"为了过测试改脚本"
+    ///    发生，①②照样绿而"零改动"这条已经输了。
+    #[test]
+    fn the_five_bundled_scripts_load_from_the_builtin_dir_untouched() {
+        let _guard = guard();
+        let app = crate::common::isolated_app_dir("five_builtin");
+        let dir = app.path();
+
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(dir.join("config.ini")).unwrap(),
+        ));
+        let mut manager = PluginManager::new(config, db::Database::init_readonly());
+
+        let found = manager
+            .discover()
+            .expect("内置目录该读得动")
+            .into_iter()
+            .map(|f| {
+                (
+                    f.path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    f.source,
+                )
+            })
+            .collect::<Vec<_>>();
+        let want = [
+            "accounting_plugin",
+            "pomodoro_plugin",
+            "scheduler_plugin",
+            "edge_history_plugin",
+            "stats_overview",
+        ];
+        for stem in want {
+            assert!(
+                found
+                    .iter()
+                    .any(|(s, src)| s == stem && *src == PluginSource::Builtin),
+                "随包脚本 {stem} 没从内置目录进清单（或来源被贴错）: {found:?}"
+            );
+        }
+        assert_eq!(
+            found.len(),
+            want.len(),
+            "清单比随包的五份多了或少了条目: {found:?}"
+        );
+
+        for stem in want {
+            let path = dir
+                .join("plugins")
+                .join("builtin")
+                .join(format!("{stem}.lua"));
+            let name = manager
+                .load_plugin(&path)
+                .unwrap_or_else(|e| panic!("加载随包脚本 {stem} 失败: {e}"));
+            let info = manager.get_plugin(&name).expect("插件应已注册");
+            assert!(
+                info.view.is_some(),
+                "{name}（{stem}）应渲染出视图 —— 这两步不该让任何一个面板空白"
+            );
+        }
+
+        // ③ 零改动：夹具那五份就是仓库随包那五份的字节，且没被加上新的清单字段
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+        for stem in want {
+            let repo = std::fs::read(shipped.join(format!("{stem}.lua")))
+                .expect("随包脚本读不出来（CARGO_MANIFEST_DIR/plugins 变了？）");
+            let fixture = std::fs::read(
+                dir.join("plugins")
+                    .join("builtin")
+                    .join(format!("{stem}.lua")),
+            )
+            .expect("夹具那份不在了");
+            assert_eq!(repo, fixture, "{stem}.lua 被改过就不是「零改动加载」了");
+            let text = String::from_utf8_lossy(&repo);
+            for field in ["PLUGIN_API", "PLUGIN_PERMISSIONS", "PLUGIN_LIFECYCLE"] {
+                assert!(
+                    !text.contains(field),
+                    "{stem}.lua 里出现了新清单字段 {field} —— 这两步只改宿主读哪里"
+                );
+            }
+        }
     }
 }

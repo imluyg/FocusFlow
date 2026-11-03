@@ -26,7 +26,8 @@ Stop-App
 $app = Join-Path $WorkDir 'app'
 New-AppDir $app @('[collector]', 'enabled = false')
 # The probe copy only carries its own plugins; add the shipped ones so accounting_plugin is there.
-$dst = Join-Path $app 'plugins'
+# 落点是 plugins\builtin\：随包内置模块从程序目录的那一处加载（旧版平铺的 plugins\ 只当迁移源）。
+$dst = Join-Path $app 'plugins\builtin'
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 # The shipped copy lives with the core crate; the repo-root plugins/ twin was deleted by name
 # on 2026-10-30, so pointing here is the only path that exists on a fresh clone.

@@ -33,7 +33,7 @@ REM reusing it would ship those leftovers inside the zip and the installer.)
 set DIST=%ROOT%dist\FocusFlow-%VERSION%
 if exist "%DIST%" rmdir /s /q "%DIST%"
 mkdir "%DIST%"
-mkdir "%DIST%\plugins"
+mkdir "%DIST%\plugins\builtin"
 mkdir "%DIST%\data"
 copy /y "%ROOT%target\release\FocusFlow.exe" "%DIST%\FocusFlow.exe" >nul
 REM No assets\ in the package: build.rs embeds assets\focusflow.ico into the exe as its
@@ -42,7 +42,10 @@ REM files again only duplicated the icon (and a .png no code reads) inside the z
 REM No config.ini in the package: the repo-root one is gitignored and is the developer's
 REM local file, so it drifts from default_config() (e.g. scroll_burst_window 0.8 vs 0.25).
 REM The app writes the code defaults on first run, which is what a fresh install should get.
-copy /y "%ROOT%crates\core\plugins\*.lua" "%DIST%\plugins\" >nul
+REM Builtin modules ship under plugins\builtin\ (read-only-as-shipped, never backed up);
+REM user-installed scripts live in the data dir (data\plugins\). The flat plugins\ is only
+REM a migration source now, so the app never has to write into Program Files to load a plugin.
+copy /y "%ROOT%crates\core\plugins\*.lua" "%DIST%\plugins\builtin\" >nul
 
 echo [3/5] Packing portable zip...
 set ZIP=%ROOT%dist\FocusFlow-%VERSION%-win64.zip

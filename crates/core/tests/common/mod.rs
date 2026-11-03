@@ -16,18 +16,23 @@
 
 use focusflow_core::paths;
 
-/// 建一个隔离的临时程序目录，把随包插件复制进去、把表建好，并把全局 `app_dir` 锚过去。
+/// 建一个隔离的临时程序目录，把随包插件复制进**内置目录**、把表建好，并把全局 `app_dir` 锚过去。
 ///
 /// 返回值守着期间目录可用，离开作用域（含 panic 路径）自动删除并把 `app_dir` 恢复到
 /// 哨兵 —— 那套收尾逻辑在 `paths::TestAppDir::drop` 里，不在这里重抄。
 /// 调用方必须自己持有本文件的串行守卫：切换的是进程级全局目录。
+///
+/// 复制的落点是 `plugins/builtin/` 而不是旧的 `plugins/`：随包的五个 `.lua` 走的就是那一处
+/// （`build_native.bat` 把 `crates\core\plugins\*` 拷进 `dist\plugins\builtin\`）。
+/// 放进旧的平铺 `plugins/` 也能被加载 —— 但那是靠"迁移复制到数据目录"那一条路进去的，
+/// 于是这些用例测的其实是迁移，而不是随包内置模块的加载，且来源会被标成用户插件。
 pub fn isolated_app_dir(tag: &str) -> paths::TestAppDir {
     let app = paths::test_app_dir(&format!("plugins_{tag}"));
     let shipped = std::env::current_dir()
         .expect("集成测试的 cwd 是 crates/core")
         .join("plugins");
-    let dst = app.path().join("plugins");
-    std::fs::create_dir_all(&dst).expect("建临时 plugins 目录");
+    let dst = app.path().join("plugins").join("builtin");
+    std::fs::create_dir_all(&dst).expect("建临时内置插件目录");
     let mut copied = 0usize;
     for entry in std::fs::read_dir(&shipped).unwrap_or_else(|e| {
         panic!("读随包 plugins 目录 {} 失败: {e}", shipped.display());

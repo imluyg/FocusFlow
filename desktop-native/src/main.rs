@@ -7482,7 +7482,15 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             &format!(
                 "{} 个 · 目录 {}",
                 rows.len(),
-                focusflow_core::paths::plugins_dir().display()
+                // 这一行说的必须是清单真正来自的那几处：抄一份"内置 + 数据目录"的字面量，
+                // 用户开着回滚开关时就会照屏上那个目录放插件、放下去不加载。
+                focusflow_core::paths::plugin_scan_dirs(
+                    focusflow_core::config::instance().get_bool("plugins", "legacy_layout", false)
+                )
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" / ")
             ),
             &p.fmt.caption,
             520.0,
@@ -15081,7 +15089,7 @@ mod clip_tests {
             // 插件第二行：两个分支共用 desc_w（所以这一针本来就是两处）
             ("p.clip(&text,&p.fmt.caption,desc_w),rect(r.left+8.0,y+23.0,desc_w,16.0)", 1),
             ("&p.fmt.caption,desc_w)", 2),
-            ("p.clip(&format!(\"{}个·目录{}\",rows.len(),focusflow_core::paths::plugins_dir().display()),&p.fmt.caption,520.0)", 1),
+            ("p.clip(&format!(\"{}个·目录{}\",rows.len(),focusflow_core::paths::plugin_scan_dirs(focusflow_core::config::instance().get_bool(\"plugins\",\"legacy_layout\",false)).iter().map(|d|d.display().to_string()).collect::<Vec<_>>().join(\"/\")),&p.fmt.caption,520.0)", 1),
             ("p.clip(&format!(\"插件目录读不出来：{e}\"),&p.fmt.caption,card.right-card.left-32.0)", 1),
             // 值框：夹取与画它的矩形共用 val_w（那一格还要给右边的按钮让位）
             ("p.clip(shown,&p.fmt.text13,val_w),rect(vb.left+8.0,vb.top,val_w,vb.bottom-vb.top)", 1),

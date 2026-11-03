@@ -69,7 +69,15 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     // 插件沙箱的两个上限（manager.rs 读；超限的插件会被标记为不可用）
     s(
         "plugins",
-        &[("memory_limit_mb", "16"), ("instruction_limit", "10000000")],
+        &[
+            ("memory_limit_mb", "16"),
+            ("instruction_limit", "10000000"),
+            // 回滚开关（读者：`plugins::manager` 的目录选择）。默认**关**：
+            // true = 只扫旧的 `app_dir/plugins/` 平铺目录、忽略 `data/plugins/`，
+            // 行为退回目录分离之前那一版，用于线上出问题时让用户先跑起来。
+            // 开关只保留一个版本；开着时迁移照旧不删旧目录，所以关掉之后副本还在。
+            ("legacy_layout", "false"),
+        ],
     );
     // 设备维度采集的总开关（device_stats.rs 读它；关掉只停采集，历史不动）
     s("device_stats", &[("enabled", "true")]);

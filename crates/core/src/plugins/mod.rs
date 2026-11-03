@@ -18,7 +18,7 @@
 pub mod host;
 pub mod manager;
 
-pub use manager::{DiscoveredPlugin, PluginInfo, PluginManager};
+pub use manager::{Discovered, DiscoveredPlugin, PluginInfo, PluginManager, PluginSource};
 
 pub use self::Widget as WidgetT;
 

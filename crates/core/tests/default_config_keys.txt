@@ -31,6 +31,7 @@ listener/scroll_burst_window
 paths/data_home
 paths/data_migrate_from
 plugins/instruction_limit
+plugins/legacy_layout
 plugins/memory_limit_mb
 pomodoro/auto_break
 pomodoro/break_minutes

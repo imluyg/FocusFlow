@@ -66,6 +66,39 @@ pub struct PluginInfo {
     pub view: Option<PluginView>,
 }
 
+/// 插件出自哪一处目录，即它的**身份**。
+///
+/// 身份由位置决定，不由脚本自己写的常量决定（见 `docs/plugin-system-rework-plan.md` 3.1）：
+/// 允许脚本写 `PLUGIN_KIND = "builtin"` 来免授权，权限模型第一天就失效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginSource {
+    /// `app_dir/plugins/builtin/`：随包发布的内置模块。
+    Builtin,
+    /// `data_dir/plugins/`：用户自己装的脚本插件。
+    User,
+    /// `[plugins] legacy_layout = true` 那条回滚分支里唯一被扫的旧目录（平铺的 `app_dir/plugins/`）。
+    /// 这个变体只服务回滚，开关删掉时一起删。
+    Legacy,
+}
+
+impl PluginSource {
+    /// 给日志用的一行名字（启动那一行要说清两处各拿到几个）。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "内置",
+            Self::User => "用户",
+            Self::Legacy => "旧目录",
+        }
+    }
+}
+
+/// 一处目录里扫到的一个插件文件（[`PluginManager::discover`] 的返回项）。
+#[derive(Debug)]
+pub struct Discovered {
+    pub path: PathBuf,
+    pub source: PluginSource,
+}
+
 /// 插件元数据（从 Lua 脚本读取）。
 struct PluginMeta {
     name: String,
@@ -91,6 +124,59 @@ pub struct DiscoveredPlugin {
     pub loaded: bool,
     /// 加载错误信息（启用但加载失败时展示）
     pub error: Option<String>,
+    /// 出自哪一处目录 = 它是内置模块还是用户装的插件。
+    ///
+    /// 今天的读者是启动那一行日志（`load_all`）；插件页按两栏分组显示是路线图 P0 第 8 步，
+    /// 不在本次改动里。
+    pub source: PluginSource,
+}
+
+/// 随包内置模块的文件名白名单。
+///
+/// 迁移旧平铺目录时用它把「随包的内置模块」与「用户自己装的第三方脚本」分开：白名单里的
+/// 名字由 `plugins/builtin/` 那一份提供（随包发布、升级覆盖），旧目录里的同名残留**不搬进
+/// 数据目录** —— 搬过去就变成两条同 stem 的清单条目，而"用户改过的内置脚本从此以用户插件
+/// 的身份活着"也与「升级覆盖内置脚本」这条既有行为相反。
+const BUILTIN_PLUGIN_STEMS: &[&str] = &[
+    "accounting_plugin",
+    "pomodoro_plugin",
+    "scheduler_plugin",
+    "edge_history_plugin",
+    "stats_overview",
+];
+
+/// 迁移标记的文件名，落在数据目录那一侧（`data/plugins/.migrated`）。
+const MIGRATION_MARKER: &str = ".migrated";
+
+/// 「同一件事本进程只说一次」的登记处。
+///
+/// 为什么需要它：`discover()` 不是只在启动跑一次，插件页开着时每秒重扫一遍。迁移这件事
+/// 里的冲突、失败、旧目录残留都是**盘上的稳定状态**，每秒说一次就把日志刷满，而一次说清
+/// 才是有用的那条。按完整路径记，用例之间各用各的临时目录，互不吃对方的登记。
+static NOTICED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// 这个键第一次出现时返回 `true`（该出声），之后返回 `false`（说过就别再刷）。
+fn notice_once(key: &str) -> bool {
+    let slot = NOTICED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    slot.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.to_string())
+}
+
+/// 旧平铺目录搬进数据目录的一轮结果（`migrate_legacy_plugins` 交回，由调用方决定怎么说）。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MigrationReport {
+    /// 这一轮复制成功的文件名（不带 `.lua`）
+    copied: Vec<String>,
+    /// 数据目录已有同名文件 ⇒ 不动它，以数据目录那份为准
+    conflicts: Vec<String>,
+    /// 白名单里的内置名字：由 `plugins/builtin/` 提供，不搬
+    builtin_kept: Vec<String>,
+    /// 复制失败的文件名 + 原因
+    failed: Vec<(String, String)>,
+    /// 旧目录读不出来的原因（`None` = 读得动，含"目录本来就不存在"）
+    unreadable: Option<String>,
 }
 
 /// 插件管理器（GUI 线程专用，不跨线程共享）。
@@ -160,23 +246,168 @@ const MAX_WIDGET_DEPTH: u32 = 32;
 /// 或这一瞬间目录被换成另一份两种可能。带路径分隔或 `..` 的名字**不走存在性检查**：
 /// 那是把这里变成"文件存在预言机"，而这个 crate 的插件表本就是外部数据
 /// （沙箱那段的注释防的就是这类通道）。
-fn missing_plugin_reason(dir: &Path, stem: &str) -> String {
+///
+/// `dirs` 是这一轮真正被扫的那几处（内置 + 数据目录，回滚开关打开时只有旧目录一处）：
+/// 只问其中一处的话，另一处明明有这个名字的文件会被说成「插件文件不存在」。
+fn missing_plugin_reason(dirs: &[PathBuf], stem: &str) -> String {
     let simple =
         !stem.is_empty() && !stem.contains('/') && !stem.contains('\\') && !stem.contains("..");
-    if simple && dir.join(format!("{stem}.lua")).is_file() {
+    if simple && dirs.iter().any(|d| d.join(format!("{stem}.lua")).is_file()) {
         return format!("插件目录这一轮没扫到 {stem}（目录被占用或正在整份替换），请再试一次");
     }
     format!("插件文件不存在: {stem}")
+}
+
+/// 把旧版平铺在 `app_dir/plugins/` 的用户插件搬进数据目录（runbook 12.2 的前三条）。
+///
+/// 四条纪律，一条都不能少：
+/// · **只复制、不移动**：旧目录的原件全留。它是回滚的退路 —— `[plugins] legacy_layout = true`
+///   只认旧目录，搬走等于把那条开关变成"请重新下载一遍插件"。
+/// · **同名不覆盖**：数据目录那一份赢。用户已经在新目录放过同名文件，那才是他要跑的。
+/// · **复制失败只记 error、不阻塞**：权限不足、文件被占用、磁盘满都只让那一个文件留在原地。
+///   把"搬不动"变成"起不来"是不可逆操作里最糟的一种错法。
+/// · 白名单里的内置名字不搬（见 [`BUILTIN_PLUGIN_STEMS`]），由 `plugins/builtin/` 那份提供。
+///
+/// 两个目录都是参数（不读进程全局）：用例按路径钉每一条纪律，别的用例换过一次 `app_dir`
+/// 就不该影响这里。`NotFound` 算"旧目录里什么都没有"，与 [`list_lua_plugins`] 同一个口径。
+fn migrate_legacy_plugins(legacy_dir: &Path, user_dir: &Path) -> MigrationReport {
+    let mut report = MigrationReport::default();
+    let files = match list_lua_plugins(legacy_dir) {
+        Ok(files) => files,
+        Err(e) => {
+            report.unreadable = Some(e);
+            return report;
+        }
+    };
+    for path in files {
+        let stem = PluginManager::stem_of(&path);
+        if BUILTIN_PLUGIN_STEMS.contains(&stem.as_str()) {
+            report.builtin_kept.push(stem);
+            continue;
+        }
+        let dst = user_dir.join(path.file_name().unwrap_or_default());
+        if dst.exists() {
+            report.conflicts.push(stem);
+            continue;
+        }
+        // 目标目录还没建（全新安装、或上一轮没走到这里）：建不出来的原因交给下面的 copy 报，
+        // 不在这里单独分一支 —— 那一支的结局同样是"没搬动，只记 error"。
+        match std::fs::copy(&path, &dst) {
+            Ok(_) => report.copied.push(stem),
+            Err(e) => report.failed.push((stem, e.to_string())),
+        }
+    }
+    report
+}
+
+/// 跑一轮迁移并把结局说干净（`discover()` 的新布局分支调用；它自己不报错也不让谁报错）。
+///
+/// 标记（12.2 第 4 步）写在数据目录那一侧，语义是「已经搬过一轮」：搬成功之后不再重搬。
+/// 这里刻意**照旧每轮读一次旧目录**，因为今天装插件的唯一办法就是往目录里扔文件 ——
+/// 若按标记整个跳过，扔进旧目录的新插件会永远不被加载而一声不吭（静默失效）。
+/// 跳过的是复制，报出来的是"旧目录里有一份数据目录没有的名字"，用户照着搬或删标记都能修。
+///
+/// 只复制一次：`[plugins] legacy_layout = true` 那条回滚分支根本不走这里。
+fn run_legacy_migration(legacy_dir: &Path, user_dir: &Path) {
+    let migrated = user_dir.join(MIGRATION_MARKER);
+    let already = migrated.is_file();
+    let report = migrate_legacy_plugins(legacy_dir, user_dir);
+
+    if let Some(e) = &report.unreadable {
+        // 旧目录读不出来不影响新布局：内置在程序目录、用户在数据目录，两处都不靠它。
+        tracing::error!("{e}；旧目录这一轮搬不动也不影响加载（回滚开关才读它）");
+        return;
+    }
+    for (stem, e) in &report.failed {
+        tracing::error!(
+            "旧插件没搬进数据目录（{stem}）：{e} —— 原件留在 {}，本次继续用数据目录那份清单，\
+             不阻塞启动",
+            legacy_dir.display()
+        );
+    }
+    for stem in &report.conflicts {
+        if notice_once(&format!("conflict:{}", stem)) {
+            tracing::warn!(
+                "旧目录与数据目录各有一份 {stem}：不动数据目录那份（以它为准），\
+                 {} 里的同名原件保留不覆盖",
+                legacy_dir.display()
+            );
+        }
+    }
+    for stem in &report.builtin_kept {
+        if notice_once(&format!("builtin:{}", stem)) {
+            tracing::info!(
+                "{stem} 是内置模块，由 {} 那一份提供，不搬进数据目录",
+                legacy_dir.display()
+            );
+        }
+    }
+    if !report.copied.is_empty() && !already {
+        // 标记只在"这一轮真的搬了东西"之后写：一次都没搬成（全新安装、旧目录本来就空）
+        // 留着它没有意义，下一次启动该照样看见用户新扔进来的文件。
+        if let Err(e) = std::fs::write(&migrated, b"legacy plugins copied\n") {
+            tracing::warn!(
+                "迁移标记写不进去（{}）：{e} —— 下次启动会重搬一轮，同名不覆盖，无害",
+                migrated.display()
+            );
+        }
+        tracing::info!(
+            "旧目录的 {} 个用户插件已复制到数据目录（原件没动）：{}",
+            report.copied.len(),
+            report.copied.join(", ")
+        );
+    }
+    if already {
+        // 搬过一轮之后，旧目录里再出现"数据目录没有的"名字 = 用户往一个不再被扫的目录里
+        // 扔了文件。不说出来的话，症状就是"我放了插件但插件页没有"。
+        let user_stems: Vec<String> = list_lua_plugins(user_dir)
+            .unwrap_or_default()
+            .iter()
+            .map(|p| PluginManager::stem_of(p))
+            .collect();
+        for stem in list_lua_plugins(legacy_dir)
+            .unwrap_or_default()
+            .iter()
+            .map(|p| PluginManager::stem_of(p))
+            .filter(|s| !BUILTIN_PLUGIN_STEMS.contains(&s.as_str()))
+            .filter(|s| !user_stems.iter().any(|u| u == s))
+        {
+            if notice_once(&format!("stale:{stem}")) {
+                tracing::warn!(
+                    "{stem}.lua 只在旧目录 {} 里，而迁移标记已在（不再重搬）：\
+                     把它复制到 {}，或删掉 {} 让下次启动重搬一轮",
+                    legacy_dir.display(),
+                    user_dir.display(),
+                    migrated.display()
+                );
+            }
+        }
+    }
+}
+
+/// 路径上最深的那一格存在、但它不是目录 ⇒ 这个"不存在"的目录是被**文件堵住**的。
+///
+/// `read_dir` 对两种情况都报 `NotFound`：父级整条不存在（全新安装，真的一个插件都没有），
+/// 以及父级里有一格是普通文件（`app_dir/plugins` 被建成同名文件，它底下的 `builtin/`
+/// 就取不到了）。后者的症状是"5 个插件全在盘上，插件页却写着暂无插件" ——
+/// 把它折成空清单正是这套护栏当初要修的那件事。
+fn blocked_by_a_file(dir: &Path) -> bool {
+    dir.ancestors()
+        .take_while(|p| p.parent().is_some())
+        .find(|p| p.try_exists().unwrap_or(false))
+        .map(|p| !p.is_dir())
+        .unwrap_or(false)
 }
 
 /// 读一个插件目录，回 `(排序后的 .lua 清单)`，或者**这个目录读不出来的原因**。
 ///
 /// 三种结局要分开：
 /// · 读得动 ⇒ `Ok(清单)`，哪怕清单是空的（那就是"目录里真没有插件"）；
-/// · `NotFound` ⇒ `Ok(空)`：整个目录不存在就是"一个插件都没有"，全新安装是这个形状，
-///   把它报成错误会让第一次打开插件页的人看见一句红字"读不出来"；
-/// · 其余错误码 ⇒ `Err(带上路径与原因)`：`plugins` 被建成同名文件、整份放在断线的网盘上、
-///   移动盘休眠、杀软首扫握着句柄、构建脚本正在整份替换目录 —— 这些时候盘上**有**插件，
+/// · `NotFound` 且路径上没有被文件堵住 ⇒ `Ok(空)`：整个目录不存在就是"一个插件都没有"，
+///   全新安装是这个形状，把它报成错误会让第一次打开插件页的人看见一句红字"读不出来"；
+/// · 其余错误码，或 `NotFound` 但被一格普通文件堵住 ⇒ `Err(带上路径与原因)`：
+///   `plugins` 被建成同名文件、整份放在断线的网盘上、移动盘休眠、杀软首扫握着句柄、
+///   构建脚本正在整份替换目录 —— 这些时候盘上**有**插件，
 ///   把它们折成空清单就是谎报"暂无插件"。
 ///
 /// 单独收一个 `dir` 参数（而不是挂在 `&self` 上）是为了让三种结局都能被用例直接按路径钉住：
@@ -188,7 +419,9 @@ fn list_lua_plugins(dir: &Path) -> Result<Vec<PathBuf>, String> {
             .map(|e| e.path())
             .filter(|p| p.extension().map(|e| e == "lua").unwrap_or(false))
             .collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !blocked_by_a_file(dir) => {
+            return Ok(Vec::new())
+        }
         Err(e) => {
             return Err(format!(
                 "插件目录读不出来（{}）：{e} —— 这不是「没有插件」",
@@ -356,9 +589,21 @@ impl PluginManager {
         tracing::error!("插件已停用: {name}: {msg}");
     }
 
-    /// 插件目录。
-    fn plugins_dir(&self) -> PathBuf {
-        paths::plugins_dir()
+    /// `[plugins] legacy_layout`：回滚开关。`true` = 只扫旧的平铺目录 `app_dir/plugins/`，
+    /// 忽略数据目录，行为退回目录分离之前那一版（runbook 12.4）。保留一个版本，之后连分支一起删。
+    fn legacy_layout(&self) -> bool {
+        self.config.get_bool("plugins", "legacy_layout", false)
+    }
+
+    /// 这一轮真正被扫的插件目录：内置在程序目录、用户在数据目录；回滚开关打开时只剩旧目录一处。
+    ///
+    /// 顺序就是身份的顺序：内置在前。同名的两条（用户把内置脚本复制了一份放进数据目录）
+    /// 以程序目录那份为准 —— 内置模块随包发布、升级覆盖，这是它唯一的权威来源。
+    ///
+    /// 热重载线程与"文件还在不在"的检查都从这里取目录，所以它必须和 [`Self::discover`]
+    /// 同一把尺子：两处各说一套，就会出现"清单在 A、监视在 B"的错位。
+    fn plugin_dirs(&self) -> Vec<PathBuf> {
+        paths::plugin_scan_dirs(self.legacy_layout())
     }
 
     /// 文件名（不含扩展名）：启用/停用配置的键。
@@ -407,11 +652,11 @@ impl PluginManager {
         // 扫一次，两次判断共用同一份清单：原先这里扫一遍、启用时再扫一遍，
         // 目录正在被整份替换时两半能各读到不同的东西（前一半说"在"、后一半找不到那个文件，
         // 于是配置写了、插件却没加载，页面还报成功）。
-        let files = self.discover()?;
+        let files = self.discover_paths()?;
         if !files.iter().any(|p| Self::stem_of(p) == stem) {
             // 以前这里是 `return Ok(())`：命令层把 Ok 当成功，前端弹「插件已启用」，
             // 而配置一个字没改 —— 对着一个不存在的插件报成功。
-            let reason = missing_plugin_reason(&self.plugins_dir(), stem);
+            let reason = missing_plugin_reason(&self.plugin_dirs(), stem);
             tracing::warn!("启用插件被拒（{stem}）: {reason}");
             return Err(reason);
         }
@@ -474,7 +719,9 @@ impl PluginManager {
         Ok(self
             .discover()?
             .into_iter()
-            .map(|path| {
+            .map(|found| {
+                let path = found.path;
+                let source = found.source;
                 let stem = Self::stem_of(&path);
                 let enabled = !disabled.iter().any(|s| s.as_str() == stem);
                 if let Some(info) = self
@@ -504,6 +751,7 @@ impl PluginManager {
                         file: stem,
                         enabled,
                         loaded: info.loaded,
+                        source,
                         error: if reasons.is_empty() {
                             None
                         } else {
@@ -520,6 +768,7 @@ impl PluginManager {
                         file: stem.clone(),
                         enabled,
                         loaded: false,
+                        source,
                         // 没加载、但加载失败过：原因得显示出来，不能只剩"未加载"
                         error: self.load_errors.get(&stem).cloned(),
                     },
@@ -531,6 +780,7 @@ impl PluginManager {
                         file: stem,
                         enabled,
                         loaded: false,
+                        source,
                         error: Some(e),
                     },
                 }
@@ -538,18 +788,97 @@ impl PluginManager {
             .collect())
     }
 
-    /// 扫描插件目录，返回 .lua 文件列表；**目录读不出来时交回原因，不交回空清单**。
+    /// 扫两处插件目录并**带上来源**：内置在 `app_dir/plugins/builtin/`、用户在 `data_dir/plugins/`。
     ///
-    /// 空清单从此只有一种含义：这个目录读全了、里面确实没有 .lua。以前是
-    /// `.unwrap_or_default()`：`plugins` 被建成同名文件、整份放在断线的网盘上、或替换目录
-    /// 的那一刻，插件页显示「暂无插件」而 5 个插件都还在盘上，日志里一个字都没有；
-    /// 点启用还会得到一句假原因「插件文件不存在」。旧桌面端那份扫描早就区分了这两件事
-    /// （那一侧随 WebView 删了），这一头只补了一行日志、结论照样是空的
-    /// —— 注释声称"已经分开"，实际没有。
-    pub fn discover(&self) -> Result<Vec<PathBuf>, String> {
-        let dir = self.plugins_dir();
-        std::fs::create_dir_all(&dir).ok();
-        list_lua_plugins(&dir)
+    /// 为什么要分两处（3.1）：内置模块是程序的一部分（重装即恢复、不进备份、也不该由用户改），
+    /// 用户自己装的插件是用户数据（要能写、要跟着"更改数据文件夹"一起搬、要进备份）。
+    /// 混在程序目录里则三条都反着来：安装版写 Program Files 要管理员权限、升级会清掉用户插件、
+    /// 备份扫程序目录。
+    ///
+    /// 身份**由位置决定**，不看脚本里写了什么常量 —— 否则一个脚本自述 `PLUGIN_KIND = "builtin"`
+    /// 就能绕过授权。这里交出的 `source` 就是那份身份，插件页两栏分组（P0 第 8 步）用它。
+    ///
+    /// 旧目录 `app_dir/plugins/*.lua` 在这条路上不是清单来源，只是**迁移的源**：
+    /// 先按 12.2 把用户插件复制进数据目录（只复制、同名不覆盖、失败只记 error），
+    /// 再由数据目录进清单。`[plugins] legacy_layout = true` 是唯一读旧目录清单的分支。
+    ///
+    /// **目录读不出来时交回原因，不交回空清单**：空清单从此只有一种含义 —— 这些目录读全了、
+    /// 里面确实没有 .lua。以前是 `.unwrap_or_default()`：`plugins` 被建成同名文件、整份放在
+    /// 断线的网盘上、或替换目录的那一刻，插件页显示「暂无插件」而 5 个插件都还在盘上，
+    /// 日志里一个字都没有；点启用还会得到一句假原因「插件文件不存在」。
+    /// 半份清单比没清单更难解释，所以任一目录读不出来就整体交 Err。
+    pub fn discover(&self) -> Result<Vec<Discovered>, String> {
+        // 扫哪几处只在 `paths::plugin_scan_dirs` 说一次：插件页那一行「目录」读的是同一份。
+        // 这里再列一遍目录的话，两处会各说一套 —— 变异探针把内置目录从那把尺子里摘掉，
+        // 行为用例照样绿，而屏上告诉用户的目录已经和清单来的不是同一处（那就是"照屏上放的
+        // 地方放下去不加载"）。身份按位置算，见 [`Self::source_at`]。
+        let legacy = self.legacy_layout();
+        let dirs = paths::plugin_scan_dirs(legacy);
+        if legacy {
+            // 只有真要用旧目录的人才建它（新布局不建程序目录那一格：安装版写不进去，
+            // 而这些函数会被每秒的清单扫描调到，建不出的 warn 会变成日志噪声）。
+            if let Some(dir) = dirs.first() {
+                std::fs::create_dir_all(dir).ok();
+            }
+        } else {
+            run_legacy_migration(&paths::plugins_dir(), &paths::plugins_user_dir());
+        }
+        let mut errors: Vec<String> = Vec::new();
+        let mut out: Vec<Discovered> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        for (index, dir) in dirs.iter().enumerate() {
+            let source = Self::source_at(index, legacy);
+            let files = match list_lua_plugins(dir) {
+                Ok(files) => files,
+                Err(e) => {
+                    errors.push(e);
+                    Vec::new()
+                }
+            };
+            for path in files {
+                let stem = Self::stem_of(&path);
+                if seen.contains(&stem) {
+                    // 同名只认先那一支（内置在前）。不报出来的话，用户看到的是"我放了一份但
+                    // 插件页没多一条"，而这一句在日志里本来该有原因。
+                    if notice_once(&format!("shadowed:{}:{}", source.label(), path.display())) {
+                        tracing::warn!(
+                            "{stem} 在同名的前一处目录里已经有了，这一份（{}，{}插件）不加载：\
+                             内置模块以随包那一份为准，想跑自己改的那份请换个文件名",
+                            path.display(),
+                            source.label()
+                        );
+                    }
+                    continue;
+                }
+                seen.push(stem);
+                out.push(Discovered { path, source });
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("；"));
+        }
+        Ok(out)
+    }
+
+    /// 位置决定身份（3.1）：回滚分支里只有一处旧目录；新布局是那两处的顺序就是身份的顺序，
+    /// 那份顺序写在 `paths::plugin_scan_dirs` 里，这里只按位次翻译。
+    fn source_at(index: usize, legacy_layout: bool) -> PluginSource {
+        if legacy_layout {
+            return PluginSource::Legacy;
+        }
+        if index == 0 {
+            PluginSource::Builtin
+        } else {
+            PluginSource::User
+        }
+    }
+
+    /// [`Self::discover`] 的"只要路径"投影 —— 不需要身份的调用方用这一条。
+    ///
+    /// 刻意不另扫一遍目录：两处各扫会出现"清单与来源对不上"，而这份清单的每一个消费者
+    /// 要么只要路径、要么两者都要。
+    pub fn discover_paths(&self) -> Result<Vec<PathBuf>, String> {
+        Ok(self.discover()?.into_iter().map(|d| d.path).collect())
     }
 
     /// 只做文本扫描读元数据，**不执行插件代码**：`(name, desc, version, author)`。
@@ -944,14 +1273,25 @@ impl PluginManager {
     /// 再进插件页也只是重扫清单，屏上永远是「已启用，尚未加载」，而那一刻目录早读得出来了。
     pub fn load_all(&mut self) -> bool {
         let disabled = self.disabled_list();
-        let files = match self.discover() {
-            Ok(files) => files,
+        let found = match self.discover() {
+            Ok(found) => found,
             Err(e) => {
                 tracing::error!("{e}：本次一个插件也不加载");
                 return false;
             }
         };
-        for path in files {
+        // 这一行是 `source` 今天的读者：清单上有几处来源、各几个，出事时（内置目录没打上包、
+        // 数据目录被换走）先看这句比翻目录快。插件页两栏分组（P0 第 8 步）是它的界面版。
+        let builtin = found
+            .iter()
+            .filter(|f| f.source == PluginSource::Builtin)
+            .count();
+        let user = found
+            .iter()
+            .filter(|f| f.source == PluginSource::User)
+            .count();
+        tracing::info!("插件清单：内置 {builtin} 个 · 用户 {user} 个");
+        for path in found.into_iter().map(|f| f.path) {
             let stem = Self::stem_of(&path);
             if disabled.iter().any(|s| s.as_str() == stem) {
                 continue;
@@ -1008,10 +1348,10 @@ impl PluginManager {
         self.stop_event.store(false, Ordering::SeqCst);
         let stop = Arc::clone(&self.stop_event);
         let tx = self.reload_tx.clone();
-        let dir = self.plugins_dir();
+        let dirs = self.plugin_dirs();
         let handle = std::thread::Builder::new()
             .name("plugin-hot-reload".into())
-            .spawn(move || hot_reload_loop(dir, tx, stop))
+            .spawn(move || hot_reload_loop(dirs, tx, stop))
             .map_err(|e| tracing::error!("启动热重载线程失败: {e}"))
             .ok();
         // spawn 失败时 .ok() 已经是 None，字段本身就该留 None
@@ -1037,9 +1377,11 @@ impl PluginManager {
     /// （那条 `reload_plugin_by_key` 随 WebView 一起删了；原生端到今天还没接这条线）。
     pub fn poll_reload_requests(&mut self) -> Vec<String> {
         let mut reloaded = Vec::new();
-        let dir = self.plugins_dir();
+        let dirs = self.plugin_dirs();
         while let Ok(name) = self.reload_rx.try_recv() {
-            if !dir.join(format!("{name}.lua")).exists() {
+            // "文件还在不在"要问这一轮真被扫的那几处：只问内置目录会把用户插件的删除
+            // 当成"还在"，只问数据目录则反过来把内置的删除吞掉。
+            if !dirs.iter().any(|d| d.join(format!("{name}.lua")).exists()) {
                 if self.unload_by_stem(&name) {
                     tracing::info!("插件文件已删除，已卸载: {name}");
                     reloaded.push(name);
@@ -1326,15 +1668,23 @@ fn is_limit_error(e: &mlua::Error) -> bool {
 /// 3. 0 字节的 `.lua` 本轮不算变更（编辑器"先截断再写入"的一瞬间，见
 ///    [`scan_plugin_mtimes`]）—— 空的 .lua 会被 Lua 当成空块、一句错都不报，
 ///    插件就此变成没有函数的空壳。
-fn hot_reload_loop(dir: PathBuf, tx: mpsc::Sender<String>, stop: Arc<AtomicBool>) {
-    let mut last_mtime: HashMap<String, Option<SystemTime>> = HashMap::new();
-    // 基线是否已经配平过（首轮只建基线不发事件，否则每次启动都把全部插件当"新文件"
-    // 重载一遍）
-    let mut primed = false;
+///
+/// 热重载检测线程：每 2 秒把这一轮被扫的**每一处**目录各扫一遍，变更名发到通道里。
+///
+/// 基线与"是否已配平"必须**按目录各存一份**：首轮只建基线不发事件，否则每次启动都把全部
+/// 插件当新文件重载一遍。共用一份 primed 的话，第二处目录会在第一处配平后被当成
+/// "全都是新的"，一开程序就把所有插件重载一次。
+fn hot_reload_loop(dirs: Vec<PathBuf>, tx: mpsc::Sender<String>, stop: Arc<AtomicBool>) {
+    let mut state: Vec<(PathBuf, HashMap<String, Option<SystemTime>>, bool)> = dirs
+        .into_iter()
+        .map(|dir| (dir, HashMap::new(), false))
+        .collect();
     while !stop.load(Ordering::SeqCst) {
-        for name in hot_reload_round(&dir, &mut last_mtime, &mut primed) {
-            tracing::info!("热重载检测到变更: {name}");
-            let _ = tx.send(name);
+        for (dir, last_mtime, primed) in state.iter_mut() {
+            for name in hot_reload_round(dir, last_mtime, primed) {
+                tracing::info!("热重载检测到变更: {name}");
+                let _ = tx.send(name);
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(2000));
     }
@@ -1838,6 +2188,11 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
         let config: &'static FocusFlowConfig = Box::leak(Box::new(
             FocusFlowConfig::load(tmp.join("config.ini")).expect("临时配置应能载入"),
         ));
+        manager_in_with(config, tmp)
+    }
+
+    /// 同上，但配置由调用方给（回滚开关那条用例要在载入之后再改口一次）。
+    fn manager_in_with(config: &'static FocusFlowConfig, _tmp: &Path) -> PluginManager {
         PluginManager::new(config, db::Database::init_readonly())
     }
 
@@ -2712,12 +3067,16 @@ end
         );
     }
 
-    /// 这道闸的形状：`discover()` 的三个消费点，一个也不许偷偷把 Err 折回"空"。
+    /// 这道闸的形状：取数的三个消费点，一个也不许偷偷把 Err 折回"空"。
     ///
     /// 上面两条行为用例盯的是现在的写法；这里防的是"下一次有人把 `?` 换成
     /// `unwrap_or_default()`" —— 那种改动的症状恰恰是界面重新变成一片安静的「暂无插件」，
     /// 而改的那一瞬间之外没有任何东西会响。判序按归一化后的调用形态数，
     /// 光数函数名会被 `discover()` 的注释与另一种写法顶班。
+    ///
+    /// 目录分离之后 `discover()` 交出带来源的清单（路线图 11 节第 2 步：返回项带来源），
+    /// 只要路径的调用方走 `discover_paths()` 那条薄壳投影。两条都必须把"读不出来"交出去，
+    /// 合计仍是三个消费点。
     #[test]
     fn no_caller_folds_an_unreadable_plugin_dir_back_into_empty() {
         let src = include_str!("manager.rs");
@@ -2730,25 +3089,53 @@ end
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
+        // `discover_paths()` 只是"把来源抹平"的薄壳，它自己那一句委托不算消费点。
+        // 先按位置把它摘掉，剩下的才是要判的三个消费点 —— 不摘的话它与列表那一处的
+        // 归一化形状一模一样（都是 `Ok(self.discover()?)`），数出来的 2 说不清是谁。
+        let shell_head = "pubfndiscover_paths(&self)->Result<Vec<PathBuf>,String>{";
+        let shell_at = flat
+            .find(shell_head)
+            .expect("`discover_paths()` 的函数头形状变了（这条判序要跟着改）");
+        let shell =
+            &flat[shell_at..shell_at + flat[shell_at..].find('}').expect("函数体没有结束？") + 1];
+        assert!(
+            shell.contains("self.discover()"),
+            "`discover_paths()` 不再经带来源那一头取数 = 它自己重新扫了一遍目录，\
+             两处各扫会出现\"清单与来源对不上\""
+        );
+        let consumers = flat.replacen(shell, "", 1);
+        assert!(
+            !consumers.contains(shell_head),
+            "薄壳没摘干净（生产段里出现了第二个同形状的 `discover_paths()`？）"
+        );
+
         assert_eq!(
-            flat.matches("self.discover()").count(),
-            3,
-            "取数只有三个消费点（列表、启用、启动加载），多一处要先说清它吃的是哪种结局"
+            consumers.matches("self.discover_paths()?").count(),
+            1,
+            "只要路径的消费点只剩「启用」这一处（列表与启动加载都要来源），\
+             且它必须把 Err 原样交出去（`?`）"
         );
         assert_eq!(
-            flat.matches("self.discover()?").count(),
-            2,
-            "列表与启用两处必须把 Err 原样交出去（`?`），而不是就地折成空"
+            consumers.matches("self.discover()?").count(),
+            1,
+            "列表那一处必须把 Err 原样交出去（`?`），而不是就地折成空"
         );
         assert_eq!(
-            flat.matches("matchself.discover()").count(),
+            consumers.matches("matchself.discover()").count(),
             1,
             "启动加载那一处必须自己接住 Err 并出声"
         );
-        for (at, call) in flat.match_indices("self.discover()") {
-            let after = &flat[at + call.len()..];
+        // 兜底：三个消费点之外不许再有人取数（第四处一定是新加的，先问它吃哪种结局）
+        let total = consumers.matches("self.discover()").count()
+            + consumers.matches("self.discover_paths()").count();
+        assert_eq!(
+            total, 3,
+            "取数只有三个消费点（列表、启用、启动加载），第四处要先说清它吃的是哪种结局"
+        );
+        for (at, call) in consumers.match_indices("self.discover()") {
+            let after = &consumers[at + call.len()..];
             let taken_by_question = after.starts_with('?');
-            let taken_by_match = flat[..at].ends_with("match");
+            let taken_by_match = consumers[..at].ends_with("match");
             assert!(
                 taken_by_question || taken_by_match,
                 "第 {} 个字符处这一处 `discover()` 既没把 Err 交出去（`?`），也没自己接住并出声\
@@ -2756,6 +3143,100 @@ end
                 at
             );
         }
+        for (at, call) in consumers.match_indices("self.discover_paths()") {
+            let after = &consumers[at + call.len()..];
+            let taken_by_question = after.starts_with('?');
+            assert!(
+                taken_by_question,
+                "第 {} 个字符处这一处 `discover_paths()` 没把 Err 交出去（`?`）",
+                at
+            );
+        }
+        // 来源在清单这一头不能丢：`discover()` 交出的必须是带来源的那一项，
+        // 退化成 `Vec<PathBuf>` 就等于把身份那件事又抹平（第 8 步的两栏分组会拿不到依据）。
+        assert!(
+            flat.contains("pubfndiscover(&self)->Result<Vec<Discovered>,String>{"),
+            "`discover()` 的返回项不再带来源了"
+        );
+    }
+
+    /// 目录分离这两步的接线形状：清单来自两处、旧目录只当迁移的源、开关是那条唯一的分支。
+    ///
+    /// 行为用例已经各自钉住了自己那一块，这里防的是**换法**：把内置目录改成又去读平铺目录、
+    /// 或者把迁移偷偷变成移动，行为用例可能照样绿（夹具刚好都在），而产品语义已经换了。
+    #[test]
+    fn the_two_dirs_are_the_only_things_the_new_layout_reads() {
+        let src = include_str!("manager.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let flat: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // 清单只从"那一处唯一的尺子"取目录，扫描本身对每处目录只写一遍。
+        // 这两条是变异探针逼出来的：先前这里数的是 `list_lua_plugins(&builtin_dir)`，
+        // 也就是**清单自己又列了一遍目录** —— 把内置目录从 `paths::plugin_scan_dirs` 摘掉，
+        // 行为用例照样绿，而插件页那一行「目录」已经和清单来的不是同一处。
+        assert_eq!(
+            flat.matches("paths::plugin_scan_dirs(self.legacy_layout())")
+                .count(),
+            1,
+            "`plugin_dirs()`（热重载与存在性检查那几处用）不再委托那一把尺子"
+        );
+        assert!(
+            flat.contains("letdirs=paths::plugin_scan_dirs(legacy)"),
+            "`discover()` 不再从那一把尺子取目录 = 界面与清单会各说一套"
+        );
+        assert_eq!(
+            flat.matches("list_lua_plugins(dir)").count(),
+            1,
+            "每处目录一次扫描；数到第二处说明清单又列了一遍目录"
+        );
+        // 身份按位次翻译，不在清单里硬编码目录名（那样一改目录顺序就把身份贴错）。
+        assert!(
+            flat.contains("letsource=Self::source_at(index,legacy)"),
+            "`source` 不再由位次决定 = 位置决定身份这条被换了"
+        );
+        // 身份不看脚本自己写什么：生产段里不许出现读 PLUGIN_KIND 的代码。
+        // 判据要吃**去掉注释**的那一份 —— 上面这几段注释本身就写着这个词，
+        // 拿原文数会把"注释里提到"数成"代码里在读"（假红），而摘掉判据又等于没判。
+        assert_eq!(
+            flat.matches("PLUGIN_KIND").count(),
+            0,
+            "身份由位置决定；一旦开始读脚本自述的 PLUGIN_KIND，权限模型第一天就失效"
+        );
+        // 内置目录不许在这份文件里被单独列进清单（只在 `paths` 那一处出现）
+        assert_eq!(
+            flat.matches("plugins_builtin_dir()").count(),
+            0,
+            "清单在这份文件里又点了一次内置目录 = 与界面那一行「目录」各说一套"
+        );
+        assert_eq!(
+            flat.matches("get_bool(\"plugins\",\"legacy_layout\",false)")
+                .count(),
+            1,
+            "开关只有一处读点，默认值必须是 false（新布局）"
+        );
+        // 迁移只复制：生产段里不许出现 remove/move 那两条（12.2 第一条纪律）
+        let migrate = &flat[flat
+            .find("fnmigrate_legacy_plugins")
+            .expect("迁移函数不在了")..];
+        let migrate = &migrate[..migrate
+            .find("fnrun_legacy_migration")
+            .expect("迁移函数与它的日志包装之间该是相邻的")];
+        for forbidden in ["std::fs::remove", "std::fs::rename"] {
+            assert!(
+                !migrate.contains(forbidden),
+                "迁移里出现 {forbidden} = 复制变成了移动，回滚开关会读不到东西"
+            );
+        }
+        assert!(
+            migrate.contains("BUILTIN_PLUGIN_STEMS.contains(&stem.as_str())"),
+            "白名单那道判断不在迁移里 = 内置脚本会被搬进数据目录"
+        );
     }
 
     /// 「插件文件不存在」不能当成"这一轮没列出它"的默认解释。
@@ -2764,6 +3245,9 @@ end
     /// `an_unreadable_plugin_dir_is_not_reported_as_having_no_plugins`），剩下的"目录读全了、
     /// 清单里却没有这个名字"仍然有两种可能：文件在盘上但这一轮没扫到（目录正在被整份替换），
     /// 或真没有这个名字。后者才配得上「不存在」—— 把前者说成不存在，用户会去重命名、重传插件。
+    ///
+    /// 目录分离之后这个名字可能在**两处**里的任何一处，所以存在性检查必须问全部被扫的目录：
+    /// 只问内置那一处的话，用户装的那份会被说成「插件文件不存在」。
     #[test]
     fn an_unreadable_directory_is_not_reported_as_a_missing_file() {
         let _lock = paths::test_app_dir_lock();
@@ -2771,20 +3255,30 @@ end
         let dir = tmp.path().join("plugins");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("w.lua"), "PLUGIN_NAME = \"w\"\n").unwrap();
+        // 第二处：只在数据目录里有的名字，也必须被认成"在盘上"
+        let user = tmp.path().join("data").join("plugins");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("u.lua"), "PLUGIN_NAME = \"u\"\n").unwrap();
+        let both = vec![dir.clone(), user.clone()];
 
-        let present = missing_plugin_reason(&dir, "w");
+        let present = missing_plugin_reason(&both, "w");
         assert!(
             present.contains("这一轮没扫到") && present.contains("再试一次"),
             "文件在盘上就该说\"读不到/没扫到\"，不是\"不存在\": {present}"
         );
-        let absent = missing_plugin_reason(&dir, "nope");
+        let present_in_second_dir = missing_plugin_reason(&both, "u");
+        assert!(
+            present_in_second_dir.contains("这一轮没扫到"),
+            "名字在第二处目录里，那句\"不存在\"就是假的: {present_in_second_dir}"
+        );
+        let absent = missing_plugin_reason(&both, "nope");
         assert!(
             absent.contains("插件文件不存在") && absent.contains("nope"),
             "真没有这个名字才配得上那句\"不存在\": {absent}"
         );
         // 带路径分隔或 `..` 的名字不许触发存在性检查：那会把这里变成文件存在预言机
         for evil in ["../plugins/w", "..\\plugins\\w", "a/b", ""] {
-            let r = missing_plugin_reason(&dir, evil);
+            let r = missing_plugin_reason(&both, evil);
             assert!(
                 !r.contains("这一轮没扫到"),
                 "越界/畸形名不该给出探测结果: {evil} → {r}"
@@ -2798,6 +3292,301 @@ end
             prod.match_indices("missing_plugin_reason(").count(),
             2,
             "应当是「定义一处 + set_enabled 用一处」，多一处少一处都要查"
+        );
+        // 而且问的是"这一轮被扫的那几处"，不是硬编码的某一个目录
+        let flat: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("missing_plugin_reason(&self.plugin_dirs()"),
+            "存在性检查必须跟着 plugin_dirs() 那把尺子走，否则内置/数据两处会各说一套"
+        );
+    }
+
+    /// 两处目录的身份由**位置**决定，清单一并交出来源；同名只认随包那一份。
+    ///
+    /// 这条盯三件事，都是目录分离之后才会出现的形状：
+    /// ① 内置与用户各自从自己的目录进清单，来源标签不能贴反（贴反＝授权与备份口径全错）；
+    /// ② 数据目录里放一份与内置同名的文件，不会变成两条清单条目，也不会顶掉内置那份；
+    /// ③ 顶掉的那一刻要在日志里留下原因 —— 否则用户看到的是"我放了但插件页没多一条"。
+    #[test]
+    fn the_two_plugin_dirs_keep_their_identities_and_same_name_collides_once() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("two_dirs");
+        let builtin = tmp.path().join("plugins").join("builtin");
+        let user = tmp.path().join("data").join("plugins");
+        write_lua(&builtin, "shared", "PLUGIN_NAME = \"随包那份\"\n");
+        write_lua(&builtin, "only_builtin", "PLUGIN_NAME = \"只内置\"\n");
+        write_lua(&user, "only_user", "PLUGIN_NAME = \"只用户\"\n");
+        // 同名的第二份：内容刻意不同，读出来的名字能证明是哪一份进了清单
+        write_lua(&user, "shared", "PLUGIN_NAME = \"用户改过的那份\"\n");
+
+        let pm = manager_in(tmp.path());
+        // 第一轮的日志里必须有那句"顶掉"：`notice_once` 是按本进程记的，第二轮只该安静。
+        let (found, first_logs) = crate::logger::capture_logs(|| pm.discover());
+        let found = found.expect("两处目录都读得动，该交出完整清单");
+        let by_stem = |stem: &str| -> Vec<&Discovered> {
+            found
+                .iter()
+                .filter(|f| PluginManager::stem_of(&f.path) == stem)
+                .collect()
+        };
+        assert_eq!(
+            by_stem("shared").len(),
+            1,
+            "同名的两份只该进清单一条（内置在前），实测 {found:?}"
+        );
+        assert_eq!(
+            by_stem("shared")[0].source,
+            PluginSource::Builtin,
+            "内置模块以随包那一份为准"
+        );
+        assert_eq!(
+            by_stem("only_user")[0].source,
+            PluginSource::User,
+            "数据目录那份的身份是用户插件，来源不许贴反"
+        );
+        assert_eq!(by_stem("only_builtin")[0].source, PluginSource::Builtin);
+        assert_eq!(
+            found.len(),
+            3,
+            "两处各一份 + 同名一条 ⇒ 清单共 3 条，实测 {found:?}"
+        );
+
+        // 名字读出来的是随包那份 ⇒ 顶掉的那一份在日志里留了原因
+        let (listed, second_logs) = crate::logger::capture_logs(|| pm.list_discovered());
+        let rows = listed.expect("清单读得动");
+        let shared = rows
+            .iter()
+            .find(|r| r.file == "shared")
+            .expect("清单里有 shared");
+        assert_eq!(
+            shared.name, "随包那份",
+            "插件页那一行是内置那份的名字，用户复制的那份没有顶掉它"
+        );
+        assert_eq!(shared.source, PluginSource::Builtin);
+        assert!(
+            rows.iter()
+                .any(|r| r.file == "only_user" && r.source == PluginSource::User),
+            "列表这一头也要带上来源: {rows:?}"
+        );
+        let shown = first_logs.join("\n");
+        assert!(
+            first_logs
+                .iter()
+                .any(|l| l.contains("shared") && l.contains("不加载")),
+            "同名被内置顶掉这件事要出声，否则症状是\"放了插件但插件页没多一条\": {shown}"
+        );
+        // 那句只说一次：插件页开着时 `discover()` 每秒一轮，同一件事刷满日志就等于没说。
+        // 这条腿的观察量是"第二轮确实看得见重跑"（同一份盘、同一组目录），不是猜的。
+        assert!(
+            !second_logs.iter().any(|l| l.contains("不加载")),
+            "同一件事第二轮不许再刷一遍: {}",
+            second_logs.join("\n")
+        );
+    }
+
+    /// 旧平铺目录里的用户插件是**复制**进数据目录的，同名不覆盖，内置白名单不搬。
+    ///
+    /// 三条各对一个真实后果：
+    /// · 原件不删 —— `[plugins] legacy_layout = true` 那条回滚只认旧目录，搬走就把回滚
+    ///   变成"请用户重新下载插件"；
+    /// · 同名不动 —— 用户已经在新目录放过一份，说明那才是他要跑的（12.2 第 2 步：以数据目录为准）；
+    /// · 白名单不搬 —— 内置脚本搬进数据目录会变成两条同 stem 条目，而且"用户改过的内置脚本
+    ///   从此以用户插件身份活着"与「升级覆盖内置脚本」这条既有行为相反。
+    #[test]
+    fn legacy_plugins_are_copied_into_the_data_dir_without_overwriting() {
+        let legacy = std::env::temp_dir().join(format!(
+            "ff_legacy_copy_{}_{}/plugins",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let user = legacy.with_file_name("plugins_user");
+        write_lua(&legacy, "mytool", "PLUGIN_NAME = \"旧目录那份\"\n");
+        write_lua(&legacy, "pomodoro_plugin", "PLUGIN_NAME = \"随包的内置\"\n");
+        write_lua(&user, "keepme", "PLUGIN_NAME = \"新目录已有\"\n");
+
+        let report = migrate_legacy_plugins(&legacy, &user);
+        assert_eq!(report.copied, vec!["mytool".to_string()], "只搬用户那份");
+        assert_eq!(
+            report.builtin_kept,
+            vec!["pomodoro_plugin".to_string()],
+            "白名单里的名字由 plugins/builtin/ 提供，不搬"
+        );
+        // 复制不移动：原件必须还在旧目录
+        assert!(
+            legacy.join("mytool.lua").is_file(),
+            "旧目录的原件被删了 —— 回滚开关就没东西可读了"
+        );
+        assert!(user.join("mytool.lua").is_file(), "数据目录该多出这一份");
+        assert!(
+            !user.join("pomodoro_plugin.lua").exists(),
+            "内置脚本被搬进了数据目录：插件页会出现两条同名"
+        );
+
+        // 同名不覆盖：把数据目录那份改成另一个内容，再跑一轮，它一个字都不许变
+        std::fs::write(user.join("mytool.lua"), "PLUGIN_NAME = \"用户自己那份\"\n").unwrap();
+        let again = migrate_legacy_plugins(&legacy, &user);
+        assert_eq!(
+            again.conflicts,
+            vec!["mytool".to_string()],
+            "这一份该记成\"没覆盖\"，不是\"复制成功\""
+        );
+        assert!(again.copied.is_empty(), "重跑一轮不能又搬一次");
+        assert_eq!(
+            std::fs::read_to_string(user.join("mytool.lua")).unwrap(),
+            "PLUGIN_NAME = \"用户自己那份\"\n",
+            "数据目录那份被旧目录顶掉了 —— 12.2 说的是以数据目录为准"
+        );
+
+        // 旧目录本来不存在 = 全新安装，不是"读不出来"
+        let fresh = migrate_legacy_plugins(&legacy.with_file_name("no_such_plugins_dir"), &user);
+        assert!(
+            fresh.unreadable.is_none(),
+            "目录不存在就是没有旧插件，不许报读不出来: {:?}",
+            fresh.unreadable
+        );
+        let _ = std::fs::remove_dir_all(&legacy);
+        let _ = std::fs::remove_dir_all(&user);
+    }
+
+    /// 迁移搬不动时只记 error，启动照旧：清单不因此变空，也不交 Err。
+    ///
+    /// 这是整套方案里唯一不可逆那一步的反面：如果"复制失败"变成"起不来"，用户双击没反应
+    /// 而日志里只有一句权限错误 —— 那比留在旧目录不能用了更糟。
+    /// 夹具取"数据目录那一格被同名普通文件占住"（复制必败，而 `run_legacy_migration`
+    /// 拿的是已经算好的两处目录，不看这一格）。
+    #[test]
+    fn a_migration_copy_failure_is_logged_and_does_not_block_startup() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("migration_fail");
+        let legacy = tmp.path().join("plugins");
+        write_lua(&legacy, "mytool", "PLUGIN_NAME = \"旧目录那份\"\n");
+
+        // 尺子本身：目标目录建不出来（父级是个普通文件）⇒ 进的是 failed，不是 copied/conflicts
+        let blocked_user = tmp.path().join("no_such_parent").join("plugins");
+        std::fs::write(tmp.path().join("no_such_parent"), "这不是目录").unwrap();
+        let report = migrate_legacy_plugins(&legacy, &blocked_user);
+        assert!(
+            report.copied.is_empty() && report.conflicts.is_empty(),
+            "一份都没搬成，不该有 copied/conflicts: {report:?}"
+        );
+        assert_eq!(
+            report.failed.iter().map(|(s, _)| s).collect::<Vec<_>>(),
+            vec!["mytool"],
+            "复制失败要落在 failed 里，并带上文件名"
+        );
+        assert!(!report.failed[0].1.is_empty(), "还要带上原因");
+
+        // 消费侧：这一轮失败要说 error、要点名文件，并且不许念"已复制"
+        let (_, logs) = crate::logger::capture_logs(|| {
+            run_legacy_migration(&legacy, &blocked_user);
+        });
+        let shown = logs.join("\n");
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("mytool") && l.contains("不阻塞启动")),
+            "失败要点名是哪个文件、并说不阻塞这件事: {shown}"
+        );
+        assert!(
+            !shown.contains("已复制到数据目录"),
+            "一份都没搬成，不该念\"已复制\": {shown}"
+        );
+        assert!(
+            !blocked_user.join(MIGRATION_MARKER).is_file(),
+            "什么都没搬成却写了标记 = 下次启动不再重试，那份插件就永远留在旧目录"
+        );
+
+        // 旧目录整个读不出来（被建成同名文件）也只出声，并说不影响新布局的加载
+        let legacy_file = tmp.path().join("broken.lua");
+        std::fs::write(&legacy_file, "占位：这是一个文件").unwrap();
+        let (_, logs) = crate::logger::capture_logs(|| {
+            run_legacy_migration(&legacy_file, &tmp.path().join("some_user_dir"));
+        });
+        let shown = logs.join("\n");
+        assert!(
+            shown.contains("旧目录这一轮搬不动也不影响加载"),
+            "旧目录读不出来要出声，但要说不影响加载: {shown}"
+        );
+    }
+
+    /// `[plugins] legacy_layout = true`：只扫旧目录，忽略新布局，也不做迁移。
+    ///
+    /// 这条开关存在的意义是"线上新布局出问题时用户能自己退回去"，所以退回的必须是
+    /// **完整旧行为**：旧目录那份清单、不碰数据目录、来源只能是旧目录。
+    /// 开关打开时还往数据目录复制，回滚就不再是"退回上一版"而是"两份都在跑"。
+    #[test]
+    fn the_rollback_switch_scans_only_the_legacy_dir() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("legacy_switch");
+        let legacy = tmp.path().join("plugins");
+        write_lua(&legacy, "oldstyle", "PLUGIN_NAME = \"旧目录那份\"\n");
+        write_lua(
+            &tmp.path().join("plugins").join("builtin"),
+            "newstyle",
+            "PLUGIN_NAME = \"内置那份\"\n",
+        );
+        write_lua(
+            &tmp.path().join("data").join("plugins"),
+            "userstyle",
+            "PLUGIN_NAME = \"用户那份\"\n",
+        );
+
+        // 开关默认关：新布局两处
+        let off = FocusFlowConfig::load(tmp.path().join("config.ini")).unwrap();
+        let off = Box::leak(Box::new(off));
+        let pm = manager_in_with(off, tmp.path());
+        assert!(!pm.legacy_layout(), "默认值就该是新布局");
+        let found = pm.discover().expect("两处都读得动");
+        let got: Vec<(String, PluginSource)> = found
+            .iter()
+            .map(|f| (PluginManager::stem_of(&f.path), f.source))
+            .collect();
+        assert!(
+            got.contains(&("newstyle".to_string(), PluginSource::Builtin)),
+            "内置那份要从 plugins/builtin/ 进清单，来源标内置: {got:?}"
+        );
+        assert!(
+            got.contains(&("userstyle".to_string(), PluginSource::User)),
+            "数据目录那份的来源必须是用户插件: {got:?}"
+        );
+        assert!(
+            got.contains(&("oldstyle".to_string(), PluginSource::User)),
+            "旧目录那份要先复制进数据目录、再以用户插件的身份进清单 —— 迁移不接进清单，\
+             升级后就等于把用户已有的插件弄丢了: {got:?}"
+        );
+        assert!(
+            tmp.path().join("plugins").join("oldstyle.lua").is_file(),
+            "复制不是移动：旧目录那份原件必须还在（回滚开关只认它）"
+        );
+
+        // 开关打开：只认旧目录，且数据目录一个字都不被写
+        std::fs::write(
+            tmp.path().join("config.ini"),
+            "[plugins]\nlegacy_layout = true\n",
+        )
+        .unwrap();
+        let on = Box::leak(Box::new(
+            FocusFlowConfig::load(tmp.path().join("config.ini")).unwrap(),
+        ));
+        let pm = manager_in_with(on, tmp.path());
+        assert!(pm.legacy_layout(), "配置里那句 true 要读得出来");
+        let found = pm.discover().expect("旧目录读得动");
+        assert_eq!(
+            found
+                .iter()
+                .map(|f| (PluginManager::stem_of(&f.path), f.source))
+                .collect::<Vec<_>>(),
+            vec![("oldstyle".to_string(), PluginSource::Legacy)],
+            "回滚分支里清单只有旧目录那一份，来源也必须说清是旧目录"
         );
     }
 
