@@ -1471,7 +1471,10 @@ mod tests {
         assert!(ok.contains("测试餐饮"), "正常报告该列出分类:\n{ok}");
         assert!(!ok.contains("没读全"), "读全了不许报任何保留:\n{ok}");
 
-        // 把库换成一份读不出来的字节（半截文件 / 被同步盘换成的占位内容）
+        // 把库换成一份读不出来的字节（半截文件 / 被同步盘换成的占位内容）。
+        // 先放掉连接池里那一份：关连接会把 WAL 检查点并删掉，反过来的话检查点正好
+        // 把刚写的坏字节盖回去，这一档就白摆了。
+        focusflow_core::db::connection::clear_aux_cache();
         std::fs::write(accounting::db_path(), "这不是一个 SQLite 文件").expect("写坏文件");
         manager
             .plugin_action(&name, "cat_profit")

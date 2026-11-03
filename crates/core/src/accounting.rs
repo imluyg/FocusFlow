@@ -39,14 +39,20 @@ pub fn db_path() -> std::path::PathBuf {
     paths::data_dir().join("focusflow_accounting.db")
 }
 
-fn open() -> rusqlite::Result<Connection> {
-    std::fs::create_dir_all(paths::data_dir()).ok();
-    let conn = Connection::open(db_path())?;
-    conn.pragma_update(None, "journal_mode", "WAL").ok();
-    conn.pragma_update(None, "synchronous", "NORMAL").ok();
-    conn.pragma_update(None, "foreign_keys", "ON").ok();
-    conn.busy_timeout(std::time::Duration::from_secs(15)).ok();
-    Ok(conn)
+/// 打开记账库：**同一线程内复用这一份连接**（方案 3.9.1 的 A 档）。
+///
+/// 从前这里每次调用都 `Connection::open` + 四条 PRAGMA，而记账面板一次 `get_view()` 要走
+/// 三个这样的 API —— 实测 3 次 open+3 查询 p50 7.41 ms、复用连接 + 3 查询 0.021 ms，
+/// 也就是说那 17 ms 里 99.7% 是开库，不是 Lua 也不是查询。
+/// 交回的 `AuxConn` 靠 `Deref` 当 `Connection` 用，Drop 时放回池里；备份改名与
+/// 「更改数据文件夹」之前必须先 `connection::clear_aux_cache()` 把句柄放掉。
+fn open() -> rusqlite::Result<crate::db::connection::AuxConn> {
+    crate::db::connection::aux_conn(&db_path(), |conn| {
+        conn.pragma_update(None, "journal_mode", "WAL").ok();
+        conn.pragma_update(None, "synchronous", "NORMAL").ok();
+        conn.pragma_update(None, "foreign_keys", "ON").ok();
+        conn.busy_timeout(std::time::Duration::from_secs(15)).ok();
+    })
 }
 
 /// 空白值按"没有分类"处理：落库存 NULL。
@@ -2721,6 +2727,9 @@ mod tests {
         );
 
         // 库整个读不动时：一批都没查，那句话必须说成"没查"，不能像"这几条没日期"
+        // 顺序是判据的一半：先放掉池里那份句柄（关连接会把 WAL 检查点并删掉），
+        // 再把文件写坏 —— 反过来的话，关闭时的检查点正好把我们刚写的坏字节盖回去。
+        crate::db::connection::clear_aux_cache();
         std::fs::write(db_path(), "这不是一个 SQLite 文件").unwrap();
         let (got2, misses2) = days_ago(&[ok]);
         assert!(got2.is_empty(), "{got2:?}");
@@ -3215,6 +3224,7 @@ mod tests {
         assert_eq!(summary, (de, di), "{summary:?} 对 {de} {di}");
 
         // 库读不动：这一路也必须把那句留痕说出口（旧行为是安静地交零）
+        crate::db::connection::clear_aux_cache();
         std::fs::write(db_path(), "这不是一个 SQLite 文件").unwrap();
         let (s2, logs) = crate::logger::capture_logs(|| monthly_summary("2026-08"));
         assert_eq!(s2, (0.0, 0.0), "{s2:?}");
@@ -3514,6 +3524,7 @@ mod tests {
 
         // 第二档：整个文件不是数据库（移动盘上的半截文件、被同步盘换成的占位内容）。
         // 这一档连一行都没有，原因照样要交出，且不许与"一个分类都没有"同形。
+        crate::db::connection::clear_aux_cache();
         std::fs::write(db_path(), "这不是一个 SQLite 文件").unwrap();
         let ((cats, gap), logs) = crate::logger::capture_logs(get_all_categories);
         assert!(cats.is_empty(), "读不动时不该凭空给出分类: {cats:?}");
@@ -3596,6 +3607,7 @@ mod tests {
         assert!(rows2.is_empty(), "{rows2:?}");
 
         // 第三档：整个文件不是数据库（半截文件 / 被同步盘换成的占位内容）。
+        crate::db::connection::clear_aux_cache();
         let _ = std::fs::write(db_path(), "这不是一个 SQLite 文件");
         let (_, _, _, _, gap6) = monthly_summary_detail("2026-08");
         assert!(

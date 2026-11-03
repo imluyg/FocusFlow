@@ -125,6 +125,9 @@ pub fn invalidate_years_cache() {
     c.insert(cache_key(), (None, vec![]));
     // 数据文件可能被替换/移动，同时失效只读连接缓存
     crate::db::connection::clear_ro_cache();
+    // 附属库（记账/番茄/调度/Edge）也在同一棵数据目录里，句柄跟着一起作废：
+    //  Windows 上握着句柄改不了名、删不掉，而换回来的新文件也不该被旧句柄继续回答
+    crate::db::connection::clear_aux_cache();
 }
 
 /// 获取所有有数据的年份列表（降序，带 30 秒缓存，按 app_dir 隔离）。

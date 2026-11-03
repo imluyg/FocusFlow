@@ -656,6 +656,10 @@ pub fn migrate_data_tree(from: &Path, to: &Path) -> Result<MigrationReport, Stri
             from.display()
         ));
     }
+    // 复用连接池要先放干净：这一路最后一步是**删源侧**（`remove_source_trees`），
+    // 而 Windows 上句柄还握着的文件删不掉 —— 删不掉的后果不是留点垃圾，是
+    // "两棵都还在、从今天起各攒一份历史"。备份那一路同理，见 `backup_database`。
+    crate::db::connection::clear_aux_cache();
     // 读得出来、但两棵子树都没有：这确实是"没有可搬的历史"，让它成功（否则刚装完
     // 就改目录的用户会被这个标记钉在旧目录上，永远搬不完），只留一条 warn 备查。
     if !from.join("data").is_dir() && !from.join("backup").is_dir() {

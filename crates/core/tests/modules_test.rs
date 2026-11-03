@@ -1,4 +1,11 @@
-//! scheduler 与 pomodoro 模块测试。
+//! scheduler / pomodoro / accounting / edge_history 四块附属库的模块级冒烟测试。
+//!
+//! 临时目录一律走 [`paths::test_app_dir`] 的 RAII 收尾，不再手写
+//! `std::fs::remove_dir_all(&dir).ok()`：那个 `.ok()` 把"没删掉"吃掉了，而 Windows 上
+//! 连接池（年度库只读池与附属库复用池）握着句柄时 `remove_dir_all` 必失败 ⇒ 每个用例
+//! 每跑一次在 %TEMP% 留一份，门禁的 `TEMP_LEAK` 数到的就是这四份（`ff_acc_*`、
+//! `ff_pomo_*`、`ff_sched_*`、`ff_edge_*`）。`TestAppDir::drop` 先把两把缓存放掉、
+//! 再把 app_dir 指到哨兵，然后带重试地删，删不掉会出声。
 
 #[cfg(test)]
 mod tests {
@@ -23,9 +30,7 @@ mod tests {
     #[test]
     fn scheduler_crud_and_validation() {
         let _g = guard();
-        let dir = std::env::temp_dir().join(format!("ff_sched_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("sched");
 
         // 初始化
         scheduler::init_db().unwrap();
@@ -75,16 +80,12 @@ mod tests {
             scheduler::describe_schedule("once", "2026-12-01 10:00"),
             "一次性 2026-12-01 10:00"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn pomodoro_timer_flow() {
         let _g = guard();
-        let dir = std::env::temp_dir().join(format!("ff_pomo_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("pomo");
         pomodoro::init_db().unwrap();
 
         let timer = pomodoro::PomodoroTimer::new();
@@ -127,15 +128,12 @@ mod tests {
         assert_eq!(sessions[0].key_count, 2, "按键数应随会话一起入库");
 
         timer.shutdown();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn accounting_crud_and_summary() {
         let _g = guard();
-        let dir = std::env::temp_dir().join(format!("ff_acc_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("acc");
         accounting::init_db().unwrap();
 
         // 添加支出与收入
@@ -186,16 +184,12 @@ mod tests {
         // 删除
         assert!(accounting::delete_expense(id1));
         assert_eq!(accounting::get_all_expenses(10).len(), 1);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn edge_history_storage() {
         let _g = guard();
-        let dir = std::env::temp_dir().join(format!("ff_edge_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        paths::set_app_dir(&dir);
+        let _app = paths::test_app_dir("edge");
 
         // 保存计数到本地趋势库
         let today = chrono::Local::now().date_naive();
@@ -216,7 +210,5 @@ mod tests {
         let prev_found = counts.iter().find(|(d, _)| *d == prev_str).map(|(_, c)| *c);
         assert_eq!(today_found, Some(100));
         assert_eq!(prev_found, Some(50));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

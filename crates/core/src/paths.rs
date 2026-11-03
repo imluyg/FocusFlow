@@ -118,6 +118,9 @@ impl Drop for TestAppDir {
         //    +1/run，所以哨兵之后还要 clear_ro_cache）。
         set_app_dir(test_scratch_app_dir());
         crate::db::connection::clear_ro_cache();
+        // 附属库那份复用池同一条命：句柄还握着的时候 Windows 的 remove_dir_all 会失败，
+        // 每个用例每跑一次留一个目录（上面那段注释写的就是同一族泄漏）。
+        crate::db::connection::clear_aux_cache();
         // 句柄释放有竞态（写线程先清 alive 标志、连接在其后析构）：remove
         // 撞上未释放的句柄会失败，重试几轮等它放干净；目录已经不在了就当成功。
         // 前 10 轮用普通路径，之后换成 `\\?\` 前缀再试 10 轮 —— 普通路径删不动

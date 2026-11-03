@@ -452,12 +452,13 @@ pub fn edge_db_path() -> PathBuf {
     paths::data_dir().join("focusflow_edge_history.db")
 }
 
-/// 打开本地 Edge 计数库：busy_timeout 防并发短锁导致读写直接失败。
-fn open_local() -> rusqlite::Result<Connection> {
-    std::fs::create_dir_all(paths::data_dir()).ok();
-    let conn = Connection::open(edge_db_path())?;
-    conn.busy_timeout(std::time::Duration::from_secs(15)).ok();
-    Ok(conn)
+/// 打开本地 Edge 计数库：同一线程内复用（方案 3.9.1 的 A 档，理由同 `accounting::open`）。
+///
+/// `busy_timeout` 防并发短锁导致读写直接失败；这一份没有 WAL（与从前一致，不趁机改性质）。
+fn open_local() -> rusqlite::Result<crate::db::connection::AuxConn> {
+    crate::db::connection::aux_conn(&edge_db_path(), |conn| {
+        conn.busy_timeout(std::time::Duration::from_secs(15)).ok();
+    })
 }
 
 /// 本地 Edge 缓存库**在不在**：`Ok(true)` 在、`Ok(false)` 确认没有、`Err` 这一问问不出来。
@@ -2129,6 +2130,7 @@ mod tests {
 
         // 读不动：把本地缓存库的路径占成目录，open 必失败。先删掉对照腿里
         // `open_local()` 已经创建出来的那个空库文件，否则同名占位建不出来。
+        crate::db::connection::clear_aux_cache();
         std::fs::remove_file(edge_db_path()).ok();
         std::fs::create_dir_all(edge_db_path()).expect("占位目录应能建出来");
         assert!(

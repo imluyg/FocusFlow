@@ -2035,6 +2035,10 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
     if batch == crate::db::writer::BatchFlush::Missed {
         tracing::warn!("备份前的 flush 没等到回音（3 秒）：这一份拷贝不含最近那一批按键");
     }
+    // 附属库那份复用连接池先放干净：备份要在这几份文件上做改名与轮转，而 Windows 上
+    // 句柄还握着时 `rename` 与删除都会失败 —— 这是换"复用连接"必须配的代价（方案 3.9.1
+    // 写死了这一条：切换数据目录与备份前必须主动 close）。按代次失效，别的线程下一次取自愈。
+    crate::db::connection::clear_aux_cache();
     std::fs::create_dir_all(paths::backup_dir()).ok();
     // 顺手清掉遗留的 sidecar 垃圾（旧版只删 .db，`-wal`/`-shm` 会永久堆积）
     let swept = sweep_stale_sidecars();

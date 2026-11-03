@@ -1045,6 +1045,115 @@ fn migrate_device_tables(conn: &Connection) -> anyhow::Result<()> {
     }
 }
 
+// ===== 附属库的复用连接（方案 3.9.1 的 A 档）=====
+//
+// 症状：记账本每次 `get_view()` 至少调三个宿主 API，每个都 `Connection::open` + 三条 PRAGMA。
+// 实测（生产库只读副本）单次 open+1 查询 p50 2.43 ms，3 次 open+3 查询 7.41 ms，
+// 复用连接 + 3 查询 0.021 ms —— **连接开销占 99.7%**，17 ms 的记账本面板里 Lua 只占 1–2 ms。
+//
+// 两条纪律，缺一条就不该上这个东西：
+// · **只在同一线程复用**（`Connection` 不是 `Send`，年度库那一份只读池同一条理由）；
+// · 备份改名与"更改数据文件夹"之前必须先 [`clear_aux_cache`]：Windows 上句柄还握着的时候
+//   `rename` 与删除都会失败 —— 那不是疏忽而是这套方案的取舍本身（方案 3.9.1 写的就是这一条）。
+//   失效按**代次**走：别的线程调过 `clear_aux_cache` 之后，本线程下一次取连接时自愈。
+
+thread_local! {
+    static AUX_POOL: std::cell::RefCell<HashMap<PathBuf, Connection>> =
+        std::cell::RefCell::new(HashMap::new());
+    static AUX_GEN_SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+static AUX_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 开库次数（测试构建或 `test-utils` 才有）：A 档到底有没有生效，需要一个数得出来的判据。
+#[cfg(any(test, feature = "test-utils"))]
+static AUX_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 一个"用完放回池里"的连接。`Deref` 到 `Connection`，所以调用方的写法与从前一样。
+///
+/// 为什么不返回 `&Connection`：那个引用得挂在池上，而池是 `RefCell` —— 借用检查会要求
+/// 整个操作期间没人能碰池（正好是备份要清池的那一刻）。改成"取出来用、Drop 时放回"，
+/// 池的锁只在取与放这两瞬持有。
+pub struct AuxConn {
+    path: PathBuf,
+    conn: Option<Connection>,
+}
+
+impl std::ops::Deref for AuxConn {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        // `conn` 只在 Drop 里被取走，活着的时候恒为 `Some`
+        self.conn.as_ref().expect("连接在 Drop 之前不会为空")
+    }
+}
+
+impl Drop for AuxConn {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else { return };
+        let path = self.path.clone();
+        AUX_POOL.with(|pool| {
+            // 别的线程已经清过池 ⇒ 这一份句柄是过期的（文件可能已被改名或删除），
+            // 放回去就是让下一次查询拿着旧 inode 读数
+            if AUX_GEN_SEEN.get() != AUX_GEN.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            pool.borrow_mut().insert(path, conn);
+        });
+    }
+}
+
+/// 取一份附属库的连接（同一线程内复用）。
+///
+/// `pragmas` 只在**新开**时跑一遍 —— 复用那条连接已经带着 WAL / busy_timeout 了，
+/// 这正是省下 2.4 ms 的地方。
+pub fn aux_conn(path: &Path, pragmas: impl FnOnce(&Connection)) -> rusqlite::Result<AuxConn> {
+    let gen = AUX_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let pooled = AUX_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if AUX_GEN_SEEN.get() != gen {
+            pool.clear();
+            AUX_GEN_SEEN.set(gen);
+        }
+        pool.remove(path)
+    });
+    if let Some(conn) = pooled {
+        return Ok(AuxConn {
+            path: path.to_path_buf(),
+            conn: Some(conn),
+        });
+    }
+    std::fs::create_dir_all(path.parent().unwrap_or(path)).ok();
+    let conn = Connection::open(path)?;
+    #[cfg(any(test, feature = "test-utils"))]
+    AUX_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    pragmas(&conn);
+    Ok(AuxConn {
+        path: path.to_path_buf(),
+        conn: Some(conn),
+    })
+}
+
+/// 放掉本线程这一份、并让所有线程的下一次取用作废：备份改名与换数据目录之前必须叫一声。
+///
+/// 顺序也是判据的一半（写"这库读不动"那一族夹具时要知道）：先叫这一声、再改文件。
+/// 反过来 —— 先把主库文件写成坏字节、再放句柄 —— 关闭那一下会把 WAL 检查点回主库，
+/// 正好盖掉刚写进去的坏内容，于是重开照样读得出行，那一档从此测不到东西。
+pub fn clear_aux_cache() {
+    AUX_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+    AUX_POOL.with(|pool| pool.borrow_mut().clear());
+}
+
+/// 本线程此刻池里有几份连接（诊断与用例用）。
+#[cfg(any(test, feature = "test-utils"))]
+pub fn aux_pool_len_for_test() -> usize {
+    AUX_POOL.with(|pool| pool.borrow().len())
+}
+
+/// 这个构建里一共真的开过几次库（A 档有没有生效就靠它数）。
+#[cfg(any(test, feature = "test-utils"))]
+pub fn aux_opens_for_test() -> u64 {
+    AUX_OPENS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

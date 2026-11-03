@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Local;
-use rusqlite::Connection;
 
 use crate::paths;
 
@@ -24,14 +23,13 @@ pub fn db_path() -> std::path::PathBuf {
     paths::data_dir().join("focusflow_pomodoro.db")
 }
 
-/// 打开本地库：WAL + busy_timeout，避免并发短锁导致读写直接失败。
-fn open_local() -> rusqlite::Result<Connection> {
-    std::fs::create_dir_all(paths::data_dir()).ok();
-    let conn = Connection::open(db_path())?;
-    conn.pragma_update(None, "journal_mode", "WAL").ok();
-    conn.pragma_update(None, "synchronous", "NORMAL").ok();
-    conn.busy_timeout(std::time::Duration::from_secs(15)).ok();
-    Ok(conn)
+/// 打开番茄钟库：同一线程内复用（方案 3.9.1 的 A 档，理由同 `accounting::open`）。
+fn open_local() -> rusqlite::Result<crate::db::connection::AuxConn> {
+    crate::db::connection::aux_conn(&db_path(), |conn| {
+        conn.pragma_update(None, "journal_mode", "WAL").ok();
+        conn.pragma_update(None, "synchronous", "NORMAL").ok();
+        conn.busy_timeout(std::time::Duration::from_secs(15)).ok();
+    })
 }
 
 /// 初始化番茄钟数据库。
@@ -1104,6 +1102,8 @@ mod tests {
         let (_, _, _, sum_gap) = today_summary();
         assert!(sum_gap.is_empty(), "同上，今日汇总那一问: {sum_gap}");
 
+        // 先放掉本线程池里那份句柄：Windows 上句柄还握着的时候，删除与同名占位都会失败
+        crate::db::connection::clear_aux_cache();
         std::fs::remove_file(&path).expect("先撤掉真库");
         std::fs::create_dir_all(&path).expect("在同一位置摆一个目录");
 
@@ -1340,6 +1340,7 @@ mod busy_lock_tests {
         let _lock = crate::paths::test_app_dir_lock();
         let _dir = crate::paths::test_app_dir("pomo_stop_fail");
         init_db().ok();
+        crate::db::connection::clear_aux_cache();
         std::fs::remove_file(db_path()).ok();
         std::fs::create_dir_all(db_path()).expect("夹具：把番茄库路径做成目录");
 

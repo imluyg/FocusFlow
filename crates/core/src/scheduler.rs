@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{Local, NaiveDateTime, Timelike};
-use rusqlite::Connection;
 
 use crate::paths;
 
@@ -33,13 +32,13 @@ pub fn db_path() -> std::path::PathBuf {
     paths::data_dir().join("focusflow_scheduler.db")
 }
 
-fn open() -> rusqlite::Result<Connection> {
-    std::fs::create_dir_all(paths::data_dir()).ok();
-    let conn = Connection::open(db_path())?;
-    conn.pragma_update(None, "journal_mode", "WAL").ok();
-    conn.pragma_update(None, "synchronous", "NORMAL").ok();
-    conn.busy_timeout(std::time::Duration::from_secs(15)).ok();
-    Ok(conn)
+/// 打开日程库：同一线程内复用（方案 3.9.1 的 A 档，理由同 `accounting::open`）。
+fn open() -> rusqlite::Result<crate::db::connection::AuxConn> {
+    crate::db::connection::aux_conn(&db_path(), |conn| {
+        conn.pragma_update(None, "journal_mode", "WAL").ok();
+        conn.pragma_update(None, "synchronous", "NORMAL").ok();
+        conn.busy_timeout(std::time::Duration::from_secs(15)).ok();
+    })
 }
 
 /// 初始化表结构（幂等）。
@@ -1747,7 +1746,7 @@ mod tests {
         {
             // 夹具只负责把"老库长什么样"摆出来：同一批列名、另一种列序。
             // "按名字读"是产品的事，摘掉点名列清单这条判据就必须红。
-            let conn = Connection::open(db_path()).expect("打开调度库");
+            let conn = rusqlite::Connection::open(db_path()).expect("打开调度库");
             conn.execute_batch(
                 "DROP TABLE scheduled_tasks;
                  CREATE TABLE scheduled_tasks (
@@ -1886,6 +1885,8 @@ mod tests {
 
         // ③ 库根本开不出来 → Err，且原因说清是"打不开库"（不能说成"没这条任务"）
         let path = db_path();
+        // 先放掉本线程池里那份句柄：句柄握着的时候 Windows 上删不掉，同名目录也就摆不出来
+        crate::db::connection::clear_aux_cache();
         let _ = std::fs::remove_file(&path);
         for suffix in ["-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
@@ -3255,6 +3256,7 @@ mod tests {
         // ③ 库整个打不开：清单是空的，但那一位必须写成一句原因
         {
             let p = db_path();
+            crate::db::connection::clear_aux_cache();
             std::fs::remove_file(&p).unwrap();
             // 同名目录让 `Connection::open` 直接失败（不是"给你一个空库"）
             std::fs::create_dir(&p).unwrap();

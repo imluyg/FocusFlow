@@ -1955,6 +1955,8 @@ mod tests {
         {
             let _: mlua::Result<()> = lua.load("focusflow.scheduler_shutdown()").eval();
             let p = crate::scheduler::db_path();
+            // 连接池现在也握着这份文件：不清掉本线程那一份，下面 20 次重试照样删不动
+            crate::db::connection::clear_aux_cache();
             // 把文件挪开要让调度线程一次（它每 30 秒开一次库，可能正握在那一瞬）：
             // 不让就是只有连跑才红的随机红。
             let mut moved = false;
