@@ -14,7 +14,9 @@ use focusflow_core::config::FocusFlowConfig;
 use focusflow_core::db;
 use focusflow_core::paths;
 use focusflow_core::plugins::manager::PluginManager;
-use focusflow_core::plugins::{permissions, plugin_events, plugin_store, PluginSource};
+use focusflow_core::plugins::{
+    permissions, plugin_events, plugin_store, plugin_timers, PluginSource,
+};
 
 fn guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
@@ -231,6 +233,45 @@ fn subscribing_to_tick_still_needs_only_timer() {
         read_cell(stem, "last").is_none(),
         "app_change 的载荷不该喂给只订 tick 的那一格，实得 {:?}",
         read_cell(stem, "last")
+    );
+    clear_slot();
+}
+
+/// 事件回调跑在**投递那一拍的线程**上（验收第 5 条对这一族事件的照法）。
+///
+/// 这一条盯的是件口那个设计本身：投的人是采样线程，如果取的时候顺手在投的那一侧调
+/// 回调，就是往另一根线程的 VM 里伸手 —— 症状是偶发崩溃或数据错乱，而不是报错。
+/// 读数按 owner 分格，所以"另一根线程"那一条对照必须留着：谁都能成立的读数等于没读。
+#[test]
+fn the_event_callback_runs_on_the_pumping_thread() {
+    let _g = guard();
+    clear_slot();
+    let app = paths::test_app_dir("app_change_thread");
+    let stem = "ac_thread";
+    let (mut pm, _name) = load(&app, stem, &["events.app", "storage.read", "storage.write"]);
+
+    let other = std::thread::spawn(|| format!("{:?}", std::thread::current().id()))
+        .join()
+        .expect("取另一根线程的 id");
+    let mine = format!("{:?}", std::thread::current().id());
+    assert_ne!(other, mine, "夹具前提：这两根线程得真是两根");
+    assert_eq!(
+        plugin_timers::last_fire_thread_for_test(stem),
+        None,
+        "还没投递就留下了记录 = 这一格被别人用过"
+    );
+
+    plugin_events::post_app_change("记事本.exe");
+    let _ = pm.pump_timers();
+    assert_eq!(
+        plugin_timers::last_fire_thread_for_test(stem),
+        Some(mine),
+        "回调不在投递那一拍的线程上跑，就是往另一个 VM 里伸手"
+    );
+    assert_ne!(
+        plugin_timers::last_fire_thread_for_test(stem),
+        Some(other),
+        "读数与调用方线程相等这条如果谁都成立，就是量具坏了"
     );
     clear_slot();
 }
