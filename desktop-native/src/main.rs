@@ -4641,6 +4641,30 @@ fn avg_sub(snap: &Snapshot) -> String {
     }
 }
 
+/// 打卡条那七个点的达标态：**只有末格（今天）改成屏上那份权威今日读数**，其余六格照旧吃
+/// `goal_status` 算出来的（它们讲的是已经落库的日子，本来就该读库）。
+///
+/// 为什么要改这一格：`g.days` 末位是"库值 + 未落库增量"，而 `flush_pending` 把一批增量从
+/// 内存取走、还没写进 SQLite 的那一瞬，两边都没有它 —— `collect::today_total` 的注释就记着
+/// 这个空窗（实测 `today = 5 → 0 → 5`）。进度条与「今日 x / 目标 y」读的是那条权威值，
+/// 于是同一页出现**绿条配灰点**：屏上自己跟自己对着说"今天到底达没达标"。
+///
+/// 改之前先确认末格真是今天：快照比屏幕慢一拍、正好跨过午夜时末格还是昨天，那就一个字都不改
+/// （否则午夜后那几秒，昨天那一格会被今天的读数点亮）。
+fn goal_dot_states(
+    g: &focusflow_core::stats::GoalStatus,
+    today_str: &str,
+    today_met: bool,
+) -> Vec<bool> {
+    let mut out: Vec<bool> = g.days.iter().map(|(_, _, m)| *m).collect();
+    if let (Some((key, _, _)), Some(slot)) = (g.days.last(), out.last_mut()) {
+        if key == today_str {
+            *slot = today_met;
+        }
+    }
+    out
+}
+
 /// 排行榜/应用/设备三屏空榜时的那句话。
 ///
 /// 三句从前都把窗口写死成「今日」，而这三屏读的是 `window_days(period)` 那一段
@@ -5444,7 +5468,14 @@ fn draw_goal_strip(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot) {
         &p.br.muted,
     );
 
-    for (i, (_, _, dmet)) in g.days.iter().enumerate().take(7) {
+    // 今天那一格跟着进度条那份读数走（理由见 `goal_dot_states`）：绿条配灰点是屏上自相矛盾。
+    // 今天那一格跟着进度条那份读数走（理由见 `goal_dot_states`）：绿条配灰点是屏上自相矛盾。
+    let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+    for (i, dmet) in goal_dot_states(g, &today_str, met)
+        .iter()
+        .enumerate()
+        .take(7)
+    {
         let dot = rect(dots_x + i as f32 * 17.0, r.top + 16.0, 14.0, 14.0);
         p.round(
             dot,
@@ -12964,6 +12995,86 @@ mod window_say_tests {
         assert!(
             !pending.contains("还没有记录"),
             "不许给两个窗口口径: {pending}"
+        );
+    }
+
+    /// 打卡条今天那颗点不许与同一页的进度条对着说话。
+    ///
+    /// `g.days` 末位吃的是"库值 + 未落库增量"，而 `flush_pending` 把一批从内存取走、还没写进
+    /// SQLite 的那一瞬两边都没有它（`collect::today_total` 的注释记着实测 `5 → 0 → 5`）；
+    /// 进度条与「今日 x / 目标 y」读的是那条权威值 ⇒ 同一页绿条配灰点，屏上自己跟自己讲
+    /// "今天到底达没达标"。四条腿：达标时末格跟着亮、没过线时末格跟着灭、
+    /// 末格不是今天（刚跨午夜的那一拍旧快照）一个字都不改、其余六格永远不动（读库是对的）。
+    #[test]
+    fn the_newest_dot_follows_the_authoritative_today() {
+        use focusflow_core::stats::GoalStatus;
+        let g = |days: Vec<(String, i64, bool)>| GoalStatus {
+            goal: 10,
+            today: 0,
+            today_met: false,
+            streak: 0,
+            best: 0,
+            days,
+        };
+        let d = |s: &str, met: bool| (s.to_string(), 0, met);
+        let week = vec![
+            d("2026-10-28", true),
+            d("2026-10-29", false),
+            d("2026-10-30", true),
+            d("2026-10-31", false),
+            d("2026-11-01", true),
+            d("2026-11-02", true),
+            d("2026-11-03", false),
+        ];
+
+        let met = goal_dot_states(&g(week.clone()), "2026-11-03", true);
+        assert_eq!(
+            met,
+            vec![true, false, true, false, true, true, true],
+            "只有今天那一格能被进度条那份读数改写"
+        );
+
+        let mut last_lit = week.clone();
+        last_lit[6].2 = true;
+        let met = goal_dot_states(&g(last_lit), "2026-11-03", false);
+        assert!(!met[6], "进度条没过线时，今天那颗不许自己亮着");
+        assert_eq!(
+            met[..6].to_vec(),
+            vec![true, false, true, false, true, true],
+            "其余六格读的是已经落库的日子，不该被今天的读数改动"
+        );
+
+        let met = goal_dot_states(&g(week.clone()), "2026-11-04", true);
+        assert_eq!(
+            met,
+            vec![true, false, true, false, true, true, false],
+            "末格是昨天（刚跨过午夜那一拍）时不许拿今天的读数去点它"
+        );
+
+        // 接线腿：画点那一圈必须吃这个函数，且喂进去的是进度条那份 `met`
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            flat.matches("goal_dot_states(g,&today_str,met)").count(),
+            1,
+            "点那一圈没接上进度条那份权威读数，实得 {}",
+            flat.matches("goal_dot_states(g,&today_str,met)").count()
+        );
+        assert_eq!(
+            flat.matches("for(i,(_,_,dmet))in g.days.iter()").count(),
+            0,
+            "画点又改回直接吃 g.days（今天那颗会与进度条对着说）"
+        );
+
+        assert!(
+            goal_dot_states(&g(vec![]), "2026-11-03", true).is_empty(),
+            "空清单不许 panic，也不许凭空造出一格"
         );
     }
 }
