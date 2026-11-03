@@ -6607,6 +6607,15 @@ enum POp {
         /// 当前选中的记录 id（画图用的那一份高亮）。
         sel: Vec<String>,
     },
+    /// 图表（折线/柱状）。**没有点击分支**：路线图 3.2.2 本期不做交互，
+    /// 它在命中测试那一圈里必须保持惰性（见 `plugin_view_hit_arms` 那条判据），
+    /// 否则一块画图的矩形会吃掉它下面的按钮。
+    Chart {
+        rect: D2D_RECT_F,
+        kind: String,
+        labels: Vec<String>,
+        points: Vec<i64>,
+    },
 }
 
 impl POp {
@@ -6620,7 +6629,8 @@ impl POp {
             | POp::Field { rect, .. }
             | POp::Select { rect, .. }
             | POp::Button { rect, .. }
-            | POp::Table { rect, .. } => *rect,
+            | POp::Table { rect, .. }
+            | POp::Chart { rect, .. } => *rect,
         }
     }
 }
@@ -6644,6 +6654,14 @@ const PV_TABLE_ROW_H: f32 = 20.0;
 /// 只截 `rows` 等于给画不出来的行留出一块点击区（见
 /// `a_table_with_more_rows_than_drawn_has_no_invisible_hit_rows`）。
 const PV_TABLE_MAX_ROWS: usize = 6;
+/// 一张插件图表占多高（卡片本体，含轴）。
+///
+/// 与内置页那张「每日活跃趋势」不同一处：那一块的高度跟着窗口走，这一块的正文没有滚动以外的
+/// 自适应，所以钉死一档就行 —— 但必须是**一处**：布局算这个值、画的时候读同一份 plan，
+/// 两边各写一遍就会出现卡片高度与绘图区高度对不上。
+const PV_CHART_H: f32 = 150.0;
+/// 横轴最多标几个刻度文本（面板宽约 900，一格 90 px 已经挤；90 个点全标就是糊成一片）。
+const PV_CHART_MAX_LABELS: usize = 7;
 
 /// 第 `i` 行的整行矩形（画图高亮与点击命中都从这里算，别各写一遍）。
 fn pv_table_row_rect(r: &D2D_RECT_F, i: usize) -> D2D_RECT_F {
@@ -6867,6 +6885,19 @@ fn plugin_view_ops(
                         text: format!("第 {page} / {pages} 页 · 共 {total} 条"),
                     });
                     *y += 22.0;
+                }
+                Widget::Chart {
+                    kind,
+                    labels,
+                    points,
+                } => {
+                    ops.push(POp::Chart {
+                        rect: rect(x, *y, w, PV_CHART_H),
+                        kind: kind.clone(),
+                        labels: labels.clone(),
+                        points: points.clone(),
+                    });
+                    *y += PV_CHART_H + 8.0;
                 }
                 Widget::Row { children } => {
                     // 横向容器先按纵向堆（子控件宽度有限，硬拆列反而更难读）。
@@ -7112,6 +7143,12 @@ fn draw_plugin_view(
                     p.text(label, *br, &p.fmt.center_small, &p.br.white);
                 }
             }
+            POp::Chart {
+                rect: r,
+                kind,
+                labels,
+                points,
+            } => draw_plugin_chart(p, *r, kind, labels, points),
         }
     }
 
@@ -8839,6 +8876,163 @@ fn line_grid_y(plot: D2D_RECT_F, i: usize) -> f32 {
 /// 某个次数在绘图区里的纵坐标：与刻度共用 `top` 做分母，从高度反推才回得到原值。
 fn line_point_y(plot: D2D_RECT_F, top: i64, value: i64) -> f32 {
     plot.bottom - (value as f64 / top as f64) as f32 * plot_height(plot)
+}
+
+/// `kind` 只认 `bar`（大小写与首尾空格都不挑），其它一律按折线画。
+///
+/// 作者把控件类型写成字符串是本协议里的常态，写错一档的代价不该是"整张图消失"或报错：
+/// 折线照样看得出趋势，而这是那一族控件共用的口径（未知控件退化成一行可读的文本，
+/// 不是一片空白）。
+fn chart_is_bar(kind: &str) -> bool {
+    kind.trim().eq_ignore_ascii_case("bar")
+}
+
+/// 一张**插件**图表的画法（纯函数，不碰 D2D）：绘图区、纵轴顶格、横轴标哪几格、空数据怎么说。
+///
+/// 抽出来是因为这几条都是"看着对、其实各算了一遍"的高发地：
+/// · 点高与纵轴刻度必须共用 `axis_top` 那一个分母 —— 内置页就栽过"每档少报 12%"，
+///   只有拿刻度反推高度才看得出来（`the_peak_point_reads_back_as_the_peak_count_through_the_ticks`）；
+/// · 绘图区边距沿用 [`line_plot`]，两处各挑一套边距，同一份数据在插件面板与内置看板页
+///   会画出两个不一样的高度；
+/// · 顶格**永不取 0**：空数据时 `axis_top(0)` 自己兜成 4，除数那一头不留坑；
+/// · 横轴文本从**最新那一格**往前每隔 `label_step` 标一个，所以最后一天一定有文本
+///   （90 个点全标就是一片糊）。
+#[derive(Debug)]
+struct PluginChartPlan {
+    plot: D2D_RECT_F,
+    /// 纵轴顶格（也是点高的分母），恒 ≥ 4
+    top: i64,
+    /// 0 = 一个都不标（没有文本或没有数据）；否则从最后一格往前每这么多格标一个
+    label_step: usize,
+    empty: bool,
+    bars: bool,
+}
+
+fn plugin_chart_plan(card: D2D_RECT_F, kind: &str, points: &[i64]) -> PluginChartPlan {
+    let plot = line_plot(card);
+    let peak = points.iter().copied().max().unwrap_or(0);
+    PluginChartPlan {
+        plot,
+        top: axis_top(peak),
+        label_step: if points.is_empty() {
+            0
+        } else {
+            points.len().div_ceil(PV_CHART_MAX_LABELS)
+        },
+        empty: points.is_empty(),
+        bars: chart_is_bar(kind),
+    }
+}
+
+/// 第 `i` 格的横轴文本该不该标出来（`n` = 点数）。最后一格必标，其余往前每 `step` 格一个。
+///
+/// 单独一个函数是因为画与测都要问同一件事：按"索引整除"来标会让最后一天有没有文本
+/// 取决于点数是不是步长的整数倍 —— 那正是趋势图最需要看的那一天。
+fn chart_label_at(n: usize, step: usize, i: usize) -> bool {
+    step > 0 && i < n && (n - 1 - i).is_multiple_of(step)
+}
+
+/// 画一张插件图表。线、柱、网格、纵轴数字全部复用内置页那一套几何函数。
+fn draw_plugin_chart(p: &P<'_>, r: D2D_RECT_F, kind: &str, labels: &[String], points: &[i64]) {
+    p.card(r, R_CARD);
+    let plan = plugin_chart_plan(r, kind, points);
+    let plot = plan.plot;
+    let grid_weak = p.brush(with_alpha(p.pal.grid, 0.55));
+    for i in 0..=4 {
+        let y = line_grid_y(plot, i);
+        if let Some(g) = &grid_weak {
+            p.line(plot.left, y, plot.right, y, g, 1.0);
+        }
+    }
+    if plan.empty {
+        // 空数据不许留白（3.2.2）：网格与基线照画，中间说一句「暂无数据」。
+        // 「面板是空的但没有任何提示」是这一族 UI 明令禁止的状态 —— 用户只能猜。
+        p.text(
+            "暂无数据",
+            rect(
+                plot.left,
+                (plot.top + plot.bottom) / 2.0 - 9.0,
+                plot_width(plot),
+                18.0,
+            ),
+            &p.fmt.caption_center,
+            &p.br.muted,
+        );
+        return;
+    }
+    for i in 0..=4 {
+        let y = line_grid_y(plot, i);
+        p.text(
+            &thousands(line_tick_value(plan.top, i).max(0) as u64),
+            rect(plot.left - 48.0, y - 7.0, 44.0, 14.0),
+            &p.fmt.caption_right,
+            &p.br.muted,
+        );
+    }
+    let n = points.len();
+    if plan.bars {
+        let slot = plot_width(plot) / n.max(1) as f32;
+        let bw = (slot * 0.6).max(2.0);
+        for (i, v) in points.iter().enumerate() {
+            let cx = line_point_x(plot, n, i);
+            let y = line_point_y(plot, plan.top, (*v).max(0));
+            p.round(
+                rect(cx - bw / 2.0, y, bw, (plot.bottom - y).max(1.0)),
+                R_MICRO,
+                &p.br.accent,
+                None,
+            );
+        }
+    } else {
+        let pt = |i: usize| Vector2 {
+            X: line_point_x(plot, n, i),
+            Y: line_point_y(plot, plan.top, points[i].max(0)),
+        };
+        let pts: Vec<Vector2> = (0..n).map(pt).collect();
+        p.area(&pts, plot);
+        for i in 1..n {
+            let a = pt(i - 1);
+            let b = pt(i);
+            unsafe {
+                p.rt.DrawLine(a, b, &p.br.accent, 2.0, None);
+            }
+        }
+        if n == 1 {
+            let c = pt(0);
+            p.round(
+                rect(c.X - 4.0, c.Y - 4.0, 8.0, 8.0),
+                R_MICRO,
+                &p.br.accent,
+                None,
+            );
+        }
+    }
+    // 横轴：一格给 `slot × step` 宽（最后一格靠右、按右对齐收），文本自己带长度上界 ——
+    // 这块 UI 不按矩形裁切，画得下与否取决于传进去几格宽。
+    let slot = plot_width(plot) / n.max(1) as f32;
+    let cell_w = (slot * plan.label_step as f32).clamp(28.0, 90.0);
+    for (i, text) in labels.iter().enumerate() {
+        if !chart_label_at(n, plan.label_step, i) {
+            continue;
+        }
+        let cx = line_point_x(plot, n, i);
+        let last = i + 1 == n;
+        p.text(
+            &p.clip(text, &p.fmt.caption, cell_w),
+            rect(
+                (cx - cell_w / 2.0).max(plot.left),
+                plot.bottom + 4.0,
+                cell_w,
+                14.0,
+            ),
+            if last {
+                &p.fmt.caption_right
+            } else {
+                &p.fmt.caption_center
+            },
+            &p.br.muted,
+        );
+    }
 }
 
 fn draw_line_chart(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) {
@@ -11650,6 +11844,8 @@ mod chart_axis_mirror_tests {
         for what in [
             "fn draw_table",
             "fn draw_line_chart",
+            "fn draw_plugin_chart",
+            "fn plugin_chart_plan",
             "fn left_rows",
             "fn gap_note",
             "fn axis_top",
@@ -11660,6 +11856,175 @@ mod chart_axis_mirror_tests {
                  接线守卫会开始少扫生产码（少扫不会红，只会假绿）"
             );
         }
+    }
+
+    /// 插件图表与内置页那张折线**共用同一把纵轴尺子**：顶格由 [`axis_top`] 定，
+    /// 最高点拿刻度反推必须回得到原值。
+    ///
+    /// 分两处算分母的后果内置页已经演过一遍：点高按 `峰 × 1.12`、刻度按另一套，
+    /// 整条纵轴每档少报约 12%，而"峰刚好贴着顶格"看着完全像对的 ——
+    /// 只有拿刻度反推高度才看得出来（本轮的插件图必须走同一条路，否则同一天的数字
+    /// 在插件面板与内置看板页会画成两个高度）。
+    #[test]
+    fn a_plugin_chart_shares_the_axis_ruler_with_the_builtin_trend() {
+        let card = rect(0.0, 0.0, 900.0, 150.0);
+        let points: Vec<i64> = vec![10, 40, 25, 7];
+        let plan = plugin_chart_plan(card, "line", &points);
+        assert_eq!(
+            plan.top,
+            axis_top(40),
+            "顶格必须是 axis_top(峰值)，不许自己乘系数"
+        );
+        assert!(plan.top >= 40, "顶格低于峰值会把最高点画到卡片外面");
+
+        let y = line_point_y(plan.plot, plan.top, 40);
+        let back = ((plan.plot.bottom - y) / plot_height(plan.plot) * plan.top as f32) as i64;
+        assert!(
+            (39..=41).contains(&back),
+            "拿刻度反推最高点 = {back}，应为 40 ⇒ 点高与刻度分了两个分母"
+        );
+
+        let ticks: Vec<i64> = (0..5).map(|i| line_tick_value(plan.top, i)).collect();
+        assert_eq!(ticks[0], plan.top, "最上面那条网格必须就是顶格");
+        assert_eq!(ticks[4], 0, "最下面那条必须是 0（基线）");
+        let step = plan.top / 4;
+        for i in 1..5 {
+            assert_eq!(
+                ticks[i - 1] - ticks[i],
+                step,
+                "四档必须等差，否则刻度念得出、图上量不出来: {ticks:?}"
+            );
+        }
+        for i in 0..5 {
+            assert!(
+                line_grid_y(plan.plot, i) <= plan.plot.bottom + 0.01,
+                "网格线第 {i} 条落到绘图区外面"
+            );
+        }
+    }
+
+    /// 空数据、漏写 kind、写错 kind 这三种都要"仍然画出可读的一张图"，不是留白、不是消失。
+    ///
+    /// 3.2.2 把这条写成了硬要求（空数据画基线并显示「暂无数据」）；而 `points` 为空
+    /// 是这一族最常见的真实状态：今天还没人按键、新装的第一周、插件刚启用还没数据。
+    /// 顶格那一头还有一条隐藏要求：**不能取 0**，[`line_point_y`] 拿它做除数。
+    #[test]
+    fn an_empty_or_mis_kinded_plugin_chart_still_draws_something() {
+        let card = rect(0.0, 0.0, 900.0, 150.0);
+        let empty = plugin_chart_plan(card, "", &[]);
+        assert!(empty.empty, "没有点 ⇒ 必须走「暂无数据」那一支，而不是留白");
+        assert_eq!(empty.label_step, 0, "空数据不标横轴文本");
+        assert_eq!(empty.top, axis_top(0), "顶格不许取 0：它是点高的除数");
+        assert!(!empty.bars, "kind 漏写按折线画");
+
+        for kind in ["bar", "BAR", " bar ", "Bar"] {
+            assert!(chart_is_bar(kind), "{kind} 该按柱状画");
+        }
+        for kind in ["", "line", "LINE", "pie", "柱状", "histogram"] {
+            assert!(
+                !chart_is_bar(kind),
+                "{kind} 不该被认成柱状：认错了会画成完全不同的图，而写的人看不出来"
+            );
+        }
+    }
+
+    /// 横轴文本必须**永远包含最后一格**，且总标注数不超过那一档上限。
+    ///
+    /// 按"索引整除"来标会让最后一天有没有文本取决于点数能否整除步长 —— 而趋势图最需要
+    /// 认出的就是最新那一格（今天）。这条函数从尾部往前数，把这个依赖拿掉。
+    #[test]
+    fn the_newest_point_always_gets_an_axis_label() {
+        for n in [1usize, 2, 3, 7, 8, 13, 30, 31, 60, 90] {
+            let step = n.div_ceil(PV_CHART_MAX_LABELS);
+            assert!(
+                chart_label_at(n, step, n - 1),
+                "{n} 个点时最后一格没有文本（step={step}）"
+            );
+            let marked: Vec<usize> = (0..n).filter(|i| chart_label_at(n, step, *i)).collect();
+            assert!(
+                marked.len() <= PV_CHART_MAX_LABELS,
+                "{n} 个点标了 {} 格，超出这一档上限 {PV_CHART_MAX_LABELS} ⇒ 糊成一片",
+                marked.len()
+            );
+            assert!(
+                marked.iter().all(|i| *i < n),
+                "标到了不存在的格: {marked:?}"
+            );
+        }
+        assert!(
+            !chart_label_at(5, 0, 4),
+            "step=0（空数据/没文本）一个都不标"
+        );
+        assert!(!chart_label_at(5, 2, 5), "越界索引不标");
+    }
+
+    /// 布局这一头：图占自己那一格高度、进 ops、并跟着算进内容高度；
+    /// 而点击那一圈**必须没有它**（本期不做交互，见 3.2.2）。
+    ///
+    /// 后半截是接线判据而不是行为判据：交互没做的时候，加一个 `POp::Chart` 的点击分支
+    /// 不会让任何用走红，却会把这块矩形变成一块吃掉后续按钮的点击区（表格那一条
+    /// `a_table_with_more_rows_than_drawn_has_no_invisible_hit_rows` 就是同族的教训）。
+    #[test]
+    fn a_plugin_chart_takes_its_own_row_and_stays_inert_to_clicks() {
+        let view = focusflow_core::plugins::PluginView {
+            title: "夹具".to_string(),
+            widgets: vec![
+                focusflow_core::plugins::Widget::Chart {
+                    kind: "line".to_string(),
+                    labels: vec!["一".to_string(), "二".to_string()],
+                    points: vec![3, 9],
+                },
+                focusflow_core::plugins::Widget::Button {
+                    id: "b".to_string(),
+                    text: "刷新".to_string(),
+                    disabled: false,
+                    modal: None,
+                    sel: false,
+                    group: String::new(),
+                },
+            ],
+        };
+        let area = rect(0.0, 0.0, 900.0, 400.0);
+        let ops = plugin_view_ops(&view, area, 0.0, &HashMap::new());
+        let Some(POp::Chart {
+            rect: r,
+            kind,
+            labels,
+            points,
+        }) = ops.first()
+        else {
+            panic!("夹具那张图没走到 POp::Chart，实得 {} 项", ops.len());
+        };
+        assert_eq!(r.bottom - r.top, PV_CHART_H, "卡片高度必须由那一处常量定");
+        assert_eq!(kind, "line");
+        assert_eq!(labels.len(), 2);
+        assert_eq!(points, &vec![3, 9]);
+
+        // 排在它后面的按钮必须被推下去，而不是压在图上（正文没有重叠布局）
+        let Some(button_top) = ops.get(1).map(|op| op.bounds().top) else {
+            panic!("按钮那一格没进布局：ops 只有 {} 项", ops.len());
+        };
+        assert!(
+            button_top >= r.bottom,
+            "图表后面的控件压在了图上: 按钮 top={button_top} 卡片 bottom={}",
+            r.bottom
+        );
+        assert!(
+            plugin_content_height(&view, area) >= PV_CHART_H,
+            "内容高度没把这一格算进去 ⇒ 滚动位置会被夹过头，图的下半截看不见"
+        );
+
+        // 接线：`POp::Chart` 在生产段只出现在三处（bounds 那一条 | 列表、布局 push、画），
+        // 第四处只可能是有人给它加了点击分支。
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            flat.matches("POp::Chart{").count(),
+            3,
+            "图表这一族的落点不再是「bounds／布局／画」三处 —— \
+             本期不做交互，多一处要先问它是不是把这块矩形变成了点击区"
+        );
     }
 }
 

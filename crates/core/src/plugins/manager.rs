@@ -1991,7 +1991,7 @@ fn parse_widget(
         )));
     }
     let wtype: String = w.get("type")?;
-    use crate::plugins::{FormField, Widget};
+    use crate::plugins::{FormField, Widget, MAX_CHART_POINTS};
     match wtype.as_str() {
         "label" => Ok(Widget::Label(w.get("text").unwrap_or_default())),
         "heading" => Ok(Widget::Heading(w.get("text").unwrap_or_default())),
@@ -2144,8 +2144,90 @@ fn parse_widget(
                 onselect: w.get("onselect").unwrap_or_default(),
             })
         }
+        "chart" => {
+            let mut labels = lua_text_list(w, "labels");
+            let (mut points, dropped) = lua_number_list(w, "points");
+            if dropped > 0 && notice_once(&format!("chart-drop:{auto_id}:{dropped}")) {
+                tracing::warn!(
+                    "图表控件（{auto_id}）里有 {dropped} 个值不是数，已跳过、其余照常画 —— \
+                     points 要给一串数字（{MAX_CHART_POINTS} 个以内）"
+                );
+            }
+            // 上限挂在解析这一头，且夹的是**开头**：趋势图被夹掉的一定是最早那几个，
+            // 留最近这段才是读者要看的那一段（夹尾部等于把最新数据藏起来）。
+            if points.len() > MAX_CHART_POINTS {
+                let over = points.len() - MAX_CHART_POINTS;
+                points.drain(..over);
+                labels.drain(..over.min(labels.len()));
+                if notice_once(&format!("chart-cap:{auto_id}:{}", over + MAX_CHART_POINTS)) {
+                    tracing::warn!(
+                        "图表控件（{auto_id}）交了 {} 个点，只画最近 {MAX_CHART_POINTS} 个\
+                         （夹掉最早的 {over} 个）：横轴范围请由插件自己收窄，别指望宿主画得下",
+                        over + MAX_CHART_POINTS
+                    );
+                }
+            }
+            // 点数与刻度数对齐：谁的尾巴对谁的尾巴（夹过头部之后长度可能差几格）
+            if labels.len() > points.len() {
+                labels.drain(..labels.len() - points.len());
+            }
+            Ok(Widget::Chart {
+                kind: w.get("kind").unwrap_or_default(),
+                labels,
+                points,
+            })
+        }
         _ => Ok(Widget::Label(format!("[未知控件: {wtype}]"))),
     }
+}
+
+/// 把 Lua 那一侧「一串文本」读成 `Vec<String>`：逐个元素自己转，**不按整表转**。
+///
+/// 整表 `w.get::<Vec<String>>("labels")` 在作者把横轴写成 `{1, 2, 3}`（日序号，很常见的写法）
+/// 时整串转换失败，而这一族全都是 `.unwrap_or_default()` 的口径 —— 于是一格都不剩，
+/// 症状是图画出来了、横轴空白，面板一句话不说。逐个转把"这一项不是文本"只算在它自己头上：
+/// 数字变成自己的十进制文本，其它项照常。
+fn lua_text_list(w: &mlua::Table, key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(list) = w.get::<mlua::Table>(key) else {
+        return out;
+    };
+    for (_, v) in list.pairs::<mlua::Value, mlua::Value>().flatten() {
+        out.push(match v {
+            mlua::Value::String(s) => s.to_string_lossy().to_string(),
+            mlua::Value::Integer(n) => n.to_string(),
+            mlua::Value::Number(f) => f.to_string(),
+            other => other.to_string().unwrap_or_default(),
+        });
+    }
+    out
+}
+
+/// 把 Lua 那一侧「一串数值」读成 `Vec<i64>`，并交回**丢掉了几个不是数的元素**。
+///
+/// 与 [`lua_text_list`] 同一理由：整表转 `Vec<i64>` 会因为其中一个 `"12 万"`（作者从
+/// 展示文本里抄来的）而一个都不剩，画出来是一张「暂无数据」的空图，而盘上明明有值。
+/// 布尔/nil/表 这些是真的当不成数，丢掉并交回个数，由调用方出声。
+fn lua_number_list(w: &mlua::Table, key: &str) -> (Vec<i64>, usize) {
+    let mut out = Vec::new();
+    let mut dropped = 0usize;
+    let Ok(list) = w.get::<mlua::Table>(key) else {
+        return (out, dropped);
+    };
+    for (_, v) in list.pairs::<mlua::Value, mlua::Value>().flatten() {
+        let n = match v {
+            mlua::Value::Integer(i) => Some(i),
+            // 小数按既有那把尺子截断（表格读数把 Number 也 `as i64`），不另发明四舍五入
+            mlua::Value::Number(f) => Some(f as i64),
+            mlua::Value::String(s) => s.to_string_lossy().trim().parse::<i64>().ok(),
+            _ => None,
+        };
+        match n {
+            Some(v) => out.push(v),
+            None => dropped += 1,
+        }
+    }
+    (out, dropped)
 }
 
 #[cfg(test)]
@@ -3401,15 +3483,13 @@ end
     ///   从此以用户插件身份活着"与「升级覆盖内置脚本」这条既有行为相反。
     #[test]
     fn legacy_plugins_are_copied_into_the_data_dir_without_overwriting() {
-        let legacy = std::env::temp_dir().join(format!(
-            "ff_legacy_copy_{}_{}/plugins",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let user = legacy.with_file_name("plugins_user");
+        // 用 `test_app_dir` 那一套临时目录（Drop 收尾，**断言失败也收**）：手写
+        // `remove_dir_all` 只在全绿时执行，一次红就在 %TEMP% 里永久留一份；
+        // 门禁的 TEMP_LEAK 那一道量的就是这个。
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("legacy_copy");
+        let legacy = tmp.path().join("plugins");
+        let user = tmp.path().join("data").join("plugins");
         write_lua(&legacy, "mytool", "PLUGIN_NAME = \"旧目录那份\"\n");
         write_lua(&legacy, "pomodoro_plugin", "PLUGIN_NAME = \"随包的内置\"\n");
         write_lua(&user, "keepme", "PLUGIN_NAME = \"新目录已有\"\n");
@@ -3448,14 +3528,15 @@ end
         );
 
         // 旧目录本来不存在 = 全新安装，不是"读不出来"
-        let fresh = migrate_legacy_plugins(&legacy.with_file_name("no_such_plugins_dir"), &user);
+        let fresh = migrate_legacy_plugins(
+            &tmp.path().join("no_such_plugins_dir"),
+            &tmp.path().join("no_such_user_dir"),
+        );
         assert!(
             fresh.unreadable.is_none(),
             "目录不存在就是没有旧插件，不许报读不出来: {:?}",
             fresh.unreadable
         );
-        let _ = std::fs::remove_dir_all(&legacy);
-        let _ = std::fs::remove_dir_all(&user);
     }
 
     /// 迁移搬不动时只记 error，启动照旧：清单不因此变空，也不交 Err。
@@ -3702,6 +3783,204 @@ end
             ids(&pm),
             first,
             "id 每轮渲染都变 ⇒ 推送一来，正在填的弹窗就没了"
+        );
+    }
+
+    /// 图表控件的解析口径：点数上限夹头部、横轴与数值尾对齐、非法元素只丢自己那一格。
+    ///
+    /// 四条腿各对一个"面板看起来正常但数据是错的"形状：
+    /// ① 超上限夹**尾部**会把最新几天藏起来 —— 趋势图留的必须是最近这一段；
+    /// ② 横轴写成数字（`labels = {1,2,3}`，作者拿日序号填的很常见）时，整表转
+    ///    `Vec<String>` 会一句都不剩 ⇒ 图有、轴空白、还不报错；
+    /// ③ `points` 里混进一个 `"12 万"`（从展示文本抄来的）时，整表转 `Vec<i64>` 同样清零，
+    ///    画出来是一张「暂无数据」的空图，而盘上明明有值 —— 必须只丢那一格并出声；
+    /// ④ `kind` 写错（`pie`）不许把整个控件变成 `[未知控件]` 或空白：按折线画照样看得出趋势。
+    /// 空 `points` 是合法输入（今天还没数据），交回空序列，怎么画由渲染那一头负责（那边
+    /// 有自己的一条：画基线并写「暂无数据」，不许留白）。
+    #[test]
+    fn a_chart_keeps_the_recent_points_and_pairs_its_axis() {
+        use crate::plugins::{Widget, MAX_CHART_POINTS};
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("chart_parse");
+        let plugins = tmp.path().join("plugins");
+
+        let many_points = (1..=100i64)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let many_labels = (1..=100i32)
+            .map(|n| format!("\"d{n}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let fixture = |name: &str, body: &str| {
+            format!(
+                "PLUGIN_NAME = \"{name}\"\nfunction get_view() return {{ title = \"t\", \
+                 widgets = {{ {body} }} }} end\n"
+            )
+        };
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "基本形状",
+                fixture(
+                    "基本形状",
+                    r#"{ type = "chart", kind = "bar", labels = {"甲", "乙"}, points = {1, 2} }"#,
+                ),
+            ),
+            (
+                "夹掉的是头部",
+                fixture(
+                    "夹掉的是头部",
+                    &format!("{{ type = \"chart\", labels = {{{many_labels}}}, points = {{{many_points}}}}}"),
+                ),
+            ),
+            (
+                "横轴填的是数字",
+                fixture(
+                    "横轴填的是数字",
+                    r#"{ type = "chart", labels = {1, 2, 3}, points = {7, 8, 9} }"#,
+                ),
+            ),
+            (
+                "数值里混进一个词",
+                fixture(
+                    "数值里混进一个词",
+                    r#"{ type = "chart", labels = {"a", "b", "c"}, points = {5, "12 万", 7} }"#,
+                ),
+            ),
+            (
+                "kind 写了个画不了的",
+                fixture(
+                    "kind 写了个画不了的",
+                    r#"{ type = "chart", kind = "pie", points = {3} }"#,
+                ),
+            ),
+            (
+                "今天还没有数据",
+                fixture("今天还没有数据", r#"{ type = "chart", points = {} }"#),
+            ),
+        ];
+
+        let mut pm = manager_in(tmp.path());
+        let mut parsed: Vec<(String, String, Vec<String>, Vec<i64>)> = Vec::new();
+        for (stem, src) in &cases {
+            let file = write_lua(&plugins, stem, src);
+            let name = pm
+                .load_plugin(&file)
+                .unwrap_or_else(|e| panic!("这份视图该装得起来（{stem}）: {e}"));
+            let info = pm.get_plugin(&name).expect("插件应在表里");
+            let view = info.view.clone().expect("加载时就该有视图");
+            let widget = view
+                .widgets
+                .first()
+                .unwrap_or_else(|| panic!("{stem} 一个控件都没有"));
+            match widget {
+                Widget::Chart {
+                    kind,
+                    labels,
+                    points,
+                } => parsed.push((
+                    stem.to_string(),
+                    kind.clone(),
+                    labels.clone(),
+                    points.clone(),
+                )),
+                other => panic!(
+                    "{stem} 的 chart 没解析成 Chart 控件，退化成 {other:?} —— \
+                     落到「未知控件」那条臂上时编译与既有判据都不会响"
+                ),
+            }
+        }
+        let find = |stem: &str| -> &(String, String, Vec<String>, Vec<i64>) {
+            parsed
+                .iter()
+                .find(|p| p.0 == stem)
+                .unwrap_or_else(|| panic!("夹具里少了 {stem}"))
+        };
+
+        let (_, kind, labels, points) = find("基本形状");
+        assert_eq!(kind, "bar", "kind 要原样交出去");
+        assert_eq!(labels, &vec!["甲".to_string(), "乙".to_string()]);
+        assert_eq!(points, &vec![1, 2]);
+
+        // ① 一百个点 ⇒ 留最后 90 个（11..=100），横轴跟着一起对齐（d11..=d100）
+        let (head_dropped, tail): (Vec<i64>, Vec<i64>) =
+            ((1..=10i64).collect(), (11..=100i64).collect());
+        let want_labels: Vec<String> = (11..=100i32).map(|n| format!("d{n}")).collect();
+        let got = find("夹掉的是头部");
+        assert_eq!(got.2, want_labels, "横轴必须跟着夹掉同样的头部");
+        assert!(
+            !got.3.starts_with(&head_dropped),
+            "头部那 10 个点还留着 ⇒ 夹的位置不对: {:?}",
+            &got.3[..10.min(got.3.len())]
+        );
+        assert_eq!(got.3, tail, "留的必须是最近 90 天");
+        assert_eq!(
+            got.3.len(),
+            MAX_CHART_POINTS,
+            "上限挂在一个地方，别这里 90 那里 89"
+        );
+
+        // ② 横轴给数字 ⇒ 变成自己的十进制文本，不是一个都不剩
+        assert_eq!(
+            find("横轴填的是数字").2,
+            vec!["1".to_string(), "2".to_string(), "3".to_string()],
+            "整表转 Vec<String> 在这条输入上会清零 ⇒ 图有轴空白"
+        );
+
+        // ③ 混进一个词 ⇒ 只丢那一格（5 与 7 都要留着）
+        assert_eq!(
+            find("数值里混进一个词").3,
+            vec![5, 7],
+            "一格坏不能把整条序列清零"
+        );
+
+        // ④ kind 不认识也照样收下（按折线画是渲染那一头的兜底，控件本身不许消失）
+        assert_eq!(find("kind 写了个画不了的").1, "pie");
+        assert_eq!(find("kind 写了个画不了的").3, vec![3]);
+
+        // 空数据是合法输入：交回空序列，「暂无数据」由渲染画
+        assert!(
+            find("今天还没有数据").3.is_empty(),
+            "空 points 不该变成错误或缺失控件"
+        );
+    }
+
+    /// 图表的两处出声要点名到"是哪个控件"，并且同一件事本进程只说一次。
+    ///
+    /// 插件面板开着时 `get_view()` 每秒跑一轮：夹了 10 个点如果每秒都 warn 一句，
+    /// 日志就被同一件事刷满，而真正要看的那条线索（哪个控件、夹了多少）反而找不到。
+    #[test]
+    fn an_over_long_chart_says_it_once_and_names_the_widget() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("chart_cap_notice");
+        let plugins = tmp.path().join("plugins");
+        let many = (1..=200i64)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let src = format!(
+            "PLUGIN_NAME = \"长图\"\nfunction get_view() return {{ title = \"t\", widgets = {{ \
+             {{ type = \"chart\", points = {{{many}}} }} }} }} end\n"
+        );
+        let file = write_lua(&plugins, "longchart", &src);
+        let mut pm = manager_in(tmp.path());
+        let (loaded, logs) = crate::logger::capture_logs(|| pm.load_plugin(&file));
+        loaded.expect("这份视图该装得起来");
+        let shown = logs.join("\n");
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("只画最近") && l.contains("200") && l.contains("110")),
+            "夹了头部要点名交了多少、夹掉几个: {shown}"
+        );
+
+        // 第二轮（同一个进程、同一个控件）不许再说一遍
+        let (_, second) = crate::logger::capture_logs(|| {
+            pm.reload_plugin("longchart");
+        });
+        assert!(
+            !second.iter().any(|l| l.contains("只画最近")),
+            "同一件事第二轮不许再刷一遍: {}",
+            second.join("\n")
         );
     }
 
