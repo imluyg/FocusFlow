@@ -7737,6 +7737,45 @@ fn restore_button(g: &TableGeom, y: f32) -> D2D_RECT_F {
     rect(g.x_last - 64.0, y + 3.0, 58.0, 18.0)
 }
 
+/// 缺口清单里到底有几**本**年度库读不动（不是几条读数）。
+///
+/// 一年一份文件（core 那一族各栏读的都是 `paths::year_db_path(year)`），而那一年读不动时
+/// 按键统计／应用时长／设备统计三栏**各记一条**：年份相同、域名不同，`sort` + `dedup`
+/// 也并不掉。从前周报直接念 `gaps.len()` ⇒ 一本读不动的库被说成三本，跨年那一周说成六本，
+/// 而这句话正是"上面那些数字是不是下界"的凭据，数错了没人会去核对。
+///
+/// 形状对不上的那一条（core 改了那句话而没改这里）整串自成一类：宁可多念一本，
+/// 不许把一次读不动吞掉 —— 吞掉等于把下界念成实测。
+fn gap_year_count(gaps: &[String]) -> usize {
+    let mut seen: Vec<&str> = Vec::new();
+    for g in gaps {
+        let head = g.split(" 年库").next().unwrap_or(g.as_str());
+        let key = if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) {
+            head
+        } else {
+            g.as_str()
+        };
+        if !seen.contains(&key) {
+            seen.push(key);
+        }
+    }
+    seen.len()
+}
+
+/// 周报开头那句「这一轮没读全」。**纯函数**：`generate_weekly_report` 要读库、要落文件，
+/// 无头环境里跑不动，而这一句里的两个数（几本库／几条读数）正是最容易说错的地方。
+fn weekly_gap_sentence(gaps: &[String]) -> String {
+    if gaps.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n> 有 {} 个年度库没读全（{} 处读数）：{}",
+        gap_year_count(gaps),
+        gaps.len(),
+        gaps.join("；")
+    )
+}
+
 /// 应用时长：秒 。
 /// 生成「上周」周报（周一~周日），返回 Markdown 路径。旧 WebView 版在每周一自动生成，
 /// 原生端先做成设置页「目标 → 上周周报」里的一颗手动按钮，内容口径与旧版一致。
@@ -7882,13 +7921,9 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
             thousands(device_total.max(0) as u64)
         );
     }
-    if !gaps.is_empty() {
-        let _ = writeln!(
-            out,
-            "\n> 有 {} 个年度库没读全：{}",
-            gaps.len(),
-            gaps.join("；")
-        );
+    let gap_say = weekly_gap_sentence(&gaps);
+    if !gap_say.is_empty() {
+        let _ = write!(out, "{gap_say}");
     }
 
     let _ = writeln!(out, "\n## 每日活跃\n\n| 日期 | 次数 |\n|---|---:|");
@@ -12822,6 +12857,56 @@ mod weekly_report_tests {
 
     fn d(y: i32, m: u32, day: u32) -> chrono::NaiveDate {
         chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    /// 「有 N 个年度库没读全」数的是**几本库**，不是几条读数。
+    ///
+    /// 一年一份文件，而那一年读不动时按键统计／应用时长／设备统计三栏各记一条
+    /// （年份相同、域名不同 ⇒ `sort` + `dedup` 也并不掉）。从前周报那句直接念
+    /// `gaps.len()`：一本读不动的库被说成三本，跨年那一周说成六本 —— 而这句话正是
+    /// "上面那些数字只是下界"的凭据，念错本数没人会去核对。
+    ///
+    /// 三条腿：①同年三条 ⇒ 1 本 / 3 处，并且**不许**出现"有 3 个"；②两个年份四条 ⇒ 2 本 / 4 处；
+    /// ③形状对不上的那条整串自成一类（吞掉一次读不动＝把下界念成实测，并进某一年＝少报一本）。
+    /// 最后再加一条"全都读到时不多一个字"，钉住空清单那一支。
+    #[test]
+    fn the_weekly_report_counts_libraries_not_domain_lines() {
+        let one_year = vec![
+            "2025 年库按键统计读不出来: 盘睡了".to_string(),
+            "2025 年库应用时长读不出来: 盘睡了".to_string(),
+            "2025 年库设备统计读不出来: 盘睡了".to_string(),
+        ];
+        let line = weekly_gap_sentence(&one_year);
+        assert!(
+            line.contains("有 1 个年度库") && line.contains("3 处读数"),
+            "三条同年的缺读只有**一本**库，而清单长度也要一起给: {line}"
+        );
+        assert!(!line.contains("有 3 个"), "不许把一本念成三本: {line}");
+        assert!(line.contains("盘睡了"), "原因尾巴得跟着走出去: {line}");
+
+        let mut two_years = one_year.clone();
+        two_years.push("2024 年库每日趋势读不出来: 打不开".to_string());
+        let line = weekly_gap_sentence(&two_years);
+        assert!(
+            line.contains("有 2 个年度库") && line.contains("4 处读数"),
+            "两个年份四条读数: {line}"
+        );
+
+        let odd = vec![
+            "2025 年库按键统计读不出来: x".to_string(),
+            "读不出是哪一年的那一句".to_string(),
+        ];
+        let line = weekly_gap_sentence(&odd);
+        assert!(
+            line.contains("有 2 个年度库") && line.contains("读不出是哪一年的那一句"),
+            "形状对不上那条要自成一类、既不许被吞也不许并进任何一年: {line}"
+        );
+
+        assert_eq!(
+            weekly_gap_sentence(&[]),
+            "",
+            "全都读到了就多一个字都不许说（空报告里冒出一句警告也是病）"
+        );
     }
 
     /// 周一边界最容易判错：周一当天要的是"刚过去的那一周"（上周一），不是今天。
