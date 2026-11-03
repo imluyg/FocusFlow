@@ -1635,7 +1635,8 @@ pub fn start_periodic_backup() -> crate::startup::CheckResult {
                 }
                 if last.elapsed() >= std::time::Duration::from_secs(hours * 3600) {
                     let max_backups = config.get_int("database", "max_backups", 5);
-                    match backup_database(max_backups) {
+                    let out = backup_database(max_backups);
+                    match &out {
                         BackupOutcome::Failed { reason } => {
                             tracing::error!("定时备份失败: {reason}")
                         }
@@ -1643,6 +1644,10 @@ pub fn start_periodic_backup() -> crate::startup::CheckResult {
                             tracing::debug!("定时备份：无可备份的年度库")
                         }
                         BackupOutcome::Done { .. } => {}
+                    }
+                    // 定时这一路没有人看屏，日志就是唯一的读者：拷贝少一批也得说一句
+                    if out.missed_batch() {
+                        tracing::warn!("定时备份：{}", batch_missed_note());
                     }
                     last = std::time::Instant::now();
                 }
@@ -1696,14 +1701,24 @@ fn snapshot_before_destructive(op: &str) -> Option<String> {
 fn snapshot_note(op: &str, outcome: &BackupOutcome) -> Option<String> {
     match outcome {
         BackupOutcome::Done { count, failed, .. } => {
-            if failed.is_empty() {
+            let mut note = if failed.is_empty() {
                 None
             } else {
                 Some(format!(
                     "{op}: 执行前快照只兜住了 {count} 份，这些库没备份出去: {failed:?} —— \
                      接下来在这几个库上做的删除没有退路"
                 ))
+            };
+            // 全兜住了也可能仍是"少了最近几秒的那一份"：拷贝前那批增量没等到（见 `batch`）。
+            // 破坏性操作拿它当退路，这一档必须一起说出来。
+            if outcome.missed_batch() {
+                let short = batch_missed_note();
+                note = Some(match note {
+                    Some(s) => format!("{s}；而且{short}"),
+                    None => format!("{op}: 执行前快照兜住了 {count} 份，{short}"),
+                });
             }
+            note
         }
         BackupOutcome::NothingToDo => None,
         BackupOutcome::Failed { reason } => Some(format!(
@@ -1840,11 +1855,40 @@ pub enum BackupOutcome {
         count: usize,
         /// 这一轮**没**产出通过校验的备份的库（年度库/附属库名）。空 = 全都备份到了。
         failed: Vec<String>,
+        /// 开始拷贝之前，内存里那一批增量落没落成（见 `writer::BatchFlush`）。
+        ///
+        /// 少了这一栏，`Missed` 那一档在调用方眼里与 `Landed` 完全一样：屏上念「备份完成：5 份」，
+        /// 而那份文件里其实缺最近几秒的按键（写线程正卡在 busy_timeout 里时 `flush(true)`
+        /// 只等 3 秒就撒手，备份照样读得出库）。
+        batch: crate::db::writer::BatchFlush,
     },
     /// 没有该备份的东西：一套年度库都没有、附属库都不在，或历史库都与上次指纹一致
     NothingToDo,
     /// 该备份的都失败了（或年度库根本没能列出来）
     Failed { reason: String },
+}
+
+/// 「这一份拷贝不含最近几秒」那句提醒的**唯一出处**：设置页那颗「执行」、CLI 的
+/// `--backup`、破坏性操作前的兜底快照三处说同一件事，措辞不许各写一份
+/// （本仓同一句话两处不同口径的账已经吃过几次）。
+pub fn batch_missed_note() -> &'static str {
+    "这份拷贝不含最近几秒还没落库的按键（写线程 3 秒内没回音，那一批还在内存里，下一次落库才进库）"
+}
+
+impl BackupOutcome {
+    /// 这一轮交回的备份**少了最近一批还没落库的增量**。
+    ///
+    /// 走这个访问器而不是在各处 `match` 里比 `BatchFlush::Missed`：三处读者（屏上、终端、
+    /// 执行前快照）都只问"要不要带那半句"，写成三份就能被漏掉一份而不被发现。
+    pub fn missed_batch(&self) -> bool {
+        matches!(
+            self,
+            BackupOutcome::Done {
+                batch: crate::db::writer::BatchFlush::Missed,
+                ..
+            }
+        )
+    }
 }
 
 impl BackupOutcome {
@@ -1878,6 +1922,15 @@ impl BackupOutcome {
 /// 那份改名留档、仍留在 `backup/`，而报告与日志说的是它现在到底在哪儿（见 `verify_backup_file`）。
 pub fn backup_database(max_backups: i64) -> BackupOutcome {
     let _guard = BACKUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // **先把内存里那一批增量逼出去再拷贝**：批是攒着每 ≤10 秒才落一次的，用户点下「立即备份」
+    // 通常就发生在刚用过键盘之后，不 flush 的那一份拷贝天生少最近几秒。
+    // 结局带在 `Done.batch` 里，四个调用方（设置页、CLI、定时线程、破坏性操作前的快照）
+    // 都从这一份读数说话 —— 以前"备份前必须 flush"只写在 `flush_confirmed` 的注释里，
+    // 而备份走的是 core 的自由函数，调用方拿不到 writer，谁都没执行过。
+    let batch = crate::db::writer::flush_for_backup();
+    if batch == crate::db::writer::BatchFlush::Missed {
+        tracing::warn!("备份前的 flush 没等到回音（3 秒）：这一份拷贝不含最近那一批按键");
+    }
     std::fs::create_dir_all(paths::backup_dir()).ok();
     // 顺手清掉遗留的 sidecar 垃圾（旧版只删 .db，`-wal`/`-shm` 会永久堆积）
     let swept = sweep_stale_sidecars();
@@ -2155,6 +2208,7 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
             first: backed_up.remove(0),
             count,
             failed,
+            batch,
         }
     } else if !failed.is_empty() {
         BackupOutcome::Failed {
@@ -4758,6 +4812,72 @@ mod tests {
         assert_eq!(merged, 12, "已存在的行应合并计数（5 + 7）");
     }
 
+    /// 一份备份必须含"刚记下、还没落库的那一批"。
+    ///
+    /// 病状不是报错而是**账本少一截**：写线程按 ≤10 秒攒批，用户点下「立即备份」多半就在
+    /// 刚用过键盘之后；拷贝前不 flush 的那一份缺最近几秒，而屏上说的是「备份完成：5 份」。
+    /// `flush_confirmed` 的注释写着"备份前的调用方必须走这一条"，可备份走的是 core 的自由
+    /// 函数，四个调用方（设置页那颗、CLI 的 `--backup`、定时线程、破坏性操作前的快照）
+    /// 都拿不到 writer ⇒ 谁都没执行过。所以 flush 挪进 `backup_database` 自己身上。
+    ///
+    /// 夹具刻意用**一小时**的批间隔：那一批只能靠备份前这一次 flush 出去，不会自己到点落库
+    /// （否则改前也绿）。读数打开的是**拷出来的那个年度库文件**，不是活库。
+    #[test]
+    fn a_backup_covers_the_increment_that_is_still_in_memory() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("backup_covers_pending");
+        queries::invalidate_years_cache();
+
+        let w = crate::db::writer::DbWriter::start(std::time::Duration::from_secs(3600))
+            .expect("测试里写线程必须起得来");
+        // core 那道闸读的就是这一份全局注册（`writer::flush_for_backup`）
+        crate::db::writer::register_panic_recovery(std::sync::Arc::clone(&w));
+
+        let now = chrono::Local::now().timestamp();
+        w.record("第一批", now);
+        // 先把年度库建出来：一件东西都没有的那一轮走的是 NothingToDo，红不到这条腿上
+        w.flush(true);
+        w.record("第二批", now);
+
+        backup_database(5);
+        let year_tag = format!("focusflow_{}", chrono::Local::now().format("%Y"));
+        let entries: Vec<std::path::PathBuf> = std::fs::read_dir(paths::backup_dir())
+            .expect("备份目录该在")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        // 要的是**拷出来的那一份年度库**（`first_path()` 可能是附属库，那一份里没有按键表）
+        let dst = entries
+            .iter()
+            .find(|p| {
+                p.file_name()
+                    .map(|n| {
+                        let n = n.to_string_lossy();
+                        n.starts_with(&year_tag) && n.ends_with(".db")
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or_else(|| panic!("这一轮应产出 {year_tag}_*.db 这一份；backup/={entries:?}"));
+
+        let landed: Vec<String> = connection::open_ro(dst.as_path())
+            .expect("备份文件要打得开")
+            .prepare("SELECT DISTINCT key_name FROM key_counts")
+            .expect("拷出来的文件里有这张表")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("读得动")
+            .filter_map(|s| s.ok())
+            .collect();
+        w.stop_and_wait();
+
+        assert!(
+            landed.contains(&"第一批".to_string()),
+            "已落库那批必须在: {landed:?}"
+        );
+        assert!(
+            landed.contains(&"第二批".to_string()),
+            "刚记下、还在内存里的第二批也要进这份拷贝（备份前没 flush 就红在这条）: {landed:?}"
+        );
+    }
+
     /// 备份必须是**单个自包含文件**：不留 `-wal`/`-shm`，且能被只读打开。
     ///
     /// 回归：在线备份 API 会把源库的 WAL 头一起复制过来，于是每次备份都在旁边留下
@@ -5452,11 +5572,13 @@ mod tests {
             first: first.clone(),
             count: 5,
             failed: Vec::new(),
+            batch: crate::db::writer::BatchFlush::Landed,
         };
         let partial = BackupOutcome::Done {
             first,
             count: 1,
             failed: vec!["2026 年库".to_string(), "device_stats".to_string()],
+            batch: crate::db::writer::BatchFlush::Landed,
         };
         assert!(all_landed.is_complete(), "全部备份到了就该判成兜住了");
         assert!(
@@ -5490,6 +5612,7 @@ mod tests {
             first: std::path::PathBuf::from("backup/a.db"),
             count: 1,
             failed: vec!["focusflow_2025.db".to_string()],
+            batch: crate::db::writer::BatchFlush::Landed,
         };
         let note = snapshot_note("reset_all_data", &holes).expect("只兜住一部分必须说一句");
         assert!(
@@ -5502,11 +5625,40 @@ mod tests {
             first: std::path::PathBuf::from("backup/a.db"),
             count: 3,
             failed: vec![],
+            batch: crate::db::writer::BatchFlush::Landed,
         };
         assert_eq!(
             snapshot_note("reset_all_data", &full),
             None,
             "全都兜住时不多话"
+        );
+        // 第三份事实（拷贝前那批没等到）不许被前两份盖住：`Done` 且 `failed` 为空
+        // 以前就等于"这句不用说了"，而那份文件其实少了最近几秒的按键。
+        let full_but_short = BackupOutcome::Done {
+            first: std::path::PathBuf::from("backup/a.db"),
+            count: 3,
+            failed: vec![],
+            batch: crate::db::writer::BatchFlush::Missed,
+        };
+        let short_note = snapshot_note("reset_all_data", &full_but_short)
+            .expect("兜住了份数、却少了最近一批 ⇒ 照样要有话");
+        assert!(
+            short_note.contains("3 份") && short_note.contains("最近几秒"),
+            "已拿到的份数与\"少了最近一批\"都要在: {short_note}"
+        );
+        let holes_and_short = BackupOutcome::Done {
+            first: std::path::PathBuf::from("backup/a.db"),
+            count: 1,
+            failed: vec!["focusflow_2025.db".to_string()],
+            batch: crate::db::writer::BatchFlush::Missed,
+        };
+        let both = snapshot_note("reset_all_data", &holes_and_short)
+            .expect("两样毛病要一起说出来，不是后者顶掉前者");
+        assert!(
+            both.contains("focusflow_2025.db")
+                && both.contains("没有退路")
+                && both.contains("最近几秒"),
+            "两半都要在屏上: {both}"
         );
         assert_eq!(
             snapshot_note("reset_all_data", &BackupOutcome::NothingToDo),

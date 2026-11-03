@@ -1259,14 +1259,22 @@ fn backup_outcome(outcome: &db::maintenance::BackupOutcome) -> (String, i32) {
             first,
             count,
             failed,
+            ..
         } => {
             let line = format!("{}（共 {count} 份）", first.display());
+            // 拷贝前那批增量没等到 ⇒ "完成"那句必须带这一条（这条命令挂在计划任务上，
+            // 收 stdout 的那一份记录就是唯一的读者）
+            let tail = if outcome.missed_batch() {
+                format!("；{}", db::maintenance::batch_missed_note())
+            } else {
+                String::new()
+            };
             if outcome.is_complete() {
-                (format!("备份完成: {line}"), 0)
+                (format!("备份完成: {line}{tail}"), 0)
             } else {
                 (
                     format!(
-                        "备份不完整: 这些库没能产出通过校验的备份: {failed:?}（{line}仍然有效）"
+                        "备份不完整: 这些库没能产出通过校验的备份: {failed:?}（{line}仍然有效）{tail}"
                     ),
                     1,
                 )
@@ -2133,6 +2141,7 @@ mod tests {
             first: std::path::PathBuf::from("backup/focusflow_2026_20261019.db"),
             count,
             failed,
+            batch: focusflow_core::db::writer::BatchFlush::Landed,
         };
 
         let (line, code) = backup_outcome(&done(vec!["focusflow_2025.db".to_string()], 1));
@@ -2151,6 +2160,26 @@ mod tests {
         assert!(
             ok_line.contains("备份完成") && ok_line.contains("共 3 份"),
             "全都成功时才说完成，并把份数带上：{ok_line}"
+        );
+
+        // 第三份事实：库全兜住了，这一份仍可能是**少了最近一批**的拷贝（备份前那批增量没等到）。
+        // 这一句必须进 stdout 那一行（挂在计划任务上收的就是 stdout），但退码不许升成 1 ——
+        // 文件是真产出的，只是短了一截；把口径混进"不完整"那一档会让天天退 1。
+        let short = || B::Done {
+            first: std::path::PathBuf::from("backup/focusflow_2026_20261019.db"),
+            count: 3,
+            failed: vec![],
+            batch: focusflow_core::db::writer::BatchFlush::Missed,
+        };
+        let (short_line, short_code) = backup_outcome(&short());
+        assert_eq!(short_code, 0, "少一批不是备份失败，退码不许升成 1");
+        assert!(
+            short_line.contains("备份完成") && short_line.contains("最近几秒"),
+            "「完成」那句必须带着少了哪一截：{short_line}"
+        );
+        assert!(
+            !ok_line.contains("最近几秒"),
+            "没少那一批就不许瞎说少了最近几秒：{ok_line}"
         );
 
         // 三态分开这条口径不能塌：无事可做退 0 且不说"完成"，真失败退 1 并带上原因

@@ -2392,16 +2392,12 @@ impl App {
                             "max_backups",
                             5,
                         );
-                        match backup_database(max) {
+                        let out = backup_database(max);
+                        // 拷贝前那批增量没等到 ⇒ 这句"备份完成"必须带那半句（屏上唯一的读者）
+                        let missed = out.missed_batch();
+                        match out {
                             BackupOutcome::Done { count, failed, .. } => {
-                                if failed.is_empty() {
-                                    format!("备份完成：{count} 份")
-                                } else {
-                                    format!(
-                                        "备份部分失败：{count} 份，没兜住 {}",
-                                        failed.join("、")
-                                    )
-                                }
+                                backup_status_line(count, &failed, missed)
                             }
                             BackupOutcome::Failed { reason } => format!("备份失败：{reason}"),
                             BackupOutcome::NothingToDo => {
@@ -9238,11 +9234,29 @@ fn capture_refusal(vk: u32) -> Option<&'static str> {
 
 /// 读 `[hotkey] <key>` 并注册它。成功返回组合，失败返回原因（这一条不占用全局键）。
 /// 日志里带 `key = 原串` 这段 ASCII，验收脚本据此核对"配置写的"和"注册的"是不是同一个。
+/// 设置页那颗「立即备份」交回状态行的那一句话。**纯函数**：屏上这句由两份独立的事实拼成
+/// （哪些库没兜住 / 拷贝前那批增量落没落成），两半各有一条腿盯着，写在 match 分支里就测不到。
+fn backup_status_line(count: usize, failed: &[String], missed_batch: bool) -> String {
+    let head = if failed.is_empty() {
+        format!("备份完成：{count} 份")
+    } else {
+        format!("备份部分失败：{count} 份，没兜住 {}", failed.join("、"))
+    };
+    if missed_batch {
+        format!(
+            "{head}，{}",
+            focusflow_core::db::maintenance::batch_missed_note()
+        )
+    } else {
+        head
+    }
+}
+
 /// 配置写不进持久化队列时要补的那半句（空串 = 写进去了，什么都别说）。
 ///
-/// `config::set` 只是把改动投给去抖线程，真正的写盘在另一头：那条线程死了（spawn 失败／
-/// 通道断）交回来的 `Err` 意思是"本次会话之后所有改动都不会落盘"。屏上那一格读的是运行时
-/// 状态，看着一切正常，下一次开机才露出来 —— 折进 `let _ =` 就等于替代码许一句没人兑现的诺。
+/// 喂进来的必须是 `config::set_now` 的结局：它当场走完 `save()`，那个 `Err` 就是"这一笔
+/// 没落盘"。`config::set` 只把改动投给去抖线程、**恒回 `Ok(()))`**，拿它的结局来拼这句话
+/// 永远拼不出东西 —— 屏上那一格读运行时、`config.ini` 读的是老一档，两边分家到下次开机才露出来。
 fn config_write_note(what: &str, r: std::result::Result<(), String>) -> String {
     match r {
         Ok(()) => String::new(),
@@ -12152,6 +12166,37 @@ mod settings_type_tests {
 #[cfg(test)]
 mod hotkey_tests {
     use super::*;
+
+    /// 「备份完成」那一句话由两份独立的事实拼成，两半都要能被单独说出口。
+    ///
+    /// 屏上以前只看 `failed`：拷贝前那批增量没等到（`missed_batch`）在界面上与"全都兜住"
+    /// 长得一模一样，而那份文件里其实少了最近几秒的按键。三条腿各钉一边：两份都干净＝原句
+    /// 一个字都不许多说、只少一批＝带上那半句、既有库没兜住又少一批＝两样都在（不许后者顶掉前者）。
+    #[test]
+    fn the_backup_line_says_both_what_missed_and_what_is_short() {
+        let clean = backup_status_line(5, &[], false);
+        assert_eq!(
+            clean, "备份完成：5 份",
+            "两份都干净时一个字都不许多说：{clean}"
+        );
+        let short = backup_status_line(5, &[], true);
+        assert!(
+            short.contains("5 份") && short.contains("最近几秒"),
+            "少了最近一批要当场说出来：{short}"
+        );
+        let holes = backup_status_line(1, &["focusflow_2025.db".to_string()], true);
+        assert!(
+            holes.contains("focusflow_2025.db") && holes.contains("最近几秒"),
+            "两样毛病都要在屏上，不是后者盖掉前者：{holes}"
+        );
+        let partial = backup_status_line(1, &["device_stats".to_string()], false);
+        assert!(
+            partial.contains("部分失败")
+                && partial.contains("device_stats")
+                && !partial.contains("最近几秒"),
+            "没兜住的库要说，而这批没少就不许瞎说少了最近几秒：{partial}"
+        );
+    }
 
     /// 配置写不进持久化队列那句"这次没落盘"必须带到状态行上。
     ///

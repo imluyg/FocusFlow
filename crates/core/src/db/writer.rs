@@ -1243,6 +1243,45 @@ pub fn panic_recovery_snapshot() {
     }
 }
 
+/// 备份开始前，对"内存里那一批增量"的三态读数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchFlush {
+    /// 没有活的写线程（只读那一头、或线程已经停了）：本来就没有内存增量要等
+    NoWriter,
+    /// 这批确认落完了 ⇒ 这一份拷贝含到目前为止的每一次按键
+    Landed,
+    /// 等了 3 秒没等到（或那批里有年度库没写进去）⇒ **这一份拷贝少最后一批**
+    Missed,
+}
+
+/// 备份前把内存里的增量逼出去，交回三态（见 [`BatchFlush`]）。
+///
+/// 为什么这件事住在 core、而不是"调用方自己记得先 flush"：`flush_confirmed` 的注释写着
+/// 「备份前的调用方必须看这个返回值」，可备份走的是 core 的自由函数 `backup_database`，
+/// 而 writer 握在调用方手里的那份 `Database` 里 —— 设置页那颗「执行」（在后台线程里，
+/// 只拿到 config）、CLI 的 `--backup`（起的是只读库）、定时备份线程、破坏性操作前的
+/// 兜底快照，四个调用方**一个都没有** writer，于是谁都没看，而它们都说"备份完成"。
+/// 屏上那句「备份完成：5 份」底下可能正是一份少了最近几秒按键的账本。
+pub fn flush_for_backup() -> BatchFlush {
+    let writer = PANIC_WRITER
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().cloned());
+    let Some(w) = writer else {
+        return BatchFlush::NoWriter;
+    };
+    // 线程已经停了（退出收尾、或采集刚关掉）：再发一次 flush 只会白等 3 秒，
+    // 而那批增量在 `stop()` 里已经做过兜底 —— 这一档不算"少了最后一批"。
+    if !w.is_alive() {
+        return BatchFlush::NoWriter;
+    }
+    if w.flush_confirmed(true) {
+        BatchFlush::Landed
+    } else {
+        BatchFlush::Missed
+    }
+}
+
 fn writer_loop(state: Arc<WriterState>, sig_rx: mpsc::Receiver<Signal>, flush_interval: Duration) {
     let mut last_flush = Instant::now();
     // 排着却没做成的那次重锚（`Some(上一次尝试的时刻)`）—— 见 `reanchor_retry_due`
