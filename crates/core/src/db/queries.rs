@@ -107,7 +107,7 @@ pub fn is_valid_period(period: i64) -> bool {
 /// [`clamp_query_days`]：那是"窗口含几天"的口径、下界是 1，拿它钳增量会把
 /// "减 0 天"抬成"减 1 天" ⇒ `get_daily_counts(1)`（起点 = 今天 - 0）返回的是**昨天**，
 /// 而它自己的文档写着"含当天共 N 天"。
-fn date_minus_days(date: chrono::NaiveDate, days: i64) -> Option<chrono::NaiveDate> {
+pub(crate) fn date_minus_days(date: chrono::NaiveDate, days: i64) -> Option<chrono::NaiveDate> {
     date.checked_sub_days(Days::new(days.clamp(0, MAX_QUERY_DAYS) as u64))
 }
 
@@ -545,8 +545,8 @@ fn gather_rank_totals(
     years: &[i32],
     label: &str,
     cond: &str,
-    param: Option<i64>,
-    query: impl Fn(&Connection, &str, Option<i64>) -> YearRead<(i64, HashMap<String, i64>)>,
+    params: &[i64],
+    query: impl Fn(&Connection, &str, &[i64]) -> YearRead<(i64, HashMap<String, i64>)>,
 ) -> RankTotals {
     let mut out = RankTotals::default();
     for year in years.iter().copied() {
@@ -561,7 +561,7 @@ fn gather_rank_totals(
             }
             YearGate::Read => {}
         }
-        let got = connection::with_ro_conn_why(&path, |conn| query(conn, cond, param));
+        let got = connection::with_ro_conn_why(&path, |conn| query(conn, cond, params));
         match got {
             Err(why) => out
                 .unreadable
@@ -629,9 +629,13 @@ pub fn stats_totals(days: Option<i64>, year: Option<i32>) -> RankTotals {
     } else {
         ""
     };
-    gather_rank_totals(&years, DOMAIN_KEYS, cond, start_dk, |conn, cond, param| {
-        query_stats_in_conn(conn, cond, param, true)
-    })
+    gather_rank_totals(
+        &years,
+        DOMAIN_KEYS,
+        cond,
+        start_dk.as_slice(),
+        |conn, cond, params| query_stats_in_conn(conn, cond, params, true),
+    )
 }
 
 /// 某一天的按键统计读数。
@@ -641,8 +645,8 @@ pub fn stats_totals_on(target_date: chrono::NaiveDate) -> RankTotals {
         &[target_date.year()],
         DOMAIN_KEYS,
         "date_key = ?1",
-        Some(dk),
-        |conn, cond, param| query_stats_in_conn(conn, cond, param, false),
+        &[dk],
+        |conn, cond, params| query_stats_in_conn(conn, cond, params, false),
     )
 }
 
@@ -661,7 +665,7 @@ pub fn stats_totals_on(target_date: chrono::NaiveDate) -> RankTotals {
 fn query_stats_in_conn(
     conn: &rusqlite::Connection,
     cond: &str,
-    param: Option<i64>,
+    params: &[i64],
     group: bool,
 ) -> YearRead<(i64, HashMap<String, i64>)> {
     match connection::table_presence_cached(conn, "daily_counts") {
@@ -674,18 +678,11 @@ fn query_stats_in_conn(
     } else {
         format!(" WHERE {cond}")
     };
-    let summed = match param {
-        Some(p) => conn.query_row(
-            &format!("SELECT COALESCE(SUM(count), 0) FROM daily_counts{where_clause}"),
-            [p],
-            |r| r.get::<_, i64>(0),
-        ),
-        None => conn.query_row(
-            "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
-            [],
-            |r| r.get::<_, i64>(0),
-        ),
-    };
+    let summed = conn.query_row(
+        &format!("SELECT COALESCE(SUM(count), 0) FROM daily_counts{where_clause}"),
+        rusqlite::params_from_iter(params.iter()),
+        |r| r.get::<_, i64>(0),
+    );
     let total: i64 = match summed {
         Ok(v) => v,
         Err(e) => {
@@ -705,16 +702,11 @@ fn query_stats_in_conn(
     let map: HashMap<String, i64> = {
         let mapper = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?));
         let rows = match conn.prepare(&sql) {
-            Ok(mut stmt) => match param {
-                // 迭代器每一项都是 Result：库读到一半坏了、还是某行取值失败，都出在这里。
-                // collect 让它们都变成 Err；旧写法 flatten() 会把第一项错误之后的一切当"读完了"。
-                Some(p) => stmt
-                    .query_map([p], mapper)
-                    .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
-                None => stmt
-                    .query_map([], mapper)
-                    .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
-            },
+            // 迭代器每一项都是 Result：库读到一半坏了、还是某行取值失败，都出在这里。
+            // collect 让它们都变成 Err；旧写法 flatten() 会把第一项错误之后的一切当"读完了"。
+            Ok(mut stmt) => stmt
+                .query_map(rusqlite::params_from_iter(params.iter()), mapper)
+                .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
             Err(e) => Err(e),
         };
         match rows {
@@ -1393,7 +1385,7 @@ pub fn get_hourly_totals(days: i64, year: Option<i32>) -> Vec<i64> {
 fn query_apps_in_conn(
     conn: &rusqlite::Connection,
     cond: &str,
-    param: Option<i64>,
+    params: &[i64],
 ) -> YearRead<(i64, HashMap<String, i64>)> {
     match connection::table_presence_cached(conn, "app_usage") {
         connection::Presence::No => return YearRead::NoTable,
@@ -1405,16 +1397,11 @@ fn query_apps_in_conn(
     } else {
         format!(" WHERE {cond}")
     };
-    let summed = match param {
-        Some(p) => conn.query_row(
-            &format!("SELECT COALESCE(SUM(seconds), 0) FROM app_usage{where_clause}"),
-            [p],
-            |r| r.get::<_, i64>(0),
-        ),
-        None => conn.query_row("SELECT COALESCE(SUM(seconds), 0) FROM app_usage", [], |r| {
-            r.get::<_, i64>(0)
-        }),
-    };
+    let summed = conn.query_row(
+        &format!("SELECT COALESCE(SUM(seconds), 0) FROM app_usage{where_clause}"),
+        rusqlite::params_from_iter(params.iter()),
+        |r| r.get::<_, i64>(0),
+    );
     let total: i64 = match summed {
         Ok(v) => v,
         Err(e) => {
@@ -1428,14 +1415,9 @@ fn query_apps_in_conn(
     let map: HashMap<String, i64> = {
         let mapper = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?));
         let rows = match conn.prepare(&sql) {
-            Ok(mut stmt) => match param {
-                Some(p) => stmt
-                    .query_map([p], mapper)
-                    .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
-                None => stmt
-                    .query_map([], mapper)
-                    .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
-            },
+            Ok(mut stmt) => stmt
+                .query_map(rusqlite::params_from_iter(params.iter()), mapper)
+                .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
             Err(e) => Err(e),
         };
         match rows {
@@ -1469,7 +1451,13 @@ pub fn app_stats_totals(days: Option<i64>, year: Option<i32>) -> RankTotals {
     } else {
         ""
     };
-    gather_rank_totals(&years, DOMAIN_APPS, cond, start_dk, query_apps_in_conn)
+    gather_rank_totals(
+        &years,
+        DOMAIN_APPS,
+        cond,
+        start_dk.as_slice(),
+        query_apps_in_conn,
+    )
 }
 
 /// 某一天的前台应用时长读数。
@@ -1479,7 +1467,7 @@ pub fn app_stats_totals_on(target_date: chrono::NaiveDate) -> RankTotals {
         &[target_date.year()],
         DOMAIN_APPS,
         "date_key = ?1",
-        Some(dk),
+        &[dk],
         query_apps_in_conn,
     )
 }
@@ -1668,7 +1656,7 @@ struct DeviceRow {
 fn query_devices_in_conn(
     conn: &Connection,
     cond: &str,
-    param: Option<i64>,
+    params: &[i64],
     year: i32,
 ) -> YearRead<Vec<DeviceRow>> {
     match connection::table_presence_cached(conn, "device_counts") {
@@ -1702,14 +1690,9 @@ fn query_devices_in_conn(
         })
     };
     let rows = match conn.prepare(&sql) {
-        Ok(mut stmt) => match param {
-            Some(p) => stmt
-                .query_map([p], mapper)
-                .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
-            None => stmt
-                .query_map([], mapper)
-                .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
-        },
+        Ok(mut stmt) => stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), mapper)
+            .and_then(|rows| rows.collect::<Result<Vec<_>, rusqlite::Error>>()),
         Err(e) => Err(e),
     };
     match rows {
@@ -1869,7 +1852,7 @@ pub struct DeviceTotals {
 }
 
 /// 逐年度库取设备行并合并；读不出来的那一年进 `unreadable`，不按"没设备"计。
-fn gather_device_totals(years: &[i32], cond: &str, param: Option<i64>) -> DeviceTotals {
+fn gather_device_totals(years: &[i32], cond: &str, params: &[i64]) -> DeviceTotals {
     let mut rows: Vec<DeviceRow> = Vec::new();
     let mut out = DeviceTotals::default();
     for year in years.iter().copied() {
@@ -1884,7 +1867,7 @@ fn gather_device_totals(years: &[i32], cond: &str, param: Option<i64>) -> Device
             YearGate::Read => {}
         }
         let got = connection::with_ro_conn_why(&path, |conn| {
-            query_devices_in_conn(conn, cond, param, year)
+            query_devices_in_conn(conn, cond, params, year)
         });
         match got {
             Err(why) => out.unreadable.push(gap_of(why)),
@@ -1920,7 +1903,7 @@ pub fn device_totals(days: Option<i64>, year: Option<i32>) -> DeviceTotals {
     } else {
         ""
     };
-    gather_device_totals(&years, cond, start_dk)
+    gather_device_totals(&years, cond, start_dk.as_slice())
 }
 
 /// 设备登记表的行数口径：认得的设备**总数**（跨年按身份键去重）。
@@ -2007,7 +1990,7 @@ pub fn get_device_stats_by_date(target_date: chrono::NaiveDate) -> (i64, Vec<Dev
 /// 某一天的设备维度读数。
 pub fn device_totals_on(target_date: chrono::NaiveDate) -> DeviceTotals {
     let dk = day_key_of_date(target_date);
-    gather_device_totals(&[target_date.year()], "date_key = ?1", Some(dk))
+    gather_device_totals(&[target_date.year()], "date_key = ?1", &[dk])
 }
 
 /// 单台设备的详情（点击「设备排行」某一行时按需查询）。
@@ -2453,6 +2436,248 @@ fn local_day_start_ts(date: chrono::NaiveDate) -> i64 {
             }
         },
     }
+}
+
+// ===== 区间内的一问：插件侧 `focusflow.query` 的那一块（方案 3.4 / 9.1）=====
+
+/// 分行维度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupBy {
+    /// 按本地日期一行（含首含尾，缺的那天补 0）
+    Day,
+    /// 按小时一行（0..23，跨天的同一小时合并）
+    Hour,
+    /// 按前台应用一行
+    App,
+    /// 按设备一行（别名优先，与设备页同一把尺子）
+    Device,
+    /// 按键名一行
+    Key,
+}
+
+/// 要哪个量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metric {
+    /// 次数
+    Count,
+    /// 秒数
+    Seconds,
+}
+
+impl GroupBy {
+    /// 脚本里写的那个词。
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Hour => "hour",
+            Self::App => "app",
+            Self::Device => "device",
+            Self::Key => "key",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "day" => Some(Self::Day),
+            "hour" => Some(Self::Hour),
+            "app" => Some(Self::App),
+            "device" => Some(Self::Device),
+            "key" => Some(Self::Key),
+            _ => None,
+        }
+    }
+}
+
+impl Metric {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Seconds => "seconds",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "count" => Some(Self::Count),
+            "seconds" => Some(Self::Seconds),
+            _ => None,
+        }
+    }
+}
+
+/// 这一维 + 这一量在 schema 里到底有没有对应的那一列。
+///
+/// 写死在这里而不是"试一次看报不报错"：`key_counts` 只有 `count`、`app_usage` 只有 `seconds`、
+/// `hourly_counts` 与 `device_counts` 只有 `count`，两列都有的只有 `daily_counts`。
+/// 问一列表里没有的量，最坏的写法是让 SQL 报错后被折成一片 0 —— 那正是本仓反复在治的
+/// 「读不出来被念成没有」。所以不支持的组合必须**在查库之前**就说出来。
+pub fn supports(group: GroupBy, metric: Metric) -> bool {
+    matches!(
+        (group, metric),
+        (GroupBy::Day, Metric::Count)
+            | (GroupBy::Day, Metric::Seconds)
+            | (GroupBy::Hour, Metric::Count)
+            | (GroupBy::Key, Metric::Count)
+            | (GroupBy::Device, Metric::Count)
+            | (GroupBy::App, Metric::Seconds)
+    )
+}
+
+/// 不支持的那一句：点名是哪一张表、哪一列没有，而不是只说"参数错"。
+pub fn unsupported_reason(group: GroupBy, metric: Metric) -> String {
+    let (table, cols) = match group {
+        GroupBy::Day => ("daily_counts", "count 与 seconds 两列都有"),
+        GroupBy::Hour => ("hourly_counts", "只有 count"),
+        GroupBy::App => ("app_usage", "只有 seconds"),
+        GroupBy::Device => ("device_counts", "只有 count"),
+        GroupBy::Key => ("key_counts", "只有 count"),
+    };
+    format!(
+        "group_by={} 这一维落在 {table}（{cols}），而 metric={} 问的是表里没有的那一列：这次没有查库",
+        group.keyword(),
+        metric.keyword()
+    )
+}
+
+/// 区间读数：分行 + 窗口总数 + 这一轮没读全的地方。
+#[derive(Debug, Clone, Default)]
+pub struct RangeRows {
+    /// `(标签, 数值)`。榜那一侧已按次数/时长降序并截到 limit；按日与按小时那一侧按标签升序
+    pub rows: Vec<(String, i64)>,
+    /// 整个窗口的合计（**不受 limit 影响**：截掉的是榜的尾巴，不是漏掉的数）
+    pub total: i64,
+    /// 每项形如「N 年库X读不出来: 原因」；非空 ⇒ 上面的数只是下界
+    pub unreadable: Vec<String>,
+}
+
+/// 本地日期区间内的一问，**含首含尾**。
+///
+/// 三条与既有读数同源的纪律，不是新立的：
+/// · 年份清单按 `from.year()..=to.year()` 现算，跨年由这里合并（口径第 2 条），调用方不感知分库；
+/// · 榜那一侧的排序走 [`crate::format::cmp_rank_desc`] 那一把唯一的尺子（同分按名字），
+///   不然"谁进前 N"每进程一变；
+/// · 缺读原样交回，不折成 0。
+///
+/// `limit = 0` 是"别截"。日期越界与跨度上限由调用方（宿主 API 那一层）先判。
+pub fn query_range(
+    group: GroupBy,
+    metric: Metric,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+    limit: usize,
+) -> RangeRows {
+    let mut out = RangeRows::default();
+    if !supports(group, metric) {
+        out.unreadable.push(unsupported_reason(group, metric));
+        return out;
+    }
+    // 反着写不猜作者的意思：按字面区间原样问（库里那段本来就在）
+    let (from, to) = if from <= to { (from, to) } else { (to, from) };
+    let years: Vec<i32> = (from.year()..=to.year()).collect();
+    let from_dk = day_key_of_date(from);
+    let to_dk = day_key_of_date(to);
+    let span = to_dk - from_dk + 1;
+    // 一维一句条件，两界都在里面 —— 与"最近 N 天"那条走的是同一批 per-conn 读手
+    let cond = "date_key >= ?1 AND date_key <= ?2";
+    let params = [from_dk, to_dk];
+    let take = |rows: Vec<(String, i64)>| -> Vec<(String, i64)> {
+        if limit == 0 {
+            rows
+        } else {
+            rows.into_iter().take(limit).collect()
+        }
+    };
+    match group {
+        GroupBy::Day | GroupBy::Hour => {
+            let hourly = group == GroupBy::Hour;
+            let (label, pairs, gaps) = if hourly {
+                let (p, g) = read_window_years(
+                    DOMAIN_HOURLY,
+                    &years,
+                    from_dk,
+                    to_dk,
+                    query_hourly_window_in_conn,
+                );
+                (DOMAIN_HOURLY, p, g)
+            } else if metric == Metric::Seconds {
+                let (p, g) = read_window_years(
+                    DOMAIN_DAILY,
+                    &years,
+                    from_dk,
+                    to_dk,
+                    query_daily_seconds_window_in_conn,
+                );
+                (DOMAIN_DAILY, p, g)
+            } else {
+                let (p, g) = read_window_years(
+                    DOMAIN_DAILY,
+                    &years,
+                    from_dk,
+                    to_dk,
+                    query_daily_window_in_conn,
+                );
+                (DOMAIN_DAILY, p, g)
+            };
+            // 先把窗口里每一格初始化成 0，再把读回来的行加上去。两维的"一格"不是一种东西：
+            // 按日是**区间里的每一天**（缺的那一天 = 那天没数据），按小时是 **0..23 这一圈**
+            // （跨天的同一小时已经由 SQL 的 GROUP BY hour 合并）。
+            let mut map: HashMap<i64, i64> = HashMap::new();
+            if hourly {
+                for hour in 0..24 {
+                    map.insert(hour, 0);
+                }
+            } else {
+                for i in 0..span {
+                    map.insert(from_dk + i, 0);
+                }
+            }
+            for (key, value) in pairs {
+                if let Some(slot) = map.get_mut(&key) {
+                    *slot += value;
+                }
+            }
+            let mut rows: Vec<(String, i64)> = map
+                .iter()
+                .filter_map(|(slot, value)| {
+                    if hourly {
+                        Some((format!("{slot:02}"), *value))
+                    } else {
+                        day_key_to_date(*slot).map(|d| (d.format("%Y-%m-%d").to_string(), *value))
+                    }
+                })
+                .collect();
+            rows.sort();
+            out.total = rows.iter().map(|(_, v)| *v).sum();
+            out.rows = take(rows);
+            out.unreadable = gaps.into_iter().map(|(_, s)| s).collect();
+            // `label` 只用来保证三行读手各自的域名串没写岔（缺读那句话里带着它）
+            debug_assert!(!label.is_empty());
+        }
+        GroupBy::Key | GroupBy::App => {
+            let rt = if group == GroupBy::Key {
+                gather_rank_totals(&years, DOMAIN_KEYS, cond, &params, |conn, cond, params| {
+                    query_stats_in_conn(conn, cond, params, true)
+                })
+            } else {
+                gather_rank_totals(&years, DOMAIN_APPS, cond, &params, query_apps_in_conn)
+            };
+            let mut rows: Vec<(String, i64)> = rt.rows.into_iter().collect();
+            rows.sort_by(|a, b| crate::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
+            out.total = rt.total;
+            out.rows = take(rows);
+            out.unreadable = rt.unreadable;
+        }
+        GroupBy::Device => {
+            let dt = gather_device_totals(&years, cond, &params);
+            let rows: Vec<(String, i64)> =
+                dt.devices.into_iter().map(|d| (d.name, d.count)).collect();
+            // `merge_device_rows` 已经按次数降序（同一把尺子），这里只截不断
+            out.total = dt.total;
+            out.rows = take(rows);
+            out.unreadable = dt.unreadable;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -5838,9 +6063,189 @@ mod tests {
         );
         assert_eq!(
             prod.matches(wired.as_str()).count(),
-            1,
+            2,
             "排名尺子的接线数变了：设备详情那一列（键名明细）随 `keys` 一起撤掉后，\
-             core 里只剩设备榜这一列走它 —— 再少一处或有人开始手抄都要红"
+             core 里只剩设备榜这一列走它 —— 再少一处或有人开始手抄都要红。\
+             第二处是 `query_range` 的榜那一支（插件侧 `focusflow.query`），\
+             它与设备榜同为「合法消费者」，不是手抄。"
         );
+    }
+
+    /// 给区间那一问铺一段数据：只建 `daily_counts` 与 `key_counts`，别的维度各自另说。
+    /// 一格 = `(日期, 当日次数, 当日秒数, 这一天的键名榜)`。
+    type DaySeed<'a> = (chrono::NaiveDate, i64, i64, &'a [(&'a str, i64)]);
+
+    fn seed_daily_keys(year: i32, rows: &[DaySeed<'_>]) {
+        let conn = crate::db::connection::open_rw(&paths::year_db_path(year)).unwrap();
+        crate::db::connection::ensure_schema(&conn, year).unwrap();
+        for (date, count, seconds, keys) in rows {
+            let dk = day_key_of_date(*date);
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_counts (date_key, count, seconds) VALUES (?1, ?2, ?3)",
+                rusqlite::params![dk, count, seconds],
+            )
+            .unwrap();
+            for (name, n) in keys.iter() {
+                conn.execute(
+                    "INSERT OR REPLACE INTO key_counts (date_key, key_name, count) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![dk, name, n],
+                )
+                .unwrap();
+            }
+        }
+        invalidate_years_cache();
+    }
+
+    /// 按日那一问交出**区间里的每一天**：库里缺的那一天补 0，不是把那一行丢掉。
+    ///
+    /// 缺一天与缺一年是两件事：前者是"那天真没数据"（答案），后者必须进 `unreadable`
+    /// （问不出）。这一条同时钉住标签的写法（`YYYY-MM-DD`）与升序。
+    #[test]
+    fn a_day_range_carries_every_day_of_the_window_and_zero_fills_the_gaps() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("range_day");
+        let y = Local::now().year();
+        let d = |m: u32, day: u32| chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        seed_daily_keys(
+            y,
+            &[
+                (d(3, 2), 100, 300, &[("Space", 60)]),
+                // 3 月 3 日库里没有行 = 那天真没数据
+                (d(3, 4), 7, 20, &[("Space", 7)]),
+            ],
+        );
+        let got = query_range(GroupBy::Day, Metric::Count, d(3, 2), d(3, 5), 0);
+        let want: Vec<String> = (0..4)
+            .map(|i| d(3, 2 + i).format("%Y-%m-%d").to_string())
+            .collect();
+        let got_labels: Vec<String> = got.rows.iter().map(|(l, _)| l.clone()).collect();
+        assert_eq!(
+            got_labels, want,
+            "区间含首含尾、缺日补一行 0、按日期升序，实得 {got_labels:?}"
+        );
+        assert_eq!(
+            got.rows.len(),
+            4,
+            "四天该四行，缺的那天是一行 0 而不是少一行"
+        );
+        assert_eq!(
+            got.rows
+                .iter()
+                .find(|(l, _)| l.ends_with("-03-03"))
+                .unwrap()
+                .1,
+            0
+        );
+        assert_eq!(got.total, 107, "总数 = 100 + 0 + 7 + 0");
+        assert!(
+            got.unreadable.is_empty(),
+            "读全了就不该有点名: {:?}",
+            got.unreadable
+        );
+        // 同一问要 seconds 那一列走的是同一张表的另一列
+        let secs = query_range(GroupBy::Day, Metric::Seconds, d(3, 2), d(3, 5), 0);
+        assert_eq!(secs.total, 320, "活跃秒数 = 300 + 20");
+    }
+
+    /// 跨年那一问由这里合并，调用方只给一段日期（口径第 2 条）。
+    #[test]
+    fn a_range_spanning_two_years_adds_both_year_dbs() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("range_cross_year");
+        let this = Local::now().year();
+        let prev = this - 1;
+        let d =
+            |year: i32, m: u32, day: u32| chrono::NaiveDate::from_ymd_opt(year, m, day).unwrap();
+        seed_daily_keys(prev, &[(d(prev, 12, 31), 40, 10, &[("A", 40)])]);
+        seed_daily_keys(this, &[(d(this, 1, 1), 2, 5, &[("A", 2)])]);
+        let got = query_range(
+            GroupBy::Day,
+            Metric::Count,
+            d(prev, 12, 31),
+            d(this, 1, 1),
+            0,
+        );
+        assert_eq!(got.rows.len(), 2, "两天跨两个年度库，实得 {:?}", got.rows);
+        assert_eq!(got.total, 42, "跨年必须两边都算进来");
+        assert!(got.unreadable.is_empty(), "{:?}", got.unreadable);
+    }
+
+    /// 表里没有那一列的组合，必须在**查库之前**说清楚，而不是回一片 0。
+    ///
+    /// 这是本仓最硬的那一族症状：`metric=seconds` 问按键榜，SQL 报错被折成 0，
+    /// 面板就写"这段时间活跃 0 秒"—— 而真实情况是"这一问问不出"。
+    #[test]
+    fn asking_a_column_the_table_does_not_have_names_the_table_instead_of_returning_zero() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("range_unsupported");
+        let today = Local::now().date_naive();
+        let cases = [
+            (GroupBy::Hour, Metric::Seconds, "hourly_counts"),
+            (GroupBy::Key, Metric::Seconds, "key_counts"),
+            (GroupBy::App, Metric::Count, "app_usage"),
+            (GroupBy::Device, Metric::Seconds, "device_counts"),
+        ];
+        for (group, metric, table) in cases {
+            let got = query_range(group, metric, today, today, 0);
+            assert!(
+                !got.unreadable.is_empty(),
+                "{:?}/{:?} 问不出却不出声",
+                group,
+                metric
+            );
+            let why = &got.unreadable[0];
+            assert!(
+                why.contains(table) && why.contains("没有查库"),
+                "要点名是哪张表、并且说清没查库: {why}"
+            );
+            assert!(
+                got.rows.is_empty() && got.total == 0,
+                "问不出的那一问不许交出任何数: {got:?}"
+            );
+        }
+        // 反问：支持的那几组不许被同一把尺子误伤
+        for (group, metric) in [
+            (GroupBy::Day, Metric::Count),
+            (GroupBy::Day, Metric::Seconds),
+            (GroupBy::Hour, Metric::Count),
+            (GroupBy::Key, Metric::Count),
+            (GroupBy::App, Metric::Seconds),
+            (GroupBy::Device, Metric::Count),
+        ] {
+            assert!(
+                supports(group, metric),
+                "{:?}/{:?} 是有的那一半，不该判成问不出",
+                group,
+                metric
+            );
+        }
+    }
+
+    /// `limit` 截的是榜的尾巴，不是窗口里的数；同分那一堆里进榜的是谁由那把唯一的尺子定。
+    ///
+    /// 两条各挡一种写法：拿截断后的行求和当 total ⇒ 面板的"总计"跟着变小（这族修过两轮）；
+    /// 榜按 HashMap 序排 ⇒ 同分时谁进前 N 每进程一变。
+    #[test]
+    fn a_limited_rank_keeps_the_window_total_and_breaks_ties_by_name() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("range_limit");
+        let y = Local::now().year();
+        let day = chrono::NaiveDate::from_ymd_opt(y, 5, 6).unwrap();
+        let keys: Vec<(&str, i64)> = vec![("B", 50), ("A", 50), ("Space", 90), ("C", 50), ("D", 1)];
+        let refs: &[(&str, i64)] = &keys;
+        seed_daily_keys(y, &[(day, 200, 10, refs)]);
+        let full = query_range(GroupBy::Key, Metric::Count, day, day, 0);
+        assert_eq!(full.rows[0].0, "Space", "次数降序第一");
+        assert_eq!(
+            full.rows
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Space", "A", "B", "C", "D"],
+            "同分那一堆必须按名字定序"
+        );
+        let cut = query_range(GroupBy::Key, Metric::Count, day, day, 2);
+        assert_eq!(cut.rows.len(), 2, "截到前 2");
+        assert_eq!(cut.total, full.total, "limit 只截榜，窗口总数不许跟着变小");
     }
 }

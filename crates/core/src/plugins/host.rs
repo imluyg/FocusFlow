@@ -204,6 +204,7 @@ pub const EXTENSION_API_NAMES: &[&str] = &[
     "now",
     "off",
     "on",
+    "query",
     "stats",
     "store",
     "timers",
@@ -1416,6 +1417,164 @@ pub fn register_host_api(
         })?,
     )?;
     host.set("store", store)?;
+
+    // 通用的一问（方案 3.4 / 9.1）：`focusflow.query{ from=, to=, group_by=, metric=, limit= }`。
+    //
+    // 这一格是把 `stats` / `daily_counts` 那几条各自为政的读法收成一个入口，
+    // 而它**不写自己的 SQL**：全部走 `db::queries::query_range`，与看板页、活跃分析同一批读手。
+    // 交回 `(行数组, 原因)` 两值，与 `stats` 那条同一形状：读不出来的那一半必须能说出来，
+    // 不许折成"榜是空的"。
+    let query_fn = lua.create_function(|lua, spec: mlua::Value| {
+        use crate::db::queries::{self, GroupBy, Metric};
+        let empty = lua.create_table()?;
+        let mlua::Value::Table(table) = spec else {
+            return Ok((
+                empty,
+                Some(
+                    "focusflow.query 要一张参数表，例如 { from=\"2026-10-01\", to=\"2026-11-03\", \
+                     group_by=\"day\", metric=\"count\" }"
+                        .to_string(),
+                ),
+            ));
+        };
+        let text = |key: &str| -> Option<String> {
+            match table.get::<mlua::Value>(key) {
+                Ok(mlua::Value::String(s)) => Some(s.to_string_lossy()),
+                Ok(mlua::Value::Integer(n)) => Some(n.to_string()),
+                _ => None,
+            }
+        };
+        let group = match text("group_by").as_deref() {
+            None => GroupBy::Day,
+            Some(raw) => match GroupBy::parse(raw) {
+                Some(g) => g,
+                None => {
+                    return Ok((
+                        empty,
+                        Some(format!(
+                            "group_by=「{raw}」认不得：可写 day / hour / app / device / key"
+                        )),
+                    ));
+                }
+            },
+        };
+        let metric = match text("metric").as_deref() {
+            None => Metric::Count,
+            Some(raw) => match Metric::parse(raw) {
+                Some(m) => m,
+                None => {
+                    return Ok((
+                        empty,
+                        Some(format!("metric=「{raw}」认不得：可写 count / seconds")),
+                    ));
+                }
+            },
+        };
+        // 区间：`days = N`（含今天往回数 N 天）与 `from`/`to` 二选一，两个都给不许猜哪一个
+        let today = chrono::Local::now().date_naive();
+        let span = match (text("days"), text("from")) {
+            (Some(_), Some(_)) => {
+                return Ok((
+                    empty,
+                    Some(
+                        "focusflow.query 的 days 与 from 只能给一个：一个说「含今天往回数几天」，\
+                         一个说「从哪一天起」"
+                            .to_string(),
+                    ),
+                ))
+            }
+            (Some(raw), None) => match raw.parse::<i64>() {
+                Ok(n) if (1..=crate::db::queries::MAX_QUERY_DAYS).contains(&n) => {
+                    // `n` 已经夹在 1..=上限里；`date_minus_days` 只在减穿历元时才交 None
+                    let from = crate::db::queries::date_minus_days(today, n - 1).unwrap_or(today);
+                    (from, today)
+                }
+                Ok(n) => {
+                    return Ok((
+                        empty,
+                        Some(format!(
+                            "days={n} 不在 1..={} 天里：这一问不查库（要全部历史请用 stats(0)）",
+                            crate::db::queries::MAX_QUERY_DAYS
+                        )),
+                    ))
+                }
+                Err(_) => {
+                    return Ok((empty, Some(format!("days=「{raw}」读不出天数：要写正整数"))))
+                }
+            },
+            (None, Some(raw)) => match chrono::NaiveDate::parse_from_str(&raw, "%Y-%m-%d") {
+                Ok(from) => {
+                    let to = match text("to") {
+                        Some(t) => match chrono::NaiveDate::parse_from_str(&t, "%Y-%m-%d") {
+                            Ok(d) => d,
+                            Err(e) => {
+                                return Ok((
+                                    empty,
+                                    Some(format!("to=「{t}」不是 YYYY-MM-DD（{e}）：这一问不查库")),
+                                ))
+                            }
+                        },
+                        None => today,
+                    };
+                    (from, to)
+                }
+                Err(e) => {
+                    return Ok((
+                        empty,
+                        Some(format!(
+                            "from=「{raw}」不是 YYYY-MM-DD（{e}）：这一问不查库"
+                        )),
+                    ))
+                }
+            },
+            (None, None) => {
+                return Ok((
+                    empty,
+                    Some(
+                        "focusflow.query 没给区间：请写 days = N，或 from = \"YYYY-MM-DD\" \
+                         （to 可以省，省了就是今天）"
+                            .to_string(),
+                    ),
+                ))
+            }
+        };
+        let (from, to) = span;
+        let limit = match text("limit") {
+            Some(raw) => match raw.parse::<i64>() {
+                Ok(n) if n >= 0 => n as usize,
+                Ok(n) => {
+                    return Ok((
+                        empty,
+                        Some(format!("limit={n} 是负数：要 0（不截）或正整数")),
+                    ))
+                }
+                Err(_) => {
+                    return Ok((
+                        empty,
+                        Some(format!("limit=「{raw}」读不出整数：要 0（不截）或正整数")),
+                    ))
+                }
+            },
+            None => 0,
+        };
+        let rows = queries::query_range(group, metric, from, to, limit);
+        let out = lua.create_table()?;
+        for (idx, (label, value)) in rows.rows.iter().enumerate() {
+            let row = lua.create_table()?;
+            row.set("label", label.as_str())?;
+            row.set("value", *value)?;
+            out.set(idx + 1, row)?;
+        }
+        out.set("total", rows.total)?;
+        // 缺读那句原样交回：非空 ⇒ 上面所有数只是**已读部分**
+        let gap = if rows.unreadable.is_empty() {
+            None
+        } else {
+            Some(rows.unreadable.join("；"))
+        };
+        Ok((out, gap))
+    })?;
+    host.set("query", query_fn)?;
 
     // 注册为全局 `focusflow`
     lua.globals().set("focusflow", host.clone())?;
