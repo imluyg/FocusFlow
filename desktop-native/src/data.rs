@@ -398,6 +398,18 @@ pub fn rank_is_mouse(key: &str) -> bool {
     focusflow_core::format::MOUSE_GROUPS.contains(&focusflow_core::format::classify_key(key))
 }
 
+/// 打卡条那一问的读数闸：宽段（`GOAL_LOOKBACK_DAYS` 那 370 天）里只要有**一年没读上来**，
+/// 这一轮就不交结论。
+///
+/// 症状不是报错，是两个安静少报的数：坏掉那一年在 `stats::goal_status` 里按 0 次/天算
+/// ⇒「连续打卡 N 天」被截断、「近一年最长 M 天」抬不上去。而屏上本来备着一句
+/// 「每日目标读不出来（这一轮统计没答上来）」，因为 `Snapshot::goal` 从前无条件 `Some(..)`，
+/// 那一句从来不可达 —— 这一问不走面板那套按域名分栏的 `gaps`（理由见调用点那段），
+/// 所以闸只能住在这里。
+pub(crate) fn goal_reading_blocked(unreadable: &[String]) -> bool {
+    !unreadable.is_empty()
+}
+
 /// 「日均」这一格除过去的那个**分母**（屏上那半句要说清的正是它）。
 ///
 /// 单独成一条是因为卡片下面那句从前无条件写「按周期窗口」，而「总计」那一档吃的
@@ -580,8 +592,10 @@ pub fn load(period: i64) -> Snapshot {
     // 上面 `daily_counts_windows` 交回的就是它的宽段，这里只取那一段的行。
     // ⚠ 宽段自己的"哪一年没读上"**不进**下面那个 `gaps`：面板是按域名把缺读分栏念的，
     // 而「每日趋势」那一栏只画窄窗口那些天，把打卡条扫到的坏年份念进去就是指控错了人。
-    // 打卡条今天没有自己的缺读栏（`get_daily_counts` 那个二元组口子本来也交不回原因），
-    // 要不要给它接上是一句口径题，已登记待点。
+    // 它走的是自己那条通道：宽段报缺读 ⇒ `goal` 交回 `None`（见 `goal_reading_blocked`），
+    // 屏上那句「每日目标读不出来（这一轮统计没答上来）」才是可达的一支。从前这里无条件
+    // `Some(..)`，那一句从来不会说出口，而坏年份在 `goal_status` 里是按 0 次/天算的 ——
+    // 「连续打卡 N 天 · 近一年最长 M 天」两个数一起念小，没有一处会响。
     let goal_cfg = focusflow_core::config::instance().get_int("goal", "daily_keys", 20000);
     let goal_rows = goal_read.series;
     let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -590,7 +604,11 @@ pub fn load(period: i64) -> Snapshot {
     // 「进度条已过线、连续打卡还少一天」。症状（现量在屏上）：达标后的那最多 10 秒里，
     // 「今日 20,050 / 20,000」与那条绿进度条读的是写线程缓存（含增量），而「连续打卡 N 天」
     // 和最近七天那七个点读的是已落库的聚合表 —— 今天那一格还灰着。
-    let goal = Some(goal_status(goal_cfg, &goal_rows, &today_str, pending));
+    let goal = if goal_reading_blocked(&goal_read.unreadable) {
+        None
+    } else {
+        Some(goal_status(goal_cfg, &goal_rows, &today_str, pending))
+    };
 
     // 采集开着时，今日直接用写线程缓存：它含未落库与在途增量，落库前后都不跳
     // （用「库值 + pending」会在 flush 取走批次、尚未提交的那一瞬读到 0）。
@@ -691,6 +709,38 @@ mod readout_rulers_tests {
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// 「连续打卡/最长」那一问不许在坏年份上按 0 次交结论。
+    ///
+    /// 屏上本来就有那句「每日目标读不出来（这一轮统计没答上来）」，而 `Snapshot::goal`
+    /// 从前无条件 `Some(..)` ⇒ 它是一次都说不出口的死臂。四条腿：读全了不许改口念"读不出来"、
+    /// 宽段缺一年就要闭嘴、生产段不许再出现无条件 `Some(goal_status(`、
+    /// 以及那道闸**确实接在宽段的 unreadable 上**（接错到窄段那一栏就等于没接）。
+    #[test]
+    fn the_streak_strip_stops_claiming_when_a_year_is_missing() {
+        assert!(
+            !goal_reading_blocked(&[]),
+            "全读到了就不许念成读不出来（真·没有数据是另一回事）"
+        );
+        assert!(
+            goal_reading_blocked(&["2025 年库每日趋势读不出来: 盘睡了".to_string()]),
+            "宽段缺了一年，连续与最长就不能照算好的数念"
+        );
+
+        let prod = prod();
+        assert!(
+            !prod.contains("let goal = Some(goal_status("),
+            "打卡条又回到无条件 Some：坏年份会被按 0 次算，屏上还一句不响"
+        );
+        assert_eq!(
+            prod.matches("goal_reading_blocked(&goal_read.unreadable)")
+                .count(),
+            1,
+            "闸没接在打卡条那一段的缺读上，实得 {}",
+            prod.matches("goal_reading_blocked(&goal_read.unreadable)")
+                .count()
+        );
     }
 
     /// 设置清单上的每一行都必须在 `default_config()` 里真有默认值。
