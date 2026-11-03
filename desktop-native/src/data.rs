@@ -291,6 +291,11 @@ pub struct Snapshot {
     /// 当前周期的日均（有限窗口按窗口含几天算；「总计」按全历史记到过次数的天数算，
     /// 见 [`avg_of`]）。
     pub avg: i64,
+    /// 上面那个日均**实际除过去的那个天数**（[`avg_divisor`] 的返回值）。
+    ///
+    /// 卡片下面那半句要跟着它说话：从前无条件写「按周期窗口」，而「总计」那一档
+    /// 除的是全历史里记到过次数的天数 —— 数额没错，话是错的。
+    pub avg_days: i64,
     /// 全历史最高单日。
     pub max_day: Option<(String, i64)>,
     pub rank: Vec<(String, i64)>,
@@ -393,18 +398,25 @@ pub fn rank_is_mouse(key: &str) -> bool {
     focusflow_core::format::MOUSE_GROUPS.contains(&focusflow_core::format::classify_key(key))
 }
 
+/// 「日均」这一格除过去的那个**分母**（屏上那半句要说清的正是它）。
+///
+/// 单独成一条是因为卡片下面那句从前无条件写「按周期窗口」，而「总计」那一档吃的
+/// 不是窗口、是全历史里记到过次数的那几天 —— 分母与那句话必须算同一个数额，
+/// 否则话跟着数值说谎。分母至少 1：一个数都没有时不许除出个 `inf` 或 panic。
+pub(crate) fn avg_divisor(window_days: Option<i64>, active_days: i64) -> i64 {
+    match window_days {
+        Some(d) => d.max(1),
+        None => active_days.max(1),
+    }
+}
+
 /// 「日均」这一格：分子是这一轮的总次数（含还没落库的增量），分母按周期分两档 ——
-/// 有限窗口就是窗口本身含几天，「总计」则是全历史里记到过次数的那几天。
+/// 有限窗口就是窗口本身含几天，「总计」则是全历史里记到过次数的那几天（[`avg_divisor`]）。
 ///
 /// 收成一条纯函数是因为分母的两档过去混在一个内联 `match` 里，而其中一档取错了源：
 /// 拿"图上那 30 天里干了事的天数"去除"全部历史的次数"。这样写，两档各吃什么数在签名上就摊开了。
-/// 分母至少 1：一个数都没有时不许除出个 `inf` 或 panic。
 pub(crate) fn avg_of(total: i64, window_days: Option<i64>, active_days: i64) -> i64 {
-    let days = match window_days {
-        Some(d) => d.max(1),
-        None => active_days.max(1),
-    };
-    total / days
+    total / avg_divisor(window_days, active_days)
 }
 
 /// 键名分组榜 + 键/鼠两侧总次数：一次算出，「分组」那一屏与标题行那两个数读同一份。
@@ -539,6 +551,7 @@ pub fn load(period: i64) -> Snapshot {
     // 二十几倍，而卡片下面那句写的却是"按周期窗口"。现在分子与分母同一段：`active_days`
     // 与全历史次数点的是同一批年度库（core 的 `get_alltime_max_day` 那一趟，每库仍一条
     // 语句，没为多要一个数再排一次队）。
+    let avg_days = avg_divisor(days, all.active_days);
     let avg = avg_of(stats.total + pending, days, all.active_days);
 
     let mut hours = hourly_read.hours;
@@ -615,6 +628,7 @@ pub fn load(period: i64) -> Snapshot {
         today_app_seconds,
         period_total: stats.total + pending,
         avg,
+        avg_days,
         max_day: all.max_day,
         rank,
         rank_kinds,
@@ -645,6 +659,28 @@ pub fn load(period: i64) -> Snapshot {
 #[cfg(test)]
 mod readout_rulers_tests {
     use super::*;
+
+    /// 日均的分母与卡片下面那句屏上的话必须算同一个数额。
+    ///
+    /// 两档各吃什么数（窗口天数 / 全历史里记到过次数的天数）从前混在一个内联 `match` 里，
+    /// 其中一档取错源已被修过；这一条钉的是**分母本身**，且 `avg_of` 除的就是同一个数额 ——
+    /// 卡片那半句现在照着 `Snapshot::avg_days` 说话，两边不同源就等于话又说反了。
+    #[test]
+    fn the_average_denominator_is_the_number_the_card_names() {
+        assert_eq!(
+            avg_divisor(Some(30), 3),
+            30,
+            "有限窗口吃窗口天数，不是窗口里干了事的天数"
+        );
+        assert_eq!(
+            avg_divisor(None, 412),
+            412,
+            "总计档吃全历史里记到过次数的天数"
+        );
+        assert_eq!(avg_divisor(Some(0), 0), 1, "两档都不许除出 0");
+        assert_eq!(avg_of(900, Some(30), 3), 30, "屏上那句跟着这个数额");
+        assert_eq!(avg_of(824, None, 412), 2, "总计档：824 除 412");
+    }
 
     /// 生产文本（整行注释与 `///` 一并滤掉，判据数的是代码）。
     fn prod() -> String {

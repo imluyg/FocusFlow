@@ -4626,6 +4626,41 @@ fn period_text(period: i64) -> String {
     }
 }
 
+/// 「日均」那张卡下面的一行：说清这一格**除过去的是哪个天数**。
+///
+/// 从前这里无条件写「按周期窗口」，而「总计」那一档除的是全历史里记到过次数的天数
+/// （见 `data::avg_divisor`，data.rs 那段注释自己就点了"卡片下面那句写的是按周期窗口"）。
+/// 数额是修对过的，话没说对着 —— 屏上那句话正是用户判断"这个日均算的是什么"的唯一依据。
+/// 分母与这句话读同一个 `snap.avg_days`，两处不许各写各的。
+fn avg_sub(snap: &Snapshot) -> String {
+    let days = snap.avg_days.max(1);
+    if snap.period == 0 {
+        format!("按全历史 {days} 天")
+    } else {
+        format!("按窗口 {days} 天")
+    }
+}
+
+/// 排行榜/应用/设备三屏空榜时的那句话。
+///
+/// 三句从前都把窗口写死成「今日」，而这三屏读的是 `window_days(period)` 那一段
+/// （「总计」那一档是**全历史**）：切到近 30 天看到空榜，屏上说"今日还没有记录"，
+/// 用户就去翻今天的数据 —— 与它无关。措辞跟着 `period_text` 走，那一份就是榜与卡片
+/// 共用的周期说法（导出行、设备详情弹窗也念它）。`pending` 那一臂讲的是"还没落库的
+/// 今日增量"，与窗口无关，所以只有它保留「今日」的含义。
+fn empty_board_line(tab: usize, window: &str, pending: i64, flush_secs: i64) -> String {
+    match tab {
+        1 => format!("{window}还没有应用时长（[app_stats] enabled 关着？）"),
+        2 => format!("{window}还没有设备计数（[device_stats] enabled 关着？）"),
+        _ if pending > 0 => format!(
+            "已记录 {} 条，还没落库（写线程每 {} 秒写一次，落库后就出现在这里）",
+            thousands(pending as u64),
+            flush_secs.max(1)
+        ),
+        _ => format!("{window}还没有记录（数据目录见左下角）"),
+    }
+}
+
 /// 「今日活跃」那张卡下面的一行：念的是这一轮里出现过的键名**种数**。
 ///
 /// 为什么单独立一个函数：这里从前用的是榜的长度，而榜只为面板列行截到上限
@@ -5130,7 +5165,7 @@ fn draw_screen(
         (
             "日均".into(),
             thousands(snap.avg.max(0) as u64),
-            "按周期窗口".into(),
+            avg_sub(snap),
         ),
         (
             "最高单日".into(),
@@ -8404,18 +8439,14 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         // `[database] flush_interval`（默认 10 秒）才落一次。这不是"没记上"，
         // 所以这里要说清楚还差哪一步 —— 不然"今日 5 次 + 空列表"看着像 bug。
         let pending = collect::pending_today();
-        let empty = match tab {
-            1 => "今日还没有应用时长（[app_stats] enabled 关着？）".to_string(),
-            2 => "今日还没有设备计数（[device_stats] enabled 关着？）".to_string(),
-            _ if pending > 0 => format!(
-                "已记录 {} 条，还没落库（写线程每 {} 秒写一次，落库后就出现在这里）",
-                thousands(pending as u64),
-                focusflow_core::config::instance()
-                    .get_int("database", "flush_interval", 10)
-                    .max(1)
-            ),
-            _ => "今日还没有记录（数据目录见左下角）".to_string(),
-        };
+        let empty = empty_board_line(
+            tab,
+            &period_text(snap.period),
+            pending,
+            focusflow_core::config::instance()
+                .get_int("database", "flush_interval", 10)
+                .max(1),
+        );
         p.text(
             &empty,
             rect(
@@ -12848,6 +12879,92 @@ mod boot_notice_tests {
                 "启动状态行没把这句降级喂进去（缺 {needle}）"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod window_say_tests {
+    use super::*;
+
+    /// 「日均」那张卡下面那半句要跟着它**实际除过去的天数**说话。
+    ///
+    /// 改前是无条件写「按周期窗口」：`总计` 那一档除的是全历史里记到过次数的天数
+    /// （`data::avg_divisor`），数额早修对了、话还说反 —— 而屏上这半句就是用户判断
+    /// "这个日均算的是什么"的唯一依据。三条腿：窗口档说窗口、总计档说全历史并且
+    /// **不许**再出现"窗口"二字、分母为 0 时兜成 1（不许写出除不动的那句话）。
+    #[test]
+    fn the_average_card_says_which_days_it_divided_by() {
+        let window = Snapshot {
+            period: 30,
+            avg_days: 30,
+            ..Default::default()
+        };
+        let line = avg_sub(&window);
+        assert!(
+            line.contains("窗口") && line.contains("30"),
+            "有限窗口要说窗口天数: {line}"
+        );
+        assert!(!line.contains("全历史"), "窗口那一档不许念成全历史: {line}");
+
+        let all = Snapshot {
+            period: 0,
+            avg_days: 412,
+            ..Default::default()
+        };
+        let line = avg_sub(&all);
+        assert!(
+            line.contains("全历史") && line.contains("412"),
+            "总计档要说全历史那几个字与实际天数: {line}"
+        );
+        assert!(
+            !line.contains("窗口"),
+            "「按周期窗口」正是总计档说谎的那句话: {line}"
+        );
+
+        let zero = Snapshot {
+            period: 0,
+            avg_days: 0,
+            ..Default::default()
+        };
+        assert!(
+            avg_sub(&zero).contains('1'),
+            "分母为 0 要兜成 1，不许写「按全历史 0 天」: {}",
+            avg_sub(&zero)
+        );
+    }
+
+    /// 空榜那三句里的窗口必须就是这三屏数的那一段。
+    ///
+    /// 改前把「今日」写死在三句话里，而这三屏读的是 `window_days(period)` 那一段
+    /// （`总计` 那一档是全历史）：切到近 30 天看到空榜，屏上说"今日还没有记录"，
+    /// 用户就去翻今天的数据 —— 与它无关。`pending` 那一臂讲的是还没落库的**今日**增量，
+    /// 与窗口无关，所以只有它保留"今日"的含义，且不许同时冒出两个窗口。
+    #[test]
+    fn the_empty_board_line_names_the_window_it_counted() {
+        let apps = empty_board_line(1, "近 30 天", 0, 10);
+        assert!(
+            apps.contains("近 30 天") && !apps.contains("今日"),
+            "应用那一屏读的是 30 天，不许说今日: {apps}"
+        );
+        let dev = empty_board_line(2, "全部", 0, 10);
+        assert!(
+            dev.contains("全部") && !dev.contains("今日"),
+            "总计档的榜是全历史: {dev}"
+        );
+        let keys = empty_board_line(0, "近 7 天", 0, 10);
+        assert!(
+            keys.contains("近 7 天") && keys.contains("还没有记录"),
+            "排行那一屏同样跟着窗口: {keys}"
+        );
+        let pending = empty_board_line(0, "近 30 天", 12, 10);
+        assert!(
+            pending.contains("还没落库") && pending.contains("12"),
+            "有增量时说的是落库节奏: {pending}"
+        );
+        assert!(
+            !pending.contains("还没有记录"),
+            "不许给两个窗口口径: {pending}"
+        );
     }
 }
 
