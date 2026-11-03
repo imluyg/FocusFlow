@@ -818,6 +818,32 @@ fn plugin_slots(rows: &[PluginRow]) -> Vec<PluginSlot> {
     out
 }
 
+/// 热重载这一轮换上来几格之后，这一拍还要做什么：`(要不要重扫这一页, 那句公告)`。
+///
+/// 两个症状各管一头，所以两头都得有断言：
+/// - 不在这一页却每 2 秒全量重扫 ⇒ 白读两遍目录、再为每一格问一次存储占用；
+/// - 就在这页却不重扫 ⇒ 屏上停在改之前那一行，而作者看到的症状恰恰是「我改了没生效」。
+///
+/// 公告那头管的是"有没有人看见"：换了名字就要留一行（这是唯一能事后对账的痕迹），
+/// 而一次也没换过时不许留 —— 每拍写一行日志等于把日志刷成一秒十条的空话。
+fn reload_followup(on_plugin_page: bool, changed: &[String]) -> (bool, Option<String>) {
+    if changed.is_empty() {
+        return (false, None);
+    }
+    let joined = changed.join("、");
+    let note = if on_plugin_page {
+        format!("插件热重载：{joined}（这一页跟着重扫了清单）")
+    } else {
+        format!("插件热重载：{joined}（不在这一页，清单留给下次进来重扫）")
+    };
+    // ASCII 尾巴是给验收脚本看的：这一句的主体是中文，脚本里嵌中文匹配会踩编码坑
+    // （本仓那条「含 · 的整串在 shell 里比不中」的同族），数得上的部分留成纯 ASCII。
+    (
+        on_plugin_page,
+        Some(format!("{note} hotreload={}", changed.len())),
+    )
+}
+
 /// 行内编辑这一格是在改什么：设备改名、设置页的值，还是插件视图里的输入框。
 #[derive(Clone, Debug)]
 enum EditTarget {
@@ -2955,6 +2981,30 @@ impl App {
         if self.pm.is_none() {
             let cfg = focusflow_core::config::instance();
             self.pm = Some(PluginManager::new(cfg, Arc::clone(&self._db)));
+            // 建起来这一刻就把检测线程开掉：「改一行 Lua 要重启」这件症状跟用户去没去过
+            // 插件页无关，而懒创建意味着"没人碰过插件"时本来就没有重载可做。
+            // 线程只扫目录 mtime、不碰 Lua；真换上/卸下留在 GUI 线程的 `pump_plugin_reloads`。
+            // 退出时不 join 它：那一轮 sleep 是 2 秒，join 会把退出拖成"点了没反应"，
+            // 而进程一退，线程自己就没了（它不参与落盘，存储那一步在 quit 前已经问过了）。
+            if let Some(pm) = self.pm.as_mut() {
+                pm.enable_hot_reload();
+            }
+        }
+    }
+
+    /// 一问热重载通道，把盘上改过的脚本换上来（删除的那些走卸载）。
+    /// 每拍一次，通道空着时就是一次空的 `try_recv`。
+    fn pump_plugin_reloads(&mut self, on_plugin_page: bool) {
+        let changed = match self.pm.as_mut() {
+            Some(pm) => pm.poll_reload_requests(),
+            None => return,
+        };
+        let (rescan, note) = reload_followup(on_plugin_page, &changed);
+        if let Some(note) = note {
+            tracing_note(&note);
+        }
+        if rescan {
+            self.reload_plugins();
         }
     }
 
@@ -2984,7 +3034,8 @@ impl App {
         }
         // 进这一页先把存储里攒着的改动落一次盘：这一格要说"占用多少"与"最近一次写没写成"，
         // 去抖那 300ms 里进来看，说的就是上一次的值。失败的原因不在这里重复出声 ——
-        // 它已经写在每一行的第二格上（`store_error`），而这一页是每秒重扫的。
+        // 它已经写在每一行的第二格上（`store_error`）。清单也不每秒重扫：它在进页、
+        // 开关之后，以及热重载真换上来东西时各重扫一次（见 `reload_followup`）。
         focusflow_core::plugins::plugin_store::flush_all();
         let Some(pm) = self.pm.as_ref() else { return };
         match pm.list_discovered() {
@@ -11240,6 +11291,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             // 件口多数时候是空的 —— 一拍一次互斥体取空向量，不换回每键一次 VM 的代价。
             if let Some(app) = unsafe { app_ptr(hwnd) } {
                 app.pump_plugin_key_batches();
+                // 热重载的通道也在这一拍取空：检测线程只发请求，进 Lua 的那一跳必须在 GUI 线程。
+                // 少了这两行，那条线程整晚在扫目录而没人处理它的话，屏上照旧是"改了要重启"。
+                let on_plugin_page = app.view == 4;
+                app.pump_plugin_reloads(on_plugin_page);
             }
             // 托盘点击 / 菜单 / 热键只在事件通道里，靠这 100ms 一拍取出来。
             while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
@@ -17153,6 +17208,120 @@ mod plugin_page_tests {
         assert!(
             asked.unwrap() < body.find("save_main_geometry(hwnd)").unwrap(),
             "落盘那一问排到了后面几步之后 ⇒ 退出备份收走的还是旧的一份"
+        );
+    }
+
+    /// 热重载之后"要不要重扫这一页 / 要不要留一行"的四档判定。
+    ///
+    /// 这两半各钉一个症状，缺任何一半都是假绿：只断"在页 ⇒ 重扫"照不出"不在页也每 2 秒
+    /// 全量重扫"（白读两遍目录、逐格问一次存储）；只断"有变更 ⇒ 出声"照不出"每拍都留一行"
+    /// —— 通道空着是本分的常态，那种日志一秒钟就有十条废话。
+    #[test]
+    fn the_reload_followup_decides_rescan_and_notice_separately() {
+        let one = vec!["pomodoro".to_string()];
+        let (rescan, note) = reload_followup(true, &one);
+        assert!(
+            rescan,
+            "就在插件页却换了东西 ⇒ 清单得跟着重扫，否则屏上停在改之前那一行"
+        );
+        let note = note.expect("真换上来了就该留一行可对账的痕迹");
+        assert!(note.contains("pomodoro"), "那行要说清是哪一格: {note}");
+        assert!(
+            note.contains("重扫了清单"),
+            "在页那一档的措辞要写明已经重扫: {note}"
+        );
+        // 验收脚本靠这一段 ASCII 数（中文主体在 shell/PowerShell 里匹配不稳）
+        assert!(note.contains("hotreload=1"), "少了 ASCII 那截计数: {note}");
+
+        let (rescan, note) = reload_followup(false, &one);
+        assert!(
+            !rescan,
+            "不在这一页时别全量重扫 ⇒ 每 2 秒白读目录、逐格问存储"
+        );
+        let note = note.expect("没在看也要留痕迹：作者关心的正是'存盘到底进没进去'");
+        assert!(
+            note.contains("下次进来"),
+            "这一档要老实说清单还没重扫: {note}"
+        );
+
+        let (rescan, note) = reload_followup(true, &[]);
+        assert!(!rescan && note.is_none(), "一次也没换 ⇒ 既不重扫也不出声");
+
+        let both = vec!["a".to_string(), "b".to_string()];
+        let (_, note) = reload_followup(true, &both);
+        let note = note.expect("两格都换了");
+        assert!(
+            note.contains("a、b"),
+            "一轮里多格变更要一次说完，不是只提第一个: {note}"
+        );
+        assert!(note.contains("hotreload=2"), "计数要说几格: {note}");
+    }
+
+    /// 接线腿：那条检测线程必须两头都接上，只接一头等于没接。
+    ///
+    /// 摘掉头一头 ⇒ 线程根本不跑（改 `.lua` 照旧要重启，而 core 那边用例全绿，
+    /// 病状只在屏上）；摘掉头二头 ⇒ 线程整晚在扫目录、发请求，而没人处理，屏上还是旧代码。
+    /// 判据钉的是调用形态与所在函数，只查函数名会被注释与文档顶班。
+    #[test]
+    fn the_hot_reload_chain_has_both_ends_in_production() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let at = code
+            .find("fn ensure_plugin_manager(&mut self)")
+            .expect("懒创建那个函数不见了（改名或换了写法，这条守卫的锚要跟着改）");
+        let rest = &code[at..];
+        let body = &rest[..rest.find("\n    }").expect("懒创建的函数体切不出来")];
+        assert!(
+            body.contains("pm.enable_hot_reload()"),
+            "管理器建起来时不再起检测线程 ⇒ 「改一行 Lua 要重启」回来了"
+        );
+
+        let at = code
+            .find("fn pump_plugin_reloads(&mut self, on_plugin_page: bool)")
+            .expect("GUI 线程那一问不见了");
+        let rest = &code[at..];
+        let body = &rest[..rest.find("\n    }").expect("那一问的函数体切不出来")];
+        assert!(
+            body.contains("pm.poll_reload_requests()"),
+            "接了线程却不问通道 ⇒ 请求在里头堆着，屏上永远停在旧代码"
+        );
+        assert!(
+            body.contains("if rescan {") && body.contains("self.reload_plugins()"),
+            "重扫那一支不再走判定 ⇒ 回到两头各数各的"
+        );
+
+        assert!(
+            code.contains("app.pump_plugin_reloads(on_plugin_page);"),
+            "那一拍不再问通道了（被摘掉、或搬去了别的非 UI 线程 —— 后者更糟：`Lua` 不是 Send）"
+        );
+        assert!(
+            code.contains("let on_plugin_page = app.view == 4;"),
+            "在不在这一页不再现量当前页签 ⇒ 判定吃的是一条猜出来的输入"
+        );
+    }
+
+    /// 退出时不许 join 那条检测线程：它一轮 sleep 两秒，join 会把"点了退出"拖成两秒没反应。
+    ///
+    /// 这条是反向腿（钉一个**不该存在**的调用）：线程不参与落盘 —— 存储那一步在
+    /// `quit_app` 开头已经问过了 —— 所以没有任何一致性理由为它等这两秒。
+    #[test]
+    fn quitting_does_not_wait_for_the_watcher_thread() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn quit_app(hwnd: HWND)")
+            .expect("quit_app 不见了（改名或换了写法，这条守卫的锚要跟着改）");
+        let rest = &prod[at..];
+        let body = &rest[..rest.find("\n}").expect("quit_app 的函数体切不出来")];
+        assert!(
+            !body.contains("disable_hot_reload"),
+            "退出时 join 了检测线程 ⇒ 那一轮 sleep 是 2 秒，用户看到的是点了没反应"
         );
     }
 }

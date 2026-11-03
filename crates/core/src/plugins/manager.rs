@@ -5,9 +5,14 @@
 //! GUI 线程持有。热重载检测线程只扫描文件并发送"重载请求"到 channel，
 //! 由 GUI 线程调用 `poll_reload_requests()` 实际执行重载。
 //!
-//! ⚠ 这半条链今天**没人在生产里跑**：调用方原是旧桌面端的那条热重载，它随 WebView 一起
-//! 删了，原生端没有接（`desktop-native/src/main.rs` 只在面板刷新时重扫目录）。后果是改
-//! `.lua` 要重启才生效、删掉 `.lua` 也要重启才停 —— 现在只有 core 的用例在跑这条路径。
+//! ⚠ 这半条链曾经**没人在生产里跑**：调用方原是旧桌面端的那条热重载，它随 WebView 一起
+//! 删了，原生端到今天才接上（`desktop-native/src/main.rs`：管理器建起来时 `enable_hot_reload`，
+//! 100ms 那一拍 `poll_reload_requests`）。接上之前的症状是改 `.lua` 要重启才生效、
+//! 删 `.lua` 也要重启才停。
+//!
+//! 一条边界要说清：热重载只管**已经在跑的**那些。新扔进目录的 `.lua` 不在实例表里，
+//! `reload_plugin` 找不到键就返回 false（见它的注释），所以它要等下一次进插件页或重启才加载 ——
+//! 「自动把目录里每个陌生脚本装进 VM」不是这一条链的承诺。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1424,7 +1429,7 @@ impl PluginManager {
     pub fn reload_plugin(&mut self, key: &str) -> bool {
         // 先按文件名（stem）、再按展示名。它原先生产里唯一的调用方是旧桌面端的热重载
         // （`reload_plugin_by_key`，发的是"改了的那个文件名"；那一侧随 WebView 删了，
-        // 原生端到今天还没接这条线 ⇒ 现在只有测试在调它），
+        // 原生端接上的现在这一侧走的是 `poll_reload_requests` ⇒ 到这里的路径又有了生产调用方），
         // 而表是以展示名为键的 ⇒ 旧顺序先查展示名会在重名时把**另一个**插件顶上来：
         // 文件 `beta.lua` 变更 → key="beta"，若 `alpha.lua` 的 PLUGIN_NAME 正好叫「beta」，
         // 命中的是 alpha：没改过的被重载、改过的继续跑旧代码，而日志写着"插件已热重载: beta"，
@@ -1884,9 +1889,22 @@ fn hot_reload_loop(dirs: Vec<PathBuf>, tx: mpsc::Sender<String>, stop: Arc<Atomi
         .collect();
     while !stop.load(Ordering::SeqCst) {
         for (dir, last_mtime, primed) in state.iter_mut() {
-            for name in hot_reload_round(dir, last_mtime, primed) {
+            let (names, unreadable) = hot_reload_round(dir, last_mtime, primed);
+            for name in names {
                 tracing::info!("热重载检测到变更: {name}");
                 let _ = tx.send(name);
+            }
+            // 读不出来这件事每 2 秒会重来一次，而它是盘上的稳定状态：照实每轮说一次，
+            // 一天能刷出四万条，把真正要看的那几条埋掉。所以走全仓那一把「同一件事只说一次」
+            // 的尺子，并且**按目录各记一格** —— 用常数当键，内置那一格读不动就会把数据目录
+            // 那一格的公告一起吃掉（症状：只有一处目录坏了，日志里却永远只提另一处）。
+            if let Some(why) = unreadable {
+                if notice_once(&format!("watch-unreadable:{}", dir.display())) {
+                    tracing::error!(
+                        "热重载扫描读不到插件目录（{}），本轮不判定任何变更 —— 这不是「没有插件」: {why}",
+                        dir.display()
+                    );
+                }
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(2000));
@@ -1895,42 +1913,42 @@ fn hot_reload_loop(dirs: Vec<PathBuf>, tx: mpsc::Sender<String>, stop: Arc<Atomi
 
 /// 一轮扫描的全部判定（线程里除了 sleep 就只剩这一句，判定本身全在这里 —— 这样
 /// 上面那三条保护才测得动，不用去起真线程、也不用等 2 秒一周期的 tick）。
-/// 返回这一轮该发出去的重载请求；`last` / `primed` 是跨轮状态。
+/// 交回「这一轮该发出去的重载请求」与「这一轮目录读不出来的原因」（`None` = 读得动），
+/// 出声与否留给调用方定（线程要按目录去重，判定函数不该替它决定）。
+/// `last` / `primed` 是跨轮状态。
 fn hot_reload_round(
     dir: &Path,
     last: &mut HashMap<String, Option<SystemTime>>,
     primed: &mut bool,
-) -> Vec<String> {
-    // `None` = 这一轮目录没读出来：基线与 `primed` 一个字都不动，下一轮再说。
-    let Some(seen) = scan_plugin_mtimes(dir, last) else {
-        return Vec::new();
+) -> (Vec<String>, Option<String>) {
+    // 读不出来：基线与 `primed` 一个字都不动，下一轮再说（也不发任何"文件消失"）。
+    let seen = match scan_plugin_mtimes(dir, last) {
+        Ok(seen) => seen,
+        Err(why) => return (Vec::new(), Some(why)),
     };
     let requests = reload_requests(last, &seen, *primed);
     *last = seen;
     *primed = true;
-    requests
+    (requests, None)
 }
 
-/// 扫一次插件目录，得到「文件名 → mtime」快照；**返回 `None` 表示目录没读出来**
+/// 扫一次插件目录，得到「文件名 → mtime」快照；**`Err` 表示目录没读出来**
 /// （`plugins` 被建成同名文件、整份放在断线的网盘上、构建脚本正在替换目录……）。
 /// 这条区分必须传出去：把"没读到"当"目录空了"参与比对，每个插件都会被判成
 /// 「文件已删除」而全部卸载；把基线清空，则下一轮成功读取会把所有文件当成新变更，
 /// 白重载一整轮。
 ///
+/// 这里不出声：一轮扫描每秒被调到两次，去重是线程那一层的事（见 [`hot_reload_loop`]），
+/// 判定函数只负责把原因原样交回去。
+///
 /// `last` 只用来给 0 字节的文件沿用上一轮指纹（本轮既不算新增也不算消失）。
 fn scan_plugin_mtimes(
     dir: &Path,
     last: &HashMap<String, Option<SystemTime>>,
-) -> Option<HashMap<String, Option<SystemTime>>> {
+) -> Result<HashMap<String, Option<SystemTime>>, String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) => {
-            tracing::error!(
-                "热重载扫描读不到插件目录（{}），本轮不判定任何变更 —— 这不是「没有插件」: {e}",
-                dir.display()
-            );
-            return None;
-        }
+        Err(e) => return Err(e.to_string()),
     };
     let mut seen: HashMap<String, Option<SystemTime>> = HashMap::new();
     for entry in entries.flatten() {
@@ -1957,7 +1975,7 @@ fn scan_plugin_mtimes(
         }
         seen.insert(name.to_string(), meta.modified().ok());
     }
-    Some(seen)
+    Ok(seen)
 }
 
 /// 两轮快照之间该发哪些重载请求：mtime 变了、出现了新文件、**文件消失了**。
@@ -3240,7 +3258,7 @@ end
         let mut primed = false;
 
         assert!(
-            hot_reload_round(&dir, &mut last, &mut primed).is_empty(),
+            hot_reload_round(&dir, &mut last, &mut primed).0.is_empty(),
             "首轮只建基线，否则每次启动都把全部插件重载一遍"
         );
         assert!(primed);
@@ -3248,28 +3266,28 @@ end
         // 半截文件（编辑器"先截断再写入"的那一瞬间 / 网盘还没同步上来）
         write_lua(&dir, "b", "");
         assert!(
-            hot_reload_round(&dir, &mut last, &mut primed).is_empty(),
+            hot_reload_round(&dir, &mut last, &mut primed).0.is_empty(),
             "0 字节的 b 不该被当成新版本，也不该被记进基线"
         );
         assert!(!last.contains_key("b"), "空壳不该有指纹");
 
         // 内容写上了 → 这才算一个新文件
         write_lua(&dir, "b", "PLUGIN_NAME = \"乙\"\n");
-        assert_eq!(hot_reload_round(&dir, &mut last, &mut primed), ["b"]);
+        assert_eq!(hot_reload_round(&dir, &mut last, &mut primed).0, ["b"]);
 
         // 已知插件被截成 0 字节：本轮不发请求，指纹沿用上一轮
         let known = last["a"];
         std::thread::sleep(std::time::Duration::from_millis(60));
         write_lua(&dir, "a", "");
         assert!(
-            hot_reload_round(&dir, &mut last, &mut primed).is_empty(),
+            hot_reload_round(&dir, &mut last, &mut primed).0.is_empty(),
             "0 字节 = 还没写完，不能判成变更（旧实现在这里发请求，把空壳装上去）"
         );
         assert_eq!(last["a"], known, "删除检测不能把截断误判成文件消失");
 
         // 真删掉：必须报（旧实现漏这一整条）
         std::fs::remove_file(dir.join("a.lua")).unwrap();
-        assert_eq!(hot_reload_round(&dir, &mut last, &mut primed), ["a"]);
+        assert_eq!(hot_reload_round(&dir, &mut last, &mut primed).0, ["a"]);
         assert!(!last.contains_key("a"), "基线要跟着收缩");
     }
 
@@ -3286,21 +3304,59 @@ end
         let not_a_dir = write_lua(tmp.path(), "not_a_dir", "这是个文件，不是目录\n");
         let mut last = HashMap::new();
         let mut primed = false;
-        assert!(hot_reload_round(&dir, &mut last, &mut primed).is_empty());
+        let (first, why) = hot_reload_round(&dir, &mut last, &mut primed);
+        assert!(first.is_empty());
+        assert!(why.is_none(), "读得动的那一轮不该交回原因");
         let baseline = last.clone();
 
         assert!(
-            scan_plugin_mtimes(&not_a_dir, &last).is_none(),
+            scan_plugin_mtimes(&not_a_dir, &last).is_err(),
             "读不出来要当成「不知道」，不是「目录空了」"
         );
+        let (reqs, why) = hot_reload_round(&not_a_dir, &mut last, &mut primed);
         assert!(
-            hot_reload_round(&not_a_dir, &mut last, &mut primed).is_empty(),
+            reqs.is_empty(),
             "读不出来的那一轮不该判成\"所有插件都被删了\""
+        );
+        // 原因要交回调用方：线程按目录去重之后只说一次，判定函数自己不出声
+        // （每 2 秒真说一次，一天四万条，把要看的那几条埋掉）。
+        let why = why.expect("读不出来的原因要一路交回去，不是就地吞掉");
+        assert!(
+            !why.is_empty(),
+            "交了错却没带上原因＝日志里只能说「读不出来」"
         );
         assert_eq!(last, baseline, "基线一个字都不许动");
         assert!(
-            hot_reload_round(&dir, &mut last, &mut primed).is_empty(),
+            hot_reload_round(&dir, &mut last, &mut primed).0.is_empty(),
             "下一轮成功读取不能把每个文件都当成新变更（旧实现在这里全员重载）"
+        );
+    }
+
+    /// 「只说一次」这件事必须**按目录各记一格**：用常数当键，内置那一格读不动就会把
+    /// 数据目录那一格的公告一起吃掉 —— 症状是只有一处坏了，日志里永远只提另一处。
+    /// 这条只能钉调用形态（一次线程要跑 2 秒一轮，用例里等不到）。
+    #[test]
+    fn the_unreadable_notice_is_keyed_per_directory() {
+        let src = include_str!("manager.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let loop_body = &prod[prod
+            .find("fn hot_reload_loop(")
+            .expect("热重载线程的本体找不到了")
+            ..prod.find("fn hot_reload_round(").expect("一轮扫描找不到了")];
+        assert!(
+            loop_body.contains("notice_once(&format!(\"watch-unreadable:{}\", dir.display()))"),
+            "读不出来的公告不再按目录去重了（改成了常数键、或干脆不去重每轮都说）"
+        );
+        // 判定函数那一侧不许自己出声，否则去重这一层管不到它
+        let scan_body = &prod[prod
+            .find("fn scan_plugin_mtimes(")
+            .expect("扫描函数找不到了")
+            ..prod
+                .find("/// 两轮快照之间该发哪些重载请求")
+                .expect("下一段找不到")];
+        assert!(
+            !scan_body.contains("tracing::error!("),
+            "一轮扫描自己出声了：去重在线程那一层，它拦不住每 2 秒一条"
         );
     }
 
