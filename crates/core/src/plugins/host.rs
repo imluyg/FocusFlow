@@ -395,7 +395,9 @@ pub fn register_host_api(
     // 番茄钟历史
     let sessions_fn = lua.create_function(|lua, limit: i64| {
         ensure_pomodoro_db();
-        let sessions = pomodoro::get_recent_sessions(limit.clamp(1, 100));
+        // 第二个返回值是"这一轮没读全"的原因（空串 = 读全了）：从前库打不开也回一张空表，
+        // 面板就在「历史记录（最近 20 条）」下面什么都不念 —— 与真的一条没做过长得一样。
+        let (sessions, gap) = pomodoro::get_recent_sessions(limit.clamp(1, 100));
         let t = lua.create_table()?;
         for (i, s) in sessions.iter().enumerate() {
             let row = lua.create_table()?;
@@ -407,14 +409,15 @@ pub fn register_host_api(
             row.set("keys", s.key_count)?;
             t.set(i + 1, row)?;
         }
-        Ok(t)
+        Ok((t, gap))
     })?;
     host.set("pomodoro_sessions", sessions_fn)?;
 
     let summary_fn = lua.create_function(|_, ()| {
         ensure_pomodoro_db();
-        let (count, keys, secs) = pomodoro::today_summary();
-        Ok((count, keys, secs))
+        // 第四个返回值同上（只取前三个的旧脚本一字不改照样拿到数）
+        let (count, keys, secs, gap) = pomodoro::today_summary();
+        Ok((count, keys, secs, gap))
     })?;
     host.set("pomodoro_summary", summary_fn)?;
 
@@ -1229,6 +1232,61 @@ mod tests {
         assert!(
             !crate::accounting::db_path().exists(),
             "记账库必须等记账 API 被调用才建"
+        );
+    }
+
+    /// 番茄钟那两条读数要把"没读全"的话交到 Lua 手上，而随包面板也确实接住了那一位。
+    ///
+    /// 只改 core 不够：宿主从前交回的是 `(count, keys, secs)` 与一张表，面板拿它们直接印
+    /// 「今日完成 0 个」和一张空的「历史记录（最近 20 条）」——库打不开与"今天真没做过"
+    /// 在屏上是同一句话。这一条钉两件事：多出来的那一位**是字符串而不是 nil**（面板写的是
+    /// `gap ~= ""`，nil 时那个判断永不成立，等于白改），以及随包
+    /// `crates/core/plugins/pomodoro_plugin.lua` 真的读了那两位并念"没读全"。
+    /// 「库好时它是空串」那条腿住在 `pomodoro.rs` 的用例里——那里的临时目录是真隔离的。
+    #[test]
+    fn the_pomodoro_host_api_hands_the_missing_reading_to_the_panel() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("host_pomo_gap");
+        let lua = Lua::new();
+        let database = db::Database::init_readonly();
+        register_host_api(&lua, crate::config::instance(), database, "pomo_gap_test")
+            .expect("注册宿主 API");
+
+        for (src, which) in [
+            (
+                "local _, _, _, g = focusflow.pomodoro_summary() return g",
+                "今日汇总",
+            ),
+            (
+                "local _, g = focusflow.pomodoro_sessions(5) return g",
+                "历史记录",
+            ),
+        ] {
+            let got: mlua::Result<String> = lua.load(src).eval();
+            match got {
+                // 「库好时它是空串」那条腿住在 core 的用例里（那里 per-test 目录是真的隔离）。
+                // 这一头不能那么断：`ensure_pomodoro_db` 的闩是进程级 OnceCell，
+                // 同进程里先跑过的那条用例已经把闩落下、它那份临时目录又被删了
+                // ⇒ 这里读不到库是**执行顺序**决定的，不是缺陷（顺序依赖的断言会翻脸）。
+                // 这一支只钉两件事：那一位是字符串（不是 nil），以及非空时它得是一句原因。
+                Ok(g) => assert!(
+                    g.is_empty()
+                        || g.contains("打不开")
+                        || g.contains("读不出来")
+                        || g.contains("读不动"),
+                    "{which} 交回的那一位要么是空串、要么得是一句能给人看的原因，实得: {g}"
+                ),
+                Err(e) => panic!(
+                    "{which} 多交回的那一位必须是字符串（拿到 nil 说明宿主没把它交出去，\
+                     面板那句 ~= 空串 的判断就永远不成立）: {e}"
+                ),
+            }
+        }
+
+        let panel = include_str!("../../plugins/pomodoro_plugin.lua").replace("\r\n", "\n");
+        assert!(
+            panel.contains("summary_gap") && panel.contains("hist_gap") && panel.contains("没读全"),
+            "面板没接住宿主多交回的那两位：读不出来时它照样只念 0 与一张空表"
         );
     }
 

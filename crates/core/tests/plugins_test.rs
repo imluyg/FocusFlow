@@ -1706,7 +1706,7 @@ mod tests {
         tick();
         manager.plugin_action(&name, "skip").expect("跳过");
         assert!(
-            pomodoro::get_recent_sessions(10).is_empty(),
+            pomodoro::get_recent_sessions(10).0.is_empty(),
             "跳过过的这一段不该留下一行"
         );
         assert_eq!(pomodoro::today_summary().0, 0, "跳过不该被数成'完成 1 个'");
@@ -1723,7 +1723,8 @@ mod tests {
             .expect("再开一个");
         tick();
         manager.plugin_action(&name, "stop").expect("停止");
-        let rows = pomodoro::get_recent_sessions(10);
+        let (rows, gap) = pomodoro::get_recent_sessions(10);
+        assert!(gap.is_empty(), "停止后这一问该读得出来，实得: {gap}");
         assert_eq!(
             rows.len(),
             1,
@@ -1766,7 +1767,7 @@ mod tests {
             "空闲时点暂停要说'先开始工作'，而不是分不清的已暂停/已继续"
         );
         assert_eq!(
-            pomodoro::get_recent_sessions(10).len(),
+            pomodoro::get_recent_sessions(10).0.len(),
             1,
             "以上没有任何一段被记成完成"
         );

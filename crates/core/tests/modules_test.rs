@@ -115,7 +115,8 @@ mod tests {
         assert_eq!(timer.get_state(), pomodoro::STATE_IDLE);
 
         // 历史记录
-        let sessions = pomodoro::get_recent_sessions(10);
+        let (sessions, gap) = pomodoro::get_recent_sessions(10);
+        assert!(gap.is_empty(), "这一步历史记录该读得出来，实得: {gap}");
         assert!(!sessions.is_empty(), "停止时应保存一条记录");
         assert_eq!(sessions[0].rtype, "work");
         assert!(

@@ -117,14 +117,15 @@ function get_view() return { title = "t", widgets = { {type="label", text="v"} }
 
     assert!(pm.reload_plugin("pomo_reload"), "重载应当成功");
     assert_eq!(
-        pomodoro::get_recent_sessions(10).len(),
+        pomodoro::get_recent_sessions(10).0.len(),
         0,
         "存一次文件不该落出一条已完成的番茄记录"
     );
 
     // 反向腿：卸载（= 停用）必须照旧回收，否则上面那条断言只是"什么都没写"的假绿
     assert!(pm.unload_plugin("番茄重载入"), "卸载应当成功");
-    let rows = pomodoro::get_recent_sessions(10);
+    let (rows, gap) = pomodoro::get_recent_sessions(10);
+    assert!(gap.is_empty(), "卸载后这一问该读得出来，实得: {gap}");
     assert_eq!(
         rows.len(),
         1,

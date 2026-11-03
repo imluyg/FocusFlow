@@ -145,7 +145,9 @@ function _build_widgets()
     local brk_min = state["break_minutes"] or 5
     -- 今日完成取库里的当日汇总，不取计时器里的 work_finished：后者是进程内的
     -- 累加值，重启后归零、跨零点又继续往上加，标成「今日」两头都会说谎。
-    local summary_count, summary_keys = focusflow.pomodoro_summary()
+    -- 第四个返回值是"这一轮没读全"的原因（空串 = 读全了）：库读不动时前三个数都是 0，
+    -- 只念数字就等于把"没读到"说成"你今天没做过番茄"。
+    local summary_count, summary_keys, _, summary_gap = focusflow.pomodoro_summary()
 
     local st = _state_text(code)
     if paused then st = st .. "（已暂停）" end
@@ -172,6 +174,17 @@ function _build_widgets()
         widgets[#widgets + 1] = { type = "label", text = hint }
     end
 
+    -- 今日汇总没读全时，那一行必须跟在那两个 0 后面说：面板拿 `pomodoro_summary()` 的前三个
+    -- 数直接印「今日完成 0 个 / 今日键鼠 0」，库打不开与"今天真没做过"在屏上长得一模一样，
+    -- 而用户会照这个读数决定要不要重来一段。
+    if summary_gap and summary_gap ~= "" then
+        widgets[#widgets + 1] = {
+            type = "label",
+            text = "今日汇总这次没读全：" .. tostring(summary_gap)
+                .. "。上面那两个 0 是没读到，不等于今天没做过",
+        }
+    end
+
     widgets[#widgets + 1] = { type = "separator" }
 
     -- 时长：以前 work_min/brk_min 取出即弃，面板既看不到也改不了
@@ -190,8 +203,8 @@ function _build_widgets()
     widgets[#widgets + 1] = { type = "separator" }
     widgets[#widgets + 1] = { type = "heading", text = "历史记录（最近 20 条）" }
 
-    -- 历史表格
-    local sessions = focusflow.pomodoro_sessions(20)
+    -- 历史表格（第二个返回值：这一轮没读全的原因，空串 = 读全了。空表 + 不说原因＝"没做过"）
+    local sessions, hist_gap = focusflow.pomodoro_sessions(20)
     local rows = {}
     for _, s in ipairs(sessions) do
         local tname = "工作"
@@ -203,6 +216,12 @@ function _build_widgets()
         headers = { "类型", "开始时间", "时长", "键鼠数" },
         rows = rows,
     }
+    if hist_gap and hist_gap ~= "" then
+        widgets[#widgets + 1] = {
+            type = "label",
+            text = "这份历史没读全：" .. tostring(hist_gap) .. "。表里缺的行不代表没有做过",
+        }
+    end
 
     return widgets
 end

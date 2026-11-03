@@ -137,13 +137,23 @@ where
     (sessions, dropped, first_err)
 }
 
-/// 按日期查询会话。
-pub fn get_sessions_by_date(date_str: &str, limit: i64) -> Vec<Session> {
+/// 按日期查询会话，**另交回"这一问到底哪儿没答上来"**（空串 = 答上了）。
+///
+/// 与 `accounting::subcategories_readout` 同一个口径。从前这里失败一律回 `Vec::new()`，
+/// 于是面板拿它念「今日完成 0 个」和一张空的「历史记录（最近 20 条）」——库被别的进程握着、
+/// 表读不出来、某几行读不动，这三件事在屏上都长成"你今天没做过番茄"，而用户会照这个读数
+/// 决定要不要重来一段。`collect_sessions` 早就把"丢掉几行 + 第一个原因"交回上层了
+/// （注释写着"调用方负责把后两样说出来"），只差最后那一步：它过去只进日志，
+/// 而日志默认不开（`[gui] trace_log`）。
+pub fn get_sessions_by_date(date_str: &str, limit: i64) -> (Vec<Session>, String) {
     let conn = match open_local() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("番茄钟查询（{date_str}）失败：库打不开: {e}");
-            return Vec::new();
+            return (
+                Vec::new(),
+                format!("番茄钟库打不开（{e}）：这一天做过几个没读到"),
+            );
         }
     };
     let mut stmt = match conn.prepare(&format!(
@@ -152,7 +162,7 @@ pub fn get_sessions_by_date(date_str: &str, limit: i64) -> Vec<Session> {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("番茄钟查询（{date_str}）失败：语句准备不了: {e}");
-            return Vec::new();
+            return (Vec::new(), format!("番茄钟的历史表读不出来（{e}）"));
         }
     };
     // 上界取「次日 00:00:00」的开区间。原先写成 `start_time < '<date> 23:59:59'`，
@@ -170,13 +180,27 @@ pub fn get_sessions_by_date(date_str: &str, limit: i64) -> Vec<Session> {
         Ok(rows) => {
             let (sessions, dropped, why) = collect_sessions(rows);
             report_dropped(date_str, dropped, why.as_deref());
-            sessions
+            let gap = dropped_reason(dropped, why.as_deref()).unwrap_or_default();
+            (sessions, gap)
         }
         Err(e) => {
             tracing::error!("番茄钟查询（{date_str}）失败：这一天的行一条都没读出来: {e}");
-            Vec::new()
+            (Vec::new(), format!("这一天的记录一条都没读出来（{e}）"))
         }
     }
+}
+
+/// "有 N 行读不出来"那句要点明的原因（`None` = 一行没丢）。
+///
+/// 与 `report_dropped` 同一串文字，区别只是这一个交回调用方去说、那个进日志：
+/// 少几行不是"那一天就这么些"，而是"有几行我们没读动"。
+fn dropped_reason(dropped: usize, first_err: Option<&str>) -> Option<String> {
+    (dropped > 0).then(|| {
+        format!(
+            "有 {dropped} 行读不出来（第一个原因：{}），它们没算进来",
+            first_err.unwrap_or("没带上原因")
+        )
+    })
 }
 
 /// 把一行（按下标，顺序即 [`SESSION_COLS`]）读成会话。
@@ -204,13 +228,16 @@ fn report_dropped(date_str: &str, dropped: usize, first_err: Option<&str>) {
     }
 }
 
-/// 查询最近会话。
-pub fn get_recent_sessions(limit: i64) -> Vec<Session> {
+/// 查询最近会话，另交回"这一问没答上来的原因"（空串 = 答上了）。理由同 `get_sessions_by_date`。
+pub fn get_recent_sessions(limit: i64) -> (Vec<Session>, String) {
     let conn = match open_local() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("番茄钟最近会话查询失败：库打不开: {e}");
-            return Vec::new();
+            return (
+                Vec::new(),
+                format!("番茄钟库打不开（{e}）：历史记录这一轮没读到"),
+            );
         }
     };
     let mut stmt = match conn.prepare(&format!(
@@ -219,7 +246,7 @@ pub fn get_recent_sessions(limit: i64) -> Vec<Session> {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("番茄钟最近会话查询失败：语句准备不了: {e}");
-            return Vec::new();
+            return (Vec::new(), format!("番茄钟的历史表读不出来（{e}）"));
         }
     };
     let result = stmt.query_map([limit], row_to_session);
@@ -227,24 +254,30 @@ pub fn get_recent_sessions(limit: i64) -> Vec<Session> {
         Ok(rows) => {
             let (sessions, dropped, why) = collect_sessions(rows);
             report_dropped("最近", dropped, why.as_deref());
-            sessions
+            let gap = dropped_reason(dropped, why.as_deref()).unwrap_or_default();
+            (sessions, gap)
         }
         Err(e) => {
             tracing::error!("番茄钟最近会话查询失败：一条都没读出来: {e}");
-            Vec::new()
+            (Vec::new(), format!("历史记录一条都没读出来（{e}）"))
         }
     }
 }
 
 /// 今日番茄钟汇总。
-pub fn today_summary() -> (i64, i64, i64) {
+/// 今日番茄钟汇总。第四个返回值是"这一轮到底哪儿没答上来"（空串 = 答上了）。
+///
+/// 前三个数在库读不动时全是 0，而面板把它们念成「今日完成 0 个 / 今日键鼠 0」——
+/// 与真的一天没做过长得一样。原因从今天起有地方交出去：`host.rs` 的 `pomodoro_summary`
+/// 把它作为第四个返回值给 Lua，面板照 `accounting_plugin` 那句「这次没读全」的写法念出来。
+pub fn today_summary() -> (i64, i64, i64, String) {
     let today = Local::now().format("%Y-%m-%d").to_string();
-    let sessions = get_sessions_by_date(&today, 1000);
+    let (sessions, gap) = get_sessions_by_date(&today, 1000);
     let work: Vec<&Session> = sessions.iter().filter(|s| s.rtype == "work").collect();
     let count = work.len() as i64;
     let total_keys = work.iter().map(|s| s.key_count).sum();
     let total_secs = work.iter().map(|s| s.actual_seconds).sum();
-    (count, total_keys, total_secs)
+    (count, total_keys, total_secs, gap)
 }
 
 /// 番茄钟定时器（后台线程驱动）。
@@ -776,10 +809,10 @@ mod tests {
 
         assert_eq!(
             today_summary(),
-            (0, 0, 0),
+            (0, 0, 0, String::new()),
             "不到一秒的番茄不该被记成今天完成了一个"
         );
-        assert!(get_recent_sessions(10).is_empty(), "不该落进历史记录");
+        assert!(get_recent_sessions(10).0.is_empty(), "不该落进历史记录");
         assert_eq!(t.get_state_info()["work_finished"], 0, "不该算完成一个番茄");
     }
 
@@ -905,7 +938,7 @@ mod tests {
             1,
             "落库成功要计一个番茄"
         );
-        assert_eq!(get_recent_sessions(10).len(), 1, "库里要留下那一行");
+        assert_eq!(get_recent_sessions(10).0.len(), 1, "库里要留下那一行");
     }
 
     /// 读会话必须按**列名**问，不能拿 `SELECT *` 的下标去猜。
@@ -945,7 +978,8 @@ mod tests {
             .unwrap();
         }
 
-        for got in [get_sessions_by_date(&today, 100), get_recent_sessions(10)] {
+        for (got, gap) in [get_sessions_by_date(&today, 100), get_recent_sessions(10)] {
+            assert!(gap.is_empty(), "两条读路都该答得上来，实得: {gap}");
             let s = got
                 .first()
                 .expect("旧形态那张表的行必须读得出来，不能变成「今天没做过番茄」");
@@ -966,7 +1000,11 @@ mod tests {
         }
 
         // 今日汇总吃的是同一条读路：错位的三个数会直接变成卡片上的键数与时长
-        let (count, keys, secs) = today_summary();
+        let (count, keys, secs, sum_gap) = today_summary();
+        assert!(
+            sum_gap.is_empty(),
+            "读得出来的日子不该带「没读全」那句：{sum_gap}"
+        );
         assert!(
             count == 1 && keys == 42 && secs == 900,
             "今日汇总要按字段本来的意思算，实得 count={count} keys={keys} secs={secs}"
@@ -1038,8 +1076,64 @@ mod tests {
         })
         .unwrap();
 
-        let got = get_sessions_by_date(&today, 100);
+        let (got, gap) = get_sessions_by_date(&today, 100);
+        assert!(gap.is_empty(), "这一天读得出来，实得: {gap}");
         assert_eq!(got.len(), 1, "23:59:59 开始的会话被查询边界吃掉了");
+    }
+
+    /// 库读不动时交回的是"没读到"，不是干干净净的一串 0。
+    ///
+    /// 病状：`get_recent_sessions` / `get_sessions_by_date` / `today_summary` 三种失败
+    /// （库被别的进程握着、表读不出来、若干行读不动）从前一律只回空值 ⇒ 面板照那两个 0 念
+    /// 「今日完成 0 个 / 今日键鼠 0」和一张空的「历史记录（最近 20 条）」，与真的一天没做过
+    /// 长得一模一样，而用户会照着它决定要不要重来一段。日志那句"打不开"要开着
+    /// `[gui] trace_log` 才看得见（默认关）。
+    ///
+    /// 夹具是本仓那一族的常用造法：把库的位置换成**同名目录** ⇒ `Connection::open` 必然失败。
+    /// 四条腿：库好时原因必须是空串（写成"总在"就红）；换成目录后交回的原因要点名"打不开"；
+    /// 三个数照旧是 0（这一条不改，改的是"只有 0 没有话"）；且不许凭空造出读出来的行。
+    #[test]
+    fn an_unreadable_pomodoro_db_is_reported_instead_of_becoming_zero() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("pomo_unreadable");
+        init_db().expect("番茄钟库该能建起来");
+        let path = db_path();
+
+        let (_, gap) = get_recent_sessions(10);
+        assert!(gap.is_empty(), "库好好的时候不该有「没读全」那句：{gap}");
+        let (_, _, _, sum_gap) = today_summary();
+        assert!(sum_gap.is_empty(), "同上，今日汇总那一问: {sum_gap}");
+
+        std::fs::remove_file(&path).expect("先撤掉真库");
+        std::fs::create_dir_all(&path).expect("在同一位置摆一个目录");
+
+        let (rows, gap) = get_recent_sessions(10);
+        assert!(rows.is_empty(), "读不出来时不许凭空造出行: {rows:?}");
+        assert!(
+            gap.contains("打不开") && !gap.contains("没做过"),
+            "要说清是读不出来，而不是替用户下结论：{gap}"
+        );
+
+        let (count, keys, secs, sum_gap) = today_summary();
+        assert_eq!(
+            (count, keys, secs),
+            (0, 0, 0),
+            "三个数照旧（这一笔改的是「只有数、没有话」）"
+        );
+        assert!(
+            sum_gap.contains("打不开"),
+            "今日汇总必须同时交出「为什么没读到」，否则屏上那两个 0 就是假话: {sum_gap}"
+        );
+
+        std::fs::remove_dir_all(&path).expect("清掉夹具目录");
+        // 撤掉障碍后要重新建一次库：上一次 `init_db` 建的那份文件已经连着目录一起被删了，
+        // 只剩一个空路径。此时"没有这张表"是真·没数据，而我们的读路会照实说"表读不出来"——
+        // 那句在这个前提下是对的（`ensure_pomodoro_db` 的闩落下过就不再来一次），
+        // 所以这一腿要先把它建回来，再验"话说回去了"。
+        init_db().expect("障碍清掉后该能重新建库");
+        let (rows, gap) = get_recent_sessions(10);
+        assert!(gap.is_empty(), "障碍清掉后同一问要立刻恢复说得出来: {gap}");
+        assert!(rows.is_empty(), "障碍清掉后表本来是空的（不是读不出来）");
     }
 }
 
@@ -1093,7 +1187,7 @@ mod busy_lock_tests {
             waited.elapsed()
         );
         // 反向腿：这一段确实落了库，否则上面的"不卡"只是因为什么都没写
-        assert_eq!(get_recent_sessions(10).len(), 1);
+        assert_eq!(get_recent_sessions(10).0.len(), 1);
     }
 
     /// `[pomodoro]` 三键必须真的落到计时器上。
