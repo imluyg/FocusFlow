@@ -235,8 +235,8 @@ fn check_field_shapes(sink: &mut Sink<'_>, raw: &DeclaredFields, source: PluginS
                 Level::Error,
                 "PLUGIN_API",
                 format!(
-                    "= {n} 比本宿主认得的最高版本还高（这一版到 {}）。宿主今天照样加载它，\
-                     但它要的那些新格子可能一个都没有 —— 这一份要配更高版本的程序",
+                    "= {n} 比本宿主认得的最高版本还高（这一版到 {}）—— 加载会在执行脚本之前就被拒绝，\
+                     插件页那一行写「需要更新版本」；这一份要配更高版本的程序",
                     MAX_SUPPORTED_PLUGIN_API
                 ),
             );

@@ -167,9 +167,9 @@ const DEFAULT_PLUGIN_API: u32 = 1;
 
 /// 本宿主认得上去的最高能力版本（方案 3.10：宿主支持 `1..=2`）。
 ///
-/// 今天只有校验器（[`super::validate`]）拿它说话：加载侧"太新就拒绝并提示升级插件"那一支
-/// 还没接（3.10 的另一半），所以高版本的插件现在照样加载。把这个数写在一处，等那一支落地
-/// 时两处念同一句话。
+/// 两个读者念同一个数：加载侧 [`PluginManager::load_plugin`] 那一道门（比它高就在执行脚本之前拒绝，
+/// 并把这句话留在插件页那一行）与校验器（[`super::validate`]，让作者不用跑到运行时才知道）。
+/// 升版本时必须当场回答这两处各自要不要跟着动 —— 只动一处的症状是"校验器放行、加载拒绝"。
 pub const MAX_SUPPORTED_PLUGIN_API: u32 = 2;
 
 /// 同时加载的常驻插件上限（方案 3.11 那张表：128 MB 总账 ÷ 16 MB 单插件上限 = 8）。
@@ -1428,6 +1428,17 @@ impl PluginManager {
     /// 一路带到这里：它决定插件看见哪一组宿主 API（3.4）。身份不读脚本自己写的常量，
     /// 所以这里必须由调用方说，不能在函数里猜。
     pub fn load_plugin(&mut self, path: &Path, source: PluginSource) -> Result<String, String> {
+        // 方案 3.10 那一档：能力版本比宿主还高的这一份，在**执行脚本之前**就拒绝。
+        // 取这一眼靠的是纯文本扫描（`scan_meta`，与插件页那一栏同一把尺子），不碰 Lua ——
+        // 症状是作者写 `PLUGIN_API = 3` 指望那些新格子，而今天每一格拿到的都是 nil；
+        // 与其让它在运行时零散失败，不如在加载这一步就说清"这一份要配更高版本的程序"。
+        let scanned = Self::scan_meta(path)?;
+        if scanned.api > MAX_SUPPORTED_PLUGIN_API {
+            return Err(format!(
+                "{} 需要更新版本的 FocusFlow：它声明要 API {}，而这一版只到 API {}",
+                scanned.name, scanned.api, MAX_SUPPORTED_PLUGIN_API
+            ));
+        }
         let meta = self.read_meta(path)?;
         // 展示名（PLUGIN_NAME）是插件表的键。两个文件声明同一个名字时，原先是
         // 后来者静默覆盖前者：被顶掉的那个既不再接收键事件，也再没有 unload
