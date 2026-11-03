@@ -1753,30 +1753,79 @@ fn png_bytes(buf: &[u8], w: i32, h: i32) -> std::result::Result<Vec<u8>, String>
     focusflow_core::capture::encode_png(&rgba, w as u32, h as u32)
 }
 
+/// 撞车时往后挪后缀的上限：够同秒连按很多次，又不至于把一次磁盘错误拖成长循环。
+const SNIP_NAME_TRIES: usize = 100;
+
 /// 把已编好的 PNG 落进 `dir`，返回写出去的路径。
 ///
 /// 目录由调用方给：产品用 `screenshots_dir()`，屏上探针用临时目录。
-/// 文件名带宽高（`snip_<时间戳>_<宽>x<高>.png`），同秒连按靠 `_2` 区分 ——
-/// 只到秒的旧命名会让两张同名互相覆盖，连按两次只剩一张。
 fn write_png_named(
     dir: &std::path::Path,
     png: &[u8],
     w: i32,
     h: i32,
 ) -> std::result::Result<std::path::PathBuf, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("建目录失败：{e}"))?;
-    let listing: Vec<String> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let name = out_name(&ts, w as u32, h as u32, &listing);
-    let path = dir.join(&name);
-    std::fs::write(&path, png).map_err(|e| format!("写盘失败：{e}"))?;
-    Ok(path)
+    write_png_listing(dir, png, w as u32, h as u32, &ts, list_dir_names(dir))
+}
+
+/// 目录里现有的名字。`None` = **这一问没答上来**（`read_dir` 失败：备份正握着目录、
+/// 共享冲突、权限），它与"目录里是空的"是两件事，不许折成一样。
+fn list_dir_names(dir: &std::path::Path) -> Option<Vec<String>> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    Some(
+        rd.filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect(),
+    )
+}
+
+/// 真正落盘那一步。**清单不可信时也不许盖掉已经在盘上的那一张。**
+///
+/// 文件名带宽高（`snip_<时间戳>_<宽>x<高>.png`），同秒连按靠 `_2` 区分 ——
+/// 只到秒的旧命名会让两张同名互相覆盖，连按两次只剩一张。
+///
+/// 从前这里只有一条路：`read_dir(...).unwrap_or_default()` 把"读不到"折成"目录里什么都没有"，
+/// 于是同名的先例看不见，而下一句 `fs::write` 是 truncate —— 上一张截图被这一张整个盖掉，
+/// 日志与回执说的却是「截图已保存：<同一个路径>」。文件名带宽高、同秒连按靠 `_2` 区分，
+/// 判的都是"清单读得到"这一条前提。
+///
+/// 最后一道防线不是信清单，是 `create_new`：名字被占了就按 `unique_name` 那套写法往后挪一个
+/// 后缀（与 `out_name` 同一个出处，不另起第三套命名），挪到 [`SNIP_NAME_TRIES`] 个还没空位
+/// 就报错，绝不回头去盖。`ts` 与清单都做成参数，是为了让"清单读不到"这一档能被用例造出来
+/// —— 真把 `read_dir` 弄失败在这台机器上不稳定。
+fn write_png_listing(
+    dir: &std::path::Path,
+    png: &[u8],
+    w: u32,
+    h: u32,
+    ts: &str,
+    listing: Option<Vec<String>>,
+) -> std::result::Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("建目录失败：{e}"))?;
+    let mut known: Vec<String> = listing.unwrap_or_default();
+    for _ in 0..SNIP_NAME_TRIES {
+        // 名字只有这一把尺子（`out_name`）：后缀写法与那条"同秒连按"的既有用例同源
+        let name = out_name(ts, w, h, &known);
+        let path = dir.join(&name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(png).map_err(|e| format!("写盘失败：{e}"))?;
+                return Ok(path);
+            }
+            // 清单说没有、盘上却已经有一个 ⇒ 清单不可信（读失败，或刚被别的进程写过）
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => known.push(name),
+            Err(e) => return Err(format!("写盘失败：{e}")),
+        }
+    }
+    Err(format!(
+        "写盘失败：{ts} 那一张往后 {SNIP_NAME_TRIES} 个名字都被占了，这一张没落盘（也没有盖掉任何一张）"
+    ))
 }
 
 /// 一次出图之后覆盖层留不留，只看这两件事的成败。
@@ -6772,6 +6821,82 @@ mod tests {
             out_name("20261028_120000", 640, 480, &listing),
             "snip_20261028_120000_640x480.png"
         );
+    }
+
+    /// 清单读不到的那一次，也不许把已经在盘上的那一张截断盖掉。
+    ///
+    /// 上面那条用例判的是"名字怎么挑"，前提永远是**清单读得到**；而写盘那一步从前只信清单：
+    /// `read_dir(...).unwrap_or_default()` 把"读不到"折成"目录里是空的"，同名的先例就看不见，
+    /// 下一句 `fs::write` 是 truncate ⇒ 上一张截图整个被盖掉，日志与回执还写着
+    /// 「截图已保存：<同一个路径>」。这一档真把 `read_dir` 弄失败在本机不稳定，
+    /// 所以名字挑选抽成 `write_png_listing`，清单来源做成可注入的参数。
+    ///
+    /// 四条腿：①清单读不到（`None`）时新那张落到别的名字上、**旧那张的内容一字未动**；
+    /// ②清单谎报"空"时结论一样，且与①不撞名；③清单如实为空时仍用那个最朴素的名字
+    /// （不许无缘无故多挪一层后缀）；④占满上限时报错，且不回过去盖任何东西。
+    #[test]
+    fn a_shot_never_truncates_the_one_already_on_disk() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.scratch/snip-no-truncate");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建得出夹具目录");
+        let ts = "20261103_023000";
+        let base = dir.join(format!("snip_{ts}_300x200.png"));
+        std::fs::write(&base, b"the earlier shot").expect("先摆一张在同名位置");
+
+        let png = b"the new shot";
+        let got = write_png_listing(&dir, png, 300, 200, ts, None).expect("该落到别的名字上");
+        assert_ne!(
+            got,
+            base,
+            "同名那张已经在这儿了，不许回头盖它: {}",
+            got.display()
+        );
+        assert_eq!(
+            std::fs::read(&base).unwrap(),
+            b"the earlier shot",
+            "上一张截图被这一张截断改掉了"
+        );
+        assert_eq!(
+            std::fs::read(&got).unwrap(),
+            png.to_vec(),
+            "新这张自己得真写进去: {}",
+            got.display()
+        );
+
+        let got2 = write_png_listing(&dir, png, 300, 200, ts, Some(Vec::new()))
+            .expect("清单谎报为空时也该找得到空位");
+        assert_ne!(got2, base, "同前：不许盖先例: {}", got2.display());
+        assert_ne!(got2, got, "两次落盘也不许撞同一个名字");
+
+        // ③ 清单如实为空 ⇒ 还是那个最朴素的名字
+        let fresh = dir.join("fresh");
+        let ok = write_png_listing(&fresh, png, 640, 480, ts, Some(Vec::new())).expect("写得出去");
+        assert_eq!(
+            ok.file_name().map(|n| n.to_string_lossy().into_owned()),
+            Some(format!("snip_{ts}_640x480.png")),
+            "没有先例时不许无缘无故多挪一层后缀"
+        );
+
+        // ④ 占满上限：报错，而不是回头去盖
+        let crowded = dir.join("crowded");
+        std::fs::create_dir_all(&crowded).expect("建得出拥挤目录");
+        std::fs::write(crowded.join(format!("snip_{ts}_10x10.png")), b"keep me").unwrap();
+        for n in 2..=SNIP_NAME_TRIES as u32 {
+            std::fs::write(crowded.join(format!("snip_{ts}_10x10_{n}.png")), b"keep me").unwrap();
+        }
+        let err = write_png_listing(&crowded, png, 10, 10, ts, None)
+            .expect_err("名字占满就该报错，不许没完没了地试");
+        assert!(
+            err.contains("没落盘") && err.contains("没有盖掉"),
+            "报错要说清这张没写成、也没动别人的: {err}"
+        );
+        assert_eq!(
+            std::fs::read(crowded.join(format!("snip_{ts}_10x10.png"))).unwrap(),
+            b"keep me",
+            "撞满上限那一次也不许回头截断第一张"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 拖一笔成什么形状；空串 = 这一笔不落。选区固定成 200x200 在 (100,100)。
