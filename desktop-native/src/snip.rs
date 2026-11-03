@@ -1842,6 +1842,39 @@ pub fn snip_receipt(file: &str, w: i32, h: i32, pinned: bool) -> String {
     format!("截图已存 {file}（{w}x{h}），同时复制到剪贴板{tail}")
 }
 
+/// 贴图（钉在桌面上）那一条的成交句：三件事各自成没成，按真的说。
+///
+/// 从前这一支只看 `saved` 有没有值，只要文件落了就直接交回 `snip_receipt(.., pinned=true)`，
+/// 而那句写着「同时复制到剪贴板」。别的程序正握着剪贴板时
+/// （`write_image_to_clipboard` 重试 5×50ms 就放弃）盘上文件成了、钉也成了，
+/// 屏上却说"复制了"——用户到聊天框里粘，粘出来是空的，而覆盖层已经退了、重试那一按也没了。
+/// 反过来文件没落时 `saved` 是 None，屏上一句都不说（贴图走的是 Done），
+/// 只剩一条默认不开的 `trace_log`。
+pub fn pin_receipt(
+    saved_name: Option<&str>,
+    save_err: Option<&str>,
+    clip_err: Option<&str>,
+    w: i32,
+    h: i32,
+) -> String {
+    match (saved_name, save_err, clip_err) {
+        // 三件都成：还是那句既有写法（尺寸、文件名、两个去处都在）
+        (Some(name), None, None) => snip_receipt(name, w, h, true),
+        (Some(name), None, Some(e)) => format!(
+            "截图已存 {name}（{w}x{h}），并钉在桌面上；复制到剪贴板没成：{e}（粘到别处拿不到这张图）"
+        ),
+        (None, Some(e), None) => format!(
+            "图没存下来：{e}（已经钉在桌面上，可以右键再处理；要留文件就修好那一处再截一次）"
+        ),
+        (None, Some(e), Some(c)) => format!(
+            "图没存下来：{e}；复制到剪贴板也没成：{c}（只有钉在桌面上这张成了，右键还能再处理）"
+        ),
+        // 落盘失败时 `saved_name` 必是 None、`save_err` 必是 Some：剩下这一支是
+        // "什么都没成却说不出为什么"，宁可念一句没成，也不许编一句成。
+        _ => "贴图这一步没能确认：文件与剪贴板两边都没交回结果（钉在桌面上那张可能仍可用）".to_string(),
+    }
+}
+
 /// 一次出图：合成 → 落盘 → 进剪贴板（CF_DIB 与 `PNG` 两份，编码只做一次）。
 /// `pin` = 顺手把这一张钉在桌面上（不再多落一个文件）。
 ///
@@ -1910,15 +1943,16 @@ fn commit_into(dir: &std::path::Path, clipboard: bool, pin: bool) -> Verdict {
         }
     };
     if pin {
-        // 贴图这条以"钉上了"为成交：文件/剪贴板没成都已在日志里出声，
-        // 而钉好的那张还在桌上可以右键再处理，不该把覆盖层压着不放。
+        // 贴图这条以"钉上了"为成交：钉好的那张还在桌上可以右键再处理，不该把覆盖层压着不放。
+        // 但"成交"不等于"三件都成"——`commit_verdict` 上面那段自己写的规矩（只丢剪贴板也要
+        // 说出来，因为"以为复制上了"会让他粘到别处才发现是空的）在这一支同样成立：
+        // 从前这里只看 `saved` 有没有值，于是剪贴板没进去也照念「同时复制到剪贴板」，
+        // 而文件没落时一句都不说（覆盖层已经退了，重试那一按也没了）。
         open_pin(buf, w, h, origin.0 + sel.0, origin.1 + sel.1);
-        if let Some(name) = &saved {
-            crate::note_snip_result(
-                HWND(owner as *mut core::ffi::c_void),
-                snip_receipt(name, w, h, true),
-            );
-        }
+        let save_err = save.as_ref().err().map(|s| s.as_str());
+        let clip_err = clip.as_ref().err().map(|s| s.as_str());
+        let msg = pin_receipt(saved.as_deref(), save_err, clip_err, w, h);
+        crate::note_snip_result(HWND(owner as *mut core::ffi::c_void), msg);
         return Verdict::Done;
     }
     let v = commit_verdict(save, clip);
@@ -7164,6 +7198,96 @@ mod tests {
         assert!(pin.contains("钉在桌面"), "贴图那条要说全：{pin}");
         assert!(pin.contains("剪贴板"), "贴图这条其实也上了剪贴板：{pin}");
         assert_ne!(plain, pin, "两句一模一样，等于没说");
+    }
+
+    /// 贴图那一条按"三件事各自成没成"说话，而不是只看文件落没落。
+    ///
+    /// 病状是 `commit_verdict` 上面那段自己写着要防的那件事：只丢剪贴板时屏上说
+    /// 「同时复制到剪贴板」，人到聊天框里粘出来是空的，而覆盖层已经退了、重试那一按也没了。
+    /// 反过来的那一半同样要说：文件没落时从前一句都不说（`saved` 是 None 就跳过回执）。
+    ///
+    /// 五条腿：三件都成＝沿用既有那句（不另发明一套话）；只丢剪贴板＝**不许**出现成功那半句、
+    /// 要点名原因、文件那一半照旧在；只丢文件＝不许说"已存"也不许说复制上了；
+    /// 两件都丢＝两条原因都在，不许后者顶掉前者；最后一条兜底＝什么都问不出时不许编一句成。
+    #[test]
+    fn the_pin_receipt_names_each_destination_that_actually_took() {
+        // 三件都成
+        let all_ok = pin_receipt(Some("snip_a.png"), None, None, 300, 200);
+        assert_eq!(
+            all_ok,
+            snip_receipt("snip_a.png", 300, 200, true),
+            "都成时就用既有那句话，不另发明一套写法：{all_ok}"
+        );
+
+        // 文件成了、剪贴板没进 —— 这一支从前照样念「同时复制到剪贴板」
+        let clip_bad = pin_receipt(
+            Some("snip_a.png"),
+            None,
+            Some("打开剪贴板失败：占用"),
+            300,
+            200,
+        );
+        assert!(
+            !clip_bad.contains("同时复制到剪贴板"),
+            "没进去就不许念那句成功话：{clip_bad}"
+        );
+        assert!(
+            clip_bad.contains("剪贴板没成")
+                && clip_bad.contains("打开剪贴板失败：占用")
+                && clip_bad.contains("snip_a.png"),
+            "要点名哪一处没成、为什么，文件那一半照常说: {clip_bad}"
+        );
+
+        // 文件没落（`saved` 是 None）—— 从前这一支连回执都不发
+        let save_bad = pin_receipt(None, Some("写盘失败：只读"), None, 300, 200);
+        assert!(
+            save_bad.contains("图没存下来") && save_bad.contains("写盘失败：只读"),
+            "文件没落必须当场说，附上原因: {save_bad}"
+        );
+        assert!(
+            !save_bad.contains("已存") && !save_bad.contains("复制到剪贴板"),
+            "既没说成的文件，也不能顺口说复制上了: {save_bad}"
+        );
+        assert!(
+            save_bad.contains("钉在桌面"),
+            "钉成了这件事是真的，别一起抹掉: {save_bad}"
+        );
+
+        // 两件都没成：两条原因都要在
+        let both_bad = pin_receipt(None, Some("写盘失败：盘满"), Some("剪贴板被占"), 300, 200);
+        assert!(
+            both_bad.contains("盘满") && both_bad.contains("剪贴板被占"),
+            "两样都没成时不许后者顶掉前者: {both_bad}"
+        );
+
+        // 兜底支（正常走不到）：问不出来就不许编一句成
+        let odd = pin_receipt(None, None, Some("剪贴板被占"), 300, 200);
+        assert!(
+            !odd.contains("已存") && !odd.contains("同时复制"),
+            "没有文件名就没有'已存'可说: {odd}"
+        );
+
+        // 接线腿：贴图那一支确实改吃这个函数，旧的"只看 saved"写法必须为零
+        let src = include_str!("snip.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            flat.matches("pin_receipt(saved.as_deref()").count(),
+            1,
+            "贴图那一支没接上按去处分档的回执，实得 {}",
+            flat.matches("pin_receipt(saved.as_deref()").count()
+        );
+        assert_eq!(
+            flat.matches("ifletSomenamedsaved{cratenotesnipresult")
+                .count(),
+            0,
+            "贴图那一支又回到「文件落了就说全成」：剪贴板没进去时屏上会念一句假话"
+        );
     }
 
     #[test]
