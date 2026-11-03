@@ -716,6 +716,106 @@ struct PluginRow {
     enabled: bool,
     loaded: bool,
     error: Option<String>,
+    /// 出自内置那一处目录 = 画在「内置模块」那一栏。身份读的是 core 交回的
+    /// `DiscoveredPlugin.source`（位置说了算，不看脚本自己写的常量）。
+    builtin: bool,
+    /// 常驻标签（内置由位置强制，用户装的认自己声明的 `PLUGIN_LIFECYCLE`）。
+    resident: bool,
+    /// 声明那一格的原料：`PLUGIN_API` / `PLUGIN_PERMISSIONS` / `PLUGIN_REFRESH_MS` /
+    /// `PLUGIN_MIN_APP`，以及这一份 `state.json` 的占用与最近一次写不进去的原因。
+    api: u32,
+    permissions: usize,
+    refresh_ms: u64,
+    min_app: String,
+    store_bytes: Option<usize>,
+    store_error: Option<String>,
+}
+
+impl PluginRow {
+    /// 第二格右边那一串「它自己声明了什么」。
+    ///
+    /// 只列**与缺省不同**的那些（`API 1`、`面板`、`0ms`、空权限都不出声），
+    /// 于是随包那五个一字未改的脚本这一格是空的 —— 屏上不会多出五排没人看得懂的小字。
+    /// 每一项都读 core 交回的那份清单，不是在这里再算一遍。
+    fn declaration(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.resident {
+            parts.push("常驻".to_string());
+        }
+        if self.api != 1 {
+            parts.push(format!("API {}", self.api));
+        }
+        if self.permissions > 0 {
+            parts.push(format!("权限 {} 项", self.permissions));
+        }
+        if self.refresh_ms > 0 {
+            parts.push(format!("{}ms 自刷", self.refresh_ms));
+        }
+        if !self.min_app.is_empty() {
+            parts.push(format!("需 {}", self.min_app));
+        }
+        if let Some(n) = self.store_bytes {
+            if n > 0 {
+                // 1 KB 以下就说字节，别显示"0 KB"（那是"没有"的读法）
+                parts.push(if n < 1024 {
+                    format!("占用 {n} B")
+                } else {
+                    format!("占用 {} KB", n.div_ceil(1024))
+                });
+            }
+        }
+        parts.join(" · ")
+    }
+
+    /// 第二格那句话，外加"这是不是一句坏消息"（决定画danger还是muted）。
+    ///
+    /// 四种结局各有各的话，顺序不能反：加载失败 > 存储写不进去 > 启用了却没加载上 > 简介。
+    /// `store_error` 这一句从前只在日志里，屏上一片安静 —— 用户以为插件存成功了，
+    /// 重启才发现那一份没落盘（去抖那一头失败时唯一的通知就是这一格）。
+    fn second_line(&self) -> (String, bool) {
+        if let Some(e) = &self.error {
+            (format!("加载失败：{}", one_line(e, 72)), true)
+        } else if let Some(w) = &self.store_error {
+            (format!("存储写不进去：{}", one_line(w, 72)), true)
+        } else if self.enabled && !self.loaded {
+            (format!("{}（已启用，尚未加载）", self.desc), false)
+        } else {
+            (self.desc.clone(), false)
+        }
+    }
+}
+
+/// 插件页那一列从上到下的一格。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluginSlot {
+    /// 分栏表头（`扩展插件` 那一栏在没有条目时不画表头，见 [`plugin_slots`]）
+    Header(&'static str),
+    /// 第 N 行（下标指进 `&[PluginRow]`，命中与开关都按它算）
+    Row(usize),
+}
+
+/// 把两份清单排成"内置模块 / 扩展插件"两栏的一列格子。
+///
+/// 为什么是一张**格子表**而不是画的时候各画两个循环：这一页有三个读者（画、鼠标命中、
+/// 滚轮上限），三处都要知道"第 vis 格上有没有表头"。表头占一格行高，
+/// 一屏能装的行数因此比原来少两格 —— 三处各算各的话，症状就是"点开关点到隔壁那一行"。
+/// 分组只按 `builtin` 那一位切（= core 的 `source`），不看名字里有没有"内置"。
+fn plugin_slots(rows: &[PluginRow]) -> Vec<PluginSlot> {
+    let mut out: Vec<PluginSlot> = Vec::with_capacity(rows.len() + 2);
+    for (group, title) in [(true, "内置模块"), (false, "扩展插件")] {
+        let ids: Vec<usize> = (0..rows.len())
+            .filter(|i| rows[*i].builtin == group)
+            .collect();
+        if ids.is_empty() {
+            // 空栏不画表头：只有一栏有东西时，屏上不会出现一句孤零零的「扩展插件 (0)」
+            continue;
+        }
+        out.push(PluginSlot::Header(title));
+        for i in ids {
+            out.push(PluginSlot::Row(i));
+        }
+    }
+    out
 }
 
 /// 行内编辑这一格是在改什么：设备改名、设置页的值，还是插件视图里的输入框。
@@ -1712,14 +1812,20 @@ impl App {
             changed |= self.heat_hover.take().is_some();
             changed |= self.chart_hover.take().is_some();
             let (list_top, row_h, max_rows) = plugin_geom(w, h);
-            let count = self.plugin_rows.len();
-            self.scroll = self.scroll.min(count.saturating_sub(max_rows));
+            // 悬停也要按**格子**走：表头占一格，行号与格子号就此分家。
+            // 两处各数一遍的话，装了插件之后鼠标停在第 N 行、亮的却是第 N+1 行。
+            let slots = plugin_slots(&self.plugin_rows);
+            self.scroll = self.scroll.min(slots.len().saturating_sub(max_rows));
             let mut row = None;
             for vis in 0..max_rows {
-                let idx = self.scroll + vis;
-                if idx >= count {
+                let Some(slot) = slots.get(self.scroll + vis) else {
                     break;
-                }
+                };
+                let idx = match slot {
+                    PluginSlot::Row(i) => *i,
+                    // 表头那一格不能悬停
+                    PluginSlot::Header(_) => continue,
+                };
                 let y0 = list_top + vis as f32 * row_h;
                 if y >= y0 && y < y0 + row_h - 4.0 {
                     row = Some(idx);
@@ -2133,14 +2239,19 @@ impl App {
                 return;
             }
             let (list_top, row_h, max_rows) = plugin_geom(w, h);
-            let count = self.plugin_rows.len();
-            let scroll = self.scroll.min(count.saturating_sub(max_rows));
+            // 命中读的是与画同一份格子表（[`plugin_slots`]）：表头占一格，
+            // 少了这一格，装了内置模块之后每一次点击都会落到上面那一行去。
+            let slots = plugin_slots(&self.plugin_rows);
+            let scroll = self.scroll.min(slots.len().saturating_sub(max_rows));
             self.scroll = scroll;
             for vis in 0..max_rows {
-                let idx = scroll + vis;
-                if idx >= count {
+                let Some(slot) = slots.get(scroll + vis) else {
                     break;
-                }
+                };
+                let idx = match slot {
+                    PluginSlot::Row(i) => *i,
+                    PluginSlot::Header(_) => continue,
+                };
                 let y0 = list_top + vis as f32 * row_h;
                 let row_rect = rect(32.0, y0, w - 64.0, row_h - 4.0);
                 if hit(row_rect, x, y) {
@@ -2871,20 +2982,53 @@ impl App {
                 self.plugins_loaded = pm.load_all();
             }
         }
+        // 进这一页先把存储里攒着的改动落一次盘：这一格要说"占用多少"与"最近一次写没写成"，
+        // 去抖那 300ms 里进来看，说的就是上一次的值。失败的原因不在这里重复出声 ——
+        // 它已经写在每一行的第二格上（`store_error`），而这一页是每秒重扫的。
+        focusflow_core::plugins::plugin_store::flush_all();
         let Some(pm) = self.pm.as_ref() else { return };
         match pm.list_discovered() {
             Ok(list) => {
                 self.plugin_rows = list
                     .into_iter()
-                    .map(|p| PluginRow {
-                        name: p.name,
-                        desc: p.desc,
-                        version: p.version,
-                        author: p.author,
-                        stem: p.file,
-                        enabled: p.enabled,
-                        loaded: p.loaded,
-                        error: p.error,
+                    .map(|p| {
+                        // 先在 `p` 上问完（结构体字面量会把它部分移走）
+                        let builtin = p.source == focusflow_core::plugins::PluginSource::Builtin;
+                        let resident = p.lifecycle()
+                            == focusflow_core::plugins::manager::PluginLifecycle::Always;
+                        let stem = p.file.clone();
+                        let store_bytes = focusflow_core::plugins::plugin_store::used_bytes(&stem);
+                        let store_error = focusflow_core::plugins::plugin_store::last_error(&stem);
+                        let focusflow_core::plugins::PluginManifest {
+                            name,
+                            desc,
+                            version,
+                            author,
+                            api,
+                            permissions,
+                            refresh_ms,
+                            min_app,
+                            lifecycle: _,
+                        } = p.manifest;
+                        PluginRow {
+                            name,
+                            desc,
+                            version,
+                            author,
+                            enabled: p.enabled,
+                            loaded: p.loaded,
+                            error: p.error,
+                            stem,
+                            builtin,
+                            resident,
+                            api,
+                            permissions: permissions.len(),
+                            refresh_ms,
+                            min_app,
+                            // 存储那一格按**文件名**问（键从来进不了路径，见 plugin_store）
+                            store_bytes,
+                            store_error,
+                        }
                     })
                     .collect();
                 self.plugin_err = None;
@@ -7550,6 +7694,11 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
 
 // ===== 插件 =====
 
+/// 插件页那一列的几何。
+///
+/// ⚠ 第三个读数 `max_rows` 数的是**格子**（表头 + 行），不是行数 —— 两栏分组之后
+/// 一屏能装的行数少了最多两格。三个读者（画 / 悬停 / 点击 / 滚轮上限）都必须按
+/// [`plugin_slots`] 的那张表来数，各数各的就会"亮一行、点另一行"。
 fn plugin_geom(_w: f32, h: f32) -> (f32, f32, usize) {
     let list_top = 208.0 + 44.0;
     let row_h = 46.0;
@@ -7621,14 +7770,33 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
     }
 
     let (list_top, row_h, max_rows) = plugin_geom(w, h);
-    let scroll = vs.scroll.min(rows.len().saturating_sub(max_rows));
+    // 一列格子 = 两栏表头 + 各行（[`plugin_slots`]）。滚动与命中都按**格子**走，
+    // 而 `vs.sel` / `vs.hover` 记的还是行号 —— 表头不能被选中，也不该顶掉一行的名额。
+    let slots = plugin_slots(rows);
+    let scroll = vs.scroll.min(slots.len().saturating_sub(max_rows));
     for vis in 0..max_rows {
-        let idx = scroll + vis;
-        if idx >= rows.len() {
+        let Some(slot) = slots.get(scroll + vis) else {
             break;
-        }
-        let row = &rows[idx];
+        };
         let y = list_top + vis as f32 * row_h;
+        let idx = match slot {
+            PluginSlot::Header(title) => {
+                p.text(
+                    title,
+                    rect(
+                        card.left + 16.0,
+                        y + 4.0,
+                        card.right - card.left - 32.0,
+                        18.0,
+                    ),
+                    &p.fmt.caption,
+                    &p.br.muted,
+                );
+                continue;
+            }
+            PluginSlot::Row(i) => *i,
+        };
+        let row = &rows[idx];
         let r = rect(
             card.left + 16.0,
             y,
@@ -7658,6 +7826,18 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             &p.fmt.caption,
             &p.br.muted,
         );
+        // 声明那一格：宽度与画它的矩形取同一个表达式（这一页的字体全是 NO_WRAP，
+        // 而 `DrawText` 不按矩形裁切 —— 不夹就是画到窗口外）。
+        let decl_w = r.right - (r.left + 520.0) - 92.0;
+        let decl = row.declaration();
+        if !decl.is_empty() && decl_w > 20.0 {
+            p.text(
+                &p.clip(&decl, &p.fmt.caption, decl_w),
+                rect(r.left + 520.0, y + 7.0, decl_w, 16.0),
+                &p.fmt.caption,
+                &p.br.muted,
+            );
+        }
         // 启用开关（只画；命中在 on_click 里用同一份几何）
         let vb = rect(r.right - 76.0, y + 9.0, 60.0, 22.0);
         p.round(
@@ -7680,43 +7860,33 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
                 &p.br.muted
             },
         );
-        // 第二行：加载失败说失败原因，否则说它是什。
-        // 两分支同一格（卡片内宽减 92），所以夹取按这一格的宽度算 —— `one_line` 那个 72
-        // 是"多少个字符"，不是"这一格装得下多少"：72 个汉字约 900 px，比格子宽一倍。
+        // 第二行：坏消息说坏消息，否则说它是什么。
+        // 分支收在 [`PluginRow::second_line`] 里（这一格与画它的矩形取同一个宽度表达式）——
+        // `one_line` 那个 72 是"多少个字符"，不是"这一格装得下多少"：72 个汉字约 900 px，
+        // 比格子宽一倍，所以夹取必须按 desc_w 算。
         let desc_w = r.right - r.left - 92.0;
-        match &row.error {
-            Some(e) => {
-                p.text(
-                    &p.clip(
-                        &format!("加载失败：{}", one_line(e, 72)),
-                        &p.fmt.caption,
-                        desc_w,
-                    ),
-                    rect(r.left + 8.0, y + 23.0, desc_w, 16.0),
-                    &p.fmt.caption,
-                    &p.br.danger,
-                );
-            }
-            None => {
-                // 启用了却没加载上（还没轮到、或加载被静默跳过）要说出来。
-                let text = if row.enabled && !row.loaded {
-                    format!("{}（已启用，尚未加载）", row.desc)
-                } else {
-                    row.desc.clone()
-                };
-                p.text(
-                    &p.clip(&text, &p.fmt.caption, desc_w),
-                    rect(r.left + 8.0, y + 23.0, desc_w, 16.0),
-                    &p.fmt.caption,
-                    &p.br.muted,
-                );
-            }
-        }
+        let (line, bad) = row.second_line();
+        p.text(
+            &p.clip(&line, &p.fmt.caption, desc_w),
+            rect(r.left + 8.0, y + 23.0, desc_w, 16.0),
+            &p.fmt.caption,
+            if bad { &p.br.danger } else { &p.br.muted },
+        );
     }
 
     if rows.is_empty() {
         p.text(
-            "插件目录是空的：把一个 .lua 放进 plugins/ 就会出现在这里",
+            // 说的是**用户能写的那一格**：内置那一处随包发布、也不该由用户改。
+            // 具体路径页顶那一行已经印着（与清单同一把尺子 `plugin_scan_dirs`），
+            // 这一句只指方向，别在这里抄第二份路径。
+            &p.clip(
+                &format!(
+                    "插件目录是空的：把一个 .lua 放进 {} 就会出现在这里",
+                    focusflow_core::paths::plugins_user_dir().display()
+                ),
+                &p.fmt.center_small,
+                card.right - card.left,
+            ),
             rect(card.left, card.top + 120.0, card.right - card.left, 20.0),
             &p.fmt.center_small,
             &p.br.muted,
@@ -10576,6 +10746,12 @@ fn toggle_theme(hwnd: HWND) -> String {
 /// 过去每次都留在缓冲区里没了**。CLI 那条路早就显式收（`crates/cli/src/main.rs` 里
 /// 写着同样的理由），原生端当时漏了 —— 而排查崩溃与"退出没退干净"靠的正是日志的尾巴。
 fn quit_app(hwnd: HWND) {
+    // 插件存储是按 300ms 去抖落盘的：最后一次改动可能还停在内存里。退出前先把它们问一次，
+    // 顺序不能反 —— 后面那句退出备份要把盘上的那份收进包里，内存里有而盘上没有，
+    // 收进去的就是旧的那一份（用户看到的症状是"刚存的一条没了"）。
+    for why in focusflow_core::plugins::plugin_store::flush_all() {
+        tracing_note(&format!("退出前插件存储没落盘：{why}"));
+    }
     // 最后补一次几何：拖完最后一下马上退出、最大化之后直接退出，都不经过 `WM_EXITSIZEMOVE`。
     save_main_geometry(hwnd);
     floating::shutdown();
@@ -11449,7 +11625,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     .snap
                     .lock()
                     .map(|snap| match app.view {
-                        4 => app.plugin_rows.len(),
+                        4 => plugin_slots(&app.plugin_rows).len(),
                         5 => settings_items(&snap, &app.search, app.settings_cat).len(),
                         1 => snap.apps.len(),
                         2 => snap.devices.len(),
@@ -15735,9 +15911,13 @@ mod clip_tests {
             // ⚠ 压平空白也会压掉**字符串字面量里面**的空格，所以这一针里的 `v{}·{}`
             // 与源码里的 `v{} · {}` 是同一个东西 —— 别照着源码补空格。
             ("p.clip(&format!(\"v{}·{}\",row.version,row.author),&p.fmt.caption,260.0),rect(r.left+250.0,y+7.0,260.0,16.0)", 1),
-            // 插件第二行：两个分支共用 desc_w（所以这一针本来就是两处）
-            ("p.clip(&text,&p.fmt.caption,desc_w),rect(r.left+8.0,y+23.0,desc_w,16.0)", 1),
-            ("&p.fmt.caption,desc_w)", 2),
+            // 插件第二行：那句话的分支收进了 `PluginRow::second_line`，画只剩一处，
+            // 夹取与画它的矩形仍取同一个 desc_w。
+            ("p.clip(&line,&p.fmt.caption,desc_w),rect(r.left+8.0,y+23.0,desc_w,16.0)", 1),
+            ("&p.fmt.caption,desc_w)", 1),
+            // 插件声明那一格（常驻 / API / 权限数 / 自刷 / 版本要求 / 占用）：
+            // 夹取与画它的矩形取同一个 decl_w，而 decl_w 又是从那一格的右边界算下来的
+            ("p.clip(&decl,&p.fmt.caption,decl_w),rect(r.left+520.0,y+7.0,decl_w,16.0)", 1),
             ("p.clip(&format!(\"{}个·目录{}\",rows.len(),focusflow_core::paths::plugin_scan_dirs(focusflow_core::config::instance().get_bool(\"plugins\",\"legacy_layout\",false)).iter().map(|d|d.display().to_string()).collect::<Vec<_>>().join(\"/\")),&p.fmt.caption,520.0)", 1),
             ("p.clip(&format!(\"插件目录读不出来：{e}\"),&p.fmt.caption,card.right-card.left-32.0)", 1),
             // 值框：夹取与画它的矩形共用 val_w（那一格还要给右边的按钮让位）
@@ -16746,5 +16926,233 @@ mod log_rotation_tests {
         assert!(!dir.join("focusflow.log.2").exists(), "只留一份备份");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod plugin_page_tests {
+    use super::*;
+
+    fn row(stem: &str, builtin: bool) -> PluginRow {
+        PluginRow {
+            name: stem.to_string(),
+            desc: "简介".to_string(),
+            version: "1.0".to_string(),
+            author: "某人".to_string(),
+            stem: stem.to_string(),
+            enabled: true,
+            loaded: true,
+            error: None,
+            builtin,
+            resident: false,
+            api: 1,
+            permissions: 0,
+            refresh_ms: 0,
+            min_app: String::new(),
+            store_bytes: None,
+            store_error: None,
+        }
+    }
+
+    /// 两栏分组的格子表：表头在前、行在后，`Row` 里的下标仍是 `rows` 的行号。
+    ///
+    /// 这条钉三件事，都是"分组"这一步才会出现的形状：
+    /// ① 顺序 = 内置栏在前（与 core 交出清单的那一序同一含义，同名的以随包那份为准）；
+    /// ② 行号不重编（命中与开关都按它走，重编了就是"点开关关到隔壁那个插件"）；
+    /// ③ 空栏不画表头（只有一栏有东西时，屏上不该出现一句孤零零的「扩展插件」）。
+    #[test]
+    fn the_two_columns_carry_headers_and_keep_the_row_numbers() {
+        let mut rows = vec![row("pomodoro_plugin", true), row("stats_overview", true)];
+        rows.push(row("my_tool", false));
+        let slots = plugin_slots(&rows);
+        assert_eq!(
+            slots,
+            vec![
+                PluginSlot::Header("内置模块"),
+                PluginSlot::Row(0),
+                PluginSlot::Row(1),
+                PluginSlot::Header("扩展插件"),
+                PluginSlot::Row(2),
+            ],
+            "两栏的格子表长这样，行号必须还是原表的下标"
+        );
+
+        // 只有内置那一栏有东西 ⇒ 不画第二句表头
+        let only_builtin = plugin_slots(&rows[..2]);
+        assert_eq!(
+            only_builtin
+                .iter()
+                .filter(|s| matches!(s, PluginSlot::Header(_)))
+                .count(),
+            1,
+            "空的那一栏不该有表头: {only_builtin:?}"
+        );
+        // 只有用户装的 ⇒ 也不画「内置模块」
+        let only_user = plugin_slots(&rows[2..]);
+        assert_eq!(
+            only_user[0],
+            PluginSlot::Header("扩展插件"),
+            "{only_user:?}"
+        );
+        assert!(
+            plugin_slots(&[]).is_empty(),
+            "一份插件都没有 ⇒ 一格都不该画"
+        );
+    }
+
+    /// 三个消费点必须读同一份格子表（画 / 悬停命中 / 点击命中 / 滚轮上限）。
+    ///
+    /// 这条是本仓那条老教训的形状版：分组这件事一改，"一屏能装几行"就跟着变，
+    /// 任何一处还按 `rows.len()` 数 ⇒ 屏上画的是这一行、点下去命中的是那一行。
+    /// 判据数的是**调用形态**（`plugin_slots(` 出现的次数与那一句滚轮上限的写法），
+    /// 只查函数名在不在会被注释顶班。
+    #[test]
+    fn every_plugin_page_consumer_reads_the_same_slot_table() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let uses = code.matches("plugin_slots(").count();
+        assert!(
+            uses >= 5,
+            "格子表的读者从 5 处（定义 1 + 画 1 + 悬停 1 + 点击 1 + 滚轮 1）掉到 {uses} 处了"
+        );
+        assert!(
+            code.contains("4 => plugin_slots(&app.plugin_rows).len()"),
+            "滚轮上限不再按格子数了 ⇒ 到底那一屏还能不能再滚取决于表头被不算一行"
+        );
+        assert!(
+            code.matches("let slots = plugin_slots(&self.plugin_rows);")
+                .count()
+                >= 2,
+            "两处命中（悬停与点击）不再读同一份表了 ⇒ 亮的是一行、点的是另一行"
+        );
+        assert!(
+            code.contains("let slots = plugin_slots(rows);"),
+            "画这一页时读的不是这份表"
+        );
+        // 反向腿：旧的那把尺子不许还留在插件页的任何一个消费点上
+        assert!(
+            !code.contains("let count = self.plugin_rows.len();"),
+            "命中那一头还在按行数（不算表头）夹滚动 ⇒ 最后两行会被表头挤掉"
+        );
+    }
+
+    /// 声明那一格只说**与缺省不同**的东西，随包那五个一字未改的脚本不该有字。
+    #[test]
+    fn the_declaration_cell_only_shows_what_differs_from_the_defaults() {
+        let quiet = row("stats_overview", true);
+        assert_eq!(
+            quiet.declaration(),
+            "",
+            "全是缺省值时这一格该是空的: {quiet:?}"
+        );
+
+        let mut loud = row("my_tool", false);
+        loud.resident = true;
+        loud.api = 2;
+        loud.permissions = 3;
+        loud.refresh_ms = 1500;
+        loud.min_app = "1.6.0".to_string();
+        loud.store_bytes = Some(4096);
+        let text = loud.declaration();
+        for want in [
+            "常驻",
+            "API 2",
+            "权限 3 项",
+            "1500ms 自刷",
+            "需 1.6.0",
+            "占用 4 KB",
+        ] {
+            assert!(text.contains(want), "声明里少了「{want}」: {text}");
+        }
+        // 占用小于 1 KB 时说字节，不显示"0 KB"（那是"没有"的读法）
+        let mut tiny = row("tiny", false);
+        tiny.store_bytes = Some(512);
+        assert!(
+            tiny.declaration().contains("占用 512 B"),
+            "{:?}",
+            tiny.declaration()
+        );
+        let mut none_yet = row("fresh", false);
+        none_yet.store_bytes = Some(0);
+        assert_eq!(none_yet.declaration(), "", "还没写过东西不该报一个 0");
+    }
+
+    /// 第二格那句话的四条臂，各自要有各自的话。
+    ///
+    /// `store_error` 这一条最容易被漏：写盘失败发生在去抖之后的另一个线程上，
+    /// 屏上不说，用户就只能等重启那天才发现那一份没落盘。
+    #[test]
+    fn the_second_line_names_whichever_thing_actually_went_wrong() {
+        let mut r = row("t", false);
+        assert_eq!(
+            r.second_line(),
+            ("简介".to_string(), false),
+            "正常就报那个插件是什么"
+        );
+
+        r.enabled = true;
+        r.loaded = false;
+        let (text, bad) = r.second_line();
+        assert!(text.contains("已启用，尚未加载") && !bad, "{text}");
+
+        r.store_error = Some("写盘失败（X）：os error 5".to_string());
+        let (text, bad) = r.second_line();
+        assert!(
+            text.contains("存储写不进去") && text.contains("os error 5"),
+            "{text}"
+        );
+        assert!(bad, "存储没落盘是一句坏消息，不该画成灰色");
+
+        r.error = Some("attempt to call a nil value".to_string());
+        let (text, bad) = r.second_line();
+        assert!(
+            text.starts_with("加载失败：") && bad,
+            "加载失败比存储失败更要紧，两样都在时先说前者: {text}"
+        );
+        assert!(
+            !text.contains("存储写不进去"),
+            "一句话里不该同时挤进两件事: {text}"
+        );
+    }
+
+    /// 接线腿：`plugin_store::flush_all` 必须真被两个读者用到，而且顺序对。
+    ///
+    /// 摘掉退出前那一次 ⇒ 最后 300ms 的改动停在内存里，而随后那次退出备份收走的是盘上
+    /// 旧的一份（症状是"刚存的一条没了"）；摘掉进插件页那一次 ⇒ 这一页的"占用"与
+    /// "存储写不进去"说的都是上一次的值。判据数的是调用形态与先后，
+    /// 只查函数名在不在会被注释与文档顶班。
+    #[test]
+    fn the_pending_store_writes_are_asked_before_the_page_and_before_exit() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("plugin_store::flush_all").count(),
+            2,
+            "两个读者（退出前 / 进插件页）少了一个 —— 去抖那一头从此没人问了"
+        );
+        let at = code
+            .find("fn quit_app(hwnd: HWND)")
+            .expect("quit_app 不见了（改名或换了写法，这条守卫的锚要跟着改）");
+        let rest = &code[at..];
+        let body = &rest[..rest.find("\n}").expect("quit_app 的函数体切不出来")];
+        let asked = body.find("plugin_store::flush_all");
+        assert!(
+            asked.is_some(),
+            "退出前不再问一次插件存储的结局 ⇒ 最后那 300ms 的改动永远不落盘"
+        );
+        assert!(
+            asked.unwrap() < body.find("save_main_geometry(hwnd)").unwrap(),
+            "落盘那一问排到了后面几步之后 ⇒ 退出备份收走的还是旧的一份"
+        );
     }
 }

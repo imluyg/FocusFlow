@@ -1788,23 +1788,57 @@ fn baseline_predates_expected_shrink(backup: &Path) -> bool {
 
 /// 附属数据库：`(库名, 对应插件的文件名 stem, 路径)`。
 ///
+/// **通用发现，不再列清单**（方案 3.8）：数据目录里凡是 `focusflow_<名字>.db` 且不是年度库的，
+/// 都算附属库。以前这里是四行硬编码，代价不是"多写四行"而是**新出现的库永远不会被备份**：
+/// 插件声明了自己的库、或内置模块换了名字，备份这一头一个字都不报，直到要恢复时才发现没有那一份。
+/// 名字与路径都从同一个文件名派生，所以这一份清单与盘上事实不可能各说一套。
+///
 /// 第二个字段用于判断该插件是否已被停用 —— 停用的插件其库不再被写入，
 /// 没必要占用备份轮转名额（可用 `[database] backup_disabled_plugins = true` 强制全量）。
-fn auxiliary_db_paths() -> Vec<(&'static str, &'static str, std::path::PathBuf)> {
-    vec![
-        (
-            "accounting",
-            "accounting_plugin",
-            crate::accounting::db_path(),
-        ),
-        ("pomodoro", "pomodoro_plugin", crate::pomodoro::db_path()),
-        ("scheduler", "scheduler_plugin", crate::scheduler::db_path()),
-        (
-            "edge_history",
-            "edge_history_plugin",
-            crate::edge_history::edge_db_path(),
-        ),
-    ]
+/// 注意这一条**只适用于附属库**：插件的 `state/` 不按停用跳过，理由见
+/// [`plugin_state_backup_files`]（两类数据的语义不同）。
+fn auxiliary_db_paths() -> Vec<(String, String, std::path::PathBuf)> {
+    let dir = paths::data_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(it) => it,
+        // 数据目录读不出来 ⇒ 一份附属库都没发现。这不能悄悄过去：本轮"备份成功"
+        // 而附属库全没进包，正是这一族最难查的形状（与本文件那句"目录读不出来不交空清单"同源）。
+        Err(e) => {
+            tracing::error!(
+                "附属库发现跳过：数据目录读不出来（{}）: {e} —— 本轮没有附属库进备份",
+                dir.display()
+            );
+            return Vec::new();
+        }
+    };
+    let mut out: Vec<(String, String, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = aux_db_name(&path)?;
+            Some((name.clone(), name, path))
+        })
+        .collect();
+    // 顺序按库名稳定：轮转与日志都要能对拍，别让目录返回顺序决定备份顺序
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// `focusflow_<名字>.db` 里那个"名字"；不是这个形状（含年度库）交 `None`。
+///
+/// 年度库必须排除：它有自己的那一条备份与轮转流程（按年份分组、异常体检的基线也按它算）。
+/// 名字只收字母/数字/下划线且非空 —— `focusflow_.db`、`focusflow_a-b.db` 这种形状不进清单，
+/// 因为它们进不了备份文件名那一段（会拼出一个解不回来的名字）。
+fn aux_db_name(path: &std::path::Path) -> Option<String> {
+    let file = path.file_name()?.to_str()?;
+    let stem = file.strip_prefix("focusflow_")?.strip_suffix(".db")?;
+    if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return None;
+    }
+    if crate::paths::is_year_db_file(path).is_some() {
+        return None;
+    }
+    Some(stem.to_string())
 }
 
 /// 解析 `[plugins] disabled`（逗号分隔的插件文件名 stem，与 plugins::manager 同语义）。
@@ -1818,8 +1852,78 @@ fn disabled_plugin_stems(config: &FocusFlowConfig) -> Vec<String> {
 }
 
 /// 该附属库是否参与本次备份：插件停用时跳过（`force` = 强制全量）。
-fn should_backup_aux(plugin_stem: &str, disabled: &[String], force: bool) -> bool {
-    force || !disabled.iter().any(|s| s == plugin_stem)
+///
+/// 名字对得上两种写法都算停用：库叫 `focusflow_accounting.db` 而插件文件叫
+/// `accounting_plugin.lua` 是这批内置模块的既有形状，`mytool.db` / `mytool.lua` 同名单则是
+/// 新插件更自然的写法。认不出主人的那个库**照常备份** —— 认不出顶多多占一格轮转名额，
+/// 而"停用一次就再也不备份"是丢数据。
+fn should_backup_aux(db_name: &str, disabled: &[String], force: bool) -> bool {
+    force
+        || !disabled
+            .iter()
+            .any(|stem| stem == db_name || *stem == format!("{db_name}_plugin"))
+}
+
+/// 插件运行时数据的通用发现：`data/plugins/state/**` 里的 `.json` 文件。
+///
+/// 三条口径都写在方案 3.8 上，而且每一条都有反面：
+/// - **只扫数据目录** ⇒ `app_dir/plugins/builtin/` 不进备份。那是程序的一部分（重装即恢复、
+///   也不许用户改），跟着轮转只会让备份包里存着一份与安装目录争嘴的脚本副本；
+///   顺带解决了"安装版 Program Files 不可写"与"备份扫程序目录"两件事。
+/// - **停用不跳过**：停用是临时状态，用户重新启用后数据必须还在，而备份轮转只留最近几份 ——
+///   跳过几次就真没了。这一条与上面的附属库**故意不同**，两类数据的语义不一样。
+/// - 交回 `(插件名, 文件名字段, 路径)`，一个插件有多个运行时文件时各占一格。
+///
+/// 目录读不出来时交回空清单**并 error 一句**：这一格的缺失不影响主库备份成败，
+/// 但不能没声音（与别名快照那一族同一口径）。
+fn plugin_state_backup_files() -> Vec<(String, String, std::path::PathBuf)> {
+    let root = paths::plugins_state_dir();
+    let entries = match std::fs::read_dir(&root) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::error!(
+                "插件运行时的数据没进本次备份：状态目录读不出来（{}）: {e}",
+                root.display()
+            );
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let stem = match dir.file_name().and_then(|n| n.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let files = match std::fs::read_dir(&dir) {
+            Ok(it) => it,
+            Err(e) => {
+                tracing::error!(
+                    "插件 {stem} 的状态目录读不出来（{}）: {e} —— 这一份没进本次备份",
+                    dir.display()
+                );
+                continue;
+            }
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if !path.is_file() || path.extension().map(|e| e != "json").unwrap_or(true) {
+                continue;
+            }
+            let field = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("state")
+                .to_string();
+            out.push((stem.clone(), field, path));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    out
 }
 
 /// 备份串行化锁。
@@ -2120,7 +2224,7 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
         if !src.exists() {
             continue;
         }
-        if !should_backup_aux(stem, &disabled, force_aux) {
+        if !should_backup_aux(&stem, &disabled, force_aux) {
             tracing::debug!("跳过已停用插件的数据备份: {name}（{stem}）");
             continue;
         }
@@ -2151,16 +2255,21 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
                     );
                 }
             }
-            failed.push(name.to_string());
+            failed.push(name.clone());
             tracing::error!("附属库 {name}：{}", failed_backup_note(kept.as_deref()));
         }
     }
+    // 插件运行时数据（`data/plugins/state/**`）跟着这一轮一起快照与轮转（方案 3.8）。
+    // 失败**并入 `failed`**：这一份与附属库同样是"用户的东西"，没进包却说"本轮全部成功"
+    // 就是那句假公告。
+    backup_plugin_state_snapshots(&timestamp, &mut failed, &mut backed_up);
     // 设备别名表跟着这一轮一起快照与轮转：它既不在年度库也不在附属库里，
     // 而失败不并入 `failed` —— 库已经备份好了，把"别名文件此刻读不出来"报成
     // 整轮备份失败会让设置页与破坏性快照一起发出假警报（该函数内部只记 error）。
     let alias_frozen = suspicious_detail.is_some();
     backup_alias_snapshot(&timestamp);
     rotate_alias_backups(max_backups.max(1) as usize, alias_frozen);
+    rotate_state_backups(max_backups.max(1) as usize, alias_frozen);
     if !backed_up.is_empty() {
         let mut policy = RetentionPolicy::from_config(config);
         // 调用方传入的 max_backups 覆盖「最近 N 份」（保持旧签名语义不变）
@@ -2362,6 +2471,132 @@ fn rotate_alias_backups(keep: usize, freeze: bool) {
             tracing::warn!(
                 "别名快照轮转：这一份该删的旧快照删不掉（{e}），它会继续占着「最近 N 份」的名额"
             );
+        }
+    }
+}
+
+/// 一份备份文件名的分组键：`focusflow_state_<插件名>_<字段>_<时间戳>.json` 去掉首尾那两段。
+///
+/// 尾部是 `%Y%m%d_%H%M%S%3f`（8 + _ + 9），所以按 `_` 切开后**最后两段是数字**。
+/// 认不出这个形状（被人手工改过名）就交 `None`：宁可这一份不参与轮转，
+/// 也不要把它认成别的插件的那一组而删掉。
+fn state_backup_group(path: &std::path::Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name
+        .strip_prefix("focusflow_state_")?
+        .strip_suffix(".json")?;
+    let parts: Vec<&str> = rest.split('_').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let is_num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !(is_num(parts[parts.len() - 2]) && is_num(parts[parts.len() - 1])) {
+        return None;
+    }
+    Some(parts[..parts.len() - 2].join("_"))
+}
+
+/// 插件运行时数据的快照：把 `data/plugins/state/**` 里每个 `.json` 复制进备份目录。
+///
+/// 走的是**逐字节复制 + 读完再比**，不是 SQLite 那套 `backup_db_file`/`quick_check`：
+/// 这一头是 JSON，没有引擎可问。复制后再读回来比一遍长度与内容，比不动就交回失败。
+/// 停用插件不跳过（与附属库相反，理由见 [`plugin_state_backup_files`]）。
+fn backup_plugin_state_snapshots(
+    timestamp: &str,
+    failed: &mut Vec<String>,
+    backed_up: &mut Vec<std::path::PathBuf>,
+) {
+    for (stem, field, src) in plugin_state_backup_files() {
+        let bytes = match std::fs::read(&src) {
+            Ok(b) => b,
+            Err(e) => {
+                failed.push(format!("state/{stem}/{field}"));
+                tracing::error!(
+                    "插件状态读不出来（{}）: {e} —— 这一份没进本次备份",
+                    src.display()
+                );
+                continue;
+            }
+        };
+        let dst =
+            paths::backup_dir().join(format!("focusflow_state_{stem}_{field}_{timestamp}.json"));
+        if let Err(e) = std::fs::write(&dst, &bytes) {
+            failed.push(format!("state/{stem}/{field}"));
+            tracing::error!("插件状态快照写入失败（{}）: {e}", dst.display());
+            continue;
+        }
+        // 读回来比一次：写出去的是半截（盘满、同步盘插队）时，这一句是唯一的发现途径
+        match std::fs::read(&dst) {
+            Ok(back) if back == bytes => {
+                backed_up.push(dst);
+            }
+            Ok(_) => {
+                let _ = remove_backup(&dst);
+                failed.push(format!("state/{stem}/{field}"));
+                tracing::error!(
+                    "插件状态快照校验不过（{}）：读回来与源文件不一样，那份坏备份已删掉",
+                    dst.display()
+                );
+            }
+            Err(e) => {
+                let _ = remove_backup(&dst);
+                failed.push(format!("state/{stem}/{field}"));
+                tracing::error!(
+                    "插件状态快照校验没做成（{}）: {e}，那份没能验的备份已删掉",
+                    dst.display()
+                );
+            }
+        }
+    }
+}
+
+/// 插件状态快照的轮转：**每个插件的每一个字段**各留最近 `keep` 份。
+///
+/// 分组键见 [`state_backup_group`]。与别名快照同口径：不做日/周/月分层（那是给每天涨的
+/// 库快照准备的），异常体检冻结时一份都不删。
+/// 为什么按"插件 + 字段"分组而不是整族一份：否则装了三个插件的那一格会把只装了一个的
+/// 那格的历史一起吃掉（每轮每格都要留名额）。
+fn rotate_state_backups(keep: usize, freeze: bool) {
+    if freeze {
+        return;
+    }
+    let entries = match std::fs::read_dir(paths::backup_dir()) {
+        Ok(it) => it,
+        Err(e) => {
+            tracing::warn!(
+                "插件状态快照轮转跳过：备份目录读不出来（{}）: {e}，旧快照一份都没删",
+                paths::backup_dir().display()
+            );
+            return;
+        }
+    };
+    let mut groups: std::collections::HashMap<String, Vec<std::path::PathBuf>> =
+        std::collections::HashMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(group) = state_backup_group(&path) else {
+            continue;
+        };
+        groups.entry(group).or_default().push(path);
+    }
+    for (group, mut files) in groups {
+        if files.len() <= keep {
+            continue;
+        }
+        // 文件名里那段 `%Y%m%d_%H%M%S%3f` 字典序即时间序（与本文件那把老尺子同一句）
+        let name_of = |p: &std::path::Path| -> String {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        };
+        files.sort_by_key(|a| std::cmp::Reverse(name_of(a)));
+        for old in files.iter().skip(keep) {
+            if let Err(e) = remove_backup(old) {
+                tracing::warn!(
+                    "插件状态快照轮转：{group} 这一份该删的旧快照删不掉（{e}），\
+                     它会继续占着「最近 {keep} 份」的名额"
+                );
+            }
         }
     }
 }
@@ -5328,20 +5563,276 @@ mod tests {
         );
     }
 
-    /// 附属库与插件文件的对应关系必须真实存在：插件改名后这条会立刻失败，
-    /// 避免「停用开关失效」这种静默退化。
+    /// 附属库靠**发现**而不是靠清单：新出现的库不用改代码就会进备份，年度库不会被重复收。
+    ///
+    /// 为什么值得单独钉：四行硬编码的病状不是"备份少一份"那么轻 —— 它红在任何地方都没有，
+    /// 只有到要恢复的那一天才发现那一份从来没进过包。两条臂各挡一边：
+    /// 臂一钉"该收的都收到"（含一个谁都没在代码里写过的名字），
+    /// 臂二钉"不该收的别收"（年度库走的是另一条流程，收两次会把轮转分组搞乱）。
+    #[test]
+    fn auxiliary_databases_are_discovered_not_listed() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("aux_discovery");
+        let data = crate::paths::data_dir();
+        for name in [
+            "focusflow_accounting.db",   // 随包那批（改名前也照样是这个名字）
+            "focusflow_newtool.db",      // 谁都没在代码里列过的新插件库
+            "focusflow_edge_history.db", // 名字里带下划线的
+            "focusflow_2026.db",         // 年度库 ⇒ 不算附属库
+            "focusflow_.db",             // 空名字 ⇒ 拼不出可解的备份名
+            "focusflow_a-b.db",          // 形状不对
+            "device_aliases.json",       // 别名表另有一条快照流程
+            "focusflow_notes.txt",       // 不是 .db
+        ] {
+            std::fs::write(data.join(name), b"x").unwrap();
+        }
+        let found: Vec<String> = auxiliary_db_paths()
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                "accounting".to_string(),
+                "edge_history".to_string(),
+                "newtool".to_string()
+            ],
+            "发现出来的附属库清单不对（年度库与怪名字都不该在里面）: {found:?}"
+        );
+        // 顺序稳定（按名字），备份轮转与日志都要能对拍
+        assert!(
+            found.windows(2).all(|w| w[0] < w[1]),
+            "顺序不稳 ⇒ 同一份盘两次跑能给出两份清单: {found:?}"
+        );
+
+        // 停用跳过认两种写法：库名与插件文件名同名，或插件文件叫 `<库名>_plugin`
+        let disabled = vec!["accounting_plugin".to_string(), "newtool".to_string()];
+        assert!(
+            !should_backup_aux("accounting", &disabled, false),
+            "随包那批的旧写法（插件文件带 _plugin 后缀）必须还能认出停用"
+        );
+        assert!(
+            !should_backup_aux("newtool", &disabled, false),
+            "新插件库与插件同名 ⇒ 停用也要认"
+        );
+        assert!(
+            should_backup_aux("edge_history", &disabled, false),
+            "没停用的照常备份"
+        );
+        assert!(
+            should_backup_aux("accounting", &disabled, true),
+            "backup_disabled_plugins=true 时强制全量"
+        );
+        // 认不出主人的那个库**不许**被跳过：认不出顶多多占一格名额，跳过是丢数据
+        assert!(
+            should_backup_aux("unknown_tool", &disabled, false),
+            "停用列表里没有的名字必须照常备份（不能把认不出折成停用）"
+        );
+    }
+
+    /// 随包的四个附属库名字仍然对得上盘上的插件文件（改名要在这里红，别静默退化）。
     #[test]
     fn aux_db_plugin_stems_match_plugin_files() {
-        for (name, stem, _) in auxiliary_db_paths() {
+        for name in ["accounting", "pomodoro", "scheduler", "edge_history"] {
+            let stem = format!("{name}_plugin");
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins")
                 .join(format!("{stem}.lua"));
             assert!(
                 path.exists(),
-                "附属库 {name} 对应的插件文件不存在: {}（插件改名后需同步 auxiliary_db_paths）",
+                "附属库 {name} 对应的插件文件不存在: {}（改名后停用跳过这一条会认不出）",
                 path.display()
             );
+            // 反向腿：这条判据本身要能被满足 —— 停用那一项必须真能命中这个名字
+            let disabled = vec![stem.clone()];
+            assert!(
+                !should_backup_aux(name, &disabled, false),
+                "停用 {stem} 之后，库 {name} 却没被跳过 ⇒ 两边对不上"
+            );
         }
+    }
+
+    /// 插件的 `state/` 进备份，而且**停用不跳过**（方案 3.8）。
+    ///
+    /// 这一条钉的是两类数据语义不同：附属库停用后不再被写入，跳过只是省名额；
+    /// 插件状态停用后还在（用户重新启用就得接着用），而轮转只留最近几份 ——
+    /// 照附属库那条规则跳过几次，那份数据就真没了。
+    #[test]
+    fn a_disabled_plugins_state_still_goes_into_the_backup() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("state_backup");
+        // 两个插件：一个"停用"、一个启用；各写一份 state.json
+        std::fs::write(
+            crate::paths::plugin_state_dir("off_plugin").join("state.json"),
+            "{\"k\":\"关着的那份\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            crate::paths::plugin_state_dir("on_plugin").join("state.json"),
+            "{\"k\":\"开着的那份\"}",
+        )
+        .unwrap();
+        // 停用列表里明确写着 off_plugin —— 附属库那一头会跳过它，状态这一头不许。
+        let disabled = vec!["off_plugin".to_string()];
+        let mut failed: Vec<String> = Vec::new();
+        let mut backed: Vec<std::path::PathBuf> = Vec::new();
+        backup_plugin_state_snapshots("20261103_101112123", &mut failed, &mut backed);
+        assert!(failed.is_empty(), "这一轮不该有失败: {failed:?}");
+        assert_eq!(backed.len(), 2, "两份状态都该进包: {backed:?}");
+        for (stem, field) in [("off_plugin", "state"), ("on_plugin", "state")] {
+            let dst = crate::paths::backup_dir().join(format!(
+                "focusflow_state_{stem}_{field}_20261103_101112123.json"
+            ));
+            assert!(dst.exists(), "{stem} 的那份没进备份");
+            assert_eq!(
+                std::fs::read_to_string(&dst).unwrap(),
+                std::fs::read_to_string(
+                    crate::paths::plugin_state_dir(stem).join(format!("{field}.json"))
+                )
+                .unwrap(),
+                "备份里那份与源文件不一样"
+            );
+        }
+        // `disabled` 这一头只用来证明"这里没有读它"：把它交给附属库那条会跳，交给状态这条不跳
+        assert!(
+            !should_backup_aux("off_plugin", &disabled, false),
+            "对照臂失效：附属库那侧现在不认停用了，那这两条规则就没在分开了"
+        );
+    }
+
+    /// 备份的范围**只在数据目录**：程序目录那一侧（内置脚本）一份都不进。
+    ///
+    /// 这条钉的是"扫程序目录"那一次回退：内置脚本是程序的一部分（重装即恢复、也不许用户改），
+    /// 跟着轮转既没意义又会让安装版去碰 Program Files。
+    #[test]
+    fn the_builtin_plugin_scripts_are_not_backed_up() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("builtin_not_backed_up");
+        let builtin = crate::paths::plugins_builtin_dir();
+        std::fs::create_dir_all(&builtin).unwrap();
+        std::fs::write(builtin.join("tool.lua"), "PLUGIN_NAME = \"内置\"\n").unwrap();
+        std::fs::write(
+            crate::paths::plugin_state_dir("tool").join("state.json"),
+            "{}",
+        )
+        .unwrap();
+
+        let found = plugin_state_backup_files();
+        assert_eq!(found.len(), 1, "只该发现那一份状态: {found:?}");
+        // 程序目录那一侧 = `app_dir/plugins/**`（内置脚本住在里面）。数据那一侧在
+        // `app_dir/data/plugins/**`（默认位置下也嵌在同一个 app_dir 里），所以要比的是
+        // **那一格**，不是整个 app_dir —— 拿 app_dir 比会把合法那份也判成越界。
+        let program_plugins = crate::paths::plugins_dir();
+        assert!(
+            !found
+                .iter()
+                .any(|(_, _, p)| p.starts_with(&program_plugins)),
+            "发现结果里出现了程序目录的东西: {found:?}"
+        );
+
+        let mut failed = Vec::new();
+        let mut backed = Vec::new();
+        backup_plugin_state_snapshots("20261103_101112124", &mut failed, &mut backed);
+        let leftovers: Vec<String> = std::fs::read_dir(crate::paths::backup_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("builtin") || n.ends_with(".lua"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "备份目录里出现了程序目录的东西: {leftovers:?}"
+        );
+    }
+
+    /// 分组解析与轮转：每个插件的每个字段各留最近 N 份，名字认不出的那份不参与。
+    #[test]
+    fn state_snapshots_rotate_per_plugin_and_field() {
+        assert_eq!(
+            state_backup_group(std::path::Path::new(
+                "focusflow_state_my_tool_state_20261103_101112123.json"
+            ))
+            .as_deref(),
+            Some("my_tool_state"),
+            "带下划线的插件名要把整段认成一格，不能只取第一段"
+        );
+        assert_eq!(
+            state_backup_group(std::path::Path::new(
+                "focusflow_state_tool_state_notatimestamp.json"
+            )),
+            None,
+            "解不出时间戳的名字不许参与轮转（会被当成别的插件那一组删掉）"
+        );
+        assert_eq!(
+            state_backup_group(std::path::Path::new(
+                "focusflow_aliases_20261103_101112123.json"
+            )),
+            None,
+            "别名快照那一族有自己的轮转，不能被这里一起吃掉"
+        );
+
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("state_rotate");
+        let backup = crate::paths::backup_dir();
+        for stamp in [
+            "20261101_101112123",
+            "20261102_101112123",
+            "20261103_101112123",
+        ] {
+            std::fs::write(
+                backup.join(format!("focusflow_state_a_state_{stamp}.json")),
+                "{}",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            backup.join("focusflow_state_b_state_20261101_101112123.json"),
+            "{}",
+        )
+        .unwrap();
+        rotate_state_backups(1, false);
+        let names: Vec<String> = std::fs::read_dir(&backup)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.contains(&"focusflow_state_a_state_20261103_101112123.json".to_string()),
+            "每组都要留下**最新**那一份: {names:?}"
+        );
+        assert!(
+            !names.contains(&"focusflow_state_a_state_20261101_101112123.json".to_string()),
+            "a 那组的旧份该删掉: {names:?}"
+        );
+        assert!(
+            names.contains(&"focusflow_state_b_state_20261101_101112123.json".to_string()),
+            "b 那一组只有一份，不能被 a 那组的轮转连带删掉: {names:?}"
+        );
+        // 冻结那一路（异常体检）一份都不删
+        rotate_state_backups(1, true);
+        std::fs::write(
+            backup.join("focusflow_state_c_state_20261101_101112123.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(
+            backup.join("focusflow_state_c_state_20261102_101112123.json"),
+            "{}",
+        )
+        .unwrap();
+        rotate_state_backups(1, true);
+        assert!(
+            std::fs::read_dir(&backup)
+                .unwrap()
+                .flatten()
+                .filter(|e| e
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("focusflow_state_c_"))
+                .count()
+                == 2,
+            "冻结轮转时 c 那组两份都该留着"
+        );
     }
 
     /// 分层保留：无论短期备份多密集，都留着「每天 / 每周 / 每月」的快照 ——

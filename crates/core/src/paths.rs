@@ -446,6 +446,24 @@ pub fn plugins_user_dir() -> PathBuf {
     ensure_dir(data_dir().join("plugins"))
 }
 
+/// `stem` 能不能当一个状态目录名 —— 这条规则**只有这一份**。
+///
+/// 插件状态这一族有两个读者：[`plugin_state_dir`]（要不要落盘）与
+/// `plugins::plugin_store`（要不要接受这次读写）。两处各写一遍的话，
+///  store 那关放宽一寸，`../grants` 就又回到"能碰别人的授权文件"。
+pub fn is_safe_state_stem(stem: &str) -> bool {
+    !stem.is_empty() && !stem.contains('/') && !stem.contains('\\') && stem != ".."
+}
+
+/// 某个插件状态目录的**位置**，不建目录 —— 读一侧用它。
+///
+/// 把一次只读查询变成一次 `mkdir` 是副作用：开着插件页就会给每个插件（包括从来不存东西的）
+/// 在数据目录里造出一格空目录。真要落盘的那一侧用 [`plugin_state_dir`]，它才建。
+/// 路径公式只有这一处，越界与否由 [`is_safe_state_stem`] 判。
+pub fn plugin_state_path(stem: &str) -> PathBuf {
+    plugins_state_dir().join(stem)
+}
+
 /// 某个插件的私有运行时数据目录 `data/plugins/state/<stem>/`。
 ///
 /// `stem` 必须是**插件文件名**（来自目录扫描，不是插件自己起的展示名，也不是 store 的键）：
@@ -455,16 +473,16 @@ pub fn plugins_user_dir() -> PathBuf {
 /// store 落地之后，插件给的键、config.ini 里被人手改过的 `disabled` 项都会往这儿流。
 /// 一个 `../grants` 就能把"插件私有"变成"碰别人的授权文件"。越界的名字不落盘、只出声。
 pub fn plugin_state_dir(stem: &str) -> PathBuf {
-    let safe = !stem.is_empty() && !stem.contains('/') && !stem.contains('\\') && stem != "..";
+    let safe = is_safe_state_stem(stem);
     if !safe {
         tracing::error!(
             "插件状态目录的名字不合法（{stem}）：只认插件文件名，不许带路径分隔或 .. —— \
              本次不落盘，别去 {} 底下找它",
-            data_dir().join("plugins").join("state").display()
+            plugins_state_dir().display()
         );
-        return data_dir().join("plugins").join("state");
+        return plugins_state_dir();
     }
-    ensure_dir(data_dir().join("plugins").join("state").join(stem))
+    ensure_dir(plugin_state_path(stem))
 }
 
 /// `config.ini` 配置文件路径。
@@ -487,6 +505,15 @@ pub fn plugin_scan_dirs(legacy_layout: bool) -> Vec<PathBuf> {
     } else {
         vec![plugins_builtin_dir(), plugins_user_dir()]
     }
+}
+
+/// 所有插件运行时数据的根 `data/plugins/state/`（**不建目录**）。
+///
+/// 备份与体检扫这一棵子树用它（方案 3.8：范围只在数据目录）。刻意不调 `ensure_dir`：
+/// 一次备份扫描不该在数据目录里凭空造出一格 `state/`，而程序目录那一侧
+/// （`app_dir/plugins/builtin/`）**不在这里** —— 那是程序的一部分，重装即可恢复，没有备份价值。
+pub fn plugins_state_dir() -> PathBuf {
+    data_dir().join("plugins").join("state")
 }
 
 /// 指定年份的数据库文件路径：`data/focusflow_YYYY.db`。
@@ -751,11 +778,18 @@ mod tests {
         let _lock = test_app_dir_lock();
         let app = test_app_dir("state_dir");
         set_app_dir(app.path());
-        let root = data_dir().join("plugins").join("state");
+        let root = plugins_state_dir();
 
         let mine = plugin_state_dir("mytool");
         assert_eq!(mine, root.join("mytool"));
         assert!(mine.is_dir(), "取用时该已经把目录建好");
+        // 读的一侧不 mkdir：`plugin_state_path` 只算位置。少了这一分，插件页每刷一次就给
+        // 每个从不存东西的插件造出一格空目录（在真程序里现量到 5 个空目录、0 个文件）。
+        let quiet = plugin_state_path("quiet");
+        assert_eq!(quiet, root.join("quiet"), "两处算的必须是同一格");
+        assert!(!quiet.exists(), "只是算了一下位置，目录不该被建出来");
+        assert_eq!(plugin_state_dir("quiet"), quiet, "落盘那一侧才建");
+        assert!(quiet.is_dir(), "落盘那一侧确实把目录建出来了");
         assert_eq!(
             plugin_state_dir("mytool"),
             mine,

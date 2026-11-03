@@ -255,3 +255,39 @@ local w = focusflow.available_years()
         "行注释里的名字不该算调用: {got2:?}"
     );
 }
+
+/// 存储那一格必须在**插件实际看到的 Lua 环境**里是六个能调的函数（方案 3.5 那张表）。
+///
+/// 为什么单列一条：`store` 是表里的表，上面那份审计只列 `focusflow` 的顶层键名，
+/// 看不见 `focusflow.store` 里缺了哪个动词。缺一个的症状还是本文件顶部那句话 ——
+/// `attempt to call a nil value`，界面上就是"插件存不了东西"而宿主日志里一个字都没有。
+/// 反向腿同样重要：`focusflow.store` 整格不在时也照样是一条红，不是一句"没测到"。
+#[test]
+fn the_store_subtable_exposes_every_verb() {
+    let _g = round7::guard();
+    let app = common::isolated_app_dir("store_wiring");
+    let config: &'static FocusFlowConfig = Box::leak(Box::new(
+        FocusFlowConfig::load(app.path().join("config.ini")).expect("读取 config.ini 失败"),
+    ));
+    let lua = Lua::new();
+    host::register_host_api(&lua, config, db::Database::init_readonly(), "store_wiring")
+        .expect("注册宿主 API 失败");
+    let missing: String = lua
+        .load(
+            r#"
+            if type(focusflow.store) ~= "table" then return "整格不是表" end
+            local want = { "get", "set", "delete", "list", "clear", "flush" }
+            local out = {}
+            for _, k in ipairs(want) do
+                if type(focusflow.store[k]) ~= "function" then out[#out + 1] = k end
+            end
+            return table.concat(out, ",")
+            "#,
+        )
+        .eval()
+        .expect("这一段 Lua 跑不通");
+    assert_eq!(
+        missing, "",
+        "focusflow.store 这一格里缺动词（或少了整格）: {missing}"
+    );
+}

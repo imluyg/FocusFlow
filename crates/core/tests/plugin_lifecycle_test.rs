@@ -293,7 +293,7 @@ fn listing_plugins_never_runs_their_code() {
         .iter()
         .find(|p| p.file == "top_level_boom")
         .expect("停用的插件也该出现在列表里");
-    assert_eq!(entry.name, "顶层会炸", "元数据要靠扫描拿到");
+    assert_eq!(entry.manifest.name, "顶层会炸", "元数据要靠扫描拿到");
     assert!(!entry.enabled);
     assert!(
         entry.error.is_none(),
@@ -322,7 +322,7 @@ fn load_failure_is_visible_in_the_list() {
         .into_iter()
         .find(|p| p.file == "broken")
         .expect("应列出该文件");
-    assert_eq!(entry.name, "坏掉的", "展示名照样扫得出来");
+    assert_eq!(entry.manifest.name, "坏掉的", "展示名照样扫得出来");
     assert!(!entry.loaded);
     let err = entry
         .error

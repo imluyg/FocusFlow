@@ -50,12 +50,17 @@ pub fn take_key_batches() -> Vec<(String, i64)> {
     std::mem::take(&mut *q)
 }
 
+/// 加载时读到的插件元数据：清单 + 宿主要知道的两个钩子存在性。
+struct PluginMeta {
+    manifest: PluginManifest,
+    has_init: bool,
+    has_view: bool,
+}
+
 /// 插件信息。
 pub struct PluginInfo {
-    pub name: String,
-    pub desc: String,
-    pub version: String,
-    pub author: String,
+    /// 脚本自己声明的那份清单（加载时经 `read_meta` 折叠）
+    pub manifest: PluginManifest,
     pub file_path: PathBuf,
     pub file_mtime: Option<SystemTime>,
     pub loaded: bool,
@@ -99,24 +104,173 @@ pub struct Discovered {
     pub source: PluginSource,
 }
 
-/// 插件元数据（从 Lua 脚本读取）。
-struct PluginMeta {
+/// 插件活多久（方案 3.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PluginLifecycle {
+    /// 缺省：只在面板被打开时用到它。
+    #[default]
+    Panel,
+    /// 常驻：面板关了也要继续收宿主投递（内置模块全是这一档 —— 番茄钟靠按键批次累计键数，
+    /// 随面板卸载就断统计）。
+    Always,
+}
+
+impl PluginLifecycle {
+    /// 脚本里写的那个词。
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Panel => "panel",
+            Self::Always => "always",
+        }
+    }
+
+    /// 插件页那一格的话。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Panel => "面板",
+            Self::Always => "常驻",
+        }
+    }
+
+    /// 只认 `panel` / `always` 这两个词，拼错的折回缺省档并由调用方出声。
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "panel" => Some(Self::Panel),
+            "always" => Some(Self::Always),
+            _ => None,
+        }
+    }
+}
+
+/// 清单里那几个字段的缺省值（方案 3.3：v1 老插件什么都不写也是这套）。
+const DEFAULT_PLUGIN_API: u32 = 1;
+
+/// 一个脚本插件在文件顶层声明的清单（方案 3.3 的那 9 个字段）。
+///
+/// **两处生产、一份折叠**：`scan_meta_source`（纯文本，不执行代码）与 `read_meta`
+/// （执行顶层代码后读全局）各自取到原始声明，折叠规则只在 `build_manifest` 一份。
+/// 插件页那一行的身份来自前者，加载后的那一份来自后者；两边口径不同就是"同一个插件画出
+/// 两张脸"—— 本文件对 `PLUGIN_NAME` 早就为这件事钉过判据（见 `scan_meta` 的说明），
+/// 这 5 个新字段同理，所以合进同一个结构，让"两处等值"能整体断言。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginManifest {
+    /// 展示名（`PLUGIN_NAME`，缺省 = 文件名）
+    pub name: String,
+    /// 简介（`PLUGIN_DESC`，缺省空）
+    pub desc: String,
+    /// 版本（`PLUGIN_VERSION`，缺省 `1.0`）
+    pub version: String,
+    /// 作者（`PLUGIN_AUTHOR`，缺省空）
+    pub author: String,
+    /// 能力版本（`PLUGIN_API`，缺省 1）
+    pub api: u32,
+    /// 声明的能力名（`PLUGIN_PERMISSIONS`，已排序去重；将来授权哈希绑这一份）
+    pub permissions: Vec<String>,
+    /// 面板自刷间隔（`PLUGIN_REFRESH_MS`，缺省 0 = 只在动作后刷新）
+    pub refresh_ms: u64,
+    /// 存活档位（`PLUGIN_LIFECYCLE`，缺省 [`PluginLifecycle::Panel`]）
+    pub lifecycle: PluginLifecycle,
+    /// 要求的最低程序版本（`PLUGIN_MIN_APP`，缺省空 = 不限）
+    pub min_app: String,
+}
+
+impl Default for PluginManifest {
+    fn default() -> Self {
+        PluginManifest {
+            name: String::new(),
+            desc: String::new(),
+            version: "1.0".to_string(),
+            author: String::new(),
+            api: DEFAULT_PLUGIN_API,
+            permissions: Vec::new(),
+            refresh_ms: 0,
+            lifecycle: PluginLifecycle::default(),
+            min_app: String::new(),
+        }
+    }
+}
+
+/// 两侧各自的"原始声明读数"：取法不同（文本扫描 / Lua 全局），折叠前必须长得一样。
+///
+/// `None` = 脚本没声明这一项（折成缺省值），不是"声明了但读坏了"。
+struct DeclaredFields {
+    /// 展示名已经带上各自的缺省（文件名），因为两处缺省来源相同、不必再折一次
     name: String,
-    desc: String,
-    version: String,
-    author: String,
-    has_init: bool,
-    has_view: bool,
+    desc: Option<String>,
+    version: Option<String>,
+    author: Option<String>,
+    api: Option<i64>,
+    permissions: Option<Vec<String>>,
+    refresh_ms: Option<i64>,
+    lifecycle: Option<String>,
+    min_app: Option<String>,
+    /// 出声时自报家门的那一句（「扫描 x.lua」/「加载 x.lua」），一条规则两处报
+    where_: String,
+}
+
+/// 把原始声明折成一份清单：缺省值与非法值的折叠**只有这一份**。
+///
+/// 非法值（`PLUGIN_API = 0`、`PLUGIN_REFRESH_MS = -5`、`PLUGIN_LIFECYCLE = "Always"`）
+/// 一律折回缺省档并出声一次：静默折叠的症状是"作者写了却像没写"，而这一族缺陷
+/// 在本仓已经修过两次（把"读不出来"印成"没有"）。
+fn build_manifest(raw: DeclaredFields) -> PluginManifest {
+    let where_ = raw.where_.as_str();
+    let api = match raw.api {
+        Some(n) if (1..=u32::MAX as i64).contains(&n) => n as u32,
+        Some(n) => {
+            tracing::warn!(
+                "{where_} 的 PLUGIN_API = {n} 不是一个正整数，按缺省 {DEFAULT_PLUGIN_API} 走"
+            );
+            DEFAULT_PLUGIN_API
+        }
+        None => DEFAULT_PLUGIN_API,
+    };
+    let refresh_ms = match raw.refresh_ms {
+        // 非负就行：`u64::MAX as i64` 是 -1，拿它当上界会把每一个合法值都折回缺省
+        // （第一版就是这么红的 —— 写夹具的人看不出错，只有断言看得出）。
+        Some(n) if n >= 0 => n as u64,
+        Some(n) => {
+            tracing::warn!("{where_} 的 PLUGIN_REFRESH_MS = {n} 不是一个非负整数，按缺省 0（只在动作后刷新）走");
+            0
+        }
+        None => 0,
+    };
+    let lifecycle = match raw.lifecycle.as_deref() {
+        None => PluginLifecycle::default(),
+        Some(word) => PluginLifecycle::parse(word).unwrap_or_else(|| {
+            tracing::warn!(
+                "{where_} 的 PLUGIN_LIFECYCLE = \"{word}\" 认不出来（只认 panel / always），\
+                 按缺省 {} 走",
+                PluginLifecycle::default().keyword()
+            );
+            PluginLifecycle::default()
+        }),
+    };
+    let mut permissions = raw.permissions.unwrap_or_default();
+    permissions.sort();
+    permissions.dedup();
+    PluginManifest {
+        name: raw.name,
+        desc: raw.desc.unwrap_or_default(),
+        version: raw.version.unwrap_or_else(|| "1.0".to_string()),
+        author: raw.author.unwrap_or_default(),
+        api,
+        permissions,
+        refresh_ms,
+        lifecycle,
+        min_app: raw.min_app.unwrap_or_default().trim().to_string(),
+    }
 }
 
 /// 目录中发现的插件（含已停用的），供插件管理页展示。
 #[derive(Debug)]
 pub struct DiscoveredPlugin {
-    /// 展示名（PLUGIN_NAME，读取失败时回退为文件名）
-    pub name: String,
-    pub desc: String,
-    pub version: String,
-    pub author: String,
+    /// 清单：展示名、简介、版本、作者 + 方案 3.3 新加的 5 个声明字段。
+    ///
+    /// 已加载的取 `read_meta` 那一份，未加载的取 `scan_meta_source` 那一份 ——
+    /// 两条路的折叠共用 `build_manifest`，所以同一份文件在两处只会有一张脸
+    /// （`manifest_scan_and_load_agree_on_one_manifest` 钉这条）。
+    pub manifest: PluginManifest,
     /// 文件名（不含扩展名）：启用状态的持久化标识，插件改名不影响配置
     pub file: String,
     pub enabled: bool,
@@ -126,9 +280,25 @@ pub struct DiscoveredPlugin {
     pub error: Option<String>,
     /// 出自哪一处目录 = 它是内置模块还是用户装的插件。
     ///
-    /// 今天的读者是启动那一行日志（`load_all`）；插件页按两栏分组显示是路线图 P0 第 8 步，
-    /// 不在本次改动里。
+    /// 今天的读者有两个：启动那一行日志（`load_all`）与插件页的两栏分组；
+    /// [`Self::lifecycle`] 也按它决定内置要不要强制常驻。
     pub source: PluginSource,
+}
+
+impl DiscoveredPlugin {
+    /// 这一条实际该按哪一档活着：内置模块**由位置强制**常驻，用户装的认自己写的。
+    ///
+    /// 为什么内置不许自己说不：随包的模块都靠宿主持续投递（番茄钟累计每个番茄的键数、
+    /// 定时任务到点触发），将来「面板关掉就卸载」真落地时，让脚本自己写 `panel`
+    /// 就等于让一次升级把统计打断。反过来，强制也不看脚本里写了什么 `PLUGIN_KIND`
+    /// —— 身份由位置说一次（3.1），这里只是把那份身份翻译成存活档位。
+    pub fn lifecycle(&self) -> PluginLifecycle {
+        if self.source == PluginSource::Builtin {
+            PluginLifecycle::Always
+        } else {
+            self.manifest.lifecycle
+        }
+    }
 }
 
 /// 随包内置模块的文件名白名单。
@@ -698,7 +868,7 @@ impl PluginManager {
                 .plugins
                 .values()
                 .find(|p| Self::stem_of(&p.file_path) == stem)
-                .map(|p| p.name.clone());
+                .map(|p| p.manifest.name.clone());
             if let Some(n) = name {
                 self.unload_plugin(&n);
             }
@@ -744,10 +914,7 @@ impl PluginManager {
                         reasons.push(format!("最近一次重载失败：{e}（界面跑的还是改之前那份）"));
                     }
                     return DiscoveredPlugin {
-                        name: info.name.clone(),
-                        desc: info.desc.clone(),
-                        version: info.version.clone(),
-                        author: info.author.clone(),
+                        manifest: info.manifest.clone(),
                         file: stem,
                         enabled,
                         loaded: info.loaded,
@@ -760,11 +927,8 @@ impl PluginManager {
                     };
                 }
                 match Self::scan_meta(&path) {
-                    Ok((name, desc, version, author)) => DiscoveredPlugin {
-                        name,
-                        desc,
-                        version,
-                        author,
+                    Ok(manifest) => DiscoveredPlugin {
+                        manifest,
                         file: stem.clone(),
                         enabled,
                         loaded: false,
@@ -773,10 +937,15 @@ impl PluginManager {
                         error: self.load_errors.get(&stem).cloned(),
                     },
                     Err(e) => DiscoveredPlugin {
-                        name: stem.clone(),
-                        desc: String::new(),
-                        version: String::new(),
-                        author: String::new(),
+                        // 读不出来时名字仍回退成文件名，但那几个字段一律留空、不当"1.0"报出去：
+                        // 插件页这一行说的是"这份文件我没能读全"，不是"它自述版本是 1.0"。
+                        manifest: PluginManifest {
+                            name: stem.clone(),
+                            desc: String::new(),
+                            version: String::new(),
+                            author: String::new(),
+                            ..PluginManifest::default()
+                        },
                         file: stem,
                         enabled,
                         loaded: false,
@@ -881,42 +1050,53 @@ impl PluginManager {
         Ok(self.discover()?.into_iter().map(|d| d.path).collect())
     }
 
-    /// 只做文本扫描读元数据，**不执行插件代码**：`(name, desc, version, author)`。
+    /// 只做文本扫描读元数据，**不执行插件代码**：交出完整清单 [`PluginManifest`]。
     ///
     /// `list_discovered` 原先回退到 `read_meta`，而 `read_meta` 是 `exec()` 整段脚本再取
     /// 全局变量 —— 于是「已停用」的插件每开一次插件管理页、每来一次 `plugins-reloaded`
     /// 都要在主线程上把顶层代码跑一遍（只有指令数上限兜着），与 `mod.rs` 里
     /// 「停用的不执行其代码」这句承诺正好相反，也白跑了加载失败那批的顶层代码。
-    /// 这 4 个字段本来就是给人看的字符串字面量，扫一行足够；真正要执行顶层代码的
-    /// 加载路径照旧用 `read_meta`。
+    /// 这 9 个字段本来就是给人看的字面量（字符串 / 整数 / 字符串数组），扫一行足够；
+    /// 真正要执行顶层代码的加载路径照旧用 `read_meta`。**新增声明字段不许在这条路上开口子
+    /// 去 exec**：方案 3.3 要的正是「已停用的插件也不执行脚本代码」。
     ///
     /// **判据必须与 `read_meta` 的实际口径一致**（扫出来的名字 = 加载后的名字），
     /// 否则插件管理页会拿一个假名字当键用：那页的「打开」按钮传的就是列表里的
-    /// `p.name`（原生端同一条路：`desktop-native/src/main.rs` 拿这一行的名字点
+    /// `p.manifest.name`（原生端同一条路：`desktop-native/src/main.rs` 拿这一行的名字点
     /// `open_plugin_view`），名字对不上
     /// 就是点一次报一次「插件未提供视图」。所以要挡掉两类假命中：
     /// `--[[ ]]` 块注释里被注释掉的旧值、函数体里缩进的同名局部赋值。
     /// 规则写在 [`top_level_string_assign`] 与 [`strip_lua_non_code`] 里：
     /// 先把注释和长字符串整段抹成空格，再只认**从第 0 列起**正好是
     /// `KEY = "字面量"` 的行（`local KEY = …` 也不算 —— 那根本不会成为全局变量）。
-    fn scan_meta(path: &Path) -> Result<(String, String, String, String), String> {
+    fn scan_meta(path: &Path) -> Result<PluginManifest, String> {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         Ok(Self::scan_meta_source(&text, path))
     }
 
     /// `scan_meta` 的全部判定（读文件之外的那部分，单独拿出来才测得动）。
-    fn scan_meta_source(text: &str, path: &Path) -> (String, String, String, String) {
+    fn scan_meta_source(text: &str, path: &Path) -> PluginManifest {
         let code = strip_lua_non_code(text);
         let field = |key: &str| -> Option<String> {
             code.lines()
                 .find_map(|line| top_level_string_assign(line, key))
         };
-        (
-            field("PLUGIN_NAME").unwrap_or_else(|| Self::stem_of(path)),
-            field("PLUGIN_DESC").unwrap_or_default(),
-            field("PLUGIN_VERSION").unwrap_or_else(|| "1.0".to_string()),
-            field("PLUGIN_AUTHOR").unwrap_or_default(),
-        )
+        let number = |key: &str| -> Option<i64> {
+            code.lines()
+                .find_map(|line| top_level_int_assign(line, key))
+        };
+        build_manifest(DeclaredFields {
+            name: field("PLUGIN_NAME").unwrap_or_else(|| Self::stem_of(path)),
+            desc: field("PLUGIN_DESC"),
+            version: field("PLUGIN_VERSION"),
+            author: field("PLUGIN_AUTHOR"),
+            api: number("PLUGIN_API"),
+            permissions: top_level_table_strings(&code, "PLUGIN_PERMISSIONS"),
+            refresh_ms: number("PLUGIN_REFRESH_MS"),
+            lifecycle: field("PLUGIN_LIFECYCLE"),
+            min_app: field("PLUGIN_MIN_APP"),
+            where_: format!("扫描 {}", Self::stem_of(path)),
+        })
     }
 
     /// 从 Lua 脚本读取元数据（不执行 init）。
@@ -942,29 +1122,54 @@ impl PluginManager {
             .map_err(|e| format!("Lua 执行失败: {e}"))?;
 
         let globals = lua.globals();
-        let gstr = |key: &str, def: &str| -> String {
-            globals
-                .get::<mlua::String>(key)
-                .ok()
-                .map(|s| s.to_string_lossy())
-                .unwrap_or_else(|| def.to_string())
+        // 只认 Lua 字符串：`PLUGIN_MIN_APP = 123` 在加载侧会被 `lua_tostring` 折成 "123"，
+        // 而扫描侧根本读不出它（值不是引号串）—— 两侧就会交出两份清单（第一条用例就是这么红的）。
+        // 折成"没声明"才是两边的共同答案。
+        let gstr = |key: &str| -> Option<String> {
+            match globals.get::<mlua::Value>(key).ok()? {
+                mlua::Value::String(s) => Some(s.to_string_lossy()),
+                _ => None,
+            }
         };
-        let name = gstr(
-            "PLUGIN_NAME",
+        // 整数只认 Lua 的整数（`PLUGIN_API = 2`）：写成 `2.0` 或 `"2"` 都不算声明。
+        // 这不是苛刻，是为了和扫描侧的 `top_level_int_assign`（只认裸十进制）折回同一个缺省值
+        // —— 一侧认、另一侧不认，插件页就会显示一个值而跑起来是另一个值。
+        let gint = |key: &str| -> Option<i64> { globals.get::<i64>(key).ok() };
+        let gperms = || -> Option<Vec<String>> {
+            let t = globals.get::<mlua::Table>("PLUGIN_PERMISSIONS").ok()?;
+            // 只取数组部分的字符串项：`{ "a", b }` 里的 `b` 是个变量，扫描侧同样取不到它。
+            let mut out = Vec::new();
+            for item in t.sequence_values::<mlua::String>().flatten() {
+                out.push(item.to_string_lossy());
+            }
+            Some(out)
+        };
+        let name = gstr("PLUGIN_NAME").unwrap_or_else(|| {
             path.file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("plugin"),
-        );
-        let desc = gstr("PLUGIN_DESC", "");
-        let version = gstr("PLUGIN_VERSION", "1.0");
-        let author = gstr("PLUGIN_AUTHOR", "");
+                .unwrap_or("plugin")
+                .to_string()
+        });
         let has_fn = |key: &str| -> bool { globals.get::<mlua::Function>(key).is_ok() };
 
         Ok(PluginMeta {
-            name,
-            desc,
-            version,
-            author,
+            manifest: build_manifest(DeclaredFields {
+                name,
+                desc: gstr("PLUGIN_DESC"),
+                version: gstr("PLUGIN_VERSION"),
+                author: gstr("PLUGIN_AUTHOR"),
+                api: gint("PLUGIN_API"),
+                permissions: gperms(),
+                refresh_ms: gint("PLUGIN_REFRESH_MS"),
+                lifecycle: gstr("PLUGIN_LIFECYCLE"),
+                min_app: gstr("PLUGIN_MIN_APP"),
+                where_: format!(
+                    "加载 {}",
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("plugin")
+                ),
+            }),
             has_init: has_fn("init"),
             has_view: has_fn("get_view"),
         })
@@ -984,14 +1189,15 @@ impl PluginManager {
         // （上一场就是卡在这一步停手的）。同一个源文件的重复加载不算撞名：
         // 下面 insert 会顶掉它自己那一条，改了名的旧名字另外摘掉。
         let stem = Self::stem_of(path);
+        let manifest = &meta.manifest;
         if let Some(clash) = self
             .plugins
             .values()
-            .find(|p| p.name == meta.name && !is_same_source(&p.file_path, path))
+            .find(|p| p.manifest.name == manifest.name && !is_same_source(&p.file_path, path))
         {
             return Err(format!(
                 "PLUGIN_NAME「{}」与已加载插件（文件 {}）重名，请改一个再启用",
-                meta.name,
+                manifest.name,
                 Self::stem_of(&clash.file_path)
             ));
         }
@@ -1005,7 +1211,7 @@ impl PluginManager {
             .map_err(|e| format!("宿主 API 注册失败: {e}"))?;
         let script = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         lua.load(&script)
-            .set_name(&meta.name)
+            .set_name(&meta.manifest.name)
             .exec()
             .map_err(|e| format!("Lua 执行失败: {e}"))?;
 
@@ -1051,10 +1257,7 @@ impl PluginManager {
         };
 
         let info = PluginInfo {
-            name: meta.name,
-            desc: meta.desc,
-            version: meta.version,
-            author: meta.author,
+            manifest: meta.manifest,
             file_path: path.to_path_buf(),
             file_mtime: mtime,
             loaded: true,
@@ -1072,22 +1275,22 @@ impl PluginManager {
             .plugins
             .iter()
             .find(|(name, p)| {
-                name.as_str() != info.name.as_str() && is_same_source(&p.file_path, path)
+                name.as_str() != info.manifest.name.as_str() && is_same_source(&p.file_path, path)
             })
             .map(|(name, _)| name.clone());
         if let Some(old) = renamed {
-            tracing::info!("插件改名，旧条目退休: {old} -> {}", info.name);
+            tracing::info!("插件改名，旧条目退休: {old} -> {}", info.manifest.name);
             self.plugins.remove(&old);
         }
 
-        self.plugins.insert(info.name.clone(), info);
+        self.plugins.insert(info.manifest.name.clone(), info);
         tracing::info!("插件加载成功: {}", self.plugins.len());
         // 返回刚加载的插件名
         let name = self
             .plugins
             .values()
             .find(|p| p.file_path == path)
-            .map(|p| p.name.clone())
+            .map(|p| p.manifest.name.clone())
             .ok_or_else(|| "加载后未找到插件".to_string())?;
         Ok(name)
     }
@@ -1198,7 +1401,7 @@ impl PluginManager {
             .plugins
             .values()
             .find(|p| Self::stem_of(&p.file_path) == stem)
-            .map(|p| p.name.clone());
+            .map(|p| p.manifest.name.clone());
         match name {
             Some(n) => self.unload_plugin(&n),
             None => false,
@@ -1325,7 +1528,7 @@ impl PluginManager {
         for p in self.plugins.values() {
             if !p.loaded {
                 if let Some(e) = &p.error {
-                    out.push((p.name.clone(), e.clone()));
+                    out.push((p.manifest.name.clone(), e.clone()));
                 }
             }
         }
@@ -1930,6 +2133,111 @@ fn top_level_string_assign(line: &str, key: &str) -> Option<String> {
     let inner = value.get(1..)?;
     let end = inner.find(quote as char)?;
     Some(inner.get(..end)?.to_string())
+}
+
+/// 从一行**已抹掉注释**的 Lua 代码里取顶层整数赋值 `KEY = 123`（取不到 `None`）。
+///
+/// 与 [`top_level_string_assign`] 同一套纪律（不 trim 行首 ⇒ 挡掉函数体里的缩进赋值，
+/// `strip_prefix(key)` 挡掉 `local KEY = …`），并且**只认裸的十进制整数**（可带一个负号）：
+/// `PLUGIN_API = "2"` / `= 2.0` / `= 2 + 0` 一律算没声明。理由写在那两条缺省折叠里 ——
+/// 加载侧读的是 Lua 整数，两侧认得动的项目必须完全一样，否则同一份文件两处折成两个值。
+///
+/// 负号**要认**：`PLUGIN_REFRESH_MS = -5` 是"写了但写坏了"，扫出来才谈得上出声一句；
+/// 当成没声明的话，症状恰恰是作者最难受的那种（改了文件，屏上毫无反应）。
+/// 折叠规则本身（负数 ⇒ 缺省 0）在 [`build_manifest`]，两侧共用。
+fn top_level_int_assign(line: &str, key: &str) -> Option<i64> {
+    let after_key = line.strip_prefix(key)?.trim_start();
+    let value = after_key.strip_prefix('=')?.trim_start();
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<i64>().ok()
+}
+
+/// 一行里出现的引号串内容（`{ "a", 'b' }` → `["a", "b"]`）。
+///
+/// 注释与长字符串早就被 `strip_lua_non_code` 处理过了，这里只看引号；
+/// 反斜杠按 Lua 的转义吃掉下一个字符（`{ "a\"b" }` 不至于在 `\"` 中间断开）。
+fn quoted_strings_in(seg: &str) -> Vec<String> {
+    let b = seg.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let q = b[i];
+        if q != b'"' && q != b'\'' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut piece = Vec::new();
+        loop {
+            match b.get(j) {
+                None => break, // 这行没闭合：这段不要（半截文件本来就不是声明）
+                Some(&b'\\') => {
+                    if let Some(&c) = b.get(j + 1) {
+                        piece.push(c);
+                    }
+                    j += 2;
+                }
+                Some(&c) if c == q => break, // 闭合
+                Some(&c) => {
+                    piece.push(c);
+                    j += 1;
+                }
+            }
+        }
+        if j < b.len() && b[j] == q {
+            if let Ok(s) = String::from_utf8(piece) {
+                out.push(s);
+            }
+            i = j + 1;
+            continue;
+        }
+        // 没找到闭合引号：整段放弃，别把行尾的半个串当成声明
+        return out;
+    }
+    out
+}
+
+/// 从**已抹掉注释**的源码里取顶层表赋值 `KEY = { "a", "b" }` 的字符串项（取不到 `None`）。
+///
+/// 表可以跨行（作者们真会把它写成多行），但起始那一行仍受顶层纪律约束：从第 0 列起正好是
+/// `KEY = {`，`local` 与缩进都不算。只在这一处开始往后读，读到配平的 `}` 为止；
+/// 读不到 `}`（文件被写坏）当"没声明"，交缺省值 —— 加载侧遇到同样的半截表也拿不到东西。
+fn top_level_table_strings(code: &str, key: &str) -> Option<Vec<String>> {
+    let lines: Vec<&str> = code.lines().collect();
+    /// 这一行是不是顶层的 `KEY = {`：是就交出花括号之后剩下的那段。
+    fn opened_at(line: &str, key: &str) -> Option<String> {
+        let after_key = line.strip_prefix(key)?.trim_start();
+        let value = after_key.strip_prefix('=')?.trim_start();
+        value.strip_prefix('{').map(|s| s.to_string())
+    }
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(mut buf) = opened_at(lines[i], key) else {
+            i += 1;
+            continue;
+        };
+        let mut items = Vec::new();
+        loop {
+            match buf.find('}') {
+                Some(close) => {
+                    items.extend(quoted_strings_in(&buf[..close]));
+                    return Some(items);
+                }
+                None => {
+                    items.extend(quoted_strings_in(&buf));
+                    i += 1;
+                    let Some(next) = lines.get(i) else {
+                        return None; // 表没闭合 = 文件被写坏，按"没声明"折回缺省
+                    };
+                    buf = next.to_string();
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 解析 Lua 表的 options 数组为 (value, label) 列表。
@@ -2630,7 +2938,7 @@ end
     #[test]
     fn scan_meta_only_takes_top_level_assignments() {
         let path = Path::new("whatever.lua");
-        let name_of = |src: &str| PluginManager::scan_meta_source(src, path).0;
+        let name_of = |src: &str| PluginManager::scan_meta_source(src, path).name;
 
         // 块注释里的假名正好顶在第 0 列 —— 旧实现就是它赢
         assert_eq!(
@@ -2677,22 +2985,244 @@ end
     #[test]
     fn scan_meta_still_reads_normal_fields() {
         let path = Path::new("whatever.lua");
-        let (name, desc, version, author) = PluginManager::scan_meta_source(
+        let scanned = PluginManager::scan_meta_source(
             "PLUGIN_NAME = '单引号也行'\nPLUGIN_DESC = \"含 -- 破折号的简介\"\n\
              PLUGIN_VERSION = \"1.2.3\"\nPLUGIN_AUTHOR = \"某人\"\n",
             path,
         );
-        assert_eq!(name, "单引号也行");
-        assert_eq!(desc, "含 -- 破折号的简介", "引号里的 -- 不是注释");
-        assert_eq!(version, "1.2.3");
-        assert_eq!(author, "某人");
+        assert_eq!(scanned.name, "单引号也行");
+        assert_eq!(scanned.desc, "含 -- 破折号的简介", "引号里的 -- 不是注释");
+        assert_eq!(scanned.version, "1.2.3");
+        assert_eq!(scanned.author, "某人");
 
-        let (name, desc, version, author) =
-            PluginManager::scan_meta_source("function init() end\n", path);
-        assert_eq!(name, "whatever", "扫不到就回退成文件名");
-        assert_eq!(desc, "");
-        assert_eq!(version, "1.0");
-        assert_eq!(author, "");
+        let scanned = PluginManager::scan_meta_source("function init() end\n", path);
+        assert_eq!(scanned.name, "whatever", "扫不到就回退成文件名");
+        assert_eq!(scanned.desc, "");
+        assert_eq!(scanned.version, "1.0");
+        assert_eq!(scanned.author, "");
+    }
+
+    /// 新加的 5 个声明字段扫得出来，而且**不靠执行代码**（方案 3.3）。
+    ///
+    /// 这条不是"能解析就行"的样板用例：`PLUGIN_PERMISSIONS = { … }` 与两个整数声明
+    /// 都不是原来那把尺子（只认 `KEY = "字符串"`）覆盖的形状 —— 少一项的症状是插件页
+    /// 那一格永远空着，而作者明明写了。数组还要检查**排序去重**：将来授权哈希绑的
+    /// 就是这一份，两处顺序不同会让同一个权限集合算出两个哈希。
+    #[test]
+    fn scan_reads_the_five_new_manifest_fields() {
+        let path = Path::new("whatever.lua");
+        let scanned = PluginManager::scan_meta_source(
+            "PLUGIN_NAME = \"声明齐全\"\n\
+             PLUGIN_API = 2\n\
+             PLUGIN_PERMISSIONS = { \"stats.read\", \"storage.write\", \"stats.read\" }\n\
+             PLUGIN_REFRESH_MS = 1500\n\
+             PLUGIN_LIFECYCLE = \"always\"\n\
+             PLUGIN_MIN_APP = \"1.6.0\"\n\
+             function init() error(\"扫这一轮绝不该跑到这里\") end\n",
+            path,
+        );
+        assert_eq!(scanned.api, 2, "PLUGIN_API 扫不出来");
+        assert_eq!(
+            scanned.permissions,
+            vec!["stats.read".to_string(), "storage.write".to_string()],
+            "权限清单要排序 + 去重（授权哈希将来就绑这一份）"
+        );
+        assert_eq!(scanned.refresh_ms, 1500, "PLUGIN_REFRESH_MS 扫不出来");
+        assert_eq!(
+            scanned.lifecycle,
+            PluginLifecycle::Always,
+            "PLUGIN_LIFECYCLE = \"always\" 认不出来"
+        );
+        assert_eq!(scanned.min_app, "1.6.0", "PLUGIN_MIN_APP 扫不出来");
+        // 名字仍照旧（这一句是防"新规则把老的 4 项吃掉了"）
+        assert_eq!(scanned.name, "声明齐全");
+    }
+
+    /// 老插件什么都不写 ⇒ 五项全按缺省（v1 的 5 个随包脚本一字不改也要有这份清单）。
+    #[test]
+    fn absent_manifest_fields_fold_to_the_documented_defaults() {
+        let path = Path::new("old.lua");
+        let scanned = PluginManager::scan_meta_source("PLUGIN_NAME = \"老插件\"\n", path);
+        assert_eq!(scanned.api, 1, "PLUGIN_API 的缺省是 1");
+        assert!(scanned.permissions.is_empty(), "没声明就是零项");
+        assert_eq!(scanned.refresh_ms, 0, "缺省只在动作后刷新");
+        assert_eq!(
+            scanned.lifecycle,
+            PluginLifecycle::Panel,
+            "PLUGIN_LIFECYCLE 的缺省是 panel"
+        );
+        assert_eq!(scanned.min_app, "", "缺省不限版本");
+    }
+
+    /// 扫描侧与加载侧必须交出**同一份清单**（含非法值的折叠）。
+    ///
+    /// 这是这一族缺陷的共用尺子：插件页那一行读扫描侧（不执行代码），加载之后的运行态
+    /// 读加载侧。两边折得不一样，症状是"屏上写着常驻、跑起来是面板"这种最难查的一半 ——
+    /// 所以三条臂都放在一起比，而不是各比各的：齐全那条钉五个字段都接得上，
+    /// 非法那条钉折叠规则同源，缺省那条钉"没写"这个状态两侧一致。
+    #[test]
+    fn manifest_scan_and_load_agree_on_one_manifest() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("manifest_two_sides");
+        let pm = manager_in(tmp.path());
+        let cases = [
+            (
+                "齐全",
+                "PLUGIN_NAME = \"齐全\"\nPLUGIN_API = 2\n\
+                 PLUGIN_PERMISSIONS = {\n  \"timer\",\n  \"stats.read\",\n}\n\
+                 PLUGIN_REFRESH_MS = 30000\nPLUGIN_LIFECYCLE = \"always\"\n\
+                 PLUGIN_MIN_APP = \"1.6.0\"\n",
+            ),
+            (
+                "非法",
+                "PLUGIN_NAME = \"非法\"\nPLUGIN_API = 0\nPLUGIN_API_OVERRIDE = 7\n\
+                 PLUGIN_REFRESH_MS = -5\nPLUGIN_LIFECYCLE = \"Always\"\n\
+                 PLUGIN_MIN_APP = 123\n",
+            ),
+            ("缺省", "PLUGIN_NAME = \"缺省\"\nfunction init() end\n"),
+        ];
+        for (tag, src) in cases {
+            let file = write_lua(&tmp.path().join("plugins").join("builtin"), tag, src);
+            let scanned = PluginManager::scan_meta(&file).expect("扫描侧读得动");
+            let loaded = pm
+                .read_meta(&file)
+                .unwrap_or_else(|e| panic!("加载侧（{tag}）跑不了：{e}"))
+                .manifest;
+            assert_eq!(
+                scanned, loaded,
+                "「{tag}」这一份两处口径不一致：{scanned:?} vs {loaded:?}"
+            );
+        }
+    }
+
+    /// 非法声明要出声一次，不许静默折回缺省。
+    ///
+    /// 折叠本身由上面那条盯等值；这条盯的是"作者能不能知道自己写错了"。
+    /// `PLUGIN_LIFECYCLE = "Always"` 那一档差一个大写字母，静默折叠的症状是
+    /// 「我明明写了常驻，插件页却写着面板」。
+    #[test]
+    fn an_illegal_declaration_says_so_instead_of_quietly_defaulting() {
+        let logs = crate::logger::capture_logs(|| {
+            PluginManager::scan_meta_source(
+                "PLUGIN_LIFECYCLE = \"Always\"\nPLUGIN_API = 0\nPLUGIN_REFRESH_MS = -5\n",
+                Path::new("noisy.lua"),
+            );
+        })
+        .1;
+        for want in ["PLUGIN_LIFECYCLE", "PLUGIN_API", "PLUGIN_REFRESH_MS"] {
+            assert!(
+                logs.iter().any(|l| l.contains(want)),
+                "{want} 写坏了却没有一句说明（日志只有 {logs:?}）"
+            );
+        }
+    }
+
+    /// 权限表的两条边界：跨行要读得动，注释与函数体里的不算声明。
+    ///
+    /// 反面形状各钉一次：块注释里那份"以前用的权限清单"顶班 ⇒ 插件页显示成早已作废的
+    /// 一组；函数体里的缩进表根本是局部变量，加载后 globals 里没有它 ⇒ 两侧不一致。
+    #[test]
+    fn the_permissions_table_is_only_read_at_top_level() {
+        let path = Path::new("x.lua");
+        // 跨行的那一行紧跟着 `}` ⇒ 仍要读全
+        let multi = PluginManager::scan_meta_source(
+            "PLUGIN_PERMISSIONS = {\n  \"timer\",\n  \"notify\",\n}\n",
+            path,
+        );
+        assert_eq!(
+            multi.permissions,
+            vec!["notify".to_string(), "timer".to_string()],
+            "跨行写的权限表要读得动（作者真会这么写）"
+        );
+        // 块注释里的旧清单不顶班
+        let commented = PluginManager::scan_meta_source(
+            "--[[\nPLUGIN_PERMISSIONS = { \"早就作废的那一组\" }\n--]]\n\
+             PLUGIN_PERMISSIONS = { \"stats.read\" }\n",
+            path,
+        );
+        assert_eq!(
+            commented.permissions,
+            vec!["stats.read".to_string()],
+            "注释里那份是历史，不是声明"
+        );
+        // 函数体里缩进的那一份是局部变量，加载后 globals 里没有它
+        let nested = PluginManager::scan_meta_source(
+            "function init()\n  PLUGIN_PERMISSIONS = { \"函数体里的\" }\nend\n",
+            path,
+        );
+        assert!(
+            nested.permissions.is_empty(),
+            "缩进的那一份不算声明: {:?}",
+            nested.permissions
+        );
+        // 表没闭合（文件被写坏）⇒ 按"没声明"折回缺省，不许把剩下的整份文件当权限读
+        let unclosed = PluginManager::scan_meta_source(
+            "PLUGIN_PERMISSIONS = { \"timer\",\nfunction init() end\n",
+            path,
+        );
+        assert!(
+            unclosed.permissions.is_empty(),
+            "没闭合的表不该读出东西: {:?}",
+            unclosed.permissions
+        );
+    }
+
+    /// 内置那份**由位置强制**常驻，用户装的认自己写的（方案 3.3）。
+    ///
+    /// 这条钉的是"谁说了算"：如果哪天有人改成读脚本里的 `PLUGIN_KIND`，
+    /// 一个用户插件自述 builtin 就能免掉一切按位置算的口径（授权、备份都在这条上）。
+    #[test]
+    fn a_bundled_plugin_is_resident_even_without_declaring_it() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("lifecycle_by_position");
+        let builtin = tmp.path().join("plugins").join("builtin");
+        let user = tmp.path().join("data").join("plugins");
+        write_lua(
+            &builtin,
+            "quiet_builtin",
+            "PLUGIN_NAME = \"没声明的内置\"\n",
+        );
+        write_lua(&user, "quiet_user", "PLUGIN_NAME = \"没声明的用户插件\"\n");
+        write_lua(
+            &user,
+            "loud_user",
+            "PLUGIN_NAME = \"自己说要常驻\"\nPLUGIN_LIFECYCLE = \"always\"\n",
+        );
+        write_lua(
+            &user,
+            "fake_builtin",
+            "PLUGIN_NAME = \"自称内置的\"\nPLUGIN_KIND = \"builtin\"\n",
+        );
+
+        let pm = manager_in(tmp.path());
+        let by_file = |file: &str| -> DiscoveredPlugin {
+            pm.list_discovered()
+                .expect("两处目录都该读得动")
+                .into_iter()
+                .find(|p| p.file == file)
+                .unwrap_or_else(|| panic!("清单里没有 {file}"))
+        };
+        assert_eq!(
+            by_file("quiet_builtin").lifecycle(),
+            PluginLifecycle::Always,
+            "内置模块没自己声明也该常驻"
+        );
+        assert_eq!(
+            by_file("quiet_user").lifecycle(),
+            PluginLifecycle::Panel,
+            "用户插件的缺省档是面板"
+        );
+        assert_eq!(
+            by_file("loud_user").lifecycle(),
+            PluginLifecycle::Always,
+            "用户插件自己声明的 always 要认"
+        );
+        let fake = by_file("fake_builtin");
+        assert_eq!(
+            (fake.source, fake.lifecycle()),
+            (PluginSource::User, PluginLifecycle::Panel),
+            "脚本自述 PLUGIN_KIND 不改变身份：身份只由位置决定"
+        );
     }
 
     // ---------- 第八节 A11：core 自己那份热重载扫描的三条保护 ----------
@@ -3448,7 +3978,7 @@ end
             .find(|r| r.file == "shared")
             .expect("清单里有 shared");
         assert_eq!(
-            shared.name, "随包那份",
+            shared.manifest.name, "随包那份",
             "插件页那一行是内置那份的名字，用户复制的那份没有顶掉它"
         );
         assert_eq!(shared.source, PluginSource::Builtin);

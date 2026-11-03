@@ -8,6 +8,7 @@
 //! - `focusflow.daily_counts(days)` -> 每日统计
 //! - `focusflow.available_years()` -> 年份列表
 //! - `focusflow.config_get("section.key")` -> 配置值
+//! - `focusflow.store.get/set/delete/list/clear/flush` -> 这个插件自己的 KV（`state.json`）
 
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
@@ -18,6 +19,7 @@ use crate::accounting;
 use crate::config::FocusFlowConfig;
 use crate::db;
 use crate::edge_history;
+use crate::plugins::plugin_store;
 use crate::pomodoro::{self, PomodoroTimer};
 use crate::scheduler;
 
@@ -568,7 +570,7 @@ pub fn register_host_api(
     // 显示为「已停用」的状态下继续触发。重新启用插件时首次调用任一日程
     // API 会经 claim_scheduler 再把线程起回来。
     // 只回收**本插件**那一份：还有别的插件在用就不停（见 `SchedulerSlot`）。
-    let shutdown_owner = owner;
+    let shutdown_owner = owner.clone();
     host.set(
         "scheduler_shutdown",
         lua.create_function(move |_, ()| {
@@ -1079,9 +1081,212 @@ pub fn register_host_api(
         })?;
     host.set("edge_saved_total", edge_saved_total)?;
 
+    // ---- 通用存储 `focusflow.store.*`（方案 3.5）----
+    //
+    // 六个函数都交 `(结果, 原因?)`：第二个值是"读不出来 / 写不进去"这句话，
+    // 与上面 `edge_saved_today` 一族同一个口径。老脚本只取第一个返回值照样能用，
+    // 而**三态分得开**：`get` 交回 `(nil, nil)` 是"这个键没写过"，`(nil, "…")` 是
+    // "这份存储读不出来" —— 把后者画成前者，就是本仓修过两轮的那个症状（把"读不出来"
+    // 印成"没有"）。
+    //
+    // 键在这里只是一个字符串参数，进 `plugin_store` 之后只当 JSON 的键名用；
+    // 路径那一头永远固定为 `state.json`，插件给什么都拼不出第二格（3.5 的硬约束）。
+    let store = lua.create_table()?;
+    let owner_for_get = owner.clone();
+    store.set(
+        "get",
+        lua.create_function(move |lua, key: String| {
+            let owner = owner_for_get.clone();
+            match plugin_store::get(&owner, &key) {
+                Ok(Some(v)) => Ok((json_to_lua(lua, &v)?, None::<String>)),
+                Ok(None) => Ok((mlua::Value::Nil, None::<String>)),
+                Err(e) => Ok((mlua::Value::Nil, Some(e))),
+            }
+        })?,
+    )?;
+    let owner_for_set = owner.clone();
+    let set_config: &'static FocusFlowConfig = config;
+    store.set(
+        "set",
+        lua.create_function(move |_, (key, value): (String, mlua::Value)| {
+            let owner = owner_for_set.clone();
+            let limits = plugin_store::Limits::from_config(set_config);
+            let json = match lua_to_json(value, 0) {
+                Ok(v) => v,
+                // 转不动的值（函数、userdata、NaN）算**这次没写**，并把原因说清；
+                // 悄悄写成 null 的话，插件下次读回来只会看到一个说不清的假值。
+                Err(e) => return Ok((false, Some(e))),
+            };
+            match plugin_store::set(&owner, &key, json, &limits) {
+                Ok(()) => Ok((true, None::<String>)),
+                Err(e) => Ok((false, Some(e))),
+            }
+        })?,
+    )?;
+    let owner_for_del = owner.clone();
+    store.set(
+        "delete",
+        lua.create_function(move |_, key: String| {
+            let owner = owner_for_del.clone();
+            match plugin_store::delete(&owner, &key) {
+                Ok(removed) => Ok((removed, None::<String>)),
+                Err(e) => Ok((false, Some(e))),
+            }
+        })?,
+    )?;
+    let owner_for_list = owner.clone();
+    store.set(
+        "list",
+        lua.create_function(move |lua, ()| {
+            let owner = owner_for_list.clone();
+            match plugin_store::list(&owner) {
+                Ok(pairs) => {
+                    let t = lua.create_table()?;
+                    for (k, v) in pairs {
+                        t.set(k.as_str(), json_to_lua(lua, &v)?)?;
+                    }
+                    Ok((t, None::<String>))
+                }
+                Err(e) => Ok((lua.create_table()?, Some(e))),
+            }
+        })?,
+    )?;
+    let owner_for_clear = owner.clone();
+    store.set(
+        "clear",
+        lua.create_function(move |_, ()| {
+            let owner = owner_for_clear.clone();
+            match plugin_store::clear(&owner) {
+                Ok(n) => Ok((n as i64, None::<String>)),
+                Err(e) => Ok((0i64, Some(e))),
+            }
+        })?,
+    )?;
+    // 第六个：当场问一次落盘的结局。去抖意味着 `set` 返回时盘上还没动，
+    // 少了这一条，"写好了"这句话在插件作者那一头就永远没有证据（配置那一头红过一次）。
+    let owner_for_flush = owner.clone();
+    store.set(
+        "flush",
+        lua.create_function(move |_, ()| {
+            let owner = owner_for_flush.clone();
+            match plugin_store::flush(&owner) {
+                Ok(wrote) => Ok((wrote, None::<String>)),
+                Err(e) => Ok((false, Some(e))),
+            }
+        })?,
+    )?;
+    host.set("store", store)?;
+
     // 注册为全局 `focusflow`
     lua.globals().set("focusflow", host.clone())?;
     Ok(host)
+}
+
+/// 一次转换最多往下走几层（与控件解析 `MAX_WIDGET_DEPTH` 同一族防护）。
+///
+/// 为什么必须有：`local t = {}; t.self = t` 是自引用的表，无界递归会打穿线程栈 ——
+/// 栈溢出是 SIGSEGV，不走 panic hook，release 又是 abort + 无控制台，
+/// 用户看到的是"插件一存东西程序就没了"。
+const MAX_STORE_DEPTH: u32 = 8;
+
+/// 一层里最多转换多少个条目（配额最终兜住总量，这里防的是一次转换把内存吃掉）。
+const MAX_STORE_ITEMS: usize = 4000;
+
+/// Lua 值 → JSON 值。转不动的东西交 `Err` 并说清是哪一个，不许折成 `null`。
+///
+/// 表的两种形状按 Lua 自己的样子分：键正好是 `1..n` 的整数才是数组，其余当对象。
+/// 反过来说也成立 —— 读回来时数组是 `{1,2,3}`、对象是 `{a=1}`，插件不需要猜。
+fn lua_to_json(value: mlua::Value, depth: u32) -> Result<serde_json::Value, String> {
+    use serde_json::Value as J;
+    if depth > MAX_STORE_DEPTH {
+        return Err(format!(
+            "存储的值嵌套超过 {MAX_STORE_DEPTH} 层，本次没有写入：state.json 是给设置项用的，\
+             不是记录库（要存很多条请换地方）"
+        ));
+    }
+    match value {
+        mlua::Value::Nil => Err("存储不许写 nil：要删掉一个键请调 store.delete(key)".to_string()),
+        mlua::Value::Boolean(b) => Ok(J::Bool(b)),
+        mlua::Value::Integer(n) => Ok(J::from(n)),
+        mlua::Value::Number(f) => {
+            if f.is_finite() {
+                Ok(J::from(f))
+            } else {
+                // JSON 里没有 NaN / inf；写成 null 会让下一次读回来变成一个说不清的假值
+                Err(format!("存储不许写非有限的数（{f}）"))
+            }
+        }
+        mlua::Value::String(s) => Ok(J::String(s.to_string_lossy())),
+        mlua::Value::Table(t) => {
+            let mut entries: Vec<(mlua::Value, mlua::Value)> = Vec::new();
+            for kv in t.pairs::<mlua::Value, mlua::Value>() {
+                let (k, v) = kv.map_err(|e| format!("表读不动：{e}"))?;
+                entries.push((k, v));
+                if entries.len() > MAX_STORE_ITEMS {
+                    return Err(format!("一层里超过 {MAX_STORE_ITEMS} 个条目，本次没有写入"));
+                }
+            }
+            let n = entries.len();
+            let is_array = n > 0
+                && entries.iter().enumerate().all(|(i, (k, _))| match k {
+                    mlua::Value::Integer(x) => *x == (i as i64) + 1,
+                    _ => false,
+                });
+            if is_array {
+                let mut out = Vec::with_capacity(n);
+                for (_, v) in entries {
+                    out.push(lua_to_json(v, depth + 1)?);
+                }
+                Ok(J::Array(out))
+            } else {
+                let mut map = serde_json::Map::new();
+                for (k, v) in entries {
+                    let key = match k {
+                        mlua::Value::String(s) => s.to_string_lossy(),
+                        mlua::Value::Integer(n) => n.to_string(),
+                        mlua::Value::Number(f) => f.to_string(),
+                        mlua::Value::Boolean(b) => b.to_string(),
+                        _ => return Err("存储的键名只能是字符串或数".to_string()),
+                    };
+                    map.insert(key, lua_to_json(v, depth + 1)?);
+                }
+                Ok(J::Object(map))
+            }
+        }
+        mlua::Value::Function(_) => Err("存储不许写函数（函数不会被序列化）".to_string()),
+        // 兜住其余一切"落不了盘的东西"：userdata、协程、错误对象，以及 mlua 里那个
+        // 说不清的 `Other`。逐条列会漏变体（编译器只在这条 match 上穷尽），
+        // 而漏出去的那一支就是"写进去了一个说不清的值"。
+        _ => Err("存储只收字符串、数、布尔与表；这一样落不了盘".to_string()),
+    }
+}
+
+/// JSON 值 → Lua 值。
+fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<mlua::Value> {
+    use serde_json::Value as J;
+    Ok(match value {
+        J::Null => mlua::Value::Nil,
+        J::Bool(b) => mlua::Value::Boolean(*b),
+        J::Number(n) => match n.as_i64() {
+            Some(i) => mlua::Value::Integer(i),
+            None => mlua::Value::Number(n.as_f64().unwrap_or(0.0)),
+        },
+        J::String(s) => mlua::Value::String(lua.create_string(s)?),
+        J::Array(items) => {
+            let t = lua.create_table()?;
+            for (i, item) in items.iter().enumerate() {
+                t.set(i + 1, json_to_lua(lua, item)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+        J::Object(map) => {
+            let t = lua.create_table()?;
+            for (k, v) in map {
+                t.set(k.as_str(), json_to_lua(lua, v)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1397,6 +1602,195 @@ mod tests {
         assert!(
             !shutdown_pomodoro_if_owned_by("甲"),
             "没持有归还第二次是无操作，不能假报动过手"
+        );
+    }
+
+    /// 把插件那一头的环境搭起来（存储用的是**这个** config，不是进程全局那一份）。
+    ///
+    /// 配额写在传进来的那份 config.ini 里，所以这条路径能测到"超限那一句在 Lua 侧长什么样"，
+    /// 而不必依赖哪个用例先初始化了 `config::instance()`。
+    fn lua_with_store(cfg_path: &std::path::Path, owner: &str) -> Lua {
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(cfg_path).expect("临时配置应能载入"),
+        ));
+        let lua = Lua::new();
+        register_host_api(&lua, config, db::Database::init_readonly(), owner)
+            .expect("注册宿主 API");
+        lua
+    }
+
+    /// 值的形状要按插件给的样子回来：数组是数组、对象是对象，嵌套也在。
+    ///
+    /// 这条盯的是适配器（`lua_to_json` / `json_to_lua`）而不是存储本体：
+    /// 折叠成"一切都是对象"或"一切都是数组"在这种写法上都能过一遍，
+    /// 症状却是插件下次读回 `#x == 0`（数组没了）—— 上面存储本体的用例摸不到这一层。
+    #[test]
+    fn store_values_come_back_in_the_shape_they_went_in() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let tmp = crate::paths::test_app_dir("host_store_shapes");
+        std::fs::write(tmp.path().join("config.ini"), "[plugins]\n").unwrap();
+        let lua = lua_with_store(&tmp.path().join("config.ini"), "shape_lua");
+        let got: String = lua
+            .load(
+                r#"
+                focusflow.store.set("s", "文本")
+                focusflow.store.set("n", 42)
+                focusflow.store.set("f", 1.5)
+                focusflow.store.set("b", true)
+                focusflow.store.set("arr", { "一", "二", "三" })
+                focusflow.store.set("obj", { k = "v", deep = { 1, 2 } })
+                local wrote = focusflow.store.flush()
+                local parts = {}
+                parts[#parts + 1] = tostring(wrote)
+                parts[#parts + 1] = tostring(focusflow.store.get("s"))
+                parts[#parts + 1] = tostring(#focusflow.store.get("arr"))
+                parts[#parts + 1] = tostring(focusflow.store.get("obj").k)
+                parts[#parts + 1] = tostring(focusflow.store.get("obj").deep[2])
+                parts[#parts + 1] = tostring(focusflow.store.get("f"))
+                return table.concat(parts, "|")
+                "#,
+            )
+            .eval()
+            .expect("这一段 Lua 跑不通");
+        assert_eq!(
+            got, "true|文本|3|v|2|1.5",
+            "盘上那份与读回来的形状不对（写出结局|字符串|数组长度|对象取值|嵌套|小数）"
+        );
+        // 盘上那份是 JSON，键名照原样
+        let on_disk =
+            std::fs::read_to_string(crate::paths::plugin_state_dir("shape_lua").join("state.json"))
+                .expect("state.json 该在插件自己的那一格里");
+        assert!(
+            on_disk.contains("\"arr\":[\"一\",\"二\",\"三\"]"),
+            "{on_disk}"
+        );
+        assert!(
+            on_disk.contains("\"obj\":{\"deep\":[1,2],\"k\":\"v\"}"),
+            "{on_disk}"
+        );
+    }
+
+    /// 被拒的那一次要说清原因，而且什么都没写进去。
+    ///
+    /// 三样都从 Lua 那一头问：超容量（config 里把上限压到 200 字节）、自引用的表
+    /// （不打穿栈）、写 nil（要删就该调 delete）。三条都必须是 `false` + 一句原因，
+    /// 而不是把 `true` 交回去 —— 恒 `Ok` 的那一类缺陷就是在这里被抓出来的。
+    #[test]
+    fn a_refused_write_says_why_and_leaves_the_store_untouched() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let tmp = crate::paths::test_app_dir("host_store_refused");
+        std::fs::write(
+            tmp.path().join("config.ini"),
+            "[plugins]\nstore_max_bytes = 200\n",
+        )
+        .unwrap();
+        let lua = lua_with_store(&tmp.path().join("config.ini"), "refused_lua");
+        let got: String = lua
+            .load(
+                r#"
+                local ok1, why1 = focusflow.store.set("big", string.rep("x", 400))
+                local self_t = {}
+                self_t.me = self_t
+                local ok2, why2 = focusflow.store.set("loop", self_t)
+                local ok3, why3 = focusflow.store.set("nada", nil)
+                local ok4, why4 = focusflow.store.set("fn", function() end)
+                local kept = focusflow.store.set("small", "留下")
+                local listed = focusflow.store.list()
+                local n = 0
+                for _ in pairs(listed) do n = n + 1 end
+                return table.concat({
+                    tostring(ok1), why1 or "", tostring(ok2), why2 or "",
+                    tostring(ok3), why3 or "", tostring(ok4), why4 or "",
+                    tostring(kept), tostring(n)
+                }, "|")
+                "#,
+            )
+            .eval()
+            .expect("这一段 Lua 跑不通");
+        let cells: Vec<&str> = got.split('|').collect();
+        assert_eq!(cells.len(), 10, "读数形状变了: {got}");
+        assert_eq!(cells[0], "false", "超容量的那一次没被挡下");
+        assert!(cells[1].contains("容量超限"), "要说清是容量: {}", cells[1]);
+        assert_eq!(cells[2], "false", "自引用的表把栈打穿了（该按层数拒绝）");
+        assert!(cells[3].contains("嵌套"), "要说清是嵌套: {}", cells[3]);
+        assert_eq!(cells[4], "false", "写 nil 被当成了成功");
+        assert!(cells[5].contains("delete"), "要指路 delete: {}", cells[5]);
+        assert_eq!(cells[6], "false", "写函数被当成了成功");
+        assert!(
+            cells[7].contains("函数"),
+            "函数那一问也要说一句: {}",
+            cells[7]
+        );
+        assert_eq!(cells[8], "true", "被拒的那些不该顺手把合法的也拒了");
+        assert_eq!(cells[9], "1", "只有那一条写进去了: {got}");
+    }
+
+    /// 「这个键没写过」与「这一份读不出来」在 Lua 侧必须是两个答案。
+    ///
+    /// 这是本仓修过两轮的那一族（把"读不出来"印成"没有"）：`get` 只回一个 nil 时，
+    /// 插件面板只能两句都说成"你从没存过东西"。三态各问一次。
+    #[test]
+    fn a_missing_key_and_an_unreadable_store_are_two_different_answers() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let tmp = crate::paths::test_app_dir("host_store_three_states");
+        std::fs::write(tmp.path().join("config.ini"), "[plugins]\n").unwrap();
+        let cfg = tmp.path().join("config.ini");
+        let lua = lua_with_store(&cfg, "three_states");
+        let ask = |lua: &Lua, src: &str| -> String {
+            lua.load(src).eval::<String>().expect("这一段 Lua 跑不通")
+        };
+        // 第一态：文件不在 = 读全了而这个键没写过 ⇒ nil + 空原因
+        assert_eq!(
+            ask(
+                &lua,
+                "local v, why = focusflow.store.get('从没写过') return tostring(v) .. '|' .. (why or '')"
+            ),
+            "nil|",
+            "没写过的那一问该是 nil 加一句空原因"
+        );
+        // 第二态：写过 ⇒ 值 + 空原因
+        lua.load("focusflow.store.set('有', 1)")
+            .eval::<()>()
+            .unwrap();
+        assert_eq!(
+            ask(
+                &lua,
+                "local v, why = focusflow.store.get('有') return tostring(v) .. '|' .. (why or '')"
+            ),
+            "1|",
+            "写了的那一问该读得到值"
+        );
+        // 第三态：这一份读不出来 ⇒ nil + 一句原因，而且 list 也要说同一句
+        std::fs::write(
+            crate::paths::plugin_state_dir("corrupt_lua").join("state.json"),
+            "{ 这不是 JSON",
+        )
+        .unwrap();
+        let lua2 = lua_with_store(&cfg, "corrupt_lua");
+        let third = ask(
+            &lua2,
+            "local v, why = focusflow.store.get('k') return tostring(v) .. '|' .. (why or '')",
+        );
+        assert!(
+            third.starts_with("nil|") && third.contains("读不出来"),
+            "读不出来必须与「没写过」分开，实得: {third}"
+        );
+        let listed = ask(
+            &lua2,
+            "local t, why = focusflow.store.list() return (#t == 0 and '空' or '有货') .. '|' .. (why or '')",
+        );
+        assert!(
+            listed.contains("读不出来"),
+            "列全表那一问也得把同一句原因交回来，实得: {listed}"
+        );
+        // 写的一侧同样不许假装成功
+        let wrote = ask(
+            &lua2,
+            "local ok, why = focusflow.store.set('k', 1) return tostring(ok) .. '|' .. (why or '')",
+        );
+        assert!(
+            wrote.starts_with("false|"),
+            "读不出来的那一份不许被悄悄改写: {wrote}"
         );
     }
 }

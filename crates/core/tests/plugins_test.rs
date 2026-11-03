@@ -50,7 +50,7 @@ mod tests {
 
         // 检查元数据
         let info = manager.get_plugin(&name).expect("插件应存在");
-        assert_eq!(info.version, "1.0.0");
+        assert_eq!(info.manifest.version, "1.0.0");
         assert!(info.view.is_some(), "应有视图");
 
         // 视图内容

@@ -208,7 +208,7 @@ fn run(args: &[String]) -> i32 {
                 // 一轮里，只收 stdout 的计划任务看到的仍然是一行像成功的话。
                 emit_line(
                     &format!(
-                        "  目录: {}（已停用插件的数据会跳过）",
+                        "  目录: {}（停用插件的附属库会跳过；插件自己存的那份不跳过）",
                         focusflow_core::paths::backup_dir().display()
                     ),
                     code,
