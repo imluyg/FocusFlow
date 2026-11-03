@@ -443,7 +443,9 @@ pub fn register_host_api(
     let tasks_owner = owner.clone();
     let tasks_fn = lua.create_function(move |lua, ()| {
         claim_scheduler(&tasks_owner);
-        let tasks = scheduler::get_all_tasks();
+        // 第二个返回值 = 这一轮没读全的原因（空串 = 读全了）。只回清单的话，库打不开时
+        // 面板拿到的是一张空表，而"没建过任务"与"读不出来"在界面上长得一模一样。
+        let (tasks, gap) = scheduler::all_tasks_read();
         let t = lua.create_table()?;
         for (i, task) in tasks.iter().enumerate() {
             let row = lua.create_table()?;
@@ -461,7 +463,7 @@ pub fn register_host_api(
             )?;
             t.set(i + 1, row)?;
         }
-        Ok(t)
+        Ok((t, gap))
     })?;
     host.set("scheduler_tasks", tasks_fn)?;
 
@@ -1287,6 +1289,90 @@ mod tests {
         assert!(
             panel.contains("summary_gap") && panel.contains("hist_gap") && panel.contains("没读全"),
             "面板没接住宿主多交回的那两位：读不出来时它照样只念 0 与一张空表"
+        );
+    }
+
+    /// 番茄钟的同一条链在日程这一头：宿主 `scheduler_tasks` 只回清单 ⇒ 库读不出来时
+    /// 插件页拿到一张空表，渲染成「他一条任务都没建过」，而那些定时任务其实再也不触发了。
+    /// 这里钉三件事：多交回的那一位**是字符串而不是 nil**（nil 的话面板那句
+    /// `gap ~= ""` 永远不成立甚至直接报错）、坏库里它得是一句能给人看的原因、
+    /// 以及随包的那份面板真的读了它。
+    #[test]
+    fn the_scheduler_host_api_hands_the_missing_reading_to_the_panel() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("host_sched_gap");
+        let lua = Lua::new();
+        let database = db::Database::init_readonly();
+        register_host_api(&lua, crate::config::instance(), database, "sched_gap_test")
+            .expect("注册宿主 API");
+        // 表要建在**本用例自己的**临时目录里：调度线程那份建表闩可能已经被隔壁用例的
+        // 目录落下了（进程级），不补这一步，"健康那一支的原因必须是空串"就成了顺序依赖。
+        crate::scheduler::init_db().expect("建表");
+
+        let read = "local t, g = focusflow.scheduler_tasks() return t, g, #t";
+
+        // ① 库好好的：原因必须是空串（永远挂一句「没读全」也是缺陷）
+        let (_, gap, n): (mlua::Table, String, usize) = lua
+            .load(read)
+            .eval()
+            .expect("scheduler_tasks 该回（表, 字符串, 行数）");
+        assert_eq!(n, 0, "全新库里没有任务");
+        assert_eq!(gap, "", "这一轮读全了不许有话，实得: {gap}");
+
+        // ② 库整个打不开：清单还是空的，但那一位必须写成一句能给人看的原因。
+        //    用的是"同名目录"而不是 DROP TABLE —— 调度线程会自愈建表，删表这条夹具
+        //    撞上一次自愈就永远绿（等于没测）。
+        {
+            let _: mlua::Result<()> = lua.load("focusflow.scheduler_shutdown()").eval();
+            let p = crate::scheduler::db_path();
+            // 把文件挪开要让调度线程一次（它每 30 秒开一次库，可能正握在那一瞬）：
+            // 不让就是只有连跑才红的随机红。
+            let mut moved = false;
+            for _ in 0..20 {
+                match std::fs::remove_file(&p) {
+                    Ok(()) => {
+                        moved = true;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        moved = true;
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                }
+            }
+            assert!(moved, "库文件一直被人握着，夹具摆不出来");
+            std::fs::create_dir(&p).unwrap();
+            let got: mlua::Result<(mlua::Table, String, usize)> = lua.load(read).eval();
+            let (_, gap, n) = match got {
+                Ok(v) => v,
+                Err(e) => panic!(
+                    "读不出来时多交回的那一位也必须还是字符串（拿到 nil 说明宿主没把它\
+                     交出去，面板那句 ~= 空串 的判断就永远不成立）: {e}"
+                ),
+            };
+            assert_eq!(n, 0, "读不出来时清单是空的，这正是症状的源头");
+            assert!(
+                gap.contains("没读出来") && gap.contains("库打不开"),
+                "要说清是读不出来、败在哪一步，实得: {gap}"
+            );
+            std::fs::remove_dir(&p).ok();
+            let _ = crate::scheduler::init_db();
+        }
+
+        // 收尾必须把调度线程的登记还回去：`scheduler_tasks` 每次调用都按 owner 登记，
+        // 而那张表是进程级的。留着不还，隔壁那批「owner 数」用例（`a_failed_first_load_
+        // does_not_leave_an_orphan_scheduler_owner` 等四条）就在我这份目录删掉之后读到
+        // 一个多出来的用户 —— 单跑绿、连跑红。
+        let _: mlua::Result<()> = lua.load("focusflow.scheduler_shutdown()").eval();
+
+        // ③ 面板接住它：只改宿主不改面板，屏上念的还是那张空表
+        let panel = include_str!("../../plugins/scheduler_plugin.lua").replace("\r\n", "\n");
+        assert!(
+            panel.contains("local tasks, gap = focusflow.scheduler_tasks()")
+                && panel.contains("这份清单这次没读全：")
+                && panel.contains("_not_in_list(tid, gap)"),
+            "日程面板没接住宿主多交回的那一位：读不出来时它照样只念一张空表"
         );
     }
 

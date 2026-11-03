@@ -892,16 +892,32 @@ pub fn toggle_task(id: i64, enabled: bool) -> anyhow::Result<bool> {
 const TASK_COLS: &str = "id, name, target_path, args, schedule_type, schedule_time, \
                          enabled, last_run, created_at";
 
-/// 获取所有任务。
+/// 只看清单的那一位：调度循环与既有用例用。
 ///
-/// 读不出来时**必须留日志**：返回空列表与"他一条任务都没建过"在界面上长得一样，
-/// 而插件页会直接显示成空列表。
+/// ⚠ 缺读的原因在这一位里被丢掉，所以**界面别用它** —— 要用 [`all_tasks_read`]。
 pub fn get_all_tasks() -> Vec<ScheduledTask> {
+    all_tasks_read().0
+}
+
+/// 获取所有任务，并把「这一轮有没有缺读」一起交回去。
+///
+/// 第二个返回值：空串 = 从打开库到每一行解码都读上了；非空 = 上面那份清单**不完整**，
+/// 缺了几条、为什么缺都写在里面。
+///
+/// 为什么要有这一位：三条失败分支各自 `tracing::error!` 后 `return Vec::new()`，
+/// 解不出来的行也只进日志 ⇒ 插件页把「库读不动」渲染成「他一条任务都没建过」，
+/// 而定时任务真的不再触发时屏上一字不提（文件日志层还常常是关着的）。
+/// 日志那一条路保留，这一位是给屏上用的：同族的番茄钟（`pomodoro::today_summary`
+/// 与 `pomodoro::get_recent_sessions`）已经按同一个形状把原因交到了面板上。
+pub fn all_tasks_read() -> (Vec<ScheduledTask>, String) {
     let conn = match open() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("定时任务读不出来（打开库失败），本次按空列表处理: {e}");
-            return Vec::new();
+            return (
+                Vec::new(),
+                format!("任务清单一条都没读出来（库打不开：{e}）"),
+            );
         }
     };
     let mut stmt = match conn.prepare(&format!(
@@ -910,7 +926,10 @@ pub fn get_all_tasks() -> Vec<ScheduledTask> {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("定时任务读不出来（查询准备失败），本次按空列表处理: {e}");
-            return Vec::new();
+            return (
+                Vec::new(),
+                format!("任务清单一条都没读出来（查询准备失败：{e}）"),
+            );
         }
     };
     let result = stmt.query_map([], |r| {
@@ -943,7 +962,10 @@ pub fn get_all_tasks() -> Vec<ScheduledTask> {
         }
         Err(e) => {
             tracing::error!("定时任务读不出来（查询失败），本次按空列表处理: {e}");
-            return Vec::new();
+            return (
+                Vec::new(),
+                format!("任务清单一条都没读出来（查询失败：{e}）"),
+            );
         }
     }
     // 逐行报错而不是整体吞掉：rusqlite 的错误串带列号与列名（如
@@ -953,7 +975,16 @@ pub fn get_all_tasks() -> Vec<ScheduledTask> {
             "定时任务有一行解不出来，已跳过（这条不会参与调度，请在插件页删掉重建）: {d}"
         );
     }
-    out
+    let gap = if dropped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "有 {} 行任务读不出来（第一个原因：{}），它们不参与调度，请在插件页删掉重建",
+            dropped.len(),
+            dropped.first().map(|s| s.as_str()).unwrap_or("没带上原因")
+        )
+    };
+    (out, gap)
 }
 
 /// [`parse_interval_checked`] 解不开时的分别，与 [`ClockErr`] 同一口径：
@@ -3172,6 +3203,71 @@ mod tests {
             .unwrap()
         };
         assert_eq!(raw, "", "init_db 要把遗留的 NULL args 补成空串");
+    }
+
+    /// 回归（番茄钟面板同族）：`get_all_tasks` 在三条失败分支上都只 `return Vec::new()`，
+    /// 解不出来的行只进日志 ⇒ 日程插件页把「库读不出来」渲染成「他一条任务都没建过」，
+    /// 而定时任务真的不再触发时屏上一字不提（文件日志层常常是关着的）。
+    /// 现在清单旁边必须跟着「这一轮缺了什么、为什么缺」，且**读全时那句话是空串**——
+    /// 永远挂着一句"没读全"同样是缺陷。
+    #[test]
+    fn an_unreadable_task_list_says_so_instead_of_becoming_empty() {
+        let _g = isolate_app_dir("tasks_gap");
+        // ① 库好好的：那条读得回来，原因必须是空串
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_tasks (id, name, target_path, args, schedule_type, \
+                 schedule_time, enabled, last_run, created_at) \
+                 VALUES (7301, '好行', ?1, '', 'daily', '09:00', 1, NULL, '2026-01-01T00:00:00')",
+                [r"C:\focusflow-test-dir\不存在的目标.exe"],
+            )
+            .unwrap();
+        }
+        let (tasks, gap) = all_tasks_read();
+        assert_eq!(tasks.len(), 1, "健康库里那条要读得回来，实得 {tasks:?}");
+        assert_eq!(gap, "", "这一轮读全了不许有话，实得: {gap}");
+
+        // ② 有一行解不出来：好行不许连累，缺的那一行要点名
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_tasks (id, name, target_path, args, schedule_type, \
+                 schedule_time, enabled, last_run, created_at) \
+                 VALUES (7302, '坏行', ?1, '', 'daily', '09:00', '不是整数', NULL, \
+                 '2026-01-01T00:00:00')",
+                [r"C:\focusflow-test-dir\不存在的目标.exe"],
+            )
+            .unwrap();
+        }
+        let (tasks, gap) = all_tasks_read();
+        assert_eq!(tasks.len(), 1, "坏行不能连累好行，实得 {tasks:?}");
+        assert!(gap.contains("有 1 行"), "要点名缺了几行，实得: {gap}");
+        assert!(
+            gap.contains("enabled"),
+            "rusqlite 那句带列名，一路交上来才定位得到是哪一条哪一列，实得: {gap}"
+        );
+        assert!(
+            gap.contains("读不出来") && gap.contains("不参与调度"),
+            "要说清缺的是行、且这些任务真的不再跑，实得: {gap}"
+        );
+
+        // ③ 库整个打不开：清单是空的，但那一位必须写成一句原因
+        {
+            let p = db_path();
+            std::fs::remove_file(&p).unwrap();
+            // 同名目录让 `Connection::open` 直接失败（不是"给你一个空库"）
+            std::fs::create_dir(&p).unwrap();
+            let (tasks, gap) = all_tasks_read();
+            assert!(tasks.is_empty(), "库打不开时不该有条目，实得 {tasks:?}");
+            assert!(
+                gap.contains("没读出来") && gap.contains("库打不开"),
+                "要点名败在哪一步，不能说成「没建过任务」，实得: {gap}"
+            );
+            // 只看清单的那一位照旧能用（调度循环走它），但症状正是它丢了这句话
+            assert!(get_all_tasks().is_empty(), "get_all_tasks 仍是那份清单");
+            std::fs::remove_dir(&p).ok();
+        }
     }
 
     /// 回归：`launch_failures >= 3` 以后**从来没有**按窗口复位（唯一的清零是启动成功），

@@ -53,7 +53,10 @@ function on_action(id)
         msg = add_sample_task()
     elseif id:match("^toggle_") then
         local tid = tonumber(id:sub(8))
-        local tasks = focusflow.scheduler_tasks()
+        -- 第二个返回值：这一轮没读全的原因（空串 = 读全了）。找不到那条任务有两种
+        -- 完全不同的原因 —— 真没建过 / 库这一轮读不出来，只说"先点刷新"会把人
+        -- 推进一个刷新永远为空的死循环。
+        local tasks, gap = focusflow.scheduler_tasks()
         local target = nil
         for _, t in ipairs(tasks) do
             if t["id"] == tid then
@@ -62,7 +65,7 @@ function on_action(id)
             end
         end
         if not target then
-            msg = "切换失败：任务 #" .. tostring(tid) .. " 不在列表里（先点刷新）"
+            msg = "切换失败：" .. _not_in_list(tid, gap)
         else
             -- 宿主给的是 (是否改成, 原因)：库被写事务占住时不能说成"已启用"
             local ok, why = focusflow.scheduler_toggle(tid, not target["enabled"])
@@ -76,8 +79,11 @@ function on_action(id)
         -- 行内「编辑」：动作 id = "edit_" .. 任务 id
         local tid = tonumber(id:sub(6))
         local target = nil
+        local gap = ""
         if tid then
-            for _, t in ipairs(focusflow.scheduler_tasks()) do
+            local tasks
+            tasks, gap = focusflow.scheduler_tasks()
+            for _, t in ipairs(tasks) do
                 if t["id"] == tid then
                     target = t
                     break
@@ -85,7 +91,7 @@ function on_action(id)
             end
         end
         if not target then
-            msg = "编辑失败：任务 #" .. tostring(tid) .. " 不在列表里（先点刷新）"
+            msg = "编辑失败：" .. _not_in_list(tid, gap)
         else
             load_draft(target)
             edit_id = tid
@@ -165,8 +171,21 @@ function _last_run(t)
     return s
 end
 
+-- 「这一问没在那份清单里」：清单空着有两种完全不同的原因 —— 一条任务都没建过，
+-- 与这一轮库读不出来。后者撞上"先点刷新"是个死循环（刷新多少次都是空表），
+-- 所以缺读的原因必须跟着这句话一起上屏。
+function _not_in_list(tid, gap)
+    local s = "任务 #" .. tostring(tid) .. " 不在列表里"
+    if gap and gap ~= "" then
+        return s .. "（这份清单这次没读全：" .. gap .. "）"
+    end
+    return s .. "（先点刷新）"
+end
+
 function get_view()
-    local tasks = focusflow.scheduler_tasks()
+    -- 第二个返回值是"这一轮没读全"的原因（空串 = 读全了）：库读不动时清单是空表，
+    -- 而插件页把空表渲染成"他一条任务都没建过"——定时任务真的不再触发却一字不提。
+    local tasks, gap = focusflow.scheduler_tasks()
     local rows = {}
     local ids = {}
     for _, t in ipairs(tasks) do
@@ -229,6 +248,15 @@ function get_view()
             },
         },
     }
+    -- 清单没读全：这句话要跟着那张（可能是空的）表一起上屏，否则用户读到的是
+    -- "一条任务都没建过"，而真话是"库这一轮读不出来、定时任务再也不会触发"。
+    if gap and gap ~= "" then
+        widgets[#widgets + 1] = { type = "separator" }
+        widgets[#widgets + 1] = {
+            type = "label",
+            text = "这份清单这次没读全：" .. tostring(gap),
+        }
+    end
     -- 上一次操作的结果：被白名单拒绝、删除成功与否都要在面板上说出来，
     -- 只写日志的话用户看到的就是「点了没反应」。
     if msg then
