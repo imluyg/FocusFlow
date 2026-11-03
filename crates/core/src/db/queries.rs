@@ -885,6 +885,19 @@ pub struct DailyTotals {
     pub unreadable: Vec<String>,
 }
 
+/// `daily_counts` 里那一趟窗口要读的那一列。
+///
+/// 只有两个取值，且刻意不做成"任意列名"的字符串参数：让调用方能传列名等于把 SQL 拼接
+/// 开口留给外部数据，而这两列是产品自己要读的全部。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DailyField {
+    /// 按键次数（图与打卡条今天读的就是这一列）
+    Count,
+    /// 活跃秒数（看板的「活跃时长」读这一列；它**包含**没采到前台应用的那段，
+    /// 与按应用秒数算出来的那一格不是同一个数，见方案里指标口径的第 3 条边界规则）
+    Seconds,
+}
+
 /// 所选窗口内每小时合计的读数（长度 24）。同样：读不全时只是下界。
 #[derive(Debug, Clone, Default)]
 pub struct HourlyTotals {
@@ -960,6 +973,31 @@ fn query_hourly_window_in_conn(
     )
 }
 
+/// 单库读窗口内的每日活跃秒数 `(date_key, seconds)`。
+///
+/// 与 [`query_daily_window_in_conn`] 同一张表、同一个窗口、同一套三态，只是取另一列。
+/// 这一列此前**没有任何窗口读者**：`daily_counts.seconds` 只在迁移与写侧的单日聚合里出现过，
+/// 所以看板的「活跃时长」要么按应用秒数念（那是另一个口径：不含"没采到前台应用的时间"），
+/// 要么新加这一条 —— 文档定的口径是 `daily_counts` 的 `seconds` 合计，就按它读。
+fn query_daily_seconds_window_in_conn(
+    conn: &Connection,
+    start_dk: i64,
+    end_dk: i64,
+) -> YearRead<Vec<(i64, i64)>> {
+    match connection::table_presence_cached(conn, "daily_counts") {
+        connection::Presence::No => return YearRead::NoTable,
+        connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
+        connection::Presence::Yes => {}
+    }
+    read_pairs(
+        conn,
+        "SELECT date_key, seconds FROM daily_counts WHERE date_key >= ?1 AND date_key <= ?2",
+        start_dk,
+        end_dk,
+        "每日活跃秒数读不出来",
+    )
+}
+
 /// 一趟窗口读回来的行：`(date_key, 次数)` 序列。
 type WindowRows = Vec<(i64, i64)>;
 /// 一趟窗口读回来的缺读：`(哪一年, 那句点名的话)`。
@@ -1029,6 +1067,19 @@ fn read_daily_pair(
     wide_days: i64,
     year: Option<i32>,
 ) -> (DailyTotals, DailyTotals) {
+    read_daily_pair_of(small_days, wide_days, year, DailyField::Count)
+}
+
+/// [`read_daily_pair`] 的全部机制，唯一区别是取 `daily_counts` 的哪一列。
+///
+/// 窗口算术、补零、缺读点名只有一份实现：第二列（活跃秒数）走的是同一段日期的同一批
+/// 年度库，各写一遍就是"同一天在两个读数里可能是两个答案"的起点。
+fn read_daily_pair_of(
+    small_days: i64,
+    wide_days: i64,
+    year: Option<i32>,
+    field: DailyField,
+) -> (DailyTotals, DailyTotals) {
     let today = Local::now().date_naive();
     let small_days = clamp_query_days(small_days);
     // 宽的一段至少要把窄的盖住，否则"从一趟里切两段"这个前提就不成立了
@@ -1043,13 +1094,22 @@ fn read_daily_pair(
         daily_map.insert(start_dk + i, 0);
     }
 
-    let (pairs, gaps) = read_window_years(
-        DOMAIN_DAILY,
-        &years_to_query,
-        start_dk,
-        end_dk,
-        query_daily_window_in_conn,
-    );
+    let (pairs, gaps) = match field {
+        DailyField::Count => read_window_years(
+            DOMAIN_DAILY,
+            &years_to_query,
+            start_dk,
+            end_dk,
+            query_daily_window_in_conn,
+        ),
+        DailyField::Seconds => read_window_years(
+            DOMAIN_DAILY,
+            &years_to_query,
+            start_dk,
+            end_dk,
+            query_daily_seconds_window_in_conn,
+        ),
+    };
     for (dk, c) in pairs {
         if let Some(e) = daily_map.get_mut(&dk) {
             *e += c;
@@ -1132,6 +1192,57 @@ pub fn chart_window_days(period: i64) -> i64 {
         0 => 30,
         n if n > 0 => n,
         _ => 7,
+    }
+}
+
+/// 最近 N 天每日活跃秒数：[(YYYY-MM-DD, 秒)]，含"这一轮没读全"。
+///
+/// 与 [`daily_counts_totals`] 是同一趟窗口机制的另一列（都走 `read_daily_pair_of`），
+/// 所以同一天在两列里的日期串、补零、缺读点名的口径完全一致。
+/// 这一列是看板「活跃时长」的出处；它**含**没采到前台应用的那段时间，
+/// 因此一定 ≥ 按应用秒数加总的排行那一格，两条读数不该互相校对。
+pub fn daily_seconds_totals(days: i64, year: Option<i32>) -> DailyTotals {
+    read_daily_pair_of(days, days, year, DailyField::Seconds).0
+}
+
+/// 看板那一页的时间范围（方案 3.2：固定这三档，只允许切范围，不做自定义看板）。
+///
+/// 缺省 `Week`（14 节第 3 项按默认执行）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashRange {
+    Today,
+    Week,
+    Month,
+}
+
+impl DashRange {
+    /// 页签上那两个字。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Today => "今日",
+            Self::Week => "本周",
+            Self::Month => "本月",
+        }
+    }
+
+    /// 这一档**含今天**一共几天，也就是既有窗口读数要的 `days` 参数。
+    ///
+    /// 为什么不新开一条 `(start, end)` 区间查询：整个查询层只认"从今天往前 N 天"或"某一天"
+    /// （窗口那一段见 `read_window_years`），而日历范围的上界永远是今天 —— 本周/本月
+    /// 恰好就等价于"含今天的 N 天"。另开一条区间 API 等于给同一件事第二把尺子，
+    /// 而后头的补零、跨年合并、缺读点名都要再走一遍。
+    ///
+    /// `today` 是**参数**而不是内部取时钟：跨月那一拍（1 号）、跨年那一周、周一与周日
+    /// 这两端都得能在用例里造出来，否则这条规则只能等日历自己走到那天才验得到。
+    /// 周起点是周一（与 `aggregate_weekday` 那一把尺子同源：它的 0 就是周一），
+    /// 周六周日不跳过（14 节第 2 项已确认）。
+    pub fn days_including_today(self, today: chrono::NaiveDate) -> i64 {
+        use chrono::Datelike;
+        match self {
+            Self::Today => 1,
+            Self::Week => today.weekday().num_days_from_monday() as i64 + 1,
+            Self::Month => today.day() as i64,
+        }
     }
 }
 
@@ -1802,6 +1913,81 @@ pub fn device_totals(days: Option<i64>, year: Option<i32>) -> DeviceTotals {
         ""
     };
     gather_device_totals(&years, cond, start_dk)
+}
+
+/// 设备登记表的行数口径：认得的设备**总数**（跨年按身份键去重）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceRegistry {
+    pub devices: i64,
+    /// 这一轮没答上来的年度库，每项形如「N 年库设备登记读不出来: 原因」。空 = 读全了。
+    pub unreadable: Vec<String>,
+}
+
+/// 单库取登记键。三态分开：没有这张表 = 这一年确实没登记过设备；读不动 ≠ 没有。
+fn query_device_keys_in_conn(conn: &Connection) -> YearRead<Vec<String>> {
+    match connection::table_presence_cached(conn, "devices") {
+        connection::Presence::No => return YearRead::NoTable,
+        connection::Presence::Unreadable(why) => return YearRead::Unreadable(why),
+        connection::Presence::Yes => {}
+    }
+    let got = (|| -> rusqlite::Result<Vec<String>> {
+        let mut stmt = conn.prepare("SELECT device_key FROM devices")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    })();
+    match got {
+        Ok(list) => YearRead::Read(list),
+        Err(e) => {
+            tracing::error!("设备登记表读不出来（SELECT device_key FROM devices）: {e}");
+            YearRead::Unreadable(format!("设备登记表读不出来: {e}"))
+        }
+    }
+}
+
+/// 认得的设备总数：`devices` 表里出现过的身份键，跨年去重，**含没起过别名的**。
+///
+/// 与 [`device_totals`] 不是一把尺子，也不是同一道问：那一把读 `device_counts`，问的是
+/// "这个窗口里有活动的设备有哪些"，窗口里没活动的设备根本不出现；KPI 那一格要的是
+/// "我一共认得几台"，与范围无关（方案 3.2.1 标的就是"否（快照）"）。
+/// 去重按 [`crate::device_alias::hardware_identity_key`]：同一台设备换过接口会在两个年度库里
+/// 各留一行，按行数相加就把它算成两台。
+/// 读不出来的那一年进 `unreadable`，**不许**折成"那一年没有设备"。
+pub fn device_registry_totals() -> DeviceRegistry {
+    let mut out = DeviceRegistry::default();
+    let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // 走 `try_` 那一条：数据目录列不出来的时候 `available_years()` 给的是空清单，
+    // 那一格就会念「0 台」—— 而 0 台设备与"这一次没问出来"在 KPI 上长得一模一样。
+    let years = match try_available_years() {
+        Ok(years) => years,
+        Err(e) => {
+            out.unreadable.push(format!("设备登记这一年没问出来: {e}"));
+            return out;
+        }
+    };
+    for year in years {
+        let gap_of = |why: String| format!("{year} 年库设备登记读不出来: {why}");
+        let path = paths::year_db_path(year);
+        match gate_year(year, &path, "设备登记") {
+            YearGate::SkipAbsent => continue,
+            YearGate::CannotTell(why) => {
+                out.unreadable.push(gap_of(why));
+                continue;
+            }
+            YearGate::Read => {}
+        }
+        match connection::with_ro_conn_why(&path, query_device_keys_in_conn) {
+            Err(why) => out.unreadable.push(gap_of(why)),
+            Ok(YearRead::Unreadable(why)) => out.unreadable.push(gap_of(why)),
+            Ok(YearRead::NoTable) => {}
+            Ok(YearRead::Read(list)) => {
+                for key in list {
+                    keys.insert(crate::device_alias::hardware_identity_key(&key));
+                }
+            }
+        }
+    }
+    out.devices = keys.len() as i64;
+    out
 }
 
 /// 查询指定日期设备维度统计。⚠ 同 [`get_device_stats`]：说不出"没读全"。
@@ -5195,6 +5381,234 @@ mod tests {
         assert_eq!(
             broken.total, 0,
             "旧写法在这里交回 0 台 / 0 次，与「今天没插设备」同形"
+        );
+    }
+
+    /// 看板「活跃时长」读的那一列：`daily_counts.seconds`，且与次数那一列共用同一趟窗口。
+    ///
+    /// 这一列此前**没有任何窗口读者**（只有写侧的单日聚合与迁移碰过它），所以这里三条腿
+    /// 都是新的：① 取的必须是 `seconds` 而不是 `count` —— 拿错列的症状是「活跃 1234 小时」，
+    /// 数字看着完全合理而整个是错的；② 窗口算术与补零必须与次数那一列同一条尺子
+    /// （问 30 天就得拿 30 个点，否则趋势与 KPI 的分母不同）；③ 读不出来的那一年要点名。
+    #[test]
+    fn the_active_seconds_column_reads_the_same_window_as_the_counts() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_dash_seconds");
+        let year = Local::now().year();
+        let today = Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let path = paths::year_db_path(year);
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE daily_counts (date_key INTEGER PRIMARY KEY, count INTEGER, seconds INTEGER);",
+            )
+            .unwrap();
+            // 两列给完全不同的量级，拿错列才不会被"看着合理"蒙过去
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 1234, 600)",
+                [day_key_of_date(today)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 1, 3600)",
+                [day_key_of_date(yesterday)],
+            )
+            .unwrap();
+        }
+        invalidate_years_cache();
+
+        let two = daily_seconds_totals(2, Some(year));
+        assert!(
+            two.unreadable.is_empty(),
+            "读得动时不该挂一句: {:?}",
+            two.unreadable
+        );
+        assert_eq!(two.series.len(), 2, "两天窗口要交回两天");
+        let sum: i64 = two.series.iter().map(|(_, v)| *v).sum();
+        assert_eq!(
+            sum, 4_200,
+            "合计必须来自 seconds 那一列（600 + 3600），不是 count: {:?}",
+            two.series
+        );
+
+        let one = daily_seconds_totals(1, Some(year));
+        assert_eq!(one.series.len(), 1, "只问一天 ⇒ 昨天不进窗口");
+        assert_eq!(one.series[0].1, 600, "窗口最后一格必须是今天");
+
+        let wide = daily_seconds_totals(30, Some(year));
+        assert_eq!(
+            wide.series.len(),
+            30,
+            "补零那条尺子必须与次数那一列共用，否则趋势与 KPI 的分母不同"
+        );
+        assert_eq!(
+            wide.series.iter().map(|(_, v)| *v).sum::<i64>(),
+            4_200,
+            "宽窗口只是把没有的那几天按 0 补上，不该重复计"
+        );
+        // 同一趟机制的另一半：问同一天的次数时，那一列读到的还是次数，两列不互相污染
+        let counts = daily_counts_totals(2, Some(year));
+        assert_eq!(
+            counts.series.iter().map(|(_, v)| *v).sum::<i64>(),
+            1_235,
+            "加了 seconds 这一列之后，次数那一列的读数不能跟着变: {:?}",
+            counts.series
+        );
+
+        // 没有这张表 = 安静按 0（与次数那一列同一口径）
+        connection::clear_ro_cache();
+        std::fs::remove_file(&path).unwrap();
+        invalidate_years_cache();
+        let absent = daily_seconds_totals(2, Some(year));
+        assert!(
+            absent.unreadable.is_empty() && absent.series.iter().all(|(_, v)| *v == 0),
+            "没有这张表是真没有数据，实得 {:?}",
+            absent.unreadable
+        );
+
+        // 库整个读不动 ⇒ 点名那一年（"0 秒"与"没读出来"不能同形）
+        std::fs::write(&path, b"this is not a sqlite database at all").unwrap();
+        connection::clear_ro_cache();
+        invalidate_years_cache();
+        let broken = daily_seconds_totals(2, Some(year));
+        assert!(
+            broken
+                .unreadable
+                .iter()
+                .any(|g| g.contains(&year.to_string()) && g.contains("读不出来")),
+            "读不出来的那一年必须点名是哪一年，实得 {:?}",
+            broken.unreadable
+        );
+        assert!(
+            broken.series.iter().all(|(_, v)| *v == 0),
+            "读不出来时交回的只是下界，而这里连下界都没有"
+        );
+
+        // 只有这一列问不出来（旧格式库里没有 `seconds` 那一列）⇒ 次数照旧是实数，
+        // 挂的那一句必须说的是秒数这一列，不能把整年判成读不出来
+        connection::clear_ro_cache();
+        std::fs::remove_file(&path).unwrap();
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            // 行必须落在窗口内（今天），否则那条"次数那一列没被连累"读的是空窗口。
+            // `execute_batch` 不吃绑定参数，所以这里的 date_key 是我们自己算出来的整数。
+            conn.execute_batch(&format!(
+                "CREATE TABLE daily_counts (date_key INTEGER PRIMARY KEY, count INTEGER);
+                 INSERT INTO daily_counts (date_key, count) VALUES ({}, 7);",
+                day_key_of_date(today)
+            ))
+            .unwrap();
+        }
+        connection::clear_ro_cache();
+        invalidate_years_cache();
+        let no_column = daily_seconds_totals(2, Some(year));
+        assert!(
+            no_column
+                .unreadable
+                .iter()
+                .any(|g| g.contains("秒数") || g.contains("seconds")),
+            "只坏在一列上时，那句话要说是哪一列，实得 {:?}",
+            no_column.unreadable
+        );
+        assert_eq!(
+            daily_counts_totals(2, Some(year))
+                .series
+                .iter()
+                .map(|(_, v)| *v)
+                .sum::<i64>(),
+            7,
+            "次数那一列不该被秒数的坏读法连累"
+        );
+    }
+
+    /// 看板「设备数」那一格：跨年按身份去重、没有表安静为 0、读不出来要点名。
+    ///
+    /// 与 `device_totals` 不是一把尺子（那把读 `device_counts`，问的是"窗口里有活动的设备"）。
+    /// 去重这条最容易错：同一台键盘换过一次接口，两个年度库里就各留一行，按行数相加
+    /// 会把一台念成两台 —— 而这正是这一格存在的意义（"我一共认得几台"）。
+    #[test]
+    fn the_device_registry_counts_distinct_identities_across_years() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("q_dash_devices");
+        let year = Local::now().year();
+        let prev = year - 1;
+        let dk = day_key_of_date(Local::now().date_naive());
+        let seed = |y: i32, keys: &[&str]| {
+            let conn = connection::open_rw(&paths::year_db_path(y)).unwrap();
+            // `available_years()` 只列"聚合表里还有行"的年份，所以每年都得摆一行聚合数据
+            conn.execute_batch(
+                "CREATE TABLE daily_counts (date_key INTEGER PRIMARY KEY, count INTEGER, seconds INTEGER);
+                 CREATE TABLE devices (id INTEGER PRIMARY KEY, device_key TEXT, name TEXT, kind TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 1, 1)",
+                [dk],
+            )
+            .unwrap();
+            for key in keys {
+                conn.execute(
+                    "INSERT INTO devices (device_key, name, kind) VALUES (?1, 'x', 'keyboard')",
+                    [*key],
+                )
+                .unwrap();
+            }
+        };
+        // 本年：同一台键盘的两个实例路径（身份都是 AAA）+ 一台鼠标 BBB
+        seed(year, &["HID#AAA#1", "HID#AAA#2", "HID#BBB#1"]);
+        // 上一年：那台键盘（又一条实例路径）+ 一台新的 CCC
+        seed(prev, &["HID#AAA#MI_02", "HID#CCC#1"]);
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+
+        let got = device_registry_totals();
+        assert!(
+            got.unreadable.is_empty(),
+            "两个库都读得动，实得 {:?}",
+            got.unreadable
+        );
+        assert_eq!(
+            got.devices, 3,
+            "四个登记行里三个身份（AAA 跨库、跨实例路径都算一台）；按行数相加会是 4"
+        );
+
+        // 有聚合行但没有 devices 表 = 那一年真没登记过设备，安静为 0、不编错误
+        connection::clear_ro_cache();
+        std::fs::remove_file(paths::year_db_path(prev)).unwrap();
+        {
+            let conn = connection::open_rw(&paths::year_db_path(prev)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE daily_counts (date_key INTEGER PRIMARY KEY, count INTEGER, seconds INTEGER);
+                 INSERT INTO daily_counts VALUES (1, 1, 1);",
+            )
+            .unwrap();
+        }
+        connection::clear_ro_cache();
+        invalidate_years_cache();
+        let no_table = device_registry_totals();
+        assert_eq!(
+            no_table.devices, 2,
+            "少了一年 ⇒ 只剩本年那三个登记行里的两个身份"
+        );
+        assert!(
+            no_table.unreadable.is_empty(),
+            "没有 devices 表是真答案，实得 {:?}",
+            no_table.unreadable
+        );
+
+        // 读不出来的那一年：点名，并且**不许**把已读到的那些当成全貌闭嘴说个总数
+        std::fs::write(paths::year_db_path(prev), b"not a database").unwrap();
+        connection::clear_ro_cache();
+        invalidate_years_cache();
+        let broken = device_registry_totals();
+        assert!(
+            broken
+                .unreadable
+                .iter()
+                .any(|g| g.contains(&prev.to_string()) && g.contains("设备登记")),
+            "读不出来的那一年必须点名，实得 {:?}",
+            broken.unreadable
         );
     }
 

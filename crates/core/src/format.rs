@@ -155,6 +155,42 @@ pub fn fmt_duration(secs: i64) -> String {
     }
 }
 
+/// 次数 → 「1.2万」或千分位（口径见看板指标那一节：`≥10000` 收成一位小数的「万」）。
+///
+/// 为什么单独一把尺子而不是让页面自己除：这一格与它下面的明细表念的是**同一个数**，
+/// 折叠规则分两处就会出现"卡片写 1.2万、榜上写 12,345"这种自己对着自己。
+/// 负数与 `i64::MIN` 不许 panic（`abs` 在那一档会溢出，所以按无符号走）。
+pub fn fmt_compact(n: i64) -> String {
+    if n.unsigned_abs() >= 10_000 {
+        let sign = if n < 0 { "-" } else { "" };
+        let v = (n as f64).abs() / 10_000.0;
+        return format!("{sign}{v:.1}万");
+    }
+    fmt_thousands(n)
+}
+
+/// 秒 → 紧凑时长：`≥1h` 用「3.2h」，`≥1m` 用「42m」，`<1m` 用「<1m」。
+///
+/// 与 [`fmt_duration`] 是**两把不同的尺子**，不是一个的两种写法：那一把给报表与命令行念
+/// 「1小时23分」，这一把给 KPI 那一格念「3.2h」（一格放不下一句中文时长）。
+/// 分两处定义而不是一处派生另一处，是因为它们的舍入方向本来就不同
+/// （「1小时23分」要的是分解，「3.2h」要的是一位小数）。
+///
+/// 不足一分钟必须念「<1m」而不是「0m」：同一屏上按键数写着 40 次而活跃时长写着 0m，
+/// 读到的第一反应是"这时长没统计上"，而它其实只是一段不到一分钟的活动。
+pub fn fmt_compact_duration(secs: i64) -> String {
+    if secs >= 3600 {
+        return format!("{:.1}h", secs as f64 / 3600.0);
+    }
+    if secs >= 60 {
+        return format!("{}m", secs / 60);
+    }
+    if secs > 0 {
+        return "<1m".to_string();
+    }
+    "0m".to_string()
+}
+
 /// CSV 字段转义：含逗号/引号/换行时加引号并将内部引号双写；
 /// `=`/`+`/`-`/`@`/Tab/CR 开头加前导单引号，防止 Excel 公式注入。
 ///
@@ -232,12 +268,53 @@ mod tests {
         );
     }
 
+    /// 千分位格式化
     #[test]
     fn thousands_formatter() {
         assert_eq!(fmt_thousands(0), "0");
         assert_eq!(fmt_thousands(1000), "1,000");
         assert_eq!(fmt_thousands(1234567), "1,234,567");
         assert_eq!(fmt_thousands(-500), "-500");
+    }
+
+    /// 「1.2万」那一档的折叠边界。
+    ///
+    /// 期望值全部手算（方案 3.2.1 口径第 4 条写的是 `≥10000` 用「1.2万」），
+    /// 不拿被测函数自己算：那样一改折叠规则判据就跟着一起变，红不了。
+    #[test]
+    fn compact_numbers_collapse_only_at_ten_thousand() {
+        assert_eq!(fmt_compact(0), "0");
+        assert_eq!(fmt_compact(9_999), "9,999", "差一个数就换写法，边界要钉住");
+        assert_eq!(fmt_compact(10_000), "1.0万", "正好一万要折叠，不是 10,000");
+        assert_eq!(fmt_compact(12_345), "1.2万");
+        // 一位小数是**四舍五入**：99999 = 9.9999 万 → 进位成 10.0 万（不是截成 9.9）
+        assert_eq!(fmt_compact(99_999), "10.0万");
+        assert_eq!(fmt_compact(-12_345), "-1.2万", "负数不能丢掉符号");
+        // `i64::MIN` 那一档：`fmt_thousands` 走的是 `n.abs()`，在那里会溢出 panic；
+        // 这一条走的是无符号判据 + f64，必须活着回来（release 是 panic=abort）
+        let extreme = fmt_compact(i64::MIN);
+        assert!(
+            extreme.starts_with('-') && extreme.ends_with('万'),
+            "{extreme}"
+        );
+    }
+
+    /// 紧凑时长：`≥1h` 一位小数小时、`≥1m` 分钟、不足一分钟**不许念 0m**。
+    ///
+    /// 「0m」那一档是这条尺子存在的理由：KPI 一行里「按键总数 42」与「活跃时长 0m」
+    /// 同时出现，读到的第一反应是"时长没统计上"，而它真的只是一段不到一分钟的活动
+    /// （本仓那条「同一页不许自己对着说」的规矩）。
+    #[test]
+    fn compact_durations_split_at_an_hour_and_never_write_a_false_zero() {
+        assert_eq!(fmt_compact_duration(0), "0m", "一秒都没有才是 0m");
+        assert_eq!(fmt_compact_duration(45), "<1m");
+        assert_eq!(fmt_compact_duration(59), "<1m");
+        assert_eq!(fmt_compact_duration(60), "1m");
+        assert_eq!(fmt_compact_duration(2_520), "42m", "方案里写的那个例子");
+        assert_eq!(fmt_compact_duration(3_599), "59m", "差一秒还不是一小时");
+        assert_eq!(fmt_compact_duration(3_600), "1.0h");
+        assert_eq!(fmt_compact_duration(11_520), "3.2h");
+        assert_eq!(fmt_compact_duration(-5), "0m", "坏数据不许念成负时长");
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod app_stats;
 pub mod autostart;
 pub mod capture;
 pub mod config;
+pub mod dashboard;
 pub mod data_location;
 pub mod db;
 pub mod device_alias;
