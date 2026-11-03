@@ -2173,14 +2173,16 @@ impl App {
                         SItem::Basic(Basic::ClosePins) => self.close_pins(hwnd),
                         SItem::Basic(Basic::WeeklyReport) => self.make_weekly_report(hwnd),
                         SItem::Basic(Basic::Floating) => {
-                            toggle_floating(hwnd, None);
+                            self.status = Some(toggle_floating(hwnd, None));
                             unsafe {
                                 let _ = InvalidateRect(Some(hwnd), None, false);
                             }
                         }
                         SItem::Basic(Basic::Collector) => self.toggle_collector(hwnd),
                         SItem::Basic(Basic::Pause) => self.toggle_pause(hwnd),
-                        SItem::Basic(Basic::Theme) => toggle_theme(hwnd),
+                        SItem::Basic(Basic::Theme) => {
+                            self.status = Some(toggle_theme(hwnd));
+                        }
                         SItem::Basic(Basic::DataDir) => self.open_data_dir(),
                         SItem::Setting(i) => {
                             // 先问值框右沿那颗小钮：点它不该顺手把值框打开。
@@ -2202,24 +2204,19 @@ impl App {
                                         } else {
                                             String::new()
                                         };
-                                        match focusflow_core::config::instance()
-                                            .set(section, key, &v)
-                                        {
-                                            Ok(()) => {
-                                                let msg = self.reload_hotkeys();
-                                                // 这句留着 `key = 值` 那个 ASCII 形状（与
-                                                // `register_combo` 同一形状）：验收脚本只能匹配
-                                                // ASCII，中文夹在中间它就逮不到。
-                                                tracing_note(&format!(
-                                                    "热键 {key} = {v:?} 由值框右边那颗钮改过：{msg}"
-                                                ));
-                                                self.status = Some(msg);
-                                            }
-                                            Err(e) => {
-                                                tracing_note(&format!("热键 {key} 写入失败：{e}"));
-                                                self.status = Some(format!("热键没改：{e}"));
-                                            }
-                                        }
+                                        let note = config_write_note(
+                                            &format!("热键 {key}"),
+                                            focusflow_core::config::instance()
+                                                .set_now(section, key, &v),
+                                        );
+                                        let msg = self.reload_hotkeys();
+                                        // 这句留着 `key = 值` 那个 ASCII 形状（与
+                                        // `register_combo` 同一形状）：验收脚本只能匹配
+                                        // ASCII，中文夹在中间它就逮不到。
+                                        tracing_note(&format!(
+                                            "热键 {key} = {v:?} 由值框右边那颗钮改过：{msg}"
+                                        ));
+                                        self.status = Some(format!("{msg}{note}"));
                                         self.refresh_now();
                                         unsafe {
                                             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2655,13 +2652,11 @@ impl App {
         let mut msg = self.reload_hotkeys();
         msg.push_str(&config_write_note(
             "全局热键总开关",
-            focusflow_core::config::instance()
-                .set(
-                    "hotkey",
-                    "enabled",
-                    if self.hotkeys_on { "true" } else { "false" },
-                )
-                .map_err(|e| e.to_string()),
+            focusflow_core::config::instance().set_now(
+                "hotkey",
+                "enabled",
+                if self.hotkeys_on { "true" } else { "false" },
+            ),
         ));
         tracing_note(&msg);
         self.status = Some(msg);
@@ -2727,18 +2722,14 @@ impl App {
             }
             return true;
         }
-        match focusflow_core::config::instance().set(section, key, &combo) {
-            Ok(()) => {
-                let msg = self.reload_hotkeys();
-                tracing_note(&format!("热键 {key} = {combo:?} 由按下录入写入：{msg}"));
-                self.status = Some(msg);
-                self.refresh_now();
-            }
-            Err(e) => {
-                tracing_note(&format!("热键 {key} 录入写入失败：{e}"));
-                self.status = Some(format!("热键没改：{e}"));
-            }
-        }
+        let note = config_write_note(
+            &format!("热键 {key}"),
+            focusflow_core::config::instance().set_now(section, key, &combo),
+        );
+        let msg = self.reload_hotkeys();
+        tracing_note(&format!("热键 {key} = {combo:?} 由按下录入写入：{msg}"));
+        self.status = Some(format!("{msg}{note}"));
+        self.refresh_now();
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
@@ -2760,32 +2751,23 @@ impl App {
             collect::is_started(),
         ) {
             collect::CollectorAction::Stop => {
-                let note = config_write_note(
-                    "采集开关",
-                    cfg.set("collector", "enabled", "false")
-                        .map_err(|e| e.to_string()),
-                );
+                let note =
+                    config_write_note("采集开关", cfg.set_now("collector", "enabled", "false"));
                 collect::stop_listening();
                 format!("采集已停用：键鼠与设备计数已停，重启后彻底退出{note}")
             }
             collect::CollectorAction::StartFresh => match collect::start(cfg) {
                 Ok(()) => {
-                    let note = config_write_note(
-                        "采集开关",
-                        cfg.set("collector", "enabled", "true")
-                            .map_err(|e| e.to_string()),
-                    );
+                    let note =
+                        config_write_note("采集开关", cfg.set_now("collector", "enabled", "true"));
                     format!("{ON_MSG}{note}")
                 }
                 Err(e) => format!("采集没起来：{e}"),
             },
             collect::CollectorAction::Resume => match collect::resume_listening() {
                 Ok(()) => {
-                    let note = config_write_note(
-                        "采集开关",
-                        cfg.set("collector", "enabled", "true")
-                            .map_err(|e| e.to_string()),
-                    );
+                    let note =
+                        config_write_note("采集开关", cfg.set_now("collector", "enabled", "true"));
                     format!("{ON_MSG}{note}")
                 }
                 Err(e) => format!("采集没起来：{e}"),
@@ -3393,13 +3375,19 @@ impl App {
         });
         if let Some((section, key, cur)) = row {
             let next = if cur == "true" { "false" } else { "true" };
-            match focusflow_core::config::instance().set(section, key, next) {
-                Ok(()) => {
-                    self.refresh_now();
-                    tracing_note(&format!("设置已切换 {section}.{key}={next}"));
-                }
-                Err(e) => tracing_note(&format!("设置写入失败 {section}.{key}: {e}")),
-            }
+            // 当场落盘并问一次结局：`config::set` 恒回 `Ok(())`（真正写盘的是另一头的去抖
+            // 线程），拿它的 `Err` 分支当"没写进去"永远是死路 —— 屏上读的是刚改的内存值，
+            // `config.ini` 里还是老一档，两边分家要到下一次开机才露出来。
+            let note = config_write_note(
+                &format!("{section}.{key}"),
+                focusflow_core::config::instance().set_now(section, key, next),
+            );
+            // 没落成也照样刷：内存里的值确实变了，这一格当场要显示新状态，
+            // 而"只到本次运行"由那句 note 说清楚。
+            self.refresh_now();
+            let msg = format!("设置已切换 {section}.{key}={next}{note}");
+            self.status = Some(msg.clone());
+            tracing_note(&msg);
         }
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -3477,18 +3465,25 @@ impl App {
                                     (true, _) => default,
                                     (false, _) => value,
                                 };
-                                match focusflow_core::config::instance().set(section, key, &v) {
-                                    Ok(()) => {
-                                        if section == "hotkey" {
-                                            let msg = self.reload_hotkeys();
-                                            self.status = Some(msg);
-                                        }
-                                        self.refresh_now();
-                                        tracing_note(&format!("设置已写入 {section}.{key}={v:?}"));
-                                    }
-                                    Err(err) => tracing_note(&format!(
-                                        "设置写入失败 {section}.{key}: {err}"
-                                    )),
+                                // 与 `toggle_setting` 同一把尺子：当场落盘、当场问结局。
+                                // 这一支从前也写着 `Err` 分支，而 `config::set` 恒回 `Ok`，
+                                // 那句"设置写入失败"永远走不到；热键那几行还会顺手把
+                                // `reload_hotkeys` 的话盖在状态行上，看着像已经记住了。
+                                let note = config_write_note(
+                                    &format!("{section}.{key}"),
+                                    focusflow_core::config::instance().set_now(section, key, &v),
+                                );
+                                if section == "hotkey" {
+                                    let mut msg = self.reload_hotkeys();
+                                    msg.push_str(&note);
+                                    self.status = Some(msg);
+                                } else {
+                                    self.status =
+                                        Some(format!("设置已写入 {section}.{key}={v:?}{note}"));
+                                }
+                                self.refresh_now();
+                                if let Some(s) = &self.status {
+                                    tracing_note(s);
                                 }
                             }
                         }
@@ -9897,41 +9892,54 @@ fn publish_floating(snap: &Snapshot) {
 ///
 /// 写的是 `[floating] enabled`，所以"关掉"能跨重启记住；但**不要求重启**：
 /// 开关这一下就把卡片显示/藏起来（与旧版同一个口径）。
-fn toggle_floating(main: HWND, want: Option<bool>) -> bool {
+///
+/// ⚠ 「能跨重启记住」这句以前只是承诺：写盘走 `config::set`，它恒回 `Ok(())`（真写的是
+/// 另一头的去抖线程），落没落成这里问不出来，而去抖线程死了以后**每一次**改动都不落盘。
+/// 现在走 `set_now` 当场验一次，结局拼进交回的那句状态话（`config_write_note`）。
+/// 交回给状态行那一句话，说的是"屏上真出现的状态"：显示那一步没成就不念"显示"。
+fn toggle_floating(main: HWND, want: Option<bool>) -> String {
     let want = want.unwrap_or(!floating::is_visible());
     let cfg = focusflow_core::config::instance();
-    if let Err(e) = cfg.set("floating", "enabled", if want { "true" } else { "false" }) {
-        tracing_note(&format!("悬浮窗开关写配置失败：{e}"));
-    }
+    let note = config_write_note(
+        "悬浮窗开关",
+        cfg.set_now("floating", "enabled", if want { "true" } else { "false" }),
+    );
     if want && !floating::is_alive() {
         // 线程第一次就没起来（或已经关掉）时，再点一次要真的能起回来。
         if let Err(e) = floating::spawn(main) {
-            tracing_note(&format!("悬浮窗重启失败：{e}"));
-            return false;
+            let msg = format!("悬浮窗起不来：{e}{note}");
+            tracing_note(&msg);
+            return msg;
         }
     }
     let _ = floating::set_visible(want);
-    let visible = floating::is_visible();
-    tracing_note(if want {
-        "悬浮窗：显示"
-    } else {
-        "悬浮窗：隐藏"
-    });
-    visible
+    let msg = format!(
+        "悬浮窗：{}{note}",
+        if floating::is_visible() {
+            "显示"
+        } else {
+            "隐藏"
+        }
+    );
+    tracing_note(&msg);
+    msg
 }
 
 /// 深色 / 浅色切换（设置页那一行）。写 `[gui] theme`，当下重画，悬浮窗也立刻换色。
-fn toggle_theme(hwnd: HWND) {
+///
+/// 与 [`toggle_floating`] 同一口径：当场落盘、把结局拼进交回的那句状态话（这一项重启后
+/// 才生效的项另说，屏上念的是本次运行里的样子）。
+fn toggle_theme(hwnd: HWND) -> String {
     let next = if theme_name().trim() == "dark" {
         "light"
     } else {
         "dark"
     };
     let cfg = focusflow_core::config::instance();
-    match cfg.set("gui", "theme", next) {
-        Ok(()) => tracing_note(&format!("主题已切换：{next}")),
-        Err(e) => tracing_note(&format!("主题写入失败：{e}")),
-    }
+    let msg = format!(
+        "主题已切换：{next}{}",
+        config_write_note("主题", cfg.set_now("gui", "theme", next))
+    );
     // 标题栏是非客户区，不归 D2D 管：深浅得单独告诉 DWM 一次。
     apply_title_theme(hwnd);
     // 悬浮窗自己每秒重读配置，这里催一帧让它当场变色（与主界面同一刻）。
@@ -9939,6 +9947,8 @@ fn toggle_theme(hwnd: HWND) {
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
+    tracing_note(&msg);
+    msg
 }
 
 /// 退出：托盘菜单与验收消息共用这一条。顺序有讲究 —— 先收卡片，再停采集并落库
@@ -10467,7 +10477,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         }
                     }
                     "floating" => {
-                        toggle_floating(hwnd, None);
+                        let msg = toggle_floating(hwnd, None);
+                        // 托盘那一下点在主窗口之外：状态行要落在主窗口上，下次开窗才看得见。
+                        if let Some(app) = unsafe { app_ptr(hwnd) } {
+                            app.status = Some(msg);
+                        }
                         unsafe {
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
@@ -12141,10 +12155,14 @@ mod hotkey_tests {
 
     /// 配置写不进持久化队列那句"这次没落盘"必须带到状态行上。
     ///
-    /// 两半各钉一条：①纯函数那一半钉**空串那一支也要**（写进去了就多一个字都不许说），
+    /// 三条腿：①纯函数那一半钉**空串那一支也要**（写进去了就多一个字都不许说），
     /// 只钉"出现过 `没写进` 三个字"的判据盯不到把 `Ok` 也念成出错的改法；
-    /// ②接线那一半钉落点：`config::set` 的结局不许再折进 `let _ =` —— 这一族的病状是
-    /// 屏上那一格读运行时、`config.ini` 读的是老一档，两边分家要到下一次开机才露出来。
+    /// ②接线那一半钉落点数目；③**钉喂给它的是哪一次调用** —— 这一半是这一笔补上的：
+    /// `config::set` 恒回 `Ok(())`（它只改内存 + 叫醒去抖线程），把它的结局喂给
+    /// `config_write_note` 时那个 `Err` 分支是**死路**，屏上那句"这次没落盘"永远说不出口，
+    /// 而上一笔的判据照样绿。能落盘的只有当场走完 `save()` 的 `set_now`，
+    /// 所以形状要钉到那一个名字上（`arrange_data_move` 是另一条已经自己补了 save 的路，
+    /// 它的写法是 `cfg.set(...)` + 紧随的 `cfg.save()`，不在这三条判据的射程里，也不该在）。
     #[test]
     fn a_config_write_that_failed_is_said_out_loud() {
         assert_eq!(config_write_note("全局热键总开关", Ok(())), "");
@@ -12166,19 +12184,30 @@ mod hotkey_tests {
             .flat_map(|l| l.chars())
             .filter(|c| !c.is_whitespace())
             .collect();
-        for forbidden in ["let_=cfg.set(", "let_=focusflow_core::config::instance()"] {
+        for forbidden in [
+            "let_=cfg.set(",
+            "let_=focusflow_core::config::instance()",
+            "::instance().set(",
+        ] {
             assert_eq!(
                 flat.matches(forbidden).count(),
                 0,
                 "又一处把写盘结局折掉了：{forbidden}"
             );
         }
-        // 定义那一行也算一次命中：总开关一颗 + 采集三条 + 定义 = 五处。
+        // 十颗用户手势的写点（总开关一颗 + 采集三条 + 开关行 + 值框提交 + 悬浮窗 + 主题
+        // + 热键那颗钮 + 按下录入）各喂一次 `set_now`，加上定义那一行 = 十一处。
         assert_eq!(
             flat.matches("config_write_note(").count(),
-            5,
+            11,
             "落点数目变了，实得 {}",
             flat.matches("config_write_note(").count()
+        );
+        assert_eq!(
+            flat.matches("set_now(").count(),
+            10,
+            "写点没都换成能问出结局的那一条调用，实得 {}",
+            flat.matches("set_now(").count()
         );
     }
 

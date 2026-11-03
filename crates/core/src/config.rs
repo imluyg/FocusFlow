@@ -1055,6 +1055,23 @@ impl FocusFlowConfig {
         Ok(())
     }
 
+    /// 改一处配置并**当场落盘**，把落盘的结局交回调用方。
+    ///
+    /// 为什么不能拿 `set()` 的返回值当"这次改动落没落成"：那条永远回 `Ok(())` —— 它只改
+    /// 内存 + 叫醒去抖线程，`send` 失败也只 `warn_saver_dead_once()` 一行日志。于是界面上
+    /// 「已停用（重启后彻底退出）」「关掉能跨重启记住」这类话从来问不出真假：保存线程没了、
+    /// 或 `config.ini` 那个位置成了目录 ⇒ 盘上一个字没变，而屏上一切正常，到下一次开机才露出来。
+    ///
+    /// 用户点一下开关是**一次可等的写**：这里同步走一遍 `save()`，把真的结局给出去。
+    /// 并发安全与去抖线程共用同一把 `SAVE_WRITE_LOCK`（旧快照盖掉新值那一族由它挡），
+    /// 写失败时待写标记照旧保住（`save_inner` 的 `?` 在摘除之前返回），退出前那次强制
+    /// save 还会再试一次。⚠ 高频那一路（悬浮窗拖动每动一下都写坐标）**留在 `set()`**：
+    /// 别把整文件重写搬进鼠标消息里。
+    pub fn set_now(&self, section: &str, key: &str, value: &str) -> Result<(), String> {
+        self.set_local(section, key, value);
+        self.save().map_err(|e| format!("{e:#}"))
+    }
+
     /// `set()` 的前半步：只改内存 + 记上"这一处是本进程改的"，不叫醒全局去抖保存线程。
     ///
     /// 单测走这条：那条线程写的是 `instance()` 的路径，而测试用的是自己的临时目录 ——
@@ -1249,6 +1266,40 @@ mod tests {
             cfg.last_save_error(),
             None,
             "落成了还留着失败原因＝界面永远红着"
+        );
+    }
+
+    /// `set_now` 交回的是"文件真拿到这个值没有"，而 `set()` 问不出来（它恒回 `Ok`）。
+    ///
+    /// 夹具与上面那条同一族：把目标位置换成**同名目录**，rename 必然失败。三条腿各盯一件事：
+    /// 落不了盘必须回错误、那一句不许是空串（空串到界面上等于什么都没说）、
+    /// 障碍清掉之后同一句调用要成功**并且文件里读得到新值** —— 只断"回 `Ok`"的判据
+    /// 盯不住"内存改了而盘上没动"那一半，而那一半正是这处缺陷的病状。
+    #[test]
+    fn set_now_reports_whether_the_file_got_the_value() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("cfg_set_now");
+        let path = app.path().join("config.ini");
+        std::fs::write(&path, "[gui]\ntheme = dark\n").unwrap();
+        let cfg = FocusFlowConfig::load(&path).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let err = cfg
+            .set_now("gui", "theme", "light")
+            .expect_err("config.ini 的位置上是一个目录，set_now 不许回 Ok");
+        assert!(
+            !err.trim().is_empty(),
+            "回了错误但那是个空串，屏上拿它拼不出话（OS 原因: {err}）"
+        );
+
+        std::fs::remove_dir_all(&path).unwrap();
+        cfg.set_now("gui", "theme", "light")
+            .expect("障碍挪走之后同一句调用应当成功");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("light"),
+            "set_now 说成功了，文件里却读不到那个新值（屏上从此以为改完了）: {on_disk}"
         );
     }
 
