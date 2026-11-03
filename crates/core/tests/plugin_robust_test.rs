@@ -34,7 +34,9 @@ mod tests {
 
         // 加载所有插件
         for f in manager.discover_paths().expect("内置插件目录该读得动") {
-            manager.load_plugin(&f).unwrap();
+            manager
+                .load_plugin(&f, focusflow_core::plugins::PluginSource::Builtin)
+                .unwrap();
         }
         assert!(!manager.get_all_plugins().is_empty());
 
@@ -55,7 +57,9 @@ mod tests {
                 assert!(manager.unload_plugin(name), "卸载 {name}");
             }
             for f in manager.discover_paths().expect("内置插件目录该读得动") {
-                manager.load_plugin(&f).unwrap();
+                manager
+                    .load_plugin(&f, focusflow_core::plugins::PluginSource::Builtin)
+                    .unwrap();
             }
         }
 
@@ -80,7 +84,9 @@ mod tests {
         let database = db::Database::init_readonly();
         let mut manager = PluginManager::new(config, database);
         for f in manager.discover_paths().expect("内置插件目录该读得动") {
-            manager.load_plugin(&f).unwrap();
+            manager
+                .load_plugin(&f, focusflow_core::plugins::PluginSource::Builtin)
+                .unwrap();
         }
 
         // 向番茄钟插件投递按键（无 record_key 的插件应安全忽略）

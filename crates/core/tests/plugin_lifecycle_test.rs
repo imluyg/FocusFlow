@@ -67,13 +67,15 @@ fn unloading_one_scheduler_user_keeps_it_running_for_the_others() {
     let b = write_plugin(tmp.path(), "sched_b", &scheduler_user("调度乙"));
     let (mut pm, _) = manager_in(tmp.path());
 
-    pm.load_plugin(&a).expect("加载甲失败");
+    pm.load_plugin(&a, focusflow_core::plugins::PluginSource::Builtin)
+        .expect("加载甲失败");
     assert_eq!(
         host::scheduler_state_for_test(),
         Some(1),
         "甲用过之后应当在跑"
     );
-    pm.load_plugin(&b).expect("加载乙失败");
+    pm.load_plugin(&b, focusflow_core::plugins::PluginSource::Builtin)
+        .expect("加载乙失败");
     assert_eq!(
         host::scheduler_state_for_test(),
         Some(2),
@@ -111,7 +113,8 @@ function get_view() return { title = "t", widgets = { {type="label", text="v"} }
     let p = write_plugin(tmp.path(), "pomo_reload", body);
     let (mut pm, _) = manager_in(tmp.path());
 
-    pm.load_plugin(&p).expect("加载失败");
+    pm.load_plugin(&p, focusflow_core::plugins::PluginSource::Builtin)
+        .expect("加载失败");
     // 计时线程每秒 tick 一次，elapsed 要到 ≥1 秒才会真的落一条会话记录
     std::thread::sleep(std::time::Duration::from_millis(1400));
 
@@ -156,7 +159,9 @@ end
 "###;
     let p = write_plugin(tmp.path(), "action_view", body);
     let (mut pm, _) = manager_in(tmp.path());
-    let name = pm.load_plugin(&p).expect("加载失败");
+    let name = pm
+        .load_plugin(&p, focusflow_core::plugins::PluginSource::Builtin)
+        .expect("加载失败");
 
     assert!(
         pm.plugin_action(&name, "go").is_ok(),
@@ -252,8 +257,14 @@ fn duplicate_plugin_name_is_rejected_instead_of_evicting() {
     );
     let (mut pm, _) = manager_in(tmp.path());
 
-    assert_eq!(pm.load_plugin(&first).expect("加载甲失败"), "撞名");
-    let err = pm.load_plugin(&second).expect_err("撞名的第二个应当被拒");
+    assert_eq!(
+        pm.load_plugin(&first, focusflow_core::plugins::PluginSource::Builtin)
+            .expect("加载甲失败"),
+        "撞名"
+    );
+    let err = pm
+        .load_plugin(&second, focusflow_core::plugins::PluginSource::Builtin)
+        .expect_err("撞名的第二个应当被拒");
     assert!(err.contains("重名"), "{err}");
     assert_eq!(
         pm.get_plugin("撞名").map(|p| p.file_path.clone()),
@@ -364,7 +375,8 @@ end
 "###,
     );
     let (mut pm, _) = manager_in(tmp.path());
-    pm.load_plugin(&p).expect("加载这个插件本该成功");
+    pm.load_plugin(&p, focusflow_core::plugins::PluginSource::Builtin)
+        .expect("加载这个插件本该成功");
 
     let mut first_fail: Option<(u32, String)> = None;
     for k in 1..=60u32 {
@@ -405,7 +417,8 @@ end
 "###,
     );
     let (mut pm, _) = manager_in(tmp.path());
-    pm.load_plugin(&p).expect("加载本身不该失败");
+    pm.load_plugin(&p, focusflow_core::plugins::PluginSource::Builtin)
+        .expect("加载本身不该失败");
     assert!(
         pm.refresh_view("自引用控件").is_ok(),
         "渲染必须能返回，而不是把栈打穿"

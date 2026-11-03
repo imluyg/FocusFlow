@@ -14,6 +14,7 @@ use focusflow_core::config::FocusFlowConfig;
 use focusflow_core::db;
 use focusflow_core::paths;
 use focusflow_core::plugins::host;
+use focusflow_core::plugins::PluginSource;
 use mlua::Lua;
 use std::path::Path;
 
@@ -289,5 +290,219 @@ fn the_store_subtable_exposes_every_verb() {
     assert_eq!(
         missing, "",
         "focusflow.store 这一格里缺动词（或少了整格）: {missing}"
+    );
+}
+
+// ---- 两个视图（方案 3.4、路线图 P1 第 15 步、验收用例 14）----
+
+/// 建一份真环境，列出 `focusflow` 的键名；`extension` 为真时先过一道收口。
+///
+/// 交回 `Lua` 本身：用例还要在那个环境里问 `type(focusflow.xxx)`，而键名清单不足以说明
+/// 「摘掉之后剩下的那一组还能不能调」。
+fn view_names(dir: &Path, owner: &str, extension: bool) -> (Vec<String>, Lua) {
+    let config: &'static FocusFlowConfig = Box::leak(Box::new(
+        FocusFlowConfig::load(dir.join("config.ini")).expect("读取 config.ini 失败"),
+    ));
+    let lua = Lua::new();
+    let api = host::register_host_api(&lua, config, db::Database::init_readonly(), owner)
+        .expect("注册宿主 API 失败");
+    if extension {
+        host::hide_builtin_only_api(&api).expect("收口失败");
+    }
+    let names: Vec<String> = lua
+        .load(
+            "local out = {} for k in pairs(focusflow) do out[#out + 1] = k end table.sort(out) return out",
+        )
+        .eval()
+        .expect("列出 focusflow 表的键名失败");
+    (names, lua)
+}
+
+/// 量具腿（**期望为绿**）：全量视图里必须看得见内置专属那一组。
+///
+/// 这一条不测产品，测的是"列举真的列得出东西"。没有它，下面那条收口用例可以靠
+/// 「键名列举坏掉 ⇒ 两视图都是空 ⇒ 相等」假绿过去 —— 本文件顶部那条反向断言就是为同样的
+/// 形状写的，这里把它拆成单独一条，好让红点说得清是量具坏了还是边界没了。
+#[test]
+fn the_full_view_still_ships_the_builtin_only_apis() {
+    let _g = round7::guard();
+    let app = common::isolated_app_dir("view_full");
+    let (names, _lua) = view_names(app.path(), "view_full", false);
+    for anchor in [
+        "pomodoro_state",
+        "accounting_add",
+        "scheduler_tasks",
+        "edge_counts",
+    ] {
+        assert!(
+            names.iter().any(|n| n == anchor),
+            "全量视图里连 {anchor} 都没有 ⇒ 是注册或列举环节坏了: {names:?}"
+        );
+    }
+    assert!(
+        names.len() >= 40,
+        "全量视图只列出 {} 个键名，审计本身失效: {names:?}",
+        names.len()
+    );
+}
+
+/// 扩展视图必须**正好**剩下通用那一组（3.4），而且多出来的一个都不许漏。
+///
+/// 三条腿各有分工，缺一条就是假绿：
+/// · 相等那条防"少摘"（漏摘一组内置 API）与"多摘"（把 `store` 摘没了）两个方向；
+/// · `is_builtin_only_api` 那条防"新加一个不带内置前缀、又不该给扩展用的 API"——
+///   名字不在通用清单里、又不带前缀，收口按前缀摘不到它，而相等那条会红，
+///   这一条负责把红点指到"哪一侧"这个具体问题上；
+/// · 最后一条问的是**类型**：`nil` 与"存在但不是函数"（写错成一个值）是两个不同的病。
+#[test]
+fn the_extension_view_leaves_only_the_general_apis() {
+    let _g = round7::guard();
+    let app = common::isolated_app_dir("view_extension");
+    let (full, _full_lua) = view_names(app.path(), "view_extension", false);
+    let (kept, lua) = view_names(app.path(), "view_extension", true);
+
+    let mut want = host::EXTENSION_API_NAMES.to_vec();
+    want.sort();
+    assert_eq!(
+        kept, want,
+        "扩展视图的键集不等于通用清单（少了 = 摘过头，多了 = 摘不够）。实得: {kept:?}"
+    );
+
+    let leaked: Vec<&String> = kept
+        .iter()
+        .filter(|n| host::is_builtin_only_api(n))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "扩展视图里还留着按前缀判为内置专属的 API: {leaked:?}"
+    );
+
+    let removed = full
+        .iter()
+        .filter(|n| !kept.contains(n))
+        .collect::<Vec<_>>();
+    assert!(
+        removed.len() >= 40,
+        "收口只摘掉 {} 个键名，内置专属那一组有 45 个量级 —— 八成是前缀规则没覆盖到: {removed:?}",
+        removed.len()
+    );
+
+    let not_nil: String = lua
+        .load(
+            r#"
+            local want = { "pomodoro_state", "accounting_add", "scheduler_tasks", "edge_counts" }
+            local out = {}
+            for _, k in ipairs(want) do
+                if focusflow[k] ~= nil then out[#out + 1] = k .. "=" .. type(focusflow[k]) end
+            end
+            if type(focusflow.store) ~= "table" then out[#out + 1] = "store 整格没了" end
+            if type(focusflow.stats) ~= "function" then out[#out + 1] = "stats 不是函数" end
+            return table.concat(out, ",")
+            "#,
+        )
+        .eval()
+        .expect("这一段 Lua 跑不通");
+    assert_eq!(
+        not_nil, "",
+        "扩展视图里这些名字还在（或通用能力被摘坏了）: {not_nil}"
+    );
+}
+
+/// 一份把"看得见哪些 API"写进视图的插件：文本就是观测值。
+fn visibility_lua(body: &str) -> String {
+    format!(
+        "PLUGIN_NAME = \"{}\"\n\
+         function get_view()\n\
+           local seen = {{}}\n\
+           for _, k in ipairs({{ \"accounting_add\", \"pomodoro_state\", \"scheduler_tasks\", \"edge_counts\" }}) do\n\
+             if focusflow[k] ~= nil then seen[#seen + 1] = k end\n\
+           end\n\
+           local ok = type(focusflow.log) == \"function\"\n\
+           return {{ title = \"t\", widgets = {{ {{ type = \"label\", text = (#seen .. \"|\" .. tostring(ok) .. \"|\" .. table.concat(seen, \",\")) }} }} }}\n\
+         end\n",
+        body
+    )
+}
+
+/// 读一份视图里那颗 label 的文本。
+fn label_of(manager: &focusflow_core::plugins::PluginManager, name: &str) -> String {
+    manager
+        .get_plugin(name)
+        .and_then(|p| p.view.as_ref())
+        .and_then(|v| v.widgets.first())
+        .map(|w| match w {
+            focusflow_core::plugins::Widget::Label(t) => t.clone(),
+            other => format!("<不是 label: {other:?}>"),
+        })
+        .unwrap_or_else(|| "<没有视图>".to_string())
+}
+
+/// 经管理器加载时，来源决定看得见哪一组（3.4 的落地那一半）。
+///
+/// 为什么不只测上一条纯函数：上一条核的是 `hide_builtin_only_api` 自己，而**接线**才是缺陷所在 ——
+/// 管理器传错来源、或者只在 `load_all` 那条路上传对，插件页那颗「启用」和热重载就会走另一条。
+/// 两条臂各钉一边：用户臂钉"摘了"，内置臂钉"没多摘"（少了后者，把整条链都摘空也能全绿）。
+#[test]
+fn the_manager_hides_builtin_apis_only_for_user_plugins() {
+    let _g = round7::guard();
+    let app = common::isolated_app_dir("view_by_source");
+    let config: &'static FocusFlowConfig = Box::leak(Box::new(
+        FocusFlowConfig::load(app.path().join("config.ini")).expect("读取 config.ini 失败"),
+    ));
+    for (tag, source, want) in [
+        ("user", PluginSource::User, "0|true|"),
+        (
+            "builtin",
+            PluginSource::Builtin,
+            "4|true|accounting_add,pomodoro_state,scheduler_tasks,edge_counts",
+        ),
+    ] {
+        let dir = app.path().join(format!("plugins_{tag}"));
+        std::fs::create_dir_all(&dir).expect("建临时插件目录");
+        let file = dir.join(format!("{tag}_probe.lua"));
+        std::fs::write(&file, visibility_lua(&format!("{tag}_probe"))).expect("写夹具插件");
+        let mut manager =
+            focusflow_core::plugins::PluginManager::new(config, db::Database::init_readonly());
+        manager
+            .load_plugin(&file, source)
+            .unwrap_or_else(|e| panic!("{tag} 臂加载失败: {e}"));
+        let got = label_of(&manager, &format!("{tag}_probe"));
+        assert_eq!(
+            got, want,
+            "{tag} 臂（{source:?}）看到的内置专属 API 数量不对"
+        );
+    }
+}
+
+/// 热重载不许把边界洗掉：来源留在条目上，重载一次不该还回内置专属那一组。
+///
+/// 这一条是上一条管不到的那一半：重载的入参只有键（文件名/展示名），来源必须从**已加载的那份**
+/// 带过来。写成"重载时重新扫目录"看着也行，但那一刻目录可能正读不动 —— 读不动就退回全量视图，
+/// 症状是"改了个文件，沙箱边界没了"，而屏上什么都正常。
+#[test]
+fn reloading_a_user_plugin_keeps_the_extension_view() {
+    let _g = round7::guard();
+    let app = common::isolated_app_dir("view_reload");
+    let config: &'static FocusFlowConfig = Box::leak(Box::new(
+        FocusFlowConfig::load(app.path().join("config.ini")).expect("读取 config.ini 失败"),
+    ));
+    let dir = app.path().join("plugins_reload");
+    std::fs::create_dir_all(&dir).expect("建临时插件目录");
+    let file = dir.join("reload_probe.lua");
+    std::fs::write(&file, visibility_lua("reload_probe")).expect("写夹具插件");
+    let mut manager =
+        focusflow_core::plugins::PluginManager::new(config, db::Database::init_readonly());
+    manager
+        .load_plugin(&file, PluginSource::User)
+        .expect("加载失败");
+    assert_eq!(label_of(&manager, "reload_probe"), "0|true|");
+    assert!(
+        manager.reload_plugin("reload_probe"),
+        "夹具插件应当能按文件名重载"
+    );
+    assert_eq!(
+        label_of(&manager, "reload_probe"),
+        "0|true|",
+        "重载之后用户插件又看见了内置专属 API = 来源没跟着条目走"
     );
 }

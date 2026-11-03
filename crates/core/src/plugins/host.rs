@@ -179,10 +179,72 @@ pub fn scheduler_has_owner_for_test(owner: &str) -> bool {
         .contains(owner)
 }
 
+/// 内置模块专属 API 的名字前缀（方案 3.4）。
+///
+/// 判据用前缀而不是把 45 个名字抄成清单：抄的那一份加一个漏一个是必然的，而漏掉那一条的
+/// 症状是「用户装的脚本照样调得动 `accounting_add`」—— 权限模型第一天就失效，且没有一条
+/// 用例说得清它坏在哪。前缀这一条规则 + 一条「扩展视图的键集必须等于通用清单」的用例
+/// （`plugin_api_wiring.rs`）把这件事变成"新增 API 时必须当场回答它属于哪一侧"。
+pub const BUILTIN_ONLY_API_PREFIXES: &[&str] = &["pomodoro_", "accounting_", "scheduler_", "edge_"];
+
+/// 扩展插件（用户自己装的那些）允许看见的通用能力 —— 方案 3.4 那棵树的第一到第五枝。
+///
+/// 这一份是**审计用的那一面**，不是运行时的白名单：运行时按前缀摘，用例按这份核。
+/// 两边不一致（例如新加一个既不带内置前缀、又不该给扩展用的 API）由
+/// `the_extension_view_leaves_only_the_general_apis` 逮住，而不是靠读代码的人记得。
+pub const EXTENSION_API_NAMES: &[&str] = &[
+    "app_info",
+    "available_years",
+    "config_get",
+    "daily_counts",
+    "log",
+    "now",
+    "stats",
+    "store",
+    "today_count",
+];
+
+/// 这个名字是不是内置模块专属（扩展插件看不见）。
+pub fn is_builtin_only_api(name: &str) -> bool {
+    BUILTIN_ONLY_API_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// 把 `focusflow` 收口成扩展视图：摘掉 [`BUILTIN_ONLY_API_PREFIXES`] 命中的那些键。
+///
+/// 摘掉之后插件取到的是 `nil`，与"压根没注册"在 Lua 那一头是同一个观测结果（方案 3.4 要的就是
+/// 这个：`focusflow.pomodoro_start()` 在第三方插件里就是 nil，不是靠文档劝阻）。
+/// 刻意不做成"注册时按视图分支"：注册这一步现在没有任何副作用（建库与 spawn 都推迟到首次调用，
+/// 见 `ensure_pomodoro_db` / `claim_scheduler` 那一族），而分支要动十几处调用点 ——
+/// 那些点位以后还会新增，漏改一处的代价是"悄悄少摘一组"，屏上什么都正常。
+///
+/// 交回摘掉的名字，让调用方与用例能核对**摘了几组**，而不是只信"这个函数跑过了"。
+pub fn hide_builtin_only_api(host: &Table) -> mlua::Result<Vec<String>> {
+    let doomed: Vec<String> = host
+        .clone()
+        .pairs::<mlua::Value, mlua::Value>()
+        .filter_map(|item| item.ok())
+        .filter_map(|(key, _)| match key {
+            mlua::Value::String(s) => Some(s.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .filter(|name| is_builtin_only_api(name))
+        .collect();
+    for name in &doomed {
+        host.set(name.as_str(), mlua::Value::Nil)?;
+    }
+    Ok(doomed)
+}
+
 /// 注册宿主 API 到 Lua 全局表 `focusflow`，返回该表。
 ///
 /// `owner` 是调用方的插件文件名（stem）：调度线程按持有者计数，
 /// 所以每个会用到它的闭包都要知道自己代表哪个插件。
+///
+/// 这里注册的是**全量视图**（内置模块与 `[plugins] legacy_layout` 回滚分支）。
+/// 用户装的脚本插件要在拿到表之后再过一道 [`hide_builtin_only_api`]，由
+/// `PluginManager::load_plugin` 按来源决定 —— 身份由位置决定，不由脚本自己写什么决定（3.1）。
 pub fn register_host_api(
     lua: &Lua,
     config: &'static FocusFlowConfig,

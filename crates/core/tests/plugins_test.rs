@@ -45,7 +45,9 @@ mod tests {
             .iter()
             .find(|f| f.ends_with("stats_overview.lua"))
             .unwrap();
-        let name = manager.load_plugin(file).expect("加载插件失败");
+        let name = manager
+            .load_plugin(file, focusflow_core::plugins::PluginSource::Builtin)
+            .expect("加载插件失败");
         assert_eq!(name, "统计速览");
 
         // 检查元数据
@@ -96,7 +98,7 @@ mod tests {
         for f in &files {
             let fpath = f.display().to_string();
             let name = manager
-                .load_plugin(f)
+                .load_plugin(f, focusflow_core::plugins::PluginSource::Builtin)
                 .unwrap_or_else(|e| panic!("加载内置插件 {fpath} 失败: {e}"));
             let info = manager.get_plugin(&name).expect("插件应已注册");
             assert!(
@@ -148,7 +150,9 @@ mod tests {
             .iter()
             .find(|f| f.ends_with("accounting_plugin.lua"))
             .expect("应发现 accounting_plugin.lua");
-        let name = manager.load_plugin(file).expect("加载记账本插件失败");
+        let name = manager
+            .load_plugin(file, focusflow_core::plugins::PluginSource::Builtin)
+            .expect("加载记账本插件失败");
         assert_eq!(name, "记账本");
 
         let view = manager
@@ -251,7 +255,9 @@ mod tests {
             .iter()
             .find(|f| f.ends_with("accounting_plugin.lua"))
             .expect("应发现 accounting_plugin.lua");
-        let name = manager.load_plugin(file).expect("加载记账本插件失败");
+        let name = manager
+            .load_plugin(file, focusflow_core::plugins::PluginSource::Builtin)
+            .expect("加载记账本插件失败");
 
         fn find_widget(widgets: &[Widget], pred: impl Fn(&Widget) -> bool + Copy) -> bool {
             widgets.iter().any(|w| {
@@ -447,7 +453,9 @@ mod tests {
             .into_iter()
             .find(|f| f.ends_with("stats_overview.lua"))
             .expect("应发现 stats_overview.lua");
-        let name = manager.load_plugin(&file).expect("加载插件失败");
+        let name = manager
+            .load_plugin(&file, focusflow_core::plugins::PluginSource::Builtin)
+            .expect("加载插件失败");
         let gap_line = |manager: &mut PluginManager| -> Option<String> {
             manager.refresh_view(&name).ok()?;
             manager
@@ -553,7 +561,9 @@ mod tests {
             .into_iter()
             .find(|f| f.ends_with("stats_overview.lua"))
             .unwrap();
-        manager.load_plugin(&file).unwrap();
+        manager
+            .load_plugin(&file, focusflow_core::plugins::PluginSource::Builtin)
+            .unwrap();
 
         // 启用热重载（检测线程）
         manager.enable_hot_reload();
@@ -623,7 +633,9 @@ mod tests {
             .into_iter()
             .find(|f| f.ends_with("scheduler_plugin.lua"))
             .expect("应发现 scheduler_plugin.lua");
-        let name = manager.load_plugin(&file).expect("加载插件失败");
+        let name = manager
+            .load_plugin(&file, focusflow_core::plugins::PluginSource::Builtin)
+            .expect("加载插件失败");
         let view = manager
             .get_plugin(&name)
             .expect("插件应存在")
@@ -702,7 +714,9 @@ mod tests {
             .into_iter()
             .find(|f| f.ends_with("accounting_plugin.lua"))
             .expect("应发现 accounting_plugin.lua");
-        let name = manager.load_plugin(&file).expect("加载插件失败");
+        let name = manager
+            .load_plugin(&file, focusflow_core::plugins::PluginSource::Builtin)
+            .expect("加载插件失败");
         let view = manager
             .get_plugin(&name)
             .expect("插件应存在")
@@ -768,7 +782,9 @@ mod tests {
             .into_iter()
             .find(|f| f.ends_with("accounting_plugin.lua"))
             .expect("应发现 accounting_plugin.lua");
-        let name = manager.load_plugin(&file).expect("加载记账本插件失败");
+        let name = manager
+            .load_plugin(&file, focusflow_core::plugins::PluginSource::Builtin)
+            .expect("加载记账本插件失败");
 
         assert!(
             !labels(&manager, &name).iter().any(|t| t.contains("没保存")),
@@ -915,7 +931,7 @@ mod tests {
         ));
         let mut manager = PluginManager::new(config, db::Database::init_readonly());
         let name = manager
-            .load_plugin(&dst)
+            .load_plugin(&dst, focusflow_core::plugins::PluginSource::Builtin)
             .unwrap_or_else(|e| panic!("加载内置插件 {file} 失败: {e}"));
         (tmp, manager, name)
     }
@@ -2628,7 +2644,7 @@ mod tests {
                 .join("builtin")
                 .join(format!("{stem}.lua"));
             let name = manager
-                .load_plugin(&path)
+                .load_plugin(&path, focusflow_core::plugins::PluginSource::Builtin)
                 .unwrap_or_else(|e| panic!("加载随包脚本 {stem} 失败: {e}"));
             let info = manager.get_plugin(&name).expect("插件应已注册");
             assert!(

@@ -70,6 +70,12 @@ pub struct PluginInfo {
     pub file_mtime: Option<SystemTime>,
     pub loaded: bool,
     pub error: Option<String>,
+    /// 这一条出自哪一处目录 = 它的身份，决定它看见哪一组宿主 API（3.4）。
+    ///
+    /// 也是热重载的必需项：重载走的是「按已加载的那份文件重读一遍」，手上只有展示名/文件名，
+    /// 若不在这里留住来源，重载一次就把内置专属 API 还给用户插件 —— 屏上什么都正常，
+    /// 而边界只在下一次重载之前有效。
+    pub source: PluginSource,
     /// 插件 Lua 环境（仅 GUI 线程访问）
     pub lua: Option<Lua>,
     /// 插件声明的视图（get_view() 结果缓存）
@@ -827,8 +833,11 @@ impl PluginManager {
         // 扫一次，两次判断共用同一份清单：原先这里扫一遍、启用时再扫一遍，
         // 目录正在被整份替换时两半能各读到不同的东西（前一半说"在"、后一半找不到那个文件，
         // 于是配置写了、插件却没加载，页面还报成功）。
-        let files = self.discover_paths()?;
-        if !files.iter().any(|p| Self::stem_of(p) == stem) {
+        // 拿的是带来源的那一份（`discover`）而不是只带路径的 `discover_paths`：
+        // 「启用一个用户插件」必须按用户视图加载，把来源在这一站丢掉就等于从这条入口
+        // 给回内置专属 API —— 而这条正是插件页上那颗「启用」。
+        let files = self.discover()?;
+        if !files.iter().any(|f| Self::stem_of(&f.path) == stem) {
             // 以前这里是 `return Ok(())`：命令层把 Ok 当成功，前端弹「插件已启用」，
             // 而配置一个字没改 —— 对着一个不存在的插件报成功。
             let reason = missing_plugin_reason(&self.plugin_dirs(), stem);
@@ -860,8 +869,8 @@ impl PluginManager {
                 .values()
                 .any(|p| Self::stem_of(&p.file_path) == stem);
             if !already {
-                if let Some(path) = files.iter().find(|p| Self::stem_of(p) == stem) {
-                    if let Err(e) = self.try_load(path) {
+                if let Some(found) = files.iter().find(|f| Self::stem_of(&f.path) == stem) {
+                    if let Err(e) = self.try_load(&found.path, found.source) {
                         tracing::warn!("启用插件失败 ({stem}): {e}");
                         return Err(format!("插件已记录为启用，但加载失败：{e}"));
                     }
@@ -1181,7 +1190,11 @@ impl PluginManager {
     }
 
     /// 加载单个插件文件。
-    pub fn load_plugin(&mut self, path: &Path) -> Result<String, String> {
+    ///
+    /// `source` 是这一条**出自哪一处目录**，由 [`Self::discover`] 给出、由 [`Self::load_all`]
+    /// 一路带到这里：它决定插件看见哪一组宿主 API（3.4）。身份不读脚本自己写的常量，
+    /// 所以这里必须由调用方说，不能在函数里猜。
+    pub fn load_plugin(&mut self, path: &Path, source: PluginSource) -> Result<String, String> {
         let meta = self.read_meta(path)?;
         // 展示名（PLUGIN_NAME）是插件表的键。两个文件声明同一个名字时，原先是
         // 后来者静默覆盖前者：被顶掉的那个既不再接收键事件，也再没有 unload
@@ -1212,8 +1225,20 @@ impl PluginManager {
         self.apply_lua_limits(&lua);
         // 宿主按文件名记账调度线程的使用者，所以这里传 stem 而不是展示名：
         // 两个插件的 PLUGIN_NAME 相同是常见的手误，展示名当键会串味。
-        host::register_host_api(&lua, self.config, Arc::clone(&self.db), &stem)
+        let api = host::register_host_api(&lua, self.config, Arc::clone(&self.db), &stem)
             .map_err(|e| format!("宿主 API 注册失败: {e}"))?;
+        // 用户装的脚本只拿通用能力：内置专属那一组（`pomodoro_*` / `accounting_*` /
+        // `scheduler_*` / `edge_*`）从这张表里摘掉，插件取到的是 `nil`（3.4、用例 14）。
+        // 摘不摘由**位置**决定，脚本写什么 `PLUGIN_KIND` 都不算 —— 允许自述就等于
+        // 谁都能把自己报成内置，权限模型第一天失效（3.1）。
+        if source == PluginSource::User {
+            let hidden =
+                host::hide_builtin_only_api(&api).map_err(|e| format!("宿主 API 收口失败: {e}"))?;
+            tracing::debug!(
+                "插件 {stem} 按用户插件加载：{} 组内置专属 API 对它不可见",
+                hidden.len()
+            );
+        }
         let script = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         lua.load(&script)
             .set_name(&meta.manifest.name)
@@ -1267,6 +1292,7 @@ impl PluginManager {
             file_mtime: mtime,
             loaded: true,
             error: None,
+            source,
             lua: Some(lua),
             view,
         };
@@ -1302,9 +1328,9 @@ impl PluginManager {
 
     /// `load_plugin` 的记账版：成功就清掉这个文件之前的失败原因，失败就留档，
     /// 好让插件页显示"为什么没加载"而不是只有一行未加载。
-    fn try_load(&mut self, path: &Path) -> Result<String, String> {
+    fn try_load(&mut self, path: &Path, source: PluginSource) -> Result<String, String> {
         let stem = Self::stem_of(path);
-        match self.load_plugin(path) {
+        match self.load_plugin(path, source) {
             Ok(name) => {
                 self.load_errors.remove(&stem);
                 Ok(name)
@@ -1438,9 +1464,12 @@ impl PluginManager {
             .plugins
             .values()
             .find(|p| Self::stem_of(&p.file_path) == key)
-            .map(|p| p.file_path.clone());
-        let by_display = self.plugins.get(key).map(|p| p.file_path.clone());
-        if let (Some(s), Some(n)) = (&by_stem, &by_display) {
+            .map(|p| (p.file_path.clone(), p.source));
+        let by_display = self
+            .plugins
+            .get(key)
+            .map(|p| (p.file_path.clone(), p.source));
+        if let (Some((s, _)), Some((n, _))) = (&by_stem, &by_display) {
             if s != n {
                 tracing::warn!(
                     "重载键 {key} 同时是文件 {} 的名字与另一个插件（文件 {}）的展示名：按文件那个重载",
@@ -1449,9 +1478,9 @@ impl PluginManager {
                 );
             }
         }
-        let path = by_stem.or(by_display);
-        match path {
-            Some(p) => {
+        let found = by_stem.or(by_display);
+        match found {
+            Some((p, source)) => {
                 // 重载刻意**不**跑 cleanup()：这条路径是「存了个文件」触发的
                 // （mtime 变化、构建脚本换目录、编辑器先截断再写入），而番茄插件的
                 // cleanup 会 `pomodoro_stop()` —— 那段 `save_current()` 只要实际计时
@@ -1462,7 +1491,11 @@ impl PluginManager {
                 // API 复用同一批进程级单例（沙箱里没有 io/coroutine，插件本身持不住
                 // 别的资源），owner 记账按 stem 走、两份实例同一个 stem 也就一次登记。
                 // 真正的「停用/删文件」仍然走 unload_plugin → cleanup。
-                self.try_load(&p).is_ok()
+                //
+                // 来源**跟着已加载的那一条走**（不是重新问一遍 discover）：重载的触发点是 mtime，
+                // 那一刻目录可能正读不动，而"读不到清单"不该把沙箱边界一起放掉 ——
+                // 用户插件重载一次就拿回 `accounting_*` 是这条路径上唯一可能的越界方式。
+                self.try_load(&p, source).is_ok()
             }
             None => false,
         }
@@ -1499,7 +1532,7 @@ impl PluginManager {
             .filter(|f| f.source == PluginSource::User)
             .count();
         tracing::info!("插件清单：内置 {builtin} 个 · 用户 {user} 个");
-        for path in found.into_iter().map(|f| f.path) {
+        for Discovered { path, source } in found {
             let stem = Self::stem_of(&path);
             if disabled.iter().any(|s| s.as_str() == stem) {
                 continue;
@@ -1513,7 +1546,7 @@ impl PluginManager {
             {
                 continue;
             }
-            let _ = self.try_load(&path);
+            let _ = self.try_load(&path, source);
         }
         true
     }
@@ -2629,7 +2662,8 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
         let plugins = tmp.path().join("plugins");
         let alpha = write_lua(&plugins, "alpha", &view_only("甲"));
         let mut pm = manager_in(tmp.path());
-        pm.load_plugin(&alpha).expect("alpha 该能加载");
+        pm.load_plugin(&alpha, PluginSource::Builtin)
+            .expect("alpha 该能加载");
 
         let path = tmp.path().join("config.ini");
         pm.set_enabled("alpha", false)
@@ -2667,8 +2701,10 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
         let alpha = write_lua(&plugins, "alpha", &view_with_name("beta", "alpha-旧"));
         let beta = write_lua(&plugins, "beta", &view_with_name("真正的乙", "beta-旧"));
         let mut pm = manager_in(tmp.path());
-        pm.load_plugin(&alpha).expect("alpha 该能加载");
-        pm.load_plugin(&beta).expect("beta 该能加载");
+        pm.load_plugin(&alpha, PluginSource::Builtin)
+            .expect("alpha 该能加载");
+        pm.load_plugin(&beta, PluginSource::Builtin)
+            .expect("beta 该能加载");
 
         // 只有文件 beta.lua 变了（展示名不变，只换标题）
         write_lua(&plugins, "beta", &view_with_name("真正的乙", "beta-新"));
@@ -2708,7 +2744,8 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
         let plugins = tmp.path().join("plugins");
         let p = write_lua(&plugins, "keep_old", &scheduler_user("重载别丢我"));
         let mut pm = manager_in(tmp.path());
-        pm.load_plugin(&p).expect("好版本该能加载");
+        pm.load_plugin(&p, PluginSource::Builtin)
+            .expect("好版本该能加载");
         assert_eq!(
             host::scheduler_state_for_test(),
             Some(1),
@@ -2763,7 +2800,7 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
         let plugins = tmp.path().join("plugins");
         let p = write_lua(&plugins, "ren", &view_only("旧名"));
         let mut pm = manager_in(tmp.path());
-        pm.load_plugin(&p).expect("加载失败");
+        pm.load_plugin(&p, PluginSource::Builtin).expect("加载失败");
 
         write_lua(&plugins, "ren", &view_only("新名"));
         assert!(pm.reload_plugin("ren"), "改名重载应当成功");
@@ -2779,7 +2816,8 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
         );
 
         let other = write_lua(&plugins, "neighbour", &view_only("邻居"));
-        pm.load_plugin(&other).expect("加载邻居失败");
+        pm.load_plugin(&other, PluginSource::Builtin)
+            .expect("加载邻居失败");
         write_lua(&plugins, "ren", &view_only("邻居"));
         assert!(!pm.reload_plugin("ren"), "抢了别人的名字要被拒");
         assert!(
@@ -2836,7 +2874,10 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
         )
         .unwrap();
         write_lua(
-            &tmp.path().join("plugins"),
+            // 夹具落在**内置那一格**：它要用 `scheduler_tasks`，而那一组从 3.4 起只对内置模块开放。
+            // 落在旧的平铺格会被当成用户插件迁进数据目录，于是 `init()` 第一句就取到 nil ——
+            // 红的是这条前提，而不是被测的归还逻辑。
+            &tmp.path().join("plugins").join("builtin"),
             "hog",
             r###"
 PLUGIN_NAME = "超限甲"
@@ -2900,7 +2941,8 @@ end
     fn unloading_a_plugin_that_never_releases_still_gives_the_scheduler_back() {
         let _lock = paths::test_app_dir_lock();
         let tmp = paths::test_app_dir("unload_owner");
-        let plugins = tmp.path().join("plugins");
+        // 两份夹具都要用 `scheduler_tasks` ⇒ 落在内置那一格（用户格子从 3.4 起看不见那一组）
+        let plugins = tmp.path().join("plugins").join("builtin");
         write_lua(
             &plugins,
             "quiet",
@@ -3371,7 +3413,7 @@ end
         let plugins = tmp.path().join("plugins");
         let p = write_lua(&plugins, "gone", &scheduler_user("会被删掉的"));
         let mut pm = manager_in(tmp.path());
-        pm.load_plugin(&p).expect("加载失败");
+        pm.load_plugin(&p, PluginSource::Builtin).expect("加载失败");
         assert_eq!(host::scheduler_state_for_test(), Some(1));
 
         std::fs::remove_file(&p).unwrap();
@@ -3506,7 +3548,8 @@ end
         let plugins = tmp.path().join("plugins");
         let file = write_lua(&plugins, "w", &view_only("视图插件"));
         let mut pm = manager_in(tmp.path());
-        pm.load_plugin(&file).expect("第一版该装上");
+        pm.load_plugin(&file, PluginSource::Builtin)
+            .expect("第一版该装上");
 
         // 用户按一次 Ctrl+S：这次写进去的是半截表达式（语法错，Lua 编译就拒）
         std::fs::write(
@@ -3743,8 +3786,9 @@ end
     /// 光数函数名会被 `discover()` 的注释与另一种写法顶班。
     ///
     /// 目录分离之后 `discover()` 交出带来源的清单（路线图 11 节第 2 步：返回项带来源），
-    /// 只要路径的调用方走 `discover_paths()` 那条薄壳投影。两条都必须把"读不出来"交出去，
-    /// 合计仍是三个消费点。
+    /// 三个消费点如今**都要**那一份来源：列表要它分组、启动加载与「启用」要它决定
+    /// 插件看见哪一组宿主 API（3.4）。`discover_paths()` 那条抹平来源的薄壳只剩测试在用。
+    /// 两条都必须把"读不出来"交出去，合计仍是三个消费点。
     #[test]
     fn no_caller_folds_an_unreadable_plugin_dir_back_into_empty() {
         let src = include_str!("manager.rs");
@@ -3779,14 +3823,14 @@ end
 
         assert_eq!(
             consumers.matches("self.discover_paths()?").count(),
-            1,
-            "只要路径的消费点只剩「启用」这一处（列表与启动加载都要来源），\
-             且它必须把 Err 原样交出去（`?`）"
+            0,
+            "「启用」这一处从 3.4 起也要来源（它决定插件看见哪一组宿主 API），\
+             生产段不再有只要路径的消费点。新加一处若真只要路径，先在这里说清它为什么不需要身份"
         );
         assert_eq!(
             consumers.matches("self.discover()?").count(),
-            1,
-            "列表那一处必须把 Err 原样交出去（`?`），而不是就地折成空"
+            2,
+            "带来源的两个消费点（列表、启用）都必须把 Err 原样交出去（`?`），而不是就地折成空"
         );
         assert_eq!(
             consumers.matches("matchself.discover()").count(),
@@ -4334,7 +4378,8 @@ end
 "###;
         let file = write_lua(&plugins, "modal", src);
         let mut pm = manager_in(tmp.path());
-        pm.load_plugin(&file).expect("这份视图该装得起来");
+        pm.load_plugin(&file, PluginSource::Builtin)
+            .expect("这份视图该装得起来");
 
         let ids = |pm: &PluginManager| -> Vec<String> {
             let info = pm.get_plugin("弹窗插件").expect("插件应在表里");
@@ -4451,7 +4496,7 @@ end
         for (stem, src) in &cases {
             let file = write_lua(&plugins, stem, src);
             let name = pm
-                .load_plugin(&file)
+                .load_plugin(&file, PluginSource::Builtin)
                 .unwrap_or_else(|e| panic!("这份视图该装得起来（{stem}）: {e}"));
             let info = pm.get_plugin(&name).expect("插件应在表里");
             let view = info.view.clone().expect("加载时就该有视图");
@@ -4550,7 +4595,8 @@ end
         );
         let file = write_lua(&plugins, "longchart", &src);
         let mut pm = manager_in(tmp.path());
-        let (loaded, logs) = crate::logger::capture_logs(|| pm.load_plugin(&file));
+        let (loaded, logs) =
+            crate::logger::capture_logs(|| pm.load_plugin(&file, PluginSource::Builtin));
         loaded.expect("这份视图该装得起来");
         let shown = logs.join("\n");
         assert!(
@@ -4595,7 +4641,9 @@ get_view = { title = "这是一张表" }
 "###,
         );
         let mut pm = manager_in(tmp.path());
-        let name = pm.load_plugin(&file).expect("钩子写错类型不该挡住加载");
+        let name = pm
+            .load_plugin(&file, PluginSource::Builtin)
+            .expect("钩子写错类型不该挡住加载");
 
         let checks: [(Result<(), String>, &str); 3] = [
             (pm.plugin_action(&name, "start"), "on_action"),
@@ -4623,7 +4671,9 @@ get_view = { title = "这是一张表" }
             "PLUGIN_NAME = \"没写钩子\"\nfunction get_view() \
              return { title = \"v\", widgets = { {type=\"label\", text=\"v\"} } } end\n",
         );
-        let name2 = pm.load_plugin(&plain).expect("无钩子插件应装得上");
+        let name2 = pm
+            .load_plugin(&plain, PluginSource::Builtin)
+            .expect("无钩子插件应装得上");
         let err = pm
             .plugin_action(&name2, "start")
             .expect_err("没写 on_action 要报错");
@@ -4659,7 +4709,10 @@ cleanup = "shutdown"
 "###,
         );
         let mut pm = manager_in(tmp.path());
-        let (name, logs) = crate::logger::capture_logs(|| pm.load_plugin(&bad).expect("该装得上"));
+        let (name, logs) = crate::logger::capture_logs(|| {
+            pm.load_plugin(&bad, PluginSource::Builtin)
+                .expect("该装得上")
+        });
         assert!(
             logs.iter()
                 .any(|l| l.contains("init") && l.contains("不是函数")),
@@ -4681,7 +4734,9 @@ cleanup = "shutdown"
             "PLUGIN_NAME = \"什么都没有\"\n",
         );
         let (_, logs) = crate::logger::capture_logs(|| {
-            let n = pm.load_plugin(&none).expect("该装得上");
+            let n = pm
+                .load_plugin(&none, PluginSource::Builtin)
+                .expect("该装得上");
             pm.unload_plugin(&n);
         });
         assert!(
@@ -4709,7 +4764,8 @@ end
 "###,
         );
         let mut pm = manager_in(tmp.path());
-        pm.load_plugin(&file).expect("夹具该加载得动");
+        pm.load_plugin(&file, PluginSource::Builtin)
+            .expect("夹具该加载得动");
         let names = pm.loaded_plugin_names();
         assert!(
             names.iter().any(|n| n == "按键攒批"),
@@ -4772,7 +4828,9 @@ end
 "###,
         );
         let mut pm = manager_in(tmp.path());
-        let name = pm.load_plugin(&file).expect("插件本身该装得上");
+        let name = pm
+            .load_plugin(&file, PluginSource::Builtin)
+            .expect("插件本身该装得上");
 
         let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A", 1));
         let info = pm.get_plugin(&name).expect("插件应还在表里");
@@ -4834,7 +4892,9 @@ end
 "###,
         );
         let mut pm = manager_in(tmp.path());
-        let name = pm.load_plugin(&file).expect("插件本身该装得上");
+        let name = pm
+            .load_plugin(&file, PluginSource::Builtin)
+            .expect("插件本身该装得上");
 
         let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A", 1));
         let info = pm.get_plugin(&name).expect("插件应还在表里");
@@ -4864,7 +4924,9 @@ end
         let tmp = paths::test_app_dir("key_hook_absent");
         let file = write_lua(&tmp.path().join("plugins"), "quiet", &view_only("不收按键"));
         let mut pm = manager_in(tmp.path());
-        let name = pm.load_plugin(&file).expect("插件该装得上");
+        let name = pm
+            .load_plugin(&file, PluginSource::Builtin)
+            .expect("插件该装得上");
 
         let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A", 1));
         let info = pm.get_plugin(&name).expect("插件应还在表里");
@@ -4894,7 +4956,9 @@ end
             "PLUGIN_NAME = \"钩子写成字符串\"\nrecord_key = \"我把它写成字符串了\"\n",
         );
         let mut pm = manager_in(tmp.path());
-        let name = pm.load_plugin(&file).expect("插件该装得上");
+        let name = pm
+            .load_plugin(&file, PluginSource::Builtin)
+            .expect("插件该装得上");
 
         let (_, logs) = crate::logger::capture_logs(|| pm.plugin_key_event(&name, "A", 1));
         let info = pm.get_plugin(&name).expect("插件应还在表里");
