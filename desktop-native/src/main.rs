@@ -732,6 +732,11 @@ struct PluginRow {
     grant_note: String,
     /// 需不需要用户点一颗「授权」：只有「没授权过」与「权限变了」这两档给按钮。
     needs_grant: bool,
+    /// 这一格的面板被慢熔断降频了（方案 3.9 那一列「该插件较慢」）。
+    ///
+    /// 读的是 core 那份账本，页面不自己数耗时：两处各数一遍就会出现"页面上没标、
+    /// 而它其实已经每秒只刷一次"这种说不清的落差。
+    slow: bool,
     refresh_ms: u64,
     min_app: String,
     store_bytes: Option<usize>,
@@ -770,6 +775,10 @@ impl PluginRow {
                     format!("占用 {} KB", n.div_ceil(1024))
                 });
             }
+        }
+        // 慢熔断那一档要说出来：作者看"为什么我的面板变慢了"，用户看"这一格被降频过"
+        if self.slow {
+            parts.push("该插件较慢".to_string());
         }
         parts.join(" · ")
     }
@@ -999,8 +1008,6 @@ struct App {
     /// `sel` 按钮拼的动作 id 与行高亮都读这一份；开/关视图时清掉（旧版前端口径：
     /// 关掉面板就不留选中），切换分组互不影响。
     plugin_sel: HashMap<String, Vec<String>>,
-    /// 上一次重算插件视图的时间戳（1 秒一次就够，别跟着 100ms 心跳跑）。
-    last_pv_refresh: Option<std::time::Instant>,
     hover: Option<usize>,
     /// 指针下的控件（药丸/页签/导航）：只影响底色与光标形状，不参与点击判定。
     ctl: Option<Ctl>,
@@ -1497,7 +1504,6 @@ impl App {
                 pv_select: None,
                 pv_modal: None,
                 plugin_sel: HashMap::new(),
-                last_pv_refresh: None,
                 hover: None,
                 ctl: None,
                 sel: None,
@@ -3106,6 +3112,7 @@ impl App {
                             permissions: permissions.len(),
                             grant_note,
                             needs_grant,
+                            slow: p.slow,
                             refresh_ms,
                             min_app,
                             // 存储那一格按**文件名**问（键从来进不了路径，见 plugin_store）
@@ -11488,18 +11495,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     _ => tracing_note(&format!("收到没注册的热键事件 id={}", ev.id)),
                 }
             }
-            // 插件视图要按 1 秒重算一次：番茄钟的倒计时、键鼠计数都是插件自己在
-            // get_view() 里算出来的，不重算就停在那儿。
+            // 插件视图按**这一页自己声明的节奏**重算（方案 3.9：`PLUGIN_REFRESH_MS`，缺省 0 = 只在
+            // 动作之后刷）。番茄钟的倒计时是插件在 `get_view()` 里算出来的，不重算就停在那儿；
+            // 而"打开面板就每秒全量重算"是把记账本那 17 ms 的坑每秒往主线程挖一次。
+            // 判断（含慢熔断的降频）全在 core 的 `Cadence`，这一头只管跑与记。
             if let Some(app) = unsafe { app_ptr(hwnd) } {
                 if let Some(name) = app.plugin_open.clone() {
                     let due = app
-                        .last_pv_refresh
-                        .map(|t| t.elapsed() >= Duration::from_millis(1000))
-                        .unwrap_or(true);
+                        .pm
+                        .as_mut()
+                        .map(|pm| pm.view_due(&name, std::time::Instant::now()))
+                        .unwrap_or(false);
                     if due {
-                        app.last_pv_refresh = Some(std::time::Instant::now());
                         if let Some(pm) = app.pm.as_mut() {
+                            let started = std::time::Instant::now();
                             let _ = pm.refresh_view(&name);
+                            // 耗时要在跑完这一侧交回：那是慢熔断唯一的样本来源
+                            pm.note_view_refreshed(
+                                &name,
+                                std::time::Instant::now(),
+                                started.elapsed(),
+                            );
                         }
                         unsafe {
                             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -17103,6 +17119,7 @@ mod plugin_page_tests {
             permission_names: Vec::new(),
             grant_note: "已授权".to_string(),
             needs_grant: false,
+            slow: false,
             refresh_ms: 0,
             min_app: String::new(),
             store_bytes: None,
@@ -17162,6 +17179,56 @@ mod plugin_page_tests {
         assert!(
             prod.contains("grantable && hit(plugin_grant_rect"),
             "命中的条件必须与画它的条件同一句（needs_grant），否则会出现点不动的按钮"
+        );
+    }
+
+    /// 慢熔断那一档要在页面那一格说出来，而没进熔断的不许标。
+    ///
+    /// 两条臂：`row()` 那个夹具默认是"没被降频"的，所以第一句钉的是"不许乱标"；
+    /// 第二句钉的是"降了频要看得见" —— 少任何一句，另一边的缺陷都能悄悄活着。
+    #[test]
+    fn a_throttled_panel_says_so_in_the_declaration_cell() {
+        let plain = row("quiet_tool", false);
+        assert!(
+            !plain.declaration().contains("较慢"),
+            "没进熔断的不许标: {:?}",
+            plain.declaration()
+        );
+        let mut slow = row("slow_tool", false);
+        slow.slow = true;
+        assert!(
+            slow.declaration().contains("该插件较慢"),
+            "降频之后页面上要看得见: {:?}",
+            slow.declaration()
+        );
+    }
+
+    /// 刷新节奏这一条链两头都在生产里：判断住在 core，那一拍只问一次、跑完只记一次。
+    ///
+    /// 与看板页 `should_refresh`、热重载那条链同一把尺子：规则写在 UI 里就没人问得到，
+    /// 而"写死 1 秒"那种回退不会让任何一条用例红 —— 除非这里钉住它。
+    #[test]
+    fn the_refresh_cadence_chain_has_both_ends_in_production() {
+        let code = include_str!("../src/main.rs");
+        let at = code
+            .find("mod plugin_page_tests {")
+            .expect("插件页那一套用例的模块起点找不到了");
+        let prod: String = code[..at]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            prod.contains("pm.view_due(&name, std::time::Instant::now())"),
+            "那一拍不再问 core 的节奏 ⇒ 「缺省 0 = 只在动作后刷」这条声明又变成装饰"
+        );
+        assert!(
+            prod.contains("pm.note_view_refreshed("),
+            "跑完不记耗时 ⇒ 慢熔断永远攒不出样本，「该插件较慢」那句就没人能触发"
+        );
+        assert!(
+            !prod.contains("last_pv_refresh"),
+            "写死一秒的那份旧时钟还挂在生产里：节奏判断又回到 UI 这一头了"
         );
     }
 

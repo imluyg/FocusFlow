@@ -14,6 +14,7 @@ use focusflow_core::config::FocusFlowConfig;
 use focusflow_core::db;
 use focusflow_core::paths;
 use focusflow_core::plugins::host;
+use focusflow_core::plugins::manager::PluginManager;
 use focusflow_core::plugins::PluginSource;
 use mlua::Lua;
 use std::path::Path;
@@ -475,6 +476,50 @@ fn the_manager_hides_builtin_apis_only_for_user_plugins() {
             "{tag} 臂（{source:?}）看到的内置专属 API 数量不对"
         );
     }
+}
+
+/// 随包的五本内置脚本都必须**自己声明**刷新节奏，而且值要真读得出来。
+///
+/// 为什么钉这一条：`PLUGIN_REFRESH_MS` 的缺省是 0（只在动作之后刷），而从前这一页是
+/// "打开面板就每秒重算"。改了缺省而随包脚本不声明，症状是番茄钟那个倒计时停在原地、
+/// 「今日已省」不再走 —— 省下的主线程拿用户看得见的功能去换，而且是静默的。
+/// 这里核的是**过完整条解析链**的值（文本扫描 → `build_manifest`），不是文件里那串字面量：
+/// 解析器读不出整数时，只看文本的用例照样绿。
+#[test]
+fn every_bundled_plugin_declares_a_refresh_interval() {
+    let _g = round7::guard();
+    let app = common::isolated_app_dir("bundled_refresh");
+    let config: &'static FocusFlowConfig = Box::leak(Box::new(
+        FocusFlowConfig::load(app.path().join("config.ini")).expect("读取 config.ini 失败"),
+    ));
+    let pm = PluginManager::new(config, db::Database::init_readonly());
+    let list = pm.list_discovered().expect("清单该读得动");
+    let builtin: Vec<(String, u64)> = list
+        .iter()
+        .filter(|p| p.source == PluginSource::Builtin)
+        .map(|p| (p.file.clone(), p.manifest.refresh_ms))
+        .collect();
+    assert_eq!(
+        builtin.len(),
+        5,
+        "随包的内置脚本应当有五本，实得 {builtin:?}"
+    );
+    for (file, ms) in &builtin {
+        assert!(
+            *ms >= 1_000,
+            "{file} 没声明 PLUGIN_REFRESH_MS（读到 {ms}）：缺省 0 会让这一页不再自刷"
+        );
+    }
+    // 最重的那一本要按 3.9.1 的 D 档降频，不许还留在每秒一刷
+    let accounting = builtin
+        .iter()
+        .find(|(f, _)| f == "accounting_plugin")
+        .expect("记账本该在随包清单里");
+    assert!(
+        accounting.1 >= 5_000,
+        "记账本是五本里最重的一页（实测每次约 17 ms），至少要 5 秒一档，实得 {}",
+        accounting.1
+    );
 }
 
 /// 热重载不许把边界洗掉：来源留在条目上，重载一次不该还回内置专属那一组。

@@ -8,6 +8,11 @@ PLUGIN_DESC = "收支记录管理：增删改查、分类/子分类筛选、日�
 PLUGIN_VERSION = "1.2.0"
 PLUGIN_AUTHOR = "FocusFlow"
 
+-- 自刷节奏：这一页每次重算要问三趟库，是五本里最重的一页（实测每次约 17 ms）。
+-- 按 5 秒一档：数据最多晚 5 秒，而每秒往主线程挖一次 17 ms 的坑是看得见的卡顿。
+-- 记完一笔账要立刻看到新行 —— 那一步走的是「动作之后马上刷」，与这一条无关。
+PLUGIN_REFRESH_MS = 5000
+
 -- 新增/编辑草稿（弹窗字段，set_field 写入）
 local draft = { type = "支出", item = "", store = "", amount = "", category = "", subcategory = "", date = "", note = "" }
 local editing_id = nil -- 非 nil 时编辑弹窗打开

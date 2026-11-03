@@ -7,6 +7,9 @@ PLUGIN_DESC = "查看 Edge 浏览器历史记录数量及 30 天趋势"
 PLUGIN_VERSION = "1.0.0"
 PLUGIN_AUTHOR = "FocusFlow"
 
+-- 自刷节奏：「今日已省」这一格跟着浏览器历史变，1 秒一次与从前一致。
+PLUGIN_REFRESH_MS = 1000
+
 -- 上一次动作的结果（nil = 不显示）
 local hint = nil
 

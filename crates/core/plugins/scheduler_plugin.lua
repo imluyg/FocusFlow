@@ -7,6 +7,9 @@ PLUGIN_DESC = "定时启动指定程序（每日/一次性/间隔执行）"
 PLUGIN_VERSION = "1.0.0"
 PLUGIN_AUTHOR = "FocusFlow"
 
+-- 自刷节奏：任务列表里的「下次触发」按分钟走，1 秒一次够看，也不贵（每次约 3 ms）。
+PLUGIN_REFRESH_MS = 1000
+
 -- 正在编辑的任务 id（-1 = 编辑弹窗关闭）。以前它被声明却从不使用，
 -- `scheduler_update` 也零调用 → **GUI 里根本不存在"编辑任务"**，只能删了重建。
 local edit_id = -1

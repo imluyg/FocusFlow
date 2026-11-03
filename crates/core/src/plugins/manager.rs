@@ -27,6 +27,7 @@ use crate::db;
 use crate::paths;
 use crate::plugins::host;
 use crate::plugins::permissions;
+use crate::plugins::plugin_refresh;
 use crate::plugins::plugin_timers;
 use crate::plugins::PluginView;
 
@@ -307,6 +308,11 @@ pub struct DiscoveredPlugin {
     /// 两处必须同一句话，否则同一份文件在页面上会有两张脸（本仓为 `PLUGIN_NAME`
     /// 那件事钉过同一条判据）。
     pub authorization: permissions::Authorization,
+    /// 这一格的面板是不是被降频了（方案 3.9：慢熔断之后页面要标「该插件较慢」）。
+    ///
+    /// 只有打开过面板、且攒够样本的那一份才可能是真；没加载的一律 `false`
+    /// —— 「这一页从来没跑过」与「它跑得慢」是两种话，不许折成同一句。
+    pub slow: bool,
 }
 
 impl DiscoveredPlugin {
@@ -389,6 +395,11 @@ pub struct PluginManager {
     reload_rx: mpsc::Receiver<String>,
     /// 重载请求发送端（检测线程用）
     reload_tx: mpsc::Sender<String>,
+    /// 每个**打开过面板**的插件一份刷新账本（键 = 展示名，与 `plugins` 同键）。
+    ///
+    /// 为什么按展示名而不是文件名：面板那侧唯一拿得到的就是名字（`open_plugin_view(name)`），
+    /// 而这一格账本只为"这一页现在该不该重算"服务。
+    plans: HashMap<String, plugin_refresh::Cadence>,
 }
 
 impl Drop for PluginManager {
@@ -639,6 +650,7 @@ impl PluginManager {
             hot_reload_thread: None,
             reload_rx: rx,
             reload_tx: tx,
+            plans: HashMap::new(),
         }
     }
 
@@ -950,6 +962,7 @@ impl PluginManager {
                         loaded: info.loaded,
                         source,
                         authorization: info.authorization.clone(),
+                        slow: self.view_is_slow(&info.manifest.name),
                         error: if reasons.is_empty() {
                             None
                         } else {
@@ -970,6 +983,7 @@ impl PluginManager {
                             loaded: false,
                             source,
                             authorization,
+                            slow: false,
                             // 没加载、但加载失败过：原因得显示出来，不能只剩"未加载"
                             error: self.load_errors.get(&stem).cloned(),
                         }
@@ -995,6 +1009,7 @@ impl PluginManager {
                         } else {
                             permissions::Authorization::Exempt
                         },
+                        slow: false,
                         error: Some(e),
                     },
                 }
@@ -1636,6 +1651,76 @@ impl PluginManager {
         ran
     }
 
+    /// 打开着的那一页现在该不该重算（方案 3.9 的节奏，判断全在 `plugin_refresh`）。
+    ///
+    /// 每一拍先取一次 `invalidate` 的件口：投递方是插件自己（宿主闭包），它碰不到账本。
+    /// 声明变了（作者改了 `PLUGIN_REFRESH_MS` 又存盘）换一份新账本 —— 旧样本压着新声明，
+    /// 症状是"改成了 0 还在每秒刷"。
+    pub fn view_due(&mut self, name: &str, now: std::time::Instant) -> bool {
+        for stem in plugin_refresh::take_dirty() {
+            if let Some(info) = self
+                .plugins
+                .values()
+                .find(|p| Self::stem_of(&p.file_path) == stem)
+            {
+                let display = info.manifest.name.clone();
+                let declared = info.manifest.refresh_ms;
+                self.plans
+                    .entry(display)
+                    .or_insert_with(|| plugin_refresh::Cadence::new(declared))
+                    .invalidate();
+            }
+        }
+        let declared = match self.plugins.get(name) {
+            Some(info) => info.manifest.refresh_ms,
+            None => return false,
+        };
+        let plan = self
+            .plans
+            .entry(name.to_string())
+            .or_insert_with(|| plugin_refresh::Cadence::new(declared));
+        if !plan.declared_is(declared) {
+            *plan = plugin_refresh::Cadence::new(declared);
+            plan.invalidate();
+        }
+        plan.due(now)
+    }
+
+    /// 真的重算完之后交回耗时：这一格是慢熔断的样本来源。
+    ///
+    /// 只有跑完才记，跑失败也要记（一次失败的 `get_view()` 通常不比成功快）；
+    /// 时间戳也在这一推进，所以调用顺序必须是"问 `view_due` → 跑 → 记"，
+    /// 反过来（先记再跑）就出现了"刷失败但下一拍不再试"那一族缺陷。
+    pub fn note_view_refreshed(
+        &mut self,
+        name: &str,
+        now: std::time::Instant,
+        elapsed: std::time::Duration,
+    ) {
+        let declared = self
+            .plugins
+            .get(name)
+            .map(|p| p.manifest.refresh_ms)
+            .unwrap_or(plugin_refresh::DEFAULT_REFRESH_MS);
+        self.plans
+            .entry(name.to_string())
+            .or_insert_with(|| plugin_refresh::Cadence::new(declared))
+            .record(now, elapsed);
+    }
+
+    /// 这一页现在被降频了吗（插件页那格要说「该插件较慢」，方案 3.9 那一列）。
+    pub fn view_is_slow(&self, name: &str) -> bool {
+        self.plans.get(name).map(|p| p.is_slow()).unwrap_or(false)
+    }
+
+    /// 这一页实际按多少毫秒自刷（诊断与用例的观察量）。
+    pub fn view_interval_ms(&self, name: &str) -> u64 {
+        self.plans
+            .get(name)
+            .map(|p| p.interval_ms())
+            .unwrap_or(plugin_refresh::DEFAULT_REFRESH_MS)
+    }
+
     /// 从插件 Lua 环境读取 get_view() 返回值（声明式 UI 表）。
     fn read_view(lua: &Lua) -> mlua::Result<PluginView> {
         let get_view: mlua::Function = lua.globals().get("get_view")?;
@@ -1671,6 +1756,9 @@ impl PluginManager {
         let cfg = self.config;
         if let Some(mut info) = self.plugins.remove(name) {
             let stem = Self::stem_of(&info.file_path);
+            // 卸载 = 这一页不存在了，账本一起丢：留着旧样本的话，重新启用后第一次刷新
+            // 就会被上一次留下的"慢"记录降频，而那时插件是全新的实例。
+            self.plans.remove(name);
             // 卸载 = 用户不要它了（停用/删除/重启前的一次回收），旧的加载失败原因
             // 不该继续挂在插件页上。
             self.load_errors.remove(&stem);

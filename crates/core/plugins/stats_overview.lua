@@ -6,6 +6,9 @@ PLUGIN_DESC = "展示当前周期统计的快速概览"
 PLUGIN_VERSION = "1.0.0"
 PLUGIN_AUTHOR = "FocusFlow"
 
+-- 自刷节奏：这一页读的是内存里的计数，几乎不花钱（每次不到 1 ms），1 秒一次保持原样。
+PLUGIN_REFRESH_MS = 1000
+
 function init()
     focusflow.log("统计速览插件已初始化")
 end

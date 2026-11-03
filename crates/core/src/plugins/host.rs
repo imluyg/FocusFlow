@@ -200,6 +200,7 @@ pub const EXTENSION_API_NAMES: &[&str] = &[
     "config_get",
     "daily_counts",
     "every",
+    "invalidate",
     "log",
     "now",
     "off",
@@ -1575,6 +1576,19 @@ pub fn register_host_api(
         Ok((out, gap))
     })?;
     host.set("query", query_fn)?;
+
+    // `focusflow.invalidate()`（方案 3.9）：插件自己说"我改了，下一次该重算这一格"。
+    //
+    // 只往件口里放一个文件名，不在这里碰账本：账本（`Cadence`）住在管理器上，而那是
+    // GUI 线程专用的。与按键攒批同一形状 —— 投递方永远不需要跨线程碰 VM。
+    let invalidate_owner = owner.clone();
+    host.set(
+        "invalidate",
+        lua.create_function(move |_lua, ()| {
+            crate::plugins::plugin_refresh::mark_dirty(&invalidate_owner);
+            Ok(true)
+        })?,
+    )?;
 
     // 注册为全局 `focusflow`
     lua.globals().set("focusflow", host.clone())?;
