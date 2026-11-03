@@ -769,6 +769,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "focusflow-plugin-tool"
+version = "0.4.8"
+dependencies = [
+ "focusflow-core",
+]
+
+[[package]]
 name = "foreign-types"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

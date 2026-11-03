@@ -1,0 +1,23 @@
+[package]
+name = "focusflow-plugin-tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 插件作者的工具链（方案 3.3 / 路线图 P2 第 18 步）。
+# 与 `focusflow-cli` 分开发：那一份读的是用户的数据、命令都是"动账本"的；
+# 这一份只在脚本文件上做静态活，一个字节都不碰正在使用的会话。
+[[bin]]
+name = "focusflow-plugin"
+path = "src/main.rs"
+
+[dependencies]
+focusflow-core = { path = "../core" }
+
+[dev-dependencies]
+# 脚手架那一条腿要走真加载器：生成的那份 `.lua` 必须能被宿主装起来，
+# 而不是只被工具自己的尺子说"没问题"（临时程序目录助手挂在 core 的 test-utils 特征上）。
+focusflow-core = { path = "../core", features = ["test-utils"] }
+
+[lints]
+workspace = true

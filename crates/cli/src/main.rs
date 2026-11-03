@@ -53,8 +53,6 @@ const USAGE: &str = "\
   --cleanup <天数>           保留 N 天（含今天），删除更早的数据
   --import-legacy <旧目录>   从旧版（Python 原版或旧数据目录）导入全部数据
                              到当前数据目录（同名年度库会被改写，先 --backup）
-  --validate-plugin <路径>   检查一份脚本插件的 .lua：字段会不会被折掉、声明的权限与
-                             代码真用到的格子对不对得上（只出声提示，不影响加载）
   --reset                    清空所有统计记录（需输入 yes 确认）
   -h, --help                 显示本帮助
 ";
@@ -72,7 +70,6 @@ fn max_args(cmd: &str) -> Option<usize> {
         "--export" => Some(2),
         "--rename-device" => Some(2),
         "--list-years" | "--reset" | "--vacuum" | "--backup" => Some(0),
-        "--validate-plugin" => Some(1),
         _ => None,
     }
 }
@@ -175,30 +172,6 @@ fn run(args: &[String]) -> i32 {
                 &args[1],
                 args.get(2).map(|s| s.as_str()).unwrap_or("all"),
             )
-        }
-        "--validate-plugin" => {
-            if args.len() < 2 {
-                eprintln!("用法: --validate-plugin <插件的 .lua 路径>");
-                return 1;
-            }
-            // 判定全在 core（`plugins::validate`），这一头只读路径、选退出码：
-            // 尺子抄第二把，命令行说"这份没问题"而插件页说"要授权"就会分家。
-            // 这一条是作者手敲的，不是挂在计划任务上的，所以话一律走 stdout，
-            // 只有"根本没问到"（文件读不出来）走 stderr。
-            match focusflow_core::plugins::validate::validate_path(std::path::Path::new(&args[1])) {
-                Err(why) => {
-                    eprintln!("{why}");
-                    1
-                }
-                Ok(report) => {
-                    println!("{}", report.render());
-                    if report.has_errors() {
-                        1
-                    } else {
-                        0
-                    }
-                }
-            }
         }
         "--reset" => {
             let db = db::Database::init_readonly();
@@ -1397,75 +1370,6 @@ mod tests {
                 body.contains("RANK_LIMIT"),
                 "{name} 还自己写死着截断行数，两处上限会分叉"
             );
-        }
-    }
-
-    /// `--validate-plugin` 只读路径、选退出码，判定全在 core 那把尺子里。
-    ///
-    /// 抄第二把的下场与本仓其它那几处一样：命令行说"这份没问题"、插件页说"要授权"。
-    #[test]
-    fn validate_plugin_delegates_the_caliper_to_core() {
-        let src = include_str!("main.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
-        let at = prod
-            .find("\"--validate-plugin\" =>")
-            .expect("--validate-plugin 那条分派不见了");
-        let arm = &prod[at..];
-        let arm = &arm[..arm.find("\"--reset\" =>").expect("下一条分派不见了")];
-        assert!(
-            arm.contains("plugins::validate::validate_path("),
-            "分派没走 core 那把尺子"
-        );
-        assert!(
-            !arm.contains("PLUGIN_PERMISSIONS") && !arm.contains("PLUGIN_LIFECYCLE"),
-            "命令行自己又抄了一把清单尺子（判定只有一个出处）"
-        );
-    }
-
-    /// 四种结局各有各的出口：没问题退 0、有问题退 1、根本没问到（文件读不出来）也退 1，
-    /// 少参数那句走用法提示。"没问到"不许折成"没问题"—— 那是本仓最高产的一类缺陷。
-    #[test]
-    fn validate_plugin_exit_codes_name_which_outcome_happened() {
-        assert_eq!(
-            run(&["--validate-plugin".into()]),
-            1,
-            "没给路径这一问根本没发生"
-        );
-        let dir = std::env::temp_dir().join(format!("ff_cli_validate_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("临时目录");
-        let good = dir.join("good.lua");
-        std::fs::write(
-            &good,
-            "PLUGIN_API = 2\nPLUGIN_PERMISSIONS = { \"stats.read\" }\nfunction get_view()\n  local s = focusflow.stats(7)\n  return { type = \"text\", text = tostring(s) }\nend\n",
-        )
-        .expect("写夹具");
-        assert_eq!(
-            run(&["--validate-plugin".into(), good.display().to_string()]),
-            0,
-            "声明与用法对得上的一份，不该有退出码"
-        );
-        let bad = dir.join("bad.lua");
-        std::fs::write(
-            &bad,
-            "PLUGIN_API = 2\nfunction init()\n  focusflow.teleport(1)\nend\n",
-        )
-        .expect("写夹具");
-        assert_eq!(
-            run(&["--validate-plugin".into(), bad.display().to_string()]),
-            1,
-            "宿主没有的那一格要说成问题"
-        );
-        let missing = dir.join("nope.lua");
-        assert_eq!(
-            run(&["--validate-plugin".into(), missing.display().to_string()]),
-            1,
-            "文件读不出来与「这份没问题」是两种结局"
-        );
-        // 收尾不写 `.ok()`：删不掉要出声，否则每跑一次在 %TEMP% 留一份（本场刚为此改过四块测试）
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                panic!("测试临时目录没删掉，留在 {}: {e}", dir.display());
-            }
         }
     }
 

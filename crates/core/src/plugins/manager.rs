@@ -891,7 +891,7 @@ impl PluginManager {
 
     /// 文件名（不含扩展名）：启用/停用配置的键。
     /// 用文件名而非 PLUGIN_NAME——后者插件作者可随时改，改了配置就失配。
-    pub(crate) fn stem_of(path: &Path) -> String {
+    pub fn stem_of(path: &Path) -> String {
         path.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("plugin")
