@@ -20,6 +20,7 @@ use crate::config::FocusFlowConfig;
 use crate::db;
 use crate::edge_history;
 use crate::plugins::plugin_store;
+use crate::plugins::resources;
 use crate::pomodoro::{self, PomodoroTimer};
 use crate::scheduler;
 
@@ -94,7 +95,7 @@ fn ensure_pomodoro_db() {
 /// 那比"线程留在原地跑"更糟。
 static POMODORO_OWNER: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
-fn claim_pomodoro(owner: &str) {
+pub(crate) fn claim_pomodoro(owner: &str) {
     *POMODORO_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = Some(owner.to_string());
 }
 
@@ -139,7 +140,10 @@ pub fn shutdown_pomodoro() {
 }
 
 /// 取用调度线程，并把 `owner`（插件文件名，见 `PluginManager::stem_of`）记为用户之一。
-fn claim_scheduler(owner: &str) {
+///
+/// 走 [`crate::plugins::resources`] 的名册登记：归还那一路要按同一份名册叫完，
+/// 所以"谁在用"这一侧也必须出自同一处（只写 `release` 的登记表没有意义）。
+pub(crate) fn claim_scheduler(owner: &str) {
     let mut slot = SCHEDULER.lock().unwrap_or_else(|e| e.into_inner());
     if slot.runner.is_none() {
         slot.runner = Some(scheduler::Scheduler::start());
@@ -149,13 +153,21 @@ fn claim_scheduler(owner: &str) {
 
 /// 归还调度线程：只有最后一个用户走了才真的停线程。
 pub fn release_scheduler(owner: &str) {
+    release_scheduler_checked(owner);
+}
+
+/// 同一件事，交回"这一趟有没有把线程拆掉"：名册的 `release` 要说得出这句话，
+/// 而"跑过了"与"拆掉了"是两句话（`resources::HostResource::release` 的注释）。
+pub(crate) fn release_scheduler_checked(owner: &str) -> bool {
     let mut slot = SCHEDULER.lock().unwrap_or_else(|e| e.into_inner());
     slot.users.remove(owner);
     if slot.users.is_empty() {
         if let Some(s) = slot.runner.take() {
             s.stop();
+            return true;
         }
     }
+    false
 }
 
 /// 测试/诊断用：调度线程当前状态（`None` = 线程已回收，`Some(n)` = 在跑且有 n 个用户）。
@@ -575,7 +587,7 @@ pub fn register_host_api(
         lua.create_function(move |_, ()| {
             let t = pomodoro_timer();
             t.start_work().map_err(mlua::Error::RuntimeError)?;
-            claim_pomodoro(&work_owner);
+            resources::acquire(resources::POMODORO, &work_owner);
             Ok(())
         })?,
     )?;
@@ -586,7 +598,7 @@ pub fn register_host_api(
         lua.create_function(move |_, ()| {
             let t = pomodoro_timer();
             t.start_break().map_err(mlua::Error::RuntimeError)?;
-            claim_pomodoro(&break_owner);
+            resources::acquire(resources::POMODORO, &break_owner);
             Ok(())
         })?,
     )?;
@@ -686,7 +698,7 @@ pub fn register_host_api(
 
     let tasks_owner = owner.clone();
     let tasks_fn = lua.create_function(move |lua, ()| {
-        claim_scheduler(&tasks_owner);
+        resources::acquire(resources::SCHEDULER, &tasks_owner);
         // 第二个返回值 = 这一轮没读全的原因（空串 = 读全了）。只回清单的话，库打不开时
         // 面板拿到的是一张空表，而"没建过任务"与"读不出来"在界面上长得一模一样。
         let (tasks, gap) = scheduler::all_tasks_read();
@@ -724,7 +736,7 @@ pub fn register_host_api(
             String,
             bool,
         )| {
-            claim_scheduler(&add_owner);
+            resources::acquire(resources::SCHEDULER, &add_owner);
             match scheduler::add_task(&name, &target, &args, &stype, &stime, enabled) {
                 Ok(id) => Ok((id, String::new())),
                 Err(e) => Ok((-1i64, e.to_string())),
@@ -755,7 +767,7 @@ pub fn register_host_api(
             String,
             bool,
         )| {
-            claim_scheduler(&update_owner);
+            resources::acquire(resources::SCHEDULER, &update_owner);
             let r = scheduler::update_task(
                 id,
                 Some(&name),
@@ -777,7 +789,7 @@ pub fn register_host_api(
     // 与 scheduler_update 同形状：返回 (是否删到, 没删到的原因)。
     // 以前只有一个 bool，"库里读不出来"也会被插件说成"任务不存在"。
     let delete_fn = lua.create_function(move |_, id: i64| {
-        claim_scheduler(&delete_owner);
+        resources::acquire(resources::SCHEDULER, &delete_owner);
         let reason = match scheduler::delete_task(id) {
             Ok(true) => String::new(),
             Ok(false) => format!("任务 #{id} 不存在（可能已经被删掉了）"),
@@ -791,7 +803,7 @@ pub fn register_host_api(
     // 与 scheduler_delete 同形状：返回 (是否改成, 没改成的原因)。
     // 以前这个闭包恒回 Ok(())，"库里没这条"和"库被占住写不进去"都被插件说成"已启用"。
     let toggle_fn = lua.create_function(move |_, (id, enabled): (i64, bool)| {
-        claim_scheduler(&toggle_owner);
+        resources::acquire(resources::SCHEDULER, &toggle_owner);
         let reason = match scheduler::toggle_task(id, enabled) {
             Ok(true) => String::new(),
             Ok(false) => format!("任务 #{id} 不存在（可能已经被删掉了）"),
@@ -816,7 +828,7 @@ pub fn register_host_api(
     host.set(
         "scheduler_shutdown",
         lua.create_function(move |_, ()| {
-            release_scheduler(&shutdown_owner);
+            resources::release(resources::SCHEDULER, &shutdown_owner);
             Ok(())
         })?,
     )?;

@@ -737,6 +737,8 @@ struct PluginRow {
     /// 读的是 core 那份账本，页面不自己数耗时：两处各数一遍就会出现"页面上没标、
     /// 而它其实已经每秒只刷一次"这种说不清的落差。
     slow: bool,
+    /// 这一格**为什么没活着**（`panel` 那一档在等面板、常驻额度排到了队尾）。
+    note: Option<String>,
     refresh_ms: u64,
     min_app: String,
     store_bytes: Option<usize>,
@@ -803,6 +805,10 @@ impl PluginRow {
                 format!("{}：{}", self.grant_note, self.permission_names.join("、"))
             };
             (format!("{}（{names}）", self.desc), true)
+        } else if let Some(n) = &self.note {
+            // 「故意没加载」排在泛泛那句"已启用，尚未加载"**之前**：note 是更精确的那一句
+            // （`panel` 那一档在等面板、常驻额度排到了队尾），两句同时出现等于页面上自相矛盾。
+            (format!("{}（{n}）", self.desc), false)
         } else if self.enabled && !self.loaded {
             (format!("{}（已启用，尚未加载）", self.desc), false)
         } else {
@@ -998,6 +1004,11 @@ struct App {
     plugins_loaded: bool,
     /// 正在看哪个插件的视图（None = 插件清单）。
     plugin_open: Option<String>,
+    /// 上一拍开着的那一页（用来认出"关掉/换页"这一个转变）。
+    ///
+    /// 为什么不在三处关闭动作里各写一遍卸载：那三处迟早会漂移（本仓为"同一个手势的多个出口
+    /// 各写一份清理"改过好几次），而漏掉一处的代价是一份 VM 与一格常驻额度永远不回来。
+    plugin_panel_was: Option<String>,
     /// 插件视图的纵向滚动（像素）。
     pv_scroll: i32,
     /// 插件视图里打开的下拉（None = 没开）。
@@ -1500,6 +1511,7 @@ impl App {
                 plugins_loaded: false,
                 dash: dashboard::Dash::new(),
                 plugin_open: None,
+                plugin_panel_was: None,
                 pv_scroll: 0,
                 pv_select: None,
                 pv_modal: None,
@@ -3113,6 +3125,7 @@ impl App {
                             grant_note,
                             needs_grant,
                             slow: p.slow,
+                            note: p.note.clone(),
                             refresh_ms,
                             min_app,
                             // 存储那一格按**文件名**问（键从来进不了路径，见 plugin_store）
@@ -3267,6 +3280,12 @@ impl App {
     fn open_plugin_view(&mut self, hwnd: HWND, name: &str) {
         self.ensure_plugin_manager();
         if let Some(pm) = self.pm.as_mut() {
+            // `panel` 那一档是"打开这一页才装"（方案 3.14）：这一句就是那一步。
+            // 已经活着的是空操作，所以常驻那一档不会被重复装一遍。
+            if let Err(e) = pm.ensure_loaded(name) {
+                self.status = Some(format!("插件 {name} 装不起来：{e}"));
+                tracing_note(self.status.as_deref().unwrap_or(""));
+            }
             if let Err(e) = pm.refresh_view(name) {
                 self.status = Some(format!("插件 {name} 的视图取不出来：{e}"));
                 tracing_note(self.status.as_deref().unwrap_or(""));
@@ -11523,6 +11542,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     }
                 }
             }
+            // 关掉或换页的那一转变：把**上一**那一页按 `panel` 档位卸掉（方案 3.14）。
+            // 只卸上一页，是为了切换面板时不会把刚打开的那一页一起关掉；
+            // `always` 的那一档由 core 判，这里不参与。
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                let now_open = app.plugin_open.clone();
+                if let Some(was) = app.plugin_panel_was.clone() {
+                    if Some(was.clone()) != now_open {
+                        if let Some(pm) = app.pm.as_mut() {
+                            if pm.release_panel_of(&was) {
+                                tracing_note(&format!("面板关掉，卸掉只服务那一页的插件：{was}"));
+                                unsafe {
+                                    let _ = InvalidateRect(Some(hwnd), None, false);
+                                }
+                            }
+                        }
+                    }
+                }
+                app.plugin_panel_was = now_open;
+            }
             // 「当前速度」跟这 100ms 一拍走：数值变了才重画（否则等于 10Hz 全窗重绘）。
             let cpm_now = if collect::is_started() && !collect::is_paused() {
                 collect::cpm()
@@ -17120,6 +17158,7 @@ mod plugin_page_tests {
             grant_note: "已授权".to_string(),
             needs_grant: false,
             slow: false,
+            note: None,
             refresh_ms: 0,
             min_app: String::new(),
             store_bytes: None,
@@ -17258,6 +17297,60 @@ mod plugin_page_tests {
         assert!(
             prod.contains("app.pump_plugin_timers();"),
             "那一拍里没有真的调用（被注释掉与从来没写都算没接上）= 排程永远没人跑"
+        );
+    }
+
+    /// 「故意没加载」那句排在"已启用，尚未加载"之后，且不许画成坏消息。
+    ///
+    /// 顺序错的症状是页面上每一行 `panel` 档的插件都长得像出过错：那句"面板打开时才加载"
+    /// 本来是解释，跟着 danger 色就变成指控。两边都钉，反向那条也一起：真失败时不许被说明盖掉。
+    #[test]
+    fn a_deliberately_unloaded_row_explains_itself_without_becoming_an_error() {
+        let mut r = row("paneled_tool", false);
+        r.loaded = false;
+        r.note = Some("面板打开时才加载".to_string());
+        let (line, bad) = r.second_line();
+        assert!(line.contains("面板打开时才加载"), "{line}");
+        assert!(!bad, "设计如此的没加载不许画成 danger 色");
+        assert!(
+            !line.contains("已启用，尚未加载"),
+            "同一格不许同时说两句话: {line}"
+        );
+        r.error = Some("顶层就炸".to_string());
+        let (worse, worse_bad) = r.second_line();
+        assert!(
+            worse.starts_with("加载失败") && worse_bad && !worse.contains("面板打开"),
+            "真失败的原因不许被那句解释盖住: {worse}"
+        );
+    }
+
+    /// 面板装卸这一条链两头都在生产里：打开那一格会装，关掉那一拍会卸。
+    ///
+    /// 少任何一头，`PLUGIN_LIFECYCLE` 就只是页面上那个「面板 / 常驻」标签：
+    /// 只装不卸是一份 VM 永远不回来，只卸不装是点开一张空卡。
+    #[test]
+    fn the_panel_lifecycle_chain_has_both_ends_in_production() {
+        let code = include_str!("../src/main.rs");
+        let at = code
+            .find("mod plugin_page_tests {")
+            .expect("插件页那一套用例的模块起点找不到了");
+        let prod: String = code[..at]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            prod.contains("pm.ensure_loaded(name)"),
+            "打开面板不再装那一格 ⇒ `panel` 档永远打不开（清单上还会写着「面板打开时才加载」）"
+        );
+        assert_eq!(
+            prod.matches("pm.release_panel_of(&was)").count(),
+            1,
+            "卸那一格只该有一个调用点：多个出口各写一遍，迟早有一处漏掉"
+        );
+        assert!(
+            prod.contains("plugin_panel_was: None"),
+            "上一拍开着哪一页没被记住 ⇒ 关掉与切换的那个转变认不出来"
         );
     }
 

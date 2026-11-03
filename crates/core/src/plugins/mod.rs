@@ -21,6 +21,7 @@ pub mod permissions;
 pub mod plugin_refresh;
 pub mod plugin_store;
 pub mod plugin_timers;
+pub mod resources;
 
 pub use manager::{
     Discovered, DiscoveredPlugin, PluginInfo, PluginLifecycle, PluginManager, PluginManifest,

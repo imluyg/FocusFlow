@@ -29,6 +29,7 @@ use crate::plugins::host;
 use crate::plugins::permissions;
 use crate::plugins::plugin_refresh;
 use crate::plugins::plugin_timers;
+use crate::plugins::resources;
 use crate::plugins::PluginView;
 
 /// 按键增量的取件口：写线程（或任何不能碰 Lua 的线程）只管往里并，GUI 线程一拍取一次。
@@ -163,6 +164,27 @@ impl PluginLifecycle {
 
 /// 清单里那几个字段的缺省值（方案 3.3：v1 老插件什么都不写也是这套）。
 const DEFAULT_PLUGIN_API: u32 = 1;
+
+/// 同时加载的常驻插件上限（方案 3.11 那张表：128 MB 总账 ÷ 16 MB 单插件上限 = 8）。
+///
+/// 为什么是"按启用顺序取前 8 个、其余标待加载"而不是静默丢掉：常驻插件是一份 VM 加一条
+/// 可能存在的后台线程，装十个就是十份。页面上要看得见是谁被挤掉、为什么，
+/// 以及要给得出路（先停用别的常驻插件）。
+pub const MAX_ALWAYS_PLUGINS: usize = 8;
+
+/// 这一条实际按哪一档活着。
+///
+/// 内置模块**由位置强制**常驻，用户装的认自己写的 `PLUGIN_LIFECYCLE`。两条都不看脚本里
+/// 写的 `PLUGIN_KIND` —— 身份由位置说一次（3.1），这里只把那份身份翻译成存活档位。
+/// 强制的那一半的理由：随包模块都靠宿主持续投递（番茄钟累计每个番茄的键数、定时任务到点
+/// 触发），让脚本自己写 `panel` 就等于让一次升级把统计打断。
+pub fn lifecycle_of(source: PluginSource, manifest: &PluginManifest) -> PluginLifecycle {
+    if source == PluginSource::Builtin {
+        PluginLifecycle::Always
+    } else {
+        manifest.lifecycle
+    }
+}
 
 /// 一个脚本插件在文件顶层声明的清单（方案 3.3 的那 9 个字段）。
 ///
@@ -313,6 +335,11 @@ pub struct DiscoveredPlugin {
     /// 只有打开过面板、且攒够样本的那一份才可能是真；没加载的一律 `false`
     /// —— 「这一页从来没跑过」与「它跑得慢」是两种话，不许折成同一句。
     pub slow: bool,
+    /// 这一格**为什么没活着**（`panel` 那一档在等面板打开、常驻额度已满时排在本轮之外）。
+    ///
+    /// 方案 16 那条底线：所有失败都要在插件页留下原因，不许出现"未加载而什么都没说"。
+    /// 这一格与 `error` 分开的理由也一样：`error` 说的是"试过了、坏了"，而这里是"故意没试"。
+    pub note: Option<String>,
 }
 
 impl DiscoveredPlugin {
@@ -323,11 +350,7 @@ impl DiscoveredPlugin {
     /// 就等于让一次升级把统计打断。反过来，强制也不看脚本里写了什么 `PLUGIN_KIND`
     /// —— 身份由位置说一次（3.1），这里只是把那份身份翻译成存活档位。
     pub fn lifecycle(&self) -> PluginLifecycle {
-        if self.source == PluginSource::Builtin {
-            PluginLifecycle::Always
-        } else {
-            self.manifest.lifecycle
-        }
+        lifecycle_of(self.source, &self.manifest)
     }
 }
 
@@ -400,6 +423,12 @@ pub struct PluginManager {
     /// 为什么按展示名而不是文件名：面板那侧唯一拿得到的就是名字（`open_plugin_view(name)`），
     /// 而这一格账本只为"这一页现在该不该重算"服务。
     plans: HashMap<String, plugin_refresh::Cadence>,
+    /// 被分流出去、这一轮**故意没加载**的插件：文件名 → 那句原因。
+    ///
+    /// 两个来源：`panel` 那一档等面板打开、常驻额度满了的排在本轮之外。
+    /// 这一格必须有，否则插件页上"已启用、未加载"与"加载失败"之外会多出第三种安静 ——
+    /// 用户只能猜。它不参与判重，只给页面念一句话。
+    pending: HashMap<String, String>,
 }
 
 impl Drop for PluginManager {
@@ -651,6 +680,7 @@ impl PluginManager {
             reload_rx: rx,
             reload_tx: tx,
             plans: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
 
@@ -782,18 +812,19 @@ impl PluginManager {
             info.loaded = false;
         }
         if !owner.is_empty() {
-            host::release_scheduler(&owner);
-            // 番茄钟也要按主人归还：Lua 侧唯一的回收入口是 `cleanup()` 里的
-            // `pomodoro_shutdown()`，而它跟着 `info.lua = None` 一起消失了。不还的后果与
-            // 调度线程同族——插件页写着「已停用」，计时线程却还在倒数、还在往库里写会话行、
-            // 还在加今日完成，而界面上已经没有地方能停它。按名字还而不是无条件拆：
-            // 调度插件自己超限不该把用户正在跑的番茄钟一起打断。
-            if host::shutdown_pomodoro_if_owned_by(&owner) {
-                tracing::warn!("番茄钟随插件 {name} 一起回收（进行中那一段已落库）");
+            // 出错停用 = 这份实例已经不在了，它占着的每一份共享资源都按名册叫一遍归还
+            // （方案 3.11）。从前这里是三行各叫各的（调度线程、番茄钟、定时器），
+            // 而第四份资源加进来时早晚会有人只补两处。
+            // 番茄钟那句要点名"进行中那一段已落库"：它按主人归还，不该把用户正在跑的
+            // 番茄钟被别的插件超限打断这件事说成一条普通的回收。
+            for label in resources::release_all(&owner) {
+                let tail = if label == resources::POMODORO {
+                    "（进行中那一段已落库）"
+                } else {
+                    ""
+                };
+                tracing::warn!("{label}随插件 {name} 一起回收{tail}");
             }
-            // 出错停用同样要销定时器：那条 Lua 已经不在了，而排程表是进程级的 ——
-            // 不销就是每一拍还在为一个跑不了的回调排队（方案 3.6「卸载/出错 ⇒ 自动全部取消」）。
-            plugin_timers::forget(&owner);
         }
         tracing::error!("插件已停用: {name}: {msg}");
     }
@@ -963,6 +994,7 @@ impl PluginManager {
                         source,
                         authorization: info.authorization.clone(),
                         slow: self.view_is_slow(&info.manifest.name),
+                        note: None,
                         error: if reasons.is_empty() {
                             None
                         } else {
@@ -976,6 +1008,14 @@ impl PluginManager {
                         // 插件页上「需要授权」与「已授权」的区别就是用户点不点那一颗按钮，
                         // 两处算得不一样会先看到一句假话、再看到一次被拒。
                         let authorization = Self::authorization_at(source, &manifest, &path);
+                        let note = Self::load_note(
+                            &self.pending,
+                            &stem,
+                            source,
+                            &manifest,
+                            enabled,
+                            false,
+                        );
                         DiscoveredPlugin {
                             manifest,
                             file: stem.clone(),
@@ -984,6 +1024,7 @@ impl PluginManager {
                             source,
                             authorization,
                             slow: false,
+                            note,
                             // 没加载、但加载失败过：原因得显示出来，不能只剩"未加载"
                             error: self.load_errors.get(&stem).cloned(),
                         }
@@ -1010,6 +1051,7 @@ impl PluginManager {
                             permissions::Authorization::Exempt
                         },
                         slow: false,
+                        note: None,
                         error: Some(e),
                     },
                 }
@@ -1472,6 +1514,28 @@ impl PluginManager {
             tracing::warn!("插件 {stem} 的 {e}：初始化没有执行");
         }
 
+        // 3.14 那条警告：标了 `always` 却没有任何后台入口的用户插件，多半是抄模板抄来的 ——
+        // 它会常驻着什么都不收，白占一份 VM 与一格常驻额度。
+        // **只出声，不擅自改档位**：把它折成 `panel` 会让页面上的「常驻」标签与脚本里写的
+        // 那两个字对不上，那是另一种"读不出来被念成没有"。后台入口有两种：`record_key`
+        // 这个钩子，以及 `init()` 真排下去的定时器/事件（后者要跑完 init 才知道）。
+        if source == PluginSource::User && meta.manifest.lifecycle == PluginLifecycle::Always {
+            let hooked = lua
+                .globals()
+                .get::<mlua::Value>("record_key")
+                .map(|v| matches!(v, mlua::Value::Function(_)))
+                .unwrap_or(false)
+                || !plugin_timers::board_for(&stem)
+                    .lock()
+                    .map(|b| b.is_empty())
+                    .unwrap_or(true);
+            if !hooked {
+                tracing::warn!(
+                    "插件 {stem} 声明 PLUGIN_LIFECYCLE = \"always\"，但它既没有 record_key \
+                     也没排任何定时器：这一格会常驻着什么都不收（多半是抄模板抄来的）"
+                );
+            }
+        }
         let view = if meta.has_view {
             match Self::read_view(&lua) {
                 Ok(v) => Some(v),
@@ -1568,7 +1632,7 @@ impl PluginManager {
                     .values()
                     .any(|p| is_same_source(&p.file_path, path))
                 {
-                    host::release_scheduler(&stem);
+                    resources::release_all(&stem);
                 }
                 self.load_errors.insert(stem, e.clone());
                 Err(e)
@@ -1778,18 +1842,17 @@ impl PluginManager {
             }
             info.loaded = false;
             info.lua = None;
-            // 兜底归还调度线程：这条路径上原本**只有** Lua 侧 `scheduler_shutdown()` 一个
-            // 出口，而 `cleanup` 是插件自愿写的（没写是合法形态），于是"用了日程 API 却没写
-            // cleanup"的整类插件停用之后 owner 永留 —— 线程为它续命、它登记的定时任务照旧
+            // 兜底归还：这条路径上原本**只有** Lua 侧 `scheduler_shutdown()` 一个出口，
+            // 而 `cleanup` 是插件自愿写的（没写是合法形态），于是"用了共享资源却没写
+            // cleanup"的整类插件停用之后登记永留 —— 线程为它续命、它登记的定时任务照旧
             // 到点启动程序，而那一刻 Lua 状态已经跟着上面那行没了，本进程再没有第二条归还路。
-            // 与 `mark_plugin_error` 补掉的是同一类，那条管超限停用，这条管正常停用。
+            // 现在按名册一次叫完（调度线程、番茄钟、定时器都在册）：卸载 = 这个实例占着的
+            // 每一份资源都归还，**不依赖插件写 cleanup**（方案 3.6 与 3.11 那两句）。
             // 只摘自己那个 stem：`users` 是集合，插件自己已经归还过也不会有第二次效果。
-            host::release_scheduler(&stem);
-            // 卸载 = 定时器全取消，**不依赖插件写 cleanup**（方案 3.6 那句）。
-            // 与上面那条归还同一个理由：那份 Lua 已经没了，插件侧再没有第二个取消入口。
-            let cancelled = plugin_timers::forget(&stem);
-            if cancelled > 0 {
-                tracing::info!("插件 {name} 卸载时取消了 {cancelled} 格定时器");
+            let gave = resources::release_all(&stem);
+            if !gave.is_empty() {
+                let names: Vec<&str> = gave.clone();
+                tracing::info!("插件 {name} 卸载时归还：{}", names.join("、"));
             }
             tracing::info!("插件已卸载: {name}");
             true
@@ -1919,9 +1982,147 @@ impl PluginManager {
             {
                 continue;
             }
+            // 生命周期先分流（方案 3.14）：`panel` 那一档**不在启动时加载**，
+            // 面板打开才装（`ensure_loaded`），关掉面板就卸（`release_panel_plugins`）。
+            // 这里读的是文本扫描的那份清单，不 exec 脚本：与插件页同一条路（3.3 那条判据），
+            // 而且"没打开过的面板不该在启动时就把它的库建出来、线程拉起来"正是这一档的目的。
+            let declared = match Self::scan_meta(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    // 读不出清单就不分流：按 `always` 那一路交给 `try_load` 去报真正的原因
+                    // （清单读不动多半是文件本身坏了，那条错误比"跳过"有用）。
+                    tracing::warn!("插件 {stem} 的声明读不出来（{e}）：这一格按常驻那一档尝试加载");
+                    self.pending.remove(&stem);
+                    let _ = self.try_load(&path, source);
+                    continue;
+                }
+            };
+            if lifecycle_of(source, &declared) == PluginLifecycle::Panel {
+                self.pending
+                    .insert(stem.clone(), "面板打开时才加载".to_string());
+                continue;
+            }
+            // 常驻额度（3.11）：装十个常驻插件就是十份 VM，所以按启用顺序取前 N 个，
+            // 其余标「待加载」而不是静丢掉 —— 页面上看得见是谁被挤掉了、为什么。
+            if self.always_count() >= MAX_ALWAYS_PLUGINS {
+                self.pending.insert(
+                    stem.clone(),
+                    format!(
+                        "常驻额度已满（{} 个），待加载：先在插件页停用别的常驻插件",
+                        MAX_ALWAYS_PLUGINS
+                    ),
+                );
+                tracing::warn!(
+                    "插件 {stem} 是常驻的，但常驻额度已满（{MAX_ALWAYS_PLUGINS} 个）：本次不加载"
+                );
+                continue;
+            }
+            self.pending.remove(&stem);
             let _ = self.try_load(&path, source);
         }
         true
+    }
+
+    /// 现在活着几份常驻插件（额度那一格用）。
+    fn always_count(&self) -> usize {
+        self.plugins
+            .values()
+            .filter(|p| lifecycle_of(p.source, &p.manifest) == PluginLifecycle::Always)
+            .count()
+    }
+
+    /// 这一格"故意没加载"的那句话。`None` = 没什么要交代的。
+    ///
+    /// 顺序是刻意的：额度那句排在前面（那是本轮真把它挡在外面的原因），
+    /// 其次才是 `panel` 那一档的"等面板打开"。已加载的什么都不说 ——
+    /// 对着一张活着的卡片说"没加载"是这一族缺陷最常见的形状。
+    fn load_note(
+        pending: &HashMap<String, String>,
+        stem: &str,
+        source: PluginSource,
+        manifest: &PluginManifest,
+        enabled: bool,
+        loaded: bool,
+    ) -> Option<String> {
+        if loaded {
+            return None;
+        }
+        if let Some(why) = pending.get(stem) {
+            return Some(why.clone());
+        }
+        if enabled && lifecycle_of(source, manifest) == PluginLifecycle::Panel {
+            return Some("面板打开时才加载".to_string());
+        }
+        None
+    }
+
+    /// 面板打开时确保这一格活着（方案 3.14 那张表的"面板打开 → 加载"那一行）。
+    ///
+    /// 为什么它**不受常驻额度限制**：额度是给"没人碰它也要一直活着"的那批准备的预算，
+    /// 而用户刚刚点了这一格。挤掉一个已经在跑的常驻插件去腾位置，换来的是
+    /// "我打开的面板说我待加载"——那是比超预算更糟的答案。
+    ///
+    /// 名字两处都认（展示名与文件名）：面板与插件页传的是清单里那一行的名字，
+    /// 而清单里两个都可能出现（作者改了 `PLUGIN_NAME` 之后两者就不同）。
+    pub fn ensure_loaded(&mut self, name: &str) -> Result<(), String> {
+        let alive = self
+            .plugins
+            .values()
+            .any(|p| p.loaded && (p.manifest.name == name || Self::stem_of(&p.file_path) == name));
+        if alive {
+            return Ok(());
+        }
+        let mut target: Option<(PathBuf, PluginSource, String)> = None;
+        for found in self.discover()? {
+            let stem = Self::stem_of(&found.path);
+            let display = Self::scan_meta(&found.path)
+                .map(|m| m.name)
+                .unwrap_or_else(|_| stem.clone());
+            if stem == name || display == name {
+                target = Some((found.path, found.source, display));
+                break;
+            }
+        }
+        let (path, source, display) = match target {
+            Some(t) => t,
+            None => {
+                return Err(format!(
+                    "插件「{name}」不在插件目录里：先确认文件还在（列出的两处是 {:?}）",
+                    self.plugin_dirs()
+                ));
+            }
+        };
+        self.pending.remove(&Self::stem_of(&path));
+        self.try_load(&path, source)?;
+        if !self
+            .plugins
+            .get(&display)
+            .map(|p| p.loaded)
+            .unwrap_or(false)
+        {
+            return Err(format!("插件「{name}」加载后没进清单（展示名 {display}）"));
+        }
+        Ok(())
+    }
+
+    /// 关掉某一页：只卸它自己那一格，而且只卸 `panel` 那一档（方案 3.14）。
+    ///
+    /// 为什么不写成"把所有 panel 档都卸掉"：切换面板时上一页关掉与下一页打开是同一个手势，
+    /// 一次叫完会把刚打开的那一页一起卸掉（症状是"点开第二页要等它重新装一次"）。
+    /// `always` 的那一档不动 —— 番茄钟的按键统计与日程的到点触发都靠常驻投递，
+    /// 随面板卸载就会**断统计**（那正是 3.3 给 `PLUGIN_LIFECYCLE` 写的理由）。
+    ///
+    /// 交回有没有真的卸掉：常驻那一格点了关闭是什么都没发生，这句要能说出口。
+    pub fn release_panel_of(&mut self, name: &str) -> bool {
+        let panel = self
+            .plugins
+            .get(name)
+            .map(|p| p.loaded && lifecycle_of(p.source, &p.manifest) == PluginLifecycle::Panel)
+            .unwrap_or(false);
+        if !panel {
+            return false;
+        }
+        self.unload_plugin(name)
     }
 
     /// 获取插件列表。
@@ -4202,20 +4403,22 @@ end
         );
         assert_eq!(
             consumers.matches("self.discover()?").count(),
-            2,
-            "带来源的两个消费点（列表、启用）都必须把 Err 原样交出去（`?`），而不是就地折成空"
+            3,
+            "带来源的三个消费点（列表、启用、面板打开时的 ensure_loaded）都必须把 Err 原样交出去\
+             （`?`），而不是就地折成空"
         );
         assert_eq!(
             consumers.matches("matchself.discover()").count(),
             1,
             "启动加载那一处必须自己接住 Err 并出声"
         );
-        // 兜底：三个消费点之外不许再有人取数（第四处一定是新加的，先问它吃哪种结局）
+        // 兜底：四个消费点之外不许再有人取数（第五处一定是新加的，先问它吃哪种结局）
         let total = consumers.matches("self.discover()").count()
             + consumers.matches("self.discover_paths()").count();
         assert_eq!(
-            total, 3,
-            "取数只有三个消费点（列表、启用、启动加载），第四处要先说清它吃的是哪种结局"
+            total, 4,
+            "取数只有四个消费点（列表、启用、启动加载、面板打开时的 ensure_loaded），\
+             第五处要先说清它吃的是哪种结局"
         );
         for (at, call) in consumers.match_indices("self.discover()") {
             let after = &consumers[at + call.len()..];
@@ -5372,36 +5575,63 @@ end
         );
     }
 
-    /// 出错回收这条路上，调度线程与番茄钟**都要**归还：只还一个就是"插件页说停了、
-    /// 计时线程还在跑还在写会话行"。番茄钟那条按主人还，见
-    /// `host::shutdown_pomodoro_if_owned_by`。
+    /// 回收路径只有那一个名字（方案 3.11 的名册）。
+    ///
+    /// 三条路各查一遍：出错停用、正常卸载、加载失败回滚 —— 从前这三处各写着
+    /// `host::release_scheduler` 与 `shutdown_pomodoro_if_owned_by`（第三处还漏了番茄钟），
+    /// 加第四份共享资源时就要三处各补一行，早晚有一处漏。现在都收成 `release_all`，
+    /// 而"名册里每份都被叫到"由 `resources` 自己的用例钉。
     #[test]
-    fn the_error_path_returns_both_plugin_resources() {
+    fn every_recycle_path_releases_the_whole_roster() {
         let src = include_str!("manager.rs");
-        let at = src
-            .find("fn mark_plugin_error")
-            .expect("mark_plugin_error 不见了");
-        let rest = &src[at..];
-        let cut = ["\n    fn ", "\n    pub fn "]
-            .iter()
-            .filter_map(|p| rest[2..].find(p).map(|i| i + 2))
-            .min()
-            .unwrap_or(rest.len());
-        let flat: String = rest[..cut]
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("")
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        assert!(
-            flat.contains("host::release_scheduler(&owner)"),
-            "出错那条路上调度线程的归还被摘掉了"
-        );
-        assert!(
-            flat.contains("host::shutdown_pomodoro_if_owned_by(&owner)"),
-            "出错那条路上没归还番茄钟：计时线程会在插件停用后继续跑、继续写会话行"
-        );
+        let call = ["resources::release_all", "(&o"].concat();
+        let call_stem = ["resources::release_all", "(&s"].concat();
+        for (site, needle) in [
+            ("fn mark_plugin_error", call.as_str()),
+            ("fn unload_plugin", call_stem.as_str()),
+            ("fn try_load", call_stem.as_str()),
+        ] {
+            let at = src.find(site).unwrap_or_else(|| panic!("{site} 不见了"));
+            let rest = &src[at..];
+            let cut = ["\n    fn ", "\n    pub fn "]
+                .iter()
+                .filter_map(|p| rest[2..].find(p).map(|i| i + 2))
+                .min()
+                .unwrap_or(rest.len());
+            let body: String = rest[..cut]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(
+                body.contains(needle),
+                "{site} 这条回收路径没有按名册一次叫完：那份资源会为已停用的插件继续跑"
+            );
+        }
+        // 旧的"各叫各的"写法不许在某一条路上偷偷回来
+        for site in ["fn mark_plugin_error", "fn unload_plugin"] {
+            let at = src.find(site).expect("回收路径的函数头不见了");
+            let rest = &src[at..];
+            let cut = ["\n    fn ", "\n    pub fn "]
+                .iter()
+                .filter_map(|p| rest[2..].find(p).map(|i| i + 2))
+                .min()
+                .unwrap_or(rest.len());
+            let body: String = rest[..cut]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(
+                !body.contains("host::release_scheduler(&"),
+                "{site} 又自己去还调度线程了：这一份该由名册叫"
+            );
+        }
     }
 }

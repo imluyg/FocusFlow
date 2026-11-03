@@ -313,6 +313,15 @@ fn listing_plugins_never_runs_their_code() {
     );
 }
 
+/// 清单里某一格"为什么没活着"的那一句（`None` = 没什么要交代的）。
+fn note_of(pm: &PluginManager, stem: &str) -> Option<String> {
+    pm.list_discovered()
+        .ok()?
+        .into_iter()
+        .find(|p| p.file == stem)?
+        .note
+}
+
 /// 加载失败的原因必须能在列表里看到：改用扫描取元数据之后，`read_meta` 那条
 /// 顺带报错的路子没了，不另记一笔的话插件页就只剩"未加载"三个字。
 #[test]
@@ -326,6 +335,18 @@ fn load_failure_is_visible_in_the_list() {
     );
     let (mut pm, _) = manager_in(tmp.path());
     pm.load_all();
+
+    // `panel` 那一档在启动那一轮不装（方案 3.14）：先确认清单说的是"等面板打开"，
+    // 再把面板打开一次 —— 那条"加载失败要留在清单上"的判据靠这一次真去装才露得出来。
+    assert_eq!(
+        note_of(&pm, "broken").as_deref(),
+        Some("面板打开时才加载"),
+        "启动那一轮该把它推到面板打开时，并且要在页面上说清楚"
+    );
+    assert!(
+        pm.ensure_loaded("broken").is_err(),
+        "顶层就炸的插件，打开面板时该报失败，而不是装出一个空壳"
+    );
 
     let entry = pm
         .list_discovered()
