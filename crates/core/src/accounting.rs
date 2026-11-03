@@ -287,12 +287,39 @@ fn merge_legacy_subcategories(conn: &Connection) -> Result<usize, String> {
         .unwrap_or(0);
     // 用 Vec 而不是 HashMap：并进来的顺序跟着查询结果走，`UPDATE` 的先后也就不再
     // 每进程随机（HashMap 的迭代序是随机的，同一份旧表两次迁移会写出不同的 UPDATE 序）
+    //
+    // 带逗号的名字先挑出来：`subs` 这一列本身用逗号分隔，`add_subcategory` /
+    // `update_subcategory` 两处入口都拿这条当契约，唯独这一支直接把旧表的原串接进
+    // `all.join(",")` —— 旧表那一列是可空的 TEXT、没有任何东西拦过逗号。硬并进去不是
+    // 报错而是**换个意思**：「点卡,充值卡」会变成两条谁也没建过的子分类，真那条从此
+    // 改不掉也删不掉（清单里已经没有它了），而用户在新冒出来的两条下面记账，
+    // 记的是一条根本不存在的名字。这一支交不回"哪一行没并"，所以跳过 + 点名，
+    // 不整轮失败：为一个名字把别的子分类也扣在旧表里，代价不对等。
+    let mut skipped: Vec<(String, String)> = Vec::new();
     let mut cat_subs: Vec<(String, Vec<String>)> = Vec::new();
     for (cat, sub) in merged {
+        if sub.contains(',') {
+            skipped.push((cat, sub));
+            continue;
+        }
         match cat_subs.iter_mut().find(|(n, _)| *n == cat) {
             Some((_, list)) => list.push(sub),
             None => cat_subs.push((cat, vec![sub])),
         }
+    }
+    if !skipped.is_empty() {
+        let listing = skipped
+            .iter()
+            .map(|(cat, sub)| format!("[{cat}] 下的「{sub}」"))
+            .collect::<Vec<_>>()
+            .join("；");
+        tracing::warn!(
+            "记账迁移：旧 subcategories 表里有 {} 个名字带逗号，subs 那一列拿逗号当分隔符、\
+             装不下这种名字（硬并进去会被读成几条不相干的子分类），这一轮没并：{listing}。\
+             已经记下的账不受影响（记录里的子分类整串存），要在清单里重新用上它，\
+             请在分类管理里建一个不带逗号的名字",
+            skipped.len()
+        );
     }
     for (cat, subs) in &cat_subs {
         // **并**，不覆盖。重并不是罕见边角：旧表收不掉（别的连接握着它）就是下一次启动
@@ -2982,6 +3009,51 @@ mod tests {
         assert!(
             !legacy_table_still_there(),
             "并成功之后旧表要收掉，否则每次启动都重并一次"
+        );
+    }
+
+    /// 旧表里带逗号的名字整条跳过，不许并进 `subs`。
+    ///
+    /// `subs` 这一列拿逗号当分隔符，这条不变量在 `add_subcategory` / `update_subcategory`
+    /// 的入口都守着，唯独合并这一支直接接进 `all.join(",")`。旧表那一列是随便写的 TEXT，
+    /// Python 时代没人拦逗号 —— 所以这不是假想输入。症状不是报错而是**换意思**：
+    /// 「点卡,充值卡」在清单里成为两条谁也没建过的名字，真那条反倒改不掉也删不掉，
+    /// 而用户会往那两条幽灵下面记账。
+    ///
+    /// 第二条腿钉的是这一轮选的那条口径（跳这一条而不是拒整份合并）：旧表要被收掉。
+    /// 写成"整轮失败"也一样能让第一条腿绿，但每次启动都重并一次、每启动一行告警，
+    /// 而别的子分类被一个名字扣住永远进不了下拉。
+    #[test]
+    fn a_legacy_name_with_a_comma_does_not_become_two_ghost_subcategories() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_comma_merge");
+        build_half_done_legacy_db();
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO subcategories (name, category_id, sort_order) \
+                 VALUES ('点卡,充值卡',1,2)",
+                [],
+            )
+            .unwrap();
+        }
+
+        init_db().expect("旧表里一个带逗号的名字不能让记账初始化失败");
+
+        let game = get_all_categories()
+            .0
+            .into_iter()
+            .find(|c| c.name == "游戏")
+            .expect("分类还在");
+        assert_eq!(
+            game.subs,
+            vec!["梦幻西游".to_string(), "充值".to_string()],
+            "带逗号那条要整条跳过、其余按 sort_order 并进来（清单里多出「点卡」「充值卡」＝把它拆成了幽灵）"
+        );
+        assert!(
+            !legacy_table_still_there(),
+            "跳过一个名字不算整轮失败：旧表这一轮照样要收掉，否则每次启动重并一次、\
+             而别的子分类被这一个名字扣住永远进不了下拉"
         );
     }
 
