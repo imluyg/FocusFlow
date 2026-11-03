@@ -1215,6 +1215,14 @@ pub enum DashRange {
     Month,
 }
 
+/// 默认「本周」（方案 14 节第 3 项按默认执行）。`ViewState` 那一类"一屏交互状态"
+/// 要能 `Default`，它带的就是这一档 —— 缺省写在类型上，页面那边就不用各写一个初值。
+impl Default for DashRange {
+    fn default() -> Self {
+        Self::Week
+    }
+}
+
 impl DashRange {
     /// 页签上那两个字。
     pub fn label(self) -> &'static str {

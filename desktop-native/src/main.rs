@@ -8,6 +8,7 @@
 //! 滚动容器、六个视图、截图覆盖层与贴图都已做完；剩下的缺口清单在
 //! `docs/handoff-native-migration.md`。
 mod collect;
+mod dashboard;
 mod data;
 mod floating;
 mod floating_render;
@@ -753,6 +754,9 @@ enum Ctl {
     WinBtn(u8),
     Period(u8),
     ViewTab(u8),
+    /// 看板页那三个范围胶囊（今日/本周/本月）。手型指针要认它：胶囊是**点得动**的，
+    /// 指过去还是箭头就是"这里好像不能按"。
+    DashPill(u8),
     ATab(u8),
     RankPill(u8),
     SetNav(u8),
@@ -829,6 +833,9 @@ struct App {
     search_focused: bool,
     /// 后台操作把结果行塞这里，再投 `WM_OP_DONE` 让界面来取。
     ops: Arc<Mutex<Vec<String>>>,
+    /// 内置看板页的状态（哪一档 + 上次问库的时刻 + 算好的那一页）。
+    /// 数字本身在 `focusflow_core::dashboard`，这一页不写 SQL。
+    dash: dashboard::Dash,
     /// 插件管理器（Lua 不是 Send，只能待在 UI 线程）。
     pm: Option<PluginManager>,
     /// 插件列表（从 plugins/ 目录扫出来的）。
@@ -1341,6 +1348,7 @@ impl App {
                 plugin_rows: Vec::new(),
                 plugin_err: None,
                 plugins_loaded: false,
+                dash: dashboard::Dash::new(),
                 plugin_open: None,
                 pv_scroll: 0,
                 pv_select: None,
@@ -1515,6 +1523,7 @@ impl App {
                 collector_paused: collect::is_paused(),
                 cpm: collect::cpm(),
                 settings_cat: self.settings_cat,
+                dash_range: self.dash.range,
             };
             let pv = self.plugin_open.as_ref().and_then(|name| {
                 self.pm
@@ -1527,6 +1536,7 @@ impl App {
                 size.width,
                 size.height,
                 &snap,
+                &self.dash.board,
                 vs,
                 self.detail.as_ref(),
                 self.status.as_deref(),
@@ -1589,6 +1599,14 @@ impl App {
         for (i, r) in view_tabs().iter().enumerate() {
             if hit(*r, x, y) {
                 return Some(Ctl::ViewTab(i as u8));
+            }
+        }
+        // 看板页的范围胶囊与页签同一行，手型指针要一视同仁（那三个是真点得动的）。
+        if self.view == 6 {
+            for (i, (_, pill)) in dashboard::range_pills().iter().enumerate() {
+                if hit(*pill, x, y) {
+                    return Some(Ctl::DashPill(i as u8));
+                }
             }
         }
         match self.view {
@@ -1847,6 +1865,30 @@ impl App {
                 }
                 if i == 4 {
                     self.reload_plugins();
+                }
+                // 进看板页就先问一次库（方案 3.2.3 第一行：切到这一页时查一次）。
+                // 没这一句，第一次点进来看到的是上一次离开时那一页的旧数（或全空）。
+                if i == 6 {
+                    self.reload_board();
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+        }
+
+        // 看板页那三个范围胶囊（就在页签右边；矩形与画/悬停同源，命中用全仓那一个 `hit`）。
+        if self.view == 6 {
+            for (range, pill) in dashboard::range_pills() {
+                if !hit(pill, x, y) {
+                    continue;
+                }
+                // `set_range` 答 false = 点的就是当前那一档：那时不重查，
+                // 否则同一份数被"再点一下"白问一遍，而页面上什么都没变。
+                if self.dash.set_range(range) {
+                    tracing_note(&format!("看板换档 {} at ({x:.0},{y:.0})", range.label()));
+                    self.reload_board();
                 }
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2803,6 +2845,18 @@ impl App {
             let cfg = focusflow_core::config::instance();
             self.pm = Some(PluginManager::new(cfg, Arc::clone(&self._db)));
         }
+    }
+
+    /// 问一次内置看板页的那一屏数（切到这一页、换范围、以及停在这一页每 30 秒各来一次）。
+    ///
+    /// 「今日」那一档必须吃上还没落库的增量：主页顶部那颗卡片念的是"库值 + 增量"，
+    /// 这一页只读库值的话，同一屏上就会有两个今日数（打卡条那颗点为这件事改过一次，
+    /// 同一个症状不该在新页面上重犯）。代价也是同一份：落库那一瞬可能重复计一次，
+    /// 那是既有读数一起承担的窗口，不是这一页新引入的。
+    fn reload_board(&mut self) {
+        let range = self.dash.range;
+        self.dash.board = focusflow_core::dashboard::collect(range, collect::pending_today());
+        self.dash.mark_loaded();
     }
 
     /// 重扫插件目录（进插件页、切换开关之后各来一次）。
@@ -4990,6 +5044,8 @@ struct ViewState {
     cpm: i64,
     /// 设置页左侧选中的分类。
     settings_cat: usize,
+    /// 看板页当前选中的时间范围（画胶囊高亮与命中回写读同一份）。
+    dash_range: focusflow_core::db::queries::DashRange,
 }
 
 /// 左表格卡片的矩形：画图与命中测试共用。
@@ -5102,6 +5158,8 @@ fn draw_screen(
     w: f32,
     h: f32,
     snap: &Snapshot,
+    // 内置看板页算好的那一页（数字在 core 的 `dashboard`，这里只排版）
+    dash: &focusflow_core::dashboard::DashBoard,
     vs: ViewState,
     detail: Option<&DeviceDetail>,
     status: Option<&str>,
@@ -5266,6 +5324,9 @@ fn draw_screen(
             None => draw_plugins(p, w, h, plugins, plugin_err, vs),
         },
         5 => draw_settings(p, w, h, snap, vs, status, busy, filter),
+        // 第 7 个页签：内置看板页。它排在 `v => draw_placeholder` 前面是必须的 ——
+        // 那一支是"还没做的页签"的兜底，漏进来就会把这一页画成一句占位文案。
+        6 => draw_board_page(p, w, h, dash, vs),
         v => draw_placeholder(p, w, h, v),
     }
 
@@ -5335,18 +5396,21 @@ fn draw_window_buttons(p: &P<'_>, w: f32, vs: ViewState) {
     }
 }
 
-const VIEWS: [&str; 6] = [
+const VIEWS: [&str; 7] = [
     "键鼠排行",
     "应用排行",
     "设备排行",
     "活跃分析",
     "插件管理",
     "设置",
+    // 第 7 个页签（方案 14 节第 5 项按默认执行）：位置排在最后，
+    // 前面六个的索引与坐标一个字都不动 —— 它们各有命中测试与验收夹具按位置点。
+    "看板",
 ];
 
 /// 顶部视图页签的位置：画图与命中测试共用。
-fn view_tabs() -> [D2D_RECT_F; 6] {
-    let mut out = [rect(0.0, 0.0, 0.0, 0.0); 6];
+fn view_tabs() -> [D2D_RECT_F; 7] {
+    let mut out = [rect(0.0, 0.0, 0.0, 0.0); 7];
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = rect(16.0 + i as f32 * 84.0, 172.0, 80.0, 22.0);
     }
@@ -7660,6 +7724,203 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
     }
 }
 
+/// 内置看板页：范围胶囊 + KPI 四格 + 一句话 + 趋势 + 两列排行（方案 3.2）。
+///
+/// 三条约定：
+/// · 一个数字都不在这里算 —— 全部出自 `focusflow_core::dashboard`，那一半与「活跃分析」
+///   用的是同一批读数函数。同一天的数在两页不一样，用户只会信小的那个；
+/// · 趋势复用插件图表那一个画法（[`draw_plugin_chart`]）：纵轴顶格、绘图区边距、空数据
+///   那句「暂无数据」都只有一份，同一份数据不该因为换了一页就画成另一个高度；
+/// · 这一块 UI 的字体全是 `NO_WRAP` 且 `DrawText` 不按矩形裁切 —— 动态文本必须自己带
+///   宽度上界，预算与画它的那块矩形取同一个表达式（本仓那条老规矩）。
+fn draw_board_page(
+    p: &P<'_>,
+    w: f32,
+    h: f32,
+    dash: &focusflow_core::dashboard::DashBoard,
+    vs: ViewState,
+) {
+    let m = 16.0;
+    let top = 208.0;
+
+    // --- 范围胶囊：与页签同一行、在七个页签右边；几何与命中都读 `dashboard::range_pills` ---
+    for (i, (range, r)) in dashboard::range_pills().iter().enumerate() {
+        let active = vs.dash_range == *range;
+        if active {
+            p.round(*r, R_CONTROL, &p.br.accent, None);
+        } else {
+            p.round(*r, R_CONTROL, &p.br.card, Some(&p.br.border));
+            if vs.ctl == Some(Ctl::DashPill(i as u8)) {
+                p.round(*r, R_CONTROL, &p.br.hover, None);
+            }
+        }
+        p.text(
+            range.label(),
+            rect(r.left, r.top, r.right - r.left, r.bottom - r.top),
+            &p.fmt.tab,
+            if active { &p.br.white } else { &p.br.muted },
+        );
+    }
+
+    // --- KPI 行：四格，顺序与文案都由 core 那一半定死 ---
+    let kpi_gap = 10.0;
+    let kw = (w - m * 2.0 - kpi_gap * 3.0) / 4.0;
+    let row_h = 78.0;
+    for (i, (name, value)) in dash.kpi.iter().enumerate() {
+        let kx = m + i as f32 * (kw + kpi_gap);
+        p.card(rect(kx, top, kw, row_h), R_CARD);
+        let label_w = kw - 24.0;
+        let shown_label = p.clip(name, &p.fmt.caption, label_w);
+        p.text(
+            &shown_label,
+            rect(kx + 12.0, top + 10.0, label_w, 16.0),
+            &p.fmt.caption,
+            &p.br.muted,
+        );
+        let shown_value = p.clip(value, &p.fmt.value, label_w);
+        p.text(
+            &shown_value,
+            rect(kx + 12.0, top + 30.0, label_w, 30.0),
+            &p.fmt.value,
+            &p.br.fg,
+        );
+    }
+
+    // --- 一句话；缺读必须跟在它下面点名 ---
+    let line_y = top + row_h + 10.0;
+    let full_w = w - m * 2.0;
+    let sentence = p.clip(&dash.sentence, &p.fmt.body, full_w);
+    p.text(
+        &sentence,
+        rect(m, line_y, full_w, 20.0),
+        &p.fmt.body,
+        &p.br.fg,
+    );
+    if !dash.gaps.is_empty() {
+        // 「这份数只是下界」不说出来，整页念「本周共按键 0 次」与"他这周一次都没按"
+        // 在屏上就是同一句话（本仓修过好几次的那一类：读不出来不许印成没有）。
+        let note = p.clip(
+            &format!("这份读数这次没读全：{}", dash.gaps.join("；")),
+            &p.fmt.caption,
+            full_w,
+        );
+        p.text(
+            &note,
+            rect(m, line_y + 22.0, full_w, 16.0),
+            &p.fmt.caption,
+            &p.br.muted,
+        );
+    }
+
+    // --- 趋势（缩略版：只画线，数值留给「活跃分析」那一页）---
+    let trend_top = line_y + 44.0;
+    let trend_h = 200.0;
+    let labels: Vec<String> = dash.trend.iter().map(|(d, _)| short_day(d)).collect();
+    let points: Vec<i64> = dash.trend.iter().map(|(_, v)| *v).collect();
+    draw_plugin_chart(
+        p,
+        rect(m, trend_top, full_w, trend_h),
+        "line",
+        &labels,
+        &points,
+    );
+
+    // --- 两列排行 ---
+    let rank_top = trend_top + trend_h + 10.0;
+    let rank_h = (h - m - rank_top).max(120.0);
+    let col_w = (full_w - 12.0) / 2.0;
+    draw_rank_card(
+        p,
+        rect(m, rank_top, col_w, rank_h),
+        "Top 应用（时长）",
+        &dash.top_apps,
+        true,
+    );
+    draw_rank_card(
+        p,
+        rect(m + col_w + 12.0, rank_top, col_w, rank_h),
+        "Top 按键（次数）",
+        &dash.top_keys,
+        false,
+    );
+}
+
+/// 横轴日期串只留 `MM-DD`；不是这个形状（导入的旧库、带时间的日期）就原样交回，
+/// 由那一格的夹取兜住宽度。
+fn short_day(date: &str) -> String {
+    match date.split_once('-') {
+        Some((_, rest)) if rest.len() == 5 => rest.to_string(),
+        _ => date.to_string(),
+    }
+}
+
+/// 一列排行：标题 + 每行「名称 …… 数字」。名称先夹（右边那 84 px 是数字的位置）。
+fn draw_rank_card(
+    p: &P<'_>,
+    card: D2D_RECT_F,
+    title: &str,
+    rows: &[(String, i64)],
+    by_seconds: bool,
+) {
+    use focusflow_core::format::{fmt_compact, fmt_compact_duration};
+    let pad = 12.0;
+    p.card(card, R_CARD);
+    p.text(
+        title,
+        rect(
+            card.left + pad,
+            card.top + 10.0,
+            card.right - card.left - pad * 2.0,
+            18.0,
+        ),
+        &p.fmt.body,
+        &p.br.fg,
+    );
+    if rows.is_empty() {
+        p.text(
+            "暂无数据",
+            rect(
+                card.left + pad,
+                card.top + 34.0,
+                card.right - card.left - pad * 2.0,
+                18.0,
+            ),
+            &p.fmt.caption_center,
+            &p.br.muted,
+        );
+        return;
+    }
+    let value_w = 84.0;
+    let name_w = (card.right - card.left) - pad * 2.0 - value_w - 8.0;
+    for (i, (name, value)) in rows.iter().enumerate() {
+        let y = card.top + 34.0 + i as f32 * 20.0;
+        // 画不进这张卡的那些行直接不画：这里没有点击区，但溢出卡外的文本比少一行更难解释
+        if y + 18.0 > card.bottom - 2.0 {
+            break;
+        }
+        let shown_name = p.clip(name, &p.fmt.caption, name_w);
+        p.text(
+            &shown_name,
+            rect(card.left + pad, y, name_w, 18.0),
+            &p.fmt.caption,
+            &p.br.fg,
+        );
+        let shown_value = if by_seconds {
+            fmt_compact_duration(*value)
+        } else {
+            fmt_compact(*value)
+        };
+        p.text(
+            &shown_value,
+            rect(card.right - pad - value_w, y, value_w, 18.0),
+            &p.fmt.caption_right,
+            &p.br.muted,
+        );
+    }
+}
+
+/// 还没接上的页签兜底：以前这一支连"越界"都画不出来（`view` 是 usize，比 6 大的数
+/// 会走到这里），所以它必须留在 `match vs.view` 的最后一支。
 fn draw_placeholder(p: &P<'_>, w: f32, h: f32, view: usize) {
     let m = 16.0;
     let text = match view {
@@ -10769,6 +11030,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             if n.is_multiple_of(50) {
                 tracing_note(&format!("timer tick {n}"));
             }
+            // 内置看板页的节奏（方案 3.2.3）：停在这一页、且窗口真的被看着时，每 30 秒
+            // 重查一次。三条判据都住在 `dashboard::should_refresh`，那一条用例能测到
+            // "最小化了还在问库"这一族浪费 —— 写在 UI 里就没人问得到。
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                let watching = matches!(watching_now(hwnd), Readers::Panel);
+                if dashboard::should_refresh(app.dash.elapsed_secs(), app.view == 6, watching) {
+                    app.reload_board();
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+            }
             // 验收模式（FOCUSFLOW_ACCEPTANCE=1）下每秒写一行机器可读的状态：
             // 脚本不用 OCR 就能断言「今日涨了几个」「暂停期间有没有停」。
             // 键名用 ASCII，值也只有数字/on-off，解析起来不用管编码。
@@ -11846,6 +12119,7 @@ mod chart_axis_mirror_tests {
             "fn draw_line_chart",
             "fn draw_plugin_chart",
             "fn plugin_chart_plan",
+            "fn draw_board_page",
             "fn left_rows",
             "fn gap_note",
             "fn axis_top",
@@ -12523,8 +12797,8 @@ mod snapshot_rate_tests {
         let call = ["watching_now", "("].concat();
         assert_eq!(
             prod.matches(call.as_str()).count(),
-            3,
-            "一处定义 + 循环里两处（睡前、睡完）——数量变了说明接线动过"
+            4,
+            "一处定义 + 快照循环里两处（睡前、睡完）+ 看板页那一处 —— 数量变了说明接线动过"
         );
         // 三档真的各有出口：`Card` 那一支必须把整批 `data::load` 换掉并当场 continue，
         // 少了那次 continue，卡片那一拍查完之后还是会跑整批 —— 数照旧、白加一问。
@@ -12545,6 +12819,16 @@ mod snapshot_rate_tests {
             branch.contains("g.today=thin.today;")
                 && branch.contains("g.today_app_seconds=thin.today_app_seconds;"),
             "只有卡片那一拍不再把今日/时长写回共享快照：托盘与验收读数会停在旧值"
+        );
+        // 第四处是内置看板页那一档（30 秒重查）。它必须把"有没有人看"当成**入参**交进去，
+        // 而不是在 UI 里另写一个时间比较：后者会最小化了还问库，而这一页看不见时问库
+        // 没有任何读者（方案 3.2.3 那张表的最后一行）。
+        assert!(
+            flat.contains("letwatching=matches!(watching_now(hwnd),Readers::Panel)")
+                && flat.contains(
+                    "dashboard::should_refresh(app.dash.elapsed_secs(),app.view==6,watching)"
+                ),
+            "看板那一档不再把「有没有人看」当条件：判据那三个入参少了一个"
         );
     }
 
