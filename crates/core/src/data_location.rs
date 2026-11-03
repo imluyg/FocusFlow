@@ -722,13 +722,14 @@ fn give_up(from: &Path, to: &Path, problem: String) {
 }
 
 /// 清掉待搬运标记并立刻落盘（去抖那一路来不及：进程可能马上就退了）。
+///
+/// 走 `set_now` 而不是 `set` + 另一次 `save`：`set` 恒回 `Ok(())`，所以从前那句
+/// 「清除 data_migrate_from 失败」和它后面的 `return` 是一条死路，写没落成只有
+/// `save` 那一问知道。现在一问就知道，而失败照旧只记日志、不清内存里那份标记的
+/// 运行时值 —— 文件里留着，下一次启动会再搬一次再清一次。
 fn clear_marker(cfg: &crate::config::FocusFlowConfig) {
-    if let Err(e) = cfg.set("paths", "data_migrate_from", "") {
-        tracing::error!("清除 data_migrate_from 失败: {e}");
-        return;
-    }
-    if let Err(e) = cfg.save() {
-        tracing::error!("清除迁移标记后落盘失败: {e}");
+    if let Err(e) = cfg.set_now("paths", "data_migrate_from", "") {
+        tracing::error!("清除 data_migrate_from 没落盘: {e}（标记留在文件里，下次启动会重试）");
     }
 }
 

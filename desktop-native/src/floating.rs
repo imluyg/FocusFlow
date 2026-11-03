@@ -1448,7 +1448,7 @@ fn persist_position(hwnd: HWND) {
             ("pos_x", (rc.left as f64 / scale).round().to_string()),
             ("pos_y", (rc.top as f64 / scale).round().to_string()),
         ] {
-            if let Err(e) = cfg.set("floating", key, &value) {
+            if let Err(e) = cfg.set_now("floating", key, &value) {
                 failed.push(format!("{key}={value}（{e}）"));
             }
         }

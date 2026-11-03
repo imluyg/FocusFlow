@@ -421,8 +421,17 @@ impl PluginManager {
         } else if !list.iter().any(|s| s.as_str() == stem) {
             list.push(stem.to_string());
         }
-        if let Err(e) = self.config.set("plugins", "disabled", &list.join(",")) {
-            tracing::error!("写入插件启用状态失败 ({stem}): {e}");
+        // 这一笔要问得出结局：`config::set` 恒回 `Ok(())`（真写盘的是另一头的去抖线程），
+        // 那个 `if let Err` 从来没有活过，而调用方（`desktop-native` 的 `toggle_plugin`）
+        // 把 `Ok` 念成「插件 X 已启用/停用」—— 屏上说完，下一次启动全都回到文件里那一档。
+        // 启用/停用是用户点一下的手势，当场落盘问一次才说得上"记住了"。
+        if let Err(e) = self.config.set_now("plugins", "disabled", &list.join(",")) {
+            let action = if enabled { "启用" } else { "停用" };
+            tracing::error!("写入插件{action}状态失败 ({stem}): {e}");
+            return Err(format!(
+                "插件「{stem}」的{action}状态没写进 config.ini（{e}）：\
+                 这一次改动只到本次运行，重启会回到文件里那一档"
+            ));
         }
         if enabled {
             // 只有当前未加载时才加载，避免重复初始化
@@ -1839,6 +1848,46 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
             "PLUGIN_NAME = \"{display}\"\nfunction get_view() return {{ title = \"{title}\", \
              widgets = {{ {{type=\"label\", text=\"v\"}} }} }} end\n"
         )
+    }
+
+    /// 「插件已启用/停用」这句话要有盘上的事实兜着，而不是只看着内存里改了。
+    ///
+    /// `config::set` 恒回 `Ok(())`（真落盘的是另一头的去抖线程），所以从前 `set_enabled`
+    /// 里那句 `if let Err(e) = self.config.set(...)` 是**死路**，调用方 `toggle_plugin`
+    /// 把 `Ok` 一律念成「插件 X 已停用」：屏上说完，重启之后那条又活了。
+    /// 现在当场落盘并问一次结局，落不成就交回 Err，并把"只到本次运行"说清楚。
+    ///
+    /// 两条腿各钉一边：干净那条钉**成功必须真的写进文件**（只断"不报错"盯不住
+    /// "回 Ok 而盘上没动"那一半）；障碍那条钉失败必须回 Err 且点名是哪一样。
+    #[test]
+    fn a_plugin_toggle_that_cannot_persist_says_so_instead_of_claiming_success() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("plugin_toggle_persist");
+        let plugins = tmp.path().join("plugins");
+        let alpha = write_lua(&plugins, "alpha", &view_only("甲"));
+        let mut pm = manager_in(tmp.path());
+        pm.load_plugin(&alpha).expect("alpha 该能加载");
+
+        let path = tmp.path().join("config.ini");
+        pm.set_enabled("alpha", false)
+            .expect("正常情况下停用该成功");
+        let on_disk = std::fs::read_to_string(&path).expect("配置文件该在");
+        assert!(
+            on_disk.contains("disabled") && on_disk.contains("alpha"),
+            "屏上说了已停用，文件里却没有它: {on_disk}"
+        );
+
+        // 夹具：把 `config.ini` 的位置换成**同名目录** ⇒ 那次 rename 必然失败
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let err = pm
+            .set_enabled("alpha", true)
+            .expect_err("写不进文件就不许回 Ok（回 Ok 屏上就是「已启用」）");
+        assert!(
+            err.contains("alpha") && err.contains("没写进 config.ini") && err.contains("重启"),
+            "失败要说清是哪一样、为什么、以及只到本次运行，实得: {err}"
+        );
+        std::fs::remove_dir_all(&path).unwrap();
     }
 
     /// 热重载的键是**文件名**，所以先按文件匹配、再按展示名。

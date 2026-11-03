@@ -595,7 +595,8 @@ pub struct FocusFlowConfig {
 ///
 /// 立它的原因：那句 warn 原先对三种状态只有一句话——「配置已读出来…本次运行仍按读出来
 /// 的值」，而其中两种恰恰**没有**读出来（文件读失败 ⇒ 内存里是默认值；文件根本不存在 ⇒
-/// 也是默认值）。同一渠道会被界面当作"保存出过错"显示（`last_save_error` / 设置页），
+/// 也是默认值）。同一渠道会显示到屏上（`corrupt_note` 由原生端写进启动那一行；
+/// `last_save_error` 那一栏今天没有生产读者），
 /// 于是它把"正在跑默认值"讲成"你的配置还在用"，正好说反。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoadedFrom {
@@ -826,7 +827,9 @@ impl FocusFlowConfig {
             // `TestAppDir` 删掉之后保存线程才落地，于是每跑一次全套留一个目录。
             //
             // 不建了之后 `atomic_write` 自然失败：待写标记保住（`?` 在摘除之前返回）、
-            // `last_save_error` 会被设置页当"保存出过错"显示出来，比静默复活一个空目录诚实。
+            // `last_save_error` 记下这一句（⚠ 它今天**没有生产读者**，只有本文件的测试读它：
+            // 设置页那句显示随旧前端一起没了），比静默复活一个空目录诚实。
+            // 屏上真正看得见的那一路是调用方自己拿 `set_now` 问出来的结局。
             if !parent.is_dir() {
                 return Err(anyhow::anyhow!(
                     "配置目录不存在，本次没写（也不会替你把它建出来）: {}",
@@ -1065,8 +1068,14 @@ impl FocusFlowConfig {
     /// 用户点一下开关是**一次可等的写**：这里同步走一遍 `save()`，把真的结局给出去。
     /// 并发安全与去抖线程共用同一把 `SAVE_WRITE_LOCK`（旧快照盖掉新值那一族由它挡），
     /// 写失败时待写标记照旧保住（`save_inner` 的 `?` 在摘除之前返回），退出前那次强制
-    /// save 还会再试一次。⚠ 高频那一路（悬浮窗拖动每动一下都写坐标）**留在 `set()`**：
-    /// 别把整文件重写搬进鼠标消息里。
+    /// save 还会再试一次。
+    ///
+    /// ⚠ 现量（2026-11-03）：改完之后生产侧只剩**一个** `set()` 调用方 ——
+    /// `desktop-native/src/main.rs` 的 `arrange_data_move`，它自己紧跟一次 `cfg.save()`
+    /// 并把那次的结局用 `?` 递出去，所以那一支问得出真假。原本以为是高频那一路
+    /// （悬浮窗拖窗）需要它，现量否掉：`persist_position` 只在 `WM_EXITSIZEMOVE` 跑
+    /// （一次拖完写两键），所以也换成这一条。`set()` 与那条去抖线程先留着：删它要连
+    /// `saver_tx` / `warn_saver_dead_once` / `record_save_error` 一起收，那是另一笔账。
     pub fn set_now(&self, section: &str, key: &str, value: &str) -> Result<(), String> {
         self.set_local(section, key, value);
         self.save().map_err(|e| format!("{e:#}"))
