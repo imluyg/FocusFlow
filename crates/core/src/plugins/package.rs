@@ -348,7 +348,7 @@ fn walk_assets(dir: &Path, prefix: &str, out: &mut Vec<Entry>) -> Result<(), Str
     Ok(())
 }
 
-/// 把条目写到目录里（安装那一步用）。
+/// 把条目写到目录里（当前没有生产调用方：安装是整包落盘，运行时不解压）。
 ///
 /// 名字在写入前**再过一遍**同一把尺子：`read` 已经验过，但调用方也可能把手工拼的条目
 /// 交进来（比如以后从别处导入），路径纪律不该只挂在一条入口上。
@@ -417,13 +417,12 @@ fn checked_name(name: &str) -> Result<(), String> {
     if name.len() > 512 {
         return Err(format!("条目名太长（{} 字节）：{name}", name.len()));
     }
-    if name.starts_with('/') || name.contains('\\') || name.contains('\0') {
+    // 冒号整串都挡：盘符不只长在开头。`assets/C:evil` 的第二段是一个 Windows
+    // 盘符相对路径，逐段 `Path::push` 会用它替换掉整个目标路径。
+    if name.starts_with('/') || name.contains('\\') || name.contains('\0') || name.contains(':') {
         return Err(format!(
-            "条目名 {name:?} 不是包内相对路径（不许绝对路径、反斜杠或 NUL）"
+            "条目名 {name:?} 不是包内相对路径（不许绝对路径、反斜杠、盘符或 NUL）"
         ));
-    }
-    if name.as_bytes().get(1) == Some(&b':') {
-        return Err(format!("条目名 {name:?} 带着盘符，不是包内相对路径"));
     }
     if name.ends_with('/') {
         return Err(format!("条目名 {name:?} 是目录条目：本格式只收文件"));
@@ -609,6 +608,29 @@ mod tests {
         let entries = pack_dir(&root).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["assets/icons/a.txt", SCRIPT_NAME]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 盘符藏在第二段也要挡：`checked_name` 原先只看整串的第 2 个字节，
+    /// 而解包那一侧是逐段 `Path::push` —— Windows 上 `push("C:evil")` 会把整个目标
+    /// 路径换成盘符相对路径，于是"解到目标目录里"这句话就不成立了。
+    #[test]
+    fn a_drive_letter_is_refused_wherever_it_sits() {
+        for bad in ["C:evil.lua", "assets/C:evil", "assets/c:/x"] {
+            let err = read(&raw_zip(bad, b"x", 0)).expect_err("带盘符的条目名必须被拒");
+            assert!(
+                err.contains("盘符") || err.contains("相对路径"),
+                "拒绝的理由要说是名字的问题：{err}"
+            );
+        }
+        let root = temp_dir("extract_drive");
+        let err = extract_to(&[entry("assets/C:evil", "x")], &root)
+            .expect_err("手工拼的条目也要过同一把尺子");
+        assert!(
+            err.contains("盘符") || err.contains("相对路径"),
+            "写入那一侧也要挡住：{err}"
+        );
+        assert!(!root.join("assets").exists(), "被拒的条目不该留下半个目录");
         let _ = std::fs::remove_dir_all(&root);
     }
 
