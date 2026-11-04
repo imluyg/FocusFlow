@@ -194,8 +194,12 @@ fn the_ledger_outlives_the_instance_it_came_from() {
     assert!(view.calls >= 1, "视图那一次的次数没落盘");
     let line = plugin_health::summary_line(&restored);
     assert!(
-        line.contains("视图重建") && line.contains("按键那一路写坏了"),
-        "页面上要能一句话念出这四档与最近一次原因：{line}"
+        line.contains("视图重建") && line.contains("失败记录 1 条"),
+        "页面上要一句话念得出「哪几档跑过」与「有过几条失败」：{line}"
+    );
+    assert!(
+        !line.contains("按键那一路写坏了"),
+        "原因正文属于详情页，不该挤进行上那一格：{line}"
     );
 }
 

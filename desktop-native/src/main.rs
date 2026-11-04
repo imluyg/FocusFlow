@@ -743,6 +743,11 @@ struct PluginRow {
     min_app: String,
     store_bytes: Option<usize>,
     store_error: Option<String>,
+    /// 这一格的耗时与历史那一句话（core 的台账算好的那一份）。
+    ///
+    /// `None` = 什么都没跑过，页面上**不画这一格**；画一句"还没有记录"进每一行，
+    /// 就是把"没轮到它跑"与"跑过且没问题"折成同一句的那种噪声。
+    health: Option<String>,
 }
 
 impl PluginRow {
@@ -781,6 +786,11 @@ impl PluginRow {
         // 慢熔断那一档要说出来：作者看"为什么我的面板变慢了"，用户看"这一格被降频过"
         if self.slow {
             parts.push("该插件较慢".to_string());
+        }
+        // 台账那一句话排在最后：前面那几格说的是"这一项是什么配置"，而这一句说的是
+        // "它跑起来怎么样、上一次为什么没跑成"。没可说的（`None`）就不画，不占位。
+        if let Some(h) = &self.health {
+            parts.push(h.clone());
         }
         parts.join(" · ")
     }
@@ -3108,6 +3118,9 @@ impl App {
                             min_app,
                             lifecycle: _,
                         } = p.manifest;
+                        // 耗时与历史那一句话读 core 算好的那一份（每一格最多摸一次文件：
+                        // 台账那一格在本进程第一次被问时才读盘，之后都在内存里）
+                        let health = focusflow_core::plugins::plugin_health::summary_for(&stem);
                         PluginRow {
                             name,
                             desc,
@@ -3131,6 +3144,7 @@ impl App {
                             // 存储那一格按**文件名**问（键从来进不了路径，见 plugin_store）
                             store_bytes,
                             store_error,
+                            health,
                         }
                     })
                     .collect();
@@ -17163,7 +17177,34 @@ mod plugin_page_tests {
             min_app: String::new(),
             store_bytes: None,
             store_error: None,
+            health: None,
         }
+    }
+
+    /// 台账那一句话要真进得了这一行，而 `None`（什么都没跑过）不许在屏上留下痕迹。
+    ///
+    /// core 那边"汇总句拼得出来"是另一条判据；这一条盯的是**页面读了它** —— 少了读者，
+    /// 落盘的 `health.json` 就是本仓普查点过的那一类"写了没人读"。
+    #[test]
+    fn the_row_prints_the_ledger_line_only_when_it_exists() {
+        let quiet = row("health_row", false);
+        let before = quiet.declaration();
+        assert!(
+            !before.contains("p95") && !before.contains("还没有记录"),
+            "全新的格子不该带耗时那一句，也不该占一格：{before}"
+        );
+
+        let mut loud = row("health_row", false);
+        loud.health = Some("失败记录 2 条 · 视图重建超预算 2 次（p95 3.0 ms）".to_string());
+        let after = loud.declaration();
+        assert!(
+            after.contains("视图重建超预算 2 次"),
+            "页面上没读到台账那一句：{after}"
+        );
+        assert!(
+            after.ends_with("失败记录 2 条 · 视图重建超预算 2 次（p95 3.0 ms）"),
+            "台账那一句排在既有那几格之后（配置在前、跑起来怎么样在后）：{after}"
+        );
     }
 
     /// 「需要授权」那句必须点名**要点同意的到底是哪几项**，而且排在"已启用尚未加载"之前。

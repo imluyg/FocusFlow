@@ -40,6 +40,13 @@ pub const HEALTH_DOC_VERSION: u32 = 1;
 
 const HEALTH_FILE: &str = "health.json";
 
+/// 页面那一行的汇总最多多少个字符。
+///
+/// 这一页的字体全是 `NO_WRAP`，而 `DrawText` 不按矩形裁切 —— 一句没有上界的动态文本会一路
+/// 画到窗口外（本仓为同一件事改过"两条长路径拼进一句"那一处）。行上那格的宽度是个固定
+/// 表达式，所以"反正会被夹掉"不算保护：夹在哪一处由读的人决定，不如写的人自己停在界上。
+pub const SUMMARY_MAX_CHARS: usize = 88;
+
 /// 四类钩子。方案 3.12 那张表里的四行，一行一档。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -321,39 +328,89 @@ impl HealthDoc {
     pub fn hook(&self, kind: HookKind) -> Option<&HookDoc> {
         self.hooks.iter().find(|h| h.kind == kind.keyword())
     }
+
+    /// 这一份账有没有可说的：任何一类跑过、被降过频、被停用过，或留着错误历史。
+    ///
+    /// 「有没有东西可说」这条判断只许有这一份出处 —— 页面那一格与 `summary_for` 各写一个
+    /// 空判据，迟早一边把"只有停用记录"当成有话、另一边当成没话。
+    pub fn has_anything(&self) -> bool {
+        self.hooks.iter().any(|h| h.calls > 0)
+            || self.throttle_flips > 0
+            || self.stops > 0
+            || !self.errors.is_empty()
+    }
+}
+
+/// 插件页那一行要念的那一句；**没可说的时回 `None`**。
+///
+/// 页面上不该为了一句"这一格还没有记录"给每个插件多占一格 —— 那正是"没有"与
+/// "还没轮到它跑"混成同一句的那类噪声（本仓在打卡条与周报上修过同源的两处）。
+/// 有内容时交回 [`summary_line`] 那一份，句子只有一处写法。
+pub fn summary_for(stem: &str) -> Option<String> {
+    let doc = board_for(stem)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .to_doc();
+    if doc.has_anything() {
+        Some(summary_line(&doc))
+    } else {
+        None
+    }
 }
 
 /// 页面与工具念的那一句。四类都没跑过、也没错误时给的是"没有记录"，
 /// 不是空串——空串在屏上与"这一格没接上"分不开。
 pub fn summary_line(doc: &HealthDoc) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    if !doc.has_anything() {
+        return "这一格还没有记录".to_string();
+    }
+    // 先"要动它的那半句"，再读数：一句被夹在界上时，留下的应该是让人知道下一步做什么的那部分。
+    // 原因正文不在这一行里 —— 行上只报**几条**，具体那几句话属于详情页（那里列错误历史）。
+    let mut head: Vec<String> = Vec::new();
+    if !doc.errors.is_empty() {
+        head.push(format!("失败记录 {} 条", doc.errors.len()));
+    }
+    if doc.stops > 0 {
+        head.push(format!("停用 {} 次", doc.stops));
+    }
+    if doc.throttle_flips > 0 {
+        head.push(format!("降频 {} 次", doc.throttle_flips));
+    }
+    let mut body: Vec<String> = Vec::new();
     for kind in HookKind::ALL {
         let Some(h) = doc.hook(kind) else { continue };
         if h.calls == 0 {
             continue;
         }
-        parts.push(format!(
-            "{} p95 {:.1} ms",
-            kind.label(),
-            h.p95_us as f64 / 1000.0
-        ));
         if h.over_budget > 0 {
-            parts.push(format!("超预算 {} 次", h.over_budget));
+            body.push(format!(
+                "{}超预算 {} 次（p95 {:.1} ms）",
+                kind.label(),
+                h.over_budget,
+                h.p95_us as f64 / 1000.0
+            ));
+        } else {
+            body.push(format!(
+                "{} p95 {:.1} ms",
+                kind.label(),
+                h.p95_us as f64 / 1000.0
+            ));
         }
     }
-    if doc.throttle_flips > 0 {
-        parts.push(format!("降频 {} 次", doc.throttle_flips));
+    let all: Vec<&String> = head.iter().chain(body.iter()).collect();
+    let joined = all
+        .into_iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let chars: Vec<char> = joined.chars().collect();
+    if chars.len() <= SUMMARY_MAX_CHARS {
+        return joined;
     }
-    if doc.stops > 0 {
-        parts.push(format!("停用 {} 次", doc.stops));
-    }
-    if let Some(last) = doc.errors.last() {
-        parts.push(format!("最近一次：{} {}", last.at, last.msg));
-    }
-    if parts.is_empty() {
-        return "这一格还没有记录".to_string();
-    }
-    parts.join(" · ")
+    // 自己停在界上，而不是让 DrawText 夹出去：夹出去的那一半是谁都猜不到的
+    let mut clipped: String = chars.iter().take(SUMMARY_MAX_CHARS - 1).collect();
+    clipped.push('…');
+    clipped
 }
 
 /// 时长转微秒：亚微秒的那一段折成 0（预算最小的那一档也有 200 µs，不会把"刚好"折成"超"）。
@@ -672,6 +729,77 @@ mod tests {
         assert!(err.contains("格式版本"), "认不得的版本要念出版本号：{err}");
     }
 
+    /// 页面那一行只在有话可说时才要这一句：`summary_for` 对空账回 `None`。
+    ///
+    /// `None` 与空串不是一回事 —— 页面拿 `None` 是"这一格别画"，拿空串会画出一个孤零零的分隔点。
+    /// 两档（跑过一次 / 只留了一条错误历史）都要算"有话"，因为它们走的是同一份判据。
+    #[test]
+    fn summary_for_is_quiet_only_when_there_is_nothing_to_say() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("health_quiet");
+        assert_eq!(
+            summary_for("quiet_case"),
+            None,
+            "全新的格子什么都没跑过，不该有话"
+        );
+        let board = board_for("quiet_case");
+        board
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(HookKind::View, Duration::from_micros(3_000));
+        let said = summary_for("quiet_case").expect("跑过一次就该有话");
+        assert!(
+            said.contains("视图重建") && said.contains("超预算 1 次"),
+            "{said}"
+        );
+
+        assert_eq!(summary_for("error_only"), None);
+        board_for("error_only")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_error("07:00", "只留了一条原因");
+        assert!(
+            summary_for("error_only")
+                .expect("有历史就该有话")
+                .contains("失败记录 1 条"),
+            "只有错误历史的那一种被当成\"没话可说\" ⇒ 判据与页面各写了一份空判据"
+        );
+    }
+
+    /// 汇总那句有上界，而且被夹时留下的是"要动它的那半句"。
+    ///
+    /// 这一页全是 `NO_WRAP`，动态文本没有上界就会画到窗口外（本仓改过同源的两处）。
+    /// 段的先后按"下一步要不要动它"排：失败条数与停用/降频在前，各档 p95 读数在后。
+    #[test]
+    fn the_summary_line_is_bounded_and_keeps_the_actionable_half() {
+        let mut health = Health::default();
+        for kind in HookKind::ALL {
+            // 每一档都超预算，四段读数拼起来一定越过界
+            health.record(kind, Duration::from_micros(kind.budget_us() + 10));
+        }
+        health.note_throttle();
+        health.note_stop();
+        health.note_error("2026-11-04 07:31:09", "一条很长的原因");
+        let line = summary_line(&health.to_doc());
+        let chars = line.chars().count();
+        assert!(
+            chars <= SUMMARY_MAX_CHARS,
+            "汇总那句没有上界（{chars} 个字符 > {SUMMARY_MAX_CHARS}）：{line}"
+        );
+        assert!(
+            chars == SUMMARY_MAX_CHARS && line.ends_with('…'),
+            "内容多到越界时该停在界上并留省略号，而不是让 DrawText 夹：{line}"
+        );
+        assert!(
+            line.starts_with("失败记录 1 条"),
+            "被夹的时候留下的该是\"要动它的那半句\"：{line}"
+        );
+        assert!(
+            !line.contains("一条很长的原因"),
+            "原因正文不进这一行（它属于详情页的错误历史那一栏）：{line}"
+        );
+    }
+
     /// 页面念的那一句：空台账要说"还没有记录"，而不是空串（空串在屏上与"没接上"分不开）。
     #[test]
     fn the_summary_line_says_something_for_every_state() {
@@ -690,8 +818,8 @@ mod tests {
             "超预算那一格要说出口：{line}"
         );
         assert!(
-            line.contains("按键批次超限"),
-            "最近一条原因要念出来：{line}"
+            line.contains("失败记录 1 条"),
+            "有过几条失败要报出来（原因正文在详情页那一栏）：{line}"
         );
     }
 }
