@@ -2512,8 +2512,20 @@ impl PluginManager {
             // "文件还在不在"要问这一轮真被扫的那几处：只问内置目录会把用户插件的删除
             // 当成"还在"，只问数据目录则反过来把内置的删除吞掉。
             if !dirs.iter().any(|d| plugin_file_for(d, &name).is_some()) {
+                // 加载失败的那一份不在 `plugins` 里（`try_load` 只往 `load_errors` 留档），
+                // 于是 `unload_by_stem` 找不到实例、原样返回 false —— 这一格就永远留着。
+                // 症状：同名的新文件放进来时，插件页拿上一份的失败当它的（`list_discovered`
+                // 的未加载分支直接读 `load_errors`），自检报告也继续把已经不存在的文件
+                // 报成「启用但加载失败」。删文件 = 这一份的账一起丢，口径同
+                // `unload_plugin` 里那句。
+                let had_error = self.load_errors.remove(&name).is_some();
                 if self.unload_by_stem(&name) {
                     tracing::info!("插件文件已删除，已卸载: {name}");
+                    reloaded.push(name);
+                } else if had_error {
+                    // 没有活着的实例，但插件页上有这一行（带失败原因）→ 列表也得重扫，
+                    // 否则删掉的文件在页上留成一条点不进任何东西的幽灵。
+                    tracing::info!("加载失败的插件文件已删除，失败原因一并清掉: {name}");
                     reloaded.push(name);
                 }
                 continue;
@@ -4453,6 +4465,61 @@ end
             host::scheduler_state_for_test(),
             None,
             "卸载走了 cleanup，owner 才还得回来"
+        );
+    }
+
+    /// 删掉一个「加载失败、从没进过插件表」的文件之后，同名的新文件不许顶着上一份的
+    /// 失败原因。`unload_by_stem` 只在 `plugins` 里找实例，而失败那份只留在
+    /// `load_errors` ⇒ 删除分支从来摘不到它；插件页的「未加载」那一支直接读这一格，
+    /// 于是新放进来、还没试过加载的同名文件一上页就报「上次加载失败」。
+    /// 自检报告（`load_failures`）同样会把已经不存在的文件继续报成「启用但加载失败」。
+    #[test]
+    fn deleting_a_never_loaded_plugin_drops_its_load_error() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("hr_delete_failed");
+        // 用户插件那一侧（目录分离后的真实位置），source 跟着目录走
+        let plugins = tmp.path().join("data").join("plugins");
+        let p = write_lua(
+            &plugins,
+            "same_stem",
+            "PLUGIN_NAME = \"坏的那份\"\n这不是 Lua",
+        );
+        let mut pm = manager_in(tmp.path());
+        assert!(
+            pm.try_load(&p, PluginSource::User).is_err(),
+            "这份本来就该加载失败"
+        );
+        assert_eq!(
+            pm.load_failures().len(),
+            1,
+            "失败没记到账上，这条用例就测不到东西"
+        );
+
+        std::fs::remove_file(&p).unwrap();
+        pm.reload_tx.send("same_stem".to_string()).unwrap();
+        assert_eq!(
+            pm.poll_reload_requests(),
+            ["same_stem"],
+            "删掉一个加载失败的文件也要让插件页重扫，否则页上留一条指向空文件的幽灵"
+        );
+        assert!(
+            pm.load_failures().is_empty(),
+            "文件已经不在了，失败原因不该还挂在账上：{:?}",
+            pm.load_failures()
+        );
+
+        // 同名的新文件放进来：还没试过加载，行上不许有字
+        write_lua(&plugins, "same_stem", &view_with_name("新的一份", "新"));
+        let row = pm
+            .list_discovered()
+            .expect("这一轮的插件目录该读得动")
+            .into_iter()
+            .find(|p| p.file == "same_stem")
+            .expect("列表里得有这个文件那一行");
+        assert!(
+            row.error.is_none(),
+            "同名新文件顶着上一份的失败原因＝用户以为新代码也坏了：{:?}",
+            row.error
         );
     }
 
