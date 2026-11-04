@@ -915,6 +915,109 @@ end
         );
     }
 
+    /// 把"作者那份"写到 plugins/ 之外，返回（程序目录, 那份文件的路径）。
+    ///
+    /// 不能直接放在数据目录的 `plugins/` 里：`run` 会把手上这份拷进那一格再加载，
+    /// 同源同路径这种写法在 Windows 上就是一个错（这一场踩过一次）。
+    fn author_file(tag: &str, stem: &str) -> (paths::TestAppDir, PathBuf) {
+        let app = paths::test_app_dir(tag);
+        let author = app.path().join("author");
+        std::fs::create_dir_all(&author).expect("作者目录");
+        let file = author.join(format!("{stem}.lua"));
+        (app, file)
+    }
+
+    /// 夹具那两拍要各自有各自的一次跑，缺省那一拍当对照臂：
+    /// 摘掉投件或摘掉点动作，红点必须出现在"载荷没到手"那一句上，而不是永远绿。
+    fn run_in(app: &paths::TestAppDir, file: &Path, extra: &[&str]) -> String {
+        let mut args: Vec<String> = vec![
+            file.display().to_string(),
+            "--data".to_string(),
+            app.path().display().to_string(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let req = parse_run(&args).expect("参数读得动");
+        run_fixture(&req).expect("夹具该跑得动")
+    }
+
+    /// `--event app_change --app 名字` 那一拍：投出去的名字要落到插件自己写的那一格里。
+    ///
+    /// 对照臂是缺省那一拍（什么都没投）：只有两臂都在，"屏上出现了那个名字"才不是插件
+    /// 自己凭空写的、也不是上一拍剩在盘上的。
+    #[test]
+    fn the_app_change_beat_delivers_the_posted_name_into_the_plugin() {
+        let _g = guard();
+        let (app, file) = author_file("run_ac", "ac");
+        std::fs::write(
+            &file,
+            "\
+PLUGIN_NAME = \"ac\"
+PLUGIN_API = 2
+PLUGIN_PERMISSIONS = { \"events.app\", \"storage.read\", \"storage.write\" }
+function init()
+  focusflow.on(\"app_change\", function(name)
+    focusflow.store.set(\"who\", name)
+    focusflow.store.flush()
+  end)
+end
+function get_view()
+  return { title = \"ac\", widgets = { { type = \"label\", text = \"who=\" .. tostring(focusflow.store.get(\"who\")) } } }
+end
+",
+        )
+        .expect("写夹具");
+        let untouched = run_in(&app, &file, &[]);
+        assert!(
+            untouched.contains("who=nil"),
+            "什么都没投的那一拍不该已经有名字：{untouched}"
+        );
+
+        let (app2, file2) = author_file("run_ac2", "ac");
+        std::fs::write(&file2, std::fs::read_to_string(&file).expect("读夹具")).expect("写第二臂");
+        let posted = run_in(
+            &app2,
+            &file2,
+            &["--event", "app_change", "--app", "记事本.exe"],
+        );
+        assert!(
+            posted.contains("who=记事本.exe"),
+            "投出去的那个名字没到插件手里：{posted}"
+        );
+    }
+
+    /// `--event action --action id` 那一拍：点下去的 id 要真的进到 `on_action`。
+    #[test]
+    fn the_action_beat_clicks_the_button_the_plugin_actually_handles() {
+        let _g = guard();
+        let lua = "\
+PLUGIN_NAME = \"act\"
+PLUGIN_API = 2
+PLUGIN_PERMISSIONS = { \"storage.read\", \"storage.write\" }
+function on_action(id)
+  focusflow.store.set(\"last\", id)
+  focusflow.store.flush()
+end
+function get_view()
+  return { title = \"act\", widgets = { { type = \"label\", text = \"last=\" .. tostring(focusflow.store.get(\"last\")) } } }
+end
+";
+        let (app, file) = author_file("run_act", "act");
+        std::fs::write(&file, lua).expect("写夹具");
+        let untouched = run_in(&app, &file, &[]);
+        assert!(
+            untouched.contains("last=nil"),
+            "没点动作那一拍不该有值：{untouched}"
+        );
+
+        let (app2, file2) = author_file("run_act2", "act");
+        std::fs::write(&file2, lua).expect("写第二臂");
+        let clicked = run_in(&app2, &file2, &["--event", "action", "--action", "保存"]);
+        assert!(
+            clicked.contains("last=保存"),
+            "点下去的那个 id 没进 on_action：{clicked}"
+        );
+    }
+
     /// 多出来的参数不能被静悄悄丢掉：`hash a.lua b.lua` 只算 a 而退 0，
     /// 作者以为两份都核过了。
     #[test]
