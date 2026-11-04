@@ -8650,11 +8650,12 @@ fn draw_plugin_detail(
         &p.fmt.body,
         &p.br.fg,
     );
-    // 加载失败不经过台账（VM 都没起来），所以它排在最前面单独占一条：
-    // 这一页若只念台账，作者看到的就是"没有错误记录"，而这一格明明装不起来。
+    // 行上那一格不只有"加载失败"：按键/视图/事件某一路被熔断停掉也写在这里，
+    // 所以前缀不能写成「加载失败」。它不经过台账（加载失败时 VM 都没起来），
+    // 单独占最前面一条；不写的话这一页只念台账，作者看到的就是"没有错误记录"。
     let mut lines: Vec<String> = Vec::new();
     if let Some(e) = &row.error {
-        lines.push(format!("加载失败 · {}", one_line(e, 108)));
+        lines.push(format!("最近报错 · {}", one_line(e, 108)));
     }
     lines.extend(detail.errors.iter().cloned());
     if lines.is_empty() {

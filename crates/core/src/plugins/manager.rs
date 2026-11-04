@@ -70,6 +70,49 @@ struct PluginMeta {
 }
 
 /// 插件信息。
+/// 「坏」那一档的窗口：最近 50 次里 3 次失败 ⇒ 停掉**那一条路线**，不是整个插件。
+///
+/// 为什么按路线而不是整个插件：视图、按键批次、定时/事件三条路各有各的受害者。
+/// 按键钩子每次都抛错时，把整个插件卸掉会连面板一起没收；只停按键那一路，
+/// 用户还能看视图、点按钮，页面上也写着是哪一路停了。`on_action` / `set_field`
+/// 是用户点出来的一次调用，失败当场返回给点它的那个人，不设窗口。
+const FAIL_WINDOW: usize = 50;
+const FAIL_TRIPS: usize = 3;
+
+/// 一条路线的失败窗。`record` 在第 3 次失败落进来的那一刻交回 true（只交回一次）。
+#[derive(Default)]
+struct RouteBreaker {
+    outcomes: std::collections::VecDeque<bool>,
+    stopped: Option<String>,
+}
+
+impl RouteBreaker {
+    fn record(&mut self, failed: bool) -> bool {
+        if self.stopped.is_some() {
+            return false;
+        }
+        while self.outcomes.len() >= FAIL_WINDOW {
+            self.outcomes.pop_front();
+        }
+        self.outcomes.push_back(failed);
+        if self.outcomes.iter().filter(|failed| **failed).count() >= FAIL_TRIPS {
+            // 先占位，调用方紧接着用 `stop_with` 填那句原因；中间没有可观察的窗口
+            // （同一线程、同一次调用里）。
+            self.stopped = Some(String::new());
+            return true;
+        }
+        false
+    }
+
+    fn stop_with(&mut self, why: String) {
+        self.stopped = Some(why);
+    }
+
+    fn stopped(&self) -> Option<&str> {
+        self.stopped.as_deref()
+    }
+}
+
 pub struct PluginInfo {
     /// 脚本自己声明的那份清单（加载时经 `read_meta` 折叠）
     pub manifest: PluginManifest,
@@ -92,6 +135,10 @@ pub struct PluginInfo {
     pub lua: Option<Lua>,
     /// 插件声明的视图（get_view() 结果缓存）
     pub view: Option<PluginView>,
+    /// 三条路线各自的失败窗（3.9「坏」那一档，按路线分开）。
+    view_route: RouteBreaker,
+    key_route: RouteBreaker,
+    event_route: RouteBreaker,
 }
 
 /// 插件出自哪一处目录，即它的**身份**。
@@ -1669,6 +1716,9 @@ impl PluginManager {
             gate,
             lua: Some(lua),
             view,
+            view_route: RouteBreaker::default(),
+            key_route: RouteBreaker::default(),
+            event_route: RouteBreaker::default(),
         };
 
         // 新实例装好了，才让同源的旧版本退休。同名的那条由 insert 顶掉；
@@ -1756,6 +1806,15 @@ impl PluginManager {
         // 每个插件的每一格订阅者拿同一份，而"这一格见过谁"记在各自的排程表上。
         let app = plugin_events::take_app_change();
         for (name, stem) in loaded {
+            // 事件/定时这一路已经停过：不再投（其余两路照常）。
+            if self
+                .plugins
+                .get(&name)
+                .map(|p| p.event_route.stopped().is_some())
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let board = plugin_timers::board_for(&stem);
             let due = {
                 let mut guard = board.lock().unwrap_or_else(|e| e.into_inner());
@@ -1787,13 +1846,39 @@ impl PluginManager {
                     Self::fire_hook(lua, cfg, &stem, handle, payload.as_deref())
                 };
                 match outcome {
-                    Ok(()) => fired += 1,
+                    Ok(()) => {
+                        fired += 1;
+                        if let Some(info) = self.plugins.get_mut(&name) {
+                            info.event_route.record(false);
+                        }
+                    }
                     Err(e) => {
                         let msg = format!("{}回调（句柄 {handle}）失败: {e}", which);
                         tracing::error!("插件 {name} {msg}");
                         if is_limit_error(&e) {
                             // 死循环的那一类交给既有的熔断：停用、销表、插件页留原因
                             self.mark_plugin_error(&name, msg);
+                            break;
+                        }
+                        // 与视图那一路同一条：进错误历史，停了就不再记。
+                        self.note_hook_error(&name, &msg);
+                        let tripped = self
+                            .plugins
+                            .get_mut(&name)
+                            .map(|info| info.event_route.record(true))
+                            .unwrap_or(false);
+                        if tripped {
+                            let stop = format!(
+                                "定时/事件回调已停：最近 {FAIL_WINDOW} 次里 {FAIL_TRIPS} 次失败（最后一次：{msg}）——修好后停用再启用"
+                            );
+                            if let Some(info) = self.plugins.get_mut(&name) {
+                                info.event_route.stop_with(stop.clone());
+                                if info.error.is_none() {
+                                    info.error = Some(stop.clone());
+                                }
+                            }
+                            tracing::warn!("插件 {name} {stop}");
+                            // 这一拍剩下的句柄也不再跑：路已经停了，再跑只是重复同一句错。
                             break;
                         }
                     }
@@ -2457,6 +2542,15 @@ impl PluginManager {
     /// 否则会出现"点了没反应"（如分页不切换）。
     pub fn refresh_view(&mut self, name: &str) -> Result<(), String> {
         let cfg = self.config;
+        // 这一条路已经停过：不再进 Lua，把那句原因原样交回（面板上看得见）。
+        if let Some(why) = self
+            .plugins
+            .get(name)
+            .and_then(|i| i.view_route.stopped())
+            .map(str::to_string)
+        {
+            return Err(why);
+        }
         let info = self
             .plugins
             .get(name)
@@ -2467,8 +2561,13 @@ impl PluginManager {
             .ok_or_else(|| format!("插件未加载: {name}"))?;
         // 无 get_view 的插件没有视图，跳过；写了名字却不是函数的那一种要报错，
         // 不能捏成「这插件没有面板」—— 界面上只会少一张卡片，而原因在他自己写的文件里。
-        if Self::take_hook(lua, "get_view")?.is_none() {
-            return Ok(());
+        match Self::take_hook(lua, "get_view") {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                let stop = self.note_view_failure(name, &e);
+                return Err(stop.unwrap_or(e));
+            }
         }
         Self::arm_instruction_budget(lua, cfg);
         let view_started = std::time::Instant::now();
@@ -2478,15 +2577,39 @@ impl PluginManager {
                 let msg = format!("get_view() 失败: {e}");
                 if is_limit_error(&e) {
                     self.mark_plugin_error(name, msg.clone());
+                    return Err(msg);
                 }
-                return Err(msg);
+                // 跨过阈值的那一次就把"这一路停了"交回去：调用方（面板/页面）
+                // 看到的应该是最新的结论，而不是刚才那条还会被重试的错误。
+                return Err(self.note_view_failure(name, &msg).unwrap_or(msg));
             }
         };
         self.note_hook_time(name, plugin_health::HookKind::View, view_started.elapsed());
         if let Some(p) = self.plugins.get_mut(name) {
+            p.view_route.record(false);
             p.view = Some(view);
         }
         Ok(())
+    }
+
+    /// 视图那一路的一次失败：攒到窗口阈值就停刷新，**不卸插件**（按键/动作还能用）。
+    /// 跨过阈值的那一次交回那句"这一路停了"，其余时候交回 `None`。
+    fn note_view_failure(&mut self, name: &str, last: &str) -> Option<String> {
+        // 进详情页的错误历史：路一停就不再记了（最多三条），不会把历史刷满。
+        self.note_hook_error(name, last);
+        let info = self.plugins.get_mut(name)?;
+        if !info.view_route.record(true) {
+            return None;
+        }
+        let stop = format!(
+            "视图刷新已停：最近 {FAIL_WINDOW} 次里 {FAIL_TRIPS} 次失败（最后一次：{last}）——修好后停用再启用"
+        );
+        info.view_route.stop_with(stop.clone());
+        if info.error.is_none() {
+            info.error = Some(stop.clone());
+        }
+        tracing::warn!("插件 {name} {stop}");
+        Some(stop)
     }
 
     /// 调用插件按钮动作（动作后刷新视图缓存）。
@@ -2549,6 +2672,10 @@ impl PluginManager {
             Some(l) => l,
             None => return,
         };
+        // 按键这一路已经停过：不再进 Lua（插件的其余功能照常）。
+        if info.key_route.stopped().is_some() {
+            return;
+        }
         // 「没定义这个钩子」是正常形态（多数插件不收按键），不许因此出声；
         // 但"有一个同名的东西、偏偏不是函数"是作者写错了，过去跟前者共用同一个静默出口。
         let hook = match lua.globals().get::<mlua::Value>("record_key") {
@@ -2580,6 +2707,8 @@ impl PluginManager {
             } else {
                 self.note_key_hook_failure(name, format!("record_key 抛错，按键数不再累计: {e}"));
             }
+        } else if let Some(info) = self.plugins.get_mut(name) {
+            info.key_route.record(false);
         }
     }
 
@@ -2606,9 +2735,25 @@ impl PluginManager {
         // 原因也要进历史：这一类不停用插件，页面上那行只留最后一次，而"从这一次起按键数
         // 不再涨"发生了几次、分别是因为什么，是排障要往回看的东西。
         self.note_hook_error(name, &msg);
+        let tripped = self
+            .plugins
+            .get_mut(name)
+            .map(|info| info.key_route.record(true))
+            .unwrap_or(false);
         let Some(info) = self.plugins.get_mut(name) else {
             return;
         };
+        if tripped {
+            // 到阈值了：只停**按键这一路**。整个插件不卸 —— 视图、动作、定时器都还在，
+            // 用户不会因为一次按键表达式写错就丢掉整块面板。
+            let stop = format!(
+                "按键采集已停：record_key 最近 {FAIL_WINDOW} 次里 {FAIL_TRIPS} 次失败（最后一次：{msg}）——修好后停用再启用"
+            );
+            info.key_route.stop_with(stop.clone());
+            info.error = Some(stop.clone());
+            tracing::warn!("插件 {name} {stop}");
+            return;
+        }
         if info.error.is_some() {
             return;
         }
@@ -5748,6 +5893,142 @@ end
             !logs.iter().any(|l| l.contains("收按键失败")),
             "限额那一支不该被新加的弱口径接走: {logs:?}"
         );
+    }
+
+    /// 三条按键失败之后只停**按键这一路**：插件不卸、视图照出，且不再进 Lua。
+    #[test]
+    fn three_key_failures_stop_only_the_key_route() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("key_route_trip");
+        let file = write_lua(
+            &tmp.path().join("plugins"),
+            "keytrip",
+            r###"
+PLUGIN_NAME = "按键连坏"
+count = 0
+function record_key(k)
+  count = count + 1
+  local t = nil
+  return t.x
+end
+function get_view()
+  return { widgets = { { type = "label", text = tostring(count) } } }
+end
+"###,
+        );
+        let mut pm = manager_in(tmp.path());
+        let name = pm
+            .load_plugin(&file, PluginSource::Builtin)
+            .expect("插件该装得上");
+        for i in 0..3 {
+            pm.plugin_key_event(&name, "A", 1);
+            let _ = i;
+        }
+        let info = pm.get_plugin(&name).expect("插件还在");
+        assert!(info.loaded, "按键那一路出错不该没收整个插件");
+        let reason = info.error.clone().expect("停了要有原因");
+        assert!(
+            reason.contains("按键采集已停") && reason.contains("record_key"),
+            "{reason}"
+        );
+
+        // 再按十次也不再进 Lua：视图里的计数停在 3。
+        for _ in 0..10 {
+            pm.plugin_key_event(&name, "A", 1);
+        }
+        pm.refresh_view(&name).expect("视图这一路还必须能跑");
+        let text = match &pm
+            .get_plugin(&name)
+            .expect("插件还在")
+            .view
+            .as_ref()
+            .expect("视图该在")
+            .widgets[0]
+        {
+            crate::plugins::Widget::Label(text) => text.clone(),
+            other => panic!("夹具应当是 label，实得 {other:?}"),
+        };
+        assert_eq!(text, "3", "停了之后不许再进 record_key");
+    }
+
+    /// 视图连续失败三次 → 停这一路；之后不再进 Lua，插件本身仍在。
+    #[test]
+    fn three_view_failures_stop_only_the_view_route() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("view_route_trip");
+        let file = write_lua(
+            &tmp.path().join("plugins"),
+            "viewtrip",
+            r###"
+PLUGIN_NAME = "视图连坏"
+function get_view()
+  local t = nil
+  return t.x
+end
+"###,
+        );
+        let mut pm = manager_in(tmp.path());
+        let name = pm
+            .load_plugin(&file, PluginSource::Builtin)
+            .expect("插件该装得上");
+        let mut last = String::new();
+        for _ in 0..3 {
+            last = pm.refresh_view(&name).expect_err("三次都该失败");
+        }
+        assert!(last.contains("视图刷新已停"), "{last}");
+        let (_, logs) = crate::logger::capture_logs(|| {
+            for _ in 0..5 {
+                let _ = pm.refresh_view(&name);
+            }
+        });
+        assert!(
+            !logs.iter().any(|l| l.contains("get_view")),
+            "停了之后不该再进 Lua: {logs:?}"
+        );
+        assert!(
+            pm.get_plugin(&name).expect("插件还在").loaded,
+            "停一路不等于停整个插件"
+        );
+    }
+
+    /// 定时/事件回调连续失败三次 → 停这一路，后续拍不再投。
+    #[test]
+    fn three_event_failures_stop_only_the_event_route() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("event_route_trip");
+        let file = write_lua(
+            &tmp.path().join("plugins"),
+            "evtrip",
+            r###"
+PLUGIN_NAME = "定时连坏"
+function init()
+  for i = 1, 3 do
+    focusflow.after(1, function()
+      local t = nil
+      return t.x
+    end)
+  end
+end
+function get_view()
+  return { widgets = { { type = "label", text = "ok" } } }
+end
+"###,
+        );
+        let mut pm = manager_in(tmp.path());
+        let name = pm
+            .load_plugin(&file, PluginSource::Builtin)
+            .expect("插件该装得上");
+        // 定时器最短 1 秒：等过这一秒，三格在同一拍里一起到。
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        pm.pump_timers();
+        let reason = pm
+            .get_plugin(&name)
+            .and_then(|i| i.error.clone())
+            .expect("停了要留原因");
+        assert!(reason.contains("定时/事件回调已停"), "{reason}");
+        let again = pm.pump_timers();
+        assert!(again.is_empty(), "停了之后不该再投: {again:?}");
+        pm.refresh_view(&name).expect("视图这一路还必须能跑");
     }
 
     /// 「这个插件不收按键」是正常形态，不许因此出声、也不许挂原因。
