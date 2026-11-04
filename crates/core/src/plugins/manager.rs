@@ -1042,14 +1042,21 @@ impl PluginManager {
         // 那个 `if let Err` 从来没有活过，而调用方（`desktop-native` 的 `toggle_plugin`）
         // 把 `Ok` 念成「插件 X 已启用/停用」—— 屏上说完，下一次启动全都回到文件里那一档。
         // 启用/停用是用户点一下的手势，当场落盘问一次才说得上"记住了"。
-        if let Err(e) = self.config.set_now("plugins", "disabled", &list.join(",")) {
-            let action = if enabled { "启用" } else { "停用" };
-            tracing::error!("写入插件{action}状态失败 ({stem}): {e}");
-            return Err(format!(
-                "插件「{stem}」的{action}状态没写进 config.ini（{e}）：\
-                 这一次改动只到本次运行，重启会回到文件里那一档"
-            ));
-        }
+        //
+        // 写不进去也**不许早返回**：`set_now` 已经把内存里那一档改了（配置的契约是
+        // "这次运行按新的来、盘上可能还是旧的"），早返回只会让插件继续跑，而页面重扫
+        // 之后读的是内存、写着「已停用」—— 屏上说停，手上还在收按键。
+        let action = if enabled { "启用" } else { "停用" };
+        let save_error = match self.config.set_now("plugins", "disabled", &list.join(",")) {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::error!("写入插件{action}状态失败 ({stem}): {e}");
+                Some(format!(
+                    "插件「{stem}」的{action}状态没写进 config.ini（{e}）：\
+                     本次运行已按{action}生效，重启会回到文件里那一档"
+                ))
+            }
+        };
         if enabled {
             // 只有当前未加载时才加载，避免重复初始化
             let already = self
@@ -1075,7 +1082,10 @@ impl PluginManager {
                 self.unload_plugin(&n);
             }
         }
-        Ok(())
+        match save_error {
+            Some(why) => Err(why),
+            None => Ok(()),
+        }
     }
 
     /// 列出目录中所有插件（含已停用的），停用的不执行其代码。
@@ -6058,6 +6068,38 @@ end
             memory_limit_mb(&loaded("[plugins]\nmemory_limit_mb = 很多\n")),
             16,
             "读不出来按默认值"
+        );
+    }
+
+    /// 配置写不进盘时，停用**仍然要生效**：`set_now` 已经把内存那一档改了，配置的契约
+    /// 是"这次运行按新的来、盘上可能还是旧的"。早返回会让插件继续跑，而页面重扫之后
+    /// 写着「已停用」—— 屏上与手上跑的插件不是一回事。
+    #[test]
+    fn a_disable_that_cannot_be_saved_still_stops_the_plugin() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("disable_unsaved");
+        let dir = paths::plugins_user_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("unsaved_off.lua");
+        std::fs::write(
+            &file,
+            "PLUGIN_NAME = \"写不进配置\"\nfunction get_view() return { widgets = {} } end\n",
+        )
+        .unwrap();
+        let mut pm = manager_in(tmp.path());
+        let name = pm
+            .load_plugin(&file, PluginSource::User)
+            .expect("插件该装得上");
+        // 让这一次落盘必失败：配置文件那一格换成同名目录（rename 过不去）。
+        std::fs::remove_file(tmp.path().join("config.ini")).unwrap();
+        std::fs::create_dir(tmp.path().join("config.ini")).unwrap();
+        let err = pm
+            .set_enabled("unsaved_off", false)
+            .expect_err("写不进配置要报出来");
+        assert!(err.contains("本次运行已按停用生效"), "{err}");
+        assert!(
+            !pm.loaded_plugin_names().iter().any(|n| n == &name),
+            "配置没写进去，插件却被留在运行态 —— 页面会写着已停用"
         );
     }
 

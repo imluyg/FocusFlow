@@ -3351,6 +3351,10 @@ impl App {
             Err(e) => {
                 self.status = Some(format!("插件开关失败：{e}"));
                 tracing_note(self.status.as_deref().unwrap_or(""));
+                // 「配置没写进去」这一档**已经按内存里那一档生效了**（停用会真的把
+                // 插件卸下来），不重扫的话行上还写着改之前的状态 —— 而那正是本次修的
+                // 那个症状的另一半。
+                self.reload_plugins();
             }
         }
         unsafe {
