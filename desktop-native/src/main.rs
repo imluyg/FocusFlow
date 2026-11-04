@@ -7679,7 +7679,7 @@ fn plugin_view_ops(
                 *y += 18.0;
             }
             Widget::TextArea(t) => {
-                let lines = t.lines().count().clamp(1, 5) as f32;
+                let lines = t.lines().count().clamp(1, PV_TEXTAREA_MAX_LINES) as f32;
                 ops.push(POp::Body {
                     rect: rect(x, *y, w, lines * 18.0),
                     text: t.clone(),
@@ -7982,8 +7982,16 @@ fn draw_plugin_view(
             }
             POp::Sep { rect: r } => p.fill(*r, &p.br.grid),
             POp::Body { rect: r, text } => {
+                // 多行文本：行数上限与留高同一个常量（`emit` 那一侧按它算高度），
+                // 每行再自己夹宽 —— 整段一起夹会把换行当普通字符，后面的行被整段吃掉。
                 p.text(
-                    &p.clip(text, &p.fmt.caption, r.right - r.left),
+                    &clip_text_lines(
+                        p,
+                        text,
+                        &p.fmt.caption,
+                        r.right - r.left,
+                        PV_TEXTAREA_MAX_LINES,
+                    ),
                     *r,
                     &p.fmt.caption,
                     &p.br.muted,
@@ -8327,10 +8335,13 @@ fn modal_field_box(row: D2D_RECT_F) -> D2D_RECT_F {
 /// 弹窗正文最多画几行：高度按它算，绘制也只画这么多（多出来的行要明说）。
 const MODAL_CONTENT_MAX_LINES: usize = 8;
 
-/// 弹窗正文实际要排出来的那几行。行数一旦超过 [`MODAL_CONTENT_MAX_LINES`]，最后一行
-/// 让给「还有几行没显示」—— 悄悄少画等于让用户以为弹窗里就这么多，而分类明细恰好
+/// 滚动文本区最多画几行：与弹窗正文同一套口径（高度与绘制读同一个常量）。
+const PV_TEXTAREA_MAX_LINES: usize = 5;
+
+/// 多行动态文本实际要排出来的那几行。行数一旦超过 `max`，最后一行让给
+/// 「还有几行没显示」—— 悄悄少画等于让用户以为内容就这么多，而分类明细恰好
 /// 是"越多行越说明本月记得多"的那一类内容。
-fn modal_content_plan(content: &str, max: usize) -> Vec<String> {
+fn capped_lines(content: &str, max: usize) -> Vec<String> {
     let all: Vec<&str> = content.lines().collect();
     let max = max.max(1);
     if all.len() <= max {
@@ -8450,12 +8461,13 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
 
     if let Some(cr) = g.content {
         // 每一行自己夹：正文是插件写的，长分类名／错误原因会一路画到卡片外面。
-        let width = cr.right - cr.left;
-        let text = modal_content_plan(m.content, MODAL_CONTENT_MAX_LINES)
-            .iter()
-            .map(|line| p.clip(line, &p.fmt.caption, width))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = clip_text_lines(
+            p,
+            m.content,
+            &p.fmt.caption,
+            cr.right - cr.left,
+            MODAL_CONTENT_MAX_LINES,
+        );
         p.text(&text, cr, &p.fmt.caption, &p.br.muted);
     }
 
@@ -11443,6 +11455,17 @@ fn clip_to_cell(dw: &IDWriteFactory, text: &str, f: &IDWriteTextFormat, rect_w: 
         Some(w) if w <= rect_w => text.to_string(),
         _ => clip_middle(text, budget),
     }
+}
+
+/// 多行动态文本：先按 [`capped_lines`] 定行数（超上限时最后一行说还有几行），
+/// 再逐行夹宽。整段一起夹会把换行当普通字符量 —— 宽的那一行会把后面几行整段吃掉，
+/// 而行数又不按高度裁，多出来的行直接画到下一个控件身上。
+fn clip_text_lines(p: &P<'_>, text: &str, f: &IDWriteTextFormat, width: f32, max: usize) -> String {
+    capped_lines(text, max)
+        .iter()
+        .map(|line| p.clip(line, f, width))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 状态行里哪些该用危险色画。"注意…" 是历史形状（双计提醒、搬迁没成那一类），
@@ -16735,6 +16758,34 @@ mod pager_shape_tests {
         );
     }
 
+    /// 滚动文本区：高度按上限留、绘制也只能画这么多行。从前高度按 5 行算，绘制把
+    /// 全部行画出去，第 6 行起直接叠在下面的控件上；整段一起夹宽还会把换行后面
+    /// 的内容当成"同一行的尾巴"夹掉。
+    #[test]
+    fn a_long_text_area_is_capped_to_the_height_it_reserves() {
+        let content = (1..=9)
+            .map(|i| format!("第{i}行"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let view = PluginView {
+            title: "文本".to_string(),
+            widgets: vec![Widget::TextArea(content.clone())],
+        };
+        let ops = plugin_view_ops(&view, rect(0.0, 0.0, 800.0, 600.0), 0.0, &HashMap::new());
+        let Some(POp::Body { rect: r, text }) = ops.first() else {
+            panic!("文本区没排出来：这条判据失去锚点");
+        };
+        let rows = capped_lines(&content, PV_TEXTAREA_MAX_LINES);
+        assert_eq!(rows.len(), PV_TEXTAREA_MAX_LINES, "超上限要有提示行顶替");
+        assert_eq!(rows.last().unwrap(), "…（还有 5 行没显示）");
+        assert!(
+            (r.bottom - r.top - PV_TEXTAREA_MAX_LINES as f32 * 18.0).abs() < 0.01,
+            "留高与行数上限不是同一个常量：{}",
+            r.bottom - r.top
+        );
+        let _ = text;
+    }
+
     /// 行内 EDIT 没有自己的边框，铺满整格会把宿主画的主色描边连圆角一起盖掉
     /// （浅色主题下白底压白底，那一格看着像"点一下就没了"）。EDIT 必须缩在值框里面，
     /// 四个边各留出至少 1 px 让那圈边框留在外面。
@@ -20104,7 +20155,7 @@ mod modal_content_tests {
             .join("\n");
         let m = modal(&content, &[], &[]);
         let g = modal_geom(&m, 1200.0, 900.0);
-        let rows = modal_content_plan(m.content, MODAL_CONTENT_MAX_LINES);
+        let rows = capped_lines(m.content, MODAL_CONTENT_MAX_LINES);
         assert_eq!(
             rows.len(),
             MODAL_CONTENT_MAX_LINES,
@@ -20129,7 +20180,7 @@ mod modal_content_tests {
     #[test]
     fn a_short_modal_body_is_drawn_verbatim() {
         let m = modal("第一行\n第二行", &[], &[]);
-        let rows = modal_content_plan(m.content, MODAL_CONTENT_MAX_LINES);
+        let rows = capped_lines(m.content, MODAL_CONTENT_MAX_LINES);
         assert_eq!(rows, vec!["第一行".to_string(), "第二行".to_string()]);
         let g = modal_geom(&m, 1200.0, 900.0);
         let cr = g.content.expect("两行正文也该留出内容区");
