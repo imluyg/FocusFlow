@@ -9379,21 +9379,20 @@ fn draw_board_page(
     }
 
     // --- 趋势（缩略版：只画线，数值留给「活跃分析」那一页）---
-    let trend_top = line_y + 44.0;
-    let trend_h = 200.0;
+    let layout = board_layout(h, line_y);
     let labels: Vec<String> = dash.trend.iter().map(|(d, _)| short_day(d)).collect();
     let points: Vec<i64> = dash.trend.iter().map(|(_, v)| *v).collect();
     draw_plugin_chart(
         p,
-        rect(m, trend_top, full_w, trend_h),
+        rect(m, layout.trend_top, full_w, layout.trend_h),
         "line",
         &labels,
         &points,
     );
 
     // --- 两列排行 ---
-    let rank_top = trend_top + trend_h + 10.0;
-    let rank_h = (h - m - rank_top).max(120.0);
+    let rank_top = layout.rank_top;
+    let rank_h = layout.rank_h;
     let col_w = (full_w - 12.0) / 2.0;
     draw_rank_card(
         p,
@@ -9409,6 +9408,33 @@ fn draw_board_page(
         &dash.top_keys,
         false,
     );
+}
+
+/// 看板页下半部的纵向布局：趋势一块 + 两张排行卡。
+struct BoardLayout {
+    trend_top: f32,
+    trend_h: f32,
+    rank_top: f32,
+    rank_h: f32,
+}
+
+/// 给窗口高度排下半部：窗口矮的时候**先缩趋势图**，给两张排行卡留出 120 高。
+///
+/// 固定的 200 + 120 在最小窗口（640：客户区被撑满整窗）下会把排行卡画到窗口底边
+/// 以下 —— 圆角底边与最后几行被裁掉，而这一页没有滚动。`clamp(60, 200)` 的 60 是给
+/// 矮到不正常的窗口兜底；640 这一档算出来是 154，绘图区仍有 80 高。
+fn board_layout(h: f32, line_y: f32) -> BoardLayout {
+    const M: f32 = 16.0;
+    let trend_top = line_y + 44.0;
+    let trend_h = (h - M - trend_top - 10.0 - 120.0).clamp(60.0, 200.0);
+    let rank_top = trend_top + trend_h + 10.0;
+    let rank_h = (h - M - rank_top).max(120.0);
+    BoardLayout {
+        trend_top,
+        trend_h,
+        rank_top,
+        rank_h,
+    }
 }
 
 /// 横轴日期串只留 `MM-DD`；不是这个形状（导入的旧库、带时间的日期）就原样交回，
@@ -20638,5 +20664,60 @@ mod collector_state_tests {
             "悬浮窗把「起来过」当成「在计」"
         );
         assert!(!code.contains("crate::collect::is_started(),"));
+    }
+}
+
+/// 看板页下半部的纵向布局：最小窗口下两张排行卡必须整张落在窗口里。
+#[cfg(test)]
+mod board_layout_tests {
+    use super::board_layout;
+
+    /// 顶栏页签在 208，KPI 那一行 78 高、下面那句话说 20 高 ⇒ 下半部的起点。
+    const LINE_Y: f32 = 208.0 + 78.0 + 10.0;
+
+    #[test]
+    fn the_rank_cards_fit_inside_the_smallest_window() {
+        // 最小窗口 640（客户区被撑满整窗），窗口底边那一圈留 16。
+        let h = 640.0;
+        let l = board_layout(h, LINE_Y);
+        assert!(
+            l.trend_h < 200.0,
+            "最小窗口还占满 200 高的趋势：排行卡没位置了"
+        );
+        assert!(
+            l.rank_top + l.rank_h <= h - 16.0 + 0.01,
+            "排行卡画到窗口下面（这一页没有滚动）：rank_top={} rank_h={} h={h}",
+            l.rank_top,
+            l.rank_h
+        );
+        assert!(l.rank_h >= 120.0, "排行卡被压到看不懂：{}", l.rank_h);
+        assert!(l.trend_h >= 60.0, "趋势图被压得画不出来：{}", l.trend_h);
+
+        // 常态窗口照旧用满 200：别为了矮窗口把高窗口也缩了。
+        let tall = board_layout(860.0, LINE_Y);
+        assert_eq!(tall.trend_h, 200.0);
+        assert!(tall.rank_top + tall.rank_h <= 860.0 - 16.0 + 0.01);
+    }
+
+    /// 接线：画的那一头读的是这份布局，不是又自己写一遍 200。
+    #[test]
+    fn the_board_page_reads_the_shared_layout() {
+        let src = include_str!("main.rs");
+        let needle = ["letlayout=", "board_layout(h,line_y);"].concat();
+        let flat: String = src
+            .replace("\r\n", "\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains(&needle),
+            "看板页没读 board_layout：排行卡的高度又各写一遍"
+        );
+        // 函数本体仍在生产段（第一个 #[cfg(test)] 之前）。
+        let cut = src.find("#[cfg(test)]").expect("测试段起点找不到");
+        assert!(
+            src[..cut].contains("fn board_layout("),
+            "board_layout 落到了测试段后面：接线守卫开始少扫生产码"
+        );
     }
 }
