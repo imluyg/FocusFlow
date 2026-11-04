@@ -12466,9 +12466,15 @@ fn dp_today_rect(s: f32) -> D2D_RECT_F {
 }
 
 /// 一年 12 个月的加减（`delta` 按月算，跨年自动进位/借位）。
+///
+/// 年份来自插件交回 / 用户手输的字段值，可以写到 `i32::MAX` 这种量级：整年乘 12 在
+/// `i32` 上会溢出 —— debug 是 panic，release 是 `panic = "abort"`，翻一下月整个程序
+/// 就没了。用 i64 算完再夹回 `1..=9999`：这一档之外的年份日历画得出来也没有意义。
 fn dp_month_add(year: i32, month: u32, delta: i32) -> (i32, u32) {
-    let total = year * 12 + (month as i32 - 1) + delta;
-    (total.div_euclid(12), (total.rem_euclid(12) + 1) as u32)
+    let total = i64::from(year) * 12 + i64::from(month) - 1 + i64::from(delta);
+    let y = total.div_euclid(12).clamp(1, 9999) as i32;
+    let m = (total.rem_euclid(12) + 1) as u32;
+    (y, m)
 }
 
 fn dp_days_in_month(year: i32, month: u32) -> u32 {
@@ -12506,7 +12512,9 @@ fn dp_parse(value: &str) -> (i32, u32, Option<(i32, u32, u32)>) {
     let month = it.next().and_then(|s| s.trim().parse::<u32>().ok());
     let day = it.next().and_then(|s| s.trim().parse::<u32>().ok());
     if let (Some(year), Some(month)) = (year, month) {
-        if (1..=12).contains(&month) {
+        // 年份也来自字段值：`999999999-01-01` 这种写法要退回今天，而不是把日历
+        // 开在一个翻月会溢出的年份上（见 `dp_month_add` 那段）。
+        if (1..=9999).contains(&year) && (1..=12).contains(&month) {
             let selected = day
                 .filter(|d| (1..=dp_days_in_month(year, month)).contains(d))
                 .map(|d| (year, month, d));
@@ -17043,6 +17051,18 @@ mod date_pick_tests {
         assert_eq!(dp_month_add(2026, 1, -1), (2025, 12));
         assert_eq!(dp_month_add(2026, 12, 1), (2027, 1));
         assert_eq!(dp_month_add(2026, 3, -14), (2025, 1));
+    }
+
+    /// 字段里的年份是外部输入：翻月时整年乘 12 不许溢出（release 是 abort，
+    /// debug 是 panic），越界的年份打开时退回今天。
+    #[test]
+    fn a_typed_out_of_range_year_cannot_overflow_the_month_stepper() {
+        assert_eq!(dp_month_add(i32::MAX, 12, 1), (9999, 1));
+        assert_eq!(dp_month_add(i32::MIN, 1, -1), (1, 12));
+        let (ty, tm, _) = dp_today();
+        assert_eq!(dp_parse("999999999-01-01").0, ty, "越界年份要退回今天");
+        assert_eq!(dp_parse("999999999-01-01").1, tm);
+        assert_eq!(dp_parse("0000-01-01").0, ty, "0 年不是合法年份");
     }
 
     /// 打开时落在字段当前那个月；认不出的值退回今天，不能把选择器开在"2026 年 13 月"。
