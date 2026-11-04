@@ -163,6 +163,23 @@ fn cell_for(path: &Path) -> Arc<Mutex<Cell>> {
         .clone()
 }
 
+/// 丢掉这一格的内存态（**只给用例**：模拟"进程重启后从盘上读回"）。
+///
+/// 生产不需要这个入口 —— 进程收尾时内存本来就没了。但用例都在同一个进程里跑，
+/// 而登记表是唯一持有那份内存的地方：不放掉它，`get` 拿回的还是刚写进去的那一份内存，
+/// "重启后还在"这句话就永远碰不到盘。放掉之后下一次读走的是 `ensure_loaded` 的
+/// `Untouched` 那一支 —— 与真启动的第一次读写同一条路。
+#[cfg(test)]
+pub(crate) fn forget_for_test(stem: &str) {
+    let Some(path) = state_file(stem) else {
+        return;
+    };
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&path);
+}
+
 /// 保证内存那一份来自盘（只在第一次碰时读一次；失败就记着，既不重试也不假装是空的）。
 fn ensure_loaded(cell: &mut Cell, path: &Path) -> Result<(), String> {
     match &cell.load {
@@ -467,6 +484,26 @@ mod tests {
         std::fs::create_dir_all(file.parent().expect("状态文件总该有一格父目录")).unwrap();
         std::fs::write(&file, text).unwrap();
         file
+    }
+
+    /// 验收第 1 条要的那条真腿：**丢掉内存再从文件读回**。
+    ///
+    /// 相邻那条往返用例读回走的是同一份内存（末尾才 flush），所以它守不住"重开之后还在"
+    /// 这句话。这一条先 flush，再把登记表里那一格摘掉，于是下一次 `get` 只能从盘上读 ——
+    /// 摘掉的那一步就是"进程没了"那件事在本进程里唯一能做的等价物。
+    #[test]
+    fn a_value_survives_the_memory_being_dropped() {
+        let _lock = paths::test_app_dir_lock();
+        let _app = paths::test_app_dir("store_survives_restart");
+        let stem = "restart_case";
+        put(stem, "last_tab", Value::from("week")).unwrap();
+        assert!(flush(stem).unwrap(), "先要真的落到盘上");
+        forget_for_test(stem);
+        assert_eq!(
+            get(stem, "last_tab").unwrap(),
+            Some(Value::from("week")),
+            "内存丢掉之后，读回的必须是盘上那一份"
+        );
     }
 
     /// 读的一侧不许建目录：开着插件页就把每个从不存东西的插件在数据目录里造出一格空目录，
