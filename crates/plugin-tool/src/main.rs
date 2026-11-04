@@ -483,6 +483,17 @@ fn parse_run(args: &[String]) -> Result<RunReq, String> {
     Ok(req)
 }
 
+/// 两个路径是不是同一份文件（Windows 上 `copy(x, x)` 会直接失败）。
+///
+/// 规范化失败就当作"不是"：目标那一份还不存在时正该走复制，而源那一份读不出来
+/// 在更早的 `validate_path` 就报过了。
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// 把插件真跑一遍，返回宿主读出来的那一份视图 JSON。
 ///
 /// 三件事决定了这条命令的价值，都写在实现里而不是文档里：
@@ -507,8 +518,24 @@ fn run_fixture(req: &RunReq) -> Result<String, String> {
     eprintln!("夹具：程序目录 {}", dir.display());
 
     let installed = paths::plugins_user_dir().join(format!("{stem}.lua"));
-    std::fs::copy(&req.file, &installed)
-        .map_err(|e| format!("{} 装不进 {}: {e}", req.file.display(), installed.display()))?;
+    let package = paths::plugins_user_dir().join(format!("{stem}.zip"));
+    if package.exists() {
+        // 同一格出现两份同 stem 的插件时，"哪一份被加载"取决于文件名顺序（`.lua` 排在
+        // `.zip` 前面）—— 而这一跑是按手上这份 `.lua` 跑出来的结论。悄悄写下去等于
+        // 让工具顺手改掉产品下次会加载的那一份。
+        return Err(format!(
+            "{} 里已经有一份同名的插件包 {}：再放一份单文件，谁被加载就取决于文件名顺序，\
+             这一跑测的也不一定是那一份 —— 换一个程序目录，或先把包挪走",
+            dir.display(),
+            package.display()
+        ));
+    }
+    // 作者那份本来就在这一格里（手工放进数据目录的插件是产品支持的形态）：
+    // `copy(x, x)` 在 Windows 上直接是一个错，而"跑我盘上这一份"本该跑得动。
+    if !same_file(&req.file, &installed) {
+        std::fs::copy(&req.file, &installed)
+            .map_err(|e| format!("{} 装不进 {}: {e}", req.file.display(), installed.display()))?;
+    }
 
     let declared = report.manifest.permissions.clone();
     if !declared.is_empty() {
@@ -1059,6 +1086,56 @@ end
         assert!(
             !prod.contains("serde_json"),
             "工具自己排了一份 JSON（两处排版会分家，而 jq 读的是工具这一份）"
+        );
+    }
+
+    /// 作者那份本来就在数据目录的 `plugins/` 里（手工放插件是产品支持的形态）：
+    /// `run --data` 该跑得动，而不是把 `copy(x, x)` 那个 Windows 错误甩给他。
+    #[test]
+    fn a_plugin_already_in_the_target_plugins_dir_still_runs() {
+        let _g = guard();
+        let app = paths::test_app_dir("run_in_place");
+        let dir = paths::plugins_user_dir();
+        std::fs::create_dir_all(&dir).expect("临时插件目录");
+        let in_place = dir.join("inplace.lua");
+        write(
+            &in_place,
+            "PLUGIN_NAME = \"inplace\"\nfunction get_view() return { widgets = {{ type = \"label\", text = \"原地\" }} } end\n",
+        );
+        let req = parse_run(&[
+            in_place.display().to_string(),
+            "--data".to_string(),
+            app.path().display().to_string(),
+        ])
+        .expect("参数读得动");
+        let json = run_fixture(&req).expect("就在目标目录里的那一份该跑得动");
+        assert!(json.contains("原地"), "{json}");
+    }
+
+    /// 同一格已经有一份同名的包：再放一份单文件，谁被加载取决于文件名顺序，
+    /// 而这一跑还会悄悄把那份包顶掉。拒绝，并且一个字节都不写。
+    #[test]
+    fn run_refuses_to_shadow_a_same_stem_package() {
+        let _g = guard();
+        let (app, file) = author_file("run_shadow", "dup");
+        write(
+            &file,
+            "PLUGIN_NAME = \"dup\"\nfunction get_view() return { widgets = {} } end\n",
+        );
+        let dir = paths::plugins_user_dir();
+        std::fs::create_dir_all(&dir).expect("临时插件目录");
+        std::fs::write(dir.join("dup.zip"), b"not really a zip").expect("放一份同名的包");
+        let req = parse_run(&[
+            file.display().to_string(),
+            "--data".to_string(),
+            app.path().display().to_string(),
+        ])
+        .expect("参数读得动");
+        let err = run_fixture(&req).expect_err("同名的包挡着，这一跑不许动它");
+        assert!(err.contains("同名") && err.contains("dup.zip"), "{err}");
+        assert!(
+            !dir.join("dup.lua").exists(),
+            "被拒的那一跑还是写了一份单文件"
         );
     }
 
