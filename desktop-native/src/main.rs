@@ -8245,8 +8245,9 @@ fn draw_select_menu(p: &P<'_>, w: f32, h: f32, sel: &PvSelect) {
         if *val == sel.value {
             p.fill(*ir, &p.br.accent_soft);
         }
+        // 选项文字来自插件（分类名是用户建的，长起来没有边）：不夹就画到菜单外面。
         p.text(
-            label,
+            &p.clip(label, &p.fmt.caption, ir.right - ir.left - 12.0),
             rect(ir.left + 6.0, ir.top + 3.0, ir.right - ir.left - 12.0, 18.0),
             &p.fmt.caption,
             &p.br.fg,
@@ -18291,6 +18292,8 @@ mod clip_tests {
             ("p.clip(value,&p.fmt.caption,vb.right-vb.left-28.0)", 1),
             ("p.clip(htxt,&p.fmt.caption,cw-12.0),rect(r.left+6.0+iasf32*cw,r.top+4.0,cw-12.0,16.0)", 1),
             ("p.clip(cell,&p.fmt.small,cw-12.0),rect(rr.left+6.0+ciasf32*cw,rr.top+2.0,cw-12.0,16.0)", 1),
+            // 下拉菜单的每一项：选项文字是插件给的（分类名可以很长）
+            ("p.clip(label,&p.fmt.caption,ir.right-ir.left-12.0),rect(ir.left+6.0,ir.top+3.0,ir.right-ir.left-12.0,18.0)", 1),
             ("p.clip(&f.label,&p.fmt.caption,136.0),rect(row.left,row.top+7.0,136.0,18.0)", 1),
             ("p.clip(&f.value,&p.fmt.caption,vb.right-vb.left-28.0),rect(vb.left+8.0,vb.top+3.0,vb.right-vb.left-28.0,18.0)", 1),
             ("p.clip(m.title,&p.fmt.body,g.dialog.right-g.dialog.left-72.0)", 1),
