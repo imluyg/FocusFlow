@@ -1760,6 +1760,16 @@ impl App {
                     .and_then(|pm| pm.get_plugin(name))
                     .and_then(|p| p.view.as_ref().map(|v| (name.as_str(), v)))
             });
+            // 刷新之后内容可能变短，旧偏移会把整页推到可见区上面：画出来是一张空卡片，
+            // 要再滚一下滚轮才回来。每帧按当前内容夹一次，命中那一侧读的也是这个值。
+            let pv_scroll = match pv {
+                Some((_, view)) => clamp_plugin_scroll(
+                    self.pv_scroll,
+                    plugin_content_height(view, plugin_scroll_area(size.width, size.height)),
+                    plugin_scroll_visible(size.height),
+                ),
+                None => self.pv_scroll,
+            };
             draw_screen(
                 &p,
                 size.width,
@@ -1778,11 +1788,12 @@ impl App {
                 self.plugin_detail_installed,
                 self.plugin_uninstall.as_ref(),
                 pv,
-                self.pv_scroll,
+                pv_scroll,
                 self.pv_select.as_ref(),
                 self.pv_modal.as_deref(),
                 &self.plugin_sel,
             );
+            self.pv_scroll = pv_scroll;
         }
         let ok = unsafe { t.rt.EndDraw(None, None).is_ok() } && t.present();
         if !ok {
@@ -2293,8 +2304,9 @@ impl App {
                     &sel_map,
                 );
                 // 谁认领这次点击就由谁处理（判据见 `pv_op_claims_click`）：表格不再
-                // 把"落在它矩形外面"的点击也吞掉，排在它后面的分页条才点得到。
-                let Some(op) = pv_claiming_op(&ops, x, y) else {
+                // 把"落在它矩形外面"的点击也吞掉，排在它后面的分页条才点得到；
+                // 而正文可见区之外（标题那一条）的点击谁都不归 —— 滚上去的控件看不见。
+                let Some(op) = pv_claiming_op_in(&ops, plugin_content_clip(card), x, y) else {
                     return;
                 };
                 match op {
@@ -7456,6 +7468,15 @@ fn pv_claiming_op(ops: &[POp], x: f32, y: f32) -> Option<&POp> {
     ops.iter().find(|op| pv_op_claims_click(op, x, y))
 }
 
+/// 正文可见区里这一次点击归谁。可见区之外一律不认领：绘制按 [`plugin_content_clip`]
+/// 裁掉了滚出去的那一截，命中不裁就会"点标题那一条却触发了屏上没有的控件"。
+fn pv_claiming_op_in(ops: &[POp], clip: D2D_RECT_F, x: f32, y: f32) -> Option<&POp> {
+    if !hit(clip, x, y) {
+        return None;
+    }
+    pv_claiming_op(ops, x, y)
+}
+
 /// 插件视图内容有多高（用于把滚动位置夹在合法范围内）。
 fn plugin_content_height(view: &focusflow_core::plugins::PluginView, area: D2D_RECT_F) -> f32 {
     let ops = plugin_view_ops(view, area, 0.0, &HashMap::new());
@@ -7464,6 +7485,33 @@ fn plugin_content_height(view: &focusflow_core::plugins::PluginView, area: D2D_R
         .map(|op| op.bounds().bottom)
         .fold(0.0f32, f32::max);
     (bottom - area.top).max(0.0)
+}
+
+/// 插件正文的滚动窗口：测量内容高、夹偏移、滚轮三处共用这一份几何。
+fn plugin_scroll_area(w: f32, h: f32) -> D2D_RECT_F {
+    rect(16.0, 208.0 + 40.0, w - 32.0, h - 208.0 - 16.0)
+}
+
+/// 滚动窗口当前能看见多高（卡片去掉标题条与下边距）。
+fn plugin_scroll_visible(h: f32) -> f32 {
+    (h - 208.0 - 16.0 - 42.0).max(1.0)
+}
+
+/// 把滚动偏移夹进 `[0, 内容高 - 可见高]`：刷新之后内容会变短，旧偏移不夹的话整页被推到
+/// 可见区上面，屏上只剩一张空卡片 —— 要再滚一下滚轮才会回来。
+fn clamp_plugin_scroll(offset: i32, content: f32, visible: f32) -> i32 {
+    offset.clamp(0, (content - visible).max(0.0) as i32)
+}
+
+/// 插件正文的可见矩形（画与命中共用这一份几何）。滚出去的内容画不出来，
+/// 也就不该继续在自己原来的坐标上认领点击。
+fn plugin_content_clip(card: D2D_RECT_F) -> D2D_RECT_F {
+    rect(
+        card.left + 1.0,
+        card.top + 40.0,
+        card.right - card.left - 2.0,
+        card.bottom - card.top - 42.0,
+    )
 }
 
 /// 插件表格的行几何：表头与行高是画、命中、行内按钮三处共用的同一把尺子。
@@ -7878,12 +7926,7 @@ fn draw_plugin_view(
     );
 
     // 内容区裁剪：视图比卡片高时，滚动到一半的控件不能画到卡片外面去
-    let clip = rect(
-        card.left + 1.0,
-        card.top + 40.0,
-        card.right - card.left - 2.0,
-        card.bottom - card.top - 42.0,
-    );
+    let clip = plugin_content_clip(card);
     unsafe {
         p.rt.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     }
@@ -13282,12 +13325,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                             if find_modal(&view, app.pv_modal.as_deref()).is_some() {
                                 return LRESULT(0);
                             }
-                            let area = rect(16.0, 208.0 + 40.0, cw - 32.0, ch - 208.0 - 16.0);
-                            let content = plugin_content_height(&view, area);
-                            let visible = (ch - 208.0 - 16.0 - 42.0).max(1.0);
-                            let max_scroll = (content - visible).max(0.0) as i32;
+                            let content = plugin_content_height(&view, plugin_scroll_area(cw, ch));
                             let step = if delta > 0 { -60 } else { 60 };
-                            let next = (app.pv_scroll + step).clamp(0, max_scroll);
+                            let next = clamp_plugin_scroll(
+                                app.pv_scroll + step,
+                                content,
+                                plugin_scroll_visible(ch),
+                            );
                             if next != app.pv_scroll {
                                 app.pv_scroll = next;
                                 unsafe {
@@ -16553,6 +16597,95 @@ mod pager_shape_tests {
         assert!(
             !pv_op_claims_click(&ops[0], cx, cy),
             "表格把分页条那一带的点击也认领了：分页条又会点不动"
+        );
+    }
+
+    /// 滚到一半的表格仍在自己的原坐标上认领点击，而绘制已经把它裁出可见区：
+    /// 症状是"点标题那一条，选中了屏上看不见的一行"。
+    #[test]
+    fn a_control_scrolled_out_of_the_clip_does_not_claim_clicks() {
+        let view = PluginView {
+            title: "长表".to_string(),
+            widgets: vec![Widget::Table {
+                headers: vec!["名".to_string()],
+                rows: (0..40).map(|i| vec![format!("行{i}")]).collect(),
+                ids: (0..40).map(|i| format!("id{i}")).collect(),
+                actions: vec![],
+                group: String::new(),
+                onselect: String::new(),
+            }],
+        };
+        let card = rect(16.0, 208.0, 1200.0, 800.0);
+        let area = rect(
+            card.left,
+            card.top + 40.0,
+            card.right - card.left,
+            card.bottom - card.top,
+        );
+        let ops = plugin_view_ops(&view, area, 42.0, &HashMap::new());
+        let clip = plugin_content_clip(card);
+        // 标题那一条：在卡片里，但在正文可见区外。
+        let (hx, hy) = (card.left + 600.0, card.top + 20.0);
+        assert!(!hit(clip, hx, hy), "前提：这一点该在正文可见区外");
+        assert!(
+            ops.iter().any(|op| pv_op_claims_click(op, hx, hy)),
+            "夹具没造出「被裁掉了却还能认领」的形状，这条判据测不到东西"
+        );
+        assert!(
+            pv_claiming_op_in(&ops, clip, hx, hy).is_none(),
+            "看不见的控件认领了标题区的点击"
+        );
+        // 反面：可见区里那张表仍归它，别把整张表一起打死。
+        assert!(
+            pv_claiming_op_in(&ops, clip, card.left + 600.0, 400.0).is_some(),
+            "可见区里的点击该有控件认领"
+        );
+    }
+
+    /// 刷新把内容换短之后，旧的滚动偏移必须当场夹回来：不夹的话整段内容都在可见区
+    /// 上面，屏上只剩一张空卡片，要等用户滚一下滚轮才恢复。
+    #[test]
+    fn a_stale_scroll_offset_is_clamped_after_the_content_shrinks() {
+        let card = rect(16.0, 208.0, 1200.0, 800.0);
+        let area = plugin_scroll_area(1200.0, 800.0);
+        let visible = plugin_scroll_visible(800.0);
+        let long = PluginView {
+            title: "长表".to_string(),
+            widgets: vec![Widget::Table {
+                headers: vec!["名".to_string()],
+                rows: (0..40).map(|i| vec![format!("行{i}")]).collect(),
+                ids: (0..40).map(|i| format!("id{i}")).collect(),
+                actions: vec![],
+                group: String::new(),
+                onselect: String::new(),
+            }],
+        };
+        let short = PluginView {
+            title: "短了".to_string(),
+            widgets: vec![Widget::Label("只有一行".to_string())],
+        };
+        let content_long = plugin_content_height(&long, area);
+        let content_short = plugin_content_height(&short, area);
+        assert!(content_long > visible, "夹具前提：长内容要能滚起来");
+        let scrolled = clamp_plugin_scroll(200, content_long, visible);
+        assert_eq!(scrolled, 200, "内容没变短时偏移要留着");
+        let clamped = clamp_plugin_scroll(scrolled, content_short, visible);
+        assert_eq!(clamped, 0, "内容变短之后旧偏移必须夹回可见范围");
+        // 行为腿：旧偏移下短内容整段在可见区上方（空卡片），夹回来之后才重新出现。
+        let clip = plugin_content_clip(card);
+        let stale = plugin_view_ops(&short, area, scrolled as f32, &HashMap::new());
+        assert!(
+            stale
+                .iter()
+                .all(|op| !hit(clip, op.bounds().left + 4.0, op.bounds().top + 4.0)),
+            "旧偏移下不该有内容留在可见区里（夹具要造出空卡片）"
+        );
+        let fixed = plugin_view_ops(&short, area, clamped as f32, &HashMap::new());
+        assert!(
+            fixed
+                .iter()
+                .any(|op| hit(clip, op.bounds().left + 4.0, op.bounds().top + 4.0)),
+            "夹回来之后内容要重新出现在可见区里"
         );
     }
 
