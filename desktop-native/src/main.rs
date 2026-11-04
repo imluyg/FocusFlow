@@ -9793,6 +9793,19 @@ fn gap_year_count(gaps: &[String]) -> usize {
 
 /// 周报开头那句「这一轮没读全」。**纯函数**：`generate_weekly_report` 要读库、要落文件，
 /// 无头环境里跑不动，而这一句里的两个数（几本库／几条读数）正是最容易说错的地方。
+/// Markdown 表格单元格的转义。
+///
+/// 键名来自旧版导入数据、设备名可以是用户手输的别名：`|` 在 Windows 文件名里不合法、
+/// 在别名里完全合法，而它会把一行拆成多列；`<`/`>` 在允许内联 HTML 的 Markdown
+/// 查看器里原样生效。CSV 与 HTML 两份导出各自有转义，周报这一份从前一格都没有。
+fn md_cell(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('|', "\\|")
+        .replace(['\r', '\n'], " ")
+}
+
 fn weekly_gap_sentence(gaps: &[String]) -> String {
     if gaps.is_empty() {
         return String::new();
@@ -9935,7 +9948,7 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
         out,
         "- 最高单日：{} 次（{}）",
         thousands(max_day.1.max(0) as u64),
-        max_day.0
+        md_cell(&max_day.0)
     );
     let _ = writeln!(
         out,
@@ -9973,7 +9986,12 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
 
     let _ = writeln!(out, "\n## 键鼠 TOP 10\n\n| 键 | 次数 |\n|---|---:|");
     for (k, n) in &keys {
-        let _ = writeln!(out, "| {} | {} |", k, thousands((*n).max(0) as u64));
+        let _ = writeln!(
+            out,
+            "| {} | {} |",
+            md_cell(k),
+            thousands((*n).max(0) as u64)
+        );
     }
     if keys.is_empty() {
         let _ = writeln!(out, "| （这一周没有记录） | 0 |");
@@ -9984,7 +10002,7 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
         "\n## 应用 TOP 10（前台时长）\n\n| 应用 | 时长 |\n|---|---:|"
     );
     for (name, secs) in &apps {
-        let _ = writeln!(out, "| {} | {} |", name, duration_text(*secs));
+        let _ = writeln!(out, "| {} | {} |", md_cell(name), duration_text(*secs));
     }
     if apps.is_empty() {
         let _ = writeln!(out, "| （这一周没有记录） | 0s |");
@@ -9992,7 +10010,12 @@ fn generate_weekly_report() -> std::result::Result<std::path::PathBuf, String> {
 
     let _ = writeln!(out, "\n## 设备 TOP 10\n\n| 设备 | 次数 |\n|---|---:|");
     for (name, n) in &devices {
-        let _ = writeln!(out, "| {} | {} |", name, thousands((*n).max(0) as u64));
+        let _ = writeln!(
+            out,
+            "| {} | {} |",
+            md_cell(name),
+            thousands((*n).max(0) as u64)
+        );
     }
     if devices.is_empty() {
         let _ = writeln!(out, "| （这一周没有记录） | 0 |");
@@ -16053,6 +16076,28 @@ mod weekly_report_tests {
 
     fn d(y: i32, m: u32, day: u32) -> chrono::NaiveDate {
         chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    /// 周报是唯一没有转义的导出面：导入数据里的键名、用户起的设备别名会原样进表格。
+    /// `|` 拆列、`<` 在允许内联 HTML 的查看器里生效，两种都必须在落盘前处理掉。
+    #[test]
+    fn the_weekly_markdown_escapes_cells_from_external_data() {
+        assert_eq!(md_cell("Ctrl|C"), "Ctrl\\|C");
+        assert_eq!(md_cell("<img src=x>"), "&lt;img src=x&gt;");
+        assert_eq!(md_cell("A&B"), "A&amp;B");
+        assert_eq!(md_cell("两行\n名字"), "两行 名字");
+
+        // 生产段三处表格（键名 / 应用名 / 设备名）都要过它，外加"最高单日"那一句。
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        assert_eq!(
+            prod.matches("md_cell(").count(),
+            5,
+            "定义 1 处 + 四个使用点（最高单日 / 键名 / 应用名 / 设备名）；少一处就是那一列没转义"
+        );
+        for old in ["\"| {} | {} |\", k,", "\"| {} | {} |\", name,"] {
+            assert!(!prod.contains(old), "还有一列把外部名字原样写进表格：{old}");
+        }
     }
 
     /// 「有 N 个年度库没读全」数的是**几本库**，不是几条读数。
