@@ -295,6 +295,12 @@ pub fn set_paused(paused: bool) -> bool {
     let guard = slot().lock();
     let Ok(g) = guard else { return false };
     let Some(rt) = g.as_ref() else { return false };
+    // 采集被**停用**之后不许借「继续」把计数打开：停用那一下只是把 `listening` 翻成
+    // false 并置暂停位，rdev 的老钩子其实还在跑（见 `resume_listening` 那段），所以
+    // 解暂停就等于重新计数。重新开采集只有 `resume_listening()` 那扇门。
+    if !paused && !rt.listening.load(Ordering::SeqCst) {
+        return false;
+    }
     rt.listener.set_paused(paused);
     // 暂停时把「次/分」清空：否则恢复的那一刻会把暂停前的 60 秒算进来。
     if paused {
@@ -310,13 +316,18 @@ pub fn set_paused(paused: bool) -> bool {
     true
 }
 
-pub fn toggle_pause() -> bool {
-    let next = !is_paused();
-    if set_paused(next) {
-        next
-    } else {
-        false
-    }
+/// 暂停/继续那一下该往哪一位写：`None` = 采集没开着（不许借「继续」把计数打开）。
+///
+/// 读的必须是 `listening` 而不是 `started`：停用之后 `is_started()` 仍是 true
+/// （写线程等一次性线程没有对外停止接口），读错那一位就会把「停用」念成「暂停中」。
+pub fn pause_toggle_target(listening: bool, paused: bool) -> Option<bool> {
+    listening.then_some(!paused)
+}
+
+/// 切换暂停位。`None` = 没切成（采集没开，或状态锁被占住）；`Some(next)` = 现在的暂停位。
+pub fn toggle_pause() -> Option<bool> {
+    let next = pause_toggle_target(is_listening(), is_paused())?;
+    set_paused(next).then_some(next)
 }
 
 /// 停掉采集（配置里关掉时用）。
@@ -511,6 +522,21 @@ mod tests {
         // 系统时间被拨回去：saturating_sub 之后是负数，不该 panic 也不该误删
         prune(&mut q, 10);
         assert_eq!(q.len(), 1);
+    }
+
+    /// 采集被停用之后不许借「继续」把计数打开。
+    ///
+    /// 停用那一下只是把 `listening` 翻成 false 并置暂停位，rdev 的老钩子还在跑；
+    /// 旧算法 `!paused` 会给出「继续」，于是设置页那句「已暂停，点一下继续」真能让
+    /// 键鼠计数重新开跑，而配置里还是停用、屏上还写着已启用。
+    #[test]
+    fn pause_cannot_restart_counting_after_the_collector_was_turned_off() {
+        // 停用之后：started 仍为 true、paused 也为 true（停用时置的）。
+        assert_eq!(pause_toggle_target(false, true), None);
+        assert_eq!(pause_toggle_target(false, false), None);
+        // 采集开着时照常两档
+        assert_eq!(pause_toggle_target(true, false), Some(true));
+        assert_eq!(pause_toggle_target(true, true), Some(false));
     }
 
     /// 采集没起来时，那句"外部写完库之后重锚今日"必须报**什么都没做**。

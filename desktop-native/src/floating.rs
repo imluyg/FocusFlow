@@ -248,7 +248,7 @@ fn current_content() -> fr::PillContent {
         metric,
         today,
         live.duration_sec,
-        crate::collect::is_started(),
+        crate::collect::is_listening(),
         crate::collect::is_paused(),
         crate::collect::cpm(),
     )

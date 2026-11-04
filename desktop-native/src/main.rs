@@ -1748,7 +1748,7 @@ impl App {
                 dark: tokens.dark,
                 zoomed: unsafe { IsZoomed(hwnd) }.as_bool(),
                 search_focused: self.search_focused,
-                collector_on: collect::is_started(),
+                collector_on: collect::is_listening(),
                 collector_paused: collect::is_paused(),
                 cpm: collect::cpm(),
                 settings_cat: self.settings_cat,
@@ -3159,13 +3159,18 @@ impl App {
     }
 
     /// 暂停/继续采集（运行时开关，不写配置）。
+    ///
+    /// 采集被「停用」之后不许借这里把计数打开：停用只是不 `start()`，老监听还在跑，
+    /// 解暂停就等于重新计数。判断读 `listening`，不读 `started`（后者停用后仍为 true）。
     fn toggle_pause(&mut self, hwnd: HWND) {
-        let msg = if !collect::is_started() {
-            "采集未启用，先在上面那一行打开采集".to_string()
-        } else if collect::toggle_pause() {
-            "采集已暂停：键鼠与设备计数都停了".to_string()
+        let msg = if !collect::is_listening() {
+            "采集没启用，先在上面那一行打开采集".to_string()
         } else {
-            "采集已继续".to_string()
+            match collect::toggle_pause() {
+                Some(true) => "采集已暂停：键鼠与设备计数都停了".to_string(),
+                Some(false) => "采集已继续".to_string(),
+                None => "这一拍没切成：采集状态锁被占住".to_string(),
+            }
         };
         self.sync_pause_item();
         tracing_note(&msg);
@@ -11127,7 +11132,7 @@ fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenu
 /// 托盘 tooltip：今日次数 + 采集状态（采集开着时才有后半截）。
 fn tray_tooltip(today: i64) -> String {
     let mut tip = format!("FocusFlow · 今日 {}", thousands(today as u64));
-    if collect::is_started() {
+    if collect::is_listening() {
         tip.push_str(if collect::is_paused() {
             " · 已暂停"
         } else {
@@ -13070,7 +13075,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     tracing_note(&format!(
                         "验收状态 today={today} cpm={} collector={} paused={}",
                         collect::cpm(),
-                        if collect::is_started() { "on" } else { "off" },
+                        if collect::is_listening() { "on" } else { "off" },
                         if collect::is_paused() {
                             "true"
                         } else {
@@ -13233,7 +13238,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 app.plugin_panel_was = now_open;
             }
             // 「当前速度」跟这 100ms 一拍走：数值变了才重画（否则等于 10Hz 全窗重绘）。
-            let cpm_now = if collect::is_started() && !collect::is_paused() {
+            let cpm_now = if collect::is_listening() && !collect::is_paused() {
                 collect::cpm()
             } else {
                 0
@@ -20476,5 +20481,47 @@ mod plugin_view_lifecycle_tests {
             flat.contains("if!alive{self.plugin_open=None;self.reset_plugin_view_state();}"),
             "重扫那一头：插件没了没有收掉 plugin_open —— 屏上是清单，点击全被吞"
         );
+    }
+}
+
+/// 屏上「采集开着吗」必须读**在计**那一位（`listening`），不是「运行时起来过」
+/// （`started`）：停用之后后者仍是 true，读错它会让设置页、托盘与悬浮窗把「停用」
+/// 念成「已启用 / 已暂停」，而点一下暂停开关还能让计数偷偷恢复。
+#[cfg(test)]
+mod collector_state_tests {
+    fn flat(src: &str) -> String {
+        src.replace("\r\n", "\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn the_switch_pause_row_and_tray_read_the_listening_bit() {
+        let src = include_str!("main.rs");
+        let code = flat(src);
+        for needle in [
+            "collector_on:collect::is_listening(),",
+            "letmsg=if!collect::is_listening(){",
+            "ifcollect::is_listening(){tip.push_str",
+            "letcpm_now=ifcollect::is_listening()&&!collect::is_paused()",
+            "ifcollect::is_listening(){\"on\"}else{\"off\"}",
+        ] {
+            assert!(
+                code.contains(needle),
+                "这一处又读回了 is_started：{needle}（停用之后它仍为 true）"
+            );
+        }
+    }
+
+    #[test]
+    fn the_floating_pill_reads_the_listening_bit() {
+        let src = include_str!("floating.rs");
+        let code = flat(src);
+        assert!(
+            code.contains("crate::collect::is_listening(),"),
+            "悬浮窗把「起来过」当成「在计」"
+        );
+        assert!(!code.contains("crate::collect::is_started(),"));
     }
 }
