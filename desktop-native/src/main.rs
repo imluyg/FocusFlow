@@ -7933,6 +7933,16 @@ fn plugin_view_ops(
     ops
 }
 
+/// 插件视图标题那一格：从「返回」右边到卡片右边再留 16。
+///
+/// 标题与插件名都是插件写的，而这块 UI 不按矩形裁切（`DrawText` 不按矩形裁）——
+/// 从前那格写死 420 宽、文本原样画出去，长标题会画到卡片右边甚至窗口外。
+fn plugin_view_title_rect(card: D2D_RECT_F, back: D2D_RECT_F) -> D2D_RECT_F {
+    let left = back.right + 12.0;
+    let right = card.right - 16.0;
+    rect(left, card.top + 14.0, (right - left).max(0.0), 20.0)
+}
+
 /// 画插件视图；返回"返回"按钮的矩形（点击时用同一份几何）。
 fn draw_plugin_view(
     p: &P<'_>,
@@ -7955,9 +7965,12 @@ fn draw_plugin_view(
     } else {
         format!("{name} · {}", view.title)
     };
+    // 标题与插件名都是插件写的，而这块 UI 不按矩形裁切：从前写死 420 宽、文本原样
+    // 画出去，长标题会越到卡片右边（甚至窗口外）。按卡片剩下的那一格夹。
+    let title_rect = plugin_view_title_rect(card, back);
     p.text(
-        &title,
-        rect(back.right + 12.0, card.top + 14.0, 420.0, 20.0),
+        &p.clip(&title, &p.fmt.body, title_rect.right - title_rect.left),
+        title_rect,
         &p.fmt.body,
         &p.br.fg,
     );
@@ -20832,5 +20845,40 @@ mod table_band_tests {
                 "悬停/点击又各写一套行带：缺 {needle}"
             );
         }
+    }
+}
+
+/// 插件视图标题：长标题不许画到卡片外面（这块 UI 不按矩形裁切）。
+#[cfg(test)]
+mod plugin_view_title_tests {
+    use super::{plugin_view_title_rect, rect};
+
+    #[test]
+    fn the_plugin_view_title_is_clipped_to_the_card_not_a_fixed_420() {
+        let card = rect(16.0, 208.0, 900.0, 500.0);
+        let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
+        let t = plugin_view_title_rect(card, back);
+        assert_eq!(t.left, back.right + 12.0);
+        assert!(
+            t.right <= card.right - 16.0 + 0.01,
+            "标题格超出卡片右边：{t:?}"
+        );
+        assert!(
+            t.right - t.left >= 400.0,
+            "900 宽的卡片给标题的格子太窄：{}",
+            t.right - t.left
+        );
+
+        // 接线：画那一头按这一格夹，而不是把长文本原样画出去。
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        assert!(
+            prod.contains("let title_rect = plugin_view_title_rect(card, back);"),
+            "标题格没抽成共用的那一份"
+        );
+        assert!(
+            prod.contains("&p.clip(&title, &p.fmt.body, title_rect.right - title_rect.left)"),
+            "插件视图标题没夹宽：长标题会画到卡片外"
+        );
     }
 }
