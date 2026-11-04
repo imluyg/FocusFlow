@@ -1586,6 +1586,18 @@ pub fn register_host_api(
                         },
                         None => today,
                     };
+                    // 反着写的窗口不猜：`query_range` 会把两端对调，作者拿到的是
+                    // `[to, from]` 那一段，而 `gap` 空着、图和列表照画 —— 与 days 那两条
+                    // 冲突同一族（看着对、其实不是他写的那一问）。这里当场拒绝并点名。
+                    if from > to {
+                        return Ok((
+                            empty,
+                            Some(format!(
+                                "focusflow.query 的区间反了：from={from} 晚于 to={to} —— \
+                                 依次写 from（起点）与 to（终点）"
+                            )),
+                        ));
+                    }
                     (from, to)
                 }
                 Err(e) => {

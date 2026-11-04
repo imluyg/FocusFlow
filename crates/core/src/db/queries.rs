@@ -2574,7 +2574,8 @@ pub fn query_range(
         out.unreadable.push(unsupported_reason(group, metric));
         return out;
     }
-    // 反着写不猜作者的意思：按字面区间原样问（库里那段本来就在）
+    // 两端反着传就翻正：走到这里的两端来自 `focusflow.query` 的已校验入口（那头会拒绝
+    // `from > to`），这一句是给其它直接调用方的兜底 —— 反着传不该读成一张空榜。
     let (from, to) = if from <= to { (from, to) } else { (to, from) };
     let years: Vec<i32> = (from.year()..=to.year()).collect();
     let from_dk = day_key_of_date(from);

@@ -219,3 +219,25 @@ fn a_window_end_contradicting_days_is_refused_not_dropped() {
         "days 与 to 冲突要当场拒绝，而不是把 to 丢掉：{gap}"
     );
 }
+
+/// 区间反着写（`from` 晚于 `to`）同样拒绝，而不是被对调。
+///
+/// `query_range` 那头会把两端翻正，于是作者拿到的是 `[to, from]` 那一段 ——
+/// 列表从 `to` 开始升序、`gap` 空着、图照画，与他写的那一问不是一回事。
+/// 与上面两条冲突同一句口径：点名是哪一端反了，这一问不查库。
+#[test]
+fn a_reversed_window_is_refused_not_silently_swapped() {
+    let _g = query_round::guard();
+    let app = common::isolated_app_dir("query_reversed");
+    let (mut pm, name) = load_query(
+        app.path(),
+        "rev",
+        "{ from = \"2026-02-01\", to = \"2026-01-01\", group_by = \"day\" }",
+    );
+    pm.refresh_view(&name).expect("取视图该成功");
+    let gap = gap_of(&pm, &name);
+    assert!(
+        gap.contains("from") && gap.contains("to") && gap.contains("晚于"),
+        "反着的区间要当场拒绝并点名哪一端反了：{gap}"
+    );
+}
