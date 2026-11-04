@@ -532,6 +532,13 @@ pub fn add_expense_outcome(
         tracing::warn!("记账类型「{rtype}」不在允许值里（支出/收入），这条没写进去");
         return Err(format!("记账类型「{rtype}」不在允许值里（支出/收入）"));
     }
+    // 金额必须是有限数：面板那格是自由文本，`tonumber("1e999")` 在 Lua 里就是 `inf`，
+    // 它能过面板那句"金额要大于 0"。写进库之后 inf 跟着进月度合计，一次手滑就让总额
+    // 再也对不上；NaN 则被 SQLite 存成 NULL —— 那一行读取侧整行丢掉，条数却照算。
+    if !amount.is_finite() {
+        tracing::warn!("记账金额「{amount}」不是有限数，这条没写进去");
+        return Err(format!("金额「{amount}」不是有限数（写 12.50 这种普通数）"));
+    }
     // 日期尺子与读侧同一把（见 `normalize_date_filter`）。**空串也拒**：原先空值
     // 原样落库（`purchase_date TEXT NOT NULL` 容得下 `""`），因为**面板**自己会在
     // 提交前填今天 —— 那是面板的私有知识，不是宿主的契约。宿主收下空值就等于允许
@@ -594,6 +601,14 @@ pub fn update_expense_outcome(id: i64, e: &Expense) -> Result<(), String> {
     if !EXPENSE_TYPES.contains(&rtype) {
         tracing::warn!("记账类型「{rtype}」不在允许值里（支出/收入），#{id} 没改");
         return Err(format!("记账类型「{rtype}」不在允许值里（支出/收入）"));
+    }
+    // 与 `add_expense_outcome` 同一道闸：改一笔同样能把 inf/NaN 写进库。
+    if !e.amount.is_finite() {
+        tracing::warn!("记账金额「{}」不是有限数，#{id} 没改", e.amount);
+        return Err(format!(
+            "金额「{}」不是有限数（写 12.50 这种普通数）",
+            e.amount
+        ));
     }
     // 老库里一条日期没补零的记录，用户改个名字顺手就被修成补零形态（而不是被拒）；
     // 认不出来或空值才报错（空值被拒的理由见 `add_expense`）。
@@ -2508,6 +2523,68 @@ mod tests {
         );
         assert!(add_expense("支出", "斜杠日期", None, "2026/9/3", 3.0, None, None, None) > 0);
         assert_eq!(monthly_summary("2026-09").0, 15.0, "斜杠写法也要落进九月");
+
+        // 非有限金额：面板那格是自由文本，`tonumber("1e999")` 就是 inf，能过
+        // "金额要大于 0"；NaN 被 SQLite 存成 NULL（读取侧整行丢掉、条数照算），
+        // inf 则跟着进合计 —— 两种都不是金额，必须在写入口拒掉。
+        assert_eq!(
+            add_expense(
+                "支出",
+                "无穷",
+                None,
+                "2026-09-02",
+                f64::INFINITY,
+                None,
+                None,
+                None
+            ),
+            -1,
+            "inf 不是金额，写进去月度合计会变成 inf"
+        );
+        assert_eq!(
+            add_expense(
+                "支出",
+                "NaN",
+                None,
+                "2026-09-02",
+                f64::NAN,
+                None,
+                None,
+                None
+            ),
+            -1,
+            "NaN 会被 SQLite 存成 NULL：那一行读取侧整行丢掉，条数却照算"
+        );
+        // 改一笔同样要过这道闸：金额换成 inf 时旧值必须原样留着。
+        let mut edited = Expense {
+            id,
+            rtype: "支出".to_string(),
+            item_name: "早餐".to_string(),
+            store: None,
+            purchase_date: "2026-09-01".to_string(),
+            amount: f64::INFINITY,
+            category: None,
+            subcategory: None,
+            delivery_date: None,
+            record_time: String::new(),
+            note: None,
+        };
+        assert!(
+            update_expense_outcome(id, &edited).is_err(),
+            "更新也不能把 inf 写进去"
+        );
+        edited.amount = 99.0;
+        assert!(
+            update_expense_outcome(id, &edited).is_ok(),
+            "有限金额的更新照常该成功"
+        );
+        let rows: i64 = {
+            let conn = open().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM expenses", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows, 2, "被拒的两条一条都不能留在库里，实得 {rows}");
+        assert_eq!(monthly_summary("2026-09").0, 102.0, "99 + 3，inf 没进来");
     }
 
     /// 分类的 `ctype` 原先收任意字符串：既不报错也不生效，唯一的症状是面板上那个
