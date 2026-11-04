@@ -480,6 +480,20 @@ fn parse_run(args: &[String]) -> Result<RunReq, String> {
     if req.event == Fixture::Action && req.action.is_empty() {
         return Err("action 这一拍要给 --action <动作 id>：点的是控件上那一个 id".to_string());
     }
+    // 反过来漏写 `--event` 也不许把载荷悄悄吞掉：`run a.lua --action 保存` 若照样跑，
+    // 交出去的是**view** 那一拍的 JSON，作者会以为"按钮点过了、视图没变"。
+    if !req.app.is_empty() && req.event != Fixture::AppChange {
+        return Err(
+            "--app 只有 app_change 那一拍用得上：要投一个前台应用请写 --event app_change --app <名字>"
+                .to_string(),
+        );
+    }
+    if !req.action.is_empty() && req.event != Fixture::Action {
+        return Err(
+            "--action 只有 action 那一拍用得上：要点一个按钮请写 --event action --action <动作 id>"
+                .to_string(),
+        );
+    }
     Ok(req)
 }
 
@@ -919,6 +933,17 @@ mod tests {
         assert!(
             parse_run(&p(&["a.lua", "--event", "action"])).is_err(),
             "没给 --action"
+        );
+        // 反过来的漏写也不许悄悄吞掉载荷：只给 --action / --app 而不给 --event，
+        // 交出去的会是 view 那一拍的 JSON（作者以为按钮点过了）。
+        let no_event = parse_run(&p(&["a.lua", "--action", "保存"])).unwrap_err();
+        assert!(
+            no_event.contains("--event") && no_event.contains("--action"),
+            "要说清该怎么写：{no_event}"
+        );
+        assert!(
+            parse_run(&p(&["a.lua", "--app", "记事本.exe"])).is_err(),
+            "只给 --app 也要拒绝"
         );
         assert!(parse_run(&p(&[
             "a.lua",
