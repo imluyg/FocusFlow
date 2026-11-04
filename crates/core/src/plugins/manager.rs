@@ -3508,19 +3508,41 @@ fn parse_widget(
         }
         "chart" => {
             let mut labels = lua_text_list(w, "labels");
-            let (mut points, dropped) = lua_number_list(w, "points");
+            let (raw_points, dropped) = lua_number_list(w, "points");
             if dropped > 0 && notice_once(&format!("chart-drop:{auto_id}:{dropped}")) {
                 tracing::warn!(
                     "图表控件（{auto_id}）里有 {dropped} 个值不是数，已跳过、其余照常画 —— \
                      points 要给一串数字（{MAX_CHART_POINTS} 个以内）"
                 );
             }
+            // 标签按**位置**跟着点走：先让标签序列与原始点等长（多出来的头部标签是更早的
+            // 点，与夹头同一口径；缺的位置留空），再跟着点一起被过滤、被夹头。
+            // 从前是"先丢坏值、再按长度把标签从头砍一刀"——中间跳过一格坏值时，后面每个
+            // 标签都前移一位，5 那根柱子顶着本该属于坏值那一格的标签。
+            if labels.len() > raw_points.len() {
+                labels.drain(..labels.len() - raw_points.len());
+            }
+            let offset = raw_points.len().saturating_sub(labels.len());
+            let mut points: Vec<i64> = Vec::with_capacity(raw_points.len());
+            let mut kept_labels: Vec<String> = Vec::with_capacity(raw_points.len());
+            for (i, p) in raw_points.iter().enumerate() {
+                let Some(v) = p else { continue };
+                points.push(*v);
+                kept_labels.push(
+                    i.checked_sub(offset)
+                        .and_then(|k| labels.get(k))
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+            let mut labels = kept_labels;
             // 上限挂在解析这一头，且夹的是**开头**：趋势图被夹掉的一定是最早那几个，
             // 留最近这段才是读者要看的那一段（夹尾部等于把最新数据藏起来）。
             if points.len() > MAX_CHART_POINTS {
                 let over = points.len() - MAX_CHART_POINTS;
                 points.drain(..over);
-                labels.drain(..over.min(labels.len()));
+                // 过滤之后标签与点一一对应，夹头必须夹同样多格。
+                labels.drain(..over);
                 if notice_once(&format!("chart-cap:{auto_id}:{}", over + MAX_CHART_POINTS)) {
                     tracing::warn!(
                         "图表控件（{auto_id}）交了 {} 个点，只画最近 {MAX_CHART_POINTS} 个\
@@ -3528,10 +3550,6 @@ fn parse_widget(
                         over + MAX_CHART_POINTS
                     );
                 }
-            }
-            // 点数与刻度数对齐：谁的尾巴对谁的尾巴（夹过头部之后长度可能差几格）
-            if labels.len() > points.len() {
-                labels.drain(..labels.len() - points.len());
             }
             Ok(Widget::Chart {
                 kind: w.get("kind").unwrap_or_default(),
@@ -3570,7 +3588,12 @@ fn lua_text_list(w: &mlua::Table, key: &str) -> Vec<String> {
 /// 与 [`lua_text_list`] 同一理由：整表转 `Vec<i64>` 会因为其中一个 `"12 万"`（作者从
 /// 展示文本里抄来的）而一个都不剩，画出来是一张「暂无数据」的空图，而盘上明明有值。
 /// 布尔/nil/表 这些是真的当不成数，丢掉并交回个数，由调用方出声。
-fn lua_number_list(w: &mlua::Table, key: &str) -> (Vec<i64>, usize) {
+/// 读一串数：`None` 是"这一项不是数"（这一格跳过，但**位置留着**）。
+///
+/// 为什么保留下标：图表的标签与点是按位置配对的。只交回"留下来的值"时，中间跳过一个
+/// 坏值之后标签就无从知道该跟哪一格走 —— 调用方只能按长度把标签从头砍一刀，于是坏值
+/// 之后每个标签都前移一位（5 那根柱子顶着 7 的标签）。
+fn lua_number_list(w: &mlua::Table, key: &str) -> (Vec<Option<i64>>, usize) {
     let mut out = Vec::new();
     let mut dropped = 0usize;
     let Ok(list) = w.get::<mlua::Table>(key) else {
@@ -3585,8 +3608,11 @@ fn lua_number_list(w: &mlua::Table, key: &str) -> (Vec<i64>, usize) {
             _ => None,
         };
         match n {
-            Some(v) => out.push(v),
-            None => dropped += 1,
+            Some(v) => out.push(Some(v)),
+            None => {
+                out.push(None);
+                dropped += 1;
+            }
         }
     }
     (out, dropped)
@@ -5578,6 +5604,13 @@ end
                 ),
             ),
             (
+                "标签比点多",
+                fixture(
+                    "标签比点多",
+                    r#"{ type = "chart", labels = {"旧", "a", "b"}, points = {5, 7} }"#,
+                ),
+            ),
+            (
                 "kind 写了个画不了的",
                 fixture(
                     "kind 写了个画不了的",
@@ -5657,11 +5690,23 @@ end
             "整表转 Vec<String> 在这条输入上会清零 ⇒ 图有轴空白"
         );
 
-        // ③ 混进一个词 ⇒ 只丢那一格（5 与 7 都要留着）
+        // ③ 混进一个词 ⇒ 只丢那一格（5 与 7 都要留着），**标签也跟着丢那一格**：
+        // 从前按长度从头砍一刀，5 那根柱子会顶着本该属于坏值的 "b"。
+        let mixed = find("数值里混进一个词");
+        assert_eq!(mixed.3, vec![5, 7], "一格坏不能把整条序列清零");
         assert_eq!(
-            find("数值里混进一个词").3,
-            vec![5, 7],
-            "一格坏不能把整条序列清零"
+            mixed.2,
+            vec!["a".to_string(), "c".to_string()],
+            "坏值那一格的标签要跟着它一起消失，而不是把后面的标签整体前移"
+        );
+
+        // 标签比点多：多出来的那几格是前面的旧点，与夹头同一个口径一起截掉。
+        let extra = find("标签比点多");
+        assert_eq!(extra.3, vec![5, 7]);
+        assert_eq!(
+            extra.2,
+            vec!["a".to_string(), "b".to_string()],
+            "标签尾部对点的尾部，多出的头部标签跟着旧点一起截掉"
         );
 
         // ④ kind 不认识也照样收下（按折线画是渲染那一头的兜底，控件本身不许消失）
