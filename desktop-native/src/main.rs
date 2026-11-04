@@ -10750,6 +10750,15 @@ fn chart_label_index(n: usize, len: usize, j: usize) -> usize {
     n.saturating_sub(len) + j
 }
 
+/// 横轴文本那一格的矩形：居中在它那个点上方，但**左右都不许越出绘图区**。
+///
+/// 最右那一格是右对齐画的，从前只把左边夹进绘图区：`cell_w` 上限 90 ⇒ 它的右端
+/// 会伸到绘图区外面 45 px（比卡片右边距还宽），被内容区裁剪吃掉最后一个字。
+fn chart_label_rect(plot: D2D_RECT_F, cx: f32, cell_w: f32) -> D2D_RECT_F {
+    let left = (cx - cell_w / 2.0).clamp(plot.left, (plot.right - cell_w).max(plot.left));
+    rect(left, plot.bottom + 4.0, cell_w, 14.0)
+}
+
 /// 画一张插件图表。线、柱、网格、纵轴数字全部复用内置页那一套几何函数。
 fn draw_plugin_chart(p: &P<'_>, r: D2D_RECT_F, kind: &str, labels: &[String], points: &[i64]) {
     p.card(r, R_CARD);
@@ -10838,12 +10847,7 @@ fn draw_plugin_chart(p: &P<'_>, r: D2D_RECT_F, kind: &str, labels: &[String], po
         let last = i + 1 == n;
         p.text(
             &p.clip(text, &p.fmt.caption, cell_w),
-            rect(
-                (cx - cell_w / 2.0).max(plot.left),
-                plot.bottom + 4.0,
-                cell_w,
-                14.0,
-            ),
+            chart_label_rect(plot, cx, cell_w),
             if last {
                 &p.fmt.caption_right
             } else {
@@ -14325,6 +14329,34 @@ mod chart_axis_mirror_tests {
             chart_label_index(10, 0, 0),
             10,
             "一个文本都没有时不许倒着算（下标越界由标记判据滤掉）"
+        );
+    }
+
+    /// 横轴那一格：最右一格是右对齐画的，右端不许伸出绘图区。
+    ///
+    /// 从前只夹左端，`cell_w` 90 时最后一格右端落在 `plot.right + 45` —— 比卡片
+    /// 右边距还宽，那截被内容区裁剪吃掉：日期少一个字，而图本身看着没坏。
+    #[test]
+    fn axis_label_boxes_stay_inside_the_plot() {
+        let plot = rect(46.0, 46.0, 800.0, 76.0);
+        for cx in [plot.left, plot.left + 123.0, plot.right] {
+            for cell_w in [28.0f32, 60.0, 90.0] {
+                let r = chart_label_rect(plot, cx, cell_w);
+                assert!(
+                    r.left >= plot.left - 0.01,
+                    "横轴文本左端跑出绘图区: {r:?}（cx={cx}，格宽={cell_w}）"
+                );
+                assert!(
+                    r.right <= plot.right + 0.01,
+                    "横轴文本右端跑出绘图区: {r:?}（cx={cx}，格宽={cell_w}）"
+                );
+            }
+        }
+        // 中间那一格仍然居中：别为了夹边把整排文本整体挪走。
+        let mid = chart_label_rect(plot, plot.left + 400.0, 60.0);
+        assert!(
+            (mid.left - (plot.left + 370.0)).abs() < 0.01,
+            "中间那一格被挪了：{mid:?}"
         );
     }
 
