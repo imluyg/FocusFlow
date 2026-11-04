@@ -18226,7 +18226,17 @@ mod clip_tests {
             ("p.clip(&format!(\"今日{}/{}\",thousands(todayasu64),thousands(goalasu64)),&p.fmt.body,150.0),rect(r.left+pad,r.top+14.0,150.0,18.0)", 1),
             // 插件面板一族：作者给的字符串，宽度全是插件自己挑的
             ("p.clip(text,&p.fmt.body,r.right-r.left),*r,&p.fmt.body,&p.br.fg", 1),
-            ("p.clip(text,&p.fmt.caption,r.right-r.left),*r,&p.fmt.caption,&p.br.muted", 2),
+            // 单行的那一格（Label）仍就地夹；多行的 Body 走 `clip_text_lines`（逐行 + 行数上限），
+            // 两处各有自己的针，别把 Body 的夹取悄悄丢了。
+            ("p.clip(text,&p.fmt.caption,r.right-r.left),*r,&p.fmt.caption,&p.br.muted", 1),
+            (
+                "clip_text_lines(p,text,&p.fmt.caption,r.right-r.left,PV_TEXTAREA_MAX_LINES)",
+                1,
+            ),
+            (
+                "clip_text_lines(p,m.content,&p.fmt.caption,cr.right-cr.left,MODAL_CONTENT_MAX_LINES)",
+                1,
+            ),
             ("p.clip(key,&p.fmt.caption,140.0),rect(r.left,r.top,140.0,18.0)", 1),
             ("p.clip(value,&p.fmt.small,r.right-r.left-146.0),rect(r.left+146.0,r.top,r.right-r.left-146.0,18.0)", 1),
             // Field 与 Select 的标签同一格同一定宽 ⇒ 两处
