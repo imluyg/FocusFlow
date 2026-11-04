@@ -197,3 +197,25 @@ fn two_ways_to_name_the_window_are_not_both_honored() {
         "两个都给要拒绝并说清哪一个才是：{gap}"
     );
 }
+
+/// `days` 与 `to` 同时给 ⇒ 同样拒绝。
+///
+/// 这一条原先漏了：`days` 那边把结束日定成今天，而 `to` 被**悄悄丢掉** —— 返回的窗口
+/// 不按作者写的结束日，`gap` 还是空串、图照画。作者写完 `{ days = 7, to = "…" }` 拿到
+/// 的是一份"看着对、其实截止在今天"的数，没有任何一处能看出那个 `to` 没被采纳。
+#[test]
+fn a_window_end_contradicting_days_is_refused_not_dropped() {
+    let _g = query_round::guard();
+    let app = common::isolated_app_dir("query_days_to");
+    let (mut pm, name) = load_query(
+        app.path(),
+        "dt",
+        "{ days = 7, to = \"2026-01-01\", group_by = \"day\" }",
+    );
+    pm.refresh_view(&name).expect("取视图该成功");
+    let gap = gap_of(&pm, &name);
+    assert!(
+        gap.contains("days") && gap.contains("to") && gap.contains("只能给一个"),
+        "days 与 to 冲突要当场拒绝，而不是把 to 丢掉：{gap}"
+    );
+}

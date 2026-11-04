@@ -1542,6 +1542,17 @@ pub fn register_host_api(
                     ),
                 ))
             }
+            // `days` 已经决定了区间的**两端**（今天往回数 N 天），再给一个 `to` 只有两种
+            // 处理法：拒绝，或悄悄丢掉 —— 后者返回的窗口不按作者写的结束日，而 `gap` 还是
+            // 空串、图照画，作者没有任何办法看出那个 `to` 没被采纳。
+            (Some(_), None) if text("to").is_some() => return Ok((
+                empty,
+                Some(
+                    "focusflow.query 的 days 与 to 只能给一个：days 说的是「含今天往回数几天」，\
+                         结束日已经定在今天了 —— 要点名结束日请改用 from/to"
+                        .to_string(),
+                ),
+            )),
             (Some(raw), None) => match raw.parse::<i64>() {
                 Ok(n) if (1..=crate::db::queries::MAX_QUERY_DAYS).contains(&n) => {
                     // `n` 已经夹在 1..=上限里；`date_minus_days` 只在减穿历元时才交 None
