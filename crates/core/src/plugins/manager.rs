@@ -26,6 +26,7 @@ use crate::config::FocusFlowConfig;
 use crate::db;
 use crate::paths;
 use crate::plugins::host;
+use crate::plugins::package;
 use crate::plugins::permissions;
 use crate::plugins::plugin_events;
 use crate::plugins::plugin_health;
@@ -547,10 +548,10 @@ fn missing_plugin_reason(dirs: &[PathBuf], stem: &str) -> String {
 /// · 白名单里的内置名字不搬（见 [`BUILTIN_PLUGIN_STEMS`]），由 `plugins/builtin/` 那份提供。
 ///
 /// 两个目录都是参数（不读进程全局）：用例按路径钉每一条纪律，别的用例换过一次 `app_dir`
-/// 就不该影响这里。`NotFound` 算"旧目录里什么都没有"，与 [`list_lua_plugins`] 同一个口径。
+/// 就不该影响这里。`NotFound` 算"旧目录里什么都没有"，与 [`list_plugin_files`] 同一个口径。
 fn migrate_legacy_plugins(legacy_dir: &Path, user_dir: &Path) -> MigrationReport {
     let mut report = MigrationReport::default();
-    let files = match list_lua_plugins(legacy_dir) {
+    let files = match list_plugin_files(legacy_dir) {
         Ok(files) => files,
         Err(e) => {
             report.unreadable = Some(e);
@@ -638,12 +639,12 @@ fn run_legacy_migration(legacy_dir: &Path, user_dir: &Path) {
     if already {
         // 搬过一轮之后，旧目录里再出现"数据目录没有的"名字 = 用户往一个不再被扫的目录里
         // 扔了文件。不说出来的话，症状就是"我放了插件但插件页没有"。
-        let user_stems: Vec<String> = list_lua_plugins(user_dir)
+        let user_stems: Vec<String> = list_plugin_files(user_dir)
             .unwrap_or_default()
             .iter()
             .map(|p| PluginManager::stem_of(p))
             .collect();
-        for stem in list_lua_plugins(legacy_dir)
+        for stem in list_plugin_files(legacy_dir)
             .unwrap_or_default()
             .iter()
             .map(|p| PluginManager::stem_of(p))
@@ -690,12 +691,20 @@ fn blocked_by_a_file(dir: &Path) -> bool {
 ///
 /// 单独收一个 `dir` 参数（而不是挂在 `&self` 上）是为了让三种结局都能被用例直接按路径钉住：
 /// `plugins_dir()` 走的是进程全局的 app_dir，别的用例换过一次就会漂。
-fn list_lua_plugins(dir: &Path) -> Result<Vec<PathBuf>, String> {
+/// 插件目录里的源文件：单文件 `.lua` 与安装进来的 `.zip` 包都算（P2 第 16 步）。
+///
+/// 包里那份 `plugin.lua` 不在这一层展开：磁盘上的一格插件**就是一个文件**，
+/// stem 仍然是文件名 —— 加载时才去包里取脚本（见 `package::read_script`）。
+fn list_plugin_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(entries) => entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.extension().map(|e| e == "lua").unwrap_or(false))
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e == "lua" || e.eq_ignore_ascii_case("zip"))
+            })
             .collect(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !blocked_by_a_file(dir) => {
             return Ok(Vec::new())
@@ -709,6 +718,20 @@ fn list_lua_plugins(dir: &Path) -> Result<Vec<PathBuf>, String> {
     };
     files.sort();
     Ok(files)
+}
+
+/// 这一处目录里 `stem` 的源文件：单文件 `.lua` 排在包 `.zip` 之前。
+///
+/// 两个读者（热重载的"文件还在不在"、安装那一侧的同名检查）读同一把尺子：
+/// 两处各判一遍的话，症状是包删掉了而热重载以为它还在、或者反过来。
+fn plugin_file_for(dir: &Path, stem: &str) -> Option<PathBuf> {
+    for ext in ["lua", "zip"] {
+        let candidate = dir.join(format!("{stem}.{ext}"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 impl PluginManager {
@@ -1153,7 +1176,7 @@ impl PluginManager {
         let mut seen: Vec<String> = Vec::new();
         for (index, dir) in dirs.iter().enumerate() {
             let source = Self::source_at(index, legacy);
-            let files = match list_lua_plugins(dir) {
+            let files = match list_plugin_files(dir) {
                 Ok(files) => files,
                 Err(e) => {
                     errors.push(e);
@@ -1226,7 +1249,8 @@ impl PluginManager {
     /// 先把注释和长字符串整段抹成空格，再只认**从第 0 列起**正好是
     /// `KEY = "字面量"` 的行（`local KEY = …` 也不算 —— 那根本不会成为全局变量）。
     fn scan_meta(path: &Path) -> Result<PluginManifest, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        // 单文件与包走同一条读手：页面上读到的名字必须与真正加载的那一份是同一个人写的。
+        let (text, _) = package::read_script(path)?;
         Ok(Self::scan_meta_source(&text, path))
     }
 
@@ -1248,7 +1272,7 @@ impl PluginManager {
                 .set("focusflow", placeholder)
                 .map_err(|e| e.to_string())?;
         }
-        let script = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let (script, _) = package::read_script(path)?;
         lua.load(&script)
             .set_name(
                 path.file_name()
@@ -1347,13 +1371,17 @@ impl PluginManager {
 
     /// 用户当场点「同意」：落一份 `grants.json`，并把这一份插件的闸翻开。
     ///
-    /// 为什么要求插件已加载：授权绑的是**这份文件此刻**的权限集合与内容哈希，
-    /// 从盘上另扫一遍拿到的可能是改了半截的另一版（作者正在编辑），那样落下去的记录
-    /// 与插件实际跑的字节不是同一份，而"已授权"这句话就成了对着一份不存在的代码说的。
+    /// **没加载的插件也能授权**（2026-11-04 的 GUI 屏证逮到的死锁）：API 2 的插件若在
+    /// `init()` 里就调权限 API（脚手架正是这样），未授权会让 init 抛 `DENIED`、加载失败；
+    /// 而「授权」按钮原先要求"已加载" —— 于是"要先授权才能加载、要先加载才能授权"。
+    /// 未加载时按清单找到这一份文件，用**纯文本扫描**（不执行脚本）取声明：授权绑的是
+    /// 权限集合与文件字节，这两样扫描都拿得到，而扫描不会因为没授权而失败。
+    ///
+    /// 已加载时仍用实例里那一份清单：那是这一份 VM 真正在读的东西。
     ///
     /// 交回的是页面上那一句话（授权之后插件页要当场改口，而不是等下一次重扫）。
     pub fn grant_plugin(&mut self, stem: &str) -> Result<String, String> {
-        let found = self
+        let loaded = self
             .plugins
             .values()
             .find(|p| Self::stem_of(&p.file_path) == stem)
@@ -1361,15 +1389,27 @@ impl PluginManager {
                 (
                     p.manifest.permissions.clone(),
                     p.file_path.clone(),
-                    Arc::clone(&p.gate),
+                    Some(Arc::clone(&p.gate)),
                 )
             });
-        let Some((declared, path, gate)) = found else {
-            return Err(format!(
-                "「{stem}」现在没加载，先启用它再授权（授权要绑这一份文件的字节）"
-            ));
+        let (declared, path, gate) = match loaded {
+            Some(found) => found,
+            None => {
+                let path = self
+                    .discover()?
+                    .into_iter()
+                    .find(|d| Self::stem_of(&d.path) == stem)
+                    .map(|d| d.path)
+                    .ok_or_else(|| {
+                        format!("清单里没有「{stem}」：插件目录这一轮没扫到它，授权无处可绑")
+                    })?;
+                let manifest = Self::scan_meta(&path)?;
+                (manifest.permissions, path, None)
+            }
         };
-        let bytes = std::fs::read(&path).map_err(|e| {
+        // 与加载时同一把读手：包算包字节、单文件算文件字节 —— 两处各读一套的话，
+        // 授权落下去的那份哈希与插件实际跑的那一份不是同一个对象。
+        let (_, bytes) = package::read_script(&path).map_err(|e| {
             format!("读不出 {stem} 这一份文件（{e}）：授权绑的是它的字节，读不出就不落盘")
         })?;
         if declared.is_empty() {
@@ -1384,7 +1424,10 @@ impl PluginManager {
         };
         permissions::write_grants(stem, &record)
             .map_err(|e| format!("「{stem}」的授权没落盘（{e}）：屏上不说已授权"))?;
-        gate.set_granted(true);
+        // 没加载的那一档没有闸可翻：下一次加载会按刚落的 grants.json 重建它。
+        if let Some(gate) = gate {
+            gate.set_granted(true);
+        }
         Ok("已授权".to_string())
     }
 
@@ -1478,7 +1521,9 @@ impl PluginManager {
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         // 先读文件字节：`content_hash` 吃的就是这一份（方案 3.3 那两个哈希的范围写死了
         // "文件原始字节"，不做换行归一），而下面执行 Lua 用的也是它。
-        let script = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        // 单文件与包走同一条读手：正文用来执行，`hash_bytes` 交给授权那一头算内容哈希
+        // （包算的是包字节，单文件算的是文件字节）。
+        let (script, hash_bytes) = package::read_script(path)?;
 
         let lua = Self::create_sandboxed_lua().map_err(|e| e.to_string())?;
         self.apply_lua_limits(&lua);
@@ -1525,13 +1570,8 @@ impl PluginManager {
                 permissions::KNOWN_PERMISSIONS.join("、")
             );
         }
-        let (authorization, mode) = Self::authorization_for(
-            source,
-            meta.manifest.api,
-            &declared,
-            &stem,
-            script.as_bytes(),
-        );
+        let (authorization, mode) =
+            Self::authorization_for(source, meta.manifest.api, &declared, &stem, &hash_bytes);
         let gate = Arc::new(permissions::Gate::new(mode, &declared));
         if let permissions::GateMode::Enforce { .. } = gate.mode() {
             let wrapped = host::install_permission_guard(
@@ -2339,7 +2379,7 @@ impl PluginManager {
         while let Ok(name) = self.reload_rx.try_recv() {
             // "文件还在不在"要问这一轮真被扫的那几处：只问内置目录会把用户插件的删除
             // 当成"还在"，只问数据目录则反过来把内置的删除吞掉。
-            if !dirs.iter().any(|d| d.join(format!("{name}.lua")).exists()) {
+            if !dirs.iter().any(|d| plugin_file_for(d, &name).is_some()) {
                 if self.unload_by_stem(&name) {
                     tracing::info!("插件文件已删除，已卸载: {name}");
                     reloaded.push(name);
@@ -2721,7 +2761,11 @@ fn scan_plugin_mtimes(
     let mut seen: HashMap<String, Option<SystemTime>> = HashMap::new();
     for entry in entries.flatten() {
         let p = entry.path();
-        if !p.extension().map(|e| e == "lua").unwrap_or(false) {
+        if !p
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "lua" || e.eq_ignore_ascii_case("zip"))
+        {
             continue;
         }
         let Some(name) = p.file_stem().and_then(|s| s.to_str()) else {
@@ -3350,6 +3394,40 @@ mod tests {
         let p = dir.join(format!("{file}.lua"));
         std::fs::write(&p, body).unwrap();
         p
+    }
+
+    /// 「要先授权才能加载、要先加载才能授权」那条死锁（2026-11-04 的 GUI 屏证逮到的）。
+    ///
+    /// API 2 的插件若在 `init()` 里就调权限 API（脚手架正是这样），未授权会让 init 抛
+    /// `DENIED`、加载失败；而「授权」原先要求"已加载" —— 用户永远点不动那颗按钮。
+    /// 这一条钉两半：未加载时授权要成功；授权之后同一份文件要装得起来。
+    #[test]
+    fn a_plugin_that_fails_init_for_want_of_a_grant_can_still_be_granted() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("grant_before_load");
+        let script = "PLUGIN_NAME = \"needs_grant\"\nPLUGIN_API = 2\n\
+                      PLUGIN_PERMISSIONS = { \"storage.read\" }\n\
+                      function init() local v = focusflow.store.get(\"k\") end\n\
+                      function get_view() return { widgets = {} } end\n";
+        let path = write_lua(&paths::plugins_user_dir(), "needs_grant", script);
+        let mut pm = manager_in(tmp.path());
+
+        let err = pm
+            .load_plugin(&path, PluginSource::User)
+            .expect_err("未授权时 init 会撞 DENIED，加载应当失败");
+        assert!(
+            err.contains("DENIED") || err.contains("storage.read"),
+            "失败原因要指向权限：{err}"
+        );
+        assert!(pm.get_plugin("needs_grant").is_none(), "它不该在实例表里");
+
+        let said = pm
+            .grant_plugin("needs_grant")
+            .expect("没加载的那一档也必须能授权（否则那颗按钮永远点不动）");
+        assert!(said.contains("已授权"), "{said}");
+
+        pm.load_plugin(&path, PluginSource::User)
+            .expect("授权之后同一份文件要装得起来");
     }
 
     /// 一个用到调度线程、并按 `host.rs` 的说明在 cleanup 里归还的插件。
@@ -4366,26 +4444,29 @@ end
         std::fs::write(ok_dir.join("beta.lua"), "PLUGIN_NAME = \"乙\"\n").unwrap();
         std::fs::write(ok_dir.join("alpha.lua"), "PLUGIN_NAME = \"甲\"\n").unwrap();
         std::fs::write(ok_dir.join("readme.txt"), "这不是插件\n").unwrap();
-        let got = list_lua_plugins(&ok_dir).expect("这个目录该读得动");
+        // 装进来的包与单文件在这里**一样是一个条目**：清单只认文件名，包什么时候拆
+        // 是加载那一侧的事（`package::read_script`）。
+        std::fs::write(ok_dir.join("gamma.zip"), b"packed").unwrap();
+        let got = list_plugin_files(&ok_dir).expect("这个目录该读得动");
         assert_eq!(
             got.iter()
                 .map(|p| p.file_stem().unwrap().to_str().unwrap().to_string())
                 .collect::<Vec<_>>(),
-            vec!["alpha", "beta"],
-            "只收 .lua、并按文件名排序（列表稳定是页面上的顺序）: {got:?}"
+            vec!["alpha", "beta", "gamma"],
+            "收 .lua 与 .zip 两种源文件、按文件名排序（列表稳定是页面上的顺序）: {got:?}"
         );
 
         let empty_dir = tmp.path().join("scan_empty");
         std::fs::create_dir_all(&empty_dir).unwrap();
         assert!(
-            list_lua_plugins(&empty_dir)
+            list_plugin_files(&empty_dir)
                 .expect("空目录是读得动的")
                 .is_empty(),
             "读全了、里面确实没有 ⇒ 空清单"
         );
         let absent = tmp.path().join("scan_never_created");
         assert!(
-            list_lua_plugins(&absent)
+            list_plugin_files(&absent)
                 .expect("目录不存在＝一个插件都没有，不是读不出来")
                 .is_empty(),
             "全新安装一个目录都没建，此刻该报\"没有插件\"，不许报读不出来"
@@ -4393,7 +4474,7 @@ end
 
         let not_a_dir = tmp.path().join("scan_is_a_file");
         std::fs::write(&not_a_dir, "这是一个文件，不是目录\n").unwrap();
-        let err = list_lua_plugins(&not_a_dir)
+        let err = list_plugin_files(&not_a_dir)
             .expect_err("把一个普通文件当插件目录读，必须交回原因而不是空清单");
         assert!(
             err.contains("读不出来") && err.contains("没有插件"),
@@ -4580,22 +4661,24 @@ end
         );
         assert_eq!(
             consumers.matches("self.discover()?").count(),
-            3,
-            "带来源的三个消费点（列表、启用、面板打开时的 ensure_loaded）都必须把 Err 原样交出去\
-             （`?`），而不是就地折成空"
+            4,
+            "带来源的四个消费点（列表、启用、面板打开时的 ensure_loaded、未加载时的授权）\
+             都必须把 Err 原样交出去（`?`），而不是就地折成空 —— 折成空的那一档，症状是\
+             \"目录读不动\"被念成\"没有这一份插件\"，授权就会报一个假原因"
         );
         assert_eq!(
             consumers.matches("matchself.discover()").count(),
             1,
             "启动加载那一处必须自己接住 Err 并出声"
         );
-        // 兜底：四个消费点之外不许再有人取数（第五处一定是新加的，先问它吃哪种结局）
+        // 兜底：五个消费点之外不许再有人取数（第六处一定是新加的，先问它吃哪种结局）
         let total = consumers.matches("self.discover()").count()
             + consumers.matches("self.discover_paths()").count();
         assert_eq!(
-            total, 4,
-            "取数只有四个消费点（列表、启用、启动加载、面板打开时的 ensure_loaded），\
-             第五处要先说清它吃的是哪种结局"
+            total, 5,
+            "取数的消费点是：列表、启用、启动加载、面板打开时的 ensure_loaded、\
+             未加载时的授权（这一处用 `?` 把读不出来的原因原样交给调用方）。\
+             第六处要先说清它吃的是哪种结局"
         );
         for (at, call) in consumers.match_indices("self.discover()") {
             let after = &consumers[at + call.len()..];
@@ -4642,7 +4725,7 @@ end
             .filter(|c| !c.is_whitespace())
             .collect();
         // 清单只从"那一处唯一的尺子"取目录，扫描本身对每处目录只写一遍。
-        // 这两条是变异探针逼出来的：先前这里数的是 `list_lua_plugins(&builtin_dir)`，
+        // 这两条是变异探针逼出来的：先前这里数的是 `list_plugin_files(&builtin_dir)`，
         // 也就是**清单自己又列了一遍目录** —— 把内置目录从 `paths::plugin_scan_dirs` 摘掉，
         // 行为用例照样绿，而插件页那一行「目录」已经和清单来的不是同一处。
         assert_eq!(
@@ -4656,7 +4739,7 @@ end
             "`discover()` 不再从那一把尺子取目录 = 界面与清单会各说一套"
         );
         assert_eq!(
-            flat.matches("list_lua_plugins(dir)").count(),
+            flat.matches("list_plugin_files(dir)").count(),
             1,
             "每处目录一次扫描；数到第二处说明清单又列了一遍目录"
         );

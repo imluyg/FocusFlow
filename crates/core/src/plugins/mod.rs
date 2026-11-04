@@ -16,7 +16,9 @@
 //! 插件列表就会把调度线程拉起、把已停用插件的附属库建出来。初始化请放进 init()。
 
 pub mod host;
+pub mod install;
 pub mod manager;
+pub mod package;
 pub mod permissions;
 pub mod plugin_events;
 pub mod plugin_health;

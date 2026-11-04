@@ -30,8 +30,9 @@ const USAGE: &str = "\
 focusflow-plugin —— 脚本插件作者的工具链
 
   new <目录|路径.lua>   生成一份脚本插件脚手架（不覆盖已有文件）
-  validate <路径.lua>   检查清单：字段会不会被折掉、声明的权限与代码真用到对不对得上
-  hash <路径.lua>       打印这份插件的两个哈希（授权绑 permission_hash 那一个）
+  validate <路径.lua|包.zip>   检查清单：字段会不会被折掉、声明的权限与代码真用到对不对得上
+  hash <路径.lua|包.zip>       打印这份插件的两个哈希（授权绑 permission_hash 那一个）
+  pack <目录> [-o <文件.zip>]  把 plugin.lua + assets/ 打成确定性 zip（缺省落在目录旁边同名 .zip）
   run <路径.lua>          用一拍事件夹具把插件跑一遍，把宿主读出来的视图打成 JSON
       --event <view|timer|app_change|action>   跑哪一拍（缺省 view = 只 init + get_view）
       --app <应用名>                            app_change 那一拍投出去的就是这个名字
@@ -49,6 +50,8 @@ run 反过来 —— JSON 单独占 stdout（要能直接管道给 jq），其�
 fn max_args(cmd: &str) -> Option<usize> {
     match cmd {
         "new" | "validate" | "hash" => Some(1),
+        // `pack <目录> [-o <文件.zip>]`：目录 + 选项 + 值。
+        "pack" => Some(3),
         _ => None,
     }
 }
@@ -86,7 +89,7 @@ fn run(args: &[String]) -> i32 {
         "validate" => match args.get(1).map(String::as_str) {
             // 这一条是作者手敲的，不是挂在计划任务上的，所以逐行结论走 stdout；
             // 只有"根本没问到"（文件读不出来）走 stderr。
-            Some(target) => match plugins::validate::validate_path(Path::new(target)) {
+            Some(target) => match validate_target(Path::new(target)) {
                 Err(why) => {
                     eprintln!("{why}");
                     1
@@ -106,7 +109,7 @@ fn run(args: &[String]) -> i32 {
             }
         },
         "hash" => match args.get(1).map(String::as_str) {
-            Some(target) => match hash_lines(Path::new(target)) {
+            Some(target) => match hash_target(Path::new(target)) {
                 Err(why) => {
                     eprintln!("{why}");
                     1
@@ -122,6 +125,27 @@ fn run(args: &[String]) -> i32 {
             }
         },
         "new" => scaffold(args.get(1).map(String::as_str)),
+        "pack" => match parse_pack(&args[1..]) {
+            Err(why) => {
+                eprintln!("{why}");
+                1
+            }
+            Ok(req) => match pack_plugin(&req) {
+                Err(why) => {
+                    eprintln!("{why}");
+                    1
+                }
+                Ok(out) => {
+                    println!("已打包：{}", out.display());
+                    println!(
+                        "复核同一把尺子：focusflow-plugin validate \"{}\" / hash \"{}\"",
+                        out.display(),
+                        out.display()
+                    );
+                    0
+                }
+            },
+        },
         "run" => match parse_run(&args[1..]) {
             Err(why) => {
                 eprintln!("{why}");
@@ -158,10 +182,18 @@ fn hash_lines(file: &Path) -> Result<String, String> {
     let report = plugins::validate::validate_path(file)?;
     let bytes =
         std::fs::read(file).map_err(|e| format!("{} 的字节读不出来: {e}", file.display()))?;
+    Ok(hash_text(&report, &bytes))
+}
+
+/// 两条入口（单文件 / 包）共用的排版。
+///
+/// 两个哈希**只在这里**算：一处算权限、一处算字节的话，工具念的数与授权那道闸认的数
+/// 迟早不是一对。
+fn hash_text(report: &plugins::validate::Report, bytes: &[u8]) -> String {
     let mut out = format!(
         "permission_hash = {}\ncontent_hash    = {}",
         plugins::permissions::permission_hash(&report.manifest.permissions),
-        plugins::permissions::content_hash(&bytes),
+        plugins::permissions::content_hash(bytes),
     );
     // 清单里宿主认不得的那几项**仍留在声明里**（折叠只排序去重），但运行时不会为它装闸 ——
     // 于是那一格谁都调得动，而授权页上写着"已授权包含它"。这一句必须说出来，
@@ -172,7 +204,108 @@ fn hash_lines(file: &Path) -> Result<String, String> {
              但运行时不会为它装闸，所以那一格谁都能调"
         ));
     }
+    out
+}
+
+/// 包的哈希：清单来自包里那份 `plugin.lua`，`content_hash` 算在**包字节**上。
+///
+/// 为什么不单独算脚本字节：授权绑定的是"用户安装的这一份包"，而确定性打包保证同一棵
+/// 目录每次打出来是同一串字节 —— 重新打包不会平白让用户看到"插件已更新"。
+fn hash_package(file: &Path) -> Result<String, String> {
+    let bytes =
+        std::fs::read(file).map_err(|e| format!("{} 的字节读不出来: {e}", file.display()))?;
+    let entries = plugins::package::read(&bytes)?;
+    let text = plugins::package::script_source(&entries)?;
+    let stem = plugins::manager::PluginManager::stem_of(file);
+    let report = plugins::validate::validate(&stem, plugins::validate::source_of(file), text);
+    Ok(hash_text(&report, &bytes))
+}
+
+fn hash_target(path: &Path) -> Result<String, String> {
+    if plugins::package::is_package_path(path) {
+        hash_package(path)
+    } else {
+        hash_lines(path)
+    }
+}
+
+/// 校验的入口：`.lua` 走原路，`.zip` 先取出包里那份 `plugin.lua` 再走**同一个** `validate`。
+fn validate_target(path: &Path) -> Result<plugins::validate::Report, String> {
+    if plugins::package::is_package_path(path) {
+        let bytes = std::fs::read(path).map_err(|e| format!("{} 读不出来: {e}", path.display()))?;
+        let entries = plugins::package::read(&bytes)?;
+        let text = plugins::package::script_source(&entries)?;
+        let stem = plugins::manager::PluginManager::stem_of(path);
+        Ok(plugins::validate::validate(
+            &stem,
+            plugins::validate::source_of(path),
+            text,
+        ))
+    } else {
+        plugins::validate::validate_path(path)
+    }
+}
+
+/// `pack` 那一问要的东西。
+struct PackReq {
+    dir: PathBuf,
+    out: Option<PathBuf>,
+}
+
+fn parse_pack(args: &[String]) -> Result<PackReq, String> {
+    let mut dir: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        // 与 `parse_run` 同一个写法：取值要推进游标，闭包会与 `args` 的借用来回打架。
+        let flag = args[i].clone();
+        let mut value = |what: &str| -> Result<String, String> {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| format!("{what} 后面要跟一个值（这一问根本没问到）"))
+        };
+        match flag.as_str() {
+            "-o" => out = Some(PathBuf::from(value("-o")?)),
+            other if other.starts_with('-') => {
+                return Err(format!("认不出选项 {other}（-h 看用法）"))
+            }
+            other => {
+                if dir.is_some() {
+                    return Err(format!(
+                        "pack 只接一个目录，多出来的那一个不会执行：{other}"
+                    ));
+                }
+                dir = Some(PathBuf::from(other));
+            }
+        }
+        i += 1;
+    }
+    let dir = dir.ok_or("用法: focusflow-plugin pack <目录> [-o <文件.zip>]")?;
+    Ok(PackReq { dir, out })
+}
+
+fn pack_plugin(req: &PackReq) -> Result<PathBuf, String> {
+    let entries = plugins::package::pack_dir(&req.dir)?;
+    let bytes = plugins::package::pack(entries)?;
+    let out = req
+        .out
+        .clone()
+        .unwrap_or_else(|| default_package_path(&req.dir));
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("{} 建不出来: {e}", parent.display()))?;
+        }
+    }
+    std::fs::write(&out, bytes).map_err(|e| format!("{} 写不出去: {e}", out.display()))?;
     Ok(out)
+}
+
+/// 不给 `-o` 时落在插件目录**旁边**：`foo/` ⇒ `foo.zip`。
+fn default_package_path(dir: &Path) -> PathBuf {
+    let text = dir.to_string_lossy();
+    PathBuf::from(format!("{}.zip", text.trim_end_matches(['/', '\\'])))
 }
 
 /// 脚手架落在哪：给目录就是 `<目录>/<默认名>`，给文件名就照那个名。
@@ -473,19 +606,33 @@ mod tests {
     fn the_tools_delegate_both_calipers_to_core() {
         let src = include_str!("main.rs");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
-        let at = prod
-            .find("fn hash_lines(file: &Path)")
-            .expect("hash_lines 的实现不见了");
-        let rest = &prod[at..];
-        let body = &rest[..rest.find("\nfn ").map(|n| n + 1).unwrap_or(rest.len())];
+        fn body_of<'a>(prod: &'a str, head: &str) -> &'a str {
+            let at = prod
+                .find(head)
+                .unwrap_or_else(|| panic!("{head} 的实现不见了"));
+            let rest = &prod[at..];
+            &rest[..rest.find("\nfn ").map(|n| n + 1).unwrap_or(rest.len())]
+        }
         assert!(
-            body.contains("plugins::validate::validate_path(file)"),
+            body_of(prod, "fn hash_lines(file: &Path)")
+                .contains("plugins::validate::validate_path(file)"),
             "hash 没走 core 那把折叠尺子（它要算在宿主真会用的那份清单上）"
         );
         assert!(
-            body.contains("plugins::permissions::permission_hash(")
-                && body.contains("plugins::permissions::content_hash("),
+            body_of(prod, "fn hash_package(file: &Path)").contains("plugins::package::read(")
+                && body_of(prod, "fn hash_package(file: &Path)")
+                    .contains("plugins::package::script_source("),
+            "包的清单必须从包里那份 plugin.lua 读出来（读手是 core 那一把），不许另写一套"
+        );
+        assert!(
+            body_of(prod, "fn hash_text(").contains("plugins::permissions::permission_hash(")
+                && body_of(prod, "fn hash_text(").contains("plugins::permissions::content_hash("),
             "哈希该由 permissions.rs 出，工具自己算一份就会与授权那道闸对不上"
+        );
+        assert_eq!(
+            prod.matches("hash_text(").count(),
+            3,
+            "两条入口（单文件 / 包）各调一次 + 定义一处：多一处就是有人又抄了一份排版"
         );
         assert!(
             !prod.contains("PLUGIN_PERMISSIONS = { \"") && !prod.contains("Sha256"),
@@ -1086,5 +1233,109 @@ end
             1,
             "没接的命令要说成没接"
         );
+    }
+
+    /// `pack` 的产出必须能被工具自己另外两条命令读回去：打包不是"写出一个文件就算完"
+    /// （方案第 16 步与第 18 步的 `pack` 一起落，就是为了不出现"写了没人读"）。
+    ///
+    /// 三条一起核：①同一棵目录打两次是同一串字节；②包上的 `permission_hash` 等于那份
+    /// `.lua` 的（清单来自包里那份脚本）；③`content_hash` 算在包字节上。
+    #[test]
+    fn a_packed_plugin_is_readable_by_validate_and_hash() {
+        let _g = guard();
+        let (app, lua) = bench("pack_roundtrip", "demo");
+        let _ = &app;
+        write(
+            &lua,
+            "PLUGIN_API = 2\nPLUGIN_PERMISSIONS = { \"stats.read\" }\nfunction get_view()\n  local s = focusflow.stats(7)\n  return { title = \"t\", widgets = {} }\nend\n",
+        );
+        let src = lua.with_file_name("demo_pkg");
+        std::fs::create_dir_all(src.join("assets/icons")).unwrap();
+        std::fs::write(src.join("plugin.lua"), std::fs::read(&lua).unwrap()).unwrap();
+        std::fs::write(src.join("assets/icons/a.txt"), "a").unwrap();
+
+        // 缺省落点：目录旁边同名 .zip
+        assert_eq!(
+            run(&["pack".into(), src.display().to_string()]),
+            0,
+            "打一份插件包不该失败"
+        );
+        let first = src.with_extension("zip");
+        let bytes_first = std::fs::read(&first).expect("缺省落点那份包");
+        // 再打一次到另一个路径：同一棵树必须给出同一串字节
+        let again = src.with_file_name("demo_pkg_again.zip");
+        assert_eq!(
+            run(&[
+                "pack".into(),
+                src.display().to_string(),
+                "-o".into(),
+                again.display().to_string()
+            ]),
+            0
+        );
+        assert_eq!(
+            std::fs::read(&again).unwrap(),
+            bytes_first,
+            "同一棵目录打两次不是同一串字节：内容哈希会跟着抖，用户每次都被提示「插件已更新」"
+        );
+
+        assert_eq!(
+            run(&["validate".into(), first.display().to_string()]),
+            0,
+            "包里那份 plugin.lua 与单文件是同一把尺子，它不该被判出问题"
+        );
+        assert_eq!(
+            run(&["hash".into(), first.display().to_string()]),
+            0,
+            "包也要算得出两个哈希"
+        );
+        let line = |text: &str, key: &str| {
+            text.lines()
+                .find(|l| l.starts_with(key))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let plain = hash_lines(&lua).unwrap();
+        let packed = hash_target(&first).unwrap();
+        assert_eq!(
+            line(&plain, "permission_hash"),
+            line(&packed, "permission_hash"),
+            "权限集合没变，包与单文件的 permission_hash 必须相同"
+        );
+        assert_eq!(
+            line(&packed, "content_hash"),
+            format!(
+                "content_hash    = {}",
+                plugins::permissions::content_hash(&bytes_first)
+            ),
+            "包的 content_hash 算在包字节上（重打包=同一串字节，才敢用它提示更新）"
+        );
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    /// 不是插件目录就不许打包，而且拒绝时不许留下半个包。
+    #[test]
+    fn pack_refuses_a_directory_that_is_not_a_plugin() {
+        let _g = guard();
+        let (app, lua) = bench("pack_bad", "x");
+        let _ = &app;
+        let dir = lua.with_file_name("not_a_plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("readme.md"), "hi").unwrap();
+        assert_eq!(
+            run(&["pack".into(), dir.display().to_string()]),
+            1,
+            "根上没有 plugin.lua 的目录不是插件"
+        );
+        assert!(
+            !dir.with_extension("zip").exists(),
+            "拒绝的时候不许留下半个包（作者会以为打成了）"
+        );
+        assert_eq!(
+            run(&["pack".into(), dir.display().to_string(), "-o".into()]),
+            1,
+            "-o 后面没给值 = 这一问根本没问到"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

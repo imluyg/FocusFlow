@@ -53,6 +53,10 @@ const USAGE: &str = "\
   --cleanup <天数>           保留 N 天（含今天），删除更早的数据
   --import-legacy <旧目录>   从旧版（Python 原版或旧数据目录）导入全部数据
                              到当前数据目录（同名年度库会被改写，先 --backup）
+  --install-plugin <包.zip>  安装 / 更新一份插件包（装完要重启，或在插件页停用再启用）
+  --uninstall-plugin <stem> [--purge-state]
+                             卸载装进来的插件包；默认保留 plugins/state/<stem>/，
+                             带 --purge-state 才连设置一起删（不可恢复）
   --reset                    清空所有统计记录（需输入 yes 确认）
   -h, --help                 显示本帮助
 ";
@@ -69,6 +73,9 @@ fn max_args(cmd: &str) -> Option<usize> {
         // 而界面上正在看的那一页就是近 30 天。
         "--export" => Some(2),
         "--rename-device" => Some(2),
+        // `--uninstall-plugin <stem> [--purge-state]`
+        "--uninstall-plugin" => Some(2),
+        "--install-plugin" => Some(1),
         "--list-years" | "--reset" | "--vacuum" | "--backup" => Some(0),
         _ => None,
     }
@@ -107,6 +114,112 @@ fn run(args: &[String]) -> i32 {
     let _ = focusflow_core::config::instance();
 
     match args[0].as_str() {
+        "--install-plugin" => {
+            let Some(target) = args.get(1) else {
+                eprintln!("用法: --install-plugin <插件包.zip>");
+                return 1;
+            };
+            match focusflow_core::plugins::install::install(std::path::Path::new(target)) {
+                Err(why) => {
+                    eprintln!("{why}");
+                    1
+                }
+                Ok(done) => {
+                    println!(
+                        "{}：{} → {}（{} 个文件，{} 字节）",
+                        if done.replaced {
+                            "已更新"
+                        } else {
+                            "已安装"
+                        },
+                        done.stem,
+                        done.path.display(),
+                        done.entries,
+                        done.bytes
+                    );
+                    if done.problems > 0 {
+                        // 校验器只是提示：包照装，但别让人以为这一份是干净的。
+                        eprintln!(
+                            "提示：校验器对这份包说了 {} 条问题（不阻塞安装）—— \
+                             focusflow-plugin validate \"{}\" 看逐条",
+                            done.problems,
+                            done.path.display()
+                        );
+                    }
+                    // 装好 ≠ 已经在跑：新文件按口径要下一次进插件页或重启才加载。
+                    println!("重启程序（或在插件页停用再启用）之后才会加载它");
+                    0
+                }
+            }
+        }
+        "--uninstall-plugin" => {
+            let Some(stem) = args.get(1) else {
+                eprintln!("用法: --uninstall-plugin <stem> [--purge-state]");
+                return 1;
+            };
+            let mut purge = match args.get(2).map(String::as_str) {
+                None => false,
+                Some("--purge-state") => true,
+                Some(other) => {
+                    eprintln!("认不出 {other}（这条命令只接 --purge-state）");
+                    return 1;
+                }
+            };
+            if purge {
+                // 删设置是**不可恢复**的那一半（方案第 17 步：默认保留，删除需二次确认）。
+                // 这里与 --reset 用同一把确认尺子：没问到（stdin 关了/空的）不许折成
+                // "用户拒绝"，更不许折成"同意" —— 两条都是本仓修过的形状。
+                use std::io::BufRead;
+                print!("这会连 {stem} 的插件设置一起删掉（不可恢复）。输入 yes 继续：");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let mut line = String::new();
+                let confirm = {
+                    let stdin = std::io::stdin();
+                    let mut lock = stdin.lock();
+                    classify_confirmation(lock.read_line(&mut line), &line)
+                };
+                match purge_plan(confirm) {
+                    PurgePlan::Purge => {}
+                    PurgePlan::KeepState => {
+                        println!("已取消删除设置：这一次只卸载包，设置保留");
+                        purge = false;
+                    }
+                    PurgePlan::Unreadable(why) => {
+                        eprintln!("没问到是否确认（{why}）：这一次什么都没动");
+                        return 1;
+                    }
+                }
+            }
+            match focusflow_core::plugins::install::uninstall(stem, purge) {
+                Err(why) => {
+                    eprintln!("{why}");
+                    1
+                }
+                Ok(done) => {
+                    println!(
+                        "已卸载：{}（包 {} 已删除）",
+                        done.stem,
+                        done.removed_package.display()
+                    );
+                    // 三档各说各的：把"从来没存过"念成"删掉了"是这一族里最常见的假话。
+                    match &done.state {
+                        focusflow_core::plugins::install::StateAfter::Kept(path) => println!(
+                            "它的设置还在 {}（要一并删掉请带 --purge-state）",
+                            path.display()
+                        ),
+                        focusflow_core::plugins::install::StateAfter::Purged => {
+                            println!("它的设置目录也一并删掉了")
+                        }
+                        focusflow_core::plugins::install::StateAfter::NeverExisted => {
+                            println!("它没有留下设置目录")
+                        }
+                    }
+                    // 卸载的那一份若正开着，下一次扫描/重启才会从清单里消失。
+                    println!("重启程序（或回插件页刷新）之后清单里才不再有它");
+                    0
+                }
+            }
+        }
         "--stats" => {
             if args.len() < 2 {
                 eprintln!("用法: --stats <天数|today|all>");
@@ -1252,6 +1365,23 @@ fn classify_confirmation(read: std::io::Result<usize>, line: &str) -> ConfirmRea
     }
 }
 
+/// 删设置前那一问的三种结局：答应删、不答应（只卸包、留设置）、根本没问到（什么都不动）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PurgePlan {
+    Purge,
+    KeepState,
+    Unreadable(String),
+}
+
+fn purge_plan(confirm: ConfirmRead) -> PurgePlan {
+    match confirm {
+        ConfirmRead::Approved => PurgePlan::Purge,
+        ConfirmRead::Declined => PurgePlan::KeepState,
+        // 没问到不等于拒绝：拒绝是一次回答，这里根本没发生对话。
+        ConfirmRead::Unreadable(why) => PurgePlan::Unreadable(why),
+    }
+}
+
 fn backup_outcome(outcome: &db::maintenance::BackupOutcome) -> (String, i32) {
     use db::maintenance::BackupOutcome as B;
     match outcome {
@@ -2039,9 +2169,12 @@ mod tests {
             .iter()
             .filter(|c| !documented.contains(*c))
             .collect();
+        // 帮助里还有一种 `--xxx` 是**选项**而不是命令（它跟着某条命令走）。白名单写死在这里，
+        // 并且下面单独钉住"它真的在分派臂里被读过" —— 否则这条豁免就成了"写了没做"的后门。
+        const OPTIONS: [&str; 1] = ["--purge-state"];
         let missing_impl: Vec<&String> = documented
             .iter()
-            .filter(|c| !handled.contains(*c))
+            .filter(|c| !handled.contains(*c) && !OPTIONS.contains(&c.as_str()))
             .collect();
         assert!(
             missing_doc.is_empty(),
@@ -2055,6 +2188,12 @@ mod tests {
             documented.contains("--import-legacy") && documented.contains("--device-keys"),
             "这两条是本轮补进来的：一条会改写当前库却不该藏在源码里，一条的周期参数现在真起作用了"
         );
+        for option in OPTIONS {
+            assert!(
+                prod.contains(&format!("\"{option}\"")),
+                "帮助里写了 {option} 这个选项，分派臂却没读过它（写了没做＝静默无效）"
+            );
+        }
     }
 
     /// 周期尺子必须真的接到 `--device-keys` 那扇门上（纯函数绿不代表调用方读了参数）。
@@ -2399,6 +2538,29 @@ mod tests {
         assert!(
             flat.contains("ConfirmRead::Unreadable(why)=>{eprintln!"),
             "「没问到」那一支必须走 stderr，成功那句话才只属于成功"
+        );
+    }
+
+    /// 删设置前那一问：答应 / 不答应 / 根本没问到是三件事。
+    ///
+    /// 不答应 ⇒ 只卸包、设置保留（默认那一档）；没问到 ⇒ 什么都不动 —— 把"没问到"
+    /// 折成"不答应"会让一次 stdin 被关掉的卸载静默地少做一半，折成"答应"就直接删了
+    /// 用户的设置。`--purge-state` 是唯一能走到这里的开关，所以它也必须真被读到。
+    #[test]
+    fn a_purge_that_was_never_asked_does_nothing() {
+        use super::{purge_plan, ConfirmRead, PurgePlan};
+        assert_eq!(purge_plan(ConfirmRead::Approved), PurgePlan::Purge);
+        assert_eq!(purge_plan(ConfirmRead::Declined), PurgePlan::KeepState);
+        match purge_plan(ConfirmRead::Unreadable("stdin 是空的".into())) {
+            PurgePlan::Unreadable(why) => assert!(why.contains("stdin")),
+            other => panic!("没问到不等于拒绝：{other:?}"),
+        }
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("matchpurge_plan(confirm)"),
+            "分派臂没走这个纯函数（只把 --purge-state 当字符串记着就等于没读它）"
         );
     }
 
