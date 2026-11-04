@@ -8234,6 +8234,11 @@ fn uninstall_line(
                 path.display()
             ),
             StateAfter::Purged => format!("已卸载 {}（包与设置都删了）", done.stem),
+            StateAfter::PurgeFailed { path, why } => format!(
+                "已卸载 {}（包已删除）；设置目录删不干净（{}：{why}）—— 设置还留在原处",
+                done.stem,
+                path.display()
+            ),
             StateAfter::NeverExisted => format!("已卸载 {}（它没有留下设置目录）", done.stem),
         },
     }
@@ -18159,6 +18164,19 @@ mod plugin_page_tests {
         );
         assert!(uninstall_line(Ok(gone(StateAfter::Purged))).contains("都删了"));
         assert!(uninstall_line(Ok(gone(StateAfter::NeverExisted))).contains("没有留下设置"));
+        // 第四种结局：包删了、设置没删干净。折成"卸载失败"会让用户以为插件还在。
+        let partial = uninstall_line(Ok(gone(StateAfter::PurgeFailed {
+            path: PathBuf::from("/s/demo"),
+            why: "另一个程序正在使用此文件".to_string(),
+        })));
+        assert!(
+            partial.contains("已卸载") && partial.contains("包已删除"),
+            "包确实删掉了，得先说这件事：{partial}"
+        );
+        assert!(
+            partial.contains("设置目录删不干净") && partial.contains("还留在原处"),
+            "没删干净的那一半也要说：{partial}"
+        );
         assert!(uninstall_line(Err("不在".into())).contains("卸载失败"));
     }
 

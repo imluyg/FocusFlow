@@ -162,6 +162,11 @@ pub enum StateAfter {
     Kept(PathBuf),
     /// 这一次显式删掉了。
     Purged,
+    /// 显式要删，但删不干净（目录里的文件被别人占着、权限不够）。
+    ///
+    /// **不能折成 `Err`**：包在那之前已经删掉了，报"卸载失败"会让用户以为插件还在，
+    /// 而再点一次只会得到"不是通过安装进来的包"。这是第四种结局，不是第三种的一个坏版本。
+    PurgeFailed { path: PathBuf, why: String },
 }
 
 /// 卸载的结论：包删没删、数据去了哪一档。
@@ -303,12 +308,20 @@ pub fn uninstall(stem: &str, purge_state: bool) -> Result<Uninstalled, String> {
     let state = paths::plugin_state_path(stem);
     let state_after = if state.exists() {
         if purge_state {
-            std::fs::remove_dir_all(&state)
-                .map_err(|e| format!("{} 删不掉：{e}", state.display()))?;
-            // 内存里那一格也要摘掉：退出前那一问会把有内容的台账落盘，而这一格刚被删掉，
-            // 留下来就会把 `state/` 目录又写回来（`discard` 不落盘）。
-            crate::plugins::plugin_health::discard(stem);
-            StateAfter::Purged
+            match std::fs::remove_dir_all(&state) {
+                Ok(()) => {
+                    // 内存里那一格也要摘掉：退出前那一问会把有内容的台账落盘，而这一格刚被删掉，
+                    // 留下来就会把 `state/` 目录又写回来（`discard` 不落盘）。
+                    crate::plugins::plugin_health::discard(stem);
+                    StateAfter::Purged
+                }
+                // 包已经删掉了：这里只能把"设置没删干净"当成第四种结局交回去。报 Err 会让
+                // 调用方把"插件已经不在了"念成"卸载失败"，再点一次还只会说"不是安装进来的包"。
+                Err(e) => StateAfter::PurgeFailed {
+                    path: state.clone(),
+                    why: e.to_string(),
+                },
+            }
         } else {
             StateAfter::Kept(state)
         }
@@ -611,6 +624,42 @@ mod tests {
             !paths::plugins_user_dir().join("sticky.zip.tmp").exists(),
             "失败留下的临时包没人收"
         );
+    }
+
+    /// 设置目录删不干净（目录里的文件被别人占着）是**第四种结局**，不是"卸载失败"：
+    /// 包在那之前已经删掉了。折成 Err 会让用户以为插件还在，再点一次只会得到
+    /// "不是通过安装进来的包"。
+    #[cfg(windows)]
+    #[test]
+    fn a_purge_that_cannot_finish_says_the_package_is_already_gone() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = guard();
+        let app = paths::test_app_dir("install_purge_failed");
+        let src = app.path().join("incoming");
+        let zip = write_package(&src, "stuck", "PLUGIN_NAME = \"卡住\"\n");
+        install(&zip).unwrap();
+        let state = paths::plugin_state_path("stuck");
+        std::fs::create_dir_all(&state).unwrap();
+        let locked = state.join("locked.json");
+        std::fs::write(&locked, b"{}").unwrap();
+        // 不给共享删除权：`remove_dir_all` 在这一格上必失败（实测 os error 32）。
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked)
+            .unwrap();
+
+        let done = uninstall("stuck", true).expect("包已经删掉了，这一问不该整体失败");
+        assert!(
+            matches!(&done.state, StateAfter::PurgeFailed { .. }),
+            "{:?}",
+            done.state
+        );
+        assert!(!done.removed_package.exists(), "包该真的没了");
+        assert!(state.exists(), "设置目录还在，结局里要说出来");
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     /// 没有 `plugin.lua` 的包不是插件：拒绝，并且盘上不许留下任何东西。

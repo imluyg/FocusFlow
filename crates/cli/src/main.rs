@@ -210,6 +210,12 @@ fn run(args: &[String]) -> i32 {
                         focusflow_core::plugins::install::StateAfter::Purged => {
                             println!("它的设置目录也一并删掉了")
                         }
+                        focusflow_core::plugins::install::StateAfter::PurgeFailed { path, why } => {
+                            println!(
+                                "它的设置目录删不干净（{}：{why}）—— 包已删掉，设置还留在原处",
+                                path.display()
+                            )
+                        }
                         focusflow_core::plugins::install::StateAfter::NeverExisted => {
                             println!("它没有留下设置目录")
                         }
