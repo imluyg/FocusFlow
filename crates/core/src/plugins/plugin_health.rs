@@ -662,6 +662,11 @@ pub fn board_for(stem: &str) -> Arc<Mutex<Health>> {
 }
 
 /// 把这一格的账落到盘上（不摘格子）。停用、卸载、面板关闭那三条路都要先叫这一句。
+///
+/// 空台账不落盘：页面问过一次就会建起空的一格，而加载路径上"先落再摘"跟着就会叫
+/// 这里 —— 照落的话一个从没跑过的插件也会被造出 `plugins/state/<stem>/health.json`，
+/// 卸载时"这一格没有状态"因此变成"有"。例外是上一跑读盘失败过的那一格：写一份可读的
+/// 空台账才算把坏文件修掉、把那句"读不回来"收回（[`flush_all`] 那边选择不碰旧文件）。
 pub fn flush(stem: &str) -> Result<(), String> {
     let board = {
         let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
@@ -670,7 +675,13 @@ pub fn flush(stem: &str) -> Result<(), String> {
     let Some(board) = board else {
         return Ok(()); // 这一格没被碰过 = 没有要落的东西
     };
-    let doc = board.lock().unwrap_or_else(|e| e.into_inner()).to_doc();
+    let (doc, unreadable) = {
+        let guard = board.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.to_doc(), guard.load_error.is_some())
+    };
+    if !doc.has_anything() && !unreadable {
+        return Ok(()); // 一条都没记 = 没有要落的东西
+    }
     write(stem, &doc)?;
     // 盘上已经是刚写的一份：那句"读不回来"从这一刻起不再描述现状。
     board.lock().unwrap_or_else(|e| e.into_inner()).load_error = None;
@@ -1383,6 +1394,37 @@ mod detail_tests {
             "没跑过的格子在退出时造出了一份空台账"
         );
         let back = read("busy_exit")
+            .expect("刚写下去的那份要读得动")
+            .expect("刚写下去的那份要在盘上");
+        assert_eq!(back.hook(HookKind::View).map(|h| h.calls), Some(1));
+    }
+
+    /// 单格落盘与退出那一问同一档：页面问过一次只会建起空的一格，
+    /// 加载路径"先落再摘"跟着一叫，就会给从没跑过的插件造出 state 目录 ——
+    /// 之后卸载时"这一格没有状态"被读成"有"，用户以为保留了设置。
+    #[test]
+    fn flushing_a_cell_with_nothing_to_say_writes_nothing() {
+        let _lock = paths::test_app_dir_lock();
+        let _app = paths::test_app_dir("health_flush_quiet");
+        board_for("quiet_flush");
+        flush("quiet_flush").expect("空台账不是失败");
+        assert!(
+            !paths::plugin_state_path("quiet_flush").exists(),
+            "空台账落了盘 = 卸载时会从「没有状态」变成「有」"
+        );
+    }
+
+    /// 反面：记过一条就必须落，别为了"空的不写"把有内容的也一起吞掉。
+    #[test]
+    fn flushing_a_cell_with_records_still_writes_them() {
+        let _lock = paths::test_app_dir_lock();
+        let _app = paths::test_app_dir("health_flush_busy");
+        board_for("busy_flush")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(HookKind::View, Duration::from_micros(3_000));
+        flush("busy_flush").expect("有内容的格该落得下去");
+        let back = read("busy_flush")
             .expect("刚写下去的那份要读得动")
             .expect("刚写下去的那份要在盘上");
         assert_eq!(back.hook(HookKind::View).map(|h| h.calls), Some(1));
