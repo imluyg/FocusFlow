@@ -719,9 +719,10 @@ pub fn discard(stem: &str) -> bool {
 /// 存在的理由就是"重启之后还查得到"。少了这一问，只有面板插件与出错停用过的那些格子
 /// 能跨过重启，其余的耗时、错误历史与降频次数在退出那一刻清零。
 ///
-/// 两档不写：没跑过也没错误的格（写出去只会给每个插件造一份空台账，还会让卸载时的
-/// "这一格没有状态"变成"有"），以及这一跑读盘失败过的格（盘上那份可能还能救，
-/// 空台账不该盖上去）。
+/// 没跑过也没错误的格不写（写出去只会给每个插件造一份空台账，还会让卸载时的
+/// "这一格没有状态"变成"有"）。但**这一跑读盘失败过、又确实记了东西的格要写**：
+/// 跳过的话这一场的耗时、错误历史与降频次数在退出那一刻全丢，而盘上那份坏文件
+/// 一个字都读不出来 —— "可能还能救"在这条链路上没有任何一处真去救它。
 pub fn flush_all() -> Vec<String> {
     let cells: Vec<(String, Arc<Mutex<Health>>)> = {
         let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
@@ -732,15 +733,14 @@ pub fn flush_all() -> Vec<String> {
         if stem.is_empty() {
             continue;
         }
-        let (doc, unreadable) = {
-            let guard = board.lock().unwrap_or_else(|e| e.into_inner());
-            (guard.to_doc(), guard.load_error.is_some())
-        };
-        if unreadable || !doc.has_anything() {
+        let doc = board.lock().unwrap_or_else(|e| e.into_inner()).to_doc();
+        if !doc.has_anything() {
             continue;
         }
-        if let Err(e) = write(&stem, &doc) {
-            failed.push(format!("{stem}：{e}"));
+        match write(&stem, &doc) {
+            // 盘上已经是刚写的一份：那句"读不回来"从这一刻起不再描述现状。
+            Ok(()) => board.lock().unwrap_or_else(|e| e.into_inner()).load_error = None,
+            Err(e) => failed.push(format!("{stem}：{e}")),
         }
     }
     failed
@@ -1428,6 +1428,30 @@ mod detail_tests {
             .expect("刚写下去的那份要读得动")
             .expect("刚写下去的那份要在盘上");
         assert_eq!(back.hook(HookKind::View).map(|h| h.calls), Some(1));
+    }
+
+    /// 退出那一问：这一跑读盘失败过、但确实记了东西的格必须写出去 ——
+    /// 跳过等于整场数据丢掉，而盘上那份坏文件没有任何一处会去修，下次启动照旧说读不回来。
+    #[test]
+    fn flush_all_repairs_an_unreadable_board_that_did_record_something() {
+        let _lock = paths::test_app_dir_lock();
+        let _app = paths::test_app_dir("health_flush_all_unreadable");
+        let stem = "hurt_exit";
+        let path = health_file(stem);
+        std::fs::create_dir_all(path.parent().expect("状态目录")).expect("建状态目录");
+        std::fs::write(&path, "不是 JSON").expect("写坏夹具");
+        {
+            let board = board_for(stem);
+            let mut guard = board.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(guard.load_error.is_some(), "前提：这一格该是读盘失败的状态");
+            guard.record(HookKind::View, Duration::from_micros(1_500));
+        }
+        let failed = flush_all();
+        assert!(!failed.iter().any(|f| f.contains(stem)), "{failed:?}");
+        let back = read(stem).expect("读得动").expect("刚写下去的那份要在盘上");
+        assert_eq!(back.hook(HookKind::View).map(|h| h.calls), Some(1));
+        let said = summary_for(stem).expect("有记录时行上该有话");
+        assert!(!said.contains("读不回来"), "盘已经换成可读的一份：{said}");
     }
 
     /// 摘格子不许落盘：插件文件都已经删了（卸载时选了「删除设置」），
