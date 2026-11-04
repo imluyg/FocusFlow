@@ -5931,6 +5931,17 @@ fn draw_screen(
     );
     // 右上角三颗窗口按钮（标题栏就是这一条：原生标题条已经拆掉了）。
     draw_window_buttons(p, w, vs);
+    // 插件页的回执（安装 / 卸载 / 动作失败）只写在 `status` 里，而那一页的正文没有
+    // 画它的地方 —— 从前坏包点下去、插件动作抛错都表现成"点了没反应"。
+    if let Some((line, warn, r)) = topbar_status_line(vs.view, status, w) {
+        let fmt = &p.fmt.caption;
+        p.text(
+            &p.clip(&line, fmt, r.right - r.left),
+            r,
+            fmt,
+            if warn { &p.br.danger } else { &p.br.muted },
+        );
+    }
 
     // --- 周期页签 ---
     p.text(
@@ -11586,7 +11597,44 @@ fn status_is_warning(line: &str) -> bool {
         || line.starts_with("没存盘：")
         || line.starts_with("图没编出来：")
         || line.starts_with("没有可出的图：")
+        // 插件页那几条失败只在 `status` 里有一份（同一句话也被顶栏回执读走）：
+        // 不列在这里，坏包、动作抛错在模块里就是一行灰色的"已安装"近邻。
+        || line.starts_with("安装失败：")
+        || line.starts_with("卸载失败：")
+        || line.starts_with("插件动作失败：")
+        || line.starts_with("插件字段回写失败：")
+        || line.starts_with("插件开关失败：")
         || line.contains("剪贴板没进去")
+}
+
+/// 顶栏那条全局回执：只有插件页（`view == 4`）用得上。
+///
+/// 插件页的安装 / 卸载 / 动作失败都只写 `status`，而那一页的正文没有画它的位置
+/// （设置页有卡片底部那一行，插件页没有）—— 从前坏包点下去、插件动作抛错在屏上
+/// 都是"点了没反应"。`FocusFlow · 效率追踪器` 与三颗窗口按钮之间本来就空着。
+fn topbar_status_line(
+    view: usize,
+    status: Option<&str>,
+    w: f32,
+) -> Option<(String, bool, D2D_RECT_F)> {
+    if view != 4 {
+        return None;
+    }
+    let line = status?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let left = 16.0 + 250.0;
+    let right = win_buttons(w)[0].left - 12.0;
+    let width = right - left;
+    if width < 120.0 {
+        return None;
+    }
+    Some((
+        line.to_string(),
+        status_is_warning(line),
+        rect(left, 16.0, width, 20.0),
+    ))
 }
 
 /// 三条绑定的注册结局拼成状态栏那一行。**点名到哪一条**是这条读数的全部意义：
@@ -17012,7 +17060,7 @@ mod date_pick_tests {
 /// 热键状态行那条读数。截图的两条键就在这三条里，"按了没反应"时用户要先知道是哪一条没了。
 #[cfg(test)]
 mod hotkey_line_tests {
-    use super::{hotkey_status_line, status_is_warning};
+    use super::{hotkey_status_line, status_is_warning, topbar_status_line, win_buttons};
 
     fn item(
         label: &'static str,
@@ -17120,6 +17168,12 @@ mod hotkey_line_tests {
         ));
         assert!(status_is_warning("图没编出来：png 编码失败"));
         assert!(status_is_warning("没有可出的图：先框一个区域，再按 Enter"));
+        // 插件页那几条失败：与"没存盘"同属"要人处理"，而它们只在 status 里有一份
+        assert!(status_is_warning("安装失败：不是 zip"));
+        assert!(status_is_warning("卸载失败：目录被占用"));
+        assert!(status_is_warning(
+            "插件动作失败：attempt to index a nil value"
+        ));
         // 回执与"一切正常"不能红：满屏红等于没有红，而且会让人以为截图丢了
         assert!(!status_is_warning(
             "截图已存 snip_a.png（300x200），同时复制到剪贴板"
@@ -17130,6 +17184,47 @@ mod hotkey_line_tests {
         assert!(!status_is_warning(
             "数据目录已搬到 E 盘（12 个文件 / 旧目录剩 0 项）"
         ));
+    }
+
+    /// 插件页的回执在顶栏：安装/卸载/动作失败都只写 `status`，而那一页的正文
+    /// 没有画它的位置。设置页自己有卡片底部那一行 ⇒ 不重复；其余页没有这类回执。
+    #[test]
+    fn the_top_bar_carries_the_plugin_pages_receipts_only() {
+        let w = 1200.0;
+        assert!(
+            topbar_status_line(5, Some("安装失败：不是 zip"), w).is_none(),
+            "设置页已有卡片底部那一行，顶栏不再重复"
+        );
+        assert!(
+            topbar_status_line(4, None, w).is_none(),
+            "没有回执时顶栏那一格不许占"
+        );
+        assert!(
+            topbar_status_line(4, Some("   "), w).is_none(),
+            "全空白的回执不算话"
+        );
+        for view in [0usize, 1, 2, 3, 6] {
+            assert!(topbar_status_line(view, Some("安装失败：不是 zip"), w).is_none());
+        }
+        let (line, warn, r) =
+            topbar_status_line(4, Some("  安装失败：不是 zip  "), w).expect("插件页要看得见");
+        assert_eq!(line, "安装失败：不是 zip", "两端空白要去掉");
+        assert!(warn, "失败在顶栏也得是红的");
+        assert!(
+            r.right <= win_buttons(w)[0].left - 11.9,
+            "顶栏那一格压到窗口按钮上：{r:?}"
+        );
+        assert!(r.left >= 16.0 + 250.0 - 0.01, "压到标题那两个字上：{r:?}");
+        let (_, warn_ok, _) =
+            topbar_status_line(4, Some("已安装：demo（2 个文件，128 字节）"), w).unwrap();
+        assert!(!warn_ok, "成功回执不该用警告色");
+        // 接线：画的那一头真的调了它（函数名单独出现不算 —— 定义与说明里都有）。
+        // 拆开拼针，免得这条守卫命中测试文件自己的字面量。
+        let needle = ["topbar_status_line(", "vs.view", ", status, w)"].concat();
+        assert!(
+            include_str!("main.rs").contains(&needle),
+            "顶栏回执没接在 draw_screen 上：插件页的回执还是看不到"
+        );
     }
 }
 
