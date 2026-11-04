@@ -8052,11 +8052,17 @@ fn draw_plugin_view(
             } => {
                 if *disabled {
                     p.round(*r, R_CONTROL, &p.br.grid, None);
-                    p.text(text, *r, &p.fmt.center_small, &p.br.muted);
                 } else {
                     p.round(*r, R_CONTROL, &p.br.accent, None);
-                    p.text(text, *r, &p.fmt.center_small, &p.br.white);
                 }
+                // 按钮文字是插件写的：宽度按字数估、还会被可用宽夹住，超长的一串
+                // 必须自己带上界（这块 UI 不按矩形裁切）。
+                p.text(
+                    &p.clip(text, &p.fmt.center_small, r.right - r.left - 8.0),
+                    *r,
+                    &p.fmt.center_small,
+                    if *disabled { &p.br.muted } else { &p.br.white },
+                );
             }
             POp::Table {
                 rect: r,
@@ -8115,7 +8121,12 @@ fn draw_plugin_view(
                 // 行内操作按钮
                 for (br, _, label) in buttons {
                     p.round(*br, R_MICRO, &p.br.accent, None);
-                    p.text(label, *br, &p.fmt.center_small, &p.br.white);
+                    p.text(
+                        &p.clip(label, &p.fmt.center_small, br.right - br.left - 6.0),
+                        *br,
+                        &p.fmt.center_small,
+                        &p.br.white,
+                    );
                 }
             }
             POp::Chart {
@@ -8477,7 +8488,13 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
 
     for (br, label) in &g.buttons {
         p.round(*br, R_CONTROL, &p.br.header, Some(&p.br.border));
-        p.text(label, *br, &p.fmt.center_small, &p.br.fg);
+        // 按钮文字来自插件：多颗长标签会互相压住（宽度按字数估，没有"装不下就不画"）。
+        p.text(
+            &p.clip(label, &p.fmt.center_small, br.right - br.left - 8.0),
+            *br,
+            &p.fmt.center_small,
+            &p.br.fg,
+        );
     }
     if !m.cancel.is_empty() {
         p.round(g.cancel, R_CONTROL, &p.br.header, Some(&p.br.border));
@@ -8485,80 +8502,19 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
     }
     p.round(g.submit, R_CONTROL, &p.br.accent, None);
     p.text(
-        if m.submit_text.is_empty() {
-            "确定"
-        } else {
-            m.submit_text
-        },
+        &p.clip(
+            if m.submit_text.is_empty() {
+                "确定"
+            } else {
+                m.submit_text
+            },
+            &p.fmt.center_small,
+            g.submit.right - g.submit.left - 8.0,
+        ),
         g.submit,
         &p.fmt.center_small,
         &p.br.white,
     );
-}
-
-#[cfg(test)]
-mod modal_content_tests {
-    use super::*;
-
-    fn modal<'a>(
-        content: &'a str,
-        fields: &'a [focusflow_core::plugins::FormField],
-        buttons: &'a [(String, String)],
-    ) -> ModalRef<'a> {
-        ModalRef {
-            id: "m",
-            title: "统计结果",
-            submit: "s",
-            submit_text: "",
-            cancel: "",
-            content,
-            open: true,
-            fields,
-            buttons,
-        }
-    }
-
-    /// 正文行数超上限时，几何按上限留高、绘制也只画这么多行，最后一行说还有几行没显示 ——
-    /// 从前绘制把全部行画出去，而高度只按 8 行算：分类一多，字就压在下面那排按钮上。
-    #[test]
-    fn a_long_modal_body_is_capped_and_says_how_much_is_hidden() {
-        let content = (1..=20)
-            .map(|i| format!("第{i}行"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let m = modal(&content, &[], &[]);
-        let g = modal_geom(&m, 1200.0, 900.0);
-        let rows = modal_content_plan(m.content, MODAL_CONTENT_MAX_LINES);
-        assert_eq!(
-            rows.len(),
-            MODAL_CONTENT_MAX_LINES,
-            "画出来的行数要等于留高的行数"
-        );
-        assert_eq!(rows.last().unwrap(), "…（还有 13 行没显示）");
-        assert_eq!(rows[0], "第1行");
-        assert_eq!(rows[MODAL_CONTENT_MAX_LINES - 2], "第7行");
-        let cr = g.content.expect("有正文就该留出内容区");
-        assert!(
-            (cr.bottom - cr.top - rows.len() as f32 * 18.0).abs() < 0.01,
-            "内容区高度要装得下这几行：{}",
-            cr.bottom - cr.top
-        );
-        assert!(
-            cr.bottom <= g.dialog.bottom - 48.0,
-            "正文压到了底部按钮那一排"
-        );
-    }
-
-    /// 短正文原样画，不许为了"统一"把最后一行换成提示。
-    #[test]
-    fn a_short_modal_body_is_drawn_verbatim() {
-        let m = modal("第一行\n第二行", &[], &[]);
-        let rows = modal_content_plan(m.content, MODAL_CONTENT_MAX_LINES);
-        assert_eq!(rows, vec!["第一行".to_string(), "第二行".to_string()]);
-        let g = modal_geom(&m, 1200.0, 900.0);
-        let cr = g.content.expect("两行正文也该留出内容区");
-        assert!((cr.bottom - cr.top - 2.0 * 18.0).abs() < 0.01);
-    }
 }
 
 // ===== 插件 =====
@@ -20112,5 +20068,71 @@ mod plugin_page_tests {
             !body.contains("disable_hot_reload"),
             "退出时 join 了检测线程 ⇒ 那一轮 sleep 是 2 秒，用户看到的是点了没反应"
         );
+    }
+}
+
+/// 弹窗正文的行数计划与留高必须同源：绘制那一侧不许再自己数一遍行、画到底。
+#[cfg(test)]
+mod modal_content_tests {
+    use super::*;
+
+    fn modal<'a>(
+        content: &'a str,
+        fields: &'a [focusflow_core::plugins::FormField],
+        buttons: &'a [(String, String)],
+    ) -> ModalRef<'a> {
+        ModalRef {
+            id: "m",
+            title: "统计结果",
+            submit: "s",
+            submit_text: "",
+            cancel: "",
+            content,
+            open: true,
+            fields,
+            buttons,
+        }
+    }
+
+    /// 正文行数超上限时，几何按上限留高、绘制也只画这么多行，最后一行说还有几行没显示 ——
+    /// 从前绘制把全部行画出去，而高度只按 8 行算：分类一多，字就压在下面那排按钮上。
+    #[test]
+    fn a_long_modal_body_is_capped_and_says_how_much_is_hidden() {
+        let content = (1..=20)
+            .map(|i| format!("第{i}行"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let m = modal(&content, &[], &[]);
+        let g = modal_geom(&m, 1200.0, 900.0);
+        let rows = modal_content_plan(m.content, MODAL_CONTENT_MAX_LINES);
+        assert_eq!(
+            rows.len(),
+            MODAL_CONTENT_MAX_LINES,
+            "画出来的行数要等于留高的行数"
+        );
+        assert_eq!(rows.last().unwrap(), "…（还有 13 行没显示）");
+        assert_eq!(rows[0], "第1行");
+        assert_eq!(rows[MODAL_CONTENT_MAX_LINES - 2], "第7行");
+        let cr = g.content.expect("有正文就该留出内容区");
+        assert!(
+            (cr.bottom - cr.top - rows.len() as f32 * 18.0).abs() < 0.01,
+            "内容区高度要装得下这几行：{}",
+            cr.bottom - cr.top
+        );
+        assert!(
+            cr.bottom <= g.dialog.bottom - 48.0,
+            "正文压到了底部按钮那一排"
+        );
+    }
+
+    /// 短正文原样画，不许为了"统一"把最后一行换成提示。
+    #[test]
+    fn a_short_modal_body_is_drawn_verbatim() {
+        let m = modal("第一行\n第二行", &[], &[]);
+        let rows = modal_content_plan(m.content, MODAL_CONTENT_MAX_LINES);
+        assert_eq!(rows, vec!["第一行".to_string(), "第二行".to_string()]);
+        let g = modal_geom(&m, 1200.0, 900.0);
+        let cr = g.content.expect("两行正文也该留出内容区");
+        assert!((cr.bottom - cr.top - 2.0 * 18.0).abs() < 0.01);
     }
 }
