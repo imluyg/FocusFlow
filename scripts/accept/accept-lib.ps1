@@ -58,6 +58,18 @@ public class FF {
     }, IntPtr.Zero);
     return found;
   }
+  // Same lookup as ByClass, but returns 0 / a non-zero long: PowerShell turns a zero
+  // IntPtr into $null when it crosses a function boundary, which then fails the cast
+  // back to IntPtr ("parameter parent ... is null") instead of reading as "not found".
+  public static long ByClassHandle(uint pid, string cls) {
+    IntPtr h = ByClass(pid, cls);
+    return h == IntPtr.Zero ? 0 : h.ToInt64();
+  }
+  // Long-returning variant of ChildByClass for the same PowerShell $null reason.
+  public static long ChildByClassHandle(long parent, string cls) {
+    IntPtr h = ChildByClass(new IntPtr(parent), cls);
+    return h == IntPtr.Zero ? 0 : h.ToInt64();
+  }
   public static IntPtr ChildByClass(IntPtr parent, string cls) {
     IntPtr found = IntPtr.Zero;
     EnumChildWindows(parent, (h, l) => {

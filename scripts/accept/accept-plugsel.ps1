@@ -80,6 +80,11 @@ function get_view()
                 group = "fgroup",
                 onselect = "f_pick",
             },
+            -- The shipped ledger puts its pager BELOW the table. Keep a second one here in
+            -- that order: it is the leg that fails when a table swallows clicks outside its
+            -- own rows (the pager above the table cannot see that defect).
+            { type = "pager", page = 1, pages = 2, total = 7,
+              prev = "pg2_prev", next = "pg2_next" },
             { type = "button", id = "touch_", text = "touch", sel = true, group = "fgroup" },
             { type = "label", text = "picked=" .. picked },
         },
@@ -162,6 +167,20 @@ if (-not ($sizeOk -and $probeLive -and $afterLive -and $nextLive)) {
     $pagerDetail = 'prev is inert on page 1 while next fired'
 }
 Check 'the pager prev button is inert on the first page' ([bool]($sizeOk -and $probeLive -and $afterLive -and $nextLive -and (-not $prevFired))) $pagerDetail
+
+# ---- pager below the table (the order the shipped ledger uses) --------------------------
+# Content rows after the table: table (3 rows) ends at y=484, then the second pager band
+# 490..518. The table's hit arm used to return for every click that was not on a row, so
+# this coordinate was dead while the pager ABOVE the table stayed green -- the exact shape
+# of the reported "next page does nothing" in the ledger. A positive action readout here
+# cannot be earned by a dead band.
+[FF]::ClickWindow($h, 354, 504, 1)          # below-table pager: next
+$belowLive = Wait-FixLog '/ pg2_next'
+Check 'a pager below a table still fires its declared id' ([bool]$belowLive) ''
+[FF]::ClickWindow($h, 270, 504, 1)          # below-table pager: prev (disabled on page 1)
+Start-Sleep -Milliseconds 700
+$belowPrev = @(Get-FixLog | Where-Object { $_ -match '/ pg2_prev' }).Count -gt 0
+Check 'the below-table pager prev is inert on the first page' ([bool](-not $belowPrev)) ''
 
 Check 'nothing was skipped for want of a selection' (-not (@($afterPager | Where-Object { $_ -match 'sel-skip' }))) ''
 Check 'no error lines in the app log' (-not (@($afterPager) -match "(?i)error|$(Get-FailWord)")) ''

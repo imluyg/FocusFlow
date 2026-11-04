@@ -56,13 +56,13 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, GetMonitorInfoW,
-    GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, Rectangle, ScreenToClient,
-    SelectObject, SetBkColor, SetBkMode, SetTextColor, StretchDIBits, TextOutW, UpdateWindow,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DIB_RGB_COLORS, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID,
-    SRCCOPY, TRANSPARENT,
+    BeginPaint, ClientToScreen, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, EndPaint,
+    FillRect, FrameRect, GetMonitorInfoW, GetStockObject, GetTextExtentPoint32W, InvalidateRect,
+    LineTo, MonitorFromWindow, MoveToEx, Rectangle, ScreenToClient, SelectObject, SetBkColor,
+    SetBkMode, SetTextColor, StretchDIBits, TextOutW, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
+    FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
@@ -83,6 +83,8 @@ use windows_numerics::Vector2;
 use data::Snapshot;
 
 const CLASS_NAME: PCWSTR = w!("FocusFlowNativeD2D");
+/// 行内编辑的宿主窗类名（顶层弹出窗，见 [`edit_host_proc`] 与 `App::ensure_edit`）。
+const EDIT_HOST_CLASS: PCWSTR = w!("FocusFlowEditHost");
 const WM_REFRESH: u32 = WM_APP + 1;
 /// 自动化验收用：等价于托盘「显示主窗口。
 const WM_ACCEPTANCE_SHOW: u32 = WM_APP + 2;
@@ -575,6 +577,9 @@ impl Target {
                 .ok()?;
 
             let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device).ok()?;
+            // `topmost = false`：直接合成的内容要压在**子窗口之下**。行内编辑用的是原生
+            // EDIT 子窗口，`true` 时这层 D2D 表面永远盖在它们上面 —— 字打进去了、
+            // 光标也在，屏上却一个字都看不见，点「查询」提交后才由插件视图画出来。
             let dcomp_target = dcomp.CreateTargetForHwnd(hwnd, true).ok()?;
             let visual = dcomp.CreateVisual().ok()?;
             visual.SetContent(&swap).ok()?;
@@ -1004,6 +1009,8 @@ struct App {
     settings_cat: usize,
     /// 设置页里那个常驻的搜索框（与行内编辑用的那个 EDIT 不是同一个）。
     search_edit: Option<HWND>,
+    /// 搜索框那对「宿主 → EDIT」里的顶层宿主窗。
+    search_edit_host: Option<HWND>,
     /// 那个搜索框此刻有没有焦点（由 `edit_proc` 在 WM_SETFOCUS / WM_KILLFOCUS 上递回来）。
     /// 提示文案只在它为 `false` 时由父窗画。
     search_focused: bool,
@@ -1055,8 +1062,14 @@ struct App {
     /// 指针下的控件（药丸/页签/导航）：只影响底色与光标形状，不参与点击判定。
     ctl: Option<Ctl>,
     sel: Option<usize>,
-    /// 行内编辑用的原生 EDIT 子窗口（懒创建，一直复用）。
+    /// 行内编辑用的原生 EDIT：它挂在**顶层弹出宿主窗**下面，不是主窗的子窗口。
+    /// 主窗走 DirectComposition 合成，挂在它下面的子窗口会被那层合成内容盖住
+    /// （实测连原生按钮都只透出一点、EDIT 完全看不见：字打进去了屏上却一个字没有）。
     edit: Option<HWND>,
+    /// EDIT 的顶层宿主窗（画主题底与描边，位置用屏幕坐标）。
+    edit_host: Option<HWND>,
+    /// 日期选择器（顶层弹出窗，懒创建）。
+    date_pick: Option<HWND>,
     edit_target: Option<EditTarget>,
     edit_row: Option<usize>,
     /// 按下录入：正在录哪一条热键（`settings` 数组下标）。开着的时候主窗口必须握着焦点，
@@ -1064,6 +1077,8 @@ struct App {
     capturing: Option<usize>,
     ui_font: HFONT,
     edit_bg: HBRUSH,
+    /// 行内 EDIT 宿主窗那圈描边（主色调）。
+    edit_border: HBRUSH,
     /// EDIT 的文字色与底色（`WM_CTLCOLOREDIT` 用）。跟着主题走，与 `edit_bg` 同一份。
     edit_fg: COLORREF,
     edit_bg_color: COLORREF,
@@ -1535,6 +1550,7 @@ impl App {
                 search: String::new(),
                 settings_cat: 0,
                 search_edit: None,
+                search_edit_host: None,
                 search_focused: false,
                 ops: Arc::new(Mutex::new(Vec::new())),
                 pm: None,
@@ -1556,11 +1572,14 @@ impl App {
                 ctl: None,
                 sel: None,
                 edit: None,
+                edit_host: None,
+                date_pick: None,
                 edit_target: None,
                 edit_row: None,
                 capturing: None,
                 ui_font,
                 edit_bg,
+                edit_border: HBRUSH::default(),
                 edit_fg,
                 edit_bg_color,
                 pause_item,
@@ -1638,9 +1657,22 @@ impl App {
                         let _ = DeleteObject(HGDIOBJ(self.edit_bg.0));
                     }
                 }
+                if !self.edit_border.is_invalid() {
+                    unsafe {
+                        let _ = DeleteObject(HGDIOBJ(self.edit_border.0));
+                    }
+                }
                 self.edit_bg_color = COLORREF(rgb_ref(bg_r, bg_g, bg_b));
                 self.edit_fg = COLORREF(rgb_ref(fg_r, fg_g, fg_b));
                 self.edit_bg = unsafe { CreateSolidBrush(self.edit_bg_color) };
+                let a = pal.accent;
+                self.edit_border = unsafe {
+                    CreateSolidBrush(COLORREF(rgb_ref(
+                        (a.r * 255.0).round() as u8,
+                        (a.g * 255.0).round() as u8,
+                        (a.b * 255.0).round() as u8,
+                    )))
+                };
             }
             Err(e) => tracing_note(&format!("画刷创建失败：{e}")),
         }
@@ -2222,6 +2254,9 @@ impl App {
                                         unsafe {
                                             let _ = InvalidateRect(Some(hwnd), None, false);
                                         }
+                                    } else if f.kind == "date" {
+                                        // 日期不再走自由文本：点开就是日历，选哪天回写哪天。
+                                        self.open_date_picker(hwnd, &n, &f.field, &f.value, vb);
                                     } else {
                                         self.start_plugin_field_edit(
                                             hwnd, &n, &f.field, &f.value, vb,
@@ -2257,101 +2292,94 @@ impl App {
                     self.pv_scroll as f32,
                     &sel_map,
                 );
-                for op in &ops {
-                    match op {
-                        POp::Button {
-                            rect: r,
-                            text: _,
-                            id,
-                            disabled,
-                            modal,
-                            sel,
-                            group,
-                        } => {
-                            if !*disabled && hit(*r, x, y) {
-                                if let Some(mid) = modal {
-                                    self.pv_select = None;
-                                    self.pv_modal = Some(mid.clone());
-                                    tracing_note(&format!("插件弹窗：{n} / {mid}"));
-                                    unsafe {
-                                        let _ = InvalidateRect(Some(hwnd), None, false);
-                                    }
-                                } else if *sel {
-                                    self.press_sel_button(hwnd, &n, id, group);
-                                } else {
-                                    self.run_plugin_action(hwnd, &n, id);
-                                }
-                                return;
+                // 谁认领这次点击就由谁处理（判据见 `pv_op_claims_click`）：表格不再
+                // 把"落在它矩形外面"的点击也吞掉，排在它后面的分页条才点得到。
+                let Some(op) = pv_claiming_op(&ops, x, y) else {
+                    return;
+                };
+                match op {
+                    POp::Button {
+                        id,
+                        modal,
+                        sel,
+                        group,
+                        ..
+                    } => {
+                        if let Some(mid) = modal {
+                            self.pv_select = None;
+                            self.pv_modal = Some(mid.clone());
+                            tracing_note(&format!("插件弹窗：{n} / {mid}"));
+                            unsafe {
+                                let _ = InvalidateRect(Some(hwnd), None, false);
                             }
+                        } else if *sel {
+                            self.press_sel_button(hwnd, &n, id, group);
+                        } else {
+                            self.run_plugin_action(hwnd, &n, id);
                         }
-                        // 表格：先认行内操作按钮，再认"点了哪一行"（选中/取消）。
-                        POp::Table {
-                            rect: r,
-                            buttons,
-                            ids,
-                            group,
-                            onselect,
-                            ..
-                        } => {
-                            for (br, id, _) in buttons {
-                                if hit(*br, x, y) {
-                                    self.run_plugin_action(hwnd, &n, id);
-                                    return;
-                                }
-                            }
-                            if ids.is_empty() {
-                                return;
-                            }
-                            let Some(i) =
-                                (0..ids.len()).find(|i| hit(pv_table_row_rect(r, *i), x, y))
-                            else {
-                                return;
-                            };
-                            self.select_plugin_row(hwnd, &n, group, onselect, &ids[i]);
-                            return;
-                        }
-                        POp::Select {
-                            rect: r,
-                            value,
-                            field,
-                            options,
-                            ..
-                        } => {
-                            let vb = select_value_rect(*r);
-                            if hit(vb, x, y) {
-                                self.pv_select = Some(PvSelect {
-                                    plugin: n.clone(),
-                                    field: field.clone(),
-                                    value: value.clone(),
-                                    options: options.clone(),
-                                    anchor: vb,
-                                    scroll: 0,
-                                });
-                                unsafe {
-                                    let _ = InvalidateRect(Some(hwnd), None, false);
-                                }
-                                return;
-                            }
-                        }
-                        // 输入框：点值那一格 → 开同一个行内 EDIT，回车回写给插件
-                        POp::Field {
-                            rect: r,
-                            value,
-                            field,
-                            ..
-                        } => {
-                            let vb = rect(r.left + 146.0, r.top, 260.0, 24.0);
-                            if !field.is_empty() && hit(vb, x, y) {
-                                tracing_note(&format!(
-                                    "点中插件字段 {field} at ({x:.0},{y:.0}) rect=({:.0},{:.0})",
-                                    vb.left, vb.top
-                                ));
-                                self.start_plugin_field_edit(hwnd, &n, field, value, vb);
-                                return;
-                            }
-                        }
-                        _ => {}
+                        return;
                     }
+                    // 表格：先认行内操作按钮，再认"点了哪一行"（选中/取消）。
+                    POp::Table {
+                        rect: r,
+                        buttons,
+                        ids,
+                        group,
+                        onselect,
+                        ..
+                    } => {
+                        for (br, id, _) in buttons {
+                            if hit(*br, x, y) {
+                                self.run_plugin_action(hwnd, &n, id);
+                                return;
+                            }
+                        }
+                        // 落在表头/空白行上的点击由这张表吞掉；表格矩形之外的点击
+                        // 根本到不了这里（`pv_op_claims_click` 已经筛过）。
+                        let Some(i) = (0..ids.len()).find(|i| hit(pv_table_row_rect(r, *i), x, y))
+                        else {
+                            return;
+                        };
+                        self.select_plugin_row(hwnd, &n, group, onselect, &ids[i]);
+                        return;
+                    }
+                    POp::Select {
+                        rect: r,
+                        value,
+                        field,
+                        options,
+                        ..
+                    } => {
+                        let vb = select_value_rect(*r);
+                        self.pv_select = Some(PvSelect {
+                            plugin: n.clone(),
+                            field: field.clone(),
+                            value: value.clone(),
+                            options: options.clone(),
+                            anchor: vb,
+                            scroll: 0,
+                        });
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                        return;
+                    }
+                    // 输入框：点值那一格 → 开同一个行内 EDIT，回车回写给插件
+                    POp::Field {
+                        rect: r,
+                        value,
+                        field,
+                        ..
+                    } => {
+                        let vb = pv_field_value_rect(*r);
+                        tracing_note(&format!(
+                            "点中插件字段 {field} at ({x:.0},{y:.0}) rect=({:.0},{:.0})",
+                            vb.left, vb.top
+                        ));
+                        self.start_plugin_field_edit(hwnd, &n, field, value, vb);
+                        return;
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -2448,6 +2476,21 @@ impl App {
             return;
         }
         if self.view == 5 {
+            // 搜索框的输入层是顶层弹出窗：平时藏着（提示文案归主窗画），
+            // 点框身这一下才把它叫到屏上并接住键盘。
+            if hit(search_box_rect(w), x, y) {
+                let edit = self.ensure_search_edit(hwnd);
+                if let Some(host) = self.search_edit_host {
+                    if !edit.0.is_null() {
+                        self.place_search_edit(hwnd);
+                        unsafe {
+                            let _ = ShowWindow(host, SW_SHOW);
+                            let _ = SetFocus(Some(edit));
+                        }
+                        return;
+                    }
+                }
+            }
             let g = settings_geom(w, h);
             // 左侧分类：点标题切分类，滚动回到顶部。
             for (i, _) in SETTINGS_CATS.iter().enumerate() {
@@ -3519,19 +3562,10 @@ impl App {
         value: &str,
         cell: D2D_RECT_F,
     ) {
-        let s = self.scale(hwnd);
         let edit = self.ensure_edit(hwnd);
+        self.show_edit_cell(hwnd, cell);
         unsafe {
             let _ = SetWindowTextW(edit, &HSTRING::from(value));
-            let _ = SetWindowPos(
-                edit,
-                None,
-                ((cell.left - 2.0) * s) as i32,
-                ((cell.top - 2.0) * s) as i32,
-                ((cell.right - cell.left + 4.0) * s) as i32,
-                ((cell.bottom - cell.top + 4.0) * s) as i32,
-                SWP_NOZORDER | SWP_SHOWWINDOW,
-            );
             let _ = SetFocus(Some(edit));
             SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
         }
@@ -3541,6 +3575,107 @@ impl App {
         ));
         self.edit_row = None;
         tracing_note(&format!("开始编辑插件字段：{plugin} / {field}"));
+    }
+
+    /// 打开日期选择器：`cell` 是字段框（主窗客户区 DIP），日历默认摆它下面，
+    /// 下面放不下就翻到上面。
+    fn open_date_picker(
+        &mut self,
+        hwnd: HWND,
+        plugin: &str,
+        field: &str,
+        value: &str,
+        cell: D2D_RECT_F,
+    ) {
+        let (year, month, selected) = dp_parse(value);
+        let s = self.scale(hwnd);
+        let (w, h) = dp_size();
+        let dh = match self.date_pick.filter(|h| !h.0.is_null()) {
+            Some(h) => h,
+            None => {
+                let hinst = unsafe { GetModuleHandleW(None) }
+                    .map(|m| m.into())
+                    .unwrap_or_default();
+                unsafe {
+                    let wc = WNDCLASSW {
+                        style: CS_HREDRAW | CS_VREDRAW,
+                        lpfnWndProc: Some(date_pick_proc),
+                        hInstance: hinst,
+                        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                        lpszClassName: DATE_PICK_CLASS,
+                        ..Default::default()
+                    };
+                    let _ = RegisterClassW(&wc);
+                }
+                let dh = unsafe {
+                    CreateWindowExW(
+                        WS_EX_TOOLWINDOW,
+                        DATE_PICK_CLASS,
+                        w!(""),
+                        WINDOW_STYLE(WS_POPUP.0 | WS_CLIPCHILDREN.0),
+                        0,
+                        0,
+                        (w * s).round() as i32,
+                        (h * s).round() as i32,
+                        Some(hwnd),
+                        None,
+                        None,
+                        None,
+                    )
+                }
+                .unwrap_or_default();
+                if dh.0.is_null() {
+                    return;
+                }
+                self.date_pick = Some(dh);
+                dh
+            }
+        };
+        if let Ok(mut g) = DATE_PICK.lock() {
+            *g = Some(DatePickState {
+                owner: hwnd.0 as isize,
+                plugin: plugin.to_string(),
+                field: field.to_string(),
+                year,
+                month,
+                selected,
+                scale: s,
+            });
+        }
+        let pw = (w * s).round() as i32;
+        let ph = (h * s).round() as i32;
+        let mut pt = POINT {
+            x: (cell.left * s).round() as i32,
+            y: (cell.bottom * s).round() as i32 + 2,
+        };
+        unsafe {
+            let _ = ClientToScreen(hwnd, &mut pt);
+            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                if pt.y + ph > mi.rcWork.bottom {
+                    let mut top = POINT {
+                        x: (cell.left * s).round() as i32,
+                        y: (cell.top * s).round() as i32 - ph - 2,
+                    };
+                    let _ = ClientToScreen(hwnd, &mut top);
+                    pt.y = top.y;
+                }
+                if pt.x + pw > mi.rcWork.right {
+                    pt.x = mi.rcWork.right - pw - 8;
+                }
+                if pt.x < mi.rcWork.left {
+                    pt.x = mi.rcWork.left + 8;
+                }
+            }
+            let _ = SetWindowPos(dh, None, pt.x, pt.y, pw, ph, SWP_NOZORDER | SWP_SHOWWINDOW);
+            let _ = InvalidateRect(Some(dh), None, true);
+            let _ = SetForegroundWindow(dh);
+            let _ = SetFocus(Some(dh));
+        }
     }
 
     /// 下拉选中 / 任何字段回写：交给插件，再让插件重算视图。
@@ -3696,46 +3831,17 @@ impl App {
         if let Some(e) = self.search_edit {
             return e;
         }
-        let cls = HSTRING::from("EDIT");
-        let empty = HSTRING::from("");
-        let created = unsafe {
-            CreateWindowExW(
-                WS_EX_NOPARENTNOTIFY,
-                &cls,
-                &empty,
-                WINDOW_STYLE(WS_CHILD.0 | WS_CLIPSIBLINGS.0 | 0x0080), // WS_CHILD | CLIPSIBLINGS | ES_AUTOHSCROLL
-                0,
-                0,
-                100,
-                24,
-                Some(parent),
-                None,
-                None,
-                None,
-            )
-        };
-        let Ok(h) = created else {
-            return HWND(std::ptr::null_mut());
-        };
-        unsafe {
-            SendMessageW(
-                h,
-                WM_SETFONT,
-                Some(WPARAM(self.ui_font.0 as usize)),
-                Some(LPARAM(1)),
-            );
-            // 提示文案不交给控件：`EM_SETCUEBANNER` 要 comctl32 v6 的激活上下文，这个 exe
-            // 没带那份 manifest —— 现量（2026-11-01）发完这条消息之后空框里什么都不画。
-            // 所以提示由父窗画，但**只在控件没拿到焦点时画**：那块矩形属于子窗口，
-            // 焦点一进框，父窗再写同样的字就是两块表面抢同一批像素（看得见提示、
-            // 看不见光标，重绘交替时就是他报的那句"没有用户输入的字时字体闪烁"）。
-            // 焦点状态由 `edit_proc` 在 WM_SETFOCUS / WM_KILLFOCUS 上递回来，
-            // 靠的是这里传的子类 id（`SEARCH_EDIT_SUBCLASS`）——不是最后那个 dwRefData。
-            // 复用同一个子类过程：为的是 Enter/Esc 也走 WM_EDIT_DONE 那条回执（搜索框这一路
-            // `finish_edit` 看到 edit_target 为空会直接返回，不动任何一行）。
-            // 深色底与字色不是它给的 —— 那是父窗口接 `WM_CTLCOLOREDIT` 喂的刷子。
-            let _ = SetWindowSubclass(h, Some(edit_proc), SEARCH_EDIT_SUBCLASS, 0);
-        }
+        // 提示文案不交给控件：`EM_SETCUEBANNER` 要 comctl32 v6 的激活上下文，这个 exe
+        // 没带那份 manifest —— 现量（2026-11-01）发完这条消息之后空框里什么都不画。
+        // 所以提示由父窗画，但**只在控件没拿到焦点时画**：那块矩形属于子窗口，
+        // 焦点一进框，父窗再写同样的字就是两块表面抢同一批像素（看得见提示、
+        // 看不见光标，重绘交替时就是他报的那句"没有用户输入的字时字体闪烁"）。
+        // 焦点状态由 `edit_proc` 在 WM_SETFOCUS / WM_KILLFOCUS 上递回来，
+        // 靠的是这里传的子类 id（`SEARCH_EDIT_SUBCLASS`）——不是最后那个 dwRefData。
+        // 复用同一个子类过程：为的是 Enter/Esc 也走 WM_EDIT_DONE 那条回执（搜索框这一路
+        // `finish_edit` 看到 edit_target 为空会直接返回，不动任何一行）。
+        let (host, h) = create_hosted_edit(parent, self.ui_font, SEARCH_EDIT_SUBCLASS);
+        self.search_edit_host = Some(host);
         self.search_edit = Some(h);
         h
     }
@@ -3749,20 +3855,31 @@ impl App {
         let s = self.scale(hwnd);
         let sb = search_box_rect(w);
         let edit = self.ensure_search_edit(hwnd);
+        let Some(host) = self.search_edit_host else {
+            return;
+        };
         if edit.0.is_null() {
             return;
         }
-        unsafe {
-            let (ex, ey, ew, eh) = search_edit_px(sb, s);
-            let _ = SetWindowPos(edit, None, ex, ey, ew, eh, SWP_NOZORDER);
-            let _ = ShowWindow(edit, SW_SHOW);
-        }
+        let (ex, ey, ew, eh) = search_edit_px(sb, s);
+        self.place_hosted_edit(
+            hwnd,
+            host,
+            edit,
+            rect(ex as f32, ey as f32, ew as f32, eh as f32),
+            self.search_focused,
+        );
     }
 
     fn hide_search_edit(&mut self) {
         if let Some(e) = self.search_edit {
             unsafe {
                 let _ = ShowWindow(e, SW_HIDE);
+            }
+        }
+        if let Some(h) = self.search_edit_host {
+            unsafe {
+                let _ = ShowWindow(h, SW_HIDE);
             }
         }
     }
@@ -3794,34 +3911,98 @@ impl App {
         if let Some(h) = self.edit {
             return h;
         }
-        let h = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
-                w!("EDIT"),
-                w!(""),
-                WINDOW_STYLE(WS_CHILD.0 | 0x0080), // WS_CHILD | ES_AUTOHSCROLL
-                0,
-                0,
-                100,
-                20,
-                Some(parent),
-                None,
-                None,
-                None,
-            )
-        }
-        .unwrap_or_default();
-        unsafe {
-            SendMessageW(
-                h,
-                WM_SETFONT,
-                Some(WPARAM(self.ui_font.0 as usize)),
-                Some(LPARAM(1)),
-            );
-            let _ = SetWindowSubclass(h, Some(edit_proc), RENAME_EDIT_SUBCLASS, 0);
-        }
+        let (host, h) = create_hosted_edit(parent, self.ui_font, RENAME_EDIT_SUBCLASS);
+        self.edit_host = Some(host);
         self.edit = Some(h);
         h
+    }
+
+    /// 把行内编辑摆到主窗客户区的 `cell`（DIP）上。
+    ///
+    /// 宿主是顶层窗 ⇒ 位置要用屏幕坐标；里面的 EDIT 缩 2 px，让宿主画的那圈描边
+    /// 留在外面（EDIT 自己没边框，铺满会把整个框吃掉）。
+    fn show_edit_cell(&self, parent: HWND, cell: D2D_RECT_F) {
+        let (Some(host), Some(edit)) = (self.edit_host, self.edit) else {
+            return;
+        };
+        let s = self.scale(parent);
+        self.place_hosted_edit(
+            parent,
+            host,
+            edit,
+            rect(
+                cell.left * s,
+                cell.top * s,
+                (cell.right - cell.left) * s,
+                (cell.bottom - cell.top) * s,
+            ),
+            true,
+        );
+    }
+
+    /// 宿主/EDIT 的摆位（客户区像素 → 屏幕坐标）。三个摆位点共用这一份几何。
+    /// `show = false` 只挪位置不亮出来（搜索框未拿到焦点时，提示文案仍归主窗画）。
+    fn place_hosted_edit(
+        &self,
+        parent: HWND,
+        host: HWND,
+        edit: HWND,
+        cell: D2D_RECT_F,
+        show: bool,
+    ) {
+        let s = self.scale(parent);
+        let inset = (PV_FIELD_EDIT_INSET * s).round() as i32;
+        let flags = if show {
+            SWP_NOZORDER | SWP_SHOWWINDOW
+        } else {
+            SWP_NOZORDER
+        };
+        let w = (cell.right - cell.left).round() as i32;
+        let h = (cell.bottom - cell.top).round() as i32;
+        let mut pt = POINT {
+            x: cell.left.round() as i32,
+            y: cell.top.round() as i32,
+        };
+        unsafe {
+            let _ = ClientToScreen(parent, &mut pt);
+            let _ = SetWindowPos(host, None, pt.x, pt.y, w, h, flags);
+            let _ = SetWindowPos(
+                edit,
+                None,
+                inset,
+                inset,
+                (w - inset * 2).max(8),
+                (h - inset * 2).max(8),
+                flags,
+            );
+            if show {
+                // 宿主是被拥有的顶层弹窗：光 `SetFocus` 不行 —— 焦点只能落到
+                // **活动窗口**或它的子窗口上，而不成对地激活宿主时主窗仍是活动窗口，
+                // 键盘于是全打到主窗（BUG 表现：字打进去了、EDIT 里其实是空的）。
+                let _ = SetForegroundWindow(host);
+            }
+        }
+    }
+
+    fn hide_edit_cell(&self) {
+        if let Some(edit) = self.edit {
+            unsafe {
+                let _ = ShowWindow(edit, SW_HIDE);
+            }
+        }
+        if let Some(host) = self.edit_host {
+            // 宿主拿着前台：隐藏它之前把前台还给主窗，否则这一次提交之后
+            // 焦点会落到别的应用上（屏上像是"程序自己松开了"）。
+            let owner = unsafe { GetParent(host) }.unwrap_or_default();
+            unsafe {
+                let _ = ShowWindow(host, SW_HIDE);
+            }
+            if !owner.0.is_null() {
+                unsafe {
+                    let _ = SetForegroundWindow(owner);
+                }
+            }
+        }
     }
 
     fn start_edit(&mut self, hwnd: HWND, row: usize) {
@@ -3833,7 +4014,6 @@ impl App {
         let Some(dev) = dev else { return };
         let edit = self.ensure_edit(hwnd);
         let (w, h) = self.client_dip(hwnd);
-        let s = self.scale(hwnd);
         let g = table_geom(left_card(w, h));
         let vis = row.saturating_sub(self.scroll);
         if vis >= g.max_rows {
@@ -3846,17 +4026,9 @@ impl App {
             device_name_width(&g) + 4.0,
             g.row_h - 3.0,
         );
+        self.show_edit_cell(hwnd, cell);
         unsafe {
             let _ = SetWindowTextW(edit, &HSTRING::from(dev.name.clone()));
-            let _ = SetWindowPos(
-                edit,
-                None,
-                (cell.left * s) as i32,
-                (cell.top * s) as i32,
-                ((cell.right - cell.left) * s) as i32,
-                ((cell.bottom - cell.top) * s) as i32,
-                SWP_NOZORDER | SWP_SHOWWINDOW,
-            );
             let _ = SetFocus(Some(edit));
             SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
         }
@@ -3878,7 +4050,6 @@ impl App {
             return;
         }
         let (w, h) = self.client_dip(hwnd);
-        let s = self.scale(hwnd);
         let g = settings_geom(w, h);
         // 屏幕行号用列表下标（含分组标题），不是 `settings` 数组下标。
         let vis = item_idx.saturating_sub(self.scroll);
@@ -3888,17 +4059,9 @@ impl App {
         let edit = self.ensure_edit(hwnd);
         let y = g.list_top + vis as f32 * g.row_h;
         let cell = rect(g.value_x - 4.0, y + 8.0, g.value_w + 8.0, 28.0);
+        self.show_edit_cell(hwnd, cell);
         unsafe {
             let _ = SetWindowTextW(edit, &HSTRING::from(value));
-            let _ = SetWindowPos(
-                edit,
-                None,
-                (cell.left * s) as i32,
-                (cell.top * s) as i32,
-                ((cell.right - cell.left) * s) as i32,
-                ((cell.bottom - cell.top) * s) as i32,
-                SWP_NOZORDER | SWP_SHOWWINDOW,
-            );
             let _ = SetFocus(Some(edit));
             SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
         }
@@ -3955,11 +4118,9 @@ impl App {
             return;
         };
         if let Some(e) = self.edit {
-            // 先藏起来：藏窗口会触发 WM_KILLFOCUS，它又会投一次"提交"。
+            // 先藏起来（连同顶层宿主）：藏窗口会触发 WM_KILLFOCUS，它又会投一次"提交"。
             // 而 `edit_target` 已经取空，把这一次挡掉。
-            unsafe {
-                let _ = ShowWindow(e, SW_HIDE);
-            }
+            self.hide_edit_cell();
             if commit {
                 let mut buf = [0u16; 256];
                 let n = unsafe { GetWindowTextW(e, &mut buf) }.max(0) as usize;
@@ -7267,6 +7428,34 @@ impl POp {
     }
 }
 
+/// 插件视图里一条控件"认不认"这次点击。
+///
+/// 命中测试按 `ops` 的顺序逐条问，第一条认领的负责处理并吞掉点击。判据必须只看
+/// "这次点击落在哪个控件上"：从前 `POp::Table` 对**任何**没落在行或行内按钮上的点击
+/// 都直接 `return`，于是排在表格后面的控件（记账本的分页条就是紧挨着表格的那一颗）
+/// 永远收不到点击 —— 屏上画得出来、点下去却没反应。表格只在自己那块矩形里认领。
+fn pv_op_claims_click(op: &POp, x: f32, y: f32) -> bool {
+    match op {
+        POp::Button { rect, disabled, .. } => !*disabled && hit(*rect, x, y),
+        // 行内操作按钮可能压在表格边上，先认它；其余落在表格矩形里的点击（表头、
+        // 行与行之间）由这张表吞掉，免得穿透到下面的控件。
+        POp::Table { rect, buttons, .. } => {
+            hit(*rect, x, y) || buttons.iter().any(|(br, ..)| hit(*br, x, y))
+        }
+        POp::Select { rect, .. } => hit(select_value_rect(*rect), x, y),
+        POp::Field { rect, field, .. } => {
+            !field.is_empty() && hit(pv_field_value_rect(*rect), x, y)
+        }
+        _ => false,
+    }
+}
+
+/// 按 `ops` 的顺序问第一条认领这次点击的操作；没有就返回 `None`。
+/// 与 `on_click` 里那一圈共用同一份判据，用例可以拿它验"分页条排在表格后面也能点到"。
+fn pv_claiming_op(ops: &[POp], x: f32, y: f32) -> Option<&POp> {
+    ops.iter().find(|op| pv_op_claims_click(op, x, y))
+}
+
 /// 插件视图内容有多高（用于把滚动位置夹在合法范围内）。
 fn plugin_content_height(view: &focusflow_core::plugins::PluginView, area: D2D_RECT_F) -> f32 {
     let ops = plugin_view_ops(view, area, 0.0, &HashMap::new());
@@ -7769,7 +7958,7 @@ fn draw_plugin_view(
                     &p.fmt.caption,
                     &p.br.muted,
                 );
-                let vb = rect(r.left + 146.0, r.top, 260.0, 24.0);
+                let vb = pv_field_value_rect(*r);
                 // 可改的给强调色边框：一眼能看出这格是输入框而不是只读值
                 let border = if field.is_empty() {
                     &p.br.border
@@ -7912,6 +8101,18 @@ fn draw_plugin_view(
 fn select_value_rect(r: D2D_RECT_F) -> D2D_RECT_F {
     rect(r.left + 146.0, r.top, 260.0, 24.0)
 }
+
+/// 输入框的值框：`POp::Field` 的绘制、命中与行内 EDIT 三处共用同一份几何。
+fn pv_field_value_rect(r: D2D_RECT_F) -> D2D_RECT_F {
+    rect(r.left + 146.0, r.top, 260.0, 24.0)
+}
+
+/// 行内 EDIT 相对宿主画的那一格往里缩多少。
+///
+/// EDIT 控件本身没有边框（`WS_CHILD | ES_AUTOHSCROLL`），铺满整格会把宿主画的
+/// 主色描边连四个圆角一起盖掉：浅色主题下白底压白底，那一格看起来像"点一下就没了"。
+/// 缩两格，边框与圆角留在外面，输入框始终看得出是个输入框。
+const PV_FIELD_EDIT_INSET: f32 = 2.0;
 
 const SELECT_ITEM_H: f32 = 24.0;
 const SELECT_MAX_VISIBLE: usize = 10;
@@ -11826,10 +12027,442 @@ unsafe fn app_ptr(hwnd: HWND) -> Option<&'static mut App> {
     }
 }
 
+/// 行内 EDIT 的顶层宿主窗：画主题底 + 一圈描边，真正的 EDIT 是它的子窗口。
+///
+/// 主窗走 DirectComposition 合成，挂在主窗下面的子窗口会被那层合成内容盖住
+/// （实测：原生按钮只透出一点、EDIT 整块看不见——字打进去了、光标也在，屏上一个像素都不变）。
+/// 顶层弹出窗不受这层合成影响，所以输入框挂在它下面；宿主本身只负责那圈边框与底色。
+unsafe extern "system" fn edit_host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_ERASEBKGND => LRESULT(1),
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                let owner = GetParent(hwnd).unwrap_or_default();
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                if let Some(app) = app_ptr(owner) {
+                    if !app.edit_bg.is_invalid() {
+                        let _ = FillRect(hdc, &rc, app.edit_bg);
+                    }
+                    if !app.edit_border.is_invalid() {
+                        let _ = FrameRect(hdc, &rc, app.edit_border);
+                    }
+                }
+                let _ = EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            WM_CTLCOLOREDIT => {
+                // EDIT 的父子链是 主窗(属主) → 宿主 → EDIT，颜色问的是宿主；
+                // 主题色在主窗那头。
+                let owner = GetParent(hwnd).unwrap_or_default();
+                if let Some(app) = app_ptr(owner) {
+                    let hdc = HDC(w.0 as *mut core::ffi::c_void);
+                    SetTextColor(hdc, app.edit_fg);
+                    SetBkColor(hdc, app.edit_bg_color);
+                    return LRESULT(app.edit_bg.0 as isize);
+                }
+                DefWindowProcW(hwnd, msg, w, l)
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
+        }
+    }
+}
+
+/// 建一对「宿主 → EDIT」：宿主是顶层弹出窗，EDIT 缩在里面 2 px。
+/// 行内编辑与搜索框各建一份（它们的子类 id 不同，焦点回执分得清）。
+fn create_hosted_edit(parent: HWND, font: HFONT, subclass_id: usize) -> (HWND, HWND) {
+    let hinst = unsafe { GetModuleHandleW(None) }
+        .map(|m| m.into())
+        .unwrap_or_default();
+    unsafe {
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(edit_host_proc),
+            hInstance: hinst,
+            hCursor: LoadCursorW(None, IDC_IBEAM).unwrap_or_default(),
+            lpszClassName: EDIT_HOST_CLASS,
+            ..Default::default()
+        };
+        let _ = RegisterClassW(&wc);
+    }
+    let host = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            EDIT_HOST_CLASS,
+            w!(""),
+            WINDOW_STYLE(WS_POPUP.0 | WS_CLIPCHILDREN.0),
+            0,
+            0,
+            100,
+            24,
+            Some(parent),
+            None,
+            None,
+            None,
+        )
+    }
+    .unwrap_or_default();
+    let edit = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("EDIT"),
+            w!(""),
+            WINDOW_STYLE(WS_CHILD.0 | 0x0080), // WS_CHILD | ES_AUTOHSCROLL
+            2,
+            2,
+            96,
+            20,
+            Some(host),
+            None,
+            None,
+            None,
+        )
+    }
+    .unwrap_or_default();
+    unsafe {
+        SendMessageW(
+            edit,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+        let _ = SetWindowSubclass(edit, Some(edit_proc), subclass_id, 0);
+    }
+    (host, edit)
+}
+
+// ===== 日期选择器（插件模态里 kind = "date"） =====
+//
+// 记账本的「日期」原先是一个自由文本输入框：要手打 `2026-8-6`，格式错了插件还得回一句
+// "这一条没生效"。这里给一个真日历：点开就是一格一格的月份，选哪天就回写哪天。
+// 与行内 EDIT 一样，它必须是**顶层弹出窗**（主窗是 DComp 合成，子窗口会被盖住）。
+
+const DATE_PICK_CLASS: PCWSTR = w!("FocusFlowDatePick");
+const DP_W: f32 = 280.0;
+const DP_PAD: f32 = 8.0;
+const DP_HEAD_H: f32 = 34.0;
+const DP_WEEK_H: f32 = 22.0;
+const DP_ROW_H: f32 = 28.0;
+const DP_FOOT_H: f32 = 28.0;
+const DP_COLS: usize = 7;
+const DP_ROWS: usize = 6;
+const DP_WEEK_LABELS: [&str; 7] = ["一", "二", "三", "四", "五", "六", "日"];
+
+fn dp_size() -> (f32, f32) {
+    (
+        DP_W,
+        DP_HEAD_H + DP_WEEK_H + DP_ROW_H * DP_ROWS as f32 + DP_FOOT_H,
+    )
+}
+
+fn dp_cell_w() -> f32 {
+    (DP_W - DP_PAD * 2.0) / DP_COLS as f32
+}
+
+fn dp_cell_rect(i: usize, s: f32) -> D2D_RECT_F {
+    let col = (i % DP_COLS) as f32;
+    let row = (i / DP_COLS) as f32;
+    rect(
+        (DP_PAD + col * dp_cell_w()) * s,
+        (DP_HEAD_H + DP_WEEK_H + row * DP_ROW_H) * s,
+        dp_cell_w() * s,
+        DP_ROW_H * s,
+    )
+}
+
+fn dp_prev_rect(s: f32) -> D2D_RECT_F {
+    rect(DP_PAD * s, 7.0 * s, 24.0 * s, 20.0 * s)
+}
+
+fn dp_next_rect(s: f32) -> D2D_RECT_F {
+    rect((DP_W - DP_PAD - 24.0) * s, 7.0 * s, 24.0 * s, 20.0 * s)
+}
+
+fn dp_today_rect(s: f32) -> D2D_RECT_F {
+    rect(
+        DP_PAD * s,
+        (DP_HEAD_H + DP_WEEK_H + DP_ROW_H * DP_ROWS as f32 + 3.0) * s,
+        52.0 * s,
+        20.0 * s,
+    )
+}
+
+/// 一年 12 个月的加减（`delta` 按月算，跨年自动进位/借位）。
+fn dp_month_add(year: i32, month: u32, delta: i32) -> (i32, u32) {
+    let total = year * 12 + (month as i32 - 1) + delta;
+    (total.div_euclid(12), (total.rem_euclid(12) + 1) as u32)
+}
+
+fn dp_days_in_month(year: i32, month: u32) -> u32 {
+    let (ny, nm) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    match (
+        chrono::NaiveDate::from_ymd_opt(year, month, 1),
+        chrono::NaiveDate::from_ymd_opt(ny, nm, 1),
+    ) {
+        (Some(a), Some(b)) => (b - a).num_days() as u32,
+        _ => 30,
+    }
+}
+
+fn dp_first_weekday(year: i32, month: u32) -> usize {
+    use chrono::Datelike;
+    chrono::NaiveDate::from_ymd_opt(year, month, 1)
+        .map(|d| d.weekday().num_days_from_monday() as usize)
+        .unwrap_or(0)
+}
+
+fn dp_today() -> (i32, u32, u32) {
+    use chrono::Datelike;
+    let d = chrono::Local::now().date_naive();
+    (d.year(), d.month(), d.day())
+}
+
+/// 从字段当前值猜出要看哪个月：认 `YYYY-M-D`（补不补零都行），认不出来就落在今天。
+fn dp_parse(value: &str) -> (i32, u32, Option<(i32, u32, u32)>) {
+    let mut it = value.trim().split('-');
+    let year = it.next().and_then(|s| s.trim().parse::<i32>().ok());
+    let month = it.next().and_then(|s| s.trim().parse::<u32>().ok());
+    let day = it.next().and_then(|s| s.trim().parse::<u32>().ok());
+    if let (Some(year), Some(month)) = (year, month) {
+        if (1..=12).contains(&month) {
+            let selected = day
+                .filter(|d| (1..=dp_days_in_month(year, month)).contains(d))
+                .map(|d| (year, month, d));
+            return (year, month, selected);
+        }
+    }
+    let (y, m, _) = dp_today();
+    (y, m, None)
+}
+
+struct DatePickState {
+    /// 主窗句柄（宿主属主）。存 isize 是为了让这份状态能放进 `static Mutex`。
+    owner: isize,
+    plugin: String,
+    field: String,
+    year: i32,
+    month: u32,
+    selected: Option<(i32, u32, u32)>,
+    scale: f32,
+}
+
+static DATE_PICK: Mutex<Option<DatePickState>> = Mutex::new(None);
+
+fn dp_close(hwnd: HWND) {
+    if let Ok(mut g) = DATE_PICK.lock() {
+        *g = None;
+    }
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+fn dp_text(hdc: HDC, font: HFONT, text: &str, r: D2D_RECT_F, color: COLORREF) {
+    let wide = HSTRING::from(text);
+    let mut sz = SIZE::default();
+    unsafe {
+        SelectObject(hdc, HGDIOBJ(font.0));
+        SetTextColor(hdc, color);
+        SetBkMode(hdc, TRANSPARENT);
+        let _ = GetTextExtentPoint32W(hdc, &wide, &mut sz);
+        let x = r.left + ((r.right - r.left) - sz.cx as f32) / 2.0;
+        let y = r.top + ((r.bottom - r.top) - sz.cy as f32) / 2.0;
+        let _ = TextOutW(hdc, x.round() as i32, y.round() as i32, &wide);
+    }
+}
+
+unsafe extern "system" fn date_pick_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_ERASEBKGND => LRESULT(1),
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                let st = DATE_PICK.lock().ok().and_then(|g| {
+                    g.as_ref()
+                        .map(|s| (s.owner, s.year, s.month, s.selected, s.scale))
+                });
+                if let Some((owner, year, month, selected, scale)) = st {
+                    let owner_hwnd = HWND(owner as *mut core::ffi::c_void);
+                    if let Some(app) = app_ptr(owner_hwnd) {
+                        let mut rc = RECT::default();
+                        let _ = GetClientRect(hwnd, &mut rc);
+                        let bg = app.edit_bg;
+                        let border = app.edit_border;
+                        let fg = app.edit_fg;
+                        let white = COLORREF(0x00FF_FFFF);
+                        let muted = COLORREF(0x0080_8080);
+                        if !bg.is_invalid() {
+                            let _ = FillRect(hdc, &rc, bg);
+                        }
+                        if !border.is_invalid() {
+                            let _ = FrameRect(hdc, &rc, border);
+                        }
+                        dp_text(hdc, app.ui_font, "<", dp_prev_rect(scale), fg);
+                        dp_text(hdc, app.ui_font, ">", dp_next_rect(scale), fg);
+                        dp_text(
+                            hdc,
+                            app.ui_font,
+                            &format!("{year} 年 {month} 月"),
+                            rect(
+                                (DP_PAD + 30.0) * scale,
+                                7.0 * scale,
+                                (DP_W - 2.0 * (DP_PAD + 30.0)) * scale,
+                                20.0 * scale,
+                            ),
+                            fg,
+                        );
+                        for (i, label) in DP_WEEK_LABELS.iter().enumerate() {
+                            dp_text(
+                                hdc,
+                                app.ui_font,
+                                label,
+                                rect(
+                                    (DP_PAD + i as f32 * dp_cell_w()) * scale,
+                                    (DP_HEAD_H + 2.0) * scale,
+                                    dp_cell_w() * scale,
+                                    18.0 * scale,
+                                ),
+                                muted,
+                            );
+                        }
+                        let first = dp_first_weekday(year, month);
+                        let days = dp_days_in_month(year, month) as i32;
+                        let (ty, tm, td) = dp_today();
+                        for i in 0..DP_ROWS * DP_COLS {
+                            let day = i as i32 - first as i32 + 1;
+                            let cell = dp_cell_rect(i, scale);
+                            if day >= 1 && day <= days {
+                                let picked = selected == Some((year, month, day as u32));
+                                if picked && !border.is_invalid() {
+                                    let _ = FillRect(hdc, &cell_inset(cell, 2.0 * scale), border);
+                                } else if (year, month, day as u32) == (ty, tm, td)
+                                    && !border.is_invalid()
+                                {
+                                    let _ = FrameRect(hdc, &cell_inset(cell, 2.0 * scale), border);
+                                }
+                                dp_text(
+                                    hdc,
+                                    app.ui_font,
+                                    &day.to_string(),
+                                    cell,
+                                    if picked { white } else { fg },
+                                );
+                            }
+                        }
+                        dp_text(hdc, app.ui_font, "今天", dp_today_rect(scale), fg);
+                    }
+                }
+                let _ = EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                let x = (l.0 & 0xFFFF) as u16 as i16 as f32;
+                let y = ((l.0 >> 16) & 0xFFFF) as u16 as i16 as f32;
+                let st = DATE_PICK.lock().ok().and_then(|g| {
+                    g.as_ref().map(|s| {
+                        (
+                            s.owner,
+                            s.plugin.clone(),
+                            s.field.clone(),
+                            s.year,
+                            s.month,
+                            s.scale,
+                        )
+                    })
+                });
+                let Some((owner, plugin, field, year, month, scale)) = st else {
+                    return LRESULT(0);
+                };
+                if hit(dp_prev_rect(scale), x, y) {
+                    let (ny, nm) = dp_month_add(year, month, -1);
+                    if let Ok(mut g) = DATE_PICK.lock() {
+                        if let Some(s) = g.as_mut() {
+                            s.year = ny;
+                            s.month = nm;
+                        }
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
+                if hit(dp_next_rect(scale), x, y) {
+                    let (ny, nm) = dp_month_add(year, month, 1);
+                    if let Ok(mut g) = DATE_PICK.lock() {
+                        if let Some(s) = g.as_mut() {
+                            s.year = ny;
+                            s.month = nm;
+                        }
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
+                if hit(dp_today_rect(scale), x, y) {
+                    let (ty, tm, td) = dp_today();
+                    let date = format!("{ty:04}-{tm:02}-{td:02}");
+                    let owner_hwnd = HWND(owner as *mut core::ffi::c_void);
+                    if let Some(app) = app_ptr(owner_hwnd) {
+                        app.set_plugin_field(owner_hwnd, &plugin, &field, &date);
+                    }
+                    dp_close(hwnd);
+                    let _ = SetForegroundWindow(owner_hwnd);
+                    return LRESULT(0);
+                }
+                let first = dp_first_weekday(year, month);
+                let days = dp_days_in_month(year, month) as i32;
+                for i in 0..DP_ROWS * DP_COLS {
+                    if !hit(dp_cell_rect(i, scale), x, y) {
+                        continue;
+                    }
+                    let day = i as i32 - first as i32 + 1;
+                    if day >= 1 && day <= days {
+                        let date = format!("{year:04}-{month:02}-{day:02}");
+                        let owner_hwnd = HWND(owner as *mut core::ffi::c_void);
+                        if let Some(app) = app_ptr(owner_hwnd) {
+                            app.set_plugin_field(owner_hwnd, &plugin, &field, &date);
+                        }
+                        dp_close(hwnd);
+                        let _ = SetForegroundWindow(owner_hwnd);
+                    }
+                    return LRESULT(0);
+                }
+                LRESULT(0)
+            }
+            WM_KEYDOWN if w.0 == 0x1B => {
+                dp_close(hwnd);
+                LRESULT(0)
+            }
+            WM_ACTIVATE if (w.0 & 0xFFFF) == 0 => {
+                dp_close(hwnd);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
+        }
+    }
+}
+
+/// 把矩形四边各缩 `inset`（像素）：日历格子里那圈高亮/描边不贴到邻居格上。
+fn cell_inset(r: D2D_RECT_F, inset: f32) -> RECT {
+    RECT {
+        left: (r.left + inset) as i32,
+        top: (r.top + inset) as i32,
+        right: (r.right - inset) as i32,
+        bottom: (r.bottom - inset) as i32,
+    }
+}
+
 /// EDIT 的子类过程：Enter 提交、Esc 取消、失焦提交。
 ///
 /// 为什么用子类化而不是在父窗口里接 `WM_COMMAND`：单个 EDIT 的 Enter 不会变成
 /// `EN_*` 通知，Esc 更不会；这两个键只能靠自己截。
+///
+/// 回执投给**根属主**（主窗），不是 `GetParent`：行内 EDIT 挂在顶层宿主窗下
+/// （`edit_host_proc`），`GetParent` 拿到的是宿主，主窗永远收不到提交。
 unsafe extern "system" fn edit_proc(
     hwnd: HWND,
     msg: u32,
@@ -11844,8 +12477,9 @@ unsafe extern "system" fn edit_proc(
         match msg {
             WM_KEYDOWN if w.0 == VK_RETURN || w.0 == VK_ESCAPE => {
                 let code = if w.0 == VK_RETURN { 1 } else { 2 };
-                if let Ok(parent) = GetParent(hwnd) {
-                    let _ = PostMessageW(Some(parent), WM_EDIT_DONE, WPARAM(code), LPARAM(0));
+                let owner = GetAncestor(hwnd, GA_ROOTOWNER);
+                if !owner.0.is_null() {
+                    let _ = PostMessageW(Some(owner), WM_EDIT_DONE, WPARAM(code), LPARAM(0));
                 }
                 LRESULT(0)
             }
@@ -11855,9 +12489,10 @@ unsafe extern "system" fn edit_proc(
             // 全在 `search_focus_signal` 那一份判据里。
             WM_SETFOCUS | WM_KILLFOCUS => {
                 if let Some(on) = search_focus_signal(id, msg) {
-                    if let Ok(parent) = GetParent(hwnd) {
+                    let owner = GetAncestor(hwnd, GA_ROOTOWNER);
+                    if !owner.0.is_null() {
                         let _ = PostMessageW(
-                            Some(parent),
+                            Some(owner),
                             WM_SEARCH_FOCUS,
                             WPARAM(on as usize),
                             LPARAM(0),
@@ -12488,6 +13123,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             if let Some(app) = unsafe { app_ptr(hwnd) } {
                 if app.search_focused != (w.0 != 0) {
                     app.search_focused = w.0 != 0;
+                    if app.view == 5 {
+                        if app.search_focused {
+                            // 输入层是顶层弹窗：拿到焦点才叫出来（平时藏着，
+                            // 让主窗画的提示文案留在框里）。
+                            app.place_search_edit(hwnd);
+                        } else {
+                            app.hide_search_edit();
+                        }
+                    }
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
@@ -15818,6 +16462,161 @@ mod pager_shape_tests {
             page_size.saturating_sub(PV_TABLE_MAX_ROWS)
         );
     }
+
+    /// 命中按 `ops` 的顺序逐条问；表格那一支从前对任何没落在行/行内按钮上的点击都直接
+    /// `return`，于是**排在表格后面**的分页条（记账本就是这条顺序）永远收不到点击：
+    /// 屏上画着「下一页」，点下去连插件动作都不发。这里把那条顺序原样排出来，
+    /// 点分页条中心时必须由那一颗按钮认领，而不是被表格吞掉。
+    #[test]
+    fn a_pager_below_a_table_owns_its_clicks() {
+        let view = PluginView {
+            title: "分页".to_string(),
+            widgets: vec![
+                Widget::Table {
+                    headers: vec!["名".to_string()],
+                    rows: (0..10).map(|i| vec![format!("行{i}")]).collect(),
+                    ids: (0..10).map(|i| format!("id{i}")).collect(),
+                    actions: vec![],
+                    group: String::new(),
+                    onselect: String::new(),
+                },
+                Widget::Pager {
+                    page: 1,
+                    pages: 2,
+                    total: 10,
+                    prev_id: "page_prev".to_string(),
+                    next_id: "page_next".to_string(),
+                },
+            ],
+        };
+        let ops = plugin_view_ops(&view, rect(0.0, 0.0, 800.0, 600.0), 0.0, &HashMap::new());
+        let next = ops
+            .iter()
+            .find_map(|op| match op {
+                POp::Button { id, rect, .. } if id == "page_next" => Some(*rect),
+                _ => None,
+            })
+            .expect("分页条的「下一页」没排出来：这条判据失去锚点");
+        let (cx, cy) = (
+            (next.left + next.right) / 2.0,
+            (next.top + next.bottom) / 2.0,
+        );
+        match pv_claiming_op(&ops, cx, cy) {
+            Some(POp::Button { id, .. }) => assert_eq!(
+                id, "page_next",
+                "分页条那一格被另一颗按钮认领了：点下去发的是别的动作"
+            ),
+            Some(_) => panic!("分页条的点击被非按钮控件认领了：表格吞了它（旧缺陷）"),
+            None => panic!("分页条的点击没人认领：按钮画得出来却点不到"),
+        }
+
+        // 表格自己的行仍归表格：点击第一行时认领的必须是表格本身（选中/联动靠它）。
+        let Some(POp::Table { rect: tr, .. }) = ops.first() else {
+            panic!("夹具第一项该是表格");
+        };
+        let row = pv_table_row_rect(tr, 0);
+        let claimed = pv_claiming_op(&ops, row.left + 4.0, row.top + 4.0)
+            .unwrap_or_else(|| panic!("表格行上的点击没人认领"));
+        assert!(
+            std::ptr::eq(claimed, &ops[0]),
+            "表格行上的点击被后面那一条认领了：顺序反了"
+        );
+        // 表头也在表格矩形里：归表格，不许穿透到下面。
+        assert!(
+            pv_op_claims_click(&ops[0], tr.left + 4.0, tr.top + 4.0),
+            "表头那一带的点击没被表格认领（会穿透到下面的控件）"
+        );
+        // 表格矩形下沿之外（分页条那一带）不归表格。
+        assert!(
+            !pv_op_claims_click(&ops[0], cx, cy),
+            "表格把分页条那一带的点击也认领了：分页条又会点不动"
+        );
+    }
+
+    /// 行内 EDIT 没有自己的边框，铺满整格会把宿主画的主色描边连圆角一起盖掉
+    /// （浅色主题下白底压白底，那一格看着像"点一下就没了"）。EDIT 必须缩在值框里面，
+    /// 四个边各留出至少 1 px 让那圈边框留在外面。
+    #[test]
+    fn the_inline_edit_leaves_the_drawn_field_border_visible() {
+        let view = PluginView {
+            title: "字段".to_string(),
+            widgets: vec![Widget::TextInput {
+                field: "f_kw".to_string(),
+                label: "关键词".to_string(),
+                value: String::new(),
+            }],
+        };
+        let ops = plugin_view_ops(&view, rect(0.0, 0.0, 800.0, 600.0), 0.0, &HashMap::new());
+        let Some(POp::Field {
+            rect: field_rect, ..
+        }) = ops.first()
+        else {
+            panic!("夹具那个输入框没排出来");
+        };
+        let drawn = pv_field_value_rect(*field_rect);
+        let inset = PV_FIELD_EDIT_INSET;
+        let edit = rect(
+            drawn.left + inset,
+            drawn.top + inset,
+            (drawn.right - drawn.left) - inset * 2.0,
+            (drawn.bottom - drawn.top) - inset * 2.0,
+        );
+        assert!(
+            edit.left >= drawn.left + 1.0
+                && edit.top >= drawn.top + 1.0
+                && edit.right <= drawn.right - 1.0
+                && edit.bottom <= drawn.bottom - 1.0,
+            "EDIT 盖住了宿主画的边框：drawn={drawn:?} edit={edit:?}"
+        );
+        assert!(
+            (edit.right - edit.left) > 100.0 && (edit.bottom - edit.top) > 10.0,
+            "缩过头了，EDIT 里放不下字：{edit:?}"
+        );
+        // 点值框中心仍要能开编辑（缩边之后命中矩形没跟着搬走）。
+        assert!(
+            pv_op_claims_click(
+                &ops[0],
+                (drawn.left + drawn.right) / 2.0,
+                (drawn.top + drawn.bottom) / 2.0
+            ),
+            "值框中心的点击没被输入框认领"
+        );
+    }
+}
+
+/// 日期选择器的纯逻辑：网格起点、月份步进、当前值解析。
+#[cfg(test)]
+mod date_pick_tests {
+    use super::*;
+
+    /// 日历网格按周一开头；2 月/闰年与上下月的步进都在这里钉住。
+    #[test]
+    fn the_calendar_grid_starts_on_monday_and_handles_leap_years() {
+        // 2024-01-01 是周一、2024-02-01 是周四（周一记 0）。
+        assert_eq!(dp_first_weekday(2024, 1), 0);
+        assert_eq!(dp_first_weekday(2024, 2), 3);
+        assert_eq!(dp_days_in_month(2026, 2), 28);
+        assert_eq!(dp_days_in_month(2028, 2), 29);
+        assert_eq!(dp_days_in_month(2026, 12), 31);
+    }
+
+    #[test]
+    fn month_steps_cross_the_year_boundary_both_ways() {
+        assert_eq!(dp_month_add(2026, 1, -1), (2025, 12));
+        assert_eq!(dp_month_add(2026, 12, 1), (2027, 1));
+        assert_eq!(dp_month_add(2026, 3, -14), (2025, 1));
+    }
+
+    /// 打开时落在字段当前那个月；认不出的值退回今天，不能把选择器开在"2026 年 13 月"。
+    #[test]
+    fn the_current_value_decides_which_month_opens() {
+        assert_eq!(dp_parse("2026-8-6"), (2026, 8, Some((2026, 8, 6))));
+        assert_eq!(dp_parse("2026-02-31"), (2026, 2, None));
+        let (ty, tm, _) = dp_today();
+        assert_eq!(dp_parse("2026-13-01").0, ty);
+        assert_eq!(dp_parse("2026-13-01").1, tm);
+        assert_eq!(dp_parse("").1, tm);
+    }
 }
 
 /// 热键状态行那条读数。截图的两条键就在这三条里，"按了没反应"时用户要先知道是哪一条没了。
@@ -17308,10 +18107,11 @@ mod clip_tests {
                 "{name} 这一拍没有重摆搜索框的输入窗口：拖大窗口或最大化之后点它没反应"
             );
         }
-        // 摆位一共三处：进设置页那一下、WM_SIZE、拖拽结束。多一处少一处都要红。
+        // 摆位一共五处：进设置页那一下、WM_SIZE、拖拽结束、点搜索框叫出输入层、
+        // 焦点递回来那一下。多一处少一处都要红。
         assert_eq!(
             prod.matches("place_search_edit(hwnd)").count(),
-            3,
+            5,
             "搜索框的摆位调用点数变了"
         );
     }
@@ -17347,14 +18147,18 @@ mod clip_tests {
         );
         // 两个 EDIT 各占一个 id，且这两个 id 必须真的不同：相同就没有这条角色轴可言。
         assert_ne!(SEARCH_EDIT_SUBCLASS, RENAME_EDIT_SUBCLASS);
+        assert!(
+            flat.contains("SetWindowSubclass(edit,Some(edit_proc),subclass_id,0)"),
+            "宿主化的 EDIT 没按传入的子类 id 注册：父窗分不出是谁在递焦点"
+        );
         for (call, name) in [
             (
-                "SetWindowSubclass(h,Some(edit_proc),SEARCH_EDIT_SUBCLASS,0)",
+                "create_hosted_edit(parent,self.ui_font,SEARCH_EDIT_SUBCLASS)",
                 "搜索框",
             ),
             (
-                "SetWindowSubclass(h,Some(edit_proc),RENAME_EDIT_SUBCLASS,0)",
-                "改名框",
+                "create_hosted_edit(parent,self.ui_font,RENAME_EDIT_SUBCLASS)",
+                "行内编辑",
             ),
         ] {
             assert!(

@@ -64,14 +64,23 @@ Check 'light screenshots written' ((Get-ChildItem $WorkDir -Filter 'light-*.png'
 # A leg that can be green by accident is worse than one that fails, so the reading now comes from
 # the window, the PrintWindow result is ANDed in as the precondition, and the screen point is only
 # printed as a diagnostic.
+function Get-InlineEdit([int]$ProcId) {
+    # 行内编辑挂在顶层宿主窗下（主窗是 DComp 合成，子窗口会被盖住），所以不能
+    # 直接在主窗的子窗口里找 EDIT：先找宿主类，再找它下面的 EDIT。
+    $hv = [FF]::ByClassHandle([uint32]$ProcId, 'FocusFlowEditHost')
+    if ($hv -eq 0) { return 0 }
+    return [FF]::ChildByClassHandle($hv, 'Edit')
+}
+
 $cLight = $null
 $cDark = $null
 Click-ViewTab $h 2
 [FF]::ClickWindow($h, 639, 284, 1)   # "rename" button of device row 0
 Start-Sleep -Milliseconds 500
-$edit = [FF]::ChildByClass($h, 'Edit')
-Check 'inline EDIT appears on rename' ($edit -ne [IntPtr]::Zero)
-if ($edit -ne [IntPtr]::Zero) {
+$editL = Get-InlineEdit $p.Id
+Check 'inline EDIT appears on rename' ($editL -ne 0)
+if ($editL -ne 0) {
+    $edit = [IntPtr]$editL
     $r = Get-Rect $edit
     $shot = Join-Path $WorkDir 'light-edit.png'
     $poked = Save-WindowShot $edit $shot
@@ -94,8 +103,9 @@ Check 'theme flips back to dark' ($back -match 'dark') $back
 Click-ViewTab $h 2
 [FF]::ClickWindow($h, 639, 284, 1)
 Start-Sleep -Milliseconds 500
-$edit2 = [FF]::ChildByClass($h, 'Edit')
-if ($edit2 -ne [IntPtr]::Zero) {
+$edit2L = Get-InlineEdit $p.Id
+if ($edit2L -ne 0) {
+    $edit2 = [IntPtr]$edit2L
     $shot2 = Join-Path $WorkDir 'dark-edit.png'
     $poked2 = Save-WindowShot $edit2 $shot2
     $c2 = Get-DominantColor $shot2
