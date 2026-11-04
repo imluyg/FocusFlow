@@ -685,11 +685,54 @@ pub fn forget(stem: &str) -> bool {
     if let Err(e) = flush(stem) {
         tracing::warn!("插件 {stem} 的台账落不下去: {e}");
     }
+    discard(stem)
+}
+
+/// 摘掉这一格，**一个字都不写**（插件文件已经没了的那些路用它）。
+///
+/// `forget` 那一笔落盘会把 `plugins/state/<stem>/` 建出来 —— 用户刚在卸载确认框里
+/// 选了「删除设置」、或者自己把插件文件删了的时候，这一写等于把刚清掉的那一格又建回来
+/// （症状：包没了，`state` 目录还在，里面只有一份 health.json）。所以"文件还在"才落盘，
+/// "文件没了"只摘格子。
+pub fn discard(stem: &str) -> bool {
     registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(stem)
         .is_some()
+}
+
+/// 把每一格**有内容**的账落到盘上（退出那一条路用）。
+///
+/// 常驻插件在退出时不会走 `unload_plugin`（没有哪一处会替它们卸载），而 `health.json`
+/// 存在的理由就是"重启之后还查得到"。少了这一问，只有面板插件与出错停用过的那些格子
+/// 能跨过重启，其余的耗时、错误历史与降频次数在退出那一刻清零。
+///
+/// 两档不写：没跑过也没错误的格（写出去只会给每个插件造一份空台账，还会让卸载时的
+/// "这一格没有状态"变成"有"），以及这一跑读盘失败过的格（盘上那份可能还能救，
+/// 空台账不该盖上去）。
+pub fn flush_all() -> Vec<String> {
+    let cells: Vec<(String, Arc<Mutex<Health>>)> = {
+        let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        reg.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let mut failed = Vec::new();
+    for (stem, board) in cells {
+        if stem.is_empty() {
+            continue;
+        }
+        let (doc, unreadable) = {
+            let guard = board.lock().unwrap_or_else(|e| e.into_inner());
+            (guard.to_doc(), guard.load_error.is_some())
+        };
+        if unreadable || !doc.has_anything() {
+            continue;
+        }
+        if let Err(e) = write(&stem, &doc) {
+            failed.push(format!("{stem}：{e}"));
+        }
+    }
+    failed
 }
 
 /// 落盘的那份文件在哪：`plugins/state/<stem>/health.json`（与 grants/state 同一格）。
@@ -1308,6 +1351,65 @@ mod detail_tests {
         assert!(
             detail.hooks.iter().all(|r| r.calls == "没跑过"),
             "空台账四档都说没跑过"
+        );
+    }
+
+    /// 退出前那一问：有内容的格要落，没内容的格一个文件都不许造。
+    ///
+    /// 常驻插件在退出时不会走卸载那条路，所以少了这一问，这一场的耗时、错误历史与
+    /// 降频次数在重启后就是"没有记录"；反过来，给每个只被页面问过一次的格子都落一份
+    /// 空台账，又会在数据目录里造出一片空 state 目录（卸载时"这一格没有状态"也会变成"有"）。
+    #[test]
+    fn flush_all_writes_only_the_boards_with_something_to_say() {
+        let _lock = paths::test_app_dir_lock();
+        let _app = paths::test_app_dir("health_flush_all");
+        {
+            let busy = board_for("busy_exit");
+            busy.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(HookKind::View, Duration::from_micros(1_000));
+        }
+        let _quiet = board_for("quiet_exit");
+        let failed = flush_all();
+        assert!(
+            !failed
+                .iter()
+                .any(|f| f.contains("busy_exit") || f.contains("quiet_exit")),
+            "{failed:?}"
+        );
+        assert!(health_file("busy_exit").is_file(), "跑过的那一格没落盘");
+        assert!(
+            !paths::plugin_state_path("quiet_exit").exists(),
+            "没跑过的格子在退出时造出了一份空台账"
+        );
+        let back = read("busy_exit")
+            .expect("刚写下去的那份要读得动")
+            .expect("刚写下去的那份要在盘上");
+        assert_eq!(back.hook(HookKind::View).map(|h| h.calls), Some(1));
+    }
+
+    /// 摘格子不许落盘：插件文件都已经删了（卸载时选了「删除设置」），
+    /// 这一写会把刚被清掉的 `plugins/state/<stem>/` 又建回来。
+    #[test]
+    fn discard_drops_the_cell_without_writing_anything() {
+        let _lock = paths::test_app_dir_lock();
+        let _app = paths::test_app_dir("health_discard");
+        board_for("gone_exit")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(HookKind::View, Duration::from_micros(2_000));
+        assert!(discard("gone_exit"), "这一格该在名册里");
+        assert!(
+            !paths::plugin_state_path("gone_exit").exists(),
+            "摘格子却写出了 state 目录"
+        );
+        assert!(
+            board_for("gone_exit")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .samples(HookKind::View)
+                .is_none(),
+            "摘掉之后问到的必须是一格新的"
         );
     }
 }

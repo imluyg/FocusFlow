@@ -292,6 +292,9 @@ pub fn uninstall(stem: &str, purge_state: bool) -> Result<Uninstalled, String> {
         if purge_state {
             std::fs::remove_dir_all(&state)
                 .map_err(|e| format!("{} 删不掉：{e}", state.display()))?;
+            // 内存里那一格也要摘掉：退出前那一问会把有内容的台账落盘，而这一格刚被删掉，
+            // 留下来就会把 `state/` 目录又写回来（`discard` 不落盘）。
+            crate::plugins::plugin_health::discard(stem);
             StateAfter::Purged
         } else {
             StateAfter::Kept(state)
@@ -516,9 +519,22 @@ mod tests {
             "PLUGIN_NAME = \"要走的\"\nfunction get_view() return { widgets = {} } end\n",
         );
         install(&zip).unwrap();
+        // 台账那一格里有内容（页面看一眼就会建一格，跑过钩子就有数）：purge 之后
+        // 它也不许留在名册里，否则退出前那一问会把刚删掉的 `state/` 写回来。
+        crate::plugins::plugin_health::board_for("leaver")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(
+                crate::plugins::plugin_health::HookKind::View,
+                std::time::Duration::from_micros(1_000),
+            );
         let purged = uninstall("leaver", true).unwrap();
         assert_eq!(purged.state, StateAfter::Purged);
         assert!(!state.exists(), "显式清除之后那一格才该没了");
+        assert!(
+            !crate::plugins::plugin_health::discard("leaver"),
+            "purge 之后台账那一格该已经从名册上摘掉（否则退出时会把它写回来）"
+        );
 
         // 从来没存过东西的那一格：既不是"留着"，也不是"刚删掉"。装包会留下一份安装记录，
         // 所以要先把它删掉，才轮得到"这一格根本不存在"这条腿。

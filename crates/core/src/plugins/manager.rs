@@ -2106,7 +2106,14 @@ impl PluginManager {
             // 丢掉的是**降频那一份**（上面那行 `plans`），而诊断那一份要留下：耗时读数、
             // 超预算次数与错误历史是给人回看的东西，它与"下一拍该不该降频"不是一个用途。
             // 所以这里落盘后摘格子，下一次问账从文件里读回来。
-            plugin_health::forget(&stem);
+            //
+            // 文件已经没了（用户卸包装时选了「删除设置」、或自己删了插件文件）就**只摘不落**：
+            // 那一笔落盘会把刚被清掉的 `plugins/state/<stem>/` 又建回来。
+            if info.file_path.exists() {
+                plugin_health::forget(&stem);
+            } else {
+                plugin_health::discard(&stem);
+            }
             // 卸载 = 用户不要它了（停用/删除/重启前的一次回收），旧的加载失败原因
             // 不该继续挂在插件页上。
             self.load_errors.remove(&stem);
@@ -6017,6 +6024,35 @@ end
         assert!(
             pm.get_plugin(&name).expect("插件还在").loaded,
             "停一路不等于停整个插件"
+        );
+    }
+
+    /// 插件文件已经没了（卸载时选了「删除设置」、或用户自己删了文件）⇒ 卸载那条路
+    /// 只摘格子、不落盘：`forget` 那一笔会把刚被清掉的 `plugins/state/<stem>/` 建回来。
+    #[test]
+    fn unloading_a_deleted_plugin_does_not_recreate_its_state_directory() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("unload_gone_state");
+        let file = write_lua(
+            &tmp.path().join("plugins"),
+            "gonep",
+            "PLUGIN_NAME = \"没了\"\nfunction get_view() return { widgets = {} } end\n",
+        );
+        let mut pm = manager_in(tmp.path());
+        let name = pm
+            .load_plugin(&file, PluginSource::Builtin)
+            .expect("插件该装得上");
+        pm.refresh_view(&name).expect("视图该刷得动");
+        let stem = "gonep";
+        assert!(
+            !paths::plugin_state_path(stem).exists(),
+            "夹具前提：这一格还没写过 state"
+        );
+        std::fs::remove_file(&file).expect("删掉插件文件");
+        assert!(pm.unload_by_stem(stem), "文件没了也该能按 stem 卸");
+        assert!(
+            !paths::plugin_state_path(stem).exists(),
+            "卸载把刚清掉的 state 目录又建回来了"
         );
     }
 

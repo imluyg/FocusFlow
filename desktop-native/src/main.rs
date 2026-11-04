@@ -11613,6 +11613,12 @@ fn quit_app(hwnd: HWND) {
     for why in focusflow_core::plugins::plugin_store::flush_all() {
         tracing_note(&format!("退出前插件存储没落盘：{why}"));
     }
+    // 台账那份同一个理由：常驻插件退出时不走卸载那条路，而 `health.json` 就是为了
+    // "重启之后还查得到这一场跑了什么、坏在哪"。也要排在退出备份之前 —— `plugins/state/`
+    // 会一起收进备份包，内存里有而盘上没有的，收进去的就是旧的那一份。
+    for why in focusflow_core::plugins::plugin_health::flush_all() {
+        tracing_note(&format!("退出前插件台账没落盘：{why}"));
+    }
     // 最后补一次几何：拖完最后一下马上退出、最大化之后直接退出，都不经过 `WM_EXITSIZEMOVE`。
     save_main_geometry(hwnd);
     floating::shutdown();
@@ -18565,6 +18571,36 @@ mod plugin_page_tests {
         assert!(
             asked.unwrap() < body.find("save_main_geometry(hwnd)").unwrap(),
             "落盘那一问排到了后面几步之后 ⇒ 退出备份收走的还是旧的一份"
+        );
+    }
+
+    /// 台账那一份也要在退出前落一次：常驻插件退出时不会走卸载那条路。
+    ///
+    /// 少了这一问，只有面板插件与出错停用过的格子能跨过重启；常驻那一族这一场的
+    /// 耗时、错误历史与降频次数在退出那一刻清零（而 health.json 存在的理由正是这个）。
+    #[test]
+    fn the_health_ledger_is_flushed_before_the_exit_backup() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("fn quit_app(hwnd: HWND)")
+            .expect("quit_app 不见了（改名或换了写法，这条守卫的锚要跟着改）");
+        let rest = &code[at..];
+        let body = &rest[..rest.find("\n}").expect("quit_app 的函数体切不出来")];
+        let asked = body
+            .find("plugin_health::flush_all")
+            .expect("退出前不问一次台账 ⇒ 常驻插件这一场的账清零");
+        let backup = body
+            .find("collect::shutdown")
+            .expect("退出备份那一步找不到了");
+        assert!(
+            asked < backup,
+            "台账要在退出备份之前落盘（plugins/state/ 会被一起收进备份包）"
         );
     }
 
