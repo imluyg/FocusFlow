@@ -2187,14 +2187,16 @@ impl App {
                         .map(|v| (name.clone(), v.clone()))
                 });
                 let Some((n, view)) = pv else {
-                    // 视图取不出来（插件加载失败/返回空）时，至少「返回」还能用。
-                    let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
-                    if hit(back, x, y) {
-                        self.plugin_open = None;
-                        self.reset_plugin_view_state();
-                        unsafe {
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
+                    // 插件已经不在了（文件被删、热重载把它卸了）或视图取不出来。屏上这一拍
+                    // 画的是**清单**，而点击还按"视图开着"处理就会被这里全吞掉：点哪里都没
+                    // 反应，只有 Esc 能出来。先把状态收掉并说一句，下一次点击就落回清单。
+                    self.plugin_open = None;
+                    self.reset_plugin_view_state();
+                    self.status = Some(format!(
+                        "插件 {name} 的视图已经没了（文件被删或取不出来），已回到清单"
+                    ));
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     return;
                 };
@@ -3305,6 +3307,21 @@ impl App {
                 tracing_note(&format!("插件目录读不出来：{e}"));
                 self.plugin_err = Some(e);
                 self.plugin_rows.clear();
+            }
+        }
+        // 打开着的那一页所属插件已经不在了（文件被删、热重载把它卸了）：把视图状态
+        // 一起收掉。留着的话屏上画的是清单，点击却被 `on_click` 的视图分支吞掉 ——
+        // 看起来像程序卡死，只有 Esc 能出来。
+        if let Some(name) = self.plugin_open.clone() {
+            let alive = self
+                .pm
+                .as_ref()
+                .and_then(|pm| pm.get_plugin(&name))
+                .and_then(|p| p.view.as_ref())
+                .is_some();
+            if !alive {
+                self.plugin_open = None;
+                self.reset_plugin_view_state();
             }
         }
     }
@@ -15917,13 +15934,14 @@ mod plugin_sel_tests {
             .collect();
         assert_eq!(
             flat.matches("plugin_open=None;").count(),
-            4,
-            "关面板的入口数目变了（返回两颗 + 按 Esc 一颗）：第 4 处是打开详情时与视图互斥，\
-             它不调用 reset_plugin_view_state（那一刻没有视图状态要清），所以下一行还是 4"
+            5,
+            "关面板的入口数目变了：返回 + Esc + 视图没了时点击 + 重扫发现插件没了\
+             （四个都既置 None 又清状态）；另有两处互斥入口各只做一半：打开详情只置 None、\
+             打开视图只清状态，所以这一行与下一行同为 5"
         );
         assert_eq!(
             flat.matches("reset_plugin_view_state()").count(),
-            4,
+            5,
             "清理要么被手抄成几份、要么少了一处：实得 {}",
             flat.matches("reset_plugin_view_state()").count()
         );
@@ -20240,5 +20258,39 @@ mod modal_content_tests {
         let g = modal_geom(&m, 1200.0, 900.0);
         let cr = g.content.expect("两行正文也该留出内容区");
         assert!((cr.bottom - cr.top - 2.0 * MODAL_LINE_H).abs() < 0.01);
+    }
+}
+
+/// 视图没了的时候必须把 `plugin_open` 收掉：那一拍屏上画的是**清单**，而点击仍按
+/// "视图开着"处理就会被吞 —— 点哪里都没反应，看起来像程序卡死（只剩 Esc 能出来）。
+/// 两个入口都要收：点击时发现、重扫插件目录时发现。
+#[cfg(test)]
+mod plugin_view_lifecycle_tests {
+    fn prod() -> String {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        src[..cut]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn a_missing_view_closes_the_open_state_in_both_doors() {
+        let flat = prod();
+        assert!(
+            flat.contains(
+                "letSome((n,view))=pvelse{self.plugin_open=None;self.reset_plugin_view_state();"
+            ),
+            "点击那一头：视图取不出来时没有收掉 plugin_open —— 清单会被吞掉所有点击"
+        );
+        assert!(
+            flat.contains("if!alive{self.plugin_open=None;self.reset_plugin_view_state();}"),
+            "重扫那一头：插件没了没有收掉 plugin_open —— 屏上是清单，点击全被吞"
+        );
     }
 }
