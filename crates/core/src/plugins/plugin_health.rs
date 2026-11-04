@@ -192,6 +192,12 @@ pub struct Health {
     throttle_flips: u32,
     /// 被停用的那几次（`mark_plugin_error` 那一路）
     stops: u32,
+    /// 这一跑的起点：`health.json` 读不出来时的那句原因。
+    ///
+    /// 采集那一路必须继续（一个坏文件不该让插件的耗时统计整体停摆），但**页面不许**
+    /// 把"读不出来"念成"没有记录" —— 本仓在 store / 安装记录上都修过同一族。这句只活在
+    /// 本进程：成功落一次盘之后就清掉（那一刻盘上是新写的、可读的一份）。
+    load_error: Option<String>,
 }
 
 impl Health {
@@ -251,6 +257,7 @@ impl Health {
                 last_us: s.last_us().unwrap_or(0),
                 p95_us: s.p95_us().unwrap_or(0),
                 over_budget: s.over_budget() as u64,
+                recent_us: s.recent.iter().copied().collect(),
             });
         }
         HealthDoc {
@@ -271,19 +278,33 @@ impl Health {
         };
         for h in &doc.hooks {
             if let Some(kind) = HookKind::from_keyword(&h.kind) {
+                // 新文件带着整窗样本：原样恢复，`over_budget` 才能跟着窗口一起滚掉。
+                // 老文件只有 last/p95：用这两个数重建（页面够说话），并把计数夹到
+                // "这两个样本里真有几次超预算" —— 保留一个减不掉的计数就是假读数。
+                // **顺序是 p95 在前、last 在后**：`last_us()` 读的是窗口尾巴，反过来排的
+                // 话重启之后「最近一次」会念成 p95（那是窗口里最慢的一档，不是最后一次）。
+                let legacy = h.recent_us.is_empty() && h.calls > 0;
+                let mut recent: VecDeque<u64> = if legacy {
+                    VecDeque::from([h.p95_us, h.last_us])
+                } else {
+                    h.recent_us.iter().copied().collect()
+                };
+                while recent.len() > crate::plugins::plugin_refresh::SAMPLE_WINDOW {
+                    recent.pop_front();
+                }
+                let over_budget = if legacy {
+                    recent
+                        .iter()
+                        .filter(|micros| **micros > kind.budget_us())
+                        .count()
+                } else {
+                    h.over_budget as usize
+                };
                 health.per_kind.insert(
                     kind,
                     Samples {
-                        // 窗口里的逐条耗时不落盘（落的是 last/p95 两个读数），读回来时用这两个
-                        // 数重建：够页面说话，也够下一拍的窗口判断继续滚。**顺序是 p95 在前、
-                        // last 在后** —— `last_us()` 读的是窗口尾巴，反过来排的话重启之后
-                        // 「最近一次」会念成 p95（那是"窗口里最慢的那一档"，不是最后一次）。
-                        recent: if h.calls > 0 {
-                            VecDeque::from([h.p95_us, h.last_us])
-                        } else {
-                            VecDeque::new()
-                        },
-                        over_budget: h.over_budget as usize,
+                        recent,
+                        over_budget,
                         calls: h.calls,
                     },
                 );
@@ -312,6 +333,15 @@ pub struct HookDoc {
     pub last_us: u64,
     pub p95_us: u64,
     pub over_budget: u64,
+    /// 窗口里的逐条耗时（微秒，旧 → 新）。
+    ///
+    /// 为什么落整窗而不是只落 last/p95：`over_budget` 是**窗口内**的计数，而它是随着
+    /// 样本被顶出去一条条减的。只恢复两个读数时，若超预算的那几次不在窗口尾巴上，
+    /// 这个计数就再也减不掉 —— 重启之后最后 20 次全是快样本，页面上仍写着"超预算 2 次"。
+    /// `#[serde(default)]`：老文件没有这一格，读回时退回 last/p95 两个样本并把计数
+    /// 夹到"这两个样本里真有几次超预算"。
+    #[serde(default)]
+    pub recent_us: Vec<u64>,
 }
 
 impl Default for HealthDoc {
@@ -349,10 +379,14 @@ impl HealthDoc {
 /// "还没轮到它跑"混成同一句的那类噪声（本仓在打卡条与周报上修过同源的两处）。
 /// 有内容时交回 [`summary_line`] 那一份，句子只有一处写法。
 pub fn summary_for(stem: &str) -> Option<String> {
-    let doc = board_for(stem)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .to_doc();
+    let board = board_for(stem);
+    let guard = board.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.load_error.is_some() {
+        // 行上只放一句短的；原因正文归详情页的错误历史（那一栏本来就有红色那一行）。
+        // 不许回 `None`：那与"这一格还没有记录"在屏上是同一句话。
+        return Some("台账读不出来（详情页看原因）".to_string());
+    }
+    let doc = guard.to_doc();
     if doc.has_anything() {
         Some(summary_line(&doc))
     } else {
@@ -539,12 +573,22 @@ fn bounded_count(n: u64) -> String {
 
 /// 详情页要的那一屏（内存里那格，第一次问时才读盘 —— 与行上那句同一把尺子）。
 pub fn detail_for(stem: &str) -> PluginDetail {
-    detail_from(
-        &board_for(stem)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .to_doc(),
-    )
+    let board = board_for(stem);
+    let guard = board.lock().unwrap_or_else(|e| e.into_inner());
+    let mut detail = detail_from(&guard.to_doc());
+    if let Some(e) = &guard.load_error {
+        // 顶上那句也要改口：空台账会把它写成"没有失败、停用或降频的记录"，
+        // 而这一份账根本没读进来 —— 那句"没有"是我们不知道，不是它没发生。
+        detail.note = "台账读不出来：这一跑的计数从零开始（原因见错误历史）".to_string();
+        detail.has_trouble = true;
+        // 排在历史最前面：它不是"某一次跑坏了"，是"这一份账根本没读进来"。
+        detail.errors.insert(
+            0,
+            clip_chars(&format!("台账读不出来：{e}"), DETAIL_ERROR_MAX_CHARS),
+        );
+        detail.has_errors = true;
+    }
+    detail
 }
 
 /// 时长转微秒：亚微秒的那一段折成 0（预算最小的那一档也有 200 µs，不会把"刚好"折成"超"）。
@@ -600,12 +644,16 @@ pub fn board_for(stem: &str) -> Arc<Mutex<Health>> {
     }
     let seeded = match read(stem) {
         Ok(Some(doc)) => Health::from_doc(&doc),
-        // 读不出来（坏文件、版本认不得）不许把插件的台账整体当成"没有记录"，
-        // 也不许让采集这一路失败：话留在日志，本进程从空的一格开始记。
+        // 读不出来（坏文件、版本认不得）不许让采集这一路失败，也不许把"读不出来"
+        // 折成"没有记录"：本进程从空的一格开始记，但把原因带在台账上，页面那一行与
+        // 详情页会说出去（成功落一次盘之后清掉 —— 那一刻盘上是新写的、可读的一份）。
         Ok(None) => Health::default(),
         Err(e) => {
             tracing::warn!("插件 {stem} 的 health.json 读不回来，这一跑从空台账开始记：{e}");
-            Health::default()
+            Health {
+                load_error: Some(e),
+                ..Default::default()
+            }
         }
     };
     let cell = Arc::new(Mutex::new(seeded));
@@ -623,7 +671,10 @@ pub fn flush(stem: &str) -> Result<(), String> {
         return Ok(()); // 这一格没被碰过 = 没有要落的东西
     };
     let doc = board.lock().unwrap_or_else(|e| e.into_inner()).to_doc();
-    write(stem, &doc)
+    write(stem, &doc)?;
+    // 盘上已经是刚写的一份：那句"读不回来"从这一刻起不再描述现状。
+    board.lock().unwrap_or_else(|e| e.into_inner()).load_error = None;
+    Ok(())
 }
 
 /// 落盘并摘掉这一格（卸载、停用那两条路）。
@@ -767,6 +818,37 @@ mod tests {
         );
     }
 
+    /// 重启之后 `over_budget` 必须还能随窗口滚掉。
+    ///
+    /// 只落 last / p95 时，超预算那几次若不在窗口尾巴上，读回来的两个样本都不超预算，
+    /// 计数却原样搬回来 ⇒ 之后每一轮顶出去的都是快样本，这个数永远减不掉：
+    /// 最后 20 次全快，页面上仍写着"超预算 2 次"。落整窗样本是这条的修法。
+    #[test]
+    fn a_restored_window_lets_the_over_budget_count_roll_off() {
+        let mut health = Health::default();
+        health.record(HookKind::View, us(9_000));
+        health.record(HookKind::View, us(9_000));
+        for _ in 0..(SAMPLE_WINDOW - 2) {
+            health.record(HookKind::View, us(100));
+        }
+        let doc = health.to_doc();
+        assert_eq!(doc.hook(HookKind::View).map(|h| h.over_budget), Some(2));
+        let mut restored = Health::from_doc(&doc);
+        assert_eq!(
+            restored.samples(HookKind::View).map(|s| s.over_budget()),
+            Some(2),
+            "读回来时那两次超预算还在窗口里"
+        );
+        for _ in 0..SAMPLE_WINDOW {
+            restored.record(HookKind::View, us(100));
+        }
+        assert_eq!(
+            restored.samples(HookKind::View).map(|s| s.over_budget()),
+            Some(0),
+            "窗口已经全是快样本，计数却减不掉 ⇒ 页面上的「超预算」永远是个旧数"
+        );
+    }
+
     /// p95 取的是排好序后 95% 那一个位置，不是最大值也不是平均值。
     #[test]
     fn the_p95_reads_the_ninety_fifth_percentile_of_the_window() {
@@ -878,15 +960,55 @@ mod tests {
         assert!(err.contains("格式版本"), "认不得的版本要念出版本号：{err}");
     }
 
+    /// 台账读不出来时，页面那一行与详情页都要说"读不出来"，不许折成"没有记录"。
+    ///
+    /// 采集那一路必须继续（`board_for` 从空的一格开始记），但"读不出来"与"没有"是
+    /// 本仓分开治过好几轮的两件事。成功落一次盘之后盘上是可读的一份，那句要自己收回去。
+    #[test]
+    fn an_unreadable_ledger_is_not_reported_as_no_records() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("health_unreadable_page");
+        let stem = "health_unreadable_page_case";
+        let path = health_file(stem);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("状态目录");
+        std::fs::write(&path, "不是 JSON").expect("写坏夹具");
+
+        let said = summary_for(stem).expect("读不出来要说出来，不能当没有");
+        assert!(said.contains("台账读不出来"), "{said}");
+        let detail = detail_for(stem);
+        assert!(
+            detail.errors.iter().any(|e| e.contains("台账读不出来")),
+            "详情页的错误历史也要说出读不出来：{:?}",
+            detail.errors
+        );
+        assert!(detail.has_errors);
+        assert!(
+            detail.note.contains("台账读不出来") && detail.has_trouble,
+            "顶上那句不许写成「没有失败/停用/降频的记录」：{}",
+            detail.note
+        );
+
+        flush(stem).expect("落盘应当成功");
+        assert_eq!(
+            summary_for(stem),
+            None,
+            "盘已经换成可读的一份、这一跑又没有记录 ⇒ 那句要收回"
+        );
+        assert!(
+            read(stem).expect("读回来不该失败").is_some(),
+            "落盘之后盘上必须留着一份可读的台账"
+        );
+    }
+
     /// 页面那一行只在有话可说时才要这一句：`summary_for` 对空账回 `None`。
     ///
     /// `None` 与空串不是一回事 —— 页面拿 `None` 是"这一格别画"，拿空串会画出一个孤零零的分隔点。
     /// 两档（跑过一次 / 只留了一条错误历史）都要算"有话"，因为它们走的是同一份判据。
     /// 重启之后「最近一次」还是最近那一次，不是 p95。
     ///
-    /// 落盘的是两个读数（last / p95），窗口里的逐条样本不落盘。重建时若把 last 放在
-    /// 倒数的位置，`last_us()` 就读到 p95 —— 详情页那一格会念成"最近 7.8 ms"，而真正
-    /// 最后一次是 7.1 ms。这条腿盯的正是"读回来那两个数还认得出谁是谁"。
+    /// 这一份夹具是**老文件**（没有 `recent_us`）：只剩 last / p95 两个读数时，重建若把
+    /// last 放在倒数的位置，`last_us()` 就读到 p95 —— 详情页那一格会念成"最近 7.8 ms"，
+    /// 而真正最后一次是 7.1 ms。这条腿盯的正是"读回来那两个数还认得出谁是谁"。
     #[test]
     fn the_last_reading_survives_a_restart_as_the_last_reading() {
         let doc = HealthDoc {
@@ -897,6 +1019,7 @@ mod tests {
                 last_us: 7_100,
                 p95_us: 7_800,
                 over_budget: 3,
+                recent_us: Vec::new(),
             }],
             errors: Vec::new(),
             throttle_flips: 0,
@@ -910,6 +1033,13 @@ mod tests {
             .expect("四类都写出来才有这一格");
         assert_eq!(view.last_us, 7_100, "「最近」不许读成 p95");
         assert_eq!(view.p95_us, 7_800, "p95 那一格也不能被 last 顶掉");
+        assert_eq!(
+            Health::from_doc(&doc)
+                .samples(HookKind::View)
+                .map(|s| s.over_budget()),
+            Some(2),
+            "老文件只剩两个样本：计数要夹到这两个里真超预算的次数，别留一个减不掉的 3"
+        );
     }
 
     #[test]
@@ -1018,6 +1148,7 @@ mod detail_tests {
                     last_us: 0,
                     p95_us: 0,
                     over_budget: 0,
+                    recent_us: Vec::new(),
                 })
                 .collect(),
             errors: Vec::new(),
