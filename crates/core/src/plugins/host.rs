@@ -1621,6 +1621,21 @@ pub fn register_host_api(
             }
         };
         let (from, to) = span;
+        // `query_range` 的文档把"跨度上限由调用方先判"写在这一层，而从前只有 `days`
+        // 走过那道闸：`from`/`to` 可以写成 0001..9999，按日那一支会为**每一天**建一格
+        // （三百多万格、三百多万个标签串），前面还要按年份逐个探库 —— 一次调用就能把
+        // 界面线程钉住，插件的错不该表现成整个应用卡死。这里补上同一道上限。
+        let span_days = (to - from).num_days() + 1;
+        if span_days > crate::db::queries::MAX_QUERY_DAYS {
+            return Ok((
+                empty,
+                Some(format!(
+                    "focusflow.query 的区间有 {span_days} 天，超过 {} 天上限：请缩小 from/to \
+                     （要全部历史请用 stats(0)）",
+                    crate::db::queries::MAX_QUERY_DAYS
+                )),
+            ));
+        }
         let limit = match text("limit") {
             Some(raw) => match raw.parse::<i64>() {
                 Ok(n) if n >= 0 => n as usize,

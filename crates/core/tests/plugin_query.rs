@@ -241,3 +241,26 @@ fn a_reversed_window_is_refused_not_silently_swapped() {
         "反着的区间要当场拒绝并点名哪一端反了：{gap}"
     );
 }
+
+/// `from`/`to` 的跨度也要过同一道闸，而不是只夹 `days`。
+///
+/// `query_range` 的文档把"跨度上限由调用方先判"写在宿主这一层，而从前这里只检查了
+/// `days`：插件写 `{ from = "0001-01-01", to = "9999-12-31" }` 时，按日那一支会为
+/// 每一天建一格、还要按年份逐个探库 —— 一次调用就能把界面线程钉住。拒绝要在碰库之前
+/// 发生，并且把天数与上限都说出来，作者才改得动。
+#[test]
+fn a_window_span_over_the_limit_is_refused_before_touching_the_storage() {
+    let _g = query_round::guard();
+    let app = common::isolated_app_dir("query_span");
+    let (mut pm, name) = load_query(
+        app.path(),
+        "span",
+        "{ from = \"2000-01-01\", to = \"2100-01-01\", group_by = \"day\" }",
+    );
+    pm.refresh_view(&name).expect("取视图该成功");
+    let gap = gap_of(&pm, &name);
+    assert!(
+        gap.contains("36526") && gap.contains("36500"),
+        "跨度超过上限要当场拒绝，并说出实际天数与上限，实得: {gap}"
+    );
+}
