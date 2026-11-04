@@ -1971,7 +1971,7 @@ impl App {
                     PluginSlot::Header(_) => continue,
                 };
                 let y0 = list_top + vis as f32 * row_h;
-                if y >= y0 && y < y0 + row_h - 4.0 {
+                if hit(plugin_row_rect(w, y0, row_h), x, y) {
                     row = Some(idx);
                     break;
                 }
@@ -2456,7 +2456,7 @@ impl App {
                     PluginSlot::Header(_) => continue,
                 };
                 let y0 = list_top + vis as f32 * row_h;
-                let row_rect = rect(32.0, y0, w - 64.0, row_h - 4.0);
+                let row_rect = plugin_row_rect(w, y0, row_h);
                 if hit(row_rect, x, y) {
                     // 验收脚本按坐标点插件行：这一句是那条点击唯一的对账痕迹
                     // （点偏了与"按钮没反应"在屏上分不开）。
@@ -8658,6 +8658,15 @@ fn plugin_geom(_w: f32, h: f32) -> (f32, f32, usize) {
     (list_top, row_h, max_rows)
 }
 
+/// 插件清单里一行可画 / 可悬停 / 可点的矩形。
+///
+/// 三个读者共用这一份：从前悬停只判 `y`，指针落在卡片左右 16px 的边距里也会亮起
+/// 那一行 —— "亮的区域"与"点得到的区域"不是同一个。左右边界由卡片的内边距决定
+/// （卡片从 16 起、内容再缩 16），与 [`plugin_geom`] 的纵向几何各管一维。
+fn plugin_row_rect(w: f32, y: f32, row_h: f32) -> D2D_RECT_F {
+    rect(32.0, y, w - 64.0, row_h - 4.0)
+}
+
 /// 插件错误串里常带 `\nstack traceback:…`：只留第一行并截断，否则会把下一行顶穿。
 fn one_line(s: &str, max: usize) -> String {
     let first = s.lines().next().unwrap_or("").trim();
@@ -8858,12 +8867,7 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             PluginSlot::Row(i) => *i,
         };
         let row = &rows[idx];
-        let r = rect(
-            card.left + 16.0,
-            y,
-            card.right - card.left - 32.0,
-            row_h - 4.0,
-        );
+        let r = plugin_row_rect(w, y, row_h);
         if vs.sel == Some(idx) {
             p.round(r, R_CONTROL, &p.br.accent_soft, None);
         } else if vs.hover == Some(idx) {
@@ -20132,6 +20136,34 @@ mod plugin_page_tests {
             !code.contains("let count = self.plugin_rows.len();"),
             "命中那一头还在按行数（不算表头）夹滚动 ⇒ 最后两行会被表头挤掉"
         );
+    }
+
+    /// 一行"亮起来"的区域必须与"点得到"的区域是同一个：悬停从前只判 `y`，
+    /// 指针落在卡片左右 16px 的边距里也会亮起那一行（而点下去什么都不发生）。
+    #[test]
+    fn the_hover_band_is_the_same_rect_as_the_click_band() {
+        let w = 960.0;
+        let row_h = 46.0;
+        let r = plugin_row_rect(w, 300.0, row_h);
+        assert_eq!((r.left, r.right), (32.0, w - 32.0));
+        assert!(hit(r, 100.0, 310.0), "行中间要命中");
+        assert!(!hit(r, 20.0, 310.0), "左边距里不该亮（点也点不到）");
+        assert!(!hit(r, w - 20.0, 310.0), "右边距里不该亮（点也点不到）");
+        assert!(!hit(r, 100.0, 300.0 + row_h - 3.0), "行间空档不归这一行");
+
+        // 画 / 悬停 / 点击三处读同一个函数，不是各写一套坐标。
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        for needle in [
+            "let r = plugin_row_rect(w, y, row_h);",
+            "let row_rect = plugin_row_rect(w, y0, row_h);",
+            "if hit(plugin_row_rect(w, y0, row_h), x, y) {",
+        ] {
+            assert!(
+                prod.contains(needle),
+                "画/悬停/点击又各写一套行矩形：缺 {needle}"
+            );
+        }
     }
 
     /// 声明那一格只说**与缺省不同**的东西，随包那五个一字未改的脚本不该有字。
