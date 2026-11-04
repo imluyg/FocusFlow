@@ -7285,7 +7285,11 @@ const PV_TABLE_ROW_H: f32 = 20.0;
 /// 单列成常量是因为 `rows` 与 `ids` 必须**一起**截：命中测试按 `ids.len()` 排行矩形，
 /// 只截 `rows` 等于给画不出来的行留出一块点击区（见
 /// `a_table_with_more_rows_than_drawn_has_no_invisible_hit_rows`）。
-const PV_TABLE_MAX_ROWS: usize = 6;
+///
+/// **上限不许小于一页的条数**：内置记账本按每页 10 条查、再靠分页条翻页，上限是 6 时
+/// 每页后 4 条被画没而 `total` 照旧把它们算进去 —— 翻到哪一页都只看得到前 6 条，
+/// 而且没有任何一处说这件事（见 `the_table_row_cap_does_not_hide_a_page_of_the_ledger`）。
+const PV_TABLE_MAX_ROWS: usize = 10;
 /// 一张插件图表占多高（卡片本体，含轴）。
 ///
 /// 与内置页那张「每日活跃趋势」不同一处：那一块的高度跟着窗口走，这一块的正文没有滚动以外的
@@ -7294,6 +7298,23 @@ const PV_TABLE_MAX_ROWS: usize = 6;
 const PV_CHART_H: f32 = 150.0;
 /// 横轴最多标几个刻度文本（面板宽约 900，一格 90 px 已经挤；90 个点全标就是糊成一片）。
 const PV_CHART_MAX_LABELS: usize = 7;
+/// `row` 里相邻两个控件之间的空隙。
+const PV_ROW_GAP: f32 = 10.0;
+/// `row` 里一个输入框/下拉要占的宽度：标签 140 + 值框 260。
+///
+/// 这两个数是画法与命中共同钉死的（值框在 `left + 146`、宽 260），所以横排时这一格
+/// 必须正好是 406；少一格就会压到隔壁控件身上，而两个矩形叠着的时候点击只能中一个。
+const PV_FIELD_W: f32 = 406.0;
+/// 分页条：左边那句「第 x / y 页 · 共 n 条」占多宽，右边两颗按钮各多宽。
+const PV_PAGER_LABEL_W: f32 = 190.0;
+const PV_PAGER_BTN_W: f32 = 76.0;
+
+/// 按钮宽度：按文字量算、不低于 96。画与命中都读这一个数（从前同一个算式在两处各写一遍）。
+fn pv_button_width(text: &str, avail: f32) -> f32 {
+    ((text.chars().count() as f32) * 15.0 + 28.0)
+        .max(96.0)
+        .min(avail)
+}
 
 /// 第 `i` 行的整行矩形（画图高亮与点击命中都从这里算，别各写一遍）。
 fn pv_table_row_rect(r: &D2D_RECT_F, i: usize) -> D2D_RECT_F {
@@ -7365,182 +7386,250 @@ fn plugin_view_ops(
         plugin_sel: &HashMap<String, Vec<String>>,
     ) {
         for widget in widgets {
-            match widget {
-                Widget::Heading(t) => {
-                    ops.push(POp::Heading {
-                        rect: rect(x, *y, w, 24.0),
-                        text: t.clone(),
-                    });
-                    *y += 30.0;
-                }
-                Widget::Label(t) => {
-                    ops.push(POp::Label {
-                        rect: rect(x, *y, w, 20.0),
-                        text: t.clone(),
-                    });
-                    *y += 22.0;
-                }
-                Widget::KeyValue(k, v) => {
-                    ops.push(POp::Kv {
-                        rect: rect(x, *y, w, 20.0),
-                        key: k.clone(),
-                        value: v.clone(),
-                    });
-                    *y += 22.0;
-                }
-                Widget::Separator => {
-                    ops.push(POp::Sep {
-                        rect: rect(x, *y + 8.0, w, 1.0),
-                    });
-                    *y += 18.0;
-                }
-                Widget::TextArea(t) => {
-                    let lines = t.lines().count().clamp(1, 5) as f32;
-                    ops.push(POp::Body {
-                        rect: rect(x, *y, w, lines * 18.0),
-                        text: t.clone(),
-                    });
-                    *y += lines * 18.0 + 8.0;
-                }
-                Widget::TextInput {
-                    field,
-                    label,
-                    value,
-                } => {
-                    ops.push(POp::Field {
-                        rect: rect(x, *y, w, 26.0),
-                        label: label.clone(),
-                        value: value.clone(),
-                        field: field.clone(),
-                    });
-                    *y += 30.0;
-                }
-                Widget::Select {
-                    field,
-                    label,
-                    value,
-                    options,
-                    ..
-                } => {
-                    ops.push(POp::Select {
-                        rect: rect(x, *y, w, 26.0),
-                        label: label.clone(),
-                        value: value.clone(),
-                        field: field.clone(),
-                        options: options.clone(),
-                    });
-                    *y += 30.0;
-                }
-                Widget::Button {
-                    id,
-                    text,
-                    disabled,
-                    modal,
-                    sel,
-                    group,
-                } => {
-                    let bw = ((text.chars().count() as f32) * 15.0 + 28.0).max(96.0);
-                    ops.push(POp::Button {
-                        rect: rect(x, *y, bw.min(w), 30.0),
-                        text: text.clone(),
-                        id: id.clone(),
-                        disabled: *disabled,
-                        modal: modal.clone(),
-                        sel: *sel,
-                        group: group.clone(),
-                    });
-                    *y += 38.0;
-                }
-                Widget::Table {
-                    headers,
-                    rows,
-                    ids,
-                    actions,
-                    group,
-                    onselect,
-                    ..
-                } => {
-                    let shown: Vec<Vec<String>> =
-                        rows.iter().take(PV_TABLE_MAX_ROWS).cloned().collect();
-                    // `ids` 的契约是"与 rows 平行"（见 `POp::Table` 那一句），而命中测试按
-                    // `ids.len()` 一路往下摆行矩形 ⇒ 从前只截 rows、ids 整份交回，表格下方
-                    // 那片空白和排在后面的按钮就被读成"选了第 7、8… 行"：写回一个屏上没有的
-                    // id（`onselect` 还会让插件按它刷新），并把那次点击吞掉。
-                    let shown_ids: Vec<String> =
-                        ids.iter().take(PV_TABLE_MAX_ROWS).cloned().collect();
-                    let h = PV_TABLE_HEAD_H + shown.len() as f32 * PV_TABLE_ROW_H;
-                    // 有行内操作时，右侧留出按钮列，数据列相应收窄
-                    let mut buttons: Vec<(D2D_RECT_F, String, String)> = Vec::new();
-                    let mut reserve = 0.0f32;
-                    if !actions.is_empty() {
-                        let bw = actions
-                            .iter()
-                            .map(|(_, l)| (l.chars().count() as f32 * 14.0 + 16.0).max(44.0))
-                            .sum::<f32>()
-                            + (actions.len() as f32 - 1.0) * 6.0
-                            + 12.0;
-                        reserve = bw;
-                        for (ri, _) in shown.iter().enumerate() {
-                            let rid = shown_ids.get(ri).cloned().unwrap_or_default();
-                            let mut bx = x + w - 6.0;
-                            for (prefix, label) in actions.iter().rev() {
-                                let bw = (label.chars().count() as f32 * 14.0 + 16.0).max(44.0);
-                                bx -= bw;
-                                let by = *y + PV_TABLE_HEAD_H + ri as f32 * PV_TABLE_ROW_H + 1.0;
-                                buttons.push((
-                                    rect(bx, by, bw, 18.0),
-                                    format!("{prefix}{rid}"),
-                                    label.clone(),
-                                ));
-                                bx -= 6.0;
-                            }
+            emit(widget, x, w, y, ops, plugin_sel);
+        }
+    }
+
+    /// 排一个控件。整列与 `row` 里共用这一份：横排时调用方把宽度缩到这一格的自然宽，
+    /// 于是画与命中仍然读同一份矩形（`POp` 的 `rect` 是两边唯一的尺子）。
+    fn emit(
+        widget: &Widget,
+        x: f32,
+        w: f32,
+        y: &mut f32,
+        ops: &mut Vec<POp>,
+        plugin_sel: &HashMap<String, Vec<String>>,
+    ) {
+        match widget {
+            Widget::Heading(t) => {
+                ops.push(POp::Heading {
+                    rect: rect(x, *y, w, 24.0),
+                    text: t.clone(),
+                });
+                *y += 30.0;
+            }
+            Widget::Label(t) => {
+                ops.push(POp::Label {
+                    rect: rect(x, *y, w, 20.0),
+                    text: t.clone(),
+                });
+                *y += 22.0;
+            }
+            Widget::KeyValue(k, v) => {
+                ops.push(POp::Kv {
+                    rect: rect(x, *y, w, 20.0),
+                    key: k.clone(),
+                    value: v.clone(),
+                });
+                *y += 22.0;
+            }
+            Widget::Separator => {
+                ops.push(POp::Sep {
+                    rect: rect(x, *y + 8.0, w, 1.0),
+                });
+                *y += 18.0;
+            }
+            Widget::TextArea(t) => {
+                let lines = t.lines().count().clamp(1, 5) as f32;
+                ops.push(POp::Body {
+                    rect: rect(x, *y, w, lines * 18.0),
+                    text: t.clone(),
+                });
+                *y += lines * 18.0 + 8.0;
+            }
+            Widget::TextInput {
+                field,
+                label,
+                value,
+            } => {
+                ops.push(POp::Field {
+                    rect: rect(x, *y, w, 26.0),
+                    label: label.clone(),
+                    value: value.clone(),
+                    field: field.clone(),
+                });
+                *y += 30.0;
+            }
+            Widget::Select {
+                field,
+                label,
+                value,
+                options,
+                ..
+            } => {
+                ops.push(POp::Select {
+                    rect: rect(x, *y, w, 26.0),
+                    label: label.clone(),
+                    value: value.clone(),
+                    field: field.clone(),
+                    options: options.clone(),
+                });
+                *y += 30.0;
+            }
+            Widget::Button {
+                id,
+                text,
+                disabled,
+                modal,
+                sel,
+                group,
+            } => {
+                let bw = pv_button_width(text, w);
+                ops.push(POp::Button {
+                    rect: rect(x, *y, bw, 30.0),
+                    text: text.clone(),
+                    id: id.clone(),
+                    disabled: *disabled,
+                    modal: modal.clone(),
+                    sel: *sel,
+                    group: group.clone(),
+                });
+                *y += 38.0;
+            }
+            Widget::Table {
+                headers,
+                rows,
+                ids,
+                actions,
+                group,
+                onselect,
+                ..
+            } => {
+                let shown: Vec<Vec<String>> =
+                    rows.iter().take(PV_TABLE_MAX_ROWS).cloned().collect();
+                // `ids` 的契约是"与 rows 平行"（见 `POp::Table` 那一句），而命中测试按
+                // `ids.len()` 一路往下摆行矩形 ⇒ 从前只截 rows、ids 整份交回，表格下方
+                // 那片空白和排在后面的按钮就被读成"选了第 7、8… 行"：写回一个屏上没有的
+                // id（`onselect` 还会让插件按它刷新），并把那次点击吞掉。
+                let shown_ids: Vec<String> = ids.iter().take(PV_TABLE_MAX_ROWS).cloned().collect();
+                let h = PV_TABLE_HEAD_H + shown.len() as f32 * PV_TABLE_ROW_H;
+                // 有行内操作时，右侧留出按钮列，数据列相应收窄
+                let mut buttons: Vec<(D2D_RECT_F, String, String)> = Vec::new();
+                let mut reserve = 0.0f32;
+                if !actions.is_empty() {
+                    let bw = actions
+                        .iter()
+                        .map(|(_, l)| (l.chars().count() as f32 * 14.0 + 16.0).max(44.0))
+                        .sum::<f32>()
+                        + (actions.len() as f32 - 1.0) * 6.0
+                        + 12.0;
+                    reserve = bw;
+                    for (ri, _) in shown.iter().enumerate() {
+                        let rid = shown_ids.get(ri).cloned().unwrap_or_default();
+                        let mut bx = x + w - 6.0;
+                        for (prefix, label) in actions.iter().rev() {
+                            let bw = (label.chars().count() as f32 * 14.0 + 16.0).max(44.0);
+                            bx -= bw;
+                            let by = *y + PV_TABLE_HEAD_H + ri as f32 * PV_TABLE_ROW_H + 1.0;
+                            buttons.push((
+                                rect(bx, by, bw, 18.0),
+                                format!("{prefix}{rid}"),
+                                label.clone(),
+                            ));
+                            bx -= 6.0;
                         }
                     }
-                    ops.push(POp::Table {
-                        rect: rect(x, *y, w, h),
-                        headers: headers.clone(),
-                        rows: shown,
-                        buttons,
-                        column_w: w - reserve,
-                        ids: shown_ids,
-                        group: group.clone(),
-                        onselect: onselect.clone(),
-                        sel: plugin_sel.get(group.as_str()).cloned().unwrap_or_default(),
-                    });
-                    *y += h + 6.0;
                 }
-                Widget::Pager {
-                    page, pages, total, ..
-                } => {
-                    ops.push(POp::Label {
-                        rect: rect(x, *y, w, 18.0),
-                        text: format!("第 {page} / {pages} 页 · 共 {total} 条"),
-                    });
-                    *y += 22.0;
-                }
-                Widget::Chart {
-                    kind,
-                    labels,
-                    points,
-                } => {
-                    ops.push(POp::Chart {
-                        rect: rect(x, *y, w, PV_CHART_H),
-                        kind: kind.clone(),
-                        labels: labels.clone(),
-                        points: points.clone(),
-                    });
-                    *y += PV_CHART_H + 8.0;
-                }
-                Widget::Row { children } => {
-                    // 横向容器先按纵向堆（子控件宽度有限，硬拆列反而更难读）。
-                    walk(children, x, w, y, ops, plugin_sel);
-                }
-                Widget::ModalForm { .. } => {
-                    // 弹窗不再按普通控件排在正文里：`draw_plugin_modal` 把它画成整屏遮罩上
-                    // 的一张卡片（点在按钮上会设 `pv_modal`，插件自己 `open=true` 的直接开）。
-                    // 留出 0 高度，正文不会因为它多一块空白。
-                }
+                ops.push(POp::Table {
+                    rect: rect(x, *y, w, h),
+                    headers: headers.clone(),
+                    rows: shown,
+                    buttons,
+                    column_w: w - reserve,
+                    ids: shown_ids,
+                    group: group.clone(),
+                    onselect: onselect.clone(),
+                    sel: plugin_sel.get(group.as_str()).cloned().unwrap_or_default(),
+                });
+                *y += h + 6.0;
             }
+            Widget::Pager {
+                page,
+                pages,
+                total,
+                prev_id,
+                next_id,
+            } => {
+                // 分页条 = 一句读数 + 两颗按钮。从前只画了那句读数、把 `prev`/`next`
+                // 直接丢掉：协议带着两个动作 id，屏上却一颗都点不到（记账本翻不了页，
+                // 每页只能看到开头那几行）。到首页/末页时按钮画成禁用，点了不发动作 ——
+                // 交给插件去夹也行，但"点了没反应"与"这一头已经没有下一页"是两件事。
+                ops.push(POp::Label {
+                    rect: rect(x, *y + 5.0, PV_PAGER_LABEL_W, 18.0),
+                    text: format!("第 {page} / {pages} 页 · 共 {total} 条"),
+                });
+                let mut bx = x + PV_PAGER_LABEL_W + PV_ROW_GAP;
+                let at_start = *page <= 1;
+                let at_end = *page >= *pages;
+                for (id, label, disabled) in
+                    [(prev_id, "上一页", at_start), (next_id, "下一页", at_end)]
+                {
+                    if id.is_empty() {
+                        continue;
+                    }
+                    ops.push(POp::Button {
+                        rect: rect(bx, *y, PV_PAGER_BTN_W, 28.0),
+                        text: label.to_string(),
+                        id: id.clone(),
+                        disabled,
+                        modal: None,
+                        sel: false,
+                        group: String::new(),
+                    });
+                    bx += PV_PAGER_BTN_W + 8.0;
+                }
+                *y += 34.0;
+            }
+            Widget::Chart {
+                kind,
+                labels,
+                points,
+            } => {
+                ops.push(POp::Chart {
+                    rect: rect(x, *y, w, PV_CHART_H),
+                    kind: kind.clone(),
+                    labels: labels.clone(),
+                    points: points.clone(),
+                });
+                *y += PV_CHART_H + 8.0;
+            }
+            Widget::Row { children } => {
+                // 横排：按每个子控件的自然宽度从左往右摆，放不下就换行。
+                // 从前这里是"先按纵向堆"—— 作者写的一整排按钮与筛选框于是各占一行：
+                // 记账本那 8 颗操作按钮排成了八个单行，查询栏的五格也各占一行。
+                let mut cx = x;
+                let mut line_top = *y;
+                let mut line_h = 0.0f32;
+                for child in children {
+                    let cw = row_child_width(child, w);
+                    if cx > x + 0.01 && cx + cw > x + w + 0.01 {
+                        *y = line_top + line_h + PV_ROW_GAP;
+                        cx = x;
+                        line_top = *y;
+                        line_h = 0.0;
+                    }
+                    let mut cy = line_top;
+                    emit(child, cx, cw, &mut cy, ops, plugin_sel);
+                    line_h = line_h.max(cy - line_top);
+                    cx += cw + PV_ROW_GAP;
+                }
+                *y = line_top + line_h + PV_ROW_GAP;
+            }
+            Widget::ModalForm { .. } => {
+                // 弹窗不再按普通控件排在正文里：`draw_plugin_modal` 把它画成整屏遮罩上
+                // 的一张卡片（点在按钮上会设 `pv_modal`，插件自己 `open=true` 的直接开）。
+                // 留出 0 高度，正文不会因为它多一块空白。
+            }
+        }
+    }
+
+    /// 横排时一个子控件占多宽：按钮按文字量、输入框/下拉按值框那套固定几何，
+    /// 其余（标题/表格/图/嵌套 row）要整行 —— 它们本来就没有"半行"这一档画法。
+    fn row_child_width(widget: &Widget, avail: f32) -> f32 {
+        match widget {
+            Widget::Button { text, .. } => pv_button_width(text, avail),
+            Widget::TextInput { .. } | Widget::Select { .. } => PV_FIELD_W.min(avail),
+            _ => avail,
         }
     }
 
@@ -15034,12 +15123,14 @@ mod plugin_sel_tests {
     /// 从没看见的 id（`onselect` 还会让插件按它刷新），同时把那次点击吞掉，按钮不再响应。
     #[test]
     fn a_table_with_more_rows_than_drawn_has_no_invisible_hit_rows() {
+        // 夹具必须**超过**上限，否则这条只剩"ids 与 rows 一样长"，截断那一半没人守。
+        let over = PV_TABLE_MAX_ROWS + 3;
         let view = focusflow_core::plugins::PluginView {
             title: "夹具".to_string(),
             widgets: vec![focusflow_core::plugins::Widget::Table {
                 headers: vec!["名".to_string()],
-                rows: (0..9).map(|i| vec![format!("行{i}")]).collect(),
-                ids: (0..9).map(|i| format!("id{i}")).collect(),
+                rows: (0..over).map(|i| vec![format!("行{i}")]).collect(),
+                ids: (0..over).map(|i| format!("id{i}")).collect(),
                 actions: vec![],
                 group: "g".to_string(),
                 onselect: "picked".to_string(),
@@ -15052,6 +15143,11 @@ mod plugin_sel_tests {
         else {
             panic!("夹具那张表没走到 POp::Table，实得 {} 项", ops.len());
         };
+        assert_eq!(
+            rows.len(),
+            PV_TABLE_MAX_ROWS,
+            "超过上限的行该被截掉（夹具本来就超过上限）"
+        );
         assert_eq!(
             ids.len(),
             rows.len(),
@@ -15483,32 +15579,163 @@ mod pager_shape_tests {
     use super::*;
     use focusflow_core::plugins::{PluginView, Widget};
 
-    /// 分页条的**现状读数**：协议带着 `prev_id` / `next_id`，而 `plugin_view_ops` 把整个
-    /// `Pager` 折成一条 `POp::Label`。标签不在 `on_click` 认的那四条臂（Button / Table /
-    /// Select / Field）里，所以这一行结构上就点不动 —— 旧 WebView 那对「上一页/下一页」没了。
-    /// 接上 Pager 的那天这条要**先红**，红了之后把它改成"点下一页真的换页"的判据。
-    #[test]
-    fn the_pager_bar_is_one_label_row_and_nothing_clickable() {
+    fn pager_ops(page: i64, pages: i64, prev: &str, next: &str) -> Vec<POp> {
         let view = PluginView {
             title: "shape".to_string(),
             widgets: vec![Widget::Pager {
-                page: 2,
-                pages: 3,
+                page,
+                pages,
                 total: 12,
-                prev_id: "pg_prev".to_string(),
-                next_id: "pg_next".to_string(),
+                prev_id: prev.to_string(),
+                next_id: next.to_string(),
             }],
         };
-        let ops = plugin_view_ops(&view, rect(0.0, 0.0, 800.0, 600.0), 0.0, &HashMap::new());
-        assert_eq!(ops.len(), 1, "分页条今天只产出一条控件");
+        plugin_view_ops(&view, rect(0.0, 0.0, 800.0, 600.0), 0.0, &HashMap::new())
+    }
+
+    fn pager_buttons(ops: &[POp]) -> Vec<(&str, bool, D2D_RECT_F)> {
+        ops.iter()
+            .filter_map(|op| match op {
+                POp::Button {
+                    id, disabled, rect, ..
+                } => Some((id.as_str(), *disabled, *rect)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 分页条必须是「一句读数 + 两颗真按钮」：`prev` / `next` 是插件声明的动作 id，
+    /// 从前整条被折成一条惰性标签（协议里的两个 id 被直接丢掉），记账本于是翻不了页。
+    #[test]
+    fn the_pager_bar_turns_the_declared_ids_into_clickable_buttons() {
+        let ops = pager_ops(2, 3, "pg_prev", "pg_next");
+        assert_eq!(ops.len(), 3, "一条读数 + 两颗按钮，实得 {} 条", ops.len());
         match &ops[0] {
             POp::Label { text, .. } => {
                 assert!(text.contains("2 / 3"), "页码要在这一行里：{text}");
                 assert!(text.contains("12"), "总条数要在这一行里：{text}");
             }
-            // 标签之外的任何一种都能被 `on_click` 命中：说明 Pager 接上了。
-            _ => panic!("分页条不再是纯标签，这条读数该改成新判据"),
+            _ => panic!("分页条第一格该是读数（POp::Label），不是别的控件"),
         }
+        let buttons = pager_buttons(&ops);
+        let ids: Vec<&str> = buttons.iter().map(|(id, ..)| *id).collect();
+        assert_eq!(ids, ["pg_prev", "pg_next"], "按钮要照插件声明的 id 发动作");
+        assert!(
+            buttons.iter().all(|(_, disabled, _)| !disabled),
+            "第 2 / 3 页两头都能翻，不该有禁用"
+        );
+        // 读数与按钮同一行，按钮从左往右排在读数右边（不是各占一行）。
+        let label_top = match &ops[0] {
+            POp::Label { rect, .. } => rect.top,
+            _ => unreachable!(),
+        };
+        assert!(
+            buttons
+                .iter()
+                .all(|(_, _, r)| (r.top - label_top).abs() < 12.0),
+            "按钮与读数不在同一行：{:?}",
+            buttons.iter().map(|(_, _, r)| r.top).collect::<Vec<_>>()
+        );
+        assert!(
+            buttons[0].2.left < buttons[1].2.left,
+            "上一页该在下一页左边"
+        );
+    }
+
+    /// 首页的「上一页」、末页的「下一页」画成禁用（点了不发动作）；
+    /// 插件没给那一侧 id 时干脆不画 —— 三档不许折成同一颗可点的按钮。
+    #[test]
+    fn the_pager_buttons_go_inert_at_the_bounds_and_absent_when_unnamed() {
+        let first_ops = pager_ops(1, 3, "pg_prev", "pg_next");
+        let first = pager_buttons(&first_ops);
+        assert_eq!(first.len(), 2);
+        assert!(first[0].1, "首页的「上一页」要禁用");
+        assert!(!first[1].1, "首页的「下一页」该能点");
+
+        let last_ops = pager_ops(3, 3, "pg_prev", "pg_next");
+        let last = pager_buttons(&last_ops);
+        assert!(!last[0].1, "末页的「上一页」该能点");
+        assert!(last[1].1, "末页的「下一页」要禁用");
+
+        let next_only_ops = pager_ops(2, 3, "", "pg_next");
+        let only_next = pager_buttons(&next_only_ops);
+        assert_eq!(only_next.len(), 1, "没给 prev 的那一侧不画按钮");
+        assert_eq!(only_next[0].0, "pg_next");
+    }
+
+    /// `row` 是横排：子控件从左往右排在同一行；放不下时换到下一行（而不是压在一起）。
+    ///
+    /// 这一条对应的是屏上那一片「每个按钮各占一行」——布局不再把 `row` 当纵向堆。
+    #[test]
+    fn a_row_puts_its_children_side_by_side_and_wraps_when_the_line_is_full() {
+        let child = |text: &str, id: &str| Widget::Button {
+            id: id.to_string(),
+            text: text.to_string(),
+            disabled: false,
+            modal: None,
+            sel: false,
+            group: String::new(),
+        };
+        let view = PluginView {
+            title: "row".to_string(),
+            widgets: vec![Widget::Row {
+                children: vec![
+                    child("甲", "a"),
+                    child("乙", "b"),
+                    Widget::Select {
+                        field: "f".to_string(),
+                        label: "分类".to_string(),
+                        value: "全部".to_string(),
+                        options: vec![],
+                        refresh: false,
+                    },
+                ],
+            }],
+        };
+        let wide = plugin_view_ops(&view, rect(0.0, 0.0, 1000.0, 600.0), 0.0, &HashMap::new());
+        let tops: Vec<f32> = wide.iter().map(|op| op.bounds().top).collect();
+        let lefts: Vec<f32> = wide.iter().map(|op| op.bounds().left).collect();
+        assert_eq!(wide.len(), 3, "三个子控件都该排出来");
+        assert!(
+            tops.iter().all(|t| (t - tops[0]).abs() < 0.01),
+            "同一行必须同一高度：{tops:?}"
+        );
+        assert!(
+            lefts[0] < lefts[1] && lefts[1] < lefts[2],
+            "从左往右排：{lefts:?}"
+        );
+        // 输入框那一格要占住自己那 406 px（标签 140 + 值框 260），否则会压到隔壁身上。
+        let field_w = wide[2].bounds().right - wide[2].bounds().left;
+        assert!(
+            (field_w - PV_FIELD_W).abs() < 0.01,
+            "下拉那一格宽度是 {field_w}，应是 {PV_FIELD_W}"
+        );
+
+        // 窄窗：第三格放不下就换行，前两格仍同一行。
+        let narrow = plugin_view_ops(&view, rect(0.0, 0.0, 300.0, 600.0), 0.0, &HashMap::new());
+        assert_eq!(narrow.len(), 3);
+        let n_tops: Vec<f32> = narrow.iter().map(|op| op.bounds().top).collect();
+        assert!(
+            (n_tops[0] - n_tops[1]).abs() < 0.01 && n_tops[2] > n_tops[1] + 1.0,
+            "窄窗里第三格该换行：{n_tops:?}"
+        );
+    }
+
+    /// 表格行数上限不许小于随包记账本一页的条数：上限更小时每页后几条永远不会画出来，
+    /// 而分页条的 `total` 照旧把它们算进去 —— 翻到哪一页都看不全。
+    #[test]
+    fn the_table_row_cap_does_not_hide_a_page_of_the_ledger() {
+        let lua = include_str!("../../crates/core/plugins/accounting_plugin.lua");
+        let page_size = lua
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("local PAGE_SIZE = "))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .expect("记账本里那行 `local PAGE_SIZE = N` 找不到了：这条判据失去锚点");
+        assert!(
+            PV_TABLE_MAX_ROWS >= page_size,
+            "表格最多画 {PV_TABLE_MAX_ROWS} 行，而记账本每页 {page_size} 条：每页有 {} 条永远看不到",
+            page_size.saturating_sub(PV_TABLE_MAX_ROWS)
+        );
     }
 }
 

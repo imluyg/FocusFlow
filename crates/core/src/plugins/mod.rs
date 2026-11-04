@@ -80,6 +80,10 @@ pub enum Widget {
     /// 只读文本行（键值对）
     KeyValue(String, String),
     /// 表格（表头 + 行）
+    ///
+    /// 面板里没有表格内滚动：宿主只画得下开头那些行，多出来的那些这次不出现。要翻页请
+    /// 自己切页并配一个 `Pager` —— 只给 `total` 而不翻页的话，用户看到的是"共 N 条"
+    /// 而列表里永远只有一页。
     Table {
         headers: Vec<String>,
         rows: Vec<Vec<String>>,

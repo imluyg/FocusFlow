@@ -21,13 +21,12 @@
     "/ pg_probe" and "/ pg_after"      -- a real pixel click reached the opened view
 
   It also opens the fixture view with real pixel clicks and reads the pager bar back:
-  Widget::Pager currently renders as one inert label row (the renderer drops the
-  declared prev/next ids), so clicking across that row must fire nothing. That readout
-  is a BASELINE for the day the Pager gets its buttons -- it is supposed to fail then,
-  and to be rewritten to assert the new shape. Three controls stand in front of it
-  (the window client size the hardcoded rows assume, and the two plain buttons directly
-  above and below the pager row): with any of them red the readout reports NOT MEASURED
-  instead of passing for the wrong reason.
+  Widget::Pager draws its declared prev/next ids as real buttons, so a pixel click on
+  "next" must fire "/ pg_next", while "prev" is disabled on the first page and must
+  fire nothing. Four controls stand in front of that readout (the window client size
+  the hardcoded rows assume, the two plain buttons above and below the pager band, and
+  the next click itself): with any of them red the inert-prev readout reports
+  NOT MEASURED instead of passing for the wrong reason.
   ASCII-only, like every file in this folder.
 
 .EXAMPLE
@@ -127,16 +126,13 @@ Check 'the group name came from the Lua table' (@($log | Where-Object { $_ -matc
 Check 'onselect wrote the declared plugin field' (@($log | Where-Object { $_ -match 'f_pick = ' }).Count -gt 0)
 Check 'the sel button composed <button id><record id>' (@($log | Where-Object { $_ -like '*/ touch_r1*' }).Count -gt 0)
 
-# ---- pager readout -------------------------------------------------------
-# Today Widget::Pager becomes ONE inert POp::Label: the renderer never reads the
-# pager's prev/next ids (desktop-native/src/main.rs:5937-5947), so the bar shows
-# "page x / y" and nothing in that row can be clicked. The old WebView bar had two
-# buttons. These three checks pin that shape on purpose: wiring the Pager must turn
-# the row click into a real action and this readout red, then be rewritten to assert
-# the new behaviour. Coordinates are the client rows of the opened fixture view at
-# 100% DPI (content starts at y=260; a plain button row is 38 tall, the label row 22).
-# Since the native caption was removed the client area is the whole 1200x860 window;
-# top-anchored coordinates below are unchanged, only the bottom edge moved down.
+# ---- pager ---------------------------------------------------------------
+# Widget::Pager draws the declared prev/next ids as real buttons now (it used to be
+# one inert label row). Coordinates are the client rows of the opened fixture view at
+# 100% DPI (content starts at y=260; a plain button row is 38 tall, the pager band is
+# 34 tall: label then 上一页/下一页, then the row below). Since the native caption was
+# removed the client area is the whole 1200x860 window; top-anchored coordinates below
+# are unchanged, only the bottom edge moved down.
 Click-ViewTab $h 4
 [FF]::ClickWindow($h, 200, 270, 1)          # the only plugin row = SelFixture: open its view
 Start-Sleep -Milliseconds 600
@@ -146,25 +142,26 @@ Check 'the click coordinates address the rows they name' ([bool]$sizeOk) ("clien
 [FF]::ClickWindow($h, 90, 275, 1)           # row 1: a plain button, must fire
 $probeLive = Wait-FixLog '/ pg_probe'
 Check 'the opened view takes a pixel click on a button' ([bool]$probeLive) ''
-[FF]::ClickWindow($h, 90, 335, 1)           # row 3: lands right below the pager row
+[FF]::ClickWindow($h, 90, 345, 1)           # row 3: below the 34 px pager band
 $afterLive = Wait-FixLog '/ pg_after'
-Check 'the pager row takes one label row of height' ([bool]$afterLive) ''
-foreach ($px in 45, 600, 1150) {            # across the whole pager row band
-    [FF]::ClickWindow($h, $px, 307, 1)
-}
-Start-Sleep -Milliseconds 1200
+Check 'the pager band leaves the next row reachable' ([bool]$afterLive) ''
+[FF]::ClickWindow($h, 350, 312, 1)          # pager: 下一页 (enabled on page 1 / 3)
+$nextLive = Wait-FixLog '/ pg_next'
+Check 'the pager next button fires the declared id' ([bool]$nextLive) ''
+[FF]::ClickWindow($h, 270, 312, 1)          # pager: 上一页 (disabled on page 1)
+Start-Sleep -Milliseconds 800
 $afterPager = @(Get-FixLog)
-$inert = -not (@($afterPager | Where-Object { $_ -match '/ pg_prev|/ pg_next' }))
-# This readout only means something while the three controls above hold: a row where
-# nothing is clickable and a window whose coordinates never landed both read as "no action".
-if (-not ($sizeOk -and $probeLive -and $afterLive)) {
+$prevFired = @($afterPager | Where-Object { $_ -match '/ pg_prev' }).Count -gt 0
+# The inert-prev readout only means something while every control above held: a dead
+# band and a window whose coordinates never landed both read as "no action".
+if (-not ($sizeOk -and $probeLive -and $afterLive -and $nextLive)) {
     $pagerDetail = 'NOT MEASURED: a click control above was red, so nothing reached this view'
-} elseif ($inert) {
-    $pagerDetail = '3 clicks across the row: no action reached the plugin'
+} elseif ($prevFired) {
+    $pagerDetail = 'the disabled prev button fired an action on the first page'
 } else {
-    $pagerDetail = 'the pager row fired an action: the Pager has buttons now, rewrite this baseline'
+    $pagerDetail = 'prev is inert on page 1 while next fired'
 }
-Check 'the pager row fires no prev/next action yet' ([bool]($sizeOk -and $probeLive -and $afterLive -and $inert)) $pagerDetail
+Check 'the pager prev button is inert on the first page' ([bool]($sizeOk -and $probeLive -and $afterLive -and $nextLive -and (-not $prevFired))) $pagerDetail
 
 Check 'nothing was skipped for want of a selection' (-not (@($afterPager | Where-Object { $_ -match 'sel-skip' }))) ''
 Check 'no error lines in the app log' (-not (@($afterPager) -match "(?i)error|$(Get-FailWord)")) ''
