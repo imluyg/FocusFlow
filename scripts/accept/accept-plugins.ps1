@@ -26,7 +26,8 @@ Stop-App
 $app = Join-Path $WorkDir 'app'
 New-AppDir $app @('[collector]', 'enabled = false')
 # The probe copy only carries its own plugins; add the shipped ones so accounting_plugin is there.
-# 落点是 plugins\builtin\：随包内置模块从程序目录的那一处加载（旧版平铺的 plugins\ 只当迁移源）。
+# The landing spot is app_dir\plugins\builtin\: shipped builtin modules load from the program
+# dir (a flat app_dir\plugins\ is only a migration source). Keep this file ASCII-only.
 $dst = Join-Path $app 'plugins\builtin'
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 # The shipped copy lives with the core crate; the repo-root plugins/ twin was deleted by name
@@ -53,7 +54,8 @@ if ($h -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
 
 Click-ViewTab $h 4
 Start-Sleep -Milliseconds 600
-[FF]::ClickWindow($h, 200, 270, 1)     # first row = accounting_plugin
+# First row under the "builtin" section header: list_top 252 + one header row (46) => 298..340.
+[FF]::ClickWindow($h, 200, 320, 1)     # first row = accounting_plugin
 Start-Sleep -Milliseconds 600
 $shot = Join-Path $WorkDir 'plugin-view.png'
 Check 'plugin view renders' (Save-WindowShot $h $shot) $shot

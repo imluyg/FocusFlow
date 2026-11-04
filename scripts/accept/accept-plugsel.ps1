@@ -49,7 +49,8 @@ $logPath = Join-Path $WorkDir 'focusflow.log'
 "exe : $Exe"
 Stop-App
 New-AppDir $app @('[collector]', 'enabled = false')
-# 用户自己装的脚本插件从数据目录那一处进清单（data\plugins\），这份夹具就走那一条路。
+# A user-installed script plugin enters the list from the data dir (data\plugins\); this
+# fixture takes that path. Keep this file ASCII-only.
 $dst = Join-Path $app 'data\plugins'
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 

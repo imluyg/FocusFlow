@@ -32,6 +32,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-snip.p
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-report.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-pin.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-installer.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-install.ps1
 ```
 
 每个脚本逐条打印 `PASS` / `FAIL`，最后一行 `---- N checks, M failed ----`，有失败时退出码 1。
@@ -45,14 +46,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 | `accept-theme.ps1` | 深色 16 张 + 浅色 16 张逐视图截图 / 设置页「主题」行当场切换 / 行内 `EDIT` 背景色随主题（取主色，浅色 246,249,255、深色 31,40,59） | 10 项 |
 | `accept-ui.ps1` | 不透明档卡片有落影、卡内没被染灰 / 深色不画阴影但有顶部高光 / 空闲药丸悬停变色 / 药丸与页签是手型、空白是箭头 / 下划线宽度跟文字（四字页签 53 px vs 两字 26 px）/ **自绘标题栏**：标题带 `HTCAPTION`、关闭键 `HTCLIENT` 且悬停变红、左边缘 `HTLEFT`、最大化后客户区变大、还原回 1200×860、最小化/恢复 | 25 项 |
 | `accept-collect.ps1` | 点 5 下 → 今日 +5、速度 >0 / 暂停后不再涨、速度归 0 / 继续再 +5 / 退出 flush + 退出备份 / core 日志「数据库已关闭」 | 14 项 |
-| `accept-plugins.ps1` | 插件视图：`button.modal` 开弹窗、弹窗与正文的 Select 写回、提交/关闭触发插件动作、Esc 关弹窗 | 11 项 |
+| `accept-plugins.ps1` | 插件视图：`button.modal` 开弹窗、弹窗与正文的 Select 写回、提交/关闭触发插件动作、Esc 关弹窗 | 16 项 |
 | `accept-hotkey.ps1` | 两轮启动：配置里的三条组合按原样注册（日志逐字对）/ 一条写成裸键时程序照样起、日志点名被拒的那条、没被拒的那条照样注册 | 10 项 |
 | `accept-datadir.ps1` | 两轮启动：`[paths]` 里那条待搬运标记由启动早期兑现（data/ 与 backup/ 真到了新根、旧根清空、标记归空、日志点名新根）/ 新根建不出来时数据原地不动、标记留着下次重试 | 13 项 |
-| `accept-plugsel.ps1` | 自带一份 ASCII 小插件（分组表格 + `onselect` + `sel` 按钮）：Lua 里的 ids/group/onselect 真的走到宿主、选中写了声明的那个字段、`sel` 按钮拼出 `<按钮 id><记录 id>` | 10 项 |
+| `accept-plugsel.ps1` | 自带一份 ASCII 小插件（分组表格 + `onselect` + `sel` 按钮）：Lua 里的 ids/group/onselect 真的走到宿主、选中写了声明的那个字段、`sel` 按钮拼出 `<按钮 id><记录 id>` | 14 项 |
 | `accept-snip.ps1` | 用真注入的鼠标跑三条截图手势：拖框后快速版落 PNG / 标注版开窗不落盘、Esc 关掉；**单击选中光标下那个别人的窗口**（夹具是本脚本自己的一个 Form，产品必须排掉自己进程，选错了 PNG 尺寸就对不上）；**覆盖层挂满三分钟自己退**（这一条真等，见坑 7） | 21 项（含一条 180 秒的等待） |
 | `accept-report.ps1` | 两轮启动：缺的那份上周周报由启动补上（文件名 `weekly-<上周一>.md`、有内容）/ 第二次启动看见已有文件就不动（时间戳不变） | 10 项 |
 | `accept-pin.ps1` | 两轮：合成贴图开/收（`0x8000+12` 开 N 张、`0x8000+13` 全关）数得到窗口与尺寸、**退路一条条真按**（Esc 关单张 / 注入右键关单张 / Alt+F4 组合键关单张 / 全关后归零，另加"样式里没有标题栏⇒旧版那个 ✕ 在原生不存在"和"是 toolwindow⇒不进 Alt+Tab"两条读数）、**滚轮一格放大 10%（120×80→132×88）且连滚 20 格停在 1/4 而不是 0**、**贴图全程不多落一个 PNG**；第二轮走真手势（拖框 → 标注 → `P`）验**贴图正落在选区原位**、一次手势只写一个文件、贴到第 12 张为止且第 13 张被拒并说明原因，末尾打一行内存读数（不是判据） | 29 项 |
 | `accept-installer.ps1` | 静默装 → 目录/卸载器/快捷方式/注册表/版本号/exe 图标 → **exe 自己带版本资源**（`FileVersion` 非空且与 setup.exe 同一个数，缺了就等于右键属性一片空白）→ 装出来的 exe 默认在采集 → 静默卸 → 全部清干净 | 19 项 |
+| `accept-install.ps1` | 插件包的页面安装/卸载：自己用 `focusflow-plugin pack` 打夹具包（读手只认 STORED zip）→ 点「安装插件包…」→ 包落进 `data/plugins/`、`meta.json` 的 `content_hash` 与包字节逐字对上 → 行上「详情」打开详情页 → 「卸载…」过确认框 → 「删除设置」→ 包与 `plugins/state/<stem>/` 都没了。前置：`cargo build --release -p focusflow-plugin-tool` | 17 项 |
 
 > **跑之前先看有没有别的原生实例在跑**：`already_running()` 抢的是
 > `Global\FocusFlow.Native.P0` 这个互斥体，抢不到就把已有窗口叫出来自己退出 ——
