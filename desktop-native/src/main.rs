@@ -16,6 +16,7 @@ mod snip;
 
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -827,6 +828,13 @@ impl PluginRow {
     }
 }
 
+/// 卸载确认框要记住的东西：`name` 给人看，`stem` 用来真删。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UninstallPrompt {
+    stem: String,
+    name: String,
+}
+
 /// 插件页那一列从上到下的一格。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PluginSlot {
@@ -1024,6 +1032,10 @@ struct App {
     ///
     /// 存在这里而不是画的时候读盘：那一页每 100ms 被重画一次，读盘要在打开那一下。
     plugin_detail_source: Option<String>,
+    /// 这一格是不是通过安装进来的包（有安装记录才有包文件可卸）。
+    plugin_detail_installed: bool,
+    /// 卸载确认框（None = 没开）。
+    plugin_uninstall: Option<UninstallPrompt>,
     /// 上一拍开着的那一页（用来认出"关掉/换页"这一个转变）。
     ///
     /// 为什么不在三处关闭动作里各写一遍卸载：那三处迟早会漂移（本仓为"同一个手势的多个出口
@@ -1533,6 +1545,8 @@ impl App {
                 plugin_open: None,
                 plugin_detail_open: None,
                 plugin_detail_source: None,
+                plugin_detail_installed: false,
+                plugin_uninstall: None,
                 plugin_panel_was: None,
                 pv_scroll: 0,
                 pv_select: None,
@@ -1729,6 +1743,8 @@ impl App {
                 self.plugin_err.as_deref(),
                 self.plugin_detail_open.as_deref(),
                 self.plugin_detail_source.as_deref(),
+                self.plugin_detail_installed,
+                self.plugin_uninstall.as_ref(),
                 pv,
                 self.pv_scroll,
                 self.pv_select.as_ref(),
@@ -2104,6 +2120,21 @@ impl App {
         }
         if self.view == 4 {
             tracing_note(&format!("点击插件页 at ({x:.0},{y:.0})"));
+            // 卸载确认框开着：只认那三颗按钮（点遮罩不关，免得手一抖点到"删除设置"）。
+            if let Some(prompt) = self.plugin_uninstall.clone() {
+                let (_, buttons) = uninstall_prompt_geometry(w, h);
+                if hit(buttons[0], x, y) {
+                    self.finish_uninstall(hwnd, &prompt, false);
+                } else if hit(buttons[1], x, y) {
+                    self.finish_uninstall(hwnd, &prompt, true);
+                } else if hit(buttons[2], x, y) {
+                    self.plugin_uninstall = None;
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+                return;
+            }
             // 插件视图打开时：弹窗/下拉 → 返回 → 视图里的控件。
             if let Some(name) = self.plugin_open.clone() {
                 let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
@@ -2333,6 +2364,24 @@ impl App {
                     PluginPage::Detail(_)
                 ) {
                     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
+                    // 有安装记录的那一格右上角才有「卸载…」：与画它的条件同一个布尔值。
+                    if self.plugin_detail_installed && hit(detail_uninstall_rect(card), x, y) {
+                        if let Some(name) = self
+                            .plugin_rows
+                            .iter()
+                            .find(|r| r.stem == stem)
+                            .map(|r| r.name.clone())
+                        {
+                            self.plugin_uninstall = Some(UninstallPrompt {
+                                stem: stem.clone(),
+                                name,
+                            });
+                            unsafe {
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        }
+                        return;
+                    }
                     let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
                     if hit(back, x, y) {
                         self.close_plugin_detail(hwnd);
@@ -2342,6 +2391,13 @@ impl App {
                 // 那一格已经不在清单里了（文件被删/改名）：退回清单，让这一次点击按清单走。
                 self.plugin_detail_open = None;
                 self.plugin_detail_source = None;
+                self.plugin_detail_installed = false;
+            }
+            // 清单页右上角的安装入口。
+            let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
+            if hit(plugin_install_rect(card), x, y) {
+                self.install_plugin_package(hwnd);
+                return;
             }
             let (list_top, row_h, max_rows) = plugin_geom(w, h);
             // 命中读的是与画同一份格子表（[`plugin_slots`]）：表头占一格，
@@ -3330,6 +3386,65 @@ impl App {
     }
 
     /// 打开某个插件的视图：先让插件重算 get_view，再读缓存。
+    /// 选一份插件包并安装。
+    ///
+    /// 对话框与落盘都在后台线程（与导出那一条同一套）：`rfd` 的同步对话框会自己跑一个
+    /// 模态循环，摆到 GUI 线程上会让那扇 DComp 窗停在那儿等它。结果走 `ops` + `WM_OP_DONE`，
+    /// 与备份/导出共用同一条回执路 —— 那边会把这一页重扫一遍。
+    fn install_plugin_package(&mut self, hwnd: HWND) {
+        let hwnd_val = hwnd.0 as isize;
+        let ops = Arc::clone(&self.ops);
+        let spawned = std::thread::Builder::new()
+            .name("plugin-install".into())
+            .spawn(move || {
+                // 验收钩子：给了路径就不弹框（与 `FOCUSFLOW_EXPORT_PATH` 同一条约定）。
+                let picked = match std::env::var("FOCUSFLOW_INSTALL_PLUGIN") {
+                    Ok(p) => Some(PathBuf::from(p)),
+                    Err(_) => rfd::FileDialog::new()
+                        .set_title("安装插件包（.zip）")
+                        .add_filter("插件包", &["zip"])
+                        .pick_file(),
+                };
+                let line = match picked {
+                    None => "安装已取消（没有选中任何包）".to_string(),
+                    Some(path) => install_line(focusflow_core::plugins::install::install(&path)),
+                };
+                if let Ok(mut q) = ops.lock() {
+                    q.push(line);
+                }
+                let target = HWND(hwnd_val as *mut core::ffi::c_void);
+                let _ = unsafe { PostMessageW(Some(target), WM_OP_DONE, WPARAM(0), LPARAM(0)) };
+            });
+        if let Err(e) = spawned {
+            // 线程起不来也要留一句：否则按了按钮什么都没发生，而用户不知道"什么都没发生"。
+            self.status = Some(format!("安装没开始：后台线程起不来（{e}）"));
+            tracing_note(self.status.as_deref().unwrap_or(""));
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+    }
+
+    /// 卸载确认框上的一次选择：`purge == true` 才连设置一起删。
+    fn finish_uninstall(&mut self, hwnd: HWND, prompt: &UninstallPrompt, purge: bool) {
+        let line = uninstall_line(focusflow_core::plugins::install::uninstall(
+            &prompt.stem,
+            purge,
+        ));
+        self.plugin_uninstall = None;
+        // 那一格没了：详情页不能再停在那儿（它的「返回」还在，但底下那一行已经不存在）。
+        self.plugin_detail_open = None;
+        self.plugin_detail_source = None;
+        self.plugin_detail_installed = false;
+        self.status = Some(line.clone());
+        // ASCII 尾巴给验收脚本读（与详情/热重载那两句同一条约定）。
+        tracing_note(&format!("插件卸载：{line} uninstall_done=1"));
+        self.reload_plugins();
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
     /// 打开一格的详情页。
     ///
     /// **不加载插件**：详情读的是台账与清单，不是 VM 里的视图。所以这一条对停用的、
@@ -3341,7 +3456,10 @@ impl App {
         // 与视图互斥：屏上只有一张页，命中那一支也只认一个状态。
         self.plugin_open = None;
         self.plugin_detail_open = Some(stem.clone());
-        self.plugin_detail_source = Some(focusflow_core::plugins::install::source_line(&stem));
+        // 读一次安装记录，两个结论一起拿：那一句话，以及"这一格有没有包可卸"。
+        let meta = focusflow_core::plugins::install::meta_for(&stem);
+        self.plugin_detail_installed = focusflow_core::plugins::install::is_installed(&meta);
+        self.plugin_detail_source = Some(focusflow_core::plugins::install::source_line_of(&meta));
         // ASCII 尾巴给验收脚本读：主体是中文，脚本里嵌中文匹配会踩编码坑
         // （与热重载那一句同一条约定）。
         tracing_note(&format!("打开插件详情：{stem} detail_open=1"));
@@ -3355,6 +3473,8 @@ impl App {
             tracing_note("关掉插件详情 detail_open=0");
         }
         self.plugin_detail_source = None;
+        self.plugin_detail_installed = false;
+        self.plugin_uninstall = None;
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
@@ -5591,6 +5711,8 @@ fn draw_screen(
     // 详情页开着时的那一格（按 stem 找行；找不到就退回清单）
     plugin_detail: Option<&str>,
     plugin_detail_source: Option<&str>,
+    plugin_detail_installed: bool,
+    uninstall: Option<&UninstallPrompt>,
     plugin_view: Option<(&str, &focusflow_core::plugins::PluginView)>,
     pv_scroll: i32,
     pv_select: Option<&PvSelect>,
@@ -5748,7 +5870,15 @@ fn draw_screen(
             }
             PluginPage::Detail(row) => {
                 let detail = focusflow_core::plugins::plugin_health::detail_for(&row.stem);
-                draw_plugin_detail(p, w, h, row, plugin_detail_source, &detail);
+                draw_plugin_detail(
+                    p,
+                    w,
+                    h,
+                    row,
+                    plugin_detail_source,
+                    plugin_detail_installed,
+                    &detail,
+                );
             }
             PluginPage::List => draw_plugins(p, w, h, plugins, plugin_err, vs),
         },
@@ -5767,6 +5897,11 @@ fn draw_screen(
         if let Some(sel) = pv_select.filter(|s| s.plugin == name) {
             draw_select_menu(p, w, h, sel);
         }
+    }
+
+    // 卸载确认框也压在正文上：它开着时点击只认那三颗按钮。
+    if let Some(prompt) = uninstall {
+        draw_uninstall_prompt(p, w, h, prompt);
     }
 
     // 模态最后画：它压在所有东西上面。
@@ -8021,6 +8156,85 @@ fn plugin_detail_rect(row_right: f32, y: f32) -> D2D_RECT_F {
     rect(row_right - 76.0 - 66.0 - 66.0, y + 9.0, 58.0, 22.0)
 }
 
+/// 插件页右上角的「安装插件包…」按钮。画与命中读同一个表达式。
+fn plugin_install_rect(card: D2D_RECT_F) -> D2D_RECT_F {
+    rect(card.right - 16.0 - 132.0, card.top + 8.0, 132.0, 26.0)
+}
+
+/// 详情页右上角的「卸载…」按钮（只在有安装记录的那一档画）。
+fn detail_uninstall_rect(card: D2D_RECT_F) -> D2D_RECT_F {
+    rect(card.right - 16.0 - 88.0, card.top + 10.0, 88.0, 26.0)
+}
+
+/// 卸载确认框：框体 + 三颗按钮（左起：保留设置 / 删除设置 / 取消）。
+///
+/// 三颗按钮的宽度与间距写在这里一处 —— 画与命中都读它，错一位就是"点取消删了设置"。
+fn uninstall_prompt_geometry(w: f32, h: f32) -> (D2D_RECT_F, [D2D_RECT_F; 3]) {
+    let width = 460.0;
+    let height = 190.0;
+    let box_ = rect((w - width) / 2.0, (h - height) / 2.0, width, height);
+    let bw = 132.0;
+    let gap = 12.0;
+    let total = bw * 3.0 + gap * 2.0;
+    let left = box_.left + (width - total) / 2.0;
+    let y = box_.bottom - 16.0 - 28.0;
+    let buttons = [
+        rect(left, y, bw, 28.0),
+        rect(left + bw + gap, y, bw, 28.0),
+        rect(left + (bw + gap) * 2.0, y, bw, 28.0),
+    ];
+    (box_, buttons)
+}
+
+/// 安装那一次的结论那一句（纯函数：worker 线程拼好，GUI 只显示）。
+fn install_line(
+    result: std::result::Result<focusflow_core::plugins::install::Installed, String>,
+) -> String {
+    match result {
+        Err(e) => format!("安装失败：{e}"),
+        Ok(done) => {
+            let mut line = format!(
+                "{}：{}（{} 个文件，{} 字节）",
+                if done.replaced {
+                    "已更新"
+                } else {
+                    "已安装"
+                },
+                done.stem,
+                done.entries,
+                done.bytes
+            );
+            if done.problems > 0 {
+                line.push_str(&format!(
+                    "；校验器对这份包说了 {} 条问题（不阻塞安装）",
+                    done.problems
+                ));
+            }
+            line.push_str("；重启程序（或停用再启用）之后加载");
+            line
+        }
+    }
+}
+
+/// 卸载那一次的结论那一句。三档数据结局各说各的。
+fn uninstall_line(
+    result: std::result::Result<focusflow_core::plugins::install::Uninstalled, String>,
+) -> String {
+    use focusflow_core::plugins::install::StateAfter;
+    match result {
+        Err(e) => format!("卸载失败：{e}"),
+        Ok(done) => match done.state {
+            StateAfter::Kept(path) => format!(
+                "已卸载 {}（包已删除），设置还在 {}",
+                done.stem,
+                path.display()
+            ),
+            StateAfter::Purged => format!("已卸载 {}（包与设置都删了）", done.stem),
+            StateAfter::NeverExisted => format!("已卸载 {}（它没有留下设置目录）", done.stem),
+        },
+    }
+}
+
 fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>, vs: ViewState) {
     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
     p.card(card, R_CARD);
@@ -8044,14 +8258,23 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
         .trim()
         .parse::<u64>()
         .unwrap_or(16);
+    // 这一格的宽度：左边让给「插件」那两个字，右边让给安装按钮（148 + 12 的缝）。
+    // 目录路径的尾巴才是"到底在哪儿"，所以 `p.clip` 夹中间、两头都留。
+    let heading_w = card.right - card.left - 32.0 - 58.0 - 160.0;
     p.text(
-        // 目录路径的尾巴才是"到底在哪儿"，所以夹中间、两头都留（520 px 那格在长 profile
-        // 路径下会整句越界，而这块 UI 不裁切）。
-        &p.clip(&plugin_heading(rows, cap_mb, &dirs), &p.fmt.caption, 520.0),
-        rect(card.left + 58.0, card.top + 15.0, 520.0, 18.0),
+        &p.clip(
+            &plugin_heading(rows, cap_mb, &dirs),
+            &p.fmt.caption,
+            heading_w,
+        ),
+        rect(card.left + 58.0, card.top + 15.0, heading_w, 18.0),
         &p.fmt.caption,
         &p.br.muted,
     );
+    // 安装入口的按钮位置固定在这一页右上角：与命中读同一份几何。
+    let install = plugin_install_rect(card);
+    p.round(install, R_CONTROL, &p.br.header, Some(&p.br.border));
+    p.text("安装插件包…", install, &p.fmt.center_small, &p.br.fg);
 
     if let Some(e) = err {
         p.text(
@@ -8198,8 +8421,9 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             // 具体路径页顶那一行已经印着（与清单同一把尺子 `plugin_scan_dirs`），
             // 这一句只指方向，别在这里抄第二份路径。
             &p.clip(
+                // 两条入口都说出来：右上角那颗按钮是"装进来的包"，`.lua` 是"手放的脚本"。
                 &format!(
-                    "插件目录是空的：把一个 .lua 放进 {} 就会出现在这里",
+                    "还没有插件：点右上角安装插件包，或把一个 .lua 放进 {}",
                     focusflow_core::paths::plugins_user_dir().display()
                 ),
                 &p.fmt.center_small,
@@ -8248,6 +8472,7 @@ fn draw_plugin_detail(
     h: f32,
     row: &PluginRow,
     source: Option<&str>,
+    installed: bool,
     detail: &focusflow_core::plugins::plugin_health::PluginDetail,
 ) {
     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
@@ -8256,6 +8481,13 @@ fn draw_plugin_detail(
     let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
     p.round(back, R_CONTROL, &p.br.header, Some(&p.br.border));
     p.text("← 返回", back, &p.fmt.center_small, &p.br.fg);
+    // 有安装记录 = 盘上有一份包可卸；手工放进目录的单文件插件不画这颗
+    // （`uninstall` 也只收拾安装进来的那一类）。
+    if installed {
+        let ub = detail_uninstall_rect(card);
+        p.round(ub, R_CONTROL, &p.br.danger, None);
+        p.text("卸载…", ub, &p.fmt.center_small, &p.br.white);
+    }
     p.text(
         "插件详情",
         rect(back.right + 12.0, card.top + 14.0, 120.0, 20.0),
@@ -8472,6 +8704,53 @@ fn draw_plugin_detail(
                 &p.br.muted,
             );
         }
+    }
+}
+
+/// 卸载确认框：遮罩 + 一张小卡 + 三颗按钮。
+///
+/// 三档结局写在按钮上（保留 / 删除 / 取消）—— 卸载时"问一句"是本方案第 17 步的硬要求，
+/// 而把"删设置"做成默认那一颗是这一族里最常见的误删来源。
+fn draw_uninstall_prompt(p: &P<'_>, w: f32, h: f32, prompt: &UninstallPrompt) {
+    p.fill(rect(0.0, 0.0, w, h), &p.br.overlay);
+    let (dialog, buttons) = uninstall_prompt_geometry(w, h);
+    p.overlay_card(dialog, R_MODAL);
+
+    let x = dialog.left + 20.0;
+    let text_w = dialog.right - x - 20.0;
+    p.text(
+        &p.clip(&format!("卸载「{}」？", prompt.name), &p.fmt.body, text_w),
+        rect(x, dialog.top + 16.0, text_w, 22.0),
+        &p.fmt.body,
+        &p.br.fg,
+    );
+    p.text(
+        // 这两句要**整句画得下**：框内宽 420 px，`NO_WRAP` + 不按矩形裁切，
+        // 夹中间会留下一个没闭合的括号（这一版第一张屏证就是这样）。
+        &p.clip(
+            "插件包会被删除；设置可以留下，也可以一并删掉。",
+            &p.fmt.caption,
+            text_w,
+        ),
+        rect(x, dialog.top + 46.0, text_w, 18.0),
+        &p.fmt.caption,
+        &p.br.muted,
+    );
+    p.text(
+        &p.clip("「一并删除」不可恢复；默认是留下。", &p.fmt.caption, text_w),
+        rect(x, dialog.top + 68.0, text_w, 18.0),
+        &p.fmt.caption,
+        &p.br.muted,
+    );
+
+    let labels = ["卸载，保留设置", "卸载并删除设置", "取消"];
+    for (i, label) in labels.iter().enumerate() {
+        let (bg, fg) = match i {
+            1 => (&p.br.danger, &p.br.white),
+            _ => (&p.br.header, &p.br.fg),
+        };
+        p.round(buttons[i], R_CONTROL, bg, Some(&p.br.border));
+        p.text(label, buttons[i], &p.fmt.center_small, fg);
     }
 }
 
@@ -12146,6 +12425,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 tracing_note(&format!("OP_DONE 前 scroll={}", app.scroll));
                 // 备份/压缩/清理都可能改了库，重读一遍快照。
                 app.refresh_now();
+                if app.view == 4 {
+                    // 安装/卸载也是走这条回执的：插件目录变了，这一页要当场重扫。
+                    app.reload_plugins();
+                }
                 tracing_note(&format!("OP_DONE 后 scroll={}", app.scroll));
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -12303,6 +12586,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 if let Some(app) = unsafe { app_ptr(hwnd) } {
                     if app.detail.is_some() {
                         app.close_detail(hwnd);
+                    } else if app.plugin_uninstall.is_some() {
+                        // 确认框开着时 Esc = 取消（不删任何东西）。
+                        app.plugin_uninstall = None;
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
                     } else if app.pv_select.take().is_some() {
                         unsafe {
                             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -16548,7 +16837,7 @@ mod clip_tests {
             ("p.clip(&decl,&p.fmt.caption,decl_w),rect(r.left+520.0,y+7.0,decl_w,16.0)", 1),
             // 插件页顶上那句：正文由 `plugin_heading` 拼（含常驻个数与每格上限），
             // 夹取与画它的矩形仍取同一个 520。
-            ("p.clip(&plugin_heading(rows,cap_mb,&dirs),&p.fmt.caption,520.0),rect(card.left+58.0,card.top+15.0,520.0,18.0)", 1),
+            ("p.clip(&plugin_heading(rows,cap_mb,&dirs),&p.fmt.caption,heading_w),rect(card.left+58.0,card.top+15.0,heading_w,18.0)", 1),
             // 详情页的「来源」那一句：来源路径 + 校验和是外部字符串，自带同一格宽度。
             ("p.clip(source,&p.fmt.caption,inner_w),rect(x,card.top+88.0,inner_w,16.0)", 1),
             ("p.clip(&format!(\"插件目录读不出来：{e}\"),&p.fmt.caption,card.right-card.left-32.0)", 1),
@@ -17770,6 +18059,119 @@ mod plugin_page_tests {
         assert!(
             !line.contains("合计"),
             "合计占用是摊出来的数，不许印成读数：{line}"
+        );
+    }
+
+    /// 安装 / 卸载 / 确认框三处的几何各只有一份：画与命中读同一个表达式。
+    ///
+    /// 与「详情」「授权」那两颗同一条纪律。确认框那三颗尤其要紧 —— 画错了顺序，
+    /// 用户点「取消」落到的可能是「卸载并删除设置」。
+    #[test]
+    fn the_install_and_uninstall_buttons_have_one_geometry() {
+        let code = include_str!("../src/main.rs");
+        let at = code
+            .find("mod plugin_page_tests {")
+            .expect("插件页那一套用例的模块起点找不到了");
+        let prod = &code[..at];
+        for (name, head) in [
+            ("plugin_install_rect", "fn plugin_install_rect("),
+            ("detail_uninstall_rect", "fn detail_uninstall_rect("),
+            ("uninstall_prompt_geometry", "fn uninstall_prompt_geometry("),
+        ] {
+            assert_eq!(prod.matches(head).count(), 1, "{name} 应当只有一个定义");
+            assert_eq!(
+                prod.matches(&format!("{name}(")).count(),
+                3,
+                "{name}：定义一处 + 画一处 + 命中一处，多出来的一处就是手抄了第二遍坐标"
+            );
+        }
+    }
+
+    /// 确认框那三颗按钮要整颗落在框里，且相互不重叠。
+    #[test]
+    fn the_uninstall_prompt_buttons_sit_inside_their_box_and_do_not_overlap() {
+        let (b, buttons) = uninstall_prompt_geometry(1200.0, 860.0);
+        for (i, btn) in buttons.iter().enumerate() {
+            assert!(
+                btn.left >= b.left
+                    && btn.right <= b.right
+                    && btn.top >= b.top
+                    && btn.bottom <= b.bottom,
+                "第 {i} 颗按钮跑出框外了：{btn:?} / {b:?}"
+            );
+        }
+        for pair in buttons.windows(2) {
+            assert!(
+                pair[0].right <= pair[1].left,
+                "两颗按钮叠在一起了：{:?} / {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// 安装/卸载的回执各说各的结局（更新 vs 新装、保留 vs 删除 vs 没存过）。
+    #[test]
+    fn the_install_and_uninstall_lines_name_the_outcome() {
+        use focusflow_core::plugins::install::{Installed, StateAfter, Uninstalled};
+        let base = Installed {
+            stem: "demo".to_string(),
+            path: PathBuf::from("/x/demo.zip"),
+            replaced: false,
+            entries: 2,
+            bytes: 256,
+            problems: 0,
+        };
+        let fresh = install_line(Ok(base.clone()));
+        assert!(
+            fresh.contains("已安装") && fresh.contains("demo") && fresh.contains("2 个文件"),
+            "{fresh}"
+        );
+        assert!(!fresh.contains("问题"), "干净的包不许提示问题：{fresh}");
+        let updated = install_line(Ok(Installed {
+            replaced: true,
+            problems: 3,
+            ..base
+        }));
+        assert!(
+            updated.contains("已更新") && updated.contains("3 条问题"),
+            "{updated}"
+        );
+        assert!(install_line(Err("包坏了".into())).contains("安装失败"));
+
+        let gone = |state: StateAfter| Uninstalled {
+            stem: "demo".to_string(),
+            removed_package: PathBuf::from("/x/demo.zip"),
+            state,
+        };
+        assert!(
+            uninstall_line(Ok(gone(StateAfter::Kept(PathBuf::from("/s/demo")))))
+                .contains("设置还在")
+        );
+        assert!(uninstall_line(Ok(gone(StateAfter::Purged))).contains("都删了"));
+        assert!(uninstall_line(Ok(gone(StateAfter::NeverExisted))).contains("没有留下设置"));
+        assert!(uninstall_line(Err("不在".into())).contains("卸载失败"));
+    }
+
+    /// 详情页的「卸载」只在**有安装记录**时出现：那个布尔值必须由安装记录算出来。
+    #[test]
+    fn the_uninstall_button_follows_the_install_record() {
+        let code = include_str!("../src/main.rs");
+        let at = code
+            .find("mod plugin_page_tests {")
+            .expect("插件页那一套用例的模块起点找不到了");
+        let prod = &code[..at];
+        let start = prod
+            .find("fn open_plugin_detail(")
+            .expect("打开详情那一支不见了");
+        let rest = &prod[start..];
+        let end = rest
+            .find("\n    fn ")
+            .expect("详情那一支后面没有别的函数了");
+        let body = &rest[..end];
+        assert!(
+            body.contains("install::meta_for(") && body.contains("install::is_installed("),
+            "「有没有包可卸」必须由安装记录算出来，不许按扩展名或猜"
         );
     }
 
