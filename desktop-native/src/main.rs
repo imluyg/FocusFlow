@@ -8332,8 +8332,31 @@ fn modal_field_box(row: D2D_RECT_F) -> D2D_RECT_F {
     rect(row.left + 146.0, row.top + 3.0, width, 26.0)
 }
 
-/// 弹窗正文最多画几行：高度按它算，绘制也只画这么多（多出来的行要明说）。
-const MODAL_CONTENT_MAX_LINES: usize = 8;
+/// 弹窗正文一行的高度，以及卡片里除正文外那几块的固定高度：几何与行数上限共用。
+/// （`modal_geom` 的 `58 + content_h + fields + buttons + 52` 与这张表同源。）
+const MODAL_LINE_H: f32 = 18.0;
+const MODAL_HEAD_H: f32 = 58.0;
+const MODAL_CONTENT_GAP_H: f32 = 10.0;
+const MODAL_FIELDS_ROW_H: f32 = 38.0;
+const MODAL_BUTTONS_H: f32 = 36.0;
+const MODAL_BOTTOM_H: f32 = 52.0;
+/// 弹窗高度最多到 `窗口高 - 这个边距`。
+const MODAL_WINDOW_MARGIN: f32 = 60.0;
+
+/// 弹窗正文最多排几行：以**窗口放得下**为准，而不是一个写死的 8。
+/// 分类明细那种"行越多越说明记得多"的内容，写死上限会把后半截直接藏掉
+/// （从前是画出去压按钮，修完绘制溢出之后也不能换成"只显示前 8 行"）。
+fn modal_content_cap(m: &ModalRef<'_>, h: f32) -> usize {
+    let fields_h = m.fields.len() as f32 * MODAL_FIELDS_ROW_H;
+    let buttons_h = if m.buttons.is_empty() {
+        0.0
+    } else {
+        MODAL_BUTTONS_H
+    };
+    let fixed = MODAL_HEAD_H + MODAL_CONTENT_GAP_H + fields_h + buttons_h + MODAL_BOTTOM_H;
+    let avail = (h - MODAL_WINDOW_MARGIN) - fixed;
+    (avail / MODAL_LINE_H).floor().max(1.0) as usize
+}
 
 /// 滚动文本区最多画几行：与弹窗正文同一套口径（高度与绘制读同一个常量）。
 const PV_TEXTAREA_MAX_LINES: usize = 5;
@@ -8359,16 +8382,21 @@ fn modal_geom(m: &ModalRef<'_>, w: f32, h: f32) -> ModalGeom {
     let lines = if m.content.is_empty() {
         0
     } else {
-        m.content.lines().count().min(MODAL_CONTENT_MAX_LINES)
+        m.content.lines().count().min(modal_content_cap(m, h))
     };
     let content_h = if lines == 0 {
         0.0
     } else {
-        lines as f32 * 18.0 + 10.0
+        lines as f32 * MODAL_LINE_H + MODAL_CONTENT_GAP_H
     };
-    let fields_h = m.fields.len() as f32 * 38.0;
-    let buttons_h = if m.buttons.is_empty() { 0.0 } else { 36.0 };
-    let dh = (58.0 + content_h + fields_h + buttons_h + 52.0).min(h - 60.0);
+    let fields_h = m.fields.len() as f32 * MODAL_FIELDS_ROW_H;
+    let buttons_h = if m.buttons.is_empty() {
+        0.0
+    } else {
+        MODAL_BUTTONS_H
+    };
+    let dh = (MODAL_HEAD_H + content_h + fields_h + buttons_h + MODAL_BOTTOM_H)
+        .min(h - MODAL_WINDOW_MARGIN);
     let left = (w - dw) / 2.0;
     let top = ((h - dh) / 2.0).max(30.0);
     let dialog = rect(left, top, dw, dh);
@@ -8380,14 +8408,14 @@ fn modal_geom(m: &ModalRef<'_>, w: f32, h: f32) -> ModalGeom {
             dialog.left + pad,
             dialog.top + 52.0,
             dw - pad * 2.0,
-            lines as f32 * 18.0,
+            lines as f32 * MODAL_LINE_H,
         ))
     };
     let mut y = dialog.top + 52.0 + content_h;
     let mut fields = Vec::new();
     for _ in m.fields {
         fields.push(rect(dialog.left + pad, y, dw - pad * 2.0, 32.0));
-        y += 38.0;
+        y += MODAL_FIELDS_ROW_H;
     }
     let mut buttons = Vec::new();
     let mut bx = dialog.left + pad;
@@ -8466,7 +8494,7 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
             m.content,
             &p.fmt.caption,
             cr.right - cr.left,
-            MODAL_CONTENT_MAX_LINES,
+            modal_content_cap(m, h),
         );
         p.text(&text, cr, &p.fmt.caption, &p.br.muted);
     }
@@ -18234,7 +18262,7 @@ mod clip_tests {
                 1,
             ),
             (
-                "clip_text_lines(p,m.content,&p.fmt.caption,cr.right-cr.left,MODAL_CONTENT_MAX_LINES)",
+                "clip_text_lines(p,m.content,&p.fmt.caption,cr.right-cr.left,modal_content_cap(m,h))",
                 1,
             ),
             ("p.clip(key,&p.fmt.caption,140.0),rect(r.left,r.top,140.0,18.0)", 1),
@@ -20155,31 +20183,48 @@ mod modal_content_tests {
         }
     }
 
-    /// 正文行数超上限时，几何按上限留高、绘制也只画这么多行，最后一行说还有几行没显示 ——
-    /// 从前绘制把全部行画出去，而高度只按 8 行算：分类一多，字就压在下面那排按钮上。
+    /// 正文行数上限按**窗口装得下多少行**算，不是一个写死的 8：
+    /// 月度汇总分类一多就是十几行，8 行上限会把后半截藏掉（只显示前 8 类）。
+    /// 窗口矮到装不下时才截断，且最后一行明说还有几行没显示。
     #[test]
-    fn a_long_modal_body_is_capped_and_says_how_much_is_hidden() {
+    fn a_long_modal_body_is_capped_to_what_the_window_holds() {
         let content = (1..=20)
             .map(|i| format!("第{i}行"))
             .collect::<Vec<_>>()
             .join("\n");
         let m = modal(&content, &[], &[]);
-        let g = modal_geom(&m, 1200.0, 900.0);
-        let rows = capped_lines(m.content, MODAL_CONTENT_MAX_LINES);
-        assert_eq!(
-            rows.len(),
-            MODAL_CONTENT_MAX_LINES,
-            "画出来的行数要等于留高的行数"
-        );
-        assert_eq!(rows.last().unwrap(), "…（还有 13 行没显示）");
-        assert_eq!(rows[0], "第1行");
-        assert_eq!(rows[MODAL_CONTENT_MAX_LINES - 2], "第7行");
-        let cr = g.content.expect("有正文就该留出内容区");
+
+        // 高窗口：20 行整段看得见，行数与内容区高度同一份。
+        let tall = modal_geom(&m, 1200.0, 900.0);
+        let tall_cap = modal_content_cap(&m, 900.0);
+        assert!(tall_cap > 8, "高窗口还卡在 8 行：cap={tall_cap}");
+        let rows = capped_lines(m.content, tall_cap);
+        assert_eq!(rows.len(), 20, "900 高的窗口该装得下 20 行");
+        let cr = tall.content.expect("有正文就该留出内容区");
         assert!(
-            (cr.bottom - cr.top - rows.len() as f32 * 18.0).abs() < 0.01,
+            (cr.bottom - cr.top - rows.len() as f32 * MODAL_LINE_H).abs() < 0.01,
             "内容区高度要装得下这几行：{}",
             cr.bottom - cr.top
         );
+        assert!(
+            cr.bottom <= tall.dialog.bottom - 48.0,
+            "正文压到了底部按钮那一排"
+        );
+
+        // 矮窗口：装不下才截，最后一行换成"还有几行"。
+        let short_h = 300.0;
+        let cap = modal_content_cap(&m, short_h);
+        assert!(cap < 20, "夹具前提：矮窗口装不下 20 行（cap={cap}）");
+        let g = modal_geom(&m, 1200.0, short_h);
+        let rows = capped_lines(m.content, cap);
+        assert_eq!(rows.len(), cap, "画出来的行数要等于留高的行数");
+        assert_eq!(rows[0], "第1行");
+        assert!(
+            rows.last().unwrap().starts_with("…（还有 "),
+            "{:?}",
+            rows.last()
+        );
+        let cr = g.content.expect("有正文就该留出内容区");
         assert!(
             cr.bottom <= g.dialog.bottom - 48.0,
             "正文压到了底部按钮那一排"
@@ -20190,10 +20235,10 @@ mod modal_content_tests {
     #[test]
     fn a_short_modal_body_is_drawn_verbatim() {
         let m = modal("第一行\n第二行", &[], &[]);
-        let rows = capped_lines(m.content, MODAL_CONTENT_MAX_LINES);
+        let rows = capped_lines(m.content, modal_content_cap(&m, 900.0));
         assert_eq!(rows, vec!["第一行".to_string(), "第二行".to_string()]);
         let g = modal_geom(&m, 1200.0, 900.0);
         let cr = g.content.expect("两行正文也该留出内容区");
-        assert!((cr.bottom - cr.top - 2.0 * 18.0).abs() < 0.01);
+        assert!((cr.bottom - cr.top - 2.0 * MODAL_LINE_H).abs() < 0.01);
     }
 }
