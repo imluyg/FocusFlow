@@ -8253,11 +8253,9 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
     .map(|d| d.display().to_string())
     .collect::<Vec<_>>()
     .join(" / ");
-    let cap_mb = focusflow_core::config::instance()
-        .get_or("plugins", "memory_limit_mb", "16")
-        .trim()
-        .parse::<u64>()
-        .unwrap_or(16);
+    let cap_mb =
+        focusflow_core::plugins::manager::memory_limit_mb(focusflow_core::config::instance())
+            as u64;
     // 这一格的宽度：左边让给「插件」那两个字，右边让给安装按钮（148 + 12 的缝）。
     // 目录路径的尾巴才是"到底在哪儿"，所以 `p.clip` 夹中间、两头都留。
     let heading_w = card.right - card.left - 32.0 - 58.0 - 160.0;
@@ -18601,6 +18599,24 @@ mod plugin_page_tests {
         assert!(
             asked < backup,
             "台账要在退出备份之前落盘（plugins/state/ 会被一起收进备份包）"
+        );
+    }
+
+    /// 插件页顶上那句「每格内存上限 N MB」要读 core 那个夹过的数。
+    ///
+    /// 页面自己 parse 原始字符串时不夹：config 写 999999 就会说"999999 MB"，而 VM
+    /// 实际只有 4096；写 0 时说 0、VM 是 1 —— 两处各说一套。
+    #[test]
+    fn the_plugin_page_takes_the_memory_cap_from_core() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        assert!(
+            prod.contains("plugins::manager::memory_limit_mb("),
+            "页面没读 core 那个上限（自己 parse 一份就是两套账）"
+        );
+        assert!(
+            !prod.contains("get_or(\"plugins\", \"memory_limit_mb\""),
+            "页面还在自己读原始值"
         );
     }
 

@@ -494,6 +494,18 @@ struct MigrationReport {
     unreadable: Option<String>,
 }
 
+/// 每个插件 VM 的内存上限（MB）。**唯一出处**：装载 VM 的那一处与插件页顶上那一行都读这里。
+///
+/// 上限要夹：`memory_limit_mb` 来自可以手改的 config.ini，天文数字会在
+/// `* 1024 * 1024` 处溢出成 0（release 不做溢出检查），于是 `set_memory_limit(0)`
+/// —— 每个插件立刻 MemoryError；0 或负数同样等于别的意思。4096 MB 之外没有合理用途。
+/// 页面若自己 `parse` 原始值，就会出现"屏上说 999999 MB、VM 实际 4096"那种两套账。
+pub fn memory_limit_mb(config: &FocusFlowConfig) -> usize {
+    config
+        .get_int("plugins", "memory_limit_mb", 16)
+        .clamp(1, 4096) as usize
+}
+
 /// 插件管理器（GUI 线程专用，不跨线程共享）。
 pub struct PluginManager {
     config: &'static FocusFlowConfig,
@@ -856,14 +868,7 @@ impl PluginManager {
     /// 配置项：config.ini [plugins] memory_limit_mb（默认 16）/ instruction_limit（默认 1000 万）。
     /// Lua 状态创建后调用一次即可覆盖该状态后续所有执行路径。
     fn apply_lua_limits(&self, lua: &Lua) {
-        // 上限要夹：`memory_limit_mb` 来自可以手改的 config.ini，一个天文数字会在
-        // `* 1024 * 1024` 处 wrap 成 0（release 不做溢出检查），于是 set_memory_limit(0)
-        // ——每个插件立刻 MemoryError，而日志里只有一句 warn，看起来像"插件自己坏了"。
-        // 4096MB 之外没有合理用途，超出就是笔误，按笔误处理。
-        let mem_mb = self
-            .config
-            .get_int("plugins", "memory_limit_mb", 16)
-            .clamp(1, 4096) as usize;
+        let mem_mb = memory_limit_mb(self.config);
         if let Err(e) = lua.set_memory_limit(mem_mb * 1024 * 1024) {
             tracing::warn!("Lua 内存限制设置失败: {e}");
         }
@@ -6024,6 +6029,35 @@ end
         assert!(
             pm.get_plugin(&name).expect("插件还在").loaded,
             "停一路不等于停整个插件"
+        );
+    }
+
+    /// 上限只有一处出处，而且是夹过的：页面与 VM 不许各说一套。
+    ///
+    /// 原先页面拿原始字符串自己 parse（不夹），于是 `memory_limit_mb = 999999` 时
+    /// 屏上说 999999 MB、VM 实际 4096 MB；写成 0 时屏上说 0、VM 是 1。
+    #[test]
+    fn the_memory_cap_is_clamped_in_one_place() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("mem_cap");
+        let loaded = |text: &str| {
+            std::fs::write(tmp.path().join("config.ini"), text).unwrap();
+            FocusFlowConfig::load(tmp.path().join("config.ini")).unwrap()
+        };
+        assert_eq!(
+            memory_limit_mb(&loaded("[plugins]\nmemory_limit_mb = 999999\n")),
+            4096,
+            "天文数字要按笔误夹住"
+        );
+        assert_eq!(
+            memory_limit_mb(&loaded("[plugins]\nmemory_limit_mb = 0\n")),
+            1,
+            "0 会让每个插件立刻 MemoryError"
+        );
+        assert_eq!(
+            memory_limit_mb(&loaded("[plugins]\nmemory_limit_mb = 很多\n")),
+            16,
+            "读不出来按默认值"
         );
     }
 
