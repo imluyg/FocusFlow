@@ -2015,7 +2015,8 @@ impl App {
         // 排行页：这条分支既不在热力图上、也不在分析页那两张图上，残留的高亮在这里撤掉。
         changed |= self.heat_hover.take().is_some();
         changed |= self.chart_hover.take().is_some();
-        let g = table_geom(left_card(w, h));
+        let card = left_card(w, h);
+        let g = table_geom(card);
         let count = self
             .snap
             .lock()
@@ -2030,7 +2031,7 @@ impl App {
                 break;
             }
             let y0 = g.list_top + vis as f32 * g.row_h;
-            if y >= y0 && y < y0 + g.row_h {
+            if hit(table_row_band(card, y0, g.row_h), x, y) {
                 row = Some(idx);
                 break;
             }
@@ -2701,7 +2702,7 @@ impl App {
                 break;
             }
             let y0 = g.list_top + vis as f32 * g.row_h;
-            if y >= y0 && y < y0 + g.row_h && x >= r.left && x <= r.right {
+            if hit(table_row_band(r, y0, g.row_h), x, y) {
                 row = Some(idx);
                 break;
             }
@@ -9698,6 +9699,15 @@ fn table_geom(r: D2D_RECT_F) -> TableGeom {
         x_last,
         x_share_left,
     }
+}
+
+/// 排行表一行的命中/悬停带：横向是整张卡片（与点击一致），纵向是这一行。
+///
+/// 画那一行的高亮左右各缩 12（与列内容对齐），但"亮起来"与"点得到"必须是同一个
+/// 区域：从前悬停只判 `y`，指针压在右侧趋势图上也会点亮左表那一行，而点下去什么
+/// 都不会发生。
+fn table_row_band(card: D2D_RECT_F, y: f32, row_h: f32) -> D2D_RECT_F {
+    rect(card.left, y, card.right - card.left, row_h)
 }
 
 fn rename_button(g: &TableGeom, y: f32) -> D2D_RECT_F {
@@ -20785,5 +20795,42 @@ mod board_layout_tests {
             src[..cut].contains("fn board_layout("),
             "board_layout 落到了测试段后面：接线守卫开始少扫生产码"
         );
+    }
+}
+
+/// 排行表的行带：亮的区域与点得到的区域必须是同一个。
+#[cfg(test)]
+mod table_band_tests {
+    use super::{hit, left_card, table_row_band};
+
+    #[test]
+    fn the_rank_row_band_covers_the_card_not_the_neighbours() {
+        let (w, h) = (1000.0, 860.0);
+        let card = left_card(w, h);
+        let r = table_row_band(card, 300.0, 24.0);
+        assert_eq!((r.left, r.right), (card.left, card.right));
+        assert!(
+            hit(r, card.left + 5.0, 310.0),
+            "卡片内边距里点得到，悬停也要亮"
+        );
+        assert!(
+            !hit(r, card.right + 20.0, 310.0),
+            "指针在右侧趋势图上，不许点亮左表那一行"
+        );
+        assert!(!hit(r, card.left - 10.0, 310.0), "卡片外面不许点亮");
+        assert!(!hit(r, card.left + 5.0, 325.0), "行间空档不归这一行");
+
+        // 悬停与点击读同一个函数，不是各写一套坐标。
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        for needle in [
+            "if hit(table_row_band(card, y0, g.row_h), x, y) {",
+            "if hit(table_row_band(r, y0, g.row_h), x, y) {",
+        ] {
+            assert!(
+                prod.contains(needle),
+                "悬停/点击又各写一套行带：缺 {needle}"
+            );
+        }
     }
 }
