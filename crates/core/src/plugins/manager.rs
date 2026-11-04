@@ -28,6 +28,7 @@ use crate::paths;
 use crate::plugins::host;
 use crate::plugins::permissions;
 use crate::plugins::plugin_events;
+use crate::plugins::plugin_health;
 use crate::plugins::plugin_refresh;
 use crate::plugins::plugin_timers;
 use crate::plugins::resources;
@@ -848,6 +849,16 @@ impl PluginManager {
             .get(name)
             .map(|info| Self::stem_of(&info.file_path))
             .unwrap_or_default();
+        // 停用那一刻的两件事都要留档：为什么（进错误历史）与第几次（计数），并当场落盘 ——
+        // 用户重启之后还能在页面上查到"上次它是被什么打停的"。
+        self.note_hook_error(name, &msg);
+        if !owner.is_empty() {
+            let board = plugin_health::board_for(&owner);
+            board.lock().unwrap_or_else(|e| e.into_inner()).note_stop();
+            if let Err(e) = plugin_health::flush(&owner) {
+                tracing::warn!("插件 {owner} 停用时的台账落不下去: {e}");
+            }
+        }
         if let Some(info) = self.plugins.get_mut(name) {
             info.error = Some(msg.clone());
             info.lua = None;
@@ -1497,6 +1508,11 @@ impl PluginManager {
         // 因为线程还在为别的插件跑；这里销的是"这个实例自己的待办清单"，重载语义就是换一份。
         // 顺序不能反：先销旧格、再装入口，装的那一步取到的是这一份新表。
         plugin_timers::forget(&stem);
+        // 每一次（重）加载都从空表开始，台账同理：**先把上一份账落盘，再摘掉这一格**
+        // （`plugin_health::forget` 里就是这一序）。落盘的必要性在这条路上最直白 ——
+        // 热重载换的是字节，不该顺手把"这一格慢过几次、上次为什么停用"清零。
+        // 摘掉之后下一次 `board_for` 从盘上重开一格，读回来的正是刚写下去的那一份。
+        plugin_health::forget(&stem);
         host::install_timer_api(&lua, &api, &stem).map_err(|e| format!("定时器入口装不上: {e}"))?;
         let declared = meta.manifest.permissions.clone();
         let unknown = permissions::unknown_permissions(&declared);
@@ -1774,10 +1790,19 @@ impl PluginManager {
             Some(f) => {
                 Self::arm_instruction_budget(lua, cfg);
                 plugin_timers::note_fire_thread(stem);
-                match payload {
+                let started = std::time::Instant::now();
+                let outcome = match payload {
                     Some(name) => f.call::<()>(name.to_string()),
                     None => f.call::<()>(()),
-                }
+                };
+                // 排程表与事件回调走的是同一次投递（`pump_timers` 那一拍），所以这一档
+                // 一起算进「事件回调」：预算表那一行说的是"回调"，不是某个 Lua 名字。
+                let board = plugin_health::board_for(stem);
+                board
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record(plugin_health::HookKind::Event, started.elapsed());
+                outcome
             }
             None => Err(mlua::Error::RuntimeError(format!(
                 "句柄 {handle} 在 _ff_timers 里没有对应的函数"
@@ -1855,6 +1880,50 @@ impl PluginManager {
             .unwrap_or(plugin_refresh::DEFAULT_REFRESH_MS)
     }
 
+    /// 把一次钩子的耗时记进台账（预算表那四类的落点都走这一处 —— 尺子只有一份）。
+    ///
+    /// 四类各有各的预算，比的是 `plugin_health` 那一侧按档取的数；这里只回答
+    /// "哪一类、跑了多久"。超预算那句走 debug：按键那一路每批都可能超，warn 会把日志刷满。
+    fn note_hook_time(
+        &self,
+        name: &str,
+        kind: plugin_health::HookKind,
+        elapsed: std::time::Duration,
+    ) {
+        let Some(stem) = self.plugins.get(name).map(|i| Self::stem_of(&i.file_path)) else {
+            return;
+        };
+        let board = plugin_health::board_for(&stem);
+        let over = {
+            let mut guard = board.lock().unwrap_or_else(|e| e.into_inner());
+            guard.record(kind, elapsed)
+        };
+        if over {
+            tracing::debug!(
+                "插件 {name} 的{}用了 {:.1} ms，超过本档预算",
+                kind.label(),
+                elapsed.as_micros() as f64 / 1000.0
+            );
+        }
+    }
+
+    /// 把一条失败原因记进错误历史。**墙钟时间戳由这一侧给** ——
+    /// 台账那一侧不读钟，判据才能拿固定的时刻串测"重启后还在不在"。
+    fn note_hook_error(&self, name: &str, msg: &str) {
+        let Some(stem) = self.plugins.get(name).map(|i| Self::stem_of(&i.file_path)) else {
+            return;
+        };
+        if stem.is_empty() {
+            return;
+        }
+        let at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let board = plugin_health::board_for(&stem);
+        board
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_error(&at, msg);
+    }
+
     /// 从插件 Lua 环境读取 get_view() 返回值（声明式 UI 表）。
     fn read_view(lua: &Lua) -> mlua::Result<PluginView> {
         let get_view: mlua::Function = lua.globals().get("get_view")?;
@@ -1893,6 +1962,10 @@ impl PluginManager {
             // 卸载 = 这一页不存在了，账本一起丢：留着旧样本的话，重新启用后第一次刷新
             // 就会被上一次留下的"慢"记录降频，而那时插件是全新的实例。
             self.plans.remove(name);
+            // 丢掉的是**降频那一份**（上面那行 `plans`），而诊断那一份要留下：耗时读数、
+            // 超预算次数与错误历史是给人回看的东西，它与"下一拍该不该降频"不是一个用途。
+            // 所以这里落盘后摘格子，下一次问账从文件里读回来。
+            plugin_health::forget(&stem);
             // 卸载 = 用户不要它了（停用/删除/重启前的一次回收），旧的加载失败原因
             // 不该继续挂在插件页上。
             self.load_errors.remove(&stem);
@@ -2358,6 +2431,7 @@ impl PluginManager {
             return Ok(());
         }
         Self::arm_instruction_budget(lua, cfg);
+        let view_started = std::time::Instant::now();
         let view = match Self::read_view(lua) {
             Ok(v) => v,
             Err(e) => {
@@ -2368,6 +2442,7 @@ impl PluginManager {
                 return Err(msg);
             }
         };
+        self.note_hook_time(name, plugin_health::HookKind::View, view_started.elapsed());
         if let Some(p) = self.plugins.get_mut(name) {
             p.view = Some(view);
         }
@@ -2394,7 +2469,10 @@ impl PluginManager {
         match Self::take_hook(lua, "on_action")? {
             Some(on_action) => {
                 Self::arm_instruction_budget(lua, cfg);
-                if let Err(e) = on_action.call::<()>(action_id) {
+                let started = std::time::Instant::now();
+                let outcome = on_action.call::<()>(action_id);
+                self.note_hook_time(name, plugin_health::HookKind::Action, started.elapsed());
+                if let Err(e) = outcome {
                     let msg = format!("on_action 失败: {e}");
                     if is_limit_error(&e) {
                         self.mark_plugin_error(name, msg.clone());
@@ -2447,8 +2525,15 @@ impl PluginManager {
             }
         };
         Self::arm_instruction_budget(lua, cfg);
+        let key_started = std::time::Instant::now();
         // 两个参数：键名 + 这一批的增量。只声明一个形参的旧插件照旧能收（多给的参数被丢掉）。
-        if let Err(e) = hook.call::<()>((key, count.max(1))) {
+        let outcome = hook.call::<()>((key, count.max(1)));
+        self.note_hook_time(
+            name,
+            plugin_health::HookKind::KeyEvent,
+            key_started.elapsed(),
+        );
+        if let Err(e) = outcome {
             if is_limit_error(&e) {
                 // 跑飞了：这一类必须停用整个插件（原有口径，不许被下面那条弱化）
                 self.mark_plugin_error(name, format!("record_key 失败: {e}"));
@@ -2478,6 +2563,9 @@ impl PluginManager {
     /// 代价是按键停摆这件事在那一行上被前一个原因挡住 —— 日志里那一句仍然只记一次，
     /// 而两种失败本来就要分开看。
     fn note_key_hook_failure(&mut self, name: &str, msg: String) {
+        // 原因也要进历史：这一类不停用插件，页面上那行只留最后一次，而"从这一次起按键数
+        // 不再涨"发生了几次、分别是因为什么，是排障要往回看的东西。
+        self.note_hook_error(name, &msg);
         let Some(info) = self.plugins.get_mut(name) else {
             return;
         };
@@ -2503,7 +2591,10 @@ impl PluginManager {
         match Self::take_hook(lua, "set_field")? {
             Some(set_field) => {
                 Self::arm_instruction_budget(lua, cfg);
-                if let Err(e) = set_field.call::<()>((field, value)) {
+                let started = std::time::Instant::now();
+                let outcome = set_field.call::<()>((field, value));
+                self.note_hook_time(name, plugin_health::HookKind::Action, started.elapsed());
+                if let Err(e) = outcome {
                     let msg = format!("set_field 失败: {e}");
                     if is_limit_error(&e) {
                         self.mark_plugin_error(name, msg.clone());
