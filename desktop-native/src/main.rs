@@ -8435,15 +8435,32 @@ fn modal_geom(m: &ModalRef<'_>, w: f32, h: f32) -> ModalGeom {
         fields.push(rect(dialog.left + pad, y, dw - pad * 2.0, 32.0));
         y += MODAL_FIELDS_ROW_H;
     }
-    let mut buttons = Vec::new();
-    let mut bx = dialog.left + pad;
-    for (_, label) in m.buttons {
-        let bw = (label.chars().count() as f32 * 14.0 + 20.0).max(64.0);
-        buttons.push((rect(bx, dialog.bottom - 48.0, bw, 28.0), label.clone()));
-        bx += bw + 8.0;
-    }
     let submit = rect(dialog.right - pad - 88.0, dialog.bottom - 48.0, 88.0, 28.0);
     let cancel = rect(submit.left - 8.0 - 72.0, dialog.bottom - 48.0, 72.0, 28.0);
+    // 自定义按钮排在左半边。右边是「取消 / 确定」，而命中先问它们：伸过去的那一颗
+    // 画得出来却永远点不到（按下去归了取消/确定）。宽度先按剩余空间均分，再夹自然宽；
+    // 文字那一侧已经逐格夹过，被压窄也不会画到按钮外面。
+    let start = dialog.left + pad;
+    let row_right = if m.cancel.is_empty() {
+        submit.left
+    } else {
+        cancel.left
+    } - 8.0;
+    let n = m.buttons.len() as f32;
+    let gap = 8.0;
+    let unit = if n > 0.0 {
+        ((row_right - start - gap * (n - 1.0)) / n).max(28.0)
+    } else {
+        0.0
+    };
+    let mut buttons = Vec::new();
+    let mut bx = start;
+    for (_, label) in m.buttons {
+        let natural = (label.chars().count() as f32 * 14.0 + 20.0).max(64.0);
+        let bw = natural.min(unit).max(28.0);
+        buttons.push((rect(bx, dialog.bottom - 48.0, bw, 28.0), label.clone()));
+        bx += bw + gap;
+    }
     ModalGeom {
         dialog,
         close,
@@ -20261,6 +20278,33 @@ mod modal_content_tests {
         let g = modal_geom(&m, 1200.0, 900.0);
         let cr = g.content.expect("两行正文也该留出内容区");
         assert!((cr.bottom - cr.top - 2.0 * MODAL_LINE_H).abs() < 0.01);
+    }
+
+    /// 自定义按钮多了/长了不许伸到「取消 / 确定」底下：命中先问那两颗，压住的按钮
+    /// 画得出来却永远点不到（按下去等于取消了这次提交）。
+    #[test]
+    fn custom_buttons_never_run_under_the_action_row() {
+        let buttons: Vec<(String, String)> = (0..6)
+            .map(|i| (format!("b{i}"), format!("一个很长的自定义动作 {i}")))
+            .collect();
+        // 带取消的那一档最紧：取消与确定两颗的真实命中区都在右边。
+        let m = ModalRef {
+            cancel: "cancel_all",
+            ..modal("", &[], &buttons)
+        };
+        let g = modal_geom(&m, 900.0, 500.0);
+        assert_eq!(g.buttons.len(), 6);
+        for (br, _) in &g.buttons {
+            assert!(
+                br.right <= g.cancel.left - 7.9,
+                "自定义按钮伸进了取消/确定那一带：{br:?} vs cancel {:?}",
+                g.cancel
+            );
+            assert!(
+                br.right - br.left >= 27.9,
+                "按钮被压得连一颗字都放不下：{br:?}"
+            );
+        }
     }
 }
 
