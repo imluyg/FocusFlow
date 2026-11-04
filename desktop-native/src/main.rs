@@ -10543,6 +10543,13 @@ fn chart_label_at(n: usize, step: usize, i: usize) -> bool {
     step > 0 && i < n && (n - 1 - i).is_multiple_of(step)
 }
 
+/// 第 `j` 个横轴文本画在哪一格。`labels` 与 `points` **尾对齐**（`Widget::Chart` 的
+/// 文档就是这么写的）：文本比点少时，缺的是前面那些旧点的文本，而不是把最近几天的
+/// 文本挤到最早几格去 —— 后者每个字都对、归属全错，只有数格子才看得出来。
+fn chart_label_index(n: usize, len: usize, j: usize) -> usize {
+    n.saturating_sub(len) + j
+}
+
 /// 画一张插件图表。线、柱、网格、纵轴数字全部复用内置页那一套几何函数。
 fn draw_plugin_chart(p: &P<'_>, r: D2D_RECT_F, kind: &str, labels: &[String], points: &[i64]) {
     p.card(r, R_CARD);
@@ -10622,7 +10629,8 @@ fn draw_plugin_chart(p: &P<'_>, r: D2D_RECT_F, kind: &str, labels: &[String], po
     // 这块 UI 不按矩形裁切，画得下与否取决于传进去几格宽。
     let slot = plot_width(plot) / n.max(1) as f32;
     let cell_w = (slot * plan.label_step as f32).clamp(28.0, 90.0);
-    for (i, text) in labels.iter().enumerate() {
+    for (j, text) in labels.iter().enumerate() {
+        let i = chart_label_index(n, labels.len(), j);
         if !chart_label_at(n, plan.label_step, i) {
             continue;
         }
@@ -14091,6 +14099,21 @@ mod chart_axis_mirror_tests {
             "step=0（空数据/没文本）一个都不标"
         );
         assert!(!chart_label_at(5, 2, 5), "越界索引不标");
+    }
+
+    /// 文本比点少时，最后一个文本必须对最后一个点（文档承诺的「尾对齐」）。
+    /// 按左对齐那版会把「最近三天的日期」画在最早三格上：数不变、字不差，归属全错，
+    /// 除了数格子没有第二种发现方式。
+    #[test]
+    fn a_short_label_list_hangs_on_the_newest_points() {
+        assert_eq!(chart_label_index(10, 3, 0), 7, "缺的是前面旧点的文本");
+        assert_eq!(chart_label_index(10, 3, 2), 9, "最后一个文本对最后一个点");
+        assert_eq!(chart_label_index(3, 3, 0), 0, "一样长时一格都不挪");
+        assert_eq!(
+            chart_label_index(10, 0, 0),
+            10,
+            "一个文本都没有时不许倒着算（下标越界由标记判据滤掉）"
+        );
     }
 
     /// 布局这一头：图占自己那一格高度、进 ops、并跟着算进内容高度；
