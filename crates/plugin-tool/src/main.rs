@@ -1018,6 +1018,51 @@ end
         );
     }
 
+    /// 随包那几份脚本要走一遍**新壳**：`validate` 与 `hash` 都不许对它们说有问题。
+    ///
+    /// 上一场那条真数据腿走的是 core 的尺子（`plugins::validate`）；这一场把壳从命令行搬到
+    /// `focusflow-plugin`，判定一行没动，但"壳换了以后随包脚本还是干净的"这件事**没人核过**。
+    /// 这一条就是那一次核。身份按位置定，所以先把它们拷进内置那一格再问 ——
+    /// 拿用户位问它们，`pomodoro_*` / `accounting_*` 那些格子本来就该被念成问题。
+    #[test]
+    fn the_shipped_scripts_stay_clean_through_the_new_shell() {
+        let _g = guard();
+        let src = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../core/plugins"));
+        let app = paths::test_app_dir("tool_shipped");
+        let builtin = paths::plugins_builtin_dir();
+        std::fs::create_dir_all(&builtin).expect("内置目录");
+
+        let mut seen = 0usize;
+        for entry in std::fs::read_dir(src).expect("读随包脚本目录") {
+            let from = entry.expect("条目").path();
+            if from.extension().and_then(|e| e.to_str()) != Some("lua") {
+                continue;
+            }
+            let stem = from
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let dst = builtin.join(from.file_name().unwrap());
+            std::fs::copy(&from, &dst).unwrap_or_else(|e| panic!("{stem} 拷不进内置位: {e}"));
+            seen += 1;
+            assert_eq!(
+                run(&["validate".into(), dst.display().to_string()]),
+                0,
+                "随包的 {stem} 在新壳里被判出问题 —— 换壳该一动不动，动的是壳不是尺子"
+            );
+            assert_eq!(
+                run(&["hash".into(), dst.display().to_string()]),
+                0,
+                "随包的 {stem} 连哈希都算不出，工具对它等于没用"
+            );
+        }
+        assert!(
+            seen >= 5,
+            "随包脚本只数到 {seen} 份 —— 这一条腿的夹具是这几份文件本身，数少了就是扫空"
+        );
+        drop(app);
+    }
+
     /// 多出来的参数不能被静悄悄丢掉：`hash a.lua b.lua` 只算 a 而退 0，
     /// 作者以为两份都核过了。
     #[test]
