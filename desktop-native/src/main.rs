@@ -2000,7 +2000,7 @@ impl App {
                     break;
                 }
                 let y0 = g.list_top + vis as f32 * g.row_h;
-                if y >= y0 && y < y0 + g.row_h {
+                if hit(settings_row_rect(&g, w, y0), x, y) {
                     row = Some(idx);
                     break;
                 }
@@ -2542,7 +2542,7 @@ impl App {
                 }
                 // 注意变量名：这里的行顶端不能。
                 let y0 = g.list_top + vis as f32 * g.row_h;
-                let row_rect = rect(g.body_left, y0, w - 32.0 - g.body_left, g.row_h - 2.0);
+                let row_rect = settings_row_rect(&g, w, y0);
                 if hit(row_rect, x, y) {
                     self.sel = Some(idx);
                     match items[idx] {
@@ -4702,6 +4702,14 @@ fn settings_geom(_w: f32, h: f32) -> SettingsGeom {
     }
 }
 
+/// 设置页里一行可画 / 可悬停 / 可点的矩形（三个读者共用这一份）。
+///
+/// 悬停从前只判 `y`：指针压在左边的分类导航上、或落在右侧卡片的边距里，正文那一行
+/// 也会亮起来 —— 亮的区域与点得到的区域不是同一个。宽度与画那一行读同一个表达式。
+fn settings_row_rect(g: &SettingsGeom, w: f32, y: f32) -> D2D_RECT_F {
+    rect(g.body_left, y, w - 32.0 - g.body_left, g.row_h - 2.0)
+}
+
 /// 设置页底部的数据操作（后台线程跑，结果回投 `WM_OP_DONE`）。
 /// 设置页底部那八颗「执行」：标题 / 说明 / **点下去之后状态行那句"正在…"**。
 ///
@@ -4899,12 +4907,7 @@ fn draw_settings(
             break;
         }
         let y = g.list_top + vis as f32 * g.row_h;
-        let r = rect(
-            g.body_left,
-            y,
-            card.right - 16.0 - g.body_left,
-            g.row_h - 2.0,
-        );
+        let r = settings_row_rect(&g, w, y);
         if vs.sel == Some(idx) {
             p.round(r, R_CONTROL, &p.br.accent_soft, None);
         } else if vs.hover == Some(idx) {
@@ -15128,6 +15131,37 @@ mod snapshot_rate_tests {
 
 #[cfg(test)]
 mod settings_type_tests {
+    /// 设置页一行的"亮"与"点"必须是同一个矩形：悬停从前只判 `y`，指针压在左边的
+    /// 分类导航上也会点亮正文那一行（点导航只是切分类，不会打开那一行）。
+    #[test]
+    fn the_settings_hover_band_matches_the_click_band() {
+        use super::{hit, settings_geom, settings_row_rect};
+        let w = 960.0;
+        let g = settings_geom(w, 860.0);
+        let r = settings_row_rect(&g, w, g.list_top);
+        assert_eq!(r.left, g.body_left);
+        assert_eq!(r.right, w - 32.0);
+        assert!(hit(r, g.body_left + 10.0, g.list_top + 5.0), "行内要命中");
+        assert!(
+            !hit(r, g.nav_x + 5.0, g.list_top + 5.0),
+            "压着分类导航时正文那一行不该亮"
+        );
+        assert!(!hit(r, 20.0, g.list_top + 5.0), "卡片左边距里不该亮");
+        // 画 / 悬停 / 点击三处读同一个函数。
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        for needle in [
+            "let r = settings_row_rect(&g, w, y);",
+            "let row_rect = settings_row_rect(&g, w, y0);",
+            "if hit(settings_row_rect(&g, w, y0), x, y) {",
+        ] {
+            assert!(
+                prod.contains(needle),
+                "画/悬停/点击又各写一套行矩形：缺 {needle}"
+            );
+        }
+    }
+
     /// 清理那一句要把"执行前快照没兜住"一起带上屏（那是删完才发现没有退路的那一半）。
     ///
     /// 三条腿：①`snapshot_warning` 为空 ⇒ 屏上就是 core 那一句话，一个字都不许多
