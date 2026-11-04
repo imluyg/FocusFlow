@@ -13,6 +13,16 @@ const SHORTCUT_NAME: &str = "FocusFlow.lnk";
 const RUN_REG_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_APPROVED_PATH: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+/// 启动文件夹那一份快捷方式的「任务管理器开关」。
+///
+/// 与上面那一格不是同一个键：快捷方式在任务管理器「启动」页里被关掉时，Windows 把
+/// `03` 开头的二进制值写在这里，值名是快捷方式的**文件名**（本机实测：
+/// `FocusFlow.lnk = 02 00 00 00 00 00 00 00 00 00 00 00`）。只看 .lnk 在不在，
+/// 就会在用户关掉之后仍念「已启用」，而开机什么都不会发生。
+const STARTUP_FOLDER_APPROVED_PATH: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
+/// 那一格的值名就是启动文件夹里那份快捷方式的文件名。
+const APPROVED_VALUE_NAME: &str = SHORTCUT_NAME;
 
 /// 启动文件夹。
 fn startup_dir() -> PathBuf {
@@ -204,19 +214,51 @@ fn remove_legacy_registry() {
     }
 }
 
+/// `StartupApproved` 那一格的值（REG_BINARY，12 字节）说什么：第一字节偶数 = 启用、
+/// 奇数 = 禁用。
+///
+/// 本机实测启用档是 `02 00 00 00 00 00 00 00 00 00 00 00`；任务管理器里关掉之后第一
+/// 字节变成 `03`（后面跟一个 FILETIME）。同族的 `06/07` 也按奇偶读。空值/没有这一条
+/// 覆盖 ⇒ `None`（系统默认允许，不是"被禁用"）。
+fn approved_says_enabled(data: &[u8]) -> Option<bool> {
+    data.first().map(|first| first & 1 == 0)
+}
+
+/// 这一格现在允不允许开机启动：`None` = 没有这条覆盖（按允许处理）。
+fn approved_enabled(path: &str, value: &str) -> Option<bool> {
+    let key = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey_with_flags(path, winreg::enums::KEY_READ)
+        .ok()?;
+    // 这一格是 REG_BINARY：winreg 的 `get_value::<Vec<u8>>` 没有对应实现，读原始值。
+    let raw = key.get_raw_value(value).ok()?;
+    approved_says_enabled(&raw.bytes)
+}
+
+/// 把这一格里那条覆盖删掉：删了 = 回到"系统默认允许"，这正是「打开」该做的事。
+fn clear_approved(path: &str, value: &str) {
+    let _ = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey_with_flags(path, winreg::enums::KEY_SET_VALUE)
+        .and_then(|key| key.delete_value(value));
+}
+
 /// 是否已启用开机自启。
 pub fn is_autostart_enabled() -> bool {
     if shortcut_points_to_exe() {
-        return true;
+        // 快捷方式在、也指向本程序，但任务管理器那一格可能把这一条关掉了：此后开机
+        // 不会启动，只看 .lnk 会念「已启用」。没有那条覆盖时才按允许处理。
+        return approved_enabled(STARTUP_FOLDER_APPROVED_PATH, APPROVED_VALUE_NAME).unwrap_or(true);
     }
     // 兼容旧版本：Run 键仍存在且指向当前 exe
     if let Ok(key) = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
         .open_subkey_with_flags(RUN_REG_PATH, winreg::enums::KEY_READ)
     {
         if let Ok(val) = key.get_value::<String, _>("FocusFlow") {
-            return val
+            if val
                 .to_lowercase()
-                .contains(&exe_path().to_string_lossy().to_lowercase());
+                .contains(&exe_path().to_string_lossy().to_lowercase())
+            {
+                return approved_enabled(STARTUP_APPROVED_PATH, "FocusFlow").unwrap_or(true);
+            }
         }
     }
     false
@@ -227,6 +269,9 @@ pub fn enable_autostart() -> (bool, String) {
     match create_shortcut() {
         Ok(lnk) => {
             remove_legacy_registry();
+            // 任务管理器里被关过的那一条要一起删掉：只重建 .lnk 的话 Windows 照旧不
+            // 启动它，而这一头会报「已启用」。
+            clear_approved(STARTUP_FOLDER_APPROVED_PATH, APPROVED_VALUE_NAME);
             tracing::info!("已启用开机自启: {}", lnk.display());
             (true, "已启用开机自启，开机后将自动后台运行".to_string())
         }
@@ -247,6 +292,8 @@ pub fn disable_autostart() -> (bool, String) {
         true
     };
     remove_legacy_registry();
+    // 快捷方式没了，这一格就只剩一条陈旧标记：一并收掉，别留给下一次「打开」。
+    clear_approved(STARTUP_FOLDER_APPROVED_PATH, APPROVED_VALUE_NAME);
     if r1 {
         tracing::info!("已取消开机自启");
         (true, "已取消开机自启".to_string())
@@ -409,6 +456,60 @@ mod tests {
             norm_path(&target),
             norm_path(&exe_path().to_string_lossy()),
             "链接指向的本体应当就是当前 exe"
+        );
+    }
+
+    /// 任务管理器那一格：第一字节偶数 = 启用、奇数 = 禁用。
+    ///
+    /// 启用档的字节形状是本机实测（`StartupApproved\StartupFolder\FocusFlow.lnk`），
+    /// 不是照文档猜的；`None` 表示没有这条覆盖，调用方按"允许"处理。
+    #[test]
+    fn the_task_manager_switch_is_read_off_the_first_byte() {
+        assert_eq!(
+            approved_says_enabled(&[0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Some(true),
+            "实测的启用档"
+        );
+        assert_eq!(
+            approved_says_enabled(&[0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Some(false),
+            "任务管理器关掉之后是 03 开头"
+        );
+        assert_eq!(approved_says_enabled(&[0x06]), Some(true), "同族启用档");
+        assert_eq!(approved_says_enabled(&[0x07]), Some(false), "同族禁用档");
+        assert_eq!(approved_says_enabled(&[]), None, "没有这条覆盖 ≠ 被禁用");
+    }
+
+    /// 读与清要接在「状态 / 打开 / 关闭」三条路上（注册表 I/O 本身无头测不了，
+    /// 但"接没接上"能在生产段源码上问）。
+    #[test]
+    fn the_task_manager_switch_is_wired_into_all_three_paths() {
+        let src = include_str!("autostart.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let body = |head: &str| -> String {
+            let at = prod.find(head).unwrap_or_else(|| panic!("{head} 不见了"));
+            let rest = &prod[at..];
+            let end = rest.find("\n}\n").expect("函数体切不出来");
+            rest[..end].to_string()
+        };
+        let enabled = body("pub fn is_autostart_enabled(");
+        assert!(
+            enabled.contains("approved_enabled(STARTUP_FOLDER_APPROVED_PATH, APPROVED_VALUE_NAME)"),
+            "状态那一头不读任务管理器的开关：被关掉之后仍会念「已启用」"
+        );
+        let on = body("pub fn enable_autostart(");
+        assert!(
+            on.contains("clear_approved(STARTUP_FOLDER_APPROVED_PATH, APPROVED_VALUE_NAME)"),
+            "打开那一头不清旧标记：任务管理器关过之后，重建 .lnk 也不会真的开机启动"
+        );
+        let off = body("pub fn disable_autostart(");
+        assert!(
+            off.contains("clear_approved(STARTUP_FOLDER_APPROVED_PATH, APPROVED_VALUE_NAME)"),
+            "关闭那一头留着一条陈旧标记"
+        );
+        assert_eq!(
+            APPROVED_VALUE_NAME, SHORTCUT_NAME,
+            "那一格的值名是快捷方式文件名"
         );
     }
 }
