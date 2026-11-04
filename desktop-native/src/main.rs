@@ -8313,13 +8313,31 @@ fn modal_field_box(row: D2D_RECT_F) -> D2D_RECT_F {
     rect(row.left + 146.0, row.top + 3.0, width, 26.0)
 }
 
+/// 弹窗正文最多画几行：高度按它算，绘制也只画这么多（多出来的行要明说）。
+const MODAL_CONTENT_MAX_LINES: usize = 8;
+
+/// 弹窗正文实际要排出来的那几行。行数一旦超过 [`MODAL_CONTENT_MAX_LINES`]，最后一行
+/// 让给「还有几行没显示」—— 悄悄少画等于让用户以为弹窗里就这么多，而分类明细恰好
+/// 是"越多行越说明本月记得多"的那一类内容。
+fn modal_content_plan(content: &str, max: usize) -> Vec<String> {
+    let all: Vec<&str> = content.lines().collect();
+    let max = max.max(1);
+    if all.len() <= max {
+        return all.into_iter().map(str::to_string).collect();
+    }
+    let kept = max - 1;
+    let mut out: Vec<String> = all[..kept].iter().map(|s| s.to_string()).collect();
+    out.push(format!("…（还有 {} 行没显示）", all.len() - kept));
+    out
+}
+
 fn modal_geom(m: &ModalRef<'_>, w: f32, h: f32) -> ModalGeom {
     let pad = 20.0;
     let dw = (w - 64.0).clamp(380.0, 560.0);
     let lines = if m.content.is_empty() {
         0
     } else {
-        m.content.lines().count().min(8)
+        m.content.lines().count().min(MODAL_CONTENT_MAX_LINES)
     };
     let content_h = if lines == 0 {
         0.0
@@ -8420,7 +8438,14 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
     p.text("✕", g.close, &p.fmt.center_small, &p.br.muted);
 
     if let Some(cr) = g.content {
-        p.text(m.content, cr, &p.fmt.caption, &p.br.muted);
+        // 每一行自己夹：正文是插件写的，长分类名／错误原因会一路画到卡片外面。
+        let width = cr.right - cr.left;
+        let text = modal_content_plan(m.content, MODAL_CONTENT_MAX_LINES)
+            .iter()
+            .map(|line| p.clip(line, &p.fmt.caption, width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        p.text(&text, cr, &p.fmt.caption, &p.br.muted);
     }
 
     for (i, f) in m.fields.iter().enumerate() {
@@ -8469,6 +8494,71 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
         &p.fmt.center_small,
         &p.br.white,
     );
+}
+
+#[cfg(test)]
+mod modal_content_tests {
+    use super::*;
+
+    fn modal<'a>(
+        content: &'a str,
+        fields: &'a [focusflow_core::plugins::FormField],
+        buttons: &'a [(String, String)],
+    ) -> ModalRef<'a> {
+        ModalRef {
+            id: "m",
+            title: "统计结果",
+            submit: "s",
+            submit_text: "",
+            cancel: "",
+            content,
+            open: true,
+            fields,
+            buttons,
+        }
+    }
+
+    /// 正文行数超上限时，几何按上限留高、绘制也只画这么多行，最后一行说还有几行没显示 ——
+    /// 从前绘制把全部行画出去，而高度只按 8 行算：分类一多，字就压在下面那排按钮上。
+    #[test]
+    fn a_long_modal_body_is_capped_and_says_how_much_is_hidden() {
+        let content = (1..=20)
+            .map(|i| format!("第{i}行"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let m = modal(&content, &[], &[]);
+        let g = modal_geom(&m, 1200.0, 900.0);
+        let rows = modal_content_plan(m.content, MODAL_CONTENT_MAX_LINES);
+        assert_eq!(
+            rows.len(),
+            MODAL_CONTENT_MAX_LINES,
+            "画出来的行数要等于留高的行数"
+        );
+        assert_eq!(rows.last().unwrap(), "…（还有 13 行没显示）");
+        assert_eq!(rows[0], "第1行");
+        assert_eq!(rows[MODAL_CONTENT_MAX_LINES - 2], "第7行");
+        let cr = g.content.expect("有正文就该留出内容区");
+        assert!(
+            (cr.bottom - cr.top - rows.len() as f32 * 18.0).abs() < 0.01,
+            "内容区高度要装得下这几行：{}",
+            cr.bottom - cr.top
+        );
+        assert!(
+            cr.bottom <= g.dialog.bottom - 48.0,
+            "正文压到了底部按钮那一排"
+        );
+    }
+
+    /// 短正文原样画，不许为了"统一"把最后一行换成提示。
+    #[test]
+    fn a_short_modal_body_is_drawn_verbatim() {
+        let m = modal("第一行\n第二行", &[], &[]);
+        let rows = modal_content_plan(m.content, MODAL_CONTENT_MAX_LINES);
+        assert_eq!(rows, vec!["第一行".to_string(), "第二行".to_string()]);
+        let g = modal_geom(&m, 1200.0, 900.0);
+        let cr = g.content.expect("两行正文也该留出内容区");
+        assert!((cr.bottom - cr.top - 2.0 * 18.0).abs() < 0.01);
+    }
 }
 
 // ===== 插件 =====
