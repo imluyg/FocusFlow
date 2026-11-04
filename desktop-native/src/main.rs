@@ -7289,7 +7289,11 @@ const PV_TABLE_ROW_H: f32 = 20.0;
 /// **上限不许小于一页的条数**：内置记账本按每页 10 条查、再靠分页条翻页，上限是 6 时
 /// 每页后 4 条被画没而 `total` 照旧把它们算进去 —— 翻到哪一页都只看得到前 6 条，
 /// 而且没有任何一处说这件事（见 `the_table_row_cap_does_not_hide_a_page_of_the_ledger`）。
-const PV_TABLE_MAX_ROWS: usize = 10;
+///
+/// 这一格是**画得动的安全阀，不是分页**：内置那两张长表（Edge 近 30 天、番茄历史 20 条）
+/// 必须整张画得出来，所以上限按它们取，而不是按"一屏塞得下几行"。真超过上限时表下方
+/// 会明说还有几行没画（`table_truncated_note`），不许悄悄少画。
+const PV_TABLE_MAX_ROWS: usize = 50;
 /// 一张插件图表占多高（卡片本体，含轴）。
 ///
 /// 与内置页那张「每日活跃趋势」不同一处：那一块的高度跟着窗口走，这一块的正文没有滚动以外的
@@ -7308,6 +7312,14 @@ const PV_FIELD_W: f32 = 406.0;
 /// 分页条：左边那句「第 x / y 页 · 共 n 条」占多宽，右边两颗按钮各多宽。
 const PV_PAGER_LABEL_W: f32 = 190.0;
 const PV_PAGER_BTN_W: f32 = 76.0;
+
+/// 一张表被截断时，表下面那一句：明说总行数与画出来的行数。
+fn table_truncated_note(total_rows: usize) -> String {
+    format!(
+        "这张表共 {total_rows} 行，只画了前 {} 行（面板没有表格内滚动；要翻页请用 pager）",
+        PV_TABLE_MAX_ROWS.min(total_rows)
+    )
+}
 
 /// 按钮宽度：按文字量算、不低于 96。画与命中都读这一个数（从前同一个算式在两处各写一遍）。
 fn pv_button_width(text: &str, avail: f32) -> f32 {
@@ -7542,6 +7554,16 @@ fn plugin_view_ops(
                     sel: plugin_sel.get(group.as_str()).cloned().unwrap_or_default(),
                 });
                 *y += h + 6.0;
+                // 真超过上限时把"少画了几行"写在表下面：悄悄少画等于让用户以为表里就这么多，
+                // 而插件那边 `total`/行数说的又是另一个数。内置那几张表都在上限以内，
+                // 这一句是给第三方长表兜底的（要翻页请改用 pager）。
+                if rows.len() > PV_TABLE_MAX_ROWS {
+                    ops.push(POp::Label {
+                        rect: rect(x, *y, w, 18.0),
+                        text: table_truncated_note(rows.len()),
+                    });
+                    *y += 22.0;
+                }
             }
             Widget::Pager {
                 page,
@@ -15153,6 +15175,15 @@ mod plugin_sel_tests {
             rows.len(),
             "ids 与画出来的行分家：多出来那些行没有像素，却有点击区"
         );
+        // 截断不许悄悄发生：表下面要有一句说明总行数与画出来的行数。
+        let Some(POp::Label { text, .. }) = ops.get(1) else {
+            panic!("表被截断了却没有那一句说明（实得 {} 项）", ops.len());
+        };
+        assert!(
+            text.contains(&over.to_string()) && text.contains(&PV_TABLE_MAX_ROWS.to_string()),
+            "说明里要同时有总行数 {over} 与画出来的 {PV_TABLE_MAX_ROWS}：{text}"
+        );
+        assert_eq!(ops.len(), 2, "截断时只多这一句，不该多出别的控件");
         for i in 0..ids.len() {
             let row = pv_table_row_rect(r, i);
             assert!(
@@ -15719,6 +15750,56 @@ mod pager_shape_tests {
             (n_tops[0] - n_tops[1]).abs() < 0.01 && n_tops[2] > n_tops[1] + 1.0,
             "窄窗里第三格该换行：{n_tops:?}"
         );
+    }
+
+    /// 内置那两张长表（Edge 近 30 天、番茄历史 20 条）都必须整张画得出来：上限比它们小
+    /// 的话，表里永远只有前几行，而标题说的天数/条数照旧 —— 这是一处会"看着没问题"的少数据，
+    /// 只有把随包 Lua 里那个数读出来对一下才盯得住。
+    #[test]
+    fn the_table_row_cap_covers_the_shipped_long_tables() {
+        let call_arg = |src: &str, call: &str| -> usize {
+            let at = src
+                .find(call)
+                .unwrap_or_else(|| panic!("{call} 那一处找不到了：这条判据失去锚点"));
+            src[at + call.len()..]
+                .split(')')
+                .next()
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or_else(|| panic!("{call} 后面那个数读不出来"))
+        };
+        let edge = include_str!("../../crates/core/plugins/edge_history_plugin.lua");
+        let pomo = include_str!("../../crates/core/plugins/pomodoro_plugin.lua");
+        for (who, rows) in [
+            ("Edge 趋势", call_arg(edge, "focusflow.edge_counts(")),
+            ("番茄历史", call_arg(pomo, "focusflow.pomodoro_sessions(")),
+        ] {
+            assert!(
+                PV_TABLE_MAX_ROWS >= rows,
+                "表格最多画 {PV_TABLE_MAX_ROWS} 行，而{who}要画 {rows} 行：后面那些永远看不到"
+            );
+            // 行为腿：那一整张表真的排出来，且没有多出"被截断"那句。
+            let view = PluginView {
+                title: who.to_string(),
+                widgets: vec![Widget::Table {
+                    headers: vec!["一".to_string()],
+                    rows: (0..rows).map(|i| vec![format!("{i}")]).collect(),
+                    ids: (0..rows).map(|i| format!("{i}")).collect(),
+                    actions: vec![],
+                    group: String::new(),
+                    onselect: String::new(),
+                }],
+            };
+            let ops = plugin_view_ops(&view, rect(0.0, 0.0, 800.0, 600.0), 0.0, &HashMap::new());
+            let Some(POp::Table {
+                rows: drawn, ids, ..
+            }) = ops.first()
+            else {
+                panic!("{who} 的表格没排出来");
+            };
+            assert_eq!(drawn.len(), rows, "{who} 那一整张表该都画出来");
+            assert_eq!(ids.len(), drawn.len(), "{who} 的 ids 与行要一起截");
+            assert_eq!(ops.len(), 1, "{who} 没超上限，不该多出截断说明");
+        }
     }
 
     /// 表格行数上限不许小于随包记账本一页的条数：上限更小时每页后几条永远不会画出来，

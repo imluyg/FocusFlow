@@ -208,8 +208,14 @@ function get_view()
 
     local widgets = {
         { type = "heading", text = "任务列表" },
-        { type = "button", id = "refresh", text = "刷新" },
-        { type = "button", id = "add", text = "添加示例任务" },
+        -- 两颗按钮同一行（宿主的 `row` 是横排）：写成两个独立控件就是两行。
+        {
+            type = "row",
+            children = {
+                { type = "button", id = "refresh", text = "刷新" },
+                { type = "button", id = "add", text = "添加示例任务" },
+            },
+        },
         { type = "separator" },
         {
             type = "table",

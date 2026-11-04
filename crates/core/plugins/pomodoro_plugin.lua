@@ -164,11 +164,17 @@ function _build_widgets()
         { type = "keyvalue", key = "今日完成", value = tostring(summary_count) .. " 个" },
         { type = "keyvalue", key = "今日键鼠", value = tostring(summary_keys) },
         { type = "separator" },
-        { type = "button", id = "start_work", text = "开始工作" },
-        { type = "button", id = "start_break", text = "开始休息" },
-        { type = "button", id = "toggle_pause", text = "暂停/继续" },
-        { type = "button", id = "stop", text = "停止（记为完成）" },
-        { type = "button", id = "skip", text = "跳过（作废这一段）" },
+        -- 一排按钮放同一个 `row` 里（宿主的 row 是横排）：写成五个独立控件就是五行。
+        {
+            type = "row",
+            children = {
+                { type = "button", id = "start_work", text = "开始工作" },
+                { type = "button", id = "start_break", text = "开始休息" },
+                { type = "button", id = "toggle_pause", text = "暂停/继续" },
+                { type = "button", id = "stop", text = "停止（记为完成）" },
+                { type = "button", id = "skip", text = "跳过（作废这一段）" },
+            },
+        },
         { type = "label", text = "「停止」把已计到的时间落库并计入今日完成；「跳过」是作废这一段，既不落库也不计数。" },
     }
 
