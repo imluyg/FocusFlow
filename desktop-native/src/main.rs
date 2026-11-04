@@ -8268,9 +8268,33 @@ fn select_menu_geom(
     (menu, items, start)
 }
 
+/// 下拉菜单里那一句空态：没有可选项时不能只画一块空卡片。
+///
+/// `Widget::Select` 的 `options` 来自插件（可能查空了），空菜单在屏上只是一块 32px
+/// 的小白卡——与「点了没反应 / 控件坏了」分不开。与图表空数据写「暂无数据」同一条。
+fn empty_select_note(options: usize) -> Option<&'static str> {
+    (options == 0).then_some("没有可选项")
+}
+
 fn draw_select_menu(p: &P<'_>, w: f32, h: f32, sel: &PvSelect) {
     let (menu, items, start) = select_menu_geom(sel.anchor, sel.options.len(), sel.scroll, w, h);
     p.overlay_card(menu, R_CONTROL);
+    // 空下拉不许只留一块空白小卡：那一块与"点坏了"在屏上分不开（与图表空数据那条
+    // 「暂无数据」同一个口径）。
+    if let Some(note) = empty_select_note(sel.options.len()) {
+        p.text(
+            &p.clip(note, &p.fmt.caption, menu.right - menu.left - 12.0),
+            rect(
+                menu.left + 6.0,
+                menu.top + 4.0,
+                menu.right - menu.left - 12.0,
+                18.0,
+            ),
+            &p.fmt.caption,
+            &p.br.muted,
+        );
+        return;
+    }
     for (i, ir) in items.iter().enumerate() {
         let Some((val, label)) = sel.options.get(start + i) else {
             break;
@@ -20879,6 +20903,35 @@ mod plugin_view_title_tests {
         assert!(
             prod.contains("&p.clip(&title, &p.fmt.body, title_rect.right - title_rect.left)"),
             "插件视图标题没夹宽：长标题会画到卡片外"
+        );
+    }
+}
+
+/// 空下拉：一块空白小卡在屏上与「点坏了」分不开，要写一句话。
+#[cfg(test)]
+mod select_menu_tests {
+    use super::{empty_select_note, rect, select_menu_geom};
+
+    #[test]
+    fn an_empty_select_menu_says_so_instead_of_drawing_a_blank_card() {
+        assert_eq!(empty_select_note(0), Some("没有可选项"));
+        assert_eq!(empty_select_note(1), None, "有选项时不该多出这一句");
+
+        // 空菜单那一格装得下那行字：菜单高 = 1×24 + 8，文字 18 高、顶部留 4。
+        let (menu, items, _) =
+            select_menu_geom(rect(100.0, 100.0, 260.0, 24.0), 0, 0, 1200.0, 860.0);
+        assert!(items.is_empty(), "空 options 不该排出任何选项格");
+        assert!(
+            menu.bottom - menu.top >= 4.0 + 18.0,
+            "空菜单那一格装不下一行字：{menu:?}"
+        );
+
+        // 接线：画的那一头用这句空态（函数名在别处出现不算）。
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        assert!(
+            prod.contains("if let Some(note) = empty_select_note(sel.options.len()) {"),
+            "空下拉又画成一块空白卡"
         );
     }
 }
