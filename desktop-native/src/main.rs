@@ -8339,6 +8339,8 @@ struct ModalGeom {
     content: Option<D2D_RECT_F>,
     /// 每个字段一行（label 在左，值框用 [`modal_field_box`]）。
     fields: Vec<D2D_RECT_F>,
+    /// 字段多到装不下时，最后那一行的说明（还有几项没显示）。
+    fields_note: Option<(D2D_RECT_F, String)>,
     /// 底部自定义按钮：(矩形, 文字)。
     buttons: Vec<(D2D_RECT_F, String)>,
     submit: D2D_RECT_F,
@@ -8430,11 +8432,34 @@ fn modal_geom(m: &ModalRef<'_>, w: f32, h: f32) -> ModalGeom {
         ))
     };
     let mut y = dialog.top + 52.0 + content_h;
+    // 字段是插件给的、数量没有上限，而 `dh` 被窗口高度夹住：从前照着
+    // `m.fields.len()` 一路往下排，多出来的行画到「取消/确定」底下、再画到卡片外面。
+    // 装得下几行就画几行，最后一行让给「还有 N 项没显示」——与正文 `capped_lines`
+    // 同一套口径：可以少画，不许悄悄少画。
+    let bottom_row_top = dialog.bottom - 48.0;
+    let room = ((bottom_row_top - y) / MODAL_FIELDS_ROW_H).floor().max(0.0) as usize;
+    let (shown, hidden) = if m.fields.len() <= room {
+        (m.fields.len(), 0)
+    } else {
+        // 一行都放不下时连说明也没有落脚处：这时没有"说了也看得见"的选项。
+        let keep = room.saturating_sub(1);
+        (keep, m.fields.len() - keep)
+    };
     let mut fields = Vec::new();
-    for _ in m.fields {
+    for _ in 0..shown {
         fields.push(rect(dialog.left + pad, y, dw - pad * 2.0, 32.0));
         y += MODAL_FIELDS_ROW_H;
     }
+    let fields_note = if hidden == 0 || shown == 0 {
+        // 一行都放不下时连说明也没有落脚处（写在动作行上等于盖住按钮）：
+        // 这一档只剩"窗口太矮"，不是字段太多。
+        None
+    } else {
+        Some((
+            rect(dialog.left + pad, y, dw - pad * 2.0, 30.0),
+            format!("…（还有 {hidden} 项没显示）"),
+        ))
+    };
     let submit = rect(dialog.right - pad - 88.0, dialog.bottom - 48.0, 88.0, 28.0);
     let cancel = rect(submit.left - 8.0 - 72.0, dialog.bottom - 48.0, 72.0, 28.0);
     // 自定义按钮排在左半边。右边是「取消 / 确定」，而命中先问它们：伸过去的那一颗
@@ -8466,6 +8491,7 @@ fn modal_geom(m: &ModalRef<'_>, w: f32, h: f32) -> ModalGeom {
         close,
         content,
         fields,
+        fields_note,
         buttons,
         submit,
         cancel,
@@ -8559,6 +8585,16 @@ fn draw_plugin_modal(p: &P<'_>, w: f32, h: f32, m: &ModalRef<'_>) {
                 &p.br.muted,
             );
         }
+    }
+
+    if let Some((nr, note)) = &g.fields_note {
+        // 字段没画全是插件那份表单超出窗口兜不住的情况：与正文同一句口径，明说还有几项。
+        p.text(
+            &p.clip(note, &p.fmt.caption, nr.right - nr.left),
+            *nr,
+            &p.fmt.caption,
+            &p.br.muted,
+        );
     }
 
     for (br, label) in &g.buttons {
@@ -20305,6 +20341,75 @@ mod modal_content_tests {
                 "按钮被压得连一颗字都放不下：{br:?}"
             );
         }
+    }
+
+    /// 字段数量是插件给的、没有上限，而弹窗高度被窗口夹住：装不下的字段行不许
+    /// 画到「取消 / 确定」底下，也不许在卡片外面留一块看不见的命中区。
+    /// 最后一行改成「还有几项没显示」——与正文那条同一套口径。
+    #[test]
+    fn extra_fields_stop_above_the_action_row_and_say_how_many_are_hidden() {
+        let fields: Vec<focusflow_core::plugins::FormField> = (0..40)
+            .map(|i| focusflow_core::plugins::FormField {
+                kind: "text".into(),
+                field: format!("f{i}"),
+                label: format!("字段{i}"),
+                value: String::new(),
+                options: Vec::new(),
+                refresh: false,
+            })
+            .collect();
+        let m = modal("", &fields, &[]);
+        let g = modal_geom(&m, 900.0, 900.0);
+        assert!(
+            g.fields.len() < fields.len(),
+            "四十项都排进去了：这一跑没走到截断那一支"
+        );
+        assert!(!g.fields.is_empty(), "九百高的窗口至少放得下几项");
+        for row in &g.fields {
+            assert!(
+                row.bottom <= g.dialog.bottom - 48.0 + 0.01,
+                "字段行画到了底部动作那一排：{row:?} vs dialog {:?}",
+                g.dialog
+            );
+        }
+        let (note_rect, note) = g.fields_note.as_ref().expect("装不下就要有说明行");
+        let hidden = fields.len() - g.fields.len();
+        assert!(
+            note.contains(&hidden.to_string()),
+            "说明要说出还有几项：{note}（实有 {hidden} 项没画）"
+        );
+        assert!(
+            note_rect.bottom <= g.dialog.bottom - 48.0 + 0.01,
+            "说明行也压到了底部按钮：{note_rect:?}"
+        );
+        // 命中只认 `g.fields` 里那几行：说明行不是字段，点它不该开编辑框。
+        let below_drawn = g.fields.last().unwrap().bottom + 1.0;
+        assert!(
+            !matches!(
+                modal_hit(&m, &g, g.dialog.left + 200.0, below_drawn),
+                Some(ModalHit::Field(_))
+            ),
+            "没画出来的字段还留着看不见的点击区"
+        );
+    }
+
+    /// 装得下的时候一个都不许截：这条守住上一条别把正常表单也吞掉。
+    #[test]
+    fn a_short_form_is_not_capped_and_gets_no_note() {
+        let fields: Vec<focusflow_core::plugins::FormField> = (0..4)
+            .map(|i| focusflow_core::plugins::FormField {
+                kind: "text".into(),
+                field: format!("f{i}"),
+                label: format!("字段{i}"),
+                value: String::new(),
+                options: Vec::new(),
+                refresh: false,
+            })
+            .collect();
+        let m = modal("", &fields, &[]);
+        let g = modal_geom(&m, 900.0, 900.0);
+        assert_eq!(g.fields.len(), fields.len(), "正常表单被截了");
+        assert!(g.fields_note.is_none(), "正常表单多了说明行");
     }
 }
 
