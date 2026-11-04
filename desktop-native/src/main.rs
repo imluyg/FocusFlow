@@ -18657,7 +18657,12 @@ mod clip_tests {
             // Field 与 Select 的标签同一格同一定宽 ⇒ 两处
             ("p.clip(label,&p.fmt.caption,140.0),rect(r.left,r.top+4.0,140.0,18.0)", 2),
             ("p.clip(value,&p.fmt.caption,vb.right-vb.left-16.0)", 1),
-            ("p.clip(value,&p.fmt.caption,vb.right-vb.left-28.0)", 1),
+            // Select 的值格：可编辑时右边让 28 px 给箭头，只读时只留 16 —— 夹取与画它的
+            // 矩形共用同一个 value_w（从前两处都写死 28，只读那一档会白留一段）。
+            (
+                "p.clip(value,&p.fmt.caption,value_w),rect(vb.left+8.0,vb.top+3.0,value_w,18.0)",
+                1,
+            ),
             ("p.clip(htxt,&p.fmt.caption,cw-12.0),rect(r.left+6.0+iasf32*cw,r.top+4.0,cw-12.0,16.0)", 1),
             ("p.clip(cell,&p.fmt.small,cw-12.0),rect(rr.left+6.0+ciasf32*cw,rr.top+2.0,cw-12.0,16.0)", 1),
             // 下拉菜单的每一项：选项文字是插件给的（分类名可以很长）
