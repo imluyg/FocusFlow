@@ -83,7 +83,13 @@ pub fn meta_for(stem: &str) -> Result<Option<PackageMeta>, String> {
 /// 把格式化收在这里（而不是页面里）有两个理由：页面不在 GUI 线程之外读文件；
 /// 而"没有记录"与"读不出来"必须是两句不同的话（本仓那一族缺陷的固定形状）。
 pub fn source_line(stem: &str) -> String {
-    match meta_for(stem) {
+    source_line_of(&meta_for(stem))
+}
+
+/// [`source_line`] 的纯函数那一半：页面读一次记录，顺手把"装没装过"与那句话一起拿到，
+/// 不必为同一份文件读两遍。
+pub fn source_line_of(meta: &Result<Option<PackageMeta>, String>) -> String {
+    match meta {
         Ok(Some(meta)) => {
             let hash = meta
                 .content_hash
@@ -99,6 +105,11 @@ pub fn source_line(stem: &str) -> String {
         Ok(None) => "来源：手放进插件目录（没有安装记录）".to_string(),
         Err(e) => format!("来源：安装记录读不出来（{e}）"),
     }
+}
+
+/// 这一格是不是**通过安装进来的**包（有安装记录 ⇒ 才有包文件可卸）。
+pub fn is_installed(meta: &Result<Option<PackageMeta>, String>) -> bool {
+    matches!(meta, Ok(Some(_)))
 }
 
 /// 记录里存的是完整的 RFC3339（带纳秒与时区）；页面上只留到分钟。
