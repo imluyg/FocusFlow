@@ -11,7 +11,8 @@
 //! - `focusflow.store.get/set/delete/list/clear/flush` -> 这个插件自己的 KV（`state.json`）
 
 use std::collections::HashSet;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use mlua::{Lua, Table};
 
@@ -29,7 +30,12 @@ use crate::scheduler;
 // 用 `Mutex<Option<Arc<_>>>` 而不是 `OnceLock`：停用插件时要能拆掉后台线程，
 // 而 OnceLock 占用后永远换不进去，用户重新启用插件时线程不会再起来。
 static POMODORO: Mutex<Option<Arc<PomodoroTimer>>> = Mutex::new(None);
-static POMODORO_DB: OnceLock<()> = OnceLock::new();
+/// 哪一份番茄钟库已经建过 schema。**按路径记**，不是"本进程建过一次就永远算"。
+///
+/// 数据目录是会换的（每个用例一套临时目录；产品侧的换目录/回滚也一样）。只记一个
+/// boolean 会让换过去之后的那份库永远没人建表 —— 症状是本进程里每次 `save_session`
+/// 都报 "no such table"，而用户只说"这几周一条都没存下"。
+static POMODORO_DB: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
 
 /// 调度线程额外记一份「哪些插件在用它」。
 ///
@@ -53,6 +59,9 @@ static SCHEDULER: LazyLock<Mutex<SchedulerSlot>> = LazyLock::new(|| {
 fn pomodoro_timer() -> Arc<PomodoroTimer> {
     let mut slot = POMODORO.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(t) = slot.as_ref() {
+        // 缓存的是"当前会话"，不是"当前那一份库"：数据目录换了之后，新路径上的
+        // 那份库仍然需要自己的 schema（见 `POMODORO_DB` 的注释）。
+        ensure_pomodoro_db();
         // 上次 spawn 失败时实例照样缓存着；每次取用都再试一次（否则整个进程里
         // 倒计时永远不动，而面板每 2 秒读一次 `pomodoro_state` 正好当重试点）。
         if let Err(e) = t.ensure_tick_thread() {
@@ -76,15 +85,31 @@ fn pomodoro_timer() -> Arc<PomodoroTimer> {
 /// 闩就落下了、schema 永不重试 —— 之后整个进程里每次 `save_session` 都是
 /// "no such table"，而他不重启的话表现是"这好几周的番茄钟一条都没存下"。
 fn ensure_pomodoro_db() {
-    if POMODORO_DB.get().is_some() {
-        return;
+    let want = pomodoro::db_path();
+    {
+        let latch = POMODORO_DB.lock().unwrap_or_else(|e| e.into_inner());
+        if latch.as_deref() == Some(want.as_path()) {
+            return;
+        }
     }
     match pomodoro::init_db() {
         Ok(()) => {
-            let _ = POMODORO_DB.set(());
+            *POMODORO_DB.lock().unwrap_or_else(|e| e.into_inner()) = Some(want);
         }
         Err(e) => tracing::error!("番茄钟库初始化失败，下次调用会重试: {e}"),
     }
+}
+
+/// 测试专用：清掉番茄钟的单例与建库闩。
+///
+/// 用例各用一套临时数据目录，而这两样都是进程级的；不清的话，"上一个用例把单例
+/// 建在了它自己的目录里"会让当前用例看到"调用 API 之后库没建出来"——红的是当前
+/// 这条的断言，坏的是跨用例共享状态。
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn reset_pomodoro_for_test() {
+    *POMODORO.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *POMODORO_DB.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 番茄钟的持有者（插件文件名，与 `claim_scheduler` 同一个口径）。
@@ -1852,6 +1877,9 @@ mod tests {
     fn registering_host_api_creates_no_aux_databases() {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("host_lazy");
+        // 并行用例可能已经把番茄钟单例建在它自己的目录里了；这一条要问的是
+        // "当前这一份目录里该建什么"，不是"上一个用例留下了什么"。
+        reset_pomodoro_for_test();
 
         let lua = Lua::new();
         let database = db::Database::init_readonly();
@@ -1886,6 +1914,41 @@ mod tests {
             !crate::accounting::db_path().exists(),
             "记账库必须等记账 API 被调用才建"
         );
+    }
+
+    /// 换了数据目录之后，番茄钟库必须在新路径上重新建 schema。
+    ///
+    /// 这条盯的是两个进程级缓存的合成症状：单例里还坐着上一个目录的 timer、
+    /// 建库闩又记得"建过了" ⇒ 新目录那份库永远没人建表。并行跑用例时正是这个形状
+    /// （每条一套临时目录），而症状会红在隔壁那条"调用 API 后应建库"上。
+    #[test]
+    fn the_pomodoro_db_follows_a_data_dir_switch() {
+        let _lock = crate::paths::test_app_dir_lock();
+        {
+            let _a = crate::paths::test_app_dir("pomo_dir_a");
+            let lua = Lua::new();
+            let database = db::Database::init_readonly();
+            register_host_api(&lua, crate::config::instance(), database, "pomo_dir_a")
+                .expect("注册宿主 API");
+            lua.load("return focusflow.pomodoro_state()")
+                .eval::<mlua::Table>()
+                .expect("调用番茄钟 API");
+            assert!(crate::pomodoro::db_path().exists(), "第一份目录要先建出来");
+        }
+        // 上一份的 Drop 把 app_dir 撤到了哨兵；这里换到第二份。
+        let _b = crate::paths::test_app_dir("pomo_dir_b");
+        let lua = Lua::new();
+        let database = db::Database::init_readonly();
+        register_host_api(&lua, crate::config::instance(), database, "pomo_dir_b")
+            .expect("注册宿主 API");
+        lua.load("return focusflow.pomodoro_state()")
+            .eval::<mlua::Table>()
+            .expect("调用番茄钟 API");
+        assert!(
+            crate::pomodoro::db_path().exists(),
+            "换了数据目录，当前这一份也要有自己的库（单例还活着不等于库还在）"
+        );
+        reset_pomodoro_for_test();
     }
 
     /// 番茄钟那两条读数要把"没读全"的话交到 Lua 手上，而随包面板也确实接住了那一位。
