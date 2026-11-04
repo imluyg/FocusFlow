@@ -1018,6 +1018,15 @@ impl PluginManager {
             tracing::error!("插件名不能含逗号/换行（会破坏 [plugins] disabled 列表）: {stem}");
             return Err(format!("插件名不合法（含逗号或换行）: {stem}"));
         }
+        if stem.trim() != stem {
+            // `[plugins] disabled` 是逗号分隔的裸值，读回来时会 trim：写进去的 `" sp"`
+            // 读出来是 `"sp"`，于是"停用"当场卸了、重启又加载回来（页面还写着已启用）。
+            tracing::error!("插件名前后带空格，停用列表表示不了: {stem:?}");
+            return Err(format!(
+                "插件名前后带空格（{stem:?}）：停用列表按逗号分隔、读的时候会去掉首尾空格，\
+                 表示不了这个名字 —— 请把文件改个名再启用/停用"
+            ));
+        }
         // 扫一次，两次判断共用同一份清单：原先这里扫一遍、启用时再扫一遍，
         // 目录正在被整份替换时两半能各读到不同的东西（前一半说"在"、后一半找不到那个文件，
         // 于是配置写了、插件却没加载，页面还报成功）。
@@ -6069,6 +6078,30 @@ end
             16,
             "读不出来按默认值"
         );
+    }
+
+    /// 文件名前后带空格的插件停不掉：`[plugins] disabled` 是逗号分隔的裸值，读回来会
+    /// `trim` —— 写进去的 `" sp"` 读出来是 `"sp"`，于是"停用"当场卸了、重启又加载回来，
+    /// 页面重扫之后还写着已启用。表示不了的名字要当场说清，别写一份自己读不回来的账。
+    #[test]
+    fn a_stem_the_disabled_list_cannot_represent_is_refused() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("disabled_space_stem");
+        let dir = paths::plugins_user_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(" padded.lua");
+        std::fs::write(
+            &file,
+            "PLUGIN_NAME = \"sp\"\nfunction get_view() return { widgets = {} } end\n",
+        )
+        .unwrap();
+        let mut pm = manager_in(tmp.path());
+        pm.load_plugin(&file, PluginSource::User)
+            .expect("插件该装得上");
+        let err = pm
+            .set_enabled(" padded", false)
+            .expect_err("表示不了的名字要当场拒绝");
+        assert!(err.contains("空格"), "{err}");
     }
 
     /// 配置写不进盘时，停用**仍然要生效**：`set_now` 已经把内存那一档改了，配置的契约
