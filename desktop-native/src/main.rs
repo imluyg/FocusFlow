@@ -7491,7 +7491,11 @@ fn pv_op_claims_click(op: &POp, x: f32, y: f32) -> bool {
         POp::Table { rect, buttons, .. } => {
             hit(*rect, x, y) || buttons.iter().any(|(br, ..)| hit(*br, x, y))
         }
-        POp::Select { rect, .. } => hit(select_value_rect(*rect), x, y),
+        POp::Select { rect, field, .. } => {
+            // 没有 field 就写不回插件（与空 field 的输入框同一条）：菜单选完只会把
+            // 值写进空字段、视图照旧，看起来像"选了不生效"。这种下拉按只读展示。
+            !field.is_empty() && hit(select_value_rect(*rect), x, y)
+        }
         POp::Field { rect, field, .. } => {
             !field.is_empty() && hit(pv_field_value_rect(*rect), x, y)
         }
@@ -8078,6 +8082,7 @@ fn draw_plugin_view(
                 rect: r,
                 label,
                 value,
+                field,
                 ..
             } => {
                 p.text(
@@ -8087,20 +8092,26 @@ fn draw_plugin_view(
                     &p.br.muted,
                 );
                 let vb = select_value_rect(*r);
-                p.round(vb, R_CONTROL, &p.br.card, Some(&p.br.accent));
-                // 选中的那一项是插件给的记录名，右边 20 px 还要留给那个下拉箭头。
+                // 可改的给强调色边框与下拉箭头；没有 field 的与只读输入框同一套画法，
+                // 免得屏上看着能选、点了却不生效。
+                let editable = !field.is_empty();
+                let border = if editable { &p.br.accent } else { &p.br.border };
+                p.round(vb, R_CONTROL, &p.br.card, Some(border));
+                let value_w = vb.right - vb.left - if editable { 28.0 } else { 16.0 };
                 p.text(
-                    &p.clip(value, &p.fmt.caption, vb.right - vb.left - 28.0),
-                    rect(vb.left + 8.0, vb.top + 3.0, vb.right - vb.left - 28.0, 18.0),
+                    &p.clip(value, &p.fmt.caption, value_w),
+                    rect(vb.left + 8.0, vb.top + 3.0, value_w, 18.0),
                     &p.fmt.caption,
                     &p.br.fg,
                 );
-                p.text(
-                    "▾",
-                    rect(vb.right - 20.0, vb.top + 3.0, 16.0, 18.0),
-                    &p.fmt.center_small,
-                    &p.br.muted,
-                );
+                if editable {
+                    p.text(
+                        "▾",
+                        rect(vb.right - 20.0, vb.top + 3.0, 16.0, 18.0),
+                        &p.fmt.center_small,
+                        &p.br.muted,
+                    );
+                }
             }
             POp::Button {
                 rect: r,
@@ -16970,6 +16981,47 @@ mod pager_shape_tests {
         assert!(
             !pv_op_claims_click(&ops[0], cx, cy),
             "表格把分页条那一带的点击也认领了：分页条又会点不动"
+        );
+    }
+
+    /// 没有 field 的下拉写不回插件，按只读展示：不认领点击（与空 field 的输入框同一条）。
+    #[test]
+    fn a_select_without_a_field_is_display_only() {
+        let view = |field: &str| PluginView {
+            title: "下拉".to_string(),
+            widgets: vec![Widget::Select {
+                field: field.to_string(),
+                label: "分类".to_string(),
+                value: "食品".to_string(),
+                options: vec![("食品".to_string(), "食品".to_string())],
+                refresh: false,
+            }],
+        };
+        let ops = plugin_view_ops(
+            &view(""),
+            rect(0.0, 0.0, 800.0, 600.0),
+            0.0,
+            &HashMap::new(),
+        );
+        let Some(sel @ POp::Select { rect: r, .. }) = ops.first() else {
+            panic!("下拉没排出来：这条判据失去锚点");
+        };
+        let vb = select_value_rect(*r);
+        let (cx, cy) = ((vb.left + vb.right) / 2.0, (vb.top + vb.bottom) / 2.0);
+        assert!(
+            !pv_op_claims_click(sel, cx, cy),
+            "没有 field 的下拉不该认领点击：选完写不回插件"
+        );
+
+        let ops = plugin_view_ops(
+            &view("f_cat"),
+            rect(0.0, 0.0, 800.0, 600.0),
+            0.0,
+            &HashMap::new(),
+        );
+        assert!(
+            pv_op_claims_click(&ops[0], cx, cy),
+            "有 field 的下拉要照常能点"
         );
     }
 
