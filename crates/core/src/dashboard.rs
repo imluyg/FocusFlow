@@ -133,7 +133,8 @@ pub fn collect(range: DashRange, today_pending: i64) -> DashBoard {
     let days = range.days_including_today(today_date);
     let today = today_date.format("%Y-%m-%d").to_string();
 
-    let daily = queries::daily_counts_totals(days, None);
+    let daily_pages = queries::daily_counts_windows(days, crate::stats::GOAL_LOOKBACK_DAYS);
+    let (daily, goal_window) = daily_pages;
     let seconds = queries::daily_seconds_totals(days, None);
     let active_seconds = seconds.series.iter().map(|(_, v)| *v).sum::<i64>();
     let apps = queries::app_stats_totals(Some(days), None);
@@ -148,8 +149,10 @@ pub fn collect(range: DashRange, today_pending: i64) -> DashBoard {
             last.1 = last.1.saturating_add(today_pending);
         }
     }
-    // 连续天数也吃这份增量：否则刚打过键、还没落库的那一拍，KPI 会念「连续 0 天」
-    let streak = streak_days(&trend, &today, 0);
+    // 连续天数读**宽窗口**（`GOAL_LOOKBACK_DAYS`）：3.2.1 那张表写明它「不受范围影响
+    // （快照）」。拿页签这一档的 1/7/30 天序列去数，连续纪录会被窗口截断 —— 今天还没
+    // 敲键盘时更糟：`goal_status` 从昨天往前数，而昨天不在窗口里，屏上直接念「0 天」。
+    let streak = streak_days(&goal_window.series, &today, today_pending);
 
     let mut gaps: Vec<String> = Vec::new();
     for part in [
@@ -160,6 +163,14 @@ pub fn collect(range: DashRange, today_pending: i64) -> DashBoard {
         devices.unreadable,
     ] {
         gaps.extend(part);
+    }
+    // 连续天数那一段（370 天）坏掉的年份不在上面几份里：它的窗口比页签宽，缺读只会
+    // 让连续纪录变短。不说出来，KPI 会把一个偏小的数念成完整答案。
+    for why in goal_window.unreadable {
+        // 同一年如果页签那一份已经点过名，这里不再重复一遍。
+        if !gaps.iter().any(|g| why.contains(g.as_str())) {
+            gaps.push(format!("连续天数可能偏小：{why}"));
+        }
     }
 
     summarize(DashInput {
@@ -472,6 +483,41 @@ mod tests {
             streak_days(&weekend, &sun.format("%Y-%m-%d").to_string(), 0),
             2,
             "「连续自然日、周末不跳」是已确认过的口径"
+        );
+    }
+
+    /// 3.2.1 那张表把 `streak.days` 标成「不受范围影响（快照）」：选「今日」时，
+    /// 连续 12 天的纪录也必须照旧念 12，而不是被一格的窗口截成 1。
+    ///
+    /// 旧写法拿页签那一档的序列去数（今日 1 格 / 本周 7 格 / 本月 30 格），连续纪录
+    /// 于是随页签变短；今天还没敲键盘时更糟 —— 从昨天起算的那一段根本不在窗口里，
+    /// 屏上会念「连续 0 天」。夹具按日期各自写进它那一年，跨年也不靠日历碰运气。
+    #[test]
+    fn the_streak_is_not_clipped_by_the_selected_range() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("dash_streak_wide");
+        let today = chrono::Local::now().date_naive();
+        for i in 0..12 {
+            let d = today - chrono::Duration::days(i);
+            let year = d.year();
+            let conn = crate::db::connection::open_rw(&crate::paths::year_db_path(year))
+                .expect("打开年度库");
+            crate::db::connection::ensure_schema(&conn, year).expect("建表");
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (?1, 1)",
+                [crate::db::queries::day_key_of_date(d)],
+            )
+            .expect("写一条每日计数");
+        }
+        crate::db::queries::invalidate_years_cache();
+        crate::db::connection::clear_ro_cache();
+
+        let board = collect(DashRange::Today, 0);
+        assert_eq!(
+            board.kpi[2],
+            ("连续天数".to_string(), "12 天".to_string()),
+            "今日档把连续 12 天截成了窗口长度：{:?}",
+            board.kpi
         );
     }
 
