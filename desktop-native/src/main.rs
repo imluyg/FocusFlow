@@ -1014,6 +1014,16 @@ struct App {
     plugins_loaded: bool,
     /// 正在看哪个插件的视图（None = 插件清单）。
     plugin_open: Option<String>,
+    /// 正在看哪一格的详情（None = 不在详情页）。
+    ///
+    /// 存的是 stem 而不是展示名：详情页要拿它去问台账，而展示名是插件自己写的常量，
+    /// 两处对不上时（作者改名）会问到"另一格"的账上。与 `plugin_open` 互斥：
+    /// 视图页画 VM 交回的控件，详情页画台账，同一时刻只该有一个。
+    plugin_detail_open: Option<String>,
+    /// 详情页顶上「来源」那一句（打开详情时读一次安装记录；None = 不在详情页）。
+    ///
+    /// 存在这里而不是画的时候读盘：那一页每 100ms 被重画一次，读盘要在打开那一下。
+    plugin_detail_source: Option<String>,
     /// 上一拍开着的那一页（用来认出"关掉/换页"这一个转变）。
     ///
     /// 为什么不在三处关闭动作里各写一遍卸载：那三处迟早会漂移（本仓为"同一个手势的多个出口
@@ -1521,6 +1531,8 @@ impl App {
                 plugins_loaded: false,
                 dash: dashboard::Dash::new(),
                 plugin_open: None,
+                plugin_detail_open: None,
+                plugin_detail_source: None,
                 plugin_panel_was: None,
                 pv_scroll: 0,
                 pv_select: None,
@@ -1715,6 +1727,8 @@ impl App {
                 &self.search,
                 &self.plugin_rows,
                 self.plugin_err.as_deref(),
+                self.plugin_detail_open.as_deref(),
+                self.plugin_detail_source.as_deref(),
                 pv,
                 self.pv_scroll,
                 self.pv_select.as_ref(),
@@ -2089,6 +2103,7 @@ impl App {
             return;
         }
         if self.view == 4 {
+            tracing_note(&format!("点击插件页 at ({x:.0},{y:.0})"));
             // 插件视图打开时：弹窗/下拉 → 返回 → 视图里的控件。
             if let Some(name) = self.plugin_open.clone() {
                 let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
@@ -2309,6 +2324,25 @@ impl App {
                 }
                 return;
             }
+            // 详情页开着：只认「返回」，别的点法一律吞掉 —— 否则一次点击会落到身后那张
+            // 清单上（屏上画的是详情，点下去却打开了某个插件的视图）。
+            if let Some(stem) = self.plugin_detail_open.clone() {
+                // 与画那一支读同一份判断：这一格还在清单里，详情页才成立。
+                if matches!(
+                    plugin_page_of(None, Some(stem.as_str()), &self.plugin_rows),
+                    PluginPage::Detail(_)
+                ) {
+                    let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
+                    let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
+                    if hit(back, x, y) {
+                        self.close_plugin_detail(hwnd);
+                    }
+                    return;
+                }
+                // 那一格已经不在清单里了（文件被删/改名）：退回清单，让这一次点击按清单走。
+                self.plugin_detail_open = None;
+                self.plugin_detail_source = None;
+            }
             let (list_top, row_h, max_rows) = plugin_geom(w, h);
             // 命中读的是与画同一份格子表（[`plugin_slots`]）：表头占一格，
             // 少了这一格，装了内置模块之后每一次点击都会落到上面那一行去。
@@ -2326,6 +2360,9 @@ impl App {
                 let y0 = list_top + vis as f32 * row_h;
                 let row_rect = rect(32.0, y0, w - 64.0, row_h - 4.0);
                 if hit(row_rect, x, y) {
+                    // 验收脚本按坐标点插件行：这一句是那条点击唯一的对账痕迹
+                    // （点偏了与"按钮没反应"在屏上分不开）。
+                    tracing_note(&format!("点击插件行 {idx} at ({x:.0},{y:.0})"));
                     self.sel = Some(idx);
                     let vb = rect(row_rect.right - 76.0, y0 + 9.0, 60.0, 22.0);
                     // 命中条件与画它的条件同一个（`needs_grant`）：只画一颗不点不动的按钮、
@@ -2339,6 +2376,8 @@ impl App {
                         self.toggle_plugin(hwnd, idx);
                     } else if grantable && hit(plugin_grant_rect(row_rect.right, y0), x, y) {
                         self.grant_plugin(hwnd, idx);
+                    } else if hit(plugin_detail_rect(row_rect.right, y0), x, y) {
+                        self.open_plugin_detail(hwnd, idx);
                     } else if let Some(name) = self.plugin_rows.get(idx).map(|r| r.name.clone()) {
                         // 点行本身 = 看这个插件的视图
                         self.open_plugin_view(hwnd, &name);
@@ -3291,7 +3330,40 @@ impl App {
     }
 
     /// 打开某个插件的视图：先让插件重算 get_view，再读缓存。
+    /// 打开一格的详情页。
+    ///
+    /// **不加载插件**：详情读的是台账与清单，不是 VM 里的视图。所以这一条对停用的、
+    /// 加载失败的格子同样成立 —— 恰恰是那两种格子最需要一个"它到底怎么了"的地方。
+    fn open_plugin_detail(&mut self, hwnd: HWND, idx: usize) {
+        let Some(stem) = self.plugin_rows.get(idx).map(|r| r.stem.clone()) else {
+            return;
+        };
+        // 与视图互斥：屏上只有一张页，命中那一支也只认一个状态。
+        self.plugin_open = None;
+        self.plugin_detail_open = Some(stem.clone());
+        self.plugin_detail_source = Some(focusflow_core::plugins::install::source_line(&stem));
+        // ASCII 尾巴给验收脚本读：主体是中文，脚本里嵌中文匹配会踩编码坑
+        // （与热重载那一句同一条约定）。
+        tracing_note(&format!("打开插件详情：{stem} detail_open=1"));
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    fn close_plugin_detail(&mut self, hwnd: HWND) {
+        if self.plugin_detail_open.take().is_some() {
+            tracing_note("关掉插件详情 detail_open=0");
+        }
+        self.plugin_detail_source = None;
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
     fn open_plugin_view(&mut self, hwnd: HWND, name: &str) {
+        // 视图与详情互斥（见 `open_plugin_detail` 那一句）。
+        self.plugin_detail_open = None;
+        self.plugin_detail_source = None;
         self.ensure_plugin_manager();
         if let Some(pm) = self.pm.as_mut() {
             // `panel` 那一档是"打开这一页才装"（方案 3.14）：这一句就是那一步。
@@ -3307,7 +3379,8 @@ impl App {
         }
         self.plugin_open = Some(name.to_string());
         self.reset_plugin_view_state();
-        tracing_note(&format!("打开插件视图：{name}"));
+        // ASCII 尾巴给验收脚本读（与热重载那一句同一条约定）。
+        tracing_note(&format!("打开插件视图：{name} view_open=1"));
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
@@ -5466,6 +5539,40 @@ fn period_pills() -> [(i64, D2D_RECT_F); 6] {
     out
 }
 
+/// 第 4 个页签上该画哪一张。
+///
+/// 三张共用一个页签（清单 / 视图 / 详情），而"画哪一张"与"点哪儿有用"必须读同一份判断：
+/// 各写一套的症状是屏上画着详情、点击却按清单走（本仓在"画在 A、命中在 B"上踩过好几次）。
+#[derive(Clone, Copy, Debug)]
+enum PluginPage<'a> {
+    /// 某个插件的视图（VM 交回的控件）
+    View(&'a str, &'a focusflow_core::plugins::PluginView),
+    /// 某一格的详情；行取自清单，找不到就退回清单
+    Detail(&'a PluginRow),
+    List,
+}
+
+/// 视图 > 详情 > 清单。
+///
+/// 详情那一格按 **stem** 找回行：那一行若已经从清单里消失（文件被删/改名），
+/// 就画清单 —— 否则屏上会停在一张再也退不出去的页上（它的「返回」不会出现，
+/// 因为清单里已经没有它）。
+fn plugin_page_of<'a>(
+    view: Option<(&'a str, &'a focusflow_core::plugins::PluginView)>,
+    detail: Option<&'a str>,
+    rows: &'a [PluginRow],
+) -> PluginPage<'a> {
+    if let Some((name, view)) = view {
+        return PluginPage::View(name, view);
+    }
+    if let Some(stem) = detail {
+        if let Some(row) = rows.iter().find(|r| r.stem == stem) {
+            return PluginPage::Detail(row);
+        }
+    }
+    PluginPage::List
+}
+
 #[allow(clippy::too_many_arguments)] // 主区各视图共用这一个入口：拆开传会在每个调用点重排一遍同样的参数
 fn draw_screen(
     p: &P<'_>,
@@ -5481,6 +5588,9 @@ fn draw_screen(
     filter: &str,
     plugins: &[PluginRow],
     plugin_err: Option<&str>,
+    // 详情页开着时的那一格（按 stem 找行；找不到就退回清单）
+    plugin_detail: Option<&str>,
+    plugin_detail_source: Option<&str>,
     plugin_view: Option<(&str, &focusflow_core::plugins::PluginView)>,
     pv_scroll: i32,
     pv_select: Option<&PvSelect>,
@@ -5631,11 +5741,16 @@ fn draw_screen(
     match vs.view {
         0..=2 => draw_dashboard(p, w, h, snap, vs),
         3 => draw_analytics(p, w, h, snap, vs),
-        4 => match plugin_view {
-            Some((name, view)) => {
+        // 视图 > 详情 > 清单，判断只有一份（[`plugin_page_of`]）。
+        4 => match plugin_page_of(plugin_view, plugin_detail, plugins) {
+            PluginPage::View(name, view) => {
                 draw_plugin_view(p, w, h, name, view, pv_scroll, plugin_sel);
             }
-            None => draw_plugins(p, w, h, plugins, plugin_err, vs),
+            PluginPage::Detail(row) => {
+                let detail = focusflow_core::plugins::plugin_health::detail_for(&row.stem);
+                draw_plugin_detail(p, w, h, row, plugin_detail_source, &detail);
+            }
+            PluginPage::List => draw_plugins(p, w, h, plugins, plugin_err, vs),
         },
         5 => draw_settings(p, w, h, snap, vs, status, busy, filter),
         // 第 7 个页签：内置看板页。它排在 `v => draw_placeholder` 前面是必须的 ——
@@ -7895,6 +8010,17 @@ fn plugin_grant_rect(row_right: f32, y: f32) -> D2D_RECT_F {
     rect(row_right - 76.0 - 66.0, y + 9.0, 58.0, 22.0)
 }
 
+/// 「详情」那颗按钮的位置：画它的这一头与点它的那一头共用这一个表达式。
+///
+/// 位置**不跟着授权按钮跳**：授权只在两档出现，这一颗每一行都有 —— 让它在两种行里
+/// 摆两个位置，用户第二次找它就得重新找一遍。空出来的那一格留着，也是给"这一行有没有
+/// 授权要办"留的一个固定读法。
+///
+/// 它也是这一页最左边的那颗按钮，第二行正文的宽度按它的左沿收（见 `draw_plugins`）。
+fn plugin_detail_rect(row_right: f32, y: f32) -> D2D_RECT_F {
+    rect(row_right - 76.0 - 66.0 - 66.0, y + 9.0, 58.0, 22.0)
+}
+
 fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>, vs: ViewState) {
     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
     p.card(card, R_CARD);
@@ -7904,26 +8030,24 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
         &p.fmt.body,
         &p.br.fg,
     );
+    // 这一行说的必须是清单真正来自的那几处：抄一份"内置 + 数据目录"的字面量，
+    // 用户开着回滚开关时就会照屏上那个目录放插件、放下去不加载。
+    let dirs = focusflow_core::paths::plugin_scan_dirs(
+        focusflow_core::config::instance().get_bool("plugins", "legacy_layout", false),
+    )
+    .iter()
+    .map(|d| d.display().to_string())
+    .collect::<Vec<_>>()
+    .join(" / ");
+    let cap_mb = focusflow_core::config::instance()
+        .get_or("plugins", "memory_limit_mb", "16")
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(16);
     p.text(
         // 目录路径的尾巴才是"到底在哪儿"，所以夹中间、两头都留（520 px 那格在长 profile
         // 路径下会整句越界，而这块 UI 不裁切）。
-        &p.clip(
-            &format!(
-                "{} 个 · 目录 {}",
-                rows.len(),
-                // 这一行说的必须是清单真正来自的那几处：抄一份"内置 + 数据目录"的字面量，
-                // 用户开着回滚开关时就会照屏上那个目录放插件、放下去不加载。
-                focusflow_core::paths::plugin_scan_dirs(
-                    focusflow_core::config::instance().get_bool("plugins", "legacy_layout", false)
-                )
-                .iter()
-                .map(|d| d.display().to_string())
-                .collect::<Vec<_>>()
-                .join(" / ")
-            ),
-            &p.fmt.caption,
-            520.0,
-        ),
+        &p.clip(&plugin_heading(rows, cap_mb, &dirs), &p.fmt.caption, 520.0),
         rect(card.left + 58.0, card.top + 15.0, 520.0, 18.0),
         &p.fmt.caption,
         &p.br.muted,
@@ -8006,8 +8130,9 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             &p.br.muted,
         );
         // 声明那一格：宽度与画它的矩形取同一个表达式（这一页的字体全是 NO_WRAP，
-        // 而 `DrawText` 不按矩形裁切 —— 不夹就是画到窗口外）。
-        let decl_w = r.right - (r.left + 520.0) - 92.0;
+        // 而 `DrawText` 不按矩形裁切 —— 不夹就是画到窗口外）。右边留的是**最左那颗
+        // 按钮**（详情）的左沿，不是开关的左沿：留成 92 时这一段会画到按钮底下。
+        let decl_w = r.right - (r.left + 520.0) - 216.0;
         let decl = row.declaration();
         if !decl.is_empty() && decl_w > 20.0 {
             p.text(
@@ -8046,11 +8171,18 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             p.round(gb, R_CONTROL, &p.br.danger, None);
             p.text("授权", gb, &p.fmt.center_small, &p.br.white);
         }
+        // 「详情」每一行都有：四类钩子的耗时与错误历史只在那一页看得到，而它不加载插件
+        // （读的是台账与清单），所以给停用/加载失败的格子也留一条入口。
+        let db = plugin_detail_rect(r.right, y);
+        p.round(db, R_CONTROL, &p.br.header, Some(&p.br.border));
+        p.text("详情", db, &p.fmt.center_small, &p.br.fg);
         // 第二行：坏消息说坏消息，否则说它是什么。
         // 分支收在 [`PluginRow::second_line`] 里（这一格与画它的矩形取同一个宽度表达式）——
         // `one_line` 那个 72 是"多少个字符"，不是"这一格装得下多少"：72 个汉字约 900 px，
         // 比格子宽一倍，所以夹取必须按 desc_w 算。
-        let desc_w = r.right - r.left - 92.0;
+        // 第二行与声明那一格共用同一条右界（最左那颗按钮的左沿）：只留开关那 92 的话，
+        // 一句长原因会画到「详情」「授权」两颗按钮底下 —— 这一条在加详情那颗时就该并进来。
+        let desc_w = r.right - r.left - 216.0;
         let (line, bad) = row.second_line();
         p.text(
             &p.clip(&line, &p.fmt.caption, desc_w),
@@ -8077,6 +8209,269 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             &p.fmt.center_small,
             &p.br.muted,
         );
+    }
+}
+
+/// 插件页顶上那句话：「N 个 · 已加载 M 个常驻（每格内存上限 X MB）· 目录 …」。
+///
+/// 只报**数得清**的两样：常驻里**真装上了**的个数，与每格的配置上限。**不印合计占用** ——
+/// mlua 只有 `set_memory_limit`、没有"这个 VM 此刻占多少"的读数；按进程私有字节摊出来的
+/// 那个数不是每插件的事实，拿它当读数等于把估算印成测量（方案 ADR-10）。
+fn plugin_heading(rows: &[PluginRow], cap_mb: u64, dirs: &str) -> String {
+    let residents = rows.iter().filter(|r| r.resident && r.loaded).count();
+    format!(
+        "{} 个 · 已加载 {residents} 个常驻（每格内存上限 {cap_mb} MB） · 目录 {dirs}",
+        rows.len()
+    )
+}
+
+/// 详情页四类钩子那张表的表头 y（相对卡片顶边）与行高。
+///
+/// 抽成常量是为了让"表最后一行压到错误历史标题上"这种只在像素层看得出来的错，
+/// 有一条测试能直接核的先后关系（见 `plugin_page_tests`）。
+const DETAIL_TABLE_HEAD_Y: f32 = 150.0;
+const DETAIL_ROW_H: f32 = 22.0;
+const DETAIL_ERRORS_TITLE_Y: f32 = 266.0;
+const DETAIL_ERRORS_TOP: f32 = 290.0;
+
+/// 插件详情页：权限 / 占用 / 四类钩子耗时 / 错误历史（方案 21 步）。
+///
+/// 三条约定：
+/// · 一个数都不在这里算 —— `detail` 是 core 的 `plugin_health::detail_for` 排好的那一份，
+///   同一份账在行上与这一页才不会念成两个数；
+/// · 每一格按**像素**再夹一次：core 那一把管"多少个字符"，这一把管"这一格画得下多少"
+///   （本页字体全是 `NO_WRAP`，`DrawText` 不按矩形裁切）；
+/// · 这一页**不加载插件**：它读的是台账与清单，所以停用、加载失败的格子也进得来。
+fn draw_plugin_detail(
+    p: &P<'_>,
+    w: f32,
+    h: f32,
+    row: &PluginRow,
+    source: Option<&str>,
+    detail: &focusflow_core::plugins::plugin_health::PluginDetail,
+) {
+    let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
+    p.card(card, R_CARD);
+
+    let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
+    p.round(back, R_CONTROL, &p.br.header, Some(&p.br.border));
+    p.text("← 返回", back, &p.fmt.center_small, &p.br.fg);
+    p.text(
+        "插件详情",
+        rect(back.right + 12.0, card.top + 14.0, 120.0, 20.0),
+        &p.fmt.body,
+        &p.br.fg,
+    );
+
+    let x = card.left + 16.0;
+    let inner_w = card.right - card.left - 32.0;
+
+    // 名字/版本/作者都是插件自己写的，长度不受控，所以按像素夹。
+    let title = p.clip(
+        &format!("{} · v{} · {}", row.name, row.version, row.author),
+        &p.fmt.body,
+        inner_w,
+    );
+    p.text(
+        &title,
+        rect(x, card.top + 44.0, inner_w, 20.0),
+        &p.fmt.body,
+        &p.br.fg,
+    );
+
+    // 第二行：身份、声明、占用、授权结论 —— 全部读 core 交回的那份清单。
+    let mut meta: Vec<String> = vec![
+        format!("API {}", row.api),
+        if row.builtin {
+            "内置模块".to_string()
+        } else {
+            "扩展插件".to_string()
+        },
+        if row.resident {
+            "常驻".to_string()
+        } else {
+            "随面板".to_string()
+        },
+    ];
+    if !row.enabled {
+        meta.push("已停用".to_string());
+    }
+    if row.permissions > 0 {
+        meta.push(if row.permission_names.is_empty() {
+            format!("权限 {} 项", row.permissions)
+        } else {
+            format!(
+                "权限 {} 项：{}",
+                row.permissions,
+                row.permission_names.join("、")
+            )
+        });
+    }
+    if let Some(n) = row.store_bytes {
+        meta.push(if n < 1024 {
+            format!("占用 {n} B")
+        } else {
+            format!("占用 {} KB", n.div_ceil(1024))
+        });
+    }
+    // 内置那一档的 `grant_note` 是「内置模块，免授权」：身份那一格已经说了「内置模块」，
+    // 照抄会念成「内置模块 · 常驻 · 内置模块，免授权」。这里只留它多出来的那半句。
+    meta.push(if row.builtin {
+        "免授权".to_string()
+    } else {
+        row.grant_note.clone()
+    });
+    let meta = p.clip(&meta.join(" · "), &p.fmt.caption, inner_w);
+    p.text(
+        &meta,
+        rect(x, card.top + 68.0, inner_w, 16.0),
+        &p.fmt.caption,
+        &p.br.muted,
+    );
+
+    // 来源那一句（P2 第 19 步）：包从哪来、装进来的那一串字节的校验和前几位。
+    // 三档（有记录 / 手放的 / 记录坏了）由 core 的 `source_line` 说，页面只画。
+    if let Some(source) = source {
+        p.text(
+            &p.clip(source, &p.fmt.caption, inner_w),
+            rect(x, card.top + 88.0, inner_w, 16.0),
+            &p.fmt.caption,
+            &p.br.muted,
+        );
+    }
+
+    // 失败/停用/降频的计数；正文在下面那一栏。
+    let note = p.clip(&detail.note, &p.fmt.caption, inner_w);
+    p.text(
+        &note,
+        rect(x, card.top + 110.0, inner_w, 16.0),
+        &p.fmt.caption,
+        if detail.has_trouble {
+            &p.br.danger
+        } else {
+            &p.br.muted
+        },
+    );
+
+    // --- 四类钩子那张表 ---
+    p.text(
+        "四类钩子",
+        rect(x, card.top + 128.0, 200.0, 18.0),
+        &p.fmt.body,
+        &p.br.fg,
+    );
+    let window_note = p.clip(&detail.window_note, &p.fmt.caption, inner_w - 90.0);
+    p.text(
+        &window_note,
+        rect(x + 90.0, card.top + 130.0, inner_w - 90.0, 16.0),
+        &p.fmt.caption,
+        &p.br.muted,
+    );
+
+    // 六列的宽度：表头与每一行读同一个数组，两处各写一套就会让数字错列。
+    let head_y = card.top + DETAIL_TABLE_HEAD_Y;
+    let mut col_w: Vec<f32> = vec![120.0, 90.0, 90.0, 90.0, 100.0];
+    let taken: f32 = col_w.iter().sum();
+    col_w.push((inner_w - taken).max(60.0));
+    let mut cx = x;
+    for (i, label) in ["钩子", "次数", "最近", "p95", "超预算", "预算"]
+        .into_iter()
+        .enumerate()
+    {
+        p.text(
+            &p.clip(label, &p.fmt.caption, col_w[i]),
+            rect(cx, head_y, col_w[i], 16.0),
+            &p.fmt.caption,
+            &p.br.muted,
+        );
+        cx += col_w[i];
+    }
+    for (i, hr) in detail.hooks.iter().enumerate() {
+        // 四行恒在（[`PluginDetail::hooks`] 一一对应四档）：少画一档，屏上读成"没跑过"。
+        let y = head_y + 20.0 + i as f32 * DETAIL_ROW_H;
+        let cells = [
+            &hr.label, &hr.calls, &hr.last, &hr.p95, &hr.over, &hr.budget,
+        ];
+        let mut cx = x;
+        for (j, cell) in cells.into_iter().enumerate() {
+            let brush = if j == 4 && hr.over_flag {
+                &p.br.danger
+            } else if j == 0 {
+                &p.br.fg
+            } else {
+                &p.br.muted
+            };
+            p.text(
+                &p.clip(cell, &p.fmt.caption, col_w[j]),
+                rect(cx, y, col_w[j], 16.0),
+                &p.fmt.caption,
+                brush,
+            );
+            cx += col_w[j];
+        }
+    }
+
+    // --- 错误历史：新的在最上面 ---
+    p.text(
+        "错误历史（新的在最上面）",
+        rect(x, card.top + DETAIL_ERRORS_TITLE_Y, inner_w, 18.0),
+        &p.fmt.body,
+        &p.br.fg,
+    );
+    // 加载失败不经过台账（VM 都没起来），所以它排在最前面单独占一条：
+    // 这一页若只念台账，作者看到的就是"没有错误记录"，而这一格明明装不起来。
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(e) = &row.error {
+        lines.push(format!("加载失败 · {}", one_line(e, 108)));
+    }
+    lines.extend(detail.errors.iter().cloned());
+    if lines.is_empty() {
+        p.text(
+            "没有错误记录",
+            rect(x, card.top + DETAIL_ERRORS_TOP, inner_w, 16.0),
+            &p.fmt.caption,
+            &p.br.muted,
+        );
+    } else {
+        let room = ((card.bottom - 8.0 - (card.top + DETAIL_ERRORS_TOP)) / 18.0)
+            .floor()
+            .max(0.0) as usize;
+        // 装不下时留最后一格说"还有几条"：悄悄少画等于让用户以为只有这几条。
+        let shown = if lines.len() > room {
+            room.saturating_sub(1)
+        } else {
+            lines.len()
+        };
+        for (i, line) in lines.iter().take(shown).enumerate() {
+            p.text(
+                &p.clip(line, &p.fmt.caption, inner_w),
+                rect(
+                    x,
+                    card.top + DETAIL_ERRORS_TOP + i as f32 * 18.0,
+                    inner_w,
+                    16.0,
+                ),
+                &p.fmt.caption,
+                &p.br.danger,
+            );
+        }
+        if lines.len() > shown {
+            let more = format!(
+                "还有 {} 条没画出来（窗口高一些就能看全）",
+                lines.len() - shown
+            );
+            p.text(
+                &p.clip(&more, &p.fmt.caption, inner_w),
+                rect(
+                    x,
+                    card.top + DETAIL_ERRORS_TOP + shown as f32 * 18.0,
+                    inner_w,
+                    16.0,
+                ),
+                &p.fmt.caption,
+                &p.br.muted,
+            );
+        }
     }
 }
 
@@ -11813,6 +12208,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 }
                 // 插件视图：滚的是视图内容，不是插件清单
                 if app.view == 4 {
+                    // 详情页没有可滚的内容：吞掉滚轮，别让它滚到身后那张清单上。
+                    if app.plugin_detail_open.is_some() {
+                        return LRESULT(0);
+                    }
                     if let Some(name) = app.plugin_open.clone() {
                         let (cw, ch) = app.client_dip(hwnd);
                         let view = app.pm.as_ref().and_then(|pm| {
@@ -11905,6 +12304,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     if app.detail.is_some() {
                         app.close_detail(hwnd);
                     } else if app.pv_select.take().is_some() {
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    } else if app.plugin_detail_open.is_some() {
+                        // 与「返回」那颗钮同一个结局：下一页是清单，不是托盘。
+                        app.plugin_detail_open = None;
+                        app.plugin_detail_source = None;
                         unsafe {
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
@@ -14289,8 +14695,9 @@ mod plugin_sel_tests {
             .collect();
         assert_eq!(
             flat.matches("plugin_open=None;").count(),
-            3,
-            "关面板的入口数目变了（返回两颗 + 按 Esc 一颗），这份清理要跟着一起来核对"
+            4,
+            "关面板的入口数目变了（返回两颗 + 按 Esc 一颗）：第 4 处是打开详情时与视图互斥，\
+             它不调用 reset_plugin_view_state（那一刻没有视图状态要清），所以下一行还是 4"
         );
         assert_eq!(
             flat.matches("reset_plugin_view_state()").count(),
@@ -16139,7 +16546,11 @@ mod clip_tests {
             // 插件声明那一格（常驻 / API / 权限数 / 自刷 / 版本要求 / 占用）：
             // 夹取与画它的矩形取同一个 decl_w，而 decl_w 又是从那一格的右边界算下来的
             ("p.clip(&decl,&p.fmt.caption,decl_w),rect(r.left+520.0,y+7.0,decl_w,16.0)", 1),
-            ("p.clip(&format!(\"{}个·目录{}\",rows.len(),focusflow_core::paths::plugin_scan_dirs(focusflow_core::config::instance().get_bool(\"plugins\",\"legacy_layout\",false)).iter().map(|d|d.display().to_string()).collect::<Vec<_>>().join(\"/\")),&p.fmt.caption,520.0)", 1),
+            // 插件页顶上那句：正文由 `plugin_heading` 拼（含常驻个数与每格上限），
+            // 夹取与画它的矩形仍取同一个 520。
+            ("p.clip(&plugin_heading(rows,cap_mb,&dirs),&p.fmt.caption,520.0),rect(card.left+58.0,card.top+15.0,520.0,18.0)", 1),
+            // 详情页的「来源」那一句：来源路径 + 校验和是外部字符串，自带同一格宽度。
+            ("p.clip(source,&p.fmt.caption,inner_w),rect(x,card.top+88.0,inner_w,16.0)", 1),
             ("p.clip(&format!(\"插件目录读不出来：{e}\"),&p.fmt.caption,card.right-card.left-32.0)", 1),
             // 值框：夹取与画它的矩形共用 val_w（那一格还要给右边的按钮让位）
             ("p.clip(shown,&p.fmt.text13,val_w),rect(vb.left+8.0,vb.top,val_w,vb.bottom-vb.top)", 1),
@@ -17260,6 +17671,163 @@ mod plugin_page_tests {
             prod.contains("grantable && hit(plugin_grant_rect"),
             "命中的条件必须与画它的条件同一句（needs_grant），否则会出现点不动的按钮"
         );
+    }
+
+    /// 「详情」那颗按钮：画它的这一头与点它的那一头共用同一个表达式。
+    ///
+    /// 与授权那颗同一条纪律 —— 两处各写一遍坐标，症状是屏上有一颗看得见的按钮点不动。
+    /// 计数固定成 3（定义 + 画 + 命中），多出来的一处就是有人抄了第二份几何。
+    #[test]
+    fn the_detail_button_is_drawn_and_hit_from_one_expression() {
+        let code = include_str!("../src/main.rs");
+        let at = code
+            .find("mod plugin_page_tests {")
+            .expect("插件页那一套用例的模块起点找不到了");
+        let prod = &code[..at];
+        assert_eq!(
+            prod.matches("fn plugin_detail_rect(").count(),
+            1,
+            "详情那颗按钮的几何函数应当只有一个定义"
+        );
+        assert_eq!(
+            prod.matches("plugin_detail_rect(").count(),
+            3,
+            "定义一处 + 画一处 + 命中一处，多出来的一处就是手抄了第二遍坐标"
+        );
+        assert!(
+            prod.contains("hit(plugin_detail_rect(row_rect.right, y0), x, y)"),
+            "命中读的必须是画它的那一份几何与同一个 y"
+        );
+    }
+
+    /// 三颗按钮不许叠在一起：开关 / 授权 / 详情 各占一段，且留出 8px 的缝。
+    ///
+    /// 叠了也不会 panic —— 症状是"点开关点到了详情"或"授权那颗只有半边点得动"，
+    /// 这种错在截图上看不出来，所以用一次算术把它钉住。
+    #[test]
+    fn the_row_buttons_do_not_overlap() {
+        let right = 1000.0;
+        let y = 0.0;
+        let switch = rect(right - 76.0, y + 9.0, 60.0, 22.0);
+        let grant = plugin_grant_rect(right, y);
+        let detail = plugin_detail_rect(right, y);
+        assert!(
+            detail.right <= grant.left - 8.0,
+            "详情与授权之间要留一条缝：详情右沿 {} / 授权左沿 {}",
+            detail.right,
+            grant.left
+        );
+        assert!(
+            grant.right <= switch.left - 8.0,
+            "授权与开关之间要留一条缝：授权右沿 {} / 开关左沿 {}",
+            grant.right,
+            switch.left
+        );
+    }
+
+    /// 这一页的纵向次序：四行表格必须整段落在错误历史标题上面。
+    ///
+    /// 「最后一行压到下一段标题上」只在像素层看得出来，而这一页的字体不裁切 ——
+    /// 两段叠在一起就是两句字画在同一行上。
+    #[test]
+    fn the_hook_table_ends_before_the_error_history_begins() {
+        let table_bottom = DETAIL_TABLE_HEAD_Y + 20.0 + 4.0 * DETAIL_ROW_H;
+        assert!(
+            DETAIL_ERRORS_TITLE_Y >= table_bottom + 6.0,
+            "错误历史的标题压在表格最后一行上：表到 {table_bottom}，标题在 {DETAIL_ERRORS_TITLE_Y}"
+        );
+        const {
+            assert!(
+                DETAIL_ERRORS_TOP >= DETAIL_ERRORS_TITLE_Y + 18.0,
+                "the first error line must start below its heading"
+            )
+        };
+    }
+
+    /// 顶上那句只报数得清的两样：**已加载**的常驻个数与每格配置上限。
+    ///
+    /// 反方向也钉住：不许出现"合计占用"那一截 —— mlua 没有每 VM 的分配读数，摊出来的数
+    /// 会把估算印成测量（方案 ADR-10）。"常驻但这一轮没装上"不算已加载。
+    #[test]
+    fn the_heading_reports_resident_count_and_the_cap_but_no_fabricated_total() {
+        let mut resident_ok = row("resident_ok", false);
+        resident_ok.resident = true;
+        resident_ok.loaded = true;
+        let mut resident_waiting = row("resident_waiting", false);
+        resident_waiting.resident = true;
+        resident_waiting.loaded = false;
+        let panel_tool = row("panel_tool", false);
+
+        let line = plugin_heading(
+            &[resident_ok, resident_waiting, panel_tool],
+            16,
+            "/x/plugins",
+        );
+        assert!(line.starts_with("3 个"), "{line}");
+        assert!(line.contains("已加载 1 个常驻"), "只数真装上的：{line}");
+        assert!(line.contains("每格内存上限 16 MB"), "{line}");
+        assert!(line.contains("/x/plugins"), "目录那一截要跟着：{line}");
+        assert!(
+            !line.contains("合计"),
+            "合计占用是摊出来的数，不许印成读数：{line}"
+        );
+    }
+
+    /// 三张页的先后：视图 > 详情 > 清单；详情那一格不在清单里就退回清单。
+    ///
+    /// 最后一条不是防御性代码：文件被删/改名之后清单会重扫，而 `plugin_detail_open`
+    /// 还停在那个 stem 上 —— 不退回清单，屏上就是一张退不出去的页（「返回」只画在详情
+    /// 那一张上，而清单已经找不到那一格，点哪儿都不动）。
+    #[test]
+    fn the_fourth_tab_picks_the_view_then_the_detail_then_the_list() {
+        let rows = vec![row("alpha", false), row("beta", true)];
+        let view = focusflow_core::plugins::PluginView {
+            title: String::new(),
+            widgets: Vec::new(),
+        };
+        match plugin_page_of(Some(("alpha", &view)), Some("beta"), &rows) {
+            PluginPage::View(name, _) => assert_eq!(name, "alpha", "视图压过详情"),
+            other => panic!("应当画视图，实得 {other:?}"),
+        }
+        match plugin_page_of(None, Some("beta"), &rows) {
+            PluginPage::Detail(r) => assert_eq!(r.stem, "beta"),
+            other => panic!("应当画详情，实得 {other:?}"),
+        }
+        assert!(
+            matches!(plugin_page_of(None, Some("gone"), &rows), PluginPage::List),
+            "那一格已经从清单里消失了，就画清单（详情页的「返回」没有落点）"
+        );
+        assert!(matches!(
+            plugin_page_of(None, None, &rows),
+            PluginPage::List
+        ));
+    }
+
+    /// 详情页**不加载插件**：它读的是台账与清单。
+    ///
+    /// 这一条决定了"停用的、装不起来的格子也能点进详情"。哪天有人顺手在打开那一支里
+    /// 加一句 `ensure_loaded`，这里会先红 —— 而不是等用户发现"点一下详情把一个插件装活了"。
+    #[test]
+    fn opening_the_detail_page_does_not_load_the_plugin() {
+        let code = include_str!("../src/main.rs");
+        let at = code
+            .find("mod plugin_page_tests {")
+            .expect("插件页那一套用例的模块起点找不到了");
+        let prod = &code[..at];
+        let start = prod
+            .find("fn open_plugin_detail(")
+            .expect("打开详情那一支不见了");
+        let rest = &prod[start..];
+        let end = rest
+            .find("\n    fn ")
+            .expect("详情那一支后面没有别的函数了");
+        let body = &rest[..end];
+        for forbidden in ["ensure_loaded", "refresh_view", "pump_timers"] {
+            assert!(
+                !body.contains(forbidden),
+                "打开详情不许碰 VM（含 {forbidden}）：这一页对停用/加载失败的格子也要成立"
+            );
+        }
     }
 
     /// 慢熔断那一档要在页面那一格说出来，而没进熔断的不许标。

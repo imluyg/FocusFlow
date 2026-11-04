@@ -274,10 +274,12 @@ impl Health {
                 health.per_kind.insert(
                     kind,
                     Samples {
-                        // 窗口里的逐条耗时不落盘（落的是 last/p95 两个读数），
-                        // 读回来时窗口从 p95 那一个数重建：够页面说话，也够下一拍的窗口判断继续滚。
+                        // 窗口里的逐条耗时不落盘（落的是 last/p95 两个读数），读回来时用这两个
+                        // 数重建：够页面说话，也够下一拍的窗口判断继续滚。**顺序是 p95 在前、
+                        // last 在后** —— `last_us()` 读的是窗口尾巴，反过来排的话重启之后
+                        // 「最近一次」会念成 p95（那是"窗口里最慢的那一档"，不是最后一次）。
                         recent: if h.calls > 0 {
-                            VecDeque::from([h.last_us, h.p95_us])
+                            VecDeque::from([h.p95_us, h.last_us])
                         } else {
                             VecDeque::new()
                         },
@@ -366,16 +368,7 @@ pub fn summary_line(doc: &HealthDoc) -> String {
     }
     // 先"要动它的那半句"，再读数：一句被夹在界上时，留下的应该是让人知道下一步做什么的那部分。
     // 原因正文不在这一行里 —— 行上只报**几条**，具体那几句话属于详情页（那里列错误历史）。
-    let mut head: Vec<String> = Vec::new();
-    if !doc.errors.is_empty() {
-        head.push(format!("失败记录 {} 条", doc.errors.len()));
-    }
-    if doc.stops > 0 {
-        head.push(format!("停用 {} 次", doc.stops));
-    }
-    if doc.throttle_flips > 0 {
-        head.push(format!("降频 {} 次", doc.throttle_flips));
-    }
+    let head = head_pieces(doc);
     let mut body: Vec<String> = Vec::new();
     for kind in HookKind::ALL {
         let Some(h) = doc.hook(kind) else { continue };
@@ -384,17 +377,13 @@ pub fn summary_line(doc: &HealthDoc) -> String {
         }
         if h.over_budget > 0 {
             body.push(format!(
-                "{}超预算 {} 次（p95 {:.1} ms）",
+                "{}超预算 {} 次（p95 {}）",
                 kind.label(),
                 h.over_budget,
-                h.p95_us as f64 / 1000.0
+                ms_text(h.p95_us)
             ));
         } else {
-            body.push(format!(
-                "{} p95 {:.1} ms",
-                kind.label(),
-                h.p95_us as f64 / 1000.0
-            ));
+            body.push(format!("{} p95 {}", kind.label(), ms_text(h.p95_us)));
         }
     }
     let all: Vec<&String> = head.iter().chain(body.iter()).collect();
@@ -413,6 +402,151 @@ pub fn summary_line(doc: &HealthDoc) -> String {
     clipped
 }
 
+/// 一格里的毫秒读数。**排版口径只有一份**：行上那句与详情页那张表若各写一遍
+/// `{:.1}`，同一份账在两处就会念成两个数。
+fn ms_text(us: u64) -> String {
+    format!("{:.1} ms", us as f64 / 1000.0)
+}
+
+/// 详情页里一格的上界（字符）。这一页的字体全是 `NO_WRAP`、`DrawText` 不按矩形裁切，
+/// 所以每一格自己停得住；数字本身有界，真正会长的是时刻串与原因串。
+pub const DETAIL_CELL_MAX_CHARS: usize = 24;
+
+/// 详情页里一条错误历史的上界（字符）。原因在落盘前已按 [`ERROR_MSG_MAX_CHARS`] 截过，
+/// 那一档说的是"存多少"，这一档说的是"画得下多少"，两把尺子各管各的。
+pub const DETAIL_ERROR_MAX_CHARS: usize = 112;
+
+/// 详情页那张表里的一行 = 一类钩子。
+///
+/// 六格全是**已经排好的字符串**：页面只做排版，不读数字、不判"算不算慢"。
+/// 让页面自己把微秒换算成毫秒，就会出现"台账说超了、屏上看着没超"那一类落差。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookRow {
+    /// 这一档的名字（[`HookKind::label`]，四档各一个）
+    pub label: String,
+    /// 「共跑过多少次」
+    pub calls: String,
+    /// 「最近一次多久」——没跑过是 `—`，不是 `0.0 ms`（那是"跑过且刚好零"的读法）
+    pub last: String,
+    /// 「窗口里的 p95」
+    pub p95: String,
+    /// 「窗口里超预算的次数」
+    pub over: String,
+    /// 这一档的预算（同一个 `HookKind` 的常量，读的是 [`HookKind::budget_us`]）
+    pub budget: String,
+    /// 这一档要不要画成坏消息：窗口里有过超预算的那几次
+    pub over_flag: bool,
+}
+
+/// 详情页那一屏读到的东西。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PluginDetail {
+    /// 顶上那句：失败/停用/降频的**计数**。正文属于 [`Self::errors`]，不在这一句里。
+    pub note: String,
+    /// 「超预算」那一列按哪扇窗口算（数字出自 `plugin_refresh::SAMPLE_WINDOW`，页面不抄第二遍）
+    pub window_note: String,
+    /// 四类钩子**恒四行**，顺序就是 [`HookKind::ALL`]：少画一档会让"这一类没接线"读成"这一类没跑过"
+    pub hooks: Vec<HookRow>,
+    /// 错误历史，**新的在最上面**（作者进这一页是想看"上一次为什么坏了"）
+    pub errors: Vec<String>,
+    /// 这一格有没有被停用过/降过频之外的坏消息：页面用它决定要不要写"没有错误记录"
+    pub has_errors: bool,
+    /// 顶上那句里有没有坏消息（失败 / 停用 / 降频）。
+    ///
+    /// 页面用它决定那一行画成红的还是灰的。判断收在 core 是因为"哪几种算坏消息"
+    /// 就是顶上那三档计数（失败 / 停用 / 降频）—— 让页面去比串（`note != "没有失败…"`）的话，
+    /// 改一句文案就会把颜色改错，而那两处又不会一起红。
+    pub has_trouble: bool,
+}
+
+/// 台账折成详情页那一份。
+///
+/// 纯函数（不读墙钟、不碰文件）：判据能拿一份手搓的 `HealthDoc` 把四档、上下界、
+/// 历史顺序一次测完，不必为每一次改动重启一次宿主。
+pub fn detail_from(doc: &HealthDoc) -> PluginDetail {
+    let mut hooks = Vec::with_capacity(HookKind::ALL.len());
+    for kind in HookKind::ALL {
+        let h = doc.hook(kind);
+        let ran = h.map(|d| d.calls > 0).unwrap_or(false);
+        let over = h.map(|d| d.over_budget).unwrap_or(0);
+        hooks.push(HookRow {
+            label: clip_chars(kind.label(), DETAIL_CELL_MAX_CHARS),
+            calls: if ran {
+                bounded_count(h.map(|d| d.calls).unwrap_or(0))
+            } else {
+                "没跑过".to_string()
+            },
+            last: match (ran, h.map(|d| d.last_us).unwrap_or(0)) {
+                (true, us) => clip_chars(&ms_text(us), DETAIL_CELL_MAX_CHARS),
+                (false, _) => "—".to_string(),
+            },
+            p95: match (ran, h.map(|d| d.p95_us).unwrap_or(0)) {
+                (true, us) => clip_chars(&ms_text(us), DETAIL_CELL_MAX_CHARS),
+                (false, _) => "—".to_string(),
+            },
+            over: clip_chars(&format!("{over} 次"), DETAIL_CELL_MAX_CHARS),
+            budget: clip_chars(&ms_text(kind.budget_us()), DETAIL_CELL_MAX_CHARS),
+            over_flag: over > 0,
+        });
+    }
+    // 与行上那句同一份出处：两处各数一遍迟早一个说"3 条失败"、另一个说"3 条"
+    let head = head_pieces(doc);
+    let note = clip_chars(
+        &if head.is_empty() {
+            "没有失败、停用或降频的记录".to_string()
+        } else {
+            head.join(" · ")
+        },
+        SUMMARY_MAX_CHARS,
+    );
+    PluginDetail {
+        note,
+        window_note: format!(
+            "超预算按最近 {} 次这一扇窗口算",
+            crate::plugins::plugin_refresh::SAMPLE_WINDOW
+        ),
+        hooks,
+        errors: doc
+            .errors
+            .iter()
+            .rev()
+            .map(|e| clip_chars(&format!("{} · {}", e.at, e.msg), DETAIL_ERROR_MAX_CHARS))
+            .collect(),
+        has_errors: !doc.errors.is_empty(),
+        has_trouble: !head.is_empty(),
+    }
+}
+
+/// 行上那句与详情页顶上那句**共用**的那几段计数。
+fn head_pieces(doc: &HealthDoc) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if !doc.errors.is_empty() {
+        out.push(format!("失败记录 {} 条", doc.errors.len()));
+    }
+    if doc.stops > 0 {
+        out.push(format!("停用 {} 次", doc.stops));
+    }
+    if doc.throttle_flips > 0 {
+        out.push(format!("降频 {} 次", doc.throttle_flips));
+    }
+    out
+}
+
+/// 次数那一格：数字本身没有上界（`calls` 是 `u64`），所以过一遍 [`truncate_chars`]。
+fn bounded_count(n: u64) -> String {
+    clip_chars(&format!("{n} 次"), DETAIL_CELL_MAX_CHARS)
+}
+
+/// 详情页要的那一屏（内存里那格，第一次问时才读盘 —— 与行上那句同一把尺子）。
+pub fn detail_for(stem: &str) -> PluginDetail {
+    detail_from(
+        &board_for(stem)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .to_doc(),
+    )
+}
+
 /// 时长转微秒：亚微秒的那一段折成 0（预算最小的那一档也有 200 µs，不会把"刚好"折成"超"）。
 fn micros_of(elapsed: Duration) -> u64 {
     elapsed.as_micros().min(u64::MAX as u128) as u64
@@ -425,6 +559,21 @@ fn truncate_chars(msg: &str, max: usize) -> String {
         return msg.to_string();
     }
     let mut out: String = chars.iter().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// 停在 `max` 个字符**之内**（省略号算在这一格裡）。
+///
+/// 与 [`truncate_chars`] 是两个口径：那一把管"落盘的原因存多少"（省略号是白送的额外一格），
+/// 这一把管"页面上的一格画得下多少"——画得下多少就得连省略号一起算，否则越界的那一个字符
+/// 正是 `NO_WRAP` 字体画到窗口外的那一个。
+fn clip_chars(msg: &str, max: usize) -> String {
+    let chars: Vec<char> = msg.chars().collect();
+    if chars.len() <= max {
+        return msg.to_string();
+    }
+    let mut out: String = chars.iter().take(max - 1).collect();
     out.push('…');
     out
 }
@@ -733,6 +882,36 @@ mod tests {
     ///
     /// `None` 与空串不是一回事 —— 页面拿 `None` 是"这一格别画"，拿空串会画出一个孤零零的分隔点。
     /// 两档（跑过一次 / 只留了一条错误历史）都要算"有话"，因为它们走的是同一份判据。
+    /// 重启之后「最近一次」还是最近那一次，不是 p95。
+    ///
+    /// 落盘的是两个读数（last / p95），窗口里的逐条样本不落盘。重建时若把 last 放在
+    /// 倒数的位置，`last_us()` 就读到 p95 —— 详情页那一格会念成"最近 7.8 ms"，而真正
+    /// 最后一次是 7.1 ms。这条腿盯的正是"读回来那两个数还认得出谁是谁"。
+    #[test]
+    fn the_last_reading_survives_a_restart_as_the_last_reading() {
+        let doc = HealthDoc {
+            version: HEALTH_DOC_VERSION,
+            hooks: vec![HookDoc {
+                kind: HookKind::View.keyword().to_string(),
+                calls: 12,
+                last_us: 7_100,
+                p95_us: 7_800,
+                over_budget: 3,
+            }],
+            errors: Vec::new(),
+            throttle_flips: 0,
+            stops: 0,
+        };
+        let back = Health::from_doc(&doc).to_doc();
+        let view = back
+            .hooks
+            .iter()
+            .find(|h| h.kind == HookKind::View.keyword())
+            .expect("四类都写出来才有这一格");
+        assert_eq!(view.last_us, 7_100, "「最近」不许读成 p95");
+        assert_eq!(view.p95_us, 7_800, "p95 那一格也不能被 last 顶掉");
+    }
+
     #[test]
     fn summary_for_is_quiet_only_when_there_is_nothing_to_say() {
         let _lock = crate::paths::test_app_dir_lock();
@@ -820,6 +999,184 @@ mod tests {
         assert!(
             line.contains("失败记录 1 条"),
             "有过几条失败要报出来（原因正文在详情页那一栏）：{line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+
+    fn doc_with(view_calls: u64, view_p95_us: u64, view_over: u64) -> HealthDoc {
+        let mut doc = HealthDoc {
+            version: HEALTH_DOC_VERSION,
+            hooks: HookKind::ALL
+                .iter()
+                .map(|k| HookDoc {
+                    kind: k.keyword().to_string(),
+                    calls: 0,
+                    last_us: 0,
+                    p95_us: 0,
+                    over_budget: 0,
+                })
+                .collect(),
+            errors: Vec::new(),
+            throttle_flips: 0,
+            stops: 0,
+        };
+        let view = doc
+            .hooks
+            .iter_mut()
+            .find(|h| h.kind == HookKind::View.keyword())
+            .expect("四类都写出来才有这一格");
+        view.calls = view_calls;
+        view.last_us = view_p95_us;
+        view.p95_us = view_p95_us;
+        view.over_budget = view_over;
+        doc
+    }
+
+    /// 四类钩子**恒四行**，且"没跑过"不许读成"跑过且是 0"。
+    ///
+    /// 这一页要答的是"哪一类根本没接线"（方案 3.12 点破的那句：只测视图会漏掉最要命的一类）。
+    /// 把没跑过的那三档省掉，屏上就只剩一行读数，而"这一类从没记过"与"这一类没地方显示"
+    /// 正是同一句话的两种读法。
+    #[test]
+    fn the_detail_page_lists_all_four_buckets_and_names_the_ones_that_never_ran() {
+        let detail = detail_from(&doc_with(7, 3_000, 2));
+        assert_eq!(
+            detail.hooks.len(),
+            HookKind::ALL.len(),
+            "详情页那张表的行数必须与档位一样多"
+        );
+        for (i, kind) in HookKind::ALL.iter().enumerate() {
+            assert_eq!(
+                detail.hooks[i].label,
+                kind.label(),
+                "行的顺序就是 HookKind::ALL 的顺序，页面才有固定的表头"
+            );
+            assert_eq!(
+                detail.hooks[i].budget,
+                format!("{:.1} ms", kind.budget_us() as f64 / 1000.0),
+                "预算那一格读的是这一档自己的常量"
+            );
+        }
+        let ran = &detail.hooks[0];
+        assert_eq!(ran.calls, "7 次");
+        assert_eq!(ran.p95, "3.0 ms");
+        assert_eq!(ran.over, "2 次");
+        assert!(ran.over_flag, "窗口里超了预算的那几次要能画成坏消息");
+        for quiet in &detail.hooks[1..] {
+            assert_eq!(quiet.calls, "没跑过", "次数没跑过就说没跑过");
+            assert_eq!(quiet.last, "—", "没跑过的耗时是一横，不是 0.0 ms");
+            assert_eq!(quiet.p95, "—");
+            assert!(!quiet.over_flag, "没跑过的一档不该被画成红的");
+        }
+        assert!(
+            detail.window_note.contains("窗口"),
+            "「超预算」那一列得说清它数的是哪一扇窗口：{}",
+            detail.window_note
+        );
+    }
+
+    /// 每一格自己停在界上。
+    ///
+    /// 这一页的字体全是 `NO_WRAP`、`DrawText` 不按矩形裁切：不自带上界的句子不是"被夹掉一半"，
+    /// 而是**画到窗口外面去**（本仓在胶囊与标题栏上各踩过一次）。
+    #[test]
+    fn every_detail_cell_stops_on_its_own_bound() {
+        let mut doc = doc_with(u64::MAX, u64::MAX, u64::MAX);
+        doc.stops = u32::MAX;
+        doc.throttle_flips = u32::MAX;
+        doc.errors.push(ErrorNote {
+            at: "很久以前的一个很长很长的时刻串".repeat(12),
+            msg: "原因".repeat(400),
+        });
+        let detail = detail_from(&doc);
+        assert_eq!(detail.hooks.len(), HookKind::ALL.len());
+        for row in &detail.hooks {
+            for cell in [
+                &row.label,
+                &row.calls,
+                &row.last,
+                &row.p95,
+                &row.over,
+                &row.budget,
+            ] {
+                assert!(
+                    cell.chars().count() <= DETAIL_CELL_MAX_CHARS,
+                    "一格越过了自己的上界：{cell}"
+                );
+            }
+        }
+        assert!(
+            detail.note.chars().count() <= SUMMARY_MAX_CHARS,
+            "顶上那句用的是行上那把尺子：{}",
+            detail.note
+        );
+        assert_eq!(detail.errors.len(), 1);
+        assert!(
+            detail.errors[0].chars().count() <= DETAIL_ERROR_MAX_CHARS,
+            "错误历史那一条要停在页面上的一行之内"
+        );
+        assert!(
+            detail.errors[0].ends_with('…'),
+            "越界的那一半要说得出被夹过"
+        );
+    }
+
+    /// 历史那一栏是"上一次为什么坏了"，所以**新的在最上面**，且每条带着时刻。
+    ///
+    /// 落盘那份是按写入顺序排的（旧的在头上）；页面直接照抄顺序，作者看到的最后一条
+    /// 就永远是**最旧**那一次，而他要的是刚发生的那一次。
+    #[test]
+    fn the_error_history_reads_newest_first_and_each_line_carries_its_time() {
+        let mut doc = doc_with(1, 10, 0);
+        doc.errors.push(ErrorNote {
+            at: "07:31".to_string(),
+            msg: "第一次坏的原因".to_string(),
+        });
+        doc.errors.push(ErrorNote {
+            at: "08:02".to_string(),
+            msg: "第二次坏的原因".to_string(),
+        });
+        let detail = detail_from(&doc);
+        assert_eq!(detail.errors.len(), 2);
+        assert!(
+            detail.errors[0].starts_with("08:02"),
+            "最上面那条必须是最近一次：{}",
+            detail.errors[0]
+        );
+        assert!(
+            detail.errors[1].starts_with("07:31"),
+            "上一条排在它下面：{}",
+            detail.errors[1]
+        );
+        assert!(
+            detail.errors[0].contains("第二次坏的原因"),
+            "原因正文归这一栏"
+        );
+        assert!(detail.has_errors);
+        assert!(detail.has_trouble, "有错误历史的那一页，顶上那句是坏消息");
+        // 计数那句与错误正文各管一头：句里只报几条
+        assert!(detail.note.contains("失败记录 2 条"), "{}", detail.note);
+    }
+
+    /// 什么都没跑过、也什么都没坏过 —— 这一屏不许一句话都不说，也不许说成"坏了"。
+    ///
+    /// 行上那句在这种时候回 `None`（不占格），而详情页是用户**主动点进来的**：
+    /// 那里空着会被读成"这一页没接上"，所以要一句"没有记录"。
+    #[test]
+    fn an_empty_ledger_still_says_what_is_not_there() {
+        let detail = detail_from(&HealthDoc::default());
+        assert_eq!(detail.note, "没有失败、停用或降频的记录");
+        assert!(!detail.has_errors);
+        assert!(!detail.has_trouble, "空台账那一句不是坏消息");
+        assert!(detail.errors.is_empty());
+        assert_eq!(detail.hooks.len(), HookKind::ALL.len());
+        assert!(
+            detail.hooks.iter().all(|r| r.calls == "没跑过"),
+            "空台账四档都说没跑过"
         );
     }
 }
