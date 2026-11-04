@@ -232,13 +232,26 @@ pub fn install(package_path: &Path) -> Result<Installed, String> {
         bytes: bytes.len(),
         installed_at: chrono::Local::now().to_rfc3339(),
     };
+    // 失败时要把旧记录放回去：盘上那份旧包还在，而记录已经改口说"装进来的是新字节"
+    // （详情页的来源与 sha256 就成了假话）。先把旧记录读一份，失败那一支再原样写回。
+    let previous_meta = std::fs::read(meta_path(&stem)).ok();
     if let Err(e) = write_meta(&meta) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     if replaced {
-        std::fs::remove_file(&target)
-            .map_err(|e| format!("旧的 {} 删不掉：{e}", target.display()))?;
+        if let Err(e) = std::fs::remove_file(&target) {
+            let _ = std::fs::remove_file(&tmp);
+            match &previous_meta {
+                Some(bytes) => {
+                    let _ = std::fs::write(meta_path(&stem), bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(meta_path(&stem));
+                }
+            }
+            return Err(format!("旧的 {} 删不掉：{e}", target.display()));
+        }
     }
     if let Err(e) = std::fs::rename(&tmp, &target) {
         let _ = std::fs::remove_file(&tmp);
@@ -549,6 +562,54 @@ mod tests {
             uninstall("leaver", false).unwrap().state,
             StateAfter::NeverExisted,
             "没写过状态文件就说没写过，不许念成「删掉了」"
+        );
+    }
+
+    /// 换包失败时，盘上那份旧包还在，记录却不许改口说"装进来的是新字节"。
+    ///
+    /// 现在的顺序是"先落新记录、再删旧包"：删不掉（文件被占、只读）那一步失败之后，
+    /// 安装确实报错了，可详情页的来源与 sha256 已经换成新包的那一份 —— 用户手里跑的
+    /// 还是旧脚本，页面却说装的是新字节。失败 = 什么都没发生，记录也一样。
+    #[test]
+    fn a_failed_replacement_keeps_the_old_record_and_leaves_no_temp_file() {
+        let _lock = guard();
+        let app = paths::test_app_dir("install_replace_fail");
+        let src = app.path().join("incoming");
+        let first = write_package(
+            &src,
+            "sticky",
+            "PLUGIN_NAME = \"v1\"\nfunction get_view() return { widgets = {} } end\n",
+        );
+        install(&first).unwrap();
+        let old = meta_for("sticky")
+            .expect("旧记录读得动")
+            .expect("第一次装完该有记录");
+
+        // 让"删掉旧包"这一步必失败：目标换成同名目录（Windows 上 remove_file 过不去）。
+        let target = paths::plugins_user_dir().join("sticky.zip");
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let second = write_package(
+            &src,
+            "sticky",
+            "PLUGIN_NAME = \"v2\"\nfunction get_view() return { widgets = {} } end\n",
+        );
+        let err = install(&second).expect_err("旧包删不掉时这一次安装必须失败");
+        assert!(
+            err.contains("删不掉"),
+            "失败的理由要指向挡路的那一份：{err}"
+        );
+
+        let after = meta_for("sticky")
+            .expect("记录还读得动")
+            .expect("旧记录要留着");
+        assert_eq!(
+            after.content_hash, old.content_hash,
+            "失败之后记录改口了：它现在说的是新包的哈希"
+        );
+        assert!(
+            !paths::plugins_user_dir().join("sticky.zip.tmp").exists(),
+            "失败留下的临时包没人收"
         );
     }
 
