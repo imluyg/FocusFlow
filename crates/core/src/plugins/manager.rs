@@ -2587,7 +2587,12 @@ impl PluginManager {
         }
         Self::arm_instruction_budget(lua, cfg);
         let view_started = std::time::Instant::now();
-        let view = match Self::read_view(lua) {
+        let view = Self::read_view(lua);
+        // 失败的那一次也要进台账：它确实跑过，耗时也真花掉了。只记成功那一刻的话，
+        // 详情页的「视图重建」会把一个一直失败的插件念成「没跑过」（与"这一类没接线"
+        // 是同一句话），p95 也只统计跑成功的那几次 —— 看上去比实际快。
+        self.note_hook_time(name, plugin_health::HookKind::View, view_started.elapsed());
+        let view = match view {
             Ok(v) => v,
             Err(e) => {
                 let msg = format!("get_view() 失败: {e}");
@@ -2600,7 +2605,6 @@ impl PluginManager {
                 return Err(self.note_view_failure(name, &msg).unwrap_or(msg));
             }
         };
-        self.note_hook_time(name, plugin_health::HookKind::View, view_started.elapsed());
         if let Some(p) = self.plugins.get_mut(name) {
             p.view_route.record(false);
             p.view = Some(view);
@@ -5992,6 +5996,15 @@ end
             last = pm.refresh_view(&name).expect_err("三次都该失败");
         }
         assert!(last.contains("视图刷新已停"), "{last}");
+        // 失败的三次也是真跑过的三次：那一档的"共跑过多少次"要是 0，详情页就会把
+        // 一个一直在失败的插件念成「没跑过」——与"这一类没接线"是同一句话。
+        let calls = plugin_health::board_for("viewtrip")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .samples(plugin_health::HookKind::View)
+            .map(|s| s.calls())
+            .unwrap_or(0);
+        assert_eq!(calls, 3, "失败的重建没进耗时台账");
         let (_, logs) = crate::logger::capture_logs(|| {
             for _ in 0..5 {
                 let _ = pm.refresh_view(&name);
