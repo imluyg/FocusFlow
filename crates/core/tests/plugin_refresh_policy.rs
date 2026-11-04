@@ -9,6 +9,7 @@ use focusflow_core::config::FocusFlowConfig;
 use focusflow_core::db;
 use focusflow_core::paths;
 use focusflow_core::plugins::manager::{PluginManager, PluginSource};
+use focusflow_core::plugins::plugin_health;
 use std::time::{Duration, Instant};
 
 mod common;
@@ -138,6 +139,55 @@ fn three_slow_runs_throttle_the_panel_and_reach_the_page() {
         .find(|p| p.file == "slw_refresh")
         .expect("这一份夹具该在清单里");
     assert!(listed.slow, "页面上那句「该插件较慢」的来源就是这一格");
+}
+
+/// 翻进降频的那一次要进台账，而且只算一次。
+///
+/// 页面上的「降频 N 次」与详情页顶上那句读的都是 `Health::throttle_flips`，而它的写手
+/// 只有 `note_throttle`。少了这条腿，把那次调用摘掉照样全绿 —— 症状是屏上一边写着
+/// 「该插件较慢」、一边写着「降频 0 次」，两条账各说各的。
+#[test]
+fn a_throttle_flip_reaches_the_ledger_once_and_survives_the_grid_being_dropped() {
+    let _g = refresh_round::guard();
+    let app = common::isolated_app_dir("refresh_flip");
+    let (mut pm, name) = load(app.path(), "flip", 1_000, "local x = 1");
+    let stem = "flip_refresh";
+    let now = Instant::now();
+    let flips = || {
+        plugin_health::board_for(stem)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .throttle_flips()
+    };
+
+    for _ in 0..2 {
+        pm.note_view_refreshed(&name, now, Duration::from_millis(9));
+    }
+    assert_eq!(flips(), 0, "两次慢还不算降频");
+    pm.note_view_refreshed(&name, now, Duration::from_millis(9));
+    assert!(pm.view_is_slow(&name), "夹具前提：第三次慢该降频");
+    assert_eq!(flips(), 1, "翻进降频的那一次没进台账");
+    pm.note_view_refreshed(&name, now, Duration::from_millis(9));
+    assert_eq!(flips(), 1, "已经在降频里，再慢一次不是新的一次降频");
+
+    let line = plugin_health::summary_for(stem).expect("这一格已经有账，行上要念一句");
+    assert!(
+        line.contains("降频 1 次"),
+        "页面上那句念不出降频次数：{line}"
+    );
+
+    plugin_health::forget(stem);
+    assert_eq!(flips(), 1, "落盘之后从盘上读回，降频次数不该清零");
+
+    // 慢样本滚掉会自动解除；下一次再翻进慢，才是新的一次。
+    for _ in 0..20 {
+        pm.note_view_refreshed(&name, now, Duration::from_millis(1));
+    }
+    assert!(!pm.view_is_slow(&name), "夹具前提：慢样本滚掉之后自动解除");
+    for _ in 0..3 {
+        pm.note_view_refreshed(&name, now, Duration::from_millis(9));
+    }
+    assert_eq!(flips(), 2, "解除之后再次翻进慢，是第二次降频");
 }
 
 /// 停用再启用 = 新实例，上一份慢记录不该压着它。

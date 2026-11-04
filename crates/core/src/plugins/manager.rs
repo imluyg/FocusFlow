@@ -1975,6 +1975,10 @@ impl PluginManager {
     /// 只有跑完才记，跑失败也要记（一次失败的 `get_view()` 通常不比成功快）；
     /// 时间戳也在这一推进，所以调用顺序必须是"问 `view_due` → 跑 → 记"，
     /// 反过来（先记再跑）就出现了"刷失败但下一拍不再试"那一族缺陷。
+    ///
+    /// 从"正常"翻进"慢"的那一次还要进台账：插件页与详情页念的「降频 N 次」只有
+    /// `note_throttle` 一个写手，而它原先只在台账自己的用例里被叫过 —— 生产里那一格
+    /// 永远是 0，页面上一句"该插件较慢"与"降频 0 次"同屏，读起来就是两条账。
     pub fn note_view_refreshed(
         &mut self,
         name: &str,
@@ -1986,10 +1990,22 @@ impl PluginManager {
             .get(name)
             .map(|p| p.manifest.refresh_ms)
             .unwrap_or(plugin_refresh::DEFAULT_REFRESH_MS);
-        self.plans
+        let plan = self
+            .plans
             .entry(name.to_string())
-            .or_insert_with(|| plugin_refresh::Cadence::new(declared))
-            .record(now, elapsed);
+            .or_insert_with(|| plugin_refresh::Cadence::new(declared));
+        let was_slow = plan.is_slow();
+        plan.record(now, elapsed);
+        if was_slow || !plan.is_slow() {
+            return;
+        }
+        let Some(stem) = self.plugins.get(name).map(|p| Self::stem_of(&p.file_path)) else {
+            return;
+        };
+        plugin_health::board_for(&stem)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_throttle();
     }
 
     /// 这一页现在被降频了吗（插件页那格要说「该插件较慢」，方案 3.9 那一列）。
