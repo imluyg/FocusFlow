@@ -2087,11 +2087,7 @@ unsafe fn commit_and_close_into(hwnd: HWND, pin: bool, dir: &std::path::Path, cl
                 s.notice = Some(msg.clone());
                 // 快速那条本来"松手即存"就完事：正因为没存上才把它留在标注阶段，
                 // 否则屏上没有一个"再试一次"的落点，等于把这句原因也一起吞了。
-                s.phase = Phase::Adjust;
-                s.drag = None;
-                // 这一场事实上已经变成标注场：绝对上限得跟着改。快速那条只有 60 秒，
-                // 不跟着改的话，用户还在读那句原因、还在腾磁盘，第一记定时器就把覆盖层收走了。
-                s.ceiling_ms = snip_ceiling_ms(true);
+                demote_quick_to_annotate(&mut s);
                 owner = s.owner;
             }
             // 同一句话也递给主窗口那条状态读数：覆盖层早晚要退，原因得留个影子
@@ -2099,6 +2095,21 @@ unsafe fn commit_and_close_into(hwnd: HWND, pin: bool, dir: &std::path::Path, cl
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
+}
+
+/// 快速出图失败之后，这一场**事实上已经变成标注场**：`phase`、`annotate` 与自退上限
+/// 必须一起改。
+///
+/// `annotate` 少改一次的症状：用户腾好磁盘再框一个新区域，`finish_selection(annotate=false)`
+/// 会**松手即存**；而在这之前顺手画的几笔正躺在 `marks` 里，会被按新选区原点烘进去 ——
+/// 出来一张框对、笔错位的图。原来注释写着"这一场事实上已经变成标注场"，却只改了另外两位。
+fn demote_quick_to_annotate(s: &mut SnipState) {
+    s.phase = Phase::Adjust;
+    s.annotate = true;
+    s.drag = None;
+    // 快速那条只有 60 秒，不跟着改的话，用户还在读那句原因、还在腾磁盘，
+    // 第一记定时器就把覆盖层收走了。
+    s.ceiling_ms = snip_ceiling_ms(true);
 }
 
 // ===== 窗口清单（单击选窗口 / 悬停预览）=====
@@ -7681,6 +7692,36 @@ mod tests {
             flat.matches("note_snip_result(owner,").count(),
             3,
             "开层失败的回执少了一条：虚拟屏/冻结/建窗三处各要一句"
+        );
+    }
+
+    /// 快速出图失败后必须整场切成标注场：`annotate` 少改一次，下一个选区会松手即存，
+    /// 并把此前画的几笔按新原点烘进去（框对、笔错位）。
+    #[test]
+    fn a_failed_quick_commit_turns_the_session_into_annotate() {
+        let mut s = default_state();
+        s.annotate = false;
+        s.phase = Phase::Select;
+        s.ceiling_ms = snip_ceiling_ms(false);
+        s.drag = Some((Drag::New, 1, 2));
+        demote_quick_to_annotate(&mut s);
+        assert_eq!(s.phase, Phase::Adjust);
+        assert!(s.annotate, "还按快速那套走：下一个选区松手即存");
+        assert_eq!(s.drag, None, "旧拖动必须断掉");
+        assert_eq!(
+            s.ceiling_ms,
+            snip_ceiling_ms(true),
+            "自退上限要跟着换成标注那档"
+        );
+        assert!(snip_ceiling_ms(true) > snip_ceiling_ms(false));
+
+        let src = include_str!("snip.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            flat.matches("demote_quick_to_annotate(&muts)").count(),
+            1,
+            "快速失败那一支没接上整场切换"
         );
     }
 
