@@ -7606,6 +7606,30 @@ fn pv_button_width(text: &str, avail: f32) -> f32 {
         .min(avail)
 }
 
+/// 一格里行内操作按钮各占多宽（按 `actions` 的顺序）。
+///
+/// 自然宽按标签字数算，但整列最多占表宽的 55%：从前没有上限，插件写几个长标签
+/// 就把数据列挤成 40 px 一格，按钮本身还会从卡片左边伸出去 —— 数据看得见一半、
+/// 按钮点得着一半。压窄之后文字由画那一侧按矩形省略，不会画到按钮外面。
+fn pv_row_action_widths(labels: &[String], table_w: f32) -> Vec<f32> {
+    let n = labels.len() as f32;
+    if n == 0.0 {
+        return Vec::new();
+    }
+    let gap = 6.0;
+    let natural: Vec<f32> = labels
+        .iter()
+        .map(|l| (l.chars().count() as f32 * 14.0 + 16.0).max(44.0))
+        .collect();
+    let total = natural.iter().sum::<f32>() + (n - 1.0) * gap + 12.0;
+    let cap = (table_w * 0.55).max(0.0);
+    if total <= cap {
+        return natural;
+    }
+    let unit = ((cap - 12.0 - (n - 1.0) * gap) / n).max(20.0);
+    natural.iter().map(|w| w.min(unit)).collect()
+}
+
 /// 第 `i` 行的整行矩形（画图高亮与点击命中都从这里算，别各写一遍）。
 fn pv_table_row_rect(r: &D2D_RECT_F, i: usize) -> D2D_RECT_F {
     rect(
@@ -7797,18 +7821,15 @@ fn plugin_view_ops(
                 let mut buttons: Vec<(D2D_RECT_F, String, String)> = Vec::new();
                 let mut reserve = 0.0f32;
                 if !actions.is_empty() {
-                    let bw = actions
-                        .iter()
-                        .map(|(_, l)| (l.chars().count() as f32 * 14.0 + 16.0).max(44.0))
-                        .sum::<f32>()
-                        + (actions.len() as f32 - 1.0) * 6.0
-                        + 12.0;
-                    reserve = bw;
+                    let labels: Vec<String> = actions.iter().map(|(_, l)| l.clone()).collect();
+                    let widths = pv_row_action_widths(&labels, w);
+                    reserve =
+                        widths.iter().sum::<f32>() + (actions.len() as f32 - 1.0) * 6.0 + 12.0;
                     for (ri, _) in shown.iter().enumerate() {
                         let rid = shown_ids.get(ri).cloned().unwrap_or_default();
                         let mut bx = x + w - 6.0;
-                        for (prefix, label) in actions.iter().rev() {
-                            let bw = (label.chars().count() as f32 * 14.0 + 16.0).max(44.0);
+                        for (k, (prefix, label)) in actions.iter().enumerate().rev() {
+                            let bw = widths[k];
                             bx -= bw;
                             let by = *y + PV_TABLE_HEAD_H + ri as f32 * PV_TABLE_ROW_H + 1.0;
                             buttons.push((
@@ -16333,6 +16354,56 @@ mod plugin_sel_tests {
                 r.bottom
             );
         }
+    }
+
+    /// 行内操作按钮的列宽要跟着表格宽走。插件给几个长标签时，从前自然宽没有上限：
+    /// 数据列被挤到 40 px 一格、按钮本身还会从卡片左边伸出去。现在整列最多占 55%，
+    /// 数据列至少留 45%，每颗按钮都落在表格矩形内。
+    #[test]
+    fn long_row_action_labels_cannot_eat_the_data_columns() {
+        let long = "这是一个非常长的操作名称".to_string();
+        let view = focusflow_core::plugins::PluginView {
+            title: "夹具".to_string(),
+            widgets: vec![focusflow_core::plugins::Widget::Table {
+                headers: vec!["名".to_string(), "值".to_string()],
+                rows: vec![vec!["a".to_string(), "1".to_string()]],
+                ids: vec!["r0".to_string()],
+                actions: vec![
+                    ("run:".to_string(), long.clone()),
+                    ("del:".to_string(), long.clone()),
+                    ("more:".to_string(), long.clone()),
+                ],
+                group: String::new(),
+                onselect: String::new(),
+            }],
+        };
+        let ops = plugin_view_ops(&view, rect(0.0, 0.0, 600.0, 400.0), 0.0, &HashMap::new());
+        let Some(POp::Table {
+            rect: r,
+            buttons,
+            column_w,
+            ..
+        }) = ops.first()
+        else {
+            panic!("夹具那张表没走到 POp::Table，实得 {} 项", ops.len());
+        };
+        assert_eq!(buttons.len(), 3);
+        let table_w = r.right - r.left;
+        assert!(
+            *column_w >= table_w * 0.44,
+            "数据列被按钮列挤掉了：{column_w} / {table_w}"
+        );
+        for (br, _, _) in buttons {
+            assert!(
+                br.left >= r.left - 0.001 && br.right <= r.right + 0.001,
+                "行内按钮伸到表格外面：{br:?}（表 {r:?}）"
+            );
+        }
+        // 短标签不受影响：自然宽一个像素都不变。
+        assert_eq!(
+            pv_row_action_widths(&["跑".to_string(), "编辑".to_string()], 600.0),
+            vec![44.0, 44.0]
+        );
     }
 
     /// 不分组 = 多选（点第二行留两行、再点第一行取消一行），分组 = 单选（只留最后点的）。
