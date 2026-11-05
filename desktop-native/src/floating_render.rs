@@ -86,19 +86,13 @@ pub fn metric_from(value: &str) -> Metric {
     }
 }
 
-/// `utils.js::fmt` 的口径：按千位加逗号、负数保留。
+/// 悬浮窗里的次数：与看板、排行用同一份紧凑口径（`≥10000` 收成「1.2万」）。
+///
+/// 从前这里自己按千位加逗号。值那一格默认只有 60px（`MIN_W` 下 46px），而这一路
+/// 文字是 NO_WRAP + CLIP：`1,234,567` 会被硬切掉尾巴、连省略号都没有；同一个数
+/// 在卡片上写 1,234,567、在看板上写 123.5万 也是自己对着自己。
 pub fn fmt_count(n: i64) -> String {
-    let sign = if n < 0 { "-" } else { "" };
-    let digits = n.unsigned_abs().to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
-    out.push_str(sign);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
+    focusflow_core::format::fmt_compact(n)
 }
 
 /// 时长写法与主界面 `duration_text` 同一份口径：`3h 30m` / `12m` / `45s`。
@@ -476,12 +470,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn counts_group_by_three() {
+    fn counts_use_the_same_compact_rule_as_the_dashboard() {
         assert_eq!(fmt_count(0), "0");
         assert_eq!(fmt_count(999), "999");
         assert_eq!(fmt_count(1000), "1,000");
-        assert_eq!(fmt_count(1234567), "1,234,567");
+        assert_eq!(
+            fmt_count(1234567),
+            "123.5万",
+            "一万以上要跟看板同一把尺子，不能再按千分位往下数"
+        );
         assert_eq!(fmt_count(-1500), "-1,500");
+        // 卡片值那一格默认 60px、最小窗 46px：紧凑写法必须能落进去（超过一万的
+        // 千分位写法在 NO_WRAP+CLIP 下会被硬切尾巴，没有省略号）。
+        assert!(
+            fmt_count(12_345_678).chars().count() <= 7,
+            "七位以上的次数要收成「万」，实得 {}",
+            fmt_count(12_345_678)
+        );
     }
 
     #[test]
