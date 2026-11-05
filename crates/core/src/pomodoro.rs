@@ -598,7 +598,10 @@ impl PomodoroTimer {
     pub fn record_key(&self, _key_name: &str, count: i64) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.state == STATE_WORK && !s.paused {
-            s.key_count += count.max(1);
+            // `count` 是插件经 Lua 递进来的 i64，可以是 `i64::MAX`；release 配置不做
+            // 溢出检查，`+=` 会绕成负数，而这个数会落进 `pomodoro_sessions` 并加进
+            // 「今日键鼠」。饱和相加至少不会把计数翻到负轴。
+            s.key_count = s.key_count.saturating_add(count.max(1));
         }
     }
 
@@ -847,6 +850,28 @@ mod tests {
         live.start_work().expect("线程活着时必须允许开始");
         assert_eq!(live.get_state(), STATE_WORK);
         live.shutdown();
+    }
+
+    /// 插件递进来的批次增量不可信（Lua i64 可以是 `i64::MAX`）：累加要饱和，
+    /// 不能绕成负数 —— 那个数会落进会话记录并加进「今日键鼠」。
+    #[test]
+    fn a_plugin_batch_cannot_wrap_the_key_count_negative() {
+        let t = PomodoroTimer {
+            state: Arc::new(Mutex::new(TimerState {
+                state: STATE_WORK.to_string(),
+                ..Default::default()
+            })),
+            stop: Arc::new(AtomicBool::new(false)),
+            tick_alive: Arc::new(AtomicBool::new(false)),
+            spawn_lock: Mutex::new(()),
+        };
+        t.record_key("A", i64::MAX);
+        t.record_key("A", 5);
+        assert_eq!(
+            t.state.lock().unwrap_or_else(|e| e.into_inner()).key_count,
+            i64::MAX,
+            "饱和相加不许把计数翻到负轴"
+        );
     }
 
     /// 锁中毒之后计时必须继续按秒推进。
