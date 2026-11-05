@@ -449,18 +449,39 @@ impl DbWriter {
         };
         agg.last_ts = timestamp;
         if contrib > 0 {
-            *agg.active.entry(day_key).or_insert(0) += contrib;
-            state
-                .today_active
-                .fetch_add(contrib as u64, Ordering::Relaxed);
-            // 同一段秒数同时归给「事件发生时所在的前台应用」：
-            // 与 active 同源、同门限（ACTIVE_GAP_SECS），所以应用总时长恒 ≤ 今日活跃时长，
-            // 差额只剩「当时没有已知前台应用」的时段（启动初期 / exclude 命中）。
-            // 归给「本次事件时」的应用是安全的：切窗动作（Alt+Tab、点任务栏）本身
-            // 也是一次键鼠事件，会把上一段静默期封口在前一个应用上，
-            // 不会出现「在 A 看了半小时却记到 B 头上」。
-            if let Some(app) = agg.current_app.clone() {
-                *agg.apps.entry((day_key, app)).or_insert(0) += contrib;
+            // 一段活跃时间跨过午夜时按午夜切成两段：前一段属于前一天，后一段才是今天的。
+            // 从前整段（≤ ACTIVE_GAP_SECS）都记在"事件发生那天"头上 —— 跨零点那一下
+            // 会把昨天最后几十秒搬进今天（daily_counts.seconds、应用时长、今日缓存一起偏）。
+            let prev_day = queries::day_key_of_ts(timestamp - contrib);
+            let (before, after) = if prev_day != day_key {
+                let midnight = day_key
+                    .saturating_mul(86_400)
+                    .saturating_sub(queries::local_utc_offset_seconds());
+                let before = (midnight - (timestamp - contrib)).clamp(0, contrib);
+                (before, contrib - before)
+            } else {
+                (0, contrib)
+            };
+            if before > 0 {
+                *agg.active.entry(prev_day).or_insert(0) += before;
+                if let Some(app) = agg.current_app.clone() {
+                    *agg.apps.entry((prev_day, app)).or_insert(0) += before;
+                }
+            }
+            if after > 0 {
+                *agg.active.entry(day_key).or_insert(0) += after;
+                state
+                    .today_active
+                    .fetch_add(after as u64, Ordering::Relaxed);
+                // 同一段秒数同时归给「事件发生时所在的前台应用」：
+                // 与 active 同源、同门限（ACTIVE_GAP_SECS），所以应用总时长恒 ≤ 今日活跃时长，
+                // 差额只剩「当时没有已知前台应用」的时段（启动初期 / exclude 命中）。
+                // 归给「本次事件时」的应用是安全的：切窗动作（Alt+Tab、点任务栏）本身
+                // 也是一次键鼠事件，会把上一段静默期封口在前一个应用上，
+                // 不会出现「在 A 看了半小时却记到 B 头上」。
+                if let Some(app) = agg.current_app.clone() {
+                    *agg.apps.entry((day_key, app)).or_insert(0) += after;
+                }
             }
         }
     }
@@ -2380,6 +2401,32 @@ mod tests {
         assert_eq!(w.state.today_active.load(Ordering::Relaxed), 10);
         w.record("A", t0 + 102); // 间隔 2s：活跃 +2
         assert_eq!(w.state.today_active.load(Ordering::Relaxed), 12);
+        w.stop_and_wait();
+    }
+
+    /// 活跃时长跨过午夜要按午夜切成两段：前一段归前一天，后一段才归今天。
+    ///
+    /// 从前整段都记在「事件发生那天」头上：零点后第一条事件会把昨天最后几十秒
+    /// 一起搬进今天（日总时长、应用时长、今日缓存同时偏），昨天的账则少一截。
+    #[test]
+    fn active_seconds_spanning_midnight_are_split_between_the_two_days() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_midnight");
+        let w = start_writer(Duration::from_secs(3600));
+        let today = queries::day_key_of_ts(queries::now_ts());
+        let midnight = today * 86_400 - queries::local_utc_offset_seconds();
+        w.record("A", midnight - 40);
+        w.record("A", midnight + 20); // 间隔 60s：跨午夜 40s + 20s
+        {
+            let agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(agg.active.get(&(today - 1)), Some(&40), "午前那一段归昨天");
+            assert_eq!(agg.active.get(&today), Some(&20), "午后那一段归今天");
+        }
+        assert_eq!(
+            w.state.today_active.load(Ordering::Relaxed),
+            20,
+            "今日缓存只该收午夜之后那一段"
+        );
         w.stop_and_wait();
     }
 
