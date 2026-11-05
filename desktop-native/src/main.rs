@@ -928,8 +928,9 @@ struct PvSelect {
 /// 指针此刻压在哪个"稳定控件"上（手型光标与悬停底色共用）。
 ///
 /// 只覆盖画图与命中测试读同一份几何的那几组：周期药丸、视图页签、分析子页签、
-/// 排行页药丸、设置页导航。弹窗 / 下拉 / 插件视图那棵点击树不复刻到这里 ——
-/// 宁可那几处保持箭头，也不要出现"手型指着一个点不动的区域"。
+/// 排行页药丸、设置导航与行、插件清单行、可点的表格行。行内更细的按钮
+/// （改名/恢复/授权/详情）各有自己的矩形，不复刻到这里 —— 它们保持箭头，
+/// 因为"手型指着一个点不动的区域"比"少一处手型"更伤。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ctl {
     WinBtn(u8),
@@ -941,6 +942,14 @@ enum Ctl {
     ATab(u8),
     RankPill(u8),
     SetNav(u8),
+    /// 设置页里的一行（分组标题不算控件）。
+    SetRow(u16),
+    /// 排行榜/应用/设备里可点的那一行 —— 只有设备屏有下游动作。
+    TableRow(u16),
+    /// 插件清单里的一行。
+    PluginList(u16),
+    /// 插件页里能点的格子（返回、安装、视图控件、详情页按钮）。
+    Pv,
 }
 
 struct App {
@@ -1043,6 +1052,8 @@ struct App {
     plugin_detail_installed: bool,
     /// 卸载确认框（None = 没开）。
     plugin_uninstall: Option<UninstallPrompt>,
+    /// 「清理 30 天前」的二次确认（不可撤销那一档的唯一入口）。
+    cleanup_confirm: bool,
     /// 上一拍开着的那一页（用来认出"关掉/换页"这一个转变）。
     ///
     /// 为什么不在三处关闭动作里各写一遍卸载：那三处迟早会漂移（本仓为"同一个手势的多个出口
@@ -1058,6 +1069,14 @@ struct App {
     /// `sel` 按钮拼的动作 id 与行高亮都读这一份；开/关视图时清掉（旧版前端口径：
     /// 关掉面板就不留选中），切换分组互不影响。
     plugin_sel: HashMap<String, Vec<String>>,
+    /// 插件视图里"能点的格子"（悬停与手型共用）。几何与选中集无关，缓存键只要
+    /// 视图名 + 尺寸 + 滚动位置 —— 选中只影响画出来的底色。
+    pv_targets: Vec<PvTarget>,
+    pv_targets_key: Option<(String, u32, u32, i32)>,
+    /// 指针此刻压在插件视图的哪一格（行 / 控件）。
+    pv_hover: Option<PvTarget>,
+    /// 正在拖的滚动条滑块（None = 没在拖）。
+    scroll_drag: Option<ScrollDrag>,
     hover: Option<usize>,
     /// 指针下的控件（药丸/页签/导航）：只影响底色与光标形状，不参与点击判定。
     ctl: Option<Ctl>,
@@ -1563,11 +1582,16 @@ impl App {
                 plugin_detail_source: None,
                 plugin_detail_installed: false,
                 plugin_uninstall: None,
+                cleanup_confirm: false,
                 plugin_panel_was: None,
                 pv_scroll: 0,
                 pv_select: None,
                 pv_modal: None,
                 plugin_sel: HashMap::new(),
+                pv_targets: Vec::new(),
+                pv_targets_key: None,
+                pv_hover: None,
+                scroll_drag: None,
                 hover: None,
                 ctl: None,
                 sel: None,
@@ -1727,6 +1751,7 @@ impl App {
                 period: self.period.load(std::sync::atomic::Ordering::Relaxed),
                 hover: self.hover,
                 ctl: self.ctl,
+                pv_hover: self.pv_hover,
                 sel: self.sel,
                 editing: self.edit_row,
                 capturing: self.capturing,
@@ -1787,6 +1812,7 @@ impl App {
                 self.plugin_detail_source.as_deref(),
                 self.plugin_detail_installed,
                 self.plugin_uninstall.as_ref(),
+                self.cleanup_confirm,
                 pv,
                 pv_scroll,
                 self.pv_select.as_ref(),
@@ -1823,17 +1849,16 @@ impl App {
         )
     }
 
-    /// 指针落在哪个稳定控件上。顺序与 `on_click` 一致（药丸 → 页签 → 子页签 → 排行药丸 →
-    /// 设置导航），几何全部读画图用的那一份；弹窗与插件视图不在这里复刻（见 [`Ctl`]）。
-    fn control_at(&self, w: f32, h: f32, x: f32, y: f32) -> Option<Ctl> {
+    /// 指针落在哪个可点区域上。顺序与 `on_click` 一致（药丸 → 页签 → 页内控件）。
+    ///
+    /// 插件视图开着时周期药丸与页签仍然点得动（`on_click` 本来就先处理它们），
+    /// 所以这里不再因为"视图开着"整段早退 —— 那会让一排点得动的药丸全变回箭头。
+    fn control_at(&mut self, w: f32, h: f32, x: f32, y: f32) -> Option<Ctl> {
         // 窗口按钮在插件视图与详情弹窗里也要亮：它不归页面，归窗口。
         match top_owner(self.detail.is_some(), w, x, y) {
             TopOwner::WinBtn(i) => return Some(Ctl::WinBtn(i)),
             TopOwner::DetailModal => return None,
             TopOwner::Page => {}
-        }
-        if self.plugin_open.is_some() {
-            return None;
         }
         for (i, (_, r)) in period_pills().iter().enumerate() {
             if hit(*r, x, y) {
@@ -1854,16 +1879,28 @@ impl App {
             }
         }
         match self.view {
-            0 => {
-                let pills = rank_pills(left_card(w, h));
-                for (i, r) in pills.iter().enumerate() {
-                    // 「分组」那一屏不画筛选三格（`draw_table` 同样只画前两颗）。
-                    if self.rank_tab == 1 && i >= 2 {
-                        break;
+            0..=2 => {
+                if self.view == 0 {
+                    let pills = rank_pills(left_card(w, h));
+                    for (i, r) in pills.iter().enumerate() {
+                        // 「分组」那一屏不画筛选三格（`draw_table` 同样只画前两颗）。
+                        if self.rank_tab == 1 && i >= 2 {
+                            break;
+                        }
+                        if hit(*r, x, y) {
+                            return Some(Ctl::RankPill(i as u8));
+                        }
                     }
-                    if hit(*r, x, y) {
-                        return Some(Ctl::RankPill(i as u8));
-                    }
+                }
+                let card = left_card(w, h);
+                let g = table_geom(card);
+                let count = self
+                    .snap
+                    .lock()
+                    .map(|snap| left_rows(&snap, self.view, self.rank_tab, self.rank_filter).len())
+                    .unwrap_or(0);
+                if let Some((i, _)) = table_row_at(count, &g, card, self.view, self.scroll, x, y) {
+                    return Some(Ctl::TableRow(i as u16));
                 }
             }
             3 => {
@@ -1871,6 +1908,42 @@ impl App {
                     if hit(*r, x, y) {
                         return Some(Ctl::ATab(i as u8));
                     }
+                }
+            }
+            4 => {
+                let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
+                let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
+                if let Some(stem) = self.plugin_detail_open.as_deref() {
+                    if matches!(
+                        plugin_page_of(None, Some(stem), &self.plugin_rows),
+                        PluginPage::Detail(_)
+                    ) {
+                        if self.plugin_detail_installed && hit(detail_uninstall_rect(card), x, y) {
+                            return Some(Ctl::Pv);
+                        }
+                        if hit(back, x, y) {
+                            return Some(Ctl::Pv);
+                        }
+                        return None;
+                    }
+                }
+                if self.plugin_open.is_some() {
+                    if hit(back, x, y) {
+                        return Some(Ctl::Pv);
+                    }
+                    let clip = plugin_content_clip(card);
+                    let targets = self.pv_targets_update(w, h)?;
+                    return pv_target_on(targets, clip, x, y).map(|_| Ctl::Pv);
+                }
+                if hit(plugin_install_rect(card), x, y) {
+                    return Some(Ctl::Pv);
+                }
+                let (list_top, row_h, max_rows) = plugin_geom(w, h);
+                let slots = plugin_slots(&self.plugin_rows);
+                if let Some((i, _)) =
+                    plugin_list_row_at(&slots, list_top, row_h, max_rows, w, self.scroll, x, y)
+                {
+                    return Some(Ctl::PluginList(i as u16));
                 }
             }
             5 => {
@@ -1886,10 +1959,173 @@ impl App {
                         return Some(Ctl::SetNav(i as u8));
                     }
                 }
+                let items = self
+                    .snap
+                    .lock()
+                    .ok()
+                    .map(|s| settings_items(&s, &self.search, self.settings_cat))
+                    .unwrap_or_default();
+                if let Some((i, _)) = settings_row_at(&items, &g, w, self.scroll, x, y) {
+                    return Some(Ctl::SetRow(i as u16));
+                }
             }
             _ => {}
         }
         None
+    }
+
+    /// 确保插件视图的"能点格子"与当前这一页对得上；键不变就复用。
+    ///
+    /// 只在视图/尺寸/滚动位置变化时重排一次，`WM_MOUSEMOVE` 与 `WM_SETCURSOR`
+    /// 都读这份缓存 —— 否则每移动一个像素就要把整页控件连字符串一起重建一遍。
+    fn pv_targets_update(&mut self, w: f32, h: f32) -> Option<&[PvTarget]> {
+        let name = self.plugin_open.clone()?;
+        let key = (name.clone(), w.to_bits(), h.to_bits(), self.pv_scroll);
+        if self.pv_targets_key.as_ref() != Some(&key) {
+            let view = self
+                .pm
+                .as_ref()
+                .and_then(|pm| pm.get_plugin(&name))
+                .and_then(|p| p.view.clone());
+            let Some(view) = view else {
+                self.pv_targets.clear();
+                self.pv_targets_key = None;
+                return None;
+            };
+            let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
+            let area = rect(
+                card.left,
+                card.top + 40.0,
+                card.right - card.left,
+                card.bottom - card.top,
+            );
+            let ops = plugin_view_ops(&view, area, self.pv_scroll as f32, &self.plugin_sel);
+            self.pv_targets = pv_targets_of(&ops);
+            self.pv_targets_key = Some(key);
+        }
+        Some(&self.pv_targets)
+    }
+
+    /// 当前这一页的滚动条几何：轨道 + 总数 + 一屏容量 + 当前偏移。
+    ///
+    /// 画、拖动、命中三处读同一份；`None` = 这一页没有可滚的东西。
+    fn scroll_geom(&self, w: f32, h: f32) -> Option<(ScrollLane, D2D_RECT_F, usize, usize, usize)> {
+        match self.view {
+            0..=2 => {
+                let card = left_card(w, h);
+                let g = table_geom(card);
+                let total = self
+                    .snap
+                    .lock()
+                    .map(|s| left_rows(&s, self.view, self.rank_tab, self.rank_filter).len())
+                    .unwrap_or(0);
+                let track = rect(
+                    card.right - 11.0,
+                    g.list_top,
+                    6.0,
+                    g.max_rows as f32 * g.row_h,
+                );
+                Some((ScrollLane::Table, track, total, g.max_rows, self.scroll))
+            }
+            4 => {
+                if self.plugin_open.is_some() {
+                    let name = self.plugin_open.as_deref()?;
+                    let view = self.pm.as_ref()?.get_plugin(name)?.view.as_ref()?;
+                    let area = plugin_scroll_area(w, h);
+                    let visible = plugin_scroll_visible(h);
+                    let content = plugin_content_height(view, area);
+                    let track = rect(w - 32.0 - 11.0, area.top, 6.0, visible);
+                    Some((
+                        ScrollLane::PluginView,
+                        track,
+                        content.ceil().max(0.0) as usize,
+                        visible as usize,
+                        self.pv_scroll.max(0) as usize,
+                    ))
+                } else {
+                    let (list_top, row_h, max_rows) = plugin_geom(w, h);
+                    let slots = plugin_slots(&self.plugin_rows);
+                    let track = rect(w - 32.0 - 11.0, list_top, 6.0, max_rows as f32 * row_h);
+                    Some((
+                        ScrollLane::Plugins,
+                        track,
+                        slots.len(),
+                        max_rows,
+                        self.scroll,
+                    ))
+                }
+            }
+            5 => {
+                let g = settings_geom(w, h);
+                let total = self
+                    .snap
+                    .lock()
+                    .ok()
+                    .map(|s| settings_items(&s, &self.search, self.settings_cat).len())
+                    .unwrap_or(0);
+                let track = rect(
+                    w - 32.0 - 11.0,
+                    g.list_top,
+                    6.0,
+                    g.max_rows as f32 * g.row_h,
+                );
+                Some((ScrollLane::Settings, track, total, g.max_rows, self.scroll))
+            }
+            _ => None,
+        }
+    }
+
+    /// 左键落在滑块上 = 开始拖。返回 true 表示这一下已被滚动条吃掉，不当作点击。
+    fn begin_scroll_drag(&mut self, hwnd: HWND, px: f32, py: f32) -> bool {
+        let s = self.scale(hwnd);
+        let (w, h) = self.client_dip(hwnd);
+        let (x, y) = (px / s, py / s);
+        let Some((lane, track, total, visible, offset)) = self.scroll_geom(w, h) else {
+            return false;
+        };
+        let Some(thumb) = scrollbar_thumb(track, total, visible, offset) else {
+            return false;
+        };
+        if !hit(thumb, x, y) {
+            return false;
+        }
+        self.scroll_drag = Some(ScrollDrag {
+            lane,
+            track,
+            thumb_h: thumb.bottom - thumb.top,
+            grab: y - thumb.top,
+            total,
+            visible,
+        });
+        unsafe {
+            let _ = SetCapture(hwnd);
+        }
+        true
+    }
+
+    /// 拖动中：按滑块位置换算偏移。返回 false = 没有在拖。
+    fn drag_scroll(&mut self, hwnd: HWND, _px: f32, py: f32) -> bool {
+        let Some(d) = self.scroll_drag else {
+            return false;
+        };
+        let s = self.scale(hwnd);
+        let off = scroll_offset_for_y(&d, py / s);
+        match d.lane {
+            ScrollLane::PluginView => {
+                self.pv_scroll = off as i32;
+                self.pv_hover = None;
+            }
+            _ => self.scroll = off,
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        true
+    }
+
+    /// 松手/捕获丢失：结束拖动。返回 true 表示刚才确实在拖（松手那一下不该再落成点击）。
+    fn end_scroll_drag(&mut self) -> bool {
+        self.scroll_drag.take().is_some()
     }
 
     /// 鼠标移动：排行页更新悬停行，分析页更新悬停键 / 悬停那一格；返回是否需要重画。
@@ -1904,6 +2140,7 @@ impl App {
             changed |= self.hover.take().is_some();
             changed |= self.heat_hover.take().is_some();
             changed |= self.chart_hover.take().is_some();
+            changed |= self.pv_hover.take().is_some();
             changed |= ctl != self.ctl;
             self.ctl = ctl;
             return changed;
@@ -1952,92 +2189,47 @@ impl App {
             return changed;
         }
 
-        if self.view == 4 {
-            changed |= self.heat_hover.take().is_some();
-            changed |= self.chart_hover.take().is_some();
-            let (list_top, row_h, max_rows) = plugin_geom(w, h);
-            // 悬停也要按**格子**走：表头占一格，行号与格子号就此分家。
-            // 两处各数一遍的话，装了插件之后鼠标停在第 N 行、亮的却是第 N+1 行。
-            let slots = plugin_slots(&self.plugin_rows);
-            self.scroll = self.scroll.min(slots.len().saturating_sub(max_rows));
-            let mut row = None;
-            for vis in 0..max_rows {
-                let Some(slot) = slots.get(self.scroll + vis) else {
-                    break;
-                };
-                let idx = match slot {
-                    PluginSlot::Row(i) => *i,
-                    // 表头那一格不能悬停
-                    PluginSlot::Header(_) => continue,
-                };
-                let y0 = list_top + vis as f32 * row_h;
-                if hit(plugin_row_rect(w, y0, row_h), x, y) {
-                    row = Some(idx);
-                    break;
-                }
-            }
-            if row != self.hover {
-                self.hover = row;
-                changed = true;
-            }
-            return changed;
-        }
-
-        if self.view == 5 {
-            changed |= self.heat_hover.take().is_some();
-            changed |= self.chart_hover.take().is_some();
-            let g = settings_geom(w, h);
-            let count = self
-                .snap
-                .lock()
-                .map(|s| settings_items(&s, &self.search, self.settings_cat).len())
-                .unwrap_or(0);
-            self.scroll = self.scroll.min(count.saturating_sub(g.max_rows));
-            let mut row = None;
-            for vis in 0..g.max_rows {
-                let idx = self.scroll + vis;
-                if idx >= count {
-                    break;
-                }
-                let y0 = g.list_top + vis as f32 * g.row_h;
-                if hit(settings_row_rect(&g, w, y0), x, y) {
-                    row = Some(idx);
-                    break;
-                }
-            }
-            if row != self.hover {
-                self.hover = row;
-                changed = true;
-            }
-            return changed;
-        }
-
-        // 排行页：这条分支既不在热力图上、也不在分析页那两张图上，残留的高亮在这里撤掉。
+        // 行悬停与光标读同一份命中：`control_at` 已经把"哪一行"算出来了，这里不再
+        // 各写一遍循环（从前三处各数一遍，行高一改就有一处漏改，亮一行点另一行）。
         changed |= self.heat_hover.take().is_some();
         changed |= self.chart_hover.take().is_some();
-        let card = left_card(w, h);
-        let g = table_geom(card);
-        let count = self
-            .snap
-            .lock()
-            .map(|snap| left_rows(&snap, self.view, self.rank_tab, self.rank_filter).len())
-            .unwrap_or(0);
-        self.scroll = self.scroll.min(count.saturating_sub(g.max_rows));
-
-        let mut row = None;
-        for vis in 0..g.max_rows {
-            let idx = self.scroll + vis;
-            if idx >= count {
-                break;
+        let hover = match ctl {
+            Some(Ctl::SetRow(i)) | Some(Ctl::TableRow(i)) | Some(Ctl::PluginList(i)) => {
+                Some(i as usize)
             }
-            let y0 = g.list_top + vis as f32 * g.row_h;
-            if hit(table_row_band(card, y0, g.row_h), x, y) {
-                row = Some(idx);
-                break;
-            }
+            _ => None,
+        };
+        if hover != self.hover {
+            self.hover = hover;
+            changed = true;
         }
-        if row != self.hover {
-            self.hover = row;
+        // 插件视图上的悬停：弹窗/下拉/卸载确认开着时不亮（它们把整页压住了）。
+        let pv_hover = if self.pv_select.is_some()
+            || self.pv_modal.is_some()
+            || self.plugin_uninstall.is_some()
+        {
+            None
+        } else {
+            match ctl {
+                Some(Ctl::Pv) => {
+                    let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
+                    let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
+                    if hit(back, x, y) {
+                        Some(PvTarget {
+                            rect: back,
+                            row: false,
+                        })
+                    } else {
+                        let clip = plugin_content_clip(card);
+                        self.pv_targets_update(w, h)
+                            .and_then(|ts| pv_target_on(ts, clip, x, y))
+                    }
+                }
+                _ => None,
+            }
+        };
+        if pv_hover != self.pv_hover {
+            self.pv_hover = pv_hover;
             changed = true;
         }
         changed
@@ -2105,6 +2297,8 @@ impl App {
                 self.chart_hover = None;
                 self.pv_select = None;
                 self.pv_modal = None;
+                self.pv_hover = None;
+                self.cleanup_confirm = false;
                 // 录入态也一起清：热键录入吃掉 WM_KEYDOWN（连 Esc 都不再收窗），而它的
                 // 提示画在设置页那一格里 —— 换页之后提示看不见、按键照旧被吞，
                 // 用户只会觉得"这个键怎么没反应了"。
@@ -2448,41 +2642,34 @@ impl App {
             let slots = plugin_slots(&self.plugin_rows);
             let scroll = self.scroll.min(slots.len().saturating_sub(max_rows));
             self.scroll = scroll;
-            for vis in 0..max_rows {
-                let Some(slot) = slots.get(scroll + vis) else {
-                    break;
-                };
-                let idx = match slot {
-                    PluginSlot::Row(i) => *i,
-                    PluginSlot::Header(_) => continue,
-                };
+            if let Some((idx, vis)) =
+                plugin_list_row_at(&slots, list_top, row_h, max_rows, w, scroll, x, y)
+            {
                 let y0 = list_top + vis as f32 * row_h;
                 let row_rect = plugin_row_rect(w, y0, row_h);
-                if hit(row_rect, x, y) {
-                    // 验收脚本按坐标点插件行：这一句是那条点击唯一的对账痕迹
-                    // （点偏了与"按钮没反应"在屏上分不开）。
-                    tracing_note(&format!("点击插件行 {idx} at ({x:.0},{y:.0})"));
-                    self.sel = Some(idx);
-                    let vb = rect(row_rect.right - 76.0, y0 + 9.0, 60.0, 22.0);
-                    // 命中条件与画它的条件同一个（`needs_grant`）：只画一颗不点不动的按钮、
-                    // 或留一块看着能点其实点到"打开视图"的空格，都是这一页说假话的方式
-                    let grantable = self
-                        .plugin_rows
-                        .get(idx)
-                        .map(|r| r.needs_grant)
-                        .unwrap_or(false);
-                    if hit(vb, x, y) {
-                        self.toggle_plugin(hwnd, idx);
-                    } else if grantable && hit(plugin_grant_rect(row_rect.right, y0), x, y) {
-                        self.grant_plugin(hwnd, idx);
-                    } else if hit(plugin_detail_rect(row_rect.right, y0), x, y) {
-                        self.open_plugin_detail(hwnd, idx);
-                    } else if let Some(name) = self.plugin_rows.get(idx).map(|r| r.name.clone()) {
-                        // 点行本身 = 看这个插件的视图
-                        self.open_plugin_view(hwnd, &name);
-                    }
-                    return;
+                // 验收脚本按坐标点插件行：这一句是那条点击唯一的对账痕迹
+                // （点偏了与"按钮没反应"在屏上分不开）。
+                tracing_note(&format!("点击插件行 {idx} at ({x:.0},{y:.0})"));
+                self.sel = Some(idx);
+                let vb = rect(row_rect.right - 76.0, y0 + 9.0, 60.0, 24.0);
+                // 命中条件与画它的条件同一个（`needs_grant`）：只画一颗不点不动的按钮、
+                // 或留一块看着能点其实点到"打开视图"的空格，都是这一页说假话的方式
+                let grantable = self
+                    .plugin_rows
+                    .get(idx)
+                    .map(|r| r.needs_grant)
+                    .unwrap_or(false);
+                if hit(vb, x, y) {
+                    self.toggle_plugin(hwnd, idx);
+                } else if grantable && hit(plugin_grant_rect(row_rect.right, y0), x, y) {
+                    self.grant_plugin(hwnd, idx);
+                } else if hit(plugin_detail_rect(row_rect.right, y0), x, y) {
+                    self.open_plugin_detail(hwnd, idx);
+                } else if let Some(name) = self.plugin_rows.get(idx).map(|r| r.name.clone()) {
+                    // 点行本身 = 看这个插件的视图
+                    self.open_plugin_view(hwnd, &name);
                 }
+                return;
             }
             self.sel = None;
             unsafe {
@@ -2491,6 +2678,24 @@ impl App {
             return;
         }
         if self.view == 5 {
+            // 清理确认开着：只认那两颗按钮；点框外/取消都算取消。
+            if self.cleanup_confirm {
+                let (dialog, buttons) = cleanup_prompt_geometry(w, h);
+                let run = cleanup_choice_at(dialog, buttons, x, y);
+                let inside = hit(dialog, x, y);
+                let cancel_btn = hit(buttons[0], x, y);
+                self.cleanup_confirm = false;
+                if run {
+                    tracing_note("cleanup-run=1");
+                    self.run_action(hwnd, CLEANUP_ACTION);
+                } else if !inside || cancel_btn {
+                    tracing_note("cleanup-cancel=1");
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+                return;
+            }
             // 搜索框的输入层是顶层弹出窗：平时藏着（提示文案归主窗画），
             // 点框身这一下才把它叫到屏上并接住键盘。
             if hit(search_box_rect(w), x, y) {
@@ -2536,113 +2741,112 @@ impl App {
             let count = items.len();
             let scroll = self.scroll.min(count.saturating_sub(g.max_rows));
             self.scroll = scroll;
-            for vis in 0..g.max_rows {
-                let idx = scroll + vis;
-                if idx >= count {
-                    break;
-                }
-                // 注意变量名：这里的行顶端不能。
+            if let Some((idx, vis)) = settings_row_at(&items, &g, w, scroll, x, y) {
+                self.sel = Some(idx);
                 let y0 = g.list_top + vis as f32 * g.row_h;
-                let row_rect = settings_row_rect(&g, w, y0);
-                if hit(row_rect, x, y) {
-                    self.sel = Some(idx);
-                    match items[idx] {
-                        SItem::Header(_) => {}
-                        SItem::Action(a) => self.run_action(hwnd, a),
-                        SItem::Basic(Basic::Autostart) => self.toggle_autostart(hwnd),
-                        SItem::Basic(Basic::Hotkey) => self.toggle_hotkey(hwnd),
-                        SItem::Basic(b @ (Basic::Snip | Basic::SnipQuick)) => {
-                            if let Some(annotate) = snip_mode_of(b) {
-                                snip::start(hwnd, annotate);
-                            }
-                        }
-                        SItem::Basic(Basic::ClosePins) => self.close_pins(hwnd),
-                        SItem::Basic(Basic::WeeklyReport) => self.make_weekly_report(hwnd),
-                        SItem::Basic(Basic::Floating) => {
-                            self.status = Some(toggle_floating(hwnd, None));
-                            unsafe {
-                                let _ = InvalidateRect(Some(hwnd), None, false);
-                            }
-                        }
-                        SItem::Basic(Basic::Collector) => self.toggle_collector(hwnd),
-                        SItem::Basic(Basic::Pause) => self.toggle_pause(hwnd),
-                        SItem::Basic(Basic::Theme) => {
-                            self.status = Some(toggle_theme(hwnd));
-                        }
-                        SItem::Basic(Basic::DataDir) => self.open_data_dir(),
-                        SItem::Setting(i) => {
-                            // 先问值框右沿那颗小钮：点它不该顺手把值框打开。
-                            let hk = self.snap.lock().ok().and_then(|s| {
-                                s.settings
-                                    .get(i)
-                                    .map(|r| (r.section, r.key, r.default.clone(), r.value.clone()))
-                            });
-                            let vb = rect(g.value_x, y0 + 9.0, g.value_w, 26.0);
-                            if let Some((section, key, default, value)) = hk {
-                                if hotkey_slot(section, key).is_some() {
-                                    if hit(hotkey_btn_rect(vb), x, y) {
-                                        // 点那颗钮先把录入态收掉：不然他刚清空的那一条，
-                                        // 会被下一键随手又绑回去。
-                                        self.capturing = None;
-                                        // 有值 → 清空（这条从此不注册）；空着 → 写回默认组合。
-                                        let v = if value.trim().is_empty() {
-                                            default
-                                        } else {
-                                            String::new()
-                                        };
-                                        let note = config_write_note(
-                                            &format!("热键 {key}"),
-                                            focusflow_core::config::instance()
-                                                .set_now(section, key, &v),
-                                        );
-                                        let msg = self.reload_hotkeys();
-                                        // 这句留着 `key = 值` 那个 ASCII 形状（与
-                                        // `register_combo` 同一形状）：验收脚本只能匹配
-                                        // ASCII，中文夹在中间它就逮不到。
-                                        tracing_note(&format!(
-                                            "热键 {key} = {v:?} 由值框右边那颗钮改过：{msg}"
-                                        ));
-                                        self.status = Some(format!("{msg}{note}"));
-                                        self.refresh_now();
-                                        unsafe {
-                                            let _ = InvalidateRect(Some(hwnd), None, false);
-                                        }
-                                        return;
-                                    }
-                                    if hit(vb, x, y) {
-                                        // 值框里点一下＝开始录入。这里**不再**开文本框：
-                                        // 他要的正是"别让我手打字母"，而两种入口同时开着，
-                                        // 屏上就没法说清这一格现在等按键还是等文字。
-                                        self.capturing = Some(i);
-                                        self.edit_row = None;
-                                        unsafe {
-                                            // 录入靠主窗口自己收键；焦点不在这里就是收不到。
-                                            let _ = SetFocus(Some(hwnd));
-                                            let _ = InvalidateRect(Some(hwnd), None, false);
-                                        }
-                                        return;
-                                    }
-                                }
-                            }
-                            let kind = self
-                                .snap
-                                .lock()
-                                .ok()
-                                .and_then(|s| s.settings.get(i).map(|r| r.kind))
-                                .unwrap_or(3);
-                            tracing_note(&format!("设置行 idx={i} kind={kind} at y={y:.0}"));
-                            if kind == 0 {
-                                self.toggle_setting(hwnd, i);
-                            } else {
-                                self.start_edit_setting(hwnd, i, idx);
-                            }
-                            unsafe {
-                                let _ = InvalidateRect(Some(hwnd), None, false);
-                            }
+                match items[idx] {
+                    SItem::Header(_) => {}
+                    SItem::Action(a) if a == CLEANUP_ACTION => {
+                        self.cleanup_confirm = true;
+                        tracing_note("cleanup-confirm=1");
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
-                    return;
+                    SItem::Action(a) => self.run_action(hwnd, a),
+                    SItem::Basic(Basic::Autostart) => self.toggle_autostart(hwnd),
+                    SItem::Basic(Basic::Hotkey) => self.toggle_hotkey(hwnd),
+                    SItem::Basic(b @ (Basic::Snip | Basic::SnipQuick)) => {
+                        if let Some(annotate) = snip_mode_of(b) {
+                            snip::start(hwnd, annotate);
+                        }
+                    }
+                    SItem::Basic(Basic::ClosePins) => self.close_pins(hwnd),
+                    SItem::Basic(Basic::WeeklyReport) => self.make_weekly_report(hwnd),
+                    SItem::Basic(Basic::Floating) => {
+                        self.status = Some(toggle_floating(hwnd, None));
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+                    SItem::Basic(Basic::Collector) => self.toggle_collector(hwnd),
+                    SItem::Basic(Basic::Pause) => self.toggle_pause(hwnd),
+                    SItem::Basic(Basic::Theme) => {
+                        self.status = Some(toggle_theme(hwnd));
+                    }
+                    SItem::Basic(Basic::DataDir) => self.open_data_dir(),
+                    SItem::Setting(i) => {
+                        // 先问值框右沿那颗小钮：点它不该顺手把值框打开。
+                        let hk = self.snap.lock().ok().and_then(|s| {
+                            s.settings
+                                .get(i)
+                                .map(|r| (r.section, r.key, r.default.clone(), r.value.clone()))
+                        });
+                        let vb = rect(g.value_x, y0 + 9.0, g.value_w, 26.0);
+                        if let Some((section, key, default, value)) = hk {
+                            if hotkey_slot(section, key).is_some() {
+                                if hit(hotkey_btn_rect(vb), x, y) {
+                                    // 点那颗钮先把录入态收掉：不然他刚清空的那一条，
+                                    // 会被下一键随手又绑回去。
+                                    self.capturing = None;
+                                    // 有值 → 清空（这条从此不注册）；空着 → 写回默认组合。
+                                    let v = if value.trim().is_empty() {
+                                        default
+                                    } else {
+                                        String::new()
+                                    };
+                                    let note = config_write_note(
+                                        &format!("热键 {key}"),
+                                        focusflow_core::config::instance()
+                                            .set_now(section, key, &v),
+                                    );
+                                    let msg = self.reload_hotkeys();
+                                    // 这句留着 `key = 值` 那个 ASCII 形状（与
+                                    // `register_combo` 同一形状）：验收脚本只能匹配
+                                    // ASCII，中文夹在中间它就逮不到。
+                                    tracing_note(&format!(
+                                        "热键 {key} = {v:?} 由值框右边那颗钮改过：{msg}"
+                                    ));
+                                    self.status = Some(format!("{msg}{note}"));
+                                    self.refresh_now();
+                                    unsafe {
+                                        let _ = InvalidateRect(Some(hwnd), None, false);
+                                    }
+                                    return;
+                                }
+                                if hit(vb, x, y) {
+                                    // 值框里点一下＝开始录入。这里**不再**开文本框：
+                                    // 他要的正是"别让我手打字母"，而两种入口同时开着，
+                                    // 屏上就没法说清这一格现在等按键还是等文字。
+                                    self.capturing = Some(i);
+                                    self.edit_row = None;
+                                    unsafe {
+                                        // 录入靠主窗口自己收键；焦点不在这里就是收不到。
+                                        let _ = SetFocus(Some(hwnd));
+                                        let _ = InvalidateRect(Some(hwnd), None, false);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        let kind = self
+                            .snap
+                            .lock()
+                            .ok()
+                            .and_then(|s| s.settings.get(i).map(|r| r.kind))
+                            .unwrap_or(3);
+                        tracing_note(&format!("设置行 idx={i} kind={kind} at y={y:.0}"));
+                        if kind == 0 {
+                            self.toggle_setting(hwnd, i);
+                        } else {
+                            self.start_edit_setting(hwnd, i, idx);
+                        }
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
                 }
+                return;
             }
             self.sel = None;
             unsafe {
@@ -2695,42 +2899,27 @@ impl App {
             .unwrap_or(0);
         self.scroll = self.scroll.min(count.saturating_sub(g.max_rows));
 
-        let mut row = None;
-        for vis in 0..g.max_rows {
-            let idx = self.scroll + vis;
-            if idx >= count {
-                break;
-            }
-            let y0 = g.list_top + vis as f32 * g.row_h;
-            if hit(table_row_band(r, y0, g.row_h), x, y) {
-                row = Some(idx);
-                break;
-            }
-        }
-
-        match row {
-            Some(idx) => {
+        match table_row_at(count, &g, r, self.view, self.scroll, x, y) {
+            Some((idx, vis)) => {
                 self.sel = Some(idx);
-                if self.view == 2 {
-                    let y0 = g.list_top + (idx - self.scroll) as f32 * g.row_h;
-                    let has_alias = self
-                        .snap
-                        .lock()
-                        .ok()
-                        .and_then(|s| s.devices.get(idx).map(|d| d.has_alias))
-                        .unwrap_or(false);
-                    if has_alias && hit(restore_button(&g, y0), x, y) {
-                        self.restore_device(hwnd, idx);
-                        return;
-                    }
-                    if hit(rename_button(&g, y0), x, y) {
-                        self.start_edit(hwnd, idx);
-                        return;
-                    }
-                    // 点行本身（不在按钮上）= 看详情。
-                    self.open_detail(hwnd, idx);
+                let y0 = g.list_top + vis as f32 * g.row_h;
+                let has_alias = self
+                    .snap
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.devices.get(idx).map(|d| d.has_alias))
+                    .unwrap_or(false);
+                if has_alias && hit(restore_button(&g, y0), x, y) {
+                    self.restore_device(hwnd, idx);
                     return;
                 }
+                if hit(rename_button(&g, y0), x, y) {
+                    self.start_edit(hwnd, idx);
+                    return;
+                }
+                // 点行本身（不在按钮上）= 看详情。
+                self.open_detail(hwnd, idx);
+                return;
             }
             None => self.sel = None,
         }
@@ -3830,6 +4019,9 @@ impl App {
         self.pv_select = None;
         self.pv_modal = None;
         self.plugin_sel.clear();
+        self.pv_targets.clear();
+        self.pv_targets_key = None;
+        self.pv_hover = None;
     }
 
     /// 设置页「关掉所有贴图」：一次收掉桌面上开着的贴图。已存的 PNG 一个字都不动。
@@ -4683,18 +4875,22 @@ fn settings_items(snap: &Snapshot, filter: &str, cat: usize) -> Vec<SItem> {
     out
 }
 
-fn settings_geom(_w: f32, h: f32) -> SettingsGeom {
+fn settings_geom(w: f32, h: f32) -> SettingsGeom {
     let card_top = 208.0;
     let list_top = card_top + 52.0;
     // 高级项两行：中文名 + 一句话说明；基础行/操作也跟着这个行高，整页不再挤成一列键名。
     let row_h = 44.0;
     let max_rows = (((h - 32.0 - 30.0 - list_top) / row_h).floor() as usize).max(1);
+    // 值列右锚：宽窗时贴着卡片右边，不在中间留一大块死白；窗口再窄也先保住
+    // 说明那一列最少 120 px 的宽度（真实下限 960 远在这条线右边）。
+    let value_w = 150.0;
+    let value_x = (w - 32.0 - value_w - 24.0).max(240.0 + value_w);
     SettingsGeom {
         list_top,
         row_h,
         max_rows,
-        value_x: 720.0,
-        value_w: 150.0,
+        value_x,
+        value_w,
         nav_x: 28.0,
         nav_y: list_top,
         nav_w: 190.0,
@@ -4709,6 +4905,35 @@ fn settings_geom(_w: f32, h: f32) -> SettingsGeom {
 /// 也会亮起来 —— 亮的区域与点得到的区域不是同一个。宽度与画那一行读同一个表达式。
 fn settings_row_rect(g: &SettingsGeom, w: f32, y: f32) -> D2D_RECT_F {
     rect(g.body_left, y, w - 32.0 - g.body_left, g.row_h - 2.0)
+}
+
+/// 设置页里指针落在哪一行（返回 `(items 下标, 屏上第几行)`）。分组标题只画不点，不算控件。
+///
+/// 悬停、手型、点击三个读者都走这里：从前三处各写一遍循环，行高一改就有人漏改，
+/// 症状是"亮的是一行、点下去改的是另一行"。
+fn settings_row_at(
+    items: &[SItem],
+    g: &SettingsGeom,
+    w: f32,
+    scroll: usize,
+    x: f32,
+    y: f32,
+) -> Option<(usize, usize)> {
+    let scroll = scroll.min(items.len().saturating_sub(g.max_rows));
+    for vis in 0..g.max_rows {
+        let idx = scroll + vis;
+        let Some(item) = items.get(idx) else {
+            break;
+        };
+        if matches!(item, SItem::Header(_)) {
+            continue;
+        }
+        let y0 = g.list_top + vis as f32 * g.row_h;
+        if hit(settings_row_rect(g, w, y0), x, y) {
+            return Some((idx, vis));
+        }
+    }
+    None
 }
 
 /// 设置行里说明文字那一列的宽度：从行内左边距（`r.left + 12`）画到值框/按钮之前，留 18 px。
@@ -4755,6 +4980,9 @@ const ACTIONS: [(&str, &str, &str); 8] = [
         "正在安排更换数据文件夹…",
     ),
 ];
+
+/// 「清理 30 天前」在 `ACTIONS` 里的下标：唯一不可撤销的一颗，点击要先问一句。
+const CLEANUP_ACTION: usize = 2;
 
 /// 这一颗「执行」交回状态行的那句清理结论 = core 那一句话 + 执行前快照没兜住的那半句。
 ///
@@ -4911,6 +5139,29 @@ fn draw_settings(
         &p.br.grid,
         1.0,
     );
+
+    if count == 0 {
+        // 搜索没有命中时从前是一块空白：看不出"没匹配"还是"这一页坏了"。
+        let x = g.body_left + 12.0;
+        let width = (w - 32.0 - x - 12.0).max(120.0);
+        let msg = if filter.trim().is_empty() {
+            "这一分类没有可显示的设置项".to_string()
+        } else {
+            format!("没有匹配「{}」的设置项", filter.trim())
+        };
+        p.text(
+            &p.clip(&msg, &p.fmt.text13_em, width),
+            rect(x, g.list_top + 8.0, width, 20.0),
+            &p.fmt.text13_em,
+            &p.br.muted,
+        );
+        p.text(
+            &p.clip("搜索的是名称、说明、配置键与当前值", &p.fmt.text12, width),
+            rect(x, g.list_top + 32.0, width, 18.0),
+            &p.fmt.text12,
+            &p.br.muted,
+        );
+    }
 
     for vis in 0..g.max_rows {
         let idx = scroll + vis;
@@ -5355,30 +5606,18 @@ fn draw_settings(
         );
     }
 
-    if count > g.max_rows {
-        let track = rect(
-            card.right - 9.0,
+    draw_vscroll(
+        p,
+        rect(
+            card.right - 11.0,
             g.list_top,
-            4.0,
+            6.0,
             g.max_rows as f32 * g.row_h,
-        );
-        p.round(track, R_MICRO, &p.br.header, None);
-        let frac = g.max_rows as f32 / count as f32;
-        let thumb_h = ((track.bottom - track.top) * frac).max(16.0);
-        let max_scroll = (count - g.max_rows) as f32;
-        let t = if max_scroll > 0.0 {
-            scroll as f32 / max_scroll
-        } else {
-            0.0
-        };
-        let y = track.top + ((track.bottom - track.top) - thumb_h) * t;
-        p.round(
-            rect(track.left, y, 4.0, thumb_h),
-            R_MICRO,
-            &p.br.accent,
-            None,
-        );
-    }
+        ),
+        count,
+        g.max_rows,
+        scroll,
+    );
 }
 
 // ===== 设备详情弹层 =====
@@ -5446,7 +5685,21 @@ fn goal_dot_states(
 /// 用户就去翻今天的数据 —— 与它无关。措辞跟着 `period_text` 走，那一份就是榜与卡片
 /// 共用的周期说法（导出行、设备详情弹窗也念它）。`pending` 那一臂讲的是"还没落库的
 /// 今日增量"，与窗口无关，所以只有它保留「今日」的含义。
-fn empty_board_line(tab: usize, window: &str, pending: i64, flush_secs: i64) -> String {
+///
+/// `gaps` 那一支排在最前：这一栏有年份读不出来时，空榜**不是**"没有记录"——
+/// 卡片与悬浮窗早就不把读失败折成零，榜这里同样不许折成"空"。
+fn empty_board_line(
+    tab: usize,
+    window: &str,
+    pending: i64,
+    flush_secs: i64,
+    gaps: &[String],
+    lane: &str,
+) -> String {
+    let years = gap_years(gaps, lane);
+    if !years.is_empty() {
+        return format!("{window}的数据没读全（{years}没读全）——不一定是没有记录");
+    }
     match tab {
         1 => format!("{window}还没有应用时长（[app_stats] enabled 关着？）"),
         2 => format!("{window}还没有设备计数（[device_stats] enabled 关着？）"),
@@ -5736,6 +5989,8 @@ struct ViewState {
     hover: Option<usize>,
     /// 指针下的控件（悬停底色读它；与 `App::ctl` 同一份）。
     ctl: Option<Ctl>,
+    /// 插件视图里指针压着的那一格（行 / 控件）。
+    pv_hover: Option<PvTarget>,
     sel: Option<usize>,
     editing: Option<usize>,
     /// 按下录入开着的那条热键（`settings` 下标）；那一行的值框要改成"请按下组合…"。
@@ -5926,6 +6181,7 @@ fn draw_screen(
     plugin_detail_source: Option<&str>,
     plugin_detail_installed: bool,
     uninstall: Option<&UninstallPrompt>,
+    cleanup_confirm: bool,
     plugin_view: Option<(&str, &focusflow_core::plugins::PluginView)>,
     pv_scroll: i32,
     pv_select: Option<&PvSelect>,
@@ -6090,7 +6346,7 @@ fn draw_screen(
         // 视图 > 详情 > 清单，判断只有一份（[`plugin_page_of`]）。
         4 => match plugin_page_of(plugin_view, plugin_detail, plugins) {
             PluginPage::View(name, view) => {
-                draw_plugin_view(p, w, h, name, view, pv_scroll, plugin_sel);
+                draw_plugin_view(p, w, h, name, view, pv_scroll, plugin_sel, vs.pv_hover);
             }
             PluginPage::Detail(row) => {
                 let detail = focusflow_core::plugins::plugin_health::detail_for(&row.stem);
@@ -6126,6 +6382,9 @@ fn draw_screen(
     // 卸载确认框也压在正文上：它开着时点击只认那三颗按钮。
     if let Some(prompt) = uninstall {
         draw_uninstall_prompt(p, w, h, prompt);
+    }
+    if cleanup_confirm {
+        draw_cleanup_prompt(p, w, h);
     }
 
     // 模态最后画：它压在所有东西上面。
@@ -6200,7 +6459,7 @@ const VIEWS: [&str; 7] = [
 fn view_tabs() -> [D2D_RECT_F; 7] {
     let mut out = [rect(0.0, 0.0, 0.0, 0.0); 7];
     for (i, slot) in out.iter_mut().enumerate() {
-        *slot = rect(16.0 + i as f32 * 84.0, 172.0, 80.0, 22.0);
+        *slot = rect(16.0 + i as f32 * 84.0, 172.0, 80.0, 26.0);
     }
     out
 }
@@ -7528,6 +7787,131 @@ fn pv_claiming_op_in(ops: &[POp], clip: D2D_RECT_F, x: f32, y: f32) -> Option<&P
     pv_claiming_op(ops, x, y)
 }
 
+/// 插件视图里一个"能点"的格子。`row = true` 用行悬停底色，否则用控件那种更淡的叠加。
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct PvTarget {
+    rect: D2D_RECT_F,
+    row: bool,
+}
+
+/// 从排好版的控件里挑出真正认领点击的那几格 —— 判据与 [`pv_op_claims_click`] 同一份，
+/// 否则会亮着一格、点下去落在别处。
+///
+/// 表格那张的**整块矩形**不进来：表头与行间空白虽然会吞点击，但那里没有可做的事，
+/// 指过去亮起来等于许诺一次不存在的操作。
+fn pv_targets_of(ops: &[POp]) -> Vec<PvTarget> {
+    let mut out = Vec::new();
+    for op in ops {
+        match op {
+            POp::Button { rect, disabled, .. } if !*disabled => out.push(PvTarget {
+                rect: *rect,
+                row: false,
+            }),
+            POp::Select { rect, field, .. } if !field.is_empty() => out.push(PvTarget {
+                rect: select_value_rect(*rect),
+                row: false,
+            }),
+            POp::Field { rect, field, .. } if !field.is_empty() => out.push(PvTarget {
+                rect: pv_field_value_rect(*rect),
+                row: false,
+            }),
+            POp::Table {
+                rect, buttons, ids, ..
+            } => {
+                for (br, ..) in buttons {
+                    out.push(PvTarget {
+                        rect: *br,
+                        row: false,
+                    });
+                }
+                for i in 0..ids.len() {
+                    out.push(PvTarget {
+                        rect: pv_table_row_rect(rect, i),
+                        row: true,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 指针落在哪一格。可见区之外不算（滚出去的内容看不见，也不该亮）。
+fn pv_target_on(targets: &[PvTarget], clip: D2D_RECT_F, x: f32, y: f32) -> Option<PvTarget> {
+    if !hit(clip, x, y) {
+        return None;
+    }
+    targets.iter().copied().find(|t| hit(t.rect, x, y))
+}
+
+/// 这一条滚动条管的是哪一页（拖动松手前只改它自己的偏移）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScrollLane {
+    Table,
+    Settings,
+    Plugins,
+    PluginView,
+}
+
+/// 正在拖的那根滑块：轨道、滑块高、按下点距滑块顶部多远、总数与一屏容量。
+#[derive(Clone, Copy)]
+struct ScrollDrag {
+    lane: ScrollLane,
+    track: D2D_RECT_F,
+    thumb_h: f32,
+    grab: f32,
+    total: usize,
+    visible: usize,
+}
+
+/// 滑块矩形（`None` = 装得下，不画）。最短 16 px，否则一百行时只剩一条线。
+fn scrollbar_thumb(
+    track: D2D_RECT_F,
+    total: usize,
+    visible: usize,
+    offset: usize,
+) -> Option<D2D_RECT_F> {
+    if visible == 0 || total <= visible {
+        return None;
+    }
+    let h = track.bottom - track.top;
+    if h <= 0.0 {
+        return None;
+    }
+    let thumb_h = (h * visible as f32 / total as f32).clamp(16.0, h);
+    let max_scroll = (total - visible) as f32;
+    let t = if max_scroll > 0.0 {
+        (offset as f32 / max_scroll).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let y = track.top + (h - thumb_h) * t;
+    Some(rect(track.left, y, track.right - track.left, thumb_h))
+}
+
+/// 拖到 `y` 时该滚到哪一格。
+fn scroll_offset_for_y(d: &ScrollDrag, y: f32) -> usize {
+    if d.total <= d.visible {
+        return 0;
+    }
+    let span = (d.track.bottom - d.track.top) - d.thumb_h;
+    if span <= 0.0 {
+        return 0;
+    }
+    let t = ((y - d.grab - d.track.top) / span).clamp(0.0, 1.0);
+    (t * (d.total - d.visible) as f32).round() as usize
+}
+
+/// 画一条竖向滚动条：轨道常驻（有东西可滚时才画），滑块跟着偏移走。
+fn draw_vscroll(p: &P<'_>, track: D2D_RECT_F, total: usize, visible: usize, offset: usize) {
+    let Some(thumb) = scrollbar_thumb(track, total, visible, offset) else {
+        return;
+    };
+    p.round(track, R_MICRO, &p.br.header, None);
+    p.round(thumb, R_MICRO, &p.br.accent, None);
+}
+
 /// 插件视图内容有多高（用于把滚动位置夹在合法范围内）。
 fn plugin_content_height(view: &focusflow_core::plugins::PluginView, area: D2D_RECT_F) -> f32 {
     let ops = plugin_view_ops(view, area, 0.0, &HashMap::new());
@@ -7567,7 +7951,7 @@ fn plugin_content_clip(card: D2D_RECT_F) -> D2D_RECT_F {
 
 /// 插件表格的行几何：表头与行高是画、命中、行内按钮三处共用的同一把尺子。
 const PV_TABLE_HEAD_H: f32 = 24.0;
-const PV_TABLE_ROW_H: f32 = 20.0;
+const PV_TABLE_ROW_H: f32 = 24.0;
 /// 一张表最多画几行（面板没有表格内滚动，其余行这次就不出现）。
 ///
 /// 单列成常量是因为 `rows` 与 `ids` 必须**一起**截：命中测试按 `ids.len()` 排行矩形，
@@ -7843,7 +8227,7 @@ fn plugin_view_ops(
                             bx -= bw;
                             let by = *y + PV_TABLE_HEAD_H + ri as f32 * PV_TABLE_ROW_H + 1.0;
                             buttons.push((
-                                rect(bx, by, bw, 18.0),
+                                rect(bx, by, bw, 22.0),
                                 format!("{prefix}{rid}"),
                                 label.clone(),
                             ));
@@ -7979,6 +8363,7 @@ fn plugin_view_title_rect(card: D2D_RECT_F, back: D2D_RECT_F) -> D2D_RECT_F {
 }
 
 /// 画插件视图；返回"返回"按钮的矩形（点击时用同一份几何）。
+#[allow(clippy::too_many_arguments)] // 画这一页就是这么多读数，拆开只是换个地方排
 fn draw_plugin_view(
     p: &P<'_>,
     w: f32,
@@ -7987,12 +8372,16 @@ fn draw_plugin_view(
     view: &focusflow_core::plugins::PluginView,
     scroll: i32,
     plugin_sel: &HashMap<String, Vec<String>>,
+    hover: Option<PvTarget>,
 ) -> D2D_RECT_F {
     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
     p.card(card, R_CARD);
 
     let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
     p.round(back, R_CONTROL, &p.br.header, Some(&p.br.border));
+    if hover.is_some_and(|h| h.rect == back) {
+        p.round(back, R_CONTROL, &p.br.hover, None);
+    }
     p.text("← 返回", back, &p.fmt.center_small, &p.br.fg);
 
     let title = if view.title.is_empty() || view.title == name {
@@ -8027,6 +8416,10 @@ fn draw_plugin_view(
         scroll as f32,
         plugin_sel,
     );
+    // 行悬停铺在内容底下：叠在字上会把插件自己写的文字染成另一档颜色。
+    if let Some(h) = hover.filter(|h| h.row) {
+        p.fill(h.rect, &p.br.row_hover);
+    }
     for op in &ops {
         match op {
             POp::Heading { rect: r, text } => {
@@ -8237,6 +8630,27 @@ fn draw_plugin_view(
             } => draw_plugin_chart(p, *r, kind, labels, points),
         }
     }
+    // 控件（按钮/下拉/输入框/行内按钮）的悬停叠在最上面：它们本身就是实底色，
+    // 铺在底下看不出来。用圆角半透明色，形状与画它们时那一档一致。
+    if let Some(h) = hover.filter(|h| !h.row) {
+        p.round(h.rect, R_CONTROL, &p.br.hover, None);
+    }
+    // 正文的滚动条：从前这一页能滚但屏上没有任何指示。
+    let content_top = card.top + 40.0;
+    let visible = plugin_scroll_visible(h);
+    let content = ops
+        .iter()
+        .map(|op| op.bounds().bottom)
+        .fold(content_top, f32::max)
+        - content_top
+        + scroll as f32;
+    draw_vscroll(
+        p,
+        rect(card.right - 11.0, content_top, 6.0, visible),
+        content.ceil().max(0.0) as usize,
+        visible as usize,
+        scroll.max(0) as usize,
+    );
 
     unsafe { p.rt.PopAxisAlignedClip() };
 
@@ -8750,6 +9164,37 @@ fn plugin_row_rect(w: f32, y: f32, row_h: f32) -> D2D_RECT_F {
     rect(32.0, y, w - 64.0, row_h - 4.0)
 }
 
+/// 插件清单里指针落在哪一行（返回 `(清单行下标, 屏上第几格)`）。
+///
+/// 表头占一格但不能点，与 [`plugin_slots`] 那张表同一口径：少算这一格，
+/// 鼠标停在 N 行、亮/点的却是 N+1 行。
+#[allow(clippy::too_many_arguments)] // 七个读数都是画那一列自己的几何，拆开传反而多一层转手
+fn plugin_list_row_at(
+    slots: &[PluginSlot],
+    list_top: f32,
+    row_h: f32,
+    max_rows: usize,
+    w: f32,
+    scroll: usize,
+    x: f32,
+    y: f32,
+) -> Option<(usize, usize)> {
+    let scroll = scroll.min(slots.len().saturating_sub(max_rows));
+    for vis in 0..max_rows {
+        let Some(slot) = slots.get(scroll + vis) else {
+            break;
+        };
+        let PluginSlot::Row(idx) = *slot else {
+            continue;
+        };
+        let y0 = list_top + vis as f32 * row_h;
+        if hit(plugin_row_rect(w, y0, row_h), x, y) {
+            return Some((idx, vis));
+        }
+    }
+    None
+}
+
 /// 插件错误串里常带 `\nstack traceback:…`：只留第一行并截断，否则会把下一行顶穿。
 fn one_line(s: &str, max: usize) -> String {
     let first = s.lines().next().unwrap_or("").trim();
@@ -8766,7 +9211,7 @@ fn one_line(s: &str, max: usize) -> String {
 /// 点下去没反应，而没有任何一条用例说得清它为什么不动。摆在启用开关**左边**，
 /// 同一行同一高度，用户视线不用跳。
 fn plugin_grant_rect(row_right: f32, y: f32) -> D2D_RECT_F {
-    rect(row_right - 76.0 - 66.0, y + 9.0, 58.0, 22.0)
+    rect(row_right - 76.0 - 66.0, y + 9.0, 58.0, 24.0)
 }
 
 /// 「详情」那颗按钮的位置：画它的这一头与点它的那一头共用这一个表达式。
@@ -8777,7 +9222,7 @@ fn plugin_grant_rect(row_right: f32, y: f32) -> D2D_RECT_F {
 ///
 /// 它也是这一页最左边的那颗按钮，第二行正文的宽度按它的左沿收（见 `draw_plugins`）。
 fn plugin_detail_rect(row_right: f32, y: f32) -> D2D_RECT_F {
-    rect(row_right - 76.0 - 66.0 - 66.0, y + 9.0, 58.0, 22.0)
+    rect(row_right - 76.0 - 66.0 - 66.0, y + 9.0, 58.0, 24.0)
 }
 
 /// 插件页右上角的「安装插件包…」按钮。画与命中读同一个表达式。
@@ -8808,6 +9253,27 @@ fn uninstall_prompt_geometry(w: f32, h: f32) -> (D2D_RECT_F, [D2D_RECT_F; 3]) {
         rect(left + (bw + gap) * 2.0, y, bw, 28.0),
     ];
     (box_, buttons)
+}
+
+/// 「清理 30 天前」的确认框：框体 + 两颗按钮（左起：取消 / 清理）。
+///
+/// 左边那颗是**默认结局**：遮罩、Esc、切页都走取消，只有显式点右边才真的删。
+/// 与卸载确认同一条道理 —— 不可撤销那一档不该由"手一抖"完成。
+fn cleanup_prompt_geometry(w: f32, h: f32) -> (D2D_RECT_F, [D2D_RECT_F; 2]) {
+    let width = 460.0;
+    let height = 170.0;
+    let box_ = rect((w - width) / 2.0, (h - height) / 2.0, width, height);
+    let bw = 132.0;
+    let gap = 12.0;
+    let left = box_.left + (width - (bw * 2.0 + gap)) / 2.0;
+    let y = box_.bottom - 16.0 - 28.0;
+    let buttons = [rect(left, y, bw, 28.0), rect(left + bw + gap, y, bw, 28.0)];
+    (box_, buttons)
+}
+
+/// 确认框里这一下点的是不是"真的清理"那颗。框外、框内空白、取消都返回 false。
+fn cleanup_choice_at(_dialog: D2D_RECT_F, buttons: [D2D_RECT_F; 2], x: f32, y: f32) -> bool {
+    hit(buttons[1], x, y)
 }
 
 /// 安装那一次的结论那一句（纯函数：worker 线程拼好，GUI 只显示）。
@@ -8988,7 +9454,7 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             );
         }
         // 启用开关（只画；命中在 on_click 里用同一份几何）
-        let vb = rect(r.right - 76.0, y + 9.0, 60.0, 22.0);
+        let vb = rect(r.right - 76.0, y + 9.0, 60.0, 24.0);
         p.round(
             vb,
             R_CONTROL,
@@ -9036,6 +9502,14 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
             if bad { &p.br.danger } else { &p.br.muted },
         );
     }
+
+    draw_vscroll(
+        p,
+        rect(w - 32.0 - 11.0, list_top, 6.0, max_rows as f32 * row_h),
+        slots.len(),
+        max_rows,
+        scroll,
+    );
 
     if rows.is_empty() {
         p.text(
@@ -9377,6 +9851,53 @@ fn draw_uninstall_prompt(p: &P<'_>, w: f32, h: f32, prompt: &UninstallPrompt) {
     }
 }
 
+/// 「清理 30 天前」确认框：遮罩 + 一张小卡 + 两颗按钮（取消在左，是默认结局）。
+fn draw_cleanup_prompt(p: &P<'_>, w: f32, h: f32) {
+    p.fill(rect(0.0, 0.0, w, h), &p.br.overlay);
+    let (dialog, buttons) = cleanup_prompt_geometry(w, h);
+    p.overlay_card(dialog, R_MODAL);
+
+    let x = dialog.left + 20.0;
+    let text_w = dialog.right - x - 20.0;
+    p.text(
+        &p.clip("清理 30 天以前的明细？", &p.fmt.body, text_w),
+        rect(x, dialog.top + 16.0, text_w, 22.0),
+        &p.fmt.body,
+        &p.br.fg,
+    );
+    p.text(
+        &p.clip(
+            "只删 30 天以前的明细，现在的数据不动。",
+            &p.fmt.caption,
+            text_w,
+        ),
+        rect(x, dialog.top + 46.0, text_w, 18.0),
+        &p.fmt.caption,
+        &p.br.muted,
+    );
+    p.text(
+        &p.clip(
+            "不可撤销；执行前会试着留一份快照，兜不住时状态行会说明。",
+            &p.fmt.caption,
+            text_w,
+        ),
+        rect(x, dialog.top + 68.0, text_w, 18.0),
+        &p.fmt.caption,
+        &p.br.muted,
+    );
+
+    let labels = ["取消", "清理 30 天前"];
+    for (i, label) in labels.iter().enumerate() {
+        let (bg, fg) = if i == 1 {
+            (&p.br.danger, &p.br.white)
+        } else {
+            (&p.br.header, &p.br.fg)
+        };
+        p.round(buttons[i], R_CONTROL, bg, Some(&p.br.border));
+        p.text(label, buttons[i], &p.fmt.center_small, fg);
+    }
+}
+
 /// 内置看板页：范围胶囊 + KPI 四格 + 一句话 + 趋势 + 两列排行（方案 3.2）。
 ///
 /// 三条约定：
@@ -9703,7 +10224,7 @@ fn rank_pills(card: D2D_RECT_F) -> [D2D_RECT_F; 5] {
     let x0 = rank_pills_x0(card);
     let mut out = [rect(0.0, 0.0, 0.0, 0.0); 5];
     for (i, dx) in PILL_DX.iter().enumerate() {
-        out[i] = rect(x0 + dx, y, PILL_W, 22.0);
+        out[i] = rect(x0 + dx, y, PILL_W, 26.0);
     }
     out
 }
@@ -9789,12 +10310,43 @@ fn table_row_band(card: D2D_RECT_F, y: f32, row_h: f32) -> D2D_RECT_F {
     rect(card.left, y, card.right - card.left, row_h)
 }
 
+/// 排行/应用/设备三屏里指针落在哪一行（返回 `(榜里下标, 屏上第几行)`）。
+///
+/// **只有设备屏的行可点**（改名/恢复/看详情）。键鼠与应用两屏没有点击下游，
+/// 从前它们也画悬停、也记选中，等于让高亮许诺一件不会发生的事 —— 这里直接返回
+/// `None`，画与光标一起保持安静。
+fn table_row_at(
+    count: usize,
+    g: &TableGeom,
+    card: D2D_RECT_F,
+    view: usize,
+    scroll: usize,
+    x: f32,
+    y: f32,
+) -> Option<(usize, usize)> {
+    if view != 2 {
+        return None;
+    }
+    let scroll = scroll.min(count.saturating_sub(g.max_rows));
+    for vis in 0..g.max_rows {
+        let idx = scroll + vis;
+        if idx >= count {
+            break;
+        }
+        let y0 = g.list_top + vis as f32 * g.row_h;
+        if hit(table_row_band(card, y0, g.row_h), x, y) {
+            return Some((idx, vis));
+        }
+    }
+    None
+}
+
 fn rename_button(g: &TableGeom, y: f32) -> D2D_RECT_F {
-    rect(g.x_last, y + 3.0, 58.0, 18.0)
+    rect(g.x_last, y + 1.0, 58.0, 22.0)
 }
 
 fn restore_button(g: &TableGeom, y: f32) -> D2D_RECT_F {
-    rect(g.x_last - 64.0, y + 3.0, 58.0, 18.0)
+    rect(g.x_last - 64.0, y + 1.0, 58.0, 22.0)
 }
 
 /// 缺口清单里到底有几**本**年度库读不动（不是几条读数）。
@@ -10135,6 +10687,13 @@ fn export_html_text(s: &Snapshot) -> String {
         ));
     }
     out.push_str("</table>\n");
+    if s.app_rows_total > s.apps.len() {
+        out.push_str(&format!(
+            "<p>应用太多，只列了前 {} 个（共 {} 个）。</p>\n",
+            s.apps.len(),
+            s.app_rows_total
+        ));
+    }
 
     out.push_str(
         "<h2>设备排行</h2><table><tr><th>排名</th><th>设备</th><th>类型</th><th>次数</th></tr>",
@@ -10221,6 +10780,8 @@ fn export_json_text(s: &Snapshot) -> String {
         // 两个答案，而两份文件并排放着看不出谁对。
         "rank_total": s.rank_share_base(),
         "app_total": s.app_total,
+        // `apps` 只列前 100 个：不交这个数，读 JSON 的人会把"前 100 名"当成"全部应用"。
+        "app_rows_total": s.app_rows_total,
         "device_total": s.device_total,
         "avg": s.avg,
         "rank": rank,
@@ -10487,14 +11048,25 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         // `[database] flush_interval`（默认 10 秒）才落一次。这不是"没记上"，
         // 所以这里要说清楚还差哪一步 —— 不然"今日 5 次 + 空列表"看着像 bug。
         let pending = collect::pending_today();
-        let empty = empty_board_line(
-            tab,
-            &period_text(snap.period),
-            pending,
-            focusflow_core::config::instance()
-                .get_int("database", "flush_interval", 10)
-                .max(1),
-        );
+        // 筛选把榜筛空时，别让他去翻数据目录：这条只可能是"换一下筛选"能解开的。
+        let filtered_empty = tab == 0
+            && vs.rank_tab == 0
+            && vs.rank_filter != 0
+            && !left_rows(snap, 0, vs.rank_tab, 0).is_empty();
+        let empty = if filtered_empty {
+            "当前筛选下没有记录（只键盘 / 只鼠标）——切回「全部」看看".to_string()
+        } else {
+            empty_board_line(
+                tab,
+                &period_text(snap.period),
+                pending,
+                focusflow_core::config::instance()
+                    .get_int("database", "flush_interval", 10)
+                    .max(1),
+                &snap.gaps,
+                lane,
+            )
+        };
         p.text(
             &empty,
             rect(
@@ -10681,26 +11253,14 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         }
     }
 
-    // 滚动条：只有装不下时才画。拖动没做，滚轮与点击空白处先够用。
-    if count > g.max_rows {
-        let track = rect(r.right - 9.0, g.list_top, 4.0, g.max_rows as f32 * g.row_h);
-        p.round(track, R_MICRO, &p.br.header, None);
-        let frac = g.max_rows as f32 / count as f32;
-        let thumb_h = ((track.bottom - track.top) * frac).max(16.0);
-        let max_scroll = (count - g.max_rows) as f32;
-        let t = if max_scroll > 0.0 {
-            scroll as f32 / max_scroll
-        } else {
-            0.0
-        };
-        let y = track.top + ((track.bottom - track.top) - thumb_h) * t;
-        p.round(
-            rect(track.left, y, 4.0, thumb_h),
-            R_MICRO,
-            &p.br.accent,
-            None,
-        );
-    }
+    // 滚动条只在装不下时出现；拖动见 `begin_scroll_drag`（只拖滑块，不做点轨道翻页）。
+    draw_vscroll(
+        p,
+        rect(r.right - 11.0, g.list_top, 6.0, g.max_rows as f32 * g.row_h),
+        count,
+        g.max_rows,
+        scroll,
+    );
 
     let foot_y = r.bottom - 26.0 + 4.0;
     p.line(
@@ -10715,7 +11275,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         // 同一句 `data_home` 在设置页那格是夹过的，这一格从前没有：警告那半句本身就吃掉
         // 大半行，路径一长就越过卡片边、压到右边那张趋势卡上。夹取留头也留尾 —— 尾巴是路径。
         &p.clip(
-            &footer_line(&snap.data_home, &snap.gaps, lane),
+            &table_footer_text(snap, lane, tab),
             &p.fmt.caption,
             r.right - r.left - g.pad * 2.0,
         ),
@@ -10723,6 +11283,22 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
         &p.fmt.caption,
         &p.br.muted,
     );
+}
+
+/// 左表页脚那一句：应用榜被截断时把"只列了多少"摆在最前面，再念数据源/缺读。
+///
+/// 截断从前是静默的：100 个以外的应用既不在屏上、也不在导出里，而屏上没有任何
+/// 一个字说这是一份前 100 名的榜。`footer_line` 本身不动（有用例钉着它的调用形态）。
+fn table_footer_text(snap: &Snapshot, lane: &str, tab: usize) -> String {
+    let foot = footer_line(&snap.data_home, &snap.gaps, lane);
+    if tab == 1 && snap.app_rows_total > snap.apps.len() {
+        return format!(
+            "应用太多，只列了前 {} 个（共 {} 个） · {foot}",
+            snap.apps.len(),
+            snap.app_rows_total
+        );
+    }
+    foot
 }
 
 /// 分析页那张图卡：画图与命中测试算的是同一个矩形，两边不许各摆一份数字。
@@ -11354,7 +11930,7 @@ fn hotkey_slot(section: &str, key: &str) -> Option<usize> {
 /// 值框右沿那颗小钮的位置。**画与命中共用这一份**：两处各算一遍迟早漂开，
 /// 而漂开的症状是"看得见却点不到"或"点 A 改的是 B"。
 fn hotkey_btn_rect(vb: D2D_RECT_F) -> D2D_RECT_F {
-    rect(vb.right - 40.0, vb.top + 4.0, 34.0, 18.0)
+    rect(vb.right - 40.0, vb.top + 1.0, 34.0, 24.0)
 }
 
 /// `[hotkey]` 某个键的中文名（与设置页那一行的标签同一份）——撞车时要点名是哪一条。
@@ -12206,13 +12782,13 @@ const UI_WEIGHT_REG: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_NORMAL;
 /// 两档还是要单列成常量 —— 这块 UI 不按矩形裁切（`NO_WRAP`、不设 `DWRITE_TRIMMING`），
 /// 说明越宽就照画进右边那颗值框，宽度只许有一把尺子。
 pub(crate) const SETTINGS_TEXT_PT: f32 = 14.0;
-pub(crate) const SETTINGS_HELP_PT: f32 = 13.0;
+pub(crate) const SETTINGS_HELP_PT: f32 = 13.5;
 /// 次要信息那一档（`caption` / `caption_right` / `caption_center`）的字号。
 ///
 /// 列出来是因为排行页摘要那一格的**字符预算**要按它换算。以前那格直接借了
 /// `char_budget`（按 `SETTINGS_HELP_PT` 算）：两档字号不相等，预算与屏上像素就不是
 /// 一把尺子 —— 窄窗口下按"装得下"放行、字照画到胶囊底下。
-const CAPTION_PT: f32 = 12.5;
+const CAPTION_PT: f32 = 13.0;
 /// 正文那一档（`body` / `tab` / `table_name`）的字号。
 ///
 /// 与前两档同一个理由：设备名、插件名这类**画在定宽格子里的动态文本**要按这一档算字符
@@ -12220,7 +12796,7 @@ const CAPTION_PT: f32 = 12.5;
 const BODY_PT: f32 = 13.5;
 /// 最小的一档（`small` / `right` / `center_small`）：图上悬停读数吃的是它，
 /// 而那颗气泡只有 150 DIP 宽 —— 预算与字号同样得是同一把尺子。
-const SMALL_PT: f32 = 12.0;
+const SMALL_PT: f32 = 13.0;
 
 fn right_format(dw: &IDWriteFactory, size: f32) -> windows::core::Result<IDWriteTextFormat> {
     right_format_w(dw, size, UI_WEIGHT)
@@ -13480,8 +14056,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             let x = (l.0 & 0xFFFF) as u16 as i16 as f32;
             let y = ((l.0 >> 16) & 0xFFFF) as u16 as i16 as f32;
             let mut changed = false;
+            let mut dragging = false;
             if let Some(app) = unsafe { app_ptr(hwnd) } {
-                changed = app.on_move(hwnd, x, y);
+                if app.scroll_drag.is_some() {
+                    dragging = app.drag_scroll(hwnd, x, y);
+                }
+                if !dragging {
+                    changed = app.on_move(hwnd, x, y);
+                }
             }
             if changed {
                 unsafe {
@@ -13502,7 +14084,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
         WM_MOUSELEAVE_MSG => {
             if let Some(app) = unsafe { app_ptr(hwnd) } {
-                if app.hover.take().is_some() | app.ctl.take().is_some() {
+                if app.hover.take().is_some()
+                    | app.ctl.take().is_some()
+                    | app.pv_hover.take().is_some()
+                {
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -13536,7 +14121,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             let x = (l.0 & 0xFFFF) as u16 as i16 as f32;
             let y = ((l.0 >> 16) & 0xFFFF) as u16 as i16 as f32;
             if let Some(app) = unsafe { app_ptr(hwnd) } {
-                app.on_click(hwnd, x, y);
+                // 落在滑块上就是拖滚动条：这一下不该同时当成一次行点击。
+                if !app.begin_scroll_drag(hwnd, x, y) {
+                    app.on_click(hwnd, x, y);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                if app.end_scroll_drag() {
+                    let _ = unsafe { ReleaseCapture() };
+                }
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            // 捕获被别人拿走（切窗、弹系统框）：拖动到此为止，别拿旧轨道继续换算。
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                app.end_scroll_drag();
             }
             LRESULT(0)
         }
@@ -13791,6 +14394,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 if let Some(app) = unsafe { app_ptr(hwnd) } {
                     if app.detail.is_some() {
                         app.close_detail(hwnd);
+                    } else if app.cleanup_confirm {
+                        // 确认框开着时 Esc = 取消（那一颗是默认结局）。
+                        app.cleanup_confirm = false;
+                        tracing_note("cleanup-cancel=1");
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
                     } else if app.plugin_uninstall.is_some() {
                         // 确认框开着时 Esc = 取消（不删任何东西）。
                         app.plugin_uninstall = None;
@@ -14857,7 +15467,7 @@ mod gap_note_tests {
         // 页脚那句现在是一个真函数（`footer_line`），它的排法由下面那组用例直接钉；
         // 这里只保证画的那一处仍然调它 —— 换回手写格式串，用例就再也看不见屏上那句。
         assert!(
-            prod.contains("&footer_line("),
+            prod.contains("let foot = footer_line(&snap.data_home, &snap.gaps, lane);"),
             "页脚不再走 footer_line：那句的排法没人算了，用例也就成了摆设"
         );
     }
@@ -14981,8 +15591,8 @@ mod chart_hover_tests {
         assert_eq!(
             prod.matches(["self.chart_hover.", "take()"].concat().as_str())
                 .count(),
-            5,
-            "弹窗 / 热力 / 插件 / 设置 / 排行这五处早退各撤一次：新增一屏时要跟着补"
+            3,
+            "详情弹窗 / 分析页两个互斥分支 / 其余屏的统一收尾：三处，新增一屏要跟着补"
         );
         assert_eq!(
             prod.matches(["self.chart_hover = None"].concat().as_str())
@@ -15268,16 +15878,24 @@ mod settings_type_tests {
         // 画 / 悬停 / 点击三处读同一个函数。
         let src = include_str!("main.rs");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
-        for needle in [
-            "let r = settings_row_rect(&g, w, y);",
-            "let row_rect = settings_row_rect(&g, w, y0);",
-            "if hit(settings_row_rect(&g, w, y0), x, y) {",
-        ] {
-            assert!(
-                prod.contains(needle),
-                "画/悬停/点击又各写一套行矩形：缺 {needle}"
-            );
-        }
+        // 画那一行仍读同一个矩形；悬停与点击共用 `settings_row_at`（两处，少一处就是又分家）。
+        assert!(
+            prod.contains("let r = settings_row_rect(&g, w, y);"),
+            "画那一行没有读 settings_row_rect"
+        );
+        assert!(
+            prod.contains("if hit(settings_row_rect(g, w, y0), x, y) {"),
+            "命中函数没有读画那一份矩形"
+        );
+        assert_eq!(
+            prod.matches("settings_row_at(&items").count(),
+            2,
+            "悬停（control_at）与点击（on_click）都该走 settings_row_at，各留一份就是又各数一遍"
+        );
+        assert!(
+            prod.contains("Some(Ctl::SetRow(i))"),
+            "悬停没有从 control_at 那一个命中口径推导"
+        );
     }
 
     /// 说明那一列必须停在值框/按钮之前：从前几行"基础项"写死 560 / 640，而 960 宽时
@@ -15558,7 +16176,7 @@ mod hotkey_tests {
             .collect();
         let needle = "self.view=i;self.scroll=0;self.sel=None;self.hover=None;\
              self.heat_hover=None;self.chart_hover=None;self.pv_select=None;\
-             self.pv_modal=None;self.capturing=None;"
+             self.pv_modal=None;self.pv_hover=None;self.cleanup_confirm=false;self.capturing=None;"
             .replace(" ", "");
         assert_eq!(
             flat.matches(needle.as_str()).count(),
@@ -16024,22 +16642,22 @@ mod window_say_tests {
     /// 与窗口无关，所以只有它保留"今日"的含义，且不许同时冒出两个窗口。
     #[test]
     fn the_empty_board_line_names_the_window_it_counted() {
-        let apps = empty_board_line(1, "近 30 天", 0, 10);
+        let apps = empty_board_line(1, "近 30 天", 0, 10, &[], "应用时长");
         assert!(
             apps.contains("近 30 天") && !apps.contains("今日"),
             "应用那一屏读的是 30 天，不许说今日: {apps}"
         );
-        let dev = empty_board_line(2, "全部", 0, 10);
+        let dev = empty_board_line(2, "全部", 0, 10, &[], "设备统计");
         assert!(
             dev.contains("全部") && !dev.contains("今日"),
             "总计档的榜是全历史: {dev}"
         );
-        let keys = empty_board_line(0, "近 7 天", 0, 10);
+        let keys = empty_board_line(0, "近 7 天", 0, 10, &[], "按键统计");
         assert!(
             keys.contains("近 7 天") && keys.contains("还没有记录"),
             "排行那一屏同样跟着窗口: {keys}"
         );
-        let pending = empty_board_line(0, "近 30 天", 12, 10);
+        let pending = empty_board_line(0, "近 30 天", 12, 10, &[], "按键统计");
         assert!(
             pending.contains("还没落库") && pending.contains("12"),
             "有增量时说的是落库节奏: {pending}"
@@ -16047,6 +16665,19 @@ mod window_say_tests {
         assert!(
             !pending.contains("还没有记录"),
             "不许给两个窗口口径: {pending}"
+        );
+        // 读不出来 ≠ 没有：这一栏有年份缺读时，整句换成"下界"口径。
+        let gaps = vec!["2025 年库按键统计读不出来: 盘睡了".to_string()];
+        let keys_bad = empty_board_line(0, "近 7 天", 0, 10, &gaps, "按键统计");
+        assert!(
+            keys_bad.contains("没读全") && !keys_bad.contains("还没有记录"),
+            "缺读不许印成没有: {keys_bad}"
+        );
+        // 别的栏缺读不许串到应用那一屏（`gap_years` 按域名筛）。
+        let apps_ok = empty_board_line(1, "近 30 天", 0, 10, &gaps, "应用时长");
+        assert!(
+            apps_ok.contains("还没有应用时长"),
+            "按键的缺读串到应用屏了: {apps_ok}"
         );
     }
 
@@ -18778,7 +19409,7 @@ mod clip_tests {
             // 设备名：夹取与画它的那一格都用 device_name_width(&g)
             ("p.clip(&d.name,&p.fmt.table_name,device_name_width(&g)),rect(g.x_name,y+3.0,device_name_width(&g),18.0)", 1),
             // 页脚那句：同一个 r.right-r.left-g.pad*2.0
-            ("p.clip(&footer_line(&snap.data_home,&snap.gaps,lane),&p.fmt.caption,r.right-r.left-g.pad*2.0),rect(r.left+g.pad,foot_y,r.right-r.left-g.pad*2.0,16.0)", 1),
+            ("p.clip(&table_footer_text(snap,lane,tab),&p.fmt.caption,r.right-r.left-g.pad*2.0),rect(r.left+g.pad,foot_y,r.right-r.left-g.pad*2.0,16.0)", 1),
             // 插件名那一格是定宽 240，后面 10 px 就是"版本 · 作者"
             ("p.clip(&row.name,&p.fmt.body,240.0),rect(r.left+8.0,y+5.0,240.0,18.0)", 1),
             // ⚠ 压平空白也会压掉**字符串字面量里面**的空格，所以这一针里的 `v{}·{}`
@@ -19212,21 +19843,20 @@ mod text_tier_tests {
         }
     }
 
-    /// 次要档只掉字重、不掉字号：12.5 是上一轮"全套字号放大一档"之后的值，
-    /// 掉回 12 就是又变小了；`text12` / `nav_item` 仍跟设置页那两格同字号。
+    /// 次要档这一轮抬到 13（原先 12.5 / 12 在 100% 缩放下偏小）；三处仍要同一个数。
     #[test]
     fn the_caption_tier_keeps_its_sizes() {
         let f = build_formats(&dw()).expect("Formats");
-        assert_eq!(size(&f.caption), 12.5);
+        assert_eq!(size(&f.caption), 13.0);
         // 夹取那一道现在直接问 `GetFontSize()`，但排行摘要那几条判据仍按 `CAPTION_PT` 折算：
-        // 两边分家时判据量的就不是屏上那一格 —— 上面那条钉住 12.5，这条钉住"同一个数"。
+        // 两边分家时判据量的就不是屏上那一格 —— 上面那条钉住 13，这条钉住"同一个数"。
         assert_eq!(
             CAPTION_PT,
             size(&f.caption),
             "摘要预算的字号档与 caption 那一档分家了"
         );
-        assert_eq!(size(&f.caption_right), 12.5);
-        assert_eq!(size(&f.caption_center), 12.5);
+        assert_eq!(size(&f.caption_right), 13.0);
+        assert_eq!(size(&f.caption_center), 13.0);
         assert_eq!(size(&f.nav_item), SETTINGS_TEXT_PT);
         assert_eq!(size(&f.text12), SETTINGS_HELP_PT);
     }
@@ -19986,7 +20616,7 @@ mod plugin_page_tests {
     fn the_row_buttons_do_not_overlap() {
         let right = 1000.0;
         let y = 0.0;
-        let switch = rect(right - 76.0, y + 9.0, 60.0, 22.0);
+        let switch = rect(right - 76.0, y + 9.0, 60.0, 24.0);
         let grant = plugin_grant_rect(right, y);
         let detail = plugin_detail_rect(right, y);
         assert!(
@@ -20062,16 +20692,21 @@ mod plugin_page_tests {
             .find("mod plugin_page_tests {")
             .expect("插件页那一套用例的模块起点找不到了");
         let prod = &code[..at];
-        for (name, head) in [
-            ("plugin_install_rect", "fn plugin_install_rect("),
-            ("detail_uninstall_rect", "fn detail_uninstall_rect("),
-            ("uninstall_prompt_geometry", "fn uninstall_prompt_geometry("),
+        for (name, head, want) in [
+            ("plugin_install_rect", "fn plugin_install_rect(", 4),
+            ("detail_uninstall_rect", "fn detail_uninstall_rect(", 4),
+            (
+                "uninstall_prompt_geometry",
+                "fn uninstall_prompt_geometry(",
+                3,
+            ),
         ] {
             assert_eq!(prod.matches(head).count(), 1, "{name} 应当只有一个定义");
             assert_eq!(
                 prod.matches(&format!("{name}(")).count(),
-                3,
-                "{name}：定义一处 + 画一处 + 命中一处，多出来的一处就是手抄了第二遍坐标"
+                want,
+                "{name}：定义一处 + 画一处 + 命中一处（可点的还多一处光标），\
+                 多出来的一处就是手抄了第二遍坐标"
             );
         }
     }
@@ -21095,13 +21730,17 @@ mod table_band_tests {
         // 悬停与点击读同一个函数，不是各写一套坐标。
         let src = include_str!("main.rs");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
-        for needle in [
-            "if hit(table_row_band(card, y0, g.row_h), x, y) {",
-            "if hit(table_row_band(r, y0, g.row_h), x, y) {",
+        assert!(
+            prod.contains("if hit(table_row_band(card, y0, g.row_h), x, y) {"),
+            "命中函数没有读那一份行带"
+        );
+        for call in [
+            "table_row_at(count, &g, card, self.view, self.scroll, x, y)",
+            "table_row_at(count, &g, r, self.view, self.scroll, x, y)",
         ] {
             assert!(
-                prod.contains(needle),
-                "悬停/点击又各写一套行带：缺 {needle}"
+                prod.contains(call),
+                "悬停或点击没有走 table_row_at：缺 {call}"
             );
         }
     }
@@ -21167,6 +21806,227 @@ mod select_menu_tests {
         assert!(
             prod.contains("if let Some(note) = empty_select_note(sel.options.len()) {"),
             "空下拉又画成一块空白卡"
+        );
+    }
+}
+
+/// 这一轮体验改动的算术与文案：点击区、值列、滚动条、确认框、截断提示、插件格子。
+#[cfg(test)]
+mod ux_polish_tests {
+    use super::*;
+
+    /// 独立的点击区一律 ≥24 DIP；行内那几颗受行高限制，钉它们不越出行。
+    #[test]
+    fn standalone_controls_are_at_least_24_dip_tall() {
+        for (name, r) in [
+            ("视图页签", view_tabs()[0]),
+            (
+                "排行筛选胶囊",
+                rank_pills(rect(0.0, 208.0, 900.0, 600.0))[0],
+            ),
+            ("周期药丸", period_pills()[0].1),
+        ] {
+            assert!(
+                r.bottom - r.top >= 24.0,
+                "{name} 只有 {} 高，鼠标点得手酸",
+                r.bottom - r.top
+            );
+        }
+        // 常量比较在编译期就能算出来，但这条腿要的是"别被改回去"。
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(PV_TABLE_ROW_H >= 24.0, "插件表格行太矮");
+        }
+        for (name, r) in [
+            ("授权", plugin_grant_rect(1000.0, 0.0)),
+            ("详情", plugin_detail_rect(1000.0, 0.0)),
+            ("热键清空", hotkey_btn_rect(rect(700.0, 260.0, 150.0, 26.0))),
+        ] {
+            assert!(
+                r.bottom - r.top >= 24.0,
+                "{name} 只有 {} 高",
+                r.bottom - r.top
+            );
+        }
+        // 行内按钮：高度只许占满那一行，不许压到邻行。
+        let card = rect(0.0, 0.0, 900.0, 600.0);
+        let g = table_geom(card);
+        for (name, r) in [
+            ("改名", rename_button(&g, g.list_top)),
+            ("恢复", restore_button(&g, g.list_top)),
+        ] {
+            assert!(
+                r.bottom - r.top >= 22.0,
+                "{name} 太矮：{}",
+                r.bottom - r.top
+            );
+            assert!(
+                r.top >= g.list_top && r.bottom <= g.list_top + g.row_h,
+                "{name} 越出了自己那一行"
+            );
+        }
+    }
+
+    /// 值列右锚：宽窗贴着卡片右边，窄窗先保住说明那一列。
+    #[test]
+    fn the_settings_value_column_follows_the_window_width() {
+        let a = settings_geom(960.0, 860.0);
+        let b = settings_geom(1200.0, 860.0);
+        assert_eq!(a.value_x, 960.0 - 32.0 - a.value_w - 24.0);
+        assert_eq!(b.value_x, 1200.0 - 32.0 - b.value_w - 24.0);
+        assert!(
+            a.value_x + a.value_w <= 960.0 - 32.0,
+            "960 下值框越过卡片右边"
+        );
+        assert!(b.value_x + b.value_w <= 1200.0 - 32.0);
+        let r = settings_row_rect(&a, 960.0, a.list_top);
+        assert!(settings_note_w(&a, r) >= 120.0, "说明那一列被挤没了");
+    }
+
+    /// 设置页分组标题只画不点：命中要跳过它，否则标题会亮起来。
+    #[test]
+    fn settings_row_hit_skips_group_headers() {
+        let g = settings_geom(960.0, 860.0);
+        let items = vec![SItem::Header("数据操作"), SItem::Action(0)];
+        let x = g.body_left + 10.0;
+        assert!(
+            settings_row_at(&items, &g, 960.0, 0, x, g.list_top + g.row_h * 0.5).is_none(),
+            "分组标题不该算控件"
+        );
+        assert_eq!(
+            settings_row_at(&items, &g, 960.0, 0, x, g.list_top + g.row_h * 1.5),
+            Some((1, 1)),
+            "标题下面那一行要能命中，且屏上行号是 1"
+        );
+    }
+
+    /// 滑块比例、最短长度与"装得下不画"。
+    #[test]
+    fn the_scrollbar_thumb_is_a_fraction_of_the_track() {
+        let track = rect(100.0, 0.0, 6.0, 200.0);
+        assert!(scrollbar_thumb(track, 5, 10, 0).is_none(), "装得下不该画");
+        let top = scrollbar_thumb(track, 40, 10, 0).expect("该画");
+        assert!((top.bottom - top.top - 50.0).abs() < 0.01);
+        assert_eq!(top.top, 0.0, "偏移 0 时滑块贴顶");
+        let bottom = scrollbar_thumb(track, 40, 10, 30).expect("该画");
+        assert!((bottom.bottom - 200.0).abs() < 0.01, "滚到底时滑块贴底");
+        let tiny = scrollbar_thumb(track, 1000, 10, 0).expect("该画");
+        assert!((tiny.bottom - tiny.top - 16.0).abs() < 0.01, "最短 16");
+    }
+
+    /// 拖滑块换算偏移：夹在 [0, 总数-一屏] 里，按下点的那一点手感不跳。
+    #[test]
+    fn dragging_the_thumb_maps_to_rows_and_stays_in_range() {
+        let track = rect(0.0, 0.0, 6.0, 200.0);
+        let d = ScrollDrag {
+            lane: ScrollLane::Table,
+            track,
+            thumb_h: 20.0,
+            grab: 10.0,
+            total: 100,
+            visible: 10,
+        };
+        assert_eq!(scroll_offset_for_y(&d, 10.0), 0, "按在滑块原处不该滚");
+        assert_eq!(scroll_offset_for_y(&d, 190.0), 90, "拖到底 = 最大偏移");
+        assert_eq!(scroll_offset_for_y(&d, -500.0), 0, "拖出上界要夹住");
+        assert_eq!(scroll_offset_for_y(&d, 5000.0), 90, "拖出下界要夹住");
+    }
+
+    /// 清理确认：取消在左、命中判定与默认结局一致。
+    #[test]
+    fn the_cleanup_confirmation_defaults_to_cancel() {
+        let (dialog, buttons) = cleanup_prompt_geometry(1200.0, 860.0);
+        assert!(buttons[0].left < buttons[1].left, "取消要在左边");
+        for b in buttons {
+            assert!(
+                b.left >= dialog.left && b.right <= dialog.right,
+                "按钮跑出框"
+            );
+            assert!(b.bottom <= dialog.bottom, "按钮跑出框");
+        }
+        let mid = |r: D2D_RECT_F| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+        let (cx, cy) = mid(buttons[0]);
+        assert!(
+            !cleanup_choice_at(dialog, buttons, cx, cy),
+            "点取消不算执行"
+        );
+        let (cx, cy) = mid(buttons[1]);
+        assert!(
+            cleanup_choice_at(dialog, buttons, cx, cy),
+            "点危险按钮才算执行"
+        );
+        assert!(
+            !cleanup_choice_at(dialog, buttons, dialog.left + 8.0, dialog.top + 8.0),
+            "框内空白什么都不做"
+        );
+        assert!(
+            !cleanup_choice_at(dialog, buttons, 0.0, 0.0),
+            "点遮罩 = 取消"
+        );
+    }
+
+    /// 应用榜截断时把"只列了前 N 个"摆出来；别的屏不借这句。
+    #[test]
+    fn a_truncated_app_ranking_says_how_many_were_left_out() {
+        let mut s = Snapshot {
+            data_home: "C:\\data".to_string(),
+            apps: vec![("a".to_string(), 10)],
+            app_rows_total: 1,
+            ..Default::default()
+        };
+        let foot = table_footer_text(&s, "应用时长", 1);
+        assert!(!foot.contains("只列了前"), "没截断不该多一句: {foot}");
+        s.app_rows_total = 250;
+        let foot = table_footer_text(&s, "应用时长", 1);
+        assert!(
+            foot.contains("只列了前 1 个") && foot.contains("250"),
+            "截断要同时念两个数: {foot}"
+        );
+        let keys = table_footer_text(&s, "按键统计", 0);
+        assert!(!keys.contains("只列了前"), "键鼠那一屏不借这句: {keys}");
+    }
+
+    /// 插件视图里"亮着的格子"必须正好是"点得动的格子"。
+    #[test]
+    fn plugin_targets_are_the_parts_that_claim_clicks() {
+        use focusflow_core::plugins::{PluginView, Widget};
+        let view = PluginView {
+            title: "t".to_string(),
+            widgets: vec![
+                Widget::Button {
+                    id: "go".to_string(),
+                    text: "去".to_string(),
+                    disabled: false,
+                    modal: None,
+                    sel: false,
+                    group: String::new(),
+                },
+                Widget::Table {
+                    headers: vec!["a".to_string()],
+                    rows: vec![vec!["x".to_string()]],
+                    ids: vec!["7".to_string()],
+                    actions: vec![("edit_".to_string(), "编辑".to_string())],
+                    group: String::new(),
+                    onselect: String::new(),
+                },
+            ],
+        };
+        let clip = rect(0.0, 0.0, 800.0, 600.0);
+        let ops = plugin_view_ops(&view, clip, 0.0, &HashMap::new());
+        let targets = pv_targets_of(&ops);
+        assert!(targets.iter().any(|t| !t.row), "按钮/行内按钮没进目标表");
+        assert!(targets.iter().any(|t| t.row), "表格行没进目标表");
+        for t in &targets {
+            let cx = (t.rect.left + t.rect.right) / 2.0;
+            let cy = (t.rect.top + t.rect.bottom) / 2.0;
+            assert!(
+                pv_claiming_op_in(&ops, clip, cx, cy).is_some(),
+                "亮着的格子点下去没人认领: {t:?}"
+            );
+        }
+        assert!(
+            pv_target_on(&targets, clip, -50.0, 10.0).is_none(),
+            "可见区之外不该亮"
         );
     }
 }

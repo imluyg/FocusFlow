@@ -314,8 +314,11 @@ pub struct Snapshot {
     /// 它比卡片那个「总计」（`period_total`）少一截 —— 少的是还没落库的那批增量，
     /// 它们还没归到键盘或鼠标任何一侧（`main.rs` 标题行写「其中」就是这个理由）。
     pub keyboard_total: i64,
-    /// 前台应用时长（当前周期），按秒数降序。
+    /// 前台应用时长（当前周期），按秒数降序。只列前 100 个 —— 总数见 [`Self::app_rows_total`]。
     pub apps: Vec<(String, i64)>,
+    /// `apps` 被截断之前有多少个应用：超过 100 时屏上与导出都要说一句，
+    /// 否则"只列了前 100 个"看起来就是"一共这么多"。
+    pub app_rows_total: usize,
     pub app_total: i64,
     pub devices: Vec<DevRow>,
     /// 设备侧这一轮读回来的总次数 —— `devices` 那些行的分母。
@@ -591,6 +594,7 @@ pub fn load(period: i64) -> Snapshot {
     let app_read = queries::app_stats_totals(days, None);
     let mut apps: Vec<(String, i64)> = app_read.rows.into_iter().collect();
     apps.sort_by(|a, b| focusflow_core::format::cmp_rank_desc(&a.0, &a.1, &b.0, &b.1));
+    let app_rows_total = apps.len();
     apps.truncate(100);
 
     // 每日目标与连续打卡：要扫近 370 天按日序列 —— 这一趟**已经为图查过了**，
@@ -661,6 +665,7 @@ pub fn load(period: i64) -> Snapshot {
         mouse_total: br.mouse_total,
         keyboard_total: br.keyboard_total,
         apps,
+        app_rows_total,
         app_total: app_read.total,
         devices,
         device_total: device_read.total,
@@ -848,25 +853,28 @@ mod readout_rulers_tests {
         };
         // 列宽从设置页自己的几何算（`settings_geom` 与画那一行用的是同一份），字号取自
         // 画那一行的那一档 —— 字号一改，这条判据跟着改，不会按旧字号放行。
-        let g = crate::settings_geom(1200.0, 860.0);
-        let col = (g.value_x - g.body_left - 30.0).max(120.0);
+        // 右锚之后 960 才是最紧的一档，只量 1200 等于量了最松的那一档。
         let dw: IDWriteFactory =
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.expect("DWrite 工厂");
         let f = crate::build_formats(&dw).expect("Formats");
-        let mut over: Vec<String> = Vec::new();
-        for (section, key, _, _, _, help) in SETTINGS {
-            let w = crate::measure_text(&dw, help, &f.text12).expect("量不出来");
-            if w > col {
-                over.push(format!(
-                    "{section}.{key} 的说明实测 {w:.1} px > 列宽 {col:.1} px：{help}"
-                ));
+        for width in [960.0_f32, 1200.0] {
+            let g = crate::settings_geom(width, 860.0);
+            let col = (g.value_x - g.body_left - 30.0).max(120.0);
+            let mut over: Vec<String> = Vec::new();
+            for (section, key, _, _, _, help) in SETTINGS {
+                let w = crate::measure_text(&dw, help, &f.text12).expect("量不出来");
+                if w > col {
+                    over.push(format!(
+                        "{section}.{key} 的说明实测 {w:.1} px > {width:.0} 宽时的列宽 {col:.1} px：{help}"
+                    ));
+                }
             }
+            assert!(
+                over.is_empty(),
+                "这些设置行的说明越到值框后面（值框在它之后画，越出去那截藏进框底）：\n{}",
+                over.join("\n")
+            );
         }
-        assert!(
-            over.is_empty(),
-            "这些设置行的说明越到值框后面（值框在它之后画，越出去那截藏进框底）：\n{}",
-            over.join("\n")
-        );
     }
 
     /// 「日均」那两档的分母各吃什么数。
