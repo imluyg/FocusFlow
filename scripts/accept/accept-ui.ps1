@@ -146,7 +146,7 @@ $kindEmpty = Cursor-Kind $h 600 400
 Check 'empty space keeps the arrow' ($kindEmpty -eq 'arrow') "cursor=$kindEmpty"
 
 # ---- underline follows the label ------------------------------------------------------
-$yUnd = 196 + $oy
+$yUnd = 200 + $oy
 $w0 = Count-Accent $bl $yUnd (16 + $ox) (96 + $ox)
 Check 'the active tab draws an underline' ($w0 -ge 20) "accent_pixels=$w0"
 Click-ViewTab $h 5
@@ -232,7 +232,7 @@ Check 'restore brings it back' (-not [FFUI]::IsIconic($h)) ''
 # minimize only dismissed the dialog. Window-level actions must survive a page modal.
 $cl2 = Get-Client $h
 Click-ViewTab $h 2
-Click-PeriodPill $h 5              # 总计: today has no device rows in a fresh copy
+Click-PeriodPill $h 5              # total: today has no device rows in a fresh copy
 Start-Sleep -Milliseconds 800
 $plainShot = Join-Path $WorkDir 'ui-modal-1.png'
 Save-WindowShot $h $plainShot | Out-Null

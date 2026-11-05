@@ -135,7 +135,7 @@ Check 'the sel button composed <button id><record id>' (@($log | Where-Object { 
 # Widget::Pager draws the declared prev/next ids as real buttons now (it used to be
 # one inert label row). Coordinates are the client rows of the opened fixture view at
 # 100% DPI (content starts at y=260; a plain button row is 38 tall, the pager band is
-# 34 tall: label then 上一页/下一页, then the row below). Since the native caption was
+# 34 tall: label then prev/next, then the row below). Since the native caption was
 # removed the client area is the whole 1200x860 window; top-anchored coordinates below
 # are unchanged, only the bottom edge moved down.
 Click-ViewTab $h 4
@@ -150,10 +150,10 @@ Check 'the opened view takes a pixel click on a button' ([bool]$probeLive) ''
 [FF]::ClickWindow($h, 90, 345, 1)           # row 3: below the 34 px pager band
 $afterLive = Wait-FixLog '/ pg_after'
 Check 'the pager band leaves the next row reachable' ([bool]$afterLive) ''
-[FF]::ClickWindow($h, 350, 312, 1)          # pager: 下一页 (enabled on page 1 / 3)
+[FF]::ClickWindow($h, 350, 312, 1)          # pager: next (enabled on page 1 / 3)
 $nextLive = Wait-FixLog '/ pg_next'
 Check 'the pager next button fires the declared id' ([bool]$nextLive) ''
-[FF]::ClickWindow($h, 270, 312, 1)          # pager: 上一页 (disabled on page 1)
+[FF]::ClickWindow($h, 270, 312, 1)          # pager: prev (disabled on page 1)
 Start-Sleep -Milliseconds 800
 $afterPager = @(Get-FixLog)
 $prevFired = @($afterPager | Where-Object { $_ -match '/ pg_prev' }).Count -gt 0

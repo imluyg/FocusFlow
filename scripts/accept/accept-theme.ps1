@@ -31,9 +31,9 @@ $h = Wait-Window $p.Id
 Check 'main window appears' ($h -ne [IntPtr]::Zero)
 if ($h -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
 Start-Sleep -Milliseconds 1500
-# Period "7 days": the probe data ends yesterday, so "today" is empty and tables would
-# have no rows (the rename button lives on a device row).
-Click-PeriodPill $h 1
+# Period "all time": the probe fixture carries fixed historical dates, so a rolling 7-day
+# window goes empty as the fixture ages (no device rows -> no rename button to click).
+Click-PeriodPill $h 5
 
 # --- dark walk -------------------------------------------------------------------
 for ($i = 0; $i -lt 6; $i++) { Click-ViewTab $h $i; Save-WindowShot $h (Join-Path $WorkDir "dark-view$i.png") | Out-Null }
@@ -65,11 +65,27 @@ Check 'light screenshots written' ((Get-ChildItem $WorkDir -Filter 'light-*.png'
 # the window, the PrintWindow result is ANDed in as the precondition, and the screen point is only
 # printed as a diagnostic.
 function Get-InlineEdit([int]$ProcId) {
-    # 行内编辑挂在顶层宿主窗下（主窗是 DComp 合成，子窗口会被盖住），所以不能
-    # 直接在主窗的子窗口里找 EDIT：先找宿主类，再找它下面的 EDIT。
-    $hv = [FF]::ByClassHandle([uint32]$ProcId, 'FocusFlowEditHost')
-    if ($hv -eq 0) { return 0 }
-    return [FF]::ChildByClassHandle($hv, 'Edit')
+    # The inline editor lives under a top-level host window (the main window is DComp
+    # composed, so a child EDIT would be covered). Two hosts share this class -- the search
+    # box and the inline editor -- so pick the one whose EDIT is visible: ByClass alone can
+    # land on the hidden search host and read as "no editor".
+    $hits = New-Object System.Collections.ArrayList
+    $cb = [FF+EnumWindowsProc]{ param($h,$l)
+        $winPid = [uint32]0
+        [void][FF]::GetWindowThreadProcessId($h, [ref]$winPid)
+        if ($winPid -eq [uint32]$ProcId) {
+            $sb = New-Object System.Text.StringBuilder 256
+            [void][FF]::GetClassName($h, $sb, 256)
+            if ($sb.ToString() -eq 'FocusFlowEditHost') {
+                $ch = [FF]::ChildByClassHandle($h.ToInt64(), 'Edit')
+                if ($ch -ne 0) { [void]$hits.Add($ch); return $false }
+            }
+        }
+        return $true
+    }
+    [void][FF]::EnumWindows($cb, [IntPtr]::Zero)
+    if ($hits.Count -gt 0) { return $hits[0] }
+    return 0
 }
 
 $cLight = $null

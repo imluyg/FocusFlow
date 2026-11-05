@@ -148,10 +148,11 @@ if (-not $p3.HasExited) { Stop-App }
 # have to hold: the file gets an EMPTY value (not the default string -- restoring the default
 # would silently re-arm the combo on the next start), and the next start really skips it.
 #
-# Coordinates are CLIENT pixels (the click helper posts WM_LBUTTONDOWN in client space):
-# settings list_top=260, row_h=44, the first binding row is the 5th item of this category,
-# and the button is 18 tall starting 13 px into the row -> y = 260 + 4*44 + 22 = 458.
-# x = 847 is the centre of the 34 px button that ends 6 px inside a 150 px box at x=720.
+# Coordinates are CLIENT pixels (the click helper posts WM_LBUTTONDOWN in client space),
+# at 100% scale like the rest of this suite: settings list_top=260, row_h=44, the first
+# binding row is the 5th item of this category -> y = 260 + 4*44 + 22 = 458.
+# The value column is right-anchored now: value_x = client_width - 32 - 150 - 24.
+# The cross is the 34 px button that ends 6 px inside that box -> centre = value_x + 127.
 Set-ConfigLine $app 'hotkey' 'enabled' 'true'
 Set-ConfigLine $app 'hotkey' 'toggle_window' 'ctrl+alt+3'
 Remove-Item $logPath -ErrorAction SilentlyContinue
@@ -161,12 +162,15 @@ $h4 = Wait-Window $p4.Id
 Check 'the app starts for the clear-button round' ($h4 -ne [IntPtr]::Zero)
 if ($h4 -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
 
+$cl4 = Get-Client $h4
+$valueX4 = $cl4.W - 206
+
 Click-ViewTab $h4 5
 Start-Sleep -Milliseconds 400
 # The page opens on category 0; the three bindings live in category 1 (client y = 260 + 44*i + 20).
 [FF]::ClickWindow($h4, 123, 324, 1)
 Start-Sleep -Milliseconds 500
-[FF]::ClickWindow($h4, 847, 458, 1)
+[FF]::ClickWindow($h4, ($valueX4 + 127), 458, 1)
 Start-Sleep -Milliseconds 1500
 
 $cfg4 = Get-ConfigValue $app 'hotkey' 'toggle_window'
@@ -226,13 +230,16 @@ $h6 = Wait-Window $p6.Id
 Check 'the app starts for the capture round' ($h6 -ne [IntPtr]::Zero)
 if ($h6 -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
 
+$cl6 = Get-Client $h6
+$valueX6 = $cl6.W - 206
+
 Click-ViewTab $h6 5
 Start-Sleep -Milliseconds 400
 [FF]::ClickWindow($h6, 123, 324, 1)      # category: hotkeys
 Start-Sleep -Milliseconds 300
 [FF]::ClickScreen($h6, 600, 15, 1)       # real click on the caption -> foreground
 Start-Sleep -Milliseconds 400
-[FF]::ClickWindow($h6, 770, 458, 1)      # the value box -> capture mode
+[FF]::ClickWindow($h6, ($valueX6 + 50), 458, 1)   # the value box -> capture mode
 Start-Sleep -Milliseconds 400
 [FF]::PressChord([byte[]](0x11, 0x12), 0x76)   # ctrl + alt + F7
 Start-Sleep -Milliseconds 1500

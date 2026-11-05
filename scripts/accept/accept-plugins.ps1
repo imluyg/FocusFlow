@@ -78,11 +78,12 @@ Check 'select inside the modal writes the field' (Wait-Log 'd_type = ') ''
 [FF]::ClickWindow($h, (816 + $mx), (583 + $my), 1)     # save
 Check 'modal submit runs the plugin action' (Wait-Log 'add_record') ''
 
-# View-level filter select (category value box sits at x 185..445).
+# View-level filter select: the value box sits at y 325..350; the menu opens below it,
+# so the first option is at y 355..379.
 Start-Sleep -Milliseconds 400
-[FF]::ClickWindow($h, 300, 588, 1)
+[FF]::ClickWindow($h, 300, 338, 1)
 Start-Sleep -Milliseconds 300
-[FF]::ClickWindow($h, 300, 363, 1)
+[FF]::ClickWindow($h, 300, 365, 1)
 Check 'view-level select writes the field' (Wait-Log 'f_cat = ') ''
 
 # TextInput inside a modal still uses the inline EDIT.
@@ -94,7 +95,8 @@ Check 'modal text field opens the inline editor' (Wait-Log 'd_item') ''
 Start-Sleep -Milliseconds 400
 
 # A content-only modal (monthly summary), opened by the plugin itself (open=true).
-[FF]::ClickWindow($h, 60, 427, 1)
+# "Monthly summary" is the 5th button of the action row (478..574, y 260..290).
+[FF]::ClickWindow($h, 526, 275, 1)
 Check 'plugin can open a content modal' (Wait-Log 'monthly_detail') ''
 [FF]::ClickWindow($h, (816 + $mx), (500 + $my), 1)     # close
 Check 'content modal close runs its action' (Wait-Log 'clear_result') ''
