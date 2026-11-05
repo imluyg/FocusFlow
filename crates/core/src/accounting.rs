@@ -1316,15 +1316,36 @@ fn parse_subs(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// 按 id 获取记录。
-pub fn get_expense_by_id(id: i64) -> Option<Expense> {
-    let conn = open().ok()?;
-    conn.query_row(
+/// 按 id 取记录，并交回"这一条为什么没答上"（空串 = 答上了，或确实没有这一条）。
+///
+/// 「没有这一条」与「读不出来」必须分得开：面板的编辑按钮拿不到记录就什么都不做，
+/// 两种结局在用户眼里都是"按了没反应"。而读不出来时它还会把**上一条**的草稿留在
+/// 面板上（`editing_id` 没设），下一次保存改的是别的东西。
+pub fn get_expense_readout(id: i64) -> (Option<Expense>, String) {
+    let conn = match open() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("读取记账记录 #{id} 失败：记账库打不开: {e}");
+            return (None, format!("记账库打不开：{e}"));
+        }
+    };
+    match conn.query_row(
         &format!("SELECT {EXPENSE_COLS} FROM expenses WHERE id=?1"),
         [id],
         row_to_expense,
-    )
-    .ok()
+    ) {
+        Ok(e) => (Some(e), String::new()),
+        Err(rusqlite::Error::QueryReturnedNoRows) => (None, String::new()),
+        Err(e) => {
+            tracing::error!("读取记账记录 #{id} 失败: {e}");
+            (None, format!("这一条读不出来：{e}"))
+        }
+    }
+}
+
+/// 按 id 获取记录。
+pub fn get_expense_by_id(id: i64) -> Option<Expense> {
+    get_expense_readout(id).0
 }
 
 /// 分类下的子分类列表（分类表中声明的 + 记录中出现过的，去重合并）。
@@ -3041,6 +3062,40 @@ mod tests {
             matches!(raw, rusqlite::types::Value::Blob(_)),
             "非文本日期要原样留着，不许被改写成别的形态: {raw:?}"
         );
+    }
+
+    /// 「没有这一条」与「读不出来」必须分得开：面板的编辑按钮拿不到就什么都不做，
+    /// 两种结局在用户眼里都是"按了没反应"，而读不出来时草稿里还留着上一条。
+    #[test]
+    fn a_missing_record_and_an_unreadable_one_are_different_answers() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_get_readout");
+        init_db().expect("建库失败");
+        let id = add_expense("支出", "午饭", None, "2026-09-05", 12.5, None, None, None);
+        assert!(id > 0);
+        let (found, why) = get_expense_readout(id);
+        assert!(
+            found.is_some() && why.is_empty(),
+            "正常一条不该带原因: {why}"
+        );
+
+        let (missing, why) = get_expense_readout(id + 999_999);
+        assert!(
+            missing.is_none() && why.is_empty(),
+            "没有这一条不是故障: {why}"
+        );
+
+        // 库还开得住、但查不出来（表被外部工具删了）：这才是"读不出来"
+        open()
+            .unwrap()
+            .execute_batch("DROP TABLE expenses")
+            .unwrap();
+        let (unreadable, why) = get_expense_readout(id);
+        assert!(
+            unreadable.is_none() && !why.is_empty(),
+            "读不出来必须交回原因，不能与「没有这一条」同形"
+        );
+        assert!(why.contains("读不出来"), "原因要能直接上屏: {why}");
     }
 
     /// 读侧点名要哪些列 —— 列序不该决定"哪一个值是金额"。

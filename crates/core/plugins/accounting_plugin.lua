@@ -346,7 +346,7 @@ function on_action(id)
     elseif id:match("^edit_") then
         local rid = tonumber(id:sub(6))
         if not rid then return end
-        local rec = focusflow.accounting_get(rid)
+        local rec, why = focusflow.accounting_get(rid)
         if rec then
             draft.type = rec["type"]
             draft.item = rec["item"]
@@ -357,6 +357,14 @@ function on_action(id)
             draft.date = rec["date"]
             draft.note = rec["note"]
             editing_id = rid
+        elseif why ~= "" then
+            -- 读不出来时弹窗开不了（`editing_id` 仍是 nil），从前这一下就是"按了没反应"；
+            -- 更糟的是草稿里躺着上一条的内容，下一次保存会改到别的记录上。
+            list_msg = "没打开 #" .. tostring(rid) .. "：" .. why
+            focusflow.log("记账编辑没打开 #" .. tostring(rid) .. "：" .. why)
+        else
+            list_msg = "没打开 #" .. tostring(rid) .. "：这一条已经不在了（可能刚被删掉）"
+            focusflow.log("记账编辑没打开 #" .. tostring(rid) .. "：这一条已经不在了")
         end
     elseif id:match("^del_") then
         -- 支持多选：id 形如 del_42,43
@@ -398,7 +406,7 @@ function on_action(id)
             local n = tonumber(rid)
             if n then
                 asked = asked + 1
-                local rec = focusflow.accounting_get(n)
+                local rec, rec_why = focusflow.accounting_get(n)
                 -- 第二个值是「这一条为什么没答上」：原先宿主只交答案，没命中就一行都不拼，
                 -- 而下面那句 `result_text ~= ""` 才开弹窗 ⇒ "没填日期"、"库被别处占着"、
                 -- "这条已被删掉" 三种结局在用户眼里都是"这个按钮按了没反应"。
@@ -406,6 +414,10 @@ function on_action(id)
                 if data and data[1] then
                     local d = data[1]
                     local name = (rec and rec["item"]) or ("#" .. tostring(n))
+                    if (not rec) and rec_why and rec_why ~= "" then
+                        -- 名字回退成编号时要说清为什么：读不出来与已被删掉不是一回事。
+                        misses[#misses + 1] = rec_why
+                    end
                     if d["years"] > 0 then
                         lines[#lines + 1] = "《" .. name .. "》 距今 " .. d["years"] .. " 年 " .. d["days"] .. " 天"
                     else

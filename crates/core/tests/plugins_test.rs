@@ -2515,6 +2515,30 @@ mod tests {
         );
     }
 
+    /// 「打开一条记录」那一下要接住宿主交回的第二个值：读不出来与已被删掉不许
+    /// 都变成"按了没反应"（弹窗开不了时草稿里还躺着上一条的内容）。
+    #[test]
+    fn the_packaged_accounting_panel_says_why_a_record_could_not_be_opened() {
+        let panel = include_str!("../plugins/accounting_plugin.lua");
+        assert!(
+            panel.contains(r"local rec, why = focusflow.accounting_get("),
+            "编辑那一支要收下宿主的第二个返回值"
+        );
+        assert!(
+            panel.contains(r#"list_msg = "没打开 #" .. tostring(rid) .. "：" .. why"#),
+            "读不出来的原因要上屏"
+        );
+        assert!(
+            panel.contains("这一条已经不在了（可能刚被删掉）"),
+            "没有这一条与读不出来要分得开"
+        );
+        let host = include_str!("../src/plugins/host.rs");
+        assert!(
+            host.contains("accounting::get_expense_readout(id)"),
+            "宿主那层要走交回原因的那条读数"
+        );
+    }
+
     /// 仓库根那份 `plugins/` 不许与随包副本静默分叉。
     ///
     /// 它既不参与打包（`build_native.bat` 从 `crates/core/plugins/` 抄）、也不被运行期加载

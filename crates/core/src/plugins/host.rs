@@ -1136,11 +1136,13 @@ pub fn register_host_api(
     })?;
     host.set("accounting_subcategories", acc_subs)?;
 
-    // 按 id 查询
+    // 按 id 查询：`(记录 | nil, 这一条为什么没答上)`。第二个值必须交出去 ——
+    // 「没有这一条」与「读不出来」在面板上长得一模一样（编辑按钮都什么都不做）。
     let acc_get = lua.create_function(|lua, id: i64| {
         ensure_accounting_db();
-        let Some(e) = accounting::get_expense_by_id(id) else {
-            return Ok(mlua::Value::Nil);
+        let (found, why) = accounting::get_expense_readout(id);
+        let Some(e) = found else {
+            return Ok((mlua::Value::Nil, why));
         };
         let row = lua.create_table()?;
         row.set("id", e.id)?;
@@ -1152,7 +1154,7 @@ pub fn register_host_api(
         row.set("category", e.category.clone().unwrap_or_default())?;
         row.set("subcategory", e.subcategory.clone().unwrap_or_default())?;
         row.set("note", e.note.clone().unwrap_or_default())?;
-        Ok(mlua::Value::Table(row))
+        Ok((mlua::Value::Table(row), why))
     })?;
     host.set("accounting_get", acc_get)?;
 
