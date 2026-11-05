@@ -251,11 +251,13 @@ fn tick_arms(period: i64, collector_on: bool) -> Vec<TickArm> {
     // 生产在 `days == Some(1)` 时不再单独扫 `app_usage`（复用排行那一趟的 total，
     // `data.rs` 的「今日前台时长」那一段）⇒ 复刻跟着分叉。不复刻这一支的话，
     // 今日档那一眼数的是"生产根本不会跑的一拍"，条数会虚高一臂。
+    // 这一臂要的是**读全标记**，所以走 `app_stats_totals` 而不是丢标记的
+    // `get_app_stats` 包装（两者是同一趟 SQL，条数不变）。
     if days != Some(1) {
         arms.push((
-            "get_app_stats(Some(1))",
+            "app_stats_totals(Some(1))",
             Box::new(|| {
-                let _ = queries::get_app_stats(Some(1), None);
+                let _ = queries::app_stats_totals(Some(1), None);
             }),
         ));
     }
@@ -275,17 +277,17 @@ fn tick_replica(period: i64, collector_on: bool) {
 /// `collect::today_total()`（采集开着时是内存原子，根本不查库）、速度走
 /// `collect::cpm()`（同一份内存滑窗），只有「时长」是 `publish_floating()` 从快照
 /// 推过去的 `today_app_seconds` —— 它出自 `data.rs` 里那一问
-/// `get_app_stats(Some(1), None)`。所以卡片一个人挂着时的查询面本应只有一臂
-/// （采集没开时再加一臂 `get_today_count`）。
+/// `app_stats_totals(Some(1), None)`（`get_app_stats` 的包装本体，要的是读全标记）。
+/// 所以卡片一个人挂着时的查询面本应只有一臂（采集没开时再加一臂 `get_today_count`）。
 ///
 /// 这一条不是为了改代码，是为了把「生产现在跑的整拍」与「卡片其实需要的这一拍」
 /// 放在同一把尺子上读出来：差多少毫秒、差多少条语句。
 fn pill_arms(collector_on: bool) -> Vec<TickArm> {
     let mut arms: Vec<TickArm> = Vec::new();
     arms.push((
-        "get_app_stats(Some(1)) 卡片时长",
+        "app_stats_totals(Some(1)) 卡片时长",
         Box::new(|| {
-            let _ = queries::get_app_stats(Some(1), None);
+            let _ = queries::app_stats_totals(Some(1), None);
         }),
     ));
     if !collector_on {
