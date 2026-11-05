@@ -539,6 +539,13 @@ pub fn add_expense_outcome(
         tracing::warn!("记账金额「{amount}」不是有限数，这条没写进去");
         return Err(format!("金额「{amount}」不是有限数（写 12.50 这种普通数）"));
     }
+    // 非正数同样挡在这里：面板那句"金额要大于 0"是**面板的**校验，不是宿主的契约。
+    // 宿主是插件可直接调用的入口（`focusflow.accounting_add`），收下一笔 -50 会让
+    // 「本月总支出」倒着走、分类净额翻号；收下 0 则是一行看得见却不进任何合计的账。
+    if amount <= 0.0 {
+        tracing::warn!("记账金额「{amount}」不是正数，这条没写进去");
+        return Err(format!("金额「{amount}」必须大于 0（记账不收负数与零）"));
+    }
     // 日期尺子与读侧同一把（见 `normalize_date_filter`）。**空串也拒**：原先空值
     // 原样落库（`purchase_date TEXT NOT NULL` 容得下 `""`），因为**面板**自己会在
     // 提交前填今天 —— 那是面板的私有知识，不是宿主的契约。宿主收下空值就等于允许
@@ -607,6 +614,13 @@ pub fn update_expense_outcome(id: i64, e: &Expense) -> Result<(), String> {
         tracing::warn!("记账金额「{}」不是有限数，#{id} 没改", e.amount);
         return Err(format!(
             "金额「{}」不是有限数（写 12.50 这种普通数）",
+            e.amount
+        ));
+    }
+    if e.amount <= 0.0 {
+        tracing::warn!("记账金额「{}」不是正数，#{id} 没改", e.amount);
+        return Err(format!(
+            "金额「{}」必须大于 0（记账不收负数与零）",
             e.amount
         ));
     }
@@ -3416,6 +3430,42 @@ mod tests {
         assert_eq!(
             add_expense("转账", "午饭", None, "2026-09-05", 12.5, None, None, None),
             -1
+        );
+    }
+
+    /// 非正金额挡在宿主写入口：面板那句「金额要大于 0」是面板的校验，而宿主是插件
+    /// 可直接调用的入口（`focusflow.accounting_add`）。一笔 -50 会让「本月总支出」
+    /// 倒着走、分类净额翻号；0 则是一行看得见却不进任何合计的账。
+    #[test]
+    fn non_positive_amounts_are_refused_at_the_host_door() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_amount_sign");
+        init_db().expect("建库失败");
+        let count = || -> i64 {
+            open()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM expenses", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = count();
+        for bad in [0.0, -50.0] {
+            let why =
+                add_expense_outcome("支出", "退款", None, "2026-09-05", bad, None, None, None)
+                    .expect_err("非正金额不该写得进");
+            assert!(why.contains("大于 0"), "要念出这一条规矩: {why}");
+        }
+        assert_eq!(count(), before, "被拒的写入不许留下任何一行");
+
+        let id = add_expense("支出", "午饭", None, "2026-09-05", 12.5, None, None, None);
+        assert!(id > 0, "夹具：先写一条正常的");
+        let mut e = get_expense_by_id(id).expect("刚写的那条要读得回来");
+        e.amount = -1.0;
+        let why = update_expense_outcome(id, &e).expect_err("改成负数也要拒");
+        assert!(why.contains("大于 0"), "改动被拒的原因要说清: {why}");
+        assert_eq!(
+            get_expense_by_id(id).map(|r| r.amount),
+            Some(12.5),
+            "被拒的改动不许落到库里"
         );
     }
 

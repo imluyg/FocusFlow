@@ -210,6 +210,11 @@ fn trusted_exe_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
     for key in KEYS {
         if let Some(p) = std::env::var_os(key) {
+            // 空串不是"根目录"：`PathBuf::from("").canonicalize()` 会失败，
+            // 留下来的空路径会让 `is_under` 匹配一切（见那条函数的空根判据）。
+            if p.is_empty() {
+                continue;
+            }
             let p = std::path::PathBuf::from(p);
             dirs.push(p.canonicalize().unwrap_or(p));
         }
@@ -219,6 +224,11 @@ fn trusted_exe_dirs() -> Vec<std::path::PathBuf> {
 
 /// Windows 路径大小写不敏感：按路径组件逐一比较，忽略 ASCII 大小写。
 fn is_under(root: &std::path::Path, dir: &std::path::Path) -> bool {
+    // 空根**不是**"什么都在它下面"：`ProgramFiles` 被设成空串时，那条"只认系统
+    // 安装目录"的闸会放行任意路径（改名的 whitelist 程序丢进 %TEMP% 也能过）。
+    if root.components().next().is_none() {
+        return false;
+    }
     let mut r = root.components();
     let mut d = dir.components();
     loop {
@@ -1955,6 +1965,26 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 空根不是"什么都在它下面"：`ProgramFiles` 被设成空串时，`canonicalize` 失败会把
+    /// 空路径留下来，旧写法 `(None, _) => true` 于是放行任意目录 —— 改名成白名单名字的
+    /// 程序丢进 `%TEMP%` 也能过那道"来源目录必须可信"的闸。
+    #[test]
+    fn an_empty_trusted_root_matches_nothing() {
+        use std::path::Path;
+        assert!(
+            !is_under(Path::new(""), Path::new(r"C:\Users\Public\AppData\Temp")),
+            "空根匹配了一切 ⇒ 来源目录那道闸等于不存在"
+        );
+        assert!(is_under(
+            Path::new(r"C:\Program Files"),
+            Path::new(r"c:\program files\SomeApp\bin")
+        ));
+        assert!(!is_under(
+            Path::new(r"C:\Program Files"),
+            Path::new(r"C:\Program Files (x86)\SomeApp")
+        ));
     }
 
     /// 回归：`.bat`/`.cmd` 经被禁的 `cmd.exe` 解释、`.txt` 根本不是程序，三者都
