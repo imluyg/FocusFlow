@@ -198,6 +198,15 @@ impl Board {
         self.entries.len()
     }
 
+    /// 这个句柄还在排程表里吗。
+    ///
+    /// `collect_due` 会把一次性（`After`）的格子摘掉，而 Lua 那一侧的
+    /// `_ff_timers[句柄]` 仍攥着那个闭包 —— 调用方据此知道哪一格已经跑完、
+    /// 该把 Lua 表里那一项也清掉（否则每次 `after` 都留下一个永远不再用的函数）。
+    pub fn is_armed(&self, handle: u64) -> bool {
+        self.entries.contains_key(&handle)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -323,6 +332,22 @@ mod tests {
         let due2 = board.collect_due(later + Duration::from_secs(4), 0, 0);
         assert_eq!(due2, vec![every]);
         assert_eq!(board.fired(), 3);
+    }
+
+    /// 一次性跑完就不再 armed：调用方据此清掉 Lua 那张回调表里的闭包
+    /// （插件反复 `after` 时那张表只增不减）。周期与事件那几格必须仍然 armed。
+    #[test]
+    fn a_fired_one_shot_is_no_longer_armed() {
+        let now = Instant::now();
+        let mut board = Board::new();
+        let after = board.arm(Kind::After, 1, now).unwrap();
+        let every = board.arm(Kind::Every, 1, now).unwrap();
+        let tick = board.arm(Kind::Tick, 0, now).unwrap();
+        assert!(board.is_armed(after) && board.is_armed(every) && board.is_armed(tick));
+        let _ = board.collect_due(now + Duration::from_secs(2), 10, 20);
+        assert!(!board.is_armed(after), "一次性跑完必须从排程表摘掉");
+        assert!(board.is_armed(every), "周期那格要留着");
+        assert!(board.is_armed(tick), "事件那格要留着");
     }
 
     /// 句柄顺序稳定：同一拍里先跑谁不能随哈希序变（挂了多格的插件每次跑的顺序不同，

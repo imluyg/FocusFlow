@@ -1872,6 +1872,23 @@ impl PluginManager {
                 match outcome {
                     Ok(()) => {
                         fired += 1;
+                        // 一次性（`after`）跑完就从 Lua 那张回调表里摘掉：Rust 侧的排程格
+                        // 已经由 `collect_due` 删了，而 `_ff_timers[h]` 还攥着闭包与它的
+                        // upvalue —— 插件每次 `after` 都排一个的话，这张表只增不减。
+                        // 周期/事件那几格仍在排程表里（`is_armed`），不许清。
+                        let still_armed = board
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_armed(handle);
+                        if !still_armed {
+                            if let Some(info) = self.plugins.get(&name) {
+                                if let Some(lua) = info.lua.as_ref() {
+                                    if let Ok(t) = lua.globals().get::<mlua::Table>("_ff_timers") {
+                                        let _ = t.set(handle, mlua::Value::Nil);
+                                    }
+                                }
+                            }
+                        }
                         if let Some(info) = self.plugins.get_mut(&name) {
                             info.event_route.record(false);
                         }

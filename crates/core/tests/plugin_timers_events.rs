@@ -40,7 +40,9 @@ fn timer_lua(name: &str, body: &str) -> String {
          _G.bump = bump\n\
          function init()\n  {body}\n end\n\
          function get_view()\n\
-         \x20 return {{ title = \"t\", widgets = {{ {{ type = \"label\", text = \"hits=\" .. tostring(hits) }} }} }}\n\
+         \x20 local n = 0\n\
+         \x20 for _ in pairs(_ff_timers) do n = n + 1 end\n\
+         \x20 return {{ title = \"t\", widgets = {{ {{ type = \"label\", text = \"hits=\" .. tostring(hits) .. \"|timers=\" .. tostring(n) }} }} }}\n\
          end\n"
     )
 }
@@ -88,6 +90,18 @@ fn hits_on_disk(stem: &str) -> i64 {
         Ok(None) => 0,
         Err(e) => panic!("{stem} 的 store 读不出来: {e}"),
     }
+}
+
+/// 视图里那颗 label 的文本（`hits=…|timers=…`）。
+fn view_text(pm: &PluginManager, name: &str) -> String {
+    pm.get_plugin(name)
+        .and_then(|p| p.view.as_ref())
+        .and_then(|v| v.widgets.first())
+        .map(|w| match w {
+            focusflow_core::plugins::Widget::Label(t) => t.clone(),
+            other => format!("<不是 label: {other:?}>"),
+        })
+        .unwrap_or_else(|| "<没有视图>".to_string())
 }
 
 /// 排进去的事件会被这一拍跑到，而**同一分钟的第二拍不再跑**（每分钟一次的语义）。
@@ -146,6 +160,37 @@ fn a_periodic_timer_fires_once_the_interval_elapses() {
     assert_eq!(
         plugin_timers::board_for("per_timer").lock().unwrap().len(),
         1
+    );
+}
+
+/// 一次性 `after` 跑完要从 Lua 的回调表里摘掉。
+///
+/// Rust 侧的排程格 `collect_due` 已经删了，而插件自己那张 `_ff_timers[句柄]` 还攥着
+/// 闭包与它的 upvalue —— 插件每 `after` 一次就多一个，长时间开着就是一条只增不减的表。
+/// 观测值直接取视图里的 `timers=N`（`pairs(_ff_timers)` 的条目数）。
+#[test]
+fn a_fired_one_shot_does_not_stay_in_the_lua_callback_table() {
+    let _g = timers_round::guard();
+    let app = common::isolated_app_dir("timer_after_table");
+    let (mut pm, name) = load(&app, "aftbl", "focusflow.after(1, bump)");
+    pm.refresh_view(&name).expect("视图该刷得动");
+    assert!(
+        view_text(&pm, &name).ends_with("timers=1"),
+        "夹具：排上的那一格应该看得见: {}",
+        view_text(&pm, &name)
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    let ran = pm.pump_timers();
+    assert_eq!(
+        ran.iter().map(|(_, n)| *n).sum::<usize>(),
+        1,
+        "一次性该跑到一次: {ran:?}"
+    );
+    pm.refresh_view(&name).expect("视图该刷得动");
+    let text = view_text(&pm, &name);
+    assert!(
+        text.ends_with("timers=0"),
+        "跑完的一次性回调还留在 Lua 表里（泄漏）：{text}"
     );
 }
 
