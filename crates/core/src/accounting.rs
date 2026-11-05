@@ -366,10 +366,18 @@ fn merge_legacy_subcategories(conn: &Connection) -> Result<usize, String> {
 fn heal_purchase_date_format(conn: &Connection) -> Vec<String> {
     let pending = (|| -> rusqlite::Result<Vec<(i64, String)>> {
         let mut stmt = conn.prepare("SELECT id, purchase_date FROM expenses")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        // 日期按**值**取，不按 `String` 取：SQLite 是动态类型，Python 时代或外部工具
+        // 写进来的 NULL/BLOB 会让 `get::<String>` 整批返回 Err ⇒ 别的该补零的行也一条
+        // 都补不上，而每一轮启动都白试一遍。这种行本来就不是日期，跳过即可。
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, rusqlite::types::Value>(1)?))
+        })?;
         let mut out = Vec::new();
         for row in rows {
             let (id, raw) = row?;
+            let rusqlite::types::Value::Text(raw) = raw else {
+                continue;
+            };
             if let Some(norm) = normalize_date_filter(&raw) {
                 if norm != raw {
                     out.push((id, norm));
@@ -2980,6 +2988,58 @@ mod tests {
         assert_eq!(
             still, "2026-9-1",
             "没写成的那一行要原样留着，不能被清空、也不能替用户猜一个日期"
+        );
+    }
+
+    /// 一条非文本的 purchase_date 不许把整轮补格式拖死。
+    ///
+    /// SQLite 是动态类型：Python 时代或外部工具能往这一列写 BLOB/NULL。旧实现按
+    /// `String` 取整批，一遇到这种行就整段 `Err` ⇒ 同一张表里别的没补零的行也一条
+    /// 都补不上，而每次启动都白试一遍（它们在月度合计与日期区间里一直隐身）。
+    #[test]
+    fn a_non_text_date_does_not_block_the_rest_of_the_backfill() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_heal_blob");
+        init_db().expect("建库失败");
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO expenses (type, item_name, purchase_date, amount, record_time)
+                 VALUES ('支出', '坏行', ?1, 1.0, '')",
+                rusqlite::params![vec![0x32u8, 0x30, 0x32]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO expenses (type, item_name, purchase_date, amount, record_time)
+                 VALUES ('支出', '旧行', '2026-9-1', 1.0, '')",
+                [],
+            )
+            .unwrap();
+        }
+        let stuck = {
+            let conn = open().unwrap();
+            heal_purchase_date_format(&conn)
+        };
+        assert!(stuck.is_empty(), "写都该写得动: {stuck:?}");
+        let conn = open().unwrap();
+        let fixed: String = conn
+            .query_row(
+                "SELECT purchase_date FROM expenses WHERE item_name='旧行'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fixed, "2026-09-01", "BLOB 那一行不该把这条拖住");
+        let raw: rusqlite::types::Value = conn
+            .query_row(
+                "SELECT purchase_date FROM expenses WHERE item_name='坏行'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            matches!(raw, rusqlite::types::Value::Blob(_)),
+            "非文本日期要原样留着，不许被改写成别的形态: {raw:?}"
         );
     }
 
