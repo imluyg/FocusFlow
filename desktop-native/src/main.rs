@@ -7557,11 +7557,13 @@ fn pin_find(hwnd: isize) -> Option<PinImage> {
 }
 
 /// 开一张贴图：置顶、不进任务栏（toolwindow）、按住拖动、滚轮缩放、Esc / 右键关掉这一张。
-fn open_pin(img: Vec<u8>, w: i32, h: i32, x: i32, y: i32) -> Option<HWND> {
+fn open_pin(img: Vec<u8>, w: i32, h: i32, x: i32, y: i32) -> std::result::Result<HWND, String> {
     unsafe {
         if PINS.lock().map(|v| v.len()).unwrap_or(0) >= PIN_MAX_COUNT {
             tracing_note(&format!("贴图 pin-skip 已到上限 {PIN_MAX_COUNT} 张"));
-            return None;
+            return Err(format!(
+                "贴图最多同时钉 {PIN_MAX_COUNT} 张，先关掉几张（右键）再试"
+            ));
         }
         let hinst = GetModuleHandleW(None).map(|m| m.into()).unwrap_or_default();
         let cls = HSTRING::from("FocusFlowPin");
@@ -7608,11 +7610,11 @@ fn open_pin(img: Vec<u8>, w: i32, h: i32, x: i32, y: i32) -> Option<HWND> {
                 tracing_note(&format!(
                     "贴图 pin-chrome close_size={PIN_CLOSE_SIZE} close_inset={PIN_CLOSE_INSET} badge_ms={PIN_BADGE_MS}"
                 ));
-                Some(pin_hwnd)
+                Ok(pin_hwnd)
             }
             Err(e) => {
                 tracing_note(&format!("贴图 pin-fail 建窗失败：{e}"));
-                None
+                Err(format!("建贴图窗口失败：{e}"))
             }
         }
     }
@@ -7704,7 +7706,7 @@ fn open_test_pins(count: usize) {
                 img[o..o + 4].copy_from_slice(&px);
             }
         }
-        open_pin(img, w, h, 420 + (i as i32) * 40, 320 + (i as i32) * 30);
+        let _ = open_pin(img, w, h, 420 + (i as i32) * 40, 320 + (i as i32) * 30);
     }
 }
 

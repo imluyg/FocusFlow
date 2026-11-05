@@ -1565,6 +1565,21 @@ pub fn spawn(main: HWND) -> Result<(), String> {
         .map_err(|e| format!("悬浮窗线程没有回话：{e}"))?
 }
 
+/// 注册窗口类的结果怎么算失败：`ERROR_CLASS_ALREADY_EXISTS`（1410）不算。
+///
+/// 类名是**进程级**命名空间，而这张窗口在"第一帧没画上"之后会被重试
+/// （`main.rs::toggle_floating`）。第一次已经把类注册进去了，第二次照旧注册会拿到
+/// 1410；把它当失败就等于让"再点一次显示悬浮窗"永远起不来，只剩重启一条路。
+fn class_registration_error(registered: u16, last_error: Option<i32>) -> Option<String> {
+    if registered != 0 || last_error == Some(1410) {
+        return None;
+    }
+    Some(format!(
+        "注册悬浮窗窗口类失败（最后错误 {}）",
+        last_error.unwrap_or(0)
+    ))
+}
+
 unsafe fn run_thread(tx: &std::sync::mpsc::SyncSender<Result<(), String>>) {
     unsafe {
         let hmodule = match GetModuleHandleW(None) {
@@ -1586,11 +1601,12 @@ unsafe fn run_thread(tx: &std::sync::mpsc::SyncSender<Result<(), String>>) {
             lpszClassName: windows::core::PCWSTR(class.as_ptr()),
             ..Default::default()
         };
-        if wm::RegisterClassExW(&raw const wc) == 0 {
-            let _ = tx.send(Err(format!(
-                "注册悬浮窗窗口类失败（最后错误 {}）",
-                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-            )));
+        let registered = wm::RegisterClassExW(&raw const wc);
+        // 最后错误必须紧跟着这一句取：中间插任何系统调用都会把它覆盖掉。
+        if let Some(why) =
+            class_registration_error(registered, std::io::Error::last_os_error().raw_os_error())
+        {
+            let _ = tx.send(Err(why));
             return;
         }
 
@@ -2807,5 +2823,28 @@ mod count_width_tests {
                 "七位数只量到 {w7:.2}px（值格 {cell:.0}px），那这条判据挡不住东西"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::class_registration_error;
+
+    /// 类已经注册过（1410）不是失败：这张窗口在"第一帧没画上"之后会被重试，
+    /// 而重试必然撞上自己上一次注册的类名 —— 当成失败就再也起不来。
+    #[test]
+    fn an_already_registered_class_is_not_a_failure() {
+        assert_eq!(class_registration_error(1, None), None);
+        assert_eq!(
+            class_registration_error(0, Some(1410)),
+            None,
+            "1410 = ERROR_CLASS_ALREADY_EXISTS：复用自己上一次注册的类才是这条重试路"
+        );
+        let why = class_registration_error(0, Some(87)).expect("其余失败必须说出来");
+        assert!(why.contains("87"), "原因里要带最后错误号：{why}");
+        assert!(
+            class_registration_error(0, None).is_some(),
+            "问不出原因也不许当成成功"
+        );
     }
 }

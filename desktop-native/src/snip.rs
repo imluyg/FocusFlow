@@ -136,6 +136,18 @@ enum Phase {
     Adjust,
 }
 
+/// 拖动只在左键**仍按着**时继续：覆盖层没有 `WM_CANCELMODE` / `WM_CAPTURECHANGED`
+/// 那一支，Alt+Tab、别的程序抢走捕获、或在覆盖层外面松开鼠标之后，`WM_MOUSEMOVE`
+/// 照样会进来。不认这一条的话，选区/标注会跟着一个已经松开（甚至不在本窗口上）的
+/// 指针继续变形 —— 再移回来时用户看到的是自己被"粘住"的框。
+fn drag_without_button(drag: Option<(Drag, i32, i32)>, lbutton: bool) -> Option<(Drag, i32, i32)> {
+    if lbutton {
+        drag
+    } else {
+        None
+    }
+}
+
 /// 覆盖层上"单击选窗口"看到的一条候选：Z 序里的一个顶层窗口，只带判得动的那三件事。
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
@@ -1899,13 +1911,39 @@ pub fn snip_receipt(file: &str, w: i32, h: i32, pinned: bool) -> String {
 /// 屏上却说"复制了"——用户到聊天框里粘，粘出来是空的，而覆盖层已经退了、重试那一按也没了。
 /// 反过来文件没落时 `saved` 是 None，屏上一句都不说（贴图走的是 Done），
 /// 只剩一条默认不开的 `trace_log`。
+///
+/// `pin_err` 是**钉这一次**的结局：到十二张上限、或建窗失败时它一张都没钉上。
+/// 那一支不能再念「钉在桌面上」，否则桌面上没有、屏上说有 —— 与上面那句假话同族。
 pub fn pin_receipt(
     saved_name: Option<&str>,
     save_err: Option<&str>,
     clip_err: Option<&str>,
+    pin_err: Option<&str>,
     w: i32,
     h: i32,
 ) -> String {
+    // 贴图那一步没成（到上限 / 建窗失败）：这一支里**一个"钉在桌面"都不许有**。
+    // 从前 `open_pin` 的返回值被丢掉，于是十二张贴图时屏上说"钉在桌面上"，
+    // 桌面上却一张新的都没有；文件与剪贴板也没成时，最后那张图连个去处都没有。
+    if let Some(pe) = pin_err {
+        return match (saved_name, save_err, clip_err) {
+            (Some(name), None, None) => {
+                format!("截图已存 {name}（{w}x{h}），但没钉到桌面上：{pe}（文件与剪贴板都在）")
+            }
+            (Some(name), None, Some(e)) => {
+                format!("截图已存 {name}（{w}x{h}）；没钉到桌面上：{pe}；复制到剪贴板也没成：{e}")
+            }
+            (None, Some(e), None) => {
+                format!("图没存下来：{e}；也没钉到桌面上：{pe}（剪贴板里有这张图，粘到别处还能用）")
+            }
+            (None, Some(e), Some(c)) => {
+                format!("图没存下来：{e}；复制到剪贴板也没成：{c}；贴图也没钉上：{pe}")
+            }
+            _ => {
+                format!("贴图这一步没能确认：文件与剪贴板两边都没交回结果；钉到桌面上也没成：{pe}")
+            }
+        };
+    }
     match (saved_name, save_err, clip_err) {
         // 三件都成：还是那句既有写法（尺寸、文件名、两个去处都在）
         (Some(name), None, None) => snip_receipt(name, w, h, true),
@@ -1997,10 +2035,22 @@ fn commit_into(dir: &std::path::Path, clipboard: bool, pin: bool) -> Verdict {
         // 说出来，因为"以为复制上了"会让他粘到别处才发现是空的）在这一支同样成立：
         // 从前这里只看 `saved` 有没有值，于是剪贴板没进去也照念「同时复制到剪贴板」，
         // 而文件没落时一句都不说（覆盖层已经退了，重试那一按也没了）。
-        open_pin(buf, w, h, origin.0 + sel.0, origin.1 + sel.1);
+        let pin_err = open_pin(buf, w, h, origin.0 + sel.0, origin.1 + sel.1).err();
         let save_err = save.as_ref().err().map(|s| s.as_str());
         let clip_err = clip.as_ref().err().map(|s| s.as_str());
-        let msg = pin_receipt(saved.as_deref(), save_err, clip_err, w, h);
+        let msg = pin_receipt(
+            saved.as_deref(),
+            save_err,
+            clip_err,
+            pin_err.as_deref(),
+            w,
+            h,
+        );
+        // 文件没落、钉也没成 ⇒ 这一张连个去处都没有：覆盖层留着，"再按一次"才有落点。
+        // 文件落了就照旧收场（那张文件已经在了，回执把没钉上的原因说清楚）。
+        if pin_err.is_some() && saved.is_none() {
+            return Verdict::Stay(msg);
+        }
         crate::note_snip_result(HWND(owner as *mut core::ffi::c_void), msg);
         return Verdict::Done;
     }
@@ -2280,10 +2330,17 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
             WM_MOUSEMOVE => {
                 let x = (l.0 & 0xFFFF) as i16 as i32;
                 let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
+                // MK_LBUTTON：拖动唯一凭据（见 `drag_without_button`）。
+                let lbutton = (w.0 & 0x0001) != 0;
                 let mut changed = false;
                 if let Ok(mut s) = SNIP.lock() {
                     // 动过鼠标就算"人还在"：闲置那把表从这一刻重新数（绝对上限不受影响）
                     s.last_input = Some(Instant::now());
+                    let had_drag = s.drag.is_some();
+                    s.drag = drag_without_button(s.drag, lbutton);
+                    if had_drag && s.drag.is_none() {
+                        changed = true;
+                    }
                     match s.drag {
                         Some((Drag::New, sx, sy)) => {
                             let nr = clamp_rect(norm_rect(sx, sy, x, y), s.base_w, s.base_h);
@@ -3404,6 +3461,11 @@ pub fn start(owner: HWND, annotate: bool) {
     };
     if vw <= 0 || vh <= 0 {
         tracing_note("截图失败：拿不到虚拟屏尺寸");
+        // 覆盖层没起来时屏上什么都没有：不发回执的话，这一按看起来就是"热键没反应"。
+        crate::note_snip_result(
+            owner,
+            "截图没开起来：拿不到虚拟屏尺寸（屏幕信息读不出来）".to_string(),
+        );
         return;
     }
     // 截图期间悬浮窗藏多久：默认整场都藏满（冻结图里本来就没有它，中途再让它冒出来
@@ -3422,6 +3484,7 @@ pub fn start(owner: HWND, annotate: bool) {
             if pill_was {
                 crate::floating::set_visible(true);
             }
+            crate::note_snip_result(owner, format!("截图没开起来：冻结画面没成：{e}"));
             return;
         }
     };
@@ -3563,6 +3626,11 @@ pub fn start(owner: HWND, annotate: bool) {
                 if pill_was && !restored_early {
                     crate::floating::set_visible(true);
                 }
+                // 同上：建窗失败只在日志里，而按热键的人看不到日志。
+                crate::note_snip_result(
+                    owner,
+                    "截图没开起来：覆盖层窗口建不出来（原因见 focusflow.log）".to_string(),
+                );
             }
         }
     }
@@ -3629,7 +3697,10 @@ mod render_probe {
         let origin = SNIP.lock().map(|s| s.origin).unwrap_or((0, 0));
         let _ = SetCursorPos(origin.0 + x, origin.1 + y);
         let lp = (((y & 0xFFFF) as isize) << 16) | ((x & 0xFFFF) as isize);
-        let _ = PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(lp));
+        // wParam 与验收脚本同一约定（`accept-snip.ps1::Post-Mouse` 一直发 1）：
+        // MK_LBUTTON。合成的移动没有真实按键状态，而拖动现在只认这一位 ——
+        // 发 0 等于让每一次合成拖动在第一帧就被判成"已经松手"。
+        let _ = PostMessageW(Some(hwnd), msg, WPARAM(1), LPARAM(lp));
     }
 
     /// 窗口自己长什么样：从窗口 DC 直接 BitBlt 一块 32bpp 位图读回像素。
@@ -7337,7 +7408,7 @@ mod tests {
     #[test]
     fn the_pin_receipt_names_each_destination_that_actually_took() {
         // 三件都成
-        let all_ok = pin_receipt(Some("snip_a.png"), None, None, 300, 200);
+        let all_ok = pin_receipt(Some("snip_a.png"), None, None, None, 300, 200);
         assert_eq!(
             all_ok,
             snip_receipt("snip_a.png", 300, 200, true),
@@ -7349,6 +7420,7 @@ mod tests {
             Some("snip_a.png"),
             None,
             Some("打开剪贴板失败：占用"),
+            None,
             300,
             200,
         );
@@ -7364,7 +7436,7 @@ mod tests {
         );
 
         // 文件没落（`saved` 是 None）—— 从前这一支连回执都不发
-        let save_bad = pin_receipt(None, Some("写盘失败：只读"), None, 300, 200);
+        let save_bad = pin_receipt(None, Some("写盘失败：只读"), None, None, 300, 200);
         assert!(
             save_bad.contains("图没存下来") && save_bad.contains("写盘失败：只读"),
             "文件没落必须当场说，附上原因: {save_bad}"
@@ -7379,14 +7451,59 @@ mod tests {
         );
 
         // 两件都没成：两条原因都要在
-        let both_bad = pin_receipt(None, Some("写盘失败：盘满"), Some("剪贴板被占"), 300, 200);
+        let both_bad = pin_receipt(
+            None,
+            Some("写盘失败：盘满"),
+            Some("剪贴板被占"),
+            None,
+            300,
+            200,
+        );
         assert!(
             both_bad.contains("盘满") && both_bad.contains("剪贴板被占"),
             "两样都没成时不许后者顶掉前者: {both_bad}"
         );
 
+        // 贴图那一步没成（十二张上限 / 建窗失败）：连"钉在桌面"都不许念
+        let pin_bad = pin_receipt(
+            Some("snip_a.png"),
+            None,
+            None,
+            Some("贴图最多同时钉 12 张"),
+            300,
+            200,
+        );
+        assert!(
+            !pin_bad.contains("钉在桌面"),
+            "一张都没钉上时不许念成功的半句：{pin_bad}"
+        );
+        assert!(
+            pin_bad.contains("没钉到桌面上")
+                && pin_bad.contains("贴图最多同时钉 12 张")
+                && pin_bad.contains("snip_a.png"),
+            "要点名贴图没成、为什么，文件那一半照旧在: {pin_bad}"
+        );
+        let nothing = pin_receipt(
+            None,
+            Some("写盘失败：盘满"),
+            Some("剪贴板被占"),
+            Some("建贴图窗口失败"),
+            300,
+            200,
+        );
+        assert!(
+            nothing.contains("盘满")
+                && nothing.contains("剪贴板被占")
+                && nothing.contains("建贴图窗口失败"),
+            "三件都没成时三条原因都要在: {nothing}"
+        );
+        assert!(
+            !nothing.contains("钉在桌面"),
+            "三件都没成还念钉上了: {nothing}"
+        );
+
         // 兜底支（正常走不到）：问不出来就不许编一句成
-        let odd = pin_receipt(None, None, Some("剪贴板被占"), 300, 200);
+        let odd = pin_receipt(None, None, Some("剪贴板被占"), None, 300, 200);
         assert!(
             !odd.contains("已存") && !odd.contains("同时复制"),
             "没有文件名就没有'已存'可说: {odd}"
@@ -7412,6 +7529,12 @@ mod tests {
                 .count(),
             0,
             "贴图那一支又回到「文件落了就说全成」：剪贴板没进去时屏上会念一句假话"
+        );
+        assert_eq!(
+            flat.matches("open_pin(buf,w,h,origin.0+sel.0,origin.1+sel.1).err()")
+                .count(),
+            1,
+            "open_pin 的结局又被丢掉了：到十二张上限时桌面上没有，屏上却说「钉在桌面上」"
         );
     }
 
@@ -7511,6 +7634,53 @@ mod tests {
         assert_eq!(
             key_action(0x28, false, true, true),
             KeyAct::Nudge(0, 1, true)
+        );
+    }
+
+    /// 拖动只认左键：覆盖层没有 CANCELMODE/CAPTURECHANGED 那一支，Alt+Tab、别的程序
+    /// 抢走捕获、或在窗外面松开之后，`WM_MOUSEMOVE` 照样会进来。不结束拖动的话，
+    /// 选区与标注会跟着一个已经松开的指针继续变形（再移回来时框像被"粘住"）。
+    #[test]
+    fn a_drag_ends_as_soon_as_the_left_button_is_up() {
+        assert_eq!(drag_without_button(Some((Drag::New, 0, 0)), false), None);
+        assert_eq!(
+            drag_without_button(Some((Drag::Mark, 10, 20)), false),
+            None,
+            "标注笔也一样：松手之后不该继续画"
+        );
+        assert_eq!(
+            drag_without_button(Some((Drag::Handle(3), 5, 6)), true),
+            Some((Drag::Handle(3), 5, 6)),
+            "按着的时候不许被误判成松手"
+        );
+        assert_eq!(drag_without_button(None, true), None);
+        assert_eq!(drag_without_button(None, false), None);
+
+        // 接线腿：WM_MOUSEMOVE 必须真的把 wParam 的 MK_LBUTTON 位交给这条判据。
+        let src = include_str!("snip.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("s.drag=drag_without_button(s.drag,lbutton)"),
+            "拖动结束那条判据没接在 WM_MOUSEMOVE 上：松手后的移动会继续改选区"
+        );
+        assert!(
+            flat.contains("letlbutton=(w.0&0x0001)!=0;"),
+            "MK_LBUTTON 不再是拖动那一支的唯一凭据"
+        );
+    }
+
+    /// 开层失败的三条路（虚拟屏、冻结、建窗）都要给状态行回执：覆盖层没起来时
+    /// 只在日志里说一句，按热键的人看到的只是"这个键没反应"。
+    #[test]
+    fn every_way_the_overlay_can_fail_to_open_says_something_on_screen() {
+        let src = include_str!("snip.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            flat.matches("note_snip_result(owner,").count(),
+            3,
+            "开层失败的回执少了一条：虚拟屏/冻结/建窗三处各要一句"
         );
     }
 
