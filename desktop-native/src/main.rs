@@ -4711,6 +4711,16 @@ fn settings_row_rect(g: &SettingsGeom, w: f32, y: f32) -> D2D_RECT_F {
     rect(g.body_left, y, w - 32.0 - g.body_left, g.row_h - 2.0)
 }
 
+/// 设置行里说明文字那一列的宽度：从行内左边距（`r.left + 12`）画到值框/按钮之前，留 18 px。
+///
+/// 几行"基础项"从前各自写死 560 / 640：而这一列真正的空位只有 `720 - 240 - 12 - 18 ≈ 450`，
+/// 于是 `data_home` 这种一条真实路径（~490 px）会整句画到右边「打开」按钮身上；写死宽度的
+/// 那一侧又让 `clip_middle` 把长路径的尾巴当废物省掉 —— 屏上既看不到真正的家，也分不清字
+/// 压在哪颗按钮上。高级项那一列早就是这么算的，这里收成同一把尺子。
+fn settings_note_w(g: &SettingsGeom, r: D2D_RECT_F) -> f32 {
+    (g.value_x - r.left - 30.0).max(120.0)
+}
+
 /// 设置页底部的数据操作（后台线程跑，结果回投 `WM_OP_DONE`）。
 /// 设置页底部那八颗「执行」：标题 / 说明 / **点下去之后状态行那句"正在…"**。
 ///
@@ -4909,6 +4919,7 @@ fn draw_settings(
         }
         let y = g.list_top + vis as f32 * g.row_h;
         let r = settings_row_rect(&g, w, y);
+        let note_w = settings_note_w(&g, r);
         if vs.sel == Some(idx) {
             p.round(r, R_CONTROL, &p.br.accent_soft, None);
         } else if vs.hover == Some(idx) {
@@ -4926,12 +4937,7 @@ fn draw_settings(
                 );
                 p.text(
                     row.help,
-                    rect(
-                        r.left + 12.0,
-                        y + 23.0,
-                        (g.value_x - r.left - 30.0).max(120.0),
-                        17.0,
-                    ),
+                    rect(r.left + 12.0, y + 23.0, note_w, 17.0),
                     &p.fmt.text12,
                     &p.br.muted,
                 );
@@ -5150,7 +5156,7 @@ fn draw_settings(
                         // 会顶到右边那颗「开」按钮上。
                         p.text(
                             "总开关：开 = 注册下面三行；关 = 一条都不占用",
-                            rect(r.left + 12.0, y + 23.0, 560.0, 17.0),
+                            rect(r.left + 12.0, y + 23.0, note_w, 17.0),
                             &p.fmt.text12,
                             &p.br.muted,
                         );
@@ -5165,9 +5171,9 @@ fn draw_settings(
                             &p.clip(
                                 &format!("等于按热键 {annotate}；框好之后 Enter 或 Ctrl+S 出图"),
                                 &p.fmt.text12,
-                                640.0,
+                                note_w,
                             ),
-                            rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
+                            rect(r.left + 12.0, y + 23.0, note_w, 17.0),
                             &p.fmt.text12,
                             &p.br.muted,
                         );
@@ -5182,9 +5188,9 @@ fn draw_settings(
                                     "等于按热键 {snip}；PNG 存 data/screenshots，同时复制到剪贴板"
                                 ),
                                 &p.fmt.text12,
-                                640.0,
+                                note_w,
                             ),
-                            rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
+                            rect(r.left + 12.0, y + 23.0, note_w, 17.0),
                             &p.fmt.text12,
                             &p.br.muted,
                         );
@@ -5204,10 +5210,14 @@ fn draw_settings(
                             if n == 0 { &p.br.muted } else { &p.br.white },
                         );
                         p.text(
-                            &format!(
-                                "现在开着 {n} 张；拖动挪位、滚轮缩放、Esc/右键关单张（不另存）"
+                            &p.clip(
+                                &format!(
+                                    "现在开着 {n} 张；拖动挪位、滚轮缩放、Esc/右键关单张（不另存）"
+                                ),
+                                &p.fmt.text12,
+                                note_w,
                             ),
-                            rect(r.left + 12.0, y + 23.0, 640.0, 17.0),
+                            rect(r.left + 12.0, y + 23.0, note_w, 17.0),
                             &p.fmt.text12,
                             &p.br.muted,
                         );
@@ -5280,8 +5290,8 @@ fn draw_settings(
                             )
                         };
                         p.text(
-                            &p.clip(&dir_line, &p.fmt.text12, 560.0),
-                            rect(r.left + 12.0, y + 23.0, 560.0, 17.0),
+                            &p.clip(&dir_line, &p.fmt.text12, note_w),
+                            rect(r.left + 12.0, y + 23.0, note_w, 17.0),
                             &p.fmt.text12,
                             &p.br.muted,
                         );
@@ -5991,7 +6001,7 @@ fn draw_screen(
     let cards: Vec<(String, String, String)> = vec![
         (
             "今日活跃".into(),
-            thousands(snap.today as u64),
+            thousands(snap.today.max(0) as u64),
             kinds_sub(snap),
         ),
         ("当前速度".into(), speed_value, speed_sub),
@@ -6011,7 +6021,7 @@ fn draw_screen(
         ),
         (
             "最高单日".into(),
-            thousands(max_day.1 as u64),
+            thousands(max_day.1.max(0) as u64),
             max_day.0.clone(),
         ),
     ];
@@ -10600,7 +10610,9 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 let (app, secs) = &snap.apps[idx];
                 let share = share_text(*secs, snap.app_total);
                 p.text(
-                    app,
+                    // 应用名是库里原样存的，长度没有上限；这一格不夹就会一路画进右边的时长列
+                    // （设备详情那一列已经这么夹了，看板卡片也是）。
+                    &p.clip(app, &p.fmt.table_name, name_col_width(&g)),
                     rect(g.x_name, y + 3.0, name_col_width(&g), 18.0),
                     &p.fmt.table_name,
                     &p.br.fg,
@@ -10631,7 +10643,7 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                     &p.br.fg,
                 );
                 p.text(
-                    &thousands(*n as u64),
+                    &thousands((*n).max(0) as u64),
                     rect(g.x_count_right - NUM_COL_W, y + 4.0, NUM_COL_W, 18.0),
                     &p.fmt.right,
                     &p.br.fg,
@@ -10647,13 +10659,14 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                 let (key, n) = &snap.rank[idx];
                 let share = share_text(*n, snap.rank_share_base());
                 p.text(
-                    key,
+                    // 键名与设备名同一条：旧库导入进来的名字可以很长，夹到这一列里。
+                    &p.clip(key, &p.fmt.table_name, name_col_width(&g)),
                     rect(g.x_name, y + 3.0, name_col_width(&g), 18.0),
                     &p.fmt.table_name,
                     &p.br.fg,
                 );
                 p.text(
-                    &thousands(*n as u64),
+                    &thousands((*n).max(0) as u64),
                     rect(g.x_count_right - NUM_COL_W, y + 4.0, NUM_COL_W, 18.0),
                     &p.fmt.right,
                     &p.br.fg,
@@ -11277,7 +11290,9 @@ fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenu
 
 /// 托盘 tooltip：今日次数 + 采集状态（采集开着时才有后半截）。
 fn tray_tooltip(today: i64) -> String {
-    let mut tip = format!("FocusFlow · 今日 {}", thousands(today as u64));
+    // 次数是 `u64` 的写法：坏数据/外部导入留下的负数若直接 `as u64`，托盘上会念出
+    // 一个二十位数。真数不会为负，夹到 0 与其余几处读数同一个口径。
+    let mut tip = format!("FocusFlow · 今日 {}", thousands(today.max(0) as u64));
     if collect::is_listening() {
         tip.push_str(if collect::is_paused() {
             " · 已暂停"
@@ -15265,6 +15280,30 @@ mod settings_type_tests {
         }
     }
 
+    /// 说明那一列必须停在值框/按钮之前：从前几行"基础项"写死 560 / 640，而 960 宽时
+    /// 真实空位只有 `value_x - (body_left + 12) - 18 ≈ 450`，一条常见的数据目录路径
+    /// 就会整句画到「打开」按钮身上。
+    #[test]
+    fn the_settings_note_column_stops_before_the_value_box() {
+        use super::{settings_geom, settings_note_w, settings_row_rect};
+        let w = 960.0;
+        let g = settings_geom(w, 860.0);
+        let r = settings_row_rect(&g, w, g.list_top);
+        let note_w = settings_note_w(&g, r);
+        assert_eq!(note_w, g.value_x - (r.left + 12.0) - 18.0);
+        assert!(
+            r.left + 12.0 + note_w <= g.value_x,
+            "说明画到值框/按钮底下了：{} > {}",
+            r.left + 12.0 + note_w,
+            g.value_x
+        );
+        assert!(note_w < 560.0, "960 宽时这一列本来就没 560：实得 {note_w}");
+        // 反向腿：窗口再窄，这一列也不许缩成负的或看不见。
+        let narrow = settings_geom(480.0, 640.0);
+        let nr = settings_row_rect(&narrow, 480.0, narrow.list_top);
+        assert!(settings_note_w(&narrow, nr) >= 120.0);
+    }
+
     /// 清理那一句要把"执行前快照没兜住"一起带上屏（那是删完才发现没有退路的那一半）。
     ///
     /// 三条腿：①`snapshot_warning` 为空 ⇒ 屏上就是 core 那一句话，一个字都不许多
@@ -17661,6 +17700,17 @@ mod tray_menu_tests {
             );
         }
     }
+
+    /// 次数那一格画的是 `u64` 千分位：坏数据/外部导入留下的负数直接 `as u64` 会在托盘上
+    /// 念出一个二十位数（与卡片、排行同一族；那几处早已夹 0）。
+    #[test]
+    fn a_negative_today_count_does_not_become_a_twenty_digit_tooltip() {
+        let tip = super::tray_tooltip(-5);
+        assert!(
+            tip.starts_with("FocusFlow · 今日 0"),
+            "负数不许折成天文数字: {tip}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -18675,7 +18725,7 @@ mod clip_tests {
             .collect::<String>()
             .replace(",)", ")");
         for needle in [
-            "p.clip(&dir_line,&p.fmt.text12,560.0)",
+            "p.clip(&dir_line,&p.fmt.text12,note_w)",
             "p.clip(line,status_fmt,status_w)",
         ] {
             assert_eq!(
@@ -18787,8 +18837,19 @@ mod clip_tests {
             ("p.clip(&f.label,&p.fmt.caption,136.0),rect(row.left,row.top+7.0,136.0,18.0)", 1),
             ("p.clip(&f.value,&p.fmt.caption,vb.right-vb.left-28.0),rect(vb.left+8.0,vb.top+3.0,vb.right-vb.left-28.0,18.0)", 1),
             ("p.clip(m.title,&p.fmt.body,g.dialog.right-g.dialog.left-72.0)", 1),
-            // 热键那两行：组合键是 config.ini 的原文，两句同一格 ⇒ 两处
-            ("&p.fmt.text12,640.0)", 2),
+            // 基础行的说明列不再写死 560/640：那比按钮前的实际空位宽出一百多像素，
+            // 长路径/长热键会压到右边那颗按钮上。三处都吃 `note_w`，宽度与矩形同一个数。
+            ("&p.fmt.text12,640.0)", 0),
+            ("&p.fmt.text12,note_w)", 4),
+            // 键名/应用名是库里的原文，长度没有上限：与设备名同一把夹取尺子
+            (
+                "p.clip(app,&p.fmt.table_name,name_col_width(&g)),rect(g.x_name,y+3.0,name_col_width(&g),18.0)",
+                1,
+            ),
+            (
+                "p.clip(key,&p.fmt.table_name,name_col_width(&g)),rect(g.x_name,y+3.0,name_col_width(&g),18.0)",
+                1,
+            ),
             // 趋势图横轴起点：60 px 那一格吃的是库里的日期串
             ("p.clip(&left,&p.fmt.caption,60.0),rect(plot.left,plot.bottom+4.0,60.0,14.0)", 1),
             // 星期分布柱顶数字：居中，越界两头都跑
