@@ -9812,8 +9812,6 @@ fn gap_year_count(gaps: &[String]) -> usize {
     seen.len()
 }
 
-/// 周报开头那句「这一轮没读全」。**纯函数**：`generate_weekly_report` 要读库、要落文件，
-/// 无头环境里跑不动，而这一句里的两个数（几本库／几条读数）正是最容易说错的地方。
 /// Markdown 表格单元格的转义。
 ///
 /// 键名来自旧版导入数据、设备名可以是用户手输的别名：`|` 在 Windows 文件名里不合法、
@@ -9827,6 +9825,8 @@ fn md_cell(s: &str) -> String {
         .replace(['\r', '\n'], " ")
 }
 
+/// 周报开头那句「这一轮没读全」。**纯函数**：`generate_weekly_report` 要读库、要落文件，
+/// 无头环境里跑不动，而这一句里的两个数（几本库／几条读数）正是最容易说错的地方。
 fn weekly_gap_sentence(gaps: &[String]) -> String {
     if gaps.is_empty() {
         return String::new();
