@@ -9,7 +9,7 @@
 //! 用例里造出来，不用等日历走到那天），[`collect`] 只管去问库。
 
 use crate::db::queries::{self, DashRange};
-use crate::format::{fmt_compact, fmt_compact_duration};
+use crate::format::{fmt_compact_duration, fmt_thousands};
 use crate::stats;
 
 /// 排行每一列取前几名（方案 3.2 的表定的是各取前 8）。
@@ -79,21 +79,21 @@ pub fn summarize(input: DashInput<'_>) -> DashBoard {
         Some((name, _)) => format!(
             "{}共按键 {} 次，活跃 {}，最常用 {}",
             input.range.label(),
-            fmt_compact(keys_total),
+            fmt_thousands(keys_total),
             fmt_compact_duration(input.active_seconds),
             name
         ),
         None => format!(
             "{}共按键 {} 次，活跃 {}，这段时间没有归到某个应用上的活动",
             input.range.label(),
-            fmt_compact(keys_total),
+            fmt_thousands(keys_total),
             fmt_compact_duration(input.active_seconds)
         ),
     };
 
     DashBoard {
         kpi: vec![
-            ("按键总数".to_string(), fmt_compact(keys_total)),
+            ("按键总数".to_string(), fmt_thousands(keys_total)),
             (
                 "活跃时长".to_string(),
                 fmt_compact_duration(input.active_seconds),
@@ -235,23 +235,22 @@ mod tests {
         };
         let board = summarize(input);
 
-        // 1) keys.total = 范围内 count 合计 = 1000+2000+9200 = 12200，
-        //    按统一写法 ≥10000 收成「1.2万」（口径第 4 条），不是 12200 也不是 1.22万
-        assert_eq!(board.kpi[0], ("按键总数".to_string(), "1.2万".to_string()));
+        // 1) keys.total = 范围内 count 合计 = 1000+2000+9200 = 12200，按千分位写全数
+        assert_eq!(board.kpi[0], ("按键总数".to_string(), "12,200".to_string()));
         // 2) active.hours = seconds 合计 ÷ 3600，一位小数
         assert_eq!(board.kpi[1], ("活跃时长".to_string(), "1.0h".to_string()));
         // 3) streak.days 直接进 KPI（怎么算出来是另一条用例）
         assert_eq!(board.kpi[2], ("连续天数".to_string(), "3 天".to_string()));
         // 4) devices.count = 快照，与范围无关
         assert_eq!(board.kpi[3], ("设备数".to_string(), "3".to_string()));
-        // 5) keys.top：榜上第一是 Space（次数降序），次数写「1.2万」
+        // 5) keys.top：榜上第一是 Space（次数降序）；数字原样交给页面，卡片按千分位写全
         assert_eq!(board.top_keys[0].0, "Space");
-        assert_eq!(crate::format::fmt_compact(board.top_keys[0].1), "1.2万");
+        assert_eq!(board.top_keys[0].1, 12_345);
         // 6) apps.top：时长降序第一，格式「应用名 · 3.2h」
         assert_eq!(board.top_app_line, "编辑器 · 2.0h");
         assert_eq!(
             board.sentence,
-            "本周共按键 1.2万 次，活跃 1.0h，最常用 编辑器"
+            "本周共按键 12,200 次，活跃 1.0h，最常用 编辑器"
         );
         assert!(board.gaps.is_empty());
     }

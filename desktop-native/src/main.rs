@@ -10467,7 +10467,7 @@ fn draw_rank_card(
     rows: &[(String, i64)],
     by_seconds: bool,
 ) {
-    use focusflow_core::format::{fmt_compact, fmt_compact_duration};
+    use focusflow_core::format::{fmt_compact_duration, fmt_thousands};
     let pad = 12.0;
     p.card(card, R_CARD);
     p.text(
@@ -10513,7 +10513,7 @@ fn draw_rank_card(
         let shown_value = if by_seconds {
             fmt_compact_duration(*value)
         } else {
-            fmt_compact(*value)
+            fmt_thousands(*value)
         };
         p.text(
             &shown_value,

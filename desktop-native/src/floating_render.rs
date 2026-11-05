@@ -86,13 +86,20 @@ pub fn metric_from(value: &str) -> Metric {
     }
 }
 
-/// 悬浮窗里的次数：与看板、排行用同一份紧凑口径（`≥10000` 收成「1.2万」）。
+/// 悬浮窗里的次数：**照原样写全**（千分位），不再收成「1.2万」。
 ///
-/// 从前这里自己按千位加逗号。值那一格默认只有 60px（`MIN_W` 下 46px），而这一路
-/// 文字是 NO_WRAP + CLIP：`1,234,567` 会被硬切掉尾巴、连省略号都没有；同一个数
-/// 在卡片上写 1,234,567、在看板上写 123.5万 也是自己对着自己。
+/// 值那一格默认 60px（`MIN_W` 下 46px），13px Segoe UI 实测「999,999」= 44.87px
+/// ⇒ 六位数在最窄的卡片里也放得下（判据见 `floating::count_width_tests`）。
+/// 托盘 tooltip 一直念的就是千分位全数，卡片跟它对齐。
+///
+/// 一百万及以上仍走紧凑写法：那不是"一天的键数"会出现的量级，而 NO_WRAP + CLIP
+/// 下七位数会被硬切掉尾巴，没有省略号。
 pub fn fmt_count(n: i64) -> String {
-    focusflow_core::format::fmt_compact(n)
+    if n.unsigned_abs() >= 1_000_000 {
+        focusflow_core::format::fmt_compact(n)
+    } else {
+        focusflow_core::format::fmt_thousands(n)
+    }
 }
 
 /// 时长写法与主界面 `duration_text` 同一份口径：`3h 30m` / `12m` / `45s`。
@@ -477,23 +484,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn counts_use_the_same_compact_rule_as_the_dashboard() {
+    fn counts_are_shown_in_full_up_to_six_digits() {
         assert_eq!(fmt_count(0), "0");
         assert_eq!(fmt_count(999), "999");
         assert_eq!(fmt_count(1000), "1,000");
-        assert_eq!(
-            fmt_count(1234567),
-            "123.5万",
-            "一万以上要跟看板同一把尺子，不能再按千分位往下数"
-        );
-        assert_eq!(fmt_count(-1500), "-1,500");
-        // 卡片值那一格默认 60px、最小窗 46px：紧凑写法必须能落进去（超过一万的
-        // 千分位写法在 NO_WRAP+CLIP 下会被硬切尾巴，没有省略号）。
-        assert!(
-            fmt_count(12_345_678).chars().count() <= 7,
-            "七位以上的次数要收成「万」，实得 {}",
-            fmt_count(12_345_678)
-        );
+        assert_eq!(fmt_count(12_345), "12,345", "一万以上也要看得到全数");
+        assert_eq!(fmt_count(123_456), "123,456");
+        assert_eq!(fmt_count(999_999), "999,999");
+        assert_eq!(fmt_count(-12_345), "-12,345", "负数不能丢掉符号");
+        // 百万以上退回紧凑：卡片那一格放不下七位数（宽度判据在
+        // `floating::count_width_tests`）。
+        assert_eq!(fmt_count(1_000_000), "100.0万");
     }
 
     #[test]

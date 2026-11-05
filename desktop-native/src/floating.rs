@@ -2750,3 +2750,62 @@ mod ctx_split_tests {
         }
     }
 }
+
+/// 卡片值那一格的宽度判据：值这一路是 NO_WRAP + CLIP（溢出连省略号都没有），
+/// 所以"放得下"必须是量出来的，不是数出来的。用生产格式化函数取那串字，用卡片
+/// 同一档字体（13px Segoe UI）排版，再跟**最窄**卡片（`MIN_W`）下的值格比。
+#[cfg(test)]
+mod count_width_tests {
+    use super::*;
+    use crate::floating_render as fr;
+
+    unsafe fn text_width(dwrite: &IDWriteFactory, text: &str) -> f32 {
+        unsafe {
+            let family = wide("Segoe UI");
+            let locale = wide("zh-cn");
+            let fmt: IDWriteTextFormat = dwrite
+                .CreateTextFormat(
+                    windows::core::PCWSTR(family.as_ptr()),
+                    None,
+                    DWRITE_FONT_WEIGHT(400),
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    fr::VALUE_PX as f32,
+                    windows::core::PCWSTR(locale.as_ptr()),
+                )
+                .expect("Segoe UI 建不出文本格式");
+            let _ = fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            let u16: Vec<u16> = text.encode_utf16().collect();
+            let layout = dwrite
+                .CreateTextLayout(&u16, &fmt, 200.0, fr::ROW_H as f32)
+                .expect("值那一串排版失败");
+            let mut m = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut m).expect("度量问不出来");
+            m.widthIncludingTrailingWhitespace
+        }
+    }
+
+    #[test]
+    fn a_six_digit_count_fits_the_narrowest_card() {
+        unsafe {
+            let dwrite: IDWriteFactory =
+                DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).expect("DWrite 工厂建不起来");
+            let cell = (fr::MIN_W - fr::PAD_X - fr::LABEL_W - fr::GAP) as f32;
+            for n in [99_999i64, 123_456, 999_999] {
+                let text = fr::fmt_count(n);
+                let w = text_width(&dwrite, &text);
+                assert!(w > 0.0, "「{text}」量出来是零宽：这条没真排过版");
+                assert!(
+                    w < cell,
+                    "「{text}」宽 {w:.2}px，最窄卡片的值格只有 {cell:.0}px"
+                );
+            }
+            // 反向那一半：七位数确实放不下，所以 `fmt_count` 从百万起退回紧凑写法。
+            let w7 = text_width(&dwrite, "1,234,567");
+            assert!(
+                w7 > cell,
+                "七位数只量到 {w7:.2}px（值格 {cell:.0}px），那这条判据挡不住东西"
+            );
+        }
+    }
+}
