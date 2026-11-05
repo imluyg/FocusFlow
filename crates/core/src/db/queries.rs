@@ -2103,7 +2103,7 @@ fn device_ids_of_identity_checked(
     };
     if let Some(rest) = identity.strip_prefix(ARCHIVED_DEVICE_KEY_PREFIX) {
         // 现形 `<年份>:<库内 id>`；旧形是裸 id（那个库连占位登记都没写过），
-        // 说的就是"本库的 n 号"
+        // 说的就是"本库的 n 号"。
         let (y, n) = match rest.split_once(':') {
             Some((y, n)) => (y.parse::<i32>().ok(), n.parse::<i64>().ok()),
             None => (None, rest.parse::<i64>().ok()),
@@ -2112,8 +2112,12 @@ fn device_ids_of_identity_checked(
             Some(y) => y == db_year,
             None => true,
         };
-        if let (true, Some(n)) = (from_this_db, n) {
-            if !ids.contains(&n) {
+        // 只有**登记表里一行都没扫到**时，键里的库内 id 才是它当年的 id。
+        // 扫到了占位行时，那个数字是迁移前的旧编号：`migrate_device_identity_keys`
+        // 会给整表重新下发 id，旧号 3 很可能已经属于另一台设备 —— 再并进去就是
+        // 「排行那一行 40 次、点进详情 70 次」。
+        if ids.is_empty() {
+            if let (true, Some(n)) = (from_this_db, n) {
                 ids.push(n);
             }
         }
@@ -3642,6 +3646,72 @@ mod tests {
         assert_eq!(get_device_detail(&theirs, 0).all, 40);
         crate::device_alias::clear(&mine).unwrap();
         crate::device_alias::invalidate_cache();
+    }
+
+    /// 身份迁移重发 id 之后，占位键里的**旧**库内 id 不许再被当成现役 id。
+    ///
+    /// `migrate_device_identity_keys` 给整表重新下发 id（连续 1..N），而旧登记行的 id
+    /// 可能不连续：孤儿占着的旧号 3 在迁移后很可能已经发给另一台设备。查询侧如果
+    /// 把占位键里的旧号也并进 id 列表，详情就会把那台设备的次数一起加进来 ——
+    /// 排行那一行写着 40、点进去 70，且 active_days / 首次日期也被污染。
+    #[test]
+    fn an_archived_placeholder_does_not_pick_up_another_devices_old_id() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("devq_placeholder_old_id");
+        let year = Local::now().year();
+        let path = paths::year_db_path(year);
+        let dk = day_key_of_date(chrono::NaiveDate::from_ymd_opt(year, 6, 1).expect("date"));
+        let keys = [
+            "HID#VID_AAAA&PID_0001&MI_00#7&1&0&0000",
+            "HID#VID_BBBB&PID_0002&MI_00#7&2&0&0000",
+            "HID#VID_CCCC&PID_0003&MI_00#7&3&0&0000",
+        ];
+        {
+            let conn = crate::db::connection::open_rw(&path).unwrap();
+            crate::db::connection::ensure_schema(&conn, year).unwrap();
+            // 旧登记行的 id 故意不连续（1、2、5）：孤儿占用的旧号 3 在迁移后
+            // 会被重新发给第三台设备 —— 那正是要防的撞号。
+            for (i, key) in keys.iter().enumerate() {
+                let id = [1i64, 2, 5][i];
+                conn.execute(
+                    "INSERT INTO devices (id, device_key, name, kind)
+                     VALUES (?1, ?2, ?3, 'keyboard')",
+                    rusqlite::params![id, key, format!("设备{i}")],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![dk, id, 10 * (i as i64 + 1)],
+                )
+                .unwrap();
+            }
+            // 孤儿：统计行有、登记行没有（旧号 3）
+            conn.execute(
+                "INSERT INTO device_counts (date_key, device_id, count) VALUES (?1, 3, 40)",
+                rusqlite::params![dk],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 100, 10)",
+                rusqlite::params![dk],
+            )
+            .unwrap();
+        }
+        // 第二次 ensure_schema 才真的跑身份迁移（第一次建表时表还是空的）
+        {
+            let conn = crate::db::connection::open_rw(&path).unwrap();
+            crate::db::connection::ensure_schema(&conn, year).unwrap();
+        }
+        invalidate_years_cache();
+
+        let orphan = archived_device_key(year, 3);
+        let detail = get_device_detail(&orphan, 0);
+        assert_eq!(
+            detail.all, 40,
+            "归档占位设备把撞号那台设备的明细算进来了: {detail:?}"
+        );
+        // 第三台设备自己的明细仍是 30，没被占位那台吃掉
+        assert_eq!(get_device_detail("VID_CCCC&PID_0003&MI_00", 0).all, 30);
     }
 
     /// 库里已有的裸占位键（旧版本写下的）要在 `ensure_schema` 里补上来源年份，
