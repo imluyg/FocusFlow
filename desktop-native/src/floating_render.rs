@@ -137,11 +137,18 @@ pub fn build_content(
     metric: Metric,
     today_count: i64,
     active_seconds: i64,
+    duration_unreadable: bool,
     collector_on: bool,
     paused: bool,
     cpm: i64,
 ) -> PillContent {
-    let duration = fmt_duration(active_seconds);
+    // 读不出来与"今天确实没有前台时长"是两件事：前者会是一条读失败的下界，
+    // 后者才是 0s。卡片没有展开详情的地方，所以只在这一格里念「读不出」。
+    let duration = if duration_unreadable {
+        "读不出".to_string()
+    } else {
+        fmt_duration(active_seconds)
+    };
     let mut rows = Vec::with_capacity(3);
     match metric {
         Metric::Times => rows.push(Row {
@@ -515,7 +522,7 @@ mod tests {
     /// 只有 both 才三行。最后一格恒为「速度」。
     #[test]
     fn metric_decides_which_rows_exist_and_speed_is_always_last() {
-        let t = build_content(Metric::Times, 1234, 3700, true, false, 45);
+        let t = build_content(Metric::Times, 1234, 3700, false, true, false, 45);
         assert_eq!(t.rows.len(), 2);
         assert_eq!(t.rows[0].value, "1,234");
         assert_eq!(t.rows[1].label, "速度");
@@ -523,12 +530,12 @@ mod tests {
         assert_eq!(t.rows[1].suffix, "/分");
         assert!(t.rows[1].accent);
 
-        let d = build_content(Metric::Duration, 1234, 3700, true, false, 45);
+        let d = build_content(Metric::Duration, 1234, 3700, false, true, false, 45);
         assert_eq!(d.rows.len(), 2);
         assert_eq!(d.rows[0].value, "1h 1m");
         assert_eq!(d.rows[1].label, "速度");
 
-        let b = build_content(Metric::Both, 1234, 3700, true, false, 45);
+        let b = build_content(Metric::Both, 1234, 3700, false, true, false, 45);
         assert_eq!(b.rows.len(), 3);
         assert_eq!(b.rows[1].label, "时长");
         assert_eq!(b.rows[2].label, "速度");
@@ -537,16 +544,28 @@ mod tests {
     /// 采集没开 / 暂停时速度那一格仍在，只是写「—」/「暂停」并且不再用强调色。
     #[test]
     fn a_silent_collector_still_occupies_the_speed_row() {
-        let off = build_content(Metric::Times, 10, 0, false, false, 0);
+        let off = build_content(Metric::Times, 10, 0, false, false, false, 0);
         assert_eq!(off.rows.len(), 2);
         assert_eq!(off.rows[1].value, "—");
         assert_eq!(off.rows[1].suffix, "");
         assert!(!off.rows[1].accent);
 
-        let paused = build_content(Metric::Times, 10, 0, true, true, 0);
+        let paused = build_content(Metric::Times, 10, 0, false, true, true, 0);
         assert_eq!(paused.rows[1].value, "暂停");
         assert_eq!(paused.rows[1].suffix, "");
         assert!(!paused.rows[1].accent);
+    }
+
+    /// 时长读不出来时不能念成 `0s`：那与"今天真的一秒都没有"长得一模一样。
+    #[test]
+    fn an_unreadable_duration_says_so_instead_of_zero_seconds() {
+        let bad = build_content(Metric::Duration, 10, 0, true, true, false, 0);
+        assert_eq!(bad.rows[0].label, "活跃");
+        assert_eq!(bad.rows[0].value, "读不出");
+        assert_eq!(bad.rows.len(), 2, "读不出来也还是两行，卡片不该跳高");
+
+        let zero = build_content(Metric::Duration, 10, 0, false, true, false, 0);
+        assert_eq!(zero.rows[0].value, "0s", "真的没有时长时照旧念 0s");
     }
 
     /// 卡片默认 132×48（两行）—— 高度正好是任务栏高度。

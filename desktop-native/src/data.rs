@@ -286,6 +286,9 @@ pub struct Snapshot {
     /// 今日前台应用总时长（秒）。悬浮窗的「时长」那一格用（`[gui] floating_metric`
     /// 取 `duration` / `both` 时），与读数卡片的「今日活跃」是同一份快照。
     pub today_app_seconds: i64,
+    /// 上面那一读有没有读全（某一年度库的 `app_usage` 读不出来）。
+    /// 卡片拿它把那一格念成「读不出」，而不是把"读不来"折成 `0s`。
+    pub today_app_unreadable: bool,
     /// 当前周期的键鼠总数。
     pub period_total: i64,
     /// 当前周期的日均（有限窗口按窗口含几天算；「总计」按全历史记到过次数的天数算，
@@ -501,10 +504,12 @@ pub fn load_card_only() -> Snapshot {
         Some(n) => n,
         None => queries::get_today_count(None),
     };
+    let app = queries::app_stats_totals(Some(1), None);
     Snapshot {
         period: -1,
         today,
-        today_app_seconds: queries::get_app_stats(Some(1), None).0,
+        today_app_seconds: app.total,
+        today_app_unreadable: !app.unreadable.is_empty(),
         ..Default::default()
     }
 }
@@ -622,10 +627,11 @@ pub fn load(period: i64) -> Snapshot {
     // `app_usage` 扫第二遍 —— 现量那一臂每拍自己占 3 条语句（`perf_probe`「每一臂自己几条语句」）。
     // ⚠ 这条 dedup 只在"窗口恰好相等"时成立：`days` 是 7/15/30/总计 时，今日那一格
     // 仍是独立的一问，不许顺手把它也省了（屏上「时长」会变成整个周期的秒数）。
-    let today_app_seconds = if days == Some(1) {
-        app_read.total
+    let (today_app_seconds, today_app_unreadable) = if days == Some(1) {
+        (app_read.total, !app_read.unreadable.is_empty())
     } else {
-        queries::get_app_stats(Some(1), None).0
+        let today_apps = queries::app_stats_totals(Some(1), None);
+        (today_apps.total, !today_apps.unreadable.is_empty())
     };
 
     // 每一栏"这一轮有没有读全"合成一串，界面按域名分栏去念（该接哪几栏，
@@ -644,6 +650,7 @@ pub fn load(period: i64) -> Snapshot {
         period,
         today,
         today_app_seconds,
+        today_app_unreadable,
         period_total: stats.total + pending,
         avg,
         avg_days,
@@ -1250,7 +1257,7 @@ mod chart_window_tests {
             .find("pub fn load(period: i64) -> Snapshot {")
             .expect("面板那一拍的入口不见了");
         let load_body = &prod[at..at + prod[at..].find("\n}").expect("load 的函数体没收尾")];
-        let today_entry = ["get_app_stats", "(Some(1)"].concat();
+        let today_entry = ["app_stats_totals", "(Some(1)"].concat();
         assert_eq!(
             load_body.matches(today_entry.as_str()).count(),
             1,
@@ -1264,9 +1271,12 @@ mod chart_window_tests {
         );
         assert!(
             prod.contains(
-                ["today_app_seconds = if days == Some(1)", " {"]
-                    .concat()
-                    .as_str()
+                [
+                    "today_app_seconds, today_app_unreadable) = if days == Some(1)",
+                    " {"
+                ]
+                .concat()
+                .as_str()
             ),
             "「窗口相同就不另问」那道分支不见了 —— 剩下那一问会变成无条件重复扫。\
              （另一半不用钉：`else` 那支要是被删，`today_app_seconds` 就没定义，编不过）"
@@ -1290,12 +1300,12 @@ mod chart_window_tests {
             .expect("卡片那一问的入口不见了");
         let body = &prod[at..at + prod[at..].find("\n}").expect("函数体没收尾")];
         for banned in [
-            "stats_totals(",
+            "queries::stats_totals(",
             "get_alltime_max_day(",
             "daily_counts_windows(",
             "hourly_window_totals(",
             "device_totals(",
-            "app_stats_totals(",
+            "app_stats_totals(days",
             "load_settings(",
             "goal_status(",
         ] {
@@ -1305,8 +1315,13 @@ mod chart_window_tests {
             );
         }
         assert!(
-            body.contains("get_app_stats(Some(1), None)") && body.contains("get_today_count(None)"),
+            body.contains("app_stats_totals(Some(1), None)")
+                && body.contains("get_today_count(None)"),
             "卡片那一拍不再问它该问的那两格（今日前台时长 / 采集没开时的今日退路）"
+        );
+        assert!(
+            body.contains("today_app_unreadable: !app.unreadable.is_empty()"),
+            "读没读全这一格没跟着那一问走：卡片会把读不动的时长念成 0s"
         );
     }
 }

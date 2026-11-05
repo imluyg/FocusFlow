@@ -12263,6 +12263,7 @@ fn publish_floating(snap: &Snapshot) {
     floating::publish(floating::Live {
         today: snap.today,
         duration_sec: snap.today_app_seconds,
+        duration_unreadable: snap.today_app_unreadable,
     });
 }
 

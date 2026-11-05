@@ -108,11 +108,15 @@ const DEFAULT_H: f64 = 48.0;
 pub struct Live {
     pub today: i64,
     pub duration_sec: i64,
+    /// 时长那一读有没有读全：读不全时卡片念「读不出」，不许折成 `0s`
+    /// （那与"今天真的没有前台时长"长得一模一样）。
+    pub duration_unreadable: bool,
 }
 
 static LIVE: Mutex<Live> = Mutex::new(Live {
     today: 0,
     duration_sec: 0,
+    duration_unreadable: false,
 });
 
 /// 主窗口每次刷新后调一次。第一条快照到之前卡片显示 0 / —（不画空白）。
@@ -248,6 +252,7 @@ fn current_content() -> fr::PillContent {
         metric,
         today,
         live.duration_sec,
+        live.duration_unreadable,
         crate::collect::is_listening(),
         crate::collect::is_paused(),
         crate::collect::cpm(),
@@ -2421,10 +2426,10 @@ mod text_path_ab_tests {
         vec![
             (
                 "nums",
-                fr::build_content(m, 12345, 3 * 3600 + 30 * 60, true, false, 41),
+                fr::build_content(m, 12345, 3 * 3600 + 30 * 60, false, true, false, 41),
             ),
-            ("paused", fr::build_content(m, 7, 95, true, true, 0)),
-            ("dash", fr::build_content(m, 7, 95, false, false, 0)),
+            ("paused", fr::build_content(m, 7, 95, false, true, true, 0)),
+            ("dash", fr::build_content(m, 7, 95, false, false, false, 0)),
         ]
     }
 
