@@ -1077,6 +1077,14 @@ struct App {
     pv_hover: Option<PvTarget>,
     /// 正在拖的滚动条滑块（None = 没在拖）。
     scroll_drag: Option<ScrollDrag>,
+    /// 键盘焦点：当前页"可停住"那一列里的下标（None = 没有焦点）。
+    kbd_focus: Option<usize>,
+    /// 指针位置（DIP）与同一个悬停目标已经停了多久：tooltip 要等一会儿再出来。
+    ptr: (f32, f32),
+    hover_since: std::time::Instant,
+    tooltip_ready: bool,
+    /// 这一帧指针压着的、被截断的那一格全文（右键复制读它）。
+    tooltip_text: Option<String>,
     hover: Option<usize>,
     /// 指针下的控件（药丸/页签/导航）：只影响底色与光标形状，不参与点击判定。
     ctl: Option<Ctl>,
@@ -1592,6 +1600,11 @@ impl App {
                 pv_targets_key: None,
                 pv_hover: None,
                 scroll_drag: None,
+                kbd_focus: None,
+                ptr: (0.0, 0.0),
+                hover_since: std::time::Instant::now(),
+                tooltip_ready: false,
+                tooltip_text: None,
                 hover: None,
                 ctl: None,
                 sel: None,
@@ -1742,6 +1755,18 @@ impl App {
                 pal,
                 dw: &self.dwrite,
             };
+            let kbd_rect = self.kbd_focus.and_then(|i| {
+                self.kbd_items(size.width, size.height)
+                    .get(i)
+                    .map(|it| it.rect)
+            });
+            // 弹层把整页压住时不出 tooltip：否则会浮在对话框上面。
+            let tooltip_on = self.tooltip_ready
+                && self.detail.is_none()
+                && !self.cleanup_confirm
+                && self.plugin_uninstall.is_none()
+                && self.pv_modal.is_none()
+                && self.pv_select.is_none();
             let vs = ViewState {
                 view: self.view,
                 atab: self.atab,
@@ -1752,6 +1777,9 @@ impl App {
                 hover: self.hover,
                 ctl: self.ctl,
                 pv_hover: self.pv_hover,
+                kbd_focus: kbd_rect,
+                ptr: self.ptr,
+                tooltip: tooltip_on,
                 sel: self.sel,
                 editing: self.edit_row,
                 capturing: self.capturing,
@@ -1795,6 +1823,8 @@ impl App {
                 ),
                 None => self.pv_scroll,
             };
+            // 画的时候顺手记下"指针压着哪个被截断的格子"：提示框与右键复制同源。
+            let mut tip: Option<(String, D2D_RECT_F)> = None;
             draw_screen(
                 &p,
                 size.width,
@@ -1818,7 +1848,9 @@ impl App {
                 self.pv_select.as_ref(),
                 self.pv_modal.as_deref(),
                 &self.plugin_sel,
+                &mut tip,
             );
+            self.tooltip_text = tip.map(|(text, _)| text);
             self.pv_scroll = pv_scroll;
         }
         let ok = unsafe { t.rt.EndDraw(None, None).is_ok() } && t.present();
@@ -2128,12 +2160,290 @@ impl App {
         self.scroll_drag.take().is_some()
     }
 
+    /// 当前这一页键盘能停住的那些格子（周期 → 页签 → 本页）。
+    ///
+    /// 与画、点击读同一份几何：列表行用 `settings_row_rect` / `plugin_row_rect` /
+    /// `table_row_band`，插件视图用 `pv_targets`。键鼠与应用两屏的行仍然不可点，
+    /// 也就不进这张表 —— 焦点停过去再按 Enter 什么都不会发生，那是另一种假反馈。
+    fn kbd_items(&self, w: f32, h: f32) -> Vec<KbdItem> {
+        let mut out = Vec::new();
+        for (_, r) in period_pills() {
+            out.push(KbdItem {
+                rect: r,
+                group: 0,
+                list_index: None,
+            });
+        }
+        for r in view_tabs() {
+            out.push(KbdItem {
+                rect: r,
+                group: 1,
+                list_index: None,
+            });
+        }
+        let mut page = |rect: D2D_RECT_F, list_index: Option<usize>| {
+            out.push(KbdItem {
+                rect,
+                group: 2,
+                list_index,
+            })
+        };
+        match self.view {
+            2 => {
+                let card = left_card(w, h);
+                let g = table_geom(card);
+                let count = self
+                    .snap
+                    .lock()
+                    .map(|s| left_rows(&s, 2, self.rank_tab, self.rank_filter).len())
+                    .unwrap_or(0);
+                let scroll = self.scroll.min(count.saturating_sub(g.max_rows));
+                for i in scroll..count.min(scroll + g.max_rows) {
+                    let vis = i - scroll;
+                    page(
+                        table_row_band(card, g.list_top + vis as f32 * g.row_h, g.row_h),
+                        Some(i),
+                    );
+                }
+            }
+            3 => {
+                for r in atab_tabs() {
+                    page(r, None);
+                }
+            }
+            4 => {
+                if self.plugin_open.is_some() {
+                    let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
+                    let clip = plugin_content_clip(card);
+                    let view = self
+                        .plugin_open
+                        .as_deref()
+                        .and_then(|name| self.pm.as_ref().and_then(|pm| pm.get_plugin(name)))
+                        .and_then(|p| p.view.as_ref());
+                    if let Some(view) = view {
+                        let ops = plugin_view_ops(
+                            view,
+                            plugin_scroll_area(w, h),
+                            self.pv_scroll as f32,
+                            &self.plugin_sel,
+                        );
+                        for t in pv_targets_of(&ops) {
+                            let cx = (t.rect.left + t.rect.right) / 2.0;
+                            let cy = (t.rect.top + t.rect.bottom) / 2.0;
+                            if hit(clip, cx, cy) {
+                                page(t.rect, None);
+                            }
+                        }
+                    }
+                } else {
+                    let (list_top, row_h, max_rows) = plugin_geom(w, h);
+                    let slots = plugin_slots(&self.plugin_rows);
+                    let scroll = self.scroll.min(slots.len().saturating_sub(max_rows));
+                    for (slot_i, slot) in slots.iter().enumerate() {
+                        if !matches!(slot, PluginSlot::Row(_)) {
+                            continue;
+                        }
+                        if slot_i < scroll || slot_i >= scroll + max_rows {
+                            continue;
+                        }
+                        let vis = slot_i - scroll;
+                        page(
+                            plugin_row_rect(w, list_top + vis as f32 * row_h, row_h),
+                            Some(slot_i),
+                        );
+                    }
+                }
+            }
+            5 => {
+                let g = settings_geom(w, h);
+                let items = self
+                    .snap
+                    .lock()
+                    .ok()
+                    .map(|s| settings_items(&s, &self.search, self.settings_cat))
+                    .unwrap_or_default();
+                let scroll = self.scroll.min(items.len().saturating_sub(g.max_rows));
+                for (i, item) in items.iter().enumerate() {
+                    if matches!(item, SItem::Header(_)) {
+                        continue;
+                    }
+                    if i < scroll || i >= scroll + g.max_rows {
+                        continue;
+                    }
+                    let vis = i - scroll;
+                    page(
+                        settings_row_rect(&g, w, g.list_top + vis as f32 * g.row_h),
+                        Some(i),
+                    );
+                }
+            }
+            6 => {
+                for (_, r) in dashboard::range_pills() {
+                    page(r, None);
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// 把焦点挪一格；`same_group` 见 [`kbd_next`]。焦点落在滚动列表之外时顺手滚过去。
+    fn kbd_move(&mut self, hwnd: HWND, delta: isize, same_group: bool) {
+        let (w, h) = self.client_dip(hwnd);
+        let items = self.kbd_items(w, h);
+        let groups: Vec<u8> = items.iter().map(|i| i.group).collect();
+        let next = kbd_next(&groups, self.kbd_focus, delta, same_group);
+        self.kbd_focus = next;
+        if let Some(n) = next {
+            let item = items[n];
+            self.kbd_scroll_to(w, h, &item);
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    fn kbd_scroll_to(&mut self, w: f32, h: f32, item: &KbdItem) {
+        let Some(idx) = item.list_index else {
+            return;
+        };
+        let max_rows = match self.view {
+            2 => table_geom(left_card(w, h)).max_rows,
+            4 => plugin_geom(w, h).2,
+            5 => settings_geom(w, h).max_rows,
+            _ => return,
+        };
+        if idx < self.scroll {
+            self.scroll = idx;
+        } else if idx >= self.scroll + max_rows {
+            self.scroll = idx + 1 - max_rows;
+        }
+    }
+
+    /// Enter：等于在焦点那一格的中心点一下 —— 命中、滚动与各页自己的处理都走同一条路。
+    fn kbd_activate(&mut self, hwnd: HWND) {
+        let Some(i) = self.kbd_focus else {
+            return;
+        };
+        let (w, h) = self.client_dip(hwnd);
+        let items = self.kbd_items(w, h);
+        let Some(item) = items.get(i).copied() else {
+            self.kbd_focus = None;
+            return;
+        };
+        let s = self.scale(hwnd);
+        let cx = (item.rect.left + item.rect.right) / 2.0 * s;
+        let cy = (item.rect.top + item.rect.bottom) / 2.0 * s;
+        self.on_click(hwnd, cx, cy);
+    }
+
+    /// Ctrl+F：切到设置页并把搜索框叫到屏上、拿到焦点。
+    fn focus_search(&mut self, hwnd: HWND) {
+        if self.view != 5 {
+            self.switch_view(hwnd, 5);
+        }
+        let edit = self.ensure_search_edit(hwnd);
+        if let Some(host) = self.search_edit_host {
+            if !edit.0.is_null() {
+                self.place_search_edit(hwnd);
+                unsafe {
+                    let _ = ShowWindow(host, SW_SHOW);
+                    let _ = SetFocus(Some(edit));
+                }
+            }
+        }
+    }
+
+    /// 键盘导航：Tab / 上下 / 左右 / Enter。返回 true = 这一键已经被吃掉。
+    ///
+    /// 弹层开着时不接：焦点在页面背后按 Enter 会点到一个被盖住的控件。
+    fn handle_nav_key(&mut self, hwnd: HWND, vk: usize) -> bool {
+        if self.detail.is_some()
+            || self.cleanup_confirm
+            || self.plugin_uninstall.is_some()
+            || self.pv_modal.is_some()
+            || self.pv_select.is_some()
+            || self.edit_target.is_some()
+            || self.capturing.is_some()
+        {
+            return false;
+        }
+        let shift = (unsafe { GetKeyState(0x10) } as u16 & 0x8000) != 0;
+        match vk {
+            0x09 => {
+                self.kbd_move(hwnd, if shift { -1 } else { 1 }, false);
+                true
+            }
+            0x26 => {
+                self.kbd_move(hwnd, -1, true);
+                true
+            }
+            0x28 => {
+                self.kbd_move(hwnd, 1, true);
+                true
+            }
+            0x25 => {
+                let v = if self.view == 0 { 6 } else { self.view - 1 };
+                self.switch_view(hwnd, v);
+                true
+            }
+            0x27 => {
+                let v = (self.view + 1) % 7;
+                self.switch_view(hwnd, v);
+                true
+            }
+            0x0D => {
+                self.kbd_activate(hwnd);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 切到第 `i` 个视图：鼠标点页签与键盘左右键共用这一份。
+    fn switch_view(&mut self, hwnd: HWND, i: usize) {
+        self.view = i;
+        self.scroll = 0;
+        self.sel = None;
+        self.hover = None;
+        self.heat_hover = None;
+        self.chart_hover = None;
+        self.pv_select = None;
+        self.pv_modal = None;
+        self.pv_hover = None;
+        self.cleanup_confirm = false;
+        self.kbd_focus = None;
+        self.tooltip_ready = false;
+        self.tooltip_text = None;
+        // 录入态也一起清：热键录入吃掉 WM_KEYDOWN（连 Esc 都不再收窗），而它的
+        // 提示画在设置页那一格里 —— 换页之后提示看不见、按键照旧被吞，
+        // 用户只会觉得"这个键怎么没反应了"。
+        self.capturing = None;
+        if i == 5 {
+            self.place_search_edit(hwnd);
+        } else {
+            self.hide_search_edit();
+        }
+        if i == 4 {
+            self.reload_plugins();
+        }
+        // 进看板页就先问一次库（方案 3.2.3 第一行：切到这一页时查一次）。
+        // 没这一句，第一次点进来看到的是上一次离开时那一页的旧数（或全空）。
+        if i == 6 {
+            self.reload_board();
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
     /// 鼠标移动：排行页更新悬停行，分析页更新悬停键 / 悬停那一格；返回是否需要重画。
     fn on_move(&mut self, hwnd: HWND, px: f32, py: f32) -> bool {
         let mut changed = false;
         let (w, h) = self.client_dip(hwnd);
         let s = self.scale(hwnd);
         let (x, y) = (px / s, py / s);
+        self.ptr = (x, y);
         // 设备详情弹窗开着 = 页面模态：这一屏除了右上角三颗什么都不许亮着。
         if self.detail.is_some() {
             let ctl = self.control_at(w, h, x, y);
@@ -2141,6 +2451,8 @@ impl App {
             changed |= self.heat_hover.take().is_some();
             changed |= self.chart_hover.take().is_some();
             changed |= self.pv_hover.take().is_some();
+            changed |= self.tooltip_ready;
+            self.tooltip_ready = false;
             changed |= ctl != self.ctl;
             self.ctl = ctl;
             return changed;
@@ -2148,6 +2460,14 @@ impl App {
         // 控件悬停只影响底色与光标，不参与点击判定；每一条早退分支之前算完，
         // 免得"在分析页上药丸不亮"。
         let ctl = self.control_at(w, h, x, y);
+        // 换了一个控件/行：tooltip 的等待重新计时（同一个目标里挪一格不算）。
+        if ctl != self.ctl {
+            self.hover_since = std::time::Instant::now();
+            if self.tooltip_ready {
+                self.tooltip_ready = false;
+                changed = true;
+            }
+        }
         changed |= ctl != self.ctl;
         self.ctl = ctl;
 
@@ -2289,36 +2609,7 @@ impl App {
         for (i, tab) in view_tabs().iter().enumerate() {
             if hit(*tab, x, y) {
                 tracing_note(&format!("点击视图 {i} at ({x:.0},{y:.0})"));
-                self.view = i;
-                self.scroll = 0;
-                self.sel = None;
-                self.hover = None;
-                self.heat_hover = None;
-                self.chart_hover = None;
-                self.pv_select = None;
-                self.pv_modal = None;
-                self.pv_hover = None;
-                self.cleanup_confirm = false;
-                // 录入态也一起清：热键录入吃掉 WM_KEYDOWN（连 Esc 都不再收窗），而它的
-                // 提示画在设置页那一格里 —— 换页之后提示看不见、按键照旧被吞，
-                // 用户只会觉得"这个键怎么没反应了"。
-                self.capturing = None;
-                if i == 5 {
-                    self.place_search_edit(hwnd);
-                } else {
-                    self.hide_search_edit();
-                }
-                if i == 4 {
-                    self.reload_plugins();
-                }
-                // 进看板页就先问一次库（方案 3.2.3 第一行：切到这一页时查一次）。
-                // 没这一句，第一次点进来看到的是上一次离开时那一页的旧数（或全空）。
-                if i == 6 {
-                    self.reload_board();
-                }
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
+                self.switch_view(hwnd, i);
                 return;
             }
         }
@@ -5991,6 +6282,11 @@ struct ViewState {
     ctl: Option<Ctl>,
     /// 插件视图里指针压着的那一格（行 / 控件）。
     pv_hover: Option<PvTarget>,
+    /// 键盘焦点要画的框（None = 没有焦点或这一帧没算）。
+    kbd_focus: Option<D2D_RECT_F>,
+    /// 指针位置（DIP）与"这一拍该不该出 tooltip"。
+    ptr: (f32, f32),
+    tooltip: bool,
     sel: Option<usize>,
     editing: Option<usize>,
     /// 按下录入开着的那条热键（`settings` 下标）；那一行的值框要改成"请按下组合…"。
@@ -6188,6 +6484,8 @@ fn draw_screen(
     pv_modal: Option<&str>,
     // 插件表格各分组当前选中的记录 id（选中行高亮与 `sel` 按钮都读它）。
     plugin_sel: &HashMap<String, Vec<String>>,
+    // 画的时候顺手记下"指针压着哪个被截断的格子"：提示框与右键复制同源。
+    tip: &mut Option<(String, D2D_RECT_F)>,
 ) {
     let m = 16.0;
 
@@ -6341,12 +6639,12 @@ fn draw_screen(
     }
 
     match vs.view {
-        0..=2 => draw_dashboard(p, w, h, snap, vs),
+        0..=2 => draw_dashboard(p, w, h, snap, vs, tip),
         3 => draw_analytics(p, w, h, snap, vs),
         // 视图 > 详情 > 清单，判断只有一份（[`plugin_page_of`]）。
         4 => match plugin_page_of(plugin_view, plugin_detail, plugins) {
             PluginPage::View(name, view) => {
-                draw_plugin_view(p, w, h, name, view, pv_scroll, plugin_sel, vs.pv_hover);
+                draw_plugin_view(p, w, h, name, view, pv_scroll, plugin_sel, vs, tip);
             }
             PluginPage::Detail(row) => {
                 let detail = focusflow_core::plugins::plugin_health::detail_for(&row.stem);
@@ -6360,7 +6658,7 @@ fn draw_screen(
                     &detail,
                 );
             }
-            PluginPage::List => draw_plugins(p, w, h, plugins, plugin_err, vs),
+            PluginPage::List => draw_plugins(p, w, h, plugins, plugin_err, vs, tip),
         },
         5 => draw_settings(p, w, h, snap, vs, status, busy, filter),
         // 第 7 个页签：内置看板页。它排在 `v => draw_placeholder` 前面是必须的 ——
@@ -6391,6 +6689,61 @@ fn draw_screen(
     if let Some(d) = detail {
         draw_detail(p, w, h, d);
     }
+    // 键盘焦点框压在最上面：两圈 1px 叠成 2px，比单线在浅色底上更看得见。
+    if let Some(r) = vs.kbd_focus {
+        stroke_rect(
+            p,
+            rect(
+                r.left - 2.0,
+                r.top - 2.0,
+                r.right - r.left + 4.0,
+                r.bottom - r.top + 4.0,
+            ),
+            &p.br.accent,
+        );
+        stroke_rect(p, r, &p.br.accent);
+    }
+    if let Some((text, cell)) = tip.as_ref() {
+        draw_tooltip(p, w, h, *cell, text);
+    }
+}
+
+/// 这一格被截断、指针又正好压在上面时，把它记成这一帧的 tooltip 候选。
+fn note_tooltip(
+    tip: &mut Option<(String, D2D_RECT_F)>,
+    vs: ViewState,
+    cell: D2D_RECT_F,
+    full: &str,
+    clipped: bool,
+) {
+    if clipped && tip.is_none() && vs.tooltip && hit(cell, vs.ptr.0, vs.ptr.1) {
+        *tip = Some((full.to_string(), cell));
+    }
+}
+
+/// 一格的小提示：全文、贴在那格下面（下面放不下就翻到上面），不越出窗口。
+fn draw_tooltip(p: &P<'_>, w: f32, h: f32, anchor: D2D_RECT_F, text: &str) {
+    let pad = 8.0;
+    let max_w = (w - 32.0).min(460.0);
+    let measured = p.measure(text, &p.fmt.caption).unwrap_or(max_w);
+    let tw = (measured + pad * 2.0).min(max_w);
+    let th = 26.0;
+    let mut x = anchor.left;
+    if x + tw > w - 12.0 {
+        x = (w - 12.0 - tw).max(12.0);
+    }
+    let mut y = anchor.bottom + 4.0;
+    if y + th > h - 12.0 {
+        y = (anchor.top - 4.0 - th).max(12.0);
+    }
+    let r = rect(x, y, tw, th);
+    p.overlay_card(r, R_CONTROL);
+    p.text(
+        &p.clip(text, &p.fmt.caption, tw - pad * 2.0),
+        rect(x + pad, y + 4.0, tw - pad * 2.0, 18.0),
+        &p.fmt.caption,
+        &p.br.fg,
+    );
 }
 
 /// 1px 方框（最大化/还原图标用）。四边各画一条线，比 `DrawRectangle` 更好控粗细。
@@ -6476,14 +6829,21 @@ fn atab_tabs() -> [D2D_RECT_F; 4] {
 }
 
 /// 排行页：左表。
-fn draw_dashboard(p: &P<'_>, w: f32, h: f32, snap: &Snapshot, vs: ViewState) {
+fn draw_dashboard(
+    p: &P<'_>,
+    w: f32,
+    h: f32,
+    snap: &Snapshot,
+    vs: ViewState,
+    tip: &mut Option<(String, D2D_RECT_F)>,
+) {
     let m = 16.0;
     let left = left_card(w, h);
     let right_x = left.right + 12.0;
     let right_w = w - m - right_x;
     let body_h = left.bottom - left.top;
 
-    draw_table(p, left, snap, vs);
+    draw_table(p, left, snap, vs, tip);
 
     let chart_h = (body_h - 12.0) * 0.55;
     // 排行页右侧那两张小图不接悬停：这一屏的"光标下是什么"归左边那张表（分析页才读
@@ -7845,6 +8205,48 @@ fn pv_target_on(targets: &[PvTarget], clip: D2D_RECT_F, x: f32, y: f32) -> Optio
     targets.iter().copied().find(|t| hit(t.rect, x, y))
 }
 
+/// 键盘能停住的一格：矩形 + 组（0 周期 / 1 页签 / 2 本页）+ 滚动列表里的下标。
+#[derive(Clone, Copy)]
+struct KbdItem {
+    rect: D2D_RECT_F,
+    group: u8,
+    /// `Some` = 这一格在一条可滚动的列表里；键盘移动要把它滚进可见区。
+    list_index: Option<usize>,
+}
+
+/// 键盘焦点下一步落在哪一格。
+///
+/// `same_group` 是上下键：只在同一组里走（列表行之间），到组边界就绕回本组；
+/// Tab 走整张表。抽成纯函数是为了能把"绕回"与"跳过别组"两条都钉住。
+fn kbd_next(groups: &[u8], cur: Option<usize>, delta: isize, same_group: bool) -> Option<usize> {
+    if groups.is_empty() {
+        return None;
+    }
+    let n = groups.len();
+    let Some(i) = cur.filter(|i| *i < n) else {
+        if delta < 0 {
+            return Some(n - 1);
+        }
+        if same_group {
+            // 上下键从"本页"开始：从周期药丸起步的话，第一下 Down 会去改周期。
+            return groups.iter().position(|g| *g == 2);
+        }
+        return Some(0);
+    };
+    if !same_group {
+        return Some((i as isize + delta).rem_euclid(n as isize) as usize);
+    }
+    let g = groups[i];
+    let mut j = i as isize;
+    for _ in 0..n {
+        j = (j + delta).rem_euclid(n as isize);
+        if groups[j as usize] == g {
+            return Some(j as usize);
+        }
+    }
+    Some(i)
+}
+
 /// 这一条滚动条管的是哪一页（拖动松手前只改它自己的偏移）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScrollLane {
@@ -8372,14 +8774,15 @@ fn draw_plugin_view(
     view: &focusflow_core::plugins::PluginView,
     scroll: i32,
     plugin_sel: &HashMap<String, Vec<String>>,
-    hover: Option<PvTarget>,
+    vs: ViewState,
+    tip: &mut Option<(String, D2D_RECT_F)>,
 ) -> D2D_RECT_F {
     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
     p.card(card, R_CARD);
 
     let back = rect(card.left + 16.0, card.top + 12.0, 64.0, 24.0);
     p.round(back, R_CONTROL, &p.br.header, Some(&p.br.border));
-    if hover.is_some_and(|h| h.rect == back) {
+    if vs.pv_hover.is_some_and(|h| h.rect == back) {
         p.round(back, R_CONTROL, &p.br.hover, None);
     }
     p.text("← 返回", back, &p.fmt.center_small, &p.br.fg);
@@ -8417,7 +8820,7 @@ fn draw_plugin_view(
         plugin_sel,
     );
     // 行悬停铺在内容底下：叠在字上会把插件自己写的文字染成另一档颜色。
-    if let Some(h) = hover.filter(|h| h.row) {
+    if let Some(h) = vs.pv_hover.filter(|h| h.row) {
         p.fill(h.rect, &p.br.row_hover);
     }
     for op in &ops {
@@ -8597,18 +9000,16 @@ fn draw_plugin_view(
                         p.round(rr, R_MICRO, &p.br.accent_soft, Some(&p.br.accent));
                     }
                     let ink = &p.br.fg;
-                    for (ci, cell) in row.iter().enumerate().take(cols) {
-                        p.text(
-                            &p.clip(cell, &p.fmt.small, cw - 12.0),
-                            rect(
-                                rr.left + 6.0 + ci as f32 * cw,
-                                rr.top + 2.0,
-                                cw - 12.0,
-                                16.0,
-                            ),
-                            &p.fmt.small,
-                            ink,
+                    for (ci, text) in row.iter().enumerate().take(cols) {
+                        let cell_rect = rect(
+                            rr.left + 6.0 + ci as f32 * cw,
+                            rr.top + 2.0,
+                            cw - 12.0,
+                            16.0,
                         );
+                        let clipped = p.clip(text, &p.fmt.small, cw - 12.0);
+                        note_tooltip(tip, vs, cell_rect, text, clipped != text.as_str());
+                        p.text(&clipped, cell_rect, &p.fmt.small, ink);
                     }
                 }
                 // 行内操作按钮
@@ -8632,7 +9033,7 @@ fn draw_plugin_view(
     }
     // 控件（按钮/下拉/输入框/行内按钮）的悬停叠在最上面：它们本身就是实底色，
     // 铺在底下看不出来。用圆角半透明色，形状与画它们时那一档一致。
-    if let Some(h) = hover.filter(|h| !h.row) {
+    if let Some(h) = vs.pv_hover.filter(|h| !h.row) {
         p.round(h.rect, R_CONTROL, &p.br.hover, None);
     }
     // 正文的滚动条：从前这一页能滚但屏上没有任何指示。
@@ -9330,7 +9731,15 @@ fn uninstall_line(
     }
 }
 
-fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>, vs: ViewState) {
+fn draw_plugins(
+    p: &P<'_>,
+    w: f32,
+    h: f32,
+    rows: &[PluginRow],
+    err: Option<&str>,
+    vs: ViewState,
+    tip: &mut Option<(String, D2D_RECT_F)>,
+) {
     let card = rect(16.0, 208.0, w - 32.0, h - 208.0 - 16.0);
     p.card(card, R_CARD);
     p.text(
@@ -9422,14 +9831,10 @@ fn draw_plugins(p: &P<'_>, w: f32, h: f32, rows: &[PluginRow], err: Option<&str>
         } else if vs.hover == Some(idx) {
             p.fill(r, &p.br.row_hover);
         }
-        p.text(
-            // 名字与"版本 · 作者"都是插件自己写的，两格又都定宽（240 / 260），
-            // 后一格从 r.left + 250 起画 ⇒ 不夹就是两句叠成一片乱码。
-            &p.clip(&row.name, &p.fmt.body, 240.0),
-            rect(r.left + 8.0, y + 5.0, 240.0, 18.0),
-            &p.fmt.body,
-            &p.br.fg,
-        );
+        let name_cell = rect(r.left + 8.0, y + 5.0, 240.0, 18.0);
+        let clipped = p.clip(&row.name, &p.fmt.body, 240.0);
+        note_tooltip(tip, vs, name_cell, &row.name, clipped != row.name);
+        p.text(&clipped, name_cell, &p.fmt.body, &p.br.fg);
         p.text(
             &p.clip(
                 &format!("v{} · {}", row.version, row.author),
@@ -10859,7 +11264,13 @@ fn export_csv_text(s: &Snapshot) -> String {
     out
 }
 
-fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
+fn draw_table(
+    p: &P<'_>,
+    r: D2D_RECT_F,
+    snap: &Snapshot,
+    vs: ViewState,
+    tip: &mut Option<(String, D2D_RECT_F)>,
+) {
     p.card(r, R_CARD);
     let g = table_geom(r);
     let tab = vs.view.min(2);
@@ -11129,16 +11540,10 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
                         Some(&p.br.accent),
                     );
                 } else {
-                    p.text(
-                        // 这一列窄窗口只有 ~200 px，而两路名字都能到 24~41 个字符：
-                        // 用户别名上限 `MAX_ALIAS_CHARS = 24`（汉字 24 个 ≈ 324 px），
-                        // 没别名时 `fallback_device_name` 把长机器串截到 40 字符 + "…"。
-                        // 这块 UI 不按矩形裁切 ⇒ 不夹就一路画过「类型」「次数」和两颗按钮。
-                        &p.clip(&d.name, &p.fmt.table_name, device_name_width(&g)),
-                        rect(g.x_name, y + 3.0, device_name_width(&g), 18.0),
-                        &p.fmt.table_name,
-                        &p.br.fg,
-                    );
+                    let cell = rect(g.x_name, y + 3.0, device_name_width(&g), 18.0);
+                    let clipped = p.clip(&d.name, &p.fmt.table_name, device_name_width(&g));
+                    note_tooltip(tip, vs, cell, &d.name, clipped != d.name);
+                    p.text(&clipped, cell, &p.fmt.table_name, &p.br.fg);
                 }
                 let kind = match d.kind.as_str() {
                     "mouse" => "鼠标",
@@ -11181,14 +11586,12 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
             1 => {
                 let (app, secs) = &snap.apps[idx];
                 let share = share_text(*secs, snap.app_total);
-                p.text(
-                    // 应用名是库里原样存的，长度没有上限；这一格不夹就会一路画进右边的时长列
-                    // （设备详情那一列已经这么夹了，看板卡片也是）。
-                    &p.clip(app, &p.fmt.table_name, name_col_width(&g)),
-                    rect(g.x_name, y + 3.0, name_col_width(&g), 18.0),
-                    &p.fmt.table_name,
-                    &p.br.fg,
-                );
+                // 应用名是库里原样存的，长度没有上限；这一格不夹就会一路画进右边的时长列
+                // （设备详情那一列已经这么夹了，看板卡片也是）。
+                let cell = rect(g.x_name, y + 3.0, name_col_width(&g), 18.0);
+                let clipped = p.clip(app, &p.fmt.table_name, name_col_width(&g));
+                note_tooltip(tip, vs, cell, app, clipped != app.as_str());
+                p.text(&clipped, cell, &p.fmt.table_name, &p.br.fg);
                 p.text(
                     &duration_text(*secs),
                     rect(g.x_count_right - NUM_COL_W, y + 4.0, NUM_COL_W, 18.0),
@@ -11230,13 +11633,11 @@ fn draw_table(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, vs: ViewState) {
             _ => {
                 let (key, n) = &snap.rank[idx];
                 let share = share_text(*n, snap.rank_share_base());
-                p.text(
-                    // 键名与设备名同一条：旧库导入进来的名字可以很长，夹到这一列里。
-                    &p.clip(key, &p.fmt.table_name, name_col_width(&g)),
-                    rect(g.x_name, y + 3.0, name_col_width(&g), 18.0),
-                    &p.fmt.table_name,
-                    &p.br.fg,
-                );
+                // 键名与设备名同一条：旧库导入进来的名字可以很长，夹到这一列里。
+                let cell = rect(g.x_name, y + 3.0, name_col_width(&g), 18.0);
+                let clipped = p.clip(key, &p.fmt.table_name, name_col_width(&g));
+                note_tooltip(tip, vs, cell, key, clipped != key.as_str());
+                p.text(&clipped, cell, &p.fmt.table_name, &p.br.fg);
                 p.text(
                     &thousands((*n).max(0) as u64),
                     rect(g.x_count_right - NUM_COL_W, y + 4.0, NUM_COL_W, 18.0),
@@ -13030,6 +13431,59 @@ unsafe fn app_ptr(hwnd: HWND) -> Option<&'static mut App> {
     }
 }
 
+/// 把一段文字放进剪贴板（CF_UNICODETEXT）。
+///
+/// 与截图那一路同一条规矩：**先备料、后开窗** —— 分配失败时不能先把用户原来的
+/// 剪贴板内容清掉。占用重试 5×50ms，失败就把错误说出来，别假装复制成功。
+fn copy_text_to_clipboard(hwnd: HWND, text: &str) -> std::result::Result<(), String> {
+    use windows::Win32::Foundation::{GlobalFree, HANDLE};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+
+    /// WinUser.h: `#define CF_UNICODETEXT 13`（windows-rs 没导出这个名字）。
+    const CF_UNICODETEXT: u32 = 13;
+
+    let mut bytes: Vec<u8> = Vec::new();
+    for u in text.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[0, 0]);
+
+    unsafe {
+        let hg = GlobalAlloc(GMEM_MOVEABLE, bytes.len())
+            .map_err(|e| format!("分配剪贴板内存失败：{e}"))?;
+        let dst = GlobalLock(hg);
+        if dst.is_null() {
+            let _ = GlobalFree(Some(hg));
+            return Err("GlobalLock 返回空指针".to_string());
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+        // 锁计数归零时 GlobalUnlock 返回 0，windows 会把它翻成 Err —— 那不是失败。
+        let _ = GlobalUnlock(hg);
+
+        for attempt in 1..=5u32 {
+            match OpenClipboard(Some(hwnd)) {
+                Ok(()) => {
+                    let _ = EmptyClipboard();
+                    let r = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hg.0)));
+                    let _ = CloseClipboard();
+                    return r.map(|_| ()).map_err(|e| format!("写入剪贴板失败：{e}"));
+                }
+                Err(_) if attempt < 5 => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    let _ = GlobalFree(Some(hg));
+                    return Err(format!("剪贴板被其它程序占用（重试 5 次）：{e}"));
+                }
+            }
+        }
+    }
+    Err("剪贴板写入失败".to_string())
+}
+
 /// 行内 EDIT 的顶层宿主窗：画主题底 + 一圈描边，真正的 EDIT 是它的子窗口。
 ///
 /// 主窗走 DirectComposition 合成，挂在主窗下面的子窗口会被那层合成内容盖住
@@ -13848,6 +14302,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
+                // 同一个悬停目标停满一小会儿才出 tooltip：扫过去的鼠标不该每次弹框。
+                if !app.tooltip_ready
+                    && app.ctl.is_some()
+                    && app.hover_since.elapsed() >= std::time::Duration::from_millis(600)
+                {
+                    app.tooltip_ready = true;
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
             }
             // 验收模式（FOCUSFLOW_ACCEPTANCE=1）下每秒写一行机器可读的状态：
             // 脚本不用 OCR 就能断言「今日涨了几个」「暂停期间有没有停」。
@@ -14084,6 +14548,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
         WM_MOUSELEAVE_MSG => {
             if let Some(app) = unsafe { app_ptr(hwnd) } {
+                app.tooltip_ready = false;
+                app.tooltip_text = None;
                 if app.hover.take().is_some()
                     | app.ctl.take().is_some()
                     | app.pv_hover.take().is_some()
@@ -14140,6 +14606,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             // 捕获被别人拿走（切窗、弹系统框）：拖动到此为止，别拿旧轨道继续换算。
             if let Some(app) = unsafe { app_ptr(hwnd) } {
                 app.end_scroll_drag();
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            // 右键压在"被截断的那一格"上 = 复制它的全文（提示框里看到什么就复制什么）。
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                if let Some(text) = app.tooltip_text.clone() {
+                    match copy_text_to_clipboard(hwnd, &text) {
+                        Ok(()) => app.status = Some(format!("已复制：{text}")),
+                        Err(e) => app.status = Some(format!("复制失败：{e}")),
+                    }
+                    tracing_note(app.status.as_deref().unwrap_or(""));
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -14389,7 +14871,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             if handled {
                 return LRESULT(0);
             }
-            // Esc：先关弹层；没有弹层就收进托盘（与现有版本同一口径）。
+            // Ctrl+F：切到设置页并聚焦搜索框（任何一个页面都能按）。
+            let ctrl = (unsafe { GetKeyState(0x11) } as u16 & 0x8000) != 0;
+            if ctrl && w.0 == 0x46 {
+                if let Some(app) = unsafe { app_ptr(hwnd) } {
+                    app.focus_search(hwnd);
+                }
+                return LRESULT(0);
+            }
+            // Tab / 上下 / 左右 / Enter：焦点在页面里走，弹层开着时不接。
+            let nav = unsafe {
+                match app_ptr(hwnd) {
+                    Some(app) => app.handle_nav_key(hwnd, w.0),
+                    None => false,
+                }
+            };
+            if nav {
+                return LRESULT(0);
+            }
+            // Esc：先关弹层；再撤键盘焦点；都没有才收进托盘（与现有版本同一口径）。
             if w.0 == 0x1B {
                 if let Some(app) = unsafe { app_ptr(hwnd) } {
                     if app.detail.is_some() {
@@ -14439,6 +14939,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                             unsafe {
                                 let _ = InvalidateRect(Some(hwnd), None, false);
                             }
+                        }
+                    } else if app.kbd_focus.take().is_some() {
+                        // 有键盘焦点时先撤焦点（弹层都关完了才轮到这一档），不直接藏进托盘。
+                        app.tooltip_ready = false;
+                        app.tooltip_text = None;
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     } else if app.edit_target.is_none() {
                         hide_to_tray(app, hwnd);
@@ -16176,7 +16683,9 @@ mod hotkey_tests {
             .collect();
         let needle = "self.view=i;self.scroll=0;self.sel=None;self.hover=None;\
              self.heat_hover=None;self.chart_hover=None;self.pv_select=None;\
-             self.pv_modal=None;self.pv_hover=None;self.cleanup_confirm=false;self.capturing=None;"
+             self.pv_modal=None;self.pv_hover=None;self.cleanup_confirm=false;\
+             self.kbd_focus=None;self.tooltip_ready=false;self.tooltip_text=None;\
+             self.capturing=None;"
             .replace(" ", "");
         assert_eq!(
             flat.matches(needle.as_str()).count(),
@@ -19407,11 +19916,11 @@ mod clip_tests {
             .replace(",)", ")");
         for (needle, want) in [
             // 设备名：夹取与画它的那一格都用 device_name_width(&g)
-            ("p.clip(&d.name,&p.fmt.table_name,device_name_width(&g)),rect(g.x_name,y+3.0,device_name_width(&g),18.0)", 1),
+            ("letcell=rect(g.x_name,y+3.0,device_name_width(&g),18.0);letclipped=p.clip(&d.name,&p.fmt.table_name,device_name_width(&g));", 1),
             // 页脚那句：同一个 r.right-r.left-g.pad*2.0
             ("p.clip(&table_footer_text(snap,lane,tab),&p.fmt.caption,r.right-r.left-g.pad*2.0),rect(r.left+g.pad,foot_y,r.right-r.left-g.pad*2.0,16.0)", 1),
             // 插件名那一格是定宽 240，后面 10 px 就是"版本 · 作者"
-            ("p.clip(&row.name,&p.fmt.body,240.0),rect(r.left+8.0,y+5.0,240.0,18.0)", 1),
+            ("letname_cell=rect(r.left+8.0,y+5.0,240.0,18.0);letclipped=p.clip(&row.name,&p.fmt.body,240.0);", 1),
             // ⚠ 压平空白也会压掉**字符串字面量里面**的空格，所以这一针里的 `v{}·{}`
             // 与源码里的 `v{} · {}` 是同一个东西 —— 别照着源码补空格。
             ("p.clip(&format!(\"v{}·{}\",row.version,row.author),&p.fmt.caption,260.0),rect(r.left+250.0,y+7.0,260.0,16.0)", 1),
@@ -19462,7 +19971,7 @@ mod clip_tests {
                 1,
             ),
             ("p.clip(htxt,&p.fmt.caption,cw-12.0),rect(r.left+6.0+iasf32*cw,r.top+4.0,cw-12.0,16.0)", 1),
-            ("p.clip(cell,&p.fmt.small,cw-12.0),rect(rr.left+6.0+ciasf32*cw,rr.top+2.0,cw-12.0,16.0)", 1),
+            ("letcell_rect=rect(rr.left+6.0+ciasf32*cw,rr.top+2.0,cw-12.0,16.0);letclipped=p.clip(text,&p.fmt.small,cw-12.0);", 1),
             // 下拉菜单的每一项：选项文字是插件给的（分类名可以很长）
             ("p.clip(label,&p.fmt.caption,ir.right-ir.left-12.0),rect(ir.left+6.0,ir.top+3.0,ir.right-ir.left-12.0,18.0)", 1),
             ("p.clip(&f.label,&p.fmt.caption,136.0),rect(row.left,row.top+7.0,136.0,18.0)", 1),
@@ -19474,11 +19983,11 @@ mod clip_tests {
             ("&p.fmt.text12,note_w)", 4),
             // 键名/应用名是库里的原文，长度没有上限：与设备名同一把夹取尺子
             (
-                "p.clip(app,&p.fmt.table_name,name_col_width(&g)),rect(g.x_name,y+3.0,name_col_width(&g),18.0)",
+                "letcell=rect(g.x_name,y+3.0,name_col_width(&g),18.0);letclipped=p.clip(app,&p.fmt.table_name,name_col_width(&g));",
                 1,
             ),
             (
-                "p.clip(key,&p.fmt.table_name,name_col_width(&g)),rect(g.x_name,y+3.0,name_col_width(&g),18.0)",
+                "letcell=rect(g.x_name,y+3.0,name_col_width(&g),18.0);letclipped=p.clip(key,&p.fmt.table_name,name_col_width(&g));",
                 1,
             ),
             // 趋势图横轴起点：60 px 那一格吃的是库里的日期串
@@ -19601,11 +20110,11 @@ mod clip_tests {
                 "{name} 这一拍没有重摆搜索框的输入窗口：拖大窗口或最大化之后点它没反应"
             );
         }
-        // 摆位一共五处：进设置页那一下、WM_SIZE、拖拽结束、点搜索框叫出输入层、
-        // 焦点递回来那一下。多一处少一处都要红。
+        // 摆位一共六处：进设置页那一下、WM_SIZE、拖拽结束、点搜索框叫出输入层、
+        // 焦点递回来那一下、Ctrl+F 那一下。多一处少一处都要红。
         assert_eq!(
             prod.matches("place_search_edit(hwnd)").count(),
-            5,
+            6,
             "搜索框的摆位调用点数变了"
         );
     }
@@ -22028,5 +22537,54 @@ mod ux_polish_tests {
             pv_target_on(&targets, clip, -50.0, 10.0).is_none(),
             "可见区之外不该亮"
         );
+    }
+
+    /// 键盘焦点：Tab 走整张表，上下键只在同组里绕。
+    #[test]
+    fn keyboard_focus_moves_inside_a_group_or_across_the_whole_page() {
+        let groups = [0u8, 0, 1, 2, 2, 2];
+        assert_eq!(kbd_next(&groups, None, 1, false), Some(0));
+        assert_eq!(kbd_next(&groups, None, -1, false), Some(5));
+        assert_eq!(
+            kbd_next(&groups, None, 1, true),
+            Some(3),
+            "上下键从本页开始，不从周期药丸开始"
+        );
+        assert_eq!(
+            kbd_next(&[0u8, 1], None, 1, true),
+            None,
+            "本页没有可停的格子时上下键什么都不做"
+        );
+        assert_eq!(
+            kbd_next(&groups, Some(5), 1, false),
+            Some(0),
+            "Tab 绕回开头"
+        );
+        assert_eq!(kbd_next(&groups, Some(0), -1, false), Some(5));
+        assert_eq!(kbd_next(&groups, Some(0), -1, true), Some(1), "本组绕回");
+        assert_eq!(kbd_next(&groups, Some(3), 1, true), Some(4));
+        assert_eq!(
+            kbd_next(&groups, Some(5), 1, true),
+            Some(3),
+            "列表末行绕回本组首行"
+        );
+        assert_eq!(kbd_next(&groups, Some(2), 1, true), Some(2), "组里只有一格");
+        assert_eq!(kbd_next(&[], None, 1, false), None);
+    }
+
+    /// 键盘与右键复制的接线：光有函数名不算，得真的挂在消息循环上。
+    #[test]
+    fn keyboard_and_copy_are_wired_to_the_message_loop() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        for needle in [
+            "app.handle_nav_key(hwnd, w.0)",
+            "app.focus_search(hwnd)",
+            "copy_text_to_clipboard(hwnd, &text)",
+            "note_tooltip(tip, vs, name_cell, &row.name, clipped != row.name)",
+            "draw_tooltip(p, w, h, *cell, text)",
+        ] {
+            assert!(prod.contains(needle), "缺 {needle}");
+        }
     }
 }
