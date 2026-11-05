@@ -554,8 +554,10 @@ pub fn get_edge_history_counts(days: i64) -> Result<Vec<(String, i64)>, String> 
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         })
         .map_err(|e| format!("查询趋势失败: {e}"))?
-        .flatten()
-        .collect();
+        // 行本身读不出（被外部改过类型、库结构对不上）不能 `.flatten()` 丢掉：
+        // 那天会补成 0，整窗都坏时还退化成「从没刷过」—— 正是上面说的两种结局被折成一种。
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("趋势行里有读不出的值: {e}"))?;
     if saved.is_empty() {
         return Ok(Vec::new());
     }
@@ -943,8 +945,10 @@ fn saved_rows_since(start: NaiveDate) -> Result<std::collections::HashMap<String
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         })
         .map_err(|e| format!("查询补档判据失败: {e}"))?
-        .flatten()
-        .collect();
+        // 同 `get_edge_history_counts`：读不出的行不许被当成"这天没刷过"，否则
+        // `stale_days_before` 会永远重补那一天，而界面上只看得到"一直在刷新"。
+        .collect::<Result<std::collections::HashMap<String, i64>, _>>()
+        .map_err(|e| format!("补档判据里有读不出的值: {e}"))?;
     Ok(rows)
 }
 
@@ -2111,6 +2115,51 @@ mod tests {
         assert!(
             problem.contains("打开本地缓存库失败"),
             "错误要说清是哪一步读不动: {problem}"
+        );
+    }
+
+    /// 一行本身读不出（被外部改成别的类型）也不能当成"这天是 0 / 没刷过"：
+    /// 那会把"缓存坏了"重新折成一张正常的历史表。改前 `.flatten()` 会悄悄丢掉这一行。
+    #[test]
+    fn a_row_with_an_unreadable_value_is_not_zero_filled() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("edge_bad_row");
+        let today = Local::now().date_naive();
+        save_edge_history_count(today, 7).unwrap();
+        {
+            let conn = Connection::open(edge_db_path()).expect("缓存库应能打开");
+            conn.execute(
+                "UPDATE edge_history SET count='not-a-number' WHERE date=?1",
+                [today.format("%Y-%m-%d").to_string()],
+            )
+            .expect("SQLite 允许把文本落进 INTEGER 列");
+        }
+        let got = get_edge_history_counts(30);
+        assert!(
+            got.is_err(),
+            "这一行读不出可信数值就必须报读不动，不能补成 0: {got:?}"
+        );
+    }
+
+    /// 补档判据同理：读不出的 `updated_at` 不能被当成"这天还没刷过"，
+    /// 否则那一天会在每一轮刷新里被反复重补，而界面上看不出任何异常。
+    #[test]
+    fn a_row_with_an_unreadable_stamp_is_not_a_pending_day() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("edge_bad_stamp");
+        let today = Local::now().date_naive();
+        save_edge_history_count(today, 7).unwrap();
+        {
+            let conn = Connection::open(edge_db_path()).expect("缓存库应能打开");
+            conn.execute(
+                "UPDATE edge_history SET updated_at='not-a-number' WHERE date=?1",
+                [today.format("%Y-%m-%d").to_string()],
+            )
+            .expect("SQLite 允许把文本落进 INTEGER 列");
+        }
+        assert!(
+            saved_rows_since(today - chrono::Days::new(29)).is_err(),
+            "读不出补档判据时要报读不动，别把这一天重新挑出来补档"
         );
     }
 
