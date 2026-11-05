@@ -2219,7 +2219,7 @@ pub fn backup_database(max_backups: i64) -> BackupOutcome {
         }
     }
     // 附属库同样纳入备份与轮转（命名沿用 focusflow_{组名}_{时间戳}.db，
-    // rotate_backups 按第一段分组，"accounting" 等名称各自成组）。
+    // rotate_backups 按**整段库名**分组，"edge_history" 这种带下划线的名字各自成组）。
     // 已停用插件的数据默认跳过：其库不再被写入，备份它只会白占轮转名额。
     let config = crate::config::instance();
     let disabled = disabled_plugin_stems(config);
@@ -2877,6 +2877,23 @@ impl RetentionPolicy {
     }
 }
 
+/// 一份库备份的轮转分组键：`focusflow_<组>_<YYYYMMDD>_<HHMMSS[mmm]>.db` 去掉首尾与尾部时间戳。
+///
+/// 不能按第一段分组：`edge_history` 与 `edge_visits` 的第一段都是 `edge`，两个库共用
+/// 一套保留名额，一个库的轮转能把另一个库仅存的恢复点删掉。与 [`state_backup_group`]
+/// 同一条口径：认不出这个形状交 `None`，宁可这一份不参与轮转，也不要认成别的库的组。
+fn backup_group(stem: &str) -> Option<String> {
+    let parts: Vec<&str> = stem.split('_').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let is_num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !(is_num(parts[parts.len() - 2]) && is_num(parts[parts.len() - 1])) {
+        return None;
+    }
+    Some(parts[..parts.len() - 2].join("_"))
+}
+
 /// 从备份文件名解析日期（`focusflow_{组}_{YYYYMMDD}_{HHMMSS[mmm]}.db`），
 /// 解析失败回退文件修改时间。
 fn backup_file_date(path: &Path) -> Option<NaiveDate> {
@@ -2954,13 +2971,6 @@ fn select_retained(files: &[std::path::PathBuf], policy: RetentionPolicy) -> Vec
     keep
 }
 
-/// 按保留策略清理每组的旧备份（同时删掉其 `-wal`/`-shm`）。
-///
-/// `freeze = true` 时**本次不删任何文件**：异常体检发现数据可疑时用它兜底，
-/// 宁可多留旧备份，也不让坏数据把干净的历史顶掉。
-/// 分组键取文件名第一段（`focusflow_2026_…` → "2026"，`focusflow_accounting_…`
-/// → "accounting"）。此前按第二段分组取到的是日期，每天自成一组导致轮转
-/// 永远删不到旧日期的备份，backup/ 目录无限增长。
 /// backup/ 下现存的异常说明文件，按文件名升序（文件名里的时间戳是
 /// `%Y%m%d_%H%M%S%3f`，字典序即时间序）。
 fn suspect_notes() -> Vec<std::path::PathBuf> {
@@ -3023,6 +3033,13 @@ fn rotate_suspect_notes() {
     }
 }
 
+/// 按保留策略清理每组的旧备份（同时删掉其 `-wal`/`-shm`）。
+///
+/// `freeze = true` 时**本次不删任何文件**：异常体检发现数据可疑时用它兜底，
+/// 宁可多留旧备份，也不让坏数据把干净的历史顶掉。
+/// 分组键是去掉尾部时间戳的整段库名（见 [`backup_group`]）：`focusflow_2026_…` →
+/// "2026"、`focusflow_edge_history_…` → "edge_history"。此前按第二段分组取到的是日期，
+/// 每天自成一组导致轮转永远删不到旧日期的备份，backup/ 目录无限增长。
 fn rotate_backups(policy: RetentionPolicy, freeze: bool) {
     rotate_suspect_notes();
     let mut groups: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
@@ -3046,9 +3063,11 @@ fn rotate_backups(policy: RetentionPolicy, freeze: bool) {
             .strip_prefix("focusflow_")
             .and_then(|s| s.strip_suffix(".db"))
         {
-            let parts: Vec<&str> = stem.split('_').collect();
-            if parts.len() >= 3 {
-                let group = parts[0].to_string();
+            // 分组键是**去掉尾部时间戳的整段库名**，不是第一段：`edge_history` 与
+            // `edge_visits` 同属 `edge_*`，按第一段分组会让两个库共用一套保留名额，
+            // 一个库的轮转能把另一个库仅存的恢复点删掉。时间戳是 `%Y%m%d_%H%M%S[mmm]`，
+            // 尾部两段一定是数字；认不出这个形状就不参与轮转（与 `state_backup_group` 同口径）。
+            if let Some(group) = backup_group(stem) {
                 groups.entry(group).or_default().push(entry.path());
             }
         }
@@ -4360,7 +4379,7 @@ mod tests {
     /// 超出保留数删除最旧的。回归：旧实现按第二段（日期）分组，
     /// 每天自成一组导致轮转永远删不到旧备份，backup/ 无限增长。
     #[test]
-    fn rotate_groups_by_first_segment() {
+    fn rotate_groups_by_database_not_by_date() {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("rotate");
         std::fs::create_dir_all(paths::backup_dir()).unwrap();
@@ -4401,6 +4420,84 @@ mod tests {
         assert!(
             !remaining.contains(&"focusflow_accounting_20260911_100000.db".to_string()),
             "accounting 组最旧备份应被删除"
+        );
+    }
+
+    /// 组名带下划线的两个库不能被并成一组：`edge_history` 与 `edge_visits` 的第一段
+    /// 都是 `edge`，按第一段分组时四个文件共用一个"最近 N 份"名额，一个库的轮转
+    /// 会把另一个库仅存的那份恢复点删掉（本轮之前就是这样）。
+    #[test]
+    fn rotate_keeps_lookalike_prefixes_apart() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("rotate_prefix");
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+
+        let names = [
+            "focusflow_edge_history_20260911_100000.db",
+            "focusflow_edge_history_20260912_100000.db",
+            "focusflow_edge_visits_20260911_100000.db",
+            "focusflow_edge_visits_20260912_100000.db",
+        ];
+        for name in names {
+            std::fs::write(paths::backup_dir().join(name), b"x").unwrap();
+        }
+
+        rotate_backups(
+            RetentionPolicy {
+                recent: 1,
+                daily: 0,
+                weekly: 0,
+                monthly: 0,
+            },
+            false,
+        );
+
+        let remaining: Vec<String> = std::fs::read_dir(paths::backup_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(remaining.len(), 2, "两个库各留最近一份：{remaining:?}");
+        for keep in [
+            "focusflow_edge_history_20260912_100000.db",
+            "focusflow_edge_visits_20260912_100000.db",
+        ] {
+            assert!(
+                remaining.contains(&keep.to_string()),
+                "{keep} 被另一个库的轮转删掉了：{remaining:?}"
+            );
+        }
+    }
+
+    /// 分组键的形状判据：末尾两段必须是时间戳，且组名里的下划线要原样保留。
+    #[test]
+    fn backup_group_keeps_the_whole_database_name() {
+        assert_eq!(
+            backup_group("2026_20260723_075125"),
+            Some("2026".to_string())
+        );
+        assert_eq!(
+            backup_group("edge_history_20260723_075125"),
+            Some("edge_history".to_string())
+        );
+        assert_eq!(
+            backup_group("edge_visits_20260723_075125123"),
+            Some("edge_visits".to_string()),
+            "毫秒位是时间戳的一部分，不是组名"
+        );
+        assert_eq!(
+            backup_group("accounting_20260723_075125"),
+            Some("accounting".to_string())
+        );
+        assert_eq!(
+            backup_group("20260723_075125"),
+            None,
+            "没有组名就不参与轮转"
+        );
+        assert_eq!(
+            backup_group("edge_history_20260723_notatime"),
+            None,
+            "认不出时间戳的旧文件不参与轮转，绝不认成别的组"
         );
     }
 
