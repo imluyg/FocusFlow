@@ -380,14 +380,15 @@ fn row_from_snippet(s: Snippet) -> Row {
     }
 }
 
-/// 行内文案：图片/文件在预览前加一个类型词，文件再点明失效数。
+/// 行内文案：图片/文件在预览前加一个类型词；文件失效时把失效数放在**行首**，
+/// 否则窄弹窗里右端的省略号会把它吃掉（实测 560 px 宽就看不见了）。
 fn row_label(row: &Row) -> String {
     let text = preview_text(&row.content);
     match row.kind {
         ClipKind::Text => text,
         ClipKind::Image => format!("［图］{text}"),
         ClipKind::File if row.missing_files > 0 => {
-            format!("［件］{text}（{} 个已失效）", row.missing_files)
+            format!("［件·{} 个失效］{text}", row.missing_files)
         }
         ClipKind::File => format!("［件］{text}"),
     }
@@ -1674,5 +1675,36 @@ mod tests {
         assert_eq!(&t[2..3], "-");
         assert_eq!(&t[5..6], " ");
         assert_eq!(&t[8..9], ":");
+    }
+
+    fn label_row(kind: ClipKind, missing: usize) -> Row {
+        Row {
+            id: 1,
+            content: "1 个文件：a.txt".to_string(),
+            name: String::new(),
+            source: String::new(),
+            time: String::new(),
+            pinned: false,
+            kind,
+            image_path: None,
+            file_paths: vec!["C:\\a.txt".to_string()],
+            missing_files: missing,
+        }
+    }
+
+    #[test]
+    fn missing_files_warning_stays_at_the_front() {
+        // 窄弹窗里右端的省略号会吃掉行尾；失效标记必须排在最前面才看得见。
+        let label = row_label(&label_row(ClipKind::File, 1));
+        assert!(label.starts_with("［件·1 个失效］"), "实际是 {label}");
+        assert_eq!(
+            row_label(&label_row(ClipKind::File, 0)),
+            "［件］1 个文件：a.txt"
+        );
+        assert_eq!(
+            row_label(&label_row(ClipKind::Image, 0)),
+            "［图］1 个文件：a.txt"
+        );
+        assert_eq!(row_label(&label_row(ClipKind::Text, 0)), "1 个文件：a.txt");
     }
 }
