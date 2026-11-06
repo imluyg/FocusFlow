@@ -1,0 +1,145 @@
+<#
+.SYNOPSIS
+  Clipboard history v1: an external copy is captured, the global hotkey opens the
+  palette, Enter copies the selected item, and the app's own write is not captured
+  a second time.
+
+.DESCRIPTION
+  One launch against a fresh COPY of desktop-native\probe.
+
+  The suite drives the real path: it sets the system clipboard from PowerShell (an
+  external writer), waits for the app log to say the item was ingested, presses the
+  configured clipboard hotkey with a real chord, finds the palette window, posts
+  Enter to its search EDIT, and then checks two independent things:
+    - the clipboard now holds the selected item (Enter really copied it), and
+    - the app's own write did not add another history row (self-write suppression).
+
+  Every log assertion uses an ASCII tag (`clip_ingest`, `clip_enter`) so this file
+  can stay ASCII-only like the rest of the folder.
+
+  The original clipboard text is restored at the end.
+
+.EXAMPLE
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-clipboard.ps1
+#>
+param(
+    [string]$Exe = '',
+    [string]$WorkDir = ''
+)
+
+. "$PSScriptRoot\accept-lib.ps1"
+
+if (-not $Exe) { $Exe = Get-DefaultExe }
+if (-not $WorkDir) { $WorkDir = Join-Path (Get-RepoRoot) 'target\accept\clipboard' }
+
+$app = Join-Path $WorkDir 'app'
+$logPath = Join-Path $WorkDir 'focusflow.log'
+$older = 'accept-clipboard-older'
+$marker = 'accept-clipboard-marker-1'
+$hotCombo = 'ctrl+shift+f9'
+$hotVk = 0x78
+
+function Get-LogLines {
+    @(Read-AppLog $WorkDir)
+}
+
+function Wait-LogMatch([string]$Pattern, [int]$TimeoutMs = 6000) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        if (@(Get-LogLines | Where-Object { $_ -like $Pattern }).Count -gt 0) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 150
+    }
+    $false
+}
+
+# The clipboard writer may publish the same text more than once (dedupe updates the row
+# instead of adding one). Wait until the ingest line count stops moving before using it
+# as the "before" reading for the self-suppression check.
+function Wait-IngestCountStable([int]$StableMs = 1200, [int]$TimeoutMs = 8000) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    $last = -1
+    $since = Get-Date
+    while ((Get-Date) -lt $deadline) {
+        $n = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest*' }).Count
+        if ($n -ne $last) {
+            $last = $n
+            $since = Get-Date
+        } elseif (((Get-Date) - $since).TotalMilliseconds -ge $StableMs) {
+            return $n
+        }
+        Start-Sleep -Milliseconds 150
+    }
+    return $last
+}
+
+Stop-App $Exe
+New-AppDir $app @('[collector]', 'enabled = false')
+Set-ConfigLine $app 'hotkey' 'clipboard' $hotCombo
+Set-ConfigLine $app 'clipboard' 'enabled' 'true'
+
+$orig = $null
+try { $orig = Get-Clipboard -Raw } catch { }
+
+Remove-Item $logPath -ErrorAction SilentlyContinue
+"exe : $Exe"
+"app : $app  (hotkey=$hotCombo)"
+
+$p = Start-App $Exe $app $WorkDir
+$h = Wait-Window $p.Id
+Check 'main window appears' ($h -ne [IntPtr]::Zero)
+if ($h -eq [IntPtr]::Zero) { Stop-App $Exe; Show-Summary }
+
+Start-Sleep -Milliseconds 2000
+$log = @(Get-LogLines)
+Check 'clipboard hotkey is registered' (@($log | Where-Object { $_ -like "*clipboard = $hotCombo*" }).Count -gt 0)
+
+# Two external copies through the real clipboard: the older one first, the marker last,
+# so the palette's selection starts on the marker and Down can move to the older item.
+Set-Clipboard -Value $older
+Check 'first external copy is captured' (Wait-LogMatch '*clip_ingest*' 6000)
+Start-Sleep -Milliseconds 400
+Set-Clipboard -Value $marker
+Check 'second external copy is captured' (Wait-LogMatch '*clip_ingest*' 6000)
+$before = Wait-IngestCountStable
+
+# The hotkey must toggle ONCE. A press handled twice would leave the palette hidden.
+[FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+Start-Sleep -Milliseconds 900
+$popup = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+Check 'clipboard palette is created' ($popup -gt 0)
+$visible = $false
+if ($popup -gt 0) { $visible = [FF]::IsWindowVisible([IntPtr]$popup) }
+Check 'clipboard palette is visible after the hotkey' $visible
+
+$edit = 0
+if ($popup -gt 0) { $edit = [FF]::ChildByClassHandle($popup, 'Edit') }
+Check 'palette has a search edit' ($edit -gt 0)
+
+if ($edit -gt 0) {
+    # Down selects the second row (the older text); Enter copies that one. If the
+    # palette were still on the marker, the clipboard check below would be a no-op
+    # because the clipboard already held the marker.
+    [FF]::PostMessage([IntPtr]$edit, 0x0100, [IntPtr]0x28, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 150
+    [FF]::PostMessage([IntPtr]$edit, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 900
+}
+$hidden = $true
+if ($popup -gt 0) { $hidden = -not [FF]::IsWindowVisible([IntPtr]$popup) }
+Check 'Enter closes the palette' $hidden
+Check 'Enter reports a successful copy' (Wait-LogMatch '*clip_enter copied=true*' 3000)
+
+$clip = ''
+try { $clip = Get-Clipboard -Raw } catch { }
+Check 'Enter puts the selected (older) item on the clipboard' ($null -ne $clip -and $clip.Trim() -eq $older)
+
+# Give the listener time to see the app's own write; it must be suppressed.
+Start-Sleep -Milliseconds 1000
+$after = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest*' }).Count
+Check 'the app does not capture its own clipboard write' ($after -eq $before)
+
+Stop-App $Exe
+if ($null -ne $orig) { try { Set-Clipboard -Value $orig } catch { } }
+Show-Summary

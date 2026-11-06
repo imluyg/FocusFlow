@@ -149,6 +149,9 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             // 默认键沿用上面那三类避让；不复用 shift+f1 而另起一键，是为了让"松手即提交"
             // 那条老手势一个字节都不必改（叠修饰做分岔既容易撞车又不可发现）。
             ("snip_annotate", "shift+f2"),
+            // 剪贴板历史弹窗。刻意避开 ctrl+shift+v（终端/浏览器的纯文本粘贴）与
+            // alt 组合（菜单加速键）；F 键族与另外三条保持同一种直觉。功能关掉时不注册。
+            ("clipboard", "ctrl+shift+f3"),
         ],
     );
     s("floating", &[("enabled", "true")]);
@@ -162,6 +165,18 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     // ⚠ 这一节的两个键必须写在同一次 `s()` 里：那个 helper 是 `map.insert`，
     // 同一个节名调两次 = 后一次把前一次整节顶掉（`hide_floating` 会当场消失）。
     s("snip", &[("hide_floating", "true"), ("loupe", "true")]);
+    // 剪贴板历史：只收纯文本。`exclude` 是进程名清单（逗号分隔，缺扩展名按 .exe 补）；
+    // 三个隐私格式（应用自己声明"别收"）在运行时另有一层，改这里不会关掉那一层。
+    s(
+        "clipboard",
+        &[
+            ("enabled", "true"),
+            ("max_items", "500"),
+            ("retention_days", "30"),
+            ("max_text_bytes", "16384"),
+            ("exclude", crate::clipboard::DEFAULT_EXCLUDE),
+        ],
+    );
     // 注：`[pin] renderer` 这一档不再写默认值 —— 它与下面 DEPRECATED_CONFIG 里那几行
     // 同一族（旧前端"一张图一个浏览器页面"的选择，原生端只有一套绘制），
     // 全仓零读点却天天落盘，用户改了没反应。老文件里的那一行在 load 时清掉。
@@ -318,7 +333,7 @@ pub(crate) fn parse_ini(text: &str) -> HashMap<String, HashMap<String, String>> 
 /// 直接按 `HashMap` 迭代序排 ⇒ 实测同一份默认配置，重建路给
 /// `app_stats, plugins, device_stats`、逐行重写路给 `app_stats, device_stats, plugins`，
 /// 每跑一次进程都可能换个样子。现在两边都是"清单位置 → 同名兜底"。
-const SECTION_ORDER: [&str; 14] = [
+const SECTION_ORDER: [&str; 15] = [
     "database",
     "stats",
     "paths",
@@ -327,6 +342,7 @@ const SECTION_ORDER: [&str; 14] = [
     "goal",
     "hotkey",
     "snip",
+    "clipboard",
     "floating",
     "pin",
     "pomodoro",

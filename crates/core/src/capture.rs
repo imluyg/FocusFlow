@@ -423,7 +423,8 @@ pub mod win {
         HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
     };
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+        CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard,
+        RegisterClipboardFormatW, SetClipboardData,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
@@ -910,6 +911,9 @@ pub mod win {
                     let result = unsafe {
                         write_formats(&payload, png_fmt.zip(Some(png)), file_bytes.as_deref())
                     };
+                    // 这一笔是程序自己写的（截图复制），剪贴板历史不该把它当成用户复制。
+                    // 序号必须在锁内、Close 之前记：顺序反了监听线程会抢在记录之前入库。
+                    crate::clipboard::note_self_sequence(unsafe { GetClipboardSequenceNumber() });
                     // 无论成败都要关：不关的话其它程序从此读不到剪贴板，症状比本次失败严重得多。
                     if let Err(e) = unsafe { CloseClipboard() } {
                         tracing::warn!("关闭剪贴板失败（本次结果仍按 {result:?} 上报）：{e}");

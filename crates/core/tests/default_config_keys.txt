@@ -3,6 +3,11 @@
 # 发布用的 zip 模板（.scratch/make_zip.sh）拿这份文件做断言。只钉键、不钉值。
 app_stats/enabled
 app_stats/exclude
+clipboard/enabled
+clipboard/exclude
+clipboard/max_items
+clipboard/max_text_bytes
+clipboard/retention_days
 database/auto_vacuum_days
 database/backup_disabled_plugins
 database/backup_on_exit
@@ -18,6 +23,7 @@ gui/floating_metric
 gui/start_to_tray
 gui/theme
 gui/trace_log
+hotkey/clipboard
 hotkey/enabled
 hotkey/snip
 hotkey/snip_annotate

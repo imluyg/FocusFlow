@@ -7,6 +7,7 @@ pub mod accounting;
 pub mod app_stats;
 pub mod autostart;
 pub mod capture;
+pub mod clipboard;
 pub mod config;
 pub mod dashboard;
 pub mod data_location;

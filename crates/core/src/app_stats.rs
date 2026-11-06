@@ -65,7 +65,7 @@ fn load_config(config: &FocusFlowConfig) -> (bool, Vec<String>) {
 /// 不带 `.exe` 的前台进程名（`asktao.mod`、`UninstallTool_x64.dat`、`_unins.tmp`，
 /// 2026-09-27 实测 `dist/FocusFlow/123/data/focusflow_2026.db`）。凡是已经带扩展名的
 /// 一律原样比对 —— 给 `asktao.mod` 再添个 `.exe` 就等于把保险丝换成永远拉不断的那根。
-fn parse_exclude(raw: &str) -> (Vec<String>, Vec<String>) {
+pub(crate) fn parse_exclude(raw: &str) -> (Vec<String>, Vec<String>) {
     let mut names = Vec::new();
     let mut widened = Vec::new();
     for item in raw.split(',').map(|s| s.trim()) {
@@ -87,8 +87,40 @@ fn parse_exclude(raw: &str) -> (Vec<String>, Vec<String>) {
 ///
 /// 「不记录」只覆盖归属这一半：键鼠计数不吃这道闸，边界写在模块头第 3 条。
 /// 把它念成"这个进程的活动一条都不落库"会说反 —— 而这是用户拿来当隐私保险丝用的开关。
-fn is_recordable(name: &str, exclude: &[String]) -> bool {
+pub(crate) fn is_recordable(name: &str, exclude: &[String]) -> bool {
     !exclude.contains(&name.to_ascii_lowercase())
+}
+
+/// 窗口所属进程的 exe 文件名（不读窗口标题，也不读前台窗口）。
+///
+/// 剪贴板模块要的是"剪贴板所有者是谁"，不是"此刻谁在前台"：后台复制或热键复制时，
+/// 前台窗口往往已经换人了，拿前台窗口当来源会把数据记到错误的应用上。
+/// 自身进程返回 `None` —— 程序自己写进剪贴板的文本不该被记成一条用户复制。
+#[cfg(windows)]
+pub(crate) fn window_process_name(hwnd: isize) -> Option<String> {
+    let pid = window_process_id(hwnd)?;
+    if pid == std::process::id() {
+        return None;
+    }
+    // 缓存未命中时 `pid_to_name` 自己会重建快照；这里不必每复制一次都全量重建。
+    collect::pid_to_name(pid, false)
+}
+
+/// 窗口所属进程的 PID。剪贴板模块用它区分"所有者是我们自己"与"认不出来"：
+/// 前者整条丢掉，后者才落一个空来源。
+#[cfg(windows)]
+pub(crate) fn window_process_id(hwnd: isize) -> Option<u32> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+    if hwnd == 0 {
+        return None;
+    }
+    let mut pid: u32 = 0;
+    unsafe {
+        GetWindowThreadProcessId(HWND(hwnd as *mut core::ffi::c_void), Some(&mut pid));
+    }
+    (pid != 0).then_some(pid)
 }
 
 /// PID→进程名快照缓存（采样线程线程本地）。
@@ -299,7 +331,7 @@ mod collect {
     /// 常常是刚启动的（新开的窗口、UWP 的 ApplicationFrameHost 子进程），
     /// 只靠定期刷新会让这些应用在前 30 秒里查不到名字、整段不归属。
     #[cfg(windows)]
-    fn pid_to_name(pid: u32, force_refresh: bool) -> Option<String> {
+    pub(crate) fn pid_to_name(pid: u32, force_refresh: bool) -> Option<String> {
         use std::cell::RefCell;
         thread_local! {
             static SNAPSHOT: RefCell<SnapshotCache> = RefCell::new(SnapshotCache::default());

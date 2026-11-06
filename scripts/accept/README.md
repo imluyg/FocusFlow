@@ -27,6 +27,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-keyboa
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-collect.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-plugins.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-hotkey.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-clipboard.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-datadir.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-plugsel.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-snip.ps1
@@ -50,6 +51,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 | `accept-collect.ps1` | 点 5 下 → 今日 +5、速度 >0 / 暂停后不再涨、速度归 0 / 继续再 +5 / 退出 flush + 退出备份 / core 日志「数据库已关闭」 | 14 项 |
 | `accept-plugins.ps1` | 插件视图：`button.modal` 开弹窗、弹窗与正文的 Select 写回、提交/关闭触发插件动作、Esc 关弹窗 | 16 项 |
 | `accept-hotkey.ps1` | 两轮启动：配置里的三条组合按原样注册（日志逐字对）/ 一条写成裸键时程序照样起、日志点名被拒的那条、没被拒的那条照样注册 | 10 项 |
+| `accept-clipboard.ps1` | 两次外部复制进库（`clip_ingest` 日志）/ 剪贴板热键注册且按一次只开一次弹窗 / 弹窗可见、有搜索框 / **下移一格再回车**，关窗并把旧条目写回剪贴板（`clip_enter copied=true`；旧条目与进入前的剪贴板内容不同，避免自我证明）/ **程序自己写的剪贴板不再记一条**（前后 `clip_ingest` 条数相等）；结束时还原原剪贴板 | 11 项 |
 | `accept-datadir.ps1` | 两轮启动：`[paths]` 里那条待搬运标记由启动早期兑现（data/ 与 backup/ 真到了新根、旧根清空、标记归空、日志点名新根）/ 新根建不出来时数据原地不动、标记留着下次重试 | 13 项 |
 | `accept-plugsel.ps1` | 自带一份 ASCII 小插件（分组表格 + `onselect` + `sel` 按钮 + 两条分页条）：Lua 里的 ids/group/onselect 真的走到宿主、选中写了声明的那个字段、`sel` 按钮拼出 `<按钮 id><记录 id>`、分页条的「下一页」点得到而首页的「上一页」是禁用的；**表格下面**那条分页条也点得到（记账本就是这顺序，表格从前会把它的点击吞掉） | 17 项 |
 | `accept-snip.ps1` | 用真注入的鼠标跑三条截图手势：拖框后快速版落 PNG / 标注版开窗不落盘、Esc 关掉；**单击选中光标下那个别人的窗口**（夹具是本脚本自己的一个 Form，产品必须排掉自己进程，选错了 PNG 尺寸就对不上）；**覆盖层挂满三分钟自己退**（这一条真等，见坑 7） | 21 项（含一条 180 秒的等待） |

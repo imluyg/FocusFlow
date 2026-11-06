@@ -7,6 +7,7 @@
 //!
 //! 滚动容器、六个视图、截图覆盖层与贴图都已做完；剩下的缺口清单在
 //! `docs/handoff-native-migration.md`。
+mod clipboard_popup;
 mod collect;
 mod dashboard;
 mod data;
@@ -32,7 +33,7 @@ use crate::floating_render::fmt_duration as duration_text;
 use focusflow_core::format::{csv_field, html_escape};
 
 use global_hotkey::hotkey::HotKey;
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::*;
@@ -976,6 +977,13 @@ struct App {
     snip_hk: Option<HotKey>,
     /// 标注截图热键（`[hotkey] snip_annotate`）：选区后进标注窗，而 `snip` 是松手即存。
     snip_annotate_hk: Option<HotKey>,
+    /// 剪贴板历史弹窗热键（`[hotkey] clipboard`）。剪贴板功能关掉时不注册。
+    clipboard_hk: Option<HotKey>,
+    /// 剪贴板监听线程交件的收件口与句柄；None = 库打不开或线程没起来。
+    clip_rx: Option<std::sync::mpsc::Receiver<focusflow_core::clipboard::Captured>>,
+    /// 只为持有监听线程：`Drop` 时 `PostMessage(WM_CLOSE)` 并 join，进程退出前把隐藏窗口收掉。
+    #[allow(dead_code)]
+    clip_watcher: Option<focusflow_core::clipboard::Watcher>,
     /// 系统材质贴上了（Win11 Mica）。
     mica: bool,
     /// 现在真的走合成路径（透明/玻璃）。只有 `mica` 且合成成功才为 true。
@@ -1111,6 +1119,8 @@ struct App {
     edit_bg_color: COLORREF,
     /// 托盘里的「暂停采集」勾选项：状态变化时要把勾一起改掉。
     pause_item: Option<CheckMenuItem>,
+    /// 托盘里"记录剪贴板"那一项的勾选态（与 `[clipboard] enabled` 同源）。
+    clipboard_item: Option<CheckMenuItem>,
     /// 上一次画出来的「次/分」：100ms 心跳里对一次，变了才重画。
     last_cpm: i64,
 }
@@ -1157,6 +1167,8 @@ fn boot_notice(
 /// `WM_DPICHANGED` 走同一条路），代价是唤回面板时重建一次渲染目标，那一下的毫秒数
 /// 由屏证与读数说话，不在这里猜。
 fn hide_to_tray(app: &mut App, hwnd: HWND) {
+    // 弹窗没有 owner，主窗藏到托盘时它不会自己跟着藏，必须显式收掉。
+    clipboard_popup::hide();
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
@@ -1168,7 +1180,7 @@ fn hide_to_tray(app: &mut App, hwnd: HWND) {
 /// 两个理由：① 配置说开而三条一条都没注册上（全被别的程序占了），屏上写"开"就是假话；
 /// ② 这一格以前只看了唤出与截图两条，**漏了标注那条** —— 只注册上标注键时它显示"关"，
 /// 而那颗键确实在占用全局快捷键。清单与 `COMBO_KEYS` 同一枚，不再手写第二遍。
-fn hotkeys_on_after_boot(registered: [&Option<HotKey>; 3]) -> bool {
+fn hotkeys_on_after_boot(registered: [&Option<HotKey>; 4]) -> bool {
     registered.iter().any(|hk| hk.is_some())
 }
 
@@ -1352,12 +1364,13 @@ impl App {
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let fmt = build_formats(&dwrite)?;
 
-            let (tray, pause_item) = make_tray(&snap);
+            let (tray, pause_item, clipboard_item) = make_tray(&snap);
             let HotkeysAtBoot {
                 manager: hotkeys,
                 toggle: hotkey_hk,
                 snip: snip_hk,
                 annotate: snip_annotate_hk,
+                clipboard: clipboard_hk,
                 warning: hotkey_warning,
             } = make_hotkeys();
 
@@ -1542,6 +1555,20 @@ impl App {
                 })
                 .ok();
 
+            let (clip_rx, clip_watcher) = match focusflow_core::clipboard::init_db() {
+                Ok(()) => match focusflow_core::clipboard::start() {
+                    Ok((watcher, rx)) => (Some(rx), Some(watcher)),
+                    Err(e) => {
+                        tracing_note(&format!("剪贴板监听没起来：{e}"));
+                        (None, None)
+                    }
+                },
+                Err(e) => {
+                    tracing_note(&format!("剪贴板库打不开：{e}"));
+                    (None, None)
+                }
+            };
+
             Ok(Self {
                 d2d,
                 dwrite,
@@ -1552,10 +1579,18 @@ impl App {
                 snap,
                 tray,
                 hotkeys,
-                hotkeys_on: hotkeys_on_after_boot([&hotkey_hk, &snip_hk, &snip_annotate_hk]),
+                hotkeys_on: hotkeys_on_after_boot([
+                    &hotkey_hk,
+                    &snip_hk,
+                    &snip_annotate_hk,
+                    &clipboard_hk,
+                ]),
                 hotkey_hk,
                 snip_hk,
                 snip_annotate_hk,
+                clipboard_hk,
+                clip_rx,
+                clip_watcher,
                 mica,
                 glass: false,
                 resizing: false,
@@ -1620,6 +1655,7 @@ impl App {
                 edit_fg,
                 edit_bg_color,
                 pause_item,
+                clipboard_item,
                 last_cpm: -1,
             })
         }
@@ -1792,10 +1828,12 @@ impl App {
                     self.hotkey_hk.is_some(),
                     self.snip_hk.is_some(),
                     self.snip_annotate_hk.is_some(),
+                    self.clipboard_hk.is_some(),
                 ],
                 hotkey_on: self.hotkey_hk.is_some()
                     || self.snip_hk.is_some()
-                    || self.snip_annotate_hk.is_some(),
+                    || self.snip_annotate_hk.is_some()
+                    || self.clipboard_hk.is_some(),
                 floating_on: floating::is_visible(),
                 pin_count: PINS.lock().map(|v| v.len()).unwrap_or(0),
                 dark: tokens.dark,
@@ -3472,20 +3510,28 @@ impl App {
     fn reload_hotkeys(&mut self) -> String {
         unregister_combos(
             self.hotkeys.as_ref(),
-            [self.hotkey_hk, self.snip_hk, self.snip_annotate_hk],
+            [
+                self.hotkey_hk,
+                self.snip_hk,
+                self.snip_annotate_hk,
+                self.clipboard_hk,
+            ],
         );
         self.hotkey_hk = None;
         self.snip_hk = None;
         self.snip_annotate_hk = None;
+        self.clipboard_hk = None;
         if !self.hotkeys_on {
-            return "全局热键已关闭：三条组合都不注册".to_string();
+            return "全局热键已关闭：四条组合都不注册".to_string();
         }
         // 清单走 `COMBO_KEYS` 那一份（开机那条路读同一枚表），这里不抄第二遍：
         // 抄漏一条的症状是"开关关掉之后还剩一条热键在占键"。
-        let mut slots: [Option<HotKey>; 3] = [None, None, None];
+        let clipboard_enabled =
+            focusflow_core::config::instance().get_bool("clipboard", "enabled", true);
+        let mut slots: [Option<HotKey>; 4] = [None, None, None, None];
         let mut parts: Vec<(&'static str, String, Option<String>)> = Vec::new();
         let mut offs: Vec<&'static str> = Vec::new();
-        for (i, key) in combo_keys(true).iter().enumerate() {
+        for (i, key) in combo_keys(true, clipboard_enabled).iter().enumerate() {
             if hotkey_is_off(key) {
                 offs.push(hotkey_label(key));
                 continue;
@@ -3497,6 +3543,7 @@ impl App {
         self.hotkey_hk = slots[0];
         self.snip_hk = slots[1];
         self.snip_annotate_hk = slots[2];
+        self.clipboard_hk = slots[3];
         hotkey_status_line(&parts, &offs)
     }
 
@@ -3668,6 +3715,40 @@ impl App {
         }
     }
 
+    /// 托盘里的「记录剪贴板」勾与配置同源（不读进程里某个缓存位：这个开关每一条
+    /// 复制都要读一次配置，托盘只是它的第二个入口）。
+    fn sync_clipboard_item(&self) {
+        if let Some(it) = &self.clipboard_item {
+            it.set_checked(focusflow_core::config::instance().get_bool(
+                "clipboard",
+                "enabled",
+                true,
+            ));
+        }
+    }
+
+    /// 托盘「记录剪贴板」：写配置、对齐勾、重注册热键（关掉时第 4 条不再占用全局键）。
+    fn toggle_clipboard(&mut self, hwnd: HWND) {
+        let cfg = focusflow_core::config::instance();
+        let now = !cfg.get_bool("clipboard", "enabled", true);
+        let note = config_write_note(
+            "剪贴板记录",
+            cfg.set_now("clipboard", "enabled", if now { "true" } else { "false" }),
+        );
+        self.sync_clipboard_item();
+        let hk = self.reload_hotkeys();
+        let msg = format!(
+            "剪贴板记录已{}；{hk}{note}",
+            if now { "开启" } else { "暂停" }
+        );
+        self.status = Some(msg.clone());
+        tracing_note(&msg);
+        clipboard_popup::notify_changed();
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
     /// 插件管理器懒创建：Lua 不是 Send，只能挂。
     fn ensure_plugin_manager(&mut self) {
         if self.pm.is_none() {
@@ -3835,6 +3916,57 @@ impl App {
             "定时器：{} 个插件跑了 {total} 格 timers_fired={total}",
             ran.len()
         ));
+    }
+
+    /// 收监听线程交来的复制件，入附属库。写库留在 UI 线程（单写者）。
+    ///
+    /// 通道里只有监听线程放进来的 `Captured`，一拍最多几十条；空的时候只花一次 `try_recv`。
+    fn pump_clipboard(&mut self) {
+        // 关掉记录之后，通道里可能还躺着关掉前 100ms 内收到的一件：直接丢掉。
+        let enabled = focusflow_core::config::instance().get_bool("clipboard", "enabled", true);
+        let mut got = 0usize;
+        let mut disconnected = false;
+        if let Some(rx) = self.clip_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(c) => {
+                        if !enabled {
+                            continue;
+                        }
+                        match focusflow_core::clipboard::ingest(
+                            &c.text,
+                            &c.source_app,
+                            c.copied_at_ms,
+                        ) {
+                            Ok(focusflow_core::clipboard::IngestOutcome::Stored { id, dedup }) => {
+                                got += 1;
+                                // 验收脚本靠这一行判"真的入库了"；只报长度与条目标识，
+                                // 内容一个字都不进日志。
+                                tracing_note(&format!(
+                                    "剪贴板收录 clip_ingest id={id} dedup={dedup} len={}",
+                                    c.text.len()
+                                ));
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing_note(&format!("剪贴板入库失败：{e}")),
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            tracing_note("剪贴板监听线程已退出：本进程不再收录复制内容");
+            self.clip_rx = None;
+        }
+        if got > 0 {
+            // 弹窗开着就标脏，下一帧重查；没开时这一声只是一次原子读。
+            clipboard_popup::notify_changed();
+        }
     }
 
     fn pump_plugin_key_batches(&mut self) {
@@ -4622,7 +4754,13 @@ impl App {
             // 没落成也照样刷：内存里的值确实变了，这一格当场要显示新状态，
             // 而"只到本次运行"由那句 note 说清楚。
             self.refresh_now();
-            let msg = format!("设置已切换 {section}.{key}={next}{note}");
+            let mut msg = format!("设置已切换 {section}.{key}={next}{note}");
+            if section == "clipboard" && key == "enabled" {
+                // 剪贴板开关会改变"第 4 条热键要不要占用全局键"以及托盘那颗勾。
+                self.sync_clipboard_item();
+                msg.push_str(&format!("；{}", self.reload_hotkeys()));
+                clipboard_popup::notify_changed();
+            }
             self.status = Some(msg.clone());
             tracing_note(&msg);
         }
@@ -5057,7 +5195,7 @@ const SETTINGS_CATS: [(&str, &str); 6] = [
     ("悬浮窗", "桌面上的小卡片"),
     ("目标", "每日目标次数"),
     ("数据", "目录、备份、导入导出"),
-    ("高级", "键鼠、界面、应用与设备、调试"),
+    ("高级", "键鼠、界面、剪贴板、应用与设备、调试"),
 ];
 
 fn basic_cat(b: Basic) -> usize {
@@ -6295,8 +6433,8 @@ struct ViewState {
     chart_hover: Option<usize>,
     /// 全局热键此刻是否真的注册着（不是配置键，是运行时状态）。
     hotkey_on: bool,
-    /// 三条绑定各自注册上了没有，顺序同 `COMBO_KEYS`（0 唤出 / 1 松手即存 / 2 进标注）。
-    hotkey_live: [bool; 3],
+    /// 三条绑定各自注册上了没有，顺序同 `COMBO_KEYS`（0 唤出 / 1 松手即存 / 2 进标注 / 3 剪贴板）。
+    hotkey_live: [bool; 4],
     /// 悬浮窗此刻是否真的显示着（同上：读运行时状态，不读配置键 ——
     /// 手改 `[floating] enabled` 并不会让卡片出现或消失）。
     floating_on: bool,
@@ -12206,7 +12344,13 @@ fn draw_hourly(p: &P<'_>, r: D2D_RECT_F, snap: &Snapshot, hover: Option<usize>) 
 
 // ===== 托盘 / 热键 / 单实例 =====
 
-fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenuItem>) {
+fn make_tray(
+    snap: &Arc<Mutex<Snapshot>>,
+) -> (
+    Option<TrayIcon>,
+    Option<CheckMenuItem>,
+    Option<CheckMenuItem>,
+) {
     let today = snap.lock().map(|s| s.today).unwrap_or(0);
     let menu = Menu::new();
     let show = MenuItem::with_id("show", "显示主窗口", true, None);
@@ -12217,6 +12361,14 @@ fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenu
     // 直达最近那张：截图之后不用专门去文件夹里挑（旧 Webview 版有这一项，换原生时丢了）。
     let snip_folder = MenuItem::with_id("snip_folder", "打开截图文件夹", true, None);
     let floating_item = MenuItem::with_id("floating", "悬浮窗", true, None);
+    let clipboard_history = MenuItem::with_id("clipboard_history", "剪贴板历史", true, None);
+    let clipboard_item = CheckMenuItem::with_id(
+        "clipboard_pause",
+        "记录剪贴板",
+        true,
+        focusflow_core::config::instance().get_bool("clipboard", "enabled", true),
+        None,
+    );
     // 暂停是运行时开关（不写配置）：它只停"计数"，不改变"是否启用采集"这件事。
     let pause = CheckMenuItem::with_id("pause", "暂停采集", true, collect::is_paused(), None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
@@ -12227,12 +12379,14 @@ fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenu
         &snip_quick,
         &snip_folder,
         &floating_item,
+        &clipboard_history,
+        &clipboard_item,
         &pause,
         &sep,
         &quit,
     ]) {
         tracing_note(&format!("托盘菜单构建失败：{e}"));
-        return (None, None);
+        return (None, None, None);
     }
 
     // 以前这里直接用的是代码画的那颗蓝色圆点（函数上还挂着"真实版本换"），于是托盘那颗
@@ -12245,7 +12399,7 @@ fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenu
                 Ok(i) => i,
                 Err(e) => {
                     tracing_note(&format!("托盘图标构建失败：{e}"));
-                    return (None, None);
+                    return (None, None, None);
                 }
             }
         }
@@ -12258,11 +12412,11 @@ fn make_tray(snap: &Arc<Mutex<Snapshot>>) -> (Option<TrayIcon>, Option<CheckMenu
     {
         Ok(t) => {
             tracing_note("托盘已创建");
-            (Some(t), Some(pause))
+            (Some(t), Some(pause), Some(clipboard_item))
         }
         Err(e) => {
             tracing_note(&format!("托盘创建失败：{e}"));
-            (None, None)
+            (None, None, None)
         }
     }
 }
@@ -12341,7 +12495,9 @@ fn hotkey_label(key: &str) -> &'static str {
     match key {
         "toggle_window" => "唤出窗口热键",
         "snip" => "区域截图热键",
-        _ => "标注截图热键",
+        "snip_annotate" => "标注截图热键",
+        "clipboard" => "剪贴板历史热键",
+        _ => "未命名热键",
     }
 }
 
@@ -12790,7 +12946,7 @@ fn hotkey_status_line(items: &[(&str, String, Option<String>)], offs: &[&str]) -
             .map(|(l, raw, _)| format!("{l} {raw}"))
             .collect();
         if live.is_empty() {
-            return format!("三条热键都没挂上{off_tail}");
+            return format!("四条热键都没挂上{off_tail}");
         }
         return format!("已按配置注册：{}", live.join(" · ")) + &off_tail;
     }
@@ -12804,7 +12960,7 @@ fn hotkey_status_line(items: &[(&str, String, Option<String>)], offs: &[&str]) -
 }
 
 /// 注销此刻真正注册着的组合（总开关关掉、或改完要重注册时先走这一步）。
-fn unregister_combos(manager: Option<&GlobalHotKeyManager>, list: [Option<HotKey>; 3]) {
+fn unregister_combos(manager: Option<&GlobalHotKeyManager>, list: [Option<HotKey>; 4]) {
     let Some(manager) = manager else { return };
     let all: Vec<HotKey> = list.into_iter().flatten().collect();
     if !all.is_empty() {
@@ -12814,7 +12970,7 @@ fn unregister_combos(manager: Option<&GlobalHotKeyManager>, list: [Option<HotKey
 
 /// 设置页里能改、启动时要注册的那几条热键（`[hotkey]` 段的键名）。
 /// 这份清单只写一次：写入前的校验与改完重注册都读它，加一条不用改第二处。
-const HOTKEY_KEYS: [&str; 3] = ["toggle_window", "snip", "snip_annotate"];
+const HOTKEY_KEYS: [&str; 4] = ["toggle_window", "snip", "snip_annotate", "clipboard"];
 
 /// 「更改数据文件夹」要落的那两行，以及它们的**顺序**：先写待搬运标记，再改 `data_home`。
 /// 反过来说明中间崩掉会留下哪种半态：目录已改、标记没写 ⇒ 新进程按空的
@@ -12924,21 +13080,29 @@ fn run_plugin_sel_test(hwnd: HWND) {
     }
 }
 
-/// 三条组合的键名，**顺序就是它们各自落进哪个字段 / 状态行点名的顺序**：
-/// 0＝`toggle_window`（唤出主窗口）、1＝`snip`（松手即存）、2＝`snip_annotate`（进标注）。
-const COMBO_KEYS: [&str; 3] = ["toggle_window", "snip", "snip_annotate"];
+/// 四条组合的键名，**顺序就是它们各自落进哪个字段 / 状态行点名的顺序**：
+/// 0＝`toggle_window`（唤出主窗口）、1＝`snip`（松手即存）、2＝`snip_annotate`（进标注）、
+/// 3＝`clipboard`（剪贴板历史弹窗）。
+const COMBO_KEYS: [&str; 4] = ["toggle_window", "snip", "snip_annotate", "clipboard"];
 
-/// 这一次启动要挂哪几条组合：总开关 `[hotkey] enabled` 关掉 ⇒ 空表，三条一起不占用全局键。
+/// 这一次启动要挂哪几条组合：总开关 `[hotkey] enabled` 关掉 ⇒ 空表；剪贴板功能
+/// `[clipboard] enabled` 关掉 ⇒ 只挂前三条（不占用它的键）。
 ///
-/// 以前这条只有运行中那颗开关做得到：`toggle_hotkey` 会注销并把 `hotkey.enabled` 写进配置，
-/// 可启动侧没人读它 ⇒ 重启后 `make_hotkeys` 照配置全注册回去，而屏上那一行显示的还是"开"。
 /// 抽成纯函数是因为"关掉之后还剩几条在占键"这种形状编译器与现有腿都不响。
-fn combo_keys(enabled: bool) -> &'static [&'static str] {
-    if enabled {
+fn combo_keys(enabled: bool, clipboard_enabled: bool) -> &'static [&'static str] {
+    if !enabled {
+        &[]
+    } else if clipboard_enabled {
         &COMBO_KEYS
     } else {
-        &[]
+        &COMBO_KEYS[..3]
     }
+}
+
+/// 一次按键只会被处理一次：`global-hotkey` 在 Windows 上先发 Pressed、松手后再发
+/// Released。两条都处理的话，唤出窗会开一下又藏、剪贴板弹窗开了又关。
+fn hotkey_is_press(state: HotKeyState) -> bool {
+    matches!(state, HotKeyState::Pressed)
 }
 
 /// 开机注册三条热键的结局。写成结构体而不是五元组：调用处按名字取值，
@@ -12948,6 +13112,7 @@ struct HotkeysAtBoot {
     toggle: Option<HotKey>,
     snip: Option<HotKey>,
     annotate: Option<HotKey>,
+    clipboard: Option<HotKey>,
     /// 有条没注册上时给状态栏的那句话（全成都成功是 None）
     warning: Option<String>,
 }
@@ -12960,11 +13125,13 @@ fn make_hotkeys() -> HotkeysAtBoot {
             None
         }
     };
-    let enabled = focusflow_core::config::instance().get_bool("hotkey", "enabled", true);
-    let mut slots: [Option<HotKey>; 3] = [None, None, None];
+    let cfg = focusflow_core::config::instance();
+    let enabled = cfg.get_bool("hotkey", "enabled", true);
+    let clipboard_enabled = cfg.get_bool("clipboard", "enabled", true);
+    let mut slots: [Option<HotKey>; 4] = [None, None, None, None];
     let mut parts: Vec<(&'static str, String, Option<String>)> = Vec::new();
     let mut offs: Vec<&'static str> = Vec::new();
-    for (i, key) in combo_keys(enabled).iter().enumerate() {
+    for (i, key) in combo_keys(enabled, clipboard_enabled).iter().enumerate() {
         if hotkey_is_off(key) {
             offs.push(hotkey_label(key));
             continue;
@@ -12975,7 +13142,7 @@ fn make_hotkeys() -> HotkeysAtBoot {
     }
     let warning = if !enabled {
         tracing_note("热键未注册（[hotkey] enabled = false）：本次不占用任何全局键");
-        Some("全局热键没开（[hotkey] enabled = false）：三条组合都不注册".to_string())
+        Some("全局热键没开（[hotkey] enabled = false）：四条组合都不注册".to_string())
     } else if parts.iter().any(|(_, _, why)| why.is_some()) {
         Some(hotkey_status_line(&parts, &offs))
     } else {
@@ -12986,6 +13153,7 @@ fn make_hotkeys() -> HotkeysAtBoot {
         toggle: slots[0],
         snip: slots[1],
         annotate: slots[2],
+        clipboard: slots[3],
         warning,
     }
 }
@@ -13346,6 +13514,7 @@ fn quit_app(hwnd: HWND) {
     }
     // 最后补一次几何：拖完最后一下马上退出、最大化之后直接退出，都不经过 `WM_EXITSIZEMOVE`。
     save_main_geometry(hwnd);
+    clipboard_popup::destroy();
     floating::shutdown();
     collect::shutdown(focusflow_core::config::instance());
     focusflow_core::logger::shutdown();
@@ -13435,55 +13604,11 @@ unsafe fn app_ptr(hwnd: HWND) -> Option<&'static mut App> {
 
 /// 把一段文字放进剪贴板（CF_UNICODETEXT）。
 ///
-/// 与截图那一路同一条规矩：**先备料、后开窗** —— 分配失败时不能先把用户原来的
-/// 剪贴板内容清掉。占用重试 5×50ms，失败就把错误说出来，别假装复制成功。
-fn copy_text_to_clipboard(hwnd: HWND, text: &str) -> std::result::Result<(), String> {
-    use windows::Win32::Foundation::{GlobalFree, HANDLE};
-    use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
-    };
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-
-    /// WinUser.h: `#define CF_UNICODETEXT 13`（windows-rs 没导出这个名字）。
-    const CF_UNICODETEXT: u32 = 13;
-
-    let mut bytes: Vec<u8> = Vec::new();
-    for u in text.encode_utf16() {
-        bytes.extend_from_slice(&u.to_le_bytes());
-    }
-    bytes.extend_from_slice(&[0, 0]);
-
-    unsafe {
-        let hg = GlobalAlloc(GMEM_MOVEABLE, bytes.len())
-            .map_err(|e| format!("分配剪贴板内存失败：{e}"))?;
-        let dst = GlobalLock(hg);
-        if dst.is_null() {
-            let _ = GlobalFree(Some(hg));
-            return Err("GlobalLock 返回空指针".to_string());
-        }
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
-        // 锁计数归零时 GlobalUnlock 返回 0，windows 会把它翻成 Err —— 那不是失败。
-        let _ = GlobalUnlock(hg);
-
-        for attempt in 1..=5u32 {
-            match OpenClipboard(Some(hwnd)) {
-                Ok(()) => {
-                    let _ = EmptyClipboard();
-                    let r = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hg.0)));
-                    let _ = CloseClipboard();
-                    return r.map(|_| ()).map_err(|e| format!("写入剪贴板失败：{e}"));
-                }
-                Err(_) if attempt < 5 => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(e) => {
-                    let _ = GlobalFree(Some(hg));
-                    return Err(format!("剪贴板被其它程序占用（重试 5 次）：{e}"));
-                }
-            }
-        }
-    }
-    Err("剪贴板写入失败".to_string())
+/// 实现挪到 core 的 `clipboard::write_text`：那边与监听线程共用同一把"自写抑制"尺子
+/// （序号在锁内、关闭之前记录），否则程序自己复制的内容会被剪贴板历史再收一遍。
+/// 这里的函数名与调用形态保留给既有接线守卫。
+fn copy_text_to_clipboard(_hwnd: HWND, text: &str) -> std::result::Result<(), String> {
+    focusflow_core::clipboard::write_text(text)
 }
 
 /// 行内 EDIT 的顶层宿主窗：画主题底 + 一圈描边，真正的 EDIT 是它的子窗口。
@@ -14344,6 +14469,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 // 少了这两行，那条线程整晚在扫目录而没人处理它的话，屏上照旧是"改了要重启"。
                 let on_plugin_page = app.view == 4;
                 app.pump_plugin_reloads(on_plugin_page);
+                // 剪贴板监听线程交来的复制件在这一拍入附属库（写库留在 UI 线程）。
+                app.pump_clipboard();
             }
             // 托盘点击 / 菜单 / 热键只在事件通道里，靠这 100ms 一拍取出来。
             while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
@@ -14395,6 +14522,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
+                    "clipboard_history" => {
+                        tracing_note("托盘：打开剪贴板历史");
+                        clipboard_popup::toggle(hwnd);
+                    }
+                    "clipboard_pause" => {
+                        if let Some(app) = unsafe { app_ptr(hwnd) } {
+                            app.toggle_clipboard(hwnd);
+                        }
+                    }
                     "pause" => {
                         if let Some(app) = unsafe { app_ptr(hwnd) } {
                             app.toggle_pause(hwnd);
@@ -14405,6 +14541,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 }
             }
             while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
+                // 一次按键会来两条事件（按下 + 松开）。只认按下：两条都处理的话热键会
+                // 触发两次 —— 弹窗开了又关、唤出窗开一下又藏，屏上看起来像"没反应"。
+                if !hotkey_is_press(ev.state) {
+                    continue;
+                }
                 // 三条热键共用一个通道：按 id 分流，否则截图的键会把窗口唤出来。
                 // 组合键现在能被用户改掉，所以只响应"此刻真正注册着的那三个 id"，
                 // 刚注销/换掉的旧 id 投过来的事件一律不认。
@@ -14417,6 +14558,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         Some("snip-annotate")
                     } else if app.snip_hk.map(|h| h.id() == ev.id).unwrap_or(false) {
                         Some("snip")
+                    } else if app.clipboard_hk.map(|h| h.id() == ev.id).unwrap_or(false) {
+                        Some("clipboard")
                     } else if app.hotkey_hk.map(|h| h.id() == ev.id).unwrap_or(false) {
                         Some("toggle")
                     } else {
@@ -14431,6 +14574,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     Some("snip") => {
                         tracing_note("收到截图热键：松手即存");
                         snip::start(hwnd, false);
+                    }
+                    Some("clipboard") => {
+                        tracing_note("收到剪贴板历史热键：唤出弹窗");
+                        clipboard_popup::toggle(hwnd);
                     }
                     Some("toggle") => {
                         tracing_note("收到热键事件，唤出窗口");
@@ -16578,6 +16725,14 @@ mod settings_type_tests {
 mod hotkey_tests {
     use super::*;
 
+    /// 一次按键只处理一次。Windows 的全局热键实现会先发 Pressed、松手后再发 Released；
+    /// 两条都当按下处理，就会"按一次触发两次"（弹窗开了又关、唤出窗开一下又藏）。
+    #[test]
+    fn a_hotkey_press_is_handled_once_not_twice() {
+        assert!(hotkey_is_press(HotKeyState::Pressed));
+        assert!(!hotkey_is_press(HotKeyState::Released));
+    }
+
     /// 「备份完成」那一句话由两份独立的事实拼成，两半都要能被单独说出口。
     ///
     /// 屏上以前只看 `failed`：拷贝前那批增量没等到（`missed_batch`）在界面上与"全都兜住"
@@ -16651,17 +16806,18 @@ mod hotkey_tests {
                 "又一处把写盘结局折掉了：{forbidden}"
             );
         }
-        // 十颗用户手势的写点（总开关一颗 + 采集三条 + 开关行 + 值框提交 + 悬浮窗 + 主题
-        // + 热键那颗钮 + 按下录入）各喂一次 `set_now`，加上定义那一行 = 十一处。
+        // 十一个用户手势的写点（总开关一颗 + 采集三条 + 开关行 + 值框提交 + 悬浮窗 + 主题
+        // + 热键那颗钮 + 按下录入 + 托盘「记录剪贴板」）各喂一次 `set_now`，加上定义那一行
+        // = 十二处。
         assert_eq!(
             flat.matches("config_write_note(").count(),
-            11,
+            12,
             "落点数目变了，实得 {}",
             flat.matches("config_write_note(").count()
         );
         assert_eq!(
             flat.matches("set_now(").count(),
-            10,
+            11,
             "写点没都换成能问出结局的那一条调用，实得 {}",
             flat.matches("set_now(").count()
         );
@@ -16710,13 +16866,14 @@ mod hotkey_tests {
         );
     }
 
-    /// 小钮只该挂在那三条绑定上：其它热键段的键（`enabled`）与别的段的行都不许有。
+    /// 小钮只该挂在那几条绑定上：其它热键段的键（`enabled`）与别的段的行都不许有。
     /// 挂错行的症状是"点了叉把某条不相干的配置清空了"。
     #[test]
-    fn only_the_three_bindings_get_the_button() {
+    fn only_the_bindings_get_the_button() {
         assert_eq!(hotkey_slot("hotkey", "toggle_window"), Some(0));
         assert_eq!(hotkey_slot("hotkey", "snip"), Some(1));
         assert_eq!(hotkey_slot("hotkey", "snip_annotate"), Some(2));
+        assert_eq!(hotkey_slot("hotkey", "clipboard"), Some(3));
         assert_eq!(hotkey_slot("hotkey", "enabled"), None, "总开关不是绑定");
         assert_eq!(hotkey_slot("gui", "toggle_window"), None, "别的段不算");
     }
@@ -16813,15 +16970,16 @@ mod hotkey_tests {
         let one = parse_combo("shift+f1");
         assert!(one.is_some(), "夹具那串组合要能解析");
         assert!(
-            !hotkeys_on_after_boot([&None, &None, &None]),
+            !hotkeys_on_after_boot([&None, &None, &None, &None]),
             "一条都没注册上就该显示关"
         );
         assert!(
-            hotkeys_on_after_boot([&None, &None, &one]),
+            hotkeys_on_after_boot([&None, &None, &one, &None]),
             "只有标注那条注册上也得显示开：这一格以前漏算了第三条"
         );
-        assert!(hotkeys_on_after_boot([&one, &None, &None]));
-        assert!(hotkeys_on_after_boot([&None, &one, &None]));
+        assert!(hotkeys_on_after_boot([&one, &None, &None, &None]));
+        assert!(hotkeys_on_after_boot([&None, &one, &None, &None]));
+        assert!(hotkeys_on_after_boot([&None, &None, &None, &one]));
     }
 
     /// 总开关决定开机挂哪几条：关掉 ⇒ 一条都不占全局键；打开 ⇒ 三条，而且顺序就是
@@ -16829,11 +16987,19 @@ mod hotkey_tests {
     /// 症状是"按截图键把主窗口唤出来了"）。
     #[test]
     fn the_switch_decides_which_combos_boot() {
-        assert!(combo_keys(false).is_empty(), "开关关掉就该一条都不注册");
+        assert!(
+            combo_keys(false, true).is_empty(),
+            "开关关掉就该一条都不注册"
+        );
         assert_eq!(
-            combo_keys(true),
+            combo_keys(true, true),
             &COMBO_KEYS[..],
-            "开机清单与顺序：0=唤出、1=松手即存、2=进标注"
+            "开机清单与顺序：0=唤出、1=松手即存、2=进标注、3=剪贴板"
+        );
+        assert_eq!(
+            combo_keys(true, false),
+            &COMBO_KEYS[..3],
+            "剪贴板记录关掉时第 4 条不占用全局键"
         );
     }
 
@@ -18628,7 +18794,7 @@ mod hotkey_line_tests {
     #[test]
     fn all_three_off_says_nothing_is_bound() {
         let line = hotkey_status_line(&[], &["唤出窗口热键", "区域截图热键", "标注截图热键"]);
-        assert!(line.contains("三条热键都没挂上"), "{line}");
+        assert!(line.contains("四条热键都没挂上"), "{line}");
         assert!(line.contains("未启用 3 条"), "{line}");
         assert!(!line.contains("已按配置注册"), "{line}");
     }
