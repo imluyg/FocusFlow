@@ -7,6 +7,7 @@
 //!
 //! 滚动容器、六个视图、截图覆盖层与贴图都已做完；剩下的缺口清单在
 //! `docs/handoff-native-migration.md`。
+mod clipboard_page;
 mod clipboard_popup;
 mod collect;
 mod dashboard;
@@ -75,7 +76,8 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
+    TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -116,18 +118,21 @@ pub(crate) const WM_SNIP_NOTE: u32 = WM_APP + 14;
 /// 搜索框那个原生 EDIT 的焦点变化：`WPARAM` 1=拿到焦点、0=交出去。
 /// 父窗要靠它决定"这一帧该不该在框里写提示文案"——控件有焦点时那块矩形归控件画。
 const WM_SEARCH_FOCUS: u32 = WM_APP + 15;
+/// 剪贴板管理页的搜索框焦点回执（与设置页那个搜索框分开：两页各有一份 EDIT）。
+const WM_CLIP_SEARCH_FOCUS: u32 = WM_APP + 16;
 /// 两个 EDIT 各用哪一个子类 id。子类过程收到的第 5 个参数就是这个 id，
 /// 第 6 个参数是 `SetWindowSubclass` 的 `dwRefData`（两处都传 0，**不能拿它分角色**——
 /// 从前拿它比 2，于是搜索框的焦点永远递不回来，提示文案照旧压在控件上，2026-11-01 屏上量到）。
 const RENAME_EDIT_SUBCLASS: usize = 1;
 const SEARCH_EDIT_SUBCLASS: usize = 2;
+const CLIP_SEARCH_EDIT_SUBCLASS: usize = 3;
 
-/// 哪一条消息要把焦点变化递回父窗：只有搜索框那个 EDIT。
+/// 哪一条消息要把焦点变化递回父窗：设置页与剪贴板页的两个搜索框。
 ///
 /// 抽成纯函数是因为这条缺陷的形状是"参数拿错"——`edit_proc` 里比错一位，屏上只是"提示没让位"，
 /// 编译、lint、现有腿全都不会红。id 与消息的对应关系放在这里就能被用例钉住。
 fn search_focus_signal(id: usize, msg: u32) -> Option<bool> {
-    if id != SEARCH_EDIT_SUBCLASS {
+    if id != SEARCH_EDIT_SUBCLASS && id != CLIP_SEARCH_EDIT_SUBCLASS {
         return None;
     }
     match msg {
@@ -907,6 +912,8 @@ enum EditTarget {
     Setting(usize),
     /// 插件视图里的 TextInput：(插件展示名, 字段名)
     PluginField(String, String),
+    /// 剪贴板片段改名。
+    SnippetName(i64),
 }
 
 /// 插件视图里打开的一个下拉。
@@ -951,6 +958,11 @@ enum Ctl {
     PluginList(u16),
     /// 插件页里能点的格子（返回、安装、视图控件、详情页按钮）。
     Pv,
+    /// 剪贴板管理页：三个模式页签、工具钮、行、搜索框。
+    ClipTab(u8),
+    ClipRow(u16),
+    ClipBtn(u8),
+    ClipSearch,
 }
 
 struct App {
@@ -1031,6 +1043,12 @@ struct App {
     /// 那个搜索框此刻有没有焦点（由 `edit_proc` 在 WM_SETFOCUS / WM_KILLFOCUS 上递回来）。
     /// 提示文案只在它为 `false` 时由父窗画。
     search_focused: bool,
+    /// 剪贴板管理页（第 8 页）的状态：模式、筛选、列表、多选。
+    clip_page: clipboard_page::ClipPage,
+    /// 剪贴板管理页自己的搜索框（与设置页那个分开：两页的过滤词生命周期不同）。
+    clip_search_edit: Option<HWND>,
+    clip_search_host: Option<HWND>,
+    clip_search_focused: bool,
     /// 后台操作把结果行塞这里，再投 `WM_OP_DONE` 让界面来取。
     ops: Arc<Mutex<Vec<String>>>,
     /// 内置看板页的状态（哪一档 + 上次问库的时刻 + 算好的那一页）。
@@ -1614,6 +1632,10 @@ impl App {
                 search_edit: None,
                 search_edit_host: None,
                 search_focused: false,
+                clip_page: clipboard_page::ClipPage::new(),
+                clip_search_edit: None,
+                clip_search_host: None,
+                clip_search_focused: false,
                 ops: Arc::new(Mutex::new(Vec::new())),
                 pm: None,
                 plugin_rows: Vec::new(),
@@ -1839,6 +1861,7 @@ impl App {
                 dark: tokens.dark,
                 zoomed: unsafe { IsZoomed(hwnd) }.as_bool(),
                 search_focused: self.search_focused,
+                clip_search_focused: self.clip_search_focused,
                 collector_on: collect::is_listening(),
                 collector_paused: collect::is_paused(),
                 cpm: collect::cpm(),
@@ -1869,6 +1892,7 @@ impl App {
                 size.height,
                 &snap,
                 &self.dash.board,
+                &self.clip_page,
                 vs,
                 self.detail.as_ref(),
                 self.status.as_deref(),
@@ -2037,6 +2061,24 @@ impl App {
                     .unwrap_or_default();
                 if let Some((i, _)) = settings_row_at(&items, &g, w, self.scroll, x, y) {
                     return Some(Ctl::SetRow(i as u16));
+                }
+            }
+            7 => {
+                let lay = clipboard_page::layout_for(w, h);
+                if self.clip_page.mode != clipboard_page::Mode::Stats {
+                    if clipboard_page::search_at(&lay, x, y) {
+                        return Some(Ctl::ClipSearch);
+                    }
+                    if let Some(i) = clipboard_page::toolbar_at(&lay, x, y) {
+                        return Some(Ctl::ClipBtn(i as u8));
+                    }
+                }
+                if let Some(i) = clipboard_page::tab_at(&lay, x, y) {
+                    return Some(Ctl::ClipTab(i as u8));
+                }
+                let len = self.clip_page.rows().len();
+                if let Some(i) = clipboard_page::row_at(&lay, self.clip_page.scroll, len, x, y) {
+                    return Some(Ctl::ClipRow(i as u16));
                 }
             }
             _ => {}
@@ -2377,6 +2419,10 @@ impl App {
 
     /// Ctrl+F：切到设置页并把搜索框叫到屏上、拿到焦点。
     fn focus_search(&mut self, hwnd: HWND) {
+        if self.view == 7 {
+            self.focus_clip_search(hwnd);
+            return;
+        }
         if self.view != 5 {
             self.switch_view(hwnd, 5);
         }
@@ -2407,6 +2453,9 @@ impl App {
             return false;
         }
         let shift = (unsafe { GetKeyState(0x10) } as u16 & 0x8000) != 0;
+        if self.view == 7 && self.handle_clip_key(hwnd, vk) {
+            return true;
+        }
         match vk {
             0x09 => {
                 self.kbd_move(hwnd, if shift { -1 } else { 1 }, false);
@@ -2421,12 +2470,12 @@ impl App {
                 true
             }
             0x25 => {
-                let v = if self.view == 0 { 6 } else { self.view - 1 };
+                let v = if self.view == 0 { 7 } else { self.view - 1 };
                 self.switch_view(hwnd, v);
                 true
             }
             0x27 => {
-                let v = (self.view + 1) % 7;
+                let v = (self.view + 1) % 8;
                 self.switch_view(hwnd, v);
                 true
             }
@@ -2470,8 +2519,446 @@ impl App {
         if i == 6 {
             self.reload_board();
         }
+        if i == 7 {
+            tracing_note("clip_page_open");
+            self.clip_page.reload();
+            self.place_clip_search_edit(hwnd);
+        } else {
+            self.hide_clip_search_edit();
+        }
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    /// 第 8 页的点击：搜索框 → 模式页签 → 工具钮 → 行。
+    fn on_clip_click(&mut self, hwnd: HWND, w: f32, h: f32, x: f32, y: f32) {
+        let lay = clipboard_page::layout_for(w, h);
+        if self.clip_page.mode != clipboard_page::Mode::Stats {
+            if clipboard_page::search_at(&lay, x, y) {
+                self.focus_clip_search(hwnd);
+                return;
+            }
+            if let Some(i) = clipboard_page::toolbar_at(&lay, x, y) {
+                self.act_clip_toolbar(hwnd, i);
+                return;
+            }
+        }
+        if let Some(i) = clipboard_page::tab_at(&lay, x, y) {
+            let mode = clipboard_page::MODES[i];
+            self.clip_page.set_mode(mode);
+            self.clip_page.reload();
+            if mode == clipboard_page::Mode::Stats {
+                self.hide_clip_search_edit();
+            } else {
+                self.place_clip_search_edit(hwnd);
+            }
+            self.refresh_clip_page(hwnd);
+            return;
+        }
+        let len = self.clip_page.rows().len();
+        if let Some(i) = clipboard_page::row_at(&lay, self.clip_page.scroll, len, x, y) {
+            if self.clip_page.multi {
+                self.clip_page.toggle_checked(i);
+            } else {
+                self.clip_page.sel = i;
+            }
+            self.refresh_clip_page(hwnd);
+        }
+    }
+
+    fn act_clip_toolbar(&mut self, hwnd: HWND, slot: usize) {
+        match self.clip_page.mode {
+            clipboard_page::Mode::History => match slot {
+                0 => self.copy_clip_selected(hwnd),
+                1 => self.pin_clip_selected(hwnd),
+                2 => self.delete_clip_selected(hwnd),
+                3 => self.save_clip_snippet(hwnd),
+                4 => self.clear_clip_history(hwnd),
+                5 => {
+                    self.clip_page.toggle_multi();
+                    tracing_note(&format!("clip_page_multi on={}", self.clip_page.multi));
+                    self.refresh_clip_page(hwnd);
+                }
+                _ => {}
+            },
+            clipboard_page::Mode::Snippets => match slot {
+                0 => self.copy_clip_selected(hwnd),
+                1 => self.start_edit_snippet(hwnd, self.clip_page.sel),
+                2 => self.delete_clip_selected(hwnd),
+                5 => {
+                    self.clip_page.toggle_multi();
+                    tracing_note(&format!("clip_page_multi on={}", self.clip_page.multi));
+                    self.refresh_clip_page(hwnd);
+                }
+                _ => {}
+            },
+            clipboard_page::Mode::Stats => {}
+        }
+    }
+
+    fn copy_clip_selected(&mut self, hwnd: HWND) {
+        let Some(row) = self.clip_page.selected().cloned() else {
+            self.clip_page.status = Some("先选一条".to_string());
+            self.refresh_clip_page(hwnd);
+            return;
+        };
+        match focusflow_core::clipboard::write_text(&row.content) {
+            Ok(()) => {
+                if self.clip_page.mode == clipboard_page::Mode::Snippets {
+                    let _ = focusflow_core::clipboard::touch_snippet(row.id);
+                }
+                tracing_note(&format!("clip_page_copy len={}", row.content.len()));
+                self.clip_page.status = Some("已复制到剪贴板（Ctrl+V 粘贴）".to_string());
+            }
+            Err(e) => self.clip_page.status = Some(format!("复制失败：{e}")),
+        }
+        self.refresh_clip_page(hwnd);
+    }
+
+    fn pin_clip_selected(&mut self, hwnd: HWND) {
+        let ids = self.clip_page.action_ids();
+        if ids.is_empty() {
+            self.clip_page.status = Some("先选一条".to_string());
+            self.refresh_clip_page(hwnd);
+            return;
+        }
+        let pinned = self
+            .clip_page
+            .rows()
+            .iter()
+            .find(|r| r.id == ids[0])
+            .map(|r| r.pinned)
+            .unwrap_or(false);
+        match focusflow_core::clipboard::set_pinned_many(&ids, !pinned) {
+            Ok(n) => {
+                tracing_note(&format!("clip_page_pin n={n}"));
+                self.clip_page.status = Some(if pinned {
+                    format!("已取消固定 {n} 条")
+                } else {
+                    format!("已固定 {n} 条（裁剪时不会删）")
+                });
+            }
+            Err(e) => self.clip_page.status = Some(format!("更新固定状态失败：{e}")),
+        }
+        self.clip_page.reload();
+        self.refresh_clip_page(hwnd);
+    }
+
+    fn delete_clip_selected(&mut self, hwnd: HWND) {
+        let ids = self.clip_page.action_ids();
+        if ids.is_empty() {
+            self.clip_page.status = Some("先选一条".to_string());
+            self.refresh_clip_page(hwnd);
+            return;
+        }
+        let result = if self.clip_page.mode == clipboard_page::Mode::Snippets {
+            let mut n = 0usize;
+            let mut why = None;
+            for id in &ids {
+                match focusflow_core::clipboard::delete_snippet(*id) {
+                    Ok(true) => n += 1,
+                    Ok(false) => {}
+                    Err(e) => {
+                        why = Some(e);
+                        break;
+                    }
+                }
+            }
+            why.map_or(Ok(n), Err)
+        } else {
+            focusflow_core::clipboard::delete_many(&ids)
+        };
+        match result {
+            Ok(n) => {
+                tracing_note(&format!("clip_page_delete n={n}"));
+                self.clip_page.status = Some(format!("已删除 {n} 条"));
+                self.clip_page.clear_checked();
+            }
+            Err(e) => self.clip_page.status = Some(format!("删除失败：{e}")),
+        }
+        self.clip_page.reload();
+        self.refresh_clip_page(hwnd);
+    }
+
+    fn save_clip_snippet(&mut self, hwnd: HWND) {
+        let Some(row) = self.clip_page.selected().cloned() else {
+            self.clip_page.status = Some("先选一条历史记录".to_string());
+            self.refresh_clip_page(hwnd);
+            return;
+        };
+        match focusflow_core::clipboard::add_snippet("", &row.content) {
+            Ok(_) => self.clip_page.status = Some("已存为片段（Tab 切到片段）".to_string()),
+            Err(e) => self.clip_page.status = Some(format!("存为片段失败：{e}")),
+        }
+        self.clip_page.reload();
+        self.refresh_clip_page(hwnd);
+    }
+
+    fn clear_clip_history(&mut self, hwnd: HWND) {
+        let answer = unsafe {
+            MessageBoxW(
+                Some(hwnd),
+                w!("只清掉未固定的条目；固定项会留下。"),
+                w!("清空剪贴板历史"),
+                MESSAGEBOX_STYLE(MB_YESNO.0 | MB_ICONQUESTION.0),
+            )
+        };
+        if answer != IDYES {
+            return;
+        }
+        match focusflow_core::clipboard::clear_unpinned() {
+            Ok(n) => self.clip_page.status = Some(format!("已清空 {n} 条未固定记录")),
+            Err(e) => self.clip_page.status = Some(format!("清空失败：{e}")),
+        }
+        self.clip_page.clear_checked();
+        self.clip_page.reload();
+        self.refresh_clip_page(hwnd);
+    }
+
+    /// 片段改名：复用行内那套顶层 EDIT，落点按当前列表行算。
+    fn start_edit_snippet(&mut self, hwnd: HWND, row: usize) {
+        let Some(snippet) = self.clip_page.snippets.get(row).cloned() else {
+            self.clip_page.status = Some("先选一个片段".to_string());
+            self.refresh_clip_page(hwnd);
+            return;
+        };
+        let (w, h) = self.client_dip(hwnd);
+        let lay = clipboard_page::layout_for(w, h);
+        let vis = row.saturating_sub(self.clip_page.scroll);
+        if vis >= lay.rows {
+            return;
+        }
+        let top = lay.list_top + vis as f32 * lay.row_h;
+        let edit = self.ensure_edit(hwnd);
+        let left = if self.clip_page.multi {
+            lay.pad() + 34.0
+        } else {
+            lay.pad() + 12.0
+        };
+        let cell = rect(left, top + 4.0, 174.0, lay.row_h - 8.0);
+        self.show_edit_cell(hwnd, cell);
+        unsafe {
+            let _ = SetWindowTextW(edit, &HSTRING::from(snippet.name.clone()));
+            let _ = SetFocus(Some(edit));
+            SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+        }
+        self.edit_target = Some(EditTarget::SnippetName(snippet.id));
+        self.edit_row = Some(row);
+    }
+
+    fn refresh_clip_page(&mut self, hwnd: HWND) {
+        let (w, h) = self.client_dip(hwnd);
+        let lay = clipboard_page::layout_for(w, h);
+        self.clip_page.clamp_selection(lay.rows);
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    /// 剪贴板页的搜索框：与设置页那个分开建，子类 id 不同，焦点回执也分开。
+    fn ensure_clip_search_edit(&mut self, parent: HWND) -> HWND {
+        if let Some(e) = self.clip_search_edit {
+            return e;
+        }
+        let (host, h) = create_hosted_edit(parent, self.ui_font, CLIP_SEARCH_EDIT_SUBCLASS);
+        tracing_note(&format!(
+            "剪贴板搜索框已创建 host={} edit={}",
+            host.0 as isize, h.0 as isize
+        ));
+        self.clip_search_host = Some(host);
+        self.clip_search_edit = Some(h);
+        h
+    }
+
+    fn place_clip_search_edit(&mut self, hwnd: HWND) {
+        if self.view != 7 || self.clip_page.mode == clipboard_page::Mode::Stats {
+            return;
+        }
+        let (w, h) = self.client_dip(hwnd);
+        let lay = clipboard_page::layout_for(w, h);
+        let edit = self.ensure_clip_search_edit(hwnd);
+        let Some(host) = self.clip_search_host else {
+            return;
+        };
+        if edit.0.is_null() {
+            return;
+        }
+        if self.clip_search_focused {
+            unsafe {
+                let _ = SetWindowTextW(edit, &HSTRING::from(self.clip_page.filter.clone()));
+            }
+        }
+        self.place_hosted_edit(hwnd, host, edit, lay.search, self.clip_search_focused);
+    }
+
+    fn hide_clip_search_edit(&mut self) {
+        self.clip_search_focused = false;
+        if let Some(e) = self.clip_search_edit {
+            unsafe {
+                let _ = ShowWindow(e, SW_HIDE);
+            }
+        }
+        if let Some(h) = self.clip_search_host {
+            unsafe {
+                let _ = ShowWindow(h, SW_HIDE);
+            }
+        }
+    }
+
+    fn focus_clip_search(&mut self, hwnd: HWND) {
+        if self.view != 7 || self.clip_page.mode == clipboard_page::Mode::Stats {
+            return;
+        }
+        let edit = self.ensure_clip_search_edit(hwnd);
+        self.clip_search_focused = true;
+        self.place_clip_search_edit(hwnd);
+        if !edit.0.is_null() {
+            unsafe {
+                let _ = SetFocus(Some(edit));
+            }
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    /// 搜索框按 Enter：把字变成筛选词并重查；Esc：清掉筛选。
+    fn commit_clip_search(&mut self, hwnd: HWND, commit: bool) {
+        let Some(edit) = self.clip_search_edit else {
+            return;
+        };
+        let mut buf = [0u16; 256];
+        // 用 WM_GETTEXT 而不是 GetWindowTextW：这一格是宿主窗下的子 EDIT，跨窗口取文本
+        // 走消息更直白（与设置页搜索框那条 EN_CHANGE 的取值口径也不同，这里只读一次）。
+        let n = unsafe {
+            SendMessageW(
+                edit,
+                0x000D,
+                Some(WPARAM(buf.len())),
+                Some(LPARAM(buf.as_mut_ptr() as isize)),
+            )
+            .0 as usize
+        }
+        .min(buf.len());
+        let text = String::from_utf16_lossy(&buf[..n]);
+        self.clip_page.filter = if commit {
+            text.trim().to_string()
+        } else {
+            String::new()
+        };
+        if !commit {
+            unsafe {
+                let _ = SetWindowTextW(edit, w!(""));
+            }
+        }
+        self.clip_page.sel = 0;
+        self.clip_page.scroll = 0;
+        self.clip_page.reload();
+        tracing_note(&format!(
+            "剪贴板搜索提交 commit={commit} qlen={} edit={}",
+            self.clip_page.filter.chars().count(),
+            edit.0 as isize
+        ));
+        self.clip_page.status = Some(if self.clip_page.filter.is_empty() {
+            "筛选已清除".to_string()
+        } else {
+            format!("筛选：{}", self.clip_page.filter)
+        });
+        self.refresh_clip_page(hwnd);
+    }
+
+    /// 剪贴板页的键盘：↑↓/Enter/Del/Tab/Ctrl+P/Ctrl+1..6。
+    fn handle_clip_key(&mut self, hwnd: HWND, vk: usize) -> bool {
+        let (w, h) = self.client_dip(hwnd);
+        let rows = clipboard_page::layout_for(w, h).rows;
+        let ctrl = (unsafe { GetKeyState(0x11) } as u16 & 0x8000) != 0;
+        const VK_TAB: usize = 0x09;
+        if vk == VK_TAB {
+            let next = match self.clip_page.mode {
+                clipboard_page::Mode::History => clipboard_page::Mode::Snippets,
+                clipboard_page::Mode::Snippets => clipboard_page::Mode::Stats,
+                clipboard_page::Mode::Stats => clipboard_page::Mode::History,
+            };
+            self.clip_page.set_mode(next);
+            self.clip_page.reload();
+            if next == clipboard_page::Mode::Stats {
+                self.hide_clip_search_edit();
+            } else {
+                self.place_clip_search_edit(hwnd);
+            }
+            self.refresh_clip_page(hwnd);
+            return true;
+        }
+        if self.clip_page.mode == clipboard_page::Mode::Stats {
+            return false;
+        }
+        match vk {
+            0x26 => {
+                self.clip_page.move_selection(-1, rows);
+                self.refresh_clip_page(hwnd);
+                true
+            }
+            0x28 => {
+                self.clip_page.move_selection(1, rows);
+                self.refresh_clip_page(hwnd);
+                true
+            }
+            0x24 => {
+                self.clip_page.sel = 0;
+                self.clip_page.clamp_selection(rows);
+                self.refresh_clip_page(hwnd);
+                true
+            }
+            0x23 => {
+                self.clip_page.sel = self.clip_page.rows().len().saturating_sub(1);
+                self.clip_page.clamp_selection(rows);
+                self.refresh_clip_page(hwnd);
+                true
+            }
+            0x21 => {
+                self.clip_page.move_selection(-(rows as i32), rows);
+                self.refresh_clip_page(hwnd);
+                true
+            }
+            0x22 => {
+                self.clip_page.move_selection(rows as i32, rows);
+                self.refresh_clip_page(hwnd);
+                true
+            }
+            0x0D => {
+                self.copy_clip_selected(hwnd);
+                true
+            }
+            0x2E => {
+                self.delete_clip_selected(hwnd);
+                true
+            }
+            0x50 if ctrl => {
+                self.pin_clip_selected(hwnd);
+                true
+            }
+            v @ 0x31..=0x36 if ctrl => {
+                let idx = v - 0x31;
+                if let Some(t) = focusflow_core::clipboard::Transform::ALL.get(idx).copied() {
+                    let Some(row) = self.clip_page.selected().cloned() else {
+                        return true;
+                    };
+                    match t.apply(&row.content) {
+                        Ok(text) => match focusflow_core::clipboard::write_text(&text) {
+                            Ok(()) => {
+                                self.clip_page.status =
+                                    Some(format!("已{}并复制到剪贴板", t.label()))
+                            }
+                            Err(e) => self.clip_page.status = Some(format!("复制失败：{e}")),
+                        },
+                        Err(e) => self.clip_page.status = Some(e),
+                    }
+                    self.refresh_clip_page(hwnd);
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -2552,9 +3039,10 @@ impl App {
         changed |= self.heat_hover.take().is_some();
         changed |= self.chart_hover.take().is_some();
         let hover = match ctl {
-            Some(Ctl::SetRow(i)) | Some(Ctl::TableRow(i)) | Some(Ctl::PluginList(i)) => {
-                Some(i as usize)
-            }
+            Some(Ctl::SetRow(i))
+            | Some(Ctl::TableRow(i))
+            | Some(Ctl::PluginList(i))
+            | Some(Ctl::ClipRow(i)) => Some(i as usize),
             _ => None,
         };
         if hover != self.hover {
@@ -2669,6 +3157,11 @@ impl App {
                 }
                 return;
             }
+        }
+
+        if self.view == 7 {
+            self.on_clip_click(hwnd, w, h, x, y);
+            return;
         }
 
         if self.view == 3 {
@@ -3921,7 +4414,7 @@ impl App {
     /// 收监听线程交来的复制件，入附属库。写库留在 UI 线程（单写者）。
     ///
     /// 通道里只有监听线程放进来的 `Captured`，一拍最多几十条；空的时候只花一次 `try_recv`。
-    fn pump_clipboard(&mut self) {
+    fn pump_clipboard(&mut self, hwnd: HWND) {
         // 关掉记录之后，通道里可能还躺着关掉前 100ms 内收到的一件：直接丢掉。
         let enabled = focusflow_core::config::instance().get_bool("clipboard", "enabled", true);
         let mut got = 0usize;
@@ -3966,6 +4459,15 @@ impl App {
         if got > 0 {
             // 弹窗开着就标脏，下一帧重查；没开时这一声只是一次原子读。
             clipboard_popup::notify_changed();
+            if self.view == 7 {
+                self.clip_page.reload();
+                let (w, h) = self.client_dip(hwnd);
+                self.clip_page
+                    .clamp_selection(clipboard_page::layout_for(w, h).rows);
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
         }
     }
 
@@ -4880,6 +5382,18 @@ impl App {
                                 self.status = Some(format!("插件字段回写失败：{err}"));
                                 tracing_note(self.status.as_deref().unwrap_or(""));
                             }
+                        }
+                    }
+                    EditTarget::SnippetName(id) => {
+                        match focusflow_core::clipboard::rename_snippet(id, &text) {
+                            Ok(true) => {
+                                self.clip_page.reload();
+                                self.clip_page.status = Some("片段已重命名".to_string());
+                            }
+                            Ok(false) => {
+                                self.clip_page.status = Some("这个片段已经不在了".to_string())
+                            }
+                            Err(err) => self.clip_page.status = Some(format!("重命名失败：{err}")),
                         }
                     }
                 }
@@ -6447,6 +6961,8 @@ struct ViewState {
     /// 设置页那个搜索框（原生 EDIT）此刻有没有焦点。父窗只在它**没有**焦点时往框里写提示
     /// 文案 —— 有焦点时那块矩形归控件画，两边同时写就是"字体闪烁"（见 `SEARCH_CUE`）。
     search_focused: bool,
+    /// 剪贴板管理页的搜索框此刻有没有焦点（同上：有焦点时提示文案不归父窗画）。
+    clip_search_focused: bool,
     /// 采集真的起来了没有 / 是不是暂停着 / 最近 60 秒的次数。
     collector_on: bool,
     collector_paused: bool,
@@ -6603,6 +7119,8 @@ fn draw_screen(
     snap: &Snapshot,
     // 内置看板页算好的那一页（数字在 core 的 `dashboard`，这里只排版）
     dash: &focusflow_core::dashboard::DashBoard,
+    // 剪贴板管理页的状态（列表/模式/多选都在这一份里）
+    clip: &clipboard_page::ClipPage,
     vs: ViewState,
     detail: Option<&DeviceDetail>,
     status: Option<&str>,
@@ -6802,6 +7320,8 @@ fn draw_screen(
         // 第 7 个页签：内置看板页。它排在 `v => draw_placeholder` 前面是必须的 ——
         // 那一支是"还没做的页签"的兜底，漏进来就会把这一页画成一句占位文案。
         6 => draw_board_page(p, w, h, dash, vs),
+        // 第 8 个页签：剪贴板管理页。
+        7 => draw_clipboard_page(p, w, h, clip, vs),
         v => draw_placeholder(p, w, h, v),
     }
 
@@ -6934,7 +7454,7 @@ fn draw_window_buttons(p: &P<'_>, w: f32, vs: ViewState) {
     }
 }
 
-const VIEWS: [&str; 7] = [
+const VIEWS: [&str; 8] = [
     "键鼠排行",
     "应用排行",
     "设备排行",
@@ -6944,11 +7464,13 @@ const VIEWS: [&str; 7] = [
     // 第 7 个页签（方案 14 节第 5 项按默认执行）：位置排在最后，
     // 前面六个的索引与坐标一个字都不动 —— 它们各有命中测试与验收夹具按位置点。
     "看板",
+    // 第 8 个页签：剪贴板管理页。看板那三颗范围胶囊从这一格右边起（见 `dashboard.rs`）。
+    "剪贴板",
 ];
 
 /// 顶部视图页签的位置：画图与命中测试共用。
-fn view_tabs() -> [D2D_RECT_F; 7] {
-    let mut out = [rect(0.0, 0.0, 0.0, 0.0); 7];
+fn view_tabs() -> [D2D_RECT_F; 8] {
+    let mut out = [rect(0.0, 0.0, 0.0, 0.0); 8];
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = rect(16.0 + i as f32 * 84.0, 172.0, 80.0, 26.0);
     }
@@ -10563,7 +11085,336 @@ fn draw_board_page(
     );
 }
 
-/// 看板页下半部的纵向布局：趋势一块 + 两张排行卡。
+/// 第 8 页：剪贴板管理。列表/模式/多选的状态在 `clipboard_page.rs`，这里只排版。
+fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPage, vs: ViewState) {
+    use clipboard_page::Mode;
+
+    let lay = clipboard_page::layout_for(w, h);
+
+    // 三个模式页签：历史 / 片段 / 统计。
+    for (i, mode) in clipboard_page::MODES.iter().enumerate() {
+        let r = lay.tabs[i];
+        let active = clip.mode == *mode;
+        if active {
+            p.round(r, R_CONTROL, &p.br.accent, None);
+        } else {
+            p.round(r, R_CONTROL, &p.br.card, Some(&p.br.border));
+            if vs.ctl == Some(Ctl::ClipTab(i as u8)) {
+                p.round(r, R_CONTROL, &p.br.hover, None);
+            }
+        }
+        p.text(
+            mode.label(),
+            rect(r.left, r.top, r.right - r.left, r.bottom - r.top),
+            &p.fmt.tab,
+            if active { &p.br.white } else { &p.br.muted },
+        );
+    }
+
+    // 搜索框：底框由主窗画，真正的输入是叠在上面的原生 EDIT（拿到焦点才显示）。
+    if clip.mode != Mode::Stats {
+        let sr = lay.search;
+        p.round(sr, R_CONTROL, &p.br.card, Some(&p.br.border));
+        let cue = if !clip.filter.trim().is_empty() {
+            format!("筛选：{}", clip.filter)
+        } else {
+            "筛选历史 / 片段（Enter 生效）".to_string()
+        };
+        if !vs.clip_search_focused {
+            let cue = p.clip(&cue, &p.fmt.caption, sr.right - sr.left - 20.0);
+            p.text(
+                &cue,
+                rect(
+                    sr.left + 10.0,
+                    sr.top,
+                    sr.right - sr.left - 20.0,
+                    sr.bottom - sr.top,
+                ),
+                &p.fmt.caption,
+                if clip.filter.trim().is_empty() {
+                    &p.br.muted
+                } else {
+                    &p.br.fg
+                },
+            );
+        }
+    }
+
+    // 工具钮：历史与片段两套文案，同一份几何。
+    if clip.mode != Mode::Stats {
+        let labels: [&str; 6] = if clip.mode == Mode::History {
+            ["复制", "固定", "删除", "存为片段", "清空", "多选"]
+        } else {
+            ["复制", "重命名", "删除", "", "", "多选"]
+        };
+        let has_row = clip.selected().is_some();
+        for (i, label) in labels.iter().enumerate() {
+            if label.is_empty() {
+                continue;
+            }
+            let r = lay.toolbar[i];
+            let enabled = has_row || *label == "清空" || *label == "多选";
+            p.round(r, R_CONTROL, &p.br.card, Some(&p.br.border));
+            if vs.ctl == Some(Ctl::ClipBtn(i as u8)) && enabled {
+                p.round(r, R_CONTROL, &p.br.hover, None);
+            }
+            p.text(
+                label,
+                rect(r.left, r.top, r.right - r.left, r.bottom - r.top),
+                &p.fmt.caption,
+                if enabled { &p.br.fg } else { &p.br.muted },
+            );
+        }
+        if clip.multi {
+            let count = clip.checked_count();
+            p.text(
+                &format!("已选 {count} 条"),
+                rect(
+                    lay.toolbar[5].right + 10.0,
+                    lay.toolbar[5].top,
+                    160.0,
+                    lay.toolbar[5].bottom - lay.toolbar[5].top,
+                ),
+                &p.fmt.caption,
+                &p.br.accent,
+            );
+        }
+    }
+
+    // 列表卡片
+    let card = rect(
+        lay.pad(),
+        lay.list_top - 8.0,
+        w - lay.pad() * 2.0,
+        lay.list_bottom - (lay.list_top - 8.0),
+    );
+    p.card(card, R_CARD);
+
+    match clip.mode {
+        Mode::Stats => draw_clipboard_stats(p, clip, lay, w),
+        _ => {
+            let rows = clip.rows();
+            if rows.is_empty() {
+                let msg = match clip.mode {
+                    Mode::History if !clip.filter.trim().is_empty() => "没有匹配的记录",
+                    Mode::History => "还没有记录：复制一段文字试试",
+                    Mode::Snippets if !clip.filter.trim().is_empty() => "没有匹配的片段",
+                    Mode::Snippets => "还没有片段：在历史里点「存为片段」",
+                    Mode::Stats => "",
+                };
+                p.text(
+                    msg,
+                    rect(
+                        lay.list_top,
+                        lay.list_top + 16.0,
+                        w - lay.pad() * 2.0 - 16.0,
+                        24.0,
+                    ),
+                    &p.fmt.body,
+                    &p.br.muted,
+                );
+            } else {
+                let visible = lay.rows.min(rows.len().saturating_sub(clip.scroll));
+                for i in 0..visible {
+                    let idx = clip.scroll + i;
+                    let Some(row) = rows.get(idx) else { break };
+                    let top = lay.list_top + i as f32 * lay.row_h;
+                    let selected = !clip.multi && idx == clip.sel;
+                    let checked = clip.multi && clip.checked.contains(&row.id);
+                    let rr = rect(lay.pad() + 4.0, top, w - lay.pad() * 2.0 - 8.0, lay.row_h);
+                    if selected || checked {
+                        p.round(rr, R_CONTROL, &p.br.hover, None);
+                    }
+                    let mut left = rr.left + 8.0;
+                    if clip.multi {
+                        p.text(
+                            if checked { "✓" } else { "○" },
+                            rect(left, top + 9.0, 18.0, 20.0),
+                            &p.fmt.caption,
+                            if checked { &p.br.accent } else { &p.br.muted },
+                        );
+                        left += 22.0;
+                    }
+                    if clip.mode == Mode::History {
+                        p.text(
+                            &row.time,
+                            rect(left, top + 9.0, 86.0, 20.0),
+                            &p.fmt.caption,
+                            &p.br.muted,
+                        );
+                        let source = p.clip(&row.source, &p.fmt.caption, 112.0);
+                        p.text(
+                            &source,
+                            rect(left + 88.0, top + 9.0, 112.0, 20.0),
+                            &p.fmt.caption,
+                            &p.br.muted,
+                        );
+                        let preview = clipboard_page::preview_text(&row.content);
+                        let preview = p.clip(
+                            &preview,
+                            &p.fmt.body,
+                            (rr.right - left - 88.0 - 112.0 - 26.0).max(20.0),
+                        );
+                        p.text(
+                            &preview,
+                            rect(
+                                left + 202.0,
+                                top + 8.0,
+                                rr.right - left - 202.0 - 26.0,
+                                22.0,
+                            ),
+                            &p.fmt.body,
+                            &p.br.fg,
+                        );
+                        if row.pinned {
+                            p.text(
+                                "★",
+                                rect(rr.right - 24.0, top + 8.0, 18.0, 20.0),
+                                &p.fmt.caption,
+                                &p.br.accent,
+                            );
+                        }
+                    } else {
+                        let name = p.clip(&row.name, &p.fmt.body, 180.0);
+                        p.text(
+                            &name,
+                            rect(left, top + 8.0, 180.0, 22.0),
+                            &p.fmt.body,
+                            &p.br.fg,
+                        );
+                        let preview = clipboard_page::preview_text(&row.content);
+                        let preview = p.clip(
+                            &preview,
+                            &p.fmt.caption,
+                            (rr.right - left - 188.0).max(20.0),
+                        );
+                        p.text(
+                            &preview,
+                            rect(left + 188.0, top + 9.0, rr.right - left - 188.0, 20.0),
+                            &p.fmt.caption,
+                            &p.br.muted,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 底部：状态 / 条数 / 暂停与筛选口径。
+    let total = clip.rows().len();
+    let selected = clip
+        .checked_count()
+        .max(usize::from(clip.selected().is_some()));
+    let mut footer = if let Some(status) = &clip.status {
+        status.clone()
+    } else if clip.multi {
+        format!("已选 {selected} 条 · 工具钮作用于勾住的行 · Tab 切模式 · Esc 退出多选")
+    } else {
+        match clip.mode {
+            Mode::History => {
+                "↑↓ 选择 · Enter 复制 · Del 删除 · Ctrl+P 固定 · Tab 切模式".to_string()
+            }
+            Mode::Snippets => "↑↓ 选择 · Enter 复制 · Del 删除 · Tab 切模式".to_string(),
+            Mode::Stats => "Tab 切回历史 · 只统计次数，不展示内容".to_string(),
+        }
+    };
+    if clip.mode != Mode::Stats {
+        footer.push_str(&format!(" · {total} 条"));
+        if !clip.filter.trim().is_empty() {
+            footer.push_str(" · 已筛选");
+        }
+    }
+    if focusflow_core::clipboard::is_paused() {
+        footer.push_str(" · 记录已暂停");
+    }
+    let footer = p.clip(&footer, &p.fmt.caption, w - lay.pad() * 2.0);
+    p.text(
+        &footer,
+        rect(lay.pad(), lay.footer_y, w - lay.pad() * 2.0, 20.0),
+        &p.fmt.caption,
+        &p.br.muted,
+    );
+    if clip.mode != Mode::Stats {
+        let pos = if total == 0 {
+            "0/0".to_string()
+        } else {
+            format!("{}/{}", (clip.scroll + lay.rows).min(total), total)
+        };
+        p.text(
+            &pos,
+            rect(w - lay.pad() - 70.0, lay.footer_y, 60.0, 20.0),
+            &p.fmt.caption,
+            &p.br.muted,
+        );
+    }
+}
+
+fn draw_clipboard_stats(
+    p: &P<'_>,
+    clip: &clipboard_page::ClipPage,
+    lay: clipboard_page::Layout,
+    w: f32,
+) {
+    let Some(s) = &clip.stats else {
+        p.text(
+            "统计读不出来",
+            rect(lay.list_top, lay.list_top + 16.0, w - lay.pad() * 2.0, 24.0),
+            &p.fmt.body,
+            &p.br.muted,
+        );
+        return;
+    };
+    let lines = [
+        format!("今日复制 {} 次", s.today),
+        format!("最近 {} 天 {} 次", s.window_days, s.window_count),
+        format!(
+            "库里 {} 条（固定 {} 条） · 累计复制 {} 次",
+            s.total_items, s.pinned_items, s.total_copies
+        ),
+    ];
+    let mut y = lay.list_top + 8.0;
+    for line in &lines {
+        p.text(
+            line,
+            rect(lay.pad() + 8.0, y, w - lay.pad() * 2.0 - 16.0, 22.0),
+            &p.fmt.body,
+            &p.br.fg,
+        );
+        y += 26.0;
+    }
+    y += 8.0;
+    p.text(
+        "来源（最近 7 天）",
+        rect(lay.pad() + 8.0, y, w - lay.pad() * 2.0, 20.0),
+        &p.fmt.caption,
+        &p.br.muted,
+    );
+    y += 24.0;
+    if s.per_app.is_empty() {
+        p.text(
+            "还没有来源数据",
+            rect(lay.pad() + 8.0, y, w - lay.pad() * 2.0, 20.0),
+            &p.fmt.caption,
+            &p.br.muted,
+        );
+        return;
+    }
+    for (app, count) in &s.per_app {
+        let name = if app.is_empty() { "未知来源" } else { app };
+        p.text(
+            &p.clip(
+                &format!("{name} · {count} 次"),
+                &p.fmt.caption,
+                w - lay.pad() * 2.0 - 16.0,
+            ),
+            rect(lay.pad() + 8.0, y, w - lay.pad() * 2.0 - 16.0, 20.0),
+            &p.fmt.caption,
+            &p.br.fg,
+        );
+        y += 22.0;
+    }
+}
+
 struct BoardLayout {
     trend_top: f32,
     trend_h: f32,
@@ -12362,6 +13213,8 @@ fn make_tray(
     let snip_folder = MenuItem::with_id("snip_folder", "打开截图文件夹", true, None);
     let floating_item = MenuItem::with_id("floating", "悬浮窗", true, None);
     let clipboard_history = MenuItem::with_id("clipboard_history", "剪贴板历史", true, None);
+    let clipboard_pause_15 =
+        MenuItem::with_id("clipboard_pause_15", "暂停记录 15 分钟", true, None);
     let clipboard_item = CheckMenuItem::with_id(
         "clipboard_pause",
         "记录剪贴板",
@@ -12380,6 +13233,7 @@ fn make_tray(
         &snip_folder,
         &floating_item,
         &clipboard_history,
+        &clipboard_pause_15,
         &clipboard_item,
         &pause,
         &sep,
@@ -14083,12 +14937,13 @@ unsafe extern "system" fn edit_proc(
                 if let Some(on) = search_focus_signal(id, msg) {
                     let owner = GetAncestor(hwnd, GA_ROOTOWNER);
                     if !owner.0.is_null() {
-                        let _ = PostMessageW(
-                            Some(owner),
-                            WM_SEARCH_FOCUS,
-                            WPARAM(on as usize),
-                            LPARAM(0),
-                        );
+                        // 两页的搜索框各有一条回执：设置页与剪贴板页的提示文案分属两块矩形。
+                        let out = if id == CLIP_SEARCH_EDIT_SUBCLASS {
+                            WM_CLIP_SEARCH_FOCUS
+                        } else {
+                            WM_SEARCH_FOCUS
+                        };
+                        let _ = PostMessageW(Some(owner), out, WPARAM(on as usize), LPARAM(0));
                     }
                 }
                 DefSubclassProc(hwnd, msg, w, l)
@@ -14470,7 +15325,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 let on_plugin_page = app.view == 4;
                 app.pump_plugin_reloads(on_plugin_page);
                 // 剪贴板监听线程交来的复制件在这一拍入附属库（写库留在 UI 线程）。
-                app.pump_clipboard();
+                app.pump_clipboard(hwnd);
             }
             // 托盘点击 / 菜单 / 热键只在事件通道里，靠这 100ms 一拍取出来。
             while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
@@ -14529,6 +15384,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     "clipboard_pause" => {
                         if let Some(app) = unsafe { app_ptr(hwnd) } {
                             app.toggle_clipboard(hwnd);
+                        }
+                    }
+                    "clipboard_pause_15" => {
+                        focusflow_core::clipboard::pause_for(15 * 60);
+                        tracing_note("托盘：剪贴板记录暂停 15 分钟");
+                        if let Some(app) = unsafe { app_ptr(hwnd) } {
+                            app.status = Some("剪贴板记录已暂停 15 分钟".to_string());
+                        }
+                        clipboard_popup::notify_changed();
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
                     "pause" => {
@@ -14806,10 +15672,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             }
             LRESULT(0)
         }
+        WM_CLIP_SEARCH_FOCUS => {
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                if app.clip_search_focused != (w.0 != 0) {
+                    app.clip_search_focused = w.0 != 0;
+                    if app.view == 7 {
+                        if app.clip_search_focused {
+                            app.place_clip_search_edit(hwnd);
+                        } else {
+                            app.hide_clip_search_edit();
+                        }
+                    }
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                }
+            }
+            LRESULT(0)
+        }
         WM_EDIT_DONE => {
             tracing_note(&format!("收到 WM_EDIT_DONE code={}", w.0));
             if let Some(app) = unsafe { app_ptr(hwnd) } {
-                app.finish_edit(hwnd, w.0 == 1);
+                // 剪贴板页的搜索框与行内改名共用同一条回执：看焦点的那个 EDIT 是谁。
+                let clip_search = app.view == 7
+                    && app
+                        .clip_search_edit
+                        .is_some_and(|e| unsafe { GetFocus() } == e);
+                if clip_search {
+                    app.commit_clip_search(hwnd, w.0 == 1);
+                } else {
+                    app.finish_edit(hwnd, w.0 == 1);
+                }
             }
             LRESULT(0)
         }
@@ -14903,6 +15794,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             // delta 。
             let delta = ((w.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
             if let Some(app) = unsafe { app_ptr(hwnd) } {
+                // 剪贴板管理页自己有列表：滚轮先给它，别被下面那条"非排行/设置页"的闸吞掉。
+                if app.view == 7 {
+                    let (cw, ch) = app.client_dip(hwnd);
+                    let rows = clipboard_page::layout_for(cw, ch).rows;
+                    app.clip_page
+                        .scroll_by(if delta > 0 { 1 } else { -1 }, rows);
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return LRESULT(0);
+                }
                 // 弹窗打开时滚动归弹窗（它自己没内容可滚，直接吞掉）；
                 // 分析/插件的图表页没有可滚动的列表。
                 if app.detail.is_some() || (app.view > 2 && app.view != 5 && app.view != 4) {

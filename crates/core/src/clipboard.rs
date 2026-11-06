@@ -41,6 +41,33 @@ pub const DEFAULT_EXCLUDE: &str = "1Password.exe,Bitwarden.exe,KeePass.exe,KeePa
 /// 记录之前读到并入库（`GetClipboardSequenceNumber` 在锁内才是稳定的）。
 static SELF_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// 本次运行里的临时暂停（托盘「暂停 15 分钟」）。与 `[clipboard] enabled` 不同：
+/// 这条不落盘，重启就恢复记录；0 = 没暂停。
+static PAUSED_UNTIL_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn pause_for(seconds: i64) {
+    if seconds > 0 {
+        PAUSED_UNTIL_MS.store(
+            now_ms().saturating_add(seconds.saturating_mul(1000)),
+            Ordering::Release,
+        );
+    }
+}
+
+/// 暂停到什么时候（Unix ms）；0 = 没暂停（过期也当没暂停）。
+pub fn pause_until_ms() -> i64 {
+    let until = PAUSED_UNTIL_MS.load(Ordering::Acquire);
+    if until > now_ms() {
+        until
+    } else {
+        0
+    }
+}
+
+pub fn is_paused() -> bool {
+    pause_until_ms() > 0
+}
+
 pub fn note_self_sequence(seq: u32) {
     if seq != 0 {
         SELF_SEQ.store(seq, Ordering::Release);
@@ -413,6 +440,49 @@ pub fn set_pinned(id: i64, pinned: bool) -> Result<bool, String> {
     Ok(n > 0)
 }
 
+/// 批量固定/取消固定，一个事务里做完。交回真正改到的条数。
+pub fn set_pinned_many(ids: &[i64], pinned: bool) -> Result<usize, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let conn = open().map_err(|e| format!("打开剪贴板库失败：{e}"))?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("剪贴板库事务开不起来：{e}"))?;
+    let mut n = 0usize;
+    for id in ids {
+        n += tx
+            .execute(
+                "UPDATE clipboard_items SET pinned=?1 WHERE id=?2",
+                rusqlite::params![if pinned { 1 } else { 0 }, id],
+            )
+            .map_err(|e| format!("更新剪贴板固定状态失败：{e}"))?;
+    }
+    tx.commit()
+        .map_err(|e| format!("提交剪贴板固定状态失败：{e}"))?;
+    Ok(n)
+}
+
+/// 批量删除，一个事务里做完。
+pub fn delete_many(ids: &[i64]) -> Result<usize, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let conn = open().map_err(|e| format!("打开剪贴板库失败：{e}"))?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("剪贴板库事务开不起来：{e}"))?;
+    let mut n = 0usize;
+    for id in ids {
+        n += tx
+            .execute("DELETE FROM clipboard_items WHERE id=?1", [id])
+            .map_err(|e| format!("删除剪贴板条目失败：{e}"))?;
+    }
+    tx.commit()
+        .map_err(|e| format!("提交剪贴板删除失败：{e}"))?;
+    Ok(n)
+}
+
 pub fn delete(id: i64) -> Result<bool, String> {
     let conn = open().map_err(|e| format!("打开剪贴板库失败：{e}"))?;
     let n = conn
@@ -584,6 +654,21 @@ pub fn delete_snippet(id: i64) -> Result<bool, String> {
     let n = conn
         .execute("DELETE FROM clipboard_snippets WHERE id=?1", [id])
         .map_err(|e| format!("删除片段失败：{e}"))?;
+    Ok(n > 0)
+}
+
+pub fn rename_snippet(id: i64, name: &str) -> Result<bool, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("片段名不能为空".to_string());
+    }
+    let conn = open().map_err(|e| format!("打开剪贴板库失败：{e}"))?;
+    let n = conn
+        .execute(
+            "UPDATE clipboard_snippets SET name=?1 WHERE id=?2",
+            rusqlite::params![name, id],
+        )
+        .map_err(|e| format!("重命名片段失败：{e}"))?;
     Ok(n > 0)
 }
 
@@ -978,7 +1063,7 @@ mod win {
 
     fn capture_once() {
         let cfg = capture_config();
-        if !cfg.enabled {
+        if !cfg.enabled || super::is_paused() {
             return;
         }
         let owner = super::super::capture::win::clip_owner_hwnd().ok();
@@ -1360,5 +1445,15 @@ mod tests {
         assert_eq!(key.len(), 10);
         assert_eq!(&key[4..5], "-");
         assert_eq!(&key[7..8], "-");
+    }
+
+    #[test]
+    fn pause_is_session_only_and_expires() {
+        pause_for(3600);
+        assert!(is_paused(), "暂停一小时之内应当算暂停");
+        assert!(pause_until_ms() > now_ms());
+        PAUSED_UNTIL_MS.store(0, Ordering::Release);
+        assert!(!is_paused(), "清掉之后立刻恢复记录");
+        assert_eq!(pause_until_ms(), 0);
     }
 }

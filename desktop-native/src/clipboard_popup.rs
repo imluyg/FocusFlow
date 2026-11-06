@@ -58,6 +58,7 @@ const MENU_DELETE: u32 = 3;
 const MENU_SNIPPET: u32 = 4;
 const MENU_STATS: u32 = 5;
 const MENU_CLEAR: u32 = 6;
+const MENU_PAUSE_15: u32 = 7;
 const MENU_TRANSFORM_BASE: u32 = 100;
 /// 抢前台的重试定时器（只给弹窗自己用，和主窗的 100ms 心跳不冲突）。
 const ACTIVATE_TIMER: usize = 0x0C1A;
@@ -913,6 +914,19 @@ unsafe extern "system" fn edit_proc(
         if handle_key(parent, vk) {
             return LRESULT(0);
         }
+        // Ctrl+1..6：右击菜单里那六种文本加工也给了键盘入口（菜单标签上带着 \tCtrl+N）。
+        if ctrl && (0x31..=0x36).contains(&vk) {
+            let idx = (vk - 0x31) as usize;
+            if let Some(t) = Transform::ALL.get(idx).copied() {
+                let copied = with_state(parent, |st| st.apply_transform(t)).unwrap_or(false);
+                if copied {
+                    hide_inner(parent, true);
+                } else {
+                    let _ = InvalidateRect(Some(parent), None, false);
+                }
+            }
+            return LRESULT(0);
+        }
         // Ctrl+P 固定：`handle_key` 不接修饰键，单独判一次。
         if ctrl && vk == 0x50 {
             with_state(parent, |st| st.toggle_pin());
@@ -1145,7 +1159,7 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
     }
 
     // 底部提示 / 状态
-    let footer = if let Some(status) = &st.status {
+    let mut footer = if let Some(status) = &st.status {
         status.clone()
     } else {
         match st.mode {
@@ -1156,6 +1170,9 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
             Mode::Stats => "Tab 回历史 · Esc 关闭".to_string(),
         }
     };
+    if focusflow_core::clipboard::is_paused() {
+        footer.push_str(" · 记录已暂停");
+    }
     let muted = st.pal.muted;
     draw_str(
         hdc,
@@ -1455,8 +1472,10 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
             let _ = AppendMenuW(menu, MF_STRING, MENU_SNIPPET as usize, w!("存为片段"));
             if let Ok(sub) = CreatePopupMenu() {
                 for (i, t) in Transform::ALL.iter().enumerate() {
-                    let label: Vec<u16> =
-                        t.label().encode_utf16().chain(std::iter::once(0)).collect();
+                    let label: Vec<u16> = format!("{}\tCtrl+{}", t.label(), i + 1)
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
                     let _ = AppendMenuW(
                         sub,
                         MF_STRING,
@@ -1469,6 +1488,12 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
         }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, w!(""));
         let _ = AppendMenuW(menu, MF_STRING, MENU_STATS as usize, w!("统计"));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_PAUSE_15 as usize,
+            w!("暂停记录 15 分钟"),
+        );
         if mode == Mode::History {
             let _ = AppendMenuW(
                 menu,
@@ -1513,6 +1538,12 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
                 st.scroll = 0;
             });
             update_edit_visibility(hwnd);
+        }
+        MENU_PAUSE_15 => {
+            clipboard::pause_for(15 * 60);
+            with_state(hwnd, |st| {
+                st.status = Some("记录已暂停 15 分钟".to_string())
+            });
         }
         MENU_CLEAR => {
             let answer = unsafe {

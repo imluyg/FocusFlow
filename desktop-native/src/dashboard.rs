@@ -34,7 +34,7 @@ fn box_rect(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
 }
 
 /// 顶部那一排的宽度/间距，与 `main.rs` 的 `view_tabs()` 同一把尺子（80 宽、84 一节），
-/// 胶囊排在七个页签右边。
+/// 胶囊排在八个页签右边。
 const TAB_PITCH: f32 = 84.0;
 const TAB_FIRST_X: f32 = 16.0;
 const TAB_Y: f32 = 172.0;
@@ -53,7 +53,7 @@ pub fn range_pills() -> [(DashRange, D2D_RECT_F); 3] {
         *slot = (
             RANGES[i],
             box_rect(
-                TAB_FIRST_X + (7.0 + i as f32) * TAB_PITCH,
+                TAB_FIRST_X + (8.0 + i as f32) * TAB_PITCH,
                 TAB_Y,
                 RANGE_W,
                 TAB_H,
@@ -122,20 +122,20 @@ impl Dash {
 mod tests {
     use super::*;
 
-    /// 三个胶囊必须**排在七个页签右边**、互不重叠、且宽度落在页签那一行的同一条带上。
+    /// 三个胶囊必须**排在八个页签右边**、互不重叠、且宽度落在页签那一行的同一条带上。
     ///
     /// 钉这三件事是因为这一族几何只被两处读（画 + 命中），写歪一格的症状是
     /// "点『本月』选上的是『本周』"或者胶囊压住最后一个页签，而两个都答不上"是谁吃的那一脚"。
     #[test]
-    fn the_range_pills_sit_right_of_the_seven_tabs() {
+    fn the_range_pills_sit_right_of_the_eight_tabs() {
         let pills = range_pills();
         let names: Vec<DashRange> = pills.iter().map(|(r, _)| *r).collect();
         assert_eq!(
             names,
             vec![DashRange::Today, DashRange::Week, DashRange::Month]
         );
-        // 七个页签占 16 + i*84（i=0..6），最后一个的右边界
-        let last_tab_right = TAB_FIRST_X + 6.0 * TAB_PITCH + 80.0;
+        // 八个页签占 16 + i*84（i=0..7），最后一个的右边界
+        let last_tab_right = TAB_FIRST_X + 7.0 * TAB_PITCH + 80.0;
         assert!(
             pills[0].1.left >= last_tab_right,
             "第一个胶囊压在最右边那个页签上: 页签到 {}，胶囊从 {}",
@@ -180,7 +180,7 @@ mod tests {
             }
         }
         // 与页签也不能贴边：页签是 80 宽 / 84 一节，最后一张的右边界
-        let last_tab_right = TAB_FIRST_X + 6.0 * TAB_PITCH + 80.0;
+        let last_tab_right = TAB_FIRST_X + 7.0 * TAB_PITCH + 80.0;
         assert!(
             pills[0].1.left > last_tab_right,
             "第一个胶囊与最右那个页签贴边了"
@@ -255,31 +255,55 @@ mod tests {
         /// 页签加了一个，就必须同时加在**三处**：标签表、坐标表、以及分发那一支。
         /// 少第三处的症状最难发现 —— 页签画出来了、也点得动，画面却是"这个页面还没做"。
         #[test]
-        fn the_seventh_tab_is_declared_drawn_and_dispatched() {
+        fn the_tabs_are_declared_drawn_and_dispatched() {
             let p = prod();
-            assert_eq!(
-                p.matches("\"看板\"").count(),
-                1,
-                "页签标签应当只有 `VIEWS` 那一份"
+            for label in ["\"看板\"", "\"剪贴板\""] {
+                assert_eq!(
+                    p.matches(label).count(),
+                    1,
+                    "页签标签应当只有 `VIEWS` 那一份"
+                );
+            }
+            assert!(
+                p.contains("const VIEWS: [&str; 8]"),
+                "页签标签表不是 8 个 —— 新加的那一页根本没有入口"
             );
             assert!(
-                p.contains("const VIEWS: [&str; 7]"),
-                "页签标签表还是 6 个 —— 新加的那一页根本没有入口"
-            );
-            assert!(
-                p.contains("fn view_tabs() -> [D2D_RECT_F; 7]"),
-                "坐标表还是 6 格：标签有 7 个而位置只有 6 个，索引会越界或被截掉"
+                p.contains("fn view_tabs() -> [D2D_RECT_F; 8]"),
+                "坐标表不是 8 格：标签有 8 个而位置只有 7 个，索引会越界或被截掉"
             );
             let f = flat(&p);
-            let dispatch = f
+            let board = f
                 .find("6=>draw_board_page(p,w,h,dash,vs)")
-                .expect("分发里没有这一页：它会落到 draw_placeholder 那句占位文案");
+                .expect("看板页的分发不见了");
+            let clip = f
+                .find("7=>draw_clipboard_page(p,w,h,clip,vs)")
+                .expect("剪贴板页的分发不见了：它会落到 draw_placeholder 那句占位文案");
             let fallback = f
                 .find("v=>draw_placeholder(p,w,h,v)")
                 .expect("兜底那一支不在了（页签越界时画面会消失）");
             assert!(
-                dispatch < fallback,
+                board < fallback && clip < fallback,
                 "新页签必须排在 `v => draw_placeholder` 兜底**之前**，否则永远走不到"
+            );
+        }
+
+        /// 剪贴板页的数只能从 core 的 `clipboard` 要；桌面端不许自己写 SQL。
+        #[test]
+        fn the_clipboard_page_asks_core_and_reloads_on_entry() {
+            let f = flat(&prod());
+            assert!(
+                f.contains("self.clip_page.reload()"),
+                "进剪贴板页没有重查：翻到的会是上一次离开时的旧列表"
+            );
+            assert!(
+                f.contains("focusflow_core::clipboard::"),
+                "剪贴板页没有走 core 的读取口"
+            );
+            assert_eq!(
+                f.matches("SELECT ").count(),
+                0,
+                "桌面端生产段里出现了 SQL 语句：查库的口子应当只在 core"
             );
         }
 

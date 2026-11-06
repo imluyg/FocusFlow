@@ -43,6 +43,23 @@ function Get-LogLines {
     @(Read-AppLog $WorkDir)
 }
 
+# The app's clipboard listener opens the clipboard briefly on every change; a test writer
+# racing with it gets "cannot open clipboard". Retry instead of treating that as a product
+# failure (a real user's clipboard manager behaves the same way).
+function Set-ClipboardRetry([string]$Text) {
+    for ($i = 0; $i -lt 20; $i++) {
+        try { Set-Clipboard -Value $Text; return } catch { Start-Sleep -Milliseconds 150 }
+    }
+    throw "Set-Clipboard failed after retries"
+}
+
+function Get-ClipboardRetry {
+    for ($i = 0; $i -lt 20; $i++) {
+        try { return (Get-Clipboard -Raw) } catch { Start-Sleep -Milliseconds 150 }
+    }
+    return $null
+}
+
 function Wait-LogMatch([string]$Pattern, [int]$TimeoutMs = 6000) {
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     while ((Get-Date) -lt $deadline) {
@@ -80,7 +97,7 @@ Set-ConfigLine $app 'hotkey' 'clipboard' $hotCombo
 Set-ConfigLine $app 'clipboard' 'enabled' 'true'
 
 $orig = $null
-try { $orig = Get-Clipboard -Raw } catch { }
+try { $orig = Get-ClipboardRetry } catch { }
 
 Remove-Item $logPath -ErrorAction SilentlyContinue
 "exe : $Exe"
@@ -97,10 +114,10 @@ Check 'clipboard hotkey is registered' (@($log | Where-Object { $_ -like "*clipb
 
 # Two external copies through the real clipboard: the older one first, the marker last,
 # so the palette's selection starts on the marker and Down can move to the older item.
-Set-Clipboard -Value $older
+Set-ClipboardRetry $older
 Check 'first external copy is captured' (Wait-LogMatch '*clip_ingest*' 6000)
 Start-Sleep -Milliseconds 400
-Set-Clipboard -Value $marker
+Set-ClipboardRetry $marker
 Check 'second external copy is captured' (Wait-LogMatch '*clip_ingest*' 6000)
 $before = Wait-IngestCountStable
 
@@ -132,7 +149,7 @@ Check 'Enter closes the palette' $hidden
 Check 'Enter reports a successful copy' (Wait-LogMatch '*clip_enter copied=true*' 3000)
 
 $clip = ''
-try { $clip = Get-Clipboard -Raw } catch { }
+try { $clip = Get-ClipboardRetry } catch { }
 Check 'Enter puts the selected (older) item on the clipboard' ($null -ne $clip -and $clip.Trim() -eq $older)
 
 # Give the listener time to see the app's own write; it must be suppressed.
@@ -140,6 +157,16 @@ Start-Sleep -Milliseconds 1000
 $after = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest*' }).Count
 Check 'the app does not capture its own clipboard write' ($after -eq $before)
 
+# Page: open the management page, enable multi-select, pick the first row, pin it.
+[FF]::ClickWindow($h, 644, 183, 1)
+Check 'clipboard management page opens' (Wait-LogMatch '*clip_page_open*' 3000)
+[FF]::ClickWindow($h, 474, 256, 1)
+Start-Sleep -Milliseconds 250
+[FF]::ClickWindow($h, 300, 300, 1)
+Start-Sleep -Milliseconds 250
+[FF]::ClickWindow($h, 138, 256, 1)
+Check 'page bulk pin runs' (Wait-LogMatch '*clip_page_pin*' 3000)
+
 Stop-App $Exe
-if ($null -ne $orig) { try { Set-Clipboard -Value $orig } catch { } }
+if ($null -ne $orig) { try { Set-ClipboardRetry $orig } catch { } }
 Show-Summary

@@ -133,3 +133,37 @@ fn stats_separate_apps_and_count_window() {
     assert_eq!(s.per_app[0], ("notepad.exe".to_string(), 2));
     assert_eq!(s.per_app[1], ("chrome.exe".to_string(), 1));
 }
+
+#[test]
+fn bulk_pin_and_delete_and_snippet_rename() {
+    let _lock = paths::test_app_dir_lock();
+    let _dir = setup("clip_bulk");
+    let t = clipboard::now_ms();
+    let a = match clipboard::ingest("bulk-a", "", t).unwrap() {
+        IngestOutcome::Stored { id, .. } => id,
+        _ => panic!("bulk-a 应当入库"),
+    };
+    let b = match clipboard::ingest("bulk-b", "", t + 1).unwrap() {
+        IngestOutcome::Stored { id, .. } => id,
+        _ => panic!("bulk-b 应当入库"),
+    };
+
+    assert_eq!(clipboard::set_pinned_many(&[a, b], true).unwrap(), 2);
+    assert!(clipboard::list_recent(10).unwrap().iter().all(|i| i.pinned));
+
+    let sid = clipboard::add_snippet("old-name", "snippet body").unwrap();
+    assert!(clipboard::rename_snippet(sid, "new-name").unwrap());
+    assert_eq!(clipboard::snippets().unwrap()[0].name, "new-name");
+    assert!(
+        clipboard::rename_snippet(sid, "   ").is_err(),
+        "空白名不该写进去"
+    );
+
+    assert_eq!(clipboard::delete_many(&[a, b]).unwrap(), 2);
+    assert!(clipboard::list_recent(10).unwrap().is_empty());
+    assert_eq!(
+        clipboard::delete_many(&[]).unwrap(),
+        0,
+        "空 id 列表不报错也不动库"
+    );
+}
