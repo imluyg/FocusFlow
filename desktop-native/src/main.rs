@@ -2603,13 +2603,18 @@ impl App {
             self.refresh_clip_page(hwnd);
             return;
         };
-        match focusflow_core::clipboard::write_text(&row.content) {
-            Ok(()) => {
+        match focusflow_core::clipboard::copy_parts(
+            row.kind,
+            &row.content,
+            row.image_path.as_deref(),
+            &row.file_paths,
+        ) {
+            Ok(msg) => {
                 if self.clip_page.mode == clipboard_page::Mode::Snippets {
                     let _ = focusflow_core::clipboard::touch_snippet(row.id);
                 }
-                tracing_note(&format!("clip_page_copy len={}", row.content.len()));
-                self.clip_page.status = Some("已复制到剪贴板（Ctrl+V 粘贴）".to_string());
+                tracing_note(&format!("clip_page_copy kind={:?}", row.kind));
+                self.clip_page.status = Some(format!("{msg}（Ctrl+V 粘贴）"));
             }
             Err(e) => self.clip_page.status = Some(format!("复制失败：{e}")),
         }
@@ -2687,6 +2692,11 @@ impl App {
             self.refresh_clip_page(hwnd);
             return;
         };
+        if row.kind != focusflow_core::clipboard::ClipKind::Text {
+            self.clip_page.status = Some("图片/文件条目不能存为片段".to_string());
+            self.refresh_clip_page(hwnd);
+            return;
+        }
         match focusflow_core::clipboard::add_snippet("", &row.content) {
             Ok(_) => self.clip_page.status = Some("已存为片段（Tab 切到片段）".to_string()),
             Err(e) => self.clip_page.status = Some(format!("存为片段失败：{e}")),
@@ -2944,6 +2954,11 @@ impl App {
                     let Some(row) = self.clip_page.selected().cloned() else {
                         return true;
                     };
+                    if row.kind != focusflow_core::clipboard::ClipKind::Text {
+                        self.clip_page.status = Some("只有文本条目能加工".to_string());
+                        self.refresh_clip_page(hwnd);
+                        return true;
+                    }
                     match t.apply(&row.content) {
                         Ok(text) => match focusflow_core::clipboard::write_text(&text) {
                             Ok(()) => {
@@ -4426,18 +4441,48 @@ impl App {
                         if !enabled {
                             continue;
                         }
-                        match focusflow_core::clipboard::ingest(
-                            &c.text,
-                            &c.source_app,
-                            c.copied_at_ms,
-                        ) {
-                            Ok(focusflow_core::clipboard::IngestOutcome::Stored { id, dedup }) => {
+                        use focusflow_core::clipboard::{Captured, IngestOutcome};
+                        let (outcome, log_line) = match &c {
+                            Captured::Text {
+                                text,
+                                source_app,
+                                copied_at_ms,
+                            } => (
+                                focusflow_core::clipboard::ingest(text, source_app, *copied_at_ms),
+                                format!("clip_ingest len={}", text.len()),
+                            ),
+                            Captured::Image {
+                                stored,
+                                source_app,
+                                copied_at_ms,
+                            } => (
+                                focusflow_core::clipboard::ingest_image(
+                                    stored,
+                                    source_app,
+                                    *copied_at_ms,
+                                ),
+                                format!("clip_ingest_image {}x{}", stored.width, stored.height),
+                            ),
+                            Captured::Files {
+                                paths,
+                                source_app,
+                                copied_at_ms,
+                            } => (
+                                focusflow_core::clipboard::ingest_files(
+                                    paths,
+                                    source_app,
+                                    *copied_at_ms,
+                                ),
+                                format!("clip_ingest_files n={}", paths.len()),
+                            ),
+                        };
+                        match outcome {
+                            Ok(IngestOutcome::Stored { id, dedup }) => {
                                 got += 1;
-                                // 验收脚本靠这一行判"真的入库了"；只报长度与条目标识，
+                                // 验收脚本靠这一行判"真的入库了"；只报类型/长度与条目标识，
                                 // 内容一个字都不进日志。
                                 tracing_note(&format!(
-                                    "剪贴板收录 clip_ingest id={id} dedup={dedup} len={}",
-                                    c.text.len()
+                                    "剪贴板收录 clip_ingest id={id} dedup={dedup} {log_line}"
                                 ));
                             }
                             Ok(_) => {}
@@ -11086,6 +11131,60 @@ fn draw_board_page(
 }
 
 /// 第 8 页：剪贴板管理。列表/模式/多选的状态在 `clipboard_page.rs`，这里只排版。
+/// 把一份已解码的缩略图画进 `r`（等比缩放、居中）。建位图失败就当这一张没有，
+/// 调用方会退回文字徽标 —— 缩略图是加分项，不该让整行画不出来。
+fn draw_clip_thumb(p: &P<'_>, t: &clipboard_page::Thumb, r: D2D_RECT_F) -> bool {
+    if t.w == 0 || t.h == 0 || r.right <= r.left || r.bottom <= r.top {
+        return false;
+    }
+    // D2D 的预乘 alpha：直通会把半透明缩略图画成一圈黑边。
+    let mut bgra = Vec::with_capacity(t.rgba.len());
+    for px in t.rgba.as_chunks::<4>().0 {
+        let a = px[3] as u32;
+        let f = |c: u8| ((c as u32 * a + 127) / 255) as u8;
+        bgra.extend_from_slice(&[f(px[2]), f(px[1]), f(px[0]), a as u8]);
+    }
+    let props = D2D1_BITMAP_PROPERTIES {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+    };
+    unsafe {
+        let Ok(bmp) = p.rt.CreateBitmap(
+            D2D_SIZE_U {
+                width: t.w,
+                height: t.h,
+            },
+            Some(bgra.as_ptr() as *const core::ffi::c_void),
+            t.w * 4,
+            &props,
+        ) else {
+            return false;
+        };
+        let bw = r.right - r.left;
+        let bh = r.bottom - r.top;
+        let scale = (bw / t.w as f32).min(bh / t.h as f32);
+        let (dw, dh) = (t.w as f32 * scale, t.h as f32 * scale);
+        let dest = D2D_RECT_F {
+            left: r.left + (bw - dw) / 2.0,
+            top: r.top + (bh - dh) / 2.0,
+            right: r.left + (bw + dw) / 2.0,
+            bottom: r.top + (bh + dh) / 2.0,
+        };
+        p.rt.DrawBitmap(
+            &bmp,
+            Some(&dest),
+            1.0,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+            None,
+        );
+    }
+    true
+}
+
 fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPage, vs: ViewState) {
     use clipboard_page::Mode;
 
@@ -11197,7 +11296,7 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
             if rows.is_empty() {
                 let msg = match clip.mode {
                     Mode::History if !clip.filter.trim().is_empty() => "没有匹配的记录",
-                    Mode::History => "还没有记录：复制一段文字试试",
+                    Mode::History => "还没有记录：复制一段文字、图片或文件试试",
                     Mode::Snippets if !clip.filter.trim().is_empty() => "没有匹配的片段",
                     Mode::Snippets => "还没有片段：在历史里点「存为片段」",
                     Mode::Stats => "",
@@ -11236,6 +11335,26 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
                         left += 22.0;
                     }
                     if clip.mode == Mode::History {
+                        // 类型列：图片有缩略图就画图，否则画一个「图」「件」小签。
+                        // 位置对所有行都留出来，时间/来源列不会随类型左右跳。
+                        if row.kind != focusflow_core::clipboard::ClipKind::Text {
+                            let slot = rect(left, top + 6.0, 28.0, rr.bottom - 6.0 - (top + 6.0));
+                            let drew = row
+                                .thumb_path
+                                .as_deref()
+                                .and_then(|path| clip.thumb(path))
+                                .is_some_and(|t| draw_clip_thumb(p, &t, slot));
+                            if !drew {
+                                p.round(slot, R_CONTROL, &p.br.card, Some(&p.br.border));
+                                p.text(
+                                    clipboard_page::kind_badge(row.kind),
+                                    slot,
+                                    &p.fmt.caption,
+                                    &p.br.accent,
+                                );
+                            }
+                        }
+                        left += 30.0;
                         p.text(
                             &row.time,
                             rect(left, top + 9.0, 86.0, 20.0),
@@ -11249,7 +11368,7 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
                             &p.fmt.caption,
                             &p.br.muted,
                         );
-                        let preview = clipboard_page::preview_text(&row.content);
+                        let preview = clipboard_page::row_preview(row);
                         let preview = p.clip(
                             &preview,
                             &p.fmt.body,

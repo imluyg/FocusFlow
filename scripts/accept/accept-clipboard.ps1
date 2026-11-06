@@ -167,6 +167,77 @@ Start-Sleep -Milliseconds 250
 [FF]::ClickWindow($h, 138, 256, 1)
 Check 'page bulk pin runs' (Wait-LogMatch '*clip_page_pin*' 3000)
 
+# ---- v1.2: images and files through the real clipboard ----
+# .NET's SetImage publishes CF_DIB (BI_BITFIELDS) here; the app has to parse it (and the
+# synthesized CF_DIB from CF_BITMAP sources) to count as "copied an image".
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+$imgFile = Join-Path $WorkDir 'accept-clip-image.png'
+$bmp = New-Object System.Drawing.Bitmap 64, 48
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.Clear([System.Drawing.Color]::FromArgb(210, 60, 40))
+$g.Dispose()
+$bmp.Save($imgFile, [System.Drawing.Imaging.ImageFormat]::Png)
+
+$imgSet = $false
+for ($i = 0; $i -lt 20; $i++) {
+    try {
+        $img = [System.Drawing.Image]::FromFile($imgFile)
+        [System.Windows.Forms.Clipboard]::SetImage($img)
+        $img.Dispose()
+        $imgSet = $true
+        break
+    } catch { Start-Sleep -Milliseconds 150 }
+}
+Check 'external image copy is published' $imgSet
+Check 'external image is captured' (Wait-LogMatch '*clip_ingest_image*' 8000)
+$imgDir = Join-Path $app 'data\clipboard\images'
+$thumbDir = Join-Path $app 'data\clipboard\thumbs'
+$pngs = @()
+if (Test-Path $imgDir) { $pngs = @(Get-ChildItem $imgDir -Filter *.png) }
+$thumbs = @()
+if (Test-Path $thumbDir) { $thumbs = @(Get-ChildItem $thumbDir -Filter *.png) }
+Check 'image is stored on disk with a thumbnail' (($pngs.Count -ge 1) -and ($thumbs.Count -ge 1))
+
+# File entry: copy a real file, then delete it so the page has to say the path is gone.
+$fileFixture = Join-Path $WorkDir 'accept-clip-file.txt'
+Set-Content -Path $fileFixture -Value 'accept-clip-file' -Encoding UTF8
+$fileSet = $false
+for ($i = 0; $i -lt 20; $i++) {
+    try { Set-Clipboard -Path $fileFixture; $fileSet = $true; break } catch { Start-Sleep -Milliseconds 150 }
+}
+Check 'external file copy is published' $fileSet
+Check 'external file is captured' (Wait-LogMatch '*clip_ingest_files*' 8000)
+
+Remove-Item $fileFixture -Force
+Set-ClipboardRetry $marker
+Check 'missing file rows are marked on the page' (Wait-LogMatch '*clip_page_missing_files*' 8000)
+
+# Copy the image back from the page: re-copy it (dedupe only moves it to the top), leave
+# the pinned row alone, click the first unpinned row and press the Copy tool button.
+$imgSet2 = $false
+for ($i = 0; $i -lt 20; $i++) {
+    try {
+        $img = [System.Drawing.Image]::FromFile($imgFile)
+        [System.Windows.Forms.Clipboard]::SetImage($img)
+        $img.Dispose()
+        $imgSet2 = $true
+        break
+    } catch { Start-Sleep -Milliseconds 150 }
+}
+Check 'image can be copied a second time' $imgSet2
+Start-Sleep -Milliseconds 1200
+# Leave multi-select first: while it is on, a row click toggles a checkbox and Copy acts on
+# the checked row (still the pinned text), not on the row under the cursor.
+[FF]::ClickWindow($h, 474, 256, 1)
+Start-Sleep -Milliseconds 250
+[FF]::ClickWindow($h, 300, 340, 1)
+Start-Sleep -Milliseconds 250
+[FF]::ClickWindow($h, 54, 256, 1)
+Check 'page copy sends the image back to the clipboard' (Wait-LogMatch '*clip_page_copy kind=Image*' 4000)
+$hasImage = $false
+try { $hasImage = [System.Windows.Forms.Clipboard]::ContainsImage() } catch { }
+Check 'clipboard holds an image after copying the image row' $hasImage
+
 Stop-App $Exe
 if ($null -ne $orig) { try { Set-ClipboardRetry $orig } catch { } }
 Show-Summary

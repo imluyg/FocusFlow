@@ -165,8 +165,9 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     // ⚠ 这一节的两个键必须写在同一次 `s()` 里：那个 helper 是 `map.insert`，
     // 同一个节名调两次 = 后一次把前一次整节顶掉（`hide_floating` 会当场消失）。
     s("snip", &[("hide_floating", "true"), ("loupe", "true")]);
-    // 剪贴板历史：只收纯文本。`exclude` 是进程名清单（逗号分隔，缺扩展名按 .exe 补）；
+    // 剪贴板历史：文本 / 图片 / 文件。`exclude` 是进程名清单（逗号分隔，缺扩展名按 .exe 补）；
     // 三个隐私格式（应用自己声明"别收"）在运行时另有一层，改这里不会关掉那一层。
+    // `max_total_mb` 是未固定条目的总预算（图片按落盘 PNG 算），0 = 不设上限。
     s(
         "clipboard",
         &[
@@ -174,6 +175,8 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             ("max_items", "500"),
             ("retention_days", "30"),
             ("max_text_bytes", "16384"),
+            ("max_image_bytes", "8388608"),
+            ("max_total_mb", "64"),
             ("exclude", crate::clipboard::DEFAULT_EXCLUDE),
         ],
     );

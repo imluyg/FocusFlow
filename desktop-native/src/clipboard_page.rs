@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 
-use focusflow_core::clipboard::{self, ClipItem, ClipStats, Snippet};
+use focusflow_core::clipboard::{self, ClipItem, ClipKind, ClipStats, Snippet};
 
 /// 列表一次最多取多少条。弹窗是 100；管理页给到 500，够翻旧记录，也不至于把
 /// 一次切页变成整库扫描。
@@ -65,9 +65,20 @@ pub struct Row {
     pub source: String,
     pub time: String,
     pub pinned: bool,
+    pub kind: ClipKind,
+    pub image_path: Option<String>,
+    pub thumb_path: Option<String>,
+    pub file_paths: Vec<String>,
+    /// 文件条目里已经不在磁盘上的路径数（显示时明说，别让人以为还能粘）。
+    pub missing_files: usize,
 }
 
 fn row_from_item(item: ClipItem) -> Row {
+    let missing_files = if item.kind == ClipKind::File {
+        clipboard::split_alive_paths(&item.file_paths).1.len()
+    } else {
+        0
+    };
     Row {
         id: item.id,
         content: item.content,
@@ -79,6 +90,11 @@ fn row_from_item(item: ClipItem) -> Row {
         },
         time: short_time(item.copied_at),
         pinned: item.pinned,
+        kind: item.kind,
+        image_path: item.image_path,
+        thumb_path: item.thumb_path,
+        file_paths: item.file_paths,
+        missing_files,
     }
 }
 
@@ -94,7 +110,38 @@ fn row_from_snippet(s: Snippet) -> Row {
         source: String::new(),
         time: short_time(s.created_at),
         pinned: false,
+        kind: ClipKind::Text,
+        image_path: None,
+        thumb_path: None,
+        file_paths: Vec::new(),
+        missing_files: 0,
     }
+}
+
+/// 类型徽标（没有缩略图时画在行首）。文本条目不画，保持旧版面干净。
+pub fn kind_badge(kind: ClipKind) -> &'static str {
+    match kind {
+        ClipKind::Text => "",
+        ClipKind::Image => "图",
+        ClipKind::File => "件",
+    }
+}
+
+/// 行内那句话：文件条目把"有几个已经失效"写在后面。
+pub fn row_preview(row: &Row) -> String {
+    let text = preview_text(&row.content);
+    if row.kind == ClipKind::File && row.missing_files > 0 {
+        format!("{text}（{} 个已失效）", row.missing_files)
+    } else {
+        text
+    }
+}
+
+/// 已解码的缩略图像素。缓存只放 RGBA：位图属于渲染目标，每帧按需建、用完即放。
+pub struct Thumb {
+    pub rgba: Vec<u8>,
+    pub w: u32,
+    pub h: u32,
 }
 
 pub fn short_time(ms: i64) -> String {
@@ -124,6 +171,10 @@ pub struct ClipPage {
     /// 多选模式下勾住的条目 id。
     pub checked: HashSet<i64>,
     pub status: Option<String>,
+    /// 缩略图解码缓存。解一份 PNG 几百微秒，但一帧要画十来行、拖滚动条时每帧都画；
+    /// 缓存 64 份、按先来先出，内存上界约 64 × 160×160×4 ≈ 6 MB。
+    thumbs: std::cell::RefCell<std::collections::HashMap<String, Option<std::rc::Rc<Thumb>>>>,
+    thumb_order: std::cell::RefCell<std::collections::VecDeque<String>>,
 }
 
 impl Default for ClipPage {
@@ -145,7 +196,33 @@ impl ClipPage {
             multi: false,
             checked: HashSet::new(),
             status: None,
+            thumbs: std::cell::RefCell::new(std::collections::HashMap::new()),
+            thumb_order: std::cell::RefCell::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// 取一份已解码的缩略图。读不出来就记一个 `None`，同一张坏图不会每帧都去读盘。
+    pub fn thumb(&self, path: &str) -> Option<std::rc::Rc<Thumb>> {
+        if let Some(hit) = self.thumbs.borrow().get(path) {
+            return hit.clone();
+        }
+        let decoded = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| clipboard::decode_png_rgba_loose(&bytes).ok())
+            .map(|(rgba, w, h)| std::rc::Rc::new(Thumb { rgba, w, h }));
+        self.thumbs
+            .borrow_mut()
+            .insert(path.to_string(), decoded.clone());
+        let mut order = self.thumb_order.borrow_mut();
+        if !order.iter().any(|p| p == path) {
+            order.push_back(path.to_string());
+        }
+        while order.len() > 64 {
+            if let Some(old) = order.pop_front() {
+                self.thumbs.borrow_mut().remove(&old);
+            }
+        }
+        decoded
     }
 
     pub fn rows(&self) -> &[Row] {
@@ -171,6 +248,12 @@ impl ClipPage {
         match loaded {
             Ok(items) => {
                 self.items = items.into_iter().map(row_from_item).collect();
+                // 失效文件的条数进日志（验收脚本靠它判"界面上确实标出来了"；
+                // 屏上那句话由 `row_preview` 拼，同源）。
+                let missing = self.items.iter().filter(|r| r.missing_files > 0).count();
+                if missing > 0 {
+                    crate::tracing_note(&format!("clip_page_missing_files n={missing}"));
+                }
                 if self.status.as_deref() == Some("读剪贴板库失败") {
                     self.status = None;
                 }
@@ -370,6 +453,35 @@ pub fn search_at(lay: &Layout, x: f32, y: f32) -> bool {
 mod tests {
     use super::*;
 
+    fn test_row(id: i64, content: &str) -> Row {
+        Row {
+            id,
+            content: content.to_string(),
+            name: String::new(),
+            source: String::new(),
+            time: String::new(),
+            pinned: false,
+            kind: ClipKind::Text,
+            image_path: None,
+            thumb_path: None,
+            file_paths: Vec::new(),
+            missing_files: 0,
+        }
+    }
+
+    #[test]
+    fn kind_labels_and_missing_file_note() {
+        let mut row = test_row(1, "2 个文件：a.txt, b.txt");
+        row.kind = ClipKind::File;
+        row.missing_files = 1;
+        assert_eq!(row_preview(&row), "2 个文件：a.txt, b.txt（1 个已失效）");
+        row.missing_files = 0;
+        assert_eq!(row_preview(&row), "2 个文件：a.txt, b.txt");
+        assert_eq!(kind_badge(ClipKind::Image), "图");
+        assert_eq!(kind_badge(ClipKind::File), "件");
+        assert_eq!(kind_badge(ClipKind::Text), "");
+    }
+
     #[test]
     fn layout_keeps_tabs_search_toolbar_and_rows_apart() {
         let lay = layout_for(1200.0, 860.0);
@@ -411,14 +523,7 @@ mod tests {
     fn selection_clamps_and_scrolls_into_view() {
         let mut p = ClipPage::new();
         p.items = (0..10)
-            .map(|i| Row {
-                id: i as i64,
-                content: format!("v{i}"),
-                name: String::new(),
-                source: String::new(),
-                time: String::new(),
-                pinned: false,
-            })
+            .map(|i| test_row(i as i64, &format!("v{i}")))
             .collect();
         p.sel = 9;
         p.clamp_selection(5);
@@ -438,24 +543,7 @@ mod tests {
     #[test]
     fn action_ids_prefer_checked_rows_in_multi_mode() {
         let mut p = ClipPage::new();
-        p.items = vec![
-            Row {
-                id: 1,
-                content: "a".into(),
-                name: String::new(),
-                source: String::new(),
-                time: String::new(),
-                pinned: false,
-            },
-            Row {
-                id: 2,
-                content: "b".into(),
-                name: String::new(),
-                source: String::new(),
-                time: String::new(),
-                pinned: false,
-            },
-        ];
+        p.items = vec![test_row(1, "a"), test_row(2, "b")];
         p.sel = 1;
         assert_eq!(p.action_ids(), vec![2]);
         p.multi = true;

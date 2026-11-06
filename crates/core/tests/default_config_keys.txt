@@ -5,8 +5,10 @@ app_stats/enabled
 app_stats/exclude
 clipboard/enabled
 clipboard/exclude
+clipboard/max_image_bytes
 clipboard/max_items
 clipboard/max_text_bytes
+clipboard/max_total_mb
 clipboard/retention_days
 database/auto_vacuum_days
 database/backup_disabled_plugins

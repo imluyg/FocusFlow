@@ -24,10 +24,7 @@ fn watcher_captures_external_text_and_skips_own_writes() {
     clipboard::write_text("focusflow-self-marker").unwrap();
     std::thread::sleep(Duration::from_millis(400));
     if let Ok(c) = rx.try_recv() {
-        panic!(
-            "程序自己写进剪贴板的文本不该被收录，却收到 {:?}（来源 {:?}，序号 {}）",
-            c.text, c.source_app, c.seq
-        );
+        panic!("程序自己写进剪贴板的文本不该被收录，却收到 {c:?}");
     }
 
     // 真正的外部写入：另起一个进程（clip.exe）设剪贴板。所有者不是我们自己的窗口，
@@ -41,15 +38,131 @@ fn watcher_captures_external_text_and_skips_own_writes() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut got = None;
     while Instant::now() < deadline {
-        if let Ok(c) = rx.recv_timeout(Duration::from_millis(200)) {
-            if c.text.contains("external-marker-42") {
-                got = Some(c);
+        if let Ok(clipboard::Captured::Text {
+            text, source_app, ..
+        }) = rx.recv_timeout(Duration::from_millis(200))
+        {
+            if text.contains("external-marker-42") {
+                got = Some((text, source_app));
                 break;
             }
         }
     }
-    let got = got.expect("外部复制应在 5 秒内交件");
-    assert!(got.text.contains("external-marker-42"));
+    let (text, _source) = got.expect("外部复制应在 5 秒内交件");
+    assert!(text.contains("external-marker-42"));
+
+    watcher.shutdown();
+    if let Some(text) = original {
+        let _ = clipboard::write_text(&text);
+    }
+}
+
+/// 外部进程往剪贴板里放文件（CF_HDROP）与图片（CF_DIB），监听线程应各交来一件，
+/// 并且图片真的落了盘、库里那一行的类型也对。
+///
+/// 为什么走 PowerShell：自写抑制会过滤掉本进程的写入，只有**别的进程**设的剪贴板
+/// 才是"用户复制"的形状。`Set-Clipboard -Path` 交 CF_HDROP；`Clipboard.SetImage`
+/// 交 CF_DIB（不是 PNG 格式），正好覆盖我们自己解析 DIB 的那条路。
+#[test]
+fn watcher_captures_external_files_and_images() {
+    let _lock = paths::test_app_dir_lock();
+    let dir = paths::test_app_dir("clip_watch_img");
+    clipboard::init_db().unwrap();
+
+    let original = clipboard::read_text_for_test();
+    let (mut watcher, rx) = clipboard::start().expect("监听线程应起来");
+    std::thread::sleep(Duration::from_millis(250));
+    while rx.try_recv().is_ok() {}
+
+    fn powershell(script: &str) -> std::process::Output {
+        std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-STA", "-Command", script])
+            .output()
+            .expect("powershell.exe 应能起来")
+    }
+
+    // ---- 文件 ----
+    let file = dir.path().join("剪贴板夹具.txt");
+    std::fs::write(&file, b"fixture").unwrap();
+    let script = format!("Set-Clipboard -Path '{}'", file.display());
+    let out = powershell(&script);
+    assert!(out.status.success(), "Set-Clipboard -Path 失败: {out:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut files = None;
+    while Instant::now() < deadline {
+        if let Ok(clipboard::Captured::Files { paths, .. }) =
+            rx.recv_timeout(Duration::from_millis(200))
+        {
+            files = Some(paths);
+            break;
+        }
+    }
+    let files = files.expect("外部复制文件应在 15 秒内交件");
+    assert!(
+        files.iter().any(|p| p.ends_with("剪贴板夹具.txt")),
+        "交来的路径里应有那个文件：{files:?}"
+    );
+    let outcome = clipboard::ingest_files(&files, "explorer.exe", clipboard::now_ms()).unwrap();
+    let clipboard::IngestOutcome::Stored { id, .. } = outcome else {
+        panic!("文件条目应当入库");
+    };
+    let item = clipboard::get(id).unwrap().unwrap();
+    assert_eq!(item.kind, clipboard::ClipKind::File);
+    assert!(item.content.contains("剪贴板夹具.txt"));
+
+    // ---- 图片 ----
+    let png_path = dir.path().join("夹具.png");
+    let rgba: Vec<u8> = (0..4 * 4)
+        .flat_map(|i| {
+            if i % 2 == 0 {
+                [255u8, 0, 0, 255]
+            } else {
+                [0u8, 0, 255, 255]
+            }
+        })
+        .collect();
+    let png = focusflow_core::capture::encode_png(&rgba, 4, 4).unwrap();
+    std::fs::write(&png_path, &png).unwrap();
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
+         $img = [System.Drawing.Image]::FromFile('{}'); \
+         [System.Windows.Forms.Clipboard]::SetImage($img); $img.Dispose(); \
+         Start-Sleep -Seconds 6",
+        png_path.display()
+    );
+    let out = powershell(&script);
+    assert!(out.status.success(), "SetImage 失败: {out:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut image = None;
+    while Instant::now() < deadline {
+        if let Ok(clipboard::Captured::Image { stored, .. }) =
+            rx.recv_timeout(Duration::from_millis(200))
+        {
+            image = Some(stored);
+            break;
+        }
+    }
+    let stored = image.expect("外部复制图片应在 15 秒内交件");
+    assert_eq!((stored.width, stored.height), (4, 4), "尺寸应原样读回");
+    assert!(stored.png_path.exists(), "原图应落盘");
+    assert!(
+        stored.thumb_path.as_ref().is_some_and(|p| p.exists()),
+        "缩略图应生成"
+    );
+    let clipboard::IngestOutcome::Stored { id, .. } =
+        clipboard::ingest_image(&stored, "paint.exe", clipboard::now_ms()).unwrap()
+    else {
+        panic!("图片条目应当入库");
+    };
+    let item = clipboard::get(id).unwrap().unwrap();
+    assert_eq!(item.kind, clipboard::ClipKind::Image);
+    assert_eq!((item.width, item.height), (4, 4));
+    assert!(item
+        .image_path
+        .as_deref()
+        .is_some_and(|p| std::path::Path::new(p).exists()));
 
     watcher.shutdown();
     if let Some(text) = original {

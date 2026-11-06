@@ -45,7 +45,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
-use focusflow_core::clipboard::{self, ClipItem, ClipStats, Snippet, Transform};
+use focusflow_core::clipboard::{self, ClipItem, ClipKind, ClipStats, Snippet, Transform};
 
 const EDIT_ID: usize = 1;
 /// `EM_SETCUEBANNER`：EDIT 空的时候显示提示字。
@@ -82,6 +82,11 @@ struct Row {
     source: String,
     time: String,
     pinned: bool,
+    kind: ClipKind,
+    image_path: Option<String>,
+    file_paths: Vec<String>,
+    /// 文件条目里已经不在磁盘上的路径数。
+    missing_files: usize,
 }
 
 struct Palette {
@@ -234,8 +239,14 @@ impl State {
         let Some(row) = self.selected().cloned() else {
             return false;
         };
-        match clipboard::write_text(&row.content) {
-            Ok(()) => {
+        // 文本/图片/文件三条路都在 core：图片写回会顺带报出实际交了哪几种格式。
+        match clipboard::copy_parts(
+            row.kind,
+            &row.content,
+            row.image_path.as_deref(),
+            &row.file_paths,
+        ) {
+            Ok(_) => {
                 if self.mode == Mode::Snippets {
                     let _ = clipboard::touch_snippet(row.id);
                 }
@@ -289,6 +300,10 @@ impl State {
         let Some(row) = self.selected().cloned() else {
             return;
         };
+        if row.kind != ClipKind::Text {
+            self.status = Some("图片/文件条目不能存为片段".to_string());
+            return;
+        }
         match clipboard::add_snippet("", &row.content) {
             Ok(_) => {
                 self.reload_all();
@@ -302,6 +317,10 @@ impl State {
         let Some(row) = self.selected().cloned() else {
             return false;
         };
+        if row.kind != ClipKind::Text {
+            self.status = Some("只有文本条目能加工".to_string());
+            return false;
+        }
         match t.apply(&row.content) {
             Ok(text) => match clipboard::write_text(&text) {
                 Ok(()) => true,
@@ -319,6 +338,11 @@ impl State {
 }
 
 fn row_from_item(item: ClipItem) -> Row {
+    let missing_files = if item.kind == ClipKind::File {
+        clipboard::split_alive_paths(&item.file_paths).1.len()
+    } else {
+        0
+    };
     Row {
         id: item.id,
         content: item.content,
@@ -330,6 +354,10 @@ fn row_from_item(item: ClipItem) -> Row {
         },
         time: short_time(item.copied_at),
         pinned: item.pinned,
+        kind: item.kind,
+        image_path: item.image_path,
+        file_paths: item.file_paths,
+        missing_files,
     }
 }
 
@@ -345,6 +373,23 @@ fn row_from_snippet(s: Snippet) -> Row {
         source: String::new(),
         time: short_time(s.created_at),
         pinned: false,
+        kind: ClipKind::Text,
+        image_path: None,
+        file_paths: Vec::new(),
+        missing_files: 0,
+    }
+}
+
+/// 行内文案：图片/文件在预览前加一个类型词，文件再点明失效数。
+fn row_label(row: &Row) -> String {
+    let text = preview_text(&row.content);
+    match row.kind {
+        ClipKind::Text => text,
+        ClipKind::Image => format!("［图］{text}"),
+        ClipKind::File if row.missing_files > 0 => {
+            format!("［件］{text}（{} 个已失效）", row.missing_files)
+        }
+        ClipKind::File => format!("［件］{text}"),
     }
 }
 
@@ -1261,7 +1306,7 @@ unsafe fn draw_rows(hdc: HDC, st: &mut State, lay: Layout, w: i32, card: HBRUSH,
                 font,
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
-            let preview = preview_text(&row.content);
+            let preview = row_label(row);
             draw_str(
                 hdc,
                 &preview,
