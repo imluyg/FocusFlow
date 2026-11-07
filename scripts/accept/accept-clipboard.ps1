@@ -241,7 +241,7 @@ $hasImage = $false
 try { $hasImage = [System.Windows.Forms.Clipboard]::ContainsImage() } catch { }
 Check 'clipboard holds an image after copying the image row' $hasImage
 
-# ---- D batch: Ctrl+A, and delete must ask before it destroys anything ----
+# ---- D batch: live filtering, Ctrl+A, and delete must ask before it destroys anything ----
 function Wait-LogCount([string]$Pattern, [int]$Want, [int]$TimeoutMs = 5000) {
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     while ((Get-Date) -lt $deadline) {
@@ -250,6 +250,25 @@ function Wait-LogCount([string]$Pattern, [int]$Want, [int]$TimeoutMs = 5000) {
     }
     $false
 }
+
+# Click the search box (the drawn rect; the real EDIT only appears once it has focus),
+# then type into that EDIT. Each WM_CHAR changes the text, so EN_CHANGE must reach the
+# window and the list must be filtered without pressing Enter.
+[FF]::ClickWindow($h, 1050, 217, 1)
+Start-Sleep -Milliseconds 400
+$editHost = [FF]::ByClassHandle($p.Id, 'FocusFlowEditHost')
+$se = 0
+if ($editHost -gt 0) { $se = [FF]::ChildByClassHandle($editHost, 'Edit') }
+Check 'clipboard search edit exists after clicking the box' ($se -gt 0)
+if ($se -gt 0) {
+    foreach ($ch in @(0x7A, 0x7A, 0x7A, 0x71)) {   # "zzzq": matches nothing
+        [FF]::PostMessage([IntPtr]$se, 0x0102, [IntPtr]$ch, [IntPtr]::Zero) | Out-Null
+        Start-Sleep -Milliseconds 60
+    }
+}
+Check 'typing filters the list without Enter' (Wait-LogMatch '*clip_page_live_filter len=4 hits=0*' 4000)
+[FF]::PostMessage([IntPtr]$se, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero) | Out-Null
+Check 'Esc clears the live filter' (Wait-LogMatch '*commit=false*' 3000)
 
 [void][FF]::SetForegroundWindow($h)
 Start-Sleep -Milliseconds 300

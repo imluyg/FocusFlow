@@ -120,6 +120,9 @@ pub(crate) const WM_SNIP_NOTE: u32 = WM_APP + 14;
 const WM_SEARCH_FOCUS: u32 = WM_APP + 15;
 /// 剪贴板管理页的搜索框焦点回执（与设置页那个搜索框分开：两页各有一份 EDIT）。
 const WM_CLIP_SEARCH_FOCUS: u32 = WM_APP + 16;
+/// 宿主 EDIT 的文字变了（EN_CHANGE）。宿主不做别的，只把"哪个 EDIT"转给主窗；
+/// 主窗再看它是不是剪贴板页的搜索框 —— 是就地筛，不是等 Enter。
+const WM_EDIT_CHANGED: u32 = WM_APP + 17;
 /// 两个 EDIT 各用哪一个子类 id。子类过程收到的第 5 个参数就是这个 id，
 /// 第 6 个参数是 `SetWindowSubclass` 的 `dwRefData`（两处都传 0，**不能拿它分角色**——
 /// 从前拿它比 2，于是搜索框的焦点永远递不回来，提示文案照旧压在控件上，2026-11-01 屏上量到）。
@@ -2790,6 +2793,35 @@ impl App {
         }
     }
 
+    /// 宿主 EDIT 的文字变了（EN_CHANGE 转进来的）：是剪贴板页的搜索框就当场筛。
+    ///
+    /// 每次按键重查一次库：剪贴板列表上限 500 行、`instr` 扫描，代价与一次翻页同量级。
+    /// 同一个词不再重查 —— `place_clip_search_edit` 回填同一段文字也会触发 EN_CHANGE。
+    fn live_clip_search(&mut self, hwnd: HWND, edit: HWND) {
+        if self.view != 7 || self.clip_search_edit != Some(edit) {
+            return;
+        }
+        let filter = read_hosted_edit_text(edit).trim().to_string();
+        if filter == self.clip_page.filter {
+            return;
+        }
+        self.clip_page.filter = filter;
+        self.clip_page.sel = 0;
+        self.clip_page.scroll = 0;
+        // 片段页筛的是片段列表，得走整份 reload；历史页只重查历史，别连带重算片段与统计。
+        if self.clip_page.mode == clipboard_page::Mode::Snippets {
+            self.clip_page.reload();
+        } else {
+            self.clip_page.reload_items();
+        }
+        tracing_note(&format!(
+            "clip_page_live_filter len={} hits={}",
+            self.clip_page.filter.chars().count(),
+            self.clip_page.rows().len()
+        ));
+        self.refresh_clip_page(hwnd);
+    }
+
     /// 剪贴板页的搜索框：与设置页那个分开建，子类 id 不同，焦点回执也分开。
     fn ensure_clip_search_edit(&mut self, parent: HWND) -> HWND {
         if let Some(e) = self.clip_search_edit {
@@ -2862,20 +2894,7 @@ impl App {
         let Some(edit) = self.clip_search_edit else {
             return;
         };
-        let mut buf = [0u16; 256];
-        // 用 WM_GETTEXT 而不是 GetWindowTextW：这一格是宿主窗下的子 EDIT，跨窗口取文本
-        // 走消息更直白（与设置页搜索框那条 EN_CHANGE 的取值口径也不同，这里只读一次）。
-        let n = unsafe {
-            SendMessageW(
-                edit,
-                0x000D,
-                Some(WPARAM(buf.len())),
-                Some(LPARAM(buf.as_mut_ptr() as isize)),
-            )
-            .0 as usize
-        }
-        .min(buf.len());
-        let text = String::from_utf16_lossy(&buf[..n]);
+        let text = read_hosted_edit_text(edit);
         self.clip_page.filter = if commit {
             text.trim().to_string()
         } else {
@@ -11251,7 +11270,7 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
         let cue = if !clip.filter.trim().is_empty() {
             format!("筛选：{}", clip.filter)
         } else {
-            "筛选历史 / 片段（Enter 生效）".to_string()
+            "筛选历史 / 片段（边打边筛）".to_string()
         };
         if !vs.clip_search_focused {
             let cue = p.clip(&cue, &p.fmt.caption, sr.right - sr.left - 20.0);
@@ -14711,6 +14730,24 @@ unsafe extern "system" fn edit_host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPA
                 }
                 DefWindowProcW(hwnd, msg, w, l)
             }
+            WM_COMMAND => {
+                // EN_CHANGE = 0x0300。EDIT 的 id 是 0（建的时候没给），所以只认通知码。
+                // 只转"字变了"这一种：EN_SETFOCUS/EN_UPDATE 每敲一下会来好几条。
+                let code = ((w.0 >> 16) & 0xFFFF) as u32;
+                if code == 0x0300 {
+                    let owner = GetParent(hwnd).unwrap_or_default();
+                    if !owner.0.is_null() {
+                        let child = GetWindow(hwnd, GW_CHILD).unwrap_or_default();
+                        let _ = PostMessageW(
+                            Some(owner),
+                            WM_EDIT_CHANGED,
+                            WPARAM(child.0 as usize),
+                            LPARAM(0),
+                        );
+                    }
+                }
+                LRESULT(0)
+            }
             _ => DefWindowProcW(hwnd, msg, w, l),
         }
     }
@@ -15117,6 +15154,23 @@ fn cell_inset(r: D2D_RECT_F, inset: f32) -> RECT {
 ///
 /// 回执投给**根属主**（主窗），不是 `GetParent`：行内 EDIT 挂在顶层宿主窗下
 /// （`edit_host_proc`），`GetParent` 拿到的是宿主，主窗永远收不到提交。
+/// 读宿主 EDIT 里的文字。用 `WM_GETTEXT` 而不是 `GetWindowTextW`：这一格是宿主窗下的
+/// 子 EDIT，跨窗口取文本走消息更直白。实时筛与按 Enter 提交共用这一份。
+fn read_hosted_edit_text(edit: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let n = unsafe {
+        SendMessageW(
+            edit,
+            0x000D,
+            Some(WPARAM(buf.len())),
+            Some(LPARAM(buf.as_mut_ptr() as isize)),
+        )
+        .0 as usize
+    }
+    .min(buf.len());
+    String::from_utf16_lossy(&buf[..n])
+}
+
 unsafe extern "system" fn edit_proc(
     hwnd: HWND,
     msg: u32,
@@ -15904,6 +15958,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 } else {
                     app.finish_edit(hwnd, w.0 == 1);
                 }
+            }
+            LRESULT(0)
+        }
+        WM_EDIT_CHANGED => {
+            // 宿主窗只转"哪个 EDIT 的字变了"；是不是剪贴板搜索框由主窗认。
+            if let Some(app) = unsafe { app_ptr(hwnd) } {
+                let edit = HWND(w.0 as *mut core::ffi::c_void);
+                app.live_clip_search(hwnd, edit);
             }
             LRESULT(0)
         }

@@ -261,7 +261,8 @@ impl ClipPage {
         self.rows().get(self.sel)
     }
 
-    pub fn reload(&mut self) {
+    /// 只重查历史列表。实时筛选每敲一个键都要走这里：片段与统计不该跟着重算。
+    pub fn reload_items(&mut self) {
         // 库读不出来与"没有记录"是两件事：前者写进 status，列表留空但会有一句话。
         let filter = self.filter.trim().to_string();
         let loaded = if filter.is_empty() {
@@ -287,6 +288,11 @@ impl ClipPage {
                 self.status = Some(format!("读剪贴板库失败：{e}"));
             }
         }
+    }
+
+    pub fn reload(&mut self) {
+        let filter = self.filter.trim().to_string();
+        self.reload_items();
         let mut snippets: Vec<Row> = match clipboard::snippets() {
             Ok(v) => v.into_iter().map(row_from_snippet).collect(),
             Err(e) => {
