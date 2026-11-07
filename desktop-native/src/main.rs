@@ -144,6 +144,17 @@ fn search_focus_signal(id: usize, msg: u32) -> Option<bool> {
         _ => None,
     }
 }
+
+/// 剪贴板页搜索框里，哪些键该转给页面而不是留给文本框。
+///
+/// 单行 EDIT 对这些键没有文本语义：Tab 是页脚写着的「切模式」，↑↓ / PgUp / PgDn 是列表
+/// 导航。Delete / Home / End 留在文本框里（删字与移光标）；Enter / Esc 另有
+/// `WM_EDIT_DONE` 那条回执。设置页的搜索框不在此列：它后面没有列表。
+fn clip_search_key_goes_to_page(id: usize, msg: u32, vk: usize) -> bool {
+    id == CLIP_SEARCH_EDIT_SUBCLASS
+        && msg == WM_KEYDOWN
+        && matches!(vk, 0x09 | 0x21 | 0x22 | 0x26 | 0x28)
+}
 const TIMER_EVENTS: usize = 1;
 /// EDIT 。
 const EM_SETSEL: u32 = 0x00B1;
@@ -1594,6 +1605,8 @@ impl App {
                 },
                 Err(e) => {
                     tracing_note(&format!("剪贴板库打不开：{e}"));
+                    // 库打不开 ⇒ 监听也不会起：屏上要说出来，不能只在日志里。
+                    focusflow_core::clipboard::report_watcher_fault(format!("剪贴板库打不开：{e}"));
                     (None, None)
                 }
             };
@@ -4587,6 +4600,11 @@ impl App {
         if disconnected {
             tracing_note("剪贴板监听线程已退出：本进程不再收录复制内容");
             self.clip_rx = None;
+            // 故障要当场出现在屏上：弹窗开着就重载页脚，管理页开着就重画。
+            clipboard_popup::notify_changed();
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
         }
         if got > 0 {
             // 弹窗开着就标脏，下一帧重查；没开时这一声只是一次原子读。
@@ -5412,8 +5430,11 @@ impl App {
             // 而 `edit_target` 已经取空，把这一次挡掉。
             self.hide_edit_cell();
             if commit {
-                let mut buf = [0u16; 256];
-                let n = unsafe { GetWindowTextW(e, &mut buf) }.max(0) as usize;
+                // 长度现问：排除清单这类长设置超过 255 字时，固定缓冲会**静默截断**，
+                // 用户保存的清单后一半根本没写进 config。
+                let len = unsafe { GetWindowTextLengthW(e) }.max(0) as usize;
+                let mut buf = vec![0u16; len + 1];
+                let n = (unsafe { GetWindowTextW(e, &mut buf) }.max(0) as usize).min(len);
                 let text = String::from_utf16_lossy(&buf[..n]);
                 match target {
                     EditTarget::Device(key) => {
@@ -11533,6 +11554,12 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
     if focusflow_core::clipboard::is_paused() {
         footer.push_str(" · 记录已暂停");
     }
+    if let Some(why) = focusflow_core::clipboard::watcher_fault() {
+        // 排在最前面：页脚会被夹取，把结论放尾部会被省略号吃掉。原因限一句，
+        // 全文在日志里。
+        let why: String = why.chars().take(40).collect();
+        footer = format!("监听未运行（复制不会收录）：{why} · {footer}");
+    }
     let footer = p.clip(&footer, &p.fmt.caption, w - lay.pad() * 2.0);
     p.text(
         &footer,
@@ -15233,6 +15260,15 @@ unsafe extern "system" fn edit_proc(
     const VK_RETURN: usize = 0x0D;
     const VK_ESCAPE: usize = 0x1B;
     unsafe {
+        // 剪贴板页搜索框：导航键转给主窗（单行 EDIT 会把它们吞掉，页脚的
+        //「Tab 切模式 / ↑↓ 选择」就成了空话）。
+        if clip_search_key_goes_to_page(id, msg, w.0) {
+            let owner = GetAncestor(hwnd, GA_ROOTOWNER);
+            if !owner.0.is_null() {
+                let _ = PostMessageW(Some(owner), WM_KEYDOWN, w, l);
+            }
+            return LRESULT(0);
+        }
         match msg {
             WM_KEYDOWN if w.0 == VK_RETURN || w.0 == VK_ESCAPE => {
                 let code = if w.0 == VK_RETURN { 1 } else { 2 };
@@ -21639,6 +21675,31 @@ mod clip_tests {
             search_focus_signal(0, WM_SETFOCUS),
             None,
             "没带 id 的调用被当成搜索框"
+        );
+    }
+
+    /// 剪贴板页搜索框：导航键必须转给页面，改字键必须留给文本框。
+    #[test]
+    fn clip_search_forwards_navigation_keys_but_keeps_text_keys() {
+        for vk in [0x09, 0x21, 0x22, 0x26, 0x28] {
+            assert!(
+                clip_search_key_goes_to_page(CLIP_SEARCH_EDIT_SUBCLASS, WM_KEYDOWN, vk),
+                "0x{vk:02X} 应当转给页面（Tab/翻页/上下）"
+            );
+        }
+        for vk in [0x2E, 0x24, 0x23] {
+            assert!(
+                !clip_search_key_goes_to_page(CLIP_SEARCH_EDIT_SUBCLASS, WM_KEYDOWN, vk),
+                "0x{vk:02X} 是删字/移光标，必须留给文本框"
+            );
+        }
+        assert!(
+            !clip_search_key_goes_to_page(SEARCH_EDIT_SUBCLASS, WM_KEYDOWN, 0x09),
+            "设置页搜索框后面没有列表，不许抢 Tab"
+        );
+        assert!(
+            !clip_search_key_goes_to_page(CLIP_SEARCH_EDIT_SUBCLASS, WM_CHAR, 0x09),
+            "只接 WM_KEYDOWN：WM_CHAR 是字符输入"
         );
     }
 

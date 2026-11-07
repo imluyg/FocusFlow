@@ -1680,14 +1680,20 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
         st.font_small,
         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
     );
-    if !focusflow_core::config::instance().get_bool("clipboard", "enabled", true) {
+    let right_note = if !focusflow_core::config::instance().get_bool("clipboard", "enabled", true) {
+        Some("记录已关闭（只显示已有条目）".to_string())
+    } else {
+        // 监听线程起不来/退出：旧记录还画得出来，但新的复制一条都不会进来。
+        focusflow_core::clipboard::watcher_fault().map(|why| format!("监听未运行：{why}"))
+    };
+    if let Some(note) = right_note {
         draw_str(
             hdc,
-            "记录已关闭（只显示已有条目）",
-            &rect(w - lay.pad - 180, lay.footer_top, 180, 20),
+            &note,
+            &rect(w - lay.pad - 260, lay.footer_top, 260, 20),
             st.pal.accent,
             st.font_small,
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
     }
 

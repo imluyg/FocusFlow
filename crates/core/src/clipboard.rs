@@ -86,6 +86,31 @@ pub fn is_paused() -> bool {
     pause_until_ms() > 0
 }
 
+/// 监听线程的健康状况：`None` = 正常；`Some(原因)` = 这一跑不会再有新复制进来。
+///
+/// 只在日志里说等于没说：弹窗照常打开、旧记录还在，用户会以为仍在记录。GUI 读它，
+/// 在弹窗与管理页上把结论说出来（原因保留一句，全文在日志里）。
+static WATCHER_FAULT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 采集链路当前有没有故障（`Some` 里是人能读的一句话）。
+pub fn watcher_fault() -> Option<String> {
+    WATCHER_FAULT.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// 采集链路挂掉时留一句话。写它的三处：监听线程起不来、线程退出、启动时库打不开。
+pub fn report_watcher_fault(reason: impl Into<String>) {
+    if let Ok(mut slot) = WATCHER_FAULT.lock() {
+        *slot = Some(reason.into());
+    }
+}
+
+/// 监听真的起来了才清：启动失败后被别处顺手清掉，下一条故障就没出口了。
+fn clear_watcher_fault() {
+    if let Ok(mut slot) = WATCHER_FAULT.lock() {
+        *slot = None;
+    }
+}
+
 /// 复制后是否自动向原窗口粘贴（v2 自动粘贴）。
 ///
 /// 默认开：剪贴板弹窗的主路径就是"选中即粘"，还要用户再按一次 Ctrl+V 等于让热键白按。
@@ -2033,25 +2058,33 @@ mod win {
             Ok(j) => j,
             Err(e) => {
                 clear_sender();
-                return Err(format!("剪贴板监听线程起不来：{e}"));
+                let why = format!("剪贴板监听线程起不来：{e}");
+                super::report_watcher_fault(why.clone());
+                return Err(why);
             }
         };
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(hwnd)) => Ok((
-                Watcher {
-                    hwnd,
-                    join: Some(join),
-                },
-                rx,
-            )),
+            Ok(Ok(hwnd)) => {
+                super::clear_watcher_fault();
+                Ok((
+                    Watcher {
+                        hwnd,
+                        join: Some(join),
+                    },
+                    rx,
+                ))
+            }
             Ok(Err(e)) => {
                 let _ = join.join();
                 clear_sender();
+                super::report_watcher_fault(e.clone());
                 Err(e)
             }
             Err(_) => {
                 clear_sender();
-                Err("剪贴板监听线程 5 秒内没有报到".to_string())
+                let why = "剪贴板监听线程 5 秒内没有报到".to_string();
+                super::report_watcher_fault(why.clone());
+                Err(why)
             }
         }
     }
@@ -2087,6 +2120,7 @@ mod win {
                 DispatchMessageW(&msg);
             }
         }
+        super::report_watcher_fault("剪贴板监听线程已退出：本进程不再收录复制内容");
         clear_sender();
     }
 
@@ -2745,6 +2779,16 @@ mod tests {
         PAUSED_UNTIL_MS.store(0, Ordering::Release);
         assert!(!is_paused(), "清掉之后立刻恢复记录");
         assert_eq!(pause_until_ms(), 0);
+    }
+
+    #[test]
+    fn watcher_fault_is_reported_and_cleared() {
+        clear_watcher_fault();
+        assert_eq!(watcher_fault(), None);
+        report_watcher_fault("剪贴板监听线程 5 秒内没有报到");
+        assert!(watcher_fault().is_some_and(|s| s.contains("5 秒内没有报到")));
+        clear_watcher_fault();
+        assert_eq!(watcher_fault(), None, "监听正常之后故障要说没就没");
     }
 
     // ---- v1.2：图片 / 文件 ----
