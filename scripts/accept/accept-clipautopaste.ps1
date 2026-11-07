@@ -181,11 +181,12 @@ Pump 3000
 Check 'a minimized target is restored and pasted into' ($tb.Text.Contains($marker)) `
     "textbox='$($tb.Text)'"
 
-# --- click round: a row click must go through the same finish path as Enter (copy + paste).
+# --- double-click round: a row double-click must go through the same finish path as
+# Enter (copy + paste). A single click only selects now; that half lives in accept-clipboard.
 $tb.Clear()
 [void][FF]::ClickScreen($fx.Handle, [int](($fxRect.Right - $fxRect.Left) / 2), 60, 1)
 Pump 400
-Check 'fixture owns the foreground before the click round' `
+Check 'fixture owns the foreground before the double-click round' `
     ([FF]::GetForegroundWindow() -eq $fx.Handle) `
     "fg=$([FF]::GetForegroundWindow()) fixture=$($fx.Handle)"
 [FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
@@ -193,7 +194,7 @@ Start-Sleep -Milliseconds 900
 $popup4 = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
 $clickVisible = $false
 if ($popup4 -gt 0) { $clickVisible = [FF]::IsWindowVisible([IntPtr]$popup4) }
-Check 'palette opens for the click round' $clickVisible
+Check 'palette opens for the double-click round' $clickVisible
 if ($popup4 -gt 0) {
     $cr = New-Object FF+RECT
     [void][FF]::GetClientRect([IntPtr]$popup4, [ref]$cr)
@@ -202,14 +203,14 @@ if ($popup4 -gt 0) {
     # Row 1 center: list_top 92 + half a 36 px row, scaled exactly like `layout_for`.
     $cy = [int][Math]::Round((92 + 18) * $scale)
     $lp = [IntPtr](($cy * 65536) + ($cx -band 0xFFFF))
-    [FF]::PostMessage([IntPtr]$popup4, 0x0201, [IntPtr]1, $lp) | Out-Null
+    [FF]::PostMessage([IntPtr]$popup4, 0x0203, [IntPtr]1, $lp) | Out-Null
 }
 Pump 2500
-Check 'clicking a row auto-pastes into the target' ($tb.Text.Contains($marker)) `
+Check 'double-clicking a row auto-pastes into the target' ($tb.Text.Contains($marker)) `
     "textbox='$($tb.Text)'"
 $hiddenAfterClick = $true
 if ($popup4 -gt 0) { $hiddenAfterClick = -not [FF]::IsWindowVisible([IntPtr]$popup4) }
-Check 'clicking a row closes the palette' $hiddenAfterClick
+Check 'double-clicking a row closes the palette' $hiddenAfterClick
 
 # --- self-window guard: the app's own main window was in front, so nothing may be pasted.
 $failBefore = @(Get-LogLines | Where-Object { $_ -like '*clip_autopaste ok=false*' }).Count

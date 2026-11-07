@@ -223,11 +223,13 @@ $hiddenAfterAlt = $true
 if ($popup4 -gt 0) { $hiddenAfterAlt = -not [FF]::IsWindowVisible([IntPtr]$popup4) }
 Check 'Alt+1 closes the palette' $hiddenAfterAlt
 
-# ---- Mouse round: a screen click on row 2 must copy that row. Row 1 (the marker) was
-# copied by Alt+1, so "clipboard is now the older text" is a real change, not the old state.
+# ---- Mouse round: a single click only selects. Row 1 (the marker) was copied by Alt+1,
+# so an unchanged clipboard proves the click did not copy; Enter then copies the clicked row.
 [FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
 Start-Sleep -Milliseconds 900
 $popup5 = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+$edit5 = 0
+if ($popup5 -gt 0) { $edit5 = [FF]::ChildByClassHandle($popup5, 'Edit') }
 if ($popup5 -gt 0) {
     $pr = New-Object FF+RECT
     [void][FF]::GetWindowRect([IntPtr]$popup5, [ref]$pr)
@@ -236,16 +238,52 @@ if ($popup5 -gt 0) {
     # Row 2 center: list_top 92 + 1.5 * row_h 36, scaled exactly like `layout_for`.
     $cy = [int][Math]::Round((92 + 36 * 1.5) * $scale)
     [FF]::ClickScreen([IntPtr]$popup5, $cx, $cy, 1)
-    Start-Sleep -Milliseconds 700
+    Start-Sleep -Milliseconds 400
 }
+$visibleAfterClick = $false
+if ($popup5 -gt 0) { $visibleAfterClick = [FF]::IsWindowVisible([IntPtr]$popup5) }
+Check 'a single click keeps the palette open' $visibleAfterClick
 $clickClip = ''
 try { $clickClip = Get-ClipboardRetry } catch { }
-Check 'clicking the second row copies that row' `
-    ($null -ne $clickClip -and $clickClip.Trim() -eq $older) `
-    "clipboard='$clickClip' want='$older'"
+Check 'a single click does not copy' `
+    ($null -ne $clickClip -and $clickClip.Trim() -eq $marker) `
+    "clipboard='$clickClip' still='$marker'"
+if ($edit5 -gt 0) {
+    [FF]::PostMessage([IntPtr]$edit5, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero) | Out-Null
+}
+Start-Sleep -Milliseconds 900
+$afterClickEnter = ''
+try { $afterClickEnter = Get-ClipboardRetry } catch { }
+Check 'Enter after a single click copies the clicked row' `
+    ($null -ne $afterClickEnter -and $afterClickEnter.Trim() -eq $older) `
+    "clipboard='$afterClickEnter' want='$older'"
 $hiddenAfterClick = $true
 if ($popup5 -gt 0) { $hiddenAfterClick = -not [FF]::IsWindowVisible([IntPtr]$popup5) }
-Check 'clicking a row closes the palette' $hiddenAfterClick
+Check 'Enter after a single click closes the palette' $hiddenAfterClick
+
+# ---- Double-click row 1 copies that row and closes.
+[FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+Start-Sleep -Milliseconds 900
+$popup6 = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+if ($popup6 -gt 0) {
+    $cr = New-Object FF+RECT
+    [void][FF]::GetClientRect([IntPtr]$popup6, [ref]$cr)
+    $scale = [FF]::GetDpiForSystem() / 96.0
+    $cx1 = [int](($cr.Right - $cr.Left) / 2)
+    # Row 1 center: list_top 92 + half a 36 px row.
+    $cy1 = [int][Math]::Round((92 + 18) * $scale)
+    $lp = [IntPtr](($cy1 * 65536) + ($cx1 -band 0xFFFF))
+    [FF]::PostMessage([IntPtr]$popup6, 0x0203, [IntPtr]1, $lp) | Out-Null
+    Start-Sleep -Milliseconds 700
+}
+$dblClip = ''
+try { $dblClip = Get-ClipboardRetry } catch { }
+Check 'double-clicking the first row copies it' `
+    ($null -ne $dblClip -and $dblClip.Trim() -eq $marker) `
+    "clipboard='$dblClip' want='$marker'"
+$hiddenAfterDbl = $true
+if ($popup6 -gt 0) { $hiddenAfterDbl = -not [FF]::IsWindowVisible([IntPtr]$popup6) }
+Check 'double-clicking a row closes the palette' $hiddenAfterDbl
 
 # ---- PageDown: from the top row it lands on the last row. Put a neutral text on the
 # clipboard first so "older" is a change, not the state left by the mouse round.

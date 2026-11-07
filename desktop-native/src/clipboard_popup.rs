@@ -42,9 +42,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONQUESTION, MB_YESNO, MESSAGEBOX_STYLE, MF_POPUP, MF_SEPARATOR, MF_STRING, SWP_SHOWWINDOW,
     SW_HIDE, SW_RESTORE, SW_SHOW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
     TRACK_POPUP_MENU_FLAGS, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDOWN, WM_SETFONT, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW, WS_CHILD,
-    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETFONT, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER,
+    WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 use focusflow_core::clipboard::{self, ClipItem, ClipKind, ClipStats, Snippet, Transform};
@@ -1207,6 +1207,26 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
+            // 单击只选中：窗口不关、剪贴板不动。执行粘贴要双击或回车 ——
+            // 与列表类软件的通用习惯一致，也避免想看一眼却误粘进原窗口。
+            let (x, y) = mouse_xy(l);
+            if let Some(idx) = row_at(hwnd, x, y) {
+                with_state(hwnd, |st| {
+                    st.sel = idx;
+                    // 窗口不关了，键盘焦点必须留在搜索框：点完一行还能接着打字筛。
+                    if st.mode == Mode::History {
+                        unsafe {
+                            let _ = SetFocus(Some(st.edit));
+                        }
+                    }
+                });
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
             let (x, y) = mouse_xy(l);
             if let Some(idx) = row_at(hwnd, x, y) {
                 let copied = with_state(hwnd, |st| {
@@ -1631,7 +1651,7 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
     } else {
         match st.mode {
             Mode::History => {
-                "Enter 粘贴 · Ctrl+Enter 只复制 · Tab 片段 · 右键更多 · Esc 关闭".to_string()
+                "单击选中 · 双击/Enter 粘贴 · Ctrl+Enter 只复制 · Tab 片段 · Esc 关闭".to_string()
             }
             Mode::Snippets => "Enter 复制片段 · Del 删除 · Tab 统计 · Esc 关闭".to_string(),
             Mode::Stats => "Tab 回历史 · Esc 关闭".to_string(),
