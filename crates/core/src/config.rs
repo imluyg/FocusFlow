@@ -149,9 +149,12 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             // 默认键沿用上面那三类避让；不复用 shift+f1 而另起一键，是为了让"松手即提交"
             // 那条老手势一个字节都不必改（叠修饰做分岔既容易撞车又不可发现）。
             ("snip_annotate", "shift+f2"),
-            // 剪贴板历史弹窗。刻意避开 ctrl+shift+v（终端/浏览器的纯文本粘贴）与
-            // alt 组合（菜单加速键）；F 键族与另外三条保持同一种直觉。功能关掉时不注册。
-            ("clipboard", "ctrl+shift+f3"),
+            // 剪贴板历史弹窗。默认 alt+v（单修饰键、左手拇指＋食指，按一次出、再按一次收）。
+            // 代价说清楚：全局键会系统级吞掉所有应用的 alt+v，部分本地化软件的"视图"菜单
+            // 助记键就是它。换来的是避开 ctrl+shift+v（终端/浏览器的纯文本粘贴）与
+            // ctrl+alt+v（Word/Excel 的选择性粘贴）——那两条更常用，撞了更疼。
+            // 不想要的人在 config.ini 里改回 ctrl+shift+f3 一类即可。功能关掉时不注册。
+            ("clipboard", "alt+v"),
         ],
     );
     s("floating", &[("enabled", "true")]);
