@@ -2635,26 +2635,27 @@ impl App {
     }
 
     fn pin_clip_selected(&mut self, hwnd: HWND) {
-        let ids = self.clip_page.action_ids();
-        if ids.is_empty() {
-            self.clip_page.status = Some("先选一条".to_string());
-            self.refresh_clip_page(hwnd);
-            return;
-        }
-        let pinned = self
-            .clip_page
-            .rows()
-            .iter()
-            .find(|r| r.id == ids[0])
-            .map(|r| r.pinned)
-            .unwrap_or(false);
-        match focusflow_core::clipboard::set_pinned_many(&ids, !pinned) {
+        let plan = self.clip_page.pin_plan();
+        let (ids, target) = match plan {
+            clipboard_page::PinPlan::WrongMode => {
+                self.clip_page.status = Some("片段不能固定".to_string());
+                self.refresh_clip_page(hwnd);
+                return;
+            }
+            clipboard_page::PinPlan::Empty => {
+                self.clip_page.status = Some("先选一条".to_string());
+                self.refresh_clip_page(hwnd);
+                return;
+            }
+            clipboard_page::PinPlan::Apply { ids, pinned } => (ids, pinned),
+        };
+        match focusflow_core::clipboard::set_pinned_many(&ids, target) {
             Ok(n) => {
-                tracing_note(&format!("clip_page_pin n={n}"));
-                self.clip_page.status = Some(if pinned {
-                    format!("已取消固定 {n} 条")
-                } else {
+                tracing_note(&format!("clip_page_pin n={n} pinned={target}"));
+                self.clip_page.status = Some(if target {
                     format!("已固定 {n} 条（裁剪时不会删）")
+                } else {
+                    format!("已取消固定 {n} 条")
                 });
             }
             Err(e) => self.clip_page.status = Some(format!("更新固定状态失败：{e}")),

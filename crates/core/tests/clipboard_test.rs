@@ -192,6 +192,28 @@ fn stats_separate_apps_and_count_window() {
 }
 
 #[test]
+fn stats_window_is_calendar_days_including_today() {
+    let _lock = paths::test_app_dir_lock();
+    let _dir = setup("clip_stats_window");
+    let day = 86_400_000i64;
+    let now = clipboard::now_ms();
+    clipboard::ingest("today", "", now).unwrap();
+    clipboard::ingest("six days ago", "", now - 6 * day).unwrap();
+    clipboard::ingest("seven days ago", "", now - 7 * day).unwrap();
+
+    let s = clipboard::stats(7).unwrap();
+    assert_eq!(
+        s.window_count, 2,
+        "最近 7 天＝今天＋前 6 天；第 7 天前那条不该算进来"
+    );
+    assert_eq!(
+        clipboard::stats(1).unwrap().window_count,
+        1,
+        "最近 1 天只算今天（旧口径会把昨天一起算进来）"
+    );
+}
+
+#[test]
 fn bulk_pin_and_delete_and_snippet_rename() {
     let _lock = paths::test_app_dir_lock();
     let _dir = setup("clip_bulk");

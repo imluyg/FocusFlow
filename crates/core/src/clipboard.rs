@@ -1114,7 +1114,10 @@ pub fn stats(window_days: i64) -> Result<ClipStats, String> {
     let conn = open().map_err(|e| format!("打开剪贴板库失败：{e}"))?;
     let now = now_ms();
     let today = day_key(now);
-    let since = day_key(now.saturating_sub(window_days.saturating_mul(86_400_000)));
+    // "最近 N 天"是**日历日**，含今天：今天 + 往前 N-1 天。用 `- N` 会多算一天
+    // （7 天窗口变成 8 个日期），与 `db::queries` 那一族 `today - (n - 1)` 的口径对齐。
+    let since =
+        day_key(now.saturating_sub(window_days.saturating_sub(1).saturating_mul(86_400_000)));
     let today_count: i64 = conn
         .query_row(
             "SELECT COALESCE(SUM(count), 0) FROM clipboard_daily WHERE day=?1",

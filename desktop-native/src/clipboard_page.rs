@@ -28,6 +28,14 @@ const LIST_TOP: f32 = 282.0;
 const ROW_H: f32 = 40.0;
 const FOOTER_H: f32 = 34.0;
 
+/// 历史列表读失败时状态条那句话的开头。错误正文带着原因（`：{e}`），比对整串会让
+/// "恢复后清掉这句话"永远不成立。
+const HISTORY_LOAD_ERROR: &str = "读剪贴板库失败";
+
+fn is_history_load_error(status: Option<&str>) -> bool {
+    status.is_some_and(|s| s.starts_with(HISTORY_LOAD_ERROR))
+}
+
 fn box_rect(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
     D2D_RECT_F {
         left: x,
@@ -92,6 +100,20 @@ pub fn row_click_action(multi: bool, shift: bool, row: usize) -> RowClick {
     } else {
         RowClick::Toggle(row)
     }
+}
+
+/// 批量固定的计划。片段表没有 `pinned` 列，而 `action_ids` 交的是**当前模式**下的 id：
+/// 拿着片段 id 去改历史表，改到的是同号那条历史记录（或干脆一条没改）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinPlan {
+    /// 当前模式没有"固定"这个动作。
+    WrongMode,
+    /// 没有可作用的目标。
+    Empty,
+    Apply {
+        ids: Vec<i64>,
+        pinned: bool,
+    },
 }
 
 fn row_from_item(item: ClipItem) -> Row {
@@ -279,13 +301,13 @@ impl ClipPage {
                 if missing > 0 {
                     crate::tracing_note(&format!("clip_page_missing_files n={missing}"));
                 }
-                if self.status.as_deref() == Some("读剪贴板库失败") {
+                if is_history_load_error(self.status.as_deref()) {
                     self.status = None;
                 }
             }
             Err(e) => {
                 self.items.clear();
-                self.status = Some(format!("读剪贴板库失败：{e}"));
+                self.status = Some(format!("{HISTORY_LOAD_ERROR}：{e}"));
             }
         }
     }
@@ -436,6 +458,25 @@ impl ClipPage {
         } else {
             self.selected().map(|r| vec![r.id]).unwrap_or_default()
         }
+    }
+
+    /// `Ctrl+P` / 「固定」按钮的目标状态。
+    ///
+    /// 一条没固定就整批固定；只有全都固定了才整批取消 —— 混选时按第一行的状态取反，
+    /// 会把已经固定的那些悄悄取消掉。
+    pub fn pin_plan(&self) -> PinPlan {
+        if self.mode != Mode::History {
+            return PinPlan::WrongMode;
+        }
+        let ids = self.action_ids();
+        if ids.is_empty() {
+            return PinPlan::Empty;
+        }
+        let rows = self.rows();
+        let pinned = ids
+            .iter()
+            .any(|id| rows.iter().find(|r| r.id == *id).is_some_and(|r| !r.pinned));
+        PinPlan::Apply { ids, pinned }
     }
 
     pub fn checked_count(&self) -> usize {
@@ -677,6 +718,61 @@ mod tests {
         assert!(!p.multi);
         assert!(p.checked.is_empty());
         assert_eq!(p.sel, 0);
+    }
+
+    #[test]
+    fn pin_plan_refuses_snippet_mode_and_fixes_mixed_state() {
+        let mut p = ClipPage::new();
+        p.items = vec![test_row(1, "a"), test_row(2, "b")];
+        p.items[0].pinned = true;
+        p.multi = true;
+        p.checked.insert(1);
+        p.checked.insert(2);
+        assert_eq!(
+            p.pin_plan(),
+            PinPlan::Apply {
+                ids: vec![1, 2],
+                pinned: true
+            },
+            "混选里还有一条没固定 ⇒ 整批固定；不能按第一行的状态取反"
+        );
+
+        p.items[1].pinned = true;
+        assert_eq!(
+            p.pin_plan(),
+            PinPlan::Apply {
+                ids: vec![1, 2],
+                pinned: false
+            },
+            "全都固定了才整批取消"
+        );
+
+        p.set_mode(Mode::Snippets);
+        p.snippets = vec![test_row(1, "snippet")];
+        assert_eq!(
+            p.pin_plan(),
+            PinPlan::WrongMode,
+            "片段 id 不能拿去改历史表（同号会改到别的记录）"
+        );
+
+        p.set_mode(Mode::History);
+        p.items.clear();
+        assert_eq!(p.pin_plan(), PinPlan::Empty);
+    }
+
+    #[test]
+    fn history_error_status_clears_after_a_successful_reload() {
+        let _lock = focusflow_core::paths::test_app_dir_lock();
+        let _dir = focusflow_core::paths::test_app_dir("clip_page_status");
+        focusflow_core::clipboard::init_db().unwrap();
+        let mut p = ClipPage::new();
+        p.status = Some(format!("{HISTORY_LOAD_ERROR}：database is locked"));
+        p.reload_items();
+        assert!(
+            p.status.is_none(),
+            "读失败恢复之后，上一次那句错不该继续留在状态条上（实际：{:?}）",
+            p.status
+        );
     }
 
     #[test]
