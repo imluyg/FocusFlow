@@ -3,6 +3,7 @@
 # 发布用的 zip 模板（.scratch/make_zip.sh）拿这份文件做断言。只钉键、不钉值。
 app_stats/enabled
 app_stats/exclude
+clipboard/auto_paste
 clipboard/enabled
 clipboard/exclude
 clipboard/max_image_bytes

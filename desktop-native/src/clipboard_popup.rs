@@ -27,8 +27,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F1, VK_RETURN,
-    VK_TAB, VK_UP,
+    GetFocus, GetKeyState, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE,
+    VK_F1, VK_RETURN, VK_TAB, VK_UP, VK_V,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -740,6 +741,95 @@ fn claim_foreground(hwnd: HWND) {
     }
 }
 
+/// 复制成功后的收尾：关窗；开了自动粘贴就把焦点还给原窗口并注入 Ctrl+V。
+///
+/// 失败不回滚、也不重开弹窗：内容已经在剪贴板里，退路就是让用户自己按一下 Ctrl+V。
+/// 每一步的结局进日志（`clip_autopaste ok=…`），"没等到回音"不折成成功。
+fn finish_copy(hwnd: HWND, copied: bool) {
+    if !copied {
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        return;
+    }
+    let auto = clipboard::auto_paste_enabled();
+    let prev = with_state(hwnd, |st| st.prev_fg).unwrap_or_default();
+    // 自动粘贴这一路先不还焦点：还焦点与"确认前台真的换了"必须绑在一起判。
+    hide_inner(hwnd, !auto);
+    if auto {
+        match auto_paste_into(prev) {
+            Ok(()) => crate::tracing_note("clip_autopaste ok=true"),
+            Err(e) => crate::tracing_note(&format!("clip_autopaste ok=false why={e}")),
+        }
+    }
+}
+
+/// 目标窗口能不能作为粘贴对象。纯函数：三条否决理由各自能被单测点到。
+fn autopaste_gate(
+    has_target: bool,
+    is_self: bool,
+    foreground_ok: bool,
+) -> Result<(), &'static str> {
+    if !has_target {
+        return Err("没有可粘贴的目标窗口");
+    }
+    if is_self {
+        return Err("目标是本程序自己的窗口");
+    }
+    if !foreground_ok {
+        return Err("焦点没能还给原窗口（前台锁或提权窗口）");
+    }
+    Ok(())
+}
+
+fn auto_paste_into(prev: HWND) -> Result<(), String> {
+    let has_target = !prev.0.is_null() && unsafe { IsWindow(Some(prev)) }.as_bool();
+    let is_self = has_target && clipboard::window_belongs_to_us(prev.0 as isize);
+    autopaste_gate(has_target, is_self, true).map_err(str::to_string)?;
+    claim_foreground(prev);
+    // 前台切换与键盘焦点不是同一跳：给窗口一小段时间，再以"前台确实换了"为准。
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    let foreground_ok = unsafe { GetForegroundWindow() == prev };
+    autopaste_gate(true, false, foreground_ok).map_err(str::to_string)?;
+    send_ctrl_v()
+}
+
+/// 往当前前台窗口注入一次 Ctrl+V。返回值是"插入了几个事件"，被 UIPI 拦下时是 0。
+fn send_ctrl_v() -> Result<(), String> {
+    fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: if up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        KEYBD_EVENT_FLAGS(0)
+                    },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+    let inputs = [
+        key(VK_CONTROL, false),
+        key(VK_V, false),
+        key(VK_V, true),
+        key(VK_CONTROL, true),
+    ];
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent as usize != inputs.len() {
+        return Err(format!(
+            "SendInput 只插入 {sent}/{} 个事件（提权窗口或 UIPI 拦截）",
+            inputs.len()
+        ));
+    }
+    Ok(())
+}
+
 pub fn hide() {
     let hwnd = PALETTE_HWND.load(Ordering::Acquire);
     if hwnd == 0 {
@@ -865,13 +955,7 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                     st.copy_selected()
                 })
                 .unwrap_or(false);
-                if copied {
-                    hide_inner(hwnd, true);
-                } else {
-                    unsafe {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
-                }
+                finish_copy(hwnd, copied);
             }
             LRESULT(0)
         }
@@ -965,11 +1049,7 @@ unsafe extern "system" fn edit_proc(
             let idx = (vk - 0x31) as usize;
             if let Some(t) = Transform::ALL.get(idx).copied() {
                 let copied = with_state(parent, |st| st.apply_transform(t)).unwrap_or(false);
-                if copied {
-                    hide_inner(parent, true);
-                } else {
-                    let _ = InvalidateRect(Some(parent), None, false);
-                }
+                finish_copy(parent, copied);
             }
             return LRESULT(0);
         }
@@ -1003,13 +1083,7 @@ fn handle_key(hwnd: HWND, vk: u32) -> bool {
         x if x == VK_RETURN.0 as u32 => {
             let copied = with_state(hwnd, |st| st.copy_selected()).unwrap_or(false);
             crate::tracing_note(&format!("剪贴板弹窗回车 clip_enter copied={copied}"));
-            if copied {
-                hide_inner(hwnd, true);
-            } else {
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-            }
+            finish_copy(hwnd, copied);
             true
         }
         x if x == VK_ESCAPE.0 as u32 => {
@@ -1564,9 +1638,7 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
     match cmd {
         MENU_COPY => {
             let copied = with_state(hwnd, |st| st.copy_selected()).unwrap_or(false);
-            if copied {
-                hide_inner(hwnd, true);
-            }
+            finish_copy(hwnd, copied);
         }
         MENU_PIN => {
             with_state(hwnd, |st| st.toggle_pin());
@@ -1618,9 +1690,7 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
             let idx = (c - MENU_TRANSFORM_BASE) as usize;
             if let Some(t) = Transform::ALL.get(idx).copied() {
                 let copied = with_state(hwnd, |st| st.apply_transform(t)).unwrap_or(false);
-                if copied {
-                    hide_inner(hwnd, true);
-                }
+                finish_copy(hwnd, copied);
             }
         }
         _ => {}
@@ -1675,6 +1745,23 @@ mod tests {
         assert_eq!(&t[2..3], "-");
         assert_eq!(&t[5..6], " ");
         assert_eq!(&t[8..9], ":");
+    }
+
+    #[test]
+    fn autopaste_gate_names_each_refusal() {
+        assert_eq!(autopaste_gate(true, false, true), Ok(()));
+        assert_eq!(
+            autopaste_gate(false, false, true),
+            Err("没有可粘贴的目标窗口")
+        );
+        assert_eq!(
+            autopaste_gate(true, true, true),
+            Err("目标是本程序自己的窗口")
+        );
+        assert_eq!(
+            autopaste_gate(true, false, false),
+            Err("焦点没能还给原窗口（前台锁或提权窗口）")
+        );
     }
 
     fn label_row(kind: ClipKind, missing: usize) -> Row {

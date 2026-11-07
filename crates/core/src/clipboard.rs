@@ -86,6 +86,19 @@ pub fn is_paused() -> bool {
     pause_until_ms() > 0
 }
 
+/// 复制后是否自动向原窗口粘贴（v2 自动粘贴）。
+///
+/// 默认关：把键击注入别的程序是用户该显式点头的行为。关着的时候弹窗行为与 v1.2 完全一致。
+pub fn auto_paste_enabled() -> bool {
+    crate::config::instance().get_bool("clipboard", "auto_paste", false)
+}
+
+/// 这个窗口是不是本进程的。自动粘贴先要排掉"粘回自己"（比如从主窗打开弹窗）。
+#[cfg(windows)]
+pub fn window_belongs_to_us(hwnd: isize) -> bool {
+    crate::app_stats::window_process_id(hwnd) == Some(std::process::id())
+}
+
 pub fn note_self_sequence(seq: u32) {
     if seq != 0 {
         SELF_SEQ.store(seq, Ordering::Release);

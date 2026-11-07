@@ -98,6 +98,14 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
     ),
     (
         "clipboard",
+        "auto_paste",
+        0,
+        "改完立即生效",
+        "复制后自动粘贴",
+        "剪贴板 · 弹窗复制后自动向原窗口按 Ctrl+V；提权窗口会失败，内容仍在剪贴板",
+    ),
+    (
+        "clipboard",
         "max_items",
         1,
         "下次收录时生效",

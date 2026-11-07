@@ -177,6 +177,7 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             ("max_text_bytes", "16384"),
             ("max_image_bytes", "8388608"),
             ("max_total_mb", "64"),
+            ("auto_paste", "false"),
             ("exclude", crate::clipboard::DEFAULT_EXCLUDE),
         ],
     );

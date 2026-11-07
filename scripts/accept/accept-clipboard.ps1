@@ -147,6 +147,9 @@ $hidden = $true
 if ($popup -gt 0) { $hidden = -not [FF]::IsWindowVisible([IntPtr]$popup) }
 Check 'Enter closes the palette' $hidden
 Check 'Enter reports a successful copy' (Wait-LogMatch '*clip_enter copied=true*' 3000)
+# Auto-paste is opt-in; with the default config nothing may be injected at all.
+Check 'auto-paste stays off by default' `
+    (@(Get-LogLines | Where-Object { $_ -like '*clip_autopaste*' }).Count -eq 0)
 
 $clip = ''
 try { $clip = Get-ClipboardRetry } catch { }
