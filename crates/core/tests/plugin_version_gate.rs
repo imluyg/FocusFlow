@@ -46,8 +46,8 @@ fn a_plugin_asking_for_a_newer_api_is_rejected_before_its_code_runs() {
     let tmp = paths::test_app_dir("api_too_new");
     let p = write_plugin(
         tmp.path(),
-        "wants_v3",
-        "PLUGIN_NAME = \"要 v3 的插件\"\nPLUGIN_API = 3\nerror(\"脚本被执行了\")\n",
+        "wants_v4",
+        "PLUGIN_NAME = \"要 v4 的插件\"\nPLUGIN_API = 4\nerror(\"脚本被执行了\")\n",
     );
     let mut pm = manager_in(tmp.path());
     let e = pm
@@ -58,7 +58,7 @@ fn a_plugin_asking_for_a_newer_api_is_rejected_before_its_code_runs() {
         "要说清是版本不够，而不是笼统一句加载失败: {e}"
     );
     assert!(
-        e.contains("3") && e.contains("2"),
+        e.contains("4") && e.contains("3"),
         "要把\"它要几\"与\"这里到几\"都念出来: {e}"
     );
     assert!(
@@ -77,6 +77,7 @@ fn the_tiers_this_host_knows_still_load() {
         ("no_api", "PLUGIN_NAME = \"没写版本\"\n"),
         ("v1", "PLUGIN_NAME = \"一\"\nPLUGIN_API = 1\n"),
         ("v2", "PLUGIN_NAME = \"二\"\nPLUGIN_API = 2\n"),
+        ("v3", "PLUGIN_NAME = \"三\"\nPLUGIN_API = 3\n"),
     ] {
         let p = write_plugin(tmp.path(), file, body);
         pm.load_plugin(&p, PluginSource::User)
@@ -84,8 +85,8 @@ fn the_tiers_this_host_knows_still_load() {
     }
     assert_eq!(
         pm.list_discovered().expect("清单").len(),
-        3,
-        "三份都该在页上"
+        4,
+        "四份都该在页上"
     );
 }
 

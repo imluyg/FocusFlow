@@ -712,6 +712,32 @@ pub fn search(query: &str, limit: i64) -> Result<Vec<ClipItem>, String> {
         .map_err(|e| format!("读剪贴板搜索结果失败：{e}"))
 }
 
+/// 最近一条**文本**的内容（插件 `clipboard.read_text` 的唯一数据源）。
+///
+/// 只读文本：图片/文件在这一版不对外，所以"最新那条"如果是图片，就往更早找文本，
+/// 而不是把图片的尺寸标签当内容交出去。超过 `max_bytes` 的不截断，带着原因回来 ——
+/// 插件拿到半截文本比拿不到更糟（与收录口径同一条）。
+pub fn latest_text(max_bytes: usize) -> Result<Option<String>, String> {
+    let conn = open().map_err(|e| format!("打开剪贴板库失败：{e}"))?;
+    let row: Option<String> = conn
+        .query_row(
+            "SELECT content FROM clipboard_items
+             WHERE kind='text' ORDER BY copied_at DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("读最近一条文本失败：{e}"))?;
+    match row {
+        None => Ok(None),
+        Some(text) if text.len() > max_bytes => Err(format!(
+            "最近一条文本有 {} 字节，超过上限 {max_bytes} 字节，未交给插件",
+            text.len()
+        )),
+        Some(text) => Ok(Some(text)),
+    }
+}
+
 pub fn get(id: i64) -> Result<Option<ClipItem>, String> {
     let conn = open().map_err(|e| format!("打开剪贴板库失败：{e}"))?;
     conn.query_row(

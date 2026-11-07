@@ -47,6 +47,12 @@ pub enum Kind {
     /// 名字，所以 [`Board::collect_due`] 对它一律不回（那一拍没有新名字就是没变化），
     /// 取走它的载荷走 [`Board::collect_app_change`] 那一条路。
     AppChange,
+    /// 剪贴板收了一条新文本（`on("clipboard", fn)`）。
+    ///
+    /// 与 `AppChange` 同属"件口决定"的那一类：载荷是件口里排队的每一条文本，
+    /// [`Board::collect_clipboard`] 只回"订了这一格的句柄"，去重由件口的队列负责
+    /// （每条文本只投一次，而每个订阅者都要拿到那一条）。
+    Clipboard,
 }
 
 /// 一格定时器。
@@ -83,8 +89,10 @@ impl Board {
     /// 排一格定时器，交回句柄。三种拒绝各有各的话，不许折成同一个 `Err`：
     /// 作者看到的是"我写的哪一个字错了"，而不是"定时器没起来"。
     pub fn arm(&mut self, kind: Kind, secs: u64, now: std::time::Instant) -> Result<u64, String> {
-        if !matches!(kind, Kind::Tick | Kind::DayChange | Kind::AppChange)
-            && secs < MIN_INTERVAL_SECS
+        if !matches!(
+            kind,
+            Kind::Tick | Kind::DayChange | Kind::AppChange | Kind::Clipboard
+        ) && secs < MIN_INTERVAL_SECS
         {
             return Err(format!(
                 "定时器最短 {MIN_INTERVAL_SECS} 秒（收到 {secs}）：要更密的刷新请走 PLUGIN_REFRESH_MS"
@@ -101,7 +109,7 @@ impl Board {
         let due = match kind {
             Kind::Every => Some(now + std::time::Duration::from_secs(secs)),
             Kind::After => Some(now + std::time::Duration::from_secs(secs)),
-            Kind::Tick | Kind::DayChange | Kind::AppChange => None,
+            Kind::Tick | Kind::DayChange | Kind::AppChange | Kind::Clipboard => None,
         };
         self.entries.insert(
             handle,
@@ -141,6 +149,8 @@ impl Board {
                 Kind::DayChange => e.last_day != Some(day_key),
                 // 不是墙钟决定的：载荷没来就是这一拍什么都没变（见 collect_app_change）
                 Kind::AppChange => false,
+                // 同上：剪贴板那一格只在 collect_clipboard 里按件口取走的条目回。
+                Kind::Clipboard => false,
             })
             .map(|e| e.handle)
             .collect();
@@ -161,7 +171,7 @@ impl Board {
                 }
                 Kind::Tick => entry.last_minute = Some(minute_key),
                 Kind::DayChange => entry.last_day = Some(day_key),
-                Kind::AppChange => {}
+                Kind::AppChange | Kind::Clipboard => {}
             }
         }
         self.fired += due.len() as u64;
@@ -191,6 +201,20 @@ impl Board {
     /// 本次运行跑过多少个回调（观察量，见 `Board::fired` 那段）。
     pub fn fired(&self) -> u64 {
         self.fired
+    }
+
+    /// 订了 `on("clipboard")` 的那几格。载荷是件口里取走的每一条文本；这里只回句柄，
+    /// 每条文本对每个句柄各跑一次（队列已经保证"一条只投一次"）。
+    pub fn collect_clipboard(&mut self) -> Vec<u64> {
+        let mut due: Vec<u64> = self
+            .entries
+            .values()
+            .filter(|e| e.kind == Kind::Clipboard)
+            .map(|e| e.handle)
+            .collect();
+        due.sort_unstable();
+        self.fired += due.len() as u64;
+        due
     }
 
     /// 还挂着几格（插件页那一格要说"这个插件占了几格定时器"）。
@@ -312,6 +336,24 @@ mod tests {
 
     fn at(seconds_from_now: u64) -> Instant {
         Instant::now() + Duration::from_secs(seconds_from_now)
+    }
+
+    /// 剪贴板订阅只由 `collect_clipboard` 回，墙钟那一轮不许把它当定时器跑掉。
+    #[test]
+    fn clipboard_subscriptions_are_not_wall_clock_timers() {
+        let now = Instant::now();
+        let mut board = Board::new();
+        let clip = board.arm(Kind::Clipboard, 0, now).expect("clipboard");
+        let tick = board.arm(Kind::Tick, 0, now).expect("tick");
+        assert_eq!(board.collect_clipboard(), vec![clip]);
+        let due = board.collect_due(now, 5, 3);
+        assert!(due.contains(&tick));
+        assert!(!due.contains(&clip), "剪贴板那一格不是墙钟决定的");
+        assert_eq!(
+            board.collect_clipboard(),
+            vec![clip],
+            "订阅是常驻的：每一条新事件都该回到它"
+        );
     }
 
     /// 到点才跑；周期那格跑完自动排下一轮，一次性那格跑完就没了。

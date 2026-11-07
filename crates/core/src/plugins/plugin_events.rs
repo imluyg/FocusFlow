@@ -14,6 +14,39 @@
 
 use std::sync::Mutex;
 
+/// 剪贴板事件队列的上限。
+///
+/// 与 `app_change` 不同，剪贴板订阅的是"每一次复制"：只留最新一条会把事件吞掉。
+/// 但队列也不能无界 —— 没人取的那一边会把整段历史囤在内存里。32 条足够覆盖一拍
+/// （100ms）内的正常复制量；真的刷过去了，丢最旧的并在调用方留一句。
+const CLIP_QUEUE_MAX: usize = 32;
+
+static CLIP_QUEUE: Mutex<std::collections::VecDeque<String>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// 投一段刚入库的文本。队列满了丢最旧的并交回 `false`（调用方决定要不要出声）。
+pub fn post_clipboard_text(text: &str) -> bool {
+    let mut q = CLIP_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut kept = true;
+    if q.len() >= CLIP_QUEUE_MAX {
+        q.pop_front();
+        kept = false;
+    }
+    q.push_back(text.to_string());
+    kept
+}
+
+/// GUI 那一拍取走全部待投文本（取完即空）。
+pub fn take_clipboard_texts() -> Vec<String> {
+    let mut q = CLIP_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    q.drain(..).collect()
+}
+
+/// 清空队列：给用例用。
+pub fn reset_clipboard_events() {
+    CLIP_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 /// 件口的两个格子：`current` 是"上一次投出去的是谁"（用来去重），
 /// `pending` 是"GUI 还没取走的那一个"。合成一个 `Mutex` 是为了让"变了才投"这一步
 /// 读与写之间没有缝 —— 分两把锁的话，两次同名投递可能都被判成"变了"。
@@ -62,6 +95,41 @@ pub fn reset_app_change() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_events_keep_order_and_drain_once() {
+        reset_clipboard_events();
+        assert!(post_clipboard_text("一"));
+        assert!(post_clipboard_text("二"));
+        assert_eq!(
+            take_clipboard_texts(),
+            vec!["一".to_string(), "二".to_string()],
+            "顺序就是复制发生的顺序"
+        );
+        assert!(take_clipboard_texts().is_empty(), "取走之后再取是空");
+        reset_clipboard_events();
+    }
+
+    #[test]
+    fn clipboard_queue_is_bounded_and_drops_the_oldest() {
+        reset_clipboard_events();
+        for i in 0..CLIP_QUEUE_MAX {
+            assert!(post_clipboard_text(&i.to_string()));
+        }
+        assert!(
+            !post_clipboard_text("overflow"),
+            "满了要交回 false，让调用方有机会出声"
+        );
+        let got = take_clipboard_texts();
+        assert_eq!(got.len(), CLIP_QUEUE_MAX);
+        assert_eq!(
+            got.first().map(String::as_str),
+            Some("1"),
+            "最旧的那条被丢掉"
+        );
+        assert_eq!(got.last().map(String::as_str), Some("overflow"));
+        reset_clipboard_events();
+    }
 
     /// 去重与"取走不清 current"这两件事必须一起成立：
     /// 停在同一个应用上时不该每一拍都回调，而切走再切回来要能再投一次。

@@ -996,6 +996,14 @@ struct App {
     clipboard_hk: Option<HotKey>,
     /// 剪贴板监听线程交件的收件口与句柄；None = 库打不开或线程没起来。
     clip_rx: Option<std::sync::mpsc::Receiver<focusflow_core::clipboard::Captured>>,
+    /// 上一次投给插件的剪贴板事件（内容哈希 + 时刻）。
+    ///
+    /// 系统剪贴板服务/历史面板会把同一段文本重复发布成好几次变化，监听线程因此会
+    /// 连续交来好几件同一内容的 `Captured`（库里靠 dedupe 只动一行）。插件事件要是照单
+    /// 全投，一次复制会变成两三次回调 —— 实测一拍里同一个 marker 收到 3 次。
+    /// 这里按内容哈希压一个 1 秒窗：同内容不重复投，过后再复制同一段仍然算新事件。
+    /// 只存哈希，不存明文。
+    clip_event_last: Option<(String, std::time::Instant)>,
     /// 只为持有监听线程：`Drop` 时 `PostMessage(WM_CLOSE)` 并 join，进程退出前把隐藏窗口收掉。
     #[allow(dead_code)]
     clip_watcher: Option<focusflow_core::clipboard::Watcher>,
@@ -1612,6 +1620,7 @@ impl App {
                 clipboard_hk,
                 clip_rx,
                 clip_watcher,
+                clip_event_last: None,
                 mica,
                 glass: false,
                 resizing: false,
@@ -4532,6 +4541,30 @@ impl App {
                         match outcome {
                             Ok(IngestOutcome::Stored { id, dedup }) => {
                                 got += 1;
+                                // 插件订阅（`on("clipboard")`）：只在有插件管理器时才投，
+                                // 否则那口队列只会攒满再丢。投的是**文本**，与 API 同一版口径。
+                                // 同一内容 1 秒内只投一次：剪贴板服务会把一次复制重复发布，
+                                // 不压这一道，一个手势会变成两三次回调（实测 3 次）。
+                                if self.pm.is_some() {
+                                    if let Captured::Text { text, .. } = &c {
+                                        let hash =
+                                            focusflow_core::clipboard::sha256_hex(text.as_bytes());
+                                        let now = std::time::Instant::now();
+                                        if !clip_event_is_duplicate(
+                                            self.clip_event_last.as_ref(),
+                                            &hash,
+                                            now,
+                                        ) {
+                                            self.clip_event_last = Some((hash, now));
+                                            let kept = focusflow_core::plugins::plugin_events::post_clipboard_text(text);
+                                            if !kept {
+                                                tracing_note(
+                                                    "剪贴板：待投插件的事件队列已满，丢了最旧的一条",
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                                 // 验收脚本靠这一行判"真的入库了"；只报类型/长度与条目标识，
                                 // 内容一个字都不进日志。
                                 tracing_note(&format!(
@@ -13489,6 +13522,20 @@ fn tray_tooltip_with(
 }
 
 /// 暂停截止时刻的 `HH:MM`（本地时区）。0 = 没暂停；时间戳读不出来也按"没暂停"处理。
+/// 同一段剪贴板内容 1 秒内算同一次复制。
+///
+/// 剪贴板服务/历史面板会把一次复制重复发布成好几次变化，监听那一头只能照收（库里靠
+/// dedupe 折成一行）；插件事件这边要的是"一次手势一次回调"，所以按内容哈希压一个短窗。
+fn clip_event_is_duplicate(
+    last: Option<&(String, std::time::Instant)>,
+    hash: &str,
+    now: std::time::Instant,
+) -> bool {
+    last.is_some_and(|(h, at)| {
+        h == hash && now.duration_since(*at) < std::time::Duration::from_secs(1)
+    })
+}
+
 fn clipboard_pause_label(until_ms: i64) -> Option<String> {
     if until_ms <= 0 {
         return None;
@@ -20185,6 +20232,33 @@ mod tray_menu_tests {
             tip.starts_with("FocusFlow · 今日 0"),
             "负数不许折成天文数字: {tip}"
         );
+    }
+
+    #[test]
+    fn the_same_copied_text_is_posted_once_per_second() {
+        let t0 = std::time::Instant::now();
+        let last = Some(("h".to_string(), t0));
+        assert!(
+            super::clip_event_is_duplicate(
+                last.as_ref(),
+                "h",
+                t0 + std::time::Duration::from_millis(200)
+            ),
+            "同一段文本在一秒内的重复发布不算新事件"
+        );
+        assert!(
+            !super::clip_event_is_duplicate(
+                last.as_ref(),
+                "h",
+                t0 + std::time::Duration::from_millis(1500)
+            ),
+            "过了窗口再复制同一段应当算新事件"
+        );
+        assert!(
+            !super::clip_event_is_duplicate(last.as_ref(), "other", t0),
+            "不同内容永远算新事件"
+        );
+        assert!(!super::clip_event_is_duplicate(None, "h", t0));
     }
 
     #[test]

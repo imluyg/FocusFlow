@@ -52,6 +52,51 @@ fn a_declared_permission_that_no_call_needs_is_flagged_with_its_line() {
     );
 }
 
+/// 剪贴板那一格：动词名会折成权限名（read_text → clipboard.read），
+/// 用错了动词、或声明少了另一半，都要在调用点说出来。
+#[test]
+fn clipboard_verbs_map_to_permissions_and_typos_are_flagged() {
+    // 正腿：只调 read_text、只声明 clipboard.read ⇒ 不该有多余的提示。
+    let ok = report(
+        "PLUGIN_API = 3\nPLUGIN_PERMISSIONS = { \"clipboard.read\" }\nfunction init()\n  local t = focusflow.clipboard.read_text()\nend\n",
+        PluginSource::User,
+    );
+    assert!(
+        !ok.findings.iter().any(|f| f.level == Level::Error),
+        "read_text 与 clipboard.read 应当对得上: {:?}",
+        ok.findings
+    );
+    assert!(
+        !ok.findings
+            .iter()
+            .any(|f| f.message.contains("\"clipboard.read\"")),
+        "用到了的权限被判成多要: {:?}",
+        ok.findings
+    );
+
+    // 声明少一半：write_text 要 clipboard.write，行号是调用点那一行。
+    let missing = report(
+        "PLUGIN_API = 3\nPLUGIN_PERMISSIONS = { \"clipboard.read\" }\nfunction init()\n  focusflow.clipboard.write_text(\"x\")\nend\n",
+        PluginSource::User,
+    );
+    let f = saying(&missing, "clipboard.write").expect("没声明的写着");
+    assert_eq!(f.level, Level::Error);
+    assert_eq!(f.line, Some(5), "要指到调用点（PLUGIN_NAME 占第 1 行）");
+
+    // 动词拼错：read_txt 不是这一格认得的名字。
+    let typo = report(
+        "PLUGIN_API = 3\nPLUGIN_PERMISSIONS = { \"clipboard.read\" }\nfunction init()\n  focusflow.clipboard.read_txt()\nend\n",
+        PluginSource::User,
+    );
+    assert!(
+        typo.findings
+            .iter()
+            .any(|f| f.message.contains("clipboard.read_txt")),
+        "拼错的动词要当场点出来: {:?}",
+        typo.findings
+    );
+}
+
 /// 用了一格而没声明 ⇒ 问题，行号是**调用点**那一行（不是声明那一行）。
 #[test]
 fn using_an_api_whose_permission_is_not_declared_is_an_error_at_the_call() {

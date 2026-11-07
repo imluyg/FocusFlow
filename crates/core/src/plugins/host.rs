@@ -234,6 +234,7 @@ pub const EXTENSION_API_NAMES: &[&str] = &[
     "app_info",
     "available_years",
     "cancel",
+    "clipboard",
     "config_get",
     "daily_counts",
     "every",
@@ -248,6 +249,27 @@ pub const EXTENSION_API_NAMES: &[&str] = &[
     "timers",
     "today_count",
 ];
+
+/// 剪贴板 API 要求的最低 `PLUGIN_API`。
+///
+/// 为什么光有权限闸不够：`PLUGIN_API <= 1` 的存量插件走 `GateMode::Free`，闸根本**不装**
+/// （见 `Manager::authorization_for`）。剪贴板是隐私面最大的一格，不能因为"老插件没写
+/// PLUGIN_API"就变成谁都能读。所以这一格按版本从表里摘掉：低版本插件取到的是 `nil`，
+/// 与内置专属 API 同一套机制。
+pub const CLIPBOARD_MIN_PLUGIN_API: u32 = 3;
+
+/// 低于 [`CLIPBOARD_MIN_PLUGIN_API`] 的插件看不见 `focusflow.clipboard`。交回"摘没摘"。
+pub fn hide_clipboard_api(host: &Table, api_version: u32) -> mlua::Result<bool> {
+    if api_version >= CLIPBOARD_MIN_PLUGIN_API {
+        return Ok(false);
+    }
+    if host.contains_key("clipboard")? {
+        host.set("clipboard", mlua::Value::Nil)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
 
 /// 这个名字是不是内置模块专属（扩展插件看不见）。
 pub fn is_builtin_only_api(name: &str) -> bool {
@@ -304,6 +326,7 @@ pub fn install_permission_guard(
     gate: Arc<crate::plugins::permissions::Gate>,
     names: &[&'static str],
     store_verbs: &[&'static str],
+    clipboard_verbs: &[&'static str],
 ) -> mlua::Result<Vec<String>> {
     let check = lua.create_function(move |_lua, (api, verb): (String, Option<String>)| {
         let perm = crate::plugins::permissions::required_for(&api, verb.as_deref());
@@ -332,15 +355,23 @@ pub fn install_permission_guard(
     for v in store_verbs {
         verb_array.push((*v).to_string());
     }
+    let mut clip_array = Vec::new();
+    for v in clipboard_verbs {
+        clip_array.push((*v).to_string());
+    }
     host.set("__guard_names", name_array)?;
     host.set("__guard_verbs", verb_array)?;
+    host.set("__guard_clip_verbs", clip_array)?;
     let wrapped: Vec<String> = lua
         .load(
             r#"
             local guard = focusflow.__permission_guard
             local names = focusflow.__guard_names
             local verbs = focusflow.__guard_verbs
-            focusflow.__permission_guard, focusflow.__guard_names, focusflow.__guard_verbs = nil, nil, nil
+            local clip_verbs = focusflow.__guard_clip_verbs
+            focusflow.__permission_guard = nil
+            focusflow.__guard_names, focusflow.__guard_verbs = nil, nil
+            focusflow.__guard_clip_verbs = nil
             local out = {}
             local function wrap(box, key, label)
               local f = box[key]
@@ -374,6 +405,14 @@ pub fn install_permission_guard(
             if type(focusflow.store) == "table" then
               for _, v in ipairs(verbs) do wrap(focusflow.store, v, { name = "store", verb = v }) end
             end
+            if type(focusflow.clipboard) == "table" then
+              -- 权限动词（read/write）与 API 键名（read_text/write_text）不是同一个词：
+              -- 闸按权限名记账，包壳得落到真正的函数名上。
+              local clip_keys = { read = "read_text", write = "write_text" }
+              for _, v in ipairs(clip_verbs) do
+                wrap(focusflow.clipboard, clip_keys[v] or v, { name = "clipboard", verb = v })
+              end
+            end
             return out
             "#,
         )
@@ -400,11 +439,12 @@ pub fn install_timer_api(lua: &Lua, host: &Table, owner: &str) -> mlua::Result<(
             "tick" => Kind::Tick,
             "day_change" => Kind::DayChange,
             "app_change" => Kind::AppChange,
+            "clipboard" => Kind::Clipboard,
             other => {
                 return Ok((
                     0u64,
                     Some(format!(
-                        "认不得的定时器类型「{other}」：可写 every / after / tick / day_change / app_change"
+                        "认不得的定时器类型「{other}」：可写 every / after / tick / day_change / app_change / clipboard"
                     )),
                 ))
             }
@@ -452,8 +492,9 @@ pub fn install_timer_api(lua: &Lua, host: &Table, owner: &str) -> mlua::Result<(
           local kind = (name == "tick" and "tick")
             or (name == "day_change" and "day_change")
             or (name == "app_change" and "app_change")
+            or (name == "clipboard" and "clipboard")
           if not kind then
-            error("focusflow.on 这一版只认 tick / day_change / app_change（收到「" .. tostring(name) .. "」）", 0)
+            error("focusflow.on 这一版只认 tick / day_change / app_change / clipboard（收到「" .. tostring(name) .. "」）", 0)
           end
           return one(kind, 0, fn, "focusflow.on(event, fn)")
         end
@@ -1479,6 +1520,39 @@ pub fn register_host_api(
     )?;
     host.set("store", store)?;
 
+    // 剪贴板（v2 / `PLUGIN_API = 3`）：只文本。读是"最近一条文本"，写走与界面同一条
+    // `clipboard::write_text`（自写抑制、重试都在那一头，插件不能绕开）。
+    // 上限沿用它：16 KB。读超限不截断、带着原因回来；写超限直接拒。
+    // 权限在动词上：`clipboard.read` / `clipboard.write`，由 `install_permission_guard` 装壳。
+    let clip = lua.create_table()?;
+    clip.set(
+        "read_text",
+        lua.create_function(|_, ()| {
+            match crate::clipboard::latest_text(crate::clipboard::DEFAULT_MAX_TEXT_BYTES) {
+                Ok(Some(text)) => Ok((Some(text), None::<String>)),
+                Ok(None) => Ok((None, None::<String>)),
+                Err(e) => Ok((None, Some(e))),
+            }
+        })?,
+    )?;
+    clip.set(
+        "write_text",
+        lua.create_function(|_, text: String| {
+            let limit = crate::clipboard::DEFAULT_MAX_TEXT_BYTES;
+            if text.len() > limit {
+                return Ok((
+                    false,
+                    Some(format!("文本有 {} 字节，超过上限 {limit} 字节", text.len())),
+                ));
+            }
+            match crate::clipboard::write_text(&text) {
+                Ok(()) => Ok((true, None::<String>)),
+                Err(e) => Ok((false, Some(e))),
+            }
+        })?,
+    )?;
+    host.set("clipboard", clip)?;
+
     // 通用的一问（方案 3.4 / 9.1）：`focusflow.query{ from=, to=, group_by=, metric=, limit= }`。
     //
     // 这一格是把 `stats` / `daily_counts` 那几条各自为政的读法收成一个入口，
@@ -1803,6 +1877,69 @@ fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<mlua::Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 剪贴板那一格按版本收口：API 3 看得见，API 2 与更早的看不见。
+    #[test]
+    fn the_clipboard_table_exists_only_from_api_3() {
+        let lua = Lua::new();
+        let host = lua.create_table().expect("表");
+        host.set("clipboard", lua.create_table().expect("剪贴板表"))
+            .expect("放进去");
+        assert!(
+            !hide_clipboard_api(&host, 3).expect("收口"),
+            "API 3 不该被摘"
+        );
+        assert!(host.contains_key("clipboard").expect("问一下"));
+        assert!(hide_clipboard_api(&host, 2).expect("收口"), "API 2 该被摘");
+        assert!(!host.contains_key("clipboard").expect("问一下"));
+        assert!(
+            !hide_clipboard_api(&host, 1).expect("收口"),
+            "已经摘掉了，再摘不算一次"
+        );
+    }
+
+    /// 权限闸要把 `clipboard` 的两个动词都包上：漏一个就是"没声明的插件照样能读剪贴板"。
+    #[test]
+    fn the_guard_wraps_both_clipboard_verbs() {
+        let lua = Lua::new();
+        let host = lua.create_table().expect("表");
+        lua.globals().set("focusflow", &host).expect("挂全局");
+        let clip = lua.create_table().expect("剪贴板表");
+        clip.set(
+            "read_text",
+            lua.create_function(|_, ()| Ok((Option::<String>::None, None::<String>)))
+                .expect("read"),
+        )
+        .expect("放 read");
+        clip.set(
+            "write_text",
+            lua.create_function(|_, _t: String| Ok((true, None::<String>)))
+                .expect("write"),
+        )
+        .expect("放 write");
+        host.set("clipboard", clip).expect("挂表");
+
+        let gate = Arc::new(crate::plugins::permissions::Gate::new(
+            crate::plugins::permissions::GateMode::Free,
+            &[],
+        ));
+        let wrapped = install_permission_guard(&lua, &host, gate, &[], &[], &["read", "write"])
+            .expect("装壳");
+        assert!(
+            wrapped.contains(&"clipboard.read".to_string()),
+            "read 那个动词没被包上: {wrapped:?}"
+        );
+        assert!(
+            wrapped.contains(&"clipboard.write".to_string()),
+            "write 那个动词没被包上: {wrapped:?}"
+        );
+        // 免闸这一档要能照常调用（壳只是问一次，不许改变返回形状）。
+        let ok: bool = lua
+            .load("local ok = focusflow.clipboard.write_text('x') return ok")
+            .eval()
+            .expect("免闸下该能调");
+        assert!(ok);
+    }
 
     /// 不合法的周期必须在入口被拒绝，不许折成"一天"。
     ///

@@ -27,6 +27,8 @@ pub const KNOWN_PERMISSIONS: &[&str] = &[
     "stats.read",
     "storage.read",
     "storage.write",
+    "clipboard.read",
+    "clipboard.write",
     "timer",
     "events.app",
     "notify",
@@ -46,6 +48,10 @@ pub fn required_for(api: &str, verb: Option<&str>) -> Option<&'static str> {
             ("store", "set") | ("store", "delete") | ("store", "clear") | ("store", "flush") => {
                 Some("storage.write")
             }
+            // 剪贴板是隐私面最大的一格：读与写分开授权。**读**也覆盖 `on("clipboard")`
+            // —— 订阅事件的形状就是"每复制一次收一份内容"，不比主动读弱。
+            ("clipboard", "read") | ("on", "clipboard") => Some("clipboard.read"),
+            ("clipboard", "write") => Some("clipboard.write"),
             // `on` 按**事件名**分权限（3.6 第三条事件接上时留下的那一句，今天落了）：
             // `on("app_change")` 要的是 `events.app`，`on("tick")` / `on("day_change")` 仍是
             // `timer`。认不得的事件名在这一头算 `timer` 也无所谓 —— 脚本那一层的 `on`
@@ -59,7 +65,7 @@ pub fn required_for(api: &str, verb: Option<&str>) -> Option<&'static str> {
         "stats" | "today_count" | "daily_counts" | "available_years" | "query" => {
             Some("stats.read")
         }
-        "store" => None,
+        "store" | "clipboard" => None,
         "every" | "after" | "cancel" | "on" | "off" => Some("timer"),
         // `on` / `off` 走到这里都是"没给事件名"的那一类（闸的壳在 `on` 上会把事件名一起交
         // 进来，见 `host::install_permission_guard`）。这一格保持"不要事件名时也拦得住"，
@@ -96,7 +102,7 @@ pub fn guarded_api_names() -> Vec<&'static str> {
     crate::plugins::host::EXTENSION_API_NAMES
         .iter()
         .copied()
-        .filter(|n| *n != "store" && required_for(n, None).is_some())
+        .filter(|n| *n != "store" && *n != "clipboard" && required_for(n, None).is_some())
         .collect()
 }
 
@@ -106,6 +112,14 @@ pub fn store_verb_names() -> Vec<&'static str> {
     ["get", "list", "set", "delete", "clear", "flush"]
         .into_iter()
         .filter(|v| required_for("store", Some(v)).is_some())
+        .collect()
+}
+
+/// `clipboard` 那一格里需要装闸的动词。与 `store` 同一套来源规则。
+pub fn clipboard_verb_names() -> Vec<&'static str> {
+    ["read", "write"]
+        .into_iter()
+        .filter(|v| required_for("clipboard", Some(v)).is_some())
         .collect()
 }
 
@@ -573,6 +587,32 @@ mod tests {
         assert_eq!(required_for("on", None), Some("timer"));
         assert_eq!(required_for("off", None), Some("timer"));
         assert_eq!(required_for("notify", None), Some("notify"));
+        // 剪贴板与 store 同属"表里的表"：顶层不要权限，动词各自要；
+        // 订阅 `on("clipboard")` 归**读**那一侧（收到内容不比主动读弱）。
+        assert_eq!(required_for("clipboard", None), None);
+        assert_eq!(
+            required_for("clipboard", Some("read")),
+            Some("clipboard.read")
+        );
+        assert_eq!(
+            required_for("clipboard", Some("write")),
+            Some("clipboard.write")
+        );
+        assert_eq!(required_for("clipboard", Some("nope")), None);
+        assert_eq!(
+            required_for("on", Some("clipboard")),
+            Some("clipboard.read")
+        );
+        assert_eq!(required_for("on", Some("app_change")), Some("events.app"));
+        assert!(
+            !guarded_api_names().contains(&"clipboard"),
+            "表里的表由动词逐个包壳，顶层那一格不进名单"
+        );
+        assert_eq!(
+            clipboard_verb_names(),
+            vec!["read", "write"],
+            "剪贴板的动词清单与 required_for 同源"
+        );
         // `events.app` 现在是"清单里有、还没有人登记要用"的那一项：`app_change` 那个事件
         // 没接（3.6 的第三条），接它的时候才按事件名分权限。留在这里是有意的，
         // 但这条断言保证没人误以为 `on` 已经在吃它。

@@ -220,7 +220,7 @@ const DEFAULT_PLUGIN_API: u32 = 1;
 /// 两个读者念同一个数：加载侧 [`PluginManager::load_plugin`] 那一道门（比它高就在执行脚本之前拒绝，
 /// 并把这句话留在插件页那一行）与校验器（[`super::validate`]，让作者不用跑到运行时才知道）。
 /// 升版本时必须当场回答这两处各自要不要跟着动 —— 只动一处的症状是"校验器放行、加载拒绝"。
-pub const MAX_SUPPORTED_PLUGIN_API: u32 = 2;
+pub const MAX_SUPPORTED_PLUGIN_API: u32 = 3;
 
 /// 同时加载的常驻插件上限（方案 3.11 那张表：128 MB 总账 ÷ 16 MB 单插件上限 = 8）。
 ///
@@ -1613,6 +1613,16 @@ impl PluginManager {
                 "插件 {stem} 按用户插件加载：{} 组内置专属 API 对它不可见",
                 hidden.len()
             );
+            // 剪贴板 API 要 `PLUGIN_API >= 3`：v1 存量插件走免闸，这一格不能靠闸兜底。
+            let clip_hidden = host::hide_clipboard_api(&api, meta.manifest.api)
+                .map_err(|e| format!("剪贴板 API 收口失败: {e}"))?;
+            if clip_hidden {
+                tracing::debug!(
+                    "插件 {stem} 声明 API {}，剪贴板 API 需要 API {}，对它不可见",
+                    meta.manifest.api,
+                    host::CLIPBOARD_MIN_PLUGIN_API
+                );
+            }
         }
         // 通用那一组再叠一道权限闸（方案 3.7）：未声明/未授权的调用抛 `DENIED:` 那句话，
         // 而**照常加载** —— 拒绝加载的结局是插件页只剩一行错误，用户不知道它要什么权限。
@@ -1651,6 +1661,7 @@ impl PluginManager {
                 Arc::clone(&gate),
                 &permissions::guarded_api_names(),
                 &permissions::store_verb_names(),
+                &permissions::clipboard_verb_names(),
             )
             .map_err(|e| format!("权限闸装不上: {e}"))?;
             if wrapped.is_empty() {
@@ -1829,6 +1840,8 @@ impl PluginManager {
         // app_change 的载荷从件口取**一次**就够：它是"此刻前台是谁"这一个事实，
         // 每个插件的每一格订阅者拿同一份，而"这一格见过谁"记在各自的排程表上。
         let app = plugin_events::take_app_change();
+        // 剪贴板件口取一次：这一拍里入过库的每一条文本，每个订阅者都要各收到一条。
+        let clip_items = plugin_events::take_clipboard_texts();
         for (name, stem) in loaded {
             // 事件/定时这一路已经停过：不再投（其余两路照常）。
             if self
@@ -1851,13 +1864,24 @@ impl PluginManager {
                 }
                 None => Vec::new(),
             };
-            if due.is_empty() && event_due.is_empty() {
+            let clip_due: Vec<u64> = if clip_items.is_empty() {
+                Vec::new()
+            } else {
+                let mut guard = board.lock().unwrap_or_else(|e| e.into_inner());
+                guard.collect_clipboard()
+            };
+            if due.is_empty() && event_due.is_empty() && clip_due.is_empty() {
                 continue;
             }
             // 墙钟那一轮先跑、事件那一轮后跑：顺序固定，插件挂多格时"这一拍先跑谁"可预期
             let mut queue: Vec<(u64, Option<String>, &'static str)> = Vec::new();
             queue.extend(due.into_iter().map(|h| (h, None, "定时器")));
             queue.extend(event_due.into_iter().map(|h| (h, app.clone(), "事件")));
+            for text in &clip_items {
+                for handle in &clip_due {
+                    queue.push((*handle, Some(text.clone()), "事件"));
+                }
+            }
             let mut fired = 0usize;
             for (handle, payload, which) in queue {
                 let outcome = {

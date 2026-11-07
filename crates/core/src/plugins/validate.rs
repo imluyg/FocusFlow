@@ -189,6 +189,20 @@ fn used_apis(code: &str) -> Vec<Use> {
                 verb = Some(v);
                 j = k;
             }
+        } else if name == "clipboard" && b.get(j) == Some(&b'.') {
+            // 权限动词与函数名不是同一个词：`read_text` 归 `clipboard.read`，
+            // `write_text` 归 `clipboard.write`。不折一下，"用了没声明"会把
+            // 声明过的 clipboard.read 念成"多要的一份权限"。
+            let mut k = j + 1;
+            let v = ident_at(code, &mut k);
+            if !v.is_empty() {
+                verb = Some(match v.as_str() {
+                    "read_text" => "read".to_string(),
+                    "write_text" => "write".to_string(),
+                    other => other.to_string(),
+                });
+                j = k;
+            }
         } else if name == "on" {
             // `on` 这一格的事件名是**第一个参数**（不是链上的字段）：权限按事件名分
             // （`app_change` 要 `events.app`，`tick` / `day_change` 要 `timer`），
@@ -392,6 +406,15 @@ fn check_api_names(sink: &mut Sink<'_>, used: &[Use], source: PluginSource) {
                     format!(
                         "`focusflow.store.{v}` 没有这个动词（认得的只有 {}）",
                         permissions::store_verb_names().join(" / ")
+                    ),
+                );
+            }
+            if u.api == "clipboard" && !permissions::clipboard_verb_names().contains(&v.as_str()) {
+                sink.at(
+                    Level::Error,
+                    u.line,
+                    format!(
+                        "`focusflow.clipboard.{v}` 没有这个动词（认得的只有 read_text / write_text）"
                     ),
                 );
             }
