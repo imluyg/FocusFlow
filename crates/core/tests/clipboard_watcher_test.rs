@@ -82,9 +82,17 @@ fn watcher_captures_external_files_and_images() {
     }
 
     // ---- 文件 ----
+    // 剪贴板会被两边抢（监听线程每次变化都会短暂占用）：夹具必须重试并在失败时出声。
+    // 不重试时 .NET 的异常是非终止的，脚本退出码仍是 0 —— 于是"没放上去"会被读成"监控没收到"。
     let file = dir.path().join("剪贴板夹具.txt");
     std::fs::write(&file, b"fixture").unwrap();
-    let script = format!("Set-Clipboard -Path '{}'", file.display());
+    let script = format!(
+        "$ErrorActionPreference='Stop'; $ok=$false; \
+         for ($i=0; $i -lt 20; $i++) {{ try {{ Set-Clipboard -Path '{}'; $ok=$true; break }} \
+         catch {{ Start-Sleep -Milliseconds 150 }} }}; \
+         if (-not $ok) {{ Write-Output 'SETCLIP_FAILED'; exit 3 }}",
+        file.display()
+    );
     let out = powershell(&script);
     assert!(out.status.success(), "Set-Clipboard -Path 失败: {out:?}");
 
@@ -125,14 +133,20 @@ fn watcher_captures_external_files_and_images() {
     let png = focusflow_core::capture::encode_png(&rgba, 4, 4).unwrap();
     std::fs::write(&png_path, &png).unwrap();
     let script = format!(
-        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
-         $img = [System.Drawing.Image]::FromFile('{}'); \
-         [System.Windows.Forms.Clipboard]::SetImage($img); $img.Dispose(); \
+        "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
+         $img = [System.Drawing.Image]::FromFile('{}'); $ok=$false; \
+         for ($i=0; $i -lt 20; $i++) {{ try {{ [System.Windows.Forms.Clipboard]::SetImage($img); $ok=$true; break }} \
+         catch {{ Start-Sleep -Milliseconds 150 }} }}; \
+         $img.Dispose(); \
+         if (-not $ok) {{ Write-Output 'SETIMAGE_FAILED'; exit 3 }}; \
          Start-Sleep -Seconds 6",
         png_path.display()
     );
     let out = powershell(&script);
-    assert!(out.status.success(), "SetImage 失败: {out:?}");
+    assert!(
+        out.status.success(),
+        "SetImage 失败（夹具必须真的放上剪贴板，否则失败会被误读成监控漏收）: {out:?}"
+    );
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut image = None;
