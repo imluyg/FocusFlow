@@ -1335,7 +1335,7 @@ unsafe extern "system" fn edit_proc(
             copy_without_closing(parent);
             return LRESULT(0);
         }
-        if handle_key(parent, vk) {
+        if edit_key_goes_to_list(vk) && handle_key(parent, vk) {
             return LRESULT(0);
         }
         // Ctrl+1..6：右击菜单里那六种文本加工也给了键盘入口（菜单标签上带着 \tCtrl+N）。
@@ -1355,6 +1355,17 @@ unsafe extern "system" fn edit_proc(
         }
     }
     DefSubclassProc(hwnd, msg, w, l)
+}
+
+/// 搜索框里哪些键交给列表（导航与执行）。`Delete` 故意不在：它在文本框里是
+/// "删掉下一个字符"，而列表那条路没有确认框 —— 用户改字时按一下不该悄悄少一条
+/// 历史（页脚也只把 Del 写给片段页，那里焦点不在搜索框上）。
+fn edit_key_goes_to_list(vk: u32) -> bool {
+    [
+        VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_RETURN, VK_ESCAPE, VK_TAB, VK_F1,
+    ]
+    .map(|k| k.0 as u32)
+    .contains(&vk)
 }
 
 /// 返回 true = 这个键被弹窗吃掉了。
@@ -2144,6 +2155,23 @@ mod tests {
             autopaste_gate(true, false, false),
             Err("焦点没能还给原窗口（前台锁或提权窗口）")
         );
+    }
+
+    #[test]
+    fn delete_in_the_search_box_edits_text_instead_of_deleting_history() {
+        assert!(
+            !edit_key_goes_to_list(VK_DELETE.0 as u32),
+            "Delete 在搜索框里必须留给文本框；交给列表会在改字时删掉一条历史（无确认框）"
+        );
+        for key in [
+            VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_RETURN, VK_ESCAPE, VK_TAB, VK_F1,
+        ] {
+            assert!(
+                edit_key_goes_to_list(key.0 as u32),
+                "导航/执行键 {} 应当交给列表",
+                key.0
+            );
+        }
     }
 
     fn label_row(kind: ClipKind, missing: usize) -> Row {

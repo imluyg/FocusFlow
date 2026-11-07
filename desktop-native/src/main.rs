@@ -15205,7 +15205,10 @@ fn cell_inset(r: D2D_RECT_F, inset: f32) -> RECT {
 /// 读宿主 EDIT 里的文字。用 `WM_GETTEXT` 而不是 `GetWindowTextW`：这一格是宿主窗下的
 /// 子 EDIT，跨窗口取文本走消息更直白。实时筛与按 Enter 提交共用这一份。
 fn read_hosted_edit_text(edit: HWND) -> String {
-    let mut buf = [0u16; 256];
+    // 长度现问：固定 256 会把更长的筛选词**静默截掉** —— 框里看着是全的，列表却按
+    // 前半截筛（粘贴一条长路径时最明显）。
+    let len = unsafe { GetWindowTextLengthW(edit) }.max(0) as usize;
+    let mut buf = vec![0u16; len + 1];
     let n = unsafe {
         SendMessageW(
             edit,
@@ -15215,7 +15218,7 @@ fn read_hosted_edit_text(edit: HWND) -> String {
         )
         .0 as usize
     }
-    .min(buf.len());
+    .min(len);
     String::from_utf16_lossy(&buf[..n])
 }
 

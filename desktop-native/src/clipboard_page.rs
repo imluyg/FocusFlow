@@ -28,12 +28,15 @@ const LIST_TOP: f32 = 282.0;
 const ROW_H: f32 = 40.0;
 const FOOTER_H: f32 = 34.0;
 
-/// 历史列表读失败时状态条那句话的开头。错误正文带着原因（`：{e}`），比对整串会让
+/// 两块清单读失败时状态条那句话的开头。错误正文带着原因（`：{e}`），比对整串会让
 /// "恢复后清掉这句话"永远不成立。
 const HISTORY_LOAD_ERROR: &str = "读剪贴板库失败";
+const SNIPPETS_LOAD_ERROR: &str = "读片段失败";
 
-fn is_history_load_error(status: Option<&str>) -> bool {
-    status.is_some_and(|s| s.starts_with(HISTORY_LOAD_ERROR))
+fn clear_load_error(status: &mut Option<String>, prefix: &str) {
+    if status.as_deref().is_some_and(|s| s.starts_with(prefix)) {
+        *status = None;
+    }
 }
 
 fn box_rect(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
@@ -301,9 +304,7 @@ impl ClipPage {
                 if missing > 0 {
                     crate::tracing_note(&format!("clip_page_missing_files n={missing}"));
                 }
-                if is_history_load_error(self.status.as_deref()) {
-                    self.status = None;
-                }
+                clear_load_error(&mut self.status, HISTORY_LOAD_ERROR);
             }
             Err(e) => {
                 self.items.clear();
@@ -316,10 +317,13 @@ impl ClipPage {
         let filter = self.filter.trim().to_string();
         self.reload_items();
         let mut snippets: Vec<Row> = match clipboard::snippets() {
-            Ok(v) => v.into_iter().map(row_from_snippet).collect(),
+            Ok(v) => {
+                clear_load_error(&mut self.status, SNIPPETS_LOAD_ERROR);
+                v.into_iter().map(row_from_snippet).collect()
+            }
             Err(e) => {
                 if self.status.is_none() {
-                    self.status = Some(format!("读片段失败：{e}"));
+                    self.status = Some(format!("{SNIPPETS_LOAD_ERROR}：{e}"));
                 }
                 Vec::new()
             }
@@ -473,9 +477,12 @@ impl ClipPage {
             return PinPlan::Empty;
         }
         let rows = self.rows();
+        // 勾住的 id 可能来自上一轮筛选、这一轮不在 `rows` 里：拿不准就当"没固定"，
+        // 往**保护**的方向走 —— 多固定一次只是多一层保险，误取消会把用户显式
+        // 保护的内容暴露给裁剪。
         let pinned = ids
             .iter()
-            .any(|id| rows.iter().find(|r| r.id == *id).is_some_and(|r| !r.pinned));
+            .any(|id| rows.iter().find(|r| r.id == *id).is_none_or(|r| !r.pinned));
         PinPlan::Apply { ids, pinned }
     }
 
@@ -758,6 +765,39 @@ mod tests {
         p.set_mode(Mode::History);
         p.items.clear();
         assert_eq!(p.pin_plan(), PinPlan::Empty);
+    }
+
+    #[test]
+    fn pin_plan_treats_unknown_checked_ids_as_unpinned() {
+        let mut p = ClipPage::new();
+        p.items = vec![test_row(1, "only")];
+        p.items[0].pinned = true;
+        p.multi = true;
+        p.checked.insert(1);
+        p.checked.insert(99); // 上一轮筛选勾住、这一轮已经不在列表里
+        assert_eq!(
+            p.pin_plan(),
+            PinPlan::Apply {
+                ids: vec![1, 99],
+                pinned: true
+            },
+            "状态拿不准时往保护方向走：误固定只是多一层保险，误取消会暴露给裁剪"
+        );
+    }
+
+    #[test]
+    fn snippet_load_error_also_clears_after_a_successful_reload() {
+        let _lock = focusflow_core::paths::test_app_dir_lock();
+        let _dir = focusflow_core::paths::test_app_dir("clip_page_snip_status");
+        focusflow_core::clipboard::init_db().unwrap();
+        let mut p = ClipPage::new();
+        p.status = Some(format!("{SNIPPETS_LOAD_ERROR}：disk I/O error"));
+        p.reload();
+        assert!(
+            p.status.is_none(),
+            "片段读回来之后，上一次那句错不该继续留在状态条上（实际：{:?}）",
+            p.status
+        );
     }
 
     #[test]
