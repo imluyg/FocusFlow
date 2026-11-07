@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "focusflow-native"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "focusflow-core",
