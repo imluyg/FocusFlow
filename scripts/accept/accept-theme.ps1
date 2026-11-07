@@ -36,10 +36,11 @@ Start-Sleep -Milliseconds 1500
 Click-PeriodPill $h 5
 
 # --- dark walk -------------------------------------------------------------------
-for ($i = 0; $i -lt 6; $i++) { Click-ViewTab $h $i; Save-WindowShot $h (Join-Path $WorkDir "dark-view$i.png") | Out-Null }
+# Eight views now (board and clipboard were added after this loop was written at six).
+for ($i = 0; $i -lt 8; $i++) { Click-ViewTab $h $i; Save-WindowShot $h (Join-Path $WorkDir "dark-view$i.png") | Out-Null }
 Click-ViewTab $h 3
 for ($j = 0; $j -lt 4; $j++) { Click-ATab $h $j; Save-WindowShot $h (Join-Path $WorkDir "dark-atab$j.png") | Out-Null }
-Check 'dark screenshots written' ((Get-ChildItem $WorkDir -Filter 'dark-*.png').Count -ge 10) ''
+Check 'dark screenshots written' ((Get-ChildItem $WorkDir -Filter 'dark-*.png').Count -ge 12) ''
 
 # --- flip to light from the settings row (index 5 = theme) ------------------------
 Click-ViewTab $h 5
@@ -50,10 +51,10 @@ $after = Get-ThemeName $app
 Check 'theme flips through the settings row' (($before -match 'dark') -and ($after -match 'light')) "$before -> $after"
 
 # --- light walk ------------------------------------------------------------------
-for ($i = 0; $i -lt 6; $i++) { Click-ViewTab $h $i; Save-WindowShot $h (Join-Path $WorkDir "light-view$i.png") | Out-Null }
+for ($i = 0; $i -lt 8; $i++) { Click-ViewTab $h $i; Save-WindowShot $h (Join-Path $WorkDir "light-view$i.png") | Out-Null }
 Click-ViewTab $h 3
 for ($j = 0; $j -lt 4; $j++) { Click-ATab $h $j; Save-WindowShot $h (Join-Path $WorkDir "light-atab$j.png") | Out-Null }
-Check 'light screenshots written' ((Get-ChildItem $WorkDir -Filter 'light-*.png').Count -ge 10) ''
+Check 'light screenshots written' ((Get-ChildItem $WorkDir -Filter 'light-*.png').Count -ge 12) ''
 
 # --- inline EDIT colours (WM_CTLCOLOREDIT must follow the theme) ------------------
 # The colour must be read from the EDIT itself (PrintWindow), not from the screen rectangle:

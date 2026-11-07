@@ -2558,10 +2558,11 @@ impl App {
         }
         let len = self.clip_page.rows().len();
         if let Some(i) = clipboard_page::row_at(&lay, self.clip_page.scroll, len, x, y) {
-            if self.clip_page.multi {
-                self.clip_page.toggle_checked(i);
-            } else {
-                self.clip_page.sel = i;
+            let shift = (unsafe { GetKeyState(0x10) } as u16 & 0x8000) != 0;
+            match clipboard_page::row_click_action(self.clip_page.multi, shift, i) {
+                clipboard_page::RowClick::Select(row) => self.clip_page.sel = row,
+                clipboard_page::RowClick::Toggle(row) => self.clip_page.toggle_checked(row),
+                clipboard_page::RowClick::Range(row) => self.clip_page.check_range(row),
             }
             self.refresh_clip_page(hwnd);
         }
@@ -2655,6 +2656,29 @@ impl App {
         if ids.is_empty() {
             self.clip_page.status = Some("先选一条".to_string());
             self.refresh_clip_page(hwnd);
+            return;
+        }
+        // 删除不可撤销：单条与批量都要先点一次头。固定项也会被删，标题里说清楚。
+        let what = if self.clip_page.mode == clipboard_page::Mode::Snippets {
+            "个片段"
+        } else {
+            "条记录"
+        };
+        let msg = if ids.len() == 1 {
+            format!("删除这 1 {what}？（固定项也会被删）")
+        } else {
+            format!("删除选中的 {} {what}？（固定项也会被删）", ids.len())
+        };
+        let text = windows::core::HSTRING::from(msg);
+        let answer = unsafe {
+            MessageBoxW(
+                Some(hwnd),
+                windows::core::PCWSTR(text.as_ptr()),
+                w!("删除剪贴板内容"),
+                MESSAGEBOX_STYLE(MB_YESNO.0 | MB_ICONQUESTION.0),
+            )
+        };
+        if answer != IDYES {
             return;
         }
         let result = if self.clip_page.mode == clipboard_page::Mode::Snippets {
@@ -2942,6 +2966,16 @@ impl App {
             }
             0x2E => {
                 self.delete_clip_selected(hwnd);
+                true
+            }
+            0x41 if ctrl => {
+                // Ctrl+A：整页勾上（按当前筛选后的列表），并进入多选。
+                self.clip_page.check_all();
+                tracing_note(&format!(
+                    "clip_page_check_all n={}",
+                    self.clip_page.checked_count()
+                ));
+                self.refresh_clip_page(hwnd);
                 true
             }
             0x50 if ctrl => {
@@ -13334,6 +13368,8 @@ fn make_tray(
     let clipboard_history = MenuItem::with_id("clipboard_history", "剪贴板历史", true, None);
     let clipboard_pause_15 =
         MenuItem::with_id("clipboard_pause_15", "暂停记录 15 分钟", true, None);
+    let clipboard_pause_60 =
+        MenuItem::with_id("clipboard_pause_60", "暂停记录 60 分钟", true, None);
     let clipboard_item = CheckMenuItem::with_id(
         "clipboard_pause",
         "记录剪贴板",
@@ -13353,6 +13389,7 @@ fn make_tray(
         &floating_item,
         &clipboard_history,
         &clipboard_pause_15,
+        &clipboard_pause_60,
         &clipboard_item,
         &pause,
         &sep,
@@ -13394,22 +13431,74 @@ fn make_tray(
     }
 }
 
-/// 托盘 tooltip：今日次数 + 采集状态（采集开着时才有后半截）。
+/// 托盘 tooltip：今日次数 + 采集状态（采集开着时才有后半截）+ 剪贴板暂停截止时刻。
 fn tray_tooltip(today: i64) -> String {
+    tray_tooltip_with(
+        today,
+        collect::is_listening(),
+        collect::is_paused(),
+        collect::legacy_running(),
+        focusflow_core::clipboard::pause_until_ms(),
+    )
+}
+
+/// `tray_tooltip` 的纯核：五个读数各自从哪来由调用方给，排版本身可以被单测。
+fn tray_tooltip_with(
+    today: i64,
+    listening: bool,
+    paused: bool,
+    legacy: bool,
+    clip_pause_until: i64,
+) -> String {
     // 次数是 `u64` 的写法：坏数据/外部导入留下的负数若直接 `as u64`，托盘上会念出
     // 一个二十位数。真数不会为负，夹到 0 与其余几处读数同一个口径。
     let mut tip = format!("FocusFlow · 今日 {}", thousands(today.max(0) as u64));
-    if collect::is_listening() {
-        tip.push_str(if collect::is_paused() {
+    if listening {
+        tip.push_str(if paused {
             " · 已暂停"
         } else {
             " · 采集中"
         });
-        if collect::legacy_running() {
+        if legacy {
             tip.push_str(" · 旧版在跑");
         }
     }
+    if let Some(at) = clipboard_pause_label(clip_pause_until) {
+        tip.push_str(&format!(" · 剪贴板暂停至 {at}"));
+    }
     tip
+}
+
+/// 暂停截止时刻的 `HH:MM`（本地时区）。0 = 没暂停；时间戳读不出来也按"没暂停"处理。
+fn clipboard_pause_label(until_ms: i64) -> Option<String> {
+    if until_ms <= 0 {
+        return None;
+    }
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_millis_opt(until_ms)
+        .single()
+        .map(|dt| dt.format("%H:%M").to_string())
+}
+
+/// 托盘两档「暂停记录」共用的动作：写运行时暂停位、更新状态行与托盘提示。
+fn pause_clipboard(hwnd: HWND, minutes: i64) {
+    focusflow_core::clipboard::pause_for(minutes.saturating_mul(60));
+    let at = clipboard_pause_label(focusflow_core::clipboard::pause_until_ms())
+        .unwrap_or_else(|| "稍后".to_string());
+    let msg = format!("剪贴板记录已暂停 {minutes} 分钟（至 {at}）");
+    tracing_note(&msg);
+    if let Some(app) = unsafe { app_ptr(hwnd) } {
+        app.status = Some(msg);
+        if let Some(t) = &app.tray {
+            let today = app.snap.lock().map(|s| s.today).unwrap_or(0);
+            let _ = t.set_tooltip(Some(tray_tooltip(today)));
+        }
+    }
+    clipboard_popup::notify_changed();
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
 }
 
 /// 一条组合字符串解析成 `HotKey`；坏值/空值/没有修饰键的裸键返回 `None`。
@@ -15506,15 +15595,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         }
                     }
                     "clipboard_pause_15" => {
-                        focusflow_core::clipboard::pause_for(15 * 60);
-                        tracing_note("托盘：剪贴板记录暂停 15 分钟");
-                        if let Some(app) = unsafe { app_ptr(hwnd) } {
-                            app.status = Some("剪贴板记录已暂停 15 分钟".to_string());
-                        }
-                        clipboard_popup::notify_changed();
-                        unsafe {
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
+                        pause_clipboard(hwnd, 15);
+                    }
+                    "clipboard_pause_60" => {
+                        pause_clipboard(hwnd, 60);
                     }
                     "pause" => {
                         if let Some(app) = unsafe { app_ptr(hwnd) } {
@@ -20039,6 +20123,27 @@ mod tray_menu_tests {
             tip.starts_with("FocusFlow · 今日 0"),
             "负数不许折成天文数字: {tip}"
         );
+    }
+
+    #[test]
+    fn clipboard_pause_label_is_hh_mm_and_zero_means_none() {
+        assert_eq!(super::clipboard_pause_label(0), None);
+        assert_eq!(super::clipboard_pause_label(-1), None, "负数按没暂停处理");
+        let label = super::clipboard_pause_label(1_700_000_000_000).expect("有效时间戳应有标签");
+        assert_eq!(label.len(), 5, "HH:MM，实际是 {label}");
+        assert_eq!(&label[2..3], ":");
+    }
+
+    #[test]
+    fn tooltip_carries_the_clipboard_pause_deadline() {
+        let plain = super::tray_tooltip_with(3, false, false, false, 0);
+        assert_eq!(plain, "FocusFlow · 今日 3");
+        let paused = super::tray_tooltip_with(3, true, false, false, 1_700_000_000_000);
+        assert!(
+            paused.contains("剪贴板暂停至 "),
+            "暂停截止时刻要进托盘提示: {paused}"
+        );
+        assert!(paused.contains("采集中"), "提示前两截不能被挤掉: {paused}");
     }
 }
 

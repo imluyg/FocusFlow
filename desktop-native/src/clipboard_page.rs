@@ -73,6 +73,27 @@ pub struct Row {
     pub missing_files: usize,
 }
 
+/// 行被点了一下时该做什么。抽成纯函数：`Shift` 与多选两个开关的组合各有一条用例。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowClick {
+    /// 单选模式：把光标挪到这一行。
+    Select(usize),
+    /// 多选、普通点击：翻这一条的勾。
+    Toggle(usize),
+    /// 多选 + Shift：从锚点整段勾上。
+    Range(usize),
+}
+
+pub fn row_click_action(multi: bool, shift: bool, row: usize) -> RowClick {
+    if !multi {
+        RowClick::Select(row)
+    } else if shift {
+        RowClick::Range(row)
+    } else {
+        RowClick::Toggle(row)
+    }
+}
+
 fn row_from_item(item: ClipItem) -> Row {
     let missing_files = if item.kind == ClipKind::File {
         clipboard::split_alive_paths(&item.file_paths).1.len()
@@ -170,6 +191,8 @@ pub struct ClipPage {
     pub multi: bool,
     /// 多选模式下勾住的条目 id。
     pub checked: HashSet<i64>,
+    /// 上一次点过的行：`Shift+点击` 从这里开始整段勾选。
+    anchor: Option<usize>,
     pub status: Option<String>,
     /// 缩略图解码缓存。解一份 PNG 几百微秒，但一帧要画十来行、拖滚动条时每帧都画；
     /// 缓存 64 份、按先来先出，内存上界约 64 × 160×160×4 ≈ 6 MB。
@@ -195,6 +218,7 @@ impl ClipPage {
             scroll: 0,
             multi: false,
             checked: HashSet::new(),
+            anchor: None,
             status: None,
             thumbs: std::cell::RefCell::new(std::collections::HashMap::new()),
             thumb_order: std::cell::RefCell::new(std::collections::VecDeque::new()),
@@ -292,6 +316,7 @@ impl ClipPage {
         self.sel = 0;
         self.scroll = 0;
         self.checked.clear();
+        self.anchor = None;
         self.multi = false;
         self.status = None;
         self.clamp_selection(1);
@@ -349,12 +374,50 @@ impl ClipPage {
         if !self.checked.remove(&id) {
             self.checked.insert(id);
         }
+        self.anchor = Some(row_idx);
+    }
+
+    /// `Shift+点击`：从锚点到这一行整段勾上（只加不减，避免"点一下没了一半"）。
+    /// 没有锚点（刚进多选、或列表刚换过）时就等同于普通点一下。
+    pub fn check_range(&mut self, row_idx: usize) {
+        let ids: Vec<i64> = self.rows().iter().map(|r| r.id).collect();
+        let Some(from) = self.anchor.filter(|a| *a < ids.len()) else {
+            self.toggle_checked(row_idx);
+            return;
+        };
+        if row_idx >= ids.len() {
+            return;
+        }
+        self.multi = true;
+        let (a, b) = if from <= row_idx {
+            (from, row_idx)
+        } else {
+            (row_idx, from)
+        };
+        for id in &ids[a..=b] {
+            self.checked.insert(*id);
+        }
+        self.anchor = Some(row_idx);
+    }
+
+    /// `Ctrl+A`：把当前列表（历史或片段，按现在的筛选）全部勾上，并进入多选。
+    pub fn check_all(&mut self) {
+        let ids: Vec<i64> = self.rows().iter().map(|r| r.id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.multi = true;
+        for id in ids {
+            self.checked.insert(id);
+        }
+        self.anchor = Some(self.rows().len() - 1);
     }
 
     pub fn toggle_multi(&mut self) {
         self.multi = !self.multi;
         if !self.multi {
             self.checked.clear();
+            self.anchor = None;
         }
     }
 
@@ -375,6 +438,7 @@ impl ClipPage {
 
     pub fn clear_checked(&mut self) {
         self.checked.clear();
+        self.anchor = None;
     }
 }
 
@@ -552,6 +616,48 @@ mod tests {
         assert_eq!(p.action_ids(), vec![1, 2], "多选时按 id 排好交回");
         p.multi = false;
         assert_eq!(p.action_ids(), vec![2], "关掉多选后回到当前行");
+    }
+
+    #[test]
+    fn shift_range_and_select_all_fill_the_checked_set() {
+        let mut p = ClipPage::new();
+        p.items = (1..=6).map(|i| test_row(i, &format!("v{i}"))).collect();
+
+        p.check_all();
+        assert!(p.multi, "Ctrl+A 要顺带进入多选");
+        assert_eq!(p.action_ids(), vec![1, 2, 3, 4, 5, 6]);
+
+        p.toggle_multi();
+        p.toggle_multi();
+        assert!(p.checked.is_empty(), "关掉多选要清空勾选");
+
+        // 点第 1 行（id 2）立锚，再 Shift 点第 4 行（id 5）：2..=5 整段。
+        p.toggle_checked(1);
+        p.check_range(4);
+        assert_eq!(p.action_ids(), vec![2, 3, 4, 5]);
+
+        // 反向 Shift：锚点移到第 0 行，1..=5 都该在。
+        p.check_range(0);
+        assert_eq!(p.action_ids(), vec![1, 2, 3, 4, 5]);
+
+        // 没有锚点时等同普通点一下（不会把整段都勾上）。
+        p.clear_checked();
+        p.toggle_multi();
+        p.toggle_multi();
+        p.check_range(3);
+        assert_eq!(p.action_ids(), vec![4]);
+    }
+
+    #[test]
+    fn row_click_action_covers_the_three_gestures() {
+        assert_eq!(row_click_action(false, false, 2), RowClick::Select(2));
+        assert_eq!(
+            row_click_action(false, true, 2),
+            RowClick::Select(2),
+            "单选下 Shift 不改语义"
+        );
+        assert_eq!(row_click_action(true, false, 2), RowClick::Toggle(2));
+        assert_eq!(row_click_action(true, true, 2), RowClick::Range(2));
     }
 
     #[test]

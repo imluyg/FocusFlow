@@ -241,6 +241,31 @@ $hasImage = $false
 try { $hasImage = [System.Windows.Forms.Clipboard]::ContainsImage() } catch { }
 Check 'clipboard holds an image after copying the image row' $hasImage
 
+# ---- D batch: Ctrl+A, and delete must ask before it destroys anything ----
+function Wait-LogCount([string]$Pattern, [int]$Want, [int]$TimeoutMs = 5000) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        if (@(Get-LogLines | Where-Object { $_ -like $Pattern }).Count -ge $Want) { return $true }
+        Start-Sleep -Milliseconds 150
+    }
+    $false
+}
+
+[void][FF]::SetForegroundWindow($h)
+Start-Sleep -Milliseconds 300
+[FF]::PressChord([byte[]]@(0x11), [byte]0x41)
+Check 'Ctrl+A checks every row on the page' (Wait-LogMatch '*clip_page_check_all*' 3000)
+
+# Click Delete: the row set must still be there after a beat (the confirm dialog is up),
+# and only Enter (the default Yes) may actually remove it.
+$deletesBefore = @(Get-LogLines | Where-Object { $_ -like '*clip_page_delete*' }).Count
+[FF]::ClickWindow($h, 220, 256, 1)
+Start-Sleep -Milliseconds 900
+$deletesPending = @(Get-LogLines | Where-Object { $_ -like '*clip_page_delete*' }).Count
+Check 'delete waits for the confirmation' ($deletesPending -eq $deletesBefore)
+[FF]::PressChord([byte[]]@(), [byte]0x0D)
+Check 'confirming deletes the checked rows' (Wait-LogCount '*clip_page_delete*' ($deletesBefore + 1) 5000)
+
 Stop-App $Exe
 if ($null -ne $orig) { try { Set-ClipboardRetry $orig } catch { } }
 Show-Summary

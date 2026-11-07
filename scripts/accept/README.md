@@ -45,13 +45,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\accept\accept-instal
 |---|---|---|
 | `accept-smoke.ps1` | 主窗出现 / 悬浮窗在 / `WM_NCHITTEST`=HTCAPTION / 窗口 1200×860 / 内存 ≤120 MB / PrintWindow 抓得到 / 验收状态行 / 无 error / 8 秒内退出 | 10 项；`-Collector` 时多验"采集开着" |
 | `accept-floating.ps1` | 落点=配置 / 默认 104×48 / **搬动没落定时也要扛得住那一拍**（等过 1 秒重画周期再投 `WM_EXITSIZEMOVE`，两条腿：矩形还在 1300,300、配置也写回 1300,300）/ 重启位置还在 / 存 4000 被夹回 1900 / **放在任务栏那一条上的位置不许被抬走**（底边按整屏算，卡片贴到屏幕最底）/ **压在任务栏之上**（z-order 现量，另带一条"尺子自己得排得对"的对照：任务栏要在地面之上）/ 双击唤回收起的主窗 | 15 项 |
-| `accept-theme.ps1` | 深色 16 张 + 浅色 16 张逐视图截图 / 设置页「主题」行当场切换 / 行内 `EDIT` 背景色随主题（取主色，浅色 246,249,255、深色 31,40,59） | 10 项 |
+| `accept-theme.ps1` | 深色 24 张 + 浅色 24 张逐视图截图（八个视图含看板与剪贴板）/ 设置页「主题」行当场切换 / 行内 `EDIT` 背景色随主题（取主色，浅色 246,249,255、深色 31,40,59） | 11 项 |
 | `accept-ui.ps1` | 不透明档卡片有落影、卡内没被染灰 / 深色不画阴影但有顶部高光 / 空闲药丸悬停变色 / 药丸与页签是手型、空白是箭头 / 下划线宽度跟文字（四字页签 53 px vs 两字 26 px）/ **自绘标题栏**：标题带 `HTCAPTION`、关闭键 `HTCLIENT` 且悬停变红、左边缘 `HTLEFT`、最大化后客户区变大、还原回 1200×860、最小化/恢复 | 25 项 |
 | `accept-keyboard.ps1` | 键盘焦点框 / Enter 打开设备详情 / Esc 先关弹层、再撤焦点且不藏进托盘 / Ctrl+F 真的叫出并聚焦搜索框 / 停在被截断的插件名上出一格全文提示 / **右键把那一格的全文写进剪贴板** | 9 项 |
 | `accept-collect.ps1` | 点 5 下 → 今日 +5、速度 >0 / 暂停后不再涨、速度归 0 / 继续再 +5 / 退出 flush + 退出备份 / core 日志「数据库已关闭」 | 14 项 |
 | `accept-plugins.ps1` | 插件视图：`button.modal` 开弹窗、弹窗与正文的 Select 写回、提交/关闭触发插件动作、Esc 关弹窗 | 16 项 |
 | `accept-hotkey.ps1` | 两轮启动：配置里的三条组合按原样注册（日志逐字对）/ 一条写成裸键时程序照样起、日志点名被拒的那条、没被拒的那条照样注册 | 10 项 |
-| `accept-clipboard.ps1` | 两次外部复制进库（`clip_ingest` 日志）/ 剪贴板热键注册且按一次只开一次弹窗 / 弹窗可见、有搜索框 / **下移一格再回车**，关窗并把旧条目写回剪贴板（`clip_enter copied=true`；旧条目与进入前的剪贴板内容不同，避免自我证明）/ **程序自己写的剪贴板不再记一条**（前后 `clip_ingest` 条数相等）/ **默认不开启自动粘贴**（全程零条 `clip_autopaste`）/ 第 8 页管理页能打开（`clip_page_open`）、多选后批量固定真的写到库里（`clip_page_pin`）/ **外部复制图片入库**（`clip_ingest_image`，原图与缩略图都落盘）/ **外部复制文件入库**（`clip_ingest_files`）/ 文件被删后管理页标出失效（`clip_page_missing_files`）/ 管理页复制图片**真的把图片写回剪贴板**（`clip_page_copy kind=Image` + `ContainsImage`）；结束时还原原剪贴板 | 23 项 |
+| `accept-clipboard.ps1` | 两次外部复制进库（`clip_ingest` 日志）/ 剪贴板热键注册且按一次只开一次弹窗 / 弹窗可见、有搜索框 / **下移一格再回车**，关窗并把旧条目写回剪贴板（`clip_enter copied=true`；旧条目与进入前的剪贴板内容不同，避免自我证明）/ **程序自己写的剪贴板不再记一条**（前后 `clip_ingest` 条数相等）/ **默认不开启自动粘贴**（全程零条 `clip_autopaste`）/ 第 8 页管理页能打开（`clip_page_open`）、多选后批量固定真的写到库里（`clip_page_pin`）/ **外部复制图片入库**（`clip_ingest_image`，原图与缩略图都落盘）/ **外部复制文件入库**（`clip_ingest_files`）/ 文件被删后管理页标出失效（`clip_page_missing_files`）/ 管理页复制图片**真的把图片写回剪贴板**（`clip_page_copy kind=Image` + `ContainsImage`）/ `Ctrl+A` 整页勾选（`clip_page_check_all`）/ **点删除不会立刻删**（确认框在，日志里还没有 `clip_page_delete`），回车确认后才真的删；结束时还原原剪贴板 | 26 项 |
 | `accept-clipautopaste.ps1` | 开着 `[clipboard] auto_paste`：夹具文本框在前台 → 热键开弹窗 → 回车后内容**真的落进那个文本框**（`clip_autopaste ok=true`）；主窗在前台时同一手势**拒绝粘回自己**（`ok=false`，文本框仍为空）；本轮之前零失败注入；结束时还原原剪贴板 | 10 项 |
 | `accept-datadir.ps1` | 两轮启动：`[paths]` 里那条待搬运标记由启动早期兑现（data/ 与 backup/ 真到了新根、旧根清空、标记归空、日志点名新根）/ 新根建不出来时数据原地不动、标记留着下次重试 | 13 项 |
 | `accept-plugsel.ps1` | 自带一份 ASCII 小插件（分组表格 + `onselect` + `sel` 按钮 + 两条分页条）：Lua 里的 ids/group/onselect 真的走到宿主、选中写了声明的那个字段、`sel` 按钮拼出 `<按钮 id><记录 id>`、分页条的「下一页」点得到而首页的「上一页」是禁用的；**表格下面**那条分页条也点得到（记账本就是这顺序，表格从前会把它的点击吞掉） | 17 项 |
