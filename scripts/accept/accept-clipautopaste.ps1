@@ -4,14 +4,16 @@
   was in front when the palette opened and injects Ctrl+V into it.
 
 .DESCRIPTION
-  One launch with [clipboard] auto_paste = true. The paste target is a TextBox in this
-  script's own WinForms form (a foreign window), so the app has to:
+  One launch with no explicit [clipboard] auto_paste line: the default must be ON. The paste
+  target is a TextBox in this script's own WinForms form (a foreign window), so the app has to:
     - remember the foreground window when the palette opens,
     - hide the palette, give the foreground back, confirm it really changed,
     - inject exactly Ctrl+V, and log clip_autopaste ok=true.
 
   The second half proves the self-window guard: opening the palette while the app's own
   main window is in front must NOT paste anywhere; the log has ok=false with the reason.
+  In between, the target is minimized while the palette is open: Enter must restore it
+  before the injection (otherwise a minimized window would be "pasted into" invisibly).
 
   Injected keys do reach a focused TextBox, so the content check is the real evidence —
   the log line alone would also be written if SendInput had been called and dropped.
@@ -50,6 +52,17 @@ function Wait-LogMatch([string]$Pattern, [int]$TimeoutMs = 6000) {
     $false
 }
 
+function Wait-LogCount([string]$Pattern, [int]$Want, [int]$TimeoutMs = 5000) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        if (@(Get-LogLines | Where-Object { $_ -like $Pattern }).Count -ge $Want) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 150
+    }
+    $false
+}
+
 function Pump([int]$Ms) {
     $deadline = (Get-Date).AddMilliseconds($Ms)
     while ((Get-Date) -lt $deadline) {
@@ -69,7 +82,7 @@ Stop-App $Exe
 New-AppDir $app @('[collector]', 'enabled = false')
 Set-ConfigLine $app 'hotkey' 'clipboard' $hotCombo
 Set-ConfigLine $app 'clipboard' 'enabled' 'true'
-Set-ConfigLine $app 'clipboard' 'auto_paste' 'true'
+# Deliberately no auto_paste line: this suite is what proves the new default is ON.
 
 Add-Type -AssemblyName System.Windows.Forms
 $fx = New-Object System.Windows.Forms.Form
@@ -86,15 +99,18 @@ $tb.Dock = 'Fill'
 $fx.Controls.Add($tb)
 # The app's main window would otherwise cover this fixture, and a click meant for the
 # TextBox would land on the app. TopMost keeps the fixture visible for the click.
-$fx.TopMost = $true
+# Set it AFTER Show: WinForms drops TopMost set before the handle exists (probe measured
+# WS_EX_TOPMOST=0 and the click landing on the window above), which made this suite flaky.
 $fx.Show()
+$fx.TopMost = $true
+[System.Windows.Forms.Application]::DoEvents()
 
 $orig = $null
 try { $orig = Get-Clipboard -Raw } catch { }
 
 Remove-Item $logPath -ErrorAction SilentlyContinue
 "exe : $Exe"
-"app : $app  (auto_paste=true, hotkey=$hotCombo)"
+"app : $app  (auto_paste defaults on, hotkey=$hotCombo)"
 
 $p = Start-App $Exe $app $WorkDir
 $h = Wait-Window $p.Id
@@ -131,11 +147,72 @@ Pump 2500
 Check 'auto-paste lands in the target textbox' ($tb.Text.Contains($marker)) `
     "textbox='$($tb.Text)'"
 Check 'log reports a successful injection' (Wait-LogMatch '*clip_autopaste ok=true*' 3000)
+# The injection landing in the TextBox already implies the focus came back; assert it
+# directly too, because a lost focus with a stray Ctrl+V elsewhere would still be a bug.
+Check 'the target window keeps the foreground after the paste' `
+    ([FF]::GetForegroundWindow() -eq $fx.Handle) `
+    "fg=$([FF]::GetForegroundWindow()) fixture=$($fx.Handle)"
 # Without this, the refusal check below could be satisfied by a failure from THIS round.
 Check 'no failed injection before the self round' `
     (@(Get-LogLines | Where-Object { $_ -like '*clip_autopaste ok=false*' }).Count -eq 0)
 
+# --- minimized target: open the palette while the fixture is in front, then minimize it
+# without touching the foreground. Enter must restore it before injecting Ctrl+V; without
+# the restore the injection would go into a hidden window and the textbox would stay empty.
+$tb.Clear()
+[void][FF]::ClickScreen($fx.Handle, [int](($fxRect.Right - $fxRect.Left) / 2), 60, 1)
+Pump 400
+Check 'fixture owns the foreground before the minimized round' `
+    ([FF]::GetForegroundWindow() -eq $fx.Handle) `
+    "fg=$([FF]::GetForegroundWindow()) fixture=$($fx.Handle)"
+[FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+Start-Sleep -Milliseconds 900
+$popup3 = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+$edit3 = 0
+if ($popup3 -gt 0) { $edit3 = [FF]::ChildByClassHandle($popup3, 'Edit') }
+# SW_SHOWMINNOACTIVE = 7: iconic without changing the foreground, so the palette stays open.
+[void][FF]::ShowWindow($fx.Handle, 7)
+Pump 300
+Check 'target is minimized before Enter' ([FF]::IsIconic($fx.Handle))
+if ($edit3 -gt 0) {
+    [FF]::PostMessage([IntPtr]$edit3, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero) | Out-Null
+}
+Pump 3000
+Check 'a minimized target is restored and pasted into' ($tb.Text.Contains($marker)) `
+    "textbox='$($tb.Text)'"
+
+# --- click round: a row click must go through the same finish path as Enter (copy + paste).
+$tb.Clear()
+[void][FF]::ClickScreen($fx.Handle, [int](($fxRect.Right - $fxRect.Left) / 2), 60, 1)
+Pump 400
+Check 'fixture owns the foreground before the click round' `
+    ([FF]::GetForegroundWindow() -eq $fx.Handle) `
+    "fg=$([FF]::GetForegroundWindow()) fixture=$($fx.Handle)"
+[FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+Start-Sleep -Milliseconds 900
+$popup4 = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+$clickVisible = $false
+if ($popup4 -gt 0) { $clickVisible = [FF]::IsWindowVisible([IntPtr]$popup4) }
+Check 'palette opens for the click round' $clickVisible
+if ($popup4 -gt 0) {
+    $cr = New-Object FF+RECT
+    [void][FF]::GetClientRect([IntPtr]$popup4, [ref]$cr)
+    $scale = [FF]::GetDpiForSystem() / 96.0
+    $cx = [int](($cr.Right - $cr.Left) / 2)
+    # Row 1 center: list_top 92 + half a 36 px row, scaled exactly like `layout_for`.
+    $cy = [int][Math]::Round((92 + 18) * $scale)
+    $lp = [IntPtr](($cy * 65536) + ($cx -band 0xFFFF))
+    [FF]::PostMessage([IntPtr]$popup4, 0x0201, [IntPtr]1, $lp) | Out-Null
+}
+Pump 2500
+Check 'clicking a row auto-pastes into the target' ($tb.Text.Contains($marker)) `
+    "textbox='$($tb.Text)'"
+$hiddenAfterClick = $true
+if ($popup4 -gt 0) { $hiddenAfterClick = -not [FF]::IsWindowVisible([IntPtr]$popup4) }
+Check 'clicking a row closes the palette' $hiddenAfterClick
+
 # --- self-window guard: the app's own main window was in front, so nothing may be pasted.
+$failBefore = @(Get-LogLines | Where-Object { $_ -like '*clip_autopaste ok=false*' }).Count
 $tb.Clear()
 [void][FF]::SetForegroundWindow($h)
 Pump 300
@@ -151,7 +228,8 @@ if ($edit2 -gt 0) {
     [FF]::PostMessage([IntPtr]$edit2, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero) | Out-Null
 }
 Pump 1500
-Check 'the self-window target is refused' (Wait-LogMatch '*clip_autopaste ok=false*' 4000)
+Check 'the self-window target is refused' `
+    (Wait-LogCount '*clip_autopaste ok=false*' ($failBefore + 1) 4000)
 Check 'nothing is pasted into our own window' ($tb.Text.Length -eq 0) `
     "textbox='$($tb.Text)'"
 

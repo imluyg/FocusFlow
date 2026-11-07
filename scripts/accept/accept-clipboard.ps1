@@ -91,10 +91,24 @@ function Wait-IngestCountStable([int]$StableMs = 1200, [int]$TimeoutMs = 8000) {
     return $last
 }
 
+# Open the palette and return its EDIT handle. One helper for the paging rounds, so each
+# starts from a fresh palette (selection at row 1, scroll 0).
+function Open-ClipPalette {
+    [FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+    Start-Sleep -Milliseconds 900
+    $hp = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+    $he = 0
+    if ($hp -gt 0) { $he = [FF]::ChildByClassHandle($hp, 'Edit') }
+    [PSCustomObject]@{ Popup = $hp; Edit = $he }
+}
+
 Stop-App $Exe
 New-AppDir $app @('[collector]', 'enabled = false')
 Set-ConfigLine $app 'hotkey' 'clipboard' $hotCombo
 Set-ConfigLine $app 'clipboard' 'enabled' 'true'
+# Auto-paste is on by default as of the UI round; this suite is the copy-only arm, so it
+# must opt out explicitly. Otherwise Enter would inject Ctrl+V into the test console.
+Set-ConfigLine $app 'clipboard' 'auto_paste' 'false'
 
 $orig = $null
 try { $orig = Get-ClipboardRetry } catch { }
@@ -122,6 +136,8 @@ Check 'second external copy is captured' (Wait-LogMatch '*clip_ingest*' 6000)
 $before = Wait-IngestCountStable
 
 # The hotkey must toggle ONCE. A press handled twice would leave the palette hidden.
+# Remember who owns the foreground: with auto_paste=false, Enter must hand it back.
+$fgBefore = [FF]::GetForegroundWindow()
 [FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
 Start-Sleep -Milliseconds 900
 $popup = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
@@ -147,8 +163,11 @@ $hidden = $true
 if ($popup -gt 0) { $hidden = -not [FF]::IsWindowVisible([IntPtr]$popup) }
 Check 'Enter closes the palette' $hidden
 Check 'Enter reports a successful copy' (Wait-LogMatch '*clip_enter copied=true*' 3000)
-# Auto-paste is opt-in; with the default config nothing may be injected at all.
-Check 'auto-paste stays off by default' `
+Check 'focus returns to the window that was in front' `
+    ([FF]::GetForegroundWindow() -eq $fgBefore) `
+    "fg=$([FF]::GetForegroundWindow()) before=$fgBefore"
+# This suite explicitly sets auto_paste=false, so nothing may be injected at all.
+Check 'auto-paste stays off when configured off' `
     (@(Get-LogLines | Where-Object { $_ -like '*clip_autopaste*' }).Count -eq 0)
 
 $clip = ''
@@ -159,6 +178,163 @@ Check 'Enter puts the selected (older) item on the clipboard' ($null -ne $clip -
 Start-Sleep -Milliseconds 1000
 $after = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest*' }).Count
 Check 'the app does not capture its own clipboard write' ($after -eq $before)
+
+# ---- Search: words are ANDed across the content. The old implementation required them to
+# appear contiguously; "accept-clipboard older" only exists here as "accept-clipboard-older",
+# so a hit is a real difference between the new and old search (qlen=22, one match).
+[FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+Start-Sleep -Milliseconds 900
+$popup2 = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+$edit2 = 0
+if ($popup2 -gt 0) { $edit2 = [FF]::ChildByClassHandle($popup2, 'Edit') }
+Check 'palette reopens for the search round' ($edit2 -gt 0)
+if ($edit2 -gt 0) {
+    foreach ($ch in [System.Text.Encoding]::ASCII.GetBytes('accept-clipboard older')) {
+        [FF]::PostMessage([IntPtr]$edit2, 0x0102, [IntPtr][int]$ch, [IntPtr]::Zero) | Out-Null
+        Start-Sleep -Milliseconds 25
+    }
+}
+Check 'multi-word search matches non-contiguous content' (Wait-LogMatch '*clip_search qlen=22 n=1*' 4000)
+if ($edit2 -gt 0) {
+    [FF]::PostMessage([IntPtr]$edit2, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 400
+}
+
+# ---- Shortcut round: Ctrl+Enter copies without closing; Alt+1 picks row 1 and closes.
+[FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+Start-Sleep -Milliseconds 900
+$popup4 = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+$shortcutVisible = $false
+if ($popup4 -gt 0) { $shortcutVisible = [FF]::IsWindowVisible([IntPtr]$popup4) }
+Check 'palette opens for the shortcut round' $shortcutVisible
+# PostMessage does not move GetKeyState, so these must be real injected chords.
+[FF]::PressChord([byte[]]@(0x11), [byte]0x0D)
+Start-Sleep -Milliseconds 500
+Check 'Ctrl+Enter copies without closing' (Wait-LogMatch '*Ctrl+Enter copied=true*' 3000)
+$stillVisible = $false
+if ($popup4 -gt 0) { $stillVisible = [FF]::IsWindowVisible([IntPtr]$popup4) }
+Check 'Ctrl+Enter leaves the palette open' $stillVisible
+if ($popup4 -gt 0) { [void][FF]::SetForegroundWindow([IntPtr]$popup4) }
+Start-Sleep -Milliseconds 200
+[FF]::PressChord([byte[]]@(0x12), [byte]0x31)
+Start-Sleep -Milliseconds 800
+Check 'Alt+1 copies the first visible row' (Wait-LogMatch '*Alt+1 copied=true*' 3000)
+$hiddenAfterAlt = $true
+if ($popup4 -gt 0) { $hiddenAfterAlt = -not [FF]::IsWindowVisible([IntPtr]$popup4) }
+Check 'Alt+1 closes the palette' $hiddenAfterAlt
+
+# ---- Mouse round: a screen click on row 2 must copy that row. Row 1 (the marker) was
+# copied by Alt+1, so "clipboard is now the older text" is a real change, not the old state.
+[FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+Start-Sleep -Milliseconds 900
+$popup5 = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+if ($popup5 -gt 0) {
+    $pr = New-Object FF+RECT
+    [void][FF]::GetWindowRect([IntPtr]$popup5, [ref]$pr)
+    $scale = [FF]::GetDpiForSystem() / 96.0
+    $cx = [int](($pr.Right - $pr.Left) / 2)
+    # Row 2 center: list_top 92 + 1.5 * row_h 36, scaled exactly like `layout_for`.
+    $cy = [int][Math]::Round((92 + 36 * 1.5) * $scale)
+    [FF]::ClickScreen([IntPtr]$popup5, $cx, $cy, 1)
+    Start-Sleep -Milliseconds 700
+}
+$clickClip = ''
+try { $clickClip = Get-ClipboardRetry } catch { }
+Check 'clicking the second row copies that row' `
+    ($null -ne $clickClip -and $clickClip.Trim() -eq $older) `
+    "clipboard='$clickClip' want='$older'"
+$hiddenAfterClick = $true
+if ($popup5 -gt 0) { $hiddenAfterClick = -not [FF]::IsWindowVisible([IntPtr]$popup5) }
+Check 'clicking a row closes the palette' $hiddenAfterClick
+
+# ---- PageDown: from the top row it lands on the last row. Put a neutral text on the
+# clipboard first so "older" is a change, not the state left by the mouse round.
+$neutral = 'accept-clipboard-neutral'
+Set-ClipboardRetry $neutral
+Start-Sleep -Milliseconds 600
+[FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+Start-Sleep -Milliseconds 900
+$popup6 = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+$edit6 = 0
+if ($popup6 -gt 0) { $edit6 = [FF]::ChildByClassHandle($popup6, 'Edit') }
+if ($edit6 -gt 0) {
+    # VK_NEXT = 0x22: PageDown moves by (visible rows - 1), clamped to the last row.
+    [FF]::PostMessage([IntPtr]$edit6, 0x0100, [IntPtr]0x22, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 250
+    [FF]::PostMessage([IntPtr]$edit6, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero) | Out-Null
+}
+Start-Sleep -Milliseconds 900
+$pageClip = ''
+try { $pageClip = Get-ClipboardRetry } catch { }
+Check 'PageDown then Enter copies the last row' `
+    ($null -ne $pageClip -and $pageClip.Trim() -eq $older) `
+    "clipboard='$pageClip' want='$older'"
+
+# ---- End / Home / PageUp, each with a different "before" so a no-op key cannot pass.
+# A fresh top row makes "copy the first row" differ from whatever the clipboard held before.
+$topText = 'accept-clipboard-top'
+$ingestBeforeTop = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest*' }).Count
+Set-ClipboardRetry $topText
+$ingestAfterTop = Wait-IngestCountStable 800 8000
+Check 'the top-row text is captured before the paging round' ($ingestAfterTop -gt $ingestBeforeTop)
+
+# End + Enter: last row (older), while the clipboard still holds the fresh top text.
+$pal = Open-ClipPalette
+if ($pal.Edit -gt 0) {
+    [FF]::PostMessage([IntPtr]$pal.Edit, 0x0100, [IntPtr]0x23, [IntPtr]::Zero) | Out-Null  # VK_END
+    Start-Sleep -Milliseconds 200
+    [FF]::PostMessage([IntPtr]$pal.Edit, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero) | Out-Null
+}
+Start-Sleep -Milliseconds 900
+$endClip = ''
+try { $endClip = Get-ClipboardRetry } catch { }
+Check 'End then Enter copies the last row' `
+    ($null -ne $endClip -and $endClip.Trim() -eq $older) `
+    "clipboard='$endClip' want='$older'"
+
+# Home from a middle row: first row (the fresh top text), while the clipboard holds older.
+$pal = Open-ClipPalette
+if ($pal.Edit -gt 0) {
+    foreach ($vk in @(0x28, 0x28)) {   # VK_DOWN twice -> row 3
+        [FF]::PostMessage([IntPtr]$pal.Edit, 0x0100, [IntPtr]$vk, [IntPtr]::Zero) | Out-Null
+        Start-Sleep -Milliseconds 120
+    }
+    [FF]::PostMessage([IntPtr]$pal.Edit, 0x0100, [IntPtr]0x24, [IntPtr]::Zero) | Out-Null  # VK_HOME
+    Start-Sleep -Milliseconds 200
+    [FF]::PostMessage([IntPtr]$pal.Edit, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero) | Out-Null
+}
+Start-Sleep -Milliseconds 900
+$homeClip = ''
+try { $homeClip = Get-ClipboardRetry } catch { }
+Check 'Home from a middle row copies the first row' `
+    ($null -ne $homeClip -and $homeClip.Trim() -eq $topText) `
+    "clipboard='$homeClip' want='$topText'"
+
+# Re-arm the "before" with the app's own copy of the last row (self-write keeps the order),
+# then PageUp from a middle row must land on the first row.
+$pal = Open-ClipPalette
+if ($pal.Edit -gt 0) {
+    [FF]::PostMessage([IntPtr]$pal.Edit, 0x0100, [IntPtr]0x23, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 200
+    [FF]::PostMessage([IntPtr]$pal.Edit, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero) | Out-Null
+}
+Start-Sleep -Milliseconds 900
+$pal = Open-ClipPalette
+if ($pal.Edit -gt 0) {
+    foreach ($vk in @(0x28, 0x28)) {
+        [FF]::PostMessage([IntPtr]$pal.Edit, 0x0100, [IntPtr]$vk, [IntPtr]::Zero) | Out-Null
+        Start-Sleep -Milliseconds 120
+    }
+    [FF]::PostMessage([IntPtr]$pal.Edit, 0x0100, [IntPtr]0x21, [IntPtr]::Zero) | Out-Null  # VK_PRIOR
+    Start-Sleep -Milliseconds 200
+    [FF]::PostMessage([IntPtr]$pal.Edit, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero) | Out-Null
+}
+Start-Sleep -Milliseconds 900
+$pageUpClip = ''
+try { $pageUpClip = Get-ClipboardRetry } catch { }
+Check 'PageUp from a middle row copies the first row' `
+    ($null -ne $pageUpClip -and $pageUpClip.Trim() -eq $topText) `
+    "clipboard='$pageUpClip' want='$topText'"
 
 # Page: open the management page, enable multi-select, pick the first row, pin it.
 [FF]::ClickWindow($h, 644, 183, 1)
@@ -212,7 +388,11 @@ Check 'external file copy is published' $fileSet
 Check 'external file is captured' (Wait-LogMatch '*clip_ingest_files*' 8000)
 
 Remove-Item $fileFixture -Force
-Set-ClipboardRetry $marker
+# A fresh string, not the marker: the shortcut round just put the marker on the clipboard,
+# and re-setting the same text inside the 3 s self-write window is (correctly) suppressed.
+# Without a real ingest here nothing reloads the page, so the missing file would go unseen.
+$afterFile = 'accept-clipboard-after-file'
+Set-ClipboardRetry $afterFile
 Check 'missing file rows are marked on the page' (Wait-LogMatch '*clip_page_missing_files*' 8000)
 
 # Copy the image back from the page: re-copy it (dedupe only moves it to the top), leave

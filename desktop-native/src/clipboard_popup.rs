@@ -28,22 +28,23 @@ use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE,
-    VK_F1, VK_RETURN, VK_TAB, VK_UP, VK_V,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
+    VK_ESCAPE, VK_F1, VK_HOME, VK_NEXT, VK_PRIOR, VK_RETURN, VK_TAB, VK_UP, VK_V,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GetClientRect, GetCursorPos, GetForegroundWindow, GetParent, GetWindowLongPtrW,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
-    KillTimer, MessageBoxW, RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu, CS_DBLCLKS,
-    ES_AUTOHSCROLL, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDYES, MB_ICONQUESTION, MB_YESNO,
-    MESSAGEBOX_STYLE, MF_POPUP, MF_SEPARATOR, MF_STRING, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TRACK_POPUP_MENU_FLAGS, WA_INACTIVE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETFONT, WM_SIZE, WM_TIMER,
-    WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, KillTimer, MessageBoxW, RegisterClassW, SendMessageW, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, ShowWindowAsync,
+    TrackPopupMenu, CS_DBLCLKS, ES_AUTOHSCROLL, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDYES,
+    MB_ICONQUESTION, MB_YESNO, MESSAGEBOX_STYLE, MF_POPUP, MF_SEPARATOR, MF_STRING, SWP_SHOWWINDOW,
+    SW_HIDE, SW_RESTORE, SW_SHOW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
+    TRACK_POPUP_MENU_FLAGS, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
+    WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEWHEEL,
+    WM_PAINT, WM_RBUTTONDOWN, WM_SETFONT, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 use focusflow_core::clipboard::{self, ClipItem, ClipKind, ClipStats, Snippet, Transform};
@@ -64,6 +65,19 @@ const MENU_PAUSE_60: u32 = 8;
 const MENU_TRANSFORM_BASE: u32 = 100;
 /// 抢前台的重试定时器（只给弹窗自己用，和主窗的 100ms 心跳不冲突）。
 const ACTIVATE_TIMER: usize = 0x0C1A;
+/// 关闭弹窗后"还焦点（并按需粘贴）"的重试定时器。
+const RESTORE_TIMER: usize = 0x0C1B;
+const RESTORE_TICK_MS: u32 = 25;
+/// 12 跳 ≈ 300ms：足够前台锁松开或最小化窗口还原，又不会在用户已经走开时一直抢。
+const RESTORE_MAX_TICKS: u8 = 12;
+/// 连续这么多跳前台都是第三方窗口就放弃 —— 用户刚点了别处，不再把焦点硬拽回去。
+const RESTORE_MAX_STRAY: u8 = 4;
+/// 历史列表一次加载多少条。库默认上限也是 500；再往上只该靠搜索，不该靠滚动。
+const HISTORY_LIMIT: i64 = 500;
+
+/// 最近一次"没能把焦点还回去 / 没能粘贴"的原因。弹窗已经关了，写日志没人看；
+/// 下次打开时放到状态条。
+static LAST_RESTORE_ISSUE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 static PALETTE_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -87,8 +101,18 @@ struct Row {
     kind: ClipKind,
     image_path: Option<String>,
     file_paths: Vec<String>,
-    /// 文件条目里已经不在磁盘上的路径数。
-    missing_files: usize,
+    /// 文件条目里已经不在磁盘上的路径数。`None` = 还没查（只对可视行查，避免
+    /// 500 行 × 每条最多 20 个路径 × 每次击键上万次磁盘 stat）。
+    missing_files: Option<usize>,
+}
+
+/// 关闭弹窗后的还焦点任务：每一跳都确认目标还活着、前台真的换过去了，再决定粘不粘。
+#[derive(Clone, Copy)]
+struct RestoreJob {
+    target: HWND,
+    paste: bool,
+    ticks_left: u8,
+    stray_ticks: u8,
 }
 
 struct Palette {
@@ -149,6 +173,8 @@ struct State {
     activated: bool,
     /// 抢前台的重试还剩几次。
     activate_tries: u8,
+    /// 关闭弹窗后的还焦点/粘贴任务。
+    restore: Option<RestoreJob>,
     dpi: f32,
     font: HFONT,
     font_small: HFONT,
@@ -192,14 +218,14 @@ impl State {
     }
 
     fn reload_history(&mut self) {
-        match clipboard::search(&self.query, 100) {
-            Ok(items) => {
-                self.history = items.into_iter().map(row_from_item).collect();
+        match load_history(&self.query) {
+            Ok(rows) => {
+                self.history = rows;
                 self.status = None;
             }
             Err(e) => {
                 self.history.clear();
-                self.status = Some(format!("读剪贴板库失败：{e}"));
+                self.status = Some(e);
             }
         }
         self.clamp_selection();
@@ -234,6 +260,38 @@ impl State {
             self.scroll = self.sel;
         } else if self.sel >= self.scroll + lay.rows {
             self.scroll = self.sel + 1 - lay.rows;
+        }
+    }
+
+    fn move_selection_to(&mut self, hwnd: HWND, idx: usize) {
+        let len = self.rows().len();
+        if len == 0 {
+            self.sel = 0;
+            self.scroll = 0;
+            return;
+        }
+        let idx = idx.min(len - 1);
+        let delta = idx as i32 - self.sel as i32;
+        self.move_selection(hwnd, delta);
+    }
+
+    /// 当前布局一次能画多少行（翻页与滚轮夹取都按它算）。
+    fn visible_rows(&self, hwnd: HWND) -> usize {
+        let (w, h) = client_size(hwnd);
+        layout_for(w, h, self.dpi).rows
+    }
+
+    /// 只补**可视行**的失效检查：`Path::exists` 是磁盘 IO，不能跟着每一条历史走。
+    fn fill_missing_visible(&mut self, first: usize, visible: usize) {
+        let rows = match self.mode {
+            Mode::History => &mut self.history,
+            Mode::Snippets => &mut self.snippets,
+            Mode::Stats => return,
+        };
+        for row in rows.iter_mut().skip(first).take(visible) {
+            if row.kind == ClipKind::File && row.missing_files.is_none() {
+                row.missing_files = Some(clipboard::split_alive_paths(&row.file_paths).1.len());
+            }
         }
     }
 
@@ -340,11 +398,6 @@ impl State {
 }
 
 fn row_from_item(item: ClipItem) -> Row {
-    let missing_files = if item.kind == ClipKind::File {
-        clipboard::split_alive_paths(&item.file_paths).1.len()
-    } else {
-        0
-    };
     Row {
         id: item.id,
         content: item.content,
@@ -359,8 +412,17 @@ fn row_from_item(item: ClipItem) -> Row {
         kind: item.kind,
         image_path: item.image_path,
         file_paths: item.file_paths,
-        missing_files,
+        // 失效与否只对可视行现查（见 `fill_missing_visible`）。
+        missing_files: None,
     }
+}
+
+/// 历史列表的唯一读入口。抽出来是为了让"一次加载 500 条"能被单测看见
+/// （旧实现把 100 写死在这里）。
+fn load_history(query: &str) -> Result<Vec<Row>, String> {
+    clipboard::search(query, HISTORY_LIMIT)
+        .map(|items| items.into_iter().map(row_from_item).collect())
+        .map_err(|e| format!("读剪贴板库失败：{e}"))
 }
 
 fn row_from_snippet(s: Snippet) -> Row {
@@ -378,7 +440,7 @@ fn row_from_snippet(s: Snippet) -> Row {
         kind: ClipKind::Text,
         image_path: None,
         file_paths: Vec::new(),
-        missing_files: 0,
+        missing_files: None,
     }
 }
 
@@ -389,8 +451,8 @@ fn row_label(row: &Row) -> String {
     match row.kind {
         ClipKind::Text => text,
         ClipKind::Image => format!("［图］{text}"),
-        ClipKind::File if row.missing_files > 0 => {
-            format!("［件·{} 个失效］{text}", row.missing_files)
+        ClipKind::File if row.missing_files.unwrap_or(0) > 0 => {
+            format!("［件·{} 个失效］{text}", row.missing_files.unwrap_or(0))
         }
         ClipKind::File => format!("［件］{text}"),
     }
@@ -544,7 +606,8 @@ fn placement() -> (i32, i32, i32, i32, f32) {
         }
     };
     let w = ((560.0 * dpi / 96.0).round() as i32).min(work.right - work.left);
-    let h = ((440.0 * dpi / 96.0).round() as i32).min(work.bottom - work.top);
+    // 560 高在 96/120dpi 下都是 12 行（旧 440 只有 8 行）；工作区太矮时仍按工作区截断。
+    let h = ((560.0 * dpi / 96.0).round() as i32).min(work.bottom - work.top);
     let x = work.left + ((work.right - work.left - w) / 2).max(0);
     let y = work.top + ((work.bottom - work.top - h) / 2).max(0);
     (x, y, w, h, dpi)
@@ -646,6 +709,7 @@ fn create_and_show() -> Result<(), String> {
         menu_open: false,
         activated: false,
         activate_tries: 0,
+        restore: None,
         dpi,
         font,
         font_small,
@@ -660,7 +724,9 @@ fn create_and_show() -> Result<(), String> {
             Some(WPARAM(font.0 as usize)),
             Some(LPARAM(1)),
         );
-        let cue: Vec<u16> = "搜索剪贴板历史…\0".encode_utf16().collect();
+        let cue: Vec<u16> = "搜索：空格分词，可加 img:/file:/app:\0"
+            .encode_utf16()
+            .collect();
         SendMessageW(
             edit,
             EM_SETCUEBANNER,
@@ -676,6 +742,9 @@ fn create_and_show() -> Result<(), String> {
         st.activated = false;
         st.activate_tries = 2;
         st.reload_all();
+        if let Some(msg) = take_restore_issue() {
+            st.status = Some(msg);
+        }
     });
     unsafe {
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW);
@@ -694,6 +763,8 @@ fn create_and_show() -> Result<(), String> {
 }
 
 fn reveal(hwnd: HWND) {
+    // 上一次复制后的还焦点/粘贴任务不能让它在这次重开后突然发一发 Ctrl+V。
+    cancel_restore(hwnd);
     let (x, y, w, h, _) = placement();
     // 先记焦点再显示：`SWP_SHOWWINDOW` 之后 `GetForegroundWindow` 可能已经是弹窗自己。
     let prev_fg = unsafe { GetForegroundWindow() };
@@ -709,6 +780,9 @@ fn reveal(hwnd: HWND) {
         st.activated = false;
         st.activate_tries = 2;
         st.reload_all();
+        if let Some(msg) = take_restore_issue() {
+            st.status = Some(msg);
+        }
         unsafe {
             let _ = SetWindowTextW(st.edit, w!(""));
         }
@@ -742,10 +816,11 @@ fn claim_foreground(hwnd: HWND) {
     }
 }
 
-/// 复制成功后的收尾：关窗；开了自动粘贴就把焦点还给原窗口并注入 Ctrl+V。
+/// 复制成功后的收尾：关窗，然后由 `RESTORE_TIMER` 一跳一跳地把焦点还给原窗口，
+/// 确认前台真的换过去了才注入 Ctrl+V。
 ///
-/// 失败不回滚、也不重开弹窗：内容已经在剪贴板里，退路就是让用户自己按一下 Ctrl+V。
-/// 每一步的结局进日志（`clip_autopaste ok=…`），"没等到回音"不折成成功。
+/// 失败不回滚、也不重开弹窗：内容已经在剪贴板里，退路就是让用户自己按一下 Ctrl+V；
+/// 失败原因写日志，并在下次打开弹窗时放到状态条（弹窗已经关了，当场没人看得到）。
 fn finish_copy(hwnd: HWND, copied: bool) {
     if !copied {
         unsafe {
@@ -755,14 +830,27 @@ fn finish_copy(hwnd: HWND, copied: bool) {
     }
     let auto = clipboard::auto_paste_enabled();
     let prev = with_state(hwnd, |st| st.prev_fg).unwrap_or_default();
-    // 自动粘贴这一路先不还焦点：还焦点与"确认前台真的换了"必须绑在一起判。
-    hide_inner(hwnd, !auto);
+    let has_target = !prev.0.is_null() && unsafe { IsWindow(Some(prev)) }.as_bool();
+    let is_self = has_target && clipboard::window_belongs_to_us(prev.0 as isize);
     if auto {
-        match auto_paste_into(prev) {
-            Ok(()) => crate::tracing_note("clip_autopaste ok=true"),
-            Err(e) => crate::tracing_note(&format!("clip_autopaste ok=false why={e}")),
+        if let Err(why) = autopaste_gate(has_target, is_self, true) {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            crate::tracing_note(&format!("clip_autopaste ok=false why={why}"));
+            note_restore_issue(why.to_string());
+            return;
         }
+    } else if !has_target {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        return;
     }
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    start_restore(hwnd, prev, auto);
 }
 
 /// 目标窗口能不能作为粘贴对象。纯函数：三条否决理由各自能被单测点到。
@@ -783,16 +871,169 @@ fn autopaste_gate(
     Ok(())
 }
 
-fn auto_paste_into(prev: HWND) -> Result<(), String> {
-    let has_target = !prev.0.is_null() && unsafe { IsWindow(Some(prev)) }.as_bool();
-    let is_self = has_target && clipboard::window_belongs_to_us(prev.0 as isize);
-    autopaste_gate(has_target, is_self, true).map_err(str::to_string)?;
-    claim_foreground(prev);
-    // 前台切换与键盘焦点不是同一跳：给窗口一小段时间，再以"前台确实换了"为准。
-    std::thread::sleep(std::time::Duration::from_millis(40));
-    let foreground_ok = unsafe { GetForegroundWindow() == prev };
-    autopaste_gate(true, false, foreground_ok).map_err(str::to_string)?;
-    send_ctrl_v()
+fn start_restore(hwnd: HWND, target: HWND, paste: bool) {
+    with_state(hwnd, |st| {
+        st.restore = Some(RestoreJob {
+            target,
+            paste,
+            ticks_left: RESTORE_MAX_TICKS,
+            stray_ticks: 0,
+        });
+    });
+    unsafe {
+        let _ = SetTimer(Some(hwnd), RESTORE_TIMER, RESTORE_TICK_MS, None);
+    }
+    // 第一跳立刻做：多数机器上隐藏弹窗后前台当场就是目标窗口，不必等 25ms。
+    restore_tick(hwnd);
+}
+
+fn clear_restore(hwnd: HWND) {
+    with_state(hwnd, |st| st.restore = None);
+    unsafe {
+        let _ = KillTimer(Some(hwnd), RESTORE_TIMER);
+    }
+}
+
+/// 重新打开弹窗时取消还没跑完的任务：否则那一发 Ctrl+V 可能落进搜索框。
+fn cancel_restore(hwnd: HWND) {
+    let pending = with_state(hwnd, |st| st.restore.is_some()).unwrap_or(false);
+    if pending {
+        clear_restore(hwnd);
+        crate::tracing_note("剪贴板自动粘贴被新的弹窗取消");
+    }
+}
+
+/// 一跳的结论。抽成纯函数：目标没了 / 前台换了 / 该不该继续等，都能脱离窗口句柄单测。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreAction {
+    TargetGone,
+    ForegroundReady,
+    GiveUpStray,
+    GiveUpTimeout,
+    Wait,
+    WaitStray,
+}
+
+fn next_restore_action(
+    target_alive: bool,
+    foreground_is_target: bool,
+    foreground_is_self: bool,
+    ticks_left: u8,
+    stray_ticks: u8,
+) -> RestoreAction {
+    if !target_alive {
+        return RestoreAction::TargetGone;
+    }
+    if foreground_is_target {
+        return RestoreAction::ForegroundReady;
+    }
+    if !foreground_is_self && stray_ticks >= RESTORE_MAX_STRAY {
+        return RestoreAction::GiveUpStray;
+    }
+    if ticks_left == 0 {
+        return RestoreAction::GiveUpTimeout;
+    }
+    if foreground_is_self {
+        RestoreAction::Wait
+    } else {
+        RestoreAction::WaitStray
+    }
+}
+
+/// 一跳：确认目标还活着 → 最小化就还原 → 抢前台 → 前台真的换了才粘贴。
+fn restore_tick(hwnd: HWND) {
+    let Some(job) = with_state(hwnd, |st| st.restore).flatten() else {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), RESTORE_TIMER);
+        }
+        return;
+    };
+    let target_alive = !job.target.0.is_null() && unsafe { IsWindow(Some(job.target)) }.as_bool();
+    if target_alive && unsafe { IsIconic(job.target) }.as_bool() {
+        unsafe {
+            let _ = ShowWindowAsync(job.target, SW_RESTORE);
+        }
+    }
+    if target_alive {
+        claim_foreground(job.target);
+    }
+    let fg = unsafe { GetForegroundWindow() };
+    let action = next_restore_action(
+        target_alive,
+        target_alive && fg == job.target,
+        fg == hwnd,
+        job.ticks_left,
+        job.stray_ticks,
+    );
+    match action {
+        RestoreAction::TargetGone => {
+            finish_restore(hwnd, job, Err("原窗口已经关闭".to_string()));
+        }
+        RestoreAction::ForegroundReady => {
+            if job.paste {
+                match send_ctrl_v() {
+                    Ok(()) => crate::tracing_note("clip_autopaste ok=true"),
+                    Err(e) => {
+                        crate::tracing_note(&format!("clip_autopaste ok=false why={e}"));
+                        note_restore_issue(format!("没能自动粘贴：{e}；内容已在剪贴板"));
+                    }
+                }
+            }
+            clear_restore(hwnd);
+        }
+        RestoreAction::GiveUpStray => {
+            finish_restore(hwnd, job, Err("前台已经切到别的窗口".to_string()));
+        }
+        RestoreAction::GiveUpTimeout => {
+            let why = if job.paste {
+                autopaste_gate(true, false, false)
+                    .err()
+                    .unwrap_or("未能确认前台已经切回原窗口")
+                    .to_string()
+            } else {
+                "没能把焦点还给原窗口（前台锁或提权窗口）".to_string()
+            };
+            finish_restore(hwnd, job, Err(why));
+        }
+        RestoreAction::Wait | RestoreAction::WaitStray => {
+            let stray = action == RestoreAction::WaitStray;
+            with_state(hwnd, |st| {
+                if let Some(j) = st.restore.as_mut() {
+                    j.ticks_left = j.ticks_left.saturating_sub(1);
+                    j.stray_ticks = if stray {
+                        j.stray_ticks.saturating_add(1)
+                    } else {
+                        0
+                    };
+                }
+            });
+        }
+    }
+}
+
+fn finish_restore(hwnd: HWND, job: RestoreJob, outcome: Result<(), String>) {
+    if let Err(why) = outcome {
+        if job.paste {
+            crate::tracing_note(&format!("clip_autopaste ok=false why={why}"));
+        } else {
+            crate::tracing_note(&format!("剪贴板弹窗关闭后没能把焦点还给原窗口：{why}"));
+        }
+        note_restore_issue(why);
+    }
+    clear_restore(hwnd);
+}
+
+fn note_restore_issue(msg: String) {
+    if let Ok(mut slot) = LAST_RESTORE_ISSUE.lock() {
+        *slot = Some(msg);
+    }
+}
+
+fn take_restore_issue() -> Option<String> {
+    LAST_RESTORE_ISSUE
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
 }
 
 /// 往当前前台窗口注入一次 Ctrl+V。返回值是"插入了几个事件"，被 UIPI 拦下时是 0。
@@ -869,14 +1110,13 @@ fn hide_inner(hwnd: HWND, restore_focus: bool) {
     let prev = with_state(hwnd, |st| st.prev_fg).unwrap_or_default();
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
-        if restore_focus
-            && !prev.0.is_null()
-            && prev != hwnd
-            && IsWindow(Some(prev)).as_bool()
-            && !SetForegroundWindow(prev).as_bool()
-        {
-            crate::tracing_note("剪贴板弹窗关闭后没能把焦点还给原窗口（提权窗口或前台锁常见）");
-        }
+    }
+    if restore_focus
+        && !prev.0.is_null()
+        && prev != hwnd
+        && unsafe { IsWindow(Some(prev)) }.as_bool()
+    {
+        start_restore(hwnd, prev, false);
     }
 }
 
@@ -929,19 +1169,37 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
             LRESULT(brush.map(|b| b.0 as isize).unwrap_or(0))
         }
         WM_KEYDOWN => {
-            handle_key(hwnd, w.0 as u32);
+            let vk = w.0 as u32;
+            let ctrl = (unsafe { GetKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
+            if ctrl && vk == VK_RETURN.0 as u32 {
+                copy_without_closing(hwnd);
+            } else {
+                handle_key(hwnd, vk);
+            }
             LRESULT(0)
+        }
+        WM_SYSKEYDOWN => {
+            if handle_sys_key(hwnd, w.0 as u32) {
+                LRESULT(0)
+            } else {
+                DefWindowProcW(hwnd, msg, w, l)
+            }
         }
         WM_MOUSEWHEEL => {
             let delta = ((w.0 as u32 >> 16) as u16) as i16 as i32;
             with_state(hwnd, |st| {
-                let len = st.rows().len() as i32;
+                let len = st.rows().len();
                 let (cw, ch) = client_size(hwnd);
                 let lay = layout_for(cw, ch, st.dpi);
-                let max_scroll = (len - lay.rows as i32).max(0) as usize;
+                let max_scroll = len.saturating_sub(lay.rows);
                 let step = if delta > 0 { -2 } else { 2 };
                 let next = (st.scroll as i32 + step).clamp(0, max_scroll as i32) as usize;
                 st.scroll = next;
+                if len > 0 {
+                    // 滚动之后选中项必须还在可视区，否则 Enter 会复制到看不见的那一行。
+                    let last = (next + lay.rows).saturating_sub(1).min(len - 1);
+                    st.sel = st.sel.clamp(next, last);
+                }
             });
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
@@ -980,6 +1238,10 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
             } else {
                 with_state(hwnd, |st| st.activated = true);
             }
+            LRESULT(0)
+        }
+        WM_TIMER if w.0 == RESTORE_TIMER => {
+            restore_tick(hwnd);
             LRESULT(0)
         }
         WM_TIMER if w.0 == ACTIVATE_TIMER => {
@@ -1038,10 +1300,21 @@ unsafe extern "system" fn edit_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    if msg == WM_SYSKEYDOWN {
+        let parent = GetParent(hwnd).unwrap_or_default();
+        if handle_sys_key(parent, w.0 as u32) {
+            return LRESULT(0);
+        }
+    }
     if msg == WM_KEYDOWN {
         let parent = GetParent(hwnd).unwrap_or_default();
         let vk = w.0 as u32;
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+        // Ctrl+Enter 只复制不关窗；必须在 `handle_key` 之前判，否则回车会被当成粘贴。
+        if ctrl && vk == VK_RETURN.0 as u32 {
+            copy_without_closing(parent);
+            return LRESULT(0);
+        }
         if handle_key(parent, vk) {
             return LRESULT(0);
         }
@@ -1076,6 +1349,40 @@ fn handle_key(hwnd: HWND, vk: u32) -> bool {
         }
         x if x == VK_DOWN.0 as u32 => {
             with_state(hwnd, |st| st.move_selection(hwnd, 1));
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            true
+        }
+        x if x == VK_PRIOR.0 as u32 || x == VK_NEXT.0 as u32 => {
+            let dir = if x == VK_PRIOR.0 as u32 { -1 } else { 1 };
+            with_state(hwnd, |st| {
+                let step = st.visible_rows(hwnd).saturating_sub(1).max(1) as i32;
+                st.move_selection(hwnd, dir * step);
+            });
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            true
+        }
+        x if x == VK_HOME.0 as u32 || x == VK_END.0 as u32 => {
+            // 搜索框有文字时 Home/End 是光标键，不能抢。
+            let caret = with_state(hwnd, |st| {
+                !st.query.is_empty() && unsafe { GetFocus() } == st.edit
+            })
+            .unwrap_or(false);
+            if caret {
+                return false;
+            }
+            let end = x == VK_END.0 as u32;
+            with_state(hwnd, |st| {
+                let idx = if end {
+                    st.rows().len().saturating_sub(1)
+                } else {
+                    0
+                };
+                st.move_selection_to(hwnd, idx);
+            });
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
@@ -1136,6 +1443,45 @@ fn handle_key(hwnd: HWND, vk: u32) -> bool {
     }
 }
 
+/// Ctrl+Enter：只复制、不关窗、不粘贴。给"还要接着翻历史"的人一个出口。
+fn copy_without_closing(hwnd: HWND) -> bool {
+    let copied = with_state(hwnd, |st| {
+        let ok = st.copy_selected();
+        if ok {
+            st.status = Some("已复制，窗口保持打开".to_string());
+        }
+        ok
+    })
+    .unwrap_or(false);
+    crate::tracing_note(&format!("剪贴板弹窗 Ctrl+Enter copied={copied}"));
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+    true
+}
+
+/// Alt+1..9：选中当前可视第 n 行并走正常复制路径。`WM_SYSKEYDOWN` 才收得到。
+fn handle_sys_key(hwnd: HWND, vk: u32) -> bool {
+    if !(0x31..=0x39).contains(&vk) {
+        return false;
+    }
+    let picked = with_state(hwnd, |st| {
+        let idx = st.scroll + (vk - 0x31) as usize;
+        if idx >= st.rows().len() {
+            return false;
+        }
+        st.sel = idx;
+        true
+    })
+    .unwrap_or(false);
+    if picked {
+        let copied = with_state(hwnd, |st| st.copy_selected()).unwrap_or(false);
+        crate::tracing_note(&format!("剪贴板弹窗 Alt+{} copied={copied}", vk - 0x30));
+        finish_copy(hwnd, copied);
+    }
+    true
+}
+
 fn update_edit_visibility(hwnd: HWND) {
     if let Some((edit, mode)) = with_state(hwnd, |st| (st.edit, st.mode)) {
         unsafe {
@@ -1164,7 +1510,7 @@ fn on_query_changed(hwnd: HWND) {
         (*st).scroll = 0;
         (*st).reload_history();
         crate::tracing_note(&format!(
-            "剪贴板搜索 qlen={} n={}",
+            "剪贴板搜索 clip_search qlen={} n={}",
             (*st).query.chars().count(),
             (*st).history.len()
         ));
@@ -1285,7 +1631,7 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
     } else {
         match st.mode {
             Mode::History => {
-                "Enter 复制 · Ctrl+P 固定 · Del 删除 · Tab 片段 · 右键更多 · Esc 关闭".to_string()
+                "Enter 粘贴 · Ctrl+Enter 只复制 · Tab 片段 · 右键更多 · Esc 关闭".to_string()
             }
             Mode::Snippets => "Enter 复制片段 · Del 删除 · Tab 统计 · Esc 关闭".to_string(),
             Mode::Stats => "Tab 回历史 · Esc 关闭".to_string(),
@@ -1325,12 +1671,8 @@ unsafe fn draw_rows(hdc: HDC, st: &mut State, lay: Layout, w: i32, card: HBRUSH,
     let list_bottom = lay.list_top + lay.row_h * lay.rows as i32;
     fill(hdc, lay.pad, lay.list_top, w - lay.pad, list_bottom, card);
 
-    let rows = match st.mode {
-        Mode::History => &st.history,
-        Mode::Snippets => &st.snippets,
-        Mode::Stats => return,
-    };
-    if rows.is_empty() {
+    let len = st.rows().len();
+    if len == 0 {
         let msg = if st.mode == Mode::History && !st.query.trim().is_empty() {
             "没有匹配的记录"
         } else if st.mode == Mode::Snippets {
@@ -1351,7 +1693,14 @@ unsafe fn draw_rows(hdc: HDC, st: &mut State, lay: Layout, w: i32, card: HBRUSH,
         return;
     }
 
-    let visible = lay.rows.min(rows.len().saturating_sub(st.scroll));
+    let visible = lay.rows.min(len.saturating_sub(st.scroll));
+    // 只对将要画出来的文件行问磁盘：500 条历史每条最多 20 个路径，全查会卡住每一键。
+    st.fill_missing_visible(st.scroll, visible);
+    let rows = match st.mode {
+        Mode::History => &st.history,
+        Mode::Snippets => &st.snippets,
+        Mode::Stats => return,
+    };
     for i in 0..visible {
         let idx = st.scroll + i;
         let Some(row) = rows.get(idx) else { break };
@@ -1788,8 +2137,60 @@ mod tests {
             kind,
             image_path: None,
             file_paths: vec!["C:\\a.txt".to_string()],
-            missing_files: missing,
+            missing_files: Some(missing),
         }
+    }
+
+    #[test]
+    fn layout_at_the_new_default_height_shows_twelve_rows() {
+        let lay = layout_for(560, 560, 96.0);
+        assert_eq!(lay.rows, 12, "560 高应比旧 440 多出四行");
+    }
+
+    #[test]
+    fn history_loads_past_the_old_hundred_item_cap() {
+        let _lock = focusflow_core::paths::test_app_dir_lock();
+        let _dir = focusflow_core::paths::test_app_dir("clip_popup_limit");
+        focusflow_core::clipboard::init_db().unwrap();
+        let t = focusflow_core::clipboard::now_ms();
+        for i in 0..120 {
+            focusflow_core::clipboard::ingest(&format!("item {i}"), "", t + i).unwrap();
+        }
+        assert_eq!(
+            load_history("").unwrap().len(),
+            120,
+            "旧实现把上限写死成 100，这里必须是 120"
+        );
+    }
+
+    #[test]
+    fn restore_action_covers_every_exit() {
+        assert_eq!(
+            next_restore_action(false, false, false, 5, 0),
+            RestoreAction::TargetGone
+        );
+        assert_eq!(
+            next_restore_action(true, true, false, 5, 0),
+            RestoreAction::ForegroundReady
+        );
+        assert_eq!(
+            next_restore_action(true, false, false, 5, RESTORE_MAX_STRAY),
+            RestoreAction::GiveUpStray,
+            "用户已经点了别的窗口就不再抢"
+        );
+        assert_eq!(
+            next_restore_action(true, false, false, 0, 0),
+            RestoreAction::GiveUpTimeout
+        );
+        assert_eq!(
+            next_restore_action(true, false, true, 5, 0),
+            RestoreAction::Wait,
+            "前台还是刚隐藏的弹窗：等它让位"
+        );
+        assert_eq!(
+            next_restore_action(true, false, false, 5, 0),
+            RestoreAction::WaitStray
+        );
     }
 
     #[test]

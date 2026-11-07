@@ -77,3 +77,7 @@ png = "0.17"
 
 # 导出的 JSON 报告：core 已经在用 serde_json，这里沿用同一个版本。
 serde_json = "1"
+
+[dev-dependencies]
+# 测试要建临时 app 目录与剪贴板库（`paths::test_app_dir`），只在测试构建里开这个特征。
+focusflow-core = { path = "../crates/core", features = ["test-utils"] }

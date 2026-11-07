@@ -75,6 +75,63 @@ fn search_is_substring_and_ascii_case_insensitive() {
 }
 
 #[test]
+fn search_words_are_and_across_fields() {
+    let _lock = paths::test_app_dir_lock();
+    let _dir = setup("clip_search_words");
+    let t = clipboard::now_ms();
+    clipboard::ingest("alpha beta gamma", "editor.exe", t).unwrap();
+    clipboard::ingest("alpha only", "editor.exe", t + 1).unwrap();
+    clipboard::ingest("beta only", "chrome.exe", t + 2).unwrap();
+    clipboard::ingest_files(&["C:\\work\\report.txt".to_string()], "explorer.exe", t + 3).unwrap();
+
+    // 旧实现要求 "alpha beta" 连续出现，这里只应命中第一条。
+    let hits = clipboard::search("alpha beta", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].content.starts_with("alpha beta"));
+
+    // 来源应用也参与匹配（旧实现只看 content）。
+    let by_source = clipboard::search("chrome", 10).unwrap();
+    assert_eq!(by_source.len(), 1);
+    assert_eq!(by_source[0].content, "beta only");
+
+    // 文件路径按 JSON 里的反斜杠匹配。
+    let by_path = clipboard::search("C:\\work\\report", 10).unwrap();
+    assert_eq!(by_path.len(), 1);
+    assert_eq!(by_path[0].kind, clipboard::ClipKind::File);
+}
+
+#[test]
+fn search_prefixes_filter_by_kind_and_source() {
+    let _lock = paths::test_app_dir_lock();
+    let _dir = setup("clip_search_prefix");
+    let t = clipboard::now_ms();
+    clipboard::ingest("plain text body", "editor.exe", t).unwrap();
+    clipboard::ingest_files(&["D:\\a\\b.pdf".to_string()], "explorer.exe", t + 1).unwrap();
+
+    assert_eq!(clipboard::search("text:", 10).unwrap().len(), 1);
+    assert_eq!(clipboard::search("file:", 10).unwrap().len(), 1);
+    assert_eq!(clipboard::search("img:", 10).unwrap().len(), 0);
+    assert_eq!(clipboard::search("app:explorer", 10).unwrap().len(), 1);
+    assert_eq!(clipboard::search("app:editor body", 10).unwrap().len(), 1);
+    assert_eq!(
+        clipboard::search("unknown:token", 10).unwrap().len(),
+        0,
+        "不认识的前缀当普通文本"
+    );
+}
+
+#[test]
+fn search_can_return_more_than_the_old_popup_cap() {
+    let _lock = paths::test_app_dir_lock();
+    let _dir = setup("clip_search_cap");
+    let t = clipboard::now_ms();
+    for i in 0..120 {
+        clipboard::ingest(&format!("common item {i}"), "", t + i).unwrap();
+    }
+    assert_eq!(clipboard::search("common", 500).unwrap().len(), 120);
+}
+
+#[test]
 fn clear_keeps_pinned_and_delete_is_by_id() {
     let _lock = paths::test_app_dir_lock();
     let _dir = setup("clip_clear");

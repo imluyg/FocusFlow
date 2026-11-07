@@ -88,9 +88,10 @@ pub fn is_paused() -> bool {
 
 /// 复制后是否自动向原窗口粘贴（v2 自动粘贴）。
 ///
-/// 默认关：把键击注入别的程序是用户该显式点头的行为。关着的时候弹窗行为与 v1.2 完全一致。
+/// 默认开：剪贴板弹窗的主路径就是"选中即粘"，还要用户再按一次 Ctrl+V 等于让热键白按。
+/// 关掉的人仍然只复制，弹窗行为与 v1.2 一致。
 pub fn auto_paste_enabled() -> bool {
-    crate::config::instance().get_bool("clipboard", "auto_paste", false)
+    crate::config::instance().get_bool("clipboard", "auto_paste", true)
 }
 
 /// 这个窗口是不是本进程的。自动粘贴先要排掉"粘回自己"（比如从主窗打开弹窗）。
@@ -692,21 +693,123 @@ pub fn list_recent(limit: i64) -> Result<Vec<ClipItem>, String> {
         .map_err(|e| format!("读剪贴板历史失败：{e}"))
 }
 
+/// 搜索框里最多认几个词。再多的词只会把 SQL 拉长，不会让结果更准。
+const MAX_QUERY_TOKENS: usize = 6;
+/// 单个查询词的字符上限：够放一段路径或文件名，又不至于把整段粘贴文本当查询。
+const MAX_QUERY_TOKEN_CHARS: usize = 64;
+
+/// 一个查询词作用在哪些列上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryField {
+    /// 内容 / 来源 / 图片路径 / 文件路径，任一命中即可。
+    Any,
+    /// 只匹配来源应用（`app:` 前缀）。
+    Source,
+    /// 只在某一类型里找（`img:` / `file:` / `text:` 前缀）。
+    Kind(ClipKind),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryToken {
+    field: QueryField,
+    term: String,
+}
+
+/// 把 `img:` / `file:` / `text:` / `app:` 前缀拆出来；不认识的前缀原样当文本。
+fn parse_query_token(raw: &str) -> QueryToken {
+    let lowered = raw.to_ascii_lowercase();
+    for (prefix, kind) in [
+        ("img:", ClipKind::Image),
+        ("file:", ClipKind::File),
+        ("text:", ClipKind::Text),
+    ] {
+        if lowered.starts_with(prefix) {
+            return QueryToken {
+                field: QueryField::Kind(kind),
+                term: raw[prefix.len()..].to_string(),
+            };
+        }
+    }
+    if lowered.starts_with("app:") {
+        return QueryToken {
+            field: QueryField::Source,
+            term: raw["app:".len()..].to_string(),
+        };
+    }
+    QueryToken {
+        field: QueryField::Any,
+        term: raw.to_string(),
+    }
+}
+
+/// `file_paths` 存的是 JSON：路径里的 `\` 与 `"` 各多一层转义。
+fn json_path_term(term: &str) -> String {
+    term.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 pub fn search(query: &str, limit: i64) -> Result<Vec<ClipItem>, String> {
     let q = query.trim();
     if q.is_empty() {
         return list_recent(limit);
     }
+    let mut conds: Vec<String> = Vec::new();
+    let mut args: Vec<rusqlite::types::Value> = Vec::new();
+    for raw in q.split_whitespace().take(MAX_QUERY_TOKENS) {
+        let raw: String = raw.chars().take(MAX_QUERY_TOKEN_CHARS).collect();
+        let token = parse_query_token(&raw);
+        match token.field {
+            QueryField::Kind(kind) => {
+                conds.push("kind = ?".to_string());
+                args.push(rusqlite::types::Value::Text(kind.as_str().to_string()));
+                if !token.term.is_empty() {
+                    conds.push(
+                        "(instr(lower(content), lower(?)) > 0
+                          OR instr(lower(source_app), lower(?)) > 0
+                          OR instr(lower(image_path), lower(?)) > 0
+                          OR instr(lower(file_paths), lower(?)) > 0)"
+                            .to_string(),
+                    );
+                    for _ in 0..3 {
+                        args.push(rusqlite::types::Value::Text(token.term.clone()));
+                    }
+                    args.push(rusqlite::types::Value::Text(json_path_term(&token.term)));
+                }
+            }
+            QueryField::Source => {
+                if !token.term.is_empty() {
+                    conds.push("instr(lower(source_app), lower(?)) > 0".to_string());
+                    args.push(rusqlite::types::Value::Text(token.term));
+                }
+            }
+            QueryField::Any => {
+                conds.push(
+                    "(instr(lower(content), lower(?)) > 0
+                      OR instr(lower(source_app), lower(?)) > 0
+                      OR instr(lower(image_path), lower(?)) > 0
+                      OR instr(lower(file_paths), lower(?)) > 0)"
+                        .to_string(),
+                );
+                for _ in 0..3 {
+                    args.push(rusqlite::types::Value::Text(token.term.clone()));
+                }
+                args.push(rusqlite::types::Value::Text(json_path_term(&token.term)));
+            }
+        }
+    }
+    if conds.is_empty() {
+        return list_recent(limit);
+    }
+    let sql = format!(
+        "SELECT {ITEM_COLS} FROM clipboard_items WHERE {} ORDER BY pinned DESC, copied_at DESC LIMIT ?",
+        conds.join(" AND ")
+    );
     let conn = open().map_err(|e| format!("打开剪贴板库失败：{e}"))?;
     let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {ITEM_COLS} FROM clipboard_items
-             WHERE instr(lower(content), lower(?1)) > 0
-             ORDER BY pinned DESC, copied_at DESC LIMIT ?2"
-        ))
+        .prepare(&sql)
         .map_err(|e| format!("搜索剪贴板失败：{e}"))?;
+    args.push(rusqlite::types::Value::Integer(limit.clamp(1, 500)));
     let rows = stmt
-        .query_map(rusqlite::params![q, limit.clamp(1, 500)], row_to_item)
+        .query_map(rusqlite::params_from_iter(args.iter()), row_to_item)
         .map_err(|e| format!("搜索剪贴板失败：{e}"))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| format!("读剪贴板搜索结果失败：{e}"))

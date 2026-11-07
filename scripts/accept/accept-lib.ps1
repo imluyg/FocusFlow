@@ -39,6 +39,9 @@ public class FF {
   [DllImport("user32.dll")] public static extern uint MapVirtualKeyW(uint code, uint mapType);
   [DllImport("user32.dll")] public static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
 
   public struct RECT { public int Left, Top, Right, Bottom; }
   // Win32 POINT, named so it cannot be confused with the RECT above.
