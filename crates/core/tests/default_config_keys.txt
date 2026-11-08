@@ -23,6 +23,7 @@ floating/enabled
 goal/daily_keys
 gui/active_refresh_interval
 gui/floating_metric
+gui/idle_backoff
 gui/start_to_tray
 gui/theme
 gui/trace_log

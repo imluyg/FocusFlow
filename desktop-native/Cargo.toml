@@ -61,6 +61,10 @@ global-hotkey = "0.8"
 # 只读数据：读库与统计口径全部复用 core，不在原生端另写一份 SQL。
 focusflow-core = { path = "../crates/core" }
 
+# 文件日志：core 的 `logger::init_logging()` 装的是全局 subscriber，这里与它共用同一个
+# `tracing` 版本（工作区那一份），只为一类低频事件打点（快照刷新档位切换）。
+tracing.workspace = true
+
 # 系统窗口材质（Mica）。它收 `raw_window_handle::HasWindowHandle`，
 # 原生窗口只有 HWND，所以下面还要一个 wrapper（见 main.rs 的 HwndWrap）。
 window-vibrancy = "0.6"

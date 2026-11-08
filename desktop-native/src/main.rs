@@ -77,8 +77,8 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
-    TRACKMOUSEEVENT,
+    GetFocus, GetKeyState, GetLastInputInfo, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent,
+    LASTINPUTINFO, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -1310,9 +1310,10 @@ fn sleep_or_poke(ms: u64) -> bool {
 }
 
 /// 短档基准那一拍睡多少**秒**，取 `[gui] active_refresh_interval`（设置页那一行的说法是
-/// "改完立即生效"，所以每一拍重新读一次，不在启动时读死）。倍率见 `snapshot_tick_ms`。
+/// "改完立即生效"，所以每一拍重新读一次，不在启动时读死）。空闲退避见 `idle_tier_secs`，
+/// 长短档倍率见 `snapshot_tick_ms`。
 ///
-/// 笔误不许把界面打死：0、负数、超过 600 秒（有人写 999999）一律退回默认 1 秒。
+/// 笔误不许把界面打死：0、负数、超过 600 秒（有人写 999999）一律退回默认 2 秒。
 /// 放任大数的症状是"数字再也不动"，比按默认值刷新更糟，而且看起来像程序坏了而不是配置坏了。
 fn snapshot_sleep_secs(raw: i64) -> u64 {
     if (1..=600).contains(&raw) {
@@ -1322,7 +1323,39 @@ fn snapshot_sleep_secs(raw: i64) -> u64 {
     }
 }
 
-/// 快照线程这一拍实际睡多少**毫秒**：短档＝基准，长档＝基准 × `LONG_PERIOD_TICKS`。
+/// 空闲阶梯（秒）：键鼠停下来之后，快照间隔按这个顺序逐级放慢。
+///
+/// 每一档要**待满自己的时长**才进下一档：配 2 秒时，空闲 2 秒 → 5 秒档、再 5 秒 → 10 秒档，
+/// 到 30 秒档大约需要 2+5+10+15＝32 秒。配置的最快档会顶掉阶梯里 ≤ 它的那几档
+/// （配 10 ⇒ 10 / 15 / 30）。
+const IDLE_STEPS_SECS: [u64; 5] = [2, 5, 10, 15, 30];
+
+/// 退避出来的节拍最多放到 30 秒（用户写的最快档比 30 秒还慢时按配置走，不拿上限催快）。
+const IDLE_MAX_MS: u64 = 30_000;
+
+/// 距上次键鼠输入 `idle_ms` 毫秒时该用哪一档。
+///
+/// 分档依据是**时间**而不是"这是第几拍"：查询本身有时快有时慢，按拍数升级会漂；
+/// 按时间算是纯函数，边界能单测。输入一来 `idle_ms` 归零，下一拍就回最快档。
+fn idle_tier_secs(active: u64, idle_ms: u64) -> u64 {
+    let active = active.max(1);
+    let mut tier = active;
+    // 当前这一档要待满的累计空闲秒数：到点才进下一档。
+    let mut until = active;
+    for step in IDLE_STEPS_SECS {
+        if step <= tier {
+            continue;
+        }
+        if idle_ms < until.saturating_mul(1000) {
+            break;
+        }
+        tier = step;
+        until = until.saturating_add(step);
+    }
+    tier
+}
+
+/// 快照线程这一拍实际睡多少**毫秒**：空闲档 × 长短档倍率，退避出来的档封顶 30 秒。
 ///
 /// 为什么要分档：一拍 `load()` 的查询面由"选了哪个周期"决定 —— 今日那一档只数今天，
 /// 总计那一档要跨全部年度库。一个数顾不住两头：给总计 1 秒是为一格不会自己变的数常驻
@@ -1337,9 +1370,23 @@ fn snapshot_sleep_secs(raw: i64) -> u64 {
 ///
 /// 周期按 `PERIODS` 的取值口径算（`-1` 今日 / `7` / `15` / `30` / `365` 一年 / `0` 总计），
 /// 不是界面上那六颗胶囊的顺序。
-fn snapshot_tick_ms(raw: i64, period: i64) -> u64 {
+fn snapshot_tick_ms(active_secs: u64, period: i64, idle_ms: u64, backoff: bool) -> u64 {
+    let tier = if backoff {
+        idle_tier_secs(active_secs, idle_ms)
+    } else {
+        active_secs.max(1)
+    };
     let long = period == 0 || period >= 365;
-    snapshot_sleep_secs(raw) * if long { LONG_PERIOD_TICKS } else { 1 } * 1000
+    let mult = if long { LONG_PERIOD_TICKS } else { 1 };
+    let ms = tier.saturating_mul(mult).saturating_mul(1000);
+    // 上限只管"退避出来的档"，而且不许把节拍压到比用户配置的活跃档还快：
+    // 最快档 15 秒 + 总计 ×3 已经是 45 秒，退避到 30 秒档反而会把总计刷新"催快"。
+    let active_ms = active_secs.saturating_mul(mult).saturating_mul(1000);
+    if backoff && tier > active_secs {
+        ms.min(IDLE_MAX_MS.max(active_ms))
+    } else {
+        ms
+    }
 }
 
 /// 长档相对短档的倍率。**这两个数在本仓只写这一处**（`snapshot_tick_ms` 讲为什么分档，
@@ -1351,11 +1398,112 @@ fn snapshot_tick_ms(raw: i64, period: i64) -> u64 {
 /// 条数由挂在 `open_ro` 上的 `connection::stmt_meter` 现量（不是手算）。
 ///
 /// 读数（2026-10-29，本轮四刀之后）：今日 6.5ms／10 条语句，总计 48.8ms／17 条语句。
-/// ⇒ 今日 1 秒基准占 0.65% CPU；总计按 3 秒占 1.6%，而按 1 秒要 4.9%。
+/// ⇒ 今日按 2 秒基准占 0.33% CPU；总计按 6 秒占 0.81%，而按 1 秒要 4.9%。
+/// 空闲退避到 30 秒档之后两者都降到查询本身以下。
 const LONG_PERIOD_TICKS: u64 = 3;
 
 /// 原生端短档基准的兜底值（`[gui] active_refresh_interval` 写错时用这个）。
-const DEFAULT_SNAPSHOT_SECS: u64 = 1;
+const DEFAULT_SNAPSHOT_SECS: u64 = 2;
+
+/// 键鼠空闲钟：`GetLastInputInfo` 只交"最后一次输入的 tick"，这里把它翻成单调时钟上的时刻。
+///
+/// 只比较 tick 变没变（不拿它做减法）⇒ 32 位 tick 约 49.7 天回绕一次，不需要特殊处理。
+/// 键鼠都算：系统级最后一次输入，不区分落在哪个窗口。
+struct InputWatch {
+    tick: u32,
+    at: std::time::Instant,
+}
+
+impl InputWatch {
+    fn new() -> Self {
+        Self {
+            tick: last_input_tick().unwrap_or(0),
+            at: std::time::Instant::now(),
+        }
+    }
+
+    /// 记一次观察：tick 变了 ⇒ 刚刚有键鼠输入，空闲归零。
+    ///
+    /// 时钟由调用方交进来（不在这里读 `Instant::now`）：复位腿能脱离真实输入单测，
+    /// 而"阶梯只会往上爬、永远回不到最快档"正是这一整块最坏的病状。
+    fn observe(&mut self, tick: u32, now: std::time::Instant) -> u64 {
+        if tick != self.tick {
+            self.tick = tick;
+            self.at = now;
+        }
+        now.saturating_duration_since(self.at).as_millis() as u64
+    }
+
+    /// 距最后一次键鼠输入多少毫秒。问不出来按 0 算：多刷新一拍只多花几毫秒，
+    /// 卡在 30 秒档才是用户看得见的"数字不动"。
+    fn idle_ms(&mut self) -> u64 {
+        let Some(tick) = last_input_tick() else {
+            return 0;
+        };
+        self.observe(tick, std::time::Instant::now())
+    }
+}
+
+fn last_input_tick() -> Option<u32> {
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    unsafe { GetLastInputInfo(&mut info) }
+        .as_bool()
+        .then_some(info.dwTime)
+}
+
+/// 等到"这一拍该刷新了"：期间每 `POKE_SLICE_MS` 看一眼键鼠输入与催位。
+///
+/// 返回 `true` = 被催醒（调用方仍按 `POKE_MIN_GAP_MS` 节流）。
+/// 间隔每一片都重算：用户一回来就回最快档，而且"距上次查询已经超过新间隔"时当场拍一次 ——
+/// 回来第一眼必须是新数，不能把旧的长档睡完。
+fn wait_for_refresh(
+    last_query: std::time::Instant,
+    active_secs: u64,
+    period: i64,
+    backoff: bool,
+    input: &mut InputWatch,
+    logged_tier: &mut u64,
+) -> bool {
+    loop {
+        // 退避关着时不问系统（那一格用不上），省掉每 50ms 一次的空调用。
+        let idle_ms = if backoff { input.idle_ms() } else { 0 };
+        let tier = if backoff {
+            idle_tier_secs(active_secs, idle_ms)
+        } else {
+            active_secs
+        };
+        if tier != *logged_tier {
+            // 只在"进最长档 / 从最长档回来"各说一句：中间档每跨一次都写，墙上就会是
+            // "2→5→2→5"这种来回刷屏（人偶尔动一下鼠标就能一天几千行）。中间档的行为
+            // 由 `the_idle_ladder_walks_up_to_thirty_seconds` 钉着，不靠这行日志。
+            // 后半截是给夹具看的 ASCII 标签：中文在 BOM-less 的 .ps1 里会被按 ANSI 读花。
+            let top = *IDLE_STEPS_SECS.last().unwrap_or(&tier);
+            if tier > *logged_tier && tier > active_secs && tier == top {
+                tracing::info!(
+                    "快照刷新空闲退避到 {tier} 秒 snapshot_tier tier={tier}s idle_ms={idle_ms} backoff={}",
+                    if backoff { "on" } else { "off" }
+                );
+            } else if *logged_tier == top && tier == active_secs {
+                tracing::info!(
+                    "快照刷新恢复到最快档 {tier} 秒 snapshot_tier tier={tier}s idle_ms={idle_ms} backoff={}",
+                    if backoff { "on" } else { "off" }
+                );
+            }
+            *logged_tier = tier;
+        }
+        let want = snapshot_tick_ms(active_secs, period, idle_ms, backoff);
+        if last_query.elapsed().as_millis() as u64 >= want {
+            return false;
+        }
+        if SNAP_POKE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(POKE_SLICE_MS));
+    }
+}
 
 impl App {
     fn new(hwnd: HWND, mica: bool) -> windows::core::Result<Self> {
@@ -1509,21 +1657,25 @@ impl App {
                     let mut idle = false;
                     // 上一次真拍是什么时候：被催醒的那一拍按 `POKE_MIN_GAP_MS` 节流就靠它。
                     let mut last_query = std::time::Instant::now();
+                    // 键鼠空闲钟：阶梯放慢与"回来当场拍"都读它。
+                    let mut input = InputWatch::new();
+                    let mut logged_tier = 0u64;
                     loop {
                         // `HWND` 不是 `Send`（里面是裸指针），所以线程只带 `hwnd_val`，
                         // 每一拍就地包一个句柄出来问可见性。
                         let hwnd = HWND(hwnd_val as *mut core::ffi::c_void);
-                        // 一拍睡多久，每一拍重新问一次配置（`[gui] active_refresh_interval`）：
-                        // 设置页那一行写着"改完立即生效"，读死在启动时就成了一句许愿。
-                        // 基准之上再按周期分档 —— 选了"总计"那一格，就不该和"今日"一样勤。
-                        let tick_ms = snapshot_tick_ms(
+                        // 最快档与退避开关每一拍重新问一次配置（设置页那一行写着"改完立即生效"，
+                        // 读死在启动时就成了一句许愿）；周期分档见 `snapshot_tick_ms`。
+                        let active_secs = snapshot_sleep_secs(
                             focusflow_core::config::instance().get_int(
                                 "gui",
                                 "active_refresh_interval",
                                 DEFAULT_SNAPSHOT_SECS as i64,
                             ),
-                            p.load(std::sync::atomic::Ordering::Relaxed),
                         );
+                        let backoff = focusflow_core::config::instance()
+                            .get_bool("gui", "idle_backoff", true);
+                        let period_now = p.load(std::sync::atomic::Ordering::Relaxed);
                         let mut r = watching_now(hwnd);
                         if r == Readers::None {
                             // 没人看 ⇒ 整批聚合查询一拍都不跑，只按小片睡等有人回来。
@@ -1546,10 +1698,19 @@ impl App {
                             tracing_note("快照线程 idle=off：有读者了，当场查一次并恢复按拍刷新");
                             idle = false;
                         } else {
-                            // 睡满这一拍；期间有人按键或唤窗就提前醒。被催醒**不等于**立刻再拍：
-                            // 离上一次真拍不足 `POKE_MIN_GAP_MS` 就只补睡剩下的那一段，
-                            // 于是打字高峰合成 4 拍/秒，而不是每键 10 条语句。
-                            if sleep_or_poke(tick_ms) {
+                            // 等到这一拍该刷新：期间按键鼠空闲档重算间隔；有人按键/唤窗就提前醒。
+                            // 被催醒**不等于**立刻再拍：离上一次真拍不足 `POKE_MIN_GAP_MS`
+                            // 就只补睡剩下的那一段，于是打字高峰合成 4 拍/秒，而不是每键
+                            // 10 条语句。用户从 30 秒档回来时，`wait_for_refresh` 会因为
+                            // "距上次查询已经超过最快档"当场放行，不会把旧的长档睡完。
+                            if wait_for_refresh(
+                                last_query,
+                                active_secs,
+                                period_now,
+                                backoff,
+                                &mut input,
+                                &mut logged_tier,
+                            ) {
                                 let left = poke_backlog_ms(
                                     last_query.elapsed().as_millis() as u64,
                                     POKE_MIN_GAP_MS,
@@ -1580,6 +1741,9 @@ impl App {
                             }
                             continue;
                         }
+                        // 周期要**在这一刻**重读：`set_period` 会在 UI 线程上 `refresh_now()`
+                        // 先把新周期的数据画出来，而这一拍如果还用等待前抓到的旧周期，
+                        // 查询完就会把旧周期的快照盖回面板。`period_now` 只用于选等待间隔。
                         let next = data::load(p.load(std::sync::atomic::Ordering::Relaxed));
                         last_query = std::time::Instant::now();
                         // 悬浮窗读的是这几格，先推过去再让主界面拿新快照。
@@ -17689,26 +17853,122 @@ mod snapshot_rate_tests {
             let long = *period == 0 || *period >= 365;
             let want = if long { 3_000 } else { 1_000 };
             assert_eq!(
-                snapshot_tick_ms(1, *period),
+                snapshot_tick_ms(1, *period, 0, false),
                 want,
                 "「{label}」这一档（period={period}）的节拍归错了"
             );
         }
         // 基准仍然是用户写的那一行，倍率是乘在它上面而不是把它吃掉
-        assert_eq!(snapshot_tick_ms(2, -1), 2_000);
-        assert_eq!(snapshot_tick_ms(2, 0), 6_000);
+        assert_eq!(snapshot_tick_ms(2, -1, 0, false), 2_000);
+        assert_eq!(snapshot_tick_ms(2, 0, 0, false), 6_000);
         // 笔误那一支：基准退回默认，倍率照乘（"写错一个数"不该变成"再也不刷新"）
         assert_eq!(
-            snapshot_tick_ms(0, 0),
+            snapshot_tick_ms(snapshot_sleep_secs(0), 0, 0, false),
             DEFAULT_SNAPSHOT_SECS * LONG_PERIOD_TICKS * 1000,
             "写 0 是笔误，退回默认基准再按长档乘"
         );
-        assert_eq!(snapshot_tick_ms(-3, -1), DEFAULT_SNAPSHOT_SECS * 1000);
+        assert_eq!(
+            snapshot_tick_ms(snapshot_sleep_secs(-3), -1, 0, false),
+            DEFAULT_SNAPSHOT_SECS * 1000
+        );
     }
 
-    /// 接线腿：那一拍真的睡在**分档之后**的毫秒上。钉的是调用形态而不是函数名 ——
-    /// 只数 `snapshot_sleep_secs(` 出现几次的话，"函数写了、循环仍旧按老的秒数睡"这种
-    /// 接法照样能蒙过去。
+    /// 空闲阶梯：2 → 5 → 10 → 15 → 30，每档要待满自己的时长；到 30 就不再涨。
+    ///
+    /// 边界直接钉成毫秒（2/7/17/32 秒）：改阶梯或者把"待满"改成"按拍数"都要回来看这一条。
+    #[test]
+    fn the_idle_ladder_walks_up_to_thirty_seconds() {
+        let at = |ms| idle_tier_secs(2, ms);
+        assert_eq!(at(0), 2);
+        assert_eq!(
+            at(1_999),
+            2,
+            "还没待满第一档就升级 = 阶梯被拍快照的耗时带漂"
+        );
+        assert_eq!(at(2_000), 5);
+        assert_eq!(at(6_999), 5);
+        assert_eq!(at(7_000), 10);
+        assert_eq!(at(16_999), 10);
+        assert_eq!(at(17_000), 15);
+        assert_eq!(at(31_999), 15);
+        assert_eq!(at(32_000), 30);
+        assert_eq!(at(10 * 60_000), 30, "30 秒是上限，不再往上翻");
+        // 配置比阶梯还慢时按配置走；阶梯里 ≤ 最快档的几档被顶掉
+        assert_eq!(idle_tier_secs(10, 0), 10);
+        assert_eq!(idle_tier_secs(10, 10_000), 15);
+        assert_eq!(idle_tier_secs(10, 25_000), 30);
+        assert_eq!(idle_tier_secs(60, 3_600_000), 60);
+        assert_eq!(
+            idle_tier_secs(1, 1_000),
+            2,
+            "最快档 1 秒时 2 秒那一档接在后面"
+        );
+    }
+
+    /// 退避之后的节拍：长档倍率照乘，但**退避出来的档**封顶 30 秒；关掉退避与旧行为一致。
+    #[test]
+    fn the_backoff_tick_is_capped_and_can_be_switched_off() {
+        // 今日档：2 / 5 / 10 / 15 / 30
+        assert_eq!(snapshot_tick_ms(2, -1, 0, true), 2_000);
+        assert_eq!(snapshot_tick_ms(2, -1, 2_000, true), 5_000);
+        assert_eq!(snapshot_tick_ms(2, -1, 7_000, true), 10_000);
+        assert_eq!(snapshot_tick_ms(2, -1, 17_000, true), 15_000);
+        assert_eq!(snapshot_tick_ms(2, -1, 32_000, true), 30_000);
+        // 总计档 ×3 之后再封顶 30 秒
+        assert_eq!(snapshot_tick_ms(2, 0, 0, true), 6_000);
+        assert_eq!(snapshot_tick_ms(2, 0, 2_000, true), 15_000);
+        assert_eq!(snapshot_tick_ms(2, 0, 7_000, true), 30_000);
+        assert_eq!(
+            snapshot_tick_ms(2, 0, 17_000, true),
+            30_000,
+            "退避出来的档不许超过 30 秒"
+        );
+        // 关掉退避：一直按最快档（旧行为），上限也不压它
+        assert_eq!(snapshot_tick_ms(2, -1, 3_600_000, false), 2_000);
+        assert_eq!(snapshot_tick_ms(2, 0, 3_600_000, false), 6_000);
+        assert_eq!(snapshot_tick_ms(15, 0, 3_600_000, false), 45_000);
+        // 上限不许把比 30 秒还慢的活跃档"催快"：15 秒最快档 + 总计 ×3 = 45 秒，
+        // 退避到 30 秒档时仍应保持 45 秒，而不是反着降成 30 秒。
+        assert_eq!(
+            snapshot_tick_ms(15, 0, 3_600_000, true),
+            45_000,
+            "退避不许把用户配置的慢档反着催快"
+        );
+    }
+
+    /// 空闲钟：tick 一变就是有新输入（空闲归零）；32 位回绕只当"不等"，不需要做减法。
+    ///
+    /// 这条守着整个退避的复位腿：少了它，阶梯只会往上爬、永远回不到最快档，
+    /// 而症状是"用户回来了数字还是每分钟才动一次"。
+    #[test]
+    fn an_input_resets_the_idle_clock_and_wrap_is_just_an_inequality() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut w = InputWatch {
+            tick: u32::MAX - 1,
+            at: t0,
+        };
+        assert_eq!(
+            w.observe(u32::MAX - 1, t0 + Duration::from_secs(5)),
+            5_000,
+            "同一个 tick 期间，空闲时间应当持续累加"
+        );
+        assert_eq!(
+            w.observe(u32::MAX, t0 + Duration::from_secs(6)),
+            0,
+            "换了一个 tick 就是刚刚有输入，空闲必须归零"
+        );
+        assert_eq!(w.observe(u32::MAX, t0 + Duration::from_secs(12)), 6_000);
+        assert_eq!(
+            w.observe(0, t0 + Duration::from_secs(13)),
+            0,
+            "32 位 tick 回绕：只比较不等，不做减法"
+        );
+    }
+
+    /// 接线腿：那一拍真的睡在**分档之后**的毫秒上，而且每一片都读键鼠空闲钟。
+    /// 钉的是调用形态而不是函数名 —— 只数 `snapshot_sleep_secs(` 出现几次的话，
+    /// "函数写了、循环仍旧按老的秒数睡"这种接法照样能蒙过去。
     #[test]
     fn the_snapshot_loop_sleeps_on_the_tiered_tick() {
         let src = include_str!("main.rs");
@@ -17724,20 +17984,25 @@ mod snapshot_rate_tests {
         assert_eq!(
             prod.matches(tick.as_str()).count(),
             2,
-            "一处定义 + 循环里一处调用，数量变了说明接线动过"
+            "一处定义 + 等待函数里一处调用，数量变了说明接线动过"
         );
-        // 2026-10-30 起那一拍睡的是"可被催醒的小片"，所以针脚换成催醒包装那一句：
-        // 要钉的还是"分档出来的毫秒真的交给了睡眠"，换形状不等于换判据。
-        let sleeps_on = ["sleep_or_poke(", "tick_ms", ")"].concat();
+        // 2026-11-09 起那一拍睡的是"按空闲档重算的小片"：分档出来的毫秒交给
+        // `wait_for_refresh`，由它每片看一眼空闲钟与催位。换形状不等于换判据。
+        let waits = ["wait_for_refresh", "("].concat();
         assert_eq!(
-            prod.matches(sleeps_on.as_str()).count(),
-            1,
-            "那一拍必须睡在分档出来的毫秒上（由 sleep_or_poke 代睡，见 POKE_SLICE_MS）"
+            prod.matches(waits.as_str()).count(),
+            2,
+            "一处定义 + 循环里一处调用，数量变了说明阶梯没接上"
         );
-        let slice_sleep = ["Duration::from_millis(", "slice", ")"].concat();
+        assert_eq!(
+            prod.matches("idle_ms()").count(),
+            1,
+            "等待循环里没有读键鼠空闲钟：阶梯会永远停在第一档"
+        );
+        let slice_sleep = ["Duration::from_millis(", "POKE_SLICE_MS", ")"].concat();
         assert!(
             prod.contains(slice_sleep.as_str()),
-            "催醒包装里没有真的睡那一片：tick_ms 交进去也没人等"
+            "等待循环里没有真的睡那一片：催位与空闲钟都没人等"
         );
         let stale = ["Duration::from_secs(", "secs", ")"].concat();
         assert!(
@@ -17748,7 +18013,7 @@ mod snapshot_rate_tests {
         assert_eq!(
             prod.matches(base.as_str()).count(),
             2,
-            "一处定义 + 分档函数里一处调用（循环不再直接用它）"
+            "一处定义 + 循环里一处调用（等待函数收到的是夹过的秒数）"
         );
     }
 
@@ -17806,7 +18071,9 @@ mod snapshot_rate_tests {
             "卡片单独在看时那一拍不再走薄臂了（`Readers::Card` 分支或那一问不见了）"
         );
         let card_at = flat.find("ifr==Readers::Card{").expect("Card 那一支不见了");
-        let branch = &flat[card_at..card_at + 900.min(flat.len() - card_at)];
+        // 按**字符**截窗口，不按字节：源码里全是中文，写死 `card_at + 900` 会落在
+        // 某个汉字的中间字节上，切片直接 panic（改一行中文注释就能触发）。
+        let branch: String = flat[card_at..].chars().take(900).collect();
         assert!(
             branch.contains("continue;"),
             "Card 那一支没有当场收尾：整批查询还是会跟着跑"
@@ -22371,9 +22638,19 @@ mod snapshot_poke_tests {
             flat.contains("sleep_or_poke(IDLE_WAKE_MS)"),
             "空转那一段还在整片睡：唤窗催不动它"
         );
+        // 2026-11-09 起按拍那一段换成 `wait_for_refresh`：它每一片都查催位，
+        // 判据从"睡在哪个函数里"换成"按拍的等待循环真的 swap 催位、且没有整片睡"。
+        let wait_at = flat
+            .find("fnwait_for_refresh(")
+            .expect("按拍等待函数不见了");
+        let waits = &flat[wait_at..];
         assert!(
-            flat.contains("sleep_or_poke(tick_ms)"),
-            "按拍那一段还在整片睡：按键催不动它"
+            waits.contains("SNAP_POKE.swap(false,std::sync::atomic::Ordering::Relaxed)"),
+            "按拍那一段不再查催位：按键催不动它"
+        );
+        assert!(
+            waits.contains("Duration::from_millis(POKE_SLICE_MS)"),
+            "按拍那一段整片睡：催位要等睡完才看得见"
         );
         assert!(
             flat.contains("poke_backlog_ms(last_query.elapsed().as_millis()asu64,POKE_MIN_GAP_MS"),

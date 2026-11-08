@@ -762,6 +762,7 @@ dependencies = [
  "raw-window-handle",
  "rfd",
  "serde_json",
+ "tracing",
  "tray-icon",
  "window-vibrancy",
  "windows",

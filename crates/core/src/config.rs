@@ -103,14 +103,19 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     s(
         "gui",
         &[
-            // 主界面快照的**短档**基准（秒）。读点在 `desktop-native/src/main.rs` 的 snapshot
+            // 主界面快照的**最快档**基准（秒）。读点在 `desktop-native/src/main.rs` 的 snapshot
             // 线程：每一拍重新读一次 ⇒ 设置页那句"改完立即生效"这次是真的。跨一整年及以上
             // 的两档（"1 年"与"总计"）在它上乘 3 —— 为什么是 3、一拍量出多少，只写在
             // `desktop-native/src/main.rs` 的 `LONG_PERIOD_TICKS` 那一段一处（数出自
             // `crates/core/tests/perf_probe.rs`）；这里不再抄一份，抄一次就多一处会漂。
+            // 键鼠停下来之后按 `IDLE_STEPS_SECS` 逐级放慢（2/5/10/15/30 秒，上限 30 秒），
+            // 见 `desktop-native/src/main.rs` 的 `idle_tier_secs`。
             // 这一节里以前挂着四行都写同一句话而原生端一个都不读，那几行已按现量收掉
             // （见 DEPRECATED_CONFIG）。
-            ("active_refresh_interval", "1"),
+            ("active_refresh_interval", "2"),
+            // 空闲退避总闸：false = 一直按最快档刷新（旧行为）。留着它是因为退避依赖
+            // 系统级"最后一次键鼠输入"，真遇到误判要能一键退回，而不用重新编译。
+            ("idle_backoff", "true"),
             ("theme", "light"),
             // 启动即进托盘：原生端有读点（`desktop-native/src/main.rs` 的 `start_to_tray_cfg`）。
             // 它和开机自启那条快捷方式带的 `--hidden` 是同一个意图的两条入口 —— 改之前两条
@@ -1870,7 +1875,7 @@ renderer = webview
         // 同前缀的活键不能被顺手带走：active_refresh_interval 是快照线程真的在读的那一行（设置页
         // 明面上也有它），work_minutes 是番茄钟真正生效的时长
         assert_eq!(cfg.get_int("pomodoro", "work_minutes", 0), 45);
-        assert_eq!(cfg.get_int("gui", "active_refresh_interval", 0), 1);
+        assert_eq!(cfg.get_int("gui", "active_refresh_interval", 0), 2);
 
         // 而且不能只清内存：load() 结尾无条件 save()，文件里也不该再留着它们
         let on_disk = std::fs::read_to_string(&path).unwrap();
