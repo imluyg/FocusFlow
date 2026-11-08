@@ -12,8 +12,8 @@ use focusflow_core::clipboard::{self, ClipItem, ClipKind, ClipStats, Snippet};
 
 use crate::clip_list::{self, ReloadIntent, Viewport};
 
-/// 列表一次最多取多少条。弹窗是 100；管理页给到 500，够翻旧记录，也不至于把
-/// 一次切页变成整库扫描。
+/// 列表一次最多取多少条。弹窗与管理页都是 500，够翻旧记录，也不至于把一次
+/// 切页变成整库扫描。
 pub const LIST_LIMIT: i64 = 500;
 
 const PAD: f32 = 16.0;

@@ -118,6 +118,39 @@ fn clear_watcher_fault() {
     }
 }
 
+/// "这一笔没收进来"的原因只留 60 秒：它不是监听故障，用户下一次成功复制就该盖掉它，
+/// 也不该永久顶掉页脚的提示。
+const CAPTURE_NOTICE_TTL_MS: i64 = 60_000;
+static CAPTURE_NOTICE: std::sync::Mutex<Option<(i64, String)>> = std::sync::Mutex::new(None);
+
+/// 记一条"这次复制没收录"的原因（文本超限、图片超限、剪贴板被占用……）。
+pub fn note_capture_issue(msg: impl Into<String>) {
+    if let Ok(mut slot) = CAPTURE_NOTICE.lock() {
+        *slot = Some((now_ms(), msg.into()));
+    }
+}
+
+/// 成功收录一次就清：上一笔的原因不该继续留在页脚上。
+pub fn note_capture_ok() {
+    if let Ok(mut slot) = CAPTURE_NOTICE.lock() {
+        *slot = None;
+    }
+}
+
+/// 最近一条未收录原因（只在 60 秒内返回）。`now_ms` 由调用方给，新鲜度能脱离时钟单测。
+pub fn capture_notice(now_ms: i64) -> Option<String> {
+    let slot = CAPTURE_NOTICE.lock().ok()?;
+    slot.as_ref().and_then(|(at, msg)| {
+        (now_ms.saturating_sub(*at) < CAPTURE_NOTICE_TTL_MS).then(|| msg.clone())
+    })
+}
+
+/// 同一类噪声日志要不要记：距上次已经超过 `window_ms`（或从没记过）。剪贴板被占用
+/// 可能一秒发生好几次，逐条写会把日志刷满。
+pub fn should_log(prev_ms: Option<i64>, now_ms: i64, window_ms: i64) -> bool {
+    prev_ms.is_none_or(|prev| now_ms.saturating_sub(prev) >= window_ms)
+}
+
 /// 复制后是否自动向原窗口粘贴（v2 自动粘贴）。
 ///
 /// 默认开：剪贴板弹窗的主路径就是"选中即粘"，还要用户再按一次 Ctrl+V 等于让热键白按。
@@ -371,6 +404,34 @@ pub fn text_verdict(text: &str, max_bytes: usize) -> TextVerdict {
         return TextVerdict::TooLarge;
     }
     TextVerdict::Ok
+}
+
+/// `CF_UNICODETEXT` 的单位（UTF-16 单元）预检上限。字节上限换算成单元再多给两个：
+/// 结尾 NUL 占一个，另一个留给"字节刚好在限内、单元数对不齐"的边角。
+pub fn text_precheck_units(max_bytes: usize) -> usize {
+    max_bytes.saturating_add(2)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextReadVerdict {
+    /// 尺寸在可读范围：照常拷出来，再按字节判一次。
+    Ok,
+    /// 超过预检上限：别拷，也别落到图片/文件那几路。
+    TooLarge,
+    /// 连一个字符都没有。
+    Empty,
+}
+
+/// 只凭剪贴板报出来的单元数就判这一条文本能不能读。字节判据要拿到内容才算得出来，
+/// 而这一步的目的就是"别把一段超过上限的文本先整个搬进内存"。
+pub fn text_read_verdict(units: usize, max_bytes: usize) -> TextReadVerdict {
+    if units == 0 {
+        TextReadVerdict::Empty
+    } else if units > text_precheck_units(max_bytes) {
+        TextReadVerdict::TooLarge
+    } else {
+        TextReadVerdict::Ok
+    }
 }
 
 /// 来源应用是否不在排除清单里（大小写不敏感）。
@@ -2011,6 +2072,11 @@ mod win {
     /// 只能在锁内 `GetDIBits` 出来，所以它交来的已经是 RGBA。
     enum RawClip {
         Text(String),
+        /// 单位预检就超限。**必须**当场了结：Excel 这类复制同时带文本与 DIB，
+        /// 落回图片那一路会把一段 "复制不进来" 的文本记成一张图。
+        TextTooLarge {
+            units: usize,
+        },
         Image(RawImage),
         Files(Vec<String>),
     }
@@ -2022,12 +2088,44 @@ mod win {
         Bitmap(Vec<u8>, u32, u32),
     }
 
+    /// `CF_UNICODETEXT` 这一路的三种结局。
+    enum TextRead {
+        Text(String),
+        TooLarge {
+            units: usize,
+        },
+        /// 格式在、内容读不出来（GlobalLock 失败等）：可以退回去试图片/文件。
+        Unreadable,
+    }
+
+    /// 剪贴板被占用时的日志节流点（Unix ms）。0 = 从没记过。
+    static LAST_BUSY_LOG_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    /// 监听线程的句柄。
+    ///
+    /// 不做 `catch_unwind`：release 构建是 `panic = "abort"`，线程里 panic 会直接结束
+    /// 进程，包一层捕不到。线程"还在不在"只能靠探活（`is_running`）与它退出前写的
+    /// 故障原因；屏上宁可说"监听未运行"，也不假装修复。
     pub struct Watcher {
         hwnd: isize,
         join: Option<std::thread::JoinHandle<()>>,
     }
 
     impl Watcher {
+        /// 监听线程还活着没有。线程正常结束会先让收件口断开；这一条是兜底：
+        /// 没有它，线程以别的方式结束时屏上的"仍在记录"就没人纠正。
+        pub fn is_running(&self) -> bool {
+            self.join.as_ref().is_some_and(|j| !j.is_finished())
+        }
+
+        #[cfg(test)]
+        pub fn from_join_for_test(join: std::thread::JoinHandle<()>) -> Self {
+            Self {
+                hwnd: 0,
+                join: Some(join),
+            }
+        }
+
         pub fn shutdown(&mut self) {
             if self.hwnd != 0 {
                 let hwnd = HWND(self.hwnd as *mut core::ffi::c_void);
@@ -2200,16 +2298,25 @@ mod win {
         }
         let owner = super::super::capture::win::clip_owner_hwnd().ok();
         let mut opened = false;
-        for attempt in 0..5u32 {
+        for attempt in 0..6u32 {
             if unsafe { OpenClipboard(owner) }.is_ok() {
                 opened = true;
                 break;
             }
-            if attempt < 4 {
-                std::thread::sleep(Duration::from_millis(30));
+            if attempt < 5 {
+                std::thread::sleep(Duration::from_millis(40));
             }
         }
         if !opened {
+            // 这一笔真的丢了，要说出来；日志按 30 秒节流，别让占用它的程序刷满文件。
+            super::note_capture_issue("剪贴板被别的程序占用，这一笔没收录");
+            let now = now_ms();
+            let prev = LAST_BUSY_LOG_MS.load(std::sync::atomic::Ordering::Acquire);
+            let prev = (prev > 0).then_some(prev);
+            if super::should_log(prev, now, 30_000) {
+                LAST_BUSY_LOG_MS.store(now, std::sync::atomic::Ordering::Release);
+                tracing::info!("剪贴板被别的程序占用（OpenClipboard 重试 6 次都失败），这一笔跳过");
+            }
             return;
         }
 
@@ -2244,14 +2351,27 @@ mod win {
                             text.len(),
                             cfg.max_text_bytes
                         );
+                        super::note_capture_issue(format!(
+                            "复制的内容太长（{} 字节，上限 {} 字节），整条跳过",
+                            text.len(),
+                            cfg.max_text_bytes
+                        ));
                         return;
                     }
                 }
+                super::note_capture_ok();
                 let _ = tx.send(Captured::Text {
                     text,
                     source_app,
                     copied_at_ms: now_ms(),
                 });
+            }
+            RawClip::TextTooLarge { units } => {
+                tracing::info!(
+                    "剪贴板有一条 {units} 个 UTF-16 单元的文本，超过上限 {} 字节，整条跳过（不再按图片重试）",
+                    cfg.max_text_bytes
+                );
+                super::note_capture_issue(format!("复制的内容太长（{units} 个字符），整条跳过"));
             }
             RawClip::Image(image) => {
                 // 锁已经放开：解码与落盘都在这一步做，慢也不挡别的程序读剪贴板。
@@ -2264,6 +2384,7 @@ mod win {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::info!("剪贴板里有一张图片读不出来，跳过：{e}");
+                        super::note_capture_issue("剪贴板里的图片读不出来，这一张没收录");
                         return;
                     }
                 };
@@ -2271,9 +2392,11 @@ mod win {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::info!("剪贴板图片没有入库：{e}");
+                        super::note_capture_issue(format!("剪贴板图片没有收录：{e}"));
                         return;
                     }
                 };
+                super::note_capture_ok();
                 let _ = tx.send(Captured::Image {
                     stored,
                     source_app,
@@ -2289,9 +2412,14 @@ mod win {
                             "剪贴板里有超过 {} 个文件，整条跳过",
                             super::MAX_FILES_PER_ITEM
                         );
+                        super::note_capture_issue(format!(
+                            "复制了超过 {} 个文件，整条跳过",
+                            super::MAX_FILES_PER_ITEM
+                        ));
                         return;
                     }
                 };
+                super::note_capture_ok();
                 let _ = tx.send(Captured::Files {
                     paths,
                     source_app,
@@ -2326,10 +2454,16 @@ mod win {
             return None;
         }
         if IsClipboardFormatAvailable(CF_UNICODETEXT).is_ok() {
-            if let Some(text) = read_unicode_text() {
-                return Some((RawClip::Text(text), owner));
+            match read_unicode_text() {
+                TextRead::Text(text) => return Some((RawClip::Text(text), owner)),
+                // 超限是"这一条文本"的结论，不是"读不出来"：立刻了结，别再落到
+                // 图片/文件那几路（Excel 一类复制同时带文本与 DIB，会把文字记成图）。
+                TextRead::TooLarge { units } => {
+                    return Some((RawClip::TextTooLarge { units }, owner));
+                }
+                // 文本格式在、内容却读不出来：继续按图片/文件试，不因一次坏文本丢掉这次更新。
+                TextRead::Unreadable => {}
             }
-            // 文本格式在、内容却读不出来：继续按图片/文件试，不因一次坏文本丢掉这次更新。
         }
         let png_fmt = unsafe { RegisterClipboardFormatW(w!("PNG")) };
         if png_fmt != 0 && IsClipboardFormatAvailable(png_fmt).is_ok() {
@@ -2459,27 +2593,28 @@ mod win {
         Some(v)
     }
 
-    unsafe fn read_unicode_text() -> Option<String> {
-        let h = GetClipboardData(CF_UNICODETEXT).ok()?;
+    unsafe fn read_unicode_text() -> TextRead {
+        let Ok(h) = GetClipboardData(CF_UNICODETEXT) else {
+            return TextRead::Unreadable;
+        };
         let hg = HGLOBAL(h.0);
         let bytes = GlobalSize(hg);
-        if bytes < 2 {
-            return None;
-        }
-        // 上限在拷贝之前就挡掉：先读进内存再判超限会让一条 1 MB 的复制多一次全量分配。
-        let max_units = (super::capture_config().max_text_bytes).saturating_add(2);
-        if bytes / 2 > max_units {
-            return None;
+        let units = bytes / 2;
+        // 上限在拷贝之前就挡掉：先读进内存再判超限会让一条几 MB 的复制多一次全量分配。
+        match super::text_read_verdict(units, super::capture_config().max_text_bytes) {
+            super::TextReadVerdict::Empty => return TextRead::Unreadable,
+            super::TextReadVerdict::TooLarge => return TextRead::TooLarge { units },
+            super::TextReadVerdict::Ok => {}
         }
         let p = GlobalLock(hg);
         if p.is_null() {
-            return None;
+            return TextRead::Unreadable;
         }
-        let units = std::slice::from_raw_parts(p as *const u16, bytes / 2);
+        let units = std::slice::from_raw_parts(p as *const u16, units);
         let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
         let text = String::from_utf16_lossy(&units[..end]);
         let _ = GlobalUnlock(hg);
-        Some(text)
+        TextRead::Text(text)
     }
 
     /// 把文本写进剪贴板。返回后调用方可以关窗/还焦点，粘贴由用户自己按 Ctrl+V。
@@ -2494,7 +2629,10 @@ mod win {
         if unsafe { OpenClipboard(owner) }.is_err() {
             return None;
         }
-        let text = unsafe { read_unicode_text() };
+        let text = match unsafe { read_unicode_text() } {
+            TextRead::Text(t) => Some(t),
+            _ => None,
+        };
         let _ = unsafe { CloseClipboard() };
         text
     }
@@ -2667,6 +2805,38 @@ mod tests {
     }
 
     #[test]
+    fn the_unicode_precheck_works_in_units() {
+        // 字节上限 6 ⇒ 单元预检上限 8（结尾 NUL 两个余量）。
+        assert_eq!(text_precheck_units(6), 8);
+        assert_eq!(text_precheck_units(usize::MAX), usize::MAX, "加法要饱和");
+        assert_eq!(
+            text_read_verdict(0, 6),
+            TextReadVerdict::Empty,
+            "空全局内存（连 NUL 都没有）"
+        );
+        assert_eq!(
+            text_read_verdict(1, 6),
+            TextReadVerdict::Ok,
+            "只有一个 NUL 的空串：读出来之后按空串跳过"
+        );
+        assert_eq!(
+            text_read_verdict(3, 6),
+            TextReadVerdict::Ok,
+            "CJK「中文」= 2 个单元 + NUL"
+        );
+        assert_eq!(
+            text_read_verdict(8, 6),
+            TextReadVerdict::Ok,
+            "恰好等于预检上限"
+        );
+        assert_eq!(
+            text_read_verdict(9, 6),
+            TextReadVerdict::TooLarge,
+            "多一个单元就整条跳过"
+        );
+    }
+
+    #[test]
     fn trim_keeps_pinned_and_applies_three_budgets() {
         let now = 1_000_000_000_000i64;
         let day = 86_400_000i64;
@@ -2796,12 +2966,77 @@ mod tests {
 
     #[test]
     fn watcher_fault_is_reported_and_cleared() {
+        // 全局 watching 状态：与其它碰它的用例串行，否则并发跑会互相清掉。
+        let _lock = crate::paths::test_app_dir_lock();
         clear_watcher_fault();
         assert_eq!(watcher_fault(), None);
         report_watcher_fault("剪贴板监听线程 5 秒内没有报到");
         assert!(watcher_fault().is_some_and(|s| s.contains("5 秒内没有报到")));
         clear_watcher_fault();
         assert_eq!(watcher_fault(), None, "监听正常之后故障要说没就没");
+    }
+
+    #[test]
+    fn capture_notice_lives_for_sixty_seconds_and_success_clears_it() {
+        let _lock = crate::paths::test_app_dir_lock();
+        note_capture_ok();
+        assert_eq!(capture_notice(now_ms()), None, "没出过问题就没有提示");
+
+        note_capture_issue("剪贴板被别的程序占用");
+        assert_eq!(
+            capture_notice(now_ms()).as_deref(),
+            Some("剪贴板被别的程序占用")
+        );
+        assert_eq!(
+            capture_notice(now_ms() + 59_000).as_deref(),
+            Some("剪贴板被别的程序占用"),
+            "60 秒内还看得见"
+        );
+        assert_eq!(
+            capture_notice(now_ms() + 120_000),
+            None,
+            "过了 60 秒不再顶页脚"
+        );
+
+        note_capture_issue("复制的内容太长");
+        note_capture_ok();
+        assert_eq!(capture_notice(now_ms()), None, "成功收录一次就清掉上一条");
+    }
+
+    #[test]
+    fn repeated_busy_errors_do_not_flood_the_log() {
+        assert!(should_log(None, 1_000, 30_000), "第一次要记");
+        assert!(!should_log(Some(1_000), 30_999, 30_000));
+        assert!(should_log(Some(1_000), 31_000, 30_000));
+        assert!(should_log(Some(1_000), 1_000, 0), "窗口取 0 时永远记");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn watcher_is_running_tracks_the_thread() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let join = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let mut watcher = super::win::Watcher::from_join_for_test(join);
+        assert!(watcher.is_running(), "线程还在等消息");
+        let _ = tx.send(());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!watcher.is_running(), "线程结束之后要说没在跑");
+        watcher.shutdown();
+    }
+
+    #[test]
+    fn ingest_refuses_an_oversize_text_without_truncating() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("clip_ingest_oversize");
+        init_db().unwrap();
+        let text = "x".repeat(DEFAULT_MAX_TEXT_BYTES + 1);
+        assert_eq!(
+            ingest(&text, "", now_ms()).unwrap(),
+            IngestOutcome::Skipped(SkipReason::TooLarge),
+            "超上限整条跳过，不截断保存"
+        );
     }
 
     // ---- v1.2：图片 / 文件 ----

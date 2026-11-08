@@ -1,4 +1,4 @@
-//! 剪贴板历史弹窗（v1：纯文本）。
+//! 剪贴板历史弹窗（历史 / 片段 / 统计；文本、图片与文件条目都能复制）。
 //!
 //! 形态：`WS_POPUP` + `WS_EX_TOOLWINDOW | WS_EX_TOPMOST`，**不设 owner**。设了 owner 之后
 //! 主窗藏进托盘会把弹窗一起藏掉；而主窗可能是隐藏的，热键仍应能把历史叫出来。
@@ -1810,6 +1810,12 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
     };
     if focusflow_core::clipboard::is_paused() {
         footer.push_str(" · 记录已暂停");
+    }
+    if let Some(note) =
+        focusflow_core::clipboard::capture_notice(focusflow_core::clipboard::now_ms())
+    {
+        // 这一笔没收进来的原因：最多占 60 秒，成功收录一次就清。
+        footer = format!("{note} · {footer}");
     }
     let muted = st.pal.muted;
     draw_str(

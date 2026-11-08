@@ -4546,6 +4546,9 @@ impl App {
         let enabled = focusflow_core::config::instance().get_bool("clipboard", "enabled", true);
         let mut got = 0usize;
         let mut disconnected = false;
+        // 探活是兜底：线程正常结束会让收件口断开（下面那支先发现），但"线程没了、
+        // 屏上还写着在记录"不能靠猜测，每拍问一次 `is_finished` 很便宜。
+        let watcher_dead = self.clip_watcher.as_ref().is_some_and(|w| !w.is_running());
         if let Some(rx) = self.clip_rx.as_ref() {
             loop {
                 match rx.try_recv() {
@@ -4647,6 +4650,17 @@ impl App {
             clipboard_popup::notify_changed();
             if self.view == 7 {
                 self.reload_clip_page(hwnd, clip_list::ReloadIntent::Keep);
+            }
+        }
+        if watcher_dead && focusflow_core::clipboard::watcher_fault().is_none() {
+            // 线程没了却没人说过：屏上必须改口，否则"还在记录"是假象。
+            focusflow_core::clipboard::report_watcher_fault(
+                "剪贴板监听线程已退出：本进程不再收录复制内容",
+            );
+            tracing_note("剪贴板监听线程探活失败：已退出（由主循环补报）");
+            clipboard_popup::notify_changed();
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
         }
     }
@@ -11628,6 +11642,12 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
         ) {
             footer.push_str(&format!("（剩 {left}）"));
         }
+    }
+    if let Some(note) =
+        focusflow_core::clipboard::capture_notice(focusflow_core::clipboard::now_ms())
+    {
+        // 这一笔没收进来的原因：60 秒内看得见、成功收录一次就清，不永久顶页脚。
+        footer = format!("{note} · {footer}");
     }
     if let Some(why) = focusflow_core::clipboard::watcher_fault() {
         // 排在最前面：页脚会被夹取，把结论放尾部会被省略号吃掉。原因限一句，
