@@ -22,6 +22,11 @@ Unicode true
 !ifndef PUBLISHER
   !define PUBLISHER "FocusFlow"
 !endif
+; 版本资源里缺 LegalCopyright 时 makensis 会报 9100（不影响产出，但它是唯一一条警告，
+; 每次打包都把它盖在真问题上面）。仓库没有单独的授权文件，这里用发布者名。
+!ifndef COPYRIGHT
+  !define COPYRIGHT "Copyright (C) FocusFlow"
+!endif
 
 ; 源目录 = build_native.bat 组装的 dist\FocusFlow-<版本>\。
 ; 注意不要指回旧的 dist\FocusFlow\：那是 Tauri 绿色包，里面还留着旧 FocusFlow.exe
@@ -50,6 +55,7 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "FileDescription" "${APPNAME} installer"
 VIAddVersionKey "CompanyName" "${PUBLISHER}"
+VIAddVersionKey "LegalCopyright" "${COPYRIGHT}"
 
 Page directory
 Page instfiles
