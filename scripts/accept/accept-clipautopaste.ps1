@@ -233,6 +233,13 @@ Check 'the self-window target is refused' `
     (Wait-LogCount '*clip_autopaste ok=false*' ($failBefore + 1) 4000)
 Check 'nothing is pasted into our own window' ($tb.Text.Length -eq 0) `
     "textbox='$($tb.Text)'"
+# A refusal must stay visible: the user has to see why nothing was pasted, and the
+# content is already on the clipboard for a manual Ctrl+V.
+$stillOpen = $false
+if ($popup2 -gt 0) { $stillOpen = [FF]::IsWindowVisible([IntPtr]$popup2) }
+Check 'the palette stays open when the paste is refused' $stillOpen
+Check 'the refusal log says the palette was kept' `
+    (Wait-LogMatch '*clip_autopaste ok=false*kept=1*' 2000)
 
 Stop-App $Exe
 $fx.Close()

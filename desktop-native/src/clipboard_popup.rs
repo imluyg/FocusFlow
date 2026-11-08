@@ -116,6 +116,9 @@ struct RestoreJob {
     paste: bool,
     ticks_left: u8,
     stray_ticks: u8,
+    /// 还能"硬抢"几次前台。正常粘贴第一跳必须抢一次；之后用户如果已经点去别处，
+    /// 再每跳硬拽就是把焦点从人手里抢回来。
+    claim_left: u8,
 }
 
 struct Palette {
@@ -881,23 +884,34 @@ fn finish_copy(hwnd: HWND, copied: bool) {
     let is_self = has_target && clipboard::window_belongs_to_us(prev.0 as isize);
     if auto {
         if let Err(why) = autopaste_gate(has_target, is_self, true) {
+            // 拒绝时窗口留着：原因要当场看得见，而且内容已经在剪贴板了 ——
+            // 藏起来的唯一后果是用户以为没复制上，下次打开才看到一句话。
+            crate::tracing_note(&format!("clip_autopaste ok=false why={why} kept=1"));
+            let msg = kept_message(why);
+            with_state(hwnd, |st| st.status = Some(msg));
             unsafe {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
-            crate::tracing_note(&format!("clip_autopaste ok=false why={why}"));
-            note_restore_issue(why.to_string());
             return;
         }
     } else if !has_target {
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        }
+        // auto_paste 关着且没有目标：复制完就关窗（保持既有行为）。
+        hide_palette(hwnd);
         return;
     }
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_HIDE);
-    }
+    hide_palette(hwnd);
     start_restore(hwnd, prev, auto);
+}
+
+/// 自动粘贴被拒绝、窗口留在原地时那句状态。`why` 来自 `autopaste_gate`。
+fn kept_message(why: &str) -> String {
+    match why {
+        "没有可粘贴的目标窗口" => "已复制 · 没有可粘贴的窗口（Esc 关闭）".to_string(),
+        "目标是本程序自己的窗口" => {
+            "已复制 · 目标是本程序窗口，未自动粘贴（Ctrl+V 粘贴，Esc 关闭）".to_string()
+        }
+        other => format!("已复制 · 未自动粘贴：{other}；请按 Ctrl+V"),
+    }
 }
 
 /// 目标窗口能不能作为粘贴对象。纯函数：三条否决理由各自能被单测点到。
@@ -925,6 +939,7 @@ fn start_restore(hwnd: HWND, target: HWND, paste: bool) {
             paste,
             ticks_left: RESTORE_MAX_TICKS,
             stray_ticks: 0,
+            claim_left: 1,
         });
     });
     unsafe {
@@ -955,24 +970,31 @@ fn cancel_restore(hwnd: HWND) {
 enum RestoreAction {
     TargetGone,
     ForegroundReady,
+    ClaimAndWait,
     GiveUpStray,
     GiveUpTimeout,
     Wait,
     WaitStray,
 }
 
+/// 一跳的结论。`can_claim` = 这次还允许硬抢前台：第一跳必须抢一次（正常粘贴
+/// 靠它），之后若用户已经点去第三方窗口，就只数 stray、不再每跳硬拽。
 fn next_restore_action(
     target_alive: bool,
     foreground_is_target: bool,
     foreground_is_self: bool,
     ticks_left: u8,
     stray_ticks: u8,
+    can_claim: bool,
 ) -> RestoreAction {
     if !target_alive {
         return RestoreAction::TargetGone;
     }
     if foreground_is_target {
         return RestoreAction::ForegroundReady;
+    }
+    if can_claim {
+        return RestoreAction::ClaimAndWait;
     }
     if !foreground_is_self && stray_ticks >= RESTORE_MAX_STRAY {
         return RestoreAction::GiveUpStray;
@@ -1001,9 +1023,6 @@ fn restore_tick(hwnd: HWND) {
             let _ = ShowWindowAsync(job.target, SW_RESTORE);
         }
     }
-    if target_alive {
-        claim_foreground(job.target);
-    }
     let fg = unsafe { GetForegroundWindow() };
     let action = next_restore_action(
         target_alive,
@@ -1011,10 +1030,20 @@ fn restore_tick(hwnd: HWND) {
         fg == hwnd,
         job.ticks_left,
         job.stray_ticks,
+        job.claim_left > 0,
     );
     match action {
         RestoreAction::TargetGone => {
             finish_restore(hwnd, job, Err("原窗口已经关闭".to_string()));
+        }
+        RestoreAction::ClaimAndWait => {
+            claim_foreground(job.target);
+            with_state(hwnd, |st| {
+                if let Some(j) = st.restore.as_mut() {
+                    j.claim_left = j.claim_left.saturating_sub(1);
+                    j.ticks_left = j.ticks_left.saturating_sub(1);
+                }
+            });
         }
         RestoreAction::ForegroundReady => {
             if job.paste {
@@ -1022,7 +1051,9 @@ fn restore_tick(hwnd: HWND) {
                     Ok(()) => crate::tracing_note("clip_autopaste ok=true"),
                     Err(e) => {
                         crate::tracing_note(&format!("clip_autopaste ok=false why={e}"));
-                        note_restore_issue(format!("没能自动粘贴：{e}；内容已在剪贴板"));
+                        note_restore_issue(
+                            "提权窗口拦下了模拟按键；内容已在剪贴板，请按 Ctrl+V".to_string(),
+                        );
                     }
                 }
             }
@@ -1033,10 +1064,7 @@ fn restore_tick(hwnd: HWND) {
         }
         RestoreAction::GiveUpTimeout => {
             let why = if job.paste {
-                autopaste_gate(true, false, false)
-                    .err()
-                    .unwrap_or("未能确认前台已经切回原窗口")
-                    .to_string()
+                "没能把焦点还给原窗口（前台锁或提权窗口）；内容已在剪贴板，请按 Ctrl+V".to_string()
             } else {
                 "没能把焦点还给原窗口（前台锁或提权窗口）".to_string()
             };
@@ -1153,11 +1181,18 @@ pub fn notify_changed() {
     }
 }
 
-fn hide_inner(hwnd: HWND, restore_focus: bool) {
-    let prev = with_state(hwnd, |st| st.prev_fg).unwrap_or_default();
+/// 隐藏弹窗的唯一入口。顺手停掉"抢前台"重试定时器：只 `ShowWindow(SW_HIDE)`
+/// 会让那个定时器继续每 80ms 抢一次前台，用户看不到窗却觉得键盘被抢走。
+fn hide_palette(hwnd: HWND) {
     unsafe {
+        let _ = KillTimer(Some(hwnd), ACTIVATE_TIMER);
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
+}
+
+fn hide_inner(hwnd: HWND, restore_focus: bool) {
+    let prev = with_state(hwnd, |st| st.prev_fg).unwrap_or_default();
+    hide_palette(hwnd);
     if restore_focus
         && !prev.0.is_null()
         && prev != hwnd
@@ -1287,10 +1322,12 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
         }
         WM_RBUTTONDOWN => {
             let (x, y) = mouse_xy(l);
+            // 空白处也要能开菜单：全部是列表项时，想清空历史/暂停记录还得先右键到
+            // 某一行上，空列表里则根本没有入口。
             if let Some(idx) = row_at(hwnd, x, y) {
                 with_state(hwnd, |st| st.sel = idx);
-                open_menu(hwnd, x, y);
             }
+            open_menu(hwnd, x, y);
             LRESULT(0)
         }
         WM_ACTIVATE => {
@@ -1382,6 +1419,16 @@ unsafe extern "system" fn edit_proc(
             copy_without_closing(parent);
             return LRESULT(0);
         }
+        // Delete：Ctrl+Del 总是删当前行；空搜索框里的 Del 也是（空框里它本来什么
+        // 都不做）；有字又没有 Ctrl 时留给文本框删字符；Shift+Del 整个不碰。
+        if vk == VK_DELETE.0 as u32 {
+            let shift = (GetKeyState(0x10) as u16 & 0x8000) != 0;
+            let len = GetWindowTextLengthW(hwnd).max(0) as usize;
+            if !shift && delete_key_goes_to_list(ctrl, len) {
+                delete_row(parent);
+                return LRESULT(0);
+            }
+        }
         if edit_key_goes_to_list(vk) && handle_key(parent, vk) {
             return LRESULT(0);
         }
@@ -1404,15 +1451,64 @@ unsafe extern "system" fn edit_proc(
     DefSubclassProc(hwnd, msg, w, l)
 }
 
-/// 搜索框里哪些键交给列表（导航与执行）。`Delete` 故意不在：它在文本框里是
-/// "删掉下一个字符"，而列表那条路没有确认框 —— 用户改字时按一下不该悄悄少一条
-/// 历史（页脚也只把 Del 写给片段页，那里焦点不在搜索框上）。
+/// 搜索框里哪些键交给列表（导航与执行）。`Delete` 不在这一组：它自己有
+/// `delete_key_goes_to_list` 的三档规则（空框 / Ctrl / Shift）。
 fn edit_key_goes_to_list(vk: u32) -> bool {
     [
         VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_RETURN, VK_ESCAPE, VK_TAB, VK_F1,
     ]
     .map(|k| k.0 as u32)
     .contains(&vk)
+}
+
+/// 搜索框里的 Delete 什么时候归列表：`Ctrl+Del` 总是归（有字也能删这一条）；
+/// 不带修饰时只在搜索框为空才归 —— 空框里 Delete 在 EDIT 里本来就是空操作。
+/// `Shift+Del` 由调用方先挡掉（保留文本框的剪切语义），所以这里不看 Shift。
+fn delete_key_goes_to_list(ctrl: bool, edit_len: usize) -> bool {
+    ctrl || edit_len == 0
+}
+
+/// 删除这一条之前要不要问一句：片段与固定记录会弹确认框，普通未固定历史直接删。
+/// 以前一律不问，Del 一下少一条；现在固定项也不会被误删。
+fn needs_confirm(mode: Mode, pinned: bool) -> bool {
+    mode == Mode::Snippets || pinned
+}
+
+/// 列表里的"删除当前行"唯一入口：键盘 Del、菜单「删除」都走这里。
+fn delete_row(hwnd: HWND) {
+    let Some((ask, what)) = with_state(hwnd, |st| {
+        let row = st.selected()?;
+        let what = if st.mode == Mode::Snippets {
+            "个片段"
+        } else if row.pinned {
+            "条固定记录"
+        } else {
+            "条记录"
+        };
+        Some((needs_confirm(st.mode, row.pinned), what))
+    })
+    .flatten() else {
+        return;
+    };
+    if ask {
+        let msg = format!("删除这 1 {what}？");
+        let text = windows::core::HSTRING::from(msg);
+        let answer = unsafe {
+            MessageBoxW(
+                Some(hwnd),
+                windows::core::PCWSTR(text.as_ptr()),
+                w!("删除剪贴板内容"),
+                MESSAGEBOX_STYLE(MB_YESNO.0 | MB_ICONQUESTION.0),
+            )
+        };
+        if answer != IDYES {
+            return;
+        }
+    }
+    with_state(hwnd, |st| st.delete_selected(hwnd));
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
 }
 
 /// 返回 true = 这个键被弹窗吃掉了。
@@ -1495,10 +1591,7 @@ fn handle_key(hwnd: HWND, vk: u32) -> bool {
             true
         }
         x if x == VK_DELETE.0 as u32 => {
-            with_state(hwnd, |st| st.delete_selected(hwnd));
-            unsafe {
-                let _ = InvalidateRect(Some(hwnd), None, false);
-            }
+            delete_row(hwnd);
             true
         }
         x if x == VK_F1.0 as u32 => {
@@ -2005,24 +2098,24 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
         )
     })
     .unwrap_or((Mode::History, false, false));
-    if !has_row {
-        return;
-    }
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
         return;
     };
     unsafe {
-        let _ = AppendMenuW(menu, MF_STRING, MENU_COPY as usize, w!("复制"));
-        if mode == Mode::History {
-            let pin_label = if pinned {
-                w!("取消固定")
-            } else {
-                w!("固定")
-            };
-            let _ = AppendMenuW(menu, MF_STRING, MENU_PIN as usize, pin_label);
+        // 行相关的那几项只在真有行时出现；空白处/空列表只剩全局项。
+        if has_row {
+            let _ = AppendMenuW(menu, MF_STRING, MENU_COPY as usize, w!("复制"));
+            if mode == Mode::History {
+                let pin_label = if pinned {
+                    w!("取消固定")
+                } else {
+                    w!("固定")
+                };
+                let _ = AppendMenuW(menu, MF_STRING, MENU_PIN as usize, pin_label);
+            }
+            let _ = AppendMenuW(menu, MF_STRING, MENU_DELETE as usize, w!("删除"));
         }
-        let _ = AppendMenuW(menu, MF_STRING, MENU_DELETE as usize, w!("删除"));
-        if mode == Mode::History {
+        if has_row && mode == Mode::History {
             let _ = AppendMenuW(menu, MF_STRING, MENU_SNIPPET as usize, w!("存为片段"));
             if let Ok(sub) = CreatePopupMenu() {
                 for (i, t) in Transform::ALL.iter().enumerate() {
@@ -2093,7 +2186,7 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
             with_state(hwnd, |st| st.toggle_pin(hwnd));
         }
         MENU_DELETE => {
-            with_state(hwnd, |st| st.delete_selected(hwnd));
+            delete_row(hwnd);
         }
         MENU_SNIPPET => {
             with_state(hwnd, |st| st.save_snippet(hwnd));
@@ -2158,8 +2251,18 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
     // 让弹窗短暂失活，提前恢复会在确认框还开着时把窗藏掉。
     with_state(hwnd, |st| st.menu_open = false);
     let still_visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
-    if still_visible && unsafe { GetForegroundWindow() } != hwnd {
-        hide_inner(hwnd, false);
+    if still_visible {
+        if unsafe { GetForegroundWindow() } != hwnd {
+            // 菜单开着的时候用户点去别处了：照旧藏起来。
+            hide_palette(hwnd);
+        } else if mode == Mode::History {
+            // 菜单关掉后焦点回到搜索框，否则"接着打字没反应"。
+            if let Some(edit) = with_state(hwnd, |st| st.edit) {
+                unsafe {
+                    let _ = SetFocus(Some(edit));
+                }
+            }
+        }
     }
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2280,31 +2383,98 @@ mod tests {
     #[test]
     fn restore_action_covers_every_exit() {
         assert_eq!(
-            next_restore_action(false, false, false, 5, 0),
+            next_restore_action(false, false, false, 5, 0, false),
             RestoreAction::TargetGone
         );
         assert_eq!(
-            next_restore_action(true, true, false, 5, 0),
+            next_restore_action(true, true, false, 5, 0, false),
             RestoreAction::ForegroundReady
         );
         assert_eq!(
-            next_restore_action(true, false, false, 5, RESTORE_MAX_STRAY),
+            next_restore_action(true, false, false, 5, RESTORE_MAX_STRAY, false),
             RestoreAction::GiveUpStray,
             "用户已经点了别的窗口就不再抢"
         );
         assert_eq!(
-            next_restore_action(true, false, false, 0, 0),
+            next_restore_action(true, false, false, 0, 0, false),
             RestoreAction::GiveUpTimeout
         );
         assert_eq!(
-            next_restore_action(true, false, true, 5, 0),
+            next_restore_action(true, false, true, 5, 0, false),
             RestoreAction::Wait,
             "前台还是刚隐藏的弹窗：等它让位"
         );
         assert_eq!(
-            next_restore_action(true, false, false, 5, 0),
+            next_restore_action(true, false, false, 5, 0, false),
             RestoreAction::WaitStray
         );
+    }
+
+    #[test]
+    fn the_restore_job_claims_the_foreground_exactly_once() {
+        // 第一跳无条件抢一次：正常粘贴靠它。
+        assert_eq!(
+            next_restore_action(true, false, true, 5, 0, true),
+            RestoreAction::ClaimAndWait
+        );
+        assert_eq!(
+            next_restore_action(true, false, false, 5, RESTORE_MAX_STRAY, true),
+            RestoreAction::ClaimAndWait,
+            "抢的那一跳比 stray 上限优先"
+        );
+        // 抢过之后（claim_left = 0）不再每跳硬拽：第三方窗口只累计 stray。
+        assert_eq!(
+            next_restore_action(true, false, false, 5, 0, false),
+            RestoreAction::WaitStray
+        );
+        assert_eq!(
+            next_restore_action(true, false, false, 5, RESTORE_MAX_STRAY, false),
+            RestoreAction::GiveUpStray
+        );
+    }
+
+    #[test]
+    fn a_refused_autopaste_says_why_the_palette_stayed() {
+        assert_eq!(
+            kept_message("目标是本程序自己的窗口"),
+            "已复制 · 目标是本程序窗口，未自动粘贴（Ctrl+V 粘贴，Esc 关闭）"
+        );
+        assert_eq!(
+            kept_message("没有可粘贴的目标窗口"),
+            "已复制 · 没有可粘贴的窗口（Esc 关闭）"
+        );
+        assert_eq!(
+            kept_message("焦点没能还给原窗口（前台锁或提权窗口）"),
+            "已复制 · 未自动粘贴：焦点没能还给原窗口（前台锁或提权窗口）；请按 Ctrl+V"
+        );
+    }
+
+    #[test]
+    fn the_delete_key_routing_has_three_tiers() {
+        assert!(
+            delete_key_goes_to_list(false, 0),
+            "空搜索框里的 Del 在文本框里什么也不做，归列表"
+        );
+        assert!(
+            !delete_key_goes_to_list(false, 3),
+            "有字又没有 Ctrl：留给文本框删字符"
+        );
+        assert!(
+            delete_key_goes_to_list(true, 3),
+            "Ctrl+Del 总是删当前行，搜索框有字也一样"
+        );
+        assert!(delete_key_goes_to_list(true, 0));
+    }
+
+    #[test]
+    fn only_pinned_rows_and_snippets_ask_before_deleting() {
+        assert!(!needs_confirm(Mode::History, false), "普通历史直接删");
+        assert!(
+            needs_confirm(Mode::History, true),
+            "固定项要问一句：删了就没了"
+        );
+        assert!(needs_confirm(Mode::Snippets, false), "片段要问一句");
+        assert!(needs_confirm(Mode::Snippets, true));
     }
 
     #[test]
