@@ -2841,9 +2841,13 @@ impl App {
         if filter == self.clip_page.filter {
             return;
         }
+        let had_checked = self.clip_page.checked_count();
         self.clip_page.filter = filter;
-        self.clip_page.sel = 0;
-        self.clip_page.scroll = 0;
+        // 勾住的 id 可能已经不在新列表里：留着它们，下一次删除会动到屏幕外的东西。
+        self.clip_page.on_filter_changed();
+        if had_checked > 0 {
+            self.clip_page.status = Some("筛选已变，已取消勾选".to_string());
+        }
         // 片段页筛的是片段列表，得走整份 reload；历史页只重查历史，别连带重算片段与统计。
         if self.clip_page.mode == clipboard_page::Mode::Snippets {
             self.reload_clip_page(hwnd, clip_list::ReloadIntent::ResetTop);
@@ -2925,31 +2929,45 @@ impl App {
         }
     }
 
-    /// 搜索框按 Enter：把字变成筛选词并重查；Esc：清掉筛选。
+    /// 搜索框按 Enter：把字变成筛选词并重查；Esc：退出多选或清掉筛选。
     fn commit_clip_search(&mut self, hwnd: HWND, commit: bool) {
         let Some(edit) = self.clip_search_edit else {
             return;
         };
+        // 多选中按 Esc：用户要收掉的是"勾选这个模式"，不是把筛选词清掉。
+        if !commit && self.clip_page.multi {
+            self.clip_page.exit_multi();
+            self.clip_page.status = Some("已退出多选（筛选保留）".to_string());
+            tracing_note("clip_page_multi_off_by_esc");
+            self.refresh_clip_page(hwnd);
+            return;
+        }
         let text = read_hosted_edit_text(edit);
-        self.clip_page.filter = if commit {
+        let next = if commit {
             text.trim().to_string()
         } else {
             String::new()
         };
+        let changed = next != self.clip_page.filter;
+        let had_checked = self.clip_page.checked_count();
+        self.clip_page.filter = next;
         if !commit {
             unsafe {
                 let _ = SetWindowTextW(edit, w!(""));
             }
         }
-        self.clip_page.sel = 0;
-        self.clip_page.scroll = 0;
+        if changed {
+            self.clip_page.on_filter_changed();
+        }
         self.reload_clip_page(hwnd, clip_list::ReloadIntent::ResetTop);
         tracing_note(&format!(
             "剪贴板搜索提交 commit={commit} qlen={} edit={}",
             self.clip_page.filter.chars().count(),
             edit.0 as isize
         ));
-        self.clip_page.status = Some(if self.clip_page.filter.is_empty() {
+        self.clip_page.status = Some(if changed && had_checked > 0 {
+            "筛选已变，已取消勾选".to_string()
+        } else if self.clip_page.filter.is_empty() {
             "筛选已清除".to_string()
         } else {
             format!("筛选：{}", self.clip_page.filter)
@@ -3012,6 +3030,11 @@ impl App {
             }
             0x22 => {
                 self.clip_page.move_selection(rows as i32, rows);
+                self.refresh_clip_page(hwnd);
+                true
+            }
+            0x20 if self.clip_page.multi => {
+                self.clip_page.toggle_checked(self.clip_page.sel);
                 self.refresh_clip_page(hwnd);
                 true
             }
@@ -5667,6 +5690,21 @@ impl P<'_> {
             if let Some(bd) = border {
                 self.rt.DrawRoundedRectangle(&rr, bd, 1.0, None);
             }
+        }
+    }
+
+    /// 只描边不填充：多选里"键盘当前在哪一行"要压在勾选底色之上，不能被填充盖住。
+    fn outline(&self, r: D2D_RECT_F, radius: f32, b: &ID2D1SolidColorBrush, width: f32) {
+        let radius = radius
+            .min((r.right - r.left).min(r.bottom - r.top) / 2.0)
+            .max(0.0);
+        let rr = D2D1_ROUNDED_RECT {
+            rect: r,
+            radiusX: radius,
+            radiusY: radius,
+        };
+        unsafe {
+            self.rt.DrawRoundedRectangle(&rr, b, width, None);
         }
     }
 
@@ -11362,12 +11400,19 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
             ["复制", "重命名", "删除", "", "", "多选"]
         };
         let has_row = clip.selected().is_some();
-        for (i, label) in labels.iter().enumerate() {
-            if label.is_empty() {
+        for (i, base) in labels.iter().enumerate() {
+            if base.is_empty() {
                 continue;
             }
+            // 多选开着时这颗钮是出口，文案要说出来：用户找不到"怎么退出来"时会去按 Esc，
+            // 而以前的 Esc 只会把窗口收进托盘。
+            let label = if i == 5 && clip.multi {
+                "退出多选"
+            } else {
+                *base
+            };
             let r = lay.toolbar[i];
-            let enabled = has_row || *label == "清空" || *label == "多选";
+            let enabled = has_row || *base == "清空" || *base == "多选";
             p.round(r, R_CONTROL, &p.br.card, Some(&p.br.border));
             if vs.ctl == Some(Ctl::ClipBtn(i as u8)) && enabled {
                 p.round(r, R_CONTROL, &p.br.hover, None);
@@ -11418,12 +11463,7 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
                 };
                 p.text(
                     msg,
-                    rect(
-                        lay.list_top,
-                        lay.list_top + 16.0,
-                        w - lay.pad() * 2.0 - 16.0,
-                        24.0,
-                    ),
+                    clipboard_page::empty_text_rect(&lay, w),
                     &p.fmt.body,
                     &p.br.muted,
                 );
@@ -11438,9 +11478,14 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
                     let top = lay.list_top + i as f32 * lay.row_h;
                     let selected = !clip.multi && idx == clip.sel;
                     let checked = clip.multi && clip.checked.contains(&row.id);
+                    // 多选里 ✓ 只说明"勾了"，不说明键盘现在停在哪一行（↑↓ 只挪焦点）。
+                    let focused = clip.multi && idx == clip.sel;
                     let rr = rect(lay.pad() + 4.0, top, w - lay.pad() * 2.0 - 8.0, lay.row_h);
                     if selected || checked {
                         p.round(rr, R_CONTROL, &p.br.hover, None);
+                    }
+                    if focused {
+                        p.outline(rr, R_CONTROL, &p.br.accent, 1.5);
                     }
                     let mut left = rr.left + 8.0;
                     if clip.multi {
@@ -11546,13 +11591,20 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
 
     // 底部：状态 / 条数 / 暂停与筛选口径。
     let total = clip.rows().len();
-    let selected = clip
-        .checked_count()
-        .max(usize::from(clip.selected().is_some()));
+    // 多选里报"勾了几条"；没进多选时焦点行就是唯一目标。
+    let selected = if clip.multi {
+        clip.checked_count()
+    } else {
+        usize::from(clip.selected().is_some())
+    };
     let mut footer = if let Some(status) = &clip.status {
         status.clone()
     } else if clip.multi {
-        format!("已选 {selected} 条 · 工具钮作用于勾住的行 · Tab 切模式 · Esc 退出多选")
+        // 三个手势各管什么，一句话说全：焦点行是"复制/存片段/改名"的目标，勾选
+        // （没勾时退回焦点行）是"删除/固定"的目标。
+        format!(
+            "已勾选 {selected} 条 · 焦点行：复制/存片段/改名 · 勾选（无勾时焦点行）：删除/固定 · Space 勾选 · Esc 退出多选"
+        )
     } else {
         match clip.mode {
             Mode::History => {
@@ -11570,6 +11622,12 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
     }
     if focusflow_core::clipboard::is_paused() {
         footer.push_str(" · 记录已暂停");
+        if let Some(left) = clipboard_page::format_remaining(
+            focusflow_core::clipboard::pause_until_ms(),
+            focusflow_core::clipboard::now_ms(),
+        ) {
+            footer.push_str(&format!("（剩 {left}）"));
+        }
     }
     if let Some(why) = focusflow_core::clipboard::watcher_fault() {
         // 排在最前面：页脚会被夹取，把结论放尾部会被省略号吃掉。原因限一句，
@@ -11577,14 +11635,18 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
         let why: String = why.chars().take(40).collect();
         footer = format!("监听未运行（复制不会收录）：{why} · {footer}");
     }
-    let footer = p.clip(&footer, &p.fmt.caption, w - lay.pad() * 2.0);
+    // 页脚分两槽：右侧 x/y 是固定宽度的位置读数，左侧正文只能用到它前面 ——
+    // 以前两段各自按整窗宽画，长句会从左槽伸到右槽底下。
+    let right_w = if clip.mode != Mode::Stats { 70.0 } else { 0.0 };
+    let left_w = (w - lay.pad() * 2.0 - right_w - 8.0).max(20.0);
+    let footer = p.clip(&footer, &p.fmt.caption, left_w);
     p.text(
         &footer,
-        rect(lay.pad(), lay.footer_y, w - lay.pad() * 2.0, 20.0),
+        rect(lay.pad(), lay.footer_y, left_w, 20.0),
         &p.fmt.caption,
         &p.br.muted,
     );
-    if clip.mode != Mode::Stats {
+    if right_w > 0.0 {
         let pos = if total == 0 {
             "0/0".to_string()
         } else {
@@ -11608,7 +11670,7 @@ fn draw_clipboard_stats(
     let Some(s) = &clip.stats else {
         p.text(
             "统计读不出来",
-            rect(lay.list_top, lay.list_top + 16.0, w - lay.pad() * 2.0, 24.0),
+            clipboard_page::empty_text_rect(&lay, w),
             &p.fmt.body,
             &p.br.muted,
         );
@@ -16388,6 +16450,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                             unsafe {
                                 let _ = InvalidateRect(Some(hwnd), None, false);
                             }
+                        }
+                    } else if app.view == 7 && app.clip_page.multi {
+                        // 多选是一种"正在批量操作"的状态，Esc 先退出它；页脚一直是这么
+                        // 承诺的，而以前这句话后面直接落到 hide_to_tray。
+                        app.clip_page.exit_multi();
+                        app.clip_page.status = Some("已退出多选".to_string());
+                        tracing_note("clip_page_multi_off_by_esc");
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     } else if app.kbd_focus.take().is_some() {
                         // 有键盘焦点时先撤焦点（弹层都关完了才轮到这一档），不直接藏进托盘。

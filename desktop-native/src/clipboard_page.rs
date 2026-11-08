@@ -193,6 +193,21 @@ pub fn short_time(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// 暂停还剩多久的短写法。`until_ms` 已经过去（或本来就 0）返回 `None`：页脚不该
+/// 写「已暂停（剩 0 秒）」。向上取整到秒，剩 500ms 说「1 秒」而不是「0 秒」。
+pub fn format_remaining(until_ms: i64, now_ms: i64) -> Option<String> {
+    let left = until_ms.saturating_sub(now_ms);
+    if left <= 0 {
+        return None;
+    }
+    let secs = (left + 999) / 1000;
+    Some(if secs >= 60 {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    } else {
+        format!("{secs} 秒")
+    })
+}
+
 /// 行里只画一行：换行折成空格，超长交给调用侧的夹取。
 pub fn preview_text(content: &str) -> String {
     content.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -439,6 +454,8 @@ impl ClipPage {
         );
     }
 
+    /// 翻一行的勾。多选态里光靠 ✓ 认不出"现在键盘在谁身上"（↑↓ 只挪焦点），
+    /// 所以焦点行也跟着这次点击走。
     pub fn toggle_checked(&mut self, row_idx: usize) {
         let Some(row) = self.rows().get(row_idx) else {
             return;
@@ -448,6 +465,7 @@ impl ClipPage {
             self.checked.insert(id);
         }
         self.anchor = Some(row_idx);
+        self.sel = row_idx;
     }
 
     /// `Shift+点击`：从锚点到这一行整段勾上（只加不减，避免"点一下没了一半"）。
@@ -471,6 +489,7 @@ impl ClipPage {
             self.checked.insert(*id);
         }
         self.anchor = Some(row_idx);
+        self.sel = row_idx;
     }
 
     /// `Ctrl+A`：把当前列表（历史或片段，按现在的筛选）全部勾上，并进入多选。
@@ -487,11 +506,27 @@ impl ClipPage {
     }
 
     pub fn toggle_multi(&mut self) {
-        self.multi = !self.multi;
-        if !self.multi {
-            self.checked.clear();
-            self.anchor = None;
+        if self.multi {
+            self.exit_multi();
+        } else {
+            self.multi = true;
         }
+    }
+
+    /// 退出多选：勾选与 Shift 锚点一起清掉。`sel`（焦点行）留着 —— 用户只是不再
+    /// 批量操作，不是把光标挪走。
+    pub fn exit_multi(&mut self) {
+        self.multi = false;
+        self.checked.clear();
+        self.anchor = None;
+    }
+
+    /// 筛选变了：勾住的 id 可能已经不在列表里。继续留着它们，删除/固定会作用到
+    /// 屏幕上看不见的行，所以退多选、清勾选、回顶。
+    pub fn on_filter_changed(&mut self) {
+        self.exit_multi();
+        self.sel = 0;
+        self.scroll = 0;
     }
 
     /// 这次动作作用在哪些 id 上：多选且有勾 ⇒ 勾住的；否则当前行。
@@ -578,6 +613,17 @@ pub fn layout_for(w: f32, h: f32) -> Layout {
         list_bottom,
         footer_y,
     }
+}
+
+/// 空状态/统计读不出来那一行的矩形。贴着列表卡片的内容左边距（`pad + 8`）画，
+/// 不按 `list_top` 起——那是卡片内的纵向起点，横向会落到卡片外面去。
+pub fn empty_text_rect(lay: &Layout, w: f32) -> D2D_RECT_F {
+    box_rect(
+        lay.pad() + 8.0,
+        lay.list_top + 16.0,
+        (w - lay.pad() * 2.0 - 16.0).max(20.0),
+        24.0,
+    )
 }
 
 pub fn tab_at(lay: &Layout, x: f32, y: f32) -> Option<usize> {
@@ -946,5 +992,78 @@ mod tests {
             "新复制插到顶部后下标整体后移，光标要跟着 id 走：Enter 不能粘到别的条目"
         );
         assert_eq!(page.scroll, 0, "本来在顶部：新条目应当直接可见");
+    }
+
+    #[test]
+    fn toggling_a_row_moves_the_focus_row_too() {
+        let mut p = ClipPage::new();
+        p.items = vec![test_row(1, "a"), test_row(2, "b"), test_row(3, "c")];
+        p.multi = true;
+        p.toggle_checked(2);
+        assert_eq!(p.sel, 2, "多选里点一行，焦点行也要跟过去");
+        assert_eq!(p.action_ids(), vec![3], "删除/固定只认勾选");
+        p.toggle_checked(2);
+        assert!(p.checked.is_empty());
+        assert_eq!(p.sel, 2, "取消勾选不挪焦点行");
+    }
+
+    #[test]
+    fn exiting_multi_clears_the_checked_set_but_keeps_the_focus_row() {
+        let mut p = ClipPage::new();
+        p.items = vec![test_row(1, "a"), test_row(2, "b")];
+        p.multi = true;
+        p.checked.insert(1);
+        p.checked.insert(2);
+        p.anchor = Some(1);
+        p.sel = 1;
+        p.exit_multi();
+        assert!(!p.multi);
+        assert!(p.checked.is_empty(), "退出多选不能留下勾选");
+        assert_eq!(p.anchor, None);
+        assert_eq!(p.sel, 1, "焦点行不是批量目标，退出多选不该把它挪走");
+    }
+
+    #[test]
+    fn a_filter_change_drops_multi_selection_and_goes_back_to_the_top() {
+        let mut p = ClipPage::new();
+        p.items = vec![test_row(1, "a"), test_row(2, "b")];
+        p.multi = true;
+        p.checked.insert(1);
+        p.checked.insert(2);
+        p.anchor = Some(1);
+        p.sel = 1;
+        p.scroll = 1;
+        p.on_filter_changed();
+        assert!(!p.multi, "筛选变了就退多选");
+        assert!(p.checked.is_empty(), "屏幕外的勾选不能留到下一次删除");
+        assert_eq!(p.anchor, None);
+        assert_eq!((p.sel, p.scroll), (0, 0), "换了一批数据要回顶");
+    }
+
+    #[test]
+    fn remaining_pause_time_reads_as_minutes_and_seconds() {
+        assert_eq!(format_remaining(0, 1_000), None, "没暂停就没有剩余时间");
+        assert_eq!(format_remaining(1_000, 1_000), None, "刚好到点不显示");
+        assert_eq!(
+            format_remaining(500, 0).as_deref(),
+            Some("1 秒"),
+            "剩 500ms 说 1 秒，不说 0 秒"
+        );
+        assert_eq!(format_remaining(59_000, 0).as_deref(), Some("59 秒"));
+        assert_eq!(format_remaining(60_000, 0).as_deref(), Some("1:00"));
+        assert_eq!(format_remaining(3_600_000, 0).as_deref(), Some("60:00"));
+    }
+
+    #[test]
+    fn the_empty_state_text_sits_inside_the_card() {
+        let lay = layout_for(1200.0, 860.0);
+        let r = empty_text_rect(&lay, 1200.0);
+        assert_eq!(r.left, lay.pad() + 8.0, "和列表内容同一个左边距");
+        assert!(
+            r.right <= 1200.0 - lay.pad() - 8.0 + 0.01,
+            "右侧要留在卡片里（实际 {:.1}）",
+            r.right
+        );
+        assert!(r.top > lay.list_top, "在卡片顶部之下");
     }
 }

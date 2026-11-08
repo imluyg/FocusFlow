@@ -493,6 +493,33 @@ Start-Sleep -Milliseconds 300
 [FF]::PressChord([byte[]]@(0x11), [byte]0x41)
 Check 'Ctrl+A checks every row on the page' (Wait-LogMatch '*clip_page_check_all*' 3000)
 
+# Ctrl+A checked every row. Now change the filter: the checked ids that fall out of the
+# list must not stay armed, or Del would remove rows the user cannot see.
+[FF]::ClickWindow($h, 1050, 217, 1)
+Start-Sleep -Milliseconds 300
+foreach ($ch in @(0x6D, 0x61, 0x72, 0x6B, 0x65, 0x72)) {  # "marker": exactly one row
+    [FF]::PostMessage([IntPtr]$se, 0x0102, [IntPtr]$ch, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 60
+}
+Check 'the filter change narrows the list to one row' (Wait-LogMatch '*clip_page_live_filter len=6 hits=1*' 4000)
+# The keyboard still belongs to the search EDIT here, so drive the delete through the
+# toolbar button: the point of this leg is which ids are armed, not the key routing.
+[FF]::ClickWindow($h, 220, 256, 1)
+Start-Sleep -Milliseconds 900
+[FF]::PressChord([byte[]]@(), [byte]0x0D)
+Check 'delete after a filter change only removes the visible row' (Wait-LogMatch '*clip_page_delete n=1*' 5000)
+
+# Clear the filter again so the rounds below still have a full page to work with.
+[FF]::ClickWindow($h, 1050, 217, 1)
+Start-Sleep -Milliseconds 300
+$clearsBefore = @(Get-LogLines | Where-Object { $_ -like '*commit=false*' }).Count
+[FF]::PostMessage([IntPtr]$se, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero) | Out-Null
+Check 'Esc clears the filter again after the delete round' (Wait-LogCount '*commit=false*' ($clearsBefore + 1) 3000)
+[void][FF]::SetForegroundWindow($h)
+Start-Sleep -Milliseconds 250
+[FF]::PressChord([byte[]]@(0x11), [byte]0x41)
+Check 'Ctrl+A checks every row again after clearing the filter' (Wait-LogCount '*clip_page_check_all*' 2 3000)
+
 # Click Delete: the row set must still be there after a beat (the confirm dialog is up),
 # and only Enter (the default Yes) may actually remove it.
 $deletesBefore = @(Get-LogLines | Where-Object { $_ -like '*clip_page_delete*' }).Count
