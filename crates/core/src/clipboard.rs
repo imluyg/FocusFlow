@@ -2347,9 +2347,10 @@ mod win {
                     TextVerdict::Empty => return,
                     TextVerdict::TooLarge => {
                         tracing::info!(
-                            "剪贴板有一条 {} 字节的文本，超过上限 {} 字节，整条跳过",
+                            "剪贴板有一条 {} 字节的文本，超过上限 {} 字节，整条跳过 clip_text_too_large bytes={}",
                             text.len(),
-                            cfg.max_text_bytes
+                            cfg.max_text_bytes,
+                            text.len()
                         );
                         super::note_capture_issue(format!(
                             "复制的内容太长（{} 字节，上限 {} 字节），整条跳过",
@@ -2368,7 +2369,7 @@ mod win {
             }
             RawClip::TextTooLarge { units } => {
                 tracing::info!(
-                    "剪贴板有一条 {units} 个 UTF-16 单元的文本，超过上限 {} 字节，整条跳过（不再按图片重试）",
+                    "剪贴板有一条 {units} 个 UTF-16 单元的文本，超过上限 {} 字节，整条跳过（不再按图片重试） clip_text_too_large units={units}",
                     cfg.max_text_bytes
                 );
                 super::note_capture_issue(format!("复制的内容太长（{units} 个字符），整条跳过"));
@@ -2834,6 +2835,25 @@ mod tests {
             TextReadVerdict::TooLarge,
             "多一个单元就整条跳过"
         );
+    }
+
+    #[test]
+    fn the_oversize_fixture_dib_is_decodable() {
+        // 验收脚本里「超长文本 + DIB」那份夹具的图片一半必须真的解得出来：否则
+        // 「没有多出图片」那条断言就分不出「守卫生效」和「图片本来就是坏的」。
+        let mut dib = vec![0u8; 56];
+        dib[0..4].copy_from_slice(&40i32.to_le_bytes()); // biSize
+        dib[4..8].copy_from_slice(&2i32.to_le_bytes()); // biWidth
+        dib[8..12].copy_from_slice(&2i32.to_le_bytes()); // biHeight
+        dib[12..14].copy_from_slice(&1i16.to_le_bytes()); // biPlanes
+        dib[14..16].copy_from_slice(&24i16.to_le_bytes()); // biBitCount
+        dib[20..24].copy_from_slice(&16i32.to_le_bytes()); // biSizeImage
+        for b in dib.iter_mut().skip(40) {
+            *b = 0x80;
+        }
+        let (rgba, w, h) = dib_to_rgba(&dib).expect("夹具里的 DIB 必须解得出来");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(rgba.len(), 16);
     }
 
     #[test]

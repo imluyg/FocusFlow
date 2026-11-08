@@ -17,6 +17,10 @@
   Every log assertion uses an ASCII tag (`clip_ingest`, `clip_enter`) so this file
   can stay ASCII-only like the rest of the folder.
 
+  The last round publishes an oversize `CF_UNICODETEXT` together with a valid `CF_DIB`
+  from this script (an external owner): the text must be refused as text and the DIB
+  must not be recorded as an image in its place.
+
   The original clipboard text is restored at the end.
 
 .EXAMPLE
@@ -529,6 +533,77 @@ $deletesPending = @(Get-LogLines | Where-Object { $_ -like '*clip_page_delete*' 
 Check 'delete waits for the confirmation' ($deletesPending -eq $deletesBefore)
 [FF]::PressChord([byte[]]@(), [byte]0x0D)
 Check 'confirming deletes the checked rows' (Wait-LogCount '*clip_page_delete*' ($deletesBefore + 1) 5000)
+
+# ---- capture guard: an oversize text that also carries a DIB must not become an image ----
+# Excel-style copies publish both CF_UNICODETEXT and CF_DIB. When the text was over the
+# limit the reader used to fall through to the image path, so a text the user could never
+# get back was stored as a picture. The fixture publishes both formats from THIS script's
+# process: a same-process writer inside the app would be rejected as a self write, so the
+# end-to-end case has to come from outside.
+if (-not ('FFClipFixture' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class FFClipFixture {
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool CloseClipboard();
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool EmptyClipboard();
+    [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SetClipboardData(uint format, IntPtr mem);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr GlobalAlloc(uint flags, UIntPtr bytes);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr GlobalLock(IntPtr mem);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GlobalUnlock(IntPtr mem);
+    static IntPtr CopyToGlobal(byte[] bytes) {
+        IntPtr h = GlobalAlloc(0x0002, (UIntPtr)bytes.Length);
+        if (h == IntPtr.Zero) return IntPtr.Zero;
+        IntPtr p = GlobalLock(h);
+        if (p == IntPtr.Zero) return IntPtr.Zero;
+        Marshal.Copy(bytes, 0, p, bytes.Length);
+        GlobalUnlock(h);
+        return h;
+    }
+    public static bool Publish(string text, byte[] dib) {
+        if (!OpenClipboard(IntPtr.Zero)) return false;
+        try {
+            if (!EmptyClipboard()) return false;
+            byte[] utf16 = System.Text.Encoding.Unicode.GetBytes(text + "\0");
+            IntPtr h1 = CopyToGlobal(utf16);
+            if (h1 == IntPtr.Zero || SetClipboardData(13, h1) == IntPtr.Zero) return false;
+            IntPtr h2 = CopyToGlobal(dib);
+            if (h2 == IntPtr.Zero || SetClipboardData(8, h2) == IntPtr.Zero) return false;
+            return true;
+        } finally { CloseClipboard(); }
+    }
+}
+'@
+}
+# 2x2, 24 bpp, BI_RGB: 40-byte header + 16 bytes of bottom-up rows (2 pixels padded to 4).
+$dib = New-Object byte[] 56
+[BitConverter]::GetBytes([int]40).CopyTo($dib, 0)
+[BitConverter]::GetBytes([int]2).CopyTo($dib, 4)
+[BitConverter]::GetBytes([int]2).CopyTo($dib, 8)
+[BitConverter]::GetBytes([int16]1).CopyTo($dib, 12)
+[BitConverter]::GetBytes([int16]24).CopyTo($dib, 14)
+[BitConverter]::GetBytes([int]16).CopyTo($dib, 20)
+for ($i = 40; $i -lt 56; $i++) { $dib[$i] = 0x80 }
+$imageBefore = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest_image*' }).Count
+$ingestBefore = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest *' }).Count
+$oversize = 'x' * 17000
+# Liveness control: a normal copy right before the fixture proves the watcher is
+# seeing clipboard updates. Without it, "nothing was ingested" below could also mean
+# "the watcher never looked" -- the assertion would pass for the wrong reason.
+$ingestBeforeControl = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest *' }).Count
+Set-ClipboardRetry 'accept-clip-overlimit-control'
+Check 'the watcher is alive before the over-limit round' `
+    (Wait-LogCount '*clip_ingest *' ($ingestBeforeControl + 1) 5000)
+$imageBefore = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest_image*' }).Count
+$ingestBefore = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest *' }).Count
+Check 'the oversize text + DIB fixture is published' ([FFClipFixture]::Publish($oversize, $dib))
+Start-Sleep -Milliseconds 1500
+$imageAfter = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest_image*' }).Count
+$ingestAfter = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest *' }).Count
+Check 'the DIB is not captured in place of the oversize text' `
+    (($imageAfter -eq $imageBefore) -and ($ingestAfter -eq $ingestBefore)) `
+    "image=$imageBefore->$imageAfter ingest=$ingestBefore->$ingestAfter"
 
 Stop-App $Exe
 if ($null -ne $orig) { try { Set-ClipboardRetry $orig } catch { } }
