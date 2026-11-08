@@ -10,6 +10,8 @@ use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 
 use focusflow_core::clipboard::{self, ClipItem, ClipKind, ClipStats, Snippet};
 
+use crate::clip_list::{self, ReloadIntent, Viewport};
+
 /// 列表一次最多取多少条。弹窗是 100；管理页给到 500，够翻旧记录，也不至于把
 /// 一次切页变成整库扫描。
 pub const LIST_LIMIT: i64 = 500;
@@ -320,11 +322,16 @@ impl ClipPage {
         }
     }
 
-    pub fn reload(&mut self) {
+    /// 重查整页。`intent` 决定选中/视口怎么落（见 `clip_list::settle`）：
+    /// 新复制、固定、删除用 `Keep`，进页/换模式/换筛选用 `ResetTop`。
+    pub fn reload(&mut self, intent: ReloadIntent, visible: usize) {
+        let prev_id = self.selected().map(|r| r.id);
+        let prev = Viewport {
+            sel: self.sel,
+            scroll: self.scroll,
+        };
+        let was_at_top = self.scroll == 0;
         let filter = self.filter.trim().to_string();
-        // 盘上可能变了的那几个时机（进页/换模式/新复制进来）才清失效缓存；实时筛选的
-        // 每一键走 `reload_items`，不该重新 stat 一遍。
-        self.missing.borrow_mut().clear();
         self.reload_items();
         let mut snippets: Vec<Row> = match clipboard::snippets() {
             Ok(v) => {
@@ -347,7 +354,30 @@ impl ClipPage {
         }
         self.snippets = snippets;
         self.stats = clipboard::stats(7).ok();
-        self.clamp_selection(1);
+        // 下标已经换了含义：旧的 Shift 锚点不能再拿去整段勾。
+        self.anchor = None;
+        let ids: Vec<i64> = self.rows().iter().map(|r| r.id).collect();
+        let vp = clip_list::settle(&ids, prev_id, prev, was_at_top, visible, intent);
+        self.sel = vp.sel;
+        self.scroll = vp.scroll;
+    }
+
+    /// 盘上可能变了的时刻（进页、换模式）才丢失效缓存。`reload` 不丢：新复制进来时
+    /// 其余行的文件失效状态不会因此改变，重 stat 一遍只会让每次复制都卡一下。
+    pub fn reset_probes(&mut self) {
+        self.missing.borrow_mut().clear();
+    }
+
+    /// 把当前视口里那几行的失效检查补上（`Path::exists` 只问要画出来的行）。
+    /// 返回这次真的问了磁盘的行数 —— 调用方据此在重画之前记一条日志。
+    pub fn warm_missing(&self, visible: usize) -> usize {
+        let mut fresh = 0;
+        for row in self.rows().iter().skip(self.scroll).take(visible) {
+            if self.missing_files_for(row).1 {
+                fresh += 1;
+            }
+        }
+        fresh
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
@@ -361,6 +391,7 @@ impl ClipPage {
         self.anchor = None;
         self.multi = false;
         self.status = None;
+        self.reset_probes();
         self.clamp_selection(1);
     }
 
@@ -623,7 +654,7 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
 
         let mut page = ClipPage::new();
-        page.reload();
+        page.reload(ReloadIntent::ResetTop, 8);
         let row = page
             .items
             .iter()
@@ -647,7 +678,14 @@ mod tests {
             "文本行不做磁盘检查"
         );
 
-        page.reload();
+        page.reload(ReloadIntent::Keep, 8);
+        assert_eq!(
+            page.missing_files_for(&row),
+            (1, false),
+            "新复制进来自动 refresh 时不该把可视行的失效检查全部重 stat 一遍"
+        );
+
+        page.reset_probes();
         let row = page
             .items
             .iter()
@@ -657,7 +695,7 @@ mod tests {
         assert_eq!(
             page.missing_files_for(&row),
             (1, true),
-            "reload 是'盘上可能变了'的时刻，要重新问一次"
+            "进页/换模式（reset_probes）才是'盘上可能变了'的时刻，要重新问一次"
         );
     }
 
@@ -853,7 +891,7 @@ mod tests {
         focusflow_core::clipboard::init_db().unwrap();
         let mut p = ClipPage::new();
         p.status = Some(format!("{SNIPPETS_LOAD_ERROR}：disk I/O error"));
-        p.reload();
+        p.reload(ReloadIntent::ResetTop, 8);
         assert!(
             p.status.is_none(),
             "片段读回来之后，上一次那句错不该继续留在状态条上（实际：{:?}）",
@@ -880,5 +918,33 @@ mod tests {
     fn preview_flattens_whitespace() {
         assert_eq!(preview_text(" a\n\n b\tc "), "a b c");
         assert_eq!(preview_text("   "), "");
+    }
+
+    #[test]
+    fn a_new_copy_at_the_top_keeps_the_cursor_on_the_same_row() {
+        let _lock = focusflow_core::paths::test_app_dir_lock();
+        let _dir = focusflow_core::paths::test_app_dir("clip_page_keep_by_id");
+        focusflow_core::clipboard::init_db().unwrap();
+        let t = focusflow_core::clipboard::now_ms();
+        for (i, text) in ["first", "second", "third"].iter().enumerate() {
+            focusflow_core::clipboard::ingest(text, "test.exe", t + i as i64).unwrap();
+        }
+
+        let mut page = ClipPage::new();
+        page.reload(ReloadIntent::ResetTop, 8);
+        assert_eq!(page.items[0].content, "third", "最新的在最上面");
+        page.sel = 1;
+        let before = page.selected().unwrap().content.clone();
+        assert_eq!(before, "second");
+
+        focusflow_core::clipboard::ingest("fourth", "test.exe", t + 9_000).unwrap();
+        page.reload(ReloadIntent::Keep, 8);
+
+        assert_eq!(
+            page.selected().map(|r| r.content.clone()).as_deref(),
+            Some(before.as_str()),
+            "新复制插到顶部后下标整体后移，光标要跟着 id 走：Enter 不能粘到别的条目"
+        );
+        assert_eq!(page.scroll, 0, "本来在顶部：新条目应当直接可见");
     }
 }

@@ -293,7 +293,7 @@ mod tests {
         fn the_clipboard_page_asks_core_and_reloads_on_entry() {
             let f = flat(&prod());
             assert!(
-                f.contains("self.clip_page.reload()"),
+                f.contains("self.clip_page.reload("),
                 "进剪贴板页没有重查：翻到的会是上一次离开时的旧列表"
             );
             assert!(

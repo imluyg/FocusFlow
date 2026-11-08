@@ -49,6 +49,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use focusflow_core::clipboard::{self, ClipItem, ClipKind, ClipStats, Snippet, Transform};
 
+use crate::clip_list::{self, ReloadIntent, Viewport};
+
 const EDIT_ID: usize = 1;
 /// `EM_SETCUEBANNER`：EDIT 空的时候显示提示字。
 const EM_SETCUEBANNER: u32 = 0x1501;
@@ -218,9 +220,18 @@ impl State {
         }
     }
 
-    fn reload_history(&mut self) {
+    fn reload_history(&mut self, hwnd: HWND, intent: ReloadIntent) {
+        let visible = self.visible_rows(hwnd);
+        let prev_id = self.history.get(self.sel).map(|r| r.id);
+        let prev = Viewport {
+            sel: self.sel,
+            scroll: self.scroll,
+        };
+        let was_at_top = self.scroll == 0;
+        let old = std::mem::take(&mut self.history);
         match load_history(&self.query) {
-            Ok(rows) => {
+            Ok(mut rows) => {
+                inherit_missing(&old, &mut rows);
                 self.history = rows;
                 self.status = None;
             }
@@ -229,18 +240,41 @@ impl State {
                 self.status = Some(e);
             }
         }
-        self.clamp_selection();
+        if self.mode == Mode::History {
+            let ids: Vec<i64> = self.history.iter().map(|r| r.id).collect();
+            let vp = clip_list::settle(&ids, prev_id, prev, was_at_top, visible, intent);
+            self.sel = vp.sel;
+            self.scroll = vp.scroll;
+        }
     }
 
-    fn reload_all(&mut self) {
-        self.reload_history();
+    fn reload_all(&mut self, hwnd: HWND, intent: ReloadIntent) {
+        self.reload_history(hwnd, intent);
+        let visible = self.visible_rows(hwnd);
+        let prev_id = self.snippets.get(self.sel).map(|r| r.id);
+        let prev = Viewport {
+            sel: self.sel,
+            scroll: self.scroll,
+        };
+        let was_at_top = self.scroll == 0;
+        let old = std::mem::take(&mut self.snippets);
         match clipboard::snippets() {
-            Ok(items) => self.snippets = items.into_iter().map(row_from_snippet).collect(),
+            Ok(items) => {
+                let mut rows: Vec<Row> = items.into_iter().map(row_from_snippet).collect();
+                inherit_missing(&old, &mut rows);
+                self.snippets = rows;
+            }
             Err(e) => {
                 if self.status.is_none() {
                     self.status = Some(format!("读片段失败：{e}"));
                 }
             }
+        }
+        if self.mode == Mode::Snippets {
+            let ids: Vec<i64> = self.snippets.iter().map(|r| r.id).collect();
+            let vp = clip_list::settle(&ids, prev_id, prev, was_at_top, visible, intent);
+            self.sel = vp.sel;
+            self.scroll = vp.scroll;
         }
         self.stats = clipboard::stats(7).ok();
         self.clamp_selection();
@@ -321,13 +355,13 @@ impl State {
         }
     }
 
-    fn toggle_pin(&mut self) {
+    fn toggle_pin(&mut self, hwnd: HWND) {
         let Some(row) = self.selected().cloned() else {
             return;
         };
         match clipboard::set_pinned(row.id, !row.pinned) {
             Ok(true) => {
-                self.reload_all();
+                self.reload_all(hwnd, ReloadIntent::Keep);
                 self.status = Some(if row.pinned {
                     "已取消固定".to_string()
                 } else {
@@ -339,7 +373,7 @@ impl State {
         }
     }
 
-    fn delete_selected(&mut self) {
+    fn delete_selected(&mut self, hwnd: HWND) {
         let Some(row) = self.selected().cloned() else {
             return;
         };
@@ -349,7 +383,7 @@ impl State {
         };
         match result {
             Ok(true) => {
-                self.reload_all();
+                self.reload_all(hwnd, ReloadIntent::Keep);
                 self.status = Some("已删除".to_string());
             }
             Ok(false) => self.status = Some("这一条已经不在了".to_string()),
@@ -357,7 +391,7 @@ impl State {
         }
     }
 
-    fn save_snippet(&mut self) {
+    fn save_snippet(&mut self, hwnd: HWND) {
         let Some(row) = self.selected().cloned() else {
             return;
         };
@@ -367,7 +401,7 @@ impl State {
         }
         match clipboard::add_snippet("", &row.content) {
             Ok(_) => {
-                self.reload_all();
+                self.reload_all(hwnd, ReloadIntent::Keep);
                 self.status = Some("已存为片段（Tab 切到片段列表）".to_string());
             }
             Err(e) => self.status = Some(format!("存为片段失败：{e}")),
@@ -442,6 +476,18 @@ fn row_from_snippet(s: Snippet) -> Row {
         image_path: None,
         file_paths: Vec::new(),
         missing_files: None,
+    }
+}
+
+/// 重建 Row 时按 id 继承上一轮的失效检查结果。新复制每来一条都会重查整份列表，
+/// 不继承的话可视的文件行每次都要重新 stat 一遍 —— 那正是"每复制一下就卡"的来源。
+fn inherit_missing(old: &[Row], rows: &mut [Row]) {
+    let mut known: std::collections::HashMap<i64, Option<usize>> =
+        old.iter().map(|r| (r.id, r.missing_files)).collect();
+    for row in rows.iter_mut() {
+        if let Some(v) = known.remove(&row.id) {
+            row.missing_files = v;
+        }
     }
 }
 
@@ -742,7 +788,7 @@ fn create_and_show() -> Result<(), String> {
         st.prev_fg = unsafe { GetForegroundWindow() };
         st.activated = false;
         st.activate_tries = 2;
-        st.reload_all();
+        st.reload_all(hwnd, ReloadIntent::ResetTop);
         if let Some(msg) = take_restore_issue() {
             st.status = Some(msg);
         }
@@ -780,7 +826,7 @@ fn reveal(hwnd: HWND) {
         st.prev_fg = prev_fg;
         st.activated = false;
         st.activate_tries = 2;
-        st.reload_all();
+        st.reload_all(hwnd, ReloadIntent::ResetTop);
         if let Some(msg) = take_restore_issue() {
             st.status = Some(msg);
         }
@@ -1101,7 +1147,7 @@ pub fn notify_changed() {
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
         return;
     }
-    with_state(hwnd, |st| st.reload_all());
+    with_state(hwnd, |st| st.reload_all(hwnd, ReloadIntent::Keep));
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
@@ -1350,7 +1396,7 @@ unsafe extern "system" fn edit_proc(
         }
         // Ctrl+P 固定：`handle_key` 不接修饰键，单独判一次。
         if ctrl && vk == 0x50 {
-            with_state(parent, |st| st.toggle_pin());
+            with_state(parent, |st| st.toggle_pin(parent));
             let _ = InvalidateRect(Some(parent), None, false);
             return LRESULT(0);
         }
@@ -1449,7 +1495,7 @@ fn handle_key(hwnd: HWND, vk: u32) -> bool {
             true
         }
         x if x == VK_DELETE.0 as u32 => {
-            with_state(hwnd, |st| st.delete_selected());
+            with_state(hwnd, |st| st.delete_selected(hwnd));
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
@@ -1540,7 +1586,7 @@ fn on_query_changed(hwnd: HWND) {
         (*st).query = text;
         (*st).sel = 0;
         (*st).scroll = 0;
-        (*st).reload_history();
+        (*st).reload_history(hwnd, ReloadIntent::ResetTop);
         crate::tracing_note(&format!(
             "剪贴板搜索 clip_search qlen={} n={}",
             (*st).query.chars().count(),
@@ -2044,13 +2090,13 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
             finish_copy(hwnd, copied);
         }
         MENU_PIN => {
-            with_state(hwnd, |st| st.toggle_pin());
+            with_state(hwnd, |st| st.toggle_pin(hwnd));
         }
         MENU_DELETE => {
-            with_state(hwnd, |st| st.delete_selected());
+            with_state(hwnd, |st| st.delete_selected(hwnd));
         }
         MENU_SNIPPET => {
-            with_state(hwnd, |st| st.save_snippet());
+            with_state(hwnd, |st| st.save_snippet(hwnd));
         }
         MENU_STATS => {
             with_state(hwnd, |st| {
@@ -2089,7 +2135,7 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
                 match clipboard::clear_unpinned() {
                     Ok(n) => {
                         with_state(hwnd, |st| {
-                            st.reload_all();
+                            st.reload_all(hwnd, ReloadIntent::Keep);
                             st.status = Some(format!("已清空 {n} 条未固定记录"));
                         });
                     }
@@ -2275,5 +2321,49 @@ mod tests {
             "［图］1 个文件：a.txt"
         );
         assert_eq!(row_label(&label_row(ClipKind::Text, 0)), "1 个文件：a.txt");
+    }
+
+    #[test]
+    fn a_new_copy_does_not_move_the_popup_selection() {
+        let _lock = focusflow_core::paths::test_app_dir_lock();
+        let _dir = focusflow_core::paths::test_app_dir("clip_popup_keep_by_id");
+        focusflow_core::clipboard::init_db().unwrap();
+        let t = focusflow_core::clipboard::now_ms();
+        for (i, text) in ["alpha", "beta", "gamma"].iter().enumerate() {
+            focusflow_core::clipboard::ingest(text, "test.exe", t + i as i64).unwrap();
+        }
+
+        let rows = load_history("").unwrap();
+        let sel = 1;
+        let prev_id = rows[sel].id;
+        let prev = Viewport { sel, scroll: 0 };
+
+        // 新复制插到顶部：`reload_history` 里做的正是"重查 + 按 id 结算"这两步。
+        focusflow_core::clipboard::ingest("delta", "test.exe", t + 9_000).unwrap();
+        let mut fresh = load_history("").unwrap();
+        inherit_missing(&rows, &mut fresh);
+        let ids: Vec<i64> = fresh.iter().map(|r| r.id).collect();
+        let vp = clip_list::settle(&ids, Some(prev_id), prev, true, 12, ReloadIntent::Keep);
+
+        assert_eq!(
+            fresh[vp.sel].id, prev_id,
+            "列表顶部插进新条目后，弹窗的 Enter 必须还落在原来那条上"
+        );
+        assert_eq!(vp.scroll, 0);
+    }
+
+    #[test]
+    fn missing_file_counts_survive_a_row_rebuild() {
+        let mut old = vec![label_row(ClipKind::File, 2)];
+        old[0].id = 7;
+        let mut fresh = vec![label_row(ClipKind::File, 0)];
+        fresh[0].id = 7;
+        fresh[0].missing_files = None;
+        inherit_missing(&old, &mut fresh);
+        assert_eq!(
+            fresh[0].missing_files,
+            Some(2),
+            "重查整份历史不该把可视文件的失效结果清掉（否则每次复制都要重新 stat）"
+        );
     }
 }

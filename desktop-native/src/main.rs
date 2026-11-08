@@ -7,6 +7,7 @@
 //!
 //! 滚动容器、六个视图、截图覆盖层与贴图都已做完；剩下的缺口清单在
 //! `docs/handoff-native-migration.md`。
+mod clip_list;
 mod clipboard_page;
 mod clipboard_popup;
 mod collect;
@@ -2546,7 +2547,8 @@ impl App {
         }
         if i == 7 {
             tracing_note("clip_page_open");
-            self.clip_page.reload();
+            self.clip_page.reset_probes();
+            self.reload_clip_page(hwnd, clip_list::ReloadIntent::ResetTop);
             self.place_clip_search_edit(hwnd);
         } else {
             self.hide_clip_search_edit();
@@ -2572,7 +2574,7 @@ impl App {
         if let Some(i) = clipboard_page::tab_at(&lay, x, y) {
             let mode = clipboard_page::MODES[i];
             self.clip_page.set_mode(mode);
-            self.clip_page.reload();
+            self.reload_clip_page(hwnd, clip_list::ReloadIntent::ResetTop);
             if mode == clipboard_page::Mode::Stats {
                 self.hide_clip_search_edit();
             } else {
@@ -2673,8 +2675,7 @@ impl App {
             }
             Err(e) => self.clip_page.status = Some(format!("更新固定状态失败：{e}")),
         }
-        self.clip_page.reload();
-        self.refresh_clip_page(hwnd);
+        self.reload_clip_page(hwnd, clip_list::ReloadIntent::Keep);
     }
 
     fn delete_clip_selected(&mut self, hwnd: HWND) {
@@ -2732,8 +2733,7 @@ impl App {
             }
             Err(e) => self.clip_page.status = Some(format!("删除失败：{e}")),
         }
-        self.clip_page.reload();
-        self.refresh_clip_page(hwnd);
+        self.reload_clip_page(hwnd, clip_list::ReloadIntent::Keep);
     }
 
     fn save_clip_snippet(&mut self, hwnd: HWND) {
@@ -2751,8 +2751,7 @@ impl App {
             Ok(_) => self.clip_page.status = Some("已存为片段（Tab 切到片段）".to_string()),
             Err(e) => self.clip_page.status = Some(format!("存为片段失败：{e}")),
         }
-        self.clip_page.reload();
-        self.refresh_clip_page(hwnd);
+        self.reload_clip_page(hwnd, clip_list::ReloadIntent::Keep);
     }
 
     fn clear_clip_history(&mut self, hwnd: HWND) {
@@ -2772,8 +2771,7 @@ impl App {
             Err(e) => self.clip_page.status = Some(format!("清空失败：{e}")),
         }
         self.clip_page.clear_checked();
-        self.clip_page.reload();
-        self.refresh_clip_page(hwnd);
+        self.reload_clip_page(hwnd, clip_list::ReloadIntent::Keep);
     }
 
     /// 片段改名：复用行内那套顶层 EDIT，落点按当前列表行算。
@@ -2807,6 +2805,21 @@ impl App {
         self.edit_row = Some(row);
     }
 
+    /// 剪贴板页统一的重查入口：先按当前窗口算可见行数，再让页面按 id 结算选中/视口，
+    /// 最后把视口里那几行的失效检查补上并重画。
+    fn reload_clip_page(&mut self, hwnd: HWND, intent: clip_list::ReloadIntent) {
+        let (w, h) = self.client_dip(hwnd);
+        let rows = clipboard_page::layout_for(w, h).rows;
+        self.clip_page.reload(intent, rows);
+        let fresh = self.clip_page.warm_missing(rows);
+        if fresh > 0 {
+            tracing_note(&format!("clip_page_missing_files n={fresh}"));
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
     fn refresh_clip_page(&mut self, hwnd: HWND) {
         let (w, h) = self.client_dip(hwnd);
         let lay = clipboard_page::layout_for(w, h);
@@ -2833,7 +2846,7 @@ impl App {
         self.clip_page.scroll = 0;
         // 片段页筛的是片段列表，得走整份 reload；历史页只重查历史，别连带重算片段与统计。
         if self.clip_page.mode == clipboard_page::Mode::Snippets {
-            self.clip_page.reload();
+            self.reload_clip_page(hwnd, clip_list::ReloadIntent::ResetTop);
         } else {
             self.clip_page.reload_items();
         }
@@ -2930,7 +2943,7 @@ impl App {
         }
         self.clip_page.sel = 0;
         self.clip_page.scroll = 0;
-        self.clip_page.reload();
+        self.reload_clip_page(hwnd, clip_list::ReloadIntent::ResetTop);
         tracing_note(&format!(
             "剪贴板搜索提交 commit={commit} qlen={} edit={}",
             self.clip_page.filter.chars().count(),
@@ -2957,7 +2970,7 @@ impl App {
                 clipboard_page::Mode::Stats => clipboard_page::Mode::History,
             };
             self.clip_page.set_mode(next);
-            self.clip_page.reload();
+            self.reload_clip_page(hwnd, clip_list::ReloadIntent::ResetTop);
             if next == clipboard_page::Mode::Stats {
                 self.hide_clip_search_edit();
             } else {
@@ -4610,13 +4623,7 @@ impl App {
             // 弹窗开着就标脏，下一帧重查；没开时这一声只是一次原子读。
             clipboard_popup::notify_changed();
             if self.view == 7 {
-                self.clip_page.reload();
-                let (w, h) = self.client_dip(hwnd);
-                self.clip_page
-                    .clamp_selection(clipboard_page::layout_for(w, h).rows);
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
+                self.reload_clip_page(hwnd, clip_list::ReloadIntent::Keep);
             }
         }
     }
@@ -5540,7 +5547,7 @@ impl App {
                     EditTarget::SnippetName(id) => {
                         match focusflow_core::clipboard::rename_snippet(id, &text) {
                             Ok(true) => {
-                                self.clip_page.reload();
+                                self.reload_clip_page(hwnd, clip_list::ReloadIntent::Keep);
                                 self.clip_page.status = Some("片段已重命名".to_string());
                             }
                             Ok(false) => {
