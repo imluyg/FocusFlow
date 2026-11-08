@@ -72,6 +72,13 @@ pub fn pause_for(seconds: i64) {
     }
 }
 
+/// 取消本次运行里的临时暂停（托盘/弹窗里的「恢复记录」）。
+///
+/// 暂停只有 15/60 两档时，点错一次就得等满或重启；这条是那条路的反向出口。
+pub fn resume_now() {
+    PAUSED_UNTIL_MS.store(0, Ordering::Release);
+}
+
 /// 暂停到什么时候（Unix ms）；0 = 没暂停（过期也当没暂停）。
 pub fn pause_until_ms() -> i64 {
     let until = PAUSED_UNTIL_MS.load(Ordering::Acquire);
@@ -2778,6 +2785,12 @@ mod tests {
         assert!(pause_until_ms() > now_ms());
         PAUSED_UNTIL_MS.store(0, Ordering::Release);
         assert!(!is_paused(), "清掉之后立刻恢复记录");
+        assert_eq!(pause_until_ms(), 0);
+        // 「恢复记录」那条出口：暂停之后再点它，必须立刻回到未暂停。
+        pause_for(3600);
+        assert!(is_paused());
+        resume_now();
+        assert!(!is_paused(), "恢复记录不能等截止时间到");
         assert_eq!(pause_until_ms(), 0);
     }
 

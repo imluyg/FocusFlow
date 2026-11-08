@@ -11422,6 +11422,9 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
                 );
             } else {
                 let visible = lay.rows.min(rows.len().saturating_sub(clip.scroll));
+                // 失效检查只为画出来的行做（见 `ClipPage::missing_files_for`）；这里
+                // 数一下"这次现问了磁盘且真有失效"的行，验收脚本靠这行日志判屏上标了。
+                let mut fresh_missing_rows = 0usize;
                 for i in 0..visible {
                     let idx = clip.scroll + i;
                     let Some(row) = rows.get(idx) else { break };
@@ -11476,7 +11479,11 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
                             &p.fmt.caption,
                             &p.br.muted,
                         );
-                        let preview = clipboard_page::row_preview(row);
+                        let (missing, fresh) = clip.missing_files_for(row);
+                        if fresh && missing > 0 {
+                            fresh_missing_rows += 1;
+                        }
+                        let preview = clipboard_page::row_preview(row, missing);
                         let preview = p.clip(
                             &preview,
                             &p.fmt.body,
@@ -11522,6 +11529,9 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
                             &p.br.muted,
                         );
                     }
+                }
+                if fresh_missing_rows > 0 {
+                    crate::tracing_note(&format!("clip_page_missing_files n={fresh_missing_rows}"));
                 }
             }
         }
@@ -13450,6 +13460,8 @@ fn make_tray(
         MenuItem::with_id("clipboard_pause_15", "暂停记录 15 分钟", true, None);
     let clipboard_pause_60 =
         MenuItem::with_id("clipboard_pause_60", "暂停记录 60 分钟", true, None);
+    // 暂停只有两档入口时，点错一次只能等满或重启；这一项是它的反向出口。
+    let clipboard_resume = MenuItem::with_id("clipboard_resume", "恢复剪贴板记录", true, None);
     let clipboard_item = CheckMenuItem::with_id(
         "clipboard_pause",
         "记录剪贴板",
@@ -13470,6 +13482,7 @@ fn make_tray(
         &clipboard_history,
         &clipboard_pause_15,
         &clipboard_pause_60,
+        &clipboard_resume,
         &clipboard_item,
         &pause,
         &sep,
@@ -13584,6 +13597,29 @@ fn pause_clipboard(hwnd: HWND, minutes: i64) {
     tracing_note(&msg);
     if let Some(app) = unsafe { app_ptr(hwnd) } {
         app.status = Some(msg);
+        if let Some(t) = &app.tray {
+            let today = app.snap.lock().map(|s| s.today).unwrap_or(0);
+            let _ = t.set_tooltip(Some(tray_tooltip(today)));
+        }
+    }
+    clipboard_popup::notify_changed();
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
+/// 与 `pause_clipboard` 成对：点「恢复剪贴板记录」立刻回到记录状态。
+fn resume_clipboard(hwnd: HWND) {
+    let was_paused = focusflow_core::clipboard::is_paused();
+    focusflow_core::clipboard::resume_now();
+    let msg = if was_paused {
+        "剪贴板记录已恢复"
+    } else {
+        "剪贴板记录本来就没暂停"
+    };
+    tracing_note(msg);
+    if let Some(app) = unsafe { app_ptr(hwnd) } {
+        app.status = Some(msg.to_string());
         if let Some(t) = &app.tray {
             let today = app.snap.lock().map(|s| s.today).unwrap_or(0);
             let _ = t.set_tooltip(Some(tray_tooltip(today)));
@@ -15740,6 +15776,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     }
                     "clipboard_pause_60" => {
                         pause_clipboard(hwnd, 60);
+                    }
+                    "clipboard_resume" => {
+                        resume_clipboard(hwnd);
                     }
                     "pause" => {
                         if let Some(app) = unsafe { app_ptr(hwnd) } {

@@ -68,7 +68,9 @@ fn load_config(config: &FocusFlowConfig) -> (bool, Vec<String>) {
 pub(crate) fn parse_exclude(raw: &str) -> (Vec<String>, Vec<String>) {
     let mut names = Vec::new();
     let mut widened = Vec::new();
-    for item in raw.split(',').map(|s| s.trim()) {
+    // 分隔符把中文标点也算上：只认 ASCII 逗号时，`1Password，Bitwarden` 会变成
+    // 一个永远匹配不上的名字 —— 隐私保险丝静默失效，而屏上看着像是配好了。
+    for item in raw.split([',', '，', ';', '；', '、']).map(str::trim) {
         if item.is_empty() {
             continue;
         }
@@ -522,6 +524,32 @@ mod tests {
         assert!(parse_exclude(" , , ").0.is_empty());
         let ex = parse_exclude("  KEEPASSXC.EXE  ").0;
         assert!(!is_recordable("keepassxc.exe", &ex));
+    }
+
+    /// 中文标点也要当分隔符：只认 ASCII 逗号时，一条中英混排的清单会变成
+    /// 一个永远匹配不上的名字 —— 保险丝看着配好了、实际什么都没拦。
+    #[test]
+    fn exclude_entries_accept_chinese_separators() {
+        let (ex, widened) = parse_exclude("1Password，Bitwarden；KeePass、obsidian");
+        assert_eq!(
+            ex,
+            vec![
+                "1password.exe".to_string(),
+                "bitwarden.exe".to_string(),
+                "keepass.exe".to_string(),
+                "obsidian.exe".to_string()
+            ],
+            "中文逗号/分号/顿号都要切开"
+        );
+        assert_eq!(widened.len(), 4, "四条都缺后缀，都要进补全报告");
+        for name in [
+            "1Password.exe",
+            "Bitwarden.exe",
+            "KeePass.exe",
+            "obsidian.exe",
+        ] {
+            assert!(!is_recordable(name, &ex), "{name} 应当被拦住");
+        }
     }
 
     /// 少写 `.exe` 曾经是**静默**不生效（密码管理器全程被记录、零提示）：

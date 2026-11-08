@@ -80,8 +80,6 @@ pub struct Row {
     pub image_path: Option<String>,
     pub thumb_path: Option<String>,
     pub file_paths: Vec<String>,
-    /// 文件条目里已经不在磁盘上的路径数（显示时明说，别让人以为还能粘）。
-    pub missing_files: usize,
 }
 
 /// 行被点了一下时该做什么。抽成纯函数：`Shift` 与多选两个开关的组合各有一条用例。
@@ -120,11 +118,6 @@ pub enum PinPlan {
 }
 
 fn row_from_item(item: ClipItem) -> Row {
-    let missing_files = if item.kind == ClipKind::File {
-        clipboard::split_alive_paths(&item.file_paths).1.len()
-    } else {
-        0
-    };
     Row {
         id: item.id,
         content: item.content,
@@ -140,7 +133,6 @@ fn row_from_item(item: ClipItem) -> Row {
         image_path: item.image_path,
         thumb_path: item.thumb_path,
         file_paths: item.file_paths,
-        missing_files,
     }
 }
 
@@ -160,7 +152,6 @@ fn row_from_snippet(s: Snippet) -> Row {
         image_path: None,
         thumb_path: None,
         file_paths: Vec::new(),
-        missing_files: 0,
     }
 }
 
@@ -173,11 +164,12 @@ pub fn kind_badge(kind: ClipKind) -> &'static str {
     }
 }
 
-/// 行内那句话：文件条目把"有几个已经失效"写在后面。
-pub fn row_preview(row: &Row) -> String {
+/// 行内那句话：文件条目把"有几个已经失效"写在后面。失效数由调用方只对**要画出来的**
+/// 行现问（`ClipPage::missing_files_for`），不在建行时对 500 条记录逐条 stat。
+pub fn row_preview(row: &Row, missing_files: usize) -> String {
     let text = preview_text(&row.content);
-    if row.kind == ClipKind::File && row.missing_files > 0 {
-        format!("{text}（{} 个已失效）", row.missing_files)
+    if row.kind == ClipKind::File && missing_files > 0 {
+        format!("{text}（{missing_files} 个已失效）")
     } else {
         text
     }
@@ -223,6 +215,10 @@ pub struct ClipPage {
     /// 缓存 64 份、按先来先出，内存上界约 64 × 160×160×4 ≈ 6 MB。
     thumbs: std::cell::RefCell<std::collections::HashMap<String, Option<std::rc::Rc<Thumb>>>>,
     thumb_order: std::cell::RefCell<std::collections::VecDeque<String>>,
+    /// 文件失效数缓存（条目 id → 失效路径数）。`Path::exists` 是磁盘 IO：一次列表重查
+    /// 就对最多 500 条文件记录逐条 stat，会让实时筛选的每一键都卡一下 —— 只问**要画出来的**
+    /// 那几行（与弹窗同一条口径）。
+    missing: std::cell::RefCell<std::collections::HashMap<i64, usize>>,
 }
 
 impl Default for ClipPage {
@@ -247,6 +243,7 @@ impl ClipPage {
             status: None,
             thumbs: std::cell::RefCell::new(std::collections::HashMap::new()),
             thumb_order: std::cell::RefCell::new(std::collections::VecDeque::new()),
+            missing: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -282,6 +279,22 @@ impl ClipPage {
         }
     }
 
+    /// 这一行的失效路径数；`true` = 这次真的问了磁盘（调用方据此只记一次日志）。
+    ///
+    /// 只对将要画出来的行调用：500 条历史 × 每条最多 20 个路径，一次筛选上万次 stat
+    /// 会把实时搜索卡住。
+    pub fn missing_files_for(&self, row: &Row) -> (usize, bool) {
+        if row.kind != ClipKind::File {
+            return (0, false);
+        }
+        if let Some(n) = self.missing.borrow().get(&row.id).copied() {
+            return (n, false);
+        }
+        let n = clipboard::split_alive_paths(&row.file_paths).1.len();
+        self.missing.borrow_mut().insert(row.id, n);
+        (n, true)
+    }
+
     pub fn selected(&self) -> Option<&Row> {
         self.rows().get(self.sel)
     }
@@ -298,12 +311,6 @@ impl ClipPage {
         match loaded {
             Ok(items) => {
                 self.items = items.into_iter().map(row_from_item).collect();
-                // 失效文件的条数进日志（验收脚本靠它判"界面上确实标出来了"；
-                // 屏上那句话由 `row_preview` 拼，同源）。
-                let missing = self.items.iter().filter(|r| r.missing_files > 0).count();
-                if missing > 0 {
-                    crate::tracing_note(&format!("clip_page_missing_files n={missing}"));
-                }
                 clear_load_error(&mut self.status, HISTORY_LOAD_ERROR);
             }
             Err(e) => {
@@ -315,6 +322,9 @@ impl ClipPage {
 
     pub fn reload(&mut self) {
         let filter = self.filter.trim().to_string();
+        // 盘上可能变了的那几个时机（进页/换模式/新复制进来）才清失效缓存；实时筛选的
+        // 每一键走 `reload_items`，不该重新 stat 一遍。
+        self.missing.borrow_mut().clear();
         self.reload_items();
         let mut snippets: Vec<Row> = match clipboard::snippets() {
             Ok(v) => {
@@ -583,7 +593,6 @@ mod tests {
             image_path: None,
             thumb_path: None,
             file_paths: Vec::new(),
-            missing_files: 0,
         }
     }
 
@@ -591,13 +600,65 @@ mod tests {
     fn kind_labels_and_missing_file_note() {
         let mut row = test_row(1, "2 个文件：a.txt, b.txt");
         row.kind = ClipKind::File;
-        row.missing_files = 1;
-        assert_eq!(row_preview(&row), "2 个文件：a.txt, b.txt（1 个已失效）");
-        row.missing_files = 0;
-        assert_eq!(row_preview(&row), "2 个文件：a.txt, b.txt");
+        assert_eq!(row_preview(&row, 1), "2 个文件：a.txt, b.txt（1 个已失效）");
+        assert_eq!(row_preview(&row, 0), "2 个文件：a.txt, b.txt");
         assert_eq!(kind_badge(ClipKind::Image), "图");
         assert_eq!(kind_badge(ClipKind::File), "件");
         assert_eq!(kind_badge(ClipKind::Text), "");
+    }
+
+    #[test]
+    fn missing_file_check_is_lazy_and_cached_until_reload() {
+        let _lock = focusflow_core::paths::test_app_dir_lock();
+        let dir = focusflow_core::paths::test_app_dir("clip_page_missing_lazy");
+        focusflow_core::clipboard::init_db().unwrap();
+        let file = dir.path().join("gone.txt");
+        std::fs::write(&file, b"x").unwrap();
+        focusflow_core::clipboard::ingest_files(
+            &[file.to_string_lossy().to_string()],
+            "explorer.exe",
+            focusflow_core::clipboard::now_ms(),
+        )
+        .unwrap();
+        std::fs::remove_file(&file).unwrap();
+
+        let mut page = ClipPage::new();
+        page.reload();
+        let row = page
+            .items
+            .iter()
+            .find(|r| r.kind == ClipKind::File)
+            .cloned()
+            .expect("文件条目应当读回来");
+
+        assert_eq!(
+            page.missing_files_for(&row),
+            (1, true),
+            "第一次问要真的看盘：文件已经删了"
+        );
+        assert_eq!(
+            page.missing_files_for(&row),
+            (1, false),
+            "同一行第二次问走缓存，不再碰磁盘"
+        );
+        assert_eq!(
+            page.missing_files_for(&test_row(9, "文本")),
+            (0, false),
+            "文本行不做磁盘检查"
+        );
+
+        page.reload();
+        let row = page
+            .items
+            .iter()
+            .find(|r| r.kind == ClipKind::File)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            page.missing_files_for(&row),
+            (1, true),
+            "reload 是'盘上可能变了'的时刻，要重新问一次"
+        );
     }
 
     #[test]

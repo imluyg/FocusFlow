@@ -62,6 +62,7 @@ const MENU_STATS: u32 = 5;
 const MENU_CLEAR: u32 = 6;
 const MENU_PAUSE_15: u32 = 7;
 const MENU_PAUSE_60: u32 = 8;
+const MENU_RESUME: u32 = 9;
 const MENU_TRANSFORM_BASE: u32 = 100;
 /// 抢前台的重试定时器（只给弹窗自己用，和主窗的 100ms 心跳不冲突）。
 const ACTIVATE_TIMER: usize = 0x0C1A;
@@ -2007,6 +2008,15 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
             MENU_PAUSE_60 as usize,
             w!("暂停记录 60 分钟"),
         );
+        // 暂停着的时候才出现：这就是"点错了怎么回去"的唯一入口。
+        if clipboard::is_paused() {
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                MENU_RESUME as usize,
+                w!("恢复记录（立即）"),
+            );
+        }
         if mode == Mode::History {
             let _ = AppendMenuW(
                 menu,
@@ -2061,6 +2071,10 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
             with_state(hwnd, |st| {
                 st.status = Some("记录已暂停 60 分钟".to_string())
             });
+        }
+        MENU_RESUME => {
+            clipboard::resume_now();
+            with_state(hwnd, |st| st.status = Some("记录已恢复".to_string()));
         }
         MENU_CLEAR => {
             let answer = unsafe {
