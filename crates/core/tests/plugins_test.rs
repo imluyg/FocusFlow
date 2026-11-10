@@ -909,6 +909,104 @@ mod tests {
         );
     }
 
+    /// 记账编辑失败时，原因必须出现在**弹窗正文**里。
+    ///
+    /// 编辑弹窗失败后会自己重新打开（`editing_id` 不清、草稿还在），而原因从前只写
+    /// `list_msg` —— 那是页面上的标签，被整屏遮罩盖住，用户只看到"点保存后弹窗又弹回来"。
+    /// 这条走真 Lua：先撞本地校验，再撞宿主日期校验，最后确认改字段/取消都会清掉旧原因。
+    #[test]
+    fn accounting_edit_failure_reason_is_visible_inside_the_modal() {
+        use focusflow_core::accounting;
+        use focusflow_core::plugins::Widget;
+
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("acct_edit_err", "accounting_plugin.lua");
+        accounting::init_db().expect("记账库应能建起来");
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let id = accounting::add_expense("支出", "原名称", None, &today, 10.0, None, None, None);
+        assert!(id > 0, "夹具：记录应能写入");
+
+        let edit_modal = |manager: &PluginManager| -> (bool, String, String) {
+            view_of(manager, &name)
+                .into_iter()
+                .find_map(|w| match w {
+                    Widget::ModalForm {
+                        id,
+                        open,
+                        title,
+                        content,
+                        ..
+                    } if id == "edit_modal" => Some((open, title, content)),
+                    _ => None,
+                })
+                .expect("视图里应有编辑弹窗")
+        };
+
+        manager
+            .plugin_action(&name, &format!("edit_{id}"))
+            .expect("打开编辑弹窗");
+        let (open, title, content) = edit_modal(&manager);
+        assert!(open, "编辑动作应把弹窗打开");
+        assert!(
+            content.is_empty(),
+            "刚开始编辑时不该挂着旧原因: {content:?}"
+        );
+        assert_eq!(title, "修改记录");
+
+        // 本地校验失败：名称清空。
+        manager
+            .plugin_set_field(&name, "d_item", "")
+            .expect("清空名称");
+        manager
+            .plugin_action(&name, "save_edit")
+            .expect("校验失败不该让动作本身报错");
+        let (open, title, content) = edit_modal(&manager);
+        assert!(open, "校验失败后弹窗必须留着改");
+        assert!(
+            content.contains("没保存") && content.contains("名称"),
+            "弹窗正文要说清为什么没保存，实际: {content:?}"
+        );
+        assert!(
+            title.contains("没保存"),
+            "标题也要让人一眼看到这次没成，实际: {title:?}"
+        );
+
+        // 改任一字段，旧原因就过期了。
+        manager
+            .plugin_set_field(&name, "d_item", "新名称")
+            .expect("改回合法名称");
+        manager.refresh_view(&name).expect("重新出图");
+        let (_, _, content) = edit_modal(&manager);
+        assert!(content.is_empty(), "改字段后旧原因还在: {content:?}");
+
+        // 宿主日期校验失败：原因同样要进弹窗。
+        manager
+            .plugin_set_field(&name, "d_date", "2026-02-31")
+            .expect("填一个不存在的日期");
+        manager
+            .plugin_action(&name, "save_edit")
+            .expect("宿主拒绝不该让动作本身报错");
+        let (open, _, content) = edit_modal(&manager);
+        assert!(open, "宿主拒绝后弹窗必须留着改");
+        assert!(
+            content.contains("没更新") && content.contains("日期"),
+            "宿主拒绝的原因要写进弹窗，实际: {content:?}"
+        );
+
+        // 取消：弹窗关闭、错误行清零。
+        manager
+            .plugin_action(&name, "cancel_edit")
+            .expect("取消编辑");
+        let (open, _, content) = edit_modal(&manager);
+        assert!(!open, "取消后弹窗要关");
+        assert!(content.is_empty(), "取消后错误行还在: {content:?}");
+        assert!(manager.unload_plugin(&name), "卸载要回收资源");
+        drop(tmp);
+    }
+
     // =====================================================================
     // 下面这组用例都跑在**独立临时目录**里：它们要真的写记账/番茄钟/定时任务的
     // 附属库，不能落在程序目录（上面那批只做加载+渲染，走 `common::isolated_app_dir`，
@@ -1966,6 +2064,24 @@ mod tests {
             open_modal_ids(&manager, &name).contains(&"edit_modal".to_string()),
             "被拒时弹窗要留着（草稿还在里面）"
         );
+        // 原因不只要在页面标签上（那会被弹窗遮住），还要在弹窗正文/标题里。
+        let modal = view_of(&manager, &name)
+            .into_iter()
+            .find(|w| matches!(w, Widget::ModalForm { id, .. } if id == "edit_modal"))
+            .expect("被拒后视图里还应有编辑弹窗");
+        match modal {
+            Widget::ModalForm { title, content, .. } => {
+                assert!(
+                    content.contains("更新失败") && content.contains("调度"),
+                    "弹窗正文要带被拒原因，实际: {content:?}"
+                );
+                assert!(
+                    title.contains("没保存"),
+                    "弹窗标题要标出这次没保存，实际: {title:?}"
+                );
+            }
+            _ => unreachable!(),
+        }
         assert_eq!(
             scheduler::get_all_tasks()
                 .iter()

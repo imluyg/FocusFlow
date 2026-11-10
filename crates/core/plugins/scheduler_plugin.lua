@@ -21,6 +21,9 @@ local ed_type = "daily"
 local ed_time = ""
 local ed_enabled = "1"
 local msg = nil
+-- 编辑弹窗自己的错误行：保存被拒时弹窗还开着，页面上的 `msg` 会被遮罩盖住。
+-- 改任一字段、成功、取消或重开编辑时清掉。
+local edit_msg = ""
 
 -- 「面板已关闭」由前端在关闭路径上发来（`ui/js/plugins.js` 的 closePlugin）：
 -- Lua 状态在面板关掉后仍然活着，不清就会把上一次的结果挂到重开之后。
@@ -50,6 +53,7 @@ function on_action(id)
     if id == PANEL_CLOSED then
         msg = nil
         edit_id = -1
+        edit_msg = ""
     elseif id == "refresh" then
         msg = nil
     elseif id == "add" then
@@ -99,10 +103,12 @@ function on_action(id)
             load_draft(target)
             edit_id = tid
             msg = nil
+            edit_msg = ""
         end
     elseif id == "cancel_edit" then
         -- 取消：只关弹窗，草稿留着下次编辑会重新装填
         edit_id = -1
+        edit_msg = ""
     elseif id == "save_edit" then
         if edit_id < 0 then return end
         -- 宿主给的是 (是否改成, 原因)，与「启用/禁用」「删除」同一形状：
@@ -115,9 +121,11 @@ function on_action(id)
                 .. _status(ed_enabled == "1") .. "）"
             -- 刻意不关弹窗以外的状态：草稿即下一次的真值
             edit_id = -1
+            edit_msg = ""
         else
             -- 被拒时**不关弹窗**：草稿还在，改完能立刻再保存
             msg = "更新失败：" .. ((why and #why > 0) and why or ("任务 #" .. tostring(edit_id) .. " 没改成"))
+            edit_msg = msg
         end
     elseif id:match("^del_") then
         local tid = tonumber(id:sub(5))
@@ -134,6 +142,8 @@ end
 
 -- 供宿主调用：编辑弹窗里的输入框回写
 function set_field(field, value)
+    -- 一改字段，上一轮"没保存"就不再代表当前这份草稿了。
+    if edit_id >= 0 and field:sub(1, 3) == "ed_" then edit_msg = "" end
     if field == "ed_name" then ed_name = value
     elseif field == "ed_target" then ed_target = value
     elseif field == "ed_args" then ed_args = value
@@ -233,11 +243,15 @@ function get_view()
         {
             type = "modal_form",
             id = "edit_modal",
-            title = edit_id >= 0 and ("编辑任务 #" .. tostring(edit_id)) or "编辑任务",
+            title = edit_id >= 0
+                and ("编辑任务 #" .. tostring(edit_id) .. (edit_msg ~= "" and "（没保存）" or ""))
+                or "编辑任务",
             submit = "save_edit",
             submit_text = "保存",
             cancel = "cancel_edit",
             open = edit_id >= 0,
+            -- 被拒时弹窗留着，原因必须写在弹窗里面；只写页面 `msg` 会被遮罩盖住。
+            content = edit_msg,
             fields = {
                 { kind = "text", field = "ed_name", label = "名称", value = ed_name },
                 { kind = "text", field = "ed_target", label = "目标程序", value = ed_target },

@@ -35,6 +35,9 @@ local result_text = ""
 -- `modalSubmit`），于是校验失败/写库失败的表现是"弹窗关了、列表里没这条"，
 -- 一个字都没有 —— 与定时任务那边已修的"被拒时必须说清原因"同一族。
 local list_msg = ""
+-- 编辑弹窗自己的错误行：失败时弹窗是**盖在页面上的**，只写 `list_msg` 等于把原因
+-- 藏在遮罩后面。成功、取消、重新打开编辑、或开始改任一字段时清掉。
+local edit_msg = ""
 local picker_open = false
 local profit_cat = ""
 
@@ -73,6 +76,7 @@ local function reset_transient_state()
     draft.category = ""; draft.subcategory = ""; draft.date = ""; draft.note = ""
     result_text = ""
     list_msg = ""
+    edit_msg = ""
     picker_open = false
     profit_cat = ""
     manage_open = false
@@ -301,6 +305,7 @@ function on_action(id)
         if draft.item == "" or amount <= 0 then
             -- 刻意不清 editing_id：弹窗带着原草稿重新开出来，改完就能再保存
             list_msg = "没保存：请填写名称，金额要大于 0（小数写 12.50 这种，别写 1,234）"
+            edit_msg = list_msg
             focusflow.log("请填写名称和有效金额")
             return
         end
@@ -312,6 +317,7 @@ function on_action(id)
         if ok then
             local updated = editing_id
             list_msg = "已更新记录 #" .. tostring(updated)
+            edit_msg = ""
             focusflow.log("已更新记录 #" .. tostring(updated))
             editing_id = nil
             -- 清空草稿，避免下次"添加记录"弹窗预填旧数据
@@ -341,6 +347,7 @@ function on_action(id)
             -- 库占用。宿主没说原因（旧宿主／nil）时才退回那句。
             local reason = why ~= "" and why or "写入失败（库被占用或记录已被删除）"
             list_msg = "没更新 #" .. tostring(editing_id) .. "：" .. reason
+            edit_msg = list_msg
             focusflow.log("记账没更新 #" .. tostring(editing_id) .. "：" .. reason)
         end
     elseif id:match("^edit_") then
@@ -357,6 +364,7 @@ function on_action(id)
             draft.date = rec["date"]
             draft.note = rec["note"]
             editing_id = rid
+            edit_msg = ""
         elseif why ~= "" then
             -- 读不出来时弹窗开不了（`editing_id` 仍是 nil），从前这一下就是"按了没反应"；
             -- 更糟的是草稿里躺着上一条的内容，下一次保存会改到别的记录上。
@@ -499,6 +507,7 @@ function on_action(id)
     elseif id == "cancel_edit" then
         -- 取消编辑：清空编辑状态（弹窗由前端关闭）
         editing_id = nil
+        edit_msg = ""
     elseif id == "cancel_profit" then
         -- 取消分类选择
         picker_open = false
@@ -653,6 +662,9 @@ end
 
 -- 文本输入更新（宿主调用）
 function set_field(field, value)
+    -- 一改字段，上一轮"没保存"就不再代表当前这份草稿了：从弹窗正文里撤掉，
+    -- 免得用户改完还看着旧原因以为没改上。
+    if editing_id ~= nil and field:sub(1, 2) == "d_" then edit_msg = "" end
     if field == "d_type" then draft.type = value
     elseif field == "d_item" then draft.item = value
     elseif field == "d_store" then draft.store = value
@@ -772,11 +784,14 @@ function get_view()
     add({
         type = "modal_form",
         id = "edit_modal",
-        title = "修改记录",
+        title = edit_msg ~= "" and "修改记录（没保存）" or "修改记录",
         submit = "save_edit",
         submit_text = "保存",
         cancel = "cancel_edit",
         open = editing_id ~= nil,
+        -- 失败时弹窗会留在屏上（`editing_id` 不清），原因必须写在弹窗**里面**：
+        -- 只写页面上的 `list_msg` 会被这一层遮罩盖住。
+        content = edit_msg,
         fields = form_fields,
     })
 
