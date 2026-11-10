@@ -73,7 +73,7 @@ use windows::Win32::System::Threading::CreateMutexW;
 // 匹配任意值的绑定，把后面的滚轮/右键/Esc/关窗分支全变成不可达。
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{
-    GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
+    GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -6244,6 +6244,9 @@ fn settings_geom(w: f32, h: f32) -> SettingsGeom {
     // 说明那一列最少 120 px 的宽度（真实下限 960 远在这条线右边）。
     let value_w = 150.0;
     let value_x = (w - 32.0 - value_w - 24.0).max(240.0 + value_w);
+    // 分类导航从 list_top 一直排到卡片底：矮窗口按可用高度压缩每格，否则最后两格
+    // 会落到卡片外面（这一栏没有滚动）。560 以上仍是原来的 44。
+    let cat_h = ((h - list_top - 16.0) / SETTINGS_CATS.len() as f32).clamp(28.0, 44.0);
     SettingsGeom {
         list_top,
         row_h,
@@ -6253,7 +6256,7 @@ fn settings_geom(w: f32, h: f32) -> SettingsGeom {
         nav_x: 28.0,
         nav_y: list_top,
         nav_w: 190.0,
-        cat_h: 44.0,
+        cat_h,
         body_left: 240.0,
     }
 }
@@ -7407,6 +7410,11 @@ const TITLEBAR_H: f32 = 44.0;
 /// 窗口按钮的宽高（DIP）。46 是 Windows 11 标题栏按钮的常见宽度。
 const WIN_BTN_W: f32 = 46.0;
 const WIN_BTN_H: f32 = 40.0;
+/// 主窗的用户可调下限（DIP）。高度从 640 降到 480：1366×768@125% 的工作区
+/// 只有约 582 DIP 高，旧下限 640 会让底部状态行永远在屏外。480 这一档由
+/// 看板紧凑档、分析页图表卡与插件详情的矮窗分支共同撑住。
+const MAIN_MIN_W: f32 = 960.0;
+const MAIN_MIN_H: f32 = 480.0;
 
 /// 右上角三颗窗口按钮：最小化 / 最大化-还原 / 关闭。画图、命中、点击读同一份，
 /// `Ctl::WinBtn(i)` 的下标就是这个顺序。
@@ -11047,6 +11055,11 @@ const DETAIL_ROW_H: f32 = 22.0;
 const DETAIL_ERRORS_TITLE_Y: f32 = 266.0;
 const DETAIL_ERRORS_TOP: f32 = 290.0;
 
+/// 错误历史那一栏至少装得下一行（16 高 + 2 余量）才画；480 这一档正好放不下。
+fn detail_errors_have_room(card: D2D_RECT_F) -> bool {
+    (card.bottom - 8.0) - (card.top + DETAIL_ERRORS_TOP) >= 18.0
+}
+
 /// 插件详情页：权限 / 占用 / 四类钩子耗时 / 错误历史（方案 21 步）。
 ///
 /// 三条约定：
@@ -11161,8 +11174,26 @@ fn draw_plugin_detail(
         );
     }
 
-    // 失败/停用/降频的计数；正文在下面那一栏。
-    let note = p.clip(&detail.note, &p.fmt.caption, inner_w);
+    // 行上那一格不只有"加载失败"：按键/视图/事件某一路被熔断停掉也写在这里，
+    // 所以前缀不能写成「加载失败」。它不经过台账（加载失败时 VM 都没起来），
+    // 单独占最前面一条；不写的话这一页只念台账，作者看到的就是"没有错误记录"。
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(e) = &row.error {
+        lines.push(format!("最近报错 · {}", one_line(e, 108)));
+    }
+    lines.extend(detail.errors.iter().cloned());
+
+    // 失败/停用/降频的计数；正文在下面那一栏。矮窗口里错误历史放不下，
+    // 把条数并进这一句——总比整段消失、让人以为什么都没发生强。
+    let mut note_text = detail.note.clone();
+    if !detail_errors_have_room(card) {
+        if lines.is_empty() {
+            note_text.push_str(" · 没有错误记录");
+        } else {
+            note_text.push_str(&format!(" · 错误历史 {} 条（窗口太矮未展开）", lines.len()));
+        }
+    }
+    let note = p.clip(&note_text, &p.fmt.caption, inner_w);
     p.text(
         &note,
         rect(x, card.top + 110.0, inner_w, 16.0),
@@ -11232,6 +11263,11 @@ fn draw_plugin_detail(
         }
     }
 
+    // 矮窗口里错误历史连标题都放不下：上面那句已经带了条数，这里不再画。
+    if !detail_errors_have_room(card) {
+        return;
+    }
+
     // --- 错误历史：新的在最上面 ---
     p.text(
         "错误历史（新的在最上面）",
@@ -11239,14 +11275,6 @@ fn draw_plugin_detail(
         &p.fmt.body,
         &p.br.fg,
     );
-    // 行上那一格不只有"加载失败"：按键/视图/事件某一路被熔断停掉也写在这里，
-    // 所以前缀不能写成「加载失败」。它不经过台账（加载失败时 VM 都没起来），
-    // 单独占最前面一条；不写的话这一页只念台账，作者看到的就是"没有错误记录"。
-    let mut lines: Vec<String> = Vec::new();
-    if let Some(e) = &row.error {
-        lines.push(format!("最近报错 · {}", one_line(e, 108)));
-    }
-    lines.extend(detail.errors.iter().cloned());
     if lines.is_empty() {
         p.text(
             "没有错误记录",
@@ -11481,15 +11509,24 @@ fn draw_board_page(
 
     // --- 趋势（缩略版：只画线，数值留给「活跃分析」那一页）---
     let layout = board_layout(h, line_y);
-    let labels: Vec<String> = dash.trend.iter().map(|(d, _)| short_day(d)).collect();
-    let points: Vec<i64> = dash.trend.iter().map(|(_, v)| *v).collect();
-    draw_plugin_chart(
-        p,
-        rect(m, layout.trend_top, full_w, layout.trend_h),
-        "line",
-        &labels,
-        &points,
-    );
+    if layout.compact {
+        p.text(
+            "窗口较矮：趋势图已收起（拉高窗口可看）",
+            rect(m, layout.trend_top, full_w, 18.0),
+            &p.fmt.caption,
+            &p.br.muted,
+        );
+    } else {
+        let labels: Vec<String> = dash.trend.iter().map(|(d, _)| short_day(d)).collect();
+        let points: Vec<i64> = dash.trend.iter().map(|(_, v)| *v).collect();
+        draw_plugin_chart(
+            p,
+            rect(m, layout.trend_top, full_w, layout.trend_h),
+            "line",
+            &labels,
+            &points,
+        );
+    }
 
     // --- 两列排行 ---
     let rank_top = layout.rank_top;
@@ -11966,17 +12003,31 @@ struct BoardLayout {
     trend_h: f32,
     rank_top: f32,
     rank_h: f32,
+    /// 矮窗口把趋势图整块收起，把下半部让给两张排行卡。
+    compact: bool,
 }
 
-/// 给窗口高度排下半部：窗口矮的时候**先缩趋势图**，给两张排行卡留出 120 高。
+/// 给窗口高度排下半部：窗口矮的时候**先缩趋势图**，给两张排行卡留出足够高度。
 ///
-/// 固定的 200 + 120 在最小窗口（640：客户区被撑满整窗）下会把排行卡画到窗口底边
-/// 以下 —— 圆角底边与最后几行被裁掉，而这一页没有滚动。`clamp(60, 200)` 的 60 是给
-/// 矮到不正常的窗口兜底；640 这一档算出来是 154，绘图区仍有 80 高。
+/// 640 那一档算出来趋势 154、排行 120，趋势的绘图区还有 80 高；但 960×480 的新下限
+/// 只剩 480 高，再按同一公式算趋势只有 34 —— 绘图区是负数。所以低于 620 直接进紧凑档：
+/// 趋势收起（用一行说明），排行卡从 `line_y + 64` 一直排到窗口底。
 fn board_layout(h: f32, line_y: f32) -> BoardLayout {
     const M: f32 = 16.0;
+    const COMPACT_BELOW: f32 = 620.0;
     let trend_top = line_y + 44.0;
-    let trend_h = (h - M - trend_top - 10.0 - 120.0).clamp(60.0, 200.0);
+    if h < COMPACT_BELOW {
+        let rank_top = trend_top + 20.0;
+        let rank_h = (h - M - rank_top).max(60.0);
+        return BoardLayout {
+            trend_top,
+            trend_h: 0.0,
+            rank_top,
+            rank_h,
+            compact: true,
+        };
+    }
+    let trend_h = (h - M - trend_top - 10.0 - 120.0).clamp(120.0, 200.0);
     let rank_top = trend_top + trend_h + 10.0;
     let rank_h = (h - M - rank_top).max(120.0);
     BoardLayout {
@@ -11984,6 +12035,7 @@ fn board_layout(h: f32, line_y: f32) -> BoardLayout {
         trend_h,
         rank_top,
         rank_h,
+        compact: false,
     }
 }
 
@@ -13241,12 +13293,10 @@ fn table_footer_text(snap: &Snapshot, lane: &str, tab: usize) -> String {
 
 /// 分析页那张图卡：画图与命中测试算的是同一个矩形，两边不许各摆一份数字。
 fn chart_card(content: D2D_RECT_F) -> D2D_RECT_F {
-    rect(
-        content.left,
-        content.top,
-        content.right - content.left,
-        300.0,
-    )
+    // 固定 300 只在窗口够高时才成立：最小窗口（960×480 DIP）下内容区只有 172 高，
+    // 照画 300 会把卡片和柱/点一起伸到窗口下面。高度跟随内容区，上限仍是 300。
+    let h = (content.bottom - content.top).clamp(0.0, 300.0);
+    rect(content.left, content.top, content.right - content.left, h)
 }
 
 /// 趋势图的绘图区：卡片之内、标题与坐标字之外。
@@ -15703,6 +15753,24 @@ fn dpi_scale_of(hwnd: HWND) -> f64 {
     dpi_scale_from(unsafe { GetDpiForWindow(hwnd) })
 }
 
+/// 用户可调下限的物理像素：按缩放换算后**再夹进工作区**。
+///
+/// 夹工作区这一步是 1366×768@125% 那一档的关键：换算出来的 1200×600 比工作区
+/// 的 1092×582 还大时，窗口仍会被撑出屏外；取 min 之后至少能完整放进屏幕。
+fn min_track_px(scale: f64, work_w: i32, work_h: i32) -> (i32, i32) {
+    let s = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let want_w = (MAIN_MIN_W as f64 * s).round() as i32;
+    let want_h = (MAIN_MIN_H as f64 * s).round() as i32;
+    (
+        want_w.min(work_w.max(1)).max(1),
+        want_h.min(work_h.max(1)).max(1),
+    )
+}
+
 /// 存档（逻辑像素 + 存盘时那块屏的缩放）→ 物理像素矩形。
 ///
 /// 缩放取自存档而不是"建完窗再问"：多屏缩放不同时，逻辑坐标可能先落在另一块屏上，
@@ -15726,14 +15794,17 @@ fn physical_rect_of(st: &MainWindowState) -> (i32, i32, i32, i32) {
 /// 次序不能反：先夹坐标再夹尺寸的话，"存档比屏幕还宽"那种窗口会把左边顶到屏外。
 /// 拆成纯函数是为了能测 —— 换分辨率、拔掉副屏、把窗口拖到只剩一条边这些情形，
 /// 靠的全是这一条规则（窗口一旦整个落在屏幕外就再也拖不回来）。
-fn clamp_main_rect(work: (i32, i32, i32, i32), rect: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
-    const MIN_W: i32 = 480;
-    const MIN_H: i32 = 360;
+fn clamp_main_rect(
+    work: (i32, i32, i32, i32),
+    rect: (i32, i32, i32, i32),
+    min_w: i32,
+    min_h: i32,
+) -> (i32, i32, i32, i32) {
     let (wl, wt, wr, wb) = work;
     let work_w = (wr - wl).max(1);
     let work_h = (wb - wt).max(1);
-    let w = rect.2.clamp(MIN_W.min(work_w), work_w);
-    let h = rect.3.clamp(MIN_H.min(work_h), work_h);
+    let w = rect.2.clamp(min_w.min(work_w).max(1), work_w);
+    let h = rect.3.clamp(min_h.min(work_h).max(1), work_h);
     let x = rect.0.clamp(wl, wr - w);
     let y = rect.1.clamp(wt, wb - h);
     (x, y, w, h)
@@ -15977,12 +16048,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         }
         WM_GETMINMAXINFO => {
             // 先让系统填一遍（最大化尺寸/位置就在里面），再只补一条下限：
-            // 窗口再窄下去，固定矩形版面会开始互相压字。
+            // 窗口再窄下去，固定矩形版面会开始互相压字。下限还要夹当前工作区：
+            // 1366×768@125% 下 960×480 DIP 换算成物理像素后仍可能比工作区宽/高。
             let r = unsafe { DefWindowProcW(hwnd, msg, w, l) };
-            let dpi = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
+            let scale = dpi_scale_from(unsafe { GetDpiForWindow(hwnd) });
+            let (wl, wt, wr, wb) = work_area_near_window(hwnd);
+            let (min_w, min_h) = min_track_px(scale, (wr - wl).max(1), (wb - wt).max(1));
             let mmi = unsafe { &mut *(l.0 as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = (960.0 * dpi) as i32;
-            mmi.ptMinTrackSize.y = (640.0 * dpi) as i32;
+            mmi.ptMinTrackSize.x = min_w;
+            mmi.ptMinTrackSize.y = min_h;
             r
         }
         WM_TIMER if w.0 == TIMER_EVENTS => {
@@ -17027,10 +17101,20 @@ fn main() -> windows::core::Result<()> {
         std::sync::atomic::Ordering::Relaxed,
     );
     // 存档里带着"量这组坐标时那块屏的缩放"，直接换成物理像素建窗；
-    // 建完只需要把可能落在屏幕外的矩形夹回来。
+    // 建完只需要把可能落在屏幕外的矩形夹回来。没有存档时，默认的 1200×860 也是
+    // **逻辑像素**，要按系统 DPI 换成物理像素，否则 150% 下首启会开出一个偏小的窗。
+    let initial_scale = saved_window
+        .as_ref()
+        .map(|s| s.scale)
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or_else(|| dpi_scale_from(unsafe { GetDpiForSystem() }));
     let (init_x, init_y, init_w, init_h) = match &saved_window {
         Some(st) => physical_rect_of(st),
-        None => physical_rect_of(&MainWindowState::defaults()),
+        None => {
+            let mut defaults = MainWindowState::defaults();
+            defaults.scale = initial_scale;
+            physical_rect_of(&defaults)
+        }
     };
     let style = if hidden {
         WS_OVERLAPPEDWINDOW
@@ -17068,21 +17152,26 @@ fn main() -> windows::core::Result<()> {
         );
     }
 
-    // 存档里的逻辑像素 → 这块屏上的物理像素，再夹进工作区：换分辨率、拔掉副屏之后，
-    // 上次那组坐标可能整块落在屏幕外面，不夹回来窗口就再也点不到。
-    if let Some(st) = &saved_window {
-        let target = clamp_main_rect(work_area_near_window(hwnd), physical_rect_of(st));
-        unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                target.0,
-                target.1,
-                target.2,
-                target.3,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
+    // 建完之后无条件夹一次：换分辨率、拔掉副屏之后上次坐标可能整块在屏幕外；
+    // **首次启动**的默认 1200×860 在 125% 笔记本上也比工作区大，不夹就会把底部
+    // 状态行和任务栏一起压出屏。下限取 `min_track_px`，小屏上它会自动退到工作区。
+    let work = work_area_near_window(hwnd);
+    let work_w = (work.2 - work.0).max(1);
+    let work_h = (work.3 - work.1).max(1);
+    // 存档里的缩放可能是另一块屏的；这条下限同时再按**当前窗口**的 DPI 夹一次，
+    // 免得从 100% 屏搬到 125% 屏时把窗口还原成低于版面的尺寸。
+    let (min_w, min_h) = min_track_px(initial_scale.max(dpi_scale_of(hwnd)), work_w, work_h);
+    let target = clamp_main_rect(work, (init_x, init_y, init_w, init_h), min_w, min_h);
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            target.0,
+            target.1,
+            target.2,
+            target.3,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
 
     let app = Box::into_raw(Box::new(App::new(hwnd, false)?));
@@ -22873,33 +22962,33 @@ mod main_window_state_tests {
     fn a_saved_rect_is_clamped_back_into_the_work_area() {
         let work = (0, 0, 1920, 1040);
         assert_eq!(
-            clamp_main_rect(work, (300, 150, 1200, 860)),
+            clamp_main_rect(work, (300, 150, 1200, 860), 480, 360),
             (300, 150, 1200, 860),
             "本来就完整可见的窗口不许被挪"
         );
         assert_eq!(
-            clamp_main_rect(work, (5000, 5000, 1200, 860)),
+            clamp_main_rect(work, (5000, 5000, 1200, 860), 480, 360),
             (720, 180, 1200, 860),
             "右下角之外的窗口要推回来，且右下边贴住工作区"
         );
         assert_eq!(
-            clamp_main_rect(work, (-500, -400, 1200, 860)),
+            clamp_main_rect(work, (-500, -400, 1200, 860), 480, 360),
             (0, 0, 1200, 860),
             "拔掉左边那块屏之后，负坐标要被收回来"
         );
         assert_eq!(
-            clamp_main_rect(work, (100, 100, 3000, 2000)),
+            clamp_main_rect(work, (100, 100, 3000, 2000), 480, 360),
             (0, 0, 1920, 1040),
             "比屏幕还大的存档要先缩到工作区、再贴左上角"
         );
         assert_eq!(
-            clamp_main_rect(work, (100, 100, 10, 10)),
+            clamp_main_rect(work, (100, 100, 10, 10), 480, 360),
             (100, 100, 480, 360),
             "小到抓不住的尺寸要抬到下限"
         );
         let left_monitor = (-1920, 0, 0, 1040);
         assert_eq!(
-            clamp_main_rect(left_monitor, (-2000, 100, 1200, 860)),
+            clamp_main_rect(left_monitor, (-2000, 100, 1200, 860), 480, 360),
             (-1920, 100, 1200, 860),
             "副屏在主屏左边时负的原点是合法工作区"
         );
@@ -24726,5 +24815,69 @@ mod instance_and_tray_tests {
             body.contains("config::instance().save()"),
             "关机前没有同步保存配置：最后 300ms 的去抖改动会丢"
         );
+    }
+}
+
+#[cfg(test)]
+mod min_size_layout_tests {
+    use super::*;
+
+    /// 下限要按缩放换算，再被工作区夹住；两种夹法缺一不可。
+    #[test]
+    fn the_min_track_fits_inside_the_work_area() {
+        assert_eq!(min_track_px(1.0, 1920, 1040), (960, 480));
+        assert_eq!(min_track_px(1.25, 1366, 728), (1200, 600));
+        assert_eq!(
+            min_track_px(1.25, 1000, 500),
+            (1000, 500),
+            "工作区比换算后的下限还小时，必须退到工作区"
+        );
+        assert_eq!(min_track_px(2.0, 1920, 1040), (1920, 960));
+        assert_eq!(min_track_px(f64::NAN, 800, 600), (800, 480));
+    }
+
+    /// 小到抓不住的存档要抬到新的 960×480 下限，而不是旧的 480×360。
+    #[test]
+    fn a_saved_tiny_window_is_lifted_to_the_new_minimum() {
+        let work = (0, 0, 1920, 1040);
+        assert_eq!(
+            clamp_main_rect(work, (100, 100, 10, 10), 960, 480),
+            (100, 100, 960, 480)
+        );
+    }
+
+    /// 分析页图表卡跟随内容高度：960×480 下内容只有 172 高，不许再画 300。
+    #[test]
+    fn the_chart_card_never_exceeds_the_content_band() {
+        let short = chart_card(rect(16.0, 292.0, 928.0, 172.0));
+        assert_eq!(short.bottom - short.top, 172.0);
+        let tall = chart_card(rect(16.0, 292.0, 928.0, 860.0));
+        assert_eq!(tall.bottom - tall.top, 300.0, "高窗口仍用满 300");
+    }
+
+    /// 看板在 960×480 下进紧凑档：趋势收起，两张排行卡仍落在窗口内。
+    #[test]
+    fn the_board_is_compact_at_the_minimum_height() {
+        let line_y = 208.0 + 78.0 + 10.0;
+        let l = board_layout(480.0, line_y);
+        assert!(l.compact, "480 高还走完整走势图");
+        assert_eq!(l.trend_h, 0.0);
+        assert!(
+            l.rank_top + l.rank_h <= 480.0 - 16.0 + 0.01,
+            "排行卡画到窗口下面：top={} h={}",
+            l.rank_top,
+            l.rank_h
+        );
+        assert!(l.rank_h >= 100.0, "排行卡压得太矮：{}", l.rank_h);
+        // 640 仍走完整走势图（旧下限的那一档不回归）。
+        assert!(!board_layout(640.0, line_y).compact);
+    }
+
+    /// 插件详情的错误历史在 480/520 下没有位置，改为并在顶部说明里报条数。
+    #[test]
+    fn the_plugin_detail_hides_the_error_list_when_there_is_no_room() {
+        assert!(!detail_errors_have_room(rect(0.0, 208.0, 800.0, 296.0)));
+        assert!(!detail_errors_have_room(rect(0.0, 208.0, 800.0, 261.0)));
+        assert!(detail_errors_have_room(rect(0.0, 208.0, 800.0, 336.0)));
     }
 }
