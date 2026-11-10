@@ -121,26 +121,45 @@ fn clear_watcher_fault() {
 /// "这一笔没收进来"的原因只留 60 秒：它不是监听故障，用户下一次成功复制就该盖掉它，
 /// 也不该永久顶掉页脚的提示。
 const CAPTURE_NOTICE_TTL_MS: i64 = 60_000;
-static CAPTURE_NOTICE: std::sync::Mutex<Option<(i64, String)>> = std::sync::Mutex::new(None);
+struct CaptureNotice {
+    order: u64,
+    issue: Option<(i64, String)>,
+}
 
-/// 记一条"这次复制没收录"的原因（文本超限、图片超限、剪贴板被占用……）。
-pub fn note_capture_issue(msg: impl Into<String>) {
+static CAPTURE_NOTICE: std::sync::Mutex<CaptureNotice> = std::sync::Mutex::new(CaptureNotice {
+    order: 0,
+    issue: None,
+});
+static CAPTURE_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_capture_order() -> u64 {
+    CAPTURE_ORDER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn update_capture_notice(order: u64, issue: Option<String>) {
     if let Ok(mut slot) = CAPTURE_NOTICE.lock() {
-        *slot = Some((now_ms(), msg.into()));
+        // 排队中的旧收录完成，不能覆盖监听线程刚报告的新失败。
+        if order >= slot.order {
+            slot.order = order;
+            slot.issue = issue.map(|msg| (now_ms(), msg));
+        }
     }
 }
 
-/// 成功收录一次就清：上一笔的原因不该继续留在页脚上。
-pub fn note_capture_ok() {
-    if let Ok(mut slot) = CAPTURE_NOTICE.lock() {
-        *slot = None;
-    }
+/// 记一条"这次复制没收录"的原因（文本超限、图片超限、剪贴板被占用……）。
+pub fn note_capture_issue(msg: impl Into<String>) {
+    update_capture_notice(next_capture_order(), Some(msg.into()));
+}
+
+#[cfg(test)]
+fn note_capture_ok() {
+    update_capture_notice(next_capture_order(), None);
 }
 
 /// 最近一条未收录原因（只在 60 秒内返回）。`now_ms` 由调用方给，新鲜度能脱离时钟单测。
 pub fn capture_notice(now_ms: i64) -> Option<String> {
     let slot = CAPTURE_NOTICE.lock().ok()?;
-    slot.as_ref().and_then(|(at, msg)| {
+    slot.issue.as_ref().and_then(|(at, msg)| {
         (now_ms.saturating_sub(*at) < CAPTURE_NOTICE_TTL_MS).then(|| msg.clone())
     })
 }
@@ -1147,7 +1166,6 @@ pub fn derive_snippet_name(content: &str) -> String {
 }
 
 pub fn add_snippet(name: &str, content: &str) -> Result<i64, String> {
-    let content = content.trim_end();
     if content.trim().is_empty() {
         return Err("片段内容为空".to_string());
     }
@@ -2044,20 +2062,63 @@ mod win {
             text: String,
             source_app: String,
             copied_at_ms: i64,
+            capture_order: u64,
         },
         Image {
             stored: super::StoredImage,
             source_app: String,
             copied_at_ms: i64,
+            capture_order: u64,
         },
         Files {
             paths: Vec<String>,
             source_app: String,
             copied_at_ms: i64,
+            capture_order: u64,
         },
     }
 
     impl Captured {
+        pub fn ingest(&self) -> Result<super::IngestOutcome, String> {
+            let (order, outcome) = match self {
+                Self::Text {
+                    text,
+                    source_app,
+                    copied_at_ms,
+                    capture_order,
+                } => (
+                    *capture_order,
+                    super::ingest(text, source_app, *copied_at_ms),
+                ),
+                Self::Image {
+                    stored,
+                    source_app,
+                    copied_at_ms,
+                    capture_order,
+                } => (
+                    *capture_order,
+                    super::ingest_image(stored, source_app, *copied_at_ms),
+                ),
+                Self::Files {
+                    paths,
+                    source_app,
+                    copied_at_ms,
+                    capture_order,
+                } => (
+                    *capture_order,
+                    super::ingest_files(paths, source_app, *copied_at_ms),
+                ),
+            };
+            match &outcome {
+                Ok(super::IngestOutcome::Stored { .. }) => {
+                    super::update_capture_notice(order, None)
+                }
+                Err(e) => super::update_capture_notice(order, Some(format!("剪贴板入库失败：{e}"))),
+                Ok(super::IngestOutcome::Skipped(_)) => {}
+            }
+            outcome
+        }
+
         pub fn source_app(&self) -> &str {
             match self {
                 Captured::Text { source_app, .. }
@@ -2360,11 +2421,11 @@ mod win {
                         return;
                     }
                 }
-                super::note_capture_ok();
                 let _ = tx.send(Captured::Text {
                     text,
                     source_app,
                     copied_at_ms: now_ms(),
+                    capture_order: super::next_capture_order(),
                 });
             }
             RawClip::TextTooLarge { units } => {
@@ -2397,11 +2458,11 @@ mod win {
                         return;
                     }
                 };
-                super::note_capture_ok();
                 let _ = tx.send(Captured::Image {
                     stored,
                     source_app,
                     copied_at_ms: now_ms(),
+                    capture_order: super::next_capture_order(),
                 });
             }
             RawClip::Files(paths) => {
@@ -2420,11 +2481,11 @@ mod win {
                         return;
                     }
                 };
-                super::note_capture_ok();
                 let _ = tx.send(Captured::Files {
                     paths,
                     source_app,
                     copied_at_ms: now_ms(),
+                    capture_order: super::next_capture_order(),
                 });
             }
         }
@@ -3021,6 +3082,84 @@ mod tests {
         note_capture_issue("复制的内容太长");
         note_capture_ok();
         assert_eq!(capture_notice(now_ms()), None, "成功收录一次就清掉上一条");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn captured_ingest_failure_is_visible_and_success_clears_it() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("clip_ingest_notice");
+        init_db().unwrap();
+        note_capture_ok();
+        let conn = open().unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_ingest BEFORE INSERT ON clipboard_items BEGIN SELECT RAISE(ABORT, 'fixture-ingest-denied'); END;").unwrap();
+        let captured = Captured::Text {
+            text: "notice fixture".to_string(),
+            source_app: "fixture.exe".to_string(),
+            copied_at_ms: now_ms(),
+            capture_order: next_capture_order(),
+        };
+        assert!(captured
+            .ingest()
+            .unwrap_err()
+            .contains("fixture-ingest-denied"));
+        assert!(
+            list_recent(10).unwrap().is_empty(),
+            "数据库应真正拒绝这条写入"
+        );
+        assert!(
+            capture_notice(now_ms()).is_some_and(|s| s.contains("fixture-ingest-denied")),
+            "入库失败必须有可见原因"
+        );
+        conn.execute_batch("DROP TRIGGER reject_ingest;").unwrap();
+        assert!(matches!(
+            captured.ingest().unwrap(),
+            IngestOutcome::Stored { .. }
+        ));
+        assert_eq!(list_recent(10).unwrap().len(), 1);
+        assert_eq!(capture_notice(now_ms()), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn queued_ingest_cannot_replace_a_newer_capture_issue() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("clip_notice_order");
+        init_db().unwrap();
+        let make = |text: &str| Captured::Text {
+            text: text.to_string(),
+            source_app: "fixture.exe".to_string(),
+            copied_at_ms: now_ms(),
+            capture_order: next_capture_order(),
+        };
+        let old_success = make("queued success");
+        let old_failure = make("queued failure");
+        note_capture_issue("new capture failed");
+        assert!(matches!(
+            old_success.ingest().unwrap(),
+            IngestOutcome::Stored { .. }
+        ));
+        assert_eq!(
+            capture_notice(now_ms()).as_deref(),
+            Some("new capture failed")
+        );
+        let conn = open().unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_ingest BEFORE INSERT ON clipboard_items BEGIN SELECT RAISE(ABORT, 'older-ingest-denied'); END;").unwrap();
+        assert!(old_failure
+            .ingest()
+            .unwrap_err()
+            .contains("older-ingest-denied"));
+        assert_eq!(
+            capture_notice(now_ms()).as_deref(),
+            Some("new capture failed")
+        );
+        conn.execute_batch("DROP TRIGGER reject_ingest;").unwrap();
+        let newest = make("newest success");
+        assert!(matches!(
+            newest.ingest().unwrap(),
+            IngestOutcome::Stored { .. }
+        ));
+        assert_eq!(capture_notice(now_ms()), None);
     }
 
     #[test]

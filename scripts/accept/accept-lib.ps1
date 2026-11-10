@@ -30,6 +30,7 @@ public class FF {
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool GetMenuItemRect(IntPtr hwnd, IntPtr hMenu, uint item, out RECT r);
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
@@ -128,6 +129,24 @@ public class FF {
       PostMessage(hwnd, 0x0202, IntPtr.Zero, (IntPtr)((y << 16) | (x & 0xFFFF)));
       System.Threading.Thread.Sleep(120);
     }
+  }
+  // Click one item of an open popup menu. Keyboard navigation depends on which item
+  // the physical cursor happens to hover, so the acceptance harness selects by item
+  // rectangle instead. MN_GETHMENU = 0x01E1; GetMenuItemRect works on menu windows.
+  public static bool ClickMenuItem(IntPtr menuHwnd, uint item) {
+    IntPtr hMenu = SendMessage(menuHwnd, 0x01E1, IntPtr.Zero, IntPtr.Zero);
+    if (hMenu == IntPtr.Zero) return false;
+    RECT r;
+    if (!GetMenuItemRect(menuHwnd, hMenu, item, out r)) return false;
+    int x = (r.Left + r.Right) / 2;
+    int y = (r.Top + r.Bottom) / 2;
+    SetCursorPos(x, y);
+    System.Threading.Thread.Sleep(80);
+    mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(50);
+    mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(200);
+    return true;
   }
   // Screen-level click: this one goes through the global hook (for collector tests).
   public static void ClickScreen(IntPtr hwnd, int x, int y, int times) {

@@ -492,6 +492,16 @@ Check 'typing filters the list without Enter' (Wait-LogMatch '*clip_page_live_fi
 [FF]::PostMessage([IntPtr]$se, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero) | Out-Null
 Check 'Esc clears the live filter' (Wait-LogMatch '*commit=false*' 3000)
 
+# Tab out of the search EDIT: History -> Snippets -> Stats. Hiding the hosted EDIT
+# must hand the foreground back to the main window, or every later key goes elsewhere.
+[FF]::PostMessage([IntPtr]$se, 0x0100, [IntPtr]0x09, [IntPtr]::Zero) | Out-Null
+Start-Sleep -Milliseconds 300
+[FF]::PostMessage([IntPtr]$se, 0x0100, [IntPtr]0x09, [IntPtr]::Zero) | Out-Null
+Start-Sleep -Milliseconds 400
+Check 'Tab to stats leaves the main window in the foreground' ([FF]::GetForegroundWindow() -eq $h)
+[FF]::PostMessage([IntPtr]$h, 0x0100, [IntPtr]0x09, [IntPtr]::Zero) | Out-Null
+Start-Sleep -Milliseconds 300
+
 [void][FF]::SetForegroundWindow($h)
 Start-Sleep -Milliseconds 300
 [FF]::PressChord([byte[]]@(0x11), [byte]0x41)
@@ -604,6 +614,99 @@ $ingestAfter = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest *' }).Coun
 Check 'the DIB is not captured in place of the oversize text' `
     (($imageAfter -eq $imageBefore) -and ($ingestAfter -eq $ingestBefore)) `
     "image=$imageBefore->$imageAfter ingest=$ingestBefore->$ingestAfter"
+
+$dbHelper = Join-Path $WorkDir 'clipboard-db-fixture.cjs'
+[IO.File]::WriteAllText($dbHelper, @'
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(process.argv[2]);
+db.exec('PRAGMA busy_timeout=3000');
+const mode = process.argv[3];
+if (mode === 'reject') db.exec("CREATE TRIGGER ux_reject BEFORE INSERT ON clipboard_items BEGIN SELECT RAISE(ABORT, 'ux-ingest-denied'); END");
+if (mode === 'allow') db.exec('DROP TRIGGER ux_reject');
+console.log(JSON.stringify({
+  snippets: db.prepare('SELECT name,content FROM clipboard_snippets ORDER BY id DESC').all(),
+  failed: db.prepare("SELECT count(*) AS n FROM clipboard_items WHERE content='accept-ingest-failure'").get().n
+}));
+db.close();
+'@, [Text.Encoding]::ASCII)
+function Read-FixtureDb([string]$Mode = 'read') {
+    $out = & node --no-warnings $dbHelper (Join-Path $app 'data\focusflow_clipboard.db') $Mode
+    if ($LASTEXITCODE -ne 0) { throw "database fixture failed: $Mode" }
+    $out | ConvertFrom-Json
+}
+
+[FF]::ClickWindow($h, 474, 256, 1)
+$pageBody = "accept-snippet-page`r`n`t  "
+$beforeSnippet = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest *' }).Count
+Set-ClipboardRetry $pageBody
+Check 'page snippet fixture preserves its trailing whitespace' ((Get-ClipboardRetry) -ceq $pageBody)
+Check 'page snippet source is captured' (Wait-LogCount '*clip_ingest *' ($beforeSnippet + 1) 5000)
+[FF]::ClickWindow($h, 300, 300, 1)
+[FF]::ClickWindow($h, 306, 256, 1)
+Start-Sleep -Milliseconds 400
+$dbState = Read-FixtureDb
+Check 'page saves snippet body without trimming' ($dbState.snippets.Count -eq 1 -and $dbState.snippets[0].content -ceq $pageBody)
+[FF]::ClickWindow($h, 138, 217, 1)
+Set-ClipboardRetry 'accept-before-snippet-copy'
+[FF]::ClickWindow($h, 54, 256, 1)
+Start-Sleep -Milliseconds 500
+Check 'page copies snippet body byte-for-byte' ((Get-ClipboardRetry) -ceq $pageBody)
+[FF]::ClickWindow($h, 54, 217, 1)
+
+$popupBody = "accept-snippet-popup`n`t  "
+$beforePopupSnippet = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest *' }).Count
+Set-ClipboardRetry $popupBody
+Check 'popup snippet fixture preserves its trailing whitespace' ((Get-ClipboardRetry) -ceq $popupBody)
+Check 'popup snippet source is captured' (Wait-LogCount '*clip_ingest *' ($beforePopupSnippet + 1) 5000)
+$pal = Open-ClipPalette
+$scale = [FF]::GetDpiForSystem() / 96.0
+$menuX = [int][Math]::Round(140 * $scale)
+$menuY = [int][Math]::Round(110 * $scale)
+$pr = Get-Rect ([IntPtr]$pal.Popup)
+# Real right click: the menu must open at a known point and own the foreground.
+if ($pal.Popup -gt 0) {
+    [void][FF]::SetForegroundWindow([IntPtr]$pal.Popup)
+    Start-Sleep -Milliseconds 250
+    [FF]::RightClick(($pr.X + $menuX), ($pr.Y + $menuY))
+    Start-Sleep -Milliseconds 350
+}
+# Select by item rectangle, not by a fixed number of Downs: the item under the
+# physical cursor is already hot when a menu opens, which made the old key count
+# land on Stats/Transform depending on where the previous round left the cursor.
+$menu = [FF]::ByClass([uint32]$p.Id, '#32768')
+Check 'popup context menu opens' ($menu -ne [IntPtr]::Zero)
+if ($menu -ne [IntPtr]::Zero) {
+    Check 'popup menu item save-as-snippet is clickable' ([FF]::ClickMenuItem($menu, 3))
+}
+Start-Sleep -Milliseconds 400
+$dbState = Read-FixtureDb
+Check 'popup menu saves snippet body without trimming' ($dbState.snippets.Count -eq 2 -and $dbState.snippets[0].content -ceq $popupBody)
+[FF]::PostMessage([IntPtr]$pal.Edit, 0x0100, [IntPtr]0x09, [IntPtr]::Zero) | Out-Null
+Start-Sleep -Milliseconds 200
+Set-ClipboardRetry 'accept-before-popup-snippet-copy'
+[FF]::PostMessage([IntPtr]$pal.Popup, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero) | Out-Null
+Start-Sleep -Milliseconds 600
+Check 'popup copies snippet body byte-for-byte' ((Get-ClipboardRetry) -ceq $popupBody)
+
+Set-ClipboardRetry 'accept-before-ingest-failure'
+Start-Sleep -Milliseconds 500
+Read-FixtureDb 'reject' | Out-Null
+$pal = Open-ClipPalette
+try {
+    Set-ClipboardRetry 'accept-ingest-failure'
+    Check 'database really rejects the captured write' (Wait-LogMatch '*ux-ingest-denied*' 5000)
+    Check 'failed capture is absent from the database' ((Read-FixtureDb).failed -eq 0)
+    Save-WindowShot ([IntPtr]$pal.Popup) (Join-Path $WorkDir 'ingest-failed-popup.png')
+    [FF]::PostMessage([IntPtr]$pal.Edit, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 400
+    Save-WindowShot $h (Join-Path $WorkDir 'ingest-failed-page.png')
+} finally {
+    Read-FixtureDb 'allow' | Out-Null
+}
+$beforeRecovery = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest *' }).Count
+Set-ClipboardRetry 'accept-ingest-recovery'
+Check 'capture resumes after the write failure' (Wait-LogCount '*clip_ingest *' ($beforeRecovery + 1) 5000)
+Save-WindowShot $h (Join-Path $WorkDir 'ingest-recovered-page.png')
 
 Stop-App $Exe
 if ($null -ne $orig) { try { Set-ClipboardRetry $orig } catch { } }

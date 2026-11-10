@@ -176,6 +176,33 @@ fn snippets_can_be_added_touched_and_deleted() {
 }
 
 #[test]
+fn snippet_body_preserves_trailing_whitespace_on_disk() {
+    let _lock = paths::test_app_dir_lock();
+    let _dir = setup("clip_snippet_body");
+    for content in [
+        "末尾空格  ",
+        "末尾制表\t",
+        "末尾换行\n",
+        "末尾回车换行\r\n",
+        "  前后空白\t\r\n",
+    ] {
+        let id = clipboard::add_snippet("保留原文", content).unwrap();
+        let reopened = rusqlite::Connection::open(clipboard::db_path()).unwrap();
+        let saved: String = reopened
+            .query_row(
+                "SELECT content FROM clipboard_snippets WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, content, "重新打开数据库后正文必须逐字相同");
+        let list = clipboard::snippets().unwrap();
+        assert_eq!(list.iter().find(|s| s.id == id).unwrap().content, content);
+    }
+    assert!(clipboard::add_snippet("空白", " \t\r\n").is_err());
+}
+
+#[test]
 fn stats_separate_apps_and_count_window() {
     let _lock = paths::test_app_dir_lock();
     let _dir = setup("clip_stats");

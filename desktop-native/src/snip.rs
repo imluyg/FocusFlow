@@ -118,6 +118,9 @@ pub struct Mark {
 enum Drag {
     /// 重新框一个选区
     New,
+    /// 标注阶段在选区外按下：先只记起点，真的拖过 `MIN_DRAG` 才升成 `New`。
+    /// 这样一次误点不会把已经画好的标注和整场截图一起清掉。
+    NewPending,
     /// 八向手柄之一（0=左上 1=上 2=右上 3=右 4=右下 5=下 6=左下 7=左）
     Handle(u8),
     /// 标注工具正在画
@@ -148,13 +151,21 @@ fn drag_without_button(drag: Option<(Drag, i32, i32)>, lbutton: bool) -> Option<
     }
 }
 
-/// 覆盖层上"单击选窗口"看到的一条候选：Z 序里的一个顶层窗口，只带判得动的那三件事。
-#[derive(Clone, Copy, Debug)]
+/// 标注阶段在选区外按下之后，鼠标要真的拉出这么大才算是"重新框选"。
+/// 阈值与松手判定共用 `MIN_DRAG`：小于它的一下只是点击，不该清掉已画好的标注。
+fn pending_new_should_promote(sx: i32, sy: i32, x: i32, y: i32) -> bool {
+    (x - sx).abs() >= MIN_DRAG || (y - sy).abs() >= MIN_DRAG
+}
+
+/// 覆盖层上"单击选窗口"看到的一条候选：Z 序里的一个顶层窗口，带上判得动的四件事。
+#[derive(Clone, Debug)]
 struct Candidate {
     pid: u32,
     visible: bool,
     /// left, top, right, bottom（屏幕坐标）
     rect: (i32, i32, i32, i32),
+    /// 窗口类名：`Progman`/`WorkerW` 是桌面本身，单击它们不算"选中一个窗口"。
+    class: String,
 }
 
 /// 工具条上的一颗按钮（覆盖层客户区坐标）。
@@ -637,6 +648,7 @@ fn chip_band(y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
 pub fn bright_rect(s: &SnipState) -> Option<(i32, i32, i32, i32)> {
     match s.drag {
         Some((Drag::New, _, _))
+        | Some((Drag::NewPending, _, _))
         | Some((Drag::Handle(_), _, _))
         | Some((Drag::Mark, _, _))
         | Some((Drag::Pick(_), _, _))
@@ -1951,14 +1963,14 @@ pub fn pin_receipt(
             "截图已存 {name}（{w}x{h}），并钉在桌面上；复制到剪贴板没成：{e}（粘到别处拿不到这张图）"
         ),
         (None, Some(e), None) => format!(
-            "图没存下来：{e}（已经钉在桌面上，可以右键再处理；要留文件就修好那一处再截一次）"
+            "图没存下来：{e}（已经钉在桌面上：可拖动/滚轮缩放；关掉这张贴图就没有别的副本了；要留文件就修好那一处再截一次）"
         ),
         (None, Some(e), Some(c)) => format!(
-            "图没存下来：{e}；复制到剪贴板也没成：{c}（只有钉在桌面上这张成了，右键还能再处理）"
+            "图没存下来：{e}；复制到剪贴板也没成：{c}（只有钉在桌面上这张成了：先别关它，关掉就没有别的副本了）"
         ),
         // 落盘失败时 `saved_name` 必是 None、`save_err` 必是 Some：剩下这一支是
         // "什么都没成却说不出为什么"，宁可念一句没成，也不许编一句成。
-        _ => "贴图这一步没能确认：文件与剪贴板两边都没交回结果（钉在桌面上那张可能仍可用）".to_string(),
+        _ => "贴图这一步没能确认：文件与剪贴板两边都没交回结果（钉在桌面上可拖动缩放，关掉就没了）".to_string(),
     }
 }
 
@@ -2030,7 +2042,8 @@ fn commit_into(dir: &std::path::Path, clipboard: bool, pin: bool) -> Verdict {
         }
     };
     if pin {
-        // 贴图这条以"钉上了"为成交：钉好的那张还在桌上可以右键再处理，不该把覆盖层压着不放。
+        // 贴图这条以"钉上了"为成交：钉好的那张还在桌上可以拖动/缩放（关掉就没了），
+        // 不该把覆盖层压着不放。
         // 但"成交"不等于"三件都成"——`commit_verdict` 上面那段自己写的规矩（只丢剪贴板也要
         // 说出来，因为"以为复制上了"会让他粘到别处才发现是空的）在这一支同样成立：
         // 从前这里只看 `saved` 有没有值，于是剪贴板没进去也照念「同时复制到剪贴板」，
@@ -2067,6 +2080,7 @@ fn commit_into(dir: &std::path::Path, clipboard: bool, pin: bool) -> Verdict {
 
 /// 出图并据此收场：成则关窗，败则把原因写在屏上、覆盖层留着等第二次 Enter。
 /// 五个调用点（工具条"保存"与"贴图"、松手即存、Enter/Ctrl+S、P）都走这条，去向都是真实的。
+#[cfg(not(test))]
 unsafe fn commit_and_close(hwnd: HWND, pin: bool) {
     let dir = focusflow_core::paths::screenshots_dir();
     commit_and_close_into(hwnd, pin, &dir, true);
@@ -2076,6 +2090,15 @@ unsafe fn commit_and_close(hwnd: HWND, pin: bool) {
 /// 屏上探针要靠它端到端判"写盘失败不退、写成就退"这两条，而真实去向会往用户的
 /// `data/screenshots` 落一张、还会盖掉他的剪贴板——那两件事只能在独立进程的验收套件里做。
 unsafe fn commit_and_close_into(hwnd: HWND, pin: bool, dir: &std::path::Path, clipboard: bool) {
+    // 点击出图时 EDIT 的失焦回执可能还没处理：合成前同步落字。
+    // 先取走身份，销毁输入框投来的旧 WM_EDIT_DONE 就不会重复落笔；失败重试也一样。
+    let (edit, at) = SNIP
+        .lock()
+        .map(|mut s| (std::mem::take(&mut s.text_edit), s.text_at))
+        .unwrap_or((0, (0, 0)));
+    if edit != 0 {
+        finish_text_edit(HWND(edit as *mut core::ffi::c_void), at, true);
+    }
     match commit_into(dir, clipboard, pin) {
         Verdict::Done => {
             let _ = DestroyWindow(hwnd);
@@ -2144,11 +2167,15 @@ unsafe extern "system" fn collect_hit(hwnd: HWND, _l: LPARAM) -> BOOL {
             let _ = GetWindowRect(hwnd, &mut rc);
         }
     }
+    let mut cbuf = [0u16; 64];
+    let cn = unsafe { GetClassNameW(hwnd, &mut cbuf) }.max(0) as usize;
+    let class = String::from_utf16_lossy(&cbuf[..cn]);
     if let Ok(mut v) = SNIP_HITS.lock() {
         v.push(Candidate {
             pid,
             visible: unsafe { IsWindowVisible(hwnd) }.as_bool(),
             rect: (rc.left, rc.top, rc.right, rc.bottom),
+            class,
         });
     }
     TRUE
@@ -2168,6 +2195,11 @@ fn window_hit(
 ) -> Option<(i32, i32, i32, i32)> {
     for c in candidates {
         if c.pid == self_pid || !c.visible {
+            continue;
+        }
+        // 桌面本身不是"一个窗口"：单击壁纸在快速模式里会被当成整屏选区，
+        // 直接存一张图并把剪贴板盖掉。跳过它，没别的窗口就落到 Cancel。
+        if c.class.eq_ignore_ascii_case("Progman") || c.class.eq_ignore_ascii_case("WorkerW") {
             continue;
         }
         let (l, t, r, b) = c.rect;
@@ -2326,11 +2358,18 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                     Press::Text(x, y) => open_text_edit(hwnd, x, y),
                     Press::New(x, y) => {
                         if let Ok(mut s) = SNIP.lock() {
-                            s.phase = Phase::Select;
-                            s.drag = Some((Drag::New, x, y));
-                            s.sel = (x, y, x, y);
-                            s.hover = None;
-                            s.cur = (x, y);
+                            if s.phase == Phase::Adjust {
+                                // 标注阶段点选区外不等于"重新框选"：可能是误点。
+                                // 先挂成待定，拖够距离才真的换选区（见 WM_MOUSEMOVE）。
+                                s.drag = Some((Drag::NewPending, x, y));
+                                s.cur = (x, y);
+                            } else {
+                                s.phase = Phase::Select;
+                                s.drag = Some((Drag::New, x, y));
+                                s.sel = (x, y, x, y);
+                                s.hover = None;
+                                s.cur = (x, y);
+                            }
                         }
                         let _ = SetCapture(hwnd);
                         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2353,6 +2392,16 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                         changed = true;
                     }
                     match s.drag {
+                        Some((Drag::NewPending, sx, sy)) => {
+                            // 拖过门槛才承认这是"重新框选"；标注到这一刻才允许被清。
+                            if pending_new_should_promote(sx, sy, x, y) {
+                                s.phase = Phase::Select;
+                                s.sel = clamp_rect(norm_rect(sx, sy, x, y), s.base_w, s.base_h);
+                                s.drag = Some((Drag::New, sx, sy));
+                                s.hover = None;
+                                changed = true;
+                            }
+                        }
                         Some((Drag::New, sx, sy)) => {
                             let nr = clamp_rect(norm_rect(sx, sy, x, y), s.base_w, s.base_h);
                             if nr != s.sel {
@@ -2436,6 +2485,12 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                 let _ = ReleaseCapture();
                 let drag = SNIP.lock().map(|s| s.drag).unwrap_or(None);
                 match drag {
+                    Some((Drag::NewPending, _, _)) => {
+                        // 只是点了一下选区外：把待定清掉，选区与标注原样留着。
+                        if let Ok(mut s) = SNIP.lock() {
+                            s.drag = None;
+                        }
+                    }
                     Some((Drag::New, _, _)) => {
                         let (sel, annotate, hit) = SNIP
                             .lock()
@@ -2831,8 +2886,14 @@ unsafe fn on_key(hwnd: HWND, vk: usize) {
         KeyAct::Pin => {
             commit_and_close(hwnd, true);
         }
-        KeyAct::Undo => undo(),
-        KeyAct::Redo => redo_mark(),
+        KeyAct::Undo => {
+            undo();
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        KeyAct::Redo => {
+            redo_mark();
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
         KeyAct::DeleteSelected => {
             let mut del = false;
             if let Ok(mut s) = SNIP.lock() {
@@ -2926,7 +2987,8 @@ fn redo_mark() {
 unsafe fn finish_text_edit(h: HWND, at: (i32, i32), keep: bool) {
     unsafe {
         if keep {
-            let mut buf = [0u16; 256];
+            let len = GetWindowTextLengthW(h).max(0) as usize;
+            let mut buf = vec![0u16; len + 1];
             let n = GetWindowTextW(h, &mut buf).max(0) as usize;
             let text = String::from_utf16_lossy(&buf[..n]);
             if !text.trim().is_empty() {
@@ -3677,12 +3739,472 @@ pub fn test_capture_to(rect: (i32, i32, i32, i32), out: &std::path::Path) {
 }
 
 #[cfg(test)]
+unsafe fn commit_and_close(hwnd: HWND, pin: bool) {
+    if let Some(dir) = render_probe::UX_COMMIT_DIR.with(|v| v.borrow().clone()) {
+        commit_and_close_into(hwnd, pin, &dir, false);
+    } else {
+        let dir = focusflow_core::paths::screenshots_dir();
+        commit_and_close_into(hwnd, pin, &dir, true);
+    }
+}
+
+#[cfg(test)]
 mod render_probe {
     use super::*;
     use windows::Win32::Graphics::Gdi::{BitBlt, CreateCompatibleBitmap, GetDIBits, SRCCOPY};
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
     };
+
+    std::thread_local! {
+        // 只替换出图去向，真实鼠标仍走 overlay_proc -> bar_action -> 共享保存边界。
+        pub(super) static UX_COMMIT_DIR: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    struct UxProbe {
+        ov: HWND,
+        home: POINT,
+        foreground: HWND,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for UxProbe {
+        fn drop(&mut self) {
+            unsafe {
+                // 只收本测试进程自己的窗口；红测 panic 也要释放桌面。
+                let pins: Vec<_> = crate::PINS.lock().unwrap().iter().map(|p| p.hwnd).collect();
+                for pin in pins {
+                    let _ = DestroyWindow(HWND(pin as *mut core::ffi::c_void));
+                }
+                if IsWindow(Some(self.ov)).as_bool() {
+                    let _ = DestroyWindow(self.ov);
+                }
+                UX_COMMIT_DIR.with(|v| *v.borrow_mut() = None);
+                let _ = SetCursorPos(self.home.x, self.home.y);
+                let _ = SetForegroundWindow(self.foreground);
+                pump(100);
+            }
+        }
+    }
+
+    impl UxProbe {
+        unsafe fn new(name: &str) -> Self {
+            let root = std::path::PathBuf::from(
+                std::env::var_os("SNIP_UX_ARTIFACT_DIR").expect("必须指定本轮 .scratch 工件目录"),
+            );
+            assert!(root.is_absolute() && root.is_dir());
+            let dir = root.join(format!("{name}-{}", std::process::id()));
+            std::fs::create_dir(&dir).expect("必须使用未占用的测试目录");
+            assert!(crate::PINS.lock().unwrap().is_empty(), "本测试进程已有贴图");
+            let mut probe = Self {
+                ov: HWND::default(),
+                home: POINT::default(),
+                foreground: GetForegroundWindow(),
+                dir,
+            };
+            GetCursorPos(&mut probe.home).unwrap();
+            start(HWND::default(), true);
+            probe.ov = HWND(SNIP.lock().unwrap().overlay as *mut core::ffi::c_void);
+            assert!(IsWindow(Some(probe.ov)).as_bool());
+            pump(300);
+            {
+                let mut s = SNIP.lock().unwrap();
+                assert!(s.base_w > 900 && s.base_h > 600, "屏幕太小");
+                s.base = [35, 65, 95, 255].repeat((s.base_w * s.base_h) as usize);
+                s.dim = dim_bgra(&s.base);
+                s.presented_all = false;
+                s.hits.clear();
+                s.hover = None;
+                s.color = rgb(255, 45, 45);
+                s.font = 24;
+            }
+            // 由真实产品手势触发首帧；不在测试里 Invalidate/UpdateWindow。
+            post_mouse(probe.ov, WM_LBUTTONDOWN, 240, 200);
+            post_mouse(probe.ov, WM_MOUSEMOVE, 640, 460);
+            post_mouse(probe.ov, WM_LBUTTONUP, 640, 460);
+            pump(300);
+            assert_eq!(SNIP.lock().unwrap().sel, (240, 200, 640, 460));
+            assert_eq!(SNIP.lock().unwrap().phase, Phase::Adjust);
+            UX_COMMIT_DIR.with(|v| *v.borrow_mut() = Some(probe.dir.join("out")));
+            probe
+        }
+
+        unsafe fn shot(&self, name: &str) -> Vec<u8> {
+            let origin = SNIP.lock().unwrap().origin;
+            let pixels = grab_rect(origin.0 + 240, origin.1 + 200, 400, 260).unwrap();
+            std::fs::write(
+                self.dir.join(format!("{name}.png")),
+                png_bytes(&pixels, 400, 260).unwrap(),
+            )
+            .unwrap();
+            pixels
+        }
+
+        unsafe fn block(&self) {
+            click_bar(self.ov, "block");
+            pump(100);
+            post_mouse(self.ov, WM_LBUTTONDOWN, 260, 220);
+            post_mouse(self.ov, WM_MOUSEMOVE, 360, 320);
+            post_mouse(self.ov, WM_LBUTTONUP, 360, 320);
+            pump(250);
+            assert_eq!(SNIP.lock().map(|s| s.marks.len()).unwrap(), 1);
+            assert_eq!(pixel3(&self.shot("drawn"), 400, 60, 60), [45, 45, 255]);
+        }
+
+        unsafe fn edit(&self) -> HWND {
+            real_bar(self.ov, "text");
+            real_click(self.ov, 270, 350);
+            let ed = HWND(SNIP.lock().map(|s| s.text_edit).unwrap() as *mut core::ffi::c_void);
+            assert!(IsWindow(Some(ed)).as_bool(), "真实点击未打开 EDIT");
+            assert_eq!(windows::Win32::UI::Input::KeyboardAndMouse::GetFocus(), ed);
+            ed
+        }
+    }
+
+    unsafe fn real_click(ov: HWND, x: i32, y: i32) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        assert_eq!(GetForegroundWindow(), ov, "输入前覆盖层必须是前台窗口");
+        let origin = SNIP.lock().unwrap().origin;
+        SetCursorPos(origin.0 + x, origin.1 + y).unwrap();
+        pump(100);
+        assert_eq!(
+            WindowFromPoint(POINT {
+                x: origin.0 + x,
+                y: origin.1 + y
+            }),
+            ov,
+            "真实点击必须命中覆盖层而非 EDIT 或别的窗口"
+        );
+        let inputs = [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP].map(|flags| INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dwFlags: flags,
+                    ..Default::default()
+                },
+            },
+        });
+        assert_eq!(SendInput(&inputs, std::mem::size_of::<INPUT>() as i32), 2);
+        pump(250);
+    }
+
+    unsafe fn real_bar(ov: HWND, id: &str) {
+        let btns = {
+            let s = SNIP.lock().unwrap();
+            bar_rects(s.sel, s.base_w, s.base_h).0
+        };
+        let b = btns.iter().find(|b| b.id == id).unwrap();
+        real_click(ov, b.x + b.w / 2, b.y + b.h / 2);
+    }
+
+    unsafe fn real_key(vk: u16, ctrl: bool) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        let key = |vk, flags| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(vk),
+                    dwFlags: flags,
+                    ..Default::default()
+                },
+            },
+        };
+        let mut inputs = Vec::new();
+        if ctrl {
+            inputs.push(key(VK_CONTROL.0, KEYBD_EVENT_FLAGS(0)));
+        }
+        inputs.push(key(vk, KEYBD_EVENT_FLAGS(0)));
+        inputs.push(key(vk, KEYEVENTF_KEYUP));
+        if ctrl {
+            inputs.push(key(VK_CONTROL.0, KEYEVENTF_KEYUP));
+        }
+        assert_eq!(
+            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32),
+            inputs.len() as u32
+        );
+        pump(300);
+    }
+
+    unsafe fn type_text(ed: HWND, text: &str) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        assert_eq!(GetFocus(), ed);
+        let inputs: Vec<_> = text
+            .encode_utf16()
+            .flat_map(|unit| {
+                [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP].map(|flags| INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wScan: unit,
+                            dwFlags: flags,
+                            ..Default::default()
+                        },
+                    },
+                })
+            })
+            .collect();
+        for pair in inputs.chunks(2) {
+            assert_eq!(SendInput(pair, std::mem::size_of::<INPUT>() as i32), 2);
+            pump(60);
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        while edit_text(ed) != text && Instant::now() < deadline {
+            pump(50);
+        }
+        assert_eq!(edit_text(ed), text, "夹具必须先证实 EDIT 已收到完整输入");
+        assert_eq!(GetFocus(), ed, "点击保存之前不能提前移走焦点");
+        assert!(
+            SNIP.lock().unwrap().marks.is_empty(),
+            "点击前文字不能已落成 mark"
+        );
+    }
+
+    unsafe fn edit_text(ed: HWND) -> String {
+        let mut text = vec![0; GetWindowTextLengthW(ed) as usize + 1];
+        let n = GetWindowTextW(ed, &mut text) as usize;
+        String::from_utf16(&text[..n]).unwrap()
+    }
+
+    fn text_marks() -> Vec<String> {
+        SNIP.lock()
+            .unwrap()
+            .marks
+            .iter()
+            .filter_map(|m| match &m.shape {
+                Shape::Text(_, _, t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "独占桌面；需 SNIP_UX_ARTIFACT_DIR"]
+    fn ux_keyboard_undo_repaints_without_mouse_motion() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let p = UxProbe::new("undo");
+            p.block();
+            let mut before = POINT::default();
+            GetCursorPos(&mut before).unwrap();
+            real_key(0x5A, true);
+            assert!(SNIP.lock().unwrap().marks.is_empty(), "Ctrl+Z 未到达产品");
+            let after = p.shot("undone");
+            let mut cursor = POINT::default();
+            GetCursorPos(&mut cursor).unwrap();
+            assert_eq!((cursor.x, cursor.y), (before.x, before.y));
+            assert_eq!(
+                pixel3(&after, 400, 60, 60),
+                [35, 65, 95],
+                "撤销改了 marks 但屏幕仍是色块"
+            );
+            real_key(0x59, true);
+            assert_eq!(pixel3(&p.shot("redone"), 400, 60, 60), [45, 45, 255]);
+            real_key(0x08, false);
+            assert_eq!(pixel3(&p.shot("backspace"), 400, 60, 60), [35, 65, 95]);
+        }
+    }
+
+    #[test]
+    #[ignore = "独占桌面；需 SNIP_UX_ARTIFACT_DIR"]
+    fn ux_keyboard_redo_repaints_without_mouse_motion() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let p = UxProbe::new("redo");
+            p.block();
+            click_bar(p.ov, "undo");
+            pump(250);
+            assert_eq!(pixel3(&p.shot("undone"), 400, 60, 60), [35, 65, 95]);
+            let mut before = POINT::default();
+            GetCursorPos(&mut before).unwrap();
+            real_key(0x59, true);
+            assert_eq!(
+                SNIP.lock().map(|s| s.marks.len()).unwrap(),
+                1,
+                "Ctrl+Y 未到达产品"
+            );
+            let after = p.shot("redone");
+            let mut cursor = POINT::default();
+            GetCursorPos(&mut cursor).unwrap();
+            assert_eq!((cursor.x, cursor.y), (before.x, before.y));
+            assert_eq!(
+                pixel3(&after, 400, 60, 60),
+                [45, 45, 255],
+                "重做改了 marks 但屏幕仍是底图"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "独占桌面；需 SNIP_UX_ARTIFACT_DIR"]
+    fn ux_long_edit_preserves_utf16_boundary_and_tail() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let p = UxProbe::new("long-edit");
+            let ed = p.edit();
+            let text = format!(
+                "{}\u{20000}{}TAIL-MARKER",
+                "甲".repeat(254),
+                "乙".repeat(90)
+            );
+            let units: Vec<_> = text.encode_utf16().collect();
+            assert!((0xD800..=0xDBFF).contains(&units[254]));
+            assert!((0xDC00..=0xDFFF).contains(&units[255]));
+            SetWindowTextW(ed, &HSTRING::from(&text)).unwrap();
+            assert_eq!(edit_text(ed), text);
+            real_key(0x0D, false);
+            let got = text_marks();
+            std::fs::write(p.dir.join("expected.txt"), &text).unwrap();
+            std::fs::write(p.dir.join("actual.txt"), got.join("\n")).unwrap();
+            assert_eq!(
+                got,
+                vec![text],
+                "真实 EDIT 落笔丢失了跨旧边界的代理对或末尾"
+            );
+            assert!(!IsWindow(Some(ed)).as_bool());
+        }
+    }
+
+    unsafe fn check_text_output(p: &UxProbe, pin: bool) {
+        assert!(!IsWindow(Some(p.ov)).as_bool(), "成功保存后覆盖层应关闭");
+        let files: Vec<_> = std::fs::read_dir(p.dir.join("out"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        let (rgba, w, h) =
+            focusflow_core::capture::decode_png_rgba(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!((w, h), (400, 260));
+        let red_pixels = (150..180)
+            .flat_map(|y| (30..260).map(move |x| (y * 400 + x) * 4))
+            .filter(|&i| rgba[i] > 180 && rgba[i + 1] < 100 && rgba[i + 2] < 100)
+            .count();
+        eprintln!("output={} text_red_pixels={red_pixels}", files[0].display());
+        assert!(
+            red_pixels > 20,
+            "不按 Enter 直接点保存/贴图，文字没进入 PNG"
+        );
+        if pin {
+            let pins = crate::PINS.lock().unwrap();
+            assert_eq!(pins.len(), 1);
+            let h = HWND(pins[0].hwnd as *mut core::ffi::c_void);
+            drop(pins);
+            let (screen, w, h) = print_window(h).unwrap();
+            std::fs::write(p.dir.join("pin.png"), png_bytes(&screen, w, h).unwrap()).unwrap();
+            let red = screen
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[2] > 180 && p[1] < 100 && p[0] < 100)
+                .count();
+            assert!(red > 20, "贴图窗口里也必须有文字像素");
+        }
+    }
+
+    #[test]
+    #[ignore = "独占桌面；真实输入点击，仅写临时目录，禁用剪贴板"]
+    fn ux_live_edit_is_saved_by_real_toolbar_click() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let p = UxProbe::new("save-text");
+            let ed = p.edit();
+            type_text(ed, "未提交文字");
+            p.shot("editing");
+            real_bar(p.ov, "save");
+            check_text_output(&p, false);
+        }
+    }
+
+    #[test]
+    #[ignore = "独占桌面；真实输入点击，仅写临时目录，禁用剪贴板"]
+    fn ux_live_edit_is_pinned_by_real_toolbar_click() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let p = UxProbe::new("pin-text");
+            let ed = p.edit();
+            type_text(ed, "未提交文字");
+            p.shot("editing");
+            real_bar(p.ov, "pin");
+            check_text_output(&p, true);
+        }
+    }
+
+    #[test]
+    #[ignore = "独占桌面；真实输入点击，仅写临时目录，禁用剪贴板"]
+    fn ux_failed_save_commits_once_and_retry_keeps_text() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let p = UxProbe::new("retry-text");
+            let blocked = p.dir.join("blocked");
+            std::fs::write(&blocked, b"not a directory").unwrap();
+            UX_COMMIT_DIR.with(|v| *v.borrow_mut() = Some(blocked));
+            let ed = p.edit();
+            type_text(ed, "未提交文字");
+            p.shot("editing");
+            real_bar(p.ov, "save");
+            assert!(IsWindow(Some(p.ov)).as_bool());
+            assert!(SNIP.lock().unwrap().notice.is_some());
+            assert_eq!(
+                SNIP.lock().map(|s| s.text_edit).unwrap(),
+                0,
+                "失败也应同步落字并清 EDIT 身份"
+            );
+            assert_eq!(text_marks(), vec!["未提交文字"]);
+            // 重放被销毁 EDIT 的异步回执：必须无效，不能重复落笔。
+            PostMessageW(Some(p.ov), WM_EDIT_DONE, WPARAM(1), LPARAM(ed.0 as isize)).unwrap();
+            pump(100);
+            assert_eq!(text_marks(), vec!["未提交文字"]);
+            assert_eq!(SNIP.lock().map(|s| s.undo_stack.len()).unwrap(), 1);
+            real_click(p.ov, 300, 400);
+            let next = SNIP.lock().map(|s| s.text_edit).unwrap();
+            assert_ne!(next, 0);
+            assert_ne!(next, ed.0 as isize, "夹具需要不同 EDIT 身份");
+            let next_hwnd = HWND(next as *mut core::ffi::c_void);
+            SetWindowTextW(next_hwnd, &HSTRING::from("DISCARD")).unwrap();
+            for code in [1, 2] {
+                PostMessageW(
+                    Some(p.ov),
+                    WM_EDIT_DONE,
+                    WPARAM(code),
+                    LPARAM(ed.0 as isize),
+                )
+                .unwrap();
+            }
+            pump(100);
+            assert_eq!(
+                SNIP.lock().map(|s| s.text_edit).unwrap(),
+                next,
+                "旧回执误收了新框"
+            );
+            assert_eq!(edit_text(next_hwnd), "DISCARD");
+            assert_eq!(text_marks(), vec!["未提交文字"]);
+            real_key(0x1B, false);
+            assert_eq!(text_marks(), vec!["未提交文字"]);
+            assert_eq!(SNIP.lock().map(|s| s.undo_stack.len()).unwrap(), 1);
+            UX_COMMIT_DIR.with(|v| *v.borrow_mut() = Some(p.dir.join("out")));
+            real_bar(p.ov, "save");
+            check_text_output(&p, false);
+        }
+    }
+
+    #[test]
+    #[ignore = "独占桌面；需 SNIP_UX_ARTIFACT_DIR"]
+    fn ux_escape_discards_only_current_text() {
+        unsafe {
+            let _serial = crate::probe_guard();
+            let p = UxProbe::new("escape-text");
+            let first = p.edit();
+            type_text(first, "保留");
+            real_key(0x0D, false);
+            assert_eq!(text_marks(), vec!["保留"]);
+            real_click(p.ov, 300, 400);
+            let ed = HWND(SNIP.lock().map(|s| s.text_edit).unwrap() as *mut core::ffi::c_void);
+            SetWindowTextW(ed, &HSTRING::from("DISCARD")).unwrap();
+            real_key(0x1B, false);
+            assert!(IsWindow(Some(p.ov)).as_bool());
+            assert_eq!(SNIP.lock().map(|s| s.text_edit).unwrap(), 0);
+            assert_eq!(text_marks(), vec!["保留"]);
+        }
+    }
 
     /// 把消息跑掉一段**有界**时间：测试不许因为一条没来的消息挂在那儿。
     unsafe fn pump(ms: u32) {
@@ -4103,6 +4625,7 @@ mod render_probe {
                 s.hits = vec![Candidate {
                     pid: 999_999,
                     visible: true,
+                    class: "Notepad".to_string(),
                     rect: (
                         origin.0 + hot.0,
                         origin.1 + hot.1,
@@ -4795,6 +5318,7 @@ mod render_probe {
                 s.hits = vec![Candidate {
                     pid: 999_998,
                     visible: true,
+                    class: "Notepad".to_string(),
                     rect: (
                         org3.0 + far.0,
                         org3.1 + far.1,
@@ -5890,7 +6414,16 @@ mod tests {
     use super::*;
 
     fn cand(pid: u32, visible: bool, rect: (i32, i32, i32, i32)) -> Candidate {
-        Candidate { pid, visible, rect }
+        cand_class(pid, visible, rect, "Notepad")
+    }
+
+    fn cand_class(pid: u32, visible: bool, rect: (i32, i32, i32, i32), class: &str) -> Candidate {
+        Candidate {
+            pid,
+            visible,
+            rect,
+            class: class.to_string(),
+        }
     }
 
     /// 范围版合成：`clip` 之外的像素一个都不许动（那是上一帧已经交出去、这一帧没改的部分）。
@@ -6488,6 +7021,40 @@ mod tests {
         assert_eq!(
             window_hit(&list, 1, SCREEN, 150, 150),
             Some((100, 100, 300, 260))
+        );
+    }
+
+    /// 桌面不是窗口：单击壁纸在快速模式里不能被当成"选中整个桌面"。
+    ///
+    /// 旧行为是 `Progman`/`WorkerW` 也进候选，于是热键→点一下桌面想取消，结果
+    /// 存了一张整屏图、剪贴板也被盖掉。
+    #[test]
+    fn desktop_shell_windows_are_never_picked() {
+        // 桌面在最上面，下面压着真正的应用窗口 ⇒ 必须跳过桌面选应用。
+        let list = [
+            cand_class(4, true, (0, 0, 1920, 1080), "Progman"),
+            cand(9, true, (400, 400, 700, 500)),
+        ];
+        assert_eq!(
+            window_hit(&list, 1, SCREEN, 450, 450),
+            Some((400, 400, 700, 500)),
+            "桌面类没被跳过，抢走了应用窗口"
+        );
+        // 只有桌面 ⇒ 没有可选的窗口，交给 `release_outcome` 走 Cancel。
+        assert_eq!(
+            window_hit(
+                &[cand_class(5, true, (0, 0, 1920, 1080), "WorkerW")],
+                1,
+                SCREEN,
+                500,
+                500
+            ),
+            None
+        );
+        assert_eq!(
+            release_outcome((5, 5, 6, 6), None),
+            Release::Cancel,
+            "点空桌面必须取消，不能存一张整屏图"
         );
     }
 
@@ -7681,6 +8248,20 @@ mod tests {
         );
     }
 
+    /// 标注阶段点选区外：没拖够只是点击（不许清标注），拖够才升成重新框选。
+    #[test]
+    fn a_stray_click_does_not_promote_to_a_new_selection() {
+        assert!(!pending_new_should_promote(100, 100, 100, 100));
+        assert!(
+            !pending_new_should_promote(100, 100, 100 + MIN_DRAG - 1, 100),
+            "差一像素就清掉标注，等于把误点做成了重新框选"
+        );
+        assert!(pending_new_should_promote(100, 100, 100 + MIN_DRAG, 100));
+        assert!(pending_new_should_promote(100, 100, 100, 100 - MIN_DRAG));
+        // 方向无关：负向同样按绝对值判
+        assert!(pending_new_should_promote(100, 100, 100 - MIN_DRAG, 100));
+    }
+
     /// 开层失败的三条路（虚拟屏、冻结、建窗）都要给状态行回执：覆盖层没起来时
     /// 只在日志里说一句，按热键的人看到的只是"这个键没反应"。
     #[test]
@@ -7897,5 +8478,85 @@ mod loupe_tests {
         assert!(t.contains("-1888,32"), "要说屏幕上那一格在哪: {t}");
         assert!(t.contains("11×11"), "取的是多大一块: {t}");
         assert!(t.contains("8 倍"), "倍率要写在同一句里: {t}");
+    }
+
+    struct SnipStateReset;
+    impl Drop for SnipStateReset {
+        fn drop(&mut self) {
+            if let Ok(mut s) = SNIP.lock() {
+                *s = default_state();
+            }
+        }
+    }
+
+    fn packed_point(x: i32, y: i32) -> LPARAM {
+        LPARAM((((y as isize) & 0xFFFF) << 16) | ((x as isize) & 0xFFFF))
+    }
+
+    /// 标注阶段点选区外：单击不清标注；拖够距离才换选区并清标注。
+    ///
+    /// 这条直接走 `overlay_proc` 的按下/移动/松开三段（不含真实窗口），
+    /// 盯的是"误点一下 → marks 还在、选区不变"这个用户能看见的结局。
+    #[test]
+    fn a_stray_click_outside_the_selection_keeps_the_marks() {
+        let _serial = crate::probe_guard();
+        let _reset = SnipStateReset;
+        {
+            let mut s = SNIP.lock().unwrap();
+            s.phase = Phase::Adjust;
+            s.annotate = true;
+            s.sel = (240, 200, 640, 460);
+            s.base_w = 1920;
+            s.base_h = 1080;
+            s.marks.push(Mark {
+                shape: Shape::Rect(10, 10, 20, 20),
+                style: Style {
+                    rgb: PALETTE[0].0,
+                    w: WIDTHS[0].0,
+                    font: FONTS[1].0,
+                },
+            });
+        }
+        let hwnd = HWND::default();
+        unsafe {
+            overlay_proc(hwnd, WM_LBUTTONDOWN, WPARAM(1), packed_point(800, 600));
+        }
+        {
+            let s = SNIP.lock().unwrap();
+            assert_eq!(s.phase, Phase::Adjust, "误点一开始就切走了选区阶段");
+            assert_eq!(s.sel, (240, 200, 640, 460), "误点改了选区");
+            assert_eq!(s.marks.len(), 1, "误点清了标注");
+            assert_eq!(s.drag, Some((Drag::NewPending, 800, 600)));
+        }
+        unsafe {
+            overlay_proc(hwnd, WM_LBUTTONUP, WPARAM(0), packed_point(800, 600));
+        }
+        {
+            let s = SNIP.lock().unwrap();
+            assert_eq!(s.phase, Phase::Adjust);
+            assert_eq!(s.sel, (240, 200, 640, 460));
+            assert_eq!(s.marks.len(), 1, "单击松开后标注被清了");
+            assert_eq!(s.drag, None);
+        }
+
+        // 真的拖出新区：这一下才允许换选区/清标注。
+        unsafe {
+            overlay_proc(hwnd, WM_LBUTTONDOWN, WPARAM(1), packed_point(700, 700));
+            overlay_proc(hwnd, WM_MOUSEMOVE, WPARAM(1), packed_point(900, 500));
+        }
+        {
+            let s = SNIP.lock().unwrap();
+            assert_eq!(s.phase, Phase::Select, "拖够距离反而没进新选区");
+            assert_eq!(s.sel, (700, 500, 900, 700));
+        }
+        unsafe {
+            overlay_proc(hwnd, WM_LBUTTONUP, WPARAM(0), packed_point(900, 500));
+        }
+        {
+            let s = SNIP.lock().unwrap();
+            assert_eq!(s.phase, Phase::Adjust);
+            assert_eq!(s.sel, (700, 500, 900, 700));
+            assert!(s.marks.is_empty(), "重新框选之后旧标注应当清掉");
+        }
     }
 }

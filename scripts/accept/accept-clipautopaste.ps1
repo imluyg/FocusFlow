@@ -96,6 +96,13 @@ $fx.Size = New-Object System.Drawing.Size(420, 160)
 $tb = New-Object System.Windows.Forms.TextBox
 $tb.Multiline = $true
 $tb.Dock = 'Fill'
+$script:pasteKeys = New-Object 'System.Collections.Generic.List[string]'
+$tb.Add_KeyDown({
+    param($sender, $event)
+    if ($event.KeyCode -eq [System.Windows.Forms.Keys]::V) {
+        $script:pasteKeys.Add("ctrl=$($event.Control) alt=$($event.Alt) shift=$($event.Shift)")
+    }
+})
 $fx.Controls.Add($tb)
 # The app's main window would otherwise cover this fixture, and a click meant for the
 # TextBox would land on the app. TopMost keeps the fixture visible for the click.
@@ -211,6 +218,121 @@ Check 'double-clicking a row auto-pastes into the target' ($tb.Text.Contains($ma
 $hiddenAfterClick = $true
 if ($popup4 -gt 0) { $hiddenAfterClick = -not [FF]::IsWindowVisible([IntPtr]$popup4) }
 Check 'double-clicking a row closes the palette' $hiddenAfterClick
+
+$tb.Clear()
+$script:pasteKeys.Clear()
+[void][FF]::ClickScreen($fx.Handle, [int](($fxRect.Right - $fxRect.Left) / 2), 60, 1)
+Pump 300
+Check 'target owns the foreground before held Alt selection' ([FF]::GetForegroundWindow() -eq $fx.Handle)
+[FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+Pump 900
+$altPopup = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+Check 'palette is visible before held Alt selection' ($altPopup -gt 0 -and [FF]::IsWindowVisible([IntPtr]$altPopup))
+try {
+    [FF]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x31, 0, 0, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x31, 0, 2, [UIntPtr]::Zero)
+    Pump 150
+    Check 'no paste key is injected while Alt remains held' ($script:pasteKeys.Count -eq 0) ($script:pasteKeys -join '; ')
+    Check 'held Alt does not insert content early' ($tb.Text.Length -eq 0)
+} finally {
+    [FF]::keybd_event(0x31, 0, 2, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+}
+Pump 900
+Check 'Alt selection pastes exactly once after release' ($tb.Text -eq $marker) "textbox='$($tb.Text)'"
+Check 'Alt selection sends only unmodified Ctrl+V' `
+    ($script:pasteKeys.Count -eq 1 -and $script:pasteKeys[0] -eq 'ctrl=True alt=False shift=False') `
+    ($script:pasteKeys -join '; ')
+
+$tb.Clear()
+$script:pasteKeys.Clear()
+[void][FF]::ClickScreen($fx.Handle, [int](($fxRect.Right - $fxRect.Left) / 2), 60, 1)
+Pump 300
+[FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+Pump 900
+$failBeforeHeld = @(Get-LogLines | Where-Object { $_ -like '*clip_autopaste ok=false*' }).Count
+try {
+    [FF]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x31, 0, 0, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x31, 0, 2, [UIntPtr]::Zero)
+    Pump 650
+    Check 'held modifier timeout never injects a paste key' ($script:pasteKeys.Count -eq 0)
+} finally {
+    [FF]::keybd_event(0x31, 0, 2, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+}
+Pump 500
+Check 'releasing Alt after timeout cannot paste late' ($tb.Text.Length -eq 0 -and $script:pasteKeys.Count -eq 0)
+Check 'modifier timeout reports a failed auto-paste' (Wait-LogCount '*clip_autopaste ok=false*' ($failBeforeHeld + 1) 2000)
+
+$tb.Clear()
+$script:pasteKeys.Clear()
+[void][FF]::ClickScreen($fx.Handle, [int](($fxRect.Right - $fxRect.Left) / 2), 60, 1)
+Pump 300
+[FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+Pump 900
+$reopenPopup = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+try {
+    [FF]::keybd_event(0x10, 0, 0, [UIntPtr]::Zero)
+    [FF]::PostMessage([IntPtr]$reopenPopup, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero) | Out-Null
+    Pump 70
+    [FF]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero)
+    [FF]::keybd_event([byte]$hotVk, 0, 0, [UIntPtr]::Zero)
+    [FF]::keybd_event([byte]$hotVk, 0, 2, [UIntPtr]::Zero)
+    Pump 170
+} finally {
+    [FF]::keybd_event([byte]$hotVk, 0, 2, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x10, 0, 2, [UIntPtr]::Zero)
+}
+Pump 500
+Check 'hotkey reopens the palette while paste waits on Shift' ([FF]::IsWindowVisible([IntPtr]$reopenPopup))
+Check 'reopening cancels the pending paste' ($tb.Text.Length -eq 0 -and $script:pasteKeys.Count -eq 0)
+$reopenEdit = [FF]::ChildByClassHandle($reopenPopup, 'Edit')
+if ($reopenEdit -gt 0) {
+    [FF]::PostMessage([IntPtr]$reopenEdit, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero) | Out-Null
+}
+Pump 300
+
+$tb.Clear()
+$script:pasteKeys.Clear()
+[void][FF]::ClickScreen($fx.Handle, [int](($fxRect.Right - $fxRect.Left) / 2), 60, 1)
+Pump 300
+[FF]::PressChord([byte[]]@(0x11, 0x10), [byte]$hotVk)
+Pump 900
+$other = New-Object System.Windows.Forms.Form
+$other.Text = 'FFOtherPasteTarget'
+$other.StartPosition = 'Manual'
+$other.Location = New-Object System.Drawing.Point(480, 260)
+$other.Size = New-Object System.Drawing.Size(420, 160)
+$otherText = New-Object System.Windows.Forms.TextBox
+$otherText.Multiline = $true
+$otherText.Dock = 'Fill'
+$other.Controls.Add($otherText)
+$otherText.Add_KeyDown({
+    param($sender, $event)
+    if ($event.KeyCode -eq [System.Windows.Forms.Keys]::V) { $script:pasteKeys.Add('other-target-V') }
+})
+try {
+    [FF]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x31, 0, 0, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x31, 0, 2, [UIntPtr]::Zero)
+    Pump 80
+    $other.Show()
+    $other.TopMost = $true
+    [FF]::ClickScreen($other.Handle, 200, 60, 1)
+    Pump 200
+    Check 'another application target owns the foreground during the wait' ([FF]::GetForegroundWindow() -eq $other.Handle)
+} finally {
+    [FF]::keybd_event(0x31, 0, 2, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+}
+Pump 500
+Check 'changing windows during the wait never pastes into either target' `
+    ($tb.Text.Length -eq 0 -and $otherText.Text.Length -eq 0 -and $script:pasteKeys.Count -eq 0)
+$other.Close()
+Pump 200
 
 # --- self-window guard: the app's own main window was in front, so nothing may be pasted.
 $failBefore = @(Get-LogLines | Where-Object { $_ -like '*clip_autopaste ok=false*' }).Count

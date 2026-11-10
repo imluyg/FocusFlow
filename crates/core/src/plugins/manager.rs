@@ -2448,7 +2448,13 @@ impl PluginManager {
                 ));
             }
         };
-        self.pending.remove(&Self::stem_of(&path));
+        // 停用是"它不参与"的硬闸：load_all 会跳过停用插件，点行这条入口不许
+        // 绕过它把 `always` 插件重新拉起来（面板打开 → 加载 只对启用中的插件成立）。
+        let stem = Self::stem_of(&path);
+        if self.is_disabled(&stem) {
+            return Err(format!("插件「{name}」已停用：先在插件页启用再看它的视图"));
+        }
+        self.pending.remove(&stem);
         self.try_load(&path, source)?;
         if !self
             .plugins
@@ -6286,6 +6292,41 @@ end
         assert!(
             !pm.loaded_plugin_names().iter().any(|n| n == &name),
             "配置没写进去，插件却被留在运行态 —— 页面会写着已停用"
+        );
+    }
+
+    /// 停用的插件不许从“打开面板”这条入口被重新加载。
+    ///
+    /// `load_all` 会跳过 `[plugins] disabled`，但插件页点行走的是 `ensure_loaded`：
+    /// 它原先只问“是否已加载”，于是停用的 `always` 插件点一下又跑起来，开关看起来是假的。
+    #[test]
+    fn ensure_loaded_refuses_a_disabled_plugin() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("ensure_disabled");
+        let dir = paths::plugins_user_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("off_view.lua");
+        std::fs::write(
+            &file,
+            "PLUGIN_NAME = \"停用的面板\"\nfunction get_view() return { widgets = {} } end\n",
+        )
+        .unwrap();
+        let mut pm = manager_in(tmp.path());
+        let name = pm
+            .load_plugin(&file, PluginSource::User)
+            .expect("插件该装得上");
+        pm.set_enabled("off_view", false).expect("停用应成功");
+        assert!(
+            !pm.loaded_plugin_names().iter().any(|n| n == &name),
+            "前提：停用之后插件应已卸下"
+        );
+        let err = pm
+            .ensure_loaded(&name)
+            .expect_err("停用的插件不许被点开加载");
+        assert!(err.contains("已停用"), "原因要说清是停用，实得: {err}");
+        assert!(
+            !pm.loaded_plugin_names().iter().any(|n| n == &name),
+            "被拒之后插件仍被加载了"
         );
     }
 

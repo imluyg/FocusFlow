@@ -53,6 +53,10 @@ const AUX_DBS: &[&str] = &[
 /// 从旧数据目录导入全部数据到当前数据目录。
 pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
     use crate::db::connection::Presence;
+    // 附属库下面要用 rename 留档：Windows 上池里还握着连接时那一步必失败。
+    // 同线程的调用方（CLI/测试）靠这一句放掉；GUI 的池在 UI 线程上，调用方
+    // 必须在 spawn 后台线程之前自己再清一次（见 desktop-native 的导入动作）。
+    connection::clear_aux_cache();
     let mut summary = ImportSummary::default();
 
     // 1) 年度键鼠库

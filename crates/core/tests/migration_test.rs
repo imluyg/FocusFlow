@@ -220,6 +220,80 @@ mod tests {
         );
     }
 
+    /// 回归：记账/日程库打开过之后，导入仍要能覆盖它。
+    ///
+    /// `AuxConn` 用完会回到线程局部池里，池里那份 `Connection` 仍握着文件句柄；
+    /// Windows 上 `backup_before_overwrite` 的 rename 会直接失败，整个附属库被跳过，
+    /// 而回执照样说"导入完成"。修法是导入前清掉池（GUI 必须在 UI 线程清，
+    /// 因为池是线程局部的）。这里让句柄真的进池，再跑一遍导入。
+    #[test]
+    fn import_replaces_aux_db_even_after_a_pooled_connection_was_open() {
+        let _g = guard();
+        let _old = paths::test_app_dir("auxopen_old");
+        let old_dir = _old.path().to_path_buf();
+        let _new = paths::test_app_dir("auxopen_new");
+        let new_dir = _new.path().to_path_buf();
+        db::queries::invalidate_years_cache();
+
+        let seed = |path: &std::path::Path, item: &str| {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute(
+                "CREATE TABLE expenses (id INTEGER PRIMARY KEY, item_name TEXT)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO expenses (id, item_name) VALUES (1, ?1)",
+                [item],
+            )
+            .unwrap();
+        };
+        let item_of = |path: &std::path::Path| -> Option<String> {
+            let conn = rusqlite::Connection::open(path).ok()?;
+            conn.query_row("SELECT item_name FROM expenses WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .ok()
+        };
+
+        let aux = "focusflow_accounting.db";
+        seed(&old_dir.join(aux), "来自旧目录");
+        let data_dir = new_dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let dst = data_dir.join(aux);
+        seed(&dst, "当前新数据");
+
+        // 取一份连接、查一次、放回池：模拟用户先打开过记账本。
+        {
+            let conn = db::connection::aux_conn(&dst, |_| {}).expect("取附属库连接");
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM expenses", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "夹具：池里那份连接要真的读到当前数据");
+        }
+        assert!(
+            db::connection::aux_pool_len_for_test() > 0,
+            "前提没成立：连接没有进池，这条用例就照不出重命名失败"
+        );
+
+        let summary = migration::import_legacy_data(&old_dir);
+        assert!(
+            summary.errors.is_empty(),
+            "有连接在池里时附属库导入不该失败: {:?}",
+            summary.errors
+        );
+        assert!(
+            summary.copied_aux.contains(&aux.to_string()),
+            "附属库必须真的被覆盖: {:?}",
+            summary.copied_aux
+        );
+        assert_eq!(
+            item_of(&dst).as_deref(),
+            Some("来自旧目录"),
+            "目标库仍应是导入内容，而不是被跳过"
+        );
+    }
+
     /// 回归：目标年库**已有当天聚合行**时，导入必须累加而不是插入。
     ///
     /// 三条 `INSERT ... SELECT ... GROUP BY` 原本没有 ON CONFLICT，而新版一直

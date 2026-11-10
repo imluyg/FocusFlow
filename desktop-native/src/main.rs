@@ -124,6 +124,11 @@ const WM_CLIP_SEARCH_FOCUS: u32 = WM_APP + 16;
 /// 宿主 EDIT 的文字变了（EN_CHANGE）。宿主不做别的，只把"哪个 EDIT"转给主窗；
 /// 主窗再看它是不是剪贴板页的搜索框 —— 是就地筛，不是等 Enter。
 const WM_EDIT_CHANGED: u32 = WM_APP + 17;
+/// 第二个实例来唤窗：新进程只投这一条，已有进程自己调 `bring_to_front`。
+///
+/// 不能让新进程直接调那一个函数：它要读窗口的 `GWLP_USERDATA` 并解引用，
+/// 那是**另一个进程**的堆指针，跨进程访问会把新进程直接打崩。
+const WM_SECOND_INSTANCE: u32 = WM_APP + 18;
 /// 两个 EDIT 各用哪一个子类 id。子类过程收到的第 5 个参数就是这个 id，
 /// 第 6 个参数是 `SetWindowSubclass` 的 `dwRefData`（两处都传 0，**不能拿它分角色**——
 /// 从前拿它比 2，于是搜索框的焦点永远递不回来，提示文案照旧压在控件上，2026-11-01 屏上量到）。
@@ -1542,6 +1547,19 @@ impl App {
         } else {
             tracing_note("采集未启用（[collector] enabled = false，可在设置页开启）");
         }
+        // 「自动压缩（天）」此前只有设置项，`maybe_auto_vacuum` 在生产里零调用，
+        // 开关写多少都不会 VACUUM。按设置页的承诺（重启后生效）在启动时跑一次；
+        // 可能压很久，放到后台线程，且不挂在 core 的 `Database::init` 上 ——
+        // 那会让每条 core 用例都多起一条线程去碰临时库。
+        let auto_vacuum_days = cfg.get_int("database", "auto_vacuum_days", 7);
+        if auto_vacuum_days > 0 {
+            if let Err(e) = std::thread::Builder::new()
+                .name("auto-vacuum".into())
+                .spawn(move || focusflow_core::db::maintenance::maybe_auto_vacuum(auto_vacuum_days))
+            {
+                tracing_note(&format!("自动压缩线程没起来（本次不压缩）：{e}"));
+            }
+        }
         let db = focusflow_core::db::Database::init_readonly();
         let period = Arc::new(AtomicI64::new(-1));
         let first = data::load(-1);
@@ -2144,9 +2162,11 @@ impl App {
             TopOwner::DetailModal => return None,
             TopOwner::Page => {}
         }
-        for (i, (_, r)) in period_pills().iter().enumerate() {
-            if hit(*r, x, y) {
-                return Some(Ctl::Period(i as u8));
+        if period_pills_visible(self.view) {
+            for (i, (_, r)) in period_pills().iter().enumerate() {
+                if hit(*r, x, y) {
+                    return Some(Ctl::Period(i as u8));
+                }
             }
         }
         for (i, r) in view_tabs().iter().enumerate() {
@@ -3070,8 +3090,15 @@ impl App {
             }
         }
         if let Some(h) = self.clip_search_host {
+            // 宿主拿着前台：隐藏它之前把前台还给主窗。与行内编辑那条
+            //（`hide_edit_cell`）同一个症状——不还的话，Tab 切到「统计」之后
+            // 焦点会落到别的应用上，页面还在，键盘却不再归它。
+            let owner = unsafe { GetParent(h) }.unwrap_or_default();
             unsafe {
                 let _ = ShowWindow(h, SW_HIDE);
+            }
+            if !owner.0.is_null() {
+                let _ = unsafe { SetForegroundWindow(owner) };
             }
         }
     }
@@ -3415,10 +3442,12 @@ impl App {
             }
             TopOwner::Page => {}
         }
-        for (period, pill) in period_pills() {
-            if hit(pill, x, y) {
-                self.set_period(hwnd, period);
-                return;
+        if period_pills_visible(self.view) {
+            for (period, pill) in period_pills() {
+                if hit(pill, x, y) {
+                    self.set_period(hwnd, period);
+                    return;
+                }
             }
         }
 
@@ -3791,6 +3820,10 @@ impl App {
             return;
         }
         if self.view == 5 {
+            // 这一页任何一次鼠标按下都先放弃"等热键"的录入态：点分类、点别的行、
+            // 点空白都算走了。值框那一支随后会重新置位；不清的话，提示画在原分类里
+            // 已经看不见，下一下按键却仍被静默写进旧行。
+            self.capturing = None;
             // 清理确认开着：只认那两颗按钮；点框外/取消都算取消。
             if self.cleanup_confirm {
                 let (dialog, buttons) = cleanup_prompt_geometry(w, h);
@@ -4061,6 +4094,12 @@ impl App {
         } else {
             None
         };
+        // 导入要覆盖记账/日程等附属库，而 Windows 上 rename 会被本进程池里的
+        // 连接占住。池是线程局部的：只能在持有它的这条 UI 线程上先放掉，
+        // 后台 data-op 线程里再清也够不着这一份。
+        if which == 6 {
+            focusflow_core::db::connection::clear_aux_cache();
+        }
         let spawned = std::thread::Builder::new()
             .name("data-op".into())
             .spawn(move || {
@@ -4207,6 +4246,11 @@ impl App {
                         }
                         if !s.copied_aux.is_empty() {
                             line.push_str(&format!("；附属库 {} 份", s.copied_aux.len()));
+                        }
+                        if !s.backed_up_aux.is_empty() {
+                            // 覆盖前把当前那份改了名：用户要能知道旧账还在、去了哪里，
+                            // 否则"导入完成"看起来就像旧数据被换掉了。
+                            line.push_str(&format!("；覆盖前已留档 {} 份", s.backed_up_aux.len()));
                         }
                         if !s.skipped.is_empty() {
                             line.push_str(&format!("；跳过 {} 项", s.skipped.len()));
@@ -4708,7 +4752,7 @@ impl App {
     fn pump_clipboard(&mut self, hwnd: HWND) {
         // 关掉记录之后，通道里可能还躺着关掉前 100ms 内收到的一件：直接丢掉。
         let enabled = focusflow_core::config::instance().get_bool("clipboard", "enabled", true);
-        let mut got = 0usize;
+        let mut changed = false;
         let mut disconnected = false;
         // 探活是兜底：线程正常结束会让收件口断开（下面那支先发现），但"线程没了、
         // 屏上还写着在记录"不能靠猜测，每拍问一次 `is_finished` 很便宜。
@@ -4721,43 +4765,21 @@ impl App {
                             continue;
                         }
                         use focusflow_core::clipboard::{Captured, IngestOutcome};
-                        let (outcome, log_line) = match &c {
-                            Captured::Text {
-                                text,
-                                source_app,
-                                copied_at_ms,
-                            } => (
-                                focusflow_core::clipboard::ingest(text, source_app, *copied_at_ms),
-                                format!("clip_ingest len={}", text.len()),
-                            ),
-                            Captured::Image {
-                                stored,
-                                source_app,
-                                copied_at_ms,
-                            } => (
-                                focusflow_core::clipboard::ingest_image(
-                                    stored,
-                                    source_app,
-                                    *copied_at_ms,
-                                ),
-                                format!("clip_ingest_image {}x{}", stored.width, stored.height),
-                            ),
-                            Captured::Files {
-                                paths,
-                                source_app,
-                                copied_at_ms,
-                            } => (
-                                focusflow_core::clipboard::ingest_files(
-                                    paths,
-                                    source_app,
-                                    *copied_at_ms,
-                                ),
-                                format!("clip_ingest_files n={}", paths.len()),
-                            ),
+                        let outcome = c.ingest();
+                        let log_line = match &c {
+                            Captured::Text { text, .. } => {
+                                format!("clip_ingest len={}", text.len())
+                            }
+                            Captured::Image { stored, .. } => {
+                                format!("clip_ingest_image {}x{}", stored.width, stored.height)
+                            }
+                            Captured::Files { paths, .. } => {
+                                format!("clip_ingest_files n={}", paths.len())
+                            }
                         };
                         match outcome {
                             Ok(IngestOutcome::Stored { id, dedup }) => {
-                                got += 1;
+                                changed = true;
                                 // 插件订阅（`on("clipboard")`）：只在有插件管理器时才投，
                                 // 否则那口队列只会攒满再丢。投的是**文本**，与 API 同一版口径。
                                 // 同一内容 1 秒内只投一次：剪贴板服务会把一次复制重复发布，
@@ -4789,7 +4811,10 @@ impl App {
                                 ));
                             }
                             Ok(_) => {}
-                            Err(e) => tracing_note(&format!("剪贴板入库失败：{e}")),
+                            Err(e) => {
+                                changed = true;
+                                tracing_note(&format!("剪贴板入库失败：{e}"));
+                            }
                         }
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -4809,7 +4834,7 @@ impl App {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
         }
-        if got > 0 {
+        if changed {
             // 弹窗开着就标脏，下一帧重查；没开时这一声只是一次原子读。
             clipboard_popup::notify_changed();
             if self.view == 7 {
@@ -5290,6 +5315,12 @@ impl App {
                 tracing_note(self.status.as_deref().unwrap_or(""));
             }
         }
+        // 动作 id 在点击那一刻已经取走；视图可能随动作变了（筛选/翻页/删除），
+        // 旧的勾选若留着，下一次删除会把屏幕外那些 id 一起拼进去（点不见的行也被删）。
+        // 悬停落点也一起清：同一滚动位下重排之后，旧矩形已经指到别的行。
+        self.plugin_sel.clear();
+        self.pv_targets_key = None;
+        self.pv_hover = None;
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
@@ -7453,6 +7484,14 @@ fn period_pills() -> [(i64, D2D_RECT_F); 6] {
     out
 }
 
+/// 全局周期药丸只在真正读它的页面上出现。
+///
+/// 看板页有自己的一套范围药丸（`dashboard::range_pills`），插件/设置/剪贴板页
+/// 根本没有周期数据。把它们也画出来，点下去只会让这一排高亮、页面数字一动不动。
+fn period_pills_visible(view: usize) -> bool {
+    view <= 3
+}
+
 /// 第 4 个页签上该画哪一张。
 ///
 /// 三张共用一个页签（清单 / 视图 / 详情），而"画哪一张"与"点哪儿有用"必须读同一份判断：
@@ -7544,30 +7583,32 @@ fn draw_screen(
     }
 
     // --- 周期页签 ---
-    p.text(
-        "统计周期",
-        rect(m, 50.0, 60.0, 24.0),
-        &p.fmt.caption,
-        &p.br.muted,
-    );
-    for (i, (period, label)) in PERIODS.iter().enumerate() {
-        let active = vs.period == *period;
-        let r = period_pills()[i].1;
-        if active {
-            p.round(r, R_CONTROL, &p.br.accent, None);
-        } else {
-            p.round(r, R_CONTROL, &p.br.card, Some(&p.br.border));
-            // 悬停只叠一层淡色：白底、卡片底、主色底上都成立，所以三组药丸共用一个画法。
-            if vs.ctl == Some(Ctl::Period(i as u8)) {
-                p.round(r, R_CONTROL, &p.br.hover, None);
-            }
-        }
+    if period_pills_visible(vs.view) {
         p.text(
-            label,
-            rect(r.left, r.top, r.right - r.left, r.bottom - r.top),
-            &p.fmt.tab,
-            if active { &p.br.white } else { &p.br.muted },
+            "统计周期",
+            rect(m, 50.0, 60.0, 24.0),
+            &p.fmt.caption,
+            &p.br.muted,
         );
+        for (i, (period, label)) in PERIODS.iter().enumerate() {
+            let active = vs.period == *period;
+            let r = period_pills()[i].1;
+            if active {
+                p.round(r, R_CONTROL, &p.br.accent, None);
+            } else {
+                p.round(r, R_CONTROL, &p.br.card, Some(&p.br.border));
+                // 悬停只叠一层淡色：白底、卡片底、主色底上都成立，所以三组药丸共用一个画法。
+                if vs.ctl == Some(Ctl::Period(i as u8)) {
+                    p.round(r, R_CONTROL, &p.br.hover, None);
+                }
+            }
+            p.text(
+                label,
+                rect(r.left, r.top, r.right - r.left, r.bottom - r.top),
+                &p.fmt.tab,
+                if active { &p.br.white } else { &p.br.muted },
+            );
+        }
     }
 
     // --- 五张统计卡（真数据）---
@@ -13762,6 +13803,9 @@ fn make_tray(
     };
     match TrayIconBuilder::new()
         .with_menu(Box::new(menu))
+        // 左键是"显示主窗口"的手势（见 TrayIconEvent::Click 那一支），不是开菜单。
+        // crate 的默认值是左键也弹菜单，于是点一下托盘会盖出一整张十二项菜单。
+        .with_menu_on_left_click(false)
         .with_icon(icon)
         .with_tooltip(tray_tooltip(today))
         .build()
@@ -14323,35 +14367,42 @@ fn clip_text_lines(p: &P<'_>, text: &str, f: &IDWriteTextFormat, width: f32, max
 /// 就是红色的那一档。
 fn status_is_warning(line: &str) -> bool {
     line.starts_with("注意")
+        // 失败是这一类的主形状：备份/导出/导入/清理/压缩/开机自启/插件授权……
+        // 一处一处列前缀会漏掉后来新增的动作；"失败"这两个字在回执里没有成功含义。
+        || line.contains("失败")
         || line.starts_with("没注册上：")
         || line.starts_with("没存盘：")
         || line.starts_with("图没编出来：")
         || line.starts_with("没有可出的图：")
-        // 插件页那几条失败只在 `status` 里有一份（同一句话也被顶栏回执读走）：
-        // 不列在这里，坏包、动作抛错在模块里就是一行灰色的"已安装"近邻。
-        || line.starts_with("安装失败：")
-        || line.starts_with("卸载失败：")
-        || line.starts_with("插件动作失败：")
-        || line.starts_with("插件字段回写失败：")
-        || line.starts_with("插件开关失败：")
+        || line.contains("没改成")
+        || line.contains("没有生效")
+        || line.contains("打不开")
         || line.contains("剪贴板没进去")
 }
 
-/// 顶栏那条全局回执：只有插件页（`view == 4`）用得上。
+/// 顶栏那条全局回执。
 ///
 /// 插件页的安装 / 卸载 / 动作失败都只写 `status`，而那一页的正文没有画它的位置
 /// （设置页有卡片底部那一行，插件页没有）—— 从前坏包点下去、插件动作抛错在屏上
-/// 都是"点了没反应"。`FocusFlow · 效率追踪器` 与三颗窗口按钮之间本来就空着。
+/// 都是"点了没反应"。
+///
+/// 其余页只画**警告**：启动时"某条热键没注册上"、备份/导入失败都写进同一个
+/// `status`，而设置页底部那一行只有进设置才看得见。顶栏在 `FocusFlow · 效率追踪器`
+/// 与三颗窗口按钮之间本来就空着，把这些要人处理的话放到每一页的头上。
 fn topbar_status_line(
     view: usize,
     status: Option<&str>,
     w: f32,
 ) -> Option<(String, bool, D2D_RECT_F)> {
-    if view != 4 {
+    // 设置页自己底部有完整的一行，顶栏不再重复。
+    if view == 5 {
         return None;
     }
     let line = status?.trim();
     if line.is_empty() {
+        return None;
+    }
+    if view != 4 && !status_is_warning(line) {
         return None;
     }
     let left = 16.0 + 250.0;
@@ -14693,12 +14744,33 @@ unsafe fn bring_to_front(hwnd: HWND) {
 
 /// 一个实例只留一个：抢不到互斥体就把已有窗口叫出来，自己退出。
 fn already_running() -> Option<HANDLE> {
-    let handle = unsafe { CreateMutexW(None, true, w!("Global\\FocusFlow.Native.P0")) }.ok()?;
+    let handle = match unsafe { CreateMutexW(None, true, w!("Global\\FocusFlow.Native.P0")) } {
+        Ok(h) => h,
+        Err(e) => {
+            // 受限令牌/沙箱里互斥体可能建不出来。原先 `.ok()?` 会让进程一声不响地退出：
+            // 没有窗口、没有托盘、也没有一句话。建不出来就放弃单实例保护，照常启动。
+            tracing_note(&format!("单实例互斥体创建失败：{e}（本次不做单实例保护）"));
+            return Some(HANDLE::default());
+        }
+    };
     // GetLastError 必须紧跟着读：中间任何一。
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         if let Ok(existing) = unsafe { FindWindowW(CLASS_NAME, None) } {
             if !existing.is_invalid() {
-                unsafe { bring_to_front(existing) };
+                // 跨进程只投消息：唤窗那一步读的是本进程的 App 指针，
+                // 新进程里解引用就是野指针（见 `WM_SECOND_INSTANCE` 的注释）。
+                let mut pid = 0u32;
+                unsafe { GetWindowThreadProcessId(existing, Some(&mut pid)) };
+                if pid != 0 {
+                    let _ = unsafe { AllowSetForegroundWindow(pid) };
+                }
+                if unsafe { PostMessageW(Some(existing), WM_SECOND_INSTANCE, WPARAM(0), LPARAM(0)) }
+                    .is_err()
+                {
+                    // UIPI 挡住消息时至少把窗口显示出来；是否能抢到前台由系统决定。
+                    let _ = unsafe { ShowWindow(existing, SW_SHOW) };
+                    let _ = unsafe { SetForegroundWindow(existing) };
+                }
             }
         }
         return None;
@@ -16683,6 +16755,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             unsafe { bring_to_front(hwnd) };
             LRESULT(0)
         }
+        WM_SECOND_INSTANCE => {
+            // 另一个进程又启动了一次：在本进程里完成"建目标 + 画首帧 + 显示"。
+            tracing_note("第二个实例：唤出已有窗口");
+            unsafe { bring_to_front(hwnd) };
+            LRESULT(0)
+        }
         WM_ACCEPTANCE_PAUSE if ACCEPTANCE.load(std::sync::atomic::Ordering::Relaxed) => {
             tracing_note("验收消息：切换暂停采集");
             if let Some(app) = unsafe { app_ptr(hwnd) } {
@@ -17871,6 +17949,21 @@ mod snapshot_rate_tests {
             snapshot_tick_ms(snapshot_sleep_secs(-3), -1, 0, false),
             DEFAULT_SNAPSHOT_SECS * 1000
         );
+    }
+
+    /// 全局周期药丸只在主页/排行/活跃分析出现；看板有自己的范围药丸，
+    /// 插件/设置/剪贴板没有周期数据。画出来就是"点了高亮、数字不动"的死控件。
+    #[test]
+    fn the_period_pills_only_show_where_they_are_read() {
+        for view in 0..=3 {
+            assert!(period_pills_visible(view), "view={view} 应当显示周期药丸");
+        }
+        for view in 4..=7 {
+            assert!(
+                !period_pills_visible(view),
+                "view={view} 不读全局周期，不该画出可点的药丸"
+            );
+        }
     }
 
     /// 空闲阶梯：2 → 5 → 10 → 15 → 30，每档要待满自己的时长；到 30 就不再涨。
@@ -20479,6 +20572,11 @@ mod hotkey_line_tests {
         assert!(status_is_warning(
             "插件动作失败：attempt to index a nil value"
         ));
+        // 数据页/系统动作的失败：这些回执以前只写 status（灰色），主页面上没人看得见
+        assert!(status_is_warning("备份失败：磁盘已满"));
+        assert!(status_is_warning("导出失败：没有权限"));
+        assert!(status_is_warning("开机自启没改成：拒绝访问"));
+        assert!(status_is_warning("开机自启没有生效：启动文件夹对不上"));
         // 回执与"一切正常"不能红：满屏红等于没有红，而且会让人以为截图丢了
         assert!(!status_is_warning(
             "截图已存 snip_a.png（300x200），同时复制到剪贴板"
@@ -20491,10 +20589,12 @@ mod hotkey_line_tests {
         ));
     }
 
-    /// 插件页的回执在顶栏：安装/卸载/动作失败都只写 `status`，而那一页的正文
-    /// 没有画它的位置。设置页自己有卡片底部那一行 ⇒ 不重复；其余页没有这类回执。
+    /// 插件页的回执在顶栏；其余页只把**警告**放到同一格。
+    ///
+    /// 启动时"某条热键没注册上"、备份/导入失败都只写 `status`，而设置页底部那一行
+    /// 只有进设置才看得见。设置页自己已有完整一行 ⇒ 不重复。
     #[test]
-    fn the_top_bar_carries_the_plugin_pages_receipts_only() {
+    fn the_top_bar_shows_warnings_on_every_page_and_receipts_on_the_plugin_page() {
         let w = 1200.0;
         assert!(
             topbar_status_line(5, Some("安装失败：不是 zip"), w).is_none(),
@@ -20508,8 +20608,16 @@ mod hotkey_line_tests {
             topbar_status_line(4, Some("   "), w).is_none(),
             "全空白的回执不算话"
         );
-        for view in [0usize, 1, 2, 3, 6] {
-            assert!(topbar_status_line(view, Some("安装失败：不是 zip"), w).is_none());
+        // 非插件页：警告要看得见，普通成功回执不许占地方。
+        for view in [0usize, 1, 2, 3, 6, 7] {
+            let (line, warn, _) =
+                topbar_status_line(view, Some("备份失败：磁盘已满"), w).expect("警告要上顶栏");
+            assert_eq!(line, "备份失败：磁盘已满");
+            assert!(warn, "警告必须用危险色");
+            assert!(
+                topbar_status_line(view, Some("已安装：demo（2 个文件）"), w).is_none(),
+                "普通回执不该在非插件页占顶栏：view={view}"
+            );
         }
         let (line, warn, r) =
             topbar_status_line(4, Some("  安装失败：不是 zip  "), w).expect("插件页要看得见");
@@ -24495,5 +24603,88 @@ mod ux_polish_tests {
         ] {
             assert!(prod.contains(needle), "缺 {needle}");
         }
+    }
+}
+
+#[cfg(test)]
+mod instance_and_tray_tests {
+    /// 第二个实例只能投消息，不能跨进程解引用已有窗口的 `GWLP_USERDATA`。
+    #[test]
+    fn a_second_instance_posts_a_message_instead_of_touching_the_other_process() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let start = prod
+            .find("fn already_running() -> Option<HANDLE>")
+            .expect("already_running 不见了");
+        let body = &prod[start..start + prod[start..].find("\n}").expect("函数体没收尾")];
+        assert!(
+            body.contains("WM_SECOND_INSTANCE"),
+            "新进程没有投唤窗消息：又回到跨进程调 bring_to_front 了"
+        );
+        assert!(
+            body.contains("AllowSetForegroundWindow"),
+            "允许已有进程抢前台那一步不见了"
+        );
+        assert!(
+            !body.contains("bring_to_front"),
+            "already_running 里出现了 bring_to_front：那是另一个进程的 App 指针"
+        );
+    }
+
+    /// 托盘左键是唤窗，不是开菜单；crate 默认两者都会做。
+    #[test]
+    fn tray_left_click_does_not_open_the_menu() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        assert!(
+            prod.contains(".with_menu_on_left_click(false)"),
+            "托盘左键会连菜单一起弹出来"
+        );
+    }
+
+    /// 设置页任何一次点击都要先放弃"等热键"的录入态（值框那一支随后会重新置位）。
+    #[test]
+    fn a_settings_click_drops_the_hotkey_capture() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let start = prod
+            .find("if self.view == 5 {")
+            .expect("设置页点击分支不见了");
+        let body = &prod[start..start + 600];
+        assert!(
+            body.contains("self.capturing = None;"),
+            "设置页点击不再清录入态：换分类后下一下按键仍会写进旧行"
+        );
+    }
+
+    /// 插件动作后必须清掉旧的勾选与悬停落点；否则筛选/翻页后的删除会带上看不见的 id。
+    #[test]
+    fn a_plugin_action_drops_the_invisible_selection() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let start = prod
+            .find("fn run_plugin_action(&mut self, hwnd: HWND, name: &str, action: &str)")
+            .expect("run_plugin_action 不见了");
+        let body = &prod[start..start + prod[start..].find("\n    }\n").expect("函数体没收尾")];
+        assert!(
+            body.contains("self.plugin_sel.clear();"),
+            "插件动作后没清勾选：筛选/翻页后删除会删到屏幕外的行"
+        );
+        assert!(
+            body.contains("self.pv_targets_key = None;") && body.contains("self.pv_hover = None;"),
+            "插件动作后没清悬停落点：同一滚动位重排后高亮会落到旧矩形"
+        );
+    }
+
+    /// 「自动压缩（天）」必须有生产调用点；否则设置页上的开关永远不做事。
+    #[test]
+    fn the_auto_vacuum_setting_reaches_a_background_thread() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        assert!(
+            prod.contains(".name(\"auto-vacuum\"")
+                && prod.contains("maybe_auto_vacuum(auto_vacuum_days)"),
+            "自动压缩仍然没有调用方：设置页那一行是假的"
+        );
     }
 }

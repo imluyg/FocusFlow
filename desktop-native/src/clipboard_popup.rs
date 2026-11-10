@@ -174,6 +174,10 @@ struct State {
     /// 右键菜单开着时不要把 `WM_ACTIVATE` 失活当成"用户点走了" —— 菜单自己的弹开会
     /// 让弹窗短暂失去激活，不挡一下会在菜单出现的同时把窗藏掉。
     menu_open: bool,
+    /// 确认框（`MessageBoxW`）开着时同理：它也是本窗自己的模态子窗，
+    /// 失活那一下不是用户点走了。不挡的话弹窗会连同确认框一起消失，
+    /// 删除在看不见的地方继续，用户只看到"按 Del 后程序卡住"。
+    modal_open: bool,
     /// 这一轮显示里有没有真正拿到过激活。没有的话，刚 `ShowWindow` 时那条失活消息
     /// 不是"用户点走了"，不能据此关窗（否则热键按下去只会闪一个隐藏窗）。
     activated: bool,
@@ -673,7 +677,13 @@ pub fn is_open() -> bool {
 
 pub fn toggle(_main_hwnd: HWND) {
     if is_open() {
-        hide();
+        // 热键再按一次是"收起来"：与 Esc 一样要把前台还给打开前那个窗口。
+        // 走 `hide()` 的 false 分支会把焦点留在被藏起来的弹窗上，系统随后
+        // 随便挑一个窗口激活——用户下一次按键就打到别的应用里去了。
+        let raw = PALETTE_HWND.load(Ordering::Acquire);
+        if raw != 0 {
+            hide_inner(HWND(raw as *mut core::ffi::c_void), true);
+        }
     } else {
         show();
     }
@@ -757,6 +767,7 @@ fn create_and_show() -> Result<(), String> {
         scroll: 0,
         status: None,
         menu_open: false,
+        modal_open: false,
         activated: false,
         activate_tries: 0,
         restore: None,
@@ -1333,10 +1344,11 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
         WM_ACTIVATE => {
             let code = w.0 as u32 & 0xFFFF;
             if code == WA_INACTIVE {
-                let (activated, menu_open) =
-                    with_state(hwnd, |st| (st.activated, st.menu_open)).unwrap_or((false, false));
+                let (activated, menu_open, modal_open) =
+                    with_state(hwnd, |st| (st.activated, st.menu_open, st.modal_open))
+                        .unwrap_or((false, false, false));
                 // 第一次激活还没拿到时的失活不是"用户点走了"：那一下关窗，热键就像没反应。
-                if activated && !menu_open {
+                if should_hide_on_deactivate(activated, menu_open, modal_open) {
                     hide_inner(hwnd, false);
                 }
             } else {
@@ -1474,6 +1486,12 @@ fn needs_confirm(mode: Mode, pinned: bool) -> bool {
     mode == Mode::Snippets || pinned
 }
 
+/// 失活这一下到底是不是"用户点走了"。菜单与确认框都是本窗自己的模态子窗，
+/// 它们出现时也会发失活；把这两类当成点走，窗会在用户还没回答前消失。
+fn should_hide_on_deactivate(activated: bool, menu_open: bool, modal_open: bool) -> bool {
+    activated && !menu_open && !modal_open
+}
+
 /// 列表里的"删除当前行"唯一入口：键盘 Del、菜单「删除」都走这里。
 fn delete_row(hwnd: HWND) {
     let Some((ask, what)) = with_state(hwnd, |st| {
@@ -1493,6 +1511,8 @@ fn delete_row(hwnd: HWND) {
     if ask {
         let msg = format!("删除这 1 {what}？");
         let text = windows::core::HSTRING::from(msg);
+        // 确认框是本窗的模态子窗：它出现的失活不是"用户点走了"（见 `should_hide_on_deactivate`）。
+        with_state(hwnd, |st| st.modal_open = true);
         let answer = unsafe {
             MessageBoxW(
                 Some(hwnd),
@@ -1501,6 +1521,7 @@ fn delete_row(hwnd: HWND) {
                 MESSAGEBOX_STYLE(MB_YESNO.0 | MB_ICONQUESTION.0),
             )
         };
+        with_state(hwnd, |st| st.modal_open = false);
         if answer != IDYES {
             return;
         }
@@ -2182,6 +2203,9 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
     unsafe {
         let _ = DestroyMenu(menu);
     }
+    // `0` = 没选中任何项（点外面取消 / 菜单没拿到键盘）。这一行是"菜单点了没反应"
+    // 唯一能区分"没开"与"开在别的窗口上"的现场读数。
+    crate::tracing_note(&format!("clip_menu cmd={cmd} has_row={has_row}"));
 
     match cmd {
         MENU_COPY => {
@@ -2541,5 +2565,27 @@ mod tests {
             Some(2),
             "重查整份历史不该把可视文件的失效结果清掉（否则每次复制都要重新 stat）"
         );
+    }
+
+    /// 失活只有在"真的点走了"时才该关窗：菜单与确认框也是本窗的模态子窗。
+    #[test]
+    fn a_modal_of_our_own_is_not_clicking_away() {
+        assert!(
+            !should_hide_on_deactivate(false, false, false),
+            "还没真正激活过时的失活不是点走（否则热键按下去只闪一下）"
+        );
+        assert!(
+            should_hide_on_deactivate(true, false, false),
+            "正常点走要把弹窗收起来"
+        );
+        assert!(
+            !should_hide_on_deactivate(true, true, false),
+            "右键菜单开着：菜单自己造成的失活不许关窗"
+        );
+        assert!(
+            !should_hide_on_deactivate(true, false, true),
+            "删除确认框开着：它造成的失活不许关窗"
+        );
+        assert!(!should_hide_on_deactivate(true, true, true));
     }
 }
