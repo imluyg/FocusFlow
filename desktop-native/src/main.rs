@@ -1536,6 +1536,11 @@ impl App {
         if let Some(n) = &move_notice {
             tracing_note(&format!("数据目录迁移：{}：{}", n.step, n.detail));
         }
+        // 文件日志不能绑在采集上：采集关掉时热键/托盘/截图/插件失败仍然要有一份现场。
+        // 这一步放在数据目录迁移之后，日志才会落在最终的数据根；`collect::start` 里的
+        // 同名调用是幂等的（它重复装 panic hook 也只是换成同一套）。
+        focusflow_core::logger::init_logging();
+        focusflow_core::logger::install_panic_hook();
         // 采集按 `[collector] enabled`（默认开）：它一起来就是全局键鼠钩子。
         // 打开时这里先起采集，再读第一份快照 —— 这样「今日」从第一帧
         // 就带着未落库增量（否则首帧会少一截）。
@@ -5721,6 +5726,10 @@ impl App {
                                 tracing_note(&format!(
                                     "设置 {section}.{key} 的值 {value:?} 不是数字，未写入"
                                 ));
+                                self.status = Some(format!("设置没有改：{value:?} 不是数字"));
+                                unsafe {
+                                    let _ = InvalidateRect(Some(hwnd), None, false);
+                                }
                             } else if let Some(why) = hotkey_err {
                                 self.status = Some(format!("热键没有改：{why}"));
                                 tracing_note(&format!("热键 {key} 未写入：{why}"));
@@ -16744,6 +16753,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             }
             LRESULT(0)
         }
+        WM_QUERYENDSESSION => {
+            // 关机/注销不是点托盘退出：不接这一条，退出备份、插件存储的最后一次
+            // 去抖落盘和窗口几何都会被系统直接掐掉。先同步存一次配置，再走与托盘
+            // 退出同一条路，最后允许系统继续关机。
+            tracing_note("系统关机/注销：退出前落盘");
+            if let Err(e) = focusflow_core::config::instance().save() {
+                tracing_note(&format!("关机前配置落盘失败：{e:#}"));
+            }
+            quit_app(hwnd);
+            LRESULT(1)
+        }
         WM_ACCEPTANCE_SHOW if ACCEPTANCE.load(std::sync::atomic::Ordering::Relaxed) => {
             tracing_note("验收消息：唤出窗口");
             unsafe { bring_to_front(hwnd) };
@@ -24685,6 +24705,26 @@ mod instance_and_tray_tests {
             prod.contains(".name(\"auto-vacuum\"")
                 && prod.contains("maybe_auto_vacuum(auto_vacuum_days)"),
             "自动压缩仍然没有调用方：设置页那一行是假的"
+        );
+    }
+
+    /// 关机/注销要走与托盘退出同一条路；否则退出备份和最后一次去抖落盘被系统掐掉。
+    #[test]
+    fn system_shutdown_takes_the_exit_backup_path() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        assert!(prod.contains("WM_QUERYENDSESSION"), "没接关机/注销消息");
+        let at = prod
+            .find("WM_QUERYENDSESSION =>")
+            .expect("关机处理块不见了");
+        let body = &prod[at..at + 700];
+        assert!(
+            body.contains("quit_app(hwnd)"),
+            "关机没有走退出那条路：备份与落盘都不会发生"
+        );
+        assert!(
+            body.contains("config::instance().save()"),
+            "关机前没有同步保存配置：最后 300ms 的去抖改动会丢"
         );
     }
 }

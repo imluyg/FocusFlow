@@ -378,6 +378,39 @@ const fn default_state() -> SnipState {
 static SNIP: Mutex<SnipState> = Mutex::new(default_state());
 static SNIP_HITS: Mutex<Vec<Candidate>> = Mutex::new(Vec::new());
 
+/// 覆盖层 UI 的缩放（千分比）。冻结图、选区与出图像素永远是 1:1 物理像素；
+/// 只有工具条/手柄/读数/放大镜/标注字号这些"画在人眼前"的尺寸按这个数放大。
+///
+/// 覆盖层只有一个、消息都跑在同一条线程上，所以这一格不需要锁；`start()` 按覆盖层
+/// 窗口的 DPI 写入，`WM_DESTROY` 复位成 1.0。默认 1.0 让所有纯几何用例与 100% DPI
+/// 的验收脚本保持原样。
+static UI_SCALE_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
+fn ui_scale() -> f32 {
+    UI_SCALE_MILLI.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+}
+
+fn set_ui_scale(scale: f32) {
+    let s = if scale.is_finite() {
+        scale.clamp(1.0, 3.0)
+    } else {
+        1.0
+    };
+    UI_SCALE_MILLI.store(
+        (s * 1000.0).round() as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// 把 DIP 常量换算成物理像素；只用于 UI 尺寸，不用于选区/像素坐标。
+fn ui_at(v: i32, scale: f32) -> i32 {
+    ((v as f32) * scale).round() as i32
+}
+
+fn ui(v: i32) -> i32 {
+    ui_at(v, ui_scale())
+}
+
 // ===== 纯几何 / 像素裁决 =====
 
 /// 任意两点折成「左上 + 右下」，返回 (l, t, r, b)。
@@ -412,7 +445,11 @@ pub fn handle_points(rc: (i32, i32, i32, i32)) -> [(i32, i32); 8] {
 
 /// 命中哪个手柄（没有就 `None`）。只在选区已定的阶段用。
 pub fn hit_handle(rc: (i32, i32, i32, i32), x: i32, y: i32) -> Option<u8> {
-    let half = HANDLE_PX / 2;
+    hit_handle_at(rc, x, y, ui_scale())
+}
+
+fn hit_handle_at(rc: (i32, i32, i32, i32), x: i32, y: i32, scale: f32) -> Option<u8> {
+    let half = ui_at(HANDLE_PX, scale) / 2;
     for (i, (hx, hy)) in handle_points(rc).iter().enumerate() {
         if x >= hx - half && x <= hx + half && y >= hy - half && y <= hy + half {
             return Some(i as u8);
@@ -630,14 +667,20 @@ fn band(y0: i32, y1: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
 /// 读数有两种落点：贴着锚点那一行，和被挤到屏幕底边那一行。两条都得算进来 —— 少算一条，
 /// 屏幕上就把上一帧那句读数留在原地。横向按整条带走：夹回之后落在哪一列不必预知。
 fn chip_band(y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
-    let mut r = band(y - 6, y + CHIP_MAX_H + 6, w, h);
+    chip_band_at(y, w, h, ui_scale())
+}
+
+fn chip_band_at(y: i32, w: i32, h: i32, scale: f32) -> (i32, i32, i32, i32) {
+    let max_h = ui_at(CHIP_MAX_H, scale);
+    let margin = ui_at(6, scale);
+    let mut r = band(y - margin, y + max_h + margin, w, h);
     if y < 0 {
         // 锚点在屏幕上方（选区贴着第一行）：盒子被夹到屏幕顶那一格才是真落点
-        r = union_rect(r, band(0, CHIP_MAX_H + 6, w, h));
+        r = union_rect(r, band(0, max_h + margin, w, h));
     }
-    if y + CHIP_MAX_H > h {
+    if y + max_h > h {
         // 这一刻才可能挤回屏内，落点只能更靠上：把屏幕底边那一条一起算进来
-        r = union_rect(r, band(h - CHIP_MAX_H - 6, h, w, h));
+        r = union_rect(r, band(h - max_h - margin, h, w, h));
     }
     r
 }
@@ -675,26 +718,29 @@ pub fn frame_content(s: &SnipState) -> (i32, i32, i32, i32) {
     let (w, h) = (s.base_w, s.base_h);
     let mut r = (0, 0, 0, 0);
     if let Some(b) = bright_rect(s) {
-        r = union_rect(r, pad_rect(b, 12));
-        r = union_rect(r, chip_band(b.1 - 24, w, h));
+        r = union_rect(r, pad_rect(b, ui(12)));
+        r = union_rect(r, chip_band(b.1 - ui(24), w, h));
     }
     if s.phase == Phase::Adjust {
         let (_, bar) = bar_rects(s.sel, w, h);
-        r = union_rect(r, pad_rect((bar.0, bar.1, bar.0 + bar.2, bar.1 + bar.3), 4));
+        r = union_rect(
+            r,
+            pad_rect((bar.0, bar.1, bar.0 + bar.2, bar.1 + bar.3), ui(4)),
+        );
     }
     if s.phase == Phase::Select {
         if let Some((lx, ly, ls, lsz)) = loupe_rect(s.cur.0, s.cur.1, w, h) {
-            r = union_rect(r, pad_rect((lx, ly, lx + ls, ly + lsz), 4));
+            r = union_rect(r, pad_rect((lx, ly, lx + ls, ly + lsz), ui(4)));
             r = union_rect(r, chip_band(ly + lsz + 1, w, h));
         }
         if s.drag.is_none() {
-            r = union_rect(r, chip_band(12, w, h));
+            r = union_rect(r, chip_band(ui(12), w, h));
         }
     }
     if s.notice.is_some() {
         // 贴到屏幕顶时那句改画在选区里侧：两种落点都算进来
-        r = union_rect(r, chip_band(s.sel.1 - 48, w, h));
-        r = union_rect(r, chip_band(s.sel.1 + 26, w, h));
+        r = union_rect(r, chip_band(s.sel.1 - ui(48), w, h));
+        r = union_rect(r, chip_band(s.sel.1 + ui(26), w, h));
     }
     clamp_rect(r, w, h)
 }
@@ -814,12 +860,22 @@ pub fn fill_block(w: i32, h: i32, color: u32) -> Vec<u8> {
 }
 
 /// 工具条排版：按最大宽度流式换行，返回**相对条内原点**的按钮与整条的宽、高。
+// 100% 基线的纯几何包装：产品走 `bar_flow_scaled`，这里的入口留给按 DPI 分档的用例。
+#[allow(dead_code)]
 pub fn bar_flow(max_w: i32) -> (Vec<BarBtn>, i32, i32) {
+    bar_flow_scaled(max_w, 1.0)
+}
+
+fn bar_flow_scaled(max_w: i32, scale: f32) -> (Vec<BarBtn>, i32, i32) {
+    let row_h = ui_at(BAR_ROW_H, scale);
+    let gap = ui_at(BAR_GAP, scale);
+    let group_gap = ui_at(BAR_GROUP_GAP, scale);
     let mut btns: Vec<BarBtn> = Vec::new();
     let (mut x, mut row, mut row_w, mut total_w) = (0i32, 0i32, 0i32, 0i32);
     for (i, (id, label, w, group)) in BAR_SPECS.iter().enumerate() {
+        let w = ui_at(*w, scale);
         if i > 0 {
-            x += if *group { BAR_GROUP_GAP } else { BAR_GAP };
+            x += if *group { group_gap } else { gap };
         }
         if x > 0 && x + w > max_w {
             total_w = total_w.max(row_w);
@@ -830,20 +886,21 @@ pub fn bar_flow(max_w: i32) -> (Vec<BarBtn>, i32, i32) {
             id,
             label,
             x,
-            y: row * (BAR_ROW_H + BAR_GAP),
-            w: *w,
-            h: BAR_ROW_H,
+            y: row * (row_h + gap),
+            w,
+            h: row_h,
         });
-        x += *w;
+        x += w;
         row_w = x;
     }
     total_w = total_w.max(row_w);
     let rows = row + 1;
-    (btns, total_w, rows * BAR_ROW_H + (rows - 1) * BAR_GAP)
+    (btns, total_w, rows * row_h + (rows - 1) * gap)
 }
 
 /// 工具条整条的落点：默认贴选区下方 6 像素；底下放不下翻到选区上方，
 /// 再把横向夹回屏幕（四周各留 4 像素）。
+#[allow(dead_code)]
 pub fn bar_placement(
     sel: (i32, i32, i32, i32),
     screen_w: i32,
@@ -851,19 +908,32 @@ pub fn bar_placement(
     bar_w: i32,
     bar_h: i32,
 ) -> (i32, i32) {
-    let mut y = sel.3 + 6;
-    if y + bar_h > screen_h - 4 {
-        y = (sel.1 - bar_h - 6).max(4);
+    bar_placement_scaled(sel, screen_w, screen_h, bar_w, bar_h, 1.0)
+}
+
+fn bar_placement_scaled(
+    sel: (i32, i32, i32, i32),
+    screen_w: i32,
+    screen_h: i32,
+    bar_w: i32,
+    bar_h: i32,
+    scale: f32,
+) -> (i32, i32) {
+    let gap = ui_at(6, scale);
+    let margin = ui_at(4, scale);
+    let mut y = sel.3 + gap;
+    if y + bar_h > screen_h - margin {
+        y = (sel.1 - bar_h - gap).max(margin);
     }
-    if y < 4 {
-        y = 4;
+    if y < margin {
+        y = margin;
     }
     let mut x = sel.0;
-    if x + bar_w > screen_w - 4 {
-        x = (screen_w - 4 - bar_w).max(0);
+    if x + bar_w > screen_w - margin {
+        x = (screen_w - margin - bar_w).max(0);
     }
-    if x < 4 {
-        x = 4;
+    if x < margin {
+        x = margin;
     }
     (x, y)
 }
@@ -874,15 +944,26 @@ pub fn bar_rects(
     screen_w: i32,
     screen_h: i32,
 ) -> (Vec<BarBtn>, (i32, i32, i32, i32)) {
-    let min_screen = (screen_w - 8).max(120);
-    let max_w = ((sel.2 - sel.0) * 2).clamp(360, min_screen.max(360));
-    let (mut btns, bw, bh) = bar_flow(max_w);
-    let (ox, oy) = bar_placement(sel, screen_w, screen_h, bw + 2 * BAR_PAD, bh + 2 * BAR_PAD);
+    bar_rects_at(sel, screen_w, screen_h, ui_scale())
+}
+
+fn bar_rects_at(
+    sel: (i32, i32, i32, i32),
+    screen_w: i32,
+    screen_h: i32,
+    scale: f32,
+) -> (Vec<BarBtn>, (i32, i32, i32, i32)) {
+    let pad = ui_at(BAR_PAD, scale);
+    let min_screen = (screen_w - ui_at(8, scale)).max(ui_at(120, scale));
+    let min_w = ui_at(360, scale);
+    let max_w = ((sel.2 - sel.0) * 2).clamp(min_w, min_screen.max(min_w));
+    let (mut btns, bw, bh) = bar_flow_scaled(max_w, scale);
+    let (ox, oy) = bar_placement_scaled(sel, screen_w, screen_h, bw + 2 * pad, bh + 2 * pad, scale);
     for b in btns.iter_mut() {
-        b.x += ox + BAR_PAD;
-        b.y += oy + BAR_PAD;
+        b.x += ox + pad;
+        b.y += oy + pad;
     }
-    (btns, (ox, oy, bw + 2 * BAR_PAD, bh + 2 * BAR_PAD))
+    (btns, (ox, oy, bw + 2 * pad, bh + 2 * pad))
 }
 
 fn hit_btn(btns: &[BarBtn], x: i32, y: i32) -> Option<usize> {
@@ -998,7 +1079,7 @@ pub fn endpoint_points(m: &Mark) -> Option<[(i32, i32); 4]> {
 
 /// 压中了选中那一笔的哪个角（与选区手柄同一套 8 像素命中框）。
 pub fn hit_endpoint(m: &Mark, x: i32, y: i32) -> Option<u8> {
-    let half = HANDLE_PX / 2;
+    let half = ui(HANDLE_PX) / 2;
     for (i, (hx, hy)) in endpoint_points(m)?.iter().enumerate() {
         if x >= hx - half && x <= hx + half && y >= hy - half && y <= hy + half {
             return Some(i as u8);
@@ -1180,17 +1261,24 @@ pub const LOUPE_GAP: i32 = 18;
 /// 返回 `None` = 这块屏小到连方块加间距都放不下 —— 宁可不画，也不要压在光标底下
 /// 挡住人正在对的那几个像素。
 pub fn loupe_rect(cx: i32, cy: i32, w: i32, h: i32) -> Option<(i32, i32, i32, i32)> {
-    let side = LOUPE_SPAN * LOUPE_SCALE;
-    if w <= 0 || h <= 0 || side + LOUPE_GAP * 2 >= w || side + LOUPE_TEXT_H + LOUPE_GAP * 2 >= h {
+    loupe_rect_at(cx, cy, w, h, ui_scale())
+}
+
+fn loupe_rect_at(cx: i32, cy: i32, w: i32, h: i32, scale: f32) -> Option<(i32, i32, i32, i32)> {
+    let k = ui_at(LOUPE_SCALE, scale).max(1);
+    let side = LOUPE_SPAN * k;
+    let gap = ui_at(LOUPE_GAP, scale);
+    let text_h = ui_at(LOUPE_TEXT_H, scale);
+    if w <= 0 || h <= 0 || side + gap * 2 >= w || side + text_h + gap * 2 >= h {
         return None;
     }
-    let mut x = cx + LOUPE_GAP;
+    let mut x = cx + gap;
     if x + side > w {
-        x = cx - LOUPE_GAP - side;
+        x = cx - gap - side;
     }
-    let mut y = cy + LOUPE_GAP;
-    if y + side + LOUPE_TEXT_H > h {
-        y = cy - LOUPE_GAP - side - LOUPE_TEXT_H;
+    let mut y = cy + gap;
+    if y + side + text_h > h {
+        y = cy - gap - side - text_h;
     }
     Some((x.max(0), y.max(0), side, side))
 }
@@ -1227,8 +1315,13 @@ pub fn loupe_source(cx: i32, cy: i32, w: i32, h: i32) -> (i32, i32, i32) {
 /// 字节不足时交出全零缓冲而不 panic —— 冻结图短一截是别处已经出声的异常，
 /// 不该在这里再炸掉一次截图。
 pub fn loupe_pixels(base: &[u8], bw: i32, src: (i32, i32, i32)) -> Vec<u8> {
+    loupe_pixels_at(base, bw, src, ui_scale())
+}
+
+fn loupe_pixels_at(base: &[u8], bw: i32, src: (i32, i32, i32), scale: f32) -> Vec<u8> {
     let (sx, sy, span) = src;
-    let side = (span * LOUPE_SCALE).max(0);
+    let k = ui_at(LOUPE_SCALE, scale).max(1);
+    let side = (span * k).max(0);
     let mut out = vec![0u8; (side as usize) * (side as usize) * 4];
     if span <= 0 || bw <= 0 || side <= 0 {
         return out;
@@ -1236,23 +1329,20 @@ pub fn loupe_pixels(base: &[u8], bw: i32, src: (i32, i32, i32)) -> Vec<u8> {
     let half = span / 2;
     for dy in 0..side {
         for dx in 0..side {
-            let sxp = sx + dx / LOUPE_SCALE;
-            let syp = sy + dy / LOUPE_SCALE;
+            let sxp = sx + dx / k;
+            let syp = sy + dy / k;
             let si = ((syp as usize) * (bw as usize) + (sxp as usize)) * 4;
             if si + 3 >= base.len() {
                 continue;
             }
             let di = ((dy as usize) * (side as usize) + dx as usize) * 4;
-            let grid = dx % LOUPE_SCALE == 0 || dy % LOUPE_SCALE == 0;
-            let center_cell = dx / LOUPE_SCALE == half && dy / LOUPE_SCALE == half;
-            let edge = center_cell
-                && (dx % LOUPE_SCALE == 0
-                    || dx % LOUPE_SCALE == LOUPE_SCALE - 1
-                    || dy % LOUPE_SCALE == 0
-                    || dy % LOUPE_SCALE == LOUPE_SCALE - 1);
-            for k in 0..3 {
-                let v = base[si + k] as i32;
-                out[di + k] = if edge {
+            let grid = dx % k == 0 || dy % k == 0;
+            let center_cell = dx / k == half && dy / k == half;
+            let edge =
+                center_cell && (dx % k == 0 || dx % k == k - 1 || dy % k == 0 || dy % k == k - 1);
+            for c in 0..3 {
+                let v = base[si + c] as i32;
+                out[di + c] = if edge {
                     0xFF
                 } else if grid {
                     (v - 48).max(0) as u8
@@ -1275,7 +1365,7 @@ pub fn loupe_text(src: (i32, i32, i32), origin: (i32, i32)) -> String {
         origin.1 + src.1 + src.2 / 2,
         src.2,
         src.2,
-        LOUPE_SCALE
+        ui(LOUPE_SCALE).max(1)
     )
 }
 
@@ -1440,8 +1530,8 @@ unsafe fn draw_arrow(hdc: HDC, x0: i32, y0: i32, x1: i32, y1: i32) {
             let _ = MoveToEx(hdc, x1, y1, None);
             let _ = LineTo(
                 hdc,
-                (x1 as f32 + rx * 14.0) as i32,
-                (y1 as f32 + ry * 14.0) as i32,
+                (x1 as f32 + rx * ui(14) as f32) as i32,
+                (y1 as f32 + ry * ui(14) as f32) as i32,
             );
         }
     }
@@ -1580,12 +1670,12 @@ pub fn chip_origin(x: i32, y: i32, w: i32, h: i32, vis: (i32, i32)) -> (i32, i32
 
 unsafe fn draw_chip(hdc: HDC, x: i32, y: i32, text: &str, fg: u32) {
     unsafe {
-        let font = yaihe(CHIP_FONT_H, false);
+        let font = yaihe(ui(CHIP_FONT_H), false);
         let oldf = SelectObject(hdc, font.into());
         let wide: Vec<u16> = text.encode_utf16().collect();
         let mut sz = SIZE { cx: 0, cy: 0 };
         let _ = GetTextExtentPoint32W(hdc, &wide, &mut sz);
-        let (cw, ch) = (sz.cx + 12, sz.cy + CHIP_PAD_V);
+        let (cw, ch) = (sz.cx + ui(12), sz.cy + ui(CHIP_PAD_V));
         let mut vis = RECT::default();
         let _ = GetClipBox(hdc, &mut vis);
         let (x, y) = chip_origin(x, y, cw, ch, (vis.right, vis.bottom));
@@ -1596,7 +1686,7 @@ unsafe fn draw_chip(hdc: HDC, x: i32, y: i32, text: &str, fg: u32) {
         let _ = DeleteObject(brush.into());
         let _ = SetTextColor(hdc, COLORREF(fg));
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = TextOutW(hdc, x + 6, y + 3, &wide);
+        let _ = TextOutW(hdc, x + ui(6), y + ui(3), &wide);
         SelectObject(hdc, oldf);
     }
 }
@@ -1699,7 +1789,7 @@ unsafe fn draw_bar(
         let _ = Rectangle(hdc, bar.0, bar.1, bar.0 + bar.2, bar.1 + bar.3);
         SelectObject(hdc, old);
         let _ = DeleteObject(bg.into());
-        let hfont = yaihe(14, false);
+        let hfont = yaihe(ui(14), false);
         let oldf = SelectObject(hdc, hfont.into());
         let _ = SetBkMode(hdc, TRANSPARENT);
         for b in &btns {
@@ -1722,7 +1812,13 @@ unsafe fn draw_bar(
                 // 色块按钮涂成它代表的那色，比汉字好认
                 let sw = CreateSolidBrush(COLORREF(*c));
                 let olds = SelectObject(hdc, sw.into());
-                let _ = Rectangle(hdc, b.x + 4, b.y + b.h - 9, b.x + b.w - 4, b.y + b.h - 4);
+                let _ = Rectangle(
+                    hdc,
+                    b.x + ui(4),
+                    b.y + b.h - ui(9),
+                    b.x + b.w - ui(4),
+                    b.y + b.h - ui(4),
+                );
                 SelectObject(hdc, olds);
                 let _ = DeleteObject(sw.into());
             }
@@ -2554,8 +2650,8 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                                     shape: sh,
                                     style: Style {
                                         rgb: s.color,
-                                        w: s.width,
-                                        font: s.font,
+                                        w: ui(s.width),
+                                        font: ui(s.font),
                                     },
                                 })
                             })
@@ -2725,6 +2821,8 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                         let _ = floating::set_visible(true);
                     }
                 }
+                // 下一场在 `start()` 里按新的 DPI 重设；这里复位让测试与 100% 几何回到基线。
+                set_ui_scale(1.0);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, w, l),
@@ -2995,8 +3093,8 @@ unsafe fn finish_text_edit(h: HWND, at: (i32, i32), keep: bool) {
                 if let Ok(mut s) = SNIP.lock() {
                     let st = Style {
                         rgb: s.color,
-                        w: s.width,
-                        font: s.font,
+                        w: ui(s.width),
+                        font: ui(s.font),
                     };
                     push_undo(&mut s);
                     s.marks.push(Mark {
@@ -3022,7 +3120,7 @@ unsafe fn open_text_edit(overlay: HWND, x: i32, y: i32) {
             // 会把已经打进去的那行字吃掉——点在画布上本来是"换个地方再写一条"的意思）
             finish_text_edit(HWND(old.0 as *mut core::ffi::c_void), old.1, true);
         }
-        let font = SNIP.lock().map(|s| s.font).unwrap_or(30);
+        let font = ui(SNIP.lock().map(|s| s.font).unwrap_or(30));
         let (sl, st) = SNIP.lock().map(|s| (s.sel.0, s.sel.1)).unwrap_or((0, 0));
         let cls = HSTRING::from("EDIT");
         let empty = HSTRING::from("");
@@ -3033,8 +3131,8 @@ unsafe fn open_text_edit(overlay: HWND, x: i32, y: i32) {
             WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0x0080), // WS_CHILD | VISIBLE | ES_AUTOHSCROLL
             x,
             y,
-            240,
-            font + 8,
+            ui(240),
+            font + ui(8),
             Some(overlay),
             None,
             None,
@@ -3199,8 +3297,14 @@ unsafe fn paint(hwnd: HWND) {
                         let oldp = SelectObject(hdc, pen.into());
                         let null = GetStockObject(NULL_BRUSH);
                         let oldb = SelectObject(hdc, null);
-                        let _ =
-                            Rectangle(hdc, rc.0 + l - 3, rc.1 + t - 3, rc.0 + r + 3, rc.1 + b + 3);
+                        let pad = ui(3);
+                        let _ = Rectangle(
+                            hdc,
+                            rc.0 + l - pad,
+                            rc.1 + t - pad,
+                            rc.0 + r + pad,
+                            rc.1 + b + pad,
+                        );
                         SelectObject(hdc, oldb);
                         SelectObject(hdc, oldp);
                         let _ = DeleteObject(pen.into());
@@ -3210,12 +3314,13 @@ unsafe fn paint(hwnd: HWND) {
                             let old = SelectObject(hdc, brush.into());
                             let hp = CreatePen(PS_SOLID, 1, COLORREF(ACCENT));
                             let oldpen = SelectObject(hdc, hp.into());
+                            let half = ui(3);
                             let _ = Rectangle(
                                 hdc,
-                                rc.0 + hx - 3,
-                                rc.1 + hy - 3,
-                                rc.0 + hx + 3,
-                                rc.1 + hy + 3,
+                                rc.0 + hx - half,
+                                rc.1 + hy - half,
+                                rc.0 + hx + half,
+                                rc.1 + hy + half,
                             );
                             SelectObject(hdc, oldpen);
                             SelectObject(hdc, old);
@@ -3229,8 +3334,8 @@ unsafe fn paint(hwnd: HWND) {
             if let Some((Drag::Mark, sx, sy)) = drag {
                 let st = Style {
                     rgb: color,
-                    w: width,
-                    font,
+                    w: ui(width),
+                    font: ui(font),
                 };
                 if tool == 3 {
                     // 马赛克的实时预览只画虚线感的空心框：格子平均留给出图那一步
@@ -3269,11 +3374,11 @@ unsafe fn paint(hwnd: HWND) {
             draw_chip(
                 hdc,
                 rc.0,
-                rc.1 - 24,
+                rc.1 - ui(24),
                 &format!("{} × {}", rc.2 - rc.0, rc.3 - rc.1),
                 0x00FF_FFFF,
             );
-            let pen = CreatePen(PS_SOLID, 2, COLORREF(ACCENT));
+            let pen = CreatePen(PS_SOLID, ui(2).max(1), COLORREF(ACCENT));
             let oldp = SelectObject(hdc, pen.into());
             let null = GetStockObject(NULL_BRUSH);
             let oldb = SelectObject(hdc, null);
@@ -3282,18 +3387,13 @@ unsafe fn paint(hwnd: HWND) {
             SelectObject(hdc, oldp);
             let _ = DeleteObject(pen.into());
             if phase == Phase::Adjust {
+                let half = ui(HANDLE_PX) / 2;
                 for (hx, hy) in handle_points(rc) {
                     let brush = CreateSolidBrush(COLORREF(0x00FF_FFFF));
                     let old = SelectObject(hdc, brush.into());
                     let hp = CreatePen(PS_SOLID, 1, COLORREF(ACCENT));
                     let oldpen = SelectObject(hdc, hp.into());
-                    let _ = Rectangle(
-                        hdc,
-                        hx - HANDLE_PX / 2,
-                        hy - HANDLE_PX / 2,
-                        hx + HANDLE_PX / 2,
-                        hy + HANDLE_PX / 2,
-                    );
+                    let _ = Rectangle(hdc, hx - half, hy - half, hx + half, hy + half);
                     SelectObject(hdc, oldpen);
                     SelectObject(hdc, old);
                     let _ = DeleteObject(hp.into());
@@ -3314,10 +3414,10 @@ unsafe fn paint(hwnd: HWND) {
         // 出图没成的那句写在选区上沿外面（贴到屏幕顶就改画在选区里侧）：这一句是给人看的，
         // 只在日志里出声等于没出声——覆盖层正是为它才不退的。
         if let Some(msg) = notice {
-            let ny = if sel.1 - 48 >= 0 {
-                sel.1 - 48
+            let ny = if sel.1 - ui(48) >= 0 {
+                sel.1 - ui(48)
             } else {
-                sel.1 + 26
+                sel.1 + ui(26)
             };
             draw_chip(hdc, sel.0, ny, msg, rgb(255, 60, 60));
         }
@@ -3326,8 +3426,8 @@ unsafe fn paint(hwnd: HWND) {
         if phase == Phase::Select && drag.is_none() {
             draw_chip(
                 hdc,
-                24,
-                12,
+                ui(24),
+                ui(12),
                 "拖框选区 · 单击选窗口 · 右键或 Esc 取消 · 定下后可用方向键挪 1 像素",
                 0x00FF_FFFF,
             );
@@ -3341,7 +3441,7 @@ unsafe fn paint(hwnd: HWND) {
             if let Some((lx, ly, ls, lsz)) = loupe_rect(cur.0, cur.1, bw, bh) {
                 let box_bytes = loupe_pixels(base, bw, loupe_src);
                 blit_bgra(hdc, &box_bytes, ls, lsz, lx, ly);
-                let ty = (ly + lsz + 1).clamp(0, (bh - LOUPE_TEXT_H - 2).max(0));
+                let ty = (ly + lsz + 1).clamp(0, (bh - ui(LOUPE_TEXT_H) - ui(2)).max(0));
                 draw_chip(
                     hdc,
                     lx,
@@ -3606,6 +3706,10 @@ pub fn start(owner: HWND, annotate: bool) {
         );
         match created {
             Ok(ov) => {
+                // 工具条/手柄/读数按这一块屏的 DPI 放大；冻结图与出图仍是 1:1 物理像素。
+                // 覆盖层跨屏时 Windows 按窗口所在的那块屏给 DPI，先接受这个近似。
+                let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(ov);
+                set_ui_scale(if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 });
                 // 放大镜开不开：每开一场读一次，所以设置页那句"改完立即生效"对**下一场**成立，
                 // 而正在飞的这一场不会因为半路改配置少掉一块画面。
                 let loupe_on = focusflow_core::config::instance().get_bool("snip", "loupe", true);
@@ -7431,6 +7535,61 @@ mod tests {
         // 横向夹回屏幕
         let (x4, _) = bar_placement((1700, 300, 1900, 500), 1920, 1080, 600, 70);
         assert_eq!(x4, 1920 - 4 - 600);
+    }
+
+    /// DIP→物理像素的换算：四舍五入到整像素，1.0 时一个数都不许变。
+    #[test]
+    fn ui_scale_rounds_dip_to_physical_pixels() {
+        assert_eq!(ui_at(26, 1.0), 26);
+        assert_eq!(ui_at(8, 1.25), 10);
+        assert_eq!(ui_at(26, 1.5), 39);
+        assert_eq!(ui_at(3, 1.5), 5);
+        assert_eq!(ui_at(240, 2.0), 480);
+    }
+
+    /// 150% DPI：工具条、手柄、放大镜与读数带都得跟着放大，而不是只把字放大。
+    #[test]
+    fn a_150_percent_overlay_scales_toolbar_handles_and_loupe() {
+        let (btns1, _) = bar_rects_at((200, 200, 800, 600), 1920, 1080, 1.0);
+        let (btns15, bar15) = bar_rects_at((200, 200, 800, 600), 1920, 1080, 1.5);
+        assert_eq!(btns1[0].w, 36, "100% 时按钮宽度不该变");
+        assert_eq!(btns1[0].h, 26, "100% 时按钮高度不该变");
+        assert_eq!(btns15[0].w, 54, "150% 时按钮宽度应随 DPI 放大");
+        assert_eq!(btns15[0].h, 39, "150% 时按钮高度应随 DPI 放大");
+        assert!(
+            bar15.0 + bar15.2 <= 1920 && bar15.1 + bar15.3 <= 1080,
+            "放大后的工具条跑出屏幕: {bar15:?}"
+        );
+
+        // 100% 时 x=206 已在角手柄外；150% 时命中框放大到 ±6，必须命中。
+        let rc = (100, 100, 200, 300);
+        assert_eq!(hit_handle_at(rc, 206, 100, 1.0), None);
+        assert_eq!(hit_handle_at(rc, 206, 100, 1.5), Some(2));
+
+        let one = loupe_rect_at(100, 100, 1920, 1080, 1.0).expect("100% 放得下");
+        let big = loupe_rect_at(100, 100, 1920, 1080, 1.5).expect("150% 放得下");
+        assert_eq!(one.2, LOUPE_SPAN * LOUPE_SCALE);
+        assert_eq!(big.2, LOUPE_SPAN * ui_at(LOUPE_SCALE, 1.5));
+        assert!(big.2 > one.2, "放大镜方块没有随 DPI 变大");
+
+        let base = vec![0u8; 32 * 32 * 4];
+        let small = loupe_pixels_at(&base, 32, (5, 5, LOUPE_SPAN), 1.0);
+        let large = loupe_pixels_at(&base, 32, (5, 5, LOUPE_SPAN), 1.5);
+        assert_eq!(
+            small.len(),
+            (11 * LOUPE_SCALE * 11 * LOUPE_SCALE * 4) as usize
+        );
+        assert_eq!(
+            large.len(),
+            (11 * ui_at(LOUPE_SCALE, 1.5) * 11 * ui_at(LOUPE_SCALE, 1.5) * 4) as usize
+        );
+
+        let band1 = chip_band_at(100, 500, 500, 1.0);
+        let band15 = chip_band_at(100, 500, 500, 1.5);
+        assert!(
+            band15.3 - band15.1 > band1.3 - band1.1,
+            "读数带的预留高度没有随 DPI 放大"
+        );
     }
 
     #[test]

@@ -1486,6 +1486,16 @@ fn needs_confirm(mode: Mode, pinned: bool) -> bool {
     mode == Mode::Snippets || pinned
 }
 
+/// 历史页底栏说的是**这一次真会发生的事**：自动粘贴关着时 Enter 只复制，
+/// 旧文案却一直写着"粘贴"——用户按下去没反应，只会以为复制失败。
+fn history_footer(auto_paste: bool) -> &'static str {
+    if auto_paste {
+        "单击选中 · 双击/Enter 粘贴 · Ctrl+Enter 只复制 · Tab 片段 · Esc 关闭"
+    } else {
+        "单击选中 · 双击/Enter 复制（自动粘贴已关） · Ctrl+Enter 只复制 · Tab 片段 · Esc 关闭"
+    }
+}
+
 /// 失活这一下到底是不是"用户点走了"。菜单与确认框都是本窗自己的模态子窗，
 /// 它们出现时也会发失活；把这两类当成点走，窗会在用户还没回答前消失。
 fn should_hide_on_deactivate(activated: bool, menu_open: bool, modal_open: bool) -> bool {
@@ -1823,7 +1833,7 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
     } else {
         match st.mode {
             Mode::History => {
-                "单击选中 · 双击/Enter 粘贴 · Ctrl+Enter 只复制 · Tab 片段 · Esc 关闭".to_string()
+                history_footer(focusflow_core::clipboard::auto_paste_enabled()).to_string()
             }
             Mode::Snippets => "Enter 复制片段 · Del 删除 · Tab 统计 · Esc 关闭".to_string(),
             Mode::Stats => "Tab 回历史 · Esc 关闭".to_string(),
@@ -2587,5 +2597,19 @@ mod tests {
             "删除确认框开着：它造成的失活不许关窗"
         );
         assert!(!should_hide_on_deactivate(true, true, true));
+    }
+
+    #[test]
+    fn the_history_footer_matches_the_configured_enter_action() {
+        assert!(
+            history_footer(true).contains("双击/Enter 粘贴"),
+            "自动粘贴开着时 Enter 就是粘贴"
+        );
+        let off = history_footer(false);
+        assert!(
+            off.contains("双击/Enter 复制") && off.contains("自动粘贴已关"),
+            "关掉自动粘贴后底栏还说粘贴：用户会以为复制失败: {off}"
+        );
+        assert!(!off.contains("双击/Enter 粘贴"));
     }
 }
