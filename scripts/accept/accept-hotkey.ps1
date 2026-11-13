@@ -165,12 +165,12 @@ if ($h4 -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
 $cl4 = Get-Client $h4
 $valueX4 = $cl4.W - 206
 
-Click-ViewTab $h4 5
+Click-ViewTab $h4 $VIEW_SETTINGS
 Start-Sleep -Milliseconds 400
 # The page opens on category 0; the three bindings live in category 1 (client y = 260 + 44*i + 20).
-[FF]::ClickWindow($h4, 123, 324, 1)
+[FF]::ClickWindow($h4, 123, 236, 1)
 Start-Sleep -Milliseconds 500
-[FF]::ClickWindow($h4, ($valueX4 + 127), 458, 1)
+[FF]::ClickWindow($h4, ($valueX4 + 127), 370, 1)
 Start-Sleep -Milliseconds 1500
 
 $cfg4 = Get-ConfigValue $app 'hotkey' 'toggle_window'
@@ -233,13 +233,13 @@ if ($h6 -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
 $cl6 = Get-Client $h6
 $valueX6 = $cl6.W - 206
 
-Click-ViewTab $h6 5
+Click-ViewTab $h6 $VIEW_SETTINGS
 Start-Sleep -Milliseconds 400
-[FF]::ClickWindow($h6, 123, 324, 1)      # category: hotkeys
+[FF]::ClickWindow($h6, 123, 236, 1)      # category: hotkeys
 Start-Sleep -Milliseconds 300
 [FF]::ClickScreen($h6, 600, 15, 1)       # real click on the caption -> foreground
 Start-Sleep -Milliseconds 400
-[FF]::ClickWindow($h6, ($valueX6 + 50), 458, 1)   # the value box -> capture mode
+[FF]::ClickWindow($h6, ($valueX6 + 50), 370, 1)   # the value box -> capture mode
 Start-Sleep -Milliseconds 400
 [FF]::PressChord([byte[]](0x11, 0x12), 0x76)   # ctrl + alt + F7
 Start-Sleep -Milliseconds 1500

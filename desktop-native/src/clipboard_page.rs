@@ -17,16 +17,16 @@ use crate::clip_list::{self, ReloadIntent, Viewport};
 pub const LIST_LIMIT: i64 = 500;
 
 const PAD: f32 = 16.0;
-const TAB_Y: f32 = 204.0;
+const TAB_Y: f32 = crate::CONTENT_TOP_BARE;
 const TAB_W: f32 = 80.0;
 const TAB_H: f32 = 26.0;
 const TAB_PITCH: f32 = 84.0;
 const SEARCH_W: f32 = 260.0;
-const TOOL_Y: f32 = 242.0;
+const TOOL_Y: f32 = TAB_Y + 38.0;
 const TOOL_H: f32 = 28.0;
 const TOOL_W: f32 = 76.0;
 const TOOL_GAP: f32 = 8.0;
-const LIST_TOP: f32 = 282.0;
+const LIST_TOP: f32 = TAB_Y + 78.0;
 const ROW_H: f32 = 40.0;
 const FOOTER_H: f32 = 34.0;
 

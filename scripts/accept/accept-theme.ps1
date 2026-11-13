@@ -31,19 +31,16 @@ $h = Wait-Window $p.Id
 Check 'main window appears' ($h -ne [IntPtr]::Zero)
 if ($h -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
 Start-Sleep -Milliseconds 1500
-# Period "all time": the probe fixture carries fixed historical dates, so a rolling 7-day
-# window goes empty as the fixture ages (no device rows -> no rename button to click).
-Click-PeriodPill $h 5
 
 # --- dark walk -------------------------------------------------------------------
 # Eight views now (board and clipboard were added after this loop was written at six).
 for ($i = 0; $i -lt 8; $i++) { Click-ViewTab $h $i; Save-WindowShot $h (Join-Path $WorkDir "dark-view$i.png") | Out-Null }
-Click-ViewTab $h 3
+Click-ViewTab $h $VIEW_ANALYTICS
 for ($j = 0; $j -lt 4; $j++) { Click-ATab $h $j; Save-WindowShot $h (Join-Path $WorkDir "dark-atab$j.png") | Out-Null }
 Check 'dark screenshots written' ((Get-ChildItem $WorkDir -Filter 'dark-*.png').Count -ge 12) ''
 
-# --- flip to light from the settings row (index 5 = theme) ------------------------
-Click-ViewTab $h 5
+# --- flip to light from the settings row (regular category, row 3 = theme) ---------
+Click-ViewTab $h $VIEW_SETTINGS
 $before = Get-ThemeName $app
 Click-BasicRow $h 3
 Start-Sleep -Milliseconds 700
@@ -52,7 +49,7 @@ Check 'theme flips through the settings row' (($before -match 'dark') -and ($aft
 
 # --- light walk ------------------------------------------------------------------
 for ($i = 0; $i -lt 8; $i++) { Click-ViewTab $h $i; Save-WindowShot $h (Join-Path $WorkDir "light-view$i.png") | Out-Null }
-Click-ViewTab $h 3
+Click-ViewTab $h $VIEW_ANALYTICS
 for ($j = 0; $j -lt 4; $j++) { Click-ATab $h $j; Save-WindowShot $h (Join-Path $WorkDir "light-atab$j.png") | Out-Null }
 Check 'light screenshots written' ((Get-ChildItem $WorkDir -Filter 'light-*.png').Count -ge 12) ''
 
@@ -91,7 +88,10 @@ function Get-InlineEdit([int]$ProcId) {
 
 $cLight = $null
 $cDark = $null
-Click-ViewTab $h 2
+Click-ViewTab $h $VIEW_DEVICES
+# Period "all time": the probe fixture carries fixed historical dates, so a rolling 7-day
+# window goes empty as the fixture ages (no device rows -> no rename button to click).
+Click-PeriodPill $h 5
 [FF]::ClickWindow($h, 639, 284, 1)   # "rename" button of device row 0
 Start-Sleep -Milliseconds 500
 $editL = Get-InlineEdit $p.Id
@@ -111,13 +111,14 @@ if ($editL -ne 0) {
     Start-Sleep -Milliseconds 400
 }
 
-Click-ViewTab $h 5
+Click-ViewTab $h $VIEW_SETTINGS
 Click-BasicRow $h 3
 Start-Sleep -Milliseconds 600
 $back = Get-ThemeName $app
 Check 'theme flips back to dark' ($back -match 'dark') $back
 
-Click-ViewTab $h 2
+Click-ViewTab $h $VIEW_DEVICES
+Click-PeriodPill $h 5
 [FF]::ClickWindow($h, 639, 284, 1)
 Start-Sleep -Milliseconds 500
 $edit2L = Get-InlineEdit $p.Id

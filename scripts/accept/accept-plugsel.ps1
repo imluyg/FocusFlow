@@ -138,22 +138,22 @@ Check 'the sel button composed <button id><record id>' (@($log | Where-Object { 
 # 34 tall: label then prev/next, then the row below). Since the native caption was
 # removed the client area is the whole 1200x860 window; top-anchored coordinates below
 # are unchanged, only the bottom edge moved down.
-Click-ViewTab $h 4
-[FF]::ClickWindow($h, 200, 270, 1)          # the only plugin row = SelFixture: open its view
+Click-ViewTab $h $VIEW_PLUGINS
+[FF]::ClickWindow($h, 200, 182, 1)          # the only plugin row = SelFixture: open its view
 Start-Sleep -Milliseconds 600
 $cl = Get-Client $h
 $sizeOk = ($cl.W -eq 1200 -and $cl.H -eq 860)
 Check 'the click coordinates address the rows they name' ([bool]$sizeOk) ("client=" + $cl.W + "x" + $cl.H)
-[FF]::ClickWindow($h, 90, 275, 1)           # row 1: a plain button, must fire
+[FF]::ClickWindow($h, 90, 187, 1)           # row 1: a plain button, must fire
 $probeLive = Wait-FixLog '/ pg_probe'
 Check 'the opened view takes a pixel click on a button' ([bool]$probeLive) ''
-[FF]::ClickWindow($h, 90, 345, 1)           # row 3: below the 34 px pager band
+[FF]::ClickWindow($h, 90, 257, 1)           # row 3: below the 34 px pager band
 $afterLive = Wait-FixLog '/ pg_after'
 Check 'the pager band leaves the next row reachable' ([bool]$afterLive) ''
-[FF]::ClickWindow($h, 350, 312, 1)          # pager: next (enabled on page 1 / 3)
+[FF]::ClickWindow($h, 350, 224, 1)          # pager: next (enabled on page 1 / 3)
 $nextLive = Wait-FixLog '/ pg_next'
 Check 'the pager next button fires the declared id' ([bool]$nextLive) ''
-[FF]::ClickWindow($h, 270, 312, 1)          # pager: prev (disabled on page 1)
+[FF]::ClickWindow($h, 270, 224, 1)          # pager: prev (disabled on page 1)
 Start-Sleep -Milliseconds 800
 $afterPager = @(Get-FixLog)
 $prevFired = @($afterPager | Where-Object { $_ -match '/ pg_prev' }).Count -gt 0
@@ -174,10 +174,10 @@ Check 'the pager prev button is inert on the first page' ([bool]($sizeOk -and $p
 # this coordinate was dead while the pager ABOVE the table stayed green -- the exact shape
 # of the reported "next page does nothing" in the ledger. A positive action readout here
 # cannot be earned by a dead band.
-[FF]::ClickWindow($h, 354, 504, 1)          # below-table pager: next
+[FF]::ClickWindow($h, 354, 416, 1)          # below-table pager: next
 $belowLive = Wait-FixLog '/ pg2_next'
 Check 'a pager below a table still fires its declared id' ([bool]$belowLive) ''
-[FF]::ClickWindow($h, 270, 504, 1)          # below-table pager: prev (disabled on page 1)
+[FF]::ClickWindow($h, 270, 416, 1)          # below-table pager: prev (disabled on page 1)
 Start-Sleep -Milliseconds 700
 $belowPrev = @(Get-FixLog | Where-Object { $_ -match '/ pg2_prev' }).Count -gt 0
 Check 'the below-table pager prev is inert on the first page' ([bool](-not $belowPrev)) ''

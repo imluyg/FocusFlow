@@ -54,7 +54,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         1,
         "改完立即生效",
         "每日目标",
-        "目标 · 今天的活跃次数目标，主界面目标条用它",
+        "今天的活跃次数目标，主界面目标条用它",
     ),
     (
         "hotkey",
@@ -62,7 +62,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         3,
         "改完立即生效",
         "唤出窗口热键",
-        "热键 · 按下它把主窗口带到前台，如 ctrl+shift+f；右边的叉＝这条不注册",
+        "按下它把主窗口带到前台，如 ctrl+shift+f；右边的叉＝这条不注册",
     ),
     (
         "hotkey",
@@ -70,7 +70,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         3,
         "改完立即生效",
         "区域截图热键",
-        "热键 · 框选后松手即存（PNG + 剪贴板），如 shift+f1；两条热键不能相同",
+        "框选后松手即存（PNG + 剪贴板），如 shift+f1；两条热键不能相同",
     ),
     (
         "hotkey",
@@ -78,7 +78,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         3,
         "改完立即生效",
         "标注截图热键",
-        "热键 · 按下它框选后进标注窗（方框/箭头/文字），如 shift+f2",
+        "按下它框选后进标注窗（方框/箭头/文字），如 shift+f2",
     ),
     (
         "hotkey",
@@ -86,7 +86,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         3,
         "改完立即生效",
         "剪贴板历史热键",
-        "热键 · 按下它唤出剪贴板历史弹窗；剪贴板记录关掉时这条不注册",
+        "按下它唤出剪贴板历史弹窗；剪贴板记录关掉时这条不注册",
     ),
     (
         "clipboard",
@@ -94,7 +94,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "改完立即生效",
         "记录剪贴板",
-        "剪贴板 · 开＝收录文本、图片与文件；关＝不再记录，热键也不占",
+        "开＝收录文本、图片与文件；关＝不再记录，热键也不占",
     ),
     (
         "clipboard",
@@ -102,7 +102,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "改完立即生效",
         "复制后自动粘贴",
-        "剪贴板 · 开＝双击/回车后自动向原窗口粘贴；关＝只复制",
+        "开＝双击/回车后自动向原窗口粘贴；关＝只复制",
     ),
     (
         "clipboard",
@@ -110,7 +110,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         1,
         "下次收录时生效",
         "最多保留条数",
-        "剪贴板 · 未固定条目的上限；界面只读最近 500 条，固定项不计入",
+        "未固定条目的上限；界面只读最近 500 条，固定项不计入",
     ),
     (
         "clipboard",
@@ -118,7 +118,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         1,
         "下次收录时生效",
         "保留天数",
-        "剪贴板 · 超过这么多天的未固定条目会被清掉；0＝不按天数清",
+        "超过这么多天的未固定条目会被清掉；0＝不按天数清",
     ),
     (
         "clipboard",
@@ -126,7 +126,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         1,
         "改完立即生效",
         "单条文本上限（字节）",
-        "剪贴板 · 超过上限的复制整条跳过，不截断保存",
+        "超过上限的复制整条跳过，不截断保存",
     ),
     (
         "clipboard",
@@ -134,7 +134,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         1,
         "下次收录时生效",
         "单张图片上限（字节）",
-        "剪贴板 · 超过上限的图片整张跳过；按落盘 PNG 的大小算",
+        "超过上限的图片整张跳过；按落盘 PNG 的大小算",
     ),
     (
         "clipboard",
@@ -142,7 +142,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         1,
         "下次收录时生效",
         "未固定条目总预算（MB）",
-        "剪贴板 · 未固定条目的总大小上限（图片按落盘 PNG 算）；0＝不设上限",
+        "未固定条目的总大小上限（图片按落盘 PNG 算）；0＝不设上限",
     ),
     (
         "clipboard",
@@ -150,7 +150,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         3,
         "改完立即生效",
         "排除的进程",
-        "剪贴板 · 逗号分隔的进程名，这些程序复制的内容不记录；缺扩展名按 .exe 补",
+        "逗号分隔的进程名，这些程序复制的内容不记录；缺扩展名按 .exe 补",
     ),
     (
         "snip",
@@ -158,7 +158,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "改完立即生效",
         "截图时隐藏悬浮窗",
-        "截图 · 开＝整场都不显示；关＝冻结后立刻放回（会闪一下桌面）",
+        "开＝整场都不显示；关＝冻结后立刻放回（会闪一下桌面）",
     ),
     (
         "snip",
@@ -166,7 +166,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "改完立即生效",
         "像素放大镜",
-        "截图 · 关＝选区定下前也不画那台跟光标的方块",
+        "关＝选区定下前也不画那台跟光标的方块",
     ),
     (
         "listener",
@@ -174,7 +174,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "改完立即生效",
         "忽略修饰键",
-        "键鼠 · Ctrl/Shift/Alt/Win 本身不计入统计",
+        "Ctrl/Shift/Alt/Win 本身不计入统计",
     ),
     (
         "listener",
@@ -182,7 +182,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "改完立即生效",
         "忽略功能键",
-        "键鼠 · F1–F12、Insert 等功能键不计入",
+        "F1–F12、Insert 等功能键不计入",
     ),
     (
         "listener",
@@ -190,7 +190,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "改完立即生效",
         "过滤长按重复",
-        "键鼠 · 按住不放只算第一次",
+        "按住不放只算第一次",
     ),
     (
         "listener",
@@ -198,7 +198,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         2,
         "改完立即生效",
         "重复判定（秒）",
-        "键鼠 · 同一键多久没抬起就当新的一次",
+        "同一键多久没抬起就当新的一次",
     ),
     (
         "listener",
@@ -206,7 +206,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "改完立即生效",
         "统计鼠标",
-        "键鼠 · 鼠标点击与滚轮也计入活跃",
+        "鼠标点击与滚轮也计入活跃",
     ),
     (
         "listener",
@@ -214,7 +214,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         2,
         "改完立即生效",
         "滚轮合并（秒）",
-        "键鼠 · 连续滚动只记一批，防止一滚刷几百次",
+        "连续滚动只记一批，防止一滚刷几百次",
     ),
     // 注：这里不再有 `[rest]` 那六格。久坐提醒在原生重写后没有任何生产代码读它，
     // 屏上那六行等于替一个不存在的功能许诺（2026-10-31 把 `core::stats::RestMonitor`
@@ -225,7 +225,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         1,
         "改完立即生效",
         "刷新间隔（秒）",
-        "界面 · 键鼠活跃时多久重读一次库；空闲后自动放慢，最长 30 秒",
+        "键鼠活跃时多久重读一次库；空闲后自动放慢，最长 30 秒",
     ),
     (
         "database",
@@ -233,7 +233,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         1,
         "改完立即生效",
         "备份保留份数",
-        "数据 · 自动备份最多保留几个",
+        "自动备份最多保留几个",
     ),
     (
         "database",
@@ -241,7 +241,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "改完立即生效",
         "退出时自动备份",
-        "数据 · 每次正常退出前给各类库各存一份快照",
+        "每次正常退出前给各类库各存一份快照",
     ),
     (
         "database",
@@ -249,7 +249,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         1,
         "改完立即生效",
         "定时备份间隔（小时）",
-        "数据 · 运行中每隔几小时备份一次；0 = 关闭",
+        "运行中每隔几小时备份一次；0 = 关闭",
     ),
     (
         "database",
@@ -257,7 +257,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "改完立即生效",
         "备份插件数据",
-        "数据 · 把插件数据库也一起备份",
+        "把插件数据库也一起备份",
     ),
     (
         "app_stats",
@@ -265,7 +265,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "改完立即生效",
         "应用时长统计",
-        "应用 · 记录前台应用的使用时长",
+        "记录前台应用的使用时长",
     ),
     (
         "app_stats",
@@ -273,7 +273,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         3,
         "改完立即生效",
         "不统计的应用",
-        "应用 · 进程名逗号分隔，如 chrome.exe,code.exe",
+        "进程名逗号分隔，如 chrome.exe,code.exe",
     ),
     (
         "gui",
@@ -281,7 +281,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "重启程序后生效",
         "启动即进托盘",
-        "界面 · 开机启动不弹窗，只留托盘图标",
+        "开机启动不弹窗，只留托盘图标",
     ),
     (
         "database",
@@ -289,7 +289,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         1,
         "重启程序后生效",
         "自动压缩（天）",
-        "数据 · 每隔几天重建数据库回收空间",
+        "每隔几天重建数据库回收空间",
     ),
     (
         "device_stats",
@@ -297,7 +297,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "重启程序后生效",
         "设备分别统计",
-        "设备 · 按键盘/鼠标设备分别计数（Raw Input）",
+        "按键盘/鼠标设备分别计数（Raw Input）",
     ),
     (
         "gui",
@@ -305,7 +305,7 @@ const SETTINGS: &[(&str, &str, u8, &str, &str, &str)] = &[
         0,
         "改完立即生效",
         "诊断日志",
-        "调试 · 开＝把界面事件与心跳写进 focusflow.log（超 512 KiB 轮转）",
+        "开＝把界面事件与心跳写进 focusflow.log（超 512 KiB 轮转）",
     ),
 ];
 
@@ -843,34 +843,43 @@ mod readout_rulers_tests {
         }
     }
 
-    /// 「高级」那一页左侧那句话说的是这一页有哪几组。行加一组（或删空一组）却忘了改那句，
-    /// 屏上就多一句许诺 —— `[rest]` 那六格被摘掉时，「键鼠、休息、…」这句就是残留的半句。
-    /// 两个方向都钉：页面上每一组的前缀都要在那句话里出现；那句话里每一段都要对上页面上的一组。
-    /// 只钉「高级」这一页，因为只有这一页的行按「分组 · 说明」写，别的分类描述的是按钮行。
+    /// 「高级」那一页的分组小标题、左侧那句话与 `advanced_group` 必须对得上。
+    /// 行加一组（或删空一组）却忘了改那句，屏上就多一句许诺 —— `[rest]` 那六格被摘掉时，
+    /// 左侧「键鼠、休息、…」就是残留的半句。这里钉三件事：每一行都落进一个分组、
+    /// 每组至少一行、导航那句里的每一段都对得上真实的分组。
     #[test]
     fn the_advanced_nav_line_names_exactly_the_groups_on_the_page() {
-        let desc = crate::SETTINGS_CATS[5].1;
-        let mut prefixes: Vec<&str> = SETTINGS
-            .iter()
-            .filter(|(section, ..)| crate::setting_cat(section) == 5)
-            .map(|(_, _, _, _, _, help)| help.split(" · ").next().unwrap_or(help).trim())
-            .collect();
-        prefixes.sort_unstable();
-        prefixes.dedup();
-        assert!(
-            prefixes.len() >= 2,
-            "夹具前提：这一页只抠出一组，上面两条比较是空转: {prefixes:?}"
+        assert_eq!(
+            crate::SETTINGS_CATS.len(),
+            5,
+            "分类数变了，下面的高级索引与导航那句都要跟着改"
         );
-        for p in &prefixes {
-            assert!(
-                desc.contains(p),
-                "页面上有「{p}」这一组，左侧那句没提: {desc}"
-            );
+        let desc = crate::SETTINGS_CATS[4].1;
+        let mut groups: Vec<&str> = Vec::new();
+        for (section, key, ..) in SETTINGS {
+            if crate::setting_cat(section, key) != 4 {
+                continue;
+            }
+            let g = crate::advanced_group(section, key)
+                .unwrap_or_else(|| panic!("高级行 {section}.{key} 没有落进任何分组"));
+            let label = crate::ADVANCED_GROUPS[g];
+            if !groups.contains(&label) {
+                groups.push(label);
+            }
         }
+        assert_eq!(
+            groups.len(),
+            crate::ADVANCED_GROUPS.len(),
+            "有分组在页面上没有行：{groups:?}"
+        );
+        assert!(
+            desc.contains(&format!("{} 组", groups.len())),
+            "左侧那句的「N 组」与真实分组数不一致: {desc}"
+        );
         for seg in desc.split('、') {
             assert!(
-                prefixes.iter().any(|p| seg.contains(p)),
-                "左侧那句里的「{seg}」对不上页面上任何一组: {prefixes:?}"
+                groups.iter().any(|p| seg.contains(p)),
+                "左侧那句里的「{seg}」对不上页面上任何一组: {groups:?}"
             );
         }
     }

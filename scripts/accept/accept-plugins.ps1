@@ -52,10 +52,10 @@ $h = Wait-Window $p.Id
 Check 'main window appears' ($h -ne [IntPtr]::Zero)
 if ($h -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
 
-Click-ViewTab $h 4
+Click-ViewTab $h $VIEW_PLUGINS
 Start-Sleep -Milliseconds 600
 # First row under the "builtin" section header: list_top 252 + one header row (46) => 298..340.
-[FF]::ClickWindow($h, 200, 320, 1)     # first row = accounting_plugin
+[FF]::ClickWindow($h, 200, 232, 1)     # first row = accounting_plugin
 Start-Sleep -Milliseconds 600
 $shot = Join-Path $WorkDir 'plugin-view.png'
 Check 'plugin view renders' (Save-WindowShot $h $shot) $shot
@@ -67,7 +67,7 @@ $cl = Get-Client $h
 $mx = [int](($cl.W - 1184) / 2)
 $my = [int](($cl.H - 821) / 2)
 
-[FF]::ClickWindow($h, 60, 275, 1)      # + add record: button carries modal="add_modal"
+[FF]::ClickWindow($h, 60, 187, 1)      # + add record: button carries modal="add_modal"
 Check 'button.modal opens the modal form' (Wait-Log 'add_modal') ''
 
 [FF]::ClickWindow($h, (520 + $mx), (270 + $my), 1)     # the type select inside the modal
@@ -81,13 +81,13 @@ Check 'modal submit runs the plugin action' (Wait-Log 'add_record') ''
 # View-level filter select: the value box sits at y 325..350; the menu opens below it,
 # so the first option is at y 355..379.
 Start-Sleep -Milliseconds 400
-[FF]::ClickWindow($h, 300, 338, 1)
+[FF]::ClickWindow($h, 300, 250, 1)
 Start-Sleep -Milliseconds 300
-[FF]::ClickWindow($h, 300, 365, 1)
+[FF]::ClickWindow($h, 300, 277, 1)
 Check 'view-level select writes the field' (Wait-Log 'f_cat = ') ''
 
 # TextInput inside a modal still uses the inline EDIT.
-[FF]::ClickWindow($h, 60, 275, 1)
+[FF]::ClickWindow($h, 60, 187, 1)
 Start-Sleep -Milliseconds 500
 [FF]::ClickWindow($h, (520 + $mx), (301 + $my), 1)
 Check 'modal text field opens the inline editor' (Wait-Log 'd_item') ''
@@ -96,7 +96,7 @@ Start-Sleep -Milliseconds 400
 
 # A content-only modal (monthly summary), opened by the plugin itself (open=true).
 # "Monthly summary" is the 5th button of the action row (478..574, y 260..290).
-[FF]::ClickWindow($h, 526, 275, 1)
+[FF]::ClickWindow($h, 526, 187, 1)
 Check 'plugin can open a content modal' (Wait-Log 'monthly_detail') ''
 [FF]::ClickWindow($h, (816 + $mx), (500 + $my), 1)     # close
 Check 'content modal close runs its action' (Wait-Log 'clear_result') ''

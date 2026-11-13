@@ -37,8 +37,8 @@ fn box_rect(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
 /// 胶囊排在八个页签右边。
 const TAB_PITCH: f32 = 84.0;
 const TAB_FIRST_X: f32 = 16.0;
-const TAB_Y: f32 = 172.0;
-const TAB_H: f32 = 22.0;
+const TAB_Y: f32 = crate::TAB_ROW_TOP;
+const TAB_H: f32 = 26.0;
 const RANGE_W: f32 = 68.0;
 
 /// 范围胶囊：(哪一档, 矩形)。画、悬停、点击三处都从这一处取矩形，
@@ -257,9 +257,13 @@ mod tests {
         #[test]
         fn the_tabs_are_declared_drawn_and_dispatched() {
             let p = prod();
+            let start = p
+                .find("const VIEWS: [&str; 8]")
+                .expect("页签标签表找不到了");
+            let block = &p[start..start + 400];
             for label in ["\"看板\"", "\"剪贴板\""] {
                 assert_eq!(
-                    p.matches(label).count(),
+                    block.matches(label).count(),
                     1,
                     "页签标签应当只有 `VIEWS` 那一份"
                 );
@@ -274,10 +278,10 @@ mod tests {
             );
             let f = flat(&p);
             let board = f
-                .find("6=>draw_board_page(p,w,h,dash,vs)")
+                .find("V_BOARD=>draw_board_page(p,w,h,dash,vs)")
                 .expect("看板页的分发不见了");
             let clip = f
-                .find("7=>draw_clipboard_page(p,w,h,clip,vs)")
+                .find("V_CLIPBOARD=>draw_clipboard_page(p,w,h,clip,vs)")
                 .expect("剪贴板页的分发不见了：它会落到 draw_placeholder 那句占位文案");
             let fallback = f
                 .find("v=>draw_placeholder(p,w,h,v)")
@@ -286,6 +290,35 @@ mod tests {
                 board < fallback && clip < fallback,
                 "新页签必须排在 `v => draw_placeholder` 兜底**之前**，否则永远走不到"
             );
+        }
+
+        /// 页签顺序：总览在前、配置在最后。顺序一变，命中、快捷键与验收脚本
+        /// 都会跟着错位，所以这里把八格的先后钉死。
+        #[test]
+        fn the_tab_order_starts_with_the_board_and_ends_with_settings() {
+            let p = prod();
+            let start = p
+                .find("const VIEWS: [&str; 8]")
+                .expect("页签标签表找不到了");
+            let block = &p[start..start + 400];
+            let want = [
+                "\"看板\"",
+                "\"键鼠排行\"",
+                "\"应用排行\"",
+                "\"设备排行\"",
+                "\"活跃分析\"",
+                "\"剪贴板\"",
+                "\"插件管理\"",
+                "\"设置\"",
+            ];
+            let mut at = 0;
+            for label in want {
+                let i = block
+                    .find(label)
+                    .unwrap_or_else(|| panic!("页签表里没有 {label}"));
+                assert!(i >= at, "页签顺序错了：{label} 排到了前一个前面");
+                at = i;
+            }
         }
 
         /// 剪贴板页的数只能从 core 的 `clipboard` 要；桌面端不许自己写 SQL。
@@ -337,7 +370,7 @@ mod tests {
             let f = flat(&prod());
             // ① 切到这一页就问一次（写在页签那一圈里）
             assert!(
-                f.contains("ifi==6{self.reload_board();}"),
+                f.contains("ifi==V_BOARD{self.reload_board();}"),
                 "切到看板页没有立刻问库：第一次点进来看到的是旧数或全空"
             );
             // ② 换档问一次

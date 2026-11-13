@@ -95,8 +95,8 @@ $p = Start-App $Exe $app $Work
 $h = Wait-Window $p.Id
 Check 'window appears' ($h -ne [IntPtr]::Zero)
 if ($h -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
+Click-ViewTab $h $VIEW_DEVICES
 Click-PeriodPill $h 5
-Click-ViewTab $h 2
 Start-Sleep -Milliseconds 500
 
 $plain = Join-Path $Work 'kbd-plain.png'
@@ -142,7 +142,7 @@ $search = Has-Visible-Edit $p.Id
 Check 'Ctrl+F puts a visible search EDIT on screen' $search ''
 
 # --- hover a clipped plugin name -> tooltip; right click -> copy the full text ---
-Click-ViewTab $h 4
+Click-ViewTab $h $VIEW_PLUGINS
 Start-Sleep -Milliseconds 800
 $preTip = Join-Path $Work 'kbd-pretip.png'
 Save-WindowShot $h $preTip | Out-Null
@@ -150,15 +150,15 @@ Save-WindowShot $h $preTip | Out-Null
 # WM_MOUSELEAVE (the pointer really is elsewhere) and the hover state is cleared.
 $wr = New-Object FF+RECT
 [void][FF]::GetWindowRect($h, [ref]$wr)
-[void][FF]::SetCursorPos(($wr.Left + 120), ($wr.Top + 312))
+[void][FF]::SetCursorPos(($wr.Left + 120), ($wr.Top + 224))
 Start-Sleep -Milliseconds 1000
 $tipShot = Join-Path $Work 'kbd-tooltip.png'
 Save-WindowShot $h $tipShot | Out-Null
-$tip = Count-Diff $preTip $tipShot 40 320 480 350
+$tip = Count-Diff $preTip $tipShot 40 232 480 262
 Check 'hovering a clipped plugin name shows a tooltip' ($tip -ge 20) "diff=$tip"
 
 Set-Clipboard -Value 'sentinel'
-[void][FF]::PostMessage($h, 0x0204, [IntPtr]::Zero, [IntPtr]((312 -shl 16) -bor 120))
+[void][FF]::PostMessage($h, 0x0204, [IntPtr]::Zero, [IntPtr]((224 -shl 16) -bor 120))
 Start-Sleep -Milliseconds 500
 $clip = (Get-Clipboard -Raw)
 Check 'right click copies the full name' ($clip -eq $longName) "clip=[$clip]"

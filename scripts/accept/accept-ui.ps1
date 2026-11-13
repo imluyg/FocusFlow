@@ -53,14 +53,14 @@ function Find-CardOrigin($Bmp, [int]$WantR, [int]$WantG, [int]$WantB, [int]$Tol)
         # pills are card-fill coloured and would win the scan for the card top.
         $c = $Bmp.GetPixel(60, $y)
         if ([Math]::Abs($c.R - $WantR) -le $Tol -and [Math]::Abs($c.G - $WantG) -le $Tol -and [Math]::Abs($c.B - $WantB) -le $Tol) {
-            $oy = $y - 84
+            $oy = $y - 120
             break
         }
     }
     if ($oy -lt 0) { return @(-1, -1) }
     $ox = -1
     for ($x = 0; $x -lt 260; $x++) {
-        $c = $Bmp.GetPixel($x, ($oy + 120))
+        $c = $Bmp.GetPixel($x, ($oy + 150))
         if ([Math]::Abs($c.R - $WantR) -le $Tol -and [Math]::Abs($c.G - $WantG) -le $Tol -and [Math]::Abs($c.B - $WantB) -le $Tol) {
             $ox = $x - 16
             break
@@ -113,6 +113,7 @@ Check 'main window appears' ($h -ne [IntPtr]::Zero)
 if ($h -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
 Start-Sleep -Milliseconds 1400
 [void][FFUI]::SetForegroundWindow($h)
+Click-ViewTab $h $VIEW_KEYS   # the five stat cards only live on ranking pages now
 Move-CursorAway $h
 Start-Sleep -Milliseconds 300
 $lightShot = Join-Path $WorkDir 'ui-light.png'
@@ -121,9 +122,9 @@ $bl = [System.Drawing.Bitmap]::FromFile($lightShot)
 $o = Find-CardOrigin $bl 255 255 255 2
 Check 'the first stat card is found in the frame' ($o[0] -ge 0) "offset=$($o[0]),$($o[1])"
 $ox = $o[0]; $oy = $o[1]
-$page = Shot-Pixel $bl (4 + $ox) (150 + $oy)
-$near = Shot-Pixel $bl (12 + $ox) (150 + $oy)
-$card = Shot-Pixel $bl (220 + $ox) (150 + $oy)
+$page = Shot-Pixel $bl (4 + $ox) (186 + $oy)
+$near = Shot-Pixel $bl (12 + $ox) (186 + $oy)
+$card = Shot-Pixel $bl (220 + $ox) (186 + $oy)
 $delta = ($page.R - $near.R) + ($page.G - $near.G) + ($page.B - $near.B)
 Check 'opaque cards cast a visible shadow' ($delta -ge 6) "page=$($page.R),$($page.G),$($page.B) shadow=$($near.R),$($near.G),$($near.B) delta=$delta"
 Check 'the shadow stays outside the card' ($card.R -ge 250 -and $card.G -ge 250 -and $card.B -ge 250) "card=$($card.R),$($card.G),$($card.B)"
@@ -140,21 +141,21 @@ $hd = [Math]::Abs($after.R - $before.R) + [Math]::Abs($after.G - $before.G) + [M
 Check 'an idle pill changes colour on hover' ($hd -ge 6) "before=$($before.R),$($before.G),$($before.B) after=$($after.R),$($after.G),$($after.B) delta=$hd"
 $bh.Dispose()
 Check 'the period pill shows a hand cursor' ($kindPill -eq 'hand') "cursor=$kindPill"
-$kindTab = Cursor-Kind $h 56 183
+$kindTab = Cursor-Kind $h 56 97
 Check 'a view tab shows a hand cursor' ($kindTab -eq 'hand') "cursor=$kindTab"
 $kindEmpty = Cursor-Kind $h 600 400
 Check 'empty space keeps the arrow' ($kindEmpty -eq 'arrow') "cursor=$kindEmpty"
 
 # ---- underline follows the label ------------------------------------------------------
-$yUnd = 200 + $oy
-$w0 = Count-Accent $bl $yUnd (16 + $ox) (96 + $ox)
+$yUnd = 112 + $oy
+$w0 = Count-Accent $bl $yUnd (100 + $ox) (180 + $ox)
 Check 'the active tab draws an underline' ($w0 -ge 20) "accent_pixels=$w0"
-Click-ViewTab $h 5
+Click-ViewTab $h $VIEW_SETTINGS
 Start-Sleep -Milliseconds 600
 $setShot = Join-Path $WorkDir 'ui-settings.png'
 Save-WindowShot $h $setShot | Out-Null
 $bs = [System.Drawing.Bitmap]::FromFile($setShot)
-$w5 = Count-Accent $bs $yUnd (436 + $ox) (516 + $ox)
+$w5 = Count-Accent $bs $yUnd (604 + $ox) (684 + $ox)
 Check 'the underline width follows the label (2 chars vs 4)' (($w0 - $w5) -ge 8) "four_chars=$w0 two_chars=$w5"
 $bs.Dispose()
 $bl.Dispose()
@@ -231,7 +232,7 @@ Check 'restore brings it back' (-not [FFUI]::IsIconic($h)) ''
 # moved into the client area they used to be swallowed by it: with the dialog open, clicking
 # minimize only dismissed the dialog. Window-level actions must survive a page modal.
 $cl2 = Get-Client $h
-Click-ViewTab $h 2
+Click-ViewTab $h $VIEW_DEVICES
 Click-PeriodPill $h 5              # total: today has no device rows in a fresh copy
 Start-Sleep -Milliseconds 800
 $plainShot = Join-Path $WorkDir 'ui-modal-1.png'
@@ -279,6 +280,7 @@ Set-ConfigLine $app 'gui' 'theme' 'dark'
 $p2 = Start-App $Exe $app $WorkDir @{ 'FOCUSFLOW_NO_GLASS' = '1' }
 $h2 = Wait-Window $p2.Id
 Start-Sleep -Milliseconds 1400
+Click-ViewTab $h2 $VIEW_KEYS
 $darkShot = Join-Path $WorkDir 'ui-dark.png'
 Save-WindowShot $h2 $darkShot | Out-Null
 $bd = [System.Drawing.Bitmap]::FromFile($darkShot)
@@ -286,13 +288,13 @@ $od = Find-CardOrigin $bd 33 39 54 2
 Check 'the dark card fill is found in the frame' ($od[0] -ge 0) "offset=$($od[0]),$($od[1])"
 if ($od[0] -ge 0) {
     $dx = $od[0]; $dy = $od[1]
-    $dPage = Shot-Pixel $bd (4 + $dx) (150 + $dy)
-    $dNear = Shot-Pixel $bd (12 + $dx) (150 + $dy)
+    $dPage = Shot-Pixel $bd (4 + $dx) (186 + $dy)
+    $dNear = Shot-Pixel $bd (12 + $dx) (186 + $dy)
     $dSame = [Math]::Abs($dPage.R - $dNear.R) + [Math]::Abs($dPage.G - $dNear.G) + [Math]::Abs($dPage.B - $dNear.B)
     Check 'the dark theme paints no shadow' ($dSame -le 2) "page=$($dPage.R),$($dPage.G),$($dPage.B) near=$($dNear.R),$($dNear.G),$($dNear.B)"
     # $dy is found from the first *card-fill* row, so the highlight line sits one row above it.
-    $top = Shot-Pixel $bd (200 + $dx) ($dy + 83)
-    $body = Shot-Pixel $bd (200 + $dx) ($dy + 97)
+    $top = Shot-Pixel $bd (200 + $dx) ($dy + 119)
+    $body = Shot-Pixel $bd (200 + $dx) ($dy + 133)
     $hl = ($top.R - $body.R) + ($top.G - $body.G) + ($top.B - $body.B)
     Check 'the dark theme has a top highlight' ($hl -ge 8) "top=$($top.R),$($top.G),$($top.B) body=$($body.R),$($body.G),$($body.B)"
 }

@@ -379,13 +379,13 @@ Check 'PageUp from a middle row copies the first row' `
     "clipboard='$pageUpClip' want='$topText'"
 
 # Page: open the management page, enable multi-select, pick the first row, pin it.
-[FF]::ClickWindow($h, 644, 183, 1)
+Click-ViewTab $h $VIEW_CLIPBOARD
 Check 'clipboard management page opens' (Wait-LogMatch '*clip_page_open*' 3000)
-[FF]::ClickWindow($h, 474, 256, 1)
+[FF]::ClickWindow($h, 474, 172, 1)
 Start-Sleep -Milliseconds 250
-[FF]::ClickWindow($h, 300, 300, 1)
+[FF]::ClickWindow($h, 300, 216, 1)
 Start-Sleep -Milliseconds 250
-[FF]::ClickWindow($h, 138, 256, 1)
+[FF]::ClickWindow($h, 138, 172, 1)
 Check 'page bulk pin runs' (Wait-LogMatch '*clip_page_pin*' 3000)
 
 # ---- v1.2: images and files through the real clipboard ----
@@ -453,11 +453,11 @@ Check 'image can be copied a second time' $imgSet2
 Start-Sleep -Milliseconds 1200
 # Leave multi-select first: while it is on, a row click toggles a checkbox and Copy acts on
 # the checked row (still the pinned text), not on the row under the cursor.
-[FF]::ClickWindow($h, 474, 256, 1)
+[FF]::ClickWindow($h, 474, 172, 1)
 Start-Sleep -Milliseconds 250
-[FF]::ClickWindow($h, 300, 340, 1)
+[FF]::ClickWindow($h, 300, 256, 1)
 Start-Sleep -Milliseconds 250
-[FF]::ClickWindow($h, 54, 256, 1)
+[FF]::ClickWindow($h, 54, 172, 1)
 Check 'page copy sends the image back to the clipboard' (Wait-LogMatch '*clip_page_copy kind=Image*' 4000)
 $hasImage = $false
 try { $hasImage = [System.Windows.Forms.Clipboard]::ContainsImage() } catch { }
@@ -476,7 +476,7 @@ function Wait-LogCount([string]$Pattern, [int]$Want, [int]$TimeoutMs = 5000) {
 # Click the search box (the drawn rect; the real EDIT only appears once it has focus),
 # then type into that EDIT. Each WM_CHAR changes the text, so EN_CHANGE must reach the
 # window and the list must be filtered without pressing Enter.
-[FF]::ClickWindow($h, 1050, 217, 1)
+[FF]::ClickWindow($h, 1050, 133, 1)
 Start-Sleep -Milliseconds 400
 $editHost = [FF]::ByClassHandle($p.Id, 'FocusFlowEditHost')
 $se = 0
@@ -509,7 +509,7 @@ Check 'Ctrl+A checks every row on the page' (Wait-LogMatch '*clip_page_check_all
 
 # Ctrl+A checked every row. Now change the filter: the checked ids that fall out of the
 # list must not stay armed, or Del would remove rows the user cannot see.
-[FF]::ClickWindow($h, 1050, 217, 1)
+[FF]::ClickWindow($h, 1050, 133, 1)
 Start-Sleep -Milliseconds 300
 foreach ($ch in @(0x6D, 0x61, 0x72, 0x6B, 0x65, 0x72)) {  # "marker": exactly one row
     [FF]::PostMessage([IntPtr]$se, 0x0102, [IntPtr]$ch, [IntPtr]::Zero) | Out-Null
@@ -518,13 +518,13 @@ foreach ($ch in @(0x6D, 0x61, 0x72, 0x6B, 0x65, 0x72)) {  # "marker": exactly on
 Check 'the filter change narrows the list to one row' (Wait-LogMatch '*clip_page_live_filter len=6 hits=1*' 4000)
 # The keyboard still belongs to the search EDIT here, so drive the delete through the
 # toolbar button: the point of this leg is which ids are armed, not the key routing.
-[FF]::ClickWindow($h, 220, 256, 1)
+[FF]::ClickWindow($h, 220, 172, 1)
 Start-Sleep -Milliseconds 900
 [FF]::PressChord([byte[]]@(), [byte]0x0D)
 Check 'delete after a filter change only removes the visible row' (Wait-LogMatch '*clip_page_delete n=1*' 5000)
 
 # Clear the filter again so the rounds below still have a full page to work with.
-[FF]::ClickWindow($h, 1050, 217, 1)
+[FF]::ClickWindow($h, 1050, 133, 1)
 Start-Sleep -Milliseconds 300
 $clearsBefore = @(Get-LogLines | Where-Object { $_ -like '*commit=false*' }).Count
 [FF]::PostMessage([IntPtr]$se, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero) | Out-Null
@@ -537,7 +537,7 @@ Check 'Ctrl+A checks every row again after clearing the filter' (Wait-LogCount '
 # Click Delete: the row set must still be there after a beat (the confirm dialog is up),
 # and only Enter (the default Yes) may actually remove it.
 $deletesBefore = @(Get-LogLines | Where-Object { $_ -like '*clip_page_delete*' }).Count
-[FF]::ClickWindow($h, 220, 256, 1)
+[FF]::ClickWindow($h, 220, 172, 1)
 Start-Sleep -Milliseconds 900
 $deletesPending = @(Get-LogLines | Where-Object { $_ -like '*clip_page_delete*' }).Count
 Check 'delete waits for the confirmation' ($deletesPending -eq $deletesBefore)
@@ -635,23 +635,23 @@ function Read-FixtureDb([string]$Mode = 'read') {
     $out | ConvertFrom-Json
 }
 
-[FF]::ClickWindow($h, 474, 256, 1)
+[FF]::ClickWindow($h, 474, 172, 1)
 $pageBody = "accept-snippet-page`r`n`t  "
 $beforeSnippet = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest *' }).Count
 Set-ClipboardRetry $pageBody
 Check 'page snippet fixture preserves its trailing whitespace' ((Get-ClipboardRetry) -ceq $pageBody)
 Check 'page snippet source is captured' (Wait-LogCount '*clip_ingest *' ($beforeSnippet + 1) 5000)
-[FF]::ClickWindow($h, 300, 300, 1)
-[FF]::ClickWindow($h, 306, 256, 1)
+[FF]::ClickWindow($h, 300, 216, 1)
+[FF]::ClickWindow($h, 306, 172, 1)
 Start-Sleep -Milliseconds 400
 $dbState = Read-FixtureDb
 Check 'page saves snippet body without trimming' ($dbState.snippets.Count -eq 1 -and $dbState.snippets[0].content -ceq $pageBody)
-[FF]::ClickWindow($h, 138, 217, 1)
+[FF]::ClickWindow($h, 138, 133, 1)
 Set-ClipboardRetry 'accept-before-snippet-copy'
-[FF]::ClickWindow($h, 54, 256, 1)
+[FF]::ClickWindow($h, 54, 172, 1)
 Start-Sleep -Milliseconds 500
 Check 'page copies snippet body byte-for-byte' ((Get-ClipboardRetry) -ceq $pageBody)
-[FF]::ClickWindow($h, 54, 217, 1)
+[FF]::ClickWindow($h, 54, 133, 1)
 
 $popupBody = "accept-snippet-popup`n`t  "
 $beforePopupSnippet = @(Get-LogLines | Where-Object { $_ -like '*clip_ingest *' }).Count

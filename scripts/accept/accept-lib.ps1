@@ -463,14 +463,24 @@ function Read-AppLog([string]$WorkDir) {
 }
 
 # Viewer-tab / settings-row helpers (client coordinates, 100% DPI, 1184x821 client).
+# Tab order (left to right): 0 board, 1 keys, 2 apps, 3 devices, 4 analytics,
+# 5 clipboard, 6 plugins, 7 settings. Scripts read these names, not raw numbers.
+$VIEW_BOARD = 0
+$VIEW_KEYS = 1
+$VIEW_APPS = 2
+$VIEW_DEVICES = 3
+$VIEW_ANALYTICS = 4
+$VIEW_CLIPBOARD = 5
+$VIEW_PLUGINS = 6
+$VIEW_SETTINGS = 7
 # Period pills: 16 + 66 + i*60, 48, 54x26 -> centre (109 + i*60, 61)
 #   0 today, 1 7d, 2 15d, 3 30d, 4 1y, 5 all
 function Click-PeriodPill([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 109 + $Index * 60, 61, 1); Start-Sleep -Milliseconds 500 }
-function Click-ViewTab([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 56 + $Index * 84, 183, 1); Start-Sleep -Milliseconds 400 }
+function Click-ViewTab([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 56 + $Index * 84, 97, 1); Start-Sleep -Milliseconds 400 }
 function Click-ATab([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 48 + $Index * 68, 270, 1); Start-Sleep -Milliseconds 400 }
 # Basic rows in the first ("regular") category (current order): 0 autostart, 1 collector,
-# 2 pause, 3 theme -- 44 px apart starting at y=260 (row centre 282).
-function Click-BasicRow([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 320, 282 + $Index * 44, 1); Start-Sleep -Milliseconds 450 }
+# 2 pause, 3 theme -- 44 px apart starting at y=172 (row centre 194).
+function Click-BasicRow([IntPtr]$Hwnd, [int]$Index) { [FF]::ClickWindow($Hwnd, 320, 194 + $Index * 44, 1); Start-Sleep -Milliseconds 450 }
 
 # Real mouse drag at absolute screen coordinates (LEFTDOWN / moves / LEFTUP).
 # Used by the snip overlay, which is a full-virtual-screen window: at 100% DPI with the

@@ -89,11 +89,11 @@ $h = Wait-Window $p.Id
 Check 'main window appears' ($h -ne [IntPtr]::Zero)
 if ($h -eq [IntPtr]::Zero) { Stop-App; Show-Summary }
 
-Click-ViewTab $h 4
+Click-ViewTab $h $VIEW_PLUGINS
 Start-Sleep -Milliseconds 700
 
 # Install button: plugin_install_rect(card) with a 1200x860 client.
-[FF]::ClickWindow($h, 1102, 229, 1)
+[FF]::ClickWindow($h, 1102, 141, 1)
 Check 'the install operation reported back' (Wait-Log 'OP_DONE' 15000) ''
 Check 'the package landed in the data dir' (Wait-File $pkg) $pkg
 Check 'the install record exists' (Wait-File (Join-Path $state 'meta.json')) ''
@@ -110,13 +110,13 @@ Check 'the list redraws after install' (Save-WindowShot $h $shot1) $shot1
 
 # Row is the first extension row: list_top 252 + header 46 => y 298..340.
 # Its "detail" button sits at row_right-208, y+9 (58x22).
-[FF]::ClickWindow($h, 989, 318, 1)
+[FF]::ClickWindow($h, 989, 230, 1)
 Check 'the detail page opens' (Wait-Log 'detail_open=1') ''
 $shot2 = Join-Path $WorkDir 'detail.png'
 Check 'the detail page renders' (Save-WindowShot $h $shot2) $shot2
 
 # Uninstall button top-right of the detail card, then "delete settings" (middle button).
-[FF]::ClickWindow($h, 1124, 231, 1)
+[FF]::ClickWindow($h, 1124, 143, 1)
 Start-Sleep -Milliseconds 500
 $shot3 = Join-Path $WorkDir 'uninstall-prompt.png'
 Check 'the confirm box renders' (Save-WindowShot $h $shot3) $shot3
