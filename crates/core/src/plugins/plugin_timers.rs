@@ -16,7 +16,7 @@
 //!
 //! 时钟不进内部状态：[`Board::collect_due`] 收的是调用方算好的 `now`（`Instant`）与
 //! `minute_key`/`day_key` 两个整数。这样"每分钟一次""跨过午夜那一次"这类判据能在用例里
-//! 直接造出来，而不是等日历走到那天（与 `dashboard::summarize` 那种"纯的那一半"同一个手法）。
+//! 直接造出来，而不是等日历走到那天（纯函数、时钟由调用方传进去的同一手法）。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

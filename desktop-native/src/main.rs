@@ -7,11 +7,11 @@
 //!
 //! 滚动容器、六个视图、截图覆盖层与贴图都已做完；剩下的缺口清单在
 //! `docs/handoff-native-migration.md`。
+mod board;
 mod clip_list;
 mod clipboard_page;
 mod clipboard_popup;
 mod collect;
-mod dashboard;
 mod data;
 mod floating;
 mod floating_render;
@@ -964,9 +964,9 @@ enum Ctl {
     WinBtn(u8),
     Period(u8),
     ViewTab(u8),
-    /// 看板页那三个范围胶囊（今日/本周/本月）。手型指针要认它：胶囊是**点得动**的，
-    /// 指过去还是箭头就是"这里好像不能按"。
-    DashPill(u8),
+    /// 看板落地页：两列的「查看排行」入口与 Top 3 行。
+    BoardLink(u8),
+    BoardRow(u8, u8),
     ATab(u8),
     RankPill(u8),
     SetNav(u8),
@@ -1079,9 +1079,6 @@ struct App {
     clip_search_focused: bool,
     /// 后台操作把结果行塞这里，再投 `WM_OP_DONE` 让界面来取。
     ops: Arc<Mutex<Vec<String>>>,
-    /// 内置看板页的状态（哪一档 + 上次问库的时刻 + 算好的那一页）。
-    /// 数字本身在 `focusflow_core::dashboard`，这一页不写 SQL。
-    dash: dashboard::Dash,
     /// 插件管理器（Lua 不是 Send，只能待在 UI 线程）。
     pm: Option<PluginManager>,
     /// 插件列表（从 plugins/ 目录扫出来的）。
@@ -1833,7 +1830,6 @@ impl App {
                 plugin_rows: Vec::new(),
                 plugin_err: None,
                 plugins_loaded: false,
-                dash: dashboard::Dash::new(),
                 plugin_open: None,
                 plugin_detail_open: None,
                 plugin_detail_source: None,
@@ -2058,7 +2054,6 @@ impl App {
                 collector_paused: collect::is_paused(),
                 cpm: collect::cpm(),
                 settings_cat: self.settings_cat,
-                dash_range: self.dash.range,
             };
             let pv = self.plugin_open.as_ref().and_then(|name| {
                 self.pm
@@ -2083,7 +2078,6 @@ impl App {
                 size.width,
                 size.height,
                 &snap,
-                &self.dash.board,
                 &self.clip_page,
                 vs,
                 self.detail.as_ref(),
@@ -2158,11 +2152,25 @@ impl App {
                 return Some(Ctl::ViewTab(i as u8));
             }
         }
-        // 看板页的范围胶囊与页签同一行，手型指针要一视同仁（那三个是真点得动的）。
+        // 看板落地页：两列的「查看排行」与 Top 3 行都可点。
         if self.view == V_BOARD {
-            for (i, (_, pill)) in dashboard::range_pills().iter().enumerate() {
-                if hit(*pill, x, y) {
-                    return Some(Ctl::DashPill(i as u8));
+            let l = board::layout(w, h);
+            for (c, link) in l.links.iter().enumerate() {
+                if hit(*link, x, y) {
+                    return Some(Ctl::BoardLink(c as u8));
+                }
+            }
+            let counts = self
+                .snap
+                .lock()
+                .map(|s| [s.apps.len(), s.rank.len()])
+                .unwrap_or([0, 0]);
+            for (c, rows) in l.rows.iter().enumerate() {
+                let n = counts[c].min(board::TOP_N);
+                for (r, row) in rows.iter().take(n).enumerate() {
+                    if hit(*row, x, y) {
+                        return Some(Ctl::BoardRow(c as u8, r as u8));
+                    }
                 }
             }
         }
@@ -2552,8 +2560,19 @@ impl App {
                 }
             }
             V_BOARD => {
-                for (_, r) in dashboard::range_pills() {
-                    page(r, None);
+                let l = board::layout(w, h);
+                for link in l.links {
+                    page(link, None);
+                }
+                let counts = self
+                    .snap
+                    .lock()
+                    .map(|s| [s.apps.len(), s.rank.len()])
+                    .unwrap_or([0, 0]);
+                for (c, rows) in l.rows.iter().enumerate() {
+                    for row in rows.iter().take(counts[c].min(board::TOP_N)) {
+                        page(*row, None);
+                    }
                 }
             }
             _ => {}
@@ -2711,11 +2730,6 @@ impl App {
         }
         if i == V_PLUGINS {
             self.reload_plugins();
-        }
-        // 进看板页就先问一次库（方案 3.2.3 第一行：切到这一页时查一次）。
-        // 没这一句，第一次点进来看到的是上一次离开时那一页的旧数（或全空）。
-        if i == V_BOARD {
-            self.reload_board();
         }
         if i == V_CLIPBOARD {
             tracing_note("clip_page_open");
@@ -3448,21 +3462,36 @@ impl App {
             }
         }
 
-        // 看板页那三个范围胶囊（就在页签右边；矩形与画/悬停同源，命中用全仓那一个 `hit`）。
+        // 看板落地页：点「查看排行」或任意一条 Top 3，去对应的排行页。
         if self.view == V_BOARD {
-            for (range, pill) in dashboard::range_pills() {
-                if !hit(pill, x, y) {
-                    continue;
+            let l = board::layout(w, h);
+            let counts = self
+                .snap
+                .lock()
+                .map(|s| [s.apps.len(), s.rank.len()])
+                .unwrap_or([0, 0]);
+            let mut target = None;
+            for (c, link) in l.links.iter().enumerate() {
+                if hit(*link, x, y) {
+                    target = Some(c);
                 }
-                // `set_range` 答 false = 点的就是当前那一档：那时不重查，
-                // 否则同一份数被"再点一下"白问一遍，而页面上什么都没变。
-                if self.dash.set_range(range) {
-                    tracing_note(&format!("看板换档 {} at ({x:.0},{y:.0})", range.label()));
-                    self.reload_board();
+            }
+            if target.is_none() {
+                for (c, rows) in l.rows.iter().enumerate() {
+                    let n = counts[c].min(board::TOP_N);
+                    if rows.iter().take(n).any(|row| hit(*row, x, y)) {
+                        target = Some(c);
+                    }
                 }
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
+            }
+            if let Some(c) = target {
+                tracing_note(&format!(
+                    "看板跳转 {} at ({x:.0},{y:.0})",
+                    if c == 0 { "应用" } else { "键鼠" }
+                ));
+                self.rank_tab = 0;
+                self.rank_filter = 0;
+                self.switch_view(hwnd, if c == 0 { V_APPS } else { V_KEYS });
                 return;
             }
         }
@@ -4603,12 +4632,6 @@ impl App {
     /// 这一页只读库值的话，同一屏上就会有两个今日数（打卡条那颗点为这件事改过一次，
     /// 同一个症状不该在新页面上重犯）。代价也是同一份：落库那一瞬可能重复计一次，
     /// 那是既有读数一起承担的窗口，不是这一页新引入的。
-    fn reload_board(&mut self) {
-        let range = self.dash.range;
-        self.dash.board = focusflow_core::dashboard::collect(range, collect::pending_today());
-        self.dash.mark_loaded();
-    }
-
     /// 重扫插件目录（进插件页、切换开关之后各来一次）。
     fn reload_plugins(&mut self) {
         self.ensure_plugin_manager();
@@ -7433,8 +7456,6 @@ struct ViewState {
     cpm: i64,
     /// 设置页左侧选中的分类。
     settings_cat: usize,
-    /// 看板页当前选中的时间范围（画胶囊高亮与命中回写读同一份）。
-    dash_range: focusflow_core::db::queries::DashRange,
 }
 
 // 视图下标：画、命中、键盘与快捷键共用的唯一一份，顺序就是顶部页签从左到右。
@@ -7584,10 +7605,10 @@ fn period_pills() -> [(i64, D2D_RECT_F); 6] {
 
 /// 全局周期药丸只在真正读它的页面上出现。
 ///
-/// 看板页有自己的一套范围药丸（`dashboard::range_pills`），插件/设置/剪贴板页
-/// 根本没有周期数据。把它们也画出来，点下去只会让这一排高亮、页面数字一动不动。
+/// 排行、活跃分析与看板都读当前周期；插件/设置/剪贴板页根本没有周期数据。
+/// 把它们也画出来，点下去只会让这一排高亮、页面数字一动不动。
 fn period_pills_visible(view: usize) -> bool {
-    matches!(view, V_KEYS..=V_ANALYTICS)
+    matches!(view, V_BOARD..=V_ANALYTICS)
 }
 
 /// 第 4 个页签上该画哪一张。
@@ -7630,8 +7651,6 @@ fn draw_screen(
     w: f32,
     h: f32,
     snap: &Snapshot,
-    // 内置看板页算好的那一页（数字在 core 的 `dashboard`，这里只排版）
-    dash: &focusflow_core::dashboard::DashBoard,
     // 剪贴板管理页的状态（列表/模式/多选都在这一份里）
     clip: &clipboard_page::ClipPage,
     vs: ViewState,
@@ -7812,7 +7831,7 @@ fn draw_screen(
     }
 
     match vs.view {
-        V_BOARD => draw_board_page(p, w, h, dash, vs),
+        V_BOARD => draw_board_page(p, w, h, snap, vs),
         V_KEYS..=V_DEVICES => draw_dashboard(p, w, h, snap, vs, tip),
         V_ANALYTICS => draw_analytics(p, w, h, snap, vs),
         // 视图 > 详情 > 清单，判断只有一份（[`plugin_page_of`]）。
@@ -11535,133 +11554,114 @@ fn draw_cleanup_prompt(p: &P<'_>, w: f32, h: f32) {
     }
 }
 
-/// 内置看板页：范围胶囊 + KPI 四格 + 一句话 + 趋势 + 两列排行（方案 3.2）。
+/// 看板落地页：四格 KPI、一句结论、两列 Top 3。
 ///
-/// 三条约定：
-/// · 一个数字都不在这里算 —— 全部出自 `focusflow_core::dashboard`，那一半与「活跃分析」
-///   用的是同一批读数函数。同一天的数在两页不一样，用户只会信小的那个；
-/// · 趋势复用插件图表那一个画法（[`draw_plugin_chart`]）：纵轴顶格、绘图区边距、空数据
-///   那句「暂无数据」都只有一份，同一份数据不该因为换了一页就画成另一个高度；
-/// · 这一块 UI 的字体全是 `NO_WRAP` 且 `DrawText` 不按矩形裁切 —— 动态文本必须自己带
-///   宽度上界，预算与画它的那块矩形取同一个表达式（本仓那条老规矩）。
-fn draw_board_page(
-    p: &P<'_>,
-    w: f32,
-    h: f32,
-    dash: &focusflow_core::dashboard::DashBoard,
-    vs: ViewState,
-) {
-    let m = 16.0;
-    let top = content_top(V_BOARD);
+/// 数字全部来自当前周期的 `Snapshot`（与排行页同一份），时间口径就是顶部那排全局
+/// 周期药丸；这里不再有自己的范围胶囊、趋势图与完整榜单 —— 那几块在排行/分析页
+/// 已经有了，重复一遍只会让切页时同一排控件换一套口径。
+fn draw_board_page(p: &P<'_>, w: f32, h: f32, snap: &Snapshot, vs: ViewState) {
+    let view = board::board_view(snap, &period_text(snap.period));
+    let l = board::layout(w, h);
 
-    // --- 范围胶囊：与页签同一行、在八个页签右边；几何与命中都读 `dashboard::range_pills` ---
-    for (i, (range, r)) in dashboard::range_pills().iter().enumerate() {
-        let active = vs.dash_range == *range;
-        if active {
-            p.round(*r, R_CONTROL, &p.br.accent, None);
-        } else {
-            p.round(*r, R_CONTROL, &p.br.card, Some(&p.br.border));
-            if vs.ctl == Some(Ctl::DashPill(i as u8)) {
-                p.round(*r, R_CONTROL, &p.br.hover, None);
-            }
-        }
+    for ((name, value), r) in view.kpis.iter().zip(l.kpi.iter()) {
+        p.card(*r, R_CARD);
+        let label_w = r.right - r.left - 24.0;
         p.text(
-            range.label(),
-            rect(r.left, r.top, r.right - r.left, r.bottom - r.top),
-            &p.fmt.tab,
-            if active { &p.br.white } else { &p.br.muted },
-        );
-    }
-
-    // --- KPI 行：四格，顺序与文案都由 core 那一半定死 ---
-    let kpi_gap = 10.0;
-    let kw = (w - m * 2.0 - kpi_gap * 3.0) / 4.0;
-    let row_h = 78.0;
-    for (i, (name, value)) in dash.kpi.iter().enumerate() {
-        let kx = m + i as f32 * (kw + kpi_gap);
-        p.card(rect(kx, top, kw, row_h), R_CARD);
-        let label_w = kw - 24.0;
-        let shown_label = p.clip(name, &p.fmt.caption, label_w);
-        p.text(
-            &shown_label,
-            rect(kx + 12.0, top + 10.0, label_w, 16.0),
+            &p.clip(name, &p.fmt.caption, label_w),
+            rect(r.left + 12.0, r.top + 10.0, label_w, 16.0),
             &p.fmt.caption,
             &p.br.muted,
         );
-        let shown_value = p.clip(value, &p.fmt.value, label_w);
         p.text(
-            &shown_value,
-            rect(kx + 12.0, top + 30.0, label_w, 30.0),
+            &p.clip(value, &p.fmt.value, label_w),
+            rect(r.left + 12.0, r.top + 30.0, label_w, 30.0),
             &p.fmt.value,
             &p.br.fg,
         );
     }
 
-    // --- 一句话；缺读必须跟在它下面点名 ---
-    let line_y = top + row_h + 10.0;
-    let full_w = w - m * 2.0;
-    let sentence = p.clip(&dash.sentence, &p.fmt.body, full_w);
+    let line_w = l.line.right - l.line.left;
     p.text(
-        &sentence,
-        rect(m, line_y, full_w, 20.0),
+        &p.clip(&view.sentence, &p.fmt.body, line_w),
+        l.line,
         &p.fmt.body,
         &p.br.fg,
     );
-    if !dash.gaps.is_empty() {
-        // 「这份数只是下界」不说出来，整页念「本周共按键 0 次」与"他这周一次都没按"
-        // 在屏上就是同一句话（本仓修过好几次的那一类：读不出来不许印成没有）。
-        let note = p.clip(
-            &format!("这份读数这次没读全：{}", dash.gaps.join("；")),
-            &p.fmt.caption,
-            full_w,
-        );
+    if let Some(gaps) = view.gaps.as_deref() {
+        let note = format!("这份读数这次没读全：{gaps}");
         p.text(
-            &note,
-            rect(m, line_y + 22.0, full_w, 16.0),
+            &p.clip(&note, &p.fmt.caption, line_w),
+            l.gaps,
             &p.fmt.caption,
             &p.br.muted,
         );
     }
 
-    // --- 趋势（缩略版：只画线，数值留给「活跃分析」那一页）---
-    let layout = board_layout(h, line_y);
-    if layout.compact {
+    for (c, card) in l.cards.iter().enumerate() {
+        p.card(*card, R_CARD);
+        let (title, rows) = if c == 0 {
+            ("Top 应用（时长）", &view.top_apps)
+        } else {
+            ("Top 按键（次数）", &view.top_keys)
+        };
         p.text(
-            "窗口较矮：趋势图已收起（拉高窗口可看）",
-            rect(m, layout.trend_top, full_w, 18.0),
-            &p.fmt.caption,
-            &p.br.muted,
+            title,
+            rect(
+                card.left + 12.0,
+                card.top + 10.0,
+                card.right - card.left - 120.0,
+                18.0,
+            ),
+            &p.fmt.body,
+            &p.br.fg,
         );
-    } else {
-        let labels: Vec<String> = dash.trend.iter().map(|(d, _)| short_day(d)).collect();
-        let points: Vec<i64> = dash.trend.iter().map(|(_, v)| *v).collect();
-        draw_plugin_chart(
-            p,
-            rect(m, layout.trend_top, full_w, layout.trend_h),
-            "line",
-            &labels,
-            &points,
+        let hot = vs.ctl == Some(Ctl::BoardLink(c as u8));
+        p.text(
+            "查看排行 →",
+            l.links[c],
+            &p.fmt.center_small,
+            if hot { &p.br.accent } else { &p.br.muted },
         );
+        if rows.is_empty() {
+            p.text(
+                "暂无数据",
+                rect(
+                    card.left + 28.0,
+                    card.top + 40.0,
+                    card.right - card.left - 36.0,
+                    20.0,
+                ),
+                &p.fmt.caption,
+                &p.br.muted,
+            );
+            continue;
+        }
+        for (r, (name, value)) in rows.iter().enumerate() {
+            let row = l.rows[c][r];
+            if vs.ctl == Some(Ctl::BoardRow(c as u8, r as u8)) {
+                p.fill(row, &p.br.row_hover);
+            }
+            p.text(
+                &format!("{}", r + 1),
+                rect(row.left + 4.0, row.top + 5.0, 20.0, 18.0),
+                &p.fmt.caption,
+                &p.br.muted,
+            );
+            let name_w = (row.right - row.left - 28.0 - 76.0).max(40.0);
+            p.text(
+                &p.clip(name, &p.fmt.body, name_w),
+                rect(row.left + 28.0, row.top + 4.0, name_w, 20.0),
+                &p.fmt.body,
+                &p.br.fg,
+            );
+            p.text(
+                &p.clip(value, &p.fmt.caption_right, 70.0),
+                rect(row.right - 70.0, row.top + 5.0, 70.0, 18.0),
+                &p.fmt.caption_right,
+                &p.br.muted,
+            );
+        }
     }
-
-    // --- 两列排行 ---
-    let rank_top = layout.rank_top;
-    let rank_h = layout.rank_h;
-    let col_w = (full_w - 12.0) / 2.0;
-    draw_rank_card(
-        p,
-        rect(m, rank_top, col_w, rank_h),
-        "Top 应用（时长）",
-        &dash.top_apps,
-        true,
-    );
-    draw_rank_card(
-        p,
-        rect(m + col_w + 12.0, rank_top, col_w, rank_h),
-        "Top 按键（次数）",
-        &dash.top_keys,
-        false,
-    );
 }
 
 /// 第 8 页：剪贴板管理。列表/模式/多选的状态在 `clipboard_page.rs`，这里只排版。
@@ -12111,121 +12111,6 @@ fn draw_clipboard_stats(
             &p.br.fg,
         );
         y += 22.0;
-    }
-}
-
-struct BoardLayout {
-    trend_top: f32,
-    trend_h: f32,
-    rank_top: f32,
-    rank_h: f32,
-    /// 矮窗口把趋势图整块收起，把下半部让给两张排行卡。
-    compact: bool,
-}
-
-/// 给窗口高度排下半部：窗口矮的时候**先缩趋势图**，给两张排行卡留出足够高度。
-///
-/// 640 那一档算出来趋势 154、排行 120，趋势的绘图区还有 80 高；但 960×480 的新下限
-/// 只剩 480 高，再按同一公式算趋势只有 34 —— 绘图区是负数。所以低于 620 直接进紧凑档：
-/// 趋势收起（用一行说明），排行卡从 `line_y + 64` 一直排到窗口底。
-fn board_layout(h: f32, line_y: f32) -> BoardLayout {
-    const M: f32 = 16.0;
-    const COMPACT_BELOW: f32 = 620.0;
-    let trend_top = line_y + 44.0;
-    if h < COMPACT_BELOW {
-        let rank_top = trend_top + 20.0;
-        let rank_h = (h - M - rank_top).max(60.0);
-        return BoardLayout {
-            trend_top,
-            trend_h: 0.0,
-            rank_top,
-            rank_h,
-            compact: true,
-        };
-    }
-    let trend_h = (h - M - trend_top - 10.0 - 120.0).clamp(120.0, 200.0);
-    let rank_top = trend_top + trend_h + 10.0;
-    let rank_h = (h - M - rank_top).max(120.0);
-    BoardLayout {
-        trend_top,
-        trend_h,
-        rank_top,
-        rank_h,
-        compact: false,
-    }
-}
-
-/// 横轴日期串只留 `MM-DD`；不是这个形状（导入的旧库、带时间的日期）就原样交回，
-/// 由那一格的夹取兜住宽度。
-fn short_day(date: &str) -> String {
-    match date.split_once('-') {
-        Some((_, rest)) if rest.len() == 5 => rest.to_string(),
-        _ => date.to_string(),
-    }
-}
-
-/// 一列排行：标题 + 每行「名称 …… 数字」。名称先夹（右边那 84 px 是数字的位置）。
-fn draw_rank_card(
-    p: &P<'_>,
-    card: D2D_RECT_F,
-    title: &str,
-    rows: &[(String, i64)],
-    by_seconds: bool,
-) {
-    use focusflow_core::format::{fmt_compact_duration, fmt_thousands};
-    let pad = 12.0;
-    p.card(card, R_CARD);
-    p.text(
-        title,
-        rect(
-            card.left + pad,
-            card.top + 10.0,
-            card.right - card.left - pad * 2.0,
-            18.0,
-        ),
-        &p.fmt.body,
-        &p.br.fg,
-    );
-    if rows.is_empty() {
-        p.text(
-            "暂无数据",
-            rect(
-                card.left + pad,
-                card.top + 34.0,
-                card.right - card.left - pad * 2.0,
-                18.0,
-            ),
-            &p.fmt.caption_center,
-            &p.br.muted,
-        );
-        return;
-    }
-    let value_w = 84.0;
-    let name_w = (card.right - card.left) - pad * 2.0 - value_w - 8.0;
-    for (i, (name, value)) in rows.iter().enumerate() {
-        let y = card.top + 34.0 + i as f32 * 20.0;
-        // 画不进这张卡的那些行直接不画：这里没有点击区，但溢出卡外的文本比少一行更难解释
-        if y + 18.0 > card.bottom - 2.0 {
-            break;
-        }
-        let shown_name = p.clip(name, &p.fmt.caption, name_w);
-        p.text(
-            &shown_name,
-            rect(card.left + pad, y, name_w, 18.0),
-            &p.fmt.caption,
-            &p.br.fg,
-        );
-        let shown_value = if by_seconds {
-            fmt_compact_duration(*value)
-        } else {
-            fmt_thousands(*value)
-        };
-        p.text(
-            &shown_value,
-            rect(card.right - pad - value_w, y, value_w, 18.0),
-            &p.fmt.caption_right,
-            &p.br.muted,
-        );
     }
 }
 
@@ -16239,18 +16124,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             if n.is_multiple_of(50) {
                 tracing_note(&format!("timer tick {n}"));
             }
-            // 内置看板页的节奏（方案 3.2.3）：停在这一页、且窗口真的被看着时，每 30 秒
-            // 重查一次。三条判据都住在 `dashboard::should_refresh`，那一条用例能测到
-            // "最小化了还在问库"这一族浪费 —— 写在 UI 里就没人问得到。
             if let Some(app) = unsafe { app_ptr(hwnd) } {
-                let watching = matches!(watching_now(hwnd), Readers::Panel);
-                if dashboard::should_refresh(app.dash.elapsed_secs(), app.view == V_BOARD, watching)
-                {
-                    app.reload_board();
-                    unsafe {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
-                }
                 // 同一个悬停目标停满一小会儿才出 tooltip：扫过去的鼠标不该每次弹框。
                 if !app.tooltip_ready
                     && app.ctl.is_some()
@@ -17377,10 +17251,6 @@ fn main() -> windows::core::Result<()> {
         // 验收套件的截图走 `PrintWindow`、点击走 `PostMessage`，不依赖窗口在最上层。
         // 攒批的按键增量得有收件方：插件在启动这一趟就加载，不再等第一次进插件页。
         (*app).load_plugins_at_startup();
-        // 启动落上看板页：第一帧先问一次库，别等 100ms 之后那一拍（否则首屏是空数）。
-        if (*app).view == V_BOARD {
-            (*app).reload_board();
-        }
         let _ = SetTimer(Some(hwnd), TIMER_EVENTS, 100, None);
         let _ = UpdateWindow(hwnd);
     }
@@ -18244,10 +18114,10 @@ mod snapshot_rate_tests {
     /// 插件/设置/剪贴板没有周期数据。画出来就是"点了高亮、数字不动"的死控件。
     #[test]
     fn the_period_pills_only_show_where_they_are_read() {
-        for view in [V_KEYS, V_APPS, V_DEVICES, V_ANALYTICS] {
+        for view in [V_BOARD, V_KEYS, V_APPS, V_DEVICES, V_ANALYTICS] {
             assert!(period_pills_visible(view), "view={view} 应当显示周期药丸");
         }
-        for view in [V_BOARD, V_CLIPBOARD, V_PLUGINS, V_SETTINGS] {
+        for view in [V_CLIPBOARD, V_PLUGINS, V_SETTINGS] {
             assert!(
                 !period_pills_visible(view),
                 "view={view} 不读全局周期，不该画出可点的药丸"
@@ -18446,8 +18316,8 @@ mod snapshot_rate_tests {
         let call = ["watching_now", "("].concat();
         assert_eq!(
             prod.matches(call.as_str()).count(),
-            4,
-            "一处定义 + 快照循环里两处（睡前、睡完）+ 看板页那一处 —— 数量变了说明接线动过"
+            3,
+            "一处定义 + 快照循环里两处（睡前、睡完）—— 数量变了说明接线动过"
         );
         // 三档真的各有出口：`Card` 那一支必须把整批 `data::load` 换掉并当场 continue，
         // 少了那次 continue，卡片那一拍查完之后还是会跑整批 —— 数照旧、白加一问。
@@ -18470,16 +18340,6 @@ mod snapshot_rate_tests {
             branch.contains("g.today=thin.today;")
                 && branch.contains("g.today_app_seconds=thin.today_app_seconds;"),
             "只有卡片那一拍不再把今日/时长写回共享快照：托盘与验收读数会停在旧值"
-        );
-        // 第四处是内置看板页那一档（30 秒重查）。它必须把"有没有人看"当成**入参**交进去，
-        // 而不是在 UI 里另写一个时间比较：后者会最小化了还问库，而这一页看不见时问库
-        // 没有任何读者（方案 3.2.3 那张表的最后一行）。
-        assert!(
-            flat.contains("letwatching=matches!(watching_now(hwnd),Readers::Panel)")
-                && flat.contains(
-                    "dashboard::should_refresh(app.dash.elapsed_secs(),app.view==V_BOARD,watching)"
-                ),
-            "看板那一档不再把「有没有人看」当条件：判据那三个入参少了一个"
         );
     }
 
@@ -24524,58 +24384,6 @@ mod collector_state_tests {
     }
 }
 
-/// 看板页下半部的纵向布局：最小窗口下两张排行卡必须整张落在窗口里。
-#[cfg(test)]
-mod board_layout_tests {
-    use super::board_layout;
-
-    /// 顶栏页签在 84，看板的 KPI 那一行 78 高、下面那句话说 20 高 ⇒ 下半部的起点。
-    const LINE_Y: f32 = crate::CONTENT_TOP_BARE + 78.0 + 10.0;
-
-    #[test]
-    fn the_rank_cards_fit_inside_the_smallest_window() {
-        // 最小窗口 640（客户区被撑满整窗），窗口底边那一圈留 16。
-        let h = 640.0;
-        let l = board_layout(h, LINE_Y);
-        assert!(l.trend_h <= 200.0, "趋势超过 200 的上限：排行卡没位置了");
-        assert!(
-            l.rank_top + l.rank_h <= h - 16.0 + 0.01,
-            "排行卡画到窗口下面（这一页没有滚动）：rank_top={} rank_h={} h={h}",
-            l.rank_top,
-            l.rank_h
-        );
-        assert!(l.rank_h >= 120.0, "排行卡被压到看不懂：{}", l.rank_h);
-        assert!(l.trend_h >= 60.0, "趋势图被压得画不出来：{}", l.trend_h);
-
-        // 常态窗口照旧用满 200：别为了矮窗口把高窗口也缩了。
-        let tall = board_layout(860.0, LINE_Y);
-        assert_eq!(tall.trend_h, 200.0);
-        assert!(tall.rank_top + tall.rank_h <= 860.0 - 16.0 + 0.01);
-    }
-
-    /// 接线：画的那一头读的是这份布局，不是又自己写一遍 200。
-    #[test]
-    fn the_board_page_reads_the_shared_layout() {
-        let src = include_str!("main.rs");
-        let needle = ["letlayout=", "board_layout(h,line_y);"].concat();
-        let flat: String = src
-            .replace("\r\n", "\n")
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        assert!(
-            flat.contains(&needle),
-            "看板页没读 board_layout：排行卡的高度又各写一遍"
-        );
-        // 函数本体仍在生产段（第一个 #[cfg(test)] 之前）。
-        let cut = src.find("#[cfg(test)]").expect("测试段起点找不到");
-        assert!(
-            src[..cut].contains("fn board_layout("),
-            "board_layout 落到了测试段后面：接线守卫开始少扫生产码"
-        );
-    }
-}
-
 /// 排行表的行带：亮的区域与点得到的区域必须是同一个。
 #[cfg(test)]
 mod table_band_tests {
@@ -24681,6 +24489,138 @@ mod select_menu_tests {
     }
 }
 
+/// 页签表、坐标表、分发与落地页接线：这几处各写一遍就是"画在 A、命中在 B"。
+#[cfg(test)]
+mod view_wiring_tests {
+    fn prod() -> String {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        src[..cut].to_string()
+    }
+
+    fn flat(s: &str) -> String {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// 页签加了一个，就必须同时加在**三处**：标签表、坐标表、以及分发那一支。
+    /// 少第三处的症状最难发现 —— 页签画出来了、也点得动，画面却是"这个页面还没做"。
+    #[test]
+    fn the_tabs_are_declared_drawn_and_dispatched() {
+        let p = prod();
+        let start = p
+            .find("const VIEWS: [&str; 8]")
+            .expect("页签标签表找不到了");
+        let block = &p[start..start + 400];
+        for label in ["\"看板\"", "\"剪贴板\""] {
+            assert_eq!(
+                block.matches(label).count(),
+                1,
+                "页签标签应当只有 `VIEWS` 那一份"
+            );
+        }
+        assert!(
+            p.contains("fn view_tabs() -> [D2D_RECT_F; 8]"),
+            "坐标表不是 8 格：标签有 8 个而位置只有 7 个，索引会越界或被截掉"
+        );
+        let f = flat(&p);
+        let board = f
+            .find("V_BOARD=>draw_board_page(p,w,h,snap,vs)")
+            .expect("看板页的分发不见了");
+        let clip = f
+            .find("V_CLIPBOARD=>draw_clipboard_page(p,w,h,clip,vs)")
+            .expect("剪贴板页的分发不见了：它会落到 draw_placeholder 那句占位文案");
+        let fallback = f
+            .find("v=>draw_placeholder(p,w,h,v)")
+            .expect("兜底那一支不在了（页签越界时画面会消失）");
+        assert!(
+            board < fallback && clip < fallback,
+            "页签必须排在 `v => draw_placeholder` 兜底**之前**，否则永远走不到"
+        );
+    }
+
+    /// 页签顺序：总览在前、配置在最后。顺序一变，命中、快捷键与验收脚本
+    /// 都会跟着错位，所以这里把八格的先后钉死。
+    #[test]
+    fn the_tab_order_starts_with_the_board_and_ends_with_settings() {
+        let p = prod();
+        let start = p
+            .find("const VIEWS: [&str; 8]")
+            .expect("页签标签表找不到了");
+        let block = &p[start..start + 400];
+        let want = [
+            "\"看板\"",
+            "\"键鼠排行\"",
+            "\"应用排行\"",
+            "\"设备排行\"",
+            "\"活跃分析\"",
+            "\"剪贴板\"",
+            "\"插件管理\"",
+            "\"设置\"",
+        ];
+        let mut at = 0;
+        for label in want {
+            let i = block
+                .find(label)
+                .unwrap_or_else(|| panic!("页签表里没有 {label}"));
+            assert!(i >= at, "页签顺序错了：{label} 排到了前一个前面");
+            at = i;
+        }
+    }
+
+    /// 剪贴板页的数只能从 core 的 `clipboard` 要；桌面端不许自己写 SQL。
+    #[test]
+    fn the_clipboard_page_asks_core_and_reloads_on_entry() {
+        let f = flat(&prod());
+        assert!(
+            f.contains("self.clip_page.reload("),
+            "进剪贴板页没有重查：翻到的会是上一次离开时的旧列表"
+        );
+        assert!(
+            f.contains("focusflow_core::clipboard::"),
+            "剪贴板页没有走 core 的读取口"
+        );
+        assert_eq!(
+            f.matches("SELECT ").count(),
+            0,
+            "桌面端生产段里出现了 SQL 语句：查库的口子应当只在 core"
+        );
+    }
+
+    /// 落地页只读当前周期的快照：不再有独立的看板查询、独立时间胶囊或 30 秒重查。
+    #[test]
+    fn the_landing_page_reads_the_snapshot_and_has_no_own_query() {
+        let f = flat(&prod());
+        assert!(
+            f.contains("board::board_view(snap,&period_text(snap.period))"),
+            "落地页不再从当前周期的快照取数"
+        );
+        assert!(
+            !f.contains("focusflow_core::dashboard") && !f.contains("dashboard::range_pills"),
+            "落地页又接回了独立看板查询/独立范围胶囊"
+        );
+        assert!(
+            !f.contains("self.reload_board()"),
+            "落地页又多了自己的重查路径"
+        );
+    }
+
+    /// 两列 Top 3 与「查看排行」落到对应的排行页。
+    #[test]
+    fn the_landing_rows_go_to_the_matching_ranking_page() {
+        let f = flat(&prod());
+        assert!(
+            f.contains("self.switch_view(hwnd,ifc==0{V_APPS}else{V_KEYS})"),
+            "看板的 Top 行/查看排行没有接到排行页"
+        );
+    }
+}
+
 /// 页签重排后的顶栏几何：页签固定在一处，统计卡只在排行与活跃分析页出现。
 #[cfg(test)]
 mod chrome_layout_tests {
@@ -24709,10 +24649,10 @@ mod chrome_layout_tests {
             "周期药丸压在页签上"
         );
         assert_eq!(STATS_CARD_TOP + STATS_CARD_H, CONTENT_TOP_RANK - 10.0);
-        for v in [V_KEYS, V_APPS, V_DEVICES, V_ANALYTICS] {
+        for v in [V_BOARD, V_KEYS, V_APPS, V_DEVICES, V_ANALYTICS] {
             assert!(period_pills_visible(v), "第 {v} 页该有周期药丸");
         }
-        for v in [V_BOARD, V_CLIPBOARD, V_PLUGINS, V_SETTINGS] {
+        for v in [V_CLIPBOARD, V_PLUGINS, V_SETTINGS] {
             assert!(!period_pills_visible(v), "第 {v} 页没有周期数据");
         }
     }
@@ -24727,11 +24667,12 @@ mod chrome_layout_tests {
     }
 
     #[test]
-    fn the_board_range_pills_sit_on_the_tab_row() {
-        for (_, pill) in dashboard::range_pills() {
-            assert_eq!(pill.top, TAB_ROW_TOP);
-            assert_eq!(pill.bottom, TAB_ROW_TOP + 26.0);
-        }
+    fn the_board_top_cards_carry_the_landing_page_rows() {
+        let l = board::layout(960.0, 480.0);
+        assert_eq!(l.cards.len(), 2);
+        assert_eq!(l.links.len(), 2);
+        assert_eq!(l.rows[0].len(), board::TOP_N);
+        assert!(l.cards[1].top <= 480.0 - 16.0);
     }
 
     /// 排行表内部那个 0/1/2 页签必须由 `view` 减掉起始下标得到。
@@ -25249,24 +25190,6 @@ mod min_size_layout_tests {
         assert_eq!(short.bottom - short.top, 172.0);
         let tall = chart_card(rect(16.0, 292.0, 928.0, 860.0));
         assert_eq!(tall.bottom - tall.top, 300.0, "高窗口仍用满 300");
-    }
-
-    /// 看板在 960×480 下进紧凑档：趋势收起，两张排行卡仍落在窗口内。
-    #[test]
-    fn the_board_is_compact_at_the_minimum_height() {
-        let line_y = crate::CONTENT_TOP_BARE + 78.0 + 10.0;
-        let l = board_layout(480.0, line_y);
-        assert!(l.compact, "480 高还走完整走势图");
-        assert_eq!(l.trend_h, 0.0);
-        assert!(
-            l.rank_top + l.rank_h <= 480.0 - 16.0 + 0.01,
-            "排行卡画到窗口下面：top={} h={}",
-            l.rank_top,
-            l.rank_h
-        );
-        assert!(l.rank_h >= 100.0, "排行卡压得太矮：{}", l.rank_h);
-        // 640 仍走完整走势图（旧下限的那一档不回归）。
-        assert!(!board_layout(640.0, line_y).compact);
     }
 
     /// 插件详情的错误历史在 480/520 下没有位置，改为并在顶部说明里报条数。
