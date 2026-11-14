@@ -1038,8 +1038,10 @@ struct App {
     was_maximized: bool,
     /// 只读库句柄：`init_readonly` 的副作用是全局年度缓存。
     _db: Arc<focusflow_core::db::Database>,
-    /// 顶部视图：0=键鼠排行 1=应用排行 2=设备排行 3=活跃分析 4=插件 5=设置。
+    /// 顶部视图下标：见 `V_*`（顺序就是页签从左到右）。
     view: usize,
+    /// 看板落地页此刻是否显示（`[gui] show_board` 的运行时镜像，与 `hotkeys_on` 同口径）。
+    board_on: bool,
     /// 活跃分析页内的子页签：0=趋势 1=小时 2=星期 3=热力。
     atab: usize,
     /// 键鼠榜那一屏的页内视图：0=排行 1=分组（旧 WebView 版的两颗 tab，同源同周期）。
@@ -1775,6 +1777,7 @@ impl App {
                 }
             };
 
+            let board_on = board_on_cfg();
             Ok(Self {
                 d2d,
                 dwrite,
@@ -1805,7 +1808,8 @@ impl App {
                 size_at_enter: (0.0, 0.0),
                 was_maximized: false,
                 _db: db,
-                view: DEFAULT_VIEW,
+                view: if board_on { V_BOARD } else { V_KEYS },
+                board_on,
                 atab: 0,
                 rank_tab: 0,
                 rank_filter: 0,
@@ -2015,6 +2019,7 @@ impl App {
                 && self.pv_select.is_none();
             let vs = ViewState {
                 view: self.view,
+                board_on: self.board_on,
                 atab: self.atab,
                 rank_tab: self.rank_tab,
                 rank_filter: self.rank_filter,
@@ -2147,9 +2152,9 @@ impl App {
                 }
             }
         }
-        for (i, r) in view_tabs().iter().enumerate() {
-            if hit(*r, x, y) {
-                return Some(Ctl::ViewTab(i as u8));
+        for (view, r) in visible_tabs(self.board_on) {
+            if hit(r, x, y) {
+                return Some(Ctl::ViewTab(view as u8));
             }
         }
         // 看板落地页：两列的「查看排行」与 Top 3 行都可点。
@@ -2456,7 +2461,7 @@ impl App {
                 list_index: None,
             });
         }
-        for r in view_tabs() {
+        for (_, r) in visible_tabs(self.board_on) {
             out.push(KbdItem {
                 rect: r,
                 group: 1,
@@ -2683,17 +2688,11 @@ impl App {
                 true
             }
             0x25 => {
-                let v = if self.view == V_BOARD {
-                    V_SETTINGS
-                } else {
-                    self.view - 1
-                };
-                self.switch_view(hwnd, v);
+                self.switch_view(hwnd, nav_step(self.view, -1, self.board_on));
                 true
             }
             0x27 => {
-                let v = (self.view + 1) % 8;
-                self.switch_view(hwnd, v);
+                self.switch_view(hwnd, nav_step(self.view, 1, self.board_on));
                 true
             }
             0x0D => {
@@ -3454,10 +3453,10 @@ impl App {
         }
 
         // 顶部视图页签。
-        for (i, tab) in view_tabs().iter().enumerate() {
-            if hit(*tab, x, y) {
-                tracing_note(&format!("点击视图 {i} at ({x:.0},{y:.0})"));
-                self.switch_view(hwnd, i);
+        for (view, tab) in visible_tabs(self.board_on) {
+            if hit(tab, x, y) {
+                tracing_note(&format!("点击视图 {view} at ({x:.0},{y:.0})"));
+                self.switch_view(hwnd, view);
                 return;
             }
         }
@@ -3932,6 +3931,7 @@ impl App {
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
+                    SItem::Basic(Basic::Board) => self.toggle_board(hwnd),
                     SItem::Basic(Basic::Collector) => self.toggle_collector(hwnd),
                     SItem::Basic(Basic::Pause) => self.toggle_pause(hwnd),
                     SItem::Basic(Basic::Theme) => {
@@ -4409,6 +4409,30 @@ impl App {
         ));
         tracing_note(&msg);
         self.status = Some(msg);
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    /// 看板页开关：顶部页签与启动落点都跟着 `[gui] show_board` 走。
+    fn toggle_board(&mut self, hwnd: HWND) {
+        let next = !self.board_on;
+        let note = config_write_note(
+            "看板页",
+            focusflow_core::config::instance().set_now(
+                "gui",
+                "show_board",
+                if next { "true" } else { "false" },
+            ),
+        );
+        self.board_on = next;
+        let msg = if next {
+            format!("看板页已显示{note}")
+        } else {
+            format!("看板页已隐藏；启动落在键鼠排行{note}")
+        };
+        self.status = Some(msg.clone());
+        tracing_note(&msg);
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
@@ -6103,6 +6127,7 @@ enum Basic {
     SnipQuick,
     ClosePins,
     Floating,
+    Board,
     Theme,
     DataDir,
     WeeklyReport,
@@ -6118,6 +6143,7 @@ fn basic_label(b: Basic) -> &'static str {
         Basic::SnipQuick => "区域截图（松手即存）",
         Basic::ClosePins => "关掉所有贴图",
         Basic::Floating => "悬浮窗",
+        Basic::Board => "看板页",
         Basic::Theme => "主题",
         Basic::DataDir => "数据目录",
         Basic::WeeklyReport => "上周周报",
@@ -6149,7 +6175,12 @@ fn advanced_group(section: &str, key: &str) -> Option<usize> {
 
 fn basic_cat(b: Basic) -> usize {
     match b {
-        Basic::Autostart | Basic::Collector | Basic::Pause | Basic::Theme | Basic::Floating => 0,
+        Basic::Autostart
+        | Basic::Collector
+        | Basic::Pause
+        | Basic::Theme
+        | Basic::Floating
+        | Basic::Board => 0,
         Basic::Hotkey | Basic::Snip | Basic::SnipQuick | Basic::ClosePins => 1,
         Basic::WeeklyReport => 2,
         Basic::DataDir => 3,
@@ -6170,7 +6201,7 @@ fn snip_mode_of(b: Basic) -> Option<bool> {
 
 /// 设置页上"按钮型"的行，按显示顺序。漏在这一张表里的变体不会出现在屏上，
 /// 而画它的分支、点它的分支照旧编得过——所以这两张表各由一条用例钉着。
-const BASIC_ROWS: [Basic; 11] = [
+const BASIC_ROWS: [Basic; 12] = [
     Basic::Autostart,
     Basic::Collector,
     Basic::Pause,
@@ -6179,6 +6210,7 @@ const BASIC_ROWS: [Basic; 11] = [
     Basic::Snip,
     Basic::SnipQuick,
     Basic::ClosePins,
+    Basic::Board,
     Basic::Floating,
     Basic::DataDir,
     Basic::WeeklyReport,
@@ -6917,6 +6949,31 @@ fn draw_settings(
                             &p.br.muted,
                         );
                     }
+                    Basic::Board => {
+                        let on = vs.board_on;
+                        p.round(
+                            vb,
+                            R_CONTROL,
+                            if on { &p.br.success } else { &p.br.grid },
+                            None,
+                        );
+                        p.text(
+                            if on { "显示" } else { "隐藏" },
+                            vb,
+                            &p.fmt.center13,
+                            if on { &p.br.white } else { &p.br.muted },
+                        );
+                        p.text(
+                            &p.clip(
+                                "关＝顶部少这一页，启动落在键鼠排行（[gui] show_board）",
+                                &p.fmt.text12,
+                                note_w,
+                            ),
+                            rect(r.left + 12.0, y + 23.0, note_w, 17.0),
+                            &p.fmt.text12,
+                            &p.br.muted,
+                        );
+                    }
                     Basic::Theme => {
                         let dark = vs.dark;
                         p.round(
@@ -7411,6 +7468,8 @@ fn draw_detail(p: &P<'_>, w: f32, h: f32, d: &DeviceDetail) {
 #[derive(Clone, Copy, Default)]
 struct ViewState {
     view: usize,
+    /// 看板页签这一帧出不出（App 里的运行时镜像；画页签与命中同一份）。
+    board_on: bool,
     atab: usize,
     rank_tab: usize,
     rank_filter: usize,
@@ -7467,7 +7526,11 @@ pub(crate) const V_ANALYTICS: usize = 4;
 pub(crate) const V_CLIPBOARD: usize = 5;
 pub(crate) const V_PLUGINS: usize = 6;
 pub(crate) const V_SETTINGS: usize = 7;
-const DEFAULT_VIEW: usize = V_BOARD;
+
+/// 看板页开不开（`[gui] show_board`）。默认开：新装用户第一屏仍是总览。
+fn board_on_cfg() -> bool {
+    focusflow_core::config::instance().get_bool("gui", "show_board", true)
+}
 
 /// 页签那一排的顶边。所有页面同一位置：统计卡只在部分页出现，页签不跟着上下跳。
 pub(crate) const TAB_ROW_TOP: f32 = 84.0;
@@ -7804,10 +7867,10 @@ fn draw_screen(
     }
 
     // --- 视图页签 ---
-    for (i, label) in VIEWS.iter().enumerate() {
-        let r = view_tabs()[i];
-        let active = vs.view == i;
-        let hot = vs.ctl == Some(Ctl::ViewTab(i as u8));
+    for (view, r) in visible_tabs(vs.board_on) {
+        let label = VIEWS[view];
+        let active = vs.view == view;
+        let hot = vs.ctl == Some(Ctl::ViewTab(view as u8));
         p.text(
             label,
             rect(r.left, r.top, r.right - r.left, r.bottom - r.top),
@@ -7998,13 +8061,30 @@ const VIEWS: [&str; 8] = [
     "设置",
 ];
 
-/// 顶部视图页签的位置：画图与命中测试共用。下标与 `V_*` 一一对应。
-fn view_tabs() -> [D2D_RECT_F; 8] {
-    let mut out = [rect(0.0, 0.0, 0.0, 0.0); 8];
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = rect(16.0 + i as f32 * 84.0, TAB_ROW_TOP, 80.0, 26.0);
+/// 屏上从左到右的页签：(视图下标, 矩形)。
+///
+/// 看板关掉时整格不出现，后面的往前挪 —— 画图、悬停、键盘焦点与点击四个读者
+/// 都读这一份；各写一套坐标的症状是"画在 A、命中在 B"。
+fn visible_tabs(show_board: bool) -> Vec<(usize, D2D_RECT_F)> {
+    let mut out = Vec::with_capacity(8);
+    for view in V_BOARD..=V_SETTINGS {
+        if view == V_BOARD && !show_board {
+            continue;
+        }
+        let slot = out.len() as f32;
+        out.push((view, rect(16.0 + slot * 84.0, TAB_ROW_TOP, 80.0, 26.0)));
     }
     out
+}
+
+/// 在可见页签里前后移动并回绕（←/→ 与点击顺序读同一份）。
+fn nav_step(view: usize, dir: isize, show_board: bool) -> usize {
+    let views: Vec<usize> = visible_tabs(show_board)
+        .into_iter()
+        .map(|(view, _)| view)
+        .collect();
+    let at = views.iter().position(|v| *v == view).unwrap_or(0) as isize;
+    views[(at + dir).rem_euclid(views.len() as isize) as usize]
 }
 
 /// 活跃分析页的子页签（趋势 / 小时 / 星期 / 热力）。
@@ -12209,7 +12289,7 @@ fn rank_pills_x0(card: D2D_RECT_F) -> f32 {
 
 /// 排行页标题行里那排胶囊。下标 0..1 = 视图（排行 / 分组），2..4 = 筛选（全部 / 键盘 / 鼠标）。
 /// 「分组」那一屏不读筛选，那时后面三格既不画也不接 —— 与画图共用这一份位置，
-/// 照的是 `view_tabs` / `atab_tabs` 那个做法。
+/// 照的是 `visible_tabs` / `atab_tabs` 那个做法。
 fn rank_pills(card: D2D_RECT_F) -> [D2D_RECT_F; 5] {
     let y = card.top + 8.0;
     let x0 = rank_pills_x0(card);
@@ -18743,18 +18823,18 @@ mod hotkey_tests {
                 "又一处把写盘结局折掉了：{forbidden}"
             );
         }
-        // 十一个用户手势的写点（总开关一颗 + 采集三条 + 开关行 + 值框提交 + 悬浮窗 + 主题
-        // + 热键那颗钮 + 按下录入 + 托盘「记录剪贴板」）各喂一次 `set_now`，加上定义那一行
-        // = 十二处。
+        // 十二个用户手势的写点（总开关一颗 + 采集三条 + 开关行 + 值框提交 + 悬浮窗 + 看板页
+        // + 主题 + 热键那颗钮 + 按下录入 + 托盘「记录剪贴板」）各喂一次 `set_now`，加上定义
+        // 那一行 = 十三处。
         assert_eq!(
             flat.matches("config_write_note(").count(),
-            12,
+            13,
             "落点数目变了，实得 {}",
             flat.matches("config_write_note(").count()
         );
         assert_eq!(
             flat.matches("set_now(").count(),
-            11,
+            12,
             "写点没都换成能问出结局的那一条调用，实得 {}",
             flat.matches("set_now(").count()
         );
@@ -22167,9 +22247,9 @@ mod clip_tests {
             ("p.clip(&f.value,&p.fmt.caption,vb.right-vb.left-28.0),rect(vb.left+8.0,vb.top+3.0,vb.right-vb.left-28.0,18.0)", 1),
             ("p.clip(m.title,&p.fmt.body,g.dialog.right-g.dialog.left-72.0)", 1),
             // 基础行的说明列不再写死 560/640：那比按钮前的实际空位宽出一百多像素，
-            // 长路径/长热键会压到右边那颗按钮上。三处都吃 `note_w`，宽度与矩形同一个数。
+            // 长路径/长热键会压到右边那颗按钮上。每一处都吃 `note_w`，宽度与矩形同一个数。
             ("&p.fmt.text12,640.0)", 0),
-            ("&p.fmt.text12,note_w)", 13),
+            ("&p.fmt.text12,note_w)", 14),
             // 键名/应用名是库里的原文，长度没有上限：与设备名同一把夹取尺子
             (
                 "letcell=rect(g.x_name,y+3.0,name_col_width(&g),18.0);letclipped=p.clip(app,&p.fmt.table_name,name_col_width(&g));",
@@ -24516,7 +24596,8 @@ mod view_wiring_tests {
         let start = p
             .find("const VIEWS: [&str; 8]")
             .expect("页签标签表找不到了");
-        let block = &p[start..start + 400];
+        // 按字符取前缀：按字节切会落在中文中间（本仓踩过一次）。
+        let block: String = p[start..].chars().take(400).collect();
         for label in ["\"看板\"", "\"剪贴板\""] {
             assert_eq!(
                 block.matches(label).count(),
@@ -24525,8 +24606,8 @@ mod view_wiring_tests {
             );
         }
         assert!(
-            p.contains("fn view_tabs() -> [D2D_RECT_F; 8]"),
-            "坐标表不是 8 格：标签有 8 个而位置只有 7 个，索引会越界或被截掉"
+            p.contains("fn visible_tabs(show_board: bool) -> Vec<(usize, D2D_RECT_F)>"),
+            "页签坐标表不见了：画、悬停、键盘焦点与点击都读它"
         );
         let f = flat(&p);
         let board = f
@@ -24552,7 +24633,8 @@ mod view_wiring_tests {
         let start = p
             .find("const VIEWS: [&str; 8]")
             .expect("页签标签表找不到了");
-        let block = &p[start..start + 400];
+        // 按字符取前缀：按字节切会落在中文中间（本仓踩过一次）。
+        let block: String = p[start..].chars().take(400).collect();
         let want = [
             "\"看板\"",
             "\"键鼠排行\"",
@@ -24640,7 +24722,7 @@ mod chrome_layout_tests {
 
     #[test]
     fn the_tab_row_is_fixed_and_the_cards_fit_above_content() {
-        for r in view_tabs() {
+        for (_, r) in visible_tabs(true) {
             assert_eq!(r.top, TAB_ROW_TOP);
             assert_eq!(r.bottom, TAB_ROW_TOP + 26.0);
         }
@@ -24783,7 +24865,7 @@ mod ux_polish_tests {
     #[test]
     fn standalone_controls_are_at_least_24_dip_tall() {
         for (name, r) in [
-            ("视图页签", view_tabs()[0]),
+            ("视图页签", visible_tabs(true)[0].1),
             (
                 "排行筛选胶囊",
                 rank_pills(rect(0.0, 208.0, 900.0, 600.0))[0],
@@ -25198,5 +25280,96 @@ mod min_size_layout_tests {
         assert!(!detail_errors_have_room(rect(0.0, 208.0, 800.0, 296.0)));
         assert!(!detail_errors_have_room(rect(0.0, 208.0, 800.0, 261.0)));
         assert!(detail_errors_have_room(rect(0.0, 208.0, 800.0, 336.0)));
+    }
+}
+
+/// 看板开关：页签几何、左右键回绕与设置页那一行的接线。
+#[cfg(test)]
+mod board_toggle_tests {
+    use super::*;
+
+    /// 关掉看板是整格消失、后面的往前挪，而不是留一个隐形空位。
+    #[test]
+    fn hiding_the_board_drops_one_tab_and_shifts_the_rest_left() {
+        let shown = visible_tabs(true);
+        assert_eq!(shown.len(), 8);
+        assert_eq!(shown[0].0, V_BOARD);
+        assert_eq!(shown[0].1.left, 16.0);
+        assert_eq!(shown[1].0, V_KEYS);
+        assert_eq!(shown[1].1.left, 100.0);
+
+        let hidden = visible_tabs(false);
+        assert_eq!(hidden.len(), 7);
+        assert_eq!(hidden[0].0, V_KEYS);
+        assert_eq!(hidden[0].1.left, 16.0);
+        assert_eq!(hidden[6].0, V_SETTINGS);
+        assert_eq!(hidden[6].1.left, 16.0 + 6.0 * 84.0);
+        assert!(
+            hidden.iter().all(|(view, _)| *view != V_BOARD),
+            "看板关了还留在页签表里"
+        );
+        for (_, r) in shown.iter().chain(hidden.iter()) {
+            assert_eq!(r.top, TAB_ROW_TOP);
+            assert_eq!(r.bottom, TAB_ROW_TOP + 26.0);
+        }
+    }
+
+    /// 左右键只在可见页签里走，回绕也不能把隐藏的看板带回来。
+    #[test]
+    fn arrow_keys_walk_only_the_visible_tabs() {
+        assert_eq!(nav_step(V_BOARD, 1, true), V_KEYS);
+        assert_eq!(nav_step(V_KEYS, -1, true), V_BOARD);
+        assert_eq!(nav_step(V_BOARD, -1, true), V_SETTINGS);
+        assert_eq!(nav_step(V_SETTINGS, 1, true), V_BOARD);
+
+        assert_eq!(nav_step(V_KEYS, 1, false), V_APPS);
+        assert_eq!(nav_step(V_KEYS, -1, false), V_SETTINGS);
+        assert_eq!(nav_step(V_SETTINGS, 1, false), V_KEYS);
+        for at in visible_tabs(false) {
+            for dir in [-1, 1] {
+                assert_ne!(
+                    nav_step(at.0, dir, false),
+                    V_BOARD,
+                    "看板已隐藏，左右键却还能切到它"
+                );
+            }
+        }
+    }
+
+    /// 开关那一行要真的在「常规」屏上，搜索「看板」也找得到。
+    #[test]
+    fn the_board_row_lives_under_regular_and_is_searchable() {
+        assert!(BASIC_ROWS.contains(&Basic::Board), "看板页没排进设置页");
+        assert_eq!(basic_cat(Basic::Board), 0, "看板页应归在常规");
+        assert!(basic_label(Basic::Board).contains("看板"));
+        let empty = Snapshot::default();
+        assert!(
+            settings_items(&empty, "", 0)
+                .iter()
+                .any(|i| matches!(i, SItem::Basic(Basic::Board))),
+            "常规分类里没有看板页那一行"
+        );
+        assert!(
+            settings_items(&empty, "看板", 4)
+                .iter()
+                .any(|i| matches!(i, SItem::Basic(Basic::Board))),
+            "设置搜索「看板」找不到这一行"
+        );
+    }
+
+    /// 画图、悬停、键盘焦点、点击四处必须读同一份坐标。
+    #[test]
+    fn all_four_tab_readers_use_the_same_geometry() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        for needle in [
+            "for (view, r) in visible_tabs(self.board_on)",
+            "for (_, r) in visible_tabs(self.board_on)",
+            "for (view, tab) in visible_tabs(self.board_on)",
+            "for (view, r) in visible_tabs(vs.board_on)",
+        ] {
+            assert!(prod.contains(needle), "页签读者没读同一份坐标：{needle}");
+        }
+        assert!(!prod.contains("fn view_tabs()"), "又长出一套私有页签坐标");
     }
 }
