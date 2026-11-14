@@ -125,10 +125,10 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
             // ⚠ 验收套件的等窗前提由 `scripts/accept/accept-lib.ps1` 的 `New-AppDir` 兜住：
             // 它给每份夹具都追加一行 `start_to_tray = false`（后写的节赢），翻这个默认值不用改十二套。
             ("start_to_tray", "false"),
-            // 看板落地页开关。默认**开**：新装用户第一屏仍是总览。关掉后顶部少一页，
-            // 启动落在键鼠排行（读点：`desktop-native/src/main.rs` 的 `board_on_cfg`；
+            // 看板落地页开关。默认**关**：新装用户第一屏落在键鼠排行，看板要用时在设置里打开。
+            // 关掉时顶部少一页（读点：`desktop-native/src/main.rs` 的 `board_on_cfg`；
             // 设置页「常规 → 看板页」那一行是唯一入口）。
-            ("show_board", "true"),
+            ("show_board", "false"),
             // 悬浮窗显示口径：times / duration / both（原生端有读点：`desktop-native/src/floating.rs`
             // 取出来交给 `floating_render::metric_from`，别的值一律当 times）
             ("floating_metric", "times"),

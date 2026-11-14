@@ -7527,9 +7527,9 @@ pub(crate) const V_CLIPBOARD: usize = 5;
 pub(crate) const V_PLUGINS: usize = 6;
 pub(crate) const V_SETTINGS: usize = 7;
 
-/// 看板页开不开（`[gui] show_board`）。默认开：新装用户第一屏仍是总览。
+/// 看板页开不开（`[gui] show_board`）。默认关：新装用户第一屏落在键鼠排行。
 fn board_on_cfg() -> bool {
-    focusflow_core::config::instance().get_bool("gui", "show_board", true)
+    focusflow_core::config::instance().get_bool("gui", "show_board", false)
 }
 
 /// 页签那一排的顶边。所有页面同一位置：统计卡只在部分页出现，页签不跟着上下跳。
@@ -25287,6 +25287,20 @@ mod min_size_layout_tests {
 #[cfg(test)]
 mod board_toggle_tests {
     use super::*;
+
+    /// 默认关：新装（或配置里没写这一行）时第一屏是键鼠排行。
+    #[test]
+    fn the_shipped_default_hides_the_board() {
+        let defaults = focusflow_core::config::default_config();
+        assert_eq!(
+            defaults
+                .get("gui")
+                .and_then(|s| s.get("show_board"))
+                .map(String::as_str),
+            Some("false"),
+            "新装默认应当关掉看板页"
+        );
+    }
 
     /// 关掉看板是整格消失、后面的往前挪，而不是留一个隐形空位。
     #[test]
