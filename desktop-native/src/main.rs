@@ -2454,7 +2454,7 @@ impl App {
     /// 也就不进这张表 —— 焦点停过去再按 Enter 什么都不会发生，那是另一种假反馈。
     fn kbd_items(&self, w: f32, h: f32) -> Vec<KbdItem> {
         let mut out = Vec::new();
-        for (_, r) in period_pills() {
+        for (_, r) in nav_period_pills(self.view) {
             out.push(KbdItem {
                 rect: r,
                 group: 0,
@@ -4426,6 +4426,9 @@ impl App {
             ),
         );
         self.board_on = next;
+        // 顶栏页签数量 7↔8 会让本页所有键盘格的下标整体挪一格：旧下标指着相邻那一行，
+        // 再按一次 Enter 就会去开关别的设置。与 `switch_view` 同口径，改完直接撤焦点。
+        self.kbd_focus = None;
         let msg = if next {
             format!("看板页已显示{note}")
         } else {
@@ -7672,6 +7675,18 @@ fn period_pills() -> [(i64, D2D_RECT_F); 6] {
 /// 把它们也画出来，点下去只会让这一排高亮、页面数字一动不动。
 fn period_pills_visible(view: usize) -> bool {
     matches!(view, V_BOARD..=V_ANALYTICS)
+}
+
+/// 键盘焦点表里该出现的周期药丸：画与点击都不接的页面，焦点也不许停过去。
+///
+/// 只按 `period_pills()` 铺满整排会让剪贴板/插件/设置三页的 Tab 先经过 6 个空白格：
+/// 焦点框浮在没画药丸的位置，Enter 也没有去处 —— 正是 `kbd_items` 注释要挡的假反馈。
+fn nav_period_pills(view: usize) -> Vec<(i64, D2D_RECT_F)> {
+    if period_pills_visible(view) {
+        period_pills().to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 /// 第 4 个页签上该画哪一张。
@@ -24739,6 +24754,25 @@ mod chrome_layout_tests {
         }
     }
 
+    /// 键盘焦点表只收画得出来的药丸：没有周期数据的页不许留 6 个空白焦点格。
+    #[test]
+    fn keyboard_focus_skips_period_pills_that_are_not_drawn() {
+        for v in [V_CLIPBOARD, V_PLUGINS, V_SETTINGS] {
+            assert!(
+                nav_period_pills(v).is_empty(),
+                "第 {v} 页不画周期药丸，焦点表里却还有 {} 格",
+                nav_period_pills(v).len()
+            );
+        }
+        for v in [V_BOARD, V_KEYS, V_APPS, V_DEVICES, V_ANALYTICS] {
+            assert_eq!(
+                nav_period_pills(v).len(),
+                period_pills().len(),
+                "第 {v} 页画了周期药丸，键盘也要停得过去"
+            );
+        }
+    }
+
     #[test]
     fn the_bare_pages_reclaim_the_stats_card_band() {
         let g = settings_geom(960.0, 480.0);
@@ -25385,5 +25419,23 @@ mod board_toggle_tests {
             assert!(prod.contains(needle), "页签读者没读同一份坐标：{needle}");
         }
         assert!(!prod.contains("fn view_tabs()"), "又长出一套私有页签坐标");
+    }
+
+    /// 开关看板会改变页签数量 ⇒ 键盘格下标整体挪位；开关那一支必须撤掉旧焦点。
+    #[test]
+    fn toggling_the_board_drops_a_stale_keyboard_focus_index() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let start = prod.find("fn toggle_board").expect("看板开关找不到了");
+        let rest = &prod[start..];
+        let end = rest
+            .find("\n    }\n")
+            .map(|i| i + "\n    }\n".len())
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("self.kbd_focus = None;"),
+            "页签数量变了，键盘焦点下标会指向相邻那一行"
+        );
     }
 }

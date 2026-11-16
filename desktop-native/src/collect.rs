@@ -1,8 +1,9 @@
 //! 采集接线：把 core 的 `Database` 与 `InputListener` 接进原生端。
 //!
-//! **默认关闭**（`[collector] enabled`，默认 `false`）：装完先当只读查看器，
-//! 用户明确打开之后才开始采集。理由不是技术上的 —— `Database::init` 一起来就会
-//! 全局钩键盘鼠标，那是要用户点头的事（见 docs/webview-removal-plan.md §10p）。
+//! **默认开启**（`[collector] enabled`，默认 `true`，2026-10-27 用户要求）：装完即采集，
+//! 设置页「采集」那一行可以随时关掉。`Database::init` 一起来就会全局钩键盘鼠标，这是
+//! 用户点过头的事（见 docs/webview-removal-plan.md §10p）；监听起不来时状态会清回
+//! 未启动，调用方可以重试。
 //!
 //! 打开之后这里负责四件事：
 //! 1. `Database::init(&cfg, paused)`：写线程、启动自检、在线备份、前台应用采样、

@@ -305,12 +305,13 @@ function New-AppDir([string]$Dest, [string[]]$ConfigAppend = @()) {
     New-Item -ItemType Directory -Force -Path $Dest | Out-Null
     Copy-Item (Join-Path $probe 'data') $Dest -Recurse
     Copy-Item (Join-Path $probe 'config.ini') (Join-Path $Dest 'config.ini')
-    # Every suite's premise is "the main window shows up". Silent start ([gui] start_to_tray,
-    # wired on 2026-10-30) breaks that premise for the whole lane at once, so the guard belongs
-    # here rather than in twelve suites. The probe fixture deliberately keeps the key ON: that
-    # way every green suite run is also proof this line works. A caller that wants the hidden
-    # path passes its own [gui] block -- the parser lets the LAST section win, so it overrides us.
-    $lines_add = @('[gui]', 'start_to_tray = false', 'trace_log = true') + $ConfigAppend
+    # Two lane-wide premises live here rather than in twelve suites: the main window must show
+    # up ([gui] start_to_tray, wired 2026-10-30) and the tab strip must keep its eight slots
+    # ([gui] show_board defaulted OFF on 2026-11-15). The probe fixture deliberately keeps
+    # start_to_tray ON: every green suite run is also proof this line works. A caller that
+    # wants a hidden path passes its own [gui] block -- the parser lets the LAST section win,
+    # so it overrides us.
+    $lines_add = @('[gui]', 'start_to_tray = false', 'show_board = true', 'trace_log = true') + $ConfigAppend
     if ($lines_add.Count -gt 0) {
         $cfg = Join-Path $Dest 'config.ini'
         $lines = [System.Collections.Generic.List[string]](Get-Content $cfg -Encoding UTF8)
@@ -463,8 +464,10 @@ function Read-AppLog([string]$WorkDir) {
 }
 
 # Viewer-tab / settings-row helpers (client coordinates, 100% DPI, 1184x821 client).
-# Tab order (left to right): 0 board, 1 keys, 2 apps, 3 devices, 4 analytics,
-# 5 clipboard, 6 plugins, 7 settings. Scripts read these names, not raw numbers.
+# Slots are counted left to right on screen: 0 board, 1 keys, 2 apps, 3 devices,
+# 4 analytics, 5 clipboard, 6 plugins, 7 settings. Slot == view index only while the board
+# tab is shown, and New-AppDir pins [gui] show_board = true for exactly that reason. A suite
+# that hides the board must click by SLOT (settings = slot 6), not by view index.
 $VIEW_BOARD = 0
 $VIEW_KEYS = 1
 $VIEW_APPS = 2
