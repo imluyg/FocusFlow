@@ -1,4 +1,4 @@
-//! 剪贴板历史弹窗（历史 / 片段 / 统计；文本、图片与文件条目都能复制）。
+//! 剪贴板历史弹窗（历史 / 收藏 / 统计；文本、图片与文件条目都能复制）。
 //!
 //! 形态：`WS_POPUP` + `WS_EX_TOOLWINDOW | WS_EX_TOPMOST`，**不设 owner**。设了 owner 之后
 //! 主窗藏进托盘会把弹窗一起藏掉；而主窗可能是隐藏的，热键仍应能把历史叫出来。
@@ -11,7 +11,7 @@
 //! 那个 host 是顶层窗，`place_hosted_edit` 会 `SetForegroundWindow(host)`，弹窗会立刻
 //! 收到失活而自动关闭；`edit_proc` 还会把 `WM_EDIT_DONE` 递给主窗。
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -84,6 +84,18 @@ static LAST_RESTORE_ISSUE: std::sync::Mutex<Option<String>> = std::sync::Mutex::
 
 static PALETTE_HWND: AtomicIsize = AtomicIsize::new(0);
 
+/// 弹窗改过剪贴板库的代数（收藏增删、历史固定/删除/清空）。管理页开着时主循环读它，
+/// 变了就重查 —— 否则在弹窗里存一条收藏，回到已经开着的管理页还是旧列表。
+static DATA_GEN: AtomicU64 = AtomicU64::new(1);
+
+fn bump_data_gen() {
+    DATA_GEN.fetch_add(1, Ordering::Release);
+}
+
+pub fn data_generation() -> u64 {
+    DATA_GEN.load(Ordering::Acquire)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     History,
@@ -94,9 +106,9 @@ enum Mode {
 #[derive(Clone)]
 struct Row {
     id: i64,
-    /// 历史条目是内容；片段是片段内容。
+    /// 历史条目是内容；收藏是收藏内容。
     content: String,
-    /// 片段名；历史条目为空。
+    /// 收藏名；历史条目为空。
     name: String,
     source: String,
     time: String,
@@ -272,9 +284,8 @@ impl State {
                 self.snippets = rows;
             }
             Err(e) => {
-                if self.status.is_none() {
-                    self.status = Some(format!("读片段失败：{e}"));
-                }
+                self.snippets.clear();
+                self.status = Some(format!("读收藏失败：{e}"));
             }
         }
         if self.mode == Mode::Snippets {
@@ -363,11 +374,16 @@ impl State {
     }
 
     fn toggle_pin(&mut self, hwnd: HWND) {
+        if self.mode != Mode::History {
+            self.status = Some("收藏不能固定".to_string());
+            return;
+        }
         let Some(row) = self.selected().cloned() else {
             return;
         };
         match clipboard::set_pinned(row.id, !row.pinned) {
             Ok(true) => {
+                bump_data_gen();
                 self.reload_all(hwnd, ReloadIntent::Keep);
                 self.status = Some(if row.pinned {
                     "已取消固定".to_string()
@@ -390,6 +406,7 @@ impl State {
         };
         match result {
             Ok(true) => {
+                bump_data_gen();
                 self.reload_all(hwnd, ReloadIntent::Keep);
                 self.status = Some("已删除".to_string());
             }
@@ -403,15 +420,16 @@ impl State {
             return;
         };
         if row.kind != ClipKind::Text {
-            self.status = Some("图片/文件条目不能存为片段".to_string());
+            self.status = Some("图片/文件条目不能存为收藏".to_string());
             return;
         }
         match clipboard::add_snippet("", &row.content) {
             Ok(_) => {
+                bump_data_gen();
                 self.reload_all(hwnd, ReloadIntent::Keep);
-                self.status = Some("已存为片段（Tab 切到片段列表）".to_string());
+                self.status = Some("已存为收藏（Tab 切到收藏列表）".to_string());
             }
-            Err(e) => self.status = Some(format!("存为片段失败：{e}")),
+            Err(e) => self.status = Some(format!("存为收藏失败：{e}")),
         }
     }
 
@@ -472,7 +490,7 @@ fn row_from_snippet(s: Snippet) -> Row {
         id: s.id,
         content: s.content,
         name: if s.name.trim().is_empty() {
-            "(未命名片段)".to_string()
+            "(未命名收藏)".to_string()
         } else {
             s.name
         },
@@ -840,6 +858,8 @@ fn reveal(hwnd: HWND) {
         st.prev_fg = prev_fg;
         st.activated = false;
         st.activate_tries = 2;
+        // 上一次打开时留下的「已删除」「已固定」不是这一次的反馈，重开就清掉。
+        st.status = None;
         st.reload_all(hwnd, ReloadIntent::ResetTop);
         if let Some(msg) = take_restore_issue() {
             st.status = Some(msg);
@@ -1480,7 +1500,7 @@ fn delete_key_goes_to_list(ctrl: bool, edit_len: usize) -> bool {
     ctrl || edit_len == 0
 }
 
-/// 删除这一条之前要不要问一句：片段与固定记录会弹确认框，普通未固定历史直接删。
+/// 删除这一条之前要不要问一句：收藏与固定记录会弹确认框，普通未固定历史直接删。
 /// 以前一律不问，Del 一下少一条；现在固定项也不会被误删。
 fn needs_confirm(mode: Mode, pinned: bool) -> bool {
     mode == Mode::Snippets || pinned
@@ -1490,9 +1510,9 @@ fn needs_confirm(mode: Mode, pinned: bool) -> bool {
 /// 旧文案却一直写着"粘贴"——用户按下去没反应，只会以为复制失败。
 fn history_footer(auto_paste: bool) -> &'static str {
     if auto_paste {
-        "单击选中 · 双击/Enter 粘贴 · Ctrl+Enter 只复制 · Tab 片段 · Esc 关闭"
+        "单击选中 · 双击/Enter 粘贴 · Ctrl+Enter 只复制 · Tab 收藏 · Esc 关闭"
     } else {
-        "单击选中 · 双击/Enter 复制（自动粘贴已关） · Ctrl+Enter 只复制 · Tab 片段 · Esc 关闭"
+        "单击选中 · 双击/Enter 复制（自动粘贴已关） · Ctrl+Enter 只复制 · Tab 收藏 · Esc 关闭"
     }
 }
 
@@ -1507,7 +1527,7 @@ fn delete_row(hwnd: HWND) {
     let Some((ask, what)) = with_state(hwnd, |st| {
         let row = st.selected()?;
         let what = if st.mode == Mode::Snippets {
-            "个片段"
+            "个收藏"
         } else if row.pinned {
             "条固定记录"
         } else {
@@ -1687,7 +1707,7 @@ fn handle_sys_key(hwnd: HWND, vk: u32) -> bool {
 fn update_edit_visibility(hwnd: HWND) {
     if let Some((edit, mode)) = with_state(hwnd, |st| (st.edit, st.mode)) {
         unsafe {
-            // 只有历史页有搜索框。片段页与统计页把它藏起来：留着却不过滤片段/统计，
+            // 只有历史页有搜索框。收藏页与统计页把它藏起来：留着却不过滤收藏/统计，
             // 比看不见更像坏了。切回历史时顺手把焦点还给它。
             if mode == Mode::History {
                 let _ = ShowWindow(edit, SW_SHOW);
@@ -1782,7 +1802,7 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
     // 标题 + 当前模式
     let title = match st.mode {
         Mode::History => "剪贴板历史",
-        Mode::Snippets => "片段",
+        Mode::Snippets => "收藏",
         Mode::Stats => "剪贴板统计",
     };
     let count = match st.mode {
@@ -1835,7 +1855,7 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
             Mode::History => {
                 history_footer(focusflow_core::clipboard::auto_paste_enabled()).to_string()
             }
-            Mode::Snippets => "Enter 复制片段 · Del 删除 · Tab 统计 · Esc 关闭".to_string(),
+            Mode::Snippets => "Enter 复制收藏 · Del 删除 · Tab 统计 · Esc 关闭".to_string(),
             Mode::Stats => "Tab 回历史 · Esc 关闭".to_string(),
         }
     };
@@ -1890,7 +1910,7 @@ unsafe fn draw_rows(hdc: HDC, st: &mut State, lay: Layout, w: i32, card: HBRUSH,
         let msg = if st.mode == Mode::History && !st.query.trim().is_empty() {
             "没有匹配的记录"
         } else if st.mode == Mode::Snippets {
-            "还没有片段：在历史条目上右键「存为片段」"
+            "还没有收藏：在历史条目上右键「存为收藏」"
         } else {
             "还没有记录：复制一段文字试试"
         };
@@ -2153,7 +2173,7 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
             let _ = AppendMenuW(menu, MF_STRING, MENU_DELETE as usize, w!("删除"));
         }
         if has_row && mode == Mode::History {
-            let _ = AppendMenuW(menu, MF_STRING, MENU_SNIPPET as usize, w!("存为片段"));
+            let _ = AppendMenuW(menu, MF_STRING, MENU_SNIPPET as usize, w!("存为收藏"));
             if let Ok(sub) = CreatePopupMenu() {
                 for (i, t) in Transform::ALL.iter().enumerate() {
                     let label: Vec<u16> = format!("{}\tCtrl+{}", t.label(), i + 1)
@@ -2267,6 +2287,7 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
             if answer == IDYES {
                 match clipboard::clear_unpinned() {
                     Ok(n) => {
+                        bump_data_gen();
                         with_state(hwnd, |st| {
                             st.reload_all(hwnd, ReloadIntent::Keep);
                             st.status = Some(format!("已清空 {n} 条未固定记录"));
@@ -2295,8 +2316,9 @@ fn open_menu(hwnd: HWND, x: i32, y: i32) {
         if unsafe { GetForegroundWindow() } != hwnd {
             // 菜单开着的时候用户点去别处了：照旧藏起来。
             hide_palette(hwnd);
-        } else if mode == Mode::History {
-            // 菜单关掉后焦点回到搜索框，否则"接着打字没反应"。
+        } else if with_state(hwnd, |st| st.mode).unwrap_or(mode) == Mode::History {
+            // 菜单关掉后焦点回到搜索框，否则"接着打字没反应"。模式要现问：
+            // 「统计」这一项会把页面切走，拿着菜单打开前的模式会把焦点设到已藏起的搜索框。
             if let Some(edit) = with_state(hwnd, |st| st.edit) {
                 unsafe {
                     let _ = SetFocus(Some(edit));
@@ -2513,7 +2535,7 @@ mod tests {
             needs_confirm(Mode::History, true),
             "固定项要问一句：删了就没了"
         );
-        assert!(needs_confirm(Mode::Snippets, false), "片段要问一句");
+        assert!(needs_confirm(Mode::Snippets, false), "收藏要问一句");
         assert!(needs_confirm(Mode::Snippets, true));
     }
 

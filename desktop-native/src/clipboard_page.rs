@@ -33,7 +33,7 @@ const FOOTER_H: f32 = 34.0;
 /// 两块清单读失败时状态条那句话的开头。错误正文带着原因（`：{e}`），比对整串会让
 /// "恢复后清掉这句话"永远不成立。
 const HISTORY_LOAD_ERROR: &str = "读剪贴板库失败";
-const SNIPPETS_LOAD_ERROR: &str = "读片段失败";
+const SNIPPETS_LOAD_ERROR: &str = "读收藏失败";
 
 fn clear_load_error(status: &mut Option<String>, prefix: &str) {
     if status.as_deref().is_some_and(|s| s.starts_with(prefix)) {
@@ -61,7 +61,7 @@ impl Mode {
     pub fn label(self) -> &'static str {
         match self {
             Mode::History => "历史",
-            Mode::Snippets => "片段",
+            Mode::Snippets => "收藏",
             Mode::Stats => "统计",
         }
     }
@@ -73,7 +73,7 @@ pub const MODES: [Mode; 3] = [Mode::History, Mode::Snippets, Mode::Stats];
 pub struct Row {
     pub id: i64,
     pub content: String,
-    /// 片段名；历史条目为空。
+    /// 收藏名；历史条目为空。
     pub name: String,
     pub source: String,
     pub time: String,
@@ -105,8 +105,8 @@ pub fn row_click_action(multi: bool, shift: bool, row: usize) -> RowClick {
     }
 }
 
-/// 批量固定的计划。片段表没有 `pinned` 列，而 `action_ids` 交的是**当前模式**下的 id：
-/// 拿着片段 id 去改历史表，改到的是同号那条历史记录（或干脆一条没改）。
+/// 批量固定的计划。收藏表没有 `pinned` 列，而 `action_ids` 交的是**当前模式**下的 id：
+/// 拿着收藏 id 去改历史表，改到的是同号那条历史记录（或干脆一条没改）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinPlan {
     /// 当前模式没有"固定"这个动作。
@@ -143,7 +143,7 @@ fn row_from_snippet(s: Snippet) -> Row {
         id: s.id,
         content: s.content,
         name: if s.name.trim().is_empty() {
-            "(未命名片段)".to_string()
+            "(未命名收藏)".to_string()
         } else {
             s.name
         },
@@ -316,7 +316,7 @@ impl ClipPage {
         self.rows().get(self.sel)
     }
 
-    /// 只重查历史列表。实时筛选每敲一个键都要走这里：片段与统计不该跟着重算。
+    /// 只重查历史列表。实时筛选每敲一个键都要走这里：收藏与统计不该跟着重算。
     pub fn reload_items(&mut self) {
         // 库读不出来与"没有记录"是两件事：前者写进 status，列表留空但会有一句话。
         let filter = self.filter.trim().to_string();
@@ -492,7 +492,7 @@ impl ClipPage {
         self.sel = row_idx;
     }
 
-    /// `Ctrl+A`：把当前列表（历史或片段，按现在的筛选）全部勾上，并进入多选。
+    /// `Ctrl+A`：把当前列表（历史或收藏，按现在的筛选）全部勾上，并进入多选。
     pub fn check_all(&mut self) {
         let ids: Vec<i64> = self.rows().iter().map(|r| r.id).collect();
         if ids.is_empty() {
@@ -904,7 +904,7 @@ mod tests {
         assert_eq!(
             p.pin_plan(),
             PinPlan::WrongMode,
-            "片段 id 不能拿去改历史表（同号会改到别的记录）"
+            "收藏 id 不能拿去改历史表（同号会改到别的记录）"
         );
 
         p.set_mode(Mode::History);
@@ -940,7 +940,7 @@ mod tests {
         p.reload(ReloadIntent::ResetTop, 8);
         assert!(
             p.status.is_none(),
-            "片段读回来之后，上一次那句错不该继续留在状态条上（实际：{:?}）",
+            "收藏读回来之后，上一次那句错不该继续留在状态条上（实际：{:?}）",
             p.status
         );
     }

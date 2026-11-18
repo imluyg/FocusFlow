@@ -21,7 +21,8 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 chrono.workspace = true
 serde.workspace = true
-serde_json = "1"
+# preserve_order：JSON 美化只该动空白，不能把对象的键按字母重排。
+serde_json = { version = "1", features = ["preserve_order"] }
 anyhow.workspace = true
 
 # SQLite（bundled 编译，无需系统库）

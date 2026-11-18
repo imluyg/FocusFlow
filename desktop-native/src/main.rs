@@ -932,7 +932,7 @@ enum EditTarget {
     Setting(usize),
     /// 插件视图里的 TextInput：(插件展示名, 字段名)
     PluginField(String, String),
-    /// 剪贴板片段改名。
+    /// 剪贴板收藏改名。
     SnippetName(i64),
 }
 
@@ -1079,6 +1079,9 @@ struct App {
     clip_search_edit: Option<HWND>,
     clip_search_host: Option<HWND>,
     clip_search_focused: bool,
+    /// 上一次看到的弹窗库改动代数。弹窗里存/删收藏、固定/删除/清空历史都不会产生
+    /// `Captured`，管理页开着时靠这个代数发现该重查。
+    clip_data_gen: u64,
     /// 后台操作把结果行塞这里，再投 `WM_OP_DONE` 让界面来取。
     ops: Arc<Mutex<Vec<String>>>,
     /// 插件管理器（Lua 不是 Send，只能待在 UI 线程）。
@@ -1829,6 +1832,7 @@ impl App {
                 clip_search_edit: None,
                 clip_search_host: None,
                 clip_search_focused: false,
+                clip_data_gen: clipboard_popup::data_generation(),
                 ops: Arc::new(Mutex::new(Vec::new())),
                 pm: None,
                 plugin_rows: Vec::new(),
@@ -2838,7 +2842,7 @@ impl App {
         let plan = self.clip_page.pin_plan();
         let (ids, target) = match plan {
             clipboard_page::PinPlan::WrongMode => {
-                self.clip_page.status = Some("片段不能固定".to_string());
+                self.clip_page.status = Some("收藏不能固定".to_string());
                 self.refresh_clip_page(hwnd);
                 return;
             }
@@ -2870,16 +2874,17 @@ impl App {
             self.refresh_clip_page(hwnd);
             return;
         }
-        // 删除不可撤销：单条与批量都要先点一次头。固定项也会被删，标题里说清楚。
-        let what = if self.clip_page.mode == clipboard_page::Mode::Snippets {
-            "个片段"
+        // 删除不可撤销：单条与批量都要先点一次头。历史里固定项也会被删，标题里说清楚。
+        let (what, pinned_note) = if self.clip_page.mode == clipboard_page::Mode::Snippets {
+            // 收藏没有固定状态，别把"固定项也会被删"这句无关的话塞给用户。
+            ("个收藏", "")
         } else {
-            "条记录"
+            ("条记录", "（固定项也会被删）")
         };
         let msg = if ids.len() == 1 {
-            format!("删除这 1 {what}？（固定项也会被删）")
+            format!("删除这 1 {what}？{pinned_note}")
         } else {
-            format!("删除选中的 {} {what}？（固定项也会被删）", ids.len())
+            format!("删除选中的 {} {what}？{pinned_note}", ids.len())
         };
         let text = windows::core::HSTRING::from(msg);
         let answer = unsafe {
@@ -2913,7 +2918,12 @@ impl App {
         match result {
             Ok(n) => {
                 tracing_note(&format!("clip_page_delete n={n}"));
-                self.clip_page.status = Some(format!("已删除 {n} 条"));
+                self.clip_page.status =
+                    Some(if self.clip_page.mode == clipboard_page::Mode::Snippets {
+                        format!("已删除 {n} 个收藏")
+                    } else {
+                        format!("已删除 {n} 条")
+                    });
                 self.clip_page.clear_checked();
             }
             Err(e) => self.clip_page.status = Some(format!("删除失败：{e}")),
@@ -2928,13 +2938,13 @@ impl App {
             return;
         };
         if row.kind != focusflow_core::clipboard::ClipKind::Text {
-            self.clip_page.status = Some("图片/文件条目不能存为片段".to_string());
+            self.clip_page.status = Some("图片/文件条目不能存为收藏".to_string());
             self.refresh_clip_page(hwnd);
             return;
         }
         match focusflow_core::clipboard::add_snippet("", &row.content) {
-            Ok(_) => self.clip_page.status = Some("已存为片段（Tab 切到片段）".to_string()),
-            Err(e) => self.clip_page.status = Some(format!("存为片段失败：{e}")),
+            Ok(_) => self.clip_page.status = Some("已存为收藏（Tab 切到收藏）".to_string()),
+            Err(e) => self.clip_page.status = Some(format!("存为收藏失败：{e}")),
         }
         self.reload_clip_page(hwnd, clip_list::ReloadIntent::Keep);
     }
@@ -2959,10 +2969,10 @@ impl App {
         self.reload_clip_page(hwnd, clip_list::ReloadIntent::Keep);
     }
 
-    /// 片段改名：复用行内那套顶层 EDIT，落点按当前列表行算。
+    /// 收藏改名：复用行内那套顶层 EDIT，落点按当前列表行算。
     fn start_edit_snippet(&mut self, hwnd: HWND, row: usize) {
         let Some(snippet) = self.clip_page.snippets.get(row).cloned() else {
-            self.clip_page.status = Some("先选一个片段".to_string());
+            self.clip_page.status = Some("先选一个收藏".to_string());
             self.refresh_clip_page(hwnd);
             return;
         };
@@ -3033,7 +3043,7 @@ impl App {
         if had_checked > 0 {
             self.clip_page.status = Some("筛选已变，已取消勾选".to_string());
         }
-        // 片段页筛的是片段列表，得走整份 reload；历史页只重查历史，别连带重算片段与统计。
+        // 收藏页筛的是收藏列表，得走整份 reload；历史页只重查历史，别连带重算收藏与统计。
         if self.clip_page.mode == clipboard_page::Mode::Snippets {
             self.reload_clip_page(hwnd, clip_list::ReloadIntent::ResetTop);
         } else {
@@ -4879,6 +4889,14 @@ impl App {
                 self.reload_clip_page(hwnd, clip_list::ReloadIntent::Keep);
             }
         }
+        // 弹窗里做的固定/删除/存收藏不经过收录通道；管理页开着时在这里补一次重查。
+        let popup_gen = clipboard_popup::data_generation();
+        if popup_gen != self.clip_data_gen {
+            self.clip_data_gen = popup_gen;
+            if self.view == V_CLIPBOARD && !changed {
+                self.reload_clip_page(hwnd, clip_list::ReloadIntent::Keep);
+            }
+        }
         if watcher_dead && focusflow_core::clipboard::watcher_fault().is_none() {
             // 线程没了却没人说过：屏上必须改口，否则"还在记录"是假象。
             focusflow_core::clipboard::report_watcher_fault(
@@ -5822,10 +5840,10 @@ impl App {
                         match focusflow_core::clipboard::rename_snippet(id, &text) {
                             Ok(true) => {
                                 self.reload_clip_page(hwnd, clip_list::ReloadIntent::Keep);
-                                self.clip_page.status = Some("片段已重命名".to_string());
+                                self.clip_page.status = Some("收藏已重命名".to_string());
                             }
                             Ok(false) => {
-                                self.clip_page.status = Some("这个片段已经不在了".to_string())
+                                self.clip_page.status = Some("这个收藏已经不在了".to_string())
                             }
                             Err(err) => self.clip_page.status = Some(format!("重命名失败：{err}")),
                         }
@@ -11819,7 +11837,7 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
 
     let lay = clipboard_page::layout_for(w, h);
 
-    // 三个模式页签：历史 / 片段 / 统计。
+    // 三个模式页签：历史 / 收藏 / 统计。
     for (i, mode) in clipboard_page::MODES.iter().enumerate() {
         let r = lay.tabs[i];
         let active = clip.mode == *mode;
@@ -11846,7 +11864,7 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
         let cue = if !clip.filter.trim().is_empty() {
             format!("筛选：{}", clip.filter)
         } else {
-            "筛选历史 / 片段（边打边筛）".to_string()
+            "筛选历史 / 收藏（边打边筛）".to_string()
         };
         if !vs.clip_search_focused {
             let cue = p.clip(&cue, &p.fmt.caption, sr.right - sr.left - 20.0);
@@ -11868,10 +11886,10 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
         }
     }
 
-    // 工具钮：历史与片段两套文案，同一份几何。
+    // 工具钮：历史与收藏两套文案，同一份几何。
     if clip.mode != Mode::Stats {
         let labels: [&str; 6] = if clip.mode == Mode::History {
-            ["复制", "固定", "删除", "存为片段", "清空", "多选"]
+            ["复制", "固定", "删除", "存为收藏", "清空", "多选"]
         } else {
             ["复制", "重命名", "删除", "", "", "多选"]
         };
@@ -11933,8 +11951,8 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
                 let msg = match clip.mode {
                     Mode::History if !clip.filter.trim().is_empty() => "没有匹配的记录",
                     Mode::History => "还没有记录：复制一段文字、图片或文件试试",
-                    Mode::Snippets if !clip.filter.trim().is_empty() => "没有匹配的片段",
-                    Mode::Snippets => "还没有片段：在历史里点「存为片段」",
+                    Mode::Snippets if !clip.filter.trim().is_empty() => "没有匹配的收藏",
+                    Mode::Snippets => "还没有收藏：在历史里点「存为收藏」",
                     Mode::Stats => "",
                 };
                 p.text(
@@ -12076,11 +12094,17 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
     let mut footer = if let Some(status) = &clip.status {
         status.clone()
     } else if clip.multi {
-        // 三个手势各管什么，一句话说全：焦点行是"复制/存片段/改名"的目标，勾选
-        // （没勾时退回焦点行）是"删除/固定"的目标。
-        format!(
-            "已勾选 {selected} 条 · 焦点行：复制/存片段/改名 · 勾选（无勾时焦点行）：删除/固定 · Space 勾选 · Esc 退出多选"
-        )
+        // 三个手势各管什么，一句话说全：焦点行是"复制/存收藏/改名"的目标，勾选
+        // （没勾时退回焦点行）是删除（历史页还有固定）的目标。
+        if clip.mode == Mode::Snippets {
+            format!(
+                "已勾选 {selected} 条 · 焦点行：复制/改名 · 勾选（无勾时焦点行）：删除 · Space 勾选 · Esc 退出多选"
+            )
+        } else {
+            format!(
+                "已勾选 {selected} 条 · 焦点行：复制/存收藏/改名 · 勾选（无勾时焦点行）：删除/固定 · Space 勾选 · Esc 退出多选"
+            )
+        }
     } else {
         match clip.mode {
             Mode::History => {

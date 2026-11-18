@@ -2352,10 +2352,10 @@ mod tests {
             on_disk.contains("\"arr\":[\"一\",\"二\",\"三\"]"),
             "{on_disk}"
         );
-        assert!(
-            on_disk.contains("\"obj\":{\"deep\":[1,2],\"k\":\"v\"}"),
-            "{on_disk}"
-        );
+        // 对象键的顺序不写死：serde_json 开了 preserve_order，Lua 表的迭代顺序才是盘上顺序。
+        let disk: serde_json::Value = serde_json::from_str(&on_disk).expect("state.json 应是 JSON");
+        assert_eq!(disk["obj"]["k"].as_str(), Some("v"), "{on_disk}");
+        assert_eq!(disk["obj"]["deep"][1].as_i64(), Some(2), "{on_disk}");
     }
 
     /// 被拒的那一次要说清原因，而且什么都没写进去。

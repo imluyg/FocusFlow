@@ -1122,7 +1122,7 @@ fn trim(conn: &rusqlite::Connection) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// 片段
+// 收藏（库表沿用 `clipboard_snippets`）
 // ---------------------------------------------------------------------------
 
 pub fn snippets() -> Result<Vec<Snippet>, String> {
@@ -1132,7 +1132,7 @@ pub fn snippets() -> Result<Vec<Snippet>, String> {
             "SELECT id, name, content, created_at, use_count
              FROM clipboard_snippets ORDER BY created_at DESC, id DESC",
         )
-        .map_err(|e| format!("读片段失败：{e}"))?;
+        .map_err(|e| format!("读收藏失败：{e}"))?;
     let rows = stmt
         .query_map([], |r| {
             Ok(Snippet {
@@ -1143,9 +1143,9 @@ pub fn snippets() -> Result<Vec<Snippet>, String> {
                 use_count: r.get(4)?,
             })
         })
-        .map_err(|e| format!("读片段失败：{e}"))?;
+        .map_err(|e| format!("读收藏失败：{e}"))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| format!("读片段失败：{e}"))
+        .map_err(|e| format!("读收藏失败：{e}"))
 }
 
 pub fn derive_snippet_name(content: &str) -> String {
@@ -1153,13 +1153,13 @@ pub fn derive_snippet_name(content: &str) -> String {
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .unwrap_or("片段");
+        .unwrap_or("收藏");
     let mut out: String = line.chars().take(40).collect();
     if line.chars().count() > 40 {
         out.push('…');
     }
     if out.is_empty() {
-        "片段".to_string()
+        "收藏".to_string()
     } else {
         out
     }
@@ -1167,7 +1167,7 @@ pub fn derive_snippet_name(content: &str) -> String {
 
 pub fn add_snippet(name: &str, content: &str) -> Result<i64, String> {
     if content.trim().is_empty() {
-        return Err("片段内容为空".to_string());
+        return Err("收藏内容为空".to_string());
     }
     let name = if name.trim().is_empty() {
         derive_snippet_name(content)
@@ -1179,7 +1179,7 @@ pub fn add_snippet(name: &str, content: &str) -> Result<i64, String> {
         "INSERT INTO clipboard_snippets(name, content, created_at, use_count) VALUES (?1, ?2, ?3, 0)",
         rusqlite::params![name, content, now_ms()],
     )
-    .map_err(|e| format!("写入片段失败：{e}"))?;
+    .map_err(|e| format!("写入收藏失败：{e}"))?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -1187,14 +1187,14 @@ pub fn delete_snippet(id: i64) -> Result<bool, String> {
     let conn = open().map_err(|e| format!("打开剪贴板库失败：{e}"))?;
     let n = conn
         .execute("DELETE FROM clipboard_snippets WHERE id=?1", [id])
-        .map_err(|e| format!("删除片段失败：{e}"))?;
+        .map_err(|e| format!("删除收藏失败：{e}"))?;
     Ok(n > 0)
 }
 
 pub fn rename_snippet(id: i64, name: &str) -> Result<bool, String> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("片段名不能为空".to_string());
+        return Err("收藏名不能为空".to_string());
     }
     let conn = open().map_err(|e| format!("打开剪贴板库失败：{e}"))?;
     let n = conn
@@ -1202,7 +1202,7 @@ pub fn rename_snippet(id: i64, name: &str) -> Result<bool, String> {
             "UPDATE clipboard_snippets SET name=?1 WHERE id=?2",
             rusqlite::params![name, id],
         )
-        .map_err(|e| format!("重命名片段失败：{e}"))?;
+        .map_err(|e| format!("重命名收藏失败：{e}"))?;
     Ok(n > 0)
 }
 
@@ -1212,7 +1212,7 @@ pub fn touch_snippet(id: i64) -> Result<(), String> {
         "UPDATE clipboard_snippets SET use_count = use_count + 1 WHERE id=?1",
         [id],
     )
-    .map_err(|e| format!("记片段使用次数失败：{e}"))?;
+    .map_err(|e| format!("记收藏使用次数失败：{e}"))?;
     Ok(())
 }
 
@@ -1555,10 +1555,13 @@ pub fn dib_to_rgba(dib: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
 }
 
 /// 按掩码取一个通道并缩到 0..255。
+///
+/// 用 u64 算：坏 DIB 可能把 24 位以上的掩码塞进来，`v * 255` 在 u32 里会溢出
+/// （debug 直接 panic，release 静默回绕）。这份数据来自别的进程，不能按"掩码总是 8 位"假设。
 fn channel8(px: u32, mask: u32) -> u8 {
     let shift = mask.trailing_zeros();
-    let max = mask >> shift;
-    let v = (px & mask) >> shift;
+    let max = (mask >> shift) as u64;
+    let v = ((px & mask) >> shift) as u64;
     ((v * 255 + max / 2) / max) as u8
 }
 
@@ -2712,7 +2715,11 @@ mod win {
                     let touched = !matches!(&result, Err(WriteError::Untouched(_)));
                     if mark_self && touched {
                         note_self_sequence(unsafe { GetClipboardSequenceNumber() });
-                        super::note_self_text(text);
+                        // 只有真写成功才记内容哈希。清空后写失败时剪贴板里没有这段文本，
+                        // 记了反而会把用户几秒内从别处复制同样文字的那一笔误当自己写的。
+                        if result.is_ok() {
+                            super::note_self_text(text);
+                        }
                     }
                     if let Err(e) = unsafe { CloseClipboard() } {
                         tracing::warn!("关闭剪贴板失败（本次结果仍按 {result:?} 上报）：{e}");
@@ -2998,6 +3005,20 @@ mod tests {
     }
 
     #[test]
+    fn pretty_json_keeps_key_order() {
+        // 美化只该动空白，不该把对象的键按字母重排（默认 serde_json 会）。
+        let got = Transform::PrettyJson
+            .apply("{\"z\":1,\"a\":{\"y\":2,\"b\":3}}")
+            .unwrap();
+        let z = got.find("\"z\"").expect("z");
+        let a = got.find("\"a\"").expect("a");
+        let y = got.find("\"y\"").expect("y");
+        let b = got.find("\"b\"").expect("b");
+        assert!(z < a, "外层键顺序变了：{got}");
+        assert!(y < b, "内层键顺序变了：{got}");
+    }
+
+    #[test]
     fn case_transforms_are_unicode_aware() {
         assert_eq!(Transform::Upper.apply("abc 中文").unwrap(), "ABC 中文");
         assert_eq!(Transform::Lower.apply("ABC 中文").unwrap(), "abc 中文");
@@ -3010,7 +3031,7 @@ mod tests {
         let name = derive_snippet_name(&long);
         assert_eq!(name.chars().count(), 41);
         assert!(name.ends_with('…'));
-        assert_eq!(derive_snippet_name("   "), "片段");
+        assert_eq!(derive_snippet_name("   "), "收藏");
     }
 
     #[test]
@@ -3262,6 +3283,15 @@ mod tests {
         dib.extend_from_slice(&[0x10, 0x20, 0x30, 0x00]);
         let (rgba, _, _) = dib_to_rgba(&dib).unwrap();
         assert_eq!(rgba, vec![0x30, 0x20, 0x10, 255]);
+    }
+
+    #[test]
+    fn wide_bitfield_masks_do_not_overflow() {
+        // 坏 DIB 可以把整 32 位当通道掩码；u32 里乘 255 会溢出。这里只要求不 panic、
+        // 结果落在 0..=255。
+        assert_eq!(channel8(0xFFFF_FFFF, 0xFFFF_FFFF), 255);
+        assert_eq!(channel8(0x8000_0000, 0xFFFF_FFFF), 128);
+        assert_eq!(channel8(0x0000_0000, 0xFFFF_FFFF), 0);
     }
 
     #[test]

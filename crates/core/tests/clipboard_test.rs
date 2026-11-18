@@ -1,4 +1,4 @@
-//! 剪贴板历史库的行为测试：去重、置顶、搜索、清空、片段与次数台账。
+//! 剪贴板历史库的行为测试：去重、置顶、搜索、清空、收藏与次数台账。
 //!
 //! 隔离目录与串行锁是硬要求：`app_dir` 是进程级全局，两个用例并行切目录会互相看到
 //! 对方的库（症状是随机红、单跑永远绿）。
@@ -171,7 +171,7 @@ fn snippets_can_be_added_touched_and_deleted() {
     assert!(clipboard::snippets().unwrap().is_empty());
     assert!(
         clipboard::add_snippet("x", "   ").is_err(),
-        "空内容不该建片段"
+        "空内容不该建收藏"
     );
 }
 
