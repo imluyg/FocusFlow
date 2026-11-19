@@ -1285,10 +1285,12 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
         WM_KEYDOWN => {
             let vk = w.0 as u32;
             let ctrl = (unsafe { GetKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
-            if ctrl && vk == VK_RETURN.0 as u32 {
-                copy_without_closing(hwnd);
-            } else {
-                handle_key(hwnd, vk);
+            // 焦点在弹窗本身时（收藏页 / 统计页 / 点过空白处）也接同一组快捷键。
+            match popup_shortcut(ctrl, vk) {
+                Some(shortcut) => run_popup_shortcut(hwnd, shortcut),
+                None => {
+                    handle_key(hwnd, vk);
+                }
             }
             LRESULT(0)
         }
@@ -1447,11 +1449,6 @@ unsafe extern "system" fn edit_proc(
         let parent = GetParent(hwnd).unwrap_or_default();
         let vk = w.0 as u32;
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
-        // Ctrl+Enter 只复制不关窗；必须在 `handle_key` 之前判，否则回车会被当成粘贴。
-        if ctrl && vk == VK_RETURN.0 as u32 {
-            copy_without_closing(parent);
-            return LRESULT(0);
-        }
         // Delete：Ctrl+Del 总是删当前行；空搜索框里的 Del 也是（空框里它本来什么
         // 都不做）；有字又没有 Ctrl 时留给文本框删字符；Shift+Del 整个不碰。
         if vk == VK_DELETE.0 as u32 {
@@ -1462,22 +1459,13 @@ unsafe extern "system" fn edit_proc(
                 return LRESULT(0);
             }
         }
+        // Ctrl+Enter / Ctrl+1..6 / Ctrl+P：与窗口本身的 `WM_KEYDOWN` 共用一张判定。
+        // 必须在 `edit_key_goes_to_list` 之前：Ctrl+Enter 里的回车不能被当成粘贴。
+        if let Some(shortcut) = popup_shortcut(ctrl, vk) {
+            run_popup_shortcut(parent, shortcut);
+            return LRESULT(0);
+        }
         if edit_key_goes_to_list(vk) && handle_key(parent, vk) {
-            return LRESULT(0);
-        }
-        // Ctrl+1..6：右击菜单里那六种文本加工也给了键盘入口（菜单标签上带着 \tCtrl+N）。
-        if ctrl && (0x31..=0x36).contains(&vk) {
-            let idx = (vk - 0x31) as usize;
-            if let Some(t) = Transform::ALL.get(idx).copied() {
-                let copied = with_state(parent, |st| st.apply_transform(t)).unwrap_or(false);
-                finish_copy(parent, copied);
-            }
-            return LRESULT(0);
-        }
-        // Ctrl+P 固定：`handle_key` 不接修饰键，单独判一次。
-        if ctrl && vk == 0x50 {
-            with_state(parent, |st| st.toggle_pin(parent));
-            let _ = InvalidateRect(Some(parent), None, false);
             return LRESULT(0);
         }
     }
@@ -1663,6 +1651,53 @@ fn handle_key(hwnd: HWND, vk: u32) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// 带 Ctrl 的快捷键。搜索框子类与弹窗自己的 `WM_KEYDOWN` 各收一半键：
+/// 焦点在搜索框时走子类，焦点被点回弹窗本身（空白处、收藏/统计页）时走窗口，
+/// 所以两张入口必须读同一份判定，否则同一组键会时灵时不灵。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupShortcut {
+    CopyNoClose,
+    Transform(Transform),
+    TogglePin,
+}
+
+fn popup_shortcut(ctrl: bool, vk: u32) -> Option<PopupShortcut> {
+    if !ctrl {
+        return None;
+    }
+    if vk == VK_RETURN.0 as u32 {
+        return Some(PopupShortcut::CopyNoClose);
+    }
+    if (0x31..=0x36).contains(&vk) {
+        return Transform::ALL
+            .get((vk - 0x31) as usize)
+            .copied()
+            .map(PopupShortcut::Transform);
+    }
+    if vk == 0x50 {
+        return Some(PopupShortcut::TogglePin);
+    }
+    None
+}
+
+fn run_popup_shortcut(hwnd: HWND, shortcut: PopupShortcut) {
+    match shortcut {
+        PopupShortcut::CopyNoClose => {
+            copy_without_closing(hwnd);
+        }
+        PopupShortcut::Transform(t) => {
+            let copied = with_state(hwnd, |st| st.apply_transform(t)).unwrap_or(false);
+            finish_copy(hwnd, copied);
+        }
+        PopupShortcut::TogglePin => {
+            with_state(hwnd, |st| st.toggle_pin(hwnd));
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
     }
 }
 
@@ -2538,6 +2573,34 @@ mod tests {
         );
         assert!(needs_confirm(Mode::Snippets, false), "收藏要问一句");
         assert!(needs_confirm(Mode::Snippets, true));
+    }
+
+    #[test]
+    fn ctrl_shortcuts_are_the_same_whether_the_edit_or_the_popup_has_focus() {
+        assert_eq!(
+            popup_shortcut(true, VK_RETURN.0 as u32),
+            Some(PopupShortcut::CopyNoClose)
+        );
+        assert_eq!(
+            popup_shortcut(true, 0x31),
+            Some(PopupShortcut::Transform(Transform::Trim))
+        );
+        assert_eq!(
+            popup_shortcut(true, 0x36),
+            Some(PopupShortcut::Transform(Transform::Lower))
+        );
+        assert_eq!(popup_shortcut(true, 0x50), Some(PopupShortcut::TogglePin));
+        for vk in [VK_RETURN.0 as u32, 0x31, 0x36, 0x50] {
+            assert_eq!(popup_shortcut(false, vk), None, "没有 Ctrl 就不是快捷键");
+        }
+        // 搜索框子类与弹窗 WM_KEYDOWN 各收一半焦点，两张入口必须问同一个判定。
+        let src = include_str!("clipboard_popup.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        assert_eq!(
+            prod.matches("popup_shortcut(ctrl, vk)").count(),
+            2,
+            "两张键盘入口要共用 popup_shortcut，否则焦点换个地方就不灵"
+        );
     }
 
     #[test]

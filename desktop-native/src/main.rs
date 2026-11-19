@@ -12094,15 +12094,15 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
     let mut footer = if let Some(status) = &clip.status {
         status.clone()
     } else if clip.multi {
-        // 三个手势各管什么，一句话说全：焦点行是"复制/存收藏/改名"的目标，勾选
-        // （没勾时退回焦点行）是删除（历史页还有固定）的目标。
+        // 三个手势各管什么，一句话说全：收藏页焦点行是"复制/改名"的目标，历史页
+        // 没有改名；勾选（没勾时退回焦点行）是删除（历史页还有固定）的目标。
         if clip.mode == Mode::Snippets {
             format!(
                 "已勾选 {selected} 条 · 焦点行：复制/改名 · 勾选（无勾时焦点行）：删除 · Space 勾选 · Esc 退出多选"
             )
         } else {
             format!(
-                "已勾选 {selected} 条 · 焦点行：复制/存收藏/改名 · 勾选（无勾时焦点行）：删除/固定 · Space 勾选 · Esc 退出多选"
+                "已勾选 {selected} 条 · 焦点行：复制/存为收藏 · 勾选（无勾时焦点行）：删除/固定 · Space 勾选 · Esc 退出多选"
             )
         }
     } else {
