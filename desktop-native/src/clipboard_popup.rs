@@ -1976,9 +1976,17 @@ fn paint(hwnd: HWND) {
     }
 }
 
-/// 弹窗底栏两槽的几何：右侧状态固定 260 宽，左侧正文让出那块再加 8px 间隔。
-fn footer_slots(w: i32, pad: i32, right_present: bool) -> (i32, i32) {
-    let right_w = if right_present { 260 } else { 0 };
+/// 页脚右侧状态槽的宽度（DIP）：字号随 DPI 放大，槽也必须跟着放大，
+/// 否则 150% 下同一句话会被多省略一截。
+const FOOTER_NOTE_DIP: f32 = 260.0;
+
+/// 弹窗底栏两槽的几何：右侧状态占固定的 DIP 宽度，左侧正文让出那块再加 8px 间隔。
+fn footer_slots(w: i32, pad: i32, right_present: bool, dpi: f32) -> (i32, i32) {
+    let right_w = if right_present {
+        (FOOTER_NOTE_DIP * dpi / 96.0).round() as i32
+    } else {
+        0
+    };
     let gap = if right_present { 8 } else { 0 };
     let left_w = (w - pad * 2 - right_w - gap).max(20);
     (left_w, w - pad - right_w)
@@ -2072,7 +2080,7 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
     };
     // 页脚分两槽：右侧状态是固定宽度，左侧正文只能用到它前面 —— 右边那句
     // 以前直接盖在整宽正文上，关掉记录/监听坏掉时两行字叠在一起。
-    let (left_w, right_x) = footer_slots(w, lay.pad, right_note.is_some());
+    let (left_w, right_x) = footer_slots(w, lay.pad, right_note.is_some(), st.dpi);
     let muted = st.pal.muted;
     draw_str(
         hdc,
@@ -2086,7 +2094,12 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
         draw_str(
             hdc,
             &note,
-            &rect(right_x, lay.footer_top, 260, 20),
+            &rect(
+                right_x,
+                lay.footer_top,
+                (FOOTER_NOTE_DIP * st.dpi / 96.0).round() as i32,
+                20,
+            ),
             st.pal.accent,
             st.font_small,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
@@ -2821,7 +2834,7 @@ mod tests {
 
     #[test]
     fn footer_slots_keep_the_reason_from_covering_the_hint() {
-        let (left, right_x) = footer_slots(560, 16, true);
+        let (left, right_x) = footer_slots(560, 16, true, 96.0);
         assert_eq!(left, 260);
         assert_eq!(right_x, 284);
         assert!(
@@ -2829,10 +2842,15 @@ mod tests {
             "左槽与右侧状态之间要留间隔，不能叠字"
         );
         assert_eq!(
-            footer_slots(560, 16, false),
+            footer_slots(560, 16, false, 96.0),
             (528, 544),
             "没有右侧状态时正文用整宽"
         );
+        // 150%：窗口 840 物理像素、pad 24；右侧槽也要按 390 物理像素（260 DIP）留，
+        // 否则字号放大一档、固定 260 的槽会把同一句话多省略一截。
+        let (left15, right15) = footer_slots(840, 24, true, 144.0);
+        assert_eq!(right15, 840 - 24 - 390);
+        assert_eq!(left15, 840 - 48 - 390 - 8);
     }
 
     #[test]
