@@ -269,9 +269,8 @@ pub fn check_years_readable() -> anyhow::Result<Vec<i32>> {
 /// `get_daily_counts` 那一段窗口的**起点与它会去读的年份**，一份算法两处用。
 ///
 /// 口径：含当天共 N 天 ⇒ 起点 `今天 - (days-1)`；`days` 先收敛，越界会让日期运算 panic。
-/// 为什么不直接复用 `query_years(days, None)`：那条的起点是 `今天 - days`，跨年头那一天两套
-/// 清单会差一个年份 —— 可读性闸就会要么多拦（把不相干的坏年份算进这次读数），要么漏拦
-/// （放过窗口里真正坏掉的那一年）。
+/// 为什么不直接复用 `query_years`：这里要吃调用方取定的 `today`（同一帧里闸与读数各取一次
+/// "今天"，跨午夜那一瞬会差一年），起点算式与 `query_years` 现在是同一把尺子。
 fn window_start_and_years(
     today: chrono::NaiveDate,
     days: i64,
@@ -470,29 +469,61 @@ pub fn get_today_count(writer: Option<&crate::db::DbWriter>) -> i64 {
     }
 }
 
-/// 根据查询范围确定年份列表。
-fn query_years(days: Option<i64>, target_date: Option<chrono::NaiveDate>) -> Vec<i32> {
+/// 「含今天共 `days` 天」这个窗口会碰到哪些年份（起点 = 今天 - (days-1)）。
+///
+/// 抽出来是为了能用一个**指定的今天**把跨年头那天钉住（生产那条 `query_years` 读的是
+/// `Local::now()`，用例造不出 1 月 1 日）。旧写法起点减 `days`，每年 1 月 1 日（N=1）
+/// 都会把上一年拉进清单。
+fn years_span(today: chrono::NaiveDate, days: i64) -> Vec<i32> {
+    let sanitized = clamp_query_days(days);
+    let start = date_minus_days(today, sanitized - 1)
+        .unwrap_or_else(|| today - Days::new((MAX_QUERY_DAYS - 1) as u64));
+    (start.year()..=today.year()).collect()
+}
+
+/// 根据查询范围确定年份列表，并把**清单本身没问出来**的原因一起交回。
+///
+/// 第二个值只在"总计"那一档出现：有限窗口不需要年度清单（按日期跨度逐年过三态闸），
+/// 而"总计"离开清单就不知道该读哪几年，此时只读当年并把缺口说出来 —— 旧写法走
+/// [`available_years`]（read_dir 失败折成空表），于是整段历史被念成 0 且 `unreadable`
+/// 是空的，与"真的没有任何数据"一模一样。
+fn query_years(
+    days: Option<i64>,
+    target_date: Option<chrono::NaiveDate>,
+    label: &str,
+) -> (Vec<i32>, Option<String>) {
     if let Some(d) = target_date {
-        return vec![d.year()];
-    }
-    if days.is_none() {
-        return available_years();
+        return (vec![d.year()], None);
     }
     let now = Local::now();
-    // 天数先收敛再进日期运算：越界会 panic（release 下 panic=abort 直接崩进程）。
-    let sanitized = clamp_query_days(days.unwrap_or(1));
-    let start = date_minus_days(now.date_naive(), sanitized)
-        .unwrap_or_else(|| now.date_naive() - Days::new(MAX_QUERY_DAYS as u64));
-    let years: Vec<i32> = (start.year()..=now.year()).collect();
-    let available: std::collections::HashSet<i32> = available_years().into_iter().collect();
-    let filtered: Vec<i32> = years
-        .into_iter()
-        .filter(|y| available.contains(y))
-        .collect();
-    if filtered.is_empty() {
-        vec![now.year()]
-    } else {
-        filtered
+    let listed = try_available_years();
+    match days {
+        None => match listed {
+            Ok(years) => (years, None),
+            Err(e) => (
+                vec![now.year()],
+                Some(format!(
+                    "{} 年库{label}读不出来: 数据目录里的年度库列不出来（{e}）—— 这一趟只读了当年",
+                    now.year()
+                )),
+            ),
+        },
+        Some(d) => {
+            let span = years_span(now.date_naive(), d);
+            match listed {
+                Ok(available) => {
+                    let set: std::collections::HashSet<i32> = available.into_iter().collect();
+                    let filtered: Vec<i32> = span.into_iter().filter(|y| set.contains(y)).collect();
+                    if filtered.is_empty() {
+                        (vec![now.year()], None)
+                    } else {
+                        (filtered, None)
+                    }
+                }
+                // 清单问不出来不影响有限窗口：照日期跨度逐年过三态闸，每一年各自给答案。
+                Err(_) => (span, None),
+            }
+        }
     }
 }
 
@@ -622,9 +653,9 @@ fn gate_year(year: i32, path: &std::path::Path, label: &str) -> YearGate {
 
 /// 按键统计的读数（含"这一轮有没有读全"）。
 pub fn stats_totals(days: Option<i64>, year: Option<i32>) -> RankTotals {
-    let years = match year {
-        Some(y) => vec![y],
-        None => query_years(days, None),
+    let (years, list_gap) = match year {
+        Some(y) => (vec![y], None),
+        None => query_years(days, None, DOMAIN_KEYS),
     };
     let start_dk = cutoff_day_key(days);
     let cond = if start_dk.is_some() {
@@ -632,13 +663,17 @@ pub fn stats_totals(days: Option<i64>, year: Option<i32>) -> RankTotals {
     } else {
         ""
     };
-    gather_rank_totals(
+    let mut out = gather_rank_totals(
         &years,
         DOMAIN_KEYS,
         cond,
         start_dk.as_slice(),
         |conn, cond, params| query_stats_in_conn(conn, cond, params, true),
-    )
+    );
+    if let Some(g) = list_gap {
+        out.unreadable.push(g);
+    }
+    out
 }
 
 /// 某一天的按键统计读数。
@@ -1444,9 +1479,9 @@ pub fn get_app_stats(days: Option<i64>, year: Option<i32>) -> (i64, HashMap<Stri
 
 /// 前台应用时长读数（含"这一轮有没有读全"），周期选择与按键统计一致。
 pub fn app_stats_totals(days: Option<i64>, year: Option<i32>) -> RankTotals {
-    let years = match year {
-        Some(y) => vec![y],
-        None => query_years(days, None),
+    let (years, list_gap) = match year {
+        Some(y) => (vec![y], None),
+        None => query_years(days, None, DOMAIN_APPS),
     };
     let start_dk = cutoff_day_key(days);
     let cond = if start_dk.is_some() {
@@ -1454,13 +1489,17 @@ pub fn app_stats_totals(days: Option<i64>, year: Option<i32>) -> RankTotals {
     } else {
         ""
     };
-    gather_rank_totals(
+    let mut out = gather_rank_totals(
         &years,
         DOMAIN_APPS,
         cond,
         start_dk.as_slice(),
         query_apps_in_conn,
-    )
+    );
+    if let Some(g) = list_gap {
+        out.unreadable.push(g);
+    }
+    out
 }
 
 /// 某一天的前台应用时长读数。
@@ -1896,9 +1935,9 @@ pub fn get_device_stats(days: Option<i64>, year: Option<i32>) -> (i64, Vec<Devic
 
 /// 设备维度读数（含"这一轮有没有读全"）。
 pub fn device_totals(days: Option<i64>, year: Option<i32>) -> DeviceTotals {
-    let years = match year {
-        Some(y) => vec![y],
-        None => query_years(days, None),
+    let (years, list_gap) = match year {
+        Some(y) => (vec![y], None),
+        None => query_years(days, None, DOMAIN_DEVICES),
     };
     let start_dk = cutoff_day_key(days);
     let cond = if start_dk.is_some() {
@@ -1906,7 +1945,11 @@ pub fn device_totals(days: Option<i64>, year: Option<i32>) -> DeviceTotals {
     } else {
         ""
     };
-    gather_device_totals(&years, cond, start_dk.as_slice())
+    let mut out = gather_device_totals(&years, cond, start_dk.as_slice());
+    if let Some(g) = list_gap {
+        out.unreadable.push(g);
+    }
+    out
 }
 
 /// 设备登记表的行数口径：认得的设备**总数**（跨年按身份键去重）。
@@ -2147,7 +2190,11 @@ fn id_params(ids: &[i64]) -> Vec<&dyn rusqlite::ToSql> {
 fn device_date_series(identity: &str) -> (Vec<(i64, i64)>, Vec<String>) {
     let mut merged: HashMap<i64, i64> = HashMap::new();
     let mut gaps: Vec<String> = Vec::new();
-    for year in query_years(None, None) {
+    let (years, list_gap) = query_years(None, None, DOMAIN_DEVICES);
+    if let Some(g) = list_gap {
+        gaps.push(g);
+    }
+    for year in years {
         let path = paths::year_db_path(year);
         let gap_of = |why: String| format!("{year} 年库按天序列读不出来: {why}");
         let got = connection::with_ro_conn_why(&path, |conn| -> YearRead<Vec<(i64, i64)>> {
@@ -2238,11 +2285,17 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
     let all: i64 = series.iter().map(|(_, c)| *c).sum();
     let active_days = series.len() as i64;
 
-    // 周期内的排名/占比/类型：复用「设备排行」同一套口径（含别名与同名去重）
+    // 周期内的排名/占比/类型：复用「设备排行」同一套口径（含别名与同名去重）。
+    // 走带缺口的读数：二元组包装会把"这一年 device_counts 没读出来"丢掉，于是排行、
+    // 占比分母与台数一起变成静默的下界，而详情页那句「这一轮没读全」并不响。
     let (period_total, stats) = if period == -1 {
-        get_device_stats_by_date(today_date)
+        let totals = device_totals_on(today_date);
+        gaps.extend(totals.unreadable);
+        (totals.total, totals.devices)
     } else {
-        get_device_stats((period > 0).then_some(period), None)
+        let totals = device_totals((period > 0).then_some(period), None);
+        gaps.extend(totals.unreadable);
+        (totals.total, totals.devices)
     };
     let idx = stats.iter().position(|s| s.key == device_key);
 
@@ -2350,7 +2403,11 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
 /// `get_device_detail` 已有的那份 `unreadable`，详情页那句"这一轮没读全"跟着念出来。
 fn registered_kind(identity: &str) -> (Option<String>, Vec<String>) {
     let mut gaps: Vec<String> = Vec::new();
-    for year in query_years(None, None) {
+    let (years, list_gap) = query_years(None, None, DOMAIN_DEVICES);
+    if let Some(g) = list_gap {
+        gaps.push(g);
+    }
+    for year in years {
         let path = paths::year_db_path(year);
         let got = connection::with_ro_conn_why(&path, |conn| -> YearRead<String> {
             match connection::table_presence_cached(conn, "devices") {
@@ -3201,6 +3258,74 @@ mod tests {
         assert_eq!(clamp_query_days(30), 30);
         assert_eq!(clamp_query_days(i64::MAX), MAX_QUERY_DAYS);
         assert_eq!(clamp_query_days(i64::MIN), 1);
+    }
+
+    /// 窗口的年份跨度必须是「含今天共 N 天」：起点减 N-1。
+    ///
+    /// 旧写法减 N：1 月 1 日的「今日」会把上一年也拉进清单去问，那一年的读失败就被记到
+    /// 一个根本不含它任何一天的窗口头上（面板报"没读全"，CLI 直接退 1）。
+    #[test]
+    fn a_window_span_never_reaches_a_year_it_does_not_contain() {
+        let d = |y, m, day| chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        assert_eq!(years_span(d(2027, 1, 1), 1), vec![2027]);
+        assert_eq!(years_span(d(2027, 1, 7), 7), vec![2027]);
+        assert_eq!(years_span(d(2027, 1, 8), 7), vec![2027]);
+        // 窗口真的跨年时，上一年必须在清单里（别把跨年那两天漏掉）
+        assert_eq!(years_span(d(2027, 1, 1), 2), vec![2026, 2027]);
+        assert_eq!(years_span(d(2027, 1, 7), 8), vec![2026, 2027]);
+        // 越界天数先收敛，不许 panic
+        assert_eq!(years_span(d(2027, 5, 1), 0), vec![2027]);
+        assert_eq!(
+            years_span(d(2027, 5, 1), i64::MAX),
+            years_span(d(2027, 5, 1), MAX_QUERY_DAYS)
+        );
+    }
+
+    /// 「总计」那一档的年度清单读不出来时，不许把整段历史念成 0 且什么都不说。
+    #[test]
+    fn the_alltime_year_list_failure_is_a_gap_not_an_empty_answer() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let app = crate::paths::test_app_dir("queries_years_unlistable");
+        // 把数据目录换成同名文件：read_dir 必然失败（与"没有年度库"是两件事）
+        let data = app.path().join("data");
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::write(&data, b"not a dir").unwrap();
+        invalidate_years_cache();
+        let r = stats_totals(None, None);
+        assert_eq!(r.total, 0);
+        assert!(
+            r.unreadable.iter().any(|g| g.contains("年度库列不出来")),
+            "清单没列出来必须说出来，实得 {:?}",
+            r.unreadable
+        );
+    }
+
+    /// 设备详情页的排行/分母读不全时，详情页那份 `unreadable` 必须响。
+    #[test]
+    fn the_device_detail_rank_read_keeps_the_unreadable_gaps() {
+        let src = include_str!("queries.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn get_device_detail(")
+            .expect("get_device_detail 找不到了");
+        let end = prod[at..]
+            .find("\n}\n")
+            .map(|n| n + at + 3)
+            .unwrap_or(prod.len());
+        let code = &prod[at..end];
+        assert!(
+            !code.contains("get_device_stats("),
+            "详情页又走了丢缺口的二元组包装"
+        );
+        assert!(
+            !code.contains("get_device_stats_by_date("),
+            "详情页又走了丢缺口的二元组包装"
+        );
+        assert_eq!(
+            code.matches("gaps.extend(totals.unreadable)").count(),
+            2,
+            "两条周期分支都要把缺读并进详情页那份账"
+        );
     }
 
     /// 回归：非法周期值不得 panic（`panic = "abort"` 下会直接终止进程，
@@ -5091,11 +5216,14 @@ mod tests {
         invalidate_years_cache();
         connection::clear_ro_cache();
         let detail = get_device_detail(key, 0);
+        // 过滤认**整段前缀**「2027 年库」：只比年份数字会被临时目录名里的纳秒串撞上
+        // （实测 `…_179511220287…` 里就含着 "2028"），于是断到别人的那一句上去。
+        let broken_prefix = format!("{broken} 年库");
         assert!(
             detail
                 .unreadable
                 .iter()
-                .any(|g| g.contains("按天序列") && g.contains(&broken.to_string())),
+                .any(|g| g.starts_with(&broken_prefix) && g.contains("按天序列")),
             "按天序列那一年读不出来必须点名，实得 {:?}",
             detail.unreadable
         );
@@ -5161,15 +5289,16 @@ mod tests {
         invalidate_years_cache();
         connection::clear_ro_cache();
         let half = get_device_detail(key, 0);
+        let tail_prefix = format!("{tail} 年库");
         let named: Vec<&String> = half
             .unreadable
             .iter()
-            .filter(|g| g.contains(&tail.to_string()))
+            .filter(|g| g.starts_with(&tail_prefix))
             .collect();
         assert!(
             !named.is_empty(),
-            "{tail} 这一年读不出来必须点名（现量：这一趟只剩按天序列一问会撞坏页——\
-             键名明细那两问随 `keys` 一起撤了），实得 {:?}",
+            "{tail} 这一年读不出来必须点名（按天序列与设备榜这两问都会撞上坏页），\
+             实得 {:?}",
             half.unreadable
         );
         for g in &named {
