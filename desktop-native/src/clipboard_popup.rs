@@ -17,8 +17,8 @@ use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    FrameRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, SelectObject, SetBkColor,
-    SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    FrameRect, GetDC, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, ReleaseDC, SelectObject,
+    SetBkColor, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
     DEFAULT_PITCH, DRAW_TEXT_FORMAT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
     DT_VCENTER, FONT_WEIGHT, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, TRANSPARENT,
@@ -54,8 +54,9 @@ use focusflow_core::clipboard::{self, ClipItem, ClipKind, ClipStats, Snippet, Tr
 use crate::clip_list::{self, ReloadIntent, Viewport};
 
 const EDIT_ID: usize = 1;
-/// `EM_SETCUEBANNER`：EDIT 空的时候显示提示字。
-const EM_SETCUEBANNER: u32 = 0x1501;
+/// 搜索框为空时我们自己画的提示。不用 `EM_SETCUEBANNER`：它要 comctl32 v6 的
+/// 激活上下文，这个 exe 没带那份 manifest（主窗那条已实测发完什么都不画）。
+const SEARCH_HINT: &str = "搜索：空格分词，可加 img:/file:/app:";
 const EN_CHANGE: u16 = 0x0300;
 
 const MENU_COPY: u32 = 1;
@@ -841,15 +842,6 @@ fn create_and_show() -> Result<(), String> {
             Some(WPARAM(font.0 as usize)),
             Some(LPARAM(1)),
         );
-        let cue: Vec<u16> = "搜索：空格分词，可加 img:/file:/app:\0"
-            .encode_utf16()
-            .collect();
-        SendMessageW(
-            edit,
-            EM_SETCUEBANNER,
-            Some(WPARAM(1)),
-            Some(LPARAM(cue.as_ptr() as isize)),
-        );
         let _ = SetWindowSubclass(edit, Some(edit_proc), 1, 0);
     }
     PALETTE_HWND.store(hwnd.0 as isize, Ordering::Release);
@@ -1515,6 +1507,39 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
     }
 }
 
+/// 空搜索框里那句提示由我们自己画：`EM_SETCUEBANNER` 在本进程不生效
+///（没有 comctl32 v6 的激活上下文，主窗那条已实测）。只由这个子窗在 WM_PAINT
+/// 里写，不会出现"父子两块表面抢同一批像素"的闪烁。
+unsafe fn draw_search_hint(hwnd: HWND) {
+    if GetWindowTextLengthW(hwnd).max(0) > 0 {
+        return;
+    }
+    let parent = GetParent(hwnd).unwrap_or_default();
+    let Some((font, color)) = with_state(parent, |st| (st.font_small, st.pal.muted)) else {
+        return;
+    };
+    let hdc = GetDC(Some(hwnd));
+    if hdc.0.is_null() {
+        return;
+    }
+    let old = SelectObject(hdc, HGDIOBJ(font.0));
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, color);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    // 左边留 4px 给光标：空框有焦点时提示与光标同时在场，不互相压住。
+    rc.left += 4;
+    let mut text: Vec<u16> = SEARCH_HINT.encode_utf16().collect();
+    DrawTextW(
+        hdc,
+        &mut text,
+        &mut rc,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+    );
+    SelectObject(hdc, old);
+    ReleaseDC(Some(hwnd), hdc);
+}
+
 unsafe extern "system" fn edit_proc(
     hwnd: HWND,
     msg: u32,
@@ -1523,6 +1548,11 @@ unsafe extern "system" fn edit_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    if msg == WM_PAINT {
+        let result = DefSubclassProc(hwnd, msg, w, l);
+        draw_search_hint(hwnd);
+        return result;
+    }
     if msg == WM_SYSKEYDOWN {
         let parent = GetParent(hwnd).unwrap_or_default();
         if handle_sys_key(parent, w.0 as u32) {
@@ -2675,6 +2705,26 @@ mod tests {
         );
         assert!(needs_confirm(Mode::Snippets, false), "收藏要问一句");
         assert!(needs_confirm(Mode::Snippets, true));
+    }
+
+    /// `EM_SETCUEBANNER` 在这个 exe 里什么都不画（没有 comctl32 v6 的激活上下文），
+    /// 提示只能由搜索框子窗自己补；别再退回那条死路。
+    #[test]
+    fn the_search_hint_is_drawn_ourselves_since_the_cue_banner_is_dead() {
+        let src = include_str!("clipboard_popup.rs");
+        let prod = &src[..src.find("\nmod tests {").expect("测试模块的起点找不到了")];
+        assert!(
+            !prod.contains("EM_SETCUEBANNER,"),
+            "这个 exe 没有 comctl32 v6，cue banner 不会画任何字"
+        );
+        assert!(
+            prod.contains("draw_search_hint(hwnd)"),
+            "空搜索框的提示没人画，等于框里什么都没有"
+        );
+        assert!(
+            SEARCH_HINT.contains("img:") && SEARCH_HINT.contains("app:"),
+            "提示要写清可用的前缀：{SEARCH_HINT}"
+        );
     }
 
     #[test]
