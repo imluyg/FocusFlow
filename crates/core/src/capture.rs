@@ -912,13 +912,19 @@ pub mod win {
                         write_formats(&payload, png_fmt.zip(Some(png)), file_bytes.as_deref())
                     };
                     // 这一笔是程序自己写的（截图复制），剪贴板历史不该把它当成用户复制。
+                    // 但只有**真动过剪贴板**（写成功或已清空后失败）才记：备料/清空失败时
+                    // 板子还是别人的内容，记下当时的序号会把人家刚复制的那一笔吞掉。
                     // 序号必须在锁内、Close 之前记：顺序反了监听线程会抢在记录之前入库。
-                    crate::clipboard::note_self_sequence(unsafe { GetClipboardSequenceNumber() });
+                    if image_write_is_ours(&result) {
+                        crate::clipboard::note_self_sequence(unsafe {
+                            GetClipboardSequenceNumber()
+                        });
+                    }
                     // 无论成败都要关：不关的话其它程序从此读不到剪贴板，症状比本次失败严重得多。
                     if let Err(e) = unsafe { CloseClipboard() } {
                         tracing::warn!("关闭剪贴板失败（本次结果仍按 {result:?} 上报）：{e}");
                     }
-                    return result;
+                    return result.map_err(|f| f.msg);
                 }
                 Err(e) => last = format!("{e}"),
             }
@@ -951,22 +957,44 @@ pub mod win {
         Ok(hg)
     }
 
+    /// 写剪贴板失败时"有没有动过用户原来的内容"。
+    ///
+    /// 自发序号只在动过剪贴板时才记：备料/清空失败时剪贴板仍是别人的内容，
+    /// 把当时的序号记成"自己写的"会让监听线程丢掉别的程序刚复制的那一笔。
+    #[derive(Debug)]
+    pub(super) struct FormatFailure {
+        pub(super) touched: bool,
+        pub(super) msg: String,
+    }
+
+    /// 这次写图该不该记自发序号。
+    pub(super) fn image_write_is_ours(outcome: &Result<Vec<&'static str>, FormatFailure>) -> bool {
+        match outcome {
+            Ok(_) => true,
+            Err(f) => f.touched,
+        }
+    }
+
     /// 已持有剪贴板时的写入段。调用方负责 `CloseClipboard`。
     unsafe fn write_formats(
         dib: &[u8],
         png: Option<(u32, &[u8])>,
         hdrop: Option<&[u8]>,
-    ) -> Result<Vec<&'static str>, String> {
+    ) -> Result<Vec<&'static str>, FormatFailure> {
         // 顺序刻意是「先把内存备料完成，最后才 EmptyClipboard」：备料任何一步失败都不该动用户
         // 已有的剪贴板内容。旧写法先 Empty 再备料，失败就留下一个**空剪贴板** —— 症状比"没复制上"
         // 更糟，是把他原本要粘的东西擦掉了。
-        let h_dib = prep_global(dib)?;
+        let untouched = |msg: String| FormatFailure {
+            touched: false,
+            msg,
+        };
+        let h_dib = prep_global(dib).map_err(untouched)?;
         let h_png = match png {
             Some((fmt, bytes)) => match prep_global(bytes) {
                 Ok(h) => Some((fmt, h)),
                 Err(e) => {
                     let _ = GlobalFree(Some(h_dib));
-                    return Err(e);
+                    return Err(untouched(e));
                 }
             },
             None => None,
@@ -980,7 +1008,7 @@ pub mod win {
                         let _ = GlobalFree(Some(hp));
                     }
                     let _ = GlobalFree(Some(h_dib));
-                    return Err(e);
+                    return Err(untouched(e));
                 }
             },
             None => None,
@@ -996,7 +1024,7 @@ pub mod win {
                 let _ = GlobalFree(Some(hf));
             }
             let _ = GlobalFree(Some(h_dib));
-            return Err(format!("清空剪贴板失败：{e}"));
+            return Err(untouched(format!("清空剪贴板失败：{e}")));
         }
         // 从这一行起用户原来的内容**已经没了**。所以后面失败的症状不是"没复制上"，
         // 而是"原内容被擦掉、新内容也没进去" —— 这个残口按第 63 轮的口径**接受**：
@@ -1013,7 +1041,10 @@ pub mod win {
             tracing::error!(
                 "剪贴板已清空却什么都没写进去（用户原来的内容没了，这次截图也没复制上）：{e}"
             );
-            return Err(format!("写入剪贴板失败：{e}"));
+            return Err(FormatFailure {
+                touched: true,
+                msg: format!("写入剪贴板失败：{e}"),
+            });
         }
         let mut written = vec!["CF_DIB"];
         // PNG 是加分项：它失败不该让整次截图算失败（CF_DIB 已经进了剪贴板）。
@@ -2142,6 +2173,24 @@ mod tests {
                 "文件不在了还交这一格式＝粘出一个不存在的文件"
             );
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// 写图失败但没碰剪贴板时，不许把当前序号记成"自己写的" —— 那会吞掉
+        /// 别的程序刚复制的那一笔（与 `write_text_inner` 的 touched 口径一致）。
+        #[test]
+        fn a_failed_image_copy_only_claims_the_sequence_if_it_touched_the_clipboard() {
+            assert!(win::image_write_is_ours(&Ok(vec!["CF_DIB"])));
+            assert!(
+                !win::image_write_is_ours(&Err(win::FormatFailure {
+                    touched: false,
+                    msg: "备料失败".to_string(),
+                })),
+                "没动过剪贴板的失败不能记成自己写的"
+            );
+            assert!(win::image_write_is_ours(&Err(win::FormatFailure {
+                touched: true,
+                msg: "已清空后写失败".to_string(),
+            })));
         }
 
         /// 成功路径真的落到剪贴板上：写一张 1x1 的 CF_DIB，再问"现在有没有 CF_DIB"。
