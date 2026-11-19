@@ -25,7 +25,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::UI::HiDpi::{
+    GetDpiForMonitor, GetDpiForSystem, GetDpiForWindow, MDT_EFFECTIVE_DPI,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
     KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
@@ -650,6 +652,15 @@ fn register_class() -> Result<(), String> {
 }
 
 /// 光标所在显示器的工作区里居中；尺寸按系统 DPI 缩放。
+/// 弹窗该按哪个 DPI 排：优先光标所在显示器的有效 DPI，取不到再退回系统 DPI；
+/// 两个都不可用时按 96 处理。纯函数，便于单测混合缩放的三种输入。
+fn pick_dpi(monitor_dpi: Option<u32>, system_dpi: u32) -> f32 {
+    match monitor_dpi.filter(|d| *d > 0).unwrap_or(system_dpi) {
+        0 => 96.0,
+        d => d as f32,
+    }
+}
+
 fn placement() -> (i32, i32, i32, i32, f32) {
     let mut pt = POINT::default();
     unsafe {
@@ -670,14 +681,15 @@ fn placement() -> (i32, i32, i32, i32, f32) {
             bottom: 800,
         }
     };
-    let dpi = {
-        let d = unsafe { GetDpiForSystem() } as f32;
-        if d <= 0.0 {
-            96.0
-        } else {
-            d
-        }
-    };
+    // 程序是 PerMonitorV2：光标在副屏时按那块屏的有效 DPI 取尺寸，不能读系统 DPI
+    // （它永远是主屏的）。混合缩放下读错会让弹窗整块偏小/偏大，字也跟着错档。
+    let system_dpi = unsafe { GetDpiForSystem() };
+    let mut mx = 0u32;
+    let mut my = 0u32;
+    let monitor_dpi = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut mx, &mut my) }
+        .ok()
+        .map(|_| mx);
+    let dpi = pick_dpi(monitor_dpi, system_dpi);
     let w = ((560.0 * dpi / 96.0).round() as i32).min(work.right - work.left);
     // 560 高在 96/120dpi 下都是 12 行（旧 440 只有 8 行）；工作区太矮时仍按工作区截断。
     let h = ((560.0 * dpi / 96.0).round() as i32).min(work.bottom - work.top);
@@ -725,7 +737,7 @@ pub fn show() {
 
 fn create_and_show() -> Result<(), String> {
     register_class()?;
-    let (x, y, w, h, dpi) = placement();
+    let (x, y, w, h, placed_dpi) = placement();
     let hinstance =
         unsafe { GetModuleHandleW(None) }.map_err(|e| format!("取模块句柄失败：{e}"))?;
     let hwnd = unsafe {
@@ -746,6 +758,13 @@ fn create_and_show() -> Result<(), String> {
     }
     .map_err(|e| format!("创建剪贴板弹窗失败：{e}"))?;
 
+    // 窗口真正落在哪块屏、那块屏的 DPI 是多少，以窗口自己的读数为准；取不到才用前置估算。
+    let actual_dpi = unsafe { GetDpiForWindow(hwnd) };
+    let dpi = if actual_dpi > 0 {
+        actual_dpi as f32
+    } else {
+        placed_dpi
+    };
     let lay = layout_for(w, h, dpi);
     let edit = unsafe {
         CreateWindowExW(
@@ -2612,6 +2631,17 @@ mod tests {
             2,
             "两张键盘入口要共用 popup_shortcut，否则焦点换个地方就不灵"
         );
+    }
+
+    #[test]
+    fn popup_dpi_follows_the_cursor_monitor() {
+        assert_eq!(
+            pick_dpi(Some(144), 96),
+            144.0,
+            "光标在 150% 副屏：按那块屏排，不读主屏 DPI"
+        );
+        assert_eq!(pick_dpi(None, 120), 120.0, "问不到那块屏：退回系统 DPI");
+        assert_eq!(pick_dpi(Some(0), 0), 96.0, "两个都不可用：按 96");
     }
 
     #[test]
