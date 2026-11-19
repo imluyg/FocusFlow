@@ -355,7 +355,16 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
         }
     };
     if !dst_there {
-        std::fs::copy(&src_path, &dst_path)?;
+        if let Err(e) = std::fs::copy(&src_path, &dst_path) {
+            // 复制可能已经写出了半份主库。留在原位的话，下一次导入会当"目标库已存在"
+            // 改走合并分支（读的正是缺尾巴的副本），而当前年度库还会被程序直接打开。
+            // 与下面 WAL 搬不动那一支同一处置：先清掉半份，再按清理结果说能不能直接重试。
+            let leftover = rollback_fresh_copy(&dst_path);
+            return Err(anyhow::anyhow!(
+                "{year} 年库整库复制失败（{e}）：本次导入未完成。{}",
+                retry_hint(&leftover)
+            ));
+        }
         // 复制 WAL/SHM（若有未 checkpoint 数据）。这一问原先用的是 `from.exists()`：源 `-wal`
         // 正被别的程序握着（同步盘在传、杀软首扫、移动盘休眠）时它也回 false ⇒ 那段尾巴被静默
         // 跳过，然后照常写 `imported_src_*` 标记、把整年报成"已导入" ⇒ 之后重导被大小+mtime 与
@@ -1600,6 +1609,39 @@ mod tests {
         let clean = retry_hint(&[]);
         assert!(clean.contains("可以直接重试"));
         assert!(!clean.contains("手动"));
+    }
+
+    /// 接线腿：整库复制那一步失败时也必须回滚半份副本。
+    ///
+    /// `std::fs::copy` 中途失败会把已写出的那半份留在目标路径上；下一次导入会把它
+    /// 当"目标库已存在"改走合并分支（读的正是缺尾巴的副本），当前年度还会被程序直接打开。
+    /// 这条判据钉的是调用形态：不许变回裸 `?`。
+    #[test]
+    fn a_failed_fresh_copy_is_rolled_back_not_left_behind() {
+        let src = include_str!("migration.rs").replace("\r\n", "\n");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn import_year_db(")
+            .expect("import_year_db 找不到了");
+        let end = prod[at..]
+            .find("\nfn ")
+            .map(|n| n + at)
+            .unwrap_or(prod.len());
+        let body = &prod[at..end];
+        // 摘掉注释行再判：解释"为什么必须回滚"的那几句本来就带着这些词。
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("std::fs::copy(&src_path, &dst_path)?;"),
+            "整库复制又变回裸 `?`：失败时半份主库会留在年度库路径上"
+        );
+        assert!(
+            code.contains("rollback_fresh_copy(&dst_path)"),
+            "整库复制失败必须走回滚（半份副本不许留在原位）"
+        );
     }
 
     /// **重试不得把那一年累加第二遍**：聚合是 `count = count + excluded` 且没有去重键，
