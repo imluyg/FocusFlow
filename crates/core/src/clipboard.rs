@@ -1356,16 +1356,41 @@ fn is_tracking_key(key: &str) -> bool {
         )
 }
 
-fn strip_tracking(text: &str) -> String {
-    let (before_frag, frag) = match text.find('#') {
-        Some(i) => (&text[..i], &text[i..]),
-        None => (text, ""),
-    };
-    let Some(q) = before_frag.find('?') else {
-        return text.to_string();
-    };
-    let base = &before_frag[..q];
-    let query = &before_frag[q + 1..];
+/// 文字里出现这些标点时，URL 到这儿就结束了：后面那半句不是查询参数。
+fn is_url_stop(c: char) -> bool {
+    matches!(
+        c,
+        ',' | ';'
+            | '"'
+            | '\''
+            | '<'
+            | '>'
+            | ')'
+            | '，'
+            | '。'
+            | '；'
+            | '：'
+            | '！'
+            | '？'
+            | '、'
+            | '）'
+            | '】'
+            | '》'
+            | '」'
+            | '』'
+            | '”'
+            | '’'
+    )
+}
+
+/// 只改一个词里的 URL：没带追踪参数就原样返回 `None`。
+fn strip_tracking_in_word(word: &str) -> Option<String> {
+    let q = word.find('?')?;
+    // '#' 在 '?' 前面是 fragment，不参与查询串切分。
+    let hash = word.find('#').filter(|h| *h > q).unwrap_or(word.len());
+    let base = &word[..q];
+    let query = &word[q + 1..hash];
+    let frag = &word[hash..];
     let pairs: Vec<&str> = query.split('&').collect();
     let kept: Vec<&str> = pairs
         .iter()
@@ -1376,12 +1401,66 @@ fn strip_tracking(text: &str) -> String {
         })
         .collect();
     if kept.len() == pairs.len() {
-        return text.to_string();
+        return None;
     }
-    if kept.is_empty() {
-        format!("{base}{frag}")
+    let mut out = String::with_capacity(word.len());
+    out.push_str(base);
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    out.push_str(frag);
+    Some(out)
+}
+
+fn strip_tracking(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    // 逐行、逐词处理：查询串只到空白或标点为止，URL 后面的字与后续行都不是
+    // 参数，不能被当成查询串一起扔掉。
+    for line in text.split_inclusive('\n') {
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+        let mut rebuilt = String::with_capacity(body.len());
+        let mut line_changed = false;
+        let mut idx = 0;
+        while idx < body.len() {
+            let ch = body[idx..].chars().next().expect("idx 落在字符边界上");
+            if ch.is_whitespace() || is_url_stop(ch) {
+                rebuilt.push(ch);
+                idx += ch.len_utf8();
+                continue;
+            }
+            let start = idx;
+            while idx < body.len() {
+                let c = body[idx..].chars().next().expect("idx 落在字符边界上");
+                if c.is_whitespace() || is_url_stop(c) {
+                    break;
+                }
+                idx += c.len_utf8();
+            }
+            match strip_tracking_in_word(&body[start..idx]) {
+                Some(word) => {
+                    rebuilt.push_str(&word);
+                    line_changed = true;
+                }
+                None => rebuilt.push_str(&body[start..idx]),
+            }
+        }
+        if line_changed {
+            changed = true;
+            out.push_str(&rebuilt);
+            out.push_str(newline);
+        } else {
+            out.push_str(line);
+        }
+    }
+    if changed {
+        out
     } else {
-        format!("{base}?{}{frag}", kept.join("&"))
+        text.to_string()
     }
 }
 
@@ -2998,6 +3077,34 @@ mod tests {
     }
 
     #[test]
+    fn strip_tracking_keeps_text_after_the_url_and_other_lines() {
+        // 查询串到空白为止：URL 后面的字不是参数，不能被吞掉。
+        let got = Transform::StripTracking
+            .apply(
+                "看这个 https://e.com/p?utm_source=x&a=1 挺好\n第二行 https://f.com/?fbclid=y 收到",
+            )
+            .unwrap();
+        assert_eq!(
+            got,
+            "看这个 https://e.com/p?a=1 挺好\n第二行 https://f.com/ 收到"
+        );
+        assert_eq!(
+            Transform::StripTracking
+                .apply("https://e.com/?utm_source=x#frag 后面")
+                .unwrap(),
+            "https://e.com/#frag 后面",
+            "fragment 与其后的字都要留下"
+        );
+        assert_eq!(
+            Transform::StripTracking
+                .apply("https://e.com/?utm_source=x 后面")
+                .unwrap(),
+            "https://e.com/ 后面",
+            "URL 后面的字不是查询参数"
+        );
+    }
+
+    #[test]
     fn pretty_json_reports_invalid_input() {
         let got = Transform::PrettyJson.apply("{\"a\":1}").unwrap();
         assert!(got.contains("\n  \"a\": 1"));
@@ -3016,6 +3123,15 @@ mod tests {
         let b = got.find("\"b\"").expect("b");
         assert!(z < a, "外层键顺序变了：{got}");
         assert!(y < b, "内层键顺序变了：{got}");
+    }
+
+    #[test]
+    fn pretty_json_keeps_integers_wider_than_u64() {
+        // Value 默认把装不下的整数转成 f64，美化后数字会被悄悄改掉。
+        let got = Transform::PrettyJson
+            .apply("{\"id\":123456789012345678901234567890}")
+            .unwrap();
+        assert!(got.contains("123456789012345678901234567890"), "{got}");
     }
 
     #[test]

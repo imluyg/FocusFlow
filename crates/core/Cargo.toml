@@ -22,7 +22,8 @@ tracing-appender.workspace = true
 chrono.workspace = true
 serde.workspace = true
 # preserve_order：JSON 美化只该动空白，不能把对象的键按字母重排。
-serde_json = { version = "1", features = ["preserve_order"] }
+# arbitrary_precision：超过 u64 的整数原样保留，不能被转成 f64 悄悄改值。
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 anyhow.workspace = true
 
 # SQLite（bundled 编译，无需系统库）
