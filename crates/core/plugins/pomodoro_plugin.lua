@@ -104,7 +104,8 @@ function on_action(id)
             hint = "已停止：这一段（" .. _fmt(seconds)
                 .. "）没能写进库（库被占用或打不开），没有算作完成"
         elseif kind == "work" then
-            hint = "已停止：这一段 " .. _fmt(seconds) .. " 按完成落库，会算进「今日完成」"
+            hint = "已停止：这一段 " .. _fmt(seconds)
+                .. " 按完成落库，计入开始那天的「今日完成」"
         else
             hint = "已停止：这段休息 " .. _fmt(seconds) .. " 落库了，但「今日完成」只数工作阶段"
         end
@@ -171,11 +172,11 @@ function _build_widgets()
                 { type = "button", id = "start_work", text = "开始工作" },
                 { type = "button", id = "start_break", text = "开始休息" },
                 { type = "button", id = "toggle_pause", text = "暂停/继续" },
-                { type = "button", id = "stop", text = "停止（记为完成）" },
+                { type = "button", id = "stop", text = "停止（结束本段）" },
                 { type = "button", id = "skip", text = "跳过（作废这一段）" },
             },
         },
-        { type = "label", text = "「停止」把已计到的时间落库并计入今日完成；「跳过」是作废这一段，既不落库也不计数。" },
+        { type = "label", text = "「停止」把已计到的时间落库：工作阶段按开始那天计入「今日完成」，休息阶段只落库不计数；「跳过」是作废这一段，既不落库也不计数。" },
     }
 
     -- 上一次动作的结果。面板打开时给一句引导语，之后每点一次按钮都被改写一次；

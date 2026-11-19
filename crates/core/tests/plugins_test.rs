@@ -1963,6 +1963,51 @@ mod tests {
         drop(tmp);
     }
 
+    /// 停止休息段：落库但**不计入**今日完成，面板那句提示要说对。
+    ///
+    /// 静态文案原先把「停止 → 计入今日完成」写死在按钮上（休息段也照着说），
+    /// 而 `today_summary` 只数 work 行 —— 同一个面板里那句承诺与下方的数字自相矛盾。
+    #[test]
+    fn stopping_a_break_records_it_without_claiming_a_pomodoro() {
+        use focusflow_core::pomodoro;
+
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("pomo_break_stop", "pomodoro_plugin.lua");
+        pomodoro::init_db().expect("番茄钟库应能建起来");
+        manager
+            .plugin_action(&name, "start_break")
+            .expect("开始休息");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        manager.plugin_action(&name, "stop").expect("停止休息");
+
+        let (rows, gap) = pomodoro::get_recent_sessions(10);
+        assert!(gap.is_empty(), "停止后这一问该读得出来: {gap}");
+        assert_eq!(rows.len(), 1, "休息这一段照旧要落库");
+        assert_eq!(rows[0].rtype, "break", "落库类型要写清是休息");
+        assert_eq!(
+            pomodoro::today_summary().0,
+            0,
+            "休息段落了库也不该被数成完成一个番茄"
+        );
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("只数工作阶段")),
+            "提示要说清休息不计入今日完成: {:?}",
+            labels_of(&manager, &name)
+        );
+        // 静态说明也不能再说成「停止一律计入今日完成」——那一句在休息段是假话。
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("休息阶段只落库不计数")),
+            "常驻说明要写清工作/休息两档的差别: {:?}",
+            labels_of(&manager, &name)
+        );
+        assert!(manager.unload_plugin(&name));
+        drop(tmp);
+    }
+
     /// A0.5 之一：番茄钟面板看得到、也改得动时长（以前 `work_min`/`brk_min`
     /// 取出即弃，宿主的 `pomodoro_set_durations` 零调用方）。
     #[test]
