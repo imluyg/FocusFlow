@@ -396,8 +396,12 @@ pub struct InputListener {
     paused: PauseFlag,
     /// 事件回调（番茄钟 / 护眼提醒）
     key_callbacks: Mutex<Vec<KeyCallback>>,
-    /// 监听线程是否存活
+    /// 要监听线程活着吗（`start()` 置真、`stop()` 置假）
     alive: Arc<Mutex<bool>>,
+    /// 监听线程**此刻真的在跑**吗。与 `alive` 分开：`stop()` 只把 `alive` 置假，
+    /// 线程可能还挂在 rdev 的消息循环里；这时再 `start()` 就是第二个钩子。
+    /// 只有线程确实退出了（`listen` 返回且 `alive` 已假），这个标志才会落回 false。
+    running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl InputListener {
@@ -416,6 +420,7 @@ impl InputListener {
             paused,
             key_callbacks: Mutex::new(Vec::new()),
             alive: Arc::new(Mutex::new(false)),
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         listener.cfg.reload(config);
         Arc::new(listener)
@@ -667,28 +672,33 @@ impl InputListener {
             return Ok(());
         }
         let this = Arc::clone(self);
+        let running = Arc::clone(&self.running);
         // 持锁跨 spawn：spawn 只是建线程不阻塞，锁到置位为止，
         // 防两个并发 start 都过了检查、双起线程。
         // 新线程首件事也是锁 alive —— 它会短暂等在这里，等我们置位后放行。
         thread::Builder::new()
             .name("input-listener".into())
-            .spawn(move || loop {
-                if !*this.alive.lock().unwrap_or_else(|e| e.into_inner()) {
-                    break;
+            .spawn(move || {
+                running.store(true, std::sync::atomic::Ordering::SeqCst);
+                loop {
+                    if !*this.alive.lock().unwrap_or_else(|e| e.into_inner()) {
+                        break;
+                    }
+                    let this2 = Arc::clone(&this);
+                    let db2 = Arc::clone(&db);
+                    let result = listen(move |event: Event| {
+                        this2.process_event(&db2, &event);
+                    });
+                    if !*this.alive.lock().unwrap_or_else(|e| e.into_inner()) {
+                        break;
+                    }
+                    match result {
+                        Ok(()) => tracing::warn!("键鼠监听意外结束，5 秒后自动重启"),
+                        Err(e) => tracing::error!("键鼠监听失败，5 秒后自动重启: {e:?}"),
+                    }
+                    thread::sleep(Duration::from_secs(5));
                 }
-                let this2 = Arc::clone(&this);
-                let db2 = Arc::clone(&db);
-                let result = listen(move |event: Event| {
-                    this2.process_event(&db2, &event);
-                });
-                if !*this.alive.lock().unwrap_or_else(|e| e.into_inner()) {
-                    break;
-                }
-                match result {
-                    Ok(()) => tracing::warn!("键鼠监听意外结束，5 秒后自动重启"),
-                    Err(e) => tracing::error!("键鼠监听失败，5 秒后自动重启: {e:?}"),
-                }
-                thread::sleep(Duration::from_secs(5));
+                running.store(false, std::sync::atomic::Ordering::SeqCst);
             })
             .map_err(|e| {
                 tracing::error!("启动输入监听线程失败: {e}");
@@ -704,6 +714,12 @@ impl InputListener {
     pub fn stop(&self) {
         *self.alive.lock().unwrap_or_else(|e| e.into_inner()) = false;
         tracing::info!("键鼠监听已停止");
+    }
+
+    /// 监听线程是否真的还在跑。`stop()` 之后它可能仍挂在 rdev 消息循环里，
+    /// 这时**不许**再 `start()`（第二个钩子会双记）；只有这里为 false 才该重开。
+    pub fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1306,6 +1322,28 @@ mod tests {
         assert_eq!(
             crate::format::classify_key(&normalize_key(rescue_rdev_gap_key(&Key::Unknown(92)))),
             "修饰键"
+        );
+    }
+
+    /// 线程存活标志必须两头都写：只在入口置真、不在出口置假，恢复那一路会永远
+    /// 以为线程还在；线程真退出后就再也不重开（界面却说已恢复）。
+    #[test]
+    fn the_running_flag_brackets_the_listener_thread() {
+        let src = include_str!("listener.rs");
+        let prod = &src[..src.find("\nmod tests {").expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("pub fn start(self: &Arc<Self>")
+            .expect("start 不见了");
+        let end = prod[at..]
+            .find("pub fn stop(&self)")
+            .map(|n| n + at)
+            .expect("stop 不见了");
+        let body = &prod[at..end];
+        assert!(body.contains("running.store(true"), "线程入口没标记在跑");
+        assert!(body.contains("running.store(false"), "线程出口没清标记");
+        assert!(
+            prod.contains("pub fn is_running(&self) -> bool"),
+            "没有对外的存活读数：调用方只能靠猜"
         );
     }
 

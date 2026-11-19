@@ -137,9 +137,20 @@ pub fn resume_listening() -> Result<(), String> {
     let Some(rt) = g.as_ref() else {
         return Err("采集从没起来过，这条不该走".to_string());
     };
+    // 停用时线程可能还挂在 rdev 消息循环里（stop 只置 alive），这时再 start 就是
+    // 第二个钩子、每次按键双记；只有线程确实退出过才重开。`start()` 自己按 alive
+    // 幂等，判据在这里是为了让"还活着"那一路绝不去碰它。
+    if !rt.listener.is_running() {
+        let why = "采集没起来";
+        rt.listener
+            .start(Arc::clone(&rt.db))
+            .map_err(|e| format!("{why}：{e}"))?;
+        crate::tracing_note("采集已恢复：监听线程上一轮已退出，本次重新起了一条");
+    } else {
+        crate::tracing_note("采集已恢复：键鼠与设备计数重新开跑（原监听线程仍在，不会双记）");
+    }
     rt.listener.set_paused(false);
     rt.listening.store(true, Ordering::SeqCst);
-    crate::tracing_note("采集已恢复：键鼠与设备计数重新开跑（没有重开监听线程，所以不会双记）");
     Ok(())
 }
 
@@ -436,11 +447,12 @@ mod tests {
         assert_eq!(collector_toggle_action(true, false), CollectorAction::Stop);
     }
 
-    /// 接线守卫：「再打开」那一条**绝不再起一个监听线程** —— rdev 的钩子没有 Unhook 的口子，
-    /// 老线程还挂在消息泵里，再 start 就是第二个钩子，而 `alive` 与 `PauseFlag` 是共享的 ⇒
-    /// 每次按键被记两遍。回来走的门只有暂停那一枚。
+    /// 接线守卫：「再打开」那一条**绝不在老线程还活着时再起一个** —— rdev 的钩子没有
+    /// Unhook 的口子，老线程还挂在消息泵里，再 start 就是第二个钩子，每次按键双记。
+    /// 反过来，线程确实退出过（`is_running()` 为假）时必须重开，否则"恢复"只翻了
+    /// 暂停位、界面说已恢复而键鼠一条都不记。
     #[test]
-    fn resuming_never_starts_a_second_listener() {
+    fn resuming_only_starts_a_listener_when_the_old_thread_is_gone() {
         let src = include_str!("collect.rs");
         // 先摘注释行再比：本文件的文档里就写着「不走 `listener.start()`」这类反例，
         // 不摘干净的话守卫会被自己的说明文字命中（这仓里为这一条栽过两次）。
@@ -469,8 +481,12 @@ mod tests {
         };
         let body = seg(at);
         assert!(
-            !body.contains("listener.start("),
-            "恢复那条路又去起监听线程了：那是第二个钩子，会双记"
+            !body.contains("listener.start(") || body.contains("!rt.listener.is_running()"),
+            "恢复那条路无条件起监听线程了：老线程还活着就是第二个钩子，会双记"
+        );
+        assert!(
+            body.contains("rt.listener.is_running()"),
+            "恢复那条路没问监听线程是否还活着：线程退出过时只解暂停＝永远不再计数"
         );
         assert!(
             body.contains("rt.listener.set_paused(false)"),
