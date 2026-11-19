@@ -178,7 +178,27 @@ pub struct Uninstalled {
 }
 
 /// 安装一份 `.zip` 插件包。
+///
+/// 旧目录回滚模式（`[plugins] legacy_layout = true`）下**拒绝**：那一档只扫
+/// `app_dir/plugins/`，而安装写的是 `data/plugins/`，发现/卸载/安装记录也都绑在后者上
+/// —— 装进去的包永远不会出现在插件页，回执却说"已安装…重启后加载"。
 pub fn install(package_path: &Path) -> Result<Installed, String> {
+    let legacy = crate::config::instance().get_bool("plugins", "legacy_layout", false);
+    install_with(package_path, legacy)
+}
+
+/// [`install`] 的判定本体：回滚开关由调用方给，好让"拒绝"这一档能单测。
+pub fn install_with(package_path: &Path, legacy_layout: bool) -> Result<Installed, String> {
+    if legacy_layout {
+        return Err(format!(
+            "当前是旧目录回滚模式（[plugins] legacy_layout = true）：这一档只扫 {}，\
+             而安装写进 {} 的包不会被扫描 —— 装进去也永远不会出现在插件页。\
+             要装插件请先关掉回滚开关，或把插件文件手动放到 {}",
+            paths::plugins_dir().display(),
+            paths::plugins_user_dir().display(),
+            paths::plugins_dir().display()
+        ));
+    }
     if !package::is_package_path(package_path) {
         return Err(format!(
             "{} 不是 .zip 插件包：请先用 focusflow-plugin pack 打一份",
@@ -407,6 +427,39 @@ mod tests {
             .expect("包里的脚本要装得起来");
         assert_eq!(name, "装进来的");
         assert!(pm.get_plugin(&name).is_some(), "装上之后实例表里要有它");
+    }
+
+    /// 回滚模式下安装必须被拒并说清原因，而不是写一份永远不会被扫到的包。
+    ///
+    /// `legacy_layout = true` 只扫 `app_dir/plugins/`，安装却写 `data/plugins/` ——
+    /// 不拦的话回执说"已安装…重启后加载"，而插件页永远少那一条，且没有任何后续提示。
+    #[test]
+    fn install_is_refused_while_the_legacy_layout_rollback_is_on() {
+        let _lock = guard();
+        let app = paths::test_app_dir("install_legacy_refused");
+        let src = app.path().join("incoming");
+        let zip = write_package(
+            &src,
+            "legacy_blocked",
+            "PLUGIN_NAME = \"回滚里装不了\"\nfunction get_view() return { widgets = {} } end\n",
+        );
+
+        let err = install_with(&zip, true).expect_err("回滚模式下安装必须被拒");
+        assert!(err.contains("legacy_layout"), "要点名那个开关: {err}");
+        assert!(
+            err.contains(&paths::plugins_dir().display().to_string()),
+            "要点名真正被扫的目录: {err}"
+        );
+        assert!(
+            !paths::plugins_user_dir()
+                .join("legacy_blocked.zip")
+                .exists(),
+            "被拒时不许在数据目录留下包，也不许留安装记录"
+        );
+
+        // 反向腿：同一份包在新布局下必须装得进去 —— 拒绝的是模式，不是这份包。
+        let report = install_with(&zip, false).expect("新布局下同一份包该装得进去");
+        assert!(report.path.is_file());
     }
 
     /// 安装记录要说清**从哪来**与**装进来的是哪一串字节**（P2 第 19 步的来源提示 + 校验和）。
