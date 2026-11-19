@@ -39,6 +39,43 @@ Click-ViewTab $h $VIEW_ANALYTICS
 for ($j = 0; $j -lt 4; $j++) { Click-ATab $h $j; Save-WindowShot $h (Join-Path $WorkDir "dark-atab$j.png") | Out-Null }
 Check 'dark screenshots written' ((Get-ChildItem $WorkDir -Filter 'dark-*.png').Count -ge 12) ''
 
+# The palette is a REUSED window: open it once here (dark), close it, and open it
+# again after the flip below. A palette that only reads the theme at creation
+# keeps painting the first theme forever.
+function Get-PaletteHandle([int]$ProcId) {
+    [FF]::ByClass([uint32]$ProcId, 'FocusFlowClipboardPalette')
+}
+function Get-CornerColor([IntPtr]$Pal, [string]$Path) {
+    $r = Get-Rect $Pal
+    Save-RectShot $r.X $r.Y $r.W $r.H $Path
+    $bmp = [System.Drawing.Bitmap]::FromFile($Path)
+    $c = $bmp.GetPixel(6, 6)
+    $bmp.Dispose()
+    $c
+}
+function Open-PaletteNow([int]$ProcId) {
+    [void][FF]::SetForegroundWindow($h)
+    Start-Sleep -Milliseconds 250
+    [FF]::PressChord([byte[]]@(0x12), [byte]0x56)
+    Start-Sleep -Milliseconds 900
+    Get-PaletteHandle $ProcId
+}
+function Close-Palette([IntPtr]$Pal) {
+    $edit = [FF]::ChildByClassHandle($Pal, 'Edit')
+    [void][FF]::PostMessage($edit, 0x0100, [IntPtr]0x1B, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 400
+}
+
+$palDark = Open-PaletteNow $p.Id
+Check 'the palette opens in the dark theme' ($palDark -ne [IntPtr]::Zero)
+if ($palDark -ne [IntPtr]::Zero) {
+    $cDark = Get-CornerColor $palDark (Join-Path $WorkDir 'palette-dark.png')
+    Check 'the dark palette paints a dark corner' `
+        ($cDark.R -lt 80 -and $cDark.G -lt 80 -and $cDark.B -lt 80) `
+        "rgb=$($cDark.R),$($cDark.G),$($cDark.B)"
+    Close-Palette $palDark
+}
+
 # --- flip to light from the settings row (regular category, row 3 = theme) ---------
 Click-ViewTab $h $VIEW_SETTINGS
 $before = Get-ThemeName $app
@@ -46,6 +83,17 @@ Click-BasicRow $h 3
 Start-Sleep -Milliseconds 700
 $after = Get-ThemeName $app
 Check 'theme flips through the settings row' (($before -match 'dark') -and ($after -match 'light')) "$before -> $after"
+
+# Same window, new theme: it must have been recoloured on this reopen.
+$palLight = Open-PaletteNow $p.Id
+Check 'the palette window is reused' (($palLight -ne [IntPtr]::Zero) -and ($palLight -eq $palDark)) "dark=$palDark light=$palLight"
+if ($palLight -ne [IntPtr]::Zero) {
+    $cLight = Get-CornerColor $palLight (Join-Path $WorkDir 'palette-light.png')
+    Check 'the reused palette follows the light theme' `
+        ($cLight.R -gt 180 -and $cLight.G -gt 180 -and $cLight.B -gt 180) `
+        "rgb=$($cLight.R),$($cLight.G),$($cLight.B) (dark was $($cDark.R),$($cDark.G),$($cDark.B))"
+    Close-Palette $palLight
+}
 
 # --- light walk ------------------------------------------------------------------
 for ($i = 0; $i -lt 8; $i++) { Click-ViewTab $h $i; Save-WindowShot $h (Join-Path $WorkDir "light-view$i.png") | Out-Null }

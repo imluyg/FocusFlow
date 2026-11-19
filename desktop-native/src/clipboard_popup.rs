@@ -903,6 +903,21 @@ fn apply_dpi(st: &mut State, dpi: f32) -> bool {
     true
 }
 
+/// 主题是主窗上的设置，而弹窗窗口是复用的：每次唤出都重取一次配色与 EDIT 底色，
+/// 否则在设置页切到浅色后再开弹窗，它画的还是第一次创建时那一档深色。
+fn apply_theme(st: &mut State) {
+    st.pal = Palette::for_theme(dark_theme());
+    let old = st.edit_bg;
+    st.edit_bg = unsafe { CreateSolidBrush(st.pal.card) };
+    unsafe {
+        if !old.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ(old.0));
+        }
+        // 换刷子之后让搜索框按新底色重画一次（WM_CTLCOLOREDIT 会读 st.edit_bg）。
+        let _ = InvalidateRect(Some(st.edit), None, true);
+    }
+}
+
 /// 按当前客户区与 DPI 把搜索框摆到新位置（WM_SIZE 与换档后共用）。
 fn place_edit(hwnd: HWND) {
     if let Some((edit, lay)) = with_state(hwnd, |st| {
@@ -934,6 +949,8 @@ fn reveal(hwnd: HWND) {
     unsafe {
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW);
     }
+    // 窗口已上屏：此时换配色与 EDIT 底色，再让搜索框按新底色重画。
+    let _ = with_state(hwnd, |st| apply_theme(st));
     let actual = unsafe { GetDpiForWindow(hwnd) };
     if actual > 0 {
         let swapped = with_state(hwnd, |st| apply_dpi(st, actual as f32)).unwrap_or(false);
