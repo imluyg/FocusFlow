@@ -219,6 +219,10 @@ pub struct ClipPage {
     pub items: Vec<Row>,
     pub snippets: Vec<Row>,
     pub stats: Option<ClipStats>,
+    /// 这两份清单这一轮是不是读失败了。读失败时列表也会是空的，但空状态
+    /// 不能说"还没有记录/收藏" —— 那等于把"没读出来"印成"没有"。
+    pub history_load_failed: bool,
+    pub snippets_load_failed: bool,
     /// 当前光标所在行（相对**过滤后**的列表）。
     pub sel: usize,
     pub scroll: usize,
@@ -252,6 +256,8 @@ impl ClipPage {
             items: Vec::new(),
             snippets: Vec::new(),
             stats: None,
+            history_load_failed: false,
+            snippets_load_failed: false,
             sel: 0,
             scroll: 0,
             multi: false,
@@ -328,10 +334,12 @@ impl ClipPage {
         match loaded {
             Ok(items) => {
                 self.items = items.into_iter().map(row_from_item).collect();
+                self.history_load_failed = false;
                 clear_load_error(&mut self.status, HISTORY_LOAD_ERROR);
             }
             Err(e) => {
                 self.items.clear();
+                self.history_load_failed = true;
                 self.status = Some(format!("{HISTORY_LOAD_ERROR}：{e}"));
             }
         }
@@ -350,10 +358,12 @@ impl ClipPage {
         self.reload_items();
         let mut snippets: Vec<Row> = match clipboard::snippets() {
             Ok(v) => {
+                self.snippets_load_failed = false;
                 clear_load_error(&mut self.status, SNIPPETS_LOAD_ERROR);
                 v.into_iter().map(row_from_snippet).collect()
             }
             Err(e) => {
+                self.snippets_load_failed = true;
                 if self.status.is_none() {
                     // core 的正文已经以「读收藏失败」开头，再拼一次会写成两层前缀。
                     self.status = Some(e);
@@ -376,6 +386,33 @@ impl ClipPage {
         let vp = clip_list::settle(&ids, prev_id, prev, was_at_top, visible, intent);
         self.sel = vp.sel;
         self.scroll = vp.scroll;
+    }
+
+    /// 当前这一屏的空列表是"没读出来"还是"真的没有"。
+    pub fn load_failed(&self) -> bool {
+        match self.mode {
+            Mode::History => self.history_load_failed,
+            Mode::Snippets => self.snippets_load_failed,
+            Mode::Stats => false,
+        }
+    }
+
+    /// 列表为空时那句文案：读失败、筛选无命中与"真的还没有"三件事不许混。
+    pub fn empty_state_text(mode: Mode, has_filter: bool, load_failed: bool) -> &'static str {
+        if load_failed {
+            return match mode {
+                Mode::History => "历史没读出来（原因见底栏）",
+                Mode::Snippets => "收藏没读出来（原因见底栏）",
+                Mode::Stats => "",
+            };
+        }
+        match mode {
+            Mode::History if has_filter => "没有匹配的记录",
+            Mode::History => "还没有记录：复制一段文字、图片或文件试试",
+            Mode::Snippets if has_filter => "没有匹配的收藏",
+            Mode::Snippets => "还没有收藏：在历史里点「存为收藏」",
+            Mode::Stats => "",
+        }
     }
 
     /// 盘上可能变了的时刻（进页、换模式）才丢失效缓存。`reload` 不丢：新复制进来时
@@ -1053,6 +1090,29 @@ mod tests {
         assert_eq!(format_remaining(59_000, 0).as_deref(), Some("59 秒"));
         assert_eq!(format_remaining(60_000, 0).as_deref(), Some("1:00"));
         assert_eq!(format_remaining(3_600_000, 0).as_deref(), Some("60:00"));
+    }
+
+    #[test]
+    fn a_failed_read_never_reads_as_an_empty_list() {
+        for mode in [Mode::History, Mode::Snippets] {
+            let msg = ClipPage::empty_state_text(mode, false, true);
+            assert!(
+                msg.contains("没读出来"),
+                "{mode:?} 读失败时还在说「还没有」：{msg}"
+            );
+        }
+        assert_eq!(
+            ClipPage::empty_state_text(Mode::History, false, false),
+            "还没有记录：复制一段文字、图片或文件试试"
+        );
+        assert_eq!(
+            ClipPage::empty_state_text(Mode::Snippets, false, false),
+            "还没有收藏：在历史里点「存为收藏」"
+        );
+        assert_eq!(
+            ClipPage::empty_state_text(Mode::History, true, false),
+            "没有匹配的记录"
+        );
     }
 
     #[test]

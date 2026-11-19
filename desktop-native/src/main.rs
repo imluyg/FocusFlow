@@ -11948,13 +11948,12 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
         _ => {
             let rows = clip.rows();
             if rows.is_empty() {
-                let msg = match clip.mode {
-                    Mode::History if !clip.filter.trim().is_empty() => "没有匹配的记录",
-                    Mode::History => "还没有记录：复制一段文字、图片或文件试试",
-                    Mode::Snippets if !clip.filter.trim().is_empty() => "没有匹配的收藏",
-                    Mode::Snippets => "还没有收藏：在历史里点「存为收藏」",
-                    Mode::Stats => "",
-                };
+                // 读失败与"真的没有"不许共用一句：前者说读不出来，后者才说还没有。
+                let msg = clipboard_page::ClipPage::empty_state_text(
+                    clip.mode,
+                    !clip.filter.trim().is_empty(),
+                    clip.load_failed(),
+                );
                 p.text(
                     msg,
                     clipboard_page::empty_text_rect(&lay, w),

@@ -182,6 +182,9 @@ struct State {
     history: Vec<Row>,
     snippets: Vec<Row>,
     stats: Option<ClipStats>,
+    /// 两份清单这一轮是不是读失败了：列表为空时必须说读不出来，不能说"还没有"。
+    history_load_failed: bool,
+    snippets_load_failed: bool,
     sel: usize,
     scroll: usize,
     status: Option<String>,
@@ -226,6 +229,15 @@ impl State {
         }
     }
 
+    /// 当前这一屏的空列表是不是"没读出来"。
+    fn load_failed(&self) -> bool {
+        match self.mode {
+            Mode::History => self.history_load_failed,
+            Mode::Snippets => self.snippets_load_failed,
+            Mode::Stats => false,
+        }
+    }
+
     fn selected(&self) -> Option<&Row> {
         self.rows().get(self.sel)
     }
@@ -254,10 +266,12 @@ impl State {
             Ok(mut rows) => {
                 inherit_missing(&old, &mut rows);
                 self.history = rows;
+                self.history_load_failed = false;
                 self.status = None;
             }
             Err(e) => {
                 self.history.clear();
+                self.history_load_failed = true;
                 self.status = Some(e);
             }
         }
@@ -284,9 +298,11 @@ impl State {
                 let mut rows: Vec<Row> = items.into_iter().map(row_from_snippet).collect();
                 inherit_missing(&old, &mut rows);
                 self.snippets = rows;
+                self.snippets_load_failed = false;
             }
             Err(e) => {
                 self.snippets.clear();
+                self.snippets_load_failed = true;
                 // core 返回的正文已经带「读收藏失败：」，这里只转发，别叠第二层。
                 self.status = Some(e);
             }
@@ -801,6 +817,8 @@ fn create_and_show() -> Result<(), String> {
         history: Vec::new(),
         snippets: Vec::new(),
         stats: None,
+        history_load_failed: false,
+        snippets_load_failed: false,
         sel: 0,
         scroll: 0,
         status: None,
@@ -2020,7 +2038,14 @@ unsafe fn draw_rows(hdc: HDC, st: &mut State, lay: Layout, w: i32, card: HBRUSH,
 
     let len = st.rows().len();
     if len == 0 {
-        let msg = if st.mode == Mode::History && !st.query.trim().is_empty() {
+        let msg = if st.load_failed() {
+            // 读失败时列表也是空的，但这句话不能说成"还没有"。
+            match st.mode {
+                Mode::History => "历史没读出来（原因见底栏）",
+                Mode::Snippets => "收藏没读出来（原因见底栏）",
+                Mode::Stats => "",
+            }
+        } else if st.mode == Mode::History && !st.query.trim().is_empty() {
             "没有匹配的记录"
         } else if st.mode == Mode::Snippets {
             "还没有收藏：在历史条目上右键「存为收藏」"
