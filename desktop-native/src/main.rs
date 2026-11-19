@@ -16117,6 +16117,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     // 底框，点下去没反应，占位文案留在原地跟每一拍重绘一起闪。
                     // 摆位不能挪到画图那条路上（在 WM_PAINT 里动窗位会重入）。
                     app.place_search_edit(hwnd);
+                    // 剪贴板页那个搜索框同一形状：不在剪贴板页时自己会早退。
+                    app.place_clip_search_edit(hwnd);
                 }
             }
             unsafe {
@@ -16163,6 +16165,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     // 不然用户拖着边框把窗口改宽，设置页那个搜索框的输入窗口还留在老位置，
                     // 底框与输入框分家之后的症状与「点搜索框没反应」是同一条。
                     app.place_search_edit(hwnd);
+                    app.place_clip_search_edit(hwnd);
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -22417,6 +22420,10 @@ mod clip_tests {
             assert!(
                 body.contains("app.place_search_edit(hwnd)"),
                 "{name} 这一拍没有重摆搜索框的输入窗口：拖大窗口或最大化之后点它没反应"
+            );
+            assert!(
+                body.contains("app.place_clip_search_edit(hwnd)"),
+                "{name} 这一拍没有重摆剪贴板页的搜索框：底框与输入窗口会分家"
             );
         }
         // 摆位一共六处：进设置页那一下、WM_SIZE、拖拽结束、点搜索框叫出输入层、
