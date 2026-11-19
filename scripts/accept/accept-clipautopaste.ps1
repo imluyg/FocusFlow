@@ -314,10 +314,19 @@ $otherText.Add_KeyDown({
     param($sender, $event)
     if ($event.KeyCode -eq [System.Windows.Forms.Keys]::V) { $script:pasteKeys.Add('other-target-V') }
 })
+# Hold Shift (not Alt) to keep the paste waiting: with Alt held, Windows opens the
+# target's window menu on click and deliberately does NOT change the foreground --
+# the "other window owns the foreground" premise would be false no matter what the
+# app does. Enter on the search edit is the normal copy path, and Shift makes the
+# restore wait on the modifier gate.
+$popupWait = [FF]::ByClassHandle($p.Id, 'FocusFlowClipboardPalette')
+$editWait = 0
+if ($popupWait -gt 0) { $editWait = [FF]::ChildByClassHandle($popupWait, 'Edit') }
 try {
-    [FF]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
-    [FF]::keybd_event(0x31, 0, 0, [UIntPtr]::Zero)
-    [FF]::keybd_event(0x31, 0, 2, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x10, 0, 0, [UIntPtr]::Zero)
+    if ($editWait -gt 0) {
+        [FF]::PostMessage([IntPtr]$editWait, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero) | Out-Null
+    }
     Pump 80
     $other.Show()
     $other.TopMost = $true
@@ -325,12 +334,12 @@ try {
     Pump 200
     Check 'another application target owns the foreground during the wait' ([FF]::GetForegroundWindow() -eq $other.Handle)
 } finally {
-    [FF]::keybd_event(0x31, 0, 2, [UIntPtr]::Zero)
-    [FF]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+    [FF]::keybd_event(0x10, 0, 2, [UIntPtr]::Zero)
 }
 Pump 500
 Check 'changing windows during the wait never pastes into either target' `
-    ($tb.Text.Length -eq 0 -and $otherText.Text.Length -eq 0 -and $script:pasteKeys.Count -eq 0)
+    ($tb.Text.Length -eq 0 -and $otherText.Text.Length -eq 0 -and $script:pasteKeys.Count -eq 0) `
+    "tb='$($tb.Text)' other='$($otherText.Text)' keys=$($script:pasteKeys -join ';')"
 $other.Close()
 Pump 200
 

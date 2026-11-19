@@ -29,9 +29,9 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, GetDpiForSystem, GetDpiForWindow, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
-    VK_ESCAPE, VK_F1, VK_HOME, VK_NEXT, VK_PRIOR, VK_RETURN, VK_TAB, VK_UP, VK_V,
+    GetAsyncKeyState, GetFocus, GetKeyState, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD,
+    KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN,
+    VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_NEXT, VK_PRIOR, VK_RETURN, VK_TAB, VK_UP, VK_V,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -1155,6 +1155,42 @@ fn restore_tick(hwnd: HWND) {
         job.stray_ticks,
         job.claim_left > 0,
     );
+    // 目标已经在前台，但用户的手还按着 Alt/Shift/Win：此刻注入 Ctrl+V，目标收到的是
+    // Ctrl+Alt+V / Ctrl+Shift+V —— 那不是"粘贴"。等用户松手再发；一直按住就按失败收场，
+    // 松手之后也不许补发（那时用户已经不知道粘贴从哪来）。
+    // 用**全局实时**按键状态，不用 `GetKeyState`：后者是"本线程消息队列里读到的状态"，
+    // 另一进程刚按下的修饰键在应用线程还没处理到那一条时会读成"没按"，门卫就被绕过去了
+    //（实测：按住 Shift 回车，Ctrl+V 仍被注入，目标收到 ctrl+shift+V）。
+    let modifiers_held = job.paste
+        && unsafe {
+            GetAsyncKeyState(0x12) < 0 // VK_MENU
+                || GetAsyncKeyState(0x10) < 0 // VK_SHIFT
+                || GetAsyncKeyState(0x5B) < 0
+                || GetAsyncKeyState(0x5C) < 0
+        };
+    if modifiers_held && action == RestoreAction::ForegroundReady {
+        if job.ticks_left == 0 {
+            finish_restore(
+                hwnd,
+                job,
+                Err(
+                    "修饰键一直按着（Alt/Shift/Win），没有自动粘贴；内容已在剪贴板，请松手后按 Ctrl+V"
+                        .to_string(),
+                ),
+            );
+        } else {
+            with_state(hwnd, |st| {
+                if let Some(j) = st.restore.as_mut() {
+                    j.ticks_left = j.ticks_left.saturating_sub(1);
+                    j.stray_ticks = 0;
+                    // 目标已经在前台：这次等人的过程中不必再"抢"一次。名额留着的话，
+                    // 用户按住修饰键时点去别的窗口，几拍之后反而会被硬拽回目标窗口。
+                    j.claim_left = 0;
+                }
+            });
+        }
+        return;
+    }
     match action {
         RestoreAction::TargetGone => {
             finish_restore(hwnd, job, Err("原窗口已经关闭".to_string()));
