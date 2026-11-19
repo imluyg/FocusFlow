@@ -3115,8 +3115,14 @@ impl App {
     }
 
     fn focus_clip_search(&mut self, hwnd: HWND) {
-        if self.view != V_CLIPBOARD || self.clip_page.mode == clipboard_page::Mode::Stats {
+        if self.view != V_CLIPBOARD {
             return;
+        }
+        if self.clip_page.mode == clipboard_page::Mode::Stats {
+            // Ctrl+F 是"任何页面都能按"的搜索键；统计页上没有搜索框，
+            // 直接返回就是按了没反应。先回历史页，再照常聚焦。
+            self.clip_page.set_mode(clipboard_page::Mode::History);
+            self.reload_clip_page(hwnd, clip_list::ReloadIntent::ResetTop);
         }
         let edit = self.ensure_clip_search_edit(hwnd);
         self.clip_search_focused = true;
@@ -22430,6 +22436,32 @@ mod clip_tests {
             prod.matches("place_search_edit(hwnd)").count(),
             6,
             "搜索框的摆位调用点数变了"
+        );
+    }
+
+    /// Ctrl+F 在剪贴板统计页上不许变成死键：先回历史页，再聚焦搜索框。
+    #[test]
+    fn ctrl_f_on_the_clipboard_stats_page_returns_to_history_first() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        let at = prod
+            .find("fn focus_clip_search")
+            .expect("focus_clip_search 不见了");
+        let end = prod[at..]
+            .find("\n    fn ")
+            .map(|n| n + at)
+            .expect("下一个函数不见了");
+        let body = &prod[at..end];
+        let mode = body
+            .find("set_mode(clipboard_page::Mode::History)")
+            .expect("统计页上按 Ctrl+F 没有先回历史页：这是死键");
+        let focus = body
+            .find("ensure_clip_search_edit")
+            .expect("聚焦搜索框那一步不见了");
+        assert!(
+            mode < focus,
+            "必须先回历史页再聚焦搜索框，否则搜索框被藏起来又抢焦点"
         );
     }
 
