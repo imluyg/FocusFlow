@@ -428,11 +428,30 @@ pub fn install_permission_guard(
 ///
 /// 类型检查放在 Lua 那一层是有意的：`every(5, "print")` 这种写法要被拒 in place，
 /// 并指着**那一个参数**说话；交给 Rust 只能报"第二参数读不出函数"。
-pub fn install_timer_api(lua: &Lua, host: &Table, owner: &str) -> mlua::Result<()> {
+///
+/// `allow_clipboard_events`：`on("clipboard")` 收到的载荷是每次复制的原文 —— 那是
+/// **读**那一侧的能力，必须与 `focusflow.clipboard` 同一道版本闸（见
+/// [`CLIPBOARD_MIN_PLUGIN_API`]）。`PLUGIN_API <= 1` 的存量插件走 `GateMode::Free`，
+/// 权限闸根本不装，光摘掉 `clipboard` 表挡不住这条订阅。
+pub fn install_timer_api(
+    lua: &Lua,
+    host: &Table,
+    owner: &str,
+    allow_clipboard_events: bool,
+) -> mlua::Result<()> {
     use crate::plugins::plugin_timers::{self, Kind};
     let board = plugin_timers::board_for(owner);
     let for_arm = Arc::clone(&board);
     let arm = lua.create_function(move |_lua, (kind, secs): (String, i64)| {
+        if kind == "clipboard" && !allow_clipboard_events {
+            return Ok((
+                0u64,
+                Some(format!(
+                    "剪贴板事件要 PLUGIN_API >= {CLIPBOARD_MIN_PLUGIN_API}（这一份声明的是更低的一版）：\
+                     收事件与主动读是同一格隐私能力，版本闸一起管"
+                )),
+            ));
+        }
         let kind = match kind.as_str() {
             "every" => Kind::Every,
             "after" => Kind::After,
@@ -441,12 +460,15 @@ pub fn install_timer_api(lua: &Lua, host: &Table, owner: &str) -> mlua::Result<(
             "app_change" => Kind::AppChange,
             "clipboard" => Kind::Clipboard,
             other => {
+                let known = if allow_clipboard_events {
+                    "every / after / tick / day_change / app_change / clipboard"
+                } else {
+                    "every / after / tick / day_change / app_change"
+                };
                 return Ok((
                     0u64,
-                    Some(format!(
-                        "认不得的定时器类型「{other}」：可写 every / after / tick / day_change / app_change / clipboard"
-                    )),
-                ))
+                    Some(format!("认不得的定时器类型「{other}」：可写 {known}")),
+                ));
             }
         };
         if secs < 0 {

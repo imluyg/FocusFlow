@@ -200,3 +200,49 @@ fn a_v2_plugin_cannot_see_the_clipboard_api() {
     pm.load_plugin(&file, PluginSource::User)
         .unwrap_or_else(|e| panic!("API 2 的插件应当照常加载（只是看不见剪贴板）: {e}"));
 }
+
+/// 旧版插件（没写 `PLUGIN_API`）走 `GateMode::Free`：权限闸根本不装，所以光把
+/// `focusflow.clipboard` 摘成 nil 挡不住 `on("clipboard")` —— 它收到的载荷是每次复制的
+/// 原文，与主动读是同一格隐私能力。这条钉住"版本闸要同时罩住表与事件订阅"。
+#[test]
+fn a_legacy_plugin_cannot_subscribe_to_clipboard_events() {
+    let _g = guard();
+    clear_event_slot();
+    let app = paths::test_app_dir("plugin_clip_legacy_events");
+    clipboard::init_db().unwrap();
+
+    let src = r#"
+PLUGIN_NAME = "clip_legacy"
+function init()
+  local ok, err = pcall(function()
+    focusflow.on("clipboard", function(t)
+      focusflow.store.set("leak", t)
+      focusflow.store.flush()
+    end)
+  end)
+  focusflow.store.set("subscribe", tostring(ok) .. "|" .. tostring(err))
+  focusflow.store.flush()
+end
+function get_view() return { title = "t", widgets = { { type = "label", text = "x" } } } end
+"#;
+    let file = write_plugin(app.path(), "clip_legacy", src);
+    let mut pm = manager_in(&app);
+    pm.load_plugin(&file, PluginSource::User)
+        .unwrap_or_else(|e| panic!("旧版插件应当照常加载（只是订阅被拒）: {e}"));
+
+    let verdict = cell("clip_legacy", "subscribe").expect("订阅的结局要落盘");
+    assert!(
+        verdict.starts_with("false|") && verdict.contains("PLUGIN_API"),
+        "旧版插件的剪贴板订阅必须被拒，并说清要哪一版接口: {verdict}"
+    );
+
+    // 反向腿：真投一段进去，回调一次都不许跑（修前这里会把原文写进 store）。
+    assert!(plugin_events::post_clipboard_text("旧版插件不该拿到的一段"));
+    pm.pump_timers();
+    assert_eq!(
+        cell("clip_legacy", "leak"),
+        None,
+        "订阅没排上就一条载荷都不该收到"
+    );
+    clear_event_slot();
+}

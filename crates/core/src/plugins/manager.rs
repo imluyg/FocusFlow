@@ -1639,7 +1639,13 @@ impl PluginManager {
         // 热重载换的是字节，不该顺手把"这一格慢过几次、上次为什么停用"清零。
         // 摘掉之后下一次 `board_for` 从盘上重开一格，读回来的正是刚写下去的那一份。
         plugin_health::forget(&stem);
-        host::install_timer_api(&lua, &api, &stem).map_err(|e| format!("定时器入口装不上: {e}"))?;
+        // 剪贴板事件与 `focusflow.clipboard` 同一道版本闸：v1/v2 的用户插件在 Free 档
+        // 根本没有权限闸，光把 `clipboard` 表摘成 nil 挡不住 `on("clipboard")` 这条订阅
+        // —— 它收到的载荷就是每次复制的原文，不比主动读弱。
+        let allow_clip_events =
+            source != PluginSource::User || meta.manifest.api >= host::CLIPBOARD_MIN_PLUGIN_API;
+        host::install_timer_api(&lua, &api, &stem, allow_clip_events)
+            .map_err(|e| format!("定时器入口装不上: {e}"))?;
         let declared = meta.manifest.permissions.clone();
         let unknown = permissions::unknown_permissions(&declared);
         if !unknown.is_empty() {
