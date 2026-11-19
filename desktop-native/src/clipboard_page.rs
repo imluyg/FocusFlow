@@ -401,8 +401,8 @@ impl ClipPage {
     pub fn empty_state_text(mode: Mode, has_filter: bool, load_failed: bool) -> &'static str {
         if load_failed {
             return match mode {
-                Mode::History => "历史没读出来（原因见底栏）",
-                Mode::Snippets => "收藏没读出来（原因见底栏）",
+                Mode::History => "历史这一轮没读出来（稍后重开这一页再试）",
+                Mode::Snippets => "收藏这一轮没读出来（稍后重开这一页再试）",
                 Mode::Stats => "",
             };
         }

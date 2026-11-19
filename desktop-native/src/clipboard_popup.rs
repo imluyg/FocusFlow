@@ -1757,6 +1757,8 @@ fn handle_key(hwnd: HWND, vk: u32) -> bool {
                 };
                 st.sel = 0;
                 st.scroll = 0;
+                // 与 Tab 同一口径：上一页那次操作的回执不是这一页的反馈。
+                st.status = None;
             });
             update_edit_visibility(hwnd);
             unsafe {
@@ -2071,8 +2073,8 @@ unsafe fn draw_rows(hdc: HDC, st: &mut State, lay: Layout, w: i32, card: HBRUSH,
         let msg = if st.load_failed() {
             // 读失败时列表也是空的，但这句话不能说成"还没有"。
             match st.mode {
-                Mode::History => "历史没读出来（原因见底栏）",
-                Mode::Snippets => "收藏没读出来（原因见底栏）",
+                Mode::History => "历史这一轮没读出来（稍后重开这一页再试）",
+                Mode::Snippets => "收藏这一轮没读出来（稍后重开这一页再试）",
                 Mode::Stats => "",
             }
         } else if st.mode == Mode::History && !st.query.trim().is_empty() {
