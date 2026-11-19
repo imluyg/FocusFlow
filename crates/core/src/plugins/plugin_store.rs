@@ -260,14 +260,27 @@ fn saver_tx() -> &'static mpsc::Sender<PathBuf> {
     })
 }
 
-/// 改完之后安排一次去抖落盘。
-fn schedule(path: &Path) {
-    if let Err(e) = saver_tx().send(path.to_path_buf()) {
-        // 线程收不到 ⇒ 这次改动只会停在内存里。留在 last_error 上，让 flush / 插件页问得出。
-        let why = format!("插件存储的保存线程收不到信号（{e}）：本次改动不会落盘，重启程序可恢复");
-        tracing::error!("{why}");
-        if let Ok(mut cell) = cell_for(path).lock() {
-            cell.last_error = Some(why);
+/// 改完之后安排一次去抖落盘；交回"这一次没安排上"的原因。
+///
+/// **这里不许回头锁 `cell_for(path)`**：调用方 `set` / `delete` / `clear` 正持着同一把
+/// `std::sync::Mutex`，线程再锁一次就是自死锁。保存线程起不来（spawn 失败 ⇒ 接收端当场
+/// 被丢）那一档原先正是这么写的：第一次 `store.set` 就把界面冻死，而那句"本进程的插件
+/// 数据不会自动落盘"永远说不出来。
+fn schedule(path: &Path) -> Option<String> {
+    schedule_via(saver_tx(), path)
+}
+
+/// [`schedule`] 的判定本体：发送端可注入，"收不到"那一档才能单测。
+fn schedule_via(tx: &mpsc::Sender<PathBuf>, path: &Path) -> Option<String> {
+    match tx.send(path.to_path_buf()) {
+        Ok(()) => None,
+        Err(e) => {
+            // 线程收不到 ⇒ 这次改动只会停在内存里。原因交给调用方留在 last_error 上，
+            // 让 flush / 插件页问得出。
+            let why =
+                format!("插件存储的保存线程收不到信号（{e}）：本次改动不会落盘，重启程序可恢复");
+            tracing::error!("{why}");
+            Some(why)
         }
     }
 }
@@ -356,7 +369,9 @@ pub fn set(stem: &str, key: &str, value: Value, limits: &Limits) -> Result<(), S
     guard.data = trial;
     ensure_state_dir(stem);
     guard.dirty = true;
-    schedule(&path);
+    if let Some(why) = schedule(&path) {
+        guard.last_error = Some(why);
+    }
     Ok(())
 }
 
@@ -370,7 +385,9 @@ pub fn delete(stem: &str, key: &str) -> Result<bool, String> {
     if removed {
         ensure_state_dir(stem);
         guard.dirty = true;
-        schedule(&path);
+        if let Some(why) = schedule(&path) {
+            guard.last_error = Some(why);
+        }
     }
     Ok(removed)
 }
@@ -399,7 +416,9 @@ pub fn clear(stem: &str) -> Result<usize, String> {
     if n > 0 {
         ensure_state_dir(stem);
         guard.dirty = true;
-        schedule(&path);
+        if let Some(why) = schedule(&path) {
+            guard.last_error = Some(why);
+        }
     }
     Ok(n)
 }
@@ -706,6 +725,50 @@ mod tests {
             "内存那一份还要能继续改（等下次 flush 再试）"
         );
         assert_eq!(get(stem, "k3").unwrap(), Some(Value::from(2)));
+    }
+
+    /// 保存线程收不到信号时，`schedule` 把原因交回调用方，**绝不回头锁那一格**：
+    /// `set` / `delete` / `clear` 正持着同一把 `std::sync::Mutex`，线程再锁一次就是自死锁。
+    /// 保存线程 spawn 失败那一档原先正是这么写的 —— 第一次 `store.set` 就把界面冻死，
+    /// 而"本进程的插件数据不会自动落盘"这句永远说不出来。
+    #[test]
+    fn a_dead_saver_channel_hands_the_reason_back() {
+        let (tx, rx) = mpsc::channel::<PathBuf>();
+        drop(rx);
+        let why = schedule_via(&tx, Path::new("state.json")).expect("接收端没了必须交回原因");
+        assert!(
+            why.contains("保存线程") && why.contains("不会落盘"),
+            "{why}"
+        );
+
+        // 活着的一支：交回 None，不产生任何"没安排上"。
+        let (alive, _rx) = mpsc::channel::<PathBuf>();
+        assert_eq!(schedule_via(&alive, Path::new("state.json")), None);
+
+        // 接线腿：`schedule` 本体里不许再出现 `cell_for(`（那正是重入锁的形状）。
+        // 先摘掉注释行：解释"为什么不能锁"的那句本身就带着这个词。
+        // 切生产代码要认**测试模块**那一个 `#[cfg(test)]`：文件上方还有一处给
+        // `forget_for_test` 的属性，按第一个切会把 `schedule` 一起切掉（本用例逮到过）。
+        let src = include_str!("plugin_store.rs").replace("\r\n", "\n");
+        let prod = &src[..src
+            .find("#[cfg(test)]\nmod tests")
+            .expect("测试模块的起点找不到了")];
+        let at = prod
+            .find("fn schedule(path: &Path)")
+            .expect("schedule 找不到了");
+        let end = prod[at..]
+            .find("\nfn ")
+            .map(|n| n + at)
+            .unwrap_or(prod.len());
+        let body: String = prod[at..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains("cell_for("),
+            "schedule 里又出现了重入锁（调用方正持着那一格）: {body}"
+        );
     }
 
     /// 连着写几次，盘上必须是**最后那一版**；后台那一轮自己也要能把改动落出去。
