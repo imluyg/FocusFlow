@@ -355,7 +355,8 @@ impl ClipPage {
             }
             Err(e) => {
                 if self.status.is_none() {
-                    self.status = Some(format!("{SNIPPETS_LOAD_ERROR}：{e}"));
+                    // core 的正文已经以「读收藏失败」开头，再拼一次会写成两层前缀。
+                    self.status = Some(e);
                 }
                 Vec::new()
             }

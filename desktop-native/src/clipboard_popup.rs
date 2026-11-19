@@ -285,7 +285,8 @@ impl State {
             }
             Err(e) => {
                 self.snippets.clear();
-                self.status = Some(format!("读收藏失败：{e}"));
+                // core 返回的正文已经带「读收藏失败：」，这里只转发，别叠第二层。
+                self.status = Some(e);
             }
         }
         if self.mode == Mode::Snippets {
