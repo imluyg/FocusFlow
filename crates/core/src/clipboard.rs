@@ -2055,15 +2055,25 @@ fn delete_rows_cleaning_files(conn: &rusqlite::Connection, ids: &[i64]) -> Resul
 /// 启动时扫一遍：库还没引用的图片/缩略图删掉（"文件写了、库没写成"那一路的残局）。
 fn sweep_orphan_images(conn: &rusqlite::Connection) {
     let mut referenced = std::collections::HashSet::new();
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT image_path FROM clipboard_items WHERE image_path<>''
-         UNION SELECT thumb_path FROM clipboard_items WHERE thumb_path<>''",
-    ) {
-        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
-            for p in rows.flatten() {
-                referenced.insert(p);
-            }
+    // 先证明引用清单**读全了**：读不出来不等于"一条引用都没有"。把它当成空集合，
+    // 下面就会把所有十分钟前的图片当作孤儿删掉 —— 库被占住/碰上坏页的那一次启动
+    // 会删掉仍被历史引用的截图。宁可不清理，也不误删。
+    let read = (|| -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare(
+            "SELECT image_path FROM clipboard_items WHERE image_path<>''
+             UNION SELECT thumb_path FROM clipboard_items WHERE thumb_path<>''",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for p in rows {
+            referenced.insert(p?);
         }
+        Ok(())
+    })();
+    if let Err(e) = read {
+        tracing::warn!(
+            "剪贴板图片引用清单读不出来，这一轮跳过孤儿图片清理（宁可不删也不误删）：{e}"
+        );
+        return;
     }
     for dir in [images_dir(), thumbs_dir()] {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -3576,6 +3586,36 @@ mod tests {
         delete(id).unwrap();
         assert!(!stored.png_path.exists(), "删行时原图应一起删掉");
         assert!(!thumb.exists(), "删行时缩略图应一起删掉");
+    }
+
+    #[test]
+    fn orphan_sweep_keeps_images_when_the_reference_list_cannot_be_read() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("clip_sweep_unreadable");
+        init_db().unwrap();
+
+        let dir = images_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("still-referenced.png");
+        std::fs::write(&path, b"png").unwrap();
+        // 十分钟内的文件本来就不会被清；把时间推到一小时前才能触发这条路径。
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        // 让引用清单一问就失败：读不出来 ≠ 没有引用。
+        let conn = open().unwrap();
+        conn.execute("DROP TABLE clipboard_items", []).unwrap();
+        sweep_orphan_images(&conn);
+
+        assert!(
+            path.exists(),
+            "引用表读不出来时，不许把仍可能被引用的图片当孤儿删掉"
+        );
     }
 
     #[test]
