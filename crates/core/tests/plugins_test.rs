@@ -1395,6 +1395,38 @@ mod tests {
         drop(tmp);
     }
 
+    /// 关闭面板的收尾现在由宿主入口发：`notify_panel_closed` 要真的把那个约定动作
+    /// 交给插件，而不是只记一笔（`always` 档的 VM 还在，Lua 状态跨面板复用）。
+    ///
+    /// 上面那条用例是**手动**发 `__panel_closed`，生产侧发不发它证明不了 —— 这条走宿主。
+    #[test]
+    fn the_host_close_notice_reaches_the_plugin() {
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("host_close_notice", "scheduler_plugin.lua");
+        manager
+            .plugin_action(&name, "toggle_999999")
+            .expect("点不存在的任务不该报错");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .any(|t| t.contains("切换失败")),
+            "夹具前提：面板上要先有一句会残留的结果语"
+        );
+
+        manager.notify_panel_closed(&name);
+        // 重开面板那一拍才会重新出图：通知本身刻意不刷新（那一页已经不在屏上）。
+        manager.refresh_view(&name).expect("重新出图");
+        assert!(
+            labels_of(&manager, &name)
+                .iter()
+                .all(|t| !t.contains("切换失败")),
+            "宿主发过关闭通知之后，上一句结果语必须清零: {:?}",
+            labels_of(&manager, &name)
+        );
+        assert!(manager.unload_plugin(&name), "卸载要回收调度线程");
+        drop(tmp);
+    }
+
     /// A0.1 的补测（`ca9111c` 的行为断言）：改名/删除分类后，悬空的筛选条件必须被
     /// 校正回来，而且**列表要重新有数据**。
     ///

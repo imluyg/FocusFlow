@@ -16454,6 +16454,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 if let Some(was) = app.plugin_panel_was.clone() {
                     if Some(was.clone()) != now_open {
                         if let Some(pm) = app.pm.as_mut() {
+                            // 先给插件一次收尾机会再判卸载：Lua 状态跨面板复用，`always`
+                            // 档不卸 VM，不发这一下就会把上次的提示/草稿挂到重开之后。
+                            pm.notify_panel_closed(&was);
                             if pm.release_panel_of(&was) {
                                 tracing_note(&format!("面板关掉，卸掉只服务那一页的插件：{was}"));
                                 unsafe {
@@ -23909,6 +23912,20 @@ mod plugin_page_tests {
             1,
             "卸那一格只该有一个调用点：多个出口各写一遍，迟早有一处漏掉"
         );
+        // 同一拍还要给插件收尾：`always` 档不卸 VM，Lua 里的提示/草稿只在
+        // `__panel_closed` 这一下清。原先只有测试手动发它，生产侧从没发过。
+        assert_eq!(
+            prod.matches("pm.notify_panel_closed(&was)").count(),
+            1,
+            "关掉/切走面板时必须给插件一次收尾，否则上次的提示会挂到重开之后"
+        );
+        let notify = prod
+            .find("pm.notify_panel_closed(&was)")
+            .expect("上面刚断言过它在");
+        let release = prod
+            .find("pm.release_panel_of(&was)")
+            .expect("上面刚断言过它在");
+        assert!(notify < release, "先通知插件收尾，再决定卸不卸那一格");
         assert!(
             prod.contains("plugin_panel_was: None"),
             "上一拍开着哪一页没被记住 ⇒ 关掉与切换的那个转变认不出来"

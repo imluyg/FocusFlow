@@ -2767,6 +2767,37 @@ impl PluginManager {
         }
     }
 
+    /// 面板关闭/切走：给仍加载着的插件一次收尾机会（`__panel_closed` 约定动作）。
+    ///
+    /// 这不是卸载：`always` 档的内置模块不卸 VM，而它们把"上一次的提示、草稿、编辑态"
+    /// 存在 Lua 局部量里。之前只有测试手动发这个动作，生产侧从没发过 —— 关掉再打开面板，
+    /// 上一次那句「已停止：…按完成落库」会被当成刚发生的结果再显示一遍。
+    ///
+    /// 与 [`Self::plugin_action`] 的差别只有一处：**不刷新视图** —— 那一页已经不在屏上了，
+    /// 再跑一遍 `get_view()` 只是白读一次库。
+    pub fn notify_panel_closed(&mut self, name: &str) {
+        let cfg = self.config;
+        let Some(info) = self.plugins.get(name) else {
+            return;
+        };
+        let Some(lua) = info.lua.as_ref() else {
+            return;
+        };
+        match Self::take_hook(lua, "on_action") {
+            Ok(Some(on_action)) => {
+                Self::arm_instruction_budget(lua, cfg);
+                let started = std::time::Instant::now();
+                let outcome = on_action.call::<()>("__panel_closed");
+                self.note_hook_time(name, plugin_health::HookKind::Action, started.elapsed());
+                if let Err(e) = outcome {
+                    tracing::warn!("插件 {name} 的面板关闭收尾没跑成: {e}");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("插件 {name} 的 on_action 取不出来: {e}"),
+        }
+    }
+
     /// 向插件投递**一批**按键：`key` 是键名，`count` 是这一批里它的增量。
     ///
     /// 为什么按批而不是逐键：mlua 的 `Lua` 不是 Send，插件的 VM 只能由 GUI 线程碰（模块顶部
