@@ -861,14 +861,76 @@ fn create_and_show() -> Result<(), String> {
     Ok(())
 }
 
+/// 把弹窗的 DPI 与两把字体换到新档；返回是否真的换了。
+///
+/// 窗口是复用对象：跨屏后再打开只走 `reveal`，不重建窗口，所以这里必须跟着
+/// 光标所在显示器走，否则尺寸换了、字还在旧档。`WM_SIZE` 也读 `st.dpi`，
+/// 因此换档要发生在 `SetWindowPos` 之前。
+fn apply_dpi(st: &mut State, dpi: f32) -> bool {
+    if (st.dpi - dpi).abs() < 0.5 {
+        return false;
+    }
+    st.dpi = dpi;
+    let old_font = st.font;
+    let old_small = st.font_small;
+    st.font = create_font(15.0, dpi, FW_SEMIBOLD);
+    st.font_small = create_font(12.0, dpi, FW_NORMAL);
+    unsafe {
+        let _ = SendMessageW(
+            st.edit,
+            WM_SETFONT,
+            Some(WPARAM(st.font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+        // 先给还活着的控件换上新字体，再删旧句柄：顺序反了会画不出字。
+        if !old_font.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ(old_font.0));
+        }
+        if !old_small.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ(old_small.0));
+        }
+    }
+    true
+}
+
+/// 按当前客户区与 DPI 把搜索框摆到新位置（WM_SIZE 与换档后共用）。
+fn place_edit(hwnd: HWND) {
+    if let Some((edit, lay)) = with_state(hwnd, |st| {
+        let (cw, ch) = client_size(hwnd);
+        (st.edit, layout_for(cw, ch, st.dpi))
+    }) {
+        unsafe {
+            let _ = SetWindowPos(
+                edit,
+                None,
+                lay.search.left + 8,
+                lay.search.top + 5,
+                (lay.search.right - lay.search.left - 16).max(20),
+                (lay.search.bottom - lay.search.top - 10).max(16),
+                Default::default(),
+            );
+        }
+    }
+}
+
 fn reveal(hwnd: HWND) {
     // 上一次复制后的还焦点/粘贴任务不能让它在这次重开后突然发一发 Ctrl+V。
     cancel_restore(hwnd);
-    let (x, y, w, h, _) = placement();
+    let (x, y, w, h, dpi) = placement();
     // 先记焦点再显示：`SWP_SHOWWINDOW` 之后 `GetForegroundWindow` 可能已经是弹窗自己。
     let prev_fg = unsafe { GetForegroundWindow() };
+    // 复用的窗口可能是在另一块屏、另一档缩放下建的：先把 DPI 换到光标这块屏。
+    let _ = with_state(hwnd, |st| apply_dpi(st, dpi));
     unsafe {
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW);
+    }
+    let actual = unsafe { GetDpiForWindow(hwnd) };
+    if actual > 0 {
+        let swapped = with_state(hwnd, |st| apply_dpi(st, actual as f32)).unwrap_or(false);
+        if swapped {
+            // 尺寸已经换过、WM_SIZE 那一拍用的还是旧档：按新档再摆一次搜索框。
+            place_edit(hwnd);
+        }
     }
     if let Some(edit) = with_state(hwnd, |st| {
         st.mode = Mode::History;
@@ -1265,22 +1327,7 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_SIZE => {
-            if let Some((edit, lay)) = with_state(hwnd, |st| {
-                let (cw, ch) = client_size(hwnd);
-                (st.edit, layout_for(cw, ch, st.dpi))
-            }) {
-                unsafe {
-                    let _ = SetWindowPos(
-                        edit,
-                        None,
-                        lay.search.left + 8,
-                        lay.search.top + 5,
-                        (lay.search.right - lay.search.left - 16).max(20),
-                        (lay.search.bottom - lay.search.top - 10).max(16),
-                        Default::default(),
-                    );
-                }
-            }
+            place_edit(hwnd);
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -2630,6 +2677,21 @@ mod tests {
             prod.matches("popup_shortcut(ctrl, vk)").count(),
             2,
             "两张键盘入口要共用 popup_shortcut，否则焦点换个地方就不灵"
+        );
+    }
+
+    #[test]
+    fn reopening_the_popup_follows_the_cursor_monitor_dpi() {
+        // 窗口是复用对象：跨屏后再打开只走 `reveal`，必须在那里换 DPI 与字体。
+        let src = include_str!("clipboard_popup.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let start = prod.find("fn reveal(hwnd: HWND)").expect("reveal 找不到了");
+        let rest = &prod[start..];
+        let end = rest.find("\nfn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("placement()") && body.contains("apply_dpi"),
+            "reveal 要按光标所在显示器换 DPI，否则复用窗口跨屏后仍是旧档"
         );
     }
 
