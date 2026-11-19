@@ -950,7 +950,7 @@ fn reveal(hwnd: HWND) {
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW);
     }
     // 窗口已上屏：此时换配色与 EDIT 底色，再让搜索框按新底色重画。
-    let _ = with_state(hwnd, |st| apply_theme(st));
+    let _ = with_state(hwnd, apply_theme);
     let actual = unsafe { GetDpiForWindow(hwnd) };
     if actual > 0 {
         let swapped = with_state(hwnd, |st| apply_dpi(st, actual as f32)).unwrap_or(false);
