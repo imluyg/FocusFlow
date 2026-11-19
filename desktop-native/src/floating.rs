@@ -107,6 +107,9 @@ const DEFAULT_H: f64 = 48.0;
 #[derive(Clone, Copy, Default)]
 pub struct Live {
     pub today: i64,
+    /// 今日数那一读有没有读全：读不全时卡片念「读不出」，不许折成 `0`
+    /// （那与"今天真的没打字"长得一模一样）。
+    pub today_unreadable: bool,
     pub duration_sec: i64,
     /// 时长那一读有没有读全：读不全时卡片念「读不出」，不许折成 `0s`
     /// （那与"今天真的没有前台时长"长得一模一样）。
@@ -115,6 +118,7 @@ pub struct Live {
 
 static LIVE: Mutex<Live> = Mutex::new(Live {
     today: 0,
+    today_unreadable: false,
     duration_sec: 0,
     duration_unreadable: false,
 });
@@ -247,10 +251,14 @@ fn current_content() -> fr::PillContent {
     // 今日这一格直接问采集侧那个原子计数：`LIVE` 里那份是快照线程每 2 秒推过来的缓存，
     // 而卡片是他**当场盯着看**的东西 —— 走缓存等于在 2 秒之外再叠一层延迟。
     // 采集没起来时（`None`）退回那份缓存，与主界面同一个口径，不另起一把尺子。
-    let today = crate::collect::today_total().unwrap_or(live.today);
+    let (today, today_unreadable) = match crate::collect::today_total() {
+        Some(n) => (n, false),
+        None => (live.today, live.today_unreadable),
+    };
     fr::build_content(
         metric,
         today,
+        today_unreadable,
         live.duration_sec,
         live.duration_unreadable,
         crate::collect::is_listening(),
@@ -2442,10 +2450,16 @@ mod text_path_ab_tests {
         vec![
             (
                 "nums",
-                fr::build_content(m, 12345, 3 * 3600 + 30 * 60, false, true, false, 41),
+                fr::build_content(m, 12345, false, 3 * 3600 + 30 * 60, false, true, false, 41),
             ),
-            ("paused", fr::build_content(m, 7, 95, false, true, true, 0)),
-            ("dash", fr::build_content(m, 7, 95, false, false, false, 0)),
+            (
+                "paused",
+                fr::build_content(m, 7, false, 95, false, true, true, 0),
+            ),
+            (
+                "dash",
+                fr::build_content(m, 7, false, 95, false, false, false, 0),
+            ),
         ]
     }
 

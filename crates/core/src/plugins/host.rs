@@ -604,10 +604,12 @@ pub fn register_host_api(
     })?;
     host.set("stats", stats_fn)?;
 
-    // 今日计数
+    // 今日计数：交回 (数量, 读不出来的原因)。第二个值是空串 = 读全了 —— 与
+    // `stats` / `edge_saved_*` 那一族同形；老脚本只取第一个值照样能用。
     let db_today = Arc::clone(&database);
     let today_fn = lua.create_function(move |_, ()| {
-        Ok(db::get_today_count(db_today.writer().map(|w| w.as_ref())))
+        let (n, why) = db::get_today_count(db_today.writer().map(|w| w.as_ref()));
+        Ok((n, why.unwrap_or_default()))
     })?;
     host.set("today_count", today_fn)?;
 

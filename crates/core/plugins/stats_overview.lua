@@ -19,7 +19,7 @@ end
 
 function get_view()
     local total, keys, distinct, gap = focusflow.stats(-1)  -- 今日统计
-    local today = focusflow.today_count()
+    local today, today_why = focusflow.today_count()
 
     -- 构建排行行（宿主已按次数降序，这里只截前十）
     local rows = {}
@@ -30,9 +30,11 @@ function get_view()
         if i > 10 then break end
     end
 
+    -- 今日计数那一问读不出来时不许印 0：0 与"今天真没打字"在屏上长得一样。
+    local today_unreadable = today_why ~= nil and today_why ~= ""
     local widgets = {
         { type = "heading", text = "今日活跃" },
-        { type = "keyvalue", key = "总次数", value = tostring(today) },
+        { type = "keyvalue", key = "总次数", value = today_unreadable and "读不出来" or tostring(today) },
         { type = "keyvalue", key = "键鼠种类", value = tostring(distinct or #rows) },
         { type = "separator" },
         { type = "heading", text = "键鼠排行（Top 10）" },
@@ -44,6 +46,10 @@ function get_view()
         { type = "separator" },
         { type = "label", text = "数据来自 focusflow.stats API" },
     }
+
+    if today_unreadable then
+        widgets[#widgets + 1] = { type = "label", text = "今日计数没读出来：" .. today_why }
+    end
 
     -- 第四个返回值是"这次哪一年没答上来"。不接住它，移动盘没醒、`-wal` 被杀软握着
     -- 那一轮，这里念出来的今日数就长得像一份完整答案（宿主从前也只交回三个值）。

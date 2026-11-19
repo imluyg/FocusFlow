@@ -355,6 +355,9 @@ pub struct Snapshot {
     pub period: i64,
     /// 今日次数（不受周期影响）。
     pub today: i64,
+    /// 上面那个今日数有没有读全（当前年度库打不开 / 坏页）。
+    /// 悬浮窗那一格念「读不出」；面板把它并进 `gaps`，不让 0 冒充答案。
+    pub today_unreadable: bool,
     /// 今日前台应用总时长（秒）。悬浮窗的「时长」那一格用（`[gui] floating_metric`
     /// 取 `duration` / `both` 时），与读数卡片的「今日活跃」是同一份快照。
     pub today_app_seconds: i64,
@@ -575,16 +578,18 @@ pub fn rank_break(rows: &HashMap<String, i64>, total: i64) -> RankBreak {
 /// 调用方只许把它推给卡片；整份替掉面板那份快照就是把"没查"念成"是 0"，
 /// 那一族的反面（给了薄数据却念成全量）正是本仓一直在挡的形状。
 pub fn load_card_only() -> Snapshot {
-    let today = match crate::collect::today_total() {
-        Some(n) => n,
+    let (today, today_why) = match crate::collect::today_total() {
+        Some(n) => (n, None),
         None => queries::get_today_count(None),
     };
     let app = queries::app_stats_totals(Some(1), None);
     Snapshot {
         period: -1,
         today,
+        today_unreadable: today_why.is_some(),
         today_app_seconds: app.total,
         today_app_unreadable: !app.unreadable.is_empty(),
+        gaps: today_why.into_iter().collect(),
         ..Default::default()
     }
 }
@@ -693,8 +698,8 @@ pub fn load(period: i64) -> Snapshot {
 
     // 采集开着时，今日直接用写线程缓存：它含未落库与在途增量，落库前后都不跳
     // （用「库值 + pending」会在 flush 取走批次、尚未提交的那一瞬读到 0）。
-    let today = match crate::collect::today_total() {
-        Some(n) => n,
+    let (today, today_why) = match crate::collect::today_total() {
+        Some(n) => (n, None),
         None => queries::get_today_count(None),
     };
     // 今日前台时长：与上面应用排行同一个口径，只是窗口固定成 1 天（悬浮窗要的是"今天"）。
@@ -721,10 +726,15 @@ pub fn load(period: i64) -> Snapshot {
     gaps.extend(daily_read.unreadable);
     gaps.extend(hourly_read.unreadable);
     gaps.extend(all.unreadable);
+    // 今日那一格读不出来也进同一份账：面板按整串念"读数未全"，悬浮窗另有自己的那一格。
+    if let Some(g) = &today_why {
+        gaps.push(g.clone());
+    }
 
     Snapshot {
         period,
         today,
+        today_unreadable: today_why.is_some(),
         today_app_seconds,
         today_app_unreadable,
         period_total: stats.total + pending,
@@ -1411,6 +1421,10 @@ mod chart_window_tests {
         assert!(
             body.contains("today_app_unreadable: !app.unreadable.is_empty()"),
             "读没读全这一格没跟着那一问走：卡片会把读不动的时长念成 0s"
+        );
+        assert!(
+            body.contains("today_unreadable: today_why.is_some()"),
+            "今日数读没读全没跟着那一问走：卡片会把读不动的今日念成 0"
         );
     }
 }

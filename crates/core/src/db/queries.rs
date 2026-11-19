@@ -425,47 +425,45 @@ pub(crate) fn hour_of_ts(ts: i64) -> i64 {
     ((ts + local_utc_offset_seconds()).div_euclid(3600)).rem_euclid(24)
 }
 
-/// 查询今日按键数（聚合表）。
-fn query_today_count() -> i64 {
-    let dk = day_key_of_date(Local::now().date_naive());
-    query_day_total(paths::current_year(), dk).unwrap_or(0)
-}
-
-/// 查询某年某天的总计数。
-fn query_day_total(year: i32, day_key: i64) -> Option<i64> {
-    let path = paths::year_db_path(year);
-    connection::with_ro_conn(&path, |conn| {
-        if !table_exists(conn, "daily_counts") {
-            return None;
-        }
-        conn.query_row(
-            "SELECT COALESCE(SUM(count), 0) FROM daily_counts WHERE date_key = ?1",
-            [day_key],
-            |r| r.get::<_, i64>(0),
-        )
-        .ok()
-    })
-    .flatten()
-}
-
-fn table_exists(conn: &Connection, name: &str) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-        [name],
-        |_| Ok(()),
-    )
-    .is_ok()
-}
-
-/// 获取今日按键数（写入器缓存优先，未启动写入器时查库）。
+/// 今日按键数，并把**这一问没答上来的原因**一起交回（`None` = 读全了）。
 ///
-/// 走 `today_count_for_display`：跨过午夜、今天还没输入时缓存是昨天的，
-/// 这里必须按日期对一次（插件 `today_count` 随时可能先被问到）。
-pub fn get_today_count(writer: Option<&crate::db::DbWriter>) -> i64 {
+/// 原先是 `query_day_total(..).unwrap_or(0)`：打不开、坏页、表问不出来、查询失败
+/// 与"今天真的没有输入"共用同一个 0。这是面板与悬浮窗的头号数字，读失败必须说出口
+/// —— 与同文件其它读数同一口径（三态），不许把"读不出来"印成"今天没打字"。
+pub fn get_today_count(writer: Option<&crate::db::DbWriter>) -> (i64, Option<String>) {
     if let Some(w) = writer {
-        w.today_count_for_display() as i64
-    } else {
-        query_today_count()
+        // 写线程缓存含未落库增量，且读失败在它那一侧已经由落库路径负责说话
+        return (w.today_count_for_display() as i64, None);
+    }
+    query_today_count_checked()
+}
+
+/// 查当前年度库的今日总数；三态：读到了 / 没有这张表 / 读不出来。
+fn query_today_count_checked() -> (i64, Option<String>) {
+    let year = paths::current_year();
+    let dk = day_key_of_date(Local::now().date_naive());
+    let path = paths::year_db_path(year);
+    let got = connection::with_ro_conn_why(&path, |conn| -> YearRead<i64> {
+        match connection::table_presence_cached(conn, "daily_counts") {
+            // 没有这张表＝这个库还没有任何统计（首启 / 刚建库）：0 是答案，不是失败
+            connection::Presence::No => YearRead::NoTable,
+            connection::Presence::Unreadable(why) => YearRead::Unreadable(why),
+            connection::Presence::Yes => match conn.query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM daily_counts WHERE date_key = ?1",
+                [dk],
+                |r| r.get::<_, i64>(0),
+            ) {
+                Ok(v) => YearRead::Read(v),
+                Err(e) => YearRead::Unreadable(format!("查询失败: {e}")),
+            },
+        }
+    });
+    let shape = |why: String| format!("{year} 年库今日计数读不出来: {why}");
+    match got {
+        Ok(YearRead::Read(v)) => (v, None),
+        Ok(YearRead::NoTable) => (0, None),
+        Ok(YearRead::Unreadable(why)) => (0, Some(shape(why))),
+        Err(why) => (0, Some(shape(why))),
     }
 }
 
@@ -4255,6 +4253,48 @@ mod tests {
         assert_eq!(stats[0].name, "HID 鼠标 · 046D/C52B");
 
         crate::device_alias::invalidate_cache();
+    }
+
+    /// 今日计数读不出来时不许交一个裸 0：库坏了/打不开要带原因。
+    ///
+    /// 这是面板与悬浮窗的头号数字，0 与"今天真的没打字"在屏上长得一模一样。
+    #[test]
+    fn an_unreadable_today_count_is_a_gap_not_zero() {
+        use chrono::Datelike;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("today_count_gap");
+        let year = Local::now().year();
+        let dk = day_key_of_date(Local::now().date_naive());
+        {
+            let conn = connection::open_rw(&paths::year_db_path(year)).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_counts (date_key, count) VALUES (?1, 5)",
+                [dk],
+            )
+            .unwrap();
+            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        }
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+        let (n, why) = get_today_count(None);
+        assert_eq!(n, 5, "读得动时照旧给数");
+        assert!(why.is_none(), "读全了不该有原因: {why:?}");
+
+        // 把库换成一份不是 SQLite 的字节：打不开就必须带原因，0 不能冒充答案。
+        // 先放掉只读池里的句柄，否则 Windows 上 -wal 还握着，边车清不掉。
+        let path = paths::year_db_path(year);
+        connection::clear_ro_cache();
+        strip_db_sidecars(&path);
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+        connection::clear_ro_cache();
+        let (n, why) = get_today_count(None);
+        assert_eq!(n, 0);
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("今日计数读不出来")),
+            "打不开要说出是哪一年的今日计数: {why:?}"
+        );
     }
 
     /// 回归：`get_daily_counts(1)` 返回的是**昨天**。
