@@ -719,10 +719,10 @@ function get_view()
     -- "表格空着 + 第 3 / 3 页"，要等下一次 2 秒推送才自愈。
     -- 夹过之后重查一次（只在真的越界时发生，正常翻页一次查询就够）。
     local asked = page
-    local records, total = query_page()
+    local records, total, gap = query_page()
     local pages = clamp_page(total)
     if page ~= asked then
-        records, total = query_page()
+        records, total, gap = query_page()
         pages = clamp_page(total)
     end
 
@@ -858,20 +858,26 @@ function get_view()
     if list_msg ~= "" then
         add({ type = "label", text = list_msg })
     end
-    add({
-        type = "table",
-        headers = { "日期", "类型", "名称", "渠道", "金额", "分类", "子分类", "备注" },
-        rows = rows,
-        ids = ids,
-    })
-    add({
-        type = "pager",
-        page = page,
-        pages = pages,
-        total = total,
-        prev = "page_prev",
-        next = "page_next",
-    })
+    if gap ~= "" then
+        -- 读不完整时不许再摆一张空表 + 「共 0 条」：那两句合起来就是一句
+        -- 「你一条记录都没有」，而库里的记录一条都没少。
+        add({ type = "label", text = "收支记录没读全：" .. gap })
+    else
+        add({
+            type = "table",
+            headers = { "日期", "类型", "名称", "渠道", "金额", "分类", "子分类", "备注" },
+            rows = rows,
+            ids = ids,
+        })
+        add({
+            type = "pager",
+            page = page,
+            pages = pages,
+            total = total,
+            prev = "page_prev",
+            next = "page_next",
+        })
+    end
 
     -- 统计结果弹窗（月度汇总/盈亏/距今多久）
     add({

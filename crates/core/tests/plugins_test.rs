@@ -1104,6 +1104,39 @@ mod tests {
         );
     }
 
+    /// `accounting_query` 的第三个返回值要真的穿过 Lua 边界：读全了是空串。
+    ///
+    /// 少了这条接线，Rust 侧把 gap 交出来了、面板那一头却永远拿到 nil —— 读不出来
+    /// 仍会被画成「共 0 条」。读不出来的那一档由 `accounting::tests` 钉（构造打开失败）。
+    #[test]
+    fn host_accounting_query_carries_the_read_gap_across_lua() {
+        let _guard = guard();
+        let tmp = paths::test_app_dir("host_query_gap");
+        focusflow_core::accounting::init_db().expect("记账库应能建起来");
+        let config: &'static FocusFlowConfig = Box::leak(Box::new(
+            FocusFlowConfig::load(tmp.path().join("config.ini")).expect("临时配置应能载入"),
+        ));
+        let lua = mlua::Lua::new();
+        focusflow_core::plugins::host::register_host_api(
+            &lua,
+            config,
+            db::Database::init_readonly(),
+            "host_query_gap",
+        )
+        .expect("宿主 API 应能注册");
+
+        let (rows, total, gap): (i64, i64, String) = lua
+            .load(
+                "local t, total, gap = focusflow.accounting_query(1, 20, '', '', '', '', '') \
+                 return #t, total, gap or '<nil>'",
+            )
+            .eval()
+            .expect("accounting_query 该回三个值");
+        assert_eq!(rows, 0);
+        assert_eq!(total, 0);
+        assert_eq!(gap, "", "读全了 gap 必须是空串（不是 nil）");
+    }
+
     /// 等 Edge 那一轮后台刷新真的收尾，再让用例继续往下走。
     ///
     /// `edge-refresh` 线程是 detach 的，而它落盘用的 `data_dir()` 取的是**当下**的
@@ -1783,7 +1816,7 @@ mod tests {
         assert_eq!(first_table_rows(&manager, &name).len(), 5);
 
         // 外部把库删到只剩 4 条（面板的 page 还是 3 → 必须重查而不是给空表）
-        let (all, _) = accounting::get_expenses_page(1, 200, None, None, None, None, None);
+        let (all, _, _) = accounting::get_expenses_page(1, 200, None, None, None, None, None);
         for e in all.iter().skip(4) {
             assert!(accounting::delete_expense(e.id));
         }

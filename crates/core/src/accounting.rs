@@ -444,7 +444,9 @@ const EXPENSE_COLS: &str = "id, type, item_name, store, purchase_date, amount, \
 /// 分页那一头的条数取的是 `COUNT(*)`，于是界面写着「共 37 条」却只列得出 30 条，
 /// 日志一个字都没有 —— 少了列序这个错因之后这条路仍可能触发（外部工具往 `amount`
 /// 里写过文字就是），所以要说出来。
-fn collect_expenses<I>(rows: I, which: &str) -> Vec<Expense>
+///
+/// 逐行收账；第二个值是**整行读不出来**的条数（读侧的决定要不要把它说出去）。
+fn collect_expenses<I>(rows: I, which: &str) -> (Vec<Expense>, usize)
 where
     I: Iterator<Item = rusqlite::Result<Expense>>,
 {
@@ -465,7 +467,7 @@ where
              却仍被算进那一头的条数"
         );
     }
-    out
+    (out, dropped)
 }
 
 /// 记账允许的类型值。
@@ -738,7 +740,7 @@ pub fn get_all_expenses(limit: i64) -> Vec<Expense> {
     };
     let result = stmt.query_map([limit], row_to_expense);
     match result {
-        Ok(rows) => collect_expenses(rows, "全部记录"),
+        Ok(rows) => collect_expenses(rows, "全部记录").0,
         Err(e) => {
             tracing::error!("读记账记录列表失败：查询开始就失败（{e}）");
             Vec::new()
@@ -760,7 +762,7 @@ pub fn get_expenses_by_date(date: &str) -> Vec<Expense> {
     };
     let result = stmt.query_map([date], row_to_expense);
     match result {
-        Ok(rows) => collect_expenses(rows, "按日期筛选"),
+        Ok(rows) => collect_expenses(rows, "按日期筛选").0,
         Err(_) => Vec::new(),
     }
 }
@@ -1473,8 +1475,12 @@ pub fn normalize_date_filter(raw: &str) -> Option<String> {
         .map(|dt| dt.format("%Y-%m-%d").to_string())
 }
 
-/// 分页 + 筛选查询：返回 (records, total)。
+/// 分页 + 筛选查询：返回 `(records, total, gap)`。
 /// category/subcategory/keyword/date_from/date_to 为空时不过滤。
+///
+/// `gap` 空串 = 这一页**读全了**；非空 = 这一份读数不完整（库打不开、条数或明细读不出来、
+/// 有整行解码失败），句子里已带上能确定的那部分事实。调用方不许把 `(空, 0)` 念成
+/// "一条记录都没有" —— 那正是这一栏原先的形状（读失败与真的没有共用同一句话）。
 #[allow(clippy::too_many_arguments)]
 pub fn get_expenses_page(
     page: i64,
@@ -1484,12 +1490,16 @@ pub fn get_expenses_page(
     keyword: Option<&str>,
     date_from: Option<&str>,
     date_to: Option<&str>,
-) -> (Vec<Expense>, i64) {
+) -> (Vec<Expense>, i64, String) {
     let conn = match open() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("读记账分页失败：记账库打不开: {e}");
-            return (Vec::new(), 0);
+            return (
+                Vec::new(),
+                0,
+                format!("记账库打不开，这一页一条都没读（{e}）"),
+            );
         }
     };
     let mut conds: Vec<String> = Vec::new();
@@ -1551,14 +1561,14 @@ pub fn get_expenses_page(
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("读记账分页的条数失败（{e}）");
-                return (Vec::new(), 0);
+                return (Vec::new(), 0, format!("读条数的语句准备不了（{e}）"));
             }
         };
         let mut rows = match stmt.query(rusqlite::params_from_iter(params.iter())) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("读记账分页的条数失败：查询没跑起来（{e}）");
-                return (Vec::new(), 0);
+                return (Vec::new(), 0, format!("读条数的查询没跑起来（{e}）"));
             }
         };
         match rows.next() {
@@ -1566,7 +1576,11 @@ pub fn get_expenses_page(
             Ok(None) => 0,
             Err(e) => {
                 tracing::error!("读记账分页的条数失败：结果读不出来（{e}）");
-                0
+                return (
+                    Vec::new(),
+                    0,
+                    format!("条数读不出来（{e}）：这一页连『共几条』都没有答案"),
+                );
             }
         }
     };
@@ -1582,11 +1596,15 @@ pub fn get_expenses_page(
         Err(e) => {
             // 条数是刚刚才查证过的真数，不许在这里被改成 0：面板会因此显示
             // 「共 0 条」，而用户的记录一条都没少 —— 那是比"列不出来"更坏的一句假话。
-            // 这一支的矛盾（有 N 条却列不出行）由日志说清，不由返回值撒谎来遮。
+            // 这一支的矛盾（有 N 条却列不出行）交给 gap 说清，不由条数撒谎来遮。
             tracing::error!(
                 "读记账分页的明细失败（{e}）：条数 {total} 仍然有效，但这一页没有行可读"
             );
-            return (Vec::new(), total);
+            return (
+                Vec::new(),
+                total,
+                format!("这一页的明细没读出来（{e}）：共 {total} 条的计数仍然有效"),
+            );
         }
     };
     let mut all_params: Vec<rusqlite::types::Value> = params;
@@ -1596,14 +1614,25 @@ pub fn get_expenses_page(
         rusqlite::params_from_iter(all_params.iter()),
         row_to_expense,
     );
+    let mut gap = String::new();
     let records = match result {
-        Ok(rows) => collect_expenses(rows, "分页列表"),
+        Ok(rows) => {
+            let (kept, dropped) = collect_expenses(rows, "分页列表");
+            if dropped > 0 {
+                gap = format!(
+                    "这一页有 {dropped} 行整行读不出来：它们不会出现在列表里，\
+                     却仍被算进共 {total} 条"
+                );
+            }
+            kept
+        }
         Err(e) => {
             tracing::error!("读记账分页的明细失败：查询没跑起来（{e}）：条数 {total} 仍然有效");
+            gap = format!("这一页的明细没读出来（{e}）：共 {total} 条的计数仍然有效");
             Vec::new()
         }
     };
-    (records, total)
+    (records, total, gap)
 }
 
 /// 月度汇总（含分类明细）：返回 (总支出, 总收入, 条数, [(分类, 净额=收入-支出)]，按净额降序)。
@@ -3135,8 +3164,9 @@ mod tests {
             .unwrap();
         }
 
-        let (rows, total) = get_expenses_page(1, 20, None, None, None, None, None);
+        let (rows, total, gap) = get_expenses_page(1, 20, None, None, None, None, None);
         assert_eq!(total, 1, "COUNT(*) 看得见这一行");
+        assert_eq!(gap, "", "这一页读全了，gap 必须是空串");
         assert_eq!(
             rows.len(),
             1,
@@ -3945,7 +3975,7 @@ mod tests {
             )
             .unwrap();
         }
-        let (records, total) = get_expenses_page(1, 20, None, None, None, None, None);
+        let (records, total, gap) = get_expenses_page(1, 20, None, None, None, None, None);
         assert!(
             records.is_empty(),
             "这张表读不出明细（少一列），不该硬凑出行来"
@@ -3954,6 +3984,27 @@ mod tests {
             total, 1,
             "COUNT 查证过的条数不许被归零：那等于对用户说「你一条记录都没有」"
         );
+        assert!(
+            !gap.is_empty(),
+            "明细这一页读不出来必须交回 gap，否则面板只会摆一张空表: {gap:?}"
+        );
+    }
+
+    /// 库整个打不开时，分页读数必须把原因交出来（`gap`），而不是 `(空, 0)`。
+    ///
+    /// 面板拿 `(空, 0)` 会画成「共 0 条」—— 与"真的没有记录"是同一句话，而库里一条没少。
+    #[test]
+    fn an_unopenable_accounting_db_is_a_gap_not_an_empty_page() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _app = crate::paths::test_app_dir("acc_page_unopenable");
+        // 在本该是库文件的位置放一个目录：SQLite 打不开它（盘满/占位文件同一档的确定造法）。
+        let db = db_path();
+        std::fs::create_dir_all(&db).unwrap();
+        let (records, total, gap) = get_expenses_page(1, 20, None, None, None, None, None);
+        assert!(records.is_empty());
+        assert_eq!(total, 0);
+        assert!(!gap.is_empty(), "读不出来必须说出来");
+        assert!(gap.contains("打不开"), "要说清是库打不开: {gap}");
     }
 
     /// 接线腿：两条读路不许再把错误整个吞掉换成"没有记录"。

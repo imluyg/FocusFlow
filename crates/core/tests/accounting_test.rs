@@ -105,24 +105,25 @@ fn page_filter_and_escaping() {
     add("2026-08-06", "收入", "奖金", 800.0, "收入", "");
 
     // 分页：每页 2 条 → 3 页，第 1 页最新在前
-    let (page1, total) = accounting::get_expenses_page(1, 2, None, None, None, None, None);
+    let (page1, total, gap) = accounting::get_expenses_page(1, 2, None, None, None, None, None);
     assert_eq!(total, 6);
+    assert_eq!(gap, "", "库读得动时 gap 必须是空串（别把成功也报成不完整）");
     assert_eq!(page1.len(), 2);
     assert_eq!(page1[0].purchase_date, "2026-08-06");
     assert_eq!(page1[1].purchase_date, "2026-08-05");
 
     // 第 3 页
-    let (page3, _) = accounting::get_expenses_page(3, 2, None, None, None, None, None);
+    let (page3, _, _) = accounting::get_expenses_page(3, 2, None, None, None, None, None);
     assert_eq!(page3.len(), 2);
     assert_eq!(page3[1].purchase_date, "2026-08-01");
 
     // 超尾页 → 空列表但 total 正确
-    let (page9, total9) = accounting::get_expenses_page(9, 2, None, None, None, None, None);
+    let (page9, total9, _) = accounting::get_expenses_page(9, 2, None, None, None, None, None);
     assert!(page9.is_empty());
     assert_eq!(total9, 6);
 
     // 分类筛选
-    let (only_cat, total_cat) =
+    let (only_cat, total_cat, _) =
         accounting::get_expenses_page(1, 10, Some("餐饮"), None, None, None, None);
     assert_eq!(total_cat, 2);
     assert!(only_cat
@@ -130,13 +131,13 @@ fn page_filter_and_escaping() {
         .all(|e| e.category.as_deref() == Some("餐饮")));
 
     // 子分类筛选
-    let (only_sub, total_sub) =
+    let (only_sub, total_sub, _) =
         accounting::get_expenses_page(1, 10, None, Some("午餐类"), None, None, None);
     assert_eq!(total_sub, 1);
     assert_eq!(only_sub[0].item_name, "午餐");
 
     // 日期范围
-    let (_in_range, total_range) = accounting::get_expenses_page(
+    let (_in_range, total_range, _) = accounting::get_expenses_page(
         1,
         10,
         None,
@@ -148,16 +149,16 @@ fn page_filter_and_escaping() {
     assert_eq!(total_range, 2);
 
     // 关键词：% 和 _ 按字面匹配（不当作通配符）
-    let (kw_pct, total_pct) =
+    let (kw_pct, total_pct, _) =
         accounting::get_expenses_page(1, 10, None, None, Some("100%"), None, None);
     assert_eq!(total_pct, 1, "百分号应字面匹配");
     assert_eq!(kw_pct[0].item_name, "网费100%");
-    let (_kw_under, total_under) =
+    let (_kw_under, total_under, _) =
         accounting::get_expenses_page(1, 10, None, None, Some("_"), None, None);
     assert_eq!(total_under, 0, "下划线不应作为通配符");
 
     // 关键词匹配分类
-    let (_kw_cat, total_kw) =
+    let (_kw_cat, total_kw, _) =
         accounting::get_expenses_page(1, 10, None, None, Some("餐饮"), None, None);
     assert_eq!(total_kw, 2);
 }

@@ -1015,7 +1015,9 @@ pub fn register_host_api(
     )?;
     host.set("accounting_add", acc_add)?;
 
-    // 分页 + 筛选查询：返回 (records, total)
+    // 分页 + 筛选查询：返回 (records, total, gap)。第三个值是"这一份读数完整吗"：
+    // 空串 = 读全了；非空 = 库打不开/条数或明细读不出来（句子里带原因）。
+    // 少了它，面板会把"读不出来"画成"共 0 条"，而库里的记录一条都没少。
     let acc_query = lua.create_function(
         |lua,
          (page, page_size, cat, sub, kw, date_from, date_to): (
@@ -1028,7 +1030,7 @@ pub fn register_host_api(
             String,
         )| {
             ensure_accounting_db();
-            let (records, total) = accounting::get_expenses_page(
+            let (records, total, gap) = accounting::get_expenses_page(
                 page,
                 page_size,
                 if cat.is_empty() {
@@ -1071,7 +1073,7 @@ pub fn register_host_api(
                 row.set("note", e.note.clone().unwrap_or_default())?;
                 t.set(i + 1, row)?;
             }
-            Ok((t, total))
+            Ok((t, total, gap))
         },
     )?;
     host.set("accounting_query", acc_query)?;
