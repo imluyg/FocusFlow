@@ -16743,12 +16743,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         .map(|se| l.0 as usize == se.0 as usize)
                         .unwrap_or(false);
                     if from_search {
-                        let mut buf = [0u16; 128];
-                        let n = match app.search_edit {
-                            Some(se) => unsafe { GetWindowTextW(se, &mut buf) }.max(0) as usize,
-                            None => 0,
-                        };
-                        app.search = String::from_utf16_lossy(&buf[..n]);
+                        // 长度现问：固定缓冲会把长筛选词静默截掉，框里看着是全的、
+                        // 列表却按前半截筛（粘贴一条长路径当筛选词时最明显）。
+                        if let Some(se) = app.search_edit {
+                            app.search = read_hosted_edit_text(se);
+                        }
                         app.scroll = 0;
                         unsafe {
                             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -22431,6 +22430,29 @@ mod clip_tests {
             prod.matches("place_search_edit(hwnd)").count(),
             6,
             "搜索框的摆位调用点数变了"
+        );
+    }
+
+    /// 设置页搜索框的 EN_CHANGE 也要按实际长度读：固定缓冲会把长筛选词静默截掉，
+    /// 框里看着是全的、列表却按前半截筛。
+    #[test]
+    fn the_settings_search_reads_the_whole_edit_text() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        let at = prod.find("WM_COMMAND =>").expect("WM_COMMAND 不见了");
+        let end = prod[at..]
+            .find("WM_MOUSEWHEEL =>")
+            .map(|n| n + at)
+            .expect("WM_MOUSEWHEEL 不见了");
+        let body = &prod[at..end];
+        assert!(
+            body.contains("read_hosted_edit_text(se)"),
+            "设置页搜索要按实际长度读全文"
+        );
+        assert!(
+            !body.contains("[0u16; 128]"),
+            "固定 128 的缓冲会静默截断长筛选词"
         );
     }
 
