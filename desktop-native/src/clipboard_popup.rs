@@ -1824,6 +1824,14 @@ fn paint(hwnd: HWND) {
     }
 }
 
+/// 弹窗底栏两槽的几何：右侧状态固定 260 宽，左侧正文让出那块再加 8px 间隔。
+fn footer_slots(w: i32, pad: i32, right_present: bool) -> (i32, i32) {
+    let right_w = if right_present { 260 } else { 0 };
+    let gap = if right_present { 8 } else { 0 };
+    let left_w = (w - pad * 2 - right_w - gap).max(20);
+    (left_w, w - pad - right_w)
+}
+
 unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
     let (w, h) = client_size(hwnd);
     let lay = layout_for(w, h, st.dpi);
@@ -1904,26 +1912,29 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
         // 这一笔没收进来的原因：最多占 60 秒，成功收录一次就清。
         footer = format!("{note} · {footer}");
     }
-    let muted = st.pal.muted;
-    draw_str(
-        hdc,
-        &footer,
-        &rect(lay.pad, lay.footer_top, w - lay.pad * 2, 20),
-        muted,
-        st.font_small,
-        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
-    );
     let right_note = if !focusflow_core::config::instance().get_bool("clipboard", "enabled", true) {
         Some("记录已关闭（只显示已有条目）".to_string())
     } else {
         // 监听线程起不来/退出：旧记录还画得出来，但新的复制一条都不会进来。
         focusflow_core::clipboard::watcher_fault().map(|why| format!("监听未运行：{why}"))
     };
+    // 页脚分两槽：右侧状态是固定宽度，左侧正文只能用到它前面 —— 右边那句
+    // 以前直接盖在整宽正文上，关掉记录/监听坏掉时两行字叠在一起。
+    let (left_w, right_x) = footer_slots(w, lay.pad, right_note.is_some());
+    let muted = st.pal.muted;
+    draw_str(
+        hdc,
+        &footer,
+        &rect(lay.pad, lay.footer_top, left_w, 20),
+        muted,
+        st.font_small,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+    );
     if let Some(note) = right_note {
         draw_str(
             hdc,
             &note,
-            &rect(w - lay.pad - 260, lay.footer_top, 260, 20),
+            &rect(right_x, lay.footer_top, 260, 20),
             st.pal.accent,
             st.font_small,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
@@ -2600,6 +2611,22 @@ mod tests {
             prod.matches("popup_shortcut(ctrl, vk)").count(),
             2,
             "两张键盘入口要共用 popup_shortcut，否则焦点换个地方就不灵"
+        );
+    }
+
+    #[test]
+    fn footer_slots_keep_the_reason_from_covering_the_hint() {
+        let (left, right_x) = footer_slots(560, 16, true);
+        assert_eq!(left, 260);
+        assert_eq!(right_x, 284);
+        assert!(
+            16 + left + 8 <= right_x,
+            "左槽与右侧状态之间要留间隔，不能叠字"
+        );
+        assert_eq!(
+            footer_slots(560, 16, false),
+            (528, 544),
+            "没有右侧状态时正文用整宽"
         );
     }
 
