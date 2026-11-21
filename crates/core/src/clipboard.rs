@@ -932,8 +932,8 @@ pub fn search(query: &str, limit: i64) -> Result<Vec<ClipItem>, String> {
 /// 收藏只有名称与正文，没有来源/图片/文件那几列；但管理页是**同一个搜索框**同时筛
 /// 历史与收藏（提示写着「筛选历史 / 收藏」）。从前收藏那一路拿整串 trim 后的词做一次
 /// `contains`，而历史那一路按空白分词、逐词 AND：同一个框里打「微信 支付」，历史能同时
-/// 命中两个词，收藏却只认整句连着的「微信 支付」。这里与 [`search`] 共用
-/// [`parse_query_token`]、同一个词数/长度上限与同一个 AND 口径。
+/// 命中两个词，收藏却只认整句连着的「微信 支付」。这里与 [`search`] 共用同一份
+/// 前缀解析（`parse_query_token`，私有）、同一个词数/长度上限与同一个 AND 口径。
 pub fn snippet_matches(query: &str, name: &str, content: &str) -> bool {
     let q = query.trim();
     if q.is_empty() {
