@@ -11838,6 +11838,16 @@ fn draw_clip_thumb(p: &P<'_>, t: &clipboard_page::Thumb, r: D2D_RECT_F) -> bool 
     true
 }
 
+/// 底栏那格「N 条」。读失败时列表已被清空、状态行正说着"这一轮没读出来"；
+/// 再跟一句「0 条」就是同一屏里的两句自相矛盾的话（与弹窗标题那格同一条尺子）。
+fn footer_count(total: usize, load_failed: bool) -> String {
+    if load_failed {
+        "读不出来".to_string()
+    } else {
+        format!("{total} 条")
+    }
+}
+
 fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPage, vs: ViewState) {
     use clipboard_page::Mode;
 
@@ -12120,7 +12130,8 @@ fn draw_clipboard_page(p: &P<'_>, w: f32, h: f32, clip: &clipboard_page::ClipPag
         }
     };
     if clip.mode != Mode::Stats {
-        footer.push_str(&format!(" · {total} 条"));
+        footer.push_str(" · ");
+        footer.push_str(&footer_count(total, clip.load_failed()));
         if !clip.filter.trim().is_empty() {
             footer.push_str(" · 已筛选");
         }
@@ -24996,6 +25007,14 @@ mod settings_layout_tests {
 #[cfg(test)]
 mod ux_polish_tests {
     use super::*;
+
+    /// 管理页底栏与弹窗标题同一条尺子：读失败时不许再念「0 条」。
+    #[test]
+    fn the_clipboard_footer_count_never_turns_a_failed_read_into_zero() {
+        assert_eq!(footer_count(0, true), "读不出来");
+        assert_eq!(footer_count(0, false), "0 条", "真没记录才念 0");
+        assert_eq!(footer_count(37, false), "37 条");
+    }
 
     /// 独立的点击区一律 ≥24 DIP；行内那几颗受行高限制，钉它们不越出行。
     #[test]
