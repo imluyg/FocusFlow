@@ -206,6 +206,17 @@ function _build_widgets()
         }
     end
 
+    -- 自动走完的那一段没人点按钮；写库失败原先只留一句默认不落盘的日志，
+    -- 于是历史表与「今日完成」安静地少一段。这句一直挂到下一次落库成功。
+    local save_err = focusflow.pomodoro_last_save_error()
+    if save_err and save_err ~= "" then
+        widgets[#widgets + 1] = {
+            type = "label",
+            text = "最近一次段落没能写进库：" .. tostring(save_err)
+                .. "。这一段不在历史里，也没有计入「今日完成」",
+        }
+    end
+
     widgets[#widgets + 1] = { type = "separator" }
 
     -- 时长：以前 work_min/brk_min 取出即弃，面板既看不到也改不了

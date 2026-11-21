@@ -788,6 +788,13 @@ pub fn register_host_api(
     })?;
     host.set("pomodoro_summary", summary_fn)?;
 
+    // 最近一次落库失败的原因（空串 = 没有）。自动走完的阶段没人点按钮，失败只写日志
+    // 等于没说；面板每次渲染都读它，直到下一次落库成功。
+    host.set(
+        "pomodoro_last_save_error",
+        lua.create_function(|_, ()| Ok(pomodoro_timer().last_save_error()))?,
+    )?;
+
     // 番茄钟按键联动（监听器回调调用）
     host.set(
         "pomodoro_record_key",

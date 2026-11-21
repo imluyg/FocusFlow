@@ -2552,6 +2552,48 @@ mod tests {
         );
     }
 
+    /// 自动走完/结束的那一段没写进库时，面板必须说一句：原先只有一句默认不落盘的
+    /// 日志，历史表与「今日完成」安静地少一段。下一次成功落库后这句旧账要消失。
+    #[test]
+    fn a_failed_pomodoro_save_is_spoken_by_the_panel() {
+        use focusflow_core::pomodoro;
+
+        let _guard = guard();
+        let (_tmp, mut manager, name) = bundled_in("pomo_save_err", "pomodoro_plugin.lua");
+        pomodoro::init_db().ok();
+        focusflow_core::db::connection::clear_aux_cache();
+        std::fs::remove_file(pomodoro::db_path()).ok();
+        std::fs::create_dir_all(pomodoro::db_path()).expect("夹具：把番茄库路径做成目录");
+        focusflow_core::db::connection::clear_aux_cache();
+
+        manager
+            .plugin_action(&name, "start_work")
+            .expect("开始工作不该失败");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        manager.plugin_action(&name, "stop").expect("停止不该失败");
+        let said = labels_of(&manager, &name).join(" | ");
+        assert!(
+            said.contains("最近一次段落没能写进库"),
+            "落库失败要留在面板上: {said}"
+        );
+        assert!(said.contains("不在历史里"), "要说明这一段没进历史: {said}");
+
+        // 把库位换回来并成功落一段：旧账要清掉，别一直挂着。
+        focusflow_core::db::connection::clear_aux_cache();
+        std::fs::remove_dir_all(pomodoro::db_path()).ok();
+        pomodoro::init_db().expect("库应能重建");
+        manager
+            .plugin_action(&name, "start_work")
+            .expect("再开一段不该失败");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        manager.plugin_action(&name, "stop").expect("停止不该失败");
+        let said2 = labels_of(&manager, &name).join(" | ");
+        assert!(
+            !said2.contains("最近一次段落没能写进库"),
+            "下一次成功落库后旧账要清掉: {said2}"
+        );
+    }
+
     /// 插件这一头必须把"类型读不出来"与"库里没设类型"当两件事。
     ///
     /// 宿主这条通道原先只回一个字符串：`None` 被印成空串，于是分类表里那一格画「双向」

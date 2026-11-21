@@ -313,6 +313,11 @@ struct TimerState {
     work_finished: i64,
     /// 当前阶段开始时间（保存记录用）
     start_time: String,
+    /// 最近一次落库失败的原因（`None` = 没有未说的失败）。
+    ///
+    /// 阶段是计时线程**自动**走完的：那一刻没人点按钮，写库失败原先只留一句默认不落盘的
+    /// `tracing::error!`，面板上的「今日完成」与历史表就安静地少一段。存下来交给面板说。
+    save_error: Option<String>,
 }
 
 impl Default for TimerState {
@@ -329,6 +334,7 @@ impl Default for TimerState {
             auto_break: true,
             work_finished: 0,
             start_time: String::new(),
+            save_error: None,
         }
     }
 }
@@ -413,6 +419,19 @@ impl PomodoroTimer {
         m.insert("break_minutes".into(), s.break_minutes);
         m.insert("auto_break".into(), s.auto_break as i64);
         m
+    }
+
+    /// 最近一次落库失败的原因（空串 = 没有未说的失败）。
+    ///
+    /// 计时线程自动走完一段时，没人站在按钮前面；`tracing::error!` 默认不落盘，
+    /// 面板若不念这句，"这一段没进历史、也没计入今日完成"就无声无息。
+    pub fn last_save_error(&self) -> String {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .save_error
+            .clone()
+            .unwrap_or_default()
     }
 
     pub fn get_state(&self) -> String {
@@ -686,17 +705,23 @@ fn take_current(s: &mut TimerState) -> Option<Session> {
 /// `tracing::error!`：内存里的计数与库里的行数从此永久分叉 —— 卡片上"今日完成 4 个"
 /// 而库里只有 3 行，重启后按库行数读数就无声缩水。改成两边同轨：库里有这一行才算数。
 fn persist_session(state: &Mutex<TimerState>, session: &Session) -> bool {
-    if let Err(e) = save_session(session) {
-        tracing::error!("保存番茄钟记录失败: {e}（本次不计入已完成番茄数）");
-        return false;
+    match save_session(session) {
+        Ok(()) => {
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            if session.rtype == STATE_WORK && session.actual_seconds >= 1 {
+                s.work_finished += 1;
+            }
+            s.save_error = None;
+            true
+        }
+        Err(e) => {
+            tracing::error!("保存番茄钟记录失败: {e}（本次不计入已完成番茄数）");
+            // 自动走完的阶段没人点按钮，这句失败只写进默认关闭的日志就等于没说。
+            // 存进状态，面板每次都把它念出来，直到下一次落库成功。
+            state.lock().unwrap_or_else(|e| e.into_inner()).save_error = Some(e.to_string());
+            false
+        }
     }
-    if session.rtype == STATE_WORK && session.actual_seconds >= 1 {
-        state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .work_finished += 1;
-    }
-    true
 }
 
 /// 一次 tick 之间过了多少**墙钟秒**。
@@ -1431,5 +1456,47 @@ mod busy_lock_tests {
             "写不进去要报成「没落成」，实际 {out:?}"
         );
         assert_eq!(today_summary().0, 0, "没落库就不该计入今日完成");
+    }
+
+    /// 落库失败要留下原因给面板，并且下一次成功落库后清掉这条旧账。
+    #[test]
+    fn a_failed_save_is_remembered_until_the_next_success() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("pomo_save_error");
+        init_db().ok();
+        crate::db::connection::clear_aux_cache();
+        std::fs::remove_file(db_path()).ok();
+        std::fs::create_dir_all(db_path()).expect("夹具：把番茄库路径做成目录");
+
+        let t = PomodoroTimer::new();
+        t.start_work().expect("计时线程应可用");
+        tick_once(&t.state, 5, Local::now());
+        let out = t.stop();
+        t.shutdown();
+        assert!(
+            matches!(out, Stopped::SaveFailed { .. }),
+            "前提：这一段写不进去，实际 {out:?}"
+        );
+        assert!(
+            !t.last_save_error().is_empty(),
+            "写库失败必须留下原因，否则面板无从说明这段为什么没进历史"
+        );
+
+        // 把库位换回来，再落一段：成功后这条旧账要清掉。
+        crate::db::connection::clear_aux_cache();
+        std::fs::remove_dir_all(db_path()).ok();
+        init_db().expect("库应能重建");
+        let session = Session {
+            id: 0,
+            rtype: STATE_WORK.to_string(),
+            start_time: "2026-01-01 09:00:00".to_string(),
+            end_time: "2026-01-01 09:25:00".to_string(),
+            planned_seconds: 1500,
+            actual_seconds: 1500,
+            key_count: 0,
+            created_at: "2026-01-01 09:25:00".to_string(),
+        };
+        assert!(persist_session(&t.state, &session), "恢复后的库应能落库");
+        assert_eq!(t.last_save_error(), "", "下一次成功落库要清掉旧账");
     }
 }
