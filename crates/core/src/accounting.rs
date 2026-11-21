@@ -1078,46 +1078,60 @@ pub fn update_subcategory(category: &str, old_sub: &str, new_sub: &str) -> (bool
         );
     }
     let idx = subs.iter().position(|s| s == old_sub);
-    match idx {
-        Some(i) => {
-            subs[i] = new_sub.to_string();
-            // 与 update_category 同理：分类表的 subs 与 expenses.subcategory
-            // 必须一起改，否则按子分类筛选查不到记录却提示"更新成功"。
-            if let Err(e) = conn.execute("BEGIN IMMEDIATE;", []) {
-                return (false, format!("更新失败: {e}"));
-            }
-            let apply = (|| -> rusqlite::Result<usize> {
-                let n = conn.execute(
-                    "UPDATE categories SET subs=?1 WHERE name=?2",
-                    rusqlite::params![subs.join(","), category],
-                )?;
-                if n > 0 {
-                    conn.execute(
-                        "UPDATE expenses SET subcategory=?1 WHERE category=?2 AND subcategory=?3",
-                        rusqlite::params![new_sub, category, old_sub],
-                    )?;
-                }
-                Ok(n)
-            })();
-            match apply {
-                Ok(0) => {
-                    let _ = conn.execute("ROLLBACK;", []);
-                    (false, format!("分类 [{category}] 不存在"))
-                }
-                Ok(_) => match conn.execute("COMMIT;", []) {
-                    Ok(_) => (true, "更新成功".into()),
-                    Err(e) => {
-                        let _ = conn.execute("ROLLBACK;", []);
-                        (false, format!("更新失败: {e}"))
-                    }
-                },
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK;", []);
-                    (false, format!("更新失败: {e}"))
-                }
-            }
+    // 「分类管理」右侧那张表把**记录里出现过**的子分类也并进来了（见
+    // `subcategories_readout`），而声明清单里没有它。只认声明那一栏的话，这类行
+    // 看得见、改名/删除却永远答"不存在"（删过分类再加回来、或导入的老数据就是这样）。
+    if idx.is_none() {
+        match subs_in_records(&conn, category) {
+            Ok(seen) if seen.iter().any(|s| s == old_sub) => {}
+            Ok(_) => return (false, format!("子分类 [{old_sub}] 不存在")),
+            Err(e) => return (false, format!("读记录里的子分类失败: {e}")),
         }
-        None => (false, format!("子分类 [{old_sub}] 不存在")),
+    }
+    let declared_has = idx.is_some();
+    if let Some(i) = idx {
+        subs[i] = new_sub.to_string();
+    }
+    // 与 update_category 同理：分类表的 subs 与 expenses.subcategory
+    // 必须一起改，否则按子分类筛选查不到记录却提示"更新成功"。
+    if let Err(e) = conn.execute("BEGIN IMMEDIATE;", []) {
+        return (false, format!("更新失败: {e}"));
+    }
+    let apply = (|| -> rusqlite::Result<usize> {
+        // 只在声明清单里有它时才改 subs 列；记录里独有的那一条改名后仍由记录侧
+        // 出现在列表里，不该顺手把它写进声明清单（那会让它删光记录后还留着）。
+        let n = if declared_has {
+            conn.execute(
+                "UPDATE categories SET subs=?1 WHERE name=?2",
+                rusqlite::params![subs.join(","), category],
+            )?
+        } else {
+            1
+        };
+        if n > 0 {
+            conn.execute(
+                "UPDATE expenses SET subcategory=?1 WHERE category=?2 AND subcategory=?3",
+                rusqlite::params![new_sub, category, old_sub],
+            )?;
+        }
+        Ok(n)
+    })();
+    match apply {
+        Ok(0) => {
+            let _ = conn.execute("ROLLBACK;", []);
+            (false, format!("分类 [{category}] 不存在"))
+        }
+        Ok(_) => match conn.execute("COMMIT;", []) {
+            Ok(_) => (true, "更新成功".into()),
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK;", []);
+                (false, format!("更新失败: {e}"))
+            }
+        },
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK;", []);
+            (false, format!("更新失败: {e}"))
+        }
     }
 }
 
@@ -1132,14 +1146,21 @@ pub fn delete_subcategory(category: &str, sub_name: &str) -> (bool, String) {
         SubsRead::MissingCategory => return (false, format!("分类 [{category}] 不存在")),
         SubsRead::Unreadable(e) => return (false, e),
     };
+    let declared_has = all.iter().any(|s| s == sub_name);
+    if !declared_has {
+        // 同 `update_subcategory`：记录里出现过、声明清单里没有的子分类也在界面上，
+        // 删它必须清掉记录那一侧，不能答"不存在"。
+        match subs_in_records(&conn, category) {
+            Ok(seen) if seen.iter().any(|s| s == sub_name) => {}
+            Ok(_) => return (false, format!("子分类 [{sub_name}] 不存在")),
+            Err(e) => return (false, format!("读记录里的子分类失败: {e}")),
+        }
+    }
     let subs: Vec<String> = all
         .iter()
         .filter(|s| s.as_str() != sub_name)
         .cloned()
         .collect();
-    if subs.len() == all.len() {
-        return (false, format!("子分类 [{sub_name}] 不存在"));
-    }
     // 两条 UPDATE 必须同事务，且必须**一起**做：`get_subcategories` 会把"记录里出现过
     // 的子分类"并回列表（见它那段注释），所以只改 categories.subs 的话，删掉的子分类
     // 立刻又出现在下拉里 —— 插件页刚说完"子分类 […] 已删除"，细分盈亏里它也还在。

@@ -348,6 +348,64 @@ fn category_management_crud() {
     assert_eq!(rec2.category.as_deref(), Some("游戏"));
 }
 
+/// 「分类管理」右侧表把**记录里出现过**的子分类也列出来了，它们必须和声明的一样
+/// 能改名、能删除。复现：删掉分类（记录保留）→ 用空 subs 再加回同名分类 ⇒ 旧子分类
+/// 从记录那边回到表里，而旧实现只查 `categories.subs`，两个按钮都答"不存在"。
+#[test]
+fn record_only_subcategories_can_be_renamed_and_deleted() {
+    let _g = guard();
+    let _dir = setup();
+    let id = add("2026-08-01", "支出", "点卡", 100.0, "游戏", "梦幻西游");
+    assert!(id > 0, "夹具：先记一笔带子分类的账");
+
+    assert!(accounting::delete_category("游戏").0, "删分类不动记录");
+    assert!(
+        accounting::add_category("游戏", "expense", &[]) > 0,
+        "再用空 subs 把同名分类加回来"
+    );
+
+    let (subs, gap) = accounting::subcategories_readout("游戏");
+    assert!(gap.is_empty(), "夹具前提：清单读得出来，实得 {gap}");
+    assert!(
+        subs.iter().any(|s| s == "梦幻西游"),
+        "记录里的子分类应出现在管理表里: {subs:?}"
+    );
+
+    let (ok, why) = accounting::update_subcategory("游戏", "梦幻西游", "点卡充值");
+    assert!(ok, "记录里独有的子分类也必须能改名：{why}");
+    assert_eq!(
+        accounting::get_expense_by_id(id)
+            .unwrap()
+            .subcategory
+            .as_deref(),
+        Some("点卡充值"),
+        "改名必须同步到记录"
+    );
+    let game = accounting::get_all_categories()
+        .0
+        .into_iter()
+        .find(|c| c.name == "游戏")
+        .expect("分类行还在");
+    assert!(
+        game.subs.is_empty(),
+        "改名不该顺手把它写进声明清单: {:?}",
+        game.subs
+    );
+
+    let (ok, why) = accounting::delete_subcategory("游戏", "点卡充值");
+    assert!(ok, "记录里独有的子分类也必须能删除：{why}");
+    assert_eq!(
+        accounting::get_expense_by_id(id).unwrap().subcategory,
+        None,
+        "删除必须清掉记录上的子分类"
+    );
+    let (subs2, _) = accounting::subcategories_readout("游戏");
+    assert!(
+        !subs2.iter().any(|s| s == "点卡充值"),
+        "删掉后不该再出现: {subs2:?}"
+    );
+}
+
 #[test]
 fn profit_and_days_ago() {
     let _g = guard(); // 全程持有：app_dir 是进程级全局
