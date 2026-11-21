@@ -771,12 +771,6 @@ pub fn update_task(
     schedule_time: Option<&str>,
     enabled: Option<bool>,
 ) -> anyhow::Result<()> {
-    if let Some(a) = args {
-        if let Err(e) = validate_task_args(a) {
-            tracing::warn!("更新定时任务被拒绝（id={id}）: {e}");
-            return Err(e);
-        }
-    }
     // 读取当前值。last_run 必须在**同一次** SELECT 里读回来：分成两次时第二次的
     // `.ok().flatten()` 把"读失败"和"这一条没有 last_run"并成一件 —— 库 BUSY 超过
     // 15 秒那一瞬，更新照样返回 Ok，而写回的 NULL 抹掉的正是防同日重跑的锚
@@ -822,6 +816,14 @@ pub fn update_task(
         }
     }
     let new_args = args.unwrap_or(&existing.2).trim().to_string();
+    // 与目标那一半同理：调用方把整条记录原样传回来，没改参数就不该拿库外/旧数据重新判
+    // 一次 —— Python 时代迁来的 `-n` 这类历史参数会让"只改个名字/时刻"永远失败。
+    if args.is_some() && new_args != existing.2.trim() {
+        if let Err(e) = validate_task_args(&new_args) {
+            tracing::warn!("更新定时任务被拒绝（id={id}）: {e}");
+            return Err(e);
+        }
+    }
     let new_type = schedule_type.unwrap_or(&existing.3).to_string();
     // 入库一律写 trim 过的串（与 `add_task` 同一半）：`validate_schedule` 判的是 trim
     // 之后的值，写原样字符串就会留下 `"2026-12-01 10:00 "` 这种"校验通过、执行期永远
@@ -3709,6 +3711,47 @@ mod tests {
             .expect_err("换了非法目标必须照旧校验");
         assert!(
             e.to_string().contains("不能为空"),
+            "要说清为什么被拒，实得: {e}"
+        );
+    }
+
+    /// 与上一条同族：Python 时代迁来的 `-n` 参数在编辑页原样传回时不该重新判，
+    /// 否则"只改个名字/时刻"也会被参数闸挡住（而这条任务本身正因该参数跑不起来，
+    /// 编辑是唯一的修复路径）。
+    #[test]
+    fn editing_a_task_does_not_revalidate_its_unchanged_legacy_args() {
+        let _g = isolate_app_dir("edit_legacy_args");
+        let notepad = daily_task("23:59").target_path;
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_tasks (id, name, target_path, args, schedule_type, \
+                 schedule_time, enabled, last_run, created_at) \
+                 VALUES (7202, '老任务', ?1, '-n', 'daily', '08:30', 1, NULL, \
+                 '2026-01-01T00:00:00')",
+                [&notepad],
+            )
+            .unwrap();
+        }
+        // 面板那一步：七个参数原样传回来，只有名字是新的
+        update_task(
+            7202,
+            Some("改名"),
+            Some(&notepad),
+            Some("-n"),
+            Some("daily"),
+            Some("08:30"),
+            Some(true),
+        )
+        .expect("原样传回的旧参数不该挡住改名");
+        let t = get_all_tasks().into_iter().find(|t| t.id == 7202).unwrap();
+        assert_eq!(t.args, "-n", "没人改的参数要原样留着");
+
+        // 反向腿：真的改了参数 ⇒ 照旧校验（这道闸不是被删掉，只是改了判据）
+        let e = update_task(7202, None, None, Some("-x"), None, None, None)
+            .expect_err("改了参数必须照旧校验");
+        assert!(
+            e.to_string().contains("命令行开关"),
             "要说清为什么被拒，实得: {e}"
         );
     }
