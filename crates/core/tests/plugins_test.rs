@@ -2105,6 +2105,14 @@ mod tests {
 
     /// A0.5 之二：定时任务面板要真能**编辑**任务。
     ///
+    /// 帮助文字要与目标校验一致：`.lnk` 会先解析成指向的 .exe（见 scheduler.rs 的
+    /// 快捷方式解析），别再叫人只去找 .exe。
+    #[test]
+    fn scheduler_help_mentions_lnk_shortcuts() {
+        let src = include_str!("../plugins/scheduler_plugin.lua");
+        assert!(src.contains(".lnk"), "帮助文字漏了 .lnk 这条合法入口");
+    }
+
     /// `scheduler_plugin.lua` 的 `edit_id` 从未被使用、宿主的 `scheduler_update` 零
     /// 调用方 → GUI 里根本不存在"编辑任务"，只能删了重建（而新建被目标白名单卡着）。
     #[test]

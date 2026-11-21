@@ -289,7 +289,7 @@ function get_view()
     widgets[#widgets + 1] = { type = "separator" }
     widgets[#widgets + 1] = { type = "label", text = "调度类型：daily=每日 / once=一次性 / interval=窗口间隔" }
     widgets[#widgets + 1] = { type = "label", text = "调度时刻：daily 写 HH:MM；once 写 YYYY-MM-DD HH:MM；interval 写 HH:MM-HH:MM|分钟数。改了时刻会连同「上次执行」一起重置。" }
-    widgets[#widgets + 1] = { type = "label", text = "示例任务固定启动记事本。要定时启动别的程序：目标必须是 .exe、位于系统安装目录（或写进 config.ini 的 [scheduler] allow_extra），且参数不能是开关/URL 形态。" }
+    widgets[#widgets + 1] = { type = "label", text = "示例任务固定启动记事本。要定时启动别的程序：目标写 .exe，或指向它的 .lnk（快捷方式会先解析成对应的 .exe），且必须位于系统安装目录（或写进 config.ini 的 [scheduler] allow_extra），参数不能是开关/URL 形态。" }
 
     return {
         title = "定时任务",
