@@ -970,11 +970,14 @@ fn reveal(hwnd: HWND) {
         // 上一次打开时留下的「已删除」「已固定」不是这一次的反馈，重开就清掉。
         st.status = None;
         st.reload_all(hwnd, ReloadIntent::ResetTop);
-        if let Some(msg) = take_restore_issue() {
-            st.status = Some(msg);
-        }
+        // 先清搜索框再写原因：SetWindowTextW 会同步投 EN_CHANGE → on_query_changed →
+        // reload_history，而它的成功分支把 status 置 None —— 顺序反了，上一次还焦点
+        // 失败的解释就永远上不了屏（这条消息只在"下次打开"时才说）。
         unsafe {
             let _ = SetWindowTextW(st.edit, w!(""));
+        }
+        if let Some(msg) = take_restore_issue() {
+            st.status = Some(msg);
         }
         st.edit
     }) {
@@ -2838,6 +2841,26 @@ mod tests {
             prod.matches("popup_shortcut(ctrl, vk)").count(),
             2,
             "两张键盘入口要共用 popup_shortcut，否则焦点换个地方就不灵"
+        );
+    }
+
+    /// 还焦点失败的原因只在"下次打开"时才说。`reveal` 里清空搜索框会同步触发
+    /// EN_CHANGE → `reload_history`，成功分支把 status 置 None；先写原因再清框，
+    /// 这条解释就被冲掉了。
+    #[test]
+    fn the_restore_issue_is_written_after_the_search_box_is_cleared() {
+        let src = include_str!("clipboard_popup.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let reveal = &prod[prod.find("fn reveal(").expect("reveal 找不到了")..];
+        let clear = reveal
+            .find("SetWindowTextW(st.edit")
+            .expect("reveal 里没有清空搜索框");
+        let issue = reveal
+            .find("take_restore_issue()")
+            .expect("reveal 里没有还焦点的原因");
+        assert!(
+            issue > clear,
+            "清空搜索框引起的重查会把原因冲掉：先清框，再写这条消息"
         );
     }
 
