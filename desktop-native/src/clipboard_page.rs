@@ -372,11 +372,7 @@ impl ClipPage {
             }
         };
         if !filter.is_empty() {
-            let f = filter.to_ascii_lowercase();
-            snippets.retain(|r| {
-                r.name.to_ascii_lowercase().contains(&f)
-                    || r.content.to_ascii_lowercase().contains(&f)
-            });
+            snippets.retain(|r| clipboard::snippet_matches(&filter, &r.name, &r.content));
         }
         self.snippets = snippets;
         self.stats = clipboard::stats(7).ok();

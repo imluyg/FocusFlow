@@ -927,6 +927,44 @@ pub fn search(query: &str, limit: i64) -> Result<Vec<ClipItem>, String> {
         .map_err(|e| format!("读剪贴板搜索结果失败：{e}"))
 }
 
+/// 收藏能不能被这个筛选词命中。
+///
+/// 收藏只有名称与正文，没有来源/图片/文件那几列；但管理页是**同一个搜索框**同时筛
+/// 历史与收藏（提示写着「筛选历史 / 收藏」）。从前收藏那一路拿整串 trim 后的词做一次
+/// `contains`，而历史那一路按空白分词、逐词 AND：同一个框里打「微信 支付」，历史能同时
+/// 命中两个词，收藏却只认整句连着的「微信 支付」。这里与 [`search`] 共用
+/// [`parse_query_token`]、同一个词数/长度上限与同一个 AND 口径。
+pub fn snippet_matches(query: &str, name: &str, content: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
+    let name = name.to_ascii_lowercase();
+    let content = content.to_ascii_lowercase();
+    for raw in q.split_whitespace().take(MAX_QUERY_TOKENS) {
+        let raw: String = raw.chars().take(MAX_QUERY_TOKEN_CHARS).collect();
+        let token = parse_query_token(&raw);
+        let term = token.term.to_ascii_lowercase();
+        let matches_text = || term.is_empty() || name.contains(&term) || content.contains(&term);
+        match token.field {
+            // 收藏都是文本：`text:` 与无前缀落在同一批列上。
+            QueryField::Any | QueryField::Kind(ClipKind::Text) => {
+                if !matches_text() {
+                    return false;
+                }
+            }
+            // `app:` 只筛来源，收藏没有来源；空词与 `search` 一样不构成条件。
+            QueryField::Source => {
+                if !term.is_empty() {
+                    return false;
+                }
+            }
+            QueryField::Kind(_) => return false,
+        }
+    }
+    true
+}
+
 /// 最近一条**文本**的内容（插件 `clipboard.read_text` 的唯一数据源）。
 ///
 /// 只读文本：图片/文件在这一版不对外，所以"最新那条"如果是图片，就往更早找文本，
@@ -2953,6 +2991,37 @@ mod tests {
             cloud_flag: Some(0),
             ..Default::default()
         }));
+    }
+
+    /// 同一个搜索框筛历史与收藏：两页必须同一套分词与 AND 口径。
+    #[test]
+    fn the_snippet_filter_speaks_the_same_query_language_as_history() {
+        // 两个词分别落在名称与正文里：历史那一路能命中，收藏也不许只认整句。
+        assert!(snippet_matches("微信 支付", "微信", "扫码支付成功"));
+        assert!(
+            !snippet_matches("微信 支付", "微信", "扫码成功"),
+            "缺一个词就不算命中"
+        );
+        assert!(
+            snippet_matches("  微信   支付  ", "微信", "支付"),
+            "空白分词"
+        );
+        assert!(snippet_matches("", "任意", "任意"), "空筛选放行");
+        assert!(
+            snippet_matches("微信", "", "微信支付"),
+            "名称空着也能按正文命中"
+        );
+        // 前缀与历史同一套：text: 落在正文，img:/file:/app: 在收藏里无从命中。
+        assert!(snippet_matches("text:支付", "", "微信支付"));
+        assert!(!snippet_matches("img:支付", "", "微信支付"));
+        assert!(!snippet_matches("file:支付", "", "微信支付"));
+        assert!(!snippet_matches("app:微信", "微信", "支付"));
+        assert!(
+            snippet_matches("app:", "微信", "支付"),
+            "空前缀词不构成条件"
+        );
+        // 大小写：与 SQL 的 lower() 同口径（ASCII 不敏感）。
+        assert!(snippet_matches("CHROME", "chrome", ""));
     }
 
     #[test]
