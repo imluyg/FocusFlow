@@ -173,7 +173,9 @@ pub fn build_content(
             suffix: "",
         }),
         Metric::Duration => rows.push(Row {
-            label: "活跃",
+            // 与 both 那一路同一把尺子：这一格装的是时长就写「时长」，
+            // 写「活跃」会与"按键次数"那一格共用标签、又没有单位。
+            label: "时长",
             value: duration,
             accent: false,
             suffix: "",
@@ -527,7 +529,7 @@ mod tests {
         assert_eq!(metric_from("耗时"), Metric::Times);
     }
 
-    /// `metric=duration` 时「活跃」那一格换成长度，但**不会**多出第三行；
+    /// `metric=duration` 时那一格换成长度（标签也换成「时长」），但**不会**多出第三行；
     /// 只有 both 才三行。最后一格恒为「速度」。
     #[test]
     fn metric_decides_which_rows_exist_and_speed_is_always_last() {
@@ -542,6 +544,7 @@ mod tests {
         let d = build_content(Metric::Duration, 1234, false, 3700, false, true, false, 45);
         assert_eq!(d.rows.len(), 2);
         assert_eq!(d.rows[0].value, "1h 1m");
+        assert_eq!(d.rows[0].label, "时长", "装的是时长就写时长，别再叫活跃");
         assert_eq!(d.rows[1].label, "速度");
 
         let b = build_content(Metric::Both, 1234, false, 3700, false, true, false, 45);
@@ -569,7 +572,7 @@ mod tests {
     #[test]
     fn an_unreadable_duration_says_so_instead_of_zero_seconds() {
         let bad = build_content(Metric::Duration, 10, false, 0, true, true, false, 0);
-        assert_eq!(bad.rows[0].label, "活跃");
+        assert_eq!(bad.rows[0].label, "时长");
         assert_eq!(bad.rows[0].value, "读不出");
         assert_eq!(bad.rows.len(), 2, "读不出来也还是两行，卡片不该跳高");
 
