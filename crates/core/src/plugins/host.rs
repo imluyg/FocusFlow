@@ -831,6 +831,9 @@ pub fn register_host_api(
             row.set("time", task.schedule_time.as_str())?;
             row.set("enabled", task.enabled)?;
             row.set("last_run", task.last_run.clone().unwrap_or_default())?;
+            // 上一次没启动成功的原因（空串 = 没有）：目标被卸载、白名单拒绝、
+            // 调度解不开原先只进日志，面板照旧显示"启用 / 上次执行：从未"。
+            row.set("last_error", task.last_error.clone().unwrap_or_default())?;
             row.set(
                 "desc",
                 scheduler::describe_schedule(&task.schedule_type, &task.schedule_time),

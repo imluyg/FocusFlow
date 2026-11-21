@@ -25,6 +25,11 @@ pub struct ScheduledTask {
     pub schedule_time: String,
     pub enabled: bool,
     pub last_run: Option<String>,
+    /// 上一次启动没成功的直接原因（成功启动或修好后被清掉）。
+    ///
+    /// 目标被卸载、白名单拒绝、调度时刻解不开、连续三次起不来 —— 这些原先只写进
+    /// 默认可能关着的日志，面板上那条任务照旧显示"启用 / 上次执行：从未"。
+    pub last_error: Option<String>,
     pub created_at: String,
 }
 
@@ -41,6 +46,23 @@ fn open() -> rusqlite::Result<crate::db::connection::AuxConn> {
     })
 }
 
+/// 老库补 `last_error` 列（幂等）。
+///
+/// Python 时代整份复制进来的库、或升级前的本仓库都没有这一列。`init_db` 会补；
+/// 读侧也再确认一次 —— 有的用例/升级路径直接换掉整张表，不能假设建表语句刚跑过。
+fn ensure_last_error_column(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(scheduled_tasks)")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name.eq_ignore_ascii_case("last_error") {
+            return Ok(());
+        }
+    }
+    conn.execute_batch("ALTER TABLE scheduled_tasks ADD COLUMN last_error TEXT")?;
+    Ok(())
+}
+
 /// 初始化表结构（幂等）。
 pub fn init_db() -> anyhow::Result<()> {
     let conn = open()?;
@@ -54,9 +76,12 @@ pub fn init_db() -> anyhow::Result<()> {
             schedule_time TEXT NOT NULL,
             enabled INTEGER NOT NULL DEFAULT 1,
             last_run TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            last_error TEXT
         );",
     )?;
+    ensure_last_error_column(&conn)
+        .map_err(|e| anyhow::anyhow!("补齐定时任务的 last_error 列失败: {e}"))?;
     // 把遗留的 NULL `args` 补成空串。schema 里这列可空（Python 版就这么存），而读侧
     // 要把它当非 Option 的 String 用；库里留着 NULL 的话，那条任务会在所有"要读 args"
     // 的面上凭空消失（见 get_all_tasks 的逐行解码）。补一次比在每个读点各自兜底强。
@@ -899,9 +924,11 @@ pub fn toggle_task(id: i64, enabled: bool) -> anyhow::Result<bool> {
 /// 老表原样留着）。同族的 `accounting::EXPENSE_COLS` 与 `pomodoro::SESSION_COLS` 已经
 /// 因为同一个理由点过名，症状与修法一字不差：列序一错位，类型对不上的整行被丢掉
 /// （任务凭空消失），类型碰巧能读的则把时间读成路径（永久拒绝启动）。
-/// 写侧本来就点名这九列，所以点名不引入新的失败形态。
+/// 写侧本来就点名这几列，所以点名不引入新的失败形态（`last_error` 由 `init_db` 补列）。
+const TASK_COLS_BASE: &str = "id, name, target_path, args, schedule_type, schedule_time, \
+                              enabled, last_run, created_at";
 const TASK_COLS: &str = "id, name, target_path, args, schedule_type, schedule_time, \
-                         enabled, last_run, created_at";
+                         enabled, last_run, created_at, last_error";
 
 /// 只看清单的那一位：调度循环与既有用例用。
 ///
@@ -931,9 +958,17 @@ pub fn all_tasks_read() -> (Vec<ScheduledTask>, String) {
             );
         }
     };
-    let mut stmt = match conn.prepare(&format!(
-        "SELECT {TASK_COLS} FROM scheduled_tasks ORDER BY id"
-    )) {
+    // 列在就读带原因的清单；补不上（如只读库）就退回旧九列，别为了一列把整张表
+    // 判成"读不出来"。
+    let error_col = match ensure_last_error_column(&conn) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("定时任务表没有 last_error 列且补不上（{e}），这一轮不显示失败原因");
+            false
+        }
+    };
+    let cols = if error_col { TASK_COLS } else { TASK_COLS_BASE };
+    let mut stmt = match conn.prepare(&format!("SELECT {cols} FROM scheduled_tasks ORDER BY id")) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("定时任务读不出来（查询准备失败），本次按空列表处理: {e}");
@@ -943,7 +978,7 @@ pub fn all_tasks_read() -> (Vec<ScheduledTask>, String) {
             );
         }
     };
-    let result = stmt.query_map([], |r| {
+    let result = stmt.query_map([], move |r| {
         // args 在 schema 里可空（Python 版遗留库、backup/ 还原、手改都会留下 NULL），
         // 读成 Option 再兜底。原来读成非 Option 的 String，NULL 行会解码失败，
         // 又被下面的 flatten() 静默丢掉 —— 那条任务连一条日志都没有就再也不触发。
@@ -958,6 +993,11 @@ pub fn all_tasks_read() -> (Vec<ScheduledTask>, String) {
             enabled: r.get::<_, i64>(6)? != 0,
             last_run: r.get(7)?,
             created_at: r.get(8)?,
+            last_error: if error_col {
+                r.get::<_, Option<String>>(9)?
+            } else {
+                None
+            },
         })
     });
     let mut out: Vec<ScheduledTask> = Vec::new();
@@ -1522,12 +1562,30 @@ fn check_loop(stop: Arc<AtomicBool>, schema_ready: Arc<AtomicBool>) {
                              在插件页改正这一条的时刻即可恢复",
                             task.id
                         );
+                        record_last_error(
+                            task.id,
+                            Some(&format!("调度配置解不开，永远不会执行：{why}")),
+                        );
                         bad_config_window.insert(task.id, window.clone());
                     }
                 }
                 RunDecision::Wait => {}
             }
         }
+    }
+}
+
+/// 把这一次没能启动/不会执行的原因写进任务行（`None` = 这次成功，清掉旧账）。
+///
+/// 库里存一份而不是只留内存：插件页刷新时读的就是这一行，进程重启后也还看得见
+/// 上次为什么没起来。写失败只记日志 —— 不能因为"记不下原因"把调度本身搞红。
+fn record_last_error(id: i64, why: Option<&str>) {
+    let Ok(conn) = open() else { return };
+    if let Err(e) = conn.execute(
+        "UPDATE scheduled_tasks SET last_error=?1 WHERE id=?2",
+        rusqlite::params![why, id],
+    ) {
+        tracing::warn!("记录定时任务 #{id} 的失败原因失败: {e}");
     }
 }
 
@@ -1540,6 +1598,14 @@ fn record_launch(
     stamp: &str,
 ) {
     let outcome = execute_task(t);
+    // 面板上"启用 / 上次执行：从未"分不出"还没到点"与"每次都被拒"。把原因写回任务行，
+    // 成功启动时清掉；写失败只留日志，不能因为记不下原因把调度本身搞红。
+    match &outcome {
+        LaunchOutcome::Fired(_) => record_last_error(t.id, None),
+        LaunchOutcome::Refused(why) | LaunchOutcome::Transient(why) => {
+            record_last_error(t.id, Some(why))
+        }
+    }
     let fired_at = apply_attempt(backoffs, t.id, window, stamp, &outcome);
     if let Some(at) = fired_at {
         // 连配置指纹一起记：改了这条任务的时刻之后，这个戳就不再代表当前配置
@@ -1800,6 +1866,31 @@ mod tests {
         assert_eq!(t.created_at, "2026-01-01 00:00:00");
     }
 
+    /// 失败原因要落到任务行上，成功启动时清掉。
+    #[test]
+    fn a_failed_launch_is_remembered_on_the_task_row() {
+        let _g = isolate_app_dir("last_error");
+        let id = add_task(
+            "每日记事本",
+            &daily_task("23:59").target_path,
+            "",
+            "daily",
+            "23:59",
+            true,
+        )
+        .expect("夹具任务应能建起来");
+        record_last_error(id, Some("目标程序不见了"));
+        let t = get_all_tasks().into_iter().find(|t| t.id == id).unwrap();
+        assert_eq!(
+            t.last_error.as_deref(),
+            Some("目标程序不见了"),
+            "失败原因必须随清单一起读回来"
+        );
+        record_last_error(id, None);
+        let t = get_all_tasks().into_iter().find(|t| t.id == id).unwrap();
+        assert_eq!(t.last_error, None, "成功启动后旧账要清掉");
+    }
+
     /// 接线守卫：那条读路必须走点名列清单。
     ///
     /// 上面那条用例钉的是"读出来的值对不对"，它盯不到有人把 SQL 改回 `SELECT *` ——
@@ -1821,10 +1912,14 @@ mod tests {
             "又有查询用 SELECT * 猜列的位置（老库列序由建表决定）"
         );
         assert_eq!(
-            prod.matches("SELECT{TASK_COLS}FROMscheduled_tasksORDERBYid")
+            prod.matches("SELECT{cols}FROMscheduled_tasksORDERBYid")
                 .count(),
             1,
             "这一条读路不见了、或被改写成两份（列清单与下标顺序必须一对一）"
+        );
+        assert!(
+            TASK_COLS.ends_with("last_error") && !TASK_COLS_BASE.contains("last_error"),
+            "带原因的清单必须把 last_error 放在末尾；兜底清单不许带它（老库没这列）"
         );
     }
 
@@ -2417,6 +2512,7 @@ mod tests {
             schedule_time: time.into(),
             enabled: true,
             last_run: None,
+            last_error: None,
             created_at: String::new(),
         }
     }
@@ -3177,6 +3273,7 @@ mod tests {
             schedule_time: time.into(),
             enabled: true,
             last_run: None,
+            last_error: None,
             created_at: "2026-01-01T00:00:00".into(),
         }
     }

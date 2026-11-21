@@ -280,6 +280,25 @@ function get_view()
             text = "这份清单这次没读全：" .. tostring(gap),
         }
     end
+    -- 启动失败原先只写进默认可能关着的日志：目标被卸载/不在白名单、调度时刻解不开、
+    -- 连续三次起不来时，面板上仍是"启用 / 上次执行：从未"，看不出"它永远不会跑"。
+    local failed = {}
+    for _, t in ipairs(tasks) do
+        local why = t["last_error"]
+        if why and why ~= "" then
+            failed[#failed + 1] = "任务 #" .. tostring(t["id"]) .. " 上次没启动成功：" .. tostring(why)
+        end
+    end
+    if #failed > 0 then
+        widgets[#widgets + 1] = { type = "separator" }
+        widgets[#widgets + 1] = {
+            type = "label",
+            text = "下面这些任务上一次没能启动（改好目标或时刻后会重新试；重启程序会重开这一轮退避）：",
+        }
+        for _, line in ipairs(failed) do
+            widgets[#widgets + 1] = { type = "label", text = line }
+        end
+    end
     -- 上一次操作的结果：被白名单拒绝、删除成功与否都要在面板上说出来，
     -- 只写日志的话用户看到的就是「点了没反应」。
     if msg then

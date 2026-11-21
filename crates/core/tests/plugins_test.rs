@@ -2113,6 +2113,41 @@ mod tests {
         assert!(src.contains(".lnk"), "帮助文字漏了 .lnk 这条合法入口");
     }
 
+    /// 启动失败的原因要上屏：原先只写进默认可能关着的日志，面板上那条任务永远
+    /// 显示"启用 / 上次执行：从未"，看不出它其实每次都被拒。
+    #[test]
+    fn scheduler_panel_shows_the_last_launch_failure() {
+        use focusflow_core::scheduler;
+
+        let _guard = guard();
+        let (tmp, mut manager, name) = bundled_in("sched_last_error", "scheduler_plugin.lua");
+        scheduler::init_db().expect("定时任务库应能建起来");
+        let id = scheduler::add_task(
+            "老任务",
+            r"C:\Windows\notepad.exe",
+            "",
+            "daily",
+            "09:00",
+            true,
+        )
+        .expect("夹具任务应能建起来");
+        {
+            let conn = rusqlite::Connection::open(scheduler::db_path()).expect("打开调度库");
+            conn.execute(
+                "UPDATE scheduled_tasks SET last_error='目标程序不见了' WHERE id=?1",
+                [id],
+            )
+            .expect("写入夹具失败原因");
+        }
+        manager.refresh_view(&name).expect("重新出图");
+        let said = labels_of(&manager, &name).join(" | ");
+        assert!(said.contains("上次没启动成功"), "失败原因要上屏: {said}");
+        assert!(said.contains("目标程序不见了"), "{said}");
+
+        assert!(manager.unload_plugin(&name));
+        drop(tmp);
+    }
+
     /// `scheduler_plugin.lua` 的 `edit_id` 从未被使用、宿主的 `scheduler_update` 零
     /// 调用方 → GUI 里根本不存在"编辑任务"，只能删了重建（而新建被目标白名单卡着）。
     #[test]
