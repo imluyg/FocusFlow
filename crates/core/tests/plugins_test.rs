@@ -1710,6 +1710,23 @@ mod tests {
         );
         assert!(!ok.contains("没算出来"), "{ok}");
 
+        // 未来日期（记一笔明天的账是支持的）不许念成「距今 0 天」——那与今天同一句话。
+        let future = (chrono::Local::now().date_naive() + chrono::Duration::days(3))
+            .format("%Y-%m-%d")
+            .to_string();
+        let ahead =
+            accounting::add_expense("支出", "预订", None, &future, 2.0, Some("餐饮"), None, None);
+        assert!(ahead > 0, "夹具：未来日期那笔要写进去");
+        manager
+            .plugin_action(&name, &format!("days_{ahead}"))
+            .expect("距今多久");
+        let fut = report_of(&manager, &name);
+        assert!(fut.contains("还有 3 天"), "未来日期要说清还有几天:\n{fut}");
+        assert!(
+            !fut.contains("距今 0 天"),
+            "未来日期不许与今天共用「距今 0 天」:\n{fut}"
+        );
+
         // 把这条的日期改成空白：算不出来时要点名是哪一条、为什么，而且弹窗必须开
         {
             let conn = rusqlite::Connection::open(accounting::db_path()).expect("打开记账库");

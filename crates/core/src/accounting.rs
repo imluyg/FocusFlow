@@ -1957,7 +1957,8 @@ pub fn years_and_days(from: chrono::NaiveDate, today: chrono::NaiveDate) -> (i64
     (years as i64, (today - anniversary).num_days().max(0))
 }
 
-/// 距今多久：`交回 [(id, 年, 天)], 与「哪一条没答上、为什么」`（天是去掉整年后的余数）。
+/// 距今多久：`交回 [(id, 年, 天)], 与「哪一条没答上、为什么」`（天是去掉整年后的余数；
+/// 未来日期的 `天` 是负数，表示"还有 N 天"）。
 ///
 /// 第二个值不是装饰。面板原先只把命中的几条拼成行，`result_text` 为空时**连结果弹窗都不开**
 /// ⇒ 「选中一条按『距今多久』毫无反应」这一个症状，由四种结局共用：库正被别处占着、
@@ -2025,6 +2026,11 @@ pub fn days_ago(ids: &[i64]) -> (Vec<(i64, i64, i64)>, Vec<String>) {
         let parsed = normalize_date_filter(&date_str)
             .and_then(|norm| chrono::NaiveDate::parse_from_str(&norm, "%Y-%m-%d").ok());
         match parsed {
+            Some(date) if date > today => {
+                // 未来日期（「记一笔明天的账」是支持的）：负数天数表示还没到，
+                // 面板念「还有 N 天」。折成 `(0, 0)` 会与"就是今天"共用一句话。
+                out.push((rid, 0, -(date - today).num_days()));
+            }
             Some(date) => {
                 let (years, rest) = years_and_days(date, today);
                 out.push((rid, years, rest));

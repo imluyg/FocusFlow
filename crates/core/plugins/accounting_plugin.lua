@@ -446,7 +446,12 @@ function on_action(id)
                         -- 名字回退成编号时要说清为什么：读不出来与已被删掉不是一回事。
                         misses[#misses + 1] = rec_why
                     end
-                    if d["years"] > 0 then
+                    -- 负数是宿主的"日期在未来"约定：明天的账不叫"距今 0 天"
+                    -- （那与今天同一句话），要说清还有几天。
+                    if d["days"] < 0 then
+                        lines[#lines + 1] = "《" .. name .. "》 还有 " .. tostring(-d["days"])
+                            .. " 天（日期在未来）"
+                    elseif d["years"] > 0 then
                         lines[#lines + 1] = "《" .. name .. "》 距今 " .. d["years"] .. " 年 " .. d["days"] .. " 天"
                     else
                         lines[#lines + 1] = "《" .. name .. "》 距今 " .. d["days"] .. " 天"
