@@ -2518,6 +2518,40 @@ mod tests {
         );
     }
 
+    /// 「跳过」与「停止」同一族：空闲时宿主是静默空操作，面板不许替没发生的段落
+    /// 说一句「已作废」。
+    #[test]
+    fn skipping_an_idle_pomodoro_does_not_claim_a_voided_segment() {
+        let _guard = guard();
+        let (_tmp, mut manager, name) = bundled_in("pomo_skip_idle", "pomodoro_plugin.lua");
+        focusflow_core::pomodoro::init_db().ok();
+
+        manager
+            .plugin_action(&name, "skip")
+            .expect("跳过动作不该失败");
+        let said = labels_of(&manager, &name).join(" | ");
+        assert!(
+            said.contains("没有在计时的番茄钟"),
+            "空闲跳过要说清没有可作废的段落: {said}"
+        );
+        assert!(!said.contains("这一段作废"), "空闲跳过不许说已作废: {said}");
+
+        // 反向腿：刚开始就跳过（一秒都没计到）同样是"什么也没作废"
+        manager
+            .plugin_action(&name, "start_work")
+            .expect("开始工作不该失败");
+        manager.plugin_action(&name, "skip").expect("跳过不该失败");
+        let said2 = labels_of(&manager, &name).join(" | ");
+        assert!(
+            said2.contains("一秒都没计到"),
+            "零秒跳过要说清什么也没作废: {said2}"
+        );
+        assert!(
+            !said2.contains("这一段作废"),
+            "零秒跳过不许说已作废: {said2}"
+        );
+    }
+
     /// 插件这一头必须把"类型读不出来"与"库里没设类型"当两件事。
     ///
     /// 宿主这条通道原先只回一个字符串：`None` 被印成空串，于是分类表里那一格画「双向」

@@ -112,8 +112,18 @@ function on_action(id)
     elseif id == "skip" then
         -- 宿主的 pomodoro_skip 早就有"这段作废"的语义（不落库、不计入今日番茄数），
         -- 只是面板一直缺这个按钮：工作到一半只能按停止，于是今日汇总谎报"完成 1 个"。
+        -- 空闲时宿主是静默空操作，与「停止」同一族：不许替没发生的段落说"已作废"。
+        local state = focusflow.pomodoro_state()
+        local was_running = (state["state"] or 0) ~= 0
+        local elapsed = (state["planned"] or 0) - (state["remaining"] or 0)
         focusflow.pomodoro_skip()
-        hint = "已跳过：这一段作废，不落库、也不计入「今日完成」"
+        if not was_running then
+            hint = "没有在计时的番茄钟：没有可作废的段落"
+        elseif elapsed <= 0 then
+            hint = "已跳过：这一段一秒都没计到，什么也没有作废"
+        else
+            hint = "已跳过：这一段作废，不落库、也不计入「今日完成」"
+        end
     elseif id == "apply_durations" then
         local w = tonumber(d_work)
         local b = tonumber(d_brk)
