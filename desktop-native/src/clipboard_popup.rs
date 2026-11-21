@@ -2009,6 +2009,18 @@ fn footer_slots(w: i32, pad: i32, right_present: bool, dpi: f32) -> (i32, i32) {
     (left_w, w - pad - right_w)
 }
 
+/// 标题右侧那一格计数。
+///
+/// 读失败时列表已经被清空，照 `len()` 念就是「0 条」—— 与下面那句「这一轮没读出来」
+/// 同一屏互相打脸，还会把"库打不开"说成"你没有记录"。真没记录时才念 0。
+fn header_count(mode: Mode, len: usize, load_failed: bool) -> String {
+    match mode {
+        Mode::Stats => String::new(),
+        Mode::History | Mode::Snippets if load_failed => "读不出来".to_string(),
+        Mode::History | Mode::Snippets => format!("{len} 条"),
+    }
+}
+
 unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
     let (w, h) = client_size(hwnd);
     let lay = layout_for(w, h, st.dpi);
@@ -2026,11 +2038,7 @@ unsafe fn draw(hdc: HDC, hwnd: HWND, st: &mut State) {
         Mode::Snippets => "收藏",
         Mode::Stats => "剪贴板统计",
     };
-    let count = match st.mode {
-        Mode::History => format!("{} 条", st.history.len()),
-        Mode::Snippets => format!("{} 条", st.snippets.len()),
-        Mode::Stats => String::new(),
-    };
+    let count = header_count(st.mode, st.rows().len(), st.load_failed());
     draw_str(
         hdc,
         title,
@@ -2589,6 +2597,16 @@ mod tests {
         let lay = layout_for(10, 10, 96.0);
         assert_eq!(lay.rows, 1);
         assert!(lay.search.right > lay.search.left);
+    }
+
+    /// 标题的「N 条」不许把读失败折成 0：正文写着没读出来，右上角却说 0 条。
+    #[test]
+    fn the_header_count_never_turns_a_failed_read_into_zero() {
+        assert_eq!(header_count(Mode::History, 0, true), "读不出来");
+        assert_eq!(header_count(Mode::Snippets, 0, true), "读不出来");
+        assert_eq!(header_count(Mode::History, 0, false), "0 条", "真没记录");
+        assert_eq!(header_count(Mode::Snippets, 7, false), "7 条");
+        assert_eq!(header_count(Mode::Stats, 0, false), "");
     }
 
     #[test]
