@@ -238,6 +238,26 @@ local function gap_head(lines, gap)
     return true
 end
 
+-- 月度汇总的每一格要不要念「读不出来」。宿主按字段给原因（"支出合计读不出来：…"），
+-- 而库打不开/月份写错时整份都不可用、原因里不含任何字段名 —— 那一档每格都不许给数。
+local SUMMARY_FIELDS = { "支出合计", "收入合计", "条数", "分类明细" }
+local function summary_field_failed(gap, label)
+    if gap == nil or gap == "" then
+        return false
+    end
+    local named = false
+    for _, key in ipairs(SUMMARY_FIELDS) do
+        if string.find(gap, key, 1, true) then
+            named = true
+            break
+        end
+    end
+    if not named then
+        return true
+    end
+    return string.find(gap, label, 1, true) ~= nil
+end
+
 function on_action(id)
     if id == PANEL_CLOSED then
         reset_transient_state()
@@ -456,10 +476,26 @@ function on_action(id)
         local expense, income, count, stats, gap = focusflow.accounting_monthly_detail(ym)
         local lines = { "【" .. ym .. " 月度汇总】" }
         local partial = gap_head(lines, gap)
-        lines[#lines + 1] = "  总支出：" .. fmt2(expense)
-        lines[#lines + 1] = "  总收入：" .. fmt2(income)
-        lines[#lines + 1] = "  净额：" .. fmt_net(income - expense)
-        lines[#lines + 1] = "  记录数：" .. tostring(count)
+        -- 没读全时那几格按原因分头说话：库打不开是整份不可用，单条合计读不动时
+        -- 另外两条仍是真数。原先前四行无条件按 0 印，与上一句"没读全"自相矛盾。
+        local function money_line(label, field, value)
+            if summary_field_failed(gap, field) then
+                return "  " .. label .. "：读不出来"
+            end
+            return "  " .. label .. "：" .. fmt2(value)
+        end
+        lines[#lines + 1] = money_line("总支出", "支出合计", expense)
+        lines[#lines + 1] = money_line("总收入", "收入合计", income)
+        if summary_field_failed(gap, "支出合计") or summary_field_failed(gap, "收入合计") then
+            lines[#lines + 1] = "  净额：读不出来"
+        else
+            lines[#lines + 1] = "  净额：" .. fmt_net(income - expense)
+        end
+        if summary_field_failed(gap, "条数") then
+            lines[#lines + 1] = "  记录数：读不出来"
+        else
+            lines[#lines + 1] = "  记录数：" .. tostring(count)
+        end
         lines[#lines + 1] = ""
         if stats and #stats > 0 then
             lines[#lines + 1] = "分类明细（净额，收入为正/支出为负）："

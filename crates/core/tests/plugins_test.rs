@@ -1659,6 +1659,16 @@ mod tests {
             !monthly.contains("（本月暂无分类明细）"),
             "读不动时不许断定本月没有明细:\n{monthly}"
         );
+        // 合计与条数也不许照 0 印：上一句刚说"没读全"，下一句写「总支出：0.00
+        // 记录数：0」就是把"读不动"说成了"这个月没花钱"。
+        assert!(
+            !monthly.contains("总支出：0.00") && !monthly.contains("记录数：0"),
+            "读不动不许给零报告:\n{monthly}"
+        );
+        assert!(
+            monthly.contains("总支出：读不出来") && monthly.contains("记录数：读不出来"),
+            "哪一格没读到要就地说明:\n{monthly}"
+        );
 
         assert!(manager.unload_plugin(&name));
         drop(tmp);
