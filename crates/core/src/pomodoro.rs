@@ -770,16 +770,37 @@ fn tick_once(
     session
 }
 
+/// 下一轮用来算 `delta` 的锚点。
+///
+/// 计时中只把**已计入的整秒**加到锚点上，余下的零头留到下一轮：`sleep(1000ms)` 在
+/// Windows 上通常多睡几毫秒，若每轮都把锚点拽到 `now`，这点零头就被永久丢掉 ——
+/// 25 分钟的番茄会走成 25 分十几秒，而落库的 `actual_seconds` 又按整秒写着 1500。
+/// 空闲/暂停的轮次反过来必须跟到当下：否则 resume 后第一轮会把暂停期间整个补计进去。
+fn next_tick_anchor(
+    last_tick: chrono::DateTime<Local>,
+    now_wall: chrono::DateTime<Local>,
+    delta: i64,
+    running: bool,
+) -> chrono::DateTime<Local> {
+    if running {
+        last_tick + chrono::Duration::seconds(delta.max(0))
+    } else {
+        now_wall
+    }
+}
+
 /// 后台计时循环（每秒 tick）。
 fn tick_loop(state: Arc<Mutex<TimerState>>, stop: Arc<AtomicBool>) {
     let mut last_tick = Local::now();
     while !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(1000));
         let now_wall = Local::now();
-        // 每轮都推进锚点：空闲/暂停的这些轮也必须重置，否则 resume 之后
-        // 第一次 tick 会把"暂停期间过去的时间"整个算进这一段
+        let running = {
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.state != STATE_IDLE && !s.paused
+        };
         let delta = tick_delta_seconds(&last_tick, &now_wall);
-        last_tick = now_wall;
+        last_tick = next_tick_anchor(last_tick, now_wall, delta, running);
         // 落盘排在出锁之后：原先是持锁 INSERT，而 SQLite 的 busy_timeout 是 15 秒，
         // 一旦库被占住，主线程每次按键的 record_key（抢同一把锁）都会跟着卡住整个界面。
         if let Some(session) = tick_once(&state, delta, now_wall) {
@@ -1295,6 +1316,36 @@ mod busy_lock_tests {
         assert_eq!(tick_delta_seconds(&a, &b), 1800, "睡 30 分钟要一次补齐");
         assert_eq!(tick_delta_seconds(&b, &a), 0, "时钟往回拨不能把进度吐回去");
         assert_eq!(tick_delta_seconds(&a, &a), 0);
+    }
+
+    /// 每轮 `sleep` 多出来的零头不能永久丢掉：25 分钟会被走成 25 分十几秒，
+    /// 而落库的 `actual_seconds` 仍按整秒写着 1500。
+    #[test]
+    fn the_tick_anchor_carries_the_sub_second_remainder() {
+        use chrono::{Duration as ChronoDuration, TimeZone};
+        let start = Local
+            .with_ymd_and_hms(2026, 9, 23, 10, 0, 0)
+            .single()
+            .expect("合法本地时刻");
+        // 每轮实际睡 1.2 秒：按旧写法每轮只计入 1 秒，5 轮会少算 1 秒。
+        let mut anchor = start;
+        let mut counted = 0;
+        for step in 1..=5 {
+            let now = start + ChronoDuration::milliseconds(1200 * step);
+            let delta = tick_delta_seconds(&anchor, &now);
+            counted += delta;
+            anchor = next_tick_anchor(anchor, now, delta, true);
+        }
+        assert_eq!(counted, 6, "1.2 秒 × 5 轮的实际过去时间里应有 6 秒被计入");
+        assert_eq!(
+            anchor,
+            start + ChronoDuration::seconds(6),
+            "锚点只前进已计入的整秒，零头留给下一轮"
+        );
+
+        // 反向腿：空闲/暂停时锚点必须跟到当下，否则 resume 后第一轮会把暂停时间补计进来。
+        let later = start + ChronoDuration::minutes(10);
+        assert_eq!(next_tick_anchor(start, later, 600, false), later);
     }
 
     /// 墙钟**向前**凭空跳，不能给本段造出没走过的时间。
