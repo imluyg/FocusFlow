@@ -1181,7 +1181,8 @@ unsafe fn repaint(hwnd: HWND) -> bool {
             // 卡片与停靠条那一条重叠 ⇒ 每拍抢一次层级，**不碰坐标**。
             // 只答 `WM_WINDOWPOSCHANGING` 不够：没被问到的那一刻没人替我们答，而任务栏同为
             // topmost，它在我们的锚点之后被按过一次就会把我们盖在下面（21:00 现场报的那一种）。
-            if top + h > mon.bar_bottom {
+            // 任务栏可以停在上/下/左/右任一边，所以四条边都要看。
+            if overlaps_taskbar(rc.left, top, w, h, &mon) {
                 keep_above_bar(hwnd);
             }
         }
@@ -1195,10 +1196,10 @@ unsafe fn get_rect(hwnd: HWND) -> Option<RECT> {
     unsafe { wm::GetWindowRect(hwnd, &mut rc).is_ok() }.then_some(rc)
 }
 
-/// 一块屏幕的**整屏**矩形（`MONITORINFO.rcMonitor`），物理像素，另带停靠条那一条的下边界。
+/// 一块屏幕的**整屏**矩形（`MONITORINFO.rcMonitor`），物理像素，另带工作区四条边。
 ///
-/// 落点与"长高让位"都按整屏问；`bar_bottom` 只用来判断"这张卡片压没压在任务栏那一条上"，
-/// 压着就改层级、不改坐标。
+/// 落点与"长高让位"都按整屏问；工作区只用来判断"这张卡片压没压在任务栏那一条上"，
+/// 压着就改层级、不改坐标。任务栏可能停在上/下/左/右任一边，所以四条边都要留。
 ///
 /// ⚠ 口径变更（2026-10-27 深夜他实测报的）：把卡片放到任务栏那一条上，它自己跑了 ⇒
 /// "别乱动我放的位置"优先，"被任务栏盖住"那一格由 [`keep_above_bar`] 用层级解决。
@@ -1211,8 +1212,11 @@ struct Mon {
     y: i32,
     w: i32,
     h: i32,
-    /// 工作区底边（物理像素）：停靠条占掉的那一条的下沿。
-    bar_bottom: i32,
+    /// 工作区四条边（物理像素）：停靠条占掉的那一条就在整屏与它之间。
+    work_left: i32,
+    work_top: i32,
+    work_right: i32,
+    work_bottom: i32,
 }
 
 unsafe fn monitor_at(px_x: i32, px_y: i32, flags: g::MONITOR_FROM_FLAGS) -> Option<Mon> {
@@ -1229,26 +1233,38 @@ unsafe fn monitor_at(px_x: i32, px_y: i32, flags: g::MONITOR_FROM_FLAGS) -> Opti
             y: mi.rcMonitor.top,
             w: (mi.rcMonitor.right - mi.rcMonitor.left).max(1),
             h: (mi.rcMonitor.bottom - mi.rcMonitor.top).max(1),
-            bar_bottom: mi.rcWork.bottom,
+            work_left: mi.rcWork.left,
+            work_top: mi.rcWork.top,
+            work_right: mi.rcWork.right,
+            work_bottom: mi.rcWork.bottom,
         })
     }
 }
 
 /// 离这个物理坐标最近的那块屏的整屏矩形；拿不到就退回主屏尺寸。
 ///
-/// 退回那条只有 `SM_CXSCREEN`/`SM_CYSCREEN`（都是整屏），拿不到工作区，于是 `bar_bottom`
-/// 只能填成整屏底边 ⇒ 那一刻不会去抢层级，但**也不会搬坐标**——宁可少压一层，不要乱动位置。
+/// 退回那条只有 `SM_CXSCREEN`/`SM_CYSCREEN`（都是整屏），拿不到工作区，于是工作区按整屏
+/// 填 ⇒ 那一刻不会去抢层级，但**也不会搬坐标**——宁可少压一层，不要乱动位置。
 fn nearest_monitor(px_x: i32, px_y: i32) -> Mon {
     unsafe { monitor_at(px_x, px_y, g::MONITOR_DEFAULTTONEAREST) }.unwrap_or_else(|| unsafe {
+        let w = wm::GetSystemMetrics(wm::SM_CXSCREEN).max(1);
         let h = wm::GetSystemMetrics(wm::SM_CYSCREEN).max(1);
         Mon {
             x: 0,
             y: 0,
-            w: wm::GetSystemMetrics(wm::SM_CXSCREEN).max(1),
+            w,
             h,
-            bar_bottom: h,
+            work_left: 0,
+            work_top: 0,
+            work_right: w,
+            work_bottom: h,
         }
     })
+}
+
+/// 卡片矩形有没有压到停靠条那一条（任务栏可能停在上/下/左/右任一边）。
+fn overlaps_taskbar(x: i32, y: i32, w: i32, h: i32, mon: &Mon) -> bool {
+    x < mon.work_left || y < mon.work_top || x + w > mon.work_right || y + h > mon.work_bottom
 }
 
 /// 存过的坐标该落在哪：物理落点 `(x, y)` 与逻辑锚点 top。
@@ -1333,6 +1349,19 @@ fn card_logical_size(width_cfg: f64, height_cfg: f64, rows: usize, taskbar_h: i3
     )
 }
 
+/// 存档坐标该乘回的倍数：`pos_scale` 合理就用它，否则退回当前（建窗时是主屏）那一档。
+///
+/// 建窗那一刻窗口在 (0,0)，`GetDpiForWindow` 问到的永远是主屏；主屏 100%、卡片停在
+/// 150% 副屏时，拿主屏倍数还原 150% 屏上存的逻辑坐标，落点会偏进另一块屏甚至屏幕外。
+/// 旧配置没有 `pos_scale`，退回旧行为（当前倍数），不制造新的错位。
+fn saved_scale(pos_scale: f64, current: f64) -> f64 {
+    if pos_scale.is_finite() && (0.5..=8.0).contains(&pos_scale) {
+        pos_scale
+    } else {
+        current
+    }
+}
+
 /// 初始位置：配置里的逻辑坐标；没存过就落右上角附近。
 fn initial_position(scale: f64) -> (i32, i32, i32) {
     let cfg = focusflow_core::config::instance();
@@ -1346,6 +1375,8 @@ fn initial_position(scale: f64) -> (i32, i32, i32) {
             60,
         )
     } else {
+        // 存盘那块屏的倍数才是这对逻辑坐标的尺子；建窗时问到的只是主屏。
+        let scale = saved_scale(cfg.get_float("floating", "pos_scale", f64::NAN), scale);
         // 存过的坐标必须过一遍夹取：拔掉副屏再启动时那对数字可能整张落在屏幕之外，
         // 而卡片看不见就拖不到，界面上没有别的入口能把它召回来。
         let mon = nearest_monitor(
@@ -1460,6 +1491,8 @@ fn persist_position(hwnd: HWND) {
         for (key, value) in [
             ("pos_x", (rc.left as f64 / scale).round().to_string()),
             ("pos_y", (rc.top as f64 / scale).round().to_string()),
+            // 与坐标一起存：混 DPI 多屏时，没有这一格就只能拿主屏倍数猜它当年是哪块屏。
+            ("pos_scale", scale.to_string()),
         ] {
             if let Err(e) = cfg.set_now("floating", key, &value) {
                 failed.push(format!("{key}={value}（{e}）"));
@@ -1717,7 +1750,7 @@ pub fn shutdown() {
 #[cfg(test)]
 mod anchor_tests {
     // 本测试模是选择性导入（不是 `use super::*`）：新用例引用生产项要在这里补名字。
-    use super::{anchor_now, card_logical_size};
+    use super::{anchor_now, card_logical_size, overlaps_taskbar, saved_scale, Mon};
     use crate::floating_render as fr;
 
     /// 用户在拖：这一格既不是锚点、也不是我们自己摆出去的 ⇒ 锚点认它。
@@ -1804,6 +1837,79 @@ mod anchor_tests {
         );
         // 配置值高于两者时原样保住用户要的
         assert_eq!(card_logical_size(400.0, 120.0, 2, 48), (400, 120));
+    }
+
+    /// 混 DPI 多屏：存档倍数要在还原时用上、拖完要写回。
+    ///
+    /// 建窗那一刻窗口在 (0,0)，问到的永远是主屏倍数；主屏 100% 而卡片停在 150% 副屏时，
+    /// 按主屏倍数还原那对逻辑坐标会把卡片放回另一块屏（甚至夹到屏幕外）。
+    #[test]
+    fn the_floating_position_remembers_which_scale_it_was_saved_at() {
+        assert_eq!(
+            saved_scale(1.5, 1.0),
+            1.5,
+            "150% 副屏上存的坐标不能按主屏倍数还原"
+        );
+        assert_eq!(
+            saved_scale(f64::NAN, 1.25),
+            1.25,
+            "旧配置没有这一格：退回当前倍数，不制造新的错位"
+        );
+        assert_eq!(saved_scale(0.0, 1.0), 1.0, "坏值不参与换算");
+        assert_eq!(saved_scale(99.0, 1.0), 1.0, "坏值不参与换算");
+
+        let src = include_str!("floating.rs");
+        let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
+        let prod = &src[..cut];
+        assert!(
+            prod.contains("(\"pos_scale\", scale.to_string())"),
+            "拖完不写倍数，下次启动还按主屏猜"
+        );
+        assert!(
+            prod.contains("saved_scale(cfg.get_float(\"floating\", \"pos_scale\""),
+            "还原时没读存档倍数"
+        );
+    }
+
+    /// 任务栏停在哪一边都要能被 `overlaps_taskbar` 看见：旧实现只看底边，
+    /// 顶/左/右停靠时卡片被任务栏盖住却从不抢层级。
+    #[test]
+    fn a_taskbar_on_any_edge_still_gets_the_raise() {
+        let base = Mon {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+            work_left: 0,
+            work_top: 0,
+            work_right: 1920,
+            work_bottom: 1080,
+        };
+        assert!(
+            !overlaps_taskbar(100, 100, 300, 48, &base),
+            "没有停靠条时不该抢层级"
+        );
+        let bottom = Mon {
+            work_bottom: 1040,
+            ..base
+        };
+        assert!(overlaps_taskbar(100, 1000, 300, 48, &bottom), "底边停靠");
+        assert!(!overlaps_taskbar(100, 900, 300, 48, &bottom));
+        let top = Mon {
+            work_top: 40,
+            ..base
+        };
+        assert!(overlaps_taskbar(100, 10, 300, 48, &top), "顶边停靠");
+        let left = Mon {
+            work_left: 60,
+            ..base
+        };
+        assert!(overlaps_taskbar(10, 100, 300, 48, &left), "左边停靠");
+        let right = Mon {
+            work_right: 1860,
+            ..base
+        };
+        assert!(overlaps_taskbar(1700, 100, 300, 48, &right), "右边停靠");
     }
 
     /// 接线守卫：重画那一拍与启动那一次钳位**都得**问这同一把尺子。
