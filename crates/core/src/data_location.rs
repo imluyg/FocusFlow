@@ -586,7 +586,7 @@ fn plan_migration(
             };
         }
     }
-    if from == resolved {
+    if same_directory(&from, resolved) {
         return MigrationPlan::ClearMarker;
     }
     MigrationPlan::Migrate {
@@ -1879,6 +1879,29 @@ mod migration_plan_tests {
         // 配置里根本没写 data_home（便携包的默认布局）时也照旧走原来的两条分支
         let plan2 = plan_migration(&app.path().to_string_lossy(), "", app.path(), app.path());
         assert!(matches!(plan2, MigrationPlan::ClearMarker), "{plan2:?}");
+
+        // 同一目录换一种大小写写法（Windows 不区分大小写）也要清标记：
+        // 字节比较会把它放去 Migrate，最后交回一份「搬了 0 个文件、旧目录已清空」的回执。
+        let mut spelled = app.path().to_string_lossy().to_string();
+        let first = spelled.chars().next().unwrap_or('?');
+        if first.is_ascii_alphabetic() {
+            let flipped = if first.is_ascii_uppercase() {
+                first.to_ascii_lowercase()
+            } else {
+                first.to_ascii_uppercase()
+            };
+            spelled.replace_range(0..1, &flipped.to_string());
+            let plan3 = plan_migration(
+                &spelled,
+                &app.path().to_string_lossy(),
+                app.path(),
+                app.path(),
+            );
+            assert!(
+                matches!(plan3, MigrationPlan::ClearMarker),
+                "同一目录的大小写写法该清标记: {plan3:?}"
+            );
+        }
     }
 }
 
