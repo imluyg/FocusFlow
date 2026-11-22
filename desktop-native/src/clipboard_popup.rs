@@ -2301,8 +2301,11 @@ fn draw_stats(hdc: HDC, st: &mut State, lay: Layout, w: i32) {
         format!("今日复制 {} 次", s.today),
         format!("最近 {} 天 {} 次", s.window_days, s.window_count),
         format!(
-            "库里 {} 条（固定 {} 条） · 累计复制 {} 次",
-            s.total_items, s.pinned_items, s.total_copies
+            "库里 {} 条（固定 {} 条） · {} {} 次",
+            s.total_items,
+            s.pinned_items,
+            clipboard::TOTAL_COPIES_LABEL,
+            s.total_copies
         ),
     ];
     let mut y = lay.list_top + 10;

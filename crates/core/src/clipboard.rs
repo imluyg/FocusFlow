@@ -532,11 +532,18 @@ pub struct Snippet {
     pub use_count: i64,
 }
 
+/// `ClipStats::total_copies` 的口径：台账只保留一年（见 `trim`），屏上不许念「累计」。
+///
+/// 这句统计同时出现在弹窗与管理页，标签只留这一份：把「近一年」写死两遍，
+/// 将来改台账上界时另一处很容易忘了跟。
+pub const TOTAL_COPIES_LABEL: &str = "近一年复制";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClipStats {
     pub today: i64,
     pub window_days: i64,
     pub window_count: i64,
+    /// `clipboard_daily` 台账（近一年）里的复制次数；不是全历史累计。
     pub total_copies: i64,
     pub total_items: i64,
     pub pinned_items: i64,
@@ -3740,6 +3747,26 @@ mod tests {
         crate::config::instance()
             .set("clipboard", "max_items", "500")
             .unwrap();
+    }
+
+    /// 统计那三句里「近一年复制」的口径：`clipboard_daily` 台账只保留一年，不许写成
+    /// 「累计」。台账一直涨不会有人清理，但一年前的计数确实被 `trim` 删掉 —— 屏上若
+    /// 念「累计」，用满一年后那个数就会停涨甚至变小。
+    #[test]
+    fn the_total_copies_line_names_the_one_year_ledger_not_a_lifetime_total() {
+        assert_eq!(TOTAL_COPIES_LABEL, "近一年复制");
+        assert!(!TOTAL_COPIES_LABEL.contains("累计"));
+
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("clip_ledger_year");
+        init_db().unwrap();
+        let old = now_ms() - 400 * 86_400_000;
+        ingest("四百天前的一次复制", "explorer.exe", old).unwrap();
+        assert_eq!(
+            stats(7).unwrap().total_copies,
+            0,
+            "台账只保留一年：那句若写「累计」，这里就是它说的谎"
+        );
     }
 
     #[test]
