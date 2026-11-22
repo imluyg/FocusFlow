@@ -539,14 +539,20 @@ pub fn current_year() -> i32 {
 }
 
 /// 判断路径是否为年度数据库文件（`focusflow_<4位年份>.db`）。
+///
+/// 年份只认 1000..=9999（与 CLI `--stats-year` 同一把尺子）：四位数字里 `0000`/`0999`
+/// 这种名字拼出的年份库没人生产过，而目录扫描（统计、迁移、备份、清理）会把它们当
+/// 真年份库去开 —— 一个恰好叫 `focusflow_0000.db` 的陌生 SQLite 文件就会让面板长期
+/// 报「这一轮没读全」。`focusflow_1969.db` 这类真实年份仍然认（跨年归档会生产它）。
 pub fn is_year_db_file(path: &Path) -> Option<i32> {
     let name = path.file_name()?.to_str()?;
     let stem = name.strip_prefix("focusflow_")?.strip_suffix(".db")?;
-    if stem.len() == 4 && stem.chars().all(|c| c.is_ascii_digit()) {
-        stem.parse().ok()
-    } else {
-        None
+    if stem.len() != 4 || !stem.chars().all(|c| c.is_ascii_digit()) {
+        return None;
     }
+    stem.parse::<i32>()
+        .ok()
+        .filter(|y| (1000..=9999).contains(y))
 }
 
 #[cfg(test)]
@@ -817,6 +823,32 @@ mod tests {
                 logs.iter().any(|l| l.contains("不合法") && l.contains(evil)),
                 "越界的名字要点名是哪个、并出声（静默给一个能用的路径等于让它下次真写进去）: {logs:?}"
             );
+        }
+    }
+
+    /// 年度库名只认 1000..=9999：四位数字里的 `0000`/`0999` 不是年份，不能被统计、
+    /// 迁移、备份当成真年份库去打开（陌生文件恰好叫这个名字时，面板会长期报读不全）。
+    #[test]
+    fn year_db_names_are_limited_to_four_digit_years() {
+        use std::path::Path as P;
+        assert_eq!(is_year_db_file(P::new("focusflow_2026.db")), Some(2026));
+        assert_eq!(
+            is_year_db_file(P::new(r"C:\data\focusflow_1969.db")),
+            Some(1969),
+            "跨年归档会生产 1970 之前的真实年份库"
+        );
+        assert_eq!(is_year_db_file(P::new("focusflow_1000.db")), Some(1000));
+        assert_eq!(is_year_db_file(P::new("focusflow_9999.db")), Some(9999));
+        for bad in [
+            "focusflow_0000.db",
+            "focusflow_0999.db",
+            "focusflow_202.db",
+            "focusflow_20266.db",
+            "focusflow_2026.db-wal",
+            "focusflow_2026.DB",
+            "FocusFlow_2026.db",
+        ] {
+            assert_eq!(is_year_db_file(P::new(bad)), None, "{bad} 不该被认成年度库");
         }
     }
 }
