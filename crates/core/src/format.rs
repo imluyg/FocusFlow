@@ -193,15 +193,19 @@ pub fn fmt_compact_duration(secs: i64) -> String {
 }
 
 /// CSV 字段转义：含逗号/引号/换行时加引号并将内部引号双写；
-/// `=`/`+`/`-`/`@`/Tab/CR 开头加前导单引号，防止 Excel 公式注入。
+/// `=`/`+`/`-`/`@`/Tab/CR/LF 开头加前导单引号，防止 Excel 公式注入。
 ///
 /// 键名来自旧版导入数据与恢复文件，不是可信内部常量，必须转义后再落盘。
 ///
-/// `-` 与 `\t` 也在 OWASP 列出的公式前缀里。对本项目 `-` 尤其不是理论风险：
+/// `-`、`\t`、CR 与 LF 都在 OWASP 列出的公式前缀里。对本项目 `-` 尤其不是理论风险：
 /// 减号键本身就叫 `-`，`-=~` 这类组合键名会以 `-` 开头，Excel 会按公式求值
-/// （如 `-2+3` → 计算结果，`=cmd()|certutil` 之类可执行外部命令）。
+/// （如 `-2+3` → 计算结果，`=cmd()|certutil` 之类可执行外部命令）。LF 那一条不能
+/// 靠"反正整格会加引号"兜住：引号是 CSV 语法，Excel 打开后仍会把换行后的 `=` 当公式。
 pub fn csv_field(s: &str) -> String {
-    let escaped = if matches!(s.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r')) {
+    let escaped = if matches!(
+        s.chars().next(),
+        Some('=' | '+' | '-' | '@' | '\t' | '\r' | '\n')
+    ) {
         format!("'{s}")
     } else {
         s.to_string()
@@ -348,6 +352,10 @@ mod tests {
         assert_eq!(csv_field("-=~-_+"), "'-=~-_+");
         assert_eq!(csv_field("-2+3"), "'-2+3");
         assert_eq!(csv_field("\tA"), "'\tA");
+        // CR 与 LF 同属 OWASP 的前缀表。整格会因为换行被加引号，但引号只是 CSV 语法，
+        // Excel 打开后仍会把换行后的 `=` 当公式 —— 前导单引号那一道不能漏。
+        assert_eq!(csv_field("\r=cmd()"), "\"'\r=cmd()\"");
+        assert_eq!(csv_field("\n=cmd()"), "\"'\n=cmd()\"");
         // 注入 + 逗号同时命中：先加前导引号，再因逗号整体加引号
         assert_eq!(csv_field("=a,b"), "\"'=a,b\"");
     }
