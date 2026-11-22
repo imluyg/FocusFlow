@@ -1717,7 +1717,8 @@ mod tests {
     /// 用例分别钉住了收尾与采纳那一半，这条钉的是窗口本身不回来）。
     #[test]
     fn a_local_set_keeps_the_value_lock_through_the_pending_mark() {
-        let src = include_str!("config.rs");
+        // 换行先统一：CRLF 检出时 `"\n    }\n"` 切不出函数体（与 `main.rs` 那批源码守卫同一条口径）。
+        let src = include_str!("config.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod.find("fn set_local(").expect("set_local 不见了");
         let rest = &prod[at..];
