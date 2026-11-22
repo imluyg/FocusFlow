@@ -877,6 +877,14 @@ pub fn update_task(
     } else {
         existing.6 // 就是上面那次 SELECT 读回来的值，读失败已经在那里 return 了
     };
+    // 目标/参数/调度任一真的改了，上一条 `last_error` 就不再描述这条任务：
+    // 用户已经按那句话把配置改对了，面板不能继续说「上次没启动成功」，更不能
+    // 顶着「调度配置解不开，永远不会执行」等到下一个触发时刻（daily 可能是明天）。
+    // 与 `last_run` 同一把尺子：只认**合并后**的值变化，插件把整条记录原样传回来不算。
+    let config_changed = new_target != existing.1.trim()
+        || new_args != existing.2.trim()
+        || new_type != existing.3
+        || new_time != existing.4.trim();
 
     conn.execute(
         "UPDATE scheduled_tasks SET name=?1, target_path=?2, args=?3, schedule_type=?4, schedule_time=?5, enabled=?6, last_run=?7 WHERE id=?8",
@@ -885,6 +893,15 @@ pub fn update_task(
             if new_enabled { 1 } else { 0 }, last_run, id
         ],
     )?;
+    if config_changed {
+        // 单独一条、失败只记日志：老库补列失败时主更新仍要成功（读侧已有同样的兜底）。
+        if let Err(e) = conn.execute(
+            "UPDATE scheduled_tasks SET last_error=NULL WHERE id=?1",
+            [id],
+        ) {
+            tracing::warn!("定时任务 #{id} 的配置已改，但清掉上次失败原因失败: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -2291,6 +2308,37 @@ mod tests {
         let t2 = get_all_tasks().into_iter().find(|x| x.id == id).unwrap();
         assert_eq!(t2.last_run, None, "改了调度时刻就该重新计一次");
         assert!(should_run(&t2, &Local::now()), "改到新时刻后要能重新触发");
+    }
+
+    /// 把导致失败的配置改对之后，面板不许继续念旧的失败原因。
+    ///
+    /// `last_error` 描述的是**改之前**那条配置；若等到下次真的启动成功才清，daily
+    /// 任务可能要带着「调度配置解不开，永远不会执行」过一整天。改名/改备注不算
+    /// "修好了配置"，旧原因仍要留着 —— 它还没被验证过。
+    #[test]
+    fn fixing_the_config_clears_the_stale_failure_reason() {
+        let _g = isolate_app_dir("edit_clears_last_error");
+        let notepad = r"C:\Windows\notepad.exe";
+        if !std::path::Path::new(notepad).is_file() {
+            return; // 与既有测试同口径：没有 notepad 的机器跳过建任务
+        }
+        let id = add_task("改坏的任务", notepad, "", "daily", "00:01", true).unwrap();
+        record_last_error(id, Some("目标程序不见了"));
+
+        update_task(id, Some("只改个名字"), None, None, None, None, None).unwrap();
+        let t = get_all_tasks().into_iter().find(|x| x.id == id).unwrap();
+        assert_eq!(
+            t.last_error.as_deref(),
+            Some("目标程序不见了"),
+            "只改名不算修好配置，旧原因要留着等下一次启动验证"
+        );
+
+        update_task(id, None, None, None, None, Some("00:02"), None).unwrap();
+        let t = get_all_tasks().into_iter().find(|x| x.id == id).unwrap();
+        assert_eq!(
+            t.last_error, None,
+            "调度时刻已改对，面板不能继续念旧配置的失败原因"
+        );
     }
 
     /// 写库失败时，本轮兜底记忆必须顶得上；重启后则以库里那次为准。
