@@ -121,8 +121,12 @@ pub fn cmp_rank_desc(
 }
 
 /// 千分位格式化（如 1234567 → "1,234,567"，支持负数）。
+///
+/// 取绝对值走无符号：`i64::MIN.abs()` 在 debug 下 panic、release 下回绕成它自己
+/// （输出会变成 `--9,223,…`）。库里的计数来自旧版导入/恢复文件，坏到 i64::MIN 时
+/// 屏上只是读一个数，不该让整个程序 abort（release 是 `panic = "abort"`）。
 pub fn fmt_thousands(n: i64) -> String {
-    let s = n.abs().to_string();
+    let s = n.unsigned_abs().to_string();
     let mut out = String::new();
     let len = s.len();
     for (i, ch) in s.chars().enumerate() {
@@ -280,6 +284,8 @@ mod tests {
         assert_eq!(fmt_thousands(1000), "1,000");
         assert_eq!(fmt_thousands(1234567), "1,234,567");
         assert_eq!(fmt_thousands(-500), "-500");
+        // i64::MIN 那一档：`n.abs()` 会溢出（debug panic / release 回绕出双负号）。
+        assert_eq!(fmt_thousands(i64::MIN), "-9,223,372,036,854,775,808");
     }
 
     /// 「1.2万」那一档的折叠边界（现在只有悬浮窗的百万以上兜底走它）。
