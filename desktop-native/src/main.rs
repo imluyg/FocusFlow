@@ -25346,7 +25346,8 @@ mod instance_and_tray_tests {
     /// 插件动作后必须清掉旧的勾选与悬停落点；否则筛选/翻页后的删除会带上看不见的 id。
     #[test]
     fn a_plugin_action_drops_the_invisible_selection() {
-        let src = include_str!("main.rs");
+        // 换行先统一：CRLF 检出时 `"\n    }\n"` 切不出函数体（与同文件那批源码守卫同一条口径）。
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let start = prod
             .find("fn run_plugin_action(&mut self, hwnd: HWND, name: &str, action: &str)")
