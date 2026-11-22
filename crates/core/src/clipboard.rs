@@ -29,6 +29,9 @@ use crate::paths;
 pub const DEFAULT_MAX_TEXT_BYTES: usize = 16 * 1024;
 pub const DEFAULT_MAX_ITEMS: i64 = 500;
 pub const DEFAULT_RETENTION_DAYS: i64 = 30;
+/// 次数台账（`clipboard_daily`）保留多少天。`trim` 按它删旧行，统计也只念这一段：
+/// 两处共用同一个数，「近一年复制」才不会在别处漂成另一种窗口。
+const LEDGER_DAYS: i64 = 365;
 /// 未固定条目的总字节上限。固定项不计入（用户显式保护的内容不该被别人挤掉）。
 ///
 /// 图片按落盘 PNG 的大小计入。默认给到 64 MB：一张 4K 截图的 PNG 常有 3–8 MB，
@@ -1156,8 +1159,8 @@ fn trim(conn: &rusqlite::Connection) -> Result<(), String> {
         tx.execute("DELETE FROM clipboard_items WHERE id=?1", [id])
             .map_err(|e| format!("裁剪剪贴板条目失败：{e}"))?;
     }
-    // 次数台账比内容活得更久，但也留一条上界：一年。
-    let cutoff_day = day_key(now_ms().saturating_sub(365 * 86_400_000));
+    // 次数台账比内容活得更久，但也留一条上界：见 `LEDGER_DAYS`。
+    let cutoff_day = day_key(now_ms().saturating_sub(LEDGER_DAYS.saturating_mul(86_400_000)));
     tx.execute("DELETE FROM clipboard_daily WHERE day < ?1", [cutoff_day])
         .map_err(|e| format!("裁剪剪贴板次数台账失败：{e}"))?;
     tx.commit()
@@ -1274,6 +1277,8 @@ pub fn stats(window_days: i64) -> Result<ClipStats, String> {
     // （7 天窗口变成 8 个日期），与 `db::queries` 那一族 `today - (n - 1)` 的口径对齐。
     let since =
         day_key(now.saturating_sub(window_days.saturating_sub(1).saturating_mul(86_400_000)));
+    let ledger_since =
+        day_key(now.saturating_sub(LEDGER_DAYS.saturating_sub(1).saturating_mul(86_400_000)));
     let today_count: i64 = conn
         .query_row(
             "SELECT COALESCE(SUM(count), 0) FROM clipboard_daily WHERE day=?1",
@@ -1281,17 +1286,21 @@ pub fn stats(window_days: i64) -> Result<ClipStats, String> {
             |r| r.get(0),
         )
         .map_err(|e| format!("读剪贴板统计失败：{e}"))?;
+    // 上界是今天：墙钟在错误的年份上待过一阵（手工改表、RTC 没电）会留下未来日期的
+    // 台账行；只写 `day>=since` 的话它们会永远算进「最近 N 天」，而且到了那天还会再算一遍。
     let window_count: i64 = conn
         .query_row(
-            "SELECT COALESCE(SUM(count), 0) FROM clipboard_daily WHERE day>=?1",
-            [&since],
+            "SELECT COALESCE(SUM(count), 0) FROM clipboard_daily WHERE day>=?1 AND day<=?2",
+            [&since, &today],
             |r| r.get(0),
         )
         .map_err(|e| format!("读剪贴板统计失败：{e}"))?;
+    // 「近一年复制」按台账窗口算，不只依赖 trim 已经跑过：抄录停用一年以上时旧行
+    // 仍在表里，但标签说的是近一年。
     let total_copies: i64 = conn
         .query_row(
-            "SELECT COALESCE(SUM(count), 0) FROM clipboard_daily",
-            [],
+            "SELECT COALESCE(SUM(count), 0) FROM clipboard_daily WHERE day>=?1 AND day<=?2",
+            [&ledger_since, &today],
             |r| r.get(0),
         )
         .map_err(|e| format!("读剪贴板统计失败：{e}"))?;
@@ -1309,11 +1318,11 @@ pub fn stats(window_days: i64) -> Result<ClipStats, String> {
         let mut stmt = conn
             .prepare(
                 "SELECT source_app, SUM(count) FROM clipboard_daily
-                 WHERE day>=?1 GROUP BY source_app ORDER BY 2 DESC LIMIT 5",
+                 WHERE day>=?1 AND day<=?2 GROUP BY source_app ORDER BY 2 DESC LIMIT 5",
             )
             .map_err(|e| format!("读剪贴板来源失败：{e}"))?;
         let rows = stmt
-            .query_map([&since], |r| {
+            .query_map([&since, &today], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
             })
             .map_err(|e| format!("读剪贴板来源失败：{e}"))?;
@@ -3766,6 +3775,29 @@ mod tests {
             stats(7).unwrap().total_copies,
             0,
             "台账只保留一年：那句若写「累计」，这里就是它说的谎"
+        );
+    }
+
+    /// 未来日期的台账行（墙钟曾在错误的年份上待过一阵）不许算进任何「最近 N 天」。
+    ///
+    /// `day >= since` 对未来行永远成立；没有上界时它们会永久撑大窗口，直到那个日期
+    /// 真的到来——「最近 7 天」变成「最近 7 天 + 明天的错误记录」，来源榜也一样。
+    #[test]
+    fn future_dated_ledger_rows_do_not_inflate_the_recent_windows() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("clip_future_ledger");
+        init_db().unwrap();
+        let now = now_ms();
+        ingest("今天的一次复制", "explorer.exe", now).unwrap();
+        ingest("未来的一次复制", "paint.exe", now + 400 * 86_400_000).unwrap();
+
+        let s = stats(7).unwrap();
+        assert_eq!(s.window_count, 1, "明天以后的计数不属于最近 7 天");
+        assert_eq!(s.total_copies, 1, "也不属于近一年");
+        assert_eq!(
+            s.per_app,
+            vec![("explorer.exe".to_string(), 1)],
+            "来源（最近 7 天）同样不许把未来那一行算进 paint.exe"
         );
     }
 
