@@ -667,7 +667,13 @@ fn insert_or_touch(new: NewItem<'_>) -> Result<IngestOutcome, String> {
     .map_err(|e| format!("记剪贴板次数失败：{e}"))?;
     tx.commit()
         .map_err(|e| format!("提交剪贴板条目失败：{e}"))?;
-    trim(&conn)?;
+    // 到这里条目与次数都已经提交。裁剪失败只说明"这一轮没按预算瘦身"（库被写锁、
+    // 磁盘出错、触发器拒绝删除），不能反过来说入库失败 —— 调用方会把这句话原样
+    // 念成「剪贴板入库失败」，而用户要的东西其实已经在历史里了。裁剪每次收录都会
+    // 再跑一遍，失败留下的超额条目下一次补上。
+    if let Err(e) = trim(&conn) {
+        tracing::warn!("剪贴板条目已入库，但按配置裁剪失败（下次收录会再试）: {e}");
+    }
     Ok(IngestOutcome::Stored { id, dedup })
 }
 
@@ -3756,6 +3762,50 @@ mod tests {
         crate::config::instance()
             .set("clipboard", "max_items", "500")
             .unwrap();
+    }
+
+    /// 条目已提交之后裁剪失败，不许把这次收录说成「入库失败」。
+    ///
+    /// 裁剪只是"按预算瘦身"；它失败（库被写锁、磁盘出错）时用户复制的东西其实已经
+    /// 在历史里，面板却会念「剪贴板入库失败」。夹具用一条拒删触发器把 DELETE 按住，
+    /// 让失败发生在提交之后——正是生产里那句假话的现场。
+    #[test]
+    fn a_failed_trim_does_not_turn_a_stored_item_into_an_ingest_failure() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("clip_trim_fail_notice");
+        init_db().unwrap();
+        let cfg = crate::config::instance();
+        cfg.set("clipboard", "max_items", "1").unwrap();
+
+        let IngestOutcome::Stored { id: first_id, .. } =
+            ingest("第一条", "explorer.exe", now_ms()).unwrap()
+        else {
+            panic!("第一条应当入库");
+        };
+        {
+            let conn = open().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER refuse_trim BEFORE DELETE ON clipboard_items
+                 BEGIN SELECT RAISE(ABORT, 'trim blocked'); END;",
+            )
+            .unwrap();
+        }
+
+        let second = ingest("第二条", "explorer.exe", now_ms() + 1);
+        assert!(
+            matches!(second, Ok(IngestOutcome::Stored { .. })),
+            "条目已经落库，裁剪失败不能反过来说入库失败: {second:?}"
+        );
+        assert!(
+            get(first_id).unwrap().is_some(),
+            "裁剪失败时旧条目当然还在（这是超预算，不是丢数据）"
+        );
+
+        {
+            let conn = open().unwrap();
+            conn.execute_batch("DROP TRIGGER refuse_trim;").unwrap();
+        }
+        cfg.set("clipboard", "max_items", "500").unwrap();
     }
 
     /// 统计那三句里「近一年复制」的口径：`clipboard_daily` 台账只保留一年，不许写成
