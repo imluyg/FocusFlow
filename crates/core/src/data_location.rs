@@ -175,7 +175,7 @@ pub fn copy_data_tree(src_root: &Path, dst_root: &Path) -> CopySummary {
         // 程序目录，而"在程序目录里新建一个子文件夹当数据目录"是完全正当的用法。
         // 上一版的宽判定把用户实测选的 `FocusFlow\123` 当成套娃拒了，而且对
         // `data`、`backup` 各报一遍，目录一个字都没换成。
-        if dst.starts_with(&src) {
+        if is_same_or_under(&dst, &src) {
             summary.errors.push(format!(
                 "目标落在当前 {} 子树内部（{}），已拒绝以免自我嵌套；请选一个外面的文件夹",
                 sub,
@@ -263,7 +263,7 @@ fn guard_destination(src_root: &Path, dst_root: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("源目录读不出来（{}）: 路径无效", src_root.display()))?;
     let dst = stable_abs(dst_root).unwrap_or_else(|| dst_root.to_path_buf());
 
-    if src == dst {
+    if path_eq(&src, &dst) {
         return Err(format!(
             "目标就是当前的数据目录（{}），无需更改",
             src.display()
@@ -271,7 +271,7 @@ fn guard_destination(src_root: &Path, dst_root: &Path) -> Result<(), String> {
     }
     for sub in ["data", "backup"] {
         let inside = src.join(sub);
-        if dst.starts_with(&inside) {
+        if is_same_or_under(&dst, &inside) {
             return Err(format!(
                 "目标在当前数据目录内部（{}），请选一个外面的文件夹",
                 inside.display()
@@ -462,14 +462,36 @@ pub(crate) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Windows 上路径比较不区分大小写（`C:\data` 与 `c:\DATA` 是同一个目录），其他平台按原样。
+///
+/// 逐段比而不是比字符串：`data2` 不能因为字面前缀像 `data` 就被当成它的子目录。
+fn is_same_or_under(path: &Path, base: &Path) -> bool {
+    if !cfg!(windows) {
+        return path.starts_with(base);
+    }
+    let mut p = path.components();
+    for b in base.components() {
+        match p.next() {
+            Some(c)
+                if c.as_os_str().to_string_lossy().to_lowercase()
+                    == b.as_os_str().to_string_lossy().to_lowercase() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn path_eq(path: &Path, other: &Path) -> bool {
+    is_same_or_under(path, other) && is_same_or_under(other, path)
+}
+
 /// 两个路径是不是同一个目录？`PathBuf` 的相等是按字节比的，Windows 上同一个目录
 /// 至少有下列写法：`C:\data`、`C:\data\`、`C:/data`、`c:\DATA`。
 ///
-/// 字节不等时才 `canonicalize`（它解析大小写与 `..` 段，并给两边同一个 `\\?\` 前缀）。
-/// 任一 `canonicalize` 失败就回 `false`：读不出来的那条由调用方自己的失败路径去报错，
-/// 这里不顺手把"读不出来"判成"同一个目录"（那会让一次 U 盘没挂上被说成"不用搬"）。
+/// 先按段折大小写比一次（目标常常还不存在，`canonicalize` 会失败）；字节不等且两边
+/// 都读得出来时才 `canonicalize`（它还会解析短名/junction）。
 fn same_directory(a: &Path, b: &Path) -> bool {
-    if a == b {
+    if path_eq(a, b) {
         return true;
     }
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
@@ -1221,6 +1243,46 @@ mod tests {
             "源侧就是目标侧，主库一个字都不能少"
         );
         assert!(dir.path().join("backup/keep.db").is_file(), "backup 侧同理");
+    }
+
+    /// Windows 大小写不敏感：`d:\…\data\inside` 仍落在 `D:\…\data` 里面。
+    ///
+    /// 旧判据按字节比 `starts_with`，大小写一变就放行；校验那一步还会先
+    /// `create_dir_all` 把目标目录造进源子树，迁移时再往里递归复制（自我套娃）。
+    #[test]
+    fn a_case_variant_nested_target_is_still_rejected() {
+        let _lock = paths::test_app_dir_lock();
+        let dir = paths::test_app_dir("mv_case_nested");
+        write_file(&dir.path().join("data/focusflow_2026.db"), "history");
+        let src = dir.path().to_path_buf();
+        let mut spelled = src.to_string_lossy().to_string();
+        let first = spelled.chars().next().unwrap_or('?');
+        if !first.is_ascii_alphabetic() {
+            return; // 不是盘符路径（非 Windows），这条只考 Windows 的大小写口径
+        }
+        let flipped = if first.is_ascii_uppercase() {
+            first.to_ascii_lowercase()
+        } else {
+            first.to_ascii_uppercase()
+        };
+        spelled.replace_range(0..1, &flipped.to_string());
+        let nested = Path::new(&spelled).join("data").join("inside");
+
+        let err = validate_new_data_home(&src, &nested)
+            .expect_err("大小写不同的嵌套目标仍要被拒（本机文件系统不区分大小写）");
+        assert!(err.contains("内部"), "{err}");
+        assert!(
+            !src.join("data").join("inside").exists(),
+            "校验就该停下：目标目录不许先被造进源子树"
+        );
+
+        let summary = copy_data_tree(&src, &nested);
+        assert!(summary.has_errors(), "复制那一层也要拒绝自我嵌套");
+        assert_eq!(summary.copied, 0, "一个字都不该复制");
+        assert!(
+            !src.join("data").join("inside").exists(),
+            "复制这一层同样不许把目标目录造进源子树"
+        );
     }
 
     #[test]
