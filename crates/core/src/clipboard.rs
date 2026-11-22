@@ -2019,6 +2019,13 @@ pub fn copy_parts(
             Ok(format!("已复制图片 {} × {}（{}）", w, h, formats.join("+")))
         }
         ClipKind::File => {
+            // 空清单只可能来自坏记录（入库时 `files_verdict::Empty` 已整条跳过，JSON 损坏
+            // 则被解析成空表）。照旧走下面的"都失效"分支会写一段空文本进剪贴板，还回一句
+            // 「0 个文件都已不存在，已把路径作为文本复制」——既说反了，也把用户原来的
+            // 剪贴板内容清掉了。
+            if file_paths.is_empty() {
+                return Err("这条文件记录里没有路径（记录可能已损坏），没有写入剪贴板".to_string());
+            }
             let (alive, gone) = split_alive_paths(file_paths);
             if alive.is_empty() {
                 // 文件都不在了：写回路径文本仍比"什么也没发生"有用，但必须说清是文本。
@@ -3730,6 +3737,19 @@ mod tests {
         let (alive, gone) = split_alive_paths(&item.file_paths);
         assert!(alive.is_empty());
         assert_eq!(gone.len(), 2);
+    }
+
+    /// 空路径清单只可能来自坏记录：不许写一段空文本进剪贴板，还回一句「已把路径作为文本复制」。
+    /// 这条分支在碰剪贴板之前就返回，所以用例不需要真的打开剪贴板。
+    #[test]
+    fn a_file_row_without_paths_fails_instead_of_claiming_an_empty_copy() {
+        let e = copy_parts(ClipKind::File, "0 个文件", None, &[])
+            .expect_err("没有路径的文件记录不能算复制成功");
+        assert!(e.contains("路径"), "要说清缺的是路径: {e}");
+        assert!(
+            !e.contains("已把路径作为文本复制"),
+            "不能替一次空写入念成功: {e}"
+        );
     }
 
     #[test]
