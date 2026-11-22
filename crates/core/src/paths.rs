@@ -309,6 +309,46 @@ pub fn force_data_home(dir: impl Into<PathBuf>) {
         .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// 把配置里的目录展开成绝对路径：普通相对路径以 `app` 为基准；盘符相对 `C:foo`
+/// 与根相对 `\foo` **不是**"相对路径"——`Path::join` 会把基准整段替换掉
+/// （`C:foo` 还会按那台机器上 C 盘的当前目录落点，换一台机器/换一次 CWD 就换地方）。
+///
+/// 两者分别展开成 `C:\foo` 与程序目录所在盘的根：与用户写 `C:foo` 时想要的
+/// `C:\foo` 一致，也让 [`resolve_data_home`] 与 `data_location::expand_data_home`
+/// 两边比的是同一个绝对路径。
+pub(crate) fn expand_configured_dir(configured: &str, app: &Path) -> PathBuf {
+    use std::path::Component;
+    let p = Path::new(configured);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let mut parts = p.components();
+    match parts.next() {
+        Some(Component::Prefix(prefix)) => {
+            // `C:foo`：补上那个盘的根；`C:` 本身落成 `C:\`。
+            let mut out = PathBuf::from(prefix.as_os_str());
+            out.push(std::path::MAIN_SEPARATOR.to_string());
+            for c in parts {
+                out.push(c.as_os_str());
+            }
+            out
+        }
+        Some(Component::RootDir) => {
+            // `\foo`：Windows 语义是"当前盘的根"，这里取程序目录所在那个盘。
+            let mut out = PathBuf::new();
+            if let Some(Component::Prefix(prefix)) = app.components().next() {
+                out.push(prefix.as_os_str());
+            }
+            out.push(std::path::MAIN_SEPARATOR.to_string());
+            for c in parts {
+                out.push(c.as_os_str());
+            }
+            out
+        }
+        _ => app.join(p),
+    }
+}
+
 /// 解析一次 [`data_home`]：读程序目录下的 config.ini，取 `[paths] data_home`。
 fn resolve_data_home() -> PathBuf {
     let app = app_dir();
@@ -328,12 +368,7 @@ fn resolve_data_home() -> PathBuf {
     // 相对路径按程序目录展开：便携包里写 `data_home = D:\FocusData` 是绝对路径，
     // 而写 `..\Data` 这种相对形式的人也该有个明确的基准，不能取决于起始位置
     // （app_dir 的注释里就是为了防这个才在 release 下取 exe 目录的）。
-    let p = Path::new(&configured);
-    let candidate = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        app.join(p)
-    };
+    let candidate = expand_configured_dir(&configured, &app);
     match std::fs::create_dir_all(&candidate) {
         Ok(()) => candidate,
         Err(e) => {
@@ -719,6 +754,29 @@ mod tests {
     ///   放在 `data_home` 根下要么被落在旧目录，要么直接把「更改数据文件夹」挡死
     ///   （与 [`screenshots_dir`] 同一条理由，那条已有用例钉着）。
     /// 换数据目录时内置不跟着走：那一处仍是程序目录下面的 `plugins/builtin/`。
+    /// 配置里的目录展开：普通相对路径以程序目录为基准；`C:foo`/`\foo` 带盘符或根，
+    /// `Path::join` 会把基准整段替换掉，必须先按盘根补齐（否则落点随 CWD/机器变）。
+    #[test]
+    fn configured_dirs_with_a_prefix_do_not_replace_the_app_dir() {
+        let app = Path::new(r"D:\Apps\FocusFlow");
+        assert_eq!(expand_configured_dir("Data", app), app.join("Data"));
+        if cfg!(windows) {
+            assert_eq!(
+                expand_configured_dir(r"E:\Focus", app),
+                PathBuf::from(r"E:\Focus"),
+                "绝对路径原样"
+            );
+            let drive_rel = expand_configured_dir("C:Focus", app);
+            assert_eq!(drive_rel, PathBuf::from(r"C:\Focus"));
+            assert!(drive_rel.is_absolute(), "盘符相对的路径不能原样交回去");
+            assert_eq!(
+                expand_configured_dir(r"\Focus", app),
+                PathBuf::from(r"D:\Focus"),
+                "根相对用程序目录所在盘的根"
+            );
+        }
+    }
+
     #[test]
     fn builtin_plugins_follow_the_app_dir_while_user_plugins_follow_the_data_dir() {
         let _lock = test_app_dir_lock();

@@ -548,14 +548,10 @@ enum MigrationPlan {
 }
 
 /// 把配置里的 `data_home` 原文按 `paths::resolve_data_home` 的同一条规则展开
-/// （绝对路径原样、相对路径以程序目录为基准），好让两边比的是同一种东西。
+/// （绝对路径原样、相对路径以程序目录为基准，盘符相对/根相对也由同一把尺子补齐），
+/// 好让两边比的是同一种东西。公式只有 [`paths::expand_configured_dir`] 那一份。
 fn expand_data_home(configured: &str, app_dir: &Path) -> PathBuf {
-    let p = Path::new(configured);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        app_dir.join(p)
-    }
+    paths::expand_configured_dir(configured, app_dir)
 }
 
 fn plan_migration(
