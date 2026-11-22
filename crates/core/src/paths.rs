@@ -455,7 +455,11 @@ pub fn plugins_user_dir() -> PathBuf {
 /// `plugins::plugin_store`（要不要接受这次读写）。两处各写一遍的话，
 ///  store 那关放宽一寸，`../grants` 就又回到"能碰别人的授权文件"。
 pub fn is_safe_state_stem(stem: &str) -> bool {
-    !stem.is_empty() && !stem.contains('/') && !stem.contains('\\') && stem != ".."
+    // `:` 不是"名字里多个标点"这么轻：Windows 上 `C:evil` 带盘符前缀但无根，
+    // `Path::join` 会**替换掉整段基路径** —— 落点从 `data/plugins/state/` 变成
+    // 进程当前目录所在的盘（`C:evil/state.json`），与 `..` 是同一类越界。
+    // `.` 则会算回 `state/` 根那一格，把某个插件的状态写进公共目录。
+    !stem.is_empty() && stem != "." && stem != ".." && !stem.contains(['/', '\\', ':', '\0'])
 }
 
 /// 某个插件状态目录的**位置**，不建目录 —— 读一侧用它。
@@ -800,8 +804,10 @@ mod tests {
         );
         assert_ne!(plugin_state_dir("other"), mine, "两个插件不共享一个目录");
 
-        // 越界的名字不落盘、只出声，交回去的路径就是 state/ 那一格本身（不是某个插件的目录）
-        for evil in ["../grants", "..\\x", "a/b", "..", ""] {
+        // 越界的名字不落盘、只出声，交回去的路径就是 state/ 那一格本身（不是某个插件的目录）。
+        // `C:evil` 与 `.` 是同一族的另外两个口子：前者带 Windows 盘符前缀，join 会整段替换
+        // 基路径；后者会算回 `state/` 根。两者都必须交回根、并点名。
+        for evil in ["../grants", "..\\x", "a/b", "..", ".", "C:evil", ""] {
             let (got, logs) = crate::logger::capture_logs(|| plugin_state_dir(evil));
             assert_eq!(
                 got, root,
