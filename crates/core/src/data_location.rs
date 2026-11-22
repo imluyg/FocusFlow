@@ -861,12 +861,47 @@ fn verify_copy(src_root: &Path, dst_root: &Path) -> Result<(), String> {
 ///
 /// 只删这两棵，绝不整个删掉 `from`：默认情形下 `from` 就是程序目录，那里还放着
 /// config.ini、日志与插件，它们跟着程序走、不归这次搬运管。
+/// 删源时问到的四种结局。只有 `Absent`（`NotFound`）能当成"本来就没有"；
+/// 受限、被握着、路径形状不对都是 `Unknown`，回执必须承认"没敢删/没删成"。
+#[derive(Debug, PartialEq, Eq)]
+enum EntryState {
+    Absent,
+    NotDir,
+    Dir,
+    Unknown,
+}
+
+fn entry_state(meta: &std::io::Result<std::fs::Metadata>) -> EntryState {
+    match meta {
+        Err(e) if is_confirmed_absent(e) => EntryState::Absent,
+        Err(_) => EntryState::Unknown,
+        Ok(m) if m.is_dir() => EntryState::Dir,
+        Ok(_) => EntryState::NotDir,
+    }
+}
+
 fn remove_source_trees(from: &Path) -> usize {
     let mut leftover = 0;
     for sub in ["data", "backup"] {
         let dir = from.join(sub);
-        if !dir.exists() {
-            continue;
+        // 与复制/核对两处同一把三态尺子：`!dir.exists()` 会把"这一刻问不出"（盘休眠、
+        // ACL、换成同名文件）折成"没有"，回执就会说旧目录已经清干净，而它整棵还在。
+        let meta = std::fs::metadata(&dir);
+        match entry_state(&meta) {
+            EntryState::Absent => continue,
+            EntryState::Unknown => {
+                if let Err(e) = &meta {
+                    tracing::warn!("旧目录 {} 这一刻问不出，本次不删: {e}", dir.display());
+                }
+                leftover += 1;
+                continue;
+            }
+            EntryState::NotDir => {
+                // 同名普通文件：不是可删的子树，也不该误删 —— 照旧记一条没清掉的账。
+                leftover += 1;
+                continue;
+            }
+            EntryState::Dir => {}
         }
         if let Err(e) = std::fs::remove_dir_all(&dir) {
             tracing::warn!("旧目录 {} 没能删除: {e}", dir.display());
@@ -1243,6 +1278,45 @@ mod tests {
             "源侧就是目标侧，主库一个字都不能少"
         );
         assert!(dir.path().join("backup/keep.db").is_file(), "backup 侧同理");
+    }
+
+    /// 删源那一步也要分得清「确认没有」与「问不出」：只有 `NotFound` 能当"没有"。
+    ///
+    /// 旧写法 `!dir.exists()` 只有布尔值，受限/被握着/路径形状不对统统折成"没有"，
+    /// 回执就会说旧目录已经清干净，而它整棵还在。
+    #[test]
+    fn only_not_found_counts_as_absent_when_cleaning_source() {
+        let _lock = paths::test_app_dir_lock();
+        let dir = paths::test_app_dir("mv_remove_state");
+
+        let missing = Err::<std::fs::Metadata, _>(std::io::Error::from_raw_os_error(2));
+        assert_eq!(
+            entry_state(&missing),
+            EntryState::Absent,
+            "NotFound 才是确认没有"
+        );
+        let denied = Err::<std::fs::Metadata, _>(std::io::Error::from_raw_os_error(5));
+        assert_eq!(
+            entry_state(&denied),
+            EntryState::Unknown,
+            "受限/被握着不许折成没有"
+        );
+
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        assert_eq!(
+            entry_state(&std::fs::metadata(dir.path().join("data"))),
+            EntryState::Dir
+        );
+        std::fs::write(dir.path().join("backup"), b"x").unwrap();
+        assert_eq!(
+            entry_state(&std::fs::metadata(dir.path().join("backup"))),
+            EntryState::NotDir
+        );
+
+        // 同名普通文件不是可删的子树，但确实没清掉：回执要记这一条（data/ 正常删）。
+        assert_eq!(remove_source_trees(dir.path()), 1);
+        assert!(!dir.path().join("data").exists(), "能删的那棵要删掉");
+        assert!(dir.path().join("backup").is_file(), "普通文件不能被误删");
     }
 
     /// Windows 大小写不敏感：`d:\…\data\inside` 仍落在 `D:\…\data` 里面。
