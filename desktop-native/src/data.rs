@@ -395,6 +395,12 @@ pub struct Snapshot {
     /// 否则"只列了前 100 个"看起来就是"一共这么多"。
     pub app_rows_total: usize,
     pub app_total: i64,
+    /// 当前周期的应用时长那一读有没有读全（某一年度库的 `app_usage` 读不出来）。
+    ///
+    /// 看板那句「活跃 …」与 KPI 拿它念「读不出」：`app_total` 此时是 0，直接印成
+    /// 「0m」就是又一处「没读来」冒充「真的没有」。悬浮窗那一格另有
+    /// [`Self::today_app_unreadable`]（今日窗口可能与当前周期不是同一趟读）。
+    pub app_unreadable: bool,
     pub devices: Vec<DevRow>,
     /// 设备侧这一轮读回来的总次数 —— `devices` 那些行的分母。
     ///
@@ -721,6 +727,7 @@ pub fn load(period: i64) -> Snapshot {
     // 是按域名字样挑的），它只进导出里那句全句（`main.rs::gap_line` 念整串）。
     let mut gaps: Vec<String> = Vec::new();
     gaps.extend(stats.unreadable);
+    let app_unreadable = !app_read.unreadable.is_empty();
     gaps.extend(app_read.unreadable);
     gaps.extend(device_read.unreadable);
     gaps.extend(daily_read.unreadable);
@@ -749,6 +756,7 @@ pub fn load(period: i64) -> Snapshot {
         apps,
         app_rows_total,
         app_total: app_read.total,
+        app_unreadable,
         devices,
         device_total: device_read.total,
         daily,

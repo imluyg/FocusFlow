@@ -29,26 +29,40 @@ pub struct BoardView {
 
 pub fn board_view(snap: &Snapshot, period_label: &str) -> BoardView {
     let keys = snap.period_total.max(0);
-    let active = snap.app_total.max(0);
+    // 应用时长那一读失败时 `app_total` 是 0：印成「0m」就是又一处"没读来"冒充
+    // "真的没有"。与悬浮窗同一口径，这一格改念「读不出」。
+    let active = if snap.app_unreadable {
+        "读不出".to_string()
+    } else {
+        fmt_compact_duration(snap.app_total.max(0))
+    };
     let streak = match snap.goal.as_ref() {
         Some(g) => format!("{} 天", g.streak),
         // 读不出来不许印成 0：那会变成"一天都没连过"。
         None => "读不出".to_string(),
     };
-    let sentence = match snap.apps.first() {
-        Some((name, _)) => format!(
-            "{}共按键 {} 次，活跃 {}，最常用 {}",
+    let sentence = if snap.app_unreadable {
+        format!(
+            "{}共按键 {} 次，应用时长这一轮没读全，暂不下「最常用」的结论",
             period_label,
-            fmt_thousands(keys),
-            fmt_compact_duration(active),
-            name
-        ),
-        None => format!(
-            "{}共按键 {} 次，活跃 {}，这段时间没有归到某个应用上的活动",
-            period_label,
-            fmt_thousands(keys),
-            fmt_compact_duration(active)
-        ),
+            fmt_thousands(keys)
+        )
+    } else {
+        match snap.apps.first() {
+            Some((name, _)) => format!(
+                "{}共按键 {} 次，活跃 {}，最常用 {}",
+                period_label,
+                fmt_thousands(keys),
+                active,
+                name
+            ),
+            None => format!(
+                "{}共按键 {} 次，活跃 {}，这段时间没有归到某个应用上的活动",
+                period_label,
+                fmt_thousands(keys),
+                active
+            ),
+        }
     };
     let top_apps = snap
         .apps
@@ -70,7 +84,7 @@ pub fn board_view(snap: &Snapshot, period_label: &str) -> BoardView {
     BoardView {
         kpis: [
             ("按键总数", fmt_thousands(keys)),
-            ("活跃时长", fmt_compact_duration(active)),
+            ("活跃时长", active),
             ("连续天数", streak),
             ("设备数", snap.devices.len().to_string()),
         ],
@@ -209,6 +223,27 @@ mod tests {
         assert!(v.top_keys.is_empty());
         assert!(v.sentence.contains("没有归到某个应用上的活动"));
         assert_eq!(v.kpis[2].1, "读不出");
+    }
+
+    /// 应用时长读失败时 `app_total` 是 0：KPI 与那句话都不许把它念成「0m」，
+    /// 也不许落到「没有归到某个应用上的活动」——那是另一个结论。
+    #[test]
+    fn an_unreadable_app_reading_is_not_printed_as_zero_minutes() {
+        let snap = Snapshot {
+            period_total: 42,
+            app_total: 0,
+            app_unreadable: true,
+            apps: Vec::new(),
+            ..Default::default()
+        };
+        let v = board_view(&snap, "近 7 天");
+        assert_eq!(v.kpis[1], ("活跃时长", "读不出".to_string()));
+        assert!(v.sentence.contains("没读全"), "{}", v.sentence);
+        assert!(
+            !v.sentence.contains("没有归到某个应用上的活动"),
+            "读不出来不能落进「真的没有」那句: {}",
+            v.sentence
+        );
     }
 
     #[test]
