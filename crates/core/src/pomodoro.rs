@@ -801,6 +801,11 @@ fn tick_once(
 /// Windows 上通常多睡几毫秒，若每轮都把锚点拽到 `now`，这点零头就被永久丢掉 ——
 /// 25 分钟的番茄会走成 25 分十几秒，而落库的 `actual_seconds` 又按整秒写着 1500。
 /// 空闲/暂停的轮次反过来必须跟到当下：否则 resume 后第一轮会把暂停期间整个补计进去。
+///
+/// 墙钟被往回拨时锚点不能留在未来：`delta` 夹成 0 只保证"不把进度吐回去"，
+/// 但锚点若停在回拨前的时刻，之后每一轮都是 `now < last_tick` ⇒ 永远 0 秒，
+/// 倒计时要冻到墙钟重新追回那个时刻才恢复（NTP 校时/手工改表/休眠后 RTC 对齐）。
+/// 这时直接从当下的墙钟重新起算，负的那一段不补也不退。
 fn next_tick_anchor(
     last_tick: chrono::DateTime<Local>,
     now_wall: chrono::DateTime<Local>,
@@ -808,6 +813,9 @@ fn next_tick_anchor(
     running: bool,
 ) -> chrono::DateTime<Local> {
     if running {
+        if now_wall < last_tick {
+            return now_wall;
+        }
         last_tick + chrono::Duration::seconds(delta.max(0))
     } else {
         now_wall
@@ -1371,6 +1379,31 @@ mod busy_lock_tests {
         // 反向腿：空闲/暂停时锚点必须跟到当下，否则 resume 后第一轮会把暂停时间补计进来。
         let later = start + ChronoDuration::minutes(10);
         assert_eq!(next_tick_anchor(start, later, 600, false), later);
+    }
+
+    /// 墙钟被往回拨后，锚点不能留在未来：否则之后每轮 `delta` 都是 0，倒计时会冻结到
+    /// 墙钟重新追回回拨前的时刻（30 分钟的回拨 = 冻 30 分钟）。回拨掉的那一截不补，
+    /// 但必须从拨回后的当下继续走。
+    #[test]
+    fn a_backward_clock_jump_reanchors_instead_of_freezing_the_timer() {
+        use chrono::{Duration as ChronoDuration, TimeZone};
+        let before = Local
+            .with_ymd_and_hms(2026, 9, 23, 10, 0, 0)
+            .single()
+            .expect("合法本地时刻");
+        let rolled = before - ChronoDuration::minutes(30);
+        let delta = tick_delta_seconds(&before, &rolled);
+        assert_eq!(delta, 0, "回拨不把已走的进度吐回去");
+
+        let anchor = next_tick_anchor(before, rolled, delta, true);
+        assert_eq!(anchor, rolled, "锚点必须跟到回拨后的当下，不能留在未来");
+
+        let next = rolled + ChronoDuration::seconds(1);
+        assert_eq!(
+            tick_delta_seconds(&anchor, &next),
+            1,
+            "回拨后的下一轮就要恢复计数，不能等墙钟走回 10:00"
+        );
     }
 
     /// 墙钟**向前**凭空跳，不能给本段造出没走过的时间。
