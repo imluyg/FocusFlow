@@ -5624,7 +5624,7 @@ impl App {
         }
         let y = g.list_top + vis as f32 * g.row_h;
         let cell = rect(
-            g.x_name - 4.0,
+            device_name_x(&g) - 4.0,
             y + 1.0,
             device_name_width(&g) + 4.0,
             g.row_h - 3.0,
@@ -12310,10 +12310,22 @@ const NUM_COL_W: f32 = 72.0;
 /// 占比列宽度（右沿与「改名」按钮的右沿对齐，见 `table_geom`）。
 const SHARE_COL_W: f32 = 52.0;
 
-/// 设备页「设备名」那一列的宽度：右边依次是类型 48 + 12、次数 `NUM_COL_W`、8、
-/// 还原 58、6、改名 58。行文字、编辑中那圈框、原生 EDIT 的落点三处都读它。
+/// 设备页行首类型标签的宽度与到名字的间距。类型最多两个字（键盘 / 鼠标 / 键鼠 / 未知），
+/// 40 是 `caption` 那一档下两个字加两侧内边距。
+const KIND_CHIP_W: f32 = 40.0;
+const KIND_CHIP_GAP: f32 = 8.0;
+
+/// 设备页「设备名」文字的起点：类型标签钉在行首、左对齐，名字跟在标签后面。
+/// 行文字、编辑中那圈框、原生 EDIT 的落点三处都读它。
+fn device_name_x(g: &TableGeom) -> f32 {
+    g.x_name + KIND_CHIP_W + KIND_CHIP_GAP
+}
+
+/// 设备页「设备名」那一列的宽度：右边只剩 12 px 缝 + 次数 `NUM_COL_W`、8、
+/// 还原 58、6、改名 58 —— 类型从右端挪到了名字前面（见 [`device_name_x`]），
+/// 这一列因此比原来宽 12 px。
 fn device_name_width(g: &TableGeom) -> f32 {
-    g.x_count_right_ops - NUM_COL_W - 12.0 - 48.0 - 12.0 - g.x_name
+    g.x_count_right_ops - NUM_COL_W - 12.0 - device_name_x(g)
 }
 
 /// 键鼠 / 应用 / 分组三张榜的名字列宽度（次数列左边留 12 px）。
@@ -13142,17 +13154,31 @@ fn draw_table(
         &p.fmt.caption,
         &p.br.muted,
     );
+    // 设备页的类型标签占在名字前面，两个表头各压各的格：标签上是「类型」，名字从标签之后起。
+    let name_head_x = if tab == 2 {
+        device_name_x(&g)
+    } else {
+        g.x_name
+    };
     p.text(
         heads[1],
         rect(
-            g.x_name,
+            name_head_x,
             g.head_y + 3.0,
-            count_right - NUM_COL_W - g.x_name,
+            count_right - NUM_COL_W - name_head_x,
             18.0,
         ),
         &p.fmt.caption,
         &p.br.muted,
     );
+    if tab == 2 {
+        p.text(
+            "类型",
+            rect(g.x_name, g.head_y + 3.0, KIND_CHIP_W, 18.0),
+            &p.fmt.caption,
+            &p.br.muted,
+        );
+    }
     p.text(
         heads[2],
         rect(count_right - NUM_COL_W, g.head_y + 3.0, NUM_COL_W, 18.0),
@@ -13245,14 +13271,24 @@ fn draw_table(
         match tab {
             2 => {
                 let d = &snap.devices[idx];
-                // 类型与次数两格都从「次数列右沿」往回推，免得名字列一改宽、这两格还按旧数摆。
+                // 次数格从「次数列右沿」往回推，免得名字列一改宽、这一格还按旧数摆。
                 let count_x = g.x_count_right_ops - NUM_COL_W;
-                let kind_x = count_x - 12.0 - 48.0;
+                // 类型标签钉在行首、左对齐：扫榜时类型都落在同一列，按块分得开。
+                // （以前挂在名字右端且右对齐，名字一长就飘，按类型看榜只能一行一行读。）
+                let kind = match d.kind.as_str() {
+                    "mouse" => "鼠标",
+                    "keyboard" => "键盘",
+                    "hybrid" => "键鼠",
+                    _ => "未知",
+                };
+                let chip = rect(g.x_name, y + 3.0, KIND_CHIP_W, 18.0);
+                p.round(chip, R_MICRO, &p.br.header, None);
+                p.text(kind, chip, &p.fmt.center_small, &p.br.muted);
                 if vs.editing == Some(idx) {
-                    // 编辑中：这一格由原生 EDIT 盖着，这里只画一圈边框。
+                    // 编辑中：名字这一格由原生 EDIT 盖着，这里只画一圈边框。
                     p.round(
                         rect(
-                            g.x_name - 4.0,
+                            device_name_x(&g) - 4.0,
                             y + 1.0,
                             device_name_width(&g) + 4.0,
                             g.row_h - 3.0,
@@ -13262,23 +13298,11 @@ fn draw_table(
                         Some(&p.br.accent),
                     );
                 } else {
-                    let cell = rect(g.x_name, y + 3.0, device_name_width(&g), 18.0);
+                    let cell = rect(device_name_x(&g), y + 3.0, device_name_width(&g), 18.0);
                     let clipped = p.clip(&d.name, &p.fmt.table_name, device_name_width(&g));
                     note_tooltip(tip, vs, cell, &d.name, clipped != d.name);
                     p.text(&clipped, cell, &p.fmt.table_name, &p.br.fg);
                 }
-                let kind = match d.kind.as_str() {
-                    "mouse" => "鼠标",
-                    "keyboard" => "键盘",
-                    "hybrid" => "键鼠",
-                    _ => "未知",
-                };
-                p.text(
-                    kind,
-                    rect(kind_x, y + 5.0, 48.0, 16.0),
-                    &p.fmt.caption_right,
-                    &p.br.muted,
-                );
                 p.text(
                     &thousands(d.count.max(0) as u64),
                     rect(count_x, y + 4.0, NUM_COL_W, 18.0),
@@ -21446,12 +21470,49 @@ mod table_layout_tests {
                 "w={w}: 设备名那一列只剩 {} px",
                 device_name_width(&g)
             );
+            // 类型标签、名字、次数三段首尾不许互相压住：标签左沿就是名字列左沿，
+            // 名字从标签之后起，名字右沿再让 12 px 给次数列。
+            assert!(
+                device_name_x(&g) >= g.x_name + KIND_CHIP_W,
+                "w={w}: 类型标签与设备名重叠了"
+            );
+            assert!(
+                device_name_x(&g) + device_name_width(&g) < g.x_count_right_ops - NUM_COL_W,
+                "w={w}: 设备名那一列画进了次数列"
+            );
             assert!(
                 name_col_width(&g) >= 100.0,
                 "w={w}: 名字列只剩 {} px",
                 name_col_width(&g)
             );
         }
+    }
+
+    /// 类型标签钉在设备名前面（行首同一列）。
+    ///
+    /// 旧形态是名字后面飘一个右对齐的类型：名字长短不一，类型就跟着飘，按类型看榜
+    /// 只能一行一行读。画图那一段跑不起来，按源码钉住两端：标签从 `g.x_name` 起画、
+    /// 名字格读 `device_name_x` —— 只改一边的话名字会压在标签上。
+    #[test]
+    fn the_kind_chip_sits_before_the_device_name() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let start = src
+            .find("let d = &snap.devices[idx];")
+            .expect("设备行画法不见了");
+        let end = src[start..]
+            .find("if d.has_alias")
+            .map(|n| n + start)
+            .expect("还原按钮不见了");
+        let body = &src[start..end];
+        assert!(
+            body.contains("rect(g.x_name, y + 3.0, KIND_CHIP_W, 18.0)"),
+            "类型标签不在行首固定列上"
+        );
+        assert!(
+            body.contains("device_name_x(&g)"),
+            "名字格没跟着标签右移，会压在类型标签上"
+        );
+        assert!(!body.contains("kind_x"), "名字后面那格右对齐的类型又回来了");
     }
 
     /// 胶囊组与它左边那句读数都不许越出左卡。这块 UI 不按矩形裁切（`NO_WRAP`），越出去的字
@@ -22248,8 +22309,8 @@ mod clip_tests {
             .collect::<String>()
             .replace(",)", ")");
         for (needle, want) in [
-            // 设备名：夹取与画它的那一格都用 device_name_width(&g)
-            ("letcell=rect(g.x_name,y+3.0,device_name_width(&g),18.0);letclipped=p.clip(&d.name,&p.fmt.table_name,device_name_width(&g));", 1),
+            // 设备名：夹取与画它的那一格都用 device_name_width(&g)，起点在类型标签之后
+            ("letcell=rect(device_name_x(&g),y+3.0,device_name_width(&g),18.0);letclipped=p.clip(&d.name,&p.fmt.table_name,device_name_width(&g));", 1),
             // 页脚那句：同一个 r.right-r.left-g.pad*2.0
             ("p.clip(&table_footer_text(snap,lane,tab),&p.fmt.caption,r.right-r.left-g.pad*2.0),rect(r.left+g.pad,foot_y,r.right-r.left-g.pad*2.0,16.0)", 1),
             // 插件名那一格是定宽 240，后面 10 px 就是"版本 · 作者"
