@@ -813,7 +813,7 @@ impl PluginManager {
     /// 创建沙箱化的 Lua 状态：
     /// - 剔除 `io` 库（任意文件读写）；
     /// - 移除 `os` 中可触达系统的高危函数（保留 date/time/clock 供插件使用）；
-    /// - 禁用 `package.loadlib`/`cpath`（防加载任意 DLL）；
+    /// - 不放行 `package` 库（`require` 的 Lua/C searcher 可读盘并加载 DLL）；
     /// - 摘掉 base 库的 `dofile`/`loadfile`（base 由 mlua 无条件打开，白名单挡不住）；
     /// - 不放行 `coroutine` 库（见下方 hook 说明）。
     ///
@@ -827,12 +827,7 @@ impl PluginManager {
         // 能完整绕开指令数上限，而内存配额也拦不住不分配内存的死循环 ——
         // 所有 Lua 都跑在 Tauri 主线程上，这等价于永久冻死整个界面。
         // 与其去给新线程补 hook，不如关掉这个唯一的搬移入口（随附插件无一使用）。
-        let libs = StdLib::TABLE
-            | StdLib::STRING
-            | StdLib::UTF8
-            | StdLib::MATH
-            | StdLib::PACKAGE
-            | StdLib::OS;
+        let libs = StdLib::TABLE | StdLib::STRING | StdLib::UTF8 | StdLib::MATH | StdLib::OS;
         let lua = Lua::new_with(libs, LuaOptions::default())?;
         let globals = lua.globals();
         // base 库由 mlua 无条件打开（白名单里没有 BASE 也挡不住），所以按名字
@@ -853,10 +848,6 @@ impl PluginManager {
             ] {
                 os.set(name, mlua::Value::Nil)?;
             }
-        }
-        if let Ok(pkg) = globals.get::<mlua::Table>("package") {
-            pkg.set("loadlib", mlua::Value::Nil)?;
-            pkg.set("cpath", "")?;
         }
         Ok(lua)
     }
@@ -4697,24 +4688,26 @@ end
         );
     }
 
-    /// 沙箱必须让 io 库不可用、os 高危函数与 package.loadlib 被移除，
+    /// 沙箱必须让 io/package 库不可用、os 高危函数被移除，
     /// 同时保留 os.date 等插件在用的安全函数。
     #[test]
     fn sandboxed_lua_blocks_dangerous_stdlib() {
         let lua = PluginManager::create_sandboxed_lua().unwrap();
-        // io 库整体不可用
+        // io/package 库整体不可用
         assert!(lua.globals().get::<mlua::Value>("io").unwrap().is_nil());
+        assert!(lua
+            .globals()
+            .get::<mlua::Value>("package")
+            .unwrap()
+            .is_nil());
         // os 高危函数已移除
         for name in ["execute", "exit", "getenv", "remove", "rename", "tmpname"] {
             let v: mlua::Value = lua.load(format!("return os.{name}")).eval().unwrap();
             assert!(v.is_nil(), "os.{name} 应为 nil");
         }
-        // package.loadlib 已禁用
-        let loadlib: mlua::Value = lua.load("return package.loadlib").eval().unwrap();
-        assert!(loadlib.is_nil());
         // base 库 mlua 会无条件打开（白名单里没有 BASE 也挡不住），能落盘的两个
-        // 入口只能按名字摘掉；协程库则整体不在白名单内（hook 是 per-thread 的）
-        for name in ["dofile", "loadfile", "coroutine"] {
+        // 入口只能按名字摘掉；协程与 require 则整体不在白名单内
+        for name in ["dofile", "loadfile", "coroutine", "require"] {
             let v: mlua::Value = lua.globals().get(name).unwrap();
             assert!(v.is_nil(), "{name} 应为 nil");
         }
@@ -4734,6 +4727,24 @@ end
             panic!("io 不可用时必须报错");
         };
         assert!(err.to_string().contains("io"));
+    }
+
+    #[test]
+    fn sandboxed_lua_cannot_require_a_real_module() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("sandbox_require");
+        let module = tmp.path().join("probe_module.lua");
+        std::fs::write(&module, "return { value = 42 }\n").unwrap();
+        let lua = PluginManager::create_sandboxed_lua().unwrap();
+        let script = format!(
+            "package.path = [[{}]]\nreturn require('probe_module')",
+            module.display()
+        );
+        let loaded = lua.load(&script).eval::<mlua::Value>();
+        assert!(
+            loaded.is_err(),
+            "真实模块就在盘上，旧沙箱会加载成功；本次必须失败: {loaded:?}"
+        );
     }
 
     /// 内嵌控件的两个出口都必须走 `skip_nested_widget`，不许退回静默的 `if let Ok(..)`。

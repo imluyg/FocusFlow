@@ -585,6 +585,40 @@ mod tests {
         );
     }
 
+    /// 整库复制来的纯聚合旧库，启动一致性自愈后仍须保留原始计数。
+    #[test]
+    fn aggregate_only_fresh_copy_survives_startup_heal() {
+        let _g = guard();
+        let _old = paths::test_app_dir("agg_heal_old");
+        let old_dir = _old.path().to_path_buf();
+        let _new = paths::test_app_dir("agg_heal_new");
+        {
+            let conn = rusqlite::Connection::open(old_dir.join("focusflow_2025.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE daily_counts (date_key INTEGER PRIMARY KEY, count INTEGER NOT NULL, seconds INTEGER NOT NULL);
+                 INSERT INTO daily_counts VALUES (20500, 99, 500);",
+            )
+            .unwrap();
+        }
+        db::queries::invalidate_years_cache();
+        let summary = migration::import_legacy_data(&old_dir);
+        assert!(summary.errors.is_empty(), "errors: {:?}", summary.errors);
+        let path = paths::year_db_path(2025);
+        let count = || {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT count FROM daily_counts WHERE date_key=20500",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count(), 99, "整库复制必须先保住旧计数");
+        db::maintenance::heal_daily_consistency();
+        assert_eq!(count(), 99, "启动自愈不能把纯聚合旧库清零");
+    }
+
     /// 目标年度库的导入标记**读不出来**时，那一年必须报错跳过，不能当成"没导过"再累加一遍。
     ///
     /// 两道去重闸（源文件大小+mtime、key_log 内容指纹）认的都是"标记里写着的值"，

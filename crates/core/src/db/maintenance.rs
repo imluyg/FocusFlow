@@ -3320,7 +3320,8 @@ pub fn delete_key_today(key_name: &str) -> i64 {
 }
 
 /// 启动时一次性聚合表一致性自愈：
-/// 1. daily_counts.count 与 Σkey_counts 不符的天，以 key_counts 为准重算；
+/// 1. daily_counts.count 与 Σkey_counts 不符、且当天确有按键明细的天，以 key_counts 为准重算；
+///    没有明细的天可能是只剩聚合表的旧库，不能据此当成残留清零；
 /// 2. Σhourly_counts 与 daily_counts 不符的天，按比例把小时分布缩放到当日总数
 ///    （hourly 无按 key 拆分，只能整体缩放；余数补到最大小时）。
 ///
@@ -3373,14 +3374,18 @@ pub fn heal_daily_consistency() {
             }
         };
         if dirty.has_daily_mismatch {
-            // 两条 UPDATE 失败以前是 `.unwrap_or(0)` ⇒ 与"本来就没有偏差"同一个数，
+            // UPDATE 失败以前是 `.unwrap_or(0)` ⇒ 与"本来就没有偏差"同一个数，
             // 连下面那条 info 都不会印出来，看起来像"这个库不需要修"。
+            // 只重算当天确有 key_counts 明细的日子：纯聚合旧库与混合库里的无明细日
+            // 都可能是真实历史，不能因为没有明细就把它清零。
             let fixed_daily = match conn
                 .execute(
                     "UPDATE daily_counts SET count = COALESCE(
                          (SELECT SUM(count) FROM key_counts WHERE key_counts.date_key = daily_counts.date_key), 0)
                      WHERE count != COALESCE(
-                         (SELECT SUM(count) FROM key_counts WHERE key_counts.date_key = daily_counts.date_key), 0)",
+                         (SELECT SUM(count) FROM key_counts WHERE key_counts.date_key = daily_counts.date_key), 0)
+                     AND EXISTS (
+                         SELECT 1 FROM key_counts WHERE key_counts.date_key = daily_counts.date_key)",
                     [],
                 ) {
                 Ok(n) => n,
@@ -3389,24 +3394,8 @@ pub fn heal_daily_consistency() {
                     0
                 }
             };
-            // 无 key_counts 行但 daily_counts 有值的残留天，直接清零
-            let cleared = match conn
-                .execute(
-                    "UPDATE daily_counts SET count = 0
-                     WHERE count != 0 AND NOT EXISTS
-                         (SELECT 1 FROM key_counts WHERE key_counts.date_key = daily_counts.date_key)",
-                    [],
-                ) {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!("一致性自愈：{year} 年库残留天清零失败，本轮没修成: {e}");
-                    0
-                }
-            };
-            if fixed_daily > 0 || cleared > 0 {
-                tracing::info!(
-                    "一致性自愈：{year} 年库修正 {fixed_daily} 天 daily_counts（另清零 {cleared} 天）"
-                );
+            if fixed_daily > 0 {
+                tracing::info!("一致性自愈：{year} 年库修正 {fixed_daily} 天 daily_counts");
             }
         }
 
@@ -3459,7 +3448,7 @@ pub fn heal_daily_consistency() {
 /// 一致性体检结果（全部只在只读连接上得出）。
 #[derive(Default)]
 struct Inconsistency {
-    /// daily_counts 与 Σkey_counts 存在偏差（或有残留天）
+    /// daily_counts 与 Σkey_counts 存在偏差，且该天确有按键明细
     has_daily_mismatch: bool,
     /// Σhourly 与 daily 不一致的天
     hourly_mismatch_days: Vec<i64>,
@@ -3474,12 +3463,15 @@ struct Inconsistency {
 /// 只读体检：找出 daily/hourly 与明细表不一致的天。
 fn daily_inconsistency(conn: &Connection) -> Inconsistency {
     let mut probe_errors: Vec<String> = Vec::new();
-    // 1. 有没有哪天的 daily != Σkey_counts（含 daily 有值但明细全无的残留天）
+    // 1. 有没有哪天的 daily != Σkey_counts，且该天确有明细。
+    //    没有 key_counts 行不等于当天真实计数为 0：只剩聚合表的旧库没有明细，
+    //    把它当残留清零会直接删掉整年历史。
     //    只有 `QueryReturnedNoRows` 才是"没有偏差"；其余 Err 是"没探测成"。
     let has_daily_mismatch = match conn.query_row(
         "SELECT 1 FROM daily_counts d
           WHERE d.count != COALESCE((SELECT SUM(count) FROM key_counts k
                                       WHERE k.date_key = d.date_key), 0)
+            AND EXISTS (SELECT 1 FROM key_counts k WHERE k.date_key = d.date_key)
           LIMIT 1",
         [],
         |_| Ok(()),
@@ -5449,6 +5441,70 @@ mod tests {
             assert!(!d.has_daily_mismatch);
             assert!(d.hourly_mismatch_days.is_empty());
         }
+    }
+
+    #[test]
+    fn heal_preserves_days_without_key_detail() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("heal_aggregate_only");
+        let year = chrono::Local::now().year();
+        let path = paths::year_db_path(year);
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (1, 99)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO hourly_counts (date_key, hour, count) VALUES (1, 9, 99)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let ro = connection::open_ro(&path).unwrap();
+            let d = daily_inconsistency(&ro);
+            assert!(
+                !d.has_daily_mismatch,
+                "整个库没有按键明细时，不能把 daily 当成残留偏差"
+            );
+        }
+        {
+            let conn = connection::open_rw(&path).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts (date_key, count) VALUES (2, 99)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO key_counts (date_key, key_name, count) VALUES (2, 'A', 4)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO hourly_counts (date_key, hour, count) VALUES (2, 9, 4)",
+                [],
+            )
+            .unwrap();
+        }
+        queries::invalidate_years_cache();
+        heal_daily_consistency();
+
+        let conn = connection::open_ro(&path).unwrap();
+        let legacy: i64 = conn
+            .query_row("SELECT count FROM daily_counts WHERE date_key=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let repaired: i64 = conn
+            .query_row("SELECT count FROM daily_counts WHERE date_key=2", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(legacy, 99, "没有按键明细的旧聚合日必须原样保留");
+        assert_eq!(repaired, 4, "确有按键明细的偏差日仍按明细重算");
     }
 
     /// 主库那一格**问不出**（被别的程序挡着读）时，清扫不许把它的 sidecar 当孤儿删掉。
