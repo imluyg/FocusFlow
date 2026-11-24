@@ -1014,6 +1014,14 @@ pub fn add_subcategory(category: &str, sub_name: &str) -> (bool, String) {
     if sub_name.is_empty() {
         return (false, "子分类名不能为空".into());
     }
+    if sub_name == "[]" {
+        return (
+            false,
+            "子分类名不能写成 []：[] 是 subs 列里表示「没有子分类」的占位值，\
+             存进去之后任何清单都不会显示它，也删不掉"
+                .into(),
+        );
+    }
     if sub_name.contains(',') {
         return (
             false,
@@ -1052,6 +1060,14 @@ pub fn update_subcategory(category: &str, old_sub: &str, new_sub: &str) -> (bool
     let new_sub = new_sub.trim();
     if new_sub.is_empty() {
         return (false, "子分类名不能为空".into());
+    }
+    if new_sub == "[]" {
+        return (
+            false,
+            "子分类名不能改成 []：[] 是 subs 列里表示「没有子分类」的占位值，\
+             改完之后这一项会从所有清单里消失，也删不掉"
+                .into(),
+        );
     }
     if old_sub == new_sub {
         return (false, "没有需要修改的内容".into());
@@ -3969,6 +3985,33 @@ mod tests {
         assert!(
             !ok2 && msg2.contains("不存在"),
             "缺分类不许被说成读不动，反之也不行: {msg2}"
+        );
+    }
+
+    /// `[]` 是 `subs` 列的"没有子分类"哨兵：读侧会把它滤掉。入口不拦的话，
+    /// 添加会回「成功」、库里落一串看不见的值，之后改名/删除都说"不存在"。
+    #[test]
+    fn the_empty_sentinel_cannot_be_added_or_renamed_to() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("acc_subs_sentinel");
+        init_db().expect("建库失败");
+        assert!(add_category("收藏", "both", &["充值".to_string()]) > 0);
+
+        let (ok, msg) = add_subcategory("收藏", "[]");
+        assert!(!ok, "哨兵名被当成真子分类写进去了");
+        assert!(msg.contains("[]"), "要说清是哪个名字不能用: {msg}");
+        assert!(
+            !get_subcategories("收藏").iter().any(|s| s == "[]"),
+            "被拒之后清单里不该多出任何东西"
+        );
+
+        let (ok, msg) = update_subcategory("收藏", "充值", " [] ");
+        assert!(!ok, "改名成哨兵同样会让这一项从清单里消失");
+        assert!(msg.contains("[]"), "要说清是哪个名字不能用: {msg}");
+        assert_eq!(
+            get_subcategories("收藏"),
+            vec!["充值".to_string()],
+            "被拒的改名不许动原名字"
         );
     }
 
