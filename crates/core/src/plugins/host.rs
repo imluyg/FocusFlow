@@ -439,8 +439,26 @@ pub fn install_timer_api(
     owner: &str,
     allow_clipboard_events: bool,
 ) -> mlua::Result<()> {
-    use crate::plugins::plugin_timers::{self, Kind};
-    let board = plugin_timers::board_for(owner);
+    install_timer_api_with_board(
+        lua,
+        host,
+        crate::plugins::plugin_timers::board_for(owner),
+        allow_clipboard_events,
+    )
+}
+
+/// 同 [`install_timer_api`]，但排程表由调用方交进来。
+///
+/// 重载路径要用这一条：新实例先把回调排进一份**尚未登记**的空表，脚本与 `init()`
+/// 都跑成功之后才 publish 进名册 —— 失败时名册上那份旧表一个字都不动，
+/// 旧实例的定时器与事件照常到期（见 [`crate::plugins::plugin_timers::publish`]）。
+pub fn install_timer_api_with_board(
+    lua: &Lua,
+    host: &Table,
+    board: Arc<std::sync::Mutex<crate::plugins::plugin_timers::Board>>,
+    allow_clipboard_events: bool,
+) -> mlua::Result<()> {
+    use crate::plugins::plugin_timers::Kind;
     let for_arm = Arc::clone(&board);
     let arm = lua.create_function(move |_lua, (kind, secs): (String, i64)| {
         if kind == "clipboard" && !allow_clipboard_events {

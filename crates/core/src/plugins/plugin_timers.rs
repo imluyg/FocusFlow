@@ -107,8 +107,16 @@ impl Board {
         self.next_handle += 1;
         let handle = self.next_handle;
         let due = match kind {
-            Kind::Every => Some(now + std::time::Duration::from_secs(secs)),
-            Kind::After => Some(now + std::time::Duration::from_secs(secs)),
+            // 秒数由插件给：`now + Duration` 在结果不可表示时会 panic，而这一层是
+            // `focusflow.every()` 的唯一入口 —— 拒绝要在这里说出来，不能让进程替它崩。
+            Kind::Every | Kind::After => Some(
+                now.checked_add(std::time::Duration::from_secs(secs))
+                    .ok_or_else(|| {
+                        format!(
+                            "定时器的秒数太大（收到 {secs}）：算出来的时间点超出可表示范围，请改小"
+                        )
+                    })?,
+            ),
             Kind::Tick | Kind::DayChange | Kind::AppChange | Kind::Clipboard => None,
         };
         self.entries.insert(
@@ -157,6 +165,9 @@ impl Board {
         // 顺序稳定：插件挂了多格时"这一拍先跑谁"不该随 HashMap 的哈希序变
         // （本仓为同一件事在排行与看板那两处各收过一次，`cmp_rank_desc` 那一份）。
         due.sort_unstable();
+        // 到点之后重排出错（`now + secs` 不可表示）的格子：留着也永远不再到期，
+        // 只会在 8 格上限里占一个名字，所以按"这一格已经没了"处理。
+        let mut unschedulable: Vec<u64> = Vec::new();
         for handle in &due {
             let Some(entry) = self.entries.get_mut(handle) else {
                 continue;
@@ -166,13 +177,17 @@ impl Board {
                     // 先摘再跑：跑回调的那一刻插件可能又 arm 一格新的，摘在后面会把新的也算进去
                     self.entries.remove(handle);
                 }
-                Kind::Every => {
-                    entry.due = Some(now + std::time::Duration::from_secs(entry.secs));
-                }
+                Kind::Every => match now.checked_add(std::time::Duration::from_secs(entry.secs)) {
+                    Some(next) => entry.due = Some(next),
+                    None => unschedulable.push(*handle),
+                },
                 Kind::Tick => entry.last_minute = Some(minute_key),
                 Kind::DayChange => entry.last_day = Some(day_key),
                 Kind::AppChange | Kind::Clipboard => {}
             }
+        }
+        for handle in unschedulable {
+            self.entries.remove(&handle);
         }
         self.fired += due.len() as u64;
         due
@@ -253,11 +268,29 @@ fn registry() -> &'static Mutex<Registry> {
 pub fn board_for(owner: &str) -> Arc<Mutex<Board>> {
     let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
     reg.entry(owner.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(Board::new())))
+        .or_insert_with(new_board)
         .clone()
 }
 
-/// 摘掉这一份插件的全部定时器（卸载、出错、重载换字节之前）。
+/// 一份还没登记进名册的空表。
+///
+/// 重载插件时新实例先把自己的回调排在这里，**装成功之后**才 [`publish`]：
+/// 失败要把名册上那份旧表原样留着 —— 旧实例还在跑，它的定时器与事件不该跟着
+/// 一次语法错误的存盘一起哑掉。
+pub fn new_board() -> Arc<Mutex<Board>> {
+    Arc::new(Mutex::new(Board::new()))
+}
+
+/// 把一份表登记成这个 owner 的排程表（同名覆盖）。
+pub fn publish(owner: &str, board: Arc<Mutex<Board>>) {
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    reg.insert(owner.to_string(), board);
+}
+
+/// 摘掉这一份插件的全部定时器（卸载、出错）。
+///
+/// 重载**不走**这条：新表在脚本与 `init()` 都成功之后由 [`publish`] 顶掉，
+/// 失败时旧表原样留着（旧实例还在跑，回调得继续到期）。
 ///
 /// 交回摘掉了几格：`unload` 那一条用例要能看见"整格没了"，而不只是"函数跑过了"。
 pub fn forget(owner: &str) -> usize {
@@ -461,6 +494,27 @@ mod tests {
             "挂满要说清上限和出路，不能只说失败: {full}"
         );
         assert_eq!(board.len(), MAX_TIMERS_PER_PLUGIN, "被拒的那一格不许占位");
+    }
+
+    /// 秒数大到"现在 + 这一段"表示不了时，`arm` 要回一句可读的拒绝，而不是让
+    /// `Instant + Duration` 在插件回调里 panic（release 下 panic 跨 Lua/FFI 边界的结局是
+    /// 整个进程消失，插件作者只会看到程序没了）。
+    #[test]
+    fn an_interval_that_cannot_be_represented_is_refused_not_panicked() {
+        let now = Instant::now();
+        let mut board = Board::new();
+        for kind in [Kind::Every, Kind::After] {
+            let e = board.arm(kind, u64::MAX, now).unwrap_err();
+            assert!(
+                e.contains("太大") && e.contains("请改小"),
+                "{kind:?} 的超大秒数要说清是哪一格、怎么改：{e}"
+            );
+        }
+        assert_eq!(board.len(), 0, "被拒的格子不许占位");
+        // 边界负腿：能表示的长间隔照常排得进去
+        board
+            .arm(Kind::Every, 24 * 3600, now)
+            .expect("一天一次应当排得进去");
     }
 
     /// `cancel` 摘掉是真的少了格子，句柄不复用（拿旧句柄再 cancel 是 false 而不是误杀新格）。

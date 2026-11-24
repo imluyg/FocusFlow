@@ -1630,10 +1630,12 @@ impl PluginManager {
         // 闸才会把它们一起包进去）。
         // 每次（重）加载都从**空表**开始：回调函数住在上一份 Lua 里，那份已经跟着旧条目没了，
         // 留着旧句柄就是让排程去查一个再也不存在的回调。
+        // **新表先在手里攒着，装载成功之后才发布进名册**（见 `plugin_timers::publish`）：
+        // 失败的重载 = 什么都没发生，旧实例还在表里跑，它那一份排程必须原样留着 ——
+        // 先 `forget` 再执行脚本的写法会让旧实例的 `every`/`on` 永久哑掉，且无日志。
         // 与调度线程那一份 owner 记账不同 —— 那条刻意不在重载时销（见 `reload_plugin`），
         // 因为线程还在为别的插件跑；这里销的是"这个实例自己的待办清单"，重载语义就是换一份。
-        // 顺序不能反：先销旧格、再装入口，装的那一步取到的是这一份新表。
-        plugin_timers::forget(&stem);
+        let timer_board = plugin_timers::new_board();
         // 每一次（重）加载都从空表开始，台账同理：**先把上一份账落盘，再摘掉这一格**
         // （`plugin_health::forget` 里就是这一序）。落盘的必要性在这条路上最直白 ——
         // 热重载换的是字节，不该顺手把"这一格慢过几次、上次为什么停用"清零。
@@ -1644,7 +1646,7 @@ impl PluginManager {
         // —— 它收到的载荷就是每次复制的原文，不比主动读弱。
         let allow_clip_events =
             source != PluginSource::User || meta.manifest.api >= host::CLIPBOARD_MIN_PLUGIN_API;
-        host::install_timer_api(&lua, &api, &stem, allow_clip_events)
+        host::install_timer_api_with_board(&lua, &api, Arc::clone(&timer_board), allow_clip_events)
             .map_err(|e| format!("定时器入口装不上: {e}"))?;
         let declared = meta.manifest.permissions.clone();
         let unknown = permissions::unknown_permissions(&declared);
@@ -1704,10 +1706,7 @@ impl PluginManager {
                 .get::<mlua::Value>("record_key")
                 .map(|v| matches!(v, mlua::Value::Function(_)))
                 .unwrap_or(false)
-                || !plugin_timers::board_for(&stem)
-                    .lock()
-                    .map(|b| b.is_empty())
-                    .unwrap_or(true);
+                || !timer_board.lock().map(|b| b.is_empty()).unwrap_or(true);
             if !hooked {
                 tracing::warn!(
                     "插件 {stem} 声明 PLUGIN_LIFECYCLE = \"always\"，但它既没有 record_key \
@@ -1779,6 +1778,9 @@ impl PluginManager {
             self.plugins.remove(&old);
         }
 
+        // 脚本与 `init()` 都跑完了：这一刻才用新表替换名册里旧实例那一份。
+        // 上面任何一步失败都会提前返回，旧表因此原样留着。
+        plugin_timers::publish(&stem, timer_board);
         self.plugins.insert(info.manifest.name.clone(), info);
         tracing::info!("插件加载成功: {}", self.plugins.len());
         // 返回刚加载的插件名
@@ -3898,6 +3900,18 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
             Some(1),
             "init() 用过调度线程就该把这个文件名登记成使用者"
         );
+        // 旧实例在 init() 里排下的定时器（这里直接排一格代替跑脚本）：
+        // 一次失败的换字节不许把它清掉，否则页面写着插件还在、回调却永不触发。
+        let old_board = crate::plugins::plugin_timers::board_for("keep_old");
+        old_board
+            .lock()
+            .unwrap()
+            .arm(
+                crate::plugins::plugin_timers::Kind::Every,
+                30,
+                std::time::Instant::now(),
+            )
+            .expect("给旧实例排一格");
 
         // 半截的语法错误
         write_lua(
@@ -3925,6 +3939,16 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
             Some(1),
             "加载失败时把旧实例的 owner 销掉，等于把定时任务的线程拆了"
         );
+
+        // 旧实例的排程表也不能被这次失败的换字节动过：它还在表里跑，`every`/`on`
+        // 还得继续到期。旧实现先 `forget` 再执行新脚本，失败路径把旧表留成了空表 ——
+        // 页面写着插件还在，回调却永不触发，且没有任何日志。
+        let after = crate::plugins::plugin_timers::board_for("keep_old");
+        assert!(
+            std::sync::Arc::ptr_eq(&old_board, &after),
+            "失败的重载换掉了旧实例的排程表：回调从此永远不会到期"
+        );
+        assert_eq!(after.lock().unwrap().len(), 1, "旧格子被清掉了");
 
         // 反向腿：旧实例活着 ⇒ 停用就能回收。旧实现走到这里条目已经没了，
         // `unload_plugin` 返回 false、owner 永远留在表上（= 上面那句"再也回收不掉"）。
