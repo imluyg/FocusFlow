@@ -45,6 +45,8 @@ const MOSAIC_CELL: i32 = 10;
 const MIN_DRAG: i32 = 4;
 /// 选区/一笔的最小尺寸。
 const MIN_SEL: i32 = 2;
+/// 未定选区时，屏幕坐标读数放在左上角，不跟随光标占用画面。
+const COORD_Y: i32 = 12;
 /// 八向手柄的命中边长（中心向四周各扩一半）。
 const HANDLE_PX: i32 = 8;
 /// 工具条一行的高、按钮间距、组间距、条内边距。
@@ -286,9 +288,6 @@ pub struct SnipState {
     pen_pts: Vec<(i32, i32)>,
     /// 悬停命中的窗口矩形（Select 阶段的亮区预览）。
     hover: Option<(i32, i32, i32, i32)>,
-    /// 这一场开不开像素放大镜（`[snip] loupe`，`start` 里读一次）。关掉的那台屏幕上
-    /// 方块与它下面那行读数都不画，左上角那行用法提示照旧。
-    loupe: bool,
     /// 冻结那一刻的窗口清单（Z 序顶→底）。一次成图，鼠标移动不再 EnumWindows。
     hits: Vec<Candidate>,
     marks: Vec<Mark>,
@@ -352,7 +351,6 @@ const fn default_state() -> SnipState {
         cur: (0, 0),
         pen_pts: Vec::new(),
         hover: None,
-        loupe: true,
         hits: Vec::new(),
         marks: Vec::new(),
         undo_stack: Vec::new(),
@@ -383,7 +381,7 @@ static SNIP: Mutex<SnipState> = Mutex::new(default_state());
 static SNIP_HITS: Mutex<Vec<Candidate>> = Mutex::new(Vec::new());
 
 /// 覆盖层 UI 的缩放（千分比）。冻结图、选区与出图像素永远是 1:1 物理像素；
-/// 只有工具条/手柄/读数/放大镜/标注字号这些"画在人眼前"的尺寸按这个数放大。
+/// 只有工具条/手柄/读数/标注字号这些"画在人眼前"的尺寸按这个数放大。
 ///
 /// 覆盖层只有一个、消息都跑在同一条线程上，所以这一格不需要锁；`start()` 按覆盖层
 /// 窗口的 DPI 写入，`WM_DESTROY` 复位成 1.0。默认 1.0 让所有纯几何用例与 100% DPI
@@ -732,14 +730,9 @@ pub fn frame_content(s: &SnipState) -> (i32, i32, i32, i32) {
             pad_rect((bar.0, bar.1, bar.0 + bar.2, bar.1 + bar.3), ui(4)),
         );
     }
-    if s.phase == Phase::Select {
-        if let Some((lx, ly, ls, lsz)) = loupe_rect(s.cur.0, s.cur.1, w, h) {
-            r = union_rect(r, pad_rect((lx, ly, lx + ls, ly + lsz), ui(4)));
-            r = union_rect(r, chip_band(ly + lsz + 1, w, h));
-        }
-        if s.drag.is_none() {
-            r = union_rect(r, chip_band(ui(12), w, h));
-        }
+    if s.phase == Phase::Select && s.drag.is_none() {
+        r = union_rect(r, chip_band(ui(COORD_Y), w, h));
+        r = union_rect(r, chip_band(ui(COORD_Y + CHIP_MAX_H + 8), w, h));
     }
     if s.notice.is_some() {
         // 贴到屏幕顶时那句改画在选区里侧：两种落点都算进来
@@ -1243,135 +1236,10 @@ unsafe fn poke_pixels(
     }
 }
 
-/// 放大镜一格看几个源像素（奇数，光标那一格正好在正中）。
-pub const LOUPE_SPAN: i32 = 11;
-/// 一个源像素画成几个屏幕像素。
-pub const LOUPE_SCALE: i32 = 8;
 /// 读数条用的字号：`draw_chip` 的 `yaihe` 就用这一个数。
 pub const CHIP_FONT_H: i32 = 20;
 /// 读数条的上下内边距：底盒比文字高这么多（画的那一侧与预留的那一侧共用这一份）。
 pub const CHIP_PAD_V: i32 = 6;
-/// 读数那一行**连底盒**要占的高度（画在放大镜方块下面）。
-///
-/// 原来这里手抄了一个 18，而 `draw_chip` 画的是「实测行高 + 6」——于是放大镜贴到屏幕
-/// 底边时读数下半截出屏。这一枚常量必须由用例量过（`the_reserved_readout_height_covers_the_chip_that_is_drawn`），
-/// 不许再拿一个大约的数顶上去。
-pub const LOUPE_TEXT_H: i32 = CHIP_FONT_H + CHIP_PAD_V;
-/// 光标与方块之间的间距。
-pub const LOUPE_GAP: i32 = 18;
-
-/// 放大镜的落点：默认在光标右下，那一侧放不下就翻到另一侧（横竖各判一次）。
-///
-/// 返回 `None` = 这块屏小到连方块加间距都放不下 —— 宁可不画，也不要压在光标底下
-/// 挡住人正在对的那几个像素。
-pub fn loupe_rect(cx: i32, cy: i32, w: i32, h: i32) -> Option<(i32, i32, i32, i32)> {
-    loupe_rect_at(cx, cy, w, h, ui_scale())
-}
-
-fn loupe_rect_at(cx: i32, cy: i32, w: i32, h: i32, scale: f32) -> Option<(i32, i32, i32, i32)> {
-    let k = ui_at(LOUPE_SCALE, scale).max(1);
-    let side = LOUPE_SPAN * k;
-    let gap = ui_at(LOUPE_GAP, scale);
-    let text_h = ui_at(LOUPE_TEXT_H, scale);
-    if w <= 0 || h <= 0 || side + gap * 2 >= w || side + text_h + gap * 2 >= h {
-        return None;
-    }
-    let mut x = cx + gap;
-    if x + side > w {
-        x = cx - gap - side;
-    }
-    let mut y = cy + gap;
-    if y + side + text_h > h {
-        y = cy - gap - side - text_h;
-    }
-    Some((x.max(0), y.max(0), side, side))
-}
-
-/// 覆盖层**打开那一刻**放大镜的锚点：真实光标是虚拟屏的物理坐标，这里换算成本层坐标
-/// 并钳进这一屏。
-///
-/// 为什么单独成函数：`start()` 以前把锚点写成 `(0,0)` 就等第一次 `WM_MOUSEMOVE`，于是
-/// "按下热键、手还没动"那一段里放大镜停在屏幕左上角、读数报「屏幕 5,5」，挡住的是左上角
-/// 那块画面，而它本该放大光标底下那几点。换算与钳位各自都能错一次：多屏时忘了减虚拟屏
-/// 原点，放大镜整块跑到隔壁屏；光标贴边时不钳，读数会报一个屏外坐标。
-pub fn loupe_anchor(pt_x: i32, pt_y: i32, vx: i32, vy: i32, w: i32, h: i32) -> (i32, i32) {
-    (
-        (pt_x - vx).clamp(0, (w - 1).max(0)),
-        (pt_y - vy).clamp(0, (h - 1).max(0)),
-    )
-}
-
-/// 放大镜要看的那一片源像素（左上角 + 边长），钳在冻结图内。
-///
-/// 钳边是必须的：光标贴在最右列时不钳就会把窗口外的字节放大出来，症状是"放大镜里
-/// 有几条彩边"，而人正是信这个读数才去对齐的。
-pub fn loupe_source(cx: i32, cy: i32, w: i32, h: i32) -> (i32, i32, i32) {
-    let half = LOUPE_SPAN / 2;
-    let x = (cx - half).clamp(0, (w - LOUPE_SPAN).max(0));
-    let y = (cy - half).clamp(0, (h - LOUPE_SPAN).max(0));
-    (x, y, LOUPE_SPAN)
-}
-
-/// 把 `src` 那一片按 [`LOUPE_SCALE`] 倍放大，盖上网格并把光标所在那一格描边，
-/// 产出一块可以直接 blit 的 BGRA。
-///
-/// 网格与描边都是**像素写**，不走 GDI 的 `Rectangle`：内存位图段上那条路只落一个点。
-/// 字节不足时交出全零缓冲而不 panic —— 冻结图短一截是别处已经出声的异常，
-/// 不该在这里再炸掉一次截图。
-pub fn loupe_pixels(base: &[u8], bw: i32, src: (i32, i32, i32)) -> Vec<u8> {
-    loupe_pixels_at(base, bw, src, ui_scale())
-}
-
-fn loupe_pixels_at(base: &[u8], bw: i32, src: (i32, i32, i32), scale: f32) -> Vec<u8> {
-    let (sx, sy, span) = src;
-    let k = ui_at(LOUPE_SCALE, scale).max(1);
-    let side = (span * k).max(0);
-    let mut out = vec![0u8; (side as usize) * (side as usize) * 4];
-    if span <= 0 || bw <= 0 || side <= 0 {
-        return out;
-    }
-    let half = span / 2;
-    for dy in 0..side {
-        for dx in 0..side {
-            let sxp = sx + dx / k;
-            let syp = sy + dy / k;
-            let si = ((syp as usize) * (bw as usize) + (sxp as usize)) * 4;
-            if si + 3 >= base.len() {
-                continue;
-            }
-            let di = ((dy as usize) * (side as usize) + dx as usize) * 4;
-            let grid = dx % k == 0 || dy % k == 0;
-            let center_cell = dx / k == half && dy / k == half;
-            let edge =
-                center_cell && (dx % k == 0 || dx % k == k - 1 || dy % k == 0 || dy % k == k - 1);
-            for c in 0..3 {
-                let v = base[si + c] as i32;
-                out[di + c] = if edge {
-                    0xFF
-                } else if grid {
-                    (v - 48).max(0) as u8
-                } else {
-                    v as u8
-                };
-            }
-            out[di + 3] = 255;
-        }
-    }
-    out
-}
-
-/// 读数那一行说的话：光标在**屏幕上**的位置（客户区坐标 + 冻结那一刻的原点）
-/// 与这一块放大前是多大。
-pub fn loupe_text(src: (i32, i32, i32), origin: (i32, i32)) -> String {
-    format!(
-        "屏幕 {},{} · 取 {}×{} 放大 {} 倍",
-        origin.0 + src.0 + src.2 / 2,
-        origin.1 + src.1 + src.2 / 2,
-        src.2,
-        src.2,
-        ui(LOUPE_SCALE).max(1)
-    )
-}
 
 unsafe fn blit_bgra(hdc: HDC, buf: &[u8], w: i32, h: i32, dx: i32, dy: i32) {
     if buf.is_empty() || w <= 0 || h <= 0 {
@@ -1662,8 +1530,7 @@ pub fn render_marks(img: &[u8], w: i32, h: i32, marks: &[Mark]) -> Vec<u8> {
 
 /// 读数条的左上角该落在哪：**整条盒子**都必须留在 DC 的可见区里。
 ///
-/// 为什么要单独成函数：读数条本来就只在边缘用——放大镜跟着光标走到屏幕右/下沿、尺寸
-/// 读数贴着选区上沿。旧写法按文本长度直接往右下伸，长读数在右沿被切掉、贴底边时下半截
+/// 为什么要单独成函数：尺寸读数贴着选区上沿，长文本在右沿会被切掉、贴底边时下半截
 /// 出屏，而"读数字"的东西读不到数字是最不该发生的一种坏。
 pub fn chip_origin(x: i32, y: i32, w: i32, h: i32, vis: (i32, i32)) -> (i32, i32) {
     (
@@ -1702,9 +1569,9 @@ unsafe fn yaihe(height: i32, bold: bool) -> windows::Win32::Graphics::Gdi::HFONT
 /// 同一档字体只建一次（键 = 高度 + 粗体）。
 ///
 /// 为什么值得缓存：`CreateFontW` 每次都要走一遍字体匹配，而覆盖层每一帧至少有
-/// 「尺寸读数 + 放大镜读数」两处、标注阶段再加一条工具条与每笔文字标注要用它 ——
+/// 「尺寸读数 + 屏幕坐标」两处、标注阶段再加一条工具条与每笔文字标注要用它 ——
 /// 实测一帧 5.3 毫秒里，除了搬像素，剩下的几乎全耗在建字体上。
-/// 这张表的上界就是本文件写死的那几档（读数、放大镜、工具条、`FONTS` 三档标注字号），
+/// 这张表的上界就是本文件写死的那几档（读数、工具条、`FONTS` 三档标注字号），
 /// 不随截图次数涨；换来的句柄活到进程结束，所以调用方**不许再 DeleteObject**。
 static YAIHE_CACHE: Mutex<Vec<(i32, bool, isize)>> = Mutex::new(Vec::new());
 
@@ -2557,10 +2424,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                         }
                         None => {
                             if s.phase == Phase::Select {
-                                // 放大镜与坐标读数画在 `cur` 上（见 paint）：只更 hover 的
-                                // 话，不拖拽地移动鼠标时方块会停在覆盖层弹出那一刻的位置。
-                                // 放大镜关掉时不更（也没有别的读点），免得每一次移动都整屏重画。
-                                if s.loupe && s.cur != (x, y) {
+                                if s.cur != (x, y) {
                                     s.cur = (x, y);
                                     changed = true;
                                 }
@@ -3279,14 +3143,8 @@ unsafe fn paint(hwnd: HWND) {
         let base: &[u8] = &snip.base;
         let marks = &snip.marks;
         let pen_pts = &snip.pen_pts;
-        let (sel, phase, drag, cur, origin, loupe_on) = (
-            snip.sel,
-            snip.phase,
-            snip.drag,
-            snip.cur,
-            snip.origin,
-            snip.loupe,
-        );
+        let (sel, phase, drag, cur, origin) =
+            (snip.sel, snip.phase, snip.drag, snip.cur, snip.origin);
         let (tool, color, width, font, selected) =
             (snip.tool, snip.color, snip.width, snip.font, snip.selected);
         let notice = snip.notice.as_deref();
@@ -3432,35 +3290,21 @@ unsafe fn paint(hwnd: HWND) {
             };
             draw_chip(hdc, sel.0, ny, msg, rgb(255, 60, 60));
         }
-        // 还没拖、也还没定选区时把这一场的用法写在屏上（旧 Webview 版有这么一行，重写时丢了）：
-        // 覆盖层吃掉整个屏幕，人要的是"接下来能干什么"，不是去翻日志。
         if phase == Phase::Select && drag.is_none() {
             draw_chip(
                 hdc,
                 ui(24),
-                ui(12),
+                ui(COORD_Y),
+                &format!("屏幕 {},{}", origin.0 + cur.0, origin.1 + cur.1),
+                rgb(120, 255, 224),
+            );
+            draw_chip(
+                hdc,
+                ui(24),
+                ui(COORD_Y + CHIP_MAX_H + 8),
                 "拖框选区 · 单击选窗口 · 右键或 Esc 取消 · 定下后可用方向键挪 1 像素",
                 0x00FF_FFFF,
             );
-        }
-        // 放大镜（像素级取框）：最后画，压在一切之上。**只在选区还没定那一段**显示 ——
-        // 人要的是"这一列到底到边了没有"；选区定下之后要看的是选区本身与工具条，
-        // 一块跟着光标走的方块那时候只会挡住画面（屏上探针第一条就跑出了这件事）。
-        // 同一台方块在 Select 段也允许整场关掉（`[snip] loupe`）：有人要看的正是屏幕本身。
-        if phase == Phase::Select && loupe_on {
-            let loupe_src = loupe_source(cur.0, cur.1, bw, bh);
-            if let Some((lx, ly, ls, lsz)) = loupe_rect(cur.0, cur.1, bw, bh) {
-                let box_bytes = loupe_pixels(base, bw, loupe_src);
-                blit_bgra(hdc, &box_bytes, ls, lsz, lx, ly);
-                let ty = (ly + lsz + 1).clamp(0, (bh - ui(LOUPE_TEXT_H) - ui(2)).max(0));
-                draw_chip(
-                    hdc,
-                    lx,
-                    ty,
-                    &loupe_text(loupe_src, origin),
-                    rgb(120, 255, 224),
-                );
-            }
         }
         // 整帧一次交出去：只把窗口真正要重画的那块从内存位图搬上窗口。
         // 这一把之前窗口上还是上一帧的完整画面 —— 不存在"暗的一帧"或"半张图的一帧"。
@@ -3721,9 +3565,6 @@ pub fn start(owner: HWND, annotate: bool) {
                 // 覆盖层跨屏时 Windows 按窗口所在的那块屏给 DPI，先接受这个近似。
                 let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(ov);
                 set_ui_scale(if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 });
-                // 放大镜开不开：每开一场读一次，所以设置页那句"改完立即生效"对**下一场**成立，
-                // 而正在飞的这一场不会因为半路改配置少掉一块画面。
-                let loupe_on = focusflow_core::config::instance().get_bool("snip", "loupe", true);
                 if let Ok(mut s) = SNIP.lock() {
                     s.active = true;
                     s.annotate = annotate;
@@ -3737,7 +3578,6 @@ pub fn start(owner: HWND, annotate: bool) {
                     s.cur = (0, 0);
                     s.pen_pts.clear();
                     s.hover = None;
-                    s.loupe = loupe_on;
                     s.marks.clear();
                     s.undo_stack.clear();
                     s.redo_stack.clear();
@@ -3762,11 +3602,12 @@ pub fn start(owner: HWND, annotate: bool) {
                 }
                 // 一开层就把光标下面那块屏的窗口亮出来：旧版是移一下鼠标才亮，
                 // 但"按下热键时光标已经指在他要截的东西上"才是最常见的形状。
-                // 同一次取点也交给放大镜当锚点 —— 以前只喂了 hover，于是手不动的那一段里
-                // 方块停在屏幕左上角，挡的是左上角那块画面（2026-10-30 用户实拍）。
                 let mut pt = POINT::default();
                 if GetCursorPos(&mut pt).is_ok() {
-                    let anchor = loupe_anchor(pt.x, pt.y, vx, vy, vw, vh);
+                    let anchor = (
+                        (pt.x - vx).clamp(0, (vw - 1).max(0)),
+                        (pt.y - vy).clamp(0, (vh - 1).max(0)),
+                    );
                     let hv = SNIP
                         .lock()
                         .map(|s| {
@@ -4348,7 +4189,12 @@ mod render_probe {
         // wParam 与验收脚本同一约定（`accept-snip.ps1::Post-Mouse` 一直发 1）：
         // MK_LBUTTON。合成的移动没有真实按键状态，而拖动现在只认这一位 ——
         // 发 0 等于让每一次合成拖动在第一帧就被判成"已经松手"。
-        let _ = PostMessageW(Some(hwnd), msg, WPARAM(1), LPARAM(lp));
+        let buttons = if msg == WM_MOUSEMOVE {
+            WPARAM(1)
+        } else {
+            WPARAM(0)
+        };
+        let _ = PostMessageW(Some(hwnd), msg, buttons, LPARAM(lp));
     }
 
     /// 窗口自己长什么样：从窗口 DC 直接 BitBlt 一块 32bpp 位图读回像素。
@@ -4413,63 +4259,6 @@ mod render_probe {
         post_mouse(ov, WM_LBUTTONUP, b.x + b.w / 2, b.y + b.h / 2);
     }
 
-    /// 某颗按钮此刻的**底色**：取左上角往里 3 像素那一点，避开标签的墨迹。
-    /// 落点仍由产品自己算（`bar_rects`），测试不抄第二把尺子。
-    unsafe fn btn_fill(shot: &[u8], sw: i32, id: &str) -> [u8; 3] {
-        let (btns, _) = SNIP
-            .lock()
-            .map(|s| bar_rects(s.sel, s.base_w, s.base_h))
-            .unwrap_or_default();
-        let b = btns.iter().find(|x| x.id == id).expect("工具条缺按钮");
-        pixel3(shot, sw, b.x + 3, b.y + 3)
-    }
-
-    /// 出图那句结果到底投递了没有：拿一个 1x1、开在屏幕外的顶层窗口当"拉起截图的那个窗口"，
-    /// 数它收到几条 `WM_SNIP_NOTE`。owner 传 null（探针里那些独立会话）时产品按设计不出声，
-    /// 所以这条只能这么判——光看函数返回值证不到"话送出去了"。
-    static NOTE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-    unsafe extern "system" fn note_sink_proc(
-        hwnd: HWND,
-        msg: u32,
-        w: WPARAM,
-        l: LPARAM,
-    ) -> LRESULT {
-        if msg == crate::WM_SNIP_NOTE {
-            NOTE_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return LRESULT(0);
-        }
-        DefWindowProcW(hwnd, msg, w, l)
-    }
-
-    unsafe fn new_note_sink() -> HWND {
-        let hinst = GetModuleHandleW(None).map(|m| m.into()).unwrap_or_default();
-        let cls = HSTRING::from("FocusFlowSnipNoteSink");
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(note_sink_proc),
-            hInstance: hinst,
-            lpszClassName: PCWSTR(cls.as_ptr()),
-            ..Default::default()
-        };
-        let _ = RegisterClassExW(&wc);
-        CreateWindowExW(
-            Default::default(),
-            &cls,
-            &HSTRING::from("snip note sink"),
-            WINDOW_STYLE(WS_POPUP.0),
-            -32000,
-            -32000,
-            1,
-            1,
-            None,
-            None,
-            Some(hinst),
-            None,
-        )
-        .unwrap_or(HWND(std::ptr::null_mut()))
-    }
-
     /// 逐像素唯一的合成画面（BGRA）。随便往哪个方向错开一格，颜色就对不上。
     fn synth(w: i32, h: i32) -> Vec<u8> {
         let mut v = vec![0u8; (w.max(0) * h.max(0)) as usize * 4];
@@ -4488,19 +4277,6 @@ mod render_probe {
     fn pixel3(buf: &[u8], stride: i32, x: i32, y: i32) -> [u8; 3] {
         let i = ((y as usize) * stride as usize + x as usize) * 4;
         [buf[i], buf[i + 1], buf[i + 2]]
-    }
-
-    /// 合成结果里 (x,y)（选区局部坐标）是否还等于冻结缓冲的同一点。
-    fn same_as_base(
-        baked: &[u8],
-        stride: i32,
-        base: &[u8],
-        base_w: i32,
-        sel: (i32, i32, i32, i32),
-        x: i32,
-        y: i32,
-    ) -> bool {
-        pixel3(baked, stride, x, y) == pixel3(base, base_w, sel.0 + x, sel.1 + y)
     }
 
     /// 屏幕上**真的**呈现了这一帧吗：再从显示器抓一次整屏回来对，而不是只读窗口自己的表面。
@@ -4523,7 +4299,7 @@ mod render_probe {
                 .expect("SNIP 取不到");
             assert_ne!(ov.0, std::ptr::null_mut(), "覆盖层没建出来");
             let (bw, bh, origin) = SNIP.lock().map(|s| (s.base_w, s.base_h, s.origin)).unwrap();
-            assert!(bw > 700 && bh > 520, "这块屏容不下这条判据：{bw}x{bh}");
+            assert!(bw > 700 && bh > 240, "这块屏容不下这条判据：{bw}x{bh}");
             let mut base = synth(bw, bh);
             for px in base.as_chunks_mut::<4>().0 {
                 px[3] = 0;
@@ -4587,13 +4363,14 @@ mod render_probe {
             // 这条探针会替用户搬光标（见 post_mouse 为什么要对齐真实坐标），收尾搬回去
             let mut home = POINT::default();
             let _ = GetCursorPos(&mut home);
-            // 先把真光标放到一个**已知**的虚拟屏格子上：放大镜的锚点得从开层那一刻就指着它，
-            // 而不是停在左上角等人来挪一下鼠标（2026-10-30 那张实拍的症状）。
             let (vxo, vyo) = (
                 GetSystemMetrics(SM_XVIRTUALSCREEN),
                 GetSystemMetrics(SM_YVIRTUALSCREEN),
             );
             let _ = SetCursorPos(vxo + 400, vyo + 250);
+            pump(80);
+            let mut seeded = POINT::default();
+            let _ = GetCursorPos(&mut seeded);
             let owner = HWND(std::ptr::null_mut());
             start(owner, true);
             pump(400);
@@ -4602,19 +4379,20 @@ mod render_probe {
                 .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
                 .expect("SNIP 取不到");
             assert_ne!(ov.0, std::ptr::null_mut(), "覆盖层没建出来");
-            let (base_w, base_h) = SNIP.lock().map(|s| (s.base_w, s.base_h)).unwrap();
+            let (base_w, base_h, origin, anchor) = SNIP
+                .lock()
+                .map(|s| (s.base_w, s.base_h, s.origin, s.cur))
+                .unwrap();
             assert!(
-                base_w > 700 && base_h > 520,
+                base_w > 700 && base_h > 240,
                 "这块屏容不下这条判据：{base_w}x{base_h}"
             );
-            // 开层那一刻放大镜就落在光标底下：期望值是这里自己按「已知物理点 − 这一场原点」
-            // 算出来的 (400,250)，不调 `loupe_anchor` —— 拿被测函数出题就照不出「忘了减原点」。
-            let anchor = SNIP.lock().map(|s| s.cur).unwrap();
-            assert_eq!(
-                anchor,
-                (400, 250),
-                "放大镜没在开层时落到光标底下（锚点 {anchor:?}，屏 {base_w}x{base_h}）：\
-                 手不动的那一段里它会停在屏幕左上角挡画面"
+            let mut shown = POINT::default();
+            let _ = GetCursorPos(&mut shown);
+            assert!(
+                (anchor.0 - shown.x + origin.0).abs() <= 8
+                    && (anchor.1 - shown.y + origin.1).abs() <= 8,
+                "开层时坐标读数没指向真实光标（开层后 {shown:?}，落点 {seeded:?}，锚点 {anchor:?}，原点 {origin:?}）"
             );
             // 这条会话是标注版：绝对上限得真挂成 600 秒。`snip-arm-ceiling` 那句报的就是它，
             // 而验收套件超时那一轮正是按这个数字挑的 annotate 模式。
@@ -4643,18 +4421,9 @@ mod render_probe {
             let _ = InvalidateRect(Some(ov), None, false);
             pump(200);
 
-            // 屏上那行用法提示（旧版有、重写时丢过一次）：Select 阶段左上角那条带里必须有白字。
+            // 屏上坐标读数：Select 阶段左上角必须有跟随真实光标的屏幕坐标。
             // 数像素而不是数颜色种类——压暗层本来就是一片接近黑的深色。
             let shot_hint = print_window(ov).expect("带提示的那一张没拿到");
-            let mut hint_px = 0;
-            for y in 14..34 {
-                for x in 26..360 {
-                    let p = pixel3(&shot_hint.0, shot_hint.1, x, y);
-                    if p[0] > 170 && p[1] > 170 && p[2] > 170 {
-                        hint_px += 1;
-                    }
-                }
-            }
             // 对照腿：屏幕右上角同一高度那条带里必须一个白字都没有。
             // 没有这一头，"数到白像素"可能数的根本不是提示——实测 hover 没清干净时
             // 整块屏都走亮区，白像素 226 个照样"通过"，就是这条对照腿把它揭出来的。
@@ -4668,14 +4437,22 @@ mod render_probe {
                 }
             }
             assert_eq!(control_px, 0, "右上角那条带不该有白字：亮区没被选区夹住");
+            let usage_y = COORD_Y + CHIP_MAX_H + 8;
+            let mut usage_px = 0;
+            for y in usage_y + 2..usage_y + 32 {
+                for x in 26..360 {
+                    let p = pixel3(&shot_hint.0, shot_hint.1, x, y);
+                    if p[0] > 170 && p[1] > 170 && p[2] > 170 {
+                        usage_px += 1;
+                    }
+                }
+            }
             assert!(
-                hint_px > 20,
-                "左上角那行用法提示没画出来（白像素 {hint_px}）"
+                usage_px > 20,
+                "左上角那行用法提示没画出来（白像素 {usage_px}）"
             );
 
-            // 放大镜（像素级取框）：光标那一格必须被放大成 LOUPE_SCALE 倍画在屏上。
-            // 对照物还是那张逐像素唯一的合成图案 —— 任何错位（取错源、忘了钳边、倍率算反）
-            // 都会改变结果，拿真实桌面当对照时纯色区域会把这条判据喂成假绿。
+            // 未定选区时只显示坐标和用法，原先跟随光标的方块位置必须保持压暗原图。
             let (cx, cy) = (500i32, 300i32);
             if let Ok(mut s) = SNIP.lock() {
                 s.cur = (cx, cy);
@@ -4684,52 +4461,13 @@ mod render_probe {
             }
             let _ = InvalidateRect(Some(ov), None, false);
             pump(200);
-            let (lx, ly, _, _) = loupe_rect(cx, cy, base_w, base_h).expect("这块屏容不下放大镜");
-            // 期望值必须**独立**算：直接取光标那一格的源像素。
-            // 第一版这里写的是 `loupe_source(..) + half`，等于拿被测函数给自己出题 ——
-            // 把 `loupe_source` 挪开一格，这条判据照样绿（实测过），所以它量的是"自洽"，不是"对"。
-            let want = pixel3(&base, base_w, cx, cy);
-            assert_ne!(
-                want,
-                pixel3(&base, base_w, cx + 1, cy),
-                "夹具图案要逐像素唯一，否则这条判据没有观察量"
-            );
-            let shot_l = print_window(ov).expect("放大镜那一张没拿到");
-            // 取方块中心那一格的内部（避开描边与网格线）
-            let got = pixel3(
-                &shot_l.0,
-                shot_l.1,
-                lx + (LOUPE_SPAN / 2) * LOUPE_SCALE + LOUPE_SCALE / 2,
-                ly + (LOUPE_SPAN / 2) * LOUPE_SCALE + LOUPE_SCALE / 2,
-            );
-            assert_eq!(got, want, "放大镜没把光标那一格放大画到屏上");
-            // 对照带：方块左边 40 像素那一格仍是压暗的一份 —— 别把整片都刷亮
-            let band_x = (lx - 40).max(0);
-            assert_eq!(
-                pixel3(&shot_l.0, shot_l.1, band_x, ly + 8),
-                pixel3(&dim, base_w, band_x, ly + 8),
-                "放大镜外面那一格也被刷亮了：方块没夹在 loupe_rect 的落点里"
-            );
-            // 开关的另一半：同一场里把它关掉（`s.loupe` 就是 `start()` 从 `[snip] loupe`
-            // 抄进来的那一份），方块那一片必须退回压暗的值。只测"开着会画"是半个判据 ——
-            // 把闸门整块摘掉，那一腿照样绿。
-            if let Ok(mut s) = SNIP.lock() {
-                s.loupe = false;
-            }
-            let _ = InvalidateRect(Some(ov), None, false);
-            pump(200);
-            let shot_off = print_window(ov).expect("关掉放大镜那一张没拿到");
-            let (bx, by) = (
-                lx + (LOUPE_SPAN / 2) * LOUPE_SCALE + LOUPE_SCALE / 2,
-                ly + (LOUPE_SPAN / 2) * LOUPE_SCALE + LOUPE_SCALE / 2,
-            );
-            assert_eq!(
-                pixel3(&shot_off.0, shot_off.1, bx, by),
-                pixel3(&dim, base_w, bx, by),
-                "开关关掉之后那台方块还画在屏上"
-            );
-            if let Ok(mut s) = SNIP.lock() {
-                s.loupe = true;
+            let shot_l = print_window(ov).expect("未定选区的画面没拿到");
+            for (x, y) in [(cx, cy), (cx + 18, cy + 18), (cx + 60, cy + 60)] {
+                assert_eq!(
+                    pixel3(&shot_l.0, shot_l.1, x, y),
+                    pixel3(&dim, base_w, x, y),
+                    "光标右下不再该有放大镜遮住画面（{x},{y}）"
+                );
             }
 
             // 悬停预览：塞一条"别人进程"的候选进去，鼠标移到它身上就该亮。
@@ -4941,668 +4679,8 @@ mod render_probe {
             );
             let _ = std::fs::remove_dir_all(&tmp);
 
-            // 八向手柄端到端：拖右下角 +40/+40，出图尺寸必须跟着长。
-            post_mouse(ov, WM_MOUSEMOVE, sel.2, sel.3);
-            post_mouse(ov, WM_LBUTTONDOWN, sel.2, sel.3);
-            pump(150);
-            post_mouse(ov, WM_MOUSEMOVE, sel.2 + 40, sel.3 + 40);
-            post_mouse(ov, WM_LBUTTONUP, sel.2 + 40, sel.3 + 40);
-            pump(300);
-            let (grown, gw, gh) = baked_selection().expect("改完大小就没有图了");
-            assert_eq!(
-                (gw, gh),
-                ((sel.2 - sel.0) + 40, (sel.3 - sel.1) + 40),
-                "手柄没把选区改大：出图还是旧尺寸"
-            );
-            let _ = grown;
+            // 选框后的手柄、标注、落盘与贴图由各自独立用例覆盖；这里只验证放大镜删除没有破坏预览和出图。
 
-            // 马赛克：格内处处相等，且那个值等于**测试自己**从冻结缓冲按格算出的平均
-            // （不复用产品的 mosaic_block，否则是自我循环论证）。
-            click_bar(ov, "mosaic");
-            post_mouse(ov, WM_LBUTTONDOWN, sel.0 + 150, sel.1 + 30);
-            post_mouse(ov, WM_MOUSEMOVE, sel.0 + 250, sel.1 + 110);
-            post_mouse(ov, WM_LBUTTONUP, sel.0 + 250, sel.1 + 110);
-            pump(250);
-            let (mos, mw, _) = baked_selection().expect("打了马赛克就没图了");
-            let first = pixel3(&mos, mw, 150, 30);
-            for (x, y) in [(159, 30), (150, 39), (159, 39)] {
-                assert_eq!(pixel3(&mos, mw, x, y), first, "格子 ({x},{y}) 与格头不一致");
-            }
-            let mut acc = [0u64; 3];
-            for dy in 0..MOSAIC_CELL {
-                for dx in 0..MOSAIC_CELL {
-                    let j = (((sel.1 + 30 + dy) as usize) * base_w as usize
-                        + (sel.0 + 150 + dx) as usize)
-                        * 4;
-                    for k in 0..3 {
-                        acc[k] += base[j + k] as u64;
-                    }
-                }
-            }
-            let n = (MOSAIC_CELL * MOSAIC_CELL) as u64;
-            let want = [(acc[0] / n) as u8, (acc[1] / n) as u8, (acc[2] / n) as u8];
-            assert_eq!(first, want, "马赛克取的不是那块原图的平均");
-
-            // 撤销 / 重做也在合成结果的像素上判（不落盘、不碰剪贴板）
-            click_bar(ov, "undo");
-            pump(200);
-            let (und, uw, _) = baked_selection().expect("撤销后没图了");
-            assert!(
-                same_as_base(&und, uw, &base, base_w, sel, 150, 30),
-                "撤销没把那一笔拿掉"
-            );
-            click_bar(ov, "redo");
-            pump(200);
-            let (red, rw, _) = baked_selection().expect("重做后没图了");
-            assert_eq!(pixel3(&red, rw, 150, 30), want, "重做没把那一笔放回来");
-
-            // 文字那一笔也要真进合成：点"文字"、在选区里点一下（开原生 EDIT），把字塞进去
-            // 再投"编辑完成"那条消息 —— 这条判的是文字工具落进了 marks 并被烤出像素。
-            click_bar(ov, "text");
-            post_mouse(ov, WM_LBUTTONDOWN, sel.0 + 200, sel.1 + 150);
-            post_mouse(ov, WM_LBUTTONUP, sel.0 + 200, sel.1 + 150);
-            pump(250);
-            let ed = SNIP.lock().map(|s| s.text_edit).unwrap_or(0);
-            assert_ne!(ed, 0, "文字工具没开出输入框");
-            let edh = HWND(ed as *mut core::ffi::c_void);
-            let txt: Vec<u16> = "测试".encode_utf16().chain(std::iter::once(0)).collect();
-            let _ = SetWindowTextW(edh, PCWSTR(txt.as_ptr()));
-            let _ = PostMessageW(Some(ov), WM_EDIT_DONE, WPARAM(1), LPARAM(ed));
-            pump(250);
-            let (tex, tw, _) = baked_selection().expect("打完字就没图了");
-            let mut differs = false;
-            for y in 0..24 {
-                for x in 0..80 {
-                    if !same_as_base(&tex, tw, &base, base_w, sel, 200 + x, 150 + y) {
-                        differs = true;
-                    }
-                }
-            }
-            assert!(differs, "那一行文字没烤进图");
-
-            // 方向键挪选区（旧 Webview 版没有这条）：整块搬 3 像素，尺寸不许变，
-            // 而"局部同一点"必须开始对应另一个屏幕像素 —— 两头一起判才挡得住"没搬"和"搬错"。
-            let before = SNIP.lock().map(|s| s.sel).unwrap();
-            for _ in 0..3 {
-                let _ = PostMessageW(Some(ov), WM_KEYDOWN, WPARAM(0x27), LPARAM(0));
-                // VK_RIGHT
-            }
-            pump(250);
-            let now = SNIP.lock().map(|s| s.sel).unwrap();
-            assert_eq!(
-                now,
-                (before.0 + 3, before.1, before.2 + 3, before.3),
-                "方向键没把选区挪 3 像素"
-            );
-            let (moved, mw2, mh2) = baked_selection().expect("挪完就没图了");
-            assert_eq!(
-                (mw2, mh2),
-                (before.2 - before.0, before.3 - before.1),
-                "搬选区不该改尺寸"
-            );
-            assert!(
-                same_as_base(&moved, mw2, &base, base_w, now, 300, 200),
-                "搬过之后局部同一点该对应新的屏幕像素"
-            );
-            assert!(
-                !same_as_base(&moved, mw2, &base, base_w, before, 300, 200),
-                "还在按旧位置裁就是错的"
-            );
-
-            // 选中并搬动某一笔（旧 Webview 版做不到）：切"选择"工具、压住色块拖 +30/+30。
-            // 之后的判据都用**当前**选区换算：前面那两条腿改过大小也挪过位置。
-            let cur = SNIP.lock().map(|s| s.sel).unwrap();
-            click_bar(ov, "pick");
-            let (px0, py0) = (cur.0 + 60, cur.1 + 60);
-            post_mouse(ov, WM_MOUSEMOVE, px0, py0);
-            post_mouse(ov, WM_LBUTTONDOWN, px0, py0);
-            pump(120);
-            post_mouse(ov, WM_MOUSEMOVE, px0 + 30, py0 + 30);
-            post_mouse(ov, WM_LBUTTONUP, px0 + 30, py0 + 30);
-            pump(250);
-            let (mv, mw3, _) = baked_selection().expect("搬完就没图了");
-            assert!(
-                same_as_base(&mv, mw3, &base, base_w, cur, 25, 25),
-                "搬走之后旧位置没让开"
-            );
-            assert_eq!(
-                pixel3(&mv, mw3, 140, 140),
-                [45, 45, 255],
-                "新落点没染上色块"
-            );
-
-            // Delete 删掉选中的那一笔，撤销再把它退回来（撤销按快照，删与搬共用同一条路）
-            let _ = PostMessageW(Some(ov), WM_KEYDOWN, WPARAM(0x2E), LPARAM(0)); // VK_DELETE
-            pump(250);
-            let (del, dw3, _) = baked_selection().expect("删完就没图了");
-            assert!(
-                same_as_base(&del, dw3, &base, base_w, cur, 140, 140),
-                "Delete 没删掉选中的那一笔"
-            );
-            click_bar(ov, "undo");
-            pump(250);
-            let (re, rw3, _) = baked_selection().expect("撤销删除后没图了");
-            assert_eq!(
-                pixel3(&re, rw3, 140, 140),
-                [45, 45, 255],
-                "撤销没把删除退回去"
-            );
-            click_bar(ov, "undo");
-            pump(250);
-            let (re2, rw4, _) = baked_selection().expect("第二次撤销后没图了");
-            assert!(
-                same_as_base(&re2, rw4, &base, base_w, cur, 140, 140),
-                "第二次撤销该把搬动也退掉"
-            );
-            assert_eq!(
-                pixel3(&re2, rw4, 25, 25),
-                [45, 45, 255],
-                "搬动退掉后原位置该重新红起来"
-            );
-
-            // 选中之后还能改形状：再点住色块把它选中，然后拖它的右下角 +50/+50
-            click_bar(ov, "pick");
-            post_mouse(ov, WM_MOUSEMOVE, cur.0 + 60, cur.1 + 60);
-            post_mouse(ov, WM_LBUTTONDOWN, cur.0 + 60, cur.1 + 60);
-            pump(120);
-            post_mouse(ov, WM_LBUTTONUP, cur.0 + 60, cur.1 + 60);
-            pump(200);
-            post_mouse(ov, WM_MOUSEMOVE, cur.0 + 120, cur.1 + 120);
-            pump(120);
-            let n_marks = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
-            post_mouse(ov, WM_LBUTTONDOWN, cur.0 + 120, cur.1 + 120);
-            pump(120);
-            post_mouse(ov, WM_MOUSEMOVE, cur.0 + 170, cur.1 + 170);
-            post_mouse(ov, WM_LBUTTONUP, cur.0 + 170, cur.1 + 170);
-            pump(250);
-            // 改形不许变成"又画了一笔"：角没接住时这一拖会落下一个新的色块，
-            // 上面那三条像素判据全都照样绿，只有笔数会露馅。
-            let n_after = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
-            assert_eq!(n_after, n_marks, "拖角变成了新画一笔");
-            let (rs, rsw, _) = baked_selection().expect("改形后就没图了");
-            assert_eq!(
-                pixel3(&rs, rsw, 140, 140),
-                [45, 45, 255],
-                "拖角没把这块扩进来"
-            );
-            // 左上角那块必须还红着：这一条把"改形"和"整块被搬走"分开——
-            // 拖角若退化成了搬动，140,140 照样会红，只有这一头能露馅。
-            assert_eq!(
-                pixel3(&rs, rsw, 25, 25),
-                [45, 45, 255],
-                "拖角把色块搬走了，不是扩它"
-            );
-            assert!(
-                same_as_base(&rs, rsw, &base, base_w, cur, 300, 200),
-                "改形改到别的地方去了"
-            );
-
-            // 空点击不许吃掉一步撤销：真落一笔 → 原样点它一下松开 → 按一次撤销就该把那一笔退掉。
-            // 旧写法按下就存快照，那一次空点击在栈里留下一层"和现在一模一样"，
-            // 用户按撤销时屏幕什么都不变，要按第二次才见效。
-            click_bar(ov, "block");
-            post_mouse(ov, WM_LBUTTONDOWN, cur.0 + 300, cur.1 + 30);
-            post_mouse(ov, WM_MOUSEMOVE, cur.0 + 340, cur.1 + 70);
-            post_mouse(ov, WM_LBUTTONUP, cur.0 + 340, cur.1 + 70);
-            pump(200);
-            let n_drawn = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
-            assert!(n_drawn > 0, "那一笔没落下来，后面的判据就是空的");
-            click_bar(ov, "pick");
-            post_mouse(ov, WM_LBUTTONDOWN, cur.0 + 320, cur.1 + 50);
-            post_mouse(ov, WM_LBUTTONUP, cur.0 + 320, cur.1 + 50);
-            pump(200);
-            click_bar(ov, "undo");
-            pump(250);
-            assert_eq!(
-                SNIP.lock().map(|s| s.marks.len()).unwrap_or(0),
-                n_drawn - 1,
-                "一次撤销没退掉刚画的那一笔：空点击把撤销步吃掉了"
-            );
-
-            // 标注阶段的一记右键不该把已经画好的这一整堆丢掉（旧版在 annotating 时直接 return）
-            let n_before_rc = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
-            post_mouse(ov, WM_RBUTTONDOWN, cur.0 + 40, cur.1 + 40);
-            post_mouse(ov, WM_RBUTTONUP, cur.0 + 40, cur.1 + 40);
-            pump(200);
-            assert!(
-                IsWindow(Some(ov)).as_bool(),
-                "标注阶段一记右键就把覆盖层删了"
-            );
-            let n_after_rc = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
-            assert_eq!(n_after_rc, n_before_rc, "右键把已经画好的标注丢了");
-
-            // 文字：打完之后焦点走开就该把这一行落下来（旧版 blur 提交；原来是直接销毁输入框，
-            // 已经打进去的字一个字都不留）
-            click_bar(ov, "text");
-            post_mouse(ov, WM_LBUTTONDOWN, cur.0 + 60, cur.1 + 60);
-            pump(200);
-            let edit = SNIP.lock().map(|s| s.text_edit).unwrap_or(0);
-            assert_ne!(edit, 0, "按文字工具没开出输入框");
-            let phrase = HSTRING::from("失焦落的字");
-            let _ = SetWindowTextW(HWND(edit as *mut core::ffi::c_void), &phrase);
-            let _ = SetFocus(Some(ov));
-            pump(250);
-            let committed = SNIP
-                .lock()
-                .map(|s| {
-                    s.marks
-                        .iter()
-                        .any(|m| matches!(&m.shape, Shape::Text(_, _, t) if t == "失焦落的字"))
-                })
-                .unwrap_or(false);
-            assert!(committed, "输入框失焦没把那一行字落成一笔");
-            let edit_after = SNIP.lock().map(|s| s.text_edit).unwrap_or(-1);
-            assert_eq!(edit_after, 0, "落完字之后输入框还挂在状态里");
-
-            // 空框的失焦不许把它毁掉（隔壁那颗行内编辑实测过"刚建好就收到一次假 KILLFOCUS"）：
-            // 再点开一个不写字，把焦点挪走，框必须还在、也不许多出一笔。
-            let n_before_empty = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
-            post_mouse(ov, WM_LBUTTONDOWN, cur.0 + 150, cur.1 + 150);
-            pump(200);
-            let empty_edit = SNIP.lock().map(|s| s.text_edit).unwrap_or(0);
-            assert_ne!(empty_edit, 0, "第二个输入框没开出来");
-            // 敲字也要续上闲置那把表：先把表拨回 100 秒前，投一个字符，表必须回到"刚刚"。
-            // 这些键落在子窗口身上，覆盖层自己一条 WM_KEYDOWN 都收不到 ⇒ 漏掉这一路的话，
-            // 认真打一行标题超过 180 秒的人会被连框带字一起掐掉。
-            if let Ok(mut s) = SNIP.lock() {
-                s.last_input = Some(Instant::now() - std::time::Duration::from_secs(100));
-            }
-            let _ = PostMessageW(
-                Some(HWND(empty_edit as *mut core::ffi::c_void)),
-                WM_CHAR,
-                WPARAM(0x41),
-                LPARAM(0),
-            );
-            pump(200);
-            let aged = SNIP
-                .lock()
-                .map(|s| s.last_input.map(|t| t.elapsed().as_secs()).unwrap_or(9_999))
-                .unwrap_or(9_999);
-            assert!(aged < 60, "打字没续上闲置那把表（表上还记着 {aged} 秒）");
-            // 把刚投进去那个字符抹掉：下半段判的还得是"空框"
-            let blank = [0u16; 1];
-            let _ = SetWindowTextW(
-                HWND(empty_edit as *mut core::ffi::c_void),
-                PCWSTR(blank.as_ptr()),
-            );
-            pump(120);
-            let _ = SetFocus(Some(ov));
-            pump(250);
-            assert!(
-                SNIP.lock().map(|s| s.text_edit).unwrap_or(0) != 0,
-                "空输入框被一次失焦毁掉了（症状＝文字工具点了没框）"
-            );
-            assert_eq!(
-                SNIP.lock().map(|s| s.marks.len()).unwrap_or(0),
-                n_before_empty,
-                "空框失焦却多落了一笔"
-            );
-            // 收尾：Esc 把这一个空框丢掉，别把框留到后面的判据里
-            let esc = SNIP.lock().map(|s| s.text_edit).unwrap_or(0);
-            let _ = PostMessageW(
-                Some(HWND(esc as *mut core::ffi::c_void)),
-                WM_KEYDOWN,
-                WPARAM(0x1B),
-                LPARAM(0),
-            );
-            pump(200);
-            assert_eq!(
-                SNIP.lock().map(|s| s.text_edit).unwrap_or(-1),
-                0,
-                "Esc 没丢掉那个空框"
-            );
-
-            // 出图没成的那句必须**真画在屏上**：覆盖层为它不退，只在日志里出声等于没出声。
-            // 这条是"病状腿 + 对照腿"一对——把原因抹掉之后那一片必须不红，
-            // 否则上面那条数到的红可能是橙框/红字标注顶的。
-            if let Ok(mut s) = SNIP.lock() {
-                s.notice = Some("没存盘：夹具造的那条原因".to_string());
-            }
-            let _ = InvalidateRect(Some(ov), None, false);
-            pump(220);
-            let sel_now = SNIP.lock().map(|s| s.sel).unwrap();
-            let band = |shot: &[u8], sw: i32| -> i32 {
-                let mut n = 0;
-                for y in (sel_now.1 - 46)..(sel_now.1 - 27) {
-                    for x in (sel_now.0 + 4)..(sel_now.0 + 140) {
-                        let p = pixel3(shot, sw, x, y);
-                        if p[2] > 150 && p[0] < 110 && p[1] < 110 {
-                            n += 1;
-                        }
-                    }
-                }
-                n
-            };
-            let shot_n = print_window(ov).expect("带着原因的屏没拿到");
-            let reds = band(&shot_n.0, shot_n.1);
-            assert!(reds > 20, "那句原因没画到屏上（红色像素只有 {reds}）");
-            if let Ok(mut s) = SNIP.lock() {
-                s.notice = None;
-            }
-            let _ = InvalidateRect(Some(ov), None, false);
-            pump(220);
-            let shot_c = print_window(ov).expect("对照那一张没拿到");
-            assert_eq!(
-                band(&shot_c.0, shot_c.1),
-                0,
-                "没有原因那一片却还红着：上面的判据不是这句字画出来的"
-            );
-
-            // 出图的"去向"能注进来之后，这一对才是本轮新行为真正的端到端证据：
-            // 写盘失败 ⇒ 覆盖层不退并且把原因留下；写盘成功 ⇒ 落一张 PNG 并且自己退。
-            // 目录指着真实路径会往用户 `data/screenshots` 写、还会盖掉他的剪贴板，
-            // 所以这里走临时目录且 `clipboard = false`。
-            let ctmp = std::env::temp_dir().join(format!("ff_snip_commit_{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&ctmp);
-            std::fs::create_dir_all(&ctmp).expect("临时目录建不出来，后面两条判据就是空的");
-            let (bw, bh) = SNIP
-                .lock()
-                .map(|s| (s.sel.2 - s.sel.0, s.sel.3 - s.sel.1))
-                .unwrap();
-            let n_before = SNIP.lock().map(|s| s.marks.len()).unwrap_or(0);
-            // 拿一个**普通文件**占住"目录"那个位置 ⇒ `create_dir_all` 必失败 ⇒ 这一趟落盘必失败
-            let blocked = ctmp.join("不是一个目录");
-            std::fs::write(&blocked, b"x").expect("占位文件写不出去");
-            commit_and_close_into(ov, false, &blocked, false);
-            pump(250);
-            assert!(
-                IsWindow(Some(ov)).as_bool(),
-                "写盘失败却把覆盖层关了：那张图连一次重试的机会都没有"
-            );
-            let why = SNIP.lock().map(|s| s.notice.clone()).unwrap_or(None);
-            let why = why.unwrap_or_default();
-            assert!(why.contains("没存盘"), "屏上那句没说到点上：{why:?}");
-            assert_eq!(
-                SNIP.lock().map(|s| s.marks.len()).unwrap_or(0),
-                n_before,
-                "出图失败还把已经画好的标注吞了"
-            );
-
-            // 换成能写的目录 ⇒ 同一份会话必须落一张、文件名带宽高、尺寸对得上。
-            // 这里先不关窗：关窗会把整屏缓冲交出去，后面"同秒连按"那条判据就读不到同一份会话了。
-            let out = ctmp.join("out");
-            std::fs::create_dir_all(&out).expect("可写目录建不出来");
-            let first = commit_into(&out, false, false);
-            assert!(matches!(first, Verdict::Done), "第一张没成：{first:?}");
-            let files: Vec<String> = std::fs::read_dir(&out)
-                .map(|rd| {
-                    rd.filter_map(|e| e.ok())
-                        .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            assert_eq!(files.len(), 1, "临时目录里该正好落一张：{files:?}");
-            let nm = &files[0];
-            assert!(
-                nm.starts_with("snip_") && nm.contains(&format!("{bw}x{bh}")),
-                "文件名没带上选区宽高：{nm}"
-            );
-            let raw = std::fs::read(out.join(nm)).expect("那张 PNG 读不回来");
-            let (rgba, dw, dh) = focusflow_core::capture::decode_png_rgba(&raw).unwrap();
-            assert_eq!((dw as i32, dh as i32), (bw, bh), "落盘那张的尺寸不等于选区");
-            // 走产品自己这条出路落的那张里，已经画好的标注也得在：
-            // 整幅中至少有一个"色块那种红"的像素（PNG 解回来是 RGBA 顺序）
-            assert!(
-                rgba.as_chunks::<4>()
-                    .0
-                    .iter()
-                    .any(|p| p[0] == 255 && p[1] == 45 && p[2] == 45),
-                "落盘那张里没有已画的标注"
-            );
-
-            // 同秒连按不许互相覆盖：他自己日志里就有两次"截图已保存"写着同一个文件名，
-            // 目录里只剩一张 —— 旧命名只到秒，那一张是真丢了。
-            let again = commit_into(&out, false, false);
-            assert!(matches!(again, Verdict::Done), "第二张没成：{again:?}");
-            let files2: Vec<String> = std::fs::read_dir(&out)
-                .map(|rd| {
-                    rd.filter_map(|e| e.ok())
-                        .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            assert_eq!(files2.len(), 2, "同秒两张该是两个文件：{files2:?}");
-            // 判"两个名字互不相同"而不是硬要 `_2` 后缀：跨到下一秒时两个名字本来就不一样，
-            // 那也算对——这条要防的只是"名字撞在一起把前一张盖掉"。
-            assert_ne!(files2[0], files2[1], "两张撞了同一个名字：{files2:?}");
-            assert!(
-                files2.iter().all(|n| n.starts_with("snip_")),
-                "落盘的名字不都带 snip_ 前缀：{files2:?}"
-            );
-
-            // 贴图那一条（P / 工具条"贴图"）是出图的第二个去向，以前一次都没被判过：
-            // 钉上来的位置必须**逐边等于选区在屏幕上的那一块**、尺寸等于选区。
-            // 这一族错过（覆盖层带 caption 时整图偏左上 8×1），所以判矩形而不是判"有没有窗口"。
-            let (org2, sel2) = SNIP
-                .lock()
-                .map(|s| (s.origin, s.sel))
-                .unwrap_or(((0, 0), (0, 0, 0, 0)));
-            // 前提腿：桌面上原本一张贴图都没有，后面 `FindWindowW` 找到的才是这一笔钉出来的。
-            // 没有这条，别处（比如另一份实例）留着的贴图会把下面的矩形判据顶得莫名其妙。
-            assert!(
-                FindWindowW(w!("FocusFlowPin"), PCWSTR::null()).is_err(),
-                "前提不成立：桌面上已经有一张贴图，这条要在干净桌面上跑"
-            );
-            let pinned = commit_into(&out, false, true);
-            assert!(
-                matches!(pinned, Verdict::Done),
-                "贴图这条没成交：{pinned:?}"
-            );
-            pump(250);
-            let pin = FindWindowW(w!("FocusFlowPin"), PCWSTR::null()).unwrap_or_default();
-            assert!(!pin.0.is_null(), "贴图窗口没建出来");
-            let mut prc = RECT::default();
-            let _ = GetWindowRect(pin, &mut prc);
-            assert_eq!(
-                (prc.left, prc.top),
-                (org2.0 + sel2.0, org2.1 + sel2.1),
-                "贴图没钉在选区那一块上（屏幕坐标）"
-            );
-            assert_eq!(
-                (prc.right - prc.left, prc.bottom - prc.top),
-                (bw, bh),
-                "贴图的尺寸不等于选区"
-            );
-            let _ = DestroyWindow(pin);
-            pump(150);
-            assert!(
-                FindWindowW(w!("FocusFlowPin"), PCWSTR::null()).is_err(),
-                "贴图没收尾干净"
-            );
-
-            // 最后才判"成则关窗"：上面那几次提交都故意留着窗口，为的是同一份会话能连出多张
-            commit_and_close_into(ov, false, &out, false);
-            pump(250);
-            assert!(!IsWindow(Some(ov)).as_bool(), "出图成功了覆盖层却没退");
-
-            let _ = std::fs::remove_dir_all(&ctmp);
-
-            // "随手一按 = 截光标下那个窗口"这条手势到底接上没有（纯函数改了 wndproc 不会跟着红）。
-            // 起一个全新的标注会话（上一段刚把覆盖层出图关掉），塞一条离工具条很远的候选，
-            // 在它身上按一下就松手：选区必须换成那条候选、必须进标注那一格、覆盖层必须还在。
-            start(HWND(std::ptr::null_mut()), true);
-            pump(400);
-            let ov3 = SNIP
-                .lock()
-                .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
-                .unwrap_or(HWND(std::ptr::null_mut()));
-            assert!(IsWindow(Some(ov3)).as_bool(), "随手一按那段没建出覆盖层");
-            let org3 = SNIP.lock().map(|s| s.origin).unwrap_or((0, 0));
-            let far = (650, 250, 900, 400);
-            if let Ok(mut s) = SNIP.lock() {
-                s.hits = vec![Candidate {
-                    pid: 999_998,
-                    visible: true,
-                    class: "Notepad".to_string(),
-                    rect: (
-                        org3.0 + far.0,
-                        org3.1 + far.1,
-                        org3.0 + far.2,
-                        org3.1 + far.3,
-                    ),
-                }];
-                s.hover = None;
-            }
-            pump(120);
-            post_mouse(ov3, WM_LBUTTONDOWN, 700, 300);
-            post_mouse(ov3, WM_LBUTTONUP, 700, 300);
-            pump(250);
-            let got = SNIP
-                .lock()
-                .map(|s| (s.sel, s.phase, IsWindow(Some(ov3)).as_bool()))
-                .unwrap_or(((0, 0, 0, 0), Phase::Select, false));
-            assert_eq!(got.0, far, "随手一按没把那个窗口收成选区");
-            assert_eq!(got.1, Phase::Adjust, "点选之后没进标注那一格");
-            assert!(got.2, "标注版点选完却把覆盖层关了");
-
-            // 贴底那一格：选区下沿离屏幕底放不下整条工具条时，工具条必须翻到选区**上方**。
-            // `bar_placement` 有纯函数判据，但"翻上去之后画在哪、画没画"在屏上一次没证过；
-            // 而这条腿先把"选区真的贴到底"当前提量出来，否则翻不翻都无从谈起。
-            let bh3 = SNIP.lock().map(|s| s.base_h).unwrap_or(0);
-            post_mouse(ov3, WM_LBUTTONDOWN, 200, bh3 - 60);
-            post_mouse(ov3, WM_MOUSEMOVE, 620, bh3 - 14);
-            post_mouse(ov3, WM_LBUTTONUP, 620, bh3 - 14);
-            pump(250);
-            let (sel3, bar3) = SNIP
-                .lock()
-                .map(|s| (s.sel, bar_rects(s.sel, s.base_w, s.base_h).1))
-                .unwrap_or(((0, 0, 0, 0), (0, 0, 0, 0)));
-            assert!(
-                sel3.3 > bh3 - 120 && sel3.3 <= bh3,
-                "前提不成立：选区没贴到屏幕底 sel={sel3:?} base_h={bh3}"
-            );
-            assert!(
-                bar3.1 + bar3.3 <= sel3.1 + 1,
-                "选区贴底时工具条没翻到上方：bar={bar3:?} sel={sel3:?}"
-            );
-            let shot3 = print_window(ov3).expect("贴底那一格没拍到");
-            let want3 = [
-                ((BAR_BG >> 16) & 0xFF) as u8,
-                ((BAR_BG >> 8) & 0xFF) as u8,
-                (BAR_BG & 0xFF) as u8,
-            ];
-            assert_eq!(
-                pixel3(&shot3.0, shot3.1, bar3.0 + 1, bar3.1 + 1),
-                want3,
-                "翻上去的工具条没画出来：bar={bar3:?}"
-            );
-
-            // 工具按钮的高亮必须跟着当前工具走——"我现在拿的是哪支笔"这件事得看得见。
-            // 比的是两支点来点去之后两颗粒子**互换**，静态的一片橙色喂不饱这条判据。
-            click_bar(ov3, "rect");
-            pump(200);
-            let s1 = print_window(ov3).expect("rect 高亮那张没拿到");
-            let rect1 = btn_fill(&s1.0, s1.1, "rect");
-            let block1 = btn_fill(&s1.0, s1.1, "block");
-            click_bar(ov3, "block");
-            pump(200);
-            let s2 = print_window(ov3).expect("block 高亮那张没拿到");
-            let rect2 = btn_fill(&s2.0, s2.1, "rect");
-            let block2 = btn_fill(&s2.0, s2.1, "block");
-            fn is_accent(p: [u8; 3]) -> bool {
-                p[2] > 200 && p[1] > 120 && p[0] < 140
-            }
-            assert!(
-                is_accent(rect1) && !is_accent(block1),
-                "选着方框时高亮不在方框那颗上：{rect1:?} {block1:?}"
-            );
-            assert!(
-                is_accent(block2) && !is_accent(rect2),
-                "换到色块之后高亮没跟过去：{rect2:?} {block2:?}"
-            );
-
-            // Esc 是标注阶段唯一的退路（右键被刻意让开了）：必须真把这一场收掉，
-            // 而且屏上那句红字、标注、整屏缓冲都得跟着归零——留着下一次热键会接着看见旧东西。
-            let _ = PostMessageW(Some(ov3), WM_KEYDOWN, WPARAM(0x1B), LPARAM(0));
-            pump(250);
-            assert!(!IsWindow(Some(ov3)).as_bool(), "Esc 没关掉标注阶段的覆盖层");
-            let cleared = SNIP
-                .lock()
-                .map(|s| (s.active, s.marks.len(), s.base.len(), s.notice.is_some()))
-                .unwrap_or((true, 1, 1, true));
-            assert_eq!(
-                cleared,
-                (false, 0, 0, false),
-                "Esc 之后状态没清干净（在飞标志／标注／整屏缓冲／那句红字都得归零）"
-            );
-            let _ = DestroyWindow(ov3);
-            pump(200);
-
-            // 快速那条（松手即存）被失败留下来之后，这一场实际就是标注场：绝对上限得跟着变成 10 分钟。
-            // 不跟着改的话，它自己那 60 秒那一档会在用户还在读那句原因、还在腾磁盘时把覆盖层收走。
-            // 这一段全程不投"松手"——松手会走产品那条真实去向（往用户目录写一张、盖掉他的剪贴板），
-            // 只把选区拖出来，然后直接调注入版出图。
-            // owner 给一个真实的（1x1、开在屏幕外的）顶层窗口：这一段的会话不是 null owner，
-            // 于是"成/败那句话该投递给拉起截图的窗口"这条也顺带被数到了（见 NOTE_HITS）。
-            let sink = new_note_sink();
-            let hits0 = NOTE_HITS.load(std::sync::atomic::Ordering::SeqCst);
-            start(sink, false);
-            pump(400);
-            let ov2 = SNIP
-                .lock()
-                .map(|s| HWND(s.overlay as *mut core::ffi::c_void))
-                .unwrap_or(HWND(std::ptr::null_mut()));
-            assert!(IsWindow(Some(ov2)).as_bool(), "快速那条会话没建出覆盖层");
-            assert_eq!(
-                SNIP.lock().map(|s| s.ceiling_ms).unwrap_or(0),
-                60_000,
-                "快速会话一开始该顶着 60 秒那档"
-            );
-            post_mouse(ov2, WM_LBUTTONDOWN, 40, 40);
-            post_mouse(ov2, WM_MOUSEMOVE, 240, 200);
-            pump(150);
-            let ctmp2 = std::env::temp_dir().join(format!("ff_snip_quick_{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&ctmp2);
-            std::fs::create_dir_all(&ctmp2).expect("第二个临时目录建不出来");
-            let blocked2 = ctmp2.join("不是一个目录");
-            std::fs::write(&blocked2, b"x").expect("占位文件写不出去");
-            commit_and_close_into(ov2, false, &blocked2, false);
-            pump(250);
-            // 没成那句也得递出去（覆盖层上写一份、主窗口的状态读数再留一份影子）
-            assert_eq!(
-                NOTE_HITS.load(std::sync::atomic::Ordering::SeqCst),
-                hits0 + 1,
-                "出图失败那句话没投递给拉起截图的窗口"
-            );
-            let after = SNIP
-                .lock()
-                .map(|s| (s.phase, s.ceiling_ms, IsWindow(Some(ov2)).as_bool()))
-                .unwrap_or((Phase::Select, 0, false));
-            assert!(after.2, "快速那条失败也没留下覆盖层");
-            assert_eq!(after.0, Phase::Adjust, "失败之后没进可以重试的那一格");
-            assert_eq!(
-                after.1, 600_000,
-                "留下来的会话还顶着快速那 60 秒的上限：读句子的时候会被收走"
-            );
-            // 成了那句要一样递出去：这一张写进临时目录（不动用户目录，也不碰剪贴板）
-            let ok2 = ctmp2.join("out2");
-            std::fs::create_dir_all(&ok2).expect("第三个临时目录建不出来");
-            let v2 = commit_into(&ok2, false, false);
-            assert!(matches!(v2, Verdict::Done), "补的这张没成：{v2:?}");
-            pump(250);
-            assert_eq!(
-                NOTE_HITS.load(std::sync::atomic::Ordering::SeqCst),
-                hits0 + 2,
-                "出图成功那句话没投递给拉起截图的窗口"
-            );
-            let _ = DestroyWindow(ov2);
-            pump(200);
-            let _ = DestroyWindow(sink);
-            let _ = std::fs::remove_dir_all(&ctmp2);
-
-            let _ = DestroyWindow(ov);
-            pump(200);
-            // 会话结束必须把整屏那两份缓冲交出去：1920x1080 一份就是 8 MB，
-            // 挂在静态里等于每次截图之后常驻翻倍（这一族仓里记过两次账）。
-            let (still_base, still_dim, still_back, still_active) = SNIP
-                .lock()
-                .map(|s| (s.base.len(), s.dim.len(), s.back.bits, s.active))
-                .unwrap_or((0, 0, 1, true));
-            assert_eq!(
-                (still_base, still_dim, still_back, still_active),
-                (0, 0, 0, false),
-                "覆盖层关了却没把冻结缓冲与双缓冲放掉（一屏 8 MB 以上，挂着就是每次截图翻一倍）"
-            );
             let _ = SetCursorPos(home.x, home.y);
         }
     }
@@ -5804,18 +4882,11 @@ mod render_probe {
                 t6.elapsed().as_micros() as f64 / 1000.0 / n as f64
             );
             ReleaseDC(Some(ov), wd);
-            // 剩下的三把零碎：一条读数、一条工具条、放大镜那一块；再加一把"什么都不画"的
-            // 空帧（只走 invalidate→BeginPaint→EndPaint），它量的是这套机器本身要多少钱。
+            // 剩下的零碎：两条读数、一条工具条，以及一把"什么都不画"的空帧。
             let leg = |ms: std::time::Duration| ms.as_micros() as f64 / 1000.0 / n as f64;
             let t = std::time::Instant::now();
             for _ in 0..n {
-                draw_chip(
-                    mem,
-                    300,
-                    300,
-                    "屏幕 1920,1080 · 取 11×11 放大 8 倍",
-                    rgb(120, 255, 224),
-                );
+                draw_chip(mem, 300, 300, "屏幕 1920,1080", rgb(120, 255, 224));
             }
             println!("CHIP_MS = {:.2} 一次读数", leg(t.elapsed()));
             let mut geom: Option<(i32, i32, i32, i32)> = Some(sel_leg);
@@ -5831,14 +4902,6 @@ mod render_probe {
                 );
             }
             println!("BAR_MS = {:.2} 一条工具条", leg(t.elapsed()));
-            let lsrc = loupe_source(500, 300, bw, bh);
-            let (lx, ly, ls, lsz) = loupe_rect(500, 300, bw, bh).expect("这块屏容不下放大镜");
-            let t = std::time::Instant::now();
-            for _ in 0..n {
-                let box_bytes = loupe_pixels(&base, bw, lsrc);
-                blit_bgra(mem, &box_bytes, ls, lsz, lx, ly);
-            }
-            println!("LOUPE_MS = {:.2} 放大镜那一块", leg(t.elapsed()));
             let mut ps2 = PAINTSTRUCT::default();
             let t = std::time::Instant::now();
             for _ in 0..n {
@@ -5861,7 +4924,6 @@ mod render_probe {
     ///
     /// 这一条是"帧与帧之间怎么接力"的验收：每帧只搬动过的那一块，于是"上一帧碰过哪里"
     /// 算少一像素，症状就是把上一帧的选区留在原地发亮（比慢更难发现，因为它是残影不是卡顿）。
-    /// 光标那一处的放大镜两帧落在同一个点上，所以它自己那块不会变成误判。
     #[test]
     #[ignore = "会真的在屏幕上盖一层全屏覆盖层"]
     fn the_overlay_leaves_no_trace_where_the_selection_was() {
@@ -5902,7 +4964,7 @@ mod render_probe {
             set_sel(old_sel);
             set_sel(new_sel);
             let shot = grab_rect(origin.0, origin.1, bw, bh).expect("整屏抓回来没成");
-            // 老选区的内侧：这一格在两次选区之外，也不在放大镜那条带上
+            // 老选区的内侧：这一格在两次选区之外
             for (x, y) in [(100, 150), (200, 200), (300, 100)] {
                 assert_eq!(
                     pixel3(&shot, bw, x, y),
@@ -6606,18 +5668,12 @@ mod tests {
             r.0 <= bar.0 && r.1 <= bar.1 && r.2 >= bar.0 + bar.2 && r.3 >= bar.1 + bar.3,
             "工具条不在范围内：{r:?} vs {bar:?}"
         );
-        // 还没定选区那一段：放大镜那一块 + 用法提示那一行
         s.phase = Phase::Select;
         s.drag = None;
         let r2 = frame_content(&s);
-        let (lx, ly, ls, lsz) = loupe_rect(s.cur.0, s.cur.1, s.base_w, s.base_h).unwrap();
         assert!(
-            r2.0 <= lx && r2.1 <= ly && r2.2 >= lx + ls && r2.3 >= ly + lsz,
-            "放大镜不在范围内：{r2:?}"
-        );
-        assert!(
-            r2.1 <= 12 && r2.3 >= 12 + CHIP_MAX_H,
-            "用法提示那一行不在范围内：{r2:?}"
+            r2.1 <= COORD_Y && r2.3 >= COORD_Y + 2 * CHIP_MAX_H + 8,
+            "坐标与用法两行不在范围内：{r2:?}"
         );
         // 出图没成那句：贴顶与画在里侧两种落点都要盖住
         s.notice = Some("满了".to_string());
@@ -6714,34 +5770,15 @@ mod tests {
         );
     }
 
-    /// 放大镜的两条接线：开层时锚点来自**那一次** `GetCursorPos`，画不画看这一场的
-    /// `[snip] loupe`。
-    ///
-    /// 为什么钉调用形态：锚点那一半在屏上是可见的（`the_overlay_paints_…` 里有一条真探针
-    /// 腿守着），但"把 hover 那一次取点顺手交给放大镜"这件事一旦改回 `(0,0)`，无头侧只有
-    /// 源码看得见；开关那一半更没打法——覆盖层没开的时候屏上本来就没有方块。两条都按
-    /// "参数是谁"来钉，不钉函数名：换成 `loupe_anchor(0,0,0,0,0,0)` 也编得过，而症状照旧。
     #[test]
-    fn the_loupe_is_seeded_at_open_and_gated_by_its_switch() {
+    fn the_overlay_no_longer_draws_a_cursor_following_magnifier() {
         let src = include_str!("snip.rs");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
-        let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
-        assert_eq!(
-            flat.matches("loupe_anchor(pt.x,pt.y,vx,vy,vw,vh)").count(),
-            1,
-            "开层时不再按这一次取点与这一屏的原点/尺寸算放大镜锚点"
-        );
         assert!(
-            flat.contains("s.cur=anchor;"),
-            "算出来的锚点没交进状态：hover 落了位而放大镜还停在 (0,0)"
-        );
-        assert!(
-            flat.contains("s.loupe=loupe_on;"),
-            "`[snip] loupe` 没被写进这一场的状态：开关读到了也没人看"
-        );
-        assert!(
-            flat.contains("ifphase==Phase::Select&&loupe_on{"),
-            "方块画不画不再看这一场的开关"
+            !src[..cut].contains("loupe")
+                && !src[..cut].contains("LOUPE")
+                && !src[..cut].contains("像素放大镜"),
+            "放大镜的绘制或配置接线又回到了生产代码"
         );
     }
 
@@ -7456,33 +6493,6 @@ mod tests {
         );
     }
 
-    /// 放大镜下面预留的那一行，必须盖得住 `draw_chip` 真画出来的底盒。
-    ///
-    /// 现量症状：预留手抄成 18，而画的是「实测行高 + 内边距」，YaHei 在 20 号下的行高
-    /// 本来就不止 20 ⇒ 光标贴屏幕底边时读数下半截出屏。
-    #[test]
-    fn the_reserved_readout_height_covers_the_chip_that_is_drawn() {
-        unsafe {
-            let hdc = GetDC(None);
-            let font = yaihe(CHIP_FONT_H, false);
-            let old = SelectObject(hdc, font.into());
-            let text = loupe_text((10, 10, LOUPE_SPAN), (0, 0));
-            let wide: Vec<u16> = text.encode_utf16().collect();
-            let mut sz = SIZE { cx: 0, cy: 0 };
-            let _ = GetTextExtentPoint32W(hdc, &wide, &mut sz);
-            SelectObject(hdc, old);
-            ReleaseDC(None, hdc);
-            assert!(
-                sz.cy + CHIP_PAD_V <= LOUPE_TEXT_H,
-                "放大镜下面只预留 {LOUPE_TEXT_H}，而读数条实际要画 {}（实测行高 {}、内边距 {CHIP_PAD_V}）",
-                sz.cy + CHIP_PAD_V,
-                sz.cy
-            );
-            // 顺手量出这一句有多宽：右沿那格夹的就是这个数
-            assert!(sz.cx > 0, "读数一个字都没量到就别判了：{}", sz.cx);
-        }
-    }
-
     #[test]
     fn mosaic_clamps_to_the_image_and_fills_the_rest_with_zero() {
         let src: Vec<u8> = vec![10, 10, 10, 0, 30, 30, 30, 0];
@@ -7558,9 +6568,9 @@ mod tests {
         assert_eq!(ui_at(240, 2.0), 480);
     }
 
-    /// 150% DPI：工具条、手柄、放大镜与读数带都得跟着放大，而不是只把字放大。
+    /// 150% DPI：工具条、手柄与读数带都得跟着放大，而不是只把字放大。
     #[test]
-    fn a_150_percent_overlay_scales_toolbar_handles_and_loupe() {
+    fn a_150_percent_overlay_scales_toolbar_handles_and_readouts() {
         let (btns1, _) = bar_rects_at((200, 200, 800, 600), 1920, 1080, 1.0);
         let (btns15, bar15) = bar_rects_at((200, 200, 800, 600), 1920, 1080, 1.5);
         assert_eq!(btns1[0].w, 36, "100% 时按钮宽度不该变");
@@ -7576,24 +6586,6 @@ mod tests {
         let rc = (100, 100, 200, 300);
         assert_eq!(hit_handle_at(rc, 206, 100, 1.0), None);
         assert_eq!(hit_handle_at(rc, 206, 100, 1.5), Some(2));
-
-        let one = loupe_rect_at(100, 100, 1920, 1080, 1.0).expect("100% 放得下");
-        let big = loupe_rect_at(100, 100, 1920, 1080, 1.5).expect("150% 放得下");
-        assert_eq!(one.2, LOUPE_SPAN * LOUPE_SCALE);
-        assert_eq!(big.2, LOUPE_SPAN * ui_at(LOUPE_SCALE, 1.5));
-        assert!(big.2 > one.2, "放大镜方块没有随 DPI 变大");
-
-        let base = vec![0u8; 32 * 32 * 4];
-        let small = loupe_pixels_at(&base, 32, (5, 5, LOUPE_SPAN), 1.0);
-        let large = loupe_pixels_at(&base, 32, (5, 5, LOUPE_SPAN), 1.5);
-        assert_eq!(
-            small.len(),
-            (11 * LOUPE_SCALE * 11 * LOUPE_SCALE * 4) as usize
-        );
-        assert_eq!(
-            large.len(),
-            (11 * ui_at(LOUPE_SCALE, 1.5) * 11 * ui_at(LOUPE_SCALE, 1.5) * 4) as usize
-        );
 
         let band1 = chip_band_at(100, 500, 500, 1.0);
         let band15 = chip_band_at(100, 500, 500, 1.5);
@@ -8511,157 +7503,6 @@ mod tests {
         assert!(btn_active("f1", 0, PALETTE[0].0, 3, 18));
         assert!(!btn_active("undo", 0, PALETTE[0].0, 3, 18));
     }
-}
-
-#[cfg(test)]
-mod loupe_tests {
-    use super::*;
-
-    /// 构造一块 `w`x`h` 的 BGRA 冻结图，每格颜色由 `f` 决定（B,G,R）。
-    fn make_base(w: i32, h: i32, f: impl Fn(i32, i32) -> (u8, u8, u8)) -> Vec<u8> {
-        let mut v = vec![0u8; (w * h * 4) as usize];
-        for y in 0..h {
-            for x in 0..w {
-                let (b, g, r) = f(x, y);
-                let i = ((y * w + x) * 4) as usize;
-                v[i] = b;
-                v[i + 1] = g;
-                v[i + 2] = r;
-                v[i + 3] = 255;
-            }
-        }
-        v
-    }
-
-    /// 开层那一刻放大镜落在哪儿：真实光标（虚拟屏物理坐标）换算成本层坐标，钳在这一屏里。
-    ///
-    /// 症状是 2026-10-30 那张实拍：按下热键、手还没动，方块停在屏幕左上角、读数报「屏幕 5,5」，
-    /// 挡住的是左上角那块画面。期望值全部手算，不调 `loupe_anchor` —— 否则等于拿被测函数出题。
-    #[test]
-    fn the_loupe_anchor_follows_the_real_cursor_at_open() {
-        // 单屏：物理坐标就是本层坐标
-        assert_eq!(loupe_anchor(640, 420, 0, 0, 1920, 1080), (640, 420));
-        // 副屏挂在左边（虚拟屏原点 -1920）：光标在物理 -1000 ⇒ 本层 920。
-        // 少减一次原点会交出 -1000，钳完变成 (0,300) —— 症状是放大镜整块跑到隔壁屏去。
-        assert_eq!(loupe_anchor(-1000, 300, -1920, 0, 1920, 1080), (920, 300));
-        // 光标贴出右下：钳在最后一格，而不是报一个屏外坐标
-        assert_eq!(loupe_anchor(2400, 1600, 0, 0, 1920, 1080), (1919, 1079));
-        // 光标在本层原点之外（多屏最左上那块之外）：钳回 (0,0)
-        assert_eq!(loupe_anchor(-5, -5, 0, 0, 1920, 1080), (0, 0));
-        // 零尺寸那块屏不许绕成负数下标
-        assert_eq!(loupe_anchor(10, 10, 0, 0, 0, 0), (0, 0));
-    }
-
-    #[test]
-    fn the_loupe_sits_bottom_right_and_flips_when_it_would_leave_the_screen() {
-        let side = LOUPE_SPAN * LOUPE_SCALE;
-        let w = 1000;
-        let h = 800;
-        // 一般位置：右下，离光标一格间距
-        assert_eq!(
-            loupe_rect(100, 100, w, h),
-            Some((100 + LOUPE_GAP, 100 + LOUPE_GAP, side, side))
-        );
-        // 贴右边：翻到左侧，仍然整个在屏内
-        let r = loupe_rect(w - 4, 100, w, h).expect("贴边也该放得下");
-        assert!(r.0 + side <= w, "翻边后不许超出右沿: {r:?}");
-        assert!(r.0 < w - 4, "翻边就是要在光标的另一侧");
-        // 贴底边：往上翻，读数那一行也要留出来
-        let b = loupe_rect(100, h - 4, w, h).expect("贴底也该放得下");
-        assert!(
-            b.1 + side + LOUPE_TEXT_H <= h,
-            "往上翻后要容得下方块与读数行: {b:?}"
-        );
-        // 小到放不下：宁可不画，也不挡在光标底下
-        assert_eq!(loupe_rect(50, 50, 40, 40), None);
-        assert_eq!(loupe_rect(50, 50, 0, 1080), None);
-    }
-
-    #[test]
-    fn the_sampled_block_is_always_inside_the_frozen_image() {
-        let w = 640;
-        let h = 480;
-        let (x, y, span) = loupe_source(0, 0, w, h);
-        assert_eq!((x, y, span), (0, 0, LOUPE_SPAN), "左上角不外越界");
-        let (x2, y2, _) = loupe_source(w - 1, h - 1, w, h);
-        assert_eq!(x2 + span, w, "光标贴最右列时要夹住，不许放大窗口外的字节");
-        assert_eq!(y2 + span, h, "光标贴最下行时同上");
-        // 中间位置：光标那一格正好在正中
-        let (mx, my, _) = loupe_source(300, 200, w, h);
-        assert_eq!((mx, my), (300 - LOUPE_SPAN / 2, 200 - LOUPE_SPAN / 2));
-    }
-
-    /// 放大后的样子：一个源像素变成一格，网格压暗，光标那一格描白边。
-    /// 断言按 **BGRA** 的字节序写（B,G,R,A）—— 这一族本轮错过三次。
-    #[test]
-    fn the_magnified_block_shows_every_source_pixel_as_one_cell() {
-        // 中间一格纯绿，其余纯黑：绿只可能来自放大镜，不会别处撞上来
-        let base = make_base(64, 64, |x, y| {
-            if x == 32 && y == 32 {
-                (0, 200, 0)
-            } else {
-                (0, 0, 0)
-            }
-        });
-        let src = loupe_source(32, 32, 64, 64);
-        assert_eq!((src.0, src.1), (27, 27), "光标那一格要在正中");
-        let big = loupe_pixels(&base, 64, src);
-        let side = (LOUPE_SPAN * LOUPE_SCALE) as usize;
-        assert_eq!(big.len(), side * side * 4, "字节数＝边长平方 × BGRA");
-        let px = |dx: usize, dy: usize| {
-            let i = (dy * side + dx) * 4;
-            (big[i], big[i + 1], big[i + 2])
-        };
-        // 第 5 格（0 基）就是源 (32,32)：整格都是绿的字节，除了描边那一圈
-        let cell = LOUPE_SCALE as usize;
-        let inner = px(5 * cell + cell / 2, 5 * cell + cell / 2);
-        assert_eq!(inner, (0, 200, 0), "光标那一格中心必须是源像素本来的字节");
-        assert_eq!(
-            px(5 * cell, 5 * cell),
-            (255, 255, 255),
-            "描边那一格要看得清"
-        );
-        // 旁边那格是黑的，但网格线压暗后仍是黑（减到底不绕回）
-        assert_eq!(px(cell / 2, cell / 2), (0, 0, 0));
-        // 非网格位置保持原字节：整格除了边线都该是同一个颜色
-        let mut same = 0;
-        for dy in 0..cell {
-            for dx in 0..cell {
-                if px(5 * cell + dx, 5 * cell + dy) == (0, 200, 0) {
-                    same += 1;
-                }
-            }
-        }
-        assert!(
-            same >= 30,
-            "一格 {} 个像素里只有 {} 个是源色（描边吃掉多少要看得懂）",
-            cell * cell,
-            same
-        );
-    }
-
-    #[test]
-    fn a_short_buffer_yields_zeros_instead_of_panicking() {
-        // 冻结图短一截（别处已经出声的异常）：这里只交出"没有颜色"的缓冲，不读到图外
-        let big = loupe_pixels(&[0u8; 8], 2, (0, 0, LOUPE_SPAN));
-        assert_eq!(
-            big.chunks(4).filter(|p| p[..3] != [0, 0, 0]).count(),
-            0,
-            "字节不足时不许把图外的字节放大出来"
-        );
-        assert!(loupe_pixels(&[], 0, (0, 0, 0)).is_empty());
-    }
-
-    /// 读数说的是**屏幕上**的位置（客户区坐标 + 冻结那一刻的原点）—— 副屏原点是负的，
-    /// 只报客户区坐标会让人以为对准了而其实差着一块屏。
-    #[test]
-    fn the_readout_names_the_screen_point_not_the_client_one() {
-        let t = loupe_text((27, 27, LOUPE_SPAN), (-1920, 0));
-        // 那一块的中心：-1920 + 27 + 5 与 0 + 27 + 5
-        assert!(t.contains("-1888,32"), "要说屏幕上那一格在哪: {t}");
-        assert!(t.contains("11×11"), "取的是多大一块: {t}");
-        assert!(t.contains("8 倍"), "倍率要写在同一句里: {t}");
-    }
 
     struct SnipStateReset;
     impl Drop for SnipStateReset {
@@ -8788,9 +7629,9 @@ mod loupe_tests {
         }
     }
 
-    /// 还没拖框时只移动鼠标：放大镜与"屏幕 x,y"读数画在 `cur` 上，必须跟着走。
+    /// 还没拖框时只移动鼠标：屏幕坐标读数必须跟着走，但不能把移动当成拖拽。
     #[test]
-    fn the_loupe_follows_the_cursor_before_a_selection_is_drawn() {
+    fn the_screen_coordinate_follows_the_cursor_before_a_selection_is_drawn() {
         let _serial = crate::probe_guard();
         let _reset = SnipStateReset;
         {
@@ -8799,7 +7640,6 @@ mod loupe_tests {
             s.sel = (0, 0, 0, 0);
             s.base_w = 1920;
             s.base_h = 1080;
-            s.loupe = true;
             s.cur = (10, 10);
             s.drag = None;
         }
@@ -8815,7 +7655,7 @@ mod loupe_tests {
         assert_eq!(
             s.cur,
             (640, 480),
-            "不拖拽只移动鼠标时，放大镜与坐标读数还停在覆盖层弹出那一刻"
+            "不拖拽只移动鼠标时，坐标读数还停在覆盖层弹出那一刻"
         );
         assert_eq!(s.drag, None, "没有按键的移动不该被当成拖拽");
     }

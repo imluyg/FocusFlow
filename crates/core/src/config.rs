@@ -170,13 +170,7 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
     // 截图期间悬浮窗藏多久（`desktop-native/src/snip.rs` 的 `start` 读它）：
     // true = 整场截图都不显示；false = 冻结画面一抓完就还回去（旧观感，覆盖层上屏前会
     // 闪一下真实桌面）。默认 true —— 冻结图里没有卡片，中途再让它冒出来只会多一次闪。
-    // 截图那台像素放大镜开不开（读点在 `desktop-native/src/snip.rs` 的 `start`，每开一场
-    // 读一次）：它按设计压在光标右下 18 像素，对边靠它，但正在看屏幕本身的人会被它挡住，
-    // 所以留一条能关的口子。默认开 —— 关掉的人是自己来关的。
-    //
-    // ⚠ 这一节的两个键必须写在同一次 `s()` 里：那个 helper 是 `map.insert`，
-    // 同一个节名调两次 = 后一次把前一次整节顶掉（`hide_floating` 会当场消失）。
-    s("snip", &[("hide_floating", "true"), ("loupe", "true")]);
+    s("snip", &[("hide_floating", "true")]);
     // 剪贴板历史：文本 / 图片 / 文件。`exclude` 是进程名清单（逗号分隔，缺扩展名按 .exe 补）；
     // 三个隐私格式（应用自己声明"别收"）在运行时另有一层，改这里不会关掉那一层。
     // `max_total_mb` 是未固定条目的总预算（图片按落盘 PNG 算），0 = 不设上限。
@@ -218,6 +212,8 @@ pub fn default_config() -> HashMap<String, HashMap<String, String>> {
 const DEPRECATED_CONFIG: &[(&str, &[&str])] = &[
     // 已移除：今日计数用写入线程内存缓存，此键不再读取
     ("stats", &["today_count_cache_ttl"]),
+    // 像素放大镜已移除，老配置里的开关不再有读点。
+    ("snip", &["loupe"]),
     // 以下这些是「每次启动都写进 config.ini、但全仓一个读点都没有」的假开关：
     // 用户改了没反应，比压根没有这个键更糟（同一类问题上一场已经处理过
     // [pomodoro] 的时长三键）。老文件里的这些键在 load 时清掉。
@@ -1764,13 +1760,21 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         let app = crate::paths::test_app_dir("cfg_ext_deprecated");
         let path = app.path().join("config.ini");
-        std::fs::write(&path, "[stats]\ntoday_count_cache_ttl = 999\n").unwrap();
+        std::fs::write(
+            &path,
+            "[stats]\ntoday_count_cache_ttl = 999\n[snip]\nloupe = true\nhide_floating = true\n",
+        )
+        .unwrap();
         let cfg = FocusFlowConfig::load(&path).unwrap();
         cfg.save().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !text.contains("today_count_cache_ttl"),
+            !text.contains("today_count_cache_ttl") && !text.contains("loupe"),
             "废弃键被采纳回内存又写回文件了: {text}"
+        );
+        assert!(
+            text.contains("hide_floating = true"),
+            "同一节的活跃配置被误删了: {text}"
         );
     }
 

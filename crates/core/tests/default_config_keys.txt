@@ -48,5 +48,4 @@ pomodoro/auto_break
 pomodoro/break_minutes
 pomodoro/work_minutes
 snip/hide_floating
-snip/loupe
 stats/cpm_window
