@@ -122,6 +122,21 @@ fn using_an_api_whose_permission_is_not_declared_is_an_error_at_the_call() {
     );
 }
 
+/// 顶格写的调用也要指到它自己那一行：`lines()` 在命中前那段以换行结尾时会少算一行。
+#[test]
+fn a_call_at_column_zero_reports_its_own_line() {
+    let r = report(
+        "PLUGIN_API = 2\nPLUGIN_PERMISSIONS = { \"stats.read\" }\nfunction init()\nfocusflow.store.set(\"a\", 1)\nend\n",
+        PluginSource::User,
+    );
+    let f = saying(&r, "storage.write").expect("没声明的这一格必须点名");
+    assert_eq!(
+        f.line,
+        Some(5),
+        "顶格调用被指到了上一行：作者照着改会改错地方"
+    );
+}
+
 /// 清单外的权限：说清宿主没有这一项，并把认得的清单念出来。
 #[test]
 fn a_permission_outside_the_frozen_list_names_the_known_ones() {

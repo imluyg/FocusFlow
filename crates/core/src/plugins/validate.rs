@@ -211,10 +211,10 @@ fn used_apis(code: &str) -> Vec<Use> {
             verb = first_string_arg_at(code, j);
         }
         // 行号按命中之前那一段数出来（`strip_lua_non_code` 保住换行 ⇒ 与原文件同一行）。
-        // `lines()` 会把这一段末尾那半行也算一行，所以这里不能再 +1。
+        // 不能数 `lines()`：命中前面那半行若为空（调用从第 0 列开始），`lines()` 会少算一行。
         let line = code
             .get(..i)
-            .map(|head| head.lines().count())
+            .map(|head| head.matches('\n').count() + 1)
             .unwrap_or(1)
             .max(1);
         if !out.iter().any(|u| u.api == name && u.verb == verb) {
