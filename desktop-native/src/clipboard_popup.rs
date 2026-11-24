@@ -946,6 +946,13 @@ fn reveal(hwnd: HWND) {
     let prev_fg = unsafe { GetForegroundWindow() };
     // 复用的窗口可能是在另一块屏、另一档缩放下建的：先把 DPI 换到光标这块屏。
     let _ = with_state(hwnd, |st| apply_dpi(st, dpi));
+    // 复位必须在上屏**之前**：`SWP_SHOWWINDOW` 可能当场就把窗口激活（见上面 prev_fg 的
+    // 注释），那条 WM_ACTIVATE 已经把 `activated` 置成 true；若上屏之后再清一次，
+    // 之后真正点走时 `should_hide_on_deactivate` 会判成"还没激活过"，弹窗留在最前面不消失。
+    let _ = with_state(hwnd, |st| {
+        st.activated = false;
+        st.activate_tries = 2;
+    });
     unsafe {
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW);
     }
@@ -965,8 +972,7 @@ fn reveal(hwnd: HWND) {
         st.scroll = 0;
         st.query.clear();
         st.prev_fg = prev_fg;
-        st.activated = false;
-        st.activate_tries = 2;
+        // `activated` / `activate_tries` 已在上屏之前复位（那一序决定失焦能不能收起）。
         // 上一次打开时留下的「已删除」「已固定」不是这一次的反馈，重开就清掉。
         st.status = None;
         st.reload_all(hwnd, ReloadIntent::ResetTop);
@@ -2864,6 +2870,27 @@ mod tests {
         assert!(
             issue > clear,
             "清空搜索框引起的重查会把原因冲掉：先清框，再写这条消息"
+        );
+    }
+
+    #[test]
+    fn the_activation_flag_is_reset_before_the_window_is_shown_again() {
+        let src = include_str!("clipboard_popup.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let start = prod.find("fn reveal(hwnd: HWND)").expect("reveal 找不到了");
+        let rest = &prod[start..];
+        let end = rest.find("\nfn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        let reset = body
+            .find("st.activated = false")
+            .expect("reveal 里没有复位 activated");
+        let show = body
+            .find("SetWindowPos(hwnd, Some(HWND_TOPMOST)")
+            .expect("reveal 里没有上屏那一句");
+        assert!(
+            reset < show,
+            "activated 必须在上屏之前复位：SWP_SHOWWINDOW 当场激活产生的 WM_ACTIVATE \
+             会被后面的复位抹掉，点走时弹窗就不收了"
         );
     }
 
