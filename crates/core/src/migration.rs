@@ -867,38 +867,27 @@ struct ImportMarker {
 }
 
 /// 读取导入标记。
+///
+/// 只有「这一键不存在」或「值解析不了」算缺键；**查询本身失败**要向上抛 ——
+/// 读不动 ≠ 没导过：把 Err 折成 `None` 等于卸掉两道去重闸，累加式导入会把那一年翻倍。
 fn read_import_marker(dst_path: &Path) -> anyhow::Result<Option<ImportMarker>> {
+    use rusqlite::OptionalExtension;
     let conn = connection::open_ro(dst_path)?;
-    let size: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'imported_src_size'",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-    let mtime: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'imported_src_mtime'",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-    let kl_count: Option<i64> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'imported_src_kl_count'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
-        .and_then(|v| v.parse().ok());
-    let kl_maxts: Option<i64> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'imported_src_kl_maxts'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let read = |key: &str| -> anyhow::Result<Option<String>> {
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "读导入标记 {key} 失败（{e}）：不能把它当成「没导过」——同一份明细再聚合一遍会让那一年翻倍"
+            )
+        })
+    };
+    let size = read("imported_src_size")?;
+    let mtime = read("imported_src_mtime")?;
+    let kl_count = read("imported_src_kl_count")?.and_then(|v| v.parse().ok());
+    let kl_maxts = read("imported_src_kl_maxts")?.and_then(|v| v.parse().ok());
     let Some(sz) = size else {
         return Ok(None);
     };
@@ -954,6 +943,38 @@ mod tests {
                 .expect("读得动时照常留档")
                 .is_some(),
             "有现有库就该留下一份"
+        );
+    }
+
+    /// 标记读不出来 ≠ 没有标记：前者要跳过这一年，后者才允许走"首次导入"。
+    /// 旧写法把 `SELECT` 的错误 `.ok()` 成 `None`，等于把两道去重闸一起卸掉。
+    #[test]
+    fn an_unreadable_marker_is_not_reported_as_no_marker() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("import_marker_unreadable");
+        let db = crate::paths::app_dir().join("foreign.db");
+        {
+            let conn = Connection::open(&db).expect("建一个别的库");
+            conn.execute_batch("CREATE TABLE unrelated(x)")
+                .expect("建表");
+        }
+        let err = read_import_marker(&db)
+            .err()
+            .expect("没有 meta 表时查询失败，不能当成没导过");
+        assert!(
+            err.to_string().contains("imported_src_size") && err.to_string().contains("翻倍"),
+            "要说清是哪一次读取失败、以及为什么不能折成没导过: {err}"
+        );
+
+        // 反向腿：meta 表在、这一键真的没有 ⇒ 这才是"没导过"
+        {
+            let conn = Connection::open(&db).expect("重开");
+            conn.execute_batch("CREATE TABLE meta(key TEXT, value TEXT)")
+                .expect("建 meta");
+        }
+        assert!(
+            read_import_marker(&db).expect("读得动时不该报错").is_none(),
+            "缺这一键就该回答「没有标记」"
         );
     }
 
