@@ -261,7 +261,7 @@ struct WriterState {
     /// 时钟**往回**跨过本地午夜 ⇒ 上面那两个"今日"缓存被清零过、需要按库里真值重锚一次。
     ///
     /// 为什么是一个标志而不是一次直接重锚：置位的地方是 `record()`，它在键鼠热路径上
-    /// （那条的注释写着"非阻塞，永不阻塞监听热路径"），而重锚要读库。写线程每个 tick
+    /// （那条的注释写着"不等待 SQLite IO"），而重锚要读库。写线程每个 tick
     /// （≤100 ms）看一眼这个标志，就把"少报到下次重启"缩成"少报一个 tick"。
     ///
     /// 为什么这种跳变要单独处理：往前跨天是真的新的一天，库里那一天的行还不存在，
@@ -285,6 +285,8 @@ struct WriterState {
     /// 而它要等到进程早就退出之后才轮到回填，等于退出即丢。
     /// 锁序一律 agg → in_flight（两边都按这个顺序拿，别处不得反过来）。
     in_flight: Mutex<AggDeltas>,
+    /// 在途批次已有年份落成、其余失败回填时为真；此后快照只算 agg，不再并入旧在途副本。
+    in_flight_settled: AtomicBool,
     /// `stop()` 超时或 panic 真的写出过恢复文件：在途批次出结果后要由写线程把
     /// 文件收敛成"此刻真正未落库的集合"（见 [`settle_after_stop_snapshot`]）。
     stop_snapshot_taken: AtomicBool,
@@ -374,6 +376,7 @@ impl DbWriter {
         let state = Arc::new(WriterState {
             agg: Mutex::new(initial),
             in_flight: Mutex::new(AggDeltas::default()),
+            in_flight_settled: AtomicBool::new(false),
             snapshot_taken: Mutex::new(AggDeltas::default()),
             stop_snapshot_taken: AtomicBool::new(false),
             sig_tx,
@@ -403,10 +406,11 @@ impl DbWriter {
         Ok(writer)
     }
 
-    /// 记录一次按键：累加到内存聚合（非阻塞，永不阻塞监听热路径）。
+    /// 记录一次按键：累加到内存聚合（不等待 SQLite IO）。
     pub fn record(&self, key_name: &str, timestamp: i64) {
         let state = &*self.state;
         // 跨天检查：日期变化则重置今日计数/活跃时长（避免次日显示累计值）
+        let mut agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
         let day = current_day_key();
         let stored = state.today_key.load(Ordering::Relaxed);
         if stored != day {
@@ -418,7 +422,7 @@ impl DbWriter {
             // CMOS 掉电后 NTP 把表拨回来，且正好在午夜附近）：清零会把那一天此前的
             // 按键与活跃秒数从"今日"里抹掉，而这两个缓存之后只往上加，一整天补不回来。
             // 这里不能就地重锚 —— 那是把一次 SQLite 读压进键鼠热路径（本函数开头的
-            // "非阻塞，永不阻塞监听热路径"），所以留个标志交给写线程，见字段注释。
+            // "不等待 SQLite IO"），所以留个标志交给写线程，见字段注释。
             if day < stored {
                 state.today_reanchor.store(true, Ordering::Relaxed);
             }
@@ -427,7 +431,6 @@ impl DbWriter {
 
         let day_key = queries::day_key_of_ts(timestamp);
         let hour = queries::hour_of_ts(timestamp);
-        let mut agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
         *agg.daily.entry(day_key).or_insert(0) += 1;
         *agg.hourly.entry((day_key, hour)).or_insert(0) += 1;
         // 不用 entry()：那会为每次按键分配一个立刻丢弃的 String；
@@ -665,21 +668,16 @@ impl DbWriter {
     /// （「总计」卡片和悬浮窗跟着偏小）。
     pub fn recompute_today_totals(&self) {
         let flushed = self.flush_confirmed(true);
+        let agg = self.state.agg.lock().unwrap_or_else(|e| e.into_inner());
         self.state
             .today_key
             .store(current_day_key(), Ordering::Relaxed);
         let today_dk = queries::day_key_of_date(chrono::Local::now().date_naive());
-        // 持着 agg 锁去读库：写线程的 flush_pending 也要这把锁（它的 SQLite IO 在
-        // 锁外做），所以"库里的值"和"内存里的待落库增量"取的是同一瞬间的状态，
-        // 不会出现同一批既算进库值又算进增量。
-        let agg = self.state.agg.lock().unwrap_or_else(|e| e.into_inner());
         let pending_count = agg.daily.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
         let pending_active = agg.active.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
         let landed = today_landed_totals(today_dk);
-        // 锁到这一步才放：上面那句读库必须和"读内存增量"取同一瞬间的状态
         let base_count = self.state.today_count.load(Ordering::Relaxed);
         let base_active = self.state.today_active.load(Ordering::Relaxed);
-        drop(agg);
         if !flushed {
             tracing::warn!("recompute_today_totals: flush 未确认完成，今日基准只追平不回退");
         }
@@ -709,6 +707,7 @@ impl DbWriter {
         };
         self.state.today_count.store(new_count, Ordering::Relaxed);
         self.state.today_active.store(new_active, Ordering::Relaxed);
+        drop(agg);
     }
 
     /// 立即 flush：发信号让写线程落库。`wait=true` 时阻塞等待完成。
@@ -878,6 +877,7 @@ impl From<AggDeltasFile> for AggDeltas {
 /// 把未落库增量快照写到恢复文件。
 /// `take=true` 时同时从内存聚合移除：用于 stop 超时 / panic（进程即将终止），
 /// 数据此后只存在于文件中，避免写线程随后恢复后再次落库造成重复计数。
+/// 在途批次只在「结果还没出来」时属于快照；已经有一部分年份落成的，只快照失败部分。
 ///
 /// 全程持有 agg 锁，且**先写盘成功、后从内存取走**：原先是"先取走再写盘"，
 /// 写失败只留一行 `tracing::error!` 就 return —— 那批增量既不在库里、也不在
@@ -898,7 +898,9 @@ fn snapshot_recovery(state: &WriterState, take: bool) {
     // （`flush_pending` 已在 agg 锁内取走、SQLite IO 还在锁外跑）会同时不在库里、
     // 不在内存里、也不在兜底文件里 —— 而这恰恰是 stop 超时/panic 最常见的形态。
     let mut merged = agg.clone();
-    merged.merge_in(&state.in_flight.lock().unwrap_or_else(|e| e.into_inner()));
+    if !state.in_flight_settled.load(Ordering::Acquire) {
+        merged.merge_in(&state.in_flight.lock().unwrap_or_else(|e| e.into_inner()));
+    }
     // 第三次：上一份兜底文件"取走"的那一批。`take=true` 会把批次从 agg 挪进
     // `snapshot_taken`，此后它**只剩两处副本**：内存里那一份和盘上那一份。
     // 只按 agg ∪ 在途重写文件的话（panic 钩子在 stop 之后再插一次就是这条，
@@ -1109,15 +1111,14 @@ fn reanchor_today(state: &WriterState) -> bool {
     // 它看见 `today_key` 不是今天就 `store(0)` 那两个基准，而基准之后只往上加。
     // 先算基准、后立键 ⇒ 中间隔着一次 SQLite 读的那几毫秒里只要有一次按键落下，
     // 刚算好的整天基准就被清零后再加 1，「今日」剩 1 次且一整天补不回来。
+    // record 热路径也走这把锁：基准与并发新增量必须一笔提交，不能在读库后
+    // 用旧快照 store 覆盖已经 fetch_add 的新数。
+    let agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
     state.today_key.store(current_day_key(), Ordering::Relaxed);
     let today_dk = queries::day_key_of_date(chrono::Local::now().date_naive());
-    // 与 recompute_today_totals 同一条规矩：持着 agg 锁读库，让"库里的值"与
-    // "内存里的待落库增量"取的是同一瞬间，同一批不会既算进库值又算进增量。
-    let agg = state.agg.lock().unwrap_or_else(|e| e.into_inner());
     let pending_count = agg.daily.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
     let pending_active = agg.active.get(&today_dk).copied().unwrap_or(0).max(0) as u64;
     let landed = today_landed_totals(today_dk);
-    drop(agg);
     // 读不出来时**什么都不写**：把 `None` 当 0 用，等于把整天已经落库的活跃数从今日里
     // 抹掉，而这两个缓存之后只往上加 —— 一次瞬时读不动就让今日整天偏小，且没人知道。
     // 保持原样最多让今日多带着上一天的数（日期键已经先立好了，见上面那段），
@@ -1138,6 +1139,7 @@ fn reanchor_today(state: &WriterState) -> bool {
     state
         .today_active
         .store(seconds.max(0) as u64 + pending_active, Ordering::Relaxed);
+    drop(agg);
     true
 }
 
@@ -1435,6 +1437,7 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
         // 同一把锁内登记"这批已离开内存、结果还没出来"，恢复快照才看得见它。
         // clone 的代价是每 10 秒一次、量级是一天的增量，换的是退出时不丢数据。
         *state.in_flight.lock().unwrap_or_else(|e| e.into_inner()) = taken.clone();
+        state.in_flight_settled.store(false, Ordering::Release);
         taken
     };
 
@@ -1506,7 +1509,8 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
         }
     }
     drop(agg);
-    // 这批有了最终结论（失败的那部分已回填进 agg）：在途记录作废并收敛恢复文件
+    // 成功年份已经落库，失败部分已回填；此后的快照只能并入 agg，不能把旧在途副本再算一次。
+    state.in_flight_settled.store(true, Ordering::Release);
     *state.in_flight.lock().unwrap_or_else(|e| e.into_inner()) = AggDeltas::default();
     settle_after_stop_snapshot(state);
     false
@@ -2780,6 +2784,37 @@ mod tests {
             "文件里得是「第一次取走的 7 条 + 第二次那 4 条」；只盖成第二次那一趟就丢了 7 条：{:?}",
             saved.daily
         );
+
+        let dk_last = queries::day_key_of_date(
+            chrono::NaiveDate::from_ymd_opt(chrono::Local::now().year() - 1, 12, 31).unwrap(),
+        );
+        let dk_today = queries::day_key_of_date(chrono::Local::now().date_naive());
+        {
+            let mut agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+            agg.daily.insert(dk_last, 5);
+            agg.daily.insert(dk_today, 6);
+        }
+        let blocked = paths::year_db_path(chrono::Local::now().year() - 1);
+        std::fs::create_dir_all(&blocked).unwrap();
+        let current_path = paths::current_year_db_path();
+        std::fs::remove_dir(&current_path).expect("撤掉前一段夹具的目录占位");
+        let conn = connection::open_rw(&current_path).unwrap();
+        connection::ensure_schema(&conn, chrono::Local::now().year()).unwrap();
+        let mut conn = Some(conn);
+        let mut conn_year = chrono::Local::now().year();
+        assert!(!flush_pending(&mut conn, &mut conn_year, &w.state));
+        assert_eq!(w.flush_seq(), 1, "前提：本轮今年那 6 次已经落成");
+        settle_after_stop_snapshot(&w.state);
+        snapshot_recovery(&w.state, true);
+        let saved: AggDeltasFile = serde_json::from_str(
+            &std::fs::read_to_string(recovery_path()).expect("部分失败后仍要有恢复文件"),
+        )
+        .unwrap();
+        assert_eq!(
+            saved.daily.iter().map(|(_, n)| *n).sum::<i64>(),
+            16,
+            "第一次快照的 11 + 本轮失败的 5；已落成的 6 不能再次进入文件"
+        );
     }
 
     /// 恢复文件**既改不了名也删不掉**时不许回放（同步盘/杀软握着句柄的真实形态）。
@@ -3923,6 +3958,72 @@ mod tests {
         }
         assert_eq!(db_count(), base + 2, "设备计数应恰好回放一次");
         w2.stop_and_wait();
+    }
+
+    /// 跨年批次旧年已落、新年失败后退出，恢复文件只能留下失败年份；重启恰好补落一次。
+    #[test]
+    fn partial_year_landing_is_not_replayed_twice() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("recovery_partial_year");
+        let now = chrono::Local::now();
+        let last_year = now.year() - 1;
+        let dk_last = queries::day_key_of_date(
+            chrono::NaiveDate::from_ymd_opt(last_year, 12, 31).expect("12-31 一定存在"),
+        );
+        let dk_today = queries::day_key_of_date(now.date_naive());
+        let blocked = paths::year_db_path(last_year);
+        std::fs::create_dir_all(&blocked).expect("把上一年的库做成同名目录");
+        {
+            let w = start_writer(Duration::from_secs(3600));
+            {
+                let mut agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+                agg.daily.insert(dk_last, 4);
+                agg.daily.insert(dk_today, 3);
+            }
+            w.flush(true);
+            assert!(w.flush_seq() > 0, "前提：今年那半已经落库");
+            w.stop_and_wait();
+        }
+        let saved: AggDeltasFile = serde_json::from_str(
+            &std::fs::read_to_string(recovery_path()).expect("失败年份必须留下恢复文件"),
+        )
+        .expect("恢复文件要能解析");
+        assert_eq!(
+            saved
+                .daily
+                .iter()
+                .map(|(dk, _)| *dk)
+                .collect::<std::collections::HashSet<_>>(),
+            std::iter::once(dk_last).collect(),
+            "已落库的今年那半不许再进恢复文件"
+        );
+        assert_eq!(
+            saved.daily.iter().map(|(_, n)| *n).sum::<i64>(),
+            4,
+            "恢复文件只保留真正未落库的旧年四次"
+        );
+
+        std::fs::remove_dir(&blocked).expect("撤掉旧年库障碍");
+        let w = start_writer(Duration::from_secs(3600));
+        w.flush(true);
+        let last: i64 = connection::open_ro(&blocked)
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(count),0) FROM daily_counts WHERE date_key=?1",
+                [dk_last],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let today: i64 = connection::open_ro(&paths::current_year_db_path())
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(count),0) FROM daily_counts WHERE date_key=?1",
+                [dk_today],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((last, today), (4, 3), "失败年份补落一次，成功年份不能重放");
+        w.stop_and_wait();
     }
 
     /// 恢复机制：快照落盘并从内存移除 → 正常 flush 不再落库 →

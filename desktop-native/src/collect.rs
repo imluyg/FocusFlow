@@ -314,8 +314,11 @@ pub fn set_paused(paused: bool) -> bool {
         return false;
     }
     rt.listener.set_paused(paused);
-    // 暂停时把「次/分」清空：否则恢复的那一刻会把暂停前的 60 秒算进来。
     if paused {
+        if let Some(w) = rt.db.writer() {
+            w.reset_active_anchor();
+        }
+        // 暂停时把「次/分」清空：否则恢复的那一刻会把暂停前的 60 秒算进来。
         if let Ok(mut q) = KEY_TICKS.lock() {
             q.clear();
         }
@@ -353,6 +356,9 @@ pub fn stop_listening() {
     let Some(rt) = g.as_ref() else { return };
     rt.listener.stop();
     rt.listener.set_paused(true);
+    if let Some(w) = rt.db.writer() {
+        w.reset_active_anchor();
+    }
     rt.listening.store(false, Ordering::SeqCst);
     if let Ok(mut q) = KEY_TICKS.lock() {
         q.clear();
@@ -379,6 +385,10 @@ pub fn shutdown(cfg: &'static FocusFlowConfig) {
     let Ok(g) = guard else { return };
     let Some(rt) = g.as_ref() else { return };
     rt.listener.stop();
+    rt.listener.set_paused(true);
+    if let Some(w) = rt.db.writer() {
+        w.reset_active_anchor();
+    }
     rt.db.shutdown(cfg);
 }
 
@@ -499,6 +509,16 @@ mod tests {
         assert!(
             stop.contains("listening.store(false,"),
             "关掉采集没翻状态位，开关就还是单向的"
+        );
+        assert!(
+            stop.contains("db.writer()") && stop.contains("reset_active_anchor()"),
+            "停用也要清活跃锚，否则关再开会把停用区间算进应用时长"
+        );
+        let pause_at = src.find("pub fn set_paused").expect("set_paused 不见了");
+        let pause = seg(pause_at);
+        assert!(
+            pause.contains("ifpaused{") && pause.contains("reset_active_anchor()"),
+            "暂停入口必须清活跃锚；只在写线程单测里调它不算接上生产路径"
         );
     }
 

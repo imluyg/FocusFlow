@@ -398,9 +398,11 @@ pub struct InputListener {
     key_callbacks: Mutex<Vec<KeyCallback>>,
     /// 要监听线程活着吗（`start()` 置真、`stop()` 置假）
     alive: Arc<Mutex<bool>>,
-    /// 监听线程**此刻真的在跑**吗。与 `alive` 分开：`stop()` 只把 `alive` 置假，
+    /// `stop()` 在自动重启退避期间也要能唤醒等待，否则关再开时旧线程会带着新的暂停位退出。
+    wake: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    /// rdev 钩子**此刻已经挂上**吗。与 `alive` 分开：`stop()` 只把 `alive` 置假，
     /// 线程可能还挂在 rdev 的消息循环里；这时再 `start()` 就是第二个钩子。
-    /// 只有线程确实退出了（`listen` 返回且 `alive` 已假），这个标志才会落回 false。
+    /// 自动重启退避期间为假，好让「关再开」重起线程而不是只解除暂停。
     running: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -420,6 +422,7 @@ impl InputListener {
             paused,
             key_callbacks: Mutex::new(Vec::new()),
             alive: Arc::new(Mutex::new(false)),
+            wake: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         listener.cfg.reload(config);
@@ -673,22 +676,34 @@ impl InputListener {
         }
         let this = Arc::clone(self);
         let running = Arc::clone(&self.running);
+        let wake = Arc::clone(&self.wake);
         // 持锁跨 spawn：spawn 只是建线程不阻塞，锁到置位为止，
         // 防两个并发 start 都过了检查、双起线程。
         // 新线程首件事也是锁 alive —— 它会短暂等在这里，等我们置位后放行。
         thread::Builder::new()
             .name("input-listener".into())
             .spawn(move || {
-                running.store(true, std::sync::atomic::Ordering::SeqCst);
                 loop {
                     if !*this.alive.lock().unwrap_or_else(|e| e.into_inner()) {
                         break;
                     }
+                    let (wake_lock, wake_cv) = &*wake;
+                    let mut wake = wake_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    while *wake && *this.alive.lock().unwrap_or_else(|e| e.into_inner()) {
+                        wake = wake_cv.wait(wake).unwrap_or_else(|e| e.into_inner());
+                    }
+                    if !*this.alive.lock().unwrap_or_else(|e| e.into_inner()) {
+                        break;
+                    }
+                    *wake = false;
+                    drop(wake);
                     let this2 = Arc::clone(&this);
                     let db2 = Arc::clone(&db);
+                    running.store(true, std::sync::atomic::Ordering::SeqCst);
                     let result = listen(move |event: Event| {
                         this2.process_event(&db2, &event);
                     });
+                    running.store(false, std::sync::atomic::Ordering::SeqCst);
                     if !*this.alive.lock().unwrap_or_else(|e| e.into_inner()) {
                         break;
                     }
@@ -696,7 +711,10 @@ impl InputListener {
                         Ok(()) => tracing::warn!("键鼠监听意外结束，5 秒后自动重启"),
                         Err(e) => tracing::error!("键鼠监听失败，5 秒后自动重启: {e:?}"),
                     }
-                    thread::sleep(Duration::from_secs(5));
+                    let wake = wake_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if !*wake && *this.alive.lock().unwrap_or_else(|e| e.into_inner()) {
+                        let _ = wake_cv.wait_timeout(wake, Duration::from_secs(5));
+                    }
                 }
                 running.store(false, std::sync::atomic::Ordering::SeqCst);
             })
@@ -705,19 +723,27 @@ impl InputListener {
                 anyhow::anyhow!("启动输入监听线程失败: {e}")
             })?;
         *alive = true;
+        let (lock, cv) = &*self.wake;
+        let mut wake = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *wake = false;
+        cv.notify_one();
+        drop(wake);
         drop(alive);
         tracing::info!("{}", Self::effective_switches(&self.cfg));
         Ok(())
     }
 
-    /// 停止监听。
+    /// 停止监听，并唤醒自动重启的退避等待。
     pub fn stop(&self) {
         *self.alive.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        let (lock, cv) = &*self.wake;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_one();
         tracing::info!("键鼠监听已停止");
     }
 
-    /// 监听线程是否真的还在跑。`stop()` 之后它可能仍挂在 rdev 消息循环里，
-    /// 这时**不许**再 `start()`（第二个钩子会双记）；只有这里为 false 才该重开。
+    /// rdev 钩子是否已经挂上。`stop()` 之后旧线程可能仍在消息循环里，不能重起；
+    /// 自动重启退避期间为假，此时「关再开」可以唤醒旧线程重新挂钩。
     pub fn is_running(&self) -> bool {
         self.running.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -1325,8 +1351,7 @@ mod tests {
         );
     }
 
-    /// 线程存活标志必须两头都写：只在入口置真、不在出口置假，恢复那一路会永远
-    /// 以为线程还在；线程真退出后就再也不重开（界面却说已恢复）。
+    /// running 必须紧贴 listen 的两侧，退避等待不能冒充正在监听；停止还要能唤醒退避。
     #[test]
     fn the_running_flag_brackets_the_listener_thread() {
         let src = include_str!("listener.rs");
@@ -1339,8 +1364,37 @@ mod tests {
             .map(|n| n + at)
             .expect("stop 不见了");
         let body = &prod[at..end];
-        assert!(body.contains("running.store(true"), "线程入口没标记在跑");
-        assert!(body.contains("running.store(false"), "线程出口没清标记");
+        let flat: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("running.store(true,") && flat.contains("letresult=listen("),
+            "必须先标记钩子已挂上，再进入 listen：退避等待不能冒充正在监听"
+        );
+        assert!(
+            flat.find("running.store(true,").unwrap() < flat.find("letresult=listen(").unwrap(),
+            "running 必须在 listen 之前置真"
+        );
+        assert!(
+            flat.find("running.store(false,").unwrap() > flat.find("letresult=listen(").unwrap(),
+            "listen 每次返回都要清掉 running"
+        );
+        assert!(
+            flat.contains("wait_timeout(wake,Duration::from_secs(5))"),
+            "自动重启仍要保留 5 秒退避"
+        );
+        assert!(
+            flat.contains("cv.wait(wake)"),
+            "旧线程必须在退避/停止请求里可唤醒，不能睡满 5 秒才看停止请求"
+        );
+        let stop_at = prod.find("pub fn stop(&self)").unwrap();
+        let stop = &prod[stop_at..prod[stop_at..].find("\n    }").unwrap() + stop_at + 6];
+        assert!(stop.contains("cv.notify_one()"), "stop 必须唤醒退避等待");
         assert!(
             prod.contains("pub fn is_running(&self) -> bool"),
             "没有对外的存活读数：调用方只能靠猜"
