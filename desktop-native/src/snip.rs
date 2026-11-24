@@ -153,8 +153,12 @@ fn drag_without_button(drag: Option<(Drag, i32, i32)>, lbutton: bool) -> Option<
 
 /// 标注阶段在选区外按下之后，鼠标要真的拉出这么大才算是"重新框选"。
 /// 阈值与松手判定共用 `MIN_DRAG`：小于它的一下只是点击，不该清掉已画好的标注。
+///
+/// **两轴都要过**，与 [`release_outcome`] 同一把尺子：只按一轴移动会拉出零高度/零宽度的
+/// 选区，那个形状松手时判不成 `Commit`（`Cancel` 或改成点中的窗口），而升级那一刻已经
+/// 离开 Adjust —— 于是"横着抖了 5 像素"会把整场标注连同选区一起丢掉。
 fn pending_new_should_promote(sx: i32, sy: i32, x: i32, y: i32) -> bool {
-    (x - sx).abs() >= MIN_DRAG || (y - sy).abs() >= MIN_DRAG
+    (x - sx).abs() >= MIN_DRAG && (y - sy).abs() >= MIN_DRAG
 }
 
 /// 覆盖层上"单击选窗口"看到的一条候选：Z 序里的一个顶层窗口，带上判得动的四件事。
@@ -2553,6 +2557,13 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                         }
                         None => {
                             if s.phase == Phase::Select {
+                                // 放大镜与坐标读数画在 `cur` 上（见 paint）：只更 hover 的
+                                // 话，不拖拽地移动鼠标时方块会停在覆盖层弹出那一刻的位置。
+                                // 放大镜关掉时不更（也没有别的读点），免得每一次移动都整屏重画。
+                                if s.loupe && s.cur != (x, y) {
+                                    s.cur = (x, y);
+                                    changed = true;
+                                }
                                 let hv = hover_at(
                                     &s.hits,
                                     GetCurrentProcessId(),
@@ -8415,10 +8426,23 @@ mod tests {
             !pending_new_should_promote(100, 100, 100 + MIN_DRAG - 1, 100),
             "差一像素就清掉标注，等于把误点做成了重新框选"
         );
-        assert!(pending_new_should_promote(100, 100, 100 + MIN_DRAG, 100));
-        assert!(pending_new_should_promote(100, 100, 100, 100 - MIN_DRAG));
+        assert!(
+            !pending_new_should_promote(100, 100, 100 + MIN_DRAG, 100),
+            "只朝一个方向拖：松手时框不住（release_outcome 要两轴都过），不该升级"
+        );
+        assert!(pending_new_should_promote(
+            100,
+            100,
+            100 + MIN_DRAG,
+            100 + MIN_DRAG
+        ));
         // 方向无关：负向同样按绝对值判
-        assert!(pending_new_should_promote(100, 100, 100 - MIN_DRAG, 100));
+        assert!(pending_new_should_promote(
+            100,
+            100,
+            100 - MIN_DRAG,
+            100 - MIN_DRAG
+        ));
     }
 
     /// 开层失败的三条路（虚拟屏、冻结、建窗）都要给状态行回执：覆盖层没起来时
@@ -8717,5 +8741,82 @@ mod loupe_tests {
             assert_eq!(s.sel, (700, 500, 900, 700));
             assert!(s.marks.is_empty(), "重新框选之后旧标注应当清掉");
         }
+    }
+
+    /// 标注阶段在选区外只朝一个方向拖过门槛：不能升级成零高度选区，否则松手时
+    /// `release_outcome` 判不成 Commit（落在桌面就是 Cancel），整场标注与选区一起没了。
+    #[test]
+    fn a_one_axis_drag_outside_the_selection_keeps_the_marks() {
+        let _serial = crate::probe_guard();
+        let _reset = SnipStateReset;
+        {
+            let mut s = SNIP.lock().unwrap();
+            s.phase = Phase::Adjust;
+            s.annotate = true;
+            s.sel = (240, 200, 640, 460);
+            s.base_w = 1920;
+            s.base_h = 1080;
+            s.marks.push(Mark {
+                shape: Shape::Rect(10, 10, 20, 20),
+                style: Style {
+                    rgb: PALETTE[0].0,
+                    w: WIDTHS[0].0,
+                    font: FONTS[1].0,
+                },
+            });
+        }
+        let hwnd = HWND::default();
+        unsafe {
+            overlay_proc(hwnd, WM_LBUTTONDOWN, WPARAM(1), packed_point(800, 600));
+            overlay_proc(hwnd, WM_MOUSEMOVE, WPARAM(1), packed_point(806, 600));
+        }
+        {
+            let s = SNIP.lock().unwrap();
+            assert_eq!(s.phase, Phase::Adjust, "单向拖动被误当成重新框选");
+            assert_eq!(s.sel, (240, 200, 640, 460), "旧选区被换成了零高度框");
+            assert_eq!(s.marks.len(), 1, "旧标注被清了");
+        }
+        unsafe {
+            overlay_proc(hwnd, WM_LBUTTONUP, WPARAM(0), packed_point(806, 600));
+        }
+        {
+            let s = SNIP.lock().unwrap();
+            assert_eq!(s.phase, Phase::Adjust);
+            assert_eq!(s.sel, (240, 200, 640, 460));
+            assert_eq!(s.marks.len(), 1);
+            assert_eq!(s.drag, None);
+        }
+    }
+
+    /// 还没拖框时只移动鼠标：放大镜与"屏幕 x,y"读数画在 `cur` 上，必须跟着走。
+    #[test]
+    fn the_loupe_follows_the_cursor_before_a_selection_is_drawn() {
+        let _serial = crate::probe_guard();
+        let _reset = SnipStateReset;
+        {
+            let mut s = SNIP.lock().unwrap();
+            s.phase = Phase::Select;
+            s.sel = (0, 0, 0, 0);
+            s.base_w = 1920;
+            s.base_h = 1080;
+            s.loupe = true;
+            s.cur = (10, 10);
+            s.drag = None;
+        }
+        unsafe {
+            overlay_proc(
+                HWND::default(),
+                WM_MOUSEMOVE,
+                WPARAM(0),
+                packed_point(640, 480),
+            );
+        }
+        let s = SNIP.lock().unwrap();
+        assert_eq!(
+            s.cur,
+            (640, 480),
+            "不拖拽只移动鼠标时，放大镜与坐标读数还停在覆盖层弹出那一刻"
+        );
+        assert_eq!(s.drag, None, "没有按键的移动不该被当成拖拽");
     }
 }
