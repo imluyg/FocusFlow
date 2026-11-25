@@ -796,13 +796,13 @@ pub fn update_task(
     schedule_time: Option<&str>,
     enabled: Option<bool>,
 ) -> anyhow::Result<()> {
-    // 读取当前值。last_run 必须在**同一次** SELECT 里读回来：分成两次时第二次的
-    // `.ok().flatten()` 把"读失败"和"这一条没有 last_run"并成一件 —— 库 BUSY 超过
-    // 15 秒那一瞬，更新照样返回 Ok，而写回的 NULL 抹掉的正是防同日重跑的锚
-    // （那条 09:00 的任务当天会被再启动一遍）。
+    // 读取当前值。**刻意不读 `last_run`**：这一行过去把它读回来再原样写回，
+    // 而调度线程可能在 SELECT 与 UPDATE 之间刚好执行并写好新的锚 —— 写回旧值
+    // 就把"今天已经跑过"抹掉，30 秒后同一分钟再启动一次。现在更新语句只在
+    // **调度时刻真的变了**时把 `last_run` 置空，其余情况碰都不碰。
     let conn = open()?;
     let existing = match conn.query_row(
-        "SELECT name, target_path, args, schedule_type, schedule_time, enabled, last_run FROM scheduled_tasks WHERE id=?1",
+        "SELECT name, target_path, args, schedule_type, schedule_time, enabled FROM scheduled_tasks WHERE id=?1",
         [id],
         |r| {
             Ok((
@@ -812,7 +812,6 @@ pub fn update_task(
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, i64>(5)?,
-                r.get::<_, Option<String>>(6)?,
             ))
         },
     ) {
@@ -872,11 +871,6 @@ pub fn update_task(
     // 比较也要按 trim 后的做：一条历史脏行 `"09:00 "` 被规范化成 `"09:00"` 不算
     // "改了调度时刻"，否则这次编辑会顺手清空 last_run、当天多启动一次。
     let schedule_changed = new_type != existing.3 || new_time != existing.4.trim();
-    let last_run: Option<String> = if schedule_changed {
-        None // 改了调度时刻：按新时刻重新计一次
-    } else {
-        existing.6 // 就是上面那次 SELECT 读回来的值，读失败已经在那里 return 了
-    };
     // 目标/参数/调度任一真的改了，上一条 `last_error` 就不再描述这条任务：
     // 用户已经按那句话把配置改对了，面板不能继续说「上次没启动成功」，更不能
     // 顶着「调度配置解不开，永远不会执行」等到下一个触发时刻（daily 可能是明天）。
@@ -887,10 +881,18 @@ pub fn update_task(
         || new_time != existing.4.trim();
 
     conn.execute(
-        "UPDATE scheduled_tasks SET name=?1, target_path=?2, args=?3, schedule_type=?4, schedule_time=?5, enabled=?6, last_run=?7 WHERE id=?8",
+        "UPDATE scheduled_tasks SET name=?1, target_path=?2, args=?3, schedule_type=?4, \
+         schedule_time=?5, enabled=?6, \
+         last_run = CASE WHEN ?7 THEN NULL ELSE last_run END WHERE id=?8",
         rusqlite::params![
-            new_name, new_target, new_args, new_type, new_time,
-            if new_enabled { 1 } else { 0 }, last_run, id
+            new_name,
+            new_target,
+            new_args,
+            new_type,
+            new_time,
+            if new_enabled { 1 } else { 0 },
+            schedule_changed,
+            id
         ],
     )?;
     if config_changed {
@@ -1349,6 +1351,39 @@ fn record_fired_if_current(t: &ScheduledTask, at: &str) -> anyhow::Result<bool> 
     Ok(changed > 0)
 }
 
+/// 本轮快照里的这条任务**此刻**还能不能启动。
+///
+/// 调度循环先一次性取快照，再逐条判断、逐条启动；中间可能隔着前几条的目标校验
+/// （`validate_task_target` 要读文件/解快捷方式）。用户在这个窗口里删掉或停用任务，
+/// 旧快照仍会走到 `execute_task` —— 回写那一侧有 [`record_fired_if_current`] 挡着，
+/// 但程序已经弹出去了。启动前按主键再问一次：行还在、仍启用、配置指纹没变。
+///
+/// 读库失败按"不启动"处理：这一刻无法确认用户意图，宁可晚 30 秒再试。
+fn still_launchable(t: &ScheduledTask) -> bool {
+    let Ok(conn) = open() else {
+        return false;
+    };
+    match conn.query_row(
+        "SELECT 1 FROM scheduled_tasks WHERE id=?1 AND enabled=1 AND target_path=?2 \
+         AND args=?3 AND schedule_type=?4 AND schedule_time=?5",
+        rusqlite::params![
+            t.id,
+            t.target_path,
+            t.args,
+            t.schedule_type,
+            t.schedule_time
+        ],
+        |_| Ok(()),
+    ) {
+        Ok(()) => true,
+        Err(rusqlite::Error::QueryReturnedNoRows) => false,
+        Err(e) => {
+            tracing::warn!("定时任务 #{} 启动前复核读不出来，本轮不启动: {e}", t.id);
+            false
+        }
+    }
+}
+
 /// 执行任务（启动目标程序，DETACHED_PROCESS）。
 ///
 /// 只有 [`LaunchOutcome::Fired`] 意味着"这次真的启动了"；两个失败臂都无时刻。
@@ -1632,6 +1667,14 @@ fn record_launch(
     window: &str,
     stamp: &str,
 ) {
+    // 快照之后、真正 spawn 之前再复核一次：删掉/停用/改过配置的任务不许按旧快照启动。
+    if !still_launchable(t) {
+        tracing::info!(
+            "定时任务 #{} 在本轮快照之后被删除、停用或改动，本次不启动",
+            t.id
+        );
+        return;
+    }
     let outcome = execute_task(t);
     // 面板上"启用 / 上次执行：从未"分不出"还没到点"与"每次都被拒"。把原因写回任务行，
     // 成功启动时清掉；写失败只留日志，不能因为记不下原因把调度本身搞红。
@@ -2326,6 +2369,61 @@ mod tests {
         let t2 = get_all_tasks().into_iter().find(|x| x.id == id).unwrap();
         assert_eq!(t2.last_run, None, "改了调度时刻就该重新计一次");
         assert!(should_run(&t2, &Local::now()), "改到新时刻后要能重新触发");
+    }
+
+    /// 编辑任务的 UPDATE 不许把读到的 `last_run` 原样写回。
+    ///
+    /// 调度线程可能在 SELECT 与 UPDATE 之间刚好执行并写好新的锚：写回旧值就把
+    /// "今天已经跑过"抹掉，下一轮同一分钟再启动一次。只有调度时刻真的变了才置空，
+    /// 其余情况由 SQL 自己保留库里的现值。
+    #[test]
+    fn update_task_never_writes_back_a_stale_last_run() {
+        let src = include_str!("scheduler.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块起点找不到了")];
+        let at = prod
+            .find("pub fn update_task(")
+            .expect("update_task 不见了");
+        let body = &prod[at..];
+        assert!(
+            !body.contains("last_run=?7"),
+            "更新语句又把读到的 last_run 原样写回了（会抹掉并发的执行锚）"
+        );
+        assert!(
+            body.contains("CASE WHEN ?7 THEN NULL ELSE last_run END"),
+            "只有调度时刻真的变了才该把 last_run 置空"
+        );
+    }
+
+    /// 快照之后被删除/停用/改配置的任务不许启动：回写那一侧只挡得住 `last_run`，
+    /// 挡不住已经弹出去的程序。复核按主键 + 启用位 + 配置指纹。
+    #[test]
+    fn a_snapshot_task_that_was_deleted_or_disabled_does_not_launch() {
+        let _g = isolate_app_dir("stale_launch_guard");
+        let notepad = r"C:\Windows\notepad.exe";
+        if !std::path::Path::new(notepad).is_file() {
+            return;
+        }
+        let id = add_task("快照后改动", notepad, "", "daily", "00:01", true).unwrap();
+        let snap = get_all_tasks()
+            .into_iter()
+            .find(|t| t.id == id)
+            .expect("刚建好的任务应当读得回来");
+        assert!(still_launchable(&snap), "启用且配置一致时应当可启动");
+
+        toggle_task(id, false).unwrap();
+        assert!(!still_launchable(&snap), "停用之后旧快照不许启动");
+
+        toggle_task(id, true).unwrap();
+        assert!(still_launchable(&snap), "重新启用后同一份快照又可启动");
+
+        update_task(id, None, None, None, None, Some("00:02"), None).unwrap();
+        assert!(
+            !still_launchable(&snap),
+            "调度时刻改了，旧快照不能按旧配置启动"
+        );
+
+        delete_task(id).unwrap();
+        assert!(!still_launchable(&snap), "删除之后旧快照不许启动");
     }
 
     #[test]
