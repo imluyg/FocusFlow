@@ -126,19 +126,34 @@ pub fn check_yearly_archive(yearly_archive_enabled: bool) {
     {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!("{current_year} 年库探测失败，本轮年度归档跳过（未做任何改动）: {e}");
-            return;
+            // 不再整轮收手：其他年度库可能与当前年库无关地各有一批错位行。
+            tracing::error!(
+                "{current_year} 年库探测失败，当前年库这一轮不做年度归档（其他年度库仍会检查）: {e}"
+            );
+            None
         }
     };
 
-    let Some(earliest) = earliest else {
-        return;
-    };
-    tracing::info!(
-        "检测到早于 {current_year} 年的数据在当前库中（最早 date_key {earliest}），开始归档..."
-    );
-    if archive_stale_years(current_year) {
-        queries::invalidate_years_cache();
+    if let Some(earliest) = earliest {
+        tracing::info!(
+            "检测到早于 {current_year} 年的数据在当前库中（最早 date_key {earliest}），开始归档..."
+        );
+        if archive_stale_years(current_year) {
+            queries::invalidate_years_cache();
+        }
+    }
+
+    // 其他年度库里也可能躺着更早年份的行：导入按**源文件名**定目标库
+    // （`migration.rs` 的 `focusflow_<年>.db`），旧版迁移也按文件分库 —— 一份
+    // 「2025 命名、内含 2024 时间戳」的库就是这样来的。这些行按日期查询会去
+    // 2024 库找（看不见），却照常进总计：两个面各说各的。每个库各自归位。
+    for year in queries::available_years() {
+        if year == current_year {
+            continue;
+        }
+        if archive_stale_years(year) {
+            queries::invalidate_years_cache();
+        }
     }
 }
 
@@ -5527,6 +5542,56 @@ mod tests {
             !archive_stale_years(source_year),
             "无往年数据时不应重复归档"
         );
+    }
+
+    /// 非当年年度库里的错位行（更早年份）也要归位。
+    ///
+    /// 导入按**源文件名**把整库放进 `focusflow_<年>.db`，而库里可能含更早年份的
+    /// 时间戳：按日期查询会去那一年找（看不见），总计却算得进去，两个面各说各的。
+    /// 启动归档原先只从当年库出发，这些行永远搬不走。
+    #[test]
+    fn stale_rows_in_an_older_year_db_are_archived_too() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("archive_older_db");
+        let current = Local::now().year();
+        let source_year = current - 1;
+        let stale_year = source_year - 1;
+        let dk = |y: i32, m: u32, d: u32| {
+            queries::day_key_of_date(NaiveDate::from_ymd_opt(y, m, d).expect("date"))
+        };
+
+        let src_path = paths::year_db_path(source_year);
+        let conn = connection::open_rw(&src_path).unwrap();
+        connection::ensure_schema(&conn, source_year).unwrap();
+        conn.execute(
+            "INSERT INTO daily_counts (date_key, count, seconds) VALUES (?1, 7, 11)",
+            [dk(stale_year, 6, 1)],
+        )
+        .unwrap();
+        drop(conn);
+        queries::invalidate_years_cache();
+
+        check_yearly_archive(true);
+
+        let moved = connection::open_ro(&paths::year_db_path(stale_year)).unwrap();
+        let count: i64 = moved
+            .query_row(
+                "SELECT count FROM daily_counts WHERE date_key=?1",
+                [dk(stale_year, 6, 1)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 7, "错位到更早年份库的行必须归位");
+        drop(moved);
+        let left = connection::open_ro(&src_path).unwrap();
+        let stale: i64 = left
+            .query_row(
+                "SELECT COUNT(*) FROM daily_counts WHERE date_key < ?1",
+                [dk(source_year, 1, 1)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "源库里的往年行要搬走");
     }
 
     /// 目标库已存在同 date_key 时必须合并计数而不是冲突回滚。
