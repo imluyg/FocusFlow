@@ -554,6 +554,38 @@ pub struct MigrationReport {
     pub leftover_in_source: usize,
 }
 
+impl MigrationReport {
+    /// 启动日志/状态行那一句：搬了多少、旧目录清没清、目标里原有的文件被留档到哪儿。
+    ///
+    /// `backed_up` 以前只写进结构体、没人读：目标目录里原有的同名文件被改名成
+    /// `.pre-switch-*` 之后，屏上和日志里一个字都没有，用户会以为那份历史没了。
+    pub fn summary_line(&self) -> String {
+        let mut line = format!(
+            "数据目录已搬运：{} → {}（{} 个文件 / {} 字节，{}）",
+            self.from.display(),
+            self.to.display(),
+            self.summary.copied,
+            self.summary.bytes,
+            if self.leftover_in_source > 0 {
+                format!(
+                    "旧目录还剩 {} 项删不掉，可手工清理",
+                    self.leftover_in_source
+                )
+            } else {
+                "旧目录已清空".to_string()
+            }
+        );
+        if !self.summary.backed_up.is_empty() {
+            line.push_str(&format!(
+                "；目标目录原有的 {} 份文件已改名留档：{}",
+                self.summary.backed_up.len(),
+                self.summary.backed_up.join("、")
+            ));
+        }
+        line
+    }
+}
+
 /// 留给启动报告的一条说明：只有失败才填（全绿不该打扰用户，这是 B15 的既有口径）。
 static STARTUP_NOTICE: Mutex<Option<crate::startup::CheckResult>> = Mutex::new(None);
 
@@ -673,18 +705,7 @@ pub fn run_pending_migration() -> Option<MigrationReport> {
         MigrationPlan::Migrate { from, to } => match migrate_data_tree(&from, &to) {
             Ok(report) => {
                 clear_marker(cfg);
-                tracing::info!(
-                    "数据目录迁移完成：{} → {}（{} 个文件 / {} 字节，旧目录{}）",
-                    report.from.display(),
-                    report.to.display(),
-                    report.summary.copied,
-                    report.summary.bytes,
-                    if report.leftover_in_source > 0 {
-                        format!("还剩下 {} 项删不掉，可手工清理", report.leftover_in_source)
-                    } else {
-                        "已清空".to_string()
-                    }
-                );
+                tracing::info!("{}", report.summary_line());
                 Some(report)
             }
             Err(problem) => {
@@ -1557,6 +1578,46 @@ mod tests {
             "覆盖前那份留档不许丢: {:?}",
             again.backed_up
         );
+    }
+
+    #[test]
+    fn the_migration_report_names_the_files_it_kept_aside() {
+        let with_backup = MigrationReport {
+            from: std::path::PathBuf::from(r"D:\old"),
+            to: std::path::PathBuf::from(r"E:\new"),
+            summary: CopySummary {
+                copied: 2,
+                bytes: 4096,
+                skipped_existing: Vec::new(),
+                backed_up: vec![r"E:\new\data\focusflow_2025.db.pre-switch-20260101".to_string()],
+                errors: Vec::new(),
+            },
+            leftover_in_source: 0,
+        };
+        let line = with_backup.summary_line();
+        assert!(line.contains("2 个文件"), "要念搬了多少: {line}");
+        assert!(line.contains("旧目录已清空"), "要念旧目录的下场: {line}");
+        assert!(
+            line.contains("pre-switch-20260101"),
+            "目标里被改名留档的文件必须念出路径，否则用户以为那份历史没了: {line}"
+        );
+
+        let clean = MigrationReport {
+            from: std::path::PathBuf::from(r"D:\old"),
+            to: std::path::PathBuf::from(r"E:\new"),
+            summary: CopySummary {
+                copied: 1,
+                bytes: 10,
+                ..CopySummary::default()
+            },
+            leftover_in_source: 3,
+        };
+        let line = clean.summary_line();
+        assert!(
+            line.contains("还剩 3 项删不掉"),
+            "旧目录没清干净要说: {line}"
+        );
+        assert!(!line.contains("留档"), "没有留档时不要凭空念一句: {line}");
     }
 
     #[test]

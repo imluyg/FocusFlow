@@ -1522,18 +1522,7 @@ impl App {
         let moved = focusflow_core::data_location::run_pending_migration();
         let move_notice = focusflow_core::data_location::take_startup_notice();
         if let Some(r) = &moved {
-            tracing_note(&format!(
-                "数据目录已搬运：{} → {}（{} 个文件 / {} 字节，{}）",
-                r.from.display(),
-                r.to.display(),
-                r.summary.copied,
-                r.summary.bytes,
-                if r.leftover_in_source > 0 {
-                    format!("旧目录还剩 {} 项删不掉", r.leftover_in_source)
-                } else {
-                    "旧目录已清空".to_string()
-                }
-            ));
+            tracing_note(&r.summary_line());
         }
         if let Some(n) = &move_notice {
             tracing_note(&format!("数据目录迁移：{}：{}", n.step, n.detail));
