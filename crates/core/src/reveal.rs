@@ -21,18 +21,24 @@ use std::path::{Path, PathBuf};
 pub fn scan_png(dir: &Path) -> Result<Option<PathBuf>, String> {
     let mut best: Option<(std::time::SystemTime, String, PathBuf)> = None;
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    for entry in entries.flatten() {
+    for item in entries {
+        let entry = item.map_err(|e| format!("{} 枚举到一半出错: {e}", dir.display()))?;
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
         let is_png = path
             .extension()
             .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("png"));
         if !is_png {
             continue;
         }
-        let mtime = match path.metadata().and_then(|m| m.modified()) {
+        let metadata = match path.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{} 的元数据读不出来: {e}", path.display())),
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let mtime = match metadata.modified() {
             Ok(t) => t,
             // 读不到时间就退回"按名字比"，别整张丢掉：退回的值取 Unix epoch，
             // 保证它只会输给真的有时间的文件。
@@ -202,6 +208,24 @@ mod tests {
         assert!(
             scan_png(&blocker).is_err(),
             "位置是个普通文件 ⇒ 读不出来，不是空目录"
+        );
+    }
+
+    #[test]
+    fn scan_png_does_not_silently_skip_directory_entries() {
+        let src = include_str!("reveal.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
+        let at = prod.find("pub fn scan_png(").expect("扫描函数不见了");
+        let end = prod[at..]
+            .find("\n}\n")
+            .map(|n| at + n + 3)
+            .unwrap_or(prod.len());
+        let body = &prod[at..end];
+        assert!(!body.contains("entries.flatten()"), "枚举错误不能被吞掉");
+        assert!(body.contains("item.map_err"), "每个目录条目都要显式处理");
+        assert!(
+            body.contains("元数据读不出来"),
+            "文件元数据失败也不能当作没这张图"
         );
     }
 
