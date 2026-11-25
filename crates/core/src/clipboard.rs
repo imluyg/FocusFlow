@@ -135,6 +135,7 @@ static CAPTURE_NOTICE: std::sync::Mutex<CaptureNotice> = std::sync::Mutex::new(C
 });
 static CAPTURE_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static CAPTURE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static CLEARED_CLIPBOARD_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 fn next_capture_order() -> u64 {
     CAPTURE_ORDER.fetch_add(1, Ordering::Relaxed)
@@ -146,6 +147,26 @@ fn current_capture_generation() -> u64 {
 
 fn advance_capture_generation() {
     CAPTURE_GENERATION.fetch_add(1, Ordering::Release);
+}
+
+fn current_clipboard_sequence() -> u32 {
+    #[cfg(windows)]
+    {
+        win::clipboard_sequence()
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+fn record_clear_sequence(sequence: u32) {
+    CLEARED_CLIPBOARD_SEQUENCE.fetch_max(sequence, Ordering::Release);
+}
+
+#[cfg(test)]
+fn reset_clear_sequence_for_test() {
+    CLEARED_CLIPBOARD_SEQUENCE.store(0, Ordering::Release);
 }
 
 fn update_capture_notice(order: u64, issue: Option<String>) {
@@ -1099,8 +1120,10 @@ pub fn clear_unpinned() -> Result<usize, String> {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| format!("清空剪贴板历史失败：{e}"))?
     };
+    let clear_sequence = current_clipboard_sequence();
     let deleted = delete_rows_cleaning_files(&conn, &ids)?;
     advance_capture_generation();
+    record_clear_sequence(clear_sequence);
     Ok(deleted)
 }
 
@@ -2200,6 +2223,7 @@ fn sweep_orphan_images(conn: &rusqlite::Connection) {
 
 #[cfg(windows)]
 mod win {
+    use std::cell::Cell;
     use std::sync::mpsc;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -2240,6 +2264,14 @@ mod win {
 
     static WATCHER_TX: Mutex<Option<mpsc::Sender<Captured>>> = Mutex::new(None);
 
+    thread_local! {
+        static LAST_READ_SEQUENCE: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(super) fn clipboard_sequence() -> u32 {
+        unsafe { GetClipboardSequenceNumber() }
+    }
+
     #[derive(Debug, Clone)]
     pub enum Captured {
         Text {
@@ -2248,6 +2280,7 @@ mod win {
             copied_at_ms: i64,
             capture_order: u64,
             capture_generation: u64,
+            clipboard_sequence: u32,
         },
         Image {
             stored: super::StoredImage,
@@ -2255,6 +2288,7 @@ mod win {
             copied_at_ms: i64,
             capture_order: u64,
             capture_generation: u64,
+            clipboard_sequence: u32,
         },
         Files {
             paths: Vec<String>,
@@ -2262,12 +2296,16 @@ mod win {
             copied_at_ms: i64,
             capture_order: u64,
             capture_generation: u64,
+            clipboard_sequence: u32,
         },
     }
 
     impl Captured {
         pub fn ingest(&self) -> Result<super::IngestOutcome, String> {
-            if self.capture_generation() != super::current_capture_generation() {
+            if self.capture_generation() != super::current_capture_generation()
+                || self.clipboard_sequence()
+                    <= super::CLEARED_CLIPBOARD_SEQUENCE.load(std::sync::atomic::Ordering::Acquire)
+            {
                 return Ok(super::IngestOutcome::Skipped(super::SkipReason::Cleared));
             }
             let (order, outcome) = match self {
@@ -2323,6 +2361,20 @@ mod win {
                 | Captured::Files {
                     capture_generation, ..
                 } => *capture_generation,
+            }
+        }
+
+        pub fn clipboard_sequence(&self) -> u32 {
+            match self {
+                Captured::Text {
+                    clipboard_sequence, ..
+                }
+                | Captured::Image {
+                    clipboard_sequence, ..
+                }
+                | Captured::Files {
+                    clipboard_sequence, ..
+                } => *clipboard_sequence,
             }
         }
 
@@ -2636,6 +2688,7 @@ mod win {
                     copied_at_ms: now_ms(),
                     capture_order: super::next_capture_order(),
                     capture_generation,
+                    clipboard_sequence: LAST_READ_SEQUENCE.with(|last| last.get()),
                 });
             }
             RawClip::TextTooLarge { units } => {
@@ -2674,6 +2727,7 @@ mod win {
                     copied_at_ms: now_ms(),
                     capture_order: super::next_capture_order(),
                     capture_generation,
+                    clipboard_sequence: LAST_READ_SEQUENCE.with(|last| last.get()),
                 });
             }
             RawClip::Files(paths) => {
@@ -2698,6 +2752,7 @@ mod win {
                     copied_at_ms: now_ms(),
                     capture_order: super::next_capture_order(),
                     capture_generation,
+                    clipboard_sequence: LAST_READ_SEQUENCE.with(|last| last.get()),
                 });
             }
         }
@@ -2707,6 +2762,7 @@ mod win {
     /// 读取顺序就是优先级：Excel 单元格这类同时带文本与 DIB 的按文本收，不会一条变两条。
     unsafe fn read_locked() -> Option<(RawClip, HWND)> {
         let seq = GetClipboardSequenceNumber();
+        LAST_READ_SEQUENCE.with(|last| last.set(seq));
         if is_self_sequence(seq) {
             return None;
         }
@@ -3388,6 +3444,7 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         let _dir = crate::paths::test_app_dir("clip_ingest_notice");
         init_db().unwrap();
+        reset_clear_sequence_for_test();
         note_capture_ok();
         let conn = open().unwrap();
         conn.execute_batch("CREATE TRIGGER reject_ingest BEFORE INSERT ON clipboard_items BEGIN SELECT RAISE(ABORT, 'fixture-ingest-denied'); END;").unwrap();
@@ -3397,6 +3454,7 @@ mod tests {
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
             capture_generation: current_capture_generation(),
+            clipboard_sequence: win::clipboard_sequence(),
         };
         assert!(captured
             .ingest()
@@ -3425,12 +3483,15 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         let _dir = crate::paths::test_app_dir("clip_clear_generation");
         init_db().unwrap();
+        reset_clear_sequence_for_test();
+        let sequence_before_clear = win::clipboard_sequence();
         let old = Captured::Text {
             text: "copied before clear".to_string(),
             source_app: "fixture.exe".to_string(),
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
             capture_generation: current_capture_generation(),
+            clipboard_sequence: sequence_before_clear,
         };
         assert_eq!(clear_unpinned().unwrap(), 0);
         assert!(matches!(
@@ -3439,12 +3500,29 @@ mod tests {
         ));
         assert!(list_recent(10).unwrap().is_empty(), "清空前的旧件不能复活");
 
+        let delayed = Captured::Text {
+            text: "read after clear".to_string(),
+            source_app: "fixture.exe".to_string(),
+            copied_at_ms: now_ms(),
+            capture_order: next_capture_order(),
+            capture_generation: current_capture_generation(),
+            clipboard_sequence: sequence_before_clear,
+        };
+        assert!(
+            matches!(
+                delayed.ingest().unwrap(),
+                IngestOutcome::Skipped(SkipReason::Cleared)
+            ),
+            "监听消息在清空后才处理时，旧剪贴板序号仍必须被丢弃"
+        );
+
         let fresh = Captured::Text {
             text: "copied after clear".to_string(),
             source_app: "fixture.exe".to_string(),
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
             capture_generation: current_capture_generation(),
+            clipboard_sequence: sequence_before_clear.wrapping_add(1),
         };
         assert!(matches!(
             fresh.ingest().unwrap(),
@@ -3459,6 +3537,7 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         let _dir = crate::paths::test_app_dir("clip_clear_generation_failed");
         init_db().unwrap();
+        reset_clear_sequence_for_test();
         assert!(matches!(
             ingest("seed", "fixture", now_ms()).unwrap(),
             IngestOutcome::Stored { .. }
@@ -3469,6 +3548,7 @@ mod tests {
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
             capture_generation: current_capture_generation(),
+            clipboard_sequence: win::clipboard_sequence(),
         };
         let conn = open().unwrap();
         conn.execute_batch(
@@ -3490,12 +3570,14 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         let _dir = crate::paths::test_app_dir("clip_notice_order");
         init_db().unwrap();
+        reset_clear_sequence_for_test();
         let make = |text: &str| Captured::Text {
             text: text.to_string(),
             source_app: "fixture.exe".to_string(),
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
             capture_generation: current_capture_generation(),
+            clipboard_sequence: win::clipboard_sequence(),
         };
         let old_success = make("queued success");
         let old_failure = make("queued failure");
