@@ -5810,10 +5810,14 @@ impl App {
                                 // 这一支从前也写着 `Err` 分支，而 `config::set` 恒回 `Ok`，
                                 // 那句"设置写入失败"永远走不到；热键那几行还会顺手把
                                 // `reload_hotkeys` 的话盖在状态行上，看着像已经记住了。
-                                let note = config_write_note(
-                                    &format!("{section}.{key}"),
-                                    focusflow_core::config::instance().set_now(section, key, &v),
-                                );
+                                let write_result =
+                                    focusflow_core::config::instance().set_now(section, key, &v);
+                                let wrote = write_result.is_ok();
+                                let note =
+                                    config_write_note(&format!("{section}.{key}"), write_result);
+                                if wrote && section == "gui" && key == "active_refresh_interval" {
+                                    poke_snapshot();
+                                }
                                 if section == "hotkey" {
                                     let mut msg = self.reload_hotkeys();
                                     msg.push_str(&note);
@@ -18255,6 +18259,10 @@ mod chart_hover_tests {
 mod snapshot_rate_tests {
     use super::*;
 
+    /// 两组测试都按同一个全局催位：并跑时一组会把另一组的位吃掉（或替它睡满），
+    /// 所以凡是要 poke/wait 两半的用例都先拿这把锁。
+    pub(super) static POKE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// 刷新间隔的取值：正常值原样用；笔误那一支退回默认。放任 0 是"每秒狂转"，
     /// 放任天文数字是"数字再也不动"——两种都比按默认值刷新更糟，而且看着像程序坏了。
     #[test]
@@ -18418,6 +18426,46 @@ mod snapshot_rate_tests {
         );
     }
 
+    #[test]
+    fn changing_the_refresh_interval_pokes_the_snapshot_waiter() {
+        let _guard = POKE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
+        let at = prod
+            .find("EditTarget::Setting(idx)")
+            .expect("设置编辑分支不见了");
+        let end = prod[at..]
+            .find("EditTarget::PluginField")
+            .map(|n| at + n)
+            .unwrap_or(prod.len());
+        let branch = &prod[at..end];
+        assert!(
+            branch.contains("set_now(section, key, &v)"),
+            "设置提交入口不见了"
+        );
+        assert!(
+            branch.contains("section == \"gui\" && key == \"active_refresh_interval\"")
+                && branch.contains("poke_snapshot();"),
+            "改刷新间隔后必须催醒快照线程，不能等旧周期"
+        );
+
+        SNAP_POKE.store(false, std::sync::atomic::Ordering::Relaxed);
+        poke_snapshot();
+        let mut input = InputWatch::new();
+        let mut logged_tier = 0;
+        assert!(
+            wait_for_refresh(
+                std::time::Instant::now(),
+                600,
+                -1,
+                false,
+                &mut input,
+                &mut logged_tier,
+            ),
+            "催位必须能打断旧的长等待"
+        );
+    }
+
     /// 接线腿：那一拍真的睡在**分档之后**的毫秒上，而且每一片都读键鼠空闲钟。
     /// 钉的是调用形态而不是函数名 —— 只数 `snapshot_sleep_secs(` 出现几次的话，
     /// "函数写了、循环仍旧按老的秒数睡"这种接法照样能蒙过去。
@@ -18429,8 +18477,8 @@ mod snapshot_rate_tests {
         let key = ["\"", "active_refresh_interval", "\""].concat();
         assert_eq!(
             prod.matches(key.as_str()).count(),
-            2,
-            "两处：快照线程读值 + 设置页的分组表（后者不读值）；再多就是多了个读者"
+            3,
+            "三处：快照线程读值 + 设置页的分组表（后者不读值）+ 设置提交分支的催醒条件；再多就是多了个读者"
         );
         let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
@@ -23188,6 +23236,10 @@ mod snapshot_poke_tests {
     /// 又白醒一次，而这条判据看不见。
     #[test]
     fn a_poke_wakes_the_sleep_and_an_unpoked_sleep_runs_its_full_length() {
+        let _guard = super::snapshot_rate_tests::POKE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        SNAP_POKE.store(false, std::sync::atomic::Ordering::Relaxed);
         poke_snapshot();
         let t = std::time::Instant::now();
         assert!(sleep_or_poke(4_000), "按过催位却没醒");
@@ -23266,13 +23318,8 @@ mod snapshot_poke_tests {
             flat.contains("poke_backlog_ms(last_query.elapsed().as_millis()asu64,POKE_MIN_GAP_MS"),
             "被催醒那一拍不再节流（或节流用的是别的钟）"
         );
-        let shown = flat
-            .find("let_=ShowWindow(hwnd,SW_RESTORE)")
-            .expect("唤窗那一步不见了");
-        let poked = flat
-            .find("poke_snapshot();")
-            .expect("唤窗之后不再催拍：点开窗口还是先看见旧数");
-        assert!(shown < poked, "催拍排在上屏之前：线程会醒在还没人看那一刻");
+        // 设置提交分支也有一处 `poke_snapshot();`（改刷新间隔当场催一拍），所以
+        // 唤醒那条只能收在 `bring_to_front` 这一身之内比 —— 全文找第一处会撞上它。
         // 隐藏时放掉了渲染目标 ⇒ 唤回必须先画好再显示，否则屏上是一段"有底色没内容"的面板
         // （现量 9 帧 / 约 110 ms，`.scratch/hide_show_first_frame.ps1` 的连拍腿）。
         // 次序在这里是唯一有意义的判据：反过来写照样编译、照样跑绿，症状只在人眼里。
@@ -23291,6 +23338,13 @@ mod snapshot_poke_tests {
         assert!(
             draw_at < show_at,
             "画帧排到显示之后了：打开面板会先闪一块只有底色的表面，再等首帧内容"
+        );
+        let poke_at = bf
+            .find("poke_snapshot();")
+            .expect("唤窗之后不再催拍：点开窗口还是先看见旧数");
+        assert!(
+            show_at < poke_at,
+            "催拍排在上屏之前：线程会醒在还没人看那一刻"
         );
         // 针脚要挑**这一处**的调用形状：`refresh_now()` 里也有一句 `let next = data::load(`，
         // 只写前半会先撞上它，那条顺序断言就成了比两句话的先后而不是比这一拍。
