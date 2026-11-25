@@ -380,28 +380,45 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
                 retry_hint(&leftover)
             ));
         }
-        let conn = connection::open_rw(&dst_path)?;
-        // 先从刚复制的原形状读指纹；ensure_schema 会补出空 daily_counts，
-        // 那会让“源库没有时长表”与“源库有一张空时长表”算出不同哈希。
-        let kl = key_log_fingerprint(&conn)?;
-        let content_hash = logical_content_hash(&conn)?;
-        connection::ensure_schema(&conn, year)?;
-        drop(conn);
-        // **标记写在聚合之前**，与下面合并分支同一条理由（那里的注释是完整版）：
-        // `migrate_v2` 是累加式且没有去重键，"这份导过了"只记在 `meta` 的
-        // `imported_src_*` 里。旧顺序在两步之间失败时留下「已聚合、未标记」，
-        // 用户点重试 ⇒ 读不到标记 ⇒ 那一年再累加一遍。整库复制这一支以前正好漏在
-        // 外面（"整库都搬过来了，标记写不上去有什么关系"），而它一样要跑 `migrate_v2`。
-        record_import_marker(&dst_path, &src_path, kl, &content_hash)?;
-        crate::db::maintenance::migrate_v2();
-        // 统计导入条数（聚合表总量）
-        let conn = connection::open_ro(&dst_path)?;
-        let count: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
-            [],
-            |r| r.get(0),
-        )?;
-        return Ok(count);
+        let prepared = (|| -> anyhow::Result<i64> {
+            let conn = connection::open_rw(&dst_path)?;
+            // 先从刚复制的原形状读指纹；ensure_schema 会补出空 daily_counts，
+            // 那会让“源库没有时长表”与“源库有一张空时长表”算出不同哈希。
+            let kl = key_log_fingerprint(&conn)?;
+            let content_hash = logical_content_hash(&conn)?;
+            connection::ensure_schema(&conn, year)?;
+            drop(conn);
+            // **标记写在聚合之前**，与下面合并分支同一条理由（那里的注释是完整版）：
+            // `migrate_v2` 是累加式且没有去重键，"这份导过了"只记在 `meta` 的
+            // `imported_src_*` 里。旧顺序在两步之间失败时留下「已聚合、未标记」，
+            // 用户点重试 ⇒ 读不到标记 ⇒ 那一年再累加一遍。整库复制这一支以前正好漏在
+            // 外面（"整库都搬过来了，标记写不上去有什么关系"），而它一样要跑 `migrate_v2`。
+            record_import_marker(&dst_path, &src_path, kl, &content_hash)?;
+            crate::db::maintenance::migrate_v2();
+            // 统计导入条数（聚合表总量）
+            let conn = connection::open_ro(&dst_path)?;
+            let count: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(count)
+        })();
+        return match prepared {
+            Ok(count) => Ok(count),
+            Err(e) => {
+                // 整库复制成功之后开库/建表/写标记失败：半份或读不出的副本留在目标位置，
+                // 下一次导入会因为它"已存在"改走合并分支（读的正是这份）；旧盘带过来的
+                // 只读属性更会让它永远导不进来。与复制、WAL 那两支同一处置：先清掉，
+                // 重试才仍走整体复制这条快路。
+                let leftover = rollback_fresh_copy(&dst_path);
+                Err(anyhow::anyhow!(
+                    "{year} 年库已整库复制，但后续开库/建表/写导入标记失败（{e}）：\
+                     本次导入未完成。{}",
+                    retry_hint(&leftover)
+                ))
+            }
+        };
     }
 
     // 目标库已存在：先把导入标记读一次，而且**只读一次**（下面两处都用这份）。
@@ -1847,6 +1864,35 @@ mod tests {
             .query_row("SELECT x FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(copied, "legacy", "剪贴板库必须真的被导进来");
+    }
+
+    /// 整库复制成功之后的失败（开库/建表/写标记）必须回滚那份副本。
+    ///
+    /// 否则下一次导入会因为它"已存在"改走合并分支，读的正是这份打不开的副本；
+    /// 旧盘带来的只读属性更会让那一年永远导不进来。
+    #[test]
+    fn a_copy_that_fails_after_landing_is_rolled_back() {
+        use chrono::Datelike;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("bad_year_copy");
+        let src_dir = _dir.path().join("old");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let year = chrono::Local::now().year() - 1;
+        std::fs::write(
+            src_dir.join(format!("focusflow_{year}.db")),
+            b"this is not a sqlite database",
+        )
+        .unwrap();
+
+        let summary = import_legacy_data(&src_dir);
+        assert!(
+            summary.errors.iter().any(|e| e.contains("本次导入未完成")),
+            "失败回执要按同一套口径说清: {summary:?}"
+        );
+        assert!(
+            !crate::paths::year_db_path(year).exists(),
+            "落进去又打不开的副本必须清掉，重试才仍走整体复制"
+        );
     }
 
     #[cfg(windows)]
