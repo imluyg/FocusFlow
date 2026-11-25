@@ -668,7 +668,7 @@ impl DbWriter {
     /// 尚未落库的今日增量` 才是今日真值。原来超时后照用库值，等于把那批增量从
     /// 「今日」里抹掉，而 `today_count` 之后只会往上加，一整天都补不回来
     /// （「总计」卡片和悬浮窗跟着偏小）。
-    pub fn recompute_today_totals(&self) {
+    pub fn recompute_today_totals(&self) -> bool {
         let flushed = self.flush_confirmed(true);
         let agg = self.state.agg.lock().unwrap_or_else(|e| e.into_inner());
         self.state
@@ -709,7 +709,12 @@ impl DbWriter {
         };
         self.state.today_count.store(new_count, Ordering::Relaxed);
         self.state.today_active.store(new_active, Ordering::Relaxed);
+        let complete = flushed && landed.is_some();
+        self.state
+            .today_reanchor
+            .store(!complete, Ordering::Release);
         drop(agg);
+        complete
     }
 
     /// 立即 flush：发信号让写线程落库。`wait=true` 时阻塞等待完成。
@@ -2465,7 +2470,9 @@ mod tests {
         assert_eq!(w.today_count(), 2, "还没刷：内存仍是旧值（这条前提得成立）");
         assert_eq!(w.today_active_seconds(), 10);
 
-        w.recompute_today_totals();
+        w.state.today_reanchor.store(true, Ordering::Release);
+        assert!(w.recompute_today_totals(), "完整重锚要交回成功");
+        assert!(!w.state.today_reanchor.load(Ordering::Acquire));
         assert_eq!(w.today_count(), 502, "按键数跟着库走");
         assert_eq!(w.today_active_seconds(), 4010, "活跃时长也得跟着库走");
         w.stop_and_wait();
@@ -2491,7 +2498,11 @@ mod tests {
         {
             let blocker = connection::open_rw(&path).unwrap();
             blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
-            w.recompute_today_totals();
+            assert!(!w.recompute_today_totals(), "flush 未确认时不能报重锚成功");
+            assert!(
+                w.state.today_reanchor.load(Ordering::Acquire),
+                "失败要进入自动重试队列"
+            );
             assert!(
                 w.today_count() >= 5,
                 "未落库的 5 次必须还在今日里，实际 {}",
@@ -2577,7 +2588,11 @@ mod tests {
         }
         connection::clear_ro_cache();
 
-        w.recompute_today_totals();
+        assert!(!w.recompute_today_totals(), "今日库值读不出来不能报成功");
+        assert!(
+            w.state.today_reanchor.load(Ordering::Acquire),
+            "读失败也要自动重试"
+        );
         assert_eq!(
             w.today_count(),
             5,
@@ -2585,6 +2600,20 @@ mod tests {
             w.today_count()
         );
         assert_eq!(w.today_active_seconds(), before_secs, "活跃时长同理");
+
+        {
+            let conn = connection::open_rw(&paths::current_year_db_path()).unwrap();
+            connection::ensure_schema(&conn, chrono::Local::now().year()).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts(date_key, count) VALUES (?1, 5)",
+                [queries::day_key_of_date(chrono::Local::now().date_naive())],
+            )
+            .unwrap();
+        }
+        connection::clear_ro_cache();
+        assert!(w.state.today_reanchor.swap(false, Ordering::Acquire));
+        assert!(reanchor_today(&w.state), "库恢复后写线程补做要成功");
+        assert_eq!(w.today_count(), 5, "自动重试后今日基准补齐");
         w.stop_and_wait();
     }
 

@@ -205,10 +205,9 @@ pub fn reanchor_today_after_external_write() -> bool {
         .lock()
         .ok()
         .and_then(|g| {
-            g.as_ref().and_then(|r| r.db.writer()).map(|w| {
-                w.recompute_today_totals();
-                true
-            })
+            g.as_ref()
+                .and_then(|r| r.db.writer())
+                .map(|w| w.recompute_today_totals())
         })
         .unwrap_or(false)
 }

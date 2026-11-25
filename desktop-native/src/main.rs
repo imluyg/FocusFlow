@@ -4270,12 +4270,17 @@ impl App {
                         // 今日那个数一直到下次重启才对上。
                         // 这句必须待在 data-op 这条后台线程上：它要给写线程投消息并最多等 3 秒，
                         // 挪进窗口过程就是把整扇主窗冻在那 3 秒里。
-                        if collect::reanchor_today_after_external_write() {
+                        let reanchor_pending = collect::is_started()
+                            && !collect::reanchor_today_after_external_write();
+                        if collect::is_started() && !reanchor_pending {
                             tracing_note(
                                 "导入后今日已按库值重锚（采集开着时屏上那个今日读的是写线程缓存）",
                             );
                         }
                         let mut line = format!("导入完成：{} 个年度库", s.year_dbs.len());
+                        if reanchor_pending {
+                            line.push_str("；今日读数重锚未完成，将自动重试");
+                        }
                         if !s.records_by_year.is_empty() {
                             let total: i64 = s.records_by_year.iter().map(|(_, n)| *n).sum();
                             line.push_str(&format!("，共 {total} 条"));
@@ -18580,6 +18585,10 @@ mod snapshot_rate_tests {
         assert!(
             call_at > imported_at && call_at < receipt_at,
             "重锚必须夹在「导入返回」与「拼回执」之间：导入={imported_at} 重锚={call_at} 回执={receipt_at}"
+        );
+        assert!(
+            prod.contains("今日读数重锚未完成，将自动重试"),
+            "重锚失败不能装作成功，回执必须说明会自动补做"
         );
     }
 
