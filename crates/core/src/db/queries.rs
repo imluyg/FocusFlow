@@ -2261,7 +2261,12 @@ pub fn get_device_detail(device_key: &str, period: i64) -> DeviceDetail {
     let device_key = crate::device_alias::hardware_identity_key(device_key);
     let today_date = Local::now().date_naive();
     let today_key = day_key_of_date(today_date);
-    let (series, mut gaps) = device_date_series(&device_key);
+    let (mut series, mut gaps) = device_date_series(&device_key);
+    // 未来日期的行不进详情：系统时钟被拨快后回拨、恢复旧备份都会留下这种行，而同一页的
+    // 分母（`device_totals` 的 `[today-n+1, today]` 窗口）不含它 —— 分子带上会让占比
+    // 超过 100%，「最后记录日期」还会显示明天。趋势/"活跃天数/日均"都是从这份序列推的，
+    // 在这里一次剔干净。
+    series.retain(|(dk, _)| *dk <= today_key);
 
     let from_key = period_start_key(today_key, period);
     let in_period = |dk: i64| dk >= from_key;
@@ -4054,6 +4059,9 @@ mod tests {
             ins(a, 1, 50);
             ins(a, 2, 25);
             ins(b, 0, 10);
+            // 未来日期的行（时钟被拨快后回拨、恢复旧备份）：详情各口径都不该算它，
+            // 尤其不能让"周期次数"超过分母、「最后记录日期」显示明天。
+            ins(a, -1, 7);
             // 键名明细：A 设备今天 左下键多于滚轮；B 设备也有明细（用于验证按设备隔离）
             for (key, n, off) in [
                 ("鼠标左键", 60, 0),
