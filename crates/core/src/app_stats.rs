@@ -42,8 +42,13 @@ use crate::db::DbWriter;
 const SAMPLE_INTERVAL_SECS: u64 = 1;
 /// 进程名快照刷新周期（秒）。
 const SNAPSHOT_REFRESH_SECS: u64 = 30;
-/// 快照「未命中后立即重建」的最小间隔（秒），防止异常 PID 造成高频重建。
-const SNAPSHOT_FORCE_MIN_SECS: u64 = 1;
+/// 快照「未命中后立即重建」的最小间隔（秒）。
+///
+/// 必须明显大于采样周期：采样每 1 秒一次，若这里也写 1，未命中期间每一拍都会满足
+/// 条件（重建前已把 `at` 刷成 now），全量进程枚举就退化成每秒一次，与"防止异常 PID
+/// 造成高频重建"的初衷正好相反。5 秒既压住异常 PID，又让刚启动的应用最多晚 5 秒
+/// 拿到名字（换窗那一路另有 `force_refresh`，不受这个节流限制）。
+const SNAPSHOT_FORCE_MIN_SECS: u64 = 5;
 
 /// 读取 [app_stats] 配置：enabled（默认 true）+ exclude（逗号分隔的进程名清单）。
 fn load_config(config: &FocusFlowConfig) -> (bool, Vec<String>) {
@@ -680,5 +685,46 @@ mod tests {
             "窗口换了、PID 被复用后必须改用新进程名"
         );
         assert_eq!(calls, 1, "换窗那一腿必须真的重建一次快照");
+    }
+
+    /// PID 持续查不到（受保护进程、窗口所属进程刚退出）时，"未命中立即重建"也要节流。
+    ///
+    /// 旧口径把最小间隔设成 1 秒、与采样周期相等，而重建前就把 `cache.at` 刷成 now：
+    /// 未命中期间每一拍都满足条件，全量进程枚举退化成每秒一次。
+    #[cfg(windows)]
+    #[test]
+    fn repeated_misses_do_not_enumerate_all_processes_every_second() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut cache = SnapshotCache::default();
+        let mut calls = 0usize;
+        for secs in [0u64, 1, 2, 3, 4] {
+            let got = pid_to_name_with(
+                &mut cache,
+                777,
+                false,
+                t0 + Duration::from_secs(secs),
+                || {
+                    calls += 1;
+                    Ok(HashMap::new())
+                },
+            );
+            assert_eq!(got, None, "查不到的 PID 不该凭空出现名字");
+        }
+        assert_eq!(
+            calls, 1,
+            "首次建表后，最小间隔内不许每秒重跑全量枚举，实测 {calls} 次"
+        );
+
+        // 到点必须再给一次机会：刚启动的进程名字要能补上。
+        let later = t0 + Duration::from_secs(super::SNAPSHOT_FORCE_MIN_SECS);
+        let mut fresh = HashMap::new();
+        fresh.insert(777u32, "late.exe".to_string());
+        let got = pid_to_name_with(&mut cache, 777, false, later, || {
+            calls += 1;
+            Ok(fresh.clone())
+        });
+        assert_eq!(got.as_deref(), Some("late.exe"));
+        assert_eq!(calls, 2, "跨过最小间隔必须真的重试一次");
     }
 }
