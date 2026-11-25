@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{Datelike, Local, NaiveDate};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::FocusFlowConfig;
 use crate::db::connection;
@@ -105,6 +105,10 @@ fn is_device_id_table(table: &str) -> bool {
 /// 回放、或旧版单库迁移而来），旧数据永远迁不走，而每次启动都会重复判定
 /// "有数据要归档"，空跑一次 ATTACH + 事务 + VACUUM。
 pub fn check_yearly_archive(yearly_archive_enabled: bool) {
+    // 先把上次「目标已提交、源库还没扣减」的归档收尾：标记落在目标库里，而常规归档
+    // 只从当年库出发，跨年后再也走不到那个目标年。这一步与开关无关 —— 已经提交的
+    // 那一半必须补完，否则源库和目标库各留一份、总计翻倍。
+    finish_all_pending_archive_batches();
     if !yearly_archive_enabled {
         return;
     }
@@ -249,6 +253,178 @@ pub fn archive_stale_years(source_year: i32) -> bool {
     migrated_any
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ArchiveBatch {
+    version: u32,
+    source_year: i32,
+    dk_from: i64,
+    dk_to: i64,
+    daily: Vec<(i64, i64, i64)>,
+    hourly: Vec<(i64, i64, i64)>,
+    keys: Vec<(i64, String, i64)>,
+    apps: Vec<(i64, String, i64)>,
+    devices: Vec<(i64, i64, i64)>,
+    device_keys: Vec<(i64, i64, String, i64)>,
+}
+
+impl ArchiveBatch {
+    fn key(&self) -> String {
+        format!(
+            "archive_batch_v1:{}:{}:{}",
+            self.source_year, self.dk_from, self.dk_to
+        )
+    }
+
+    fn row_count(&self) -> usize {
+        self.daily.len()
+            + self.hourly.len()
+            + self.keys.len()
+            + self.apps.len()
+            + self.devices.len()
+            + self.device_keys.len()
+    }
+}
+
+fn snapshot_archive_range(
+    conn: &Connection,
+    source_year: i32,
+    dk_from: i64,
+    dk_to: i64,
+) -> anyhow::Result<ArchiveBatch> {
+    conn.execute_batch("BEGIN;")?;
+    let read = || -> rusqlite::Result<ArchiveBatch> {
+        Ok(ArchiveBatch {
+            version: 1,
+            source_year,
+            dk_from,
+            dk_to,
+            daily: conn
+                .prepare("SELECT date_key, count, seconds FROM daily_counts WHERE date_key >= ?1 AND date_key < ?2")?
+                .query_map(rusqlite::params![dk_from, dk_to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            hourly: conn
+                .prepare("SELECT date_key, hour, count FROM hourly_counts WHERE date_key >= ?1 AND date_key < ?2")?
+                .query_map(rusqlite::params![dk_from, dk_to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            keys: conn
+                .prepare("SELECT date_key, key_name, count FROM key_counts WHERE date_key >= ?1 AND date_key < ?2")?
+                .query_map(rusqlite::params![dk_from, dk_to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            apps: conn
+                .prepare("SELECT date_key, app_name, seconds FROM app_usage WHERE date_key >= ?1 AND date_key < ?2")?
+                .query_map(rusqlite::params![dk_from, dk_to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            devices: conn
+                .prepare("SELECT date_key, device_id, count FROM device_counts WHERE date_key >= ?1 AND date_key < ?2")?
+                .query_map(rusqlite::params![dk_from, dk_to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            device_keys: conn
+                .prepare("SELECT date_key, device_id, key_name, count FROM device_key_counts WHERE date_key >= ?1 AND date_key < ?2")?
+                .query_map(rusqlite::params![dk_from, dk_to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        })
+    };
+    let result = read();
+    let end = if result.is_ok() {
+        "COMMIT;"
+    } else {
+        "ROLLBACK;"
+    };
+    conn.execute_batch(end)?;
+    result.map_err(Into::into)
+}
+
+fn read_archive_batch(conn: &Connection, key: &str) -> anyhow::Result<Option<ArchiveBatch>> {
+    let value: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+        .optional()?;
+    value
+        .map(|text| {
+            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("归档批次标记读不出来: {e}"))
+        })
+        .transpose()
+}
+
+fn write_archive_batch(conn: &Connection, batch: &ArchiveBatch) -> anyhow::Result<()> {
+    let json = serde_json::to_string(batch)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![batch.key(), json],
+    )?;
+    Ok(())
+}
+
+fn clear_archive_batch(conn: &Connection, batch: &ArchiveBatch) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM meta WHERE key=?1", [batch.key()])?;
+    Ok(())
+}
+
+fn reconcile_archive_source(source_path: &Path, batch: &ArchiveBatch) -> anyhow::Result<usize> {
+    let conn = connection::open_rw(source_path)?;
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> anyhow::Result<()> {
+        for (dk, count, seconds) in &batch.daily {
+            conn.execute(
+                "UPDATE daily_counts SET count=MAX(0, count-?1), seconds=MAX(0, seconds-?2) WHERE date_key=?3",
+                rusqlite::params![count, seconds, dk],
+            )?;
+            conn.execute(
+                "DELETE FROM daily_counts WHERE date_key=?1 AND count<=0",
+                [dk],
+            )?;
+        }
+        for (dk, hour, count) in &batch.hourly {
+            conn.execute(
+                "UPDATE hourly_counts SET count=MAX(0, count-?1) WHERE date_key=?2 AND hour=?3",
+                rusqlite::params![count, dk, hour],
+            )?;
+            conn.execute(
+                "DELETE FROM hourly_counts WHERE date_key=?1 AND hour=?2 AND count<=0",
+                rusqlite::params![dk, hour],
+            )?;
+        }
+        for (dk, key, count) in &batch.keys {
+            conn.execute(
+                "UPDATE key_counts SET count=MAX(0, count-?1) WHERE date_key=?2 AND key_name=?3",
+                rusqlite::params![count, dk, key],
+            )?;
+            conn.execute(
+                "DELETE FROM key_counts WHERE date_key=?1 AND key_name=?2 AND count<=0",
+                rusqlite::params![dk, key],
+            )?;
+        }
+        for (dk, app, seconds) in &batch.apps {
+            conn.execute(
+                "UPDATE app_usage SET seconds=MAX(0, seconds-?1) WHERE date_key=?2 AND app_name=?3",
+                rusqlite::params![seconds, dk, app],
+            )?;
+            conn.execute(
+                "DELETE FROM app_usage WHERE date_key=?1 AND app_name=?2 AND seconds<=0",
+                rusqlite::params![dk, app],
+            )?;
+        }
+        for (dk, device_id, count) in &batch.devices {
+            conn.execute("UPDATE device_counts SET count=MAX(0, count-?1) WHERE date_key=?2 AND device_id=?3", rusqlite::params![count, dk, device_id])?;
+            conn.execute(
+                "DELETE FROM device_counts WHERE date_key=?1 AND device_id=?2 AND count<=0",
+                rusqlite::params![dk, device_id],
+            )?;
+        }
+        for (dk, device_id, key, count) in &batch.device_keys {
+            conn.execute("UPDATE device_key_counts SET count=MAX(0, count-?1) WHERE date_key=?2 AND device_id=?3 AND key_name=?4", rusqlite::params![count, dk, device_id, key])?;
+            conn.execute("DELETE FROM device_key_counts WHERE date_key=?1 AND device_id=?2 AND key_name=?3 AND count<=0", rusqlite::params![dk, device_id, key])?;
+        }
+        Ok(())
+    })();
+    if result.is_ok() {
+        conn.execute_batch("COMMIT;")?;
+    } else {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    result?;
+    Ok(batch.row_count())
+}
+
 /// 将 `source_year` 库中 `[dk_from, dk_to)` 的数据迁移到 `target_year` 库。
 ///
 /// 目标库可能已存在同 date_key（历史遗留、跨年误写），因此用 UPSERT 合并计数，
@@ -299,7 +475,43 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
     }
 
     // 2-4. ATTACH 迁移：任一步失败即回滚，杜绝"源库已删、目标库未写"
+    let batch_key = format!("archive_batch_v1:{source_year}:{dk_from}:{dk_to}");
+    let pending = match connection::open_rw(&target_path)
+        .and_then(|conn| read_archive_batch(&conn, &batch_key))
+    {
+        Ok(pending) => pending,
+        Err(e) => {
+            tracing::error!("年度归档中止：读目标库批次标记失败: {e}");
+            return false;
+        }
+    };
+    let has_pending = pending.is_some();
+    let batch = if let Some(batch) = pending {
+        if batch.version != 1
+            || batch.source_year != source_year
+            || batch.dk_from != dk_from
+            || batch.dk_to != dk_to
+        {
+            tracing::error!("年度归档中止：目标库里的批次标记与本次范围不一致");
+            return false;
+        }
+        batch
+    } else {
+        let snapshot = connection::open_ro(&source_path)
+            .and_then(|conn| snapshot_archive_range(&conn, source_year, dk_from, dk_to));
+        match snapshot {
+            Ok(batch) => batch,
+            Err(e) => {
+                tracing::error!("年度归档中止：源库范围快照失败: {e}");
+                return false;
+            }
+        }
+    };
+
     let result = (|| -> anyhow::Result<usize> {
+        if has_pending {
+            return Ok(batch.row_count());
+        }
         let source_str = source_path.to_str().ok_or_else(|| {
             anyhow::anyhow!("源库路径包含非 UTF-8 字符: {}", source_path.display())
         })?;
@@ -315,7 +527,6 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
         // 所以这条目前只是"锁型不对"，不是已经在丢数据。
         conn.execute("BEGIN IMMEDIATE;", [])?;
         let migrate: anyhow::Result<usize> = (|| {
-            let mut moved = 0usize;
             // 设备字典先同步 + 建 id 映射（明细表跨库搬 id 必须换算）
             sync_device_dict(&conn, dk_from, dk_to, source_year)?;
             for table in DATA_TABLES {
@@ -347,24 +558,15 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
                     ),
                     rusqlite::params![dk_from, dk_to],
                 )?;
-                let deleted = conn.execute(
-                    &format!("DELETE FROM source.{table} WHERE date_key >= ?1 AND date_key < ?2"),
-                    rusqlite::params![dk_from, dk_to],
-                )?;
-                moved += deleted;
             }
-            moved += move_device_rows(&conn, dk_from, dk_to)?;
-            Ok(moved)
+            move_device_rows(&conn, dk_from, dk_to)?;
+            write_archive_batch(&conn, &batch)?;
+            Ok(batch.row_count())
         })();
         match migrate {
             Ok(moved) => {
                 conn.execute("COMMIT;", [])?;
-                // DETACH 是**提交之后**的收尾，它失败不能把已经做成的归档说成失败：
-                // 上层 `archive_stale_years` 拿到 false 会连带跳过 `mark_expected_year_shrink()`，
-                // 下一次备份就拿归档**前**的基线比总量 ⇒ 一句假"骤降" + 轮转被冻结
-                // （旧备份从此不再回收），而日志说的是"年度归档失败"——
-                // 数据其实已经在上面那个 COMMIT 里搬过去了（源库那些行就是同一条事务删掉的）。
-                // 与本文件"提交后的清理只出声"那条（`vacuum_path` 的 last_vacuum 那一处）同形状。
+                // 目标数据与批次标记先一起提交；源库清理是独立的第二步。
                 if let Err(e) = conn.execute("DETACH DATABASE source", []) {
                     tracing::warn!(
                         "年度归档已提交，只是没能脱离源库（{e}）：不重做归档，连接释放时自然会脱离"
@@ -380,20 +582,29 @@ pub fn archive_year_range(target_year: i32, source_year: i32, dk_from: i64, dk_t
         }
     })();
 
-    match result {
-        Ok(0) => false,
-        Ok(moved) => {
-            tracing::info!(
-                "归档完成：{target_year} 年 {moved} 行已迁移到 {}（源 {source_year} 年库）",
-                target_path.display()
-            );
-            true
-        }
-        Err(e) => {
-            tracing::error!("年度归档失败（{target_year} 年 <- {source_year} 年库）: {e}");
-            false
-        }
+    if let Err(e) = result {
+        tracing::error!("年度归档失败（{target_year} 年 <- {source_year} 年库）: {e}");
+        return false;
     }
+    let moved = match reconcile_archive_source(&source_path, &batch) {
+        Ok(moved) => moved,
+        Err(e) => {
+            tracing::error!(
+                "年度归档目标已提交，但源库清理失败（{target_year} 年 <- {source_year} 年库）: {e}；批次标记保留，下次只清理源库"
+            );
+            return false;
+        }
+    };
+    if let Err(e) =
+        connection::open_rw(&target_path).and_then(|conn| clear_archive_batch(&conn, &batch))
+    {
+        tracing::warn!("年度归档源库已清理，但目标库批次标记没删掉（{e}）：下次会幂等重试");
+    }
+    tracing::info!(
+        "归档完成：{target_year} 年 {moved} 行已迁移到 {}（源 {source_year} 年库）",
+        target_path.display()
+    );
+    true
 }
 
 /// 归档前把源库的设备字典同步进目标库，并建立「源 id → 目标 id」映射。
@@ -466,7 +677,7 @@ fn move_device_rows(conn: &Connection, dk_from: i64, dk_to: i64) -> anyhow::Resu
         } else {
             ", c.key_name"
         };
-        conn.execute(
+        moved += conn.execute(
             &format!(
                 "INSERT INTO {table} ({pk_cols}, count) \
                  SELECT c.date_key, m.dst_id{key_expr}, c.count FROM source.{table} c \
@@ -475,10 +686,6 @@ fn move_device_rows(conn: &Connection, dk_from: i64, dk_to: i64) -> anyhow::Resu
                  ON CONFLICT({pk_cols}) DO UPDATE SET count = \
                     {table}.count + excluded.count"
             ),
-            rusqlite::params![dk_from, dk_to],
-        )?;
-        moved += conn.execute(
-            &format!("DELETE FROM source.{table} WHERE date_key >= ?1 AND date_key < ?2"),
             rusqlite::params![dk_from, dk_to],
         )?;
     }
@@ -3168,6 +3375,84 @@ fn rotate_backups(policy: RetentionPolicy, freeze: bool) {
     }
 }
 
+fn finish_pending_archive_batches(target_year: i32) -> anyhow::Result<()> {
+    let target_path = paths::year_db_path(target_year);
+    let conn = connection::open_rw(&target_path)?;
+    let has_meta: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !has_meta {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare("SELECT value FROM meta WHERE key GLOB 'archive_batch_v1:*'")?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for text in rows {
+        let batch: ArchiveBatch = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("{target_year} 年库的归档批次标记读不出来: {e}"))?;
+        if batch.version != 1 {
+            anyhow::bail!(
+                "{target_year} 年库里的归档批次标记是认不出的版本 {}：不动源库",
+                batch.version
+            );
+        }
+        let source_path = paths::year_db_path(batch.source_year);
+        let mut reconciled = false;
+        match crate::data_location::probe_open(&source_path) {
+            connection::Presence::No => {}
+            connection::Presence::Yes => {
+                reconcile_archive_source(&source_path, &batch)?;
+                reconciled = true;
+            }
+            connection::Presence::Unreadable(reason) => {
+                anyhow::bail!("归档源库 {} 问不出在不在: {reason}", source_path.display());
+            }
+        }
+        if reconciled && batch.source_year == Local::now().year() {
+            // 这一减就是"当年库主动缩减"：即便上次崩溃前已经减过（那一轮没来得及走到
+            // 缩减标记），下一次备份也不能拿缩减前的快照当基线，否则必然报一次假骤降。
+            mark_expected_year_shrink();
+        }
+        clear_archive_batch(&conn, &batch)?;
+    }
+    Ok(())
+}
+
+/// 启动时把每个年度库里残留的归档批次标记载下并收尾。
+///
+/// 标记跟着**目标库**走，而常规归档只看当年库：崩溃若把源库留在了上一年的文件里，
+/// 下一次启动时当年库里已经没有那批往年行，`archive_stale_years` 不会再去碰那个
+/// 目标年 —— 那批数据就同时留在两个库里，总计翻倍且再也不会有一次日志提到它。
+/// 所以这里不看年份关系，逐个年度库文件问一次。数据目录读不出来时不猜，出声跳过。
+fn finish_all_pending_archive_batches() {
+    let dir = paths::data_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::error!(
+                "未完成的归档批次没收尾：数据目录读不出来（{}）: {e} —— 本轮没有清理任何源库",
+                dir.display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let Some(year) = paths::is_year_db_file(&entry.path()) else {
+            continue;
+        };
+        if let Err(e) = finish_pending_archive_batches(year) {
+            tracing::error!("{year} 年库有未完成的归档批次，本轮没收尾: {e}");
+        }
+    }
+}
+
 /// 清空所有年度库的统计表（键鼠计数/小时分布/按键明细/活跃时长/前台应用）。
 /// 不可逆操作：执行前先做一次全量备份。备份没兜住**不阻断**操作（口径不变：这是用户
 /// 主动发起的），但结局会放进 `report.snapshot_warning` —— 只在日志里高亮过一次不算说过。
@@ -3196,6 +3481,11 @@ pub fn reset_all_data() -> MaintenanceReport {
                 continue;
             }
         };
+        if let Err(e) = finish_pending_archive_batches(year) {
+            tracing::error!("{year} 年库有未完成的归档批次，本年度未清空: {e}");
+            report.failed_years.push(year);
+            continue;
+        }
         if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
             tracing::error!("{year} 年库拿不到写锁，本年度未清空: {e}");
             report.failed_years.push(year);
@@ -5240,6 +5530,283 @@ mod tests {
     ///
     /// 回归：旧实现裸 INSERT，主键冲突会让整个归档事务回滚，
     /// 归档从此永久失败、旧数据一直留在错误的文件里。
+    #[test]
+    fn a_committed_archive_batch_is_reconciled_without_double_counting() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("archive_crash_retry");
+        let source_year = 2025;
+        let target_year = 2024;
+        let from = queries::day_key_of_date(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
+        let to = queries::day_key_of_date(NaiveDate::from_ymd_opt(2025, 1, 1).unwrap());
+        let source_path = paths::year_db_path(source_year);
+        let target_path = paths::year_db_path(target_year);
+        {
+            let conn = connection::open_rw(&source_path).unwrap();
+            connection::ensure_schema(&conn, source_year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts(date_key, count) VALUES (?1, 7)",
+                [from],
+            )
+            .unwrap();
+        }
+        {
+            let conn = connection::open_rw(&target_path).unwrap();
+            connection::ensure_schema(&conn, target_year).unwrap();
+        }
+        let batch = snapshot_archive_range(
+            &connection::open_ro(&source_path).unwrap(),
+            source_year,
+            from,
+            to,
+        )
+        .unwrap();
+
+        // 模拟目标库已提交、进程在源库 DELETE 前崩溃。
+        {
+            let conn = connection::open_rw(&target_path).unwrap();
+            conn.execute(
+                "ATTACH DATABASE ?1 AS source",
+                [source_path.to_str().unwrap()],
+            )
+            .unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts(date_key, count) SELECT date_key, count FROM source.daily_counts \
+                 WHERE date_key >= ?1 AND date_key < ?2",
+                rusqlite::params![from, to],
+            )
+            .unwrap();
+            write_archive_batch(&conn, &batch).unwrap();
+            conn.execute_batch("COMMIT; DETACH DATABASE source;")
+                .unwrap();
+        }
+        // 崩溃后又追加了 3 条：重试只能扣掉已归档的 7 条，不能把新增的一起删掉。
+        {
+            let conn = connection::open_rw(&source_path).unwrap();
+            conn.execute(
+                "UPDATE daily_counts SET count=count+3 WHERE date_key=?1",
+                [from],
+            )
+            .unwrap();
+        }
+        assert!(archive_year_range(target_year, source_year, from, to));
+        let target_count: i64 = connection::open_ro(&target_path)
+            .unwrap()
+            .query_row(
+                "SELECT count FROM daily_counts WHERE date_key=?1",
+                [from],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let source_count: i64 = connection::open_ro(&source_path)
+            .unwrap()
+            .query_row(
+                "SELECT count FROM daily_counts WHERE date_key=?1",
+                [from],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_count, 7, "重试不能把旧批次再加一遍");
+        assert_eq!(source_count, 3, "新增数据必须留在源库等下一批");
+
+        assert!(archive_year_range(target_year, source_year, from, to));
+        let target_count: i64 = connection::open_ro(&target_path)
+            .unwrap()
+            .query_row(
+                "SELECT count FROM daily_counts WHERE date_key=?1",
+                [from],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_count, 10, "下一批只应追加剩下的 3 条");
+        assert!(!range_has_rows(&connection::open_ro(&source_path).unwrap(), from, to).unwrap());
+    }
+
+    #[test]
+    fn reset_finishes_a_pending_archive_batch_before_clearing_it() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("archive_reset_retry");
+        let source_year = 2025;
+        let target_year = 2024;
+        let from = queries::day_key_of_date(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
+        let to = queries::day_key_of_date(NaiveDate::from_ymd_opt(2025, 1, 1).unwrap());
+        let source_path = paths::year_db_path(source_year);
+        let target_path = paths::year_db_path(target_year);
+        {
+            let conn = connection::open_rw(&source_path).unwrap();
+            connection::ensure_schema(&conn, source_year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts(date_key, count) VALUES (?1, 7)",
+                [from],
+            )
+            .unwrap();
+        }
+        {
+            let conn = connection::open_rw(&target_path).unwrap();
+            connection::ensure_schema(&conn, target_year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts(date_key, count) VALUES (?1, 7)",
+                [from],
+            )
+            .unwrap();
+        }
+        let batch = snapshot_archive_range(
+            &connection::open_ro(&source_path).unwrap(),
+            source_year,
+            from,
+            to,
+        )
+        .unwrap();
+        write_archive_batch(&connection::open_rw(&target_path).unwrap(), &batch).unwrap();
+
+        assert!(!reset_all_data().incomplete());
+        assert!(!range_has_rows(&connection::open_ro(&source_path).unwrap(), from, to).unwrap());
+        assert!(!range_has_rows(&connection::open_rw(&target_path).unwrap(), from, to).unwrap());
+        assert!(
+            read_archive_batch(&connection::open_rw(&target_path).unwrap(), &batch.key())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// 造一份「目标库已提交、源库还没扣减」的现场：源库一行 `(count, seconds)`，
+    /// 目标库已经含这批数据、且带着同一份批次标记（＝进程在源库清理前崩掉）。
+    fn stage_committed_archive(
+        source_year: i32,
+        target_year: i32,
+        from: i64,
+        to: i64,
+        row: (i64, i64),
+    ) -> ArchiveBatch {
+        let source_path = paths::year_db_path(source_year);
+        let target_path = paths::year_db_path(target_year);
+        {
+            let conn = connection::open_rw(&source_path).unwrap();
+            connection::ensure_schema(&conn, source_year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts(date_key, count, seconds) VALUES (?1, ?2, ?3)",
+                rusqlite::params![from, row.0, row.1],
+            )
+            .unwrap();
+        }
+        {
+            let conn = connection::open_rw(&target_path).unwrap();
+            connection::ensure_schema(&conn, target_year).unwrap();
+        }
+        let batch = snapshot_archive_range(
+            &connection::open_ro(&source_path).unwrap(),
+            source_year,
+            from,
+            to,
+        )
+        .unwrap();
+        {
+            let conn = connection::open_rw(&target_path).unwrap();
+            conn.execute(
+                "ATTACH DATABASE ?1 AS source",
+                [source_path.to_str().unwrap()],
+            )
+            .unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts(date_key, count, seconds) \
+                 SELECT date_key, count, seconds FROM source.daily_counts \
+                  WHERE date_key >= ?1 AND date_key < ?2",
+                rusqlite::params![from, to],
+            )
+            .unwrap();
+            write_archive_batch(&conn, &batch).unwrap();
+            conn.execute_batch("COMMIT; DETACH DATABASE source;")
+                .unwrap();
+        }
+        batch
+    }
+
+    /// 崩溃留下的批次标记要在启动时收尾，哪怕源库已经不是"当年库"、常规归档再也走不到它。
+    ///
+    /// 跨年重启正是最难看见的那种：标记在 2024 年库里，源数据留在 2025 年库里，
+    /// 而启动时的归档只从当年库出发 —— 不收尾就等于两个库各留一份、总计翻倍。
+    #[test]
+    fn startup_sweep_finishes_a_pending_batch_whose_source_year_is_already_past() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("archive_startup_sweep");
+        let source_year = 2025;
+        let target_year = 2024;
+        let from = queries::day_key_of_date(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
+        let to = queries::day_key_of_date(NaiveDate::from_ymd_opt(2025, 1, 1).unwrap());
+        let batch = stage_committed_archive(source_year, target_year, from, to, (7, 700));
+
+        // 归档开关关着也别跳过：这一半已经提交进目标库了，必须补完。
+        check_yearly_archive(false);
+
+        let source_path = paths::year_db_path(source_year);
+        let target_path = paths::year_db_path(target_year);
+        assert!(!range_has_rows(&connection::open_ro(&source_path).unwrap(), from, to).unwrap());
+        assert!(
+            read_archive_batch(&connection::open_rw(&target_path).unwrap(), &batch.key())
+                .unwrap()
+                .is_none(),
+            "收尾之后标记要删掉，不然每次启动都重做一遍"
+        );
+        let kept: i64 = connection::open_ro(&target_path)
+            .unwrap()
+            .query_row(
+                "SELECT count FROM daily_counts WHERE date_key=?1",
+                [from],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 7, "目标库那份是已经提交的，收尾不能连它一起清");
+    }
+
+    /// 对账要扣掉**已归档的那一份**（count 与 seconds 一起），并盖缩减标记。
+    ///
+    /// 快照之后同一 date_key 还会继续增长（跨年那几小时里写线程照常记账），
+    /// 只按 count 扣会把这批数据的活跃时长留在源库里，两边各算一遍。
+    #[test]
+    fn finishing_a_pending_batch_subtracts_the_archived_seconds_and_marks_the_shrink() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("archive_sweep_partial");
+        let source_year = Local::now().year();
+        let target_year = source_year - 1;
+        let from = queries::day_key_of_date(NaiveDate::from_ymd_opt(target_year, 1, 1).unwrap());
+        let to = queries::day_key_of_date(NaiveDate::from_ymd_opt(source_year, 1, 1).unwrap());
+        let batch = stage_committed_archive(source_year, target_year, from, to, (7, 700));
+        connection::open_rw(&paths::year_db_path(source_year))
+            .unwrap()
+            .execute(
+                "UPDATE daily_counts SET count=count+3, seconds=seconds+300 WHERE date_key=?1",
+                [from],
+            )
+            .unwrap();
+
+        check_yearly_archive(false);
+
+        let (count, seconds): (i64, i64) = connection::open_ro(&paths::year_db_path(source_year))
+            .unwrap()
+            .query_row(
+                "SELECT count, seconds FROM daily_counts WHERE date_key=?1",
+                [from],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (count, seconds),
+            (3, 300),
+            "对账只该扣走已归档的那一份，count 与 seconds 都要扣"
+        );
+        assert!(
+            expected_shrink_marker().exists(),
+            "当年库被扣减后要盖缩减标记，否则下一次备份报假骤降并冻结轮转"
+        );
+        assert!(read_archive_batch(
+            &connection::open_rw(&paths::year_db_path(target_year)).unwrap(),
+            &batch.key()
+        )
+        .unwrap()
+        .is_none());
+    }
+
     #[test]
     fn archive_merges_into_existing_target_rows() {
         let _lock = crate::paths::test_app_dir_lock();
