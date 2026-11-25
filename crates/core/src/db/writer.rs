@@ -632,15 +632,24 @@ impl DbWriter {
     /// 落库之后今日那项会被清空、库里同时长出同一批 → 加上它不会重复计数。
     pub fn today_pending_count(&self) -> i64 {
         let dk = queries::day_key_of_date(chrono::Local::now().date_naive());
-        self.state
-            .agg
+        // 锁序与写线程一致：agg → in_flight。
+        let agg = self.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = agg.daily.get(&dk).copied().unwrap_or(0);
+        // 落库管道里的那一批已经从 `agg` 取走、结果还没出来（SQLite IO 在锁外跑，
+        // 库忙时最长要等 busy_timeout 那一截）。只读 `agg` 的话，每次 flush 期间
+        // 这个数都会掉成 0 而库里还没长出同一批 —— 统计线程拿它补「近 N 天」，
+        // 屏上那几张卡片就会在每 10 秒一次的落库窗口里少一截再弹回。
+        pending += self
+            .state
+            .in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .daily
             .get(&dk)
             .copied()
-            .unwrap_or(0)
-            .max(0)
+            .unwrap_or(0);
+        drop(agg);
+        pending.max(0)
     }
 
     /// 重新统计「今日按键数 + 今日活跃时长」这两个内存缓存。
@@ -3290,6 +3299,27 @@ mod tests {
             0,
             "落库之后必须归零 —— 否则统计线程把同一批加两遍"
         );
+
+        // 落库管道里那一批（已从 agg 取走、SQLite 还没提交）同样算"尚未落库"。
+        // 只读 agg 的旧写法会在每次 flush 期间把这个数掉成 0，而库里还没长出同一批，
+        // 统计线程补出来的「近 N 天」就少一截再弹回。
+        let taken = {
+            w.record("B", t0 + 100);
+            let mut agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+            agg.take_for_flush()
+        };
+        *w.state.in_flight.lock().unwrap_or_else(|e| e.into_inner()) = taken;
+        w.state.in_flight_settled.store(false, Ordering::Release);
+        assert_eq!(
+            w.today_pending_count(),
+            1,
+            "在途批次还没落库，必须仍算作今日增量"
+        );
+        // 模拟落库成功后的收尾（与 flush_pending 同一形状）：在途作废，读数归零。
+        *w.state.in_flight.lock().unwrap_or_else(|e| e.into_inner()) = AggDeltas::default();
+        w.state.in_flight_settled.store(true, Ordering::Release);
+        assert_eq!(w.today_pending_count(), 0, "在途落成之后不许再算一遍");
+
         w.stop_and_wait();
     }
 
