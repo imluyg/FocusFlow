@@ -125,6 +125,7 @@ enum Load {
 }
 
 /// 一个插件的内存态。
+#[derive(Clone)]
 struct Cell {
     load: Load,
     data: BTreeMap<String, Value>,
@@ -141,6 +142,49 @@ impl Cell {
             data: BTreeMap::new(),
             dirty: false,
             last_error: None,
+        }
+    }
+}
+
+pub(crate) struct StoreSnapshot {
+    path: PathBuf,
+    cell: Cell,
+    disk: Option<Vec<u8>>,
+}
+
+pub(crate) fn snapshot_for_load(stem: &str) -> Result<StoreSnapshot, String> {
+    let path = state_file(stem).ok_or_else(|| unsafe_stem_reason(stem))?;
+    let cell = cell_for(&path);
+    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_loaded(&mut guard, &path)?;
+    let disk = match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{} 读不出来：{e}", path.display())),
+    };
+    Ok(StoreSnapshot {
+        path,
+        cell: guard.clone(),
+        disk,
+    })
+}
+
+impl StoreSnapshot {
+    pub(crate) fn rollback(self) -> Result<(), String> {
+        let cell = cell_for(&self.path);
+        let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = self.cell;
+        if let Some(bytes) = self.disk {
+            let text = String::from_utf8(bytes)
+                .map_err(|e| format!("{} 的旧内容不是 UTF-8：{e}", self.path.display()))?;
+            crate::config::atomic_write(&self.path, &text)
+                .map_err(|e| format!("恢复 {} 失败：{e}", self.path.display()))
+        } else {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("删掉本次新建的 {} 失败：{e}", self.path.display())),
+            }
         }
     }
 }

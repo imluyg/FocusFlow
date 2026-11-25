@@ -134,9 +134,18 @@ static CAPTURE_NOTICE: std::sync::Mutex<CaptureNotice> = std::sync::Mutex::new(C
     issue: None,
 });
 static CAPTURE_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static CAPTURE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn next_capture_order() -> u64 {
     CAPTURE_ORDER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn current_capture_generation() -> u64 {
+    CAPTURE_GENERATION.load(Ordering::Acquire)
+}
+
+fn advance_capture_generation() {
+    CAPTURE_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 fn update_capture_notice(order: u64, issue: Option<String>) {
@@ -265,7 +274,6 @@ pub fn init_db() -> anyhow::Result<()> {
             width      INTEGER NOT NULL DEFAULT 0,
             height     INTEGER NOT NULL DEFAULT 0
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_clip_hash ON clipboard_items(hash);
         CREATE INDEX IF NOT EXISTS idx_clip_copied ON clipboard_items(pinned DESC, copied_at DESC);
         CREATE TABLE IF NOT EXISTS clipboard_daily (
             day        TEXT    NOT NULL,
@@ -282,6 +290,7 @@ pub fn init_db() -> anyhow::Result<()> {
         );",
     )?;
     ensure_item_columns(&conn)?;
+    ensure_kind_hash_index(&conn)?;
     sweep_orphan_images(&conn);
     Ok(())
 }
@@ -318,6 +327,15 @@ fn ensure_item_columns(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn ensure_kind_hash_index(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_clip_hash;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_clip_hash_kind
+         ON clipboard_items(kind, hash);",
+    )
+    .map_err(|e| anyhow::anyhow!("剪贴板迁移：按类型去重索引失败：{e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +576,7 @@ pub struct ClipStats {
 pub enum SkipReason {
     Empty,
     TooLarge,
+    Cleared,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,8 +637,8 @@ fn insert_or_touch(new: NewItem<'_>) -> Result<IngestOutcome, String> {
         .map_err(|e| format!("剪贴板库事务开不起来：{e}"))?;
     let existing: Option<i64> = tx
         .query_row(
-            "SELECT id FROM clipboard_items WHERE hash=?1",
-            [new.hash],
+            "SELECT id FROM clipboard_items WHERE kind=?1 AND hash=?2",
+            rusqlite::params![new.kind.as_str(), new.hash],
             |r| r.get(0),
         )
         .optional()
@@ -1080,7 +1099,9 @@ pub fn clear_unpinned() -> Result<usize, String> {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| format!("清空剪贴板历史失败：{e}"))?
     };
-    delete_rows_cleaning_files(&conn, &ids)
+    let deleted = delete_rows_cleaning_files(&conn, &ids)?;
+    advance_capture_generation();
+    Ok(deleted)
 }
 
 // ---------------------------------------------------------------------------
@@ -1611,11 +1632,13 @@ pub fn dib_to_rgba(dib: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     if bpp != 24 && bpp != 32 {
         return Err(format!("不支持的 DIB 位深（{bpp} bpp）"));
     }
+    let stride = (w as usize * (bpp as usize / 8)).div_ceil(4) * 4;
+    let pixel_bytes = stride * h as usize;
     // BI_RGB(0) 是直接通道顺序；BI_BITFIELDS(3) 把红绿蓝掩码放在头后面
     //（40 字节的老头紧跟着 12 字节掩码；V4/V5 头则已经含在头里）。
     // .NET 的 `Clipboard.SetImage` 交的就是后者，不认它等于"从 WinForms 应用复制图片收不到"。
-    let masks: Option<(u32, u32, u32)> = match compression {
-        0 => None,
+    let (masks, mask_bytes): (Option<(u32, u32, u32, u32)>, usize) = match compression {
+        0 => (None, 0),
         3 => {
             if bpp != 32 {
                 return Err(format!("BI_BITFIELDS 只支持 32 bpp，这份是 {bpp}"));
@@ -1634,18 +1657,20 @@ pub fn dib_to_rgba(dib: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
             if rm == 0 || gm == 0 || bm == 0 {
                 return Err(format!("DIB 通道掩码不可用（{rm:#x}/{gm:#x}/{bm:#x}）"));
             }
-            Some((rm, gm, bm))
+            let alpha_off = m_off + 12;
+            let (am, extra) = if header_size >= 56 {
+                (rd_u32(alpha_off), 0)
+            } else if dib.len() >= alpha_off + 4 + pixel_bytes {
+                (rd_u32(alpha_off), 4)
+            } else {
+                (0, 0)
+            };
+            let rgb_bytes = if header_size < 52 { 12 } else { 0 };
+            (Some((rm, gm, bm, am)), rgb_bytes + extra)
         }
         other => return Err(format!("不支持的 DIB 压缩方式（{other}）")),
     };
-    // 掩码在 40 字节老头里是"紧跟其后"的 12 字节，要算进像素起点。
-    let mask_bytes = if masks.is_some() && header_size < 52 {
-        12
-    } else {
-        0
-    };
     let pixel_at = at + header_size + mask_bytes + clr_used * 4;
-    let stride = (w as usize * (bpp as usize / 8)).div_ceil(4) * 4;
     let need = pixel_at + stride * h as usize;
     if need > dib.len() {
         return Err(format!(
@@ -1663,7 +1688,7 @@ pub fn dib_to_rgba(dib: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
         for x in 0..w as usize {
             let d = &mut dst[x * 4..x * 4 + 4];
             match masks {
-                Some((rm, gm, bm)) => {
+                Some((rm, gm, bm, am)) => {
                     let px = u32::from_le_bytes(
                         row[x * 4..x * 4 + 4]
                             .try_into()
@@ -1672,7 +1697,7 @@ pub fn dib_to_rgba(dib: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
                     d[0] = channel8(px, rm);
                     d[1] = channel8(px, gm);
                     d[2] = channel8(px, bm);
-                    d[3] = 255;
+                    d[3] = if am == 0 { 255 } else { channel8(px, am) };
                 }
                 None => {
                     let s = &row[x * (bpp as usize / 8)..];
@@ -2222,29 +2247,36 @@ mod win {
             source_app: String,
             copied_at_ms: i64,
             capture_order: u64,
+            capture_generation: u64,
         },
         Image {
             stored: super::StoredImage,
             source_app: String,
             copied_at_ms: i64,
             capture_order: u64,
+            capture_generation: u64,
         },
         Files {
             paths: Vec<String>,
             source_app: String,
             copied_at_ms: i64,
             capture_order: u64,
+            capture_generation: u64,
         },
     }
 
     impl Captured {
         pub fn ingest(&self) -> Result<super::IngestOutcome, String> {
+            if self.capture_generation() != super::current_capture_generation() {
+                return Ok(super::IngestOutcome::Skipped(super::SkipReason::Cleared));
+            }
             let (order, outcome) = match self {
                 Self::Text {
                     text,
                     source_app,
                     copied_at_ms,
                     capture_order,
+                    ..
                 } => (
                     *capture_order,
                     super::ingest(text, source_app, *copied_at_ms),
@@ -2254,6 +2286,7 @@ mod win {
                     source_app,
                     copied_at_ms,
                     capture_order,
+                    ..
                 } => (
                     *capture_order,
                     super::ingest_image(stored, source_app, *copied_at_ms),
@@ -2263,6 +2296,7 @@ mod win {
                     source_app,
                     copied_at_ms,
                     capture_order,
+                    ..
                 } => (
                     *capture_order,
                     super::ingest_files(paths, source_app, *copied_at_ms),
@@ -2276,6 +2310,20 @@ mod win {
                 Ok(super::IngestOutcome::Skipped(_)) => {}
             }
             outcome
+        }
+
+        pub fn capture_generation(&self) -> u64 {
+            match self {
+                Captured::Text {
+                    capture_generation, ..
+                }
+                | Captured::Image {
+                    capture_generation, ..
+                }
+                | Captured::Files {
+                    capture_generation, ..
+                } => *capture_generation,
+            }
         }
 
         pub fn source_app(&self) -> &str {
@@ -2540,6 +2588,8 @@ mod win {
             return;
         }
 
+        // 代次必须在读剪贴板之前取：清空发生在解码/落盘期间时，这件仍按旧代次处理。
+        let capture_generation = super::current_capture_generation();
         let read = unsafe { read_locked() };
         let _ = unsafe { CloseClipboard() };
         let Some((raw, owner_hwnd)) = read else {
@@ -2585,6 +2635,7 @@ mod win {
                     source_app,
                     copied_at_ms: now_ms(),
                     capture_order: super::next_capture_order(),
+                    capture_generation,
                 });
             }
             RawClip::TextTooLarge { units } => {
@@ -2622,6 +2673,7 @@ mod win {
                     source_app,
                     copied_at_ms: now_ms(),
                     capture_order: super::next_capture_order(),
+                    capture_generation,
                 });
             }
             RawClip::Files(paths) => {
@@ -2645,6 +2697,7 @@ mod win {
                     source_app,
                     copied_at_ms: now_ms(),
                     capture_order: super::next_capture_order(),
+                    capture_generation,
                 });
             }
         }
@@ -3343,6 +3396,7 @@ mod tests {
             source_app: "fixture.exe".to_string(),
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
+            capture_generation: current_capture_generation(),
         };
         assert!(captured
             .ingest()
@@ -3367,6 +3421,71 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn clearing_history_discards_queued_items_from_the_previous_generation() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("clip_clear_generation");
+        init_db().unwrap();
+        let old = Captured::Text {
+            text: "copied before clear".to_string(),
+            source_app: "fixture.exe".to_string(),
+            copied_at_ms: now_ms(),
+            capture_order: next_capture_order(),
+            capture_generation: current_capture_generation(),
+        };
+        assert_eq!(clear_unpinned().unwrap(), 0);
+        assert!(matches!(
+            old.ingest().unwrap(),
+            IngestOutcome::Skipped(SkipReason::Cleared)
+        ));
+        assert!(list_recent(10).unwrap().is_empty(), "清空前的旧件不能复活");
+
+        let fresh = Captured::Text {
+            text: "copied after clear".to_string(),
+            source_app: "fixture.exe".to_string(),
+            copied_at_ms: now_ms(),
+            capture_order: next_capture_order(),
+            capture_generation: current_capture_generation(),
+        };
+        assert!(matches!(
+            fresh.ingest().unwrap(),
+            IngestOutcome::Stored { .. }
+        ));
+        assert_eq!(list_recent(10).unwrap().len(), 1, "清空后的新件仍要入库");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_clear_does_not_discard_queued_items() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("clip_clear_generation_failed");
+        init_db().unwrap();
+        assert!(matches!(
+            ingest("seed", "fixture", now_ms()).unwrap(),
+            IngestOutcome::Stored { .. }
+        ));
+        let queued = Captured::Text {
+            text: "still valid".to_string(),
+            source_app: "fixture.exe".to_string(),
+            copied_at_ms: now_ms(),
+            capture_order: next_capture_order(),
+            capture_generation: current_capture_generation(),
+        };
+        let conn = open().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_clear BEFORE DELETE ON clipboard_items BEGIN SELECT RAISE(ABORT, 'fixture-clear-denied'); END;",
+        )
+        .unwrap();
+        assert!(clear_unpinned().is_err(), "夹具前提：清空必须失败");
+        conn.execute_batch("DROP TRIGGER reject_clear;").unwrap();
+        assert!(matches!(
+            queued.ingest().unwrap(),
+            IngestOutcome::Stored { .. }
+        ));
+        assert_eq!(list_recent(10).unwrap().len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn queued_ingest_cannot_replace_a_newer_capture_issue() {
         let _lock = crate::paths::test_app_dir_lock();
         let _dir = crate::paths::test_app_dir("clip_notice_order");
@@ -3376,6 +3495,7 @@ mod tests {
             source_app: "fixture.exe".to_string(),
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
+            capture_generation: current_capture_generation(),
         };
         let old_success = make("queued success");
         let old_failure = make("queued failure");
@@ -3507,6 +3627,31 @@ mod tests {
         dib.extend_from_slice(&[0x10, 0x20, 0x30, 0x00]);
         let (rgba, _, _) = dib_to_rgba(&dib).unwrap();
         assert_eq!(rgba, vec![0x30, 0x20, 0x10, 255]);
+    }
+
+    #[test]
+    fn dib_bitfields_alpha_mask_preserves_transparent_pixels() {
+        for header_size in [40u32, 108] {
+            for alpha in [0u8, 128] {
+                let mut dib = dib_header(1, 1, 32, 3);
+                dib[0..4].copy_from_slice(&header_size.to_le_bytes());
+                dib.resize(
+                    if header_size > 40 {
+                        header_size as usize
+                    } else {
+                        56
+                    },
+                    0,
+                );
+                dib[40..44].copy_from_slice(&0x00FF_0000u32.to_le_bytes());
+                dib[44..48].copy_from_slice(&0x0000_FF00u32.to_le_bytes());
+                dib[48..52].copy_from_slice(&0x0000_00FFu32.to_le_bytes());
+                dib[52..56].copy_from_slice(&0xFF00_0000u32.to_le_bytes());
+                dib.extend_from_slice(&[0x10, 0x20, 0x30, alpha]);
+                let (rgba, _, _) = dib_to_rgba(&dib).unwrap();
+                assert_eq!(rgba, vec![0x30, 0x20, 0x10, alpha]);
+            }
+        }
     }
 
     #[test]
@@ -3739,6 +3884,46 @@ mod tests {
         assert_eq!(gone.len(), 2);
     }
 
+    #[test]
+    fn identical_bytes_in_text_and_file_rows_do_not_dedup_across_types() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("clip_kind_dedup");
+        init_db().unwrap();
+
+        for paths in [
+            vec!["C:\\same.txt".to_string()],
+            vec!["D:\\same.txt".to_string(), "E:\\same.png".to_string()],
+        ] {
+            let json = serde_json::to_string(&paths).unwrap();
+            let IngestOutcome::Stored {
+                id: file_id,
+                dedup: file_dedup,
+            } = ingest_files(&paths, "explorer.exe", now_ms()).unwrap()
+            else {
+                panic!("文件件应入库");
+            };
+            let IngestOutcome::Stored {
+                id: text_id,
+                dedup: text_dedup,
+            } = ingest(&json, "notepad.exe", now_ms()).unwrap()
+            else {
+                panic!("同字节的文本件也应入库");
+            };
+            assert!(!file_dedup && !text_dedup, "跨类型不能去重");
+            assert_ne!(file_id, text_id, "文本与文件必须是两行");
+            assert_eq!(get(file_id).unwrap().unwrap().kind, ClipKind::File);
+            assert_eq!(get(text_id).unwrap().unwrap().kind, ClipKind::Text);
+            assert!(matches!(
+                ingest_files(&paths, "explorer.exe", now_ms()).unwrap(),
+                IngestOutcome::Stored { id, dedup: true } if id == file_id
+            ));
+            assert!(matches!(
+                ingest(&json, "notepad.exe", now_ms()).unwrap(),
+                IngestOutcome::Stored { id, dedup: true } if id == text_id
+            ));
+        }
+    }
+
     /// 空路径清单只可能来自坏记录：不许写一段空文本进剪贴板，还回一句「已把路径作为文本复制」。
     /// 这条分支在碰剪贴板之前就返回，所以用例不需要真的打开剪贴板。
     #[test]
@@ -3886,7 +4071,8 @@ mod tests {
                     copied_at  INTEGER NOT NULL,
                     pinned     INTEGER NOT NULL DEFAULT 0,
                     byte_len   INTEGER NOT NULL
-                );",
+                );
+                CREATE UNIQUE INDEX idx_clip_hash ON clipboard_items(hash);",
             )
             .unwrap();
             conn.execute(
@@ -3897,6 +4083,30 @@ mod tests {
             .unwrap();
         }
         init_db().unwrap();
+        let conn = open().unwrap();
+        let old_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_clip_hash'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let kind_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_clip_hash_kind'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_index, 0, "旧的全局 hash 唯一索引必须撤掉");
+        assert_eq!(kind_index, 1, "新索引必须按类型 + hash 唯一");
+        conn.execute(
+            "INSERT INTO clipboard_items(content, hash, kind, copied_at, byte_len)
+             VALUES ('同哈希文件', 'h1', 'file', 2, 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(get(2).unwrap().unwrap().kind, ClipKind::File);
         let item = get(1).unwrap().unwrap();
         assert_eq!(item.kind, ClipKind::Text);
         assert!(item.image_path.is_none());

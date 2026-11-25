@@ -1204,7 +1204,52 @@ fn reset_plan(readable: Result<Vec<i32>, String>) -> ResetPlan {
     }
 }
 
+#[cfg(windows)]
+struct ResetMutexGuard(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for ResetMutexGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(windows)]
+fn lock_native_instance(name: &[u16]) -> Result<ResetMutexGuard, String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    let handle = unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) }
+        .map_err(|e| format!("原生端单实例互斥锁创建失败：{e}"))?;
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let _ = unsafe { CloseHandle(handle) };
+        return Err("FocusFlow 仍在运行，请先从托盘退出后再清空统计".to_string());
+    }
+    Ok(ResetMutexGuard(handle))
+}
+
+#[cfg(windows)]
+fn lock_native_for_reset() -> Result<ResetMutexGuard, String> {
+    let name: Vec<u16> = "Global\\FocusFlow.Native.P0"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    lock_native_instance(&name)
+}
+
+#[cfg(not(windows))]
+fn lock_native_for_reset() -> Result<(), String> {
+    Ok(())
+}
+
 fn reset(_db: &db::Database) -> i32 {
+    // 先做一次快速占锁：原生端可能只有未落库增量，年度库看起来还是空壳，
+    // 但不能因此报“没什么可清”并把内存里那批留给它随后写回。
+    if let Err(e) = lock_native_for_reset() {
+        eprintln!("{e}；本次没有改动任何数据");
+        return 1;
+    }
     // 确认提示必须说清楚要清的是哪一套库、哪些年份：这是唯一一个有确认的破坏性命令，
     // 而它原先只写"清空所有记录"—— 用户无从发现 `FOCUSFLOW_APP_DIR` 还指着真实数据目录。
     //
@@ -1248,6 +1293,13 @@ fn reset(_db: &db::Database) -> i32 {
         }
         ConfirmRead::Approved => {}
     }
+    let _native_guard = match lock_native_for_reset() {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("{e}；本次没有改动任何数据");
+            return 1;
+        }
+    };
     let report = db::maintenance::reset_all_data();
     // 快照没兜住 ⇒ 在说"已清空"之前先把这句说出口（stderr，退出码不变：
     // 删除确实做完了）。以前这句话只在 `logs/` 里，终端上看到的是一句干净的"已清空"。
@@ -1428,6 +1480,8 @@ fn backup_outcome(outcome: &db::maintenance::BackupOutcome) -> (String, i32) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::lock_native_instance;
     use super::{
         backup_outcome, cleanup_outcome, export_csv, export_html, export_target, import_report,
         max_args, parse_period, parse_stats_year, partial_read_note, period_window,
@@ -2110,6 +2164,44 @@ mod tests {
             ResetPlan::Blocked(e) => assert_eq!(e, bad, "拒绝的原因要原样递给用户"),
             other => panic!("读不出清单必须 Blocked，不能退化成空白确认: {other:?}"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reset_mutex_excludes_a_running_native_and_releases_after_drop() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!(
+            "Global\\FocusFlow.Tests.Reset.{}.{nonce}",
+            std::process::id()
+        );
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let first = lock_native_instance(&wide).expect("第一次应拿到锁");
+        let second = lock_native_instance(&wide)
+            .err()
+            .expect("原生端持锁时必须拒绝");
+        assert!(second.contains("仍在运行"), "实得 {second}");
+        drop(first);
+        assert!(lock_native_instance(&wide).is_ok(), "释放后应能重新拿到");
+    }
+
+    #[test]
+    fn reset_takes_the_native_lock_before_deleting_any_rows() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("mod tests").expect("测试模块的起点")];
+        let at = prod.find("fn reset(").expect("reset 函数不见了");
+        let end = prod[at..]
+            .find("\nfn ")
+            .map(|n| at + n)
+            .unwrap_or(prod.len());
+        let body = &prod[at..end];
+        let lock = body
+            .find("lock_native_for_reset()")
+            .expect("reset 没抢单实例锁");
+        let delete = body.find("reset_all_data()").expect("reset 没执行清空");
+        assert!(lock < delete, "必须先确认原生端没在跑，再删数据库");
     }
 
     /// 帮助文本与真正接的命令必须是同一份清单（两个方向都查）。

@@ -10,6 +10,7 @@
 //! - `focusflow.config_get("section.key")` -> 配置值
 //! - `focusflow.store.get/set/delete/list/clear/flush` -> 这个插件自己的 KV（`state.json`）
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -55,6 +56,66 @@ static SCHEDULER: LazyLock<Mutex<SchedulerSlot>> = LazyLock::new(|| {
         users: HashSet::new(),
     })
 });
+
+thread_local! {
+    static SCHEDULER_LOADING: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) struct SchedulerSnapshot {
+    runner: Option<Arc<scheduler::Scheduler>>,
+    users: HashSet<String>,
+}
+
+pub(crate) fn begin_scheduler_load() -> SchedulerSnapshot {
+    let snapshot = {
+        let slot = SCHEDULER.lock().unwrap_or_else(|e| e.into_inner());
+        SchedulerSnapshot {
+            runner: slot.runner.clone(),
+            users: slot.users.clone(),
+        }
+    };
+    SCHEDULER_LOADING.with(|loading| loading.set(true));
+    snapshot
+}
+
+pub(crate) fn rollback_scheduler_load(snapshot: SchedulerSnapshot) {
+    let current = {
+        let mut slot = SCHEDULER.lock().unwrap_or_else(|e| e.into_inner());
+        let same = matches!(
+            (&slot.runner, &snapshot.runner),
+            (Some(a), Some(b)) if Arc::ptr_eq(a, b)
+        );
+        let current = slot.runner.take();
+        slot.runner = snapshot.runner;
+        slot.users = snapshot.users;
+        (current, same)
+    };
+    SCHEDULER_LOADING.with(|loading| loading.set(false));
+    let (current, same) = current;
+    if let Some(runner) = current {
+        if !same {
+            runner.stop();
+        }
+    }
+}
+
+pub(crate) fn commit_scheduler_load(snapshot: SchedulerSnapshot) {
+    let stop = {
+        let mut slot = SCHEDULER.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.runner.is_none() && !slot.users.is_empty() {
+            slot.runner = snapshot.runner;
+            None
+        } else if slot.users.is_empty() {
+            slot.runner.take()
+        } else {
+            None
+        }
+    };
+    SCHEDULER_LOADING.with(|loading| loading.set(false));
+    if let Some(runner) = stop {
+        runner.stop();
+    }
+}
 
 fn pomodoro_timer() -> Arc<PomodoroTimer> {
     let mut slot = POMODORO.lock().unwrap_or_else(|e| e.into_inner());
@@ -187,6 +248,11 @@ pub(crate) fn release_scheduler_checked(owner: &str) -> bool {
     let mut slot = SCHEDULER.lock().unwrap_or_else(|e| e.into_inner());
     slot.users.remove(owner);
     if slot.users.is_empty() {
+        // 候选 init() 里的 shutdown 只记录意图，不能真拆旧实例正在用的线程；
+        // 加载失败时快照会恢复，加载成功时由 commit_scheduler_load 收尾。
+        if SCHEDULER_LOADING.with(|loading| loading.get()) {
+            return false;
+        }
         if let Some(s) = slot.runner.take() {
             s.stop();
             return true;

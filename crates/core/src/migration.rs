@@ -9,9 +9,8 @@
 //!   再通过聚合迁移落进 daily/hourly/key 三张聚合表并压缩文件；
 //!   按天的**活跃时长**单独并（明细里没有时长信息，旧库存在 `active_seconds` 表
 //!   或 `daily_counts.seconds` 里，同一天取两侧较大值 —— 幂等且不覆盖新值）
-//! - 重复导入靠源文件指纹（大小+mtime）跳过；指纹变了但 key_log **内容**没变
-//!   （复制/云盘摸过 mtime 的同一份文件）靠内容指纹（行数+最大时间戳）跳过 ——
-//!   聚合是累加式，把同一批明细再聚一遍就是整体翻倍
+//! - 重复导入靠逻辑内容哈希（key_log 明细 + 活跃时长）跳过；旧版本留下的
+//!   大小/mtime 与行数/最大时间戳标记只作兼容回退 —— 聚合是累加式，重聚会翻倍
 //! - 附属库（accounting/pomodoro/scheduler/edge_history）：整体复制覆盖，
 //!   **覆盖前先把现有库改名留档**（见 `backup_before_overwrite`）——
 //!   导入目录由用户自己选，选错目录不能让当前数据凭空消失
@@ -187,6 +186,18 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+fn restore_moved_sidecars(dst: &Path, kept: &Path, moved: &[&str]) -> Vec<String> {
+    let mut leftover = Vec::new();
+    for suffix in moved.iter().rev() {
+        let from = crate::data_location::with_suffix(kept, suffix);
+        let to = crate::data_location::with_suffix(dst, suffix);
+        if let Err(e) = std::fs::rename(&from, &to) {
+            leftover.push(format!("{} 搬不回 {}（{e}）", from.display(), to.display()));
+        }
+    }
+    leftover
+}
+
 /// 覆盖前的留档：把现有文件改名成 `<原名>.import-backup-<时间戳>`。
 ///
 /// 用 rename 而不是 copy —— 既省一次全量拷贝，也保证不会出现"复制到一半
@@ -221,25 +232,38 @@ fn backup_before_overwrite(dst: &Path) -> anyhow::Result<Option<std::path::PathB
     //    `-wal` 比主库还大），留在原位等于让下次打开按错配的 WAL 去恢复。
     // ③ 路径用 OsString 追加，不用 `format!("{}", path.display())`：后者对非 UTF-8
     //    文件名是 lossy 转换，拼出来的路径根本不存在 ⇒ 配合 `let _ =` 连失败都不会报。
-    for suffix in ["-wal", "-shm"] {
-        let from = crate::data_location::with_suffix(dst, suffix);
-        match crate::data_location::probe_open(&from) {
-            Presence::No => {}
-            // 问不出就一步都不搬：主库的 rename 紧跟在后面，把它搬走而这一格留在原地，
-            // 目录里就剩下"主库已改名带走、那段 -wal 还在原位"的半套状态
-            Presence::Unreadable(reason) => {
-                return Err(anyhow::anyhow!(
-                    "{} 在不在问不出（{reason}）—— 整次留档不做，免得主库搬走后这段尾巴留在原位",
-                    from.display()
-                ))
-            }
-            Presence::Yes => {
-                std::fs::rename(&from, crate::data_location::with_suffix(&kept, suffix))
-                    .map_err(|e| anyhow::anyhow!("{} 没能一起留档: {e}", from.display()))?;
+    let mut moved: Vec<&str> = Vec::new();
+    let archived = (|| -> anyhow::Result<()> {
+        for suffix in ["-wal", "-shm"] {
+            let from = crate::data_location::with_suffix(dst, suffix);
+            match crate::data_location::probe_open(&from) {
+                Presence::No => {}
+                Presence::Unreadable(reason) => {
+                    anyhow::bail!(
+                        "{} 在不在问不出（{reason}）—— 整次留档不做，免得主库搬走后这段尾巴留在原位",
+                        from.display()
+                    );
+                }
+                Presence::Yes => {
+                    std::fs::rename(&from, crate::data_location::with_suffix(&kept, suffix))
+                        .map_err(|e| anyhow::anyhow!("{} 没能一起留档: {e}", from.display()))?;
+                    moved.push(suffix);
+                }
             }
         }
+        std::fs::rename(dst, &kept)?;
+        Ok(())
+    })();
+    if let Err(e) = archived {
+        let leftover = restore_moved_sidecars(dst, &kept, &moved);
+        if leftover.is_empty() {
+            return Err(anyhow::anyhow!("{e}；已搬走的附属文件已复原"));
+        }
+        return Err(anyhow::anyhow!(
+            "{e}；附属文件复原未完成：{}",
+            leftover.join("；")
+        ));
     }
-    std::fs::rename(dst, &kept)?;
     tracing::info!(
         "导入前已留档现有库: {} -> {}",
         dst.display(),
@@ -418,20 +442,19 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
                 retry_hint(&leftover)
             ));
         }
-        // 用 Rusqlite 打开确认可用 + 建聚合表
         let conn = connection::open_rw(&dst_path)?;
-        connection::ensure_schema(&conn, year)?;
-        // 指纹从这份**刚复制过来的**库里读：它与源文件逐字节相同、连接已经开着，
-        // 不需要再开第三次源文件（`ensure_schema` 不建 key_log，所以这里读到的
-        // 有无明细与源库一致）。
+        // 先从刚复制的原形状读指纹；ensure_schema 会补出空 daily_counts，
+        // 那会让“源库没有时长表”与“源库有一张空时长表”算出不同哈希。
         let kl = key_log_fingerprint(&conn)?;
+        let content_hash = logical_content_hash(&conn)?;
+        connection::ensure_schema(&conn, year)?;
         drop(conn);
         // **标记写在聚合之前**，与下面合并分支同一条理由（那里的注释是完整版）：
         // `migrate_v2` 是累加式且没有去重键，"这份导过了"只记在 `meta` 的
         // `imported_src_*` 里。旧顺序在两步之间失败时留下「已聚合、未标记」，
         // 用户点重试 ⇒ 读不到标记 ⇒ 那一年再累加一遍。整库复制这一支以前正好漏在
         // 外面（"整库都搬过来了，标记写不上去有什么关系"），而它一样要跑 `migrate_v2`。
-        record_import_marker(&dst_path, &src_path, kl)?;
+        record_import_marker(&dst_path, &src_path, kl, &content_hash)?;
         crate::db::maintenance::migrate_v2();
         // 统计导入条数（聚合表总量）
         let conn = connection::open_ro(&dst_path)?;
@@ -460,8 +483,16 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
             ));
         }
     };
-    // 源文件未变化（大小+修改时间一致）→ 已导入过，跳过
-    if let Ok(meta) = std::fs::metadata(&src_path) {
+    let src_conn = Connection::open(&src_path)?;
+    let content_hash = logical_content_hash(&src_conn)?;
+    if let Some(previous) = marker.as_ref().and_then(|m| m.content_hash.as_deref()) {
+        if previous == content_hash {
+            let note = format!("{year} 年源库的逻辑内容与上次导入完全相同：跳过，本次没有新数据");
+            tracing::info!("{note}");
+            summary.skipped.push(note);
+            return Ok(0);
+        }
+    } else if let Ok(meta) = std::fs::metadata(&src_path) {
         let same_size = marker.as_ref().map(|m| m.size) == Some(meta.len());
         let same_mtime = match (marker.as_ref().and_then(|m| m.mtime), meta.modified().ok()) {
             (Some(a), Some(b)) => {
@@ -478,12 +509,8 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
             _ => false,
         };
         if same_size && same_mtime {
-            // 这条 `Ok(0)` 也得往 `summary.skipped` 里写一条（本函数开头的契约）：
-            // 调用方照样把这一年记进 `year_dbs`，只按数字说话时「2025 年度键鼠: 0 条」
-            // 与"这一年本来没数据"逐字节同形 —— 而重跑导入正是用户查"刚才到底导进去没有"
-            // 的动作。`tracing::info!` 不算答复：日志埋在 logs/ 里，不主动翻就永远不知道。
             let note = format!(
-                "{year} 年源文件与上次导入时一模一样（大小与修改时间都没变）：整库跳过，本次没有新数据"
+                "{year} 年源文件与旧标记的大小、修改时间一致：按兼容口径跳过，本次没有新数据"
             );
             tracing::info!("{note}");
             summary.skipped.push(note);
@@ -491,8 +518,6 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
         }
     }
 
-    // 去重合并（写入暂存表）
-    let src_conn = Connection::open(&src_path)?;
     let dst_conn = connection::open_rw(&dst_path)?;
     connection::ensure_schema(&dst_conn, year)?;
 
@@ -523,16 +548,16 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
     // 被**再聚合一遍**，而 migrate_v2 是累加式（`count = count + excluded`），
     // 那一年就整体翻倍，界面上没有任何提示。
     // 用开头读过的那一份标记（不再第三次开库：读不动的结局上面已经处理过了）
-    if let Some((c0, t0)) = marker.as_ref().and_then(|m| m.key_log) {
-        if (c0, t0) == kl_now {
-            // 同一条契约的第二处：第一道闸（大小+mtime）已经放行、靠内容指纹才跳过，
-            // 报出来的还是一个裸 `0`。
-            let note = format!(
-                "{year} 年源库的明细内容与上次导入逐行相同（只有文件时间戳被改动过）：跳过，不重复聚合"
-            );
-            tracing::info!("{note}");
-            summary.skipped.push(note);
-            return Ok(0);
+    if marker.as_ref().is_some_and(|m| m.content_hash.is_none()) {
+        if let Some((c0, t0)) = marker.as_ref().and_then(|m| m.key_log) {
+            if (c0, t0) == kl_now {
+                let note = format!(
+                    "{year} 年源库的明细内容与旧标记逐行相同（只有文件时间戳被改动过）：跳过，不重复聚合"
+                );
+                tracing::info!("{note}");
+                summary.skipped.push(note);
+                return Ok(0);
+            }
         }
     }
     // 已知局限（判定不修，留档）：源库**真的追加过**新明细时，这里仍会整份重聚合，
@@ -582,7 +607,7 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
     // 反过来「已标记、未聚合」是可自愈的：明细还在目标库的 `key_log` 里，
     // 而 `Database::init` 每次启动都会跑一遍 `migrate_v2`（见 db/mod.rs），
     // 下一次启动就把它聚合掉。两种半截状态里只有一个会毁数据，所以把另一个留下。
-    record_import_marker(&dst_path, &src_path, Some(kl_now))?;
+    record_import_marker(&dst_path, &src_path, Some(kl_now), &content_hash)?;
     // 聚合落库并压缩（幂等：key_log 迁移后清空）
     crate::db::maintenance::migrate_v2();
 
@@ -697,12 +722,9 @@ fn merge_active_seconds_from_src(src: &Connection, dst: &Connection) -> anyhow::
     Ok(gained)
 }
 
-/// 源库 key_log 的内容指纹：(行数, 最大时间戳)。**确认**没有这张表才返回 None。
+/// 旧版 key_log 指纹：(行数, 最大时间戳)。**确认**没有这张表才返回 None。
 ///
-/// 行数 + 最大时间戳足以分辨"这份旧库的明细变没变"：key_log 是按键发生时
-/// 逐条追加的，内容没变时两者恒定，摸一摸 mtime 不会动它们。反推不成立
-/// （两份不同内容可能撞上同一对数）不碍事 —— 误判的代价只是少跳过一次
-/// 幂等的导入，而**不是**漏导或翻倍。
+/// 它只用于没有逻辑内容哈希的旧标记；不同明细可能撞上同一对数，不能作为新判据。
 ///
 /// 「查不动」不能折成「没有这张表」：那条路上调用方说的是"源库只剩聚合表、按键明细本来就没有"，
 /// 而真实情况是这一问没答上（坏页、schema 被截断、别的连接正挡着查询）—— 那一年整段按键数
@@ -731,7 +753,69 @@ fn key_log_fingerprint(conn: &Connection) -> anyhow::Result<Option<(i64, i64)>> 
     Ok(Some(row))
 }
 
-/// 记录源文件指纹（大小 + 修改时间 + key_log 内容）到目标库 meta，用于重复导入检测。
+fn logical_content_hash(conn: &Connection) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut hash = Sha256::new();
+    hash.update(b"focusflow-import-content-v1\0");
+    match connection::table_presence(conn, "key_log") {
+        connection::Presence::No => hash.update(b"key-log:none\0"),
+        connection::Presence::Unreadable(reason) => {
+            anyhow::bail!("读不出源库有没有 key_log（{reason}）：本次不写导入标记");
+        }
+        connection::Presence::Yes => {
+            let mut stmt = conn
+                .prepare("SELECT key_name, timestamp FROM key_log ORDER BY key_name, timestamp")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            let mut count = 0u64;
+            for row in rows {
+                let (name, timestamp) = row?;
+                count += 1;
+                hash.update((name.len() as u64).to_le_bytes());
+                hash.update(name.as_bytes());
+                hash.update(timestamp.to_le_bytes());
+            }
+            hash.update(b"key-log:rows\0");
+            hash.update(count.to_le_bytes());
+        }
+    }
+
+    let seconds_sql = match pick_active_seconds_source(
+        connection::table_presence(conn, "active_seconds"),
+        connection::column_presence(conn, "daily_counts", "seconds"),
+    ) {
+        SecondsSource::ActiveTable => {
+            "SELECT date_key, seconds FROM active_seconds ORDER BY date_key, seconds"
+        }
+        SecondsSource::DailyColumn => {
+            "SELECT date_key, seconds FROM daily_counts ORDER BY date_key, seconds"
+        }
+        SecondsSource::Neither => "",
+        SecondsSource::CannotTell(reason) => {
+            anyhow::bail!("{reason}：本次不写导入标记");
+        }
+    };
+    if seconds_sql.is_empty() {
+        hash.update(b"seconds:none\0");
+    } else {
+        let rows = read_day_seconds(conn, seconds_sql)?;
+        hash.update(b"seconds:rows\0");
+        hash.update((rows.len() as u64).to_le_bytes());
+        for (date_key, seconds) in rows {
+            hash.update(date_key.to_le_bytes());
+            hash.update(seconds.to_le_bytes());
+        }
+    }
+
+    let mut hex = String::with_capacity(64);
+    for byte in hash.finalize() {
+        write!(&mut hex, "{byte:02x}").expect("写字符串不会失败");
+    }
+    Ok(format!("sha256:{hex}"))
+}
+
+/// 记录逻辑内容哈希与旧版文件指纹到目标库 meta，用于重复导入检测。
 ///
 /// `kl` 由调用方给：合并分支手上已经有 `kl_now`，整库复制那一支的目标库就是源文件的
 /// 逐字节副本、连接也已经开着 —— 两处都不该再去开第三次。旧写法在这里
@@ -744,6 +828,7 @@ fn record_import_marker(
     dst_path: &Path,
     src_path: &Path,
     kl: Option<(i64, i64)>,
+    content_hash: &str,
 ) -> anyhow::Result<()> {
     let meta = std::fs::metadata(src_path)?;
     let conn = connection::open_rw(dst_path)?;
@@ -773,6 +858,10 @@ fn record_import_marker(
             [kl.1.to_string()],
         )?;
     }
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('imported_src_content_hash', ?1)",
+        [content_hash],
+    )?;
     Ok(())
 }
 
@@ -858,12 +947,14 @@ fn restore_after_failed_copy(
     summary.errors.extend(leftover);
 }
 
-/// 导入标记：源文件指纹 + 上次导入时源库 key_log 的内容指纹。
+/// 导入标记：逻辑内容哈希 + 旧版文件/明细指纹回退。
 struct ImportMarker {
     size: u64,
     mtime: Option<std::time::SystemTime>,
     /// (行数, 最大时间戳)；旧版本留下的标记没有这两个键 → None。
     key_log: Option<(i64, i64)>,
+    /// 新版本保存的逻辑内容哈希；旧标记没有这一键。
+    content_hash: Option<String>,
 }
 
 /// 读取导入标记。
@@ -888,6 +979,7 @@ fn read_import_marker(dst_path: &Path) -> anyhow::Result<Option<ImportMarker>> {
     let mtime = read("imported_src_mtime")?;
     let kl_count = read("imported_src_kl_count")?.and_then(|v| v.parse().ok());
     let kl_maxts = read("imported_src_kl_maxts")?.and_then(|v| v.parse().ok());
+    let content_hash = read("imported_src_content_hash")?;
     let Some(sz) = size else {
         return Ok(None);
     };
@@ -897,6 +989,7 @@ fn read_import_marker(dst_path: &Path) -> anyhow::Result<Option<ImportMarker>> {
             .and_then(|mt| mt.parse::<u64>().ok())
             .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
         key_log: kl_count.zip(kl_maxts),
+        content_hash,
     }))
 }
 
@@ -1888,6 +1981,43 @@ mod tests {
         drop(hold);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_shm_archive_puts_the_already_moved_wal_back() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("mig_shm_hold_after_wal");
+        let data = crate::paths::data_dir();
+        let main = data.join("focusflow_accounting.db");
+        let wal = crate::data_location::with_suffix(&main, "-wal");
+        let shm = crate::data_location::with_suffix(&main, "-shm");
+        std::fs::write(&main, b"current").unwrap();
+        std::fs::write(&wal, b"wal-tail").unwrap();
+        std::fs::write(&shm, b"shm-index").unwrap();
+
+        // 允许 probe_open 读，但不给删除共享：WAL 先搬成功，SHM 的 rename 必失败。
+        let hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1)
+            .open(&shm)
+            .unwrap();
+        let err = backup_before_overwrite(&main).expect_err("SHM 搬不动时留档必须失败");
+        assert!(err.to_string().contains("-shm"), "实得 {err}");
+        assert_eq!(std::fs::read(&main).unwrap(), b"current");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"wal-tail", "WAL 必须回位");
+        assert_eq!(std::fs::read(&shm).unwrap(), b"shm-index");
+        assert!(
+            !data
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(".import-backup-")),
+            "回滚后不留半套留档"
+        );
+        drop(hold);
+    }
+
     /// 同一份旧库、内容一行没变、只是 mtime 变了（资源管理器复制一份、云盘
     /// 同步、备份还原都是这个形状）→ 再导入一次**不得**把那一年翻倍。
     ///
@@ -1966,6 +2096,73 @@ mod tests {
             again
         );
         assert_eq!(daily_total(), 100, "重导同内容不得把那一年翻倍");
+    }
+
+    #[test]
+    fn same_size_and_mtime_with_different_key_log_is_not_skipped() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("reimport_hash_collision");
+        let year = 2024i32;
+        let src_dir = _dir.path().join("old");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join(format!("focusflow_{year}.db"));
+        let timestamp = 1_700_000_000i64;
+        {
+            let conn = Connection::open(&src).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE key_log (key_name TEXT NOT NULL, timestamp INTEGER NOT NULL)",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO key_log(key_name, timestamp) VALUES ('A', ?1)",
+                [timestamp],
+            )
+            .unwrap();
+        }
+        let before = std::fs::metadata(&src).unwrap();
+        let dst = paths::year_db_path(year);
+        {
+            let conn = connection::open_rw(&dst).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+        }
+
+        let first = import_legacy_data(&src_dir);
+        assert!(first.errors.is_empty(), "首次导入失败: {:?}", first);
+        assert_eq!(first.records_by_year, vec![(year, 1)]);
+
+        {
+            let conn = Connection::open(&src).unwrap();
+            conn.execute("UPDATE key_log SET key_name = 'B'", [])
+                .unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        let after = std::fs::metadata(&src).unwrap();
+        assert_eq!(after.len(), before.len(), "夹具前提：文件大小必须相同");
+        let source = Connection::open(&src).unwrap();
+        assert_eq!(key_log_fingerprint(&source).unwrap(), Some((1, timestamp)));
+        drop(source);
+
+        let second = import_legacy_data(&src_dir);
+        assert!(second.errors.is_empty(), "二次导入失败: {:?}", second);
+        assert_eq!(
+            second.records_by_year,
+            vec![(year, 1)],
+            "同大小、同秒级 mtime、同 count/max 但明细不同，不能跳过"
+        );
+        let total: i64 = connection::open_ro(&dst)
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 2, "两条不同明细都要落进聚合");
     }
 
     /// 回滚那一步：留档的主库与它的 WAL 必须**一起**回位，且每一步的成败都要说实话。

@@ -22,6 +22,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use focusflow_core::config::FocusFlowConfig;
 use focusflow_core::db::Database;
@@ -45,39 +46,32 @@ fn slot() -> &'static Mutex<Option<Runtime>> {
     RUNTIME.get_or_init(|| Mutex::new(None))
 }
 
-/// 「次/分」的时间戳（Unix 秒）。60 秒滑窗，见 [`cpm`]。
-static KEY_TICKS: Mutex<VecDeque<i64>> = Mutex::new(VecDeque::new());
+/// 「次/分」的单调时钟刻度。60 秒滑窗，见 [`cpm`]。
+static KEY_TICKS: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
 
-/// 滑窗长度（秒）。
-const CPM_WINDOW_SECS: i64 = 60;
+/// 滑窗长度。
+const CPM_WINDOW: Duration = Duration::from_secs(60);
 
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// 丢掉窗口之外的旧时间戳。抽出来是为了能单测（不依赖真时钟）。
-fn prune(q: &mut VecDeque<i64>, now: i64) {
+/// 丢掉窗口之外的旧刻度。抽出来是为了能单测（不依赖真时钟）。
+fn prune(q: &mut VecDeque<Instant>, now: Instant) {
     while q
         .front()
-        .is_some_and(|s| now.saturating_sub(*s) >= CPM_WINDOW_SECS)
+        .is_some_and(|s| now.duration_since(*s) >= CPM_WINDOW)
     {
         q.pop_front();
     }
 }
 
-fn record_key_at(sec: i64) {
+fn record_key_at(now: Instant) {
     if let Ok(mut q) = KEY_TICKS.lock() {
-        q.push_back(sec);
-        prune(&mut q, sec);
+        q.push_back(now);
+        prune(&mut q, now);
     }
 }
 
 /// 最近 60 秒的按键次数，即卡片上的「当前速度（次/分）」。
 pub fn cpm() -> i64 {
-    let now = now_secs();
+    let now = Instant::now();
     if let Ok(mut q) = KEY_TICKS.lock() {
         prune(&mut q, now);
         return q.len() as i64;
@@ -276,7 +270,7 @@ pub fn start(cfg: &'static FocusFlowConfig) -> Result<(), String> {
         if LOG_KEYS.load(Ordering::Relaxed) {
             crate::tracing_note(&format!("按键：{key}"));
         }
-        record_key_at(now_secs());
+        record_key_at(Instant::now());
         // 催快照线程一拍：一次原子位存储，不是 IO，也不在这儿查库——查由对面按
         // `POKE_MIN_GAP_MS` 节流，所以打字高峰是 4 拍/秒而不是每键 10 条语句。
         crate::poke_snapshot();
@@ -523,41 +517,53 @@ mod tests {
     }
 
     #[test]
+    fn the_speed_window_uses_a_monotonic_clock() {
+        let src = include_str!("collect.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
+        assert!(
+            prod.contains("VecDeque<Instant>")
+                && prod.contains("record_key_at(Instant::now());")
+                && !prod.contains("SystemTime::now")
+                && !prod.contains("UNIX_EPOCH"),
+            "次/分滑窗不能用墙上时钟：回拨后未来刻度会一直堵在队首"
+        );
+    }
+
+    #[test]
     fn the_sliding_window_drops_ticks_older_than_a_minute() {
-        let mut q: VecDeque<i64> = VecDeque::new();
+        let start = Instant::now();
+        let mut q: VecDeque<Instant> = VecDeque::new();
         for s in 0..60 {
-            q.push_back(1000 + s);
+            q.push_back(start + Duration::from_secs(s));
         }
-        // 同一秒里读：整窗都在
-        prune(&mut q, 1059);
+        prune(&mut q, start + Duration::from_secs(59));
         assert_eq!(q.len(), 60);
 
-        // 到 1060：1000 那一秒正好满 60 秒，丢掉
-        prune(&mut q, 1060);
+        prune(&mut q, start + Duration::from_secs(60));
         assert_eq!(q.len(), 59);
-        assert_eq!(q.front(), Some(&1001));
+        assert_eq!(q.front(), Some(&(start + Duration::from_secs(1))));
 
-        // 一整分钟没人按键：清空
-        prune(&mut q, 2000);
+        prune(&mut q, start + Duration::from_secs(2000));
         assert!(q.is_empty());
     }
 
     #[test]
     fn the_window_is_exactly_sixty_seconds_wide() {
-        let mut q: VecDeque<i64> = VecDeque::new();
-        q.push_back(100);
-        prune(&mut q, 159); // 差 59 秒：还算在窗口里
+        let start = Instant::now();
+        let mut q: VecDeque<Instant> = VecDeque::new();
+        q.push_back(start);
+        prune(&mut q, start + Duration::from_secs(59)); // 差 59 秒：还算在窗口里
         assert_eq!(q.len(), 1);
-        prune(&mut q, 160); // 差 60 秒：出窗
+        prune(&mut q, start + Duration::from_secs(60)); // 差 60 秒：出窗
         assert!(q.is_empty());
     }
 
     #[test]
-    fn clock_going_backwards_does_not_panic() {
-        let mut q: VecDeque<i64> = VecDeque::new();
-        q.push_back(5000);
-        // 系统时间被拨回去：saturating_sub 之后是负数，不该 panic 也不该误删
-        prune(&mut q, 10);
+    fn a_sample_newer_than_the_reading_does_not_panic_or_get_pruned() {
+        let now = Instant::now();
+        let mut q: VecDeque<Instant> = VecDeque::new();
+        q.push_back(now + Duration::from_secs(100));
+        prune(&mut q, now);
         assert_eq!(q.len(), 1);
     }
 

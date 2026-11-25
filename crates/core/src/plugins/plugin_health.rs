@@ -695,6 +695,7 @@ pub fn flush(stem: &str) -> Result<(), String> {
 pub fn forget(stem: &str) -> bool {
     if let Err(e) = flush(stem) {
         tracing::warn!("插件 {stem} 的台账落不下去: {e}");
+        return false;
     }
     discard(stem)
 }
@@ -1456,6 +1457,29 @@ mod detail_tests {
 
     /// 摘格子不许落盘：插件文件都已经删了（卸载时选了「删除设置」），
     /// 这一写会把刚被清掉的 `plugins/state/<stem>/` 又建回来。
+    #[test]
+    fn a_failed_flush_does_not_discard_the_live_health_cell() {
+        let _lock = paths::test_app_dir_lock();
+        let _app = paths::test_app_dir("health_forget_failed");
+        let state = paths::plugin_state_path("stuck_health");
+        std::fs::create_dir_all(state.join("health.json")).unwrap();
+        let board = board_for("stuck_health");
+        board
+            .lock()
+            .unwrap()
+            .record(HookKind::View, Duration::from_micros(2_000));
+        assert!(!forget("stuck_health"), "落盘失败时不许摘掉内存台账");
+        assert!(std::sync::Arc::ptr_eq(&board, &board_for("stuck_health")));
+        assert_eq!(
+            board_for("stuck_health")
+                .lock()
+                .unwrap()
+                .samples(HookKind::View)
+                .map(|h| h.calls),
+            Some(1)
+        );
+    }
+
     #[test]
     fn discard_drops_the_cell_without_writing_anything() {
         let _lock = paths::test_app_dir_lock();

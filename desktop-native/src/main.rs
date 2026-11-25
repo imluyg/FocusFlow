@@ -4139,6 +4139,7 @@ impl App {
                 use focusflow_core::db::maintenance::{
                     backup_database, cleanup_old_data, vacuum_all, vacuum_line, BackupOutcome,
                 };
+                use focusflow_core::db::writer::BatchFlush;
                 let line = match which {
                     0 => {
                         let max = focusflow_core::config::instance().get_int(
@@ -4223,12 +4224,14 @@ impl App {
                         }
                     }
                     2 => {
-                        // 这句话由 core 说一遍（`cleanup_line`，与 CLI 的 `--cleanup` 同一出处）。
-                        // 以前这里自己拼「已清理 N 条（保留 30 天）」，于是同一次清理在命令行说
-                        // 「清理未完成」、在按钮上说的是「已清理」，而单位（每天每键一行）谁都没讲。
-                        // 执行前快照没兜住那半句同样不许在这里掉（见 `cleanup_status_line`）。
-                        let r = cleanup_old_data(30);
-                        cleanup_status_line(30, &r)
+                        // 未落库的旧日期增量会在 DELETE 后重新写回历史；先逼出内存批次，
+                        // 等不到确认就一条都不删。新事件属于今天，不与这次保留窗口冲突。
+                        if focusflow_core::db::writer::flush_for_backup() == BatchFlush::Missed {
+                            "清理未执行：写线程仍有未确认落库的增量，请稍后重试".to_string()
+                        } else {
+                            let r = cleanup_old_data(30);
+                            cleanup_status_line(30, &r)
+                        }
                     }
                     6 => {
                         let dir = match std::env::var("FOCUSFLOW_IMPORT_DIR") {
@@ -17891,6 +17894,30 @@ mod cleanup_readout_tests {
             "只许有那一处调用（按钮），数量变了说明接线动过"
         );
     }
+
+    #[test]
+    fn the_cleanup_button_flushes_pending_before_deleting_history() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
+        let start = prod.find("let line = match which").expect("执行分支不见了");
+        let arm = prod[start..].find("2 => {").expect("清理分支不见了") + start;
+        let end = prod[arm..].find("6 => {").expect("清理分支的边界") + arm;
+        let flat: String = prod[arm..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let flush = flat
+            .find("flush_for_backup()")
+            .expect("清理前没把写线程增量逼出去");
+        let delete = flat
+            .find("cleanup_old_data(30)")
+            .expect("清理按钮没接 core 清理");
+        assert!(flush < delete, "必须先确认落库，再 DELETE 历史");
+        assert!(
+            flat.contains("BatchFlush::Missed") && flat.contains("清理未执行"),
+            "flush 失败时必须拒绝删除并说明原因"
+        );
+    }
 }
 
 /// 「这一轮没读全」在屏上怎么说：每一栏只认领自己那个域名。
@@ -23282,7 +23309,7 @@ mod snapshot_poke_tests {
         let cflat: String = csrc.chars().filter(|c| !c.is_whitespace()).collect();
         // 那两句之间夹着注释，所以比的是先后而不是拼成一串：整串匹配会被注释挡掉（红过一次）。
         let rec = cflat
-            .find("record_key_at(now_secs());")
+            .find("record_key_at(Instant::now());")
             .expect("键回调里不再记账");
         let poked = cflat
             .find("crate::poke_snapshot();")

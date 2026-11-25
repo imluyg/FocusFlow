@@ -45,6 +45,43 @@ fn meta_path(stem: &str) -> PathBuf {
     paths::plugin_state_path(stem).join(META_FILE)
 }
 
+fn replace_file(tmp: &Path, target: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
+
+        let wide = |path: &Path| -> Vec<u16> {
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        };
+        if target.exists() {
+            let target_wide = wide(target);
+            let tmp_wide = wide(tmp);
+            unsafe {
+                ReplaceFileW(
+                    PCWSTR(target_wide.as_ptr()),
+                    PCWSTR(tmp_wide.as_ptr()),
+                    PCWSTR(std::ptr::null()),
+                    REPLACE_FILE_FLAGS(0),
+                    None,
+                    None,
+                )
+            }
+            .map_err(|e| format!("{} 原子替换失败：{e}", target.display()))
+        } else {
+            std::fs::rename(tmp, target).map_err(|e| format!("{} 换名失败：{e}", target.display()))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(tmp, target).map_err(|e| format!("{} 原子替换失败：{e}", target.display()))
+    }
+}
+
 /// 给人看的来源路径：去掉 `canonicalize` 带出来的 `\\?\` 前缀。
 ///
 /// 那一串是 Windows 的扩展长度写法，合法但没人认得；`\\?\UNC\srv\share` 还原成
@@ -131,10 +168,11 @@ fn write_meta(meta: &PackageMeta) -> Result<(), String> {
         serde_json::to_string_pretty(meta).map_err(|e| format!("安装记录序列化失败：{e}"))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text).map_err(|e| format!("{} 写不进去：{e}", tmp.display()))?;
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| format!("旧的 {} 删不掉：{e}", path.display()))?;
+    if let Err(e) = replace_file(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, &path).map_err(|e| format!("{} 换名失败：{e}", path.display()))
+    Ok(())
 }
 
 /// 装完之后的结论（页面/命令行要说的话都从这里取，不各自重算）。
@@ -239,11 +277,8 @@ pub fn install_with(package_path: &Path, legacy_layout: bool) -> Result<Installe
     let target = user_dir.join(format!("{stem}.zip"));
     let replaced = target.exists();
 
-    // 先写临时文件再换名：写到一半失败时盘上不会留下半份包（加载一侧会把半份当成坏包，
-    // 而用户看到的是"我明明装好了"）。Windows 的 rename 不覆盖已有文件，先删再换。
     let tmp = user_dir.join(format!("{stem}.zip.tmp"));
     std::fs::write(&tmp, &bytes).map_err(|e| format!("{} 写不进去：{e}", tmp.display()))?;
-    // 安装记录先落，再换名：后者失败时把记录清掉，不留"记录说有、盘上没有"的格子。
     let meta = PackageMeta {
         version: META_VERSION,
         stem: stem.clone(),
@@ -257,31 +292,44 @@ pub fn install_with(package_path: &Path, legacy_layout: bool) -> Result<Installe
         bytes: bytes.len(),
         installed_at: chrono::Local::now().to_rfc3339(),
     };
-    // 失败时要把旧记录放回去：盘上那份旧包还在，而记录已经改口说"装进来的是新字节"
-    // （详情页的来源与 sha256 就成了假话）。先把旧记录读一份，失败那一支再原样写回。
-    let previous_meta = std::fs::read(meta_path(&stem)).ok();
-    if let Err(e) = write_meta(&meta) {
+
+    let rollback = replaced.then(|| target.with_extension("zip.rollback"));
+    if let Some(path) = &rollback {
+        if path.exists() {
+            std::fs::remove_file(path)
+                .map_err(|e| format!("旧的回滚副本 {} 清不掉：{e}", path.display()))?;
+        }
+        std::fs::copy(&target, path)
+            .map_err(|e| format!("旧插件 {} 留不成回滚副本：{e}", target.display()))?;
+    }
+    if let Err(e) = replace_file(&tmp, &target) {
         let _ = std::fs::remove_file(&tmp);
+        if let Some(path) = &rollback {
+            let _ = std::fs::remove_file(path);
+        }
         return Err(e);
     }
-    if replaced {
-        if let Err(e) = std::fs::remove_file(&target) {
-            let _ = std::fs::remove_file(&tmp);
-            match &previous_meta {
-                Some(bytes) => {
-                    let _ = std::fs::write(meta_path(&stem), bytes);
-                }
-                None => {
-                    let _ = std::fs::remove_file(meta_path(&stem));
-                }
+    if let Err(e) = write_meta(&meta) {
+        if let Some(path) = &rollback {
+            if let Err(restore) = replace_file(path, &target) {
+                return Err(format!("{e}；旧插件恢复也没成功：{restore}"));
             }
-            return Err(format!("旧的 {} 删不掉：{e}", target.display()));
+        } else {
+            let _ = std::fs::remove_file(&target);
         }
-    }
-    if let Err(e) = std::fs::rename(&tmp, &target) {
         let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(meta_path(&stem));
-        return Err(format!("{} 换名失败：{e}", target.display()));
+        if let Some(path) = &rollback {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(e);
+    }
+    if let Some(path) = &rollback {
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::warn!(
+                "新插件已装好，但旧包回滚副本 {} 没删掉：{e}",
+                path.display()
+            );
+        }
     }
 
     // 校验器的结论只是"提示"（方案 3.7：漏报比误报代价低），装还是要装 ——
@@ -631,13 +679,12 @@ mod tests {
         );
     }
 
-    /// 换包失败时，盘上那份旧包还在，记录却不许改口说"装进来的是新字节"。
-    ///
-    /// 现在的顺序是"先落新记录、再删旧包"：删不掉（文件被占、只读）那一步失败之后，
-    /// 安装确实报错了，可详情页的来源与 sha256 已经换成新包的那一份 —— 用户手里跑的
-    /// 还是旧脚本，页面却说装的是新字节。失败 = 什么都没发生，记录也一样。
+    /// 换包失败时，旧包与旧记录都必须原样留下。
+    #[cfg(windows)]
     #[test]
-    fn a_failed_replacement_keeps_the_old_record_and_leaves_no_temp_file() {
+    fn a_failed_replacement_keeps_the_old_package_and_record() {
+        use std::os::windows::fs::OpenOptionsExt;
+
         let _lock = guard();
         let app = paths::test_app_dir("install_replace_fail");
         let src = app.path().join("incoming");
@@ -647,35 +694,80 @@ mod tests {
             "PLUGIN_NAME = \"v1\"\nfunction get_view() return { widgets = {} } end\n",
         );
         install(&first).unwrap();
+        let target = paths::plugins_user_dir().join("sticky.zip");
+        let old_bytes = std::fs::read(&target).unwrap();
         let old = meta_for("sticky")
             .expect("旧记录读得动")
             .expect("第一次装完该有记录");
 
-        // 让"删掉旧包"这一步必失败：目标换成同名目录（Windows 上 remove_file 过不去）。
-        let target = paths::plugins_user_dir().join("sticky.zip");
-        std::fs::remove_file(&target).unwrap();
-        std::fs::create_dir(&target).unwrap();
+        // 允许读，但不给删除共享：原子替换与旧写法的 remove_file 都必须失败。
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&target)
+            .unwrap();
         let second = write_package(
             &src,
             "sticky",
             "PLUGIN_NAME = \"v2\"\nfunction get_view() return { widgets = {} } end\n",
         );
-        let err = install(&second).expect_err("旧包删不掉时这一次安装必须失败");
+        let err = install(&second).expect_err("旧包替换不掉时这一次安装必须失败");
         assert!(
-            err.contains("删不掉"),
+            err.contains("原子替换失败"),
             "失败的理由要指向挡路的那一份：{err}"
         );
-
+        assert_eq!(std::fs::read(&target).unwrap(), old_bytes, "旧包字节被动了");
         let after = meta_for("sticky")
             .expect("记录还读得动")
             .expect("旧记录要留着");
-        assert_eq!(
-            after.content_hash, old.content_hash,
-            "失败之后记录改口了：它现在说的是新包的哈希"
+        assert_eq!(after, old, "失败之后记录改口了");
+        assert!(!paths::plugins_user_dir().join("sticky.zip.tmp").exists());
+        assert!(!paths::plugins_user_dir()
+            .join("sticky.zip.rollback")
+            .exists());
+    }
+
+    #[test]
+    fn a_meta_failure_after_replacement_restores_the_old_package() {
+        let _lock = guard();
+        let app = paths::test_app_dir("install_meta_rollback");
+        let src = app.path().join("incoming");
+        let first = write_package(&src, "rollback", "PLUGIN_NAME = \"v1\"\n");
+        install(&first).unwrap();
+        let target = paths::plugins_user_dir().join("rollback.zip");
+        let old_bytes = std::fs::read(&target).unwrap();
+        let old_meta = meta_for("rollback").unwrap();
+
+        // 临时记录的位置被目录占住，write_meta 必失败；此时新包已经原子换上去。
+        std::fs::create_dir(meta_path("rollback").with_extension("json.tmp")).unwrap();
+        let second = write_package(&src, "rollback", "PLUGIN_NAME = \"v2\"\n");
+        assert!(install(&second).is_err(), "记录写不进去时安装必须失败");
+        assert_eq!(std::fs::read(&target).unwrap(), old_bytes, "旧包要恢复");
+        assert_eq!(meta_for("rollback").unwrap(), old_meta, "旧记录要保留");
+        assert!(!paths::plugins_user_dir().join("rollback.zip.tmp").exists());
+        assert!(!paths::plugins_user_dir()
+            .join("rollback.zip.rollback")
+            .exists());
+    }
+
+    #[test]
+    fn the_update_path_replaces_instead_of_deleting_the_old_package_first() {
+        let src = include_str!("install.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
+        let at = prod.find("pub fn install_with(").expect("安装函数不见了");
+        let end = prod[at..]
+            .find("\n}\n")
+            .map(|n| at + n + 3)
+            .unwrap_or(prod.len());
+        let code = &prod[at..end];
+        let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("replace_file(&tmp,&target)"),
+            "同名更新必须走原子替换，不能给旧包留一个删掉后的空窗"
         );
         assert!(
-            !paths::plugins_user_dir().join("sticky.zip.tmp").exists(),
-            "失败留下的临时包没人收"
+            !flat.contains("std::fs::rename(&tmp,&target)"),
+            "Windows 的 rename 不覆盖旧包，不能回到删旧再换名"
         );
     }
 

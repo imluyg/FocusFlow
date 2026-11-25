@@ -525,9 +525,12 @@ fn query_years(
     }
 }
 
-/// 周期天数 → 起始 date_key（含当天，共 N 天）。None 表示不限。
-fn cutoff_day_key(days: Option<i64>) -> Option<i64> {
-    days.map(|d| day_key_of_date(Local::now().date_naive()) - clamp_query_days(d) + 1)
+/// 周期天数 → `[起始, 结束]` date_key（含当天、不含未来）。None 表示不限。
+fn period_day_keys(days: Option<i64>) -> Option<[i64; 2]> {
+    days.map(|d| {
+        let today = day_key_of_date(Local::now().date_naive());
+        [today - clamp_query_days(d) + 1, today]
+    })
 }
 
 /// 查询统计：返回 (总数, {键名: 次数})。
@@ -655,19 +658,16 @@ pub fn stats_totals(days: Option<i64>, year: Option<i32>) -> RankTotals {
         Some(y) => (vec![y], None),
         None => query_years(days, None, DOMAIN_KEYS),
     };
-    let start_dk = cutoff_day_key(days);
-    let cond = if start_dk.is_some() {
-        "date_key >= ?1"
+    let bounds = period_day_keys(days);
+    let params = bounds.as_ref().map_or(&[][..], |range| range.as_slice());
+    let cond = if bounds.is_some() {
+        "date_key >= ?1 AND date_key <= ?2"
     } else {
         ""
     };
-    let mut out = gather_rank_totals(
-        &years,
-        DOMAIN_KEYS,
-        cond,
-        start_dk.as_slice(),
-        |conn, cond, params| query_stats_in_conn(conn, cond, params, true),
-    );
+    let mut out = gather_rank_totals(&years, DOMAIN_KEYS, cond, params, |conn, cond, params| {
+        query_stats_in_conn(conn, cond, params, true)
+    });
     if let Some(g) = list_gap {
         out.unreadable.push(g);
     }
@@ -1481,19 +1481,14 @@ pub fn app_stats_totals(days: Option<i64>, year: Option<i32>) -> RankTotals {
         Some(y) => (vec![y], None),
         None => query_years(days, None, DOMAIN_APPS),
     };
-    let start_dk = cutoff_day_key(days);
-    let cond = if start_dk.is_some() {
-        "date_key >= ?1"
+    let bounds = period_day_keys(days);
+    let params = bounds.as_ref().map_or(&[][..], |range| range.as_slice());
+    let cond = if bounds.is_some() {
+        "date_key >= ?1 AND date_key <= ?2"
     } else {
         ""
     };
-    let mut out = gather_rank_totals(
-        &years,
-        DOMAIN_APPS,
-        cond,
-        start_dk.as_slice(),
-        query_apps_in_conn,
-    );
+    let mut out = gather_rank_totals(&years, DOMAIN_APPS, cond, params, query_apps_in_conn);
     if let Some(g) = list_gap {
         out.unreadable.push(g);
     }
@@ -1937,13 +1932,14 @@ pub fn device_totals(days: Option<i64>, year: Option<i32>) -> DeviceTotals {
         Some(y) => (vec![y], None),
         None => query_years(days, None, DOMAIN_DEVICES),
     };
-    let start_dk = cutoff_day_key(days);
-    let cond = if start_dk.is_some() {
-        "date_key >= ?1"
+    let bounds = period_day_keys(days);
+    let params = bounds.as_ref().map_or(&[][..], |range| range.as_slice());
+    let cond = if bounds.is_some() {
+        "date_key >= ?1 AND date_key <= ?2"
     } else {
         ""
     };
-    let mut out = gather_device_totals(&years, cond, start_dk.as_slice());
+    let mut out = gather_device_totals(&years, cond, params);
     if let Some(g) = list_gap {
         out.unreadable.push(g);
     }
@@ -3343,6 +3339,81 @@ mod tests {
         // 合法值同样走通
         let _ = get_stats(Some(7), None);
         let _ = get_daily_counts(7, None);
+    }
+
+    /// 近 N 天含今天与过去，不含时钟拨错或恢复文件带进来的未来行。
+    #[test]
+    fn finite_period_totals_exclude_future_rows_in_every_domain() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("period_future_rows");
+        let today = Local::now().date_naive();
+        let year = today.year();
+        let today_dk = day_key_of_date(today);
+        let device_key = "VID_046D&PID_C52B";
+        {
+            let conn = connection::open_rw(&paths::year_db_path(year)).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            for (dk, count, seconds) in [
+                (today_dk - 1, 2, 20),
+                (today_dk, 3, 30),
+                (today_dk + 1, 100, 1000),
+            ] {
+                conn.execute(
+                    "INSERT INTO daily_counts(date_key, count, seconds) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![dk, count, seconds],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO key_counts(date_key, key_name, count) VALUES (?1, 'A', ?2)",
+                    rusqlite::params![dk, count],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO app_usage(date_key, app_name, seconds) VALUES (?1, 'Editor', ?2)",
+                    rusqlite::params![dk, seconds],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO devices(device_key, name, kind) VALUES (?1, '鼠标', 'mouse')",
+                [device_key],
+            )
+            .unwrap();
+            let device_id = connection::device_id_of(&conn, device_key).unwrap();
+            for (dk, count) in [(today_dk - 1, 2), (today_dk, 3), (today_dk + 1, 100)] {
+                conn.execute(
+                    "INSERT INTO device_counts(date_key, device_id, count) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![dk, device_id, count],
+                )
+                .unwrap();
+            }
+        }
+        invalidate_years_cache();
+        connection::clear_ro_cache();
+
+        let keys = stats_totals(Some(2), None);
+        assert_eq!(keys.total, 5, "近 2 天只能含昨天和今天: {keys:?}");
+        assert_eq!(keys.rows.get("A"), Some(&5));
+        assert!(keys.unreadable.is_empty(), "实得 {:?}", keys.unreadable);
+
+        let apps = app_stats_totals(Some(2), None);
+        assert_eq!(apps.total, 50, "未来应用时长不该算进近 2 天: {apps:?}");
+        assert_eq!(apps.rows.get("Editor"), Some(&50));
+        assert!(apps.unreadable.is_empty(), "实得 {:?}", apps.unreadable);
+
+        let devices = device_totals(Some(2), None);
+        assert_eq!(devices.total, 5, "未来设备输入不该算进近 2 天: {devices:?}");
+        assert_eq!(devices.devices.len(), 1);
+        assert_eq!(devices.devices[0].count, 5);
+        assert!(
+            devices.unreadable.is_empty(),
+            "实得 {:?}",
+            devices.unreadable
+        );
+
+        assert_eq!(stats_totals(None, None).total, 105, "全历史仍应保留未来行");
+        assert_eq!(app_stats_totals(None, None).total, 1050);
+        assert_eq!(device_totals(None, None).total, 105);
     }
 
     /// 含当天共 N 天：N=1 只含今天，N=200 跨 200 个日期。

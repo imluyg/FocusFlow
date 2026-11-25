@@ -31,6 +31,7 @@ use crate::plugins::permissions;
 use crate::plugins::plugin_events;
 use crate::plugins::plugin_health;
 use crate::plugins::plugin_refresh;
+use crate::plugins::plugin_store;
 use crate::plugins::plugin_timers;
 use crate::plugins::resources;
 use crate::plugins::PluginView;
@@ -791,6 +792,47 @@ fn plugin_file_for(dir: &Path, stem: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+struct LoadTransaction {
+    store: Option<plugin_store::StoreSnapshot>,
+    scheduler: Option<host::SchedulerSnapshot>,
+    committed: bool,
+}
+
+impl LoadTransaction {
+    fn new(stem: &str) -> Result<Self, String> {
+        let store = plugin_store::snapshot_for_load(stem)?;
+        Ok(Self {
+            store: Some(store),
+            scheduler: Some(host::begin_scheduler_load()),
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) {
+        if let Some(snapshot) = self.scheduler.take() {
+            host::commit_scheduler_load(snapshot);
+        }
+        self.store.take();
+        self.committed = true;
+    }
+}
+
+impl Drop for LoadTransaction {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(snapshot) = self.scheduler.take() {
+            host::rollback_scheduler_load(snapshot);
+        }
+        if let Some(snapshot) = self.store.take() {
+            if let Err(e) = snapshot.rollback() {
+                tracing::error!("插件加载失败后的存储回滚也没成功：{e}");
+            }
+        }
+    }
 }
 
 impl PluginManager {
@@ -1627,11 +1669,7 @@ impl PluginManager {
         // 与调度线程那一份 owner 记账不同 —— 那条刻意不在重载时销（见 `reload_plugin`），
         // 因为线程还在为别的插件跑；这里销的是"这个实例自己的待办清单"，重载语义就是换一份。
         let timer_board = plugin_timers::new_board();
-        // 每一次（重）加载都从空表开始，台账同理：**先把上一份账落盘，再摘掉这一格**
-        // （`plugin_health::forget` 里就是这一序）。落盘的必要性在这条路上最直白 ——
-        // 热重载换的是字节，不该顺手把"这一格慢过几次、上次为什么停用"清零。
-        // 摘掉之后下一次 `board_for` 从盘上重开一格，读回来的正是刚写下去的那一份。
-        plugin_health::forget(&stem);
+        // 台账保持到候选实例提交：失败时旧实例正在用的那一格不能提前摘掉。
         // 剪贴板事件与 `focusflow.clipboard` 同一道版本闸：v1/v2 的用户插件在 Free 档
         // 根本没有权限闸，光把 `clipboard` 表摘成 nil 挡不住 `on("clipboard")` 这条订阅
         // —— 它收到的载荷就是每次复制的原文，不比主动读弱。
@@ -1671,6 +1709,7 @@ impl PluginManager {
                 );
             }
         }
+        let transaction = LoadTransaction::new(&stem)?;
         lua.load(&script)
             .set_name(&meta.manifest.name)
             .exec()
@@ -1769,18 +1808,13 @@ impl PluginManager {
             self.plugins.remove(&old);
         }
 
-        // 脚本与 `init()` 都跑完了：这一刻才用新表替换名册里旧实例那一份。
-        // 上面任何一步失败都会提前返回，旧表因此原样留着。
+        // 候选脚本与 init() 都跑完了：先提交 store/scheduler 副作用，再发布新实例。
+        let name = info.manifest.name.clone();
+        transaction.commit();
+        plugin_health::forget(&stem);
         plugin_timers::publish(&stem, timer_board);
-        self.plugins.insert(info.manifest.name.clone(), info);
+        self.plugins.insert(name.clone(), info);
         tracing::info!("插件加载成功: {}", self.plugins.len());
-        // 返回刚加载的插件名
-        let name = self
-            .plugins
-            .values()
-            .find(|p| p.file_path == path)
-            .map(|p| p.manifest.name.clone())
-            .ok_or_else(|| "加载后未找到插件".to_string())?;
         Ok(name)
     }
 
@@ -3949,6 +3983,125 @@ function get_view() return {{ title = "{name}", widgets = {{ {{type="label", tex
             None,
             "最后一个用户走了就该回收"
         );
+    }
+
+    #[test]
+    fn a_failed_reload_restores_store_scheduler_and_health_side_effects() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("reload_side_effects");
+        let plugins = tmp.path().join("plugins");
+        let p = write_lua(
+            &plugins,
+            "tx_reload",
+            "PLUGIN_NAME = \"副作用回滚\"\n\
+             function init()\n\
+               focusflow.store.set(\"keep\", \"old\")\n\
+               focusflow.scheduler_tasks()\n\
+             end\n\
+             function get_view() return { title = \"旧视图\" } end\n",
+        );
+        let mut pm = manager_in(tmp.path());
+        pm.load_plugin(&p, PluginSource::Builtin)
+            .expect("好版本该能加载");
+        plugin_store::flush("tx_reload").unwrap();
+        let health = plugin_health::board_for("tx_reload");
+        health.lock().unwrap().record(
+            plugin_health::HookKind::View,
+            std::time::Duration::from_micros(1000),
+        );
+        plugin_health::flush("tx_reload").unwrap();
+
+        write_lua(
+            &plugins,
+            "tx_reload",
+            "PLUGIN_NAME = \"副作用回滚\"\n\
+             function init()\n\
+               focusflow.store.clear()\n\
+               focusflow.store.flush()\n\
+               focusflow.scheduler_shutdown()\n\
+               error(\"candidate failed\")\n\
+             end\n",
+        );
+        assert!(!pm.reload_plugin("tx_reload"), "坏版本必须重载失败");
+        assert_eq!(
+            plugin_store::get("tx_reload", "keep").unwrap(),
+            Some(serde_json::json!("old")),
+            "候选 init 清掉的数据必须恢复"
+        );
+        assert!(host::scheduler_has_owner_for_test("tx_reload"));
+        assert_eq!(host::scheduler_state_for_test(), Some(1));
+        assert!(std::sync::Arc::ptr_eq(
+            &health,
+            &plugin_health::board_for("tx_reload")
+        ));
+        assert_eq!(
+            plugin_health::board_for("tx_reload")
+                .lock()
+                .unwrap()
+                .samples(plugin_health::HookKind::View)
+                .map(|h| h.calls()),
+            Some(1),
+            "失败重载不能提前摘掉旧健康台账"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        let disk =
+            std::fs::read_to_string(paths::plugin_state_path("tx_reload").join("state.json"))
+                .unwrap();
+        assert!(
+            disk.contains("old"),
+            "去抖保存也不能把候选数据留在盘上：{disk}"
+        );
+        assert!(pm.get_plugin("副作用回滚").unwrap().view.is_some());
+
+        write_lua(
+            &plugins,
+            "tx_reload",
+            "PLUGIN_NAME = \"副作用回滚\"\n\
+             function init()\n\
+               focusflow.store.set(\"keep\", \"new\")\n\
+               focusflow.scheduler_tasks()\n\
+             end\n\
+             function get_view() return { title = \"新视图\" } end\n",
+        );
+        assert!(pm.reload_plugin("tx_reload"), "好版本必须能提交");
+        assert_eq!(
+            plugin_store::get("tx_reload", "keep").unwrap(),
+            Some(serde_json::json!("new"))
+        );
+        assert!(host::scheduler_has_owner_for_test("tx_reload"));
+        assert_eq!(
+            plugin_health::board_for("tx_reload")
+                .lock()
+                .unwrap()
+                .samples(plugin_health::HookKind::View)
+                .map(|h| h.calls()),
+            Some(1),
+            "成功重载应从盘上接回旧健康历史"
+        );
+        assert!(pm.unload_plugin("副作用回滚"));
+    }
+
+    #[test]
+    fn a_failed_first_load_rolls_back_store_writes() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("first_load_store_rollback");
+        let plugins = tmp.path().join("plugins");
+        let p = write_lua(
+            &plugins,
+            "tx_first",
+            "PLUGIN_NAME = \"首载回滚\"\n\
+             function init()\n\
+               focusflow.store.set(\"keep\", \"candidate\")\n\
+               focusflow.store.flush()\n\
+               error(\"first load failed\")\n\
+             end\n",
+        );
+        let mut pm = manager_in(tmp.path());
+        assert!(pm.load_plugin(&p, PluginSource::Builtin).is_err());
+        assert_eq!(plugin_store::get("tx_first", "keep").unwrap(), None);
+        assert!(!paths::plugin_state_path("tx_first")
+            .join("state.json")
+            .exists());
     }
 
     /// 撞名闸按**源文件**判重之后，两个方向都要钉住：
