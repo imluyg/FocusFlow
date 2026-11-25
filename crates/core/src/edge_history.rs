@@ -228,9 +228,15 @@ fn cleanup_stale_copies_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let legacy = paths::data_dir().join("_edge_history_temp.db");
-        let _ = std::fs::remove_file(&legacy);
-        for suffix in ["-wal", "-shm"] {
-            let _ = std::fs::remove_file(crate::data_location::with_suffix(&legacy, suffix));
+        // 与正常路径同一把尺子：删不动要说出来（NotFound 不算）。原先三处 `let _ =`
+        // 让"这份明文浏览记录还在"在日志里一个字都没有，而 ONCE 又要等到下次启动。
+        let stuck = remove_temp_copy(&legacy);
+        if !stuck.is_empty() {
+            tracing::warn!(
+                "旧版留在数据目录的 Edge 历史明文副本删不掉（{}）—— \
+                 它会一直留着，直到下一次启动的清扫再试",
+                stuck.join("；")
+            );
         }
         let report = sweep_stale_temp_copies_in(&std::env::temp_dir(), STALE_TEMP_COPY_AGE);
         // 三种结局各说一句：副本里是明文浏览记录，"清不动"和"没得清"必须分得开，
@@ -1298,6 +1304,28 @@ mod tests {
             );
             drop(blocker);
         }
+    }
+
+    /// 启动清扫那一支（旧版数据目录里的副本）也要走同一把"删不动要说"的尺子。
+    ///
+    /// `cleanup_stale_copies_once` 一个进程只跑一次：裸 `remove_file` 吞掉的失败，
+    /// 在本次运行里再没有任何出口。这条钉的是"别回到 `let _ =`"。
+    #[test]
+    fn the_legacy_copy_cleanup_uses_the_reporting_remover() {
+        let src = include_str!("edge_history.rs");
+        let prod = &src[..src.rfind("#[cfg(test)]").expect("测试模块起点找不到了")];
+        let start = prod
+            .find("fn cleanup_stale_copies_once")
+            .expect("cleanup_stale_copies_once 不见了");
+        let body = &prod[start..];
+        assert!(
+            body.contains("remove_temp_copy(&legacy)"),
+            "旧版副本的删除必须走带回报的 remove_temp_copy，否则删不动就无声无息"
+        );
+        assert!(
+            !body.contains("remove_file(&legacy)"),
+            "裸 remove_file 会把「删不动」折成「没这回事」"
+        );
     }
 
     /// 缺 WAL 的副本不许拿去查：补档历史日会把偏小的数永久写进本地缓存。
