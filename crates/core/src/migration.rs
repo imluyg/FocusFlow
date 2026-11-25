@@ -380,45 +380,46 @@ fn import_year_db(src_dir: &Path, year: i32, summary: &mut ImportSummary) -> any
                 retry_hint(&leftover)
             ));
         }
-        let prepared = (|| -> anyhow::Result<i64> {
+        // 开库 / 读指纹 / 建表：任一失败都说明这份副本**不可用**（旧盘带来的只读属性、
+        // 源库本身损坏）。留在目标位置的话，下一次导入会因为它"已存在"改走合并分支
+        // （读的正是这份），那一年就再也导不进来 —— 清掉，重试才仍走整体复制的快路。
+        let prepared = (|| -> anyhow::Result<(Option<(i64, i64)>, String)> {
             let conn = connection::open_rw(&dst_path)?;
             // 先从刚复制的原形状读指纹；ensure_schema 会补出空 daily_counts，
             // 那会让“源库没有时长表”与“源库有一张空时长表”算出不同哈希。
             let kl = key_log_fingerprint(&conn)?;
             let content_hash = logical_content_hash(&conn)?;
             connection::ensure_schema(&conn, year)?;
-            drop(conn);
-            // **标记写在聚合之前**，与下面合并分支同一条理由（那里的注释是完整版）：
-            // `migrate_v2` 是累加式且没有去重键，"这份导过了"只记在 `meta` 的
-            // `imported_src_*` 里。旧顺序在两步之间失败时留下「已聚合、未标记」，
-            // 用户点重试 ⇒ 读不到标记 ⇒ 那一年再累加一遍。整库复制这一支以前正好漏在
-            // 外面（"整库都搬过来了，标记写不上去有什么关系"），而它一样要跑 `migrate_v2`。
-            record_import_marker(&dst_path, &src_path, kl, &content_hash)?;
-            crate::db::maintenance::migrate_v2();
-            // 统计导入条数（聚合表总量）
-            let conn = connection::open_ro(&dst_path)?;
-            let count: i64 = conn.query_row(
-                "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
-                [],
-                |r| r.get(0),
-            )?;
-            Ok(count)
+            Ok((kl, content_hash))
         })();
-        return match prepared {
-            Ok(count) => Ok(count),
+        let (kl, content_hash) = match prepared {
+            Ok(v) => v,
             Err(e) => {
-                // 整库复制成功之后开库/建表/写标记失败：半份或读不出的副本留在目标位置，
-                // 下一次导入会因为它"已存在"改走合并分支（读的正是这份）；旧盘带过来的
-                // 只读属性更会让它永远导不进来。与复制、WAL 那两支同一处置：先清掉，
-                // 重试才仍走整体复制这条快路。
                 let leftover = rollback_fresh_copy(&dst_path);
-                Err(anyhow::anyhow!(
-                    "{year} 年库已整库复制，但后续开库/建表/写导入标记失败（{e}）：\
+                return Err(anyhow::anyhow!(
+                    "{year} 年库已整库复制，但开库/读指纹/建表失败（{e}）：\
                      本次导入未完成。{}",
                     retry_hint(&leftover)
-                ))
+                ));
             }
         };
+        // **标记写在聚合之前**，与下面合并分支同一条理由（那里的注释是完整版）：
+        // `migrate_v2` 是累加式且没有去重键，"这份导过了"只记在 `meta` 的
+        // `imported_src_*` 里。旧顺序在两步之间失败时留下「已聚合、未标记」，
+        // 用户点重试 ⇒ 读不到标记 ⇒ 那一年再累加一遍。整库复制这一支以前正好漏在
+        // 外面（"整库都搬过来了，标记写不上去有什么关系"），而它一样要跑 `migrate_v2`。
+        // 这几步失败时副本本身仍是可用的，刻意**不删**：重试会走合并分支并把标记补上，
+        // 幂等口径由那条路负责（既有用例钉着"重试不翻倍"）。
+        record_import_marker(&dst_path, &src_path, kl, &content_hash)?;
+        crate::db::maintenance::migrate_v2();
+        // 统计导入条数（聚合表总量）
+        let conn = connection::open_ro(&dst_path)?;
+        let count: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(count), 0) FROM daily_counts",
+            [],
+            |r| r.get(0),
+        )?;
+        return Ok(count);
     }
 
     // 目标库已存在：先把导入标记读一次，而且**只读一次**（下面两处都用这份）。
