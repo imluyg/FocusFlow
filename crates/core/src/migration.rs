@@ -11,7 +11,7 @@
 //!   或 `daily_counts.seconds` 里，同一天取两侧较大值 —— 幂等且不覆盖新值）
 //! - 重复导入靠逻辑内容哈希（key_log 明细 + 活跃时长）跳过；旧版本留下的
 //!   大小/mtime 与行数/最大时间戳标记只作兼容回退 —— 聚合是累加式，重聚会翻倍
-//! - 附属库（accounting/pomodoro/scheduler/edge_history）：SQLite 在线备份覆盖，
+//! - 附属库（数据目录里所有 `focusflow_<名字>.db`，年度库除外）：SQLite 在线备份覆盖，
 //!   **覆盖前先做一致快照**（见 `backup_before_overwrite`）——
 //!   导入目录由用户自己选，选错目录不能让当前数据凭空消失
 //! - 目标库不存在时由在线备份 API 直接创建
@@ -41,13 +41,29 @@ pub struct ImportSummary {
     pub errors: Vec<String>,
 }
 
-/// 附属库文件名列表（直接复制）。
-const AUX_DBS: &[&str] = &[
-    "focusflow_accounting.db",
-    "focusflow_pomodoro.db",
-    "focusflow_scheduler.db",
-    "focusflow_edge_history.db",
-];
+/// 附属库的发现规则：数据目录里凡是 `focusflow_<名字>.db` 且不是年度库的，都算附属库。
+///
+/// 以前这里是四行硬编码，代价不是"多写四行"而是**新出现的库永远导不进来**：
+/// 剪贴板库（`focusflow_clipboard.db`，含置顶与图片等用户数据）就是这样被静默漏掉的，
+/// 而回执照报「导入完成」—— 用户随后清掉旧目录，那份数据就没了。
+/// 备份那一侧早就改成通用发现（见 `db::maintenance::aux_db_name`），两处读同一把尺子。
+///
+/// 返回 `(文件名清单, 读目录失败的原因)`：读不出来不能说成"旧目录里没有附属库"。
+fn list_aux_dbs(dir: &Path) -> (Vec<String>, Option<String>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(e) => return (Vec::new(), Some(format!("{}: {e}", dir.display()))),
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|e| crate::db::maintenance::aux_db_name(&e.path()).is_some())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    // 顺序稳定：回执与日志要能对拍，别让目录返回顺序决定导入顺序
+    out.sort();
+    (out, None)
+}
 
 /// 从旧数据目录导入全部数据到当前数据目录。
 pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
@@ -76,7 +92,14 @@ pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
     }
 
     // 2) 附属库：整体复制（表独立，无法按行合并）
-    for aux in AUX_DBS {
+    let (aux_dbs, aux_why) = list_aux_dbs(src_dir);
+    if let Some(why) = aux_why {
+        summary.errors.push(format!(
+            "旧目录里的附属库没列全（{why}）—— 本次只处理已列出的那些，没列出的不会导入"
+        ));
+    }
+    for aux in &aux_dbs {
+        let aux = aux.as_str();
         let src = src_dir.join(aux);
         // 这一问也走那把三态尺子：`!src.exists()` 在"旧目录里那份正被握着、属性问不出"时同样
         // 回 false ⇒ 整块附属库被当成「旧目录里没有」跳过，而这一轮报的还是"导入完成"——
@@ -1789,6 +1812,41 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".import-backup-"))
             .collect();
         assert_eq!(kept.len(), 1, "被覆盖的现有库必须留档一份");
+    }
+
+    /// 附属库按目录里的事实发现，不再靠四行硬编码：剪贴板库与插件自建库都要导进来。
+    ///
+    /// 这条钉的是"新出现的库永远导不进来"那类缺口：剪贴板库（含置顶与图片）
+    /// 原先不在 `AUX_DBS` 里，导入回执照报「导入完成」。
+    #[test]
+    fn clipboard_and_plugin_dbs_are_imported_by_discovery() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("aux_discovery");
+        let data = crate::paths::data_dir();
+        let src_dir = _dir.path().join("old");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        for name in ["focusflow_clipboard.db", "focusflow_mytool.db"] {
+            let conn = Connection::open(src_dir.join(name)).unwrap();
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES ('legacy');")
+                .unwrap();
+        }
+        // 不是 `focusflow_<名字>.db` 的形状不进清单（备份与导入同一把尺子）
+        std::fs::write(src_dir.join("focusflow_.db"), b"not a sqlite file").unwrap();
+
+        let summary = import_legacy_data(&src_dir);
+        assert_eq!(
+            summary.copied_aux,
+            vec![
+                "focusflow_clipboard.db".to_string(),
+                "focusflow_mytool.db".to_string()
+            ],
+            "剪贴板与插件自建库都该被发现并复制: {summary:?}"
+        );
+        let copied: String = Connection::open(data.join("focusflow_clipboard.db"))
+            .unwrap()
+            .query_row("SELECT x FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(copied, "legacy", "剪贴板库必须真的被导进来");
     }
 
     #[cfg(windows)]

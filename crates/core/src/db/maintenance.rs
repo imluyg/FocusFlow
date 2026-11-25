@@ -2080,7 +2080,10 @@ fn auxiliary_db_paths() -> Vec<(String, String, std::path::PathBuf)> {
 /// 年度库必须排除：它有自己的那一条备份与轮转流程（按年份分组、异常体检的基线也按它算）。
 /// 名字只收字母/数字/下划线且非空 —— `focusflow_.db`、`focusflow_a-b.db` 这种形状不进清单，
 /// 因为它们进不了备份文件名那一段（会拼出一个解不回来的名字）。
-fn aux_db_name(path: &std::path::Path) -> Option<String> {
+///
+/// 导入侧（`migration::list_aux_dbs`）也读这一把尺子：备份与导入各列一份清单的话，
+/// 新出现的库会在其中一侧被静默漏掉。
+pub(crate) fn aux_db_name(path: &std::path::Path) -> Option<String> {
     let file = path.file_name()?.to_str()?;
     let stem = file.strip_prefix("focusflow_")?.strip_suffix(".db")?;
     if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
