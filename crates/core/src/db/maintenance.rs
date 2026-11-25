@@ -1258,6 +1258,25 @@ fn verify_backup(dst: &Path) -> BackupVerify {
     }
 }
 
+fn rollback_quarantined_backup(dst: &Path, target: &Path, moved: &[&str]) -> Vec<String> {
+    let mut leftover = Vec::new();
+    for suffix in moved.iter().rev() {
+        let from = crate::data_location::with_suffix(target, suffix);
+        let to = crate::data_location::with_suffix(dst, suffix);
+        if let Err(e) = std::fs::rename(&from, &to) {
+            leftover.push(format!("{} 搬不回 {}（{e}）", from.display(), to.display()));
+        }
+    }
+    if let Err(e) = std::fs::rename(target, dst) {
+        leftover.push(format!(
+            "{} 搬不回 {}（{e}）",
+            target.display(),
+            dst.display()
+        ));
+    }
+    leftover
+}
+
 /// 把"这次验不了"的备份改名留档，返回新路径。
 ///
 /// 名字以 `.db.unverified` 结尾：轮转与 `newest_backup_of_group` 只认 `.db`，
@@ -1276,16 +1295,40 @@ fn quarantine_backup(dst: &Path) -> Result<std::path::PathBuf, String> {
     }
     std::fs::rename(dst, &target)
         .map_err(|e| format!("改名 {} → {} 失败: {e}", dst.display(), target.display()))?;
+    let mut moved: Vec<&str> = Vec::new();
     for suffix in ["-wal", "-shm"] {
         let from = crate::data_location::with_suffix(dst, suffix);
-        if from.exists() {
+        let present = match std::fs::metadata(&from) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                let leftover = rollback_quarantined_backup(dst, &target, &moved);
+                return Err(format!(
+                    "{} 在不在问不出（{e}）；留档已回滚{}",
+                    from.display(),
+                    if leftover.is_empty() {
+                        String::new()
+                    } else {
+                        format!("，但仍有残留：{}", leftover.join("；"))
+                    }
+                ));
+            }
+        };
+        if present {
             let to = crate::data_location::with_suffix(&target, suffix);
             if let Err(e) = std::fs::rename(&from, &to) {
-                tracing::warn!(
-                    "验不了的备份留档时，sidecar 没跟着搬（{}）：{e}",
-                    from.display()
-                );
+                let leftover = rollback_quarantined_backup(dst, &target, &moved);
+                return Err(format!(
+                    "{} 没能一起留档（{e}）；留档已回滚{}",
+                    from.display(),
+                    if leftover.is_empty() {
+                        String::new()
+                    } else {
+                        format!("，但仍有残留：{}", leftover.join("；"))
+                    }
+                ));
             }
+            moved.push(suffix);
         }
     }
     Ok(target)
@@ -1477,22 +1520,23 @@ fn finalize_backup(dst: &Path) {
 ///
 /// sidecar 删不掉不算失败：`sweep_stale_sidecars` 每轮启动都会再清一遍。
 fn remove_backup(db: &Path) -> Result<(), String> {
-    let main = std::fs::remove_file(db);
-    for p in sidecar_paths(db) {
-        if let Err(e) = std::fs::remove_file(&p) {
-            // rollback journal 模式下根本没有 sidecar：不存在是常态，不进这一格
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(
-                    "备份的 sidecar 没删掉（下一轮启动的清扫还会再试）: {} {e}",
-                    p.display()
-                );
+    match std::fs::remove_file(db) {
+        Ok(()) => {
+            for p in sidecar_paths(db) {
+                if let Err(e) = std::fs::remove_file(&p) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::debug!(
+                            "备份的 sidecar 没删掉（下一轮启动的清扫还会再试）: {} {e}",
+                            p.display()
+                        );
+                    }
+                }
             }
+            Ok(())
         }
-    }
-    match main {
-        Ok(()) => Ok(()),
-        // 主文件本来就不在 = 目标状态已经达成，不是失败
+        // 主文件本来就不在 = 目标状态已经达成；sidecar 留给专门的孤儿清扫。
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // 主文件还在时绝不能先删 WAL：那里可能仍有唯一一份未 checkpoint 的数据。
         Err(e) => Err(format!("{}: {e}", db.display())),
     }
 }
@@ -2802,6 +2846,21 @@ fn write_source_fingerprint(backup: &Path, fp: Option<(i64, i128)>) {
     }
 }
 
+fn source_wal_may_have_data(src: &Path) -> bool {
+    let wal = sidecar_paths(src)[0].clone();
+    match std::fs::metadata(&wal) {
+        Ok(meta) => meta.len() > 0,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!(
+                "读不到源库 WAL 的状态（{}）：{e} —— 本轮保守备份，不跳过可能只在 WAL 里的改动",
+                wal.display()
+            );
+            true
+        }
+    }
+}
+
 /// 该年度库是否还需要备份：与**本组最新备份记录的源库指纹**比对。
 ///
 /// 指纹一致 → 这份备份就是当前源库状态的快照，跳过；任何读取失败/指纹缺失
@@ -2811,6 +2870,9 @@ fn year_db_needs_backup(year: i32, current: Option<(i64, i128)>) -> bool {
         // 源库状态读不到（刚被删/权限异常）：保守备份
         return true;
     };
+    if source_wal_may_have_data(&paths::year_db_path(year)) {
+        return true;
+    }
     let newest = match newest_backup_of_group(&year.to_string()) {
         Ok(path) => path,
         // 问不出这一组有没有备份 ⇒ 保守再备份一次：多备份一份只是开销，跳过一年是损失。
@@ -4021,6 +4083,36 @@ mod tests {
         assert!(err.contains("写不进"), "要说清是哪一小时的写不进去: {err}");
     }
 
+    #[test]
+    fn a_nonempty_source_wal_prevents_the_history_backup_skip() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("history_backup_wal");
+        let year = 2024;
+        let src = paths::year_db_path(year);
+        {
+            let conn = connection::open_rw(&src).unwrap();
+            connection::ensure_schema(&conn, year).unwrap();
+            conn.execute(
+                "INSERT INTO daily_counts(date_key, count) VALUES (1, 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let fp = source_fingerprint(&src);
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+        let backup = paths::backup_dir().join("focusflow_2024_20260101_000000.db");
+        std::fs::copy(&src, &backup).unwrap();
+        write_source_fingerprint(&backup, fp);
+        assert!(!year_db_needs_backup(year, fp), "主文件指纹一致时允许跳过");
+
+        let wal = crate::data_location::with_suffix(&src, "-wal");
+        std::fs::write(&wal, b"uncheckpointed-change").unwrap();
+        assert_eq!(source_fingerprint(&src), fp, "夹具前提：主文件指纹没变");
+        assert!(year_db_needs_backup(year, fp), "非空 WAL 有变化时不能跳过");
+        std::fs::write(&wal, b"").unwrap();
+        assert!(!year_db_needs_backup(year, fp), "空 WAL 不含未落库改动");
+    }
+
     /// 「没有可比的那一份」与「有一份却读不动」是两件事，不许共用一个 `None`。
     ///
     /// 后者意味着这一轮的异常体检没有比对对象 —— 而"本轮全部通过校验"那句照打，
@@ -4211,6 +4303,59 @@ mod tests {
             remove_backup(&p).is_ok(),
             "句柄放开之后该删得掉 —— 证明上面的失败原因是句柄，不是路径或权限"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_sidecar_quarantine_restores_the_main_and_moved_sidecars() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("quarantine_sidecar_rollback");
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+        let db = paths::backup_dir().join("focusflow_2026_20260102_000002.db");
+        let wal = crate::data_location::with_suffix(&db, "-wal");
+        let shm = crate::data_location::with_suffix(&db, "-shm");
+        std::fs::write(&db, b"main").unwrap();
+        std::fs::write(&wal, b"wal").unwrap();
+        std::fs::write(&shm, b"shm").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&shm)
+            .unwrap();
+        assert!(quarantine_backup(&db).is_err());
+        assert_eq!(std::fs::read(&db).unwrap(), b"main", "主库要回位");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"wal", "先搬的 WAL 要回位");
+        assert_eq!(
+            std::fs::read(&shm).unwrap(),
+            b"shm",
+            "搬不动的 SHM 要留在原位"
+        );
+        assert!(!db.with_extension("db.unverified").exists(), "不留半套留档");
+        drop(holder);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_main_backup_delete_keeps_its_wal() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("remove_backup_keeps_wal");
+        std::fs::create_dir_all(paths::backup_dir()).unwrap();
+        let db = paths::backup_dir().join("focusflow_2026_20260102_000001.db");
+        let wal = crate::data_location::with_suffix(&db, "-wal");
+        std::fs::write(&db, b"main").unwrap();
+        std::fs::write(&wal, b"uncheckpointed-tail").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&db)
+            .unwrap();
+        assert!(remove_backup(&db).is_err());
+        assert_eq!(std::fs::read(&wal).unwrap(), b"uncheckpointed-tail");
+        drop(holder);
+        assert!(remove_backup(&db).is_ok());
+        assert!(!wal.exists(), "主文件删成功后 sidecar 才可一起删");
     }
 
     /// 一条**平台前提**（本轮现量，三个产品路径都踩在它上面：

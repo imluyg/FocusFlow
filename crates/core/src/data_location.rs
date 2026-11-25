@@ -355,6 +355,18 @@ fn copy_file(from: &Path, to: &Path, summary: &mut CopySummary) -> anyhow::Resul
     Ok(())
 }
 
+fn restore_kept_sidecars(dst: &Path, kept: &Path, moved: &[&str]) -> Vec<String> {
+    let mut leftover = Vec::new();
+    for suffix in moved.iter().rev() {
+        let from = with_suffix(kept, suffix);
+        let to = with_suffix(dst, suffix);
+        if let Err(e) = std::fs::rename(&from, &to) {
+            leftover.push(format!("{} 搬不回 {}（{e}）", from.display(), to.display()));
+        }
+    }
+    leftover
+}
+
 /// 把目标上原有的文件改名成 `<原名>.pre-switch-<时间戳>`；**确认**不存在时才是 No-op。
 ///
 /// 用 rename 而不是 copy：省一次全量读写，也不会出现"复制到一半失败、原文件与
@@ -391,23 +403,52 @@ fn keep_aside(dst: &Path) -> anyhow::Result<Option<PathBuf>> {
     // WAL 附属文件必须跟着主库走：只搬主库，目标目录里那份 `-wal` 就留在原位配上了新主库。
     // 附属文件本就不存在是常态（多数库早就 checkpoint 了），所以只在存在时搬；
     // 搬不动就当失败：宁可这次不覆盖，也不能留下主库与 wal 成套但来源不同的两份。
+    let mut moved: Vec<&str> = Vec::new();
     for suffix in ["-wal", "-shm"] {
         let sidecar = with_suffix(dst, suffix);
         match sidecar.metadata() {
             Ok(_) => {
-                std::fs::rename(&sidecar, with_suffix(&kept, suffix))
-                    .map_err(|e| anyhow::anyhow!("{} 没能一起留档: {e}", sidecar.display()))?;
+                if let Err(e) = std::fs::rename(&sidecar, with_suffix(&kept, suffix)) {
+                    let leftover = restore_kept_sidecars(dst, &kept, &moved);
+                    anyhow::bail!(
+                        "{} 没能一起留档（{e}）；已搬边车已恢复{}",
+                        sidecar.display(),
+                        if leftover.is_empty() {
+                            String::new()
+                        } else {
+                            format!("，但仍有残留：{}", leftover.join("；"))
+                        }
+                    );
+                }
+                moved.push(suffix);
             }
             Err(e) if is_confirmed_absent(&e) => {}
             Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "读不出 {} 在不在（{e}）：说不准就不动它旁边那份主库",
-                    sidecar.display()
-                ))
+                let leftover = restore_kept_sidecars(dst, &kept, &moved);
+                anyhow::bail!(
+                    "读不出 {} 在不在（{e}）；已搬边车已恢复{}",
+                    sidecar.display(),
+                    if leftover.is_empty() {
+                        String::new()
+                    } else {
+                        format!("，但仍有残留：{}", leftover.join("；"))
+                    }
+                );
             }
         }
     }
-    std::fs::rename(dst, &kept)?;
+    if let Err(e) = std::fs::rename(dst, &kept) {
+        let leftover = restore_kept_sidecars(dst, &kept, &moved);
+        anyhow::bail!(
+            "{} 没能留档（{e}）；已搬边车已恢复{}",
+            dst.display(),
+            if leftover.is_empty() {
+                String::new()
+            } else {
+                format!("，但仍有残留：{}", leftover.join("；"))
+            }
+        );
+    }
     Ok(Some(kept))
 }
 
@@ -1069,6 +1110,34 @@ mod tests {
             bad.push("保护段必须走那把三态尺子".to_string());
         }
         assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_sidecar_keep_aside_restores_the_whole_set() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = paths::test_app_dir_lock();
+        let app = paths::test_app_dir("keep_aside_sidecar_rollback");
+        let dst = app.path().join("focusflow_accounting.db");
+        let wal = with_suffix(&dst, "-wal");
+        let shm = with_suffix(&dst, "-shm");
+        write_file(&dst, "main");
+        write_file(&wal, "wal");
+        write_file(&shm, "shm");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&shm)
+            .unwrap();
+        assert!(keep_aside(&dst).is_err());
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "main");
+        assert_eq!(std::fs::read_to_string(&wal).unwrap(), "wal");
+        assert_eq!(std::fs::read_to_string(&shm).unwrap(), "shm");
+        assert!(!std::fs::read_dir(app.path())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(".pre-switch-")));
+        drop(holder);
     }
 
     fn write_file(p: &Path, content: &str) {
