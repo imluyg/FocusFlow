@@ -761,14 +761,8 @@ pub fn write(stem: &str, doc: &HealthDoc) -> Result<(), String> {
             .map_err(|e| format!("{} 建不出来: {e}", parent.display()))?;
     }
     let json = serde_json::to_string_pretty(doc).map_err(|e| format!("台账排不出 JSON: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json.as_bytes())
-        .map_err(|e| format!("{} 写不出去: {e}", tmp.display()))?;
-    if path.exists() {
-        std::fs::remove_file(&path).ok();
-    }
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| format!("{} 换不到 {}：{e}", tmp.display(), path.display()))
+    crate::config::atomic_write(&path, &json)
+        .map_err(|e| format!("{} 写不出去: {e:#}", path.display()))
 }
 
 /// 读回一份台账。读不出来分两档说：没这份文件（`Ok(None)`，新插件的正常样子）与
@@ -1478,6 +1472,49 @@ mod detail_tests {
                 .map(|h| h.calls),
             Some(1)
         );
+    }
+
+    #[test]
+    fn health_write_uses_the_shared_atomic_writer() {
+        let src = include_str!("plugin_health.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
+        let at = prod.find("pub fn write(").expect("台账写入不见了");
+        let end = prod[at..]
+            .find("\n}\n")
+            .map(|n| at + n + 3)
+            .unwrap_or(prod.len());
+        let body = &prod[at..end];
+        assert!(
+            body.contains("crate::config::atomic_write"),
+            "台账要走原子写"
+        );
+        assert!(!body.contains("remove_file(&path)"), "不能先删旧台账再换名");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_health_file_keeps_the_old_doc_when_replacement_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = paths::test_app_dir_lock();
+        let _app = paths::test_app_dir("health_locked_write");
+        let old = HealthDoc {
+            stops: 1,
+            ..HealthDoc::default()
+        };
+        write("locked_health", &old).unwrap();
+        let path = health_file("locked_health");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .unwrap();
+        let edited = HealthDoc {
+            stops: 2,
+            ..HealthDoc::default()
+        };
+        assert!(write("locked_health", &edited).is_err());
+        assert_eq!(read("locked_health").unwrap(), Some(old));
+        drop(holder);
     }
 
     #[test]

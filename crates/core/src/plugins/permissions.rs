@@ -246,14 +246,8 @@ pub fn write_grants(stem: &str, grants: &Grants) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "授权记录的路径没有上一层，写不下去".to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| format!("建授权目录失败: {e}"))?;
-    let bytes = serde_json::to_vec_pretty(grants).map_err(|e| format!("序列化失败: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("写临时授权文件失败: {e}"))?;
-    // Windows 上 rename 不覆盖已存在的目标，先摘掉旧的
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| format!("换掉旧授权记录失败: {e}"))?;
-    }
-    std::fs::rename(&tmp, &path).map_err(|e| format!("换掉授权记录失败: {e}"))
+    let text = serde_json::to_string_pretty(grants).map_err(|e| format!("序列化失败: {e}"))?;
+    crate::config::atomic_write(&path, &text).map_err(|e| format!("换掉授权记录失败: {e:#}"))
 }
 
 /// 撤销授权（用户点「停用授权」或权限变了）：文件删掉，回到「没授权过」。
@@ -799,6 +793,51 @@ mod tests {
         revoke_grants(stem).expect("撤销该成功");
         assert_eq!(read_grants(stem), GrantRead::Absent);
         revoke_grants(stem).expect("再撤一次是空操作，不该报错");
+    }
+
+    #[test]
+    fn write_grants_uses_the_shared_atomic_writer() {
+        let src = include_str!("permissions.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
+        let at = prod.find("pub fn write_grants(").expect("授权写入不见了");
+        let end = prod[at..]
+            .find("\n}\n")
+            .map(|n| at + n + 3)
+            .unwrap_or(prod.len());
+        let body = &prod[at..end];
+        assert!(
+            body.contains("crate::config::atomic_write"),
+            "授权记录要走原子写"
+        );
+        assert!(!body.contains("remove_file(&path)"), "不能先删旧授权再换名");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_grants_file_keeps_the_old_record_when_replacement_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _lock = crate::paths::test_app_dir_lock();
+        let _app = crate::paths::test_app_dir("grants_locked");
+        let stem = "locked_plugin";
+        let old = Grants {
+            permission_hash: permission_hash(&p(&["stats.read"])),
+            content_hash: content_hash(b"old"),
+            granted: p(&["stats.read"]),
+        };
+        write_grants(stem, &old).unwrap();
+        let path = grants_file(stem).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .unwrap();
+        let edited = Grants {
+            content_hash: content_hash(b"new"),
+            ..old.clone()
+        };
+        assert!(write_grants(stem, &edited).is_err());
+        assert_eq!(read_grants(stem), GrantRead::Found(old));
+        drop(holder);
     }
 
     /// 判定那一头不许沾运行时类型（方案 3.4 那条判据在权限这一族的照法）。
