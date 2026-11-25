@@ -494,7 +494,23 @@ pub fn is_safe_state_stem(stem: &str) -> bool {
     // `Path::join` 会**替换掉整段基路径** —— 落点从 `data/plugins/state/` 变成
     // 进程当前目录所在的盘（`C:evil/state.json`），与 `..` 是同一类越界。
     // `.` 则会算回 `state/` 根那一格，把某个插件的状态写进公共目录。
-    !stem.is_empty() && stem != "." && stem != ".." && !stem.contains(['/', '\\', ':', '\0'])
+    // 结尾的点和空格同样不行：Windows 建目录时会把它们吞掉，`p.` 与 `p` 落到同一格
+    // （`p..lua` 的 `file_stem()` 正是 `p.`）—— 两个插件共享状态与授权，隔离就失效了。
+    let trimmed = stem.trim_end_matches([' ', '.']);
+    !stem.is_empty()
+        && stem == trimmed
+        && stem != "."
+        && stem != ".."
+        && !stem.contains(['/', '\\', ':', '\0'])
+}
+
+/// 状态目录名的**碰撞键**：Windows 文件系统不区分大小写，且会吞掉结尾的点和空格。
+///
+/// 两个 stem 算出同一个键 ⇒ 在这台机器上落到同一格 `state/<stem>/`。只用于判重
+/// （扫描时"后一处同名的不加载"），**不要拿它拼路径** —— 拼路径仍用原名，判据仍是
+/// [`is_safe_state_stem`]。
+pub fn state_stem_collision_key(stem: &str) -> String {
+    stem.trim_end_matches([' ', '.']).to_lowercase()
 }
 
 /// 某个插件状态目录的**位置**，不建目录 —— 读一侧用它。
@@ -518,7 +534,7 @@ pub fn plugin_state_dir(stem: &str) -> PathBuf {
     let safe = is_safe_state_stem(stem);
     if !safe {
         tracing::error!(
-            "插件状态目录的名字不合法（{stem}）：只认插件文件名，不许带路径分隔或 .. —— \
+            "插件状态目录的名字不合法（{stem}）：只认插件文件名，不许带路径分隔、.. 或结尾的点/空格 —— \
              本次不落盘，别去 {} 底下找它",
             plugins_state_dir().display()
         );
@@ -871,7 +887,17 @@ mod tests {
         // 越界的名字不落盘、只出声，交回去的路径就是 state/ 那一格本身（不是某个插件的目录）。
         // `C:evil` 与 `.` 是同一族的另外两个口子：前者带 Windows 盘符前缀，join 会整段替换
         // 基路径；后者会算回 `state/` 根。两者都必须交回根、并点名。
-        for evil in ["../grants", "..\\x", "a/b", "..", ".", "C:evil", ""] {
+        for evil in [
+            "../grants",
+            "..\\x",
+            "a/b",
+            "..",
+            ".",
+            "C:evil",
+            "",
+            "tail.",
+            "tail ",
+        ] {
             let (got, logs) = crate::logger::capture_logs(|| plugin_state_dir(evil));
             assert_eq!(
                 got, root,
@@ -882,6 +908,23 @@ mod tests {
                 "越界的名字要点名是哪个、并出声（静默给一个能用的路径等于让它下次真写进去）: {logs:?}"
             );
         }
+
+        // Windows 会把结尾的点和空格吞掉，并把大小写当同一格：两个不同的 stem 可能落到
+        // 同一个状态目录（`p..lua` 的 stem 是 `p.`）。扫描判重必须按这个键算。
+        assert_eq!(
+            state_stem_collision_key("p."),
+            state_stem_collision_key("p"),
+            "结尾的点会被 Windows 吞掉，两个名字是同一格目录"
+        );
+        assert_eq!(
+            state_stem_collision_key("Stats_Overview"),
+            state_stem_collision_key("stats_overview"),
+            "文件系统不区分大小写"
+        );
+        assert_ne!(
+            state_stem_collision_key("mine"),
+            state_stem_collision_key("other")
+        );
     }
 
     /// 年度库名只认 1000..=9999：四位数字里的 `0000`/`0999` 不是年份，不能被统计、

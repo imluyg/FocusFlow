@@ -1277,6 +1277,9 @@ impl PluginManager {
         }
         let mut errors: Vec<String> = Vec::new();
         let mut out: Vec<Discovered> = Vec::new();
+        // 判重按 Windows 的身份算（忽略大小写、吞掉结尾的点/空格），不按字符串相等：
+        // 内置 `stats_overview.lua` 与用户 `STATS_OVERVIEW.lua` 在盘上能共存（两处目录），
+        // 但状态目录 `state/<stem>/` 实际是同一格 —— 放行两份就是共享存储与授权。
         let mut seen: Vec<String> = Vec::new();
         for (index, dir) in dirs.iter().enumerate() {
             let source = Self::source_at(index, legacy);
@@ -1289,20 +1292,34 @@ impl PluginManager {
             };
             for path in files {
                 let stem = Self::stem_of(&path);
-                if seen.contains(&stem) {
+                // 非法 stem 先出局，再参与判重：否则 `p..lua` 按字节序排在 `p.lua` 前面，
+                // 会先把 `p` 这一格占了，把真正能用的那份挡在清单外。
+                if !paths::is_safe_state_stem(&stem) {
+                    if notice_once(&format!("unsafe-stem:{}", path.display())) {
+                        tracing::warn!(
+                            "{stem} 不能当插件标识（不许带路径分隔、..，结尾不许是点或空格）：\
+                             这一份（{}）不加载，它在 Windows 上会和别的插件落到同一格状态目录",
+                            path.display()
+                        );
+                    }
+                    continue;
+                }
+                let key = paths::state_stem_collision_key(&stem);
+                if seen.contains(&key) {
                     // 同名只认先那一支（内置在前）。不报出来的话，用户看到的是"我放了一份但
                     // 插件页没多一条"，而这一句在日志里本来该有原因。
                     if notice_once(&format!("shadowed:{}:{}", source.label(), path.display())) {
                         tracing::warn!(
-                            "{stem} 在同名的前一处目录里已经有了，这一份（{}，{}插件）不加载：\
-                             内置模块以随包那一份为准，想跑自己改的那份请换个文件名",
+                            "{stem} 与前一处目录里的插件在 Windows 上算同一个名字（忽略大小写、\
+                             结尾的点/空格）：这一份（{}，{}插件）不加载 —— 两处会共用同一格\
+                             状态目录。内置模块以随包那一份为准，想跑自己改的那份请换个文件名",
                             path.display(),
                             source.label()
                         );
                     }
                     continue;
                 }
-                seen.push(stem);
+                seen.push(key);
                 out.push(Discovered { path, source });
             }
         }
@@ -1587,6 +1604,17 @@ impl PluginManager {
     /// 一路带到这里：它决定插件看见哪一组宿主 API（3.4）。身份不读脚本自己写的常量，
     /// 所以这里必须由调用方说，不能在函数里猜。
     pub fn load_plugin(&mut self, path: &Path, source: PluginSource) -> Result<String, String> {
+        // 状态/授权目录按 stem 分格，而 `p..lua` 的 stem 是 `p.`、Windows 建目录时会把
+        // 结尾的点吞成 `p` —— 放进来就等于和 `p.lua` 共用一格。这种名字在盘上很少见
+        // （正常新建文件建不出来），但只要加载了一次，隔离就已经破了，所以直接拒绝。
+        // 放在最前面：拒绝之前不许执行这份脚本的顶层代码。
+        let stem = Self::stem_of(path);
+        if !paths::is_safe_state_stem(&stem) {
+            return Err(format!(
+                "插件文件名 {stem:?} 不能当插件标识（不许带路径分隔、..，结尾不许是点或空格）：\
+                 它会在 Windows 上与别的插件落到同一格状态目录，请改名后再启用"
+            ));
+        }
         // 方案 3.10 那一档：能力版本比宿主还高的这一份，在**执行脚本之前**就拒绝。
         // 取这一眼靠的是纯文本扫描（`scan_meta`，与插件页那一栏同一把尺子），不碰 Lua ——
         // 症状是作者写 `PLUGIN_API = 3` 指望那些新格子，而今天每一格拿到的都是 nil；
@@ -5497,6 +5525,83 @@ end
             !second_logs.iter().any(|l| l.contains("不加载")),
             "同一件事第二轮不许再刷一遍: {}",
             second_logs.join("\n")
+        );
+    }
+
+    /// 字符串不同的两个 stem 可能在盘上落到同一格：Windows 忽略大小写，并吞掉结尾的点。
+    ///
+    /// 两条真实形态：① 内置 `stats_overview.lua` 与用户手放的 `STATS_OVERVIEW.lua`
+    /// 分居两处目录、字符串不同，但 `state/stats_overview/` 是同一格；
+    /// ② `p..lua` 的 `file_stem()` 是 `p.`，与 `p.lua` 的 `p` 也是同一格 —— 两份同时
+    /// 加载就会共享状态与授权文件（授权按 permission_hash 判，换个文件同样能对上）。
+    /// 所以扫描判重必须按"Windows 上的身份"算，后一处那份不加载并出声。
+    #[test]
+    fn stems_that_resolve_to_one_state_dir_collide_across_directories() {
+        let _lock = paths::test_app_dir_lock();
+        let tmp = paths::test_app_dir("state_stem_collision");
+        let builtin = tmp.path().join("plugins").join("builtin");
+        let user = tmp.path().join("data").join("plugins");
+        write_lua(&builtin, "stats_overview", "PLUGIN_NAME = \"内置统计\"\n");
+        write_lua(&user, "STATS_OVERVIEW", "PLUGIN_NAME = \"用户统计\"\n");
+        write_lua(&builtin, "tool", "PLUGIN_NAME = \"内置工具\"\n");
+        write_lua(&user, "tool.", "PLUGIN_NAME = \"尾点工具\"\n");
+        // 同一目录里"非法 stem 排在前面"的形态：`p..lua` 按字节序先于 `p.lua`。
+        // 非法的那份必须先出局，否则它会占住 `p` 这一格、把能用的 `p.lua` 挡掉。
+        write_lua(&user, "p..", "PLUGIN_NAME = \"尾点占用者\"\n");
+        write_lua(&user, "p", "PLUGIN_NAME = \"正常 p\"\n");
+
+        let pm = manager_in(tmp.path());
+        let (found, logs) = crate::logger::capture_logs(|| pm.discover());
+        let found = found.expect("两处目录都读得动");
+        let stems: Vec<String> = found
+            .iter()
+            .map(|f| PluginManager::stem_of(&f.path))
+            .collect();
+        assert_eq!(
+            stems,
+            vec![
+                "stats_overview".to_string(),
+                "tool".to_string(),
+                "p".to_string()
+            ],
+            "与内置落到同一格状态目录的两份都不该进清单，非法的 p.. 也不该占住 p，实测 {found:?}"
+        );
+        let sources: Vec<PluginSource> = found.iter().map(|f| f.source).collect();
+        assert_eq!(
+            sources,
+            vec![
+                PluginSource::Builtin,
+                PluginSource::Builtin,
+                PluginSource::User
+            ],
+            "留下的是随包那两份 + 用户那份真正的 p"
+        );
+        let shown = logs.join("\n");
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("STATS_OVERVIEW") && l.contains("不加载")),
+            "大小写不同被顶掉这件事要出声: {shown}"
+        );
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("tool.") && l.contains("不加载")),
+            "结尾的点被顶掉这件事要出声: {shown}"
+        );
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("不能当插件标识") && l.contains("p.")),
+            "非法 stem 被跳过这件事要出声，并且点名: {shown}"
+        );
+
+        // 绕过清单直接加载同样要被挡：否则它的 store/grants 还是会落进 `state/tool/`。
+        let lone = write_lua(&user, "lonely.", "PLUGIN_NAME = \"孤零零尾点\"\n");
+        let mut pm = manager_in(tmp.path());
+        let err = pm
+            .load_plugin(&lone, PluginSource::User)
+            .expect_err("结尾是点的文件名不许当插件标识");
+        assert!(
+            err.contains("不能当插件标识"),
+            "拒绝原因要说清是名字的问题: {err}"
         );
     }
 
