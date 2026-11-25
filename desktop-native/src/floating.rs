@@ -1476,6 +1476,10 @@ unsafe fn keep_above_bar(hwnd: HWND) {
     }
 }
 
+fn logical_position_value(physical: i32, scale: f64) -> i32 {
+    (physical as f64 / scale).round() as i32
+}
+
 /// 拖完之后把位置写回 `[floating] pos_x/pos_y`，**按逻辑像素**存（与旧版同一口径）。
 fn persist_position(hwnd: HWND) {
     unsafe {
@@ -1485,12 +1489,12 @@ fn persist_position(hwnd: HWND) {
         };
         let scale = scale_of(hwnd);
         // 拖完之后锚点就是眼前这一个矩形：用户搬的是他看见的卡片。
-        ANCHOR_TOP.store((rc.top as f64 / scale).round() as i32, Ordering::SeqCst);
+        ANCHOR_TOP.store(logical_position_value(rc.top, scale), Ordering::SeqCst);
         let cfg = focusflow_core::config::instance();
         let mut failed = Vec::new();
         for (key, value) in [
-            ("pos_x", (rc.left as f64 / scale).round().to_string()),
-            ("pos_y", (rc.top as f64 / scale).round().to_string()),
+            ("pos_x", logical_position_value(rc.left, scale).to_string()),
+            ("pos_y", logical_position_value(rc.top, scale).to_string()),
             // 与坐标一起存：混 DPI 多屏时，没有这一格就只能拿主屏倍数猜它当年是哪块屏。
             ("pos_scale", scale.to_string()),
         ] {
@@ -1563,10 +1567,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         rc.bottom - rc.top,
                         wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
                     );
-                    // 系统给的矩形就是"我们自己照新缩放比摆的"，登记它，别让它被下一拍
-                    // 当成用户搬动。锚点这一格照旧不动：动它就是改 DPI 那条链路的行为，
-                    // 而那台 125%/150% 的机器本场量不到（见 README 的 DPI 未回归），不该顺手改。
                     APPLIED_TOP.store(rc.top, Ordering::SeqCst);
+                    let scale = scale_of(hwnd);
+                    ANCHOR_TOP.store(logical_position_value(rc.top, scale), Ordering::SeqCst);
+                    persist_position(hwnd);
                 }
                 let _ = repaint(hwnd);
                 LRESULT(0)
@@ -1750,7 +1754,9 @@ pub fn shutdown() {
 #[cfg(test)]
 mod anchor_tests {
     // 本测试模是选择性导入（不是 `use super::*`）：新用例引用生产项要在这里补名字。
-    use super::{anchor_now, card_logical_size, overlaps_taskbar, saved_scale, Mon};
+    use super::{
+        anchor_now, card_logical_size, logical_position_value, overlaps_taskbar, saved_scale, Mon,
+    };
     use crate::floating_render as fr;
 
     /// 用户在拖：这一格既不是锚点、也不是我们自己摆出去的 ⇒ 锚点认它。
@@ -1857,6 +1863,8 @@ mod anchor_tests {
         );
         assert_eq!(saved_scale(0.0, 1.0), 1.0, "坏值不参与换算");
         assert_eq!(saved_scale(99.0, 1.0), 1.0, "坏值不参与换算");
+        assert_eq!(logical_position_value(900, 1.5), 600);
+        assert_eq!(logical_position_value(601, 1.5), 401);
 
         let src = include_str!("floating.rs");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
@@ -1868,6 +1876,17 @@ mod anchor_tests {
         assert!(
             prod.contains("saved_scale(cfg.get_float(\"floating\", \"pos_scale\""),
             "还原时没读存档倍数"
+        );
+        let at = prod.find("wm::WM_DPICHANGED =>").expect("DPI 分支不见了");
+        let end = prod[at..]
+            .find("wm::WM_EXITSIZEMOVE =>")
+            .map(|n| at + n)
+            .unwrap_or(prod.len());
+        let dpi = &prod[at..end];
+        assert!(
+            dpi.contains("persist_position(hwnd)")
+                && dpi.contains("logical_position_value(rc.top, scale)"),
+            "改 DPI 后必须按新倍率写回坐标与锚点，不能等下次拖动"
         );
     }
 

@@ -47,12 +47,6 @@ function cleanup()
     focusflow.log("番茄工作法插件已清理")
 end
 
--- 供宿主调用：按键联动。宿主按**批**投（每 10 秒一批：键名 + 这一批的增量），
--- 不是逐键投 —— 所以面板那两格键鼠最多慢一批，换的是"每个物理按键都进一次 Lua"没回来。
-function record_key(_key, _count)
-    focusflow.pomodoro_record_key(_key, _count or 1)
-end
-
 -- 时长输入是否可用。`tonumber` 收得下 "inf"/"nan"/"1e300" 这类值，宿主的
 -- `set_durations` 只在换成 i64 **之后**才夹 1..=180，所以这一道由面板自己把关
 -- （`v == v` 挡 NaN，上下界挡 ±inf 与 1e300）。

@@ -29,6 +29,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::UI::Controls::EM_LIMITTEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_SHIFT,
 };
@@ -1006,7 +1007,7 @@ pub fn mark_bbox(m: &Mark) -> Option<(i32, i32, i32, i32)> {
         Shape::Text(x, y, s) => {
             // 至少占一个字号宽：空串也不许缩成一个点，否则选中它得像素级准
             let f = m.style.font.max(1);
-            let w = (s.chars().count() as i32 * f).max(f);
+            let w = (s.encode_utf16().count() as i32 * f).max(f);
             Some((*x, *y, x + w, y + f))
         }
     }
@@ -1040,8 +1041,20 @@ pub fn topmost_hit(marks: &[Mark], x: i32, y: i32) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// 把一笔整体搬 (dx,dy)。坐标都是选区局部 ⇒ 搬完直接就是最终位置，落盘不必再换算。
-pub fn move_mark(m: &mut Mark, dx: i32, dy: i32) {
+/// 把一笔整体搬 (dx,dy)，并把整个包围盒夹在选区里。
+pub fn move_mark(m: &mut Mark, dx: i32, dy: i32, selection_w: i32, selection_h: i32) {
+    let (dx, dy) = match mark_bbox(m) {
+        Some((l, t, r, b)) => {
+            let mark_w = (r - l).max(0) as i64;
+            let mark_h = (b - t).max(0) as i64;
+            let max_x = (selection_w as i64 - mark_w).max(0);
+            let max_y = (selection_h as i64 - mark_h).max(0);
+            let next_x = (l as i64 + dx as i64).clamp(0, max_x);
+            let next_y = (t as i64 + dy as i64).clamp(0, max_y);
+            ((next_x - l as i64) as i32, (next_y - t as i64) as i32)
+        }
+        None => (dx, dy),
+    };
     match &mut m.shape {
         Shape::Rect(x, y, ..) | Shape::Block(x, y, ..) | Shape::Mosaic(x, y, ..) => {
             *x += dx;
@@ -2403,7 +2416,8 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                                 s.cur = (x, y);
                                 if i < s.marks.len() {
                                     push_undo_if_pending(&mut s);
-                                    move_mark(&mut s.marks[i], dx, dy);
+                                    let (sw, sh) = (s.sel.2 - s.sel.0, s.sel.3 - s.sel.1);
+                                    move_mark(&mut s.marks[i], dx, dy, sw, sh);
                                     changed = true;
                                 }
                             }
@@ -2966,21 +2980,56 @@ unsafe fn finish_text_edit(h: HWND, at: (i32, i32), keep: bool) {
             let text = String::from_utf16_lossy(&buf[..n]);
             if !text.trim().is_empty() {
                 if let Ok(mut s) = SNIP.lock() {
-                    let st = Style {
-                        rgb: s.color,
-                        w: ui(s.width),
-                        font: ui(s.font),
-                    };
-                    push_undo(&mut s);
-                    s.marks.push(Mark {
-                        shape: Shape::Text(at.0, at.1, text),
-                        style: st,
-                    });
+                    let sel_w = (s.sel.2 - s.sel.0).max(1);
+                    let sel_h = (s.sel.3 - s.sel.1).max(1);
+                    let units = text.encode_utf16().count().max(1);
+                    if units > sel_w as usize {
+                        tracing_note("文字标注已放弃：选区宽度装不下这段文字");
+                    } else {
+                        let font = ui(s.font).min(sel_h).min(sel_w / units as i32).max(1);
+                        let st = Style {
+                            rgb: s.color,
+                            w: ui(s.width),
+                            font,
+                        };
+                        push_undo(&mut s);
+                        s.marks.push(Mark {
+                            shape: Shape::Text(at.0, at.1, text),
+                            style: st,
+                        });
+                    }
                 }
             }
         }
         let _ = DestroyWindow(h);
     }
+}
+
+fn text_edit_box(
+    sel: (i32, i32, i32, i32),
+    click: (i32, i32),
+    requested_font: i32,
+) -> ((i32, i32, i32, i32), usize) {
+    let (sl, st, sr, sb) = sel;
+    let sel_w = (sr - sl).max(1);
+    let sel_h = (sb - st).max(1);
+    let font = requested_font.max(1).min(sel_w).min(sel_h);
+    let width = ui(240).min(sel_w);
+    let height = (font + ui(8)).min(sel_h);
+    let x = if click.0 + width > sr {
+        sr - width
+    } else {
+        click.0
+    }
+    .clamp(sl, sr - width);
+    let y = if click.1 + height > sb {
+        sb - height
+    } else {
+        click.1
+    }
+    .clamp(st, sb - height);
+    let max_units = (sel_w / font).max(1) as usize;
+    ((x, y, width, height), max_units)
 }
 
 /// 在覆盖层上开一个文字输入框（原生 EDIT，自带中文输入法）。落点存的是选区本地坐标。
@@ -2995,8 +3044,13 @@ unsafe fn open_text_edit(overlay: HWND, x: i32, y: i32) {
             // 会把已经打进去的那行字吃掉——点在画布上本来是"换个地方再写一条"的意思）
             finish_text_edit(HWND(old.0 as *mut core::ffi::c_void), old.1, true);
         }
-        let font = ui(SNIP.lock().map(|s| s.font).unwrap_or(30));
-        let (sl, st) = SNIP.lock().map(|s| (s.sel.0, s.sel.1)).unwrap_or((0, 0));
+        let (sel, requested_font) = SNIP
+            .lock()
+            .map(|s| (s.sel, s.font))
+            .unwrap_or(((0, 0, 400, 260), 30));
+        let font = ui(requested_font);
+        let ((x, y, width, height), max_units) = text_edit_box(sel, (x, y), font);
+        let (sl, st) = (sel.0, sel.1);
         let cls = HSTRING::from("EDIT");
         let empty = HSTRING::from("");
         let created = CreateWindowExW(
@@ -3006,8 +3060,8 @@ unsafe fn open_text_edit(overlay: HWND, x: i32, y: i32) {
             WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0x0080), // WS_CHILD | VISIBLE | ES_AUTOHSCROLL
             x,
             y,
-            ui(240),
-            font + ui(8),
+            width,
+            height,
             Some(overlay),
             None,
             None,
@@ -3016,6 +3070,7 @@ unsafe fn open_text_edit(overlay: HWND, x: i32, y: i32) {
         if let Ok(h) = created {
             let f = mark_text_font(font);
             SendMessageW(h, WM_SETFONT, Some(WPARAM(f.0 as usize)), Some(LPARAM(1)));
+            SendMessageW(h, EM_LIMITTEXT, Some(WPARAM(max_units)), Some(LPARAM(0)));
             let _ = SetWindowSubclass(h, Some(text_edit_proc), 7, 0);
             let _ = SetFocus(Some(h));
             if let Ok(mut s) = SNIP.lock() {
@@ -6995,11 +7050,29 @@ mod tests {
         assert_eq!(topmost_hit(&marks, 500, 500), None);
 
         let mut pen = mk(Shape::Pen(vec![(1, 2), (3, 4)]), 3);
-        move_mark(&mut pen, 10, -2);
+        move_mark(&mut pen, 10, -2, 100, 100);
         assert_eq!(mark_bbox(&pen), Some((11, 0, 13, 2)));
         let mut txt = mk(Shape::Text(5, 5, "x".to_string()), 3);
-        move_mark(&mut txt, 2, 3);
+        move_mark(&mut txt, 2, 3, 100, 100);
         assert_eq!(mark_bbox(&txt), Some((7, 8, 37, 38)));
+
+        let mut block = mk(Shape::Block(20, 20, 100, 100), 3);
+        move_mark(&mut block, 500, 500, 400, 260);
+        assert_eq!(mark_bbox(&block), Some((300, 160, 400, 260)));
+        move_mark(&mut block, -500, -500, 400, 260);
+        assert_eq!(mark_bbox(&block), Some((0, 0, 100, 100)));
+    }
+
+    #[test]
+    fn a_text_edit_at_the_right_and_bottom_edges_stays_inside_the_selection() {
+        let (rect, max_units) = text_edit_box((0, 0, 400, 260), (399, 259), 30);
+        let (x, y, w, h) = rect;
+        assert!(
+            x >= 0 && y >= 0 && x + w <= 400 && y + h <= 260,
+            "实得 {rect:?}"
+        );
+        assert_eq!((x + w, y + h), (400, 260), "贴边输入框应整体移回选区");
+        assert_eq!(max_units, 13, "上限必须按 UTF-16 单元与字号计算");
     }
 
     #[test]

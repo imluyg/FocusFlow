@@ -318,6 +318,8 @@ struct TimerState {
     /// 阶段是计时线程**自动**走完的：那一刻没人点按钮，写库失败原先只留一句默认不落盘的
     /// `tracing::error!`，面板上的「今日完成」与历史表就安静地少一段。存下来交给面板说。
     save_error: Option<String>,
+    /// 落库失败、等待下次重试的完整会话。
+    pending_sessions: Vec<Session>,
 }
 
 impl Default for TimerState {
@@ -335,6 +337,7 @@ impl Default for TimerState {
             work_finished: 0,
             start_time: String::new(),
             save_error: None,
+            pending_sessions: Vec::new(),
         }
     }
 }
@@ -509,6 +512,8 @@ impl PomodoroTimer {
         }
         if let Some(session) = pending {
             persist_session(&self.state, &session);
+        } else {
+            retry_pending_sessions(&self.state);
         }
         tracing::info!("番茄钟开始工作");
         Ok(())
@@ -537,6 +542,8 @@ impl PomodoroTimer {
         }
         if let Some(session) = pending {
             persist_session(&self.state, &session);
+        } else {
+            retry_pending_sessions(&self.state);
         }
         tracing::info!("番茄钟开始休息");
         Ok(())
@@ -593,6 +600,9 @@ impl PomodoroTimer {
         };
         match pending {
             None => {
+                if retry_pending_sessions(&self.state) {
+                    tracing::info!("番茄钟停止时重试了此前落库失败的会话");
+                }
                 tracing::info!("番茄钟已停止（这一段没有可落库的内容）");
                 Stopped::Nothing
             }
@@ -634,6 +644,8 @@ impl PomodoroTimer {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(session) = pending {
             persist_session(&self.state, &session);
+        } else {
+            retry_pending_sessions(&self.state);
         }
     }
 }
@@ -704,24 +716,73 @@ fn take_current(s: &mut TimerState) -> Option<Session> {
 /// 原来 `take_current` 在锁内就先 `work_finished += 1`，写库失败只留一句
 /// `tracing::error!`：内存里的计数与库里的行数从此永久分叉 —— 卡片上"今日完成 4 个"
 /// 而库里只有 3 行，重启后按库行数读数就无声缩水。改成两边同轨：库里有这一行才算数。
-fn persist_session(state: &Mutex<TimerState>, session: &Session) -> bool {
-    match save_session(session) {
-        Ok(()) => {
-            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-            if session.rtype == STATE_WORK && session.actual_seconds >= 1 {
-                s.work_finished += 1;
+fn persist_batch(state: &Mutex<TimerState>, current: Option<&Session>) -> Option<bool> {
+    let mut batch = {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut s.pending_sessions)
+    };
+    if let Some(session) = current {
+        batch.push(session.clone());
+    }
+    if batch.is_empty() {
+        return None;
+    }
+    let current_index = current.map(|_| batch.len() - 1);
+    let mut failed = Vec::new();
+    let mut current_saved = false;
+    let mut work_saved = 0i64;
+    let mut last_error = None;
+    for (index, session) in batch.into_iter().enumerate() {
+        match save_session(&session) {
+            Ok(()) => {
+                if Some(index) == current_index {
+                    current_saved = true;
+                }
+                if session.rtype == STATE_WORK && session.actual_seconds >= 1 {
+                    work_saved += 1;
+                }
             }
-            s.save_error = None;
-            true
-        }
-        Err(e) => {
-            tracing::error!("保存番茄钟记录失败: {e}（本次不计入已完成番茄数）");
-            // 自动走完的阶段没人点按钮，这句失败只写进默认关闭的日志就等于没说。
-            // 存进状态，面板每次都把它念出来，直到下一次落库成功。
-            state.lock().unwrap_or_else(|e| e.into_inner()).save_error = Some(e.to_string());
-            false
+            Err(e) => {
+                tracing::error!("保存番茄钟记录失败: {e}（保留到下次重试）");
+                last_error = Some(e.to_string());
+                failed.push(session);
+            }
         }
     }
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    s.work_finished = s.work_finished.saturating_add(work_saved);
+    s.pending_sessions.extend(failed);
+    if s.pending_sessions.is_empty() {
+        s.save_error = None;
+    } else {
+        let fallback = s
+            .save_error
+            .clone()
+            .unwrap_or_else(|| "番茄钟会话仍待重试".to_string());
+        s.save_error = Some(last_error.unwrap_or(fallback));
+    }
+    Some(current_saved)
+}
+
+fn persist_session(state: &Mutex<TimerState>, session: &Session) -> bool {
+    persist_batch(state, Some(session)).unwrap_or(false)
+}
+
+fn retry_pending_sessions(state: &Mutex<TimerState>) -> bool {
+    let had_pending = !state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending_sessions
+        .is_empty();
+    if !had_pending {
+        return false;
+    }
+    persist_batch(state, None);
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending_sessions
+        .is_empty()
 }
 
 /// 一次 tick 之间过了多少**墙钟秒**。
@@ -1489,6 +1550,88 @@ mod busy_lock_tests {
             "写不进去要报成「没落成」，实际 {out:?}"
         );
         assert_eq!(today_summary().0, 0, "没落库就不该计入今日完成");
+    }
+
+    #[test]
+    fn a_failed_stopped_session_is_retried_on_the_next_stop() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("pomo_retry_stopped");
+        init_db().ok();
+        crate::db::connection::clear_aux_cache();
+        std::fs::remove_file(db_path()).ok();
+        std::fs::create_dir_all(db_path()).unwrap();
+
+        let t = PomodoroTimer::new();
+        t.start_work().expect("计时线程应可用");
+        tick_once(&t.state, 5, Local::now());
+        assert!(matches!(t.stop(), Stopped::SaveFailed { .. }));
+        assert_eq!(t.state.lock().unwrap().pending_sessions.len(), 1);
+
+        crate::db::connection::clear_aux_cache();
+        std::fs::remove_dir_all(db_path()).unwrap();
+        init_db().unwrap();
+        assert_eq!(t.stop(), Stopped::Nothing, "空闲停止也要重试旧会话");
+        assert_eq!(today_summary().0, 1, "恢复后此前那段必须恰好落库一次");
+        assert_eq!(t.last_save_error(), "");
+        assert!(t.state.lock().unwrap().pending_sessions.is_empty());
+
+        assert_eq!(t.stop(), Stopped::Nothing);
+        assert_eq!(today_summary().0, 1, "重试队列清空后不能重复落库");
+        t.shutdown();
+    }
+
+    #[test]
+    fn keys_are_counted_before_the_writer_flushes_or_the_plugin_pumps() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("pomo_key_tail");
+        init_db().unwrap();
+        let timer = PomodoroTimer::new();
+        crate::plugins::host::set_pomodoro_for_test(timer.clone());
+        timer.start_work().expect("计时线程应可用");
+        tick_once(&timer.state, 5, Local::now());
+
+        let writer = crate::db::DbWriter::start(std::time::Duration::from_secs(3600)).unwrap();
+        for _ in 0..3 {
+            writer.record("A", Local::now().timestamp());
+        }
+        assert!(writer.has_pending(), "夹具前提：按键还没落库");
+        assert!(matches!(timer.stop(), Stopped::Recorded { .. }));
+        let sessions = get_recent_sessions(10).0;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].key_count, 3, "停钟前尾批必须已计入当前阶段");
+
+        writer.stop_and_wait();
+        timer.shutdown();
+        crate::plugins::host::reset_pomodoro_for_test();
+    }
+
+    #[test]
+    fn keys_after_auto_break_do_not_move_back_into_the_finished_work_session() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _dir = crate::paths::test_app_dir("pomo_key_phase");
+        init_db().unwrap();
+        let timer = PomodoroTimer::new();
+        crate::plugins::host::set_pomodoro_for_test(timer.clone());
+        timer.start_work().expect("计时线程应可用");
+        tick_once(&timer.state, 5, Local::now());
+        let writer = crate::db::DbWriter::start(std::time::Duration::from_secs(3600)).unwrap();
+        writer.record("A", Local::now().timestamp());
+        writer.record("B", Local::now().timestamp());
+        if let Some(session) = tick_once(&timer.state, 1500, Local::now()) {
+            persist_session(&timer.state, &session);
+        }
+        writer.record("C", Local::now().timestamp());
+        tick_once(&timer.state, 5, Local::now());
+        assert!(matches!(timer.stop(), Stopped::Recorded { .. }));
+
+        let sessions = get_recent_sessions(10).0;
+        let work = sessions.iter().find(|s| s.rtype == STATE_WORK).unwrap();
+        let rest = sessions.iter().find(|s| s.rtype == STATE_BREAK).unwrap();
+        assert_eq!(work.key_count, 2);
+        assert_eq!(rest.key_count, 0, "休息阶段按键不能记回已完成的工作段");
+        writer.stop_and_wait();
+        timer.shutdown();
+        crate::plugins::host::reset_pomodoro_for_test();
     }
 
     /// 落库失败要留下原因给面板，并且下一次成功落库后清掉这条旧账。

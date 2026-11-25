@@ -185,6 +185,23 @@ pub(crate) fn claim_pomodoro(owner: &str) {
     *POMODORO_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = Some(owner.to_string());
 }
 
+pub(crate) fn record_pomodoro_key(key_name: &str) {
+    let timer = POMODORO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .cloned();
+    if let Some(timer) = timer {
+        timer.record_key(key_name, 1);
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn set_pomodoro_for_test(timer: Arc<PomodoroTimer>) {
+    *POMODORO.lock().unwrap_or_else(|e| e.into_inner()) = Some(timer);
+}
+
 /// 出错兜底：只有当这个插件确实是番茄钟的主人时才回收计时线程，交回有没有动手。
 pub fn shutdown_pomodoro_if_owned_by(owner: &str) -> bool {
     {
@@ -877,16 +894,6 @@ pub fn register_host_api(
     host.set(
         "pomodoro_last_save_error",
         lua.create_function(|_, ()| Ok(pomodoro_timer().last_save_error()))?,
-    )?;
-
-    // 番茄钟按键联动（监听器回调调用）
-    host.set(
-        "pomodoro_record_key",
-        // 第二个形参是这一批的增量：宿主按批投，不逐键投。只传键名的旧写法按一次算。
-        lua.create_function(|_, (key, count): (String, Option<i64>)| {
-            pomodoro_timer().record_key(&key, count.unwrap_or(1));
-            Ok(())
-        })?,
     )?;
 
     // ---- 定时任务 API ----

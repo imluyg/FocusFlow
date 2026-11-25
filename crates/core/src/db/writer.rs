@@ -487,6 +487,8 @@ impl DbWriter {
                 }
             }
         }
+        drop(agg);
+        crate::plugins::host::record_pomodoro_key(key_name);
     }
 
     /// 今日计数（内存缓存值）。

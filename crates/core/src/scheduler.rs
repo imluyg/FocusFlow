@@ -1330,6 +1330,25 @@ enum LaunchOutcome {
     Transient(String),
 }
 
+fn record_fired_if_current(t: &ScheduledTask, at: &str) -> anyhow::Result<bool> {
+    let conn = open().map_err(|e| anyhow::anyhow!("打开定时任务库失败: {e}"))?;
+    let changed = conn
+        .execute(
+            "UPDATE scheduled_tasks SET last_run=?1 WHERE id=?2 AND target_path=?3 \
+             AND args=?4 AND schedule_type=?5 AND schedule_time=?6",
+            rusqlite::params![
+                at,
+                t.id,
+                t.target_path,
+                t.args,
+                t.schedule_type,
+                t.schedule_time
+            ],
+        )
+        .map_err(|e| anyhow::anyhow!("写定时任务 last_run 失败: {e}"))?;
+    Ok(changed > 0)
+}
+
 /// 执行任务（启动目标程序，DETACHED_PROCESS）。
 ///
 /// 只有 [`LaunchOutcome::Fired`] 意味着"这次真的启动了"；两个失败臂都无时刻。
@@ -1378,15 +1397,14 @@ fn execute_task(t: &ScheduledTask) -> LaunchOutcome {
             // 写库失败也必须把"这次已经启动过"带回去。原来这里 `let _ =` 吞掉错误：
             // 库里 last_run 还是空 → 30 秒后 `should_run` 又说该跑 → 程序一遍遍地开，
             // 表现是"我设的定时任务弹了一窗口"。（库 BUSY 超过 15 秒、表不可用时就会这样。）
-            if let Err(e) = open().and_then(|conn| {
-                conn.execute(
-                    "UPDATE scheduled_tasks SET last_run=?1 WHERE id=?2",
-                    rusqlite::params![now_str.clone(), t.id],
-                )
-            }) {
-                tracing::error!(
+            match record_fired_if_current(t, &now_str) {
+                Ok(true) => {}
+                Ok(false) => tracing::info!(
+                    "定时任务已启动，但任务配置在启动后被修改或删除，丢弃旧快照的 last_run 回写"
+                ),
+                Err(e) => tracing::error!(
                     "定时任务已启动，但 last_run 没写进库（本进程内先记着，不会再启一次）: {e}"
-                );
+                ),
             }
             LaunchOutcome::Fired(now_str)
         }
@@ -2308,6 +2326,46 @@ mod tests {
         let t2 = get_all_tasks().into_iter().find(|x| x.id == id).unwrap();
         assert_eq!(t2.last_run, None, "改了调度时刻就该重新计一次");
         assert!(should_run(&t2, &Local::now()), "改到新时刻后要能重新触发");
+    }
+
+    #[test]
+    fn an_old_launch_snapshot_cannot_overwrite_a_new_schedule() {
+        let _g = isolate_app_dir("stale_launch_write");
+        {
+            let conn = open().unwrap();
+            conn.execute(
+                "INSERT INTO scheduled_tasks \
+                 (id, name, target_path, args, schedule_type, schedule_time, enabled, last_run, created_at) \
+                 VALUES (5150, '旧快照', ?1, '', 'once', '2000-01-01 00:00', 1, NULL, '2026-01-01T00:00:00')",
+                [r"C:\focusflow-test-dir\不存在的目标.exe"],
+            )
+            .unwrap();
+        }
+        let snapshot = get_all_tasks().into_iter().find(|t| t.id == 5150).unwrap();
+        update_task(
+            5150,
+            None,
+            None,
+            None,
+            Some("once"),
+            Some("2000-01-02 00:00"),
+            None,
+        )
+        .unwrap();
+        assert!(!record_fired_if_current(&snapshot, "2026-01-01 12:00:00").unwrap());
+        let current = get_all_tasks().into_iter().find(|t| t.id == 5150).unwrap();
+        assert_eq!(current.last_run, None, "旧快照不能清掉新计划的执行锚");
+        assert!(should_run(&current, &Local::now()), "新计划必须仍可触发");
+        assert!(record_fired_if_current(&current, "2026-01-01 12:00:00").unwrap());
+        assert_eq!(
+            get_all_tasks()
+                .into_iter()
+                .find(|t| t.id == 5150)
+                .unwrap()
+                .last_run
+                .as_deref(),
+            Some("2026-01-01 12:00:00")
+        );
     }
 
     /// 把导致失败的配置改对之后，面板不许继续念旧的失败原因。
