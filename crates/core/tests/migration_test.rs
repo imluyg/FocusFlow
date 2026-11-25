@@ -684,12 +684,13 @@ mod tests {
         db::queries::invalidate_years_cache();
 
         let src_aux = old_dir.join("focusflow_accounting.db");
-        std::fs::write(&src_aux, b"main-db-bytes").unwrap();
-        std::fs::write(
-            format!("{}-wal", src_aux.display()),
-            b"the-uncheckpointed-tail",
-        )
-        .unwrap();
+        let source = rusqlite::Connection::open(&src_aux).unwrap();
+        source
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE t(x); INSERT INTO t VALUES ('wal-only-row');",
+            )
+            .unwrap();
 
         let summary = migration::import_legacy_data(&old_dir);
         assert!(
@@ -700,12 +701,13 @@ mod tests {
             "附属库应报已复制: {:?}",
             summary.copied_aux
         );
-        let dst_wal = paths::data_dir().join("focusflow_accounting.db-wal");
-        assert_eq!(
-            std::fs::read(&dst_wal).ok(),
-            Some(b"the-uncheckpointed-tail".to_vec()),
-            "WAL 尾巴必须跟到目标目录，否则那一段永远留在旧目录"
-        );
+        let value: String =
+            rusqlite::Connection::open(paths::data_dir().join("focusflow_accounting.db"))
+                .unwrap()
+                .query_row("SELECT x FROM t", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(value, "wal-only-row", "只写在 WAL 里的行也必须导入");
+        drop(source);
     }
 
     /// `-wal` 搬不过去时：不许报"已导入"，而且要把留档那份回滚回正名。
@@ -722,15 +724,15 @@ mod tests {
         let _new = paths::test_app_dir("auxrb_new");
         db::queries::invalidate_years_cache();
 
-        // 让那趟 sidecar 复制必然失败：源目录里的 `-wal` 是个同名**目录**
-        // （同步盘或清理脚本留下的畸形物就是这个形态），`std::fs::copy` 会直接拒绝。
         let src_aux = old_dir.join("focusflow_accounting.db");
-        std::fs::write(&src_aux, b"new-from-old-dir").unwrap();
-        std::fs::create_dir_all(format!("{}-wal", src_aux.display())).unwrap();
+        std::fs::write(&src_aux, b"not-a-sqlite-database").unwrap();
 
-        // 目标位置先放一份现有库：它会被留档，然后必须被回滚回正名
         let dst_aux = paths::data_dir().join("focusflow_accounting.db");
-        std::fs::write(&dst_aux, b"existing-current-db").unwrap();
+        {
+            let conn = rusqlite::Connection::open(&dst_aux).unwrap();
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES ('existing-current-db');")
+                .unwrap();
+        }
 
         let summary = migration::import_legacy_data(&old_dir);
         assert!(
@@ -739,15 +741,15 @@ mod tests {
             summary.copied_aux
         );
         assert!(
-            summary.errors.iter().any(|e| e.contains("WAL")),
+            summary.errors.iter().any(|e| e.contains("在线覆盖失败")),
             "要说出是哪一步没成: {:?}",
             summary.errors
         );
-        assert_eq!(
-            std::fs::read(&dst_aux).ok(),
-            Some(b"existing-current-db".to_vec()),
-            "目标库必须还是导入前那一份（已回滚）"
-        );
+        let value: String = rusqlite::Connection::open(&dst_aux)
+            .unwrap()
+            .query_row("SELECT x FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "existing-current-db", "目标库必须恢复导入前数据");
         assert!(
             summary.backed_up_aux.is_empty(),
             "留档已经搬回正名，报告里不该再留一条指向不存在文件的备份: {:?}",

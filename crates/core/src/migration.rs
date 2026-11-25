@@ -11,10 +11,10 @@
 //!   或 `daily_counts.seconds` 里，同一天取两侧较大值 —— 幂等且不覆盖新值）
 //! - 重复导入靠逻辑内容哈希（key_log 明细 + 活跃时长）跳过；旧版本留下的
 //!   大小/mtime 与行数/最大时间戳标记只作兼容回退 —— 聚合是累加式，重聚会翻倍
-//! - 附属库（accounting/pomodoro/scheduler/edge_history）：整体复制覆盖，
-//!   **覆盖前先把现有库改名留档**（见 `backup_before_overwrite`）——
+//! - 附属库（accounting/pomodoro/scheduler/edge_history）：SQLite 在线备份覆盖，
+//!   **覆盖前先做一致快照**（见 `backup_before_overwrite`）——
 //!   导入目录由用户自己选，选错目录不能让当前数据凭空消失
-//! - 若目标库不存在则整体复制文件（最快路径）
+//! - 目标库不存在时由在线备份 API 直接创建
 //! - 输出导入汇总
 
 use std::path::Path;
@@ -119,55 +119,13 @@ pub fn import_legacy_data(src_dir: &Path) -> ImportSummary {
                 continue;
             }
         };
-        match std::fs::copy(&src, &dst) {
-            Ok(_) => {}
+        match backup_sqlite_file(&src, &dst) {
+            Ok(()) => {}
             Err(e) => {
-                summary.errors.push(format!("{aux} 复制失败: {e}"));
+                summary.errors.push(format!("{aux} 在线覆盖失败: {e}"));
                 restore_after_failed_copy(&mut summary, &dst, &kept);
                 continue;
             }
-        }
-        // `-wal` 里是**还没 checkpoint 进主库的记录**（§十四 在真库上量到 `-wal` 比
-        // 主库还大）。年度库那一支早就为此改成"搬不动就回滚、报错、不报已导入"，
-        // 附属库这一支以前只 `std::fs::copy(&src, &dst)` 那一个文件 ⇒ 旧目录里那段
-        // 尾巴永久留在原地，而界面报的是「导入完成」（记账/日程/浏览历史都算）。
-        let mut sidecar_fail: Option<String> = None;
-        for suffix in ["-wal", "-shm"] {
-            let from = crate::data_location::with_suffix(&src, suffix);
-            let to = crate::data_location::with_suffix(&dst, suffix);
-            // 这里也不许用 `!from.exists()`：源 `-wal` 正被别的程序握着时它回 false ⇒ 那段还没
-            // checkpoint 的记录被静默留在旧目录，而这一支照常 push `copied_aux`（界面说"已复制"）
-            match crate::data_location::probe_open(&from) {
-                Presence::No => continue,
-                // 共享内存索引，SQLite 会照着 WAL 自己重建：拿不到、问不出都算了
-                Presence::Unreadable(reason) if suffix == "-shm" => {
-                    tracing::debug!(
-                        "说不出 {aux} 的 -shm 在不在（{reason}）：它会照着 WAL 重建，跳过"
-                    );
-                    continue;
-                }
-                Presence::Unreadable(reason) => {
-                    sidecar_fail = Some(format!("问不出 {} 在不在（{reason}）", from.display()));
-                    break;
-                }
-                Presence::Yes => {
-                    if let Err(e) = std::fs::copy(&from, &to) {
-                        if suffix == "-shm" {
-                            tracing::debug!("跳过 {aux} 的 -shm 副本: {e}");
-                            continue;
-                        }
-                        sidecar_fail = Some(format!("{} → {}: {e}", from.display(), to.display()));
-                        break;
-                    }
-                }
-            }
-        }
-        if let Some(detail) = sidecar_fail {
-            summary.errors.push(format!(
-                "{aux} 的 WAL 没搬过来（{detail}）—— 那里面可能还有未落盘记录"
-            ));
-            restore_after_failed_copy(&mut summary, &dst, &kept);
-            continue;
         }
         summary.copied_aux.push(aux.to_string());
     }
@@ -186,28 +144,18 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn restore_moved_sidecars(dst: &Path, kept: &Path, moved: &[&str]) -> Vec<String> {
-    let mut leftover = Vec::new();
-    for suffix in moved.iter().rev() {
-        let from = crate::data_location::with_suffix(kept, suffix);
-        let to = crate::data_location::with_suffix(dst, suffix);
-        if let Err(e) = std::fs::rename(&from, &to) {
-            leftover.push(format!("{} 搬不回 {}（{e}）", from.display(), to.display()));
-        }
-    }
-    leftover
+fn backup_sqlite_file(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    let src_conn = Connection::open_with_flags(
+        src,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    src_conn.backup(rusqlite::DatabaseName::Main, dst, None)?;
+    Ok(())
 }
 
-/// 覆盖前的留档：把现有文件改名成 `<原名>.import-backup-<时间戳>`。
-///
-/// 用 rename 而不是 copy —— 既省一次全量拷贝，也保证不会出现"复制到一半
-/// 失败、原文件和新文件都不完整"的中间态。返回被留下的路径（原先不存在时为 None）。
+/// 覆盖前用 SQLite 在线备份留档；目标正名保持不动，后台池句柄不会挡住导入。
 fn backup_before_overwrite(dst: &Path) -> anyhow::Result<Option<std::path::PathBuf>> {
     use crate::db::connection::Presence;
-    // 覆盖前这一问必须分得清三件事。旧写法 `!dst.exists()` 把"这一刻问不出"（现有库正被
-    // 别的程序握着、杀软首扫、移动盘刚休眠）读成「没有要留档的东西」，于是那份**还在被用**
-    // 的附属库被直接覆盖、一份留档都没留 —— 与这个函数存在的理由（"宁可这次不导入，也不能
-    // 拿用户数据冒险"）正好相反，而且事后无从找回。
     match crate::data_location::probe_open(dst) {
         Presence::No => return Ok(None),
         Presence::Unreadable(reason) => {
@@ -224,48 +172,15 @@ fn backup_before_overwrite(dst: &Path) -> anyhow::Result<Option<std::path::PathB
         .to_os_string();
     name.push(format!(".import-backup-{timestamp}"));
     let kept = dst.with_file_name(name);
-    // 附属文件**先**搬、主库**后**搬，搬不动就整次失败。
-    // ① 顺序：旧写法先把主库 rename 走，再 `let _ =` 吞掉 sidecar 的失败 —— 那一刻目录里
-    //    躺着的是"主库已改名带走、别人那份 -wal 还在原位"的半套状态，而调用方只看到
-    //    一条错误文案，不知道目录被动过了。
-    // ② 不吞：`-wal` 里正是还没 checkpoint 进主库的那段新数据（§十四 在真库上量到
-    //    `-wal` 比主库还大），留在原位等于让下次打开按错配的 WAL 去恢复。
-    // ③ 路径用 OsString 追加，不用 `format!("{}", path.display())`：后者对非 UTF-8
-    //    文件名是 lossy 转换，拼出来的路径根本不存在 ⇒ 配合 `let _ =` 连失败都不会报。
-    let mut moved: Vec<&str> = Vec::new();
-    let archived = (|| -> anyhow::Result<()> {
+    if let Err(e) = backup_sqlite_file(dst, &kept) {
+        let _ = std::fs::remove_file(&kept);
         for suffix in ["-wal", "-shm"] {
-            let from = crate::data_location::with_suffix(dst, suffix);
-            match crate::data_location::probe_open(&from) {
-                Presence::No => {}
-                Presence::Unreadable(reason) => {
-                    anyhow::bail!(
-                        "{} 在不在问不出（{reason}）—— 整次留档不做，免得主库搬走后这段尾巴留在原位",
-                        from.display()
-                    );
-                }
-                Presence::Yes => {
-                    std::fs::rename(&from, crate::data_location::with_suffix(&kept, suffix))
-                        .map_err(|e| anyhow::anyhow!("{} 没能一起留档: {e}", from.display()))?;
-                    moved.push(suffix);
-                }
-            }
+            let _ = std::fs::remove_file(crate::data_location::with_suffix(&kept, suffix));
         }
-        std::fs::rename(dst, &kept)?;
-        Ok(())
-    })();
-    if let Err(e) = archived {
-        let leftover = restore_moved_sidecars(dst, &kept, &moved);
-        if leftover.is_empty() {
-            return Err(anyhow::anyhow!("{e}；已搬走的附属文件已复原"));
-        }
-        return Err(anyhow::anyhow!(
-            "{e}；附属文件复原未完成：{}",
-            leftover.join("；")
-        ));
+        return Err(anyhow::anyhow!("{} 在线留档失败: {e}", dst.display()));
     }
     tracing::info!(
-        "导入前已留档现有库: {} -> {}",
+        "导入前已在线留档现有库: {} -> {}",
         dst.display(),
         kept.display()
     );
@@ -865,86 +780,45 @@ fn record_import_marker(
     Ok(())
 }
 
-/// 覆盖式复制失败之后的回滚：删掉刚复制过来的那半套，把留档那份原样搬回正名。
-///
-/// 为什么必须回滚：`backup_before_overwrite` 已经把旧库连 sidecar 一起 rename 走了，
-/// 失败那一刻目录里躺着的是"新库缺一段 WAL"这种中间态，而**下一次导入会把它当成
-/// "目标库已存在"走合并分支**，读的就是这份残缺的新库。回滚之后状态与导入前一致，
-/// 那句"请重试"才真的成立。回滚成功时把 `backed_up_aux` 里那条撤掉 —— 那份文件已经
-/// 回到正名上，再报"给你留了一份备份"就是让人去删一个不存在的文件。
-///
-/// 顺序是这份报告能不能说实话的关键：**先把主库 rename 回去，再搬 sidecar**。
-/// 旧顺序反过来（先搬 `-wal`/`-shm`，最后才 rename 主库），于是主库那一步失败时
-/// 留档已经只剩一个光杆主库 —— 而那句错误提示写的是「导入前那份**完整**留在 …，
-/// 请手工改回原名」，照着做等于把主库与它的 WAL 拆开：正是 `backup_before_overwrite`
-/// 的注释禁止的那个状态（"留在原位等于让下次打开按错配的 WAL 去恢复"）。
+/// 在线覆盖失败后的回滚：用留档快照原位恢复目标；目标原本不存在时删掉半份新库。
 fn restore_after_failed_copy(
     summary: &mut ImportSummary,
     dst: &Path,
     kept: &Option<std::path::PathBuf>,
 ) {
-    // 半套新库删不掉也要说出来：它留在原地，下一次导入就会当"目标库已存在"去读它。
-    // 判断用这一次删除自己的回音，不再回头 `exists()` 问（问不出＝会被读成"没有"⇒ 沉默）。
-    let mut leftover: Vec<String> = Vec::new();
-    if let Err(e) = std::fs::remove_file(dst) {
-        if !crate::data_location::is_confirmed_absent(&e) {
-            leftover.push(format!("删不掉残缺的 {}: {e}", dst.display()));
-        }
-    }
-    for suffix in ["-wal", "-shm"] {
-        let half = crate::data_location::with_suffix(dst, suffix);
-        if let Err(e) = std::fs::remove_file(&half) {
-            if !crate::data_location::is_confirmed_absent(&e) {
-                leftover.push(format!("删不掉残缺的 {}: {e}", half.display()));
-            }
-        }
-    }
     let Some(kept_path) = kept else {
-        summary.errors.extend(leftover);
+        summary.errors.extend(rollback_fresh_copy(dst));
         return;
     };
-    // 主库先回位：这一步成了，留档那一侧才允许被动
-    let main_back = match std::fs::rename(kept_path, dst) {
-        Ok(()) => true,
-        Err(e) => {
-            summary.errors.push(format!(
-                "回滚失败（{e}）：导入前那一份还留在 {}，本次未导入 —— 它旁边的 -wal/-shm \
-                 没有动过，仍然在一起；先让这两个名字都能用（残缺的那份如果删不掉，下面会\
-                 单独说），再手工把它改回原名",
-                kept_path.display()
-            ));
-            false
-        }
-    };
-    if main_back {
-        let kept_text = kept_path.display().to_string();
-        if let Some(i) = summary.backed_up_aux.iter().position(|p| *p == kept_text) {
-            summary.backed_up_aux.remove(i);
-        }
-        summary.errors.push(format!(
-            "已回滚到导入前的那份 {}，本次未导入",
-            dst.display()
-        ));
-        // sidecar 跟着回位；搬不动的那一个必须点名 —— 只搬回主库等于交回一个缺 WAL 尾巴的库
-        for suffix in ["-wal", "-shm"] {
-            let from = crate::data_location::with_suffix(kept_path, suffix);
-            let to = crate::data_location::with_suffix(dst, suffix);
-            // 这一问由改名自己回答，不再回头 `exists()` 猜。旧写法 `if !from.exists() { continue }`
-            // 把"这一刻问不出"读成"没有"⇒ 主库回了位、那段未 checkpoint 的尾巴却留在留档名
-            // 旁边，交回的正是上面那句注释禁止的状态。`NotFound` 才是"确实没有要搬的"。
-            match std::fs::rename(&from, &to) {
-                Ok(()) => {}
-                Err(e) if crate::data_location::is_confirmed_absent(&e) => {}
-                Err(e) => leftover.push(format!(
-                    "{} 搬不回 {} 旁边（{e}）：那一段未 checkpoint 的记录还留在原地，\
-                     手工处理时要把它一起挪",
-                    from.display(),
-                    dst.display(),
-                )),
+    match backup_sqlite_file(kept_path, dst) {
+        Ok(()) => {
+            let kept_text = kept_path.display().to_string();
+            if let Some(i) = summary.backed_up_aux.iter().position(|p| *p == kept_text) {
+                summary.backed_up_aux.remove(i);
             }
+            let mut leftover = Vec::new();
+            for path in [
+                kept_path.clone(),
+                crate::data_location::with_suffix(kept_path, "-wal"),
+                crate::data_location::with_suffix(kept_path, "-shm"),
+            ] {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if !crate::data_location::is_confirmed_absent(&e) {
+                        leftover.push(format!("{} 回滚后没删掉: {e}", path.display()));
+                    }
+                }
+            }
+            summary.errors.push(format!(
+                "已回滚到导入前的那份 {}，本次未导入",
+                dst.display()
+            ));
+            summary.errors.extend(leftover);
         }
+        Err(e) => summary.errors.push(format!(
+            "回滚失败（{e}）：导入前那一份仍留在 {}，本次未导入",
+            kept_path.display()
+        )),
     }
-    summary.errors.extend(leftover);
 }
 
 /// 导入标记：逻辑内容哈希 + 旧版文件/明细指纹回退。
@@ -1009,7 +883,11 @@ mod tests {
         let _lock = crate::paths::test_app_dir_lock();
         let _tmp = crate::paths::test_app_dir("import_aux_guard");
         let dst = crate::paths::data_dir().join("accounting.db");
-        std::fs::write(&dst, "我是要紧的数据".as_bytes()).expect("写现有库");
+        {
+            let conn = Connection::open(&dst).unwrap();
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES ('old');")
+                .unwrap();
+        }
         let _holder = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
@@ -1026,11 +904,11 @@ mod tests {
         );
         // 撤掉占用 ⇒ 库还在原位、内容一字没动，这一次才照常留档
         drop(_holder);
-        assert_eq!(
-            std::fs::read(&dst).expect("现有库必须还在"),
-            "我是要紧的数据".as_bytes(),
-            "被拒绝的那一步绝不能碰原文件"
-        );
+        let value: String = Connection::open(&dst)
+            .unwrap()
+            .query_row("SELECT x FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "old", "被拒绝的那一步绝不能碰原文件");
         assert!(
             backup_before_overwrite(&dst)
                 .expect("读得动时照常留档")
@@ -1239,45 +1117,6 @@ mod tests {
         );
     }
 
-    /// 附属库那一支同理：问不出要进 `errors`，不许只 push `copied_aux`（界面那句"已复制"）。
-    #[cfg(windows)]
-    #[test]
-    fn an_unanswerable_source_wal_is_not_reported_as_copied_for_aux_dbs() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let _lock = crate::paths::test_app_dir_lock();
-        let _dir = crate::paths::test_app_dir("import_aux_src_wal");
-        let src_dir = _dir.path().join("src_aux");
-        std::fs::create_dir_all(&src_dir).expect("建源目录");
-        let src = src_dir.join("focusflow_accounting.db");
-        std::fs::write(&src, "main").expect("写源附属库");
-        let src_wal = crate::data_location::with_suffix(&src, "-wal");
-        std::fs::write(&src_wal, "tail").expect("写源 WAL");
-        let _holder = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(&src_wal)
-            .expect("占位句柄应能打开");
-        assert!(
-            std::fs::File::open(&src_wal).is_err(),
-            "夹具没成立：这个句柄没挡住读，测不到「问不出」那一支"
-        );
-
-        let summary = import_legacy_data(&src_dir);
-        assert!(
-            summary
-                .errors
-                .iter()
-                .any(|e| e.contains("WAL") && e.contains("问不出")),
-            "要说清是哪一段没搬来、哪一问没答上: {:?}",
-            summary.errors
-        );
-        assert!(
-            !summary.copied_aux.iter().any(|a| a.contains("accounting")),
-            "问不出的那一支不许算成已复制: {:?}",
-            summary.copied_aux
-        );
-    }
-
     /// 旧目录里那份**主库**问不出时要点头名，不许当成「旧目录里没有这一份」而照报完成。
     ///
     /// 用户随后清掉旧目录，那份番茄钟/日程数据就没了 —— 而 `Path::exists()` 在属性问不出的
@@ -1291,7 +1130,11 @@ mod tests {
         let src_dir = _dir.path().join("src_main");
         std::fs::create_dir_all(&src_dir).expect("建源目录");
         let src = src_dir.join("focusflow_pomodoro.db");
-        std::fs::write(&src, "main").expect("写源库");
+        {
+            let conn = Connection::open(&src).unwrap();
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES ('source');")
+                .unwrap();
+        }
         let _holder = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
@@ -1326,11 +1169,7 @@ mod tests {
         );
     }
 
-    /// 接线判据：导入链那几问都走同一把尺子，且"删完/搬完再问一遍在不在"这种写法不许回来。
-    ///
-    /// 后半句是本轮补的：原先只禁 `"if from.exists()"` 这一个串，而回滚那一问写的是
-    /// `if !from.exists()` —— 多了两个字符就抓不到，于是"第四处 sidecar 那一问"从来没上
-    /// 尺子，判据却以为整条链都上了（`probe_open(&from)` 钉在 3，现场也正好是 3）。
+    /// 接线判据：年度库 sidecar 仍走三态尺子，附属库改走 SQLite 在线备份。
     #[test]
     fn the_import_chain_asks_its_source_files_with_one_ruler() {
         let text = include_str!("migration.rs");
@@ -1342,8 +1181,16 @@ mod tests {
             .join("\n");
         assert_eq!(
             code.matches("probe_open(&from)").count(),
-            3,
-            "三处 sidecar 那一问（留档、附属库复制、年度库复制）都要走三态尺子"
+            1,
+            "年度库复制仍要显式处理 WAL/SHM 三态"
+        );
+        assert!(
+            code.contains("backup_sqlite_file(&src, &dst)"),
+            "附属库覆盖要走在线备份"
+        );
+        assert!(
+            code.contains("backup_sqlite_file(dst, &kept)"),
+            "附属库留档要走在线备份"
         );
         for shape in [
             "probe_open(&src)",
@@ -1352,13 +1199,10 @@ mod tests {
         ] {
             assert!(code.contains(shape), "那一问要走共用的尺子，少了 {shape}");
         }
-        // "残留删没删掉"与"sidecar 搬没搬走"这四问由**那一次 syscall 自己的错误**回答，
-        // 口径与上面同一把尺子：只有 `NotFound` 算"确实没有"。
         assert_eq!(
             code.matches("is_confirmed_absent(&e)").count(),
-            4,
-            "四问（整体复制回滚 1 处、覆盖回滚主库 1 处 + sidecar 2 处、搬回留档 1 处里的\
-             删除与改名）都该按错误分类，实得 {}",
+            2,
+            "整体复制回滚与在线覆盖回滚的清理都要按错误分类，实得 {}",
             code.matches("is_confirmed_absent(&e)").count()
         );
         for forbidden in [
@@ -1913,11 +1757,19 @@ mod tests {
         let _dir = crate::paths::test_app_dir("crossimport");
         let data = crate::paths::data_dir();
         let aux = data.join("focusflow_accounting.db");
-        std::fs::write(&aux, b"current").unwrap();
+        {
+            let conn = Connection::open(&aux).unwrap();
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES ('current');")
+                .unwrap();
+        }
 
         let src_dir = _dir.path().join("old");
         std::fs::create_dir_all(&src_dir).unwrap();
-        std::fs::write(src_dir.join("focusflow_accounting.db"), b"legacy").unwrap();
+        {
+            let conn = Connection::open(src_dir.join("focusflow_accounting.db")).unwrap();
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES ('legacy');")
+                .unwrap();
+        }
 
         let summary = import_legacy_data(&src_dir);
 
@@ -1926,7 +1778,11 @@ mod tests {
             "跨目录导入应照常复制：{:?}",
             summary
         );
-        assert_eq!(std::fs::read_to_string(&aux).unwrap(), "legacy");
+        let value: String = Connection::open(&aux)
+            .unwrap()
+            .query_row("SELECT x FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "legacy");
         let kept: Vec<_> = std::fs::read_dir(&data)
             .unwrap()
             .flatten()
@@ -1935,87 +1791,37 @@ mod tests {
         assert_eq!(kept.len(), 1, "被覆盖的现有库必须留档一份");
     }
 
-    /// 附属文件搬不动时，整次留档必须在**动主库之前**失败。
-    ///
-    /// 旧写法是「先 rename 主库 → `let _ =` 吞掉 `-wal` 的失败」，于是目录里留下
-    /// "主库已改名带走、别人那份 `-wal` 还在原位"这半套状态；而 `-wal` 里正是还没
-    /// checkpoint 进主库的那段新数据（§十四 在真库上量到 `-wal` 比主库还大），
-    /// 下次打开就是按错配的 WAL 去恢复。
     #[cfg(windows)]
     #[test]
-    fn a_sidecar_that_cannot_be_archived_aborts_before_the_main_file_moves() {
-        use std::os::windows::fs::OpenOptionsExt;
+    fn an_open_aux_db_can_be_backed_up_and_overwritten_in_place() {
         let _lock = crate::paths::test_app_dir_lock();
-        let _dir = crate::paths::test_app_dir("mig_sidecar_hold");
+        let _dir = crate::paths::test_app_dir("mig_open_aux");
         let data = crate::paths::data_dir();
-        let main = data.join("focusflow_accounting.db");
-        std::fs::write(&main, b"current").unwrap();
-        let wal = crate::data_location::with_suffix(&main, "-wal");
-        std::fs::write(&wal, b"someone-else-tail").unwrap();
-
-        // 独占占住 -wal（同步盘/杀软那一类，不需要真杀软）：rename 它必失败
-        let hold = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(&wal)
-            .expect("占位句柄应能打开");
-        let e = backup_before_overwrite(&main).expect_err("-wal 搬不动时整次留档必须失败");
-        assert!(
-            e.to_string().contains("-wal"),
-            "错误要说清是哪个附属文件搬不动: {e}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&main).unwrap(),
-            "current",
-            "失败的那一次绝不能已经把主库改名带走"
-        );
-        assert!(wal.exists(), "搬不动的 -wal 必须还在原位");
-        assert!(
-            !data
-                .read_dir()
-                .unwrap()
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().contains(".import-backup-")),
-            "半套归档也不该留下"
-        );
-        drop(hold);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn a_failed_shm_archive_puts_the_already_moved_wal_back() {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        let _lock = crate::paths::test_app_dir_lock();
-        let _dir = crate::paths::test_app_dir("mig_shm_hold_after_wal");
-        let data = crate::paths::data_dir();
-        let main = data.join("focusflow_accounting.db");
-        let wal = crate::data_location::with_suffix(&main, "-wal");
-        let shm = crate::data_location::with_suffix(&main, "-shm");
-        std::fs::write(&main, b"current").unwrap();
-        std::fs::write(&wal, b"wal-tail").unwrap();
-        std::fs::write(&shm, b"shm-index").unwrap();
-
-        // 允许 probe_open 读，但不给删除共享：WAL 先搬成功，SHM 的 rename 必失败。
-        let hold = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0x1)
-            .open(&shm)
+        let dst = data.join("focusflow_accounting.db");
+        let holder = Connection::open(&dst).unwrap();
+        holder
+            .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES ('old');")
             .unwrap();
-        let err = backup_before_overwrite(&main).expect_err("SHM 搬不动时留档必须失败");
-        assert!(err.to_string().contains("-shm"), "实得 {err}");
-        assert_eq!(std::fs::read(&main).unwrap(), b"current");
-        assert_eq!(std::fs::read(&wal).unwrap(), b"wal-tail", "WAL 必须回位");
-        assert_eq!(std::fs::read(&shm).unwrap(), b"shm-index");
-        assert!(
-            !data
-                .read_dir()
-                .unwrap()
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().contains(".import-backup-")),
-            "回滚后不留半套留档"
-        );
-        drop(hold);
+
+        let kept = backup_before_overwrite(&dst)
+            .expect("后台连接池句柄不该挡住在线留档")
+            .expect("现有库必须留下快照");
+        let src = _dir.path().join("source.db");
+        {
+            let conn = Connection::open(&src).unwrap();
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES ('new');")
+                .unwrap();
+        }
+        backup_sqlite_file(&src, &dst).expect("在线覆盖不该要求 rename 目标");
+        let value: String = holder
+            .query_row("SELECT x FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "new", "原连接应看到原位覆盖后的新内容");
+        let old: String = Connection::open(&kept)
+            .unwrap()
+            .query_row("SELECT x FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old, "old", "留档必须保留导入前数据");
     }
 
     /// 同一份旧库、内容一行没变、只是 mtime 变了（资源管理器复制一份、云盘
@@ -2167,28 +1973,17 @@ mod tests {
 
     /// 回滚那一步：留档的主库与它的 WAL 必须**一起**回位，且每一步的成败都要说实话。
     ///
-    /// 旧顺序先 rename `-wal`/`-shm`、最后才搬主库；主库那一步失败时留档已经只剩光杆
-    /// 主库，而提示写的是「导入前那份**完整**留在 …，请手工改回原名」—— 照着做就是把
-    /// 主库与它的 WAL 拆开（`backup_before_overwrite` 的注释正禁止这个状态：缺了配套
-    /// WAL 的主库会让下一次打开按错配的尾巴去恢复）。
     fn rollback_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("ff_mig_rollback_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("临时目录该建得出来");
         let dst = dir.join("focusflow_aux.db");
         let kept = dir.join("focusflow_aux.db.kept-20260101");
-        std::fs::write(&dst, "半套的新库".as_bytes()).unwrap();
-        std::fs::write(
-            crate::data_location::with_suffix(&dst, "-wal"),
-            "半套的 wal".as_bytes(),
-        )
-        .unwrap();
-        std::fs::write(&kept, "导入前那一份".as_bytes()).unwrap();
-        std::fs::write(
-            crate::data_location::with_suffix(&kept, "-wal"),
-            "没 checkpoint 的记录".as_bytes(),
-        )
-        .unwrap();
+        for (path, value) in [(&dst, "half-new"), (&kept, "old")] {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE t(x);").unwrap();
+            conn.execute("INSERT INTO t VALUES (?1)", [value]).unwrap();
+        }
         (dir, dst, kept)
     }
 
@@ -2200,17 +1995,12 @@ mod tests {
 
         restore_after_failed_copy(&mut summary, &dst, &Some(kept.clone()));
 
-        assert_eq!(
-            std::fs::read(&dst).unwrap(),
-            "导入前那一份".as_bytes().to_vec(),
-            "主库要回到正名上"
-        );
-        assert_eq!(
-            std::fs::read(crate::data_location::with_suffix(&dst, "-wal")).unwrap(),
-            "没 checkpoint 的记录".as_bytes().to_vec(),
-            "配套 WAL 必须跟着回位，否则下次打开按错配的尾巴恢复"
-        );
-        assert!(!kept.exists() && !crate::data_location::with_suffix(&kept, "-wal").exists());
+        let value: String = Connection::open(&dst)
+            .unwrap()
+            .query_row("SELECT x FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "old", "目标要恢复导入前数据");
+        assert!(!kept.exists(), "恢复成功后留档副本要清掉");
         assert!(
             summary.backed_up_aux.is_empty(),
             "已经回到正名的那份不该再报成\"给你留了备份\""
@@ -2233,17 +2023,12 @@ mod tests {
         std::fs::remove_file(&dst).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
         std::fs::write(dst.join("挡住"), "非空").unwrap();
-        let kept_wal = crate::data_location::with_suffix(&kept, "-wal");
-
         let mut summary = ImportSummary::default();
         restore_after_failed_copy(&mut summary, &dst, &Some(kept.clone()));
 
         assert!(
-            kept.exists() && kept_wal.exists(),
-            "主库没能回位时，留档的主库与它的 WAL 都该还在原地（旧顺序会先把 WAL 搬走）；\
-             实得 kept={} wal={} errors={:?}",
             kept.exists(),
-            kept_wal.exists(),
+            "回滚失败时留档必须仍在原地，实得 errors={:?}",
             summary.errors
         );
         let text = summary.errors.join("\n");
@@ -2252,10 +2037,9 @@ mod tests {
             !text.contains("完整"),
             "没能证明它完整就不许说「完整」，实得: {text}"
         );
-        // 挡路的目录也算"残缺没删掉"：下一次导入会把它当成目标库
         assert!(
-            text.contains("删不掉"),
-            "正名上删不掉的东西必须点名，实得: {text}"
+            text.contains(&kept.display().to_string()),
+            "回滚失败必须指出留档仍在哪儿，实得: {text}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
