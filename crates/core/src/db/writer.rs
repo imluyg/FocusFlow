@@ -1490,6 +1490,10 @@ fn flush_pending(conn: &mut Option<Connection>, conn_year: &mut i32, state: &Wri
         // 那一份，进程一退（或当场崩）就两头落空、盘上连痕迹都没有。
         if wrote_any {
             drop_recovery_leftover(state);
+            // 这一批可能刚把某个年度库建出来（首次安装后的第一次写入、元旦跨年）。
+            // 读侧的 `available_years()` 有 30 秒缓存，不失效的话这段窗口里新库
+            // 被当成不存在：「全部 / 近 370 天」静默少一年，而「今日」卡片仍是真数。
+            crate::db::queries::invalidate_years_cache();
         }
         // 全部落库：在途记录作废，并把 stop 超时可能留下的恢复文件收敛掉
         *state.in_flight.lock().unwrap_or_else(|e| e.into_inner()) = AggDeltas::default();
@@ -2137,8 +2141,44 @@ mod tests {
         crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
     }
 
-    /// 跨天边界：today_key 落后于当前日期时，record 应重置今日计数
-    /// （统计线程运行中跨 0 点，避免次日显示昨日累计值）。
+    /// 新落成的年度库必须让读侧的年度清单当场失效。
+    ///
+    /// `available_years()` 有 30 秒缓存。首次写入（首次安装、元旦跨年）会新建年度库；
+    /// 不失效的话这段时间「全部 / 近 370 天」读不到它，而「今日」卡片仍是真数。
+    #[test]
+    fn flushing_a_fresh_year_db_makes_the_year_list_cache_stale() {
+        let _lock = crate::paths::test_app_dir_lock();
+        let _tmp = crate::paths::test_app_dir("writer_year_cache");
+        let now = chrono::Local::now();
+        let last_year = now.year() - 1;
+        let last_date = chrono::NaiveDate::from_ymd_opt(last_year, 12, 31).unwrap();
+        let dk_last = queries::day_key_of_date(last_date);
+
+        // 先建立缓存：此刻上一年的库还不存在
+        queries::invalidate_years_cache();
+        assert!(
+            !queries::available_years().contains(&last_year),
+            "缓存建立时还没有这一年"
+        );
+
+        let w = start_writer(Duration::from_secs(3600));
+        {
+            let mut agg = w.state.agg.lock().unwrap_or_else(|e| e.into_inner());
+            agg.daily.insert(dk_last, 1);
+        }
+        w.flush(true);
+        assert!(
+            crate::paths::year_db_path(last_year).exists(),
+            "这次落库应新建上一年度库"
+        );
+        assert!(
+            queries::available_years().contains(&last_year),
+            "新落成的年度库必须立刻可见，不能等 30 秒缓存过期"
+        );
+
+        w.stop_and_wait();
+        crate::paths::set_app_dir(crate::paths::test_scratch_app_dir());
+    }
     #[test]
     fn record_resets_today_count_on_day_change() {
         let _lock = crate::paths::test_app_dir_lock();
