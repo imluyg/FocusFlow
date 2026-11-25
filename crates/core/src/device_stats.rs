@@ -656,20 +656,26 @@ mod win {
             let now = std::time::Instant::now();
             let entry = match self.devices.see(cache_key, now) {
                 Some(e) => e,
-                None => match register_device(header.hDevice) {
-                    Some(e) => {
-                        tracing::info!("设备统计：登记新设备 {}", e.0);
-                        self.devices.record(cache_key, e.clone(), now);
-                        e
+                None => {
+                    // 无法解析路径：宁可不计也不张冠李戴。但不能每来一个事件就把
+                    // 两趟 Win32 查询加一次开注册表键再跑一遍 —— 这里跑在
+                    // Raw Input 的消息循环线程上，而模块头承诺的是"首个事件查一次"。
+                    // 节流必须挡在 `register_device` **之前**：它才是那两趟查询本身，
+                    // 只挡住日志/记账的写法等于每次事件照样重跑一遍。
+                    let since = self.failed_probe.age_secs(cache_key, now);
+                    if !super::reg_retry_allowed(since) {
+                        return;
                     }
-                    None => {
-                        // 无法解析路径：宁可不计也不张冠李戴。但不能每来一个事件就把
-                        // 两趟 Win32 查询加一次开注册表键再跑一遍 —— 这里跑在
-                        // Raw Input 的消息循环线程上，而模块头承诺的是"首个事件查一次"。
-                        // 现在按句柄节流，并且**出声一次**：这台设备不会出现在排行里，
-                        // 一声不响就没人知道它为什么不见。
-                        let since = self.failed_probe.age_secs(cache_key, now);
-                        if super::reg_retry_allowed(since) {
+                    match register_device(header.hDevice) {
+                        Some(e) => {
+                            tracing::info!("设备统计：登记新设备 {}", e.0);
+                            self.devices.record(cache_key, e.clone(), now);
+                            e
+                        }
+                        None => {
+                            // 这次失败要留档：预算之内不再重试，到点再给一次机会；
+                            // 并且**出声一次** —— 这台设备不会出现在排行里，
+                            // 一声不响就没人知道它为什么不见。
                             self.failed_probe.record(cache_key, (), now);
                             tracing::warn!(
                                 "设备统计：设备句柄 {:#x}（{}）的实例路径解析不出来，本次不计；\
@@ -678,10 +684,10 @@ mod win {
                                 cache_key.1,
                                 super::REG_RETRY_GAP_SECS
                             );
+                            return;
                         }
-                        return;
                     }
-                },
+                }
             };
             let ts = match crate::listener::now_ts_secs() {
                 Some(ts) => ts,
@@ -901,6 +907,18 @@ mod tests {
         assert!(
             body.contains("reg_retry_allowed(since)"),
             "解析失败那支又回到每个事件重跑一遍注册表查询"
+        );
+        // 光出现还不够：预算判断必须挡在 `register_device` 之前。旧写法是"先解析、
+        // 再拿结果决定要不要出声"，于是节流只拦住了日志，两趟查询照样每事件一次。
+        let budget = body
+            .find("reg_retry_allowed(since)")
+            .expect("预算判据不见了");
+        let probe = body
+            .find("register_device(header.hDevice)")
+            .expect("设备解析调用不见了");
+        assert!(
+            budget < probe,
+            "节流判断必须在昂贵的设备解析之前，否则每个输入事件都会重跑两趟 Win32 查询"
         );
         assert!(
             body.contains("tracing::warn!"),
