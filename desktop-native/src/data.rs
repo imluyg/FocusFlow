@@ -592,15 +592,48 @@ pub fn load_card_only() -> Snapshot {
     }
 }
 
+/// 库值 + 未落库增量，**配成同一份**读出来。
+///
+/// 原先固定"先读增量、再查库"：写线程每 `flush_interval`（默认 10 秒）把内存那批搬进库，
+/// 若它恰好在这两步之间落库完成，库值已含这批、增量又原样加一次 —— 「总计/日均」一拍
+/// 多算一批（几十次），而同一屏的「今日」走写线程缓存是真值，两格互相打架；那一拍导出
+/// 还会把偏大的数写进文件。反过来"先查库再读增量"也不行：提交完成到清空在途之间那一小段
+/// 里，两边都含同一批。所以配对读：读前读后各取一次增量，一致才认；不一致就重查库再配，
+/// 连试 [`PENDING_PAIR_TRIES`] 次仍不一致就取较小那份（宁可这一拍少算一批、下一拍从库里
+/// 补齐，也不把同一批算两遍）。
+const PENDING_PAIR_TRIES: usize = 3;
+
+fn pair_pending_with_stats<P, S>(
+    mut pending_now: P,
+    mut read_stats: S,
+    tries: usize,
+) -> (queries::RankTotals, i64)
+where
+    P: FnMut() -> i64,
+    S: FnMut() -> queries::RankTotals,
+{
+    let mut last: Option<(queries::RankTotals, i64)> = None;
+    for _ in 0..tries.max(1) {
+        let before = pending_now();
+        let stats = read_stats();
+        let after = pending_now();
+        if after == before {
+            return (stats, before);
+        }
+        last = Some((stats, before.min(after)));
+    }
+    last.expect("tries.max(1) 至少跑过一次")
+}
+
 pub fn load(period: i64) -> Snapshot {
     let days = window_days(period);
-    // 采集开着时，写线程内存里那批**还没落库**的按键也要算进来：`queries::*` 读的是
-    // 已落库的部分，不加这一步「今日」会比输入慢一个 `flush_interval`（默认 10 秒）。
-    // `today_pending_count()` 在落库之后自己会减，所以 库值 + 增量 不会重复计。
-    // 采集没开时它恒为 0（没有写线程）。
-    let pending = crate::collect::pending_today();
-    // 按周期查：键鼠排行、应用时长、设备次数都跟同一把尺子。
-    let stats = queries::stats_totals(days, None);
+    // 周期增量与库值必须来自同一个"落库间隙"：为什么"各读一次"会重复计/少算，
+    // 见 [`pair_pending_with_stats`]。采集没开时增量恒为 0（没有写线程）。
+    let (stats, pending) = pair_pending_with_stats(
+        crate::collect::pending_today,
+        || queries::stats_totals(days, None),
+        PENDING_PAIR_TRIES,
+    );
     // 「最高单日」这一趟只问最大值：它交回的全历史总次数此前一个读者都没有
     // （屏上那个「总计」念的是上面 `stats.total + pending`），每拍多算一条每库的 SUM。
     let all = queries::get_alltime_max_day();
@@ -792,6 +825,59 @@ mod readout_rulers_tests {
         assert_eq!(avg_divisor(Some(0), 0), 1, "两档都不许除出 0");
         assert_eq!(avg_of(900, Some(30), 3), 30, "屏上那句跟着这个数额");
         assert_eq!(avg_of(824, None, 412), 2, "总计档：824 除 412");
+    }
+
+    /// 未落库增量与库值必须配对读：写线程在两次读之间落库完成时不能把同一批算两遍。
+    ///
+    /// 这条钉的是判据本身（用脚本化的增量序列，不碰真库）：第一次配对前后不一致 ⇒
+    /// 必须重查库；连续几对都对不上（写线程一直在落库）就取较小那份，宁少算不重复。
+    #[test]
+    fn the_delta_and_the_db_reading_are_paired_across_a_flush() {
+        use std::cell::Cell;
+        // 第一对：读前 30、落库在这中间完成、读后 0 ⇒ 库值已含那批，重查一次；第二对 0/0 收敛。
+        let script = [30i64, 0, 0, 0];
+        let i = Cell::new(0usize);
+        let loads = Cell::new(0usize);
+        let (_, pending) = pair_pending_with_stats(
+            || {
+                let v = script[i.get().min(script.len() - 1)];
+                i.set(i.get() + 1);
+                v
+            },
+            || {
+                loads.set(loads.get() + 1);
+                queries::RankTotals::default()
+            },
+            3,
+        );
+        assert_eq!(loads.get(), 2, "第一次配对不一致，必须重查库值再配");
+        assert_eq!(pending, 0, "落库后增量归零：库值已含那批，不能再加一次");
+
+        // 连续几对都对不上（写线程一直在落库）⇒ 用较小那份。
+        let script = [50i64, 10, 50, 10, 50, 10];
+        let i = Cell::new(0usize);
+        let (_, pending) = pair_pending_with_stats(
+            || {
+                let v = script[i.get().min(script.len() - 1)];
+                i.set(i.get() + 1);
+                v
+            },
+            queries::RankTotals::default,
+            3,
+        );
+        assert_eq!(pending, 10, "上限到了取较小增量：宁少算一批，不重复计");
+
+        // 一致时只查一次库。
+        let loads = Cell::new(0usize);
+        let (_, pending) = pair_pending_with_stats(
+            || 7,
+            || {
+                loads.set(loads.get() + 1);
+                queries::RankTotals::default()
+            },
+            3,
+        );
+        assert_eq!((pending, loads.get()), (7, 1));
     }
 
     /// 生产文本（整行注释与 `///` 一并滤掉，判据数的是代码）。
