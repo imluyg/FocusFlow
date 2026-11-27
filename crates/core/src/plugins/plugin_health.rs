@@ -1476,7 +1476,7 @@ mod detail_tests {
 
     #[test]
     fn health_write_uses_the_shared_atomic_writer() {
-        let src = include_str!("plugin_health.rs");
+        let src = include_str!("plugin_health.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
         let at = prod.find("pub fn write(").expect("台账写入不见了");
         let end = prod[at..]

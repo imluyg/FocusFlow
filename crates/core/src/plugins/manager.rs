@@ -4722,7 +4722,7 @@ end
     /// 这条只能钉调用形态（一次线程要跑 2 秒一轮，用例里等不到）。
     #[test]
     fn the_unreadable_notice_is_keyed_per_directory() {
-        let src = include_str!("manager.rs");
+        let src = include_str!("manager.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let loop_body = &prod[prod
             .find("fn hot_reload_loop(")
@@ -4936,7 +4936,7 @@ end
     /// 就是这么补上的，内嵌两处漏了半边）。
     #[test]
     fn nested_widget_failures_are_never_silent() {
-        let src = include_str!("manager.rs");
+        let src = include_str!("manager.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert_eq!(
             prod.match_indices("skip_nested_widget(").count(),
@@ -5212,7 +5212,7 @@ end
     /// 两条都必须把"读不出来"交出去，合计仍是三个消费点。
     #[test]
     fn no_caller_folds_an_unreadable_plugin_dir_back_into_empty() {
-        let src = include_str!("manager.rs");
+        let src = include_str!("manager.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let flat: String = prod
             .lines()
@@ -5303,7 +5303,7 @@ end
     /// 或者把迁移偷偷变成移动，行为用例可能照样绿（夹具刚好都在），而产品语义已经换了。
     #[test]
     fn the_two_dirs_are_the_only_things_the_new_layout_reads() {
-        let src = include_str!("manager.rs");
+        let src = include_str!("manager.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let flat: String = prod
             .lines()
@@ -5423,7 +5423,7 @@ end
         }
 
         // 接线：`set_enabled` 走的必须就是这个函数（判据写在源码里，行为用例碰不得配置）
-        let src = include_str!("manager.rs");
+        let src = include_str!("manager.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert_eq!(
             prod.match_indices("missing_plugin_reason(").count(),
@@ -5842,7 +5842,7 @@ end
 
         // 接线：旧的那句 clamp 不许回来。needle 用拼接 —— 上面那个函数的**注释里
         // 就写着这串原文**，直接当字面量会先匹配到说明文字，把判据变成自己盯自己。
-        let src = include_str!("manager.rs");
+        let src = include_str!("manager.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let old_clamp = format!("clamp(0, {} as i64)", "u32::MAX");
         assert!(
@@ -6786,7 +6786,7 @@ end
         );
 
         // 形状腿：四个出口各有归属，谁被摘掉都要红
-        let src = include_str!("manager.rs");
+        let src = include_str!("manager.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let flat: String = prod
             .lines()
@@ -6822,7 +6822,7 @@ end
     /// 而"名册里每份都被叫到"由 `resources` 自己的用例钉。
     #[test]
     fn every_recycle_path_releases_the_whole_roster() {
-        let src = include_str!("manager.rs");
+        let src = include_str!("manager.rs").replace("\r\n", "\n");
         let call = ["resources::release_all", "(&o"].concat();
         let call_stem = ["resources::release_all", "(&s"].concat();
         for (site, needle) in [

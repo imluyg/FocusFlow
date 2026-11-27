@@ -645,7 +645,7 @@ mod tests {
     /// 抄第二把的下场与本仓其它那几处一样：工具说"这份没问题"、插件页说"要授权"。
     #[test]
     fn the_tools_delegate_both_calipers_to_core() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         fn body_of<'a>(prod: &'a str, head: &str) -> &'a str {
             let at = prod
@@ -1092,7 +1092,7 @@ end
     /// 视图的词汇表只有一份出处：JSON 必须由 core 那把序列化尺子出，工具不自己排版。
     #[test]
     fn the_json_comes_from_core_not_from_a_second_printer() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("fn run_fixture(req: &RunReq)")

@@ -2441,7 +2441,7 @@ mod tests {
     /// "没读到"印成"暂无子分类" —— 这一族的病状从来都在最后一环，不在判据里。
     #[test]
     fn the_gap_reaches_the_panel_that_prints_the_claim() {
-        let wired = include_str!("plugins/host.rs");
+        let wired = include_str!("plugins/host.rs").replace("\r\n", "\n");
         assert!(
             wired.contains("accounting::subcategories_readout(&cat)"),
             "插件那一路又回到只拿清单、丢掉原因的 get_subcategories"
@@ -2839,7 +2839,7 @@ mod tests {
         );
 
         // 形状腿：宿主给插件的那条通道必须把原因一起交出去（只回一个字符串就等于又折一次）
-        let src = include_str!("plugins/host.rs");
+        let src = include_str!("plugins/host.rs").replace("\r\n", "\n");
         let at = src
             .find("let acc_cat_type = lua.create_function")
             .expect("accounting_category_type 的注册处找不到了（判据要跟着改）");
@@ -3524,7 +3524,7 @@ mod tests {
 
         // 形状腿：这一路只许转读那个共用口。注释会被自己的说明文字喂绿，所以先切函数体、
         // 再摘掉注释行，最后数它有没有第二次自己开库、自己发 SQL。
-        let src = include_str!("accounting.rs");
+        let src = include_str!("accounting.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("pub fn monthly_summary(")
@@ -3554,7 +3554,7 @@ mod tests {
     /// 时面板那句「详见日志」指向一条不存在的记录。
     #[test]
     fn add_category_uses_one_connection_and_the_insert_answer() {
-        let src = include_str!("accounting.rs");
+        let src = include_str!("accounting.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("pub fn add_category(")
@@ -3770,7 +3770,7 @@ mod tests {
     /// 于是那句提示成了查不到的死路（同 `add_category` 那处，一起钉住这一类）。
     #[test]
     fn write_doors_say_why_the_database_could_not_be_opened() {
-        let src = include_str!("accounting.rs");
+        let src = include_str!("accounting.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let code: String = prod
             .lines()
@@ -4083,7 +4083,7 @@ mod tests {
     /// 库被握着 / 页坏了 / 临时目录读不动都会走成那句话，旧代码一个字都不留。
     #[test]
     fn the_read_paths_say_why_the_records_could_not_be_read() {
-        let src = include_str!("accounting.rs");
+        let src = include_str!("accounting.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         for head in ["pub fn get_all_expenses(", "pub fn get_expenses_page("] {
             let at = prod.find(head).unwrap_or_else(|| panic!("{head} 不见了"));

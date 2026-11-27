@@ -729,7 +729,7 @@ mod tests {
     /// 而这条只有钉调用点才看得见。
     #[test]
     fn the_unanswerable_stamp_is_never_cached() {
-        let src = include_str!("device_alias.rs");
+        let src = include_str!("device_alias.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("pub fn table(")
@@ -784,7 +784,7 @@ mod tests {
     /// 锁一旦被挪到读文件之后，这份旧表就可能带着旧 mtime 存回缓存，之后一直命中。
     #[test]
     fn table_reload_is_serialized_with_writers() {
-        let src = include_str!("device_alias.rs");
+        let src = include_str!("device_alias.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod.find("pub fn table(").expect("table 不见了");
         let rest = &prod[at..];

@@ -5774,7 +5774,7 @@ mod tests {
     /// "抓第一帧"那条读数对回归是瞎的 ⇒ 断言必须比的是调用的先后与形态。
     #[test]
     fn overlay_is_created_hidden_and_populated_first() {
-        let src = include_str!("snip.rs");
+        let src = include_str!("snip.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
@@ -5827,7 +5827,7 @@ mod tests {
 
     #[test]
     fn the_overlay_no_longer_draws_a_cursor_following_magnifier() {
-        let src = include_str!("snip.rs");
+        let src = include_str!("snip.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         assert!(
             !src[..cut].contains("loupe")
@@ -5848,7 +5848,7 @@ mod tests {
     /// （拿它当控制点要的是"建不出来"，而机器上它建得出来）⇒ 只能钉调用形态。
     #[test]
     fn a_failed_overlay_gives_the_floating_card_back() {
-        let src = include_str!("snip.rs");
+        let src = include_str!("snip.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
         let arm = flat
@@ -6190,7 +6190,7 @@ mod tests {
     /// 直接把窗口刷成"先暗后亮"的两帧）。判据按调用形态比，不比函数名。
     #[test]
     fn paint_composites_into_the_backbuffer_and_presents_once() {
-        let src = include_str!("snip.rs");
+        let src = include_str!("snip.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
@@ -6511,7 +6511,7 @@ mod tests {
     fn both_mosaic_paths_pass_their_own_image_origin() {
         // 预览交选区左上角（它的源是整屏），烤图交自己的原点（它的源就是那张图）。
         // 判据按"调用形态"比，不比函数名；先把空白归一化，fmt 怎么重排都顶得住。
-        let src = include_str!("snip.rs");
+        let src = include_str!("snip.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
@@ -6539,7 +6539,7 @@ mod tests {
         assert_eq!(chip_origin(50, 50, 900, 400, (400, 300)), (0, 0));
         // 接线：`draw_chip` 必须真的把量出来的盒子尺寸与可见区交给这把夹子——
         // 纯函数判得再对，没人调它等于没修。
-        let src = include_str!("snip.rs");
+        let src = include_str!("snip.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
@@ -7405,7 +7405,7 @@ mod tests {
     /// 接线守卫：四处写历史的地方都得走这把钳子（纯函数绿不代表调用方用了它）。
     #[test]
     fn every_history_write_goes_through_the_clamp() {
-        let src = include_str!("snip.rs");
+        let src = include_str!("snip.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
         let n = flat.matches("push_history_snapshot(&mut").count();

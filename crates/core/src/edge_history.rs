@@ -1201,7 +1201,7 @@ mod tests {
         );
         drop(app);
 
-        let src = include_str!("edge_history.rs");
+        let src = include_str!("edge_history.rs").replace("\r\n", "\n");
         // ⚠ 本文件的**生产代码里就有 `#[cfg(test)]`**（测试夹具那几处），
         // 所以不能按第一次出现切：那会把整段生产代码切成第 20 行之前那一小截。
         let prod = &src[..src.find("\nmod tests {").expect("测试模块的起点找不到了")];
@@ -1312,7 +1312,7 @@ mod tests {
     /// 在本次运行里再没有任何出口。这条钉的是"别回到 `let _ =`"。
     #[test]
     fn the_legacy_copy_cleanup_uses_the_reporting_remover() {
-        let src = include_str!("edge_history.rs");
+        let src = include_str!("edge_history.rs").replace("\r\n", "\n");
         let prod = &src[..src.rfind("#[cfg(test)]").expect("测试模块起点找不到了")];
         let start = prod
             .find("fn cleanup_stale_copies_once")
@@ -2248,7 +2248,7 @@ mod tests {
     /// 这个测试模里，不摘干净的话守卫会被自己那串字面量命中（永远绿）。
     #[test]
     fn the_copy_branch_asks_the_guard_instead_of_guessing_zero() {
-        let src = include_str!("edge_history.rs");
+        let src = include_str!("edge_history.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("\nmod tests {").expect("测试模块的起点找不到了")];
         let flat: String = prod
             .lines()

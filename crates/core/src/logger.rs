@@ -267,7 +267,7 @@ mod tests {
     /// subscriber 去观察"ERROR 到底写到哪个流"。
     #[test]
     fn the_console_layer_writes_to_stderr() {
-        let src = include_str!("logger.rs");
+        let src = include_str!("logger.rs").replace("\r\n", "\n");
         let at = src
             .find("let console_layer")
             .expect("控制台层不见了（删掉它之前请先想想到底的 ERROR 往哪儿走）");
@@ -351,7 +351,7 @@ mod tests {
     /// 就在那两个臂里（原先失败只 `eprintln!`，桌面端没人能看见）。
     #[test]
     fn both_file_layer_arms_record_their_outcome() {
-        let src = include_str!("logger.rs");
+        let src = include_str!("logger.rs").replace("\r\n", "\n");
         let at = src
             .find("pub fn init_logging()")
             .expect("init_logging 不见了");

@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn the_update_path_replaces_instead_of_deleting_the_old_package_first() {
-        let src = include_str!("install.rs");
+        let src = include_str!("install.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
         let at = prod.find("pub fn install_with(").expect("安装函数不见了");
         let end = prod[at..]

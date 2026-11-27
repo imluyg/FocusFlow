@@ -1374,7 +1374,7 @@ mod tests {
     /// `ensure_staging_table`）里仍是"确认有才算有"的窄视图，不在本判据范围内。
     #[test]
     fn the_device_migration_asks_only_with_the_three_state_ruler() {
-        let src = include_str!("connection.rs");
+        let src = include_str!("connection.rs").replace("\r\n", "\n");
         let from = src
             .find("fn migrate_device_identity_keys(")
             .expect("归组键迁移函数找不到了");

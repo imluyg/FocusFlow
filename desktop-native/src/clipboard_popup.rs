@@ -2809,7 +2809,7 @@ mod tests {
     /// 提示只能由搜索框子窗自己补；别再退回那条死路。
     #[test]
     fn the_search_hint_is_drawn_ourselves_since_the_cue_banner_is_dead() {
-        let src = include_str!("clipboard_popup.rs");
+        let src = include_str!("clipboard_popup.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("\nmod tests {").expect("测试模块的起点找不到了")];
         assert!(
             !prod.contains("EM_SETCUEBANNER,"),
@@ -2844,7 +2844,7 @@ mod tests {
             assert_eq!(popup_shortcut(false, vk), None, "没有 Ctrl 就不是快捷键");
         }
         // 搜索框子类与弹窗 WM_KEYDOWN 各收一半焦点，两张入口必须问同一个判定。
-        let src = include_str!("clipboard_popup.rs");
+        let src = include_str!("clipboard_popup.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert_eq!(
             prod.matches("popup_shortcut(ctrl, vk)").count(),
@@ -2858,7 +2858,7 @@ mod tests {
     /// 这条解释就被冲掉了。
     #[test]
     fn the_restore_issue_is_written_after_the_search_box_is_cleared() {
-        let src = include_str!("clipboard_popup.rs");
+        let src = include_str!("clipboard_popup.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let reveal = &prod[prod.find("fn reveal(").expect("reveal 找不到了")..];
         let clear = reveal
@@ -2875,7 +2875,7 @@ mod tests {
 
     #[test]
     fn the_activation_flag_is_reset_before_the_window_is_shown_again() {
-        let src = include_str!("clipboard_popup.rs");
+        let src = include_str!("clipboard_popup.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let start = prod.find("fn reveal(hwnd: HWND)").expect("reveal 找不到了");
         let rest = &prod[start..];
@@ -2897,7 +2897,7 @@ mod tests {
     #[test]
     fn reopening_the_popup_follows_the_cursor_monitor_dpi() {
         // 窗口是复用对象：跨屏后再打开只走 `reveal`，必须在那里换 DPI 与字体。
-        let src = include_str!("clipboard_popup.rs");
+        let src = include_str!("clipboard_popup.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let start = prod.find("fn reveal(hwnd: HWND)").expect("reveal 找不到了");
         let rest = &prod[start..];

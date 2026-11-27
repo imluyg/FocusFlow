@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn scan_png_does_not_silently_skip_directory_entries() {
-        let src = include_str!("reveal.rs");
+        let src = include_str!("reveal.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
         let at = prod.find("pub fn scan_png(").expect("扫描函数不见了");
         let end = prod[at..]

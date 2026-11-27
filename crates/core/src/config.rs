@@ -2484,7 +2484,7 @@ renderer = webview
     /// 太多（真实文件 + 让它失败 + 再让回写也失败），只能钉形状。
     #[test]
     fn load_routes_the_note_through_the_actual_read_outcome() {
-        let src = include_str!("config.rs");
+        let src = include_str!("config.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = src[..cut]
             .lines()

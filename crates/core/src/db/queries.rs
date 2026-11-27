@@ -2981,7 +2981,7 @@ mod tests {
         // （榜／设备／时间窗口／当日小时）。判据留在调用方就只剩"它调了谁"，
         // 抽掉的那半边反而没人守 —— 探针＝把 `Ok(false) => SkipAbsent` 那一臂删掉，
         // 这条与 `a_missing_year_db_is_an_answer_not_a_refusal` 一起红。
-        let src = include_str!("queries.rs");
+        let src = include_str!("queries.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod.find("fn gate_year(").expect("gate_year 找不到了");
         let raw = &prod[at..at + prod[at..].find("\n}").expect("函数体切不出来")];
@@ -3302,7 +3302,7 @@ mod tests {
     /// 设备详情页的排行/分母读不全时，详情页那份 `unreadable` 必须响。
     #[test]
     fn the_device_detail_rank_read_keeps_the_unreadable_gaps() {
-        let src = include_str!("queries.rs");
+        let src = include_str!("queries.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("pub fn get_device_detail(")
@@ -4492,7 +4492,7 @@ mod tests {
     /// 昨天一整天的数当成"今日"。纯函数用例在 writer.rs，这条钉调用点。
     #[test]
     fn get_today_count_uses_the_day_checked_cache() {
-        let src = include_str!("queries.rs");
+        let src = include_str!("queries.rs").replace("\r\n", "\n");
         let at = src
             .find("pub fn get_today_count")
             .expect("get_today_count 找不到了");
@@ -5140,7 +5140,7 @@ mod tests {
 
     #[test]
     fn the_rank_readings_do_not_fold_a_broken_page_into_a_short_list() {
-        let src = include_str!("queries.rs");
+        let src = include_str!("queries.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         for header in [
             "fn query_stats_in_conn(",
@@ -5178,7 +5178,7 @@ mod tests {
     /// 打不开／扫到坏页三臂）。留这条是为了把"问不出＝没有"那次回退挡在编译之外。
     #[test]
     fn the_window_readers_ask_the_three_state_table_ruler() {
-        let src = include_str!("queries.rs");
+        let src = include_str!("queries.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         for header in [
             "fn query_daily_window_in_conn(",
@@ -5228,7 +5228,7 @@ mod tests {
     /// 的形状才触发，本轮没造那种夹具）。
     #[test]
     fn the_device_detail_readers_ask_the_three_state_rulers() {
-        let src = include_str!("queries.rs");
+        let src = include_str!("queries.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         for header in ["fn device_date_series(", "fn registered_kind("] {
             let at = prod
@@ -6372,7 +6372,7 @@ mod tests {
     /// 后面紧跟着 `truncate`）。少一份手抄，就少一处没人认领的分叉。
     #[test]
     fn the_core_boards_use_the_one_comparator() {
-        let src = include_str!("queries.rs");
+        let src = include_str!("queries.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         // 针要拼出来，否则这条用例自己的字面量会被它正在查的样式数进去。

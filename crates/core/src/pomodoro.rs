@@ -1156,7 +1156,7 @@ mod tests {
     /// 静默吞掉的形状）。所以这两半各钉一条字面判据。
     #[test]
     fn the_session_reads_name_their_columns_and_count_their_losses() {
-        let src = include_str!("pomodoro.rs");
+        let src = include_str!("pomodoro.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = src[..cut]
             .lines()

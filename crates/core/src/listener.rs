@@ -864,7 +864,7 @@ mod tests {
         );
 
         // 形状腿：`start()` 里那句日志不许再自己去问 config
-        let src = include_str!("listener.rs");
+        let src = include_str!("listener.rs").replace("\r\n", "\n");
         let prod = &src[..src
             .find("\nmod tests {")
             .or_else(|| src.find("#[cfg(test)]"))
@@ -1354,7 +1354,7 @@ mod tests {
     /// running 必须紧贴 listen 的两侧，退避等待不能冒充正在监听；停止还要能唤醒退避。
     #[test]
     fn the_running_flag_brackets_the_listener_thread() {
-        let src = include_str!("listener.rs");
+        let src = include_str!("listener.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("\nmod tests {").expect("测试模块的起点找不到了")];
         let at = prod
             .find("pub fn start(self: &Arc<Self>")
@@ -1408,7 +1408,7 @@ mod tests {
     /// 之后 ⇒ 这条救援根本走不到。
     #[test]
     fn both_press_and_release_arms_rescue_before_filtering() {
-        let src = include_str!("listener.rs");
+        let src = include_str!("listener.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("fn process_event")

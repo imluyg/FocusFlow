@@ -3993,7 +3993,7 @@ mod tests {
     /// 接线腿：`finalize_backup` 不许再用「它没报错」当确认。
     #[test]
     fn finalize_backup_uses_the_returned_mode_as_proof() {
-        let src = include_str!("maintenance.rs");
+        let src = include_str!("maintenance.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod.find("fn finalize_backup(").expect("收尾函数找不到了");
         let rest = &prod[at..];
@@ -4169,7 +4169,7 @@ mod tests {
     /// 接线判据：两个备份循环都按 `kept` 分流 —— 能动那份文件的口子只在"没有留档"那一支开着。
     #[test]
     fn the_backup_loops_do_not_delete_what_they_could_not_verify() {
-        let src = include_str!("maintenance.rs");
+        let src = include_str!("maintenance.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let code: String = prod
             .lines()
@@ -4215,7 +4215,7 @@ mod tests {
     /// 保守留下的非空 WAL，下一轮就会被这次清扫按"空"删掉。
     #[test]
     fn the_sidecar_sweep_uses_the_same_wal_size_ruler() {
-        let src = include_str!("maintenance.rs");
+        let src = include_str!("maintenance.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("pub fn sweep_stale_sidecars(")
@@ -4311,7 +4311,7 @@ mod tests {
     /// 锁住才造得出，无头环境给不出那个形态 ⇒ 这里钉形状，行为那半登记为眼验项。
     #[test]
     fn post_commit_cleanup_does_not_retract_a_committed_archive() {
-        let src = include_str!("maintenance.rs");
+        let src = include_str!("maintenance.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("fn archive_year_range(")
@@ -7941,7 +7941,7 @@ mod tests {
     /// 两条计数一起红（生产半边出现 bool 版、三态版少一处）。
     #[test]
     fn the_v2_migration_guard_asks_with_the_three_state_ruler() {
-        let src = include_str!("maintenance.rs");
+        let src = include_str!("maintenance.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let code: String = prod
             .lines()
@@ -8346,7 +8346,7 @@ mod tests {
     /// 而把尺子换回 `exists()` 时两条一起红。
     #[test]
     fn the_archive_still_asks_the_source_year_in_three_states() {
-        let src = include_str!("maintenance.rs");
+        let src = include_str!("maintenance.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("pub fn archive_stale_years(")

@@ -2400,7 +2400,7 @@ mod tests {
     /// 整段删掉，`reanchor_today` 与调度函数各自都还对 ⇒ 只有这条看得出少了一处调用。
     #[test]
     fn the_writer_loop_queues_the_failed_reanchor_itself() {
-        let src = include_str!("writer.rs");
+        let src = include_str!("writer.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("fn writer_loop(")
@@ -3855,7 +3855,7 @@ mod tests {
     /// 那是行为用例在"库根本不存在"那种夹具下照不出来的东西。
     #[test]
     fn the_preload_asks_presence_before_it_opens() {
-        let src = include_str!("writer.rs");
+        let src = include_str!("writer.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("fn preload_device_meta(")

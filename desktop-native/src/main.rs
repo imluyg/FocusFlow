@@ -17522,7 +17522,7 @@ mod icon_resource_tests {
     /// 这条盯的是"少接一份"那一族：`build.rs` 那份资源一直在，只是运行时没人读它。
     #[test]
     fn the_tray_and_the_title_bar_both_ask_the_module_first() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("fn tray_icon_image")
@@ -17635,7 +17635,7 @@ mod chart_axis_mirror_tests {
     /// 症状不是红，而是**少数了几处调用还照样绿**（这一条就是被 such 一次插错位置逼出来的）。
     #[test]
     fn the_prod_scan_boundary_stays_below_the_production_code() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("找不到测试模块的起点了");
         let prod = &src[..cut];
         for what in [
@@ -17857,7 +17857,7 @@ mod chart_axis_mirror_tests {
 
         // 接线：`POp::Chart` 在生产段只出现在三处（bounds 那一条 | 列表、布局 push、画），
         // 第四处只可能是有人给它加了点击分支。
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
@@ -17877,7 +17877,7 @@ mod cleanup_readout_tests {
     /// 查的是**调用形态**：句子由 core 的 `cleanup_line` 说一遍，这里只许调用。
     #[test]
     fn the_cleanup_button_defers_to_the_core_sentence() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         let local = ["format!(\"", "已清理"].concat();
@@ -17895,7 +17895,7 @@ mod cleanup_readout_tests {
 
     #[test]
     fn the_cleanup_button_flushes_pending_before_deleting_history() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
         let start = prod.find("let line = match which").expect("执行分支不见了");
         let arm = prod[start..].find("2 => {").expect("清理分支不见了") + start;
@@ -18004,7 +18004,7 @@ mod gap_note_tests {
     /// 新增一条域名而这里没接，红在缺登记那一句；面板自创一个名字，红在第一句。
     #[test]
     fn the_panel_claims_only_registered_domains() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         // 整行注释先滤掉：这条数的是"代码里真的点了一栏"，文档里提一句函数名不算认领。
         let prod = src[..cut]
@@ -18210,7 +18210,7 @@ mod chart_hover_tests {
     /// 漏撤的那一屏会亮着一格谁都没指的读数 —— 那比没有读数更糟。
     #[test]
     fn the_hover_state_reaches_the_draw_and_is_reset_wherever_it_cannot_apply() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = src[..cut]
             .lines()
@@ -18418,7 +18418,7 @@ mod snapshot_rate_tests {
     #[test]
     fn changing_the_refresh_interval_pokes_the_snapshot_waiter() {
         let _guard = POKE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
         let at = prod
             .find("EditTarget::Setting(idx)")
@@ -18460,7 +18460,7 @@ mod snapshot_rate_tests {
     /// "函数写了、循环仍旧按老的秒数睡"这种接法照样能蒙过去。
     #[test]
     fn the_snapshot_loop_sleeps_on_the_tiered_tick() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         let key = ["\"", "active_refresh_interval", "\""].concat();
@@ -18547,7 +18547,7 @@ mod snapshot_rate_tests {
     /// 窗口可能又被藏起来，那就该把这批查询省掉）。只在纯函数里算而循环不读 ⇒ 等于没做。
     #[test]
     fn the_snapshot_loop_asks_whether_anyone_is_watching() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         let call = ["watching_now", "("].concat();
@@ -18596,7 +18596,7 @@ mod snapshot_rate_tests {
     /// 剥完再跑同一次变异才第一次看到它红。
     #[test]
     fn the_import_branch_reanchors_today_right_after_writing_the_db() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod: String = src[..cut]
             .lines()
@@ -18634,7 +18634,7 @@ mod snapshot_rate_tests {
     /// （缓存照样被写），所以钉的是接线形状：每一处推快照，紧跟一次催画。
     #[test]
     fn every_snapshot_push_nudges_the_pill_to_repaint() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         let push = ["publish_floating(&", "next"].concat();
@@ -18678,7 +18678,7 @@ mod settings_type_tests {
         );
         assert!(!hit(r, 20.0, g.list_top + 5.0), "卡片左边距里不该亮");
         // 画 / 悬停 / 点击三处读同一个函数。
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         // 画那一行仍读同一个矩形；悬停与点击共用 `settings_row_at`（两处，少一处就是又分家）。
         assert!(
@@ -18823,7 +18823,7 @@ mod settings_type_tests {
     /// 只在屏上看得见，所以拿源码范围钉住。
     #[test]
     fn the_settings_page_draws_with_its_own_scale() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let from = src
             .find("fn draw_settings(")
             .expect("设置页的绘制入口找不到了");
@@ -18850,7 +18850,7 @@ mod settings_type_tests {
     /// 它原先直接写雅黑，于是同一行里框外的数字与框里敲进去的数字是两种字重。
     #[test]
     fn the_edit_font_shares_the_directwrite_family() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let from = src
             .find("fn make_ui_font(")
             .expect("主窗口那把 EDIT 字体的构造点找不到了");
@@ -18871,7 +18871,7 @@ mod settings_type_tests {
     /// 并给三个已经建出来的 EDIT 重发 `WM_SETFONT`。
     #[test]
     fn the_edit_font_is_rebuilt_when_the_monitor_dpi_changes() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         let start = prod.find("WM_DPICHANGED =>").expect("WM_DPICHANGED 不见了");
@@ -19201,7 +19201,7 @@ mod hotkey_tests {
     /// 把键名写成字面量——抄漏一条的症状是"开关明明关掉了，还剩一条键在占全局"。
     #[test]
     fn both_hotkey_paths_share_one_combo_list() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         let call = ["combo_keys", "("].concat();
@@ -19410,7 +19410,7 @@ mod boot_notice_tests {
     /// 这条缺陷的形状正是"日志里说了，屏上没说"，所以钉的是调用形态而不是函数名。
     #[test]
     fn the_boot_line_is_fed_both_silent_degradations() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         // 钉"调用形态"而不是函数名：光找 `boot_notice(` 会先撞上那句 `fn boot_notice(`
@@ -19635,7 +19635,7 @@ mod weekly_report_tests {
         assert_eq!(md_cell("两行\n名字"), "两行 名字");
 
         // 生产段三处表格（键名 / 应用名 / 设备名）都要过它，外加"最高单日"那一句。
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert_eq!(
             prod.matches("md_cell(").count(),
@@ -19719,7 +19719,7 @@ mod weekly_report_tests {
     /// 按自然周取窗口）无头造不出来，所以钉的是同一份源码里的先后次序。
     #[test]
     fn the_weekly_report_sums_devices_before_it_cuts_the_list() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod: String = src[..cut]
             .lines()
@@ -20030,7 +20030,7 @@ mod user_file_write_tests {
     /// 否则这条用例自己的字面量会被它正在查的样式数进去（`listener.rs` 同一手）。
     #[test]
     fn the_user_file_paths_go_through_the_atomic_writer() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         let direct = ["std::fs::write", "("].concat();
@@ -21083,7 +21083,9 @@ mod hotkey_line_tests {
         // 拆开拼针，免得这条守卫命中测试文件自己的字面量。
         let needle = ["topbar_status_line(", "vs.view", ", status, w)"].concat();
         assert!(
-            include_str!("main.rs").contains(&needle),
+            include_str!("main.rs")
+                .replace("\r\n", "\n")
+                .contains(&needle),
             "顶栏回执没接在 draw_screen 上：插件页的回执还是看不到"
         );
     }
@@ -21292,7 +21294,7 @@ mod always_on_top_tests {
     /// 点掉的）。而"悬浮窗压在任务栏上面"是另一条产品口径，不能跟着一起删。
     #[test]
     fn the_main_window_is_normal_and_the_card_still_floats_on_top() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         assert!(
@@ -21303,7 +21305,7 @@ mod always_on_top_tests {
             .find("WS_EX_TOPMOST | WS_EX_TOOLWINDOW")
             .expect("贴图窗的置顶样式不见了");
         assert!(pins > 0, "贴图窗仍要置顶");
-        let floating = include_str!("floating.rs");
+        let floating = include_str!("floating.rs").replace("\r\n", "\n");
         let fcut = floating
             .find("#[cfg(test)]")
             .expect("悬浮窗的测试模块找不到了");
@@ -21725,7 +21727,7 @@ mod share_base_tests {
     /// 生产文本（整行注释与 `///` 一并滤掉：这条守卫曾被"把调用整块注释掉"假绿过一次，
     /// 注释里那句话与针脚可以逐字相同）。
     fn prod() -> String {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         src[..cut]
             .lines()
@@ -22039,7 +22041,7 @@ mod export_ruler_tests {
     /// 这三条规则在原生侧都不许再长出第二份手抄。
     #[test]
     fn the_export_rules_have_one_owner() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("找不到测试模块的起点了");
         let prod: String = src[..cut]
             .lines()
@@ -22100,7 +22102,7 @@ mod weekday_label_tests {
     /// 接线守卫：画柱与画数字**两处**都问同一把尺子——少一处就是叠字复发的形状。
     #[test]
     fn the_weekday_bar_and_its_number_share_one_headroom() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("找不到测试模块的起点了");
         let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
@@ -23167,7 +23169,7 @@ mod underline_tests {
     /// 页签下划线必须按文字实测的宽度画；固定 52px 时两个字和四个字挂同一条线。
     #[test]
     fn the_tab_underline_is_measured_not_fixed() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = src[..cut]
             .lines()
@@ -23282,7 +23284,7 @@ mod snapshot_poke_tests {
     /// 症状照旧是点开窗口先看见旧数。
     #[test]
     fn the_poke_is_wired_after_the_show_and_on_the_key_callback() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
@@ -23357,7 +23359,7 @@ mod snapshot_poke_tests {
             "卡片那一拍不再「查完就记时刻」：被催醒的那一拍会照旧立刻再问一次"
         );
 
-        let csrc = include_str!("collect.rs");
+        let csrc = include_str!("collect.rs").replace("\r\n", "\n");
         let cflat: String = csrc.chars().filter(|c| !c.is_whitespace()).collect();
         // 那两句之间夹着注释，所以比的是先后而不是拼成一串：整串匹配会被注释挡掉（红过一次）。
         let rec = cflat
@@ -23631,7 +23633,7 @@ mod plugin_page_tests {
     /// 按钮的几何只有一份：画它的这一头与点它的那一头共用同一个函数（命中条件也是同一句）。
     #[test]
     fn the_grant_button_geometry_is_not_copied() {
-        let code = include_str!("../src/main.rs");
+        let code = include_str!("../src/main.rs").replace("\r\n", "\n");
         let at = code
             .find("mod plugin_page_tests {")
             .expect("插件页那一套用例的模块起点找不到了");
@@ -23658,7 +23660,7 @@ mod plugin_page_tests {
     /// 计数固定成 3（定义 + 画 + 命中），多出来的一处就是有人抄了第二份几何。
     #[test]
     fn the_detail_button_is_drawn_and_hit_from_one_expression() {
-        let code = include_str!("../src/main.rs");
+        let code = include_str!("../src/main.rs").replace("\r\n", "\n");
         let at = code
             .find("mod plugin_page_tests {")
             .expect("插件页那一套用例的模块起点找不到了");
@@ -23758,7 +23760,7 @@ mod plugin_page_tests {
     /// 用户点「取消」落到的可能是「卸载并删除设置」。
     #[test]
     fn the_install_and_uninstall_buttons_have_one_geometry() {
-        let code = include_str!("../src/main.rs");
+        let code = include_str!("../src/main.rs").replace("\r\n", "\n");
         let at = code
             .find("mod plugin_page_tests {")
             .expect("插件页那一套用例的模块起点找不到了");
@@ -23864,7 +23866,7 @@ mod plugin_page_tests {
     /// 详情页的「卸载」只在**有安装记录**时出现：那个布尔值必须由安装记录算出来。
     #[test]
     fn the_uninstall_button_follows_the_install_record() {
-        let code = include_str!("../src/main.rs");
+        let code = include_str!("../src/main.rs").replace("\r\n", "\n");
         let at = code
             .find("mod plugin_page_tests {")
             .expect("插件页那一套用例的模块起点找不到了");
@@ -23919,7 +23921,7 @@ mod plugin_page_tests {
     /// 加一句 `ensure_loaded`，这里会先红 —— 而不是等用户发现"点一下详情把一个插件装活了"。
     #[test]
     fn opening_the_detail_page_does_not_load_the_plugin() {
-        let code = include_str!("../src/main.rs");
+        let code = include_str!("../src/main.rs").replace("\r\n", "\n");
         let at = code
             .find("mod plugin_page_tests {")
             .expect("插件页那一套用例的模块起点找不到了");
@@ -23967,7 +23969,7 @@ mod plugin_page_tests {
     /// 而"写死 1 秒"那种回退不会让任何一条用例红 —— 除非这里钉住它。
     #[test]
     fn the_refresh_cadence_chain_has_both_ends_in_production() {
-        let code = include_str!("../src/main.rs");
+        let code = include_str!("../src/main.rs").replace("\r\n", "\n");
         let at = code
             .find("mod plugin_page_tests {")
             .expect("插件页那一套用例的模块起点找不到了");
@@ -23996,7 +23998,7 @@ mod plugin_page_tests {
     /// 那条链同形（检测线程整晚在扫而没人处理），所以照同一把尺子钉。
     #[test]
     fn the_timer_chain_has_both_ends_in_production() {
-        let code = include_str!("../src/main.rs");
+        let code = include_str!("../src/main.rs").replace("\r\n", "\n");
         assert!(
             code.contains("fn pump_plugin_timers(&mut self)"),
             "投递那一步没写成方法"
@@ -24049,7 +24051,7 @@ mod plugin_page_tests {
     /// 只装不卸是一份 VM 永远不回来，只卸不装是点开一张空卡。
     #[test]
     fn the_panel_lifecycle_chain_has_both_ends_in_production() {
-        let code = include_str!("../src/main.rs");
+        let code = include_str!("../src/main.rs").replace("\r\n", "\n");
         let at = code
             .find("mod plugin_page_tests {")
             .expect("插件页那一套用例的模块起点找不到了");
@@ -24141,7 +24143,7 @@ mod plugin_page_tests {
     /// 只查函数名在不在会被注释顶班。
     #[test]
     fn every_plugin_page_consumer_reads_the_same_slot_table() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let code: String = prod
             .lines()
@@ -24188,7 +24190,7 @@ mod plugin_page_tests {
         assert!(!hit(r, 100.0, 300.0 + row_h - 3.0), "行间空档不归这一行");
 
         // 画 / 悬停 / 点击三处读同一个函数，不是各写一套坐标。
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         for needle in [
             "let r = plugin_row_rect(w, y, row_h);",
@@ -24289,7 +24291,7 @@ mod plugin_page_tests {
     /// 只查函数名在不在会被注释与文档顶班。
     #[test]
     fn the_pending_store_writes_are_asked_before_the_page_and_before_exit() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let code: String = prod
             .lines()
@@ -24323,7 +24325,7 @@ mod plugin_page_tests {
     /// 耗时、错误历史与降频次数在退出那一刻清零（而 health.json 存在的理由正是这个）。
     #[test]
     fn the_health_ledger_is_flushed_before_the_exit_backup() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let code: String = prod
             .lines()
@@ -24353,7 +24355,7 @@ mod plugin_page_tests {
     /// 实际只有 4096；写 0 时说 0、VM 是 1 —— 两处各说一套。
     #[test]
     fn the_plugin_page_takes_the_memory_cap_from_core() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert!(
             prod.contains("plugins::manager::memory_limit_mb("),
@@ -24418,7 +24420,7 @@ mod plugin_page_tests {
     /// 判据钉的是调用形态与所在函数，只查函数名会被注释与文档顶班。
     #[test]
     fn the_hot_reload_chain_has_both_ends_in_production() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let code: String = prod
             .lines()
@@ -24466,7 +24468,7 @@ mod plugin_page_tests {
     /// `quit_app` 开头已经问过了 —— 所以没有任何一致性理由为它等这两秒。
     #[test]
     fn quitting_does_not_wait_for_the_watcher_thread() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("fn quit_app(hwnd: HWND)")
@@ -24707,8 +24709,8 @@ mod collector_state_tests {
 
     #[test]
     fn the_switch_pause_row_and_tray_read_the_listening_bit() {
-        let src = include_str!("main.rs");
-        let code = flat(src);
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let code = flat(&src);
         for needle in [
             "collector_on:collect::is_listening(),",
             "letmsg=if!collect::is_listening(){",
@@ -24725,8 +24727,8 @@ mod collector_state_tests {
 
     #[test]
     fn the_floating_pill_reads_the_listening_bit() {
-        let src = include_str!("floating.rs");
-        let code = flat(src);
+        let src = include_str!("floating.rs").replace("\r\n", "\n");
+        let code = flat(&src);
         assert!(
             code.contains("crate::collect::is_listening(),"),
             "悬浮窗把「起来过」当成「在计」"
@@ -24758,7 +24760,7 @@ mod table_band_tests {
         assert!(!hit(r, card.left + 5.0, 325.0), "行间空档不归这一行");
 
         // 悬停与点击读同一个函数，不是各写一套坐标。
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert!(
             prod.contains("if hit(table_row_band(card, y0, g.row_h), x, y) {"),
@@ -24798,7 +24800,7 @@ mod plugin_view_title_tests {
         );
 
         // 接线：画那一头按这一格夹，而不是把长文本原样画出去。
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert!(
             prod.contains("let title_rect = plugin_view_title_rect(card, back);"),
@@ -24831,7 +24833,7 @@ mod select_menu_tests {
         );
 
         // 接线：画的那一头用这句空态（函数名在别处出现不算）。
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert!(
             prod.contains("if let Some(note) = empty_select_note(sel.options.len()) {"),
@@ -24844,7 +24846,7 @@ mod select_menu_tests {
 #[cfg(test)]
 mod view_wiring_tests {
     fn prod() -> String {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         src[..cut].to_string()
     }
@@ -25051,7 +25053,7 @@ mod chrome_layout_tests {
     /// 以前写的是 `view.min(2)`：设备页拿到「应用页」的下标去索引设备表，行数一多就 panic。
     #[test]
     fn the_table_tab_is_derived_from_the_view_index() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert!(prod.contains("let tab = vs.view.saturating_sub(V_KEYS);"));
         assert!(
@@ -25418,7 +25420,7 @@ mod ux_polish_tests {
     /// 键盘与右键复制的接线：光有函数名不算，得真的挂在消息循环上。
     #[test]
     fn keyboard_and_copy_are_wired_to_the_message_loop() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         for needle in [
             "app.handle_nav_key(hwnd, w.0)",
@@ -25437,7 +25439,7 @@ mod instance_and_tray_tests {
     /// 第二个实例只能投消息，不能跨进程解引用已有窗口的 `GWLP_USERDATA`。
     #[test]
     fn a_second_instance_posts_a_message_instead_of_touching_the_other_process() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let start = prod
             .find("fn already_running() -> Option<HANDLE>")
@@ -25460,7 +25462,7 @@ mod instance_and_tray_tests {
     /// 托盘左键是唤窗，不是开菜单；crate 默认两者都会做。
     #[test]
     fn tray_left_click_does_not_open_the_menu() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert!(
             prod.contains(".with_menu_on_left_click(false)"),
@@ -25471,7 +25473,7 @@ mod instance_and_tray_tests {
     /// 设置页任何一次点击都要先放弃"等热键"的录入态（值框那一支随后会重新置位）。
     #[test]
     fn a_settings_click_drops_the_hotkey_capture() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let start = prod
             .find("if self.view == V_SETTINGS {")
@@ -25506,7 +25508,7 @@ mod instance_and_tray_tests {
     /// 「自动压缩（天）」必须有生产调用点；否则设置页上的开关永远不做事。
     #[test]
     fn the_auto_vacuum_setting_reaches_a_background_thread() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert!(
             prod.contains(".name(\"auto-vacuum\"")
@@ -25518,7 +25520,7 @@ mod instance_and_tray_tests {
     /// 关机/注销要走与托盘退出同一条路；否则退出备份和最后一次去抖落盘被系统掐掉。
     #[test]
     fn system_shutdown_takes_the_exit_backup_path() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert!(prod.contains("WM_QUERYENDSESSION"), "没接关机/注销消息");
         let at = prod
@@ -25673,7 +25675,7 @@ mod board_toggle_tests {
     /// 画图、悬停、键盘焦点、点击四处必须读同一份坐标。
     #[test]
     fn all_four_tab_readers_use_the_same_geometry() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         for needle in [
             "for (view, r) in visible_tabs(self.board_on)",
@@ -25689,7 +25691,7 @@ mod board_toggle_tests {
     /// 开关看板会改变页签数量 ⇒ 键盘格下标整体挪位；开关那一支必须撤掉旧焦点。
     #[test]
     fn toggling_the_board_drops_a_stale_keyboard_focus_index() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let start = prod.find("fn toggle_board").expect("看板开关找不到了");
         let rest = &prod[start..];

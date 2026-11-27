@@ -850,7 +850,7 @@ mod tests {
     /// `refuse` 数不齐就红 —— 以后再加一条早退而忘了回音，红点会指在这里。
     #[test]
     fn every_early_exit_in_the_thread_body_reports_back() {
-        let src = include_str!("device_stats.rs");
+        let src = include_str!("device_stats.rs").replace("\r\n", "\n");
         let at = src.find("pub fn run(").expect("win::run 不见了");
         let rest = &src[at..];
         let body = &rest[..rest.find("SINK.with").expect("线程本体的锚点不见了")];
@@ -897,7 +897,7 @@ mod tests {
     /// 接线守卫：那条早退必须真的走节流并出声（纯函数绿不代表调用方读了它）。
     #[test]
     fn the_unresolvable_branch_actually_uses_the_budget() {
-        let src = include_str!("device_stats.rs");
+        let src = include_str!("device_stats.rs").replace("\r\n", "\n");
         let start = src.find("fn on_input(").expect("Sink::on_input 不见了");
         let end = src[start..]
             .find("fn register_device(")
@@ -1261,7 +1261,7 @@ mod tests {
     /// 接线守卫：热路径必须真的走带宽限期那张缓存 —— 上面几条纯函数绿不代表调用方读了它。
     #[test]
     fn on_input_uses_the_expiring_cache_on_both_maps() {
-        let src = include_str!("device_stats.rs");
+        let src = include_str!("device_stats.rs").replace("\r\n", "\n");
         let start = src.find("fn on_input(").expect("Sink::on_input 不见了");
         let end = src[start..]
             .find("fn register_device(")

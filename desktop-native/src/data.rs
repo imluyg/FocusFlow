@@ -796,7 +796,7 @@ mod readout_rulers_tests {
 
     /// 生产文本（整行注释与 `///` 一并滤掉，判据数的是代码）。
     fn prod() -> String {
-        let src = include_str!("data.rs");
+        let src = include_str!("data.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
         src[..cut]
             .lines()
@@ -1113,9 +1113,9 @@ mod rank_ruler_tests {
     /// 自己的字面量会被它正在查的样式数进去（`main.rs` 里同一手）。
     fn prod(self_file: bool) -> String {
         let src = if self_file {
-            include_str!("data.rs")
+            include_str!("data.rs").replace("\r\n", "\n")
         } else {
-            include_str!("main.rs")
+            include_str!("main.rs").replace("\r\n", "\n")
         };
         let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
         src[..cut].to_string()
@@ -1152,7 +1152,7 @@ mod rank_break_tests {
 
     /// 生产文本（连整行注释一起滤掉，判据数的是代码）：本文件 `#[cfg(test)]` 之前的部分。
     fn prod() -> String {
-        let src = include_str!("data.rs");
+        let src = include_str!("data.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
         src[..cut]
             .lines()
@@ -1266,7 +1266,7 @@ mod chart_window_tests {
     /// 接线守卫数的是调用点，注释里提一次函数名（带括号的写法很自然）不该把计数抬起来。
     /// 针脚仍旧拼出来，免得用例自己的字面量被它正在查的样式数进去。
     fn prod() -> String {
-        let src = include_str!("data.rs");
+        let src = include_str!("data.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
         src[..cut]
             .lines()
@@ -1391,7 +1391,7 @@ mod chart_window_tests {
     /// （`crates/core/tests/perf_probe.rs` 的 `pill_arms` / `tick_arms`）。
     #[test]
     fn the_card_only_tick_asks_only_the_card_question() {
-        let src = include_str!("data.rs");
+        let src = include_str!("data.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
         let prod = &src[..cut];
         let at = prod

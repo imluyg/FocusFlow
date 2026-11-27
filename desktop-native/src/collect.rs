@@ -456,7 +456,7 @@ mod tests {
     /// 暂停位、界面说已恢复而键鼠一条都不记。
     #[test]
     fn resuming_only_starts_a_listener_when_the_old_thread_is_gone() {
-        let src = include_str!("collect.rs");
+        let src = include_str!("collect.rs").replace("\r\n", "\n");
         // 先摘注释行再比：本文件的文档里就写着「不走 `listener.start()`」这类反例，
         // 不摘干净的话守卫会被自己的说明文字命中（这仓里为这一条栽过两次）。
         let flat = |s: &str| -> String {
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn the_speed_window_uses_a_monotonic_clock() {
-        let src = include_str!("collect.rs");
+        let src = include_str!("collect.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
         assert!(
             prod.contains("VecDeque<Instant>")

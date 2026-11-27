@@ -1544,7 +1544,7 @@ mod tests {
 
         // 接线腿：两个面板都必须真的说这句话。纯函数自己绿不等于有人调它 ——
         // 这条缺陷原本的形状就是"一处说、一处不说"。
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
         for name in ["print_stats", "print_year_stats"].iter() {
             let at = prod
@@ -1572,7 +1572,7 @@ mod tests {
     /// `--cleanup 999999` 一路放行，而它们实际等价于"把历史全删了"。
     #[test]
     fn cleanup_takes_both_calipers_from_core() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let at = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..at];
         assert!(
@@ -1672,7 +1672,7 @@ mod tests {
     /// 桌面那条用例管不到这个 crate，所以覆盖面要在这儿自己盯住。
     #[test]
     fn every_cli_rank_goes_through_the_one_comparator() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
         let sorts: Vec<usize> = prod.match_indices(".sort_by(").map(|(i, _)| i).collect();
         assert_eq!(
@@ -1939,7 +1939,7 @@ mod tests {
     /// 它们把这一支折掉了，接住它的是形状判据而不是编译器。
     #[test]
     fn every_cli_read_command_checks_the_years_are_readable() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
         let readers = [
             "print_stats",
@@ -2189,7 +2189,7 @@ mod tests {
 
     #[test]
     fn reset_takes_the_native_lock_before_deleting_any_rows() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("mod tests").expect("测试模块的起点")];
         let at = prod.find("fn reset(").expect("reset 函数不见了");
         let end = prod[at..]
@@ -2213,7 +2213,7 @@ mod tests {
     /// 在本仓就是缺陷，不是待办。
     #[test]
     fn usage_lists_exactly_the_commands_the_cli_handles() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let open = src
             .find("const USAGE: &str = \"")
             .expect("USAGE 常量不见了")
@@ -2301,7 +2301,7 @@ mod tests {
     /// 红点落在没人看的接线处。
     #[test]
     fn the_device_keys_command_actually_reads_its_period() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
         // 从分派入口往后找：文件前面还有参数元数据（max_args）也写着同一个串，
         // 从文件头 find 会把那张表当成"分派臂" —— 守卫要盯的是真正执行的那一段。
@@ -2345,7 +2345,7 @@ mod tests {
     /// 计划任务收的 stdout 说的正好是反的。结论串抄成两处，就等于随时可以退回那一版。
     #[test]
     fn the_backup_verdict_only_exists_in_the_outcome_function() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
         // 只数「会印出去的那一句」：注释里引用旧文案时带书名号，不带后面那个冒号。
         assert_eq!(
@@ -2469,7 +2469,7 @@ mod tests {
     /// 钉的是接线（两个入口各一处），不是纯函数：core 那边三条臂有自己的用例。
     #[test]
     fn the_destructive_commands_echo_the_snapshot_warning() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("mod tests").expect("测试模块的起点找不到了")];
 
         let arm = prod
@@ -2553,7 +2553,7 @@ mod tests {
     /// 部分失败的一轮里，只收 stdout 的计划任务看到的仍是一行像成功的话。
     #[test]
     fn the_backup_arm_has_no_unconditional_stdout_print() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         // 锚点必须带 `{`：`max_args` 那张表里也有 `"--backup" => 2`，不带就会从表那里切开
         let at = prod
@@ -2626,7 +2626,7 @@ mod tests {
         assert_eq!(classify_confirmation(Ok(5), "YES\n"), ConfirmRead::Approved);
 
         // 调用形态也得钉住：读一次、把结果交给分类器，三分支各自去哪。
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
@@ -2653,7 +2653,7 @@ mod tests {
             PurgePlan::Unreadable(why) => assert!(why.contains("stdin")),
             other => panic!("没问到不等于拒绝：{other:?}"),
         }
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let flat: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
@@ -2671,7 +2671,7 @@ mod tests {
     /// 收 stdout 就是它们的唯一读者。
     #[test]
     fn the_write_arms_route_every_stdout_line_through_the_exit_code() {
-        let src = include_str!("main.rs");
+        let src = include_str!("main.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         // (`eprintln!` 的文本里含着 `println!`，所以按"总次数减 e 前缀次数"数裸的那一个)
         for (arm, next) in [

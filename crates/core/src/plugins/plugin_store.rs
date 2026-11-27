@@ -862,7 +862,7 @@ mod tests {
     /// 守卫要钉调用形态，不是钉函数名在不在）。
     #[test]
     fn only_the_fixed_file_name_ever_enters_a_path() {
-        let src = include_str!("plugin_store.rs");
+        let src = include_str!("plugin_store.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let joins: Vec<&str> = prod.match_indices(".join(").map(|(_, s)| s).collect();
         assert_eq!(

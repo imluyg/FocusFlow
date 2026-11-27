@@ -1976,7 +1976,7 @@ mod tests {
     /// 进来的老库又开始错位。所以按 `pomodoro.rs` 同一把尺子再钉一条字面判据。
     #[test]
     fn the_task_read_names_its_columns() {
-        let src = include_str!("scheduler.rs");
+        let src = include_str!("scheduler.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod: String = src[..cut]
             .lines()
@@ -2378,7 +2378,7 @@ mod tests {
     /// 其余情况由 SQL 自己保留库里的现值。
     #[test]
     fn update_task_never_writes_back_a_stale_last_run() {
-        let src = include_str!("scheduler.rs");
+        let src = include_str!("scheduler.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块起点找不到了")];
         let at = prod
             .find("pub fn update_task(")
@@ -2586,7 +2586,7 @@ mod tests {
     /// 必须经过 `take_memo`，而老的 `fired_memo.get(&task.id).cloned()` 不许回来。
     #[test]
     fn the_scheduler_thread_reads_its_memo_through_the_staleness_check() {
-        let src = include_str!("scheduler.rs");
+        let src = include_str!("scheduler.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let mut wrong: Vec<String> = Vec::new();
         let n = prod.matches("take_memo(&mut fired_memo").count();
@@ -4065,7 +4065,7 @@ mod tests {
     /// `--test-threads=1` 全绿。这条按文本形状钉住声明顺序。
     #[test]
     fn the_isolation_guard_drops_the_dir_before_the_lock() {
-        let src = include_str!("scheduler.rs");
+        let src = include_str!("scheduler.rs").replace("\r\n", "\n");
         // needle 用拼接：本用例自己的注释里就写着 `struct Isolated`，
         // 直接写常量会先匹配到注释、把比较对象换成自己的说明文字
         let at = src
@@ -4132,7 +4132,7 @@ mod tests {
     /// 系统目录放文件，测试里不该那么做。所以第二个出口用形状钉住。
     #[test]
     fn both_whitelist_refusals_share_the_same_hint() {
-        let src = include_str!("scheduler.rs");
+        let src = include_str!("scheduler.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         assert_eq!(
             prod.match_indices("{ALLOW_EXTRA_HINT}").count(),
@@ -4234,7 +4234,7 @@ mod tests {
     /// 就又只剩一句「格式应为」，而那种写法对行为用例的另一半（判据本身）完全无害。
     #[test]
     fn all_three_readers_of_a_schedule_use_the_checked_parser() {
-        let src = include_str!("scheduler.rs");
+        let src = include_str!("scheduler.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod
             .find("fn validate_schedule")

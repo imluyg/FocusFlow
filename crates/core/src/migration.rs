@@ -1213,7 +1213,7 @@ mod tests {
     /// 接线判据：年度库 sidecar 仍走三态尺子，附属库改走 SQLite 在线备份。
     #[test]
     fn the_import_chain_asks_its_source_files_with_one_ruler() {
-        let text = include_str!("migration.rs");
+        let text = include_str!("migration.rs").replace("\r\n", "\n");
         let prod = &text[..text.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let code = prod
             .lines()

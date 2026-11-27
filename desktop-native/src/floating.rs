@@ -1866,7 +1866,7 @@ mod anchor_tests {
         assert_eq!(logical_position_value(900, 1.5), 600);
         assert_eq!(logical_position_value(601, 1.5), 401);
 
-        let src = include_str!("floating.rs");
+        let src = include_str!("floating.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         assert!(
@@ -1936,7 +1936,7 @@ mod anchor_tests {
     /// 上面那条只证明函数自己算得对；这两处调用点不接进来，两条缺陷照样会复发。
     #[test]
     fn both_floating_paths_ask_the_same_card_size() {
-        let src = include_str!("floating.rs");
+        let src = include_str!("floating.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let flat: String = src[..cut].chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
@@ -1963,7 +1963,7 @@ mod anchor_tests {
     /// 一分钱没省，屏上还看不出来）。所以钉三件事：paste 在条件里、循环还在、store 在循环后。
     #[test]
     fn the_background_template_gates_the_pixel_loop_without_replacing_it() {
-        let src = include_str!("floating.rs");
+        let src = include_str!("floating.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         assert!(
@@ -2069,7 +2069,7 @@ mod paint_order_tests {
     /// （此前只有注释在守）。钉的是**索引次序**：换序即红，删句即红。
     #[test]
     fn the_card_comes_back_before_anything_is_submitted() {
-        let src = include_str!("floating.rs");
+        let src = include_str!("floating.rs").replace("\r\n", "\n");
         let cut = src.find("#[cfg(test)]").expect("测试模块的起点找不到了");
         let prod = &src[..cut];
         // 次序只能在 `repaint` 那一身之内比：全文 `find` 会先撞上别的函数的**定义**
@@ -2664,7 +2664,7 @@ mod text_path_ab_tests {
     /// 比较范围收在函数体之内（全文 `find` 会撞上别的函数的定义，本仓红过一次）。
     #[test]
     fn the_production_text_ctx_uses_the_software_dc_target() {
-        let src = include_str!("floating.rs");
+        let src = include_str!("floating.rs").replace("\r\n", "\n");
         let cut = src
             .find("#[cfg(test)]")
             .expect("测试模块的起点不见了：那生产码的边界就没法切");

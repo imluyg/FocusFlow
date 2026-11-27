@@ -1091,7 +1091,7 @@ mod tests {
     /// 行为用例只挡住其中一半（附属搬不动那条），所以这里把形状钉住。
     #[test]
     fn keep_aside_reads_metadata_and_moves_sidecars_first() {
-        let src = include_str!("data_location.rs");
+        let src = include_str!("data_location.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let at = prod.find("fn keep_aside(").expect("keep_aside 找不到了");
         let rest = &prod[at..];
@@ -1759,7 +1759,7 @@ mod tests {
     /// 而"看不清也放行"这个症状只会在调用点上发生。
     #[test]
     fn the_destination_check_feeds_the_real_listing_to_the_verdict() {
-        let src = include_str!("data_location.rs");
+        let src = include_str!("data_location.rs").replace("\r\n", "\n");
         let at = src
             .find("pub fn validate_new_data_home(")
             .expect("校验函数找不到了");

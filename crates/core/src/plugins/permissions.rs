@@ -797,7 +797,7 @@ mod tests {
 
     #[test]
     fn write_grants_uses_the_shared_atomic_writer() {
-        let src = include_str!("permissions.rs");
+        let src = include_str!("permissions.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点")];
         let at = prod.find("pub fn write_grants(").expect("授权写入不见了");
         let end = prod[at..]
@@ -847,7 +847,7 @@ mod tests {
     /// 判据要挡住的方向，所以钉在源文件形状上，而不是只写在注释里。
     #[test]
     fn the_ruler_does_not_name_a_runtime() {
-        let src = include_str!("permissions.rs");
+        let src = include_str!("permissions.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         for banned in ["mlua", "Lua", "Table", "Function", "Variadic"] {
             assert!(
