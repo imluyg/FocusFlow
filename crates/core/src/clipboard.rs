@@ -134,19 +134,36 @@ static CAPTURE_NOTICE: std::sync::Mutex<CaptureNotice> = std::sync::Mutex::new(C
     issue: None,
 });
 static CAPTURE_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-static CAPTURE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// 上一次成功清空时领的"采集起点界"：起点**早于**它的采集一律丢弃（那是清空前的旧件）。
+///
+/// 为什么不按代次相等判：代次只能在删除成功之后推进，而删行 + 清图片可能持续几百毫秒 ——
+/// 用户在这段里复制的那一笔（起点的号比界大）会被"代次还没推进"误杀，历史里静默没有它。
+/// 界在**删除之前**领，失败时不落界：失败的清空不会丢掉队列里那些旧件。
+static CLEARED_CAPTURE_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CLEARED_CLIPBOARD_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 fn next_capture_order() -> u64 {
     CAPTURE_ORDER.fetch_add(1, Ordering::Relaxed)
 }
 
-fn current_capture_generation() -> u64 {
-    CAPTURE_GENERATION.load(Ordering::Acquire)
+/// 一次采集**开始**时领的号（读剪贴板之前领，与 `capture_order` 共用同一枚递增计数器）。
+///
+/// 与 [`CLEARED_CAPTURE_START`] 比大小：起点在界之前的采集属于"清空前那一笔"，
+/// 哪怕它的解码/落盘跨过了整次清空；起点在界之后的（清空进行中复制的那一笔）必须留下。
+fn capture_start_mark() -> u64 {
+    next_capture_order()
 }
 
-fn advance_capture_generation() {
-    CAPTURE_GENERATION.fetch_add(1, Ordering::Release);
+fn record_clear_capture_start(boundary: u64) {
+    CLEARED_CAPTURE_START.fetch_max(boundary, Ordering::Release);
+}
+
+/// 这次采集该不该按"清空前的旧件"丢掉。
+///
+/// 两条各自挡一类：起点早于界（清空开始之前就已经在读的那一笔）；或读到的剪贴板序号
+/// 不晚于清空时记下的序号（旧内容被监听消息迟到地重读一遍 —— 起点虽晚，内容仍是旧的）。
+fn capture_is_cleared(start: u64, boundary: u64, sequence: u32, cleared_sequence: u32) -> bool {
+    start < boundary || sequence <= cleared_sequence
 }
 
 fn current_clipboard_sequence() -> u32 {
@@ -167,6 +184,9 @@ fn record_clear_sequence(sequence: u32) {
 #[cfg(test)]
 fn reset_clear_sequence_for_test() {
     CLEARED_CLIPBOARD_SEQUENCE.store(0, Ordering::Release);
+    // 清空界是进程级全局：用例之间必须一起归零，否则上一个用例落的界会把下一个用例
+    // "当前时刻"的采集全判成旧件（起点号虽然一直在涨，但界也可能比它大）。
+    CLEARED_CAPTURE_START.store(0, Ordering::Release);
 }
 
 fn update_capture_notice(order: u64, issue: Option<String>) {
@@ -1120,9 +1140,14 @@ pub fn clear_unpinned() -> Result<usize, String> {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| format!("清空剪贴板历史失败：{e}"))?
     };
+    // 清空界在**删除之前**领：删行 + 清图片可能持续几百毫秒，用户在这段里复制的那一笔
+    // 起点比界大，必须留下（原先按"代次相等"判，代次只能等删除成功后才推进，于是这段里
+    // 的新复制全被当代次过期丢掉，历史里静默没有）。失败时**不落界**：失败的清空一个
+    // 旧件都不该丢（见 `a_failed_clear_does_not_discard_queued_items`）。
+    let capture_boundary = capture_start_mark();
     let clear_sequence = current_clipboard_sequence();
     let deleted = delete_rows_cleaning_files(&conn, &ids)?;
-    advance_capture_generation();
+    record_clear_capture_start(capture_boundary);
     record_clear_sequence(clear_sequence);
     Ok(deleted)
 }
@@ -2279,7 +2304,7 @@ mod win {
             source_app: String,
             copied_at_ms: i64,
             capture_order: u64,
-            capture_generation: u64,
+            capture_start: u64,
             clipboard_sequence: u32,
         },
         Image {
@@ -2287,7 +2312,7 @@ mod win {
             source_app: String,
             copied_at_ms: i64,
             capture_order: u64,
-            capture_generation: u64,
+            capture_start: u64,
             clipboard_sequence: u32,
         },
         Files {
@@ -2295,17 +2320,21 @@ mod win {
             source_app: String,
             copied_at_ms: i64,
             capture_order: u64,
-            capture_generation: u64,
+            capture_start: u64,
             clipboard_sequence: u32,
         },
     }
 
     impl Captured {
         pub fn ingest(&self) -> Result<super::IngestOutcome, String> {
-            if self.capture_generation() != super::current_capture_generation()
-                || self.clipboard_sequence()
-                    <= super::CLEARED_CLIPBOARD_SEQUENCE.load(std::sync::atomic::Ordering::Acquire)
-            {
+            // 两条都按"清空"处理，各自的由来见 `super::capture_is_cleared` 的注释。
+            let cleared = super::capture_is_cleared(
+                self.capture_start(),
+                super::CLEARED_CAPTURE_START.load(std::sync::atomic::Ordering::Acquire),
+                self.clipboard_sequence(),
+                super::CLEARED_CLIPBOARD_SEQUENCE.load(std::sync::atomic::Ordering::Acquire),
+            );
+            if cleared {
                 return Ok(super::IngestOutcome::Skipped(super::SkipReason::Cleared));
             }
             let (order, outcome) = match self {
@@ -2350,17 +2379,11 @@ mod win {
             outcome
         }
 
-        pub fn capture_generation(&self) -> u64 {
+        pub fn capture_start(&self) -> u64 {
             match self {
-                Captured::Text {
-                    capture_generation, ..
-                }
-                | Captured::Image {
-                    capture_generation, ..
-                }
-                | Captured::Files {
-                    capture_generation, ..
-                } => *capture_generation,
+                Captured::Text { capture_start, .. }
+                | Captured::Image { capture_start, .. }
+                | Captured::Files { capture_start, .. } => *capture_start,
             }
         }
 
@@ -2640,8 +2663,11 @@ mod win {
             return;
         }
 
-        // 代次必须在读剪贴板之前取：清空发生在解码/落盘期间时，这件仍按旧代次处理。
-        let capture_generation = super::current_capture_generation();
+        // 采集起点号必须在读剪贴板**之前**领：清空若发生在解码/落盘期间，这件仍算
+        // "清空开始前就在读的那一笔"（起点比清空界小）；反之，清空进行中才开始的采集
+        // 起点比界大，会照常入库。代次那一套（只能等删除成功才推进）已经废弃，理由见
+        // `CLEARED_CAPTURE_START`。
+        let capture_start = super::capture_start_mark();
         let read = unsafe { read_locked() };
         let _ = unsafe { CloseClipboard() };
         let Some((raw, owner_hwnd)) = read else {
@@ -2687,7 +2713,7 @@ mod win {
                     source_app,
                     copied_at_ms: now_ms(),
                     capture_order: super::next_capture_order(),
-                    capture_generation,
+                    capture_start,
                     clipboard_sequence: LAST_READ_SEQUENCE.with(|last| last.get()),
                 });
             }
@@ -2726,7 +2752,7 @@ mod win {
                     source_app,
                     copied_at_ms: now_ms(),
                     capture_order: super::next_capture_order(),
-                    capture_generation,
+                    capture_start,
                     clipboard_sequence: LAST_READ_SEQUENCE.with(|last| last.get()),
                 });
             }
@@ -2751,7 +2777,7 @@ mod win {
                     source_app,
                     copied_at_ms: now_ms(),
                     capture_order: super::next_capture_order(),
-                    capture_generation,
+                    capture_start,
                     clipboard_sequence: LAST_READ_SEQUENCE.with(|last| last.get()),
                 });
             }
@@ -3453,7 +3479,7 @@ mod tests {
             source_app: "fixture.exe".to_string(),
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
-            capture_generation: current_capture_generation(),
+            capture_start: capture_start_mark(),
             clipboard_sequence: win::clipboard_sequence(),
         };
         assert!(captured
@@ -3479,7 +3505,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn clearing_history_discards_queued_items_from_the_previous_generation() {
+    fn clearing_history_discards_items_captured_before_it() {
         let _lock = crate::paths::test_app_dir_lock();
         let _dir = crate::paths::test_app_dir("clip_clear_generation");
         init_db().unwrap();
@@ -3490,7 +3516,7 @@ mod tests {
             source_app: "fixture.exe".to_string(),
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
-            capture_generation: current_capture_generation(),
+            capture_start: capture_start_mark(),
             clipboard_sequence: sequence_before_clear,
         };
         assert_eq!(clear_unpinned().unwrap(), 0);
@@ -3505,7 +3531,7 @@ mod tests {
             source_app: "fixture.exe".to_string(),
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
-            capture_generation: current_capture_generation(),
+            capture_start: capture_start_mark(),
             clipboard_sequence: sequence_before_clear,
         };
         assert!(
@@ -3521,7 +3547,7 @@ mod tests {
             source_app: "fixture.exe".to_string(),
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
-            capture_generation: current_capture_generation(),
+            capture_start: capture_start_mark(),
             clipboard_sequence: sequence_before_clear.wrapping_add(1),
         };
         assert!(matches!(
@@ -3529,6 +3555,19 @@ mod tests {
             IngestOutcome::Stored { .. }
         ));
         assert_eq!(list_recent(10).unwrap().len(), 1, "清空后的新件仍要入库");
+    }
+
+    /// 清空窗口的判据：只按"采集起点 vs 清空界"与"读到的序号"两条，且各自只管一件事。
+    #[test]
+    fn only_captures_started_before_the_clear_or_reading_old_sequence_are_dropped() {
+        // 起点在界之前 ⇒ 旧件（哪怕解码/落盘跨过了整次清空）
+        assert!(capture_is_cleared(5, 10, 100, 50));
+        // 清空进行中才开始、读到的序号更新 ⇒ 就是原先把"代次相等"误杀的那一类，必须放行
+        assert!(!capture_is_cleared(11, 10, 51, 50));
+        // 起点晚但读到的仍是清空时那个序号 ⇒ 旧内容被监听消息迟到重读，按旧件丢
+        assert!(capture_is_cleared(11, 10, 50, 50));
+        // 从没清空过（界与序号都为 0）⇒ 一律放行
+        assert!(!capture_is_cleared(11, 10, 50, 0));
     }
 
     #[cfg(windows)]
@@ -3547,7 +3586,7 @@ mod tests {
             source_app: "fixture.exe".to_string(),
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
-            capture_generation: current_capture_generation(),
+            capture_start: capture_start_mark(),
             clipboard_sequence: win::clipboard_sequence(),
         };
         let conn = open().unwrap();
@@ -3557,6 +3596,11 @@ mod tests {
         .unwrap();
         assert!(clear_unpinned().is_err(), "夹具前提：清空必须失败");
         conn.execute_batch("DROP TRIGGER reject_clear;").unwrap();
+        assert_eq!(
+            CLEARED_CAPTURE_START.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "失败的清空不许落界：否则队列里那些清空前的旧件会被一起丢掉"
+        );
         assert!(matches!(
             queued.ingest().unwrap(),
             IngestOutcome::Stored { .. }
@@ -3576,7 +3620,7 @@ mod tests {
             source_app: "fixture.exe".to_string(),
             copied_at_ms: now_ms(),
             capture_order: next_capture_order(),
-            capture_generation: current_capture_generation(),
+            capture_start: capture_start_mark(),
             clipboard_sequence: win::clipboard_sequence(),
         };
         let old_success = make("queued success");
