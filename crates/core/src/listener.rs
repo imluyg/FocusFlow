@@ -176,6 +176,19 @@ pub fn normalize_key(key: &Key) -> std::borrow::Cow<'static, str> {
     }
 }
 
+/// 长按去重锚点用的身份串。
+///
+/// 显示名相同的两个**物理键**不能共用同一格锚点：`IntlBackslash`（ISO 键盘左 Shift
+/// 旁那一颗，rdev 码 226）与 `BackSlash`（码 220）都念 `\`，于是按住主 `\` 时敲
+/// ISO 那颗会被当成「长按重复」丢掉，抬手还会把主 `\` 的锚点删掉 —— 之后自动重复的
+/// 那一串又从头计一遍。显示名保持合并（榜上本来就该是一行），只把去重身份分开。
+fn press_anchor(key: &Key) -> std::borrow::Cow<'static, str> {
+    match key {
+        Key::IntlBackslash => std::borrow::Cow::Borrowed("IntlBackslash"),
+        _ => normalize_key(key),
+    }
+}
+
 /// 字母键映射：rdev `KeyA`..`KeyZ` -> "A".."Z"（零分配）
 fn letter_name(key: &Key) -> Option<&'static str> {
     use Key::*;
@@ -267,7 +280,10 @@ fn kp_name(key: &Key) -> Option<&'static str> {
         KpPlus => "数字键盘+",
         KpMultiply => "数字键盘*",
         KpDivide => "数字键盘/",
-        KpDelete => "Delete",
+        // 小键盘小数点（VK_DECIMAL，rdev 码 110）。原先念 "Delete"：它与主 Delete
+        // 撞名 ⇒ 排行榜把按小数点的人记成按下 Delete，而两条链在设备明细里叫的是
+        // 「数字键盘.」（`device_stats::classify::vkey_name(0x6E)`）。名字对齐那一边。
+        KpDelete => "数字键盘.",
         _ => return None,
     })
 }
@@ -596,8 +612,9 @@ impl InputListener {
                     return;
                 }
                 let name = normalize_key(key);
-                // 长按自动重复过滤
-                if ignore_key_repeat && !self.is_new_press(&name) {
+                // 长按自动重复过滤（锚点用 `press_anchor`：显示名相同的两个物理键
+                // 不能互相顶掉锚点，见那个函数的注释）
+                if ignore_key_repeat && !self.is_new_press(&press_anchor(key)) {
                     return;
                 }
                 self.record_event(db, &name);
@@ -611,7 +628,7 @@ impl InputListener {
                 if matches!(key, Key::Unknown(_)) {
                     return;
                 }
-                let name = normalize_key(key);
+                let name = press_anchor(key);
                 self.pressed
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -926,6 +943,64 @@ mod tests {
         // 此测试保证 Unknown(N) 格式契约不因实现调整而漂移
         assert_eq!(normalize_key(&Key::Unknown(173)), "Unknown(173)");
         assert_eq!(normalize_key(&Key::Unknown(0)), "Unknown(0)");
+    }
+
+    /// 小键盘小数点必须与小键盘其它键同一套名字，而不是顶着主 Delete 的名字。
+    ///
+    /// rdev 码 110（VK_DECIMAL）→ `Key::KpDelete`，原先念成 "Delete"：排行榜把按
+    /// 小数点的人记成按 Delete，而设备明细那一链对同一次按键叫「数字键盘.」——
+    /// 同一颗键两条链各说各的。
+    #[test]
+    fn the_numpad_decimal_is_not_the_delete_key() {
+        assert_eq!(normalize_key(&Key::KpDelete), "数字键盘.");
+        assert_ne!(
+            normalize_key(&Key::KpDelete),
+            normalize_key(&Key::Delete),
+            "两把不同的物理键不许共用一个显示名"
+        );
+        assert_eq!(
+            normalize_key(&Key::KpDelete).as_ref(),
+            crate::device_stats::classify::vkey_name(0x6E).expect("VK_DECIMAL 有名字"),
+            "与设备明细那一链同一套名字（rdev KpDelete = VK_DECIMAL）"
+        );
+    }
+
+    /// 显示名相同的两个物理键，长按去重锚点必须分开。
+    ///
+    /// 按住主 `\`（BackSlash）时敲 ISO 那颗 `\`（IntlBackslash）：共用一个锚点时
+    /// 第二下被当成长按重复吞掉，抬手又删掉第一颗的锚点 —— 之后那一串自动重复再计一遍。
+    /// 显示名仍允许合并成一行，被分开的只是去重身份。
+    #[test]
+    fn distinct_physical_keys_keep_distinct_press_anchors() {
+        use Key::*;
+        for (a, b) in [(BackSlash, IntlBackslash), (Delete, KpDelete)] {
+            assert_ne!(
+                press_anchor(&a),
+                press_anchor(&b),
+                "{a:?} 与 {b:?} 的去重锚点撞了：一颗按住时另一颗会被当成重复"
+            );
+        }
+        assert_eq!(
+            normalize_key(&BackSlash),
+            normalize_key(&IntlBackslash),
+            "显示名合并是刻意的（榜上同一行）；被分开的只是去重锚点"
+        );
+
+        // 行为腿：按住 Delete 时敲小键盘小数点，第二下必须照常计数；
+        // 抬小数点也不能把 Delete 的锚点带走。
+        let l = InputListener::new(test_config(), new_pause_flag());
+        let held = press_anchor(&Delete);
+        let tapped = press_anchor(&KpDelete);
+        assert!(l.is_new_press(&held));
+        assert!(l.is_new_press(&tapped), "另一颗物理键不是长按重复");
+        l.pressed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(tapped.as_ref());
+        assert!(
+            !l.is_new_press(&held),
+            "抬小键盘小数点不许把 Delete 的锚点删掉"
+        );
     }
 
     /// 长按去重：窗口内重复按下不计数，stale 超时后重新计数。
