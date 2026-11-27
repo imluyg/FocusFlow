@@ -518,7 +518,10 @@ mod tests {
     /// 但"接没接上"能在生产段源码上问）。
     #[test]
     fn the_task_manager_switch_is_wired_into_all_three_paths() {
-        let src = include_str!("autostart.rs");
+        // 行尾必须归一：这条守卫按 `"\n}\n"` 切函数体，而 checkout 出来的工作区是
+        // CRLF（`core.autocrlf`/仓库 filter 决定），那一刻切片一个都切不出来，
+        // 用例在"代码完全正确"的树上红。同文件新守卫都带这一句，这条是漏下的。
+        let src = include_str!("autostart.rs").replace("\r\n", "\n");
         let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
         let body = |head: &str| -> String {
             let at = prod.find(head).unwrap_or_else(|| panic!("{head} 不见了"));
