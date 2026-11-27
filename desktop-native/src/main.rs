@@ -1737,18 +1737,38 @@ impl App {
                         // 周期要**在这一刻**重读：`set_period` 会在 UI 线程上 `refresh_now()`
                         // 先把新周期的数据画出来，而这一拍如果还用等待前抓到的旧周期，
                         // 查询完就会把旧周期的快照盖回面板。`period_now` 只用于选等待间隔。
-                        let next = data::load(p.load(std::sync::atomic::Ordering::Relaxed));
+                        //
+                        // 只"重读"挡不住全程：`data::load` 本身要 6–50 ms，用户恰好在这段里
+                        // 点了药丸时，这一份旧周期的账会在 `set_period` 画完新数据**之后**
+                        // 落回面板 —— 药丸高亮读的是原子 period、数字读的是快照，屏幕上就是
+                        // 「选了近 30 天、数字还是 7 天」，直到下一拍才自愈。载入回来后先对一次
+                        // 原子值，变了就整份作废（新周期那份已经由 `refresh_now` 画上了）。
+                        let period_at_load = p.load(std::sync::atomic::Ordering::Relaxed);
+                        let next = data::load(period_at_load);
                         last_query = std::time::Instant::now();
+                        if p.load(std::sync::atomic::Ordering::Relaxed) != period_at_load {
+                            continue;
+                        }
                         // 悬浮窗读的是这几格，先推过去再让主界面拿新快照。
                         publish_floating(&next);
                         // 推完要**催**一下：主界面这一拍是靠下面那条 `WM_REFRESH` 立刻重画的，
                         // 而卡片只有一个每秒自走的 `SetTimer` —— 不催就是"直接看的那个反而最慢"，
                         // 数字平均要多等半秒到一秒（`set_visible` 当年为同样的理由投这条消息）。
                         floating::refresh();
+                        // 检查与写入放在同一把锁里：`set_period` 也在这把锁下写快照，
+                        // 且先存周期再落快照 —— 这里若看见周期已经变了就整份不写，
+                        // 不会出现"旧快照后写、把新周期盖掉"的次序。
+                        let mut stored = false;
                         if let Ok(mut g) = s.lock() {
-                            *g = next;
+                            if p.load(std::sync::atomic::Ordering::Relaxed) == period_at_load {
+                                *g = next;
+                                stored = true;
+                            }
                         }
-                        let _ = PostMessageW(Some(hwnd), WM_REFRESH, WPARAM(0), LPARAM(0));
+                        if stored {
+                            let _ =
+                                PostMessageW(Some(hwnd), WM_REFRESH, WPARAM(0), LPARAM(0));
+                        }
                     }
                 })
                 .ok();
@@ -23347,7 +23367,7 @@ mod snapshot_poke_tests {
         // `loaded` 往后找会让这条永远成立 —— 那是把判据做成空的，不走。）
         assert!(
             flat.contains(
-                "letnext=data::load(p.load(std::sync::atomic::Ordering::Relaxed));\
+                "letnext=data::load(period_at_load);\
                  last_query=std::time::Instant::now();"
                     .replace([' ', '\n', '\r'], "")
                     .as_str()
