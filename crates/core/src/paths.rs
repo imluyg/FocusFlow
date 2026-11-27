@@ -352,8 +352,29 @@ pub(crate) fn expand_configured_dir(configured: &str, app: &Path) -> PathBuf {
 /// 解析一次 [`data_home`]：读程序目录下的 config.ini，取 `[paths] data_home`。
 fn resolve_data_home() -> PathBuf {
     let app = app_dir();
-    let configured = std::fs::read_to_string(app.join("config.ini"))
-        .ok()
+    let config_path = app.join("config.ini");
+    // `read_to_string(...).ok()` 把"读不出来"折成"没有配置文件"：整份配置里可能设过
+    // `[paths] data_home`，那一刻本次运行会把程序目录当成数据根 —— 界面读的是一套空库
+    // （全 0），写入也落在这套新目录里，与真实历史分裂；日志与启动状态行一个字都没有。
+    // 只有 `NotFound` 才是"还没有配置文件"这个正常答案，其余错误必须说出来。
+    let text = match std::fs::read_to_string(&config_path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            let note = format!(
+                "配置读不出来（{}）: {e}；本次数据目录回落到程序目录 {} —— \
+                 若配置里设过 [paths] data_home，真正的数据不在这里",
+                config_path.display(),
+                app.display(),
+            );
+            tracing::error!("{note}");
+            *data_home_fallback_slot()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(note);
+            None
+        }
+    };
+    let configured = text
         .and_then(|text| {
             crate::config::parse_ini(&text)
                 .get("paths")
@@ -702,6 +723,49 @@ mod tests {
             data_home_fallback_notice().is_none(),
             "换目录之后旧的那句必须作废"
         );
+    }
+
+    /// 配置文件**在、但读不出来**时不许当成"没有配置"。
+    ///
+    /// 整份 `config.ini` 可能设过 `[paths] data_home`；折成"没有"会让本次运行把程序目录
+    /// 当成数据根 —— 界面读一套空库、写入也落在这一套里，与真实历史分裂，而日志与启动
+    /// 状态行一个字都没有。只有 `NotFound` 才是正常的"首启还没写配置"。
+    #[test]
+    fn an_unreadable_config_is_not_read_as_no_custom_data_home() {
+        let _lock = test_app_dir_lock();
+        let app = test_app_dir("home_cfg_unreadable");
+        set_app_dir(app.path());
+        let custom = app.path().join("custom_home");
+        std::fs::create_dir_all(&custom).unwrap();
+        let cfg = app.path().join("config.ini");
+        std::fs::write(&cfg, format!("[paths]\ndata_home = {}\n", custom.display())).unwrap();
+        assert!(data_home_fallback_notice().is_none());
+
+        // share_mode(0)：这一刻别人读不到它（另一个进程独占、同步盘占位是同一支）。
+        // 句柄必须活过整个断言段 —— 提前 drop 就又把文件读回来了。
+        let held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&cfg)
+                .expect("按住配置文件")
+        };
+        assert!(
+            std::fs::read_to_string(&cfg).is_err(),
+            "前提：这一刻配置文件真的读不出来"
+        );
+
+        assert_eq!(data_home(), app.path(), "读不出来时仍按程序目录继续跑");
+        let note = data_home_fallback_notice()
+            .expect("读不出配置不许静默回落：屏上要说清数据根换成了哪里");
+        assert!(note.contains("配置读不出来"), "要点名是哪一步失败: {note}");
+        assert!(
+            note.contains(&cfg.display().to_string()),
+            "要带上配置文件的位置: {note}"
+        );
+        assert!(note.contains("回落到程序目录"), "要说清现在记在哪: {note}");
+        drop(held);
     }
 
     /// 目录修好之后，下一次解析要真的用回配置里那一枚，而不是停在回落后的程序目录。
