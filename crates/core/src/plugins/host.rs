@@ -693,7 +693,10 @@ pub fn register_host_api(
         let key_stats = totals.rows;
         let distinct = key_stats.len();
         let mut ordered: Vec<(&String, &i64)> = key_stats.iter().collect();
-        ordered.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        // 排名尺子只许有全仓那一份（`format::cmp_rank_desc`）：插件榜与面板/CLI 的
+        // "次数降序、同分按名字"必须是同一把尺子。手抄一份今天逐字等价，但两把尺子
+        // 改一漏一正是本仓产出最高的缺陷形状（见 `format.rs` 模块注释里那三次事故）。
+        ordered.sort_by(|a, b| crate::format::cmp_rank_desc(a.0.as_str(), a.1, b.0.as_str(), b.1));
         let rows = lua.create_table()?;
         for (idx, (name, count)) in ordered.iter().enumerate() {
             let row = lua.create_table()?;
@@ -2004,6 +2007,34 @@ fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<mlua::Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `focusflow.stats` 那条榜必须走全仓唯一那把排名尺子。
+    ///
+    /// 手抄 `b.1.cmp(a.1).then_with(|| a.0.cmp(b.0))` 与 `cmp_rank_desc` 今天逐字等价，
+    /// 但两把尺子改一漏一正是本仓产出最高的缺陷形状；而 core 那条守卫只扫 `queries.rs`，
+    /// 抓不到这里 —— 抄第二份的下场见 `format.rs` 模块注释里那三次事故。
+    #[test]
+    fn the_plugin_stats_board_uses_the_one_comparator() {
+        let src = include_str!("host.rs").replace("\r\n", "\n");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        // 注释行先摘掉：上面讲"抄了哪一截"的那段注释里就有那个串。
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 针要拼出来，否则这条用例自己的字面量会被它正在查的样式数进去。
+        let hand = [".cmp(&a.", "1).then_with"].concat();
+        let hand2 = [".cmp(a.", "1).then_with"].concat();
+        assert!(
+            !code.contains(hand.as_str()) && !code.contains(hand2.as_str()),
+            "host 里又手写了一遍排名尺子 ⇒ 它与 cmp_rank_desc 分叉时没有任何用例会红"
+        );
+        assert!(
+            code.contains("cmp_rank_desc("),
+            "插件榜没接那把唯一尺子，实得: {code}"
+        );
+    }
 
     /// 剪贴板那一格按版本收口：API 3 看得见，API 2 与更早的看不见。
     #[test]
