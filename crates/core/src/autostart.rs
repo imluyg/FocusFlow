@@ -126,14 +126,18 @@ fn create_shortcut_at(lnk: &std::path::Path) -> anyhow::Result<()> {
     cmd.args([
         "-NoProfile",
         "-NonInteractive",
-        "-WindowStyle",
-        "Hidden",
         "-ExecutionPolicy",
         "Bypass",
         "-Command",
         &ps_cmd,
     ]);
-    // Windows 下隐藏控制台窗口（CREATE_NO_WINDOW）
+    // 隐蔽控制台靠 CREATE_NO_WINDOW，**不要**再加 `-WindowStyle Hidden`。
+    //
+    // 2026-11-27 现量：父进程没有控制台窗口、子进程 stdout/stderr 又是管道时
+    // （正是 `cargo test` 的形状），带 `-WindowStyle Hidden` 的 PowerShell 5.1
+    // 会卡满 30 秒后以退出码 -1、两个流全空收场 —— 与"建快捷方式失败"长得一样，
+    // 但重试也必然再花 30 秒。`-WindowStyle` 本来就是给"有窗口可藏"的进程用的，
+    // 而 CREATE_NO_WINDOW 已经把窗口从源头掐掉（GUI 形态的桌面端实测 0.3s 建成）。
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -478,6 +482,36 @@ mod tests {
         assert_eq!(approved_says_enabled(&[0x06]), Some(true), "同族启用档");
         assert_eq!(approved_says_enabled(&[0x07]), Some(false), "同族禁用档");
         assert_eq!(approved_says_enabled(&[]), None, "没有这条覆盖 ≠ 被禁用");
+    }
+
+    /// 起 PowerShell 的命令行不许再带 `-WindowStyle Hidden`。
+    ///
+    /// 2026-11-27 现量：无控制台窗口的父进程（`cargo test` 就是这样）里，带这个开关的
+    /// PowerShell 5.1 会卡 30 秒后以退出码 -1、两个流全空收场，而重试只是再花 30 秒
+    /// ——`shortcut_target_reads_real_shell_links` 那一侧没法分辨它，于是整条自启
+    /// 用例在 mintty / CI 这类环境里必红。隐藏窗口已由 CREATE_NO_WINDOW 负责。
+    /// 注释行要先摘掉：上面解释为什么删它的那段注释里就有这个串。
+    #[test]
+    fn the_hidden_window_switch_is_not_passed_to_powershell() {
+        let src = include_str!("autostart.rs").replace("\r\n", "\n");
+        let prod = &src[..src.find("#[cfg(test)]").expect("测试模块的起点找不到了")];
+        let code: String = prod
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("WindowStyle"),
+            "`-WindowStyle Hidden` 会让无控制台的父进程里的 PowerShell 卡 30 秒再失败；\
+             窗口由 CREATE_NO_WINDOW 隐藏"
+        );
+        assert!(
+            code.contains("creation_flags(0x08000000)"),
+            "去掉 -WindowStyle 之后，CREATE_NO_WINDOW 必须还在，否则会闪一个控制台窗口"
+        );
     }
 
     /// 读与清要接在「状态 / 打开 / 关闭」三条路上（注册表 I/O 本身无头测不了，
